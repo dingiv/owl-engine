@@ -29,6 +29,13 @@
 #  例 `testdata/args/bench-27b-tp2.toml`;本档只管"TP 形状":白名单/几何/旋钮)。
 [model]
 kind = "awq27b"
+# **lm_head int8 per-row**(P1.5-a;2026-10-20 起本档默认):
+#   装载期现算(`s_o = absmax/127`,q = RN-even(w/s)),头走
+#   `owl_gemv_i8w_{f16,bf16}`(**只吃 m=1**:prefill 也在末行窄切后调用 ⇒ 同一核)。
+#   判据:TP1 27B token 100%(344/344);TP2 词表切下 96.9%(744/768,唯一分歧
+#   步 = 21.6094 vs 21.6094 的 near-tie,margin 1.6e-2);decode 22.43 → 21.47 ms/tok
+#   (**−4.3%**,3080 对实测)。回退 = 删本行(缺省 off)或显式 `head_quant = "off"`。
+head_quant = "rtn-int8-row"
 
 [runtime]
 # **TP 档选卡 = 显式双 ordinal**(v1;与 device / device_ordinal 互斥 ——

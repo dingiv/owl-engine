@@ -96,6 +96,12 @@ pub const DERIVED_SUFFIXES: &[&str] = &[
     ".marlin_ws",
     ".marlin_ctmp",
     ".a8_factor",
+    // P1.5-a(2026-10-20):int8 头的两件派生键(源 = 检查点 bf16 `weight`,
+    // 装载期现算)。**必须剥**:不剥 ⇒ 回落 `Replicate` ⇒ 两 rank 读同一段
+    // (实测现象:TP2 int8 臂 concat 后 top-2 是 `x` 与 `x+vocab/2` **同值**,
+    // 即高半是低半的复制)。
+    ".i8q",
+    ".i8s",
 ];
 
 /// 剥派生后缀 → 语义基键(未命中则原样返回)。

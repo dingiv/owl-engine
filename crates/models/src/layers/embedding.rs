@@ -184,6 +184,10 @@ impl Embedding {
             // 键 = **局部键**(main 的新约定:全键由调用方 `KeyConvention::head_key`
             // 改写;`lm_head.i8q/.i8s` 不是 `lm_head` 本身 ⇒ 原样直通,
             // 正是 AWQ 源认的派生键)。
+            //
+            // **层声明规则覆盖**(与 `Linear::layout` 同律):派生键的键表默认
+            // 是 `Replicate`(lm_head 不切),词表切档必须显式覆盖成 `UniformCol`
+            // —— 否则两 rank 读同一段(高半 = 低半的复制,实测撞过)。
             let ops =
                 h.q.layout_as("lm_head.i8q", ctx).chain(h.s.layout_as("lm_head.i8s", ctx));
             return Some(if h.rule != crate::plan::rules::rule_of("lm_head") {
@@ -240,7 +244,8 @@ impl Embedding {
         if let Some(h) = &self.head_i8 {
             let sh = hidden.shape();
             let tokens: usize = sh[..sh.len() - 1].iter().product();
-            // **激活 dtype 定实例**(2026-10-20:单一 op_id 会撞 dtype 守门)
+            // **激活 dtype 定实例**(2026-10-20:单一 op_id 会撞 dtype 守门 ——
+            // 执行 dtype = f16 的档(W4A16Awq/F16 27B)拿到 bf16 核 = 输出域不符)
             let kern = match hidden.dtype {
                 crate::tensor::Dtype::BF16 => crate::ops::SemanticKernel::GemvI8wBf16,
                 crate::tensor::Dtype::F16 => crate::ops::SemanticKernel::GemvI8wF16,

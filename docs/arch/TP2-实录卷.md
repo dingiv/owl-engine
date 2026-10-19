@@ -5687,3 +5687,152 @@ lm_head 一处消费者**,单独一个槽 + 一个分派即可,且**回退 = 删
 
 判据与风险:①单位带宽 ≥700(`marlin_bw_bench` 同形状);②**数值同式**
 (同一份 int4 + 同 scale/zp,只差 fp32 累加序 ~1e-7);③门 = `tp_g8_gate` L1 + std。
+
+## 75. P1.5-a 落地到 TP2(2026-10-20)—— 两个真 bug + 生产 A/B **decode +9.5%**
+
+> 上一轮(§72–§74)只把 int8 头做到"单卡能跑、核 718.8 GB/s"。本轮把它接进
+> **双卡词表切**的生产档,顺带修掉一个把 TP2 起服全堵死的 trunk 回归。三件事的
+> 共同点:**判据都是"同值"**——两半 logits 同值、dtype 同值、账本同值。
+
+### 75.1 TL;DR
+
+| 面 | 修前 | 修后 |
+|---|---|---|
+| TP2 起服(任何档) | **必拒**:`adopt_ledger: 已发过 2221 条事件` | 起服 + 双 rank 图捕获 + std 全跑(0.8B 门:312 条事件那档也绿) |
+| int8 头 × f16 执行档 | **装配即拒**:`owl_gemv_i8w_bf16` 声明 BF16 实得 F16 | 双 op_id(`_f16`/`_bf16`),层侧按激活 dtype 选 |
+| int8 头 × 词表切 | **静谧错值**:两 rank 读同一段行(高半 = 低半复制) | 每 rank 本行区间(CPU 门 + GPU 运行期宽度/vs 双门) |
+| 精度(TP1 27B,N=48) | — | **344/344 = 100%**(3/3 prompt 逐 token 全等) |
+| 精度(TP2 词表切,N=256) | — | **744/768 = 96.9%**;唯一分歧步 = near-tie(margin **1.56e-2**) |
+| 生产 std(3080 对,@1024/256) | decode **45.09** t/s | decode **49.37** t/s(**+9.5%**);prefill/TTFT 不变 |
+
+### 75.2 bug ①:语义算子只有一个 `op_id` ⇒ 单一 dtype 实例
+
+现象:`QuantPlan::I8W` 在 **f16 执行档**(27B W4A16Awq 的本档)装配即拒 ——
+
+```
+[dtype 守门] kernel "owl_gemv_i8w_bf16" 声明输出为 BF16,实得 F16
+```
+
+根因:核有两颗(`GemvI8wF16`/`GemvI8wBf16`,同一 `SRC`、模板参数不同),
+但语义枚举只有 **一个** 变体、`op_id` 写死 `elems.gemv_i8w_bf16` ⇒ f16 档必撞。
+(先例在仓里就有:`elems.quant_int8_row_{f16,bf16}` = 两个 op_id。)
+
+修法(三处,与先例同形):
+1. `models/src/ops.rs`:枚举拆 `GemvI8wBf16` / `GemvI8wF16`(`elems.gemv_i8w_f16`);
+2. `kernels/src/driver.rs`:补 `"elems.gemv_i8w_f16" => elems::gemv_i8w(rows, cols, tokens)`;
+3. `layers/embedding.rs::lm_head_matmul`:**按 `hidden.dtype` 选**(bf16 ⇒ BF16 核,
+   f16 ⇒ F16 核;其它响亮 panic —— 头只有这两个档)。
+
+门:`models/src/ops.rs::gemv_i8w_selection_face_is_wired`(op_id → 核名 → 声明出 dtype,
+两档各一颗)。
+
+### 75.3 bug ②:派生键没进"切分链路"(**静默错值**,最险)
+
+现象:TP2 + 词表切 + int8 头,**装载绿、装配绿、生成连贯**,但把两 rank 的
+logits 拼起来做 top-2 诊断时:
+
+```
+top1=97237(27.1719)  top2=221397(27.1719)  margin=0.00e0    ← 221397 = 97237 + 124160
+```
+
+**高半 == 低半,逐位相同** ⇒ 后半词表全是错的(只是"看起来能生成")。
+
+根因两条(必须同时踩,故此前单卡门看不出来):
+1. `plan::rules::DERIVED_SUFFIXES` **漏 `.i8q` / `.i8s`** ⇒ `base_key` 不剥后缀
+   ⇒ `rule_of` 回落 `Replicate`(2026-10-17 就为量化族踩过同一坑,注释还写着
+   "不剥 ⇒ 分片区间不翻译 ⇒ 两 rank 读同一段");
+2. `Embedding::layout_lm_head` 的 i8 臂**没挂层声明规则** —— 词表切的
+   `UniformCol` 覆盖只有 `Linear::layout` 里那一处(`with_tp_rule` ⇒ `Want.rule`),
+   i8 头不走 `Linear`(§72 的设计),于是覆盖面漏了(`Want.rule = None`)。
+
+修法:`DERIVED_SUFFIXES` 补两件 + i8 臂按 `h.rule` 调 `ops.with_rule(...)`
+(与 `Linear::layout` 逐字同律:只在**真覆盖**时打标)。
+
+门:
+- CPU(`formats/shard.rs::derived_i8_head_rows_split_per_rank`):两 rank 各读
+  本行区间、且**不许相等**(直接锁死"高半=低半");同时锁 `base_key` 剥后缀;
+- GPU(`tests/tp_head_i8_gate.rs`):装配期 `spec.head_vocab × 2 == vocab`,
+  运行期 `logits 宽 == head_vocab`。
+
+### 75.4 顺带修的 trunk 回归:**TP2 起服全堵死**(与 int8 无关)
+
+现象:`TpEngine::assemble` 在 rank1 报
+`adopt_ledger: 本引擎已发过 N 条事件,只允许 boot 期(零事件)接管`
+(0.8B **312 条** / 27B **2221 条**)⇒ **所有** TP2 门(0.8B 装配门、确定性门、
+27B 门)与 server 起服全红,与 head 档无关。
+
+根因:`c012cc5`(boot 收编设备面)之后 `Engine::on` **在 boot 就挂账本**,
+而 TP2 的装配顺序是"先装载两 rank → 再 assemble";装载**必发事件** ⇒ rank1 的
+私账已有内容 ⇒ 事后接管 = 把事件丢进孤儿账 ⇒ 设计上就该拒。**设计没错,调用面错了。**
+
+修法(把"合流"提前到**装载之前**,并让接管可判):
+1. `AllocLedger::book_token()`(默认 0 = 不表态;store 实现 = **书本体 Arc 指针**,
+   不是 cell 指针 —— `ledger_entry()` 每次都新建 cell 壳);
+2. `DeviceHandle::adopt_ledger`:**同一本书 ⇒ 幂等放行**(零事件丢失风险),
+   另一本书 + 已记账 ⇒ **仍响亮拒**(老判据不削弱;`Arc::ptr_eq` 先行防双锁自死锁);
+3. `Engine::new_with_ledger(cfg, ledger, dev_rank)`:rank1 在**构造期**接账本 +
+   落定 `dev_rank`(池复用键带 rank,晚设会把两 rank 临时块混池);
+4. `assemble_with_staging` 的"rank1 单元必须为空"判据加**同一性豁免**
+   (`Arc::ptr_eq(cell0, cell1)` ⇒ 那本来就是主账,在借记录是两侧装载欠的);
+5. 调用面:server `engine_of_tp` + 6 个 TP2 测试目标各一行
+   (`Engine::new_with_ledger(cfg, e0.ledger_cell(), 1)`)。
+
+门:CPU `device_handle.rs::adopt_same_book_is_idempotent_after_events`
+(同书 + 已记账 ⇒ 放行;另一本 ⇒ 拒;token=0 ⇒ 按另一本);
+GPU:0.8B `tp_assemble_gate` / `tp_determinism_gate` 双绿,server 起服日志
+`[tp] 事件账:两 rank 合流到同一本(rank 维区分卡)`。
+
+> 教训:判据写成"零事件"这类**时序谓词**时,必须同时给出**允许调用它的时点**
+> 的入口(否则调用面一挪就全红);而"同一实体重复声明"应当是幂等,不是拒绝。
+
+### 75.5 精度门(两进程;同进程两臂被池守卫拒)
+
+同进程连跑两臂 = 两次 27B 装载 ⇒ 第二次 `PoolExhausted`(驱动 free 897MiB /
+池 reserved 18816MiB;设备内存从不 Free 是设计前提,不是漏 free)。改成
+`OWL_I8_HEAD_ARM=f16|i8|compare` 三态(两进程各一臂 + 零 GPU 比对)。
+
+| 档 | 数据 | 判据 |
+|---|---|---|
+| **TP1 27B**(N=48,3 prompt) | **344/344**,3/3 逐 token 全等 | ≥0.95 ✅(实=1.0) |
+| **TP2 词表切**(N=48) | 144/144,3/3 全等 | ✅ |
+| **TP2 词表切**(N=256) | **744/768 = 96.9%**,2/3 全等 | ✅ |
+
+唯一分歧(Rust 中位数那条,第 232 token)是**并列翻转**,不是错值:
+
+| 臂 | top-1 | top-2 | margin |
+|---|---|---|---|
+| f16 头 | 478 (21.6250) | 16 (21.6094) | **1.56e-2** |
+| int8 头 | 16 (21.6094) | 478 (21.6094) | 0.00e0 |
+
+⇒ 满足"首分歧必须互为 top-N"(vLLM `check_logprobs_close` 同形)判据;
+1.6e-2 的 logit 差在 int8 per-row(`s = absmax/127`,q 误差 ≤0.5)量级之内。
+
+### 75.6 生产 A/B(server 档,std 口径,3080 对 @1024/256 ×3 轮)
+
+| 臂 | prefill | TTFT | decode |
+|---|---:|---:|---:|
+| `head_quant = off` | 1596.5 t/s | 643.2 ms | **45.09** t/s(22.18 ms/tok) |
+| `head_quant = rtn-int8-row` | 1594.9 t/s | 643.7 ms | **49.37** t/s(20.26 ms/tok) |
+| 差 | −0.1% | +0.1% | **+9.5%** |
+
+复测(另一 boot):off 45.25;int8 @2048 48.91 ⇒ 稳定。
+TTFT/prefill 不变**符合结构**:prefill 也在**末行窄切后**调头(`forward_last` /
+`prefill_chunk` 都是 `[1,d]`),头永远只吃 m=1 ⇒ 省的是纯权重读:
+每 rank 1.27 GB(bf16)→ **0.635 GB**(i8),核 718.8 GB/s(§72)。
+
+> 口径注:门内计时(int8 前/后 22.43 → 21.47 ms/tok,−4.3%)含**逐步 D2H 读
+> 124160 logits 的同步**(两臂同加),把差值压小;**生产 std 的 +9.5% 才是准数**。
+
+两条与本刀无关的观察(记在这,免得下轮白查):
+1. **3080 对 × `tp27b` 档,≥4096 prompt 撞池上限**:`池 used=18671MiB / reserved=18720MiB`、
+   驱动 free 1011MiB ⇒ `vram-hard-budget` 硬拒(该 turn 被优雅丢弃,不崩)。
+   档的 `max_seq = 8704` 是按 24G 卡算的;20G 对得上更小的池或更低的 `vram_target`。
+2. **停服后进程不退**:SIGTERM 走完优雅关停(打印 + 释放卡锁 + `exit 0`)后
+   RSS 4.1GB 仍存活,需 `kill -9`(卡上内存随之释放)。别用 `pkill -f`(自杀陷阱)。
+
+### 75.7 下一步
+
+1. 本刀已把 `flavors/tp27b.toml` 默认开到 `rtn-int8-row`(回退 = 删该行);
+2. std 五点三轮全矩阵(待 3090 对被占解除;当前 ordinal 1 被 vLLM 占着);
+3. P1.5-b(读 marlin 布局 + 寄存器 perm,§74.3)仍未开工 —— 那一刀的靶是
+   marlin 的 613 GB/s → 700+,与本刀(头)**叠加**后 decode 还有 ~6%。

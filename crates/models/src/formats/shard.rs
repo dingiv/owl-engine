@@ -537,6 +537,51 @@ use crate::plan::rules::{SegKind, WeightRule};
         assert_eq!(got, want_ref, "{key}(slice {slice_id}/{shard}): 分片读 ≠ 先全量后切");
     }
 
+    /// **P1.5-a 派生键 × 层声明规则**:`lm_head.i8q`/`.i8s` 的切分完全靠
+    /// `Want.rule = UniformCol`(键表对 `lm_head` 的默认是 `Replicate`)。
+    ///
+    /// 回归判例(2026-10-20,TP2 实测):①派生后缀表漏 `.i8q/.i8s` ②层侧漏
+    /// `.with_rule` ⇒ 两 rank 读同一段 ⇒ concat 后 top-2 是 `x` 与 `x+vocab/2`
+    /// **同值**(高半 = 低半的复制,看起来"头没坏",实则词表后半全错)。
+    /// 本门在 CPU 上锁死"两 rank 读不同行段、且各等于该 rank 的行区间"。
+    #[test]
+    fn derived_i8_head_rows_split_per_rank() {
+        let (vocab, k) = (8usize, 4usize); // 词表 8 ⇒ 每 rank 4 行
+        let q_full: Vec<f32> = (0..vocab * k).map(|i| i as f32).collect();
+        let s_full: Vec<f32> = (0..vocab).map(|i| i as f32 * 0.25).collect();
+        for (key, full_shape, fullv, row_w) in [
+            ("lm_head.i8q", vec![vocab, k], q_full, k),
+            ("lm_head.i8s", vec![vocab], s_full, 1),
+        ] {
+            let mut seen: Vec<Vec<f32>> = Vec::new();
+            for slice_id in 0..2usize {
+                let mut shard_shape = full_shape.clone();
+                shard_shape[0] /= 2;
+                let mut w = want(key, shard_shape);
+                // 层侧覆盖(生产唯一入口 = `Embedding::layout_lm_head`)
+                w.rule = Some(WeightRule::UniformCol);
+                let mut ops = LoaderOps::want(w);
+                let ctx =
+                    LoaderCtx { dtype: Dtype::F32, shard: 2, slice_id, ..Default::default() };
+                let spans = build_shard_pass(&mut ops, &ctx).expect("pass");
+                let mut src = MemSource { data: HashMap::new() };
+                src.data.insert(key.to_string(), fullv.clone());
+                let sharded = ShardedSource::new(&src, spans);
+                let n = t(sharded.elem_len(key));
+                let got = t(sharded.take_range(key, 0, n));
+                let rows = vocab / 2;
+                let wantv: Vec<f32> =
+                    fullv[slice_id * rows * row_w..(slice_id + 1) * rows * row_w].to_vec();
+                assert_eq!(got, wantv, "{key} slice{slice_id}: 分片读 ≠ 本 rank 的行区间");
+                seen.push(got);
+            }
+            assert_ne!(seen[0], seen[1], "{key}: 两 rank 读到同一段(高半 = 低半复制)");
+        }
+        // 剥后缀表必须认识这两件(否则 `rule_of` 回落 Replicate ⇒ 上面的覆盖失效)
+        assert_eq!(crate::plan::rules::base_key("lm_head.i8q"), "lm_head");
+        assert_eq!(crate::plan::rules::base_key("lm_head.i8s"), "lm_head");
+    }
+
     /// 行切(out)逐元素对拍
     #[test]
     fn rows_shard_matches_full_then_slice() {

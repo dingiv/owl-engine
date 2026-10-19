@@ -342,6 +342,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         }
         // aux = [rows, cols, tokens](P1.5-a:int8 权重 lm_head)
         "elems.gemv_i8w_bf16" => elems::gemv_i8w_bf16(ax(0), ax(1), ax(2)),
+        "elems.gemv_i8w_f16" => elems::gemv_i8w(ax(0), ax(1), ax(2)),
         "ops.narrow" => elems::narrow(dt),
         "ops.ts_stamp" => ops::ts_stamp(),
         "ops.argmax" => ops::argmax(),
