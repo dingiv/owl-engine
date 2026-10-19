@@ -1077,3 +1077,70 @@ prefill 实测(1001-token prompt):
    半块是上窗残留 ⇒ 偶发 `inf`。**判据**:门的 m=64/101 两档 + 四型全覆盖;
 3. (反例)把 x 暂存改成"token 外层"消除法 —— **实测慢 1.35×**(502 vs 687 t/s),
    已回退。原因未深究,但说明**这条路径必须用实测选形**,别凭直觉。
+
+---
+
+## 十八、W-2c 立案:核心算子**不再自研** —— 移植 llama.cpp 官方 MMQ
+
+> 用户裁决(2026-10-19):"核心算子不要自己去写 —— 去 llama.cpp 官方库薅;
+> 官方慢的话再去社区找高性能 GGUF 算子库。"
+
+### 18.1 现状盘点:我们已经"薅"了什么、还差什么
+
+| 件 | 来源 | 状态 |
+|---|---|---|
+| 块结构 / `dequantize_block_*` / `vec_dot_*` | llama.cpp(`ggml-cuda.cu` 时代,经 `repos/attention.rs` 快照 → 本仓 `gguf.cuh`) | ✅ 已在用(MMVQ/行解量化) |
+| MMVQ 内核 | 同上(`gguf_gemm.cu`) | ✅ |
+| **MMQ(tensor-core prefill)** | llama.cpp **官方** | ⬜ **本刀:已 vendoring + 编译通过** |
+| 自研 smem 复用臂(W-2b) | 本仓 | ⚠️ 保留为 MMQ 未覆盖形态的回退(它比 MMVQ 快 2.5×,比 MMQ 预期慢 3-5×) |
+
+### 18.2 关键决策:按**同代 revision** 薅,而不是 head
+
+本仓 `gguf.cuh` 的快照还带 `#ifdef GGML_QKK_64`;上游在 **2024-05-23**(`e84b71c2c`)
+删掉了 QK_K=64 ⇒ 我们的块布局 = **该日之前**那一代。据此锁定 vendoring revision:
+
+- **`llama.cpp@1b1e27cb49`(2024-05-23,`e84b71c2c` 的父提交)**
+- 该版 MMQ 是 **单文件 `mmq.cu` 1570 行 + `vecdotq.cuh` 1280 行**(head 已拆成
+  7.8k 行、且含本仓没有的 fp4/Q1_0 型);
+- **额外红利**:该版 MMQ **直吃普通 `block_q8_1`(36B)** —— 正是本仓
+  `owl_gguf_quant_act_*` 已经在产的布局 ⇒ **不需要新造激活量化臂**;
+- 该版只依赖 `common.cuh` 的两处 host 面(`ggml_cuda_info()` 取 cc + `GGML_UNUSED`),
+  且**内核里零分配、零设备查询**(H1/H2 天然满足)。
+
+落地:`crates/kernels/cu/gguf/vendor/`(逐字 + MIT LICENSE + `README.md` 记
+revision/文件/shim 差异/接线清单)· 适配壳 `vendor/common.cuh` 把
+`ggml_cuda_info()` 改成**编译期 `OWL_CUDA_CC` 常量**(H2),
+`kvalues_iq4nl` 等按上游同代 `common.cuh` 逐字补入 ·
+编译验证:`nvcc -arch=sm_86` 通过,`cuobjdump` 可见
+`mul_mat_q<{q4_K,q5_K,q6_K,q8_0}, fallback=true|false>`。
+
+### 18.3 为什么不是"自研 wmma"(原 W-2c 计划)
+
+自研 wmma 臂只解决"内层循环",而 MMQ 已经把 **tile 调度 / smem 布局 /
+逐型解量化进 fragment / dp4a↔mma 分档 / 小 ncols 回退** 都调好了(上游数年打磨)。
+我们自研版还停在"寄存器 4×2 分块 + vec_dot 复用"(有效 6.6 TFLOPS),自研到 MMQ
+水平等于重走一遍上游的路 —— 违背用户裁决,也不划算。
+
+### 18.4 接线清单(下一刀,详见 `vendor/README.md`)
+
+1. `gguf_mmq.cu`:每型 `extern "C"` 入口(9 参,末位 `stream`)→ 合成最小
+   `ggml_tensor` → 调 `ggml_cuda_op_mul_mat_q`;
+2. **server 侧 foreign 分派**(`owl_gguf_mmq_*` 按名 → 带 stream 调用,与
+   `cublas`/`flashinfer` 同一条通道);
+3. `ops/gguf.rs` 四型声明 + `driver.rs` 拾取 + `ops/mod.rs` 白名单;
+4. `linear.rs` 分派:`m ≥ 阈值` 且 `k % 32 == 0` 且**无内维列序表** ⇒ MMQ
+   (MMQ 不做 tiled 置换 ⇒ 单卡 `ssm_out` 回退 smem 臂);
+5. 门:vs MMVQ `max|Δ|/max < 2e-2` + 1001-token 首 token 一致 + 4B/27B prefill 实测。
+   预期:Ampere 档 MMQ ≈ 30-50 TFLOPS ⇒ 27B **400-600 t/s**(现 121)。
+
+### 18.5 社区备选(用户要求:官方慢再看社区)
+
+| 候选 | 值不值得 | 备注 |
+|---|---|---|
+| **ik_llama.cpp**(本地 `repos/ik_llama.cpp` 已有) | 值得(官方接入后对照) | ikawrakow 的 fork,MMQ/注意力有一批 Ampere 优化;同一套块结构 ⇒ 可当"官方 MMQ 更快版本"直接替换块 |
+| llamafile `tinyblas.cu` | 观察 | 走 BLAS 路(权重解成 tile 再 GEMM),与本仓"压缩驻留"约束冲突(需 f16 tile 缓冲) |
+| vLLM gguf-plugin | 不取 | 也是 dequant + cuBLAS 路(显存放大),与 I-3 冲突 |
+| Marlin(EXL/AWQ 生态) | 不适用 | 面向 4bit 分组量化布局,GGUF 的 K-quant 超块不匹配 |
+
+**纪律**:先让官方 MMQ 跑起来并端到端对拍,再拿 ik_llama.cpp 的同一批核做
+A/B —— 不允许两套同时接线。
