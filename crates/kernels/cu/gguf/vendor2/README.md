@@ -1,7 +1,17 @@
 # vendored:s**head 版 int8-MMA MMQ**(W-2f;设计 §二十二)
 
-> 本目录是第三方代码(MIT,见 `LICENSE`)。**逐字未改**(零补丁)。上游 =
+> 本目录是第三方代码(MIT,见 `LICENSE`)。上游 =
 > 本机 `packages/llama.cpp` fork(即 §21 剖析的那个二进制之源码树)。
+>
+> **三处登记补丁**(2026-10-19 W-2f 接线;判据 = 门全部绿):
+>
+> | # | 文件 | 改动 | 原因 |
+> |---|---|---|---|
+> | P1 | `mmq.cuh` | `mul_mat_q`:`__launch_bounds__(…) static __global__` → `static __device__ __forceinline__` | fatbin 只出**设备码**(宿主函数永不执行)⇒ 入口必须由本仓 `extern "C" __global__` wrapper 提供;`launch_bounds(256,1)` 搬到 wrapper |
+> | P2 | `mmq.cuh` | 内核 + `mul_mat_q_process_tile` + `write_back_{mma,dp4a}` 的 `dst`:`float*` → `__half*`(+`__float2half`),fixup 分支强转 | 本仓输出 f16 `[m,n]` 行主序,与上游 `dst[col*stride+row]` 布局逐位相同 ⇒ 省 f32 中间缓冲 |
+> | P3 | (无) | StreamK 取上游"tiles 效率 ≥90%"形态(一维 `grid=ntiles`、`tmp_fixup=nullptr`) | 零 fixup 核、零新机制 |
+>
+> 其余逐字未改。
 
 | 项 | 值 |
 |---|---|
