@@ -87,7 +87,7 @@ async fn load_once(
         Qwen35Convention::new(&base),
         quant,
         QuantPlan::F16,
-    );
+    ).expect("Model::new");
     let opts = LoadOpts {
         dtype: spec.dtype,
         shard: n,
@@ -354,7 +354,7 @@ async fn source_body(dir: &Path) {
         Qwen35Convention::new(&base),
         QuantPlan::W4A16Awq,
         QuantPlan::F16,
-    );
+    ).expect("Model::new");
     // 全量口径(声明 = 层侧全量形状)
     let ctx_full = LoaderCtx { dtype: spec.dtype, shard: 1, slice_id: 0, device_repack: true, ..Default::default() };
     let ops_full = model.layout(&ctx_full);
@@ -379,7 +379,7 @@ async fn source_body(dir: &Path) {
             Qwen35Convention::new(&base),
             QuantPlan::W4A16Awq,
             QuantPlan::F16,
-        );
+        ).expect("Model::new");
         let mut ops_s = model_s.layout(&ctx_s);
         let spans = owl_models::formats::shard::build_shard_pass(&mut ops_s, &ctx_s)
             .expect("build_shard_pass");
@@ -510,7 +510,7 @@ async fn repack_body(dir: &Path, ordinal: usize) {
         let plan = TpPlan::new(plan_i, shard).expect("plan");
         let (spec, base) = two_layer_spec(dir);
         let spec_s = if shard > 1 { spec.sharded(plan).expect("sharded spec") } else { spec.clone() };
-        let model = Model::new(&spec_s, Qwen35Convention::new(&base), QuantPlan::W4A16Awq, QuantPlan::F16);
+        let model = Model::new(&spec_s, Qwen35Convention::new(&base), QuantPlan::W4A16Awq, QuantPlan::F16).expect("Model::new");
         let ctx = LoaderCtx {
             dtype: spec.dtype,
             shard,

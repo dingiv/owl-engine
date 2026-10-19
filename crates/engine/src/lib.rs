@@ -53,6 +53,9 @@ pub(crate) mod tp;
 // 由 crates/engine/tests/engine.e2e.rs 手动调用。
 #[cfg(any(test, feature = "e2e"))]
 pub mod tests;
+/// GGUF 档 e2e 门(纯测试模块;非测试构建不编译)
+#[cfg(test)]
+pub mod tests_gguf;
 
 pub use engine::{Engine, EngineConfig, EngineKnobs};
 pub use loader::{LoadedModel, ModelLoader};

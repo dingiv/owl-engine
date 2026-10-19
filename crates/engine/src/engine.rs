@@ -960,7 +960,11 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 与 hw 同律:引擎 = 环境事实来源,算子层零探测
         env.kv.head_dim = hd;
         env.kv.grp = hq.checked_div(hkv).unwrap_or(0);
-        env.quant = rm.quant_plan;
+        // 逐张量计划(GGUF)不注入单值 —— 计划的**真源**已在构造期烧进层容器
+        // (`PlanSource::Keyed`);此字段只服务"单一方案"档位的一致性/准入面。
+        if let Some(q) = rm.quant_plan {
+            env.quant = q;
+        }
         // FI 面启用(量化恒 = 主池;影子池已删,本值只作"启用 + 池量化"携带)
         // FI 面启用条件 = **能力条件**(f16 池 + paged 页表),不是开关:
         // 2026-10-13 起配置面无 flashinfer 选项,FI 恒启用(env.attn.fi 仅门/诊断用)

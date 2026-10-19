@@ -51,7 +51,7 @@ async fn load_once<F: DeviceClient>(
         Qwen35Convention::new(rep.keys_base.trim_end_matches('.')),
         QuantPlan::F16,
         QuantPlan::F16,
-    );
+    ).expect("Model::new");
     let opts = LoadOpts {
         dtype: spec.dtype,
         shard: n,
