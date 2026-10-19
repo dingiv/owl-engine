@@ -272,6 +272,23 @@ pub const ROWS_Q6K: &str = "owl_gguf_dequant_rows_q6k";
 /// 行解量化的资产 id
 pub const ROWS_SRC: &str = "cu/gguf/gguf_rows.cu";
 
+/// **权重复用 GEMM(prefill 臂)入口名**(W-2;设计 §十六)
+pub const GEMM_TILE_Q8_0: &str = "owl_gguf_gemm_tile_q8_0";
+/// 同上(Q4_K)
+pub const GEMM_TILE_Q4K: &str = "owl_gguf_gemm_tile_q4k";
+/// 同上(Q5_K)
+pub const GEMM_TILE_Q5K: &str = "owl_gguf_gemm_tile_q5k";
+/// 同上(Q6_K)
+pub const GEMM_TILE_Q6K: &str = "owl_gguf_gemm_tile_q6k";
+/// 复用臂的资产 id
+pub const TILE_SRC: &str = "cu/gguf/gguf_tile.cu";
+
+/// **复用臂的 token 窗宽**(= `gguf_tile.cu` 的编译期 `OWL_GGUF_TILE_MT`)。
+///
+/// 同一事实两处落地(`.cu` 的 `#define` 与这里)⇒ `cu_sig` 面单测互锁
+/// (`tile_mt_matches_cu`):改一处不改另一处 = 网格与核内循环错位(静默错值)。
+pub const TILE_MT: usize = 16;
+
 /// **激活侧列置换**入口(v-head 反重排;设计 §11.4)
 pub const QUANT_ACT_F16_TILED: &str = "owl_gguf_quant_act_f16_tiled";
 /// 同上,bf16 入
@@ -297,6 +314,31 @@ pub const fn entry_for(ty: GgmlTy) -> Option<&'static str> {
         GgmlTy::Q6K => Some(GEMM_Q6K),
         _ => None,
     }
+}
+
+/// 型 → **复用臂**入口名(`None` = 未移植 ⇒ 调用方回退 MMVQ,不静默)
+pub const fn tile_entry_for(ty: GgmlTy) -> Option<&'static str> {
+    match ty {
+        GgmlTy::Q8_0 => Some(GEMM_TILE_Q8_0),
+        GgmlTy::Q4K => Some(GEMM_TILE_Q4K),
+        GgmlTy::Q5K => Some(GEMM_TILE_Q5K),
+        GgmlTy::Q6K => Some(GEMM_TILE_Q6K),
+        _ => None,
+    }
+}
+
+/// **复用臂发射几何**(唯一产地;`cu/gguf/gguf_tile.cu` 头注 = 同一契约):
+/// `grid = (ceil(n / n_warps), ceil(m / TILE_MT))`,`block = (32, n_warps, 1)`
+pub const fn gemm_tile_geom(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
+    let mut gx = (n as u32).div_ceil(N_WARPS);
+    if gx == 0 {
+        gx = 1;
+    }
+    let mut gy = (m as u32).div_ceil(TILE_MT as u32);
+    if gy == 0 {
+        gy = 1;
+    }
+    ((gx, gy, 1), (32, N_WARPS, 1))
 }
 
 /// MMVQ 发射几何(唯一产地;`cu/gguf/gguf_gemm.cu` 头注 = 同一契约):/// `grid = (ceil(n / n_warps), m)`,`block = (32, n_warps, 1)`。

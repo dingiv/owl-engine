@@ -165,6 +165,13 @@ pub fn resolve(req: OpReq) -> KernelPick {
             ax(1),
             ax(2),
         ),
+        // **prefill 复用臂**(W-2):同 aux = [ty, m, n];网格按 `TILE_MT` 切 token 窗
+        "gguf.gemm_tile" => gguf::gemm_tile(
+            crate::family::gguf::GgmlTy::from_code(ax(0) as u32)
+                .unwrap_or_else(|| panic!("driver::resolve(\"gguf.gemm_tile\"): 未知 ggml 型码 {}", ax(0))),
+            ax(1),
+            ax(2),
+        ),
         // aux = [rows, k_padded](网格从它们算;与 gemm 的 aux = [ty, m, n] 区分)
         // 两个 op_id 各一档:输出恒 U8 ⇒ `dt` 载不了输入档(与 QuantInt8Row* 同律)
         "gguf.quant_act_f16" => gguf::quant_act(DType::F16, ax(0), ax(1)),
@@ -495,6 +502,23 @@ pub mod gguf {
             GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufGemmQ6K>(shape),
             other => panic!(
                 "owl_gguf_gemm: {} 未移植(已移植集 = {:?};设计 REQ-GGUF-04 / R3)",
+                other.name(),
+                fam::PORTED
+            ),
+        }
+    }
+
+    /// **权重复用 GEMM**(prefill;W-2):`grid = (ceil(n/n_warps), ceil(m/TILE_MT))`
+    pub fn gemm_tile(ty: GgmlTy, m: usize, n: usize) -> KernelPick {
+        let (grid, block) = fam::gemm_tile_geom(m, n);
+        let shape = Shape { grid, block, smem: 0 };
+        match ty {
+            GgmlTy::Q8_0 => KernelPick::of::<crate::ops::gguf::GgufTileQ8_0>(shape),
+            GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufTileQ4K>(shape),
+            GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufTileQ5K>(shape),
+            GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufTileQ6K>(shape),
+            other => panic!(
+                "owl_gguf_gemm_tile: {} 未移植(复用臂集 = {:?})",
                 other.name(),
                 fam::PORTED
             ),

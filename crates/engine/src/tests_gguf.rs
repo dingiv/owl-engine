@@ -540,3 +540,76 @@ async fn tp2_body(key: &str, layers: usize, want_first: &str, oa: usize, ob: usi
     let uniq: std::collections::HashSet<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(uniq.len() >= 4, "输出字符种类过少({text:?})—— 疑似错几何导致的退化");
 }
+
+/// **prefill 探针**(W-2 A/B):长 prompt 的 TTFT ⇒ prefill tok/s。
+///
+/// 两臂对照(`OWL_GGUF_TILE=1` 复用臂 / `OWL_GGUF_TILE=0` MMVQ)× 两档 chunk。
+/// 判据不是"绝对值"(机器状态相关),而是**同进程两臂的比值** —— 复用臂应把
+/// 权重流量 ÷ `TILE_MT`,实测比值即收益。
+#[cfg(test)]
+#[owl_test(gpu)]
+async fn gpu_gguf_prefill_probe() {
+    if !resource_ok("gguf:27b") {
+        eprintln!("skip: 资源清单缺 \"gguf:27b\"");
+        return;
+    }
+    let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));
+    // ≈1024 token 的 prompt(重复句;实际 token 数由 `turn_prompt_len` 报)
+    let prompt: String = "The quick brown fox jumps over the lazy dog. ".repeat(100);
+    let ord = owl_cuda::test_device_ordinal();
+    let mut rows: Vec<(usize, bool, usize, f64, String)> = Vec::new();
+    for chunk in [128usize, 512] {
+        for tile in [false, true] {
+            std::env::set_var("OWL_GGUF_TILE", if tile { "1" } else { "0" });
+            let mut cfg = gguf_cfg(ord, 8192, 8192, 1);
+            cfg.prefill_chunk = chunk;
+            let mut engine = Engine::new(cfg).expect("引擎");
+            let loaded = engine.loader().load_gguf(&path).await.expect("装载");
+            let mut running = engine.run(loaded).await.expect("装配");
+            // prompt 长度**提交后立刻**取:turn 收摊后账会退役(实测取到 0)
+            let (_, tid) = running.submit_session(Some(9), &prompt, 1).expect("submit");
+            let ntok = running.turn_prompt_len(tid).unwrap_or(0);
+            let t0 = std::time::Instant::now();
+            let mut first = String::new();
+            loop {
+                match running.pump().await.expect("pump") {
+                    TurnEvent::Token { turn, delta } if turn == tid => {
+                        first.push_str(&delta);
+                        break;
+                    }
+                    TurnEvent::Completed { turn, .. } if turn == tid => break,
+                    TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+                    _ => {}
+                }
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            rows.push((chunk, tile, ntok, dt, first.clone()));
+            eprintln!(
+                "[gguf-prefill] chunk={chunk} tile={} · prompt {ntok} tok · {dt:.3}s ⇒ {:.1} tok/s · 首 token {first:?}",
+                tile as u8,
+                ntok as f64 / dt.max(1e-9)
+            );
+            drop(running);
+        }
+    }
+    // 比值门(同 chunk 内):复用臂必须**快于** MMVQ —— 这是 W-2 的存在理由
+    for chunk in [128usize, 512] {
+        let get = |tile: bool| {
+            rows.iter()
+                .find(|(c, t, ..)| *c == chunk && *t == tile)
+                .map(|r| (r.3, r.4.clone()))
+                .expect("缺样本")
+        };
+        let ((mmvq, t_mmvq), (tile, t_tile)) = (get(false), get(true));
+        // 两臂**位级相同** ⇒ 长 prompt 的首 token 必须一致(端到端验证分派)
+        assert_eq!(
+            t_tile, t_mmvq,
+            "chunk={chunk}:两臂首 token 不同(复用臂改变了数值路径?{t_tile:?} vs {t_mmvq:?})"
+        );
+        eprintln!(
+            "[gguf-prefill] chunk={chunk} 加速比 MMVQ/复用 = {:.2}×",
+            mmvq / tile.max(1e-9)
+        );
+        assert!(tile < mmvq, "chunk={chunk}:复用臂没更快({tile:.3}s vs {mmvq:.3}s)");
+    }
+}

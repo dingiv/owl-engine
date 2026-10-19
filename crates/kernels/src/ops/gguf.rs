@@ -69,6 +69,39 @@ gguf_gemm_spec!(GgufGemmQ4K, crate::family::gguf::GEMM_Q4K);
 gguf_gemm_spec!(GgufGemmQ5K, crate::family::gguf::GEMM_Q5K);
 gguf_gemm_spec!(GgufGemmQ6K, crate::family::gguf::GEMM_Q6K);
 
+// ---- **复用臂(W-2;prefill)** ————————————————————————————————
+//
+// 与 MMVQ **同槽序**(`GEMM_PARAMS` 逐字相同)—— 两者是同一语义动作的两种
+// 调度:MMVQ = 每 (行, token) 读一遍权重;复用臂 = 一行权重算 `TILE_MT` 个
+// token。故声明面只差 `ENTRY`/`SRC`/`PARAMS` 之外的几何。
+
+/// `owl_gguf_gemm_tile_q8_0` —— 权重复用 GEMM(Q8_0;W-2 prefill 臂)
+pub struct GgufTileQ8_0;
+/// 同上(Q4_K)
+pub struct GgufTileQ4K;
+/// 同上(Q5_K)
+pub struct GgufTileQ5K;
+/// 同上(Q6_K)
+pub struct GgufTileQ6K;
+
+macro_rules! gguf_tile_spec {
+    ($t:ty, $entry:expr) => {
+        impl KernelSpec for $t {
+            const ENTRY: &'static str = $entry;
+            const SRC: &'static str = crate::family::gguf::TILE_SRC;
+            const PARAMS: &'static [Param] = GEMM_PARAMS;
+            const LAWS: &'static [Law] = &[Law::OutputFinite];
+            const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+            const DETERMINISM: Determinism = Determinism::Deterministic;
+        }
+    };
+}
+
+gguf_tile_spec!(GgufTileQ8_0, crate::family::gguf::GEMM_TILE_Q8_0);
+gguf_tile_spec!(GgufTileQ4K, crate::family::gguf::GEMM_TILE_Q4K);
+gguf_tile_spec!(GgufTileQ5K, crate::family::gguf::GEMM_TILE_Q5K);
+gguf_tile_spec!(GgufTileQ6K, crate::family::gguf::GEMM_TILE_Q6K);
+
 /// `owl_gguf_quant_act_f16` —— 激活 → q8_1 块(f16 入;MMVQ 喂料手)
 pub struct GgufQuantActF16;
 /// `owl_gguf_quant_act_bf16` —— 同上,bf16 入
@@ -209,11 +242,21 @@ pub static ROWS_Q4K: KernelMeta = meta_of::<GgufRowsQ4K>();
 pub static ROWS_Q5K: KernelMeta = meta_of::<GgufRowsQ5K>();
 pub static ROWS_Q6K: KernelMeta = meta_of::<GgufRowsQ6K>();
 
+// ---- 复用臂(W-2):四个 prefill 入口的元数据表项 ----
+pub static TILE_Q8_0: KernelMeta = meta_of::<GgufTileQ8_0>();
+pub static TILE_Q4K: KernelMeta = meta_of::<GgufTileQ4K>();
+pub static TILE_Q5K: KernelMeta = meta_of::<GgufTileQ5K>();
+pub static TILE_Q6K: KernelMeta = meta_of::<GgufTileQ6K>();
+
 pub static METAS: &[&KernelMeta] = &[
     &GEMM_Q8_0,
     &GEMM_Q4K,
     &GEMM_Q5K,
     &GEMM_Q6K,
+    &TILE_Q8_0,
+    &TILE_Q4K,
+    &TILE_Q5K,
+    &TILE_Q6K,
     &QUANT_ACT_F16,
     &QUANT_ACT_BF16,
     &QUANT_ACT_F16_TILED,

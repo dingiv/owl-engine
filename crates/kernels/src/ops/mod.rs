@@ -377,6 +377,12 @@ pub const PROD_GGUF4B_2026_10_19: &[&str] = &[
     "owl_gguf_gemm_q5k",
     "owl_gguf_gemm_q6k",
     "owl_gguf_gemm_q8_0",
+    // **prefill 复用臂**(W-2,2026-10-19):`m >= 8` 的 GEMM 走这里
+    // (与 MMVQ 位级相同,只是调度不同)
+    "owl_gguf_gemm_tile_q4k",
+    "owl_gguf_gemm_tile_q5k",
+    "owl_gguf_gemm_tile_q6k",
+    "owl_gguf_gemm_tile_q8_0",
     "owl_gguf_quant_act_f16",
     "owl_gguf_quant_act_f16_tiled",
     "owl_narrow_strided_f16",

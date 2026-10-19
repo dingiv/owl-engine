@@ -209,6 +209,10 @@ pub enum SemanticKernel {
     /// 块型住 `aux[0]`(ggml 型码)→ driver 经 `family::gguf::entry_for` 单一
     /// 映射拾取入口(H3:逐型一条准入声明)
     GgufGemm,
+    /// **GGUF 权重复用 GEMM**(prefill;W-2):同一 warp 一行权重算 `TILE_MT`
+    /// 个 token —— 与 [`Self::GgufGemm`] 同槽序,只是调度不同(门:
+    /// 两臂**位级相同**)
+    GgufGemmTile,
     /// **GGUF 量化表的行解量化**(查表臂;`token_embd` 在 GGUF 里是量化块,
     /// 既不是 f16 表也不可解量化驻留 ⇒ 查表自带解量化;块型住 `aux[0]`,几何 = `rows_geom`)
     GgufDequantRows,
@@ -320,6 +324,7 @@ impl SemanticKernel {
             SemanticKernel::GgufQuantActF16 => "gguf.quant_act_f16",
             SemanticKernel::GgufQuantActBf16 => "gguf.quant_act_bf16",
             SemanticKernel::GgufGemm => "gguf.gemm",
+            SemanticKernel::GgufGemmTile => "gguf.gemm_tile",
             SemanticKernel::GgufDequantRows => "gguf.dequant_rows",
             SemanticKernel::GgufQuantActTiledF16 => "gguf.quant_act_f16_tiled",
             SemanticKernel::GgufQuantActTiledBf16 => "gguf.quant_act_bf16_tiled",

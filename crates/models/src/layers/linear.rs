@@ -25,6 +25,22 @@ use crate::TensorOps;
 ///
 /// 槽序/几何见 `ops/gguf.rs` 与 `family/gguf.rs::gemm_geom`;
 /// 激活 dtype 分档(输出恒 `U8`,`dt` 载不了输入档 ⇒ 两个 op_id 各一档)。
+/// **prefill 复用臂的最小 token 数**(W-2;`m ≥ 本值` 才切调度)。
+///
+/// 为什么是 8:decode(m = 1)与投机 verify(m = 2..7)都留在 MMVQ —— 那条路径是
+/// 带宽下限(读一遍权重),复用臂的小窗只会多几条 guard;prefill 的 chunk
+/// (128/512/1024)才谈得上复用。
+pub(crate) const GGUF_TILE_MIN_M: usize = 8;
+
+/// **复用臂开关**(诊断/对拍用;缺省开)。
+///
+/// `OWL_GGUF_TILE=0` ⇒ 全档回 MMVQ(与 W-2 之前逐位相同)—— A/B 测 prefill
+/// 收益、以及"怀疑复用臂"时的一键回退。**不影响图形态之外的任何语义**:
+/// 两臂位级相同(门:`kernel_gate::gpu_gguf_tile_gemm_matches_mmvq_bitwise`)。
+fn gguf_tile_arm_enabled() -> bool {
+    !matches!(std::env::var("OWL_GGUF_TILE").as_deref(), Ok("0"))
+}
+
 pub(crate) fn gguf_quant_gemm(
     w: &Weight,
     ty: GgmlTy,
@@ -73,7 +89,16 @@ pub(crate) fn gguf_quant_gemm(
         .arg_i32(k as i32)
         .aux(&[m, k])
         .with_shape(Dtype::U8, vec![m, xq_row]);
-    TensorOps::call(SemanticKernel::GgufGemm)
+    // **调度分派**(W-2,设计 §十六):prefill(m ≥ 8)走**权重复用臂** ——
+    // 一行权重算一窗 token,权重流量 ÷ `TILE_MT`;decode 仍 MMVQ(本来就只该
+    // 读一遍权重)。两臂**位级相同**(同一 `vec_dot` 序 + 同一 warp reduce;
+    // 门 = `kernel_gate::tile_gemm_matches_mmvq_bitwise`)⇒ 切换零数值风险。
+    let gemm = if m >= GGUF_TILE_MIN_M && gguf_tile_arm_enabled() {
+        SemanticKernel::GgufGemmTile
+    } else {
+        SemanticKernel::GgufGemm
+    };
+    TensorOps::call(gemm)
         .arg(&w.decl())
         .arg(&xq)
         .arg_i32(m as i32)

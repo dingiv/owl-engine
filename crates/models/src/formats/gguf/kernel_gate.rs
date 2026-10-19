@@ -163,6 +163,90 @@ mod tests {
         }
     }
 
+    /// **复用臂 ↔ MMVQ 位级门**(W-2;2026-10-19):同一权重/激活/形状下,两臂
+    /// 的输出必须**逐位相同**。
+    ///
+    /// 为什么可以要求"位级"而不是 allclose:复用臂只改了**调度**(一行权重算
+    /// `TILE_MT` 个 token),每个 token 的 `vec_dot` 序与 warp reduce **一字未动**
+    /// ⇒ 数值路径完全相同。位级门一旦红,就是几何/越界/串行化写坏了 —— 这类错
+    /// 在 allclose 下可能被"平均值掩盖"。
+    ///
+    /// 覆盖:`m = TILE_MT`(整窗)与 `m = TILE_MT + 4`(尾窗)两档 × 四型。
+    #[owl_test(gpu)]
+    async fn gpu_gguf_tile_gemm_matches_mmvq_bitwise() {
+        if !resource_ok("gguf:4b") {
+            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            return;
+        }
+        const MT: usize = owl_kernels::family::gguf::TILE_MT;
+        let path = PathBuf::from(resource("gguf:4b").expect("resource_ok 已过"));
+        let g = Gguf::open(&path).expect("open 4B");
+        let cases: &[(&str, &str)] = &[
+            ("blk.0.attn_gate.weight", "Q4_K"),
+            ("blk.0.ssm_out.weight", "Q8_0"),
+            ("blk.0.attn_qkv.weight", "Q6_K"),
+            ("blk.3.attn_k.weight", "Q5_K"),
+        ];
+        let mut gpu = crate::testkit::gpu_client().await;
+        for (tname, want_ty) in cases.iter().copied() {
+            let ti = g.get_tensor(tname).unwrap_or_else(|| panic!("缺张量 {tname}"));
+            let ix = g.index_of(tname).unwrap();
+            let bytes = g.bytes(ix);
+            let (rows, inner) = (ti.rows() as usize, ti.inner() as usize);
+            let (be, bb) = ti.ty.block();
+            let row_bytes = inner / be * bb;
+            let wblk = TensorOps::from_host(Dtype::U8, vec![rows, row_bytes], bytes);
+            for m in [MT, MT + 4] {
+                let xv: Vec<f32> = (0..m * inner)
+                    .map(|i| half::f16::from_f32(((i as f32 * 0.0137).cos() * 1.3).clamp(-2.5, 2.5)).to_f32())
+                    .collect();
+                let xb: Vec<u8> =
+                    xv.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
+                let x = TensorOps::from_host(Dtype::F16, vec![m, inner], &xb);
+                let xq = TensorOps::call(SemanticKernel::GgufQuantActF16)
+                    .arg(&x)
+                    .arg_i32(inner as i32)
+                    .arg_i32(inner as i32)
+                    .aux(&[m, inner])
+                    .with_shape(Dtype::U8, vec![m, inner / 32 * XQ_BLOCK]);
+                let build = |op: SemanticKernel| {
+                    TensorOps::call(op)
+                        .arg(&wblk)
+                        .arg(&xq)
+                        .arg_i32(m as i32)
+                        .arg_i32(rows as i32)
+                        .arg_i32(inner as i32)
+                        .arg_i32(inner as i32)
+                        .arg_i32(0)
+                        .arg_i32(rows as i32)
+                        .aux(&[want_ty_code(want_ty), m, rows])
+                        .with_shape(Dtype::F16, vec![m, rows])
+                };
+                let a = harvest_f16(&mut gpu, &build(SemanticKernel::GgufGemm)).await;
+                let b = harvest_f16(&mut gpu, &build(SemanticKernel::GgufGemmTile)).await;
+                assert_eq!(a.len(), b.len(), "{tname} m={m} 输出长度");
+                let mut nbit = 0usize;
+                let mut worst = 0usize;
+                for (i, (p, q)) in a.iter().zip(&b).enumerate() {
+                    if p.to_bits() != q.to_bits() {
+                        nbit += 1;
+                        if nbit == 1 {
+                            worst = i;
+                        }
+                    }
+                }
+                assert_eq!(
+                    nbit, 0,
+                    "{tname}({want_ty}) m={m}:复用臂与 MMVQ 有 {nbit} 项不逐位相同(首个 @ {worst}:{} vs {})",
+                    a[worst], b[worst]
+                );
+                eprintln!(
+                    "[gguf-gpu] {tname}({want_ty}, {rows}×{inner}, m={m}):复用臂 ≡ MMVQ 逐位相同 ✓"
+                );
+            }
+        }
+    }
+
     /// **量化表行解量化门**(查表臂;`token_embd` 在 GGUF 里是量化块)。
     ///
     /// 覆盖两个靶位的真表:4B = Q6_K(`tie_word_embeddings`)· 27B = Q4_K。
