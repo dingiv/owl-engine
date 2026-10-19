@@ -1542,15 +1542,9 @@ impl GpuCtx {
         let env_mb = self.diag.capture_slab_mb.filter(|&v| v > 0);
         let slab_cap = match env_mb {
             Some(mb) => mb << 20,
-            None => {
-                let h = owl_shared::slab_hint::take_hint().unwrap_or(64 << 20);
-                // ⚠️ 实测(§65.3-2):+1MiB 余量**不够**(cap 涨到 14.0M 仍差 139264B),
-                // 且 hint 与**本图**的真实峰值差一个量级(固定档 32MiB 可跑)——
-                // 疑为 hint 的**按图分配**错位(take 是一次性消费;图数/顺序变化 ⇒
-                // 某图拿到的是别的图的里程计)。⇒ 暂取**保守 2×**(仍在“图slab
-                // 640MiB”预算内;图数 × 2·hint),待 slab_hint 定量逻辑修正后收紧。
-                h.saturating_mul(2)
-            }
+            // 余量已在**源头**给足(见 `graph_plan` 的 hint 定尺:2× + 2MiB;
+            // §65.3-2 定谳)—— 此处**不再二次放大**(双保险会 4× 吃显存)。
+            None => owl_shared::slab_hint::take_hint().unwrap_or(64 << 20),
         };
         let slab = unsafe { stream.alloc::<u8>(slab_cap) }
             .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败({}MiB) {e:?}", slab_cap >> 20)))?;

@@ -5197,3 +5197,35 @@ if prof { owl_shared::metrics::query_metrics(&MetricsFilter::new().tag_prefix("e
 **方法论坑（记为纪律㊲）**：**`step_profile` 会改变被测对象**（每步 +1.6ms）——
 凡用它做的长跑读数（decode t/s、相位比），要么**先扣探针开销**，要么看
 `pump-phases` 的 `head`/`sched→exec` 是否为 ns 级自证。
+
+---
+
+## §67 slab 定尺**根治**（保守版;2026-10-19 深夜）
+
+> 承接 §65.3-2（融合档启动被拒 → 临时 `[cuda] capture_slab_mb = 32` 解封 + `state.rs` 的 hint×2 兜）。
+
+### 67.1 根因（精确定位）
+
+- `slab_hint` 设计：`GraphPlan` warmup 的 eager dry 跑 → `probe_end()` 取**实测影子峰值**
+  `peak` → `hint = base(+12.5%)+1MiB` → `graph_begin` 消费（**口径已对齐**：`reclaim_capture`
+  用 `peak`、plain 用 `metered`，见 `graph_plan.rs` 的 M1 教训注释）。
+- **但 `peak` 是 warmup（eager）期的峰值**，而**捕获期**的回收点更少（**节点合并** ⇒
+  块活跃期变长）：v1 两核融合把 stage+reduce 并成一节点后，**实测需求/base ∈ [1.40, 2.45)**
+  （base ≈ 10.1MiB 时：12.36MiB 的旧 hint 差 139264B 仍爆；24.7MiB 够）。
+
+### 67.2 修法（源头给足；不二次放大）
+
+1. `graph_plan.rs`：hint 余量 **`+12.5%+1MiB` → `2× + 2MiB`**（覆盖 2.0 以下的需求比）；
+2. `state.rs`：**回退**先前的 `hint × 2`（双保险会 4× 吃显存）⇒ 恢复原逻辑。
+
+### 67.3 验证
+
+| 档（均**无** `capture_slab_mb`）| 结果 |
+|---|---|
+| spec + 切档 + **融合** | ✅ 启动;**std decode 109.96**（与解封前 110.01 一致）|
+| spec + 切档（不融合）| ✅ 启动 |
+
+### 67.4 遗留（真根治）
+
+`peak` 的**捕获期 liveness 直接跟踪**（现在是 warmup peak + 2× 余量兜）——
+或 carve 失败自动放大重试（**受 `FnOnce` 闭包限制不可行**，见 §65.3-2）。

@@ -384,7 +384,15 @@ impl<D: DeviceClient> GraphPlan<D> {
                 // 峰值活跃集(影子高水位);plain(历史口径)⇒ 窗内块常驻 ⇒
                 // 需求 = 分配总和。混用会把族定小 ⇒ 捕获中途耗尽当场炸。
                 let base = if desc.reclaim_capture { peak } else { metered }.max(4 << 20);
-                let hint_bytes = base + base / 8 + (1 << 20);
+                // **余量:原 +12.5%+1MiB → +100%+2MiB**(§65.3-2 定谳;2026-10-19):
+                // `peak` 是 **warmup(eager)期**的实测影子峰值,而**捕获期**的回收点
+                // 更少(节点合并 ⇒ 块活跃期变长):v1 两核融合(§65)把 stage+reduce
+                // 并一节点后,实测**需求/base ∈ [1.40, 2.45)**(base=10.1MiB 时,
+                // 12.36MiB 的旧 hint 差 139264B 仍爆;24.7MiB 够)。
+                // ⇒ 取 **2× + 2MiB**(覆盖 2.0 以下;仍比双保险(下游再 ×2)省 ~40%)。
+                // 真根治 = 捕获期 liveness 直接跟踪/或 carve 失败自动重试
+                // (后者受 FnOnce 闭包限制,不可行 —— 见 §65.3-2)。
+                let hint_bytes = base.saturating_mul(2) + (2 << 20);
                 owl_shared::slab_hint::set_hint(hint_bytes);
                 sess.slab_bytes = hint_bytes; // 图显存总账账源
                 owl_shared::log_info!(
