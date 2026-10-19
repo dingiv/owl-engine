@@ -1364,3 +1364,37 @@ torch/cuBLAS 在本机(3090 Ti,**本仓的 GEMM 形状**)实测:
    它们对任何权重格式都成立 ⇒ 属**引擎级**下一步(优先级应高于 GGUF 收尾)。
 3. 本轮之后本机对照:llama.cpp 同工具 **1211 avg / 1374 边际**;本仓 **1059 / 1175**
    ⇒ 差 **14% / 14%**(全程从 3.6× 追到 1.14×)。
+
+### 20.7 为什么 `prefill_chunk` **退回 1024**(2026-10-19 用户裁决)+ 桶/CUDA 图账
+
+**先钉一条事实(不然会误读 §20.4 的阶梯)**:`flavors/gguf27b.toml` **没有 `[graph]` 段**
+⇒ `PrefillBucket::Off` ⇒ **本档 prefill 一直是 eager(逐核发射,没有 prefill 图)**。
+所以 §20.4 那张 chunk 阶梯**全是 eager 口径**,两档之间只有 chunk 一个变量:
+chunk 的收益与桶无关,它来自"每 chunk 解一遍 17.7 GB 权重"被摊薄。
+
+**桶是什么(现役代码)**
+- 阶梯:`prefill_plan::ladder(Geobuckets) = [32,64,128,256,512,1024]`,`T512 = [512]`,`Off = []`;
+- 命中:`pick_bucket` **向上取整**到最小可用桶;**> 阶梯顶 ⇒ `None` ⇒ eager**
+  (单测硬钉:`pick_bucket(l, 1025) == None`);
+- 一张图 = 一个 `t_pad` 桶,图内含注意力(FI)+ KV 写;回放 = 写输入槽 + **1 条 `graph_launch`**;
+- 捕获**只在 boot**(静止点律:捕获前的 warmup 会真跑一遍 eager,prefill 有 KV/GDN 副作用),
+  **t_pad 降序**捕获(家族 scratch 只增不减,已捕图烘的是当前指针)。
+
+**若要把 chunk 抬到 2048/4096 并同时开桶,要配四件(逐项带本仓实测数)**
+
+| # | 项 | 现状/口径 | 抬到 2048 | 抬到 4096 |
+|---|---|---|---|---|
+| 1 | **图 slab 预算** | 五点阶梯:prefill 桶 203 MiB / 全图 Σ **296.5 MiB**;+t1024 尾档后 Σ **502.3 MiB**(⇒ 桶 slab ≈ **0.2 MiB/token**) | Σ ≈ 700 MiB ⇒ `GRAPH_SLAB_BUDGET` 640 → **832 MiB**(KV 池让 ~192 MiB ≈ 3k tok,本档 per_tok 65 536 B) | Σ ≈ 1.1 GiB ⇒ 预算 **1.25 GiB**(KV 池让 ~600 MiB ≈ 9k tok) |
+| 2 | **boot 捕获成本** | 每桶一次真 forward | +≈1.8 s | +≈3.5 s |
+| 3 | **GDN 状态槽** | `t_pad ≥ 64` 的 chunked/scalar 臂把 **host 槽指针**烘进图 ⇒ 桶图只对 `gdn_slot == baked` 可用(`BucketGraph::usable` 结构化拒,绝不串台) | 本档 `gdn_slots=1` 无碍;多槽档要么回 eager,要么做 P-6c(槽做成设备面) | 同左 |
+| 4 | **`allowed_ops` 白名单** | 按**发射账并集**生成(W-3 台账);新桶会引入新的 m 档变体(marlin m / GDN chunked T / FI hd256 T / cublas tile) | 必须重跑 W-3 台账,否则 boot 捕获被白名单拒 | 同左 |
+| 5 | **假行纪律** | `t_pad` 行里假行不进序列(`seq_cu=[0,t_real]` + 假行池写落 dump 页) | 沿用 | 沿用 |
+
+**裁决**
+1. **`prefill_chunk` 回 1024**(与历史生产口径一致;改它等于换测速靶位,不可比);
+2. 想吃那 +9.8% 时,把「chunk 2048」+「t2048 桶」**作为一次改动成对落地** ——
+   2048 已拿到阶梯收益的 2/3(`@8192` 点 1109 vs 987),而 slab 只 +200 MiB;
+   4096 的边际(1109 → 1173)不值得再 +500 MiB;
+3. **开桶的真正理由不是吞吐**(release 口径下 eager 的 host 开销已经很小,
+   `std 1024 点` 1016 ms 墙钟 vs 内核总时长同量级),而是**形态纪律**
+   (每 chunk 一条 launch、host 抖动与 P50 稳定、以及 prefill/decode 同图族)。
