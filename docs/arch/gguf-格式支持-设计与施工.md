@@ -1144,3 +1144,40 @@ revision/文件/shim 差异/接线清单)· 适配壳 `vendor/common.cuh` 把
 
 **纪律**:先让官方 MMQ 跑起来并端到端对拍,再拿 ik_llama.cpp 的同一批核做
 A/B —— 不允许两套同时接线。
+
+### 18.6 W-2c 收口实录(2026-10-19):两档实测 —— **快的是大 token 窗,不是张量核**
+
+接线完成后按 README 清单落地(适配入口 → `ops`/`driver` 声明 → `linear` 分派 →
+对拍门)。先跑**上游默认**(张量核档),结果**不比自研 smem 臂快**:
+
+| 档 | tile(`x`=每 CTA token 数) | 4B prefill | 27B prefill |
+|---|---|---:|---:|
+| 张量核(`CUDA_USE_TENSOR_CORES`) | Q4_K/Q5_K/Q6_K `{4,32,4}` | 739 t/s | 117 t/s |
+| 自研 smem 臂(W-2b,参照) | 64 token/CTA | 819 | 121 |
+| **dp4a 档(现役默认)** | Q4_K/Q5_K `{64,128,4}`、Q6_K `{64,64,4}`、Q8_0 `{128,64,4}` | **1829** | **335** |
+
+**根因**(读核源码定谳):张量核档 `mmq_x = 4` ⇒ 每个 CTA 只覆盖 4 个 token,而 k 全量
+在 CTA 内流过 ⇒ **权重被重读 `m/4` 次**(27B @m=512:m/4 = 128 遍 = 2.3 TB)。
+dp4a 档 `mmq_x = 64/128` ⇒ 权重复用 16-32×,点积走 int8 dp4a 但算术密度足够
+(每权重字节换 4-8 个 MAC)。⇒ 世上"MMQ 快"在这个硬件上来自**大 token 窗**;
+张量核只是把 tile 内部算得更快,却把 token 窗压到 4。
+
+**纪律红利**:切换档位时 Rust 几何(`MMQ_CFG`)与 C 开关必须同步 —— 不同步时
+数值门立刻给 **1.0 相对误差**(实测踩到:`.cu` 没重编,因为 build.rs 的 fatbin 指纹
+**原先不含 `#include` 的头**;已修:凡引用 `vendor/` 的 `.cu`,指纹混入 vendor 全树
+的长度+mtime ⇒ 改开关必重编)。
+
+**现役分派**(`linear.rs`):
+`m ≥ 32` → **官方 MMQ(dp4a 档)**;`m < 32` → MMVQ(官方同款);`ssm_out` 带 A2
+内维列序表(单卡、占参数 ~6%)→ 自研 smem 臂回退(MMQ 不做激活侧列序置换)。
+`OWL_GGUF_MMQ=0` / `OWL_GGUF_SMEM=0` 可逐级回退;数值门
+`gpu_gguf_mmq_matches_mmvq`(四型 × m=32/71,`max|Δ|/max = 2.5e-5 ~ 1.6e-2`)。
+
+**W-2 全程账**(27B,1001-token prompt,chunk 512):
+
+```text
+W-2 前(MMVQ)          48.5 t/s      权重流量 = m × 权重字节(带宽墙)
+W-2a(vec_dot 复用)     78.0 t/s      流量 ÷16,露出算术墙(≈4.4 TFLOPS)
+W-2b(自研 smem 臂)    121.4 t/s      每窗解量化一次(≈6.6 TFLOPS)
+W-2c(官方 MMQ·dp4a)   335.1 t/s      大 token 窗 + dp4a int8 点积   ← 现役
+```

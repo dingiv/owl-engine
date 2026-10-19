@@ -179,6 +179,13 @@ pub fn resolve(req: OpReq) -> KernelPick {
             ax(1),
             ax(2),
         ),
+        // **官方 MMQ**(W-2c):同 aux = [ty, m, n];几何 = {x=4,y=32,nwarps=4}
+        "gguf.mmq" => gguf::mmq(
+            crate::family::gguf::GgmlTy::from_code(ax(0) as u32)
+                .unwrap_or_else(|| panic!("driver::resolve(\"gguf.mmq\"): 未知 ggml 型码 {}", ax(0))),
+            ax(1),
+            ax(2),
+        ),
         // aux = [rows, k_padded](网格从它们算;与 gemm 的 aux = [ty, m, n] 区分)
         // 两个 op_id 各一档:输出恒 U8 ⇒ `dt` 载不了输入档(与 QuantInt8Row* 同律)
         "gguf.quant_act_f16" => gguf::quant_act(DType::F16, ax(0), ax(1)),
@@ -547,6 +554,20 @@ pub mod gguf {
                 other.name(),
                 fam::PORTED
             ),
+        }
+    }
+
+    /// **官方 MMQ**(W-2c;tensor-core prefill):`grid = (ceil(n/32), ceil(m/4))`,
+    /// `block = (32, 4)`,`smem = 0`(tile 为静态 `__shared__`)。
+    pub fn mmq(ty: GgmlTy, m: usize, n: usize) -> KernelPick {
+        let (grid, block) = fam::mmq_geom(ty, m, n);
+        let shape = Shape { grid, block, smem: 0 };
+        match ty {
+            GgmlTy::Q8_0 => KernelPick::of::<crate::ops::gguf::GgufMmqQ8_0>(shape),
+            GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufMmqQ4K>(shape),
+            GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufMmqQ5K>(shape),
+            GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufMmqQ6K>(shape),
+            other => panic!("owl_gguf_mmq: {} 未移植(MMQ 集 = Q4_K/Q5_K/Q6_K/Q8_0)", other.name()),
         }
     }
 

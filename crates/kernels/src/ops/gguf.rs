@@ -69,6 +69,48 @@ gguf_gemm_spec!(GgufGemmQ4K, crate::family::gguf::GEMM_Q4K);
 gguf_gemm_spec!(GgufGemmQ5K, crate::family::gguf::GEMM_Q5K);
 gguf_gemm_spec!(GgufGemmQ6K, crate::family::gguf::GEMM_Q6K);
 
+// ---- **官方 MMQ**(W-2c;tensor-core prefill)———————————————
+//
+// 槽序 = 适配 TU `gguf_mmq.cu` 的形参序(6 参:3 张量 + 3 标量);几何由
+// `family::gguf::mmq_geom` 按上游 ampere 档 `{x=4, y=32, nwarps=4}` 算。
+
+/// `owl_gguf_mmq_q8_0`(llama.cpp `mul_mat_q<Q8_0>`)
+pub struct GgufMmqQ8_0;
+/// 同上(Q4_K)
+pub struct GgufMmqQ4K;
+/// 同上(Q5_K)
+pub struct GgufMmqQ5K;
+/// 同上(Q6_K)
+pub struct GgufMmqQ6K;
+
+const MMQ_PARAMS: &[Param] = &[
+    Param::t_in("weights", Dtype::U8, 2),
+    // 激活 q8_1(36B 块;**上游同代布局**,本仓 `GgufQuantAct*` 已产)
+    Param::t_in("xq", Dtype::U8, 2),
+    Param::t_out("out", Dtype::F16, 2),
+    Param::i32("k"),
+    Param::i32("n"),
+    Param::i32("m"),
+];
+
+macro_rules! gguf_mmq_spec {
+    ($t:ty, $entry:expr) => {
+        impl KernelSpec for $t {
+            const ENTRY: &'static str = $entry;
+            const SRC: &'static str = crate::family::gguf::MMQ_SRC;
+            const PARAMS: &'static [Param] = MMQ_PARAMS;
+            const LAWS: &'static [Law] = &[Law::OutputFinite];
+            const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+            const DETERMINISM: Determinism = Determinism::Deterministic;
+        }
+    };
+}
+
+gguf_mmq_spec!(GgufMmqQ8_0, crate::family::gguf::MMQ_Q8_0);
+gguf_mmq_spec!(GgufMmqQ4K, crate::family::gguf::MMQ_Q4K);
+gguf_mmq_spec!(GgufMmqQ5K, crate::family::gguf::MMQ_Q5K);
+gguf_mmq_spec!(GgufMmqQ6K, crate::family::gguf::MMQ_Q6K);
+
 // ---- **smem 复用臂(W-2b;prefill 的算术杠杆)** ————————————————
 //
 // 与 MMVQ/复用臂**不同槽序**:本臂吃**原始 f16 激活**(不经 q8_1)——
@@ -292,6 +334,12 @@ pub static TILE_Q4K: KernelMeta = meta_of::<GgufTileQ4K>();
 pub static TILE_Q5K: KernelMeta = meta_of::<GgufTileQ5K>();
 pub static TILE_Q6K: KernelMeta = meta_of::<GgufTileQ6K>();
 
+// ---- MMQ 的元数据表项 ----
+pub static MMQ_Q8_0: KernelMeta = meta_of::<GgufMmqQ8_0>();
+pub static MMQ_Q4K: KernelMeta = meta_of::<GgufMmqQ4K>();
+pub static MMQ_Q5K: KernelMeta = meta_of::<GgufMmqQ5K>();
+pub static MMQ_Q6K: KernelMeta = meta_of::<GgufMmqQ6K>();
+
 // ---- smem 复用臂的元数据表项 ----
 pub static SMEM_Q8_0: KernelMeta = meta_of::<GgufSmemQ8_0>();
 pub static SMEM_Q4K: KernelMeta = meta_of::<GgufSmemQ4K>();
@@ -311,6 +359,10 @@ pub static METAS: &[&KernelMeta] = &[
     &SMEM_Q4K,
     &SMEM_Q5K,
     &SMEM_Q6K,
+    &MMQ_Q8_0,
+    &MMQ_Q4K,
+    &MMQ_Q5K,
+    &MMQ_Q6K,
     &QUANT_ACT_F16,
     &QUANT_ACT_BF16,
     &QUANT_ACT_F16_TILED,

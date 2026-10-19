@@ -10,7 +10,7 @@ typedef float (*vec_dot_q_mul_mat_cuda_t)(
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ms, const int & i, const int & j, const int & k);
 typedef void (*dot_kernel_k_t)(const void * __restrict__ vx, const int ib, const int iqs, const float * __restrict__ y, float & v);
 typedef void (mul_mat_q_t)(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst);
 
 struct mmq_arch_config_t {
@@ -1075,7 +1075,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_mul_mat(
 template <int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
               allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
 static __device__ __forceinline__ void mul_mat_q(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
     const block_q_t  * x = (const block_q_t  *) vx;
@@ -1177,7 +1177,7 @@ static __device__ __forceinline__ void mul_mat_q(
                 continue;
             }
 
-            dst[col_dst*nrows_dst + row_dst] = sum[i/WARP_SIZE][j/nwarps];
+            dst[col_dst*nrows_dst + row_dst] = __float2half(sum[i/WARP_SIZE][j/nwarps]);
         }
     }
 }
@@ -1210,7 +1210,7 @@ template <bool need_check> static __global__ void
 #endif // defined(RDNA3) || defined(RDNA2)
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
     mul_mat_q4_0(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1235,7 +1235,7 @@ template <bool need_check> static __global__ void
     __launch_bounds__(WARP_SIZE*MMQ_CONFIG_Q4_1.pascal.nwarps, 2)
 #endif // __CUDA_ARCH__ < CC_VOLTA
     mul_mat_q4_1(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1258,7 +1258,7 @@ template <bool need_check> static __global__ void
 #endif // defined(RDNA3) || defined(RDNA2)
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
     mul_mat_q5_0(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1281,7 +1281,7 @@ template <bool need_check> static __global__ void
 #endif // defined(RDNA3) || defined(RDNA2)
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 mul_mat_q5_1(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1304,7 +1304,7 @@ template <bool need_check> static __global__ void
 #endif // defined(RDNA3) || defined(RDNA2)
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
     mul_mat_q8_0(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1327,7 +1327,7 @@ template <bool need_check> static __global__ void
 #endif // defined(RDNA3) || defined(RDNA2)
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 mul_mat_q2_K(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1352,7 +1352,7 @@ template <bool need_check> static __global__ void
     __launch_bounds__(WARP_SIZE*MMQ_CONFIG_Q3_K.pascal.nwarps, 2)
 #endif // __CUDA_ARCH__ < CC_VOLTA
     mul_mat_q3_K(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1377,7 +1377,7 @@ template <bool need_check> static __global__ void
     __launch_bounds__(WARP_SIZE*MMQ_CONFIG_Q4_K.pascal.nwarps, 2)
 #endif // __CUDA_ARCH__ < CC_VOLTA
     mul_mat_q4_K(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1400,7 +1400,7 @@ template <bool need_check> static __global__ void
 #endif // defined(RDNA3) || defined(RDNA2)
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 mul_mat_q5_K(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1425,7 +1425,7 @@ template <bool need_check> static __global__ void
     __launch_bounds__(WARP_SIZE*MMQ_CONFIG_Q4_K.pascal.nwarps, 2)
 #endif // __CUDA_ARCH__ < CC_VOLTA
     mul_mat_q6_K(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, __half * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
 
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1455,7 +1455,7 @@ template <bool need_check> static __global__ void
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-    const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
+    const char * src1_ddq_i, __half * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream) {
 
     const int64_t ne00 = src0->ne[0];

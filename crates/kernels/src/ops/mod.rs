@@ -388,6 +388,11 @@ pub const PROD_GGUF4B_2026_10_19: &[&str] = &[
     "owl_gguf_gemm_smem_q5k",
     "owl_gguf_gemm_smem_q6k",
     "owl_gguf_gemm_smem_q8_0",
+    // **官方 MMQ**(W-2c;`m >= 32` 的 GEMM 走这里)
+    "owl_gguf_mmq_q4k",
+    "owl_gguf_mmq_q5k",
+    "owl_gguf_mmq_q6k",
+    "owl_gguf_mmq_q8_0",
     "owl_gguf_quant_act_f16",
     "owl_gguf_quant_act_f16_tiled",
     "owl_narrow_strided_f16",

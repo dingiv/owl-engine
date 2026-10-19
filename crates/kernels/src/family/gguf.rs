@@ -294,6 +294,63 @@ pub const QUANT_ACT_F16_TILED: &str = "owl_gguf_quant_act_f16_tiled";
 /// 同上,bf16 入
 pub const QUANT_ACT_BF16_TILED: &str = "owl_gguf_quant_act_bf16_tiled";
 
+// ---- **官方 MMQ**(W-2c;tensor-core prefill)--------------------------------
+/// `owl_gguf_mmq_q8_0`(= llama.cpp `mul_mat_q<Q8_0>` 的 C 入口;见 `vendor/README.md`)
+pub const MMQ_Q8_0: &str = "owl_gguf_mmq_q8_0";
+/// 同上(Q4_K)
+pub const MMQ_Q4K: &str = "owl_gguf_mmq_q4k";
+/// 同上(Q5_K)
+pub const MMQ_Q5K: &str = "owl_gguf_mmq_q5k";
+/// 同上(Q6_K)
+pub const MMQ_Q6K: &str = "owl_gguf_mmq_q6k";
+/// MMQ 适配 TU 的资产 id(内核本体 = `vendor/mmq.cu`)
+pub const MMQ_SRC: &str = "cu/gguf/gguf_mmq.cu";
+
+/// MMQ 的 tile 档(**与 `vendor/common.cuh` 的 `OWL_MMQ_TENSOR_CORES` 互锁**;
+/// 改一处必须改另一处 —— 网格与核内 tile 错位 = 静默错值,由数值门兜底)。
+///
+/// | 档 | Q8_0 | Q4_K/Q5_K | Q6_K | 备注 |
+/// |---|---|---|---|---|
+/// | **dp4a(本仓默认)** | {128,64,4} | {64,128,4} | {64,64,4} | 64-128 token/权重读 |
+/// | 张量核 | {4,32,4} | {4,32,4} | {4,32,4} | 4 token/权重读 ⇒ 带宽墙 |
+///
+/// 实测(3090 Ti,27B,1001 tok):dp4a 档明显更快(见设计 §18.6)。
+pub const MMQ_TENSOR_CORES: bool = false;
+
+/// 型 → (mmq_x = 每 CTA token 数, mmq_y = 每 CTA 权重行数, nwarps)
+pub const fn mmq_tile(ty: GgmlTy) -> (usize, usize, usize) {
+    if MMQ_TENSOR_CORES {
+        return (4, 32, 4);
+    }
+    match ty {
+        GgmlTy::Q8_0 => (128, 64, 4),
+        GgmlTy::Q4K | GgmlTy::Q5K => (64, 128, 4),
+        GgmlTy::Q6K => (64, 64, 4),
+        _ => (64, 64, 4),
+    }
+}
+
+/// 型 → MMQ 入口名(`None` = 未移植/未 vendoring)
+pub const fn mmq_entry_for(ty: GgmlTy) -> Option<&'static str> {
+    match ty {
+        GgmlTy::Q8_0 => Some(MMQ_Q8_0),
+        GgmlTy::Q4K => Some(MMQ_Q4K),
+        GgmlTy::Q5K => Some(MMQ_Q5K),
+        GgmlTy::Q6K => Some(MMQ_Q6K),
+        _ => None,
+    }
+}
+
+/// **MMQ 发射几何**(唯一产地;与 `vendor/mmq.cu` 的 `arch_config` 同一契约):
+/// `grid = (ceil(n / MMQ_Y), ceil(m / MMQ_X))`,`block = (32, MMQ_NW)`,`smem = 0`
+/// (tile 全是 `__shared__` 静态数组)。
+pub fn mmq_geom(ty: GgmlTy, m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
+    let (x, y, nw) = mmq_tile(ty);
+    let gx = n.div_ceil(y).max(1) as u32; // 权重行方向(grid.x)
+    let gy = m.div_ceil(x).max(1) as u32; // token 方向(grid.y,按 x 分窗)
+    ((gx, gy, 1), (32, nw as u32, 1))
+}
+
 // ---- **smem 复用臂**(W-2b;prefill 的算术杠杆)------------------------------
 /// `owl_gguf_gemm_smem_q8_0`
 pub const GEMM_SMEM_Q8_0: &str = "owl_gguf_gemm_smem_q8_0";

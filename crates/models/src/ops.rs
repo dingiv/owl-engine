@@ -216,6 +216,9 @@ pub enum SemanticKernel {
     /// **GGUF smem 复用 GEMM**(prefill 的算术杠杆;W-2b):权重窗解量化进 smem
     /// **每窗一次**,激活直吃 f16(不经 q8_1),寄存器 4×4 分块点积
     GgufGemmSmem,
+    /// **GGUF 官方 MMQ**(tensor-core prefill;内核 = llama.cpp vendoring)。
+    /// 与 smem/vec_dot 臂同槽序?**不**:MMQ 只吃 (weights, xq, out, k, n, m)。
+    GgufMmq,
     /// **GGUF 量化表的行解量化**(查表臂;`token_embd` 在 GGUF 里是量化块,
     /// 既不是 f16 表也不可解量化驻留 ⇒ 查表自带解量化;块型住 `aux[0]`,几何 = `rows_geom`)
     GgufDequantRows,
@@ -329,6 +332,7 @@ impl SemanticKernel {
             SemanticKernel::GgufGemm => "gguf.gemm",
             SemanticKernel::GgufGemmTile => "gguf.gemm_tile",
             SemanticKernel::GgufGemmSmem => "gguf.gemm_smem",
+            SemanticKernel::GgufMmq => "gguf.mmq",
             SemanticKernel::GgufDequantRows => "gguf.dequant_rows",
             SemanticKernel::GgufQuantActTiledF16 => "gguf.quant_act_f16_tiled",
             SemanticKernel::GgufQuantActTiledBf16 => "gguf.quant_act_bf16_tiled",

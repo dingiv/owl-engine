@@ -41,6 +41,18 @@ fn gguf_tile_arm_enabled() -> bool {
     !matches!(std::env::var("OWL_GGUF_TILE").as_deref(), Ok("0"))
 }
 
+/// **官方 MMQ 的最小 token 数**(W-2c)。
+///
+/// 上游的批分界:MMVQ 用于小批、MMQ 用于大批(`MMVQ_MAX_BATCH_SIZE = 8`)。
+/// 本仓取 32:tile 是 `x=4, y=32`(每 CTA 4 个 token),`m = 32` 时 m 方向 8 个
+/// CTA、每 CTA 打满 4 token —— 再小就退化成"小批走大 tile",不如 MMVQ。
+pub(crate) const GGUF_MMQ_MIN_M: usize = 32;
+
+/// MMQ 臂开关(诊断/对拍;缺省开)。`OWL_GGUF_MMQ=0` ⇒ 回退 smem/vec_dot 臂。
+fn gguf_mmq_arm_enabled() -> bool {
+    !matches!(std::env::var("OWL_GGUF_MMQ").as_deref(), Ok("0"))
+}
+
 /// **smem 复用臂的最小 token 数**(W-2b)。窗 = `MT = 64`,故 `m ≥ 64` 才吃满;
 /// 8..63 仍是 vec_dot 复用臂(1.65×),decode/verify 仍 MMVQ。
 pub(crate) const GGUF_SMEM_MIN_M: usize = 64;
@@ -67,6 +79,45 @@ pub(crate) fn gguf_quant_gemm(
     }
     let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
     let k = in_dim;
+    // **官方 MMQ**(W-2c;tensor-core prefill):llama.cpp 的 `mul_mat_q`。
+    // 适用门(缺一即回退到下一臂,不静默):
+    // 1. `m ≥ GGUF_MMQ_MIN_M`(小批让位给 MMVQ —— 上游同款分界思想);
+    // 2. `k % 32 == 0`(q8_1 块轴;GGUF 计划面已保证);
+    // 3. **无内维列序表**(MMQ 不做 tiled 置换 ⇒ 单卡 `ssm_out` 走 smem 臂)。
+    if m >= GGUF_MMQ_MIN_M
+        && k % 32 == 0
+        && col_index.is_none()
+        && gguf_mmq_arm_enabled()
+        && owl_kernels::family::gguf::mmq_entry_for(ty).is_some()
+    {
+        let m_us = m;
+        let xq_row = k / 32 * crate::formats::gguf::Q8_1_BLOCK_BYTES;
+        let act = match xs.dtype {
+            Dtype::F16 => SemanticKernel::GgufQuantActF16,
+            Dtype::BF16 => SemanticKernel::GgufQuantActBf16,
+            other => {
+                return TensorOps::poisoned(
+                    Dtype::F16,
+                    vec![m, out_dim],
+                    format!("GGUF MMQ: 激活 dtype {other:?} 无对应量化臂(需 F16/BF16)"),
+                )
+            }
+        };
+        let xq = TensorOps::call(act)
+            .arg(xs)
+            .arg_i32(k as i32)
+            .arg_i32(k as i32)
+            .aux(&[m, k])
+            .with_shape(Dtype::U8, vec![m_us, xq_row]);
+        return TensorOps::call(SemanticKernel::GgufMmq)
+            .arg(&w.decl())
+            .arg(&xq)
+            .arg_i32(k as i32)
+            .arg_i32(out_dim as i32)
+            .arg_i32(m_us as i32)
+            .aux(&[ty.code() as usize, m_us, out_dim])
+            .with_shape(Dtype::F16, vec![m_us, out_dim]);
+    }
     // **smem 复用臂**(W-2b;prefill 的算术杠杆):权重窗解量化进 smem **每窗一次**,
     // 激活直吃 f16(不再 q8_1),寄存器 4×4 分块点积 —— 少一发核且更准。
     //

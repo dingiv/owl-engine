@@ -29,6 +29,22 @@
 #ifndef GGML_PAD
 #define GGML_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
 #endif
+// 上游默认开张量核(`GGML_CUDA_FORCE_MMQ` 才关)—— 本仓同样默认开:
+// 开 ⇒ ampere 档配置 = {x=4, y=32, nwarps=4}(mma 小 tile);
+// 关 ⇒ {x=64/128, y=64/128, nwarps=4..8}(dp4a 大 tile)。
+// ⚠️ 本仓 2026-10-19 实测(4B/27B,3090 Ti):
+//   张量核档 ampere 配置 = `{x=4, y=32}`(每 CTA 只吃 4 个 token)⇒ 权重被重读
+//   `m/4` 次 ⇒ prefill 反而**受权重带宽**限制(27B ≈ 117 t/s);
+//   dp4a 档 = `{x=64/128, y=64/128}`(64-128 token/权重读)⇒ 权重复用高 16-32×,
+//   代价是点积走 int8 dp4a。本仓默认走 **dp4a 档**(`OWL_MMQ_TENSOR_CORES=1`
+//   可切回张量核档;切换必须同时改 `family::gguf::MMQ_CFG`,两边由数值门互锁)。
+#ifndef OWL_MMQ_TENSOR_CORES
+#define GGML_CUDA_FORCE_MMQ
+#endif
+#ifndef GGML_CUDA_FORCE_MMQ
+#define CUDA_USE_TENSOR_CORES
+#endif
+
 // 上游:非 DP4A 代际的"无设备代码"哨兵(只用于 CPU/老架构分支的编译期占位)
 #define NO_DEVICE_CODE
 #define NO_DEVICE_CODE_DEFINED
