@@ -163,6 +163,52 @@ fn symbols_of(text: &str) -> Vec<String> {
 /// 闭包),**改任何一个 Rust 文件都会重跑 build.rs** ⇒ 没有本闸的话每次 Rust
 /// 编辑都要把 20 个 `.cu` 重编一遍(实测数十秒)。指纹 = 源 mtime+长度 +
 /// 架构集 + 额外编译选项;任一变 ⇒ 重编。
+/// **头文件依赖**(2026-10-19 定谳):fatbin 指纹原先只看 `.cu` 本身 ⇒ 改
+/// `#include` 进来的头(如 `cu/gguf/vendor/common.cuh`)**不触发重编**,
+/// 现场表现为"改了开关但核行为没变"(MMQ 张量核↔dp4a 切换时踩到:几何在 Rust
+/// 侧变了、cubin 还是旧的 ⇒ 数值门给 1.0)。
+///
+/// 规则:凡 `.cu` 文本里出现 `#include "vendor/`(vendored 第三方树),
+/// 就把该目录下**所有文件**的(相对路径, 长度, mtime)混进指纹。
+fn vendor_stamp(src: &std::path::Path) -> String {
+    let Ok(text) = std::fs::read_to_string(src) else { return String::new() };
+    if !text.contains("#include \"vendor/") {
+        return String::new();
+    }
+    let dir = src.parent().map(|p| p.join("vendor")).unwrap_or_default();
+    let mut out = String::from(" vendor=");
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![dir];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    for p in files {
+        let md = std::fs::metadata(&p).expect("stat vendor 文件");
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "{}:{}:{};",
+            p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+            md.len(),
+            mtime
+        ));
+    }
+    out
+}
+
 fn fingerprint(src: &std::path::Path, archs: &[String], extra: &[&str]) -> String {
     let md = std::fs::metadata(src).expect("stat .cu");
     let mtime = md
@@ -172,12 +218,13 @@ fn fingerprint(src: &std::path::Path, archs: &[String], extra: &[&str]) -> Strin
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!(
-        "src={} len={} mtime={} archs={} flags={}",
+        "src={} len={} mtime={} archs={} flags={}{}",
         src.display(),
         md.len(),
         mtime,
         archs.join(","),
-        extra.join(" ")
+        extra.join(" "),
+        vendor_stamp(src)
     )
 }
 
