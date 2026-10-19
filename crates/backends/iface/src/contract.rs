@@ -237,6 +237,10 @@ pub struct BlockLedgerRow {
     pub addr: u64,
     /// 所属账本(actor 序号)
     pub ledger: u32,
+    /// **分配点点名**(服务端账房自带的 `BlockEntry.name`;2026-10-20 加入)。
+    /// 用途:对账时直接看"这些**不在账本里**的块是谁分配的"(§79 的追查面)——
+    /// 没有它,`recon.only_block` 只能给 id,还得再拼发射账。
+    pub name: String,
 }
 
 /// **复合命令 `UploadAndLaunch` 的一块搬运**(字节口径;租约所有权随命令
@@ -661,6 +665,15 @@ pub trait DeviceClient: Send {
     /// 跳过(幂等)。默认 = 无操作(无块账房的后端,如 CPU 面)。
     fn free(&mut self, _ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move { Ok(()) }
+    }
+
+    /// **结清口径的归还**(N4 兜底;2026-10-20):调用方已把**借出登记结清**
+    /// (store `drain_owner`:删登记 + 出三层账 + 摘池索引),这里只把块**真还驱动**
+    /// —— 不再查池、不再补 `FreeEvent`(否则账本会记"幽灵归还")。
+    ///
+    /// 缺省 = 与 [`DeviceClient::free`] 同(无账本的后端没有"结清"这回事)。
+    fn free_settled(&mut self, ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
+        self.free(ids)
     }
 
     /// f32 直传(流式装载,2026-09-26):owned Vec<f32> **所有权移入**

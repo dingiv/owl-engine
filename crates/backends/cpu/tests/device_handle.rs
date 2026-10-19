@@ -86,7 +86,7 @@ impl AllocLedger for RecLedgerProxy {
         g.pool.push((bytes, id));
         Vec::new()
     }
-    fn pool_drain(&mut self) -> Vec<u64> {
+    fn pool_drain(&mut self, _rank: u8) -> Vec<u64> {
         std::mem::take(&mut lock(&self.0).pool).into_iter().map(|(_, id)| id).collect()
     }
 }

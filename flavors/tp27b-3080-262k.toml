@@ -23,8 +23,9 @@
 #   · `prefill_chunk = 512`(**长 ctx 专用**):chunk 1024 的单 turn 瞬态账
 #     实测 6 GiB(rank0),512 降到 ~3.5 GiB,256 只 ~1.8 GiB 但 prefill −9%
 #     (4k 档实测 1523 vs 1597 t/s)⇒ 长 ctx 取 512。
-#   · **不启用** `prefill_split`:本机 TP2 + 长 ctx 下实测**首请求挂死**(>180s 无 chunk);
-#     关掉后同档立即正常 ⇒ 保持 false(重开需先查 FI split 的 TP 分片)。
+#   · `prefill_split` **保持 false**(存疑,不是已定谳):常驻 16k 档下实测**正常**
+#     (4k prompt:prefill 1517 t/s、decode 52.7);一次挂死(>180s 无 chunk)观测在
+#     **262k + kvmem 虚拟化**组合上,原因未定 ⇒ 本档(虚拟化)保守关,待 §78 P4 复现。
 #   · **不启用** `gdn_chunked`:AOT cubin 按 NV=48 烘死,TP2 的分片 NV=24 未重编
 #     (§68 判定)⇒ 走 `gdn_recurrence_varlen_gqa`(§68 重写版,1.08 µs/tok)。
 #
@@ -41,7 +42,7 @@
 # 实测读数(本档,3080 对):boot 装配 24.5 s;**boot 后 free 5458 / 5473 MiB(两卡对称)**;
 #   1058 tok turn:decode **45.1 t/s**(虚拟化召回每步的税 ≈ 13%,对比纯常驻档 51.9);
 #   4k turn(chunk 512、冷):prefill **1523 t/s**、decode **44.7 t/s**;
-#   **第二个长 turn 必失败**(见上 🔴)。
+#   **第二个长 turn 必失败**(见上 🔴;根因 = §78 P1 的瞬态账不归还)。
 #
 # ── 若不需要长 ctx:纯常驻档(推荐今天就用这个)────────────────────────
 #   把下面三处改掉即可(无召回、无宿主腿 ⇒ decode ~51.9 t/s、4k turn 可反复若干次):

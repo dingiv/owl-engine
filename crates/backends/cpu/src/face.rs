@@ -840,6 +840,7 @@ impl DeviceClient for CpuFace {
             .declared
             .iter()
             .map(|(id, (_dtype, bytes))| BlockLedgerRow {
+                name: String::new(),
                 id: *id,
                 bytes: *bytes,
                 addr: 0x1000_0000u64 + id * 0x1_0000,

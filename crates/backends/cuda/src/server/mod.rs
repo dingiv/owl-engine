@@ -1507,29 +1507,37 @@ impl GpuServer {
     /// 所需数据(dtoh 回执即 COMPUTE 排空);图捕获期由 G2 拒绝臂拦截。
     fn handle_free(&mut self, ids: Vec<u64>, ack: Ack<Result<(), ModelError>>) {
         let t0 = std::time::Instant::now();
+        // **硬拒在前**:跨账本 / 未知 id 一律 Err(不改账、不清零账;显式失败给调用方)
+        let freed = match self.ctx_mut().free_blocks(&ids) {
+            Ok(n) => n,
+            Err(e) => {
+                ack.send(Err(e));
+                return;
+            }
+        };
         // 清零账同批清掉(id 复用后误等陈旧事件 = 白等;见 `clear_zeroing` 注)
         self.ctx_mut().clear_zeroing(&ids);
-        let freed = self.ctx_mut().free_blocks(&ids);
         self.sink.timer("srv.seg.free", t0.elapsed());
         self.sink.count("srv.count.free_blocks", freed as u64);
-        if self.probes.debug {
-            // 常规路径 **DEBUG**(每 chunk 一次,不该占 WARN);只有账目不平
-            // (freed ≠ 请求数 = 真异常)才升 WARN —— 2026-10-19 pi 真机实测:
-            // WARN 档下一次会话刷 49920 行,把真信号淹了
-            if freed == ids.len() {
+        // **free 必须找到自己的块**(C 纪律:每个 malloc 都要有对应 free)。
+        // 常态 = DEBUG;`freed ≠ 请求数` = **真异常**(双 free / 跨 server / 账目串了)
+        // ⇒ **无条件 WARN**(限流:首条 + 每 1024 条一次),并把差额入 metrics ——
+        // 2026-10-20 实测就靠它抓到"两 rank 共用一本账、把 rank1 的 id 丢给 rank0
+        // 的 server ⇒ 434/1010 块静默漏"(§79)。
+        if freed == ids.len() {
+            if self.probes.debug {
                 self.sink.logf(
                     owl_shared::log::LVL_DEBUG,
                     "owl-gpu",
                     format_args!("free: {}/{} 块归池", freed, ids.len()),
                 );
-            } else {
-                // 账目不平 = 真异常 ⇒ 升 WARN(响亮;不静默也不刷屏)
-                self.sink.logf(
-                    owl_shared::log::LVL_WARN,
-                    "owl-gpu",
-                    format_args!("free: {}/{} 块归池(**账目不平**)", freed, ids.len()),
-                );
             }
+        } else {
+            self.sink.logf(
+                owl_shared::log::LVL_WARN,
+                "owl-gpu",
+                format_args!("free: {}/{} 块归池(**账目不平**)", freed, ids.len()),
+            );
         }
         ack.send(Ok(()));
     }

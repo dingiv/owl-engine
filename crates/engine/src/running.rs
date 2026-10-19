@@ -923,6 +923,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             Node::TurnEnd(turn) => {
                 self.n4_pool_sweep(turn);
                 self.n4_report_unreturned(turn);
+                // **兜底释放**(2026-10-20;§78 P1):清点只报告、不处置 ⇒ 有调用点
+                // 漏 free 时每 turn 掉一截显存(4k prefill ≈ 1.6 GiB),长 ctx 撞
+                // `vram-hard-budget`。这里把 `Turn(t)` 名下"仍开着、不在池里"的块
+                // **强制归还驱动**(决策在 store `stale_of`,执行在句柄)。
+                self.n4_force_release(turn).await?;
                 Ok(())
             }
             // N5:会话关闭 —— 链已由会话表归还(store API),本节点只记账/归属复位
@@ -1202,6 +1207,73 @@ impl<D: DeviceClient> RunningEngine<D> {
             pooled.len(),
             detail.join(" ｜ ")
         );
+    }
+
+    /// **N4 兜底释放**(2026-10-20;§78 P1 的收口)。
+    ///
+    /// **为什么需要**:`n4_report_unreturned` 只**报告**不处置。实测 27B 4k prefill
+    /// 每 turn 有 ~1000 块挂在 `Turn(t)` 名下从不归还(名单 = 整层前向中间量)
+    /// ⇒ 第 2 个长 turn 就撞 `vram-hard-budget`(要 2 KiB 也发不出)。
+    ///
+    /// **分工**(与 N6 池排空同律):决策+结清在 store(`drain_owner`:删借出登记 +
+    /// 出三层账 + 摘池索引),执行在这里(`free_settled`:只发驱动 free,不补事件)。
+    ///
+    /// **纪律**:
+    /// - 释放前 WARN 已由 `n4_report_unreturned` 打过(**名字/字节** = 定位材料),
+    ///   这里补一条 INFO 的"已收口"账(不许因为兜住了就静默);
+    /// - 驱动 free 失败 = **上抛**(收尾路径会响亮留痕;账已在 store 结清,记得
+    ///   显存已经回不来了 —— 这是硬错,不是可重试的软错);
+    /// - 只碰 `Turn(t)` 归属 —— 图/池/会话各有归属,不会被误伤。
+    async fn n4_force_release(&mut self, turn: u64) -> Result<()> {
+        let owner = owl_iface::handle::Owner::Turn(turn);
+        // **逐 rank 分账**:两 rank 共用一本账,但块在**各自的 server** 块表里 ——
+        // 把 rank1 的 id 交给 rank0 的 server = 找不到 ⇒ 静默漏(实测 434/1010)。
+        let mut total = (0usize, 0usize);
+        for rank in 0..2u8 {
+            let (ids, bytes) = {
+                let cell = self.bank.rel.ledger_cell();
+                let mut b = owl_store::book_lock(&cell);
+                b.drain_owner(owner, Some(rank))
+            };
+            if ids.is_empty() {
+                continue;
+            }
+            let face = if rank == 0 {
+                Some(self.dev.graphs.session.face_mut())
+            } else {
+                self.peer.as_mut().map(|p| p.graphs.session.face_mut())
+            };
+            let Some(face) = face else {
+                // 单卡档不该有 rank1 的账;有 = 账目串了 ⇒ 响亮(不静默丢)
+                owl_shared::log_error!(
+                    "store",
+                    "N4 兜底释放:rank{rank} 有 {} 块待还,但本引擎**无 rank1 束** —— 账目串了",
+                    ids.len()
+                );
+                return Err(ModelError::Msg(format!(
+                    "N4 兜底释放:rank{rank} 无对应设备面(ids={})",
+                    ids.len()
+                )));
+            };
+            let n = ids.len();
+            face.free_settled(&ids).await?;
+            total.0 += n;
+            total.1 += bytes;
+        }
+        if total.0 == 0 {
+            return Ok(());
+        }
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.counter_add("store.turn_end.stale_blocks", total.0 as u64, file!(), line!());
+            m.counter_add("store.turn_end.stale_bytes", total.1 as u64, file!(), line!());
+        });
+        owl_shared::log_info!(
+            "store",
+            "N4 兜底释放:turn {turn} {} 块 / {} KiB 结清并归还驱动(逐 rank 归各自面)",
+            total.0,
+            total.1 / 1024
+        );
+        Ok(())
     }
 
     /// **store 报告面**(设计卷 §2.4 / §13.4 对账口):三层 + 两腿 +

@@ -602,6 +602,7 @@ fn head_name(h: super::HeadQuant) -> &'static str {
     match h {
         super::HeadQuant::Off => "off",
         super::HeadQuant::RtnInt4G32 => "rtn-int4-g32",
+        super::HeadQuant::RtnInt8Row => "rtn-int8-row",
     }
 }
 

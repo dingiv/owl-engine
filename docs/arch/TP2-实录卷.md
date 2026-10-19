@@ -5976,3 +5976,277 @@ TTFT/prefill 不变**符合结构**:prefill 也在**末行窄切后**调头(`for
 ⇒ 该档是**能力声明**(boot + 单长 turn 可用),不是已验收生产档;
 持续长 ctx 服务被待办 #7(失败/长 turn 的块必须归还 + 20G 卡的瞬态预算)堵住。
 同卷另附**纯常驻 16k 变体**改法(无召回 ⇒ ~51.9 t/s,今天可生产)。
+
+## 78. 问题清单与定位(2026-10-20)—— 长 ctx 的**真堵点**是"每 turn 的 prefill 瞬态账不归还"
+
+> 本轮把 §77 里"第二个长 turn 必失败"往下挖了一层:**不是池几何、不是 fp8、不是 chunk**,
+> 而是**每 turn 有几百到上千个设备块永不归还**。下面每条都给"证据 → 已排除 → 假设 →
+> 下一步量法",按优先级排。
+
+### 78.1 P1 🔴 **prefill 瞬态块不归还**(N4 未归还清单;长 ctx 的唯一硬堵点)
+
+**证据**(`tp27b` + `max_seq=16384`/`chunk=512`/常驻;每 turn 一次 `/debug/vram` + N4 行):
+
+| prompt | 泄漏块 | 泄漏字节 | 备注 |
+|---:|---:|---:|---|
+| 378 tok(1 chunk) | 31 | **12 MB** | 只有末块 ⇒ 末块路径**正常** |
+| 698 tok(2 chunks) | 53 | **27 MB** | 1 个中间块,也基本正常 |
+| 1338 tok(3 chunks) | **1497** | **973 MB** | ← **跳变** |
+| 2725 tok | 798 + 801 | 476 + 469 MB | |
+| 3657 tok(split on) | 1071 + 1209 | 337 + 376 MB | |
+| 3657 tok(split off) | 995 | **1583 MB** | |
+
+泄漏名单 = **整层前向的中间量**(1338 tok 那轮):
+`owl_gdn_conv_fwd_f16 ×319 / 261MB` · `owl_fused_add_rmsnorm_f16 ×54 / 196MB` ·
+`owl_narrow_strided_f16 ×186 / 186MB` · `owl_gdn_norm_act_f16 ×77 / 132MB` ·
+`owl_norm_rope_f16 ×84 / 56MB` · `owl_add_f16 ×12 / 43MB` · `owl_gdn_recurrence ×31 / 41MB` ·
+`marlin ×61 / 33MB` · `flashinfer_prefill_paged_f16 ×11 / 27MB` · `htod ×20` ·
+`vllm_reshape_and_cache_f16_knhd ×64 / 128 B` …(计数据 = **两 rank 共用一本账**,×2)
+
+**已排除**(逐条实测):
+1. **复用池**:`N4 池清点:… 池 25 块 / 256416 KiB` —— 池**卡在 256 MiB 上限**、命中 26828/未中
+   14378 ⇒ 淘汰(evicted)正常,**不是池囤货**;
+2. **末块路径**:`prefill_chunk` 末块把 `arena1/arena2/arena3/hb/hfb/blks[0]` 全 free(源码
+   1291–1298),378 tok 只漏 12 MB 与之一致;
+3. **中途活性回收**:`OWL_LIVE_DIAG=1` 实测 last chunk `新块 2862 / 真回收 2603`
+   (拒:pending 2192 / users 1344 / alias 0 / 非竞技场 0)⇒ 解释器回收**在工作**,
+   残余 ~259 块按设计由调用方 `face.free(&arena)` 收;
+4. **不是 fp8/池几何**:泄漏在 fp16 池 + 常驻档上同样发生(上表即 fp16 池)。
+
+**假设(按可能性排)**:
+1. **某条 eval 的 arena 被丢弃**(返回的 `candidates` 没人 free)—— 只要一处,就正好是
+   "整层中间量"这种面貌;候选点 = 逐 chunk 的 `eval_ops_multi_env`(plain,设计上不回收)
+   被某分支走到、或 `prefill_harvest`/`prefill_tail` 的 arena 生命周期;
+2. **块在 eval 之外分配**(表格/`htod`/KV 写暂存)且 owner 被标成 turn;
+3. free 之后 loan 未销(池化口径)—— 但 #1 已排除池,可能性最低。
+
+**下一步量法(1 小时内可定谳)**:在 `eval_ops_scoped_env` 返回处与 `face.free` 调用点各打
+一份 **id 清单**(env 门 `OWL_ARENA_DUMP`),N4 收尾时做**差集**:差集非空 ⇒ 假设 1 成立
+(直接指到调用点);差集为空而台账仍开 ⇒ 假设 3。
+
+### 78.2 P2 rank 不对称(**不是独立 bug**,但决定谁先撞顶)
+
+每个 turn **两 rank 泄漏近似对称**(4k:3.0 GiB vs 2.75 GiB),但 **rank0 起跑 free 低 ~2.5 GiB**
+(host 面/输出槽/会话账都在 rank0)⇒ 同一条件下 **rank0 先撞 `vram-hard-budget`**。
+修完 P1 自动消失;短期若要在 20G 上抢余量,可让 rank1 多担一点池(未做)。
+
+### 78.3 P3 失败 turn 的账泄漏 + **连环失败**
+
+任何一次 `vram-hard-budget` 拒发之后:
+- 该 turn 的块留在账上(`N4 未归还清单:turn N 名下仍有 845 块 / 1.5 GiB`);
+- **同进程后续请求继续失败**(实测:4096 失败后连 1024 也连红;要求 2 KiB 也发不出)。
+
+⇒ 失败路径必须**抽干该 turn 的 arena**(与 78.1 同源,但**可独立先修**:失败收尾也 drain)。
+
+### 78.4 P4 `prefill_split` × 262k/虚拟化:**一次挂死,未定谳**
+
+- **常驻 16k 档**:`prefill_split = true` 实测**正常**(4k prompt,prefill 1517 t/s / decode 52.7);
+- **262k + `[kvmem]` 虚拟化档**:同一开关下**首请求挂死**(>180 s 无 chunk),关掉即正常。
+⇒ 目前只能记"组合相关";`tp27b-3080-262k` 保守关。复现后再查 FI split 的 TP 分片
+(nparts 与半表 stride 的相互作用)。
+
+### 78.5 P5 进程偶发停不掉(1/3)
+
+- 3 次 SIGTERM:2 次干净退出(释放卡锁 + exit 0),1 次**打印退出后仍活**(RSS 4.1 GB),
+  需 `kill -9`。⇒ teardown 里可能有一个不返回的 join/阻塞 recv(疑点在 turn 中或
+  `PoolExhausted` 之后)。判据:退出日志后 15 s 仍在 ⇒ `ps` 抓 `wchan`/线程名。
+
+### 78.6 P6(测量面,已量化)**std 绝对数比真 ITL 悲观 ~5%**
+
+同 boot 同长度:自写流式客户端 **52.9 t/s** vs `llm_speedtest` **50.14 t/s**。
+A/B 同口径可比;但**不许**把 std 的绝对数直接与 nsys 设备账相减(§76.6 的"15% 幽灵"来源)。
+
+### 78.7 优先级与判据
+
+| # | 任务 | 判据 | 量级 |
+|---|---|---|---|
+| 1 | **P1**:定位并修"arena 不归还" | 连做 4 个 4k turn,`free` 每轮降幅 ≤ 50 MiB;`/debug/vram` 的 turn 维不爬坡 | 长 ctx 的总闸 |
+| 2 | **P3**:失败路径 drain | 故意超预算 → 同一进程下一次正常请求**成功** | 半刀 |
+| 3 | **P5**:teardown 阻塞点 | 5/5 次 SIGTERM 在 15 s 内退 | 小 |
+| 4 | **P4**:split × 虚拟化 repro | 能复现 + 定位到 nparts/stride | 中 |
+| 5 | 之后:262k 档复测 + std 五点三轮 | 262k 连续 3 个 4k turn 通过 | — |
+
+## 79. 显存泄漏定位(二):**设备块有一大批不在账上**(recon.only_block)+ N4 兜底释放钩子落地
+
+> 承接 §78。§78 量到"每 turn 漏 ~1000 块",本轮先按用户裁决**同步主干**
+> (`ce647b4`;合批 decode / config 模块化 / GGUF)再动刀,并把"账内那部分"用
+> **store 钩子**收口;同时发现**更大的那部分根本不在账上**。
+
+### 79.1 已落地:**N4 兜底释放**(store 决策 + 句柄执行,与 N6 池排空同分工)
+
+| 件 | 位置 | 语义 |
+|---|---|---|
+| `LedgerBook::drain_owner(owner) -> (ids, bytes)` | `crates/store/src/tier.rs` | **唯一 store 钩子**:把该归属名下**仍开着**的块整批结清(删借出登记 + 出三层账 + **摘池索引**,池内块也算 —— 池成员 = 无活持有者,归还安全) |
+| `DeviceClient::free_settled(ids)` | `crates/backends/iface/src/contract.rs`(默认=`free`) | **结清口径**的归还:只发驱动 free,**不补 FreeEvent**(账已结清,补了就成"幽灵归还") |
+| `DeviceHandle::free_settled` | `handle.rs` | 覆盖:只 `inner.free` + `untrack` |
+| `RunningEngine::n4_force_release` | `running.rs`(`Node::TurnEnd`) | 报告(WARN 名字/字节)→ drain → free_settled → INFO "结清并归还驱动" + metrics `store.turn_end.stale_{blocks,bytes}` |
+
+**实测(3080 对,`tp27b` + `max_seq=16384`/chunk 512;4k prompt)**:
+
+| | 修前 | 修后 |
+|---|---|---|
+| 账内(`/debug/vram` 的 `gpu_used` 每 turn) | +0.92 GiB | **+0.26 GiB**(= 复用池上限 256 MiB,设计如此) |
+| N4 结清 | — | turn1 **1073 块 / 344 MB**;turn2 **1128 / 363 MB**(逐轮结清) |
+| 门 | — | 0.8B `tp_g8_gate`(融合档,L1 **逐位 0 项不同**)+ `tp_assemble_gate` 全绿 |
+
+### 79.2 🆕 更大的那部分:**设备块不在账上**(`recon.only_block`)
+
+`/debug/vram` 的 `recon` 面 = 设备块表 vs 账本事件的**对账**。同一台机、一个 4k turn:
+
+| 面 | 修前一轮 | 说明 |
+|---|---:|---|
+| rank0 `dev_blocks` | 2666 → **3675**(+1009) | 设备块表增长 |
+| rank0 `ledger_events` | 2646 → **2648**(+2) | 账本几乎没动 |
+| **`only_block`** | 20 → **1027** | **设备有、账本没有** |
+| rank1 | dev +1656 / `only_block` **1623** | 同型 |
+| `events.hook_fail` | 0 → **5324** | 引擎在 free 账本里不存在的 id("双次入池"/"幽灵归还") |
+
+⇒ **驱动 free 每 turn 掉 ~3.7 GiB,其中 ~2.7 GiB 账本根本看不见** —— 这正是
+"`drain_owner` 已把账内部分收干净、但第二个长 turn 仍会撞顶"的原因。
+尺寸分布(能取到的 32 个样本):`64 B / 96 B / 48 B / 16 B / 2 KiB / 4 KiB / 8 KiB /
+16 KiB / 64 KiB` ⇒ 不像 eval 的中间量(那些是 MB 级),更像**每发的标量/叶子暂存**
+(eval 的 `from_host` 叶 / `arg_*` 标量上传)—— 即**不经 `DeviceHandle` 的分配路径**。
+
+**下一步(定位到源码行)**:在 `DeviceHandle::exec` 里给 `Command::Alloc*/Htod`
+之外的**回程块**加一条"未入账即响亮"的判据(或 `has_loan(id)` 探针),跑一个 chunk,
+就能抓到"谁分配的";修法 = 该路径改走句柄(或由服务端把分配数上报给账本)。
+随后 N4 的 `drain_owner` 会自动把它们一起收掉。
+
+### 79.3 ✅ 结案:根因 = **free 没找到自己的块**(池跨 rank 顶出 + 兜底未分账)
+
+> 用户定调(2026-10-20):"两层复用要分清 —— server 层按块复用有算法;算子内部的分配要么
+> 用 Rust RAII 包一块自释放,要么记名交给 store;C 纪律:**每个 malloc 必须找到它的 free**。
+> 现在的问题就是 turn 期间分配的显存,收尾那里没释放。"
+> 顺着这条往下查,1 小时定位、1 处修复:
+
+**证据链(全部来自本轮新增的探针,不再靠猜)**
+
+1. `free: 576/1010 块归池(**账目不平**)` —— 服务器只认得 576/1010 个 id;
+2. 两 rank **共用一本账**,但块表在**各自的 server** 里 ⇒ 原 `drain_owner` 把 rank1 的 id
+   也丢给 rank0 的面 ⇒ **静默丢**(差额 434 = rank1 那份);
+3. 修掉分账后仍有 `free: 0/1 块归池(账目不平)` ≈ **2048 次/轮**,按名聚合集中在两个:
+   `owl_add_f16 ×8862`、`owl_fused_add_rmsnorm_f16 ×5881` —— **残留流的高频块**;
+4. 这些块的路径是"先入复用池、满 256 MiB 后**淘汰回驱动**",而 `pool_release` 的淘汰
+   **挑的是池里最旧的任意一条(跨 rank)** ⇒ 淘汰返回的 id 被**当前调用方的面**去 free
+   ⇒ 打着别的 rank 的 server ⇒ `free_blocks` 找不到 ⇒ **设备块永不归还**。
+
+**修复(三处同律:块只能在自己那个 server 上 free)**
+
+| 件 | 改动 |
+|---|---|
+| `LedgerBook::drain_owner(owner, rank)` | 按 `Loan.rank` 分账(N4 兜底逐 rank) |
+| `Engine::n4_force_release` | 逐 rank 交给 `dev` / `peer` **各自的 session 面**;无 peer 却有 rank1 账 ⇒ 响亮拒 |
+| `LedgerBook::pool_release` 淘汰 | **只顶同 rank 的条目**(跨 rank 顶出 = 必然打空) |
+| `AllocLedger::pool_drain(rank)` + `DeviceHandle::drain_pool_to_driver` | N6 压力路径同病同治(只排本 rank) |
+| `GpuServer::handle_free` | `freed ≠ 请求数` **无条件 WARN**(限流 1/1024)+ 计数 —— 静默吞掉 = 藏泄漏 |
+
+**判据(3080 对 / `tp27b` / chunk 512 / 4k prompt)**
+
+| | 修前 | 修后 |
+|---|---|---|
+| 连做 4k turn | 第 2~3 轮 `vram-hard-budget` 拒发 | **4/4 全过** |
+| 驱动 free | 9138 → 1008 MiB(每轮 −2.8 GiB) | 9138 → **7984**(每轮 ≤0.15 GiB = 池高水位) |
+| `recon.only_block` | 966 / 1239(且逐轮爬) | **20 / 20**(= `selfcheck.*` ×12 + `tp.staging/peer` 各 1 —— 固定的死东西,不必管) |
+| `free` 账目不平 | ~2048 次/轮 | **0** |
+| decode / prefill | 52.6 / 1519 t/s | 52.3 / 1532 t/s(不动) |
+| 门 | — | 0.8B `tp_g8_gate`(L1 **逐位 0 项不同**)+ `tp_assemble_gate` + 27B `tp_head_i8_gate` **144/144 全等** |
+
+**遗留(下一步)**:`hook_fail` 累计仍高(来源 = "双次入池",即调用点对同一批块**释放两次**;
+现在被幂等吸收、不再漏显存,但按"每个 malloc 一个 free"的纪律应清零)+ `probes.debug` 下
+decode 掉 5%(诊断档自身的同步税,与修复无关)。
+
+### 79.4 遗留项(双 free)的追查结论 —— 已定位到源码,修复方案与代价都量过了
+
+**定位(探针 `OWL_LEDGER_DOUBLE=1` 打栈,一次就中)**
+
+```
+pool_release ← LedgerEntry ← DeviceHandle::pool_release_all ← DeviceHandle::free
+  ← RankDev::prefill_chunk_enqueue   ← 解释器**中途活性回收**(inlined)
+```
+
+即:第二次 free 不是显式调用点,而是**解释器的中途回收**又归还了同一块。
+名字集中在 `owl_add_f16` / `owl_fused_add_rmsnorm_f16`(残留流,每层每 chunk 各一块)。
+
+**根因(记账口径失衡,不是逻辑错)**
+
+- `block_users` 按**块**计数:`track_new(id)` 只 `+1`;
+- 中途回收按**父边**递减:`for (p, b) in t.parents.zip(vals) { ... }`;
+- 同一块被 **两个节点**当父用(残差流天然如此:layer 输出既进下一层
+  `fused_add_rmsnorm`、又进 MLP 残差)⇒ 只需 `+1`、却要递减两次
+  ⇒ **第二次递减看到 `u == 0` 就再归还一次**。
+- 影响:**不漏显存**(第二次被存储层按"双次入池"幂等吞掉,`recon.only_block` = 20 恒定、
+  free 每轮 ≤0.15 GiB),只是 `hook_fail` 计数虚高(≈14.7k/次运行)—— 按
+  "一个 malloc 一个 free" 的纪律该清零,但**不影响长 ctx 可用性**。
+
+**试过并回退的修法(材料留档,下轮直接接上)**
+
+把计数改成"按边":`track_new(id, node)` / `track_alias(id, node)` 用
+`pending[node]`(该节点的父边数)初始化 `block_users`。实测:
+
+| 指标 | 结果 |
+|---|---|
+| `双次入池` | 14.7k → **0** ✅ |
+| decode / prefill | 52.1 / 1521 t/s(不变)✅ |
+| **4 个 liveness 单测** | **失败**(`候选表应为空,得 1 块`,残留 = `from_host` 常量叶) |
+| 驱动 free(首轮后) | 9136 → **5168 MiB**(比现状多占 3 GiB) |
+
+⇒ 说明 `count_pending` 的口径(根 +1、同一节点只贡献一次边)与"按边计 users"**还没对齐**;
+要对齐得先定谳"根 +1"与"重复父边"两个约定,再重跑 4 个 liveness 单测 + 内存/性能基线。
+**已回退**(保留 `OWL_LEDGER_DOUBLE` 探针),作为独立一刀立项。
+
+## 80. 防呆(2026-10-20,用户裁决"都是显式拒绝,不要留隐式")—— 三层强制门 + 五类硬错误
+
+> 教训:**"拦住了但只是记一笔"= 没拦住**。§79 的整条泄漏里,五类非法调用
+> 全都"看得见、却没拒";而且为了定位我塞过三处全局计数器/OnceLock(用户否决)。
+> 本轮把它们全部改成**硬错误 + 各自的字段**,并把"以后怎么防"钉成判据。
+
+### 80.1 五类硬错误(全部 `Err` 上抛,不改账、不吞)
+
+| # | 判据 | 位置 | 说明 |
+|---|---|---|---|
+| 1 | **跨账本 free** | `GpuServer::free_blocks` | id 高位 = 账本号(`pack_block_id`);与本 server 不符 ⇒ `CrossLedger`(§79 的元凶曾被静默放过) |
+| 2 | **未知块 free** | 同上 | 块表里没有 ⇒ `Err`(双 free / 早已回收) |
+| 3 | **跨 rank free** | `DeviceHandle::free`(归还前置校验) | `loan.rank != 本句柄 dev_rank` ⇒ `Err` |
+| 4 | **双 free** | 同上 | 账上 `loan.pooled == true`(已在复用池)⇒ `Err` |
+| 5 | **幽灵 free / 批内重复** | 同上 | 无在借登记 ⇒ `Err`;同一批里同一 id 出现两次 ⇒ `Err`(带 **name + 第 i/j 项 + 批长**,错误自解释) |
+
+实现要点:前置校验**全批先判**(一条不合法整批拒,不留"半还"状态);
+store 侧保留 `pool_release_on(id, rank)` 兜底复核。
+
+### 80.2 顺带修掉的两个真 bug(都是硬错误逼出来的)
+
+1. **池上限顶出后 `pooled` 没清** ⇒ 顶出的块进入"池↔待还"死循环:下一次 free 被当
+   "双次入池"拒掉(既没还、又留账)。修:`Loan.evicted` 标记 —— 顶出后**必须真还**,
+   不许再入池。
+2. **同一 eval 内块 id 会被复用**(先还进池、再被取回)⇒ `arena` 里同 id 出现两次
+   (前一条命 + 后一条命)⇒ 候选表重复发、**同批双 free**。修:候选表出口
+   **排序 + 去重**(契约:归还清单每块一次),三处出口同改。
+
+### 80.3 全局清零(用户否决后收编)
+
+| 原全局 | 现状 |
+|---|---|
+| `server/mod.rs` 的 `static MISS: AtomicU64` | **删除**(打空变硬错误后无意义) |
+| `handle.rs` 的 `OnceLock<bool>` + `static SEEN`(审计探针) | **整段删除**(隐式面;硬错误取代) |
+| `tier.rs` 的 `static N`(双 free 打栈) | **删除** |
+| 健康门读 `owl_shared::metrics`(进程级) | 改为**只读引擎返回值**(`store_report` / `block_ledger_probe`),零全局 |
+
+### 80.4 回归门:`tp_vram_health_gate`(新增,默认需双卡)
+
+0.8B TP2 跑 3 轮,四条判据(全读引擎返回值):
+
+| 判据 | 实测 |
+|---|---|
+| H0 三轮全部 `Completed`(硬错误 = 0 的等价判据) | ✅ |
+| H1 `store_report().events.hook_fail` 增量 = 0 | **0** |
+| H2 每轮收尾后 **无** `Owner::Turn(_)` 在借 | ✅ |
+| H3 `设备块数 − 账本在借块数` 缺口不增 | 基线 **4**(= 固定的死东西)`→ 4 → 4 → 4` |
+
+### 80.5 现状与最后一条隐式面(**下一步**)
+
+- 27B/3080 对连做 3 个 4k turn:decode **52.0~52.7 t/s**、free 9136 → 8080 MiB(每轮 ≤0.1 GiB)、
+  五类硬错误计数**全 0**、`recon.only_block` **20/20**。
+- ⚠️ **还剩一条隐式面**:turn 收尾的兜底 `drain_owner` 每轮仍要收 ~900 块(prefill 的
+  arena 在某条路径上没还干净)。按用户裁决它**最终必须变成"欠账即报错"**,
+  但前提是先把 prefill 那条调用点修到 `drain == 0`;判据已就位:
+  `N4 未归还清单` 为空 + `store.turn_end.stale_blocks == 0`。
