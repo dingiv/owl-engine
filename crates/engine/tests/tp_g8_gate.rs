@@ -249,13 +249,33 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     // ⚠️ metrics store 是**进程级 OnceLock** ⇒ **必须在 turn 之前 init**
     // (turn 期间 counter_add 才有效;事后 init 只能看到 0 —— 本刀踩过)。
     let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
-    let Steps { gen: tp2_gen, logits: tp2_logits } =
-        run_turn_steps(&mut r, 1, PROMPT, MAX_NEW).await.expect("TP2 turn");
-    let cnt = |t: &str| -> u64 {
+    let cnt0 = |t: &str| -> u64 {
         owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new().tag(t))
             .iter()
             .map(|x| x.counter)
             .sum()
+    };
+    // **基线快照**(2026-10-20):metrics store 是**进程级 OnceLock**,而本目标还有
+    // 另一个测试(`body_probe`,走 `assemble` 默认档 = 两核)⇒ 若它先跑,计数已经
+    // 不是 0 ⇒ "融合档下 v1 必须为 0"的绝对判据会**假红**(实测 v1=2016 全是它留的)。
+    // 判据改成**本臂增量**(turn 前后的差),与测试顺序解耦。
+    let base = ["tp.ar.push", "tp.ar.v1", "tp.ar.fused", "tp.ar.1stage"].map(|t| cnt0(t));
+    let Steps { gen: tp2_gen, logits: tp2_logits } =
+        run_turn_steps(&mut r, 1, PROMPT, MAX_NEW).await.expect("TP2 turn");
+    let cnt = |t: &str| -> u64 {
+        let now: u64 = owl_shared::metrics::query_metrics(
+            &owl_shared::metrics::MetricsFilter::new().tag(t),
+        )
+        .iter()
+        .map(|x| x.counter)
+        .sum();
+        let i = match t {
+            "tp.ar.push" => 0,
+            "tp.ar.v1" => 1,
+            "tp.ar.fused" => 2,
+            _ => 3,
+        };
+        now.saturating_sub(base[i])
     };
     let (n_push, n_v1) = (cnt("tp.ar.push"), cnt("tp.ar.v1"));
     let n_fused = cnt("tp.ar.fused");
