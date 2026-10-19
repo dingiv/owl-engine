@@ -131,6 +131,9 @@ pub struct EventBook {
     pub bytes: usize,
     /// 记账失败计数(非零 = 有事件没入账;**不许静默**)。
     pub hook_fail: u64,
+    /// **片级换层跳过**计数(口径不支持:KV 池物理块 = 多层片,swap 逐片发 ⇒
+    /// 事件账的层归属对该资产不适用,以腿自报为准)。**不是**失败。
+    pub partial_moves: u64,
     /// **逐 rank 在借 id 集**(与块账房做全等门的原料)。
     pub ids: Vec<(u8, Vec<u64>)>,
     /// **复用池**(缺口 4;一等指标:池内可复用字节)
@@ -938,6 +941,7 @@ impl Rel {
                     entries: b.open_count_rank(None),
                     bytes: b.open_total_bytes_rank(None),
                     hook_fail: b.hook_fail(),
+                    partial_moves: b.partial_moves(),
                     ids: b.open_ids_by_rank(),
                     pool: {
                         let (n, by) = b.pool_stats();

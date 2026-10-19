@@ -564,10 +564,11 @@ mod tests {
         assert_eq!(b.open_count(), 1, "合法那条仍在场");
     }
 
-    /// **步 2 门 ③**:换层 = **不注销**(owner/entries 不变;tier 迁移);
-    /// 部分换层(片和 ≠ 登记)响亮拒。
+    /// **步 2 门 ③**(2026-10-19 修订):换层 = **不注销**(owner/entries 不变;
+    /// tier 迁移);片级换层(片和 ≠ 登记)= **跳过 + 单独计数**(口径不支持,
+    /// 不是 `hook_fail` —— 真机 4352 条噪声定谳)。
     #[test]
-    fn ledger_book_move_keeps_owner_and_rejects_partial() {
+    fn ledger_book_move_keeps_owner_and_skips_piecewise() {
         use owl_iface::handle::{
             AllocEvent, AllocLedger, AssetClass, MoveDir, MoveEvent, Owner as IfOwner,
         };
@@ -596,10 +597,12 @@ mod tests {
         // 方向不符(Host 上再 Out)= 响亮拒
         h.on_move(&MoveEvent { id: 5, bytes: 8192, dir: MoveDir::Out });
         assert_eq!(book_lock(&cell).hook_fail(), 1, "方向不符必须计数");
-        // **部分换层**(片和 ≠ 登记整块)= 响亮拒(账只按逻辑块记)
+        // **片级换层**(片和 ≠ 登记整块)= 口径不支持 ⇒ **跳过 + 单独计数**
+        // (不是记账失败:`hook_fail` 必须恒 0 —— 2026-10-19 真机 4352 条噪声的定谳)
         h.on_move(&MoveEvent { id: 5, bytes: 4096, dir: MoveDir::In });
         let b = book_lock(&cell);
-        assert_eq!(b.hook_fail(), 2, "部分换层必须计数");
+        assert_eq!(b.hook_fail(), 1, "部分换层不得计为记账失败");
+        assert_eq!(b.partial_moves(), 1, "片级换层单独计数");
         assert_eq!(b.tiers().kind_bytes(Tier::Host, AssetKind::Snap), 8192, "账未被部分搬运搅动");
     }
 
@@ -775,6 +778,11 @@ pub struct LedgerBook {
     tiers: TierLedger,
     open: BTreeMap<u64, Loan>,
     hook_fail: u64,
+    /// **片级换层跳过**计数(2026-10-19 真机:KV 池一个物理块 = 多层片,
+    /// `swap` 逐片发 ⇒ "片和 ≠ 登记整块"是**常态口径**,不是记账失败)。
+    /// 与 `hook_fail` 分开:后者必须恒为 0(真失败信号),本计数只说明
+    /// "该资产的事件层账不适用(以腿自报为准)"。
+    partial_moves: u64,
     /// **临时块池**(缺口 4;2026-10-19):`(kind, bytes) → 可复用 id 栈`(LIFO)。
     ///
     /// 三条律:
@@ -805,6 +813,7 @@ impl LedgerBook {
             tiers: TierLedger::new(budget),
             open: BTreeMap::new(),
             hook_fail: 0,
+            partial_moves: 0,
             pool: BTreeMap::new(),
             pool_cap: pool_cap_default(),
             pool_hits: 0,
@@ -827,6 +836,11 @@ impl LedgerBook {
     /// 钩子失败计数(非零 = 有事件没入账;**不许静默**)。
     pub fn hook_fail(&self) -> u64 {
         self.hook_fail
+    }
+
+    /// 片级换层跳过计数(口径不支持;不是失败 —— 见字段注释)。
+    pub fn partial_moves(&self) -> u64 {
+        self.partial_moves
     }
 
     /// 当前出借条数(诊断面:与块账房/腿自报**互相校验**)。
@@ -1133,10 +1147,20 @@ impl LedgerBook {
             return;
         };
         if ev.bytes != 0 && ev.bytes != l.bytes {
-            self.fail(
-                "部分换层(片和 ≠ 登记整块;账本按逻辑块记账)",
-                format!("id={} 片和={} 登记={} name={}", ev.id, ev.bytes, l.bytes, l.name),
-            );
+            // **片级换层 = 口径不支持,不是失败**(2026-10-19 真机定谳):
+            // KV 池一个物理块 = 多层片(`kv.k.<层>` × 每页字节),`swap` 按片发
+            // ⇒ 片和 < 登记整块是**常态**。事件账按整块记 ⇒ 该资产的层归属
+            // **以腿自报为准**(`kv.host_blocks`);这里只计数(首条+每 1024 条一条日志)。
+            // ⚠️ 真"半块搬运"(调用方切半)同样落这里 —— 判据是"片和 ≠ 登记",
+            // 无法与常态区分;靠腿自报与事件账的对账面兜底(§13.4)。
+            self.partial_moves = self.partial_moves.saturating_add(1);
+            let n = self.partial_moves;
+            if n == 1 || n.is_multiple_of(1024) {
+                eprintln!(
+                    "[store.ledger] 片级换层跳过(账按整块;腿自报层账为准,累计 {n}):                     id={} 片和={} 登记={} name={}",
+                    ev.id, ev.bytes, l.bytes, l.name
+                );
+            }
             return;
         }
         let to = match (ev.dir, l.tier) {

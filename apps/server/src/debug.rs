@@ -334,6 +334,8 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
             "entries": r.events.entries,
             "bytes": r.events.bytes,
             "hook_fail": r.events.hook_fail,
+            // 片级换层跳过(口径不支持,不是失败;层账以腿自报为准)
+            "partial_moves": r.events.partial_moves,
             "rows": r.events.rows.iter().map(|e| json!({
                 "rank": e.rank,
                 "owner": e.owner.label(),
