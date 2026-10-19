@@ -1632,3 +1632,41 @@ llama.cpp 同模型 24.3 ms/步(41.2 t/s,≈885 GB/s)。
 **墙**:17.7 GB / 936 GB/s = **18.9 ms** 是 m=1 的物理地板 ⇒ 单卡上限 ≈ 53 t/s;
 追平 llama.cpp(24.3)即 78% 效率,再往上要靠 **4-bit 更省的格式/更小模型**,
 不是 scheduling 问题。
+
+### 22.8 实测定谳(2026-10-19):eager/graph 双臂 + 客户端↔server 逐命令账本
+
+工具:`cargo build --release -p server --features owl-shared/perf`
+(`PERF_BUILD` 是**编译期常量**,不带 feature 的 release 里 `srv.wait/queue/op` 整段被
+常量折叠 ⇒ 第一次跑“没数”不是没实现,是没编进去),配 `[cuda] srv_timing = true`、
+`[graph] no_graph = true`。
+
+| 臂 | decode | 每步 | GPU busy(图内节点直读) |
+|---|---:|---:|---:|
+| **图回放(默认)** | **36.5 t/s** | 27.4 ms | 24.57 ms(1477 发) |
+| eager(`no_graph`) | 13.1 t/s | **88.5 ms** | ≈24.6 ms(同核集) |
+
+⇒ **我们的图比自家 eager 快 2.8×**;“llama.cpp eager 比我们图快”是误读:他们那份
+nsys 的 31.8 ms **GPU busy 不可能成立**(否则 41.2 t/s 不成立),2246 发 eager ×
+~3.4 µs CUPTI 注入 ≈ 7.6 ms 正好是差额 ⇒ 他们**真实 GPU busy ≈ 24.2 ms**,与我们的
+24.57 持平。
+
+**eager 的 64 ms 差额,逐命令账本(perf 构建,32 步;每步 = 合计 ÷ 32)**
+
+| 段 | tag | 每步 |
+|---|---|---:|
+| 客户端等栅栏回执 | `srv.wait.sync`(3.90 ms × 1.2 次) | **4.6 ms** |
+| 客户端等回读 | `srv.wait.dtoh`(2.64 ms × 1 次) | **2.6 ms** |
+| 客户端等发射回执 | `srv.wait.launch`(19.4 µs × 128 段) | 2.5 ms |
+| 同上(free/alloc) | 15.8/14.9 µs × 各 128 段 | 3.9 ms |
+| 服务端排队 | `srv.queue.{launch,alloc,free}`(7 µs × 384) | 2.7 ms |
+| 服务端段内发射 | `srv.op.*`(7-9 µs × 128) | **4.5 ms** |
+| 清零 | `srv.wait.memset_zero`(33 µs × 19) | 0.6 ms |
+
+**三条定谳**:① 发射本身不贵(`srv.op` 4.5 ms/步),**往返贵**(128 段/步 × 15-19 µs);
+② 每步一次 **`sync` 3.9 ms + `dtoh` 2.64 ms = 7.2 ms** 是**真 GPU 排空**——也就是开图
+模式剩下的 2.8 ms 的来源(图里只剩 dtoh),**两条路径同一病根**;
+③ 修法因此分两处:回读异步化(双缓冲,只依赖下一步输入槽)+ 回执批量
+(fire-and-forget 真语义)。
+
+⚠️ 语义提醒:`launch`/`alloc` 文档写的是“issue 即 send → 立即 resolve”,**实测 15-19 µs**
+说明回执走了完整唤醒路径 ⇒ 这一条本身就是实现与文档的偏差。
