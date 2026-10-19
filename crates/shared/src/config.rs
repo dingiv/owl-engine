@@ -119,6 +119,12 @@ pub enum ModelKind {
     Qwen35_08b,
     #[serde(rename = "awq27b")]
     Awq27b,
+    /// **GGUF 单文件档**(2026-10-19 gguf 轮;设计 §四 L4)。
+    /// `model.dir` = **`.gguf` 单文件路径**(不是目录):超参/词表/模板/rope/权重
+    /// 全从该文件取(REQ-GGUF-02「单文件自给」);权重量化型逐张量读,
+    /// 故无 `model.quant`/`head_quant` 两个键(写上也无效 —— 档位语义不同)。
+    #[serde(rename = "gguf")]
+    Gguf,
 }
 
 /// 采样模式(sampling.mode;原 `!= "greedy"` 字符串和稀泥废除)

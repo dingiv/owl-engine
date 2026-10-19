@@ -283,6 +283,26 @@ impl ServerConfig {
         Ok(out)
     }
 
+    /// **对外模型名的缺省**(唯一产地;`model.name` 显式给则用给的)。
+    ///
+    /// 为什么 GGUF 档要回落到**文件名**:GGUF 是**单文件档**,一个目录里可能并排放
+    /// 着同一模型的多个量化档(`…-Q4_K_M.gguf` / `…-Q8_0.gguf`)—— 用固定缺省名
+    /// (`qwen3.5-0.8b`)会让 `/v1/models`、`/health`、日志三处都显示别人的名字
+    /// (2026-10-19 实测:GGUF 档起机报 `model=qwen3.5-0.8b`)。词干就是实例身份
+    /// (`Qwen_Qwen3.5-4B-Q4_K_M`),与"声明即事实"同律。
+    ///
+    /// 其余档位保持历史缺省(改它会动既有档位的对外面,不在本轮射程)。
+    fn default_model_name(kind: ModelKind, dir: Option<&std::path::Path>) -> String {
+        if kind == ModelKind::Gguf {
+            if let Some(stem) = dir.and_then(|d| d.file_stem()).and_then(|s| s.to_str()) {
+                if !stem.is_empty() {
+                    return stem.to_string();
+                }
+            }
+        }
+        DEFAULT_MODEL_NAME.to_string()
+    }
+
     /// app 面组装(已加载配置 → server 形态;测试可直接喂 default/定制)
     pub fn from_config(cfg: OwlConfig) -> Self {
         Self {
@@ -297,7 +317,7 @@ impl ServerConfig {
                 .model
                 .name
                 .clone()
-                .unwrap_or_else(|| DEFAULT_MODEL_NAME.into()),
+                .unwrap_or_else(|| Self::default_model_name(cfg.model.kind, cfg.model.dir.as_deref())),
             knobs: owl_engine::EngineKnobs::from_config(&cfg),
             // 占位:真值由 `load()` 的声明式选卡回填(设备表 + 卡锁都在那边)
             devices: Devices::placeholder(),

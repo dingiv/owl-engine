@@ -8,6 +8,9 @@ description = "owl 引擎 SSE 服务架子(OpenAI 兼容 chat completions;engine
 [dependencies]
 # 引擎面(构造/装载/submit_session/pump)
 owl-engine = { path = "../../crates/engine" }
+# 模型面:GGUF 起点族(模板自给 —— `tokenizer.chat_template` 在 .gguf 文件里;
+# 2026-10-19 gguf 轮 REQ-GGUF-02)
+owl-models = { path = "../../crates/models" }
 # GPU 绑定(Engine::new 的 GpuClient 特化;actor 泛型界见 iface)
 owl-cuda = { path = "../../crates/backends/cuda" }
 owl-iface = { path = "../../crates/backends/iface" }

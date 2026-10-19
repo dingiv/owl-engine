@@ -247,7 +247,12 @@ async fn main() {
     // ── chat 模板(agent 服务面 §3.2):**快照资产**,装配期编译一次 ──
     // 渲染唯一权威 = 模型目录里的 chat_template.jinja(新建/重命名为内置模板
     // 串会直接打碎前缀复用,见 §4.3 R2);装载失败 = 拒启(渲染不出来 = 服务无意义)
-    let tpl = match chat_tpl::ChatTpl::load_with(
+    //
+    // **2026-10-19 GGUF 轮**:`model.dir` 指向 **`.gguf` 单文件**时,模板改从
+    // `.gguf` 的 `tokenizer.chat_template` KV 读(设计 REQ-GGUF-02「单文件自给」)
+    // —— 与快照路径**同一个下游**(`ChatTpl::from_str`,环境/兼容层单源)。
+    // 显式 `agent.template_path` 覆盖仍然优先(运维 A/B)。
+    let tpl = match chat_tpl::ChatTpl::load_snapshot_or_gguf(
         &config.model_dir,
         config.agent.template_path.as_deref(),
         config.agent_template_defaults(),
@@ -437,6 +442,8 @@ async fn load_shard(
                 .await
         }
         ModelKind::Qwen35_08b => loader.load_qwen35_0_8b(&config.model_dir).await,
+        // GGUF 单文件档:超参/词表/模板/rope/权重全从 `model.dir` 那个文件取
+        ModelKind::Gguf => loader.load_gguf(&config.model_dir).await,
     }
 }
 
@@ -463,6 +470,9 @@ async fn actor_main(
                     ModelKind::Awq27b => load_shard(&config, &mut engine, 0, 1).await?,
                     ModelKind::Qwen35_08b => {
                         engine.loader().load_qwen35_0_8b(&config.model_dir).await?
+                    }
+                    ModelKind::Gguf => {
+                        engine.loader().load_gguf(&config.model_dir).await?
                     }
                 };
                 owl_shared::log_info!("boot", "权重/tokenizer/rope 装载 {:.2}s", t0.elapsed().as_secs_f32());

@@ -95,10 +95,67 @@ impl ChatTpl {
                 (s, format!("{} (agent.template_path)", path.display()))
             }
         };
+        Self::from_str(src, source, defaults)
+    }
+
+    /// **是否 GGUF 档 + 自动路由的唯一产地**(路径是文件 ⇒ GGUF 单文件形态)。
+    ///
+    /// 优先级:显式 `agent.template_path`(运维覆盖)> GGUF 内嵌 > 快照文件。
+    /// 为什么把路由放这里而不放 main:两条路径的**优先级顺序**是契约
+    /// (将来新增模板来源必须在同一处排序,防“两个入口各执一词”)。
+    pub fn load_snapshot_or_gguf(
+        model_path: &Path,
+        template_path: Option<&str>,
+        defaults: Map<String, Json>,
+    ) -> Result<Self, TplError> {
+        if template_path.is_some() {
+            return Self::load_with(model_path, template_path, defaults);
+        }
+        if model_path.is_file() {
+            return Self::load_gguf(model_path, defaults);
+        }
+        Self::load_with(model_path, None, defaults)
+    }
+
+    /// **从模板字符串装**(2026-10-19 GGUF 轮;唯一编译入口)。
+    ///
+    /// 为什么需要:GGUF 的模板住 `.gguf` 的 `tokenizer.chat_template` **KV**,不在目录文件里
+    /// (设计 REQ-GGUF-02「单文件自给」)。
+    /// 本构造函数是 `load_with` 与 [`ChatTpl::load_gguf`] 的**共同下游** ——
+    /// 环境/兼容层只有一份(`build_env`),不存在第二套 Jinja 语义。
+    pub fn from_str(
+        template: String,
+        source: String,
+        defaults: Map<String, Json>,
+    ) -> Result<Self, TplError> {
         let mut env = build_env();
-        env.add_template_owned(TPL_NAME.to_string(), src)
+        env.add_template_owned(TPL_NAME.to_string(), template)
             .map_err(|e| TplError(format!("chat 模板编译失败({source}): {e}")))?;
         Ok(Self { env, source, defaults })
+    }
+
+    /// **从 GGUF 文件装**(`tokenizer.chat_template` KV;缺 = 拒启)。
+    ///
+    /// 与 `load_with` 同一条下游 ⇒ 渲染语义完全一致;差别只在模板**来源**。
+    /// 事实自证(单测 `gguf_template_equals_hf_snapshot`):两靶位的 GGUF 内嵌模板
+    /// 与其 HF 快照的 `chat_template.jinja` **逐字节相同**。
+    pub fn load_gguf(
+        gguf_path: &Path,
+        defaults: Map<String, Json>,
+    ) -> Result<Self, TplError> {
+        let g = owl_models::formats::gguf::Gguf::open(gguf_path)
+            .map_err(|e| TplError(format!("读 GGUF {}: {e}", gguf_path.display())))?;
+        let t = g
+            .kv
+            .opt_str("tokenizer.chat_template")
+            .map_err(|e| TplError(format!("GGUF 元数据: {e}")))?
+            .ok_or_else(|| {
+                TplError(format!(
+                    "GGUF {} 无 `tokenizer.chat_template`(无权渲染 prompt ⇒ 拒启)",
+                    gguf_path.display()
+                ))
+            })?;
+        Self::from_str(t.to_string(), format!("{}#tokenizer.chat_template", gguf_path.display()), defaults)
     }
 
     /// 模板来源(装配日志)
@@ -339,9 +396,7 @@ mod tests {
     }
 
     fn tpl(src: &str) -> ChatTpl {
-        let mut env = build_env();
-        env.add_template_owned(TPL_NAME.to_string(), src.to_string()).unwrap();
-        ChatTpl { env, source: "test".into(), defaults: Map::new() }
+        ChatTpl::from_str(src.to_string(), "test".into(), Map::new()).unwrap()
     }
 
     /// 渲染器必须可跨线程共享(HTTP 层多任务持有)
@@ -468,6 +523,68 @@ mod tests {
             let want = std::fs::read_to_string(fx.join("qwen35_0.8b_ctx1.txt")).unwrap();
             let got = render_case(&t8, &case);
             assert!(got == want, "qwen35_0.8b_ctx1 与 HF oracle 逐字节不等");
+        }
+    }
+
+    /// **GGUF 模板来源等价门**(2026-10-19 刀 2;REQ-GGUF-02)。
+    ///
+    /// 两段清单式断言:
+    /// ① **字节等价**:`.gguf` 的 `tokenizer.chat_template` ≡ 对应 HF 快照的
+    ///    `chat_template.jinja` —— 证明 GGUF 读取路径**不丢/不歪**模板事实;
+    /// ② **渲染等价**:同一批载荷下,`load_gguf(gguf)` 与 `load(hf 目录)` 的
+    ///    输出**逐字节相等** —— 证明两条来源走的是同一渲染语义。
+    ///
+    /// 为什么不重造金标:渲染器本身已有 HF oracle 金标门
+    ///([`golden_snapshot_templates`]);本门把“模板事实”接到那条已验链上。
+    #[test]
+    fn gguf_template_equals_hf_snapshot() {
+        let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chat_tpl");
+        let mut checked = 0usize;
+        for (gk, hk) in [("tpl:gguf4b", "tpl:hf4b"), ("tpl:gguf27b", "tpl:hf27b")] {
+            let (Some(gguf), Some(hf_dir)) = (
+                owl_shared::testkit::resource(gk),
+                owl_shared::testkit::resource(hk),
+            ) else {
+                eprintln!("skip: 资源清单缺 {gk}/{hk}");
+                continue;
+            };
+            let g = owl_models::formats::gguf::Gguf::open(std::path::Path::new(&gguf)).expect("开 GGUF");
+            let from_gguf = g.kv.opt_str("tokenizer.chat_template").expect("KV 形态").expect("模板在场");
+            let hf = std::fs::read_to_string(std::path::Path::new(&hf_dir).join(TPL_FILE)).expect("HF 模板");
+            // ① 字节等价
+            assert_eq!(from_gguf, hf, "[{gk}] 内嵌模板 ≠ HF 快照模板(逐字节)");
+            // ② 渲染等价(同批载荷:tools / 多轮 / 关思考 / 纯文本)
+            let a = ChatTpl::load_gguf(std::path::Path::new(&gguf), Map::new()).expect("load_gguf");
+            let b = ChatTpl::load(std::path::Path::new(&hf_dir)).expect("load(hf)");
+            let mut cases: Vec<Json> = Vec::new();
+            for name in ["ctx1_tools", "ctx2_tools_multiturn", "ctx3_tools_notinking", "ctx4_plain_notinking"] {
+                let p = fx.join(format!("{name}.json"));
+                if let Ok(s) = std::fs::read_to_string(&p) {
+                    cases.push(serde_json::from_str(&s).expect("fixture json"));
+                }
+            }
+            cases.push(serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": "你是一个助手"},
+                    {"role": "user", "content": "画一个图"},
+                    {"role": "assistant", "content": "好的"},
+                    {"role": "user", "content": "再来一个"}
+                ],
+                "add_generation_prompt": true
+            }));
+            assert!(!cases.is_empty(), "[{gk}] 无载荷可比较");
+            for c in &cases {
+                assert_eq!(
+                    render_case(&a, c),
+                    render_case(&b, c),
+                    "[{gk}] GGUF 来源与快照来源渲染不等(载荷 {c})"
+                );
+            }
+            eprintln!("[{gk}] 模板 {} B 逐字节等 ;;{} 例渲染逐字节等", from_gguf.len(), cases.len());
+            checked += 1;
+        }
+        if checked == 0 {
+            eprintln!("skip: 无 GGUF 模板资源(tpl:gguf9b / tpl:gguf27b)");
         }
     }
 

@@ -2,7 +2,8 @@
 //!
 //! **两处声明必须同票**:
 //! - 配置面 = flavor 的 `dispatch.allowed_ops`(TOML 文本);
-//! - 权威台账 = `owl_kernels::ops::PROD_{SPEC_DFLASH,AWQ27B}_2026_10_13`
+//! - 权威台账 = `owl_kernels::ops::PROD_{SPEC_DFLASH,AWQ27B}_2026_10_13` /
+//!   `PROD_GGUF4B_2026_10_19`
 //!   (实测:真跑生产档 + `[cuda] launch_time` 逐发射记账)。
 //!
 //! 锁死三件事:
@@ -31,6 +32,8 @@ fn flavor_whitelists_match_audited_tables() {
     for (flavor, want) in [
         ("spec-dflash", owl_kernels::ops::PROD_SPEC_DFLASH_2026_10_13),
         ("awq27b", owl_kernels::ops::PROD_AWQ27B_2026_10_13),
+        // GGUF 4B 单文件档(2026-10-19):白名单由**发射账**生成,台账存 kernels 侧
+        ("gguf4b", owl_kernels::ops::PROD_GGUF4B_2026_10_19),
     ] {
         let mut got = whitelist(flavor);
         got.sort_unstable();
@@ -42,7 +45,7 @@ fn flavor_whitelists_match_audited_tables() {
 
 #[test]
 fn whitelists_are_built_and_pass_pool_audit() {
-    for flavor in ["spec-dflash", "awq27b"] {
+    for flavor in ["spec-dflash", "awq27b", "gguf4b"] {
         let names = whitelist(flavor);
         for n in &names {
             assert!(
