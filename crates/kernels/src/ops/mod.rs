@@ -41,6 +41,8 @@ pub mod elems;
 pub mod flashinfer;
 pub mod fused;
 pub mod gdn;
+/// **GGUF 族算子声明**(2026-10-19;逐型一条 = H3 的"不许裸 int 路由")
+pub mod gguf;
 pub mod gdn_chunked;
 pub mod gdn_scalar;
 pub mod comm;
@@ -55,6 +57,7 @@ pub mod xqa;
 pub static TABLES: &[&[&KernelMeta]] = &[
     attn::METAS,
     gdn::METAS,
+    gguf::METAS,
     gdn_chunked::METAS,
     gdn_scalar::METAS,
     comm::METAS,
@@ -342,6 +345,49 @@ pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
     "vllm_paged_attention_v2_reduce_f16_hd256",
     "vllm_reshape_and_cache_bf16",
+    "vllm_reshape_and_cache_f16_knhd",
+];
+
+/// `--flavor gguf4b` 实测发射集(30 个;GGUF 4B Q4_K_M 单卡,无投机/无 XQA)
+///
+/// **来源 = 真实发射账**(不是手抄):`[cuda] trace_ring = 40000` 起机 →
+/// 依次打 11 / ~512 / ~1024 / ~2048 / ~4096 / ~8192 token 的请求 →
+/// 每轮 `GET /debug/launches/40000` 取 `cmd=="launch"` 的 `name` **取并集**
+/// (⚠️ ring 会绕圈:只 dump 一次实测漏 5 个解码臂)→ 去重排序。
+///
+/// **判据**(见 `apps/server/tests/ops_whitelist.rs`):① 与 flavor 的
+/// `dispatch.allowed_ops` 逐项一致;② 每项已建表;③ 过**池写集穷举审计**。
+/// 换文件(不同量化型混布)/换臂(开 spec、改 kv_fp8)⇒ 重跑上面的收账流程。
+pub const PROD_GGUF4B_2026_10_19: &[&str] = &[
+    "cublas_gemm_f16",
+    "flashinfer_prefill_paged_f16",
+    "owl_add_f16",
+    "owl_argmax_f32idx_f16",
+    "owl_fused_add_rmsnorm_f16",
+    "owl_gdn_conv_fwd_f16",
+    "owl_gdn_conv_upd_dual_f16",
+    "owl_gdn_decode_step_v2_f16",
+    "owl_gdn_gating_g_f16",
+    "owl_gdn_l2norm_f16",
+    "owl_gdn_norm_act_f16",
+    "owl_gdn_recurrence_varlen_gqa_f16",
+    "owl_gemv_dual_f16",
+    "owl_gguf_dequant_rows_q6k",
+    "owl_gguf_gemm_q4k",
+    "owl_gguf_gemm_q5k",
+    "owl_gguf_gemm_q6k",
+    "owl_gguf_gemm_q8_0",
+    "owl_gguf_quant_act_f16",
+    "owl_gguf_quant_act_f16_tiled",
+    "owl_narrow_strided_f16",
+    "owl_norm_rope_f16",
+    "owl_qknorm_rope_kv_insert_f16_knhd",
+    "owl_rmsnorm_f16",
+    "owl_sigmoid_f16",
+    "owl_sigmoid_gate_mul_f16",
+    "owl_silu_and_mul_f16",
+    "vllm_paged_attention_v2_f16_knhd_hd256bs32",
+    "vllm_paged_attention_v2_reduce_f16_hd256",
     "vllm_reshape_and_cache_f16_knhd",
 ];
 

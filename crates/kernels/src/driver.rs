@@ -159,6 +159,25 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
         // foreign 家族臂(2026-10-12 用户律:gdn 两臂入词表,与 native 同一
         // Call 通道;名字 = family 单源,发射配置 = FOREIGN 哨兵直通)
+        "gguf.gemm" => gguf::gemm(
+            crate::family::gguf::GgmlTy::from_code(ax(0) as u32)
+                .unwrap_or_else(|| panic!("driver::resolve(\"gguf.gemm\"): 未知 ggml 型码 {}", ax(0))),
+            ax(1),
+            ax(2),
+        ),
+        // aux = [rows, k_padded](网格从它们算;与 gemm 的 aux = [ty, m, n] 区分)
+        // 两个 op_id 各一档:输出恒 U8 ⇒ `dt` 载不了输入档(与 QuantInt8Row* 同律)
+        "gguf.quant_act_f16" => gguf::quant_act(DType::F16, ax(0), ax(1)),
+        "gguf.quant_act_bf16" => gguf::quant_act(DType::BF16, ax(0), ax(1)),
+        // tiled 变体(v-head 列序;表 = `blk.N.ssm_out.perm` 虚拟键)
+        "gguf.quant_act_f16_tiled" => gguf::quant_act_tiled(DType::F16, ax(0), ax(1)),
+        "gguf.quant_act_bf16_tiled" => gguf::quant_act_tiled(DType::BF16, ax(0), ax(1)),
+        "gguf.dequant_rows" => gguf::dequant_rows(
+            crate::family::gguf::GgmlTy::from_code(ax(0) as u32)
+                .unwrap_or_else(|| panic!("driver::resolve(\"gguf.dequant_rows\"): 未知 ggml 型码 {}", ax(0))),
+            ax(1),
+            ax(2),
+        ),
         "gdn.chunked_delta" => gdn::chunked_delta(),
         "gdn.scalar_delta" => gdn::scalar_delta(),
         // 通信族(TP2 S4;dtype ⇒ 三实例之一;族 runtime 自持单 block 几何 —— FOREIGN 哨兵)
@@ -434,6 +453,79 @@ pub const FOREIGN: Shape = Shape { grid: (0, 0, 0), block: (0, 0, 0), smem: 0 };
 // ============================================================================
 // §3 算子族(GDN;F5 批 1-5 核 + 工单 G 批核,2026-09-25 语义)
 // ============================================================================
+
+/// **GGUF 族拾取**(2026-10-19;H3:逐型入口由 `family::gguf::entry_for` 单一映射回答)
+pub mod gguf {
+    use super::{DType, KernelPick, Shape};
+    use crate::family::gguf as fam;
+    use crate::family::gguf::GgmlTy;
+
+    /// **激活 → q8_1**(MMVQ 喂料手;几何 = `quant_act_geom`)
+    pub fn quant_act(dt: DType, rows: usize, k_padded: usize) -> KernelPick {
+        let (grid, block) = fam::quant_act_geom(rows, k_padded);
+        let shape = Shape { grid, block, smem: 0 };
+        match dt {
+            DType::F16 => KernelPick::of::<crate::ops::gguf::GgufQuantActF16>(shape),
+            DType::BF16 => KernelPick::of::<crate::ops::gguf::GgufQuantActBf16>(shape),
+            other => panic!("owl_gguf_quant_act 只有 f16/bf16 变体(dt={other:?})"),
+        }
+    }
+
+    /// **激活 → q8_1(tiled 变体;v-head 列序)** —— 表为**附加输入槽**,
+    /// 几何与普通臂**逐字相同**(置换不改变发射形状)。
+    pub fn quant_act_tiled(dt: DType, rows: usize, k_padded: usize) -> KernelPick {
+        let (grid, block) = fam::quant_act_geom(rows, k_padded);
+        let shape = Shape { grid, block, smem: 0 };
+        match dt {
+            DType::F16 => KernelPick::of::<crate::ops::gguf::GgufQuantActF16Tiled>(shape),
+            DType::BF16 => KernelPick::of::<crate::ops::gguf::GgufQuantActBf16Tiled>(shape),
+            other => panic!("owl_gguf_quant_act_tiled 只有 f16/bf16 变体(dt={other:?})"),
+        }
+    }
+
+    /// **GGUF GEMM**(按型选入口;`m`/`n` 定网格)。权重块型 = `GgmlTy`,
+    /// 未移植型 **panic 带可读信息**(picker 契约:编程错误当场炸,不许静默兜底)。
+    pub fn gemm(ty: GgmlTy, m: usize, n: usize) -> KernelPick {
+        let (grid, block) = fam::gemm_geom(m, n);
+        let shape = Shape { grid, block, smem: 0 };
+        match ty {
+            GgmlTy::Q8_0 => KernelPick::of::<crate::ops::gguf::GgufGemmQ8_0>(shape),
+            GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufGemmQ4K>(shape),
+            GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufGemmQ5K>(shape),
+            GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufGemmQ6K>(shape),
+            other => panic!(
+                "owl_gguf_gemm: {} 未移植(已移植集 = {:?};设计 REQ-GGUF-04 / R3)",
+                other.name(),
+                fam::PORTED
+            ),
+        }
+    }
+
+    /// 型 → 入口名(诊断/门用;与 [`gemm`] 同一映射源)
+    pub fn gemm_entry(ty: GgmlTy) -> &'static str {
+        fam::entry_for(ty).unwrap_or_else(|| panic!("owl_gguf_gemm: {} 未移植", ty.name()))
+    }
+
+    /// **量化表行解量化**(`token_embd` 查表臂;`rows_geom` 定几何)。
+    /// 未移植型(`ROWS_PORTED` 外)/ `k` 非超块整数倍 ⇒ panic 带可读信息
+    /// (picker 契约:编程错误当场炸;构造期已由计划面拦一道)。
+    pub fn dequant_rows(ty: GgmlTy, tokens: usize, k: usize) -> KernelPick {
+        let (grid, block) = fam::rows_geom(ty, tokens, k).unwrap_or_else(|| {
+            panic!(
+                "owl_gguf_dequant_rows: {} 未移植(行臂集 = {:?})或 k={k} 非超块整数倍",
+                ty.name(),
+                fam::ROWS_PORTED
+            )
+        });
+        let shape = Shape { grid, block, smem: 0 };
+        match ty {
+            GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufRowsQ4K>(shape),
+            GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufRowsQ5K>(shape),
+            GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufRowsQ6K>(shape),
+            other => panic!("owl_gguf_dequant_rows: {} 未移植", other.name()),
+        }
+    }
+}
 
 pub mod gdn {
     use super::{DType, KernelPick, Shape, FOREIGN, SENTINEL_1D};

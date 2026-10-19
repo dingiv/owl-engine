@@ -24,6 +24,9 @@ pub mod gdn_scalar;
 pub mod comm;
 /// Marlin:族身份 + FFI 声明(零门);**repack** 随 feature=marlin(half/rayon)
 pub mod marlin;
+/// **GGUF 族**(2026-10-19):格式词汇 `GgmlTy` + 块几何 + 内核码唯一映射。
+/// 零门零依赖(声明面;`cu/gguf/` 执行面随 `device` 门)。
+pub mod gguf;
 /// **构建期 cubin 资产登记表**(build.rs 生成;源文本哈希 → fatbin 字节)。
 /// 门 = `device` —— 只有执行面(backends/cuda)按源查资产;models 侧零成本。
 #[cfg(feature = "device")]
