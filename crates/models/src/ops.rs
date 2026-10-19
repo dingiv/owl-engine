@@ -85,6 +85,8 @@ pub enum SemanticKernel {
     CastF16F32,
     /// 刀3a':双权 GEMV 单发(b/a 投影;aux = [rows_b, rows_a, cols, tokens])
     GemvDual,
+    /// **int8 权重 GEMV**(P1.5-a;lm_head 专用;aux = [rows, cols, tokens])
+    GemvI8w,
 
     // ---- attn.*(aux 序见各变体)----
     /// KV 散写(classic 布局;aux = [tokens])
@@ -292,6 +294,7 @@ impl SemanticKernel {
             SemanticKernel::Embed => "ops.embed",
             SemanticKernel::CastF16F32 => "elems.cast_f16_f32",
             SemanticKernel::GemvDual => "elems.gemv_dual",
+            SemanticKernel::GemvI8w => "elems.gemv_i8w_bf16",
             SemanticKernel::K0Write => "attn.k0_write",
             SemanticKernel::K0WriteKnhd => "attn.k0_write_knhd",
             SemanticKernel::K0WriteFp8Knhd => "attn.k0_write_fp8_knhd",

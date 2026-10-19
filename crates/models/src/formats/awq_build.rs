@@ -192,6 +192,49 @@ impl AwqSource {
 /// 量化线性物化(键首触才建;qweight/scales/zeros/weight 四键共享
     /// 一次构建)。双检缓存 + build_lock 串行(w4a16 同款)。
     pub(crate) fn linear_bytes_for(&self, base: &str, key: &str) -> Taken<Arc<[u8]>> {
+        // ---- P1.5-a:int8 per-row 头(专用分支;**不经** `build_linear`)----
+        //
+        // 为什么独立:lm_head 走 `build_linear` 会连带把 int4 三件套(scales/zeros/
+        // marlin B)也烘一遍 —— 那是纯浪费(636M nibble 重排),而且会往缓存塞
+        // 三份用不到的字节。本分支只读 bf16 源、只产 i8q/i8s。
+        if key.ends_with(".i8q") || key.ends_with(".i8s") {
+            {
+                let cache = self.cache_guard();
+                if let Some(b) = cache.0.get(key) {
+                    return Ok(Some(b.clone()));
+                }
+            }
+            let Some((out, k, form)) = self.linear_form(base) else { return Ok(None) };
+            let QuantForm::F16 { we } = form else {
+                // 只有"未量化的 bf16 权重"才做 int8 头;Ct(packed)源不反解
+                // (从 int4 反解再压 int8 = 双重损失,响亮拒)
+                return Err(ModelError::Msg(format!(
+                    "{base}: int8 头要求 bf16 源,**不得**从 packed int4 反解"
+                )));
+            };
+            let wb = &self.maps[we.map_ix][we.start..we.start + we.nbytes];
+            let w_f32: Vec<f32> = match we.dtype {
+                safetensors::Dtype::BF16 => bf16_par(wb),
+                safetensors::Dtype::F16 => wb
+                    .chunks_exact(2)
+                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect(),
+                safetensors::Dtype::F32 => wb
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+                _ => return Err(ModelError::Msg(format!("awq: {base} i8 源 dtype 不支持"))),
+            };
+            self.maps[we.map_ix].dontneed(we.start, we.nbytes);
+            let (q8, s8) = rtn_i8_row_sym(&w_f32, out, k);
+            let bytes: Vec<u8> = if key.ends_with(".i8q") { q8 } else { s8 };
+            let n = bytes.len();
+            let mut cache = self.cache_guard();
+            cache.0.insert(key.to_string(), Arc::from(bytes.into_boxed_slice()));
+            let _ = n;
+            return Ok(cache.0.get(key).cloned());
+        }
+
         // **a8 键族走独立构建**(S2):与 a16 同源不同布局,且**互不物化**
         // —— a8 路只产 a8 四件,不陪跑 a16 的重排(反之亦然)
         if is_a8_key(key) {
@@ -387,6 +430,8 @@ impl AwqSource {
                         Arc::from(i32s_le_bytes(&packed_ct).into_boxed_slice()),
                         packed_ct.len() * 4,
                     ));
+                    // (P1.5-a 的 int8 两键**不在这里**:那样会连带把 int4 三件套
+                    //  也给 lm_head 烘一遍 —— 专用分支见 `linear_bytes_for`)
                 }
             }
             let s_len = s_bytes.len();
@@ -952,6 +997,38 @@ pub(crate) fn rtn_g32_sym_scales(w: &[f32], out: usize, k: usize) -> Vec<f32> {
         }
     }
     s
+}
+
+/// **RTN int8 per-row-sym**(P1.5-a;lm_head 专用):`s_o = absmax/127`(全零行 = 1),
+/// `q = clamp(RN-even(w/s), -127, 127)`。返回 `(i8 字节 [out×k] 行主, f32 LE [out])`。
+///
+/// ⚠️ **两条与设备核逐元素一致的纪律**(台子 `quant_i8_row_w_bench` 与
+/// `gemv_i8w_bench` 背书):
+/// 1. **除法不换倒数**(两侧都写 `w/s`;`w*(1/s)` 会在舍入上分家);
+/// 2. **RN-even**(`round_ties_even` ↔ `__float2int_rn`);`round()` 是 half-away,**不可用**。
+pub(crate) fn rtn_i8_row_sym(w: &[f32], out: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+    use rayon::prelude::*;
+    let mut q = vec![0u8; out * k];
+    let sc: Vec<f32> = (0..out)
+        .into_par_iter()
+        .map(|o| {
+            let row = &w[o * k..(o + 1) * k];
+            let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+            if amax > 0.0 { amax / 127.0 } else { 1.0 }
+        })
+        .collect();
+    q.par_chunks_mut(k).enumerate().for_each(|(o, dst)| {
+        let s = sc[o];
+        for (i, v) in w[o * k..(o + 1) * k].iter().enumerate() {
+            let qi = (v / s).round_ties_even().clamp(-127.0, 127.0);
+            dst[i] = (qi as i8) as u8;
+        }
+    });
+    let mut sb = Vec::with_capacity(out * 4);
+    for v in &sc {
+        sb.extend_from_slice(&v.to_le_bytes());
+    }
+    (q, sb)
 }
 
 /// AWQ 非对称反量化(host rayon;非 eligible 小线性专用):

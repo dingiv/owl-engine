@@ -186,6 +186,10 @@ pub enum HeadQuant {
     /// 质量†:HyperQwen GPTQ 口径 +0.6%PPL/GSM8K 不变;本地 RTN g32
     /// 口径 A/B 恒等门已过(prose/数学逐字同,竖式同错=模型固有)
     RtnInt4G32,
+    /// **per-row 对称 int8**(P1.5-a,2026-10-20):`s_o = absmax/127`,
+    /// `q = RN-even(w/s)`;装载期现算,头走 `owl_gemv_i8w_bf16`
+    /// (decode 单步 1.76 → ~0.89 ms)。质量门 = top-1 ≥99.9% + 贪心 256 逐字。
+    RtnInt8Row,
     // 预留:GptqInt4G128(需自采 hidden states 产量化,另案)、
     // RtnInt8G128(中间档)——加值时同步 loader 映射与质量门台账
 }

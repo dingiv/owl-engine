@@ -1250,6 +1250,14 @@ pub enum QuantPlan {
     /// **逐张量型**:26B/4B 等混型 GGUF 里同一个模型不同张量型不同
     /// ⇒ 由 [`PlanSource`] 逐键给(设计刀 0);未移植型 = 构造期**响亮拒**。
     Gguf(crate::formats::gguf::GgmlTy),
+    /// **int8 per-row 头**(P1.5-a,2026-10-20):只对 **lm_head** 有意义
+    /// (装载期现算:`s_o = absmax/127`,`q = RN-even(w/s)`;头走
+    /// `owl_gemv_i8w_{f16,bf16}`,prefill 也在末行窄切后调用 ⇒ m 恒 1)。
+    ///
+    /// **不走 `Linear`**:`Linear` 已有四条臂(F16/W4A16/W4A16Awq/W4A8Awq),
+    /// 再插一条会变成"万能类型";int8 头只有 lm_head 一个消费者 ⇒
+    /// 由 `Embedding::head_i8` 单槽承载(回退 = 删槽,bf16 原路不动)。
+    I8W,
 }
 
 /// **逐张量量化计划表**(混型源的计划来源;2026-10-19 GGUF 轮)。

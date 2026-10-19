@@ -171,6 +171,15 @@ impl AwqSource {
             let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
             return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
         }
+        // ---- P1.5-a:int8 per-row 头(packed-⌚ lm_head;源 = bf16 权重)----
+        if let Some(base) = key.strip_suffix(".i8q") {
+            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            return Ok(Some(Resolved::Bytes(__b, Dtype::I8)));
+        }
+        if let Some(base) = key.strip_suffix(".i8s") {
+            let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
+            return Ok(Some(Resolved::Bytes(__b, Dtype::F32)));
+        }
         // ---- W4A8 键族(S2;a8 布局三件套 + 全局因子)----
         // `scales_a8` 线 dtype = **F16**:int16 归一位型塞在 2 字节槽里,
         // 与 a8 GEMM 的 `scales` 槽(声明 F16)同宽同形
@@ -257,6 +266,9 @@ impl AwqSource {
             || key.ends_with(".zeros_a8")
             || key.ends_with(".a8_factor")
             || key.ends_with(".packed_raw")
+            // P1.5-a:int8 per-row 头两键(名判定镜像;与 resolve 同改)
+            || key.ends_with(".i8q")
+            || key.ends_with(".i8s")
             || key == "mtp.fc_e.weight"
             || key == "mtp.fc_h.weight"
     }
