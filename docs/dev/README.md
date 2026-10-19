@@ -21,10 +21,10 @@
 3. **卡是共享资源,本工作区多会话**:起机前查卡占位、`/proc/vmstat` 看 `oom_kill`、
    被外部 kill 是常态(判定顺序见 `debug-tools.md` §5)。
 
-## 新工作树开箱(两条隐性前置 + 冷建成本)
+## 新工作树开箱(三条隐性前置 + 冷建成本)
 
-`git worktree add` 出来的新树**开箱不能构建/跑测试** —— 两件前置资产在 git 里没有
-(2026-10-17 审查实录:一位 agent 在这上面花了十几分钟)。
+`git worktree add` 出来的新树**开箱不能构建/跑测试** —— 三件前置资产在 git 里没有
+(2026-10-17 审查实录:一位 agent 在这上面花了十几分钟;2026-10-19 gguf 轮补第 ③ 条)。
 
 ```bash
 # ① triton venv(不建 = `kernels/build.rs` 直接 panic:"gdn_chunked 六核 AOT
@@ -42,6 +42,24 @@ done
 ```
 
 冷建一次 **~9 分钟**(44 源 cubin 全编;之后增量 10-20s)。工作树位置与清理纪律见包根 `AGENTS.md`。
+
+```bash
+# ③ testdata/ 的**本地面**(资源清单 / args / 用例 overlay / 金标)。
+#    ⚠️ 不要 `cp -r <主树>/testdata <新树>/testdata` —— 新树**已经**有 testdata/
+#    (被 git 追踪的那几个文件)⇒ cp 会嵌成 `testdata/testdata/`,顶层
+#    `resources.toml` 依然缺 ⇒ 需要资源清单的用例**静默 skip**(看起来全绿,
+#    实则少跑)。用 `-a ./.` 形式覆盖式拷:
+SRC=/home/div/Documents/codes/packages/owl
+DST=/home/div/Documents/codes/packages/owl-worktrees/<新树>
+cp -a "$SRC/testdata/." "$DST/testdata/"
+# 验证(两行都必须有内容):
+#   ls "$DST/testdata/resources.toml"          # 资源清单(本机路径)
+#   ls "$DST/testdata/args" | wc -l            # 预期 ~17(只留 git 追踪的 = 3)
+```
+
+**静态资产面自查**:跑完一轮 GPU 套件后 `grep -i "skip:"` 一次 —— 若出现
+`skip: 资源清单缺 …` 或 `skip: 资源 "<key>" 的路径不在 …`,就是前置没铺全
+(其余 `skip: OWL_*=1 未开` 是有意门控,正常)。
 
 ## 维护约定
 
