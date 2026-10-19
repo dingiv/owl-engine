@@ -4888,3 +4888,221 @@ drafter 实例/rope)—— 跨 rank 复用一个树 = 引用别人的账本 ⇒ 
 2. **`depth` 扫描**(现 4;上限 7)与 `draft_kv_fp8` A/B;
 3. 显存:草稿池 + 主池在 20G 卡上紧(`live 23.7~25.0G` 对 `total 19.63G`,
    靠治理器压池)—— 后续要么 fp8 草稿池、要么降 `pool_tokens`。
+
+---
+
+## §63 P1.1 第二步:**lm_head 词表切 —— 引擎接线**(2026-10-19 同轮)
+
+> 承接 §P1.1 详案(路线图)的"待做五步";第一步(`ModelSpec.head_split` /
+> `Embedding::new_untied_head` / `logits_vocab()` 唯一真源)已在前轮落地
+> (缺省关 ⇒ 零行为变化)。
+
+### 63.1 战绩(std 五点三轮;双 3080;`tp2` 档;w4a16;非投机)
+
+| 臂 | prefill avg | decode avg | 显存 `live`(每卡) |
+|---|---:|---:|---:|
+| base(`tp_vocab_split = false`)| 1493.8 | **44.55** | 11.42 G |
+| **切档(`true`)** | 1486.1 | **48.06** | **10.24 G** |
+
+- **decode 五点一致 +7.9%**(逐点 +6.9% ~ +9.4%;详案预期 +9%);
+- prefill **持平**(+0.7%,噪声内);
+- **显存 −1.18 GiB/卡**(live 11.42 → 10.24),与详案账(半表 lm_head)逐字节吻合;
+- 冒烟:48 tok greedy 输出 **与不切档逐字一致**。
+
+> 数据:`/tmp/owl-vsplit-ab/{base,vsplit}/tp2-std.{csv,json}`。
+
+**附带收益(实测)**:IP 池容量上限(`[vram-gov] cap`)随 live 下降上抬 ——
+不切档 cap ≈ 187.5k tok → 切档 **226156 tok**(+20%,同一档 `per_tok = 32768B`)。
+256k(ctx 262144)仍需 **fp8 KV 池**(bf16 档差 ~1.7 GB;与 P1.1 无关的另一条路)。
+
+### 63.2 五步落地(每步的判据面)
+
+| # | 步 | 落点(文件级) | 判据 |
+|---|---|---|---|
+| 1 | **装载面规则传递** | `module.rs`: `Want.rule: Option<WeightRule>` + `LoaderOps::with_rule`;`linear.rs`: `layout` 收口(仅 `tp_role ≠ rule_of(key)` 时打标);`shard.rs`: `build_shard_pass` 优先读 `want.rule` | 新单测 `declared_rule_overrides_keytable`(声明档切/无声明直通) |
+| 2 | **配置位 + 装配** | `[runtime] tp_vocab_split`(`shared/config.rs`)/`ServerConfig`/`ModelLoader::vocab_split`(写入 `spec.head_split` 于 `sharded()` **之前**) | **单卡给值 = 响亮拒**;`sharded()` 拒 `tied × head_split` |
+| 3 | **槽宽 + stride** | `graph_fleet.rs`:decode/verify 两图 logits 槽与两处设备 argmax stride 改 `logits_vocab()`;`phases.rs`/`prefill_chunk.rs` 同类三处 | 半表档不越界(全量 stride 会跨行读) |
+| 4 | **拼接面(唯一出口)** | `running.rs`: `RunningEngine::read_full_logits`(未切档 = 单次读,逐字节等价)+ `concat_head_rows` 纯函数(r0 低半 ++ r1 高半);消费点:decode 采样/argmax/诊断、`harvest_prefill` 末块 token、`spec.rs` verify 行、`draft.rs` eager verify | 形状不符 ⇒ 响亮拒(不静默拼错) |
+| 5 | **门** | 新门 `tp_vocab_split_gate.rs`(27B;臂 A 不切 vs 臂 B 切;L1 结构 / L2 数值 / L3 功能);`tp_g8_gate` 加 `OWL_TP_VOCAB_SPLIT` 档(0.8B = tied ⇒ 验**响亮拒**) | 全绿(见 63.3) |
+
+**判据面 = 事实而非意图位**:引擎侧一律用 `head_split_active()`(`logits_vocab() !=
+vocab_size()`),不读 `spec.head_split` —— 意图可能被模型结构否定(tied 档),
+"事实在模型里"。
+
+### 63.3 验证读数(全绿)
+
+| 面 | 命令/门 | 读数 |
+|---|---|---|
+| 切档正判据(27B,untied) | `tp_vocab_split_gate`(2/3) | 半表 124160 ×2 = 248320;**逐步 max\|Δ\| = 0.000000**(逐位相同);token 序列逐位相同 |
+| tied 拒 | `tp_g8_gate` + `OWL_TP_VOCAB_SPLIT=1`(0.8B) | 装载**响亮拒** ✓(tied 表切不了) |
+| 常规回归 | `tp_g8_gate`(不切档) | 全绿(L1 逐位 / L2 top-N 互含) |
+| 装载面 | `tp_load_gate_27b` | 4/4 绿 |
+| 装配/确定性/位传输 | `tp_assemble_gate` / `tp_determinism_gate` / `tp_transport_bits_gate` | 全绿 |
+| lib | kernels 92 / models 229 / engine 57 | 全绿 |
+
+### 63.4 ★ 定谳:**切档 × 草稿档(DFlash2/MTP)= 投机失效**(实测回归 104→40 t/s)
+
+**现场**:`tp2-spec-d7-vsplit.toml`(TP2 + depth=7 + 切档)std 五点 ⇒ decode
+**40.20**(不切档同档 **104.05**)。日志:`spec-degrade` 31 条 —— **AL 2.4 → 1.4**
+⇒ B4 降级态机(盈亏线 1.4-1.9)持续把 spec 拖到裸 decode。
+
+**根因**(定谳):**草稿头共享 target lm_head** ——
+- DFlash2:`dflash2.rs` propose 内 `embed.lm_head_matmul(&hidden_head)`
+  ⇒ 切档后 logits = `[7, 124160]`;而 `CandidateSelector` 按 **`vocab = 248320`**
+  索引(码本 `[vocab, rank]` + topk)⇒ **候选只在前半词表**(rank0 半表,id 恰好
+  与全局前段一致 ⇒ AL **降而不零**:1.4 的形态与"半个词表可用"一致);
+- MTP:`mtp.rs` 同病(`embed.lm_head_matmul` + `argmax_f32idx(…, vocab, …)`)。
+
+**性质**:不是数值问题(拼接本身已验证逐位一致),是**草稿选择面的词表域**
+与 target 头切分**不匹配**。
+
+**处置(本轮)**:boot 期**响亮拒**(`engine.rs::boot_rank`:mode ∈ {DFlash2, Mtp}
+且 `logits_vocab() != vocab_size()` ⇒ 拒启,提示"关 tp_vocab_split 或 depth = 0")。
+**解**(未施工,记遗留):草稿选择面半表化 —— 两 rank 各出 top-k 候选 + host 合并
+(DFlash2 另需码本行偏移)。估:半天,见路线图 §11.6。
+
+### 63.5 教训(两条)
+
+1. **"共享件"是切分的隐藏契约面**:P2.1 的注释写"草稿 embed/lm_head 共享 target
+   不持有" —— 当时是**省显存的好事**,P1.1 一来就成了**词表切的爆炸点**。
+   凡"共享"必问:它的**维度**会不会被别的档切?(头/表/码本/池几何同族)
+2. **意图位 ≠ 实效**:`spec.head_split` 与"本 rank logits 真的半表"是两回事
+   (tied 档前者 true 后者 false;写错就是拼接 2× 宽)。引擎侧判据统一用
+   `logits_vocab() != vocab_size()`(事实),配置位只进装载面。
+
+### 63.6 遗留(下一步)
+
+1. **草稿选择面半表化**(上文 63.4 的解)—— 这是**生产 spec 档 × 词表切**的
+   唯一缺口(非投机档已 +7.9% 可用);
+2. `tp_load_gate`(0.8B;CpuFace)**既有失败**(与本轮无关,stash 复现同错):
+   `dtoh` 按 F32 读,而块的 dtype = F16 ⇒ "声明 7340032B != 收割 14680064B"。
+   修法 = 门按 `LoadEntry.dtype` 读;低频门,另案;
+3. 半表档的 greedy 走 host argmax(每步 ~1MB D2H)—— 详案说的"8B 分布式
+   argmax"仍是后续优化(值 ≈ 半表档 decode 再 +2% 量级)。
+
+---
+
+## §64 草稿选择面半表化 —— **spec 档 × 词表切解锁**(2026-10-19 深夜)
+
+> 承接 §63.4 的定谳(切档 × 草稿档 = 投机失效)与路线图 §11.7 的立案。
+
+### 64.1 战绩(std 五点三轮;双 3080;`tp2-spec-d7` 档;w4a16;depth=7)
+
+| 臂 | prefill avg | decode avg | 显存 `live`(每卡) | `spec-degrade` |
+|---|---:|---:|---:|---:|
+| base(`tp_vocab_split = false`)| 1472.8 | **104.05** | 12.61 G | 0 |
+| **切档(`true`)** | 1472.0 | **109.74** | **11.43 G** | **0** |
+
+- **decode 五点全正 +5.1% ~ +7.2%(均值 +5.5%)**;
+- **显存 −1.18 GiB/卡**(12.61 → 11.43);
+- **0 降级**(AL 与不切档同档 —— 草稿候选不再塌);
+- 冒烟:48 tok greedy 输出 **与不切档逐字一致**。
+
+> 数据:`/tmp/owl-vsplit-ab/{spec-base,spec-vsplit2}/tp2-std.{csv,json}`。
+
+### 64.2 方案(零新核、零跨 rank 设备设施)
+
+```text
+propose 图（图内,每 rank 半表）:
+  7 层草稿 → lm_head(半表) → logits [7, half]
+  → Topk16Split/Merge（**半表域**,stride = 张量形状）→ topk 单缓冲 224
+  → 图输出槽:`topk`（值 112 ‖ 索引 112）+ `sel_proj` [7,256]（草稿 dt）
+host（engine）:
+  读两 rank → rank1 id += half → merge_topk_two_halves（值降序/平局小 id）
+  → 回送设备 → **rank0** select_from_candidates（全表域;码本**不切**）→ drafts
+```
+
+**正确性依据**:全局 top-16 ⊆ 两半各自 top-16 的并集(截断性质)。
+
+### 64.3 落地(六件)
+
+| # | 件 | 落点 |
+|---|---|---|
+| 1 | selector 拆三件 + `forward_hidden` + `propose_block_split`(零回归:smoke 逐字一致)| `models/layers/dflash2.rs` |
+| 2 | **图两形态**:切档出 `topk`/`sel_proj`,未切档原路 | `engine/graph_fleet.rs::plan_dflash` |
+| 3 | **`read_output_f32` 加 BF16 分支**(见 64.4 坑②)| `engine/graph_plan.rs` |
+| 4 | **候选合并纯函数** `merge_topk_two_halves` + 4 单测 | `engine/running.rs` |
+| 5 | **收割面** `dflash_select_merged`(读槽→合并→rank0 select→drafts);`dflash_graph_round` 切档分支 | `engine/exec/draft.rs` |
+| 6 | 护栏收窄:DFlash2 **图档放行**;MTP / eager 降级档仍拒 | `engine/engine.rs::boot_rank` |
+
+### 64.4 现场两个坑(都会静默错,记录防再踩)
+
+1. **图输出槽 = "整父块"契约**:`sc.output(name, &view)` 输出的是 view 的**整父块**
+   (原 `drafts` 注释:"输出槽形状 = 整缓冲 —— dtoh 整父块契约")。首版按 `[7,16]`×2
+   声明两槽 ⇒ 装配期**响亮拒**("输出 topk_vals 归约 224 元素 ≠ 声明 112")⇒
+   收成单槽 `[2·7·16]`(值区 ‖ 索引区),host 按同序切片。
+2. **`read_output_f32` 把 BF16 当 F32 读**(旧实现 `match { F16 => ..., _ => f32 }`)——
+   此前无 BF16 输出槽被读 ⇒ 潜伏;**草稿 `sel_proj` 槽是草稿 dt(BF16)** 才暴露。
+   补 BF16 分支(`half::bf16`),对既有路径零影响。
+
+### 64.5 验证(全绿)
+
+| 面 | 门/命令 | 读数 |
+|---|---|---|
+| 组合正确性 | 生产 spec 档 smoke(不切 vs 切)| 48 tok **逐字一致**;0 降级 |
+| 非投机切档 | `tp_vocab_split_gate`(27B) | L1/L2/L3 全绿(max\|Δ\|=0) |
+| 常规 TP | `tp_g8_gate`(0.8B)+ lib | 全绿(kernels 92 / models 229 / engine 61) |
+| 性能 | std 五点三轮 | decode **+5.5%**;显存 **−1.18 GiB/卡** |
+
+### 64.6 残留
+
+1. **MTP 草稿档 × 切档**:仍**响亮拒**(MTP 的 argmax stride/选择面未半表化)——
+   若将来要 MTP × 切档,照本案同法(候选合并)做;
+2. **DFlash2 eager 降级档 × 切档**:仍拒(`[graph] no_graph = true` 或捕获失败的
+   降级路未做合并;生产图档已覆盖);
+3. 9B/35B 等其它档的切档收益未量(本案只测 27B)。
+
+---
+
+## §65 v1 两核融合 —— **AR 一核落地**(2026-10-19 深夜)
+
+> 出处:路线图 §11.2 细案;靶来自 §59.1 定谳(两核 22.13µs/次 = 两个核各自的
+> 落地/排空,协议钱 ≈ 0)。
+
+### 65.1 战绩
+
+| 档 | 基线(两核) | **融合一核** | 差 |
+|---|---:|---:|---:|
+| **非投机(std 五点;切档)** | 47.44 | **49.25** | **+3.8%** |
+| 投机 spec-d7(切档;两次交替采样) | 108.19 / 109.74 | 103.43 / **109.87** | **方差 ±5% ⇒ 待更多样本** |
+
+- 非投机档与预测(§11.2 的 ~7µs/次 × 128 = 0.9ms/步 ≈ +4%)吻合;
+- prefill 持平(1456~1484,噪声内);
+- **0.8B 门:融合档 5/5 连跑全绿**(`tp.ar.fused=96 · v1=0 · push=0`;L1 两 rank 逐位
+  相同;L2/L3 同 vLLM 判据)。
+
+### 65.2 落地(核 + 五处参数表 + 注入 + 配置)
+
+| # | 件 | 落点 |
+|---|---|---|
+| 1 | **融合核**(f32/f16/bf16 三实例):一核内两阶段 = 写槽 → 发布 produced → 尾部 rendezvous → 全线程 acquire → 读对端加 → 发布 consumed | `cu/comm/ar_fused.cu`(新;helper 逐字复制自两核,遵"`.cu` 间不 include"纪律) |
+| 2 | 两段 `wait_done` 令牌:第一段 `2·prod+1`(credit 放行)/第二段 `2·prod+2`(rendezvous 放行) | 同上(核内) |
+| 3 | `TpOpts.ar_fused` + `TpCtx.ar_fused` + `TpStaging.ar_fused` | `engine/tp.rs` / `models/module.rs` |
+| 4 | 注入点分派(fused 档走一核;**fp8 腿仍两核**) | `models/interpreters/eval.rs` |
+| 5 | `[runtime] tp_ar_fused`(缺省 false) | `shared/config.rs` + `apps/server/src/{config,main}.rs` |
+| 6 | flavor `allowed_ops` + 2 核名 | `flavors/tp27b.toml` |
+| 7 | 门:`OWL_TP_AR_FUSED=1` 档 + 路径判据(`fused>0 ∧ v1=0 ∧ push=0`) | `tests/tp_g8_gate.rs` |
+
+**与两核的两处结构差**(详见 `ar_fused.cu` 头注):
+① `wait_done` 走**两段值**(stage 的 rendezvous 在核尾顺带完成,融合核之后还要全体读 ⇒
+必须放行全体);② `produced` **每调用 +1**(两核版 stage+reduce 各 +1 = 2×,靠流序掩盖;
+融合核用正确游标 ⇒ credit 判据真正生效)。
+
+### 65.3 两个坑
+
+1. **`tp.ar.v1/push` 计数口径**(已修):该计数原在"数据块选择"段(v1/push 两档共用),
+   融合档下也会增 ⇒ 门的路径判据误红。修法 = 计数**移到两核分支内**
+   (语义本来就是"走了两核的哪种绑法")。
+2. **★ 图捕获 slab 定尺低估**(未根治):融合核把两个节点并一 ⇒ 图捕获的**峰值活跃集
+   合法变大**(少一个中间回收点;实测差 **139264B = 一个 `[8, 8704] f16` 草稿 MLP 块**),
+   而 slab 容量来自 **warmup 计量**(hint = 12.36MiB)⇒ **生产 spec 档启动被拒**
+   ("捕获 slab 耗尽:需 139264B")。**解封 = 运行档 `[cuda] capture_slab_mb = 32`**(已验);
+   **根治 = 让 hint/定尺覆盖融合形态**(见 §65.4)。
+
+### 65.4 遗留
+
+1. **slab 定尺根治**:hint(warmup 计量)要含"融合档峰值" —— 或 `carve` 失败时
+   **自动放大重试**(现在是一次性定尺,失败即拒启);
+2. **fp8 融合腿**(prefill 的 >256KB 载荷)仍两核 —— decode 收益面已全覆盖,prefill 收益小;
+3. **spec 档的融合收益**需更多样本(±5% 方差;当前 2+2 样本 ⇒ 持平略好);
+4. `tp_vocab_split × tp_ar_fused × spec` 三档组合的**恒等门**(两臂逐字)未固化。
