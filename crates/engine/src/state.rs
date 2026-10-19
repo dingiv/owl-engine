@@ -1288,16 +1288,18 @@ impl StatePool {
     }
 
     /// **槽位选择**(纯;S2 §25.2):同 key 已在设备 ⇒ 原地;否则空槽;
-    /// 否则**最冷的设备快照**(调用方决定下沉还是丢)。池关闭 ⇒ `None`。
+    /// 否则按**store 给的出序**取第一个仍在槽上的快照(§30.6-②)。
     ///
-    /// `rank` = 逐出优先级(小者先出;调用方给事实,本函数只排序):
-    /// 生成段快照(Transient)逐出即丢、零代价 ⇒ 排在前(先丢它);
-    /// 前缀段快照(Durable)有跨会话共享价值 ⇒ 排在后。同档内照旧 LRU
-    /// ⇒ **链头那条永远最新、永远不是 victim** ⇒ 复用面无损。
+    /// `order` = [`owl_store::Rel::snap_victim_order`] 的结果(该走的先后;
+    /// 事实档 + `EvictPolicy`,与容量调度**同一份判据**)。本函数只做
+    /// **key→槽的物理映射**——判据不再在池里(旧实现自带 `rank + LRU` = 第二套规范)。
+    ///
+    /// 兜底:`order` 为空/全是已不在槽的键(判与选之间被别处移走)⇒ 池内 LRU
+    /// (只按 `last_use`;这是"物理映射的退化",不是另一套语义档)。
     pub(crate) fn snap_pick_slot(
         &self,
         key: SnapKey,
-        rank: &dyn Fn(SnapKey) -> u8,
+        order: &[SnapKey],
     ) -> Option<SnapSlotPick> {
         if self.snaps.keys.is_empty() {
             return None;
@@ -1308,13 +1310,18 @@ impl StatePool {
         if let Some(i) = self.snaps.keys.iter().position(|k| k.is_none()) {
             return Some(SnapSlotPick::Free(i as u32));
         }
+        for want in order {
+            if let Some(i) = self.snaps.keys.iter().position(|k| *k == Some(*want)) {
+                return Some(SnapSlotPick::Victim(i as u32, *want));
+            }
+        }
         let (i, _) = self
             .snaps
             .keys
             .iter()
             .enumerate()
             .filter_map(|(i, k)| k.map(|k| (i, k)))
-            .min_by_key(|(i, k)| (rank(*k), self.snaps.last_use[*i]))?;
+            .min_by_key(|(i, _)| self.snaps.last_use[*i])?;
         Some(SnapSlotPick::Victim(i as u32, self.snaps.keys[i]?))
     }
 

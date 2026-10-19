@@ -41,6 +41,8 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     let cell = owl_store::shared_ledger(owl_store::tier_budget_of(
         cfg.knobs.host_cache_mb,
         cfg.knobs.snap_host_mb,
+        cfg.knobs.disk_cache_mb,
+        cfg.knobs.snap_disk_mb,
     ));
     let face = CpuFace::mock(MockLimits {
         null_kernels: true,
@@ -110,7 +112,7 @@ async fn ledger_captures_load_pool_and_graph_phases() {
 fn ledger_budget_mismatch_is_rejected() {
     // store 侧已有单测覆盖(rel.rs `open_rejects_unmeasured_budget_and_geometry`);
     // 这里只钉住引擎侧**同一个算式**(tier_budget_of)是唯一产地。
-    let a = owl_store::tier_budget_of(512, 512);
+    let a = owl_store::tier_budget_of(512, 512, 0, 0);
     assert_eq!(a.host_bytes, 1024 << 20, "host 总量 = 两块之和");
     assert_eq!(a.disk_bytes, 0, "盘层二期(恒 0)");
     let _ = AssetClass::Weight; // 词表在引擎侧可见(公共面)

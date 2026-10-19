@@ -56,6 +56,9 @@
 //! | pool | prefix_cache | bool / true |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
 //! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
+//! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
+//! | pool | disk_cache_mb / snap_disk_mb | usize / 0、0(**磁盘两层分片**;0 = 关层) |
+//! | pool | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
 //! | spec | depth / dumb / draft_kv_fp8 | usize 0(off)、flag、flag |
 //! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
 //! | spec | degrade_after / probe_every | usize / 6、8(降级首探窗口;旧 64 = 长尾税) |
@@ -267,7 +270,7 @@ pub struct ModelCfg {
 }
 
 /// 池几何与显存预算(engine StatePool)
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PoolCfg {
     /// 设备 KV 池(token;`None` = 2 × 单会话容量)。
@@ -310,6 +313,17 @@ pub struct PoolCfg {
     /// **宿主状态腿**(MiB;0 = 关层)。GDN 快照下沉的落点 ——
     /// ⚠️ 超卖档会把压力推给它(实测 27B 单快照 607 MiB),别只给 KV 腿留量。
     pub snap_host_mb: usize,
+    /// **磁盘 KV 腿**(MiB;0 = 关层;S6)。宿主装不下时的第二落点(内容不丢)。
+    ///
+    /// 目录由 `disk_dir` 指定;进程重启后**扫目录回填账**(内容惰性读回)。
+    pub disk_cache_mb: usize,
+    /// **磁盘状态腿**(MiB;0 = 关层;与 [`Self::disk_cache_mb`] 同属盘层总账的两个分片)。
+    pub snap_disk_mb: usize,
+    /// **磁盘内容目录**(空 = 关层;两腿子目录 `kv/` 与 `snap/` 自动分)。
+    ///
+    /// 目录必须**独占**(同一目录给两个引擎用会互相扫到对方的块);
+    /// 不存在时 boot 自动创建。
+    pub disk_dir: String,
     pub vram_target: f64,
     pub vram_reserve_mb: u64,
     pub prefix_cache: bool,
@@ -980,6 +994,9 @@ impl Default for PoolCfg {
             snap_max: 4,
             host_cache_mb: 0,
             snap_host_mb: 0,
+            disk_cache_mb: 0,
+            snap_disk_mb: 0,
+            disk_dir: String::new(),
             pool_cap_mb: 256,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
@@ -1328,6 +1345,24 @@ impl OwlConfig {
                 "[pool] prefix_cache_share({}) 越界:须 0..=1(份额 × 设备池 = 缓存可占页数)",
                 self.pool.prefix_cache_share
             ));
+        }
+        // **磁盘层的配置自洽**(S6):给了配额就必须给目录(否则"要磁盘"变成静默关层);
+        // 给了目录但没配额 = 空目录守着不用(允许,但 boot 日志会显示关层)。
+        // 目录给多个引擎共用 = 互相扫到对方的块 ⇒ 拒(独占是硬约束)。
+        let disk_bytes = self.pool.disk_cache_mb + self.pool.snap_disk_mb;
+        if disk_bytes > 0 && self.pool.disk_dir.trim().is_empty() {
+            return Err(format!(
+                "[pool] 给了磁盘配额({} MiB)却没给 disk_dir —— 要么补目录,要么把配额清零\
+                 (静默关层会让「别急着丢」的承诺失效)",
+                disk_bytes
+            ));
+        }
+        if self.pool.snap_disk_mb > 0 && self.pool.snap_max == 0 {
+            return Err(
+                "[pool] snap_disk_mb > 0 但 snap_max = 0(没有快照池,盘上分片无意义)\
+                 —— 清掉 snap_disk_mb 或给快照池"
+                    .to_string(),
+            );
         }
         if self.pool.gdn_slots < self.server.max_concurrency {
             return Err(format!(

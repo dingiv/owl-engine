@@ -163,6 +163,12 @@ pub struct EngineKnobs {
     /// 不超总账)。为什么分开:两条腿的搬运形态与热区完全不同,共用一个数
     /// 只会让一边饿死(实测:全给 KV 腿 ⇒ 快照下沉无位 ⇒ 冷快照被丢)。
     pub snap_host_mb: usize,
+    /// **磁盘 KV 腿预算 MiB**(S6;0 = 关层)。宿主两级都满时的最后一站(**内容不丢**)。
+    pub disk_cache_mb: usize,
+    /// **磁盘状态腿预算 MiB**(S6;0 = 关层;与 [`Self::disk_cache_mb`] 同属盘层总账)。
+    pub snap_disk_mb: usize,
+    /// **磁盘内容目录**(空 = 关层)。
+    pub disk_dir: String,
     /// **准入满员姿态**(S3b;缺省响亮拒)。`OWL_ADMIT_ON_FULL=reject|queue[:ms]`。
     ///
     /// `Reject` = 准入拒(客户端该降并发/重试,不是压缩上下文);
@@ -251,6 +257,9 @@ impl Default for EngineKnobs {
             prefix_cache_share: 0.5,
             host_cache_mb: 0,
             snap_host_mb: 0,
+            disk_cache_mb: 0,
+            snap_disk_mb: 0,
+            disk_dir: String::new(),
             pool_cap_mb: 256,
             index_probe: false,
             coverage_probe: false,
@@ -445,12 +454,15 @@ impl EngineKnobs {
             }
         };
         format!(
-            "pool={:?} turns={} snap_max={} host={}M snap_host={}M prefix_cache={}:{:.2} align_tail={} bnd_stride={} | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
+            "pool={:?} turns={} snap_max={} host={}M snap_host={}M disk={}M snap_disk={}M dir={:?} prefix_cache={}:{:.2} align_tail={} bnd_stride={} | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
             self.gdn_slots,
             self.snap_max,
             self.host_cache_mb,
             self.snap_host_mb,
+            self.disk_cache_mb,
+            self.snap_disk_mb,
+            self.disk_dir,
             self.prefix_cache as u8,
             self.prefix_cache_share,
             self.prefill_align_tail as u8,
@@ -512,6 +524,9 @@ impl EngineKnobs {
             prefix_cache_share: cfg.pool.prefix_cache_share,
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
             host_cache_mb: cfg.pool.host_cache_mb,
+            disk_cache_mb: cfg.pool.disk_cache_mb,
+            snap_disk_mb: cfg.pool.snap_disk_mb,
+            disk_dir: cfg.pool.disk_dir.clone(),
             // 状态腿宿主预算(S2;`[pool].snap_host_mb`;两条腿各有热区,别互相饿死)
             snap_host_mb: cfg.pool.snap_host_mb,
             // ── KVMem 选择层(B 轴):全部来自 `[kvmem]`,零 env ──
@@ -689,7 +704,12 @@ fn assemble_budget(
         .saturating_sub(kv_pool + gdn_pool + snap_pool + draft_pool);
     // 中层预算(host/盘):**唯一算式在 store**(`tier_budget_of`)—— boot 造账与
     // 本处预算入参必须同源(两处各算一遍 = 迟早漂;`Rel::open` 还会交叉校验兜底)。
-    let tier_budget = owl_store::tier_budget_of(cfg.knobs.host_cache_mb, cfg.knobs.snap_host_mb);
+    let tier_budget = owl_store::tier_budget_of(
+        cfg.knobs.host_cache_mb,
+        cfg.knobs.snap_host_mb,
+        cfg.knobs.disk_cache_mb,
+        cfg.knobs.snap_disk_mb,
+    );
     let inputs = owl_store::BudgetInputs {
         v_card_bytes: boot.v_card_bytes as usize,
         weights_bytes: weights as usize,
@@ -758,6 +778,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let ledger = owl_store::shared_ledger(owl_store::tier_budget_of(
             cfg.knobs.host_cache_mb,
             cfg.knobs.snap_host_mb,
+            cfg.knobs.disk_cache_mb,
+            cfg.knobs.snap_disk_mb,
         ));
         Self::on_with_ledger(cfg, face, ledger)
     }
@@ -927,6 +949,128 @@ pub(crate) fn into_running<D: DeviceClient>(
                     dev.pool.snap_bytes(),
                     b.rel.snap_host_budget() as f64 / 1048576.0
                 );
+            }
+            // **磁盘层接线 + 启动回加载**(S6;用户 2026-10-19):配置给配额与目录 ⇒
+            // 接盘(两腿分片)+ **扫目录回填账**(内容惰性读:27B 一条快照 159 MiB,
+            // 全量预读会把启动拖垮)。大小不符/超预算/重复 = 隔离并逐条 WARN。
+            if (cfg.knobs.disk_cache_mb + cfg.knobs.snap_disk_mb) > 0 && !cfg.knobs.disk_dir.is_empty()
+            {
+                let snap_disk_bytes = if dev.pool.paged && dev.pool.snap_capacity() > 0 {
+                    cfg.knobs.snap_disk_mb << 20
+                } else {
+                    0 // 没快照池 ⇒ 状态腿盘分片无意义(不许静默吃掉配额)
+                };
+                let attach = b.rel.attach_disk(
+                    cfg.knobs.disk_dir.clone(),
+                    cfg.knobs.disk_cache_mb << 20,
+                    snap_disk_bytes,
+                )?;
+                // **S6.1:按盘上链索引重建树**(跨重启复用的真身)。
+                //
+                // 顺序:①内容入账(`adopt_disk`)②索引解码(每条链 ≈32 KB,同步读一次)
+                // ③`adopt_disk_chains` 逐链重算块身份 + 按"内容文件在场"截断到连续前缀
+                // ④重建条目为**非设备层**(`slot = None`)⑤盘上没被任何重建链引用的
+                // 内容 = 孤儿(占配额且永远用不上)⇒ 清掉(索引文件保留:只增不删)。
+                let snap_entries =
+                    crate::disk_io::scan_dir_sync::<owl_store::SnapKey>(&attach.snap_root);
+                let kv_entries =
+                    crate::disk_io::scan_dir_sync::<owl_store::ChainHash>(&attach.kv_root);
+                let (n_kv, n_snap) = (kv_entries.len(), snap_entries.len());
+                let (ra, rb) = b.rel.adopt_disk(kv_entries, snap_entries);
+                owl_shared::log_info!(
+                    "store",
+                    "磁盘层:配额 {}MiB(KV {} / 快照 {})· 目录 {} · 回填内容 KV {}/{} 快照 {}/{} 条 · 隔离 {}+{} 条(内容惰性读回)",
+                    cfg.knobs.disk_cache_mb + cfg.knobs.snap_disk_mb,
+                    cfg.knobs.disk_cache_mb,
+                    snap_disk_bytes >> 20,
+                    cfg.knobs.disk_dir,
+                    ra.adopted,
+                    n_kv,
+                    rb.adopted,
+                    n_snap,
+                    ra.skipped.len(),
+                    rb.skipped.len(),
+                );
+                for (p, why) in ra.skipped.iter().chain(rb.skipped.iter()) {
+                    owl_shared::log_warn!("store", "磁盘回填隔离 {}:{why}", p.display());
+                }
+
+                let idx_files =
+                    crate::disk_io::scan_index_sync::<owl_store::ChainHash>(&attach.kv_root);
+                let mut idxs = Vec::with_capacity(idx_files.len());
+                for (_, p) in &idx_files {
+                    let decoded = std::fs::read(p)
+                        .map_err(|e| format!("{e}"))
+                        .and_then(|bytes| {
+                            owl_store::ChainIndex::decode(&bytes).map_err(|e| format!("{e}"))
+                        });
+                    match decoded {
+                        Ok(i) => idxs.push(i),
+                        Err(e) => {
+                            owl_shared::log_warn!("store", "链索引不可用 {}:{e}", p.display());
+                        }
+                    }
+                }
+                let rep = b.rel.adopt_disk_chains(&idxs)?;
+                {
+                    let kept: std::collections::HashSet<_> = rep.kept.iter().copied().collect();
+                    let orphans: Vec<owl_store::ChainHash> = b
+                        .rel
+                        .disk
+                        .as_ref()
+                        .map(|d| {
+                            d.resident_keys()
+                                .into_iter()
+                                .filter(|k| !kept.contains(k))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !orphans.is_empty() {
+                        let paths: Vec<std::path::PathBuf> = b
+                            .rel
+                            .disk
+                            .as_ref()
+                            .map(|d| {
+                                orphans
+                                    .iter()
+                                    .filter_map(|k| d.path_of(*k).map(|p| p.to_path_buf()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for p in &paths {
+                            let _ = std::fs::remove_file(p);
+                        }
+                        let freed = b
+                            .rel
+                            .disk
+                            .as_mut()
+                            .map(|d| d.commit_evict(&orphans))
+                            .unwrap_or(0);
+                        owl_shared::log_warn!(
+                            "store",
+                            "盘上孤儿内容:清掉 {} 块 / {freed}B(无索引或索引截断;索引文件保留)",
+                            orphans.len()
+                        );
+                    }
+                }
+                owl_shared::log_info!(
+                    "store",
+                    "跨重启复用:索引 {} 条 ⇒ 重建 {} 链 / {} 块 · 跳过 {} · 截断 {}",
+                    idxs.len(),
+                    rep.chains,
+                    rep.blocks,
+                    rep.skipped.len(),
+                    rep.truncated.len()
+                );
+                for (what, why) in &rep.skipped {
+                    owl_shared::log_warn!("store", "链重建跳过({what}):{why}");
+                }
+                for (what, n) in &rep.truncated {
+                    owl_shared::log_info!(
+                        "store",
+                        "链截断({what}):盘上只覆盖前缀 {n} 块(其余内容不在盘上)"
+                    );
+                }
             }
             b
         };

@@ -52,8 +52,8 @@ pub struct PrefixMatch {
 /// 树变更(调用方据此调槽池引用 / 台账)。
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TreeUpdate {
-    /// 新进树的条目(内容身份, 设备槽)。
-    pub(crate) inserted: Vec<(ChainHash, u32)>,
+    /// 新进树的条目(内容身份, 设备槽;`None` = 盘/宿主层重建,无设备绑定)。
+    pub(crate) inserted: Vec<(ChainHash, Option<u32>)>,
     /// 因容量被逐出的条目(内容身份, 设备槽 = `None` 表示它本来就在 host 层)。
     /// **有槽 ≠ 槽被回收**:槽此刻可能仍被会话持有(回收判据在槽池引用账)。
     pub(crate) evicted: Vec<(ChainHash, Option<u32>)>,
@@ -173,8 +173,31 @@ impl PrefixTree {
         let mut update = TreeUpdate::default();
         let mut base = ChainHash::new(0); // 从根起(全量登记)
         for (block, &slot) in tokens.chunks(self.block_tokens).take(n).zip(slots) {
-            let Some(next) = self.insert_one(base, block, slot, &mut update) else {
+            let Some(next) = self.insert_one(base, block, Some(slot), &mut update) else {
                 break; // 哈希碰撞(指纹不符):当断链处理,响亮地不登记
+            };
+            base = next;
+        }
+        self.trim(&mut update);
+        update
+    }
+
+    /// **无设备绑定的链登记**(S6.1:启动时按盘上索引**重建树**)。
+    ///
+    /// 语义与 [`Self::insert`] 逐块一致(同一份哈希/指纹/父链),唯一区别是
+    /// 新条目 `slot = None` —— 内容在盘上(或宿主),`locate` 归 `Tier::Host`
+    /// ⇒ 命中后由 `fill_kv_from_disk` 读回宿主。**不复查内容是否存在**
+    /// (调用方已按"内容文件在场"截断过 tokens)。
+    pub(crate) fn insert_offloaded(&mut self, tokens: &[u32]) -> TreeUpdate {
+        if !self.enabled() {
+            return TreeUpdate::default();
+        }
+        let n = tokens.len() / self.block_tokens;
+        let mut update = TreeUpdate::default();
+        let mut base = ChainHash::new(0);
+        for block in tokens.chunks(self.block_tokens).take(n) {
+            let Some(next) = self.insert_one(base, block, None, &mut update) else {
+                break;
             };
             base = next;
         }
@@ -199,7 +222,7 @@ impl PrefixTree {
             if block.len() != self.block_tokens {
                 break; // 非整块 = 结构错(调用方保证;不静默凑数)
             }
-            let Some(next) = self.insert_one(base, block, *slot, &mut update) else {
+            let Some(next) = self.insert_one(base, block, Some(*slot), &mut update) else {
                 break;
             };
             base = next;
@@ -213,7 +236,7 @@ impl PrefixTree {
         &mut self,
         base: ChainHash,
         block: &[u32],
-        slot: u32,
+        slot: Option<u32>,
         update: &mut TreeUpdate,
     ) -> Option<ChainHash> {
         let hash = hash_block(base, block);
@@ -241,7 +264,7 @@ impl PrefixTree {
                 let access = self.next_access();
                 self.entries.insert(
                     hash,
-                    Entry { parent, children: 0, access, fingerprint, slot: Some(slot) },
+                    Entry { parent, children: 0, access, fingerprint, slot },
                 );
                 self.leaf_set.insert(hash);
                 self.leaf_lru.push_back((hash, access));
@@ -313,6 +336,15 @@ impl PrefixTree {
         }
         self.leaf_lru.extend(deferred);
         evicted
+    }
+
+    /// **宿主层条目**(`slot = None`,不限叶;S6.1 的"整链搬盘"锚点面)。
+    pub(crate) fn host_entries(&self) -> Vec<(ChainHash, u64)> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.slot.is_none())
+            .map(|(c, e)| (*c, e.access))
+            .collect()
     }
 
     /// 叶条目(驱逐候选面;调用方按策略排序)。

@@ -981,11 +981,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 );
             }
             // 登记/触达(层 = 设备;档 = 调用方给的事实)
-            self.bank.rel.state.register_snap(
+            // **会话感知**(2026-10-19):记归属与边界深度 —— 淘汰时同会话
+            // **末端(深边界)先走**,保留链头前缀(否则头部被逐 ⇒ 后面全垃圾)。
+            self.bank.rel.state.register_snap_owned(
                 key,
                 self.dev.pool.snap_bytes(),
                 owl_store::Tier::Gpu,
                 durability,
+                sid,
+                full_blocks,
             );
         }
         // **B 轴 B-0:同一处顺手采索引**(同一"块边界 + 链尾身份"事件 ⇒
@@ -1016,6 +1020,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             if !blk_slices.is_empty() {
                 let up = self.bank.rel.leg.register_chain_inc(parent0, &blk_slices)?;
+                self.bank.rel.leg.set_owner(sid, &up.inserted);
                 mcnt("store.chain.inc.blocks", up.inserted.len() as u64);
                 mcnt("store.chain.inc.evicted", up.evicted.len() as u64);
                 // **A1 取证**(`OWL_RECON_DBG=1`):注册口三数 —— 送入 / 入树 / 被逐。
@@ -1148,21 +1153,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// - 池关(`snap_max = 0`)⇒ 结构性拒(调用方已先行跳过)。
     pub(crate) async fn snap_ensure_slot(&mut self, key: owl_store::SnapKey) -> Result<u32> {
         use crate::state::SnapSlotPick;
-        // **逐出优先级 = store 的事实(重要性档)**;排序在池里(纯)。
-        // 生成段快照(Transient)先出 —— 逐出即丢、零代价;前缀段(Durable)
-        // 有跨会话共享价值,且下沉一条 159 MiB ≈ **208 ms**(实测 2026-10-19)
-        // ⇒ 只在**没有可丢的**时候才动它。
-        let pick = {
-            let state = &self.bank.rel.state;
-            let rank = |k: owl_store::SnapKey| -> u8 {
-                match state.snap_durability(k) {
-                    Some(owl_store::SnapDurability::Transient) => 0,
-                    _ => 1, // Durable / 未登账(保守:不动)
-                }
-            };
-            self.dev.pool.snap_pick_slot(key, &rank)
-        }
-        .ok_or_else(|| {
+        // **判据 = store(唯一产地;§30.6-②)**:出序(事实档 + EvictPolicy)从
+        // `Rel::snap_victim_order` 拿;池只做 key→槽映射。旧实现在池内自带
+        // `rank + LRU` = 第二套规范(与容量调度可能各说各话)。
+        let order = self.bank.rel.snap_victim_order(&[]);
+        let pick = self.dev.pool.snap_pick_slot(key, &order).ok_or_else(|| {
             owl_iface::contract::ModelError::Msg(
                 "GDN 快照池为空(snap_max = 0):调用方应跳过 capture".into(),
             )
@@ -1288,6 +1283,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let table = owl_store::reclaim_slot_table(conn)?;
         self.bank.rel.commit_snap_onload(key, table)?;
         self.dev.pool.snap_place(slot, key);
+        // **触达入 store 账**(§30.6-②):store 的 `last_use` 是出序输入;
+        // 池的 `last_use` 只是物理面。两处同刻更新 ⇒ 判据与池不再漂。
+        self.bank.rel.state.touch(key);
         owl_shared::metrics::with_metrics_store(|m| {
             m.counter_add("store.snap.in", 1, file!(), line!());
             m.counter_add(
@@ -1307,23 +1305,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         key: owl_store::SnapKey,
     ) -> Result<u32> {
         match self.bank.rel.state.locate(key) {
-            Some(owl_store::Tier::Gpu) => self
-                .dev
-                .pool
-                .snap_slot_of(key)
-                .ok_or_else(|| {
+            Some(owl_store::Tier::Gpu) => {
+                let slot = self.dev.pool.snap_slot_of(key).ok_or_else(|| {
                     owl_iface::contract::ModelError::Msg(format!(
                         "快照 {key:?} 账在设备层但池里找不到槽(账目不平)"
                     ))
-                }),
+                })?;
+                // 使用即触达(store 出序的真源)
+                self.bank.rel.state.touch(key);
+                Ok(slot)
+            }
             Some(owl_store::Tier::Host) => {
                 let slot = self.snap_ensure_slot(key).await?;
                 self.snap_onload(key, slot).await?;
                 Ok(slot)
             }
-            Some(owl_store::Tier::Disk) => Err(owl_iface::contract::ModelError::Msg(format!(
-                "快照 {key:?} 在磁盘层(未接线)"
-            ))),
+            Some(owl_store::Tier::Disk) => {
+                // **S6**:盘 → 宿主 → 设备(两跳);读回后层账回 Host,再走 Host 分支
+                self.fill_snap_from_disk(key).await?;
+                let slot = self.snap_ensure_slot(key).await?;
+                self.snap_onload(key, slot).await?;
+                Ok(slot)
+            }
             None => Err(owl_iface::contract::ModelError::Msg(format!(
                 "快照 {key:?} 不在账(已被逐出)"
             ))),

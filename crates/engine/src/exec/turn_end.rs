@@ -93,7 +93,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // E2c:块链登记前缀缓存(缓存持引用;会话释放后块仍驻留)。
             // S3-2:登记走 store 的块腿(引用配对在腿内自洽)
             if self.dev.pool.paged {
-                let up = self.bank.rel.leg.register_chain(&s.tokens, &s.block_table)?;
+                // **会话感知**(2026-10-19):链块记到会话名下(淘汰时按会话从末端削)
+                let up = self.bank.rel.leg.register_chain_owned(
+                    &s.tokens,
+                    &s.block_table,
+                    act.session_id,
+                )?;
                 if self.cfg.knobs.probes.debug {
                     owl_shared::log_debug!(
                         "dbg prefix",
@@ -103,6 +108,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         up.evicted.len()
                     );
                 }
+            }
+        }
+        // **S6.1:盘上链索引**(turn 收口一次;内容可能还没溢写 ⇒ boot 按内容截断)。
+        // 放在 `ephemeral` 焚毁之前 —— 会话 tokens 此刻还在。
+        if self.dev.pool.paged && self.bank.rel.disk_enabled() {
+            let toks = self
+                .bank
+                .sessions
+                .get(act.session_id)
+                .map(|s| s.tokens.clone())
+                .unwrap_or_default();
+            if !toks.is_empty() {
+                self.write_chain_index(&toks).await?;
             }
         }
         if act.ephemeral {

@@ -25,12 +25,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 必须在 `write_bt` 之前(否则写进设备的是占位坏槽)。搬运实现全在 store。
         if !b.pending_loads.is_empty() {
             let t_stage = std::time::Instant::now();
-            let leg = &mut self.bank.rel.leg;
-            let face = self.dev.graphs.session.face_mut();
             // §21:搬运由 engine 编排(取计划 → face.swap → 回执 → 记账);
             // **一条命令搬 N 块**(逐块 = 每块一次往返,回灌收益被吃光)。
             let chains: Vec<owl_store::ChainHash> =
                 b.pending_loads.iter().map(|(_, c)| *c).collect();
+            // **S6**:盘上的块先读回宿主(盘 → 设备要两跳;判据与账都在 store)
+            let _ = self.ensure_host_resident(&chains).await?;
+            let leg = &mut self.bank.rel.leg;
+            let face = self.dev.graphs.session.face_mut();
             let (cs, new_slots, pieces, table) = {
                 let p = owl_store::plan_onload(leg, &chains)?;
                 (p.chains, p.slots, p.pieces, p.table)

@@ -33,7 +33,21 @@ pub struct EvictCandidate {
     pub chain: Option<ChainHash>,
     /// 快照键(状态腿)。
     pub snap: Option<SnapKey>,
+    /// **会话归属**(0 = 无归属;2026-10-19 会话感知淘汰)。
+    ///
+    /// 用途:淘汰时**按会话分组**,同一会话内**从末端往头**削(见
+    /// [`crate::hooks::order_candidates`] 的会话档) —— 保留前缀,不让"头部被逐
+    /// ⇒ 后面全变垃圾"。
+    pub session: u64,
+    /// **在链上的深度**(块数;快照 = 边界块号,KV 叶 = 从根到该块的块数)。
+    ///
+    /// 同会话内**深度大者先逐**(末端先走)。
+    pub depth: usize,
 }
+
+/// **无会话归属**的哨兵(会话 id 0 是合法 id —— 临时会话从 0 起号,
+/// 所以不能用 0 当"无主")。
+pub const NO_SESSION: u64 = u64::MAX;
 
 /// 两条腿(独立管理 —— 裁决②;候选合并由关系层做)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -215,7 +229,7 @@ mod tests {
     use super::*;
 
     fn c(last_use: u64, bytes: usize, leg: Leg) -> EvictCandidate {
-        EvictCandidate { leg, tier: Tier::Gpu, bytes, last_use, chain: None, snap: None }
+        EvictCandidate { leg, tier: Tier::Gpu, bytes, last_use, chain: None, snap: None, session: 0, depth: 0 }
     }
 
     #[test]
@@ -228,7 +242,7 @@ mod tests {
     }
 
     fn cand(chain: u64, last_use: u64) -> EvictCandidate {
-        EvictCandidate { leg: Leg::Kv, tier: Tier::Gpu, bytes: 1024, last_use, chain: Some(ChainHash::new(chain)), snap: None }
+        EvictCandidate { leg: Leg::Kv, tier: Tier::Gpu, bytes: 1024, last_use, chain: Some(ChainHash::new(chain)), snap: None, session: 0, depth: 1 }
     }
 
     /// **B-4 门**:"反复被注意力选中"的块,即使 `last_use` 更老,也要**排在后面**

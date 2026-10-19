@@ -38,6 +38,7 @@ pub mod turn;
 // re-export 保持不变 —— owl_engine::{Engine, EngineConfig,
 // LoadedModel, ModelLoader, RunningEngine})
 pub(crate) mod engine;
+pub(crate) mod disk_io;
 pub(crate) mod exec;
 pub(crate) mod graph_fleet;
 pub(crate) mod loader;

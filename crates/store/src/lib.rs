@@ -36,6 +36,8 @@
 #![warn(missing_docs)]
 
 pub mod budget;
+pub mod disk;
+pub mod disk_index;
 pub mod error;
 pub mod host;
 pub mod moves;
@@ -49,6 +51,10 @@ pub mod select;
 pub mod state;
 pub mod tier;
 
+pub use disk::{
+    AdoptReport, DiskEntry, DiskEvictPlanOf, DiskKey, DiskStats, DiskTier, FillPlanOf, SpillPlanOf,
+};
+pub use disk_index::ChainIndex;
 pub use error::{StoreError, StoreResult};
 pub use host::{HostBlock, HostTier};
 pub use moves::{bytes_of, download_span, offload_to_host, onload_from_host, upload_span};
@@ -61,14 +67,15 @@ pub use leg::{
     reclaim_slot_table, BlockClass, BlockLeg, Carrier, ChainCand, ChainHit, InPlan, LegConfig,
     LegOps, LegStats, OutPlan, PieceSpec, PoolLayout,
 };
-pub use hooks::{plan, Applied, EvictOut, Need, NeedWhy, Sink, Verdict};
+pub use hooks::{plan_capacity, Applied, EvictOut, Need, NeedWhy, Room, Sink, Verdict};
 pub use policy::{
     AdmissionPolicy, EvictCandidate, EvictPolicy, EvictPolicyKind, Leg, LrfuPolicy, LruPolicy,
     QueuePolicy,
 };
 pub use leg::CachePolicy;
 pub use rel::{
-    EvictItem, EvictPlan, EventBook, KvConfig, OpenLoan, PoolReport, Protected, RecallHit,
+    AdoptChainsReport, DiskAttach, EventBook, KvConfig, OpenLoan, PoolReport, Protected, RecallHit,
+    SnapEvictPreview,
     RecallMode, Rel, StoreReport,
 };
 pub use select::{

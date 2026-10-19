@@ -288,6 +288,14 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
             "evicted": r.kv.evicted,
         },
         "state": {
+            // **淘汰序预览**(会话感知:同会话 depth 降序 = 末端先走)
+            "evict_order": snap.snap_evict.iter().map(|e| json!({
+                "key": format!("{:?}", e.key),
+                // 无归属 = null(会话 id 0 是合法 id,不能用 0 表示"无主")
+                "session": if e.session == u64::MAX { serde_json::Value::Null } else { json!(e.session) },
+                "depth": e.depth,
+                "transient": e.transient,
+            })).collect::<Vec<_>>(),
             "rows_total": r.state.rows_total,
             "rows_free": r.state.rows_free,
             "snaps": r.state.snaps,
@@ -296,6 +304,19 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
             "snap_host": r.state.snap_host,
             "hits": r.state.hits,
             "misses": r.state.misses,
+        },
+        // **磁盘层**(S6;None = 关层):账上驻留 + 目录 + 配额
+        "disk": {
+            "kv": r.disk_kv.as_ref().map(|d| json!({
+                "root": d.root, "budget_bytes": d.budget_bytes,
+                "used_bytes": d.used_bytes, "entries": d.entries,
+                "evicted_bytes": d.evicted_bytes,
+            })),
+            "snap": r.disk_snap.as_ref().map(|d| json!({
+                "root": d.root, "budget_bytes": d.budget_bytes,
+                "used_bytes": d.used_bytes, "entries": d.entries,
+                "evicted_bytes": d.evicted_bytes,
+            })),
         },
         "faces": {
             "active_turns": r.active_turns,

@@ -139,6 +139,469 @@ async fn cpu_construct_and_load(cfg: &OwlConfig) {
     assert!(!loaded.tokenizer.encode("你好").is_empty(), "tokenizer 活性");
 }
 
+/// **状态腿 mock 引擎**(§30 两门共用):snap_max 可调 + 状态腿宿主 64MiB。
+async fn mock_snap_engine(
+    snap_max: usize,
+) -> RunningEngine<owl_iface::handle::DeviceHandle<owl_cpu::CpuFace>> {
+    let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
+    knobs.pool_tokens = Some(256);
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = snap_max;
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 256,
+        prefill_chunk: 32,
+        knobs,
+    };
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
+    engine.run(loaded).await.expect("装配")
+}
+
+/// **两腿统一调度器门(engine 侧;§30)**:store 的 `plan_need` 出 `Snap{Host}` 票
+/// 之后,engine 的执行臂(`apply_verdict`)真的把设备层快照沉到宿主 ——
+/// 验的是"判据唯一 + 执行闭环",不依赖 capture 的 churn 路径。
+#[tokio::test]
+async fn idle_node_offloads_device_snapshot_via_store_plan() {
+    let mut running = mock_snap_engine(1).await;
+
+    // boot 已注册状态腿布局 ⇒ "一条快照的字节" > 0;宿主分片 64MiB 留位
+    let bytes = running.bank.rel.snap_bytes();
+    assert!(bytes > 0, "状态腿布局应在 boot 注册(snap_max>0 + paged)");
+    assert!(running.bank.rel.snap_host_free_slots() > 0, "宿主分片应留位");
+    assert!(running.dev.pool.snap_capacity() > 0, "设备槽应 >= 1");
+
+    // 手工登记一条 Durable 设备快照(不经 capture:本门只验调度 + 执行臂)
+    let key = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0x5A5A));
+    running.bank.rel.state.register_snap(
+        key,
+        bytes,
+        owl_store::Tier::Gpu,
+        owl_store::SnapDurability::Durable,
+    );
+    running.dev.pool.snap_place(0, key);
+
+    running
+        .node(crate::running::Node::Idle(0))
+        .await
+        .expect("Idle 节点");
+
+    assert_eq!(
+        running.bank.rel.state.locate(key),
+        Some(owl_store::Tier::Host),
+        "store 判 Host ⇒ engine 必须真沉(执行臂闭环)"
+    );
+    assert_eq!(running.dev.pool.snap_used(), 0, "设备槽应释放");
+}
+
+/// **磁盘层门(S6)**:宿主装不下 ⇒ 溢写到磁盘(内容不丢),再能读回宿主。
+///
+/// 验的是三件:①`plan_capacity` 的第三层出票 ②engine 的执行臂真写文件
+/// (原子 .tmp→rename)③回填把层账改回 Host(内容逐字节一致由 store 侧保证)。
+#[tokio::test]
+async fn disk_spill_and_fill_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("owl-disk-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
+    knobs.pool_tokens = Some(256);
+    knobs.host_cache_mb = 0;
+    knobs.snap_host_mb = 24; // 只装得下一张快照(0.8B 一条 ≈19MiB)
+    knobs.snap_max = 2;
+    knobs.disk_cache_mb = 8;
+    knobs.snap_disk_mb = 24;
+    knobs.disk_dir = dir.display().to_string();
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 256,
+        prefill_chunk: 32,
+        knobs,
+    };
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let bytes = running.bank.rel.snap_bytes();
+    assert!(bytes > 0, "状态腿布局应已注册");
+    assert!(running.bank.rel.disk_enabled(), "盘层应已接线(配额+目录)");
+    assert_eq!(running.bank.rel.snap_disk.as_ref().unwrap().free_slots(), 1, "24MiB / 一条");
+    let k_a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xA11));
+    let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB22));
+    for k in [k_a, k_b] {
+        running.bank.rel.state.register_snap(
+            k,
+            bytes,
+            owl_store::Tier::Gpu,
+            owl_store::SnapDurability::Durable,
+        );
+    }
+    running.dev.pool.snap_place(0, k_a);
+    running.dev.pool.snap_place(1, k_b);
+
+    // **拍 1**:目标 1 张 ⇒ 沉到宿主(宿主 1 位,刚好)
+    running
+        .pool_housekeeping(owl_store::Need {
+            slots: 0,
+            snap_bytes: bytes,
+            why: owl_store::NeedWhy::Pressure,
+        })
+        .await
+        .expect("拍 1");
+    let st1 = running.bank.rel.state.stats();
+    assert_eq!((st1.snap_gpu.0, st1.snap_host.0), (1, 1), "一拍一张:{st1:?}");
+    let in_host = [k_a, k_b]
+        .into_iter()
+        .find(|k| running.bank.rel.state.locate(*k) == Some(owl_store::Tier::Host))
+        .expect("应有一张在宿主");
+    let other = if in_host == k_a { k_b } else { k_a };
+
+    // **拍 2**:宿主满 ⇒ 逐层律第三步:把宿主里最冷的那张挪到磁盘(内容不丢)
+    running
+        .pool_housekeeping(owl_store::Need {
+            slots: 0,
+            snap_bytes: bytes,
+            why: owl_store::NeedWhy::Pressure,
+        })
+        .await
+        .expect("拍 2");
+    let disk = running.bank.rel.snap_disk.as_ref().unwrap().resident_count();
+    assert_eq!(disk, 1, "宿主满 ⇒ 一张落磁盘:{:?}", running.bank.rel.state.stats());
+    assert_eq!(
+        running.bank.rel.state.locate(in_host),
+        Some(owl_store::Tier::Disk),
+        "被挪去盘的是宿主里那张"
+    );
+    assert_eq!(
+        running.bank.rel.state.locate(other),
+        Some(owl_store::Tier::Gpu),
+        "设备那张仍在(内容不丢优先:本轮不出 Drop)"
+    );
+    let path = running
+        .bank
+        .rel
+        .snap_disk
+        .as_ref()
+        .unwrap()
+        .path_of(in_host)
+        .unwrap()
+        .to_path_buf();
+    assert!(path.exists(), "文件应真写盘:{}", path.display());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len() as usize,
+        bytes,
+        "文件大小 = 一条快照"
+    );
+
+    // 回填:盘 → 宿主(层账回 Host;磁盘副本仍在 = 权威)
+    assert!(running.fill_snap_from_disk(in_host).await.expect("回填"));
+    assert_eq!(
+        running.bank.rel.state.locate(in_host),
+        Some(owl_store::Tier::Host),
+        "回填后层账 = Host"
+    );
+    assert!(running.bank.rel.snap_host.get(in_host).is_some(), "宿主应有内容");
+    assert!(
+        running.bank.rel.snap_disk.as_ref().unwrap().contains(in_host),
+        "磁盘副本仍在(权威)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+/// **会话感知淘汰门(engine)**:turn 收口把 **KV 链块**与 **GDN 快照**都记到
+/// 会话名下(淘汰时同会话才能"从末端削")。
+#[tokio::test]
+async fn turn_records_session_ownership_for_kv_and_snaps() {
+    let mut running = mock_snap_engine(2).await;
+    let prompt: String = (0..120)
+        .map(|i| ["alpha", "bravo", "cedar", "delta", "ember", "falcon"][i % 6])
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (sid, tid) = running.submit_session(None, &prompt, 32).expect("submit");
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Completed { turn, .. } if turn == tid => break,
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败:{err}"),
+            TurnEvent::Idle => panic!("turn {tid} 队列丢失"),
+            _ => {}
+        }
+    }
+    let toks = running.tokenize(&prompt, true).expect("tokenize").tokens;
+    let page = running.dev.pool.page.max(1);
+    let full = toks.len() / page;
+    assert!(full >= 2, "prompt 应覆盖至少两块");
+    let tail = running
+        .bank
+        .rel
+        .leg
+        .tail_hash(&toks, full)
+        .expect("链尾身份");
+    assert_eq!(
+        running.bank.rel.leg.session_of(tail),
+        sid,
+        "KV 尾块应归本会话"
+    );
+    assert_eq!(running.bank.rel.leg.depth_of(tail), full, "深度 = 块数");
+
+    // 快照(页边界)也要带归属与深度
+    let snaps: Vec<_> = running
+        .bank
+        .rel
+        .state
+        .evict_candidates(&[])
+        .into_iter()
+        .filter_map(|c| c.snap)
+        .collect();
+    assert!(!snaps.is_empty(), "应有页边界快照");
+    let mut seen_depth = false;
+    for k in snaps {
+        let (s, d) = running.bank.rel.state.snap_session(k).expect("在账");
+        assert_eq!(s, sid, "快照应归本会话");
+        if d > 0 {
+            seen_depth = true;
+        }
+    }
+    assert!(seen_depth, "快照应带边界深度(末端优先的依据)");
+}
+
+/// **S6.1 端到端门**:turn 收口写链索引 → 小宿主把链溢写到盘 →
+/// **重启后按索引重建树**(非设备层)→ **同 prompt 命中前缀**(跨重启复用成立)。
+#[tokio::test]
+async fn disk_chain_index_enables_cross_restart_reuse() {
+    let dir = std::env::temp_dir().join(format!("owl-idx-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mk = |dir: &std::path::Path| {
+        let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
+        knobs.pool_tokens = Some(96); // 3 页(短池:容易满)
+        knobs.host_cache_mb = 1; // 宿主只装得下 ~2 块(0.8B 块 ≈384KiB)
+        knobs.snap_max = 0;
+        knobs.disk_cache_mb = 8;
+        knobs.snap_disk_mb = 0;
+        knobs.disk_dir = dir.display().to_string();
+        EngineConfig { device_ordinal: 0, max_seq_tokens: 256, prefill_chunk: 32, knobs }
+    };
+    let boot = |cfg: EngineConfig| async move {
+        let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+            null_kernels: true,
+            graph_capture: true,
+            ..Default::default()
+        });
+        let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+        let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+        engine.run(loaded).await.expect("装配")
+    };
+    // ≥128 token(4 整块)才能命中"整块前缀";短 prompt 不足一块 = 命中 0(语义如此)
+    let prompt: String = (0..120)
+        .map(|i| ["alpha", "bravo", "cedar", "delta", "ember", "falcon", "garnet", "harbor"][i % 8])
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // ── 第一次进程:跑一个 turn(收口写索引)+ 压力保洁把链溢写到盘
+    {
+        let mut running = boot(mk(&dir)).await;
+        let (_, tid) = running.submit_session(None, &prompt, 32).expect("submit");
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Completed { turn, .. } if turn == tid => break,
+                TurnEvent::Failed { turn, err } => panic!("t{turn} 失败:{err}"),
+                TurnEvent::Idle => panic!("turn {tid} 队列丢失"),
+                _ => {}
+            }
+        }
+        // 压力保洁(N6):设备 → 宿主 → 磁盘(小宿主 ⇒ 必然溢写)
+        for _ in 0..6 {
+            running
+                .pool_housekeeping(owl_store::Need {
+                    slots: 8,
+                    snap_bytes: 0,
+                    why: owl_store::NeedWhy::Pressure,
+                })
+                .await
+                .expect("保洁");
+        }
+        let disk_entries = running.bank.rel.disk.as_ref().unwrap().resident_count();
+        assert!(disk_entries > 0, "应已有链内容溢写到盘");
+        // 重启前的对照:同一份 token 化应命中(证明索引 tokens 与查询同源)
+        // 提交路径会套 chat 模板 ⇒ 查询侧同口径(chat_wrap = true)
+        let t0 = running.tokenize(&prompt, true).expect("tokenize").tokens;
+        let (h0, _) = running.bank.rel.match_prefix(&t0).expect("命中");
+        assert!(h0.matched_blocks > 0, "重启前应命中(否则 tokens 不同源)");
+        let idx_n = std::fs::read_dir(dir.join("kv"))
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".idx"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert!(idx_n > 0, "turn 收口应写链索引");
+    }
+
+    // ── 第二次进程:同目录 ⇒ 按索引重建树(非设备层)+ 同 prompt 命中
+    eprintln!(
+        "[idx] 重启前盘上: bin={} idx={}",
+        std::fs::read_dir(dir.join("kv"))
+            .map(|rd| rd.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".bin")).count())
+            .unwrap_or(0),
+        std::fs::read_dir(dir.join("kv"))
+            .map(|rd| rd.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".idx")).count())
+            .unwrap_or(0),
+    );
+    let mut running2 = boot(mk(&dir)).await;
+    eprintln!(
+        "[idx] 重启后: 盘 entries={} / 树 host_blocks={}",
+        running2.bank.rel.disk.as_ref().map(|d| d.resident_count()).unwrap_or(0),
+        running2.bank.rel.leg.kv_stats().host_blocks
+    );
+    let rebuilt = running2.bank.rel.leg.kv_stats().host_blocks;
+    assert!(rebuilt > 0, "重启后应按索引重建出条目(非设备层)");
+    let toks = running2.tokenize(&prompt, true).expect("tokenize").tokens;
+    let (hit, _recall) = running2.bank.rel.match_prefix(&toks).expect("命中");
+    assert!(hit.matched_blocks > 0, "重建的树应命中同一 prompt 前缀");
+    // 命中面允许回读(内容在盘 ⇒ pending_host/回灌路径);这里只验"选得中"
+    assert_eq!(
+        hit.hashes.len(),
+        hit.matched_blocks,
+        "命中面应带逐块身份(回灌/快照键的真源)"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **启动回加载门(S6)**:进程重启(新 engine、同目录)后,盘上的内容被
+/// **扫目录回填账**——账先回来(条目可见),内容惰性读回。
+#[tokio::test]
+async fn disk_adopt_on_boot_restores_ledger() {
+    let dir = std::env::temp_dir().join(format!("owl-disk-boot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mk = |dir: &std::path::Path| {
+        let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
+        knobs.pool_tokens = Some(256);
+        knobs.host_cache_mb = 0;
+        knobs.snap_host_mb = 24;
+        knobs.snap_max = 2;
+        knobs.disk_cache_mb = 8;
+        knobs.snap_disk_mb = 24;
+        knobs.disk_dir = dir.display().to_string();
+        EngineConfig { device_ordinal: 0, max_seq_tokens: 256, prefill_chunk: 32, knobs }
+    };
+    let boot = |cfg: EngineConfig| async move {
+        let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+            null_kernels: true,
+            graph_capture: true,
+            ..Default::default()
+        });
+        let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+        let loaded = engine
+            .loader()
+            .load_qwen35_0_8b(&asset_dir())
+            .await
+            .expect("装载");
+        engine.run(loaded).await.expect("装配")
+    };
+
+    let key = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xFEED));
+    // ── 第一次进程:把一张快照搬到盘上(拍 1 宿主 → 拍 2 盘)
+    {
+        let mut running = boot(mk(&dir)).await;
+        let bytes = running.bank.rel.snap_bytes();
+        running.bank
+            .rel
+            .state
+            .register_snap(key, bytes, owl_store::Tier::Gpu, owl_store::SnapDurability::Durable);
+        running.dev.pool.snap_place(0, key);
+        for _ in 0..2 {
+            running
+                .pool_housekeeping(owl_store::Need {
+                    slots: 0,
+                    snap_bytes: bytes,
+                    why: owl_store::NeedWhy::Pressure,
+                })
+                .await
+                .expect("保洁");
+        }
+        assert_eq!(
+            running.bank.rel.state.locate(key),
+            Some(owl_store::Tier::Disk),
+            "第一次进程里应已落盘"
+        );
+    } // ← engine drop(等价于进程退出)
+
+    // ── 第二次进程:同目录 ⇒ boot 扫盘回填账(不搬内容)
+    let running2 = boot(mk(&dir)).await;
+    let d = running2.bank.rel.snap_disk.as_ref().expect("盘层应接线");
+    assert_eq!(d.resident_count(), 1, "盘上条目应被回填进账");
+    assert!(d.contains(key), "回填的正是那张快照");
+    assert_eq!(
+        running2.bank.rel.state.locate(key),
+        Some(owl_store::Tier::Disk),
+        "层账回填到 Disk"
+    );
+    // 启动期**不读内容**:宿主里还没有它(惰性)
+    assert!(running2.bank.rel.snap_host.get(key).is_none(), "启动不回读内容");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **状态腿 victim 判据归一(§30.6-②)**:池满时选谁**听 store 的序**,
+/// 不再用池内自带的 `rank + LRU`(第二套规范)。
+///
+/// 构造:store 里先登记 `k_a`(更冷)、后登记 `k_b`;池里故意**反着放**
+/// (先 place `k_b`、后 place `k_a`)⇒ 池内 LRU 会选 `k_b`,store 序第一是 `k_a`。
+/// 新实现必须选 `k_a`;旧实现在此会选 `k_b`。
+#[tokio::test]
+async fn snapshot_victim_follows_store_order() {
+    use crate::state::SnapSlotPick;
+    let mut running = mock_snap_engine(2).await;
+    let bytes = running.bank.rel.snap_bytes();
+    assert!(bytes > 0);
+    let k_a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xA1));
+    let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB2));
+    running.bank.rel.state.register_snap(
+        k_a,
+        bytes,
+        owl_store::Tier::Gpu,
+        owl_store::SnapDurability::Durable,
+    );
+    running.bank.rel.state.register_snap(
+        k_b,
+        bytes,
+        owl_store::Tier::Gpu,
+        owl_store::SnapDurability::Durable,
+    );
+    // 池内序与 store 序相反:k_b 先占槽(池里更老),k_a 后占
+    running.dev.pool.snap_place(1, k_b);
+    running.dev.pool.snap_place(0, k_a);
+    assert_eq!(running.dev.pool.snap_used(), 2, "两槽已满");
+
+    let order = running.bank.rel.snap_victim_order(&[]);
+    assert_eq!(order.first(), Some(&k_a), "store 序第一 = 先登记的 k_a:{order:?}");
+    let k_c = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xC3));
+    match running.dev.pool.snap_pick_slot(k_c, &order) {
+        Some(SnapSlotPick::Victim(slot, victim)) => {
+            assert_eq!(victim, k_a, "victim 必须听 store 序(池内 LRU 会选 k_b)");
+            assert_eq!(slot, 0, "槽号 = k_a 的物理槽(映射仍在池里)");
+        }
+        other => panic!("应给出 Victim,实得 {other:?}"),
+    }
+}
+
 /// CPU:增量解码多字节字符跨 token(🌟 4 字节;逐 token 喂入,
 /// 差分不得 panic 且终态与前缀累计一致)。EngineConfig 同样走用例配置注入。
 #[cfg(test)] // dev-dep(owl-macros)门控:单元档专用
@@ -425,6 +888,24 @@ async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D
         rep2.state.snap_host.0 + rep2.state.snap_gpu.0,
         rep.state.snap_host.0 + rep.state.snap_gpu.0,
         "回灌只换层,不增删条目"
+    );
+
+    // ④ **两腿统一调度器(N6/H5;§30)**:Idle 节点给状态腿目标 ⇒ store 的
+    //    唯一判据出 `Snap{Host}` 票 ⇒ engine 执行臂把设备层快照下沉。
+    //    (接线前:状态腿只能等 capture 撞满时被 engine 池被动逐 —— 第二套判据)
+    running
+        .node(crate::running::Node::Idle(0))
+        .await
+        .expect("Idle 节点");
+    let rep3 = running.store_report();
+    eprintln!(
+        "[s2] Idle 整理后:快照 设备 {:?} / 宿主 {:?}",
+        rep3.state.snap_gpu, rep3.state.snap_host
+    );
+    assert!(
+        rep3.state.snap_gpu.0 < rep2.state.snap_gpu.0,
+        "Idle 整理应把设备层快照沉到宿主(两腿统一判据):{:?}",
+        rep3.state
     );
 }
 

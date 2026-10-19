@@ -674,6 +674,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut staged = 0usize;
         if n_need > 0 {
             let hashes: Vec<ChainHash> = need.iter().map(|(_, h)| *h).collect();
+            // **S6**:盘上的块先读回宿主(与 phases.rs 同一口)
+            let _ = self.ensure_host_resident(&hashes).await?;
             let (cs, slots, pieces, tbl) = {
                 let p = owl_store::plan_onload(&mut self.bank.rel.leg, &hashes)?;
                 (p.chains, p.slots, p.pieces, p.table)

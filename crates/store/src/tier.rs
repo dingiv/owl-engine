@@ -123,8 +123,16 @@ impl TierBudget {
 ///
 /// 口径:`host_cache_mb` = KV 块腿的宿主分片,`snap_host_mb` = 状态腿(快照)分片;
 /// 两者之和 = store 的中层总账。磁盘层二期(恒 0)。
-pub fn tier_budget_of(host_cache_mb: usize, snap_host_mb: usize) -> TierBudget {
-    TierBudget { host_bytes: (host_cache_mb + snap_host_mb) << 20, disk_bytes: 0 }
+pub fn tier_budget_of(
+    host_cache_mb: usize,
+    snap_host_mb: usize,
+    disk_cache_mb: usize,
+    snap_disk_mb: usize,
+) -> TierBudget {
+    TierBudget {
+        host_bytes: (host_cache_mb + snap_host_mb) << 20,
+        disk_bytes: (disk_cache_mb + snap_disk_mb) << 20,
+    }
 }
 
 /// 单层单类别的账目。
