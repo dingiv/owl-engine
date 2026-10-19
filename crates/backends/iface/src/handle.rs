@@ -206,10 +206,11 @@ pub trait AllocLedger: Send {
         None
     }
 
-    /// **池还块**:`None` = 已入池(**不许**再给驱动);
-    /// `Some(id)` = 该 id **必须真归还**(①不可池化 → 同一 id ②超池上限顶出的旧块)。
-    fn pool_release(&mut self, id: u64) -> Option<u64> {
-        Some(id)
+    /// **池还块**:返回**必须真归还驱动**的 id 列表(空 = 已入池)。
+    /// 不可池化 ⇒ `[id]`;超池上限顶出的旧块 ⇒ `[old…]`(**可能多块**,
+    /// 2026-10-20 定谳:早先只返还最后一块 ⇒ 多顶出时其余块永久泄漏)。
+    fn pool_release(&mut self, id: u64) -> Vec<u64> {
+        vec![id]
     }
 
     /// **池排空**(压力路径 N6):清池并交出全部 id(调用方真归还驱动)。
@@ -802,12 +803,29 @@ impl<D: DeviceClient> DeviceHandle<D> {
         if let Err(e) = self.inner.free(&ids).await {
             // 释放失败**不许静默**:本块仍归池(不销账),下次再来
             eprintln!("[device-handle] 池排空释放失败({} 块):{e}", ids.len());
-            let mut g = match cell.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
+            // 回填入池可能**顶出旧块** —— 那些 id 必须真还驱动(否则又是泄漏)
+            let evicted = {
+                let mut g = match cell.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                let mut evicted = Vec::new();
+                for id in &ids {
+                    evicted.extend(g.pool_release(*id));
+                }
+                evicted
             };
-            for id in &ids {
-                let _ = g.pool_release(*id);
+            if !evicted.is_empty() {
+                if let Err(e2) = self.inner.free(&evicted).await {
+                    eprintln!("[device-handle] 池回填顶出释放失败({} 块):{e2}", evicted.len());
+                } else {
+                    let frees: Vec<FreeEvent> =
+                        evicted.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
+                    self.send_events(&[], &frees, &[]);
+                    for id in &evicted {
+                        self.untrack(*id);
+                    }
+                }
             }
             return 0;
         }
@@ -821,7 +839,8 @@ impl<D: DeviceClient> DeviceHandle<D> {
 
     /// **池还块**(逐 id):返回 `(必须真归还的 id 列表, 入池条数)`。
     ///
-    /// 两种"必须归还":①不可池化(同一 id)②超池上限**顶出**的旧块(那个旧 id)。
+    /// 两种"必须归还":①不可池化(同一 id)②超池上限**顶出**的旧块
+    /// (**可以多条** —— 一次还块可能要腾多块;旧实现只收最后一条 ⇒ 泄漏)。
     /// 入池条数 = 本次真正留在池里的块数(打点;顶出块在 store 侧另计 `pool_evicted`)。
     fn pool_release_all(&self, ids: &[u64]) -> (Vec<u64>, usize) {
         let Some(cell) = self.ledger.as_ref() else { return (ids.to_vec(), 0) };
@@ -832,9 +851,11 @@ impl<D: DeviceClient> DeviceHandle<D> {
         let mut must_free = Vec::new();
         let mut pooled = 0usize;
         for id in ids {
-            match g.pool_release(*id) {
-                None => pooled += 1,
-                Some(real) => must_free.push(real),
+            let real = g.pool_release(*id);
+            if real.is_empty() {
+                pooled += 1;
+            } else {
+                must_free.extend(real);
             }
         }
         (must_free, pooled)

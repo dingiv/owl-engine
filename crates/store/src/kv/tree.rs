@@ -54,6 +54,13 @@ pub struct PrefixMatch {
 pub(crate) struct TreeUpdate {
     /// 新进树的条目(内容身份, 设备槽;`None` = 盘/宿主层重建,无设备绑定)。
     pub(crate) inserted: Vec<(ChainHash, Option<u32>)>,
+    /// **重绑定**(2026-10-20):同内容身份已在树里,但本次写到**新槽**
+    /// (`旧绑定, 新槽`)。典型来源 = 前缀复用的"复用面裁短"
+    /// (`m < matched`):被裁掉的段会**重算并写新槽**,而树里旧条目仍指着老槽
+    /// ⇒ 不重绑的话新槽无树引用(`refs==1`)⇒ **结构性不可沉**
+    /// (GGUF 262k 联调实测:第二 turn 池被不可沉块填满 ⇒ Exhausted)。
+    /// `旧 = None` 表示旧副本在宿主(上层须弃置宿主副本)。
+    pub(crate) rebound: Vec<(ChainHash, Option<u32>, u32)>,
     /// 因容量被逐出的条目(内容身份, 设备槽 = `None` 表示它本来就在 host 层)。
     /// **有槽 ≠ 槽被回收**:槽此刻可能仍被会话持有(回收判据在槽池引用账)。
     pub(crate) evicted: Vec<(ChainHash, Option<u32>)>,
@@ -232,6 +239,13 @@ impl PrefixTree {
     }
 
     /// **单块登记**(两条入口的唯一实现):返回新块身份;`None` = 哈希碰撞(断链)。
+    ///
+    /// **占位符归一**(2026-10-20):`slot = Some(u32::MAX)` = 该块内容在宿主
+    /// ([`crate::leg::HOST_PLACEHOLDER`])⇒ 归一成 `None`("无设备绑定")。
+    /// 旧实现把它当**真槽**存进 `Entry.slot` ⇒ 后读 `bound_slot`/`decref`
+    /// 拿 u32::MAX 去碰槽池 = 越界响亮拒(虚拟化档 turn 收口必踩:
+    /// `register_chain_owned` 的整张表本来就会带占位符)。
+    /// 同理，重绑定分支也不得把占位符当真槽绑。
     fn insert_one(
         &mut self,
         base: ChainHash,
@@ -239,11 +253,22 @@ impl PrefixTree {
         slot: Option<u32>,
         update: &mut TreeUpdate,
     ) -> Option<ChainHash> {
+        let slot = slot.filter(|s| *s != crate::leg::HOST_PLACEHOLDER);
         let hash = hash_block(base, block);
         let fingerprint = content_fingerprint(block);
         match self.entries.get(&hash) {
             Some(e) if e.fingerprint == fingerprint => {
-                // 已是同一块:只触达(缓存仍持着自己那一份绑定,不重复计引用)
+                // 已是同一块:触达 + **必要时重绑新槽**(见 `TreeUpdate::rebound`)。
+                // 不重绑会让重算出来的新槽没有树引用 ⇒ 永远不可沉。
+                if let Some(new_slot) = slot {
+                    let old = e.slot;
+                    if old != Some(new_slot) {
+                        if let Some(em) = self.entries.get_mut(&hash) {
+                            em.slot = Some(new_slot);
+                        }
+                        update.rebound.push((hash, old, new_slot));
+                    }
+                }
                 let access = self.next_access();
                 if let Some(e) = self.entries.get_mut(&hash) {
                     e.access = access;

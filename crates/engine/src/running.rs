@@ -1163,22 +1163,41 @@ impl<D: DeviceClient> RunningEngine<D> {
         if loans.is_empty() {
             return;
         }
-        let mut agg: std::collections::BTreeMap<String, (usize, usize)> =
-            std::collections::BTreeMap::new();
-        for (_, l) in &loans {
-            let e = agg.entry(l.name.clone()).or_insert((0, 0));
-            e.0 += 1;
-            e.1 += l.bytes;
+        // **池内块不算"未归还"**(2026-10-20):`pool_release` 入池时 loan 仍开着
+        // (`pooled=true`)—— 它已可零命令复用,是**缓存**不是泄漏。旧报告把两者
+        // 混在一起 ⇒ 每 turn 都喊几百 MiB,真泄漏反而被噪声淹没。
+        let (pooled, open): (Vec<_>, Vec<_>) = loans.iter().partition(|(_, l)| l.pooled);
+        let agg_of = |xs: &[&(u64, owl_store::Loan)]| {
+            let mut agg: std::collections::BTreeMap<String, (usize, usize)> =
+                std::collections::BTreeMap::new();
+            for (_, l) in xs {
+                let e = agg.entry(l.name.clone()).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += l.bytes;
+            }
+            agg
+        };
+        if open.is_empty() {
+            let pool_kib: usize = pooled.iter().map(|(_, l)| l.bytes).sum::<usize>() / 1024;
+            owl_shared::log_debug!(
+                "store",
+                "N4 池内复用:turn {turn} 名下 {} 块 / {pool_kib} KiB 仍在复用池(非泄漏)",
+                pooled.len()
+            );
+            return;
         }
+        let agg = agg_of(&open);
         let total_kib: usize = agg.values().map(|(_, b)| *b).sum::<usize>() / 1024;
         let detail: Vec<String> = agg
             .iter()
             .map(|(n, (c, b))| format!("{n} ×{c} / {}B", b))
             .collect();
+        let pool_kib: usize = pooled.iter().map(|(_, l)| l.bytes).sum::<usize>() / 1024;
         owl_shared::log_warn!(
             "store",
-            "N4 未归还清单:turn {turn} 名下仍有 {} 块 / {total_kib} KiB 开着 —— {}",
-            loans.len(),
+            "N4 未归还清单:turn {turn} 名下仍有 {} 块 / {total_kib} KiB 开着(另有池内复用 {} 块 / {pool_kib} KiB)—— {}",
+            open.len(),
+            pooled.len(),
             detail.join(" ｜ ")
         );
     }

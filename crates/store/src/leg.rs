@@ -600,6 +600,8 @@ impl BlockLeg {
     pub fn register_chain(&mut self, tokens: &[u32], table: &[u32]) -> StoreResult<CacheUpdate> {
         let up = self.kv.register_chain(tokens, table)?;
         self.drop_host_evicted(&up.evicted)?;
+        // **重绑掉宿主的幽灵副本**(2026-10-20;见 `CacheUpdate::host_drop`)
+        self.drop_host_chains(&up.host_drop)?;
         Ok(up)
     }
 
@@ -614,12 +616,26 @@ impl BlockLeg {
     }
 
     /// **增量链登记**(B-3e-2 第 2b 项;见 [`KvStore::register_chain_inc`])。
+    ///
+    /// 与全量登记同款收尾:被逐的宿主条目 + 重绑的幽灵宿主副本都要丢掉
+    /// (`rel` 侧的旧版漏了这两步 ⇒ 宿主副本留尸;2026-10-20 收口)。
     pub fn register_chain_inc(
         &mut self,
         parent0: ChainHash,
         blocks: &[(&[u32], u32)],
     ) -> StoreResult<crate::kv::CacheUpdate> {
-        self.kv.register_chain_inc(parent0, blocks)
+        let up = self.kv.register_chain_inc(parent0, blocks)?;
+        self.drop_host_evicted(&up.evicted)?;
+        self.drop_host_chains(&up.host_drop)?;
+        Ok(up)
+    }
+
+    /// 丢掉一批**宿主副本**(内容已重绑设备或已离树)。
+    fn drop_host_chains(&mut self, chains: &[ChainHash]) -> StoreResult<()> {
+        for chain in chains {
+            let _ = self.host.evict(*chain)?;
+        }
+        Ok(())
     }
 
     /// 释放整张表的引用(表回空;与逐块 `release` 同源)。

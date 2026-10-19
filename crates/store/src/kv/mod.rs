@@ -50,12 +50,16 @@ pub struct CacheUpdate {
     /// 因容量被逐出的条目(内容身份, 设备槽 = `None` 表示它本来就在 host 层;
     /// 上层须为 host 条目丢掉宿主副本)。
     pub evicted: Vec<(ChainHash, Option<u32>)>,
+    /// **重绑定后需弃置宿主副本的块**(2026-10-20):树条目在 host
+    /// (`slot=None`),本次重算写回设备并重绑 ⇒ 宿主那份已成幽灵,
+    /// 上层须弃置(`Rel::register_chain*` 的 `host.evict`)。
+    pub host_drop: Vec<ChainHash>,
 }
 
 impl CacheUpdate {
     /// 是否无变化。
     pub fn is_empty(&self) -> bool {
-        self.inserted.is_empty() && self.evicted.is_empty()
+        self.inserted.is_empty() && self.evicted.is_empty() && self.host_drop.is_empty()
     }
 }
 
@@ -289,9 +293,35 @@ impl KvStore {
     ) -> StoreResult<CacheUpdate> {
         let up = self.tree.insert(tokens, table);
         let mut out = CacheUpdate::default();
+        self.apply_tree_update(up, &mut out)?;
+        Ok(out)
+    }
+
+    /// **树变更 → 槽池引用账 + 宿主弃置清单**(两条登记入口共用,单一产地)。
+    ///
+    /// - `inserted`:新条目 ⇒ 槽池 `incref`(缓存持一份绑定);
+    /// - `rebound`:同内容已入树、本次写到**新槽**(旧 `Some` = 老槽 ⇒
+    ///   `decref` 旧的;旧 `None` = 旧副本在宿主 ⇒ 记 `host_drop` 由上层弃置;
+    ///   新槽 `incref`)—— 不重绑会让重算出的新槽永远无树引用 ⇒ 不可沉;
+    /// - `evicted`:条目离树 ⇒ 有槽 `decref`,host 条目进 `evicted` 由上层弃置。
+    fn apply_tree_update(
+        &mut self,
+        up: crate::kv::tree::TreeUpdate,
+        out: &mut CacheUpdate,
+    ) -> StoreResult<()> {
         for (chain, slot) in &up.inserted {
             if let Some(slot) = slot {
                 self.pool.incref(*slot)?;
+            }
+            out.inserted.push(*chain);
+        }
+        for (chain, old, new) in &up.rebound {
+            self.pool.incref(*new)?;
+            match old {
+                Some(old) => {
+                    self.pool.decref(*old)?;
+                }
+                None => out.host_drop.push(*chain),
             }
             out.inserted.push(*chain);
         }
@@ -302,7 +332,7 @@ impl KvStore {
             self.evicted += 1;
             out.evicted.push((*chain, *slot));
         }
-        Ok(out)
+        Ok(())
     }
 
     /// **整链搬盘的候选**(S6.1):宿主里任意条目为锚 → 回溯链尾 → **整链都在宿主**
@@ -403,19 +433,7 @@ impl KvStore {
     ) -> StoreResult<CacheUpdate> {
         let up = self.tree.insert_inc(parent0, blocks);
         let mut out = CacheUpdate::default();
-        for (chain, slot) in &up.inserted {
-            if let Some(slot) = slot {
-                self.pool.incref(*slot)?;
-            }
-            out.inserted.push(*chain);
-        }
-        for (chain, slot) in &up.evicted {
-            if let Some(slot) = slot {
-                self.pool.decref(*slot)?;
-            }
-            self.evicted += 1;
-            out.evicted.push((*chain, *slot));
-        }
+        self.apply_tree_update(up, &mut out)?;
         Ok(out)
     }
 
@@ -650,6 +668,37 @@ mod tests {
             .register_chain_inc(root, &[(&t[..page], tbl[0])])
             .expect("重复增量");
         assert!(up3.inserted.is_empty(), "已登记的块不得重复插入");
+    }
+
+    #[test]
+    fn rebind_repoints_tree_entry_to_new_slot() {
+        let page = crate::id::TOKENS_PER_BLOCK;
+        let t = toks(page * 2);
+        let mut m = kv(8, 8);
+        let mut tbl = Vec::new();
+        m.ensure_for_len(&mut tbl, t.len()).expect("块表");
+        m.register_chain(&t, &tbl).expect("首登");
+        // 重算同一内容到**新槽**(模拟“复用面裁短 ⇒ 从更早处重算写新槽”)
+        let mut tbl2 = Vec::new();
+        m.ensure_for_len(&mut tbl2, t.len()).expect("新块表");
+        assert_ne!(tbl, tbl2, "新槽必须不同");
+        let up = m.register_chain(&t, &tbl2).expect("重绑");
+        assert_eq!(up.inserted.len(), 2, "两块都要重绑(engine 据此认领)");
+        assert!(up.host_drop.is_empty(), "旧绑定在设备 ⇒ 无宿主副本要丢");
+        let hit = m.match_prefix(&t);
+        assert_eq!(
+            hit.blocks.iter().map(|b| b.slot).collect::<Vec<_>>(),
+            tbl2.iter().map(|s| Some(*s)).collect::<Vec<_>>(),
+            "树绑定必须指向新槽"
+        );
+        assert!(
+            tbl.iter().all(|s| m.slot_refs(*s) == 1),
+            "旧槽的**树**引用必须释放(旧的会话引用另算 —— 本用例未 release_table)"
+        );
+        assert!(
+            tbl2.iter().all(|s| m.slot_refs(*s) == 2),
+            "新槽 = 会话 + 树双持 ⇒ 可沉(refs==2 是下沉前置)"
+        );
     }
 
     #[test]
