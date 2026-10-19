@@ -35,6 +35,7 @@ pub fn family_factories() -> Vec<FamilyFactory> {
         comm::CommArStageRuntime::assemble,
         comm::CommArReduceRuntime::assemble,
         comm::CommAr1StageRuntime::assemble,
+        comm::CommArFusedRuntime::assemble,
         #[cfg(feature = "cublas")]
         cublas::CublasRuntime::assemble,
         #[cfg(feature = "marlin")]

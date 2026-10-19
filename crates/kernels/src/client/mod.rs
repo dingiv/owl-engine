@@ -238,6 +238,15 @@ mod tests {
             (crate::family::comm::asset::ONE_STAGE_F16, crate::client::comm::PARSE_SLOTS_1STAGE),
             (crate::family::comm::asset::ONE_STAGE_BF16, crate::client::comm::PARSE_SLOTS_1STAGE),
             (crate::family::comm::asset::ONE_STAGE_F32, crate::client::comm::PARSE_SLOTS_1STAGE),
+            // v1 两核融合(§11.2;2026-10-19;8 槽 —— 自己的表)
+            (crate::family::comm::asset::FUSED_F16, crate::client::comm::PARSE_SLOTS_FUSED),
+            (crate::family::comm::asset::FUSED_BF16, crate::client::comm::PARSE_SLOTS_FUSED),
+            (crate::family::comm::asset::FUSED_F32, crate::client::comm::PARSE_SLOTS_FUSED),
+            // fp8 载荷档(§47 第二步;线格式与常规档**逐字同形** —— 只是核名不同)
+            (crate::family::comm::asset::STAGE_F8_F16, crate::client::comm::PARSE_SLOTS),
+            (crate::family::comm::asset::STAGE_F8_BF16, crate::client::comm::PARSE_SLOTS),
+            (crate::family::comm::asset::REDUCE_F8_F16, crate::client::comm::PARSE_SLOTS_REDUCE),
+            (crate::family::comm::asset::REDUCE_F8_BF16, crate::client::comm::PARSE_SLOTS_REDUCE),
         ]);
         #[cfg(feature = "cublas")]
         cases.extend([
@@ -314,6 +323,14 @@ mod tests {
             crate::family::comm::asset::ONE_STAGE_F16,
             crate::family::comm::asset::ONE_STAGE_BF16,
             crate::family::comm::asset::ONE_STAGE_F32,
+            crate::family::comm::asset::STAGE_F8_F16,
+            crate::family::comm::asset::STAGE_F8_BF16,
+            crate::family::comm::asset::REDUCE_F8_F16,
+            crate::family::comm::asset::REDUCE_F8_BF16,
+            // v1 两核融合(§11.2;2026-10-19)
+            crate::family::comm::asset::FUSED_F16,
+            crate::family::comm::asset::FUSED_BF16,
+            crate::family::comm::asset::FUSED_F32,
         ]);
         #[cfg(feature = "cublas")]
         want.extend([crate::family::cublas::GEMM_F16, crate::family::cublas::GEMM_BF16]);

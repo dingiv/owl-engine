@@ -430,7 +430,7 @@ async fn load_shard(
     rank: usize,
     world: usize,
 ) -> owl_engine::Result<owl_engine::LoadedModel> {
-    let mut loader = engine.loader().slice(rank, world);
+    let mut loader = engine.loader().slice(rank, world).vocab_split(config.tp_vocab_split);
     match config.model_kind {
         ModelKind::Awq27b => {
             // 量化方案映射(唯一点 owl_engine::{head_plan_of, quant_plan_of})
@@ -495,9 +495,19 @@ async fn actor_main(
                 let tp = owl_engine::TpEngine::assemble_with(
                     vec![engine, engine1],
                     vec![model0, model1],
-                    owl_engine::TpOpts { push: config.tp_push },
+                    owl_engine::TpOpts {
+                        push: config.tp_push,
+                        ar_f8: config.tp_ar_f8,
+                        ar_fused: config.tp_ar_fused,
+                    },
                 )
                 .await?;
+                if config.tp_ar_f8 {
+                    owl_shared::log_info!(
+                        "boot",
+                        "TP2 **AR fp8 载荷档**已开(runtime.tp_ar_f8):载荷 e4m3(1.031×)"
+                    );
+                }
                 if config.tp_push {
                     owl_shared::log_info!(
                         "boot",

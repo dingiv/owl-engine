@@ -515,7 +515,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 let ts = std::time::Instant::now();
                 self.prefill_dflash_encode(host.probes, taps, base).await?;
                 mrec("dflash.prefill.encode", ts.elapsed());
-            } else if self.spec_rt.drafter.is_some() && t > 1 {
+            } else if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
                 let sid = host.sid;
                 let bank = host.bank_mut()?;
                 self.prefill_extend(bank, sid, root, t - 1, ids, base).await?;
@@ -547,14 +547,16 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             eval_ops_scoped_env(last.step(), face, self.env, self.tp.as_ref()).await?
         };
         let hb_view = TensorOps::of_block(hb.id, d.dtype, vec![1, d_model]);
-        let vocab = self.model.vocab_size();
+        // P1.1:stride = 本 rank logits 宽(词表切档 = 半表;半表档 token 只是局部
+        // argmax —— 消费面在 `harvest_prefill` 用拼接后的全表重算)
+        let vocab = self.model.logits_vocab();
         let (b, arena3) = {
             let face = self.graphs.session.face_mut();
             let logits = self.model.embed.lm_head_matmul(&hb_view);
             let tok = owl_models::ops::argmax_f32idx(&logits, vocab, 0);
             eval_ops_scoped_env(tok.step(), face, self.env, self.tp.as_ref()).await?
         };
-        if self.spec_rt.drafter.is_some() && t > 1 {
+        if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
             let sid = host.sid;
             let bank = host.bank_mut()?;
             self.prefill_extend(bank, sid, root, t - 1, ids, base).await?;
@@ -1098,7 +1100,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             owl_shared::log_debug!("pf-bisect", "chunk base={base} t={t} 层 checksum 已记");
         }
         let _face = self.graphs.session.face_mut();
-        let vocab = self.model.vocab_size();
+        // P1.1:同桶图路(stride = 本 rank logits 宽;token 在收割半重算)
+        let vocab = self.model.logits_vocab();
         if is_last {
             // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh)。
             // E5-M5:树一 = hidden_full 根([T, hidden] 存活 → prefill
@@ -1270,7 +1273,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     face.copy_block_at(lb, 0, &slot, 0, n).await?;
                 }
             }
-            if self.spec_rt.drafter.is_some() && t > 1 {
+            if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
                 // prefill extend(E5-M5):本 chunk 行 0..T-1 的 mtp KV
                 // (行 T-1 的配对需下一 chunk 首 token,由其 extend 补;
                 // 末位 P-1 由首轮 propose_first 的 extend 行补)
@@ -1370,7 +1373,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                         })
                         .collect();
                     self.prefill_dflash_encode(host.probes, &tap_views, base).await?;
-                } else if self.spec_rt.drafter.is_some() && t > 1 {
+                } else if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
                     let ts = std::time::Instant::now();
                     let sid = host.sid;
                     let bank = host.bank_mut()?;

@@ -20,7 +20,7 @@
 //! ```
 //! 未设 env = skip(与 `device_rows` 门同风格)。
 //!
-//! ⚠️ 本门**不做** peer 授予前的分档校验(`classify` 在 `owl-comm` 侧;
+//! ⚠️ 本门**不做** peer 授予前的分档校验(`owl_cuda::comm::peer::classify`;
 //! server 只认单笔 cap)。混插对(3090×3080)上 `import` 可能被驱动拒 ——
 //! 那属预期(D5 裁决:v1 拒混插),不算本门失败。
 

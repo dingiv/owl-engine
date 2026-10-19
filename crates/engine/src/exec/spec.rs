@@ -30,12 +30,32 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let mut t_rollback = std::time::Duration::ZERO;
         let mut t_propose = std::time::Duration::ZERO;
         let depth = self.dev.spec_rt.depth;
+        owl_shared::log_debug!("spec-round", "轮开始 token={token} pos={pos} depth={depth}");
 
         // ① 快照(轮首;恢复后仍有效 → 只在失效时拍)
         if !self.tspec()?.spec_snap_valid {
             let ts = std::time::Instant::now();
-            let face = self.dev.graphs.session.face_mut();
-            self.dev.pool.capture_spec_snap(face, gdn_slot).await?;
+            // ★ **双 rank 镜像**(P2.1-c,2026-10-19):快照缓冲是**每 rank 各自的池**
+            // ⇒ 两边都要拍(只拍 rank0 ⇒ peer 恢复的是陈旧/未初始化态 ⇒ 重放
+            // logits 错 ⇒ m=0 回滚路输出与裸 decode 不一致)。单卡 = 原路。
+            {
+                let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+                match peer {
+                    None => {
+                        let face = dev.graphs.session.face_mut();
+                        dev.pool.capture_spec_snap(face, gdn_slot).await?
+                    }
+                    Some(p) => {
+                        let (r0, r1) = crate::exec::join2(
+                            dev.pool.capture_spec_snap(dev.graphs.session.face_mut(), gdn_slot),
+                            p.pool.capture_spec_snap(p.graphs.session.face_mut(), gdn_slot),
+                        )
+                        .await;
+                        r1?;
+                        r0?
+                    }
+                }
+            }
             self.tspec()?.spec_snap_valid = true;
             t_snap = ts.elapsed();
         }
@@ -179,29 +199,73 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 与 decode 同律:表必须与运行期 chunk 数一一对应(T=8 过供给会错)。
             // 门 = **档位在场** + 槽在场（W5：verify 恒随 `fi_plan_bake`；槽只证
             // "本图带 FI 面"，档位证"表刷新面有人消费"）。
-            if self.cfg.knobs.fi_plan_bake.is_some() && fi_slots_on {
+            // ★ **双 rank 镜像**(P2.1-c,2026-10-19):verify 图含 AR(T=depth+1 行的
+            // RowParallel)⇒ 两 rank 必须同跑(否则 AR 失步;`dumb` 档实测同样挂 ⇒
+            // 与草稿无关,卡点就在这一句)。单卡档 = 原路(零分支)。
+            // FI 表两 rank 各自的图都要刷 ⇒ 规格传进 `verify_dev`。
+            let fi_spec = if self.cfg.knobs.fi_plan_bake.is_some() && fi_slots_on {
                 let d = self.dev.pool.dims;
-                let spec = owl_iface::contract::FiPlanSpec {
+                Some(owl_iface::contract::FiPlanSpec {
                     t: block.len(),
                     ctx_total: ctx_total_fi,
                     hq: d.hq,
                     hkv: d.hkv,
                     hd: d.hd,
                     page: self.dev.pool.page,
-                };
-                vg.face_mut().fi_plan_sync(spec).await?;
-            }
-            let t_step_v = std::time::Instant::now();
-            vg.step(&ins).await?;
-            let t_read_v = std::time::Instant::now();
-            let tok_f = vg.read_output_f32("tok").await?;
-            let t_tok = std::time::Instant::now();
-            // A11:采样档额外回读 per-row logits([depth1, vocab];仅采样档付)
-            let row_logits = if sampler_on {
-                Some(vg.read_output_f32("logits").await?)
+                })
             } else {
                 None
             };
+            let t_step_v = std::time::Instant::now();
+            owl_shared::log_debug!("spec-round", "verify 镜像:ins={} peer={} fi={}", ins.len(), self.peer.is_some(), fi_spec.is_some());
+            // P1.1 词表切:切档 ⇒ 两 rank 各出**半表行**、rank0 host 拼接成全表
+            // （实效判据：本 rank logits 宽 < 全量；tied 档装载期已响亮拒）
+            let head_split = self.head_split_active();
+            let half_vocab = self.dev.model.logits_vocab();
+            let (tok_f, row_logits) = {
+                let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+                match peer {
+                    None => dev.verify_dev(&ins, fi_spec, sampler_on).await?,
+                    Some(p) => {
+                        // 两半都校验(纪律:`join2` 等另一半到底,吞错 = 挂住)
+                        // 切档 ⇒ 两 rank 都要 logits 半表(rank0 拼接用);未切档
+                        // = 原路(peer 不读 ⇒ 省那份 D2H 与 host 内存)。
+                        let (r0, r1) = crate::exec::join2(
+                            dev.verify_dev(&ins, fi_spec, sampler_on || head_split),
+                            p.verify_dev(&ins, fi_spec, head_split),
+                        )
+                        .await;
+                        let (_, lg1) = r1?;
+                        let (tok0, lg0) = r0?;
+                        if head_split {
+                            let (a, b) = match (lg0, lg1) {
+                                (Some(a), Some(b)) => (a, b),
+                                _ => {
+                                    return Err(ModelError::EngineInvariant {
+                                        what: "词表切 verify:半表行缺席(装配/读面不一致)"
+                                            .into(),
+                                    })
+                                }
+                            };
+                            (tok0, Some(crate::running::concat_head_rows(&a, &b, half_vocab)?))
+                        } else {
+                            (tok0, lg0)
+                        }
+                    }
+                }
+            };
+            owl_shared::log_debug!("spec-round", "verify 完成:tok={}", tok_f.len());
+            let t_read_v = std::time::Instant::now();
+            let t_tok = std::time::Instant::now();
+            // 后续（块句柄 / 探针）继续用主 rank 的图
+            let vg = self
+                .dev
+                .graphs
+                .verify
+                .as_mut()
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: "verify 图缺席(档位与装配不一致)".into(),
+                })?;
             let t_lg = std::time::Instant::now();
             // E5 性能:verify 分相(step=上传+launch;read=同步+回读;
             // pure=同步后裸 replay+read = 图独占 GPU 时间)
@@ -221,7 +285,41 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             mrec("spec.verify.tokread", t_tok.elapsed());
             mrec("spec.verify.lgread", t_lg.elapsed());
             mrec("spec.verify.read", t_read_v.elapsed());
-            let ids: Vec<u32> = tok_f.iter().map(|&v| v as u32).collect();
+            // P1.1:切档的设备 token 只是**半表局部** argmax ⇒ 从拼接后的全表行
+            // 重算全局 argmax(贪心接受判据的唯一依据);未切档 = 原值。
+            let ids: Vec<u32> = if head_split {
+                let lg = row_logits.as_ref().ok_or_else(|| ModelError::EngineInvariant {
+                    what: "词表切 verify:全表行 logits 缺席(greedy 判据无据)".into(),
+                })?;
+                let v = self.dev.model.vocab_size();
+                if lg.len() < rows_n * v {
+                    return Err(ModelError::EngineInvariant {
+                        what: format!(
+                            "词表切 verify:行 logits 尺寸不符 {} < {}×{}",
+                            lg.len(),
+                            rows_n,
+                            v
+                        ),
+                    });
+                }
+                (0..rows_n)
+                    .map(|r| {
+                        lg[r * v..(r + 1) * v]
+                            .iter()
+                            .enumerate()
+                            .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+                                if x > a.1 {
+                                    (i, x)
+                                } else {
+                                    a
+                                }
+                            })
+                            .0 as u32
+                    })
+                    .collect()
+            } else {
+                tok_f.iter().map(|&v| v as u32).collect()
+            };
             let hidden = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
             let n_rec = self.dev.pool.gdn_count() * 8;
             let records: Vec<Bytes> = (0..n_rec)
@@ -276,13 +374,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 hist.push(tok); // 已发出的 token 进惩罚集(与逐 token 解码同语义)
             }
             let m = spec_sampled_accept_prefix(&drafts, &s[..depth]);
-            mcnt("spec.sample.rounds", 1);
-            mcnt("spec.sample.accepted", m as u64);
             (m, s[..=m].to_vec(), s[m])
         } else {
+            // **argmax/greedy 路**:直接拿 verify 行的 ids 比(drafts[i] == ids[i])
             let m = (0..depth).take_while(|&i| drafts[i] == ids[i]).count();
             (m, ids[..=m].to_vec(), ids[m])
         };
+        // **AL 计数提到分支外**(2026-10-19 修):两条路(采样/argmax)都要记 ——
+        // 旧形只挂在采样路 ⇒ `mode = "greedy"` 档的 AL **在仪表上恒为 1.00**
+        // (实测:greedy 跑 22 轮出 64 tok = 真 AL≈2.9,而计数器读 0 ⇒ 判读被带偏;
+        //  引擎行为无错,错的是仪表)。语义 = 每轮接受数;降级态机读的是
+        // `spec.recent_*`(与本计数无关,不受影响)。
+        mcnt("spec.sample.rounds", 1);
+        mcnt("spec.sample.accepted", m as u64);
         // B4 自适应降级态机(§6.24;DFlash2 专属 —— 同步机制走 dflash encode)
         // 2026-10-12 深夜重放 + 滚动 AL 窗口:连击 streak 会被"偶发 m=1"
         // 破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值 < 盈亏线即降级
@@ -420,6 +524,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             owl_shared::log_debug!("dflash-probe", "pos={pos} ids={:?} {}", &ids[..depth.min(ids.len())], hits.join(" "));
         }
 
+        owl_shared::log_debug!("spec-round", "接受完成 m={m} bonus={bonus} emitted={}", emitted.len());
         // ⑤ 部分接受 → GDN 回滚 + 已接受前缀重放(v1 窗口重处理,施工
         // 方案 §四.4);快照无条件失效(下轮轮首重拍)。
         // 轮不变量:restore 只回到 state@F-1,而下一轮需要 state@fed'-1
@@ -470,6 +575,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.dev.graphs.session.face_mut();
             face.free(&[hidden.id]).await?;
         }
+        owl_shared::log_debug!("spec-round", "⑤ extend/propose 完成");
         // ⑥ fold(尾部:图发射异步,restore 单命令;下一轮 verify 流序
         // 排其后,GPU ~1ms 藏于前端)
         //
@@ -485,17 +591,30 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 不齐 = 旧"前缀重放"(整模前向)唯一可行路, 该档不做轮内边界快照
             let foldable = records.len() == self.dev.pool.gdn_count() * 8;
             if foldable {
-                if let Some(b) = Self::decode_boundary_in(
-                    pos,
-                    pos + m + 1,
-                    self.dev.pool.page,
-                    self.cfg.knobs.snap_decode_stride,
-                ) {
+                // **消费方门**(2026-10-19,同 prefill 的 `snap_on` 判据):轮内页边界
+                // 快照的唯一消费者 = **前缀复用**(`restore_snap` 只在 prefix 命中时调);
+                // `prefix_cache = false` ⇒ 缓存区份额 0 ⇒ 复用面结构上恒 0
+                // ⇒ 下面的「卷到边界 + 拍 + 卷回」三段是**纯浪费**(实测
+                // `spec.bnd.fold1` 1.17ms + `spec.snap` 0.90ms ≈ 2.1ms/边界)。
+                // 注:`snap_decode_stride = 0` 同样关(两处门同向)。
+                let snap_consumer = self.cfg.knobs.prefix_cache && self.dev.pool.snap_capacity() > 0;
+                if let Some(b) = snap_consumer
+                    .then(|| {
+                        Self::decode_boundary_in(
+                            pos,
+                            pos + m + 1,
+                            self.dev.pool.page,
+                            self.cfg.knobs.snap_decode_stride,
+                        )
+                    })
+                    .flatten()
+                {
                     let t_b = std::time::Instant::now();
                     self.spec_fold_to(gdn_slot, &records, b - pos).await?;
                     let t_fold1 = t_b.elapsed();
                     // 尾 token = 本轮已提交、尚未进 `act.out` 的那几枚
                     let tail = &toks[..b - 1 - pos];
+                    owl_shared::log_debug!("spec-round", "边界:snap_tail 起 b={b}");
                     self.capture_gdn_snap_tail(
                         sid,
                         b,
@@ -503,6 +622,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         owl_store::SnapDurability::Transient,
                     )
                     .await?;
+                    owl_shared::log_debug!("spec-round", "边界:snap_tail 完");
                     let t_snap = t_b.elapsed() - t_fold1;
                     // 分相计时(2026-10-19;判"轮内边界值不值"的账:
                     // 卷/拍/回卷三段与 prefill 边界同粒度)
@@ -518,19 +638,41 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         );
                     }
                 }
+                owl_shared::log_debug!("spec-round", "非边界:fold(m+1={}) 起", m + 1);
                 self.spec_fold_to(gdn_slot, &records, m + 1).await?;
+                owl_shared::log_debug!("spec-round", "非边界:fold 完");
             } else {
                 // eager fallback:旧路 —— 前缀重放(整模前向,已接受行
                 // KV 覆写幂等;m=0 也重放 anchor 一行)
                 {
-                    let face = self.dev.graphs.session.face_mut();
-                    self.dev.pool.restore_spec_snap(face, gdn_slot).await?;
+                    // ★ **双 rank 镜像**(P2.1-c,2026-10-19):GDN 快照是**每 rank 各自的池**
+                    // ⇒ 两边都要恢复。只恢复 rank0 ⇒ 两 rank 状态不同源 ⇒ 重放出的
+                    // logits 错 ⇒ **m=0 回滚路的输出与裸 decode 不一致**(现场定谳:
+                    // `dumb` 档必走此路,同样退化)。
+                    let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+                    match peer {
+                        None => {
+                            let face = dev.graphs.session.face_mut();
+                            dev.pool.restore_spec_snap(face, gdn_slot).await?
+                        }
+                        Some(p) => {
+                            let (r0, r1) = crate::exec::join2(
+                                dev.pool
+                                    .restore_spec_snap(dev.graphs.session.face_mut(), gdn_slot),
+                                p.pool.restore_spec_snap(p.graphs.session.face_mut(), gdn_slot),
+                            )
+                            .await;
+                            r1?;
+                            r0?
+                        }
+                    }
                 }
                 let replay: Vec<u32> = std::iter::once(token)
                     .chain(drafts[..m].iter().copied())
                     .collect();
-                let (_, replay_hidden, _) =
-                    self.verify_forward(&replay, pos, gdn_slot, false).await?;
+                owl_shared::log_debug!("spec-round", "回滚重放:eager verify_forward 起(peer 镜像)");
+                let (_, replay_hidden, _) = self.verify_forward(&replay, pos, gdn_slot, false).await?;
+                owl_shared::log_debug!("spec-round", "回滚重放:eager verify_forward 完");
                 let face = self.dev.graphs.session.face_mut();
                 face.free(&[replay_hidden.id]).await?;
             }
@@ -736,14 +878,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         rows: usize,
     ) -> Result<()> {
         debug_assert!(rows >= 1 && rows <= self.dev.spec_rt.depth, "fold 行数越界: {rows}");
+        // ★ **双 rank 镜像**(P2.1-c,2026-10-19):fold 写的是**每 rank 自己的 GDN 池**
+        // ⇒ 两 rank 必须同跑(否则下一轮 verify 读到本 rank 未 fold 的状态)。
+        // 与 `capture_gdn_snap` 的双 rank 形态对齐(旧注释自认的缺口);单卡 = 原路。
+        if !self.dev.graphs.fold.is_empty() {
+            let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+            match peer {
+                None => dev.fold_step_dev(gdn_slot, rows).await?,
+                Some(p) => {
+                    let (r0, r1) = crate::exec::join2(
+                        dev.fold_step_dev(gdn_slot, rows),
+                        p.fold_step_dev(gdn_slot, rows),
+                    )
+                    .await;
+                    r1?;
+                    r0?
+                }
+            }
+            return Ok(());
+        }
         {
             let face = self.dev.graphs.session.face_mut();
             self.dev.pool.restore_spec_snap(face, gdn_slot).await?;
-        }
-        if !self.dev.graphs.fold.is_empty() {
-            let fg = &mut self.dev.graphs.fold[rows - 1];
-            fg.step(&[("slots", &[gdn_slot as f32])]).await?;
-            return Ok(());
         }
         // eager fold（E5-M4）：快照态 + 记录前缀 → state@pos+rows，
         // **零整模前向**（96 副作用根一次 multi-root eval）
@@ -837,8 +993,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
     pub(crate) async fn write_bt(&mut self, sid: u64) -> Result<()> {
         let table = self.bank.sessions.session(sid)?.block_table.clone();
-        let face = self.dev.graphs.session.face_mut();
-        self.dev.pool.write_bt(face, &table).await
+        // ★ **双 rank 镜像**(P2.1-c,2026-10-19):页表是**每 rank 各自**的设备块 ⇒
+        // TP 档必须两边都写(否则 peer 的寻址停代)。单卡档 = 原路(零分支)。
+        match self.peer.as_mut() {
+            None => {
+                let face = self.dev.graphs.session.face_mut();
+                self.dev.pool.write_bt(face, &table).await
+            }
+            Some(p) => {
+                let (r0, r1) = crate::exec::join2(
+                    self.dev.pool.write_bt(self.dev.graphs.session.face_mut(), &table),
+                    p.pool.write_bt(p.graphs.session.face_mut(), &table),
+                )
+                .await;
+                r1?;
+                r0
+            }
+        }
     }
 
 

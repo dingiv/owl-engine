@@ -52,6 +52,8 @@ type Result<T> = std::result::Result<T, ModelError>;
 /// [`Default`] = 生产基线)。
 #[derive(Clone, Debug)]
 pub struct EngineKnobs {
+    /// **装载旋钮**(`[load]` 段;从配置文件来,不读 env —— 用户裁决 2026-10-19)
+    pub load: owl_shared::config::LoadCfg,
     /// 步级探针(诊断面;Default = 全关)
     pub probes: crate::running::StepProbes,
     /// 块池容量覆写(None = 2 × 单会话容量;原 OWL_POOL_TOKENS)
@@ -246,6 +248,7 @@ pub struct EngineKnobs {
 impl Default for EngineKnobs {
     fn default() -> Self {
         Self {
+            load: owl_shared::config::LoadCfg::default(),
             probes: crate::running::StepProbes {
                 // 命中面/调试打印:env 覆盖(实测排障用 `OWL_PROBES_DEBUG=1`)
                 debug: owl_shared::env_reader::flag("OWL_DEBUG"),
@@ -500,6 +503,7 @@ impl EngineKnobs {
     /// 本函数只做 module → 旋钮的字段搬运。
     pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
         Self {
+            load: cfg.load.clone(),
             probes: crate::running::StepProbes::from_config(cfg),
             // ── **配置是唯一来源**(2026-10-19 统一)──
             // 本函数只做 `OwlConfig` → 旋钮的字段搬运,**不读任何 env**
@@ -519,6 +523,7 @@ impl EngineKnobs {
                 },
                 notaps: cfg.spec.notaps,
                 tapdecl: cfg.spec.tapdecl,
+                tp_draft: cfg.spec.tp_draft,
             },
             prefix_cache: cfg.pool.prefix_cache,
             prefix_cache_share: cfg.pool.prefix_cache_share,
@@ -613,11 +618,14 @@ pub struct DraftCfg {
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
     pub tapdecl: bool,
+    /// **TP 档放行投机**(`[spec] tp_draft`;缺省 false ⇒ `tp.rs` 的 v1 护栏仍拒)
+    pub tp_draft: bool,
 }
 
 impl Default for DraftCfg {
     fn default() -> Self {
         Self {
+            tp_draft: false,
             depth: 0,
             dumb: false,
             dflash2_dir: None,
@@ -802,11 +810,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         Ok(Self { face, ledger, cfg, boot })
     }
 
-    /// **续用已有句柄**装配引擎壳(TP:staging 握手要把 face 借出来再装回去;
-    /// 拆装会丢掉上下文与账本身份 ⇒ 必须“接着用”而不是“重包一遍”)。
-    ///
-    /// **契约**:`face` 的事件入口与 `ledger` **必须是同一本账**(单卡由
-    /// [`Self::on_with_ledger`] 保证;TP 由 `adopt_ledger` 保证)。
+    /// **接管已包好的句柄**(TP:两 rank 共用一本账;句柄由 `into_parts` 交出)。
     pub(crate) fn from_handle(
         cfg: EngineConfig,
         face: DeviceHandle<D>,
@@ -830,9 +834,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
     }
 
     /// 模型加载器(借用引擎 face;装载即校验,错误在 load 边界落地)。
-    /// 面类型 = 句柄(`DeviceHandle<D>`)—— 装载期的每一块都进事件账(Weight 类)。
+    /// 面类型 = 句柄(`DeviceHandle<D>`)—— 装载期的每一块都进事件账(Weight 类);
+    /// `load` 旋钮来自配置(`[load]` 段;用户裁决 2026-10-19:不读 env)。
     pub fn loader(&mut self) -> ModelLoader<'_, DeviceHandle<D>> {
-        ModelLoader::new(&mut self.face)
+        ModelLoader::new(&mut self.face, self.cfg.knobs.load.clone())
     }
 
     /// 模型交引擎:状态块/槽/Session 组建 + warmup —— 仍不跑任何 turn,
@@ -1199,6 +1204,9 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
                 dumb: cfg.knobs.draft.dumb,
                 draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
                 notaps: cfg.knobs.draft.notaps,
+                // P2.1-a:本 rank 的 TP 计划(单卡 = None ⇒ 旧行为)
+                tp: tp.as_ref().map(|c| c.plan),
+                load: cfg.knobs.load.clone(),
             },
         )
         .await?;
@@ -1235,6 +1243,12 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             } else {
                 owl_models::env::KvQuant::None
             },
+            // P2.1-b:草稿池几何(**分片后**;来自草稿声明 + 本 rank 计划)
+            draft_geom: spec.draft_geom,
+            // 治理器按卡摊 `live`(TP2 下 LIVE 含两卡之和;2026-10-19 定谳)
+            tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
+            // 草稿池 dtype 同源(量化族 BF16 / 未量化族 F16;见 spec_runtime::draft_dt)
+            draft_dt: spec.draft_dt,
             spec_mode: spec.mode,
             spec_depth: spec.depth,
             xqa_verify: cfg.knobs.env.attn.verify_xqa,
@@ -1473,6 +1487,39 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
                  或显式关闭该档([spec] depth = 0;或 [spec] notaps = true 退 last_hidden)"
                     .to_string(),
             ));
+        }
+
+        // ── 词表切 × 草稿档（DFlash2/MTP）= **boot 拒启**（P1.1 × P2.1，2026-10-19）──
+        // 两族的草稿头都**共享 target 的 lm_head**（`dflash2.rs` 的 propose /
+        // `mtp.rs` 的 `embed.lm_head_matmul`），且选择面按**全量 vocab** 索引
+        // （DFlash2 码本 [vocab, rank] / MTP argmax stride = vocab）⇒ 词表切档下
+        // 草稿 logits 只剩半表：候选塌到半词表。
+        // **实测**（3080 对，depth=7）：AL 2.4 → 1.4 ⇒ B4 降级把 spec 档拖到裸
+        // decode（**104 → 40 t/s**）。该组合的解 = 草稿选择面半表化（两 rank 各出
+        // 候选 + host 合并 + 码本行偏移）——**未施工** ⇒ 此档**响亮拒**
+        // （静默放行 = 用户跑出“投机失效”的黑盒）。
+        // dumb 草稿无头 ⇒ 不受影响；`depth = 0` ⇒ 无草稿档。
+        // ── 词表切 × 草稿档：**DFlash2 图档已支持 / 其余仍拒**（P1.1 × P2.1）──
+        // 两族的草稿头都**共享 target 的 lm_head**（`dflash2.rs` / `mtp.rs`），
+        // 选择面按**全量 vocab** 索引 ⇒ 切档后草稿 logits 只剩半表（实测
+        // AL 2.4→1.4 ⇒ 降级裸 decode 104→40 t/s）。
+        // **已解**：DFlash2 **图档** —— propose 图出半表 top-16 候选 + proj，
+        // host 合并两 rank 候选（rank1 id + half），rank0 跑 select（全表域）。
+        // **仍拒**：MTP（未做）/ DFlash2 无图（eager 降级档，未做）。
+        if matches!(spec.mode, SpecMode::DFlash2 | SpecMode::Mtp)
+            && rm.model.logits_vocab() != rm.model.vocab_size()
+        {
+            let dflash_graph_ok =
+                spec.mode == SpecMode::DFlash2 && graphs.dflash.is_some();
+            if !dflash_graph_ok {
+                return Err(owl_iface::contract::ModelError::Msg(
+                    "词表切(runtime.tp_vocab_split)与**本草稿档**不兼容：".to_string()
+                        + "草稿头共享 target lm_head ⇒ 切档后草稿 logits 只剩半表。\
+                           已解 = DFlash2 **图档**（需 `[graph] no_graph = false` 且捕获成功）；\
+                           未解 = MTP / DFlash2 eager 降级档。\
+                           请二选一：关 runtime.tp_vocab_split，或换到已解档。",
+                ));
+            }
         }
 
     Ok(RankDev {

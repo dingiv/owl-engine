@@ -148,6 +148,8 @@ impl VlmCfg {
         };
         let text_spec = ModelSpec {
             vocab: g("vocab_size")?,
+            head_vocab: g("vocab_size")?, // VLM 不进 TP(v1):头 = 全量
+            head_split: false,
             hidden,
             inter: g("intermediate_size")?,
             dtype: Dtype::F16,
@@ -255,7 +257,7 @@ impl Vlm {
         face: &mut D,
         dtype: Dtype,
     ) -> Result<Vlm, ModelError> {
-        Self::load_ctx(dir, face, LoaderCtx { dtype, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false }).await
+        Self::load_ctx(dir, face, LoaderCtx { dtype, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false }).await
     }
 
     /// 同上,装载 ctx 外给(分相探针 / 校验 / 分片调试面)
@@ -278,6 +280,8 @@ impl Vlm {
             device_repack: Some(ctx.device_repack),
             verify: ctx.verify,
             debug_tap: ctx.debug_tap,
+            staging_mb: 128,
+            dump: false,
         };
         crate::formats::load::load_from_dir(dir, face, &vlm, opts).await?;
         Ok(vlm)
@@ -661,6 +665,8 @@ mod tests {
         }
         let vlm = Vlm::load_ctx(&dir, &mut gpu, crate::module::LoaderCtx {
             dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: dbg,
+            staging_mb: 128,
+            dump: false,
         }).await.expect("Vlm::load(4B)");
         eprintln!("[vlm] 4B 整装 {:.1}s", t0.elapsed().as_secs_f64());
         if dbg {
@@ -679,7 +685,7 @@ mod tests {
             &rp,
             &mut gpu,
             &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false },
+            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false },
         )
         .await
         .expect("rope 表(f16)");
@@ -780,7 +786,7 @@ mod tests {
             &rp,
             &mut gpu,
             &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false },
+            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false },
         )
         .await
         .expect("rope 表(f16)");

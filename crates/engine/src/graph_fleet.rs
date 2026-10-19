@@ -377,7 +377,10 @@ impl<D: DeviceClient> GraphFleet<D> {
         let dims = boot.dims;
         let model = Arc::clone(&boot.model);
         let rp = boot.rope.clone();
-        let vocab = boot.model.vocab_size();
+        // **本 rank 的 logits 宽度**(P1.1 词表切档 = 半表;未切档 = 全词表):
+        // decode 图的 logits 槽宽、设备 argmax 的 stride 都读它 ——
+        // `vocab_size()` 仍是词表全量(embed/tokenizer 面用)。
+        let vocab = boot.model.logits_vocab();
         let knobs = boot.knobs;
         let kv_caches = pool.kv_caches();
         let gdn_caches = pool.gdn_caches();
@@ -514,6 +517,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                 model.forward(&ids, &ctx)
             };
             // E3 设备采样:token = argmax(logits)(f32 数值过线,契约 5)
+            // ⚠️ P1.1:stride = **本 rank 的 logits 宽度**(词表切档 = 半表);
+            // 用全量 `vocab_size()` 会跨行读(越界)。半表档的 token 只是**局部**
+            // argmax —— 消费面走 host 拼接(见 `RunningEngine::read_full_logits`)。
             let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
             sc.output("token", &tok)?;
             sc.output("logits", &tree)
@@ -678,7 +684,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             // 需要各行目标分布(原先只有 argmax ⇒ spec 臂不采样 =
             // 请求温度失效;A7/A8 根因,见 agent 专项 §7.11)。
             // 贪心档不回读(零额外 D2H);仅采样档付 ~2.4MB/轮。
-            OutputSlot { name: "logits".into(), shape: vec![depth1, model_v.vocab_size()], dtype: Dtype::F16 },
+            OutputSlot { name: "logits".into(), shape: vec![depth1, model_v.logits_vocab()], dtype: Dtype::F16 },
         ];
         // DFlash2 target taps(E5-DF2;层输出残差流,sglang capture 同语义)
         // notaps → 退回 last_hidden(排查开关:隔离 taps 图)
@@ -854,7 +860,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 let tap: std::rc::Rc<std::cell::RefCell<Vec<TensorOps>>> =
                     std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                 ctx.gdn_tap = Some(tap.clone());
-                let vocab = model_v.vocab_size();
+                let vocab = model_v.logits_vocab();
                 let (hidden, taps) = if dflash_tap_decl {
                     let (h, t) = model_v.tapped_hidden(&ids, &ctx, &[5, 19, 33, 47, 61]);
                     if dflash_taps {
@@ -1064,6 +1070,11 @@ impl<D: DeviceClient> GraphFleet<D> {
         let model_df = Arc::clone(&boot.model);
         let rp_df = boot.spec.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
         let d2g = Arc::clone(d2);
+        // **切档形态**（P1.1 × P2.1）:propose 图只出"半表 top-16 候选 + proj" ——
+        // host 合并两 rank 候选后由 rank0 跑 select（全表域）。判据 = 事实
+        // （本 rank logits 宽 < 全量），与引擎侧 `head_split_active` 同律。
+        let head_split = boot.model.logits_vocab() != boot.model.vocab_size();
+        let sel_rank = d2g.selector_rank();
         let hidd = d2.hidden();
         let Some(gface) = extra_faces.pop() else {
             owl_shared::log_info!("boot", "dflash propose 图 face 耗尽 → eager propose");
@@ -1085,14 +1096,26 @@ impl<D: DeviceClient> GraphFleet<D> {
                     InputSlot::f32("prop_kv_lens", 8),
                     InputSlot::f32("kv_len", 1),
                 ],
-                outputs: vec![
-                    OutputSlot::f32("drafts", &[7 * (16 * 16 + 1)]),
-                    OutputSlot { name: "e0".into(), shape: vec![1], dtype: Dtype::BF16 },
-                    OutputSlot { name: "e1".into(), shape: vec![1], dtype: Dtype::BF16 },
-                    OutputSlot { name: "e2".into(), shape: vec![1], dtype: Dtype::BF16 },
-                    OutputSlot { name: "e3".into(), shape: vec![1], dtype: Dtype::BF16 },
-                    OutputSlot { name: "e4".into(), shape: vec![1], dtype: Dtype::BF16 },
-                ],
+                outputs: {
+                    let mut o = vec![OutputSlot::f32("drafts", &[7 * (16 * 16 + 1)])];
+                    if head_split {
+                        // 切档:topk 单缓冲（值区 112 + 索引区 112 = 224）——
+                        // **输出槽形状 = 整父块**（`slice_view` 输出整缓冲的
+                        // 既有契约;见原 `drafts` 注），故声明 2*7*TOP_K。
+                        o.push(OutputSlot::f32("topk", &[2 * 7 * owl_models::layers::dflash2::TOP_K]));
+                        o.push(OutputSlot {
+                            name: "sel_proj".into(),
+                            shape: vec![7, sel_rank],
+                            dtype: d2g.dtype(),
+                        });
+                    }
+                    o.push(OutputSlot { name: "e0".into(), shape: vec![1], dtype: Dtype::BF16 });
+                    o.push(OutputSlot { name: "e1".into(), shape: vec![1], dtype: Dtype::BF16 });
+                    o.push(OutputSlot { name: "e2".into(), shape: vec![1], dtype: Dtype::BF16 });
+                    o.push(OutputSlot { name: "e3".into(), shape: vec![1], dtype: Dtype::BF16 });
+                    o.push(OutputSlot { name: "e4".into(), shape: vec![1], dtype: Dtype::BF16 });
+                    o
+                },
                 capture: !knobs.no_graph,
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
@@ -1148,13 +1171,26 @@ impl<D: DeviceClient> GraphFleet<D> {
                 for (i, r) in enc_roots.iter().enumerate() {
                     sc.output(format!("e{i}"), r)?;
                 }
-                let (_h, drafts, _s, _l) = d2g.propose_block(
-                    &tokens, &prop_pos, &anchor, &prop_kvs, &rp_df,
-                    &model_df.embed, &kv_len, &ctx, None,
-                );
                 // drafts = select 单缓冲前 7 元(offset 0;输出槽
                 // 形状 = 整缓冲 —— dtoh 整父块契约)
-                sc.output("drafts", &drafts)
+                if head_split {
+                    // **切档形态**:只出候选（整 topk 缓冲）+ proj
+                    // （select 由 host 合并后跑）
+                    let (_h, _cand, vals, proj, _l) = d2g.propose_block_split(
+                        &tokens, &prop_pos, &prop_kvs, &rp_df, &model_df.embed, &kv_len, &ctx, None,
+                    );
+                    // vals 是 topk 单缓冲的**前段视图** ⇒ 输出整父块
+                    // （值区 ‖ 索引区;host 按同序切片）
+                    sc.output("topk", &vals)?;
+                    sc.output("sel_proj", &proj)?;
+                    Ok(())
+                } else {
+                    let (_h, drafts, _s, _l) = d2g.propose_block(
+                        &tokens, &prop_pos, &anchor, &prop_kvs, &rp_df,
+                        &model_df.embed, &kv_len, &ctx, None,
+                    );
+                    sc.output("drafts", &drafts)
+                }
             },
         )
         .await?;

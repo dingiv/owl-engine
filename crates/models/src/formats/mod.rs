@@ -22,6 +22,7 @@
 //! 经 interpreters 模块 shim 转发(历史调用面不动)。
 
 pub mod awq;
+pub mod ckpt_config;
 pub(crate) mod awq_build;
 pub mod kind;
 pub mod load;

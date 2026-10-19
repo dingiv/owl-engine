@@ -225,6 +225,28 @@ pub struct RuntimeCfg {
     /// 副作用:staging 别名改授 `PROT_READWRITE`。
     #[serde(default)]
     pub tp_push: bool,
+    /// **TP 通信数据腿：fp8 载荷**（runtime.tp_ar_f8；§47 第二步 2026-10-19）
+    /// ⇒ 交 `TpOpts.ar_f8`。**两侧同装配 ⇒ 同档**（不同档 = 收端按错 dtype 解读）。
+    pub tp_ar_f8: bool,
+    /// **lm_head 词表切**（runtime.tp_vocab_split；P1.1 2026-10-19）
+    ///
+    /// `true` ⇒ 每 rank 只建/只算/只持**自己那半词表**的 lm_head 行
+    /// （`ModelSpec::head_split` → `head_vocab = vocab / world`）：
+    /// decode 的头部 GEMM 减半、每卡省 ~1.18 GiB；代价 = logits 需 host 侧
+    /// 拼接（两 rank 半表拼回全表后才采样/判据）。
+    /// **缺省 `false` = 逐字节旧行为**；需 `world = 2`（单卡给值 = 响亮拒）。
+    /// 词表必须被 world 整除（`ModelSpec::sharded` 的整除硬门）。
+    #[serde(default)]
+    pub tp_vocab_split: bool,
+    /// **v1 两核融合档**（runtime.tp_ar_fused；§11.2 2026-10-19）
+    ///
+    /// `true` ⇒ AR 走**一核**（`ArFusedCall`：stage+reduce 同一核内两阶段）
+    /// 而非两核 —— §59.1 实测两核成本 22.13µs/次全在"核的落地/排空"
+    /// （单核 11.13 + 第二核边际 11.00）⇒ 少发一个核 ≈ decode +4%。
+    /// **只非 fp8 载荷**（decode 档；prefill 的 fp8 腿仍两核）。
+    /// **缺省 `false` = 逐字节旧行为**；两 rank 同装配（同档）。
+    #[serde(default)]
+    pub tp_ar_fused: bool,
     /// **自动选卡的空闲占比阈值**(0..1;默认 0.9):候选卡的 `memory.free/total` 低于它
     /// ⇒ auto-pick 跳过(避让非 owl 进程/未持锁实例);显式 spec 命中且全被跳 ⇒ 响亮拒启。
     pub gpu_min_free_ratio: f64,
@@ -504,6 +526,11 @@ pub struct SpecCfg {
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
     pub tapdecl: bool,
+    /// **TP 档放行投机解码**(P2.1-c;缺省 false = 响亮拒)。
+    /// 打开 = "草稿族双 rank 化"这条路的显式闸门:草稿 spec/权重按本 rank 计划
+    /// 分片、草稿池几何按分片 hkv、草稿 AR 与主干共用同一条 AR 序列。
+    /// **配置显式声明**(不读 env)—— 分相纪律:未验完的档不许静默放行。
+    pub tp_draft: bool,
     /// **m=0 连击阈值**(达此连击 → 降级裸 decode;0 = 禁用降级)
     pub degrade_after: usize,
     /// **降级后的首次探测窗口(tokens)** —— 探测 = 跑一个投机轮试水,命中(m≥1)即恢复 spec。
@@ -529,11 +556,39 @@ pub struct SamplingCfg {    pub mode: SamplerMode,
 }
 
 /// 装载域(校验/观测)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoadCfg {
     pub verify: bool,
     pub debug_tap: bool,
+    /// **暂存槽上限 MiB**(原 `OWL_LOAD_STAGING_MB`;缺省 128)。
+    /// 单键超过它就按段流式装载(`0` = 不设上限)。**从配置来,不读 env**(用户裁决 2026-10-19)。
+    pub staging_mb: usize,
+    /// **设备重排裁决**:"auto"(缺省;能力自述 `RepackPath::resolve`)/ "device" / "cpu"。
+    /// 装载旋钮入配置面(此前只有隐式裁决,无显式入口)。
+    pub repack: String,
+    /// 逐键字节 dump(原 `OWL_LOAD_DUMP`;诊断面)
+    pub dump: bool,
+}
+
+impl LoadCfg {
+    /// `repack` 三态解析(非法值**响亮拒**;缺省 auto)
+    pub fn repack_device(&self) -> Result<Option<bool>, String> {
+        match self.repack.as_str() {
+            "auto" | "" => Ok(None),
+            "device" => Ok(Some(true)),
+            "cpu" => Ok(Some(false)),
+            other => Err(format!(
+                "[load] repack = {other:?} 非法(只认 auto|device|cpu)"
+            )),
+        }
+    }
+}
+
+impl Default for LoadCfg {
+    fn default() -> Self {
+        Self { verify: false, debug_tap: false, staging_mb: 128, repack: "auto".into(), dump: false }
+    }
 }
 
 /// 解释器分派面(models EnvProvider 组装源;**正语义** —— true = 开,
@@ -972,6 +1027,9 @@ impl Default for RuntimeCfg {
             device_ordinal: None,
             tp_ordinals: None,
             tp_push: false,
+            tp_ar_f8: false,
+            tp_vocab_split: false,
+            tp_ar_fused: false,
             gpu_min_free_ratio: 0.9,
             max_seq: 4096,
             prefill_chunk: 512,
@@ -1030,6 +1088,7 @@ impl Default for KvmemCfg {
 impl Default for SpecCfg {
     fn default() -> Self {
         Self {
+            tp_draft: false,
             depth: 0,
             dumb: false,
             draft_kv_fp8: false,
@@ -1414,6 +1473,43 @@ impl OwlConfig {
                 ));
             }
         }
+        // **白名单 ↔ 池档位自洽门**(2026-10-19):`allowed_ops` 与 `kv_fp8` 是
+        // **两处真源**、靠人手同步 ⇒ 已两次同型事故:
+        //   ① `awq27b` 白名单是 fp8 族而 `kv_fp8` 未设(缺省 false)⇒ 池 f16 /
+        //      白名单 fp8 ⇒ **首次发射**撞算子准入门
+        //      (`owl_qknorm_rope_kv_insert_f16_knhd 未列入`)⇒ 该档根本起不来;
+        //   ② `W4A8…设计与施工` §18.5 的 cast 项(同型,另一族)。
+        // 门 = 白名单必须覆盖**当前池 dtype**的「prefill 注意力族 + KV 写入族」;
+        // 缺了就在 boot 期拒启(而不是等第一发请求才炸)。
+        // 注:显式 `allowed_ops = []` = 门关(诊断态,是有意为之);不写 = None = 门关。
+        if let Some(ops) = self.dispatch.allowed_ops.as_ref().filter(|v| !v.is_empty()) {
+            const F16_POOL: [&str; 3] = [
+                "flashinfer_prefill_paged_f16",
+                "owl_qknorm_rope_kv_insert_f16_knhd",
+                "vllm_reshape_and_cache_f16_knhd",
+            ];
+            const FP8_POOL: [&str; 3] = [
+                "flashinfer_prefill_paged_fp8kv",
+                "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
+                "owl_reshape_and_cache_fp8kv_knhd",
+            ];
+            let (pool, need): (&str, &[&str; 3]) = if self.dispatch.kv_fp8 {
+                ("fp8(KV 池 = fp8_e4m3)", &FP8_POOL)
+            } else {
+                ("f16", &F16_POOL)
+            };
+            let missing: Vec<&str> = need
+                .iter()
+                .copied()
+                .filter(|n| !ops.iter().any(|o| o == n))
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "[dispatch] allowed_ops 与池档位不自洽:池 = {pool}(kv_fp8 = {}),白名单缺 {missing:?}\n              —— 该档会在**首次发射**撞算子准入门(系统级缺档,不是运行期偶发)。\n              修法:① 池档位与白名单同族(fp8 池配 fp8 族 / f16 池配 f16 族,\n              通常就是在档里显式写 `kv_fp8`);② 或显式 `allowed_ops = []`(门关,仅诊断态)。",
+                    self.dispatch.kv_fp8
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1496,6 +1592,42 @@ mod tests {
     /// **跨字段语义门**(D1,2026-10-17):`gdn_slots < max_concurrency` 必拒,
     /// 拒语要点出病因(状态格逐出 = 跨会话污染)与调法;合规组合(生产档 1/1、
     /// 缺省 8/8)必须过。
+    /// **白名单 ↔ 池档位自洽门**(2026-10-19):两次同型事故(awq27b 起不来)的回归门。
+    #[test]
+    fn 白名单与池档位必须同族() {
+        // ① 病态:fp8 白名单 + 池缺省(f16)⇒ 拒启,且文案点明不自洽
+        let e = OwlConfig::from_toml_str(
+            "[dispatch]\nallowed_ops = [\"flashinfer_prefill_paged_fp8kv\", \
+             \"owl_qknorm_rope_kv_insert_f16_fp8kv_knhd\", \"owl_reshape_and_cache_fp8kv_knhd\"]\n",
+        )
+        .expect_err("fp8 白名单 + f16 池应拒启");
+        assert!(e.contains("不自洽"), "错误文案应点明属性:{e}");
+        assert!(e.contains("kv_fp8"), "错误文案应指向 kv_fp8:{e}");
+        // ② fp8 池 + fp8 白名单 ⇒ 过
+        OwlConfig::from_toml_str(
+            "[dispatch]\nkv_fp8 = true\nallowed_ops = [\"flashinfer_prefill_paged_fp8kv\", \
+             \"owl_qknorm_rope_kv_insert_f16_fp8kv_knhd\", \"owl_reshape_and_cache_fp8kv_knhd\"]\n",
+        )
+        .expect("fp8 池 + fp8 白名单应过");
+        // ③ f16 池 + f16 白名单 ⇒ 过
+        OwlConfig::from_toml_str(
+            "[dispatch]\nkv_fp8 = false\nallowed_ops = [\"flashinfer_prefill_paged_f16\", \
+             \"owl_qknorm_rope_kv_insert_f16_knhd\", \"vllm_reshape_and_cache_f16_knhd\"]\n",
+        )
+        .expect("f16 池 + f16 白名单应过");
+        // ④ 两族共存(生产 spec-dflash 就是两族都收,池 dtype 决定发射哪族)⇒ 过
+        OwlConfig::from_toml_str(
+            "[dispatch]\nkv_fp8 = false\nallowed_ops = [\"flashinfer_prefill_paged_f16\", \
+             \"flashinfer_prefill_paged_fp8kv\", \"owl_qknorm_rope_kv_insert_f16_knhd\", \
+             \"vllm_reshape_and_cache_f16_knhd\", \"owl_qknorm_rope_kv_insert_f16_fp8kv_knhd\", \
+             \"owl_reshape_and_cache_fp8kv_knhd\"]\n",
+        )
+        .expect("两族共存的白名单(f16 池)应过");
+        // ⑤ 门关:空列表(诊断态)/ 不写 ⇒ 不校验
+        OwlConfig::from_toml_str("[dispatch]\nallowed_ops = []\n").expect("空 = 门关,应过");
+        assert!(OwlConfig::default().dispatch.allowed_ops.is_none());
+    }
+
     #[test]
     fn validate_rejects_concurrency_over_gdn_slots() {
         let e = OwlConfig::from_toml_str("[pool]\ngdn_slots = 1\n[server]\nmax_concurrency = 8\n")

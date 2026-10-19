@@ -397,8 +397,98 @@ pub fn budget_clamp(
     Ok(room)
 }
 
+/// **半表行拼接**（P1.1 词表切；纯函数 —— 判据可单测）：
+/// `[rows, half] × 2 → [rows, 2·half]`。
+///
+/// 列序 = **全局词表序**：rank0 持低半、rank1 持高半
+/// （`TpPlan::shard_range` 语义 ⇒ `build_shard_pass` 给 rank0 的 span 从 0 起），
+/// 故逐行 `a ++ b`。
+///
+/// 响亮拒：两半长度不等 / 不是半表宽的整倍（形状不符就拼接了
+/// = 静默错词，比拒启难查一百倍）。
+pub(crate) fn concat_head_rows(
+    a: &[f32],
+    b: &[f32],
+    half: usize,
+) -> crate::Result<Vec<f32>> {
+    if half == 0 || a.len() != b.len() || !a.len().is_multiple_of(half) {
+        return Err(owl_iface::contract::ModelError::EngineInvariant {
+            what: format!(
+                "词表切拼接：形状不符（半表宽 {half} / 本端 {} / 对端 {}）",
+                a.len(),
+                b.len()
+            ),
+        });
+    }
+    let rows = a.len() / half;
+    let mut out = Vec::with_capacity(a.len() * 2);
+    for r in 0..rows {
+        out.extend_from_slice(&a[r * half..(r + 1) * half]);
+        out.extend_from_slice(&b[r * half..(r + 1) * half]);
+    }
+    Ok(out)
+}
+
+/// **候选合并**（P1.1 × P2.1；纯函数 —— 判据可单测）：两 rank 各 `[rows, K]`
+/// 值/索引 → **全局 top-K**。
+///
+/// - rank1（peer）的索引是**半表域** ⇒ 全局 id = 局部 id + `half`（rank0 低半）；
+/// - 排序律与核同：**值降序、平局取小 id**（`topk` 族的既有语义）；
+/// - 正确性依据：全局 top-K ⊆ 两半各自 top-K 的并集（截断性质）。
+///
+/// 响亮拒：形状不符（行数/K 不一致 / 长度不是 rows*K）。
+pub(crate) fn merge_topk_two_halves(
+    vals_a: &[f32],
+    ids_a: &[f32],
+    vals_b: &[f32],
+    ids_b: &[f32],
+    rows: usize,
+    k: usize,
+    half: usize,
+) -> crate::Result<(Vec<f32>, Vec<u32>)> {
+    let want = rows * k;
+    if k == 0 || vals_a.len() != want || vals_b.len() != want || ids_a.len() != want || ids_b.len() != want {
+        return Err(owl_iface::contract::ModelError::EngineInvariant {
+            what: format!(
+                "候选合并：形状不符（rows {rows} k {k} / a {}/{} b {}/{}）",
+                vals_a.len(),
+                ids_a.len(),
+                vals_b.len(),
+                ids_b.len()
+            ),
+        });
+    }
+    let mut out_v = Vec::with_capacity(want);
+    let mut out_i = Vec::with_capacity(want);
+    let mut cand: Vec<(f32, u32)> = Vec::with_capacity(2 * k);
+    for r in 0..rows {
+        cand.clear();
+        for j in 0..k {
+            let ia = ids_a[r * k + j];
+            if ia.is_finite() {
+                cand.push((vals_a[r * k + j], ia as u32));
+            }
+            let ib = ids_b[r * k + j];
+            if ib.is_finite() {
+                cand.push((vals_b[r * k + j], ib as u32 + half as u32));
+            }
+        }
+        // 值降序；平局取小 id（与核的 topk 语义同律）
+        cand.sort_by(|x, y| {
+            y.0.partial_cmp(&x.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(x.1.cmp(&y.1))
+        });
+        for &(v, i) in cand.iter().take(k) {
+            out_v.push(v);
+            out_i.push(i);
+        }
+    }
+    Ok((out_v, out_i))
+}
+
 impl<D: DeviceClient> RunningEngine<D> {
-    /// 本档 prefill 块长(探针排版用;与调度器取**同一份配置** ⇒ 不会对不上)
+    /// 本档 prefill 块长（探针排版用；与调度器取**同一份配置** ⇒ 不会对不上）
     #[cfg(any(test, feature = "e2e"))]
     pub(crate) fn cfg_prefill_chunk(&self) -> usize {
         self.cfg.prefill_chunk
@@ -419,8 +509,10 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.peer.is_some()
     }
 
-    /// **诊断出口**:读主 rank(rank0)会话图的命名输出(如 `logits`/`token`)。
-    /// `None` = 该图无此输出槽。G8 对拍/数值归因用(S4 ⑤-K3)。
+    /// **诊断出口**：读主 rank（rank0）会话图的命名输出（如 `logits`/`token`）。
+    /// `None` = 该图无此输出槽。G8 对拍/数值归因用（S4 ⑤-K3）。
+    /// ⚠️ **P1.1 词表切档下 `logits` 是半表**（本 rank 宽度 = `logits_vocab()`）；
+    /// 要全表请用 [`Self::read_full_logits`]（唯一的“半表→全表”出口）。
     pub async fn read_output_f32(&mut self, name: &str) -> Result<Option<Vec<f32>>> {
         if !self.dev.graphs.session.has_output(name) {
             return Ok(None);
@@ -428,7 +520,38 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(Some(self.dev.graphs.session.read_output_f32(name).await?))
     }
 
-    /// **诊断出口**:读 peer(rank1)会话图输出(TP 对拍;**单卡 = None**)。
+    /// **P1.1 词表切：logits 的“全表”读出口**（采样/诊断/接受判据的**唯一**入口）。
+    ///
+    /// - 未切档（`head_split = false`）：单次读 —— 与旧
+    ///   `session.read_output_f32("logits")` **逐字节等价**（零开销）；
+    /// - 词表切档：本 rank 半表 + peer 半表在 **host 拼接**（两 rank 同一进程
+    ///   ⇒ 无新传输设施；列序 = 全局词表序：rank0 低半 + rank1 高半）。
+    ///
+    /// 形状 = `[rows, 2·half]`（`rows` 由半表长度推出：decode = 1，verify = depth+1）。
+    /// **词表切实效判据**（P1.1）：本 rank 的 logits 宽 < 全量词表。
+    /// **不读意图位**（`spec.head_split`）—— 意图可能被模型结构否定（tied 表
+    /// 装载期已响亮拒；但“事实在模型里”才是拼接面的唯一判据）。
+    pub(crate) fn head_split_active(&self) -> bool {
+        self.dev.model.logits_vocab() != self.dev.model.vocab_size()
+    }
+
+    pub(crate) async fn read_full_logits(&mut self, name: &str) -> Result<Vec<f32>> {
+        let a = self.dev.graphs.session.read_output_f32(name).await?;
+        if !self.head_split_active() {
+            return Ok(a);
+        }
+        let half = self.dev.model.logits_vocab();
+        let p = self
+            .peer
+            .as_mut()
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: "词表切档缺 peer：半表拼接无对端（装配不一致）".into(),
+            })?;
+        let b = p.graphs.session.read_output_f32(name).await?;
+        concat_head_rows(&a, &b, half)
+    }
+
+    /// **诊断出口**：读 peer（rank1）会话图输出（TP 对拍；**单卡 = None**）。
     /// 用途:G8 的"两 rank 同值"实证(AR 后两 rank 应**逐位相同**)。
     pub async fn read_peer_output_f32(&mut self, name: &str) -> Result<Option<Vec<f32>>> {
         let Some(p) = self.peer.as_mut() else { return Ok(None) };
@@ -1706,6 +1829,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(ev);
         }
         let prof = self.cfg.knobs.probes.step_profile;
+        // P2.2 侦察(2026-10-19):pump 内分段墙钟(pop-events / 头 / sched / exec / 尾)
+        let t_ph0 = prof.then(std::time::Instant::now);
         // metrics 框架接线(2026-10-01 合并示范):schedule 分相计时入
         // owl_shared 全局 store(debug 展开/release 零开销);prof 时查询
         // 打印。其余 STEP_PROFILE 打点保留原样(gl-prof/srv-timing 工具链
@@ -1717,6 +1842,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         //    预搬是显式策略,不是默认行为)。
         // 保洁**先于** `schedule` 里的 `ensure_for_len` ⇒ 正常路径下同步驱逐恒为空
         // (报告面 `ops.ensure_evicted` 可查)。
+        // P0.3 定谳(2026-10-19):**循环头**耗时(需求驱动保洁:need/gate/housekeeping)
+        // —— 它是"步墙钟 − 设备 − fill/launch − 采样"的缺口候选(此前未打点)。
+        let t_loophead = (prof || true).then(std::time::Instant::now);
         let need = self.step_need()?;
         let mut need = need;
         self.admission_gate(&mut need)?;
@@ -1732,25 +1860,41 @@ impl<D: DeviceClient> RunningEngine<D> {
             );
             self.node(Node::Pressure(k)).await?;
         }
+        let loophead_ms = t_loophead.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
+        let t_lh1 = prof.then(std::time::Instant::now); // 循环头之后
         owl_shared::timer_start!("engine.pump.schedule");
         let t_sched = (prof || true).then(std::time::Instant::now);
         let out = self.schedule()?;
+        let t_sc1 = prof.then(std::time::Instant::now); // schedule 之后
         if let Some(ts) = t_sched {
             let d = ts.elapsed();
             self.sched_acc_ns += d.as_nanos() as u64;
             self.sched_cnt += 1;
             if self.sched_cnt.is_multiple_of(16) {
-                owl_shared::log_info!("sched", "n={} avg={:.2}ms last={:.2}ms",
+                owl_shared::log_info!("sched", "n={} avg={:.2}ms last={:.2}ms loophead={:.3}ms",
                     self.sched_cnt,
                     self.sched_acc_ns as f64 / self.sched_cnt as f64 / 1e6,
-                    d.as_secs_f64() * 1e3
+                    d.as_secs_f64() * 1e3,
+                    loophead_ms
                 );
             }
         }
         owl_shared::timer_end!("engine.pump.schedule");
         if prof {
-            owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new()
-                .tag_prefix("engine.pump."));
+            // ⚠️ **降频**(P2.2 立案;2026-10-19):原**每步**查一次 metrics ⇒
+            // 实测 **1.63ms/步**（"探针观测即污染"—— 它把 `step_profile` 档的
+            // 读数整体抬高 ~8%,还让"循环外 1.55ms"成为 **探针假象**:分段打点
+            // 显示 `sched→exec` 1.63ms、而 schedule 本身 ≈0 ⇒ 靶就是这一句）。
+            // 改成每 64 步一次(泵循环探针面足够;静态计数零结构改动)。
+            static PUMP_METRIC_TICK: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            if PUMP_METRIC_TICK
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(64)
+            {
+                owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new()
+                    .tag_prefix("engine.pump."));
+            }
         }
         match out {
             SchedulerOutput::Idle => {
@@ -1790,7 +1934,19 @@ impl<D: DeviceClient> RunningEngine<D> {
                         let saved = self.dev.env.phase;
                         self.set_phase(owl_models::env::EvalPhase::Decode);
                         owl_shared::timer_start!("engine.phase.decode");
+                        let t_ex0 = t_ph0.map(|_| std::time::Instant::now());
                         let r = self.execute_decode(token, pos, kv_slot, gdn_slot, grew).await;
+                        if let (Some(p0), Some(ex0)) = (t_ph0, t_ex0) {
+                            let head = ex0.duration_since(p0);
+                            let exec = ex0.elapsed();
+                            let lh = t_lh1.map(|t| t.duration_since(p0)).unwrap_or_default();
+                            let sc = t_sc1.map(|t| t.duration_since(t_lh1.unwrap_or(t))).unwrap_or_default();
+                            let tail_head = t_sc1.map(|t| ex0.duration_since(t)).unwrap_or_default();
+                            owl_shared::log_info!(
+                                "pump-phases",
+                                "head={head:?} [entry→lh={lh:?} lh→sched={sc:?} sched→exec={tail_head:?}] exec={exec:?}"
+                            );
+                        }
                         owl_shared::timer_end!("engine.phase.decode");
                         self.set_phase(saved);
                         r
@@ -1823,6 +1979,89 @@ impl<D: DeviceClient> RunningEngine<D> {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod topk_merge_tests {
+    //! P1.1 候选合并单测（纯）
+    use super::merge_topk_two_halves;
+
+    /// rank0 低半 ++ rank1 高半：跨半的全局前三正确（含 id 偏移）
+    #[test]
+    fn merges_across_halves_with_offset() {
+        // rows=1, k=2, half=100
+        let va = [5.0, 1.0];
+        let ia = [3.0, 4.0];
+        let vb = [9.0, 2.0];
+        let ib = [7.0, 8.0];
+        let (v, i) = merge_topk_two_halves(&va, &ia, &vb, &ib, 1, 2, 100).unwrap();
+        assert_eq!(i, vec![107, 3], "全局 id = 局部 + half（rank1）");
+        assert_eq!(v, vec![9.0, 5.0]);
+    }
+
+    /// 平局取小 id（与核同律）
+    #[test]
+    fn ties_prefer_smaller_id() {
+        let va = [1.0];
+        let ia = [5.0];
+        let vb = [1.0];
+        let ib = [2.0]; // 全局 102
+        let (_, i) = merge_topk_two_halves(&va, &ia, &vb, &ib, 1, 1, 100).unwrap();
+        assert_eq!(i, vec![5], "平局 ⇒ 小 id 在前");
+    }
+
+    /// 非有限值（空候选槽）被跳过
+    #[test]
+    fn skips_non_finite() {
+        let va = [f32::NEG_INFINITY, 3.0];
+        let ia = [0.0, 9.0];
+        let vb = [1.0, 2.0];
+        let ib = [0.0, 1.0];
+        let (_, i) = merge_topk_two_halves(&va, &ia, &vb, &ib, 1, 2, 100).unwrap();
+        assert_eq!(i, vec![9, 101]);
+    }
+
+    /// 多行各自独立 + 形状不符响亮拒
+    #[test]
+    fn rows_independent_and_rejects_malformed() {
+        let (va, ia) = ([3.0, 2.0], [1.0, 2.0]);
+        let (vb, ib) = ([4.0, 1.0], [1.0, 2.0]);
+        let (v, _) = merge_topk_two_halves(&va, &ia, &vb, &ib, 2, 1, 10).unwrap();
+        assert_eq!(v, vec![4.0, 2.0], "行 0 取 B/行 1 取 A");
+        assert!(merge_topk_two_halves(&va[..1], &ia, &vb, &ib, 2, 1, 10).is_err());
+        assert!(merge_topk_two_halves(&va, &ia, &vb, &ib, 2, 0, 10).is_err());
+    }
+}
+
+#[cfg(test)]
+mod head_concat_tests {
+    //! P1.1 半表拼接单测（纯）
+    use super::concat_head_rows;
+
+    /// 单行：rank0 低半 + rank1 高半 = 全局词表序
+    #[test]
+    fn single_row_low_then_high() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [4.0, 5.0, 6.0];
+        assert_eq!(concat_head_rows(&a, &b, 3).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    /// 多行（verify 形状）：每行各自拼接，不串行
+    #[test]
+    fn rows_concat_independently() {
+        // rows = 2, half = 2
+        let a = [1.0, 2.0, 3.0, 4.0]; // 行0=[1,2] 行1=[3,4]
+        let b = [10.0, 20.0, 30.0, 40.0];
+        assert_eq!(concat_head_rows(&a, &b, 2).unwrap(), vec![1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0]);
+    }
+
+    /// 响亮拒：长度不等 / 非整倍 / 半表宽 0
+    #[test]
+    fn rejects_malformed() {
+        assert!(concat_head_rows(&[1.0, 2.0], &[3.0], 2).is_err());
+        assert!(concat_head_rows(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0], 2).is_err());
+        assert!(concat_head_rows(&[], &[], 0).is_err());
     }
 }
 

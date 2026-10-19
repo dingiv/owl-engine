@@ -160,6 +160,14 @@ pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     pub fi_quant: Option<owl_models::env::KvQuant>,
     /// 草稿池量化
     pub draft_kv: owl_models::env::KvQuant,
+    /// **本引擎的 rank 数**(1 = 单卡;2 = TP2)—— 治理器按卡摊 `live`
+    /// (`vram::LIVE` 是进程级全局计数器,TP2 下含两卡之和;2026-10-19 定谳)
+    pub tp_ranks: usize,
+    /// **草稿池几何**(层数, hkv, hd;**分片后**;P2.1-b)。`None` = 非 DFlash2 档
+    /// ⇒ 池不分配;`Some` ⇒ 用它替掉写死的 `DRAFT_POOL`(双 rank 下 hkv 减半)
+    pub draft_geom: Option<(usize, usize, usize)>,
+    /// 草稿 dtype(与 `spec_runtime::draft_dt` 同源:量化族 BF16 / 未量化族 F16)
+    pub draft_dt: Dtype,
     /// 投机形态(快照/MTP 链/草稿池三件的唯一事实来源)
     pub spec_mode: crate::spec_runtime::SpecMode,
     /// 投机深度(verify 块 = depth+1;verify v2 scratch 定形用;0 = off)
@@ -208,6 +216,8 @@ pub(crate) struct StatePool {
     /// 读核走 *_fp8 变体,写核 K0 转换写)
     pub(crate) kv_fp8: bool,
     pub(crate) dflash_fp8: bool,
+    /// 草稿池 elem dtype(非 fp8 时;随检查点事实:量化族 BF16 / 未量化族 F16)
+    pub(crate) dflash_dt: Dtype,
     gdns: Vec<GdnBlocks>,
     snaps: GdnSnapPool,
     snap_tick: u64,
@@ -315,6 +325,11 @@ struct DraftPoolGeom {
 }
 
 impl DraftPoolGeom {
+    /// **从声明事实构造**(P2.1-b;分片后的 (层数, hkv, hd))
+    fn from_geom(layers: usize, hkv: usize, hd: usize) -> Self {
+        DraftPoolGeom { layers, hkv, hd }
+    }
+
     /// 逐 token 字节(K+V 两张量 × 层数 × 头 × hd × elem)
     fn per_tok_bytes(self, elem: usize) -> usize {
         self.layers * 2 * self.hkv * self.hd * elem
@@ -328,6 +343,7 @@ impl DraftPoolGeom {
 
 /// 草稿池几何值(z-lab 家族;与 `DFlash2Draft::new_with_plan_dt` 的
 /// hkv/hd/n_layers 同形)
+/// ⚠️ **单卡缺省**(z-lab 家族事实;双 rank 走 `PoolPlan::draft_geom` —— 见 P2.1-b)
 const DRAFT_POOL: DraftPoolGeom = DraftPoolGeom { layers: 5, hkv: 8, hd: 128 };
 
 /// **逐 token 线性项**:池上限 = 可用预算 / 本值。
@@ -342,10 +358,20 @@ impl PerTokBytes {
     /// `draft_elem` = `Some(池 elem 字节)` 当且仅当 DFlash2 档(草稿池按 token 线性;
     /// 页取整后略同)。**elem 来自 `KvQuant::size_bytes` 单一映射** —— 原先草稿池
     /// 项写死 2B,池改 fp8 时预算不会跟(= 声明没驱动算式)。
-    fn of(dims: &ModelDims, n_full: usize, kv_elem: usize, draft_elem: Option<usize>) -> Self {
+    fn of(
+        dims: &ModelDims,
+        n_full: usize,
+        kv_elem: usize,
+        draft_elem: Option<usize>,
+        draft_geom: Option<(usize, usize, usize)>,
+    ) -> Self {
+        // 几何单源:配置/声明给的 `draft_geom` 优先(分片后),否则单卡缺省
+        let geom = draft_geom
+            .map(|(l, h, d)| DraftPoolGeom::from_geom(l, h, d))
+            .unwrap_or(DRAFT_POOL);
         PerTokBytes {
             main_kv: n_full * 2 * dims.hkv * dims.hd * kv_elem,
-            draft_pool: draft_elem.map(|e| DRAFT_POOL.per_tok_bytes(e)).unwrap_or(0),
+            draft_pool: draft_elem.map(|e| geom.per_tok_bytes(e)).unwrap_or(0),
         }
     }
 
@@ -606,6 +632,7 @@ impl StatePool {
             n_full,
             kv_bytes_elem,
             dflash.then(|| plan.draft_kv.size_bytes()),
+            plan.draft_geom,
         );
         // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + warmup 分列)
         let gdn_slot_elems = dims.nk * dims.hk * 3 + dims.nv * dims.hv * 3 + dims.nv * dims.hk * dims.hv;
@@ -614,24 +641,32 @@ impl StatePool {
         let vram_reserve = plan.vram_reserve_mb << 20;
         let vram_total = owl_shared::vram::total_bytes();
         let pool_cap = if plan.vram_target > 0.0 && plan.vram_target < 1.0 && vram_total > 0 {
+            // ★ **TP 档的账要按卡算**(2026-10-19 定谳):`owl_shared::vram::LIVE` 是
+            // **进程级全局计数器** —— TP2 下**两张卡的分配都加进同一个数**,
+            // 而 `total`/`per_tok` 是**单卡**口径 ⇒ 拿"两卡之和"比"单卡总量"
+            // 会把预算算成负数(实测 `budget = -6.58G` ⇒ `cap = 0` ⇒ 池被压到 0,
+            // KV 容量白白丢掉)。修:live 按 rank 数摊回单卡。
+            // (两 rank 的权重/草稿/池是对称的 ⇒ 摊分是正确口径)
+            let live_per_card = owl_shared::vram::live_bytes() / plan.tp_ranks.max(1) as u64;
             let budget = (vram_total as f64 * plan.vram_target) as i64
                 - vram_reserve as i64
                 - fixed_after.total() as i64
-                - owl_shared::vram::live_bytes() as i64;
+                - live_per_card as i64;
             let cap = (budget.max(0) as u64 / per_tok_bytes.max(1) as u64) as usize;
             // **A1 取证**(2026-10-19):治理器是"池能多大"的唯一产地;这条打出
             // 它的输入与产出(含主干 `FixedAfter`/`PerTokBytes` 的分解),免得再靠猜。
             // 用 `eprintln!`(取证行惯例):`log_*` 在无 `log` feature 的构建里被编译剔除,
             // 而本行必须在探针/测试里可见。
             eprintln!(
-                "[vram-gov] total={:.2}G free={:.2}G target={:.0}% reserve={}M fixed_after={:.2}G[{}] live={:.2}G per_tok={}B[{}] ⇒ budget={:.2}G cap={} tok(manual={})",
+                "[vram-gov] total={:.2}G free={:.2}G target={:.0}% reserve={}M fixed_after={:.2}G[{}] live={:.2}G(单卡口径;ranks={}) per_tok={}B[{}] ⇒ budget={:.2}G cap={} tok(manual={})",
                 vram_total as f64 / 1073741824.0,
                 owl_shared::vram::free_bytes() as f64 / 1073741824.0,
                 plan.vram_target * 100.0,
                 vram_reserve >> 20,
                 fixed_after.total() as f64 / 1073741824.0,
                 fixed_after.explain(),
-                owl_shared::vram::live_bytes() as f64 / 1073741824.0,
+                live_per_card as f64 / 1073741824.0,
+                plan.tp_ranks.max(1),
                 per_tok_bytes,
                 per_tok.explain(),
                 budget as f64 / 1073741824.0,
@@ -706,15 +741,22 @@ impl StatePool {
         // dims.dtype —— 同 2B/elem,几何 page/x 不变)
         let dflash_kvs = if dflash && paged {
             // 几何单源 = [`DRAFT_POOL`](原此处另写 `(8,128,5)`,与预算项两处各一遍)
-            let dlayers = DRAFT_POOL.layers;
+            let geom = plan
+                .draft_geom
+                .map(|(l, h, d)| DraftPoolGeom::from_geom(l, h, d))
+                .unwrap_or(DRAFT_POOL);
+            let dlayers = geom.layers;
             // B6 偷显存:草稿池 e4m3(OWL_DFLASH_KV_FP8;1B/elem,U32 字节承载)
             // 分配项与预算项共用 `KvQuant::size_bytes` + 几何单源 ⇒ 两处不会再漂
             let df_bytes_elem = plan.draft_kv.size_bytes();
-            let df_elems = DRAFT_POOL.layer_elems(nb, page);
+            let df_elems = geom.layer_elems(nb, page);
             let (df_elems, df_dt) = if df_bytes_elem == 1 {
                 (df_elems / 4, Dtype::U32)
             } else {
-                (df_elems, Dtype::BF16)
+                // 池 dtype **随草稿检查点事实**(2026-10-19):量化族 = BF16(旧行为逐字节不变);
+                // 未量化族(z-lab)= F16 —— 普通路只有 F16 算子变体(`vllm_reshape_and_cache_f16`
+                // 的 key_cache 就要求 F16),池按 BF16 分配会在装配门响亮拒。
+                (df_elems, plan.draft_dt)
             };
             let mut ks = Vec::with_capacity(dlayers);
             for l in 0..dlayers {
@@ -936,7 +978,7 @@ impl StatePool {
             None
         };
         Ok(StatePool { gdn_slots, dump_all, gdn_dbg, kvs, fi_face, fi_tables, gdn_tables, verify_attn_v2, xqa,
-            kv_fp8, dflash_fp8, gdns, snaps, snap_tick: 0, bt, bt_view, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, nb_kv, dump_page, paged, x, dims })
+            kv_fp8, dflash_fp8, dflash_dt: plan.draft_dt, gdns, snaps, snap_tick: 0, bt, bt_view, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, nb_kv, dump_page, paged, x, dims })
     }
 
     /// MTP 链块表叶子(propose 图烘焙;None = 未启用)
@@ -1022,12 +1064,12 @@ impl StatePool {
                     block_leaf_dt(
                         &kb.k_cache.0,
                         vec![self.nb, dkv, dhd / self.x, self.page, self.x],
-                        Dtype::BF16,
+                        self.dflash_dt,
                     ),
                     block_leaf_dt(
                         &kb.v_cache.0,
                         vec![self.nb, dkv, dhd, self.page],
-                        Dtype::BF16,
+                        self.dflash_dt,
                     ),
                 )
             })
@@ -1804,14 +1846,14 @@ mod vram_budget_tests {
     fn per_tok_matches_production_and_follows_declaration() {
         let d = dims_27b();
         // fp8 主池(1B/elem)+ 草稿池 bf16(2B/elem)
-        let bf16_draft = PerTokBytes::of(&d, 16, 1, Some(2));
+        let bf16_draft = PerTokBytes::of(&d, 16, 1, Some(2), None);
         assert_eq!((bf16_draft.main_kv, bf16_draft.draft_pool), (32768, 20480));
         assert_eq!(bf16_draft.total(), 53248, "生产档 per_tok(boot 日志实测)");
         // 草稿池 elem 由 `KvQuant::size_bytes` 驱动
-        let fp8_draft = PerTokBytes::of(&d, 16, 1, Some(1));
+        let fp8_draft = PerTokBytes::of(&d, 16, 1, Some(1), None);
         assert_eq!(fp8_draft.draft_pool, 10240, "草稿池 fp8 ⇒ 逐 token 减半");
         // 非投机档 = 纯主池(池 f16 2B/elem)
-        assert_eq!(PerTokBytes::of(&d, 16, 2, None).total(), 65536);
+        assert_eq!(PerTokBytes::of(&d, 16, 2, None, None).total(), 65536);
     }
 
     /// 固定项:GDN 格/快照按几何算,图 slab + warmup 两常数之和**必须仍是

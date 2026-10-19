@@ -130,6 +130,7 @@ pub async fn run_actor<D: DeviceClient>(
             handle_req(running, &mut sinks, req).await;
         }
         // ③ 泵到排空,事件按 turn 路由
+        let actor_prof = std::env::var_os("OWL_ACTOR_PROF").is_some();
         loop {
             // AGT-10:断流 turn 在下一步之前弃置(≤1 采样步延迟)
             if dropped {
@@ -145,9 +146,13 @@ pub async fn run_actor<D: DeviceClient>(
                     }
                 }
             }
+            // P2.2 侦察(2026-10-19;env 门,临时诊断):拆"循环外 1.55ms/步" ——
+            // pump(引擎侧)/dispatch(事件投递)/账务 三段。
+            let t_l0 = std::time::Instant::now();
             match running.pump().await {
                 Ok(TurnEvent::Idle) => break,
                 Ok(ev) => {
+                    let d_pump = t_l0.elapsed();
                     // turn 终了 = 性能账落盘点(每 turn 覆写,进程被 kill 也不丢)
                     let terminal = matches!(
                         ev,
@@ -186,9 +191,18 @@ pub async fn run_actor<D: DeviceClient>(
                             }
                         }
                     }
+                    let t_d0 = std::time::Instant::now();
                     if !dispatch(&mut sinks, ev).await {
                         // 投递失败 = 客户端已走 ⇒ 本 turn 弃置
                         dropped = true;
+                    }
+                    if actor_prof {
+                        let d_disp = t_d0.elapsed();
+                        owl_shared::log_info!(
+                            "actor-prof",
+                            "pump={d_pump:?} disp={d_disp:?} rest={:?}",
+                            t_l0.elapsed()
+                        );
                     }
                     if terminal {
                         if let Some(p) = &perf_dump {

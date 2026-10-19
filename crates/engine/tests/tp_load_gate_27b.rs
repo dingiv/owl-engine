@@ -95,6 +95,8 @@ async fn load_once(
         device_repack: Some(device_repack),
         verify: false,
         debug_tap: false,
+        staging_mb: 128,
+        dump: false,
     };
     load_from_dir(dir, face, &model, opts).await
 }
@@ -526,6 +528,8 @@ async fn repack_body(dir: &Path, ordinal: usize) {
             device_repack: Some(true),
             verify: false,
             debug_tap: false,
+        staging_mb: 128,
+        dump: false,
         };
         let manifest = load_from_dir(dir, &mut face, &model, opts).await.expect("装载");
         // ② 参考:同一 want 的源矩形 → CPU marlin B
@@ -573,4 +577,186 @@ async fn repack_body(dir: &Path, ordinal: usize) {
     }
     let _ = face.sync().await;
     assert!(fails.is_empty(), "重排面门失败 {} 条(见上)", fails.len());
+}
+
+// ============================================================================
+// **草稿腿**(P2.1-a,2026-10-19):草稿族双 rank 化的装载判据
+// ============================================================================
+
+fn draft_dir_of() -> PathBuf {
+    std::env::var("OWL_DFLASH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"))
+}
+
+/// 草稿 spec(真检查点维度;层表截成前 2 层 ⇒ 秒级)
+fn draft_spec(dir: &Path) -> (ModelSpec, String) {
+    let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_8_27b()))
+        .expect("草稿 spec 解析");
+    let base = rep.keys_base.trim_end_matches('.').to_string();
+    let mut spec = spec;
+    let n = spec.layer_types.len().min(2);
+    spec.layer_types = spec.layer_types[..n].to_vec();
+    (spec, base)
+}
+
+/// 草稿装载一次(全量或分片)。判据面与主模型腿同律:形状/规则/读序列
+async fn load_draft_once(
+    dir: &Path,
+    face: &mut GpuClient,
+    slice: (usize, usize),
+) -> Result<LoadManifest, ModelError> {
+    let (id, n) = slice;
+    let (spec, _base) = draft_spec(dir);
+    let spec = if n > 1 {
+        owl_models::formats::qwen35::shard_draft_spec(spec, TpPlan::new(id, n).map_err(ModelError::Msg)?)
+            .map_err(|e| ModelError::Msg(e.to_string()))?
+    } else {
+        spec
+    };
+    let draft = owl_models::layers::dflash2::DFlash2Draft::from_spec(
+        &spec,
+        QuantPlan::W4A16,
+        owl_models::contract::Dtype::BF16,
+        false,
+    );
+    // **CPU 物化面关掉**(用户裁决 2026-10-19:"CPU 面先关掉,先把 GPU 打通")
+    // —— 分片档只走设备重排臂;CPU 臂在 shard>1 下本就响亮拒(不可矩形切)
+    let opts = LoadOpts {
+        dtype: owl_models::contract::Dtype::BF16,
+        shard: n,
+        slice_id: id,
+        device_repack: Some(true),
+        verify: false,
+        debug_tap: false,
+        staging_mb: 128,
+        dump: false,
+    };
+    load_from_dir(dir, face, &draft, opts).await
+}
+
+/// **草稿分片装载门**:分片读出的元素序列 == `plan_span` 的正向读序列(逐元素)
+#[test]
+fn tp_load_gate_27b_draft() {
+    let dir = draft_dir_of();
+    if !dir.join("config.json").exists() {
+        eprintln!("skip: DFlash2 草稿检查点不在 {dir:?}(设 OWL_DFLASH_DIR)");
+        return;
+    }
+    std::thread::Builder::new()
+        .stack_size(128 << 20)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("rt")
+                .block_on(body_draft(&dir))
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+async fn body_draft(dir: &Path) {
+    // 判据面:`load-rearrange` 几何账走 log_debug(仓里日志宏)⇒ 用**配置面**
+    // (LogConfig{level: debug})初始化 logger —— 不走 env,与装载旋钮同律。
+    // `set_level` 只在 logger 已初始化时生效;此处 logger 尚未初始化 ⇒ 直接 init。
+    if !owl_shared::log::logger_ready() {
+        let _ = owl_shared::log::init_logger(owl_shared::log::LogConfig {
+            level: 3, // LVL_DEBUG
+            ..Default::default()
+        });
+    }
+    let ordinal: usize = std::env::var("OWL_TP_TEST_DEV")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let mut face = GpuClient::spawn_with(
+        DeviceSelector::Ordinal(ordinal),
+        owl_cuda::DiagOpts::default(),
+        false,
+        owl_shared::log::sink(),
+    )
+    .expect("GpuClient(设备被占?)");
+    eprintln!("[tp-load-draft] 设备 ordinal {ordinal};dir={dir:?}");
+    let full = load_draft_once(dir, &mut face, (0, 1)).await.expect("草稿全量装载");
+    eprintln!("[tp-load-draft] 全量 {} 键", full.entries().len());
+    if std::env::var("OWL_TP_DUMP").is_ok() {
+        for e in full.entries() {
+            eprintln!("  DUMP {:<70} {:?} {:?} rule={:?}", e.key, e.shape, e.dtype, rule_of(&e.key));
+        }
+    }
+    let mut shards: Vec<LoadManifest> = Vec::new();
+    for id in 0..2usize {
+        let m = load_draft_once(dir, &mut face, (id, 2)).await.expect("草稿分片装载");
+        eprintln!("[tp-load-draft] slice{id} {} 键", m.0.len());
+        shards.push(m);
+    }
+    let plan0 = TpPlan::new(0, 2).expect("plan0");
+    let plan1 = TpPlan::new(1, 2).expect("plan1");
+    let full_spec = { let (s, _) = draft_spec(dir); s };
+
+    let mut n_rep = 0usize;
+    let mut n_split = 0usize;
+    let mut n_scratch = 0usize;
+    let mut n_rearr = 0usize;
+    let mut fails: Vec<String> = Vec::new();
+    for e in full.entries() {
+        let key = &e.key;
+        // 参考规则走**同一条推导**(带段长事实;P2.1-a):草稿的 `q_proj` 无门控 ⇒
+        // 无段长声明 ⇒ `UniformCol`(与装载面 `rule_of_want` 一致)
+        let segs_try: Vec<usize> = match rule_of(key) {
+            WeightRule::SegmentedCol(kind) => kind.segments(&full_spec).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let segs_ok = !segs_try.is_empty() && segs_try.iter().sum::<usize>() == e.shape[0];
+        let rule = owl_models::plan::rules::rule_of_want(key, if segs_ok { Some(&segs_try) } else { None });
+        let full_vals = dtoh_bytes(&mut face, e).await;
+        let segs: Vec<usize> = match rule {
+            WeightRule::SegmentedCol(_) => segs_try,
+            _ => Vec::new(),
+        };
+        for (id, (plan, m)) in [(plan0, &shards[0]), (plan1, &shards[1])].into_iter().enumerate() {
+            let Some(se) = entry_by_key(m, key) else {
+                fails.push(format!("{key}: slice{id} 缺键"));
+                continue;
+            };
+            if matches!(e.layout, owl_models::module::Layout::DeviceRearrange { .. }) {
+                n_rearr += 1;
+                continue;
+            }
+            if is_scratch_key(key) {
+                n_scratch += 1;
+                continue;
+            }
+            let got = dtoh_bytes(&mut face, se).await;
+            if rule == WeightRule::Replicate {
+                n_rep += 1;
+                if got != full_vals {
+                    fails.push(format!("{key}: Replicate 键在 slice{id} 变了(len {} vs {})", got.len(), full_vals.len()));
+                }
+                continue;
+            }
+            n_split += 1;
+            let (want, want_shape) = expected_slice(
+                rule, &e.shape, plan, &segs, want_axis(key), &full_vals, e.dtype.size_bytes(),
+            );
+            if se.shape != want_shape {
+                fails.push(format!("{key}: slice{id} 形状 {:?} ≠ 参考 {:?}", se.shape, want_shape));
+                continue;
+            }
+            if got != want {
+                let esz = e.dtype.size_bytes().max(1);
+                let first = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(0);
+                fails.push(format!("{key}: slice{id} 内容不等(首差元素 idx={} / {})", first / esz, got.len() / esz));
+            }
+        }
+    }
+    eprintln!(
+        "[tp-load-draft] 复制键 {n_rep} / 分片键 {n_split} / 重排跳过 {n_rearr} / scratch 跳过 {n_scratch};失败 {}",
+        fails.len()
+    );
+    for f in fails.iter().take(30) {
+        eprintln!("  ✗ {f}");
+    }
+    assert!(fails.is_empty(), "草稿分片装载对拍失败 {} 条(见上)", fails.len());
 }

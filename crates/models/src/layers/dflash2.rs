@@ -190,7 +190,13 @@ impl DfAttn {
     #[allow(clippy::too_many_arguments)]
     pub fn new(hq: usize, hkv: usize, hd: usize, hidden: usize, eps: f32, plan: QuantPlan, dt: Dtype, kv_fp8: bool) -> Self {
         Self {
-            q_proj: Linear::new("q_proj", hq * hd, hidden, plan),
+            // ⚠️ **草稿的 `q_proj` 无门控**(out = hq·hd),而规则表按键尾
+            // `q_proj` 给的是**主模型**的 `SegmentedCol(QGate)`(Qwen3.5 主干的
+            // gated attention)⇒ 双 rank 装载会在 `build_shard_pass` 的强校验处
+            // 拒。这里**显式覆盖**为 `UniformCol`(切 out 维 = 每 rank 分头);
+            // `shard = 1` 时规则不参与 ⇒ 零行为变化。
+            q_proj: Linear::new("q_proj", hq * hd, hidden, plan)
+                .with_tp_rule(crate::plan::rules::WeightRule::UniformCol),
             k_proj: Linear::new("k_proj", hkv * hd, hidden, plan),
             v_proj: Linear::new("v_proj", hkv * hd, hidden, plan),
             o_proj: Linear::new("o_proj", hidden, hq * hd, plan),
@@ -536,25 +542,27 @@ impl CandidateSelector {
         }
     }
 
-    /// 选 draft(logits 外供版:引擎探针/调用方复用 lm_head 输出)。
-    pub fn select_with_logits(
-        &self,
-        hidden: &TensorOps,
-        anchor: &TensorOps,
-        logits: &TensorOps,
-        ctx: &ForwardCtx,
-    ) -> (TensorOps, TensorOps) {
-        let h = hidden.shape()[0];
-        let rows = h - 1; // DEPTH
-        let dim = hidden.shape()[1];
-        let pred = hidden.slice_view(dim, vec![rows, dim]); // 行 1..(连续视图)
+    /// **top-16 候选（半表域；P1.1 2026-10-19）** —— selector 的前半:只扫 logits,
+    /// 出候选值 + 索引。
+    ///
+    /// `logits_stride` = 每行宽度 = **本 rank 的 logits 宽**（未切档 = `vocab`;
+    /// 词表切档 = 半表）。⚠️ 分片档的索引是**半表域**(rank1 的全局 id = 局部 id
+    /// + half) —— 偏移修正由 host 合并面做（核面零改动）。
+    ///
+    /// 拆分动机（为什么单独存在）:切档下两 rank 各持半表，**全局 top-16 ⊆
+    /// 两半各自 top-16 的并集** ⇒ 图只出候选（896B），host 合并后再跑
+    /// [`Self::select_from_candidates`]（全表域，码本全量）。
+    pub fn topk_of_logits(&self, logits: &TensorOps) -> (TensorOps, TensorOps) {
+        let rows = logits.shape()[0];
+        // stride 的唯一真源 = 张量**声明形状**（lm_head 输出 = 本 rank 头行数）
+        let logits_stride = logits.shape()[1];
         // top-16 = **split-K 两段**(2026-10-14 D2):段一 grid=rows×NPARTS 分段扫
         // (旧的 grid=rows 只用 7/132 SM,实测 1068 µs/轮;纯扫描地板仅 16 µs),
         // 段二一行一 warp 归并。输出布局与旧单核逐位同律(平局取小索引)。
         let part = TensorOps::call(SemanticKernel::Topk16Split)
             .aux(&[rows, TOPK_NPARTS])
             .arg(logits)
-            .arg_i32(self.vocab as i32)
+            .arg_i32(logits_stride as i32)
             .arg_i32(TOPK_NPARTS as i32)
             .arg_i32(rows as i32)
             .with_shape(Dtype::F32, vec![2 * rows * TOPK_NPARTS * TOP_K]);
@@ -563,29 +571,64 @@ impl CandidateSelector {
             .arg(&part)
             .arg_i32(TOPK_NPARTS as i32)
             .arg_i32(rows as i32)
-            .arg_i32(self.vocab as i32)
+            .arg_i32(logits_stride as i32)
             .with_shape(Dtype::F32, vec![2 * rows * TOP_K]); // 值区 + 索引区(两段连续)
         let cand = topk.slice_view(rows * TOP_K, vec![rows, TOP_K]); // 索引区
         let vals = topk.slice_view(0, vec![rows, TOP_K]); // 值区(unary)
-        // ② proj = hidden_projection(pred)[rows, RANK](dtype 随 hidden)
-        let proj = self.proj.forward(&pred, ctx);
-        // ③ 格打分 + 贪心 walk(单块融合核;单缓冲 toks + scores)
-        // BF16 变体:proj/码本 bf16(同日十四);topk/格打分输出 f32 契约不变
+        (cand, vals)
+    }
+
+    /// **selector 的 proj 腿**:`hidden_projection(pred)[rows, RANK]`(dtype 随 hidden)。
+    /// 切档时与候选同出图（两件合起来 = select 的全部外供输入）。
+    pub fn selector_proj(&self, hidden: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
+        let h = hidden.shape()[0];
+        let rows = h - 1; // DEPTH
+        let dim = hidden.shape()[1];
+        let pred = hidden.slice_view(dim, vec![rows, dim]); // 行 1..(连续视图)
+        self.proj.forward(&pred, ctx)
+    }
+
+    /// **selector 的后半**:格打分 + 贪心 walk（单块融合核;单缓冲 toks + scores）。
+    /// 输入候选/值都是**全表域**（码本全量）—— 切档路径由 host 合并后喂入。
+    pub fn select_from_candidates(
+        &self,
+        cand: &TensorOps,
+        vals: &TensorOps,
+        proj: &TensorOps,
+        anchor: &TensorOps,
+        rows: usize,
+    ) -> (TensorOps, TensorOps) {
         let sel = TensorOps::call(SemanticKernel::DflashSelect)
             .aux(&[(self.dt == Dtype::BF16) as usize])
-        .arg(&cand)
-        .arg(&vals)
-        .arg(&proj)
-        .arg(anchor)
-        .arg(&self.a_code.decl())
-        .arg(&self.b_code.decl())
-        .arg_i32(rows as i32)
-        .arg_i32(TOP_K as i32)
-        .arg_i32(self.rank as i32)
-        .with_shape(Dtype::F32, vec![rows * (TOP_K * TOP_K + 1)]);
+            .arg(cand)
+            .arg(vals)
+            .arg(proj)
+            .arg(anchor)
+            .arg(&self.a_code.decl())
+            .arg(&self.b_code.decl())
+            .arg_i32(rows as i32)
+            .arg_i32(TOP_K as i32)
+            .arg_i32(self.rank as i32)
+            .with_shape(Dtype::F32, vec![rows * (TOP_K * TOP_K + 1)]);
         let drafts = sel.slice_view(0, vec![rows]);
         let scores = sel.slice_view(rows, vec![rows, TOP_K, TOP_K]);
         (drafts, scores)
+    }
+
+    /// 选 draft(logits 外供版:引擎探针/调用方复用 lm_head 输出)。
+    /// = [`Self::topk_of_logits`]（全表 stride）+ [`Self::selector_proj`]
+    /// + [`Self::select_from_candidates`] —— **未切档的逐字节原路**。
+    pub fn select_with_logits(
+        &self,
+        hidden: &TensorOps,
+        anchor: &TensorOps,
+        logits: &TensorOps,
+        ctx: &ForwardCtx,
+    ) -> (TensorOps, TensorOps) {
+        let rows = logits.shape()[0];
+        let (cand, vals) = self.topk_of_logits(logits);
+        let proj = self.selector_proj(hidden, ctx);
+        self.select_from_candidates(&cand, &vals, &proj, anchor, rows)
     }
 
     pub(crate) fn proj(&self) -> &Linear {
@@ -596,6 +639,10 @@ impl CandidateSelector {
     }
     pub(crate) fn b_code(&self) -> &Weight {
         &self.b_code
+    }
+    /// selector 的 `rank`（= proj 行数;切档图输出槽形状读它，不用编期常量）
+    pub fn rank(&self) -> usize {
+        self.rank
     }
 }
 
@@ -755,6 +802,11 @@ impl DFlash2Draft {
         matches!(self.fc, DraftFc::Q(_))
     }
 
+    /// selector 的 `rank`（切档图输出槽形状读它 —— 与 `dtype()` 同性质的声明面）
+    pub fn selector_rank(&self) -> usize {
+        self.selector.rank()
+    }
+
     /// 草稿激活 dtype(引擎探针解析/池分配对账用)
     pub fn dtype(&self) -> Dtype {
         self.dt
@@ -785,6 +837,22 @@ impl DFlash2Draft {
             // 47456+16168+… → INF → NaN 塌缩(golden 测试 taps ~0.7 从不触发,
             // 故单测全绿引擎崩)。rms 对行尺度不变 → fc 前预乘 2⁻⁸(f16 纯指
             // 数移位,零舍入损失),norm 后语义严格等价。sglang bf16 无此问题。
+            // ⚠️ **未量化草稿 = F16 普通路**(2026-10-19):该路的算子面只有 F16 变体
+            // (`cublas_gemm_f16` / `owl_mul_f16` …),而 taps 来自目标模型 = **BF16**
+            // ⇒ 必须在此**先铸 F16**,否则 BF16 数据喂进 F16 核(装配门会响亮拒:
+            // `cublas_gemm_f16: b 期望 F16(声明) 实得 BF16`;门关时则静默出错值 ——
+            // 这正是 z-lab BF16 草稿"AL 恒 1.0"的真因:**不是装载错,是算子面覆盖缺口**)。
+            let taps: Vec<TensorOps> = if self.dt == Dtype::F16 && taps[0].dtype != Dtype::F16 {
+                taps.iter()
+                    .map(|tp| {
+                        TensorOps::call(SemanticKernel::CastBf16F16)
+                            .arg(tp)
+                            .with_shape(Dtype::F16, tp.shape().to_vec())
+                    })
+                    .collect()
+            } else {
+                taps.to_vec()
+            };
             let t = taps[0].shape()[0];
             let scale = TensorOps::from_host(
                 taps[0].dtype,
@@ -848,18 +916,19 @@ impl DFlash2Draft {
     /// `kv_len_t` = [1] f32 全窗 = 前缀 + BLOCK(图化运行时读,契约 5)。返回 (hidden [BLOCK, hidden]
     /// post-norm, drafts [DEPTH] f32, scores 对拍观测面)。
     #[allow(clippy::too_many_arguments)]
-    pub fn propose_block(
+    /// 草稿层栈前向（7 层 + 残差 + final norm）→ `hidden`。
+    /// 抽自 `propose_block`（切档形态复用同一条腿 —— 不复制层循环）。
+    fn forward_hidden(
         &self,
         tokens: &TensorOps,
         pos: &TensorOps,
-        anchor: &TensorOps,
         kvs: &[KvBuffers],
         rope: &Rope,
         embed: &crate::layers::embedding::Embedding,
         kv_len_t: &TensorOps,
         ctx: &ForwardCtx,
         mut probe_layers: Option<&mut Vec<TensorOps>>,
-    ) -> (TensorOps, TensorOps, TensorOps, TensorOps) {
+    ) -> TensorOps {
         assert_eq!(kvs.len(), self.layers.len(), "草稿 KV 层数");
         // cast 边界①:embed 查表(f16 表,target 共享)→ 草稿主干入口(bf16)
         let mut x = ensure_dt(&embed.embed(tokens, BLOCK), self.dt);
@@ -892,10 +961,51 @@ impl DFlash2Draft {
         // 探针:逐层 NaN 定位(OWL_DFLASH_PROBE;引擎收割挂账 —— 声明期
         // 无法收割,改由引擎侧逐层 eval:本计数仅供断点)
         // final norm(fused add + norm;sglang `self.norm(hidden, residual)`)
-        let hidden = match &residual {
+        match &residual {
             Some(r) => Self::fused_add_norm_layer(&self.norm, &x, r),
             None => self.norm.forward(&x, ctx),
-        };
+        }
+    }
+
+    /// **切档形态**（P1.1 × P2.1;2026-10-19）:同层栈前向,但 lm_head 出来只出
+    /// **半表 top-16 候选 + proj**（不出 drafts）—— 供引擎 host 合并两 rank
+    /// 候选后跑 [`Self::select_from_candidates`]。
+    /// 返回 `(hidden, cand, vals, proj, logits)`。
+    pub fn propose_block_split(
+        &self,
+        tokens: &TensorOps,
+        pos: &TensorOps,
+        kvs: &[KvBuffers],
+        rope: &Rope,
+        embed: &crate::layers::embedding::Embedding,
+        kv_len_t: &TensorOps,
+        ctx: &ForwardCtx,
+        probe_layers: Option<&mut Vec<TensorOps>>,
+    ) -> (TensorOps, TensorOps, TensorOps, TensorOps, TensorOps) {
+        let hidden = self.forward_hidden(tokens, pos, kvs, rope, embed, kv_len_t, ctx, probe_layers);
+        let hidden_head = ensure_dt(
+            &hidden.slice_view(self.hidden, vec![DEPTH, self.hidden]),
+            Dtype::F16,
+        );
+        let logits = embed.lm_head_matmul(&hidden_head);
+        let (cand, vals) = self.selector.topk_of_logits(&logits);
+        let proj = self.selector.selector_proj(&hidden, ctx);
+        (hidden, cand, vals, proj, logits)
+    }
+
+    pub fn propose_block(
+        &self,
+        tokens: &TensorOps,
+        pos: &TensorOps,
+        anchor: &TensorOps,
+        kvs: &[KvBuffers],
+        rope: &Rope,
+        embed: &crate::layers::embedding::Embedding,
+        kv_len_t: &TensorOps,
+        ctx: &ForwardCtx,
+        probe_layers: Option<&mut Vec<TensorOps>>,
+    ) -> (TensorOps, TensorOps, TensorOps, TensorOps) {
+        let hidden = self.forward_hidden(tokens, pos, kvs, rope, embed, kv_len_t, ctx, probe_layers);
         // cast 边界②:hidden(草稿 dtype)→ lm_head 入口 f16(cublas/topk
         // 链保持 f16 不动,sglang 同位 .to(f16) 式;索引量 f32 契约不变)
         let hidden_head = ensure_dt(
@@ -943,7 +1053,8 @@ impl DFlash2Draft {
     pub(crate) fn layers(&self) -> &[DfLayer] {
         &self.layers
     }
-    pub(crate) fn selector(&self) -> &CandidateSelector {
+    /// selector 访问器（engine 切档收割面读 proj/码本/rank;P1.1 × P2.1）
+    pub fn selector(&self) -> &CandidateSelector {
         &self.selector
     }
 }
@@ -1018,7 +1129,7 @@ mod tests {
         src.insert("kernel_projection".into(), gen(2 * TAPS * groups * hidden, 1.0));
 
         let mut gpu = gpu_client().await;
-        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
             .await
             .expect("conv 装载");
 
@@ -1091,7 +1202,7 @@ mod tests {
         src.insert("successor_codebook".into(), b_tab.clone());
 
         let mut gpu = gpu_client().await;
-        crate::interpreters::eval_load(&sel, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&sel, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
             .await
             .expect("selector 装载");
 
@@ -1251,7 +1362,7 @@ mod tests {
                 fc.chain(self.0.hidden_norm().layout(_ctx))
             }
         }
-        crate::interpreters::eval_load(&FcOnly(&draft), &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&FcOnly(&draft), &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
             .await
             .expect("fc 装载");
 
@@ -1342,7 +1453,7 @@ mod tests {
                 self.0.layout(ctx).chain(self.0.layout_lm_head(ctx).unwrap())
             }
         }
-        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         let mut gpu = gpu_client().await;
         crate::interpreters::eval_load(&EmbLoad(&embed), &mut gpu, &esrc, &lctx)
             .await
@@ -1678,7 +1789,7 @@ mod tests {
         use crate::module::LoaderCtx;
         use owl_iface::DeviceClient as _;
         let mut gpu = gpu_client().await;
-        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         let draft = DFlash2Draft::new_with_plan(
             5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, false,
         );
@@ -1941,7 +2052,7 @@ mod tests {
         src.insert("q_norm".into(), gen(hd, 26.0));
 
         let mut gpu = gpu_client().await;
-        crate::interpreters::eval_load(&attn, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&attn, &mut gpu, &src, &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
             .await
             .expect("attn 装载");
 
@@ -1963,7 +2074,7 @@ mod tests {
             block_tables: bt,
         };
         let rope = Rope::new(64, hd, hd, 10_000.0).expect("rope");
-        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
             .await
             .expect("rope 表");
 
@@ -2238,7 +2349,7 @@ mod tests {
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
         src.insert("base_kernel".into(), base.clone());
         src.insert("kernel_projection".into(), w_proj.clone());
-        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::BF16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&conv, &mut gpu, &src, &LoaderCtx { dtype: Dtype::BF16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
             .await
             .expect("conv bf16 装载");
 
@@ -2316,7 +2427,7 @@ mod tests {
         src2.insert("hidden_projection".into(), w2.clone());
         src2.insert("predecessor_codebook".into(), a_tab.clone());
         src2.insert("successor_codebook".into(), b_tab.clone());
-        crate::interpreters::eval_load(&sel, &mut gpu, &src2, &LoaderCtx { dtype: Dtype::BF16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&sel, &mut gpu, &src2, &LoaderCtx { dtype: Dtype::BF16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
             .await
             .expect("selector bf16 装载");
         let hidden_h = gen((rows + 1) * rank, 6.0);
@@ -2415,7 +2526,7 @@ mod tests {
         use crate::module::LoaderCtx;
         use owl_iface::DeviceClient as _;
         let mut gpu = gpu_client().await;
-        let lctx = LoaderCtx { dtype: Dtype::BF16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = LoaderCtx { dtype: Dtype::BF16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         let draft = DFlash2Draft::new_with_plan_dt(
             5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, Dtype::BF16, false,
         );
@@ -2437,7 +2548,7 @@ mod tests {
         };
         let (_hq, hkv, hd, hidden) = (32usize, 8usize, 128usize, 5120usize);
         let rope = Rope::new(262_144, hd, hd, 1.0e7).expect("rope");
-        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
+        crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
             .await
             .expect("rope 表");
 

@@ -466,7 +466,13 @@ pub mod gdn {
                 DType::F32 => "owl_gdn_l2norm_f32",
                 DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
             },
-            shape: Shape { grid: (rows as u32, 1, 1), ..SENTINEL_1D },
+            shape: Shape {
+                // **一 warp 一行、一 block 8 行**(2026-10-19):旧形一 block 一行
+                // 在 dim=128 时一半线程闲置 + 每行两次 `__syncthreads`;
+                // decode 实测 15.5µs/发而工作量只有 128 个元素 ⇒ 块调度绑死。
+                grid: (rows.div_ceil(8) as u32, 1, 1),
+                ..SENTINEL_1D
+            },
         }
     }
 
@@ -558,15 +564,32 @@ pub mod gdn {
     }
 
     /// recurrence_varlen_gqa:批前向递推(工单 G;**仅 f16 变体**)。
-    /// shared 契约 = `(4·kd + 4)·4B`;grid = (ceil(vd/8), nv, 1),
-    /// block (32,8,1) = 8 头一组。
+    ///
+    /// **2026-10-19 布局重写(P1.4)**:核内两条路 ——
+    /// · **快路**(`recurrence_varlen_gqa_fast`):一个 warp 管 2 个相邻 v 列、
+    ///   无 shared/无 barrier、g/beta 每 head 只取一次 ⇒ 实测 1.61×
+    ///   (`tools/gdn-rec-probe.cu`,逐位相同);grid.x = `ceil(vd/16)`;
+    /// · **原形**:kd≠128 或 vd 为奇(快路的索引前提)⇒ 逐字旧实现;
+    ///   grid.x = `ceil(vd/8)`,shared 契约 = `(4·kd + 4)·4B`。
+    ///
+    /// ⚠️ 两处的步长不同(16 vs 8)⇒ **判据必须与核内 `gdn_rec_fast_shape` 同源**;
+    /// 单测 `gdn_rec_geometry_matches_route` 把这条钉住。
+    /// 快路形状判据 —— **必须与 `cu/gdn/gdn_recurrence.cu` 的
+    /// `gdn_rec_fast_shape` 逐字同源**(device 侧调不到 host fn)。
+    /// 不一致不是"性能差一点",而是**覆盖错位**(legacy 的列步长 = 8,快路 = 16)
+    /// ⇒ 由单测 `gdn_rec_geometry_matches_route` 钉住。
+    pub fn recurrence_varlen_gqa_fast(kd: usize, vd: usize) -> bool {
+        kd == 128 && vd % 2 == 0
+    }
+
     pub fn recurrence_varlen_gqa(dt: DType, vd: usize, nv: usize, kd: usize) -> KernelPick {
         assert!(
             matches!(dt, DType::F16),
             "owl_gdn_recurrence_varlen_gqa 仅有 f16 变体(dt={dt:?})"
         );
+        let fast = recurrence_varlen_gqa_fast(kd, vd);
         KernelPick::of::<crate::ops::gdn::RecurrenceVarlenGqaF16>(Shape {
-            grid: (vd.div_ceil(8) as u32, nv as u32, 1),
+            grid: (vd.div_ceil(if fast { 16 } else { 8 }) as u32, nv as u32, 1),
             block: (32, 8, 1),
             smem: ((4 * kd + 4) * 4) as u32,
         })
@@ -582,7 +605,11 @@ pub mod gdn {
                 DType::BF16 | DType::U32 | DType::U8 | DType::F8E4M3 | DType::F8E5M2 | DType::I8 => unimplemented!("GDN 族无 U32 变体"),
             },
             shape: Shape {
-                grid: ((rows * value_dim / group_size) as u32, 1, 1),
+                // **一 warp 一单元、一 block 8 个 warp**(2026-10-19):旧形一 block 一单元
+                // 在 group_size=128 时一半线程闲置 + 每单元两次 `__syncthreads`;
+                // 27B prefill chunk 1024 ⇒ 49152 块/发(实测只跑到带宽 1/4,块调度绑死)。
+                // 块数 = ceil(单元数 / 8);blockDim 仍 256(SENTINEL_1D)。
+                grid: ((rows * value_dim / group_size).div_ceil(8) as u32, 1, 1),
                 ..SENTINEL_1D
             },
         }
@@ -1725,18 +1752,57 @@ mod tests {
 
     #[test]
     fn recurrence_smem_contract() {
+        // kd=128 ⇒ **快路**(2 列/warp ⇒ x 步长 16);smem 契约保持原值(快路不用,
+        // legacy 回落时才是真契约 —— 同一个入口,故仍按 (4·kd+4)·4 传)
         let p = gdn::recurrence_varlen_gqa(DType::F16, 128, 16, 128);
         assert_eq!(p.name, "owl_gdn_recurrence_varlen_gqa_f16");
-        assert_eq!(p.shape.grid, (16, 16, 1));
+        assert_eq!(p.shape.grid, (8, 16, 1), "快路:ceil(128/16)");
         assert_eq!(p.shape.block, (32, 8, 1));
         assert_eq!(p.shape.smem, (4 * 128 + 4) * 4);
+    }
+
+    /// **路由一致性门**(2026-10-19 P1.4):host 的 grid 步长必须与核内
+    /// `gdn_rec_fast_shape` 判据同源 —— 不一致 ⇒ 列覆盖错位(缺一半或越界),
+    /// 而两种错都**不会当场报错**。这条单测把"判据 → 步长"的映射拍死。
+    #[test]
+    fn gdn_rec_geometry_matches_route() {
+        // 表 = (kd, vd, 快路?, 期望 grid.x):覆盖 0.8B / 27B / TP 两档 / 非 128 头维
+        let cases = [
+            (128usize, 128usize, true, 8u32),   // 27B TP2 每 rank nv=24 · 4 行/线
+            (128, 64, true, 4),                 // 假设的窄 v 维(vd 偶数)
+            (128, 1, false, 1),                 // vd 奇 ⇒ 回落 legacy
+            (64, 128, false, 16),               // kd≠128 ⇒ 回落 legacy
+            (128, 256, true, 16),
+        ];
+        for (kd, vd, fast, gx) in cases {
+            assert_eq!(gdn::recurrence_varlen_gqa_fast(kd, vd), fast, "判据 kd={kd} vd={vd}");
+            let p = gdn::recurrence_varlen_gqa(DType::F16, vd, 16, kd);
+            assert_eq!(p.shape.grid.0, gx, "grid.x kd={kd} vd={vd}");
+            // 覆盖性:快路须 ≥ vd/2 组(每组 2 列),legacy 须 ≥ vd 列
+            let covered = if gdn::recurrence_varlen_gqa_fast(kd, vd) {
+                gx as usize * 8 * 2
+            } else {
+                gx as usize * 8
+            };
+            assert!(covered >= vd, "kd={kd} vd={vd} 覆盖 {covered} < {vd}");
+        }
     }
 
     #[test]
     fn row_shapes_and_suffixes() {
         assert_eq!(gdn::l2norm(DType::F32, 7).name, "owl_gdn_l2norm_f32");
-        assert_eq!(gdn::l2norm(DType::F32, 7).shape.grid, (7, 1, 1));
-        assert_eq!(gdn::norm_act(DType::F16, 4, 2048, 128).shape.grid, (64, 1, 1));
+        assert_eq!(gdn::l2norm(DType::F32, 7).shape.grid, (1, 1, 1));
+        // l2norm 同 norm_act:一 warp 一行(8 行/块)⇒ 块数 = ceil(rows/8)
+        assert_eq!(gdn::l2norm(DType::F16, 8).shape.grid, (1, 1, 1));
+        assert_eq!(gdn::l2norm(DType::F16, 9).shape.grid, (2, 1, 1));
+        assert_eq!(gdn::l2norm(DType::F16, 128).shape.grid, (16, 1, 1));
+        // **2026-10-19 norm_act 改一 warp 一单元(8 单元/块)** ⇒ 块数 = ceil(单元数/8)
+        // (单元 = rows·value_dim/group_size;旧形块数 = 单元数,一 block 一单元)
+        assert_eq!(gdn::norm_act(DType::F16, 4, 2048, 128).shape.grid, (8, 1, 1));
+        // 向上取整律(单元数不整除 8 时不得漏算末尾单元)
+        assert_eq!(gdn::norm_act(DType::F16, 1, 128, 128).shape.grid, (1, 1, 1));
+        assert_eq!(gdn::norm_act(DType::F16, 9, 128, 128).shape.grid, (2, 1, 1));
+        assert_eq!(gdn::norm_act(DType::F16, 1024, 6144, 128).shape.grid, (6144, 1, 1));
         // N1(2026-10-14):grid = (ceil(d/256), tiles=ceil(tokens/32), batch);
         // tiles 只由 tokens 决定 ⇒ 几何自证(含 0/32/33 边界与 batch 维)
         assert_eq!(gdn::conv_fwd(DType::F16, 6144, 0, 1).shape.grid, (24, 1, 1));
