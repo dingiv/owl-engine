@@ -203,7 +203,6 @@ pub fn plan(leg: &BlockLeg, need: Need, protect: &[ChainHash]) -> Verdict {
 }
 
 
-// FIXME(N6-①,2026-10-19):**次序门待补** —— `NeedWhy::Pressure` 的分支已落(零缺口也搬),
-// 但要写出可判的门,腿里必须**有块**(`BlockLeg` 的装载 API + `ChainHash` 构造在 test 面
-// 未暴露)。⇒ 与引擎触发点(N6 节点)一起做:用 `StoreBank` 真装几条链,断言
-// ①`Pressure` 在 `free >= slots` 时仍出单 ②出单优先 `Sink::Host` ③非压力节点照旧早退。
+// **N6-① 次序门已收口**(2026-10-19):`tests/store_e2e.rs::pressure_offloads_without_deficit_and_prefers_host`
+// —— 真装 2 条链(池满)后断言:①`Grow` + 零缺口 = noop ②`Pressure` 目标 3 槽必出单
+// ③出单全部 `Sink::Host`(内容不丢)④span 合计 = 目标。

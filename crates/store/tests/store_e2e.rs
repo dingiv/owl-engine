@@ -347,3 +347,33 @@ async fn per_block_offload_skips_live_block_without_vetoing_others() {
     assert!(unk.is_empty());
     assert_eq!(unk.skipped[0].1, SkipWhy::Unknown);
 }
+
+/// **N6-① 次序门**(缺口 3;2026-10-19):`NeedWhy::Pressure` = **零缺口也搬**,
+/// 且出单**优先 `Sink::Host`**(内容不丢) —— 与"非压力节点在 free >= need 时早退"对照。
+#[tokio::test]
+async fn pressure_offloads_without_deficit_and_prefers_host() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let mut l = leg(6);
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
+        .expect("注册布局");
+    // 填 2 条链 × 3 块 = 池满;归还会话引用 ⇒ 缓存独占(可下沉)
+    let a_tokens: Vec<u32> = (0..PAGE_TOKENS as u32 * 3).collect();
+    let _a = build_chain(&mut l, &a_tokens).await;
+    let tokens_b: Vec<u32> = (1000..1000 + PAGE_TOKENS as u32 * 3).collect();
+    let _b = build_chain(&mut l, &tokens_b).await;
+    assert_eq!(l.slots_free(), 0, "池应已满");
+    // 对照:非压力节点,零缺口 ⇒ 不动
+    let noop = plan(&l, Need { slots: 0, why: NeedWhy::Grow }, &[]);
+    assert!(noop.is_noop(), "Grow + 零缺口 ⇒ 不搬");
+    // N6:目标腾 3 槽(与缺口无关)⇒ 必须出单,且优先 Host 下沉
+    let v = plan(&l, Need { slots: 3, why: NeedWhy::Pressure }, &[]);
+    assert!(v.deny.is_none(), "可下沉面充足 ⇒ 不拒:{:?}", v.deny);
+    assert!(!v.out.is_empty(), "压力节点必须搬(零缺口也搬)");
+    assert!(
+        v.out.iter().all(|o| o.sink == Sink::Host),
+        "宿主要位 ⇒ 首选下沉(内容不丢):{:?}",
+        v.out.iter().map(|o| o.sink).collect::<Vec<_>>()
+    );
+    assert_eq!(v.out.iter().map(|o| o.span).sum::<usize>(), 3, "整链下沉凑满目标");
+}
