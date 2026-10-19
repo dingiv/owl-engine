@@ -360,6 +360,41 @@ pub fn eval_ops_multi_scoped_env<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
+    eval_multi_scoped_inner(roots, face, env, tp, true)
+}
+
+/// **副作用根口径**(2026-10-19 泄漏定谳):与
+/// [`eval_ops_multi_scoped_env`] 同,但**根也在收尾后归还** —— 用于"根只是
+/// 契约 4 的占位、**没人读它的值**"的场景(核就地写池;如 DFlash2 `encode_kv`
+/// 的哑根:核把 K/V 写进池块,末位出参只是槽序占位)。
+///
+/// **契约**:调用方不得在返回后再读这些块(返回的 `Bytes` 仅供诊断/计数)。
+/// 为什么必须显式分两个口:哑根当"根"传是为了**触发执行**;若照 scoped 口径
+/// 保留根,则每调用一次就漏一个块(实测:DFlash2 5 层 encode = **+5 块/轮**
+/// 永久在借,`/debug/vram` 的 `turn:N` 列逐轮爬坡的**主因**)。
+pub fn eval_ops_side_effect_env<'a, D>(
+    roots: &'a [&'a TensorOps],
+    face: &'a mut D,
+    env: crate::env::EnvProvider,
+    tp: Option<&'a crate::module::TpCtx>,
+) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
+    eval_multi_scoped_inner(roots, face, env, tp, false)
+}
+
+/// 多根 scoped 的**唯一实现体**(两个公共口 = `keep_roots` 两档)。
+fn eval_multi_scoped_inner<'a, D>(
+    roots: &'a [&'a TensorOps],
+    face: &'a mut D,
+    env: crate::env::EnvProvider,
+    tp: Option<&'a crate::module::TpCtx>,
+    keep_roots: bool,
+) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
     Box::pin(async move {
         // ⚠️ **多根边只数一次**(2026-10-19 §8.31):旧口径逐根相加,在"根套根"
         // (Q 槽 / DFlash2 taps:根节点在主根子树里)时把共享子树的边数 k 次 ⇒
@@ -430,7 +465,8 @@ where
         }
         let root_ids: std::collections::HashSet<u64> = out.iter().map(|b| b.id).collect();
         let mut candidates: Vec<u64> = std::mem::take(&mut ctx.arena);
-        candidates.retain(|id| !root_ids.contains(id) && ctx.arena_set.contains(id));
+        // `keep_roots = false`(副作用根口径)⇒ 根**也在候选里**(没人会再读它们)
+        candidates.retain(|id| ctx.arena_set.contains(id) && (!keep_roots || !root_ids.contains(id)));
         if !candidates.is_empty() {
             ctx.face.free(&candidates).await?;
         }

@@ -486,6 +486,45 @@ only_block_ids = [1099511627777 … +17]   ⇒ 账本 id 1 的前 18 个块
 (属于腿/池的**复用缓存**面或视窗口径),与本节不冲突 —— 但**说明"爬坡"必须两面一起看**
 (事件账 = 块面;腿自报 = 池面),这正是 `/debug/vram` 三面同刻的理由。
 
+
+### 12.8 刀 N4-a:副作用哑根治理(7 块/轮 → 2 块/轮;2026-10-19)
+
+**侦查口径**:`/debug/vram` 新增 `events.open[]`(**lifecycle 在借清单**,逐条带
+`id/name/owner/bytes`)—— 这就是 N4「未归还清单」的原料。27B 真机 3 轮实测:
+
+| 名字 | 条数/轮 | 字节 | 判读 |
+|---|---|---|---|
+| `vllm_reshape_and_cache_bf16` | **5**(turn:1 额外多 15,共 20) | ≈0 KiB | DFlash2 草稿 **5 层**的 KV 写:核就地写池,末位出参只是**契约 4 占位**(`with_shape(dt, vec![1])` = 1 元素哑根) |
+| `owl_dflash_select_bf16` | 1 | 7 KiB | propose 路选择器输出 |
+| `owl_narrow_strided_f16` | 1 | 10 KiB | propose 路 narrow(树序/视图) |
+
+**根因**:`eval_ops_multi_scoped_env` 的收尾口径 = `候选 = 竞技场 − 根` ⇒ **副作用哑根
+(只为触发执行而传的"根")永久保留**。DFlash2 encode 每层一个 ⇒ 5 块/轮,`turn:N` 列
+逐轮爬坡的主因(它**不是** 480MB 量级的那种泄漏,是**条目**泄漏)。
+
+**修法(源头上分口径,不猜不扫)**:
+- `interpreters/eval.rs` 新增 **`eval_ops_side_effect_env`**(与 scoped 同一实现体,
+  `keep_roots = false` ⇒ **根也在候选里**);契约写明:**调用方不得在返回后再读这些块**;
+- 换口三处(全部是 `encode_kv` 的哑根):`exec/draft.rs` 两处 + 后一处(`prefill_dflash_encode`
+  的第二个 encode 站点 —— 第一轮只改了其中一处,实测**没变**,正是"同一函数两处调用点"的坑)。
+
+**实测(27B,3090 Ti,同档 3 轮)**:
+
+| 轮 | lifecycle 在借 | 内容 |
+|---|---|---|
+| 1 | **2** 条 / 17.0 KiB | select 1 + narrow 1 |
+| 2 | **4** 条 / 34.1 KiB | 每轮 +2(不再是 +7) |
+| 3 | **6** 条 / 51.1 KiB | `only_block` 恒 18 · `hook_fail` 0 · `window_unclosed` 0 |
+
+⇒ **每轮 +7 → +2**;两项各自与"轮"一一对应,`recon` 残差不变。
+
+**遗留(下一刀 N4-b)**:`owl_dflash_select_bf16` + `owl_narrow_strided_f16` 各 1/轮。
+持有面 = propose 路 `eval_ops_scoped_env(drafts.step())`(单根 scoped:根保留、`arena`
+由调用方 `face.free(&arena)` 收)。二者是 `drafts` 的**上游**块,却不在归还的 `arena` 里 ⟹
+**待查假设**:它们经 `BlockPool.give_back` 进了池(`= 零命令复用`),而池在函数出口被 drop
+而**未 flush** ⇒ 块既不在 arena 也不被 free。**下一步 = 在 `eval_ops_scoped_env` 出口
+`flush_pool`(与 scoped 多根同口径)并加门**;或证明它们是"读数据的根"而需显式在轮末归还。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |

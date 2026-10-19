@@ -67,7 +67,10 @@ pub use policy::{
     QueuePolicy,
 };
 pub use leg::CachePolicy;
-pub use rel::{EvictItem, EvictPlan, EventBook, KvConfig, Protected, RecallHit, RecallMode, Rel, StoreReport};
+pub use rel::{
+    EvictItem, EvictPlan, EventBook, KvConfig, OpenLoan, Protected, RecallHit, RecallMode, Rel,
+    StoreReport,
+};
 pub use select::{
     assemble_view, f32_to_f16, score_blocks, select, select_recency, BlockSet, IndexStats,
     MeanKEntry, MeanKIndex, block_mass, coverage_curve, derope_halves_inplace, derope_pair,

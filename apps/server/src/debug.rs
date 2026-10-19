@@ -323,6 +323,16 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
                 "mib": (e.bytes as f64) / (1024.0 * 1024.0),
                 "entries": e.entries,
             })).collect::<Vec<_>>(),
+            // **lifecycle 在借清单**(N4/N5 未归还的逐块指纹:名字 + id)。
+            // 判据:同一 `name` 的条目**逐轮增长** = 该处没在节点上归还。
+            "open": r.events.open_lifecycle.iter().map(|l| json!({
+                "id": l.id,
+                "rank": l.rank,
+                "name": l.name,
+                "owner": l.owner.label(),
+                "kind": format!("{:?}", l.kind),
+                "bytes": l.bytes,
+            })).collect::<Vec<_>>(),
         },
         // **句柄计数**(非零必须能解释:记账失败 / 窗未收)
         "handle": {

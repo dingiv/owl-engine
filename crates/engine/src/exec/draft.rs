@@ -155,7 +155,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         {
             let face = self.dev.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
-            owl_models::interpreters::eval_ops_multi_scoped_env(&refs, face, self.dev.env, self.dev.tp.as_ref()).await?;
+            // 副作用根口径:encode 的末位出参 = 契约 4 占位(核就地写池),没人读 ⇒ 收尾一并归还
+            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.env, self.dev.tp.as_ref()).await?;
         }
         // 探针:首回合 memory 落盘(python 重算 fc 对拍;真块 dtoh 合法。
         // taps 由调用方从 concat 父块整块落盘 —— 切片视图 dtoh 整父块契约)
@@ -530,7 +531,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         {
             let face = self.dev.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
-            owl_models::interpreters::eval_ops_multi_scoped_env(&refs, face, self.dev.env, self.dev.tp.as_ref()).await?;
+            // 副作用根口径:encode 的末位出参 = 契约 4 占位(核就地写池),没人读 ⇒ 收尾一并归还
+            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.env, self.dev.tp.as_ref()).await?;
         }
         if probe {
             let (k0, _) = &leaves[0];
@@ -1065,7 +1067,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         {
             let face = self.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
-            owl_models::interpreters::eval_ops_multi_scoped_env(&refs, face, self.env, self.tp.as_ref()).await?;
+            // 副作用根口径(同 encode 主路:末位出参是契约 4 占位,没人读)
+            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.env, self.tp.as_ref()).await?;
         }
         // 探针:首回合 memory 落盘(python 重算 fc 对拍;真块 dtoh 合法。
         // taps 由调用方从 concat 父块整块落盘 —— 切片视图 dtoh 整父块契约)

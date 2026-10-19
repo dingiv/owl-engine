@@ -709,6 +709,30 @@ impl LedgerBook {
             .collect()
     }
 
+    /// **在借清单**(逐条带 **id 与点名**;N4"未归还清单"的原料)。
+    ///
+    /// `owner_filter`: `None` = 全部;`Some(f)` = 只留 `f(owner)` 为真的那些
+    /// (报告面按需取 lifecycle 面 —— turn/session,即"本该在 N4/N5 归还"的那些)。
+    /// 排序 = 点名 → owner → id(同名成组,便于"哪一处要的、要了几块")。
+    pub fn open_loans(
+        &self,
+        owner_filter: impl Fn(Owner) -> bool,
+    ) -> Vec<(u64, Loan)> {
+        let mut out: Vec<(u64, Loan)> = self
+            .open
+            .iter()
+            .filter(|(_, l)| owner_filter(l.owner))
+            .map(|(id, l)| (*id, l.clone()))
+            .collect();
+        out.sort_by(|a, b| {
+            a.1.name
+                .cmp(&b.1.name)
+                .then(a.1.owner.cmp(&b.1.owner))
+                .then(a.0.cmp(&b.0))
+        });
+        out
+    }
+
     /// **逐 rank 的出借 id 集**(与块账房做**全等门**的原料;按 rank 升序)。
     pub fn open_ids_by_rank(&self) -> Vec<(u8, Vec<u64>)> {
         let mut agg: BTreeMap<u8, Vec<u64>> = BTreeMap::new();

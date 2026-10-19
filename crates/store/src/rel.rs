@@ -152,6 +152,26 @@ pub struct EventBook {
     pub hook_fail: u64,
     /// **逐 rank 在借 id 集**(与块账房做全等门的原料)。
     pub ids: Vec<(u8, Vec<u64>)>,
+    /// **lifecycle 在借清单**(turn/session 归属的逐条:id/点名/字节/类 ——
+    /// N4/N5"本该归还却还没归还"的**逐块指纹**;系统常驻/缓存面不在列)。
+    pub open_lifecycle: Vec<OpenLoan>,
+}
+
+/// 在借清单的一行(报告面投影;`Loan` + id)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenLoan {
+    /// 设备块 id。
+    pub id: u64,
+    /// 分配点点名(哪一处要的)。
+    pub name: String,
+    /// 归属主体。
+    pub owner: crate::tier::Owner,
+    /// 资产类别。
+    pub kind: AssetKind,
+    /// 字节。
+    pub bytes: usize,
+    /// 设备序(TP 分卡)。
+    pub rank: u8,
 }
 
 /// 关系层门面:两个独立管理器 + 一层关联。
@@ -681,6 +701,18 @@ impl Rel {
                     bytes: b.open_total_bytes_rank(None),
                     hook_fail: b.hook_fail(),
                     ids: b.open_ids_by_rank(),
+                    open_lifecycle: b
+                        .open_loans(|o| o.is_lifecycle())
+                        .into_iter()
+                        .map(|(id, l)| OpenLoan {
+                            id,
+                            name: l.name,
+                            owner: l.owner,
+                            kind: l.kind,
+                            bytes: l.bytes,
+                            rank: l.rank,
+                        })
+                        .collect(),
                 }
             },
         }
