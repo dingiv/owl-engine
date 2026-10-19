@@ -199,6 +199,17 @@ pub trait AllocLedger: Send {
     fn on_free(&mut self, ev: &FreeEvent);
     /// 换层(只改 tier/owner,不注销)。
     fn on_move(&mut self, ev: &MoveEvent);
+
+    /// **池取块**(缺口 4):同 kind + 同尺寸才给;`None` = 未命中(调用方真分配)。
+    /// 缺省 `None` = 无池面。
+    fn pool_acquire(&mut self, _class: AssetClass, _bytes: usize) -> Option<u64> {
+        None
+    }
+
+    /// **池还块**:`true` = 已入池(**不许**再给驱动);`false` = 不归池 ⇒ 调用方真归还。
+    fn pool_release(&mut self, _id: u64) -> bool {
+        false
+    }
 }
 
 /// **账本单元**(共享句柄;**同一本账**被 client 钩子与 store 自查共看)。
@@ -369,6 +380,9 @@ struct Ctx {
     class: AssetClass,
     /// 本引擎的设备序(单卡 0;TP rank1 = 1)—— 事件按它分组,卡不混账。
     dev_rank: u8,
+    /// 池命中/入池计数(诊断面;缺口 4)
+    pool_hits: u64,
+    pool_released: u64,
     /// 本上下文发出的事件条数(诊断 + `adopt_ledger` 的 boot 期判据;
     /// 放共享上下文 ⇒ 克隆句柄的发事件也算“本引擎已开始记账”)。
     events_sent: u64,
@@ -387,6 +401,8 @@ impl Ctx {
             owner: Owner::default_owner(),
             class: AssetClass::Unclassified,
             dev_rank: 0,
+            pool_hits: 0,
+            pool_released: 0,
             events_sent: 0,
             hook_fail: 0,
             windows: Vec::new(),
@@ -562,6 +578,22 @@ impl<D: DeviceClient> DeviceHandle<D> {
         self.ctx().window_unclosed
     }
 
+    /// **池命中/入池计数**(诊断面;缺口 4)。
+    pub fn pool_counters(&self) -> (u64, u64) {
+        let c = self.ctx();
+        (c.pool_hits, c.pool_released)
+    }
+
+    fn note_pool_hit(&self) {
+        let mut c = self.ctx();
+        c.pool_hits = c.pool_hits.saturating_add(1);
+    }
+
+    fn note_pool_released(&self, n: usize) {
+        let mut c = self.ctx();
+        c.pool_released = c.pool_released.saturating_add(n as u64);
+    }
+
     /// 当前捕获窗内**尚未归还**的块数(诊断面;非 0 且非捕获期 = 有图未退休)。
     pub fn open_window_blocks(&self) -> usize {
         let c = self.ctx();
@@ -640,11 +672,22 @@ impl<D: DeviceClient> DeviceHandle<D> {
                 Ok(Outcome::Buf(b))
             }
             Command::Free { ids } => {
-                self.inner.free(&ids).await?;
-                for id in ids {
+                // **缺口 4**:可池化的块**不回驱动**(入 store 池 ⇒ 零命令复用);
+                // 池内那条**不**发 FreeEvent(块仍在借 —— 只是变得可复用)。
+                let rest = self.pool_release_all(&ids);
+                let pooled = ids.len() - rest.len();
+                if pooled > 0 {
+                    self.note_pool_released(pooled);
+                }
+                if !rest.is_empty() {
+                    self.inner.free(&rest).await?;
+                }
+                for id in rest {
                     // 字节数在账本侧反查(FreeEvent 只带 id);此处留 0 = 由账本按登记扣
                     frees.push(FreeEvent { id, bytes: 0 });
-                    self.untrack(id);
+                }
+                for id in &ids {
+                    self.untrack(*id);
                 }
                 Ok(Outcome::Done)
             }
@@ -713,6 +756,26 @@ impl<D: DeviceClient> DeviceHandle<D> {
         if let Some(w) = c.windows.last_mut() {
             w.nodes += 1;
         }
+    }
+
+    /// **池取块**(真分配之前问一次;命中 ⇒ 零命令复用)。
+    fn pool_acquire(&self, class: AssetClass, bytes: usize) -> Option<u64> {
+        let cell = self.ledger.as_ref()?;
+        let mut g = match cell.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.pool_acquire(class, bytes)
+    }
+
+    /// **池还块**(逐 id):返回"必须真归还"的那些(顺序保持原样)。
+    fn pool_release_all(&self, ids: &[u64]) -> Vec<u64> {
+        let Some(cell) = self.ledger.as_ref() else { return ids.to_vec() };
+        let mut g = match cell.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        ids.iter().copied().filter(|id| !g.pool_release(*id)).collect()
     }
 
     /// 发事件(客户端侧;**短锁**,绝不跨 await)。
@@ -903,7 +966,16 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         elems: usize,
         name: &str,
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        // 池命中 ⇒ **零命令复用**;`alloc` 是零化语义 ⇒ 命中后补一次 memset(不许静默降级)
+        let class = self.ctx().class; // 先落变量(上下文临时 guard 不许跨到下一句)
+        let hit = DeviceHandle::pool_acquire(self, class, elems * dtype.size_bytes());
         async move {
+            if let Some(id) = hit {
+                self.note_pool_hit();
+                let b = Bytes::new(id, elems, dtype, 0);
+                self.inner.memset_zero(&b, elems * dtype.size_bytes()).await?;
+                return Ok(b);
+            }
             let b = self.inner.alloc(dtype, elems, name).await?;
             let mut ev = Vec::new();
             // 上下文读**先落变量**:实参里的 `self.ctx()` 临时 guard 会活到语句末,
@@ -921,7 +993,14 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         elems: usize,
         name: &str,
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        // 池命中 ⇒ 零命令 + **免零化**(kernel 全量覆写的块;设计原文的复用红利)
+        let class = self.ctx().class; // 先落变量(上下文临时 guard 不许跨到下一句)
+        let hit = DeviceHandle::pool_acquire(self, class, elems * dtype.size_bytes());
         async move {
+            if let Some(id) = hit {
+                self.note_pool_hit();
+                return Ok(Bytes::new(id, elems, dtype, 0));
+            }
             let b = self.inner.alloc_uninit(dtype, elems, name).await?;
             let mut ev = Vec::new();
             // 上下文读**先落变量**:实参里的 `self.ctx()` 临时 guard 会活到语句末,
@@ -1022,8 +1101,17 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
 
     fn free(&mut self, ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
-            self.inner.free(ids).await?;
-            let frees: Vec<FreeEvent> = ids.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
+            // **缺口 4**:可池化 ⇒ 入池(不回驱动);其余真归还。池内那条不发 FreeEvent。
+            let rest = self.pool_release_all(ids);
+            let pooled = ids.len() - rest.len();
+            if pooled > 0 {
+                self.note_pool_released(pooled);
+            }
+            if !rest.is_empty() {
+                self.inner.free(&rest).await?;
+            }
+            let frees: Vec<FreeEvent> =
+                rest.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
             self.send_events(&[], &frees, &[]);
             for id in ids {
                 self.untrack(*id);

@@ -76,6 +76,14 @@ impl AssetKind {
     /// 常驻系统面(Weight/Graph/Pool)也是保留面 —— 它们不参与 store 的
     /// 驱逐/下沉决策(不是池的可回收块)。`Unclassified` **不声称**保留
     /// (分类未知就不许替决策面下结论;当前决策面根本不读本函数)。
+    /// **可池化?**(缺口 4「临时池」的门;2026-10-19)——**决策产地 = store**:
+    /// 只有临时面(chunk 激活/工作区)进复用池;常驻面(权重/图/池骨架/地板/行)
+    /// 与缓存面(KV/快照/索引)**不许**被当作可复用临时块发放(它们的生命周期
+    /// 各自有主)。
+    pub fn poolable(self) -> bool {
+        matches!(self, AssetKind::Temp)
+    }
+
     pub fn is_reserved(self) -> bool {
         matches!(
             self,
@@ -311,6 +319,45 @@ impl TierLedger {
         let c = self.cells.entry((to, kind)).or_default();
         c.bytes += bytes;
         c.entries += src_entries;
+        Ok(())
+    }
+
+    /// **改归属**(tier/kind 不变,只换 owner;缺口 4 池清点用)。
+    ///
+    /// 判据:源 owner 必须在场且账够(不足 = 响亮拒);`cells`(tier,kind)不变
+    /// —— 同一层的同一类资产只是换了主。
+    pub fn reown(
+        &mut self,
+        from: Owner,
+        to: Owner,
+        tier: Tier,
+        kind: AssetKind,
+        bytes: usize,
+    ) -> StoreResult<()> {
+        if from == to {
+            return Ok(()); // 幂等
+        }
+        let src = self.owners.get_mut(&(from, tier, kind)).ok_or_else(|| {
+            StoreError::Invariant(format!(
+                "{} 在 {tier:?}/{kind:?} 无账可改归属(幽灵)",
+                from.label()
+            ))
+        })?;
+        if src.bytes < bytes || src.entries == 0 {
+            return Err(StoreError::Invariant(format!(
+                "{} 改归属超账:{tier:?}/{kind:?} {} < {bytes}",
+                from.label(),
+                src.bytes
+            )));
+        }
+        src.bytes -= bytes;
+        src.entries -= 1;
+        if src.bytes == 0 && src.entries == 0 {
+            self.owners.remove(&(from, tier, kind));
+        }
+        let dst = self.owners.entry((to, tier, kind)).or_default();
+        dst.bytes += bytes;
+        dst.entries += 1;
         Ok(())
     }
 
@@ -576,6 +623,51 @@ mod tests {
         assert!(!AssetKind::from(A::Unclassified).is_reserved(), "未分类不声称保留");
     }
 
+    /// **缺口 4 门:临时池三条律**
+    #[test]
+    fn temp_pool_reuses_released_blocks_and_sweeps_owner() {
+        use owl_iface::handle::{AllocEvent, FreeEvent, Owner as IfOwner};
+        let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        let mut b = LedgerBook::new(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        // ① 入账(temp 类)+ 释放 ⇒ 入池(不回驱动),仍在借
+        b.on_alloc(&AllocEvent {
+            id: 11,
+            bytes: 4096,
+            name: "chunk.ws".into(),
+            class: owl_iface::handle::AssetClass::Temp,
+            owner: IfOwner::Turn(1),
+            rank: 0,
+        });
+        assert!(b.pool_release(11), "temp 类可池化");
+        assert_eq!(b.open_count(), 1, "**入池 ≠ 归还**:块仍在借");
+        assert_eq!(b.pool_stats(), (1, 4096));
+        // ② 同类同尺寸命中;异类/异尺寸不命中(尺寸错 = 双错)
+        assert_eq!(b.pool_acquire(AssetKind::Temp, 4096), Some(11));
+        assert_eq!(b.pool_acquire(AssetKind::Temp, 8192), None);
+        assert_eq!(b.pool_acquire(AssetKind::KvBlock, 4096), None);
+        let (hits, misses, _) = b.pool_counters();
+        assert_eq!((hits, misses), (1, 2), "命中/未中计数");
+        // ③ 不可池化类:拒绝(bool = false ⇒ 调用方必须真归还)
+        b.on_alloc(&AllocEvent {
+            id: 12,
+            bytes: 1024,
+            name: "weight".into(),
+            class: owl_iface::handle::AssetClass::Weight,
+            owner: IfOwner::Turn(1),
+            rank: 0,
+        });
+        assert!(!b.pool_release(12), "常驻面不许进复用池");
+        // ④ 清点:池内 Turn(1) → Cache(改归属,不变 tier/kind);非池块**不动**
+        b.pool_release(11);
+        let swept = b.pool_sweep(IfOwner::Turn(1), IfOwner::Cache);
+        assert_eq!(swept, (1, 4096), "只清点池内那块");
+        assert_eq!(b.open_bytes(IfOwner::Turn(1)), 1024, "非池块仍归 turn(泄漏可见)");
+        assert_eq!(b.open_bytes(IfOwner::Cache), 4096);
+        assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Temp), 4096, "temp 面仍平");
+        assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Weight), 1024, "常驻面另账");
+        let _ = cell;
+    }
+
     /// **第 0 刀:owner 维**(每字节唯一归属;出账逐 owner 判,不替他人平账)
     #[test]
     fn owner_dimension_balances_and_rejects_cross_owner_release() {
@@ -637,12 +729,35 @@ pub struct LedgerBook {
     tiers: TierLedger,
     open: BTreeMap<u64, Loan>,
     hook_fail: u64,
+    /// **临时块池**(缺口 4;2026-10-19):`(kind, bytes) → 可复用 id 栈`(LIFO)。
+    ///
+    /// 三条律:
+    /// 1. **同 kind + 同尺寸**才复用(尺寸不等 = 元素数/字节对不上,复用会让
+    ///    形状与账目双错 ⇒ 不许);
+    /// 2. **只有"已被持有者释放"的块入池**(`on_free` 路径),池成员 = 无活持有者
+    ///    ⇒ 再发放不会造成别名/UAF;
+    /// 3. 入池**不等于归还**:块仍在借(账上照旧占着),只是**可复用** ——
+    ///    真还驱动 = 压力/关会话时的池排空(N6)。
+    pool: BTreeMap<(AssetKind, usize), Vec<u64>>,
+    /// 池命中/未命中(打点:复用率 = hits/(hits+misses))
+    pool_hits: u64,
+    pool_misses: u64,
+    /// 池排空(真还驱动)计数 —— N6 前恒 0
+    pool_drained: u64,
 }
 
 impl LedgerBook {
     /// 构造(唯一入口:预算随账走)。
     pub fn new(budget: TierBudget) -> Self {
-        Self { tiers: TierLedger::new(budget), open: BTreeMap::new(), hook_fail: 0 }
+        Self {
+            tiers: TierLedger::new(budget),
+            open: BTreeMap::new(),
+            hook_fail: 0,
+            pool: BTreeMap::new(),
+            pool_hits: 0,
+            pool_misses: 0,
+            pool_drained: 0,
+        }
     }
 
     /// 三层账(决策/报告面)。
@@ -707,6 +822,79 @@ impl LedgerBook {
             .filter(|(_, l)| rank.is_none_or(|r| l.rank == r))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// **池取块**(同 kind + 同尺寸才给;`None` = 未命中 ⇒ 调用方走真分配)。
+    pub fn pool_acquire(&mut self, kind: AssetKind, bytes: usize) -> Option<u64> {
+        let id = self.pool.get_mut(&(kind, bytes)).and_then(|v| v.pop());
+        match id {
+            Some(id) => {
+                self.pool_hits = self.pool_hits.saturating_add(1);
+                Some(id)
+            }
+            None => {
+                self.pool_misses = self.pool_misses.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    /// **池还块**(只在 `on_free` 路径调:持有者已声明不再引用)。
+    ///
+    /// 返回 `false` = 该块**不可池化**(类别不是临时面)或**不在借** ⇒ 调用方
+    /// 必须走真归还(不静默吞)。
+    pub fn pool_release(&mut self, id: u64) -> bool {
+        let Some(l) = self.open.get(&id) else { return false };
+        if !l.kind.poolable() {
+            return false;
+        }
+        let key = (l.kind, l.bytes);
+        self.pool.entry(key).or_default().push(id);
+        true
+    }
+
+    /// **N4 池清点**:把**池内**`from` 名下的块改归属 `to`(池 = 共享复用面,
+    /// 不再是某个 turn 的临时面),返回 `(块数, 字节)`。
+    ///
+    /// 为什么安全:池成员**按构造**无活持有者(只在 `free` 路径入池)⇒ 换归属
+    /// 不改变任何人的持有事实;而"真没归还"的块(不在池里)**不换** ——
+    /// 它们保持 `Turn(t)` 归属,继续在 N4 清单里点名(泄漏 vs 复用从此可分)。
+    pub fn pool_sweep(&mut self, from: Owner, to: Owner) -> (usize, usize) {
+        let pooled: Vec<u64> = self.pool.values().flatten().copied().collect();
+        let mut n = 0usize;
+        let mut bytes = 0usize;
+        for id in pooled {
+            let Some(l) = self.open.get(&id).cloned() else { continue };
+            if l.owner != from {
+                continue;
+            }
+            if self.tiers.reown(l.owner, to, l.tier, l.kind, l.bytes).is_err() {
+                self.fail("池清点改归属失败", format!("id={id}"));
+                continue;
+            }
+            if let Some(m) = self.open.get_mut(&id) {
+                m.owner = to;
+            }
+            n += 1;
+            bytes += l.bytes;
+        }
+        (n, bytes)
+    }
+
+    /// 池内块数 / 字节(一等指标)。
+    pub fn pool_stats(&self) -> (usize, usize) {
+        let n = self.pool.values().map(|v| v.len()).sum();
+        let b: usize = self
+            .pool
+            .iter()
+            .map(|((_, bytes), v)| bytes * v.len())
+            .sum();
+        (n, b)
+    }
+
+    /// 池命中/未命中/排空计数。
+    pub fn pool_counters(&self) -> (u64, u64, u64) {
+        (self.pool_hits, self.pool_misses, self.pool_drained)
     }
 
     /// **在借清单**(逐条带 **id 与点名**;N4"未归还清单"的原料)。
@@ -873,6 +1061,15 @@ pub struct LedgerEntry {
 impl owl_iface::handle::AllocLedger for LedgerEntry {
     fn on_alloc(&mut self, ev: &owl_iface::handle::AllocEvent) {
         book_lock(&self.book).on_alloc(ev);
+    }
+
+    fn pool_acquire(&mut self, class: owl_iface::handle::AssetClass, bytes: usize) -> Option<u64> {
+        let kind = AssetKind::from(class);
+        book_lock(&self.book).pool_acquire(kind, bytes)
+    }
+
+    fn pool_release(&mut self, id: u64) -> bool {
+        book_lock(&self.book).pool_release(id)
     }
     fn on_free(&mut self, ev: &owl_iface::handle::FreeEvent) {
         book_lock(&self.book).on_free(ev);

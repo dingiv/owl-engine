@@ -152,9 +152,26 @@ pub struct EventBook {
     pub hook_fail: u64,
     /// **逐 rank 在借 id 集**(与块账房做全等门的原料)。
     pub ids: Vec<(u8, Vec<u64>)>,
+    /// **复用池**(缺口 4;一等指标:池内可复用字节)
+    pub pool: PoolReport,
     /// **lifecycle 在借清单**(turn/session 归属的逐条:id/点名/字节/类 ——
     /// N4/N5"本该归还却还没归还"的**逐块指纹**;系统常驻/缓存面不在列)。
     pub open_lifecycle: Vec<OpenLoan>,
+}
+
+/// **复用池报告**(缺口 4:池内可复用面 —— 不再是告警里的一行,而是一等指标)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolReport {
+    /// 池内块数。
+    pub entries: usize,
+    /// 池内可复用字节。
+    pub bytes: usize,
+    /// 取块命中次数(零命令复用)。
+    pub hits: u64,
+    /// 取块未命中次数(走了真分配)。
+    pub misses: u64,
+    /// 池排空次数(N6;此前恒 0)。
+    pub drained: u64,
 }
 
 /// 在借清单的一行(报告面投影;`Loan` + id)。
@@ -701,6 +718,11 @@ impl Rel {
                     bytes: b.open_total_bytes_rank(None),
                     hook_fail: b.hook_fail(),
                     ids: b.open_ids_by_rank(),
+                    pool: {
+                        let (n, by) = b.pool_stats();
+                        let (hits, misses, drained) = b.pool_counters();
+                        PoolReport { entries: n, bytes: by, hits, misses, drained }
+                    },
                     open_lifecycle: b
                         .open_loans(|o| o.is_lifecycle())
                         .into_iter()

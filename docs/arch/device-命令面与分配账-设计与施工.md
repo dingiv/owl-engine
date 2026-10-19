@@ -612,6 +612,46 @@ eval B: marlin_gemm_w4a16_awq(A 的返回值当输入)→ argmax → copy_block 
 **下一刀 = 在 walk 的调用点把这两个中间根(窄块 + GEMM 输出)归还**(或整条 walk 改走
 `eval_ops_side_effect_env` 口径)。
 
+
+### 12.12 刀 缺口 4+1:**临时池入池 + N4 真归还**(2026-10-19)
+
+**用户定调落地**("释放不立即还给驱动,由 store 再分配"):这一刀是那句定调第一次真正跑起来。
+
+**设计(安全版 —— 关键在"只池化已被释放的块")**:
+
+| 件 | 内容 |
+|---|---|
+| `LedgerBook.pool` | `(kind, bytes) → id 栈`(LIFO;**同 kind + 同尺寸**才复用)。三条律:①尺寸不等不复用(元素数/字节对不上=双错)②**只有 `on_free` 路径的块入池**(池成员 = 无活持有者 ⇒ 再发放不会别名/UAF)③**入池 ≠ 归还**(块仍在借,只是可复用;真还驱动 = 压力/关会话时的池排空,N6) |
+| `AssetKind::poolable()` | 决策产地 = store:只有 `Temp` 可池化;权重/图/池骨架/KV/快照/行**一律拒**(它们各自有主) |
+| `TierLedger::reown` | 改归属(tier/kind 不变,只换 owner);源账不足 = 响亮拒 |
+| `LedgerBook::pool_sweep(from, to)` | N4 清点:**池内**该 owner 名下块改归 `Cache`(池 = 共享复用面);**非池块不动** ⇒ 继续归 `Turn(t)` 继续在清单里点名 |
+| `DeviceHandle` | `alloc/alloc_uninit` 先问池(**零命令复用**;zeroed 档命中后补一次 memset,uninit 档免零化);`free` 逐 id 问池(入池者**不回驱动、不发 FreeEvent**,其余才转发) |
+| 报告 | `/debug/vram` 新增 `events.pool{entries,bytes,hits,misses,drained}` —— 池内可复用字节**从告警里的一行升为一等指标**(立案原文) |
+
+**踩坑(值得记)**:`DeviceClient` 契约上加了同名 `pool_acquire` 后,句柄内的 `self.pool_acquire(..)`
+解析到了**契约缺省的 `None`**(而不是句柄自身的实现)⇒ 池永远取不到(表现 = 池只进不出、
+命中恒 0)。修:池面**不属 face 契约**(它是"句柄↔账本"的事),从 `DeviceClient` 上删掉;
+句柄内改显式 `DeviceHandle::pool_acquire(self, ..)` 钉死解析。
+
+**真机实测(27B / 3090 Ti / ctx16k / spec-dflash depth7,3 轮)**:
+
+```
+[INFO] N4 池清点:turn 1 归还 114 块 / 25435 KiB 入复用池 ⇒ 池 114 块(命中 3024 / 未中 10711)
+                turn 2 归还  15 块 ⇒ 池 128 块;turn 3 ⇒ 池 142 块
+/debug/vram pool: 142 块 / 24.8 MiB · 命中 6162 / 未中 10711(复用率 ≈ 37%)· drained 0
+turn 列: 轮 1/2/3 **恒 1 条**(此前 1→2→3 递增)                ← 缺口 1 判据达成
+N4 清单: 仍点名 owl_narrow_strided_f16 ×1 / 10240B             ← 池内复用 vs 泄漏**可分**
+recon only_block 恒 18 · hook_fail 0 · window_unclosed 0
+```
+
+**门**:owl-iface 11 · owl-store 88(新增池三条律门:同尺寸复用/入池≠归还/清点换归属/不可池化拒)
+· owl-cpu 17(新增池复用门:释放入池 → 再取同 id → 池化不发 FreeEvent)· owl-engine 54 ·
+device_ledger 2(断言"turn 后池非空 + hits+misses>0")· 真机三轮同上。
+
+**下一步(N6,缺口 3)**:池排空(`temp_return_to_driver`)+ `plan(Pressure)` 次序
+(H5 整链下沉 → 池回收 → 弹性面驱逐 → 降级 → 才拒),把 `Reject` 从"直通致命"改成
+"先收缩/降级";`pool.drained` 那时才该非 0。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |

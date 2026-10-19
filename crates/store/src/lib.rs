@@ -68,8 +68,8 @@ pub use policy::{
 };
 pub use leg::CachePolicy;
 pub use rel::{
-    EvictItem, EvictPlan, EventBook, KvConfig, OpenLoan, Protected, RecallHit, RecallMode, Rel,
-    StoreReport,
+    EvictItem, EvictPlan, EventBook, KvConfig, OpenLoan, PoolReport, Protected, RecallHit,
+    RecallMode, Rel, StoreReport,
 };
 pub use select::{
     assemble_view, f32_to_f16, score_blocks, select, select_recency, BlockSet, IndexStats,

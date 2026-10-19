@@ -84,6 +84,17 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     assert_eq!(hf, 0, "全程不许有未入账事件");
     assert_eq!(wu, 0, "没有窗失败 ⇒ 不该有未收窗");
     assert_eq!(b.open_count() > 0, true, "账必须有内容(否则记了个寂寞)");
+    // **缺口 4 门**:turn 内的临时块释放后应进**复用池**(不回驱动),
+    // 且池指标是一等输出(不是告警里的一行)。
+    let pool = b.pool_stats();
+    let (hits, misses, drained) = b.pool_counters();
+    eprintln!(
+        "[ledger] 池:{} 块 / {} KiB;命中 {hits} 未中 {misses} 排空 {drained}",
+        pool.0,
+        pool.1 / 1024
+    );
+    assert!(pool.0 > 0, "turn 后应有过释放的临时块入池(缺口 4)");
+    assert!(hits + misses > 0, "取块计数必须有量(hits+misses>0)");
 }
 
 /// **账本预算交叉校验**:`Rel::open` 必须拒"账本与分解不符"(boot 算式漂了 = 响亮拒)

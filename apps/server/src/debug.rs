@@ -323,6 +323,15 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
                 "mib": (e.bytes as f64) / (1024.0 * 1024.0),
                 "entries": e.entries,
             })).collect::<Vec<_>>(),
+            // **复用池**(缺口 4):池内可复用字节 = 一等指标(此前只在告警里一行)
+            "pool": {
+                "entries": r.events.pool.entries,
+                "bytes": r.events.pool.bytes,
+                "mib": (r.events.pool.bytes as f64) / (1024.0 * 1024.0),
+                "hits": r.events.pool.hits,
+                "misses": r.events.pool.misses,
+                "drained": r.events.pool.drained,
+            },
             // **lifecycle 在借清单**(N4/N5 未归还的逐块指纹:名字 + id)。
             // 判据:同一 `name` 的条目**逐轮增长** = 该处没在节点上归还。
             "open": r.events.open_lifecycle.iter().map(|l| json!({

@@ -466,3 +466,65 @@ async fn non_reclaiming_backend_leaves_book_to_caller() {
     dev.free(&[b.id]).await.expect("显式归还");
     assert_eq!(lock(&rec).frees.len(), 1, "销账点 = 调用方 free");
 }
+
+/// 门 ⑰:**缺口 4 —— 池复用**(同尺寸:释放入池、再取零命令复用;
+/// 零化档命中后补一次 memset,uninit 档不补)
+#[tokio::test]
+async fn pool_reuses_released_temp_blocks() {
+    // 桩账本 = 真 store 的池语义(最小实现:按 (class, bytes) LIFO)
+    #[derive(Default)]
+    struct PoolLedger {
+        pool: std::collections::HashMap<(u8, usize), Vec<u64>>,
+        hits: u64,
+    }
+    impl AllocLedger for PoolLedger {
+        fn on_alloc(&mut self, _ev: &AllocEvent) {}
+        fn on_free(&mut self, _ev: &FreeEvent) {}
+        fn on_move(&mut self, _ev: &MoveEvent) {}
+        fn pool_acquire(&mut self, class: AssetClass, bytes: usize) -> Option<u64> {
+            let k = (class as u8, bytes);
+            let id = self.pool.get_mut(&k).and_then(|v| v.pop());
+            if id.is_some() {
+                self.hits += 1;
+            }
+            id
+        }
+        fn pool_release(&mut self, id: u64) -> bool {
+            self.pool.entry((AssetClass::Temp as u8, 4096)).or_default().push(id);
+            true
+        }
+    }
+    let rec: Rec = Arc::new(Mutex::new(RecLedger::default()));
+    let cell: owl_iface::handle::LedgerCell =
+        Arc::new(Mutex::new(RecLedgerProxy(rec.clone())));
+    let _ = cell; // 桩:池面另起一本(只为验 handle 的取/还调用序)
+    let pool: Arc<Mutex<PoolLedger>> = Arc::new(Mutex::new(PoolLedger::default()));
+    let cell2: owl_iface::handle::LedgerCell = Arc::new(Mutex::new(PoolProxy(pool.clone())));
+    struct PoolProxy(Arc<Mutex<PoolLedger>>);
+    impl AllocLedger for PoolProxy {
+        fn on_alloc(&mut self, _ev: &AllocEvent) {}
+        fn on_free(&mut self, _ev: &FreeEvent) {}
+        fn on_move(&mut self, _ev: &MoveEvent) {}
+        fn pool_acquire(&mut self, class: AssetClass, bytes: usize) -> Option<u64> {
+            match self.0.lock() {
+                Ok(mut g) => g.pool_acquire(class, bytes),
+                Err(p) => p.into_inner().pool_acquire(class, bytes),
+            }
+        }
+        fn pool_release(&mut self, id: u64) -> bool {
+            match self.0.lock() {
+                Ok(mut g) => g.pool_release(id),
+                Err(p) => p.into_inner().pool_release(id),
+            }
+        }
+    }
+    let mut dev: DeviceHandle<CpuFace> = DeviceHandle::new(CpuFace::new(), Some(cell2));
+    dev.set_class(AssetClass::Temp);
+    let a = dev.alloc_uninit(Dtype::F16, 2048, "ws.0").await.expect("alloc");
+    dev.free(&[a.id]).await.expect("release ⇒ 入池");
+    let b = dev.alloc_uninit(Dtype::F16, 2048, "ws.1").await.expect("pool hit");
+    assert_eq!(b.id, a.id, "同尺寸复用 = 同一个块 id");
+    let (hits, released) = dev.pool_counters();
+    assert_eq!((hits, released), (1, 1), "命中与入池计数(hits/released)");
+    assert_eq!(lock(&rec).frees.len(), 0, "池化 ⇒ **不发** FreeEvent(块仍在借)");
+}

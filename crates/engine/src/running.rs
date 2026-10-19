@@ -798,6 +798,34 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(owl_store::Need { slots: 0, why: NeedWhy::Idle })
     }
 
+    /// **N4 池清点**(缺口 4 的节点面):把**已在 store 池里**的 `Turn(t)` 名下块
+    /// 改归属 `Cache`(池 = 共享复用面,不再是某 turn 的临时面),返回 `(块数, 字节)`。
+    ///
+    /// 安全性:池成员**按构造**无活持有者(只在 `free` 路径入池)⇒ 换归属不改任何
+    /// 持有事实;而"真没归还"的块(不在池里)**不换** —— 它们继续归 `Turn(t)`,
+    /// 继续在 N4 清单里点名 ⇒ **"池内复用"与"泄漏"从此可分**。
+    pub(crate) fn n4_pool_sweep(&self, turn: u64) -> (usize, usize) {
+        let cell = self.bank.rel.ledger_cell();
+        let mut b = owl_store::book_lock(&cell);
+        let swept = b.pool_sweep(
+            owl_iface::handle::Owner::Turn(turn),
+            owl_iface::handle::Owner::Cache,
+        );
+        if swept.0 > 0 {
+            let (n, bytes) = b.pool_stats();
+            let (hits, misses, _) = b.pool_counters();
+            owl_shared::log_info!(
+                "store",
+                "N4 池清点:turn {turn} 归还 {} 块 / {} KiB 入复用池 ⇒ 池 {} 块 / {} KiB(命中 {hits} / 未中 {misses})",
+                swept.0,
+                swept.1 / 1024,
+                n,
+                bytes / 1024
+            );
+        }
+        swept
+    }
+
     /// **N4 未归还清单**(store 立案 §缺口1 的第一半;2026-10-19)。
     ///
     /// turn 收尾时按**块**清点 `Turn(t)` 名下**仍开着**的块:非空 ⇒ 响亮 WARN,
