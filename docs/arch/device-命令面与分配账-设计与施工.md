@@ -584,6 +584,34 @@ marlin_gemm_w4a16_awq(吃它) → 此后无 free`;`owl_dflash_select_bf16`:`allo
 **当前进度**:每轮 **+7 → +2 → +1**(22→29→36→43 变成 1→2→3);`recon` 残差恒 18 ·
 `hook_fail` 0 · `window_unclosed` 0。
 
+
+### 12.11 刀 N4-c:未归还清单**上节点**(可见性落地)+ 最后 1 块的机制判死(2026-10-19)
+
+**(1) N4 清单上节点**(store 立案 §缺口1 的第一半,落地):turn 收尾
+(`complete`/`abandon` 两路)调 `RunningEngine::n4_report_unreturned(turn)` —— 从账本
+读该 turn 名下**仍开着**的块,按名聚合,非空即 **WARN**。实测输出:
+
+```
+[WARN] [store] N4 未归还清单:turn 1 名下仍有 1 块 / 10 KiB 开着 —— owl_narrow_strided_f16 ×1 / 10240B
+```
+
+⇒ 从此"每轮 +N"**在节点上就报名字**,不必等 `/debug/vram` 的聚合数字、也不必开
+`trace_ring` 拼发射账(本次定位两次泄漏都靠后者,代价高)。
+
+**(2) 最后 1 块的机制判死**(复核 + 发射账):`alloc_out` 的三处调用点**都**调了
+`track_new`(竞技场登记无缺口)⇒ 排除"漏登记"。真正的形状是**两次 eval**:
+
+```
+eval A: narrow(concat_rows 输出) → **A 的根** → 返回给调用方(扫尾按 `arena − root` ⇒ 根留下)
+eval B: marlin_gemm_w4a16_awq(A 的返回值当输入)→ argmax → copy_block 进常驻
+        扫尾只 free B 自己的 arena([380] 与 [423] 都在列,唯独 [422] 不在)
+```
+
+⇒ 与 N4-b **同型**:前一个 eval 的**根**被后一个 eval 当输入消费掉,而**根从未归还**。
+现场 = 草稿 select/lm_head 走词表的那条 walk(`concat_rows → narrow → marlin GEMM → argmax → copy`);
+**下一刀 = 在 walk 的调用点把这两个中间根(窄块 + GEMM 输出)归还**(或整条 walk 改走
+`eval_ops_side_effect_env` 口径)。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |

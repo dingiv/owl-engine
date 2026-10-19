@@ -798,6 +798,39 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(owl_store::Need { slots: 0, why: NeedWhy::Idle })
     }
 
+    /// **N4 未归还清单**(store 立案 §缺口1 的第一半;2026-10-19)。
+    ///
+    /// turn 收尾时按**块**清点 `Turn(t)` 名下**仍开着**的块:非空 ⇒ 响亮 WARN,
+    /// 名字直接指向分配点(哪位调用点要的、要了几块、共多少字节)。这就是
+    /// "为什么每轮 +N"的现场 —— 没有它,泄漏只有 `/debug/vram` 的聚合数字,
+    /// 定位就得开 `trace_ring` 拼发射账。
+    pub(crate) fn n4_report_unreturned(&self, turn: u64) {
+        let cell = self.bank.rel.ledger_cell();
+        let loans = owl_store::book_lock(&cell)
+            .open_loans(|o| o == owl_iface::handle::Owner::Turn(turn));
+        if loans.is_empty() {
+            return;
+        }
+        let mut agg: std::collections::BTreeMap<String, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for (_, l) in &loans {
+            let e = agg.entry(l.name.clone()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += l.bytes;
+        }
+        let total_kib: usize = agg.values().map(|(_, b)| *b).sum::<usize>() / 1024;
+        let detail: Vec<String> = agg
+            .iter()
+            .map(|(n, (c, b))| format!("{n} ×{c} / {}B", b))
+            .collect();
+        owl_shared::log_warn!(
+            "store",
+            "N4 未归还清单:turn {turn} 名下仍有 {} 块 / {total_kib} KiB 开着 —— {}",
+            loans.len(),
+            detail.join(" ｜ ")
+        );
+    }
+
     /// **store 报告面**(设计卷 §2.4 / §13.4 对账口):三层 + 两腿 +
     /// 保留/弹性/可动面。服务面 `/debug` 与准入门读这里(单一真源)。
     pub fn store_report(&self) -> owl_store::StoreReport {
