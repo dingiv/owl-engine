@@ -771,16 +771,43 @@ static BOOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 impl Engine<GpuClient> {
     /// 常规构造:按 cfg 绑定 GPU(ordinal)
     pub fn new(cfg: EngineConfig) -> Result<Self> {
-        // 诊断下沉口(boot 一次组装,显式下传):日志 + 发射/回收计时
-        let face = GpuClient::spawn_with(
-            DeviceSelector::Ordinal(cfg.device_ordinal),
-            cfg.knobs.cuda.clone(),
-            cfg.knobs.probes.debug,
-            owl_shared::log::sink(),
-        )
-            .map_err(|e| ModelError::Msg(format!("engine: gpu 绑定失败 {e:?}")))?;
+        let face = spawn_gpu_face(&cfg)?;
         Self::on(cfg, face)
     }
+
+    /// **TP 共享账本构造**(2026-10-20):把"**本 rank 写哪本书、按哪个 rank 记账**"
+    /// 在**任何设备动作之前**落定。
+    ///
+    /// 为什么必须是构造期(不是装配期):事件账的接管判据是 **boot 期(零事件)**
+    /// (`DeviceHandle::adopt_ledger`)—— 而**装载即发事件**(0.8B 就有 312 条)
+    /// ⇒ 想让两 rank 写同一本,合流只能发生在装载之前。
+    ///
+    /// `dev_rank` 同样不能晚设:事件按 rank 分组,池复用键带 rank(P0-1)⇒
+    /// 漏设会把两 rank 的临时块混池(反例 = 跨卡发句柄)。
+    ///
+    /// 用法(TP2):rank0 用 [`Self::new`](自造账本) → `rank0.ledger_cell()`
+    /// 交给 rank1 的本构造;两侧**然后**再各自 `loader().slice(..)` 装载。
+    pub fn new_with_ledger(
+        cfg: EngineConfig,
+        ledger: owl_store::SharedLedger,
+        dev_rank: u8,
+    ) -> Result<Self> {
+        let face = spawn_gpu_face(&cfg)?;
+        let engine = Self::on_with_ledger(cfg, face, ledger)?;
+        engine.device().set_dev_rank(dev_rank);
+        Ok(engine)
+    }
+}
+
+/// GPU face 绑定(两个构造入口共用;诊断下沉口在 boot 只组装一次)。
+fn spawn_gpu_face(cfg: &EngineConfig) -> Result<GpuClient> {
+    GpuClient::spawn_with(
+        DeviceSelector::Ordinal(cfg.device_ordinal),
+        cfg.knobs.cuda.clone(),
+        cfg.knobs.probes.debug,
+        owl_shared::log::sink(),
+    )
+    .map_err(|e| ModelError::Msg(format!("engine: gpu 绑定失败 {e:?}")))
 }
 
 impl<D: DeviceClient + 'static> Engine<D> {

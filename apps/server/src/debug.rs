@@ -211,6 +211,7 @@ pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
         .iter()
         .map(|r| {
             json!({
+                "name": r.name,
                 "id": r.id,
                 "bytes": r.bytes,
                 "addr": format!("{:#x}", r.addr),
@@ -410,6 +411,23 @@ fn recon_json(
             let blk: Vec<u64> = rows.iter().map(|r| r.id).collect();
             let only_event: Vec<u64> = ev.iter().copied().filter(|id| !blk.contains(id)).collect();
             let only_block: Vec<u64> = blk.iter().copied().filter(|id| !ev.contains(id)).collect();
+            // **未入账块的按名分账**(2026-10-20;判"该不该由 store 管"的唯一材料):
+            // 名字 = 服务端分配点(`selfcheck.*` / `kv.*` / 层名 / 核名)。
+            let mut hist: std::collections::BTreeMap<(&str, usize), (usize, usize)> =
+                std::collections::BTreeMap::new();
+            for r in rows.iter().filter(|r| !ev.contains(&r.id)) {
+                let e = hist.entry((r.name.as_str(), 0)).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += r.bytes;
+            }
+            let mut hist_v: Vec<(&str, usize, usize)> =
+                hist.into_iter().map(|((n, _), (c, b))| (n, c, b)).collect();
+            hist_v.sort_by(|a, b| b.2.cmp(&a.2));
+            let only_block_names: Vec<Value> = hist_v
+                .iter()
+                .take(12)
+                .map(|(n, c, b)| json!({"name": n, "count": c, "bytes": b}))
+                .collect();
             let bytes_blk: usize = rows.iter().map(|r| r.bytes).sum();
             json!({
                 "rank": rank,
@@ -421,6 +439,7 @@ fn recon_json(
                 "only_block": only_block.len(),
                 "only_event_ids": only_event.iter().take(16).collect::<Vec<_>>(),
                 "only_block_ids": only_block.iter().take(16).collect::<Vec<_>>(),
+                "only_block_names": only_block_names,
                 "block_bytes": bytes_blk,
             })
         }

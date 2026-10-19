@@ -86,7 +86,7 @@ impl AllocLedger for RecLedgerProxy {
         g.pool.push((bytes, id));
         Vec::new()
     }
-    fn pool_drain(&mut self) -> Vec<u64> {
+    fn pool_drain(&mut self, _rank: u8) -> Vec<u64> {
         std::mem::take(&mut lock(&self.0).pool).into_iter().map(|(_, id)| id).collect()
     }
 }
@@ -319,6 +319,42 @@ async fn adopt_ledger_is_boot_only() {
     let (cell2, _rec2) = cell();
     let e = dev.adopt_ledger(cell2).expect_err("已记账后接管必须拒");
     assert!(format!("{e}").contains("boot 期"), "得 {e}");
+}
+
+/// **自带令牌的桩账本**(验 `book_token` 支路:同一本书 ⇒ 幂等接管)
+struct TokenLedger(usize);
+
+impl AllocLedger for TokenLedger {
+    fn on_alloc(&mut self, _ev: &AllocEvent) {}
+    fn on_free(&mut self, _ev: &FreeEvent) {}
+    fn on_move(&mut self, _ev: &MoveEvent) {}
+    fn book_token(&self) -> usize {
+        self.0
+    }
+}
+
+fn token_cell(t: usize) -> owl_iface::handle::LedgerCell {
+    Arc::new(Mutex::new(TokenLedger(t)))
+}
+
+/// 门 ⑫-b:**同一本书**的接管幂等(TP 用:装载前已合流,装配期再 adopt 一次)。
+///
+/// 判据两层:同一令牌 + 已发过事件 ⇒ **允许**(零事件丢失);换一本书 + 已记账
+/// ⇒ **仍响亮拒**(老判据不被削弱)。缺了前一条,TP2 的"装载即发事件"会让
+/// 装配期那次 adopt 必拒(2026-10-20 回归:0.8B 就有 312 条装载事件)。
+#[tokio::test]
+async fn adopt_same_book_is_idempotent_after_events() {
+    let (mut dev, _rec0) = handle();
+    dev.adopt_ledger(token_cell(7)).expect("零事件时可接管");
+    let _ = dev.alloc(Dtype::F16, 4, "after.adopt").await.expect("alloc");
+    dev.adopt_ledger(token_cell(7)).expect("同一本书 ⇒ 幂等放行(不丢事件)");
+    let e = dev.adopt_ledger(token_cell(8)).expect_err("另一本书 + 已记账 ⇒ 必须拒");
+    assert!(format!("{e}").contains("boot 期"), "得 {e}");
+    // 令牌 0 = 不表态 ⇒ 一律按"另一本书"(没有身份就没有幂等)
+    let (mut dev2, _rec2) = handle();
+    dev2.adopt_ledger(token_cell(0)).expect("零事件接管");
+    let _ = dev2.alloc(Dtype::F16, 4, "after.adopt2").await.expect("alloc");
+    dev2.adopt_ledger(token_cell(0)).expect_err("token=0 不构成幂等判据");
 }
 
 /// 门 ⑬:`face_clone` **上下文同源**(节点设一次全族生效;事件进同一本账)

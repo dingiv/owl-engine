@@ -453,12 +453,31 @@ fn engine_of(
     config: &ServerConfig,
     ordinal: usize,
 ) -> owl_engine::Result<owl_engine::Engine<owl_cuda::GpuClient>> {
-    owl_engine::Engine::new(owl_engine::EngineConfig {
+    owl_engine::Engine::new(engine_cfg(config, ordinal))
+}
+
+/// **TP 第 2 个 rank 的引擎壳**:账本/设备序**在装载前**从 rank0 接过。
+///
+/// 为什么不能事后接管:装载即发事件(0.8B 实测 312 条)⇒ `adopt_ledger` 的
+/// boot 期判据会响亮拒(事件进孤儿账 = 后续归还全是幽灵)。详见
+/// `Engine::new_with_ledger` 与 `TpEngine::assemble` 的合流注释。
+fn engine_of_tp(
+    config: &ServerConfig,
+    ordinal: usize,
+    rank0: &owl_engine::Engine<owl_cuda::GpuClient>,
+    dev_rank: u8,
+) -> owl_engine::Result<owl_engine::Engine<owl_cuda::GpuClient>> {
+    owl_engine::Engine::new_with_ledger(engine_cfg(config, ordinal), rank0.ledger_cell(), dev_rank)
+}
+
+/// 引擎壳配置(两个构造入口共用;旋钮全件从 config 来,零 env)。
+fn engine_cfg(config: &ServerConfig, ordinal: usize) -> owl_engine::EngineConfig {
+    owl_engine::EngineConfig {
         device_ordinal: ordinal,
         max_seq_tokens: config.max_seq,
         prefill_chunk: config.prefill_chunk,
         knobs: config.knobs.clone(),
-    })
+    }
 }
 
 /// 单 rank 分片装载(**单卡档 `world = 1` = 恒等分片**,与旧路径字节同源)。
@@ -528,7 +547,7 @@ async fn actor_main(
             2 => {
                 let ord = config.devices.ordinals();
                 let model0 = load_shard(&config, &mut engine, 0, 2).await?;
-                let mut engine1 = engine_of(&config, ord[1])?;
+                let mut engine1 = engine_of_tp(&config, ord[1], &engine, 1)?;
                 let model1 = load_shard(&config, &mut engine1, 1, 2).await?;
                 owl_shared::log_info!(
                     "boot",

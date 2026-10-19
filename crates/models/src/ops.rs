@@ -85,6 +85,11 @@ pub enum SemanticKernel {
     CastF16F32,
     /// 刀3a':双权 GEMV 单发(b/a 投影;aux = [rows_b, rows_a, cols, tokens])
     GemvDual,
+    /// **int8 权重 GEMV × bf16 激活**(P1.5-a;lm_head 专用;aux = [rows, cols, tokens])
+    GemvI8wBf16,
+    /// 同上 × **f16 激活**(执行 dtype = f16 的档:W4A16Awq/F16 权重的 27B)——
+    /// 两档必须各有一个 op_id:driver 的拾取键就是 op_id,核实例按激活 dtype 分家。
+    GemvI8wF16,
 
     // ---- attn.*(aux 序见各变体)----
     /// KV 散写(classic 布局;aux = [tokens])
@@ -292,6 +297,8 @@ impl SemanticKernel {
             SemanticKernel::Embed => "ops.embed",
             SemanticKernel::CastF16F32 => "elems.cast_f16_f32",
             SemanticKernel::GemvDual => "elems.gemv_dual",
+            SemanticKernel::GemvI8wBf16 => "elems.gemv_i8w_bf16",
+            SemanticKernel::GemvI8wF16 => "elems.gemv_i8w_f16",
             SemanticKernel::K0Write => "attn.k0_write",
             SemanticKernel::K0WriteKnhd => "attn.k0_write_knhd",
             SemanticKernel::K0WriteFp8Knhd => "attn.k0_write_fp8_knhd",
@@ -871,6 +878,30 @@ mod foreign_call_lock {
                 "foreign 臂发射配置应直通"
             );
             assert!(foreign_sig(pick.name).is_some(), "driver 拾取名必须有家族 sig");
+        }
+    }
+
+    /// **int8 头 GEMV 两档选择面**(P1.5-a;2026-10-20):激活 dtype → op_id →
+    /// 核实例各一颗(f16/bf16)。缺第二条 = f16 执行档拿 bf16 核 ⇒ dtype 守门
+    /// 当场红(实测:27B W4A16Awq 的 lm_head 装配即撞)。
+    #[test]
+    fn gemv_i8w_selection_face_is_wired() {
+        for (sk, dt, want) in [
+            (SemanticKernel::GemvI8wF16, owl_kernels::driver::DType::F16, "owl_gemv_i8w_f16"),
+            (SemanticKernel::GemvI8wBf16, owl_kernels::driver::DType::BF16, "owl_gemv_i8w_bf16"),
+        ] {
+            let pick = owl_kernels::driver::resolve(OpReq {
+                op: sk.op_id(),
+                env: &env(),
+                dt,
+                shapes: &[],
+                // aux = [rows, cols, tokens](cols 须 16 对齐)
+                aux: &[124160, 5120, 1],
+                scalars: &[],
+            });
+            assert_eq!(pick.name, want, "{sk:?}: op_id 应直指该档核名");
+            let m = pick.meta().expect("必须有准入声明");
+            assert_eq!(m.out_dtype().map(|d| format!("{d:?}")), Some(format!("{dt:?}")), "{sk:?}: 声明输出 dtype");
         }
     }
 

@@ -229,12 +229,18 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         let (face1, _cfg1, cell1) = it.next().expect("world = 2 已守门").into_parts();
         // **合流自证**(可判):rank1 自己的那个单元在装配期**必须为空** ——
         // 非空就说明 rank1 在接管之前已经记过账(事件落进了没人读的孤儿账)。
-        {
+        //
+        // 例外 = **两 rank 本来就同一本书**(调用方已在装载前用
+        // `Engine::new_with_ledger` 合流):此时 `cell1` 与 `cell0` 是同一个
+        // `Arc`,“rank1 自己的单元”就**是**主账 —— 它的在借记录正是两侧装载
+        // 刚记下的,不是孤儿账。判据归零由同一性接管。
+        if !std::sync::Arc::ptr_eq(&cell0, &cell1) {
             let n = owl_store::book_lock(&cell1).open_count_rank(None);
             if n != 0 {
                 return loud(format!(
                     "TP rank1 事件账未合流:它自己的单元已有 {n} 条在借记录(孤儿账)—— \
-                     接管必须发生在任何分配之前"
+                     接管必须发生在任何分配之前;修法 = rank1 用 \
+                     `Engine::new_with_ledger(cfg1, rank0.ledger_cell(), 1)` 构造"
                 ));
             }
         }
@@ -463,11 +469,23 @@ impl TpEngine<GpuClient> {
         let (mut face1, _cfg1, _cell1) = it.next().expect("world = 2 已守门").into_parts();
         let mut face0 = face0;
         // **事件账合流(TP 纪律)**:两 rank 写**同一本**账(单卡档 = 同一本;
-        // 分卡靠事件里的 `rank` 维,不靠两本账)。rank1 在**任何分配之前**接管。
+        // 分卡靠事件里的 `rank` 维,不靠两本账)。
+        //
+        // ⚠️ **合流必须在装载之前**(2026-10-20 定谳):装载即发事件(0.8B 实测
+        // 312 条)⇒ 事后接管会把这批事件丢进孤儿账(后续归还全是幽灵)。
+        // 调用方式 = `Engine::new_with_ledger(cfg1, rank0.ledger_cell(), 1)`;
+        // 此处这次 adopt 是**幂等复核**(同一本书 ⇒ 零事件丢失风险 ⇒ 放行),
+        // 未按纪律构造的调用方在这里**响亮拒**。
         face1.set_dev_rank(1);
         face1
             .adopt_ledger(owl_store::ledger_entry(&cell0))
-            .map_err(|e| ModelError::Msg(format!("TP rank1 事件账合流失败:{e}")))?;
+            .map_err(|e| {
+                ModelError::Msg(format!(
+                    "TP rank1 事件账合流失败:{e}\n  ⇒ 修法:rank1 必须**装载前**用 \
+                     `Engine::new_with_ledger(cfg1, rank0.ledger_cell(), 1)` 构造 \
+                     (装载即发事件,boot 期判据容不下事后接管)"
+                ))
+            })?;
         owl_shared::log_info!("tp", "事件账:两 rank 合流到同一本(rank 维区分卡)");
         let (staging0, staging1) =
             handshake_staging(&mut face0, &mut face1, &caps0.uuid, &caps1.uuid, layout, opts).await?;
@@ -531,7 +549,12 @@ impl TpEngine<GpuClient> {
         face1.set_dev_rank(1);
         face1
             .adopt_ledger(owl_store::ledger_entry(&cell0))
-            .map_err(|e| ModelError::Msg(format!("同卡档 rank1 事件账合流失败:{e}")))?;
+            .map_err(|e| {
+                ModelError::Msg(format!(
+                    "同卡档 rank1 事件账合流失败:{e}\n  ⇒ 修法:rank1 必须**装载前**用 \
+                     `Engine::new_with_ledger(cfg1, rank0.ledger_cell(), 1)` 构造"
+                ))
+            })?;
         let uuid = caps0.uuid.clone();
         let (staging0, staging1) =
             handshake_staging(&mut face0, &mut face1, &uuid, &uuid, layout, TpOpts::default())

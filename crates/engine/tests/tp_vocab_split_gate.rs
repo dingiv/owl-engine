@@ -112,7 +112,7 @@ async fn run_arm(dir: &Path, oa: usize, ob: usize, chunk: usize, vsplit: bool) -
         .load_qwen38_27b_awq(dir, dir, QuantPlan::F16, QuantPlan::W4A16Awq)
         .await
         .expect("rank0 分片装载");
-    let mut e1 = Engine::new(cfg_of(ob, chunk)).expect("engine(r1)");
+    let mut e1 = Engine::new_with_ledger(cfg_of(ob, chunk), e0.ledger_cell(), 1).expect("engine(r1)");
     let m1 = e1
         .loader()
         .slice(1, 2)

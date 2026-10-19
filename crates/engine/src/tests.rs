@@ -4012,6 +4012,192 @@ pub async fn gpu_decode_marginal_bench() {
     // 旋钮已显式化,无 env 清场需要
 }
 
+/// **int8 头精度门**(P1.5-a,2026-10-20;用户口径:top-1 + 贪心逐 token)。
+///
+/// 同 prompt / greedy / 同 seed,`head_plan = F16` vs `I8W` 的**生成 token 序列**
+/// 逐位比对 —— **token 级**,不吃 detokenizer(后者在本 head 上会把字节尾截掉)。
+/// 判据:一致率 ≥ 0.95(逐 token 计数);长序列按需 `OWL_I8_HEAD_N`(缺省 48)。
+///
+/// # 两进程协议(`OWL_I8_HEAD_ARM`)
+///
+/// **为什么必须两进程**:同进程连跑两臂 = 两次 27B 装载,第二臂被 VRAM 池守卫
+/// 响亮拒(`PoolExhausted`:驱动 free 897MiB / 池 reserved 18816MiB —— 释放与
+/// 驱动回收不同步,不是漏 free)。
+///
+/// ```bash
+/// # 臂 1(bf16 头),臂 2(int8 头),然后比对(比对不需要卡)
+/// OWL_TEST_DEVICE=01:00.0 OWL_I8_HEAD_ARM=f16 cargo test -p owl-engine --test engine.e2e -- gpu_head_int8_gate --nocapture
+/// OWL_TEST_DEVICE=01:00.0 OWL_I8_HEAD_ARM=i8  cargo test -p owl-engine --test engine.e2e -- gpu_head_int8_gate --nocapture
+/// OWL_I8_HEAD_ARM=compare                     cargo test -p owl-engine --test engine.e2e -- gpu_head_int8_gate --nocapture
+/// ```
+/// 臂文件:`$OWL_I8_HEAD_OUT`(缺省 `/tmp/owl-i8head-<arm>.txt`)。
+pub async fn gpu_head_int8_gate() {
+    let arm = owl_shared::env_reader::str("OWL_I8_HEAD_ARM").unwrap_or_default();
+    let n: usize = owl_shared::env_reader::parse_or("OWL_I8_HEAD_N", 48);
+    let art = |a: &str| -> std::path::PathBuf {
+        owl_shared::env_reader::str("OWL_I8_HEAD_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(format!("/tmp/owl-i8head-{a}.txt")))
+    };
+    // ── 比对臂(零 GPU):读两臂 token 文件 → 一致率 ─────────────────
+    if arm == "compare" {
+        let read = |a: &str| -> Vec<(String, Vec<u32>)> {
+            std::fs::read_to_string(art(a))
+                .unwrap_or_else(|e| panic!("读 {a} 臂失败({}):{e} —— 先跑两臂", art(a).display()))
+                .lines()
+                .filter_map(|l| {
+                    let (p, rest) = l.split_once('\t')?;
+                    Some((p.to_string(), rest.split_whitespace().filter_map(|t| t.parse().ok()).collect()))
+                })
+                .collect()
+        };
+        let (a, b) = (read("f16"), read("i8"));
+        assert_eq!(a.len(), b.len(), "两臂 prompt 数不等");
+        let (mut agree, mut total, mut exact) = (0usize, 0usize, 0usize);
+        for ((pa, ta), (_pb, tb)) in a.iter().zip(b.iter()) {
+            let same = ta.iter().zip(tb.iter()).filter(|(x, y)| x == y).count();
+            let first = ta.iter().zip(tb.iter()).position(|(x, y)| x != y);
+            if ta == tb { exact += 1; }
+            eprintln!(
+                "[i8head] {} · len {} vs {} · 相同 {same} · 首个分歧 {first:?}",
+                pa.chars().take(24).collect::<String>(),
+                ta.len(), tb.len()
+            );
+            agree += same;
+            total += ta.len().max(tb.len());
+        }
+        let rate = agree as f64 / total.max(1) as f64;
+        eprintln!(
+            "[i8head] **token 一致率 = {rate:.4}**({agree}/{total});逐字全等 {exact}/{} 条 ⇒ {}",
+            a.len(),
+            if rate >= 0.95 { "过门(≥0.95)" } else { "✗ 未过" }
+        );
+        assert!(rate >= 0.95, "int8 头精度门未过({rate:.4} < 0.95)");
+        return;
+    }
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+        eprintln!("skip: ckpt:27b-awq 未设");
+        return;
+    };
+    async fn gen(
+        ordinal: usize,
+        dir: &str,
+        plan: owl_models::module::QuantPlan,
+        prompt: &str,
+        n: usize,
+    ) -> Vec<u32> {
+        let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
+        knobs.gdn_slots = 1;
+        knobs.snap_max = 1;
+        knobs.prefix_cache = false;
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 256,
+            prefill_chunk: 32,
+            knobs,
+        })
+        .expect("构造");
+        let loaded = engine
+            .loader()
+            .load_qwen38_27b_awq(
+                std::path::Path::new(dir),
+                std::path::Path::new(dir),
+                plan,
+                owl_models::module::QuantPlan::W4A16Awq,
+            )
+            .await
+            .expect("装载");
+        let mut running = engine.run(loaded).await.expect("装配");
+        let (_sid, id) = running.submit_session(Some(7), prompt, n).expect("submit");
+        let _ = drive_turn(&mut running, id).await;
+        let toks = running.bank.sessions.get(7).map(|s| s.tokens.clone()).unwrap_or_default();
+        drop(running);
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        toks
+    }
+    let prompts = [
+        "用五十字介绍长城。",
+        "一个水池有甲乙两个进水管，甲管单独注满需要 6 小时，乙管单独注满需要 4 小时。两管同时打开，多少小时可以注满？",
+        "用 Rust 写一个求中位数的函数。",
+    ];
+    // ── 单臂模式(推荐;两进程各自一次装载)────────────────────────────
+    if arm == "f16" || arm == "i8" {
+        let plan = if arm == "i8" {
+            owl_models::module::QuantPlan::I8W
+        } else {
+            owl_models::module::QuantPlan::F16
+        };
+        // **一次装载跑全部 prompt**(进程内第二次 27B 装载必被池守卫拒;
+        // 设备内存从不 Free,见入口注释的挂账)。
+        let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
+        knobs.gdn_slots = 1;
+        knobs.snap_max = 1;
+        knobs.prefix_cache = false;
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 256,
+            prefill_chunk: 32,
+            knobs,
+        })
+        .expect("构造");
+        let loaded = engine
+            .loader()
+            .load_qwen38_27b_awq(
+                std::path::Path::new(&dir),
+                std::path::Path::new(&dir),
+                plan,
+                owl_models::module::QuantPlan::W4A16Awq,
+            )
+            .await
+            .expect("装载");
+        let mut running = engine.run(loaded).await.expect("装配");
+        let mut out = String::new();
+        for (i, p) in prompts.iter().enumerate() {
+            let sid = 7 + i as u64;
+            let (_s, id) = running.submit_session(Some(sid), *p, n).expect("submit");
+            let _ = drive_turn(&mut running, id).await;
+            let t = running.bank.sessions.get(sid).map(|s| s.tokens.clone()).unwrap_or_default();
+            eprintln!(
+                "[i8head] {arm} 臂完成:{:?} → {} tok",
+                p.chars().take(16).collect::<String>(),
+                t.len()
+            );
+            out.push_str(&format!(
+                "{}\t{}\n",
+                p.replace('\t', " "),
+                t.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")
+            ));
+        }
+        drop(running);
+        let path = art(arm.as_str());
+        std::fs::write(&path, out).expect("写 token 文件");
+        eprintln!("[i8head] {arm} 臂 token 落盘:{}(比对 = OWL_I8_HEAD_ARM=compare)", path.display());
+        return;
+    }
+
+    // ── 缺省:同进程两臂(历史上会被 VRAM 池守卫拒;留作对照)────────
+    eprintln!("[i8head] 未设 OWL_I8_HEAD_ARM ⇒ 同进程两臂(易被 PoolExhausted 拒;推荐两进程)");
+    let (mut agree, mut total) = (0usize, 0usize);
+    for (i, p) in prompts.iter().enumerate() {
+        let a = gen(ordinal, &dir, owl_models::module::QuantPlan::F16, p, n).await;
+        let b = gen(ordinal, &dir, owl_models::module::QuantPlan::I8W, p, n).await;
+        let same = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+        let first = a.iter().zip(b.iter()).position(|(x, y)| x != y);
+        eprintln!("[i8head] #{i} len {} vs {} · 相同 {same} · 首个分歧 {first:?}", a.len(), b.len());
+        agree += same;
+        total += a.len().max(b.len());
+    }
+    let rate = agree as f64 / total.max(1) as f64;
+    eprintln!(
+        "[i8head] **token 一致率 = {rate:.4}**({agree}/{total})⇒ {}",
+        if rate >= 0.95 { "过门(≥0.95)" } else { "✗ 未过" }
+    );
+}
+
 // B4 自适应降级态机(§6.24):纯转移函数逐分支
 #[test]
 fn spec_degrade_transition_branches() {

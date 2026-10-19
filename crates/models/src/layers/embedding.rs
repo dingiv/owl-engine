@@ -22,6 +22,9 @@ pub struct Embedding {
     /// (W4A16Awq:装载源 F16 兕底 = 现场RTN int4;HyperQwen 实证
     /// lm_head int4 +0.6%PPL/GSM8K 不变,推翻旧“输出头不量化”裁决)
     lm_head: Option<Linear>,
+    /// **int8 头**(P1.5-a;`QuantPlan::I8W` ⇒ 本槽在场、`lm_head` 为 None):
+    /// `q i8 [rows, k]` 行主 + `s f32 [rows]`(装载期现算,见 `rtn_i8_row_sym`)
+    head_i8: Option<HeadI8>,
     d_dim: usize,
     vocab: usize,
     /// **GGUF 量化表臂**(tied + 量化表;设计 §11.5 ②):`Some` ⇒ 槽是
@@ -31,11 +34,19 @@ pub struct Embedding {
     gguf_ty: Option<GgmlTy>,
 }
 
+/// int8 lm_head 的两块(行数随词表切 ⇒ 与 `head_vocab` 同源)
+pub struct HeadI8 {
+    q: Weight,
+    s: Weight,
+    rows: usize,
+    rule: crate::plan::rules::WeightRule,
+}
+
 impl Embedding {
     /// 准备容器(局部键 "weight":C10 前缀源下 →
     /// `{base}.embed_tokens.weight`;单槽,tied 经 nt matmul 复用)
     pub fn new(vocab: usize, d_dim: usize) -> Embedding {
-        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: None, d_dim, vocab, gguf_ty: None }
+        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: None, head_i8: None, d_dim, vocab, gguf_ty: None }
     }
 
     /// **tied + 计划定形**(2026-10-19 刀 7g):`QuantPlan::Gguf(ty)` ⇒ 槽 = 块字节
@@ -95,13 +106,35 @@ impl Embedding {
 
     /// **untied + 词表切**(P1.1):embed 表**全量**,lm_head 只建 `head_vocab` 行。
     pub fn new_untied_head(vocab: usize, head_vocab: usize, d_dim: usize, plan: QuantPlan) -> Embedding {
+        // int8 头(§72/§73):不进 `Linear`(见 QuantPlan::I8W 的裁决注记)
+        if matches!(plan, QuantPlan::I8W) {
+            let rule = if head_vocab < vocab {
+                crate::plan::rules::WeightRule::UniformCol
+            } else {
+                crate::plan::rules::WeightRule::Replicate
+            };
+            let head_i8 = Some(HeadI8 {
+                q: Weight::new_typed("i8q", vec![head_vocab, d_dim], crate::tensor::Dtype::I8),
+                s: Weight::new_typed("i8s", vec![head_vocab], crate::tensor::Dtype::F32),
+                rows: head_vocab,
+                rule,
+            });
+            return Embedding {
+                w: Weight::new("weight", vec![vocab, d_dim]),
+                lm_head: None,
+                head_i8,
+                d_dim,
+                vocab,
+                gguf_ty: None,
+            };
+        }
         let head = Linear::new("lm_head", head_vocab, d_dim, plan);
         let head = if head_vocab < vocab {
             head.with_tp_rule(crate::plan::rules::WeightRule::UniformCol)
         } else {
             head
         };
-        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: Some(head), d_dim, vocab, gguf_ty: None }
+        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: Some(head), head_i8: None, d_dim, vocab, gguf_ty: None }
     }
 
     /// **untied + 词表切 + 表/头两个独立计划**(并集:GGUF 27B 的真实形态 ——
@@ -120,6 +153,9 @@ impl Embedding {
 
     /// 头部 TP 规则(**只读**;判据用;tied = None ⇒ 取 embed 表规则 = Replicate)
     pub fn head_rule(&self) -> crate::plan::rules::WeightRule {
+        if let Some(h) = &self.head_i8 {
+            return h.rule;
+        }
         match &self.lm_head {
             Some(lin) => lin.tp_rule(),
             None => crate::plan::rules::WeightRule::Replicate,
@@ -128,6 +164,9 @@ impl Embedding {
 
     /// 头部输出行数(= 本 rank 的 logits 宽度;tied = 词表全量)
     pub fn head_vocab(&self) -> usize {
+        if let Some(h) = &self.head_i8 {
+            return h.rows;
+        }
         match &self.lm_head {
             Some(lin) => lin.out_dim(),
             None => self.w.decl().shape[0],
@@ -139,6 +178,24 @@ impl Embedding {
     /// 经 [`crate::module::KeyConvention::head_key`] 改写 —— **第 4 类键**:
     /// HF 叫 `lm_head.weight`,GGUF 叫 `output.weight`)。
     pub fn layout_lm_head(&self, ctx: &LoaderCtx) -> Option<LoaderOps> {
+        if let Some(h) = &self.head_i8 {
+            // int8 头:只声明两个**派生键**(源 = 检查点 bf16 `lm_head.weight`,
+            // 由 `formats::awq_build` 的 F16 臂现算)⇒ 不驻留 bf16 块。
+            // 键 = **局部键**(main 的新约定:全键由调用方 `KeyConvention::head_key`
+            // 改写;`lm_head.i8q/.i8s` 不是 `lm_head` 本身 ⇒ 原样直通,
+            // 正是 AWQ 源认的派生键)。
+            //
+            // **层声明规则覆盖**(与 `Linear::layout` 同律):派生键的键表默认
+            // 是 `Replicate`(lm_head 不切),词表切档必须显式覆盖成 `UniformCol`
+            // —— 否则两 rank 读同一段(高半 = 低半的复制,实测撞过)。
+            let ops =
+                h.q.layout_as("lm_head.i8q", ctx).chain(h.s.layout_as("lm_head.i8s", ctx));
+            return Some(if h.rule != crate::plan::rules::rule_of("lm_head") {
+                ops.with_rule(h.rule)
+            } else {
+                ops
+            });
+        }
         self.lm_head.as_ref().map(|lin| lin.layout(ctx))
     }
 
@@ -183,6 +240,26 @@ impl Embedding {
         // 早先拿 `gguf_ty` 当判据 ⇒ **untied 的 GGUF 模型把头算成了
         // `hidden @ token_embdᵀ`**(静默错值:首 token 直接垃圾,而权重面全对,
         // 极难归因;4B tied 档照不到这条雷)。
+        // int8 头:GEMV(aux = [rows, cols, tokens];输出 [tokens, rows],dtype 随激活)
+        if let Some(h) = &self.head_i8 {
+            let sh = hidden.shape();
+            let tokens: usize = sh[..sh.len() - 1].iter().product();
+            // **激活 dtype 定实例**(2026-10-20:单一 op_id 会撞 dtype 守门 ——
+            // 执行 dtype = f16 的档(W4A16Awq/F16 27B)拿到 bf16 核 = 输出域不符)
+            let kern = match hidden.dtype {
+                crate::tensor::Dtype::BF16 => crate::ops::SemanticKernel::GemvI8wBf16,
+                crate::tensor::Dtype::F16 => crate::ops::SemanticKernel::GemvI8wF16,
+                other => panic!("int8 头:GEMV 输出 dtype 只可能是 f16/bf16,实得 {other:?}"),
+            };
+            return TensorOps::call(kern)
+                .arg(&h.q.decl())
+                .arg(&h.s.decl())
+                .arg(hidden)
+                .arg_i32(h.rows as i32)
+                .arg_i32(self.d_dim as i32)
+                .aux(&[h.rows, self.d_dim, tokens])
+                .with_shape(hidden.dtype, vec![tokens, h.rows]);
+        }
         match &self.lm_head {
             // untied:独立头(marlin / GGUF 量化 / f16 三臂都在 `Linear` 里)
             Some(lin) => lin.forward_inner(hidden),

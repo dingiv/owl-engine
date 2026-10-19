@@ -34,26 +34,40 @@
 // ============================================================================
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #define OWL_GEMV_I8W_WARPS 8
 #define OWL_GEMV_I8W_CHUNK 16  // 每个 lane 一次读 16 B = 16 个 int8
 
-extern "C" __global__ void owl_gemv_i8w_f16(
+// ---- 激活 dtype 桥(两个入口共用同一体;只换"激活怎么转 float / 怎么写回")----
+template <typename T> __device__ __forceinline__ float owl_i8w_to_f(T x);
+template <> __device__ __forceinline__ float owl_i8w_to_f<__half>(__half x) { return __half2float(x); }
+template <> __device__ __forceinline__ float owl_i8w_to_f<__nv_bfloat16>(__nv_bfloat16 x) {
+    return __bfloat162float(x);
+}
+template <typename T> __device__ __forceinline__ T owl_i8w_from_f(float x);
+template <> __device__ __forceinline__ __half owl_i8w_from_f<__half>(float x) { return __float2half(x); }
+template <> __device__ __forceinline__ __nv_bfloat16 owl_i8w_from_f<__nv_bfloat16>(float x) {
+    return __float2bfloat16(x);
+}
+
+template <typename T>
+__device__ __forceinline__ void owl_gemv_i8w_body(
     const signed char* __restrict__ w,  // [rows, cols] int8(行主)
     const float* __restrict__ scale,    // [rows] per-row 对称量化尺度
-    const __half* __restrict__ x,       // [tokens, cols]
+    const T* __restrict__ x,            // [tokens, cols]
     const int rows,
     const int cols,
-    __half* __restrict__ y) {           // [tokens, rows](末参 = 输出)
-    extern __shared__ __half xs[];      // cols 个 f16(块内共用)
+    T* __restrict__ y) {                // [tokens, rows](末参 = 输出)
+    extern __shared__ unsigned char xs_raw[];  // cols 个 T(块内共用)
+    T* xs = reinterpret_cast<T*>(xs_raw);
     const int token = blockIdx.y;
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
     const int row = blockIdx.x * OWL_GEMV_I8W_WARPS + warp;
 
-    // x 行 → shared(块内所有 warp 共用;一次)
-    const __half* xrow = x + (size_t)token * cols;
+    const T* xrow = x + (size_t)token * cols;
     for (int j = tid; j < cols; j += (int)blockDim.x) xs[j] = xrow[j];
     __syncthreads();
 
@@ -68,12 +82,27 @@ extern "C" __global__ void owl_gemv_i8w_f16(
         const signed char* b = reinterpret_cast<const signed char*>(&wv);
 #pragma unroll
         for (int i = 0; i < OWL_GEMV_I8W_CHUNK; ++i) {
-            const float xv = __half2float(xs[base + i]);
+            const float xv = owl_i8w_to_f<T>(xs[base + i]);
             acc = __fmaf_rn((float)b[i], xv, acc);
         }
     }
     acc *= s;
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
-    if (lane == 0) y[(size_t)token * rows + row] = __float2half(acc);
+    if (lane == 0) y[(size_t)token * rows + row] = owl_i8w_from_f<T>(acc);
+}
+
+extern "C" __global__ void owl_gemv_i8w_f16(
+    const signed char* __restrict__ w, const float* __restrict__ scale,
+    const __half* __restrict__ x, const int rows, const int cols,
+    __half* __restrict__ y) {
+    owl_gemv_i8w_body<__half>(w, scale, x, rows, cols, y);
+}
+
+// bf16 激活变体(**生产 lm_head 走这条**:模型激活是 bf16,避免两次 cast 节点)
+extern "C" __global__ void owl_gemv_i8w_bf16(
+    const signed char* __restrict__ w, const float* __restrict__ scale,
+    const __nv_bfloat16* __restrict__ x, const int rows, const int cols,
+    __nv_bfloat16* __restrict__ y) {
+    owl_gemv_i8w_body<__nv_bfloat16>(w, scale, x, rows, cols, y);
 }

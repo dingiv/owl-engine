@@ -766,6 +766,9 @@ pub struct Loan {
     /// **是否在池内**(P0-2:同一块二次入池 = 别名事故 ⇒ 响亮拒)。
     /// 入池置 true;池取命中置 false;真归还随登记一起删。
     pub pooled: bool,
+    /// **已被池上限顶出、等待真归还**(2026-10-20)。置位后本次 free 必须
+    /// **真还驱动**(不能再入池,否则同一块在池/待还两态间打转)。
+    pub evicted: bool,
 }
 
 /// **共享账本单元** = 三层账(决策面)+ 出借登记(事件面)。
@@ -927,8 +930,32 @@ impl LedgerBook {
     /// 顶出策略 = **FIFO 最旧**(池是"复用缓存",旧块留着只是白占;上限内保留
     /// 最近释放的,与 CPU cache 的 LRU 直觉一致)。计数入 `pool_evicted`。
     pub fn pool_release(&mut self, id: u64) -> Vec<u64> {
+        self.pool_release_on(id, None)
+    }
+
+    /// **带调用面 rank 的归还**(防呆门;2026-10-20):`rank` = 发起 free 的句柄的设备序。
+    ///
+    /// 块只能在**它自己那个 server** 的块表里被 free;与 `Loan.rank` 不符 ⇒
+    /// **响亮记错**(`hook_fail` + stderr)并返回**空**(不真还)—— 因为错面真还
+    /// 必然打空(服务器静默返回 0),那正是 §79 那条 ±2.8 GiB/turn 的泄漏。
+    /// 留在账上 ⇒ turn 收尾的**逐 rank 兜底**会把它还到正确的面
+    /// (错面 free 降级为"延迟还",而不是"静默丢")。
+    pub fn pool_release_on(&mut self, id: u64, rank: Option<u8>) -> Vec<u64> {
         let Some(l) = self.open.get(&id).cloned() else { return vec![id] };
+        if let Some(rk) = rank {
+            if l.rank != rk {
+                self.fail(
+                    "跨 rank 归还(块只能在自己的 server 上 free)",
+                    format!("id={id} name={} 块属 rank{} 但由 rank{rk} 发起", l.name, l.rank),
+                );
+                return Vec::new();
+            }
+        }
         if !l.kind.poolable() {
+            return vec![id];
+        }
+        // 池上限顶出过的块 = **待真还**;再入池会让它永远在"池↔待还"之间打转
+        if l.evicted {
             return vec![id];
         }
         // **P0-2**:同一块二次入池 ⇒ 池里会有两份 ⇒ 两个未来 alloc 拿到同一 id(别名)。
@@ -940,12 +967,16 @@ impl LedgerBook {
         let key = (l.rank, l.kind, l.bytes);
         // 上限:池内字节 + 本块 > cap ⇒ 顶出最旧块(跨尺寸类也顶,先保总量)。
         // **所有**被顶出的块都要交回调用方(见函数头注的 2026-10-20 定谳)。
-        let mut evicted = Vec::new();
+        // ⚠️ **只顶同 rank**(2026-10-20,§79):池是**两 rank 共用**的一本账,而块的 free
+        // 只能打到**它自己那个 server** —— 跨 rank 顶出 ⇒ 调用方拿别的面去 free ⇒
+        // 服务器块表里找不到 ⇒ **静默漏**(实测 `free: 0/1` ≈2048 次/轮,主体正是
+        // `owl_add_f16`/`owl_fused_add_rmsnorm_f16` 这些高频残留流块)。
+        let mut evicted: Vec<u64> = Vec::new();
         while self.pool_bytes() + l.bytes > self.pool_cap {
             let Some(old_key) = self
                 .pool
                 .iter()
-                .find(|(_, v)| !v.is_empty())
+                .find(|((rk, _, _), v)| *rk == l.rank && !v.is_empty())
                 .map(|(k, _)| *k)
             else {
                 break;
@@ -954,6 +985,12 @@ impl LedgerBook {
                 if let Some(old) = v.first().copied() {
                     v.remove(0);
                     self.pool_evicted = self.pool_evicted.saturating_add(1);
+                    // 出池待还:清 pooled、置 evicted(否则下一次 free 会把它当
+                    // "双次入池"拒掉 ⇒ 既没还又留账 —— 实测就是这么冒出来的)
+                    if let Some(m) = self.open.get_mut(&old) {
+                        m.pooled = false;
+                        m.evicted = true;
+                    }
                     evicted.push(old);
                     continue;
                 }
@@ -1017,9 +1054,16 @@ impl LedgerBook {
 
     /// **池排空**(N6 压力路径):清空池并**交出全部 id** —— 调用方负责真归还驱动
     /// (逐条 `FreeEvent` 销账)。返回的 id 顺序 = 池内 LIFO 逆序(无语义)。
-    pub fn pool_drain(&mut self) -> Vec<u64> {
-        let ids: Vec<u64> = self.pool.values_mut().flat_map(|v| v.drain(..)).collect();
-        self.pool.clear();
+    /// **池排空**(N6):只排**本 rank** 的条目 —— 块只能在自己那个 server 上 free
+    /// (跨 rank 返回的 id 必然打空,见 `pool_release` 的同款注记)。
+    pub fn pool_drain(&mut self, rank: Option<u8>) -> Vec<u64> {
+        let mut ids: Vec<u64> = Vec::new();
+        for ((rk, _, _), v) in self.pool.iter_mut() {
+            if rank.is_none_or(|r| *rk == r) {
+                ids.extend(v.drain(..));
+            }
+        }
+        self.pool.retain(|_, v| !v.is_empty());
         if !ids.is_empty() {
             self.pool_drained = self.pool_drained.saturating_add(1);
         }
@@ -1057,6 +1101,22 @@ impl LedgerBook {
         self.pool_evicted
     }
 
+    /// **该 id 是否有在借登记**(账本审计探针;`OWL_LEDGER_AUDIT`)。
+    pub fn has_loan(&self, id: u64) -> bool {
+        self.open.contains_key(&id)
+    }
+
+    /// **借出状态**(`Some((rank, pooled))`);`None` = 无登记。
+    /// 消费点 = `DeviceHandle::free` 的归还前置校验(幽灵/双 free/跨 rank 三判据)。
+    pub fn loan_state(&self, id: u64) -> Option<(u8, bool)> {
+        self.open.get(&id).map(|l| (l.rank, l.pooled))
+    }
+
+    /// 在借块的点名(硬错误自解释)
+    pub fn loan_name(&self, id: u64) -> Option<String> {
+        self.open.get(&id).map(|l| l.name.clone())
+    }
+
     /// **在借清单**(逐条带 **id 与点名**;N4"未归还清单"的原料)。
     ///
     /// `owner_filter`: `None` = 全部;`Some(f)` = 只留 `f(owner)` 为真的那些
@@ -1079,6 +1139,53 @@ impl LedgerBook {
                 .then(a.0.cmp(&b.0))
         });
         out
+    }
+
+    /// **按归属强制结清**(N4 兜底释放的**唯一 store 钩子**;2026-10-20)。
+    ///
+    /// 语义:把 `owner` 名下**仍开着**的块整批结清 ——
+    /// 1. 删出借登记(out of `open`)并**出三层账**(与 `on_free` 同式);
+    /// 2. **摘池索引**(池内块 `pooled = true` 也在内:池成员 = 无活持有者,
+    ///    归还驱动是安全的,只是丢了下次复用);
+    /// 3. 返回 `(id 清单, 字节数)` 交调用方**真归还驱动**(结清口径 free:
+    ///    账已结清 ⇒ 不再补 `FreeEvent`)。
+    ///
+    /// 为什么需要:**turn 收尾清点只报告不处置**时,任何漏 free 的调用点都会让
+    /// 每 turn 掉一截显存(实测 27B 4k prefill ≈ 0.9 GiB 账内 + 更多账外,§78)。
+    /// 这是"兜底",不是"代替调用点修 bug" —— 引擎侧仍会先 WARN 报名字。
+    /// `rank` = **块的归属面**(哪张卡/哪个 server 的块表);`None` = 不分(只在单卡档用)。
+    ///
+    /// ⚠️ 必须分:两 rank 共用一本账(TP),`Turn(t)` 名下同时挂着两卡的块;
+    /// 把 rank1 的 id 丢给 rank0 的 server ⇒ 那边块表里找不到 ⇒ **静默丢掉**
+    /// (实测 `free: 576/1010 块归池(账目不平)`,漏掉的那 434 个就是 rank1 的)。
+    pub fn drain_owner(
+        &mut self,
+        owner: owl_iface::handle::Owner,
+        rank: Option<u8>,
+    ) -> (Vec<u64>, usize) {
+        let ids: Vec<u64> = self
+            .open
+            .iter()
+            .filter(|(_, l)| l.owner == owner && rank.is_none_or(|r| l.rank == r))
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() {
+            return (ids, 0);
+        }
+        let mut bytes = 0usize;
+        for id in &ids {
+            if let Some(l) = self.open.remove(id) {
+                bytes += l.bytes;
+                let _ = self.tiers.remove_owned(l.owner, l.tier, l.kind, l.bytes);
+                if l.pooled {
+                    for v in self.pool.values_mut() {
+                        v.retain(|x| x != id);
+                    }
+                }
+            }
+        }
+        self.pool.retain(|_, v| !v.is_empty());
+        (ids, bytes)
     }
 
     /// **逐 rank 的出借 id 集**(与块账房做**全等门**的原料;按 rank 升序)。
@@ -1105,6 +1212,23 @@ impl LedgerBook {
     }
 
     /// 记账失败:计数 + 一条裸日志(store 无日志依赖 ⇒ eprintln;机读面 = `hook_fail`)。
+    /// `OWL_LEDGER_DOUBLE=1` ⇒ 双 free 现场打调用栈(前 3 次;诊断探针,零行为)。
+    fn double_free_trace(id: u64, name: &str) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        if std::env::var_os("OWL_LEDGER_DOUBLE").is_none() {
+            return;
+        }
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n > 3 {
+            return;
+        }
+        eprintln!(
+            "[double-free #{n}] id={id} name={name}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+
     fn fail(&mut self, what: &str, detail: String) {
         self.hook_fail = self.hook_fail.saturating_add(1);
         eprintln!("[store.ledger] {what} 未入账:{detail}");
@@ -1131,6 +1255,7 @@ impl LedgerBook {
                         bytes: ev.bytes,
                         name: ev.name.clone(),
                         pooled: false,
+                        evicted: false,
                     },
                 );
             }
@@ -1256,11 +1381,30 @@ impl owl_iface::handle::AllocLedger for LedgerEntry {
     fn pool_release(&mut self, id: u64) -> Vec<u64> {
         book_lock(&self.book).pool_release(id)
     }
+    fn pool_release_on(&mut self, id: u64, rank: Option<u8>) -> Vec<u64> {
+        book_lock(&self.book).pool_release_on(id, rank)
+    }
+    fn loan_state(&mut self, id: u64) -> Option<(u8, bool)> {
+        book_lock(&self.book).loan_state(id)
+    }
+    fn loan_name(&mut self, id: u64) -> Option<String> {
+        book_lock(&self.book).loan_name(id)
+    }
+    fn validates(&self) -> bool {
+        true
+    }
     fn on_free(&mut self, ev: &owl_iface::handle::FreeEvent) {
         book_lock(&self.book).on_free(ev);
     }
     fn on_move(&mut self, ev: &owl_iface::handle::MoveEvent) {
         book_lock(&self.book).on_move(ev);
+    }
+
+    /// 账本身份令牌 = **书本体指针**(同一本 `SharedLedger` ⇒ 同一个值;
+    /// `ledger_entry()` 每次新建的是"cell 包装",所以比 cell 指针没用 ——
+    /// 必须往里看一层,这是 TP 幂等接管的唯一判据)。
+    fn book_token(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.book) as usize
     }
 }
 

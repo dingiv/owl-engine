@@ -273,6 +273,28 @@ impl KernelSpec for Topk16F16 {
 pub static NARROW_STRIDED_F16: KernelMeta = meta_of::<NarrowStridedF16>();
 pub static GEMV_DUAL_F16: KernelMeta = meta_of::<GemvDualF16>();
 pub static GEMV_I8W_F16: KernelMeta = meta_of::<GemvI8wF16>();
+
+/// `owl_gemv_i8w_bf16` —— 同上的 **bf16 激活**变体(生产 lm_head 走这条:
+/// 模型激活是 bf16,省掉两次 cast 节点;语义/几何与 f16 版逐字相同)
+pub struct GemvI8wBf16;
+
+impl KernelSpec for GemvI8wBf16 {
+    const ENTRY: &'static str = "owl_gemv_i8w_bf16";
+    const SRC: &'static str = "cu/elems/gemv_i8w_f16.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("w", Dtype::I8, 2),
+        Param::t_in("scale", Dtype::F32, 1),
+        Param::t_in("x", Dtype::BF16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::t_out("y", Dtype::BF16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static GEMV_I8W_BF16: KernelMeta = meta_of::<GemvI8wBf16>();
 pub static ADD_F16: KernelMeta = meta_of::<AddF16>();
 pub static ADD_BF16: KernelMeta = meta_of::<AddBf16>();
 pub static SIGMOID_F16: KernelMeta = meta_of::<SigmoidF16>();
@@ -716,6 +738,7 @@ pub static METAS: &[&KernelMeta] = &[
     &NARROW_STRIDED_F16,
     &GEMV_DUAL_F16,
     &GEMV_I8W_F16,
+    &GEMV_I8W_BF16,
     &ADD_F16,
     &ADD_BF16,
     &SIGMOID_F16,

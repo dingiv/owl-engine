@@ -340,6 +340,9 @@ pub fn resolve(req: OpReq) -> KernelPick {
             // aux = [rows_b, rows_a, cols, tokens]
             elems::gemv_dual(dt, ax(0), ax(1), ax(2), ax(3))
         }
+        // aux = [rows, cols, tokens](P1.5-a:int8 权重 lm_head)
+        "elems.gemv_i8w_bf16" => elems::gemv_i8w_bf16(ax(0), ax(1), ax(2)),
+        "elems.gemv_i8w_f16" => elems::gemv_i8w(ax(0), ax(1), ax(2)),
         "ops.narrow" => elems::narrow(dt),
         "ops.ts_stamp" => ops::ts_stamp(),
         "ops.argmax" => ops::argmax(),
@@ -1903,6 +1906,16 @@ pub mod elems {
     ///
     /// 一 warp 一行、**8 warp/块**(块内共用一份 x 行缓存,`smem = cols·2 B`);
     /// 每 lane 一次读 16 B(16 个 int8)⇒ 要求 `cols % 16 == 0`。
+    /// **bf16 激活**变体(生产 lm_head 用;几何与 f16 版逐字相同)
+    pub fn gemv_i8w_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        assert!(cols % 16 == 0, "gemv_i8w 要求 cols % 16 == 0(每 lane 16 B 对齐),得 {cols}");
+        KernelPick::of::<crate::ops::elems::GemvI8wBf16>(Shape {
+            grid: (rows.div_ceil(8) as u32, tokens as u32, 1),
+            block: (256, 1, 1),
+            smem: (cols * 2) as u32,
+        })
+    }
+
     pub fn gemv_i8w(rows: usize, cols: usize, tokens: usize) -> KernelPick {
         assert!(cols % 16 == 0, "gemv_i8w 要求 cols % 16 == 0(每 lane 16 B 对齐),得 {cols}");
         KernelPick::of::<crate::ops::elems::GemvI8wF16>(Shape {

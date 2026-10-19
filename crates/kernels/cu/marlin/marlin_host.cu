@@ -276,7 +276,12 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
     exec_config_t exec_cfg;
     thread_config_t thread_tfg;
     if (thread_k != -1 && thread_n != -1) {
-      thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
+      // ⚠️ 仅**显式配置**分支(thread_k/n 都给)读这个 env:用途是把 selector 的
+      // 小批档位表扫全(实例化表里 thread_n=64 / thread_k=64 只配 threads=128)。
+      // 生产(auto)路径不经过本分支 ⇒ 引擎行为零变化。
+      int th = default_threads;
+      if (const char* e = getenv("MARLIN_THREADS")) th = atoi(e);
+      thread_tfg = thread_config_t{thread_k, thread_n, th};
       exec_cfg = exec_config_t{1, thread_tfg};
       if (prob_n % thread_n != 0 || prob_k % thread_k != 0) return 4;
     } else {

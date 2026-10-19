@@ -205,6 +205,7 @@ async fn e2e_body() {
     run!(gpu_27b_raw_completion_diag);   // greedy + Dumb 草稿 + slab
     run!(gpu_decode_marginal_bench);     // greedy + slots1
     run!(gpu_batch_decode_bench_27b);    // B5.1 合批 decode 吞吐(27B,spec off)
+    run!(gpu_head_int8_gate);            // int8 头 ≡ bf16 头(token 级)
     run!(gpu_spec_identity_gate_27b);    // MTP 草稿
     run!(gpu_dflash2_identity_gate_27b); // DFlash2 草稿 + fp8 池
 

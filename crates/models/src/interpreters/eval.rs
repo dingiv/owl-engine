@@ -298,7 +298,13 @@ where
             (Err(e), _) => return Err(e),
         };
         let mut candidates = std::mem::take(&mut ctx.arena);
+        // **候选表去重**(2026-10-20):块 id 会被**池复用**(同一 eval 内先还后取)
+        // ⇒ 同一个 id 可能在 `arena` 里出现两次(前一条命 + 后一条命)。
+        // 契约是"归还清单里每块一次",重复发 = 双 free(现已被 `DeviceHandle`
+        // 硬拒并报错)。这里在出口处钉死。
         candidates.retain(|id| *id != root.id && ctx.arena_set.contains(id));
+        candidates.sort_unstable();
+        candidates.dedup();
         Ok((root, candidates))
     })
 }
@@ -424,6 +430,8 @@ where
                     let _ = ctx.flush_pool().await;
                     let mut cand: Vec<u64> = std::mem::take(&mut ctx.arena);
                     cand.retain(|id| ctx.arena_set.contains(id));
+                    cand.sort_unstable();
+                    cand.dedup();
                     if !cand.is_empty() {
                         let _ = ctx.face.free(&cand).await; // 回收失败不掩盖原错
                     }
@@ -469,6 +477,8 @@ where
         let mut candidates: Vec<u64> = std::mem::take(&mut ctx.arena);
         // `keep_roots = false`(副作用根口径)⇒ 根**也在候选里**(没人会再读它们)
         candidates.retain(|id| ctx.arena_set.contains(id) && (!keep_roots || !root_ids.contains(id)));
+        candidates.sort_unstable();
+        candidates.dedup();
         if !candidates.is_empty() {
             ctx.face.free(&candidates).await?;
         }
@@ -1294,6 +1304,12 @@ where
                         } else {
                             outcome(bid, bytes, None, 0);
                             ctx.arena_set.remove(&bid);
+                            // **释放后摘掉块计数**(2026-10-20):`block_users` 按**块**计、
+                            // 回收按**父边**递减 ⇒ 同一块被两个节点当父用(残差流常态)时
+                            // 计数先到 0,再来一条父边就会**二次 free**。
+                            // 不改变计数口径(那会牵动 liveness 四门),只把"已还"的块
+                            // 从表里摘掉 ⇒ 第二条父边落到 `NotTracked`(不计账、不还)。
+                            ctx.block_users.remove(&bid);
                             ctx.release_block(bid).await?;
                         }
                     } else {

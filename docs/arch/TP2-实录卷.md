@@ -5638,3 +5638,615 @@ lm_head 一处消费者**,单独一个槽 + 一个分派即可,且**回退 = 删
    **top-1 一致率 ≥99.9%** + **贪心 256 token 逐字一致**;不过 ⇒ 退到 **per-128 分组尺度**
    (误差降 ~2×,scale 表 0.5 MB → 20 MB);
 5. std 五点三轮(预期 1.76 → ~0.89 ms ⇒ decode **+4.3%**:49.4 → ~51.6 t/s)。
+
+---
+
+## 74. marlin m=1 的 81%:**不是 tiling、不是并行度,是 tile-perm 布局本身**(2026-10-20)
+
+### 74.1 把"换档位"这条路扫到底
+
+上一轮(§71.3)只扫了 `(thread_k, thread_n)`,而 FFI 把 `threads` 写死 256 ⇒ 实例化表里
+**只在 `threads=128` 下存在**的两档(`thread_n=64` / `thread_k=64`)根本没被扫到。
+补上 `threads`(台子侧 `MARLIN_THREADS`,**只作用于显式配置分支**,auto 生产路不经过),
+并同时 `MARLIN_NO_OVERRIDE=1`(否则本地 override 会把显式档改回 `{128,64,128}`):
+
+| 配置(thread_k, n, threads) | 34816×5120 | 5120×17408 | 16384×5120 | 5120×6144 |
+|---|---:|---:|---:|---:|
+| 128 / 128 / 256(= auto) | 660.7 | 629.0 | 632.2 | 549 |
+| 128 / **64** / 128 | 660.3 | 629.7 | 632.4 | — |
+| **64** / 128 / 128 | 660.3 | 629.5 | 632.7 | — |
+
+**逐点相同(±0.5 GB/s)** ⇒ **tile 形状与小批并行度都不是那 15% 的原因**。
+(顺带定谳一个测量坑:不加 `NO_OVERRIDE` 时,显式 `thread_k/n` 会被本地 override
+**静默改回**默认档 ⇒ 三档读出一模一样的数就是证据。)
+
+### 74.2 那 15% 从哪来:对照我们自己写的两个 GEMV
+
+| 读法 | 布局 | 有效带宽 |
+|---|---|---:|
+| lm_head bf16 gemv(cublas) | 线性 `[n, k]` | **724 GB/s(95%)** |
+| `owl_gemv_i8w_f16`(§72) | 线性 `[n, k]` i8 | **718.8 GB/s** |
+| **marlin(所有 tile)** | **tile-perm**(`(k/16, n·2)` i32 + 1024-项 `perm`) | **550–661 GB/s(73–87%)** |
+
+⇒ 机器能跑 720+,**marlin 的缺口来自布局的访问形状**,不是 DRAM、不是算力、不是并行度。
+
+### 74.3 于是只剩一条有收益的路:**读 marlin 布局 + 在寄存器里做 perm**
+
+§73 否掉的是"**按 nibble 查 1024 项表**"(16 B 数据配 32 次查表)。但 `perm` 是
+**纯算术**构造的(`repack::marlin_perm`:32×2×4×… + interleave `[0,2,4,6,1,3,5,7]`),
+不是随机表 ⇒ 有两条更便宜的等价实现:
+
+1. **纯算术求逆**(公式内联,每 nibble ~6 条 ALU;而本核的 ALU 预算有 40× 余量);
+2. **1 KB shared 常量表**(每 block 预载一次,之后按 lane/nibble 索引):
+   带宽需求 = 每 2 字节 1 次查表 ≈ 2.8 次/周期/SM,shared 吞吐(128 B/周期)绰绰有余。
+
+读法 = **一个 warp 读一整块 512 B 连续块**(= `[16k] × [64n]`,完全 coalesced),
+再用上面任一法把 32 个 nibble 归到各自的 (k,n) 上累加。**目标 ≥700 GB/s**
+(现在 613)⇒ 11.46 → ~10.0 ms ⇒ **decode +6~7%**;且**不需要第二份权重**
+(这正是 §73 双布局方案要换掉的东西)。
+
+判据与风险:①单位带宽 ≥700(`marlin_bw_bench` 同形状);②**数值同式**
+(同一份 int4 + 同 scale/zp,只差 fp32 累加序 ~1e-7);③门 = `tp_g8_gate` L1 + std。
+
+## 75. P1.5-a 落地到 TP2(2026-10-20)—— 两个真 bug + 生产 A/B **decode +9.5%**
+
+> 上一轮(§72–§74)只把 int8 头做到"单卡能跑、核 718.8 GB/s"。本轮把它接进
+> **双卡词表切**的生产档,顺带修掉一个把 TP2 起服全堵死的 trunk 回归。三件事的
+> 共同点:**判据都是"同值"**——两半 logits 同值、dtype 同值、账本同值。
+
+### 75.1 TL;DR
+
+| 面 | 修前 | 修后 |
+|---|---|---|
+| TP2 起服(任何档) | **必拒**:`adopt_ledger: 已发过 2221 条事件` | 起服 + 双 rank 图捕获 + std 全跑(0.8B 门:312 条事件那档也绿) |
+| int8 头 × f16 执行档 | **装配即拒**:`owl_gemv_i8w_bf16` 声明 BF16 实得 F16 | 双 op_id(`_f16`/`_bf16`),层侧按激活 dtype 选 |
+| int8 头 × 词表切 | **静谧错值**:两 rank 读同一段行(高半 = 低半复制) | 每 rank 本行区间(CPU 门 + GPU 运行期宽度/vs 双门) |
+| 精度(TP1 27B,N=48) | — | **344/344 = 100%**(3/3 prompt 逐 token 全等) |
+| 精度(TP2 词表切,N=256) | — | **744/768 = 96.9%**;唯一分歧步 = near-tie(margin **1.56e-2**) |
+| 生产 std(3080 对,@1024/256) | decode **45.09** t/s | decode **49.37** t/s(**+9.5%**);prefill/TTFT 不变 |
+
+### 75.2 bug ①:语义算子只有一个 `op_id` ⇒ 单一 dtype 实例
+
+现象:`QuantPlan::I8W` 在 **f16 执行档**(27B W4A16Awq 的本档)装配即拒 ——
+
+```
+[dtype 守门] kernel "owl_gemv_i8w_bf16" 声明输出为 BF16,实得 F16
+```
+
+根因:核有两颗(`GemvI8wF16`/`GemvI8wBf16`,同一 `SRC`、模板参数不同),
+但语义枚举只有 **一个** 变体、`op_id` 写死 `elems.gemv_i8w_bf16` ⇒ f16 档必撞。
+(先例在仓里就有:`elems.quant_int8_row_{f16,bf16}` = 两个 op_id。)
+
+修法(三处,与先例同形):
+1. `models/src/ops.rs`:枚举拆 `GemvI8wBf16` / `GemvI8wF16`(`elems.gemv_i8w_f16`);
+2. `kernels/src/driver.rs`:补 `"elems.gemv_i8w_f16" => elems::gemv_i8w(rows, cols, tokens)`;
+3. `layers/embedding.rs::lm_head_matmul`:**按 `hidden.dtype` 选**(bf16 ⇒ BF16 核,
+   f16 ⇒ F16 核;其它响亮 panic —— 头只有这两个档)。
+
+门:`models/src/ops.rs::gemv_i8w_selection_face_is_wired`(op_id → 核名 → 声明出 dtype,
+两档各一颗)。
+
+### 75.3 bug ②:派生键没进"切分链路"(**静默错值**,最险)
+
+现象:TP2 + 词表切 + int8 头,**装载绿、装配绿、生成连贯**,但把两 rank 的
+logits 拼起来做 top-2 诊断时:
+
+```
+top1=97237(27.1719)  top2=221397(27.1719)  margin=0.00e0    ← 221397 = 97237 + 124160
+```
+
+**高半 == 低半,逐位相同** ⇒ 后半词表全是错的(只是"看起来能生成")。
+
+根因两条(必须同时踩,故此前单卡门看不出来):
+1. `plan::rules::DERIVED_SUFFIXES` **漏 `.i8q` / `.i8s`** ⇒ `base_key` 不剥后缀
+   ⇒ `rule_of` 回落 `Replicate`(2026-10-17 就为量化族踩过同一坑,注释还写着
+   "不剥 ⇒ 分片区间不翻译 ⇒ 两 rank 读同一段");
+2. `Embedding::layout_lm_head` 的 i8 臂**没挂层声明规则** —— 词表切的
+   `UniformCol` 覆盖只有 `Linear::layout` 里那一处(`with_tp_rule` ⇒ `Want.rule`),
+   i8 头不走 `Linear`(§72 的设计),于是覆盖面漏了(`Want.rule = None`)。
+
+修法:`DERIVED_SUFFIXES` 补两件 + i8 臂按 `h.rule` 调 `ops.with_rule(...)`
+(与 `Linear::layout` 逐字同律:只在**真覆盖**时打标)。
+
+门:
+- CPU(`formats/shard.rs::derived_i8_head_rows_split_per_rank`):两 rank 各读
+  本行区间、且**不许相等**(直接锁死"高半=低半");同时锁 `base_key` 剥后缀;
+- GPU(`tests/tp_head_i8_gate.rs`):装配期 `spec.head_vocab × 2 == vocab`,
+  运行期 `logits 宽 == head_vocab`。
+
+### 75.4 顺带修的 trunk 回归:**TP2 起服全堵死**(与 int8 无关)
+
+现象:`TpEngine::assemble` 在 rank1 报
+`adopt_ledger: 本引擎已发过 N 条事件,只允许 boot 期(零事件)接管`
+(0.8B **312 条** / 27B **2221 条**)⇒ **所有** TP2 门(0.8B 装配门、确定性门、
+27B 门)与 server 起服全红,与 head 档无关。
+
+根因:`c012cc5`(boot 收编设备面)之后 `Engine::on` **在 boot 就挂账本**,
+而 TP2 的装配顺序是"先装载两 rank → 再 assemble";装载**必发事件** ⇒ rank1 的
+私账已有内容 ⇒ 事后接管 = 把事件丢进孤儿账 ⇒ 设计上就该拒。**设计没错,调用面错了。**
+
+修法(把"合流"提前到**装载之前**,并让接管可判):
+1. `AllocLedger::book_token()`(默认 0 = 不表态;store 实现 = **书本体 Arc 指针**,
+   不是 cell 指针 —— `ledger_entry()` 每次都新建 cell 壳);
+2. `DeviceHandle::adopt_ledger`:**同一本书 ⇒ 幂等放行**(零事件丢失风险),
+   另一本书 + 已记账 ⇒ **仍响亮拒**(老判据不削弱;`Arc::ptr_eq` 先行防双锁自死锁);
+3. `Engine::new_with_ledger(cfg, ledger, dev_rank)`:rank1 在**构造期**接账本 +
+   落定 `dev_rank`(池复用键带 rank,晚设会把两 rank 临时块混池);
+4. `assemble_with_staging` 的"rank1 单元必须为空"判据加**同一性豁免**
+   (`Arc::ptr_eq(cell0, cell1)` ⇒ 那本来就是主账,在借记录是两侧装载欠的);
+5. 调用面:server `engine_of_tp` + 6 个 TP2 测试目标各一行
+   (`Engine::new_with_ledger(cfg, e0.ledger_cell(), 1)`)。
+
+门:CPU `device_handle.rs::adopt_same_book_is_idempotent_after_events`
+(同书 + 已记账 ⇒ 放行;另一本 ⇒ 拒;token=0 ⇒ 按另一本);
+GPU:0.8B `tp_assemble_gate` / `tp_determinism_gate` 双绿,server 起服日志
+`[tp] 事件账:两 rank 合流到同一本(rank 维区分卡)`。
+
+> 教训:判据写成"零事件"这类**时序谓词**时,必须同时给出**允许调用它的时点**
+> 的入口(否则调用面一挪就全红);而"同一实体重复声明"应当是幂等,不是拒绝。
+
+### 75.5 精度门(两进程;同进程两臂被池守卫拒)
+
+同进程连跑两臂 = 两次 27B 装载 ⇒ 第二次 `PoolExhausted`(驱动 free 897MiB /
+池 reserved 18816MiB;设备内存从不 Free 是设计前提,不是漏 free)。改成
+`OWL_I8_HEAD_ARM=f16|i8|compare` 三态(两进程各一臂 + 零 GPU 比对)。
+
+| 档 | 数据 | 判据 |
+|---|---|---|
+| **TP1 27B**(N=48,3 prompt) | **344/344**,3/3 逐 token 全等 | ≥0.95 ✅(实=1.0) |
+| **TP2 词表切**(N=48) | 144/144,3/3 全等 | ✅ |
+| **TP2 词表切**(N=256) | **744/768 = 96.9%**,2/3 全等 | ✅ |
+
+唯一分歧(Rust 中位数那条,第 232 token)是**并列翻转**,不是错值:
+
+| 臂 | top-1 | top-2 | margin |
+|---|---|---|---|
+| f16 头 | 478 (21.6250) | 16 (21.6094) | **1.56e-2** |
+| int8 头 | 16 (21.6094) | 478 (21.6094) | 0.00e0 |
+
+⇒ 满足"首分歧必须互为 top-N"(vLLM `check_logprobs_close` 同形)判据;
+1.6e-2 的 logit 差在 int8 per-row(`s = absmax/127`,q 误差 ≤0.5)量级之内。
+
+### 75.6 生产 A/B(server 档,std 口径,3080 对 @1024/256 ×3 轮)
+
+| 臂 | prefill | TTFT | decode |
+|---|---:|---:|---:|
+| `head_quant = off` | 1596.5 t/s | 643.2 ms | **45.09** t/s(22.18 ms/tok) |
+| `head_quant = rtn-int8-row` | 1594.9 t/s | 643.7 ms | **49.37** t/s(20.26 ms/tok) |
+| 差 | −0.1% | +0.1% | **+9.5%** |
+
+复测(另一 boot):off 45.25;int8 @2048 48.91 ⇒ 稳定。
+TTFT/prefill 不变**符合结构**:prefill 也在**末行窄切后**调头(`forward_last` /
+`prefill_chunk` 都是 `[1,d]`),头永远只吃 m=1 ⇒ 省的是纯权重读:
+每 rank 1.27 GB(bf16)→ **0.635 GB**(i8),核 718.8 GB/s(§72)。
+
+> 口径注:门内计时(int8 前/后 22.43 → 21.47 ms/tok,−4.3%)含**逐步 D2H 读
+> 124160 logits 的同步**(两臂同加),把差值压小;**生产 std 的 +9.5% 才是准数**。
+
+两条与本刀无关的观察(记在这,免得下轮白查):
+1. **3080 对 × `tp27b` 档,≥4096 prompt 撞池上限**:`池 used=18671MiB / reserved=18720MiB`、
+   驱动 free 1011MiB ⇒ `vram-hard-budget` 硬拒(该 turn 被优雅丢弃,不崩)。
+   档的 `max_seq = 8704` 是按 24G 卡算的;20G 对得上更小的池或更低的 `vram_target`。
+2. **停服后进程不退**:SIGTERM 走完优雅关停(打印 + 释放卡锁 + `exit 0`)后
+   RSS 4.1GB 仍存活,需 `kill -9`(卡上内存随之释放)。别用 `pkill -f`(自杀陷阱)。
+
+### 75.7 下一步
+
+1. 本刀已把 `flavors/tp27b.toml` 默认开到 `rtn-int8-row`(回退 = 删该行);
+2. std 五点三轮全矩阵(待 3090 对被占解除;当前 ordinal 1 被 vLLM 占着);
+3. P1.5-b(读 marlin 布局 + 寄存器 perm,§74.3)仍未开工 —— 那一刀的靶是
+   marlin 的 613 GB/s → 700+,与本刀(头)**叠加**后 decode 还有 ~6%。
+
+## 76. L2/L3 复攻(2026-10-20)—— **"15% 空隙"是幽灵**,但顺藤摸到 **+5.8% 从没开过的开关**
+
+> 立案口径(上轮结论):"decode 20.3 ms 里 ~3 ms(15%)未归因;嫌疑 = 127 次发射间隙
+> 或两 rank 偏斜"。本轮把它量到闭账,并同时收掉 AR 融合 —— 结论**两条都比预期值钱**:
+> ① 幽灵不存在(§76.1–76.3);② **同一份代码里两个早就有、却从没在生产档打开过的
+> 开关,合起来值 5.8%**(§76.4–76.5)。
+
+### 76.1 仪器(先修尺,再量)
+
+- `tools/nsys-decode-account.sh l2-fused tp27b <fused 站点档>`(**node 模式**)→
+  `tools/nsys_decode_account.py`:单步 **964 核**,设备 Σ **17.26 ms**,span **17.25 ms**;
+- **Σ ≈ span ⇒ 核是背靠背的:图内没有空隙**。脚本算出的"段间空隙(host) 2.21 ms"
+  是 **CUPTI 逐节点插桩**的代价(node 模式的 ITL 19.47 vs 同档干净 ITL ≈18.6),
+  与 §69.2 的律 @40 同一条:**空隙读数不可用,核内时长可信**;
+- 交叉验证(干净客户端,同一 boot 内换 ctx):**ctx 209 → ITL 18.68 ms;ctx 1249 →
+  18.64 ms** ⇒ **ITL 与 ctx 无关**(≤1.2k 段),不存在"隐藏的 ctx 项";
+- 闭账:**18.64(ITL)− 17.26(设备)= 1.38 ms** = `fill+launch` 0.33(§66)
+  + `sample-and-emit` 0.38(`step_profile`)+ HTTP/SSE/客户端 ~0.6。
+
+⇒ **3 ms 的"未归因空隙"= 跨 ctx/跨配置混账 + 仪器的空隙虚报。真账是 1.4 ms(7%)。**
+
+### 76.2 单步构成(node 模式核内时长;配置 = int8 头 + AR 融合 + **全表头**)
+
+| 项 | µs | 占比 | 说明 |
+|---|---:|---:|---|
+| `marlin`(352 + 64 次) | 11455 | **66%** | 68 blocks × 256 thr,每核 32.6 µs;617 GB/s |
+| **`owl_gemv_i8w_f16`(1 次/步)** | **1763** | **10%** | grid **31040** = 248320/8 ⇒ **每 rank 是全表头**(1.27 GB i8) |
+| `owl_comm_ar_fused_f16`(128 次) | 2298 | **13%** | **grid 1 × block 512**;16.4/18.0/19.2 µs(min/med/p90) |
+| paged attention v2 | 398 | 2% | |
+| gdn(step/conv/gemv_dual) | 667 | 4% | |
+| norm 四族 / silu / add / misc | ~680 | 4% | 其中 `owl_narrow` 20 µs、`qknorm_rope` 41 µs |
+| **设备合计** | **17260** | | **964 核/步** |
+
+**意外收获(§76.4 的根)**:头是 **1.76 ms** 而不是 `tp_head_i8_gate` 里的 0.88 ms ——
+因为**那个门显式开了 `vocab_split`,生产档没有** ⇒ 每 rank 跑的是**全表头**
+(1.27 GB i8 / 2.54 GB bf16),而不是半表(0.635 GB)。
+
+### 76.3 L3:AR 融合转正(**+2.4%**,6/6 配对全正)
+
+| 臂(2 冷启 × 3 轮,std @1024/256) | decode t/s |
+|---|---|
+| 两核(`ar_stage`+`ar_reduce`) | 48.63 / 48.34 / 48.56 ‖ 49.36 / 49.39 / 48.94 = **48.87** |
+| **融合(`ar_fused`)** | 49.98 / 50.02 / 49.83 ‖ 50.17 / 50.20 / 49.95 = **50.23** |
+
+⇒ **+2.4%(每步 −0.65 ms)**,已在 `tp27b` 开(`tp_ar_fused = true`)。
+0.8B 门:`tp_g8_gate` 融合档 **v1=0 / fused=96**、两 rank 末步 logits **0 项不同**。
+
+**为什么融合只省 2.4% 而核时还是 18 µs/对**(§70 的"图内双边 10.18"没复现):
+- 核**只有 1 个 block(512 thr)**:整条协议链(credit → 写槽 → 发布 → rendezvous
+  → 读对端 → 累加 → consumed)在**一个 SM** 上串行;
+- 时长分布**极窄**(min 16.4 / p90 19.2)⇒ **没有对端偏斜、没有逐层差异**,
+  是**固定常数开销**;
+- 链上要过 **4 处 `__threadfence_system()` + 2 次远端读 + 1 次远端写**,而这一步
+  同时在搬 7.7 GB 权重 ⇒ sys fence 要排在满负荷访存队列后面;
+- 于是:能安全砍的只剩"冗余 fence"约 1–2 µs/对(**+1%**)——但代价是动
+  **系统级 fence 语义**(P2P 面有硬重置前科)⇒ **判定:不做**。
+  再往下只能改结构(减少 AR 注入点),而 TP 拓扑已经是最少(每层 2 次:o/out_proj + down_proj)。
+
+### 76.4 ★ 真正的钱:**`tp_vocab_split` 从没在生产档打开过**(+3.4%)
+
+`tp_vocab_split` 缺省 false,`tp27b`/站点档都没写 ⇒ **生产一直在每 rank 装全表头**
+(P1.1 的 +7.9% 只在门/专项档量过,从未落在生产档)。本轮补 A/B:
+
+| 臂(2 冷启 × 3 轮,int8 头 + AR 融合) | decode t/s |
+|---|---|
+| 全表头(缺省) | 50.05 / 50.49 / 50.33 ‖ 50.13 / 50.18 / 50.17 = **50.23** |
+| **词表切(半表)** | 51.85 / 51.80 / 52.15 ‖ 52.01 / 51.91 / 51.81 = **51.92** |
+
+⇒ **+3.4%(每步 −0.65 ms)**;判据 `tp_vocab_split_gate`(27B 双卡):
+半表 124160×2 = 248320、逐步 **max|Δ| = 0.000000**、token 逐位相同 ⇒ **数值中性**
+(头是按行独立的)。已在 `tp27b` 开。
+
+### 76.5 合账(3080 对,@1024/256 ×3,同一操作口径)
+
+| 阶段 | decode t/s | 说明 |
+|---|---:|---|
+| 本轮起点(bf16 头 + 两核 AR + 全表头) | **45.09** | §75 的 off 臂 |
+| + int8 头(P1.5-a) | 49.37 | §75 |
+| **+ AR 融合转正** | 50.23 | §76.3 |
+| **+ 词表切转正** | **51.92** | §76.4 |
+| 合计 | **+15.2%** | 19.5% 的步时长里拿掉 ~3.0 ms |
+
+### 76.6 两条方法论(都与"数"的可靠性有关)
+
+1. **测量配置 ≠ 出厂配置**:§69/§71 的"vsplit-fused"档**从未进 flavor** ⇒ 拿它的
+   字节数(半表 1.27 GB)去套生产读数(全表 2.54 GB),会得出"627 GB/s = 82%、
+   还有 15% 带宽余量"的**假余地**。按生产真值重算:每卡每 token
+   **7.02 + 2.54 = 9.56 GB / 13.22 ms = 723 GB/s ≈ 95%**。
+   ⇒ **凡"还有多少余量"的判断,必须先核对"读数所在档"与"出厂档"逐项同参**。
+   (本刀之后:7.02 + 0.635 = **7.66 GB/token ⇒ 地板 ≈ 10.6 ms @720 GB/s**。)
+2. **客户端口径差 ~5%**:同一 boot、同一 1024/256,自写流式客户端 ITL **18.90 ms
+   (52.9 t/s)** vs `llm_speedtest` **50.14 t/s(19.94 ms)**。std 的分母窗口含尾部
+   且按 `completion_tokens` 除 ⇒ **绝对数偏悲观、A/B 同口径可比**。
+   ⇒ 以后"std 绝对数 vs nsys 设备账"不许直接相减(这正是"15% 幽灵"的来源之一)。
+
+### 76.7 下一步(按现在的账)
+
+1. **投机转正**(depth 7):一次权重读换 2~3 token,仍是最大的一笔(2×);
+2. **P1.5-b**(marlin m=1 读 marlin 布局 + 寄存器逆 perm):613 → 700 GB/s ⇒ **+6%**
+   (现在 marlin 占 66%,是唯一还剩两位数占比的内核项);
+3. 合批(别的会话)⇒ 聚合吞吐;
+4. 3080 对 ≥~2.7k ctx 撞池上限(池 18.7 GB / 驱动余 1 GB)⇒ 需按 20 GB 卡重定
+   `max_seq`/`pool_tokens`,否则 std 五点只能跑到 2048(本轮 4096 点复现了硬拒 +
+   `N4 未归还 18 块` ⇒ **后续请求连续失败**,这是失败路径的账泄漏,另案)。
+
+## 77. 新档 `tp27b-3080-262k`(2026-10-20)—— 2×20G 上的 **27B W4A16 · TP2 · 声明 262k**
+
+### 77.1 档面
+
+`flavors/tp27b-3080-262k.toml`,与基础档 `tp27b`(8704 ctx、测速专用)的差别:
+
+| 面 | 值 | 理由 |
+|---|---|---|
+| `max_seq` | **262144** | 模型训练上限(不启 YaRN) |
+| `kv_fp8` | **true** | 每 rank/token 32 KiB(fp16)→ **16 KiB**;262k = 4 GiB vs 8 GiB;**长 ctx 解码时 KV 读量 ≈ 权重的 2 倍** ⇒ 省的是带宽 |
+| 池 | 设备 3 GiB + **宿主 8 GiB** + `[kvmem]` 虚拟化 | 唯一能在 20G 上把 262k 声明下来的配方(与单卡 `awq27b-262k` 同形) |
+| `prefill_chunk` | **512** | 单 turn 瞬态账:1024 → 6 GiB(rank0)/ 512 → 3.5 / 256 → 1.8(prefill 各 −2%/−9%) |
+| `prefill_split` | **false** | TP2 + 长 ctx 下**首请求挂死**(>180 s 无 chunk);关掉即正常 —— 重开需先查 FI split 的 TP 分片 |
+| `gdn_chunked` | false | AOT cubin 按 NV=48 烘死,TP2 的 NV=24 未重编(§68) |
+| 性能刀 | int8 头 + 词表切 + AR 融合 | §75/§76 的 +15.2%,本档全开 |
+
+### 77.2 实测
+
+- boot 24.5 s;**free 5458 / 5473 MiB(两卡对称)**;KV 池面 4096 MiB(8192 槽 × 512 KiB);
+- 1058 tok turn:decode **45.1 t/s**(比纯常驻档 51.9 低 13% = 虚拟化召回税);
+- 冷 4k turn(chunk 512):prefill **1523 t/s**、decode **44.7 t/s**。
+
+### 77.3 🔴 阻塞(引擎侧,**不是参数能解**)
+
+设备块的**瞬态账每 turn 只增不还**(N4 未归还清单;与 8704 档 2.7k ctx 失败同根):
+
+| turn 形状 | 结果 |
+|---|---|
+| 1k 级 | 反复做**稳**(今日 std A/B = 6 冷启 × 3 轮 × 1024 tok 全过) |
+| ≥4k | **rank0 每 turn 掉 3.5 GiB**(rank1 只掉 ~0.7,rank 不对称)⇒ **第 2 个长 turn 必撞** `vram-hard-budget`(要求 2 KiB 也发不出),该 turn 被优雅丢弃并留 N4 账 |
+
+⇒ 该档是**能力声明**(boot + 单长 turn 可用),不是已验收生产档;
+持续长 ctx 服务被待办 #7(失败/长 turn 的块必须归还 + 20G 卡的瞬态预算)堵住。
+同卷另附**纯常驻 16k 变体**改法(无召回 ⇒ ~51.9 t/s,今天可生产)。
+
+## 78. 问题清单与定位(2026-10-20)—— 长 ctx 的**真堵点**是"每 turn 的 prefill 瞬态账不归还"
+
+> 本轮把 §77 里"第二个长 turn 必失败"往下挖了一层:**不是池几何、不是 fp8、不是 chunk**,
+> 而是**每 turn 有几百到上千个设备块永不归还**。下面每条都给"证据 → 已排除 → 假设 →
+> 下一步量法",按优先级排。
+
+### 78.1 P1 🔴 **prefill 瞬态块不归还**(N4 未归还清单;长 ctx 的唯一硬堵点)
+
+**证据**(`tp27b` + `max_seq=16384`/`chunk=512`/常驻;每 turn 一次 `/debug/vram` + N4 行):
+
+| prompt | 泄漏块 | 泄漏字节 | 备注 |
+|---:|---:|---:|---|
+| 378 tok(1 chunk) | 31 | **12 MB** | 只有末块 ⇒ 末块路径**正常** |
+| 698 tok(2 chunks) | 53 | **27 MB** | 1 个中间块,也基本正常 |
+| 1338 tok(3 chunks) | **1497** | **973 MB** | ← **跳变** |
+| 2725 tok | 798 + 801 | 476 + 469 MB | |
+| 3657 tok(split on) | 1071 + 1209 | 337 + 376 MB | |
+| 3657 tok(split off) | 995 | **1583 MB** | |
+
+泄漏名单 = **整层前向的中间量**(1338 tok 那轮):
+`owl_gdn_conv_fwd_f16 ×319 / 261MB` · `owl_fused_add_rmsnorm_f16 ×54 / 196MB` ·
+`owl_narrow_strided_f16 ×186 / 186MB` · `owl_gdn_norm_act_f16 ×77 / 132MB` ·
+`owl_norm_rope_f16 ×84 / 56MB` · `owl_add_f16 ×12 / 43MB` · `owl_gdn_recurrence ×31 / 41MB` ·
+`marlin ×61 / 33MB` · `flashinfer_prefill_paged_f16 ×11 / 27MB` · `htod ×20` ·
+`vllm_reshape_and_cache_f16_knhd ×64 / 128 B` …(计数据 = **两 rank 共用一本账**,×2)
+
+**已排除**(逐条实测):
+1. **复用池**:`N4 池清点:… 池 25 块 / 256416 KiB` —— 池**卡在 256 MiB 上限**、命中 26828/未中
+   14378 ⇒ 淘汰(evicted)正常,**不是池囤货**;
+2. **末块路径**:`prefill_chunk` 末块把 `arena1/arena2/arena3/hb/hfb/blks[0]` 全 free(源码
+   1291–1298),378 tok 只漏 12 MB 与之一致;
+3. **中途活性回收**:`OWL_LIVE_DIAG=1` 实测 last chunk `新块 2862 / 真回收 2603`
+   (拒:pending 2192 / users 1344 / alias 0 / 非竞技场 0)⇒ 解释器回收**在工作**,
+   残余 ~259 块按设计由调用方 `face.free(&arena)` 收;
+4. **不是 fp8/池几何**:泄漏在 fp16 池 + 常驻档上同样发生(上表即 fp16 池)。
+
+**假设(按可能性排)**:
+1. **某条 eval 的 arena 被丢弃**(返回的 `candidates` 没人 free)—— 只要一处,就正好是
+   "整层中间量"这种面貌;候选点 = 逐 chunk 的 `eval_ops_multi_env`(plain,设计上不回收)
+   被某分支走到、或 `prefill_harvest`/`prefill_tail` 的 arena 生命周期;
+2. **块在 eval 之外分配**(表格/`htod`/KV 写暂存)且 owner 被标成 turn;
+3. free 之后 loan 未销(池化口径)—— 但 #1 已排除池,可能性最低。
+
+**下一步量法(1 小时内可定谳)**:在 `eval_ops_scoped_env` 返回处与 `face.free` 调用点各打
+一份 **id 清单**(env 门 `OWL_ARENA_DUMP`),N4 收尾时做**差集**:差集非空 ⇒ 假设 1 成立
+(直接指到调用点);差集为空而台账仍开 ⇒ 假设 3。
+
+### 78.2 P2 rank 不对称(**不是独立 bug**,但决定谁先撞顶)
+
+每个 turn **两 rank 泄漏近似对称**(4k:3.0 GiB vs 2.75 GiB),但 **rank0 起跑 free 低 ~2.5 GiB**
+(host 面/输出槽/会话账都在 rank0)⇒ 同一条件下 **rank0 先撞 `vram-hard-budget`**。
+修完 P1 自动消失;短期若要在 20G 上抢余量,可让 rank1 多担一点池(未做)。
+
+### 78.3 P3 失败 turn 的账泄漏 + **连环失败**
+
+任何一次 `vram-hard-budget` 拒发之后:
+- 该 turn 的块留在账上(`N4 未归还清单:turn N 名下仍有 845 块 / 1.5 GiB`);
+- **同进程后续请求继续失败**(实测:4096 失败后连 1024 也连红;要求 2 KiB 也发不出)。
+
+⇒ 失败路径必须**抽干该 turn 的 arena**(与 78.1 同源,但**可独立先修**:失败收尾也 drain)。
+
+### 78.4 P4 `prefill_split` × 262k/虚拟化:**一次挂死,未定谳**
+
+- **常驻 16k 档**:`prefill_split = true` 实测**正常**(4k prompt,prefill 1517 t/s / decode 52.7);
+- **262k + `[kvmem]` 虚拟化档**:同一开关下**首请求挂死**(>180 s 无 chunk),关掉即正常。
+⇒ 目前只能记"组合相关";`tp27b-3080-262k` 保守关。复现后再查 FI split 的 TP 分片
+(nparts 与半表 stride 的相互作用)。
+
+### 78.5 P5 进程偶发停不掉(1/3)
+
+- 3 次 SIGTERM:2 次干净退出(释放卡锁 + exit 0),1 次**打印退出后仍活**(RSS 4.1 GB),
+  需 `kill -9`。⇒ teardown 里可能有一个不返回的 join/阻塞 recv(疑点在 turn 中或
+  `PoolExhausted` 之后)。判据:退出日志后 15 s 仍在 ⇒ `ps` 抓 `wchan`/线程名。
+
+### 78.6 P6(测量面,已量化)**std 绝对数比真 ITL 悲观 ~5%**
+
+同 boot 同长度:自写流式客户端 **52.9 t/s** vs `llm_speedtest` **50.14 t/s**。
+A/B 同口径可比;但**不许**把 std 的绝对数直接与 nsys 设备账相减(§76.6 的"15% 幽灵"来源)。
+
+### 78.7 优先级与判据
+
+| # | 任务 | 判据 | 量级 |
+|---|---|---|---|
+| 1 | **P1**:定位并修"arena 不归还" | 连做 4 个 4k turn,`free` 每轮降幅 ≤ 50 MiB;`/debug/vram` 的 turn 维不爬坡 | 长 ctx 的总闸 |
+| 2 | **P3**:失败路径 drain | 故意超预算 → 同一进程下一次正常请求**成功** | 半刀 |
+| 3 | **P5**:teardown 阻塞点 | 5/5 次 SIGTERM 在 15 s 内退 | 小 |
+| 4 | **P4**:split × 虚拟化 repro | 能复现 + 定位到 nparts/stride | 中 |
+| 5 | 之后:262k 档复测 + std 五点三轮 | 262k 连续 3 个 4k turn 通过 | — |
+
+## 79. 显存泄漏定位(二):**设备块有一大批不在账上**(recon.only_block)+ N4 兜底释放钩子落地
+
+> 承接 §78。§78 量到"每 turn 漏 ~1000 块",本轮先按用户裁决**同步主干**
+> (`ce647b4`;合批 decode / config 模块化 / GGUF)再动刀,并把"账内那部分"用
+> **store 钩子**收口;同时发现**更大的那部分根本不在账上**。
+
+### 79.1 已落地:**N4 兜底释放**(store 决策 + 句柄执行,与 N6 池排空同分工)
+
+| 件 | 位置 | 语义 |
+|---|---|---|
+| `LedgerBook::drain_owner(owner) -> (ids, bytes)` | `crates/store/src/tier.rs` | **唯一 store 钩子**:把该归属名下**仍开着**的块整批结清(删借出登记 + 出三层账 + **摘池索引**,池内块也算 —— 池成员 = 无活持有者,归还安全) |
+| `DeviceClient::free_settled(ids)` | `crates/backends/iface/src/contract.rs`(默认=`free`) | **结清口径**的归还:只发驱动 free,**不补 FreeEvent**(账已结清,补了就成"幽灵归还") |
+| `DeviceHandle::free_settled` | `handle.rs` | 覆盖:只 `inner.free` + `untrack` |
+| `RunningEngine::n4_force_release` | `running.rs`(`Node::TurnEnd`) | 报告(WARN 名字/字节)→ drain → free_settled → INFO "结清并归还驱动" + metrics `store.turn_end.stale_{blocks,bytes}` |
+
+**实测(3080 对,`tp27b` + `max_seq=16384`/chunk 512;4k prompt)**:
+
+| | 修前 | 修后 |
+|---|---|---|
+| 账内(`/debug/vram` 的 `gpu_used` 每 turn) | +0.92 GiB | **+0.26 GiB**(= 复用池上限 256 MiB,设计如此) |
+| N4 结清 | — | turn1 **1073 块 / 344 MB**;turn2 **1128 / 363 MB**(逐轮结清) |
+| 门 | — | 0.8B `tp_g8_gate`(融合档,L1 **逐位 0 项不同**)+ `tp_assemble_gate` 全绿 |
+
+### 79.2 🆕 更大的那部分:**设备块不在账上**(`recon.only_block`)
+
+`/debug/vram` 的 `recon` 面 = 设备块表 vs 账本事件的**对账**。同一台机、一个 4k turn:
+
+| 面 | 修前一轮 | 说明 |
+|---|---:|---|
+| rank0 `dev_blocks` | 2666 → **3675**(+1009) | 设备块表增长 |
+| rank0 `ledger_events` | 2646 → **2648**(+2) | 账本几乎没动 |
+| **`only_block`** | 20 → **1027** | **设备有、账本没有** |
+| rank1 | dev +1656 / `only_block` **1623** | 同型 |
+| `events.hook_fail` | 0 → **5324** | 引擎在 free 账本里不存在的 id("双次入池"/"幽灵归还") |
+
+⇒ **驱动 free 每 turn 掉 ~3.7 GiB,其中 ~2.7 GiB 账本根本看不见** —— 这正是
+"`drain_owner` 已把账内部分收干净、但第二个长 turn 仍会撞顶"的原因。
+尺寸分布(能取到的 32 个样本):`64 B / 96 B / 48 B / 16 B / 2 KiB / 4 KiB / 8 KiB /
+16 KiB / 64 KiB` ⇒ 不像 eval 的中间量(那些是 MB 级),更像**每发的标量/叶子暂存**
+(eval 的 `from_host` 叶 / `arg_*` 标量上传)—— 即**不经 `DeviceHandle` 的分配路径**。
+
+**下一步(定位到源码行)**:在 `DeviceHandle::exec` 里给 `Command::Alloc*/Htod`
+之外的**回程块**加一条"未入账即响亮"的判据(或 `has_loan(id)` 探针),跑一个 chunk,
+就能抓到"谁分配的";修法 = 该路径改走句柄(或由服务端把分配数上报给账本)。
+随后 N4 的 `drain_owner` 会自动把它们一起收掉。
+
+### 79.3 ✅ 结案:根因 = **free 没找到自己的块**(池跨 rank 顶出 + 兜底未分账)
+
+> 用户定调(2026-10-20):"两层复用要分清 —— server 层按块复用有算法;算子内部的分配要么
+> 用 Rust RAII 包一块自释放,要么记名交给 store;C 纪律:**每个 malloc 必须找到它的 free**。
+> 现在的问题就是 turn 期间分配的显存,收尾那里没释放。"
+> 顺着这条往下查,1 小时定位、1 处修复:
+
+**证据链(全部来自本轮新增的探针,不再靠猜)**
+
+1. `free: 576/1010 块归池(**账目不平**)` —— 服务器只认得 576/1010 个 id;
+2. 两 rank **共用一本账**,但块表在**各自的 server** 里 ⇒ 原 `drain_owner` 把 rank1 的 id
+   也丢给 rank0 的面 ⇒ **静默丢**(差额 434 = rank1 那份);
+3. 修掉分账后仍有 `free: 0/1 块归池(账目不平)` ≈ **2048 次/轮**,按名聚合集中在两个:
+   `owl_add_f16 ×8862`、`owl_fused_add_rmsnorm_f16 ×5881` —— **残留流的高频块**;
+4. 这些块的路径是"先入复用池、满 256 MiB 后**淘汰回驱动**",而 `pool_release` 的淘汰
+   **挑的是池里最旧的任意一条(跨 rank)** ⇒ 淘汰返回的 id 被**当前调用方的面**去 free
+   ⇒ 打着别的 rank 的 server ⇒ `free_blocks` 找不到 ⇒ **设备块永不归还**。
+
+**修复(三处同律:块只能在自己那个 server 上 free)**
+
+| 件 | 改动 |
+|---|---|
+| `LedgerBook::drain_owner(owner, rank)` | 按 `Loan.rank` 分账(N4 兜底逐 rank) |
+| `Engine::n4_force_release` | 逐 rank 交给 `dev` / `peer` **各自的 session 面**;无 peer 却有 rank1 账 ⇒ 响亮拒 |
+| `LedgerBook::pool_release` 淘汰 | **只顶同 rank 的条目**(跨 rank 顶出 = 必然打空) |
+| `AllocLedger::pool_drain(rank)` + `DeviceHandle::drain_pool_to_driver` | N6 压力路径同病同治(只排本 rank) |
+| `GpuServer::handle_free` | `freed ≠ 请求数` **无条件 WARN**(限流 1/1024)+ 计数 —— 静默吞掉 = 藏泄漏 |
+
+**判据(3080 对 / `tp27b` / chunk 512 / 4k prompt)**
+
+| | 修前 | 修后 |
+|---|---|---|
+| 连做 4k turn | 第 2~3 轮 `vram-hard-budget` 拒发 | **4/4 全过** |
+| 驱动 free | 9138 → 1008 MiB(每轮 −2.8 GiB) | 9138 → **7984**(每轮 ≤0.15 GiB = 池高水位) |
+| `recon.only_block` | 966 / 1239(且逐轮爬) | **20 / 20**(= `selfcheck.*` ×12 + `tp.staging/peer` 各 1 —— 固定的死东西,不必管) |
+| `free` 账目不平 | ~2048 次/轮 | **0** |
+| decode / prefill | 52.6 / 1519 t/s | 52.3 / 1532 t/s(不动) |
+| 门 | — | 0.8B `tp_g8_gate`(L1 **逐位 0 项不同**)+ `tp_assemble_gate` + 27B `tp_head_i8_gate` **144/144 全等** |
+
+**遗留(下一步)**:`hook_fail` 累计仍高(来源 = "双次入池",即调用点对同一批块**释放两次**;
+现在被幂等吸收、不再漏显存,但按"每个 malloc 一个 free"的纪律应清零)+ `probes.debug` 下
+decode 掉 5%(诊断档自身的同步税,与修复无关)。
+
+### 79.4 遗留项(双 free)的追查结论 —— 已定位到源码,修复方案与代价都量过了
+
+**定位(探针 `OWL_LEDGER_DOUBLE=1` 打栈,一次就中)**
+
+```
+pool_release ← LedgerEntry ← DeviceHandle::pool_release_all ← DeviceHandle::free
+  ← RankDev::prefill_chunk_enqueue   ← 解释器**中途活性回收**(inlined)
+```
+
+即:第二次 free 不是显式调用点,而是**解释器的中途回收**又归还了同一块。
+名字集中在 `owl_add_f16` / `owl_fused_add_rmsnorm_f16`(残留流,每层每 chunk 各一块)。
+
+**根因(记账口径失衡,不是逻辑错)**
+
+- `block_users` 按**块**计数:`track_new(id)` 只 `+1`;
+- 中途回收按**父边**递减:`for (p, b) in t.parents.zip(vals) { ... }`;
+- 同一块被 **两个节点**当父用(残差流天然如此:layer 输出既进下一层
+  `fused_add_rmsnorm`、又进 MLP 残差)⇒ 只需 `+1`、却要递减两次
+  ⇒ **第二次递减看到 `u == 0` 就再归还一次**。
+- 影响:**不漏显存**(第二次被存储层按"双次入池"幂等吞掉,`recon.only_block` = 20 恒定、
+  free 每轮 ≤0.15 GiB),只是 `hook_fail` 计数虚高(≈14.7k/次运行)—— 按
+  "一个 malloc 一个 free" 的纪律该清零,但**不影响长 ctx 可用性**。
+
+**试过并回退的修法(材料留档,下轮直接接上)**
+
+把计数改成"按边":`track_new(id, node)` / `track_alias(id, node)` 用
+`pending[node]`(该节点的父边数)初始化 `block_users`。实测:
+
+| 指标 | 结果 |
+|---|---|
+| `双次入池` | 14.7k → **0** ✅ |
+| decode / prefill | 52.1 / 1521 t/s(不变)✅ |
+| **4 个 liveness 单测** | **失败**(`候选表应为空,得 1 块`,残留 = `from_host` 常量叶) |
+| 驱动 free(首轮后) | 9136 → **5168 MiB**(比现状多占 3 GiB) |
+
+⇒ 说明 `count_pending` 的口径(根 +1、同一节点只贡献一次边)与"按边计 users"**还没对齐**;
+要对齐得先定谳"根 +1"与"重复父边"两个约定,再重跑 4 个 liveness 单测 + 内存/性能基线。
+**已回退**(保留 `OWL_LEDGER_DOUBLE` 探针),作为独立一刀立项。
+
+## 80. 防呆(2026-10-20,用户裁决"都是显式拒绝,不要留隐式")—— 三层强制门 + 五类硬错误
+
+> 教训:**"拦住了但只是记一笔"= 没拦住**。§79 的整条泄漏里,五类非法调用
+> 全都"看得见、却没拒";而且为了定位我塞过三处全局计数器/OnceLock(用户否决)。
+> 本轮把它们全部改成**硬错误 + 各自的字段**,并把"以后怎么防"钉成判据。
+
+### 80.1 五类硬错误(全部 `Err` 上抛,不改账、不吞)
+
+| # | 判据 | 位置 | 说明 |
+|---|---|---|---|
+| 1 | **跨账本 free** | `GpuServer::free_blocks` | id 高位 = 账本号(`pack_block_id`);与本 server 不符 ⇒ `CrossLedger`(§79 的元凶曾被静默放过) |
+| 2 | **未知块 free** | 同上 | 块表里没有 ⇒ `Err`(双 free / 早已回收) |
+| 3 | **跨 rank free** | `DeviceHandle::free`(归还前置校验) | `loan.rank != 本句柄 dev_rank` ⇒ `Err` |
+| 4 | **双 free** | 同上 | 账上 `loan.pooled == true`(已在复用池)⇒ `Err` |
+| 5 | **幽灵 free / 批内重复** | 同上 | 无在借登记 ⇒ `Err`;同一批里同一 id 出现两次 ⇒ `Err`(带 **name + 第 i/j 项 + 批长**,错误自解释) |
+
+实现要点:前置校验**全批先判**(一条不合法整批拒,不留"半还"状态);
+store 侧保留 `pool_release_on(id, rank)` 兜底复核。
+
+### 80.2 顺带修掉的两个真 bug(都是硬错误逼出来的)
+
+1. **池上限顶出后 `pooled` 没清** ⇒ 顶出的块进入"池↔待还"死循环:下一次 free 被当
+   "双次入池"拒掉(既没还、又留账)。修:`Loan.evicted` 标记 —— 顶出后**必须真还**,
+   不许再入池。
+2. **同一 eval 内块 id 会被复用**(先还进池、再被取回)⇒ `arena` 里同 id 出现两次
+   (前一条命 + 后一条命)⇒ 候选表重复发、**同批双 free**。修:候选表出口
+   **排序 + 去重**(契约:归还清单每块一次),三处出口同改。
+
+### 80.3 全局清零(用户否决后收编)
+
+| 原全局 | 现状 |
+|---|---|
+| `server/mod.rs` 的 `static MISS: AtomicU64` | **删除**(打空变硬错误后无意义) |
+| `handle.rs` 的 `OnceLock<bool>` + `static SEEN`(审计探针) | **整段删除**(隐式面;硬错误取代) |
+| `tier.rs` 的 `static N`(双 free 打栈) | **删除** |
+| 健康门读 `owl_shared::metrics`(进程级) | 改为**只读引擎返回值**(`store_report` / `block_ledger_probe`),零全局 |
+
+### 80.4 回归门:`tp_vram_health_gate`(新增,默认需双卡)
+
+0.8B TP2 跑 3 轮,四条判据(全读引擎返回值):
+
+| 判据 | 实测 |
+|---|---|
+| H0 三轮全部 `Completed`(硬错误 = 0 的等价判据) | ✅ |
+| H1 `store_report().events.hook_fail` 增量 = 0 | **0** |
+| H2 每轮收尾后 **无** `Owner::Turn(_)` 在借 | ✅ |
+| H3 `设备块数 − 账本在借块数` 缺口不增 | 基线 **4**(= 固定的死东西)`→ 4 → 4 → 4` |
+
+### 80.5 现状与最后一条隐式面(**下一步**)
+
+- 27B/3080 对连做 3 个 4k turn:decode **52.0~52.7 t/s**、free 9136 → 8080 MiB(每轮 ≤0.1 GiB)、
+  五类硬错误计数**全 0**、`recon.only_block` **20/20**。
+- ⚠️ **还剩一条隐式面**:turn 收尾的兜底 `drain_owner` 每轮仍要收 ~900 块(prefill 的
+  arena 在某条路径上没还干净)。按用户裁决它**最终必须变成"欠账即报错"**,
+  但前提是先把 prefill 那条调用点修到 `drain == 0`;判据已就位:
+  `N4 未归还清单` 为空 + `store.turn_end.stale_blocks == 0`。

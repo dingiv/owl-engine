@@ -1232,6 +1232,7 @@ impl GpuCtx {
                 bytes,
                 addr,
                 ledger: e.ledger,
+                name: e.name.clone(),
             });
         }
         rows.sort_by_key(|r| r.id);
@@ -2158,7 +2159,28 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
     /// 钉在 COMPUTE 尾上(nsys:H2D 5863 次等待 = 808.9 ms)⇒ 下一发 htod 卡住
     /// ⇒ 等回执的客户端卡住 ⇒ **管道永远跑不到前面**(设备 idle 85%)。
     /// 捕获期跳过(事件会被烤进图)。
-    pub(super) fn free_blocks(&mut self, ids: &[u64]) -> usize {
+    /// **归还块**(唯一入口)。**硬拒三种非法调用**(2026-10-20;用户裁决:
+    /// "都是显式拒绝,不留隐式"):
+    /// 1. **跨账本**:id 高位写着自己属于哪个 server(`pack_block_id`),与
+    ///    本账本不符 ⇒ `CrossLedger`(§79 那条 ±2.8 GiB/turn 的元凶就是它被静默放过);
+    /// 2. **未知 id**:块表里没有 ⇒ `UnknownBlock`(双 free / 早已回收);
+    /// 3. 被图租约钉住的块 ⇒ 保持原行为(响亮拒收但**不致命**,块留在账房)。
+    pub(super) fn free_blocks(&mut self, ids: &[u64]) -> Result<usize, ModelError> {
+        for id in ids {
+            let owner = ledger_of(*id);
+            if owner != self.ledger {
+                return Err(ModelError::CrossLedger { id: *id, owner, reader: self.ledger });
+            }
+            if !self.blocks.contains_key(id) {
+                return Err(ModelError::Msg(format!(
+                    "free: 未知块 id={id}(不在本账本块表里 —— 双 free 或早已回收)"
+                )));
+            }
+        }
+        Ok(self.free_blocks_inner(ids))
+    }
+
+    fn free_blocks_inner(&mut self, ids: &[u64]) -> usize {
         // **图引用租约:拒收被图引用过的块**(见 [`GraphRefs`])。
         //
         // 为什么必须在咽喉处收:图烘的是裸指针 —— 被 free 的 `Owned` 块

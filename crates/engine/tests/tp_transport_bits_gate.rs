@@ -74,7 +74,7 @@ async fn load_shards(
 ) -> (Vec<Engine<owl_cuda::GpuClient>>, Vec<owl_engine::LoadedModel>) {
     let mut e0 = Engine::new(cfg_of(oa)).expect("engine(rank0)");
     let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(dir).await.expect("rank0 分片装载");
-    let mut e1 = Engine::new(cfg_of(ob)).expect("engine(rank1)");
+    let mut e1 = Engine::new_with_ledger(cfg_of(ob), e0.ledger_cell(), 1).expect("engine(rank1)");
     let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(dir).await.expect("rank1 分片装载");
     (vec![e0, e1], vec![l0, l1])
 }

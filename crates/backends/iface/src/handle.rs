@@ -213,9 +213,54 @@ pub trait AllocLedger: Send {
         vec![id]
     }
 
-    /// **池排空**(压力路径 N6):清池并交出全部 id(调用方真归还驱动)。
-    fn pool_drain(&mut self) -> Vec<u64> {
+    /// **带调用面 rank 的还块**(防呆门;2026-10-20):块只能在自己那个 server 上 free
+    /// ⇒ 账本按 `Loan.rank` 校验;不符 ⇒ 记错并 `None`(留在账上,等 turn 收尾的
+    /// **逐 rank 兜底**还到正确的面)。缺省 = 回落 [`AllocLedger::pool_release`]。
+    fn pool_release_on(&mut self, id: u64, rank: Option<u8>) -> Vec<u64> {
+        let _ = rank;
+        self.pool_release(id)
+    }
+
+    /// **池排空**(压力路径 N6):清**本 rank** 的池条目并交出 id(调用方真归还驱动)。
+    /// `rank` = 本句柄的设备序 —— 块只能打到**它自己的 server**(跨 rank 必打空)。
+    fn pool_drain(&mut self, rank: u8) -> Vec<u64> {
+        let _ = rank;
         Vec::new()
+    }
+
+    /// **借出状态**(`Some((rank, pooled))` = 在借;`None` = 无登记)。
+    ///
+    /// 消费点 = `DeviceHandle::free` 的**前置校验**(2026-10-20 用户裁决:
+    /// "都是显式拒绝,不留隐式"):跨 rank / 双 free / 幽灵 free 一律 `Err`,
+    /// 不再"记一笔然后吞掉"。缺省 `None` = 无账面后端(不校验)。
+    fn loan_state(&mut self, id: u64) -> Option<(u8, bool)> {
+        let _ = id;
+        None
+    }
+
+    /// **在借块的点名**(错误信息自解释用;`None` = 无登记/无账面)。
+    fn loan_name(&mut self, id: u64) -> Option<String> {
+        let _ = id;
+        None
+    }
+
+    /// **本账本是否支持"归还前硬校验"**(有借出登记面的实现返回 true;
+    /// 桩/无账后端 false ⇒ `DeviceHandle::free` 跳过前置校验,原样转发)。
+    fn validates(&self) -> bool {
+        false
+    }
+
+
+    /// **账本身份令牌**(TP 两 rank 合流判据):同一个"书"必须给**同一个非零值**;
+    /// `0` = 不表态(无身份的实现 —— 一律按"另一本书"处理)。
+    ///
+    /// 用途:[`DeviceHandle::adopt_ledger`] 区分两种接管 ——
+    /// ① **同一本书**(令牌相等):接管**不丢任何事件** ⇒ 任何时点都幂等允许
+    /// (TP:调用方已在**装载前**用 `Engine::new_with_ledger` 合流,装配期那次
+    /// adopt 只是复用同一本;装载事件本就落在这本上);
+    /// ② **另一本书**:只有 boot 期(零事件)才许接管(否则事件进孤儿账)。
+    fn book_token(&self) -> usize {
+        0
     }
 }
 
@@ -541,6 +586,23 @@ impl<D: DeviceClient> DeviceHandle<D> {
     /// 判据 = 本句柄**尚未发过任何事件**(发过就不是 boot 期了)；违反 ⇒ 响亮拒
     /// (接管会把已有事件丢进孤儿账 —— 静默丢账比拒更坏)。
     pub fn adopt_ledger(&mut self, ledger: LedgerCell) -> Result<(), ModelError> {
+        // **幂等支路(同一本书)**:接管不改"账在哪"⇒ 零事件丢失风险 ⇒ 放行。
+        // 判据 = 令牌相等(`Arc::ptr_eq` 先行:同一 cell 双锁会自死锁)。
+        if let Some(cur) = self.ledger.as_ref() {
+            let same = if Arc::ptr_eq(cur, &ledger) {
+                true
+            } else {
+                // 中毒 = 有 panic 发生在持账期间:取回内层数据续用(与 `ctx` 同律)
+                let a = match cur.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                let b = match ledger.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+                let t = a.book_token();
+                t != 0 && t == b.book_token()
+            };
+            if same {
+                self.ledger = Some(ledger);
+                return Ok(());
+            }
+        }
         let sent = self.ctx().events_sent;
         if sent != 0 {
             return Err(ModelError::Msg(format!(
@@ -681,7 +743,7 @@ impl<D: DeviceClient> DeviceHandle<D> {
             Command::Free { ids } => {
                 // **缺口 4**:可池化的块**不回驱动**(入 store 池 ⇒ 零命令复用);
                 // 池内那条**不**发 FreeEvent(块仍在借 —— 只是变得可复用)。
-                let (rest, pooled) = self.pool_release_all(&ids);
+                let (rest, pooled) = self.pool_release_all(&ids)?;
                 if pooled > 0 {
                     self.note_pool_released(pooled);
                 }
@@ -699,7 +761,13 @@ impl<D: DeviceClient> DeviceHandle<D> {
             }
             Command::Launch { msg, .. } => {
                 // 输出块不许丢(律 #1):原样带出。**不算出生**(块 = 实参里的 Block)
-                Ok(Outcome::Buf(self.inner.launch(msg).await?))
+                // 审计探针要的两个量在 move 之前取
+                let (out_elems, kname) = (msg.out_elems, msg.kernel.name.clone());
+                let b = self.inner.launch(msg).await?;
+                // 账本一致性由**归还侧**硬校验(跨 rank/双 free/幽灵 ⇒ Err);
+                // 分配侧不再挂"未入账即 WARN"的隐式探针(用户裁决:一律显式拒绝)。
+                let _ = (out_elems, kname);
+                Ok(Outcome::Buf(b))
             }
             Command::Sync => {
                 self.inner.sync().await?;
@@ -715,6 +783,16 @@ impl<D: DeviceClient> DeviceHandle<D> {
         }
     }
 
+    /// **账本审计探针**(诊断面;`OWL_LEDGER_AUDIT=1`,2026-10-20)。
+    ///
+    /// 判据:**设备回程的新块必须在账上有在借登记**。没登记 = 这条命令的分配
+    /// 绕过了本句柄(服务端/裸 client 直接发)⇒ 显存**账本看不见**、`/debug/vram`
+    /// 的对账面(`recon.only_block`)会涨、store 的钩子也收不回来(§79)。
+    ///
+    /// 定位实测:27B 4k prefill 一轮 ≈ **1000 块 / ~2.7 GiB** 走的是这条路。
+    /// 这里**只报告不改账**(探针,不是功能):要让账本管起来,得改分配路径本身。
+    ///
+    /// 去重:同一命令名只报前 3 次(名字即调用面:kernel 名 / `alloc` / `htod`)。
     // ── 钩子(全部同步短锁;绝不跨 await 持锁)────────────────────────────
 
     fn ctx(&self) -> MutexGuard<'_, Ctx> {
@@ -795,7 +873,7 @@ impl<D: DeviceClient> DeviceHandle<D> {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            g.pool_drain()
+            g.pool_drain(self.ctx().dev_rank)
         };
         if ids.is_empty() {
             return 0;
@@ -842,23 +920,71 @@ impl<D: DeviceClient> DeviceHandle<D> {
     /// 两种"必须归还":①不可池化(同一 id)②超池上限**顶出**的旧块
     /// (**可以多条** —— 一次还块可能要腾多块;旧实现只收最后一条 ⇒ 泄漏)。
     /// 入池条数 = 本次真正留在池里的块数(打点;顶出块在 store 侧另计 `pool_evicted`)。
-    fn pool_release_all(&self, ids: &[u64]) -> (Vec<u64>, usize) {
-        let Some(cell) = self.ledger.as_ref() else { return (ids.to_vec(), 0) };
+    /// **归还前校验 + 入池/交还**(唯一收口;三条硬判据,2026-10-20 用户裁决):
+    ///
+    /// 1. **幽灵 free**(账上没这块)⇒ `Err`;
+    /// 2. **双 free**(账上是 `pooled` 态 ⇒ 已经在复用池里)⇒ `Err`;
+    /// 3. **跨 rank**(块的归属面 ≠ 本句柄的设备序)⇒ `Err` —— 块只能在自己那个
+    ///    server 的块表里 free,错面真还必然打空(§79 那条泄漏)。
+    ///
+    /// 不校验 = 无账面的后端(`ledger == None`,纯转发态)。
+    fn pool_release_all(&self, ids: &[u64]) -> Result<(Vec<u64>, usize), ModelError> {
+        let Some(cell) = self.ledger.as_ref() else { return Ok((ids.to_vec(), 0)) };
+        let my_rank = self.ctx().dev_rank;
         let mut g = match cell.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        // 前置校验(**全批先判**,一条不合法就整批拒 —— 不留半还的状态)
+        if g.validates() {
+            // **批内重复 id** = 调用方把同一块列了两次(硬 bug;显式拒)
+            {
+                let mut seen: std::collections::HashMap<u64, usize> =
+                    std::collections::HashMap::with_capacity(ids.len());
+                for (i, id) in ids.iter().enumerate() {
+                    if let Some(j) = seen.insert(*id, i) {
+                        return Err(ModelError::Msg(format!(
+                            "free: 批内重复 id={id}(name={:?};第 {j} 与第 {i} 项,批长 {})",
+                            g.loan_name(*id).unwrap_or_else(|| "?".into()),
+                            ids.len()
+                        )));
+                    }
+                }
+            }
+            for id in ids {
+                match g.loan_state(*id) {
+                    None => {
+                        return Err(ModelError::Msg(format!(
+                            "free: 幽灵归还 —— 账上无 id={id} 的在借登记(双 free 或未登记)"
+                        )))
+                    }
+                    Some((rank, true)) => {
+                        return Err(ModelError::Msg(format!(
+                            "free: 双 free —— id={id} 已在复用池(pooled)里,不能重复归还"
+                        )))
+                    }
+                    Some((rank, false)) if rank != my_rank => {
+                        return Err(ModelError::Msg(format!(
+                            "free: 跨 rank 归还 —— id={id} 属 rank{rank},却由 rank{my_rank} 发起\
+                             (块只能在自己的 server 上 free)"
+                        )))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
         let mut must_free = Vec::new();
         let mut pooled = 0usize;
         for id in ids {
-            let real = g.pool_release(*id);
+            // 空 = 已入池(或按防呆门拒收);非空 = 这些 id 必须真归还
+            let real = g.pool_release_on(*id, Some(my_rank));
             if real.is_empty() {
                 pooled += 1;
             } else {
                 must_free.extend(real);
             }
         }
-        (must_free, pooled)
+        Ok((must_free, pooled))
     }
 
     /// 发事件(客户端侧;**短锁**,绝不跨 await)。
@@ -1216,10 +1342,26 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         self.inner.sync()
     }
 
+    /// **结清口径**:账已由 store 结清(见 `DeviceContract::free_settled`),
+    /// 这里只发驱动 free + 摘窗/图存档 —— **不查池、不发事件**。
+    fn free_settled(&mut self, ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async move {
+            if ids.is_empty() {
+                return Ok(());
+            }
+            self.inner.free(ids).await?;
+            for id in ids {
+                self.untrack(*id);
+            }
+            Ok(())
+        }
+    }
+
     fn free(&mut self, ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
             // **缺口 4**:可池化 ⇒ 入池(不回驱动);其余真归还。池内那条不发 FreeEvent。
-            let (rest, pooled) = self.pool_release_all(ids);
+            // **前置校验**(幽灵/双 free/跨 rank)在这里**硬拒**;失败不改账
+            let (rest, pooled) = self.pool_release_all(ids)?;
             if pooled > 0 {
                 self.note_pool_released(pooled);
             }

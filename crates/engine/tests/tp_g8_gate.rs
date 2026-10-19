@@ -227,7 +227,7 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     // ── ② TP2:两 rank 分片装载 + 装配 + 执行 ───────────────────────
     let mut e0 = Engine::new(cfg_of(oa)).expect("engine(TP2 rank0)");
     let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(&dir).await.expect("rank0 分片装载");
-    let mut e1 = Engine::new(cfg_of(ob)).expect("engine(TP2 rank1)");
+    let mut e1 = Engine::new_with_ledger(cfg_of(ob), e0.ledger_cell(), 1).expect("engine(TP2 rank1)");
     let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(&dir).await.expect("rank1 分片装载");
     // ★ **push 档开关**(2026-10-18;§36.6/§36.7)—— 测试用例可放 env
     // (owl 纪律:行为开关走配置,测试可例外)。
@@ -249,13 +249,33 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     // ⚠️ metrics store 是**进程级 OnceLock** ⇒ **必须在 turn 之前 init**
     // (turn 期间 counter_add 才有效;事后 init 只能看到 0 —— 本刀踩过)。
     let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
-    let Steps { gen: tp2_gen, logits: tp2_logits } =
-        run_turn_steps(&mut r, 1, PROMPT, MAX_NEW).await.expect("TP2 turn");
-    let cnt = |t: &str| -> u64 {
+    let cnt0 = |t: &str| -> u64 {
         owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new().tag(t))
             .iter()
             .map(|x| x.counter)
             .sum()
+    };
+    // **基线快照**(2026-10-20):metrics store 是**进程级 OnceLock**,而本目标还有
+    // 另一个测试(`body_probe`,走 `assemble` 默认档 = 两核)⇒ 若它先跑,计数已经
+    // 不是 0 ⇒ "融合档下 v1 必须为 0"的绝对判据会**假红**(实测 v1=2016 全是它留的)。
+    // 判据改成**本臂增量**(turn 前后的差),与测试顺序解耦。
+    let base = ["tp.ar.push", "tp.ar.v1", "tp.ar.fused", "tp.ar.1stage"].map(|t| cnt0(t));
+    let Steps { gen: tp2_gen, logits: tp2_logits } =
+        run_turn_steps(&mut r, 1, PROMPT, MAX_NEW).await.expect("TP2 turn");
+    let cnt = |t: &str| -> u64 {
+        let now: u64 = owl_shared::metrics::query_metrics(
+            &owl_shared::metrics::MetricsFilter::new().tag(t),
+        )
+        .iter()
+        .map(|x| x.counter)
+        .sum();
+        let i = match t {
+            "tp.ar.push" => 0,
+            "tp.ar.v1" => 1,
+            "tp.ar.fused" => 2,
+            _ => 3,
+        };
+        now.saturating_sub(base[i])
     };
     let (n_push, n_v1) = (cnt("tp.ar.push"), cnt("tp.ar.v1"));
     let n_fused = cnt("tp.ar.fused");
@@ -490,7 +510,7 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
     let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
     let mut e0 = Engine::new(cfg_eager(oa)).expect("engine rank0");
     let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(&dir).await.expect("rank0 装载");
-    let mut e1 = Engine::new(cfg_eager(ob)).expect("engine rank1");
+    let mut e1 = Engine::new_with_ledger(cfg_eager(ob), e0.ledger_cell(), 1).expect("engine rank1");
     let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(&dir).await.expect("rank1 装载");
     let tp = TpEngine::assemble(vec![e0, e1], vec![l0, l1]).await.expect("装配");
     let mut r = tp.run().expect("进执行态");
