@@ -550,6 +550,40 @@ marlin_gemm_w4a16_awq(吃它) → 此后无 free`;`owl_dflash_select_bf16`:`allo
 为捕获铺路)口径,或 tap 的 narrow 块在 eval 之外构造。取证入口同上(开 trace_ring 看
 `alloc_done` 之后有没有进 arena/有没有 free)。
 
+
+### 12.10 刀 N4-c 立案:最后一个 1 块/轮(10 KiB)的发射账实证(2026-10-19)
+
+**证据(发射账窗口,`trace_ring`;seq 连号即同时序)**:
+
+```
+53443 launch  vllm_reshape_and_cache_bf16        out=…421            ← 草稿 KV 写(哑根,N4-a 已治)
+53444-53447 free [418,419,420] / free [401,406,411,416,421]          ← 该 eval 的活块正常回收 ✓
+53448 alloc   uninit:owl_narrow_strided_f16      10240B
+53449 alloc_done                                                 →…422
+53450 launch  owl_narrow_strided_f16  ids=[…380(concat_rows),…422] out=…422
+53451 alloc   uninit:marlin_gemm_w4a16_awq       496640B
+53453 launch  marlin_gemm_w4a16_awq   ids=[…422(A), 7800(权重), …423…] out=7804   ← 422 被当 A 吃
+53455/57      alloc/launch owl_argmax_f32idx_f16 (吃 423) → …424      ← top-1 走词表
+53458 copy_block  496640  [423 → 32502(常驻块)]                      ← 真结果 copy 进常驻面
+53459 free [423]                                                      ← GEMM workspace 回收 ✓
+53460 free []                                                         ← 某 eval 的 flush_pool(空)
+53461 free [380]                                                      ← concat_rows 的块回收 ✓
+（全 trace 里对 …422 的 free:**一条都没有**）
+```
+
+**判读(不猜,只登记事实)**:
+- …422 的**生产者与消费者都在同一段**(narrow 53450 → GEMM 53453),且其输入 …380(concat_rows)与
+  同段其它临时块(…418/419/420/423)都被回收 —— **只有它没进任何一次 free 列表**;
+- 因此它不是"没人知道它在哪"(那是 N4-a/N4-b 之前的形状),而是**"知道却不收"**:
+  假设 = 该块由 `alloc_uninit` 铸出后被当作**透传/别名臂**处理(块归属按块计数那条路),
+  ⇒ `arena_set` 未登记(或 `block_users` 计数没归零),于是滑出 `arena − root` 候选;
+- **下一步(刀 N4-c 正刀)**:在 `interpreters/eval.rs` 加一条**收尾不变量检验** ——
+  scoped 出口把 `arena_set` 与"本段 `alloc`/`alloc_uninit` 命令数"对账,不等 = 响亮留痕
+  (`OWL_LIVE_DIAG` 一路),把"漏登记"从"看不见"变成"每次都报";再按报出的名字定位登记缺口。
+
+**当前进度**:每轮 **+7 → +2 → +1**(22→29→36→43 变成 1→2→3);`recon` 残差恒 18 ·
+`hook_fail` 0 · `window_unclosed` 0。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |
