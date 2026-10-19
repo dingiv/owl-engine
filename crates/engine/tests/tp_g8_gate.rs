@@ -89,7 +89,7 @@ struct Steps {
 /// prefill 中间块与终局 `Completed` 都不产 token ⇒ 不记 —— 后者若记会多一条,
 /// 其 logits 槽是最后一次采样的旧值)。
 async fn run_turn_steps(
-    running: &mut RunningEngine<owl_cuda::GpuClient>,
+    running: &mut RunningEngine<owl_engine::GpuFace>,
     sid: u64,
     prompt: &str,
     max_new: usize,
@@ -184,6 +184,28 @@ fn tp_g8_gate() {
 
 async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     let n_top = topn_of();
+    // ★ **词表切档（P1.1）**：本模型（Qwen3.5-0.8B）`tie_word_embeddings = true`
+    // ⇒ lm_head 复用 embed 全量表 ⇒ 词表切**无据可依** ⇒ 装载必须**响亮拒**。
+    // 本档只验证这条拒（正判据在 27B 门：那里是 untied 检查点）。
+    if matches!(std::env::var("OWL_TP_VOCAB_SPLIT").as_deref(), Ok("1") | Ok("true")) {
+        let mut e = Engine::new(cfg_of(oa)).expect("engine(tied 拒判据)");
+        let r = e
+            .loader()
+            .slice(0, 2)
+            .vocab_split(true)
+            .load_qwen35_0_8b(&dir)
+            .await;
+        match r {
+            Ok(_) => panic!(
+                "tied 模型（tie_word_embeddings=true）+ 词表切应被**响亮拒** —— \
+                 实测装载成功 = 判据失守（词表切静默不生效）"
+            ),
+            Err(e) => {
+                eprintln!("[g8b] 词表切 × tied：装载响亮拒 ✓（{e}）");
+                return;
+            }
+        }
+    }
     // ── ① TP1 参考臂:单卡全量(先跑先卸,腾出显存给双 rank)──────────
     let (tp1, pf1) = {
         let mut e = Engine::new(cfg_of(ref_dev)).expect("engine(TP1)");
@@ -207,11 +229,55 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(&dir).await.expect("rank0 分片装载");
     let mut e1 = Engine::new(cfg_of(ob)).expect("engine(TP2 rank1)");
     let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(&dir).await.expect("rank1 分片装载");
-    let tp = TpEngine::assemble(vec![e0, e1], vec![l0, l1]).await.expect("TP2 装配");
+    // ★ **push 档开关**(2026-10-18;§36.6/§36.7)—— 测试用例可放 env
+    // (owl 纪律:行为开关走配置,测试可例外)。
+    let push = matches!(std::env::var("OWL_TP_PUSH").as_deref(), Ok("1") | Ok("true"));
+    // ★ **fp8 载荷档**(§47 第二步;测试用例可放 env —— owl 纪律:行为开关走配置,测试例外)
+    let ar_f8 = matches!(std::env::var("OWL_TP_AR_F8").as_deref(), Ok("1") | Ok("true"));
+    // ★ **v1 两核融合档**(§11.2;测试例外同上)
+    let ar_fused = matches!(std::env::var("OWL_TP_AR_FUSED").as_deref(), Ok("1") | Ok("true"));
+    let tp = TpEngine::assemble_with(
+        vec![e0, e1],
+        vec![l0, l1],
+        owl_engine::TpOpts { push, ar_f8, ar_fused },
+    )
+        .await
+        .expect("TP2 装配");
     let mut r = tp.run().expect("TP2 进执行态");
     assert!(r.has_peer(), "TP2 执行态必须带 peer 束");
+    // ★ **路径存在性判据**(纪律⑮/§35.5;2026-10-18):门全绿证明不了新路径被执行。
+    // ⚠️ metrics store 是**进程级 OnceLock** ⇒ **必须在 turn 之前 init**
+    // (turn 期间 counter_add 才有效;事后 init 只能看到 0 —— 本刀踩过)。
+    let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
     let Steps { gen: tp2_gen, logits: tp2_logits } =
         run_turn_steps(&mut r, 1, PROMPT, MAX_NEW).await.expect("TP2 turn");
+    let cnt = |t: &str| -> u64 {
+        owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new().tag(t))
+            .iter()
+            .map(|x| x.counter)
+            .sum()
+    };
+    let (n_push, n_v1) = (cnt("tp.ar.push"), cnt("tp.ar.v1"));
+    let n_fused = cnt("tp.ar.fused");
+    // ⚠️ 1-stage 档的路径判据在 `tp_perf_split_probe`(那里断言 `tp.ar.1stage > 0 ∧ v1 = 0`);
+    // 本条只管 push/v1 两档 —— **1-stage 开时 v1 本就该是 0**,别在这里拦(2026-10-19)
+    let one_stage_on = matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"));
+    eprintln!("[g8b] 路径判据:push={n_push} · v1={n_v1} · fused={n_fused}(OWL_TP_PUSH={push} · 融合={ar_fused} · 1-stage={one_stage_on})");
+    if one_stage_on {
+        /* 走 tp_perf_split_probe 的判据 */
+    } else if ar_fused {
+        // **融合档的路径判据**(§11.2;2026-10-19):必须走到 fused,且 v1/push 都为 0
+        // (否则"开了融合档但没走"= 静默不生效,与 1-stage §60.2 同族坑)
+        assert!(n_fused > 0, "开了融合档但一次都没走到(tp.ar.fused = 0)");
+        assert_eq!(n_v1, 0, "融合档下不应走 v1 两核(tp.ar.v1 = {n_v1})");
+        assert_eq!(n_push, 0, "融合档下不应走 push 两核(tp.ar.push = {n_push})");
+    } else if push {
+        assert!(n_push > 0, "开了 push 但一次都没走到(tp.ar.push = 0)");
+        assert_eq!(n_v1, 0, "开了 push 却仍在走 v1 绑定(tp.ar.v1 = {n_v1})");
+    } else {
+        assert_eq!(n_push, 0, "没开 push 却走了 push 绑定");
+        assert!(n_v1 > 0, "v1 档应有 tp.ar.v1 > 0");
+    }
     eprintln!("[g8b] TP2(双 rank {oa}/{ob}):{} tok;逐步 logits {} 条", tp2_gen.len(), tp2_logits.len());
 
     // ── ③ L1(接线):两 rank **同一个采样步**的 logits 逐位相同 ─────
@@ -340,4 +406,158 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
             worst
         ),
     }
+}
+
+// ============================================================================
+// ★ 分步计时探针(2026-10-18;**非门** —— 无判据,只 dump 分布与总墙钟)
+// ============================================================================
+//
+// 为什么需要它:1-stage(§35)结构更对却性能中性 ⇒ 必须看清**时间花在哪**。
+// 三个变量要分开:
+//   · `OWL_GPU_PROF=1` ⇒ 每次发射后同步 COMPUTE 流 ⇒ `srv.op.<核名>` 里有**真设备时间**,
+//     但**总时间失真**(同步本身很贵)—— 这就是"日志自己的开销"那一档;
+//   · `no_graph = true`(eager)⇒ 逐核可归因(图模式整步只发一次,归因不到核);
+//   · 两者都关 ⇒ 只剩**总时间**(由 `tools/tp-ab-std.sh` 给的是生产版)。
+//
+// 跑法(本例 = 分布档;把 `OWL_GPU_PROF` 去掉 = 总时间档):
+// ```bash
+// OWL_GPU_PROF=1 OWL_PERF_TAG=v1prof OWL_TP_1STAGE=0 \
+//   OWL_TP_TEST_DEV_A=2 OWL_TP_TEST_DEV_B=3 OWL_0_8B_DIR=<…0.8B> \
+//   cargo test -p owl-engine --test tp_g8_gate tp_perf_split_probe -- --nocapture
+// ```
+// `OWL_PERF_REPS`(缺省 40)控制 prompt 长度(每遍约 20 字 ≈ 13 tok)。
+
+/// **只推进、不读 logits**的 turn(`run_turn_steps` 要逐步 logits,那是判据面的需求;
+/// 计时探针不需要它 —— 而且 dtoh 本身会进总时间,污染"日志自己的开销"那一档)。
+async fn run_turn_plain<D: owl_iface::contract::DeviceClient>(
+    r: &mut RunningEngine<D>,
+    sid: u64,
+    prompt: &str,
+    max_new: usize,
+) -> Result<usize, ModelError> {
+    let (_s, turn) = r.submit_session_ex(Some(sid), prompt, max_new, true)?;
+    let mut n = 0usize;
+    loop {
+        match r.pump().await? {
+            owl_engine::TurnEvent::Token { turn: t, .. } if t == turn => n += 1,
+            owl_engine::TurnEvent::Idle => break,
+            owl_engine::TurnEvent::Failed { turn: t, err } => {
+                return Err(ModelError::Msg(format!("t{t} 失败:{err}")))
+            }
+            _ => {}
+        }
+    }
+    Ok(n)
+}
+
+fn cfg_eager(ordinal: usize) -> EngineConfig {
+    let mut c = cfg_of(ordinal);
+    c.knobs.no_graph = true; // eager:逐核可归因
+    c.max_seq_tokens = 1024; // 探针用长 prompt(缺省 256 装不下)
+    c
+}
+
+#[test]
+fn tp_perf_split_probe() {
+    let (Some(oa), Some(ob)) = (dev("OWL_TP_TEST_DEV_A"), dev("OWL_TP_TEST_DEV_B")) else {
+        eprintln!("skip: 需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B");
+        return;
+    };
+    let dir = dir_of();
+    if !dir.join("config.json").exists() {
+        eprintln!("skip: 0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)");
+        return;
+    }
+    let reps: usize = std::env::var("OWL_PERF_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let tag = std::env::var("OWL_PERF_TAG").unwrap_or_else(|_| "perf".to_string());
+    let prompt: String = "在深海下面有一座城市它的名字没有人记得。".repeat(reps);
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("rt")
+                .block_on(body_probe(oa, ob, dir, prompt, tag))
+        })
+        .expect("起测试线程")
+        .join()
+        .expect("perf 探针失败");
+}
+
+async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: String) {
+    // metrics store 是**进程级 OnceLock**:生产由 server 起时 init,测试里得自己来
+    // (不 init ⇒ `dump` 静默 Ok 且不落文件 —— 2026-10-18 踩过)
+    let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
+    let mut e0 = Engine::new(cfg_eager(oa)).expect("engine rank0");
+    let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(&dir).await.expect("rank0 装载");
+    let mut e1 = Engine::new(cfg_eager(ob)).expect("engine rank1");
+    let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(&dir).await.expect("rank1 装载");
+    let tp = TpEngine::assemble(vec![e0, e1], vec![l0, l1]).await.expect("装配");
+    let mut r = tp.run().expect("进执行态");
+    // 预热一次(装载后的首跑含 lazy 初始化;不进计时)
+    let _ = run_turn_plain(&mut r, 1, &prompt, 1).await.expect("预热 turn");
+    // ── ★ **串行 vs 并发**(2026-10-18;TBO 的最小验证)────────────────
+    // sglang 的 TBO 本质 = "两个独立微批的 forward 交错" ⇒ 它能不能拿到重叠,
+    // 取决于**调度层是否让两个 forward 同时在飞**。本档量这件事:
+    //   serial     : turn → turn(两次,单会话各一次)
+    //   concurrent : 同时挂两个会话,一起 pump
+    // 判据:**concurrent 明显快于 serial ⇒ 调度层已是并发的**,重叠有地基;
+    //       ≈ 相等 ⇒ 引擎串行处理 turn,交错要在引擎里做(本档就是立案证据)。
+    let mode = std::env::var("OWL_PERF_MODE").unwrap_or_else(|_| "serial".to_string());
+    let t0 = std::time::Instant::now();
+    let ngen = if mode == "concurrent" {
+        let (_s1, t1) = r.submit_session_ex(Some(11), &prompt, 1, true).expect("提交 A");
+        let (_s2, t2) = r.submit_session_ex(Some(12), &prompt, 1, true).expect("提交 B");
+        let mut n = 0usize;
+        loop {
+            match r.pump().await.expect("pump") {
+                owl_engine::TurnEvent::Token { .. } => n += 1,
+                owl_engine::TurnEvent::Idle => break,
+                owl_engine::TurnEvent::Failed { turn, err } => {
+                    panic!("t{turn} 失败:{err}")
+                }
+                _ => {}
+            }
+        }
+        let _ = (t1, t2);
+        n
+    } else {
+        let a = run_turn_plain(&mut r, 21, &prompt, 1).await.expect("turn A");
+        let b = run_turn_plain(&mut r, 22, &prompt, 1).await.expect("turn B");
+        a + b
+    };
+    let total = t0.elapsed();
+    eprintln!("[perf-split:{tag}] mode={mode}");
+    eprintln!(
+        "[perf-split:{tag}] prompt {} 字 / gen {} tok ⇒ **总墙钟 {:.3}s** | 1-stage={} · gpu_prof={} · eager=on",
+        prompt.chars().count(),
+        ngen,
+        total.as_secs_f64(),
+        std::env::var("OWL_TP_1STAGE").unwrap_or_else(|_| "(缺省 v1)".to_string()),
+        std::env::var("OWL_GPU_PROF").is_ok(),
+    );
+    // ★ **路径存在性判据**(2026-10-18):1-stage 开时,融合核必须真被走到
+    // —— 门全绿 ≠ 新路径被执行(本轮实测:融合核 0 次而门全绿)。
+    let cnt = |t: &str| -> u64 {
+        owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new().tag(t))
+            .iter()
+            .map(|r| r.counter)
+            .sum()
+    };
+    let one_stage = matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"));
+    let (n_new, n_old) = (cnt("tp.ar.1stage"), cnt("tp.ar.v1"));
+    eprintln!("[perf-split:{tag}] 路径判据:fusion={n_new} · v1={n_old}(开 1-stage={one_stage})");
+    if one_stage {
+        assert!(n_new > 0, "开了 1-stage 但融合核一次都没被走到(tp.ar.1stage = 0)");
+        assert_eq!(n_old, 0, "开了 1-stage 却仍在走 v1 两段(tp.ar.v1 = {n_old})");
+    } else {
+        assert_eq!(n_new, 0, "没开 1-stage 却走了融合核");
+        assert!(n_old > 0, "v1 档应有 tp.ar.v1 > 0");
+    }
+    let path = format!("/tmp/tp-perf-{tag}.txt");
+    match owl_shared::metrics::dump(&owl_shared::metrics::MetricsFilter::new(), &path) {
+        Ok(()) => eprintln!("[perf-split:{tag}] metrics → {path}"),
+        Err(e) => eprintln!("[perf-split:{tag}] metrics dump 失败: {e}"),
+    }
+    r.shutdown_tp().await.expect("收尾");
 }

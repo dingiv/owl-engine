@@ -155,7 +155,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
             req.shapes.first().map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0),
             req.scalars.first().map(|b| (*b).max(0) as usize).unwrap_or(1),
         ),
-        "gdn.recurrence_varlen_gqa" => gdn::recurrence_varlen_gqa(dt, ax(2), ax(0), ax(1)), // aux = [nv, kd, vd]
+        "gdn.recurrence_varlen_gqa" => gdn::recurrence_varlen_gqa(dt, ax(2), ax(0), ax(1), ax(3)), // aux = [nv, kd, vd, batch]
         "gdn.norm_act" => gdn::norm_act(dt, ax(0), ax(1), ax(2)), // aux = [rows, value_dim, group_size]
         // foreign 家族臂(2026-10-12 用户律:gdn 两臂入词表,与 native 同一
         // Call 通道;名字 = family 单源,发射配置 = FOREIGN 哨兵直通)
@@ -804,15 +804,34 @@ pub mod gdn {
     }
 
     /// recurrence_varlen_gqa:批前向递推(工单 G;**仅 f16 变体**)。
-    /// shared 契约 = `(4·kd + 4)·4B`;grid = (ceil(vd/8), nv, 1),
-    /// block (32,8,1) = 8 头一组。
-    pub fn recurrence_varlen_gqa(dt: DType, vd: usize, nv: usize, kd: usize) -> KernelPick {
+    ///
+    /// **2026-10-19 布局重写(P1.4)**:核内两条路 ——
+    /// · **快路**(`recurrence_varlen_gqa_fast`):一个 warp 管 2 个相邻 v 列、
+    ///   无 shared/无 barrier、g/beta 每 head 只取一次 ⇒ 实测 1.61×
+    ///   (`tools/gdn-rec-probe.cu`,逐位相同);grid.x = `ceil(vd/16)`;
+    /// · **原形**:kd≠128 或 vd 为奇(快路的索引前提)⇒ 逐字旧实现;
+    ///   grid.x = `ceil(vd/8)`,shared 契约 = `(4·kd + 4)·4B`。
+    ///
+    /// ⚠️ 两处的步长不同(16 vs 8)⇒ **判据必须与核内 `gdn_rec_fast_shape` 同源**;
+    /// 单测 `gdn_rec_geometry_matches_route` 把这条钉住。
+    /// 快路形状判据 —— **必须与 `cu/gdn/gdn_recurrence.cu` 的
+    /// `gdn_rec_fast_shape` 逐字同源**(device 侧调不到 host fn)。
+    /// 不一致不是"性能差一点",而是**覆盖错位**(legacy 的列步长 = 8,快路 = 16)
+    /// ⇒ 由单测 `gdn_rec_geometry_matches_route` 钉住。
+    pub fn recurrence_varlen_gqa_fast(kd: usize, vd: usize) -> bool {
+        kd == 128 && vd % 2 == 0
+    }
+
+    pub fn recurrence_varlen_gqa(dt: DType, vd: usize, nv: usize, kd: usize, batch: usize) -> KernelPick {
         assert!(
             matches!(dt, DType::F16),
             "owl_gdn_recurrence_varlen_gqa 仅有 f16 变体(dt={dt:?})"
         );
+        let fast = recurrence_varlen_gqa_fast(kd, vd);
         KernelPick::of::<crate::ops::gdn::RecurrenceVarlenGqaF16>(Shape {
-            grid: (vd.div_ceil(8) as u32, nv as u32, 1),
+            // grid.y = batch × nv(核内 seq_head = blockIdx.y,按 seq_idx = seq_head/nv
+            // 取 slots[seq_idx];单序列时与旧形逐位一致)
+            grid: (vd.div_ceil(if fast { 16 } else { 8 }) as u32, (nv * batch.max(1)) as u32, 1),
             block: (32, 8, 1),
             smem: ((4 * kd + 4) * 4) as u32,
         })
@@ -1880,6 +1899,43 @@ pub mod elems {
         })
     }
 
+    /// **gemv_i8w:int8 权重 × f16 激活的 GEMV**(m=1 decode;P1.5-a)。
+    ///
+    /// 一 warp 一行、**8 warp/块**(块内共用一份 x 行缓存,`smem = cols·2 B`);
+    /// 每 lane 一次读 16 B(16 个 int8)⇒ 要求 `cols % 16 == 0`。
+    pub fn gemv_i8w(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        assert!(cols % 16 == 0, "gemv_i8w 要求 cols % 16 == 0(每 lane 16 B 对齐),得 {cols}");
+        KernelPick::of::<crate::ops::elems::GemvI8wF16>(Shape {
+            grid: (rows.div_ceil(8) as u32, tokens as u32, 1),
+            block: (256, 1, 1),
+            smem: (cols * 2) as u32,
+        })
+    }
+
+    /// **装载期 lm_head 逐行 int8 量化**(两发:scale → q;P1.5-a)。
+    /// 几何 = **一 block 一行**(grid = rows,block 256,零动态 smem)。
+    pub fn quant_i8_row_w_scale() -> KernelPick {
+        KernelPick::of::<crate::ops::load::QuantI8RowWScaleBf16>(Shape {
+            grid: (1, 1, 1),  // 调用方按 rows 覆盖(见 quant_i8_row_w_grid)
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// 同上的第二步(q);几何同 [`quant_i8_row_w_scale`]
+    pub fn quant_i8_row_w_q() -> KernelPick {
+        KernelPick::of::<crate::ops::load::QuantI8RowWQBf16>(Shape {
+            grid: (1, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// 两步共用的真实几何(grid.x = rows)
+    pub fn quant_i8_row_w_grid(rows: usize) -> Shape {
+        Shape { grid: (rows.max(1) as u32, 1, 1), block: (256, 1, 1), smem: 0 }
+    }
+
     /// 行栈 concat(arity ≤ 8;哨兵 1D)
     pub fn concat(dt: DType) -> KernelPick {
         KernelPick { name: dt_name("concat", dt), shape: SENTINEL_1D }
@@ -1975,11 +2031,40 @@ mod tests {
 
     #[test]
     fn recurrence_smem_contract() {
-        let p = gdn::recurrence_varlen_gqa(DType::F16, 128, 16, 128);
+        // kd=128 ⇒ **快路**(2 列/warp ⇒ x 步长 16);smem 契约保持原值(快路不用,
+        // legacy 回落时才是真契约 —— 同一个入口,故仍按 (4·kd+4)·4 传)
+        let p = gdn::recurrence_varlen_gqa(DType::F16, 128, 16, 128, 1);
         assert_eq!(p.name, "owl_gdn_recurrence_varlen_gqa_f16");
-        assert_eq!(p.shape.grid, (16, 16, 1));
+        assert_eq!(p.shape.grid, (8, 16, 1), "快路:ceil(128/16)");
         assert_eq!(p.shape.block, (32, 8, 1));
         assert_eq!(p.shape.smem, (4 * 128 + 4) * 4);
+    }
+
+    /// **路由一致性门**(2026-10-19 P1.4):host 的 grid 步长必须与核内
+    /// `gdn_rec_fast_shape` 判据同源 —— 不一致 ⇒ 列覆盖错位(缺一半或越界),
+    /// 而两种错都**不会当场报错**。这条单测把"判据 → 步长"的映射拍死。
+    #[test]
+    fn gdn_rec_geometry_matches_route() {
+        // 表 = (kd, vd, 快路?, 期望 grid.x):覆盖 0.8B / 27B / TP 两档 / 非 128 头维
+        let cases = [
+            (128usize, 128usize, true, 8u32),   // 27B TP2 每 rank nv=24 · 4 行/线
+            (128, 64, true, 4),                 // 假设的窄 v 维(vd 偶数)
+            (128, 1, false, 1),                 // vd 奇 ⇒ 回落 legacy
+            (64, 128, false, 16),               // kd≠128 ⇒ 回落 legacy
+            (128, 256, true, 16),
+        ];
+        for (kd, vd, fast, gx) in cases {
+            assert_eq!(gdn::recurrence_varlen_gqa_fast(kd, vd), fast, "判据 kd={kd} vd={vd}");
+            let p = gdn::recurrence_varlen_gqa(DType::F16, vd, 16, kd, 1);
+            assert_eq!(p.shape.grid.0, gx, "grid.x kd={kd} vd={vd}");
+            // 覆盖性:快路须 ≥ vd/2 组(每组 2 列),legacy 须 ≥ vd 列
+            let covered = if gdn::recurrence_varlen_gqa_fast(kd, vd) {
+                gx as usize * 8 * 2
+            } else {
+                gx as usize * 8
+            };
+            assert!(covered >= vd, "kd={kd} vd={vd} 覆盖 {covered} < {vd}");
+        }
     }
 
     #[test]

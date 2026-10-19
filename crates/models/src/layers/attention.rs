@@ -216,6 +216,9 @@ impl Attention {
         // 改成一次 `filter`,拿到 `pol` 才进分支(热路径,谓词求值一处分发)。
         let insert_pol = pol.as_ref().filter(|p| {
             dt_raw == Dtype::F16
+                // 融合插池核是**单行形状**(B5.1:批 decode 走下面的
+                // verify_v2_arm 自带 K0 多行写;两臂不重叠)
+                && tokens == 1
                 && !force_naive
                 && ctx.env.attn.qkv_fuse
                 && crate::ops::paged_decode_ok(self.hd, p.page)
@@ -309,6 +312,36 @@ impl Attention {
         // 诊断开关(OWL_FORCE_NAIVE=1):强制 naive 回退路径 —— paged 核
         // 数值质量的 A/B 对照(2026-09-27 文本退化排查)
         let force_naive = ctx.env.attn.force_naive_prefill;
+        // **批 decode 臂**(B5.1 M1;2026-10-20):T>1 = B 个会话各一步。
+        // 语义 = verify 的 seq 维(T 伪序列,每行一条页链 `bt8 [T,nb]`),
+        // 但 GDN 走 decode 路径的 per-row `slots[b]`(不是 varlen 块)。
+        // 显式失败:分页池 + T>1 缺批面(v2 scratch `seqs==T` + `v2_bt8`)
+        // ⇒ 毒化声明,不许落回单 seq 核读错链。
+        if tokens > 1 {
+            // 无分页策略(CPU 锚链/legacy 池)⇒ 落 `NaiveDecode` 逐行槽窗
+            // (核原生 `slots[t]/kv_lens[t]`;M0 模型门已证 T=2 ≡ 2×T=1)。
+            if let Some(pol) = ctx.env.kv.policy() {
+            // 页配对不支持的小几何(fixture hd=4 等)⇒ 与 T=1 同律回落
+            // `NaiveDecode`(逐行槽窗),**不是错误**(谓词门与单行路径同源)。
+            if crate::ops::paged_prefill_ok(self.hd, pol.page) {
+            match (ctx.attn_v2.as_ref(), ctx.v2_bt8.as_ref()) {
+                (Some(s2), Some(bt8)) if s2.seqs == tokens => {
+                    note_arm("attn.arm.decode.batch");
+                    return self.verify_v2_arm(
+                        &q, &k, &v, &gate, kv, tokens, ctx, &pol, &kv.slots, &kv.kv_lens, bt8, s2,
+                    );
+                }
+                _ => {
+                    return TensorOps::poisoned(
+                        Dtype::F32,
+                        vec![tokens, self.hq * self.hd],
+                        "attn: decode T>1 缺批面(需 attn_v2.seqs==T + v2_bt8)",
+                    )
+                }
+            }
+            } // if paged_prefill_ok —— 小几何回落 naive
+            } // if let Some(pol) —— 无策略 = naive 逐行
+        }
         if let Some(pol) = ctx.env.kv.policy() {
             // paged 分派(K1):K0 写核 + v1 分页打分(vLLM classic 布局;
             // 页/x 来自 kv_paged_policy,块表语义见 block_tables 头注。
@@ -1693,7 +1726,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -1897,7 +1930,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, eps, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -2117,7 +2150,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f16 装载");
@@ -2215,7 +2248,7 @@ mod f16_tests {
         let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx)
             .await
             .expect("attention f32 装载");
@@ -2348,6 +2381,8 @@ mod owl_port_tests {
             device_repack: false,
             verify: false,
             debug_tap: false,
+            staging_mb: 128,
+            dump: false,
         };
         // 六槽源(本模块本地化;兄弟模块的同名 helper 私有)
         let src = crate::testkit::Src::from([
@@ -2600,7 +2635,7 @@ mod owl_port_tests {
         let sh = crate::contract::Shape::from(vec![n]);
         let dg = owl_iface::htod!(gpu, Dtype::F16, &sh, &gate.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()).await.expect("gate");
         let dxx = owl_iface::htod!(gpu, Dtype::F16, &sh, &x.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect::<Vec<u8>>()).await.expect("x");
-        let _dout = owl_iface::alloc!(gpu, Dtype::F16, n).await.expect("alloc");
+        let _dout = owl_iface::client_alloc!(gpu, Dtype::F16, n).await.expect("alloc");
         let g_decl = TensorOps::of_block(dg.id, Dtype::F16, vec![n]);
         let x_decl = TensorOps::of_block(dxx.id, Dtype::F16, vec![n]);
         let decl = TensorOps::call(SemanticKernel::GateMul)
@@ -2669,6 +2704,8 @@ mod view_alias_tests {
             device_repack: false,
             verify: false,
             debug_tap: false,
+            staging_mb: 128,
+            dump: false,
         };
         crate::interpreters::eval_load(&attn, &mut gpu, &src, &lctx).await.expect("attn 装载");
         let rp = crate::layers::rope::Rope::new(512, hd, 32, 10_000.0).expect("rope");
@@ -2821,8 +2858,8 @@ mod naive_attn_f16_tests {
         let _dq = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![2, hq, hd]), &hb(&q)).await.unwrap();
         let _dk = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![2, hkv, hd]), &hb(&k)).await.unwrap();
         let _dv = owl_iface::htod!(gpu, Dtype::F16, &sh(vec![2, hkv, hd]), &hb(&v)).await.unwrap();
-        let kc = owl_iface::alloc!(gpu, Dtype::F16, slots_n * hkv * hd).await.unwrap();
-        let vc = owl_iface::alloc!(gpu, Dtype::F16, slots_n * hkv * hd).await.unwrap();
+        let kc = owl_iface::client_alloc!(gpu, Dtype::F16, slots_n * hkv * hd).await.unwrap();
+        let vc = owl_iface::client_alloc!(gpu, Dtype::F16, slots_n * hkv * hd).await.unwrap();
 
         // 两步:token0(slot0,win[0,0]) → token1(slot1,win[0,1])
         let mut outs = Vec::new();

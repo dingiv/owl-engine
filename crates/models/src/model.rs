@@ -49,6 +49,14 @@ use crate::TensorOps;
 #[derive(Clone)]
 pub struct ModelSpec {
     pub vocab: usize,
+    /// **lm_head 的输出行数**(P1.1 词表切;缺省 = `vocab`)。
+    /// 由 [`ModelSpec::sharded`] 从 `head_split` 派生 —— 唯一的"本 rank
+    /// logits 宽度"真源(引擎侧 logits 槽形状/采样拼接都读它)。
+    pub head_vocab: usize,
+    /// **词表切开关**(P1.1;意图位,来自引擎配置 `runtime.tp_vocab_split`)。
+    /// `sharded()` 只读它一次:`true` ⇒ `head_vocab = vocab / world`(必须整除,
+    /// 否则响亮拒)。缺省 `false` ⇒ 逐字节等价于旧行为。
+    pub head_split: bool,
     pub hidden: usize,
     pub inter: usize,
     /// 模型计算 dtype(f16 基线 F5;装载/核名/KV 池的单一事实源)
@@ -82,13 +90,28 @@ impl ModelSpec {
     ///
     /// **整除硬门**:任一切分维不被 world 整除 ⇒ 结构化拒(不许 pad)。
     pub fn sharded(&self, plan: crate::plan::tp::TpPlan) -> Result<ModelSpec, String> {
+        // **tied 表切不了**（P1.1）：lm_head 复用 embed 表（查任意 token 必须全量）
+        // ⇒ “每 rank 只持半表头”无据可依。响亮拒（静默忽略 = 配置说谎）。
+        if self.head_split && self.tied {
+            return Err(
+                "词表切(TP vocab split)需要 untied 检查点：本模型 tie_word_embeddings = true，\
+                 lm_head 复用 embed 全量表（tied 档请关 runtime.tp_vocab_split）"
+                    .into(),
+            );
+        }
         if plan.is_single() {
-            return Ok(self.clone());
+            let mut s = self.clone();
+            s.head_vocab = self.vocab; // 单卡退化:头也全量(与 head_split 无关)
+            return Ok(s);
         }
         let (hq, hkv, hd) = self.full_heads;
         let (nk, hk, nv, hv) = self.gdn_heads;
         Ok(ModelSpec {
             vocab: self.vocab,
+            // **词表切(P1.1)**:embed 表保持全量(查表要任意 token);
+            // lm_head 行数按 world 等分(`head_split = false` ⇒ 全量)。
+            head_vocab: if self.head_split { plan.shard_len(self.vocab)? } else { self.vocab },
+            head_split: self.head_split,
             hidden: self.hidden,
             inter: plan.shard_len(self.inter)?,
             dtype: self.dtype,
@@ -178,12 +201,13 @@ impl Model {
                 plan.at(&keys.embed_key("weight"), spec.vocab, spec.hidden),
             )?
         } else {
-            Embedding::new_untied_quant(
+            // P1.1:head_vocab < vocab ⇒ 词表切;GGUF 档表/头**两个独立计划**
+            Embedding::new_untied_head_two_plans(
                 spec.vocab,
+                spec.head_vocab,
                 spec.hidden,
-                // **表自己的计划**(逐张量;GGUF 档的表是量化块 —— 与 tied/untied 无关)
                 plan.at(&keys.embed_key("weight"), spec.vocab, spec.hidden),
-                head.head(spec.vocab, spec.hidden),
+                head.head(spec.head_vocab, spec.hidden),
             )?
         };
         Ok(Model {
@@ -203,6 +227,14 @@ impl Model {
 
     pub fn vocab_size(&self) -> usize {
         self.vocab
+    }
+
+    /// **本 rank 的 logits 宽度**(P1.1):词表切档 = `vocab / world`;
+    /// 未切档 = `vocab`(与 `vocab_size()` 同值)。
+    /// ⚠️ 引擎侧的 logits 槽形状、采样拼接、门判据都以**本函数**为真源;
+    /// `vocab_size()` 仍是"词表全量"(embed 表/tokenizer/draft 面用它)。
+    pub fn logits_vocab(&self) -> usize {
+        self.embed.head_vocab()
     }
 
     /// VLM 图像 token 注入(embed 之后 / 层循环之前 —— 与 HF
@@ -470,6 +502,76 @@ mod spec_shard_tests {
         assert_eq!((s1.inter, s1.full_heads, s1.gdn_heads), (s.inter, s.full_heads, s.gdn_heads));
     }
 
+    /// **P1.1 词表切**:`head_split = true` ⇒ `head_vocab = vocab / world`,
+    /// embed 表仍全量;`false` ⇒ 逐字段不变(缺省零行为变化)
+    #[test]
+    fn sharded_head_split_splits_only_the_head() {
+        let mut full = crate::formats::qwen35::qwen3_8_27b();
+        assert_eq!(full.head_vocab, full.vocab, "缺省:头 = 全量");
+        let s0 = full.sharded(plan(0, 2)).expect("未开切:可切");
+        assert_eq!(s0.head_vocab, 248320, "未开切 ⇒ 头全量(旧行为)");
+        full.head_split = true;
+        let s = full.sharded(plan(0, 2)).expect("词表切:可切");
+        assert_eq!(s.vocab, 248320, "**embed 表仍全量**(每 rank 查任意 token)");
+        assert_eq!(s.head_vocab, 124160, "lm_head 切半");
+        assert!(s.head_split, "意图位透传");
+        // 两 rank 行区间恰好覆盖 [0, vocab) 且互不重叠
+        let r0 = TpPlan::new(0, 2).unwrap().shard_range(248320).unwrap();
+        let r1 = TpPlan::new(1, 2).unwrap().shard_range(248320).unwrap();
+        assert_eq!((r0.start, r0.end, r1.start, r1.end), (0, 124160, 124160, 248320));
+        // world=1 退化:即使开了切,头也是全量
+        let s1 = full.sharded(TpPlan::single()).expect("单卡");
+        assert_eq!(s1.head_vocab, 248320);
+    }
+
+    /// **整除硬门**:词表不被 world 整除 ⇒ 响亮拒(不许 pad)
+    #[test]
+    fn sharded_head_split_refuses_uneven_vocab() {
+        let full = ModelSpec {
+            vocab: 5, // 奇数:world=2 切不动
+            head_vocab: 5,
+            head_split: true,
+            hidden: 8,
+            inter: 4,
+            dtype: crate::contract::Dtype::F16,
+            full_heads: (2, 2, 4), // hkv 也要被 2 整除(否则拒因不在词表那一维)
+            gdn_heads: (2, 4, 2, 4),
+            eps: 1e-6,
+            layer_types: vec![true],
+            tokenizer: crate::formats::qwen35::qwen3_5_0_8b().tokenizer,
+            tied: false,
+        };
+        let e = match full.sharded(plan(0, 2)) {
+            Err(e) => e,
+            Ok(_) => panic!("vocab 5 不被 2 整除应拒"),
+        };
+        assert!(e.contains("整除") || e.contains("shard"), "拒因应指向整除:{e}");
+        // 同 spec 关掉切 ⇒ 可切(证明拒因只在词表切那一维)
+        let mut ok = full.clone();
+        ok.head_split = false;
+        assert!(ok.sharded(plan(0, 2)).is_ok());
+    }
+
+    /// **Model::new 的头部**:切档 ⇒ `logits_vocab = vocab/world` 且头规则 = UniformCol;
+    /// 未切档 ⇒ 全量 + 默认规则(Replicate)
+    #[test]
+    fn model_head_vocab_and_rule_follow_the_split() {
+        let full = crate::formats::qwen35::qwen3_8_27b();
+        let keys = || crate::formats::qwen35::Qwen35Convention::new("model");
+        let m_full = super::Model::new(&full, keys(), crate::module::QuantPlan::F16, crate::module::QuantPlan::F16).expect("模型构造");
+        assert_eq!(m_full.logits_vocab(), 248320);
+        assert_eq!(m_full.vocab_size(), 248320);
+        assert_eq!(m_full.embed.head_rule(), crate::plan::rules::WeightRule::Replicate, "未切:头不切");
+
+        let mut sp = full.clone();
+        sp.head_split = true;
+        let sharded = sp.sharded(plan(0, 2)).expect("切");
+        let m = super::Model::new(&sharded, keys(), crate::module::QuantPlan::F16, crate::module::QuantPlan::F16).expect("模型构造");
+        assert_eq!(m.logits_vocab(), 124160, "本 rank 的 logits 宽度");
+        assert_eq!(m.vocab_size(), 248320, "词表全量(embed/tokenizer 面)");
+        assert_eq!(m.embed.head_rule(), crate::plan::rules::WeightRule::UniformCol, "切档:头按 out 维切");
+    }
+
     /// world=1 = 逐字段恒等(退化路径零特判)
     #[test]
     fn sharded_single_is_identity() {
@@ -570,6 +672,8 @@ mod tests {
 
     fn spec() -> ModelSpec {
         ModelSpec {
+            head_vocab: 248320,
+            head_split: false,
             vocab: VOCAB,
             hidden: HIDDEN,
             inter: INTER,
@@ -1074,6 +1178,281 @@ mod tests {
             let want = host.step(id, pos, slot as usize, kv_len as usize);
             assert_close(&got, &want, 1e-4, &format!("model-step{si}"));
         }
+        gpu.close().await.expect("关机");
+    }
+
+    /// **批语义 M0 门**(B5.1,2026-10-20):两会话一次 T=2 decode ≡ 两次 T=1。
+    ///
+    /// fixture 的小几何(hd=4)不在分页配对里 ⇒ 落 `NaiveDecode` 槽直排
+    /// (与 T=1 同一条回退律);验的是**批语义本身**:
+    /// 每行自己的 KV 槽窗(`slots[]`/`kv_lens[]`,两条互不相邻的链)与
+    /// GDN 行(`gdn.slots[]`)。串行臂/合批臂各用**一套独立缓冲**(同零初态 +
+    /// 相同 prefill),判据 = logits 逐位/近位相同 + 第二步(状态续跑)仍相同。
+    /// 分页 v2 seq 臂(不同 bt 行)由 verify T=8 已证同核,引擎接入另测。
+    async fn model_step(
+        gpu: &mut owl_cuda::GpuClient,
+        model: &Model,
+        rp: &Rope,
+        kvs: &[KvBuffers],
+        gdns: &[GdnBuffers],
+        tokens: &[f32],
+        pos: &[f32],
+        slots: &[f32],
+        lens: &[f32],
+        gslots: &[f32],
+    ) -> Vec<f32> {
+        let t = tokens.len();
+        let ids = TensorOps::from_host(Dtype::F32, vec![t], &f32b(tokens));
+        let pos_t = TensorOps::from_host(Dtype::F32, vec![1, t], &f32b(pos));
+        let kvs_step: Vec<KvBuffers> = kvs
+            .iter()
+            .map(|kv| KvBuffers {
+                k_cache: kv.k_cache.clone(),
+                v_cache: kv.v_cache.clone(),
+                slots: TensorOps::from_host(Dtype::F32, vec![1, t], &f32b(slots)),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, t], &f32b(lens)),
+                block_tables: kv.block_tables.clone(),
+            })
+            .collect();
+        let gdns_step: Vec<GdnBuffers> = gdns
+            .iter()
+            .map(|g| GdnBuffers {
+                conv_q: g.conv_q.clone(),
+                conv_k: g.conv_k.clone(),
+                conv_v: g.conv_v.clone(),
+                rec: g.rec.clone(),
+                slots: TensorOps::from_host(Dtype::F32, vec![t], &f32b(gslots)),
+            })
+            .collect();
+        let ctx = ForwardCtx::model_decode(t, &pos_t, &kvs_step, &rp, &gdns_step);
+        let logits = model.forward(&ids, &ctx);
+        crate::testkit::harvest(gpu, &logits).await
+    }
+
+    #[tokio::test]
+    async fn gpu_model_batch_decode_matches_serial() {
+        if !gpu_enabled() {
+            skip_note();
+            return;
+        }
+        let model = Model::new(
+            &spec(),
+            LlamaFamily::new("model.language_model"),
+            QuantPlan::F16,
+            QuantPlan::F16,
+        ).expect("模型构造");
+        let src = checkpoint_src();
+        let mut gpu = gpu_client().await;
+        crate::interpreters::eval_load(&model, &mut gpu, &src, &Default::default())
+            .await
+            .expect("model.eval_load");
+        let rp = Rope::new(64, HD, HD, 10_000.0).expect("rope");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &Default::default())
+            .await
+            .expect("rope 表");
+
+        // 两套独立缓冲:会话 A(slot 0..2 / GDN 0)、会话 B(slot 4..6 / GDN 1)
+        // —— KV_ROWS=8 / MAX_SLOTS=4 内。
+        let (kvs_s, gdns_s) = model_bufs(&mut gpu, 1, 3).await;
+        let (kvs_b, gdns_b) = model_bufs(&mut gpu, 1, 3).await;
+
+        // prefill:每会话两步(T=1),两臂逐字相同。
+        let steps: [(&[f32], &[f32], &[f32], &[f32], &[f32]); 4] = [
+            (&[5.0], &[0.0], &[0.0], &[1.0], &[0.0]),
+            (&[9.0], &[1.0], &[1.0], &[2.0], &[0.0]),
+            (&[3.0], &[0.0], &[4.0], &[1.0], &[1.0]),
+            (&[7.0], &[1.0], &[5.0], &[2.0], &[1.0]),
+        ];
+        for (tok, pos, slot, len, gs) in steps {
+            let _ = model_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s, tok, pos, slot, len, gs).await;
+            let _ = model_step(&mut gpu, &model, &rp, &kvs_b, &gdns_b, tok, pos, slot, len, gs).await;
+        }
+
+        // 串行臂:两步单行(A 再 B)。
+        let a1 = model_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s, &[11.0], &[2.0], &[2.0], &[3.0], &[0.0]).await;
+        let b1 = model_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s, &[13.0], &[2.0], &[6.0], &[3.0], &[1.0]).await;
+        // 合批臂:一次 T=2(各走各的链/行)。
+        let batch1 = model_step(&mut gpu, &model, &rp, &kvs_b, &gdns_b, &[11.0, 13.0], &[2.0, 2.0], &[2.0, 6.0], &[3.0, 3.0], &[0.0, 1.0]).await;
+        assert_eq!(batch1.len(), 2 * VOCAB, "合批 logits 行数");
+        assert_close(&batch1[..VOCAB], &a1, 1e-5, "batch-step1-rowA");
+        assert_close(&batch1[VOCAB..], &b1, 1e-5, "batch-step1-rowB");
+
+        // 第二步:验**状态续跑**(KV 写入 + GDN conv/rec 推进)两臂仍同。
+        let a2 = model_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s, &[17.0], &[3.0], &[3.0], &[4.0], &[0.0]).await;
+        let b2 = model_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s, &[19.0], &[3.0], &[7.0], &[4.0], &[1.0]).await;
+        let batch2 = model_step(&mut gpu, &model, &rp, &kvs_b, &gdns_b, &[17.0, 19.0], &[3.0, 3.0], &[3.0, 7.0], &[4.0, 4.0], &[0.0, 1.0]).await;
+        assert_close(&batch2[..VOCAB], &a2, 1e-5, "batch-step2-rowA");
+        assert_close(&batch2[VOCAB..], &b2, 1e-5, "batch-step2-rowB");
+
+        // 反向判别:两行必须**不同**(否则判据无分辨率)
+        let d: f32 = batch1[..VOCAB].iter().zip(&batch1[VOCAB..]).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        assert!(d > 1e-3, "两行 logits 相同(maxdiff={d})→ 判据无分辨率");
+        println!("✅ batch decode: T=2 与串行 T=1×2 两行逐位同级(maxdiff row={d:.3e})");
+        gpu.close().await.expect("关机");
+    }
+
+    /// **M2 前置门**(B5.1):多序列 prefill(T = Σ 各会话行,`seq_cu`
+    /// 分段)与逐会话串行 prefill **logits 同级**。这是 spec 回合合批
+    /// (verify 8 行 × B 会话)的模型语义底:GDN 走 varlen 的 `slots[seq_idx]`,
+    /// 注意力走逐行 `kv_slots/kv_lens`。
+    async fn model_prefill_step(
+        gpu: &mut owl_cuda::GpuClient,
+        model: &Model,
+        rp: &Rope,
+        kvs: &[KvBuffers],
+        gdns: &[GdnBuffers],
+        tokens: &[f32],
+        pos: &[f32],
+        slots: &[f32],
+        lens: &[f32],
+        gslots: &[f32],
+        seq_cu: &[f32],
+    ) -> Vec<f32> {
+        let t = tokens.len();
+        let ids = TensorOps::from_host(Dtype::F32, vec![t], &f32b(tokens));
+        let pos_t = TensorOps::from_host(Dtype::F32, vec![1, t], &f32b(pos));
+        let slots_t = TensorOps::from_host(Dtype::F32, vec![t], &f32b(slots));
+        let lens_t = TensorOps::from_host(Dtype::F32, vec![t], &f32b(lens));
+        let gslot_t = TensorOps::from_host(Dtype::F32, vec![gslots.len()], &f32b(gslots));
+        let cu = TensorOps::from_host(Dtype::F32, vec![seq_cu.len()], &f32b(seq_cu));
+        let kvs_step: Vec<KvBuffers> = kvs
+            .iter()
+            .map(|kv| KvBuffers {
+                k_cache: kv.k_cache.clone(),
+                v_cache: kv.v_cache.clone(),
+                slots: slots_t.clone(),
+                kv_lens: lens_t.clone(),
+                block_tables: kv.block_tables.clone(),
+            })
+            .collect();
+        let gdns_step: Vec<GdnBuffers> = gdns
+            .iter()
+            .map(|g| GdnBuffers {
+                conv_q: g.conv_q.clone(),
+                conv_k: g.conv_k.clone(),
+                conv_v: g.conv_v.clone(),
+                rec: g.rec.clone(),
+                slots: gslot_t.clone(),
+            })
+            .collect();
+        let mut ctx = ForwardCtx::model_prefill(
+            t, &pos_t, &kvs_step, &rp, &gdns_step, &slots_t, &lens_t, &gslot_t, None, 0, None,
+        );
+        ctx.seq_cu = Some(&cu);
+        let logits = model.forward(&ids, &ctx);
+        crate::testkit::harvest_f16(gpu, &logits).await
+    }
+
+    /// F16 KV 缓冲套(KV 池 = F16,GDN 状态恒 F32)
+    async fn model_bufs_f16(
+        gpu: &mut owl_cuda::GpuClient,
+        n_full: usize,
+        n_gdn: usize,
+    ) -> (Vec<KvBuffers>, Vec<GdnBuffers>) {
+        let kv_zero = vec![0u8; KV_ROWS * HKV * HD * 2];
+        let mut kvs = Vec::new();
+        for _ in 0..n_full {
+            let k = crate::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::F16, vec![KV_ROWS * HKV * HD], &kv_zero).step(),
+                gpu,
+            )
+            .await
+            .expect("kv zero");
+            let v = crate::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::F16, vec![KV_ROWS * HKV * HD], &kv_zero).step(),
+                gpu,
+            )
+            .await
+            .expect("kv zero");
+            kvs.push(KvBuffers {
+                k_cache: TensorOps::of_block(k.id, Dtype::F16, vec![KV_ROWS, HKV, HD]),
+                v_cache: TensorOps::of_block(v.id, Dtype::F16, vec![KV_ROWS, HKV, HD]),
+                slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),
+                block_tables: TensorOps::zeros(Dtype::F32, vec![1]),
+            });
+        }
+        let key_dim = NK * HK_DIM;
+        let value_dim = NV * HV_DIM;
+        let mut gdns = Vec::new();
+        for _ in 0..n_gdn {
+            gdns.push(GdnBuffers {
+                conv_q: zero_block(gpu, MAX_SLOTS * key_dim * 3, vec![MAX_SLOTS, key_dim, 3]).await,
+                conv_k: zero_block(gpu, MAX_SLOTS * key_dim * 3, vec![MAX_SLOTS, key_dim, 3]).await,
+                conv_v: zero_block(gpu, MAX_SLOTS * value_dim * 3, vec![MAX_SLOTS, value_dim, 3]).await,
+                rec: zero_block(gpu, MAX_SLOTS * NV * HK_DIM * HV_DIM, vec![MAX_SLOTS, NV, HK_DIM, HV_DIM]).await,
+                slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+            });
+        }
+        (kvs, gdns)
+    }
+
+    #[tokio::test]
+    async fn gpu_model_batch_prefill_matches_serial() {
+        if !gpu_enabled() {
+            skip_note();
+            return;
+        }
+        // 必须走 **F16 批核 prefill**(`forward_prefill_batch`,varlen `slots[seq_idx]`)：
+        // F32 语义锚链的 expanded 路径按 token 行索引取 slots（单序列语义），
+        // 多序列会恒读 slots[0] —— 那是测试面限制，不是生产路径。
+        // 装载 dtype 由 `LoaderCtx.dtype` 定（`Model::new` 不读 spec.dtype）。
+        let model = Model::new(
+            &spec(),
+            LlamaFamily::new("model.language_model"),
+            QuantPlan::F16,
+            QuantPlan::F16,
+        ).expect("模型构造");
+        let src = checkpoint_src();
+        let mut gpu = gpu_client().await;
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, ..Default::default() };
+        crate::interpreters::eval_load(&model, &mut gpu, &src, &lctx)
+            .await
+            .expect("model.eval_load(F16)");
+        let rp = Rope::new(64, HD, HD, 10_000.0).expect("rope");
+        crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(), &lctx)
+            .await
+            .expect("rope 表(F16)");
+        let (kvs_s, gdns_s) = model_bufs_f16(&mut gpu, 1, 3).await;
+        let (kvs_b, gdns_b) = model_bufs_f16(&mut gpu, 1, 3).await;
+
+        // ── prefill:会话 A 2 行(slot 0,1 / GDN 0)、B 1 行(slot 4 / GDN 1)──
+        // 串行臂:两次单序列 prefill
+        let _ = model_prefill_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s,
+            &[5.0, 9.0], &[0.0, 1.0], &[0.0, 1.0], &[1.0, 2.0], &[0.0], &[0.0, 2.0]).await;
+        let _ = model_prefill_step(&mut gpu, &model, &rp, &kvs_s, &gdns_s,
+            &[3.0], &[0.0], &[4.0], &[1.0], &[1.0], &[0.0, 1.0]).await;
+        // 合批臂:一次 T=3,seq_cu = [0,2,3]
+        let batch_pre = model_prefill_step(&mut gpu, &model, &rp, &kvs_b, &gdns_b,
+            &[5.0, 9.0, 3.0], &[0.0, 1.0, 0.0], &[0.0, 1.0, 4.0], &[1.0, 2.0, 1.0],
+            &[0.0, 1.0], &[0.0, 2.0, 3.0]).await;
+        // 串行臂的逐会话 logits(重跑以取输出;状态已推进 ⇒ 用第二套缓冲)
+        let (kvs_s2, gdns_s2) = model_bufs_f16(&mut gpu, 1, 3).await;
+        let sA = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
+            &[5.0, 9.0], &[0.0, 1.0], &[0.0, 1.0], &[1.0, 2.0], &[0.0], &[0.0, 2.0]).await;
+        let sB = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
+            &[3.0], &[0.0], &[4.0], &[1.0], &[1.0], &[0.0, 1.0]).await;
+        assert_close(&batch_pre[..2 * VOCAB], &sA[..], 1e-5, "batch-prefill-A");
+        assert_close(&batch_pre[2 * VOCAB..], &sB[..], 1e-5, "batch-prefill-B");
+
+        // ── verify 形(槽区不重叠):A 2 行(slot 2,3;pos 2,3)、
+        //    B 3 行(slot 5..7;pos 1..3)──
+        let a1 = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
+            &[11.0, 12.0], &[2.0, 3.0], &[2.0, 3.0], &[3.0, 4.0],
+            &[0.0], &[0.0, 2.0]).await;
+        let b1 = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
+            &[21.0, 22.0, 23.0], &[1.0, 2.0, 3.0], &[5.0, 6.0, 7.0], &[2.0, 3.0, 4.0],
+            &[1.0], &[0.0, 3.0]).await;
+        // 合批臂:一次 T=5,seq_cu = [0,2,5]
+        let batch_v = model_prefill_step(&mut gpu, &model, &rp, &kvs_b, &gdns_b,
+            &[11.0, 12.0, 21.0, 22.0, 23.0],
+            &[2.0, 3.0, 1.0, 2.0, 3.0],
+            &[2.0, 3.0, 5.0, 6.0, 7.0],
+            &[3.0, 4.0, 2.0, 3.0, 4.0],
+            &[0.0, 1.0], &[0.0, 2.0, 5.0]).await;
+        assert_close(&batch_v[..2 * VOCAB], &a1[..], 1e-5, "batch-verify-A");
+        assert_close(&batch_v[2 * VOCAB..], &b1[..], 1e-5, "batch-verify-B");
+        println!("✅ 多序列 prefill/verify(2 会话,seq_cu 分段)与串行逐位同级");
         gpu.close().await.expect("关机");
     }
 

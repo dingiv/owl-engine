@@ -282,6 +282,7 @@ impl SessionBank {
         policy: owl_store::AdmissionPolicy,
         target_layout: PoolLayout,
         mtp_layout: Option<PoolLayout>,
+        ledger: owl_store::SharedLedger,
     ) -> Result<Self> {
         // **缓存容量 = store 自决**(2026-10-19 容量定档):engine 只给两件事实
         // (设备页数/宿主预算)与一条**份额政策**,容量算式住在 store
@@ -304,6 +305,7 @@ impl SessionBank {
                 class: BlockClass::KvPage,
                 label: "target",
             },
+            ledger,
         )?;
         rel.leg.attach_pool(target_layout)?;
         let mut leg_mtp = BlockLeg::open(LegConfig {
@@ -508,7 +510,11 @@ mod bank_tests {
             kv_face_bytes: p.nb * p.block_bytes,
         };
         let policy = owl_store::AdmissionPolicy::new(4, owl_store::QueuePolicy::Reject);
-        SessionBank::new(p, inputs, policy, target, mtp).expect("装配块腿")
+        let cell = owl_store::shared_ledger(owl_store::TierBudget {
+            host_bytes: inputs.host_bytes,
+            disk_bytes: inputs.disk_bytes,
+        });
+        SessionBank::new(p, inputs, policy, target, mtp, cell).expect("装配块腿")
     }
 
     #[test]

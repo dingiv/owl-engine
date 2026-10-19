@@ -25,10 +25,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// complete 与 abandon 共用 —— 两路径的清理原 ~20 行双写。
     pub(crate) fn burn_ephemeral(&mut self, session_id: u64) {
         self.bank.burn(session_id);
+        // **[N5 SessionClose]**:会话关闭 ⇒ 归属回 `System`(会话面已交还给
+        //    缓存/池;后续分配没有会话归属可谈)
+        self.set_dev_ctx(
+            owl_iface::handle::Owner::System,
+            owl_iface::handle::AssetClass::Unclassified,
+        );
     }
     pub async fn abandon(&mut self, err: String) -> TurnEvent {
-        let turn_id = self.turns.active.as_ref().map(|a| a.id).unwrap_or(0);
-        if let Some(act) = self.turns.active.take() {
+        let turn_id = self
+            .turns
+            .executing
+            .or_else(|| self.turns.active.first().map(|a| a.id))
+            .unwrap_or(0);
+        // B5.1:只弃**本步执行 turn**(批步错 = 该行失败;其余活跃行留场,
+        // 由服务面继续泵 —— 全清会把无辜会话连坐)。执行选择器缺省 = 活跃首
+        // (批动作失败时未选定)。
+        if let Some(act) = self.turns.take_exec() {
             // 草稿账随 act(TurnSpecState)销毁(生命周期收口)
             if act.ephemeral {
                 self.burn_ephemeral(act.session_id);
@@ -42,6 +55,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // S2b:还 GDN 行(半途状态**不落快照** —— 弃置的 turn 账面不可信)
             if let Err(e) = self.bank.rel.state.return_row(act.gdn_slot, None) {
                 owl_shared::log_warn!("session", "弃置 turn {} 还 GDN 行失败: {e}", act.id);
+            }
+            // **[N4 TurnEnd]**(弃置路径同款:归属下行;须在 act 还在手时取会话事实)
+            self.set_ctx_after_turn(act.session_id, act.ephemeral);
+            // abandon 返回 TurnEvent(非 Result)⇒ 节点失败**响亮留痕**但不掩盖原错
+            if let Err(e) = self.node(crate::running::Node::TurnEnd(act.id)).await {
+                owl_shared::log_warn!("store", "N4 节点失败(继续收尾): {e}");
             }
         }
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
@@ -64,7 +83,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
     pub(crate) async fn complete(&mut self, reason: crate::turn::FinishReason) -> Result<TurnEvent> {
-        let act = self.turns.active.take().ok_or_else(|| ModelError::EngineInvariant { what: "turn_end:无活跃 turn".into() })?;
+        let act = self.turns.take_exec().ok_or_else(|| ModelError::EngineInvariant { what: "turn_end:无活跃 turn".into() })?;
         // B4 分母保鲜回写(下一 turn 种入;见 RunningEngine::bare_cost_carry_ms)
         self.dev.spec_rt.carry_ms = act.spec.bare_cost_ewma_ms;
         self.dev.spec_rt.carry_ctx = act.spec.bare_cost_ctx;
@@ -81,7 +100,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // E2c:块链登记前缀缓存(缓存持引用;会话释放后块仍驻留)。
             // S3-2:登记走 store 的块腿(引用配对在腿内自洽)
             if self.dev.pool.paged {
-                let up = self.bank.rel.leg.register_chain(&s.tokens, &s.block_table)?;
+                // **会话感知**(2026-10-19):链块记到会话名下(淘汰时按会话从末端削)
+                let up = self.bank.rel.leg.register_chain_owned(
+                    &s.tokens,
+                    &s.block_table,
+                    act.session_id,
+                )?;
                 if self.cfg.knobs.probes.debug {
                     owl_shared::log_debug!(
                         "dbg prefix",
@@ -91,6 +115,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         up.evicted.len()
                     );
                 }
+            }
+        }
+        // **S6.1:盘上链索引**(turn 收口一次;内容可能还没溢写 ⇒ boot 按内容截断)。
+        // 放在 `ephemeral` 焚毁之前 —— 会话 tokens 此刻还在。
+        if self.dev.pool.paged && self.bank.rel.disk_enabled() {
+            let toks = self
+                .bank
+                .sessions
+                .get(act.session_id)
+                .map(|s| s.tokens.clone())
+                .unwrap_or_default();
+            if !toks.is_empty() {
+                self.write_chain_index(&toks).await?;
             }
         }
         if act.ephemeral {
@@ -108,6 +145,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if let Err(e) = self.bank.rel.state.return_row(act.gdn_slot, None) {
             owl_shared::log_warn!("session", "turn {} 还 GDN 行失败: {e}", act.id);
         }
+        // **[N4 TurnEnd]**:归属下行 —— 会话仍活 ⇒ `Session(s)`,焚毁 ⇒ `System`
+        self.set_ctx_after_turn(act.session_id, act.ephemeral);
+        // **[N4 TurnEnd]**(节点入口):池清点(改归属 Cache)+ 未归还清单(响亮)
+        self.node(crate::running::Node::TurnEnd(act.id)).await?;
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(act.id);
         // **B-3d**:选择层视图态随 turn 收口(视图是 turn 域资源 —— 下一 turn

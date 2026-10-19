@@ -139,21 +139,46 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
     let js: Vec<String> = {
         let mut v = Vec::new();
         for r in 0..2 {
-            v.push(tp.face_clone(r).expect("face clone").ledger_json().await.expect("ledger_json"));
+            // `ledger_json` 是 GpuClient 固有面(peer 账房)→ 走可变直通口
+            let mut f = tp.face_clone(r).expect("face clone");
+            v.push(f.client_mut().ledger_json().await.expect("ledger_json"));
         }
         v
     };
+    // ★ **2026-10-18:1-stage arena 另有 3 块/侧**(2 payload 槽 + 1 header)
+    // —— 见 `TP2-施工设计.md` §35 与 `tp.rs::handshake_arena`。账本断言必须把
+    //   两笔都算进来(否则门会把"多出的合法分配"当成漂移)。
+    let with_arena = matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"));
+    let arena_bytes = if with_arena { 2 * layout.slot_bytes + owl_cuda::comm::ar::HEADER_BYTES } else { 0 };
+    let per_rank_req = layout.total_bytes() + arena_bytes;
     let shared: Vec<u64> = js.iter().map(|j| json_u64(j, "shared_bytes")).collect();
     assert_eq!(shared[0], shared[1], "两侧分配额必须对称");
     for r in 0..2 {
-        assert!(shared[r] >= layout.total_bytes(), "rank{r} 账不得小于请求");
+        assert!(shared[r] >= per_rank_req, "rank{r} 账不得小于请求(staging + arena)");
         assert!(
-            shared[r] - layout.total_bytes() < (2 << 20),
-            "rank{r} 超出部分应是粒度上取整(< 2MiB);实得 {}B",
+            shared[r] - per_rank_req < (4 << 20),
+            "rank{r} 超出部分应是粒度上取整(< 4MiB;staging 与 arena 各自的 2MiB 取整);实得 {}B",
             shared[r]
         );
         assert_eq!(json_u64(&js[r], "alias_bytes"), shared[1 - r], "rank{r} alias 应等于对端分配额");
-        assert_eq!(json_u64(&js[r], "mappings"), 2, "rank{r} 笔数 = 1 分配 + 1 别名");
+        // 1 staging 分配 + 1 别名 +（2 槽 + 1 header)×(1 分配 + 1 别名)= 8
+        let want_map = if with_arena { 8 } else { 2 };
+        assert_eq!(json_u64(&js[r], "mappings"), want_map, "rank{r} 映射笔数 = staging 2 + arena 6(开启时)");
+    }
+    // ── ★ 1-stage arena:两档都断言(2026-10-18;缺省关,`OWL_TP_1STAGE=1` 开)──
+    // 缺省(v1 两段):**不得**有 arena(多占 64MiB/rank 的东西不许悄悄上场)。
+    // 开启:槽存在、容量合理、两个 header 不同块。
+    let expect_arena = matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"));
+    for r in 0..2 {
+        match tp.staging(r).arena() {
+            Some(a) => {
+                assert!(expect_arena, "rank{r} 有 arena 但 `OWL_TP_1STAGE` 没开(缺省必须关)");
+                assert_eq!(a.own_slots.len(), 2, "rank{r} 应有 2 个 payload 槽(乒乓)");
+                assert!(a.slot_bytes >= 1 << 20, "rank{r} 槽容量异常");
+                assert_ne!(a.own_hdr.id, a.peer_hdr.id, "rank{r} header 与对端 header 必须是两块");
+            }
+            None => assert!(!expect_arena, "rank{r} 开了 `OWL_TP_1STAGE` 却没有 arena"),
+        }
     }
 
     // ── ⑤ 别名连通实证:rank0 写 own → rank1 经 peer 读回 ───────────
@@ -194,8 +219,8 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
     let k0 = tp.face_clone(0).expect("face0(收尾)");
     let k1 = tp.face_clone(1).expect("face1(收尾)");
     tp.shutdown().await.expect("TP 收尾");
-    for (tag, f) in [("rank0", k0), ("rank1", k1)] {
-        let j = f.ledger_json().await.expect("ledger_json(after shutdown)");
+    for (tag, mut f) in [("rank0", k0), ("rank1", k1)] {
+        let j = f.client_mut().ledger_json().await.expect("ledger_json(after shutdown)");
         assert_eq!(json_u64(&j, "shared_bytes"), 0, "{tag} shared 未归零(泄漏)");
         assert_eq!(json_u64(&j, "alias_bytes"), 0, "{tag} alias 未归零(泄漏)");
         assert_eq!(json_u64(&j, "mappings"), 0, "{tag} mappings 未归零(泄漏)");

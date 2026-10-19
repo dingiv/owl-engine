@@ -314,6 +314,7 @@ pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "owl_gdn_norm_act_f16",
     "owl_gdn_recurrence_varlen_gqa_f16",
     "owl_gemv_dual_f16",
+    "owl_gemv_i8w_f16",
     "owl_naive_attn_nc_bf16_v2",
     "owl_narrow_strided_f16",
     "owl_norm_rope_bf16",
@@ -411,6 +412,9 @@ pub const PROD_GGUF4B_2026_10_19: &[&str] = &[
 pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
     "cublas_gemm_f16",
     "flashinfer_prefill_paged_fp8kv",
+    // 2026-10-20:`gdn_chunked` 定谳后转缺省 true(prefill 大 T 五核);
+    // 档位不显式关就必须列它(否则首次 prefill 撞准入门)
+    "gdn_chunked_delta_rule_fwd",
     "marlin_gemm_w4a16_awq",
     // W4A8 档(S2;env `OWL_W4A8=1` 才实际发射 —— 白名单超集无害)
     "marlin_gemm_w4a8_awq",
@@ -437,6 +441,7 @@ pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
     "owl_gdn_norm_act_f16",
     "owl_gdn_recurrence_varlen_gqa_f16",
     "owl_gemv_dual_f16",
+    "owl_gemv_i8w_f16",
     "owl_narrow_strided_f16",
     "owl_norm_rope_f16",
     "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
@@ -479,6 +484,7 @@ pub const PRODUCTION_UNION_2026_10_13: &[&str] = &[
     "owl_gdn_norm_act_f16",
     "owl_gdn_recurrence_varlen_gqa_f16",
     "owl_gemv_dual_f16",
+    "owl_gemv_i8w_f16",
     "owl_naive_attn_nc_bf16_v2",
     "owl_narrow_strided_f16",
     "owl_norm_rope_bf16",
@@ -843,10 +849,19 @@ mod tests {
             (crate::family::comm::asset::REDUCE_F16, &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
             (crate::family::comm::asset::REDUCE_BF16, &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
             (crate::family::comm::asset::REDUCE_F32, &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["F32x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            // fp8 载荷档(§47 第二步;槽序/类型与常规档**逐字同形** —— 只有核名与载荷语义不同)
+            (crate::family::comm::asset::STAGE_F8_F16, &["local", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::STAGE_F8_BF16, &["local", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::REDUCE_F8_F16, &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::REDUCE_F8_BF16, &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
             // 1-stage 融合核(§35;对称缓冲 —— 无 stage 段、零拷贝):槽 = out/own/peer/peer_data/bytes
-            (crate::family::comm::asset::ONE_STAGE_F16, &["out", "own", "peer", "peer_data", "bytes"], &["F16x0", "U8x1", "U8x1", "U8x1", "U64"]),
-            (crate::family::comm::asset::ONE_STAGE_BF16, &["out", "own", "peer", "peer_data", "bytes"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U64"]),
-            (crate::family::comm::asset::ONE_STAGE_F32, &["out", "own", "peer", "peer_data", "bytes"], &["F32x0", "U8x1", "U8x1", "U8x1", "U64"]),
+            (crate::family::comm::asset::ONE_STAGE_F16, &["out", "src", "own", "peer", "peer_data", "bytes"], &["F16x0", "F16x0", "U8x1", "U8x1", "U8x1", "U64"]),
+            (crate::family::comm::asset::ONE_STAGE_BF16, &["out", "src", "own", "peer", "peer_data", "bytes"], &["BF16x0", "BF16x0", "U8x1", "U8x1", "U8x1", "U64"]),
+            (crate::family::comm::asset::ONE_STAGE_F32, &["out", "src", "own", "peer", "peer_data", "bytes"], &["F32x0", "F32x0", "U8x1", "U8x1", "U8x1", "U64"]),
+            // v1 两核融合(§11.2;2026-10-19):8 槽 —— data_w/data_r 分开(方向不同)
+            (crate::family::comm::asset::FUSED_F16, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::FUSED_BF16, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::FUSED_F32, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["F32x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
         ];
         for (entry, want, want_ty) in EXPECT {
             let m = meta(entry).unwrap_or_else(|| panic!("锁表项 {entry} 不在声明表里"));

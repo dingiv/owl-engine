@@ -205,6 +205,8 @@ impl ModelSpec {
 
         let spec = ModelSpec {
             vocab,
+            head_vocab: 248320,
+            head_split: false,
             hidden,
             inter,
             dtype: src.dtype,

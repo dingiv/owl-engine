@@ -48,6 +48,8 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     /// verify 桶形图(E5-M4;T = depth+1 定形,输出 tok/hid + fold 记录;
     /// None = eager fallback 走旧 verify+重放路)
     pub verify: Option<GraphPlan<D>>,
+    /// **合批 decode 图**(B5.1 M1b;T = max_batch 定形,行 = 会话;None = eager)
+    pub batch: Option<GraphPlan<D>>,
     /// fold 桶形图族(E5-M5;index = m,状态 = spec 快照 buf 就地,
     /// slot 恒 0;重放后 restore 回写会话格)
     pub fold: Vec<GraphPlan<D>>,
@@ -92,6 +94,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         if let Some(g) = self.verify.as_mut() {
             record_close(&mut first, g.close().await);
         }
+        if let Some(g) = self.batch.as_mut() {
+            record_close(&mut first, g.close().await);
+        }
         for g in self.fold.iter_mut() {
             record_close(&mut first, g.close().await);
         }
@@ -115,6 +120,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         self.session.set_phase(p);
         self.prefill.set_phase(p);
         if let Some(g) = self.verify.as_mut() {
+            g.set_phase(p);
+        }
+        if let Some(g) = self.batch.as_mut() {
             g.set_phase(p);
         }
         for g in self.fold.iter_mut() {
@@ -172,6 +180,12 @@ impl<D: DeviceClient> GraphFleet<D> {
         // ① 主会话图(先留一个句柄给 ④ 的 prefill 桶族 —— 桶族在最后建,
         // 那时 `face`/`vface` 都已被消费)
         let pface_src = face.face_clone();
+        // 合批 decode 图(B5.1):独立 face(与 prefill 桶不共享);捕获失败 ⇒ None
+        let bface_src = if boot.knobs.max_batch > 1 && !boot.knobs.no_graph {
+            face.face_clone()
+        } else {
+            None
+        };
         // V1c:decode_fi 开 ⇒ 同图走 piecewise,断点挂 decode 核
         let (session, capture_outcome, decode_fi_node) = Self::plan_session(face, &boot, t0).await?;
         // ② verify 桶形图(spec 模式且主图捕获成功才有意义)
@@ -193,6 +207,33 @@ impl<D: DeviceClient> GraphFleet<D> {
             (fold, dflash, propose)
         } else {
             (Vec::new(), None, Vec::new())
+        };
+        // ③.5 **合批 decode 图**(B5.1 M1b):T = max_batch 定形,行 = 会话。
+        // 捕获失败只降级本环(eager 臂仍在执行器里),不连锁。
+        let batch = if boot.knobs.max_batch > 1 {
+            match bface_src {
+                None => {
+                    owl_shared::log_warn!(
+                        "batch",
+                        "合批图:face_clone 不可用 ⇒ 走 eager 臂"
+                    );
+                    None
+                }
+                Some(bf) => match Self::plan_batch_decode(bf, &boot, t0).await {
+                    Ok((g, outcome)) => {
+                        if let PlanOutcome::EagerFallback { reason } = &outcome {
+                            owl_shared::log_warn!("batch", "合批图捕获降级为 eager:{reason}");
+                        }
+                        Some(g)
+                    }
+                    Err(e) => {
+                        owl_shared::log_warn!("batch", "合批图装配失败(回 eager):{e}");
+                        None
+                    }
+                },
+            }
+        } else {
+            None
         };
         // ④ **prefill 桶族(M2b)**:最后建 —— 自己的槽面/自己的输出块,
         // 与前面几族无共享羁绊;必须在家族 scratch 只增不减的律下**降序**捕
@@ -332,6 +373,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             session,
             capture_outcome,
             verify,
+            batch,
             fold,
             propose,
             dflash,
@@ -351,6 +393,20 @@ impl<D: DeviceClient> GraphFleet<D> {
         self.session.face_clone()
     }
 
+    /// **设备上下文面**(生命周期节点 N1/N4/N5 用):主会话图的 face。
+    ///
+    /// 为什么改这一个就够:`DeviceHandle` 的 owner/class 上下文是 `Arc<Mutex<..>>`
+    /// **共享**的(face_clone 出来的句柄与本体同源)⇒ 图族每张图各持一个句柄,
+    /// 但设一次即全族生效(逐个设 = 漏设的温床)。
+    pub(crate) fn dev_ctx_face_mut(&mut self) -> &mut D {
+        self.session.face_mut()
+    }
+
+    /// 主会话图 face 的只读面(诊断计数:`hook_fail`/窗栈)
+    pub(crate) fn dev_ctx_face(&self) -> &D {
+        self.session.face_ref()
+    }
+
     /// main 侧签名(V1c 宿主标量槽):额外返回 FI 断点臂的 `ctx_total` 槽
     async fn plan_session(
         face: D,
@@ -363,7 +419,10 @@ impl<D: DeviceClient> GraphFleet<D> {
         let dims = boot.dims;
         let model = Arc::clone(&boot.model);
         let rp = boot.rope.clone();
-        let vocab = boot.model.vocab_size();
+        // **本 rank 的 logits 宽度**(P1.1 词表切档 = 半表;未切档 = 全词表):
+        // decode 图的 logits 槽宽、设备 argmax 的 stride 都读它 ——
+        // `vocab_size()` 仍是词表全量(embed/tokenizer 面用)。
+        let vocab = boot.model.logits_vocab();
         let knobs = boot.knobs;
         let kv_caches = pool.kv_caches();
         let gdn_caches = pool.gdn_caches();
@@ -500,6 +559,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                 model.forward(&ids, &ctx)
             };
             // E3 设备采样:token = argmax(logits)(f32 数值过线,契约 5)
+            // ⚠️ P1.1:stride = **本 rank 的 logits 宽度**(词表切档 = 半表);
+            // 用全量 `vocab_size()` 会跨行读(越界)。半表档的 token 只是**局部**
+            // argmax —— 消费面走 host 拼接(见 `RunningEngine::read_full_logits`)。
             let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
             sc.output("token", &tok)?;
             sc.output("logits", &tree)
@@ -609,6 +671,115 @@ impl<D: DeviceClient> GraphFleet<D> {
         Ok((session, capture_outcome, dfi_node_seen.load(std::sync::atomic::Ordering::Relaxed)))
     }
 
+    /// **合批 decode 图**(B5.1 M1b;2026-10-20):T = `max_batch` 定形,
+    /// 行 = 会话。槽面全部按行(`frontier/pos/kv_len/kv_slot/gdn_slot` [T]),
+    /// 页表 = 持久 `bt_batch [T,nb]`(每步重写),注意力 = v2 seq 臂
+    /// (`seqs=T`),输出 = 逐行 argmax + logits [T,vocab]。
+    ///
+    /// 捕获失败 ⇒ 执行器回 eager 臂(`graphs.batch = None`),语义不变。
+    async fn plan_batch_decode(
+        face: D,
+        boot: &FleetBoot<'_>,
+        t0: T,
+    ) -> Result<(GraphPlan<D>, PlanOutcome)> {
+        let env = boot.env;
+        let tp = boot.tp.clone();
+        let pool = boot.pool;
+        let dims = boot.dims;
+        let model = Arc::clone(&boot.model);
+        let rp = boot.rope.clone();
+        let batch = boot.knobs.max_batch;
+        let vocab = boot.model.logits_vocab();
+        let kv_caches = pool.kv_caches();
+        let gdn_caches = pool.gdn_caches();
+        let scratch = pool.batch_attn_v2_scratch().ok_or_else(|| {
+            ModelError::EngineInvariant {
+                what: "合批图:batch_attn_v2 未分配(max_batch 档位不一致)".into(),
+            }
+        })?;
+        let bt8 = pool.bt_batch_leaf().ok_or_else(|| ModelError::EngineInvariant {
+            what: "合批图:bt_batch 未分配(max_batch 档位不一致)".into(),
+        })?;
+        let desc = GraphPlanDesc {
+            inputs: vec![
+                InputSlot::f32("frontier", batch),
+                InputSlot::f32("pos", batch),
+                InputSlot::f32("kv_len", batch),
+                InputSlot::f32("kv_slot", batch),
+                InputSlot::f32("gdn_slot", batch),
+            ],
+            outputs: vec![
+                OutputSlot { name: "logits".into(), shape: vec![batch, vocab], dtype: dims.dtype },
+                // Concat 核固定 8 槽(verify 图同款)⇒ token 输出恒 [8,1];
+                // 执行器只取前 batch 行(batch ≤ 8 由配置门保证)
+                OutputSlot { name: "token".into(), shape: vec![8, 1], dtype: Dtype::F32 },
+            ],
+            capture: true,
+            slab_fixed: boot.knobs.cuda.capture_slab_mb.is_some(),
+            debug_probe: boot.knobs.probes.debug,
+            reclaim_capture: true,
+            warmup: true,
+        };
+        let forward = move |sc: &PlanCtx| -> Result<()> {
+            let ids = sc.input("frontier")?;
+            let pos = sc.input("pos")?;
+            let kv_len = sc.input("kv_len")?;
+            let kv_slot = sc.input("kv_slot")?;
+            let gdn_slot = sc.input("gdn_slot")?;
+            let kvs_step: Vec<KvBuffers> = kv_caches
+                .iter()
+                .map(|(k, v)| KvBuffers {
+                    k_cache: k.clone(),
+                    v_cache: v.clone(),
+                    slots: kv_slot.clone(),
+                    kv_lens: kv_len.clone(),
+                    block_tables: bt8.clone(),
+                })
+                .collect();
+            let gdns_step: Vec<GdnBuffers> = gdn_caches
+                .iter()
+                .map(|g| GdnBuffers {
+                    conv_q: g.conv_q.clone(),
+                    conv_k: g.conv_k.clone(),
+                    conv_v: g.conv_v.clone(),
+                    rec: g.rec.clone(),
+                    slots: gdn_slot.clone(),
+                })
+                .collect();
+            let mut ctx = ForwardCtx::model_decode(batch, &pos, &kvs_step, &rp, &gdns_step);
+            ctx.env = env;
+            ctx.attn_v2 = Some(scratch.clone());
+            ctx.v2_bt8 = Some(&bt8);
+            let hidden = model.last_hidden(&ids, &ctx);
+            let logits = model.embed.lm_head_matmul(&hidden);
+            sc.output("logits", &logits)?;
+            let rows: Vec<TensorOps> = (0..batch)
+                .map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab))
+                .collect();
+            let mut root = TensorOps::call(owl_models::ops::SemanticKernel::Concat);
+            for i in 0..8 {
+                root = root.arg(rows.get(i).unwrap_or(&rows[0]));
+            }
+            let root = root
+                .arg_usize(8)
+                .arg_usize(1)
+                .arg_usize(1)
+                .with_shape(Dtype::F32, vec![8, 1]);
+            sc.output("token", &root)?;
+            Ok(())
+        };
+        let (g, o) = GraphPlan::plan(face, env, tp, desc, forward).await?;
+        owl_shared::log_info!(
+            "boot",
+            "合批 decode 图计划(T={} / vocab={})完成 +{:.2}s outcome={:?}",
+            batch,
+            vocab,
+            t0.elapsed().as_secs_f32(),
+            o
+        );
+        Ok((g, o))
+    }
+
     /// ② verify 桶形图(E5-M4;T = depth+1 定形;spec 模式专用)—— 消
     /// 投机轮的整模 eager 发射税(~830 发 × ~25µs)。FI **在图内**(W4 转正;
     /// plan ctx 烘上界 + 引擎每轮窗外刷精确表);输出 = tok/hid +
@@ -664,7 +835,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             // 需要各行目标分布(原先只有 argmax ⇒ spec 臂不采样 =
             // 请求温度失效;A7/A8 根因,见 agent 专项 §7.11)。
             // 贪心档不回读(零额外 D2H);仅采样档付 ~2.4MB/轮。
-            OutputSlot { name: "logits".into(), shape: vec![depth1, model_v.vocab_size()], dtype: Dtype::F16 },
+            OutputSlot { name: "logits".into(), shape: vec![depth1, model_v.logits_vocab()], dtype: Dtype::F16 },
         ];
         // DFlash2 target taps(E5-DF2;层输出残差流,sglang capture 同语义)
         // notaps → 退回 last_hidden(排查开关:隔离 taps 图)
@@ -840,7 +1011,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 let tap: std::rc::Rc<std::cell::RefCell<Vec<TensorOps>>> =
                     std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                 ctx.gdn_tap = Some(tap.clone());
-                let vocab = model_v.vocab_size();
+                let vocab = model_v.logits_vocab();
                 let (hidden, taps) = if dflash_tap_decl {
                     let (h, t) = model_v.tapped_hidden(&ids, &ctx, &[5, 19, 33, 47, 61]);
                     if dflash_taps {
@@ -1035,7 +1206,10 @@ impl<D: DeviceClient> GraphFleet<D> {
             return Ok(None);
         };
         let pool = boot.pool;
-        let env = boot.env;
+        // **草稿环境**(非目标环境):草稿的 `attn.naive_nc` 等臂按草稿几何
+        // (hd=128 / GQA 比)解析 —— 捕获期就固化在算子拾取里;用目标 env
+        // (hd=256)会几何门拒(F16 路)或静默错几何(BF16 旧变体门过宽)。
+        let env = boot.spec.draft_env;
         let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let tap_blks: Vec<Bytes> = (0..5)
@@ -1050,6 +1224,11 @@ impl<D: DeviceClient> GraphFleet<D> {
         let model_df = Arc::clone(&boot.model);
         let rp_df = boot.spec.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
         let d2g = Arc::clone(d2);
+        // **切档形态**（P1.1 × P2.1）:propose 图只出"半表 top-16 候选 + proj" ——
+        // host 合并两 rank 候选后由 rank0 跑 select（全表域）。判据 = 事实
+        // （本 rank logits 宽 < 全量），与引擎侧 `head_split_active` 同律。
+        let head_split = boot.model.logits_vocab() != boot.model.vocab_size();
+        let sel_rank = d2g.selector_rank();
         let hidd = d2.hidden();
         let Some(gface) = extra_faces.pop() else {
             owl_shared::log_info!("boot", "dflash propose 图 face 耗尽 → eager propose");
@@ -1071,14 +1250,26 @@ impl<D: DeviceClient> GraphFleet<D> {
                     InputSlot::f32("prop_kv_lens", 8),
                     InputSlot::f32("kv_len", 1),
                 ],
-                outputs: vec![
-                    OutputSlot::f32("drafts", &[7 * (16 * 16 + 1)]),
-                    OutputSlot { name: "e0".into(), shape: vec![1], dtype: Dtype::BF16 },
-                    OutputSlot { name: "e1".into(), shape: vec![1], dtype: Dtype::BF16 },
-                    OutputSlot { name: "e2".into(), shape: vec![1], dtype: Dtype::BF16 },
-                    OutputSlot { name: "e3".into(), shape: vec![1], dtype: Dtype::BF16 },
-                    OutputSlot { name: "e4".into(), shape: vec![1], dtype: Dtype::BF16 },
-                ],
+                outputs: {
+                    let mut o = vec![OutputSlot::f32("drafts", &[7 * (16 * 16 + 1)])];
+                    if head_split {
+                        // 切档:topk 单缓冲（值区 112 + 索引区 112 = 224）——
+                        // **输出槽形状 = 整父块**（`slice_view` 输出整缓冲的
+                        // 既有契约;见原 `drafts` 注），故声明 2*7*TOP_K。
+                        o.push(OutputSlot::f32("topk", &[2 * 7 * owl_models::layers::dflash2::TOP_K]));
+                        o.push(OutputSlot {
+                            name: "sel_proj".into(),
+                            shape: vec![7, sel_rank],
+                            dtype: d2g.dtype(),
+                        });
+                    }
+                    o.push(OutputSlot { name: "e0".into(), shape: vec![1], dtype: Dtype::BF16 });
+                    o.push(OutputSlot { name: "e1".into(), shape: vec![1], dtype: Dtype::BF16 });
+                    o.push(OutputSlot { name: "e2".into(), shape: vec![1], dtype: Dtype::BF16 });
+                    o.push(OutputSlot { name: "e3".into(), shape: vec![1], dtype: Dtype::BF16 });
+                    o.push(OutputSlot { name: "e4".into(), shape: vec![1], dtype: Dtype::BF16 });
+                    o
+                },
                 capture: !knobs.no_graph,
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
@@ -1128,19 +1319,34 @@ impl<D: DeviceClient> GraphFleet<D> {
                         block_tables: bt.clone(),
                     })
                     .collect();
-                let ctx = ForwardCtx::minimal(8);
+                let mut ctx = ForwardCtx::minimal(8);
+                // 草稿 ctx 的环境与图环境同源(层侧读 ctx.env 时零分歧)
+                ctx.env = env;
                 let mem = d2g.project_memory(&taps, &ctx);
                 let enc_roots = d2g.encode_kv(&mem, &enc_pos, &enc_kvs, &rp_df, &ctx);
                 for (i, r) in enc_roots.iter().enumerate() {
                     sc.output(format!("e{i}"), r)?;
                 }
-                let (_h, drafts, _s, _l) = d2g.propose_block(
-                    &tokens, &prop_pos, &anchor, &prop_kvs, &rp_df,
-                    &model_df.embed, &kv_len, &ctx, None,
-                );
                 // drafts = select 单缓冲前 7 元(offset 0;输出槽
                 // 形状 = 整缓冲 —— dtoh 整父块契约)
-                sc.output("drafts", &drafts)
+                if head_split {
+                    // **切档形态**:只出候选（整 topk 缓冲）+ proj
+                    // （select 由 host 合并后跑）
+                    let (_h, _cand, vals, proj, _l) = d2g.propose_block_split(
+                        &tokens, &prop_pos, &prop_kvs, &rp_df, &model_df.embed, &kv_len, &ctx, None,
+                    );
+                    // vals 是 topk 单缓冲的**前段视图** ⇒ 输出整父块
+                    // （值区 ‖ 索引区;host 按同序切片）
+                    sc.output("topk", &vals)?;
+                    sc.output("sel_proj", &proj)?;
+                    Ok(())
+                } else {
+                    let (_h, drafts, _s, _l) = d2g.propose_block(
+                        &tokens, &prop_pos, &anchor, &prop_kvs, &rp_df,
+                        &model_df.embed, &kv_len, &ctx, None,
+                    );
+                    sc.output("drafts", &drafts)
+                }
             },
         )
         .await?;

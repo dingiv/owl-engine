@@ -348,6 +348,48 @@ impl BlockLeg {
         self.host.used_bytes()
     }
 
+    /// **取走宿主层内容**(S6:溢写到磁盘时把 RAM 块交给调用方)。
+    /// 不在宿主 = `Unknown`(响亮;调用方据此判"本来就不在")。
+    pub fn host_take(&mut self, chain: ChainHash) -> StoreResult<crate::host::HostBlock> {
+        self.host.take(chain)
+    }
+
+    /// **放回宿主层内容**(溢写失败的回滚口 / 磁盘回填的落点)。
+    pub fn host_put(&mut self, chain: ChainHash, buf: crate::host::HostBlock) -> StoreResult<()> {
+        self.host.put(chain, buf)
+    }
+
+    /// 内容是否在宿主层(不判设备)。
+    pub fn host_contains(&self, chain: ChainHash) -> bool {
+        self.host.get(chain).is_some()
+    }
+
+    /// **放入宿主层并摘掉设备绑定**(S6:盘层搬运的两端都走这里)。
+    ///
+    /// 与 `host_put` 的区别:后者只动宿主账(内容身份已 `slot = None` 时用);
+    /// 本方法把**设备绑定里的槽还给池**(否则同内容在设备与宿主各占一份,
+    /// 账目与容量双双失真)。
+    pub fn put_host(&mut self, chain: ChainHash, buf: crate::host::HostBlock) -> StoreResult<()> {
+        self.host.put(chain, buf)?;
+        let _ = self.kv.mark_host(chain)?;
+        Ok(())
+    }
+
+    /// **整链搬盘候选**(S6.1;引擎/计划面共用):`(链尾, 整链块数, last_use)`。
+    /// 只出"**整链都在宿主**"的链(半链无复用价值)。
+    pub fn host_chain_candidates(&self, protect: &[ChainHash]) -> Vec<(ChainHash, usize, u64)> {
+        self.kv.host_chain_candidates(protect)
+    }
+
+    /// **宿主层候选**(S6:溢写到磁盘的取料面):树里 `slot = None` 的**叶**,
+    /// 按最老在前(策略序由调用方出)。返回 `(链, last_use)`。
+    pub fn host_candidates(&self, protect: &[ChainHash], limit: usize) -> Vec<ChainHash> {
+        let mut c = self.kv.evict_candidates(protect);
+        c.retain(|x| x.tier == crate::tier::Tier::Host);
+        c.sort_by_key(|x| x.last_use);
+        c.into_iter().take(limit).filter_map(|x| x.chain).collect()
+    }
+
     /// 宿主层**还能装几个块**(预算 − 驻留 − 空转缓冲;关层 = 0)。
     pub fn host_free_slots(&self) -> usize {
         let used = self.host.used_bytes() + self.host.free_bytes();
@@ -375,6 +417,47 @@ impl BlockLeg {
     /// 一条链的块数(诊断/报告;不在账 = 0)。
     pub fn chain_len(&self, chain: ChainHash) -> usize {
         self.kv.chain_len(chain)
+    }
+
+    /// **会话归属**(0 = 无归属;会话感知淘汰用)。
+    pub fn session_of(&self, chain: ChainHash) -> u64 {
+        self.kv.session_of(chain)
+    }
+
+    /// **块在链上的深度**(1 = 根块;同会话内深度大者先逐)。
+    pub fn depth_of(&self, chain: ChainHash) -> usize {
+        self.kv.depth_of(chain)
+    }
+
+    /// **绑定归属**(增量登记/回灌路径:已知块身份)。
+    pub fn set_owner(&mut self, session: u64, chains: &[ChainHash]) {
+        self.kv.set_owner(session, chains);
+    }
+
+    /// **带归属的链登记**(turn 收口;会话感知淘汰的唯一写入口)。
+    pub fn register_chain_owned(
+        &mut self,
+        tokens: &[u32],
+        table: &[u32],
+        session: u64,
+    ) -> StoreResult<CacheUpdate> {
+        let up = self.kv.register_chain_owned(tokens, table, session)?;
+        self.drop_host_evicted(&up.evicted)?;
+        Ok(up)
+    }
+
+    /// **整链块身份**(从根到 `tail`;S6.1 的"整链溢写"与磁盘回填都用它)。
+    pub fn chain_blocks(&self, tail: ChainHash) -> Vec<ChainHash> {
+        self.kv.chain_of(tail).into_iter().map(|b| b.chain).collect()
+    }
+
+    /// **整链在宿主层的块数**(轮 1.5 的"整链搬盘"判据;0 = 链不在宿主)。
+    pub fn host_chain_span(&self, tail: ChainHash) -> usize {
+        self.kv
+            .chain_of(tail)
+            .into_iter()
+            .filter(|b| b.slot.is_none())
+            .count()
     }
 
     /// 整块前缀的内容身份(身份原语的腿面出口;engine 播种链游标 / 测试)。
@@ -521,6 +604,15 @@ impl BlockLeg {
     }
 
     /// 归还会话块表。
+    /// **无设备绑定的链登记**(S6.1:启动按盘上索引重建树)。
+    pub fn register_chain_offloaded(&mut self, tokens: &[u32]) -> StoreResult<Vec<crate::id::ChainHash>> {
+        let (inserted, evicted) = self.kv.register_chain_offloaded(tokens)?;
+        if !evicted.is_empty() {
+            self.ops.ensure_evicted += evicted.len() as u64;
+        }
+        Ok(inserted)
+    }
+
     /// **增量链登记**(B-3e-2 第 2b 项;见 [`KvStore::register_chain_inc`])。
     pub fn register_chain_inc(
         &mut self,

@@ -73,6 +73,14 @@ impl HostBlock {
         Self { bytes, hugepage }
     }
 
+    /// **从已有字节构造**(磁盘读回 / 溢写回滚用:内容已在,无需再零填)。
+    ///
+    /// 大页提示不适用(内存来自 `Vec` 的既有分配);`hugepage` 记 `false`
+    /// ⇒ 报告面的 `hint_failures` 不该被这条计入,故本构造**不**自报失败。
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes, hugepage: false }
+    }
+
     /// 本块的大页提示是否生效。
     pub fn hugepage(&self) -> bool {
         self.hugepage
@@ -96,6 +104,12 @@ impl HostBlock {
     /// 可写字节面(搬运的落地口)。
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.bytes
+    }
+
+    /// **取出内部字节**(零拷贝;磁盘溢写把内容交给 I/O 任务时用 ——
+    /// 159 MiB 的快照不该为了搬运再拷一份)。
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 }
 

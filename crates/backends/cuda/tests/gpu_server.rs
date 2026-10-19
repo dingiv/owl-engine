@@ -101,7 +101,7 @@ fn add_msg(a: &Bytes, b: &Bytes, out: &Bytes, n: usize) -> LaunchMsg {
 
 /// 步骤 1:alloc 零化(N4 图外 memset 回归哨)
 async fn step_alloc_zeroed(client: &mut GpuClient) {
-    let out = owl_iface::alloc!(client, Dtype::F32, 8).await.expect("alloc").view(Dtype::F32, 1);
+    let out = owl_iface::client_alloc!(client, Dtype::F32, 8).await.expect("alloc").view(Dtype::F32, 1);
     let got = harvest(client, &out, 8).await;
     assert!(
         got.iter().all(|&v| v == 0.0),
@@ -125,7 +125,7 @@ async fn step_launch_scale(client: &mut GpuClient) {
     let x = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&xs))
         .await
         .expect("htod");
-    let out = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
+    let out = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
     let ys = [4.0f32; 4];
     let y = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ys))
         .await
@@ -141,7 +141,7 @@ async fn step_sync_is_barrier(client: &mut GpuClient) {
     let x = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&src))
         .await
         .expect("htod");
-    let out = owl_iface::alloc!(client, Dtype::F32, src.len()).await.expect("alloc").view(Dtype::F32, 1);
+    let out = owl_iface::client_alloc!(client, Dtype::F32, src.len()).await.expect("alloc").view(Dtype::F32, 1);
     let zeros = vec![0.0f32; src.len()];
     let y = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![src.len()]), &le_f32(&zeros))
         .await
@@ -164,8 +164,8 @@ async fn step_graph_capture_and_replay(client: &mut GpuClient, x: &Bytes) {
     client.graph_begin().await.expect("graph_begin");
 
     // 捕获期 Alloc(切片块 + memset 进图)+ scale 发射
-    let zeros = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
-    let out = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
+    let zeros = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
+    let out = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("captured alloc").view(Dtype::F32, 1);
     client.launch(add_msg(x, &y, &out, 4)).await.expect("launch");
 
     let gid = client.graph_end().await.expect("graph_end");
@@ -197,11 +197,11 @@ async fn step_piecewise_two_segments(client: &mut GpuClient, x: &Bytes) {
     let one = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&[1.0f32; 4]))
         .await
         .expect("htod one");
-    let mid = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("pin 块(mid)").view(Dtype::F32, 1);
-    let tail = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("pin 块(tail)").view(Dtype::F32, 1);
+    let mid = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("pin 块(mid)").view(Dtype::F32, 1);
+    let tail = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("pin 块(tail)").view(Dtype::F32, 1);
 
     // ── 段0:out0 = x + one ──
-    let out0 = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("carve out0").view(Dtype::F32, 1);
+    let out0 = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("carve out0").view(Dtype::F32, 1);
     client.graph_begin().await.expect("seg0 begin");
     client.launch(add_msg(x, &one, &out0, 4)).await.expect("seg0 launch");
     let g0 = client.graph_end().await.expect("seg0 end");
@@ -259,7 +259,7 @@ async fn step_graph_ref_lease(client: &mut GpuClient) {
     // 图外分配/上卡 ⇒ Owned(可回收类;Carved 天然免疫,不在本例)
     let a = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod a");
     let b = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod b");
-    let out = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("alloc out").view(Dtype::F32, 1);
+    let out = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("alloc out").view(Dtype::F32, 1);
 
     // 捕获窗内解析三个块 ⇒ 全部入租约
     client.graph_begin().await.expect("graph_begin");
@@ -310,7 +310,7 @@ async fn step_capture_window_reuse(client: &mut GpuClient) {
     let mut live: Option<Bytes> = None;
     let mut total = 0usize;
     for _ in 0..N {
-        let b = owl_iface::alloc!(client, Dtype::F32, BLK).await.expect("窗内 alloc(切 slab)");
+        let b = owl_iface::client_alloc!(client, Dtype::F32, BLK).await.expect("窗内 alloc(切 slab)");
         total += BLK * 4;
         if let Some(prev) = live.take() {
             // 交替释放上一块 ⇒ 活块数恒 ≤ 2(回 slab 内 arena,零 CUDA 调用)
@@ -319,7 +319,7 @@ async fn step_capture_window_reuse(client: &mut GpuClient) {
         live = Some(b);
     }
     // 空窗哨兵③:发射数须 > 0
-    let out = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("alloc out").view(Dtype::F32, 1);
+    let out = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("alloc out").view(Dtype::F32, 1);
     client.launch(add_msg(&x, &y, &out, 4)).await.expect("launch");
     // **捕获窗内也能读块账**(全量记名 26-10-16):carve 出来的窗内块必须在册
     // 且带名 —— OOM 最常发生在窗内(slab 定尺失准),那刻的"谁占着"就靠这条。
@@ -362,7 +362,7 @@ async fn step_graph_abort_and_destroy(client: &mut GpuClient) {
     let a = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod a");
     let b = owl_iface::htod!(client, Dtype::F32, &Shape::from(vec![4]), &le_f32(&ones)).await.expect("htod b");
     client.graph_begin().await.expect("graph_begin");
-    let carved = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("窗内 alloc").view(Dtype::F32, 1);
+    let carved = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("窗内 alloc").view(Dtype::F32, 1);
     client.launch(add_msg(&a, &b, &carved, 4)).await.expect("launch");
     client.graph_abort().await.expect("abort 应成功");
     // 窗内自产块整批作废(不登记图 ⇒ 永不会被回放)
@@ -370,7 +370,7 @@ async fn step_graph_abort_and_destroy(client: &mut GpuClient) {
     assert!(matches!(r, Err(ModelError::DeadBlock { .. })), "abort 后 slab 块应作废,实得 {r:?}");
     // abort 后引擎仍可正常捕获(窗态已复位 —— 否则第二张图必炸)
     client.graph_begin().await.expect("abort 后再捕获");
-    let out2 = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
+    let out2 = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
     client.launch(add_msg(&a, &b, &out2, 4)).await.expect("launch");
     let gid = client.graph_end().await.expect("abort 后 graph_end 应成功");
 
@@ -418,8 +418,8 @@ async fn step_family_window_guard(client: &mut GpuClient) {
     let v = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![8, 1, 128]), &le_f16(&ones_f16)).await.expect("htod v");
     let beta = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![8, 1]), &le_f16(&[0.5; 8])).await.expect("htod beta");
     let gate = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![8, 1]), &le_f16(&[-0.01; 8])).await.expect("htod gate");
-    let state = owl_iface::alloc!(client, Dtype::F32, 128 * 128).await.expect("alloc state").view(Dtype::F32, 4);
-    let out = owl_iface::alloc!(client, Dtype::F16, elems_qkv).await.expect("alloc out").view(Dtype::F16, 3);
+    let state = owl_iface::client_alloc!(client, Dtype::F32, 128 * 128).await.expect("alloc state").view(Dtype::F32, 4);
+    let out = owl_iface::client_alloc!(client, Dtype::F16, elems_qkv).await.expect("alloc out").view(Dtype::F16, 3);
     // P-6b:序列表(cu|coff|idx)现造一块(本测只关心窗内 alloc/upload 守卫,
     // 表内容按 t=8 ⇒ nt=1;表在**窗外**造 —— 表本身归引擎写,不归 runtime)
     let nt = 8usize.div_ceil(owl_kernels::family::gdn_chunked::BT).max(1);
@@ -713,7 +713,7 @@ async fn step_close_semantics(client: &mut GpuClient) {
         matches!(r, Err(ModelError::ServerClosed)),
         "close 后 sync 应返回 ServerClosed,实得 {r:?}"
     );
-    let r = owl_iface::alloc!(client, Dtype::F32, 4).await;
+    let r = owl_iface::client_alloc!(client, Dtype::F32, 4).await;
     assert!(
         matches!(r, Err(ModelError::ServerClosed)),
         "close 后 alloc 应返回 ServerClosed,实得 {r:?}"
@@ -799,7 +799,7 @@ async fn step_graph_launch_probe(client: &mut GpuClient, x: &Bytes) {
         .expect("htod y");
     for (tag, launches) in [("小图", 1usize), ("大图", 500usize)] {
         client.graph_begin().await.expect("begin");
-        let out = owl_iface::alloc!(client, Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
+        let out = owl_iface::client_alloc!(client, Dtype::F32, 4).await.expect("alloc").view(Dtype::F32, 1);
         for _ in 0..launches {
             client.launch(add_msg(x, &y, &out, 4)).await.expect("launch");
         }
@@ -862,7 +862,7 @@ async fn gpu_gemm_f16_matches_host() {
 
     let da = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![t, k]), &le_f16(&a)).await.expect("htod a");
     let dw = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![n, k]), &le_f16(&w)).await.expect("htod w");
-    let dout = owl_iface::alloc!(client, Dtype::F16, t * n).await.expect("alloc out").view(Dtype::F16, 2); // [m,n]
+    let dout = owl_iface::client_alloc!(client, Dtype::F16, t * n).await.expect("alloc out").view(Dtype::F16, 2); // [m,n]
     let msg = LaunchMsg {
         kernel: KernelSource { name: "cublas_gemm_f16".into(), source: String::new() },
         args: vec![

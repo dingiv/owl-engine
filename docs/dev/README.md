@@ -6,7 +6,7 @@
 
 | 文档 | 讲什么 | 什么时候看 |
 |---|---|---|
-| [`config.md`](config.md) | 配置链(Default→Flavor→文件→CLI)、`extends` 继承、站点档/实验档组织、拒启错误面 | 起服务、加实验档、改档位 |
+| [`config.md`](config.md) | 配置链(Default→Flavor/Profile→文件→站点→CLI→意图派生)、`extends` 继承、`profiles/` 意图档、`--check/--print-config/--explain/--set`、拒启错误面 | 起服务、加实验档、改档位、预检 |
 | [`testing.md`](testing.md) | **测试工作流 v2**:用例 overlay 自动解析、环境档、资源清单、`#[owl_test]` 选项、决策表与反模式 | 写/改测试、加检查点、调测试口径 |
 | [`debug-tools.md`](debug-tools.md) | 诊断面速查:`/debug/*` 端点、日志分级、metrics 各族、探针、排障顺序、杀进程纪律 | 服务行为可疑、要量分相、要抓现场 |
 | [`fixtures.md`](fixtures.md) | 夹具与门控:testkit / 金标资产 / 探针测试 / e2e 两入口 / lint 门 / 怎么加新场景 | 写测试、改算子、跑回归 |

@@ -42,6 +42,28 @@ impl KernelSpec for GemvDualF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+/// `owl_gemv_i8w_f16` —— **int8 权重 × f16 激活的 GEMV**(m=1 decode;P1.5-a)
+///
+/// 语义见 `.cu` 头注:`y[token,r] = scale[r] · Σ_k w_i8[r,k] · x[token,k]`;
+/// per-row 对称量化(装载期现算),`cols % 16 == 0`(几何侧断言)。
+pub struct GemvI8wF16;
+
+impl KernelSpec for GemvI8wF16 {
+    const ENTRY: &'static str = "owl_gemv_i8w_f16";
+    const SRC: &'static str = "cu/elems/gemv_i8w_f16.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("w", Dtype::I8, 2),
+        Param::t_in("scale", Dtype::F32, 1),
+        Param::t_in("x", Dtype::F16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::t_out("y", Dtype::F16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 /// `owl_add_f16` —— 逐元素加(宏实例化;fc 部分和累加)
 pub struct AddF16;
 
@@ -250,6 +272,7 @@ impl KernelSpec for Topk16F16 {
 
 pub static NARROW_STRIDED_F16: KernelMeta = meta_of::<NarrowStridedF16>();
 pub static GEMV_DUAL_F16: KernelMeta = meta_of::<GemvDualF16>();
+pub static GEMV_I8W_F16: KernelMeta = meta_of::<GemvI8wF16>();
 pub static ADD_F16: KernelMeta = meta_of::<AddF16>();
 pub static ADD_BF16: KernelMeta = meta_of::<AddBf16>();
 pub static SIGMOID_F16: KernelMeta = meta_of::<SigmoidF16>();
@@ -692,6 +715,7 @@ impl KernelSpec for QuantInt8RowBf16 {
 pub static METAS: &[&KernelMeta] = &[
     &NARROW_STRIDED_F16,
     &GEMV_DUAL_F16,
+    &GEMV_I8W_F16,
     &ADD_F16,
     &ADD_BF16,
     &SIGMOID_F16,

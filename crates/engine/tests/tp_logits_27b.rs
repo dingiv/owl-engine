@@ -48,7 +48,7 @@ fn cfg_of(ordinal: usize, chunk: usize) -> EngineConfig {
 
 /// 跑一个 turn(只取首步 logits;`max_new = 1`)
 async fn first_logits(
-    running: &mut RunningEngine<owl_cuda::GpuClient>,
+    running: &mut RunningEngine<owl_engine::GpuFace>,
     prompt: &str,
 ) -> Result<Vec<f32>, ModelError> {
     let (sid, turn) = running.submit_session_ex(Some(1), prompt, 1, true)?;

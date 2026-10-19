@@ -247,6 +247,23 @@ extern "C" {
 
     // AWQ(kU4 非对称)臂:b_zeros = pack_marlin_z 产物((k/g, n/8) i32,
     // scale_perm + n-interleave 已烘焙);其余契约与 gemm_v2_ffi 一致。
+    fn marlin_gemm_v2_awq_cfg_ffi(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        scales: *const c_void,
+        zeros: *const c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: *mut c_void,
+        groupsize: i32,
+        dev: i32,
+        stream: usize,
+        thread_k: i32,
+        thread_n: i32,
+    ) -> i32;
+
     fn marlin_gemm_v2_awq_ffi(
         a: *const c_void,
         b: *const c_void,
@@ -327,6 +344,51 @@ pub unsafe fn gemm_v2_awq_raw(
     } else {
         Err(err)
     }
+}
+
+/// **配置可注**的 AWQ GEMM(2026-10-19;只为**台子**)—— 与 [`gemm_v2_awq_raw`]
+/// 同路同契约,多两个 tile 旋钮(`thread_k`/`thread_n`;`-1` 等价 auto)。
+///
+/// 存在理由:auto 选择器只在 `small_batch_thread_configs` 里按优先级挑一档,
+/// 而"m=1 的 4-bit GEMV"是否还有更肥的实例化档只能**实测**;
+/// 生产**不用**这个口(避免两套规范)。
+///
+/// # Safety
+/// 同 [`gemm_v2_awq_raw`]。
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_v2_awq_raw_cfg(
+    a: *const u16,
+    b: *const i32,
+    c: *mut u16,
+    scales: *const u16,
+    zeros: *const i32,
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut i32,
+    groupsize: i32,
+    dev: i32,
+    stream: usize,
+    thread_k: i32,
+    thread_n: i32,
+) -> Result<(), i32> {
+    let err = marlin_gemm_v2_awq_cfg_ffi(
+        a as *const c_void,
+        b as *const c_void,
+        c as *mut c_void,
+        scales as *const c_void,
+        zeros as *const c_void,
+        m,
+        n,
+        k,
+        workspace as *mut c_void,
+        groupsize,
+        dev,
+        stream,
+        thread_k,
+        thread_n,
+    );
+    if err == 0 { Ok(()) } else { Err(err) }
 }
 
 /// W4A8 × AWQ GEMM(裸指针):`a` = **int8 已量化激活**,`a_scales` = per-token

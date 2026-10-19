@@ -42,6 +42,30 @@ pub enum EngineReq {
         chat_wrap: bool,
         reply: tokio::sync::oneshot::Sender<Result<owl_engine::TokenizeReply, String>>,
     },
+    /// **store 账查询旁路**(`GET /debug/vram`;第 0/3 刀):不落 turn、不改状态。
+    /// 应答 = 三层账 + **owner 维明细** + **事件账** + **块账房对账**(全等门)。
+    VramReport {
+        reply: tokio::sync::oneshot::Sender<VramSnapshot>,
+    },
+}
+
+/// **`/debug/vram` 的一次快照**(三面事实:store 账 / 块账房 / 句柄计数)。
+///
+/// 为什么三面同屋:它们必须**同一时刻**取(引擎不在 pump 时)—— 分开取会让
+/// "事件账 vs 块账房"的差集混入并发窗口的噪声,判据就不再是判据。
+pub struct VramSnapshot {
+    /// store 报告(三层账 + owner 维 + 事件账)
+    pub report: owl_store::StoreReport,
+    /// 块账房快照(逐 rank;`Err` = 后端不支持/读失败,如实带出,不静默)
+    pub blocks: Vec<(u8, Result<Vec<owl_iface::contract::BlockLedgerRow>, String>)>,
+    /// 记账失败计数(非零 = 有事件没入账)
+    pub hook_fail: u64,
+    /// 窗未收次数(图窗失败且去向未定)
+    pub window_unclosed: u64,
+    /// 窗内未归还块数
+    pub open_window_blocks: usize,
+    /// **状态腿淘汰序预览**(前 8 条;会话感知淘汰的可观测面)
+    pub snap_evict: Vec<owl_store::SnapEvictPreview>,
 }
 
 /// 事件投递(律 #1:不许静默丢弃可失败返回值)。
@@ -106,6 +130,7 @@ pub async fn run_actor<D: DeviceClient>(
             handle_req(running, &mut sinks, req).await;
         }
         // ③ 泵到排空,事件按 turn 路由
+        let actor_prof = std::env::var_os("OWL_ACTOR_PROF").is_some();
         loop {
             // AGT-10:断流 turn 在下一步之前弃置(≤1 采样步延迟)
             if dropped {
@@ -121,9 +146,13 @@ pub async fn run_actor<D: DeviceClient>(
                     }
                 }
             }
+            // P2.2 侦察(2026-10-19;env 门,临时诊断):拆"循环外 1.55ms/步" ——
+            // pump(引擎侧)/dispatch(事件投递)/账务 三段。
+            let t_l0 = std::time::Instant::now();
             match running.pump().await {
                 Ok(TurnEvent::Idle) => break,
                 Ok(ev) => {
+                    let d_pump = t_l0.elapsed();
                     // turn 终了 = 性能账落盘点(每 turn 覆写,进程被 kill 也不丢)
                     let terminal = matches!(
                         ev,
@@ -162,9 +191,18 @@ pub async fn run_actor<D: DeviceClient>(
                             }
                         }
                     }
+                    let t_d0 = std::time::Instant::now();
                     if !dispatch(&mut sinks, ev).await {
                         // 投递失败 = 客户端已走 ⇒ 本 turn 弃置
                         dropped = true;
+                    }
+                    if actor_prof {
+                        let d_disp = t_d0.elapsed();
+                        owl_shared::log_info!(
+                            "actor-prof",
+                            "pump={d_pump:?} disp={d_disp:?} rest={:?}",
+                            t_l0.elapsed()
+                        );
                     }
                     if terminal {
                         if let Some(p) = &perf_dump {
@@ -180,8 +218,25 @@ pub async fn run_actor<D: DeviceClient>(
                     // 弃置滞留 = GDN 格泄漏 → 2 格两轮耗尽)+ 广播
                     owl_shared::log_warn!("actor", "pump 错误: {e}");
                     abandon_turn(running, &mut sinks, &format!("engine: {e}")).await;
-                    // **不可恢复**(显存硬预算拒发 / 设备 server 关闭)⇒ 不走"继续跑",
-                    // 直接优雅收摊(释放卡锁 + 有序退出):继续跑只会连环失败
+                    // **缺口 3(2026-10-19)**:硬预算/池耗尽 ⇒ **不再直通致命**:
+                    // 丢本 turn(客户端拿到 500/503,如实) + **立即收缩**(池排空 + N6)
+                    // + **继续跑**。判据:引擎不退出,后续请求仍可服务;只有真正的
+                    // 设备级错误(ServerClosed / 状态机失守)才走优雅关停。
+                    if matches!(e, owl_iface::contract::ModelError::PoolExhausted { .. }) {
+                        match running.relieve_pressure().await {
+                            // **如实报数**:还缓存 0 块也照说(mid-turn 池空是常态 ——
+                            // 失败那一刻的块都在使用中,不在池里)
+                            Ok((freed, k)) => owl_shared::log_warn!(
+                                "actor",
+                                "显存压力:已收缩(还缓存 {freed} 块 + 目标腾 {k} 槽)⇒ 引擎继续(丢本 turn)"
+                            ),
+                            Err(pe) => owl_shared::log_warn!(
+                                "actor",
+                                "收缩失败(继续跑,下次再试): {pe}"
+                            ),
+                        }
+                        continue;
+                    }
                     if e.is_fatal() {
                         owl_shared::log_warn!("actor", "致命引擎错误({e})⇒ 优雅关停");
                         shutdown.graceful(&format!("引擎不可恢复错误:{e}"));
@@ -260,6 +315,26 @@ async fn handle_req<D: DeviceClient>(
             if reply.send(out).is_err() {
                 // 请求方已断开(不许静默:这是可失败返回值)
                 owl_shared::log_debug!("actor", "tokenize 应答投递失败(请求方已断开)");
+            }
+        }
+        EngineReq::VramReport { reply } => {
+            // 纯读账(store_report 是只读投影)+ **块账房快照**(命令面只读口)。
+            // 同一 turn 内取两面 ⇒ 无交错(引擎此刻不在 pump)⇒ "事件账 vs 块账房"
+            // 的全等门才有意义。**本路零副作用**:不落 turn、不搬块、不建图。
+            let (hook_fail, window_unclosed, open_window_blocks) = running.handle_probe();
+            let blocks = running.block_ledger_probe().await;
+            let report = running.store_report();
+            let snap_evict = running.snap_evict_preview(8);
+            let snap = VramSnapshot {
+                report,
+                blocks,
+                hook_fail,
+                window_unclosed,
+                open_window_blocks,
+                snap_evict,
+            };
+            if reply.send(snap).is_err() {
+                owl_shared::log_debug!("actor", "vram 账应答投递失败(请求方已断开)");
             }
         }
         req => accept(running, sinks, req).await,

@@ -6,11 +6,21 @@
 //! 组装各自的 knobs/options,**零 env 直读、零散点 parse**。
 //!
 //! **叠加式加载**(2026-10-16:配置层不认识 "flavor" —— 预设档只是预先写好的
-//! 一份配置文件,由入口(`flavors::preset_path`)解析成路径当"基准文件"传入):
+//! 一份配置文件,由入口(`flavors::preset_path` / `profile_path`)解析成路径当
+//! "基准文件"传入):
 //!
 //! ```text
-//! Default(代码缺省) → Flavor(内置命名预设) → 用户文件(toml) → CLI 启动参数
+//! Default(代码缺省) → Flavor/Profile(基准档) → 位置参数 → --site → CLI(--set/旗标)
+//!                   → [intent] 派生(只填空;显式低层键优先)
 //! ```
+//!
+//! **意图层**(2026-10-20,`config::{intent,memory,resolve}`):`profiles/*.toml`
+//! 只写 6–10 个意图键(`model/hardware/goal/context/concurrency/spec/kv/kvmem/
+//! graphs/reuse`),由唯一派生器展开成低层键;`context = "max"` 用内存模型
+//! 求解(与引擎 `[vram-gov]` 同算式,另补 activation/稳定裕度)。**派生结果仍是
+//! 一份 `OwlConfig`**;每个叶子键的来源记在 [`Origins`](`ResolvedConfig::origins`)
+//! —— `--check` / `--print-config` / `--explain` 都读它。旧 flavor/testdata
+//! 无 `[intent]` ⇒ 解析器不介入,零变化。
 //!
 //! **继承 `extends`**(2026-10-18):任一被加载的文件可在顶层写
 //! `extends = "other.toml"`(相对路径 = 相对本文件目录)—— 被继承者先合并、
@@ -35,12 +45,18 @@
 //! |   |   | 链可嵌套;环/超深/类型非法 = 拒启。直载 `from_toml_str` 不解析)|
 //! | (顶层) | flavor | String / 无 —— 预设档名(等效 `extends` 到 flavors/<名>.toml;
 //! |   |   | 测试环境档/站点档用它自带基准) |
+//! | (顶层) | intent | 表 / 无 —— **意图层**(派生后摘除;见 `config/intent.rs`) |
+//! | (顶层) | site | 表 / 无 —— **站点映射**(model_dir/draft_dir/bind/device;
+//! |   |   | 派生后摘除;路径/卡位不入库) |
 //! | runtime | bind | String / "127.0.0.1:8135" |
-//! | runtime | device | usize / 0 |
+//! | runtime | device | DeviceSpec {bdf\|find_name\|uuid} / 空 = 自动挑空闲卡 |
+//! | runtime | device_ordinal | Option<usize> / None(与 device / tp_ordinals 互斥) |
+//! | runtime | tp_ordinals / tp_push / tp_ar_f8 / tp_vocab_split / tp_ar_fused | TP 档(见字段注) |
+//! | runtime | gpu_min_free_ratio | f64 / 0.9(自动挑卡的空闲占比阈值) |
 //! | runtime | max_seq | usize / 4096 |
-//! | runtime | prefill_chunk | usize / 512 |
-//! | runtime | test_device | Option<usize> / None(测试域,不入 toml) |
-//! | runtime | server_url | Option<String> / None(cli,不入 toml) |
+//! | runtime | prefill_chunk / prefill_tail_merge | usize / 512、0 |
+//! | runtime | max_batch | usize / 1(合批上限;>1 需 gdn_slots≥它、单卡、无选择层) |
+//! | runtime | test_device / server_url | 测试域 / CLI(不入 toml) |
 //! | model | kind | ModelKind 枚举("0.8b"\\|"awq27b")/ 0.8b |
 //! | model | dir / name | Option / None(workspace 资产缺省) |
 //! | model | awq27b_dir | Option<String> / None(27B AWQ 检查点门控) |
@@ -52,10 +68,15 @@
 //! |   |   | 竖式/gate 质量门后转正) |
 //! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
+//! | pool | prefix_cache_share | f64 / 0.5(缓存可占设备池比例) |
+//! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
 //! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
+//! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
+//! | pool | disk_cache_mb / snap_disk_mb | usize / 0、0(**磁盘两层分片**;0 = 关层) |
+//! | pool | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
 //! | spec | depth / dumb / draft_kv_fp8 | usize 0(off)、flag、flag |
 //! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
 //! | spec | degrade_after / probe_every | usize / 6、8(降级首探窗口;旧 64 = 长尾税) |
@@ -65,8 +86,15 @@
 //! | dispatch | qkv_fuse / gdn_fused_decode / gdn_fused_decode_v2 | bool / 全真(**正语义**) |
 //! | dispatch | prefill_split / force_naive | flag / false |
 //! | dispatch | ~~flashinfer~~ | **已移除(2026-10-13):FI 恒启用,无开关** |
-//! | dispatch | gdn_chunked / gdn_scalar / kv_fp8 | flag / false |
+//! | dispatch | gdn_chunked | bool / **true**(定谳;形状门自动回落) |
+//! | dispatch | gdn_scalar / kv_fp8 | flag / false |
 //! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
+//! | dispatch | verify_v2 / decode_fi / verify_fi / fi_cuda_graph | bool / true、false、false、false(成套:图档瓦 + 窗刷表) |
+//! | dispatch | fi_plan_bake / fi_plan_restore | Option<usize>(0=取 max_seq)、bool / true |
+//! | dispatch | allowed_ops | Option<Vec<String>> / None(空/None = 准入门关) |
+//! | kvmem | select_decode / select_partial / index / pool_overcommit | flag / false(overcommit = 四键全开) |
+//! | kvmem | workspace_per_req / select_sink / select_recent / recall_every | usize / 2240、2、4、1 |
+//! | kvmem | coverage_probe / analyze_at_ctx / evict_policy / dense_floor_mib | 见字段注(lru\|lrfu[:λ]) |
 //! | probes | step_profile / perf_level / gdn_dump / debug / prefill_cksum / fact_probe | flag / false |
 //! | probes | step_gate / step_gate_ms / step_gate_us / step_gate_every | StepMode("off"\|"sticky"\|"single") / 50 / 0(覆盖 ms) / 1 |
 //! | log | level / tags_allow / tags_deny / file / max_mb / keep / timestamp | 见模块 |
@@ -103,16 +131,23 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::file_loader;
+
+pub mod intent;
+pub mod memory;
+pub mod resolve;
+
+pub use intent::Intent;
+pub use resolve::{Origin, Origins, ResolveMeta};
 
 // ============================================================================
 // §1 枚举与位面(严格类型;非法值反序列化即报错,不许 String 和稀泥)
 // ============================================================================
 
 /// 模型档位(model.kind)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelKind {
     #[serde(rename = "0.8b")]
     #[default]
@@ -128,7 +163,7 @@ pub enum ModelKind {
 }
 
 /// 采样模式(sampling.mode;原 `!= "greedy"` 字符串和稀泥废除)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SamplerMode {
     /// 贪心(恒等门/测试口径)
@@ -141,7 +176,7 @@ pub enum SamplerMode {
 /// lm_head 量化方案(model.head_quant;2026-10-11 由 bool 升格:
 /// 量化方案是一等配置面,新增方案 = 加枚举值 + loader 映射,
 /// 禁回生字符串/布尔和稀泥)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HeadQuant {
     /// 关闭(untied lm_head 保持 f16 直读;对照系)
@@ -162,7 +197,7 @@ pub enum HeadQuant {
 /// quantization(WOQ)**,**W4A8 = weight-and-activation quantization**
 /// (激活侧也量化)。完整方案 = WxAy × 粒度 × 算法 × 动静态,本键只承载
 /// **主干层**这一维(head_quant / 草稿 / mtp 各自独立 plan)。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuantScheme {
     /// W4A16 × AWQ g32-asym(权重 4bit + zp,激活 f16)= **今天行为**
     #[serde(rename = "w4a16")]
@@ -181,7 +216,7 @@ pub enum QuantScheme {
 }
 
 /// 图实例化旗标(cuda.graph_flags;原裸 u64 魔数 2/4 收口为结构化位面)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GraphInstantiateFlags {
     /// UPLOAD=0b10(实例化后预热上传)
@@ -201,14 +236,19 @@ impl GraphInstantiateFlags {
 // §2 config modules(每 module 管一个功能域;deny_unknown = 键名打错拒启)
 // ============================================================================
 
+fn default_max_batch() -> usize {
+    1
+}
+
 /// 进程装配面
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeCfg {
     pub bind: String,
     /// **声明式选卡**:`device = { bdf = "42:00.0" }` / `{ find_name = "3090" }` /
     /// `{ uuid = "GPU-…" }`(多填 = 交集,多命中全收);**整行不写 = 自动挑空闲卡**。
     /// 与 `device_ordinal` 互斥(同时给 = 拒启)。
+    #[serde(default, skip_serializing_if = "crate::device::DeviceSpec::is_empty")]
     pub device: crate::device::DeviceSpec,
     /// 显式 ordinal(测试/特殊场景;不走设备表查找)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,11 +268,41 @@ pub struct RuntimeCfg {
     /// 副作用:staging 别名改授 `PROT_READWRITE`。
     #[serde(default)]
     pub tp_push: bool,
+    /// **TP 通信数据腿：fp8 载荷**（runtime.tp_ar_f8；§47 第二步 2026-10-19）
+    /// ⇒ 交 `TpOpts.ar_f8`。**两侧同装配 ⇒ 同档**（不同档 = 收端按错 dtype 解读）。
+    pub tp_ar_f8: bool,
+    /// **lm_head 词表切**（runtime.tp_vocab_split；P1.1 2026-10-19）
+    ///
+    /// `true` ⇒ 每 rank 只建/只算/只持**自己那半词表**的 lm_head 行
+    /// （`ModelSpec::head_split` → `head_vocab = vocab / world`）：
+    /// decode 的头部 GEMM 减半、每卡省 ~1.18 GiB；代价 = logits 需 host 侧
+    /// 拼接（两 rank 半表拼回全表后才采样/判据）。
+    /// **缺省 `false` = 逐字节旧行为**；需 `world = 2`（单卡给值 = 响亮拒）。
+    /// 词表必须被 world 整除（`ModelSpec::sharded` 的整除硬门）。
+    #[serde(default)]
+    pub tp_vocab_split: bool,
+    /// **v1 两核融合档**（runtime.tp_ar_fused；§11.2 2026-10-19）
+    ///
+    /// `true` ⇒ AR 走**一核**（`ArFusedCall`：stage+reduce 同一核内两阶段）
+    /// 而非两核 —— §59.1 实测两核成本 22.13µs/次全在"核的落地/排空"
+    /// （单核 11.13 + 第二核边际 11.00）⇒ 少发一个核 ≈ decode +4%。
+    /// **只非 fp8 载荷**（decode 档；prefill 的 fp8 腿仍两核）。
+    /// **缺省 `false` = 逐字节旧行为**；两 rank 同装配（同档）。
+    #[serde(default)]
+    pub tp_ar_fused: bool,
     /// **自动选卡的空闲占比阈值**(0..1;默认 0.9):候选卡的 `memory.free/total` 低于它
     /// ⇒ auto-pick 跳过(避让非 owl 进程/未持锁实例);显式 spec 命中且全被跳 ⇒ 响亮拒启。
     pub gpu_min_free_ratio: f64,
     pub max_seq: usize,
     pub prefill_chunk: usize,
+    /// **引擎跨会话合批上限**(B5.1;缺省 **1 = 逐字节现状**)。
+    ///
+    /// >1 ⇒ 调度面把最多 N 个活跃 turn 的 decode 拼成一次 T=N 前向
+    /// (M1 = 裸 decode / spec off)。**不改变单 turn 语义**;每行各自采样/事件。
+    /// 前置:`pool.gdn_slots ≥ max_batch`(每会话一格 GDN)、单卡(TP 的 AR
+    /// 批语义未审)、`kvmem.select_decode = false`(M1 页表按行,不做视图)。
+    #[serde(default = "default_max_batch")]
+    pub max_batch: usize,
     /// **尾块合并**(tokens;L4,2026-10-18):`剩余 ≤ prefill_chunk + 本值`
     /// ⇒ 本步一口气吃完剩余(块长上限 = chunk + tail_merge)。
     ///
@@ -251,17 +321,21 @@ pub struct RuntimeCfg {
 }
 
 /// 模型资产面
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub struct ModelCfg {
     pub kind: ModelKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// 27B AWQ 检查点目录(测试/E2E 门控)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awq27b_dir: Option<String>,
     /// DFlash2 草稿检查点目录(⚠️ 须 W4A16 量化家族 syvai 系;BF16 源
     /// (z-lab)喂引擎 = 草稿全噪声 AL=0;装载期家族嗅探拒启)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dflash2_dir: Option<String>,
     /// C1(2026-10-11):untied lm_head 头部量化方案(枚举严格;映射点
     /// 在 engine loader:HeadQuant → QuantPlan)。质量门台账见枚举值注。
@@ -273,11 +347,12 @@ pub struct ModelCfg {
 }
 
 /// 池几何与显存预算(engine StatePool)
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PoolCfg {
     /// 设备 KV 池(token;`None` = 2 × 单会话容量)。
     /// **虚拟化档可小于上下文**(`[kvmem].pool_overcommit`;boot 硬校验兜底)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_tokens: Option<usize>,
     /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)
     pub gdn_slots: usize,
@@ -310,9 +385,23 @@ pub struct PoolCfg {
     pub snap_max: usize,
     /// **宿主 KV 腿**(MiB;0 = 关层)。下沉的落点之一。
     pub host_cache_mb: usize,
+    /// **复用池容量上限**(MiB;缺口 4 收尾 P1-1;缺省 256,0 = 不限)。
+    /// 释放的临时块先进池复用、不立即还驱动;超出本上限的**逐块顶出**回驱动。
+    pub pool_cap_mb: usize,
     /// **宿主状态腿**(MiB;0 = 关层)。GDN 快照下沉的落点 ——
     /// ⚠️ 超卖档会把压力推给它(实测 27B 单快照 607 MiB),别只给 KV 腿留量。
     pub snap_host_mb: usize,
+    /// **磁盘 KV 腿**(MiB;0 = 关层;S6)。宿主装不下时的第二落点(内容不丢)。
+    ///
+    /// 目录由 `disk_dir` 指定;进程重启后**扫目录回填账**(内容惰性读回)。
+    pub disk_cache_mb: usize,
+    /// **磁盘状态腿**(MiB;0 = 关层;与 [`Self::disk_cache_mb`] 同属盘层总账的两个分片)。
+    pub snap_disk_mb: usize,
+    /// **磁盘内容目录**(空 = 关层;两腿子目录 `kv/` 与 `snap/` 自动分)。
+    ///
+    /// 目录必须**独占**(同一目录给两个引擎用会互相扫到对方的块);
+    /// 不存在时 boot 自动创建。
+    pub disk_dir: String,
     pub vram_target: f64,
     pub vram_reserve_mb: u64,
     pub prefix_cache: bool,
@@ -348,6 +437,21 @@ impl Default for EvictPolicyCfg {
 impl EvictPolicyCfg {
     /// **LRFU 缺省 λ**(与 `owl_store::LrfuPolicy::new` 的文档同值)。
     pub const LRFU_DEFAULT_LAMBDA: f32 = 0.9;
+}
+
+impl Serialize for EvictPolicyCfg {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Lru => s.serialize_str("lru"),
+            Self::Lrfu { lambda } if *lambda == Self::LRFU_DEFAULT_LAMBDA => {
+                s.serialize_str("lrfu")
+            }
+            Self::Lrfu { lambda } => s.serialize_str(&format!("lrfu:{lambda}")),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for EvictPolicyCfg {
@@ -399,7 +503,7 @@ impl<'de> Deserialize<'de> for EvictPolicyCfg {
 /// ⚠️ 与 `probes.coverage_probe` 的分工:那个是**诊断面**(真实质量全量扫描,
 /// 单次成本含 `ctx` 因子 ⇒ 全军 O(ctx²))。**生产档只需 `select_decode`**,
 /// 不要为了开功能而把探针一起打开。
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KvmemCfg {
     /// **生产总开关**:选择层接进 decode(建视图页表 + 每步展开)。
@@ -458,7 +562,7 @@ pub struct KvmemCfg {
     /// - `None` + 虚拟化开 ⇒ **0** = "只要工作集装得下就准入"(低显存档默认);
     /// - `None` + 虚拟化关 ⇒ **Strict** = 要全量 dense 放得下(旧行为);
     /// - `Some(n)` ⇒ `n` MiB(仅当虚拟化开才被接受,否则 boot 响亮拒)。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dense_floor_mib: Option<u64>,
     /// **允许设备池小于上下文**(锁①;缺省关)。
     ///
@@ -483,7 +587,7 @@ impl KvmemCfg {
 }
 
 /// 投机解码(spec 三态/草稿池量化/B4 降级参数/verify 图诊断)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpecCfg {
     pub depth: usize,
@@ -493,6 +597,11 @@ pub struct SpecCfg {
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
     pub tapdecl: bool,
+    /// **TP 档放行投机解码**(P2.1-c;缺省 false = 响亮拒)。
+    /// 打开 = "草稿族双 rank 化"这条路的显式闸门:草稿 spec/权重按本 rank 计划
+    /// 分片、草稿池几何按分片 hkv、草稿 AR 与主干共用同一条 AR 序列。
+    /// **配置显式声明**(不读 env)—— 分相纪律:未验完的档不许静默放行。
+    pub tp_draft: bool,
     /// **m=0 连击阈值**(达此连击 → 降级裸 decode;0 = 禁用降级)
     pub degrade_after: usize,
     /// **降级后的首次探测窗口(tokens)** —— 探测 = 跑一个投机轮试水,命中(m≥1)即恢复 spec。
@@ -508,7 +617,7 @@ pub struct SpecCfg {
 }
 
 /// 采样参数
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SamplingCfg {    pub mode: SamplerMode,
     pub temp: f32,
@@ -518,16 +627,44 @@ pub struct SamplingCfg {    pub mode: SamplerMode,
 }
 
 /// 装载域(校验/观测)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoadCfg {
     pub verify: bool,
     pub debug_tap: bool,
+    /// **暂存槽上限 MiB**(原 `OWL_LOAD_STAGING_MB`;缺省 128)。
+    /// 单键超过它就按段流式装载(`0` = 不设上限)。**从配置来,不读 env**(用户裁决 2026-10-19)。
+    pub staging_mb: usize,
+    /// **设备重排裁决**:"auto"(缺省;能力自述 `RepackPath::resolve`)/ "device" / "cpu"。
+    /// 装载旋钮入配置面(此前只有隐式裁决,无显式入口)。
+    pub repack: String,
+    /// 逐键字节 dump(原 `OWL_LOAD_DUMP`;诊断面)
+    pub dump: bool,
+}
+
+impl LoadCfg {
+    /// `repack` 三态解析(非法值**响亮拒**;缺省 auto)
+    pub fn repack_device(&self) -> Result<Option<bool>, String> {
+        match self.repack.as_str() {
+            "auto" | "" => Ok(None),
+            "device" => Ok(Some(true)),
+            "cpu" => Ok(Some(false)),
+            other => Err(format!(
+                "[load] repack = {other:?} 非法(只认 auto|device|cpu)"
+            )),
+        }
+    }
+}
+
+impl Default for LoadCfg {
+    fn default() -> Self {
+        Self { verify: false, debug_tap: false, staging_mb: 128, repack: "auto".into(), dump: false }
+    }
 }
 
 /// 解释器分派面(models EnvProvider 组装源;**正语义** —— true = 开,
 /// env 面的 NO_FUSE 反开关是兼容遗留,不入 toml)
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DispatchCfg {
     /// W2 qkv 融合(缺省真;2026-10-04 k-probe 硬门定谳)
@@ -547,7 +684,7 @@ pub struct DispatchCfg {
     /// **`0` = 哨兵「取 [`RuntimeCfg::max_seq`]」** —— 单序列 ctx 的天然上界,
     /// 且它随档位走(不同 max_seq 的档不必手改上界)。
     /// `None`(缺省)= 现状(piecewise 断点 + 每步重算精确表)。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fi_plan_bake: Option<usize>,
     /// **图自携 plan restore**(缺省 `true` = 捕获窗内把本 plan 的表烘进图的
     /// memcpy 节点;prefill 桶图靠它)。
@@ -626,12 +763,13 @@ pub struct DispatchCfg {
     /// 为什么是硬门:未建表(仅引入)的算子不该在不知道它契约的情况下进生产;
     /// 而"哪些算子在跑"此前**无人知道**(实测靠 `launch_time` 日志数)。
     /// 装配期还会用本表跑**池写集穷举审计**(`ops::audit_active`)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_ops: Option<Vec<String>>,
 }
 
 /// 性能框架分级(映射到 `owl_shared::metrics::level`;见
 /// docs/arch/perf-framework.md §一)。`off` = 零成本基线对照臂。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PerfLevel {
     Off,
@@ -653,7 +791,7 @@ impl PerfLevel {
 }
 
 /// 日志级别(映射到 `owl_shared::log::Level`;`off` = 静音)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Off,
@@ -679,7 +817,7 @@ impl LogLevel {
 }
 
 /// 日志面(logger 框架;模块头见 `crates/shared/src/log.rs`)
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LogCfg {
     /// 级别阈值(off/error/warn/info/debug/trace;**缺省 warn**)
@@ -689,6 +827,7 @@ pub struct LogCfg {
     /// tag 前缀黑名单(优先于白名单)
     pub tags_deny: Vec<String>,
     /// tee 落盘路径(None = 仅 stderr)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<std::path::PathBuf>,
     /// 单文件上限 MiB(0 = 不 rotation)
     pub max_mb: u64,
@@ -704,7 +843,7 @@ fn default_true() -> bool {
 }
 
 /// 诊断探针族(全域布尔;boot 一次解析,热路径零 env)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProbesCfg {
     pub step_profile: bool,
@@ -722,6 +861,7 @@ pub struct ProbesCfg {
     pub dflash_dumb: bool,
     pub gdn_dump_all: bool,
     pub pf_bisect: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pf_stages: Option<usize>,
     pub pf_fin_check: bool,
     pub raw_completion: bool,
@@ -743,7 +883,7 @@ pub struct ProbesCfg {
     pub step_gate: crate::stepgate::StepMode,
     /// **KV 页字节差分落点**(`<pos>` = 在该 decode 步前后各 d2h 一页,一次;
     /// 写者足迹取证面)—— 原 `OWL_KV_DUMP` env(同上收编)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_dump_at: Option<usize>,
     /// 粘滞档每检查点睡眠毫秒(缺省 50)
     #[serde(default = "default_step_gate_ms")]
@@ -765,7 +905,7 @@ fn default_step_gate_every() -> u64 {
 }
 
 /// CUDA 设备面(诊断旗标 + 图实例化位面 + slab 定档 + nvrtc 工具链)
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CudaCfg {
     pub srv_timing: bool,
@@ -782,6 +922,7 @@ pub struct CudaCfg {
     pub free_legacy: bool,
     pub graph_flags: GraphInstantiateFlags,
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_slab_mb: Option<usize>,
     /// **发射账容量**(0 = 关;>0 ⇒ server 记最近 N 条命令,含流/核名/块地址)。
     /// 查询:`GET /debug/launches[/<n>[/<kind>]]`;见 cuda::trace 模块头。
@@ -825,7 +966,7 @@ pub mod sync_bit {
 }
 
 /// 图装配面(engine GraphPlanDesc)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GraphCfg {
     /// eager 直发,跳过图捕获(**总闸**:连 decode/verify/fold/propose 族一起关)
@@ -844,7 +985,7 @@ pub struct GraphCfg {
 }
 
 /// prefill 图档(见 [`GraphCfg::prefill_bucket`];serde 小写:off/t512/geobuckets)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PrefillBucket {
     /// 不建 prefill 图(= 今天行为)
@@ -859,7 +1000,7 @@ pub enum PrefillBucket {
 /// 工具调用输出格式(agent.tool_call_format;**jinja 模板同名变量**)。
 /// xml = `<function=…><parameter=…>` 块;json = `<tool_call>{"name":…}` 单行。
 /// 解析器两格式都认(`toolcall.rs`),**切换时必须与模板同批**。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolCallFormat {
     /// 模板缺省(厂商推荐)
@@ -872,12 +1013,13 @@ pub enum ToolCallFormat {
 /// agent 服务面(2026-10-14 T5;agent-服务面-设计与施工.md §三/§九)。
 /// 这些旋钮此前散落为 `openai.rs` 硬编码常量与 adapter 侧约定 ——
 /// 迁入配置总账后由 `ServerConfig` 显式搬运,账外键拒启。
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentCfg {
     /// 模板路径覆盖(B2):None = 模型快照 `<model.dir>/chat_template.jinja`;
     /// 相对路径 = 相对 model.dir。**不动快照**换模板的运维抓手
     /// (模板漂移调查 / 模板 A/B 的载体)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_path: Option<String>,
     /// 隐式默认会话(AGT-09):请求不带 `session` 键时落到会话 0。
     /// pi 每轮全量重发历史 ⇒ 前缀增量命中;false = 每请求临时会话
@@ -895,6 +1037,7 @@ pub struct AgentCfg {
     pub auto_disable_thinking_with_tools: bool,
     /// 思考档位缺省(OpenAI 同名协议值:模板值域 none/low/medium/high/xhigh…;
     /// 请求带 `reasoning_effort` 时以请求为准)。None = 不传 ⇒ 模板取自己的缺省
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }
 
@@ -914,7 +1057,7 @@ impl Default for AgentCfg {
 }
 
 /// 本地服务面(并发/排队;owl 定位 = 本地单机,不做对外高并发)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerCfg {
     /// 最大并发请求数(在跑 + 排队;超出者排队等待)。
@@ -934,7 +1077,7 @@ impl Default for ServerCfg {
 // ============================================================================
 
 /// 全量配置对象(loader 唯一产物;进程内冻结,只读下传)
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OwlConfig {
     pub runtime: RuntimeCfg,
@@ -961,9 +1104,13 @@ impl Default for RuntimeCfg {
             device_ordinal: None,
             tp_ordinals: None,
             tp_push: false,
+            tp_ar_f8: false,
+            tp_vocab_split: false,
+            tp_ar_fused: false,
             gpu_min_free_ratio: 0.9,
             max_seq: 4096,
             prefill_chunk: 512,
+            max_batch: 1,
             prefill_tail_merge: 0,
             test_device: None,
             server_url: None,
@@ -983,6 +1130,10 @@ impl Default for PoolCfg {
             snap_max: 4,
             host_cache_mb: 0,
             snap_host_mb: 0,
+            disk_cache_mb: 0,
+            snap_disk_mb: 0,
+            disk_dir: String::new(),
+            pool_cap_mb: 256,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
             prefix_cache: true,
@@ -1015,6 +1166,7 @@ impl Default for KvmemCfg {
 impl Default for SpecCfg {
     fn default() -> Self {
         Self {
+            tp_draft: false,
             depth: 0,
             dumb: false,
             draft_kv_fp8: false,
@@ -1047,7 +1199,9 @@ impl Default for DispatchCfg {
             decode_xqa: false,
             xqa_prefill: false,
             fi_min_tokens: 1,
-            gdn_chunked: false,
+            // 2026-10-20:**定谳后翻默认**(FLA 五核,生产 spec-dflash 长期在跑;
+            // 形状/T 门不满足时层内自动回落 varlen,无行为风险)
+            gdn_chunked: true,
             gdn_scalar: false,
             gdn_fused_decode: true,
             gdn_fused_decode_v2: true,
@@ -1079,7 +1233,7 @@ impl Default for SamplingCfg {
 // ============================================================================
 
 /// TOML Value 深合并(覆盖层写回基座;表递归,标量/数组整体覆盖)
-fn merge(base: &mut toml::Value, over: toml::Value) {
+pub(crate) fn merge(base: &mut toml::Value, over: toml::Value) {
     match (base, over) {
         (toml::Value::Table(b), toml::Value::Table(o)) => {
             for (k, v) in o {
@@ -1092,6 +1246,23 @@ fn merge(base: &mut toml::Value, over: toml::Value) {
             }
         }
         (b, o) => *b = o,
+    }
+}
+
+/// 把一层 TOML 的**叶子路径**记进来源表(表递归;标量/数组整体记)。
+///
+/// 只记显式写过的键 —— 派生键由 [`resolve::apply`] 补记,缺省键 = `Default`。
+fn record_origins(v: &toml::Value, prefix: &str, origin: &Origin, out: &mut Origins) {
+    match v {
+        toml::Value::Table(t) => {
+            for (k, v) in t {
+                let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                record_origins(v, &path, origin, out);
+            }
+        }
+        _ => {
+            out.insert(prefix.to_string(), origin.clone());
+        }
     }
 }
 
@@ -1159,7 +1330,7 @@ const FLAVOR_KEY: &str = "flavor";
 const EXTENDS_MAX_DEPTH: usize = 8;
 
 /// TOML 值的类型名(报错用;显式 match —— 不依赖 toml crate 的辅助 API 漂移)
-fn toml_type_name(v: &toml::Value) -> &'static str {
+pub(crate) fn toml_type_name(v: &toml::Value) -> &'static str {
     match v {
         toml::Value::String(_) => "字符串",
         toml::Value::Integer(_) => "整数",
@@ -1180,6 +1351,7 @@ fn load_config_into(
     out: &mut toml::Value,
     depth: usize,
     chain: &mut Vec<PathBuf>,
+    origins: &mut Origins,
 ) -> Result<(), String> {
     if depth >= EXTENDS_MAX_DEPTH {
         let mut shown: Vec<String> = chain.iter().map(|p| p.display().to_string()).collect();
@@ -1240,7 +1412,7 @@ fn load_config_into(
     };
     chain.push(canon);
     if let Some(p) = flavor_base {
-        load_config_into(&p, out, depth + 1, chain)?;
+        load_config_into(&p, out, depth + 1, chain, origins)?;
     }
     if let Some(p) = parent {
         let p = if p.is_absolute() {
@@ -1250,11 +1422,101 @@ fn load_config_into(
                 .unwrap_or_else(|| Path::new("."))
                 .join(p)
         };
-        load_config_into(&p, out, depth + 1, chain)?;
+        load_config_into(&p, out, depth + 1, chain, origins)?;
     }
     chain.pop();
+    // 本层显式键的来源 = 文件路径(后层覆盖前层 ⇒ 后写覆盖来源)
+    let origin = Origin::File(path.display().to_string());
+    record_origins(&v, "", &origin, origins);
     merge(out, v);
     Ok(())
+}
+
+/// **带来源/意图元数据的解析产物**(boot 与 `--check` 走同一函数)。
+///
+/// `config` 是最终 [`OwlConfig`];`origins` 是逐键来源;`meta` 只在
+/// `[intent]` 存在时有值(意图/派生规则/内存估算)。
+#[derive(Clone, Debug)]
+pub struct ResolvedConfig {
+    pub config: OwlConfig,
+    pub origins: Origins,
+    pub meta: Option<ResolveMeta>,
+    /// 参与加载的层(文件路径 / `cli`;按优先级从低到高)
+    pub layers: Vec<String>,
+}
+
+impl ResolvedConfig {
+    pub fn intent(&self) -> Option<&resolve::IntentMeta> {
+        self.meta.as_ref().map(|m| &m.intent)
+    }
+
+    pub fn estimate(&self) -> Option<&memory::MemoryEstimate> {
+        self.meta.as_ref().and_then(|m| m.estimate.as_ref())
+    }
+
+    /// 逐键来源(未写/未派生 ⇒ `Default`)
+    pub fn origin(&self, key: &str) -> Origin {
+        self.origins.get(key).cloned().unwrap_or(Origin::Default)
+    }
+
+    /// 生效值(把 [`OwlConfig`] 序列化回 TOML 值后按点路径取)
+    pub fn effective_value(&self, key: &str) -> Result<toml::Value, String> {
+        let v = toml::Value::try_from(&self.config)
+            .map_err(|e| format!("生效配置序列化失败(print/explain 面): {e}"))?;
+        resolve::get(&v, key)
+            .cloned()
+            .ok_or_else(|| format!("键 {key:?} 不在生效配置里(点路径,如 pool.pool_tokens)"))
+    }
+
+    /// 单键解释:`值 + 来源 + 派生规则`
+    pub fn explain(&self, key: &str) -> Result<String, String> {
+        let v = self.effective_value(key)?;
+        let o = self.origin(key);
+        let mut out = format!("{key} = {v}\n  来源: {}\n", o.describe());
+        if let Some(m) = &self.meta {
+            if let Some(rule) = m.intent.rules.get(key) {
+                out.push_str(&format!("  规则: {rule}\n"));
+            }
+        }
+        if matches!(o, Origin::Default) {
+            out.push_str("  (未在档/派生中写 ⇒ 代码缺省;总账见 config/mod.rs 顶部)\n");
+        }
+        Ok(out)
+    }
+
+    /// 只保留**生效配置里存在**的来源键(派生后 `intent.*`/`site` 原文不再展示)
+    fn prune_origins(origins: &mut Origins, config: &OwlConfig) -> Result<(), String> {
+        let v = toml::Value::try_from(config)
+            .map_err(|e| format!("生效配置序列化失败(来源裁剪): {e}"))?;
+        origins.retain(|k, _| resolve::get(&v, k).is_some());
+        Ok(())
+    }
+
+    /// 生效配置 → TOML 文本(`--print-config --format toml`)
+    pub fn to_toml_pretty(&self) -> Result<String, String> {
+        toml::to_string_pretty(&self.config)
+            .map_err(|e| format!("生效配置 TOML 序列化失败: {e}"))
+    }
+}
+
+/// 解析一条 `--set key=value`(点路径;值先按 TOML 字面量解析,失败按字符串)
+///
+/// 例:`--set pool.prefill_chunk=1024` / `--set log.level=info` /
+/// `--set intent.context="max"`(intent 键也可覆盖,在派生之前合并)。
+pub fn parse_cli_set(s: &str) -> Result<(String, toml::Value), String> {
+    let (k, raw) = s.split_once('=').ok_or_else(|| {
+        format!("--set {s:?} 非法:须 key=value(点路径,如 pool.prefill_chunk=512)")
+    })?;
+    let key = k.trim();
+    if key.is_empty() || key.split('.').any(|seg| seg.is_empty()) {
+        return Err(format!("--set {s:?} 非法键 {key:?}(点路径,如 pool.pool_tokens)"));
+    }
+    let raw = raw.trim();
+    let val = match toml::from_str::<toml::Value>(&format!("v = {raw}")) {
+        Ok(toml::Value::Table(mut t)) => t.remove("v").expect("内部不变量:单键表"),
+        _ => toml::Value::String(raw.to_string()),
+    };
+    Ok((key.to_string(), val))
 }
 
 impl OwlConfig {
@@ -1273,26 +1535,59 @@ impl OwlConfig {
     /// 每层都支援 `flavor`(预设档名 → 该层的父层)与 `extends`;后者覆盖前者。
     /// 用途:`OWL_TEST_CONF → 用例 overlay` 这条测试链(见 `testkit::case`)。
     pub fn load_chain(base: Option<&Path>, layers: &[&Path]) -> Result<Self, String> {
+        Self::load_resolved(base, layers, &[]).map(|r| r.config)
+    }
+
+    /// **带来源/意图解析的加载入口**(boot / `--check` / `--print-config` 同一函数)
+    ///
+    /// 顺序:`base`(profile/flavor)→ `layers`(位置参数 / `--site`)→ `cli`
+    /// (`--set` / 日志/性能旗标)→ `[intent]` 派生(显式低层键覆盖派生)→
+    /// 反序列化 + `validate`。`origins` 记录**每个叶子键**的来源。
+    pub fn load_resolved(
+        base: Option<&Path>,
+        layers: &[&Path],
+        cli: &[(String, toml::Value)],
+    ) -> Result<ResolvedConfig, String> {
         let mut v = toml::Value::Table(toml::map::Map::new());
+        let mut origins = Origins::new();
+        let mut layer_names: Vec<String> = Vec::new();
         if let Some(b) = base {
-            load_config_into(b, &mut v, 0, &mut Vec::new())?;
+            load_config_into(b, &mut v, 0, &mut Vec::new(), &mut origins)?;
+            layer_names.push(b.display().to_string());
         }
         for p in layers {
-            load_config_into(p, &mut v, 0, &mut Vec::new())?;
+            load_config_into(p, &mut v, 0, &mut Vec::new(), &mut origins)?;
+            layer_names.push(p.display().to_string());
         }
+        if !cli.is_empty() {
+            let mut root = toml::Value::Table(toml::map::Map::new());
+            for (k, val) in cli {
+                resolve::set_path(&mut root, k, val.clone());
+                origins.insert(k.clone(), Origin::Cli);
+            }
+            merge(&mut v, root);
+            layer_names.push("cli".into());
+        }
+        let meta = resolve::apply(&mut v, &mut origins)?;
         reject_retired_keys(&v)?;
-        v.try_into()
-            .map_err(|e| format!("配置反序列化失败(账外键或非法枚举值): {e}"))
-            .and_then(|c: Self| {
-                c.validate()?;
-                Ok(c)
-            })
+        let config: Self = v
+            .try_into()
+            .map_err(|e| format!("配置反序列化失败(账外键或非法枚举值): {e}"))?;
+        config.validate()?;
+        ResolvedConfig::prune_origins(&mut origins, &config)?;
+        Ok(ResolvedConfig { config, origins, meta, layers: layer_names })
     }
 
     /// TOML 字符串直载(测试/ops 便捷;与 load 同一反序列化面 + 同一语义门)。
-    /// **不解析 `extends`**(无文件上下文 —— 继承请走文件加载)。
+    /// **不解析 `extends`**(无文件上下文 —— 继承请走文件加载);**支持
+    /// `[intent]`**(测试派生器用,来源记为 `<inline>`)。
     pub fn from_toml_str(s: &str) -> Result<Self, String> {
-        let v: toml::Value =
+        Self::from_toml_str_resolved(s).map(|r| r.config)
+    }
+
+    /// 字符串直载 → 完整解析产物(`[intent]` 可用;`extends`/`flavor` 拒)
+    pub fn from_toml_str_resolved(s: &str) -> Result<ResolvedConfig, String> {
+        let mut v: toml::Value =
             toml::from_str(s).map_err(|e| format!("配置解析失败(账外键或非法枚举值): {e}"))?;
         if v.get(EXTENDS_KEY).is_some() {
             return Err(format!(
@@ -1304,12 +1599,16 @@ impl OwlConfig {
                 "配置含 `{FLAVOR_KEY}`:预设档引用需要文件上下文 —— 用 OwlConfig::load / 服务端配置档(字符串直载不解析 flavor)"
             ));
         }
+        let mut origins = Origins::new();
+        record_origins(&v, "", &Origin::File("<inline>".into()), &mut origins);
+        let meta = resolve::apply(&mut v, &mut origins)?;
         reject_retired_keys(&v)?;
-        let c: Self = v
+        let config: Self = v
             .try_into()
             .map_err(|e| format!("配置反序列化失败(账外键或非法枚举值): {e}"))?;
-        c.validate()?;
-        Ok(c)
+        config.validate()?;
+        ResolvedConfig::prune_origins(&mut origins, &config)?;
+        Ok(ResolvedConfig { config, origins, meta, layers: vec!["<inline>".into()] })
     }
 
     /// **跨字段语义门**(D1,2026-10-17):反序列化只能保证**形状**(账外键 /
@@ -1323,6 +1622,29 @@ impl OwlConfig {
     /// `exit(1)`),且**只有 server 一条入口守** —— 直接构造 engine 的路径
     /// (tests / cli)裸奔。
     pub fn validate(&self) -> Result<(), String> {
+        // **选卡口径互斥**(2026-10-20;原本只在选卡函数里拒,`--check` 无 GPU 也能抓):
+        //   `device`(声明式)与 `device_ordinal`(显式序)同时给 ⇒ 卡身份两个真源;
+        //   `tp_ordinals` 与任一单卡口径同时给 ⇒ 同上。
+        if !self.runtime.device.is_empty() && self.runtime.device_ordinal.is_some() {
+            return Err(format!(
+                "[runtime] device = {:?} 与 device_ordinal = {:?} 互斥(卡身份只能有一个真源)",
+                self.runtime.device, self.runtime.device_ordinal
+            ));
+        }
+        if self.runtime.tp_ordinals.is_some()
+            && (!self.runtime.device.is_empty() || self.runtime.device_ordinal.is_some())
+        {
+            return Err(format!(
+                "[runtime] tp_ordinals = {:?} 与 device/device_ordinal 互斥(TP 档不自动挑卡)",
+                self.runtime.tp_ordinals
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.runtime.gpu_min_free_ratio) {
+            return Err(format!(
+                "[runtime] gpu_min_free_ratio({}) 越界:须 0..=1(自动挑卡的空闲占比阈值)",
+                self.runtime.gpu_min_free_ratio
+            ));
+        }
         // **前缀缓存份额**:0..=1(0 = 不留缓存设备份额;1 = 可占满设备池)。
         // 越界 = 配置错(算式在 store,静默夹会让"我要 150% 池"变成别的东西)。
         if !(0.0..=1.0).contains(&self.pool.prefix_cache_share) {
@@ -1330,6 +1652,55 @@ impl OwlConfig {
                 "[pool] prefix_cache_share({}) 越界:须 0..=1(份额 × 设备池 = 缓存可占页数)",
                 self.pool.prefix_cache_share
             ));
+        }
+        // **磁盘层的配置自洽**(S6):给了配额就必须给目录(否则"要磁盘"变成静默关层);
+        // 给了目录但没配额 = 空目录守着不用(允许,但 boot 日志会显示关层)。
+        // 目录给多个引擎共用 = 互相扫到对方的块 ⇒ 拒(独占是硬约束)。
+        let disk_bytes = self.pool.disk_cache_mb + self.pool.snap_disk_mb;
+        if disk_bytes > 0 && self.pool.disk_dir.trim().is_empty() {
+            return Err(format!(
+                "[pool] 给了磁盘配额({} MiB)却没给 disk_dir —— 要么补目录,要么把配额清零\
+                 (静默关层会让「别急着丢」的承诺失效)",
+                disk_bytes
+            ));
+        }
+        if self.pool.snap_disk_mb > 0 && self.pool.snap_max == 0 {
+            return Err(
+                "[pool] snap_disk_mb > 0 但 snap_max = 0(没有快照池,盘上分片无意义)\
+                 —— 清掉 snap_disk_mb 或给快照池"
+                    .to_string(),
+            );
+        }
+        // **合批上限的自洽门**(B5.1;2026-10-20):批 = 每会话一行 GDN 状态,
+        // 且 M1 的页表按行铺(无选择层视图)。任一不成立 ⇒ 拒启(不许"配了
+        // 但静默退回串行")。
+        if self.runtime.max_batch == 0 {
+            return Err("[runtime] max_batch = 0 —— 至少 1(1 = 串行,逐字节现状)".into());
+        }
+        if self.runtime.max_batch > 1 {
+            if self.pool.gdn_slots < self.runtime.max_batch {
+                return Err(format!(
+                    "[pool] gdn_slots({}) < [runtime] max_batch({})—— 合批每会话要一格 GDN 状态",
+                    self.pool.gdn_slots, self.runtime.max_batch
+                ));
+            }
+            if self.runtime.max_batch > 8 {
+                return Err(format!(
+                    "[runtime] max_batch({}) > 8 —— 逐行 token 输出走 Concat 8 槽(verify 图同款)",
+                    self.runtime.max_batch
+                ));
+            }
+            if self.runtime.tp_ordinals.is_some() {
+                return Err(
+                    "[runtime] max_batch > 1 与 TP 不共戴天(AR 的批语义未审;先单卡)".into(),
+                );
+            }
+            if self.kvmem.select_decode {
+                return Err(
+                    "[runtime] max_batch > 1 与 [kvmem] select_decode 不共戴天                     (M1 合批页表按行铺,不做选择层视图)"
+                        .into(),
+                );
+            }
         }
         if self.pool.gdn_slots < self.server.max_concurrency {
             return Err(format!(
@@ -1347,8 +1718,35 @@ impl OwlConfig {
         // ✅ 2026-10-19 解禁:`[graph] prefill_bucket` × `[dispatch] fi_plan_bake`
         // 不再是互斥对 —— **桶路也接了窗外 `fi_plan_sync`**(桶回放前由引擎把
         // 本桶的 plan 表刷回共享 `int_ws`;见 `exec::prefill_chunk` 的回放点)。
-        // 于是两条 FI 表承载(图自携 restore / host 每步 sync)对桶图都成立,
-        // 由 `fi_plan_restore` 唯一选择:`true` = 桶自携(旧行为),`false` = host 刷。
+        //
+        // ⚠️ **但桶图 × FI 只有一种承载组合成立**(2026-10-19 桶门定谳,原注释
+        // "两条承载对桶图都成立"是**错的**):
+        // 桶图捕获期按 `t_pad` 烘 FI 节点(plan 形状 + 表内容),回放期
+        // `ctx = base + t` 可能 > `t_pad`(尾块)⇒
+        //   · 图自携(restore=true):表内容 = 捕获期 ctx=t_pad 的那份 ⇒ 尾块
+        //     读到截断的 KV 覆盖(0.8B 实测:输出退化成"重复、重复…");
+        //   · eager 瓦(cuda_graph=false):plan 形状随 ctx 跳变 ⇒ 图内 offsets/
+        //     padded/split 与窗外刷进去的表不同构(实测 IMA:核读 `q_indptr[5]`
+        //     —— 8 字节的 2 元表被按 6 元索引)。
+        // ⇒ 桶图硬配 `fi_plan_restore = false` + `fi_cuda_graph = true`。
+        if self.graph.prefill_bucket != PrefillBucket::Off {
+            if self.dispatch.fi_plan_restore {
+                return Err(
+                    "[graph] prefill_bucket 需要 fi_plan_restore = false \
+                     (图自携的是捕获期 ctx=t_pad 的表;尾块 ctx>t_pad 会读错 KV —— \
+                     由 host 每桶回放前 `fi_plan_sync` 刷精确表)"
+                        .to_string(),
+                );
+            }
+            if !self.dispatch.fi_cuda_graph {
+                return Err(
+                    "[graph] prefill_bucket 需要 fi_cuda_graph = true \
+                     (图档瓦让 plan 形状对 ctx 恒定;eager 瓦下形状随 ctx 跳变 ⇒ \
+                     图内烘的 offsets/padded/split 与窗外刷的表不同构)"
+                        .to_string(),
+                );
+            }
+        }
         if self.dispatch.fi_plan_bake.is_some() && self.dispatch.fi_plan_restore {
             return Err(
                 "[dispatch] fi_plan_bake 需要 fi_plan_restore = false \
@@ -1534,6 +1932,31 @@ mod tests {
         // ⑤ 门关:空列表(诊断态)/ 不写 ⇒ 不校验
         OwlConfig::from_toml_str("[dispatch]\nallowed_ops = []\n").expect("空 = 门关,应过");
         assert!(OwlConfig::default().dispatch.allowed_ops.is_none());
+    }
+
+    /// **合批上限自洽门**(B5.1):gdn_slots 不足 / 与 TP / 选择层互斥 ⇒ 拒启
+    #[test]
+    fn max_batch_requires_gdn_slots_and_no_virtualization() {
+        let parse = |t: &str| OwlConfig::from_toml_str(t);
+        parse(
+            "[runtime]\nmax_batch = 2\n[pool]\ngdn_slots = 2\n[server]\nmax_concurrency = 2\n",
+        )
+        .expect("合法合批档应接受");
+        assert!(
+            parse("[runtime]\nmax_batch = 3\n[pool]\ngdn_slots = 2\n[server]\nmax_concurrency = 2\n")
+                .is_err(),
+            "gdn_slots < max_batch 应拒"
+        );
+        assert!(
+            parse("[runtime]\nmax_batch = 2\ntp_ordinals = [0, 2]\n[pool]\ngdn_slots = 2\n[server]\nmax_concurrency = 2\n")
+                .is_err(),
+            "合批 + TP 应拒"
+        );
+        assert!(
+            parse("[runtime]\nmax_batch = 2\n[kvmem]\nselect_decode = true\n[pool]\ngdn_slots = 2\n[server]\nmax_concurrency = 2\n")
+                .is_err(),
+            "合批 + 选择层视图应拒"
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //! 经 interpreters 模块 shim 转发(历史调用面不动)。
 
 pub mod awq;
+pub mod ckpt_config;
 pub(crate) mod awq_build;
 /// **GGUF 起点族**(2026-10-19;容器解析 + 元数据 + 内嵌词表 + 键约定 + 块字节源)
 pub mod gguf;

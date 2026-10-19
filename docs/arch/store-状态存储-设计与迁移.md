@@ -2278,3 +2278,424 @@ GPU 真机(状态腿探针 + §22 三门口 + `session_continuity`)。
 
 **其余 §3.6 条目经全文核对成立**(块级检索、Mean-K、两视图分离、32-token 块、top-8/16 覆盖率、
 "论文不虚拟化复发状态 = 我们的增量")。
+
+---
+
+## 30. 单一调度器:判据归一(容量调度的唯一产地)· 2026-10-19
+
+> 用户拍板(本会话):"继续做引擎最重要的容量调度管理 —— 先**收敛判据**为单一调度器。"
+> 起因是可 grep 证的三处分裂(§30.0)。本刀只做**判据归一 + 两腿同堂**,
+> 不碰并发(单活跃 turn 模型不变)、不碰盘层。
+
+### 30.0 病根(接线前的代码事实,逐条可查)
+
+| # | 事实 | 证据 |
+|---|---|---|
+| ① | `Rel::plan_evict`(两腿合并 + `EvictPolicy` 出序)**零调用点** | `grep plan_evict` 只有定义与自有测试 |
+| ② | 生产路径的"谁该走"由 `hooks::plan` 决定,而它的签名只吃 `&BlockLeg` | `hooks.rs`(旧)`plan(leg: &BlockLeg, …)` |
+| ③ | 因此 `EvictPolicy::{Lru,Lrfu}` / `note_recall` 只影响死代码 —— **策略对象装了但没上生产** | boot `set_evict_policy` + ① |
+| ④ | 状态腿(GDN 快照)不在 H1/H2/H5/N6 的保洁计划里;只能等 capture 撞满时被 engine 池被动逐 | `exec/spec.rs::snap_pick_slot`(engine 内 rank + LRU = 第二套判据) |
+| ⑤ | 同步兜底 `ensure_for_len` 自带第三套逐叶循环 | `kv/mod.rs::ensure_for_len` |
+
+⇒ 同一件事(腾设备)三套规范 = AGENTS.md 的"接口不唯一"红线;而且**策略对象是死的**。
+
+### 30.1 接口(唯一入口)
+
+```rust
+// store::hooks —— 类型
+pub struct Need { pub slots: usize, pub snap_bytes: usize, pub why: NeedWhy }
+pub enum  EvictOut { Kv { chain, sink, span }, Snap { key: SnapKey, sink } }   // 两腿同一种票
+pub struct HostRoom { pub kv_slots: usize, pub snap_slots: usize }
+
+// store::Rel —— 生产唯一入口
+pub fn plan_need(&self, need: Need, protect: &Protected) -> Verdict
+```
+
+- **两腿同一种票**:KV 链/叶与快照进同一张 `Verdict.out`;执行仍归 engine(§21 不破)。
+- **双目标**:`slots`(KV 设备槽)与 `snap_bytes`(状态腿设备字节)**各自独立满足** ——
+  KV 缺槽不能靠丢快照补,反之亦然。`deny` 文案带两腿数字。
+- **策略对象第一次上生产**:`plan_need` 内部用 `self.evict`(`Lru`/`Lrfu(attention)`)
+  给候选出序;`note_recall` 的召回信号从此真的影响"谁先让位"。
+
+### 30.2 算法(两轮 + 事实档 + 策略档)
+
+```text
+轮一 先下沉(内容不丢):KV 链级候选(§14.6)+ 状态腿快照候选 → 同一候选表
+      ├ 事实档:Transient 快照(生成段,逐出即丢)排最前
+      ├ 策略档:同档内 EvictPolicy::order(LRU / LRFU)
+      └ 出票条件:sink = Host,且**该腿宿主装得下**(KV 整链 span ≤ 剩余槽;快照 ≤ 剩余张)
+轮二 再驱逐(内容真丢):未满足的目标 → KV 叶级(不动链头)+ 状态腿候选 → 同序 → sink = Drop
+③   仍不足 ⇒ deny(两腿分别报"短多少",不许动活跃面)
+```
+
+**关键裁决(沿用旧律,不新造)**:
+- KV 下沉粒度 = **整链**(§14.6;半截不出票),驱逐粒度 = **叶**(丢尾部不动链头);
+- `Transient` 只 Drop 不下沉(下沉一条 159 MiB 换不回共享前缀价值,§9.1(6)a);
+- `protect`(活跃 turn 的链/点名快照)绝不入 `out`。
+
+### 30.3 删了什么 / 保留什么
+
+| 项 | 裁决 |
+|---|---|
+| `hooks::plan`(只吃 KV 腿) | **删除**;能力并入 `plan_capacity` |
+| `Rel::plan_evict` + `EvictItem`/`EvictPlan` | **删除**(零调用点;其"两腿合并 + 策略出序"能力并入 `plan_need`) |
+| `KvStore::ensure_for_len` 同步驱逐 | **保留为兜底**,不是第二套判据:报告面 `ops.ensure_evicted > 0` = 调度器失职的**告警信号**(正常路径应恒 0) |
+
+### 30.4 门(全绿)
+
+- store 单测 **91**(含新增 2:`plan_need_moves_durable_snapshot_to_host_when_room`、
+  `plan_need_never_offloads_transient_snapshot`)+ snap_leg 3 + store_e2e 4;
+- engine lib **55**(含新增 `idle_node_offloads_device_snapshot_via_store_plan`:
+  store 判 Host ⇒ engine 执行臂真沉、设备槽释放);
+- 回归:old `hooks::plan` 的次序门改写为 `plan_kv`(走 `plan_capacity`),
+  语义断言不变(压力/空转零缺口也搬、优先 Host、整链凑满目标)。
+
+### 30.5 行为变化(逐条)
+
+1. **Idle 节点现在带状态腿目标**:`snap_bytes = 一条快照`,且**仅当状态腿宿主有位**时给
+   (宿主关/满 ⇒ 0,不产生永远凑不够的 deny)。空转每 `IDLE_HK_EVERY=16` 拍整理一次。
+2. **两腿宿主独立开关**:KV 宿主关 ⇒ 该腿目标清零(旧行为:宿主关不换出,**也不无谓驱逐**);
+   状态腿宿主关同理。不会因为一腿开就把另一腿 Drop 掉。
+3. **Pressure 节点暂不带状态腿目标**(`snap_bytes = 0`):压力档的目标是"把驱动 free 拉回",
+   两腿字节如何分摊需显式策略 ⇒ 挂账 §30.6-①。
+4. `EvictOut` 枚举化:engine `apply_verdict` 对 `Snap{Host}` 走 `snap_offload` + 清槽,
+   `Snap{Drop}` 走 `drop_snap_host + state.drop_snap + 清槽`;新增 `Applied.snap_offloaded/dropped`
+   与 metrics `store.hook.snap.out|drop`。
+
+### 30.6 挂账(本刀新增)
+
+1. **Pressure 的状态腿分摊**:N6 目标是"驱动字节",两腿都能腾;如何分摊(KV 优先?按可搬量比例?)
+   需显式策略 —— 本刀先保持 KV-only(行为不变)。
+2. ~~**engine 池的 victim 判据**:`snap_pick_slot` 仍用 engine 内的 importance rank + LRU
+   (第二套判据)~~ ✅ **已结(§30.7 同会话第二刀)**:`snap_pick_slot` 只做 key→slot 映射,
+   判据走 `Rel::snap_victim_order`(与 `plan_need` 同一份排序)。
+3. **`ensure_for_len` 关兜底**:等调度器在真机长跑把 `ops.ensure_evicted` 压到 0 后,
+   把兜底改成 `debug_assert` + 告警(消灭第三套判据的最后一块)。
+4. 状态腿池缩容 / 盘层 / 准入 Queue 定时器 / 对账口进服务面 —— 沿用 §20 挂账。
+
+### 30.7 同会话第二刀:状态腿出序归一(§30.6-② 收口)· 2026-10-19
+
+**病**:`exec/spec.rs::snap_ensure_slot` 的 victim 选择在 engine 池里自带
+`rank(Transient/Durable) + 池内 last_use` —— 与 store 的容量调度各一套规范;
+且 store 的 `StateStore.last_use` 只在 capture 登记时更新,**回灌/复用不触达**
+⇒ 池与账的"冷热"会漂。
+
+**改法(判据仍在 store,物理映射留 engine)**:
+
+```text
+Rel::snap_victim_order(protect) -> Vec<SnapKey>
+  = state.evict_candidates(protect).filter(tier == Gpu)
+  → hooks::order_candidates(同 plan_capacity 的:事实档 + EvictPolicy)
+  → 快照键序
+
+StatePool::snap_pick_slot(key, order)   // engine 只做映射
+  Hit(同 key 在设备) → Free(空槽) → order 中第一个仍在槽的键 → Victim
+  兜底:order 用尽(判与选之间被移走) ⇒ 池内 LRU(物理退化,不是语义档)
+```
+
+**触达同步**(两处,消灭漂移):
+- `snap_onload` 成功后 `state.touch(key)`(回灌 = 使用);
+- `snap_ensure_resident` 的设备层快路 `state.touch(key)`。
+
+**门**:
+- store `snap_victim_order_is_the_plan_order`:三张快照(老 Durable / Transient / 新 Durable)
+  ⇒ 序 = `[Transient, 老 Durable, 新 Durable]`,且与 `plan_need` 的 `Snap` 票**逐条相同**;
+- engine `snapshot_victim_follows_store_order`:池内放置序**故意与 store 序相反**
+  (旧实现会选池 LRU 的 k_b)⇒ 新实现选 store 序第一的 k_a,槽号仍是 k_a 的物理槽;
+- 回归:engine lib 56 / store lib 92 / workspace check 干净。
+
+### 30.8 真机验证(27B AWQ INT4 / 3090 Ti 对 / 3080 无关)· 2026-10-19
+
+**档**:`/tmp/owl-sched-27b.toml`(临时)—— `pool_tokens=16896` / `snap_max=4` /
+`host_cache_mb=2048` / `snap_host_mb=1024` / `gdn_slots=8` / `reserve=512MiB` /
+`prefill_chunk=512` / `prefill_bucket=off`。22 个随机 prompt 请求(96 tok 输出)+ 1 个 600 词长 prompt。
+
+**通过项(判据归一在真机成立)**:
+
+| 观测 | 值 | 说明 |
+|---|---|---|
+| 请求成功率 | **22/22**(2.63–2.88s) | 无 500、无崩 |
+| `store.node.idle` | **29** | H5 空转整理在跑 |
+| `store.snap.out` / `.bytes` | **19 / 3.03 GB** | 状态腿执行臂真沉(本刀新增能力) |
+| `state.snap_gpu` / `snap_host` | 4 槽 637MB / 6 条 955MB | 池满 ⇒ 溢出到宿主 |
+| `store.hook.out` / `kv.host_blocks` | 258 / 258 | KV 链级下沉(既有路径) |
+| `store.node.pressure` | 197 | N6 在跑(见下 ⚠️A) |
+| `pool` | 45 块 / 256 MiB(贴上限)、evicted 17636 | 池上限与顶出生效 |
+| `snap_victim_order` | (单测门) | 池听 store 序 |
+
+**修正:`hook_fail` 分类(本刀副产,已落)**
+
+真机首次开宿主层 ⇒ `hook_fail=4352`,**全部**是同一条日志:
+`部分换层(片和 ≠ 登记整块) … name=kv.k.7 片和=720896 登记=34603008`。
+根因:KV 池**一个物理块 = 多层片**(`kv.k.<层>` × 每页字节),而 `swap` 逐片发
+`MoveEvent` ⇒ "片和 < 登记整块"是**常态口径**,不是记账失败(设计卷 §12.13 的
+两本账粒度差)。判据修正:
+
+- `LedgerBook` 新增 `partial_moves` 计数(片级换层**跳过**;层账以腿自报
+  `kv.host_blocks` 为准);`hook_fail` **恢复为真失败信号**;
+- 日志限流(首条 + 每 1024 条);报告面 `/debug/vram → events.partial_moves`;
+- 复验:同一档 22 请求后 **`hook_fail=0` / `partial_moves=4352`** ✅。
+
+**⚠️ 暴露的存量问题(本刀不修;逐条立案)**
+
+- **A. `pressure_probe` 阈值导致常态压力**:`target = max(2×reserve, 1GiB)`,
+  而 27B 常态 `free ≈ 847MiB < 1GiB` ⇒ **每拍 N6**(197 次)+ `store.degrade=184`(凑不够)。
+  建议判据改为"`free < reserve` 才报压力"(reserve = 硬预算线,才是真危险);
+  或给 N6 加冷却。
+- **B. 「腾设备槽」对驱动 free 零收益(结构性洞见)**:设备 KV 池与快照池都是
+  **固定分配、不缩容** ⇒ Idle/N6 把缓存/快照腾走后,`reserved` 不变、驱动 free 不变
+  (实测 `kv_free=528/528` 全空但 free 仍 847MiB)。收益只在"池内/快照池内让位",
+  代价是下次命中全要回灌。⇒ Idle 整理 KV 面应重新裁决(要么池可缩容,要么只在
+  有明确溢出压力时才搬)。
+- **C. 快照宿主抖动**:`snap_max=4` + 每请求 3–4 条快照 ⇒ capture 频繁选 victim;
+  `snap_host_mb=1024`(≈6 条)满了以后每次下沉逐一条 ⇒ `snap_host_evict_bytes=2.07GB`
+  (同一内容反复搬运)。⇒ 参数需与快照产量匹配(snap_host 预算或 snap_decode_stride)。
+- **D. 失败 turn 的未归还清单**:长 prompt 撞硬预算 500 后,
+  `N4 未归还清单:turn 22 名下仍有 622 块 / 114037 KiB`(turn 23:295 块/246MB)——
+  失败路径的相位清理有缺口(与本刀无关,但值得立案)。
+- **E. 卡配贴顶**:`live 22.9G / 可用 ≈23.1G`,长 prompt 撞 `avail=14MiB` ⇒
+  硬预算如实拒(`PoolExhausted`,引擎不死、丢本 turn)。与 Idle/判据归一无关
+  (池 reserved 是整卡口径),属档位配置问题。
+
+---
+
+## 31. 第三层:磁盘(S6)· 2026-10-19
+
+> 用户裁决(本会话):"既然有这种丢失的问题,就先把第三层也接进来 —— 启动时可以在配置里
+> 指定能用多少磁盘和内存;**KV 和 GDN 快照不要那么着急地扔掉**,先移到内存、再移到磁盘,
+> 然后去管理它;磁盘的话启动时可能要加载一下,从磁盘里回加载进来。"
+
+### 31.1 配置面(唯一旋钮)
+
+```toml
+[pool]
+host_cache_mb = 2048   # 宿主 KV 分片(MiB;0 = 关层)
+snap_host_mb  = 1024   # 宿主状态腿分片
+disk_cache_mb = 4096   # 磁盘 KV 分片(S6;0 = 关层)
+snap_disk_mb  = 2048   # 磁盘状态腿分片
+disk_dir      = "/var/lib/owl/kv"   # 内容目录(空 = 关层;两腿子目录 kv/ 与 snap/)
+```
+
+**唯一算式仍在 store**(`tier_budget_of(host_mb, snap_host_mb, disk_mb, snap_disk_mb)`)——
+boot 造账与 `Rel::open` 的交叉校验同源(§12.13);分片之和超总账 = **响亮拒**。
+
+### 31.2 `DiskTier`(**store 零 I/O**)
+
+```text
+plan_spill(key) -> SpillPlanOf { key, tmp, path, bytes }   调用方写 tmp + rename(原子)
+commit_spill(&plan)    落账(内容已写定);幂等(同键覆盖只触达)
+plan_fill(key)  -> FillPlanOf { key, path, bytes }         调用方读盘
+commit_fill(key)       触达;**不删条目**(磁盘 = 权威副本,宿主 = 缓存)
+touch(key)             命中/回填 = 触达(驱逐序输入)
+plan_evict(need, protect) -> { victims: [(K, Path)], freed_bytes }   只出计划(最老先)
+commit_evict(keys)     出账(文件删除由调用方)
+adopt(entries)         启动扫描后**回填账**(大小不符/超预算/重复 ⇒ 隔离并逐条列出)
+```
+
+- **文件名 = 内容身份**(`kv-<hex>.bin` / `snap-<hex>.bin`)⇒ 重启可逆解析;
+  `.tmp` 残件在扫描时被清理(崩在 rename 前的半块不会被当成好块);
+- **有界**:`budget_bytes = 0` = 关层;越界 = 响亮拒(调用方先 `plan_evict`);
+- **零 I/O**:store 不碰文件系统(§21);真读写由 engine 在 `spawn_blocking` 里做
+  (`engine/src/disk_io.rs`:原子写 / 读回校验大小 / 删文件 / 扫目录)。
+
+### 31.3 层级律:**逐层,不跨层**(设备 → 宿主 → 磁盘)
+
+`plan_capacity` 现在是三段(§30.2 的两轮 → 三轮):
+
+```text
+轮一  设备 ⇒ 宿主(Host 票;宿主有位且装得下)
+轮1.5 宿主 ⇒ 磁盘(Disk 票;宿主满时,把**宿主里最冷**的挪到盘 —— 腾宿主位,内容不丢)
+轮二  仍不足 ⇒ Drop(KV 叶级 / 快照;内容真丢)
+```
+
+**为什么设备不直连磁盘**:层级是"贵→廉"的缓存栈,跨层搬要临时缓冲且打乱"内容最近在哪"
+的一致语义;逐层的代价只是**一拍延迟**(需求/压力节点每拍都跑),换来内容永不先丢。
+
+**`host_relief`**:本轮若出过「宿主 → 磁盘」票 ⇒ **不出 Drop、不 deny** ——
+设备缺口留一拍(下一拍宿主有位,轮一继续接)。真丢弃只在"宿主+磁盘都动不了"时发生。
+
+**`Transient` 快照**(生成段,逐出即丢)**两级都不下沉**(写 159 MiB 换不回共享价值)。
+
+### 31.4 启动回加载(账先回来,内容惰性读)
+
+```text
+boot: attach_disk(disk_dir, kv_bytes, snap_bytes)   ← 两腿分片(超总账 = 拒)
+      scan_dir_sync::<ChainHash>(kv/) + ::<SnapKey>(snap/)
+      adopt_disk(kv_entries, snap_entries)          ← 回填账(不搬内容)
+      状态腿:set_tier(key, Tier::Disk)(层账精确到盘)
+日志: 磁盘层:配额 X MiB(KV / 快照)· 目录 · 回填 KV a/n 快照 b/m 条 · 隔离 …
+```
+
+**为什么惰性**:27B 一条快照 159 MiB、KV 块 2 MiB;全量预读会把启动拖垮。
+账先回来(命中判定/调度立刻可用),内容在**第一次需要时**读回宿主
+(`fill_kv_from_disk` / `fill_snap_from_disk`;回灌口前置 + `snap_ensure_resident` 的 Disk 分支)。
+
+### 31.5 门(全绿)
+
+- store **100**(+4:盘层容器 6 项含 adopt 隔离/文件名往返/预算/驱逐序;+2:第三层出票 +
+  `Transient` 不写盘)
+- engine **57**(+`disk_spill_and_fill_roundtrip`:CPU mock 真写文件、层账到 Disk、回填回 Host、
+  文件大小 = 一条快照)
+- iface 11 / cpu 11 / shared 82 / workspace check 干净
+
+### 31.6 挂账(S6 之后)
+
+1. **设备直连磁盘**(省一拍延迟):需临时槽台(不经宿主预算)+ store 侧的"两跳计划";
+   实测一拍延迟在压力场景是否可忽略后再定。
+2. **盘层驱逐序接 `EvictPolicy`**:现在盘内是纯 LRU(`last_use`);与 KV/快照同策略可后续统一。
+3. **盘层的启动审计**:`adopt` 只校验大小;内容哈希/校验和(可选,代价 = 读全盘)。
+4. **跨进程复用**:目录独占(同一目录给两个引擎 = 互相扫到对方块)—— 需要锁文件/租约。
+5. KV 腿的盘层在层账里仍记 `Tier::Host`(`locate` 二值);磁盘条目数在 `DiskStats` 单独报。
+   `Entry.slot` 升三值(加 `on_disk`)可让层账更精确 —— 改动面大,按需再做。
+
+### 31.7 跨重启复用的语义裁决(2026-10-19 同日实测后)
+
+**状态腿 ✅ 可跨重启复用**:`SnapKey` = 边界块的**内容身份**,独立可恢复 ⇒
+`adopt_disk` 为盘上快照**重建 `StateStore` 账**(tier = Disk;`durability` 盘上没存 ⇒
+保守记 `Durable`)⇒ 重启后 `probe` 直接看得见(`RecallMode::Exact`),第一次需要时
+`fill_snap_from_disk` 读回。门:`disk_adopt_on_boot_restores_ledger`
+(第一次进程落盘 → drop → 第二次进程同目录 ⇒ 账回填、层账 = Disk、**内容未预读**)。
+
+**KV 腿 ❌ 不跨重启复用(本版)**:块的身份是**父链哈希** —— 盘上文件名只有块身份,
+恢复不出"哪些 token 对应哪些块"(树需要父链与逐块指纹)。⇒ boot 见 KV 盘目录残留 =
+**清掉并 WARN**(占配额还骗自己"有缓存"比删掉更糟)。
+
+**⚠️ 单腿不可达(2026-10-19 真机定谳)**:`RecallHit::mode()` 要求 **KV 腿在场**才能
+给出 `ContextOnly`/`Exact` —— 只有快照腿(`None, Some(_)`)是 `Miss`。而索引重建需要
+KV 树(见下)⇒ **本版的快照回填"账上可见、实际选不中"**(内容不丢,但复用要等 S6.1)。
+真机实测(shutdown/restart 同目录):`回填 KV 0/0 快照 6/6 条` + `state.snaps = 6` +
+层账 Disk;KV 侧 `清掉 14 个残留块`(WARN)。
+
+**挂账(S6.1,KV 跨重启复用;含让快照回填真正生效)**:盘上为每条链存一份**索引文件**
+`kv-<tail>.idx`(整链 token 序列 + 逐块 `(hash, bytes)`)。boot 用它**重算块身份**
+(`hash_block(parent, tokens)`,指纹自然一致)并**重建树条目为"非设备层"**
+(`slot = None`;内容在盘上 ⇒ `locate` 归 `Tier::Host` ⇒ 命中后 `fill_kv_from_disk`
+自动把它读回宿主 —— 该链路已打通)。代价 = 索引写放大(链级一次,不是逐块)+ 恢复期树插入;
+收益 = 重启后**前缀命中率不归零**且**快照回填同时生效**(长上下文 agent 场景价值大)。
+
+**写入点**:索引必须由**链级**动作写(`spill` 是逐块的,没有 tokens)⇒ engine 在
+"链整体离开设备"或 turn 收口时落索引(`sessions`/`turns` 有 token 序列);store 只出
+"该链现在在盘上"的计划,索引内容由 engine 提供(与 `register_chain` 同源)。
+
+### 31.8 S6.1:跨重启复用落地(2026-10-19 同会话)
+
+> 用户当日裁决:"你为什么会用双卡呢?用单卡加载小模型 + **硬预算显存约束**,
+> 就可以**快速触发回收**" —— 验证方法论(见 §31.9);并开工 S6.1。
+
+**交付**:
+
+| 件 | 落点 |
+|---|---|
+| `ChainIndex`(魔数 + 页宽 + token 序列;编解码/截断;**只增不删**) | `store/src/disk_index.rs`(新) |
+| 树的无槽登记(`insert_offloaded`;`TreeUpdate.inserted` 升 `Option<u32>`) | `kv/tree.rs`、`kv/mod.rs` |
+| `KvStore::host_chain_candidates`(叶为锚 + **整链在宿主**) | `kv/mod.rs` |
+| `Rel::adopt_disk_chains`(逐块重算身份 + 按内容在场截断 + 记 `kept`) | `store/src/rel.rs` |
+| 索引写(turn 收口一次,`kv-<tail>.idx`,同 tail 幂等) | `engine/src/{running.rs,exec/turn_end.rs}` |
+| boot:内容入账 → 索引解码 → 重建树 → **孤儿内容清理** | `engine/src/engine.rs` |
+| 票**链级**化:轮 1.5 出 span=整链,engine 按 `chain_blocks` 逐块搬盘 | `hooks.rs`、`running.rs` |
+
+**整链律(S6.1 真机定谳)**:盘上要能"从根连续"重建,所以
+
+1. 轮 1.5 的锚必须是**叶**(以任意宿主块为锚会退化成只搬根块 ⇒ 重启只能重建 1–2 块);
+2. **整链都在宿主**才出票(半链 = 重启不可用,与 §14.6 同一律);
+3. 同拍可以"设备→宿主→磁盘"两跳(`apply_verdict` 按 Host 票在前、Disk 票在后执行),
+   所以轮 1.5 **不再排除轮一刚沉的链**(早期版本用 `picked` 排除 ⇒ 磁盘票恒零)。
+
+**配置律(新)**:`host_cache_mb / disk_cache_mb` 必须分别**容纳最长链**
+(`ceil(ctx/32) × 块字节`),否则整链下沉/整链搬盘永不发生(0.8B 真机两次踩中:
+宿主 1 MiB / 盘 1 MiB 都装不下 5–6 块链)。配得太小 = 退回逐叶 Drop(内容丢)。
+
+**真机结果(0.8B / 单卡 3080 / 池 16 页 / host 16 MiB / disk 16 MiB)**:
+
+```
+运行期:store.disk.index.write=13 · store.disk.spill=24 · disk.kv=24 块 · disk.snap=2 条 · host=45
+        (bin=24 idx=17;P warm cached=160/173)
+重启  :回填内容 KV 24/24 快照 2/2 条
+       跨重启复用:索引 17 条 ⇒ 重建 5 链 / 24 块 · 跳过 12(索引孤儿) · 截断 0
+```
+
+**跳过 12 条 = 索引孤儿**(turn 收口写索引,但该链的内容从未溢写到盘,或早已被逐)——
+boot 以"内容在场"为准跳过并**清掉未被引用的内容**,索引文件保留(只增不删,~32 KB/链)。
+
+**门**:store **106**(+ 索引往返/拒坏魔数/截断 · 叶锚整链候选 · 重建树/截断)·
+engine **59**(+ `disk_chain_index_enables_cross_restart_reuse`:turn 写索引 → 溢写 →
+重启重建 → **同 prompt 命中**)· workspace check 干净。
+
+### 31.9 验证方法论(用户 2026-10-19):单卡小模型 + 硬预算,快速触发回收
+
+26–27B 双卡档"装载 20 s + 每请求 2.7 s + 卡常被同侪占",不适合频繁验证存储层。改用:
+
+```text
+0.8B + 单卡(ordinal 3, 3080 20G) + 池 16 页 + host/disk 各 16 MiB + prefix_cache_share 0.9
+⇒ 每请求 0.2 s,几次请求就把"设备→宿主→磁盘"三级全部触发,重启也在 1 s 级
+```
+
+**纪律**:①配额要容得下最长链(见 §31.8 配置律);②`prefix_cache_share` 拿高
+(0.9)可让设备池更快紧;③同 prompt 发两次看 `usage.prompt_tokens_details.cached_tokens`
+(第一次 0、第二次 >0 即命中);④停服务用 `ss -ltnp | grep <port>` 拿**真 pid**
+(`setsid bash -c '…server…' &` 的 `$!` 是 bash,不是 server)。
+
+---
+
+## 32. 会话感知淘汰(per-session tail-first)· 2026-10-19
+
+> 用户裁决:"每个 session 块能感知它属于哪个会话;**淘汰 KV 块和 GDN 快照时,
+> 优先淘汰同一 session 的末端**,而不是从头开始淘汰 —— 从头淘汰,后面的全变垃圾。"
+
+### 32.1 病根(两处)
+
+1. **快照的 LRU 是"时间序",不是"结构序"**:同一会话的多个边界快照(`depth` 递增),
+   最后拍的 `last_use` 最新 ⇒ 纯 LRU 会**先逐链头**(浅边界),而链头一丢,
+   该边界之后的所有状态都无法 `Exact` 续跑 —— 正是"后面全变垃圾"。
+2. **块/快照没有会话归属**:跨会话只有一个全局 LRU,无法回答"这个块属于谁",
+   也无法按会话做"从末端削"。
+
+### 32.2 交付
+
+| 件 | 落点 |
+|---|---|
+| `EvictCandidate` 加 `session` / `depth`(KV 叶 = 链深;快照 = 边界块号) | `policy.rs` |
+| `KvStore.owners`(链 → 会话)+ `session_of`/`depth_of`/`register_chain_owned`/`set_owner` | `kv/mod.rs` |
+| `StateStore`:`SnapEntry` 加 `session`/`depth`;`register_snap_owned` + `snap_session` | `state.rs` |
+| **会话档**排序(事实档 Transient 之后):**全局深度降序** → 同层按会话冷热 → 同 (会话,深度) 内才交给 `EvictPolicy` | `hooks.rs::order_candidates` |
+| engine 写入口:turn 收口 `register_chain_owned(..., sid)`;prefill 边界 `register_snap_owned(..., sid, fed/page)`;增量登记 `set_owner` | `exec/{turn_end.rs,spec.rs}` |
+| 诊断面:`/debug/vram → state.evict_order`(前 8 条:key/session/depth/transient) | `rel.rs::snap_evict_preview` + `debug.rs` |
+
+**`NO_SESSION = u64::MAX`**:会话 id 0 是**合法 id**(临时会话从 0 起号)⇒ 不能用 0 表示
+"无主";无归属的候选排在所有会话之后。
+
+### 32.3 语义(两条规则,用户 2026-10-19 精修)
+
+```text
+① 全局深度降序:每个会话都先从**自己的最深边界**(末端)削 —— 浅的(前缀)留到最后
+   ⇒ "优先留存已计算内容"对**每个会话**成立,而不是"最冷会话被一路削光";
+② 同深度层内:会话冷热(该会话最冷候选的 last_use 小者先)→ 再交给 EvictPolicy
+   (LRU / LRFU / 注意力召回信号只在同会话同深度内决胜负)。
+③ 事实档在前:Transient(生成段,逐出即丢)永远最先,深度规则只管 Durable 与 KV。
+```
+
+**为什么深度优先于策略**:新鲜度是"跨会话的时间维",而"从末端削"是**单会话内的结构约束**;
+结构约束先满足,时间维只在同层同深度兜底。
+
+### 32.4 门(全绿)
+
+- store **108**(+`session_tail_first_eviction_order`:同会话 depth 3/2/1 即使 depth3 **最新**
+  也最先逐;+`kv_register_chain_owned_records_session_and_depth`)
+- engine **60**(+`turn_records_session_ownership_for_kv_and_snaps`:turn 收口后
+  KV 尾块与快照都归本会话,快照带边界深度)
+- workspace check 干净
+
+**真机(0.8B/单卡/snap_max=4,两会话各 128 tok 输出)**:
+
+```text
+/debug/vram → state.evict_order:
+  depth 10 session 1 transient   ← Transient 档(生成段)先
+  depth  5 session 0 durable
+  depth  4 session 0 durable     ← 同层(depth 4)冷会话先
+  depth  4 session 1 durable
+```
+
+**残余(挂账)**:①`oldest_first` 的 KV 叶按"链深"参与全局深度序(长链先削尾)——
+语义正确但"公平性"可按需再加(按会话配额);②`evict_order` 只是**候选序**,
+一次淘汰多条时仍会连续取同一会话的多层(浅层排在后面,实际很少轮到);
+③会话归属在**跨重启**后不恢复(NV 盘上索引不含 sid;需要则加进 `.idx` 头)。

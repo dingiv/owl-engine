@@ -18,7 +18,7 @@ async fn dma_microbench() {
     client.sync().await.unwrap();
 
     let src: Vec<u8> = vec![0xABu8; MB];
-    let dst = owl_iface::alloc!(client, Dtype::U32, MB / 4).await.expect("alloc");
+    let dst = owl_iface::client_alloc!(client, Dtype::U32, MB / 4).await.expect("alloc");
 
     // 1) htod 单块重复(含 to_vec 拷贝 + staging malloc/free 每次裸付)
     let t0 = Instant::now();

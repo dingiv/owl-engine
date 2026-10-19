@@ -24,7 +24,7 @@
 //! | 0.8B 默认档(默认 knobs,max_seq ≤4096) | schedule_decision_surface / two_turns / session_continuity / multi_session_isolation / prefix_cache_hit / longctx_4k | 6 → 1 |
 //! | 27B 默认档(默认 knobs,max_seq 1024) | 27b_chat_inference / awq27b_marlin_e2e | 2 → 1 |
 //! | 独立(配置不同,不可合并) | w4a16_marlin_e2e(另一装载器)/ spec_identity_gate(Dumb 草稿)/ spec_identity_gate_27b(MTP 草稿)/ dflash2_gate(DFlash2+fp8)/ decode_marginal_bench(greedy+slots1)/ raw_completion_diag(greedy+Dumb) | 各 1 |
-//! 合并做法 = 场景签名改收 `&mut RunningEngine<GpuClient>`(删各自 3 行装配),
+//! 合并做法 = 场景签名改收 `&mut RunningEngine<owl_engine::GpuFace>`(删各自 3 行装配),
 //! 由本入口建一次并传入。**改动面大、需逐场景核对借用**,单独立刀。
 
 use owl_engine::tests as scen;
@@ -174,6 +174,7 @@ async fn e2e_body() {
 
     // ── 0.8B 其余档:boot 期配置各不相同,各自装载 ──
     run!(gpu_schedule_decision_surface); // max_seq=64/chunk=4(切块敏感)
+    run!(gpu_batch_decode_matches_serial); // B5.1 合批 decode(T=2,0.8B)
     // §18 CPU mock 档:同一套 store 三门口跑在 CpuFace 上(无卡;OWL_CPU_MOCK 门控)
     run!(cpu_mock_offload_probe);
     run!(cpu_mock_state_leg_probe);
@@ -203,6 +204,7 @@ async fn e2e_body() {
     // ── 27B 其余档:boot 期配置各不相同(草稿类型/池/fp8/slab),各自装载 ──
     run!(gpu_27b_raw_completion_diag);   // greedy + Dumb 草稿 + slab
     run!(gpu_decode_marginal_bench);     // greedy + slots1
+    run!(gpu_batch_decode_bench_27b);    // B5.1 合批 decode 吞吐(27B,spec off)
     run!(gpu_spec_identity_gate_27b);    // MTP 草稿
     run!(gpu_dflash2_identity_gate_27b); // DFlash2 草稿 + fp8 池
 

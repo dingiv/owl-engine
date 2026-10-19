@@ -50,6 +50,8 @@
 pub use owl_kernels::Arch;
 
 pub mod contract;
+/// **DeviceHandle:分配账 + 命令面**(2026-10-19;设计卷 device-命令面与分配账)
+pub mod handle;
 pub mod signal;
 
 // 契约面顶层再导出(前后端共同依赖;见 contract 模块文档)

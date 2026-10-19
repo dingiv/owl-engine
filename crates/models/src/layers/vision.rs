@@ -825,6 +825,8 @@ mod tests {
             device_repack: false,
             verify: false,
             debug_tap: false,
+            staging_mb: 128,
+            dump: false,
         };
         crate::interpreters::eval_load(&tower, &mut gpu, &Src::from(weights), &lctx)
             .await
@@ -911,7 +913,7 @@ mod tests {
             .collect();
         let tower = VisionTower::new(cfg);
         let mut gpu = crate::testkit::gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&tower, &mut gpu, &Src::from(weights), &lctx)
             .await
             .expect("塔 f16 装载");
@@ -1024,7 +1026,7 @@ mod tests {
         let (weights, cfg) = visual_weights();
         let mut gpu = crate::testkit::gpu_client().await;
         let tower = VisionTower::new(cfg);
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&tower, &mut gpu, &Src::from(weights), &lctx)
             .await
             .expect("塔 f16 装载");
@@ -1096,7 +1098,7 @@ mod tests {
         let (weights, cfg) = visual_weights();
         let mut cpu = owl_cpu::CpuFace::new();
         let tower = VisionTower::new(cfg);
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&tower, &mut cpu, &Src::from(weights), &lctx)
             .await
             .expect("塔 f32 装载");

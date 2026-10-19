@@ -292,7 +292,24 @@ impl<D: DeviceClient> GraphPlan<D> {
             } else {
                 f32b(&init)
             };
-            let block = face.htod(i.dtype, &i.shape, &bytes, &format!("plan.in.{}", i.name)).await?;
+            // **参数面走 COMPUTE 流**(2026-10-19 定谳;桶门 0.8B IMA 的根因):
+            // 槽块由 `cuMemAllocAsync` **按流**落定,而槽的每步装填
+            // (`fill_slots` → `write_blocks_f32_on(Compute)`)与消费它的发射都在
+            // COMPUTE 上 ⇒ 若槽块在 **H2D** 流分配/首次上传,COMPUTE 读者与
+            // 该分配之间**没有序**(A13 同族:跨流"用前未分配")。
+            // 大模型 boot 慢、中间有栅栏 ⇒ 侥幸不炸;0.8B 小几何 boot 极快 ⇒
+            // 首个 warmup 就撞上(compute-sanitizer:`owl_embed_f16` 读
+            // `plan.in.frontier`、地址"potentially made before memory is allocated")。
+            // 修法 = 与 2026-10-17 参数同流律对齐:**同流 FIFO,结构上无竞态**。
+            let block = face
+                .htod_on(
+                    owl_iface::contract::UpStream::Compute,
+                    i.dtype,
+                    &i.shape,
+                    &bytes,
+                    &format!("plan.in.{}", i.name),
+                )
+                .await?;
             ins.push(InSlotDev {
                 name: i.name,
                 len: i.len,
@@ -384,7 +401,15 @@ impl<D: DeviceClient> GraphPlan<D> {
                 // 峰值活跃集(影子高水位);plain(历史口径)⇒ 窗内块常驻 ⇒
                 // 需求 = 分配总和。混用会把族定小 ⇒ 捕获中途耗尽当场炸。
                 let base = if desc.reclaim_capture { peak } else { metered }.max(4 << 20);
-                let hint_bytes = base + base / 8 + (1 << 20);
+                // **余量:原 +12.5%+1MiB → +100%+2MiB**(§65.3-2 定谳;2026-10-19):
+                // `peak` 是 **warmup(eager)期**的实测影子峰值,而**捕获期**的回收点
+                // 更少(节点合并 ⇒ 块活跃期变长):v1 两核融合(§65)把 stage+reduce
+                // 并一节点后,实测**需求/base ∈ [1.40, 2.45)**(base=10.1MiB 时,
+                // 12.36MiB 的旧 hint 差 139264B 仍爆;24.7MiB 够)。
+                // ⇒ 取 **2× + 2MiB**(覆盖 2.0 以下;仍比双保险(下游再 ×2)省 ~40%)。
+                // 真根治 = 捕获期 liveness 直接跟踪/或 carve 失败自动重试
+                // (后者受 FnOnce 闭包限制,不可行 —— 见 §65.3-2)。
+                let hint_bytes = base.saturating_mul(2) + (2 << 20);
                 owl_shared::slab_hint::set_hint(hint_bytes);
                 sess.slab_bytes = hint_bytes; // 图显存总账账源
                 owl_shared::log_info!(
@@ -490,21 +515,34 @@ impl<D: DeviceClient> GraphPlan<D> {
             .last
             .get(name)
             .ok_or_else(|| ModelError::Msg(format!("read_output: 无输出 {name}(先 step)")))?;
-        // 按 slot dtype 解码(f16 基线:logits f16 上载,f32 回 host)
-        let (esize, f16) = match out.dtype {
-            Dtype::F16 => (2usize, true),
-            _ => (4usize, false),
+        // 按 slot dtype 解码（f16 基线：logits f16 上载，f32 回 host）
+        // **BF16 分支（P1.1 × P2.1，2026-10-19）**：草稿组件的 proj 槽是草稿 dt
+        // （量化族检查点 = BF16）；旧实现把非 F16 一律当 F32 读 ⇒ BF16 槽读回错值。
+        enum Dec {
+            F16,
+            Bf16,
+            F32,
+        }
+        let (esize, dec) = match out.dtype {
+            Dtype::F16 => (2usize, Dec::F16),
+            Dtype::BF16 => (2usize, Dec::Bf16),
+            _ => (4usize, Dec::F32),
         };
         let mut buf = vec![0u8; out.len * esize];
         self.face.dtoh(&out.block, &mut buf).await?;
-        Ok(if f16 {
-            buf.chunks_exact(2)
+        Ok(match dec {
+            Dec::F16 => buf
+                .chunks_exact(2)
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect()
-        } else {
-            buf.chunks_exact(4)
+                .collect(),
+            Dec::Bf16 => buf
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+            Dec::F32 => buf
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
+                .collect(),
         })
     }
 
@@ -512,6 +550,11 @@ impl<D: DeviceClient> GraphPlan<D> {
     /// 槽外设备操作;对外仍零暴露 —— face 不出 engine crate)
     pub(crate) fn face_mut(&mut self) -> &mut D {
         &mut self.face
+    }
+
+    /// 只读面(诊断:句柄计数/账本读 —— 不产生分配)
+    pub(crate) fn face_ref(&self) -> &D {
+        &self.face
     }
 
     // ------------------------------------------------------------------

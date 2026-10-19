@@ -59,6 +59,8 @@ async fn load_once<F: DeviceClient>(
         device_repack: Some(false), // CPU 面不设备重排
         verify: false,
         debug_tap: false,
+        staging_mb: 128,
+        dump: false,
     };
     load_from_dir(dir, face, &model, opts).await
 }

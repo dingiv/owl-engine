@@ -157,9 +157,9 @@ async fn run_case(
     let ds = owl_iface::htod!(client, s_dtype, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
     let ws_mul: usize = owl_shared::env_reader::parse_or("OWL_WS_MUL", 1);
     let ws_len = owl_kernels::family::marlin::v2_workspace_len(n).max(n / 128 * 16) * ws_mul;
-    let dws = owl_iface::alloc!(client, Dtype::U32, ws_len).await.expect("alloc ws");
-    let dctmp = owl_iface::alloc!(client, Dtype::U32, 1).await.expect("alloc ctmp");
-    let dc = owl_iface::alloc!(client, Dtype::F16, m * n).await.expect("alloc c");
+    let dws = owl_iface::client_alloc!(client, Dtype::U32, ws_len).await.expect("alloc ws");
+    let dctmp = owl_iface::client_alloc!(client, Dtype::U32, 1).await.expect("alloc ctmp");
+    let dc = owl_iface::client_alloc!(client, Dtype::F16, m * n).await.expect("alloc c");
 
     client
         .launch(marlin_launch(
@@ -470,9 +470,9 @@ async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g:
     let db = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![b_packed.len()]), &le_i32(&b_packed)).await.expect("htod b");
     let ds = owl_iface::htod!(client, Dtype::F16, &Shape::from(vec![s_packed.len()]), &le_u16(&s_packed)).await.expect("htod s");
     let dz = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![z_packed.len()]), &le_i32(&z_packed)).await.expect("htod z");
-    let dws = owl_iface::alloc!(client, Dtype::U32, owl_kernels::family::marlin::v2_workspace_len(n)).await.expect("alloc ws");
-    let dctmp = owl_iface::alloc!(client, Dtype::U32, 1).await.expect("alloc ctmp");
-    let dc = owl_iface::alloc!(client, Dtype::F16, m * n).await.expect("alloc c");
+    let dws = owl_iface::client_alloc!(client, Dtype::U32, owl_kernels::family::marlin::v2_workspace_len(n)).await.expect("alloc ws");
+    let dctmp = owl_iface::client_alloc!(client, Dtype::U32, 1).await.expect("alloc ctmp");
+    let dc = owl_iface::client_alloc!(client, Dtype::F16, m * n).await.expect("alloc c");
     // 哨兵填充:-7.0(launch 后若残留 = 内核未写 C)
     {
         let sent: Vec<u8> = (0..m * n)
@@ -593,7 +593,7 @@ async fn ct_repack_a8_parity() {
         assert_eq!(b_ref.len(), k * out_dim / 8, "a8 B 字数 = k·n/8");
 
         let dp = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![rows, cols]), &le_i32(&packed)).await.expect("htod packed");
-        let dout = owl_iface::alloc!(client, Dtype::U32, b_ref.len()).await.expect("alloc out");
+        let dout = owl_iface::client_alloc!(client, Dtype::U32, b_ref.len()).await.expect("alloc out");
         let msg = LaunchMsg {
             kernel: owl_cuda::KernelSource {
                 name: "owl_ct_repack_a8_u32".into(),
@@ -678,7 +678,7 @@ async fn ct_repack_parity() {
         // ⚠️ 块事实按**真形状**标注(rank2):L3 事实门按声明表核 dtype/rank,
         // 标成 rank1 会被准入拒(2026-10-17 实测:本测试自 L3 门落地后一直是红的)
         let dp = owl_iface::htod!(client, Dtype::U32, &Shape::from(vec![rows, cols]), &le_i32(&packed)).await.expect("htod packed");
-        let dout = owl_iface::alloc!(client, Dtype::U32, b_ref.len()).await.expect("alloc out");
+        let dout = owl_iface::client_alloc!(client, Dtype::U32, b_ref.len()).await.expect("alloc out");
         let msg = LaunchMsg {
             kernel: owl_cuda::KernelSource {
                 name: "owl_ct_repack_u32".into(),

@@ -237,6 +237,105 @@ impl Loadable for crate::layers::mtp::MtpPredictor {
 ///
 /// 装载交给调用方走通用入口
 /// [`load_from_dir`](crate::formats::load::load_from_dir)(起点开源 + 求值)。
+/// **草稿 spec 分片**(P2.1-a;纯函数,零 I/O)—— 草稿族双 rank 化的形状单源。
+///
+/// 草稿与主干**同 TpPlan**:`inter`/`(hq,hkv)` 切,`hidden`/`vocab` 不切
+/// (hidden 来自 target taps 的复制态;embed/lm_head 共享 target 不持有)。
+/// 规则表(`plan::rules::rule_of`)按键尾匹配 ⇒ 草稿的 `q/k/v/o_proj`、
+/// `gate/up/down_proj` **天然认得出**,装载期由 `build_shard_pass` 同源切。
+///
+/// 设计参照:vLLM 的 draft model 与 target **同 TP group / 同 world size**;
+/// SGLang 的 `spec_worker` 与 target 共享 `tp_size` —— 本仓形态 = 同一套
+/// TpPlan 再走一遍(见路线图 §3 P2.1 详案)。
+pub fn shard_draft_spec(
+    spec: ModelSpec,
+    plan: crate::plan::tp::TpPlan,
+) -> Result<ModelSpec, ModelError> {
+    if plan.is_single() {
+        return Ok(spec);
+    }
+    let hidden = spec.hidden;
+    let vocab = spec.vocab;
+    let out = spec
+        .sharded(plan)
+        .map_err(|e| ModelError::Msg(format!("dflash2 草稿分片: {e}")))?;
+    // 后置自证:草稿**必须**保持 hidden/vocab 全量(共享件;切了就是两套规范)
+    if out.hidden != hidden || out.vocab != vocab {
+        return Err(ModelError::Msg(format!(
+            "dflash2 草稿分片:hidden/vocab 不得被切(得 hidden {}→{} / vocab {}→{};草稿共享 target 的 taps/embed/lm_head)",
+            hidden, out.hidden, vocab, out.vocab
+        )));
+    }
+    Ok(out)
+}
+
+/// **草稿几何事实**(P2.1-b;分片后)—— 池分配与**草稿算子环境**的同一单源。
+///
+/// 为什么单列:草稿池此前用 `state.rs` 的 `const DRAFT_POOL{hkv: 8}` **写死**,
+/// 双 rank 下草稿的 KV 头是**分片后**的(4)⇒ 池会多算一倍且与注意力几何不符。
+///
+/// 2026-10-19 扩为结构体:除池要的 `(layers, hkv, hd)` 外,草稿的**算子几何门**
+/// 还要 GQA 分组比 `hq/hkv`(`driver::resolve` 的 `ShapeQuery.grp`)。池与算子
+/// 环境共用本结构 ⇒ 不会再出现"池按草稿、算子按目标"的双规范(10-10 悬案根因)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftGeom {
+    /// 草稿层数
+    pub layers: usize,
+    /// 本 rank 的 query 头数(分片后)
+    pub hq: usize,
+    /// 本 rank 的 kv 头数(分片后)
+    pub hkv: usize,
+    /// 注意力头维(草稿 = 128;与池几何同一事实)
+    pub hd: usize,
+}
+
+impl DraftGeom {
+    /// GQA 分组比 hq/hkv(0 = 不可用 —— 与 `KvEnv.grp` 的"未知"同义)
+    pub fn grp(&self) -> usize {
+        self.hq.checked_div(self.hkv).unwrap_or(0)
+    }
+}
+
+/// **草稿池几何**(P2.1-b;分片后)—— 从检查点声明 + 本 rank 计划求 [`DraftGeom`]。
+pub fn dflash2_draft_geom(
+    dir: &Path,
+    tp: crate::plan::tp::TpPlan,
+) -> Result<DraftGeom, ModelError> {
+    let (spec, _rep) = ModelSpec::from_ckpt(
+        dir,
+        crate::formats::spec::SpecSource::family(&qwen3_8_27b()),
+    )?;
+    let spec = shard_draft_spec(spec, tp)?;
+    let (hq, hkv, hd) = spec.full_heads;
+    Ok(DraftGeom { layers: spec.layer_types.len(), hq, hkv, hd })
+}
+
+/// 草稿检查点是否**量化族**(单一真源;`dflash2_draft` 与 `load_dflash2_draft` 共用)。
+/// 影响面**只剩** `plan`(W4A16 / F16 普通路)—— **不再影响 dtype**(见
+/// [`draft_exec_dt`])。
+pub fn draft_is_quantized(dir: &Path) -> Result<bool, ModelError> {
+    use crate::formats::kind::CheckpointKind;
+    let kind = crate::formats::kind::detect(dir)?.kind;
+    Ok(matches!(kind, CheckpointKind::PackQuantized | CheckpointKind::AwqGemm))
+}
+
+/// **草稿执行 dtype 单源**(权重 / 激活 / 草稿池三处同一判据)= **恒 BF16**。
+///
+/// 为什么恒 BF16(2026-10-19 深夜**定谳**;推翻了同日早些时候的"未量化族走 F16"):
+/// - F16 路的**数值域不够**:逐层探针(OWL_DFLASH_PROBE)实测 propose 残差流
+///   `attn_fin` 2.5e4 → 逐层累加到 6.3e4 → 第 3 层起 `INF/NaN`(全 8×5120 行)
+///   ⇒ 草稿提案纯噪声、AL 恒 1.0。这不是算子面问题,F16 就是装不下;
+/// - BF16 指数域同 f32,sglang 参考实现也是 BF16(权重原生 BF16 直载,零舍入)。
+/// - 该路需要的 BF16 算子面**已经齐备**(conv/select/norm_rope/rmsnorm/silu/
+///   fused_add_rmsnorm/naive_attn_nc_v2/reshape_cache/gemm …;缺的就补算子,
+///   **不许再拿数值域换算子面** —— 那条路会静默错到底)。
+///
+/// 同一判据必须贯穿:模型 dt(`DFlash2Draft::from_spec`)、装载 opts、草稿池
+/// 分配与池叶子注解(`spec_runtime::draft_dt` → `PoolPlan::draft_dt`)。
+pub fn draft_exec_dt() -> crate::contract::Dtype {
+    crate::contract::Dtype::BF16
+}
+
 pub fn dflash2_draft(
     dir: &Path,
     kv_fp8: bool,
@@ -256,12 +355,16 @@ pub fn dflash2_draft(
     let kind = crate::formats::kind::detect(dir)?.kind;
     let is_q = matches!(kind, CheckpointKind::PackQuantized | CheckpointKind::AwqGemm);
     if !is_q {
-        // ⚠️ BF16 原生家族(z-lab)分支警示(2026-10-10 立案):本分支草稿
-        // 在 27B+draft 服务形态实测全拒(AL=1.000 恒 m0,三域/双 dtype 主池
-        // 同象)→ spec 退化为裸 decode−税(数学域 36 vs W4A16 家族 157 t/s)。
-        // 生产一律用 W4A16(syvai);本分支死活另案(golden 参考/对照臂用途)。
+        // 未量化原生家族(z-lab,81 键)分支(**2026-10-10 悬案已结**):
+        // 旧的“实测全拒 AL=1.0”不是精度/家族问题,而是三个缺陷叠加——
+        // ① 草稿算子按**目标几何**解析(hd=256 vs 草稿 128);
+        // ② `load_transposed` 对非 F16 走 F32 分支 ⇒ fc 块 **F32 字节冒充**
+        //    声明 dtype(memory 与参考实现 cos ≈ 0);
+        // ③ 中途尝试的 F16 执行域在 propose 残差流上溢出(INF/NaN)。
+        // 修后实测 AL = 3.10 / 4.96(同机 W4A16 syvai = 2.86 / 5.42)——
+        // **精度不抬 AL**(4-bit 草稿不是瓶颈)。
         eprintln!(
-            "[boot] ⚠️ DFlash2 草稿 = BF16 原生家族:实测草稿全拒(AL=1.0),\n         生产请用 W4A16 家族(syvai/...-DFlash2-W4A16);分支死活另案"
+            "[boot] DFlash2 草稿 = 未量化原生家族(BF16 直载;AL 实测 3.10/4.96,\n         与 W4A16 家族同量级 —— 生产仍推荐 W4A16 省显存)"
         );
         eprintln!("[boot] dflash draft-pool kv_fp8 = {kv_fp8}");
     }
@@ -270,10 +373,43 @@ pub fn dflash2_draft(
     } else {
         crate::module::QuantPlan::F16
     };
+    // dt = 草稿执行 dtype 单源(恒 BF16 —— 理由见 `draft_exec_dt`)
+    let dt = draft_exec_dt();
     Ok(crate::layers::dflash2::DFlash2Draft::from_spec(
         &spec,
         plan,
-        crate::contract::Dtype::BF16,
+        dt,
+        kv_fp8,
+    ))
+}
+
+/// **草稿装载的分片变体**(P2.1-a):与 [`dflash2_draft`] 同源,唯一差别 =
+/// spec 先过 [`shard_draft_spec`](`plan.is_single()` ⇒ 与旧路径逐字节同物)。
+pub fn dflash2_draft_sharded(
+    dir: &Path,
+    kv_fp8: bool,
+    tp: crate::plan::tp::TpPlan,
+) -> Result<crate::layers::dflash2::DFlash2Draft, ModelError> {
+    use crate::formats::kind::CheckpointKind;
+    let (spec, rep) = ModelSpec::from_ckpt(
+        dir,
+        crate::formats::spec::SpecSource::family(&qwen3_8_27b()),
+    )?;
+    if !rep.mismatches.is_empty() {
+        eprintln!(
+            "[dflash2] 草稿 spec 失配 {} 条: {:?}",
+            rep.mismatches.len(),
+            rep.mismatches
+        );
+    }
+    let spec = shard_draft_spec(spec, tp)?;
+    let kind = crate::formats::kind::detect(dir)?.kind;
+    let is_q = matches!(kind, CheckpointKind::PackQuantized | CheckpointKind::AwqGemm);
+    let plan = if is_q { crate::module::QuantPlan::W4A16 } else { crate::module::QuantPlan::F16 };
+    Ok(crate::layers::dflash2::DFlash2Draft::from_spec(
+        &spec,
+        plan,
+        draft_exec_dt(),
         kv_fp8,
     ))
 }
@@ -300,6 +436,8 @@ pub fn hybrid_3to1(n: usize) -> Vec<bool> {
 pub fn qwen3_5_0_8b() -> ModelSpec {
     ModelSpec {
         vocab: 248320,
+        head_vocab: 248320,
+        head_split: false,
         hidden: 1024,
         inter: 3584,
         dtype: crate::contract::Dtype::F16,
@@ -337,6 +475,8 @@ pub fn qwen3_5_0_8b() -> ModelSpec {
 pub fn qwen3_8_27b() -> ModelSpec {
     ModelSpec {
         vocab: 248320,
+        head_vocab: 248320,
+        head_split: false,
         hidden: 5120,
         inter: 17408,
         dtype: crate::contract::Dtype::F16,
@@ -390,8 +530,7 @@ mod tests {
             crate::module::QuantPlan::F16,
         ).expect("Model::new");
         let mut opts = LoadOpts::plain(spec.dtype);
-        // 逐键分相账(`OWL_LOAD_DEBUG=1`;装载测速/瓶颈定位用)
-        opts.debug_tap = owl_shared::env_reader::flag("OWL_LOAD_DEBUG");
+        // 逐键分相账:旋钮归 `[load] debug_tap`(生产入口按配置落;本 helper 不读 env)
         load_from_dir(dir, face, &model, opts).await?;
         Ok(model)
     }
@@ -405,7 +544,8 @@ mod tests {
     ) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
         let draft = dflash2_draft(dir, kv_fp8)?;
         let opts = LoadOpts {
-            dtype: Dtype::BF16,
+            // 与 `dflash2_draft` 的 dt 同一判据(草稿执行 dtype 单源)
+            dtype: draft_exec_dt(),
             shard: 1,
             slice_id: 0,
             device_repack: Some(
@@ -414,6 +554,8 @@ mod tests {
             ),
             verify: false,
             debug_tap: false,
+            staging_mb: 128,
+            dump: false,
         };
         let manifest = load_from_dir(dir, face, &draft, opts).await?;
         manifest_mem_ledger(&manifest, "draft-mem");
@@ -814,6 +956,8 @@ mod tests {
                 device_repack: false,
                 verify: false,
                 debug_tap: false,
+            staging_mb: 128,
+            dump: false,
             },
         )
         .await?;
@@ -994,7 +1138,7 @@ mod tests {
         ).expect("Model::new");
         let manifest = {
             let src = crate::formats::safetensors::SafeTensorsSource::open_dir(&dir)?;
-            let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+            let ctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
             crate::interpreters::eval_load(&model, &mut gpu, &src, &ctx).await?
         };
         eprintln!("[chk] manifest {} 条", manifest.entries().len());
@@ -1161,7 +1305,7 @@ mod tests {
         let model = load_0_8b(&dir, &mut gpu).await.expect("load_0_8b(真权重)");
         let rp = Rope::new(262_144, HD, 64, 10_000_000.0).expect("rope");
         crate::interpreters::eval_load(&rp, &mut gpu, &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false })
+            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
             .await.expect("rope 表(f16 正确姿势)");
 
         // 常驻缓冲 ×2 套(ref / prefill;KV 8 槽,GDN 状态格用 0)
@@ -1657,4 +1801,42 @@ mod tests {
         gpu.close().await.expect("关机");
     }
 
+}
+
+#[cfg(test)]
+mod draft_shard_tests {
+    //! P2.1-a:草稿 spec 分片(纯逻辑;零 I/O —— 真机腿由 `tp_load_gate_27b` 的 draft 档覆盖)
+    use crate::formats::qwen35::{qwen3_8_27b, shard_draft_spec};
+    use crate::plan::tp::TpPlan;
+
+    /// world=2:inter/heads 切半,hidden/vocab **必须**保持全量(共享件)
+    #[test]
+    fn draft_spec_shards_heads_only() {
+        let full = qwen3_8_27b();
+        let s = shard_draft_spec(full.clone(), TpPlan::new(0, 2).expect("plan")).expect("可切");
+        assert_eq!(s.hidden, full.hidden, "hidden 不切(来自 target taps 的复制态)");
+        assert_eq!(s.vocab, full.vocab, "vocab 不切(embed/lm_head 共享 target)");
+        assert_eq!(s.inter, full.inter / 2, "inter 切半");
+        assert_eq!(s.full_heads, (full.full_heads.0 / 2, full.full_heads.1 / 2, full.full_heads.2), "(hq,hkv) 切半");
+        assert_eq!(s.gdn_heads.0, full.gdn_heads.0 / 2, "nk 切半");
+        assert_eq!(s.gdn_heads.1, full.gdn_heads.1, "hk 不切");
+    }
+
+    /// world=1:逐字段恒等(单卡退化;旧路径逐字节同物)
+    #[test]
+    fn draft_spec_single_is_identity() {
+        let full = qwen3_8_27b();
+        let s = shard_draft_spec(full.clone(), TpPlan::single()).expect("单卡");
+        assert_eq!((s.hidden, s.vocab, s.inter), (full.hidden, full.vocab, full.inter));
+        assert_eq!(s.full_heads, full.full_heads);
+    }
+
+    /// 两 rank 的分片尺寸相同(等分);且与主干同 plan 时形状自洽
+    #[test]
+    fn draft_spec_both_ranks_agree() {
+        let full = qwen3_8_27b();
+        let r0 = shard_draft_spec(full.clone(), TpPlan::new(0, 2).expect("plan")).expect("rank0");
+        let r1 = shard_draft_spec(full, TpPlan::new(1, 2).expect("plan")).expect("rank1");
+        assert_eq!((r0.inter, r0.full_heads), (r1.inter, r1.full_heads));
+    }
 }

@@ -428,6 +428,27 @@ impl Linear {
         self.quant_group.is_none() && self.gguf_ty.is_none()
     }
 
+    /// 输出行数(= 本 rank 的 logits 宽度;词表切档 = `vocab / world`)
+    pub fn out_dim(&self) -> usize {
+        self.out_dim
+    }
+
+    /// 本层的 TP 规则(**只读**;判据/门用 —— 决策仍只在构造期做一次)
+    pub fn tp_rule(&self) -> crate::plan::rules::WeightRule {
+        self.tp_role
+    }
+
+    /// **TP 规则覆盖**(2026-10-19;唯一消费者 = lm_head 的**词表切**)
+    ///
+    /// 默认规则来自键表([`crate::plan::rules::rule_of`];`lm_head` = `Replicate`)。
+    /// 词表切要 `UniformCol`(切 out 维 = 词表行)。**层不猜**:调用方
+    /// ([`crate::layers::embedding::Embedding::new_untied_head`])按
+    /// "分片行数 < 全量行数"这一个判据决定 —— 单源 = `ModelSpec::head_vocab`。
+    pub fn with_tp_rule(mut self, rule: crate::plan::rules::WeightRule) -> Self {
+        self.tp_role = rule;
+        self
+    }
+
     /// 取出权重槽(单权重基本函数 `load_weight` 的入口;消费层容器)
     pub fn into_weight(self) -> Weight {
         self.w
@@ -713,6 +734,23 @@ impl Loadable for Linear {
     /// (w4a16.rs)按同款谓词供给。AWQ 臂增 zeros Want(`{w.key}.zeros`,
     /// pack_marlin_z 产物;源 awq.rs 供给)。
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
+        let ops = self.layout_arm(ctx);
+        // **层声明的规则覆盖**(P1.1,2026-10-19):规则单源 = 构造期 `tp_role`
+        // (`Linear::with_tp_rule` 是唯一覆盖口;唯一消费者 = 词表切的 lm_head)。
+        // 只在**真覆盖**(≠ 键表默认)时打标 ⇒ 其余键零行为变化;
+        // 默认规则仍归键表(`rule_of`),段长降级(`rule_of_want`)不受影响
+        // —— 覆盖只在"构造者显式声明"时发生(判据见 `Embedding::new_untied_head`)。
+        if self.tp_role != crate::plan::rules::rule_of(self.w.key()) {
+            ops.with_rule(self.tp_role)
+        } else {
+            ops
+        }
+    }
+}
+
+impl Linear {
+    /// **装载分支臂**(f16 / W4A16 / W4A8 三族;`layout` 的唯一产出点)
+    fn layout_arm(&self, ctx: &LoaderCtx) -> LoaderOps {
         // ---- W4A8 键族(S2):与 a16 键族**并列**,同源不同布局 ----
         if let (Some(_g), Some(qw), Some(sc), Some(zs), Some(ws), Some(ctmp), Some(fac)) = (
             self.quant_group,

@@ -18,6 +18,7 @@ use owl_cuda::comm::ar::StagingLayout;
 use owl_cuda::comm::peer::{PeerCaps, PeerPlan};
 use owl_cuda::{DeviceClient, GpuClient};
 use owl_iface::contract::{Bytes, ModelError};
+use owl_iface::handle::DeviceHandle;
 use owl_models::model::ModelSpec;
 use owl_models::module::{TpArenaSlots, TpCtx};
 use owl_models::plan::tp::TpPlan;
@@ -48,6 +49,12 @@ pub struct TpOpts {
     /// (`TP2-施工设计.md` §36.6/§36.7)。**副作用**:staging 别名改授
     /// `PROT_READWRITE`(v1 是 `PROT_READ`)。
     pub push: bool,
+    /// **fp8 载荷档**(§47 第二步;2026-10-19):AR 载荷走 e4m3(载荷 1.031×)。
+    /// 由入口(server config)显式传入 —— 引擎内部零 env 读取(与 push 同律)。
+    pub ar_f8: bool,
+    /// **v1 两核融合档**(§11.2;2026-10-19):AR 一核做完两段(只非 fp8 载荷)。
+    /// 由入口显式传入(缺省关);两 rank 必须同档。
+    pub ar_fused: bool,
 }
 
 /// staging 的双块与布局量(布局算术单源 = `owl_cuda::comm::ar::StagingLayout` ——
@@ -63,6 +70,10 @@ pub struct TpStaging {
     /// ★ **push 档**(2026-10-18;§36.6/§36.7):`true` ⇒ 两核把 `own`/`peer`
     /// **指针对调**(数据腿从"读对端"变成"写对端"),别名块必须已授 `PROT_READWRITE`。
     push: bool,
+    /// **fp8 载荷档**(与 `TpOpts::ar_f8` 同值;`ctx()` 把它写进 `TpCtx`)
+    ar_f8: bool,
+    /// **v1 两核融合档**(与 `TpOpts::ar_fused` 同值;§11.2)
+    ar_fused: bool,
     pub(crate) layout: StagingLayout,
 }
 
@@ -100,6 +111,8 @@ impl TpStaging {
             slot_bytes: self.layout.slot_bytes,
             arena: self.arena.clone(),
             push: self.push,
+            ar_f8: self.ar_f8,
+            ar_fused: self.ar_fused,
         }
     }
 }
@@ -175,7 +188,11 @@ pub(crate) struct TpRank<D: DeviceClient> {
 /// 装配入口 = [`TpEngine::assemble`](真机:自动探测 caps)/
 /// [`TpEngine::assemble_with_caps`](显式能力事实:测试与自定义后端)。
 pub struct TpEngine<D: DeviceClient> {
-    ranks: Vec<TpRank<D>>,
+    /// **共享账本单元**(两 rank 合流到同一本;`RunningEngine` 侧 store 用它)
+    ledger: owl_store::SharedLedger,
+    /// 两 rank 束(**face 类型 = `DeviceHandle<D>`**:D 是内核后端客户端的类型,
+    /// 对上层签名保持 `TpEngine<GpuClient>` 不变)
+    ranks: Vec<TpRank<DeviceHandle<D>>>,
     /// rank0 的 tokenizer(host 侧唯一;两侧各解析一份纯浪费)
     tokenizer: Tokenizer,
     /// rank0 的旋钮/预算(装配期已消费;出口给诊断面)
@@ -208,17 +225,30 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         // boot 快照(host 单份;`into_running` 的预算装配用它)
         let boot = engines[0].boot_vram();
         let mut it = engines.into_iter();
-        let (face0, mut cfg) = it.next().expect("world = 2 已守门").into_parts();
-        let (face1, _cfg1) = it.next().expect("world = 2 已守门").into_parts();
+        let (face0, mut cfg, cell0) = it.next().expect("world = 2 已守门").into_parts();
+        let (face1, _cfg1, cell1) = it.next().expect("world = 2 已守门").into_parts();
+        // **合流自证**(可判):rank1 自己的那个单元在装配期**必须为空** ——
+        // 非空就说明 rank1 在接管之前已经记过账(事件落进了没人读的孤儿账)。
+        {
+            let n = owl_store::book_lock(&cell1).open_count_rank(None);
+            if n != 0 {
+                return loud(format!(
+                    "TP rank1 事件账未合流:它自己的单元已有 {n} 条在借记录(孤儿账)—— \
+                     接管必须发生在任何分配之前"
+                ));
+            }
+        }
         // ── v1 范围护栏(响亮拒;分相纪律的边界)──────────────────────
         // ① 投机草稿:verify/fold/propose 族图与草稿 prefill extend 是**双 rank
         //    未接线面**(S6+);
         // ② prefill 桶族:桶出图尾自带读数(与"入队半零同步"分相冲突);
         // ③ 读数类探针:prefill 入队半里的 dtoh/sync 会撞 AR 自旋(见 on_peer 契约)。
         let k = &cfg.knobs;
-        if k.draft.depth != 0 {
+        if k.draft.depth != 0 && !k.draft.tp_draft {
             return loud(format!(
-                "TP v1 不支持投机草稿(draft.depth = {};双 rank 草稿族未接线)",
+                "TP v1 不支持投机草稿(draft.depth = {};双 rank 草稿族未接线)。\
+                 若要走 P2.1 的草稿双 rank 路,显式开 `[spec] tp_draft = true`\
+                 (草稿 spec/权重按本 rank 计划分片 + 草稿池几何按分片 hkv)",
                 k.draft.depth
             ));
         }
@@ -312,17 +342,17 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
             TpRank { plan: plan0, staging: staging0, dev: dev0 },
             TpRank { plan: plan1, staging: staging1, dev: dev1 },
         ];
-        Ok(Self { ranks, tokenizer: tokenizer.expect("rank0 必在"), cfg, boot })
+        Ok(Self { ranks, tokenizer: tokenizer.expect("rank0 必在"), cfg, boot, ledger: cell0 })
     }
 
     /// **进执行态**(S4 ⑤-K3):rank0 束 = 主设备面,rank1 束 = `peer`
     /// (设备侧程序镜像目标);host 侧账本单一(tokenizer/会话/旋钮取 rank0)。
-    pub fn run(self) -> Result<crate::running::RunningEngine<D>> {
+    pub fn run(self) -> Result<crate::running::RunningEngine<DeviceHandle<D>>> {
         let boot = self.boot; // Copy:先取(下一行 `self.ranks` 会被 part-move)
         let mut it = self.ranks.into_iter();
         let r0 = it.next().ok_or_else(|| ModelError::Msg("TP run: rank0 缺".into()))?;
         let r1 = it.next().ok_or_else(|| ModelError::Msg("TP run: rank1 缺".into()))?;
-        crate::engine::into_running(self.cfg, self.tokenizer, boot, r0.dev, Some(r1.dev))
+        crate::engine::into_running(self.cfg, self.tokenizer, boot, r0.dev, Some(r1.dev), self.ledger)
     }
 
     /// rank 数(= world;v1 恒 2)
@@ -366,7 +396,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
     }
 
     /// 本 rank 的 face 句柄克隆(诊断/门面:同一个 actor 的另一个发送端)
-    pub fn face_clone(&self, rank: usize) -> Option<D> {
+    pub fn face_clone(&self, rank: usize) -> Option<DeviceHandle<D>> {
         self.ranks[rank].dev.graphs.face_clone()
     }
 
@@ -429,17 +459,23 @@ impl TpEngine<GpuClient> {
         );
         // ── ② staging 对称握手(**建图之前**)───────────────────────────
         let mut it = engines.into_iter();
-        let (face0, mut cfg) = it.next().expect("world = 2 已守门").into_parts();
-        let (face1, _cfg1) = it.next().expect("world = 2 已守门").into_parts();
+        let (face0, cfg, cell0) = it.next().expect("world = 2 已守门").into_parts();
+        let (mut face1, _cfg1, _cell1) = it.next().expect("world = 2 已守门").into_parts();
         let mut face0 = face0;
-        let mut face1 = face1;
+        // **事件账合流(TP 纪律)**:两 rank 写**同一本**账(单卡档 = 同一本;
+        // 分卡靠事件里的 `rank` 维,不靠两本账)。rank1 在**任何分配之前**接管。
+        face1.set_dev_rank(1);
+        face1
+            .adopt_ledger(owl_store::ledger_entry(&cell0))
+            .map_err(|e| ModelError::Msg(format!("TP rank1 事件账合流失败:{e}")))?;
+        owl_shared::log_info!("tp", "事件账:两 rank 合流到同一本(rank 维区分卡)");
         let (staging0, staging1) =
             handshake_staging(&mut face0, &mut face1, &caps0.uuid, &caps1.uuid, layout, opts).await?;
         // ── ③ 通用装配(每 rank boot_rank;图捕获在此发生)──────────────
         let engines = vec![
-            Engine::on(cfg.clone(), face0)
+            Engine::from_handle(cfg.clone(), face0, cell0.clone())
                 .map_err(|e| ModelError::Msg(format!("TP 重装 rank0 引擎壳失败:{e}")))?,
-            Engine::on(cfg.clone(), face1)
+            Engine::from_handle(cfg.clone(), face1, cell0.clone())
                 .map_err(|e| ModelError::Msg(format!("TP 重装 rank1 引擎壳失败:{e}")))?,
         ];
         Self::assemble_with_staging(engines, loadeds, staging0, staging1)
@@ -489,18 +525,21 @@ impl TpEngine<GpuClient> {
             owl_cuda::comm::ar::HEADER_BYTES,
         );
         let mut it = engines.into_iter();
-        let (face0, mut cfg) = it.next().expect("world = 2 已守门").into_parts();
-        let (face1, _cfg1) = it.next().expect("world = 2 已守门").into_parts();
+        let (face0, cfg, cell0) = it.next().expect("world = 2 已守门").into_parts();
+        let (mut face1, _cfg1, _cell1) = it.next().expect("world = 2 已守门").into_parts();
         let mut face0 = face0;
-        let mut face1 = face1;
+        face1.set_dev_rank(1);
+        face1
+            .adopt_ledger(owl_store::ledger_entry(&cell0))
+            .map_err(|e| ModelError::Msg(format!("同卡档 rank1 事件账合流失败:{e}")))?;
         let uuid = caps0.uuid.clone();
         let (staging0, staging1) =
             handshake_staging(&mut face0, &mut face1, &uuid, &uuid, layout, TpOpts::default())
                 .await?;
         let engines = vec![
-            Engine::on(cfg.clone(), face0)
+            Engine::from_handle(cfg.clone(), face0, cell0.clone())
                 .map_err(|e| ModelError::Msg(format!("同卡档重装 rank0 引擎壳失败:{e}")))?,
-            Engine::on(cfg.clone(), face1)
+            Engine::from_handle(cfg.clone(), face1, cell0.clone())
                 .map_err(|e| ModelError::Msg(format!("同卡档重装 rank1 引擎壳失败:{e}")))?,
         ];
         Self::assemble_with_staging(engines, loadeds, staging0, staging1)
@@ -535,7 +574,10 @@ impl TpEngine<GpuClient> {
 /// 返回 `None` = 干净;`Some(err)` = 首错(已告警)。
 ///
 /// `GpuClient` 特化:`peer_release` 是 GpuClient 固有方法(非 trait 面)。
-async fn retire_rank(dev: &mut RankDev<GpuClient>, tag: &str) -> Option<ModelError> {
+async fn retire_rank(
+    dev: &mut RankDev<DeviceHandle<GpuClient>>,
+    tag: &str,
+) -> Option<ModelError> {
     let mut first: Option<ModelError> = None;
     let note = |e: ModelError, first: &mut Option<ModelError>| {
         owl_shared::log_warn!("tp", "{e}");
@@ -551,7 +593,7 @@ async fn retire_rank(dev: &mut RankDev<GpuClient>, tag: &str) -> Option<ModelErr
             ModelError::Msg(format!("{tag} 收尾:face 句柄耗尽,无法 PeerRelease")),
             &mut first,
         ),
-        Some(face) => match dev.tp.as_ref() {
+        Some(mut face) => match dev.tp.as_ref() {
             None => note(
                 ModelError::Msg(format!("{tag} 收尾:无 TpCtx(非 TP 态?)")),
                 &mut first,
@@ -566,7 +608,9 @@ async fn retire_rank(dev: &mut RankDev<GpuClient>, tag: &str) -> Option<ModelErr
                     ids.extend(a.own_slots.iter().map(|b| b.id));
                     ids.extend(a.peer_slots.iter().map(|b| b.id));
                 }
-                if let Err(e) = face.peer_release(ids).await {
+                // peer 面不经 `DeviceClient`(自成命令族)⇒ 走可变直通口
+                // (设计卷 §六 白名单:peer_* 指令;**这些块不入事件账** —— 见 §十二 步 3 注)
+                if let Err(e) = face.client_mut().peer_release(ids).await {
                     note(ModelError::Msg(format!("{tag} PeerRelease 失败:{e}")), &mut first);
                 }
             }
@@ -577,7 +621,7 @@ async fn retire_rank(dev: &mut RankDev<GpuClient>, tag: &str) -> Option<ModelErr
 
 /// 单 rank 的 staging 游标三元组(`(produced, consumed, err)`;见
 /// [`RunningEngine::tp_staging_state`])。
-async fn staging_state_of(dev: &mut RankDev<GpuClient>) -> Result<(u64, u64, u32)> {
+async fn staging_state_of(dev: &mut RankDev<DeviceHandle<GpuClient>>) -> Result<(u64, u64, u32)> {
     let Some(tp) = dev.tp.clone() else {
         return loud("TP staging: 无 TpCtx(装配路径错)");
     };
@@ -593,7 +637,7 @@ async fn staging_state_of(dev: &mut RankDev<GpuClient>) -> Result<(u64, u64, u32
     ))
 }
 
-impl RunningEngine<GpuClient> {
+impl RunningEngine<DeviceHandle<GpuClient>> {
     /// **TP staging 游标三元组**(诊断出口;文档 §20.4 的工具口):
     /// `(rank0 的 (produced, consumed, err), rank1 的同款)`;单卡 = `None`。
     ///
@@ -641,13 +685,18 @@ impl RunningEngine<GpuClient> {
 /// `peer_import`(两侧;所有权归分配侧 —— 导入侧绝不 close,§11.3 裁决 2)。
 /// `peer_uuid` = **对端** uuid(导入的是对端的分配)。
 async fn handshake_staging(
-    face0: &mut GpuClient,
-    face1: &mut GpuClient,
+    face0: &mut DeviceHandle<GpuClient>,
+    face1: &mut DeviceHandle<GpuClient>,
     uuid0: &str,
     uuid1: &str,
     layout: StagingLayout,
     opts: TpOpts,
 ) -> Result<(TpStaging, TpStaging)> {
+    // **peer 面 = 独立命令族**(不在 `DeviceClient` trait 上;见 TP2 施工设计 §7.0
+    // 裁决 D1)⇒ 走可变直通口。代价:**这些块不进 DeviceHandle 事件账**
+    // (TP 档对账的己知残差;单卡档不受影响 —— 见设计卷 §十二 步 3 注)。
+    let face0 = face0.client_mut();
+    let face1 = face1.client_mut();
     let bytes = layout.total_bytes() as usize;
     let (own0, cred0) = face0
         .peer_alloc(bytes, "tp.staging.r0")
@@ -684,6 +733,14 @@ async fn handshake_staging(
     };
     // ★ **1-stage 对称 arena**(2026-10-18;§35)—— 开关见 `one_stage_enabled()`
     // ⚠️ **与 push 互斥**(两者都改写数据腿;同时开只会让 push 静默不生效)。
+    // 诊断面(2026-10-19):1-stage 的启用条件一次打全 —— 它是"融合核被走到"的
+    // 唯一前提,而 §57 的教训正是"核写好了但一次没被走到"。
+    eprintln!(
+        "[tp] 1-stage 启用判据:env OWL_TP_1STAGE={:?} · push={} ⇒ arena {}",
+        std::env::var("OWL_TP_1STAGE").ok(),
+        opts.push,
+        if one_stage_enabled() && !opts.push { "装配" } else { "不装(走 v1 两段)" }
+    );
     let (arena0, arena1) = if one_stage_enabled() && !opts.push {
         // 槽大小:按 staging 的 slot_bytes 会白占显存(0.8B 的 payload 只有 ~1MiB,
         // 而 SLOT_BYTES = 32MiB ⇒ 2 槽 = 64MiB/rank,实测在 3080 上直接
@@ -696,8 +753,8 @@ async fn handshake_staging(
         (None, None)
     };
     Ok((
-        TpStaging { own: own0, peer: peer0, arena: arena0, push: opts.push, layout },
-        TpStaging { own: own1, peer: peer1, arena: arena1, push: opts.push, layout },
+        TpStaging { own: own0, peer: peer0, arena: arena0, push: opts.push, ar_f8: opts.ar_f8, ar_fused: opts.ar_fused, layout },
+        TpStaging { own: own1, peer: peer1, arena: arena1, push: opts.push, ar_f8: opts.ar_f8, ar_fused: opts.ar_fused, layout },
     ))
 }
 

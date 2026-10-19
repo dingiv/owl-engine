@@ -213,6 +213,27 @@ pub fn rule_of(key: &str) -> WeightRule {
     WeightRule::Replicate
 }
 
+/// **键 → 规则(带「段长事实」)** —— 装载面的**唯一入口**(P2.1-a,2026-10-19)。
+///
+/// 为什么需要:`rule_of(key)` 只看键名,而**同名键在不同模型里语义不同** ——
+/// 典型 = `q_proj`:主模型(Qwen3.5 主干)是 **gated attention**(out = q ⊕ gate,
+/// 段长 [hq·hd, hq·hd]),草稿(DFlash2 的 `DfAttn`)是**无门控**(out = hq·hd)。
+/// 段长是**权重的事实**,由构造者声明在 `Want::segments` 上(Want 文档原文:
+/// `Some` = 本张量是拼接而来)⇒ **无段长声明 ⇒ 不是融合张量** ⇒ 分段切无据可依,
+/// 规则降级为 `UniformCol`(切 out 维)。
+///
+/// ⚠️ 这不是「静默兜底」:降级判据 = **层自己声明的段长事实缺席**,与
+/// `SegmentedCol` 的定义(按段长切)互为表里;真要分段的张量**必然**声明段长
+/// (主模型 attention/GDN 的 `with_segments` 已在位)。若声明了段长但合计 ≠ 维度,
+/// `segments_in_key_units` 仍**响亮拒**(那条判据没被削弱)。
+pub fn rule_of_want(key: &str, segments: Option<&[usize]>) -> WeightRule {
+    let rule = rule_of(key);
+    match rule {
+        WeightRule::SegmentedCol(_) if segments.is_none() => WeightRule::UniformCol,
+        other => other,
+    }
+}
+
 /// **AR 注入判据**:该键所在层的输出是否为**部分和**(需要 allreduce)。
 ///
 /// 行并行(`UniformRow`)= 输入被切 ⇒ 输出是部分和 ⇒ 需要 AR。

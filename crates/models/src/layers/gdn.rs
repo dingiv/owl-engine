@@ -323,13 +323,19 @@ pub(crate) fn conv_fwd(
     d: usize,
     silu: bool,
 ) -> TensorOps {
+    // batch = cu_seqlens.len − 1(单序列 = 1;多序列 prefill/verify 合批用)
+    let batch = cu_seqlens
+        .shape()
+        .first()
+        .map(|n| n.saturating_sub(1).max(1))
+        .unwrap_or(1);
     TensorOps::call(SemanticKernel::GdnConvFwd).aux(&[d])
     .arg(x)
     .arg(w)
     .arg(state)
     .arg(slots)
     .arg(cu_seqlens)
-    .arg_i32(1) // batch = 1(单序列)
+    .arg_i32(batch as i32)
     .arg_i32(d as i32)
     .arg_i32(silu as i32)
     .with_shape(Dtype::F16, vec![tokens, d])
@@ -431,7 +437,13 @@ pub(crate) fn recurrence_varlen(
     vd: usize,
     q_scale: f32,
 ) -> TensorOps {
-    TensorOps::call(SemanticKernel::GdnRecurrence).aux(&[nv, kd, vd])
+    // batch = cu_seqlens.len − 1(单序列 = 1;B5.1 M2 多序列 verify 用)
+    let batch = cu_seqlens
+        .shape()
+        .first()
+        .map(|n| n.saturating_sub(1).max(1))
+        .unwrap_or(1);
+    TensorOps::call(SemanticKernel::GdnRecurrence).aux(&[nv, kd, vd, batch])
     .arg(q)
     .arg(k)
     .arg(v)
@@ -440,7 +452,7 @@ pub(crate) fn recurrence_varlen(
     .arg(state)
     .arg(slots)
     .arg(cu_seqlens)
-    .arg_usize(1) // batch = 1(单序列)
+    .arg_usize(batch)
     .arg_usize(nv)
     .arg_usize(nk)
     .arg_usize(kd)
@@ -2360,7 +2372,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f16 装载");
@@ -2434,7 +2446,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f32 装载");
@@ -2503,7 +2515,7 @@ mod f16_tests {
                 .collect();
 
         let mut gpu = gpu_client().await;
-        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false };
+        let lctx = crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         crate::interpreters::eval_load(&layer, &mut gpu, &src, &lctx)
             .await
             .expect("层 f16 装载");

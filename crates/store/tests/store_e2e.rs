@@ -19,9 +19,9 @@
 use owl_cpu::CpuFace;
 use owl_iface::contract::{DeviceClient, Dtype, HeapRegion, PinnedRegion, SwapDir};
 use owl_store::{
-    commit_offload, commit_onload, plan, plan_offload, plan_offload_blocks, plan_onload,
-    reclaim_slot_table, BlockClass, BlockLeg, ChainHash, LegConfig, Need, NeedWhy, PieceSpec,
-    PoolLayout, Sink, SkipWhy, StoreResult,
+    commit_offload, commit_onload, plan_capacity, plan_offload, plan_offload_blocks, plan_onload,
+    reclaim_slot_table, BlockClass, BlockLeg, ChainHash, EvictOut, LegConfig, LruPolicy, Room,
+    Need, NeedWhy, PieceSpec, PoolLayout, Sink, SkipWhy, StateStore, StoreResult,
 };
 
 const PIECE_ELEMS: usize = 64;
@@ -101,6 +101,18 @@ fn leg(slots: usize) -> BlockLeg {
     .expect("开腿")
 }
 
+/// 只用 KV 腿的判据入口(测试辅助:状态腿空账 + 状态宿主 0 位)。
+fn plan_kv(l: &BlockLeg, need: Need) -> owl_store::Verdict {
+    let state = StateStore::new(1, 0);
+    let room = Room {
+        host_kv_slots: l.host_free_slots(),
+        host_snap_slots: 0,
+        disk_kv_slots: 0,
+        disk_snap_slots: 0,
+    };
+    plan_capacity(l, &state, &LruPolicy, need, &[], &[], room)
+}
+
 async fn seed(face: &mut CpuFace, ps: &[PieceSpec], slot: u32, seed: u8) {
     for p in ps {
         let pat: Vec<u8> = (0..p.stride_bytes).map(|i| seed.wrapping_add(i as u8)).collect();
@@ -159,15 +171,17 @@ async fn offload_and_batch_reload_without_gpu() {
     }
 
     // ── 轮 3:新需求(池满 ⇒ 钩子判:链级整条沉最冷的链 A)
-    let need = Need { slots: 2, why: NeedWhy::Admit };
-    let verdict = plan(&l, need, &[]);
+    let need = Need::kv(2, NeedWhy::Admit);
+    let verdict = plan_kv(&l, need);
     assert!(!verdict.out.is_empty(), "池满 + 新需求 ⇒ 必须出单(下沉/驱逐)");
     // engine 式执行:逐条取计划 → swap → 记账
     let mut offloaded = 0usize;
     for item in &verdict.out {
-        match item.sink {
-            Sink::Host => offloaded += engine_offload(&mut l, &mut face, item.chain).await.expect("换出"),
-            Sink::Drop => l.drop_cached(item.chain).expect("驱逐"),
+        let EvictOut::Kv { chain, sink, .. } = item else { continue };
+        match sink {
+            Sink::Host => offloaded += engine_offload(&mut l, &mut face, *chain).await.expect("换出"),
+            Sink::Drop => l.drop_cached(*chain).expect("驱逐"),
+            Sink::Disk => panic!("本档未接盘层"),
         }
     }
     assert!(offloaded > 0, "需求驱动下沉:应真搬(而非驱逐)");
@@ -346,4 +360,40 @@ async fn per_block_offload_skips_live_block_without_vetoing_others() {
     let unk = plan_offload_blocks(&mut l, &[ChainHash::new(0xDEAD)]).expect("未知身份");
     assert!(unk.is_empty());
     assert_eq!(unk.skipped[0].1, SkipWhy::Unknown);
+}
+
+/// **N6-① 次序门**(缺口 3;2026-10-19):`NeedWhy::Pressure` = **零缺口也搬**,
+/// 且出单**优先 `Sink::Host`**(内容不丢) —— 与"非压力节点在 free >= need 时早退"对照。
+#[tokio::test]
+async fn pressure_offloads_without_deficit_and_prefers_host() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let mut l = leg(6);
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
+        .expect("注册布局");
+    // 填 2 条链 × 3 块 = 池满;归还会话引用 ⇒ 缓存独占(可下沉)
+    let a_tokens: Vec<u32> = (0..PAGE_TOKENS as u32 * 3).collect();
+    let _a = build_chain(&mut l, &a_tokens).await;
+    let tokens_b: Vec<u32> = (1000..1000 + PAGE_TOKENS as u32 * 3).collect();
+    let _b = build_chain(&mut l, &tokens_b).await;
+    assert_eq!(l.slots_free(), 0, "池应已满");
+    // 对照:非压力节点,零缺口 ⇒ 不动
+    let noop = plan_kv(&l, Need::kv(0, NeedWhy::Grow));
+    assert!(noop.is_noop(), "Grow + 零缺口 ⇒ 不搬");
+    // N6:目标腾 3 槽(与缺口无关)⇒ 必须出单,且优先 Host 下沉
+    let v = plan_kv(&l, Need::kv(3, NeedWhy::Pressure));
+    assert!(v.deny.is_none(), "可下沉面充足 ⇒ 不拒:{:?}", v.deny);
+    assert!(!v.out.is_empty(), "压力节点必须搬(零缺口也搬)");
+    assert!(
+        v.out.iter().all(|o| o.sink() == Sink::Host),
+        "宿主要位 ⇒ 首选下沉(内容不丢):{:?}",
+        v.out.iter().map(|o| o.sink()).collect::<Vec<_>>()
+    );
+    assert_eq!(v.out.iter().map(|o| o.kv_span()).sum::<usize>(), 3, "整链下沉凑满目标");
+    // **H5 空转整理**(步 4 入档):与 Pressure 同语义(零缺口也搬),只是 why 不同 ——
+    // 空转期只动缓存面(冷链),绝不碰活跃面。
+    let idle = plan_kv(&l, Need::kv(3, NeedWhy::Idle));
+    assert!(!idle.out.is_empty(), "H5 空转整理必须出单(零缺口也搬)");
+    assert!(idle.out.iter().all(|o| o.sink() == Sink::Host), "空转整理同样先下沉");
+    assert!(idle.deny.is_none(), "有可搬面 ⇒ 不拒");
 }

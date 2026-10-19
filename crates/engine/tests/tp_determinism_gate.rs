@@ -96,7 +96,7 @@ struct Arm {
 
 /// 提交一个 turn 并驱动到完结;返回生成段 + 命中量诊断。
 async fn run_turn(
-    r: &mut RunningEngine<owl_cuda::GpuClient>,
+    r: &mut RunningEngine<owl_engine::GpuFace>,
     sid: u64,
     prompt: &str,
     max_new: usize,

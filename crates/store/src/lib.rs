@@ -36,6 +36,8 @@
 #![warn(missing_docs)]
 
 pub mod budget;
+pub mod disk;
+pub mod disk_index;
 pub mod error;
 pub mod host;
 pub mod moves;
@@ -49,6 +51,10 @@ pub mod select;
 pub mod state;
 pub mod tier;
 
+pub use disk::{
+    AdoptReport, DiskEntry, DiskEvictPlanOf, DiskKey, DiskStats, DiskTier, FillPlanOf, SpillPlanOf,
+};
+pub use disk_index::ChainIndex;
 pub use error::{StoreError, StoreResult};
 pub use host::{HostBlock, HostTier};
 pub use moves::{bytes_of, download_span, offload_to_host, onload_from_host, upload_span};
@@ -61,13 +67,17 @@ pub use leg::{
     reclaim_slot_table, BlockClass, BlockLeg, Carrier, ChainCand, ChainHit, InPlan, LegConfig,
     LegOps, LegStats, OutPlan, PieceSpec, PoolLayout,
 };
-pub use hooks::{plan, Applied, EvictOut, Need, NeedWhy, Sink, Verdict};
+pub use hooks::{plan_capacity, Applied, EvictOut, Need, NeedWhy, Room, Sink, Verdict};
 pub use policy::{
     AdmissionPolicy, EvictCandidate, EvictPolicy, EvictPolicyKind, Leg, LrfuPolicy, LruPolicy,
     QueuePolicy,
 };
 pub use leg::CachePolicy;
-pub use rel::{EvictItem, EvictPlan, KvConfig, Protected, RecallHit, RecallMode, Rel, StoreReport};
+pub use rel::{
+    AdoptChainsReport, DiskAttach, EventBook, KvConfig, OpenLoan, PoolReport, Protected, RecallHit,
+    SnapEvictPreview,
+    RecallMode, Rel, StoreReport,
+};
 pub use select::{
     assemble_view, f32_to_f16, score_blocks, select, select_recency, BlockSet, IndexStats,
     MeanKEntry, MeanKIndex, block_mass, coverage_curve, derope_halves_inplace, derope_pair,
@@ -75,4 +85,8 @@ pub use select::{
     SelectBudget, ViewPlan,
 };
 pub use state::{SnapDurability, StateStore};
-pub use tier::{AssetKind, Tier, TierBudget, TierLedger, TierReport};
+pub use tier::{
+    AssetKind, EventRow, LedgerBook, LedgerEntry, Loan, Owner, OwnerRow, SharedLedger, Tier,
+    TierBudget,
+    TierLedger, TierReport, book_lock, ledger_entry, shared_ledger, tier_budget_of,
+};

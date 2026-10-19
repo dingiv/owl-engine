@@ -227,3 +227,202 @@ pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
         "blocks": blocks,
     })
 }
+
+// ============================================================================
+// `/debug/vram` —— store 三层账 + **owner 维明细**(第 0 刀)
+// ============================================================================
+
+/// store 报告 → JSON(纯投影,零决策)。
+///
+/// **判据面**:`owners[]` 里同一 owner 的 `bytes` 逐轮**单调爬坡 = 泄漏**;
+/// 持平 = 正常。`system` 桶 = 尚未接线 owner 的存量调用点(随 N4/N5 排空)。
+pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
+    let r = &snap.report;
+    let owners: Vec<Value> = r
+        .tiers
+        .owners
+        .iter()
+        .map(|o| {
+            json!({
+                "owner": o.owner.label(),
+                "lifecycle": o.owner.is_lifecycle(),
+                "tier": format!("{:?}", o.tier),
+                "kind": format!("{:?}", o.kind),
+                "bytes": o.bytes,
+                "mib": (o.bytes as f64) / (1024.0 * 1024.0),
+                "entries": o.entries,
+            })
+        })
+        .collect();
+    let cells: Vec<Value> = r
+        .tiers
+        .rows
+        .iter()
+        .map(|c| {
+            json!({
+                "tier": format!("{:?}", c.tier),
+                "kind": format!("{:?}", c.kind),
+                "bytes": c.bytes,
+                "entries": c.entries,
+            })
+        })
+        .collect();
+    json!({
+        "tiers": {
+            "gpu_used": r.tiers.gpu_used,
+            "host_used": r.tiers.host_used,
+            "disk_used": r.tiers.disk_used,
+            "host_cap": r.tiers.host_cap,
+            "disk_cap": r.tiers.disk_cap,
+            "cells": cells,
+        },
+        "owners": owners,
+        "kv": {
+            "slots_total": r.kv.slots_total,
+            "slots_free": r.kv.slots_free,
+            "cached_blocks": r.kv.cached_blocks,
+            "host_blocks": r.kv.host_blocks,
+            "gpu_bytes": r.kv.gpu_bytes,
+            "hits": r.kv.hits,
+            "misses": r.kv.misses,
+            "evicted": r.kv.evicted,
+        },
+        "state": {
+            // **淘汰序预览**(会话感知:同会话 depth 降序 = 末端先走)
+            "evict_order": snap.snap_evict.iter().map(|e| json!({
+                "key": format!("{:?}", e.key),
+                // 无归属 = null(会话 id 0 是合法 id,不能用 0 表示"无主")
+                "session": if e.session == u64::MAX { serde_json::Value::Null } else { json!(e.session) },
+                "depth": e.depth,
+                "transient": e.transient,
+            })).collect::<Vec<_>>(),
+            "rows_total": r.state.rows_total,
+            "rows_free": r.state.rows_free,
+            "snaps": r.state.snaps,
+            "snap_bytes": r.state.snap_bytes,
+            "snap_gpu": r.state.snap_gpu,
+            "snap_host": r.state.snap_host,
+            "hits": r.state.hits,
+            "misses": r.state.misses,
+        },
+        // **磁盘层**(S6;None = 关层):账上驻留 + 目录 + 配额
+        "disk": {
+            "kv": r.disk_kv.as_ref().map(|d| json!({
+                "root": d.root, "budget_bytes": d.budget_bytes,
+                "used_bytes": d.used_bytes, "entries": d.entries,
+                "evicted_bytes": d.evicted_bytes,
+            })),
+            "snap": r.disk_snap.as_ref().map(|d| json!({
+                "root": d.root, "budget_bytes": d.budget_bytes,
+                "used_bytes": d.used_bytes, "entries": d.entries,
+                "evicted_bytes": d.evicted_bytes,
+            })),
+        },
+        "faces": {
+            "active_turns": r.active_turns,
+            "reserved_bytes": r.reserved_bytes,
+            "session_held_bytes": r.session_held_bytes,
+            "elastic_bytes": r.elastic_bytes,
+            "cache_bytes": r.cache_bytes,
+            "host_resident_bytes": r.host_resident_bytes,
+            "host_free_bytes": r.host_free_bytes,
+            "policy": r.policy,
+        },
+        // **事件账**(DeviceHandle 钩子的出借登记;第 3 刀)—— 与腿自报/块账房
+        // 互为**独立来源**:三者对不上就是 bug(不是"取其一"的问题)。
+        "events": {
+            "entries": r.events.entries,
+            "bytes": r.events.bytes,
+            "hook_fail": r.events.hook_fail,
+            // 片级换层跳过(口径不支持,不是失败;层账以腿自报为准)
+            "partial_moves": r.events.partial_moves,
+            "rows": r.events.rows.iter().map(|e| json!({
+                "rank": e.rank,
+                "owner": e.owner.label(),
+                "lifecycle": e.owner.is_lifecycle(),
+                "tier": format!("{:?}", e.tier),
+                "kind": format!("{:?}", e.kind),
+                "bytes": e.bytes,
+                "mib": (e.bytes as f64) / (1024.0 * 1024.0),
+                "entries": e.entries,
+            })).collect::<Vec<_>>(),
+            // **复用池**(缺口 4):池内可复用字节 = 一等指标(此前只在告警里一行)
+            "pool": {
+                "entries": r.events.pool.entries,
+                "bytes": r.events.pool.bytes,
+                "mib": (r.events.pool.bytes as f64) / (1024.0 * 1024.0),
+                "hits": r.events.pool.hits,
+                "misses": r.events.pool.misses,
+                "drained": r.events.pool.drained,
+                "evicted": r.events.pool.evicted,
+                "cap_bytes": r.events.pool.cap,
+                // P2-3:按类明细(与 events.rows 同口径)
+                "by_class": r.events.pool.by_class.iter().map(|(k, n, b)| json!({
+                    "kind": format!("{k:?}"), "entries": n, "bytes": b,
+                })).collect::<Vec<_>>(),
+            },
+            // **lifecycle 在借清单**(N4/N5 未归还的逐块指纹:名字 + id)。
+            // 判据:同一 `name` 的条目**逐轮增长** = 该处没在节点上归还。
+            "open": r.events.open_lifecycle.iter().map(|l| json!({
+                "id": l.id,
+                "rank": l.rank,
+                "name": l.name,
+                "owner": l.owner.label(),
+                "kind": format!("{:?}", l.kind),
+                "bytes": l.bytes,
+            })).collect::<Vec<_>>(),
+        },
+        // **句柄计数**(非零必须能解释:记账失败 / 窗未收)
+        "handle": {
+            "hook_fail": snap.hook_fail,
+            "window_unclosed": snap.window_unclosed,
+            "open_window_blocks": snap.open_window_blocks,
+        },
+        // **对账(全等门)**:事件账 id 集 vs 块账房 id 集,逐 rank。
+        // `only_event` = 账里已销/账外有块(或后端自管块)—— 两者都必须能解释;
+        // `bytes_*` 给量级(不止块数)。
+        "recon": snap.blocks.iter().map(|(rank, r)| recon_json(*rank, r, &r_events(&snap.report))).collect::<Vec<_>>(),
+    })
+}
+
+/// 事件账的逐 rank id 集(对账左值)
+fn r_events(rep: &owl_store::StoreReport) -> Vec<(u8, Vec<u64>)> {
+    rep.events.ids.clone()
+}
+
+/// **单个 rank 的对账投影**(纯比较,零决策):
+/// - `only_block`:块账房有、事件账没有 ⇒ 该块**没走 DeviceHandle**(或后端自管,如 peer 面);
+/// - `only_event`:事件账有、块账房没有 ⇒ 已销但块仍在(含"被图租约拒收的 free")或**后端已回收但本层未销**;
+/// - `equal`:两面 id 集逐字相等(= 全等门通过)。
+fn recon_json(
+    rank: u8,
+    dump: &Result<Vec<owl_iface::contract::BlockLedgerRow>, String>,
+    events: &[(u8, Vec<u64>)],
+) -> Value {
+    let ev: Vec<u64> = events
+        .iter()
+        .filter(|(rk, _)| *rk == rank)
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    match dump {
+        Err(e) => json!({"rank": rank, "available": false, "error": e}),
+        Ok(rows) => {
+            let blk: Vec<u64> = rows.iter().map(|r| r.id).collect();
+            let only_event: Vec<u64> = ev.iter().copied().filter(|id| !blk.contains(id)).collect();
+            let only_block: Vec<u64> = blk.iter().copied().filter(|id| !ev.contains(id)).collect();
+            let bytes_blk: usize = rows.iter().map(|r| r.bytes).sum();
+            json!({
+                "rank": rank,
+                "available": true,
+                "blocks": blk.len(),
+                "events": ev.len(),
+                "equal": only_event.is_empty() && only_block.is_empty(),
+                "only_event": only_event.len(),
+                "only_block": only_block.len(),
+                "only_event_ids": only_event.iter().take(16).collect::<Vec<_>>(),
+                "only_block_ids": only_block.iter().take(16).collect::<Vec<_>>(),
+                "block_bytes": bytes_blk,
+            })
+        }
+    }
+}

@@ -148,6 +148,8 @@ impl VlmCfg {
         };
         let text_spec = ModelSpec {
             vocab: g("vocab_size")?,
+            head_vocab: g("vocab_size")?, // VLM 不进 TP(v1):头 = 全量
+            head_split: false,
             hidden,
             inter: g("intermediate_size")?,
             dtype: Dtype::F16,
@@ -259,7 +261,7 @@ impl Vlm {
         face: &mut D,
         dtype: Dtype,
     ) -> Result<Vlm, ModelError> {
-        Self::load_ctx(dir, face, LoaderCtx { dtype, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false }).await
+        Self::load_ctx(dir, face, LoaderCtx { dtype, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false }).await
     }
 
     /// 同上,装载 ctx 外给(分相探针 / 校验 / 分片调试面)
@@ -282,6 +284,8 @@ impl Vlm {
             device_repack: Some(ctx.device_repack),
             verify: ctx.verify,
             debug_tap: ctx.debug_tap,
+            staging_mb: 128,
+            dump: false,
         };
         crate::formats::load::load_from_dir(dir, face, &vlm, opts).await?;
         Ok(vlm)
@@ -665,6 +669,8 @@ mod tests {
         }
         let vlm = Vlm::load_ctx(&dir, &mut gpu, crate::module::LoaderCtx {
             dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: dbg,
+            staging_mb: 128,
+            dump: false,
         }).await.expect("Vlm::load(4B)");
         eprintln!("[vlm] 4B 整装 {:.1}s", t0.elapsed().as_secs_f64());
         if dbg {
@@ -683,7 +689,7 @@ mod tests {
             &rp,
             &mut gpu,
             &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false },
+            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false },
         )
         .await
         .expect("rope 表(f16)");
@@ -784,7 +790,7 @@ mod tests {
             &rp,
             &mut gpu,
             &rp.tables(),
-            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false },
+            &crate::module::LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false },
         )
         .await
         .expect("rope 表(f16)");
@@ -984,7 +990,7 @@ mod tests {
         for (i, c) in big.chunks_exact_mut(4096).enumerate() {
             c.fill((i & 0xff) as u8);
         }
-        let blk = owl_iface::alloc!(gpu, Dtype::F16, n_big).await.expect("1GB 设备块");
+        let blk = owl_iface::client_alloc!(gpu, Dtype::F16, n_big).await.expect("1GB 设备块");
         // 单发 1GB(分块 128MB)+ 尾 sync
         for reps in [1usize, 3] {
             let t0 = std::time::Instant::now();
@@ -1008,7 +1014,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut futs = Vec::new();
         for (fi, mut f) in faces.into_iter().enumerate() {
-            let blk = owl_iface::alloc!(f, Dtype::F16, per).await.expect("分块");
+            let blk = owl_iface::client_alloc!(f, Dtype::F16, per).await.expect("分块");
             let src = big[..per * 2].to_vec();
             futs.push(async move {
                 let mut off = 0usize;

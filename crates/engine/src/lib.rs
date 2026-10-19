@@ -38,6 +38,7 @@ pub mod turn;
 // re-export 保持不变 —— owl_engine::{Engine, EngineConfig,
 // LoadedModel, ModelLoader, RunningEngine})
 pub(crate) mod engine;
+pub(crate) mod disk_io;
 pub(crate) mod exec;
 pub(crate) mod graph_fleet;
 pub(crate) mod loader;
@@ -58,6 +59,11 @@ pub mod tests;
 pub mod tests_gguf;
 
 pub use engine::{Engine, EngineConfig, EngineKnobs};
+pub use owl_iface::handle::{AssetClass, DeviceHandle, Owner};
+
+/// **GPU 设备面类型糖**(内核后端 + 事件账钩子):`RunningEngine`/`TpEngine` 的
+/// 公共签名用它 —— 上层不必手写嵌套泛型(2026-10-19 步 3)。
+pub type GpuFace = DeviceHandle<owl_cuda::GpuClient>;
 pub use loader::{LoadedModel, ModelLoader};
 
 /// lm_head 量化方案映射(**唯一点**:配置枚举 → owl_models QuantPlan;

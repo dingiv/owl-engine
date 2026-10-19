@@ -209,7 +209,7 @@ fn production_picks_carry_admission_meta() {
         ),
         (
             "gdn recurrence",
-            driver::gdn::recurrence_varlen_gqa(DType::F16, 128, 16, 128),
+            driver::gdn::recurrence_varlen_gqa(DType::F16, 128, 16, 128, 1),
         ),
         // ---- elems / norm / mlp / dflash / load ----
         ("narrow", driver::elems::narrow(DType::F16)),

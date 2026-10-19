@@ -16,8 +16,11 @@ owl-cuda = { path = "../../crates/backends/cuda" }
 owl-iface = { path = "../../crates/backends/iface" }
 # 诊断:/debug/metrics 读 GPU 逐核归因分账(OWL_GPU_PROF 写入同进程 store)
 owl-shared = { path = "../../crates/shared" }
+# 诊断:/debug/vram —— store 三层账 + owner 维明细(第 0 刀;纯投影,不决策)
+owl-store = { path = "../../crates/store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 # chat template 渲染(agent 服务面 §3.2/§7.1;HF transformers 语义兼容层)
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }

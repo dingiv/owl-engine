@@ -53,7 +53,7 @@ const POOL_TOKENS: usize = 256;
 const WORDS: u32 = 4;
 
 /// 装配一个最小档(8 槽池 + 开宿主层 ⇒ 准入判决才看得到池墙)
-async fn boot() -> owl_engine::RunningEngine<CpuFace> {
+async fn boot() -> owl_engine::RunningEngine<owl_engine::DeviceHandle<CpuFace>> {
     boot_rows(12, owl_store::QueuePolicy::Reject).await
 }
 
@@ -61,7 +61,7 @@ async fn boot() -> owl_engine::RunningEngine<CpuFace> {
 async fn boot_rows(
     rows: usize,
     on_full: owl_store::QueuePolicy,
-) -> owl_engine::RunningEngine<CpuFace> {
+) -> owl_engine::RunningEngine<owl_engine::DeviceHandle<CpuFace>> {
     let cfg = EngineConfig {
         device_ordinal: 0,
         max_seq_tokens: MAX_SEQ,
@@ -85,7 +85,7 @@ async fn boot_rows(
 
 /// 提交一个 turn 并泵到终态;返回(事件, prompt token 数)
 async fn run_turn(
-    running: &mut owl_engine::RunningEngine<CpuFace>,
+    running: &mut owl_engine::RunningEngine<owl_engine::DeviceHandle<CpuFace>>,
     session: Option<u64>,
     base: u32,
     n: u32,
@@ -112,7 +112,7 @@ async fn run_turn(
 ///
 /// 与 `boot_rows` 的区别:开虚拟化两扇门 + 地板走 per-turn 覆写面,
 /// 工作集由调用方给(池下限 `nb ≥ 1 × (ws_pages + 1)` 必须装得进 8 槽池)。
-async fn boot_virt(ws_tokens: usize) -> owl_engine::RunningEngine<CpuFace> {
+async fn boot_virt(ws_tokens: usize) -> owl_engine::RunningEngine<owl_engine::DeviceHandle<CpuFace>> {
     let cfg = EngineConfig {
         device_ordinal: 0,
         max_seq_tokens: MAX_SEQ,
@@ -141,7 +141,7 @@ async fn boot_virt(ws_tokens: usize) -> owl_engine::RunningEngine<CpuFace> {
 
 /// 提交一个 turn(带 `TurnOpts`)并泵到终态;返回(事件, prompt token 数)。
 async fn run_turn_opts(
-    running: &mut owl_engine::RunningEngine<CpuFace>,
+    running: &mut owl_engine::RunningEngine<owl_engine::DeviceHandle<CpuFace>>,
     session: Option<u64>,
     base: u32,
     n: u32,

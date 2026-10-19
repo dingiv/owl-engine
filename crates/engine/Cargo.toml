@@ -21,6 +21,9 @@ owl-cuda = { path = "../backends/cuda" }
 # 方向与 owl-cuda 同:engine → backends/*(无环)。
 owl-cpu = { path = "../backends/cpu" }
 half = "2"
+# 异步运行时(S6:磁盘 I/O 跑在 `spawn_blocking` —— 写盘 159MiB 不许钉住 actor)。
+# 只取 rt(不需要 net/time;actor 运行时由 apps/server 建)。
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 # 重排面门(TP 装载:设备块 vs CPU marlin 参考)

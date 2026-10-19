@@ -84,37 +84,56 @@ impl Embedding {
 
     /// untied(lm_head 独立权重;f16 直读;测试 fixture/mtp/dflash2 同构)
     pub fn new_untied(vocab: usize, d_dim: usize) -> Embedding {
-        Embedding {
-            w: Weight::new("weight", vec![vocab, d_dim]),
-            lm_head: Some(Linear::new("lm_head", vocab, d_dim, QuantPlan::F16)),
-            d_dim,
-            vocab,
-            gguf_ty: None,
-        }
+        Embedding::new_untied_quant(vocab, d_dim, QuantPlan::F16)
     }
 
-    /// **untied + 两个独立计划**(C1 生产入口 + GGUF 档):
-    /// - `table_plan` = **表**自己的计划(GGUF 档是逐张量事实:27B 的
-    ///   `token_embd` = Q4_K ⇒ 必须走块槽,否则源侧响亮拒);
-    /// - `head_plan` = `lm_head` 的计划(plan 量化且 eligible ⇒ marlin 臂)。
-    ///
-    /// tied/untied 只决定"表兼不兼做头",与"表怎么存"正交(见 `set_table_plan`)。
-    pub fn new_untied_quant(
+    /// untied + 头部量化计划(C1 生产入口;plan 量化且 eligible 时
+    /// lm_head 走 marlin 臂,否则 f16 直读)
+    pub fn new_untied_quant(vocab: usize, d_dim: usize, plan: QuantPlan) -> Embedding {
+        Embedding::new_untied_head(vocab, vocab, d_dim, plan) // 全量头(= 词表切关)
+    }
+
+    /// **untied + 词表切**(P1.1):embed 表**全量**,lm_head 只建 `head_vocab` 行。
+    pub fn new_untied_head(vocab: usize, head_vocab: usize, d_dim: usize, plan: QuantPlan) -> Embedding {
+        let head = Linear::new("lm_head", head_vocab, d_dim, plan);
+        let head = if head_vocab < vocab {
+            head.with_tp_rule(crate::plan::rules::WeightRule::UniformCol)
+        } else {
+            head
+        };
+        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: Some(head), d_dim, vocab, gguf_ty: None }
+    }
+
+    /// **untied + 词表切 + 表/头两个独立计划**(并集:GGUF 27B 的真实形态 ——
+    /// `token_embd` = Q4_K、`output.weight` = Q6_K,且词表切档 `head_vocab < vocab`)
+    pub fn new_untied_head_two_plans(
         vocab: usize,
+        head_vocab: usize,
         d_dim: usize,
         table_plan: QuantPlan,
         head_plan: QuantPlan,
     ) -> Result<Embedding, crate::contract::ModelError> {
-        let mut e = Embedding {
-            w: Weight::new("weight", vec![vocab, d_dim]),
-            lm_head: Some(Linear::new("lm_head", vocab, d_dim, head_plan)),
-            d_dim,
-            vocab,
-            gguf_ty: None,
-        };
+        let mut e = Embedding::new_untied_head(vocab, head_vocab, d_dim, head_plan);
         e.set_table_plan(table_plan)?;
         Ok(e)
     }
+
+    /// 头部 TP 规则(**只读**;判据用;tied = None ⇒ 取 embed 表规则 = Replicate)
+    pub fn head_rule(&self) -> crate::plan::rules::WeightRule {
+        match &self.lm_head {
+            Some(lin) => lin.tp_rule(),
+            None => crate::plan::rules::WeightRule::Replicate,
+        }
+    }
+
+    /// 头部输出行数(= 本 rank 的 logits 宽度;tied = 词表全量)
+    pub fn head_vocab(&self) -> usize {
+        match &self.lm_head {
+            Some(lin) => lin.out_dim(),
+            None => self.w.decl().shape[0],
+        }
+    }
+
 
     /// untied lm_head 槽装载声明(键 = **局部键** `lm_head[*]`;全键由调用方
     /// 经 [`crate::module::KeyConvention::head_key`] 改写 —— **第 4 类键**:

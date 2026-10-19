@@ -24,6 +24,10 @@ struct SnapEntry {
     last_use: u64,
     /// 重要性档(引擎给的事实;政策在 `plan_snap_offload`)
     durability: SnapDurability,
+    /// **会话归属**(0 = 无归属;会话感知淘汰用)。
+    session: u64,
+    /// **边界块号**(同会话内深度大者先逐 —— 末端优先,保留前缀)。
+    depth: usize,
 }
 
 /// 快照的重要性档(2026-10-19;§9.1(6)a 轮内页边界快照的配套)。
@@ -118,6 +122,8 @@ impl StateStore {
                     tier: Tier::Gpu,
                     bytes: self.row_bytes,
                     last_use: tick,
+                    session: crate::policy::NO_SESSION,
+                    depth: 0,
                     durability: SnapDurability::Durable,
                 },
             );
@@ -141,6 +147,20 @@ impl StateStore {
         tier: Tier,
         durability: SnapDurability,
     ) {
+        self.register_snap_owned(key, bytes, tier, durability, crate::policy::NO_SESSION, 0);
+    }
+
+    /// **带会话归属的登记**(2026-10-19 会话感知淘汰):`session` = 该快照属于谁,
+    /// `depth` = 边界块号(同会话内**深者先逐**,保留链头前缀)。
+    pub fn register_snap_owned(
+        &mut self,
+        key: SnapKey,
+        bytes: usize,
+        tier: Tier,
+        durability: SnapDurability,
+        session: u64,
+        depth: usize,
+    ) {
         self.tick += 1;
         let tick = self.tick;
         match self.snaps.get_mut(&key) {
@@ -149,11 +169,25 @@ impl StateStore {
                 e.tier = tier;
                 e.bytes = bytes;
                 e.durability = durability;
+                if session != crate::policy::NO_SESSION {
+                    e.session = session;
+                }
+                if depth != 0 {
+                    e.depth = depth;
+                }
             }
             None => {
-                self.snaps.insert(key, SnapEntry { tier, bytes, last_use: tick, durability });
+                self.snaps.insert(
+                    key,
+                    SnapEntry { tier, bytes, last_use: tick, durability, session, depth },
+                );
             }
         }
+    }
+
+    /// **会话归属与边界深度**(不在账 = `None`;诊断/门用)。
+    pub fn snap_session(&self, key: SnapKey) -> Option<(u64, usize)> {
+        self.snaps.get(&key).map(|s| (s.session, s.depth))
     }
 
     /// 一条快照的字节(不在账 = `None`)。
@@ -227,6 +261,8 @@ impl StateStore {
                 last_use: s.last_use,
                 chain: None,
                 snap: Some(*k),
+                session: s.session,
+                depth: s.depth,
             })
             .collect()
     }

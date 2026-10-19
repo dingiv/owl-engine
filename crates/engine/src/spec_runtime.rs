@@ -58,6 +58,21 @@ pub(crate) struct SpecRuntime {
     pub draft_rope: Option<Arc<Rope>>,
     /// DFlash2 target taps 数(dflash 模式 = 5;其余 0)
     pub dflash_tap_count: usize,
+    /// **草稿池几何**(层数, hkv, hd;**分片后**;P2.1-b)—— 池分配/预算的单源。
+    /// `None` = 非 DFlash2 档(池不分配)
+    pub draft_geom: Option<(usize, usize, usize)>,
+    /// **草稿算子环境**(2026-10-19):池面之外的另一半几何事实 ——
+    /// `head_dim`/`grp` 取**草稿自己的**(DFlash2 = 128 / hq÷hkv),其余字段
+    /// (硬件档/池量化/分派旋钮)与引擎 env 同源。
+    ///
+    /// **为什么单列**:草稿与主模型共用同一个 face ⇒ `face.op_env()` 只有
+    /// 目标几何(hd=256);草稿的 `attn.naive_nc`(hd=**128**)若按目标几何解析,
+    /// F16 变体在几何门响亮拒,BF16 变体的 ShapeFamily 曾过宽 ⇒ **静默按错几何**
+    /// (2026-10-10 悬案的真因)。MTP/无草稿档 = 引擎 env(同一份)。
+    pub draft_env: owl_models::env::EnvProvider,
+    /// 草稿**权重/激活/池**的 dtype(单源 `qwen35::draft_exec_dt` = 恒 BF16;
+    /// F16 路在 propose 残差流上溢出 —— 定谳见该函数注)
+    pub draft_dt: owl_models::contract::Dtype,
     /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
     pub stats: SpecStats,
     /// taps/memory 探针落盘一次性门(OWL_DFLASH_PROBE;AL=0 排查)
@@ -95,6 +110,15 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) draft_kv_fp8: bool,
     /// DFlash2 taps 退回 last_hidden(排查开关)
     pub(crate) notaps: bool,
+    /// **本 rank 的 TP 计划**(P2.1-a;`None`/`is_single()` = 单卡 ⇒ 逐字节旧行为)。
+    /// 草稿族双 rank 化的**唯一形状/装载单源**:草稿 spec 按它切、草稿权重按它装、
+    /// 草稿 rope 按它分片 —— 与主干同 TpPlan(vLLM/SGLang 形态:同 TP group)。
+    pub(crate) tp: Option<owl_models::plan::tp::TpPlan>,
+    /// **装载旋钮**(`[load]`;与主干 loader 同源 —— 一处配置两处消费)
+    pub(crate) load: owl_shared::config::LoadCfg,
+    /// **引擎 env 快照**(已合入目标几何/硬件档;草稿环境以它为基底 ——
+    /// 只覆盖草稿自己的几何,见 [`SpecRuntime::draft_env`])
+    pub(crate) base_env: owl_models::env::EnvProvider,
 }
 
 /// **E5-M2b/C7:spec 模式三态裁决** + 草稿器装载(草稿 embed/lm_head
@@ -135,6 +159,8 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         );
     }
     // 草稿器装载(C7;embed/lm_head 均共享 target)
+    // 草稿 dtype:缺省 BF16(量化族/无草稿);DFlash2 分支按**检查点事实**改写
+    let mut draft_dt = owl_models::contract::Dtype::BF16;
     let drafter = match mode {
         SpecMode::Mtp => {
             let dir = inp.mtp_dir.ok_or_else(|| ModelError::EngineInvariant { what: "Mtp 模式缺 mtp_dir(模式裁决与输入不一致)".into() })?;
@@ -146,22 +172,37 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     &owl_models::formats::qwen35::qwen3_8_27b(),
                 ),
             )?;
+            // P2.1-a:草稿与主干同 TpPlan(单卡 ⇒ `sharded` 恒等)
+            let spec = shard_draft_plan(spec, inp.tp)?;
             let mtp = owl_models::layers::mtp::MtpPredictor::from_spec(&spec);
-            let opts = owl_models::formats::load::LoadOpts::new(face, owl_models::contract::Dtype::F16);
+            let opts = draft_load_opts(face, owl_models::contract::Dtype::F16, inp.tp, &inp.load);
             owl_models::formats::load::load_from_dir(std::path::Path::new(dir), face, &mtp, opts).await?;
             owl_shared::log_info!("boot", "MTP 草稿头装载(spec depth={depth})");
             Some(Drafter::Mtp(Arc::new(mtp)))
         }
         SpecMode::DFlash2 => {
+            // (draft_dt 在外层声明:下面按检查点事实改写)
             let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant { what: "DFlash2 模式缺 dflash2_dir(模式裁决与输入不一致)".into() })?;
             let t_draft = std::time::Instant::now();
             // 声明:草稿检查点自己的 config(组件档)+ 起点格式探测 → fc 臂;
             // 装载走通用入口(BF16 全程;设备重排 = 能力自述裁决)
-            let d2 = owl_models::formats::qwen35::dflash2_draft(
-                std::path::Path::new(dir),
-                inp.draft_kv_fp8,
-            )?;
-            let opts = owl_models::formats::load::LoadOpts::new(face, owl_models::contract::Dtype::BF16);
+            let d2 = match inp.tp {
+                Some(tp) if !tp.is_single() => {
+                    owl_models::formats::qwen35::dflash2_draft_sharded(
+                        std::path::Path::new(dir),
+                        inp.draft_kv_fp8,
+                        tp,
+                    )?
+                }
+                _ => owl_models::formats::qwen35::dflash2_draft(
+                    std::path::Path::new(dir),
+                    inp.draft_kv_fp8,
+                )?,
+            };
+            // 草稿装载 dtype = **草稿执行 dtype 单源**(恒 BF16;F16 路在
+            // propose 残差流上溢出 —— 定谳见 `qwen35::draft_exec_dt` 注)
+            draft_dt = owl_models::formats::qwen35::draft_exec_dt();
+            let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
             let draft_manifest =
                 owl_models::formats::load::load_from_dir(std::path::Path::new(dir), face, &d2, opts).await?;
             owl_models::formats::load::manifest_mem_ledger(&draft_manifest, "draft-mem");
@@ -174,13 +215,19 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     let draft_rope = match &drafter {
         Some(Drafter::DFlash2(_)) => {
             let dr = Rope::new(262_144, 128, 128, 1.0e7)?;
+            let (shard, slice_id) = match inp.tp {
+                Some(tp) => (tp.world(), tp.rank()),
+                None => (1, 0),
+            };
             let ctx = owl_models::module::LoaderCtx {
                 dtype: owl_models::contract::Dtype::F16,
-                shard: 1,
-                slice_id: 0,
+                shard,
+                slice_id,
                 device_repack: false,
                 verify: false,
                 debug_tap: false,
+                staging_mb: inp.load.staging_mb,
+                dump: false,
             };
             owl_models::interpreters::eval_load(&dr, face, &dr.tables(), &ctx).await?;
             Some(Arc::new(dr))
@@ -189,12 +236,32 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     };
     // DFlash2 target taps 数(dflash 模式 = 5 层;notaps 退 last_hidden = 0)
     let dflash_tap_count = if mode == SpecMode::DFlash2 && !inp.notaps { 5 } else { 0 };
+    // 草稿池几何(**分片后**;P2.1-b):从检查点声明 + 本 rank 计划算(不再用写死的 const)
+    let (draft_geom, draft_env) = match (&drafter, inp.dflash2_dir) {
+        (Some(Drafter::DFlash2(_)), Some(dir)) => {
+            let tp = inp.tp.unwrap_or_else(owl_models::plan::tp::TpPlan::single);
+            let g = owl_models::formats::qwen35::dflash2_draft_geom(
+                std::path::Path::new(dir),
+                tp,
+            )?;
+            // 草稿算子环境 = 引擎 env + **草稿几何**(几何门对账的单一来源;
+            // 主模型路径不消费本字段 ⇒ 逐字节不变)
+            let mut env = inp.base_env;
+            env.kv.head_dim = g.hd;
+            env.kv.grp = g.grp();
+            (Some((g.layers, g.hkv, g.hd)), env)
+        }
+        _ => (None, inp.base_env),
+    };
     Ok(SpecRuntime {
         depth,
         mode,
         drafter,
         draft_rope,
         dflash_tap_count,
+        draft_geom,
+        draft_env,
+        draft_dt,
         stats: SpecStats::default(),
         mem_dumped: false,
         mem_dumped2: false,
@@ -205,3 +272,42 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     })
 }
 
+
+/// **草稿装载 opts**(P2.1-a):与 [`LoadOpts::new`] 同律,只把分片协议换成
+/// 本 rank 的(`tp = None`/单卡 ⇒ 与旧路径逐字节同物)。
+fn draft_load_opts<D: DeviceClient>(
+    face: &D,
+    dtype: owl_models::contract::Dtype,
+    tp: Option<owl_models::plan::tp::TpPlan>,
+    load: &owl_shared::config::LoadCfg,
+) -> owl_models::formats::load::LoadOpts {
+    let mut base = owl_models::formats::load::LoadOpts::new(face, dtype);
+    // **与主干 loader 同源**(一处配置两处消费)
+    base.verify = load.verify;
+    base.debug_tap = load.debug_tap;
+    base.staging_mb = load.staging_mb;
+    base.dump = load.dump;
+    if let Ok(Some(dev)) = load.repack_device() {
+        base.device_repack = Some(dev);
+    }
+    match tp {
+        Some(tp) if !tp.is_single() => owl_models::formats::load::LoadOpts {
+            shard: tp.world(),
+            slice_id: tp.rank(),
+            ..base
+        },
+        _ => base,
+    }
+}
+
+/// **草稿 spec 分片**(P2.1-a;纯函数委托 —— 形状单源在
+/// `formats::qwen35::shard_draft_spec`,此处只做 `Option` 适配)。
+fn shard_draft_plan(
+    spec: owl_models::model::ModelSpec,
+    tp: Option<owl_models::plan::tp::TpPlan>,
+) -> Result<owl_models::model::ModelSpec> {
+    match tp {
+        Some(tp) if !tp.is_single() => owl_models::formats::qwen35::shard_draft_spec(spec, tp),
+        _ => Ok(spec),
+    }
+}

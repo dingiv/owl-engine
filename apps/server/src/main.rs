@@ -78,8 +78,12 @@ const ENGINE_STACK_BYTES: usize = 32 << 20;
 
 /// **诊断投影面共享单元**(`/debug/blocks` 的 GPU 命令出口)。
 /// 显式依赖律:不做全局变量 —— `main` 建、actor 装、HTTP 读,全走参数。
-type DbgFace =
-    std::sync::Arc<std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<owl_cuda::GpuClient>>>>;
+/// 类型 = **设备句柄**(`DeviceHandle<GpuClient>`;2026-10-19 步 3:face 收编到句柄)。
+/// 注意:句柄的账本单元是 `Arc<Mutex<..>>`(真 Send)⇒ 送到 HTTP 线程是安全的
+/// ——这正是选 `Arc<Mutex>` 而不是 `Rc<RefCell>` 的实证理由(设计卷 §十二)。
+type DbgFace = std::sync::Arc<
+    std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<owl_engine::GpuFace>>>,
+>;
 
 #[tokio::main]
 async fn main() {
@@ -93,6 +97,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if args.help {
+        eprintln!("{}", crate::config::HELP);
+        return;
+    }
     if args.list_flavors {
         eprintln!("可用 flavor:");
         for n in owl_shared::flavors::preset_names() {
@@ -100,11 +108,42 @@ async fn main() {
         }
         return;
     }
-    // 配置:四层叠加(Default → Flavor → 文件 → CLI),非法即拒
-    let config = match ServerConfig::load(args.flavor.as_deref(), args.config.as_deref(), &args) {
-        Ok(c) => c,
+    if args.list_profiles {
+        eprintln!("可用意图档(--profile):");
+        for n in owl_shared::flavors::profile_names() {
+            eprintln!("  {n}");
+        }
+        return;
+    }
+    // 配置:意图/预设 → 位置参数 → 站点 → CLI(非法即拒;**预检不解意图不选卡**)
+    let resolved = match ServerConfig::load_resolved(&args) {
+        Ok(r) => r,
         Err(e) => {
             // 拒启必须可见(A1):此刻 logger 尚未初始化,`log_info!` 会被丢弃
+            eprintln!("[boot] 配置非法: {e}");
+            std::process::exit(1);
+        }
+    };
+    // `--check` / `--print-config` / `--explain`:不加载权重、不选卡、不起引擎
+    if args.check || args.print_config || !args.explain.is_empty() {
+        match crate::config::inspect(&args, &resolved) {
+            Ok(()) => return,
+            // 预检报告已把 FAIL 行打在 stdout/stderr,这里只置退出码(不重复刷屏)
+            Err(e) if e.contains("预检未通过") => std::process::exit(1),
+            Err(e) => {
+                eprintln!("[config] FAIL: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // boot 一行摘要(意图档;详细依据用 --check / --print-config)
+    if let Some(line) = crate::config::summary_line(&resolved) {
+        eprintln!("{line}");
+    }
+    // 完整解析 → server 形态(选卡在这里;预检已提前返回)
+    let config = match ServerConfig::from_resolved(resolved, &args) {
+        Ok(c) => c,
+        Err(e) => {
             eprintln!("[boot] 配置非法: {e}");
             std::process::exit(1);
         }
@@ -431,7 +470,7 @@ async fn load_shard(
     rank: usize,
     world: usize,
 ) -> owl_engine::Result<owl_engine::LoadedModel> {
-    let mut loader = engine.loader().slice(rank, world);
+    let mut loader = engine.loader().slice(rank, world).vocab_split(config.tp_vocab_split);
     match config.model_kind {
         ModelKind::Awq27b => {
             // 量化方案映射(唯一点 owl_engine::{head_plan_of, quant_plan_of})
@@ -485,7 +524,7 @@ async fn actor_main(
             // 分片装载 → `TpEngine::assemble`(分档 / staging 对称握手**在建图
             // 之前** / 每 rank `boot_rank`)→ `run`(rank0 束 = 主设备面,
             // rank1 束 = peer)。**actor/HTTP 面零改动** —— `run()` 返回同型
-            // `RunningEngine<GpuClient>`。
+            // `RunningEngine<owl_engine::GpuFace>`。
             2 => {
                 let ord = config.devices.ordinals();
                 let model0 = load_shard(&config, &mut engine, 0, 2).await?;
@@ -501,9 +540,19 @@ async fn actor_main(
                 let tp = owl_engine::TpEngine::assemble_with(
                     vec![engine, engine1],
                     vec![model0, model1],
-                    owl_engine::TpOpts { push: config.tp_push },
+                    owl_engine::TpOpts {
+                        push: config.tp_push,
+                        ar_f8: config.tp_ar_f8,
+                        ar_fused: config.tp_ar_fused,
+                    },
                 )
                 .await?;
+                if config.tp_ar_f8 {
+                    owl_shared::log_info!(
+                        "boot",
+                        "TP2 **AR fp8 载荷档**已开(runtime.tp_ar_f8):载荷 e4m3(1.031×)"
+                    );
+                }
                 if config.tp_push {
                     owl_shared::log_info!(
                         "boot",
@@ -832,6 +881,26 @@ async fn handle(
             v["applied"] = json!(ok);
             v["action"] = json!(msg);
             http::respond_json(&mut stream, 200, &v).await?;
+        }
+        // **store 账查询面**(第 0 刀;`/debug/vram`):三层账 + **owner 维明细**。
+        // 纯读账(零副作用、零搬运)—— 泄漏判据面:同一 owner 字节逐轮爬坡 = 漏。
+        ("GET", "/debug/vram") => {
+            let (rtx, rrx) = tokio::sync::oneshot::channel();
+            if ctx.tx.clone().send(EngineReq::VramReport { reply: rtx }).await.is_err() {
+                http::respond_json(&mut stream, 503, &openai::error_json("引擎退役")).await?;
+                return Ok(());
+            }
+            match rrx.await {
+                Ok(rep) => http::respond_json(&mut stream, 200, &debug::vram_json(&rep)).await?,
+                Err(_) => {
+                    http::respond_json(
+                        &mut stream,
+                        503,
+                        &openai::error_json("引擎连接中断(vram 账应答通道关闭)"),
+                    )
+                    .await?
+                }
+            }
         }
         // **块账本投影**(判"同 id 两地址 / 两活块区间相交";与发射账互补:
         // 那张账 = 每次命令的块 id+地址,本投影 = 当前账本的权威快照)

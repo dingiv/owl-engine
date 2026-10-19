@@ -238,6 +238,8 @@ mod tests {
                 device_repack: false,
                 verify: false,
                 debug_tap: false,
+                            staging_mb: 128,
+                dump: false,
             };
             let ops = model.layout(&ctx);
 

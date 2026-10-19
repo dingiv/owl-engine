@@ -161,7 +161,7 @@ async fn smoke_scenario(key: &str, n_layers: usize, n_gdn: usize, want_first: &s
     // 只有全走一遍才谈得上"全量记名"。
     if let Some(f) = running.face_clone() {
         use owl_iface::contract::DeviceClient as _;
-        let rep = f.ledger_report(8).await.expect("ledger_report");
+        let rep = f.client().ledger_report(8).await.expect("ledger_report");
         assert!(
             !rep.contains("(未命名!)"),
             "块账出现未命名块(全量记名漏网 ⇒ OOM 现场问不出\"谁占着\"):{rep}"
@@ -169,7 +169,7 @@ async fn smoke_scenario(key: &str, n_layers: usize, n_gdn: usize, want_first: &s
         eprintln!("[gguf-e2e] 账本(前 8 类,零未命名)= {rep}");
         // 块账按**权重键**记名(`wt.<键>`)—— 全表 JSON 里必须看得到 24 张列序表
         // (虚拟键也是权重槽,一样要记名:OOM 现场"谁占着"才答得出来)
-        let js = f.ledger_json().await.expect("ledger_json");
+        let js = f.client().ledger_json().await.expect("ledger_json");
         let n_perm = js.matches("ssm_out.perm").count();
         assert_eq!(
             n_perm, n_gdn,
@@ -374,8 +374,8 @@ fn tp2_entry(key: &'static str, layers: usize, want_first: &'static str) {
 
 /// 首步 logits(与 `tp_logits_27b` 同法:`submit_session_ex(…, want_logits)`)
 #[cfg(test)]
-async fn first_logits_gguf(
-    running: &mut RunningEngine<owl_cuda::GpuClient>,
+async fn first_logits_gguf<D: owl_iface::contract::DeviceClient>(
+    running: &mut RunningEngine<D>,
     prompt: &str,
 ) -> Vec<f32> {
     let (sid, turn) = running.submit_session_ex(Some(1), prompt, 1, true).expect("submit");

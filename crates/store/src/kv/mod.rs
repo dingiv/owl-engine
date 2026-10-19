@@ -82,6 +82,9 @@ pub struct KvStats {
 
 /// attention 块腿(槽池 + 前缀树)。
 pub struct KvStore {
+    /// **会话归属**(链 → session id;2026-10-19 会话感知淘汰;0/缺省 = 无归属)。
+    /// 共享前缀的块归**最后登记它的会话**(最近的会话更相关)。
+    owners: std::collections::BTreeMap<ChainHash, u64>,
     pool: SlotPool,
     tree: PrefixTree,
     block_tokens: usize,
@@ -97,6 +100,7 @@ impl KvStore {
     /// `cache_cap` = 前缀缓存块数上限(0 = 关缓存,树不匹配不登记)。
     pub fn new(slots: usize, block_tokens: usize, block_bytes: usize, cache_cap: usize) -> Self {
         Self {
+            owners: std::collections::BTreeMap::new(),
             pool: SlotPool::new(slots),
             tree: PrefixTree::new(block_tokens, cache_cap),
             block_tokens,
@@ -286,7 +290,9 @@ impl KvStore {
         let up = self.tree.insert(tokens, table);
         let mut out = CacheUpdate::default();
         for (chain, slot) in &up.inserted {
-            self.pool.incref(*slot)?;
+            if let Some(slot) = slot {
+                self.pool.incref(*slot)?;
+            }
             out.inserted.push(*chain);
         }
         for (chain, slot) in &up.evicted {
@@ -297,6 +303,92 @@ impl KvStore {
             out.evicted.push((*chain, *slot));
         }
         Ok(out)
+    }
+
+    /// **整链搬盘的候选**(S6.1):宿主里任意条目为锚 → 回溯链尾 → **整链都在宿主**
+    /// 才出票(否则盘上只有部分块,重启重建不出从根连续的前缀)。
+    ///
+    /// 返回 `(链尾, 整链块数, 最老锚的 last_use)`,按最老在前。
+    pub fn host_chain_candidates(&self, protect: &[ChainHash]) -> Vec<(ChainHash, usize, u64)> {
+        use std::collections::BTreeMap;
+        // **锚必须是叶**(链尾):以任意宿主块为锚会退化成"根前缀"(span=1),
+        // 真机定谳:那样只把根块搬盘 ⇒ 重启只能重建 1-2 块前缀。
+        // 条件:叶在宿主 **且** 从根到叶的整条链都在宿主(否则盘上只有半链)。
+        let mut out: Vec<(ChainHash, usize, u64)> = Vec::new();
+        for (leaf, access, slot) in self.tree.leaves() {
+            if slot.is_some() {
+                continue; // 叶还在设备(轮一该管)
+            }
+            if protect.contains(&leaf) {
+                continue;
+            }
+            let chain = self.tree.chain_of(leaf);
+            if chain.iter().any(|b| b.slot.is_some()) {
+                continue; // 整链必须都在宿主
+            }
+            out.push((leaf, chain.len(), access));
+        }
+        out.sort_by_key(|(_, _, t)| *t);
+        out
+    }
+
+    /// **会话归属查询**(0 = 无归属)。
+    pub fn session_of(&self, chain: ChainHash) -> u64 {
+        self.owners
+            .get(&chain)
+            .copied()
+            .unwrap_or(crate::policy::NO_SESSION)
+    }
+
+    /// **块在链上的深度**(从根到该块的块数;1 = 根块)。
+    pub fn depth_of(&self, chain: ChainHash) -> usize {
+        self.tree.chain_of(chain).len()
+    }
+
+    /// **带会话归属的链登记**(2026-10-19 会话感知淘汰;turn 收口用)。
+    /// 语义同 [`Self::register_chain`],额外把新入树的块记到 `session` 名下。
+    pub fn register_chain_owned(
+        &mut self,
+        tokens: &[u32],
+        table: &[u32],
+        session: u64,
+    ) -> StoreResult<CacheUpdate> {
+        let up = self.register_chain(tokens, table)?;
+        if session != crate::policy::NO_SESSION {
+            for c in &up.inserted {
+                self.owners.insert(*c, session);
+            }
+        }
+        Ok(up)
+    }
+
+    /// 绑定归属(增量登记路径用:已知本次新增的块身份)。
+    pub fn set_owner(&mut self, session: u64, chains: &[ChainHash]) {
+        if session == crate::policy::NO_SESSION {
+            return;
+        }
+        for c in chains {
+            self.owners.insert(*c, session);
+        }
+    }
+
+    /// **无设备绑定的链登记**(S6.1:启动按盘上索引重建树)。
+    ///
+    /// 返回 `(新登记块身份, 因容量被逐的条目)`。内容不在设备 ⇒ **不占槽**
+    /// (`slot = None`);容量收口沿用树的 `cap`(逐出只摘树条目,不碰槽)。
+    pub fn register_chain_offloaded(
+        &mut self,
+        tokens: &[u32],
+    ) -> StoreResult<(Vec<ChainHash>, Vec<(ChainHash, Option<u32>)>)> {
+        let up = self.tree.insert_offloaded(tokens);
+        let inserted: Vec<ChainHash> = up.inserted.iter().map(|(c, _)| *c).collect();
+        for (_chain, slot) in &up.evicted {
+            if let Some(slot) = slot {
+                self.pool.decref(*slot)?;
+            }
+            self.evicted += 1;
+        }
+        Ok((inserted, up.evicted))
     }
 
     /// **增量登记**(B-3e-2 第 2b 项):从已注册的链尾续挂本次新增的整块。
@@ -312,7 +404,9 @@ impl KvStore {
         let up = self.tree.insert_inc(parent0, blocks);
         let mut out = CacheUpdate::default();
         for (chain, slot) in &up.inserted {
-            self.pool.incref(*slot)?;
+            if let Some(slot) = slot {
+                self.pool.incref(*slot)?;
+            }
             out.inserted.push(*chain);
         }
         for (chain, slot) in &up.evicted {
@@ -360,8 +454,24 @@ impl KvStore {
                 last_use,
                 chain: Some(chain),
                 snap: None,
+                session: self.session_of(chain),
+                depth: self.depth_of(chain),
             })
             .collect()
+    }
+
+    /// **标记条目在宿主层**(S6:KP 腿的盘层搬运用):摘掉设备绑定(**槽还池**),
+    /// 条目留在树里(`locate` 从此归 `Tier::Host`)。返回原绑定槽(若有)。
+    pub fn mark_host(&mut self, chain: ChainHash) -> StoreResult<Option<u32>> {
+        match self.tree.set_slot(chain, None) {
+            None => Err(StoreError::Unknown(format!("块 {chain:?} 不在缓存树里"))),
+            Some(slot) => {
+                if let Some(s) = slot {
+                    self.pool.decref(s)?;
+                }
+                Ok(slot)
+            }
+        }
     }
 
     /// 定位一块(内容身份 → 所在层)。

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use owl_shared::config::OwlConfig;
+use owl_shared::config::{OwlConfig, ResolvedConfig};
 pub use owl_shared::config::ModelKind;
 
 // ── app 面缺省(总账外的 server 组装缺省;R2 命名常量)──
@@ -23,10 +23,27 @@ const DEFAULT_MODEL_NAME: &str = "qwen3.5-0.8b";
 pub struct CliArgs {
     /// 位置参数:配置文件路径(OWL_CONFIG env 兜底;都不给 = 纯 flavor/缺省)
     pub config: Option<PathBuf>,
-    /// --flavor <NAME>:内置命名预设
+    /// --flavor <NAME>:内置命名预设(行为面整数十行;旧档)
     pub flavor: Option<String>,
-    /// --list-flavors:列出可用预设后退出
+    /// --profile <NAME>:**意图档**(`profiles/<NAME>.toml`;6–10 行意图)
+    pub profile: Option<String>,
+    /// --site <PATH>:站点层(路径/卡位/端口;`[site]` 或普通配置表)
+    pub site: Option<PathBuf>,
+    /// --list-flavors / --list-profiles:列出可用档后退出
     pub list_flavors: bool,
+    pub list_profiles: bool,
+    /// --help:打印用法后退出
+    pub help: bool,
+    /// --check:预检(不加载权重;打印意图派生/内存账/文件校验)
+    pub check: bool,
+    /// --print-config:打印生效配置(TOML,或 `--format json` 含来源/估算)
+    pub print_config: bool,
+    /// --format <toml|json>(`--print-config` 用;缺省 toml)
+    pub format: Option<String>,
+    /// --explain <KEY>:解释单键(点路径;可重复)
+    pub explain: Vec<String>,
+    /// --set <KEY=VALUE>:临时覆盖(点路径;可重复;替代启动脚本里的 extends 拼档)
+    pub sets: Vec<(String, toml::Value)>,
     /// --perf-dump <PATH>:每 turn 终了覆写性能账(CSV + 同名 .json;
     /// 见 docs/arch/perf-framework.md §三)
     pub perf_dump: Option<PathBuf>,
@@ -62,7 +79,36 @@ impl CliArgs {
                         it.next().ok_or("--flavor 需要值(--list-flavors 查可用档)")?,
                     );
                 }
+                "--profile" => {
+                    out.profile = Some(
+                        it.next().ok_or("--profile 需要值(--list-profiles 查可用档)")?,
+                    );
+                }
+                "--site" => {
+                    out.site = Some(PathBuf::from(
+                        it.next().ok_or("--site 需要路径(站点档:[site] 或普通配置表)")?,
+                    ));
+                }
                 "--list-flavors" => out.list_flavors = true,
+                "--list-profiles" => out.list_profiles = true,
+                "--check" => out.check = true,
+                "--print-config" => out.print_config = true,
+                "--format" => {
+                    let v = it.next().ok_or("--format 需要值(toml|json)")?;
+                    if !matches!(v.as_str(), "toml" | "json") {
+                        return Err(format!("--format 非法值 {v:?}(toml|json)"));
+                    }
+                    out.format = Some(v);
+                }
+                "--explain" => {
+                    out.explain.push(
+                        it.next().ok_or("--explain 需要键(点路径,如 pool.pool_tokens)")?,
+                    );
+                }
+                "--set" => {
+                    let raw = it.next().ok_or("--set 需要 key=value(点路径)")?;
+                    out.sets.push(owl_shared::config::parse_cli_set(&raw)?);
+                }
                 "--perf-dump" => {
                     out.perf_dump = Some(PathBuf::from(
                         it.next().ok_or("--perf-dump 需要路径(CSV 基名;同名 .json 一并写)")?,
@@ -114,9 +160,10 @@ impl CliArgs {
                         v.parse().map_err(|_| format!("--step-gate-every 非法值 {v:?}"))?,
                     );
                 }
+                "--help" | "-h" => out.help = true,
                 _ if a.starts_with('-') => {
                     return Err(format!(
-                        "未知参数 {a:?}(支持:[CONFIG] --flavor <N> --perf-dump <PATH> --perf-level <L> --log-level <L> --log-file <P> --list-flavors)"
+                        "未知参数 {a:?}\n\n{HELP}"
                     ));
                 }
                 _ => {
@@ -127,9 +174,61 @@ impl CliArgs {
                 }
             }
         }
+        if out.profile.is_some() && out.flavor.is_some() {
+            return Err("--profile 与 --flavor 互斥(意图档 vs 旧预设档;二选一)".into());
+        }
         Ok(out)
     }
+
+    /// **CLI 覆盖层**(与 `--set` 同一条合并链;来源 = `cli`)
+    ///
+    /// 日志/性能/调试门旗标也走这里 ⇒ `--print-config` 看到的就是 boot 用的
+    /// 同一份配置(不再有 "print 之后 ServerConfig 再改一遍" 的双源)。
+    pub fn overrides(&self) -> Vec<(String, toml::Value)> {
+        let mut v = self.sets.clone();
+        let mut push = |k: &str, val: toml::Value| v.push((k.to_string(), val));
+        if let Some(x) = &self.log_level {
+            push("log.level", toml::Value::String(x.clone()));
+        }
+        if let Some(x) = &self.log_file {
+            push(
+                "log.file",
+                toml::Value::String(x.display().to_string()),
+            );
+        }
+        if let Some(x) = &self.perf_level {
+            push("probes.perf_level", toml::Value::String(x.clone()));
+        }
+        if let Some(x) = &self.step_gate {
+            push("probes.step_gate", toml::Value::String(x.clone()));
+        }
+        if let Some(x) = self.step_gate_ms {
+            push("probes.step_gate_ms", toml::Value::Integer(x as i64));
+        }
+        if let Some(x) = self.step_gate_us {
+            push("probes.step_gate_us", toml::Value::Integer(x as i64));
+        }
+        if let Some(x) = self.step_gate_every {
+            push("probes.step_gate_every", toml::Value::Integer(x as i64));
+        }
+        v
+    }
 }
+
+/// 使用说明(打印到 stderr;`--help` / 未知参数)
+pub(crate) const HELP: &str = "用法: server [CONFIG] [选项]\n\
+  --profile <NAME>       意图档(profiles/<NAME>.toml;6–10 行意图)\n\
+  --flavor <NAME>        旧预设档(flavors/<NAME>.toml;与 --profile 互斥)\n\
+  --site <PATH>          站点层(路径/卡位/端口;[site] 或普通配置表)\n\
+  --check                预检(不加载权重;打印派生/内存账/文件校验)\n\
+  --print-config         打印生效配置(缺省 TOML;--format json 含来源/估算)\n\
+  --format <toml|json>   --print-config 的输出格式\n\
+  --explain <KEY>        解释单键(点路径;可重复)\n\
+  --set <KEY=VALUE>      临时覆盖(点路径;可重复)\n\
+  --list-profiles        列出意图档\n\
+  --list-flavors         列出旧预设档\n\
+  --log-level/-file      日志覆盖;--perf-level/--perf-dump 性能账\n\
+  --step-gate[-ms|-us|-every]  单步/粘滞调试门\n";
 
 /// **本进程持有的设备束**(boot 边界定形;rank 序 = 列表序)。
 ///
@@ -184,7 +283,7 @@ impl Devices {
     }
 }
 
-/// 服务配置(唯一构造口 [`ServerConfig::load`];boot 后只读)
+/// 服务配置(构造口 = [`ServerConfig::load_resolved`] + [`ServerConfig::from_resolved`];boot 后只读)
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// 监听地址(OWl_BIND 遗留键已废;runtime.bind)
@@ -213,6 +312,13 @@ pub struct ServerConfig {
     pub max_concurrency: usize,
     /// **TP 通信数据腿:push 档**(runtime.tp_push;2026-10-18 §36.6)⇒ 交 `TpOpts`
     pub tp_push: bool,
+    /// **TP AR 载荷 fp8 档**（runtime.tp_ar_f8；§47 第二步）⇒ 交 `TpOpts.ar_f8`
+    pub tp_ar_f8: bool,
+    /// **lm_head 词表切**（runtime.tp_vocab_split；P1.1）⇒ 装载面
+    /// `ModelSpec::head_split`（每 rank 只持半表头；logits 由引擎 host 拼接）
+    pub tp_vocab_split: bool,
+    /// **v1 两核融合档**（runtime.tp_ar_fused；§11.2）⇒ 交 `TpOpts.ar_fused`
+    pub tp_ar_fused: bool,
     /// 性能账落盘基名(--perf-dump;None = 不落盘)
     pub perf_dump: Option<PathBuf>,
     /// 性能分级(probes.perf_level,可被 --perf-level 覆盖)
@@ -232,54 +338,48 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// boot 边界唯一入口:四层叠加加载 → app 面组装。
     /// `cli` 携带 --perf-dump / --perf-level 两个 app 面覆盖。
-    pub fn load(flavor: Option<&str>, file: Option<&Path>, cli: &CliArgs) -> Result<Self, String> {
-        // 预设档(flavor)= 预先写好的配置文件:入口把名字解析成路径,配置层只认文件
-        let base = match flavor {
-            Some(name) => Some(owl_shared::flavors::preset_path(name)?),
-            None => None,
+    /// **只解析配置 + 意图派生 + 预检元数据**(不选卡、不碰 GPU;`--check` 用)
+    ///
+    /// 层序:`--profile/--flavor` 基准 → 位置参数 CONFIG → `--site` → CLI
+    /// (`--set` / 日志/性能/调试门)。`[intent]` 在同一函数里展开成低层键。
+    pub fn load_resolved(args: &CliArgs) -> Result<ResolvedConfig, String> {
+        let base = match (&args.profile, &args.flavor) {
+            (Some(p), None) => Some(owl_shared::flavors::profile_path(p)?),
+            (None, Some(f)) => Some(owl_shared::flavors::preset_path(f)?),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err("--profile 与 --flavor 互斥(二选一)".into())
+            }
         };
-        let cfg = OwlConfig::load(base.as_deref(), file)?;
+        let mut layers: Vec<&Path> = Vec::new();
+        if let Some(p) = args.config.as_deref() {
+            layers.push(p);
+        }
+        if let Some(p) = args.site.as_deref() {
+            layers.push(p);
+        }
+        let mut resolved =
+            OwlConfig::load_resolved(base.as_deref(), &layers, &args.overrides())?;
+        if let Some(m) = resolved.meta.as_mut() {
+            m.intent.profile = args.profile.clone().or_else(|| args.flavor.clone());
+        }
+        Ok(resolved)
+    }
+
+    /// 完整解析产物 → server 形态(**选卡在这里**;`--check` 不走)。
+    pub fn from_resolved(
+        resolved: ResolvedConfig,
+        args: &CliArgs,
+    ) -> Result<Self, String> {
         // 选卡(S6 2026-10-17 起两条规范:单卡声明式 / TP 显式双卡;互斥):
         //   单卡 = 声明式选卡(2026-10-16):规格 → 设备表过滤 → 剔 gpu_lock 已占
         //          → 取首张(空规格 = 全部候选 ⇒ 自动挑空闲卡);
         //   TP   = `runtime.tp_ordinals` 显式双卡(零自动挑卡,见 resolve_tp_devices);
         //   命中全列日志,无候选/全被占/口径混填 = 响亮拒启。
-        let devices = resolve_devices(&cfg.runtime)?;
-        let mut out = Self::from_config(cfg);
+        let devices = resolve_devices(&resolved.config.runtime)?;
+        let mut out = Self::from_config(resolved.config);
         out.devices = devices;
-        if let Some(l) = cli.perf_level.as_deref() {
-            out.perf_level =
-                owl_shared::metrics::level::parse(l).ok_or("perf-level 非法")?;
-        }
-        out.perf_dump = cli.perf_dump.clone();
-        if let Some(l) = cli.log_level.as_deref() {
-            out.log.level = match owl_shared::log::Level::parse_threshold(l) {
-                Some(v) if v == owl_shared::log::LVL_OFF => owl_shared::config::LogLevel::Off,
-                Some(v) if v == owl_shared::log::LVL_ERROR => owl_shared::config::LogLevel::Error,
-                Some(v) if v == owl_shared::log::LVL_WARN => owl_shared::config::LogLevel::Warn,
-                Some(v) if v == owl_shared::log::LVL_DEBUG => owl_shared::config::LogLevel::Debug,
-                Some(v) if v == owl_shared::log::LVL_TRACE => owl_shared::config::LogLevel::Trace,
-                Some(_) => owl_shared::config::LogLevel::Info,
-                None => return Err("--log-level 非法".into()),
-            };
-        }
-        if let Some(f) = cli.log_file.clone() {
-            out.log.file = Some(f);
-        }
-        // 调试门:CLI 覆盖配置面(档位/间隔/步长;非法档位在 CLI 解析期已拒)
-        if let Some(m) = cli.step_gate.as_deref() {
-            out.step_gate = owl_shared::stepgate::StepMode::parse(m)
-                .ok_or_else(|| format!("--step-gate 非法值 {m:?}"))?;
-        }
-        if let Some(v) = cli.step_gate_ms {
-            out.step_gate_ms = v;
-        }
-        if let Some(v) = cli.step_gate_us {
-            out.step_gate_us = v;
-        }
-        if let Some(v) = cli.step_gate_every {
-            out.step_gate_every = v;
-        }
+        out.perf_dump = args.perf_dump.clone();
         Ok(out)
     }
 
@@ -321,14 +421,17 @@ impl ServerConfig {
             knobs: owl_engine::EngineKnobs::from_config(&cfg),
             // 占位:真值由 `load()` 的声明式选卡回填(设备表 + 卡锁都在那边)
             devices: Devices::placeholder(),
-            // 上下文/池下限:env 覆盖(实测调压用;池容量下限 = 单会话容量 = max_seq/page)
-            max_seq: owl_shared::env_reader::parse("OWL_MAX_SEQ").unwrap_or(cfg.runtime.max_seq),
-            // prefill 块长:env 覆盖(实测调压;它同时决定块边界快照的密度 ⇒ 命中面可复用性,§22)
-            prefill_chunk: owl_shared::env_reader::parse("OWL_PREFILL_CHUNK")
-                .unwrap_or(cfg.runtime.prefill_chunk),
+            // 上下文/块长:**单一来源 = 配置**(2026-10-20 删除 OWL_MAX_SEQ /
+            // OWL_PREFILL_CHUNK —— 它们会在意图派生后再改一次 ⇒ max_seq 与
+            // pool_tokens 失配/池夹死的双源;要临时调请 `--set`）。
+            max_seq: cfg.runtime.max_seq,
+            prefill_chunk: cfg.runtime.prefill_chunk,
             head_quant: cfg.model.head_quant,
             quant: cfg.model.quant,
             tp_push: cfg.runtime.tp_push,
+            tp_ar_f8: cfg.runtime.tp_ar_f8,
+            tp_vocab_split: cfg.runtime.tp_vocab_split,
+            tp_ar_fused: cfg.runtime.tp_ar_fused,
             max_concurrency: cfg.server.max_concurrency,
             perf_dump: None,
             perf_level: cfg.probes.perf_level.to_u8(),
@@ -513,4 +616,424 @@ fn resolve_device(rt: &owl_shared::config::RuntimeCfg) -> Result<(usize, String)
         free.len()
     );
     Ok((picked.ordinal, picked.uuid.clone()))
+}
+
+
+// ============================================================================
+// 预检 / 解释面(`--check` / `--print-config` / `--explain`;不加载权重)
+// ============================================================================
+
+fn gib(bytes: u64) -> String {
+    format!("{:.2}G", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// boot 一行摘要(意图档;设计卷 §9 的最小版)
+///
+/// 位置:配置解析后、选卡/装权重前(裸 `eprintln`,logger 尚未初始化)。
+/// 详细依据用 `--check` / `--print-config`;这里只给"看一眼就知道档对不对"。
+pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
+    let m = r.intent()?;
+    let c = &r.config;
+    let e = r.estimate()?;
+    let arms = format!(
+        "prefill={} decode={} gdn={} bucket={:?}",
+        if c.graph.prefill_bucket == owl_shared::config::PrefillBucket::Off {
+            "eager"
+        } else {
+            "FI"
+        },
+        if c.dispatch.decode_fi {
+            "FI(single)"
+        } else if c.dispatch.decode_xqa {
+            "XQA"
+        } else {
+            "eager"
+        },
+        if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
+        c.graph.prefill_bucket,
+    );
+    Some(format!(
+        "[owl] profile={} card={} ctx={} pool={}({}) {} mem={}/{} (余 {}) reuse={} spec={} c={}",
+        m.profile.as_deref().unwrap_or("(inline)"),
+        m.intent.hardware.as_deref().unwrap_or("auto"),
+        c.runtime.max_seq,
+        c.pool.pool_tokens.unwrap_or(0),
+        gib(e.pool_bytes),
+        arms,
+        gib(e.used_bytes()),
+        gib(e.total_bytes),
+        gib(e.total_bytes.saturating_sub(e.used_bytes())),
+        if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
+        if c.spec.depth > 0 { format!("dflash{}", c.spec.depth) } else { "off".into() },
+        c.server.max_concurrency,
+    ))
+}
+
+/// 预检报告(`--check`):文本 + 是否通过
+pub struct CheckReport {
+    pub text: String,
+    pub ok: bool,
+}
+
+/// `--check`:意图派生 + 内存账 + 模型文件几何校验(不加载权重、不选卡)
+///
+/// 文件几何错误**收集进报告**(不中途返回)⇒ 一次看到全部问题;
+/// 解析/注册表级错误(意图非法等)仍直接 `Err`(没有报告可言)。
+pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
+    let mut out = String::new();
+    let mut ok = true;
+    let c = &r.config;
+    out.push_str(&format!(
+        "[check] layers: {}\n",
+        if r.layers.is_empty() { "(纯缺省)".to_string() } else { r.layers.join(" → ") }
+    ));
+    let intent = r.intent();
+    if let Some(m) = intent {
+        out.push_str(&format!(
+            "[check] intent: model={} hardware={} goal={} context={} concurrency={} \
+             spec={} kv={} kvmem={} graphs={}\n",
+            m.intent.model,
+            m.intent.hardware.as_deref().unwrap_or("(推断)"),
+            m.intent.goal.name(),
+            m.intent.context.name(),
+            m.intent.concurrency,
+            m.intent.spec.name(),
+            m.intent.kv.name(),
+            m.intent.kvmem.name(),
+            m.intent.graphs.name(),
+        ));
+        out.push_str(&format!(
+            "[check] resolved: max_seq={} pool_tokens={} chunk={} tail={} \
+             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={} bucket={:?}\n",
+            c.runtime.max_seq,
+            c.pool.pool_tokens.unwrap_or(0),
+            c.runtime.prefill_chunk,
+            c.runtime.prefill_tail_merge,
+            c.pool.gdn_slots,
+            c.runtime.max_batch,
+            c.server.max_concurrency,
+            c.dispatch.kv_fp8,
+            c.graph.prefill_bucket,
+        ));
+        if let Some(e) = r.estimate() {
+            out.push_str(&format!(
+                "[check] mem: weights {} + fixed {} + pool {} + act {} + margin {} = {} / {} (余 {})\n",
+                gib(e.weights_bytes),
+                gib(e.fixed_bytes),
+                gib(e.pool_bytes),
+                gib(e.activation_bytes),
+                gib(e.stability_margin_bytes),
+                gib(e.used_bytes()),
+                gib(e.total_bytes),
+                gib(e.total_bytes.saturating_sub(e.used_bytes())),
+            ));
+            out.push_str(&format!(
+                "[check] governor: budget {} cap {} tok; pool {} {} cap\n",
+                gib(e.budget_bytes),
+                e.cap_tokens,
+                e.pool_tokens,
+                if e.pool_tokens <= e.cap_tokens { "≤" } else { ">" },
+            ));
+            out.push_str(&format!(
+                "[check] basis: per_tok {}B(主 {} + 草稿 {})·激活 {}·固定 = gdn {} + snap {} + slab {} + warmup {}\n",
+                e.per_tok,
+                e.per_tok_main,
+                e.per_tok_draft,
+                e.activation_note,
+                gib(e.fixed.gdn_grid),
+                gib(e.fixed.gdn_snap),
+                gib(e.fixed.graph_slab),
+                gib(e.fixed.warmup_misc),
+            ));
+            if e.pool_tokens != c.pool.pool_tokens.unwrap_or(0) {
+                out.push_str(
+                    "[check] note: 估算池 ≠ 显式 pool_tokens(非超卖档引擎会把池下限抬到上下文)\n",
+                );
+            }
+        }
+    } else {
+        out.push_str(
+            "[check] 无 [intent]:仅做配置解析/语义门 + 模型几何校验(旧 flavor/testdata 路径)。\n\
+             [check] 要内存账/意图派生,请用 --profile <NAME> 或写 [intent]。\n",
+        );
+        out.push_str(&format!(
+            "[check] resolved: max_seq={} pool_tokens={:?} chunk={} tail={} \
+             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={} bucket={:?}\n",
+            c.runtime.max_seq,
+            c.pool.pool_tokens,
+            c.runtime.prefill_chunk,
+            c.runtime.prefill_tail_merge,
+            c.pool.gdn_slots,
+            c.runtime.max_batch,
+            c.server.max_concurrency,
+            c.dispatch.kv_fp8,
+            c.graph.prefill_bucket,
+        ));
+    }
+
+    // ── 模型/草稿目录几何校验(目录不存在 ⇒ 告警跳过,CI 假路径可跑) ──
+    let profile = match intent {
+        Some(m) => Some(owl_shared::config::intent::model_profile(&m.intent.model)?),
+        None => owl_shared::config::intent::model_by_kind(c.model.kind),
+    };
+    // 27B 没有"缺省资产":不给 dir ⇒ 真启动必失败,`--check` 直接拒;
+    // 0.8B 有 workspace 缺省资产,走它做几何校验。
+    let default_08b = || PathBuf::from(DEFAULT_MODEL_DIR);
+    let dir_owned = match &c.model.dir {
+        Some(d) => Some(d.clone()),
+        None if c.model.kind == ModelKind::Qwen35_08b => Some(default_08b()),
+        None => None,
+    };
+    match (dir_owned.as_deref(), profile) {
+        (Some(dir), Some(p)) => match check_model_dir(dir, p, c.runtime.max_seq) {
+            Ok(Some(note)) => out.push_str(&format!("[check] model dir: {note}\n")),
+            Ok(None) => {}
+            Err(e) => {
+                ok = false;
+                out.push_str(&format!("[check] FAIL: {e}\n"));
+            }
+        },
+        (None, _) => {
+            ok = false;
+            out.push_str(
+                "[check] FAIL: 未配置 [model].dir / [site].model_dir —— 27B 档无法定位检查点\
+                 (真启动必失败);请给站点档\n",
+            );
+        }
+        (Some(_), None) => {
+            out.push_str("[check] model dir: 注册表无该 kind ⇒ 几何校验跳过\n")
+        }
+    }
+    if c.spec.depth > 0 {
+        match c.model.dflash2_dir.as_deref() {
+            Some(dir) => match check_draft_dir(Path::new(dir)) {
+                Ok(note) => out.push_str(&format!("[check] draft dir: {note}\n")),
+                Err(e) => {
+                    ok = false;
+                    out.push_str(&format!("[check] FAIL: {e}\n"));
+                }
+            },
+            None => {
+                ok = false;
+                out.push_str("[check] FAIL: spec.depth > 0 但 model.dflash2_dir 为空\n");
+            }
+        }
+    }
+
+    // ── 组合告警(不拒;`--check` 的 UX 价值就在把隐患提前说出来) ──
+    if c.graph.prefill_bucket != owl_shared::config::PrefillBucket::Off
+        && c.runtime.prefill_chunk + c.runtime.prefill_tail_merge > 1024
+    {
+        out.push_str(&format!(
+            "[check] WARN: chunk+tail = {}+{} > 1024:尾块没有桶图 ⇒ eager(激活约 1.7G);\
+             贴顶档建议拆成 512+512 或 1024+0\n",
+            c.runtime.prefill_chunk, c.runtime.prefill_tail_merge
+        ));
+    }
+    if !c.kvmem.pool_overcommit {
+        if let Some(p) = c.pool.pool_tokens {
+            if p < c.runtime.max_seq {
+                out.push_str(&format!(
+                    "[check] WARN: pool_tokens={p} < max_seq={}:非超卖档引擎会把池下限抬到单会话上下文;\
+                     并发满上下文仍可能 Exhausted\n",
+                    c.runtime.max_seq
+                ));
+            }
+        }
+    }
+
+    // ── 臂摘要 ──
+    let prefill = match c.graph.prefill_bucket {
+        owl_shared::config::PrefillBucket::Off => "eager",
+        owl_shared::config::PrefillBucket::T512 => "FI(t512)",
+        owl_shared::config::PrefillBucket::Geobuckets => "FI(全桶族)",
+    };
+    let decode = if c.dispatch.decode_fi {
+        "FI(单图)"
+    } else if c.dispatch.decode_xqa {
+        "XQA"
+    } else {
+        "eager/piecewise"
+    };
+    out.push_str(&format!(
+        "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{} reuse={} batch={}\n",
+        if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
+        c.spec.depth,
+        if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
+        c.runtime.max_batch,
+    ));
+
+    if let Some(m) = intent {
+        for w in &m.warnings {
+            out.push_str(&format!("[check] WARN: {w}\n"));
+        }
+    }
+    if ok {
+        out.push_str("[check] OK(estimated:权重未加载;真机以 [vram-gov] 实测为准)\n");
+    } else {
+        out.push_str("[check] 未通过:修正上方 FAIL 后重试(其余项已全部检查)\n");
+    }
+    Ok(CheckReport { text: out, ok })
+}
+
+/// 模型 `config.json` 几何校验(读 `text_config`;与注册表逐项比对)
+fn check_model_dir(
+    dir: &Path,
+    profile: &owl_shared::config::intent::ModelProfile,
+    ctx: usize,
+) -> Result<Option<String>, String> {
+    let p = dir.join("config.json");
+    if !p.is_file() {
+        return Ok(Some(format!(
+            "{} 不可读(config.json 缺失)—— 几何校验跳过(真启动会失败)",
+            dir.display()
+        )));
+    }
+    let raw = owl_shared::file_loader::read_to_string(&p)
+        .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
+    let g = v.get("text_config").unwrap_or(&v);
+    let getu = |k: &str| g.get(k).and_then(|x| x.as_u64()).map(|n| n as usize);
+    let geom = profile.geom;
+    for (k, want) in [
+        ("hidden_size", geom.hidden),
+        ("num_hidden_layers", geom.n_layers),
+        ("num_key_value_heads", geom.n_kv_heads),
+        ("head_dim", geom.head_dim),
+        ("vocab_size", geom.vocab),
+    ] {
+        if let Some(got) = getu(k) {
+            if got != want {
+                return Err(format!(
+                    "模型目录与 intent.model={:?} 不匹配:{k}={got} 期望 {want}\n\
+                     —— 检查 [model].dir / [site].model_dir 是否指向了别的检查点",
+                    profile.key
+                ));
+            }
+        }
+    }
+    if let Some(pos) = getu("max_position_embeddings") {
+        if ctx > pos {
+            return Err(format!(
+                "max_seq={ctx} 超过检查点 max_position_embeddings={pos}(模型装不下)"
+            ));
+        }
+        if pos != geom.max_pos {
+            return Err(format!(
+                "检查点 max_position_embeddings={pos} 与注册表 {:?} 的 {} 不一致 —— \
+                 注册表需按该检查点重建(或换回注册表对应模型)",
+                profile.key, geom.max_pos
+            ));
+        }
+    }
+    if let Some(interval) = getu("full_attention_interval") {
+        if interval > 0 && geom.n_layers / interval != geom.n_full {
+            return Err(format!(
+                "检查点 full_attention_interval={interval} ⇒ n_full={},注册表 n_full={} —— 几何漂移",
+                geom.n_layers / interval,
+                geom.n_full
+            ));
+        }
+    }
+    Ok(Some(format!(
+        "{} ✓ hidden={} layers={}(full {}) kv_heads={} hd={} max_pos={}",
+        dir.display(),
+        geom.hidden,
+        geom.n_layers,
+        geom.n_full,
+        geom.n_kv_heads,
+        geom.head_dim,
+        geom.max_pos
+    )))
+}
+
+/// 草稿 `config.json` 校验(DFlash2 + W4A16 pack-quantized;BF16 源 = AL 0)
+fn check_draft_dir(dir: &Path) -> Result<String, String> {
+    let p = dir.join("config.json");
+    if !p.is_file() {
+        return Ok(format!("{} 不可读(config.json 缺失)—— 校验跳过(真启动会失败)", dir.display()));
+    }
+    let raw = owl_shared::file_loader::read_to_string(&p)
+        .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
+    let arch: Vec<String> = v
+        .get("architectures")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if !arch.iter().any(|a| a.contains("DFlash2")) {
+        return Err(format!(
+            "草稿目录 {} 的 architectures={arch:?} 不是 DFlash2 —— 检查 [site].draft_dir",
+            dir.display()
+        ));
+    }
+    let fmt = v
+        .get("quantization_config")
+        .and_then(|q| q.get("format"))
+        .and_then(|x| x.as_str());
+    if fmt != Some("pack-quantized") {
+        return Err(format!(
+            "草稿目录 {} 不是 W4A16 pack-quantized(quantization_config.format={fmt:?})\n\
+             —— BF16 源(z-lab 系)喂引擎 = 草稿全噪声 AL=0;生产用 syvai W4A16 系",
+            dir.display()
+        ));
+    }
+    let layers = v.get("num_hidden_layers").and_then(|x| x.as_u64());
+    Ok(format!(
+        "{} ✓ DFlash2 / pack-quantized{}",
+        dir.display(),
+        layers.map(|n| format!(" / {n} 层")).unwrap_or_default()
+    ))
+}
+
+/// `--print-config` / `--explain` 输出(TOML 或 JSON;JSON 含来源/估算)
+pub fn inspect(args: &CliArgs, r: &ResolvedConfig) -> Result<(), String> {
+    let json_mode = args.print_config && args.format.as_deref() == Some("json");
+    let mut check_ok = true;
+    let check = if args.check {
+        let rep = check_report(r)?;
+        check_ok = rep.ok;
+        Some(rep.text)
+    } else {
+        None
+    };
+    if let Some(t) = check.as_deref() {
+        if json_mode {
+            // stdout 必须是纯 JSON(--print-config --format json 可管道给 jq)
+            eprint!("{t}");
+        } else {
+            print!("{t}");
+        }
+    }
+    if args.print_config {
+        match args.format.as_deref().unwrap_or("toml") {
+            "json" => {
+                let v = serde_json::json!({
+                    "layers": r.layers,
+                    "intent": r.intent(),
+                    "config": &r.config,
+                    "provenance": &r.origins,
+                    "estimate": r.estimate(),
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&v)
+                        .map_err(|e| format!("--print-config JSON 序列化失败: {e}"))?
+                );
+            }
+            _ => {
+                println!("# owl 生效配置(层:{})", r.layers.join(" → "));
+                print!("{}", r.to_toml_pretty()?);
+            }
+        }
+    }
+    for k in &args.explain {
+        print!("{}", r.explain(k)?);
+    }
+    if !check_ok {
+        return Err("预检未通过(见上方 [check] FAIL)".into());
+    }
+    Ok(())
 }
