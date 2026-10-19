@@ -33,8 +33,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         );
     }
     pub async fn abandon(&mut self, err: String) -> TurnEvent {
-        let turn_id = self.turns.active.as_ref().map(|a| a.id).unwrap_or(0);
-        if let Some(act) = self.turns.active.take() {
+        let turn_id = self
+            .turns
+            .executing
+            .or_else(|| self.turns.active.first().map(|a| a.id))
+            .unwrap_or(0);
+        // B5.1:只弃**本步执行 turn**(批步错 = 该行失败;其余活跃行留场,
+        // 由服务面继续泵 —— 全清会把无辜会话连坐)。执行选择器缺省 = 活跃首
+        // (批动作失败时未选定)。
+        if let Some(act) = self.turns.take_exec() {
             // 草稿账随 act(TurnSpecState)销毁(生命周期收口)
             if act.ephemeral {
                 self.burn_ephemeral(act.session_id);
@@ -76,7 +83,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
     pub(crate) async fn complete(&mut self, reason: crate::turn::FinishReason) -> Result<TurnEvent> {
-        let act = self.turns.active.take().ok_or_else(|| ModelError::EngineInvariant { what: "turn_end:无活跃 turn".into() })?;
+        let act = self.turns.take_exec().ok_or_else(|| ModelError::EngineInvariant { what: "turn_end:无活跃 turn".into() })?;
         // B4 分母保鲜回写(下一 turn 种入;见 RunningEngine::bare_cost_carry_ms)
         self.dev.spec_rt.carry_ms = act.spec.bare_cost_ewma_ms;
         self.dev.spec_rt.carry_ctx = act.spec.bare_cost_ctx;

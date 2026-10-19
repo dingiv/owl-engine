@@ -217,6 +217,9 @@ pub struct EngineKnobs {
     pub ts_probe: bool,
     /// GDN 槽数覆写(缺省 8;原 OWL_MAX_ACTIVE_TURNS)
     pub gdn_slots: usize,
+    /// **跨会话合批上限**(B5.1;缺省 1 = 串行,逐字节现状)。
+    /// >1 = 调度面拼 T=N 裸 decode(M1;spec off / 单卡 / 无选择层)。
+    pub max_batch: usize,
     /// spec 快照轮回滚缓冲槽数(缺省 4;原 OWL_SNAP_MAX)
     pub snap_max: usize,
     /// VRAM 预算目标占比(缺省 0.97;原 OWL_VRAM_TARGET)
@@ -289,6 +292,7 @@ impl Default for EngineKnobs {
             fi_plan_restore: true,
             ts_probe: false,
             gdn_slots: 8,
+            max_batch: 1,
             snap_max: 4,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
@@ -582,6 +586,9 @@ impl EngineKnobs {
             gdn_slots: owl_shared::env_reader::parse("OWL_MAX_ACTIVE_TURNS")
                 .or_else(|| owl_shared::env_reader::parse("OWL_GDN_SLOTS"))
                 .unwrap_or(cfg.pool.gdn_slots),
+            // 合批上限:配置文件单源(`[runtime] max_batch`;env 不参与 ——
+            // 用户裁决 2026-10-19:引擎行为参数只许配置文件显式声明)
+            max_batch: cfg.runtime.max_batch,
             prefill_tail_merge: cfg.runtime.prefill_tail_merge,
             prefill_align_tail: cfg.pool.prefill_align_tail,
             snap_decode_stride: cfg.pool.snap_decode_stride,
@@ -1096,6 +1103,7 @@ pub(crate) fn into_running<D: DeviceClient>(
         cov_pending: None,
         cov_last: None,
         sel_view: None,
+        batch_steps_n: 0,
         select_view_steps: 0,
         sel_view_fallback: 0,
         stage: crate::running::StageStats::default(),
@@ -1153,6 +1161,31 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 单源 = 引擎旋钮(生产两处同源于 `[dispatch]`,行为不变;测试/直连档
         // 以后者为准)。写点必须在**图族装配之前**(boot_rank 内)。
         face.configure_fi_plan(cfg.knobs.fi_plan_restore, cfg.knobs.fi_cuda_graph)?;
+        // **合批档自洽门**(B5.1;2026-10-20):每会话一格 GDN + 单卡 AR 语义未审
+        if cfg.knobs.max_batch > 1 {
+            if tp.is_some() {
+                return Err(owl_iface::contract::ModelError::Msg(
+                    "[runtime] max_batch > 1 与 TP 不共戴天(AR 的批语义未审;先单卡)".into(),
+                ));
+            }
+            if cfg.knobs.max_batch > 8 {
+                return Err(owl_iface::contract::ModelError::Msg(format!(
+                    "max_batch({}) > 8:逐行 token 输出走 Concat 8 槽",
+                    cfg.knobs.max_batch
+                )));
+            }
+            if cfg.knobs.gdn_slots < cfg.knobs.max_batch {
+                return Err(owl_iface::contract::ModelError::Msg(format!(
+                    "gdn_slots({}) < max_batch({})—— 合批每会话要一格 GDN 状态",
+                    cfg.knobs.gdn_slots, cfg.knobs.max_batch
+                )));
+            }
+            if cfg.knobs.select_decode || cfg.knobs.select_partial {
+                return Err(owl_iface::contract::ModelError::Msg(
+                    "max_batch > 1 与选择层视图不共戴天(M1 页表按行铺)".into(),
+                ));
+            }
+        }
         // **桶图 × FI plan 承载的定形门**(2026-10-19 桶门定谳):
         // 桶图在捕获期按 `t_pad` 烘 FI 节点(plan 形状 + 表内容),而回放期
         // `ctx = base + t` 可能 > `t_pad`(尾块)⇒ 只有"图档瓦(形状对 ctx 恒定)
@@ -1293,6 +1326,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             xqa_decode: cfg.knobs.env.attn.decode_xqa && !cfg.knobs.select_partial,
             xqa_prefill: cfg.knobs.env.attn.xqa_prefill,
             gdn_slots: cfg.knobs.gdn_slots,
+            max_batch: cfg.knobs.max_batch,
             snap_max: cfg.knobs.snap_max,
             vram_target: cfg.knobs.vram_target,
             vram_reserve_mb: cfg.knobs.vram_reserve_mb,

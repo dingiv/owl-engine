@@ -181,6 +181,8 @@ pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     pub xqa_prefill: bool,
     /// GDN 行容量
     pub gdn_slots: usize,
+    /// **合批上限**(B5.1;1 = 串行)。>1 ⇒ 分配批页表块 + seqs=N 注意力 scratch
+    pub max_batch: usize,
     /// spec 快照池深度
     pub snap_max: usize,
     /// VRAM 预算目标占比(0 = 治理禁用)
@@ -231,6 +233,10 @@ pub(crate) struct StatePool {
     pub(crate) attn_v2: Option<owl_models::module::AttnV2Scratch>,
     /// verify v2 scratch(seqs=depth1;§三十一)
     pub(crate) verify_attn_v2: Option<owl_models::module::AttnV2Scratch>,
+    /// **批 decode v2 scratch**(B5.1;seqs=max_batch)。`None` = max_batch=1
+    pub(crate) batch_attn_v2: Option<owl_models::module::AttnV2Scratch>,
+    /// **批 decode 页表块**([max_batch, nb] f32;每行一条会话链)
+    pub(crate) bt_batch: Option<Bytes>,
     /// XQA verify 面(2026-10-13 D3):常量页表/掩码 + semaphores + scratch
     /// (seq_lens 逐轮变 → 由图输入槽供给,不在本结构)
     /// XQA 资源面(verify 与裸 decode **共用**;见 `plan.verify_xqa` /
@@ -848,6 +854,31 @@ impl StatePool {
         } else {
             None
         };
+        // **批 decode scratch**(B5.1;seqs=max_batch):与 verify 版同式,
+        // 只是伪序列数 = 合批上限。None = max_batch=1(拓扑零变化)。
+        let max_batch = plan.max_batch.max(1);
+        let batch_attn_v2 = if paged && max_batch > 1 {
+            let nparts = (nb * page).div_ceil(512);
+            let seqs = max_batch;
+            let es = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32, "battn2.exp_sums").await?;
+            let ml = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32, "battn2.max_logits").await?;
+            let to = zero_block_dt(face, seqs * dims.hq * nparts * dims.hd, dims.dtype, "battn2.tmp_out").await?;
+            Some(owl_models::module::AttnV2Scratch {
+                exp_sums: block_leaf(&es.0, vec![seqs, dims.hq * nparts]),
+                max_logits: block_leaf(&ml.0, vec![seqs, dims.hq * nparts]),
+                tmp_out: block_leaf_dt(&to.0, vec![seqs * dims.hq * nparts * dims.hd], dims.dtype),
+                nparts,
+                seqs,
+            })
+        } else {
+            None
+        };
+        // 批页表块([max_batch, nb] f32;内容 = 各会话链,每步重写)
+        let bt_batch = if paged && max_batch > 1 {
+            Some(eval_ops(TensorOps::zeros(Dtype::F32, vec![max_batch, nb]).step(), face).await?)
+        } else {
+            None
+        };
         // XQA 资源面(2026-10-13 D3 + ②;kNHD fp8 池 + grp6 + hd256 + page32)
         // **verify 与裸 decode 共用同一份**:恒定件(页表/掩码/semaphores/
         // scratch)两图都能用,只有 `seq_lens`/`semaphores` 需按图各挂一个
@@ -978,7 +1009,8 @@ impl StatePool {
         } else {
             None
         };
-        Ok(StatePool { gdn_slots, dump_all, gdn_dbg, kvs, fi_face, fi_tables, gdn_tables, verify_attn_v2, xqa,
+        Ok(StatePool { gdn_slots, dump_all, gdn_dbg, kvs, fi_face, fi_tables, gdn_tables, verify_attn_v2,
+            batch_attn_v2, bt_batch, xqa,
             kv_fp8, dflash_fp8, dflash_dt: plan.draft_dt, gdns, snaps, snap_tick: 0, bt, bt_view, bt_mtp, spec_snap, mtp_kvs, dflash_kvs, attn_v2, page, nb, nb_kv, dump_page, paged, x, dims })
     }
 
@@ -1094,6 +1126,47 @@ impl StatePool {
     /// verify v2 scratch(seqs=depth1;§三十一)
     pub(crate) fn verify_attn_v2_scratch(&self) -> Option<owl_models::module::AttnV2Scratch> {
         self.verify_attn_v2.clone()
+    }
+
+    /// 批 decode v2 scratch(seqs=max_batch;None = 串行档)
+    pub(crate) fn batch_attn_v2_scratch(&self) -> Option<owl_models::module::AttnV2Scratch> {
+        self.batch_attn_v2.clone()
+    }
+
+    /// 批 decode 页表叶子([max_batch, nb] —— seqs 维必须与 scratch 同源)
+    pub(crate) fn bt_batch_leaf(&self) -> Option<TensorOps> {
+        let seqs = self.batch_attn_v2.as_ref().map(|s| s.seqs)?;
+        self.bt_batch
+            .as_ref()
+            .map(|b| TensorOps::of_block(b.id, Dtype::F32, vec![seqs, self.nb]))
+    }
+
+    /// **批页表重写**:每行一条会话链(不足 nb 补 0 = padding 行)。
+    /// 与 [`Self::write_bt`] 同守占位符门(洞不许进设备表)。
+    pub(crate) async fn write_bt_batch<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        rows: &[Vec<u32>],
+    ) -> Result<()> {
+        let b = self.bt_batch.as_ref().ok_or_else(|| ModelError::EngineInvariant {
+            what: "bt_batch 未分配(max_batch 档位不一致)".into(),
+        })?;
+        for (r, table) in rows.iter().enumerate() {
+            if let Some(i) = table.iter().position(|x| owl_store::is_host_placeholder(*x)) {
+                return Err(ModelError::Msg(format!(
+                    "write_bt_batch:行 {r} 第 {i} 项是宿主占位符 —— 不得写设备块表"
+                )));
+            }
+        }
+        let w = self.nb;
+        let mut v = vec![0f32; rows.len() * w];
+        for (r, table) in rows.iter().enumerate() {
+            for (i, x) in table.iter().take(w).enumerate() {
+                v[r * w + i] = *x as f32;
+            }
+        }
+        face.write_block_f32_on(owl_iface::contract::UpStream::Compute, b, 0, &v)
+            .await
     }
 
     /// XQA 资源面(常量件;`seq_lens`/`semaphores` 由图输入槽供给,调用方覆盖)

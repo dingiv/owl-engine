@@ -1,6 +1,7 @@
 //! 调度三相位执行(begin/prefill/decode)+ 采样收口 + GDN 画像
 use super::prefill_chunk::ChunkHost;
 use super::*;
+use owl_models::module::Module; // 合批 eager:整模 `forward`
 use owl_models::ops::PlanNode; // ⚙ diag:池叶 → 块 id(写者足迹取证)
 use owl_iface::contract::ModelError;
 
@@ -248,7 +249,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let prompt_len = self
                     .turns
                     .active
-                    .as_ref()
+                    .first()
                     .map(|a| a.prompt_ids.len())
                     .unwrap_or(new_fed);
                 let next_end = Self::prefill_step_chunk(
@@ -694,6 +695,237 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         Ok(ev)
     }
 
+    /// **跨会话合批 decode**(B5.1 M1;spec off / 单卡 / 无视图)。
+    ///
+    /// 语义:一次 `model_decode(T=B)` 前向 —— 每行一个会话的一步
+    /// (KV 槽窗 `slots[]/kv_lens[]` + 页链 `bt[T,nb]` + GDN 行 `slots[b]`),
+    /// 然后**逐行**采样/事件。判据入口在调度面(`StepAction::BatchDecode`),
+    /// 本函数无决策权;任一行终局走既有 `sample_and_emit`(EOS/stop/预算)。
+    ///
+    /// 当前 = **eager 臂**(图族 M1b 另立):`eval_ops_env` 整模单树求值。
+    pub(crate) async fn execute_batch_decode(
+        &mut self,
+        rows: Vec<crate::scheduler::RowSpec>,
+    ) -> Result<TurnEvent> {
+        debug_assert!(rows.len() >= 2, "BatchDecode 至少两行");
+        self.batch_steps_n += 1;
+        let t_rows = rows.len();
+        owl_shared::step_gate!("engine.batch").await;
+        let t_step = std::time::Instant::now();
+
+        // ── ① 页表:每行 = 会话真链(整表重写;T×nb×4B 极小)──
+        let mut tables: Vec<Vec<u32>> = Vec::with_capacity(t_rows);
+        for r in &rows {
+            tables.push(self.bank.sessions.session(r.session_id)?.block_table.clone());
+        }
+        {
+            let face = self.dev.graphs.session.face_mut();
+            self.dev.pool.write_bt_batch(face, &tables).await?;
+        }
+
+        // ── ② 行槽([T];图臂按 max_batch 定形,真行数 = rows.len())──
+        let t_pad = self.cfg.knobs.max_batch.max(2);
+        if t_rows > t_pad {
+            return Err(ModelError::EngineInvariant {
+                what: format!("合批行数 {t_rows} > 图定形 {t_pad}(调度面越界)"),
+            });
+        }
+        // 假行 padding:token/pos/kv_len = 0;k slots/gdn slots = -1
+        // (K0/GDN 核按负槽跳写;v2 注意力按 kv_len=0 早退)⇒ 不碰真状态。
+        let mut ids_v = vec![0f32; t_pad];
+        let mut pos = vec![0f32; t_pad];
+        let mut slots_v = vec![-1f32; t_pad];
+        let mut lens_v = vec![0f32; t_pad];
+        let mut gslot_v = vec![-1f32; t_pad];
+        for (i, r) in rows.iter().enumerate() {
+            ids_v[i] = r.token as f32;
+            pos[i] = r.pos as f32;
+            slots_v[i] = r.kv_slot as f32;
+            lens_v[i] = r.kv_len as f32;
+            gslot_v[i] = r.gdn_slot as f32;
+        }
+        let need_logits = rows
+            .iter()
+            .any(|r| self.turns.active_by_id(r.turn).map(|a| a.sampler_on).unwrap_or(false));
+
+        // ── ③ 图臂优先(捕获成功时);否则 eager 整模单树 ──
+        let (logits_all, tok_dev): (Option<Vec<f32>>, Option<Vec<f32>>) =
+            if self.dev.graphs.batch.is_some() {
+                let refs: [(&str, &[f32]); 5] = [
+                    ("frontier", &ids_v),
+                    ("pos", &pos),
+                    ("kv_len", &lens_v),
+                    ("kv_slot", &slots_v),
+                    ("gdn_slot", &gslot_v),
+                ];
+                let g = self.dev.graphs.batch.as_mut().ok_or_else(|| {
+                    ModelError::EngineInvariant { what: "合批图缺席(判据漂移)".into() }
+                })?;
+                g.step(&refs).await?;
+                let tok = g.read_output_f32("token").await?;
+                let logits = if need_logits {
+                    Some(g.read_output_f32("logits").await?)
+                } else {
+                    None
+                };
+                (logits, Some(tok))
+            } else {
+                // eager 臂(只喂真行;不 pad)
+                let ids = TensorOps::from_host(Dtype::F32, vec![t_rows], &f32b(&ids_v[..t_rows]));
+                let pos_t = TensorOps::from_host(Dtype::F32, vec![1, t_rows], &f32b(&pos[..t_rows]));
+                let slots_t = TensorOps::from_host(Dtype::F32, vec![1, t_rows], &f32b(&slots_v[..t_rows]));
+                let lens_t = TensorOps::from_host(Dtype::F32, vec![1, t_rows], &f32b(&lens_v[..t_rows]));
+                let gslot_t = TensorOps::from_host(Dtype::F32, vec![t_rows], &f32b(&gslot_v[..t_rows]));
+                let bt8 = self.dev.pool.bt_batch_leaf().ok_or_else(|| {
+                    ModelError::EngineInvariant {
+                        what: "合批页表块未分配(max_batch 档位不一致)".into(),
+                    }
+                })?;
+                let scratch = self.dev.pool.batch_attn_v2_scratch().ok_or_else(|| {
+                    ModelError::EngineInvariant {
+                        what: "合批注意力 scratch 未分配(max_batch 档位不一致)".into(),
+                    }
+                })?;
+                let kvs_step: Vec<KvBuffers> = self
+                    .dev
+                    .pool
+                    .kv_caches()
+                    .iter()
+                    .map(|(k, v)| KvBuffers {
+                        k_cache: k.clone(),
+                        v_cache: v.clone(),
+                        slots: slots_t.clone(),
+                        kv_lens: lens_t.clone(),
+                        block_tables: bt8.clone(),
+                    })
+                    .collect();
+                let gdns_step: Vec<GdnBuffers> = self
+                    .dev
+                    .pool
+                    .gdn_caches()
+                    .iter()
+                    .map(|g| GdnBuffers {
+                        conv_q: g.conv_q.clone(),
+                        conv_k: g.conv_k.clone(),
+                        conv_v: g.conv_v.clone(),
+                        rec: g.rec.clone(),
+                        slots: gslot_t.clone(),
+                    })
+                    .collect();
+                let mut ctx =
+                    ForwardCtx::model_decode(t_rows, &pos_t, &kvs_step, &self.dev.rope, &gdns_step);
+                ctx.env = self.dev.env;
+                ctx.attn_v2 = Some(scratch);
+                ctx.v2_bt8 = Some(&bt8);
+                let logits = self.dev.model.forward(&ids, &ctx);
+                let out = {
+                    let face = self.dev.graphs.session.face_mut();
+                    owl_models::interpreters::eval_ops_env(&logits, face, self.dev.env, None).await?
+                };
+                let vocab = self.dev.model.logits_vocab();
+                let dt = logits.dtype();
+                let esz = dt.size_bytes();
+                let mut buf = vec![0u8; t_rows * vocab * esz];
+                {
+                    let face = self.dev.graphs.session.face_mut();
+                    face.dtoh(&out, &mut buf).await?;
+                }
+                let v: Vec<f32> = match dt {
+                    Dtype::F16 => buf
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect(),
+                    Dtype::F32 => buf
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                    other => {
+                        return Err(ModelError::Msg(format!(
+                            "合批 decode:logits dtype {other:?} 无 host 解码面"
+                        )))
+                    }
+                };
+                (Some(v), None)
+            };
+        let vocab = self.dev.model.logits_vocab();
+        mrec("batch.step", t_step.elapsed());
+
+        // ── ④ 逐行:推进账 → 采样 → 事件 ──
+        let mut evs: Vec<TurnEvent> = Vec::with_capacity(t_rows);
+        for (i, r) in rows.iter().enumerate() {
+            self.turns.select(Some(r.turn));
+            // 行账推进(与单行 execute_decode 同序:先 fed,再边界快照,再采样)
+            self.turns.active_mut()?.fed += 1;
+            let fed = self.turns.active()?.fed;
+            if self.dev.pool.paged && fed.is_multiple_of(self.dev.pool.page) {
+                self.capture_gdn_snap_tail(
+                    r.session_id,
+                    fed,
+                    &[],
+                    owl_store::SnapDurability::Transient,
+                )
+                .await?;
+            }
+            // 逐行采样(采样档 = per-turn cfg/seed/惩罚历史;贪心 = host argmax)
+            let (sampler_on, eff_sampler, seed, turn_id, step, history) = {
+                let act = self.turns.active()?;
+                let turn_id = act.id;
+                let step = act.out.len() as u64;
+                let seed = act
+                    .seed
+                    .unwrap_or_else(|| turn_id.wrapping_mul(0x9E3779B97F4A7C15));
+                let tail = act.prompt_ids.len().saturating_sub(64);
+                let history: Vec<u32> = act.prompt_ids[tail..]
+                    .iter()
+                    .chain(act.out.iter())
+                    .copied()
+                    .collect();
+                (act.sampler_on, act.sampler, seed, turn_id, step, history)
+            };
+            let nt = if sampler_on {
+                let all = logits_all.as_ref().ok_or_else(|| ModelError::EngineInvariant {
+                    what: "合批采样档缺 logits 回读(判据漂移)".into(),
+                })?;
+                let mut row_logits = all[i * vocab..(i + 1) * vocab].to_vec();
+                let mut rng = seed ^ step.wrapping_mul(0xBF58476D1CE4E5B9);
+                crate::sampler::sample(&mut row_logits, &eff_sampler, &mut rng, &history)
+            } else if let Some(tok) = tok_dev.as_ref() {
+                // 图臂:设备逐行 argmax(零额外 D2H 面)
+                tok[i] as u32
+            } else {
+                let all = logits_all.as_ref().ok_or_else(|| ModelError::EngineInvariant {
+                    what: "合批贪心档缺 logits(判据漂移)".into(),
+                })?;
+                all[i * vocab..(i + 1) * vocab]
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |a, (j, &v)| {
+                        if v > a.1 {
+                            (j, v)
+                        } else {
+                            a
+                        }
+                    })
+                    .0 as u32
+            };
+            owl_shared::log_debug!(
+                "batch",
+                "行{i} t{turn_id} pos={} slot={} gdn={} ⇒ {nt}",
+                r.pos,
+                r.kv_slot,
+                r.gdn_slot
+            );
+            evs.push(self.sample_and_emit(nt).await?);
+        }
+        self.turns.select(None);
+        // 事件:首个本步返回,其余入队(每 turn 内序由 push 顺序保持)
+        let first = evs.remove(0);
+        for e in evs {
+            self.turns.pending_events.push_back(e);
+        }
+        Ok(first)
+    }
+
     // ====================================================================
     // E5-M2:投机轮(哑草稿版;草稿 = 3 × anchor 重复)
     // 轮不变量:轮首 GDN = state@F-1(F = fed = anchor 位;anchor KV 未写
@@ -730,10 +962,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         {
             // 崩坏排查打点:首 token / EOS 事实(decode 与 spec 两路汇合)
             let bs = self.boot_seq;
-            let first = self.turns.active
-                .as_ref()
-                .map(|a| a.out.is_empty())
-                .unwrap_or(false);
+            let first = self.turns.active().map(|a| a.out.is_empty()).unwrap_or(false);
             if first {
                 mfact(bs, "emit.first", nt as u64);
             }
@@ -742,7 +971,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         // ignore_eos(OpenAI 兼容;测速口径):EOS 只记账不终止
-        let ignore_eos = self.turns.active.as_ref().map(|a| a.ignore_eos).unwrap_or(false);
+        let ignore_eos = self.turns.active().map(|a| a.ignore_eos).unwrap_or(false);
         if self.tok.is_eos(nt) && !ignore_eos {
             return self.complete(crate::turn::FinishReason::Stop).await;
         }

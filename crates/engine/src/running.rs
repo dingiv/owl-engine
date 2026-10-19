@@ -197,6 +197,8 @@ pub struct RunningEngine<D: DeviceClient> {    /// 步级探针(boot 解析;不�
     /// 链每 chunk 要新增 `chunk/page` 页,不腾就必然 `Exhausted`
     /// (实测:池 96 页,链要到 100 页 ⇒ 耗尽)。
     pub(crate) sel_keep: Vec<owl_store::ChainHash>,
+    /// **合批 decode 已执行步数**(B5.1 事实位;门用它证明批路径真被走到)
+    pub(crate) batch_steps_n: u64,
 }
 
 /// **stage-in 实测账**(B-3e;宿主 → 设备回灌的块数/字节/耗时)。
@@ -509,6 +511,16 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.peer.is_some()
     }
 
+    /// 合批 decode 已执行的步数(B5.1 事实位;门用 —— 0 = 批路径没被走到)
+    pub fn batch_steps(&self) -> u64 {
+        self.batch_steps_n
+    }
+
+    /// 合批图是否在场(B5.1 M1b 事实位;false = 执行器走 eager 臂)
+    pub fn has_batch_graph(&self) -> bool {
+        self.dev.graphs.batch.is_some()
+    }
+
     /// **诊断出口**：读主 rank（rank0）会话图的命名输出（如 `logits`/`token`）。
     /// `None` = 该图无此输出槽。G8 对拍/数值归因用（S4 ⑤-K3）。
     /// ⚠️ **P1.1 词表切档下 `logits` 是半表**（本 rank 宽度 = `logits_vocab()`）；
@@ -639,6 +651,19 @@ impl<D: DeviceClient> RunningEngine<D> {
         opts: crate::turn::TurnOpts,
     ) -> Result<(u64, u64)> {
         let session = session.into();
+        // **同会话并发守卫**(B5.1):合批档下两个同会话 turn 会共享同一份
+        // KV/GDN 状态 ⇒ 结构性互踩。亮拒(上层应按会话串行)。
+        if self.cfg.knobs.max_batch > 1 {
+            if let Some(id) = session {
+                if self.turns.active.iter().any(|a| a.session_id == id)
+                    || self.turns.queue.iter().any(|t| t.session_id == id)
+                {
+                    return Err(ModelError::Msg(format!(
+                        "submit: 会话 {id} 已有活跃/排队 turn —— 合批档不支持同会话并发"
+                    )));
+                }
+            }
+        }
         let prompt = prompt.into();
         let prompt_ids = {
             // 诊断开关(knobs.raw_completion):裸续写,绕过 chat 模板 ——
@@ -822,7 +847,10 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// 当前活跃 turn id(actor 侧"该发缓存纠正帧了吗"判据)
     pub fn active_turn_id(&self) -> Option<u64> {
-        self.turns.active.as_ref().map(|a| a.id)
+        // B5.1:多活跃时给“本步执行 turn”;批动作(未选)= 活跃首
+        self.turns
+            .executing
+            .or_else(|| self.turns.active.first().map(|a| a.id))
     }
 
     /// 推进到下一个事件点(每调用 = 活跃 turn 的一个采样步,或 turn 的
@@ -1033,21 +1061,28 @@ impl<D: DeviceClient> RunningEngine<D> {
         use owl_store::NeedWhy;
         let page = self.dev.pool.page.max(1);
         let slots_for = |tokens: usize| tokens.div_ceil(page);
-        // ① 待准入(队列 front):准入即要覆盖整个 prompt
-        if let Some(t) = self.turns.queue.front() {
-            let (sid, plen) = (t.session_id, t.prompt_ids.len());
-            let dev = {
-                let (hit, recall) = self.bank.rel.match_prefix(&t.prompt_ids)?;
-                Self::reuse_face(&self.bank.rel, &hit, &recall, plen, page).1
-            };
-            let have = self.bank.sessions.get(sid).map(|s| s.block_table.len()).unwrap_or(0);
-            return Ok(owl_store::Need::kv(
-                slots_for(plen).saturating_sub(dev).saturating_sub(have),
-                NeedWhy::Admit,
-            ));
+        // ① 待准入(队列 front)**且无活跃**:准入即要覆盖整个 prompt。
+        // (有活跃时它只是排队 —— 准入需求留给 admission_gate,不许把
+        //  “别人的 prompt”算成当前批的保洁缺口。)
+        if self.turns.active.is_empty() {
+            if let Some(t) = self.turns.queue.front() {
+                let (sid, plen) = (t.session_id, t.prompt_ids.len());
+                let dev = {
+                    let (hit, recall) = self.bank.rel.match_prefix(&t.prompt_ids)?;
+                    Self::reuse_face(&self.bank.rel, &hit, &recall, plen, page).1
+                };
+                let have = self.bank.sessions.get(sid).map(|s| s.block_table.len()).unwrap_or(0);
+                return Ok(owl_store::Need::kv(
+                    slots_for(plen).saturating_sub(dev).saturating_sub(have),
+                    NeedWhy::Admit,
+                ));
+            }
+            return Ok(owl_store::Need::kv(0, NeedWhy::Idle));
         }
-        // ② 活跃 turn:prefill 用单源块长;decode 用 spec 深度上界
-        if let Some(act) = self.turns.active.as_ref() {
+        // ② 活跃集:**逐 turn 求和**(B5.1 —— 批内每行都会长块链;只算
+        // 首 turn 会少腾槽 ⇒ 批步中途 Exhausted 把整批打掉)
+        let mut need = 0usize;
+        for act in self.turns.actives() {
             let target = match Self::prefill_step_chunk(
                 act.fed,
                 act.prompt_ids.len(),
@@ -1068,13 +1103,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 .get(act.session_id)
                 .map(|s| s.block_table.len())
                 .unwrap_or(0);
-            return Ok(owl_store::Need::kv(
-                slots_for(target).saturating_sub(have),
-                NeedWhy::Grow,
-            ));
+            need += slots_for(target).saturating_sub(have);
         }
-        // ③ 空转:零需求(不预搬)
-        Ok(owl_store::Need::kv(0, NeedWhy::Idle))
+        Ok(owl_store::Need::kv(need, NeedWhy::Grow))
     }
 
     /// **N4 池清点**(缺口 4 的节点面):把**已在 store 池里**的 `Turn(t)` 名下块
@@ -1184,19 +1215,30 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 不用"池实占 − 活跃实占"那种字节相减:那会把 idle 会话持着的
         // 历史算成可动,准入就说满了话而搬不动(Busy ⇒ 退回 Exhausted)。
         let movable = self.bank.rel.leg.movable_bytes();
-        let active = self.turns.active.as_ref().map(|a| (a.id, a.session_id));
-        let held = match active {
-            Some((_, sid)) => {
-                self.bank.sessions.get(sid).map_or(0, |s| s.block_table.len()) * block_bytes
-            }
-            None => 0,
-        }
-        .min(occupied.saturating_sub(movable));
+        // B5.1:多活跃 ⇒ 逐 turn 记保留额(各自会话块链实占)
+        let active_holds: Vec<(u64, usize)> = self
+            .turns
+            .actives()
+            .map(|a| {
+                let held = self
+                    .bank
+                    .sessions
+                    .get(a.session_id)
+                    .map_or(0, |s| s.block_table.len())
+                    * block_bytes;
+                (a.id, held)
+            })
+            .collect();
+        let held = active_holds
+            .iter()
+            .map(|(_, h)| *h)
+            .sum::<usize>()
+            .min(occupied.saturating_sub(movable));
         let ad = &mut self.bank.rel.admission;
         ad.set_cache_bytes(movable); // 可动面(可下沉/可驱逐)
         ad.set_session_held(occupied.saturating_sub(movable).saturating_sub(held)); // 会话持有面
-        if let Some((id, _)) = active {
-            ad.set_floor(id, held)?; // 活跃 turn 保留额(G2b)
+        for (id, h) in &active_holds {
+            ad.set_floor(*id, *h)?; // 活跃 turn 保留额(G2b)
         }
         Ok(())
     }
@@ -1239,7 +1281,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // **只在真的能起 turn 时判**(无活跃 turn)。有活跃 turn 时队首只是在
         // 等位 —— 此刻"池被活跃面占着"是常态(它马上会退成缓存),照判会
         // 把正常排队的第二个请求误拒。准入 = "谁能**开始**"。
-        if self.turns.active.is_some() {
+        if self.turns.active.len() >= self.cfg.knobs.max_batch.max(1) {
             return Ok(());
         }
         self.sync_pool_account()?;
@@ -1949,6 +1991,19 @@ impl<D: DeviceClient> RunningEngine<D> {
                         }
                         owl_shared::timer_end!("engine.phase.decode");
                         self.set_phase(saved);
+                        r
+                    }
+                    StepAction::BatchDecode { rows } => {
+                        let saved = self.dev.env.phase;
+                        self.set_phase(owl_models::env::EvalPhase::Decode);
+                        owl_shared::timer_start!("engine.phase.batch");
+                        let n = rows.len();
+                        let r = self.execute_batch_decode(rows).await;
+                        owl_shared::timer_end!("engine.phase.batch");
+                        self.set_phase(saved);
+                        if let Ok(ev) = &r {
+                            owl_shared::log_debug!("batch", "批步完成 n={n} first={ev:?}");
+                        }
                         r
                     }
                     StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew } => {

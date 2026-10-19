@@ -198,6 +198,10 @@ impl GraphInstantiateFlags {
 // §2 config modules(每 module 管一个功能域;deny_unknown = 键名打错拒启)
 // ============================================================================
 
+fn default_max_batch() -> usize {
+    1
+}
+
 /// 进程装配面
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -252,6 +256,14 @@ pub struct RuntimeCfg {
     pub gpu_min_free_ratio: f64,
     pub max_seq: usize,
     pub prefill_chunk: usize,
+    /// **引擎跨会话合批上限**(B5.1;缺省 **1 = 逐字节现状**)。
+    ///
+    /// >1 ⇒ 调度面把最多 N 个活跃 turn 的 decode 拼成一次 T=N 前向
+    /// (M1 = 裸 decode / spec off)。**不改变单 turn 语义**;每行各自采样/事件。
+    /// 前置:`pool.gdn_slots ≥ max_batch`(每会话一格 GDN)、单卡(TP 的 AR
+    /// 批语义未审)、`kvmem.select_decode = false`(M1 页表按行,不做视图)。
+    #[serde(default = "default_max_batch")]
+    pub max_batch: usize,
     /// **尾块合并**(tokens;L4,2026-10-18):`剩余 ≤ prefill_chunk + 本值`
     /// ⇒ 本步一口气吃完剩余(块长上限 = chunk + tail_merge)。
     ///
@@ -1033,6 +1045,7 @@ impl Default for RuntimeCfg {
             gpu_min_free_ratio: 0.9,
             max_seq: 4096,
             prefill_chunk: 512,
+            max_batch: 1,
             prefill_tail_merge: 0,
             test_device: None,
             server_url: None,
@@ -1423,6 +1436,37 @@ impl OwlConfig {
                     .to_string(),
             );
         }
+        // **合批上限的自洽门**(B5.1;2026-10-20):批 = 每会话一行 GDN 状态,
+        // 且 M1 的页表按行铺(无选择层视图)。任一不成立 ⇒ 拒启(不许"配了
+        // 但静默退回串行")。
+        if self.runtime.max_batch == 0 {
+            return Err("[runtime] max_batch = 0 —— 至少 1(1 = 串行,逐字节现状)".into());
+        }
+        if self.runtime.max_batch > 1 {
+            if self.pool.gdn_slots < self.runtime.max_batch {
+                return Err(format!(
+                    "[pool] gdn_slots({}) < [runtime] max_batch({})—— 合批每会话要一格 GDN 状态",
+                    self.pool.gdn_slots, self.runtime.max_batch
+                ));
+            }
+            if self.runtime.max_batch > 8 {
+                return Err(format!(
+                    "[runtime] max_batch({}) > 8 —— 逐行 token 输出走 Concat 8 槽(verify 图同款)",
+                    self.runtime.max_batch
+                ));
+            }
+            if self.runtime.tp_ordinals.is_some() {
+                return Err(
+                    "[runtime] max_batch > 1 与 TP 不共戴天(AR 的批语义未审;先单卡)".into(),
+                );
+            }
+            if self.kvmem.select_decode {
+                return Err(
+                    "[runtime] max_batch > 1 与 [kvmem] select_decode 不共戴天                     (M1 合批页表按行铺,不做选择层视图)"
+                        .into(),
+                );
+            }
+        }
         if self.pool.gdn_slots < self.server.max_concurrency {
             return Err(format!(
                 "[pool] gdn_slots({}) < [server] max_concurrency({})—— GDN 状态格 = 每并发会话一格,\n              并发超格数会把活跃会话的状态格 LRU 逐出(跨会话状态污染);请调 gdn_slots ≥ max_concurrency",
@@ -1653,6 +1697,31 @@ mod tests {
         // ⑤ 门关:空列表(诊断态)/ 不写 ⇒ 不校验
         OwlConfig::from_toml_str("[dispatch]\nallowed_ops = []\n").expect("空 = 门关,应过");
         assert!(OwlConfig::default().dispatch.allowed_ops.is_none());
+    }
+
+    /// **合批上限自洽门**(B5.1):gdn_slots 不足 / 与 TP / 选择层互斥 ⇒ 拒启
+    #[test]
+    fn max_batch_requires_gdn_slots_and_no_virtualization() {
+        let parse = |t: &str| OwlConfig::from_toml_str(t);
+        parse(
+            "[runtime]\nmax_batch = 2\n[pool]\ngdn_slots = 2\n[server]\nmax_concurrency = 2\n",
+        )
+        .expect("合法合批档应接受");
+        assert!(
+            parse("[runtime]\nmax_batch = 3\n[pool]\ngdn_slots = 2\n[server]\nmax_concurrency = 2\n")
+                .is_err(),
+            "gdn_slots < max_batch 应拒"
+        );
+        assert!(
+            parse("[runtime]\nmax_batch = 2\ntp_ordinals = [0, 2]\n[pool]\ngdn_slots = 2\n[server]\nmax_concurrency = 2\n")
+                .is_err(),
+            "合批 + TP 应拒"
+        );
+        assert!(
+            parse("[runtime]\nmax_batch = 2\n[kvmem]\nselect_decode = true\n[pool]\ngdn_slots = 2\n[server]\nmax_concurrency = 2\n")
+                .is_err(),
+            "合批 + 选择层视图应拒"
+        );
     }
 
     #[test]

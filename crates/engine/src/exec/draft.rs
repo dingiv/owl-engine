@@ -883,7 +883,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let depth = self.dev.spec_rt.depth;
         let page = self.dev.pool.page;
         let bt = {
-            let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
+            let sid = self.turns.active()?.session_id;
             let s = self.bank.sessions.get_mut(sid).expect("账在");
             self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, pos + m + depth)?;
             s.mtp_block_table.clone()
@@ -1061,7 +1061,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// mtp 链表 ensure(E5-M2b;propose eager 路径用 from_host 表,非持久
     /// bt 块 —— 图不烘焙 mtp 链)。返回 host 块链副本。
     pub(crate) fn mtp_chain_bt(&mut self, cover: usize) -> Result<Vec<u32>> {
-        let sid = self.turns.active.as_ref().expect("active 已保证").session_id;
+        let sid = self.turns.active()?.session_id;
         let s = self.bank.sessions.get_mut(sid).expect("账在");
         self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
         Ok(s.mtp_block_table.clone())
@@ -1083,7 +1083,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         want_logits: bool,
     ) -> Result<(Vec<u32>, owl_iface::contract::Bytes, Option<Vec<f32>>)> {
         let bt_chain = {
-            let act = self.turns.active.as_ref().expect("active 已保证");
+            let act = self.turns.active()?;
             let s = self.bank.sessions.get(act.session_id).expect("账在");
             s.block_table.clone()
         };

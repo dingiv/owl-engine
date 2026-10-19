@@ -48,6 +48,8 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     /// verify 桶形图(E5-M4;T = depth+1 定形,输出 tok/hid + fold 记录;
     /// None = eager fallback 走旧 verify+重放路)
     pub verify: Option<GraphPlan<D>>,
+    /// **合批 decode 图**(B5.1 M1b;T = max_batch 定形,行 = 会话;None = eager)
+    pub batch: Option<GraphPlan<D>>,
     /// fold 桶形图族(E5-M5;index = m,状态 = spec 快照 buf 就地,
     /// slot 恒 0;重放后 restore 回写会话格)
     pub fold: Vec<GraphPlan<D>>,
@@ -92,6 +94,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         if let Some(g) = self.verify.as_mut() {
             record_close(&mut first, g.close().await);
         }
+        if let Some(g) = self.batch.as_mut() {
+            record_close(&mut first, g.close().await);
+        }
         for g in self.fold.iter_mut() {
             record_close(&mut first, g.close().await);
         }
@@ -115,6 +120,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         self.session.set_phase(p);
         self.prefill.set_phase(p);
         if let Some(g) = self.verify.as_mut() {
+            g.set_phase(p);
+        }
+        if let Some(g) = self.batch.as_mut() {
             g.set_phase(p);
         }
         for g in self.fold.iter_mut() {
@@ -172,6 +180,12 @@ impl<D: DeviceClient> GraphFleet<D> {
         // ① 主会话图(先留一个句柄给 ④ 的 prefill 桶族 —— 桶族在最后建,
         // 那时 `face`/`vface` 都已被消费)
         let pface_src = face.face_clone();
+        // 合批 decode 图(B5.1):独立 face(与 prefill 桶不共享);捕获失败 ⇒ None
+        let bface_src = if boot.knobs.max_batch > 1 && !boot.knobs.no_graph {
+            face.face_clone()
+        } else {
+            None
+        };
         // V1c:decode_fi 开 ⇒ 同图走 piecewise,断点挂 decode 核
         let (session, capture_outcome, decode_fi_node) = Self::plan_session(face, &boot, t0).await?;
         // ② verify 桶形图(spec 模式且主图捕获成功才有意义)
@@ -193,6 +207,33 @@ impl<D: DeviceClient> GraphFleet<D> {
             (fold, dflash, propose)
         } else {
             (Vec::new(), None, Vec::new())
+        };
+        // ③.5 **合批 decode 图**(B5.1 M1b):T = max_batch 定形,行 = 会话。
+        // 捕获失败只降级本环(eager 臂仍在执行器里),不连锁。
+        let batch = if boot.knobs.max_batch > 1 {
+            match bface_src {
+                None => {
+                    owl_shared::log_warn!(
+                        "batch",
+                        "合批图:face_clone 不可用 ⇒ 走 eager 臂"
+                    );
+                    None
+                }
+                Some(bf) => match Self::plan_batch_decode(bf, &boot, t0).await {
+                    Ok((g, outcome)) => {
+                        if let PlanOutcome::EagerFallback { reason } = &outcome {
+                            owl_shared::log_warn!("batch", "合批图捕获降级为 eager:{reason}");
+                        }
+                        Some(g)
+                    }
+                    Err(e) => {
+                        owl_shared::log_warn!("batch", "合批图装配失败(回 eager):{e}");
+                        None
+                    }
+                },
+            }
+        } else {
+            None
         };
         // ④ **prefill 桶族(M2b)**:最后建 —— 自己的槽面/自己的输出块,
         // 与前面几族无共享羁绊;必须在家族 scratch 只增不减的律下**降序**捕
@@ -332,6 +373,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             session,
             capture_outcome,
             verify,
+            batch,
             fold,
             propose,
             dflash,
@@ -627,6 +669,115 @@ impl<D: DeviceClient> GraphFleet<D> {
             arm_facts("attn.arm.decode.")
         );
         Ok((session, capture_outcome, dfi_node_seen.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
+    /// **合批 decode 图**(B5.1 M1b;2026-10-20):T = `max_batch` 定形,
+    /// 行 = 会话。槽面全部按行(`frontier/pos/kv_len/kv_slot/gdn_slot` [T]),
+    /// 页表 = 持久 `bt_batch [T,nb]`(每步重写),注意力 = v2 seq 臂
+    /// (`seqs=T`),输出 = 逐行 argmax + logits [T,vocab]。
+    ///
+    /// 捕获失败 ⇒ 执行器回 eager 臂(`graphs.batch = None`),语义不变。
+    async fn plan_batch_decode(
+        face: D,
+        boot: &FleetBoot<'_>,
+        t0: T,
+    ) -> Result<(GraphPlan<D>, PlanOutcome)> {
+        let env = boot.env;
+        let tp = boot.tp.clone();
+        let pool = boot.pool;
+        let dims = boot.dims;
+        let model = Arc::clone(&boot.model);
+        let rp = boot.rope.clone();
+        let batch = boot.knobs.max_batch;
+        let vocab = boot.model.logits_vocab();
+        let kv_caches = pool.kv_caches();
+        let gdn_caches = pool.gdn_caches();
+        let scratch = pool.batch_attn_v2_scratch().ok_or_else(|| {
+            ModelError::EngineInvariant {
+                what: "合批图:batch_attn_v2 未分配(max_batch 档位不一致)".into(),
+            }
+        })?;
+        let bt8 = pool.bt_batch_leaf().ok_or_else(|| ModelError::EngineInvariant {
+            what: "合批图:bt_batch 未分配(max_batch 档位不一致)".into(),
+        })?;
+        let desc = GraphPlanDesc {
+            inputs: vec![
+                InputSlot::f32("frontier", batch),
+                InputSlot::f32("pos", batch),
+                InputSlot::f32("kv_len", batch),
+                InputSlot::f32("kv_slot", batch),
+                InputSlot::f32("gdn_slot", batch),
+            ],
+            outputs: vec![
+                OutputSlot { name: "logits".into(), shape: vec![batch, vocab], dtype: dims.dtype },
+                // Concat 核固定 8 槽(verify 图同款)⇒ token 输出恒 [8,1];
+                // 执行器只取前 batch 行(batch ≤ 8 由配置门保证)
+                OutputSlot { name: "token".into(), shape: vec![8, 1], dtype: Dtype::F32 },
+            ],
+            capture: true,
+            slab_fixed: boot.knobs.cuda.capture_slab_mb.is_some(),
+            debug_probe: boot.knobs.probes.debug,
+            reclaim_capture: true,
+            warmup: true,
+        };
+        let forward = move |sc: &PlanCtx| -> Result<()> {
+            let ids = sc.input("frontier")?;
+            let pos = sc.input("pos")?;
+            let kv_len = sc.input("kv_len")?;
+            let kv_slot = sc.input("kv_slot")?;
+            let gdn_slot = sc.input("gdn_slot")?;
+            let kvs_step: Vec<KvBuffers> = kv_caches
+                .iter()
+                .map(|(k, v)| KvBuffers {
+                    k_cache: k.clone(),
+                    v_cache: v.clone(),
+                    slots: kv_slot.clone(),
+                    kv_lens: kv_len.clone(),
+                    block_tables: bt8.clone(),
+                })
+                .collect();
+            let gdns_step: Vec<GdnBuffers> = gdn_caches
+                .iter()
+                .map(|g| GdnBuffers {
+                    conv_q: g.conv_q.clone(),
+                    conv_k: g.conv_k.clone(),
+                    conv_v: g.conv_v.clone(),
+                    rec: g.rec.clone(),
+                    slots: gdn_slot.clone(),
+                })
+                .collect();
+            let mut ctx = ForwardCtx::model_decode(batch, &pos, &kvs_step, &rp, &gdns_step);
+            ctx.env = env;
+            ctx.attn_v2 = Some(scratch.clone());
+            ctx.v2_bt8 = Some(&bt8);
+            let hidden = model.last_hidden(&ids, &ctx);
+            let logits = model.embed.lm_head_matmul(&hidden);
+            sc.output("logits", &logits)?;
+            let rows: Vec<TensorOps> = (0..batch)
+                .map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab))
+                .collect();
+            let mut root = TensorOps::call(owl_models::ops::SemanticKernel::Concat);
+            for i in 0..8 {
+                root = root.arg(rows.get(i).unwrap_or(&rows[0]));
+            }
+            let root = root
+                .arg_usize(8)
+                .arg_usize(1)
+                .arg_usize(1)
+                .with_shape(Dtype::F32, vec![8, 1]);
+            sc.output("token", &root)?;
+            Ok(())
+        };
+        let (g, o) = GraphPlan::plan(face, env, tp, desc, forward).await?;
+        owl_shared::log_info!(
+            "boot",
+            "合批 decode 图计划(T={} / vocab={})完成 +{:.2}s outcome={:?}",
+            batch,
+            vocab,
+            t0.elapsed().as_secs_f32(),
+            o
+        );
+        Ok((g, o))
     }
 
     /// ② verify 桶形图(E5-M4;T = depth+1 定形;spec 模式专用)—— 消

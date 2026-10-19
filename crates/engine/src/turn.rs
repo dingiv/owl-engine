@@ -219,8 +219,16 @@ pub(crate) const SPEC_SEED_SAMPLES: usize = 2;
 pub(crate) struct TurnLedger {
     /// 待跑队列(pump 逐个取首)
     pub(crate) queue: VecDeque<Turn>,
-    /// 活跃 turn(M0.5 单槽:None = 空位)
-    pub(crate) active: Option<ActiveTurn>,
+    /// 活跃 turn 集(B5.1:多活跃;长度 ≤ `knobs.max_batch`)。
+    /// **单一阵列** —— 单 turn 路径经 [`Self::executing`] 选择器读取
+    /// (调度每步设定),不存在第二份“主 turn”账。
+    pub(crate) active: Vec<ActiveTurn>,
+    /// **本步执行选择器**(调度面每步设置;`None` = 批动作或空闲)。
+    /// 单 turn 执行码(草稿/验实/快照…)经 `active()/active_mut()` 读它 ——
+    /// 多活跃时未选定 = 显式错误,不许猜。
+    pub(crate) executing: Option<u64>,
+    /// 多活跃单 turn 相位的 round-robin 游标(公平:不让首 turn 独占)
+    pub(crate) rr: usize,
     /// turn id 发号器(进程内单调)
     pub(crate) next_id: u64,
     /// 多 token 轮的事件队列(pump 逐个出;SpecRound 一轮 m+1 token)
@@ -243,8 +251,21 @@ impl TurnLedger {
     pub(crate) fn active(
         &self,
     ) -> std::result::Result<&ActiveTurn, owl_iface::contract::ModelError> {
-        self.active.as_ref().ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
-            what: "无活跃 turn(调用点落在 turn 生命周期之外)".into(),
+        if let Some(id) = self.executing {
+            return self.active.iter().find(|a| a.id == id).ok_or_else(|| {
+                owl_iface::contract::ModelError::EngineInvariant {
+                    what: format!("执行 turn {id} 不在活跃集(选择器漂移)"),
+                }
+            });
+        }
+        if self.active.len() == 1 {
+            return Ok(&self.active[0]);
+        }
+        Err(owl_iface::contract::ModelError::EngineInvariant {
+            what: format!(
+                "无执行 turn 选择(活跃 {} 个):单 turn 调用点落在批相位",
+                self.active.len()
+            ),
         })
     }
 
@@ -252,15 +273,63 @@ impl TurnLedger {
     pub(crate) fn active_mut(
         &mut self,
     ) -> std::result::Result<&mut ActiveTurn, owl_iface::contract::ModelError> {
-        self.active.as_mut().ok_or_else(|| owl_iface::contract::ModelError::EngineInvariant {
-            what: "无活跃 turn(调用点落在 turn 生命周期之外)".into(),
-        })
+        let id = self.executing.or_else(|| (self.active.len() == 1).then(|| self.active[0].id));
+        match id {
+            Some(id) => self.active.iter_mut().find(|a| a.id == id).ok_or_else(|| {
+                owl_iface::contract::ModelError::EngineInvariant {
+                    what: format!("执行 turn {id} 不在活跃集(选择器漂移)"),
+                }
+            }),
+            None => Err(owl_iface::contract::ModelError::EngineInvariant {
+                what: format!(
+                    "无执行 turn 选择(活跃 {} 个):单 turn 调用点落在批相位",
+                    self.active.len()
+                ),
+            }),
+        }
+    }
+
+    /// 设定本步执行 turn(调度面单源;批动作 = `None`)。
+    pub(crate) fn select(&mut self, turn: Option<u64>) {
+        self.executing = turn;
+    }
+
+    /// 活跃集迭代(批调度面)。
+    pub(crate) fn actives(&self) -> impl Iterator<Item = &ActiveTurn> {
+        self.active.iter()
+    }
+
+    /// 按 id 取活跃 turn(批执行面;不依赖执行选择器)。
+    pub(crate) fn active_by_id(&self, id: u64) -> Option<&ActiveTurn> {
+        self.active.iter().find(|a| a.id == id)
+    }
+
+    /// **移除活跃 turn**(终局;执行选择器一并清理)。
+    pub(crate) fn take_active(&mut self, id: u64) -> Option<ActiveTurn> {
+        let pos = self.active.iter().position(|a| a.id == id)?;
+        let act = self.active.remove(pos);
+        if self.executing == Some(id) {
+            self.executing = None;
+        }
+        Some(act)
+    }
+
+    /// 移除“本步执行 turn”(终局路径;`executing` 优先,否则取活跃首)。
+    /// ⚠ 仅用于**终局清理**(abandon/complete);单 turn 语义仍走 `active()`
+    /// (多活跃未选定 = 显式错误)。
+    pub(crate) fn take_exec(&mut self) -> Option<ActiveTurn> {
+        let id = self
+            .executing
+            .or_else(|| self.active.first().map(|a| a.id))?;
+        self.take_active(id)
     }
 
     pub(crate) fn new() -> Self {
         Self {
             queue: VecDeque::new(),
-            active: None,
+            active: Vec::new(),
+            executing: None,
+            rr: 0,
             next_id: 1,
             pending_events: VecDeque::new(),
             admit_wait: None,
@@ -299,6 +368,6 @@ impl TurnLedger {
 
     /// 活跃 turn(按 id 过滤)
     pub(crate) fn active_of(&self, turn: u64) -> Option<&ActiveTurn> {
-        self.active.as_ref().filter(|a| a.id == turn)
+        self.active.iter().find(|a| a.id == turn)
     }
 }

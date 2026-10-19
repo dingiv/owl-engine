@@ -80,6 +80,23 @@ pub(crate) enum StepAction {
         gdn_slot: usize,
         grew: bool,
     },
+    /// **跨会话合批 decode**(B5.1 M1;spec off):每行 = 一个会话的一步。
+    /// 执行器一次 T=B 前向 + 逐行采样/事件(每行各自 `TurnEvent`)。
+    BatchDecode { rows: Vec<RowSpec> },
+}
+
+/// 合批 decode 的一行(host 派生量已备齐;与单行 `Decode` 同语义)。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RowSpec {
+    pub turn: u64,
+    pub session_id: u64,
+    pub token: u32,
+    pub pos: usize,
+    pub kv_slot: u32,
+    /// 本步可见 KV 长(= pos + 1;批内各行独立)
+    pub kv_len: usize,
+    pub gdn_slot: usize,
+    pub grew: bool,
 }
 
 impl<D: DeviceClient> RunningEngine<D> {
@@ -220,144 +237,192 @@ impl<D: DeviceClient> RunningEngine<D> {
         (b > pos && (b / page).is_multiple_of(stride)).then_some(b)
     }
 
+    /// **合批行派生**(B5.1;host 侧,零 await):刷新块链(可能跨页增长)并
+    /// 算出本步物理槽。与单行 `Decode` 分支的派生逐式同源(pos+1 行)。
+    fn decode_row_of(&mut self, idx: usize) -> Result<RowSpec> {
+        let (turn, sid, gdn_slot, pos, token) = {
+            let a = &self.turns.active[idx];
+            let token = *a.out.last().ok_or_else(|| {
+                ModelError::EngineInvariant {
+                    what: "合批 decode:行 out 为空(相位判定漂移)".into(),
+                }
+            })?;
+            (a.id, a.session_id, a.gdn_slot, a.fed, token)
+        };
+        let grew = {
+            let s = self.bank.sessions.session_mut(sid)?;
+            let before = s.block_table.len();
+            self.bank
+                .rel
+                .leg
+                .ensure_for_len(&mut s.block_table, pos + 1)?;
+            s.block_table.len() != before
+        };
+        let page = self.dev.pool.page;
+        let kv_slot = {
+            let s = self.bank.sessions.session_mut(sid)?;
+            let b = s.block_table[pos / page];
+            b * page as u32 + (pos % page) as u32
+        };
+        Ok(RowSpec {
+            turn,
+            session_id: sid,
+            token,
+            pos,
+            kv_slot,
+            kv_len: pos + 1,
+            gdn_slot,
+            grew,
+        })
+    }
+
     /// 调度决策(纯主机侧)：turn 启动判定(会话守卫/前缀匹配/快照
     /// 边界)+ 相位决策(prefill chunk / decode 步,host 派生量备齐)。
     /// 只动账(队列/会话账/块账房/活跃 turn),**零 await**。
     pub(crate) fn schedule(&mut self) -> Result<SchedulerOutput> {
         let mut begin = None;
-        if self.turns.active.is_none() {
-            // **准入排队中**(S3b §23.4 `Queue` 姿态):留队首不弹 —— 起 turn
-            // 的权利在准入判决手里;弹了就会绕过判决直接撞 `ensure_for_len`。
-            if let Some((waiting, _)) = self.turns.admit_wait {
-                if self.turns.queue.front().map(|t| t.id) == Some(waiting) {
-                    return Ok(SchedulerOutput::Idle);
-                }
-            }
-            let Some(turn) = self.turns.queue.pop_front() else {
-                return Ok(SchedulerOutput::Idle);
-            };
-            // **准入登记**(S3b §23.2):turn 从此占用一块保留额(实占随
-            // `sync_pool_account` 在段边界更新;天花板门 count 靠它)。
-            self.bank.rel.admission.admit(turn.id, 0, 0)?;
-            self.turns.admit_wait = None;
-            // **S2b(§28):turn 起借 GDN 行**(账在 store:行 = 活跃 turn 的资源;
-            // 物理行号就是账里的行号 —— 一本账,不两份)。行耗尽 = 响亮拒
-            // (`Exhausted`;正常路径由准入面 `gdn_slots` 天花板先挡)。
-            let gdn_row = self.bank.rel.state.borrow_row()?;
-            // E2c 复用形态:**PrefixHit(内容寻址,块链复用 + 快照恢复)/ Fresh(全量)**
-            //
-            // **S2(§25.1①)删掉 GuardHit 快路**:idle 会话不再持设备表 ⇒
-            // "同会话原样复用块链"这条快路不再成立(表已释放),"同会话增量"
-            // 由**内容寻址**接管:tokens 前缀一致 ⇒ 命中;客户端改写历史 ⇒
-            // 命中自然变短(自回退全量)—— 守卫(isolation)的活由内容身份干,
-            // 少一条与内容寻址并行的"账本信任"路径。
-            let (cached_len, _gdn_slot, restore_key, pending_loads) = {
-                let s = self.bank.sessions
-                    .get_mut(turn.session_id)
-                    .expect("submit 已建会话账");
-                if self.dev.pool.paged {
-                    // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)。
-                    // **S3b 收尾**:经 `Rel` 门面**一次问两腿**(块链 + 快照层)
-                    // —— 少一条"引擎自己分别查两处"的旁路(§10.4 律⑤)。
-                    let (hit, recall) = self.bank.rel.match_prefix(&turn.prompt_ids)?;
-                    // S3-3b:宿主承载格(内容在 host)不再整条拒 —— 占位 + 记进
-                    // `pending_loads`,由 `execute_begin` 在段边界回灌(真槽写回,
-                    // 必须在 `write_bt` 之前换掉)。
-                    let (matched_raw, hashes) = (hit.matched_blocks, hit.hashes.clone());
-                    let mut chain: Vec<u32> = Vec::with_capacity(hit.slots.len());
-                    let mut pending_loads: Vec<(usize, owl_store::ChainHash)> = Vec::new();
-                    for (i, (slot, h)) in hit.slots.iter().zip(&hashes).enumerate() {
-                        match slot {
-                            Some(s) => chain.push(*s),
-                            None => {
-                                chain.push(PENDING_LOAD_PLACEHOLDER);
-                                pending_loads.push((i, *h));
+        // B5.1:多活跃 —— 有空位才允许起新 turn(其余逻辑不变)。
+        // **准入排队中**(S3b §23.4 `Queue` 姿态):留队首不弹 —— 起 turn
+        // 的权利在准入判决手里;弹了就会绕过判决直接撞 `ensure_for_len`。
+        // ⚠ 段首既有“排队中 = Idle”在**多活跃**下必须收窄:已有活跃 turn
+        // 时不许因队首被准入卡住而停泵(否则活跃会话被饿死)。
+        let admit_blocked = self
+            .turns
+            .admit_wait
+            .map(|(id, _)| self.turns.queue.front().map(|t| t.id) == Some(id))
+            .unwrap_or(false);
+        if self.turns.active.len() < self.cfg.knobs.max_batch.max(1) && !admit_blocked {
+            if let Some(turn) = self.turns.queue.pop_front() {
+                // **准入登记**(S3b §23.2):turn 从此占用一块保留额(实占随
+                // `sync_pool_account` 在段边界更新;天花板门 count 靠它)。
+                self.bank.rel.admission.admit(turn.id, 0, 0)?;
+                self.turns.admit_wait = None;
+                // **S2b(§28):turn 起借 GDN 行**(账在 store:行 = 活跃 turn 的资源;
+                // 物理行号就是账里的行号 —— 一本账,不两份)。行耗尽 = 响亮拒
+                // (`Exhausted`;正常路径由准入面 `gdn_slots` 天花板先挡)。
+                let gdn_row = self.bank.rel.state.borrow_row()?;
+                // E2c 复用形态:**PrefixHit(内容寻址,块链复用 + 快照恢复)/ Fresh(全量)**
+                //
+                // **S2(§25.1①)删掉 GuardHit 快路**:idle 会话不再持设备表 ⇒
+                // "同会话原样复用块链"这条快路不再成立(表已释放),"同会话增量"
+                // 由**内容寻址**接管:tokens 前缀一致 ⇒ 命中;客户端改写历史 ⇒
+                // 命中自然变短(自回退全量)—— 守卫(isolation)的活由内容身份干,
+                // 少一条与内容寻址并行的"账本信任"路径。
+                let (cached_len, _gdn_slot, restore_key, pending_loads) = {
+                    let s = self.bank.sessions
+                        .get_mut(turn.session_id)
+                        .expect("submit 已建会话账");
+                    if self.dev.pool.paged {
+                        // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)。
+                        // **S3b 收尾**:经 `Rel` 门面**一次问两腿**(块链 + 快照层)
+                        // —— 少一条"引擎自己分别查两处"的旁路(§10.4 律⑤)。
+                        let (hit, recall) = self.bank.rel.match_prefix(&turn.prompt_ids)?;
+                        // S3-3b:宿主承载格(内容在 host)不再整条拒 —— 占位 + 记进
+                        // `pending_loads`,由 `execute_begin` 在段边界回灌(真槽写回,
+                        // 必须在 `write_bt` 之前换掉)。
+                        let (matched_raw, hashes) = (hit.matched_blocks, hit.hashes.clone());
+                        let mut chain: Vec<u32> = Vec::with_capacity(hit.slots.len());
+                        let mut pending_loads: Vec<(usize, owl_store::ChainHash)> = Vec::new();
+                        for (i, (slot, h)) in hit.slots.iter().zip(&hashes).enumerate() {
+                            match slot {
+                                Some(s) => chain.push(*s),
+                                None => {
+                                    chain.push(PENDING_LOAD_PLACEHOLDER);
+                                    pending_loads.push((i, *h));
+                                }
                             }
                         }
-                    }
-                    if self.cfg.knobs.probes.debug {
-                        // 在场性 = **store 的层账**(设备/宿主都算);层号一并打出。
-                        // 头尾都要看(2026-10-19):复用面只认**最靠近链头**的在场面 ⇒
-                        // "前 4 全 '-'"曾把"链头那张缺位"误读成"全丢";故头 4 + 尾 6。
-                        let tier_of = |h: &owl_store::ChainHash| {
-                            match self.bank.rel.state.locate(owl_store::SnapKey::at_boundary(*h)) {
-                                Some(owl_store::Tier::Gpu) => "dev",
-                                Some(owl_store::Tier::Host) => "host",
-                                Some(owl_store::Tier::Disk) => "disk",
-                                None => "-",
-                            }
-                        };
-                        let head: Vec<&str> = hashes.iter().take(4).map(tier_of).collect();
-                        let tail: Vec<&str> = hashes
-                            .iter()
-                            .rev()
-                            .take(6)
-                            .rev()
-                            .map(tier_of)
-                            .collect();
-                        owl_shared::log_debug!(
-                            "dbg prefix",
-                            "match = {matched_raw} blocks / chain = {chain:?} · snap_used={}/{} 边界在场 头4={head:?} 尾6={tail:?}",
-                            self.dev.pool.snap_used(),
-                            self.dev.pool.snap_capacity()
+                        if self.cfg.knobs.probes.debug {
+                            // 在场性 = **store 的层账**(设备/宿主都算);层号一并打出。
+                            // 头尾都要看(2026-10-19):复用面只认**最靠近链头**的在场面 ⇒
+                            // "前 4 全 '-'"曾把"链头那张缺位"误读成"全丢";故头 4 + 尾 6。
+                            let tier_of = |h: &owl_store::ChainHash| {
+                                match self.bank.rel.state.locate(owl_store::SnapKey::at_boundary(*h)) {
+                                    Some(owl_store::Tier::Gpu) => "dev",
+                                    Some(owl_store::Tier::Host) => "host",
+                                    Some(owl_store::Tier::Disk) => "disk",
+                                    None => "-",
+                                }
+                            };
+                            let head: Vec<&str> = hashes.iter().take(4).map(tier_of).collect();
+                            let tail: Vec<&str> = hashes
+                                .iter()
+                                .rev()
+                                .take(6)
+                                .rev()
+                                .map(tier_of)
+                                .collect();
+                            owl_shared::log_debug!(
+                                "dbg prefix",
+                                "match = {matched_raw} blocks / chain = {chain:?} · snap_used={}/{} 边界在场 头4={head:?} 尾6={tail:?}",
+                                self.dev.pool.snap_used(),
+                                self.dev.pool.snap_capacity()
+                            );
+                        }
+                        // 裁剪(末块对齐 + 快照在场)= **单源** `reuse_face`
+                        // (需求驱动保洁 §12.4 用同一份算式,不许各算一份)
+                        let (m, _dev) = Self::reuse_face(
+                            &self.bank.rel,
+                            &hit,
+                            &recall,
+                            turn.prompt_ids.len(),
+                            self.dev.pool.page,
                         );
-                    }
-                    // 裁剪(末块对齐 + 快照在场)= **单源** `reuse_face`
-                    // (需求驱动保洁 §12.4 用同一份算式,不许各算一份)
-                    let (m, _dev) = Self::reuse_face(
-                        &self.bank.rel,
-                        &hit,
-                        &recall,
-                        turn.prompt_ids.len(),
-                        self.dev.pool.page,
-                    );
-                    if self.cfg.knobs.probes.debug {
-                        // 裁剪结果 = 复用面真值(块);页对齐后 = 可复用 token 数
-                        let found = if m > 0 {
-                            match self.bank.rel.state.locate(owl_store::SnapKey::at_boundary(hashes[m - 1])) {
-                                Some(owl_store::Tier::Gpu) => "dev",
-                                Some(owl_store::Tier::Host) => "host",
-                                _ => "?",
+                        if self.cfg.knobs.probes.debug {
+                            // 裁剪结果 = 复用面真值(块);页对齐后 = 可复用 token 数
+                            let found = if m > 0 {
+                                match self.bank.rel.state.locate(owl_store::SnapKey::at_boundary(hashes[m - 1])) {
+                                    Some(owl_store::Tier::Gpu) => "dev",
+                                    Some(owl_store::Tier::Host) => "host",
+                                    _ => "?",
+                                }
+                            } else {
+                                "(无)"
+                            };
+                            owl_shared::log_debug!(
+                                "dbg prefix",
+                                "复用面 m={m}/{matched_raw} 块(= {} tok)/ 落在边界层={found}",
+                                m * self.dev.pool.page
+                            );
+                        }
+                        if m > 0 {
+                            // 只对**已驻留**块加会话引用(宿主格的引用由回灌侧
+                            // `alloc_slot` + `rebind` 建立;占位值不参与账)
+                            for &b in &chain[..m] {
+                                if b != PENDING_LOAD_PLACEHOLDER {
+                                    self.bank.rel.leg.incref(b)?;
+                                }
                             }
+                            pending_loads
+                                .truncate(pending_loads.iter().take_while(|(i, _)| *i < m).count());
+                            let mut old = std::mem::take(&mut s.block_table);
+                            self.bank.rel.leg.release_table(&mut old)?;
+                            s.block_table = chain[..m].to_vec();
+                            // MTP 链同步重置(E5-M2b):保留前缀的 mtp 条目虽
+                            // 语义可复用(同 token 同 hidden 确定性),但 M2b
+                            // 无 prefill extend,重建面 = 0 起步(草稿质量降,
+                            // 恒等不受影响 —— 草稿只影响速度)
+                            let mut mold = std::mem::take(&mut s.mtp_block_table);
+                            self.bank.leg_mtp.release_table(&mut mold)?;
+                            s.reset();
+                            // 链哈希游标播种:身份从缓存哈希链接管(此后 prefill/
+                            // decode 的边界快照键从游标出,不再碰物理块号)
+                            s.chain.seed(m, hashes[m - 1]);
+                            s.cached_len = m * self.dev.pool.page;
+                            (
+                                m * self.dev.pool.page,
+                                gdn_row,
+                                Some(owl_store::SnapKey::at_boundary(hashes[m - 1])),
+                                pending_loads,
+                            )
                         } else {
-                            "(无)"
-                        };
-                        owl_shared::log_debug!(
-                            "dbg prefix",
-                            "复用面 m={m}/{matched_raw} 块(= {} tok)/ 落在边界层={found}",
-                            m * self.dev.pool.page
-                        );
-                    }
-                    if m > 0 {
-                        // 只对**已驻留**块加会话引用(宿主格的引用由回灌侧
-                        // `alloc_slot` + `rebind` 建立;占位值不参与账)
-                        for &b in &chain[..m] {
-                            if b != PENDING_LOAD_PLACEHOLDER {
-                                self.bank.rel.leg.incref(b)?;
-                            }
+                            let mut table = std::mem::take(&mut s.block_table);
+                            self.bank.rel.leg.release_table(&mut table)?;
+                            let mut mold = std::mem::take(&mut s.mtp_block_table);
+                            self.bank.leg_mtp.release_table(&mut mold)?;
+                            s.reset();
+                            (0, gdn_row, None, Vec::new())
                         }
-                        pending_loads
-                            .truncate(pending_loads.iter().take_while(|(i, _)| *i < m).count());
-                        let mut old = std::mem::take(&mut s.block_table);
-                        self.bank.rel.leg.release_table(&mut old)?;
-                        s.block_table = chain[..m].to_vec();
-                        // MTP 链同步重置(E5-M2b):保留前缀的 mtp 条目虽
-                        // 语义可复用(同 token 同 hidden 确定性),但 M2b
-                        // 无 prefill extend,重建面 = 0 起步(草稿质量降,
-                        // 恒等不受影响 —— 草稿只影响速度)
-                        let mut mold = std::mem::take(&mut s.mtp_block_table);
-                        self.bank.leg_mtp.release_table(&mut mold)?;
-                        s.reset();
-                        // 链哈希游标播种:身份从缓存哈希链接管(此后 prefill/
-                        // decode 的边界快照键从游标出,不再碰物理块号)
-                        s.chain.seed(m, hashes[m - 1]);
-                        s.cached_len = m * self.dev.pool.page;
-                        (
-                            m * self.dev.pool.page,
-                            gdn_row,
-                            Some(owl_store::SnapKey::at_boundary(hashes[m - 1])),
-                            pending_loads,
-                        )
                     } else {
                         let mut table = std::mem::take(&mut s.block_table);
                         self.bank.rel.leg.release_table(&mut table)?;
@@ -366,110 +431,152 @@ impl<D: DeviceClient> RunningEngine<D> {
                         s.reset();
                         (0, gdn_row, None, Vec::new())
                     }
-                } else {
-                    let mut table = std::mem::take(&mut s.block_table);
-                    self.bank.rel.leg.release_table(&mut table)?;
-                    let mut mold = std::mem::take(&mut s.mtp_block_table);
-                    self.bank.leg_mtp.release_table(&mut mold)?;
-                    s.reset();
-                    (0, gdn_row, None, Vec::new())
-                }
-            };
-            // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
-            //
-            // **锁①后半(2026-10-19)**:原实现一次长到**整个 prompt** ——
-            // 池 ≥ ctx 时从不暴露;池 < ctx(虚拟化档)时那一步就要几千页槽
-            // ⇒ 必 `Exhausted`。虚拟化档只长到**首个 chunk** 的那几页,
-            // 后面由 `execute_prefill` 逐 chunk 增量长(用到哪长到哪);
-            // 腾位归召回点的驻留调和。
-            {
-                let s = self.bank.sessions
-                    .get_mut(turn.session_id)
-                    .expect("submit 已建会话账");
-                let target = if self.cfg.knobs.kvmem_virtualization {
-                    Self::prefill_step_chunk(
-                        0,
-                        turn.prompt_ids.len(),
-                        self.cfg.prefill_chunk,
-                        self.cfg.knobs.prefill_tail_merge,
-                        Self::prefill_align_page(
-                            self.cfg.knobs.prefill_align_tail,
-                            self.cfg.knobs.prefix_cache,
-                            self.dev.pool.page,
-                        ),
-                    )
-                    .unwrap_or(1)
-                } else {
-                    turn.prompt_ids.len()
                 };
-                self.bank.rel.leg.ensure_for_len(&mut s.block_table, target)?;
-            }
-            begin = Some(BeginPlan {
-                session_id: turn.session_id,
-                gdn_slot: gdn_row,
-                restore_key,
-                reset_gdn: cached_len == 0,
-                pending_loads,
-            });
-            let ignore_eos = turn.spec.ignore_eos;
-            let opts = turn.opts.clone();
-            // 采样面合并(AGT-06):请求覆写按字段并入引擎 knobs;
-            // 请求未表达采样意图 ⇒ 完全走 knobs(flavor 语义不变)
-            let (eff_sampler, sampler_on) = match opts.sampler {
-                Some(o) if !o.is_empty() => {
-                    let mut s = self.cfg.knobs.sampler;
-                    if let Some(t) = o.temp {
-                        s.temp = t;
-                    }
-                    if let Some(k) = o.topk {
-                        s.topk = k;
-                    }
-                    if let Some(p) = o.topp {
-                        s.topp = p;
-                    }
-                    let on = s.temp > 0.0;
-                    (s, on)
+                // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
+                //
+                // **锁①后半(2026-10-19)**:原实现一次长到**整个 prompt** ——
+                // 池 ≥ ctx 时从不暴露;池 < ctx(虚拟化档)时那一步就要几千页槽
+                // ⇒ 必 `Exhausted`。虚拟化档只长到**首个 chunk** 的那几页,
+                // 后面由 `execute_prefill` 逐 chunk 增量长(用到哪长到哪);
+                // 腾位归召回点的驻留调和。
+                {
+                    let s = self.bank.sessions
+                        .get_mut(turn.session_id)
+                        .expect("submit 已建会话账");
+                    let target = if self.cfg.knobs.kvmem_virtualization {
+                        Self::prefill_step_chunk(
+                            0,
+                            turn.prompt_ids.len(),
+                            self.cfg.prefill_chunk,
+                            self.cfg.knobs.prefill_tail_merge,
+                            Self::prefill_align_page(
+                                self.cfg.knobs.prefill_align_tail,
+                                self.cfg.knobs.prefix_cache,
+                                self.dev.pool.page,
+                            ),
+                        )
+                        .unwrap_or(1)
+                    } else {
+                        turn.prompt_ids.len()
+                    };
+                    self.bank.rel.leg.ensure_for_len(&mut s.block_table, target)?;
                 }
-                _ => (self.cfg.knobs.sampler, self.cfg.knobs.sampler_enabled),
-            };
-            // **[N1 TurnBegin]**:turn 上设备 —— 归属 `Turn(id)`;类别 `Temp`
-            //    (turn 域的一切分配都是临时面:激活/工作区/回退;常驻面在 boot 已归 System)
-            let admit_id = turn.id;
-            self.set_dev_ctx(
-                owl_iface::handle::Owner::Turn(admit_id),
-                owl_iface::handle::AssetClass::Temp,
-            );
-            self.turns.active = Some(crate::turn::ActiveTurn {
-                id: turn.id,
-                session_id: turn.session_id,
-                gdn_slot: gdn_row,
-                ephemeral: turn.ephemeral,
-                prompt_ids: turn.prompt_ids,
-                max_new: turn.spec.max_new,
-                ignore_eos,
-                sampler: eff_sampler,
-                sampler_on,
-                stop: opts.stop,
-                emitted: 0,
-                trim_text_to: None,
-                seed: opts.seed,
-                out: Vec::new(),
-                fed: cached_len,
-                cached_start: cached_len,
-                decoded: String::new(),
-                spec: crate::turn::TurnSpecState {
-                    // B4 分母**跨 turn 保鲜**(见 RunningEngine::bare_cost_carry_ms);
-                    // 其余 spec 态仍全零 = 生命周期收口纪律不动
-                    bare_cost_ewma_ms: self.dev.spec_rt.carry_ms,
-                    bare_cost_ctx: self.dev.spec_rt.carry_ctx,
-                    // 分母未测 ⇒ 本 turn 发播种裸步(见 TurnSpecState::bare_seed_left)
-                    bare_seed_left: if self.dev.spec_rt.carry_ms > 0.0 { 0 } else { crate::turn::SPEC_SEED_SAMPLES },
-                    ..Default::default()
-                },
+                begin = Some(BeginPlan {
+                    session_id: turn.session_id,
+                    gdn_slot: gdn_row,
+                    restore_key,
+                    reset_gdn: cached_len == 0,
+                    pending_loads,
+                });
+                let ignore_eos = turn.spec.ignore_eos;
+                let opts = turn.opts.clone();
+                // 采样面合并(AGT-06):请求覆写按字段并入引擎 knobs;
+                // 请求未表达采样意图 ⇒ 完全走 knobs(flavor 语义不变)
+                let (eff_sampler, sampler_on) = match opts.sampler {
+                    Some(o) if !o.is_empty() => {
+                        let mut s = self.cfg.knobs.sampler;
+                        if let Some(t) = o.temp {
+                            s.temp = t;
+                        }
+                        if let Some(k) = o.topk {
+                            s.topk = k;
+                        }
+                        if let Some(p) = o.topp {
+                            s.topp = p;
+                        }
+                        let on = s.temp > 0.0;
+                        (s, on)
+                    }
+                    _ => (self.cfg.knobs.sampler, self.cfg.knobs.sampler_enabled),
+                };
+                // **[N1 TurnBegin]**:turn 上设备 —— 归属 `Turn(id)`;类别 `Temp`
+                //    (turn 域的一切分配都是临时面:激活/工作区/回退;常驻面在 boot 已归 System)
+                let admit_id = turn.id;
+                self.set_dev_ctx(
+                    owl_iface::handle::Owner::Turn(admit_id),
+                    owl_iface::handle::AssetClass::Temp,
+                );
+                self.turns.active.push(crate::turn::ActiveTurn {
+                    id: turn.id,
+                    session_id: turn.session_id,
+                    gdn_slot: gdn_row,
+                    ephemeral: turn.ephemeral,
+                    prompt_ids: turn.prompt_ids,
+                    max_new: turn.spec.max_new,
+                    ignore_eos,
+                    sampler: eff_sampler,
+                    sampler_on,
+                    stop: opts.stop,
+                    emitted: 0,
+                    trim_text_to: None,
+                    seed: opts.seed,
+                    out: Vec::new(),
+                    fed: cached_len,
+                    cached_start: cached_len,
+                    decoded: String::new(),
+                    spec: crate::turn::TurnSpecState {
+                        // B4 分母**跨 turn 保鲜**(见 RunningEngine::bare_cost_carry_ms);
+                        // 其余 spec 态仍全零 = 生命周期收口纪律不动
+                        bare_cost_ewma_ms: self.dev.spec_rt.carry_ms,
+                        bare_cost_ctx: self.dev.spec_rt.carry_ctx,
+                        // 分母未测 ⇒ 本 turn 发播种裸步(见 TurnSpecState::bare_seed_left)
+                        bare_seed_left: if self.dev.spec_rt.carry_ms > 0.0 { 0 } else { crate::turn::SPEC_SEED_SAMPLES },
+                        ..Default::default()
+                    },
+                });
+            } // if let Some(turn) = pop_front
+        }
+        // 队列空 + 无活跃 ⇒ Idle(有活跃则继续本步相位决策)
+        if self.turns.active.is_empty() {
+            return Ok(SchedulerOutput::Idle);
+        }
+
+        // ── B5.1 批 decode 门 ────────────────────────────────────────────
+        // 判据(全部成立才拼批;任一不成立走单 turn 旧路,零行为变化):
+        // ① 至少 2 个活跃且都在生成相位(无 prefill 欠账);
+        // ② **无投机**(depth==0):spec 轮的 GDN 是顺序块 + 快照,批化是 M2;
+        // ③ 单 rank(TP 的 AR 批语义未审,R8);④ 选择层视图关闭(页表需 per-row)。
+        if self.cfg.knobs.max_batch > 1
+            && self.turns.active.len() >= 2
+            && self.turns.active.iter().all(|a| a.fed >= a.prompt_ids.len())
+            && self.dev.spec_rt.depth == 0
+            && self.peer.is_none()
+            && self.sel_view.is_none()
+        {
+            let n = self.turns.active.len().min(self.cfg.knobs.max_batch);
+            let mut rows = Vec::with_capacity(n);
+            for i in 0..n {
+                rows.push(self.decode_row_of(i)?);
+            }
+            self.turns.select(None);
+            return Ok(SchedulerOutput::Step {
+                begin,
+                action: StepAction::BatchDecode { rows },
             });
         }
 
-        // 相位决策:prompt 相位(块式 prefill;W1/PF1)优先
+        // 相位决策:prompt 相位(块式 prefill;W1/PF1)优先。
+        // 多活跃时选**欠账最多的 prefill turn**(先把 prompt 灌完),否则
+        // round-robin 推进生成相(单 turn 档 = 唯一活跃,行为不变)。
+        let pick_idx = if let Some(i) = self
+            .turns
+            .active
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.fed < a.prompt_ids.len())
+            .min_by_key(|(_, a)| a.fed)
+            .map(|(i, _)| i)
+        {
+            i
+        } else {
+            let n = self.turns.active.len();
+            let i = self.turns.rr % n;
+            self.turns.rr = self.turns.rr.wrapping_add(1);
+            i
+        };
+        let pick_id = self.turns.active[pick_idx].id;
+        self.turns.select(Some(pick_id));
+
         let act = self.turns.active()?;
         if act.fed < act.prompt_ids.len() {
             let base = act.fed;
@@ -547,7 +654,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         } else {
             0
         };
-        let gdn_row = self.turns.active.as_ref().map(|a| a.gdn_slot).ok_or_else(|| {
+        let gdn_row = self.turns.active.first().map(|a| a.gdn_slot).ok_or_else(|| {
             owl_iface::contract::ModelError::Msg("decode 相位:无活跃 turn(行号真源缺失)".into())
         })?;
         let (kv_slot, kv_slots, gdn_slot, grew) = {

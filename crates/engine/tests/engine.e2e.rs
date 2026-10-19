@@ -174,6 +174,7 @@ async fn e2e_body() {
 
     // ── 0.8B 其余档:boot 期配置各不相同,各自装载 ──
     run!(gpu_schedule_decision_surface); // max_seq=64/chunk=4(切块敏感)
+    run!(gpu_batch_decode_matches_serial); // B5.1 合批 decode(T=2,0.8B)
     // §18 CPU mock 档:同一套 store 三门口跑在 CpuFace 上(无卡;OWL_CPU_MOCK 门控)
     run!(cpu_mock_offload_probe);
     run!(cpu_mock_state_leg_probe);
@@ -203,6 +204,7 @@ async fn e2e_body() {
     // ── 27B 其余档:boot 期配置各不相同(草稿类型/池/fp8/slab),各自装载 ──
     run!(gpu_27b_raw_completion_diag);   // greedy + Dumb 草稿 + slab
     run!(gpu_decode_marginal_bench);     // greedy + slots1
+    run!(gpu_batch_decode_bench_27b);    // B5.1 合批 decode 吞吐(27B,spec off)
     run!(gpu_spec_identity_gate_27b);    // MTP 草稿
     run!(gpu_dflash2_identity_gate_27b); // DFlash2 草稿 + fp8 池
 

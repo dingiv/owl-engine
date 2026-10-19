@@ -731,7 +731,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let chain: Vec<u32> = self
             .turns
             .active
-            .as_ref()
+            .first()
             .and_then(|a| self.bank.sessions.get(a.session_id))
             .map(|s| s.block_table.clone())
             .unwrap_or_default();

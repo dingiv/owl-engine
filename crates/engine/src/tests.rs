@@ -686,7 +686,7 @@ pub async fn gpu_schedule_decision_surface() {
                 }
                 _ => panic!("期望 Prefill"),
             }
-            eng.turns.active.as_ref().unwrap().prompt_ids.len()
+            eng.turns.active[0].prompt_ids.len()
         }
         _ => panic!("期望 Step"),
     };
@@ -703,7 +703,7 @@ pub async fn gpu_schedule_decision_surface() {
 
     // 模拟执行器推进至 prompt 末 + 产出首 token → decode 派生量备齐
     {
-        let act = eng.turns.active.as_mut().unwrap();
+        let act = &mut eng.turns.active[0];
         act.fed = act.prompt_ids.len();
         act.out.push(7);
     }
@@ -738,7 +738,7 @@ pub async fn gpu_schedule_decision_surface() {
     // ⇒ 内容寻址命中 0 块 ⇒ Fresh(重置 + 全量起步)。这正是新语义的判据:
     // "有没有得复用"由**内容身份**说了算,不由会话账说了算。
     {
-        let act = eng.turns.active.take().unwrap();
+        let act = eng.turns.active.pop().expect("模拟器活跃 turn");
         let s = eng.bank.sessions.get_mut(act.session_id).unwrap();
         s.commit_turn(&act.prompt_ids, &[]);
         s.cached_len -= 2;
@@ -3165,7 +3165,239 @@ pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<crate::Gpu
     }
 }
 
-    /// **0.8B 默认档共享装载**(e2e 唯一装载点之一;6 步共用:
+/// **B5.1 合批 decode 语义门**(2026-10-20,M1):两会话并发(T=2 批步)
+/// 与串行两跑**逐字相同**;并证明批路径真的被走到(`batch_steps > 0`)。
+///
+/// 判据纪律:greedy(确定性 + 不抽签);同一引擎实例、同一 prompt、临时会话
+/// (互不污染);批臂 = 同时 submit 两 turn(调度面先各自 prefill,再合批)。
+pub async fn gpu_batch_decode_matches_serial() {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 256,
+        prefill_chunk: 32,
+        knobs: EngineKnobs {
+            max_batch: 2,
+            gdn_slots: 2,
+            sampler_enabled: false,
+            ..Default::default()
+        },
+    })
+    .expect("构造(合批档)");
+    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+    assert!(running.has_batch_graph(), "合批图应捕获成功(否则测的是 eager 臂)");
+
+    let p1 = "用一句话介绍长城。";
+    let p2 = "What is the capital of France?";
+    // 串行臂:两题各自单跑(只有一活跃 ⇒ 批门不触发)
+    async fn drive(r: &mut RunningEngine<crate::GpuFace>, id: u64) -> String {
+        loop {
+            match r.pump().await.expect("pump") {
+                TurnEvent::Completed { turn, text, .. } if turn == id => return text,
+                TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+                TurnEvent::Idle => panic!("t{id}: Idle(队列丢失)"),
+                ev => eprintln!("[ev] {ev:?}"),
+            }
+        }
+    }
+    let s1 = running.submit(p1, 16).expect("submit serial t1");
+    let a1 = drive(&mut running, s1).await;
+    let s2 = running.submit(p2, 16).expect("submit serial t2");
+    let a2 = drive(&mut running, s2).await;
+    assert!(running.batch_steps() == 0, "串行臂不应走批路径");
+    eprintln!("[batch][serial] A={a1:?}\n[batch][serial] B={a2:?}");
+
+    // ── 合批臂:两 turn 同时在场 ──
+    let t1 = running.submit(p1, 16).expect("submit t1");
+    let t2 = running.submit(p2, 16).expect("submit t2");
+    let (mut b1, mut b2) = (None, None);
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Idle => break,
+            TurnEvent::Completed { turn, text, .. } if turn == t1 => b1 = Some(text),
+            TurnEvent::Completed { turn, text, .. } if turn == t2 => b2 = Some(text),
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+            _ => {}
+        }
+    }
+    let (b1, b2) = (b1.expect("t1 完成"), b2.expect("t2 完成"));
+    eprintln!("[batch][concurrent] A={b1:?}\n[batch][concurrent] B={b2:?}");
+    assert!(running.batch_steps() > 0, "合批路径必须真被走到(batch_steps=0)");
+    assert_eq!(a1, b1, "会话 A:合批 ≠ 串行");
+    assert_eq!(a2, b2, "会话 B:合批 ≠ 串行");
+    eprintln!("[batch] ✅ 贪心逐字相同;批步数 = {}", running.batch_steps());
+
+    // ── 采样档腿:固定 seed + 温度(图内 logits 行切片 → per-turn sample)──
+    let opts = || crate::turn::TurnOpts {
+        ignore_eos: true,
+        sampler: Some(crate::turn::TurnSampler {
+            temp: Some(1.0),
+            topk: Some(0),
+            topp: Some(1.0),
+        }),
+        seed: Some(20261020),
+        ..Default::default()
+    };
+    let mut samp_serial = Vec::new();
+    for p in [p1, p2] {
+        let (_, id) = running
+            .submit_session_opts(None, p, 16, opts())
+            .expect("submit sampling serial");
+        samp_serial.push(drive(&mut running, id).await);
+    }
+    let i1 = running
+        .submit_session_opts(None, p1, 16, opts())
+        .expect("submit sampling b1")
+        .1;
+    let i2 = running
+        .submit_session_opts(None, p2, 16, opts())
+        .expect("submit sampling b2")
+        .1;
+    let (mut s1, mut s2) = (None, None);
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Completed { turn, text, .. } if turn == i1 => s1 = Some(text),
+            TurnEvent::Completed { turn, text, .. } if turn == i2 => s2 = Some(text),
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+            TurnEvent::Idle => break,
+            _ => {}
+        }
+        if s1.is_some() && s2.is_some() {
+            break;
+        }
+    }
+    assert_eq!(samp_serial[0], s1.expect("采样 t1 完成"), "采样档 A 不一致");
+    assert_eq!(samp_serial[1], s2.expect("采样 t2 完成"), "采样档 B 不一致");
+    eprintln!("[batch] ✅ 采样档(seed 固定)逐字相同");
+
+    // 同会话并发 = 结构性互踩 ⇒ 必须在提交边界响亮拒(合批档)
+    let (_sid, live) = running.submit_session(Some(77), p1, 8).expect("live turn");
+    let dup = running.submit_session(Some(77), p2, 8);
+    assert!(dup.is_err(), "同会话已有活跃 turn,第二个 submit 应拒");
+    let _ = drive(&mut running, live).await;
+}
+
+    /// **B5.1 合批 decode 吞吐台(27B AWQ;spec off)** —— M1b 图臂的实测账。
+///
+/// 口径:同两 prompt、greedy + ignore_eos(64 tok),**计时窗 = 首 Token → 双完成**
+/// (排除 prefill/装载);串行臂 = 两 turn 先后跑(单活跃),合批臂 = 同时在场。
+/// 判据:① 输出逐字相同(语义门)② 批步数 > 0(真走批路径)③ 打印 t/s 比值。
+pub async fn gpu_batch_decode_bench_27b() {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+        eprintln!("skip: ckpt:27b-awq 未设");
+        return;
+    };
+    let max_new = 64usize;
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 2048,
+        prefill_chunk: 256,
+        knobs: EngineKnobs {
+            max_batch: 2,
+            gdn_slots: 2,
+            sampler_enabled: false,
+            pool_tokens: Some(4096),
+            ..Default::default()
+        },
+    })
+    .expect("构造(合批档 27B)");
+    let loaded = engine
+        .loader()
+        .load_qwen38_27b_awq(
+            std::path::Path::new(&dir),
+            std::path::Path::new(&dir),
+            owl_models::module::QuantPlan::F16,
+            owl_models::module::QuantPlan::W4A16Awq,
+        )
+        .await
+        .expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+    assert!(running.has_batch_graph(), "27B 合批图应捕获成功");
+    let p1 = "用一段话解释什么是量子纠缠。";
+    let p2 = "Explain briefly how a transformer works.";
+
+    // 串行臂
+    let t0 = std::time::Instant::now();
+    let mut first_token_at = None;
+    let mut texts = [String::new(), String::new()];
+    for (i, p) in [p1, p2].iter().enumerate() {
+        let (_, id) = running
+            .submit_session_ex(None, *p, max_new, true)
+            .expect("submit serial");
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Token { turn, .. } if turn == id && first_token_at.is_none() => {
+                    first_token_at = Some(std::time::Instant::now());
+                }
+                TurnEvent::Completed { turn, text, .. } if turn == id => {
+                    texts[i] = text;
+                    break;
+                }
+                TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+                TurnEvent::Idle => panic!("t{id}: Idle"),
+                _ => {}
+            }
+        }
+    }
+    let serial_wall = first_token_at.unwrap().elapsed();
+    let _ = t0;
+    let serial_steps = running.batch_steps();
+    assert_eq!(serial_steps, 0, "串行臂不应走批路径");
+
+    // 合批臂
+    first_token_at = None;
+    let mut done = [None, None];
+    let ids = [
+        running.submit_session_ex(None, p1, max_new, true).expect("submit b1").1,
+        running.submit_session_ex(None, p2, max_new, true).expect("submit b2").1,
+    ];
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Token { turn, .. } if first_token_at.is_none() && ids.contains(&turn) => {
+                first_token_at = Some(std::time::Instant::now());
+            }
+            TurnEvent::Completed { turn, text, .. } => {
+                if turn == ids[0] {
+                    done[0] = Some(text);
+                } else if turn == ids[1] {
+                    done[1] = Some(text);
+                }
+                if done.iter().all(|d| d.is_some()) {
+                    break;
+                }
+            }
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+            TurnEvent::Idle => panic!("合批臂 Idle"),
+            _ => {}
+        }
+    }
+    let batch_wall = first_token_at.unwrap().elapsed();
+    let batch_steps = running.batch_steps();
+    assert!(batch_steps > 0, "合批臂没走批路径");
+    assert_eq!(texts[0], done[0].clone().unwrap(), "A 输出不一致");
+    assert_eq!(texts[1], done[1].clone().unwrap(), "B 输出不一致");
+    let toks = (max_new * 2) as f64;
+    let s_ts = toks / serial_wall.as_secs_f64();
+    let b_ts = toks / batch_wall.as_secs_f64();
+    eprintln!(
+        "[batch-bench-27b] 串行 {:.2}s = {s_ts:.1} t/s | 合批 {:.2}s = {b_ts:.1} t/s | 比值 ×{:.2} | 批步数 {batch_steps}",
+        serial_wall.as_secs_f64(),
+        batch_wall.as_secs_f64(),
+        b_ts / s_ts
+    );
+    assert!(b_ts > s_ts, "合批应更快(反之 = 合批路径有退化)");
+}
+
+/// **0.8B 默认档共享装载**(e2e 唯一装载点之一;6 步共用:
 /// schedule_decision_surface / two_turns_lifecycle / session_continuity /
 /// multi_session_isolation / prefix_cache_hit / longctx_4k_prefix_qa)。
 /// 装载本身即一步测试(构造+装载+装配+捕获态断言+计时)。

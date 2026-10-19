@@ -803,7 +803,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let ev = self.sample_and_emit(t).await?;
             // 预算尽的末 token 走 Token + pending Completed(见 phases)——
             // 故 active 已尽也算 done,余段作废
-            let done = matches!(ev, TurnEvent::Completed { .. }) || self.turns.active.is_none();
+            let done = matches!(ev, TurnEvent::Completed { .. }) || self.turns.active.is_empty();
             evq.push_back(ev);
             if done {
                 break; // eos/预算:余段作废
@@ -1116,7 +1116,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             debug_assert_eq!(parent, tail, "逐块重放尾哈希须与 advance 一致(身份单源)");
             // S2b:快照拍摄用的是**本 turn 的行**(turn 域资源)
             (
-                self.turns.active.as_ref().map(|a| a.gdn_slot).unwrap_or(0),
+                self.turns.active().map(|a| a.gdn_slot).unwrap_or(0),
                 owl_store::SnapKey::at_boundary(tail),
                 per,
                 parent0, // = 本次推进前的链尾(增量登记起点)
@@ -1521,7 +1521,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         hi: usize,
         tail: &[u32],
     ) -> Result<Vec<u32>> {
-        let act = self.turns.active.as_ref().ok_or_else(|| {
+        let act = self.turns.active().map_err(|_| {
             ModelError::Msg("无活跃 turn:快照边界必须落在本 turn 的 token 链上".into())
         })?;
         let plen = act.prompt_ids.len();
