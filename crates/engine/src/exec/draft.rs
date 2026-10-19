@@ -98,6 +98,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         let t1 = prof.then(std::time::Instant::now);
+        // ★ **切档收割面**（P1.1 × P2.1,2026-10-19）:图本档只出半表候选
+        // （`drafts` 槽不写）⇒ 走"读两 rank 候选 → host 合并 → rank0 select"。
+        if self.head_split_active() {
+            return self.dflash_select_merged(bonus).await;
+        }
         let pg = self
             .dev
             .graphs
@@ -919,6 +924,130 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
 
+    /// **切档 propose 的收割面**（P1.1 × P2.1,2026-10-19）
+    ///
+    /// 图（每 rank，半表）已出三槽：`topk_vals`/`topk_ids`（各 `[7,16]`）与
+    /// `sel_proj`（`[7,rank]`）。本函数:
+    /// ① 读两 rank 候选（rank1 的 id 是**半表域**）；
+    /// ② host 合并 → 全局 top-16（纯函数 `merge_topk_two_halves`）；
+    /// ③ **rank0** 跑 selector（全表域；码本全量）→ drafts。
+    ///
+    /// 为什么正确:全局 top-16 ⊆ 两半各自 top-16 的并集（截断性质）。
+    /// 为什么 rank0:读数面单点（与全合一档同构）；peer 的图输出照旧丢弃。
+    async fn dflash_select_merged(&mut self, bonus: u32) -> Result<Vec<u32>> {
+        use owl_models::layers::dflash2::{DEPTH, TOP_K};
+        let rows = DEPTH;
+        let k = TOP_K;
+        let half = self.dev.model.logits_vocab();
+        // ① rank0 三槽（图输出；dtoh）。`topk` = 单缓冲:前段值区 ‖ 后段索引区。
+        let (v0, c0, proj, dt) = {
+            let pg = self
+                .dev
+                .graphs
+                .dflash
+                .as_mut()
+                .ok_or_else(|| ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() })?;
+            let t = pg.read_output_f32("topk").await?;
+            let p = pg.read_output_f32("sel_proj").await?;
+            if t.len() != 2 * rows * k {
+                return Err(ModelError::EngineInvariant {
+                    what: format!("切档 propose topk 槽尺寸不符:{} ≠ {}", t.len(), 2 * rows * k),
+                });
+            }
+            (t[..rows * k].to_vec(), t[rows * k..].to_vec(), p, self.dev.spec_rt.draft_dt)
+        };
+        // ② peer 同槽（候选）
+        let (v1, c1) = {
+            let p = self
+                .peer
+                .as_mut()
+                .ok_or_else(|| ModelError::EngineInvariant { what: "切档 propose 缺 peer".into() })?;
+            let pg1 = p
+                .graphs
+                .dflash
+                .as_mut()
+                .ok_or_else(|| ModelError::EngineInvariant { what: "peer dflash_graph 缺席".into() })?;
+            let t = pg1.read_output_f32("topk").await?;
+            if t.len() != 2 * rows * k {
+                return Err(ModelError::EngineInvariant {
+                    what: format!("peer 切档 propose topk 槽尺寸不符:{} ≠ {}", t.len(), 2 * rows * k),
+                });
+            }
+            (t[..rows * k].to_vec(), t[rows * k..].to_vec())
+        };
+        // ③ host 合并（rank1 的 id + half）
+        let (mv, mc) = crate::running::merge_topk_two_halves(&v0, &c0, &v1, &c1, rows, k, half)?;
+        // ④ rank0 select（eager;全表域 —— 候选已合并、码本全量）
+        let d2 = match self.dev.spec_rt.drafter.as_ref() {
+            Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
+            _ => {
+                return Err(ModelError::EngineInvariant {
+                    what: "切档 propose 收割:草稿器缺席/非 DFlash2".into(),
+                })
+            }
+        };
+        let rank = d2.selector_rank();
+        if mv.len() != rows * k || mc.len() != rows * k || proj.len() != rows * rank {
+            return Err(ModelError::EngineInvariant {
+                what: format!(
+                    "切档 propose 槽形状不符:vals {} / ids {} / proj {}(期望 {}×{}/{})",
+                    mv.len(),
+                    mc.len(),
+                    proj.len(),
+                    rows,
+                    k,
+                    rows * rank
+                ),
+            });
+        }
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let cand_v: Vec<f32> = mc.iter().map(|&i| i as f32).collect();
+        let cand_t = owl_models::TensorOps::from_host(Dtype::F32, vec![rows, k], &f32b(&cand_v));
+        let vals_t = owl_models::TensorOps::from_host(Dtype::F32, vec![rows, k], &f32b(&mv));
+        // proj 回送按**草稿 dt**（图槽已是 dt，读回 f32 无损 ⇒ 再编码回 dt 无损）
+        let proj_bytes = match dt {
+            Dtype::F16 => proj
+                .iter()
+                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
+            Dtype::BF16 => proj
+                .iter()
+                .flat_map(|f| half::bf16::from_f32(*f).to_le_bytes())
+                .collect::<Vec<u8>>(),
+            _ => f32b(&proj),
+        };
+        let proj_t = owl_models::TensorOps::from_host(dt, vec![rows, rank], &proj_bytes);
+        let anchor_t = owl_models::TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[bonus as f32]));
+        let (drafts, _scores) =
+            d2.selector()
+                .select_from_candidates(&cand_t, &vals_t, &proj_t, &anchor_t, rows);
+        let face = self.dev.graphs.session.face_mut();
+        let (b, arena) = owl_models::interpreters::eval_ops_scoped_env(
+            drafts.step(),
+            face,
+            self.dev.env,
+            self.dev.tp.as_ref(),
+        )
+        .await?;
+        let mut buf = vec![0u8; 4 * rows];
+        let face = self.dev.graphs.session.face_mut();
+        face.dtoh(&b, &mut buf).await?;
+        face.free(&[b.id]).await?;
+        face.free(&arena).await?;
+        owl_shared::log_debug!(
+            "dflash-probe",
+            "切档 propose 收割:候选合并 {}+{} → 全表 {} 行 top-{}",
+            half,
+            half,
+            rows,
+            k
+        );
+        Ok(buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+            .collect())
+    }
+
     /// mtp 链表 ensure(E5-M2b;propose eager 路径用 from_host 表,非持久
     /// bt 块 —— 图不烘焙 mtp 链)。返回 host 块链副本。
     pub(crate) fn mtp_chain_bt(&mut self, cover: usize) -> Result<Vec<u32>> {
@@ -948,7 +1077,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let s = self.bank.sessions.get(act.session_id).expect("账在");
             s.block_table.clone()
         };
+        // P1.1 词表切:切档 ⇒ 两 rank 都读半表行(rank0 host 拼接);
+        // 未切档 = 调用方原值(peer 那份 D2H 不付)。
+        // 实效判据 = 本 rank logits 宽 < 全量(不读意图位;在借用之前取)。
+        let head_split = self.head_split_active();
         let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+        let want_logits = want_logits || head_split;
+        let half_vocab = dev.model.logits_vocab();
         let out = match peer {
             None => {
                 dev.verify_forward_dev(block, base, gdn_slot, want_logits, &bt_chain)
@@ -971,8 +1106,51 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     peer_fut,
                 )
                 .await;
-                r1?;
-                r0?
+                let (_, _, lg1) = r1?;
+                let (ids0, hid0, lg0) = r0?;
+                if head_split {
+                    // 半表行 → 全表行(rank0 低半 ++ rank1 高半),再按全表重算
+                    // 每行 argmax —— 设备 ids 在切档下是**局部** index,不可用。
+                    let (a, b) = match (lg0, lg1) {
+                        (Some(a), Some(b)) => (a, b),
+                        _ => {
+                            return Err(owl_iface::contract::ModelError::EngineInvariant {
+                                what: "词表切 verify_forward:半表行缺席(镜像/读面不一致)"
+                                    .into(),
+                            })
+                        }
+                    };
+                    let full = crate::running::concat_head_rows(&a, &b, half_vocab)?;
+                    let v = dev.model.vocab_size();
+                    if full.len() < block.len() * v {
+                        return Err(owl_iface::contract::ModelError::EngineInvariant {
+                            what: format!(
+                                "词表切 verify_forward:全表行尺寸不符 {} < {}×{}",
+                                full.len(),
+                                block.len(),
+                                v
+                            ),
+                        });
+                    }
+                    let ids: Vec<u32> = (0..block.len())
+                        .map(|r| {
+                            full[r * v..(r + 1) * v]
+                                .iter()
+                                .enumerate()
+                                .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+                                    if x > a.1 {
+                                        (i, x)
+                                    } else {
+                                        a
+                                    }
+                                })
+                                .0 as u32
+                        })
+                        .collect();
+                    (ids, hid0, Some(full))
+                } else {
+                    (ids0, hid0, lg0)
+                }
             }
         };
         Ok(out)

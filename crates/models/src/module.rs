@@ -165,6 +165,9 @@ pub struct TpCtx {
     /// e4m3(1B/元素 + 64 元素/尺度 f16 ⇒ 1.031× 原字节)。两侧必须同档
     /// (rank 同装配 ⇒ 同值)。缺省 false ⇒ 与历史逐字一致。
     pub ar_f8: bool,
+    /// ★ **v1 两核融合档**(§11.2;2026-10-19):`true` ⇒ 一核做完两段
+    /// (`ArFusedCall`);**只非 fp8 载荷**(fp8 腿仍两核)。缺省 false。
+    pub ar_fused: bool,
 }
 
 impl TpCtx {
@@ -1050,6 +1053,17 @@ pub struct Want {
     /// 构造者(Attention/GDN)用 [`LoaderOps::with_segments`] 声明;
     /// **怎么切**仍归装载面(规则表 `plan::rules::rule_of`)—— 层不感知切分。
     pub segments: Option<Vec<usize>>,
+    /// **层声明的规则覆盖**(P1.1,2026-10-19)。`Some` = 本张量的切分规则
+    /// **不由键名决定**,由它的构造者声明(唯一消费者 = lm_head 的词表切:
+    /// `Linear::with_tp_rule(UniformCol)`);`None` = 走键表默认
+    /// ([`crate::plan::rules::rule_of_want`])。
+    ///
+    /// 为什么需要:键表按**键名**推规则(`lm_head` = `Replicate`),而
+    /// "这个头切不切"是**装配期事实**(`ModelSpec::head_split`,会随档位变)
+    /// —— 键名里没有这个信息。层是规则的声明者,装载面是消费者:
+    /// `build_shard_pass` 优先读本字段,缺省回落键表 ⇒ 只有**真覆盖**的键
+    /// (现仅词表切档的 lm_head)行为改变。
+    pub rule: Option<crate::plan::rules::WeightRule>,
     pub(crate) sink: Sink,
 }
 
@@ -1124,6 +1138,17 @@ impl LoaderOps {
             if crate::plan::rules::tail(bk, key_tail) {
                 w.segments = Some(segs.clone());
             }
+        }
+        self
+    }
+
+    /// **声明规则覆盖**(P1.1,2026-10-19):层声明"本清单各 Want 的切分规则"
+    /// —— 与 [`LoaderOps::with_segments`] 同律(声明者 = 构造者,
+    /// 消费者 = `build_shard_pass`)。**只在真覆盖时调用**
+    /// (判据见 `Linear::layout`:声明规则 ≠ 键表默认)。
+    pub fn with_rule(mut self, rule: crate::plan::rules::WeightRule) -> Self {
+        for w in &mut self.wants {
+            w.rule = Some(rule);
         }
         self
     }
@@ -1395,6 +1420,7 @@ impl Weight {
             shape: self.shape.clone(),
             layout: if self.transposed { Layout::Transposed } else { Layout::Direct },
             segments: None,
+            rule: None,
             sink: Sink(self.cell.clone()),
         })
     }
@@ -1419,6 +1445,7 @@ impl Weight {
             shape: vec![rows, cols],
             layout: Layout::DeviceRearrange { op, rows, cols },
             segments: None,
+            rule: None,
             sink: Sink(self.cell.clone()),
         })
     }

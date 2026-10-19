@@ -108,12 +108,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     ) -> Result<Option<u32>> {
         let Some(t) = tail else { return Ok(None) };
         let h = self.dev.prefill_harvest(t, true).await?;
-        mfact(boot_seq, "pf.last", h.token as u64);
-        mfact(boot_seq, "pf.eos", self.tok.is_eos(h.token) as u64);
+        // P1.1:词表切档的设备 token 只是**半表局部** argmax ⇒ 用发布进会话图槽的
+        // 末行半表(两 rank)拼接出全表,host argmax 重算。
+        // 未切档 = 设备 token 原值(逐字节等价)。
+        let token = if self.head_split_active() {
+            let logits = self.read_full_logits("logits").await?;
+            logits
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
+                    if v > a.1 { (i, v) } else { a }
+                })
+                .0 as u32
+        } else {
+            h.token
+        };
+        mfact(boot_seq, "pf.last", token as u64);
+        mfact(boot_seq, "pf.eos", self.tok.is_eos(token) as u64);
         if let Some(hb) = h.seed_hidden {
             self.tspec()?.spec_seed_hidden = Some(hb);
         }
-        Ok(Some(h.token))
+        Ok(Some(token))
     }
 
     /// prefill chunk 执行(设备侧;块已在决策面切好)
@@ -459,7 +474,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let eff_sampler = self.turns.active()?.sampler;
         let sampler_on = self.turns.active()?.sampler_on;
         let nt = if sampler_on {
-            let mut logits = self.dev.graphs.session.read_output_f32("logits").await?;
+            // P1.1:词表切档 ⇒ 两 rank 半表 host 拼接后的**全表**(未切档逐字节等价)
+            let mut logits = self.read_full_logits("logits").await?;
             // 诊断:分布形状(绝对尺度 / top1-top2 gap / 候选词面)——
             // 复读病理定位的仪表盘(OWL_DEBUG 门控,前 16 步)
             let (turn_id, step) = {
@@ -562,7 +578,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             nt
         } else if self.dev.env.diag.host_argmax {
-            let logits = self.dev.graphs.session.read_output_f32("logits").await?;
+            // P1.1:全表出口(半表档 = 拼接后)
+            let logits = self.read_full_logits("logits").await?;
             logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
                 if v > a.1 { (i, v) } else { a }
             })
@@ -576,7 +593,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     (act.id, act.out.len() as u64)
                 };
                 if step < 16 {
-                    let logits = self.dev.graphs.session.read_output_f32("logits").await?;
+                    // P1.1:诊断面也读全表(半表档拼接;未切档等价)
+                    let logits = self.read_full_logits("logits").await?;
                     let mut top: Vec<(f32, u32)> = logits
                         .iter()
                         .enumerate()
@@ -595,8 +613,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     owl_shared::log_debug!("logits-dump", "t{turn_id} s{step}: {}", pretty.join(" | "));
                 }
             }
-            let tok_f = self.dev.graphs.session.read_output_f32("token").await?;
-            tok_f[0] as u32
+            // P1.1:词表切档的**设备 token 是半表局部 argmax**(图内 stride = 本 rank
+            // logits 宽)⇒ 不能直接用。greedy 档改走"全表拼接 + host argmax"
+            // (详案定的第一步形态;8B 分布式 argmax 是后续优化)。
+            // 未切档 = 原路(`token` 槽 4B D2H;逐字节等价)。
+            if self.head_split_active() {
+                let logits = self.read_full_logits("logits").await?;
+                logits
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
+                        if v > a.1 { (i, v) } else { a }
+                    })
+                    .0 as u32
+            } else {
+                let tok_f = self.dev.graphs.session.read_output_f32("token").await?;
+                tok_f[0] as u32
+            }
         };
         if prof {
             owl_shared::log_info!("step-prof", "pos={pos} token-dtoh={:?}", t_dtoh.unwrap().elapsed());
@@ -983,7 +1016,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         ctx.seq_cu = Some(&seq_cu);
         ctx.env = self.env;
         let face = self.graphs.session.face_mut();
-        let vocab = self.model.vocab_size();
+        // P1.1:stride = **本 rank 的 logits 宽度**(词表切档 = 半表;用全量会越界)
+        let vocab = self.model.logits_vocab();
         // 树一:hidden 根([t, hidden];E5-M2b:extend 同迭代消费 → 根块
         // 存活返回,中间块即焚)。原单树版的 argmax 根与 _arena 均 drop 未
         // free(每轮泄漏 verify 全部中间块 —— M2a 存量雷,本轮修复)。

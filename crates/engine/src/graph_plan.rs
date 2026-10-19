@@ -490,21 +490,34 @@ impl<D: DeviceClient> GraphPlan<D> {
             .last
             .get(name)
             .ok_or_else(|| ModelError::Msg(format!("read_output: 无输出 {name}(先 step)")))?;
-        // 按 slot dtype 解码(f16 基线:logits f16 上载,f32 回 host)
-        let (esize, f16) = match out.dtype {
-            Dtype::F16 => (2usize, true),
-            _ => (4usize, false),
+        // 按 slot dtype 解码（f16 基线：logits f16 上载，f32 回 host）
+        // **BF16 分支（P1.1 × P2.1，2026-10-19）**：草稿组件的 proj 槽是草稿 dt
+        // （量化族检查点 = BF16）；旧实现把非 F16 一律当 F32 读 ⇒ BF16 槽读回错值。
+        enum Dec {
+            F16,
+            Bf16,
+            F32,
+        }
+        let (esize, dec) = match out.dtype {
+            Dtype::F16 => (2usize, Dec::F16),
+            Dtype::BF16 => (2usize, Dec::Bf16),
+            _ => (4usize, Dec::F32),
         };
         let mut buf = vec![0u8; out.len * esize];
         self.face.dtoh(&out.block, &mut buf).await?;
-        Ok(if f16 {
-            buf.chunks_exact(2)
+        Ok(match dec {
+            Dec::F16 => buf
+                .chunks_exact(2)
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect()
-        } else {
-            buf.chunks_exact(4)
+                .collect(),
+            Dec::Bf16 => buf
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+            Dec::F32 => buf
+                .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
+                .collect(),
         })
     }
 

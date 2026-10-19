@@ -1272,6 +1272,39 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             ));
         }
 
+        // ── 词表切 × 草稿档（DFlash2/MTP）= **boot 拒启**（P1.1 × P2.1，2026-10-19）──
+        // 两族的草稿头都**共享 target 的 lm_head**（`dflash2.rs` 的 propose /
+        // `mtp.rs` 的 `embed.lm_head_matmul`），且选择面按**全量 vocab** 索引
+        // （DFlash2 码本 [vocab, rank] / MTP argmax stride = vocab）⇒ 词表切档下
+        // 草稿 logits 只剩半表：候选塌到半词表。
+        // **实测**（3080 对，depth=7）：AL 2.4 → 1.4 ⇒ B4 降级把 spec 档拖到裸
+        // decode（**104 → 40 t/s**）。该组合的解 = 草稿选择面半表化（两 rank 各出
+        // 候选 + host 合并 + 码本行偏移）——**未施工** ⇒ 此档**响亮拒**
+        // （静默放行 = 用户跑出“投机失效”的黑盒）。
+        // dumb 草稿无头 ⇒ 不受影响；`depth = 0` ⇒ 无草稿档。
+        // ── 词表切 × 草稿档：**DFlash2 图档已支持 / 其余仍拒**（P1.1 × P2.1）──
+        // 两族的草稿头都**共享 target 的 lm_head**（`dflash2.rs` / `mtp.rs`），
+        // 选择面按**全量 vocab** 索引 ⇒ 切档后草稿 logits 只剩半表（实测
+        // AL 2.4→1.4 ⇒ 降级裸 decode 104→40 t/s）。
+        // **已解**：DFlash2 **图档** —— propose 图出半表 top-16 候选 + proj，
+        // host 合并两 rank 候选（rank1 id + half），rank0 跑 select（全表域）。
+        // **仍拒**：MTP（未做）/ DFlash2 无图（eager 降级档，未做）。
+        if matches!(spec.mode, SpecMode::DFlash2 | SpecMode::Mtp)
+            && rm.model.logits_vocab() != rm.model.vocab_size()
+        {
+            let dflash_graph_ok =
+                spec.mode == SpecMode::DFlash2 && graphs.dflash.is_some();
+            if !dflash_graph_ok {
+                return Err(owl_iface::contract::ModelError::Msg(
+                    "词表切(runtime.tp_vocab_split)与**本草稿档**不兼容：".to_string()
+                        + "草稿头共享 target lm_head ⇒ 切档后草稿 logits 只剩半表。\
+                           已解 = DFlash2 **图档**（需 `[graph] no_graph = false` 且捕获成功）；\
+                           未解 = MTP / DFlash2 eager 降级档。\
+                           请二选一：关 runtime.tp_vocab_split，或换到已解档。",
+                ));
+            }
+        }
+
     Ok(RankDev {
         model: rm.model,
         rope: rm.rope,

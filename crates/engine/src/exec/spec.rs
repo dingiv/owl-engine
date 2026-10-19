@@ -218,19 +218,39 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             };
             let t_step_v = std::time::Instant::now();
             owl_shared::log_debug!("spec-round", "verify 镜像:ins={} peer={} fi={}", ins.len(), self.peer.is_some(), fi_spec.is_some());
+            // P1.1 词表切:切档 ⇒ 两 rank 各出**半表行**、rank0 host 拼接成全表
+            // （实效判据：本 rank logits 宽 < 全量；tied 档装载期已响亮拒）
+            let head_split = self.head_split_active();
+            let half_vocab = self.dev.model.logits_vocab();
             let (tok_f, row_logits) = {
                 let (dev, peer) = (&mut self.dev, self.peer.as_mut());
                 match peer {
                     None => dev.verify_dev(&ins, fi_spec, sampler_on).await?,
                     Some(p) => {
                         // 两半都校验(纪律:`join2` 等另一半到底,吞错 = 挂住)
+                        // 切档 ⇒ 两 rank 都要 logits 半表(rank0 拼接用);未切档
+                        // = 原路(peer 不读 ⇒ 省那份 D2H 与 host 内存)。
                         let (r0, r1) = crate::exec::join2(
-                            dev.verify_dev(&ins, fi_spec, sampler_on),
-                            p.verify_dev(&ins, fi_spec, false),
+                            dev.verify_dev(&ins, fi_spec, sampler_on || head_split),
+                            p.verify_dev(&ins, fi_spec, head_split),
                         )
                         .await;
-                        r1?;
-                        r0?
+                        let (_, lg1) = r1?;
+                        let (tok0, lg0) = r0?;
+                        if head_split {
+                            let (a, b) = match (lg0, lg1) {
+                                (Some(a), Some(b)) => (a, b),
+                                _ => {
+                                    return Err(ModelError::EngineInvariant {
+                                        what: "词表切 verify:半表行缺席(装配/读面不一致)"
+                                            .into(),
+                                    })
+                                }
+                            };
+                            (tok0, Some(crate::running::concat_head_rows(&a, &b, half_vocab)?))
+                        } else {
+                            (tok0, lg0)
+                        }
                     }
                 }
             };
@@ -265,7 +285,41 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             mrec("spec.verify.tokread", t_tok.elapsed());
             mrec("spec.verify.lgread", t_lg.elapsed());
             mrec("spec.verify.read", t_read_v.elapsed());
-            let ids: Vec<u32> = tok_f.iter().map(|&v| v as u32).collect();
+            // P1.1:切档的设备 token 只是**半表局部** argmax ⇒ 从拼接后的全表行
+            // 重算全局 argmax(贪心接受判据的唯一依据);未切档 = 原值。
+            let ids: Vec<u32> = if head_split {
+                let lg = row_logits.as_ref().ok_or_else(|| ModelError::EngineInvariant {
+                    what: "词表切 verify:全表行 logits 缺席(greedy 判据无据)".into(),
+                })?;
+                let v = self.dev.model.vocab_size();
+                if lg.len() < rows_n * v {
+                    return Err(ModelError::EngineInvariant {
+                        what: format!(
+                            "词表切 verify:行 logits 尺寸不符 {} < {}×{}",
+                            lg.len(),
+                            rows_n,
+                            v
+                        ),
+                    });
+                }
+                (0..rows_n)
+                    .map(|r| {
+                        lg[r * v..(r + 1) * v]
+                            .iter()
+                            .enumerate()
+                            .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+                                if x > a.1 {
+                                    (i, x)
+                                } else {
+                                    a
+                                }
+                            })
+                            .0 as u32
+                    })
+                    .collect()
+            } else {
+                tok_f.iter().map(|&v| v as u32).collect()
+            };
             let hidden = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
             let n_rec = self.dev.pool.gdn_count() * 8;
             let records: Vec<Bytes> = (0..n_rec)

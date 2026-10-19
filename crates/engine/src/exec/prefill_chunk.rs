@@ -547,7 +547,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             eval_ops_scoped_env(last.step(), face, self.env, self.tp.as_ref()).await?
         };
         let hb_view = TensorOps::of_block(hb.id, d.dtype, vec![1, d_model]);
-        let vocab = self.model.vocab_size();
+        // P1.1:stride = 本 rank logits 宽(词表切档 = 半表;半表档 token 只是局部
+        // argmax —— 消费面在 `harvest_prefill` 用拼接后的全表重算)
+        let vocab = self.model.logits_vocab();
         let (b, arena3) = {
             let face = self.graphs.session.face_mut();
             let logits = self.model.embed.lm_head_matmul(&hb_view);
@@ -1098,7 +1100,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             owl_shared::log_debug!("pf-bisect", "chunk base={base} t={t} 层 checksum 已记");
         }
         let _face = self.graphs.session.face_mut();
-        let vocab = self.model.vocab_size();
+        // P1.1:同桶图路(stride = 本 rank logits 宽;token 在收割半重算)
+        let vocab = self.model.logits_vocab();
         if is_last {
             // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh)。
             // E5-M5:树一 = hidden_full 根([T, hidden] 存活 → prefill

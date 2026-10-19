@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use crate::contract::{Dtype, ModelError};
 use crate::module::Taken;
 use crate::module::{Layout, LoaderCtx, LoaderOps, WeightSource};
-use crate::plan::rules::{rule_of, rule_of_want, want_axis, WantAxis, WeightRule};
+use crate::plan::rules::{rule_of_want, want_axis, WantAxis, WeightRule};
 use crate::plan::span::segments_in_key_units;
 use crate::plan::span::{plan_span, SourceSpan};
 use crate::plan::tp::TpPlan;
@@ -123,8 +123,13 @@ pub fn build_shard_pass(
     let plan = TpPlan::new(ctx.slice_id, ctx.shard).map_err(ModelError::Msg)?;
     for w in ops.wants_mut() {
         // **带段长事实**的规则推导(P2.1-a):同名键在「融合/不融合」两个模型里
-        // 语义不同 —— 段长由层声明,缺声明 ⇒ 不按段切(见 `rule_of_want`)
-        let rule = rule_of_want(&w.key, w.segments.as_deref());
+        // 语义不同 —— 段长由层声明,缺声明 ⇒ 不按段切(见 `rule_of_want`)。
+        // **层声明的规则覆盖优先**(P1.1,2026-10-19):"这个张量切不切"是装配期
+        // 事实(如 lm_head 的词表切随档位变),键名里没有它 ⇒ 层是声明者,
+        // 装载面是消费者(want.rule;仅真覆盖时在场)。
+        let rule = w
+            .rule
+            .unwrap_or_else(|| rule_of_want(&w.key, w.segments.as_deref()));
         let axis = want_axis(&w.key);
         let shard_segs: &[usize] = w.segments.as_deref().unwrap_or(&[]);
         if rule == WeightRule::Replicate {
@@ -413,6 +418,7 @@ mod tests {
     use super::*;
     use crate::module::Want;
     use crate::module::Taken;
+    use crate::plan::rules::rule_of; // 键表默认对照（声明规则覆盖的判据面）
 use crate::plan::rules::{SegKind, WeightRule};
 
     /// 内存源(全量 f32;`Vec` 值域即"源坐标系")
@@ -447,6 +453,7 @@ use crate::plan::rules::{SegKind, WeightRule};
             shape,
             layout: Layout::Direct,
             segments: None,
+            rule: None,
             sink: crate::module::Sink::for_test(),
         }
     }
@@ -590,5 +597,40 @@ use crate::plan::rules::{SegKind, WeightRule};
         let ctx = LoaderCtx { dtype: Dtype::F32, shard: 1, slice_id: 0, ..Default::default() };
         let spans = build_shard_pass(&mut ops, &ctx).unwrap();
         assert!(spans.is_empty());
+    }
+
+    /// **层声明的规则覆盖**(P1.1,2026-10-19):`lm_head.weight` 键表默认
+    /// `Replicate`,但词表切档的 want 自带 `UniformCol` ⇒ 分片 pass 按声明切。
+    /// 同键**无声明** ⇒ 直通(未切档零行为变化)。
+    #[test]
+    fn declared_rule_overrides_keytable() {
+        let key = "lm_head.weight";
+        assert_eq!(rule_of(key), WeightRule::Replicate, "键表默认 = Replicate");
+        let full: Vec<f32> = (0..40).map(|i| i as f32 + 1.0).collect(); // [8, 5]
+        // 对照臂:无声明 ⇒ 直通
+        {
+            let mut ops = LoaderOps::want(want(key, vec![8, 5]));
+            let ctx = LoaderCtx { dtype: Dtype::F32, shard: 2, slice_id: 0, ..Default::default() };
+            let spans = build_shard_pass(&mut ops, &ctx).unwrap();
+            assert!(spans.is_empty(), "无声明 + 键表 Replicate ⇒ 不进表");
+        }
+        // 覆盖臂:声明 UniformCol ⇒ 按 out 维切(rank0 = 低半,rank1 = 高半)
+        for slice in 0..2usize {
+            let mut ops = LoaderOps::want(want(key, vec![4, 5])).with_rule(WeightRule::UniformCol);
+            let mut src = MemSource { data: HashMap::new() };
+            src.data.insert(key.to_string(), full.clone());
+            let ctx = LoaderCtx { dtype: Dtype::F32, shard: 2, slice_id: slice, ..Default::default() };
+            let spans = build_shard_pass(&mut ops, &ctx).expect("声明规则档应切");
+            let sharded = ShardedSource::new(&src, spans);
+            let n = t(sharded.elem_len(key));
+            let mut got = Vec::with_capacity(n);
+            for chunk in 0..n.div_ceil(7) {
+                let off = chunk * 7;
+                let len = 7.min(n - off);
+                got.extend(t(sharded.take_range(key, off, len)));
+            }
+            let base = slice * 4 * 5;
+            assert_eq!(got, full[base..base + 20].to_vec(), "lm_head 分片读(slice {slice})");
+        }
     }
 }

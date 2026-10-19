@@ -69,12 +69,15 @@ pub struct ModelLoader<'a, D: DeviceClient> {
     load: owl_shared::config::LoadCfg,
     /// `(slice_id, shard)`;缺省 `(0, 1)` = 单卡全量(S4 ②;见 [`ModelLoader::slice`])
     slice: (usize, usize),
+    /// **lm_head 词表切**(`runtime.tp_vocab_split`;P1.1) —— 装载前写入
+    /// `ModelSpec::head_split`(形状单源;装载规则随之切 out 维)。
+    vocab_split: bool,
 }
 
 impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     /// 构造(工厂;face 由 [`Engine::loader`](crate::Engine::loader) 借出)
     pub(crate) fn new<'a>(face: &'a mut D, load: owl_shared::config::LoadCfg) -> ModelLoader<'a, D> {
-        ModelLoader { face, load, slice: (0, 1) }
+        ModelLoader { face, load, slice: (0, 1), vocab_split: false }
     }
 
     /// **切片装载**(S4 ②;确定性分片协议):`(slice_id, shard)` —— 本 rank 只装
@@ -85,9 +88,27 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         self
     }
 
+    /// **lm_head 词表切档**(`runtime.tp_vocab_split`;P1.1 2026-10-19)
+    ///
+    /// 装载前把意图位写入 `ModelSpec::head_split` —— 形状/层/装载规则全部
+    /// 从它派生(`ModelSpec::sharded` 是唯一真源)。与 `slice` 同律:
+    /// **显式声明**,引擎内部零 env 读取。
+    pub fn vocab_split(mut self, on: bool) -> Self {
+        self.vocab_split = on;
+        self
+    }
+
     /// 分片 spec(形状单源 = [`ModelSpec::sharded`];`shard = 1` 恒等)
-    fn shard_spec(&self, spec: ModelSpec) -> Result<ModelSpec> {
+    fn shard_spec(&self, mut spec: ModelSpec) -> Result<ModelSpec> {
         let (id, n) = self.slice;
+        // 响亮拒:词表切的收益与语义都在"每 rank 半表",单卡没有任何一半
+        // (静默忽略会让配置说谎 —— 用户以为切了,实际全量头)。
+        if self.vocab_split && n <= 1 {
+            return Err(ModelError::Msg(
+                "词表切(runtime.tp_vocab_split)需要 shard ≥ 2:单卡全量头应关本档".into(),
+            ));
+        }
+        spec.head_split = self.vocab_split;
         if n <= 1 {
             return Ok(spec);
         }

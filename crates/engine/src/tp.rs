@@ -51,6 +51,9 @@ pub struct TpOpts {
     /// **fp8 载荷档**(§47 第二步;2026-10-19):AR 载荷走 e4m3(载荷 1.031×)。
     /// 由入口(server config)显式传入 —— 引擎内部零 env 读取(与 push 同律)。
     pub ar_f8: bool,
+    /// **v1 两核融合档**(§11.2;2026-10-19):AR 一核做完两段(只非 fp8 载荷)。
+    /// 由入口显式传入(缺省关);两 rank 必须同档。
+    pub ar_fused: bool,
 }
 
 /// staging 的双块与布局量(布局算术单源 = `owl_cuda::comm::ar::StagingLayout` ——
@@ -68,6 +71,8 @@ pub struct TpStaging {
     push: bool,
     /// **fp8 载荷档**(与 `TpOpts::ar_f8` 同值;`ctx()` 把它写进 `TpCtx`)
     ar_f8: bool,
+    /// **v1 两核融合档**(与 `TpOpts::ar_fused` 同值;§11.2)
+    ar_fused: bool,
     pub(crate) layout: StagingLayout,
 }
 
@@ -106,6 +111,7 @@ impl TpStaging {
             arena: self.arena.clone(),
             push: self.push,
             ar_f8: self.ar_f8,
+            ar_fused: self.ar_fused,
         }
     }
 }
@@ -712,8 +718,8 @@ async fn handshake_staging(
         (None, None)
     };
     Ok((
-        TpStaging { own: own0, peer: peer0, arena: arena0, push: opts.push, ar_f8: opts.ar_f8, layout },
-        TpStaging { own: own1, peer: peer1, arena: arena1, push: opts.push, ar_f8: opts.ar_f8, layout },
+        TpStaging { own: own0, peer: peer0, arena: arena0, push: opts.push, ar_f8: opts.ar_f8, ar_fused: opts.ar_fused, layout },
+        TpStaging { own: own1, peer: peer1, arena: arena1, push: opts.push, ar_f8: opts.ar_f8, ar_fused: opts.ar_fused, layout },
     ))
 }
 

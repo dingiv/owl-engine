@@ -90,6 +90,15 @@ impl ModelSpec {
     ///
     /// **整除硬门**:任一切分维不被 world 整除 ⇒ 结构化拒(不许 pad)。
     pub fn sharded(&self, plan: crate::plan::tp::TpPlan) -> Result<ModelSpec, String> {
+        // **tied 表切不了**（P1.1）：lm_head 复用 embed 表（查任意 token 必须全量）
+        // ⇒ “每 rank 只持半表头”无据可依。响亮拒（静默忽略 = 配置说谎）。
+        if self.head_split && self.tied {
+            return Err(
+                "词表切(TP vocab split)需要 untied 检查点：本模型 tie_word_embeddings = true，\
+                 lm_head 复用 embed 全量表（tied 档请关 runtime.tp_vocab_split）"
+                    .into(),
+            );
+        }
         if plan.is_single() {
             let mut s = self.clone();
             s.head_vocab = self.vocab; // 单卡退化:头也全量(与 head_split 无关)
