@@ -222,9 +222,28 @@ pub struct RuntimeCfg {
     /// 副作用:staging 别名改授 `PROT_READWRITE`。
     #[serde(default)]
     pub tp_push: bool,
-    /// **TP 通信数据腿:fp8 载荷**(runtime.tp_ar_f8;§47 第二步 2026-10-19)
-    /// ⇒ 交 `TpOpts.ar_f8`。**两侧同装配 ⇒ 同档**(不同档 = 收端按错 dtype 解读)。
+    /// **TP 通信数据腿：fp8 载荷**（runtime.tp_ar_f8；§47 第二步 2026-10-19）
+    /// ⇒ 交 `TpOpts.ar_f8`。**两侧同装配 ⇒ 同档**（不同档 = 收端按错 dtype 解读）。
     pub tp_ar_f8: bool,
+    /// **lm_head 词表切**（runtime.tp_vocab_split；P1.1 2026-10-19）
+    ///
+    /// `true` ⇒ 每 rank 只建/只算/只持**自己那半词表**的 lm_head 行
+    /// （`ModelSpec::head_split` → `head_vocab = vocab / world`）：
+    /// decode 的头部 GEMM 减半、每卡省 ~1.18 GiB；代价 = logits 需 host 侧
+    /// 拼接（两 rank 半表拼回全表后才采样/判据）。
+    /// **缺省 `false` = 逐字节旧行为**；需 `world = 2`（单卡给值 = 响亮拒）。
+    /// 词表必须被 world 整除（`ModelSpec::sharded` 的整除硬门）。
+    #[serde(default)]
+    pub tp_vocab_split: bool,
+    /// **v1 两核融合档**（runtime.tp_ar_fused；§11.2 2026-10-19）
+    ///
+    /// `true` ⇒ AR 走**一核**（`ArFusedCall`：stage+reduce 同一核内两阶段）
+    /// 而非两核 —— §59.1 实测两核成本 22.13µs/次全在"核的落地/排空"
+    /// （单核 11.13 + 第二核边际 11.00）⇒ 少发一个核 ≈ decode +4%。
+    /// **只非 fp8 载荷**（decode 档；prefill 的 fp8 腿仍两核）。
+    /// **缺省 `false` = 逐字节旧行为**；两 rank 同装配（同档）。
+    #[serde(default)]
+    pub tp_ar_fused: bool,
     /// **自动选卡的空闲占比阈值**(0..1;默认 0.9):候选卡的 `memory.free/total` 低于它
     /// ⇒ auto-pick 跳过(避让非 owl 进程/未持锁实例);显式 spec 命中且全被跳 ⇒ 响亮拒启。
     pub gpu_min_free_ratio: f64,
@@ -992,6 +1011,8 @@ impl Default for RuntimeCfg {
             tp_ordinals: None,
             tp_push: false,
             tp_ar_f8: false,
+            tp_vocab_split: false,
+            tp_ar_fused: false,
             gpu_min_free_ratio: 0.9,
             max_seq: 4096,
             prefill_chunk: 512,

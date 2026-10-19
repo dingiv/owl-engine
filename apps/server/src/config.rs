@@ -213,8 +213,13 @@ pub struct ServerConfig {
     pub max_concurrency: usize,
     /// **TP 通信数据腿:push 档**(runtime.tp_push;2026-10-18 §36.6)⇒ 交 `TpOpts`
     pub tp_push: bool,
-    /// **TP AR 载荷 fp8 档**(runtime.tp_ar_f8;§47 第二步)⇒ 交 `TpOpts.ar_f8`
+    /// **TP AR 载荷 fp8 档**（runtime.tp_ar_f8；§47 第二步）⇒ 交 `TpOpts.ar_f8`
     pub tp_ar_f8: bool,
+    /// **lm_head 词表切**（runtime.tp_vocab_split；P1.1）⇒ 装载面
+    /// `ModelSpec::head_split`（每 rank 只持半表头；logits 由引擎 host 拼接）
+    pub tp_vocab_split: bool,
+    /// **v1 两核融合档**（runtime.tp_ar_fused；§11.2）⇒ 交 `TpOpts.ar_fused`
+    pub tp_ar_fused: bool,
     /// 性能账落盘基名(--perf-dump;None = 不落盘)
     pub perf_dump: Option<PathBuf>,
     /// 性能分级(probes.perf_level,可被 --perf-level 覆盖)
@@ -312,6 +317,8 @@ impl ServerConfig {
             quant: cfg.model.quant,
             tp_push: cfg.runtime.tp_push,
             tp_ar_f8: cfg.runtime.tp_ar_f8,
+            tp_vocab_split: cfg.runtime.tp_vocab_split,
+            tp_ar_fused: cfg.runtime.tp_ar_fused,
             max_concurrency: cfg.server.max_concurrency,
             perf_dump: None,
             perf_level: cfg.probes.perf_level.to_u8(),

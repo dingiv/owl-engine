@@ -88,6 +88,9 @@ allowed_ops = [
         "vllm_reshape_and_cache_bf16_knhd",
         "owl_bias_add_bf16",
         "owl_comm_ar_1stage_bf16",
+        # ---- v1 两核融合(§11.2;2026-10-19;runtime.tp_ar_fused 开时发射)----
+        "owl_comm_ar_fused_f16",
+        "owl_comm_ar_fused_bf16",
         "owl_comm_ar_reduce_bf16",
         "owl_comm_ar_reduce_f8_bf16",
         "owl_comm_ar_stage_bf16",

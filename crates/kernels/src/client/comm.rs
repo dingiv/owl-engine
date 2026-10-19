@@ -71,6 +71,17 @@ fn one_stage_entry(dt: Dtype) -> &'static str {
     }
 }
 
+/// payload dtype → **fused** 发射名(单源同上;§11.2 2026-10-19)
+fn fused_entry_dt(dt: Dtype) -> &'static str {
+    use crate::driver::DType as D;
+    match dt {
+        Dtype::F32 => crate::family::comm::fused_entry(D::F32),
+        Dtype::F16 => crate::family::comm::fused_entry(D::F16),
+        Dtype::BF16 => crate::family::comm::fused_entry(D::BF16),
+        other => panic!("comm_ar_fused: 非法 payload dtype {other:?}(f32/f16/bf16)"),
+    }
+}
+
 /// stage 的 parse 槽名(声明序;F3 成对律 —— `client::tests::
 /// parse_slots_are_exactly_declared` 与 `ops` 的槽序锁双双锁死)
 ///
@@ -81,6 +92,15 @@ fn one_stage_entry(dt: Dtype) -> &'static str {
 pub const PARSE_SLOTS: &[&str] = &["local", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"];
 /// reduce 的 parse 槽名(声明序;push 档同律 —— 第 4 槽 = `data`)
 pub const PARSE_SLOTS_REDUCE: &[&str] = &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"];
+
+/// fused 臂的族名(server 路由 id;§11.2)
+pub const AR_FUSED: &str = crate::family::comm::COMM_AR_FUSED;
+/// fused 线格式 sig(`O,T,T,O,T,sz,sz,sz` —— 8 槽,比两核各多一槽)
+pub const SIG_FUSED: &str = "O,T,T,O,T,sz,sz,sz";
+/// fused 的 parse 槽名(声明序)
+pub const PARSE_SLOTS_FUSED: &[&str] = &[
+    "payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off",
+];
 
 /// stage 调用(解析/组装双向同型)。
 #[derive(Clone, Debug)]
@@ -177,6 +197,111 @@ impl ArStageCall {
     /// ★ **数据块**(v1 = own / push = peer;见 `new` 的说明)
     pub fn data(&self) -> &Bytes {
         &self.data
+    }
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    pub fn slot_bytes(&self) -> u64 {
+        self.slot_bytes
+    }
+    pub fn slab_off(&self) -> u64 {
+        self.slab_off
+    }
+}
+
+/// **v1 两核融合调用**(§11.2;2026-10-19)—— 一核做完 stage+reduce 同一协议。
+///
+/// 8 槽:payload / own / peer / data_w / data_r / bytes / slot_bytes / slab_off。
+/// `data_w` = 写目标(v1 = own、push = peer);`data_r` = 读源(v1 = peer、push = own)
+/// —— 两核版的同名 `data` 在合并后必须显式分开(方向不同)。
+/// `payload` = **私有块**(既读又写;v1 语义 —— 不依赖对称槽)。
+#[derive(Clone, Debug)]
+pub struct ArFusedCall {
+    payload: Bytes,
+    own: Bytes,
+    peer: Bytes,
+    data_w: Bytes,
+    data_r: Bytes,
+    bytes: u64,
+    slot_bytes: u64,
+    slab_off: u64,
+}
+
+impl ArFusedCall {
+    /// 直接构造(调用方备好五块:payload / 本端 staging / 对端别名 / 写块 / 读块)
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        payload: Bytes,
+        own: Bytes,
+        peer: Bytes,
+        data_w: Bytes,
+        data_r: Bytes,
+        bytes: u64,
+        slot_bytes: u64,
+        slab_off: u64,
+    ) -> Self {
+        Self { payload, own, peer, data_w, data_r, bytes, slot_bytes, slab_off }
+    }
+
+    /// 反序列化(8 槽;按名取址)
+    pub fn parse(msg: &LaunchMsg) -> Result<(Self, Bytes), OpError> {
+        let s = crate::client::NamedSlots::new(msg)?;
+        let payload = s.out_block("payload", msg.out_elems)?;
+        let own = s.out_block("own", msg.out_elems)?;
+        let peer = s.flat_block("peer")?;
+        let data_w = s.out_block("data_w", msg.out_elems)?;
+        let data_r = s.flat_block("data_r")?;
+        let me = Self {
+            payload: payload.clone(),
+            own,
+            peer,
+            data_w,
+            data_r,
+            bytes: s.u64("bytes")?,
+            slot_bytes: s.u64("slot_bytes")?,
+            slab_off: s.u64("slab_off")?,
+        };
+        Ok((me, payload))
+    }
+
+    /// 组装发射消息(几何由 runtime 自持 ⇒ grid/block 全零哨兵)
+    pub fn to_launch(&self) -> LaunchMsg {
+        LaunchMsg {
+            kernel: crate::contract::KernelSource {
+                name: fused_entry_dt(self.payload.dtype).to_string(),
+                source: String::new(),
+            },
+            args: vec![
+                Arg::block(self.payload.id, self.payload.dtype, self.payload.rank),
+                Arg::block(self.own.id, self.own.dtype, self.own.rank),
+                Arg::block(self.peer.id, self.peer.dtype, self.peer.rank),
+                Arg::block(self.data_w.id, self.data_w.dtype, self.data_w.rank),
+                Arg::block(self.data_r.id, self.data_r.dtype, self.data_r.rank),
+                Arg::U64(self.bytes),
+                Arg::U64(self.slot_bytes),
+                Arg::U64(self.slab_off),
+            ],
+            grid: (0, 0, 0),
+            block: (0, 0, 0),
+            shared_mem: 0,
+            out_elems: self.bytes as usize,
+        }
+    }
+
+    pub fn payload(&self) -> &Bytes {
+        &self.payload
+    }
+    pub fn own(&self) -> &Bytes {
+        &self.own
+    }
+    pub fn peer(&self) -> &Bytes {
+        &self.peer
+    }
+    pub fn data_w(&self) -> &Bytes {
+        &self.data_w
+    }
+    pub fn data_r(&self) -> &Bytes {
+        &self.data_r
     }
     pub fn bytes(&self) -> u64 {
         self.bytes

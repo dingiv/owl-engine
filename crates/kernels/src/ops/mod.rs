@@ -790,6 +790,10 @@ mod tests {
             (crate::family::comm::asset::ONE_STAGE_F16, &["out", "src", "own", "peer", "peer_data", "bytes"], &["F16x0", "F16x0", "U8x1", "U8x1", "U8x1", "U64"]),
             (crate::family::comm::asset::ONE_STAGE_BF16, &["out", "src", "own", "peer", "peer_data", "bytes"], &["BF16x0", "BF16x0", "U8x1", "U8x1", "U8x1", "U64"]),
             (crate::family::comm::asset::ONE_STAGE_F32, &["out", "src", "own", "peer", "peer_data", "bytes"], &["F32x0", "F32x0", "U8x1", "U8x1", "U8x1", "U64"]),
+            // v1 两核融合(§11.2;2026-10-19):8 槽 —— data_w/data_r 分开(方向不同)
+            (crate::family::comm::asset::FUSED_F16, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::FUSED_BF16, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (crate::family::comm::asset::FUSED_F32, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["F32x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
         ];
         for (entry, want, want_ty) in EXPECT {
             let m = meta(entry).unwrap_or_else(|| panic!("锁表项 {entry} 不在声明表里"));

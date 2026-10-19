@@ -287,6 +287,77 @@ impl KernelSpec for CommAr1StageF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+// ============================================================================
+// fused(v1 两核 → 一核;§11.2 2026-10-19)
+//
+// 参数比两核**多一槽**:`data_w`(写目标)/`data_r`(读源)分开 —— v1 档
+// `w = own, r = peer`;push 档对调(两核版两槽同名 `data`、各自方向不同,
+// 合并后必须显式分开)。`payload` 是**私有块**(既读又写 —— 兑 `out` 语义)。
+// ============================================================================
+
+/// `owl_comm_ar_fused_f16`
+pub struct CommArFusedF16;
+impl KernelSpec for CommArFusedF16 {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_FUSED);
+    const ENTRY: &'static str = "owl_comm_ar_fused_f16";
+    const SRC: &'static str = "cu/comm/ar_fused.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_out("payload", Dtype::F16, 0),
+        Param::t_out("own", Dtype::U8, 1),
+        Param::t_in("peer", Dtype::U8, 1),
+        Param::t_out("data_w", Dtype::U8, 1),
+        Param::t_in("data_r", Dtype::U8, 1),
+        Param::sz("bytes"),
+        Param::sz("slot_bytes"),
+        Param::sz("slab_off"),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+/// `owl_comm_ar_fused_bf16`
+pub struct CommArFusedBf16;
+impl KernelSpec for CommArFusedBf16 {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_FUSED);
+    const ENTRY: &'static str = "owl_comm_ar_fused_bf16";
+    const SRC: &'static str = "cu/comm/ar_fused.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_out("payload", Dtype::BF16, 0),
+        Param::t_out("own", Dtype::U8, 1),
+        Param::t_in("peer", Dtype::U8, 1),
+        Param::t_out("data_w", Dtype::U8, 1),
+        Param::t_in("data_r", Dtype::U8, 1),
+        Param::sz("bytes"),
+        Param::sz("slot_bytes"),
+        Param::sz("slab_off"),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+/// `owl_comm_ar_fused_f32`
+pub struct CommArFusedF32;
+impl KernelSpec for CommArFusedF32 {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_FUSED);
+    const ENTRY: &'static str = "owl_comm_ar_fused_f32";
+    const SRC: &'static str = "cu/comm/ar_fused.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_out("payload", Dtype::F32, 0),
+        Param::t_out("own", Dtype::U8, 1),
+        Param::t_in("peer", Dtype::U8, 1),
+        Param::t_out("data_w", Dtype::U8, 1),
+        Param::t_in("data_r", Dtype::U8, 1),
+        Param::sz("bytes"),
+        Param::sz("slot_bytes"),
+        Param::sz("slab_off"),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 pub static AR_STAGE_F16: KernelMeta = meta_of::<CommArStageF16>();
 pub static AR_STAGE_BF16: KernelMeta = meta_of::<CommArStageBf16>();
 pub static AR_STAGE_F32: KernelMeta = meta_of::<CommArStageF32>();
@@ -296,6 +367,10 @@ pub static AR_REDUCE_F32: KernelMeta = meta_of::<CommArReduceF32>();
 pub static AR_1STAGE_F16: KernelMeta = meta_of::<CommAr1StageF16>();
 pub static AR_1STAGE_BF16: KernelMeta = meta_of::<CommAr1StageBf16>();
 pub static AR_1STAGE_F32: KernelMeta = meta_of::<CommAr1StageF32>();
+// **v1 两核融合**(§11.2;2026-10-19)—— 只非 fp8 载荷
+pub static AR_FUSED_F16: KernelMeta = meta_of::<CommArFusedF16>();
+pub static AR_FUSED_BF16: KernelMeta = meta_of::<CommArFusedBf16>();
+pub static AR_FUSED_F32: KernelMeta = meta_of::<CommArFusedF32>();
 // **fp8 载荷档**(§47 第二步;2026-10-19)—— 登记进表才进 `ops::all()` 的预加载面
 pub static AR_STAGE_F8_F16: KernelMeta = meta_of::<CommArStageF8F16>();
 pub static AR_STAGE_F8_BF16: KernelMeta = meta_of::<CommArStageF8Bf16>();
@@ -317,4 +392,7 @@ pub static METAS: &[&KernelMeta] = &[
     &AR_1STAGE_F16,
     &AR_1STAGE_BF16,
     &AR_1STAGE_F32,
+    &AR_FUSED_F16,
+    &AR_FUSED_BF16,
+    &AR_FUSED_F32,
 ];

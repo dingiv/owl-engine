@@ -6,7 +6,7 @@
 //! **F2 尺寸自证**(家族直发前):payload 与 staging 两块都按账长校验
 //! "请求落在块内" —— 内核越界不会当场报错(写进邻块),必须在这里结构化拒。
 
-use crate::client::comm::{Ar1StageCall, ArReduceCall, ArStageCall};
+use crate::client::comm::{Ar1StageCall, ArFusedCall, ArReduceCall, ArStageCall};
 use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 use crate::device::{Exec, LaunchVal};
 use crate::family::comm::asset;
@@ -295,6 +295,119 @@ impl KernelFamily for CommArReduceRuntime {
         launch_ar(
             Self::ID, "ar_reduce", res, exec, k, out_p, own_p, peer_p, data_p, call.bytes(),
             call.slot_bytes(), call.slab_off(), grid,
+        )?;
+        Ok(out)
+    }
+}
+
+// ============================================================================
+// fused 族(v1 两核 → 一核;§11.2 2026-10-19)
+// ============================================================================
+
+/// fused 发射(8 块参数:payload / own / peer / data_w / data_r + 三标量)
+#[allow(clippy::too_many_arguments)]
+fn launch_ar_fused(
+    op: OpId,
+    kernel: &'static str,
+    res: &mut dyn crate::device::DeviceRes,
+    exec: &mut Exec,
+    k: &K,
+    payload: u64,
+    own: u64,
+    peer: u64,
+    data_w: u64,
+    data_r: u64,
+    bytes: u64,
+    slot_bytes: u64,
+    slab_off: u64,
+    grid: (u32, u32, u32),
+) -> Result<(), OpError> {
+    exec.launch(
+        res,
+        op,
+        k,
+        kernel,
+        grid,
+        (asset::BLOCK, 1, 1),
+        0,
+        &[
+            LaunchVal::Ptr(payload),
+            LaunchVal::Ptr(own),
+            LaunchVal::Ptr(peer),
+            LaunchVal::Ptr(data_w),
+            LaunchVal::Ptr(data_r),
+            LaunchVal::U64(bytes),
+            LaunchVal::U64(slot_bytes),
+            LaunchVal::U64(slab_off),
+        ],
+    )
+}
+
+/// **v1 两核融合 runtime**(`comm_ar_fused`;只非 fp8 载荷 —— fp8 腿仍走两核)
+pub struct CommArFusedRuntime {
+    k_f32: Option<K>,
+    k_f16: Option<K>,
+    k_bf16: Option<K>,
+}
+
+impl CommArFusedRuntime {
+    pub const ID: OpId = OpId(crate::family::comm::COMM_AR_FUSED);
+}
+
+impl KernelFamily for CommArFusedRuntime {
+    fn id(&self) -> OpId {
+        Self::ID
+    }
+
+    fn assemble(
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut Exec,
+    ) -> Result<Box<dyn KernelFamily>, OpError> {
+        let me = CommArFusedRuntime {
+            k_f32: Some(exec.load_aot(res, asset::FUSED_SRC, asset::FUSED_F32, Self::ID)?),
+            k_f16: Some(exec.load_aot(res, asset::FUSED_SRC, asset::FUSED_F16, Self::ID)?),
+            k_bf16: Some(exec.load_aot(res, asset::FUSED_SRC, asset::FUSED_BF16, Self::ID)?),
+        };
+        Ok(FamilyGuard::boxed(me))
+    }
+
+    fn run(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut Exec,
+    ) -> Result<Bytes, OpError> {
+        let (call, out) = ArFusedCall::parse(msg)?;
+        let k = pick(Self::ID, call.payload().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?;
+        // ── 尺寸自证(与两核同律)──
+        let pl_len = res.resolve_len(call.payload().id)?;
+        let own_len = res.resolve_len(call.own().id)?;
+        let _ = res.resolve_len(call.peer().id)?; // peer 必须在册(跨卡别名块)
+        let _ = res.resolve_len(call.data_w().id)?;
+        let _ = res.resolve_len(call.data_r().id)?;
+        check_payload_span(Self::ID, "payload", pl_len, call.slab_off(), call.bytes())?;
+        check_staging(Self::ID, "own", own_len, call.slot_bytes())?;
+        let payload_p = res.resolve(call.payload().id)?;
+        let own_p = res.resolve(call.own().id)?;
+        let peer_p = res.resolve(call.peer().id)?;
+        let w_p = res.resolve(call.data_w().id)?;
+        let r_p = res.resolve(call.data_r().id)?;
+        let grid = ar_reduce_grid(call.payload().dtype, call.bytes());
+        launch_ar_fused(
+            Self::ID,
+            "ar_fused",
+            res,
+            exec,
+            k,
+            payload_p,
+            own_p,
+            peer_p,
+            w_p,
+            r_p,
+            call.bytes(),
+            call.slot_bytes(),
+            call.slab_off(),
+            grid,
         )?;
         Ok(out)
     }

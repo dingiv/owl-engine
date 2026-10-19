@@ -184,6 +184,28 @@ fn tp_g8_gate() {
 
 async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     let n_top = topn_of();
+    // ★ **词表切档（P1.1）**：本模型（Qwen3.5-0.8B）`tie_word_embeddings = true`
+    // ⇒ lm_head 复用 embed 全量表 ⇒ 词表切**无据可依** ⇒ 装载必须**响亮拒**。
+    // 本档只验证这条拒（正判据在 27B 门：那里是 untied 检查点）。
+    if matches!(std::env::var("OWL_TP_VOCAB_SPLIT").as_deref(), Ok("1") | Ok("true")) {
+        let mut e = Engine::new(cfg_of(oa)).expect("engine(tied 拒判据)");
+        let r = e
+            .loader()
+            .slice(0, 2)
+            .vocab_split(true)
+            .load_qwen35_0_8b(&dir)
+            .await;
+        match r {
+            Ok(_) => panic!(
+                "tied 模型（tie_word_embeddings=true）+ 词表切应被**响亮拒** —— \
+                 实测装载成功 = 判据失守（词表切静默不生效）"
+            ),
+            Err(e) => {
+                eprintln!("[g8b] 词表切 × tied：装载响亮拒 ✓（{e}）");
+                return;
+            }
+        }
+    }
     // ── ① TP1 参考臂:单卡全量(先跑先卸,腾出显存给双 rank)──────────
     let (tp1, pf1) = {
         let mut e = Engine::new(cfg_of(ref_dev)).expect("engine(TP1)");
@@ -212,7 +234,13 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     let push = matches!(std::env::var("OWL_TP_PUSH").as_deref(), Ok("1") | Ok("true"));
     // ★ **fp8 载荷档**(§47 第二步;测试用例可放 env —— owl 纪律:行为开关走配置,测试例外)
     let ar_f8 = matches!(std::env::var("OWL_TP_AR_F8").as_deref(), Ok("1") | Ok("true"));
-    let tp = TpEngine::assemble_with(vec![e0, e1], vec![l0, l1], owl_engine::TpOpts { push, ar_f8 })
+    // ★ **v1 两核融合档**(§11.2;测试例外同上)
+    let ar_fused = matches!(std::env::var("OWL_TP_AR_FUSED").as_deref(), Ok("1") | Ok("true"));
+    let tp = TpEngine::assemble_with(
+        vec![e0, e1],
+        vec![l0, l1],
+        owl_engine::TpOpts { push, ar_f8, ar_fused },
+    )
         .await
         .expect("TP2 装配");
     let mut r = tp.run().expect("TP2 进执行态");
@@ -230,12 +258,19 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
             .sum()
     };
     let (n_push, n_v1) = (cnt("tp.ar.push"), cnt("tp.ar.v1"));
+    let n_fused = cnt("tp.ar.fused");
     // ⚠️ 1-stage 档的路径判据在 `tp_perf_split_probe`(那里断言 `tp.ar.1stage > 0 ∧ v1 = 0`);
     // 本条只管 push/v1 两档 —— **1-stage 开时 v1 本就该是 0**,别在这里拦(2026-10-19)
     let one_stage_on = matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"));
-    eprintln!("[g8b] 路径判据:push={n_push} · v1={n_v1}(OWL_TP_PUSH={push} · 1-stage={one_stage_on})");
+    eprintln!("[g8b] 路径判据:push={n_push} · v1={n_v1} · fused={n_fused}(OWL_TP_PUSH={push} · 融合={ar_fused} · 1-stage={one_stage_on})");
     if one_stage_on {
         /* 走 tp_perf_split_probe 的判据 */
+    } else if ar_fused {
+        // **融合档的路径判据**(§11.2;2026-10-19):必须走到 fused,且 v1/push 都为 0
+        // (否则"开了融合档但没走"= 静默不生效,与 1-stage §60.2 同族坑)
+        assert!(n_fused > 0, "开了融合档但一次都没走到(tp.ar.fused = 0)");
+        assert_eq!(n_v1, 0, "融合档下不应走 v1 两核(tp.ar.v1 = {n_v1})");
+        assert_eq!(n_push, 0, "融合档下不应走 push 两核(tp.ar.push = {n_push})");
     } else if push {
         assert!(n_push > 0, "开了 push 但一次都没走到(tp.ar.push = 0)");
         assert_eq!(n_v1, 0, "开了 push 却仍在走 v1 绑定(tp.ar.v1 = {n_v1})");

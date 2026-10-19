@@ -1108,17 +1108,43 @@ where
                     // 令牌** —— 把它们搬到对端会让 15 个 block 紧自旋**远端读**,实测把
                     // AR 从 601µs 拉到 1225µs(§36.8)。协议(credit/produced/rendezvous)
                     // 在两种绑法下都成立(推导见 §36.6)。
+                    // 数据块选择(两档 header 不变;计数**不在这里** ——
+                    // `tp.ar.v1/push` 是**两核路径**的判据,融合档下不虚增)
                     let (stage_data, reduce_data) = if tp.push {
-                        owl_shared::metrics::with_metrics_store(|s| {
-                            s.counter_add("tp.ar.push", 1, file!(), line!())
-                        });
                         (tp.peer.clone(), tp.own.clone())
                     } else {
-                        owl_shared::metrics::with_metrics_store(|s| {
-                            s.counter_add("tp.ar.v1", 1, file!(), line!())
-                        });
                         (tp.own.clone(), tp.peer.clone())
                     };
+                    // **融合档**(§11.2;缺省关 —— 配置显式开):一核做完两段。
+                    // 只非 fp8 载荷(fp8 腿仍两核 —— 阈值与 `ar_f8` 同源)。
+                    let f8_leg = tp.ar_f8 && n_bytes >= 262_144;
+                    if tp.ar_fused && !f8_leg {
+                        owl_shared::metrics::with_metrics_store(|s| {
+                            s.counter_add("tp.ar.fused", 1, file!(), line!())
+                        });
+                        // stage 的 data 槽 = **写目标**;reduce 的 data 槽 = **读源**
+                        let fused = owl_kernels::client::comm::ArFusedCall::new(
+                            out.clone(),
+                            tp.own.clone(),
+                            tp.peer.clone(),
+                            stage_data,
+                            reduce_data,
+                            n_bytes as u64,
+                            tp.slot_bytes,
+                            0,
+                        )
+                        .to_launch();
+                        ctx.face.launch(fused).await?;
+                        return Ok(out);
+                    }
+                    // **两核档的路径判据**(融合档已在上分支 return ⇒ 到这里必是两核)
+                    owl_shared::metrics::with_metrics_store(|s| {
+                        if tp.push {
+                            s.counter_add("tp.ar.push", 1, file!(), line!());
+                        } else {
+                            s.counter_add("tp.ar.v1", 1, file!(), line!());
+                        }
+                    });
                     // 两段(私有 payload ⇒ 先 stage 到 staging,再归约对端/本端 slot)
                     let stage = owl_kernels::client::comm::ArStageCall::new(
                         out.clone(),
@@ -1306,6 +1332,7 @@ mod tp_injection_tests {
             arena: None,
             push: false,
             ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
+            ar_fused: false, // 测试档:两核路(融合档由配置开)
         };
         let err = eval_ops_scoped_env(
             &row_node(),
@@ -1344,6 +1371,7 @@ mod tp_injection_tests {
             arena: None,
             push: false,
             ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
+            ar_fused: false, // 测试档:两核路(融合档由配置开)
         };
         let err = eval_ops_scoped_env(
             &row_node(),
