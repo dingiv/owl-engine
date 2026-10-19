@@ -680,6 +680,26 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
     }
 
+    /// **N6 压力探测**(缺口 3;2026-10-19):驱动余量逼近 reserve ⇒ 返回"目标腾出槽数"。
+    ///
+    /// 判据(全部实测量,零猜测):`free < reserve` 才报压力;目标 = 把 free 拉回
+    /// **2×reserve**(留一次呼吸)所需的块数,按池块字节折算,夹在 `[1, 64]`
+    /// (一次 N6 是"整理"不是"搬家";不够就下一拍再来)。无设备账(CPU mock)⇒ None。
+    fn pressure_probe(&self) -> Option<usize> {
+        let free = owl_shared::vram::free_bytes();
+        if owl_shared::vram::total_bytes() == 0 {
+            return None;
+        }
+        let reserve = (self.cfg.knobs.vram_reserve_mb as u64) << 20;
+        let target = reserve.saturating_mul(2).max(1 << 30);
+        if free >= target {
+            return None;
+        }
+        let per = self.dev.pool.block_bytes().max(1) as u64;
+        let want = ((target - free) / per) as usize;
+        Some(want.clamp(1, 64))
+    }
+
     /// **句柄计数三元组**(诊断面;`/debug/vram`):`(hook_fail, window_unclosed, 窗内块数)`
     ///
     /// 判据:三者非零 = 有事件没入账 / 有窗未收 —— **可见**比"账看起来平"更重要。
@@ -1152,8 +1172,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let (n_out, n_in) = (verdict.out.len(), verdict.in_.len());
         if let Some(why) = &verdict.deny {
-            // 凑不够 = 真容量不足预警:照搬能搬的(下沉不丢内容),响亮留痕
+            // 凑不够 = 真容量不足预警:照搬能搬的(下沉不丢内容),响亮留痕。
+            // **不致命**(缺口 3):记为一次 `degrade`(服务面/报告可查),由调用方
+            // (准入/调度)决定收缩还是降级;真正的设备级错才走关停。
             owl_shared::log_warn!("store", "钩子:需求凑不够(真容量不足预警):{why}");
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("store.degrade", 1, file!(), line!());
+            });
         }
         let applied = self.apply_verdict(&verdict).await?;
         owl_shared::log_debug!(
@@ -1196,6 +1221,21 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut need = need;
         self.admission_gate(&mut need)?;
         self.pool_housekeeping(need).await?;
+        // **[N6 Pressure]**(缺口 3):余量告急 ⇒ **零缺口也搬**(先下沉、再驱逐);
+        // 这是"压力路径第一步":先把自己能腾的腾出来,而不是等 `ensure_for_len` 撞墙。
+        if let Some(k) = self.pressure_probe() {
+            let free = owl_shared::vram::free_bytes();
+            owl_shared::log_warn!(
+                "store",
+                "N6 压力节点:驱动余量 {:.0}MiB < 目标 ⇒ 目标腾 {k} 槽(先下沉后驱逐)",
+                free as f64 / 1048576.0
+            );
+            self.pool_housekeeping(owl_store::Need {
+                slots: k,
+                why: owl_store::NeedWhy::Pressure,
+            })
+            .await?;
+        }
         owl_shared::timer_start!("engine.pump.schedule");
         let t_sched = (prof || true).then(std::time::Instant::now);
         let out = self.schedule()?;

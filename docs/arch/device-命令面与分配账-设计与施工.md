@@ -696,6 +696,22 @@ device_ledger 2(断言"turn 后池非空 + hits+misses>0")· 真机三轮同上�
 **引擎侧(N6-②,未做)**:触发点(驱动 free < reserve 或池告急)⇒ 调 `Need{slots: K, why: Pressure}`
 → `apply_verdict`;`deny` 不再直通致命 ⇒ 进**降级链**(关桶图/退 eager/缩生成长度,记 `degrade`)。
 
+
+### 12.15 刀 N6-②:引擎压力节点 + 降级计数(2026-10-19)
+
+- **触发点**(`RunningEngine::pressure_probe`):`free < 2×reserve`(留一次呼吸)且
+  `free < reserve` 族判据 —— 目标 = 把 free 拉回 2×reserve 所需块数(按池块字节折算,
+  夹 `[1,64]`;一次是"整理"不是"搬家",不够下一拍再来)。无设备账(CPU mock)⇒ 不触发。
+- **节点**:`pump()` 在常规保洁之后加 **[N6 Pressure]**:`pool_housekeeping(Need{slots:k,
+  why:Pressure})` ⇒ 先整链下沉(内容不丢)、再按叶下沉、仍要腾才驱逐;日志带驱动余量。
+- **降级面**:`verdict.deny` **不致命**(缺口 3 原文),改为 `store.degrade` 计数 + WARN;
+  服务面可据此收缩/降级。真正的设备级错误才走优雅关停(既有路径不变)。
+- 与 N6-step1 的关系:**分配失败的即时自愈**(池排空 + 重试)在前,**节点级预防**(N6)在后,
+  两条合起来 = "先收缩、再降级、才拒且不死"。
+
+**门**:engine 54 · workspace check 干净 · store 88;次序门(需腿内有块的单测)仍在
+`hooks.rs` 的 FIXME 上 —— 与真机判据同刀收(构造用例:池贴顶 + 临时需求)。
+
 ## §十一 变更记录
 
 | 日期 | 版本 | 变更 |
