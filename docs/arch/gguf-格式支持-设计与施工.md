@@ -1008,3 +1008,72 @@ k 块 + 同一 warp reduce)⇒ 输出与 MMVQ **逐位相同**:
 预算:smem = `n_tile × k_chunk × 2B`(如 32×256 = 16 KB)+ x 窗(16×256 = 8 KB)
 ⇒ 每 CTA < 32 KB,4 CTA/SM 可跑;理论算力档:纯 f16 FMA(f32 累加)≈ 40 TFLOPS
 ⇒ 27B prefill **≈ 600-800 t/s**;再用 `wmma`(f16×f16→f32)可到 ~1000 t/s。
+
+---
+
+## 十七、W-2b:prefill smem 复用臂(2026-10-19;nsys 定谳 → 算术杠杆)
+
+### 17.1 先看分布:nsys 逐核账(4B,1001-token prompt,chunk 512)
+
+```bash
+OWL_TEST_DEVICE=41:00.0 OWL_GGUF_TILE=1 \
+nsys profile -o /tmp/gguf4b --force-overwrite true --trace=cuda --stats=true \
+  cargo test -p owl-engine --lib gpu_gguf_prefill_4b_probe -- --nocapture
+```
+
+| 核 | 占比 | 实例 | 备注 |
+|---|---:|---:|---|
+| `owl_gguf_gemm_tile_q6k` | **45.6%** | 288 | Q6_K = `attn_qkv`/`ffn_down`/`token_embd`(头) |
+| `owl_gguf_gemm_tile_q4k` | **40.5%** | 744 | ffn gate/up + 各 Q4_K |
+| `owl_gguf_gemm_tile_q8_0` | 4.8% | 72 | `ssm_out` |
+| `vllm_chunked_prefill_paged_attn` | 3.0% | 48 | attention |
+| `owl_gdn_recurrence_varlen_gqa` | 2.5% | 144 | GDN |
+| `owl_gguf_gemm_tile_q5k` | 2.1% | 96 | Q5_K |
+| `owl_gguf_quant_act_f16` | 0.7% | 1235 | 激活量化 |
+| 其余(conv/norm/rope/silu/narrow…) | <0.5% | | |
+
+两条判读:
+1. **GEMM ≈ 93%**,其余全在噪声里 ⇒ 要动就动 GEMM,别碰 attention/GDN;
+2. 各型占比 ≈ **FLOPs 占比**(Q6_K 43% FLOPs / 45.6% 时间)⇒ **没有"某型特别慢"**,
+   是**整条 `vec_dot` 路径的有效算力只有 3.7-4.4 TFLOPS**(每 token 重新解量化)。
+
+### 17.2 本刀做的事(逐条对上 W-2a 的结论)
+
+| 症结 | 本刀 |
+|---|---|
+| 每 token 重新解量化 | 权重窗 `[NT=64, KC=256]` 解进 **smem**,每窗**一次** |
+| 解量化数学不想抄 | 快照的 `dequantize_block_q4_K` 是 32 线程协作式,而本核 block = `(32, NW)` ⇒ **`threadIdx.x` ≡ lane** ⇒ 单 warp 直接调 ✓(Q5_K/Q6_K 是 **64 线程**型 ⇒ 按 `tid = lane, lane+32` 两趟;Q8_0 快照无该函数 ⇒ 5 行自写) |
+| smem 带宽墙 | **寄存器 4×NR 分块**(512 线程 × 16 累加器 ⇒ smem 读 : FMA = 1 : 2) |
+| 激活还要 q8_1 | 本臂**直吃 f16**(省一发量化核;数值上更准 —— 门的口径随之从"位级"改成 allclose) |
+
+几何:`grid = (ceil(n/64), ceil(m/64))`,`block = (32, 16) = 512 线程`,
+动态 smem = `(64+64) × (256+2) × 2B = 66 048B`(>48KB ⇒ 走既有 opt-in 通道)。
+
+### 17.3 门与实测
+
+| 门 | 判据 | 结果 |
+|---|---|---|
+| 数值对拍 | `kernel_gate::gpu_gguf_smem_gemm_matches_mmvq`:四型 × `m = 64 / 101`(整窗+尾窗)vs MMVQ,`max|Δ|/max = 3.3e-3 ~ 7.9e-3`(= q8_1 量化噪声量级;错窗/错块会给 O(1)) | ✓ |
+| 端到端 | 1001-token prompt 首 token:两臂相同(`" The"`) | ✓ |
+| 回归 | 27B/4B 冒烟(短 prompt 走 MMVQ)、`op_tables` 10/10、`ops_whitelist` 2/2、`no_runtime_compile` 4/4 | ✓ |
+
+prefill 实测(1001-token prompt):
+
+| 档 | MMVQ(W-1 前) | W-2a(vec_dot 复用) | **W-2b(smem 复用)** | 总加速 |
+|---|---:|---:|---:|---:|
+| 4B(chunk 512) | 333 t/s | 468 | **819.5** | **2.46×** |
+| 27B(chunk 512) | 48.5 | 78.0 | **121.4** | **2.50×** |
+
+有效算力从 3.7-4.4 升到 **≈6.6 TFLOPS**(4B FLOPs / 时长)。
+**仍在算术墙内**(FP32 峰值 36 TFLOPS 的三成不到):下一步杠杆 = `wmma`
+(f16×f16→f32 张量核;smem 已按行主序/f16 铺好,可直接 `load_matrix_sync`)+
+双缓冲(cp.async 盖住 staging)。
+
+### 17.4 踩过的两个坑(已入档)
+
+1. **`k0` 偏移漏了**:权重窗解量化必须按 `k0 / qk` 退块指针 —— 漏了 ⇒ 每个 k 窗
+   都解第 0 块,`max|Δ|/max = 0.92`(门当场红);
+2. **Q5_K 也是 64 线程型**(`il = tid/16` 需 0..3):只调一趟 ⇒ 半块是真值、
+   半块是上窗残留 ⇒ 偶发 `inf`。**判据**:门的 m=64/101 两档 + 四型全覆盖;
+3. (反例)把 x 暂存改成"token 外层"消除法 —— **实测慢 1.35×**(502 vs 687 t/s),
+   已回退。原因未深究,但说明**这条路径必须用实测选形**,别凭直觉。
