@@ -259,3 +259,94 @@ GGUF 草稿装载失败必须**拒启**（不静默降级成无 spec，避免“
 - **不做** 码本 GGUF-gather 内核（v1 装载期反量化，254 MB 换零核改动）。
 - **不做** DSpark/其他 draft 家族的 GGUF 线（`DimInfer/…Dspark…` 另案）。
 - **不改** verify / accept / 降级窗口语义（复用现役，零风险）。
+
+---
+
+## 8. 施工记与实测(P0–P3,2026-10-20 当日结案)
+
+### 8.1 落了什么
+
+| 刀 | 文件 | 内容 |
+|---|---|---|
+| P0-a | `formats/gguf/draft_meta.rs`(新) | `dflash.*` KV → `DraftSpec`;**1-based 归一** + 家族对账(G0-b)+ 跨文件一致性(hidden/taps 越界/block/rank/conv)+ `mask_token` 兜底点 |
+| P0-b | `formats/gguf/draft.rs`(新) | `DraftGgufConvention`(计划键)+ `DraftGgufPlan`(PlanTable)+ `GgufDraftSource`(译表 + fc tap 重排 + 码本反量化)+ `GgufDraftBoot::{open,draft,load}`(装载 + G0-a 覆盖门) |
+| P1 | `layers/dflash2.rs` | `DraftFc::G`(五拆 GGUF 臂)+ `from_dims_keyed`(逐张量计划)+ `DfAttn/DfLayer` 改吃 `PlanSource` + conv 投影走 `PlanSource::or_default` |
+| — | `layers/linear.rs` / `mlp.rs` | `Linear::with_out_dtype`(输出 dtype 钉定)+ **GGUF 动态范围护栏**(见 8.3) |
+| — | `kernels/cu/elems/scale.cu`(新) | `owl_scale_{f16,bf16}`(逐元素乘常数;成对指数移位的执行体) |
+| P2 | `engine/spec_runtime.rs` / `engine.rs` / 4 个调用点 | 草稿源按**路径形态**判别(目录=HF / 文件=GGUF)+ `dflash_tap_ids`/`dflash_mask_token`/`dflash_rope` **单源化** + 5 处硬编码 taps 全替 |
+| P3 | `profiles/gguf27b-iq-dflash.toml`(新) | 27B UD-IQ4_XS + GGUF 草稿 d7 生产靶位 |
+
+**实证到的三条事实(不再靠推断)**
+1. **草稿 norm 未烘焙 `+1`**:GGUF 与 HF BF16 检查点逐元素 **max|Δ| = 0**(5 类 norm + rank-3 conv base 全 0)⇒ 草稿源事实恒 `SourceFacts::HF`,且 `DFlash2Draft` 的 `RmsNorm::new`(plain ×w)两族通用;
+2. **`target_layers` 确为 1-based**:`[6,20,34,48,62] - 1 = [5,19,33,47,61]` 与 HF 逐值相等;
+3. **`mask_token_id` 确实不在 GGUF**(48 个 KV 里没有)⇒ v1 家族兜底 + `log_warn` 点名。
+
+### 8.2 计划面:混型不只是"注意力/MLP"
+
+GGUF 草稿的量化件**比设计预期多两个**(HF 检查点里它们是原生 BF16):
+- `attn_conv_proj.weight` / `ffn_conv_proj.weight`(Q4_K)!⇒ `GroupedConv::proj` 必须吃计划;
+- `selector_hidden.weight`(Q4_K)⇒ `CandidateSelector::proj` 必须吃计划。
+
+两者在 HF 档必须**保持 F16**(改它 = 静默改变 W4A16/BF16 草稿数值)⇒ 引入
+`PlanSource::or_default(local, out, in, default)`:**Uniform 臂取 default,Keyed 臂逐键查表**。
+这条是"混型源"与"单一方案源"的语义分界,后续新格式接入照抄。
+
+`fc` 是唯一走**源侧重排**的件:`fc.weight` 的五个 tap 沿**内维**排布,量化块沿内维走
+⇒ 列切跨 `out` 行,扁平字节槽无法表达列窗。源在装载期按行搬 5 份
+(`fc_i.weight`,纯 memcpy;**设备驻留总量 = 一份 fc**),5 个 GEMM 的调用面与 W4A16 臂完全同形。
+
+### 8.3 数值面:GGUF GEMM 的 **F16 输出上限**是 BF16 草稿的结构约束
+
+GGUF 块型 GEMM 的所有臂(MMVQ/tile/MMQ/smem/cuBLAS)落点都是 `__half*`,
+而草稿执行域是 **BF16**(F16 装不下残差流,2026-10-19 定谳)。实测:
+Q4_K 草稿的 `mlp_out` / `fc` 可达 **6e4** —— 贴 F16 上限 65504,随机输入下直接出
+`inf`(静默 NaN 塌陷)。
+
+处置(不新增 GEMM 变体,零精度损失):
+- `Linear::with_out_dtype(dt)` 让 GGUF 臂**成对移位**:`x·2⁻⁶ → GEMM → f16→bf16 → ·2⁶`;
+- 2 的幂在 f16/bf16 上**精确**;相对精度仍由 F16 尾数(10-bit)决定 ⇒ 与"BF16 输出 GEMM"等价;
+- 2⁶ = 64× 上限余量(1.7e7 以下不饱和);F16 次正规临界 ×2⁶ 仍远细于 BF16 自身粒度;
+- 新核只有 20 行(`owl_scale_{f16,bf16}`),门 = 成对移位逐位复原(见 8.4);
+- `out_dt` 缺省 `None` ⇒ 主干 GGUF 路径(F16 执行域)**逐字节不变**。
+
+### 8.4 门(全部绿)
+
+| 门 | 判据 | 实测 |
+|---|---|---|
+| **G0** 声明/计划 | `dflash.*` → DraftSpec;7 个 Linear/层 + fc + selector 全部 `QuantPlan::Gguf` | 绿(taps `[5,19,33,47,61]`) |
+| **G0-a** 覆盖 | 声明请求集 ⇔ 文件张量集(双向) | **85 wants ↔ 81 张量**双向相等 |
+| **G0-c** 预算 | 草稿驻留 ≤ 1.3 GiB | **1253 MiB**(文件 1079 + 码本反量化净增 173) |
+| **G1-a** fc 重排 | 5 个 tap vs HF `fc` 列块(含**非行对齐窗口** ≡ 整段切片) | max rel **4.2e-2 / 3.9e-2** |
+| **G1-b** 原生件 | norm / rank-3 conv base vs HF | **逐位相等(max\|Δ\| = 0)** |
+| **G1-c** 码本 | 两本码本抽样行(0 / 1234 / 248319) | rel < 1e-1(量化噪声) |
+| **P1/P2-GPU** | GGUF 草稿 ≡ **HF BF16 草稿**(同 taps、同 BF16 域):`project_memory` / layer0 `conv_in` / `conv_delta` / `mlp_out` / `conv_finish` | 4.9e-2 / 6.6e-2 / 6.4e-2 / 3.1e-2 / 9.6e-2(全在 Q4_K 噪声域) |
+| 核门 | `owl_scale_bf16` 成对移位 | 逐位复原 |
+| 全量回归 | `cargo test -p owl-models --lib` / `-p owl-engine --lib` | **291 / 76 全绿** |
+
+### 8.5 P3 e2e(单 3090 Ti;27B UD-IQ4_XS 主干;256 tok,greedy)
+
+| 档 | tok/s | AL(窗口) | 轮成本 |
+|---|---:|---:|---:|
+| 无 spec(`spec.depth=0`) | **32.4** | — | 27–30 ms/步 |
+| **GGUF 草稿 d7**(本轮) | 23.5 | **2.50–3.25** | 167–174 ms |
+| HF W4A16 草稿 d7(对照) | 24.6 | **2.50–3.25** | 165–170 ms |
+| GGUF 草稿 d3 | 23.9 | 1.38 | 87 ms |
+
+**判决**
+1. **草稿本身完全达标**:AL 与 HF W4A16 草稿**逐窗口相同**,轮成本相同(propose 37–39 ms)⇒
+   Q4_K 草稿在数值上可用,W4A16 先例(2.86/5.42)得到复现;
+2. **spec 在本配置下净亏**(23.5 vs 32.4 tok/s),但**与草稿无关**——
+   `spec-prof` 定谳:`verify` 的**图内 GPU 时间 = 175 ms / 8 行**(裸 decode 27 ms/1 行,
+   即 m=8 的 GGUF GEMM 只有 m=1 的 ~1/10 效率)。HF 草稿在同主模型上数字一致 ⇒
+   这是 **GGUF 主干在 m=8(verify 形状)上的既有性能缺口**,不是草稿线引入的;
+   关 tile 臂(`OWL_GGUF_TILE=0`)无改善 ⇒ 缺口在 m=8 的形状适配层,另案。
+
+### 8.6 发现的新缺口(挂账)
+
+1. **GGUF 主干 m=8(verify)GEMM 效率**:175 ms/8 行 vs 27 ms/1 行。spec 线的
+   吞吐门(≥ 无 spec × 1.3)要等它;候选修法 = m∈[2,32) 的专用臂(或 MMVQ 多行复用),
+   与 `GGUF_TILE_MIN_M=8` 的门槛重定;
+2. **`mask_token_id` KV 缺失**:需向转换器(或 z-lab)提 issue 补 `dflash.mask_token_id`;
+3. P4(原设计):GGUF 草稿 TP2 分片、码本 GGUF-gather(省 254 MB)、Q8_0 草稿档对比;
+4. 顺手修:上一轮 IQ 落地后 `dequant::tests::rejects_bad_geometry` 拿 IQ2_XXS 当
+   "未接臂"(陈旧断言)→ 改用 IQ1_M。
