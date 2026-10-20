@@ -36,6 +36,7 @@ pub(super) fn entry_of(ctx: &GpuCtx, cmd: &Command) -> TraceEntry {
             // FI plan 表同步(W3):控制面命令(无 payload/无块)⇒ kind=ctl
             Command::FiPlanSync { .. } => E::new("fi_plan_sync", "ctl"),
             Command::MemPoolTrim { .. } => E::new("mem_pool_trim", ""),
+            Command::MemPoolStats { .. } => E::new("mem_pool_stats", ""),
             Command::UploadAndLaunch { dst, chunks, .. } => {
                 let n: usize = chunks.iter().map(|c| c.len_bytes).sum();
                 E::new("upload_and_launch", "h2d").bytes(n).id(dst.id)

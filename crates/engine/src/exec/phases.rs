@@ -18,6 +18,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
     /// 块表重写(write_bt;图烘焙 bt 指针,内容重写指针稳定图不重捕)
     pub(crate) async fn execute_begin(&mut self, b: BeginPlan) -> Result<()> {
+        // **上一 turn 的池缓存**(§23.9):turn 收尾之后才 free 的大额临时块
+        // (`RELEASE_THRESHOLD=∞` 下不主动清就永远占着)在新 turn 起点一并回收。
+        // 放在 begin 之前:此时设备已空闲,连同步一起做代价最小(ms 级)。
+        let _ = self.trim_pools().await;
         // 性能面:本轮 epoch 起点(/debug/perf?epoch=1 = 只看本轮;不 reset,
         // 历史样本仍可全量查询 —— perf-framework.md §三)
         owl_shared::metrics::mark_epoch();
@@ -41,26 +45,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 b.pending_loads.iter().map(|(_, c)| *c).collect();
             // **S6**:盘上的块先读回宿主(盘 → 设备要两跳;判据与账都在 store)
             let _ = self.ensure_host_resident(&chains).await?;
-            let leg = &mut self.bank.rel.leg;
-            let face = self.dev.graphs.session.face_mut();
             let (cs, new_slots, pieces, table) = {
-                let p = owl_store::plan_onload(leg, &chains)?;
+                let p = owl_store::plan_onload(&mut self.bank.rel.leg, &chains)?;
                 (p.chains, p.slots, p.pieces, p.table)
             };
-            let conn = match face
-                .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+            let table = match self
+                .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, table)
                 .await
             {
-                Ok(c) => c,
+                Ok(t) => t,
                 Err(e) => {
-                    owl_store::abort_onload(leg, &cs, &new_slots);
-                    return Err(owl_iface::contract::ModelError::Msg(format!(
-                        "回灌 swap 失败(engine 编排):{e}"
-                    )));
+                    owl_store::abort_onload(&mut self.bank.rel.leg, &cs, &new_slots);
+                    return Err(e);
                 }
             };
-            let table = owl_store::reclaim_slot_table(conn)?;
-            let slots = owl_store::commit_onload(leg, &cs, &new_slots, table)?;
+            let slots = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &new_slots, table)?;
             // **B-3e 实测账**:本条命令的块数/字节/墙钟(含发射 + 回执)
             self.stage.blocks += cs.len();
             self.stage.bytes += cs.len() * self.dev.pool.block_bytes();
@@ -154,6 +153,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             (act.id, act.session_id)
         };
+        // **段边界提前释放(2026-10-20;客户端咽喉 + 提前收回)**:
+        // 上一 chunk 的 `Turn(t)` 残块(arena 没盖住的,27B TP 实测 ≈94 MB/chunk,
+        // 且只在 peer)在**本 chunk 分配之前**结清 —— 不留到 turn 收尾,
+        // 否则长 prefill 会把 12 GB 余量一路吃穿(`vram-hard-budget`)。
+        // `base == 0` 不动(turn 起点还有长命块要活过整轮)。
+        if base > 0 {
+            let (n, bytes) = self.drain_turn_stale(turn_id, "prefill_boundary").await?;
+            if n > 0 {
+                owl_shared::log_debug!(
+                    "store",
+                    "段边界提前释放:turn {turn_id} base={base} {n} 块 / {} KiB(上一 chunk 残块)",
+                    bytes / 1024
+                );
+            }
+        }
         // 调试门:prefill 块粒度(见 owl_shared::stepgate;`--step-gate` 控制)
         owl_shared::step_gate!("engine.prefill").await;
         // **锁①后半:块表按 chunk 增量长**(只在虚拟化档;2026-10-19)。

@@ -272,6 +272,11 @@ pub enum Command {
     MemPoolTrim {
         ack: Ack<Result<u64, ModelError>>,
     },
+    /// **设备池账**(内存面;只读):(used, used_high, reserved, reserved_high)
+    /// —— `/debug/vram` 的 per-rank 行(物理 − live = 池缓存,见 §23.9)。
+    MemPoolStats {
+        ack: Ack<Result<(u64, u64, u64, u64), ModelError>>,
+    },
     /// **设备 SM 数查询**(宿主面只读;`cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)`)。
     /// 与 `BlockLedgerDump` 同族:无 GPU 活、无流、捕获期可放行(恒定值,不碰设备状态)。
     DeviceSmCount {
@@ -336,6 +341,7 @@ impl Command {
             Self::DeviceSmCount { .. } => "device_sm_count",
             Self::BlockLedgerDump { .. } => "block_ledger_dump",
             Self::MemPoolTrim { .. } => "mem_pool_trim",
+            Self::MemPoolStats { .. } => "mem_pool_stats",
             Self::UploadAndLaunch { .. } => "upload_and_launch",
             Self::LaunchAndHarvest { .. } => "launch_and_harvest",
             Self::HtodChunk { .. } => "htod_chunk",
@@ -378,6 +384,8 @@ impl Command {
             Self::Htod { ack, .. } => ack.created_at(),
             Self::DeviceSmCount { ack } => ack.created_at(),
             Self::BlockLedgerDump { ack } => ack.created_at(),
+            Self::MemPoolStats { ack } => ack.created_at(),
+            Self::MemPoolTrim { ack } => ack.created_at(),
             Self::MemPoolTrim { ack } => ack.created_at(),
             Self::UploadAndLaunch { ack, .. } => ack.created_at(),
             Self::LaunchAndHarvest { ack, .. } => ack.created_at(),

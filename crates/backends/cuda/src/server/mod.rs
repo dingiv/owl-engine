@@ -895,6 +895,10 @@ impl GpuServer {
                 ack.send(self.ctx().block_ledger())
             }
             Command::MemPoolTrim { ack } => ack.send(self.ctx_mut().mem_pool_trim()),
+            Command::MemPoolStats { ack } => ack.send(
+                crate::state::pool_ledger_snapshot()
+                    .ok_or_else(|| ModelError::Msg("mem_pool_stats: 池账不可读".into())),
+            ),
             Command::UploadAndLaunch { dst, chunks, msg, ack } => {
                 self.handle_upload_and_launch(dst, chunks, msg, ack)
             }
@@ -1000,11 +1004,55 @@ impl GpuServer {
         // ── 显存硬预算(2026-10-16):**主动拒发**,不去 malloc ──
         // 判据见 `crate::state::VramGuard::check`（驱动 free − reserve；可选叠
         // live 账上限）。拒发 = 结构化 `PoolExhausted` + 一条 WARN（带池账/驱动账）。
-        if let Err(e) = self.vram_guard.check(
-            n_bytes,
-            self.diag.vram_reserve_mb << 20,
-            self.diag.vram_budget_mb.map(|m| m << 20),
-        ) {
+        let guard_check = |g: &mut crate::state::VramGuard,
+                           reserve: u64,
+                           budget: Option<u64>|
+         -> Result<(), ModelError> { g.check(n_bytes, reserve, budget) };
+        let reserve_b = self.diag.vram_reserve_mb << 20;
+        let budget_b = self.diag.vram_budget_mb.map(|m| m << 20);
+        let first = guard_check(&mut self.vram_guard, reserve_b, budget_b);
+        if let Err(e) = first {
+            // **池缓存应急回收(2026-10-20 §23.9)**:`RELEASE_THRESHOLD=∞` 下
+            // 已 free 的块仍占物理显存 ⇒ "驱动 free 告急"常是**池缓存**不是 live。
+            // 拒发前先 trim 一次(块账不变),复判通过就放行;不通过才响亮拒。
+            // 先把四条流排空(异步 free 要等事件落地才进池的"空闲页"表),再 trim
+            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_COMPUTE_AUX, STREAM_D2H] {
+                if let Ok(st) = self.ctx().stream(sid) {
+                    if let Err(e) = st.synchronize() {
+                        self.sink.logf(
+                            owl_shared::log::LVL_WARN,
+                            "vram-budget",
+                            format_args!("硬预算前排空失败(stream {sid}): {e:?}"),
+                        );
+                    }
+                }
+            }
+            let trimmed = self.ctx_mut().mem_pool_trim();
+            let freed = trimmed.as_ref().ok().copied().unwrap_or(0);
+            let retry_ok = trimmed.is_ok()
+                && freed > 0
+                && guard_check(&mut self.vram_guard, reserve_b, budget_b).is_ok();
+            if retry_ok {
+                self.sink.logf(
+                    owl_shared::log::LVL_INFO,
+                    "vram-budget",
+                    format_args!(
+                        "硬预算前回收默认池缓存 {freed}B({:.1}MiB)⇒ 复判通过(本次分配 {}B)",
+                        freed as f64 / 1048576.0,
+                        n_bytes
+                    ),
+                );
+            } else {
+                if trimmed.is_err() {
+                    self.sink.logf(
+                        owl_shared::log::LVL_WARN,
+                        "vram-budget",
+                        format_args!(
+                            "硬预算前池缓存回收失败:{}",
+                            trimmed.as_ref().err().map(|t| t.to_string()).unwrap_or_default()
+                        ),
+                    );
+                }
             let pool = crate::state::pool_ledger_snapshot()
                 .map(|(u, uh, r, rh)| {
                     format!("池 used={}MiB(高水 {}MiB)/reserved={}MiB(高水 {}MiB)", u >> 20, uh >> 20, r >> 20, rh >> 20)
@@ -1026,7 +1074,21 @@ impl GpuServer {
                     owl_shared::vram::live_bytes() >> 20
                 ),
             );
-            return ack.send(Err(e));
+                return ack.send(Err(e));
+            }
+        }
+        // **大额分配取证**(2026-10-20 §23.9):池 `used_high` 高出 live 基线 GB 级
+        // 时,先要知道"谁";≥256 MiB 的单笔在 info 级别点名(每 turn 至多几笔)。
+        if n_bytes >= (16 << 20) {
+            self.sink.logf(
+                owl_shared::log::LVL_INFO,
+                "alloc-big",
+                format_args!(
+                    "rank{} 大额分配 {:.1}MiB: name={name} elems={elems} zero={zero}",
+                    self.ctx().device_ordinal(),
+                    n_bytes as f64 / 1048576.0
+                ),
+            );
         }
         // 图外:路由 COMPUTE 流;zero = true 时流序清零(契约:Zeros = 清零
         // 分配;uninit 免 memset —— eager 大量 scratch alloc 同税)

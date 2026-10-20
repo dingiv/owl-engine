@@ -956,6 +956,9 @@ pub(crate) fn into_running<D: DeviceClient>(
                     // 宿主层预算(REQ C4:默认关;0 = 关层)—— 与预算入参**同源**
                     // (腿不得超总账;`Rel::open` 交叉校验)
                     host_bytes,
+                    // **TP 宿主腿平面数 = world**(单卡 1;双 rank 2 —— 两个 rank
+                    // 的半页 KV 各占一平面,预算仍是两 rank 合计)
+                    world: if peer.is_some() { 2 } else { 1 },
                 },
                 budget_inputs,
                 admission_policy,
@@ -963,6 +966,11 @@ pub(crate) fn into_running<D: DeviceClient>(
                 dev.pool.mtp_pool_layout(0),
                 ledger,
             )?;
+            // **TP:peer 平面布局**(2026-10-20 双卡 KVMem)。两 rank 的池句柄 id
+            // 是两套 ⇒ 每个平面必须用**自己那套** `PieceSpec` 组片(靠偏移平移不行)。
+            if let Some(pr) = peer.as_ref() {
+                b.rel.leg.attach_pool_peer(pr.pool.pool_layout(0))?;
+            }
             // **复用池上限**(缺口 4 收尾 P1-1):配置面显式(=0 ⇒ 不限,仅诊断用)
             let cap = cfg.knobs.pool_cap_mb << 20;
             b.rel.set_pool_cap(cap.max(0) as usize);
@@ -988,6 +996,9 @@ pub(crate) fn into_running<D: DeviceClient>(
             }
             if dev.pool.paged && dev.pool.snap_capacity() > 0 {
                 let epoch = b.rel.attach_snap_layout(dev.pool.snap_pool_layout(0))?;
+                if let Some(pr) = peer.as_ref() {
+                    b.rel.attach_snap_layout_peer(pr.pool.snap_pool_layout(0))?;
+                }
                 owl_shared::log_info!(
                     "boot",
                     "状态腿三层化:快照 {} 槽 × {}B/条(布局 epoch {epoch})· 宿主预算 {:.1}MiB",
@@ -1130,6 +1141,7 @@ pub(crate) fn into_running<D: DeviceClient>(
         boot_seq: BOOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
         turns: crate::turn::TurnLedger::new(),
         idle_pumps: 0,
+        last_trim: None,
         degrade_seen: 0,
         bank,
         dev,

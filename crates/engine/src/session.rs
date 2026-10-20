@@ -247,6 +247,9 @@ pub(crate) struct BankPlan {
     pub cache_share_permille: u16,
     /// target 腿宿主层预算(字节;0 = 关层,REQ C4 默认关)
     pub host_bytes: usize,
+    /// **TP world**(2026-10-20):宿主腿每条链占 `world` 个平面
+    /// (单卡 1;双 rank 2 ⇒ 单链宿主字节 = world × 单页,**预算语义不变**)。
+    pub world: usize,
 }
 
 /// 会话 + 块账房(组合叶;RunningEngine 持有)。会话账与两套物理块链
@@ -293,7 +296,7 @@ impl SessionBank {
         } else {
             owl_store::CachePolicy::Off
         };
-        let mut rel = Rel::open(
+        let mut rel = Rel::open_world(
             inputs,
             policy,
             LegConfig {
@@ -306,6 +309,7 @@ impl SessionBank {
                 label: "target",
             },
             ledger,
+            plan.world.max(1),
         )?;
         rel.leg.attach_pool(target_layout)?;
         let mut leg_mtp = BlockLeg::open(LegConfig {

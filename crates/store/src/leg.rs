@@ -208,9 +208,18 @@ pub struct BlockLeg {
     kv: KvStore,
     host: HostTier,
     layout: Option<PoolLayout>,
+    /// **peer 平面布局**(TP;`None` = 单卡)。设备块 id 是**每 rank 一套**
+    /// (句柄 id 不能跨账本解析)⇒ 每个平面用自己的 `PieceSpec` 组片。
+    layout_peer: Option<PoolLayout>,
     ops: LegOps,
     class: BlockClass,
     label: &'static str,
+    /// **宿主腿的平面数 = TP world**(2026-10-20 双卡 KVMem 立案)。
+    ///
+    /// 语义:一条链在宿主层占**一个槽**,槽内是 `planes × block_bytes` ——
+    /// 每 rank 半页 KV 各占一个平面(`pieces_on_plane` 给平面偏移)。
+    /// 单卡恒 1(行为与历史逐位相同)。
+    planes: usize,
 }
 
 impl BlockLeg {
@@ -219,6 +228,18 @@ impl BlockLeg {
     /// `slots = 0` = **该腿未启用**(例:非投机档的 MTP 链)—— 合法;
     /// 误用(去要槽)= `Exhausted` 响亮拒,与接线前的 0 块页池同语义。
     pub fn open(cfg: LegConfig) -> StoreResult<Self> {
+        Self::open_planes(cfg, 1)
+    }
+
+    /// 开腿(**TP 档**:`planes` = world ⇒ 宿主槽 = world × 单页字节)。
+    ///
+    /// 为什么不是"两条腿":链身份/槽号/引用计数都是**两 rank 共用一份**
+    /// (同一 slot 号在两侧池里有同形页)⇒ 一条链只能有一个宿主席位;
+    /// 用槽内平面区分 rank,账仍然一本(预算 = 两 rank 合计)。
+    pub fn open_planes(cfg: LegConfig, planes: usize) -> StoreResult<Self> {
+        if planes == 0 {
+            return Err(StoreError::Invariant("宿主腿平面数为 0(TP world 至少 1)".into()));
+        }
         if cfg.block_tokens == 0 || cfg.block_bytes == 0 {
             return Err(StoreError::Invariant(format!(
                 "块腿几何非法:slots={} block_tokens={} block_bytes={}",
@@ -240,8 +261,9 @@ impl BlockLeg {
                             0
                         } else {
                             let dev = (cfg.slots as u128 * permille as u128 / 1000) as usize;
-                            let host_slots = if cfg.host_bytes > 0 && cfg.block_bytes > 0 {
-                                cfg.host_bytes / cfg.block_bytes
+                            let page = cfg.block_bytes.saturating_mul(planes);
+                            let host_slots = if cfg.host_bytes > 0 && page > 0 {
+                                cfg.host_bytes / page
                             } else {
                                 0
                             };
@@ -250,12 +272,52 @@ impl BlockLeg {
                     }
                 },
             ),
-            host: HostTier::new(cfg.block_bytes, cfg.host_bytes)?,
+            host: HostTier::new(cfg.block_bytes.saturating_mul(planes), cfg.host_bytes)?,
             layout: None,
+            layout_peer: None,
             ops: LegOps::default(),
             class: cfg.class,
             label: cfg.label,
+            planes,
         })
+    }
+
+    /// 宿主腿的平面数(= TP world;1 = 单卡)。
+    pub fn planes(&self) -> usize {
+        self.planes
+    }
+
+    /// 宿主**单链条目**的字节(= `planes ×` 单页字节)。
+    pub fn host_slot_bytes(&self) -> usize {
+        self.host.block_bytes()
+    }
+
+    /// **注册 peer 平面布局**(TP;`planes > 1` 必调 —— 未注册 = 组片时响亮拒)。
+    ///
+    /// 校验与 `attach_pool` 同律:两平面的单块字节必须相等(否则同一链的
+    /// 两半大小不同 ⇒ 宿主槽内偏移错位)。
+    pub fn attach_pool_peer(&mut self, layout: PoolLayout) -> StoreResult<u64> {
+        let want = self.kv.block_bytes();
+        let got = layout.slot_bytes();
+        if got != want {
+            return Err(StoreError::Invariant(format!(
+                "peer 池布局单块字节不符:布局 {got} ≠ 腿 {want}(TP 两 rank 的页必须同形)"
+            )));
+        }
+        let epoch = layout.epoch;
+        self.layout_peer = Some(layout);
+        Ok(epoch)
+    }
+
+    /// 某平面的片规格(0 = 本 rank;>0 = peer)。
+    fn pieces_at(&self, plane: usize) -> StoreResult<&[PieceSpec]> {
+        let l = if plane == 0 { self.layout.as_ref() } else { self.layout_peer.as_ref() };
+        let l = l.ok_or_else(|| {
+            StoreError::Invariant(format!(
+                "块腿平面 {plane} 的池布局未注册(TP 档 engine 必须调 attach_pool_peer)"
+            ))
+        })?;
+        Ok(&l.pieces)
     }
 
     /// **注册池布局**(boot 一次;id 级)。`epoch` 单调增即可(用调用方给的值)。
@@ -752,8 +814,9 @@ impl ChainHit {
 pub struct OutPlan {
     /// 逐块(身份, 原设备槽) —— 记账与回滚用。
     pub blocks: Vec<(ChainHash, u32)>,
-    /// 设备 → 连接器的片(每块 × 每层片段)。
-    pub pieces: Vec<SwapPiece>,
+    /// 设备 → 连接器的片,**每平面一组**(单卡 = 1 组;TP = world 组,
+    /// 每组用本 rank 的块 id ⇒ 不能靠偏移平移)。
+    pub pieces: Vec<Vec<SwapPiece>>,
     /// 宿主侧槽台(engine 原箱交给 `face.swap`,回执后交还 [`commit_offload`])。
     pub table: SlotTable,
 }
@@ -798,10 +861,17 @@ pub fn plan_offload_blocks(
         }
     }
     if blocks.is_empty() {
-        return Ok(BlockOutPlan { blocks, pieces: Vec::new(), table: SlotTable::new(Vec::new()), skipped });
+        return Ok(BlockOutPlan {
+            blocks,
+            pieces: (0..leg.planes).map(|_| Vec::new()).collect(),
+            table: SlotTable::new(Vec::new()),
+            skipped,
+        });
     }
     let bufs = leg.host.lend_slots(blocks.len())?; // 预算在借台处查(超界零副作用)
-    let pieces = out_pieces(leg, &blocks)?;
+    let pieces = (0..leg.planes)
+        .map(|p| out_pieces(leg, &blocks, p))
+        .collect::<StoreResult<Vec<_>>>()?;
     Ok(BlockOutPlan { blocks, pieces, table: SlotTable::new(bufs), skipped })
 }
 
@@ -823,8 +893,9 @@ pub fn is_host_placeholder(slot: u32) -> bool {
 pub struct BlockOutPlan {
     /// 有票的块(身份, 原设备槽) —— 交给 [`commit_offload`] / [`abort_offload`]。
     pub blocks: Vec<(ChainHash, u32)>,
-    /// 设备 → 连接器的片(每块 × 每层片段)。
-    pub pieces: Vec<SwapPiece>,
+    /// 设备 → 连接器的片,**每平面一组**(单卡 = 1 组;TP = world 组,
+    /// 每组用本 rank 的块 id ⇒ 不能靠偏移平移)。
+    pub pieces: Vec<Vec<SwapPiece>>,
     /// 宿主侧槽台(engine 原箱交给 `face.swap`)。
     pub table: SlotTable,
     /// **无票块 + 原因**(报告面:**不**否决有票块 —— 这正是本函数存在的理由)。
@@ -859,8 +930,8 @@ pub struct InPlan {
     pub chains: Vec<ChainHash>,
     /// 新分配的设备槽(同序)。
     pub slots: Vec<u32>,
-    /// 连接器 → 设备的片。
-    pub pieces: Vec<SwapPiece>,
+    /// 连接器 → 设备的片(**每平面一组**)。
+    pub pieces: Vec<Vec<SwapPiece>>,
     /// 宿主侧槽台(engine 交给 `face.swap(In, …)`)。
     pub table: SlotTable,
 }
@@ -893,7 +964,9 @@ pub fn plan_offload(leg: &mut BlockLeg, tail: ChainHash) -> StoreResult<OutPlan>
         return Err(StoreError::Busy(format!("链 {tail:?} 没有可搬的设备块")));
     }
     let bufs = leg.host.lend_slots(blocks.len())?; // 预算在借台处查(超界零副作用)
-    let pieces = out_pieces(leg, &blocks)?;
+    let pieces = (0..leg.planes)
+        .map(|p| out_pieces(leg, &blocks, p))
+        .collect::<StoreResult<Vec<_>>>()?;
     Ok(OutPlan { blocks, pieces, table: SlotTable::new(bufs) })
 }
 
@@ -932,7 +1005,8 @@ pub fn plan_onload(leg: &mut BlockLeg, chains: &[ChainHash]) -> StoreResult<InPl
         return Ok(InPlan {
             chains: Vec::new(),
             slots: Vec::new(),
-            pieces: Vec::new(),
+            // 每平面一组空片(engine 的 `pieces.len() == world` 不变量)
+            pieces: (0..leg.planes).map(|_| Vec::new()).collect(),
             table: SlotTable::new(Vec::new()),
         });
     }
@@ -961,7 +1035,9 @@ pub fn plan_onload(leg: &mut BlockLeg, chains: &[ChainHash]) -> StoreResult<InPl
         }
     }
     let planes: Vec<(ChainHash, u32)> = chains.iter().copied().zip(slots.iter().copied()).collect();
-    let pieces = in_pieces(leg, &planes, 0)?;
+    let pieces = (0..leg.planes)
+        .map(|p| in_pieces(leg, &planes, 0, p))
+        .collect::<StoreResult<Vec<_>>>()?;
     Ok(InPlan { chains: chains.to_vec(), slots, pieces, table: SlotTable::new(bufs) })
 }
 
@@ -995,11 +1071,18 @@ pub fn abort_onload(leg: &mut BlockLeg, chains: &[ChainHash], slots: &[u32]) {
 
 /// 组换出片:每块 × 每层片段一片
 /// (`dev_off = 槽 × 每页字节`;`conn_off` = 该层片段在逻辑块内的起点)。
-fn out_pieces(leg: &BlockLeg, planes: &[(ChainHash, u32)]) -> StoreResult<Vec<SwapPiece>> {
-    let specs = leg.pieces()?;
+fn out_pieces(
+    leg: &BlockLeg,
+    planes: &[(ChainHash, u32)],
+    plane: usize,
+) -> StoreResult<Vec<SwapPiece>> {
+    let specs = leg.pieces_at(plane)?;
+    // **平面基址**:第 p 个 rank 的内容落宿主槽的 `p × 单页字节` 起
+    // (槽 = world 个平面;漏了这一步 ⇒ peer 覆盖 rank0 的半页)
+    let base = plane * leg.kv.block_bytes();
     let mut out = Vec::with_capacity(planes.len() * specs.len());
     for (k, (_chain, slot)) in planes.iter().enumerate() {
-        let mut conn_off = 0usize;
+        let mut conn_off = base;
         for p in specs {
             out.push(SwapPiece {
                 block: p.buf.id,
@@ -1019,11 +1102,15 @@ fn in_pieces(
     leg: &BlockLeg,
     planes: &[(ChainHash, u32)],
     base_slot: u64,
+    plane: usize,
 ) -> StoreResult<Vec<SwapPiece>> {
-    let specs = leg.pieces()?;
+    let specs = leg.pieces_at(plane)?;
+    // **平面基址**:第 p 个 rank 的内容落宿主槽的 `p × 单页字节` 起
+    // (槽 = world 个平面;漏了这一步 ⇒ peer 覆盖 rank0 的半页)
+    let base = plane * leg.kv.block_bytes();
     let mut out = Vec::with_capacity(planes.len() * specs.len());
     for (k, (_chain, slot)) in planes.iter().enumerate() {
-        let mut conn_off = 0usize;
+        let mut conn_off = base;
         for p in specs {
             out.push(SwapPiece {
                 block: p.buf.id,
@@ -1055,7 +1142,7 @@ mod tests {
             (p.blocks, p.pieces, p.table)
         };
         let conn = face
-            .swap(SwapDir::Out, &pieces, Box::new(table))
+            .swap(SwapDir::Out, &pieces[0], Box::new(table))
             .await
             .map_err(|e| StoreError::Invariant(format!("测试编排 swap(Out) 失败:{e}")))?;
         let table = reclaim_slot_table(conn)?;
@@ -1069,7 +1156,7 @@ mod tests {
             (p.chains, p.slots, p.pieces, p.table)
         };
         let conn = face
-            .swap(SwapDir::In, &pieces, Box::new(table))
+            .swap(SwapDir::In, &pieces[0], Box::new(table))
             .await
             .map_err(|e| StoreError::Invariant(format!("测试编排 swap(In) 失败:{e}")))?;
         let table = reclaim_slot_table(conn)?;

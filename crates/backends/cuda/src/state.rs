@@ -1246,6 +1246,12 @@ impl GpuCtx {
     /// 为什么由本项目负责:池属性 `RELEASE_THRESHOLD=UINT64_MAX`(性能面,
     /// 见上方池调优注释)⇒ free 后**永不自动还 OS**,装载期那批暂存块
     /// (27B 档 156MB)会一直占着,把跑图期余量吃掉。装载收尾调一次即可。
+    /// 默认池账(used/used_high/reserved/reserved_high;见 `DeviceClient::mem_pool_stats`)。
+    pub(super) fn mem_pool_stats(&self) -> Result<(u64, u64, u64, u64), ModelError> {
+        pool_ledger_snapshot()
+            .ok_or_else(|| ModelError::Msg("mem_pool_stats: 池账不可读".into()))
+    }
+
     pub(super) fn mem_pool_trim(&mut self) -> Result<u64, ModelError> {
         use cudarc::driver::sys as cs;
         // 池句柄 = 设备默认池(server 的 cudaMallocAsync 都走它)

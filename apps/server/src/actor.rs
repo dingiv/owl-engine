@@ -66,6 +66,9 @@ pub struct VramSnapshot {
     pub open_window_blocks: usize,
     /// **状态腿淘汰序预览**(前 8 条;会话感知淘汰的可观测面)
     pub snap_evict: Vec<owl_store::SnapEvictPreview>,
+    /// **默认池账(逐 rank)**:(used, used_high, reserved, reserved_high)。
+    /// 与块账之差 = **池缓存**(已 free 仍占物理显存;`RELEASE_THRESHOLD=∞`)。
+    pub pools: Vec<(u8, Result<(u64, u64, u64, u64), String>)>,
 }
 
 /// 事件投递(律 #1:不许静默丢弃可失败返回值)。
@@ -323,6 +326,7 @@ async fn handle_req<D: DeviceClient>(
             // 的全等门才有意义。**本路零副作用**:不落 turn、不搬块、不建图。
             let (hook_fail, window_unclosed, open_window_blocks) = running.handle_probe();
             let blocks = running.block_ledger_probe().await;
+            let pools = running.pool_probe().await;
             let report = running.store_report();
             let snap_evict = running.snap_evict_preview(8);
             let snap = VramSnapshot {
@@ -332,6 +336,7 @@ async fn handle_req<D: DeviceClient>(
                 window_unclosed,
                 open_window_blocks,
                 snap_evict,
+                pools,
             };
             if reply.send(snap).is_err() {
                 owl_shared::log_debug!("actor", "vram 账应答投递失败(请求方已断开)");
