@@ -1319,3 +1319,314 @@ mod tests {
 
 
 }
+
+#[cfg(test)]
+mod m_scan {
+    use crate::contract::Dtype;
+    use crate::formats::gguf::reader::Gguf;
+    use crate::formats::gguf::GgmlTy;
+    use crate::module::{Module as _, QuantPlan, Taken, WeightSource};
+    use owl_iface::contract::DeviceClient as _;
+    use crate::TensorOps;
+    use owl_macros::owl_test;
+    use std::path::PathBuf;
+
+    /// 单张量源(诊断台;只服务 m 扫描 —— 键恒 `w`)
+    struct OneTensor {
+        key: &'static str,
+        bytes: Vec<u8>,
+    }
+
+    impl WeightSource for OneTensor {
+        fn take(&self, key: &str) -> Taken<Vec<f32>> {
+            if key == self.key { Ok(None) } else { Ok(None) }
+        }
+        fn elem_len(&self, key: &str) -> Taken<usize> {
+            Ok((key == self.key).then_some(self.bytes.len()))
+        }
+        fn native_dtype(&self, key: &str) -> Taken<Dtype> {
+            Ok((key == self.key).then_some(Dtype::U8))
+        }
+        fn convert_chunk_into_bytes(
+            &self,
+            key: &str,
+            offset: usize,
+            len: usize,
+            dst: &mut [u8],
+            dtype: Dtype,
+        ) -> Taken<()> {
+            if key != self.key {
+                return Ok(None);
+            }
+            if dtype != Dtype::U8 {
+                return Err(crate::contract::ModelError::Msg(format!(
+                    "OneTensor: 只出 U8(实得 {dtype:?})"
+                )));
+            }
+            let Some(src) = self.bytes.get(offset..offset + len) else {
+                return Ok(None);
+            };
+            dst[..len].copy_from_slice(src);
+            Ok(Some(()))
+        }
+    }
+
+    /// **IQ / K-quant 复用臂位级门**(2026-10-21):UD 混型档的每种量化型,
+    /// m = 8 / 17(TILE_MT=16 两侧)下 `GgufGemm`(MMVQ) ≡ `GgufGemmTile`。
+    ///
+    /// 判据 = **逐位相同**(两核的 vec_dot 序逐 token 不变;错型/错块会给 O(1))。
+    #[owl_test(gpu)]
+    async fn gpu_gguf_tile_matches_mmvq_iq_family() {
+        use crate::formats::gguf::Q8_1_BLOCK_BYTES;
+        use crate::ops::SemanticKernel;
+        let Some(path) = owl_shared::testkit::resource("gguf:27b-iq4xs") else {
+            eprintln!("skip: 资源清单缺 gguf:27b-iq4xs");
+            return;
+        };
+        let g = Gguf::open(&PathBuf::from(path)).expect("open 27B IQ4_XS");
+        let mut gpu = crate::testkit::gpu_client().await;
+        // 每种型取第一张非嵌入张量(embed/lm_head 走同一臂但太大,不必入此门)
+        let mut seen = std::collections::BTreeSet::new();
+        let mut cases: Vec<(String, GgmlTy, usize, usize)> = Vec::new();
+        for t in &g.tensors {
+            if t.ty.native_dtype().is_some() || t.name.starts_with("token_embd") || t.name.starts_with("output.") {
+                continue;
+            }
+            if crate::formats::gguf::require_portable(&g).is_err() {
+                break;
+            }
+            if seen.insert(format!("{:?}", t.ty)) {
+                cases.push((t.name.clone(), t.ty, t.rows() as usize, t.inner() as usize));
+            }
+        }
+        let mut checked = 0usize;
+        for (tname, ty, rows, inner) in &cases {
+            if owl_kernels::family::gguf::tile_entry_for(*ty).is_none() {
+                eprintln!("[tile-gate] {tname}({}) 无复用臂(跳过)", ty.name());
+                continue;
+            }
+            let ix = g.index_of(tname).unwrap();
+            let bytes = g.bytes(ix);
+            let (be, bb) = ty.block();
+            let wblk = TensorOps::from_host(Dtype::U8, vec![*rows, inner / be * bb], bytes);
+            for m in [8usize, 17] {
+                let xb: Vec<u8> = (0..m * inner)
+                    .flat_map(|i| {
+                        let v = (((i as f32) * 0.013).sin() * 1.4) as f32;
+                        half::f16::from_f32(v).to_le_bytes()
+                    })
+                    .collect();
+                let x = TensorOps::from_host(Dtype::F16, vec![m, *inner], &xb);
+                let xq = TensorOps::call(SemanticKernel::GgufQuantActF16)
+                    .arg(&x)
+                    .arg_i32(*inner as i32)
+                    .arg_i32(*inner as i32)
+                    .aux(&[m, *inner])
+                    .with_shape(Dtype::U8, vec![m, inner / 32 * Q8_1_BLOCK_BYTES]);
+                let build = |op: SemanticKernel| {
+                    TensorOps::call(op)
+                        .arg(&wblk)
+                        .arg(&xq)
+                        .arg_i32(m as i32)
+                        .arg_i32(*rows as i32)
+                        .arg_i32(*inner as i32)
+                        .arg_i32(*inner as i32)
+                        .arg_i32(0)
+                        .arg_i32(*rows as i32)
+                        .aux(&[ty.code() as usize, m, *rows])
+                        .with_shape(Dtype::F16, vec![m, *rows])
+                };
+                let a = crate::testkit::harvest_f16(&mut gpu, &build(SemanticKernel::GgufGemm)).await;
+                let b = crate::testkit::harvest_f16(&mut gpu, &build(SemanticKernel::GgufGemmTile)).await;
+                let mut nbit = 0usize;
+                let mut worst = 0usize;
+                for (i, (p, q)) in a.iter().zip(&b).enumerate() {
+                    if p.to_bits() != q.to_bits() {
+                        nbit += 1;
+                        if nbit == 1 { worst = i; }
+                    }
+                }
+                assert_eq!(nbit, 0, "[{tname} {} m={m}] 复用臂与 MMVQ 有 {nbit} 项不同(首个 @{worst}:{} vs {})",
+                    ty.name(), a[worst], b[worst]);
+                checked += 1;
+            }
+        }
+        eprintln!("[tile-gate] IQ/K-quant 复用臂位级门绿:{checked} 组(m=8/17)");
+        gpu.close().await.expect("关机");
+    }
+
+    /// **小 m 的 MMQ2(int8-MMA)可行性门**(2026-10-21):m ∈ {2, 8, 17, 32}
+    /// 时 MMQ2 与 MMVQ 的输出接近(容差 = int8 量化噪声,非逐位),且能被
+    /// nsys 读到耗时(用来决定 verify 形状改走哪条臂)。
+    #[owl_test(gpu)]
+    async fn gpu_gguf_mmq2_small_m() {
+        use crate::formats::gguf::Q8_1_BLOCK_BYTES;
+        use crate::ops::SemanticKernel;
+        let Some(path) = owl_shared::testkit::resource("gguf:27b-iq4xs") else {
+            eprintln!("skip: 资源清单缺 gguf:27b-iq4xs");
+            return;
+        };
+        let g = Gguf::open(&PathBuf::from(path)).expect("open 27B IQ4_XS");
+        let mut gpu = crate::testkit::gpu_client().await;
+        // 每种 MMQ2-可用型各取一张(UD 档 IQ4_XS / Q8_0 / Q4_K / Q5_K / Q6_K /
+        // IQ3_S / IQ3_XXS 都在场;按文件里首个命中取)
+        let mut seen = std::collections::BTreeSet::new();
+        let mut cases: Vec<(String, usize, usize)> = Vec::new();
+        for t in &g.tensors {
+            if t.name.starts_with("token_embd") || t.name.starts_with("output.") {
+                continue;
+            }
+            if owl_kernels::family::gguf::mmq2_entry_for(t.ty, 8).is_none() {
+                continue;
+            }
+            if t.rows() % 128 != 0 || t.inner() % 128 != 0 {
+                continue;
+            }
+            if seen.insert(t.ty.name().to_string()) {
+                cases.push((t.name.clone(), t.rows() as usize, t.inner() as usize));
+            }
+        }
+        for (tname, out_dim, in_dim) in cases.iter() {
+            let tname = tname.as_str();
+            let (out_dim, in_dim) = (*out_dim, *in_dim);
+            let ti = g.get_tensor(tname).expect("tensor");
+            let ix = g.index_of(tname).unwrap();
+            let bytes = g.bytes(ix);
+            let (be, bb) = ti.ty.block();
+            let wblk = TensorOps::from_host(Dtype::U8, vec![out_dim, in_dim / be * bb], bytes);
+            let ds4 = matches!(ti.ty, GgmlTy::Q4K | GgmlTy::Q5K);
+            for m in [2usize, 8, 17, 32, 64] {
+                let xb: Vec<u8> = (0..m * in_dim)
+                    .flat_map(|i| {
+                        let v = (((i as f32) * 0.013).sin() * 1.4) as f32;
+                        half::f16::from_f32(v).to_le_bytes()
+                    })
+                    .collect();
+                let x = TensorOps::from_host(Dtype::F16, vec![m, in_dim], &xb);
+                // MMVQ(参考)
+                let xq1 = TensorOps::call(SemanticKernel::GgufQuantActF16)
+                    .arg(&x)
+                    .arg_i32(in_dim as i32)
+                    .arg_i32(in_dim as i32)
+                    .aux(&[m, in_dim])
+                    .with_shape(Dtype::U8, vec![m, in_dim / 32 * Q8_1_BLOCK_BYTES]);
+                let y_ref = TensorOps::call(SemanticKernel::GgufGemm)
+                    .arg(&wblk)
+                    .arg(&xq1)
+                    .arg_i32(m as i32)
+                    .arg_i32(out_dim as i32)
+                    .arg_i32(in_dim as i32)
+                    .arg_i32(in_dim as i32)
+                    .arg_i32(0)
+                    .arg_i32(out_dim as i32)
+                    .aux(&[ti.ty.code() as usize, m, out_dim])
+                    .with_shape(Dtype::F16, vec![m, out_dim]);
+                // MMQ2(int8-MMA;J=64 或 128)
+                let j = if m >= 128 { 128 } else { 64 };
+                let q = if ds4 {
+                    SemanticKernel::GgufMmq2QuantDs4
+                } else {
+                    SemanticKernel::GgufMmq2QuantD4
+                };
+                let xq2 = TensorOps::call(q)
+                    .arg(&x)
+                    .arg_i32(m as i32)
+                    .arg_i32(in_dim as i32)
+                    .aux(&[m, in_dim])
+                    .with_shape(Dtype::U8, vec![in_dim / 128, m * 144]);
+                let _ = j;
+                let y2 = TensorOps::call(SemanticKernel::GgufMmq2)
+                    .arg(&wblk)
+                    .arg(&xq2)
+                    .arg_i32(out_dim as i32)
+                    .arg_i32(m as i32)
+                    .arg_i32(in_dim as i32)
+                    .aux(&[ti.ty.code() as usize, m, out_dim])
+                    .with_shape(Dtype::F16, vec![m, out_dim]);
+                let a = crate::testkit::harvest_f16(&mut gpu, &y_ref).await;
+                let b = crate::testkit::harvest_f16(&mut gpu, &y2).await;
+                let scale = a.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
+                let d = a.iter().zip(&b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / scale;
+                eprintln!("[mmq2-small-m] {tname} m={m}: MMQ2 vs MMVQ 相对最大差 {d:.3e}");
+                assert!(d < 5e-2, "[{tname} m={m}] MMQ2 与 MMVQ 相对差 {d} > 5e-2");
+                // MMQ(dp4a)对照臂:A/B 小 m 最优臂(Q4_K/Q5_K/Q6_K/Q8_0 才有)
+                if owl_kernels::family::gguf::mmq_entry_for(ti.ty).is_some() {
+                    let xqrow = in_dim / 32 * Q8_1_BLOCK_BYTES;
+                    let y3 = TensorOps::call(SemanticKernel::GgufMmq)
+                        .arg(&wblk)
+                        .arg(&xq1)
+                        .arg_i32(in_dim as i32)
+                        .arg_i32(out_dim as i32)
+                        .arg_i32(m as i32)
+                        .aux(&[ti.ty.code() as usize, m, out_dim])
+                        .with_shape(Dtype::F16, vec![m, out_dim]);
+                    let _ = xqrow;
+                    let c = crate::testkit::harvest_f16(&mut gpu, &y3).await;
+                    let d3 = a.iter().zip(&c).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / scale;
+                    eprintln!("[mmq2-small-m] {tname} m={m}: MMQ(dp4a) vs MMVQ 相对最大差 {d3:.3e}");
+                }
+            }
+        }
+        gpu.close().await.expect("关机");
+    }
+
+    /// **m 扫描(GPU;诊断台)**:同一张真实量化权重,`Linear::forward` 在
+    /// m = 1..128 的耗时 —— 定位 verify(m=8) 为何 8 倍于 decode(m=1)。
+    ///
+    /// 理想锚:m ≤ 8 应**带宽平坦**(读一遍权重)⇒ ms(8)/ms(1) ≤ 2;
+    /// 实测比 ≈ m ⇒ 该臂**零权重复用**(每 token 读一遍)。
+    #[owl_test(gpu)]
+    async fn gpu_gguf_gemm_m_scan() {
+        let Some(path) = owl_shared::testkit::resource("gguf:27b-iq4xs") else {
+            eprintln!("skip: 资源清单缺 gguf:27b-iq4xs");
+            return;
+        };
+        let path = PathBuf::from(path);
+        let g = Gguf::open(&path).expect("open 27B IQ4_XS");
+        let mut gpu = crate::testkit::gpu_client().await;
+        // 27B UD-IQ4_XS 是**重混型**(IQ4_XS 211 / Q8_0 98 / Q4_K 55 / Q5_K 51 …)
+        // ⇒ 取 IU 占比最大的 IQ4_XS 两张 + IQ2_XS 最大张量
+        let cases: &[(&str, &'static str, usize, usize)] = &[
+            ("blk.0.attn_qkv.weight", "IQ4_XS", 10240, 5120),
+            ("blk.0.attn_gate.weight", "IQ4_XS", 6144, 5120),
+            ("blk.0.ffn_gate.weight", "IQ2_XS", 17408, 5120),
+        ];
+        for (tname, want_ty, out_dim, in_dim) in cases.iter().copied() {
+            let ti = g.get_tensor(tname).unwrap_or_else(|| panic!("缺张量 {tname}"));
+            if ti.ty.name() != want_ty {
+                eprintln!("[m-scan] {tname} 型 {} ≠ 用例表 {want_ty}(跳过)", ti.ty.name());
+                continue;
+            }
+            let ix = g.index_of(tname).unwrap();
+            let src = OneTensor { key: "w", bytes: g.bytes(ix).to_vec() };
+            let lin = crate::layers::linear::Linear::new("w", out_dim, in_dim, QuantPlan::Gguf(ti.ty));
+            let opts = crate::formats::load::LoadOpts::plain(Dtype::F16);
+            crate::formats::load::load_component(&mut gpu, &lin, &src, opts)
+                .await
+                .expect("单张量装载");
+            let mut prev = 0f64;
+            for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+                let xv: Vec<f32> = (0..m * in_dim)
+                    .map(|i| ((i as f32 * 0.017).sin() * 1.5) as f32)
+                    .collect();
+                let xb: Vec<u8> = xv.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
+                let x = TensorOps::from_host(Dtype::F16, vec![m, in_dim], &xb);
+                let ctx = crate::module::ForwardCtx::minimal(m);
+                let y = lin.forward(&x, &ctx);
+                let reps = if m <= 8 { 20 } else { 8 };
+                let _ = crate::interpreters::eval_ops(y.clone().step(), &mut gpu).await.expect("warm");
+                gpu.sync().await.expect("sync");
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    let _ = crate::interpreters::eval_ops(y.clone().step(), &mut gpu).await.expect("eval");
+                }
+                gpu.sync().await.expect("sync");
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+                let ratio = if prev > 0.0 { ms / prev } else { 0.0 };
+                eprintln!("[m-scan] {tname}({want_ty}, {out_dim}×{in_dim}) m={m:3}: {ms:8.3} ms  (×{ratio:.2} vs 上一档)");
+                prev = ms;
+            }
+        }
+        gpu.close().await.expect("关机");
+    }
+}
