@@ -581,6 +581,11 @@ impl<D: DeviceClient> DeviceHandle<D> {
         self.ctx().dev_rank
     }
 
+    /// 当前账本单元(克隆;TP 合流/诊断面用;None = 纯转发态)
+    pub fn ledger_cell(&self) -> Option<LedgerCell> {
+        self.ledger.clone()
+    }
+
     /// **boot 期账本接管**(TP:两 rank 必须写**同一本**账)。
     ///
     /// 判据 = 本句柄**尚未发过任何事件**(发过就不是 boot 期了)；违反 ⇒ 响亮拒

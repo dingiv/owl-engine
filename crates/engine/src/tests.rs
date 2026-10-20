@@ -1551,7 +1551,7 @@ pub async fn gpu_08b_chunk_invariance_gate() {
 /// 一次探针跑 = **两个配置文件**描述全部行为面(与生产**同一条加载路**):
 ///
 /// ```text
-/// OWL_PROBE_FLAVOR=<name>    基准档(flavors/<name>.toml)
+/// OWL_PROBE_FLAVOR=<name>    基准档(profiles/legacy/<name>.toml)
 /// OWL_PROBE_OVERLAY=<path>   覆盖文件(可选;同 server 的 [CONFIG] 位置)
 /// ```
 ///
@@ -1566,7 +1566,7 @@ pub async fn gpu_08b_chunk_invariance_gate() {
 fn probe_engine_config(ordinal: usize, default_flavor: &str) -> EngineConfig {
     let flavor = owl_shared::env_reader::str("OWL_PROBE_FLAVOR")
         .unwrap_or_else(|| default_flavor.to_string());
-    let base = owl_shared::flavors::preset_path(&flavor).expect("预设档路径");
+    let base = owl_shared::profiles::legacy_path(&flavor).expect("预设档路径");
     let overlay = owl_shared::env_reader::str("OWL_PROBE_OVERLAY").map(std::path::PathBuf::from);
     let cfg = owl_shared::config::OwlConfig::load(Some(&base), overlay.as_deref())
         .expect("探针配置装载(账外键/非法值 = 拒)");
