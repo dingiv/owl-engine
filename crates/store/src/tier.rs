@@ -1158,15 +1158,27 @@ impl LedgerBook {
     /// ⚠️ 必须分:两 rank 共用一本账(TP),`Turn(t)` 名下同时挂着两卡的块;
     /// 把 rank1 的 id 丢给 rank0 的 server ⇒ 那边块表里找不到 ⇒ **静默丢掉**
     /// (实测 `free: 576/1010 块归池(账目不平)`,漏掉的那 434 个就是 rank1 的)。
-    pub fn drain_owner(
+    /// **带例外集**的归属清点(2026-10-21 补)。
+    ///
+    /// `skip` = 调用方**仍然持有句柄**的块 id(跨相位存活的长命块)。
+    /// 为什么必须有:段边界清"本 turn 残块"时,塔输出 `merged` 也是
+    /// `Owner::Turn(t)` 名下 —— 它要活过整个 turn(逐 chunk 复用),
+    /// 被当成残块清掉 = 下一 chunk 的 `image_scatter` 当场 `DeadBlock`
+    /// (VLM 单图基线实测)。
+    pub fn drain_owner_except(
         &mut self,
         owner: owl_iface::handle::Owner,
         rank: Option<u8>,
+        skip: &[u64],
     ) -> (Vec<u64>, usize) {
         let ids: Vec<u64> = self
             .open
             .iter()
-            .filter(|(_, l)| l.owner == owner && rank.is_none_or(|r| l.rank == r))
+            .filter(|(id, l)| {
+                l.owner == owner
+                    && rank.is_none_or(|r| l.rank == r)
+                    && !skip.contains(id)
+            })
             .map(|(id, _)| *id)
             .collect();
         if ids.is_empty() {
@@ -1186,6 +1198,15 @@ impl LedgerBook {
         }
         self.pool.retain(|_, v| !v.is_empty());
         (ids, bytes)
+    }
+
+    /// 归属清点(无异例;等价 `drain_owner_except(.., &[])`)。
+    pub fn drain_owner(
+        &mut self,
+        owner: owl_iface::handle::Owner,
+        rank: Option<u8>,
+    ) -> (Vec<u64>, usize) {
+        self.drain_owner_except(owner, rank, &[])
     }
 
     /// **逐 rank 的出借 id 集**(与块账房做**全等门**的原料;按 rank 升序)。

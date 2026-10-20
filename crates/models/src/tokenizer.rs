@@ -143,4 +143,12 @@ impl Tokenizer {
     pub fn chat_wrap(&self, user_content: &str) -> String {
         format!("{}{user_content}{}", self.fmt.prefix, self.fmt.suffix)
     }
+
+    /// **多轮渲染面**(家族模板;`ChatFormat::render_chat` 的只读入口)。
+    ///
+    /// 用途:agent 多轮 / 门控里"P 必须逐轮增长"的场景(需要拼 prior turns);
+    /// 单轮仍走 [`Self::chat_wrap`]。
+    pub fn chat_format(&self) -> &ChatFormat {
+        &self.fmt
+    }
 }

@@ -1480,6 +1480,25 @@ impl<D: DeviceClient> RunningEngine<D> {
         tag: &'static str,
     ) -> Result<(usize, usize)> {
         let owner = owl_iface::handle::Owner::Turn(turn);
+        // **例外集:本 turn 内跨相位存活的块**。
+        //
+        // 今天只有一件:VLM 塔输出 `merged`(首 chunk 评出,逐 chunk 当 scatter
+        // 的输入复用)。它同样是 `Owner::Turn(t)`,但**不是**"上一 chunk 的残块"——
+        // 清掉它 = 下一 chunk 的 `image_scatter` 拿到 `DeadBlock`
+        // (2026-10-21 VLM 单图基线实测:**首个 chunk 后**塔输出即被此处 free)。
+        // 将来若再出现"跨 chunk 长命"的 turn 块,一律加到这里(单点登记)。
+        let keep: Vec<u64> = self
+            .turns
+            .active()
+            .ok()
+            .map(|a| {
+                [a.vlm.as_ref(), a.vlm_peer.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.merged.as_ref().map(|(b, _, _)| b.id))
+                    .collect()
+            })
+            .unwrap_or_default();
         // **逐 rank 分账**:两 rank 共用一本账,但块在**各自的 server** 块表里 ——
         // 把 rank1 的 id 交给 rank0 的 server = 找不到 ⇒ 静默漏(实测 434/1010)。
         let mut total = (0usize, 0usize);
@@ -1487,7 +1506,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let (ids, bytes) = {
                 let cell = self.bank.rel.ledger_cell();
                 let mut b = owl_store::book_lock(&cell);
-                b.drain_owner(owner, Some(rank))
+                b.drain_owner_except(owner, Some(rank), &keep)
             };
             if ids.is_empty() {
                 continue;

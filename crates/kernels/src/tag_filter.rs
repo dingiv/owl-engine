@@ -20,10 +20,23 @@
 use crate::spec::{KernelMeta, KernelTag, EXCLUSIVE_TAG_FACETS, KERNEL_TAGS};
 
 /// 配置派生过滤器（Copy；随 `EnvProvider`/`DiagOpts` 值传递）
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TagFilter {
     allowed: u64,
     wildcard: bool,
+}
+
+/// **`Default` = 全放行**（诊断/测试兜底）。
+///
+/// ⚠️ 2026-10-21 抓到的**既有红**:原为 `#[derive(Default)]` ⇒
+/// `allowed = 0 ∧ wildcard = false` = **deny-all 互斥 facet** ——
+/// `EngineKnobs::default().cuda`(全部引擎 e2e/单测档)因此**第一发 pool 写核
+/// 就被拒**(实测 `vllm_reshape_and_cache_f16_knhd` / facet `kv.main`)。
+/// 本文件头注写的缺省语义就是"`*` / Default = 全放行" —— 实现现在与文档一致。
+impl Default for TagFilter {
+    fn default() -> Self {
+        Self::wildcard()
+    }
 }
 
 impl TagFilter {

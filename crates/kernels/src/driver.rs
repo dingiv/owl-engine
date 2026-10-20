@@ -1816,8 +1816,15 @@ pub mod vis {
     /// - 其余 ⇒ native(一 block 8 行 × 一头,块内共享 smem K/V tile;
     ///   grid = (ceil(rows/8), heads),smem = 2·TILE(64)·head_dim·sizeof(T))。
     pub fn attn_full(dt: DType, rows: usize, heads: usize, head_dim: usize, n_seq: i64) -> KernelPick {
-        // FI ragged 适配器只实例化 hd=64 ⇒ 条件里必须带上(否则静默按 64 维算)
-        if dt == DType::F16 && n_seq == 1 && head_dim == 64 {
+        // FI ragged 适配器只实例化 hd=64 ⇒ 条件里必须带上(否则静默按 64 维算)。
+        //
+        // **`rows >= 64` 也是硬条件(2026-10-21 实测)**:FI 的**规划器**按
+        // 形状自选 `cta_tile_q`,而适配器只实例化 {64,128,256} ⇒ 规划器给出
+        // 更小的 tile(小图/少 patch)时 run 直接 `return -205`
+        // (`[owl-fi][ragged run] 未实例化的 cta_tile_q=…`),错误从模型深处冒上来
+        // 且信息量极低。小形状走 **native 臂**是等价且更省事的路
+        // (一 block 8 行 × 一头,块内共享 smem tile)。
+        if dt == DType::F16 && n_seq == 1 && head_dim == 64 && rows >= 64 {
             return KernelPick {
                 name: crate::family::flashinfer::ATTN_RAGGED_F16,
                 shape: super::FOREIGN,
@@ -2030,6 +2037,25 @@ pub mod load {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **视觉塔非因果注意力的两臂分流**(2026-10-21 `fix/vlm`):
+    /// `rows < 64` 必须走 native —— FI ragged 的规划器会给出 {64,128,256}
+    /// 之外的 `cta_tile_q`,适配器当场 `-205`(小图实测)。
+    #[test]
+    fn vis_attn_full_arm_split_is_shape_driven() {
+        let fi = crate::family::flashinfer::ATTN_RAGGED_F16;
+        // 大形状 + f16 + 单图 + hd=64 ⇒ FI
+        assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 1).name, fi);
+        assert_eq!(vis::attn_full(DType::F16, 64, 12, 64, 1).name, fi, "边界 64 仍走 FI");
+        // 小形状 ⇒ native
+        let p = vis::attn_full(DType::F16, 16, 12, 64, 1);
+        assert_eq!(p.name, "owl_vis_attn_full_f16", "rows < 64 必须退 native");
+        assert_eq!(p.shape.grid, (2, 12, 1), "native:ceil(16/8) 行块");
+        // 其他维度不满足 ⇒ native(既有判据不动)
+        assert_eq!(vis::attn_full(DType::F16, 256, 12, 128, 1).name, "owl_vis_attn_full_f16");
+        assert_eq!(vis::attn_full(DType::F32, 256, 12, 64, 1).name, "owl_vis_attn_full_f32");
+        assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 2).name, "owl_vis_attn_full_f16");
+    }
 
     #[test]
     fn delta_dec_smem_contract() {

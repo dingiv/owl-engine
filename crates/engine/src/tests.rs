@@ -4648,3 +4648,367 @@ fn wait_histogram_and_eta_are_sane() {
     t3.note_turn_ms(100_000);
     assert_eq!(t3.eta_ms(1, 100), 30_000, "上限 30s");
 }
+
+/// **VLM 图像输入基线门**(2026-10-21,`fix/vlm` 立案):单图、无窗口、一次 turn。
+///
+/// 为什么单独立门:V1–V5 视觉接线(HTTP→预处理→占位展开→引擎→塔→scatter)
+/// 只有 CPU 对拍,没有一条端到端;**image-rotation 施工时单图即红**,
+/// 判据需要一条能独立跑的最小复现。
+///
+/// 判据:① 出非空文本;② `uploaded` 塔输出块在 scatter 时仍在账本(TEMP 探针)。
+pub async fn gpu_vlm_image_baseline() {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    if !dir.join("config.json").exists() {
+        eprintln!("skip: 0.8B 资产不在 {}", dir.display());
+        return;
+    }
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 512,
+        prefill_chunk: 32,
+        knobs: EngineKnobs { vision: true, ..Default::default() },
+    })
+    .expect("构造");
+    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载 0.8B+VLM");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let img_tok = running.dev.vlm.as_ref().expect("VLM 装配").cfg().image_token;
+    let n_img = match running.tok.try_encode("<|image_pad|>").expect("encode").as_slice() {
+        [one] => *one,
+        other => panic!("<|image_pad|> 应恰 1 token,得 {other:?}"),
+    };
+    assert_eq!(n_img, img_tok, "image_pad 必须映射到引擎 image_token");
+    // 网格 (1,16,16) ⇒ l_img = 64(大形状 ⇒ 视觉塔注意力走 FI ragged 臂)
+    let l_img = 64usize;
+    let img = owl_models::vlm::VlmImage {
+        pixel_values: (0..256 * 3 * 2 * 16 * 16)
+            .map(|i| 0.2 + (i % 7) as f32 * 0.01)
+            .collect(),
+        grid: (1, 16, 16),
+    };
+    // ⚠️ **预热轮(纯文本)**:实测"**boot 后第一轮就带图**"会吐退化串
+    // (0.8B:`!4444444`);同一张图放到第二轮就正常(`我看到的是一片灰灰色的平面区域`)。
+    // 这是**既有面**的独立缺陷(首轮+视觉,另案;不是本门要测的东西),门先跑一轮
+    // 纯文本把"首轮"这个变量消掉 —— 否则本门会在别人的红上摇摆。
+    {
+        let (_s0, t0) = running
+            .submit_session(Some(5), "请用一句话说明你看到了什么。", 8)
+            .expect("预热轮");
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Completed { turn, text, .. } if turn == t0 => {
+                    eprintln!("[test] 预热轮(纯文本,无图): {text}");
+                    assert!(!text.trim().is_empty(), "纯文本首轮必须出文本");
+                    break;
+                }
+                TurnEvent::Failed { turn, err } if turn == t0 => panic!("预热轮失败: {err}"),
+                TurnEvent::Idle => panic!("预热轮队列丢失"),
+                _ => {}
+            }
+        }
+    }
+    // **用家族模板包装**(含 `<|im_start|>` ⇒ submit 不再二次 wrap):
+    // 裸拼 ChatML 少 `<|im_end|>`/`assistant` 头 ⇒ 模型只会续写垃圾
+    // (实测 "!4444444")—— 门要看"图有没有被看见",不是看拼装的脾气。
+    let prompt = running.tok.chat_wrap(&format!(
+        "<|vision_start|>{}<|vision_end|>请用一句话说明你看到了什么。",
+        "<|image_pad|>".repeat(l_img)
+    ));
+    let (_sid, t) = running
+        .submit_session_opts(
+            Some(6),
+            prompt.as_str(),
+            8,
+            crate::turn::TurnOpts { images: vec![img], ..Default::default() },
+        )
+        .expect("提交");
+    let mut out = Ok(String::new());
+    loop {
+        match running.pump().await {
+            Ok(TurnEvent::Completed { turn, text, .. }) if turn == t => break out = Ok(text),
+            Ok(TurnEvent::Failed { turn, err }) if turn == t => break out = Err(err),
+            Ok(TurnEvent::Idle) => break out = Err("队列丢失".into()),
+            Ok(_) => {}
+            Err(e) => break out = Err(e.to_string()),
+        }
+    }
+    match out {
+        Ok(text) => {
+            eprintln!("[test] VLM 基线文本(16×16 / FI 臂): {text}");
+            assert!(!text.trim().is_empty(), "视觉 prefill 必须产出文本");
+        }
+        Err(e) => panic!("VLM 单图基线失败: {e}"),
+    }
+
+    // ── **小网格回流**(2026-10-21 `fix/vlm` F2):4×4 ⇒ 塔注意力 rows=16,
+    //    FI ragged 只实例化 cta_tile_q ∈ {64,128,256} ⇒ 必须**自动退 native**
+    //    (旧行为 = 深处 `ragged run err -205`)。
+    {
+        let small = owl_models::vlm::VlmImage {
+            pixel_values: (0..16 * 3 * 2 * 16 * 16)
+                .map(|i| 0.2 + (i % 7) as f32 * 0.01)
+                .collect(),
+            grid: (1, 4, 4),
+        };
+        let l_small = 4usize;
+        let prompt = running.tok.chat_wrap(&format!(
+            "<|vision_start|>{}<|vision_end|>请用一句话说明你看到了什么。",
+            "<|image_pad|>".repeat(l_small)
+        ));
+        let (_s1, t1) = running
+            .submit_session_opts(
+                Some(9),
+                prompt.as_str(),
+                8,
+                crate::turn::TurnOpts { images: vec![small], ..Default::default() },
+            )
+            .expect("小网格提交");
+        let mut txt = String::new();
+        loop {
+            match running.pump().await {
+                Ok(TurnEvent::Completed { turn, text, .. }) if turn == t1 => {
+                    txt = text;
+                    break;
+                }
+                Ok(TurnEvent::Failed { turn, err }) if turn == t1 => {
+                    panic!("小网格(4×4)视觉路径失败 —— 应退 native 臂: {err}")
+                }
+                Ok(TurnEvent::Idle) => panic!("小网格队列丢失"),
+                Ok(_) => {}
+                Err(e) => panic!("小网格 pump 失败: {e}"),
+            }
+        }
+        eprintln!("[test] VLM 小网格文本(4×4 / native 臂): {txt}");
+        assert!(!txt.trim().is_empty(), "小网格路径必须产出文本");
+    }
+}
+
+/// **F1 复现探针**(2026-10-21;`fix/vlm` 立案):"**进程第一轮就带图**" ⇒ 退化串。
+///
+/// 定谳证据(真机,0.8B + 16×16 网格,3 组对照):
+///
+/// | 轮序 | 带图轮的输出 |
+/// |---|---|
+/// | `图, 图, 文本, 图` | **三轮全退化**(`!44444444444`) |
+/// | `文本, 图, 文本, 图` | **两轮都正常**(`这是一张灰色的背景图…`) |
+/// | `图(首轮)` 单轮 | 退化 |
+///
+/// 同轮内塔输出 `merged` 的**指纹逐轮相同**(sum/l2/head 全等,仅块 id 不同)
+/// ⇒ **塔无罪**,问题在"首轮 + 图像"这条路径的下游(**注入面/分块/位置**)。
+/// 关图捕获(`no_graph`)不改变现象 ⇒ 不是"带图 prefill 图把指针烤死"。
+///
+/// 本探针**不设硬断言**(诊断;判决看打印),`first_image` 决定首轮形态:
+/// 两个场景各跑一次即构成 A/B(一个进程只能有一个"首轮")。
+pub async fn gpu_vlm_first_turn_probe(first_image: bool) {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    if !dir.join("config.json").exists() {
+        eprintln!("skip: 0.8B 资产不在 {}", dir.display());
+        return;
+    }
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 512,
+        prefill_chunk: 32,
+        knobs: EngineKnobs { vision: true, ..Default::default() },
+    })
+    .expect("构造");
+    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载 0.8B+VLM");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let l_img = 64usize; // 网格 (1,16,16):l_img = (16/2)² = 64(≥16×16 避开 FI 小网格缺口)
+    let mk_img = |salt: f32| owl_models::vlm::VlmImage {
+        pixel_values: (0..256 * 3 * 2 * 16 * 16)
+            .map(|i| salt + (i % 7) as f32 * 0.01)
+            .collect(),
+        grid: (1, 16, 16),
+    };
+    let q = "请用一句话说明你看到了什么。";
+    let img_part = format!(
+        "<|vision_start|>{}<|vision_end|>",
+        "<|image_pad|>".repeat(l_img)
+    );
+    let sys_img = running.tok.chat_format().render_chat(
+        &[("system", "你是助手,按约定回答。"), ("user", &format!("{img_part}{q}"))],
+        false,
+    );
+    let sys_text = running.tok.chat_format().render_chat(
+        &[("system", "你是助手,按约定回答。"), ("user", q)],
+        false,
+    );
+    eprintln!("[f1] 首轮形态 = {}", if first_image { "带图" } else { "纯文本" });
+    // 首轮形态由入参决定;之后 3 轮固定为 图/文本/图(便于两组逐轮对照)
+    let plan = if first_image {
+        [true, true, false, true]
+    } else {
+        [false, true, false, true]
+    };
+    for (idx, with_img) in plan.into_iter().enumerate() {
+        let idx = idx + 1;
+        let (prompt, images) = if with_img {
+            (sys_img.clone(), vec![mk_img(0.2)])
+        } else {
+            (sys_text.clone(), Vec::new())
+        };
+        let (_sid, t) = running
+            .submit_session_opts(
+                Some(100 + idx as u64),
+                prompt.as_str(),
+                12,
+                crate::turn::TurnOpts { images, ..Default::default() },
+            )
+            .expect("提交");
+        let mut txt = String::new();
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Completed { turn, text, .. } if turn == t => {
+                    txt = text;
+                    break;
+                }
+                TurnEvent::Failed { turn, err } if turn == t => {
+                    txt = format!("<FAILED {err}>");
+                    break;
+                }
+                TurnEvent::Idle => {
+                    txt = "<IDLE>".into();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        eprintln!(
+            "[f1] 第{idx}轮 {} ⇒ {txt:?}",
+            if with_img { "带图" } else { "纯文本" }
+        );
+    }
+}
+
+/// F1 的**控制组**(首轮纯文本):与 [`gpu_vlm_first_turn_probe`] 成对跑。
+pub async fn gpu_vlm_first_turn_probe_textfirst() {
+    gpu_vlm_first_turn_probe(false).await;
+}
+
+/// F1 的**复现组**(首轮带图)。
+pub async fn gpu_vlm_first_turn_probe_imagefirst() {
+    gpu_vlm_first_turn_probe(true).await;
+}
+
+
+/// **F1 × 27B**——同一探针在 27B AWQ INT4(生产 VLM 档)上重放。
+///
+/// 为什么要单独一档:0.8B 的结论不能外推(层数/GDN 比例/量化/kv fp8 全不同),
+/// 而 27B 是**现役生产** VLM(`profiles/tp27b-3080-262k-vlm.toml`)⇒ F1 到底
+/// 是不是"只在 0.8B 上"必须真机回答。
+pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+        eprintln!("skip: ckpt:27b-awq 未配(testdata/resources.toml)");
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let t0 = std::time::Instant::now();
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 1024,
+        prefill_chunk: 128,
+        knobs: EngineKnobs { vision: true, ..Default::default() },
+    })
+    .expect("构造");
+    let loaded = engine
+        .loader()
+        .load_qwen38_27b_awq(
+            &dir,
+            &dir,
+            owl_models::module::QuantPlan::F16,
+            owl_models::module::QuantPlan::W4A16Awq,
+        )
+        .await
+        .expect("27B AWQ 装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+    eprintln!("[f1-27b] 装载+装配 {:?}", t0.elapsed());
+    assert!(
+        running.dev.vlm.is_some(),
+        "[model].vision = true 必须有视觉塔(27B)")
+    ;
+
+    let l_img = 64usize; // 网格 (1,16,16) ⇒ (16/2)² = 64 tok
+    let mk_img = |salt: f32| owl_models::vlm::VlmImage {
+        pixel_values: (0..256 * 3 * 2 * 16 * 16)
+            .map(|i| salt + (i % 7) as f32 * 0.01)
+            .collect(),
+        grid: (1, 16, 16),
+    };
+    let q = "请用一句话说明你看到了什么。";
+    let img_part = format!(
+        "<|vision_start|>{}<|vision_end|>",
+        "<|image_pad|>".repeat(l_img)
+    );
+    let sys_img = running.tok.chat_format().render_chat(
+        &[("system", "你是助手,按约定回答。"), ("user", &format!("{img_part}{q}"))],
+        false,
+    );
+    let sys_text = running.tok.chat_format().render_chat(
+        &[("system", "你是助手,按约定回答。"), ("user", q)],
+        false,
+    );
+    eprintln!("[f1-27b] 首轮形态 = {}", if first_image { "带图" } else { "纯文本" });
+    let plan = if first_image { [true, true, false, true] } else { [false, true, false, true] };
+    for (idx, with_img) in plan.into_iter().enumerate() {
+        let idx = idx + 1;
+        let (prompt, images) = if with_img {
+            (sys_img.clone(), vec![mk_img(0.2)])
+        } else {
+            (sys_text.clone(), Vec::new())
+        };
+        let (_sid, t) = running
+            .submit_session_opts(
+                Some(300 + idx as u64),
+                prompt.as_str(),
+                12,
+                crate::turn::TurnOpts { images, ..Default::default() },
+            )
+            .expect("提交");
+        let mut txt = String::new();
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Completed { turn, text, .. } if turn == t => {
+                    txt = text;
+                    break;
+                }
+                TurnEvent::Failed { turn, err } if turn == t => {
+                    txt = format!("<FAILED {err}>");
+                    break;
+                }
+                TurnEvent::Idle => {
+                    txt = "<IDLE>".into();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        eprintln!(
+            "[f1-27b] 第{idx}轮 {} ⇒ {txt:?}",
+            if with_img { "带图" } else { "纯文本" }
+        );
+    }
+}
+
+/// 27B 的 F1 控制组(首轮纯文本)。
+pub async fn gpu_vlm_first_turn_probe_27b_textfirst() {
+    gpu_vlm_first_turn_probe_27b(false).await;
+}
+
+/// 27B 的 F1 复现组(首轮带图)。
+pub async fn gpu_vlm_first_turn_probe_27b_imagefirst() {
+    gpu_vlm_first_turn_probe_27b(true).await;
+}

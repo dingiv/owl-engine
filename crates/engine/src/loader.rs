@@ -345,17 +345,52 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         })
     }
 
+
+    /// **视觉塔装载**(`[model].vision`;两档共用同一份 —— 0.8B 与 27B 的
+    /// 检查点都是 `Qwen3_5ForConditionalGeneration`,自带 `model.visual.*`)。
+    ///
+    /// 文本主干已装好(量化/分片/头计划)⇒ 只补视觉段;塔权重**每 rank 全量**
+    /// (Replicate;TP2 不切视觉),故 opts 固定 `shard = 1`。
+    async fn load_vision_into(
+        &mut self,
+        dir: &Path,
+        model: &Arc<Model>,
+        dtype: owl_iface::contract::Dtype,
+    ) -> Result<Option<Arc<Vlm>>> {
+        if !self.vision {
+            return Ok(None);
+        }
+        let raw = owl_shared::file_loader::read(&dir.join("config.json")).map_err(|e| {
+            ModelError::Msg(format!("视觉装载:config.json 读取失败({}): {e}", dir.display()))
+        })?;
+        let vcfg = VlmCfg::from_json(&raw)?;
+        let tower = VisionTower::new(vcfg.vision);
+        let mut topts = LoadOpts::new(self.face, dtype);
+        topts.shard = 1;
+        topts.slice_id = 0;
+        topts.debug_tap = self.load.debug_tap;
+        topts.verify = self.load.verify;
+        topts.staging_mb = self.load.staging_mb;
+        topts.dump = self.load.dump;
+        topts.device_repack = self
+            .load
+            .repack_device()
+            .map_err(ModelError::Msg)?
+            .or(topts.device_repack);
+        load_from_dir(dir, self.face, &tower, topts).await?;
+        let vlm = Vlm::from_model(Arc::clone(model), tower, vcfg)?;
+        owl_shared::log_info!(
+            "boot",
+            "视觉塔已装载(model.visual.*;塔权重每 rank 全量,文本主干共用)"
+        );
+        Ok(Some(Arc::new(vlm)))
+    }
+
     /// Qwen3.5-0.8B(维度/键基座从**检查点**读:config.json 优先 + 形状
     /// 兜底;族预设只供 tokenizer 声明;装载走通用入口)
     // A3 同步隔离:引擎单线程模型;Arc 仅作共享句柄,不跨线程发送。
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn load_qwen35_0_8b(&mut self, dir: &Path) -> Result<LoadedModel> {
-        if self.vision {
-            return Err(ModelError::Msg(
-                "[model].vision = true:0.8B 档尚未接视觉塔(仅 27B AWQ 档;\
-                 视觉塔装载在 load_qwen38_27b_awq)".into(),
-            ));
-        }
         // **[相位上下文]装载 = `Weight` 类 + `System` 归属**(RAII:任何早退都还原)
         let _scope = self.face.scoped_ctx(
             owl_iface::handle::Owner::System,
@@ -378,7 +413,8 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let quant_plan = Some(owl_models::module::QuantPlan::F16);
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None, vlm: None })
+        let vlm = self.load_vision_into(dir, &model, spec.dtype).await?;
+        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None, vlm })
 
     }
 
@@ -412,7 +448,8 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let quant_plan = Some(owl_models::module::QuantPlan::W4A16);
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None, vlm: None })
+        let vlm = self.load_vision_into(dir, &model, spec.dtype).await?;
+        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None, vlm })
 
     }
 
@@ -495,37 +532,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        // ── **视觉塔**(`[model].vision`;2026-10-20 接线)──
-        // 文本主干已装好(量化/分片/头计划)⇒ 只补 `model.visual.*`;
-        // 塔权重**每 rank 全量**(Replicate;TP2 不切视觉),故 opts 固定 shard=1。
-        let vlm = if self.vision {
-            let raw = owl_shared::file_loader::read(&dir.join("config.json")).map_err(|e| {
-                ModelError::Msg(format!("视觉装载:config.json 读取失败({}): {e}", dir.display()))
-            })?;
-            let vcfg = VlmCfg::from_json(&raw)?;
-            let tower = VisionTower::new(vcfg.vision);
-            let mut topts = LoadOpts::new(self.face, spec.dtype);
-            topts.shard = 1;
-            topts.slice_id = 0;
-            topts.debug_tap = self.load.debug_tap;
-            topts.verify = self.load.verify;
-            topts.staging_mb = self.load.staging_mb;
-            topts.dump = self.load.dump;
-            topts.device_repack = self
-                .load
-                .repack_device()
-                .map_err(ModelError::Msg)?
-                .or(topts.device_repack);
-            load_from_dir(dir, self.face, &tower, topts).await?;
-            let vlm = Vlm::from_model(std::sync::Arc::clone(&model), tower, vcfg)?;
-            owl_shared::log_info!(
-                "boot",
-                "视觉塔已装载(model.visual.*;塔权重每 rank 全量,文本主干共用)"
-            );
-            Some(std::sync::Arc::new(vlm))
-        } else {
-            None
-        };
+        let vlm = self.load_vision_into(dir, &model, spec.dtype).await?;
         owl_shared::metrics::with_metrics_store(|s| {
             let _ = s.timer_end("load.27b.total", file!(), line!());
         });
