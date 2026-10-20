@@ -311,8 +311,39 @@ std(2 轮,out 256;`--lengths 512,1024,2048,8192`):
 
 | # | 项 | 预期 | 代价 |
 |---|---|---|---|
-| 1 | **MMQ2 stream-k + fixup**(gx=nsm;需给 fixup 核改 half 累加 + 一块 `tmp` 工作区 + 第二发) | round −10~13 ms(→45) | 大,动 4 文件 + 工作区账 |
+| 1 | **MMQ2 stream-k**(k 向切分;详见 §9.8 —— 唯一能翻盘的杠杆) | round 54→**45**;8k 由 −16% 翻 +15% | 大,动 4 文件 + 工作区账 |
 | 2 | ~~host 空洞~~(9.4 已证伪:是 CUPTI 放大)⇒ 只清热路径 `cuMemGetInfo` | ~0.2 ms | 低 |
 | 3 | **ssm_alpha/beta 小 GEMM**(n=48,96 发 3.3 ms):专用 k-split 单发核 | −2.5 ms | 中 |
 | 4 | FI verify 数值对齐(9.1)后转正 | @8k −15 ms,且 ctx 平坦 | 中(数值取证) |
 | 5 | Q2_K 的 D2S6 量化手(1 张 19 MB) | −0.1 ms | 低但无收益,挂账 |
+
+### 9.8 下一刀(stream-k)的**可执行**拆解 —— 三个已探明的硬障碍
+
+目标:`gx = nsm(84)` 代替 `gx = n/128`(40/48/80/136),让 40 CTA 档从 435 GB/s
+爬到 712 GB/s 的 DRAM 顶。上游 `mul_mat_q` 的 stream-k 分支**已经在** vendored 代码里
+(`mmq.cuh:1060-1240`),我们只是从没进过它。
+
+1. **`gx > ntiles` 必走 `fixup=true` 分支**(`mmq.cuh:1215`),该分支写 `tmp_fixup`;
+   传 nullptr 立刻 IMA(已复现:grid 硬拉 168 → 启动即 700)。⇒ 必须给工作区。
+2. **`mul_mat_q_stream_k_fixup` 的 dst 是 `float*`**(`mmq.cuh:1241`),而本适配层
+   的 `dst` 是 `__half*`(fork 改过 `process_tile` 直接写 half)⇒ **fixup 核要改成
+   half 累加**(两处 `dst[...] += sum` → `__float2half(__half2float(dst[...]) + sum)`)。
+   不改 = 静默错值,不是崩。
+3. **算子层是一 op 一发射**(`KernelPick { name, shape }`),没有链式;而 fixup 必须
+   紧跟主核同流发射。两条可行路:
+   - (a) `linear.rs` 连发两 op:主核带 `tmp` 槽 → `GgufMmq2Fixup` 带 `tmp`+`out` 槽。
+     **阻塞点**:`tmp` 要有图内**稳定指针** ⇒ 必须在装载期为每个 `Linear` 备一块
+     `nsm·J·I·4 B`(J=8 时 84·8·128·4 = 344 KiB)的常驻 scratch,并把句柄穿到
+     `gguf_quant_gemm`(`Linear` 增字段)。
+   - (b) 核内"末块归约":每块做完 `__threadfence()` + 原子加计数,最后一块广播槽,
+     由它跑 fixup(688 KiB 读,单块 ~3 µs)。**不需要第二次发射**,但要在 vendored
+     核里加同步(30–50 行),且计数槽仍要常驻 scratch(可复用上条的工作区)。
+   **推荐 (a)**:改动都在适配层,fork 面最小;工作区是"每层一块",与现有
+   `Weight` 账同族。
+4. 判据(上游同款,`mmq.cuh:1443`):`ntiles` 的波效率 `eff = 100·ntiles/(nsm·ceil(ntiles/nsm))`,
+   `eff ≥ 90` ⇒ 保 tiling(gx=ntiles,**无 fixup**);否则 `gx = nsm`。
+   本档:n=5120(ntiles=40,eff 47%)/6144(48,57%)/10240(80,95%→保 tiling)/17408(136,81%)
+   ⇒ 前两档进 stream-k,后两档大概率仍 tiling。**lm_head(1940)永不动**。
+5. 门:数值相对差 ≤5e-2(同 `mmq2_small_m`)、`verify pure` @884 与 @8192 各一发、
+   `OWL_GGUF_MMQ2=0` 一键回退已有。**先只挂 IQ4_XS 一型**(占权重 50.7%、时间 28%),
+   拿到读数再铺开。
