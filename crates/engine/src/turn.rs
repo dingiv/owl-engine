@@ -120,6 +120,8 @@ pub(crate) struct Turn {
     pub(crate) opts: TurnOpts,
     /// 提交时前缀命中量(usage `cached_tokens` 真源;AGT-12)
     pub(crate) cached: usize,
+    /// **提交时刻**(单调毫秒;排队时长/`/debug/vram → queued[]` 的真源)
+    pub(crate) submitted_ms: u64,
 }
 
 /// 活跃 turn(占用执行位的完整运行态)
@@ -135,6 +137,8 @@ pub(crate) struct ActiveTurn {
     pub(crate) max_new: usize,
     /// 忽略 EOS 跑满预算(TurnSpec 透传;测速口径)
     pub(crate) ignore_eos: bool,
+    /// **起跑时刻**（墙钟 EWMA 用；`start_one` 写）
+    pub(crate) started_ms: u64,
     /// 本 turn 采样参数(AGT-06;**提交时已与 knobs 合并**,见 scheduler)
     pub(crate) sampler: SamplerCfg,
     /// 本 turn 是否走采样路径(temp=0 或 flavor greedy 档 = 否)
@@ -240,6 +244,16 @@ pub(crate) struct TurnLedger {
     pub(crate) admit_wait: Option<(u64, std::time::Instant)>,
     /// 最近终了 turn 的 prompt token 数(诊断/无卡门校准;不参与语义)。
     pub(crate) last_prompt_len: Option<usize>,
+    /// **相位状态机**(时间片;`[runtime] slice_every>0` 才参与决策)
+    pub(crate) phase: crate::sched_policy::PhaseSched,
+    /// **准入状态机**(容量/会话/退避;起 turn 前唯一放行口)
+    pub(crate) admission: crate::sched_policy::Admission,
+    /// turn 墙钟 EWMA（毫秒；`Retry-After` 估算用）
+    pub(crate) turn_ms_ewma: f64,
+    /// **排队时长直方图**：`<50ms / <200ms / <1s / <5s / ≥5s`
+    pub(crate) wait_hist: [u64; 5],
+    /// **拒绝分桶**（会话 → 码 → 次数；只记最近 64 个会话）
+    pub(crate) reject_stats: std::collections::BTreeMap<(u64, String), u64>,
 }
 
 impl TurnLedger {
@@ -334,7 +348,62 @@ impl TurnLedger {
             pending_events: VecDeque::new(),
             admit_wait: None,
             last_prompt_len: None,
+            phase: crate::sched_policy::PhaseSched::new(),
+            admission: crate::sched_policy::Admission::new(),
+            turn_ms_ewma: 0.0,
+            wait_hist: [0; 5],
+            reject_stats: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// 排队时长桶（0..=4；纯函数，单测直接调）
+    pub fn wait_bucket(ms: u64) -> usize {
+        match ms {
+            0..=49 => 0,
+            50..=199 => 1,
+            200..=999 => 2,
+            1_000..=4_999 => 3,
+            _ => 4,
+        }
+    }
+
+    /// 记一次"排队 → 起跑"的等待（`start_one` 里调）
+    pub(crate) fn note_wait(&mut self, waited_ms: u64) {
+        self.wait_hist[Self::wait_bucket(waited_ms)] += 1;
+    }
+
+    /// 记一次拒绝（按会话 + 码；超 64 会话做一次裁剪 —— 有界）
+    pub(crate) fn note_reject(&mut self, session: u64, code: &str) {
+        *self
+            .reject_stats
+            .entry((session, code.to_string()))
+            .or_insert(0) += 1;
+        if self.reject_stats.len() > 256 {
+            // 保留最近的：按 (session, code) 字典序截断（确定性）
+            let keep: Vec<_> = self.reject_stats.keys().rev().take(128).cloned().collect();
+            self.reject_stats.retain(|k, _| keep.contains(k));
+        }
+    }
+
+    /// 记一次 turn 终了（墙钟 EWMA；`started_ms` 由 `ActiveTurn` 带）
+    pub(crate) fn note_turn_ms(&mut self, ms: u64) {
+        let x = ms as f64;
+        self.turn_ms_ewma = if self.turn_ms_ewma <= 0.0 {
+            x
+        } else {
+            // α = 0.2：对首值快速收敛，长跑平滑
+            self.turn_ms_ewma * 0.8 + x * 0.2
+        };
+    }
+
+    /// **新来者的预计等待**（毫秒）：`EWMA × 需要几波`。
+    ///
+    /// 波数 = `ceil((队列 + 1) / max_batch)`（含自己）；EWMA 未测 = 用 2s 保守值。
+    /// 上限 30s（客户端退避不该被估成分钟级）。
+    pub fn eta_ms(&self, max_batch: usize, queue_len: usize) -> u64 {
+        let per = if self.turn_ms_ewma > 0.0 { self.turn_ms_ewma } else { 2000.0 };
+        let waves = ((queue_len + 1) as f64 / max_batch.max(1) as f64).ceil().max(1.0);
+        ((per * waves) as u64).clamp(500, 30_000)
     }
 
     /// 号 +1

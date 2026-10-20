@@ -386,6 +386,15 @@ pub const _MIN_GEN_TOKENS: usize = 1024;
 /// ② 装不下 ⇒ 收缩:`room = max_seq − base`;`room < _MIN_GEN_TOKENS`
 ///    ⇒ `Err((base, max_new))`(真溢出,客户端压缩上下文),否则
 ///    `Ok(room)`(此时 room < max_new,即收缩后额度)。
+/// 单调毫秒（`SystemTime`；时钟回拨兜底为 0 —— 只用于排队时长/诊断，不参与语义）
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 预算收缩
 pub fn budget_clamp(
     base: usize,
     max_new: usize,
@@ -519,6 +528,11 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     /// 合批图是否在场(B5.1 M1b 事实位;false = 执行器走 eager 臂)
+    /// 合批上限(`[runtime] max_batch`;1 = 串行现状)。服务面诊断/门用。
+    pub fn max_batch(&self) -> usize {
+        self.cfg.knobs.max_batch
+    }
+
     pub fn has_batch_graph(&self) -> bool {
         self.dev.graphs.batch.is_some()
     }
@@ -653,6 +667,27 @@ impl<D: DeviceClient> RunningEngine<D> {
         opts: crate::turn::TurnOpts,
     ) -> Result<(u64, u64)> {
         let session = session.into();
+        // **在飞总数上限**（P0-2）：批位 + 队列 都有界。
+        // 为什么放在 submit 而不是 `schedule`：槽满时判决根本不跑（
+        // `active.len() < max_batch` 的闸先关），队列会无界膨胀；submit 是
+        // 唯一能看见"活跃 + 排队"总数的地方。0 = 无界（旧行为）。
+        let max_queue = self.cfg.knobs.max_queue;
+        if max_queue > 0 {
+            let in_flight = self.turns.active.len() + self.turns.queue.len();
+            let cap = self.cfg.knobs.max_batch.max(1).saturating_add(max_queue);
+            if in_flight >= cap {
+                // 退避建议（P3-c）：EWMA × 需要的波数（含自己）
+                let eta = self
+                    .turns
+                    .eta_ms(self.cfg.knobs.max_batch.max(1), self.turns.queue.len());
+                self.turns.note_reject(session.unwrap_or(0), "no_slot");
+                return Err(ModelError::Msg(format!(
+                    "admission:no_slot retry_ms={eta} —— 在飞 {in_flight} 已达上限 {cap}\
+                     （批位 {} + 队列 {max_queue}）",
+                    self.cfg.knobs.max_batch.max(1)
+                )));
+            }
+        }
         // **同会话并发守卫**(B5.1):合批档下两个同会话 turn 会共享同一份
         // KV/GDN 状态 ⇒ 结构性互踩。亮拒(上层应按会话串行)。
         if self.cfg.knobs.max_batch > 1 {
@@ -792,6 +827,32 @@ impl<D: DeviceClient> RunningEngine<D> {
             Some(id) => (self.bank.get_or_create(Some(id))?, false),
             None => (self.bank.get_or_create(None)?, true),
         };
+        // **准入封顶**（`sched_policy::cap_for`）：预留 = prompt + min(max_new, cap)。
+        // 不夹的话，turn 会生成超出预留 ⇒ 撞墙/重灌（与准入账打架）。
+        let max_new = {
+            let l = self.admission_limits();
+            let s = self.store_facts();
+            let facts = crate::sched_policy::TurnFacts {
+                turn: 0, // 尚未发号；`cap_for` 只用到 prompt/max_new/oversub
+                session: session_id,
+                prompt_tokens: prompt_ids.len(),
+                max_new,
+                fed: 0,
+                out_len: 0,
+                phase: crate::sched_policy::PhaseSz::Prefill,
+                spec: false,
+            };
+            let cap = self.turns.admission.cap_for(&l, &s, &facts);
+            if cap < max_new {
+                owl_shared::log_warn!(
+                    "admit",
+                    "生成预算夹紧：max_new {max_new} → {cap}（会话 {session_id:#x}；                     在位者优先 + 给新人留头寸；客户端会看到 finish_reason=length）"
+                );
+                cap.max(1)
+            } else {
+                max_new
+            }
+        };
         let id = self.turns.alloc_id();
         self.turns.queue.push_back(Turn {
             id,
@@ -801,6 +862,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             prompt_ids,
             opts,
             cached: cached_hit,
+            submitted_ms: now_ms(),
         });
         Ok((session_id, id))
     }
@@ -830,9 +892,57 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.turns.last_prompt_len
     }
 
+    /// 单 turn 的**实际生成预算**（submit 夹紧后的值；`Accepted` 如实带出）。
+    /// 排队/活跃两侧都查；不存在 = `None`。
+    pub fn turn_max_new(&self, turn: u64) -> Option<usize> {
+        self.turns
+            .queue
+            .iter()
+            .find(|t| t.id == turn)
+            .map(|t| t.spec.max_new)
+            .or_else(|| self.turns.active.iter().find(|a| a.id == turn).map(|a| a.max_new))
+    }
+
+    /// 拒绝分桶快照（会话, 码, 次数；按次数降序，最多 `limit` 条）
+    pub fn reject_snapshot(&self, limit: usize) -> Vec<(u64, String, u64)> {
+        let mut v: Vec<(u64, String, u64)> = self
+            .turns
+            .reject_stats
+            .iter()
+            .map(|((s, c), n)| (*s, c.clone(), *n))
+            .collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v.truncate(limit);
+        v
+    }
+
+    /// 排队时长直方图（`<50ms / <200ms / <1s / <5s / ≥5s`）
+    pub fn wait_hist(&self) -> [u64; 5] {
+        self.turns.wait_hist
+    }
+
+    /// 排队快照（`/debug/vram → batch.queued`；最多 16 条，按等待降序）
+    pub fn queued_snapshot(&self, limit: usize) -> Vec<(u64, u64, u64)> {
+        let now = now_ms();
+        let mut v: Vec<(u64, u64, u64)> = self
+            .turns
+            .queue
+            .iter()
+            .map(|t| (t.id, t.session_id, now.saturating_sub(t.submitted_ms)))
+            .collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v.truncate(limit);
+        v
+    }
+
     /// 队列长度(待跑 turn 数;服务面诊断/准入门读)。
     pub fn queue_len(&self) -> usize {
         self.turns.queue.len()
+    }
+
+    /// 活跃 turn 数(B5.1 多活跃;服务面灌流测量读 —— 并发是否真进引擎)。
+    pub fn active_len(&self) -> usize {
+        self.turns.active.len()
     }
 
     /// 提交时**前缀命中量**(usage `cached_tokens` 真源;AGT-12):

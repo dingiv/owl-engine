@@ -242,6 +242,12 @@ async fn disk_spill_and_fill_roundtrip() {
     let bytes = running.bank.rel.snap_bytes();
     assert!(bytes > 0, "状态腿布局应已注册");
     assert!(running.bank.rel.disk_enabled(), "盘层应已接线(配额+目录)");
+    // **P2 磁盘腿入准入**：`store_facts()` 必须看见盘上余量（旧行为恒 0
+    // ⇒ 超卖档配了盘也不用，宿主满 = 拒新）。单卡：盘块 = 一页 ⇒ 页数 = 槽数。
+    let facts = running.store_facts();
+    let slots = running.bank.rel.disk.as_ref().unwrap().free_slots();
+    assert!(slots > 0, "盘配额应给出空位（实得 {slots}）");
+    assert_eq!(facts.disk_free_pages, slots, "盘槽 → 页的折算必须一一对应");
     assert_eq!(running.bank.rel.snap_disk.as_ref().unwrap().free_slots(), 1, "24MiB / 一条");
     let k_a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xA11));
     let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB22));
@@ -4504,4 +4510,141 @@ fn derive_turn_ws_sets_blocks_and_floor_from_one_source() {
     let mut k = EngineKnobs { kvmem_virtualization: true, ..Default::default() };
     k.workspace_per_req = 64; // 2 页 < sink2+recent4 = 6 页
     assert!(EngineKnobs::derive_turn_ws(64, 32, page_bytes, &mut k).is_err());
+}
+
+// ===========================================================================
+// B5.1 服务面契约:取消必须**指名**(排队/活跃/按会话)
+// ===========================================================================
+
+/// 排队中取消:精确命中该 turn,不碰同队其它 turn;重复取消 = None(幂等)。
+#[tokio::test]
+async fn cancel_queued_turn_is_precise() {
+    let mut running = mock_snap_engine(1).await;
+    let prompt_a = "alpha bravo cedar delta ember falcon alpha bravo";
+    let prompt_b = "cedar delta ember falcon alpha bravo cedar delta";
+    let (_s1, t1) = running.submit_session(Some(11), prompt_a, 8).expect("submit A");
+    let (_s2, t2) = running.submit_session(Some(22), prompt_b, 8).expect("submit B");
+    assert_eq!(running.queue_len(), 2, "两个 turn 都应排队");
+    // 取消 B(排队中)
+    let ev = running.cancel_turn(t2).await.expect("排队 turn 应可取消");
+    match ev {
+        TurnEvent::Failed { turn, ref err } => {
+            assert_eq!(turn, t2);
+            assert!(err.contains("排队"), "口径应写明排队中:{err}");
+        }
+        other => panic!("应为 Failed,得到 {other:?}"),
+    }
+    assert_eq!(running.queue_len(), 1, "A 不许连坐");
+    // 幂等:再取消 = None
+    assert!(running.cancel_turn(t2).await.is_none(), "重复取消应 None");
+    // A 仍能跑完(取消没伤到队列结构)
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Completed { turn, .. } if turn == t1 => break,
+            TurnEvent::Idle => panic!("A 丢了(队列被取消路径破坏)"),
+            _ => {}
+        }
+    }
+}
+
+/// 按会话取消:只命中该会话的 turn(活跃或排队),同批别家不受影响。
+#[tokio::test]
+async fn cancel_session_targets_only_that_session() {
+    let mut running = mock_snap_engine(1).await;
+    let prompt_a = "alpha bravo cedar delta ember falcon alpha bravo";
+    let prompt_b = "cedar delta ember falcon alpha bravo cedar delta";
+    let (_s1, t1) = running.submit_session(Some(7), prompt_a, 16).expect("submit A");
+    // 泵一步让 A 进活跃(单槽档:活跃 = 执行选择器)
+    let _ = running.pump().await.expect("pump step");
+    let (_s2, t2) = running.submit_session(Some(8), prompt_b, 8).expect("submit B");
+    assert_eq!(running.queue_len(), 1, "B 应排队");
+    // 按会话 8 取消 ⇒ 只掉 B
+    let ev = running.cancel_session(8).await.expect("会话 8 应有 turn");
+    assert!(matches!(ev, TurnEvent::Failed { turn, .. } if turn == t2));
+    assert_eq!(running.queue_len(), 0);
+    // A 不受影响:跑到 Completed
+    let mut done = false;
+    for _ in 0..512 {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Completed { turn, .. } if turn == t1 => {
+                done = true;
+                break;
+            }
+            TurnEvent::Idle => break,
+            _ => {}
+        }
+    }
+    assert!(done, "A 应在 B 被取消后正常完成");
+    // 无 turn 的会话 = None(不静默成功)
+    assert!(running.cancel_session(999).await.is_none());
+}
+
+/// **P0-2 队列上限**（submit 边界）：在飞总数（活跃 + 排队）达上限 ⇒ 拒，
+/// 且错误串带 `admission:` 前缀（服务面据此翻 429 `no_slot`）。
+#[tokio::test]
+async fn queue_bound_rejects_at_submit() {
+    let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
+    knobs.pool_tokens = Some(256);
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = 1;
+    knobs.max_batch = 1;
+    knobs.max_queue = 1; // 批位 1 + 队列 1 ⇒ 在飞上限 2
+    let cfg = EngineConfig { device_ordinal: 0, max_seq_tokens: 256, prefill_chunk: 32, knobs };
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let p = "alpha bravo cedar delta ember falcon";
+    running.submit_session(Some(1), p, 8).expect("第 1 个(活跃)");
+    running.submit_session(Some(2), p, 8).expect("第 2 个(排队)");
+    match running.submit_session(Some(3), p, 8) {
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(msg.contains("admission:no_slot"), "错误串应带准入码：{msg}");
+        }
+        Ok(_) => panic!("在飞已达上限 2，第 3 个应被拒"),
+    }
+    // 无界档（max_queue=0）不拒 —— 旧行为不变
+    running.cfg.knobs.max_queue = 0;
+    running.submit_session(Some(4), p, 8).expect("无界档不拒");
+}
+
+/// **P3 退避估算/直方图**（纯函数；无卡）
+#[test]
+fn wait_histogram_and_eta_are_sane() {
+    use crate::turn::TurnLedger;
+    // 桶边界：49/50、199/200、999/1000、4999/5000
+    assert_eq!(TurnLedger::wait_bucket(0), 0);
+    assert_eq!(TurnLedger::wait_bucket(49), 0);
+    assert_eq!(TurnLedger::wait_bucket(50), 1);
+    assert_eq!(TurnLedger::wait_bucket(199), 1);
+    assert_eq!(TurnLedger::wait_bucket(200), 2);
+    assert_eq!(TurnLedger::wait_bucket(999), 2);
+    assert_eq!(TurnLedger::wait_bucket(1_000), 3);
+    assert_eq!(TurnLedger::wait_bucket(4_999), 3);
+    assert_eq!(TurnLedger::wait_bucket(5_000), 4);
+
+    let mut t = TurnLedger::new();
+    // EWMA 未测 ⇒ 2s 保守；队列 3、批位 2 ⇒ 2 波 ⇒ 4s
+    assert_eq!(t.eta_ms(2, 3), 4_000);
+    // 测过 1s ⇒ 队列 0、批位 4 ⇒ 1 波 ⇒ 1s
+    t.note_turn_ms(1_000);
+    assert_eq!(t.eta_ms(4, 0), 1_000);
+    // 下限/上限
+    let mut t2 = TurnLedger::new();
+    t2.note_turn_ms(10); // 首值即 EWMA ⇒ 10ms
+    assert_eq!(t2.eta_ms(8, 0), 500, "下限 500ms");
+    let mut t3 = TurnLedger::new();
+    t3.note_turn_ms(100_000);
+    assert_eq!(t3.eta_ms(1, 100), 30_000, "上限 30s");
 }

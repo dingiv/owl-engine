@@ -192,6 +192,16 @@ pub struct EngineKnobs {
     /// 剩余 ≤ `prefill_chunk + 本值` ⇒ 本步吃完(消灭与尺寸无关的固定宿主税
     /// ~250ms/chunk 的尾块;缺省 0 = 关 = 旧行为)。见 `scheduler::prefill_step_chunk`。
     pub prefill_tail_merge: usize,
+    /// 相位时间片(0 = 关;`[runtime] slice_every/slice_tokens`)
+    pub slice_every: usize,
+    pub slice_tokens: usize,
+    /// 准入三旋钮(`[runtime]`;见 `sched_policy::Limits`)
+    pub newcomer_min_tokens: usize,
+    pub min_gen_tokens: usize,
+    /// 池保留页(0 = 自动 `min(nb/64, 8)`)
+    pub reserve_pages: usize,
+    /// 等待队列上限(0 = 无界;超出 ⇒ 429 `no_slot`)
+    pub max_queue: usize,
     /// **末段页对齐**(前缀复用闭环,2026-10-19;`[pool] prefill_align_tail`,
     /// 缺省 **true**)。块边界快照只在**页对齐**处拍 ⇒ 单块档(整个 prompt 落进
     /// 一个 chunk)L4 会把尾端不对齐地一口吃完 ⇒ 一个快照都没有 ⇒ 下一轮全量
@@ -287,6 +297,12 @@ impl Default for EngineKnobs {
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
             prefill_tail_merge: 0,
+            slice_every: 0,
+            slice_tokens: 0,
+            newcomer_min_tokens: 4096,
+            min_gen_tokens: 256,
+            reserve_pages: 0,
+            max_queue: 0,
             prefill_align_tail: true,
             snap_decode_stride: 1,
             prefill_bucket: owl_shared::config::PrefillBucket::Off,
@@ -594,6 +610,12 @@ impl EngineKnobs {
             // 用户裁决 2026-10-19:引擎行为参数只许配置文件显式声明)
             max_batch: cfg.runtime.max_batch,
             prefill_tail_merge: cfg.runtime.prefill_tail_merge,
+            slice_every: cfg.runtime.slice_every,
+            slice_tokens: cfg.runtime.slice_tokens,
+            newcomer_min_tokens: cfg.runtime.newcomer_min_tokens,
+            min_gen_tokens: cfg.runtime.min_gen_tokens,
+            reserve_pages: cfg.runtime.reserve_pages,
+            max_queue: cfg.runtime.max_queue,
             prefill_align_tail: cfg.pool.prefill_align_tail,
             snap_decode_stride: cfg.pool.snap_decode_stride,
             // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)

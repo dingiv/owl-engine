@@ -240,6 +240,18 @@ impl GraphInstantiateFlags {
 // §2 config modules(每 module 管一个功能域;deny_unknown = 键名打错拒启)
 // ============================================================================
 
+fn default_gdn_slots() -> usize {
+    PoolCfg::default().gdn_slots
+}
+
+fn default_newcomer_min() -> usize {
+    4096
+}
+
+fn default_min_gen() -> usize {
+    256
+}
+
 fn default_max_batch() -> usize {
     1
 }
@@ -315,6 +327,26 @@ pub struct RuntimeCfg {
     /// 往返;4-token 的尾块也要 249ms)⇒ `<chunk` 的尾块是纯亏。
     /// 默认 **0 = 关 = 逐字节旧行为**(块长 = min(chunk, 剩余))。
     pub prefill_tail_merge: usize,
+    /// **相位时间片**:每 `slice_every` 拍 decode 之后插**一片** prefill
+    /// (0 = 关 = 旧行为:prefill 独占泵)。在位者 ITL 上界 ≈
+    /// `solo + slice_ms / (slice_every+1)`。见 `sched_policy` 模块头 P1。
+    #[serde(default)]
+    pub slice_every: usize,
+    /// 时间片单片 prefill token 数(0 = 用整 `prefill_chunk`)
+    #[serde(default)]
+    pub slice_tokens: usize,
+    /// **准入:给未来新人的预留**(token/人;反推在位者的生成封顶)
+    #[serde(default = "default_newcomer_min")]
+    pub newcomer_min_tokens: usize,
+    /// **准入:在位者的最小生成量**(低于它就不留新人预留 —— 在位者优先)
+    #[serde(default = "default_min_gen")]
+    pub min_gen_tokens: usize,
+    /// **准入:池保留页**(0 = 自动 `min(nb/64, 8)`)
+    #[serde(default)]
+    pub reserve_pages: usize,
+    /// **准入:等待队列上限**(0 = 无界;超出 ⇒ 新来者 429 `no_slot`)
+    #[serde(default)]
+    pub max_queue: usize,
     /// **测试设备门控值**(不入 toml;测试入口自填):`OWL_TEST_DEVICE` 的 **BDF**
     /// (如 `41:00.0`)。`Some` = GPU 门已过。**CUDA 序号禁用**(序会漂)。
     #[serde(skip)]
@@ -405,7 +437,10 @@ pub struct PoolCfg {
     /// **虚拟化档可小于上下文**(`[kvmem].pool_overcommit`;boot 硬校验兜底)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_tokens: Option<usize>,
-    /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)
+    /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)。
+    /// **0 = 自动 = `[server].max_concurrency`**(并发数配几个就几格 —— 用户裁决
+    /// 2026-10-20);非 0 = 显式值(旧档逐字节不变)。
+    #[serde(default = "default_gdn_slots")]
     pub gdn_slots: usize,
     /// **末段页对齐**(缺省 `true`;前缀复用闭环)。
     ///
@@ -1090,6 +1125,10 @@ pub struct AgentCfg {
     /// 请求带 `reasoning_effort` 时以请求为准)。None = 不传 ⇒ 模板取自己的缺省
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// **排队超时(毫秒;0 = 关)**:提交后这么久还没看到第一个 prefill/token
+    /// ⇒ 取消该 turn 并回 `429 + Retry-After`(标准 OpenAI 语义;D2 的 R 档)。
+    #[serde(default)]
+    pub queue_wait_ms: usize,
 }
 
 impl Default for AgentCfg {
@@ -1103,6 +1142,7 @@ impl Default for AgentCfg {
             tool_call_format: ToolCallFormat::Xml,
             auto_disable_thinking_with_tools: false,
             reasoning_effort: None,
+            queue_wait_ms: 0,
         }
     }
 }
@@ -1163,6 +1203,12 @@ impl Default for RuntimeCfg {
             prefill_chunk: 512,
             max_batch: 1,
             prefill_tail_merge: 0,
+            slice_every: 0,
+            slice_tokens: 0,
+            newcomer_min_tokens: 4096,
+            min_gen_tokens: 256,
+            reserve_pages: 0,
+            max_queue: 0,
             test_device: None,
             server_url: None,
         }
@@ -1570,6 +1616,26 @@ pub fn parse_cli_set(s: &str) -> Result<(String, toml::Value), String> {
     Ok((key.to_string(), val))
 }
 
+/// **自动派生**:`[pool].gdn_slots = 0` ⇒ `[server].max_concurrency`
+/// (并发数配几个就几格 —— 用户裁决 2026-10-20)。显式非 0 值逐字节不变。
+fn derive_auto_pool(v: &mut toml::Value) -> Result<(), String> {
+    let Some(root) = v.as_table_mut() else { return Ok(()) };
+    let concurrency = root
+        .get("server")
+        .and_then(|s| s.get("max_concurrency"))
+        .and_then(|c| c.as_integer())
+        .unwrap_or(8)
+        .max(1) as usize;
+    let Some(pool) = root.get_mut("pool").and_then(|p| p.as_table_mut()) else {
+        return Ok(());
+    };
+    let g = pool.get("gdn_slots").and_then(|g| g.as_integer()).unwrap_or(-1);
+    if g == 0 {
+        pool.insert("gdn_slots".into(), toml::Value::Integer(concurrency as i64));
+    }
+    Ok(())
+}
+
 impl OwlConfig {
     /// **统一 loader**(Default → 基准文件 → 覆盖文件;CLI 由入口决定前两者的
     /// 取值)。每个文件都可声明 `extends` 继承另一档 —— 被继承者先合并、本文件
@@ -1620,6 +1686,7 @@ impl OwlConfig {
             layer_names.push("cli".into());
         }
         let meta = resolve::apply(&mut v, &mut origins)?;
+        derive_auto_pool(&mut v)?;
         reject_retired_keys(&v)?;
         let config: Self = v
             .try_into()
@@ -1653,6 +1720,7 @@ impl OwlConfig {
         let mut origins = Origins::new();
         record_origins(&v, "", &Origin::File("<inline>".into()), &mut origins);
         let meta = resolve::apply(&mut v, &mut origins)?;
+        derive_auto_pool(&mut v)?;
         reject_retired_keys(&v)?;
         let config: Self = v
             .try_into()
@@ -2248,5 +2316,60 @@ mod prefill_bucket_tests {
         assert_eq!(c2.spec.depth, 7, "spec-dflash 预设 = d7");
         assert_eq!(c2.model.head_quant, HeadQuant::RtnInt4G32, "C1 int4 头");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod auto_pool_tests {
+    use super::*;
+
+    /// `[pool].gdn_slots = 0` ⇒ 自动 = `[server].max_concurrency`（并发数配几个几格）
+    #[test]
+    fn gdn_slots_auto_follows_concurrency() {
+        let c = OwlConfig::from_toml_str(
+            "[server]\nmax_concurrency = 3\n[pool]\ngdn_slots = 0\n",
+        )
+        .expect("合法档");
+        assert_eq!(c.pool.gdn_slots, 3);
+        // 缺省 server.max_concurrency = 8
+        let c = OwlConfig::from_toml_str("[pool]\ngdn_slots = 0\n").expect("合法档");
+        assert_eq!(c.pool.gdn_slots, 8);
+    }
+
+    /// 显式值逐字节不变（旧档零行为差）
+    #[test]
+    fn explicit_gdn_slots_is_untouched() {
+        let c = OwlConfig::from_toml_str(
+            "[server]\nmax_concurrency = 2\n[pool]\ngdn_slots = 6\n",
+        )
+        .expect("合法档");
+        assert_eq!(c.pool.gdn_slots, 6);
+    }
+
+    /// 准入三旋钮的缺省与显式值
+    #[test]
+    fn admission_knobs_defaults_and_overrides() {
+        let c = OwlConfig::from_toml_str("").expect("空档");
+        assert_eq!(c.runtime.newcomer_min_tokens, 4096);
+        assert_eq!(c.runtime.min_gen_tokens, 256);
+        assert_eq!(c.runtime.reserve_pages, 0, "0 = 自动");
+        assert_eq!(c.agent.queue_wait_ms, 0, "排队超时缺省关");
+        let c = OwlConfig::from_toml_str(
+            "[runtime]\nnewcomer_min_tokens = 2048\nmin_gen_tokens = 128\nreserve_pages = 4\n\
+             [agent]\nqueue_wait_ms = 15000\n",
+        )
+        .expect("合法档");
+        assert_eq!((c.runtime.newcomer_min_tokens, c.runtime.min_gen_tokens), (2048, 128));
+        assert_eq!(c.runtime.reserve_pages, 4);
+        assert_eq!(c.agent.queue_wait_ms, 15000);
+    }
+
+    /// 自动 gdn_slots 与 max_batch 的自洽门：并发 2 + 批 3 ⇒ 拒（批位吃不到）
+    #[test]
+    fn auto_gdn_slots_still_guards_max_batch() {
+        let e = OwlConfig::from_toml_str(
+            "[runtime]\nmax_batch = 3\n[server]\nmax_concurrency = 2\n[pool]\ngdn_slots = 0\n",
+        );
+        assert!(e.is_err(), "gdn_slots(auto)=2 < max_batch=3 应拒");
     }
 }
