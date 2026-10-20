@@ -279,6 +279,9 @@ pub(crate) fn gguf_quant_gemm(
         && xs.dtype == Dtype::F16
         && col_index.is_none()
         && gguf_smem_arm_enabled()
+        // **能力表门**(2026-10-20):smem 臂只对 `smem_entry_for` 已移植的型成立;
+        // 不查表 = IQ 族走到这里必 `panic!("未移植")`(实测 IQ4_XS 0.8B 起机即崩)
+        && owl_kernels::family::gguf::smem_entry_for(ty).is_some()
     {
         return TensorOps::call(SemanticKernel::GgufGemmSmem)
             .arg(&w.decl())
@@ -329,7 +332,11 @@ pub(crate) fn gguf_quant_gemm(
     // 一行权重算一窗 token,权重流量 ÷ `TILE_MT`;decode 仍 MMVQ(本来就只该
     // 读一遍权重)。两臂**位级相同**(同一 `vec_dot` 序 + 同一 warp reduce;
     // 门 = `kernel_gate::tile_gemm_matches_mmvq_bitwise`)⇒ 切换零数值风险。
-    let gemm = if m >= GGUF_TILE_MIN_M && gguf_tile_arm_enabled() {
+    let gemm = if m >= GGUF_TILE_MIN_M
+        && gguf_tile_arm_enabled()
+        // 同上:复用臂的能力集是独立的(`tile_entry_for`),不查 = IQ 族崩
+        && owl_kernels::family::gguf::tile_entry_for(ty).is_some()
+    {
         SemanticKernel::GgufGemmTile
     } else {
         SemanticKernel::GgufGemm
