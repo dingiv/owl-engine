@@ -50,9 +50,13 @@ fn gguf_cublas_arm_enabled() -> bool {
     !matches!(std::env::var("OWL_GGUF_CUBLAS").as_deref(), Ok("0"))
 }
 
-/// **head 版 int8-MMA MMQ 的最小 token 数**(W-2f)。J=64 打底 ⇒ `m ≥ 64`;
-/// 更小的批留在 cuBLAS/MMQ(dp4a)/复用臂。
-pub(crate) const GGUF_MMQ2_MIN_M: usize = 64;
+/// **head 版 int8-MMA MMQ 的最小 token 数**(W-2f;2026-10-21 重定)。
+///
+/// 原 = 64(J=64 打底,只服务 prefill)。实测(27B UD-IQ4_XS,29 MB IQ4_XS 张量):
+/// MMVQ 的权重流量 = `m × 字节数` ⇒ m=8 时 238 µs,而复用臂 153 µs、
+/// **MMQ2 81 µs(m=8..64 近乎恒定)**;m=2 时 MMVQ 66 µs 仍胜 ⇒ 交叉点 ≈ 4。
+/// 详见 `family::gguf::MMQ2_SMALL_M` 的实测表。decode(m=1)不变。
+pub(crate) const GGUF_MMQ2_MIN_M: usize = owl_kernels::family::gguf::MMQ2_SMALL_M;
 
 /// int8-MMA MMQ 开关(诊断/对拍;缺省开)。`OWL_GGUF_MMQ2=0` ⇒ 回退 cuBLAS 臂。
 fn gguf_mmq2_arm_enabled() -> bool {

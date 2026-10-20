@@ -409,6 +409,26 @@ pub struct GgufTileQ4K;
 pub struct GgufTileQ5K;
 /// 同上(Q6_K)
 pub struct GgufTileQ6K;
+/// 同上(`q2k`)
+pub struct GgufTileQ2K;
+/// 同上(`q3k`)
+pub struct GgufTileQ3K;
+/// 同上(`iq1s`)
+pub struct GgufTileIQ1S;
+/// 同上(`iq2xxs`)
+pub struct GgufTileIQ2XXS;
+/// 同上(`iq2xs`)
+pub struct GgufTileIQ2XS;
+/// 同上(`iq2s`)
+pub struct GgufTileIQ2S;
+/// 同上(`iq3xxs`)
+pub struct GgufTileIQ3XXS;
+/// 同上(`iq3s`)
+pub struct GgufTileIQ3S;
+/// 同上(`iq4nl`)
+pub struct GgufTileIQ4NL;
+/// 同上(`iq4xs`)
+pub struct GgufTileIQ4XS;
 
 macro_rules! gguf_tile_spec {
     ($t:ty, $entry:expr) => {
@@ -428,6 +448,16 @@ gguf_tile_spec!(GgufTileQ8_0, crate::family::gguf::GEMM_TILE_Q8_0);
 gguf_tile_spec!(GgufTileQ4K, crate::family::gguf::GEMM_TILE_Q4K);
 gguf_tile_spec!(GgufTileQ5K, crate::family::gguf::GEMM_TILE_Q5K);
 gguf_tile_spec!(GgufTileQ6K, crate::family::gguf::GEMM_TILE_Q6K);
+gguf_tile_spec!(GgufTileQ2K, crate::family::gguf::GEMM_TILE_Q2K);
+gguf_tile_spec!(GgufTileQ3K, crate::family::gguf::GEMM_TILE_Q3K);
+gguf_tile_spec!(GgufTileIQ1S, crate::family::gguf::GEMM_TILE_IQ1S);
+gguf_tile_spec!(GgufTileIQ2XXS, crate::family::gguf::GEMM_TILE_IQ2XXS);
+gguf_tile_spec!(GgufTileIQ2XS, crate::family::gguf::GEMM_TILE_IQ2XS);
+gguf_tile_spec!(GgufTileIQ2S, crate::family::gguf::GEMM_TILE_IQ2S);
+gguf_tile_spec!(GgufTileIQ3XXS, crate::family::gguf::GEMM_TILE_IQ3XXS);
+gguf_tile_spec!(GgufTileIQ3S, crate::family::gguf::GEMM_TILE_IQ3S);
+gguf_tile_spec!(GgufTileIQ4NL, crate::family::gguf::GEMM_TILE_IQ4NL);
+gguf_tile_spec!(GgufTileIQ4XS, crate::family::gguf::GEMM_TILE_IQ4XS);
 
 /// `owl_gguf_quant_act_f16` —— 激活 → q8_1 块(f16 入;MMVQ 喂料手)
 pub struct GgufQuantActF16;
@@ -634,6 +664,16 @@ pub static TILE_Q8_0: KernelMeta = meta_of::<GgufTileQ8_0>();
 pub static TILE_Q4K: KernelMeta = meta_of::<GgufTileQ4K>();
 pub static TILE_Q5K: KernelMeta = meta_of::<GgufTileQ5K>();
 pub static TILE_Q6K: KernelMeta = meta_of::<GgufTileQ6K>();
+pub static TILE_Q2K: KernelMeta = meta_of::<GgufTileQ2K>();
+pub static TILE_Q3K: KernelMeta = meta_of::<GgufTileQ3K>();
+pub static TILE_IQ1S: KernelMeta = meta_of::<GgufTileIQ1S>();
+pub static TILE_IQ2XXS: KernelMeta = meta_of::<GgufTileIQ2XXS>();
+pub static TILE_IQ2XS: KernelMeta = meta_of::<GgufTileIQ2XS>();
+pub static TILE_IQ2S: KernelMeta = meta_of::<GgufTileIQ2S>();
+pub static TILE_IQ3XXS: KernelMeta = meta_of::<GgufTileIQ3XXS>();
+pub static TILE_IQ3S: KernelMeta = meta_of::<GgufTileIQ3S>();
+pub static TILE_IQ4NL: KernelMeta = meta_of::<GgufTileIQ4NL>();
+pub static TILE_IQ4XS: KernelMeta = meta_of::<GgufTileIQ4XS>();
 
 // ---- 行窗解量化的元数据表项 ----
 pub static RANGE_Q8_0: KernelMeta = meta_of::<GgufRangeQ8_0>();

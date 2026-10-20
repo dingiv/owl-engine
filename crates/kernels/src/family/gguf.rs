@@ -322,6 +322,26 @@ pub const GEMM_TILE_Q4K: &str = "owl_gguf_gemm_tile_q4k";
 pub const GEMM_TILE_Q5K: &str = "owl_gguf_gemm_tile_q5k";
 /// 同上(Q6_K)
 pub const GEMM_TILE_Q6K: &str = "owl_gguf_gemm_tile_q6k";
+/// 同上(`q2k`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_Q2K: &str = "owl_gguf_gemm_tile_q2k";
+/// 同上(`q3k`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_Q3K: &str = "owl_gguf_gemm_tile_q3k";
+/// 同上(`iq1s`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ1S: &str = "owl_gguf_gemm_tile_iq1s";
+/// 同上(`iq2xxs`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ2XXS: &str = "owl_gguf_gemm_tile_iq2xxs";
+/// 同上(`iq2xs`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ2XS: &str = "owl_gguf_gemm_tile_iq2xs";
+/// 同上(`iq2s`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ2S: &str = "owl_gguf_gemm_tile_iq2s";
+/// 同上(`iq3xxs`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ3XXS: &str = "owl_gguf_gemm_tile_iq3xxs";
+/// 同上(`iq3s`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ3S: &str = "owl_gguf_gemm_tile_iq3s";
+/// 同上(`iq4nl`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ4NL: &str = "owl_gguf_gemm_tile_iq4nl";
+/// 同上(`iq4xs`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ4XS: &str = "owl_gguf_gemm_tile_iq4xs";
 /// 复用臂的资产 id
 pub const TILE_SRC: &str = "cu/gguf/gguf_tile.cu";
 
@@ -414,13 +434,31 @@ pub const fn mmq2_quant_entry_for(ty: GgmlTy) -> Option<&'static str> {
     }
 }
 
+/// **小 m 下限**(2026-10-21 实测重定;原 = 64,只服务 prefill)。
+///
+/// 为什么降到 4:`mul_mat_q` 的 J=64 分块对 `m < J` **本就带边界**(`ntx =
+/// ceil(m/J)` + 核内行边界),数值与 MMVQ 相对差 ~6e-4(门 `gpu_gguf_mmq2_small_m`);
+/// 而 MMVQ 的网格是 `(n/n_warps, m)` ⇒ **权重流量 = m × 权重字节数**。
+/// 27B UD-IQ4_XS 实测(29 MB 的 IQ4_XS 张量):
+///
+/// | m | MMVQ | 复用臂(tile) | **MMQ2(J=64)** |
+/// |---|---|---|---|
+/// | 2 | 66 µs | — | 77 µs |
+/// | 8 | 238 µs | 153 µs | **81 µs** |
+/// | 32 | 941 µs | ~400 µs | **84 µs** |
+/// | 64 | 1885 µs | 450 µs | **83 µs** |
+///
+/// ⇒ 交叉点在 m≈4(2 时 MMVQ 仍略胜),verify(depth+1 ∈ [2,8])与小块 prefill 的
+/// 最优臂都是 **MMQ2**。m = 1(decode)不变:仍是 MMVQ(读一遍权重即地板)。
+pub const MMQ2_SMALL_M: usize = 4;
+
 /// 本臂适用门(单一产地;`linear.rs` 与门/测试同读这一份):
-/// ① 型已移植 ② `m ≥ 64`(小批仍给 MMVQ/复用臂)
+/// ① 型已移植 ② `m ≥ MMQ2_SMALL_M`(decode 仍给 MMVQ;见该常量文档的实测表)
 /// ③ `n % 128 == 0`(上游 `I=128`,首版**不装 fallback**)
 /// ④ `k % 128 == 0`(激活块 128 值)
 pub const fn mmq2_ok(ty: GgmlTy, m: usize, n: usize, k: usize) -> bool {
     mmq2_entry_for(ty, m).is_some()
-        && m >= 64
+        && m >= MMQ2_SMALL_M
         && n % MMQ2_I == 0
         && k % MMQ2_QK == 0
 }
@@ -730,6 +768,16 @@ pub const fn tile_entry_for(ty: GgmlTy) -> Option<&'static str> {
         GgmlTy::Q4K => Some(GEMM_TILE_Q4K),
         GgmlTy::Q5K => Some(GEMM_TILE_Q5K),
         GgmlTy::Q6K => Some(GEMM_TILE_Q6K),
+        GgmlTy::Q2K => Some(GEMM_TILE_Q2K),
+        GgmlTy::Q3K => Some(GEMM_TILE_Q3K),
+        GgmlTy::Iq1S => Some(GEMM_TILE_IQ1S),
+        GgmlTy::Iq2Xxs => Some(GEMM_TILE_IQ2XXS),
+        GgmlTy::Iq2Xs => Some(GEMM_TILE_IQ2XS),
+        GgmlTy::Iq2S => Some(GEMM_TILE_IQ2S),
+        GgmlTy::Iq3Xxs => Some(GEMM_TILE_IQ3XXS),
+        GgmlTy::Iq3S => Some(GEMM_TILE_IQ3S),
+        GgmlTy::Iq4Nl => Some(GEMM_TILE_IQ4NL),
+        GgmlTy::Iq4Xs => Some(GEMM_TILE_IQ4XS),
         _ => None,
     }
 }
@@ -993,8 +1041,20 @@ mod tests {
         }
         assert!(GgmlTy::F32.native_dtype().is_some());
         assert!(GgmlTy::Q4K.native_dtype().is_none(), "量化型不得走元素路径");
-        // 未移植者必须**无入口** ⇒ 可跑性响亮拒(设计 R3:IQ1/IQ2 与长尾型)
-        for t in [GgmlTy::Iq1S, GgmlTy::Iq2Xxs, GgmlTy::Tq1_0, GgmlTy::Mxfp4, GgmlTy::Q2K] {
+        // 未移植者必须**无入口** ⇒ 可跑性响亮拒(设计 R3)。
+        // ⚠️ 2026-10-21 修正:原清单拿 IQ1_S/IQ2_XXS/Q2_K 当"未移植",IQ 族落地
+        // (REQ-GGUF-04)后它们**已移植** ⇒ 陈旧断言。现在判据 = **PORTED 表自洽**:
+        // 有入口 ⇔ 在 PORTED(加型只改一处,不会再有第二份清单漂移)。
+        for t in ALL {
+            assert_eq!(
+                entry_for(*t).is_some(),
+                PORTED.contains(t),
+                "{:?}: 入口在场 ⇔ 在 PORTED(单一事实源)",
+                t
+            );
+        }
+        // 长尾型(**确实**未移植)抽点:必须无入口
+        for t in [GgmlTy::Tq1_0, GgmlTy::Mxfp4, GgmlTy::Nvfp4, GgmlTy::Q1_0, GgmlTy::Q2_0, GgmlTy::Iq1M] {
             assert!(entry_for(t).is_none(), "{:?} 不该有入口(未移植)", t);
         }
     }
