@@ -45,6 +45,10 @@ pub(crate) mod loader;
 pub(crate) mod prefill_plan;
 pub(crate) mod running;
 pub(crate) mod sampler;
+// **调度政策**:准入 + 相位两个独立状态机(纯数据/零 I/O;事实由引擎每拍注入)。
+// 本刀只落骨架与算式,尚未接线 ⇒ 允许死码(接线下一步)。
+#[allow(dead_code)]
+pub(crate) mod sched_policy;
 pub(crate) mod scheduler;
 pub(crate) mod spec_runtime;
 pub(crate) mod state;
