@@ -1385,6 +1385,12 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
                 load: cfg.knobs.load.clone(),
                 // 草稿环境基底(已合入目标几何/硬件档;草稿只覆盖 hd/grp)
                 base_env: env,
+                // 草稿共享的 target 事实(GGUF 草稿声明校验 + 码本行数)
+                target: owl_models::formats::gguf::TargetFacts {
+                    vocab: rm.spec.vocab,
+                    layers: rm.spec.layer_types.len(),
+                    hidden: rm.spec.hidden,
+                },
             },
         )
         .await?;

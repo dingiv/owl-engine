@@ -251,6 +251,8 @@ pub(crate) struct BucketBoot<'a> {
     pub(crate) dims: ModelDims,
     /// DFlash2 tap 数(0 = 无草稿面)
     pub(crate) taps: usize,
+    /// **DFlash2 taps 的 target 层号(0-based;单一事实源 = SpecRuntime)**
+    pub(crate) tap_ids: std::sync::Arc<Vec<usize>>,
     /// 桶阶梯(t_pad 升序;档位 → `ladder()`)
     pub(crate) ladder: &'static [usize],
     /// `[dispatch] fi_plan_restore`(2026-10-19):false ⇒ 桶图**不自携** FI plan 表,
@@ -411,6 +413,8 @@ impl<D: DeviceClient> PrefillBuckets<D> {
 
     /// 单桶:建槽面 + 声明树 + `GraphPlan::plan`(warmup + 捕获)
     async fn capture_one(face: D, boot: &BucketBoot<'_>, t_pad: usize) -> Result<BucketGraph<D>> {
+        // 闭包须 'static ⇒ 层号表按 Arc 持有一份(捕获期只读)
+        let tap_ids = std::sync::Arc::clone(&boot.tap_ids);
         let pool = boot.pool;
         let dims = boot.dims;
         let dd = dims.hidden;
@@ -544,7 +548,7 @@ impl<D: DeviceClient> PrefillBuckets<D> {
             ctx.env = env;
             // 根:与 eager 逐字同构(单根 concat;taps 行 = 布局 t_pad)
             let (h, tps) = if taps > 0 {
-                model.tapped_hidden(&tl, &ctx, &[5, 19, 33, 47, 61])
+                model.tapped_hidden(&tl, &ctx, tap_ids.as_slice())
             } else {
                 (model.last_hidden(&tl, &ctx), Vec::new())
             };

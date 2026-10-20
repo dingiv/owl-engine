@@ -29,8 +29,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         use crate::state::StatePool as SP;
         let slot_at = |p: usize| SP::draft_prefix_slot(p);
         let _f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        // mask token 走 spec 运行态(单源:GGUF 草稿未导出该 KV ⇒ 家族兜底值已入账)
+        let mask = self.dev.spec_rt.dflash_mask_token as f32;
         let tokens_f: Vec<f32> = (0..8)
-            .map(|i| if i == 0 { bonus as f32 } else { owl_models::layers::dflash2::MASK_TOKEN_ID as f32 })
+            .map(|i| if i == 0 { bonus as f32 } else { mask })
             .collect();
         let enc_pos: Vec<f32> = (0..8).map(|i| (pos + i) as f32).collect();
         let enc_slots: Vec<f32> = (0..8).map(|i| slot_at(pos + i)).collect();
@@ -229,7 +231,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         // 噪声块 token/位置表(8 行定形)
         let mut toks = vec![anchor as f32];
-        toks.resize(8, owl_models::layers::dflash2::MASK_TOKEN_ID as f32);
+        toks.resize(8, self.dev.spec_rt.dflash_mask_token as f32);
         let toks_t = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&toks));
         let pos_t = TensorOps::from_host(
             Dtype::F32,

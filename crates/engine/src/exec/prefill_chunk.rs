@@ -1138,7 +1138,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.spec_rt.dflash_tap_count > 0 {
-                let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
+                let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &self.spec_rt.dflash_tap_ids);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for t in &tp {
                     c = c.arg(t);
@@ -1332,7 +1332,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.spec_rt.dflash_tap_count > 0 {
-                let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
+                let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &self.spec_rt.dflash_tap_ids);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for tt in &tp {
                     c = c.arg(tt);

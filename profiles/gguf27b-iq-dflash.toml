@@ -1,0 +1,64 @@
+# owl 引擎预设档 `gguf27b-iq-dflash`(27B GGUF 主干 + **GGUF 草稿** DFlash2;2026-10-20)
+#
+# 靶位:
+#   主干 = `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf`(14 GiB)
+#   草稿 = `z-lab/Qwen3.8-27B-Dflash2-gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf`(1.08 GiB)
+# 单张 3090 Ti(24 GiB):14 + 1.31(草稿驻留,含码本反量化)+ KV/图/工作 ≈ 18 GiB.
+#
+# 这是 **DFlash2-GGUF 线(P0–P3)** 的生产靶位:草稿源由 `model.dflash2_dir`
+# 的**路径形态**判别(目录 = HF 检查点;`.gguf` 文件 = GGUF 草稿),配置面
+# 不新增键(`site.draft_dir` 原样可用)。
+#
+# 起机(3090 Ti @41:00.0):
+#   CUDA_VISIBLE_DEVICES=GPU-e565c505-4921-9979-2e0f-2b83490b7aed \
+#   target/release/server -p profiles/gguf27b-iq-dflash.toml
+#
+# 起机后自检(启动日志应出现):
+#   `GGUF 草稿:… taps [5, 19, 33, 47, 61](GGUF 1-based 原值已归一)`
+#   `GGUF 草稿装载:81 个文件张量全部覆盖`
+#   `DFlash2 GGUF 草稿装载(depth=7;…)`
+#
+# 测速:
+#   cd packages/llm_speedtest && uv run cli \
+#     --api-url http://127.0.0.1:8140/v1/chat/completions \
+#     --model qwen3.8-27b --flavor std --temperature 0 --top-p 1
+#
+# ⚠️ `[dispatch] tag_wildcard = true` 的理由见 `gguf08b-iq4xs.toml`(tag 词表缺
+# layout facet ⇒ 池写者 E14 双寻址拒启;与 spec 无关的既有缺口)。
+
+[model]
+kind = "gguf"
+dir = "/home/div/Documents/codes/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf"
+dflash2_dir = "/home/div/Documents/codes/models/z-lab/Qwen3.8-27B-Dflash2-gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+
+[runtime]
+bind = "127.0.0.1:8140"
+max_seq = 12288
+prefill_chunk = 1024
+
+[spec]
+# DFlash2 生产深度 = 7(block 8 = 1 锚 + 7 草稿;草稿文件 block_size 自证)
+depth = 7
+
+[pool]
+pool_tokens = 12288
+gdn_slots = 8
+snap_max = 4
+host_cache_mb = 2048
+snap_host_mb = 256
+prefix_cache = true
+
+[sampling]
+mode = "greedy"
+
+[kvmem]
+select_decode = false
+select_partial = false
+index = false
+coverage_probe = false
+
+[dispatch]
+tag_wildcard = true
+
+[log]
+level = "info"

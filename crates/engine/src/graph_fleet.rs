@@ -273,6 +273,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                         pool: boot.pool,
                         dims: boot.dims,
                         taps: boot.spec.dflash_tap_count,
+                        tap_ids: std::sync::Arc::clone(&boot.spec.dflash_tap_ids),
                         ladder: crate::prefill_plan::ladder(boot.knobs.prefill_bucket),
                         fi_plan_restore: boot.knobs.fi_plan_restore,
                     };
@@ -424,6 +425,8 @@ impl<D: DeviceClient> GraphFleet<D> {
         // `vocab_size()` 仍是词表全量(embed/tokenizer 面用)。
         let vocab = boot.model.logits_vocab();
         let knobs = boot.knobs;
+        // taps 层号表(闭包 'static ⇒ Arc 持有;单一事实源 = SpecRuntime)
+        let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let kv_caches = pool.kv_caches();
         let gdn_caches = pool.gdn_caches();
         let bt_leaf = pool.bt_leaf();
@@ -550,7 +553,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             // B4:降级期取数面 —— tapped_hidden 拿末层 hidden + 5 层 taps
             // (零额外前向;l m_head 与 forward 同式)。非 dflash 原路(位等价)
             let tree = if decode_taps {
-                let (hidden, taps) = model.tapped_hidden(&ids, &ctx, &[5, 19, 33, 47, 61]);
+                let (hidden, taps) = model.tapped_hidden(&ids, &ctx, tap_ids.as_slice());
                 for (i, t) in taps.iter().enumerate() {
                     sc.output(format!("tap{i}"), t)?;
                 }
@@ -797,6 +800,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let knobs = boot.knobs;
         let spec_mode = boot.spec.mode;
         let depth1 = boot.spec.depth + 1;
+        let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let model_v = Arc::clone(&boot.model);
         let rp_v = boot.rope.clone();
         let kv_caches = pool.kv_caches();
@@ -1013,7 +1017,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 ctx.gdn_tap = Some(tap.clone());
                 let vocab = model_v.logits_vocab();
                 let (hidden, taps) = if dflash_tap_decl {
-                    let (h, t) = model_v.tapped_hidden(&ids, &ctx, &[5, 19, 33, 47, 61]);
+                    let (h, t) = model_v.tapped_hidden(&ids, &ctx, tap_ids.as_slice());
                     if dflash_taps {
                         for (i, t) in t.iter().enumerate() {
                             sc.output(format!("tap{i}"), t)?;
