@@ -54,6 +54,8 @@ type Result<T> = std::result::Result<T, ModelError>;
 pub struct EngineKnobs {
     /// **装载旋钮**(`[load]` 段;从配置文件来,不读 env —— 用户裁决 2026-10-19)
     pub load: owl_shared::config::LoadCfg,
+    /// **rope 外推/缩放**(`[model.rope]`;GGUF 档生效;缺省关)
+    pub rope: owl_shared::config::RopeCfg,
     /// 步级探针(诊断面;Default = 全关)
     pub probes: crate::running::StepProbes,
     /// 块池容量覆写(None = 2 × 单会话容量;原 OWL_POOL_TOKENS)
@@ -252,6 +254,7 @@ impl Default for EngineKnobs {
     fn default() -> Self {
         Self {
             load: owl_shared::config::LoadCfg::default(),
+            rope: owl_shared::config::RopeCfg::default(),
             probes: crate::running::StepProbes {
                 // 命中面/调试打印:env 覆盖(实测排障用 `OWL_PROBES_DEBUG=1`)
                 debug: owl_shared::env_reader::flag("OWL_DEBUG"),
@@ -508,6 +511,7 @@ impl EngineKnobs {
     pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
         Self {
             load: cfg.load.clone(),
+            rope: cfg.model.rope.clone(),
             probes: crate::running::StepProbes::from_config(cfg),
             // ── **配置是唯一来源**(2026-10-19 统一)──
             // 本函数只做 `OwlConfig` → 旋钮的字段搬运,**不读任何 env**
@@ -871,7 +875,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
     /// 面类型 = 句柄(`DeviceHandle<D>`)—— 装载期的每一块都进事件账(Weight 类);
     /// `load` 旋钮来自配置(`[load]` 段;用户裁决 2026-10-19:不读 env)。
     pub fn loader(&mut self) -> ModelLoader<'_, DeviceHandle<D>> {
-        ModelLoader::new(&mut self.face, self.cfg.knobs.load.clone())
+        ModelLoader::new(&mut self.face, self.cfg.knobs.load.clone()).rope(
+            self.cfg.knobs.rope.clone(),
+            self.cfg.max_seq_tokens,
+        )
     }
 
     /// 模型交引擎:状态块/槽/Session 组建 + warmup —— 仍不跑任何 turn,
