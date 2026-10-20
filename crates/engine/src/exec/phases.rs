@@ -153,6 +153,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             (act.id, act.session_id)
         };
+        // **段边界提前释放(2026-10-20;客户端咽喉 + 提前收回)**:
+        // 上一 chunk 的 `Turn(t)` 残块(arena 没盖住的,27B TP 实测 ≈94 MB/chunk,
+        // 且只在 peer)在**本 chunk 分配之前**结清 —— 不留到 turn 收尾,
+        // 否则长 prefill 会把 12 GB 余量一路吃穿(`vram-hard-budget`)。
+        // `base == 0` 不动(turn 起点还有长命块要活过整轮)。
+        if base > 0 {
+            let (n, bytes) = self.drain_turn_stale(turn_id, "prefill_boundary").await?;
+            if n > 0 {
+                owl_shared::log_debug!(
+                    "store",
+                    "段边界提前释放:turn {turn_id} base={base} {n} 块 / {} KiB(上一 chunk 残块)",
+                    bytes / 1024
+                );
+            }
+        }
         // 调试门:prefill 块粒度(见 owl_shared::stepgate;`--step-gate` 控制)
         owl_shared::step_gate!("engine.prefill").await;
         // **锁①后半:块表按 chunk 增量长**(只在虚拟化档;2026-10-19)。

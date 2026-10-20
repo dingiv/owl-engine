@@ -1318,6 +1318,35 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///   显存已经回不来了 —— 这是硬错,不是可重试的软错);
     /// - 只碰 `Turn(t)` 归属 —— 图/池/会话各有归属,不会被误伤。
     async fn n4_force_release(&mut self, turn: u64) -> Result<()> {
+        let (n, bytes) = self.drain_turn_stale(turn, "turn_end").await?;
+        if n == 0 {
+            return Ok(());
+        }
+        owl_shared::log_info!(
+            "store",
+            "N4 兜底释放:turn {turn} {n} 块 / {} KiB 结清并归还驱动(逐 rank 归各自面)",
+            bytes / 1024
+        );
+        Ok(())
+    }
+
+    /// **提前释放(段边界)**:把 `Turn(t)` 名下**仍开着**的块逐 rank 结清。
+    ///
+    /// 为什么要有"提前"这一档(2026-10-20 用户裁决):turn 收尾才收口 = 长 prefill
+    /// 的残块在**整个 turn 内**累积(27B TP 实测 peer 每 chunk ≈94 MB,128k 就把
+    /// 12 GB 余量吃光)。客户端 `DeviceHandle` 是**唯一咽喉** —— 每次分配都进了
+    /// store 账(带 rank/owner),所以"该 chunk 的中间量已经死了"这件事客户端全知:
+    /// 在**下一个 chunk 起点**把上一 chunk 遗留的 `Turn(t)` 块结清即可。
+    ///
+    /// 判据(不动长命面):只碰 `Owner::Turn(t)` —— 权重/池/图/会话各有归属,
+    /// 且调用点保证此刻上一 chunk 的前向已全部入队(同流 free 保序)。
+    ///
+    /// 返回 `(块数, 字节)`。
+    pub(crate) async fn drain_turn_stale(
+        &mut self,
+        turn: u64,
+        tag: &'static str,
+    ) -> Result<(usize, usize)> {
         let owner = owl_iface::handle::Owner::Turn(turn);
         // **逐 rank 分账**:两 rank 共用一本账,但块在**各自的 server** 块表里 ——
         // 把 rank1 的 id 交给 rank0 的 server = 找不到 ⇒ 静默漏(实测 434/1010)。
@@ -1354,19 +1383,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             total.1 += bytes;
         }
         if total.0 == 0 {
-            return Ok(());
+            return Ok((0, 0));
         }
         owl_shared::metrics::with_metrics_store(|m| {
-            m.counter_add("store.turn_end.stale_blocks", total.0 as u64, file!(), line!());
-            m.counter_add("store.turn_end.stale_bytes", total.1 as u64, file!(), line!());
+            m.counter_add(&format!("store.{tag}.stale_blocks"), total.0 as u64, file!(), line!());
+            m.counter_add(&format!("store.{tag}.stale_bytes"), total.1 as u64, file!(), line!());
         });
-        owl_shared::log_info!(
-            "store",
-            "N4 兜底释放:turn {turn} {} 块 / {} KiB 结清并归还驱动(逐 rank 归各自面)",
-            total.0,
-            total.1 / 1024
-        );
-        Ok(())
+        Ok(total)
     }
 
     /// **store 报告面**(设计卷 §2.4 / §13.4 对账口):三层 + 两腿 +
@@ -2197,6 +2220,50 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // **[H5 Idle]**(步 4 入档):空转期每 N 拍做一次整理(冷面下沉/清池),
                 // 决策仍全在 store(`NeedWhy::Idle` = 零缺口也搬);无活跃 turn ⇒
                 // 只动缓存面,绝不碰活跃面。
+                // **池缓存回收(空转出口;§23.9)**:server 的泵循环 `Idle` 即断,
+                // `Node::Idle`(每 16 拍)到不了 ⇒ 在这里按时间节流清一次。
+                // `RELEASE_THRESHOLD=∞` 下 turn 收尾后 free 的 GB 级临时块
+                // 不主动还驱动就永远占着(实测 peer 侧 3.0 GiB)。
+                let due = self
+                    .last_trim
+                    .is_none_or(|t| t.elapsed() >= Self::IDLE_TRIM_EVERY);
+                if due {
+                    self.last_trim = Some(std::time::Instant::now());
+                    // 先排空再清:异步 free 要等流上事件落地才进池的"空闲页"表
+                    for (rank, r) in [
+                        (0u8, self.dev.graphs.session.face_mut().sync().await),
+                        match self.peer.as_mut() {
+                            Some(p) => (1u8, p.graphs.session.face_mut().sync().await),
+                            None => (1u8, Ok(())),
+                        },
+                    ] {
+                        if let Err(e) = r {
+                            owl_shared::log_warn!("store", "空转排空失败(rank{rank}): {e}");
+                        }
+                    }
+                    let freed = self.trim_pools().await;
+                    let total: u64 =
+                        freed.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
+                    if total > 0 {
+                        owl_shared::log_info!(
+                            "store",
+                            "空转池缓存回收 {:.1} MiB(逐 rank: {:?})",
+                            total as f64 / 1048576.0,
+                            freed
+                                .iter()
+                                .map(|(r, x)| (*r, x.as_ref().map(|n| n >> 20).unwrap_or(0)))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    for (rank, r) in freed {
+                        if let Err(e) = r {
+                            owl_shared::log_warn!(
+                                "store",
+                                "空转池缓存回收失败(rank{rank}): {e}"
+                            );
+                        }
+                    }
+                }
                 if let Some(k) = self.idle_tick() {
                     self.node(Node::Idle(k)).await?;
                 }
