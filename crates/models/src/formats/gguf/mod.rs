@@ -20,6 +20,8 @@
 
 pub mod convention;
 pub mod dequant;
+pub mod draft;
+pub mod draft_meta;
 mod iq_tables;
 pub mod kernel_gate;
 pub mod load_gate;
@@ -32,6 +34,8 @@ pub mod source;
 pub mod transform;
 
 pub use convention::GgufConvention;
+pub use draft::{DraftGgufConvention, DraftGgufPlan, GgufDraftBoot, GgufDraftSource};
+pub use draft_meta::{DraftSpec, TargetFacts};
 pub use dequant::{dequant_all, dequant_row};
 /// 量化型词表(块几何 + 可跑性映射在同一处;`owl_kernels` 为权威住址)
 pub use owl_kernels::family::gguf::{GgmlTy, Q8_1_BLOCK_BYTES};

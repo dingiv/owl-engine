@@ -1409,6 +1409,25 @@ impl<'a> PlanSource<'a> {
         }
     }
 
+    /// **可选组件**的计划(conv 投影 / selector 投影等「两边不同档」的件)。
+    ///
+    /// Uniform 臂(既有一切档位)取 `default` —— 这些件在 HF 检查点里恒
+    /// 原生精度(`GroupedConv::proj` / `CandidateSelector::proj` 构造即 F16),
+    /// **不随主干 plan 变**(改它会静默改变 W4A16/BF16 草稿的数值);
+    /// Keyed 臂(GGUF 混型)逐键查表 —— 混型文件里它们**可能就是量化块**。
+    pub fn or_default(
+        &self,
+        local: &str,
+        out_dim: usize,
+        in_dim: usize,
+        default: QuantPlan,
+    ) -> QuantPlan {
+        match self.kind {
+            PlanKind::Uniform(_) => default,
+            PlanKind::Keyed { .. } => self.of(local, out_dim, in_dim),
+        }
+    }
+
     /// **检查点全键 → 计划**(embed / final norm 等非层键;Uniform 臂忽略键)
     pub fn at(&self, full_key: &str, out_dim: usize, in_dim: usize) -> QuantPlan {
         match self.kind {

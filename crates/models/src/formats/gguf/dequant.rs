@@ -678,8 +678,10 @@ mod tests {
         assert!(dequant_row(GgmlTy::Q4K, &[0u8; 145], &mut out).is_err(), "多一字节必须拒");
         let mut bad = vec![0f32; 250];
         assert!(dequant_row(GgmlTy::Q4K, &[0u8; 144], &mut bad).is_err(), "元素数非块倍数必须拒");
-        // IQ3/IQ4 已接;未接臂(IQ2)必须照旧响亮拒
-        assert!(dequant_row(GgmlTy::Iq2Xxs, &[0u8; 66], &mut out).is_err(), "未接臂必须拒");
+        // IQ1_S…IQ4_XS 全族已接(REQ-GGUF-04);**未接臂**(IQ1_M)必须照旧响亮拒。
+        // ⚠️ 2026-10-20 修正:原用例拿 IQ2_XXS 当"未接臂",IQ 族落地后该断言失效
+        // (静默变成"已实现却断言拒"—— 用例陈旧,不是实现错)
+        assert!(dequant_row(GgmlTy::Iq1M, &[0u8; 50], &mut out).is_err(), "未接臂必须拒");
     }
 
     /// 零块 = 全零(Q4_K 的 d=0 时:`d*q - dmin*m`,若 dmin 也 0 ⇒ 全 0)

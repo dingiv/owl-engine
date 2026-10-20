@@ -98,6 +98,8 @@ impl KeyConvention for Qwen35Convention {
 pub(crate) enum FcShape {
     Q,
     F16T,
+    /// GGUF 块字节臂(`fc_i.weight`,五拆;源侧按 tap 重排)
+    G,
 }
 
 /// DFlash2 草稿键映射(检查点原生命名;conv 的 base_kernel 无 .weight
@@ -106,6 +108,8 @@ impl crate::layers::dflash2::DFlash2Draft {
     pub(crate) fn fc_shape(&self) -> FcShape {
         if self.is_quant() {
             FcShape::Q
+        } else if self.is_gguf_fc() {
+            FcShape::G
         } else {
             FcShape::F16T
         }
@@ -139,6 +143,14 @@ impl Loadable for crate::layers::dflash2::DFlash2Draft {
                 let mut o = self.fc_q()[0].layout(ctx);
                 for l in &self.fc_q()[1..] {
                     o = o.chain(l.layout(ctx));
+                }
+                o
+            }
+            // GGUF:线性臂只发 `fc_i`(无量化后缀)⇒ 这里补 `.weight`
+            FcShape::G => {
+                let mut o = self.fc_g()[0].layout(ctx).map_keys(|k| format!("{k}.weight"));
+                for l in &self.fc_g()[1..] {
+                    o = o.chain(l.layout(ctx).map_keys(|k| format!("{k}.weight")));
                 }
                 o
             }
