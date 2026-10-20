@@ -362,6 +362,48 @@ impl KvStore {
         out
     }
 
+    /// **宿主层削减候选**(宿主满、内容真丢时的次序;`plan_capacity` 轮零与
+    /// `BlockLeg::host_relieve` 共用)。
+    ///
+    /// 两条结构律:
+    /// 1. **只从叶向内削**(与 `evict_candidates` 同源):先删链尾,父块自然成为
+    ///    新叶 ⇒ 一次给出同一条链上**连续**的 `limit` 个块,调用方按序删即可保持
+    ///    "叶子先走"(删中间块会让上层子树变成不可达碎片);
+    /// 2. **只出宿主驻留块**(设备块归下沉/驱逐的其它轮 —— 这里不做 I/O);
+    ///    遇到设备块即止(再往上是活跃/下沉面),`protect` 命中即止。
+    ///
+    /// 链间次序 = 叶的新鲜度升序(**最冷先**);链内次序 = 链尾 → 链头
+    /// (保留前缀:削掉的是末端,剩下的从头起仍可复用)。
+    pub fn host_prune_candidates(&self, protect: &[ChainHash], limit: usize) -> Vec<ChainHash> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut leaves: Vec<(ChainHash, u64)> = self
+            .tree
+            .leaves()
+            .into_iter()
+            .filter(|(c, _, slot)| slot.is_none() && !protect.contains(c))
+            .map(|(c, t, _)| (c, t))
+            .collect();
+        leaves.sort_by_key(|(_, t)| *t);
+        let mut out: Vec<ChainHash> = Vec::with_capacity(limit);
+        for (leaf, _) in leaves {
+            if out.len() >= limit {
+                break;
+            }
+            for b in self.tree.chain_of(leaf).into_iter().rev() {
+                if out.len() >= limit {
+                    break;
+                }
+                if b.slot.is_some() || protect.contains(&b.chain) {
+                    break; // 设备块/保护段:再往上不属于"冷宿主面"
+                }
+                out.push(b.chain);
+            }
+        }
+        out
+    }
+
     /// **会话归属查询**(0 = 无归属)。
     pub fn session_of(&self, chain: ChainHash) -> u64 {
         self.owners

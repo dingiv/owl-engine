@@ -400,22 +400,18 @@ impl Rel {
     ///
     /// - 目录布局:`root/kv/` + `root/snap/`(两腿分目录 —— 混放会让启动扫描
     ///   与清理串腿);
-    /// - 配额:**分片不许超总账**(`kv_bytes + snap_bytes ≤ inputs.disk_bytes`,
-    ///   与 host 同一条律;总账为 0 = 配置没给盘配额 ⇒ 响亮拒);
-    /// - `snap_bytes` 的分片粒度 = 一条快照的字节(需先 `attach_snap_layout`)。
+    /// - 配额：**分片不许超总账**（`kv_bytes + snap_bytes ≤ inputs.disk_bytes`，
+    ///   与 host 同一条律；总账为 0 = 配置没给盘配额 ⇒ 响亮拒）；
+    /// - **盘块 = 一条链的宿主槽**（`world ×` 单页）：溢写取料口是 `host_take`
+    ///   （整槽交出去），回填也落整槽 —— 用单平面字节会让 `plan_spill.bytes`
+    ///   与内容长度不符（TP 下写 2 倍、读 1 倍 = 静默截断）；
+    /// - `snap_bytes` 的分片粒度 = 一条快照的字节（需先 `attach_snap_layout`）。
     pub fn attach_disk(
         &mut self,
         root: impl Into<std::path::PathBuf>,
         kv_bytes: usize,
         snap_bytes: usize,
     ) -> StoreResult<DiskAttach> {
-        if self.world > 1 {
-            return Err(StoreError::Invariant(format!(
-                "TP 档(world = {}) + 磁盘腿未接线:磁盘层的块粒度/平面账还没做 \
-                 (先关 [pool] disk_cache_mb;宿主腿本身已支持 world)",
-                self.world
-            )));
-        }
         let total = self.budget.tier_budget().disk_bytes;
         if total == 0 {
             return Err(StoreError::Budget(
@@ -439,7 +435,7 @@ impl Rel {
         let root = root.into();
         let kv_root = root.join("kv");
         let snap_root = root.join("snap");
-        let kv = DiskTier::<ChainHash>::new(kv_root.clone(), self.leg.slot_bytes(), kv_bytes)?;
+        let kv = DiskTier::<ChainHash>::new(kv_root.clone(), self.leg.host_slot_bytes(), kv_bytes)?;
         let snap = DiskTier::<SnapKey>::new(snap_root.clone(), snap_blk.max(1), snap_bytes)?;
         let attach = DiskAttach {
             kv_root,
@@ -795,6 +791,50 @@ impl Rel {
             &protect.snaps,
             room,
         )
+    }
+
+    /// **磁盘回填落宿主**(执行面兜底):宿主满 ⇒ 先逐最冷(保护本链)再放。
+    ///
+    /// 为什么不是裸 `host_put`:回填发生在 `plan_onload` **之前** —— 宿主满时
+    /// 它同样会撞 `Exhausted`(与 offload 同一类洞)。保护面 = 本链(它正在被
+    /// 回填,删掉就是自拆)。
+    pub fn host_fill(
+        &mut self,
+        chain: ChainHash,
+        buf: crate::host::HostBlock,
+    ) -> StoreResult<()> {
+        if self.leg.host_enabled() && self.leg.host_free_slots() == 0 {
+            let protect = self.leg.chain_blocks(chain);
+            let _ = self.leg.host_relieve(1, &protect)?;
+        }
+        self.leg.host_put(chain, buf)
+    }
+
+    /// **KV 链下沉计划**(engine 执行臂用;宿主满时**先逐最冷再重试**)。
+    ///
+    /// 与 `plan_capacity` 轮零同一条政策：最冷链尾向内削、保护面（本链）整条不动。
+    /// 这口是**执行面兜底** —— 计划面已按宿主容量出票时通常一次成功；
+    /// 盘写失败/账漂时不让 turn 硬崩（`ops.host_relief_blocks` 就是
+    /// “计划曾经乐观/滞后”的指纹，engine 据此打点）。
+    ///
+    /// 宿主关层（0）= 旧行为：直接 `Exhausted`，不静默降级。
+    pub fn plan_kv_offload(&mut self, tail: ChainHash) -> StoreResult<crate::leg::OutPlan> {
+        match crate::leg::plan_offload(&mut self.leg, tail) {
+            Ok(p) => Ok(p),
+            Err(StoreError::Exhausted(why)) => {
+                let Some(need) = self.leg.chain_dev_span(tail) else {
+                    return Err(StoreError::Exhausted(why));
+                };
+                // 保护面 = 本链全部块（已在宿主的那些不能被“让位”删掉 ——
+                // 否则搬完设备的块，链上缺一段，前缀永远拼不回来）
+                let protect = self.leg.chain_blocks(tail);
+                if self.leg.host_relieve(need, &protect)? == 0 {
+                    return Err(StoreError::Exhausted(why));
+                }
+                crate::leg::plan_offload(&mut self.leg, tail)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // ───────────────── 状态腿搬运口(§25.2;与 KV 腿同形:store 出计划与账) ─────────────────
@@ -1406,6 +1446,187 @@ mod tests {
             v.out.iter().all(|o| o.sink() != Sink::Drop),
             "内容不丢优先:不得出 Drop 票:{v:?}"
         );
+    }
+
+    /// **宿主预算单位 = 链块（world × 单页）**：TP 下旧口径（除单平面页）高估
+    /// world 倍 ⇒ 计划按“有位”出票、`lend_slots` 半途撞 `Exhausted`
+    /// （双卡 1M 后第二个长 turn 的硬错，§23.11）。
+    #[test]
+    fn host_free_slots_is_counted_in_chain_slots_under_tp() {
+        let i = inputs();
+        let mut cfg = kv_cfg(64, 32);
+        cfg.host_bytes = 4 * 2 * BLOCK_BYTES; // 4 个链块（每块 = 两平面）
+        let mut r = Rel::open_world(
+            i.clone(),
+            AdmissionPolicy::new(1, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+            2,
+        )
+        .expect("装配 world=2");
+        assert_eq!(r.leg.host_slot_bytes(), 2 * BLOCK_BYTES);
+        assert_eq!(r.leg.host_free_slots(), 4, "预算 8MB / 链块 2MB");
+        let t = toks(32);
+        let mut table = Vec::new();
+        r.ensure_for_len(&mut table, 32).expect("块表");
+        r.register_chain(&t, &table).expect("登记");
+        r.release_table(&mut table).expect("归还");
+        let a = r.leg.tail_hash(&t, 1).expect("身份");
+        r.leg
+            .put_host(a, crate::host::HostBlock::zeroed(2 * BLOCK_BYTES))
+            .expect("入宿主");
+        assert_eq!(r.leg.host_free_slots(), 3, "一块 = 两个平面，不是两格");
+    }
+
+    /// **盘块 = 宿主槽（world × 单页）**：TP 档也能接盘；溢写计划字节必须等于
+    /// 一条链的宿主槽（否则写到盘上的只有半个链块 ⇒ 回填必截断）。
+    #[test]
+    fn disk_block_is_the_host_slot_under_tp() {
+        let mut i = inputs();
+        i.disk_bytes = 8 << 20;
+        let mut cfg = kv_cfg(64, 32);
+        cfg.host_bytes = 2 * 2 * BLOCK_BYTES;
+        let mut r = Rel::open_world(
+            i.clone(),
+            AdmissionPolicy::new(1, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+            2,
+        )
+        .expect("装配 world=2");
+        let at = r
+            .attach_disk("/tmp/owl-disk-test-tp", 4 * 2 * BLOCK_BYTES, 0)
+            .expect("TP 接盘");
+        assert_eq!(at.kv_slots, 4, "4 个链块");
+        let a = ChainHash::new(42);
+        let p = r.disk.as_ref().expect("盘").plan_spill(a).expect("计划");
+        assert_eq!(p.bytes, 2 * BLOCK_BYTES, "一个盘块 = 两个平面");
+        r.disk.as_mut().expect("盘").commit_spill(&p).expect("落账");
+        assert_eq!(r.disk.as_ref().expect("盘").free_slots(), 3);
+    }
+
+    /// **磁盘回填落宿主的兜底**：宿主满 ⇒ 先逐最冷（否则 onload 整单 `Exhausted`）。
+    #[test]
+    fn host_fill_relieves_cold_copy_when_full() {
+        let i = inputs();
+        let mut cfg = kv_cfg(64, 32);
+        cfg.host_bytes = BLOCK_BYTES;
+        let mut r = Rel::open(
+            i.clone(),
+            AdmissionPolicy::new(2, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+        )
+        .expect("装配");
+        let ta = toks(32);
+        let tb: Vec<u32> = (100..132).collect();
+        for t in [&ta, &tb] {
+            let mut table = Vec::new();
+            r.ensure_for_len(&mut table, 32).expect("块表");
+            r.register_chain(t, &table).expect("登记");
+            r.release_table(&mut table).expect("归还");
+        }
+        let a = r.leg.tail_hash(&ta, 1).expect("A 身份");
+        let b = r.leg.tail_hash(&tb, 1).expect("B 身份");
+        r.leg
+            .put_host(a, crate::host::HostBlock::from_bytes(vec![7u8; BLOCK_BYTES]))
+            .expect("A 入宿主");
+        assert_eq!(r.leg.host_free_slots(), 0, "宿主已满");
+        r.host_fill(b, crate::host::HostBlock::from_bytes(vec![9u8; BLOCK_BYTES]))
+            .expect("先逐最冷再落");
+        assert!(r.leg.host_contains(b), "回填内容已落宿主");
+        assert!(!r.leg.host_contains(a), "最冷副本已让位");
+        assert_eq!(r.leg.host_relief_blocks(), 1, "让位入账");
+    }
+
+    /// **轮零：宿主满 ⇒ 先削最冷宿主链，再沉设备链**（不许直接丢新块）。
+    #[test]
+    fn plan_need_prunes_cold_host_chain_to_make_room_for_device_chain() {
+        let i = inputs();
+        let mut cfg = kv_cfg(64, 32);
+        cfg.host_bytes = BLOCK_BYTES; // 宿主只装一个链块
+        let mut r = Rel::open(
+            i.clone(),
+            AdmissionPolicy::new(2, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+        )
+        .expect("装配");
+        let ta = toks(32);
+        let tb: Vec<u32> = (100..132).collect();
+        for t in [&ta, &tb] {
+            let mut table = Vec::new();
+            r.ensure_for_len(&mut table, 32).expect("块表");
+            r.register_chain(t, &table).expect("登记");
+            r.release_table(&mut table).expect("归还");
+        }
+        let a = r.leg.tail_hash(&ta, 1).expect("A 身份");
+        let b = r.leg.tail_hash(&tb, 1).expect("B 身份");
+        r.leg
+            .put_host(a, crate::host::HostBlock::from_bytes(vec![7u8; BLOCK_BYTES]))
+            .expect("A 入宿主");
+        assert_eq!(r.leg.host_free_slots(), 0, "宿主已满");
+
+        let v = r.plan_need(
+            Need { slots: 1, snap_bytes: 0, why: NeedWhy::Pressure },
+            &Protected::default(),
+        );
+        assert!(v.deny.is_none(), "腾过宿主 ⇒ 本轮不 deny:{:?}", v.deny);
+        let drop_at = v.out.iter().position(|o| {
+            matches!(o, EvictOut::Kv { sink: Sink::Drop, chain, .. } if *chain == a)
+        });
+        let host_at = v.out.iter().position(|o| {
+            matches!(o, EvictOut::Kv { sink: Sink::Host, chain, .. } if *chain == b)
+        });
+        assert!(drop_at.is_some(), "应丢最冷宿主链:{v:?}");
+        assert!(host_at.is_some(), "腾出宿主位后应下沉设备链:{v:?}");
+        assert!(drop_at < host_at, "宿主让位票必须先执行:{v:?}");
+    }
+
+    /// **执行面兜底**：计划没预见（直接调 offload）时，宿主满要先逐最冷，
+    /// 不许 `Exhausted` 硬崩（旧行为：第二个长 turn 直接失败）。
+    #[test]
+    fn plan_kv_offload_relieves_host_before_lending_slots() {
+        let i = inputs();
+        let mut cfg = kv_cfg(64, 32);
+        cfg.host_bytes = BLOCK_BYTES;
+        let mut r = Rel::open(
+            i.clone(),
+            AdmissionPolicy::new(2, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+        )
+        .expect("装配");
+        let ta = toks(32);
+        let tb: Vec<u32> = (100..132).collect();
+        for t in [&ta, &tb] {
+            let mut table = Vec::new();
+            r.ensure_for_len(&mut table, 32).expect("块表");
+            r.register_chain(t, &table).expect("登记");
+            r.release_table(&mut table).expect("归还");
+        }
+        let a = r.leg.tail_hash(&ta, 1).expect("A 身份");
+        let b = r.leg.tail_hash(&tb, 1).expect("B 身份");
+        r.leg
+            .attach_pool(crate::leg::PoolLayout {
+                class: crate::leg::BlockClass::KvPage,
+                epoch: 0,
+                pieces: vec![crate::leg::PieceSpec {
+                    buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                    stride_bytes: BLOCK_BYTES,
+                }],
+            })
+            .expect("布局");
+        r.leg
+            .put_host(a, crate::host::HostBlock::from_bytes(vec![7u8; BLOCK_BYTES]))
+            .expect("A 入宿主");
+        assert_eq!(r.leg.host_free_slots(), 0, "宿主已满");
+
+        let p = r.plan_kv_offload(b).expect("先逐最冷再借台");
+        assert_eq!(p.blocks.len(), 1, "B 的一整块拿到票");
+        assert_eq!(r.leg.host_relief_blocks(), 1, "让位块数入账（可观测）");
+        assert!(!r.leg.host_contains(a), "最冷宿主链已被丢");
+        assert_eq!(p.table.len(), 1, "借到 1 个宿主槽台（未提交前 B 仍在设备）");
     }
 
     /// **第三层门(S6)**:状态腿宿主的 Durable 挪去盘;`Transient` **不写盘**。

@@ -250,7 +250,45 @@ pub fn plan_capacity(
     let mut kv_host_room = room.host_kv_slots;
     let mut snap_host_room = room.host_snap_slots;
 
-    // ── 轮一:先下沉(宿主有位就搬,内容不丢) ─────────────────────────────
+    // ── 轮零：宿主满 ⇒ 先腾宿主位（否则轮一无位可出票） ─────────────────────
+    //
+    // 次序与三层级律一致：**能搬盘就搬盘（内容留）** → **再丢最冷（内容真丢）**。
+    // 为什么必须在轮一之前：轮一只在 `host_kv_room` 内出票；宿主满时它一张不出，
+    // 轮二只能丢**新算好的设备块**（更热），而旧的宿主冷链永远躺着 ——
+    // 双卡 1M 实测：上一 turn 的宿主块一直不逐 ⇒ 第二个长 turn 硬错。
+    let mut host_relief = false;
+    let mut disk_kv = room.disk_kv_slots;
+    if kv.host_enabled() && got_slots < kv_goal {
+        let want = (kv_goal - got_slots).max(1);
+        let mut short = want.saturating_sub(kv_host_room);
+        if short > 0 && disk_kv > 0 {
+            // 整链搬盘（与轮 1.5 同判据：半链无复用价值）；执行序在下文 Host 票之前
+            for (tail, span, _) in kv.host_chain_candidates(&picked) {
+                if short == 0 {
+                    break;
+                }
+                if span == 0 || span > disk_kv {
+                    continue;
+                }
+                v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Disk, span });
+                picked.push(tail);
+                disk_kv -= span;
+                kv_host_room += span;
+                short -= span;
+                host_relief = true;
+            }
+        }
+        if short > 0 {
+            // 盘也装不下（或无盘层）⇒ 丢宿主最冷：从链尾向内削，前缀留着
+            for chain in kv.host_prune_candidates(&picked, short) {
+                v.out.push(EvictOut::Kv { chain, sink: Sink::Drop, span: 1 });
+                picked.push(chain);
+                kv_host_room += 1;
+            }
+        }
+    }
+
+    // ── 轮一：先下沉（宿主有位就搬，内容不丢） ─────────────────────────────
     let mut cands: Vec<EvictCandidate> = Vec::new();
     if got_slots < kv_goal {
         let want = (kv_goal - got_slots).max(1);
@@ -320,8 +358,8 @@ pub fn plan_capacity(
     // 换来的是**内容永不先丢**(用户裁决 2026-10-19:不急着丢)。
     //
     // `Transient` 快照照旧不写盘(写 159 MiB 换不回共享价值 ⇒ 只配 Drop)。
-    let mut host_relief = false;
-    if room.disk_kv_slots > 0 || room.disk_snap_slots > 0 {
+    let mut host_relief_host = false;
+    if disk_kv > 0 || room.disk_snap_slots > 0 {
         let mut cands15: Vec<EvictCandidate> = Vec::new();
         if room.disk_kv_slots > 0 {
             // **整链搬盘**(S6.1):只挪宿主里的叶会拆散链 ⇒ 盘上只剩尾部,
@@ -332,7 +370,7 @@ pub fn plan_capacity(
             // ⇒ 同拍可以"设备 → 宿主 → 磁盘"两跳完成;排除掉就永远只能搬"上一拍的宿主"
             // (真机定谳:轮一刚沉的链被 `picked` 挡掉 ⇒ 磁盘票恒零)。
             for (tail, span, last_use) in kv.host_chain_candidates(protect_chains) {
-                if span == 0 || span > room.disk_kv_slots {
+                if span == 0 || span > disk_kv || picked.contains(&tail) {
                     continue;
                 }
                 cands15.push(EvictCandidate {
@@ -366,7 +404,6 @@ pub fn plan_capacity(
                     }),
             );
         }
-        let mut disk_kv = room.disk_kv_slots;
         let mut disk_snap = room.disk_snap_slots;
         for c in order_candidates(policy, cands15, state) {
             if disk_kv == 0 && disk_snap == 0 {
@@ -382,7 +419,7 @@ pub fn plan_capacity(
                     v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Disk, span });
                     picked.push(tail);
                     disk_kv -= span;
-                    host_relief = true;
+                    host_relief_host = true;
                 }
                 Leg::State => {
                     let Some(key) = c.snap else { continue };
@@ -391,7 +428,7 @@ pub fn plan_capacity(
                     }
                     v.out.push(EvictOut::Snap { key, sink: Sink::Disk });
                     disk_snap -= 1;
-                    host_relief = true;
+                    host_relief_host = true;
                 }
             }
         }
@@ -402,7 +439,7 @@ pub fn plan_capacity(
     // **`host_relief` 优先**(内容不丢):本轮已把宿主里最冷的挪去磁盘 ⇒
     // 宿主位下一拍就回来。此时**不做 Drop、不 deny** —— 设备缺口留一拍
     // (节点每拍都跑);代价是那一拍 `ensure_for_len` 可能响亮拒,而丢掉的是内容。
-    if !host_relief && (got_slots < kv_goal || got_snap < snap_goal) {
+    if !host_relief && !host_relief_host && (got_slots < kv_goal || got_snap < snap_goal) {
         let mut cands2: Vec<EvictCandidate> = Vec::new();
         if got_slots < kv_goal {
             // 叶级:丢尾部不动链头(前缀仍可复用)。已出票的链尾已在 `picked` 里。
@@ -449,7 +486,7 @@ pub fn plan_capacity(
     }
 
     // ── ③ 仍不足 ⇒ 拒(不许动活跃面;腾过宿主的一拍不算"凑不够") ──────────
-    if !host_relief && (got_slots < kv_goal || got_snap < snap_goal) {
+    if !host_relief && !host_relief_host && (got_slots < kv_goal || got_snap < snap_goal) {
         let mut why = format!(
             "{} 判据:KV 需求 {} 槽(自由 {}),状态腿需求 {} B;可搬面凑出 {} 槽/{} B(短 {} 槽/{} B);\
              宿主预算 KV {} B/{} 槽、状态腿 {} 张",
