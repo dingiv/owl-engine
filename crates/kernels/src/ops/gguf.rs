@@ -166,6 +166,17 @@ gguf_mmq2_quant_spec_bf16!(GgufMmq2QuantDs4Bf16, crate::family::gguf::MMQ2_QUANT
 gguf_mmq2_quant_spec_bf16!(GgufMmq2QuantD4Bf16, crate::family::gguf::MMQ2_QUANT_D4_BF16);
 
 /// `owl_mmq2_q8_0_j128` 等 8 个(type × J)
+pub struct GgufMmq2Q8_0_J8;
+pub struct GgufMmq2Q4K_J8;
+pub struct GgufMmq2Q5K_J8;
+pub struct GgufMmq2Q6K_J8;
+pub struct GgufMmq2Iq4Xs_J8;
+pub struct GgufMmq2Iq3S_J8;
+pub struct GgufMmq2Iq3Xxs_J8;
+pub struct GgufMmq2Q3K_J8;
+pub struct GgufMmq2Iq2S_J8;
+pub struct GgufMmq2Iq2Xs_J8;
+
 pub struct GgufMmq2Q8_0J64;
 /// 同上
 pub struct GgufMmq2Q8_0J128;
@@ -231,6 +242,16 @@ macro_rules! gguf_mmq2_spec {
     };
 }
 
+gguf_mmq2_spec!(GgufMmq2Q8_0_J8, crate::family::gguf::MMQ2_Q8_0_J8);
+gguf_mmq2_spec!(GgufMmq2Q4K_J8, crate::family::gguf::MMQ2_Q4K_J8);
+gguf_mmq2_spec!(GgufMmq2Q5K_J8, crate::family::gguf::MMQ2_Q5K_J8);
+gguf_mmq2_spec!(GgufMmq2Q6K_J8, crate::family::gguf::MMQ2_Q6K_J8);
+gguf_mmq2_spec!(GgufMmq2Iq4Xs_J8, crate::family::gguf::MMQ2_IQ4XS_J8);
+gguf_mmq2_spec!(GgufMmq2Iq3S_J8, crate::family::gguf::MMQ2_IQ3S_J8);
+gguf_mmq2_spec!(GgufMmq2Iq3Xxs_J8, crate::family::gguf::MMQ2_IQ3XXS_J8);
+gguf_mmq2_spec!(GgufMmq2Q3K_J8, crate::family::gguf::MMQ2_Q3K_J8);
+gguf_mmq2_spec!(GgufMmq2Iq2S_J8, crate::family::gguf::MMQ2_IQ2S_J8);
+gguf_mmq2_spec!(GgufMmq2Iq2Xs_J8, crate::family::gguf::MMQ2_IQ2XS_J8);
 gguf_mmq2_spec!(GgufMmq2Q8_0J64, crate::family::gguf::MMQ2_Q8_0_J64);
 gguf_mmq2_spec!(GgufMmq2Q8_0J128, crate::family::gguf::MMQ2_Q8_0_J128);
 gguf_mmq2_spec!(GgufMmq2Q4KJ64, crate::family::gguf::MMQ2_Q4K_J64);
@@ -748,6 +769,16 @@ pub static MMQ2_QUANT_DS4: KernelMeta = meta_of::<GgufMmq2QuantDs4>();
 pub static MMQ2_QUANT_D4: KernelMeta = meta_of::<GgufMmq2QuantD4>();
 pub static MMQ2_QUANT_DS4_BF16: KernelMeta = meta_of::<GgufMmq2QuantDs4Bf16>();
 pub static MMQ2_QUANT_D4_BF16: KernelMeta = meta_of::<GgufMmq2QuantD4Bf16>();
+pub static MMQ2_Q8_0_J8: KernelMeta = meta_of::<GgufMmq2Q8_0_J8>();
+pub static MMQ2_Q4K_J8: KernelMeta = meta_of::<GgufMmq2Q4K_J8>();
+pub static MMQ2_Q5K_J8: KernelMeta = meta_of::<GgufMmq2Q5K_J8>();
+pub static MMQ2_Q6K_J8: KernelMeta = meta_of::<GgufMmq2Q6K_J8>();
+pub static MMQ2_IQ4XS_J8: KernelMeta = meta_of::<GgufMmq2Iq4Xs_J8>();
+pub static MMQ2_IQ3S_J8: KernelMeta = meta_of::<GgufMmq2Iq3S_J8>();
+pub static MMQ2_IQ3XXS_J8: KernelMeta = meta_of::<GgufMmq2Iq3Xxs_J8>();
+pub static MMQ2_Q3K_J8: KernelMeta = meta_of::<GgufMmq2Q3K_J8>();
+pub static MMQ2_IQ2S_J8: KernelMeta = meta_of::<GgufMmq2Iq2S_J8>();
+pub static MMQ2_IQ2XS_J8: KernelMeta = meta_of::<GgufMmq2Iq2Xs_J8>();
 pub static MMQ2_Q8_0_J64: KernelMeta = meta_of::<GgufMmq2Q8_0J64>();
 pub static MMQ2_Q8_0_J128: KernelMeta = meta_of::<GgufMmq2Q8_0J128>();
 pub static MMQ2_Q4K_J64: KernelMeta = meta_of::<GgufMmq2Q4KJ64>();

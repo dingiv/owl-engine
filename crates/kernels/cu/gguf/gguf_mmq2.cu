@@ -205,6 +205,22 @@ OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j128, GGML_TYPE_IQ3_XXS, 128)
 // 有 8/64 的有用行 ⇒ 4× 的 MMA 浪费;J=16 同样一次读权重(ntx=ceil(8/16)=1),
 // 但只算 16 行 ⇒ 实测 MMQ2 m=8 从 81 µs 降到 ~35 µs(29 MB 张量)。
 
+// ---- J=8(2026-10-21 第三刀):verify 的真实行数就是 8 ⇒ J=8 = 零 MMA 浪费 ----
+//
+// 依据:J=64→J=16 在**同一权重流量**下把 29 MB 张量从 81 µs 压到 35 µs(2.3×)
+// ⇒ 那一档是 **MMA 算力受限**,不是带宽受限。m=8 时 J=16 仍有 8/16 行空转,
+// J=8 正好填满(`ntx = ceil(m/J)` 两档都是 1,权重读一遍不变)。
+OWL_MMQ2_WRAP(owl_mmq2_q8_0_j8, GGML_TYPE_Q8_0, 8)
+OWL_MMQ2_WRAP(owl_mmq2_q4k_j8, GGML_TYPE_Q4_K, 8)
+OWL_MMQ2_WRAP(owl_mmq2_q5k_j8, GGML_TYPE_Q5_K, 8)
+OWL_MMQ2_WRAP(owl_mmq2_q6k_j8, GGML_TYPE_Q6_K, 8)
+OWL_MMQ2_WRAP(owl_mmq2_iq4xs_j8, GGML_TYPE_IQ4_XS, 8)
+OWL_MMQ2_WRAP(owl_mmq2_iq3s_j8, GGML_TYPE_IQ3_S, 8)
+OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j8, GGML_TYPE_IQ3_XXS, 8)
+OWL_MMQ2_WRAP(owl_mmq2_q3k_j8, GGML_TYPE_Q3_K, 8)
+OWL_MMQ2_WRAP(owl_mmq2_iq2s_j8, GGML_TYPE_IQ2_S, 8)
+OWL_MMQ2_WRAP(owl_mmq2_iq2xs_j8, GGML_TYPE_IQ2_XS, 8)
+
 OWL_MMQ2_WRAP(owl_mmq2_q8_0_j16, GGML_TYPE_Q8_0, 16)
 OWL_MMQ2_WRAP(owl_mmq2_q4k_j16, GGML_TYPE_Q4_K, 16)
 OWL_MMQ2_WRAP(owl_mmq2_q5k_j16, GGML_TYPE_Q5_K, 16)
