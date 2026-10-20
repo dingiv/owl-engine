@@ -7,6 +7,7 @@
 //! 跨参耦合(表表达不了的那类)在 `check()` 里覆写:`mask` 的元素数必须
 //! 覆盖 `q_seq_len`(SPEC_DEC 掩码按 `ceil(q/32)` 行组织)。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law, OpError};
 use crate::bootcheck::{CheckCtx};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, RangeRule, ShapeFamily};
@@ -101,6 +102,7 @@ fn check_xqa(ctx: &CheckCtx<'_>) -> Result<(), OpError> {
 /// `owl_xqa_verify` —— spec-verify 注意力(`SPEC_DEC=1`, `M_TILESIZE=32`)
 pub struct XqaVerify;
 
+#[kernel_tags("dom.xqa", "role.attn", "kv.main.fp8", "feat.spec", "phase.verify")]
 impl KernelSpec for XqaVerify {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(xqa::VERIFY_XQA);
@@ -127,6 +129,7 @@ impl KernelSpec for XqaVerify {
 /// `owl_xqa_decode` —— 裸 decode 注意力(第二份实例化 `M_TILESIZE=16`,q=1)
 pub struct XqaDecode;
 
+#[kernel_tags("dom.xqa", "role.attn", "kv.main.fp8", "feat.spec", "phase.decode")]
 impl KernelSpec for XqaDecode {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(xqa::DECODE_XQA);
@@ -148,7 +151,6 @@ impl KernelSpec for XqaDecode {
     }
 }
 
-
 pub static XQA_VERIFY: KernelMeta = meta_of::<XqaVerify>();
 pub static XQA_DECODE: KernelMeta = meta_of::<XqaDecode>();
 
@@ -166,6 +168,7 @@ pub static XQA_DECODE: KernelMeta = meta_of::<XqaDecode>();
 /// `ctx.fi` 缺席),那里 9.4× 于回落核。`dispatch.xqa_prefill` 缺省 false。
 pub struct XqaPrefill;
 
+#[kernel_tags("dom.xqa", "role.attn", "kv.main.fp8", "feat.spec", "phase.prefill")]
 impl KernelSpec for XqaPrefill {
     /// 执行家族(声明驱动路由;**声明面与执行面同一字面量** —— A18 律)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(xqa::PREFILL_XQA);
@@ -195,8 +198,6 @@ impl KernelSpec for XqaPrefill {
 
 pub static XQA_PREFILL: KernelMeta = meta_of::<XqaPrefill>();
 
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[&XQA_VERIFY, &XQA_DECODE, &XQA_PREFILL];
 
 #[cfg(test)]
 mod tests {

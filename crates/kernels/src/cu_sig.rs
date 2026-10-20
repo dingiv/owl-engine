@@ -103,12 +103,13 @@ pub fn cu_params_of(src: &str, name: &str) -> Option<(String, &'static str)> {
         let t = line.trim();
         if t.starts_with("OWL_") && t.contains("KERNEL(") {
             if let Some(rest) = t.split_once('(').map(|x| x.1) {
-                let mut parts = rest.splitn(3, ',');
+                let mut parts = rest.splitn(2, ',');
                 if parts.next().map(|x| x.trim()) == Some(name) {
-                    let params = parts
-                        .nth(1)
-                        .and_then(|p| p.trim().strip_prefix('('))
-                        .and_then(|p| p.strip_suffix(')'))
+                    // 宏实参可能含模板逗号（`owl_ar_copy_bytes_t<__half>, (...)`）
+                    // ⇒ 形参 = **最后一个顶层括号组**，不能按 `splitn(3)` 取第三段。
+                    let params = rest
+                        .rsplit_once('(')
+                        .and_then(|(_, p)| p.strip_suffix(')'))
                         .unwrap_or("");
                     return Some((params.to_string(), "宏"));
                 }

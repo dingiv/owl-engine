@@ -1,11 +1,13 @@
 //! 逐元素 / 视图 / 采样 / 铸边界 生产算子元数据。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
 
 /// `owl_narrow_strided_f16` —— 窄切物化(逐 token 视图;`outer/src_dim/start/out_dim` 四标量)
 pub struct NarrowStridedF16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for NarrowStridedF16 {
     const ENTRY: &'static str = "owl_narrow_strided_f16";
     const SRC: &'static str = "cu/elems/narrow_strided.cu";
@@ -25,6 +27,7 @@ impl KernelSpec for NarrowStridedF16 {
 /// `owl_gemv_dual_f16` —— 双权 GEMV(b/a 投影单发)
 pub struct GemvDualF16;
 
+#[kernel_tags("dom.elem", "role.gemv", "phase.decode")]
 impl KernelSpec for GemvDualF16 {
     const ENTRY: &'static str = "owl_gemv_dual_f16";
     const SRC: &'static str = "cu/elems/gemv_dual_f16.cu";
@@ -48,6 +51,7 @@ impl KernelSpec for GemvDualF16 {
 /// per-row 对称量化(装载期现算),`cols % 16 == 0`(几何侧断言)。
 pub struct GemvI8wF16;
 
+#[kernel_tags("dom.elem", "role.gemv", "quant.int8", "feat.head", "phase.decode")]
 impl KernelSpec for GemvI8wF16 {
     const ENTRY: &'static str = "owl_gemv_i8w_f16";
     const SRC: &'static str = "cu/elems/gemv_i8w_f16.cu";
@@ -67,6 +71,7 @@ impl KernelSpec for GemvI8wF16 {
 /// `owl_add_f16` —— 逐元素加(宏实例化;fc 部分和累加)
 pub struct AddF16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for AddF16 {
     const ENTRY: &'static str = "owl_add_f16";
     const SRC: &'static str = "cu/elems/add.cu";
@@ -84,6 +89,7 @@ impl KernelSpec for AddF16 {
 /// `owl_add_bf16` —— 同上(BF16 域;草稿 fc 累加)
 pub struct AddBf16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for AddBf16 {
     const ENTRY: &'static str = "owl_add_bf16";
     const SRC: &'static str = "cu/elems/add.cu";
@@ -101,6 +107,7 @@ impl KernelSpec for AddBf16 {
 /// `owl_sigmoid_f16` —— 逐元素 sigmoid
 pub struct SigmoidF16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for SigmoidF16 {
     const ENTRY: &'static str = "owl_sigmoid_f16";
     const SRC: &'static str = "cu/elems/sigmoid.cu";
@@ -117,6 +124,7 @@ impl KernelSpec for SigmoidF16 {
 /// `owl_sigmoid_gate_mul_f16` —— attention 门融合(gate 先 sigmoid 再乘 x)
 pub struct SigmoidGateMulF16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for SigmoidGateMulF16 {
     const ENTRY: &'static str = "owl_sigmoid_gate_mul_f16";
     const SRC: &'static str = "cu/elems/sigmoid_gate_mul_f16.cu";
@@ -134,6 +142,7 @@ impl KernelSpec for SigmoidGateMulF16 {
 /// `owl_cast_f16_bf16` —— 铸边界(f16 → bf16;入草稿)
 pub struct CastF16Bf16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for CastF16Bf16 {
     const ENTRY: &'static str = "owl_cast_f16_bf16";
     const SRC: &'static str = "cu/elems/cast.cu";
@@ -150,6 +159,7 @@ impl KernelSpec for CastF16Bf16 {
 /// `owl_cast_bf16_f16` —— 铸边界(bf16 → f16;出草稿)
 pub struct CastBf16F16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for CastBf16F16 {
     const ENTRY: &'static str = "owl_cast_bf16_f16";
     const SRC: &'static str = "cu/elems/cast.cu";
@@ -173,6 +183,7 @@ pub const CONCAT_ROWS_SLOTS: usize = 8;
 /// `owl_concat_rows_f16` —— 8 路行拼接(arity 8 = 固定)
 pub struct ConcatRowsF16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for ConcatRowsF16 {
     const ENTRY: &'static str = "owl_concat_rows_f16";
     const SRC: &'static str = "cu/elems/concat.cu";
@@ -198,6 +209,7 @@ impl KernelSpec for ConcatRowsF16 {
 /// `owl_concat_rows_f32` —— 同上(f32;首轮拼接)
 pub struct ConcatRowsF32;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for ConcatRowsF32 {
     const ENTRY: &'static str = "owl_concat_rows_f32";
     const SRC: &'static str = "cu/elems/concat.cu";
@@ -223,6 +235,7 @@ impl KernelSpec for ConcatRowsF32 {
 /// `owl_embed_f16` —— embedding 查表(ids 为 f32 张量:设备侧索引)
 pub struct EmbedF16;
 
+#[kernel_tags("dom.elem", "role.embed")]
 impl KernelSpec for EmbedF16 {
     const ENTRY: &'static str = "owl_embed_f16";
     const SRC: &'static str = "cu/elems/embed_f32.cu";
@@ -240,6 +253,7 @@ impl KernelSpec for EmbedF16 {
 /// `owl_argmax_f32idx_f16` —— 设备侧贪心采样(argmax;输出 f32 承载索引)
 pub struct ArgmaxF32IdxF16;
 
+#[kernel_tags("dom.elem", "role.sample", "phase.decode")]
 impl KernelSpec for ArgmaxF32IdxF16 {
     const ENTRY: &'static str = "owl_argmax_f32idx_f16";
     const SRC: &'static str = "cu/elems/argmax_f16.cu";
@@ -257,6 +271,7 @@ impl KernelSpec for ArgmaxF32IdxF16 {
 /// `owl_topk16_f16` —— 逐行 top-16(DFlash2 草稿;单缓冲 [rows,32])
 pub struct Topk16F16;
 
+#[kernel_tags("dom.elem", "role.sample", "phase.decode")]
 impl KernelSpec for Topk16F16 {
     const ENTRY: &'static str = "owl_topk16_f16";
     const SRC: &'static str = "cu/elems/dflash_topk.cu";
@@ -278,6 +293,7 @@ pub static GEMV_I8W_F16: KernelMeta = meta_of::<GemvI8wF16>();
 /// 模型激活是 bf16,省掉两次 cast 节点;语义/几何与 f16 版逐字相同)
 pub struct GemvI8wBf16;
 
+#[kernel_tags("dom.elem", "role.gemv", "quant.int8", "feat.head", "phase.decode")]
 impl KernelSpec for GemvI8wBf16 {
     const ENTRY: &'static str = "owl_gemv_i8w_bf16";
     const SRC: &'static str = "cu/elems/gemv_i8w_f16.cu";
@@ -312,6 +328,7 @@ pub static TOPK16_F16: KernelMeta = meta_of::<Topk16F16>();
 /// (2026-10-14 D2:旧单块核 grid=(rows,1,1) 只用 7/132 SM)
 pub struct Topk16SplitF16;
 
+#[kernel_tags("dom.elem", "role.sample", "phase.decode")]
 impl KernelSpec for Topk16SplitF16 {
     const ENTRY: &'static str = "owl_topk16_split_f16";
     const SRC: &'static str = "cu/elems/dflash_topk.cu";
@@ -334,6 +351,7 @@ pub static TOPK16_SPLIT_F16: KernelMeta = meta_of::<Topk16SplitF16>();
 /// nparts×16 候选 → top-16,输出布局与卷 `owl_topk16_f16` 逐位一致
 pub struct Topk16MergeF16;
 
+#[kernel_tags("dom.elem", "role.sample", "phase.decode")]
 impl KernelSpec for Topk16MergeF16 {
     const ENTRY: &'static str = "owl_topk16_merge_f16";
     const SRC: &'static str = "cu/elems/dflash_topk.cu";
@@ -351,16 +369,15 @@ impl KernelSpec for Topk16MergeF16 {
 
 pub static TOPK16_MERGE_F16: KernelMeta = meta_of::<Topk16MergeF16>();
 
-
 // ============================================================================
 // `elems.rs` 域 R1 补表
 // (R1 补表 2026-10-13:声明从登记表派生,签名由 `op_tables` 门逐参互证)
 // ============================================================================
 
-
 /// `owl_add_f32` —— add.cu(R1 补表)
 pub struct AddF32;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for AddF32 {
     const ENTRY: &'static str = "owl_add_f32";
     const SRC: &'static str = "cu/elems/add.cu";
@@ -375,10 +392,10 @@ impl KernelSpec for AddF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_mul_f32` —— mul.cu(R1 补表)
 pub struct MulF32;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for MulF32 {
     const ENTRY: &'static str = "owl_mul_f32";
     const SRC: &'static str = "cu/elems/mul.cu";
@@ -393,10 +410,10 @@ impl KernelSpec for MulF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_mul_f16` —— mul.cu(R1 补表)
 pub struct MulF16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for MulF16 {
     const ENTRY: &'static str = "owl_mul_f16";
     const SRC: &'static str = "cu/elems/mul.cu";
@@ -411,10 +428,10 @@ impl KernelSpec for MulF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_mul_bf16` —— mul.cu(R1 补表)
 pub struct MulBf16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for MulBf16 {
     const ENTRY: &'static str = "owl_mul_bf16";
     const SRC: &'static str = "cu/elems/mul.cu";
@@ -429,10 +446,10 @@ impl KernelSpec for MulBf16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_sigmoid_f32` —— sigmoid.cu(R1 补表)
 pub struct SigmoidF32;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for SigmoidF32 {
     const ENTRY: &'static str = "owl_sigmoid_f32";
     const SRC: &'static str = "cu/elems/sigmoid.cu";
@@ -446,10 +463,10 @@ impl KernelSpec for SigmoidF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_silu_f32` —— silu.cu(R1 补表)
 pub struct SiluF32;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for SiluF32 {
     const ENTRY: &'static str = "owl_silu_f32";
     const SRC: &'static str = "cu/elems/silu.cu";
@@ -463,10 +480,10 @@ impl KernelSpec for SiluF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_silu_f16` —— silu.cu(R1 补表)
 pub struct SiluF16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for SiluF16 {
     const ENTRY: &'static str = "owl_silu_f16";
     const SRC: &'static str = "cu/elems/silu.cu";
@@ -480,10 +497,10 @@ impl KernelSpec for SiluF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_matmul_f32` —— matmul.cu(R1 补表)
 pub struct MatmulF32;
 
+#[kernel_tags("dom.elem", "role.gemm")]
 impl KernelSpec for MatmulF32 {
     const ENTRY: &'static str = "owl_matmul_f32";
     const SRC: &'static str = "cu/elems/matmul.cu";
@@ -500,10 +517,10 @@ impl KernelSpec for MatmulF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_matmul_nt_f32` —— matmul.cu(R1 补表)
 pub struct MatmulNtF32;
 
+#[kernel_tags("dom.elem", "role.gemm")]
 impl KernelSpec for MatmulNtF32 {
     const ENTRY: &'static str = "owl_matmul_nt_f32";
     const SRC: &'static str = "cu/elems/matmul.cu";
@@ -520,10 +537,10 @@ impl KernelSpec for MatmulNtF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_cast_f16_f32` —— cast.cu(R1 补表)
 pub struct CastF16F32;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for CastF16F32 {
     const ENTRY: &'static str = "owl_cast_f16_f32";
     const SRC: &'static str = "cu/elems/cast.cu";
@@ -537,10 +554,10 @@ impl KernelSpec for CastF16F32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_cast_f32_f16` —— cast.cu(R1 补表)
 pub struct CastF32F16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for CastF32F16 {
     const ENTRY: &'static str = "owl_cast_f32_f16";
     const SRC: &'static str = "cu/elems/cast.cu";
@@ -554,10 +571,10 @@ impl KernelSpec for CastF32F16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_embed_f32` —— embed_f32.cu(R1 补表)
 pub struct EmbedF32;
 
+#[kernel_tags("dom.elem", "role.embed")]
 impl KernelSpec for EmbedF32 {
     const ENTRY: &'static str = "owl_embed_f32";
     const SRC: &'static str = "cu/elems/embed_f32.cu";
@@ -572,10 +589,10 @@ impl KernelSpec for EmbedF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_narrow_strided_f32` —— narrow_strided.cu(R1 补表)
 pub struct NarrowStridedF32;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for NarrowStridedF32 {
     const ENTRY: &'static str = "owl_narrow_strided_f32";
     const SRC: &'static str = "cu/elems/narrow_strided.cu";
@@ -592,10 +609,10 @@ impl KernelSpec for NarrowStridedF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_rope_half_partial_f16` —— rope_f32.cu(R1 补表)
 pub struct RopeHalfPartialF16;
 
+#[kernel_tags("dom.elem", "role.rope", "feat.vision")]
 impl KernelSpec for RopeHalfPartialF16 {
     const ENTRY: &'static str = "owl_rope_half_partial_f16";
     const SRC: &'static str = "cu/elems/rope_f32.cu";
@@ -614,10 +631,10 @@ impl KernelSpec for RopeHalfPartialF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_rope_half_partial_f32` —— rope_f32.cu(R1 补表)
 pub struct RopeHalfPartialF32;
 
+#[kernel_tags("dom.elem", "role.rope", "feat.vision")]
 impl KernelSpec for RopeHalfPartialF32 {
     const ENTRY: &'static str = "owl_rope_half_partial_f32";
     const SRC: &'static str = "cu/elems/rope_f32.cu";
@@ -636,10 +653,10 @@ impl KernelSpec for RopeHalfPartialF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `probe_ts_f16` —— ts_probe.cu(R1 补表)
 pub struct ProbeTsF16;
 
+#[kernel_tags("dom.elem", "role.elem")]
 impl KernelSpec for ProbeTsF16 {
     const ENTRY: &'static str = "probe_ts_f16";
     const SRC: &'static str = "cu/probe/ts_probe.cu";
@@ -675,7 +692,6 @@ pub static PROBE_TS_F16: KernelMeta = meta_of::<ProbeTsF16>();
 pub static QUANT_INT8_ROW_F16: KernelMeta = meta_of::<QuantInt8RowF16>();
 pub static QUANT_INT8_ROW_BF16: KernelMeta = meta_of::<QuantInt8RowBf16>();
 
-/// 本域全部已建表算子
 // ============================================================================
 // W4A8 前置:激活 per-token int8 量化(S1c;2026-10-16)
 // ============================================================================
@@ -694,6 +710,7 @@ pub static QUANT_INT8_ROW_BF16: KernelMeta = meta_of::<QuantInt8RowBf16>();
 /// 同一块要能同时满足两算子的 dtype/rank 事实门)。
 pub struct QuantInt8RowF16;
 
+#[kernel_tags("dom.elem", "role.elem", "quant.w4a8", "phase.decode", "phase.load")]
 impl KernelSpec for QuantInt8RowF16 {
     const ENTRY: &'static str = "owl_quant_int8_row_f16";
     const SRC: &'static str = "cu/elems/quant_int8_row.cu";
@@ -718,6 +735,7 @@ impl KernelSpec for QuantInt8RowF16 {
 /// `owl_quant_int8_row_bf16` —— 同上,入 f16 → bf16(草稿/DFlash2 路备用)
 pub struct QuantInt8RowBf16;
 
+#[kernel_tags("dom.elem", "role.elem", "quant.w4a8", "phase.decode", "phase.load")]
 impl KernelSpec for QuantInt8RowBf16 {
     const ENTRY: &'static str = "owl_quant_int8_row_bf16";
     const SRC: &'static str = "cu/elems/quant_int8_row.cu";
@@ -733,44 +751,6 @@ impl KernelSpec for QuantInt8RowBf16 {
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
-
-pub static METAS: &[&KernelMeta] = &[
-    &NARROW_STRIDED_F16,
-    &GEMV_DUAL_F16,
-    &GEMV_I8W_F16,
-    &GEMV_I8W_BF16,
-    &ADD_F16,
-    &ADD_BF16,
-    &SIGMOID_F16,
-    &SIGMOID_GATE_MUL_F16,
-    &CAST_F16_BF16,
-    &CAST_BF16_F16,
-    &CONCAT_ROWS_F16,
-    &CONCAT_ROWS_F32,
-    &EMBED_F16,
-    &ARGMAX_F32IDX_F16,
-    &TOPK16_F16,
-    &TOPK16_SPLIT_F16,
-    &TOPK16_MERGE_F16,
-    &OWL_ADD_F32,
-    &OWL_MUL_F32,
-    &OWL_MUL_F16,
-    &OWL_MUL_BF16,
-    &OWL_SIGMOID_F32,
-    &OWL_SILU_F32,
-    &OWL_SILU_F16,
-    &OWL_MATMUL_F32,
-    &OWL_MATMUL_NT_F32,
-    &OWL_CAST_F16_F32,
-    &OWL_CAST_F32_F16,
-    &OWL_EMBED_F32,
-    &OWL_NARROW_STRIDED_F32,
-    &OWL_ROPE_HALF_PARTIAL_F16,
-    &OWL_ROPE_HALF_PARTIAL_F32,
-    &PROBE_TS_F16,
-    &QUANT_INT8_ROW_F16,
-    &QUANT_INT8_ROW_BF16,
-];
 
 #[cfg(test)]
 mod tests {

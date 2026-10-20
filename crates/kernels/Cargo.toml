@@ -36,6 +36,8 @@ owl-cuda = { path = "../backends/cuda" }
 owl-macros = { path = "../macros" }
 
 [dependencies]
+# 算子 tag 注入属性宏(`#[kernel_tags]`;仅编译期,零运行期依赖)
+owl-macros = { path = "../macros" }
 # 官方 cudarc:仅 device/cublas feature 使用(Exec/家族发射;feature 化,
 # A4 纪律:非后端 crate 引源码之家时不拖 CUDA 链接)
 # nvrtc feature 仅为 Ptx 类型(load_module 入参;纯数据包装,零运行时编译)
@@ -45,3 +47,8 @@ cudarc = { version = "0.19", default-features = false, optional = true, features
 # marlin repack(compressed-tensors → marlin 布局;weight_packed LSB-first)
 rayon = { version = "1", optional = true }
 half = { version = "2", optional = true }
+
+[build-dependencies]
+# tags.toml → KernelTag / KERNEL_TAGS 生成（构建期一次；不污染 lib 依赖面）
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+serde = { version = "1", features = ["derive"] }

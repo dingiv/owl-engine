@@ -6,12 +6,14 @@
 //!
 //! 槽序权威历史 = `client::fi_sig::SIG`;现在唯一真源 = 本表。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, ShapeFamily};
 
 /// `flashinfer_prefill_paged_fp8kv` —— paged prefill(fp8 e4m3 影子池)。
 pub struct FiPrefillFp8kv;
 
+#[kernel_tags("dom.flashinfer", "role.attn", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for FiPrefillFp8kv {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
@@ -60,13 +62,13 @@ impl KernelSpec for FiPrefillFp8kv {
     };
 }
 
-
 /// `flashinfer_prefill_paged_f16` —— paged prefill(**f16 主池**;fp8kv 孪生)。
 ///
 /// 槽序与 fp8kv 版逐位同形(适配器同一 plan;只有池元素宽不同)——
 /// 两者共享 `client::fi_sig::SIG`,故本表 PARAMS 除池 dtype 外逐字一致。
 pub struct FiPrefillF16;
 
+#[kernel_tags("dom.flashinfer", "role.attn", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for FiPrefillF16 {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
@@ -111,11 +113,9 @@ impl KernelSpec for FiPrefillF16 {
     };
 }
 
-
 pub static PREFILL_FI_F16: KernelMeta = meta_of::<FiPrefillF16>();
 
 pub static PREFILL_FI_FP8KV: KernelMeta = meta_of::<FiPrefillFp8kv>();
-
 
 // ============================================================================
 // 视觉塔注意力:ragged **非因果** prefill(2026-10-15)
@@ -126,6 +126,7 @@ pub static PREFILL_FI_FP8KV: KernelMeta = meta_of::<FiPrefillFp8kv>();
 /// `flashinfer_attn_ragged_f16` —— 非因果 varlen 自注意力(单图;dense K/V;hd ∈ {64})
 pub struct FiAttnRaggedF16;
 
+#[kernel_tags("dom.flashinfer", "role.attn", "phase.decode")]
 impl KernelSpec for FiAttnRaggedF16 {
     /// 家族 id = **FI 族**(= `FiRuntime::ID`,其值就是 paged f16 的入口名 ——
     /// 族 id 与"首个入口名"同源的既定语汇,勿把它当算子名读)
@@ -153,9 +154,6 @@ impl KernelSpec for FiAttnRaggedF16 {
 
 pub static FI_ATTN_RAGGED_F16: KernelMeta = meta_of::<FiAttnRaggedF16>();
 
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] =
-    &[&PREFILL_FI_FP8KV, &PREFILL_FI_F16, &FI_ATTN_RAGGED_F16];
 
 #[cfg(test)]
 mod tests {

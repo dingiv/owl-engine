@@ -30,6 +30,10 @@
 use crate::contract::{Arg, Dtype, Law, OpError, OpId};
 use crate::bootcheck::{BootCheck, CheckCtx};
 
+// 构建期 tag 词表(`tags.toml` → `$OUT_DIR/kernel_tags.rs`;2026-10-20)。
+// 生成物定义 `KernelTag` / `KERNEL_TAGS` / `tag_mask`;本模块只消费。
+include!(concat!(env!("OUT_DIR"), "/kernel_tags.rs"));
+
 // ============================================================================
 // §1 参数表词汇
 // ============================================================================
@@ -503,6 +507,11 @@ pub trait KernelSpec: 'static {
     const DETERMINISM: Determinism = Determinism::Unassessed;
     /// 装配期自检(独立 oracle;缺省无)
     const SELFCHECK: Option<&'static dyn BootCheck> = None;
+    /// **分面 tag**(2026-10-20;由 `#[kernel_tags(...)]` 属性宏注入)。
+    ///
+    /// tag 住算子声明处,随 [`KernelMeta`] 进编译期表;运行时只按 tag 过滤/
+    /// 审计,不再手抄算子名清单。生产算子必须至少 1 个 tag(测试门锁)。
+    const TAGS: &'static [KernelTag] = &[];
 
     /// 运行期检查(L3)。缺省 = 由 [`PARAMS`](Self::PARAMS) 自动生成;
     /// 只有**跨参耦合**的算子覆写(如 XQA 的 `q_seq_len ↔ mask` 耦合)。
@@ -527,6 +536,7 @@ pub const fn meta_of<T: KernelSpec>() -> KernelMeta {
         determinism: T::DETERMINISM,
         check: T::check,
         selfcheck: T::SELFCHECK,
+        tags: T::TAGS,
     }
 }
 
@@ -545,6 +555,8 @@ pub struct KernelMeta {
     /// L3 检查函数(`<T as KernelSpec>::check` 的 fn 指针)
     pub check: fn(&CheckCtx<'_>) -> Result<(), OpError>,
     pub selfcheck: Option<&'static dyn BootCheck>,
+    /// 分面 tag(声明处注入;空 = 未打 tag —— 生产算子测试门拒)
+    pub tags: &'static [KernelTag],
 }
 
 impl std::fmt::Debug for KernelMeta {
@@ -559,6 +571,7 @@ impl std::fmt::Debug for KernelMeta {
             .field("capture", &self.capture)
             .field("determinism", &self.determinism)
             .field("selfcheck", &self.selfcheck.is_some())
+            .field("tags", &self.tags.iter().map(|t| t.as_str()).collect::<Vec<_>>())
             .finish()
     }
 }
@@ -567,6 +580,21 @@ impl KernelMeta {
     /// 是否家族算子(非原生)
     pub fn is_family(&self) -> bool {
         self.family.0 != crate::spec::NATIVE
+    }
+
+    /// 是否带某 tag(O(tags);tag 数 ≤64)
+    pub fn has_tag(&self, tag: KernelTag) -> bool {
+        self.tags.contains(&tag)
+    }
+
+    /// tag 位掩码(热路径/集合比较用)
+    pub fn tag_mask(&self) -> u64 {
+        tag_mask(self.tags)
+    }
+
+    /// tag id 列表(诊断/CLI 用)
+    pub fn tag_ids(&self) -> Vec<&'static str> {
+        self.tags.iter().map(|t| t.as_str()).collect()
     }
 
     /// 槽序 token 序列(由 [`PARAMS`](Self::params) 派生 —— 零第二份手抄)

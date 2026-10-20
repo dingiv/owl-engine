@@ -9,6 +9,7 @@
 //! payload 槽 rank 声明 0(显式阶数无关:AR 挂在任意算子输出上);
 //! staging 两槽(own/peer)是**字节块**(U8)—— 它们是 VMM 分配的裸块。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
 
@@ -18,6 +19,7 @@ use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec,
 
 /// `owl_comm_ar_stage_f16`
 pub struct CommArStageF16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArStageF16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_STAGE);
     const ENTRY: &'static str = "owl_comm_ar_stage_f16";
@@ -38,6 +40,7 @@ impl KernelSpec for CommArStageF16 {
 
 /// `owl_comm_ar_stage_bf16`
 pub struct CommArStageBf16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArStageBf16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_STAGE);
     const ENTRY: &'static str = "owl_comm_ar_stage_bf16";
@@ -60,6 +63,7 @@ impl KernelSpec for CommArStageBf16 {
 /// 
 /// 与常规档同协议/同几何:数据面换成 e4m3(1B/元素 + 64 元素/尺度 f16)。
 pub struct CommArStageF8F16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArStageF8F16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_STAGE);
     const ENTRY: &'static str = "owl_comm_ar_stage_f8_f16";
@@ -81,6 +85,7 @@ impl KernelSpec for CommArStageF8F16 {
 /// 
 /// 与常规档同协议/同几何:数据面换成 e4m3(1B/元素 + 64 元素/尺度 f16)。
 pub struct CommArStageF8Bf16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArStageF8Bf16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_STAGE);
     const ENTRY: &'static str = "owl_comm_ar_stage_f8_bf16";
@@ -101,6 +106,7 @@ impl KernelSpec for CommArStageF8Bf16 {
 
 /// `owl_comm_ar_stage_f32`
 pub struct CommArStageF32;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArStageF32 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_STAGE);
     const ENTRY: &'static str = "owl_comm_ar_stage_f32";
@@ -125,6 +131,7 @@ impl KernelSpec for CommArStageF32 {
 
 /// `owl_comm_ar_reduce_f16`
 pub struct CommArReduceF16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArReduceF16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_REDUCE);
     const ENTRY: &'static str = "owl_comm_ar_reduce_f16";
@@ -145,6 +152,7 @@ impl KernelSpec for CommArReduceF16 {
 
 /// `owl_comm_ar_reduce_bf16`
 pub struct CommArReduceBf16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArReduceBf16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_REDUCE);
     const ENTRY: &'static str = "owl_comm_ar_reduce_bf16";
@@ -165,6 +173,7 @@ impl KernelSpec for CommArReduceBf16 {
 
 /// `owl_comm_ar_reduce_f32`
 pub struct CommArReduceF32;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArReduceF32 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_REDUCE);
     const ENTRY: &'static str = "owl_comm_ar_reduce_f32";
@@ -187,6 +196,7 @@ impl KernelSpec for CommArReduceF32 {
 /// 
 /// 与常规档同协议/同几何:数据面换成 e4m3(1B/元素 + 64 元素/尺度 f16)。
 pub struct CommArReduceF8F16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArReduceF8F16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_REDUCE);
     const ENTRY: &'static str = "owl_comm_ar_reduce_f8_f16";
@@ -208,6 +218,7 @@ impl KernelSpec for CommArReduceF8F16 {
 /// 
 /// 与常规档同协议/同几何:数据面换成 e4m3(1B/元素 + 64 元素/尺度 f16)。
 pub struct CommArReduceF8Bf16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArReduceF8Bf16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_REDUCE);
     const ENTRY: &'static str = "owl_comm_ar_reduce_f8_bf16";
@@ -232,6 +243,7 @@ impl KernelSpec for CommArReduceF8Bf16 {
 
 /// `owl_comm_ar_1stage_f16`(out 就是本端槽;peer_data 是对端槽的别名)
 pub struct CommAr1StageF16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommAr1StageF16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_1STAGE);
     const ENTRY: &'static str = "owl_comm_ar_1stage_f16";
@@ -251,6 +263,7 @@ impl KernelSpec for CommAr1StageF16 {
 
 /// `owl_comm_ar_1stage_bf16`
 pub struct CommAr1StageBf16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommAr1StageBf16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_1STAGE);
     const ENTRY: &'static str = "owl_comm_ar_1stage_bf16";
@@ -270,6 +283,7 @@ impl KernelSpec for CommAr1StageBf16 {
 
 /// `owl_comm_ar_1stage_f32`
 pub struct CommAr1StageF32;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommAr1StageF32 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_1STAGE);
     const ENTRY: &'static str = "owl_comm_ar_1stage_f32";
@@ -297,6 +311,7 @@ impl KernelSpec for CommAr1StageF32 {
 
 /// `owl_comm_ar_fused_f16`
 pub struct CommArFusedF16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArFusedF16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_FUSED);
     const ENTRY: &'static str = "owl_comm_ar_fused_f16";
@@ -318,6 +333,7 @@ impl KernelSpec for CommArFusedF16 {
 
 /// `owl_comm_ar_fused_bf16`
 pub struct CommArFusedBf16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArFusedBf16 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_FUSED);
     const ENTRY: &'static str = "owl_comm_ar_fused_bf16";
@@ -339,6 +355,7 @@ impl KernelSpec for CommArFusedBf16 {
 
 /// `owl_comm_ar_fused_f32`
 pub struct CommArFusedF32;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
 impl KernelSpec for CommArFusedF32 {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_FUSED);
     const ENTRY: &'static str = "owl_comm_ar_fused_f32";
@@ -376,23 +393,3 @@ pub static AR_STAGE_F8_F16: KernelMeta = meta_of::<CommArStageF8F16>();
 pub static AR_STAGE_F8_BF16: KernelMeta = meta_of::<CommArStageF8Bf16>();
 pub static AR_REDUCE_F8_F16: KernelMeta = meta_of::<CommArReduceF8F16>();
 pub static AR_REDUCE_F8_BF16: KernelMeta = meta_of::<CommArReduceF8Bf16>();
-
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[
-    &AR_STAGE_F8_F16,
-    &AR_STAGE_F8_BF16,
-    &AR_REDUCE_F8_F16,
-    &AR_REDUCE_F8_BF16,
-    &AR_STAGE_F16,
-    &AR_STAGE_BF16,
-    &AR_STAGE_F32,
-    &AR_REDUCE_F16,
-    &AR_REDUCE_BF16,
-    &AR_REDUCE_F32,
-    &AR_1STAGE_F16,
-    &AR_1STAGE_BF16,
-    &AR_1STAGE_F32,
-    &AR_FUSED_F16,
-    &AR_FUSED_BF16,
-    &AR_FUSED_F32,
-];

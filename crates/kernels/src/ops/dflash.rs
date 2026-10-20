@@ -2,11 +2,13 @@
 
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
+use owl_macros::kernel_tags;
 
 /// `owl_dflash_conv_bf16` —— 分组动态深度 2-tap 卷积
 /// (delta [T,2,2,G] side-major + base [2,2,H];位置掩码 t%block;group=16 烘焙)
 pub struct DflashConvBf16;
 
+#[kernel_tags("dom.dflash", "feat.dflash", "phase.propose", "role.elem")]
 impl KernelSpec for DflashConvBf16 {
     const ENTRY: &'static str = "owl_dflash_conv_bf16";
     const SRC: &'static str = "cu/dflash/dflash_conv.cu";
@@ -30,6 +32,7 @@ impl KernelSpec for DflashConvBf16 {
 /// (单缓冲 [S·(K·K+1)]:toks + scores;码本原生 BF16)
 pub struct DflashSelectBf16;
 
+#[kernel_tags("dom.dflash", "feat.dflash", "phase.propose", "role.sample")]
 impl KernelSpec for DflashSelectBf16 {
     const ENTRY: &'static str = "owl_dflash_select_bf16";
     const SRC: &'static str = "cu/dflash/dflash_select.cu";
@@ -53,16 +56,15 @@ impl KernelSpec for DflashSelectBf16 {
 pub static DFLASH_CONV_BF16: KernelMeta = meta_of::<DflashConvBf16>();
 pub static DFLASH_SELECT_BF16: KernelMeta = meta_of::<DflashSelectBf16>();
 
-
 // ============================================================================
 // `dflash.rs` 域 R1 补表
 // (R1 补表 2026-10-13:声明从登记表派生,签名由 `op_tables` 门逐参互证)
 // ============================================================================
 
-
 /// `owl_dflash_conv_f16` —— dflash_conv.cu(R1 补表)
 pub struct DflashConvF16;
 
+#[kernel_tags("dom.dflash", "feat.dflash", "phase.propose", "role.elem")]
 impl KernelSpec for DflashConvF16 {
     const ENTRY: &'static str = "owl_dflash_conv_f16";
     const SRC: &'static str = "cu/dflash/dflash_conv.cu";
@@ -84,10 +86,10 @@ impl KernelSpec for DflashConvF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_dflash_select_f16` —— dflash_select.cu(R1 补表)
 pub struct DflashSelectF16;
 
+#[kernel_tags("dom.dflash", "feat.dflash", "phase.propose", "role.sample")]
 impl KernelSpec for DflashSelectF16 {
     const ENTRY: &'static str = "owl_dflash_select_f16";
     const SRC: &'static str = "cu/dflash/dflash_select.cu";
@@ -110,9 +112,3 @@ impl KernelSpec for DflashSelectF16 {
 
 pub static OWL_DFLASH_CONV_F16: KernelMeta = meta_of::<DflashConvF16>();
 pub static OWL_DFLASH_SELECT_F16: KernelMeta = meta_of::<DflashSelectF16>();
-
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[&DFLASH_CONV_BF16, &DFLASH_SELECT_BF16,
-    &OWL_DFLASH_CONV_F16,
-    &OWL_DFLASH_SELECT_F16,
-];

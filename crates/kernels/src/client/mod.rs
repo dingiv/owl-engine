@@ -334,7 +334,12 @@ mod tests {
             crate::family::comm::asset::FUSED_F32,
         ]);
         #[cfg(feature = "cublas")]
-        want.extend([crate::family::cublas::GEMM_F16, crate::family::cublas::GEMM_BF16]);
+        want.extend([
+            crate::family::cublas::GEMM_F16,
+            crate::family::cublas::GEMM_BF16,
+            // 写列窗臂(W-2d):有独立 PARSE_SLOTS_DST;此前漏登覆盖门
+            crate::family::cublas::GEMM_F16_DST,
+        ]);
         #[cfg(feature = "marlin")]
         want.extend([
             crate::family::marlin::GEMM_W4A16,

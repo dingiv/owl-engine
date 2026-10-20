@@ -1,11 +1,13 @@
 //! 装载域生产算子元数据(ct packed → marlin B 设备重排)。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
 
 /// `owl_ct_repack_u32` —— AWQ 装载线的设备侧权重重排(**非轮内**;装载期一次)
 pub struct CtRepackU32;
 
+#[kernel_tags("dom.load", "phase.load", "role.elem")]
 impl KernelSpec for CtRepackU32 {
     const ENTRY: &'static str = "owl_ct_repack_u32";
     const SRC: &'static str = "cu/load/marlin_repack_ct.cu";
@@ -30,6 +32,7 @@ pub static CT_REPACK_U32: KernelMeta = meta_of::<CtRepackU32>();
 /// 参照实现 = `family::marlin::repack::pack_marlin_b_a8`(真机对拍验证过)。
 pub struct CtRepackA8U32;
 
+#[kernel_tags("dom.load", "phase.load", "role.elem", "quant.w4a8")]
 impl KernelSpec for CtRepackA8U32 {
     const ENTRY: &'static str = "owl_ct_repack_a8_u32";
     const SRC: &'static str = "cu/load/marlin_repack_ct_a8.cu";
@@ -56,6 +59,7 @@ pub static CT_REPACK_A8_U32: KernelMeta = meta_of::<CtRepackA8U32>();
 /// non_family_out_slot_is_last_tensor`);语义与 host 参考逐元素相同(台子背书)。
 pub struct QuantI8RowWScaleBf16;
 
+#[kernel_tags("dom.load", "phase.load", "role.elem", "quant.int8")]
 impl KernelSpec for QuantI8RowWScaleBf16 {
     const ENTRY: &'static str = "owl_quant_i8_row_w_scale_bf16";
     const SRC: &'static str = "cu/load/quant_i8_row_w.cu";
@@ -73,6 +77,7 @@ impl KernelSpec for QuantI8RowWScaleBf16 {
 /// `owl_quant_i8_row_w_q_bf16` —— 第二步:吃 `scale`,写 `q = RN(w/s)` 截到 ±127
 pub struct QuantI8RowWQBf16;
 
+#[kernel_tags("dom.load", "phase.load", "role.elem", "quant.int8")]
 impl KernelSpec for QuantI8RowWQBf16 {
     const ENTRY: &'static str = "owl_quant_i8_row_w_q_bf16";
     const SRC: &'static str = "cu/load/quant_i8_row_w.cu";
@@ -90,11 +95,3 @@ impl KernelSpec for QuantI8RowWQBf16 {
 
 pub static QUANT_I8_ROW_W_SCALE_BF16: KernelMeta = meta_of::<QuantI8RowWScaleBf16>();
 pub static QUANT_I8_ROW_W_Q_BF16: KernelMeta = meta_of::<QuantI8RowWQBf16>();
-
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[
-    &CT_REPACK_U32,
-    &CT_REPACK_A8_U32,
-    &QUANT_I8_ROW_W_SCALE_BF16,
-    &QUANT_I8_ROW_W_Q_BF16,
-];

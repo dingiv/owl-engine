@@ -853,7 +853,7 @@ mod tests {
     fn q8_1_block_bytes_matches_cu_struct() {
         // 推导:`half2 ds`(d,s 各 half = 2+2)+ `qs[QK8_1]`(32)
         assert_eq!(Q8_1_BLOCK_BYTES, 2 * 2 + QK_32, "q8_1 激活块 = half2 + qs[32]");
-        let t = crate::cu_sig::cu_text(crate::family::gguf::QUANT_SRC);
+        let t = crate::cu_sig::cu_text("cu/gguf/gguf.cuh");
         assert!(
             t.contains("sizeof(block_q8_1) == 2*sizeof(ggml_fp16_t) + QK8_0"),
             "`gguf.cuh` 的 block_q8_1 静态断言行变了 —— 同步 Q8_1_BLOCK_BYTES"

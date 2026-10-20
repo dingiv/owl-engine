@@ -4,6 +4,7 @@
 //! GDN 族是"曾出过事"的重灾区(raw g 语义律 E7、同源对拍双错 E8)——本表的
 //! `LAWS` 声明是装配期不变量门的挂点(设计 §5.5)。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param, PoolAccess};
 
@@ -14,6 +15,7 @@ use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, Kern
 /// `owl_gdn_gating_g_f16` —— g = softplus(a_log) + dt_bias 门
 pub struct GatingGF16;
 
+#[kernel_tags("dom.gdn", "role.norm")]
 impl KernelSpec for GatingGF16 {
     const ENTRY: &'static str = "owl_gdn_gating_g_f16";
     const SRC: &'static str = "cu/gdn/gdn_gating.cu";
@@ -33,6 +35,7 @@ impl KernelSpec for GatingGF16 {
 /// `owl_gdn_l2norm_f16` —— 行末维 L2 归一(一 block 一行)
 pub struct L2NormF16;
 
+#[kernel_tags("dom.gdn", "role.norm")]
 impl KernelSpec for L2NormF16 {
     const ENTRY: &'static str = "owl_gdn_l2norm_f16";
     const SRC: &'static str = "cu/gdn/gdn_l2norm.cu";
@@ -51,6 +54,7 @@ impl KernelSpec for L2NormF16 {
 /// `owl_gdn_norm_act_f16` —— 分组 RMSNorm + 激活(门控)
 pub struct NormActF16;
 
+#[kernel_tags("dom.gdn", "role.norm")]
 impl KernelSpec for NormActF16 {
     const ENTRY: &'static str = "owl_gdn_norm_act_f16";
     const SRC: &'static str = "cu/gdn/gdn_norm_act.cu";
@@ -77,6 +81,7 @@ impl KernelSpec for NormActF16 {
 /// `owl_gdn_conv_fwd_f16` —— chunked prefill 批式短卷积(state 原地更新)
 pub struct ConvFwdF16;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.prefill")]
 impl KernelSpec for ConvFwdF16 {
     const ENTRY: &'static str = "owl_gdn_conv_fwd_f16";
     const SRC: &'static str = "cu/gdn/gdn_conv_fwd.cu";
@@ -101,6 +106,7 @@ impl KernelSpec for ConvFwdF16 {
 /// `owl_gdn_conv_upd_dual_f16` —— q/k 双段 conv 单发(输出单块 [batch, dq+dk])
 pub struct ConvUpdDualF16;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.prefill")]
 impl KernelSpec for ConvUpdDualF16 {
     const ENTRY: &'static str = "owl_gdn_conv_upd_dual_f16";
     const SRC: &'static str = "cu/gdn/gdn_conv_upd.cu";
@@ -131,6 +137,7 @@ impl KernelSpec for ConvUpdDualF16 {
 /// `owl_gdn_recurrence_varlen_gqa_f16` —— 批式 varlen GQA 递推(chunked 路径)
 pub struct RecurrenceVarlenGqaF16;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.prefill")]
 impl KernelSpec for RecurrenceVarlenGqaF16 {
     const ENTRY: &'static str = "owl_gdn_recurrence_varlen_gqa_f16";
     const SRC: &'static str = "cu/gdn/gdn_recurrence.cu";
@@ -162,6 +169,7 @@ impl KernelSpec for RecurrenceVarlenGqaF16 {
 /// + sigmoid + delta + norm_act;22 参 = 13 块 + 5 sz + 3 f32 + 输出)
 pub struct DecodeStepV2F16;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.decode")]
 impl KernelSpec for DecodeStepV2F16 {
     const ENTRY: &'static str = "owl_gdn_decode_step_v2_f16";
     const SRC: &'static str = "cu/gdn/gdn_decode_step.cu";
@@ -208,16 +216,15 @@ pub static CONV_UPD_DUAL_F16: KernelMeta = meta_of::<ConvUpdDualF16>();
 pub static RECURRENCE_VARLEN_GQA_F16: KernelMeta = meta_of::<RecurrenceVarlenGqaF16>();
 pub static DECODE_STEP_V2_F16: KernelMeta = meta_of::<DecodeStepV2F16>();
 
-
 // ============================================================================
 // `gdn.rs` 域 R1 补表
 // (R1 补表 2026-10-13:声明从登记表派生,签名由 `op_tables` 门逐参互证)
 // ============================================================================
 
-
 /// `owl_gdn_conv_upd_f16` —— gdn_conv_upd.cu(R1 补表)
 pub struct GdnConvUpdF16;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.prefill")]
 impl KernelSpec for GdnConvUpdF16 {
     const ENTRY: &'static str = "owl_gdn_conv_upd_f16";
     const SRC: &'static str = "cu/gdn/gdn_conv_upd.cu";
@@ -238,10 +245,10 @@ impl KernelSpec for GdnConvUpdF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_gdn_conv_upd_f32` —— gdn_conv_upd.cu(R1 补表)
 pub struct GdnConvUpdF32;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.prefill")]
 impl KernelSpec for GdnConvUpdF32 {
     const ENTRY: &'static str = "owl_gdn_conv_upd_f32";
     const SRC: &'static str = "cu/gdn/gdn_conv_upd.cu";
@@ -262,10 +269,10 @@ impl KernelSpec for GdnConvUpdF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_gdn_delta_dec_f16` —— gdn_delta_dec.cu(R1 补表)
 pub struct GdnDeltaDecF16;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.decode")]
 impl KernelSpec for GdnDeltaDecF16 {
     const ENTRY: &'static str = "owl_gdn_delta_dec_f16";
     const SRC: &'static str = "cu/gdn/gdn_delta_dec.cu";
@@ -291,10 +298,10 @@ impl KernelSpec for GdnDeltaDecF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_gdn_delta_dec_f32` —— gdn_delta_dec.cu(R1 补表)
 pub struct GdnDeltaDecF32;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.decode")]
 impl KernelSpec for GdnDeltaDecF32 {
     const ENTRY: &'static str = "owl_gdn_delta_dec_f32";
     const SRC: &'static str = "cu/gdn/gdn_delta_dec.cu";
@@ -320,10 +327,10 @@ impl KernelSpec for GdnDeltaDecF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_gdn_decode_step_f16` —— gdn_decode_step.cu(R1 补表)
 pub struct GdnDecodeStepF16;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.decode")]
 impl KernelSpec for GdnDecodeStepF16 {
     const ENTRY: &'static str = "owl_gdn_decode_step_f16";
     const SRC: &'static str = "cu/gdn/gdn_decode_step.cu";
@@ -357,10 +364,10 @@ impl KernelSpec for GdnDecodeStepF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_gdn_gating_g_f32` —— gdn_gating.cu(R1 补表)
 pub struct GdnGatingGF32;
 
+#[kernel_tags("dom.gdn", "role.norm")]
 impl KernelSpec for GdnGatingGF32 {
     const ENTRY: &'static str = "owl_gdn_gating_g_f32";
     const SRC: &'static str = "cu/gdn/gdn_gating.cu";
@@ -377,10 +384,10 @@ impl KernelSpec for GdnGatingGF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_gdn_l2norm_f32` —— gdn_l2norm.cu(R1 补表)
 pub struct GdnL2normF32;
 
+#[kernel_tags("dom.gdn", "role.norm")]
 impl KernelSpec for GdnL2normF32 {
     const ENTRY: &'static str = "owl_gdn_l2norm_f32";
     const SRC: &'static str = "cu/gdn/gdn_l2norm.cu";
@@ -396,10 +403,10 @@ impl KernelSpec for GdnL2normF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_gdn_norm_act_f32` —— gdn_norm_act.cu(R1 补表)
 pub struct GdnNormActF32;
 
+#[kernel_tags("dom.gdn", "role.norm")]
 impl KernelSpec for GdnNormActF32 {
     const ENTRY: &'static str = "owl_gdn_norm_act_f32";
     const SRC: &'static str = "cu/gdn/gdn_norm_act.cu";
@@ -427,22 +434,3 @@ pub static OWL_GDN_DECODE_STEP_F16: KernelMeta = meta_of::<GdnDecodeStepF16>();
 pub static OWL_GDN_GATING_G_F32: KernelMeta = meta_of::<GdnGatingGF32>();
 pub static OWL_GDN_L2NORM_F32: KernelMeta = meta_of::<GdnL2normF32>();
 pub static OWL_GDN_NORM_ACT_F32: KernelMeta = meta_of::<GdnNormActF32>();
-
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[
-    &GATING_G_F16,
-    &L2NORM_F16,
-    &NORM_ACT_F16,
-    &CONV_FWD_F16,
-    &CONV_UPD_DUAL_F16,
-    &RECURRENCE_VARLEN_GQA_F16,
-    &DECODE_STEP_V2_F16,
-    &OWL_GDN_CONV_UPD_F16,
-    &OWL_GDN_CONV_UPD_F32,
-    &OWL_GDN_DELTA_DEC_F16,
-    &OWL_GDN_DELTA_DEC_F32,
-    &OWL_GDN_DECODE_STEP_F16,
-    &OWL_GDN_GATING_G_F32,
-    &OWL_GDN_L2NORM_F32,
-    &OWL_GDN_NORM_ACT_F32,
-];

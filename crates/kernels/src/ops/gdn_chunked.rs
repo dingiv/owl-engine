@@ -4,6 +4,7 @@
 //! **g 语义律(E7)**:本面只产 **raw gate**;cumsum 产物是核内私有态 ——
 //! 客户端不可达(类型面 `GateRaw` 堵死 raw/cumsum 混喂)。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Arg, Dtype, Law, OpError};
 use crate::bootcheck::CheckCtx;
 use crate::spec::check_from_params;
@@ -12,6 +13,7 @@ use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec,
 /// `gdn_chunked_delta_rule_fwd` —— GDN chunked 前向(六核编排入口)
 pub struct GdnChunkedDeltaRuleFwd;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.prefill")]
 impl KernelSpec for GdnChunkedDeltaRuleFwd {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::gdn_chunked::GDN_CHUNKED_FWD);
@@ -119,8 +121,6 @@ impl KernelSpec for GdnChunkedDeltaRuleFwd {
 
 pub static GDN_CHUNKED_FWD: KernelMeta = meta_of::<GdnChunkedDeltaRuleFwd>();
 
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[&GDN_CHUNKED_FWD];
 
 #[cfg(test)]
 mod tests {
