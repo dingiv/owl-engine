@@ -41,26 +41,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 b.pending_loads.iter().map(|(_, c)| *c).collect();
             // **S6**:盘上的块先读回宿主(盘 → 设备要两跳;判据与账都在 store)
             let _ = self.ensure_host_resident(&chains).await?;
-            let leg = &mut self.bank.rel.leg;
-            let face = self.dev.graphs.session.face_mut();
             let (cs, new_slots, pieces, table) = {
-                let p = owl_store::plan_onload(leg, &chains)?;
+                let p = owl_store::plan_onload(&mut self.bank.rel.leg, &chains)?;
                 (p.chains, p.slots, p.pieces, p.table)
             };
-            let conn = match face
-                .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+            let table = match self
+                .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, table)
                 .await
             {
-                Ok(c) => c,
+                Ok(t) => t,
                 Err(e) => {
-                    owl_store::abort_onload(leg, &cs, &new_slots);
-                    return Err(owl_iface::contract::ModelError::Msg(format!(
-                        "回灌 swap 失败(engine 编排):{e}"
-                    )));
+                    owl_store::abort_onload(&mut self.bank.rel.leg, &cs, &new_slots);
+                    return Err(e);
                 }
             };
-            let table = owl_store::reclaim_slot_table(conn)?;
-            let slots = owl_store::commit_onload(leg, &cs, &new_slots, table)?;
+            let slots = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &new_slots, table)?;
             // **B-3e 实测账**:本条命令的块数/字节/墙钟(含发射 + 回执)
             self.stage.blocks += cs.len();
             self.stage.bytes += cs.len() * self.dev.pool.block_bytes();

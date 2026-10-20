@@ -99,7 +99,7 @@ async fn snapshot_offload_and_reload_is_byte_identical() {
 
     // ① 下沉:设备槽 0 → 宿主(一条 swap 搬 N 片)
     let (pieces, table) = r.plan_snap_offload(k, 0).expect("下沉计划");
-    let conn = face.swap(SwapDir::Out, &pieces, Box::new(table)).await.expect("swap(Out)");
+    let conn = face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await.expect("swap(Out)");
     let table = owl_store::reclaim_slot_table(conn).expect("回执取台");
     r.commit_snap_offload(k, table).expect("下沉记账");
     assert_eq!(r.state.locate(k), Some(Tier::Host), "层应下沉");
@@ -108,7 +108,7 @@ async fn snapshot_offload_and_reload_is_byte_identical() {
 
     // ② 回灌:宿主 → 设备槽 2(另一槽 ⇒ 证明内容跟着走,不是原地)
     let (pieces, table) = r.plan_snap_onload(k, 2).expect("回灌计划");
-    let conn = face.swap(SwapDir::In, &pieces, Box::new(table)).await.expect("swap(In)");
+    let conn = face.swap(SwapDir::In, &pieces[0], Box::new(table)).await.expect("swap(In)");
     let table = owl_store::reclaim_slot_table(conn).expect("回执取台");
     r.commit_snap_onload(k, table).expect("回灌记账");
     assert_eq!(r.state.locate(k), Some(Tier::Gpu), "层应回设备");
@@ -121,13 +121,13 @@ async fn snapshot_offload_and_reload_is_byte_identical() {
     let k2 = key(8);
     r.state.register_snap(k2, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
     let (p1, t1) = r.plan_snap_offload(k2, 3).expect("第一条");
-    let c1 = face.swap(SwapDir::Out, &p1, Box::new(t1)).await.expect("swap");
+    let c1 = face.swap(SwapDir::Out, &p1[0], Box::new(t1)).await.expect("swap");
     r.commit_snap_offload(k2, owl_store::reclaim_slot_table(c1).expect("台")).expect("落账");
     assert_eq!(r.snap_host_free_slots(), 0, "预算 = 一条 ⇒ 此刻宿主满");
     let k3 = key(9);
     r.state.register_snap(k3, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
     let (p3, t3) = r.plan_snap_offload(k3, 1).expect("宿主满 ⇒ 逐最冷后应能下沉");
-    let c3 = face.swap(SwapDir::Out, &p3, Box::new(t3)).await.expect("swap");
+    let c3 = face.swap(SwapDir::Out, &p3[0], Box::new(t3)).await.expect("swap");
     r.commit_snap_offload(k3, owl_store::reclaim_slot_table(c3).expect("台")).expect("落账");
     assert_eq!(r.state.locate(k2), None, "最冷条目 k2 应被逐(内容整体丢)");
     assert_eq!(r.state.locate(k3), Some(Tier::Host), "新条目应落宿主");

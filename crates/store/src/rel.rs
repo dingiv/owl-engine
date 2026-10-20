@@ -262,8 +262,13 @@ pub struct Rel {
     evict: Box<dyn EvictPolicy>,
     /// 状态腿的设备布局(快照 = 「槽 × 片」;engine 在 boot 注册,§25.2)。
     snap_layout: Option<crate::leg::PoolLayout>,
+    /// **peer 快照布局**(TP;快照槽既写两 rank ⇒ 各自块 id)。
+    snap_layout_peer: Option<crate::leg::PoolLayout>,
     /// 一条快照的全量字节(布局注册后由 `slot_bytes()` 定谳)。
     snap_bytes: usize,
+    /// **TP world**(2026-10-20):宿主腿每条链/每条快照占 `world` 个平面
+    /// (= 每 rank 半份)。单卡恒 1。
+    world: usize,
 }
 
 impl Rel {
@@ -278,6 +283,25 @@ impl Rel {
         kv_cfg: LegConfig,
         ledger: crate::tier::SharedLedger,
     ) -> StoreResult<Self> {
+        Self::open_world(inputs, policy, kv_cfg, ledger, 1)
+    }
+
+    /// **TP 档装配**(`world = 2`):KV 腿与状态腿的宿主槽都按 `world` 个平面开
+    /// (`host_cache_mb` 语义不变 = **两 rank 合计**;单链字节 = `world ×` 单页)。
+    ///
+    /// 搬运面契约:engine 对每个 rank 各发一条 `swap`(片偏移用
+    /// [`crate::pieces_on_plane`]),槽台在两条命令之间**原箱传递** ⇒ 一次
+    /// 借台/一次落账(预算与账目仍是一条链一份)。
+    pub fn open_world(
+        inputs: BudgetInputs,
+        policy: AdmissionPolicy,
+        kv_cfg: LegConfig,
+        ledger: crate::tier::SharedLedger,
+        world: usize,
+    ) -> StoreResult<Self> {
+        if world == 0 {
+            return Err(StoreError::Invariant("Rel::open_world: world = 0".into()));
+        }
         if kv_cfg.block_bytes == 0 || kv_cfg.block_tokens == 0 || kv_cfg.slots == 0 {
             return Err(StoreError::Budget(format!(
                 "KV 腿几何非法:slots={} block_tokens={} block_bytes={}",
@@ -328,7 +352,7 @@ impl Rel {
             ))
         })?;
         Ok(Self {
-            leg: BlockLeg::open(kv_cfg)?,
+            leg: BlockLeg::open_planes(kv_cfg, world)?,
             index: None,
             state,
             snap_host: HostTier::new(1, snap_host_bytes)?,
@@ -340,9 +364,17 @@ impl Rel {
             budget,
             evict: Box::new(LruPolicy),
             snap_layout: None,
+            snap_layout_peer: None,
             snap_bytes: 0,
+            world,
         })
     }
+
+    /// 宿主腿平面数(= TP world;1 = 单卡)。
+    pub fn world(&self) -> usize {
+        self.world
+    }
+
 
     /// **状态腿的出序(判据唯一的一面;§30.6-②)** —— "设备层快照谁该先走"。
     ///
@@ -377,6 +409,13 @@ impl Rel {
         kv_bytes: usize,
         snap_bytes: usize,
     ) -> StoreResult<DiskAttach> {
+        if self.world > 1 {
+            return Err(StoreError::Invariant(format!(
+                "TP 档(world = {}) + 磁盘腿未接线:磁盘层的块粒度/平面账还没做 \
+                 (先关 [pool] disk_cache_mb;宿主腿本身已支持 world)",
+                self.world
+            )));
+        }
         let total = self.budget.tier_budget().disk_bytes;
         if total == 0 {
             return Err(StoreError::Budget(
@@ -530,12 +569,29 @@ impl Rel {
         if bytes == 0 {
             return Err(StoreError::Invariant("状态腿布局单块字节为 0".into()));
         }
-        // 宿主层的块粒度 = 一条快照(建 host 时未知,故此处重建:预算不变)
+        // 宿主层的块粒度 = 一条快照 × world 平面(建 host 时未知,故此处重建:预算不变)
         let budget = self.snap_host.budget_bytes();
-        self.snap_host = HostTier::new(bytes, budget)?;
+        self.snap_host = HostTier::new(bytes.saturating_mul(self.world), budget)?;
         let epoch = layout.epoch;
         self.snap_layout = Some(layout);
         self.snap_bytes = bytes;
+        Ok(epoch)
+    }
+
+    /// **注册 peer 快照布局**(TP;`world > 1` 必调;两 rank 的快照槽同形)。
+    pub fn attach_snap_layout_peer(
+        &mut self,
+        layout: crate::leg::PoolLayout,
+    ) -> StoreResult<u64> {
+        let got = layout.slot_bytes();
+        if got != self.snap_bytes {
+            return Err(StoreError::Invariant(format!(
+                "peer 快照布局单块字节不符:布局 {got} ≠ 本 rank {}",
+                self.snap_bytes
+            )));
+        }
+        let epoch = layout.epoch;
+        self.snap_layout_peer = Some(layout);
         Ok(epoch)
     }
 
@@ -744,11 +800,12 @@ impl Rel {
     // ───────────────── 状态腿搬运口(§25.2;与 KV 腿同形:store 出计划与账) ─────────────────
 
     /// 状态腿的片(逐 (层,quad);`dev_off = 槽 × 行宽`)。
-    fn snap_pieces(&self, slot: u32) -> StoreResult<Vec<SwapPiece>> {
-        let layout = self
-            .snap_layout
-            .as_ref()
-            .ok_or_else(|| StoreError::Invariant("状态腿布局未注册(engine 应在 boot 调 attach_snap_layout)".into()))?;
+    fn snap_pieces(&self, slot: u32, plane: usize) -> StoreResult<Vec<SwapPiece>> {
+        let l = if plane == 0 { self.snap_layout.as_ref() } else { self.snap_layout_peer.as_ref() };
+        let layout = l
+            .ok_or_else(|| StoreError::Invariant(format!(
+                "状态腿布局(平面 {plane})未注册(engine 应在 boot 调 attach_snap_layout/…_peer)"
+            )))?;
         Ok(layout
             .pieces
             .iter()
@@ -769,7 +826,11 @@ impl Rel {
     /// 159 MiB ≈ **50 ms**(实测,页锁定外的 PCIe 速),而生成段每 32 tok 就出
     /// 一条 ⇒ 全下沉 = 每 token 数 MiB 级 PCIe 流量,不可承受。拒语即事实
     /// (调用方回落已有"沉不下⇒丢"路;见 [`SnapDurability`])。
-    pub fn plan_snap_offload(&mut self, key: SnapKey, slot: u32) -> StoreResult<(Vec<SwapPiece>, SlotTable)> {
+    pub fn plan_snap_offload(
+        &mut self,
+        key: SnapKey,
+        slot: u32,
+    ) -> StoreResult<(Vec<Vec<SwapPiece>>, SlotTable)> {
         let bytes = self
             .state
             .snap_bytes(key)
@@ -832,14 +893,20 @@ impl Rel {
                 Err(e) => return Err(e),
             }
         };
-        let mut pieces = self.snap_pieces(slot)?;
-        // 片在宿主槽内**首尾相接**(每条快照 = 一个槽)
-        let mut off = 0usize;
-        for p in &mut pieces {
-            p.conn_off = off;
-            off += p.len;
-        }
-        Ok((pieces, SlotTable::one(buf)))
+        let all = (0..self.world.max(1))
+            .map(|plane| {
+                let mut pieces = self.snap_pieces(slot, plane)?;
+                // 片在宿主槽内**首尾相接**(每条快照 = 一个槽 × world 平面)
+                // 平面基址 = 该 rank 的快照字节(漏了 = peer 覆盖 rank0 的内容)
+                let mut off = plane * self.snap_bytes;
+                for p in &mut pieces {
+                    p.conn_off = off;
+                    off += p.len;
+                }
+                Ok(pieces)
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok((all, SlotTable::one(buf)))
     }
 
     /// **快照下沉记账**(搬运成功后;纯 host):内容落宿主 + 换层。
@@ -862,15 +929,24 @@ impl Rel {
     pub fn abort_snap_offload(&mut self, _key: SnapKey) {}
 
     /// **快照回灌计划**(宿主 → 设备槽 `slot`)。
-    pub fn plan_snap_onload(&mut self, key: SnapKey, slot: u32) -> StoreResult<(Vec<SwapPiece>, SlotTable)> {
+    pub fn plan_snap_onload(
+        &mut self,
+        key: SnapKey,
+        slot: u32,
+    ) -> StoreResult<(Vec<Vec<SwapPiece>>, SlotTable)> {
         let buf = self.snap_host.take(key)?;
-        let mut pieces = self.snap_pieces(slot)?;
-        let mut off = 0usize;
-        for p in &mut pieces {
-            p.conn_off = off;
-            off += p.len;
-        }
-        Ok((pieces, SlotTable::one(buf)))
+        let all = (0..self.world.max(1))
+            .map(|plane| {
+                let mut pieces = self.snap_pieces(slot, plane)?;
+                let mut off = plane * self.snap_bytes;
+                for p in &mut pieces {
+                    p.conn_off = off;
+                    off += p.len;
+                }
+                Ok(pieces)
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok((all, SlotTable::one(buf)))
     }
 
     /// **快照回灌记账**(搬运成功后):缓冲回池 + 层回设备。

@@ -1459,6 +1459,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     match self.snap_offload(victim, slot).await {
                         Ok(()) => {
                             self.dev.pool.snap_clear_slot(slot);
+                            if let Some(pr) = self.peer.as_mut() {
+                                pr.pool.snap_clear_slot(slot);
+                            }
                             return Ok(slot);
                         }
                         Err(e) => {
@@ -1480,6 +1483,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     m.counter_add("store.snap.drop", 1, file!(), line!());
                 });
                 self.dev.pool.snap_clear_slot(slot);
+                if let Some(pr) = self.peer.as_mut() {
+                    pr.pool.snap_clear_slot(slot);
+                }
                 Ok(slot)
             }
         }
@@ -1492,20 +1498,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     pub(crate) async fn snap_offload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
         let ev0 = self.bank.rel.snap_host_evicted_bytes();
         let (pieces, table) = self.bank.rel.plan_snap_offload(key, slot)?;
-        let face = self.dev.graphs.session.face_mut();
-        let conn = match face
-            .swap(owl_iface::contract::SwapDir::Out, &pieces, Box::new(table))
+        let table = match self
+            .swap_all_ranks(owl_iface::contract::SwapDir::Out, &pieces, table)
             .await
         {
-            Ok(c) => c,
+            Ok(t) => t,
             Err(e) => {
                 self.bank.rel.abort_snap_offload(key);
-                return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "快照下沉 swap 失败:{e}"
-                )));
+                return Err(e);
             }
         };
-        let table = owl_store::reclaim_slot_table(conn)?;
         self.bank.rel.commit_snap_offload(key, table)?;
         let ev = self.bank.rel.snap_host_evicted_bytes().saturating_sub(ev0);
         if ev > 0 {
@@ -1544,23 +1546,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// **快照回灌**(宿主 → 设备槽;一条 swap 搬 N 片)。
     pub(crate) async fn snap_onload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
         let (pieces, table) = self.bank.rel.plan_snap_onload(key, slot)?;
-        let face = self.dev.graphs.session.face_mut();
-        let conn = match face
-            .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+        let table = match self
+            .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, table)
             .await
         {
-            Ok(c) => c,
+            Ok(t) => t,
             Err(e) => {
                 // 台子随失败的 connector 消失 ⇒ 内容已丢 ⇒ 条目一并删
                 self.bank.rel.abort_snap_onload(key);
-                return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "快照回灌 swap 失败:{e}"
-                )));
+                return Err(e);
             }
         };
-        let table = owl_store::reclaim_slot_table(conn)?;
         self.bank.rel.commit_snap_onload(key, table)?;
         self.dev.pool.snap_place(slot, key);
+        // **TP:peer 的池槽索引同刻对齐**(物理槽由 swap 两 rank 同步写入;
+        // 索引不镜像 ⇒ 后续逐出/复用判据在两侧漂移)
+        if let Some(pr) = self.peer.as_mut() {
+            pr.pool.snap_place(slot, key);
+        }
         // **触达入 store 账**(§30.6-②):store 的 `last_use` 是出序输入;
         // 池的 `last_use` 只是物理面。两处同刻更新 ⇒ 判据与池不再漂。
         self.bank.rel.state.touch(key);

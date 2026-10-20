@@ -1732,6 +1732,76 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(true)
     }
 
+    /// **宿主腿一条 swap 落到每个 rank**(2026-10-20;双卡 KVMem 立案 §23.8)。
+    ///
+    /// `pieces[p]` = store 用**第 p 个 rank 自己的块 id** 组的片(两侧池句柄是两套,
+    /// 不能靠偏移平移);宿主槽 = `world` 个平面,偏移由 store 的 `out/in_pieces`
+    /// 按 `plane × 单页字节` 落好。
+    /// 槽台 = **一次借台**,两条命令之间原箱传递 ⇒ 一次落账、一条链一份预算。
+    /// 单卡(`world = 1`)= 与历史逐字相同。
+    pub(crate) async fn swap_all_ranks(
+        &mut self,
+        dir: owl_iface::contract::SwapDir,
+        pieces: &[Vec<owl_iface::contract::SwapPiece>],
+        table: owl_store::SlotTable,
+    ) -> Result<owl_store::SlotTable> {
+        let world = self.bank.rel.world().max(1);
+        if pieces.len() != world {
+            return Err(owl_iface::contract::ModelError::EngineInvariant {
+                what: format!(
+                    "宿主腿 swap({dir:?}): 片组数 {} ≠ world {world}(store 组片与装配不一致)",
+                    pieces.len()
+                ),
+            });
+        }
+        let mut table = table;
+        for p in 0..world {
+            let pcs = &pieces[p];
+            let conn = match p {
+                0 => {
+                    self.dev
+                        .graphs
+                        .session
+                        .face_mut()
+                        .swap(dir, pcs, Box::new(table))
+                        .await
+                }
+                _ => match self.peer.as_mut() {
+                    Some(pr) => pr.graphs.session.face_mut().swap(dir, pcs, Box::new(table)).await,
+                    None => {
+                        return Err(owl_iface::contract::ModelError::EngineInvariant {
+                            what: format!(
+                                "宿主腿 swap({dir:?}): world = {world} 但 peer 束缺席(装配不一致)"
+                            ),
+                        })
+                    }
+                },
+            };
+            let conn = conn.map_err(|e| {
+                owl_iface::contract::ModelError::Msg(format!(
+                    "宿主腿 swap({dir:?}) rank{p} 失败(engine 编排): {e}"
+                ))
+            })?;
+            table = owl_store::reclaim_slot_table(conn)?;
+        }
+        Ok(table)
+    }
+
+    /// **视图页表写两 rank**(TP;槽号两侧一致 ⇒ 同一份页表)。
+    ///
+    /// 只写 rank0 的后果(实测):peer 的 attention 读捕获期旧视图 ⇒ ~8k 起输出退化。
+    pub(crate) async fn write_select_view_all(&mut self, pages: &[u32]) -> Result<()> {
+        {
+            let face = self.dev.graphs.session.face_mut();
+            self.dev.pool.write_select_view(face, pages).await?;
+        }
+        if let Some(pr) = self.peer.as_mut() {
+            let face = pr.graphs.session.face_mut();
+            pr.pool.write_select_view(face, pages).await?;
+        }
+        Ok(())
+    }
+
     /// **决策单执行**(§21 裁决:**搬运由 engine 编排**;store 只出计划与记账)。
     ///
     /// 逐条:取计划(纯 host)→ **engine 自己发 `face.swap`** → 回执取台 → 记账。
@@ -1759,20 +1829,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 Err(e) => return Err(e.into()),
                             }
                         };
-                        let face = self.dev.graphs.session.face_mut();
-                        let conn = match face
-                            .swap(owl_iface::contract::SwapDir::Out, &pieces, Box::new(table))
+                        let table = match self
+                            .swap_all_ranks(owl_iface::contract::SwapDir::Out, &pieces, table)
                             .await
                         {
-                            Ok(c) => c,
+                            Ok(t) => t,
                             Err(e) => {
                                 owl_store::abort_offload(&mut self.bank.rel.leg, &blocks);
-                                return Err(owl_iface::contract::ModelError::Msg(format!(
-                                    "换出 swap 失败(engine 编排):{e}"
-                                )));
+                                return Err(e);
                             }
                         };
-                        let table = owl_store::reclaim_slot_table(conn)?;
                         a.offloaded +=
                             owl_store::commit_offload(&mut self.bank.rel.leg, &blocks, table)?;
                     }
@@ -1808,6 +1874,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                         };
                         self.snap_offload(*key, slot).await?;
                         self.dev.pool.snap_clear_slot(slot);
+                        if let Some(pr) = self.peer.as_mut() {
+                            pr.pool.snap_clear_slot(slot);
+                        }
                         a.snap_offloaded += 1;
                     }
                     Sink::Drop => {
@@ -1821,6 +1890,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                         }
                         if let Some(slot) = slot {
                             self.dev.pool.snap_clear_slot(slot);
+                            if let Some(pr) = self.peer.as_mut() {
+                                pr.pool.snap_clear_slot(slot);
+                            }
                         }
                         a.snap_dropped += 1;
                     }
@@ -1844,20 +1916,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                     Err(e) => return Err(e.into()),
                 }
             };
-            let face = self.dev.graphs.session.face_mut();
-            let conn = match face
-                .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+            let table = match self
+                .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, table)
                 .await
             {
-                Ok(c) => c,
+                Ok(t) => t,
                 Err(e) => {
                     owl_store::abort_onload(&mut self.bank.rel.leg, &cs, &slots);
-                    return Err(owl_iface::contract::ModelError::Msg(format!(
-                        "回灌 swap 失败(engine 编排):{e}"
-                    )));
+                    return Err(e);
                 }
             };
-            let table = owl_store::reclaim_slot_table(conn)?;
             let _ = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &slots, table)?;
             self.stage.blocks += cs.len();
             self.stage.bytes += cs.len() * self.dev.pool.block_bytes();
