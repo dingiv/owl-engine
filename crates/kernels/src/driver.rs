@@ -541,6 +541,18 @@ pub mod gguf {
             GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufGemmQ4K>(shape),
             GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufGemmQ5K>(shape),
             GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufGemmQ6K>(shape),
+            // IQ 族(2026-10-20;REQ-GGUF-04):MMVQ 走原生 vec_dot(q8_1 激活)
+            GgmlTy::Iq4Nl => KernelPick::of::<crate::ops::gguf::GgufGemmIq4Nl>(shape),
+            GgmlTy::Iq4Xs => KernelPick::of::<crate::ops::gguf::GgufGemmIq4Xs>(shape),
+            GgmlTy::Iq3Xxs => KernelPick::of::<crate::ops::gguf::GgufGemmIq3Xxs>(shape),
+            GgmlTy::Iq3S => KernelPick::of::<crate::ops::gguf::GgufGemmIq3S>(shape),
+            GgmlTy::Q2K => KernelPick::of::<crate::ops::gguf::GgufGemmQ2K>(shape),
+            GgmlTy::Q3K => KernelPick::of::<crate::ops::gguf::GgufGemmQ3K>(shape),
+            GgmlTy::Iq2Xxs => KernelPick::of::<crate::ops::gguf::GgufGemmIq2Xxs>(shape),
+            GgmlTy::Iq2Xs => KernelPick::of::<crate::ops::gguf::GgufGemmIq2Xs>(shape),
+            GgmlTy::Iq2S => KernelPick::of::<crate::ops::gguf::GgufGemmIq2S>(shape),
+            GgmlTy::Iq1S => KernelPick::of::<crate::ops::gguf::GgufGemmIq1S>(shape),
+
             other => panic!(
                 "owl_gguf_gemm: {} 未移植(已移植集 = {:?};设计 REQ-GGUF-04 / R3)",
                 other.name(),
@@ -609,6 +621,17 @@ pub mod gguf {
             GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufRangeQ4K>(shape),
             GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufRangeQ5K>(shape),
             GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufRangeQ6K>(shape),
+            GgmlTy::Iq4Nl => KernelPick::of::<crate::ops::gguf::GgufRangeIq4Nl>(shape),
+            GgmlTy::Iq4Xs => KernelPick::of::<crate::ops::gguf::GgufRangeIq4Xs>(shape),
+            GgmlTy::Iq3Xxs => KernelPick::of::<crate::ops::gguf::GgufRangeIq3Xxs>(shape),
+            GgmlTy::Iq3S => KernelPick::of::<crate::ops::gguf::GgufRangeIq3S>(shape),
+            GgmlTy::Q2K => KernelPick::of::<crate::ops::gguf::GgufRangeQ2K>(shape),
+            GgmlTy::Q3K => KernelPick::of::<crate::ops::gguf::GgufRangeQ3K>(shape),
+            GgmlTy::Iq2Xxs => KernelPick::of::<crate::ops::gguf::GgufRangeIq2Xxs>(shape),
+            GgmlTy::Iq2Xs => KernelPick::of::<crate::ops::gguf::GgufRangeIq2Xs>(shape),
+            GgmlTy::Iq2S => KernelPick::of::<crate::ops::gguf::GgufRangeIq2S>(shape),
+            GgmlTy::Iq1S => KernelPick::of::<crate::ops::gguf::GgufRangeIq1S>(shape),
+
             other => panic!("owl_gguf_dequant_range: {} 未移植", other.name()),
         }
     }
@@ -673,6 +696,17 @@ pub mod gguf {
             GgmlTy::Q4K => KernelPick::of::<crate::ops::gguf::GgufRowsQ4K>(shape),
             GgmlTy::Q5K => KernelPick::of::<crate::ops::gguf::GgufRowsQ5K>(shape),
             GgmlTy::Q6K => KernelPick::of::<crate::ops::gguf::GgufRowsQ6K>(shape),
+            GgmlTy::Iq4Nl => KernelPick::of::<crate::ops::gguf::GgufRowsIq4Nl>(shape),
+            GgmlTy::Iq4Xs => KernelPick::of::<crate::ops::gguf::GgufRowsIq4Xs>(shape),
+            GgmlTy::Iq3Xxs => KernelPick::of::<crate::ops::gguf::GgufRowsIq3Xxs>(shape),
+            GgmlTy::Iq3S => KernelPick::of::<crate::ops::gguf::GgufRowsIq3S>(shape),
+            GgmlTy::Q2K => KernelPick::of::<crate::ops::gguf::GgufRowsQ2K>(shape),
+            GgmlTy::Q3K => KernelPick::of::<crate::ops::gguf::GgufRowsQ3K>(shape),
+            GgmlTy::Iq2Xxs => KernelPick::of::<crate::ops::gguf::GgufRowsIq2Xxs>(shape),
+            GgmlTy::Iq2Xs => KernelPick::of::<crate::ops::gguf::GgufRowsIq2Xs>(shape),
+            GgmlTy::Iq2S => KernelPick::of::<crate::ops::gguf::GgufRowsIq2S>(shape),
+            GgmlTy::Iq1S => KernelPick::of::<crate::ops::gguf::GgufRowsIq1S>(shape),
+
             other => panic!("owl_gguf_dequant_rows: {} 未移植", other.name()),
         }
     }

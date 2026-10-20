@@ -1,0 +1,50 @@
+# owl 引擎预设档 `gguf27b-iq`(27B GGUF · IQ 混型;单 3090 Ti,2026-10-20)
+#
+# 靶位(二选一,`--set model.dir=...`):
+#   - `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf`(14 GiB;IQ4_XS 211 /
+#     IQ3_S 46 / IQ3_XXS 17 / Q2_K·Q3_K·IQ2_XS·IQ2_S 少量 + Q4_K/Q5_K/Q6_K/Q8_0/F32)
+#   - `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf`(12 GiB;IQ3_S 127 /
+#     IQ3_XXS 77 / IQ4_XS 88 + IQ2_XXS/XS/S、IQ1_S、Q2_K、Q3_K)
+#
+# 为什么单卡 3090 Ti:24 GiB 卡,14 GiB 权重 + ~1 GiB KV/图/work —— 装得下;
+# 双卡 TP2 留给 262k 档。
+#
+# 起机(3090 Ti @41:00.0):
+#   CUDA_VISIBLE_DEVICES=GPU-e565c505-4921-9979-2e0f-2b83490b7aed \
+#   target/release/server -p profiles/gguf27b-iq.toml \
+#     --set model.dir=<...>/Qwen3.8-27B-UD-IQ4_XS.gguf
+#
+# ⚠️ `[dispatch] tag_wildcard = true`:见 `profiles/gguf08b-iq4xs.toml` 的注释
+# (tag 词表缺 layout facet ⇒ `kv.main.f16` 同时命中 Classic/kNHD ⇒ E14 拒启)。
+
+[model]
+kind = "gguf"
+
+[runtime]
+bind = "127.0.0.1:8140"
+# 测速档:std 矩阵的 8192 点 + 256 输出必须装得下 ⇒ ctx/pool 给 12k;再大要牺牲权重余量
+max_seq = 12288
+prefill_chunk = 1024
+
+[pool]
+pool_tokens = 12288
+gdn_slots = 8
+snap_max = 4
+host_cache_mb = 2048
+snap_host_mb = 256
+prefix_cache = true
+
+[sampling]
+mode = "greedy"
+
+[kvmem]
+select_decode = false
+select_partial = false
+index = false
+coverage_probe = false
+
+[dispatch]
+tag_wildcard = true
+
+[log]
+level = "info"

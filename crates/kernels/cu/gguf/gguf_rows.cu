@@ -56,6 +56,80 @@ struct GgufRowDequant<QK_K, block_q6_K> {
     }
 };
 
+
+// ---- IQ 族(2026-10-20;REQ-GGUF-04):查表臂用的块解量化(32 线程协作)----
+template <>
+struct GgufRowDequant<QK_IQ4_NL, block_iq4_nl> {
+    static __device__ __forceinline__ void run(const void * __restrict__ vx, __half * __restrict__ yy) {
+        dequantize_block_iq4_nl<__half>(vx, yy);
+    }
+};
+
+template <>
+struct GgufRowDequant<QK_K, block_iq4_xs> {
+    static __device__ __forceinline__ void run(const void * __restrict__ vx, __half * __restrict__ yy) {
+        dequantize_block_iq4_xs<__half>(vx, yy);
+    }
+};
+
+template <>
+struct GgufRowDequant<QK_K, block_iq3_xxs> {
+    static __device__ __forceinline__ void run(const void * __restrict__ vx, __half * __restrict__ yy) {
+        dequantize_block_iq3_xxs<__half>(vx, yy);
+    }
+};
+
+template <>
+struct GgufRowDequant<QK_K, block_iq3_s> {
+    static __device__ __forceinline__ void run(const void * __restrict__ vx, __half * __restrict__ yy) {
+        dequantize_block_iq3_s<__half>(vx, yy);
+    }
+};
+
+
+// ---- 27B UD 档补六型(2026-10-20)----
+template <>
+struct GgufRowDequant<QK_K, block_q2_K> {
+    static __device__ __forceinline__ void run(const void * __restrict__ vx, __half * __restrict__ yy) {
+        dequantize_block_q2_K<__half>(vx, yy);
+    }
+};
+
+template <>
+struct GgufRowDequant<QK_K, block_q3_K> {
+    static __device__ __forceinline__ void run(const void * __restrict__ vx, __half * __restrict__ yy) {
+        dequantize_block_q3_K<__half>(vx, yy);
+    }
+};
+
+template <>
+struct GgufRowDequant<QK_K, block_iq2_xxs> {
+    static __device__ __forceinline__ void run(const void * __restrict__ vx, __half * __restrict__ yy) {
+        dequantize_block_iq2_xxs<__half>(vx, yy);
+    }
+};
+
+template <>
+struct GgufRowDequant<QK_K, block_iq2_xs> {
+    static __device__ __forceinline__ void run(const void * __restrict__ vx, __half * __restrict__ yy) {
+        dequantize_block_iq2_xs<__half>(vx, yy);
+    }
+};
+
+template <>
+struct GgufRowDequant<QK_K, block_iq2_s> {
+    static __device__ __forceinline__ void run(const void * __restrict__ vx, __half * __restrict__ yy) {
+        dequantize_block_iq2_s<__half>(vx, yy);
+    }
+};
+
+template <>
+struct GgufRowDequant<QK_K, block_iq1_s> {
+    static __device__ __forceinline__ void run(const void * __restrict__ vx, __half * __restrict__ yy) {
+        dequantize_block_iq1_s<__half>(vx, yy);
+    }
+};
+
 /// 共享体:`blockIdx.x = token`、`blockIdx.y = 行内块号`
 ///
 /// 入参
@@ -110,4 +184,66 @@ extern "C" __global__ void owl_gguf_dequant_rows_q6k(
     const void * __restrict__ w, const float * __restrict__ ids,
     __half * __restrict__ out, int k, int rows, int vocab) {
     owl_gguf_dequant_rows_body<QK_K, block_q6_K>(w, ids, out, k, rows, vocab);
+}
+
+extern "C" __global__ void owl_gguf_dequant_rows_iq4nl(
+    const void * __restrict__ w, const float * __restrict__ ids,
+    __half * __restrict__ out, int k, int rows, int vocab) {
+    owl_gguf_dequant_rows_body<QK_IQ4_NL, block_iq4_nl>(w, ids, out, k, rows, vocab);
+}
+
+extern "C" __global__ void owl_gguf_dequant_rows_iq4xs(
+    const void * __restrict__ w, const float * __restrict__ ids,
+    __half * __restrict__ out, int k, int rows, int vocab) {
+    owl_gguf_dequant_rows_body<QK_K, block_iq4_xs>(w, ids, out, k, rows, vocab);
+}
+
+extern "C" __global__ void owl_gguf_dequant_rows_iq3xxs(
+    const void * __restrict__ w, const float * __restrict__ ids,
+    __half * __restrict__ out, int k, int rows, int vocab) {
+    owl_gguf_dequant_rows_body<QK_K, block_iq3_xxs>(w, ids, out, k, rows, vocab);
+}
+
+extern "C" __global__ void owl_gguf_dequant_rows_iq3s(
+    const void * __restrict__ w, const float * __restrict__ ids,
+    __half * __restrict__ out, int k, int rows, int vocab) {
+    owl_gguf_dequant_rows_body<QK_K, block_iq3_s>(w, ids, out, k, rows, vocab);
+}
+
+// ---- 27B UD 档补六型(2026-10-20)----
+
+extern "C" __global__ void owl_gguf_dequant_rows_q2k(
+    const void * __restrict__ w, const float * __restrict__ ids,
+    __half * __restrict__ out, int k, int rows, int vocab) {
+    owl_gguf_dequant_rows_body<QK_K, block_q2_K>(w, ids, out, k, rows, vocab);
+}
+
+extern "C" __global__ void owl_gguf_dequant_rows_q3k(
+    const void * __restrict__ w, const float * __restrict__ ids,
+    __half * __restrict__ out, int k, int rows, int vocab) {
+    owl_gguf_dequant_rows_body<QK_K, block_q3_K>(w, ids, out, k, rows, vocab);
+}
+
+extern "C" __global__ void owl_gguf_dequant_rows_iq2xxs(
+    const void * __restrict__ w, const float * __restrict__ ids,
+    __half * __restrict__ out, int k, int rows, int vocab) {
+    owl_gguf_dequant_rows_body<QK_K, block_iq2_xxs>(w, ids, out, k, rows, vocab);
+}
+
+extern "C" __global__ void owl_gguf_dequant_rows_iq2xs(
+    const void * __restrict__ w, const float * __restrict__ ids,
+    __half * __restrict__ out, int k, int rows, int vocab) {
+    owl_gguf_dequant_rows_body<QK_K, block_iq2_xs>(w, ids, out, k, rows, vocab);
+}
+
+extern "C" __global__ void owl_gguf_dequant_rows_iq2s(
+    const void * __restrict__ w, const float * __restrict__ ids,
+    __half * __restrict__ out, int k, int rows, int vocab) {
+    owl_gguf_dequant_rows_body<QK_K, block_iq2_s>(w, ids, out, k, rows, vocab);
+}
+
+extern "C" __global__ void owl_gguf_dequant_rows_iq1s(
+    const void * __restrict__ w, const float * __restrict__ ids,
+    __half * __restrict__ out, int k, int rows, int vocab) {
+    owl_gguf_dequant_rows_body<QK_K, block_iq1_s>(w, ids, out, k, rows, vocab);
 }

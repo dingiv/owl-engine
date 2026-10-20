@@ -259,6 +259,27 @@ pub const GEMM_Q4K: &str = "owl_gguf_gemm_q4k";
 pub const GEMM_Q5K: &str = "owl_gguf_gemm_q5k";
 /// GEMM 入口(Q6_K)
 pub const GEMM_Q6K: &str = "owl_gguf_gemm_q6k";
+/// GEMM 入口(IQ4_NL;32 元素块 + 16 项码本)
+pub const GEMM_IQ4NL: &str = "owl_gguf_gemm_iq4nl";
+/// GEMM 入口(IQ4_XS;256 超块 + 码本 + 4bit 尺度)
+pub const GEMM_IQ4XS: &str = "owl_gguf_gemm_iq4xs";
+/// GEMM 入口(IQ3_XXS;256 超块 + 4×i8 码本 + 符号表)
+pub const GEMM_IQ3XXS: &str = "owl_gguf_gemm_iq3xxs";
+/// GEMM 入口(IQ3_S;256 超块 + 512 项码本)
+pub const GEMM_IQ3S: &str = "owl_gguf_gemm_iq3s";
+/// GEMM 入口(Q2_K;27B UD 档)
+pub const GEMM_Q2K: &str = "owl_gguf_gemm_q2k";
+/// GEMM 入口(Q3_K;27B UD 档)
+pub const GEMM_Q3K: &str = "owl_gguf_gemm_q3k";
+/// GEMM 入口(IQ2_XXS;27B UD 档)
+pub const GEMM_Iq2Xxs: &str = "owl_gguf_gemm_iq2xxs";
+/// GEMM 入口(IQ2_XS;27B UD 档)
+pub const GEMM_Iq2Xs: &str = "owl_gguf_gemm_iq2xs";
+/// GEMM 入口(IQ2_S;27B UD 档)
+pub const GEMM_Iq2S: &str = "owl_gguf_gemm_iq2s";
+/// GEMM 入口(IQ1_S;27B UD 档)
+pub const GEMM_Iq1S: &str = "owl_gguf_gemm_iq1s";
+
 /// 激活 → q8_1 入口(f16 入)
 pub const QUANT_ACT_F16: &str = "owl_gguf_quant_act_f16";
 /// 激活 → q8_1 入口(bf16 入)
@@ -269,6 +290,27 @@ pub const ROWS_Q4K: &str = "owl_gguf_dequant_rows_q4k";
 pub const ROWS_Q5K: &str = "owl_gguf_dequant_rows_q5k";
 /// 行解量化入口(Q6_K)
 pub const ROWS_Q6K: &str = "owl_gguf_dequant_rows_q6k";
+/// 行解量化入口(IQ4_NL)
+pub const ROWS_IQ4NL: &str = "owl_gguf_dequant_rows_iq4nl";
+/// 行解量化入口(IQ4_XS)
+pub const ROWS_IQ4XS: &str = "owl_gguf_dequant_rows_iq4xs";
+/// 行解量化入口(IQ3_XXS)
+pub const ROWS_IQ3XXS: &str = "owl_gguf_dequant_rows_iq3xxs";
+/// 行解量化入口(IQ3_S)
+pub const ROWS_IQ3S: &str = "owl_gguf_dequant_rows_iq3s";
+/// 行解量化入口(Q2_K)
+pub const ROWS_Q2K: &str = "owl_gguf_dequant_rows_q2k";
+/// 行解量化入口(Q3_K)
+pub const ROWS_Q3K: &str = "owl_gguf_dequant_rows_q3k";
+/// 行解量化入口(IQ2_XXS)
+pub const ROWS_Iq2Xxs: &str = "owl_gguf_dequant_rows_iq2xxs";
+/// 行解量化入口(IQ2_XS)
+pub const ROWS_Iq2Xs: &str = "owl_gguf_dequant_rows_iq2xs";
+/// 行解量化入口(IQ2_S)
+pub const ROWS_Iq2S: &str = "owl_gguf_dequant_rows_iq2s";
+/// 行解量化入口(IQ1_S)
+pub const ROWS_Iq1S: &str = "owl_gguf_dequant_rows_iq1s";
+
 /// 行解量化的资产 id
 pub const ROWS_SRC: &str = "cu/gguf/gguf_rows.cu";
 
@@ -415,6 +457,27 @@ pub const RANGE_Q4K: &str = "owl_gguf_dequant_range_q4k";
 pub const RANGE_Q5K: &str = "owl_gguf_dequant_range_q5k";
 /// 同上(Q6_K)
 pub const RANGE_Q6K: &str = "owl_gguf_dequant_range_q6k";
+/// 同上(IQ4_NL)
+pub const RANGE_IQ4NL: &str = "owl_gguf_dequant_range_iq4nl";
+/// 同上(IQ4_XS)
+pub const RANGE_IQ4XS: &str = "owl_gguf_dequant_range_iq4xs";
+/// 同上(IQ3_XXS)
+pub const RANGE_IQ3XXS: &str = "owl_gguf_dequant_range_iq3xxs";
+/// 同上(IQ3_S)
+pub const RANGE_IQ3S: &str = "owl_gguf_dequant_range_iq3s";
+/// 同上(Q2_K)
+pub const RANGE_Q2K: &str = "owl_gguf_dequant_range_q2k";
+/// 同上(Q3_K)
+pub const RANGE_Q3K: &str = "owl_gguf_dequant_range_q3k";
+/// 同上(IQ2_XXS)
+pub const RANGE_Iq2Xxs: &str = "owl_gguf_dequant_range_iq2xxs";
+/// 同上(IQ2_XS)
+pub const RANGE_Iq2Xs: &str = "owl_gguf_dequant_range_iq2xs";
+/// 同上(IQ2_S)
+pub const RANGE_Iq2S: &str = "owl_gguf_dequant_range_iq2s";
+/// 同上(IQ1_S)
+pub const RANGE_Iq1S: &str = "owl_gguf_dequant_range_iq1s";
+
 
 /// 型 → 行窗解量化入口(`None` = 未移植)
 pub const fn range_entry_for(ty: GgmlTy) -> Option<&'static str> {
@@ -423,6 +486,16 @@ pub const fn range_entry_for(ty: GgmlTy) -> Option<&'static str> {
         GgmlTy::Q4K => Some(RANGE_Q4K),
         GgmlTy::Q5K => Some(RANGE_Q5K),
         GgmlTy::Q6K => Some(RANGE_Q6K),
+        GgmlTy::Iq4Nl => Some(RANGE_IQ4NL),
+        GgmlTy::Iq4Xs => Some(RANGE_IQ4XS),
+        GgmlTy::Iq3Xxs => Some(RANGE_IQ3XXS),
+        GgmlTy::Iq3S => Some(RANGE_IQ3S),
+        GgmlTy::Q2K => Some(RANGE_Q2K),
+        GgmlTy::Q3K => Some(RANGE_Q3K),
+        GgmlTy::Iq2Xxs => Some(RANGE_Iq2Xxs),
+        GgmlTy::Iq2Xs => Some(RANGE_Iq2Xs),
+        GgmlTy::Iq2S => Some(RANGE_Iq2S),
+        GgmlTy::Iq1S => Some(RANGE_Iq1S),
         _ => None,
     }
 }
@@ -570,7 +643,24 @@ pub fn smem_geom(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
 }
 
 /// **已移植的型**(加型 = `.cu` 加一行实例 + 本表加一项 + `ops/gguf.rs` 加一条声明)
-pub const PORTED: &[GgmlTy] = &[GgmlTy::Q8_0, GgmlTy::Q4K, GgmlTy::Q5K, GgmlTy::Q6K];
+pub const PORTED: &[GgmlTy] = &[
+    GgmlTy::Q8_0,
+    GgmlTy::Q4K,
+    GgmlTy::Q5K,
+    GgmlTy::Q6K,
+    // IQ 族(2026-10-20;REQ-GGUF-04):块解量化 + vec_dot 均在 `gguf.cuh`,
+    // 本仓补的是入口/行窗/查表三条腿(见 ops/gguf.rs 的逐型声明)
+    GgmlTy::Iq4Nl,
+    GgmlTy::Iq4Xs,
+    GgmlTy::Iq3Xxs,
+    GgmlTy::Iq3S,
+    GgmlTy::Q2K,
+    GgmlTy::Q3K,
+    GgmlTy::Iq2Xxs,
+    GgmlTy::Iq2Xs,
+    GgmlTy::Iq2S,
+    GgmlTy::Iq1S,
+];
 
 /// **已移植「行解量化」的型**(查表臂 = `token_embd` 用)。
 ///
@@ -578,7 +668,22 @@ pub const PORTED: &[GgmlTy] = &[GgmlTy::Q8_0, GgmlTy::Q4K, GgmlTy::Q5K, GgmlTy::
 /// Q8_0 有 GEMM(点积)入口,但本仓快照的 `gguf.cuh` **没有**
 /// `dequantize_block_q8_0`(只有 `q2_K`..`q6_K` 五个块解量化)⇒ 量化表若是
 /// Q8_0,**响亮拒**(设计纪律:解析得了 ≠ 跑得了)。
-pub const ROWS_PORTED: &[GgmlTy] = &[GgmlTy::Q4K, GgmlTy::Q5K, GgmlTy::Q6K];
+pub const ROWS_PORTED: &[GgmlTy] = &[
+    GgmlTy::Q4K,
+    GgmlTy::Q5K,
+    GgmlTy::Q6K,
+    // IQ 族:块解量化自带(32 线程),行解量化与 K-quant 同一条路
+    GgmlTy::Iq4Nl,
+    GgmlTy::Iq4Xs,
+    GgmlTy::Iq3Xxs,
+    GgmlTy::Iq3S,
+    GgmlTy::Q2K,
+    GgmlTy::Q3K,
+    GgmlTy::Iq2Xxs,
+    GgmlTy::Iq2Xs,
+    GgmlTy::Iq2S,
+    GgmlTy::Iq1S,
+];
 
 /// 型 → GEMM 入口名(**唯一映射**;`None` = 本仓未移植 ⇒ 调用方**响亮拒**)
 pub const fn entry_for(ty: GgmlTy) -> Option<&'static str> {
@@ -587,6 +692,16 @@ pub const fn entry_for(ty: GgmlTy) -> Option<&'static str> {
         GgmlTy::Q4K => Some(GEMM_Q4K),
         GgmlTy::Q5K => Some(GEMM_Q5K),
         GgmlTy::Q6K => Some(GEMM_Q6K),
+        GgmlTy::Iq4Nl => Some(GEMM_IQ4NL),
+        GgmlTy::Iq4Xs => Some(GEMM_IQ4XS),
+        GgmlTy::Iq3Xxs => Some(GEMM_IQ3XXS),
+        GgmlTy::Iq3S => Some(GEMM_IQ3S),
+        GgmlTy::Q2K => Some(GEMM_Q2K),
+        GgmlTy::Q3K => Some(GEMM_Q3K),
+        GgmlTy::Iq2Xxs => Some(GEMM_Iq2Xxs),
+        GgmlTy::Iq2Xs => Some(GEMM_Iq2Xs),
+        GgmlTy::Iq2S => Some(GEMM_Iq2S),
+        GgmlTy::Iq1S => Some(GEMM_Iq1S),
         _ => None,
     }
 }
@@ -642,6 +757,16 @@ pub const fn rows_entry_for(ty: GgmlTy) -> Option<&'static str> {
         GgmlTy::Q4K => Some(ROWS_Q4K),
         GgmlTy::Q5K => Some(ROWS_Q5K),
         GgmlTy::Q6K => Some(ROWS_Q6K),
+        GgmlTy::Iq4Nl => Some(ROWS_IQ4NL),
+        GgmlTy::Iq4Xs => Some(ROWS_IQ4XS),
+        GgmlTy::Iq3Xxs => Some(ROWS_IQ3XXS),
+        GgmlTy::Iq3S => Some(ROWS_IQ3S),
+        GgmlTy::Q2K => Some(ROWS_Q2K),
+        GgmlTy::Q3K => Some(ROWS_Q3K),
+        GgmlTy::Iq2Xxs => Some(ROWS_Iq2Xxs),
+        GgmlTy::Iq2Xs => Some(ROWS_Iq2Xs),
+        GgmlTy::Iq2S => Some(ROWS_Iq2S),
+        GgmlTy::Iq1S => Some(ROWS_Iq1S),
         _ => None,
     }
 }
@@ -654,6 +779,8 @@ pub const fn rows_entry_for(ty: GgmlTy) -> Option<&'static str> {
 pub const fn rows_threads(ty: GgmlTy) -> usize {
     match ty {
         GgmlTy::Q6K => 64,
+        // Q2_K/Q3_K 的块解量化按 `tid/32`、`tid/4` 分工 ⇒ 需 64 线程
+        GgmlTy::Q2K | GgmlTy::Q3K => 64,
         _ => 32,
     }
 }
@@ -807,11 +934,23 @@ mod tests {
             ("Q5_K", GgmlTy::Q5K),
         ] {
             assert!(entry_for(t).is_some(), "{n} 应在已移植集(PORTED)");
+            assert!(range_entry_for(t).is_some(), "{n} 应有行窗解量化入口");
+        }
+        // IQ 族(2026-10-20;REQ-GGUF-04):三条腿全在(GEMM / 行解量化 / 行窗)
+        for (n, t) in [
+            ("IQ4_XS", GgmlTy::Iq4Xs),
+            ("IQ4_NL", GgmlTy::Iq4Nl),
+            ("IQ3_XXS", GgmlTy::Iq3Xxs),
+            ("IQ3_S", GgmlTy::Iq3S),
+        ] {
+            assert!(entry_for(t).is_some(), "{n} 应在已移植集(PORTED)");
+            assert!(rows_entry_for(t).is_some(), "{n} 应有行解量化入口");
+            assert!(range_entry_for(t).is_some(), "{n} 应有行窗解量化入口");
         }
         assert!(GgmlTy::F32.native_dtype().is_some());
         assert!(GgmlTy::Q4K.native_dtype().is_none(), "量化型不得走元素路径");
-        // 未移植者必须**无入口** ⇒ 可跑性响亮拒(设计 R3:IQ 样本未到)
-        for t in [GgmlTy::Iq4Xs, GgmlTy::Iq4Nl, GgmlTy::Tq1_0, GgmlTy::Mxfp4, GgmlTy::Q2K] {
+        // 未移植者必须**无入口** ⇒ 可跑性响亮拒(设计 R3:IQ1/IQ2 与长尾型)
+        for t in [GgmlTy::Iq1S, GgmlTy::Iq2Xxs, GgmlTy::Tq1_0, GgmlTy::Mxfp4, GgmlTy::Q2K] {
             assert!(entry_for(t).is_none(), "{:?} 不该有入口(未移植)", t);
         }
     }

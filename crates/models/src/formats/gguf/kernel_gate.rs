@@ -20,6 +20,7 @@ mod tests {
     use crate::contract::Dtype;
     use crate::formats::gguf::dequant::dequant_all;
     use crate::formats::gguf::reader::Gguf;
+    use crate::formats::gguf::GgmlTy;
     use crate::ops::SemanticKernel;
     use crate::testkit::harvest_f16;
     use crate::TensorOps;
@@ -1007,6 +1008,28 @@ mod tests {
                     ("blk.3.attn_q.weight", "Q8_0"),
                 ][..],
             ),
+            // ---- IQ 族行窗(2026-10-20;REQ-GGUF-04)----
+            // IQ4_NL 是最难的一档:组宽 256 = **8 个 32 元素块**(其余 IQ = 1 个超块)
+            ("gguf:0.8b-iq4xs", &[("blk.0.attn_gate.weight", "IQ4_XS")][..]),
+            (
+                "gguf:27b-iq3s",
+                &[
+                    ("blk.11.attn_k.weight", "IQ4_NL"),
+                    ("blk.4.attn_gate.weight", "IQ3_S"),
+                    ("blk.1.attn_gate.weight", "IQ3_XXS"),
+                    ("blk.19.attn_q.weight", "IQ2_XXS"),
+                    ("blk.0.ffn_up.weight", "IQ1_S"),
+                ][..],
+            ),
+            (
+                "gguf:27b-iq4xs",
+                &[
+                    ("blk.15.attn_q.weight", "Q2_K"),
+                    ("blk.12.ssm_out.weight", "Q3_K"),
+                    ("blk.0.ffn_gate.weight", "IQ2_XS"),
+                    ("blk.0.ffn_up.weight", "IQ2_S"),
+                ][..],
+            ),
         ] {
             if !resource_ok(res_key) {
                 eprintln!("skip: 资源清单缺 \"{res_key}\"");
@@ -1108,5 +1131,185 @@ mod tests {
             }
         }
     }
+
+
+    /// **IQ 族 GPU 门**(2026-10-20;REQ-GGUF-04):MMVQ vs CPU 参考(GPU 域)。
+    ///
+    /// 判据与 k-quant 门同口径(`max|Δ|/max|ref| < 2e-2`):错码本/错符号表/
+    /// 错尺度/错块位移一律 O(1) 相对误差,而 q8_1 激活量化噪声只有 ~1e-3。
+    /// 样本 = 本机存量(`0.8B-IQ4_XS` / `27B-UD-IQ3_S`)。
+    #[owl_test(gpu)]
+    async fn gpu_gguf_iq_gemm_matches_cpu_reference() {
+        // (资源键, 张量, 期望型, m)
+        let cases: &[(&str, &str, &str, usize)] = &[
+            ("gguf:0.8b-iq4xs", "blk.0.attn_gate.weight", "IQ4_XS", 2),
+            ("gguf:27b-iq3s", "blk.1.attn_gate.weight", "IQ3_XXS", 1),
+            ("gguf:27b-iq3s", "blk.4.attn_gate.weight", "IQ3_S", 1),
+            ("gguf:27b-iq3s", "blk.11.attn_k.weight", "IQ4_NL", 2),
+            // 27B UD 档(2026-10-20):Q2_K/Q3_K/IQ2_*/IQ1_S
+            ("gguf:27b-iq4xs", "blk.15.attn_q.weight", "Q2_K", 1),
+            ("gguf:27b-iq4xs", "blk.12.ssm_out.weight", "Q3_K", 1),
+            ("gguf:27b-iq4xs", "blk.0.ffn_gate.weight", "IQ2_XS", 1),
+            ("gguf:27b-iq4xs", "blk.0.ffn_up.weight", "IQ2_S", 1),
+            ("gguf:27b-iq3s", "blk.19.attn_q.weight", "IQ2_XXS", 1),
+            ("gguf:27b-iq3s", "blk.0.ffn_up.weight", "IQ1_S", 1),
+        ];
+        let mut gpu = crate::testkit::gpu_client().await;
+        for (res_key, tname, want_ty, m) in cases.iter().copied() {
+            if !resource_ok(res_key) {
+                eprintln!("skip: 资源清单缺 \"{res_key}\"");
+                continue;
+            }
+            let g = Gguf::open(&PathBuf::from(resource(res_key).expect("列了就有")))
+                .expect("open");
+            let ti = g.get_tensor(tname).unwrap_or_else(|| panic!("缺张量 {tname}"));
+            assert_eq!(ti.ty.name(), want_ty, "[{res_key}] {tname} 型不符(用例表过期?)");
+            let ix = g.index_of(tname).unwrap();
+            let bytes = g.bytes(ix);
+            let (rows, inner): (usize, usize) = (ti.rows() as usize, ti.inner() as usize);
+            let (be, bb) = ti.ty.block();
+            let row_bytes = inner / be * bb;
+            assert_eq!(row_bytes as u64, ti.row_bytes());
+
+            let w = dequant_all(ti.ty, bytes, rows, inner).expect("dequant");
+            let k = inner;
+            let xv: Vec<f32> = (0..m * k)
+                .map(|i| {
+                    let f = half::f16::from_f32(((i as f32 * 0.0173).sin() * 1.7).clamp(-2.5, 2.5));
+                    f.to_f32()
+                })
+                .collect();
+            let (yref, qloss) = reference(&xv, &w, m, rows, k);
+
+            let xb: Vec<u8> = xv.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
+            let x = TensorOps::from_host(Dtype::F16, vec![m, k], &xb);
+            let wblk = TensorOps::from_host(Dtype::U8, vec![rows, row_bytes], bytes);
+            let xq_bytes = m * (k / 32) * XQ_BLOCK;
+            let xq = TensorOps::call(SemanticKernel::GgufQuantActF16)
+                .arg(&x)
+                .arg_i32(k as i32)
+                .arg_i32(k as i32)
+                .aux(&[m, k])
+                .with_shape(Dtype::U8, vec![m, xq_bytes / m]);
+            let y = TensorOps::call(SemanticKernel::GgufGemm)
+                .arg(&wblk)
+                .arg(&xq)
+                .arg_i32(m as i32)
+                .arg_i32(rows as i32)
+                .arg_i32(k as i32)
+                .arg_i32(k as i32)
+                .arg_i32(0)
+                .arg_i32(rows as i32)
+                .aux(&[want_ty_code(want_ty), m, rows])
+                .with_shape(Dtype::F16, vec![m, rows]);
+            let got = harvest_f16(&mut gpu, &y).await;
+            assert_eq!(got.len(), m * rows, "{tname} 输出元素数");
+
+            let scale = yref.iter().fold(0f64, |a, v| a.max(v.abs())).max(1e-12);
+            let mut maxd = 0f64;
+            let mut worst = 0usize;
+            for (i, (a, b)) in got.iter().zip(&yref).enumerate() {
+                let d = (*a as f64 - *b).abs() / scale;
+                if d > maxd {
+                    maxd = d;
+                    worst = i;
+                }
+            }
+            eprintln!(
+                "[gguf-iq] {res_key} {tname}({want_ty}, {rows}×{inner}, m={m}) \
+                 max|Δ|/max|ref| = {maxd:.3e}(量化损失 {qloss:.3e};@ {worst};\
+                 gpu/ref @0 = {:.6}/{:.6} = {:.4})",
+                got[0] as f64,
+                yref[0],
+                if yref[0].abs() > 0.0 { got[0] as f64 / yref[0] } else { f64::NAN }
+            );
+            assert!(
+                maxd < 0.02,
+                "[{res_key}] {tname}({want_ty}) 超阈:{maxd:.4e} @ {worst}"
+            );
+        }
+    }
+
+    /// **IQ 族行解量化门**(合成表;覆盖本机 `token_embd` 未用到的型)。
+    ///
+    /// 判据 = 与 `dequant_row`(已与 gguf-py 位级对拍)逐元素相等;容差取 f16 舍入
+    /// 量级(核内用 half 算),错行/错块/错码本会给 O(1)。
+    #[owl_test(gpu)]
+    async fn gpu_gguf_iq_rows_matches_reference() {
+        use crate::formats::gguf::dequant::dequant_row;
+        let mut gpu = crate::testkit::gpu_client().await;
+        for ty in [
+            GgmlTy::Iq4Nl,
+            GgmlTy::Iq4Xs,
+            GgmlTy::Iq3Xxs,
+            GgmlTy::Iq3S,
+            GgmlTy::Q2K,
+            GgmlTy::Q3K,
+            GgmlTy::Iq2Xxs,
+            GgmlTy::Iq2Xs,
+            GgmlTy::Iq2S,
+            GgmlTy::Iq1S,
+        ] {
+            let (be, bb) = ty.block();
+            let inner = 512usize;
+            let rows = 4usize;
+            let row_bytes = inner / be * bb;
+            // 确定性伪随机字节(固定 LCG):块内每个 bit 都被真实覆盖
+            let mut st = 0x1234_5678u32;
+            let mut bytes = vec![0u8; rows * row_bytes];
+            for b in bytes.iter_mut() {
+                st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+                *b = (st >> 24) as u8;
+            }
+            // **尺度必须是有限 half**:随机字节的指数位会落进 inf/NaN 区,
+            // 参考侧(d = inf)与核侧同坏 ⇒ 判据变 inf/inf(实测踩到)。
+            for r in 0..rows {
+                for b in 0..(inner / be) {
+                    let d = half::f16::from_f32(0.02 + 0.001 * ((r + b) % 7) as f32);
+                    // **d 的位置随型不同**:Q3_K/Q6_K 在块尾,其余在块首
+                    let doff = match ty {
+                        GgmlTy::Q3K | GgmlTy::Q6K => bb - 2,
+                        _ => 0,
+                    };
+                    let o = r * row_bytes + b * bb + doff;
+                    bytes[o..o + 2].copy_from_slice(&d.to_le_bytes());
+                }
+            }
+            let ids: [usize; 3] = [0, 1, rows - 1];
+            let ids_b: Vec<u8> = ids.iter().flat_map(|i| (*i as f32).to_le_bytes()).collect();
+            let tbl = TensorOps::from_host(Dtype::U8, vec![rows, row_bytes], &bytes);
+            let idt = TensorOps::from_host(Dtype::F32, vec![ids.len()], &ids_b);
+            let out = TensorOps::call(SemanticKernel::GgufDequantRows)
+                .arg(&tbl)
+                .arg(&idt)
+                .arg_i32(inner as i32)
+                .arg_i32(ids.len() as i32)
+                .arg_i32(rows as i32)
+                .aux(&[ty.code() as usize, ids.len(), inner])
+                .with_shape(Dtype::F16, vec![ids.len(), inner]);
+            let got = harvest_f16(&mut gpu, &out).await;
+            for (r, id) in ids.iter().copied().enumerate() {
+                let mut want = vec![0f32; inner];
+                dequant_row(ty, &bytes[id * row_bytes..(id + 1) * row_bytes], &mut want)
+                    .unwrap_or_else(|e| panic!("{} dequant_row: {e}", ty.name()));
+                let scale = want.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6) as f64;
+                let mut maxd = 0f64;
+                let mut worst = 0usize;
+                for i in 0..inner {
+                    let d = (got[r * inner + i] as f64 - want[i] as f64).abs() / scale;
+                    if d > maxd {
+                        maxd = d;
+                        worst = i;
+                    }
+                }
+                eprintln!(
+                    "[gguf-iq-rows] {}(id={id}) max|Δ|/max|ref| = {maxd:.3e} @ {worst}",
+                    ty.name()
+                );
+                assert!(maxd < 5e-3, "{} id={id} 超阈:{maxd:.3e} @ {worst}", ty.name());
+            }
+        }
+    }
+
 
 }

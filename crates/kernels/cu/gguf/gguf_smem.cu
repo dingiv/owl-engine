@@ -117,12 +117,116 @@ __device__ __forceinline__ void row_q5_K(const void * __restrict__ vx,
     y[33] = __hsub(__hmul(d2, __int2half_rn((ql[1] >> 4) + (qh[1] & hm ? 16 : 0))), m2);
 }
 
+/// **IQ 族行解量化**(2026-10-20;REQ-GGUF-04):块解量化函数本身就是
+/// **32 线程协作式**(`tid >= 32` 早退)⇒ 单 warp 直调,零转写。
+/// 块几何:IQ4_NL = 32 元素,Iq3Xxs/Iq3S/Iq4Xs = 256 元素。
+__device__ __forceinline__ void row_iq4_nl(const void * __restrict__ vx,
+                                           __half * __restrict__ yy, int) {
+    dequantize_block_iq4_nl<__half>(vx, yy);
+}
+__device__ __forceinline__ void row_iq4_xs(const void * __restrict__ vx,
+                                           __half * __restrict__ yy, int) {
+    dequantize_block_iq4_xs<__half>(vx, yy);
+}
+__device__ __forceinline__ void row_iq3_xxs(const void * __restrict__ vx,
+                                            __half * __restrict__ yy, int) {
+    dequantize_block_iq3_xxs<__half>(vx, yy);
+}
+__device__ __forceinline__ void row_iq3_s(const void * __restrict__ vx,
+                                          __half * __restrict__ yy, int) {
+    dequantize_block_iq3_s<__half>(vx, yy);
+}
+
+/// **Q2_K / Q3_K / IQ2_* / IQ1_S 行解量化**(2026-10-20;27B UD 档):
+/// 块解量化函数本身就按 `threadIdx.x` 分工 —— Q2_K/Q3_K 需 **64 线程**
+/// (走 `RowDeq::two_pass`),IQ2_*/IQ1_S 需 32。
+/// Q2_K:**转写为 tid 参数化**(快照里的 `dequantize_block_q2_K` 读 `threadIdx.x`
+/// 且按 `tid/32` 分 n ⇒ 需要 64 线程;行窗核只有 32 lane ⇒ 用
+/// `tid = lane, lane+32` 两趟,Q6_K 同法)。数学逐式未动。
+__device__ __forceinline__ void row_q2_k(const void * __restrict__ vx,
+                                         __half * __restrict__ yy, int tid) {
+    const block_q2_K * x = reinterpret_cast<const block_q2_K *>(vx);
+    const int n = tid / 32;
+    const int l = tid - 32 * n;
+    const int is = 8 * n + l / 16;
+    const uint8_t q = x->qs[32 * n + l];
+    __half * y = yy + 128 * n;
+    const half dall = __low2half(x->dm);
+    const half dmin = __high2half(x->dm);
+    y[l +  0] = __hsub(__hmul(dall, __int2half_rn((x->scales[is + 0] & 0xF) * ((q >> 0) & 3))),
+                       __hmul(dmin, __int2half_rn(x->scales[is + 0] >> 4)));
+    y[l + 32] = __hsub(__hmul(dall, __int2half_rn((x->scales[is + 2] & 0xF) * ((q >> 2) & 3))),
+                       __hmul(dmin, __int2half_rn(x->scales[is + 2] >> 4)));
+    y[l + 64] = __hsub(__hmul(dall, __int2half_rn((x->scales[is + 4] & 0xF) * ((q >> 4) & 3))),
+                       __hmul(dmin, __int2half_rn(x->scales[is + 4] >> 4)));
+    y[l + 96] = __hsub(__hmul(dall, __int2half_rn((x->scales[is + 6] & 0xF) * ((q >> 6) & 3))),
+                       __hmul(dmin, __int2half_rn(x->scales[is + 6] >> 4)));
+}
+
+/// Q3_K:同上(快照版 `threadIdx.x/4` ⇒ 64 线程;tid 参数化 + 两趟)。
+__device__ __forceinline__ void row_q3_k(const void * __restrict__ vx,
+                                         __half * __restrict__ yy, int tid) {
+    const block_q3_K * x = reinterpret_cast<const block_q3_K *>(vx);
+    const int r = tid / 4;
+    const int t2 = r / 2;
+    const int is0 = r % 2;
+    const int l0 = 16 * is0 + 4 * (tid % 4);
+    const int n = t2 / 4;
+    const int j = t2 - 4 * n;
+    const uint8_t m = uint8_t(1 << (4 * n + j));
+    const int is = 8 * n + 2 * j + is0;
+    const int shift = 2 * j;
+    const int8_t us = is < 4 ? (x->scales[is - 0] & 0xF) | (((x->scales[is + 8] >> 0) & 3) << 4)
+                    : is < 8 ? (x->scales[is - 0] & 0xF) | (((x->scales[is + 4] >> 2) & 3) << 4)
+                    : is < 12 ? (x->scales[is - 8] >> 4) | (((x->scales[is + 0] >> 4) & 3) << 4)
+                              : (x->scales[is - 8] >> 4) | (((x->scales[is - 4] >> 6) & 3) << 4);
+    const half dl = __hmul(x->d, __int2half_rn(us - 32));
+    __half * y = yy + 128 * n + 32 * j;
+    const uint8_t * q = x->qs + 32 * n;
+    const uint8_t * hm = x->hmask;
+    for (int l = l0; l < l0 + 4; ++l) {
+        y[l] = __hmul(dl, __int2half_rn((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+    }
+}
+__device__ __forceinline__ void row_iq2_xxs(const void * __restrict__ vx,
+                                            __half * __restrict__ yy, int) {
+    dequantize_block_iq2_xxs<__half>(vx, yy);
+}
+__device__ __forceinline__ void row_iq2_xs(const void * __restrict__ vx,
+                                           __half * __restrict__ yy, int) {
+    dequantize_block_iq2_xs<__half>(vx, yy);
+}
+__device__ __forceinline__ void row_iq2_s(const void * __restrict__ vx,
+                                          __half * __restrict__ yy, int) {
+    dequantize_block_iq2_s<__half>(vx, yy);
+}
+__device__ __forceinline__ void row_iq1_s(const void * __restrict__ vx,
+                                          __half * __restrict__ yy, int) {
+    dequantize_block_iq1_s<__half>(vx, yy);
+}
+
 /// 逐型行解量化(静态分发;`two_pass = true` 的型需要两趟 `tid = lane, lane+32`)
 template <typename block_q_t, int qk, void (*ROW)(const void *, __half *, int)>
 struct RowDeq {
     static constexpr bool two_pass = false;
     static __device__ __forceinline__ void run(const void * blk, __half * dst, int lane) {
         ROW(blk, dst, lane);
+    }
+};
+template <>
+struct RowDeq<block_q2_K, QK_K, owl_gguf_smem::row_q2_k> {
+    static constexpr bool two_pass = true;
+    static __device__ __forceinline__ void run(const void * blk, __half * dst, int lane) {
+        owl_gguf_smem::row_q2_k(blk, dst, lane);
+        owl_gguf_smem::row_q2_k(blk, dst, lane + 32);
+    }
+};
+template <>
+struct RowDeq<block_q3_K, QK_K, owl_gguf_smem::row_q3_k> {
+    static constexpr bool two_pass = true;
+    static __device__ __forceinline__ void run(const void * blk, __half * dst, int lane) {
+        owl_gguf_smem::row_q3_k(blk, dst, lane);
+        owl_gguf_smem::row_q3_k(blk, dst, lane + 32);
     }
 };
 template <>
@@ -387,4 +491,66 @@ extern "C" __global__ void owl_gguf_gemm_smem_q6k(
     __half * __restrict__ out, int m, int n, int k, int out_off, int out_ld) {
     owl_gguf_smem::body<block_q6_K, QK_K, owl_gguf_smem::row_q6_K>(
         weights, x, out, m, n, k, out_off, out_ld);
+}
+
+// ---- IQ 族行窗解量化(2026-10-20;REQ-GGUF-04)----
+// 组宽仍 = 256 元素:IQ4_XS/IQ3_XXS/IQ3_S = 1 个超块;IQ4_NL = 8 个块
+// (循环 `GQ/qk` 次,每次一个 warp 解 32 元素)。
+extern "C" __global__ void owl_gguf_dequant_range_iq4nl(const void * __restrict__ w,
+                                                        __half * __restrict__ out, int n0,
+                                                        int rows, int k) {
+    owl_gguf_range::range_body<block_iq4_nl, QK_IQ4_NL, owl_gguf_smem::row_iq4_nl>(w, out, n0, rows, k);
+}
+extern "C" __global__ void owl_gguf_dequant_range_iq4xs(const void * __restrict__ w,
+                                                        __half * __restrict__ out, int n0,
+                                                        int rows, int k) {
+    owl_gguf_range::range_body<block_iq4_xs, QK_K, owl_gguf_smem::row_iq4_xs>(w, out, n0, rows, k);
+}
+extern "C" __global__ void owl_gguf_dequant_range_iq3xxs(const void * __restrict__ w,
+                                                         __half * __restrict__ out, int n0,
+                                                         int rows, int k) {
+    owl_gguf_range::range_body<block_iq3_xxs, QK_K, owl_gguf_smem::row_iq3_xxs>(w, out, n0, rows, k);
+}
+extern "C" __global__ void owl_gguf_dequant_range_iq3s(const void * __restrict__ w,
+                                                       __half * __restrict__ out, int n0,
+                                                       int rows, int k) {
+    owl_gguf_range::range_body<block_iq3_s, QK_K, owl_gguf_smem::row_iq3_s>(w, out, n0, rows, k);
+}
+
+// ---- 27B UD 档补六型(2026-10-20)----
+
+extern "C" __global__ void owl_gguf_dequant_range_q2k(const void * __restrict__ w,
+                                                        __half * __restrict__ out, int n0,
+                                                        int rows, int k) {
+    owl_gguf_range::range_body<block_q2_K, QK_K, owl_gguf_smem::row_q2_k>(w, out, n0, rows, k);
+}
+
+extern "C" __global__ void owl_gguf_dequant_range_q3k(const void * __restrict__ w,
+                                                        __half * __restrict__ out, int n0,
+                                                        int rows, int k) {
+    owl_gguf_range::range_body<block_q3_K, QK_K, owl_gguf_smem::row_q3_k>(w, out, n0, rows, k);
+}
+
+extern "C" __global__ void owl_gguf_dequant_range_iq2xxs(const void * __restrict__ w,
+                                                        __half * __restrict__ out, int n0,
+                                                        int rows, int k) {
+    owl_gguf_range::range_body<block_iq2_xxs, QK_K, owl_gguf_smem::row_iq2_xxs>(w, out, n0, rows, k);
+}
+
+extern "C" __global__ void owl_gguf_dequant_range_iq2xs(const void * __restrict__ w,
+                                                        __half * __restrict__ out, int n0,
+                                                        int rows, int k) {
+    owl_gguf_range::range_body<block_iq2_xs, QK_K, owl_gguf_smem::row_iq2_xs>(w, out, n0, rows, k);
+}
+
+extern "C" __global__ void owl_gguf_dequant_range_iq2s(const void * __restrict__ w,
+                                                        __half * __restrict__ out, int n0,
+                                                        int rows, int k) {
+    owl_gguf_range::range_body<block_iq2_s, QK_K, owl_gguf_smem::row_iq2_s>(w, out, n0, rows, k);
+}
+
+extern "C" __global__ void owl_gguf_dequant_range_iq1s(const void * __restrict__ w,
+                                                        __half * __restrict__ out, int n0,
+                                                        int rows, int k) {
+    owl_gguf_range::range_body<block_iq1_s, QK_K, owl_gguf_smem::row_iq1_s>(w, out, n0, rows, k);
 }

@@ -20,6 +20,7 @@
 
 pub mod convention;
 pub mod dequant;
+mod iq_tables;
 pub mod kernel_gate;
 pub mod load_gate;
 pub mod meta;
