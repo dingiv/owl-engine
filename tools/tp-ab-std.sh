@@ -14,7 +14,7 @@
 #   tools/tp-ab-std.sh tp2 --extra --ignore-eos   # `--extra` 之后原样转给 cli
 #
 # 口径纪律(**改任一条都会让两臂不可比**):
-#   · 档位几何/白名单在 flavor(`flavors/tp27b.toml` vs `awq27b.toml`);
+#   · 档位几何/白名单在 flavor(`profiles/legacy/tp27b.toml` vs `awq27b.toml`);
 #     运行档 `testdata/args/bench-27b-tp{1,2}.toml` 只管模型路径与卡位;
 #   · **TP1 与 TP2 必须逐项同参** —— 唯一允许的差别 = rank 数(单卡 vs 双卡);
 #   · `--ignore-eos` = greedy 档跑满 256 tok(否则 OOD 词池下提前停 ⇒ decode 成伪影);
@@ -67,7 +67,7 @@ if [ "$(busy)" != "0" ]; then
   nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid,used_memory --format=csv,noheader
 fi
 
-# 一臂 = 起服 → std → 停服。`--flavor` 与运行档由调用方给(两臂唯一差别在 rank 数)。
+# 一臂 = 起服 → std → 停服。profile 路径与运行档由调用方给(两臂唯一差别在 rank 数)。
 run_arm() {
   local tag="$1" flavor="$2" cfg="$3"
   local log="$OUT_DIR/$tag.log" csv="$OUT_DIR/$tag-std.csv" json="$OUT_DIR/$tag-std.json"
@@ -91,7 +91,7 @@ run_arm() {
     esac
   done
   sleep 3
-  setsid nohup ./target/release/server --flavor "$flavor" "$cfg" --log-level warn \
+  setsid nohup ./target/release/server -p "profiles/legacy/$flavor.toml" "$cfg" --log-level warn \
     >> "$log" 2>&1 < /dev/null &
   local srv=$!
   local ok=0

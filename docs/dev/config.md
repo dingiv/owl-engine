@@ -5,29 +5,38 @@
 > 纪律:**引擎行为不许用 env 控**(env 只剩 `OWL_CONFIG` 路径兜底 + 测试域自读);
 > 一切可配项走配置文件/CLI 显式声明。
 >
-> 2026-10-20 起有两条档位路径:**旧 flavor(低层键)** 与 **新 profile(意图)**。
-> 旧档原样可跑;新档只写 6–10 个意图键,低层键由解析器派生。
+> **2026-10-20 配置统一**:只有一个概念 —— **profile = 一份 TOML 配置文件**。
+> 没有 "flavor"。用户启动用 `-p <profile_path>`;源码 `profiles/` 下是可直接
+> 复制修改的常用档,历史低层档在 `profiles/legacy/`。
 
-## 1. 两条路径
+## 1. 一个概念:profile
 
-| | 旧:flavor | 新:profile(意图) |
-|---|---|---|
-| 文件 | `flavors/*.toml` | `profiles/*.toml` |
-| 内容 | 低层键(池/上下文/图臂/白名单…) | `[intent]` 6–10 键 |
-| 入口 | `--flavor <名>` | `--profile <名>` |
-| 预检 | 只做配置校验 | `--check` 派生 + 内存账 + 模型几何 |
-| 白名单 | 手写 `allowed_ops` | 不写(P1 才从臂集合派生;当前 = 门关) |
+| | profile |
+|---|---|
+| 文件 | 任意路径的 `.toml`;源码常用档在 `profiles/` |
+| 内容 | `[intent]` 意图键,或低层键(同一 loader;高级覆盖) |
+| 入口 | `-p/--profile <profile_path>` |
+| 查找 | **不做名字查找**;路径直接给 |
+| 预检 | `--check` 派生 + 内存账 + 模型几何 |
 
-两条路径共用同一个 loader/语义门;`--profile` 与 `--flavor` **互斥**。
-旧档迁移(P2)之前,行为面临时实验仍可写低层键(profile 里也允许,见 §6)。
+常用组合直接复制:
+
+```bash
+cp profiles/tp27b-3080-184k.toml ~/my-27b.toml
+$EDITOR ~/my-27b.toml          # 改 model.dir / runtime.bind / tp_ordinals
+./target/release/server -p ~/my-27b.toml
+```
+
+`profiles/` 顶层是常用档;`profiles/legacy/` 是历史低层档(回归/取证),
+同样用 `-p profiles/legacy/<name>.toml` 显式路径启动。
 
 ## 2. 层序(后面的覆盖前面的)
 
 ```text
 Default(代码缺省)
-  → Flavor 或 Profile(基准档;--flavor/--profile)
-  → 位置参数 CONFIG(历史用法:站点/实验覆盖)
-  → --site <PATH>(站点层:路径/卡位/端口)
+  → -p <profile_path>(配置档;意图或低层键)
+  → 位置参数 CONFIG(可选覆盖层)
+  → --site <PATH>(可选站点层)
   → CLI(--set / --log-* / --perf-level / --step-gate*)
   → [intent] 派生(只填空:显式低层键优先)
 ```
@@ -35,6 +44,27 @@ Default(代码缺省)
 注意最后一步的顺序:**显式低层键覆盖意图派生值**(高级覆盖),派生只填
 "没人写"的键。`--set`/CLI 旗标与文件同一条链,所以
 `--print-config` 看到的**就是** boot 用的配置(不再有 print 之后二次覆盖)。
+
+### 2.1 KernelSelectionEnv(boot 投影)
+
+启动后由 `KernelSelectionEnv` 冻结选核环境,不再让 picker 读配置:
+
+```text
+EnvProvider → KernelSelectionEnv {
+    HwCaps    arch
+    QuantCaps plan / act dtype
+    KvCaps    quant / dtype / page / hd / grp / paged
+    FeatureCaps vision / spec_depth / tp_ranks
+}
+           → kernel_env.op_env() → driver::OpEnv
+```
+
+- `EnvProvider.kernel_env` 是唯一快照;`op_env()` 优先读它;
+- target 与 draft 各一份(draft 的 hd/grp/池 dtype 不同);
+- boot 日志 `[kernel-env] target: ... / draft: ...` 可直接审计;
+- `KernelSelectionEnv::resolve(OpSpec)` / `collect_ops` 已提供派生入口;
+  `TagFilter` 由配置事实派生（W4A16/GGUF/KV/vision/spec/TP/head），
+  不再手抄 `allowed_ops`。
 
 ## 3. Intent schema(`[intent]`)
 
@@ -93,7 +123,7 @@ max_seq      = usable / per_tok(向下取 4k)
 - `stability_margin = 1.30G`(覆盖已知 turn 临时块泄漏 + 激活抖动;
   144k/160k 的实测曲线见设计卷 §7.2)。
 - 3090 Ti + 27B AWQ-INT4 + FP8 KV + spec off + `512+512` ⇒ **128k / 池 4G**,
-  与 `flavors/awq27b-3090-max.toml` 同档(实测 prefill 1436 / decode 47.55)。
+  与 `profiles/awq27b-3090-max.toml` 同档(实测 prefill 1436 / decode 47.55)。
 - **并发 C**:`pool_tokens` 是**全局**容量 ⇒ 非超卖档 `pool = 上下文 × C`,
   单会话上下文按 `usable / (per_tok × C)` 求解(例:C=2 ⇒ 每会话 64k / 池 128k)。
   `max_batch=C(≤8)` 自动启用合批;**≥2 活跃 turn 的批路走 v2 注意力**
@@ -123,20 +153,19 @@ device    = { bdf = "42:00.0" }              # 或 uuid / find_name
 ```bash
 # 预检(不加载权重,~10–20ms):派生 + 内存账 + 模型/草稿几何
 # 27B 必须给站点档(无缺省资产);有 FAIL ⇒ 退出码 1,报告一次列全
-server --profile awq27b-3090-max --site testdata/args/base.toml --check
+server -p profiles/awq27b-3090-max.toml --site testdata/args/base.toml --check
 
 # 生效配置 + 逐键来源 / 内存估算(JSON)
-server --profile … --site … --print-config --format json | jq '.provenance["pool.pool_tokens"]'
+server -p profiles/… --site … --print-config --format json | jq '.provenance["pool.pool_tokens"]'
 
 # 单键解释:值 / 来源 / 派生规则
-server --profile … --site … --explain runtime.max_seq
+server -p profiles/… --site … --explain runtime.max_seq
 
 # 临时覆盖(替代启动脚本的 extends 拼档;可重复)
-server --profile … --site … --set runtime.max_seq=65536 --set runtime.device.bdf=41:00.0
+server -p profiles/… --site … --set runtime.max_seq=65536 --set runtime.device.bdf=41:00.0
 
-# 列表
-server --list-profiles
-server --list-flavors
+# 查看源码里的常用档
+ls profiles/
 ```
 
 来源(`provenance`)五类:`default` / `file:<路径>` / `site` / `cli` /
@@ -144,21 +173,39 @@ server --list-flavors
 
 ## 7. 加新档
 
-1. **优先写意图档**(`profiles/<名>.toml`):只写意图 + 必要的低层覆盖;
+1. **复制 `profiles/` 里最接近的档**到任意路径,再改:优先意图键,
+   必要的低层键作覆盖;
 2. 先 `--check`(无 GPU 也能跑),看清派生值与内存账;
 3. 真机 boot 后对照 `[vram-gov]` 与 `--print-config` 的估算;偏差大时先查
    `live`(权重是否换了家族)/ `fixed_after`(并发/快照);
-4. 旧档要实验:仍可用 `--flavor … <overlay.toml>` 或 `--set`。
+4. 历史档在 `profiles/legacy/`;实验也用 `-p <path> <overlay.toml>` 或 `--set`。
+
+## 7.1 视觉塔(`[model].vision`)
+
+- `[model] vision = true` ⇒ 装载检查点 `config.json:vision_config` 的
+  `model.visual.*`(27B AWQ 档;0.8B 响亮拒)。
+- 视觉塔装载 + 引擎图像 prefill + **OpenAI `image_url` / Rust 预处理**已接
+  (data URL;单图;TP2 两 rank 各备塔输出)。
+- **图像 × 投机**(`spec.depth>0`)已接(V5):verify 的 rope 位置 =
+  真实位置 + m-RoPE `delta`,KV slots/lens 仍用真实位置;带图请求仍限
+  单图/非合批。无投机对照档 = `profiles/tp27b-3080-vlm-184k.toml`;
+  视觉+DFlash2 d7 = `profiles/tp27b-3080-184k.toml`;
+  **262k 全设备池 + 视觉 + d7** = `profiles/tp27b-3080-262k-vlm.toml`
+  (单文件完整档;视觉塔算子由 `feat.vision` tag + 配置派生 TagFilter 自动放行,
+  不再手抄 `allowed_ops`/`VISION_OPS`)。
+- `--check` 会检查 `vision_config`/`image_token_id` 并打 WARN;详见
+  `docs/arch/vision-引擎与服务面-接线-设计与施工.md`。
 
 ## 8. 兼容与挂账
 
-- **旧 flavor / testdata 原样可跑**(无 `[intent]` ⇒ 解析器不介入);
+- **历史低层档 `profiles/legacy/` / testdata 原样可跑**(无 `[intent]` ⇒ 解析器不介入);
 - `OWL_MAX_SEQ` / `OWL_PREFILL_CHUNK` **已删除**(2026-10-20):它们会在
   意图派生后再改一次,造成 `max_seq` 与 `pool_tokens` 双源。临时调压请
   `--set runtime.max_seq=…`(池会跟随,除非显式给 `pool.pool_tokens`)。
-- **P1 未做**:`allowed_ops` 从臂集合派生、启动一行摘要、`/debug/config`、
-  `--list-profiles --verbose`;**P2 未做**:旧档迁移器、`context=max`
-  校准探测、长跑泄漏余量曲线。
+- **allowed_ops 已退役**(2026-10-20):配置按 `model.kind/quant/head_quant`、
+  `dispatch.kv_fp8`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生
+  tag filter;`[dispatch] tag_wildcard = true` 是诊断 `*` 逃生门。
+- **P2 未做**:旧档迁移器、`context=max` 校准探测、长跑泄漏余量曲线。
 - 配置层 `deny_unknown_fields` 仍全 module 生效;退役键有专门迁移提示。
-- 测试链(`#[owl_test]` / `OWL_TEST_CONF`)不变:同一 loader,
-  `flavor = "<名>"` 仍是测试环境档的基准写法。
+- 测试链(`#[owl_test]` / `OWL_TEST_CONF`)不变:同一 loader;
+  环境档基准用 `extends = "<path>"`,不再有 `flavor` 名字键。

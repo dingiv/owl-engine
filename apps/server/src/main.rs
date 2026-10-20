@@ -42,6 +42,7 @@ mod config;
 mod debug;
 mod http;
 mod openai;
+mod vision_processor;
 // 三通道流式解析器(增量文本 → 思考/正文/工具调用;agent 服务面 §4.5)
 mod toolcall;
 
@@ -87,7 +88,7 @@ type DbgFace = std::sync::Arc<
 
 #[tokio::main]
 async fn main() {
-    // CLI:唯一参数面(配置文件路径 + flavor;手写解析,未知参数拒启)
+    // CLI:唯一参数面(-p <profile_path> + 显式覆盖;手写解析,未知参数拒启)
     let args = match crate::config::CliArgs::parse(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
@@ -99,20 +100,6 @@ async fn main() {
     };
     if args.help {
         eprintln!("{}", crate::config::HELP);
-        return;
-    }
-    if args.list_flavors {
-        eprintln!("可用 flavor:");
-        for n in owl_shared::flavors::preset_names() {
-            eprintln!("  {n}");
-        }
-        return;
-    }
-    if args.list_profiles {
-        eprintln!("可用意图档(--profile):");
-        for n in owl_shared::flavors::profile_names() {
-            eprintln!("  {n}");
-        }
         return;
     }
     // 配置:意图/预设 → 位置参数 → 站点 → CLI(非法即拒;**预检不解意图不选卡**)
@@ -336,7 +323,7 @@ async fn main() {
         .name("owl-engine".into())
         // **显式栈**(2026-10-17):缺省 2MiB 是 debug 档的暗雷 —— 27B + DFlash2
         // 草稿的装载/装配链在 debug 下帧深远超 release(实测
-        // `--flavor spec-dflash testdata/args/e2e-27b.toml` 的 debug 二进制
+        // `-p profiles/legacy/spec-dflash.toml testdata/args/e2e-27b.toml` 的 debug 二进制
         // 在 DFlash2 草稿初始化处栈溢出 SIGABRT;`RUST_MIN_STACK=64M` 即复活)
         // ⇒ 本线程是**唯一**背全模型生命周期的线程,给足栈,别赌优化器。
         .stack_size(ENGINE_STACK_BYTES)

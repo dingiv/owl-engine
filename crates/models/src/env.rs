@@ -362,6 +362,8 @@ pub struct EnvProvider {
     pub diag: DiagEnv,
     /// 求值阶段(性能面定相;不影响计算语义)
     pub phase: EvalPhase,
+    /// **boot 后冻结的选核环境快照**(引擎装配期填;None = 旧路/CPU)
+    pub kernel_env: Option<crate::kernel_env::KernelSelectionEnv>,
 }
 
 impl EnvProvider {
@@ -430,6 +432,9 @@ impl EnvProvider {
     /// driver OpEnv 投影(kernels 零依赖律:契约类型不过 kernels,
     /// 本处是 env → OpEnv 的唯一投影点)
     pub fn op_env(&self) -> Option<owl_kernels::driver::OpEnv> {
+        if let Some(k) = self.kernel_env {
+            return Some(k.op_env());
+        }
         match self.hw {
             HwEnv::Cpu => None,
             HwEnv::Cuda(arch) => Some(owl_kernels::driver::OpEnv {

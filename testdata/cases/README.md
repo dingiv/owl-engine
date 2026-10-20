@@ -12,15 +12,15 @@ crates/<crate>/src/<模块路径>.rs  +  用例名 <fn>
 
 ## 怎么写
 
-只写**差异项**（继承链：`flavor → OWL_TEST_CONF 环境档 → 本文件`）：
+只写**差异项**（继承链：`extends → OWL_TEST_CONF 环境档 → 本文件`）：
 
 ```toml
 # 只改几何:其余全继承(生产档或环境档)
 [runtime]
 max_seq = 2048
 
-# 也可自带基准(等效 extends 到 flavors/<名>.toml)
-# flavor = "spec-dflash"
+# 也可自带基准(显式路径)
+# extends = "profiles/legacy/spec-dflash.toml"
 ```
 
 - **存在才加载**；删除文件 = 还原；**不会影响任何兄弟用例**（天然隔离）；

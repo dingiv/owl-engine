@@ -1,0 +1,82 @@
+# owl 常用档 `tp27b-3080-262k-vlm`(2026-10-20)
+#
+# 2×RTX3080 20G:27B W4A16 · TP2 · **262,144 全设备池** · 视觉塔 · DFlash2 d7。
+# 本档是**单文件可复制**的完整配置(不再 extends):复制到任意路径,改
+# `[model].dir` / `[runtime].bind` / `[runtime].tp_ordinals`,然后:
+#   ./target/release/server -p /path/to/this.toml
+#
+# 显存账(每 rank,实测):Weight 10.44G + Pool 6.75G(主 fp8 4G + 草稿 BF16 2.5G)
+# + Unclassified 0.87G + GDN/图 0.16G ⇒ used ≈ 19.19G / 20.48G,free ≈ 0.9G。
+# 视觉塔算子由 `feat.vision` tag + 配置派生 TagFilter 自动放行(无 allowed_ops)。
+#
+[model]
+name = "qwen3.8-27b"
+dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+kind = "awq27b"
+# **W4A16**:权重 AWQ-INT4(g32 asym)+ **激活 f16**(本档口径;W4A8 质量门未过档)
+quant = "w4a16"
+# **lm_head int8 per-row**(P1.5-a;2026-10-20 起本档默认):
+#   装载期现算(`s_o = absmax/127`,q = RN-even(w/s)),头走
+#   `owl_gemv_i8w_{f16,bf16}`(**只吃 m=1**:prefill 也在末行窄切后调用 ⇒ 同一核)。
+#   判据:TP1 27B token 100%(344/344);TP2 词表切下 96.9%(744/768,唯一分歧
+#   步 = 21.6094 vs 21.6094 的 near-tie,margin 1.6e-2);decode 22.43 → 21.47 ms/tok
+#   (**−4.3%**,3080 对实测)。回退 = 删本行(缺省 off)或显式 `head_quant = "off"`。
+head_quant = "rtn-int8-row"
+
+# 视觉塔装载(model.visual.*;文本主干共享)
+vision = true
+
+[runtime]
+# **TP 档选卡 = 显式双 ordinal**(v1;与 device / device_ordinal 互斥 ——
+# 分片协议要"确定双卡 + 确定 rank 序",自动挑卡结果随占用漂移)。
+# 启动日志 `[boot] 选卡(TP 档):rank0 = ordinal N → GPU-…` 是身份自证。
+# 卡位已写本档(本机 CUDA 序 [2, 3]);换机器请改 `runtime.tp_ordinals`。
+# 测速几何(std 五点 512..8192 + 256 出 ⇒ 8448 够):与 awq27b 基准档同参
+max_seq = 262144
+prefill_chunk = 512
+bind = "127.0.0.1:8138"
+tp_ordinals = [2, 3]
+# **lm_head 词表切**(P1.1 2026-10-19;本档 2026-10-20 才真正打开 ——
+# 此前它只在门/专项档里开过,**生产档一直是每 rank 全表头**)。
+# 判据:`tp_vocab_split_gate` 27B 双卡全绿 —— 半表 124160 ×2 = 248320、
+# 逐步 max|Δ| = **0.000000**(行独立 ⇒ 数值中性)、token 逐位相同(8 tok)。
+# 收益(3080 对 @1024/256 ×3,两台冷启):decode 50.23 → **51.92(+3.4%)**。
+tp_vocab_split = true
+# **AR v1 两核融合**(§11.2;2026-10-19 就有,缺省关 ⇒ 生产一直在跑两核)。
+# A/B(2 冷启 × 3 轮,6/6 配对全正):48.87 → **50.23(+2.4%)**;
+# 0.8B `tp_g8_gate` 融合档 L1 逐位相同(v1=0 / fused=96)。
+tp_ar_fused = true
+
+[spec]
+depth = 7
+tp_draft = true
+
+[pool]
+gdn_slots = 1
+snap_max = 1
+# 长 ctx 生产服务:**前缀缓存关** —— 池按 262k 全量给
+prefix_cache = false
+# **整池 = 全上下文**(常驻,无超卖;无宿主腿)
+pool_tokens = 262144
+# 99% 贴顶:留 256 MiB 守卫余量
+vram_target = 0.99
+vram_reserve_mb = 256
+# 无宿主腿
+host_cache_mb = 0
+snap_host_mb = 0
+
+[sampling]
+# greedy = 恒等门口径(**测速档建议配 `--ignore-eos`**,否则随机词池
+# OOD 输入下模型常几个 token 就停 ⇒ decode 读数成伪影)
+mode = "greedy"
+
+[server]
+max_concurrency = 1
+
+[dispatch]
+# **主 KV e4m3 池**（262k 的唯一解，见卷首账）。
+# 旧 `allowed_ops` 大清单已退役：准入由配置派生的 tag filter 自动完成
+# （W4A16/GGUF/KV/vision/spec/TP/head），不再手抄核名。
+kv_fp8 = true
+prefill_split = false

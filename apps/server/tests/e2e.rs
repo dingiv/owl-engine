@@ -84,7 +84,10 @@ fn spawn_server() -> Result<ServerGuard, String> {
     let log = std::fs::File::create(&log_path).map_err(|e| format!("建日志 {log_path:?}: {e}"))?;
     let bin = env!("CARGO_BIN_EXE_server");
     let mut cmd = Command::new(bin);
-    cmd.args(["--flavor", "spec-dflash"])
+    let spec = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../profiles/legacy/spec-dflash.toml");
+    cmd.arg("-p")
+        .arg(&spec)
         .arg(&cfg_path)
         .stdout(Stdio::null())
         .stderr(log);

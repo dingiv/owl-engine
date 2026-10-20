@@ -11,7 +11,7 @@
 # 起机(单卡 3090 Ti;卡位用 CUDA_VISIBLE_DEVICES=UUID 钉 —— 禁用数字序,
 # 见 `docs/dev/README.md` 的 UUID 钉卡纪律):
 #   CUDA_VISIBLE_DEVICES=GPU-89dffb90-d810-7ce7-f649-60d781508f21 \
-#   target/release/server --flavor gguf4b <用户档.toml> --log-level info
+#   target/release/server -p profiles/legacy/gguf4b.toml <用户档.toml> --log-level info
 #   # 用户档里写: [model] dir = "<...>/Qwen_Qwen3.5-4B-Q4_K_M.gguf" 
 #
 # ⚠️ **量化的两个键在本档无效**(写了也不读):GGUF 的量化型是**逐张量**事实
@@ -57,63 +57,8 @@ max_concurrency = 1
 mode = "greedy"
 
 [dispatch]
-# **算子白名单(deny-by-default;生成 ≠ 手抄)**。
-#
-# 为什么是生成:`awq27b` 档曾因白名单手抄漏一条(`owl_cast_bf16_f16`)、又因
-# `kv_fp8` 与白名单不同族而**整档起不来** —— 手抄清单与真实发射面是两处真源。
-# 本档的清单来自**真实发射账**(唯一证据面):
-#   ① 用户档加 `[cuda] trace_ring = 40000`(或足够大);
-#   ② 依次打 `11 / ~512 / ~1024 / ~2048 / ~4096 / ~8192` token 的请求
-#      (覆盖短 prefill + FI 多 chunk 预填充 + decode 捕获图);
-#   ③ 每轮 `GET /debug/launches/40000` 取 `cmd=="launch"` 的 `name` **取并集**
-#      (⚠️ ring 会绕圈:只 dump 一次会漏掉被冲掉的臂 —— 本轮实测漏 5 个);
-#   ④ 去重排序写回本表。
-# 换文件(不同量化型混布)/换档(开 spec、改 kv_fp8)/改池或臂 ⇒ **重跑 ①-④**;
-# 漏列不会静默错值,而是**发射期响亮拒**(`admission_check` 点名 allowed_ops)。
-allowed_ops = [
-    "cublas_gemm_f16",
-    "flashinfer_prefill_paged_f16",
-    "owl_add_f16",
-    "owl_argmax_f32idx_f16",
-    "owl_fused_add_rmsnorm_f16",
-    "owl_gdn_conv_fwd_f16",
-    "owl_gdn_conv_upd_dual_f16",
-    "owl_gdn_decode_step_v2_f16",
-    "owl_gdn_gating_g_f16",
-    "owl_gdn_l2norm_f16",
-    "owl_gdn_norm_act_f16",
-    "owl_gdn_recurrence_varlen_gqa_f16",
-    "owl_gemv_dual_f16",
-    "owl_gguf_dequant_rows_q6k",
-    "owl_gguf_gemm_q4k",
-    "owl_gguf_gemm_q5k",
-    "owl_gguf_gemm_q6k",
-    "owl_gguf_gemm_q8_0",
-    "owl_gguf_gemm_tile_q4k",
-    "owl_gguf_gemm_tile_q5k",
-    "owl_gguf_gemm_tile_q6k",
-    "owl_gguf_gemm_tile_q8_0",
-    "owl_gguf_gemm_smem_q4k",
-    "owl_gguf_gemm_smem_q5k",
-    "owl_gguf_gemm_smem_q6k",
-    "owl_gguf_gemm_smem_q8_0",
-    "owl_gguf_mmq_q4k",
-    "owl_gguf_mmq_q5k",
-    "owl_gguf_mmq_q6k",
-    "owl_gguf_mmq_q8_0",
-    "owl_gguf_quant_act_f16",
-    "owl_gguf_quant_act_f16_tiled",
-    "owl_narrow_strided_f16",
-    "owl_norm_rope_f16",
-    "owl_qknorm_rope_kv_insert_f16_knhd",
-    "owl_rmsnorm_f16",
-    "owl_sigmoid_f16",
-    "owl_sigmoid_gate_mul_f16",
-    "owl_silu_and_mul_f16",
-    "vllm_paged_attention_v2_f16_knhd_hd256bs32",
-    "vllm_paged_attention_v2_reduce_f16_hd256",
-    "vllm_reshape_and_cache_f16_knhd",
-]
+# `allowed_ops` 已退役(2026-10-20):准入由配置派生 tag filter 自动完成
+# (`quant.gguf` + `kv.main.*` + feature facets),不再手抄/生成核名清单。
 
 [kvmem]
 # 4B 单卡:池足够,选择层关(没有超卖需求 ⇒ 没有东西可以下沉/回灌)

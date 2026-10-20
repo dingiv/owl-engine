@@ -5,8 +5,8 @@
 //! 消费方(engine/cuda/models/server)一律 `from_config(&OwlConfig)`
 //! 组装各自的 knobs/options,**零 env 直读、零散点 parse**。
 //!
-//! **叠加式加载**(2026-10-16:配置层不认识 "flavor" —— 预设档只是预先写好的
-//! 一份配置文件,由入口(`flavors::preset_path` / `profile_path`)解析成路径当
+//! **叠加式加载**(配置层不认识名字:profile 只是预先写好的
+//! 一份配置文件,由入口(`-p <profile_path>`)直接给出路径当
 //! "基准文件"传入):
 //!
 //! ```text
@@ -19,7 +19,7 @@
 //! graphs/reuse`),由唯一派生器展开成低层键;`context = "max"` 用内存模型
 //! 求解(与引擎 `[vram-gov]` 同算式,另补 activation/稳定裕度)。**派生结果仍是
 //! 一份 `OwlConfig`**;每个叶子键的来源记在 [`Origins`](`ResolvedConfig::origins`)
-//! —— `--check` / `--print-config` / `--explain` 都读它。旧 flavor/testdata
+//! —— `--check` / `--print-config` / `--explain` 都读它。旧低层档/testdata
 //! 无 `[intent]` ⇒ 解析器不介入,零变化。
 //!
 //! **继承 `extends`**(2026-10-18):任一被加载的文件可在顶层写
@@ -43,8 +43,6 @@
 //! |---|---|---|
 //! | (顶层) | extends | String / 无 —— 继承另一配置档(相对 = 相对本文件目录;
 //! |   |   | 链可嵌套;环/超深/类型非法 = 拒启。直载 `from_toml_str` 不解析)|
-//! | (顶层) | flavor | String / 无 —— 预设档名(等效 `extends` 到 flavors/<名>.toml;
-//! |   |   | 测试环境档/站点档用它自带基准) |
 //! | (顶层) | intent | 表 / 无 —— **意图层**(派生后摘除;见 `config/intent.rs`) |
 //! | (顶层) | site | 表 / 无 —— **站点映射**(model_dir/draft_dir/bind/device;
 //! |   |   | 派生后摘除;路径/卡位不入库) |
@@ -64,6 +62,7 @@
 //! |   |   | BF16 源(z-lab)喂引擎 = 草稿全噪声 AL=0,装载期嗅探拒启) |
 //! | model | quant | QuantScheme 枚举("w4a16"\|"w4a8")/ w4a16(主干量化方案;|
 //! |   |   | W4A8 = 权重 a8 布局 + per-token int8 激活 + kS8×kU4 GEMM) |
+//! | model | vision | bool / **false**(VLM 视觉塔:装载 `model.visual.*`;纯文本档勿开) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32")/ off(C1;|
 //! |   |   | 竖式/gate 质量门后转正) |
 //! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
@@ -91,7 +90,8 @@
 //! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
 //! | dispatch | verify_v2 / decode_fi / verify_fi / fi_cuda_graph | bool / true、false、false、false(成套:图档瓦 + 窗刷表) |
 //! | dispatch | fi_plan_bake / fi_plan_restore | Option<usize>(0=取 max_seq)、bool / true |
-//! | dispatch | allowed_ops | Option<Vec<String>> / None(空/None = 准入门关) |
+//! | dispatch | allowed_ops | **已退役**(旧键 `deny_unknown_fields` 拒启;准入走 tag filter) |
+//! | dispatch | tag_wildcard | bool / false(诊断 `*`:跳过 tag 过滤) |
 //! | kvmem | select_decode / select_partial / index / pool_overcommit | flag / false(overcommit = 四键全开) |
 //! | kvmem | workspace_per_req / select_sink / select_recent / recall_every | usize / 2240、2、4、1 |
 //! | kvmem | coverage_probe / analyze_at_ctx / evict_policy / dense_floor_mib | 见字段注(lru\|lrfu[:λ]) |
@@ -377,6 +377,12 @@ pub struct ModelCfg {
     pub kind: ModelKind,
     /// **rope 外推/缩放**(`[model.rope]`;缺省关。GGUF 档生效)
     pub rope: RopeCfg,
+    /// **视觉塔**(VLM;2026-10-20 视觉接线):`true` = 装载检查点
+    /// `config.json:vision_config` 的 `model.visual.*` 权重,引擎可走 VLM
+    /// prefill 面。**缺省 false = 纯文本路径逐字节不变**;检查点无
+    /// `vision_config` 而置 true = 装载期响亮拒。
+    #[serde(default)]
+    pub vision: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -805,17 +811,10 @@ pub struct DispatchCfg {
     pub resolve_trace: bool,
     pub host_argmax: bool,
     pub ts_probe: bool,
-    /// **生产算子白名单**(设计 §八 P4「白名单硬门」;`None`/空 = 门关)。
-    ///
-    /// 非空 ⇒ 只允许这些算子发射:未列出的算子**发射即结构化拒**
-    /// (deny-by-default)。语义 = "本档位需要的算子集合" —— 生产档显式列全,
-    /// dev/诊断档留空(门关)。
-    ///
-    /// 为什么是硬门:未建表(仅引入)的算子不该在不知道它契约的情况下进生产;
-    /// 而"哪些算子在跑"此前**无人知道**(实测靠 `launch_time` 日志数)。
-    /// 装配期还会用本表跑**池写集穷举审计**(`ops::audit_active`)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allowed_ops: Option<Vec<String>>,
+    /// **tag 过滤通配符**(诊断/兜底;`true` = `*`,全部放行)。
+    /// 生产缺省 false;配置派生 `TagFilter` 仍按 W4A16/GGUF/KV/feature 过滤。
+    #[serde(default)]
+    pub tag_wildcard: bool,
 }
 
 /// 性能框架分级(映射到 `owl_shared::metrics::level`;见
@@ -1257,10 +1256,10 @@ impl Default for DispatchCfg {
             gdn_fused_decode: true,
             gdn_fused_decode_v2: true,
             kv_fp8: false,
+            tag_wildcard: false,
             resolve_trace: false,
             host_argmax: false,
             ts_probe: false,
-            allowed_ops: None,
         }
     }
 }
@@ -1323,12 +1322,23 @@ fn record_origins(v: &toml::Value, prefix: &str, origin: &Origin, out: &mut Orig
 ///
 /// 新增退役键 = 在表里加一行(`旧写法 → 新写法`)。
 fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
+    if v.get("flavor").is_some() {
+        return Err(
+            "顶层 `flavor` 已移除:配置档统一走 `profiles/`;继承请写 `extends = \"相对路径.toml\"`,用户启动用 `-p <profile_path>`"
+                .to_string(),
+        );
+    }
     /// (module, 退役键, 迁移指引)
     const RETIRED: &[(&str, &str, &str)] = &[
         (
             "model",
             "w4a8",
             "W4A8 档位已从 bool 升格为量化方案枚举 —— 改用 `[model] quant = \"w4a8\"`(值域:\"w4a16\"|\"w4a8\";缺省 \"w4a16\")",
+        ),
+        (
+            "dispatch",
+            "allowed_ops",
+            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`dispatch.kv_fp8`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
         ),
         (
             "dispatch",
@@ -1368,15 +1378,8 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
 ///
 /// 语义:`extends = "other.toml"` ⇒ 先合并 other.toml(相对路径 = 相对本文件
 /// 目录),再合并本文件(本文件覆盖被继承者) ⇒ 子档只写「与 base 不同的项」。
-/// CLI 的 `--flavor` 仍是整条链最底层的基准文件。链可嵌套;环/超深 = 响亮拒。
+/// 父档只由**显式路径**给出;链可嵌套;环/超深 = 响亮拒。
 const EXTENDS_KEY: &str = "extends";
-/// **预设档引用键**(`flavor = "spec-dflash"`;顶层;2026-10-18)。
-///
-/// 语义与 `extends` 同型,但父档由**名字**解析(`crate::flavors::preset_path`,
-/// 即 `--flavor` 的同一解析面):父链顺序 = `flavor` 预设 → `extends` 父档 →
-/// 自身。用途:测试环境档/站点档自带基准(“以 `spec-dflash` 为底,只改几项”),
-/// 不必让调用方同时记得传 `--flavor`。
-const FLAVOR_KEY: &str = "flavor";
 /// extends 链深上限(含起点;防病态链/手滑)
 const EXTENDS_MAX_DEPTH: usize = 8;
 
@@ -1427,25 +1430,6 @@ fn load_config_into(
         .map_err(|e| format!("配置 {} 读取失败: {e}", path.display()))?;
     let mut v: toml::Value = toml::from_str(&raw)
         .map_err(|e| format!("配置 {} 解析失败: {e}", path.display()))?;
-    // 取走顶层 flavor(预设档名 → 路径;与 extends 同为父层,flavor 在前)
-    let flavor_base = match v.as_table_mut().and_then(|t| t.remove(FLAVOR_KEY)) {
-        None => None,
-        Some(toml::Value::String(s)) if !s.trim().is_empty() => {
-            Some(crate::flavors::preset_path(s.trim()).map_err(|e| {
-                format!("配置 {}:{FLAVOR_KEY} 解析失败: {e}", path.display())
-            })?)
-        }
-        Some(toml::Value::String(_)) => {
-            return Err(format!("配置 {}:{FLAVOR_KEY} 不能是空字符串", path.display()))
-        }
-        Some(other) => {
-            return Err(format!(
-                "配置 {}:{FLAVOR_KEY} 必须是预设档名(字符串),得到 {}",
-                path.display(),
-                toml_type_name(&other)
-            ))
-        }
-    };
     // 取走顶层 extends(必须在最终反序列化前摘掉;类型非法 = 响亮拒,不静默忽略)
     let parent = match v.as_table_mut().and_then(|t| t.remove(EXTENDS_KEY)) {
         None => None,
@@ -1462,9 +1446,6 @@ fn load_config_into(
         }
     };
     chain.push(canon);
-    if let Some(p) = flavor_base {
-        load_config_into(&p, out, depth + 1, chain, origins)?;
-    }
     if let Some(p) = parent {
         let p = if p.is_absolute() {
             p
@@ -1571,6 +1552,7 @@ pub fn parse_cli_set(s: &str) -> Result<(String, toml::Value), String> {
 }
 
 impl OwlConfig {
+
     /// **统一 loader**(Default → 基准文件 → 覆盖文件;CLI 由入口决定前两者的
     /// 取值)。每个文件都可声明 `extends` 继承另一档 —— 被继承者先合并、本文件
     /// 覆盖之(见 [`load_config_into`])。`deny_unknown_fields` 在最终反序列化
@@ -1583,7 +1565,7 @@ impl OwlConfig {
     }
 
     /// **多层链加载**(2026-10-18):`base`(可选)→ `layers` 按序叠加。
-    /// 每层都支援 `flavor`(预设档名 → 该层的父层)与 `extends`;后者覆盖前者。
+    /// 每层都支援 `extends`(显式路径 → 该层的父层);名字查找已移除。
     /// 用途:`OWL_TEST_CONF → 用例 overlay` 这条测试链(见 `testkit::case`)。
     pub fn load_chain(base: Option<&Path>, layers: &[&Path]) -> Result<Self, String> {
         Self::load_resolved(base, layers, &[]).map(|r| r.config)
@@ -1591,7 +1573,7 @@ impl OwlConfig {
 
     /// **带来源/意图解析的加载入口**(boot / `--check` / `--print-config` 同一函数)
     ///
-    /// 顺序:`base`(profile/flavor)→ `layers`(位置参数 / `--site`)→ `cli`
+    /// 顺序:`base`(profile)→ `layers`(位置参数 / `--site`)→ `cli`
     /// (`--set` / 日志/性能旗标)→ `[intent]` 派生(显式低层键覆盖派生)→
     /// 反序列化 + `validate`。`origins` 记录**每个叶子键**的来源。
     pub fn load_resolved(
@@ -1636,18 +1618,13 @@ impl OwlConfig {
         Self::from_toml_str_resolved(s).map(|r| r.config)
     }
 
-    /// 字符串直载 → 完整解析产物(`[intent]` 可用;`extends`/`flavor` 拒)
+    /// 字符串直载 → 完整解析产物(`[intent]` 可用;`extends` 拒)
     pub fn from_toml_str_resolved(s: &str) -> Result<ResolvedConfig, String> {
         let mut v: toml::Value =
             toml::from_str(s).map_err(|e| format!("配置解析失败(账外键或非法枚举值): {e}"))?;
         if v.get(EXTENDS_KEY).is_some() {
             return Err(format!(
                 "配置含 `{EXTENDS_KEY}`:继承需要文件上下文 —— 用 OwlConfig::load / 服务端配置档(字符串直载不解析 extends)"
-            ));
-        }
-        if v.get(FLAVOR_KEY).is_some() {
-            return Err(format!(
-                "配置含 `{FLAVOR_KEY}`:预设档引用需要文件上下文 —— 用 OwlConfig::load / 服务端配置档(字符串直载不解析 flavor)"
             ));
         }
         let mut origins = Origins::new();
@@ -1830,43 +1807,6 @@ impl OwlConfig {
                 ));
             }
         }
-        // **白名单 ↔ 池档位自洽门**(2026-10-19):`allowed_ops` 与 `kv_fp8` 是
-        // **两处真源**、靠人手同步 ⇒ 已两次同型事故:
-        //   ① `awq27b` 白名单是 fp8 族而 `kv_fp8` 未设(缺省 false)⇒ 池 f16 /
-        //      白名单 fp8 ⇒ **首次发射**撞算子准入门
-        //      (`owl_qknorm_rope_kv_insert_f16_knhd 未列入`)⇒ 该档根本起不来;
-        //   ② `W4A8…设计与施工` §18.5 的 cast 项(同型,另一族)。
-        // 门 = 白名单必须覆盖**当前池 dtype**的「prefill 注意力族 + KV 写入族」;
-        // 缺了就在 boot 期拒启(而不是等第一发请求才炸)。
-        // 注:显式 `allowed_ops = []` = 门关(诊断态,是有意为之);不写 = None = 门关。
-        if let Some(ops) = self.dispatch.allowed_ops.as_ref().filter(|v| !v.is_empty()) {
-            const F16_POOL: [&str; 3] = [
-                "flashinfer_prefill_paged_f16",
-                "owl_qknorm_rope_kv_insert_f16_knhd",
-                "vllm_reshape_and_cache_f16_knhd",
-            ];
-            const FP8_POOL: [&str; 3] = [
-                "flashinfer_prefill_paged_fp8kv",
-                "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
-                "owl_reshape_and_cache_fp8kv_knhd",
-            ];
-            let (pool, need): (&str, &[&str; 3]) = if self.dispatch.kv_fp8 {
-                ("fp8(KV 池 = fp8_e4m3)", &FP8_POOL)
-            } else {
-                ("f16", &F16_POOL)
-            };
-            let missing: Vec<&str> = need
-                .iter()
-                .copied()
-                .filter(|n| !ops.iter().any(|o| o == n))
-                .collect();
-            if !missing.is_empty() {
-                return Err(format!(
-                    "[dispatch] allowed_ops 与池档位不自洽:池 = {pool}(kv_fp8 = {}),白名单缺 {missing:?}\n              —— 该档会在**首次发射**撞算子准入门(系统级缺档,不是运行期偶发)。\n              修法:① 池档位与白名单同族(fp8 池配 fp8 族 / f16 池配 f16 族,\n              通常就是在档里显式写 `kv_fp8`);② 或显式 `allowed_ops = []`(门关,仅诊断态)。",
-                    self.dispatch.kv_fp8
-                ));
-            }
-        }
         Ok(())
     }
 }
@@ -1946,45 +1886,17 @@ mod tests {
         }
     }
 
+    /// `allowed_ops` 已退役:旧档必须**响亮拒**并指向 tag filter / `tag_wildcard`。
+    #[test]
+    fn allowed_ops_退役键响亮拒() {
+        let e = OwlConfig::from_toml_str("[dispatch]\nallowed_ops = []\n")
+            .expect_err("旧 allowed_ops 必须拒");
+        assert!(e.contains("退役键") && e.contains("tag_wildcard"), "{e}");
+    }
+
     /// **跨字段语义门**(D1,2026-10-17):`gdn_slots < max_concurrency` 必拒,
     /// 拒语要点出病因(状态格逐出 = 跨会话污染)与调法;合规组合(生产档 1/1、
     /// 缺省 8/8)必须过。
-    /// **白名单 ↔ 池档位自洽门**(2026-10-19):两次同型事故(awq27b 起不来)的回归门。
-    #[test]
-    fn 白名单与池档位必须同族() {
-        // ① 病态:fp8 白名单 + 池缺省(f16)⇒ 拒启,且文案点明不自洽
-        let e = OwlConfig::from_toml_str(
-            "[dispatch]\nallowed_ops = [\"flashinfer_prefill_paged_fp8kv\", \
-             \"owl_qknorm_rope_kv_insert_f16_fp8kv_knhd\", \"owl_reshape_and_cache_fp8kv_knhd\"]\n",
-        )
-        .expect_err("fp8 白名单 + f16 池应拒启");
-        assert!(e.contains("不自洽"), "错误文案应点明属性:{e}");
-        assert!(e.contains("kv_fp8"), "错误文案应指向 kv_fp8:{e}");
-        // ② fp8 池 + fp8 白名单 ⇒ 过
-        OwlConfig::from_toml_str(
-            "[dispatch]\nkv_fp8 = true\nallowed_ops = [\"flashinfer_prefill_paged_fp8kv\", \
-             \"owl_qknorm_rope_kv_insert_f16_fp8kv_knhd\", \"owl_reshape_and_cache_fp8kv_knhd\"]\n",
-        )
-        .expect("fp8 池 + fp8 白名单应过");
-        // ③ f16 池 + f16 白名单 ⇒ 过
-        OwlConfig::from_toml_str(
-            "[dispatch]\nkv_fp8 = false\nallowed_ops = [\"flashinfer_prefill_paged_f16\", \
-             \"owl_qknorm_rope_kv_insert_f16_knhd\", \"vllm_reshape_and_cache_f16_knhd\"]\n",
-        )
-        .expect("f16 池 + f16 白名单应过");
-        // ④ 两族共存(生产 spec-dflash 就是两族都收,池 dtype 决定发射哪族)⇒ 过
-        OwlConfig::from_toml_str(
-            "[dispatch]\nkv_fp8 = false\nallowed_ops = [\"flashinfer_prefill_paged_f16\", \
-             \"flashinfer_prefill_paged_fp8kv\", \"owl_qknorm_rope_kv_insert_f16_knhd\", \
-             \"vllm_reshape_and_cache_f16_knhd\", \"owl_qknorm_rope_kv_insert_f16_fp8kv_knhd\", \
-             \"owl_reshape_and_cache_fp8kv_knhd\"]\n",
-        )
-        .expect("两族共存的白名单(f16 池)应过");
-        // ⑤ 门关:空列表(诊断态)/ 不写 ⇒ 不校验
-        OwlConfig::from_toml_str("[dispatch]\nallowed_ops = []\n").expect("空 = 门关,应过");
-        assert!(OwlConfig::default().dispatch.allowed_ops.is_none());
-    }
-
     /// **合批上限自洽门**(B5.1):gdn_slots 不足 / 与 TP / 选择层互斥 ⇒ 拒启
     #[test]
     fn max_batch_requires_gdn_slots_and_no_virtualization() {
@@ -2107,7 +2019,7 @@ mod extends_tests {
         file_loader::write(p, body).expect("写档");
     }
 
-    /// 真实链路:flavor(基准) + 站点档(extends 父档) + 子档覆盖。
+    /// 真实链路:基准档 + 站点档(extends 父档) + 子档覆盖。
     /// 父档提供部署面、子档只写差异 —— 预设档未覆盖处仍保留。
     #[test]
     fn extends_父档先合并子档覆盖() {
@@ -2116,12 +2028,12 @@ mod extends_tests {
         write(&site, "[runtime]\nmax_seq = 12345\n[pool]\nsnap_max = 2\n");
         let child = d.join("child.toml");
         write(&child, "extends = \"site.toml\"\n\n[spec]\ndepth = 5\n");
-        let flavor = crate::flavors::preset_path("spec-dflash").expect("预设档");
-        let c = OwlConfig::load(Some(&flavor), Some(&child)).expect("load");
-        assert_eq!(c.spec.depth, 5, "子档覆盖 flavor/父档");
-        assert_eq!(c.runtime.max_seq, 12345, "父档提供、flavor 未写者生效");
-        assert_eq!(c.pool.snap_max, 2, "父档覆盖 flavor");
-        assert_eq!(c.sampling.mode, SamplerMode::Greedy, "flavor 未被子/父覆盖处保留");
+        let base = crate::profiles::legacy_path("spec-dflash").expect("历史档");
+        let c = OwlConfig::load(Some(&base), Some(&child)).expect("load");
+        assert_eq!(c.spec.depth, 5, "子档覆盖基准/父档");
+        assert_eq!(c.runtime.max_seq, 12345, "父档提供、基准未写者生效");
+        assert_eq!(c.pool.snap_max, 2, "父档覆盖基准");
+        assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未被子/父覆盖处保留");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2184,30 +2096,37 @@ mod extends_tests {
         assert!(e.contains("文件上下文"), "{e}");
     }
 
-    /// `flavor = "<预设名>"` = 该文件自带的基准层(复用 flavors/ 而不靠 CLI)。
+    /// `extends` 绝对路径 = 文件自带基准层(与相对路径同语义)。
     #[test]
-    fn flavor_键解析为预设基准() {
-        let d = tmp_dir("flavor_key");
+    fn extends_绝对路径基准() {
+        let d = tmp_dir("extends_abs");
+        let base = crate::profiles::legacy_path("spec-dflash").expect("历史档");
         let conf = d.join("test-conf.toml");
-        write(&conf, "flavor = \"spec-dflash\"\n\n[spec]\ndepth = 5\n\n[runtime]\nmax_seq = 2048\n");
+        write(
+            &conf,
+            &format!(
+                "extends = \"{}\"\n\n[spec]\ndepth = 5\n\n[runtime]\nmax_seq = 2048\n",
+                base.display()
+            ),
+        );
         let c = OwlConfig::load(None, Some(&conf)).expect("load");
-        assert_eq!(c.spec.depth, 5, "文件覆盖预设");
+        assert_eq!(c.spec.depth, 5, "文件覆盖基准");
         assert_eq!(c.runtime.max_seq, 2048, "文件键到手");
-        assert_eq!(c.sampling.mode, SamplerMode::Greedy, "预设未覆盖处保留(spec-dflash)");
-        assert_eq!(c.dispatch.kv_fp8, true, "预设行为面保留");
+        assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");
+        assert_eq!(c.dispatch.kv_fp8, true, "基准行为面保留");
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 未知预设名 / 直载含 flavor = 响亮拒。
+    /// `flavor` 顶层键已退役 = 响亮拒(名字查找不再存在)。
     #[test]
-    fn flavor_非法响亮拒() {
+    fn flavor_键退役响亮拒() {
         let d = tmp_dir("flavor_bad");
         let bad = d.join("bad.toml");
-        write(&bad, "flavor = \"no-such-flavor\"\n");
-        let e = OwlConfig::load(None, Some(&bad)).expect_err("未知预设必须拒");
-        assert!(e.contains("no-such-flavor"), "{e}");
+        write(&bad, "flavor = \"spec-dflash\"\n");
+        let e = OwlConfig::load(None, Some(&bad)).expect_err("退役键必须拒");
+        assert!(e.contains("已移除"), "{e}");
         let e2 = OwlConfig::from_toml_str("flavor = \"spec-dflash\"\n").expect_err("直载必须拒");
-        assert!(e2.contains("文件上下文"), "{e2}");
+        assert!(e2.contains("已移除"), "{e2}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
@@ -2233,14 +2152,14 @@ mod prefill_bucket_tests {
         );
     }
 
-    /// 基准文件 + 覆盖文件叠加(flavor 不再是配置层概念:入口把预设档解析成路径当基准)
+    /// 基准文件 + 覆盖文件叠加(入口只给文件路径)
     #[test]
     fn load_基准文件与覆盖文件叠加() {
         let dir = std::env::temp_dir().join(format!("owl_cfg_two_{}", std::process::id()));
         file_loader::create_dir_all(&dir).expect("mkdir");
         let over = dir.join("over.toml");
         file_loader::write(&over, "[spec]\ndepth = 5\n").expect("w");
-        let base = crate::flavors::preset_path("spec-dflash").expect("预设档");
+        let base = crate::profiles::legacy_path("spec-dflash").expect("预设档");
         let c = OwlConfig::load(Some(&base), Some(&over)).expect("load");
         assert_eq!(c.spec.depth, 5, "覆盖文件优先");
         assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");
@@ -2249,4 +2168,5 @@ mod prefill_bucket_tests {
         assert_eq!(c2.model.head_quant, HeadQuant::RtnInt4G32, "C1 int4 头");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
 }

@@ -1,12 +1,10 @@
 # owl 意图档 `awq27b-3090-max`(单张 3090 Ti / 24GB / W4A16 满血档)
 #
-# 只写意图;低层键(chunk/池/图臂/快照/白名单)由 config/resolve 派生。
+# 只写意图;低层键(chunk/池/图臂/快照)由 config/resolve 派生;准入走 tag filter。
 # 预检(不加载权重,<2s):
-#   ./target/release/server --profile awq27b-3090-max \
-#       --site testdata/args/base.toml --check
+#   ./target/release/server -p profiles/awq27b-3090-max.toml --check
 # 启动:
-#   ./target/release/server --profile awq27b-3090-max \
-#       --site testdata/args/base.toml
+#   ./target/release/server -p profiles/awq27b-3090-max.toml
 # 依据/来源:--print-config --format json / --explain pool.pool_tokens
 [intent]
 model       = "qwen3.8-27b-awq"   # 注册表键(27B AWQ-INT4 + lm_head int4)
@@ -19,6 +17,13 @@ kv          = "fp8"               # 容量 ×2 + FI 读核
 kvmem       = "off"               # 池 ≥ 上下文,不要选择层/宿主/磁盘腿
 graphs      = "auto"              # FI 单图 decode + prefill 桶族;不可用自动降级并打印原因
 reuse       = "off"               # 单会话最大上下文档:快照/前缀缓存是纯开销
+
+[model]
+name = "qwen3.8-27b"
+dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+
+[runtime]
+bind = "127.0.0.1:8137"
 
 [sampling]
 # 测速/恒等门口径(高级覆盖:profile 仍可写任意低层键)

@@ -63,7 +63,7 @@ flavor(可选,预设档名) → OWL_TEST_CONF(整轮环境档) → 用例 overla
 
 | 层 | 位置 | 说明 |
 |---|---|---|
-| `flavor` | `flavors/<名>.toml`(仓库顶层) | 配置档里写 `flavor = "spec-dflash"` 即**复用预设当基准**(loader 顶层键,等效 `extends` 到 `flavors/<名>.toml`);测试与站点档同用 |
+| `extends` | 任意路径 | 配置档里写 `extends = "profiles/legacy/spec-dflash.toml"` 即复用基准档;测试与站点档同用 |
 | `OWL_TEST_CONF` | 任意路径(**唯一**测试 env) | 整轮测试的环境档(TOML,引擎同款 `OwlConfig` 格式):共同口径 + 本机覆盖。未设 = 无此层;设了但文件缺失/解析失败 = **响亮 panic** |
 | 用例 overlay | `testdata/cases/<crate>/<模块路径>/<用例名>.toml` | **零 env**:由宏传入的 `file!()` 推导。临时改一个用例 = 丢个文件;删文件即还原;集成测试(`tests/*.rs`)无此层 |
 

@@ -40,7 +40,7 @@ if [[ ! -f "$SITE" ]]; then
 fi
 
 ARGS=(
-    --profile "$PROFILE"
+    -p "$PROFILE"
     --site "$SITE"
     --set "runtime.bind=127.0.0.1:$PORT"
     --set "runtime.device.bdf=$BDF"

@@ -111,6 +111,31 @@ impl ChatRequest {
             if role == "tool" && m.get("tool_call_id").and_then(|v| v.as_str()).is_none() {
                 return Err(format!("messages[{i}]:role=tool 必须带 tool_call_id"));
             }
+            // **图像输入面(V4)**:`content` 数组合法;`image_url.url` 必须是
+            // data URL(预处理在 `ChatRequest::images`,真正的解码错误在那里报)。
+            if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                for (j, part) in arr.iter().enumerate() {
+                    let is_image = part.get("type").and_then(|t| t.as_str())
+                        == Some("image_url")
+                        || part.get("image_url").is_some();
+                    if is_image {
+                        let url = part
+                            .get("image_url")
+                            .and_then(|v| v.get("url"))
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                format!(
+                                    "messages[{i}].content[{j}].image_url.url 缺失或非字符串"
+                                )
+                            })?;
+                        if !url.starts_with("data:") {
+                            return Err(format!(
+                                "messages[{i}].content[{j}]:图像 URL 只支持 data:image/...;base64(暂不支持 http)"
+                            ));
+                        }
+                    }
+                }
+            }
             if let Some(tcs) = m.get("tool_calls") {
                 if role != "assistant" {
                     return Err(format!("messages[{i}]:仅 assistant 可带 tool_calls"));
@@ -194,6 +219,38 @@ impl ChatRequest {
         } else {
             Some(s)
         }
+    }
+
+    /// **收集并预处理图像**(内容顺序 = 模板 `<|image_pad|>` 顺序)。
+    ///
+    /// 仅 data URL;`vision_processor` 负责 Qwen2VL 的 resize/patchify。
+    /// 无图像 = 空(纯文本逐字节旧行为)。
+    pub fn images(&self) -> Result<Vec<owl_models::vlm::VlmImage>, String> {
+        let mut out = Vec::new();
+        for (i, m) in self.messages.iter().enumerate() {
+            let Some(arr) = m.get("content").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for (j, part) in arr.iter().enumerate() {
+                let is_image = part.get("type").and_then(|t| t.as_str())
+                    == Some("image_url")
+                    || part.get("image_url").is_some();
+                if !is_image {
+                    continue;
+                }
+                let url = part
+                    .get("image_url")
+                    .and_then(|v| v.get("url"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        format!("messages[{i}].content[{j}].image_url.url 缺失或非字符串")
+                    })?;
+                let img = crate::vision_processor::from_data_url(url)
+                    .map_err(|e| format!("messages[{i}].content[{j}] 图像预处理失败: {e}"))?;
+                out.push(img);
+            }
+        }
+        Ok(out)
     }
 
     /// 停止串归一(OpenAI 允许 string 或 string[];非法 = 结构化拒)
@@ -465,6 +522,34 @@ impl Agg {
     }
 }
 
+/// 把模板里的每个 `<|image_pad|>` 展开成 `grid_h*grid_w/4` 个。
+///
+/// 顺序 = `images` 序(内容序)。少/多占位 = 400(不许静默错位)。
+fn expand_image_pads(prompt: &str, images: &[owl_models::vlm::VlmImage]) -> Result<String, String> {
+    const PAD: &str = "<|image_pad|>";
+    let mut out = String::with_capacity(prompt.len());
+    let mut rest = prompt;
+    for (i, img) in images.iter().enumerate() {
+        let pos = rest
+            .find(PAD)
+            .ok_or_else(|| format!("模板缺第 {i} 张图的 <|image_pad|> 占位"))?;
+        out.push_str(&rest[..pos]);
+        let n = (img.grid.1 * img.grid.2) / 4;
+        for _ in 0..n {
+            out.push_str(PAD);
+        }
+        rest = &rest[pos + PAD.len()..];
+    }
+    if rest.contains(PAD) {
+        return Err(format!(
+            "模板的 <|image_pad|> 多于图像数 {}",
+            images.len()
+        ));
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 /// chat completions:提交 actor → 首笔 Accepted/Rejected → 三通道折叠循环。
 pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
@@ -515,7 +600,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     }
     let kw_ref = if kw.is_empty() { None } else { Some(&kw) };
     // 渲染:唯一权威 = 快照模板(§4.3 R2);模板拒(如 system 含图像)= 400
-    let prompt = match tpl.render(RenderArgs {
+    let mut prompt = match tpl.render(RenderArgs {
         messages: &req.messages,
         tools: req.tools.as_deref(),
         add_generation_prompt: true,
@@ -524,6 +609,18 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         Ok(p) => p,
         Err(e) => return http::respond_json(w, 400, &error_json(e.to_string())).await,
     };
+    // 图像:预处理(与模板顺序一致)+ **占位 token 展开**:
+    // 模板对每张图只发一个 `<|image_pad|>`;视觉塔要求 `grid_h*grid_w/4` 个。
+    let images = match req.images() {
+        Ok(v) => v,
+        Err(e) => return http::respond_json(w, 400, &error_json(e)).await,
+    };
+    if !images.is_empty() {
+        prompt = match expand_image_pads(&prompt, &images) {
+            Ok(p) => p,
+            Err(e) => return http::respond_json(w, 400, &error_json(e)).await,
+        };
+    }
     let (sink_tx, mut sink_rx) = mpsc::channel::<SinkEvent>(SINK_CAPACITY);
     // 会话身份:显式 `session` 键优先;缺省按 [agent] implicit_session 落到
     // 隐式会话 0(AGT-09:pi 每轮全量重发历史 ⇒ 前缀增量命中;守卫失配
@@ -568,6 +665,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             // 将来加请求字段时在这里映射;非 `Strict` 由引擎**响亮拒**
             // (选择层 B 轴未落地,地板语义无从兼现)。
             dense_floor: None,
+            images,
         },
         sink: sink_tx,
     };

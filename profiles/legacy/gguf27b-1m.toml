@@ -12,7 +12,7 @@
 #
 # 起机:
 #   CUDA_VISIBLE_DEVICES=GPU-<3090Ti UUID> \
-#     target/release/server --flavor gguf27b-1m <用户档.toml>
+#     target/release/server -p profiles/legacy/gguf27b-1m.toml <用户档.toml>
 #
 # ── 实测(2026-10-20,单张 3090 Ti 41:00.0;greedy;needle 置 50%)──────────
 #   · **1 024 497 tok prompt:729.0 s**(≈1405 tok/s),needle **召回命中**;

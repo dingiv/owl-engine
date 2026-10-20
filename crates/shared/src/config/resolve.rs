@@ -57,7 +57,7 @@ impl Origin {
 #[derive(Clone, Debug, Serialize)]
 pub struct IntentMeta {
     pub intent: Intent,
-    /// 档名(`--profile` / `--flavor`;None = 只有位置参数)
+    /// 档路径(`-p`;None = 只有位置参数)
     pub profile: Option<String>,
     /// 派生规则(点路径 → 依据)
     pub rules: BTreeMap<String, String>,
@@ -378,6 +378,8 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         gdn_slots: get_usize(&out, "pool.gdn_slots").unwrap_or(8),
         snap_max: get_usize(&out, "pool.snap_max").unwrap_or(4),
         sessions: c,
+        tp_world: if tp { 2 } else { 1 },
+        vision: get_bool(&out, "model.vision").unwrap_or(false),
         activation_bytes: act,
         activation_note: act_note,
         stability_margin_bytes: STABILITY_MARGIN_BYTES,
@@ -385,14 +387,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     let explicit_ctx = origins.contains_key("runtime.max_seq");
     let explicit_pool = origins.contains_key("pool.pool_tokens");
     let want_max = matches!(intent.context, ContextSpec::Max) && !explicit_ctx;
-    // TP + context=max 无解(weights_per_card 未校准);显式 ctx 仍可走
-    if want_max && tp {
-        return Err(
-            "[intent].context = \"max\" 暂不支持 TP 档(weights_per_card 未校准)—— \
-             请写显式 context(如 16384)"
-                .into(),
-        );
-    }
+    // TP 的 weights/KV/GDN 按卡摊(27B TP2 权重是实测;视觉塔每 rank 全量)
     let (ctx, mut pool) = if want_max {
         let (ctx, pool, _cap) = memory::solve_max(&inp, model.geom.max_pos, overcommit)?;
         (ctx, pool)
@@ -453,7 +448,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         inp.vram_target * 100.0,
         inp.reserve_bytes as f64 / GB,
         (memory::budget_parts(&inp).0).total() as f64 / GB,
-        inp.model.weights_bytes(inp.spec_dflash) as f64 / GB,
+        memory::weights_bytes(&inp) as f64 / GB,
         memory::budget_parts(&inp).2 as f64 / GB,
         act_note,
         inp.stability_margin_bytes as f64 / GB,
@@ -475,15 +470,14 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     }
     if tp {
         warnings.push(
-            "TP 档:内存模型尚未按卡校准(--check 跳过内存账)。\
-             请以真机 [vram-gov] 为准"
+            "TP 档:内存按**单卡口径**估算(TP2 实测 weights/KV;视觉塔每 rank 全量)。\
+             真机以 [vram-gov] 为准"
                 .into(),
         );
-    } else {
-        let est = memory::estimate(&inp, ctx, pool, !overcommit)?;
-        warnings.extend(est.notes.iter().cloned());
-        estimate = Some(est);
     }
+    let est = memory::estimate(&inp, ctx, pool, !overcommit)?;
+    warnings.extend(est.notes.iter().cloned());
+    estimate = Some(est);
 
     *value = out;
     Ok(Some(ResolveMeta {
@@ -667,18 +661,18 @@ mod tests {
     }
 
     fn load_profile(name: &str) -> (Value, Origins) {
-        let raw = std::fs::read_to_string(crate::flavors::profile_path(name).expect("profile"))
+        let raw = std::fs::read_to_string(crate::profiles::profile_path(name).expect("profile"))
             .expect("读 profile");
         resolve_str(&raw)
     }
 
-    /// **P0 验收**:新 profile 的派生结果 = 手写 `flavors/awq27b-3090-max.toml`
-    /// 的逐键值(除 `allowed_ops` —— P1 才派生白名单)。
+    /// **P0 验收**:新 profile 的派生结果 = 手写 `profiles/legacy/awq27b-3090-max.toml`
+    /// 的逐键值（`allowed_ops` 已退役；准入由 tag filter 派生）。
     #[test]
     fn profile_matches_handwritten_flavor() {
         let (p, _po) = load_profile("awq27b-3090-max");
         let flavor = std::fs::read_to_string(
-            crate::flavors::preset_path("awq27b-3090-max").expect("flavor"),
+            crate::profiles::legacy_path("awq27b-3090-max").expect("flavor"),
         )
         .expect("读 flavor");
         let f: crate::config::OwlConfig = toml::from_str(&flavor).expect("flavor 解析");
@@ -725,7 +719,7 @@ mod tests {
     /// `--check` 的估算必须与手写档 boot 现场对齐(128k / 池 4G / fixed 0.90G)
     #[test]
     fn profile_estimate_matches_boot_ledger() {
-        let raw = std::fs::read_to_string(crate::flavors::profile_path("awq27b-3090-max").expect("profile"))
+        let raw = std::fs::read_to_string(crate::profiles::profile_path("awq27b-3090-max").expect("profile"))
             .expect("读");
         let mut v: Value = toml::from_str(&raw).expect("toml");
         let mut origins = Origins::new();

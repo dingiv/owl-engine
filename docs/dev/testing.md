@@ -20,7 +20,7 @@
 flavor(可选,预设名) → 环境档(OWL_TEST_CONF) → 用例 overlay(按路径自动找)
 ```
 
-- 任何一层都可写 **`flavor = "<预设名>"`**（等效 `extends` 到 `flavors/<名>.toml`）
+- 任何一层都可写 **`extends = "<路径>"`**（显式相对/绝对路径;不再有 `flavor` 名字键）
   ⇒ 基础口径永远复用生产档，不用抄；
 - **missing = 该层不参与**（全缺 = `OwlConfig::default()`）；
 - 每层都走唯一 loader：`deny_unknown_fields`、枚举严格、`flavor`/`extends`

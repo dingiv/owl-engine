@@ -153,7 +153,7 @@ K=3/7 各一张 ⇒ **总计 < 0.4 G**（对比"每桶独立图"：7 桶 verify 
 
 ### 6.4 生产档（2026-10-18 落）
 
-`flavors/spec-dflash.toml`：`fi_cuda_graph = true` / `fi_plan_bake = 0`
+`profiles/legacy/spec-dflash.toml`：`fi_cuda_graph = true` / `fi_plan_bake = 0`
 （**哨兵 = 取 `[runtime] max_seq`** —— 档位改 max_seq 时上界自动跟随，不写死）/
 `fi_plan_restore = false` / `fi_plan_bake_verify = true`。
 冒烟（裸起生产档）：`verify 面事实:FI 节点登记=true | bake=Some(16384) | 段=0 断点=0`、

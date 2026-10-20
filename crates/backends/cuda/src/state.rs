@@ -63,9 +63,10 @@ pub struct DiagOpts {
     /// **发射账容量**(cuda.trace_ring;0 = 关)。>0 ⇒ server 记最近 N 条
     /// 命令(launch/htod/dtoh/alloc/free/memset/copy;见 `crate::trace`)。
     pub trace_ring: usize,
-    /// **生产算子白名单**(dispatch.allowed_ops;None/空 = 门关)。
-    /// `Arc` = 与 server 主循环共享,逐发射判定零克隆。
-    pub allowed_ops: Option<std::sync::Arc<Vec<String>>>,
+    /// **配置派生的 tag 过滤**(2026-10-20;不显式列 allow_tags)。
+    /// 由 `model.kind/quant/head_quant`、`dispatch.kv_fp8`、`spec`、`vision`、
+    /// `runtime.tp_ordinals` 自动推导;`*`/Default = 全放行(诊断/测试)。
+    pub tag_filter: owl_kernels::tag_filter::TagFilter,
 }
 
 impl DiagOpts {
@@ -96,14 +97,61 @@ impl DiagOpts {
             capture_slab_mb: c.capture_slab_mb,
             trace_ring: c.trace_ring,
             fi_plan_restore: cfg.dispatch.fi_plan_restore,
-            allowed_ops: cfg
-                .dispatch
-                .allowed_ops
-                .as_ref()
-                .filter(|v| !v.is_empty())
-                .map(|v| std::sync::Arc::new(v.clone())),
+            tag_filter: tag_filter_from_config(cfg),
         }
     }
+}
+
+/// **配置 → tag 过滤**（2026-10-20；唯一派生点之一）。
+///
+/// 语义 = 互斥 facet 单选 + 通用算子放行；见 `owl_kernels::tag_filter`。
+/// 这里只读配置事实，不探测硬件/不读 env。
+fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::tag_filter::TagFilter {
+    use owl_kernels::spec::KernelTag as T;
+    use owl_shared::config::{HeadQuant, ModelKind, QuantScheme};
+    if cfg.dispatch.tag_wildcard {
+        return owl_kernels::tag_filter::TagFilter::wildcard();
+    }
+    let mut tags: Vec<T> = Vec::new();
+    match cfg.model.kind {
+        ModelKind::Gguf => tags.push(T::QUANT_GGUF),
+        _ => match cfg.model.quant {
+            QuantScheme::W4a16 => {
+                tags.push(T::QUANT_W4A16);
+                tags.push(T::QUANT_AWQ);
+            }
+            QuantScheme::W4a8 => {
+                tags.push(T::QUANT_W4A8);
+                tags.push(T::QUANT_AWQ);
+            }
+        },
+    }
+    if cfg.model.head_quant == HeadQuant::RtnInt8Row {
+        tags.push(T::QUANT_INT8);
+        tags.push(T::FEAT_HEAD);
+    }
+    if cfg.dispatch.kv_fp8 {
+        tags.push(T::KV_MAIN_FP8);
+    } else {
+        tags.push(T::KV_MAIN_F16);
+    }
+    if cfg.spec.depth > 0 {
+        tags.push(T::FEAT_DFLASH);
+        tags.push(T::FEAT_SPEC);
+        // 草稿池默认 BF16；draft_kv_fp8 时 fp8。
+        if cfg.spec.draft_kv_fp8 {
+            tags.push(T::KV_DRAFT_FP8);
+        } else {
+            tags.push(T::KV_DRAFT_BF16);
+        }
+    }
+    if cfg.model.vision {
+        tags.push(T::FEAT_VISION);
+    }
+    if cfg.runtime.tp_ordinals.as_ref().is_some_and(|v| v.len() > 1) {
+        tags.push(T::FEAT_TP);
+    }
+    owl_kernels::tag_filter::TagFilter::from_tags(&tags)
 }
 
 // 流身份证(server 内部路由键;客户端不可见 —— 三固定流是 server 策略)
@@ -3140,5 +3188,58 @@ mod range_tests {
         assert!(!range_fits(100, 101, 0), "起点越界(零长也不放)");
         assert!(!range_fits(usize::MAX, 1, usize::MAX), "相加溢出按越界");
         assert!(!range_fits(0, 0, 1), "空块写入");
+    }
+}
+
+#[cfg(test)]
+mod tag_filter_tests {
+    use super::tag_filter_from_config;
+    use owl_shared::config::{HeadQuant, ModelKind, OwlConfig, QuantScheme};
+
+    fn allows(cfg: &OwlConfig, entry: &str) -> bool {
+        let f = tag_filter_from_config(cfg);
+        let m = owl_kernels::ops::meta(entry).unwrap_or_else(|| panic!("缺算子 {entry}"));
+        f.allows(m)
+    }
+
+    #[test]
+    fn w4a16_fp8_vision_spec_head_filter() {
+        let mut cfg = OwlConfig::default();
+        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.quant = QuantScheme::W4a16;
+        cfg.model.head_quant = HeadQuant::RtnInt8Row;
+        cfg.model.vision = true;
+        cfg.dispatch.kv_fp8 = true;
+        cfg.spec.depth = 7;
+        cfg.runtime.tp_ordinals = Some(vec![2, 3]);
+        assert!(allows(&cfg, "marlin_gemm_w4a16_awq"));
+        assert!(!allows(&cfg, "marlin_gemm_w4a8_awq"));
+        assert!(!allows(&cfg, "owl_gguf_gemm_q4k"));
+        assert!(allows(&cfg, "vllm_paged_attention_v2_fp8_knhd_hd256bs32"));
+        assert!(!allows(&cfg, "vllm_paged_attention_v2_f16_knhd_hd256bs32"));
+        assert!(allows(&cfg, "owl_rmsnorm_f16"));
+        assert!(allows(&cfg, "owl_gemv_i8w_f16"));
+        assert!(allows(&cfg, "owl_layernorm_f16"));
+        assert!(allows(&cfg, "owl_dflash_conv_bf16"));
+        assert!(allows(&cfg, "owl_comm_ar_stage_f8_f16"));
+    }
+
+    #[test]
+    fn tag_wildcard_escapes_all_facets() {
+        let mut cfg = OwlConfig::default();
+        cfg.model.kind = ModelKind::Gguf;
+        cfg.dispatch.tag_wildcard = true;
+        assert!(allows(&cfg, "marlin_gemm_w4a16_awq"), "* 应全放行");
+        assert!(allows(&cfg, "owl_gguf_gemm_q4k"));
+    }
+
+    #[test]
+    fn gguf_filter() {
+        let mut cfg = OwlConfig::default();
+        cfg.model.kind = ModelKind::Gguf;
+        cfg.dispatch.kv_fp8 = false;
+        assert!(allows(&cfg, "owl_gguf_gemm_q4k"));
+        assert!(!allows(&cfg, "marlin_gemm_w4a16_awq"));
+        assert!(allows(&cfg, "owl_add_f16"));
     }
 }

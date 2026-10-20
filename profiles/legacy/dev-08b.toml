@@ -1,7 +1,7 @@
 # owl 引擎预设档 `dev-08b`(0.8B 开发/冒烟档)
 #
 # **两个用途**:
-# 1. CI/本机冒烟(`--flavor dev-08b`;= 代码缺省 + bind 明示);
+# 1. CI/本机冒烟(`-p profiles/legacy/dev-08b.toml`;= 代码缺省 + bind 明示);
 # 2. **0.8B 探针档的基档**(`gpu_08b_*` 系列走 `OWL_PROBE_FLAVOR=dev-08b` 装载)
 #    —— 让探针跑的条件**写在一个文件里**,而不是散在 env 里。
 #

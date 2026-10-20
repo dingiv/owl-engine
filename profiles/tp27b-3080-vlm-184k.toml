@@ -1,0 +1,40 @@
+# owl 意图档 `tp27b-3080-vlm-184k`(2×3080 20G / TP2 / 27B + **视觉塔**,spec off)
+#
+# 2026-10-20 视觉接线 V1–V4 的**无投机对照档**:
+#   · 视觉塔装载 + 图像 prefill(TP2 两 rank 各备一份塔输出)
+#   · OpenAI `image_url`(data URL;Qwen2VL 预处理 2×2 块序)
+#   · 单图/单会话;**spec off**——图像 × DFlash2 已由 V5 接到
+#     `tp27b-3080-184k`;本档保留作无草稿对照/显存更宽裕的部署姿势。
+#
+# 启动(本档已带 bind / tp_ordinals;换机器请改):
+#   server -p profiles/tp27b-3080-vlm-184k.toml
+[intent]
+model       = "qwen3.8-27b-awq"
+hardware    = "3080-20g"
+goal        = "max-context"
+context     = 184320
+concurrency = 1
+spec        = "off"
+kv          = "fp8"
+kvmem       = "off"
+graphs      = "auto"
+reuse       = "off"
+
+[runtime]
+bind = "127.0.0.1:8138"
+tp_ordinals = [2, 3]
+prefill_chunk = 1024
+prefill_tail_merge = 0
+
+[model]
+name = "qwen3.8-27b"
+dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+vision = true
+
+[pool]
+# 无投机;快照面可关(单会话,不复用)
+snap_max = 0
+
+[sampling]
+mode = "greedy"

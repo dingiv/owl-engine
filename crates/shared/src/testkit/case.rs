@@ -123,13 +123,18 @@ mod tests {
         // 臂 1:未设 + 无 overlay ⇒ 引擎缺省
         let cfg = case_config("definitely_unset_case_xyz", "crates/shared/src/testkit/case.rs");
         assert_eq!(cfg, OwlConfig::default(), "未设 = 引擎缺省配置");
-        // 臂 2:设环境档(flavor + 覆盖)
+        // 臂 2:设环境档(extends 基准 + 覆盖)
+        let base = crate::profiles::legacy_path("spec-dflash").expect("历史档");
         let path = std::env::temp_dir().join(format!("owl_test_conf_{}.toml", std::process::id()));
-        std::fs::write(&path, "flavor = \"spec-dflash\"\n[runtime]\nmax_seq = 2048\n").expect("写");
+        std::fs::write(
+            &path,
+            format!("extends = \"{}\"\n[runtime]\nmax_seq = 2048\n", base.display()),
+        )
+        .expect("写");
         let _c = crate::env_reader::EnvGuard::set(TEST_CONF_ENV, path.to_str().unwrap());
         let cfg2 = case_config("env_conf_arm", "crates/shared/src/testkit/case.rs");
         assert_eq!(cfg2.runtime.max_seq, 2048, "覆盖项到手");
-        assert_eq!(cfg2.sampling.mode, crate::config::SamplerMode::Greedy, "flavor 基准在手");
+        assert_eq!(cfg2.sampling.mode, crate::config::SamplerMode::Greedy, "基准在手");
         let direct = OwlConfig::load_chain(None, &[path.as_path()]).expect("直调复算");
         assert_eq!(cfg2, direct, "与 load_chain 直调逐字段同");
         drop(_c);
