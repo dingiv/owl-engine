@@ -74,12 +74,32 @@ pub struct ModelLoader<'a, D: DeviceClient> {
     /// **lm_head 词表切**(`runtime.tp_vocab_split`;P1.1) —— 装载前写入
     /// `ModelSpec::head_split`(形状单源;装载规则随之切 out 维)。
     vocab_split: bool,
+    /// **rope 外推/缩放**(`[model.rope]`;缺省关。只对 GGUF 档生效)
+    rope: owl_shared::config::RopeCfg,
+    /// 单 turn 预算(`runtime.max_seq`;YaRN 表长至少覆盖它)
+    max_seq: usize,
 }
 
 impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     /// 构造(工厂;face 由 [`Engine::loader`](crate::Engine::loader) 借出)
     pub(crate) fn new<'a>(face: &'a mut D, load: owl_shared::config::LoadCfg) -> ModelLoader<'a, D> {
-        ModelLoader { face, load, slice: (0, 1), vocab_split: false }
+        ModelLoader {
+            face,
+            load,
+            slice: (0, 1),
+            vocab_split: false,
+            rope: owl_shared::config::RopeCfg::default(),
+            max_seq: 0,
+        }
+    }
+
+    /// **rope 外推档**(`[model.rope]` + `runtime.max_seq`;GGUF 装载用)。
+    ///
+    /// 显式依赖律:调用方(引擎)把配置**传进来**,本模块零 env 读取。
+    pub fn rope(mut self, rope: owl_shared::config::RopeCfg, max_seq: usize) -> Self {
+        self.rope = rope;
+        self.max_seq = max_seq;
+        self
     }
 
     /// **切片装载**(S4 ②;确定性分片协议):`(slice_id, shard)` —— 本 rank 只装
@@ -268,10 +288,10 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let tokenizer = Tokenizer::from_parts(vocab.inner, eos, fmt);
         // ⑤ rope(文件自给;头维 = full_heads.2 与 spec 同源)
         let rf = rope_facts(src.gguf())?;
-        let rope = Rope::new(rf.max_pos, spec.full_heads.2, rf.rotary_dim, rf.theta)?;
+        let rope = build_gguf_rope(&rf, &self.rope, self.max_seq, spec.full_heads.2)?;
         owl_shared::log_info!(
             "boot",
-            "GGUF:{} · 层 {}(full {} / gdn {}) · 词表 {} · rope(rot {} / θ {:.3e} / max {}) · tied {}",
+            "GGUF:{} · 层 {}(full {} / gdn {}) · 词表 {} · rope(rot {} / θ {:.3e} / max {} / 表 {} / yarn ×{}) · tied {}",
             path.display(),
             spec.layer_types.len(),
             spec.layer_types.iter().filter(|f| **f).count(),
@@ -280,6 +300,8 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             rf.rotary_dim,
             rf.theta,
             rf.max_pos,
+            rope.max_pos(),
+            if self.rope.yarn_on() { self.rope.yarn_factor } else { 1.0 },
             spec.tied,
         );
         let ctx = self.shard_ctx(spec.dtype);
@@ -493,4 +515,41 @@ fn log_gguf_report(path: &std::path::Path, rep: &owl_models::formats::gguf::Gguf
     for m in &rep.issues {
         owl_shared::log_info!("boot", "[gguf] · {m}");
     }
+}
+
+/// **GGUF rope 表构造**(单一产地;`new` 无 YaRN 时与历史逐位相同)。
+///
+/// 表长 = `max(模型 context, original×factor, max_seq)` ——
+/// YaRN 的官方缓存长 = `original × factor`;我们再多看一眼 `runtime.max_seq`
+/// (用户要 1M 而 factor 只给 2.0 时**响亮拒**,不静默外推)。
+/// 未开 YaRN 且 `max_seq > 模型 context` ⇒ **响亮拒**(纯外推没有官方背书)。
+fn build_gguf_rope(
+    rf: &owl_models::formats::gguf::GgufRopeFacts,
+    cfg: &owl_shared::config::RopeCfg,
+    max_seq: usize,
+    head_dim: usize,
+) -> Result<Rope> {
+    if !cfg.yarn_on() {
+        if max_seq > rf.max_pos {
+            return Err(ModelError::Msg(format!(
+                "max_seq={max_seq} > 模型 context={}(未开 YaRN):要么把 \n                 `[runtime] max_seq` ≤ {},要么开 `[model.rope] yarn_factor=…`                 (官方:2.0→524k / 4.0→1M)",
+                rf.max_pos, rf.max_pos
+            )));
+        }
+        return Rope::new(rf.max_pos, head_dim, rf.rotary_dim, rf.theta);
+    }
+    let original = if cfg.original_max == 0 { rf.max_pos } else { cfg.original_max };
+    if original == 0 {
+        return Err(ModelError::Msg("YaRN:original_max=0 且模型 context 缺失".into()));
+    }
+    let scaled = (original as f64 * cfg.yarn_factor).round() as usize;
+    let table = rf.max_pos.max(scaled).max(max_seq.max(1));
+    let yarn = owl_models::layers::rope::YarnCfg {
+        factor: cfg.yarn_factor as f32,
+        original_max: original,
+        beta_fast: cfg.beta_fast as f32,
+        beta_slow: cfg.beta_slow as f32,
+        attention_factor: cfg.attention_factor as f32,
+    };
+    Rope::new_with(table, head_dim, rf.rotary_dim, rf.theta, Some(yarn))
 }

@@ -15,6 +15,9 @@
 # 起机:
 #   CUDA_VISIBLE_DEVICES=GPU-<3090Ti 的 UUID> \
 #     target/release/server --flavor gguf27b-262k <用户档.toml>
+#
+# 📌 **要 524k / 1M**:用 `gguf27b-1m` 档(YaRN 静态外推 factor 4.0;
+#   524k = factor 2.0 + host 33792,见该档注释与设计 §二十三.7)。
 #   # 用户档只写 [model] dir/name + [runtime] device/bind 即可
 #
 # 实测(2026-10-20,单张 3090 Ti 41:00.0;详见

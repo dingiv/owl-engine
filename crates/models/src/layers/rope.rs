@@ -31,6 +31,66 @@ pub struct Rope {
     rotary_dim: usize,
 }
 
+/// **YaRN 静态外推参数**(vLLM `YaRNScalingRotaryEmbedding` 同式;2026-10-20)。
+///
+/// `original_max` = `original_max_position_embeddings`(262144),`factor` = 2.0
+/// (524k)/ 4.0(1M),`beta_fast/slow` 取 vLLM 缺省(32/1),`attention_factor`
+/// 乘在 `mscale` 上(1.0 = vLLM 缺省)。
+#[derive(Clone, Copy, Debug)]
+pub struct YarnCfg {
+    pub factor: f32,
+    pub original_max: usize,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub attention_factor: f32,
+}
+
+/// **YaRN 逆频率表**(vLLM `_compute_inv_freq` 同式;唯一实现 —— 构造与门共用)。
+///
+/// 返回 `(inv_freq[half], mscale)`。`yarn=None` 或 `factor<=1` ⇒ 原频率、mscale=1。
+fn yarn_inv_freq(rotary_dim: usize, theta: f32, yarn: Option<YarnCfg>) -> (Vec<f32>, f32) {
+    let half = rotary_dim / 2;
+    let Some(y) = yarn.filter(|y| y.factor > 1.0) else {
+        return (
+            (0..half)
+                .map(|i| theta.powf(-(2.0 * i as f32) / rotary_dim as f32))
+                .collect(),
+            1.0,
+        );
+    };
+    let (low, high) =
+        yarn_correction_range(y.beta_fast, y.beta_slow, rotary_dim, theta, y.original_max);
+    let inv_freq = (0..half)
+        .map(|i| {
+            let base_i = theta.powf(-(2.0 * i as f32) / rotary_dim as f32);
+            let ramp = if high > low {
+                (((i as f32) - low) / (high - low)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let mask = 1.0 - ramp;
+            base_i / y.factor * (1.0 - mask) + base_i * mask
+        })
+        .collect();
+    let mscale = (0.1 * y.factor.ln() + 1.0) * y.attention_factor;
+    (inv_freq, mscale)
+}
+
+/// vLLM `yarn_find_correction_dim`。
+fn yarn_correction_dim(num_rot: f32, dim: usize, base: f32, max_pos: usize) -> f32 {
+    (dim as f32 * (max_pos as f32 / (num_rot * 2.0 * std::f32::consts::PI)).ln())
+        / (2.0 * base.ln())
+}
+
+/// vLLM `yarn_find_correction_range`(truncate = true)。
+fn yarn_correction_range(beta_fast: f32, beta_slow: f32, dim: usize, base: f32, max_pos: usize) -> (f32, f32) {
+    let low = yarn_correction_dim(beta_fast, dim, base, max_pos).floor().max(0.0);
+    let high = yarn_correction_dim(beta_slow, dim, base, max_pos)
+        .ceil()
+        .min(dim as f32 - 1.0);
+    (low, high)
+}
+
 impl Rope {
     /// `theta`(rope_theta = 1e7)、`rotary_dim` = head_dim × partial(0.25 → 64)。
     /// 配置校验是 new 唯一可败点(结构参数非法 = 容器语义不成立,非数据错)。
@@ -40,6 +100,23 @@ impl Rope {
         rotary_dim: usize,
         theta: f32,
     ) -> Result<Rope, ModelError> {
+        Self::new_with(max_pos, head_dim, rotary_dim, theta, None)
+    }
+
+    /// **带 YaRN 的构造**(`yml = None` 与 [`Rope::new`] 逐位相同)。
+    ///
+    /// 频率混合(vLLM `_compute_inv_freq` 同式):
+    /// `inv = interp*(1-mask) + extrap*mask`,
+    /// `mask = (1 - ramp(low, high, i))`,
+    /// `interp = 1/(factor·base^i')`,`extrap = 1/base^i'`;
+    /// `cos/sin *= 0.1·ln(factor)+1`(`attention_factor` 可再乘)。
+    pub fn new_with(
+        max_pos: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        theta: f32,
+        yarn: Option<YarnCfg>,
+    ) -> Result<Rope, ModelError> {
         if !rotary_dim.is_multiple_of(2) || rotary_dim > head_dim {
             return Err(ModelError::Msg(format!(
                 "Rope::new: rotary_dim {rotary_dim} 非法(须偶数且 ≤ head_dim {head_dim})"
@@ -48,18 +125,17 @@ impl Rope {
         let half = rotary_dim / 2;
         // inv_freq[i] = theta^(-2i / rotary_dim);rotate-half:对 (i, i+half) 用同一频率
         // (与 HF compute_default_rope_parameters 同式:arange(0,dim,2)/dim)
+        let (inv_freq, mscale) = yarn_inv_freq(rotary_dim, theta, yarn);
         let cos_t: Vec<f32> = (0..max_pos)
             .flat_map(|p| {
-                (0..half).map(move |i| {
-                    ((p as f32) * theta.powf(-(2.0 * i as f32) / rotary_dim as f32)).cos()
-                })
+                let pf = p as f32;
+                inv_freq.iter().map(move |f| (pf * f).cos() * mscale)
             })
             .collect();
         let sin_t: Vec<f32> = (0..max_pos)
             .flat_map(|p| {
-                (0..half).map(move |i| {
-                    ((p as f32) * theta.powf(-(2.0 * i as f32) / rotary_dim as f32)).sin()
-                })
+                let pf = p as f32;
+                inv_freq.iter().map(move |f| (pf * f).sin() * mscale)
             })
             .collect();
         Ok(Rope {
@@ -88,6 +164,12 @@ impl Rope {
     /// 旋转维数(`rotary_dim ≤ head_dim`;超出部分**直通**,核内同律)。
     pub fn rotary_dim(&self) -> usize {
         self.rotary_dim
+    }
+
+    /// 表长(位置上限;含 YaRN 外推后的长度)。
+    pub fn max_pos(&self) -> usize {
+        let half = self.rotary_dim / 2;
+        if half == 0 { 0 } else { self.cos_data.len() / half }
     }
 
     pub fn tables(&self) -> crate::module::TableSource<'_> {
@@ -178,6 +260,43 @@ mod tests {
     use crate::tensor::Dtype;
     use crate::testkit::f32b;
     
+    /// **YaRN 频率混合门**(vLLM 同式;2026-10-20 长上下文冲击):
+    /// factor=1 ⇒ 与旧表逐位相同;factor=2 ⇒ 高频端(i=0, ramp=0)原频、
+    /// 低频端(i=half-1, ramp=1)减半,mscale = 0.1·ln2+1。
+    #[test]
+    fn yarn_inv_freq_blends_extrapolation_and_interpolation() {
+        let (rotary_dim, half, theta) = (64usize, 32usize, 1e7f32);
+        let (base, ms) = yarn_inv_freq(rotary_dim, theta, None);
+        assert_eq!(ms, 1.0, "无 YaRN:mscale=1");
+        for i in 0..half {
+            let want = theta.powf(-(2.0 * i as f32) / rotary_dim as f32);
+            assert_eq!(base[i], want, "无 YaRN:原频率(i={i})");
+        }
+        let yarn = YarnCfg {
+            factor: 2.0,
+            original_max: 262144,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: 1.0,
+        };
+        let (f, ms) = yarn_inv_freq(rotary_dim, theta, Some(yarn));
+        assert!((ms - (0.1 * 2f32.ln() + 1.0)).abs() < 1e-7, "mscale={ms}");
+        // 高频端(ramp=0 ⇒ mask=1 ⇒ 外推):原频
+        assert!((f[0] - base[0]).abs() <= base[0] * 1e-6, "i=0 应外推");
+        // 低频端(ramp=1 ⇒ 插值):减半
+        assert!((f[half - 1] - base[half - 1] / 2.0).abs() <= base[half - 1] * 1e-6,
+            "i={} 应插值(÷factor)", half - 1);
+        // 表长/前向不变性:factor=1 的 Some 与 None 逐位相同
+        let a = Rope::new(64, 256, rotary_dim, theta).unwrap();
+        let b = Rope::new_with(
+            64, 256, rotary_dim, theta,
+            Some(YarnCfg { factor: 1.0, ..yarn }),
+        )
+        .unwrap();
+        assert_eq!(a.cos_data, b.cos_data, "factor=1 的 cos 表必须逐位相同");
+        assert_eq!(a.sin_data, b.sin_data, "factor=1 的 sin 表必须逐位相同");
+    }
+
     #[tokio::test]
     async fn declaration_is_wellformed() {
         let (head_dim, rotary_dim, heads) = (8usize, 4usize, 2usize);

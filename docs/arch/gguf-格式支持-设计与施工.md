@@ -1824,3 +1824,57 @@ compute-bound(f16 核读 2× 字节仍更快)。代价:宿主腿 8 → 16 GiB、
    (质量门必须先过);
 3. decode 的 `q8_0` MMVQ 读对齐(772→880 GB/s,§22.7 三处之一,+4.5%);
 4. fp8 decode 核的向量化反量化(若要用回 fp8 省显存)。
+
+### 23.7 YaRN 静态外推:524k / **1M**(2026-10-20)
+
+**官方依据**:Qwen3.8 "262,144 natively and extensible up to **1,000,000 tokens via
+YaRN**"(`qwen3.8-上下文扩展到1M-调研.md`):factor 4.0 → 1M / 2.0 → 524k,
+`original_max_position_embeddings=262144`,beta_fast=32 / beta_slow=1,
+`partial_rotary_factor=0.25`(本模型 rotary_dim=64)。
+
+**实现**(与 vLLM `YaRNScalingRotaryEmbedding` **同式**,`models/layers/rope.rs`):
+
+```text
+pos_freqs        = theta^(2i/rotary_dim)            # i = 0..half-1
+inv_extrap       = 1/pos_freqs                       # 原频(高频端)
+inv_interp       = 1/(factor·pos_freqs)              # 线性插值(低频端)
+low, high        = yarn_find_correction_range(beta_fast, beta_slow, rotary_dim, theta, original)
+mask             = 1 - clamp((i-low)/(high-low), 0, 1)
+inv_freq         = inv_interp·(1-mask) + inv_extrap·mask
+cos/sin          = cos/sin(pos·inv_freq) · (0.1·ln(factor)+1)·attention_factor
+```
+
+- 配置面:`[model.rope] yarn_factor / original_max / beta_fast / beta_slow /
+  attention_factor`(缺省 1.0/0/32/1/1 = **关**,短文本逐位不变);
+- **表长** = `max(模型 context, original×factor, runtime.max_seq)`;
+- **未开 YaRN 且 `max_seq > context` ⇒ 响亮拒**(纯外推没有官方背书);
+- 只对 GGUF 档生效(HF 家族 rope 由装载器硬编码);factor=1 与旧表**逐位相同**
+  (`yarn_inv_freq_blends_extrapolation_and_interpolation` 门)。
+
+**实测**(单张 3090 Ti;greedy;needle 置 prompt 50%):
+
+| 档 | prompt tok | 墙钟 | 吞吐 | 结果 |
+|---|---:|---:|---:|---|
+| factor 2.0 / 524k | **499 277** | 344.8 s | 1448 tok/s | needle **命中** |
+| **factor 4.0 / 1M** | **1 024 497** | **729.0 s**(12.2 min) | 1405 tok/s | needle **命中** |
+
+1M 档账(实测):
+- 设备峰值 **21.9 GB / 24 GB**(池 2 GiB + 权重 17.7 + 固定项 1.2 + rope 表 128 MB +
+  激活面);`slots_total 1024`。
+- 宿主 KV 实占 **31 693 块 × 2 MiB ≈ 62 GiB**(腿 66560 MiB);索引 ~1 GiB;
+  快照腿 2 GiB ⇒ **机器需 ≥ ~70 GiB 可用 RAM**;
+- 前向 **1002 chunk × 559 ms = 560 s** + 边界 **1002 × 164 ms = 164 s**
+  (边界 p50 108 ms;打分随块数线性增长 = 1M 的主要剩余税);
+- **decode 26.6 ms/步,与 ctx 无关**(视图只读选中 ~32 页)⇒ 1M 上仍 ~37 t/s;
+- 零 Xid / 零 N4 未归还 / 零 Exhausted。
+
+**档**:
+- `flavors/gguf27b-1m.toml`(factor 4.0 / max_seq 1048576 / host 66560);
+- 524k 变体:同档 `yarn_factor=2.0` + `max_seq=524288` + `host_cache_mb=33792`
+  (注释里已写;499k 实测 344.8 s);
+- 262k 内**仍用 `gguf27b-262k`(YaRN 关)**:静态 YaRN 对短文本有轻微精度影响
+  (官方说明),日常短对话不要吃这个税。
+
+**剩余杠杆**:1M 的边界税已占 22%(打分 O(块数):1024 边界 × 最多 32768 块),
+下一刀 = 打分/选择上 GPU 或 `recall_every` 分级(必须先过 needle 质量门);
+索引 D2H 片合并(~40 ms/边界)同理。

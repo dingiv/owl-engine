@@ -324,12 +324,59 @@ pub struct RuntimeCfg {
     pub server_url: Option<String>,
 }
 
+/// **rope 外推(YaRN,静态)** —— `[model.rope]`(2026-10-20,长上下文冲击)。
+///
+/// 官方事实(Qwen3.8):262144 native,**1M via YaRN**;官方配方 = factor 4.0
+/// (1M)/ 2.0(524k),`original_max_position_embeddings = 262144`,beta_fast=32,
+/// beta_slow=1。语义与 vLLM `YaRNScalingRotaryEmbedding` **同式**(唯一权威):
+/// 频率按 ramp 在"线性插值(÷factor)"与"外推(原频)"之间混合,cos/sin 乘
+/// `mscale = 0.1·ln(factor)+1`。
+///
+/// 只对 **GGUF 单文件档**生效(HF 家族档的 rope 事实由各自装载器硬编码 ——
+/// 显式入参,不做第二套规范)。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RopeCfg {
+    /// 缩放因子(**1.0 = 关**;2.0 → 524k;4.0 → 1M)。表长 =
+    /// `max(模型 context, original×factor, max_seq)`。
+    pub yarn_factor: f64,
+    /// `original_max_position_embeddings`(**0 = 用模型自带 context_length**)
+    pub original_max: usize,
+    /// YaRN `beta_fast`(vLLM 缺省 32)
+    pub beta_fast: f64,
+    /// YaRN `beta_slow`(vLLM 缺省 1)
+    pub beta_slow: f64,
+    /// 额外 attention 乘子(乘在 `0.1·ln(factor)+1` 上;**1.0 = vLLM 缺省**)
+    pub attention_factor: f64,
+}
+
+impl Default for RopeCfg {
+    fn default() -> Self {
+        Self {
+            yarn_factor: 1.0,
+            original_max: 0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            attention_factor: 1.0,
+        }
+    }
+}
+
+impl RopeCfg {
+    /// YaRN 是否真的开着(唯一判据)。
+    pub fn yarn_on(&self) -> bool {
+        self.yarn_factor > 1.0
+    }
+}
+
 /// 模型资产面
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub struct ModelCfg {
     pub kind: ModelKind,
+    /// **rope 外推/缩放**(`[model.rope]`;缺省关。GGUF 档生效)
+    pub rope: RopeCfg,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
