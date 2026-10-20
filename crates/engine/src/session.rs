@@ -479,6 +479,7 @@ mod bank_tests {
             prefix_cache,
             cache_share_permille: if prefix_cache { 500 } else { 0 },
             host_bytes: 0,
+            world: 1,
         }
     }
 

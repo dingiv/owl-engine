@@ -1775,9 +1775,22 @@ impl<D: DeviceClient> RunningEngine<D> {
         let bytes = crate::disk_io::read_block(plan.path.clone(), plan.bytes)
             .await
             .map_err(|e| owl_iface::contract::ModelError::Msg(e))?;
-        self.bank.rel
-            .leg
-            .host_put(chain, owl_store::HostBlock::from_bytes(bytes))?;
+        // 宿主满 ⇒ 先逐最冷再落(与 offload 同一政策;裸 `host_put` 会在
+        // 回填前撞 `Exhausted` ⇒ onload 整单失败)
+        let r0 = self.bank.rel.leg.host_relief_blocks();
+        self.bank
+            .rel
+            .host_fill(chain, owl_store::HostBlock::from_bytes(bytes))?;
+        let relief = self.bank.rel.leg.host_relief_blocks().saturating_sub(r0);
+        if relief > 0 {
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("store.host.relief_blocks", relief, file!(), line!());
+            });
+            owl_shared::log_warn!(
+                "store",
+                "宿主让位:磁盘回填前先逐最冷 {relief} 块(链 {chain:?})"
+            );
+        }
         self.bank.rel.disk.as_mut().expect("判过").commit_fill(chain)?;
         owl_shared::metrics::with_metrics_store(|m| {
             m.counter_add("store.disk.fill", 1, file!(), line!());
@@ -1957,8 +1970,9 @@ impl<D: DeviceClient> RunningEngine<D> {
             match item {
                 owl_store::EvictOut::Kv { chain, sink, .. } => match sink {
                     Sink::Host => {
+                        let relief0 = self.bank.rel.leg.host_relief_blocks();
                         let (blocks, pieces, table) = {
-                            match owl_store::plan_offload(&mut self.bank.rel.leg, *chain) {
+                            match self.bank.rel.plan_kv_offload(*chain) {
                                 Ok(p) => (p.blocks, p.pieces, p.table),
                                 Err(owl_store::StoreError::Busy(_)) => {
                                     a.skipped_busy += 1;
@@ -1967,6 +1981,29 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 Err(e) => return Err(e.into()),
                             }
                         };
+                        // 宿主满时 `plan_kv_offload` 会**先逐最冷**再借台 ——
+                        // 这不是错，但说明计划面没预见到(盘写失败/账漂);
+                        // 如实上账，别让"计划曾经乐观"隐身。
+                        let relief = self
+                            .bank
+                            .rel
+                            .leg
+                            .host_relief_blocks()
+                            .saturating_sub(relief0);
+                        if relief > 0 {
+                            owl_shared::metrics::with_metrics_store(|m| {
+                                m.counter_add(
+                                    "store.host.relief_blocks",
+                                    relief,
+                                    file!(),
+                                    line!(),
+                                );
+                            });
+                            owl_shared::log_warn!(
+                                "store",
+                                "宿主让位:offload 前先逐最冷 {relief} 块(计划面未预见;链 {chain:?})"
+                            );
+                        }
                         let table = match self
                             .swap_all_ranks(owl_iface::contract::SwapDir::Out, &pieces, table)
                             .await

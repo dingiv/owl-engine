@@ -168,6 +168,9 @@ pub struct LegOps {
     pub offload_batches: u64,
     /// 换回**命令**次数(块数见 `onloads`)。
     pub onload_batches: u64,
+    /// **宿主层让位**真删的块数(执行面兜底;>0 = 计划面曾乐观/滞后,
+    /// 是"宿主满没人逐"的指纹)。
+    pub host_relief_blocks: u64,
 }
 
 /// 腿报告(设计卷 §10 报告口径)。
@@ -452,13 +455,59 @@ impl BlockLeg {
         c.into_iter().take(limit).filter_map(|x| x.chain).collect()
     }
 
-    /// 宿主层**还能装几个块**(预算 − 驻留 − 空转缓冲;关层 = 0)。
+    /// **宿主层削减候选**(从最冷链尾向内;见 [`KvStore::host_prune_candidates`])。
+    pub fn host_prune_candidates(&self, protect: &[ChainHash], limit: usize) -> Vec<ChainHash> {
+        self.kv.host_prune_candidates(protect, limit)
+    }
+
+    /// **宿主层让位**(执行面兜底;纯内存,无 I/O):按"最冷链尾向内"真丢内容,
+    /// 直到腾出 `need` 个宿主槽(或没有可削的面)。
+    ///
+    /// 为什么要有这一口(2026-10-20 双卡 1M 后遗症):计划面按"宿主有位"出票,
+    /// 而宿主满时旧链的宿主副本**没人逐** ⇒ `lend_slots` 撞 `Exhausted` ⇒
+    /// 整个 turn 失败(实测第二个长 turn:上一 turn 的宿主块一直躺着)。
+    /// 计划面负责**经济性**(优先搬盘、其次丢最冷),这里负责**活性**
+    /// (计划失准时不许硬崩)。与快照腿 `plan_snap_offload`(宿主满 ⇒ 先逐最冷)
+    /// 同一条政策。
+    ///
+    /// 返回真删的块数(0 = 没有可削的面 ⇒ 调用方照旧响亮拒)。
+    pub fn host_relieve(&mut self, need: usize, protect: &[ChainHash]) -> StoreResult<usize> {
+        if need == 0 {
+            return Ok(0);
+        }
+        let victims = self.kv.host_prune_candidates(protect, need);
+        let mut n = 0usize;
+        for c in victims {
+            match self.drop_cached(c) {
+                Ok(()) => n += 1,
+                // 判与删之间被搬回设备(`Busy`)= 跳过该条(不是错误)
+                Err(StoreError::Busy(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if n > 0 {
+            self.ops.host_relief_blocks += n as u64;
+        }
+        Ok(n)
+    }
+
+    /// 宿主层**还能装几个链块**(预算 − 驻留 − 空转缓冲;关层 = 0)。
+    ///
+    /// **单位 = 宿主槽**(= `planes × 单页字节`,TP2 就是两个 rank 各半页);
+    /// 旧实现除的是 `kv.block_bytes()`(单平面页)—— TP 档把可容槽数**高估
+    /// world 倍** ⇒ 计划按"有位"出票、`lend_slots` 走到一半才撞 `Exhausted`
+    /// (双卡 1M 后第二个长 turn 的硬错就是这样来的,§23.11)。
     pub fn host_free_slots(&self) -> usize {
         let used = self.host.used_bytes() + self.host.free_bytes();
         self.host
             .budget_bytes()
             .saturating_sub(used)
-            / self.kv.block_bytes().max(1)
+            / self.host.block_bytes().max(1)
+    }
+
+    /// **宿主让位计数**(执行面兜底真删的块数;>0 = 计划面曾乐观/滞后)。
+    pub fn host_relief_blocks(&self) -> u64 {
+        self.ops.host_relief_blocks
     }
 
     /// 宿主层预算(字节;0 = 关层)。
@@ -520,6 +569,12 @@ impl BlockLeg {
             .into_iter()
             .filter(|b| b.slot.is_none())
             .count()
+    }
+
+    /// **整链还留在设备上的块数**(= 一次整链下沉要借几个宿主槽；
+    /// `None` = 本链不可整条下沉，与 [`crate::leg::plan_offload`] 同判据)。
+    pub fn chain_dev_span(&self, tail: ChainHash) -> Option<usize> {
+        self.kv.chain_down_span(tail)
     }
 
     /// 整块前缀的内容身份(身份原语的腿面出口;engine 播种链游标 / 测试)。
