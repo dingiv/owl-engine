@@ -350,3 +350,70 @@ Q4_K 草稿的 `mlp_out` / `fc` 可达 **6e4** —— 贴 F16 上限 65504,随�
 3. P4(原设计):GGUF 草稿 TP2 分片、码本 GGUF-gather(省 254 MB)、Q8_0 草稿档对比;
 4. 顺手修:上一轮 IQ 落地后 `dequant::tests::rejects_bad_geometry` 拿 IQ2_XXS 当
    "未接臂"(陈旧断言)→ 改用 IQ1_M。
+
+---
+
+## 9. 投机性能专项(2026-10-21 同日):m=8 的 8 倍权重流量
+
+### 9.1 定谳:verify 慢的根因是 **MMVQ 网格 = (权重行, token)**
+
+`nsys` + `--cuda-graph-trace=node` 拿到逐核数据后,证据链闭合:
+
+- 27B UD-IQ4_XS 的 verify(depth=7 ⇒ 8 行)图内 GPU 时间 **175 ms**,裸 decode 27 ms;
+- 逐深度扫描 **完美线性**:2 行 88 ms / 4 行 172 ms / 8 行 322 ms(≈43 ms/行);
+- 单张量微基准(nsys 逐例):29 MB 的 IQ4_XS 张量
+  **m=1 → 32 µs(900 GB/s,带宽地板)/ m=8 → 238 µs / m=64 → 1885 µs**;
+- 读 `gguf_gemm.cu` 的发射契约:`grid = (ceil(n/n_warps), m)` ⇒ **每个 (权重行, token)
+  独立读一遍权重行** ⇒ 权重流量 = `m × 权重字节数`。
+
+即:**decode(m=1)本来就是对的;verify(m=8)与小块 prefill 一直在读 8 遍权重**。
+27B 权重 13.3 GB × 8 = 106 GB ⇒ 175 ms(≈600 GB/s 有效)正是这条公式。
+
+### 9.2 两刀(都可回退,零语义变化)
+
+**① 复用臂补 10 型**(`gguf_tile.cu`;UD 混型档的 IQ/K-quant 全族)
+`owl_gguf_mmvq_tile_body` 本是逐型模板,只缺实例 ⇒ 加 wrapper + 入口名 + 声明:
+Q2_K/Q3_K/IQ1_S/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS(MT=16)。
+门 = `tile_gemm_matches_mmvq_bitwise` 的 IQ 版:**12 型 × m∈{8,17} 全 24 组逐位相同**。
+效果:verify 175 → **127 ms**。
+
+**② MMQ2(int8-MMA)小 m 下限 64 → 4**(`family::gguf::MMQ2_SMALL_M`)
+实测交叉表(29 MB IQ4_XS 张量,nsys 逐例):
+
+| m | MMVQ | 复用臂 | **MMQ2(J=64)** |
+|---|---:|---:|---:|
+| 2 | 66 µs | — | 77 µs |
+| 4 | ~130 µs | — | ~78 µs |
+| 8 | 238 µs | 153 µs | **81 µs** |
+| 32 | 941 µs | ~400 µs | **84 µs** |
+| 64 | 1885 µs | 450 µs | **83 µs** |
+
+MMQ2 对 m **近乎恒定**(J=64 分块 + 权重读一遍),交叉点 ≈ 4;m=1(decode)仍选 MMVQ。
+门 = `gpu_gguf_mmq2_small_m`:7 型 × m∈{2,8,17,32,64},MMQ2 vs MMVQ 相对差
+**最大 1.1e-2**(int8 量化噪声域;判据 5e-2)。
+效果:verify 127 → **71 ms**,propose 33 → **23 ms**。
+
+### 9.3 结果(单 3090 Ti,27B UD-IQ4_XS,256 tok greedy)
+
+| 阶段 | verify(GPU) | propose | 轮 | tok/s(degrade 开) | 纯 spec(degrade 关) |
+|---|---:|---:|---:|---:|---:|
+| 起点(MMVQ) | 175 ms | 37 ms | 167 ms | 23.5 | — |
+| + ① 复用臂补型 | 127 ms | 33 ms | ~145 ms | 27.0 | — |
+| + ② MMQ2 小 m | **71 ms** | **23 ms** | **73 ms** | **31.8** | **18.6** |
+| 无 spec 基线 | — | — | 26 ms | **32.4** | — |
+
+**结论(诚实的边界)**
+1. 两刀合计 **2.5× verify / 1.6× propose / 2.3× 轮**;草稿侧已无低垂果实。
+2. 纯 spec 仍**亏**(18.6 vs 32.4):验收分布**双峰**(m=0×12 / m=1×4 / m=2×2 /
+   m=3×1 / m=5×1 / m=7×6 ⇒ 均值 ≈ 2.2),而 verify 8 行仍 ≈ 2× 裸步。
+   盈亏线 = 轮/裸 = 73/26 = **2.8** ⇒ AL 均值 2.2 在线下。
+3. 因此**降级机制在位时 ≈ 平手(31.8 vs 32.4)**;关降级反而更差(18.6)——
+   该档的正确姿势就是"让降级机制自己选臂"。
+4. 剩余杠杆(按性价比):
+   - **verify 的 m=8 GEMM 有效带宽 400 vs decode 610 GB/s** ⇒ 需小 m 专用
+     tile/split-k(把 CTA 数从 n/128 提上来;IQ 族的 vec_dot 是算术瓶颈,
+     MMQ2 的 J=64 在 n=5120 时只有 40 CTA);
+   - **propose 23 ms vs 理论 ~9 ms**(lm_head 2.5 GB + 草稿 1.1 GB):逐节点归因
+     未做完(图形回放与 decode/verify 交错,窗口切分待做);
+   - **AL 是模型上限**(同族 W4A16 草稿 2.86)—— 草稿侧优化抬不动它;
+     若要 spec 真赚,只能在**更大 batch 的端侧**(多会话合批)或**更强草稿**上做。
