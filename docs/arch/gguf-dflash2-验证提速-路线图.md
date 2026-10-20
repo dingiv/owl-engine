@@ -260,8 +260,12 @@ nsys 运行时 API 账(单轮 58.5 ms):
 - `cuMemcpyHtoDAsync` 25 次 = 0.12 ms;`cuMemGetInfo` 2 次(热路径设备查询,I-4 违规面)。
 - 时序上表现为"propose 采样核结束 → 下一个核"**固定 4.0–4.6 ms 真空**(两臂都有,与 FI 无关)。
 
-⇒ 三个独立杠杆(都还没做):① 输入槽上传合并(194 → 数次);
-② 去掉热路径 `cuMemGetInfo`;③ 图启动/回放路径复核。
+⚠️ **但这条在无插桩口径下几乎为零**:同档实测 `[spec-degrade] 轮 53ms`
+(= verify pure 46.2 + propose pure_gpu ~7),即 **round ≈ verify + propose**,空洞只剩 <1 ms
+⇒ §9.4 的 4.2 ms **主要是 CUPTI 的 graph-node 追踪放大**(cuGraphLaunch/每次 memcpy 的
+主机耗时被逐节点记事件),**不是真成本**。
+⇒ 结论修正:**别去做"上传合并/去 cuMemGetInfo"**;唯一剩下的杠杆还是 §9.3 的 GEMM 带宽。
+(`cuMemGetInfo` 属热路径设备查询,I-4 面仍应清掉,但只有 ~0.2 ms。)
 
 ### 9.5 std 五项三轮(spec d7,v2 verify,**含刀 B**)
 
@@ -285,7 +289,7 @@ prefill 1753(不变,1.75k 档);`verify pure` 884→**46.2 ms**、7734→**59.0 m
 | # | 项 | 预期 | 代价 |
 |---|---|---|---|
 | 1 | **MMQ2 stream-k + fixup**(gx=nsm;需给 fixup 核改 half 累加 + 一块 `tmp` 工作区 + 第二发) | round −10~13 ms(→45) | 大,动 4 文件 + 工作区账 |
-| 2 | **host 空洞**(9.4):输入槽上传合并 / 去 `cuMemGetInfo` | round −3~5 ms | 中,引擎侧 |
+| 2 | ~~host 空洞~~(9.4 已证伪:是 CUPTI 放大)⇒ 只清热路径 `cuMemGetInfo` | ~0.2 ms | 低 |
 | 3 | **ssm_alpha/beta 小 GEMM**(n=48,96 发 3.3 ms):专用 k-split 单发核 | −2.5 ms | 中 |
 | 4 | FI verify 数值对齐(9.1)后转正 | @8k −15 ms,且 ctx 平坦 | 中(数值取证) |
 | 5 | Q2_K 的 D2S6 量化手(1 张 19 MB) | −0.1 ms | 低但无收益,挂账 |
