@@ -163,6 +163,9 @@ pub struct RunningEngine<D: DeviceClient> {    /// 步级探针(boot 解析;不�
     pub(crate) turns: TurnLedger,
     /// H5 空转整理节拍(空转 pump 计数;每 `IDLE_HK_EVERY` 拍整理一次)
     pub(crate) idle_pumps: u64,
+    /// **默认池缓存回收的节拍**(§23.9:turn 收尾之后才 free 的页要在空转期再清一次;
+    /// 每 `IDLE_TRIM_EVERY` 一次,失败只 WARN 不打断空转)。
+    pub(crate) last_trim: Option<std::time::Instant>,
     /// N6/保洁 deny 的**累计**次数(限流日志用:首条 + 每 64 条打一次;
     /// 计数本身**不丢** —— 机读面 = `store.degrade` metrics)
     pub(crate) degrade_seen: u64,
@@ -882,6 +885,10 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 走 `EngineKnobs` 显式配置字段。
     const IDLE_HK_EVERY: u64 = 16;
 
+    /// 空转期池缓存回收的最小间隔(空转 pump 很密;500ms 足够让 turn 收尾的
+    /// 大额临时块真正 free 之后再清一次)。
+    const IDLE_TRIM_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
     /// **统一节点入口**(store 立案 §三.A / §五.2;步 4 收编)。
     ///
     /// 纪律:节点只做三件事 —— ①按节点算需求 ②`store.plan` 取计划 ③`apply_verdict`
@@ -928,6 +935,30 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // `vram-hard-budget`。这里把 `Turn(t)` 名下"仍开着、不在池里"的块
                 // **强制归还驱动**(决策在 store `stale_of`,执行在句柄)。
                 self.n4_force_release(turn).await?;
+                // **池缓存回收**(2026-10-20 §23.9):`RELEASE_THRESHOLD=∞` ⇒ turn 内
+                // 的峰值缓存**永不**还 OS(peer 侧实测 3.3 GiB 长期挂着,长 prefill
+                // 因此提前撞 `vram-hard-budget`)。turn 收尾清一次:块账不变,
+                // 只把"已 free 的缓存页"还给驱动。
+                let freed = self.trim_pools().await;
+                // 让**紧随其后的 Idle 出口**再清一次:turn 收尾路径里还有一批
+                // 大额临时块是在 TurnEnd 之后才 free 的(实测 peer 3.0 GiB)。
+                self.last_trim = None;
+                for (rank, r) in freed {
+                    match r {
+                        Ok(0) => {}
+                        Ok(n) => owl_shared::log_info!(
+                            "store",
+                            "池缓存回收:turn {turn} rank{rank} 释放 {:.1} MiB(已 free 的池页还给驱动)",
+                            n as f64 / 1048576.0
+                        ),
+                        // 收尾路径的可失败调用:如实 WARN(不静默;也不升级为 turn 失败 ——
+                        // 显存多占一点不影响正确性,下一 turn 的压力旁路还会再试)
+                        Err(e) => owl_shared::log_warn!(
+                            "store",
+                            "池缓存回收失败(turn {turn} rank{rank}): {e}"
+                        ),
+                    }
+                }
                 Ok(())
             }
             // N5:会话关闭 —— 链已由会话表归还(store API),本节点只记账/归属复位
@@ -999,6 +1030,68 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 判据:三者非零 = 有事件没入账 / 有窗未收 —— **可见**比"账看起来平"更重要。
     pub fn handle_probe(&self) -> (u64, u64, usize) {
         self.dev.graphs.dev_ctx_face().ledger_probe()
+    }
+
+    /// **默认池账(逐 rank;2026-10-20 §23.9)**:`/debug/vram` 的 `pools` 行。
+    ///
+    /// 为什么要它:`RELEASE_THRESHOLD=∞` 下**已 free 的块仍占物理显存**(池缓存);
+    /// 块账只见 live ⇒ "物理 − live" 这部分在双 rank 上只长在 peer 一侧
+    /// (实测 +3.3 GiB),不读数就只能瞎猜。
+    pub async fn pool_probe(
+        &mut self,
+    ) -> Vec<(u8, std::result::Result<(u64, u64, u64, u64), String>)> {
+        let mut out: Vec<(u8, std::result::Result<(u64, u64, u64, u64), String>)> = Vec::new();
+        let r = self
+            .dev
+            .graphs
+            .session
+            .face_mut()
+            .mem_pool_stats()
+            .await
+            .map_err(|e| e.to_string());
+        out.push((0, r));
+        if let Some(p) = self.peer.as_mut() {
+            let r = p
+                .graphs
+                .session
+                .face_mut()
+                .mem_pool_stats()
+                .await
+                .map_err(|e| e.to_string());
+            out.push((1, r));
+        }
+        out
+    }
+
+    /// **默认池缓存回收(逐 rank)** —— turn 收尾 / 压力旁路调。
+    ///
+    /// 语义:`cuMemPoolTrimTo(0)` 把池内**已 free 的缓存页**还给 OS(不改块账)。
+    /// 返回逐 rank 的 `(rank, Ok(释放字节)/Err(原因))` —— 失败**如实带出**
+    /// (调用方决定是否响亮;本函数不吞)。
+    pub async fn trim_pools(
+        &mut self,
+    ) -> Vec<(u8, std::result::Result<u64, String>)> {
+        let mut out: Vec<(u8, std::result::Result<u64, String>)> = Vec::new();
+        let r = self
+            .dev
+            .graphs
+            .session
+            .face_mut()
+            .mem_pool_trim()
+            .await
+            .map_err(|e| e.to_string());
+        out.push((0, r));
+        if let Some(p) = self.peer.as_mut() {
+            let r = p
+                .graphs
+                .session
+                .face_mut()
+                .mem_pool_trim()
+                .await
+                .map_err(|e| e.to_string());
+            out.push((1, r));
+        }
+        out
     }
 
     /// **块账房快照(逐 rank)**:`/debug/vram` 与事件账做**全等门**的右值。

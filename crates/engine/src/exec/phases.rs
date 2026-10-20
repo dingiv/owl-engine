@@ -18,6 +18,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
     /// 块表重写(write_bt;图烘焙 bt 指针,内容重写指针稳定图不重捕)
     pub(crate) async fn execute_begin(&mut self, b: BeginPlan) -> Result<()> {
+        // **上一 turn 的池缓存**(§23.9):turn 收尾之后才 free 的大额临时块
+        // (`RELEASE_THRESHOLD=∞` 下不主动清就永远占着)在新 turn 起点一并回收。
+        // 放在 begin 之前:此时设备已空闲,连同步一起做代价最小(ms 级)。
+        let _ = self.trim_pools().await;
         // 性能面:本轮 epoch 起点(/debug/perf?epoch=1 = 只看本轮;不 reset,
         // 历史样本仍可全量查询 —— perf-framework.md §三)
         owl_shared::metrics::mark_epoch();

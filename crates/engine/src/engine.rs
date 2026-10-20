@@ -1141,6 +1141,7 @@ pub(crate) fn into_running<D: DeviceClient>(
         boot_seq: BOOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
         turns: crate::turn::TurnLedger::new(),
         idle_pumps: 0,
+        last_trim: None,
         degrade_seen: 0,
         bank,
         dev,
