@@ -188,3 +188,104 @@ DFlash2 草稿 = 标准 `build_attn` + **非因果 mask**(`src/models/dflash.cpp
 | 引擎 | `crates/engine/src/{spec_runtime.rs, exec/spec.rs, exec/draft.rs, graph_fleet.rs}` |
 | 门 | `crates/models/src/formats/gguf/kernel_gate.rs`(`mod m_scan`) |
 | 文档 | 本文件 + `docs/arch/gguf-dflash2-投机-调研与设计.md` §8/§9 |
+
+---
+
+## 9. 2026-10-21 第二轮实施记录(V0 结案 + 刀 B 落地)
+
+### 9.1 V0(零代码 A/B)结案:**配方缺一步,且 FI 不是等价结果**
+
+- **配方缺 `dispatch.verify_v2 = false`**。臂选择序(`layers/attention.rs:1234` vs `:1268`):
+  `verify_v2` 缺省 `true` ⇒ **v2 臂先命中,FI 节点虽登记却永不执行**。
+  实测截获:开 `verify_fi` 而忘关 `verify_v2` 时 boot 打印
+  `verify 面事实: FI 节点登记=true | 臂事实(attn.arm.verify.*):v2=32`
+  —— **看臂事实、别看节点登记**(这条路子以后所有 A/B 都照此核对)。
+- 真开 FI 后(`verify=fi=32`),verify 图 GPU(`[verify-prof] pure`):
+
+| ctx | v2(旧 MMQ2) | FI(旧 MMQ2) | 结论 |
+|---|---:|---:|---|
+| 884 | 54.5 ms | 52.4 ms | ≈ 打平 |
+| 7734 | **67.3 ms** | **52.3 ms** | FI **−15 ms**,且**对 ctx 完全平坦** |
+
+- 但 **FI 的输出与 greedy 不逐字节一致**:884 ctx 下 spec-on(FI)与 spec-off 在**第 38 个字符**
+  分叉;v2 在同一 ctx 下与 spec-off 完全一致(旧门口径)。⇒
+  **FI 不能直接转正**(它是"另一次数值",不是同一个 argmax 序列);
+  且 v2 在 7734 ctx 下与 spec-off 也在第 10 个字符分叉 ⇒ 逐字节门本身只在小 ctx 成立
+  (既有性质,与本次改动无关)。
+  **待办**:FI 与 v2 的 KV 累加序对齐(或明确降级为"数值近似臂")。
+
+### 9.2 刀 B(`db87eb2`):IQ2_S / IQ2_XS / Q3_K 接 MMQ2 J=16
+
+见提交信息。轮内 nsys 账(tiny 请求,同一轮窗口,ts 对齐):
+
+| 内核 | 改前 | 改后 |
+|---|---:|---:|
+| `tile_iq2s` ×7 | 4.83 ms | `mmq2_iq2s` **0.83** |
+| `tile_q3k` ×8 | 3.46 ms | `mmq2_q3k` **0.79** |
+| `tile_iq2xs` ×2 | 1.40 ms | `mmq2_iq2xs` ~0.15 |
+| **GPU busy/轮** | 51.7 ms | **51.7→43.5**(round 67.3 → **58.5**) |
+
+⚠️ 新增 `mmq2_sram_stride_for` / `mmq2_smem_for`:Q3_K 布局 X 面 stride = **84**(不是 76)、
+Q2_K = 100。**Q2_K 不能挂**:激活布局是 `MMQ_Q8_1_DS_LAYOUT_D2S6`,本适配层只有 D4/DS4(硬接出 inf)。
+
+### 9.3 verify 轮预算表(nsys,`--cuda-graph-trace=node`,tiny 请求,单轮 51.7 ms busy)
+
+| 项 | ms/轮 | 占比 | 备注 |
+|---|---:|---:|---|
+| MMQ2 GEMM(IQ4_XS 16.6 / Q4_K 6.8 / Q5_K 6.2 / IQ3_S 5.6 / IQ3_XXS 2.1 / Q6_K 0.7 / 新三型 1.8) | ~40 | 77% | 有效带宽 **≈330 GB/s**(权重 14.24 GB) |
+| 其中 `tile_q8_0`(ssm_alpha/beta 96 发 × 35 µs) | 3.3 | 6% | n=48 → 12 CTA,69 GB/s |
+| `gdn_recurrence` + `gdn_conv` 等 | 4.4 | 9% | |
+| 其余(norm/silu/cast/quant/argmax) | ~3 | 6% | |
+| **host 间隙**(轮内 6.2 ms) | 6.2 | 12% | 见 9.4 |
+
+**GEMM 有效带宽的根因已定谳 = CTA 数,不是算法**:
+`grid=(n/128, ceil(m/J))`,m=8 时 J=16 ⇒ `ntx=1` ⇒ **CTA 数 = n/128**。
+
+| n | CTA | 实测带宽 |
+|---:|---:|---:|
+| 5120(ffn_down / attn_qkv 的 k 向内维) | 40 | 435 GB/s |
+| 6144 / 10240 | 48 / 80 | ~490 |
+| 17408(ffn_up/gate) | 136 | 570 GB/s |
+| 248320(lm_head Q5_K,1940 CTA) | 1940 | **712 GB/s(≈ DRAM 顶)** |
+
+⇒ 理论顶 712,小 n 只有 61%。**唯一解 = k 向切分(stream-k)**;
+实测把 grid 硬拉到 168 会走 `fixup=true` 分支 → 空 `tmp_fixup` 立刻 IMA(已复现,勿再试)。
+
+### 9.4 新发现:每轮 ~4.2 ms 的 host 空洞(propose→verify)
+
+nsys 运行时 API 账(单轮 58.5 ms):
+
+- `cuGraphLaunch` ×3 = **3.2 ms 主机时间**(单次最长 2.36 ms)—— CUPTI 下有放大,但非零;
+- `cuMemcpyDtoDAsync` **387 次/轮**(单轮内 verify 前 194 次)= **2.3 ms 主机时间**;
+- `cuMemcpyHtoDAsync` 25 次 = 0.12 ms;`cuMemGetInfo` 2 次(热路径设备查询,I-4 违规面)。
+- 时序上表现为"propose 采样核结束 → 下一个核"**固定 4.0–4.6 ms 真空**(两臂都有,与 FI 无关)。
+
+⇒ 三个独立杠杆(都还没做):① 输入槽上传合并(194 → 数次);
+② 去掉热路径 `cuMemGetInfo`;③ 图启动/回放路径复核。
+
+### 9.5 std 五项三轮(spec d7,v2 verify,**含刀 B**)
+
+`docs/bench/data/gguf27b-iq4xs-std-spec-2026-10-21b.json`(五点三轮)+
+`…-std-spec-hi-2026-10-21b.json`(4096/8192 补测三轮):
+
+| 点 | 旧(spec d7) | 新 | 相对无投机(40.05) |
+|---|---:|---:|---:|
+| 512 | 72.4 / 73.8 / 66.2 | **82.2 / 82.9 / 72.9** | **+105%** |
+| 1024 | 69.2 / 66.3 / 63.7 | **77.1 / 72.7 / 69.8** | +81% |
+| 2048 | 48.7 / 45.9 / 44.5 | **53.6 / 48.8 / 52.8** | +32% |
+| 4096 | 34.6 / 34.2 / 34.7 | 33.4 / 31.8 / 31.9 ‖ 34.4 / 34.0 / 33.1 | −16% |
+| 8192 | 32.3 / 33.0 / 33.3 | 33.5 / 33.5 / 33.1 ‖ 32.2 / 34.0 / 33.6 | −16% |
+
+prefill 1753(不变,1.75k 档);`verify pure` 884→**46.2 ms**、7734→**59.0 ms**(v2 臂,−8.3 ms)。
+**4096/8192 仍不赚**:round@8k ≈ 64 ms、裸步 29 ms ⇒ 盈亏线 2.2,而窗口 AL 只有 1.7–2.0
+—— 与 §4 H2 的预判一致:**这两点要靠 AL 或 round 再砍一半**,不是本轮的范围。
+
+### 9.6 下一步队列(按 ROI 排序)
+
+| # | 项 | 预期 | 代价 |
+|---|---|---|---|
+| 1 | **MMQ2 stream-k + fixup**(gx=nsm;需给 fixup 核改 half 累加 + 一块 `tmp` 工作区 + 第二发) | round −10~13 ms(→45) | 大,动 4 文件 + 工作区账 |
+| 2 | **host 空洞**(9.4):输入槽上传合并 / 去 `cuMemGetInfo` | round −3~5 ms | 中,引擎侧 |
+| 3 | **ssm_alpha/beta 小 GEMM**(n=48,96 发 3.3 ms):专用 k-split 单发核 | −2.5 ms | 中 |
+| 4 | FI verify 数值对齐(9.1)后转正 | @8k −15 ms,且 ctx 平坦 | 中(数值取证) |
+| 5 | Q2_K 的 D2S6 量化手(1 张 19 MB) | −0.1 ms | 低但无收益,挂账 |
