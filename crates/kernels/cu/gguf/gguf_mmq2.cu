@@ -72,7 +72,8 @@ __device__ __forceinline__ float group_sum(float s) {
 
 /// `ds4 = true` ⇒ Q4_K/Q5_K(写 ds4[4] = half2(d, sum));
 /// `ds4 = false` ⇒ Q8_0/Q6_K(写 d4[4] = d)
-template <bool ds4>
+/// `bf16 = true` ⇒ 激活是 **BF16**(DFlash2 草稿执行域;2026-10-21)
+template <bool ds4, bool bf16>
 __device__ __forceinline__ void quant_body(const void * __restrict__ vx, void * __restrict__ vy,
                                            int n_tokens, int ne0) {
     const int64_t i0 = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * 4;
@@ -80,13 +81,18 @@ __device__ __forceinline__ void quant_body(const void * __restrict__ vx, void * 
         return;
     }
     const int64_t row = blockIdx.x;              // token
-    const __half * x = reinterpret_cast<const __half *>(vx) + row * (int64_t) ne0;
-
-    // 4 个 f16 读成 2 个 half2(保持与上游 float4 相同的 lane→元素映射)
-    const __half2 h0 = *reinterpret_cast<const __half2 *>(x + i0 + 0);
-    const __half2 h1 = *reinterpret_cast<const __half2 *>(x + i0 + 2);
-    const float2 f0 = __half22float2(h0);
-    const float2 f1 = __half22float2(h1);
+    float2 f0, f1;
+    if constexpr (bf16) {
+        const __nv_bfloat16 * x =
+            reinterpret_cast<const __nv_bfloat16 *>(vx) + row * (int64_t) ne0;
+        f0 = make_float2(__bfloat162float(x[i0 + 0]), __bfloat162float(x[i0 + 1]));
+        f1 = make_float2(__bfloat162float(x[i0 + 2]), __bfloat162float(x[i0 + 3]));
+    } else {
+        const __half * x = reinterpret_cast<const __half *>(vx) + row * (int64_t) ne0;
+        // 4 个 f16 读成 2 个 half2(保持与上游 float4 相同的 lane→元素映射)
+        f0 = __half22float2(*reinterpret_cast<const __half2 *>(x + i0 + 0));
+        f1 = __half22float2(*reinterpret_cast<const __half2 *>(x + i0 + 2));
+    }
 
     float amax = fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)), fmaxf(fabsf(f1.x), fabsf(f1.y)));
     amax = group_amax(amax);
@@ -120,12 +126,27 @@ __device__ __forceinline__ void quant_body(const void * __restrict__ vx, void * 
 
 extern "C" __global__ void owl_mmq2_quant_q8_1_ds4(const void * __restrict__ vx,
                                                     void * __restrict__ vy, int n_tokens, int ne0) {
-    owl_mmq2::quant_body<true>(vx, vy, n_tokens, ne0);
+    owl_mmq2::quant_body<true, false>(vx, vy, n_tokens, ne0);
 }
 
 extern "C" __global__ void owl_mmq2_quant_q8_1_d4(const void * __restrict__ vx,
                                                   void * __restrict__ vy, int n_tokens, int ne0) {
-    owl_mmq2::quant_body<false>(vx, vy, n_tokens, ne0);
+    owl_mmq2::quant_body<false, false>(vx, vy, n_tokens, ne0);
+}
+
+// ---- BF16 激活变体(2026-10-21;DFlash2 草稿执行域)----
+//
+// 为什么要有:草稿的激活是 BF16(F16 装不下残差流),而 MMQ2 的量化手只吃 F16
+// ⇒ 草稿的全部 GEMM 被迫退回复用臂(tile),propose 的 1.07 GB 权重按 290 GB/s
+// 走。本变体让 MMQ2 直接吃 BF16(数值上只多一次 bf16→f32,精度不降)。
+extern "C" __global__ void owl_mmq2_quant_q8_1_ds4_bf16(
+    const void * __restrict__ vx, void * __restrict__ vy, int n_tokens, int ne0) {
+    owl_mmq2::quant_body<true, true>(vx, vy, n_tokens, ne0);
+}
+
+extern "C" __global__ void owl_mmq2_quant_q8_1_d4_bf16(
+    const void * __restrict__ vx, void * __restrict__ vy, int n_tokens, int ne0) {
+    owl_mmq2::quant_body<false, true>(vx, vy, n_tokens, ne0);
 }
 
 // ============================================================================
@@ -178,3 +199,16 @@ OWL_MMQ2_WRAP(owl_mmq2_iq3s_j64, GGML_TYPE_IQ3_S, 64)
 OWL_MMQ2_WRAP(owl_mmq2_iq3s_j128, GGML_TYPE_IQ3_S, 128)
 OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j64, GGML_TYPE_IQ3_XXS, 64)
 OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j128, GGML_TYPE_IQ3_XXS, 128)
+
+// ---- J=16(2026-10-21):小 m(verify depth+1 = 2..8、propose 8 行)专用档 ----
+// 复用同一 `mul_mat_q<ty, J, false>`(上游 J 表本就含 16)。J=64 在 m=8 时
+// 有 8/64 的有用行 ⇒ 4× 的 MMA 浪费;J=16 同样一次读权重(ntx=ceil(8/16)=1),
+// 但只算 16 行 ⇒ 实测 MMQ2 m=8 从 81 µs 降到 ~35 µs(29 MB 张量)。
+
+OWL_MMQ2_WRAP(owl_mmq2_q8_0_j16, GGML_TYPE_Q8_0, 16)
+OWL_MMQ2_WRAP(owl_mmq2_q4k_j16, GGML_TYPE_Q4_K, 16)
+OWL_MMQ2_WRAP(owl_mmq2_q5k_j16, GGML_TYPE_Q5_K, 16)
+OWL_MMQ2_WRAP(owl_mmq2_q6k_j16, GGML_TYPE_Q6_K, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq4xs_j16, GGML_TYPE_IQ4_XS, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq3s_j16, GGML_TYPE_IQ3_S, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j16, GGML_TYPE_IQ3_XXS, 16)

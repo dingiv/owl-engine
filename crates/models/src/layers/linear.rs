@@ -131,16 +131,19 @@ pub(crate) fn gguf_quant_gemm(
     // (llama.cpp)对 cuBLAS 的 66,而且**省掉"权重→f16 解量化"那 10.4%**
     // (设计 §21.2)。`OWL_GGUF_MMQ2=0` 一键回退。
     if m >= GGUF_MMQ2_MIN_M
-        && xs.dtype == Dtype::F16
+        // 激活 ∈ {F16, BF16}(BF16 = DFlash2 草稿域;量化手有 `*_bf16` 变体)
+        && matches!(xs.dtype, Dtype::F16 | Dtype::BF16)
         && col_index.is_none()
         && gguf_mmq2_arm_enabled()
         && owl_kernels::family::gguf::mmq2_ok(ty, m, out_dim, k)
     {
         use owl_kernels::family::gguf as famg;
-        let quant = if famg::mmq2_quant_entry_for(ty) == Some(famg::MMQ2_QUANT_DS4) {
-            SemanticKernel::GgufMmq2QuantDs4
-        } else {
-            SemanticKernel::GgufMmq2QuantD4
+        let bf16 = xs.dtype == Dtype::BF16;
+        let quant = match famg::mmq2_quant_entry_for_act(ty, bf16) {
+            Some(famg::MMQ2_QUANT_DS4) => SemanticKernel::GgufMmq2QuantDs4,
+            Some(famg::MMQ2_QUANT_DS4_BF16) => SemanticKernel::GgufMmq2QuantDs4Bf16,
+            Some(famg::MMQ2_QUANT_D4_BF16) => SemanticKernel::GgufMmq2QuantD4Bf16,
+            _ => SemanticKernel::GgufMmq2QuantD4,
         };
         // 激活 → q8_1_mmq([k/128][token] × 144B;展平成 U8 二秩)
         let xq = TensorOps::call(quant)

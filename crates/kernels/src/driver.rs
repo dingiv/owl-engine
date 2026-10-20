@@ -182,8 +182,10 @@ pub fn resolve(req: OpReq) -> KernelPick {
         // **内维列序 gather**(W-2e):aux = [rows](k 走标量槽;几何只吃 rows)
         "gguf.gather_cols" => gguf::gather_cols(ax(0)),
         // **激活量化 → q8_1_mmq**(W-2f):aux = [m, k](几何只吃这两个)
-        "gguf.mmq2_quant_ds4" => gguf::mmq2_quant(true, ax(0), ax(1)),
-        "gguf.mmq2_quant_d4" => gguf::mmq2_quant(false, ax(0), ax(1)),
+        "gguf.mmq2_quant_ds4" => gguf::mmq2_quant(true, false, ax(0), ax(1)),
+        "gguf.mmq2_quant_d4" => gguf::mmq2_quant(false, false, ax(0), ax(1)),
+        "gguf.mmq2_quant_ds4_bf16" => gguf::mmq2_quant(true, true, ax(0), ax(1)),
+        "gguf.mmq2_quant_d4_bf16" => gguf::mmq2_quant(false, true, ax(0), ax(1)),
         // **head 版 int8-MMA MMQ**(W-2f):aux = [ty, m, n](J 由 m 定)
         "gguf.mmq2" => gguf::mmq2(
             crate::family::gguf::GgmlTy::from_code(ax(0) as u32)
@@ -648,13 +650,14 @@ pub mod gguf {
     }
 
     /// **激活量化 → `block_q8_1_mmq`**(W-2f):`grid=(m, ceil(k/512),1)`、`block=(128,1,1)`
-    pub fn mmq2_quant(ds4: bool, m: usize, k: usize) -> KernelPick {
+    pub fn mmq2_quant(ds4: bool, bf16: bool, m: usize, k: usize) -> KernelPick {
         let (grid, block) = fam::mmq2_quant_geom(m, k);
         let shape = Shape { grid, block, smem: 0 };
-        if ds4 {
-            KernelPick::of::<crate::ops::gguf::GgufMmq2QuantDs4>(shape)
-        } else {
-            KernelPick::of::<crate::ops::gguf::GgufMmq2QuantD4>(shape)
+        match (ds4, bf16) {
+            (true, false) => KernelPick::of::<crate::ops::gguf::GgufMmq2QuantDs4>(shape),
+            (false, false) => KernelPick::of::<crate::ops::gguf::GgufMmq2QuantD4>(shape),
+            (true, true) => KernelPick::of::<crate::ops::gguf::GgufMmq2QuantDs4Bf16>(shape),
+            (false, true) => KernelPick::of::<crate::ops::gguf::GgufMmq2QuantD4Bf16>(shape),
         }
     }
 
@@ -667,6 +670,13 @@ pub mod gguf {
             panic!("owl_gguf_mmq2: {} 未移植(已移植集 = {:?})", ty.name(), fam::PORTED)
         });
         let pick = match entry {
+            fam::MMQ2_Q8_0_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q8_0J16>(shape),
+            fam::MMQ2_Q4K_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q4KJ16>(shape),
+            fam::MMQ2_Q5K_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q5KJ16>(shape),
+            fam::MMQ2_Q6K_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q6KJ16>(shape),
+            fam::MMQ2_IQ4XS_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2IQ4XSJ16>(shape),
+            fam::MMQ2_IQ3S_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2IQ3SJ16>(shape),
+            fam::MMQ2_IQ3XXS_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2IQ3XXSJ16>(shape),
             fam::MMQ2_Q8_0_J64 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q8_0J64>(shape),
             fam::MMQ2_Q8_0_J128 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q8_0J128>(shape),
             fam::MMQ2_Q4K_J64 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q4KJ64>(shape),

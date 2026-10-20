@@ -410,28 +410,44 @@ pub const MMQ2_SMEM_X: usize = MMQ2_I * 76 * 4;
 
 /// 型 → (量化入口, MMQ 入口 J64/J128);`None` = 本臂未移植
 pub const fn mmq2_entry_for(ty: GgmlTy, m: usize) -> Option<&'static str> {
-    let (e64, e128) = match ty {
-        GgmlTy::Q8_0 => (MMQ2_Q8_0_J64, MMQ2_Q8_0_J128),
-        GgmlTy::Q4K => (MMQ2_Q4K_J64, MMQ2_Q4K_J128),
-        GgmlTy::Q5K => (MMQ2_Q5K_J64, MMQ2_Q5K_J128),
-        GgmlTy::Q6K => (MMQ2_Q6K_J64, MMQ2_Q6K_J128),
-        GgmlTy::Iq4Xs => (MMQ2_IQ4XS_J64, MMQ2_IQ4XS_J128),
-        GgmlTy::Iq3S => (MMQ2_IQ3S_J64, MMQ2_IQ3S_J128),
-        GgmlTy::Iq3Xxs => (MMQ2_IQ3XXS_J64, MMQ2_IQ3XXS_J128),
+    let (e16, e64, e128) = match ty {
+        GgmlTy::Q8_0 => (MMQ2_Q8_0_J16, MMQ2_Q8_0_J64, MMQ2_Q8_0_J128),
+        GgmlTy::Q4K => (MMQ2_Q4K_J16, MMQ2_Q4K_J64, MMQ2_Q4K_J128),
+        GgmlTy::Q5K => (MMQ2_Q5K_J16, MMQ2_Q5K_J64, MMQ2_Q5K_J128),
+        GgmlTy::Q6K => (MMQ2_Q6K_J16, MMQ2_Q6K_J64, MMQ2_Q6K_J128),
+        GgmlTy::Iq4Xs => (MMQ2_IQ4XS_J16, MMQ2_IQ4XS_J64, MMQ2_IQ4XS_J128),
+        GgmlTy::Iq3S => (MMQ2_IQ3S_J16, MMQ2_IQ3S_J64, MMQ2_IQ3S_J128),
+        GgmlTy::Iq3Xxs => (MMQ2_IQ3XXS_J16, MMQ2_IQ3XXS_J64, MMQ2_IQ3XXS_J128),
         _ => return None,
     };
-    Some(if m >= MMQ2_I { e128 } else { e64 })
+    Some(if m <= MMQ2_SMALL_J { e16 } else if m >= MMQ2_I { e128 } else { e64 })
 }
 
-/// 型 → 激活量化入口(DS4 = Q4_K/Q5_K;D4 = Q8_0/Q6_K)
+/// **BF16 激活**的量化入口(2026-10-21;DFlash2 草稿线)
+pub const MMQ2_QUANT_DS4_BF16: &str = "owl_mmq2_quant_q8_1_ds4_bf16";
+/// 同上(D4 布局)
+pub const MMQ2_QUANT_D4_BF16: &str = "owl_mmq2_quant_q8_1_d4_bf16";
+
+/// 型 → 激活量化入口(DS4 = Q4_K/Q5_K;D4 = Q8_0/Q6_K;`bf16 = 激活 dtype`)
 pub const fn mmq2_quant_entry_for(ty: GgmlTy) -> Option<&'static str> {
-    match ty {
-        GgmlTy::Q4K | GgmlTy::Q5K => Some(MMQ2_QUANT_DS4),
-        GgmlTy::Q8_0 | GgmlTy::Q6K => Some(MMQ2_QUANT_D4),
+    mmq2_quant_entry_for_act(ty, false)
+}
+
+/// 同上,**按激活 dtype**(`bf16 = true` ⇒ BF16 变体;布局 DS4/D4 与型绑定不变)
+pub const fn mmq2_quant_entry_for_act(ty: GgmlTy, bf16: bool) -> Option<&'static str> {
+    let ds4 = match ty {
+        GgmlTy::Q4K | GgmlTy::Q5K => true,
+        GgmlTy::Q8_0 | GgmlTy::Q6K => false,
         // IQ 族:vendor2 的 MMQ 配置声明 `SRAM_LAYOUT_Q8_0` ⇒ 与 Q8_0 同(D4)
-        GgmlTy::Iq4Xs | GgmlTy::Iq3S | GgmlTy::Iq3Xxs => Some(MMQ2_QUANT_D4),
-        _ => None,
-    }
+        GgmlTy::Iq4Xs | GgmlTy::Iq3S | GgmlTy::Iq3Xxs => false,
+        _ => return None,
+    };
+    Some(match (ds4, bf16) {
+        (true, false) => MMQ2_QUANT_DS4,
+        (true, true) => MMQ2_QUANT_DS4_BF16,
+        (false, false) => MMQ2_QUANT_D4,
+        (false, true) => MMQ2_QUANT_D4_BF16,
+    })
 }
 
 /// **小 m 下限**(2026-10-21 实测重定;原 = 64,只服务 prefill)。
@@ -452,10 +468,14 @@ pub const fn mmq2_quant_entry_for(ty: GgmlTy) -> Option<&'static str> {
 /// 最优臂都是 **MMQ2**。m = 1(decode)不变:仍是 MMVQ(读一遍权重即地板)。
 pub const MMQ2_SMALL_M: usize = 4;
 
+/// **小 m 档的 token 分块**(J=16;判据见 [`mmq2_j`])
+pub const MMQ2_SMALL_J: usize = 16;
+
 /// 本臂适用门(单一产地;`linear.rs` 与门/测试同读这一份):
 /// ① 型已移植 ② `m ≥ MMQ2_SMALL_M`(decode 仍给 MMVQ;见该常量文档的实测表)
 /// ③ `n % 128 == 0`(上游 `I=128`,首版**不装 fallback**)
 /// ④ `k % 128 == 0`(激活块 128 值)
+/// ⑤ 激活 dtype ∈ {F16, BF16}(BF16 = DFlash2 草稿执行域;量化手有对应变体)
 pub const fn mmq2_ok(ty: GgmlTy, m: usize, n: usize, k: usize) -> bool {
     mmq2_entry_for(ty, m).is_some()
         && m >= MMQ2_SMALL_M
@@ -492,8 +512,35 @@ pub const fn mmq2_smem(j: usize) -> usize {
 }
 
 /// J 档(分派用;与 `mmq2_entry_for` 同一判据)
+/// `owl_mmq2_q8_0_j16`(小 m;J=16)
+pub const MMQ2_Q8_0_J16: &str = "owl_mmq2_q8_0_j16";
+/// `owl_mmq2_q4k_j16`(小 m;J=16)
+pub const MMQ2_Q4K_J16: &str = "owl_mmq2_q4k_j16";
+/// `owl_mmq2_q5k_j16`(小 m;J=16)
+pub const MMQ2_Q5K_J16: &str = "owl_mmq2_q5k_j16";
+/// `owl_mmq2_q6k_j16`(小 m;J=16)
+pub const MMQ2_Q6K_J16: &str = "owl_mmq2_q6k_j16";
+/// `owl_mmq2_iq4xs_j16`(小 m;J=16)
+pub const MMQ2_IQ4XS_J16: &str = "owl_mmq2_iq4xs_j16";
+/// `owl_mmq2_iq3s_j16`(小 m;J=16)
+pub const MMQ2_IQ3S_J16: &str = "owl_mmq2_iq3s_j16";
+/// `owl_mmq2_iq3xxs_j16`(小 m;J=16)
+pub const MMQ2_IQ3XXS_J16: &str = "owl_mmq2_iq3xxs_j16";
+
+/// **token 分块 J**(唯一产地;`driver::gguf::mmq2` 与 `mmq2_entry_for` 同读)。
+///
+/// 三段(2026-10-21 实测重定):
+/// - `m ≤ MMQ2_SMALL_J(16)` ⇒ **J=16**:m=8 时 J=64 有 8/64 有用行(4× MMA 浪费),
+///   而 `ntx = ceil(m/J)` 两档都是 1 ⇒ **权重流量不变**,只砍无效算力;
+/// - `m < 128` ⇒ J=64;`m ≥ 128` ⇒ J=128。
 pub const fn mmq2_j(m: usize) -> usize {
-    if m >= MMQ2_I { 128 } else { 64 }
+    if m <= MMQ2_SMALL_J {
+        16
+    } else if m >= MMQ2_I {
+        128
+    } else {
+        64
+    }
 }
 
 /// **激活量化的几何**:`grid = (n_tokens, ceil(k/(4·BLK)), 1)`、`block = (BLK,1,1)`

@@ -1543,6 +1543,60 @@ mod m_scan {
                     .arg_i32(in_dim as i32)
                     .aux(&[ti.ty.code() as usize, m, out_dim])
                     .with_shape(Dtype::F16, vec![m, out_dim]);
+                // BF16 激活通道(2026-10-21;草稿域):同一重量化手 + MMQ2
+                // vs MMVQ(BF16 激活),判据同 5e-2
+                {
+                    // 与 f16 侧同源同值(同一 seed 公式),只换 bf16 编码
+                    let xb16: Vec<u8> = (0..m * in_dim)
+                        .flat_map(|i| {
+                            let v = (((i as f32) * 0.013).sin() * 1.4) as f32;
+                            half::bf16::from_f32(v).to_le_bytes()
+                        })
+                        .collect();
+                    let x16 = TensorOps::from_host(Dtype::BF16, vec![m, in_dim], &xb16);
+                    let xq_ref = TensorOps::call(SemanticKernel::GgufQuantActBf16)
+                        .arg(&x16)
+                        .arg_i32(in_dim as i32)
+                        .arg_i32(in_dim as i32)
+                        .aux(&[m, in_dim])
+                        .with_shape(Dtype::U8, vec![m, in_dim / 32 * Q8_1_BLOCK_BYTES]);
+                    let y_ref_b = TensorOps::call(SemanticKernel::GgufGemm)
+                        .arg(&wblk)
+                        .arg(&xq_ref)
+                        .arg_i32(m as i32)
+                        .arg_i32(out_dim as i32)
+                        .arg_i32(in_dim as i32)
+                        .arg_i32(in_dim as i32)
+                        .arg_i32(0)
+                        .arg_i32(out_dim as i32)
+                        .aux(&[ti.ty.code() as usize, m, out_dim])
+                        .with_shape(Dtype::F16, vec![m, out_dim]);
+                    let qb = if ds4 {
+                        SemanticKernel::GgufMmq2QuantDs4Bf16
+                    } else {
+                        SemanticKernel::GgufMmq2QuantD4Bf16
+                    };
+                    let xq2b = TensorOps::call(qb)
+                        .arg(&x16)
+                        .arg_i32(m as i32)
+                        .arg_i32(in_dim as i32)
+                        .aux(&[m, in_dim])
+                        .with_shape(Dtype::U8, vec![in_dim / 128, m * 144]);
+                    let y2b = TensorOps::call(SemanticKernel::GgufMmq2)
+                        .arg(&wblk)
+                        .arg(&xq2b)
+                        .arg_i32(out_dim as i32)
+                        .arg_i32(m as i32)
+                        .arg_i32(in_dim as i32)
+                        .aux(&[ti.ty.code() as usize, m, out_dim])
+                        .with_shape(Dtype::F16, vec![m, out_dim]);
+                    let ab = crate::testkit::harvest_f16(&mut gpu, &y_ref_b).await;
+                    let bb = crate::testkit::harvest_f16(&mut gpu, &y2b).await;
+                    let sc = ab.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
+                    let db = ab.iter().zip(&bb).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / sc;
+                    eprintln!("[mmq2-small-m] {tname} m={m}: MMQ2(BF16 激活) vs MMVQ 相对最大差 {db:.3e}");
+                    assert!(db < 5e-2, "[{tname} m={m} bf16] MMQ2 与 MMVQ 相对差 {db} > 5e-2");
+                }
                 let a = crate::testkit::harvest_f16(&mut gpu, &y_ref).await;
                 let b = crate::testkit::harvest_f16(&mut gpu, &y2).await;
                 let scale = a.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);

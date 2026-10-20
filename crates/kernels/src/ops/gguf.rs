@@ -113,6 +113,10 @@ gguf_gemm_spec!(GgufGemmIq1S, crate::family::gguf::GEMM_Iq1S);
 pub struct GgufMmq2QuantDs4;
 /// `owl_mmq2_quant_q8_1_d4`(同上;D4 布局)
 pub struct GgufMmq2QuantD4;
+/// `owl_mmq2_quant_q8_1_ds4_bf16`(BF16 激活;DS4)
+pub struct GgufMmq2QuantDs4Bf16;
+/// `owl_mmq2_quant_q8_1_d4_bf16`(BF16 激活;D4)
+pub struct GgufMmq2QuantD4Bf16;
 
 const MMQ2_QUANT_PARAMS: &[Param] = &[
     // 名字逐字对 `.cu` 实例(`vx`/`vy`;2026-10-20 互证门修正)
@@ -138,6 +142,28 @@ macro_rules! gguf_mmq2_quant_spec {
 
 gguf_mmq2_quant_spec!(GgufMmq2QuantDs4, crate::family::gguf::MMQ2_QUANT_DS4);
 gguf_mmq2_quant_spec!(GgufMmq2QuantD4, crate::family::gguf::MMQ2_QUANT_D4);
+// BF16 变体的 PARAMS 只有输入 dtype 不同(F16 → BF16)
+const MMQ2_QUANT_PARAMS_BF16: &[Param] = &[
+    Param::t_in("vx", Dtype::BF16, 2),
+    Param::t_out("vy", Dtype::U8, 2),
+    Param::i32("n_tokens"),
+    Param::i32("ne0"),
+];
+macro_rules! gguf_mmq2_quant_spec_bf16 {
+    ($t:ty, $entry:expr) => {
+        #[kernel_tags("dom.gguf", "quant.gguf", "role.elem")]
+        impl KernelSpec for $t {
+            const ENTRY: &'static str = $entry;
+            const SRC: &'static str = crate::family::gguf::MMQ2_SRC;
+            const PARAMS: &'static [Param] = MMQ2_QUANT_PARAMS_BF16;
+            const LAWS: &'static [Law] = &[Law::OutputFinite];
+            const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+            const DETERMINISM: Determinism = Determinism::Deterministic;
+        }
+    };
+}
+gguf_mmq2_quant_spec_bf16!(GgufMmq2QuantDs4Bf16, crate::family::gguf::MMQ2_QUANT_DS4_BF16);
+gguf_mmq2_quant_spec_bf16!(GgufMmq2QuantD4Bf16, crate::family::gguf::MMQ2_QUANT_D4_BF16);
 
 /// `owl_mmq2_q8_0_j128` 等 8 个(type × J)
 pub struct GgufMmq2Q8_0J64;
@@ -168,6 +194,13 @@ pub struct GgufMmq2Iq3SJ128;
 pub struct GgufMmq2Iq3XxsJ64;
 /// 同上(J=128)
 pub struct GgufMmq2Iq3XxsJ128;
+pub struct GgufMmq2Q8_0J16;
+pub struct GgufMmq2Q4KJ16;
+pub struct GgufMmq2Q5KJ16;
+pub struct GgufMmq2Q6KJ16;
+pub struct GgufMmq2IQ4XSJ16;
+pub struct GgufMmq2IQ3SJ16;
+pub struct GgufMmq2IQ3XXSJ16;
 
 const MMQ2_PARAMS: &[Param] = &[
     // 名字逐字对 `.cu` 实例(`vx`/`vy`;2026-10-20 互证门修正)
@@ -207,6 +240,13 @@ gguf_mmq2_spec!(GgufMmq2Iq3SJ64, crate::family::gguf::MMQ2_IQ3S_J64);
 gguf_mmq2_spec!(GgufMmq2Iq3SJ128, crate::family::gguf::MMQ2_IQ3S_J128);
 gguf_mmq2_spec!(GgufMmq2Iq3XxsJ64, crate::family::gguf::MMQ2_IQ3XXS_J64);
 gguf_mmq2_spec!(GgufMmq2Iq3XxsJ128, crate::family::gguf::MMQ2_IQ3XXS_J128);
+gguf_mmq2_spec!(GgufMmq2Q8_0J16, crate::family::gguf::MMQ2_Q8_0_J16);
+gguf_mmq2_spec!(GgufMmq2Q4KJ16, crate::family::gguf::MMQ2_Q4K_J16);
+gguf_mmq2_spec!(GgufMmq2Q5KJ16, crate::family::gguf::MMQ2_Q5K_J16);
+gguf_mmq2_spec!(GgufMmq2Q6KJ16, crate::family::gguf::MMQ2_Q6K_J16);
+gguf_mmq2_spec!(GgufMmq2IQ4XSJ16, crate::family::gguf::MMQ2_IQ4XS_J16);
+gguf_mmq2_spec!(GgufMmq2IQ3SJ16, crate::family::gguf::MMQ2_IQ3S_J16);
+gguf_mmq2_spec!(GgufMmq2IQ3XXSJ16, crate::family::gguf::MMQ2_IQ3XXS_J16);
 
 // ---- **行窗解量化**(W-2d;dequant+cuBLAS 的喂料手)———————————————
 //
@@ -698,6 +738,8 @@ pub static GATHER_COLS_F16: KernelMeta = meta_of::<GgufGatherCols>();
 // ---- head 版 int8-MMA MMQ 的元数据表项(W-2f)----
 pub static MMQ2_QUANT_DS4: KernelMeta = meta_of::<GgufMmq2QuantDs4>();
 pub static MMQ2_QUANT_D4: KernelMeta = meta_of::<GgufMmq2QuantD4>();
+pub static MMQ2_QUANT_DS4_BF16: KernelMeta = meta_of::<GgufMmq2QuantDs4Bf16>();
+pub static MMQ2_QUANT_D4_BF16: KernelMeta = meta_of::<GgufMmq2QuantD4Bf16>();
 pub static MMQ2_Q8_0_J64: KernelMeta = meta_of::<GgufMmq2Q8_0J64>();
 pub static MMQ2_Q8_0_J128: KernelMeta = meta_of::<GgufMmq2Q8_0J128>();
 pub static MMQ2_Q4K_J64: KernelMeta = meta_of::<GgufMmq2Q4KJ64>();
@@ -712,6 +754,13 @@ pub static MMQ2_IQ3S_J64: KernelMeta = meta_of::<GgufMmq2Iq3SJ64>();
 pub static MMQ2_IQ3S_J128: KernelMeta = meta_of::<GgufMmq2Iq3SJ128>();
 pub static MMQ2_IQ3XXS_J64: KernelMeta = meta_of::<GgufMmq2Iq3XxsJ64>();
 pub static MMQ2_IQ3XXS_J128: KernelMeta = meta_of::<GgufMmq2Iq3XxsJ128>();
+pub static MMQ2_Q8_0_J16: KernelMeta = meta_of::<GgufMmq2Q8_0J16>();
+pub static MMQ2_Q4K_J16: KernelMeta = meta_of::<GgufMmq2Q4KJ16>();
+pub static MMQ2_Q5K_J16: KernelMeta = meta_of::<GgufMmq2Q5KJ16>();
+pub static MMQ2_Q6K_J16: KernelMeta = meta_of::<GgufMmq2Q6KJ16>();
+pub static MMQ2_IQ4XS_J16: KernelMeta = meta_of::<GgufMmq2IQ4XSJ16>();
+pub static MMQ2_IQ3S_J16: KernelMeta = meta_of::<GgufMmq2IQ3SJ16>();
+pub static MMQ2_IQ3XXS_J16: KernelMeta = meta_of::<GgufMmq2IQ3XXSJ16>();
 
 // ---- MMQ 的元数据表项 ----
 pub static MMQ_Q8_0: KernelMeta = meta_of::<GgufMmqQ8_0>();
