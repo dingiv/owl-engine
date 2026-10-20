@@ -514,6 +514,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                     fed: cached_len,
                     cached_start: cached_len,
                     decoded: String::new(),
+                    images: opts.images.clone(),
+                    vlm: None,
+                    vlm_peer: None,
                     spec: crate::turn::TurnSpecState {
                         // B4 分母**跨 turn 保鲜**(见 RunningEngine::bare_cost_carry_ms);
                         // 其余 spec 态仍全零 = 生命周期收口纪律不动

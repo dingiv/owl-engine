@@ -24,6 +24,8 @@
 //!   塔侧同款;m-RoPE 表按行号直取 ⇒ 行号即 token 号);
 //! - decode 增量位 = `past + delta`(HF `mrope_position_deltas` 同义)。
 
+use std::sync::Arc;
+
 use crate::contract::{Dtype, ModelError};
 use crate::layers::mrope::{split_video_frames, token_types, MropeCfg};
 use crate::layers::vision::{GridThw, VisionCfg, VisionInputs, VisionTables, VisionTower};
@@ -31,6 +33,17 @@ use crate::model::{Model, ModelSpec};
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, PlanSource, QuantPlan};
 use crate::formats::qwen35::Qwen35Convention;
 use crate::TensorOps;
+
+/// **一张图的预处理结果**(服务面 → 引擎的显式输入;值全为 host f32)。
+///
+/// `pixel_values` = `[n_patch, 3·temporal·16·16]`(processor 的 2×2 块序);
+/// `grid` = `(t, h_patches, w_patches)`。**不在这里解码/缩放** —— 预处理是
+/// 服务面(`vision_processor`)的职责;引擎只消费这个契约。
+#[derive(Clone, Debug, PartialEq)]
+pub struct VlmImage {
+    pub pixel_values: Vec<f32>,
+    pub grid: GridThw,
+}
 
 /// VLM 超参(`config.json` 单源;文本 + 塔 + 占位 token 三族)
 pub struct VlmCfg {
@@ -213,16 +226,62 @@ pub struct VlmInputs {
     pub cos: TensorOps,
     /// m-RoPE sin 行表 [L, half]
     pub sin: TensorOps,
+    /// m-RoPE host 副本(chunk 切片用;元素 = f32)
+    pub cos_host: Vec<f32>,
+    pub sin_host: Vec<f32>,
+    /// 每行 cos/sin 宽度(head_dim/2)
+    pub half: usize,
+    /// cos/sin 的打包 dtype(f16 = 塔/prefill 档)
+    pub dtype: Dtype,
     /// 序列长
     pub tokens: usize,
     /// decode 增量位(HF `mrope_position_deltas`)
     pub delta: i64,
 }
 
+impl VlmInputs {
+    /// **chunk 切片**(引擎 prefill 每块用):返回 `(cos, sin, idx, has_image)`。
+    ///
+    /// `base..base+t` 是 prompt 行号区间;行号表/余弦表按行切;`
+    /// `has_image` = 本块含 ≥1 个视觉占位(`idx >= 0`),否则调用方跳过
+    /// `image_scatter`(省一次无意义的全 `-1` 扫描)。
+    pub fn chunk_tables(
+        &self,
+        base: usize,
+        t: usize,
+    ) -> (TensorOps, TensorOps, TensorOps, bool) {
+        let lo = base.min(self.tokens);
+        let hi = base.saturating_add(t).min(self.tokens);
+        let n = hi.saturating_sub(lo);
+        let pack = |v: &[f32]| -> Vec<u8> {
+            match self.dtype {
+                Dtype::F32 => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+                Dtype::F16 => v
+                    .iter()
+                    .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
+                    .collect(),
+                other => unreachable!("VlmInputs::chunk_tables: dtype {other:?}"),
+            }
+        };
+        let cos = &self.cos_host[lo * self.half..hi * self.half];
+        let sin = &self.sin_host[lo * self.half..hi * self.half];
+        let idx = &self.idx_host[lo..hi];
+        let has_image = idx.iter().any(|&x| x >= 0.0);
+        let idx_bytes: Vec<u8> = idx.iter().flat_map(|x| x.to_le_bytes()).collect();
+        (
+            TensorOps::from_host(self.dtype, vec![n, self.half], &pack(cos)),
+            TensorOps::from_host(self.dtype, vec![n, self.half], &pack(sin)),
+            TensorOps::from_host(Dtype::F32, vec![n], &idx_bytes),
+            has_image,
+        )
+    }
+}
+
 /// Qwen3.5 系 VLM = 视觉塔 + 文本主干(装配,零机制)
 pub struct Vlm {
     tower: VisionTower,
-    model: Model,
+    /// 文本主干(**与引擎共享**;`from_model` 用它接引擎已装好的量化/分片模型)
+    model: Arc<Model>,
     cfg: VlmCfg,
 }
 
@@ -245,9 +304,45 @@ impl Vlm {
         }
         Ok(Vlm {
             tower: VisionTower::new(cfg.vision),
-            model: Model::new(spec, Qwen35Convention::new(&cfg.text_prefix), plan, head_plan)?,
+            model: Arc::new(Model::new(
+                spec,
+                Qwen35Convention::new(&cfg.text_prefix),
+                plan,
+                head_plan,
+            )?),
+
             cfg,
         })
+    }
+
+    /// **用引擎已装好的文本模型装配**(2026-10-20 视觉接线第一刀)。
+    ///
+    /// 引擎的文本模型已经过 `ModelLoader`(分片/量化/头计划)⇒ 塔只补视觉段,
+    /// 文本主干**不再重装**;`model_arc` 与引擎的 `RankDev.model` 同一份。
+    /// 装配互证沿用 [`Self::new`] 的同一条(塔 out_hidden = 文本 hidden)。
+    pub fn from_model(
+        model: Arc<Model>,
+        tower: VisionTower,
+        cfg: VlmCfg,
+    ) -> Result<Vlm, ModelError> {
+        if cfg.vision.out_hidden != model.hidden() {
+            return Err(ModelError::Msg(format!(
+                "Vlm::from_model: 塔 out_hidden {} ≠ 文本 hidden {}(装配不成立)",
+                cfg.vision.out_hidden,
+                model.hidden()
+            )));
+        }
+        Ok(Vlm { tower, model, cfg })
+    }
+
+    /// 引擎共享的文本主干(同一份 `Arc`;调用方不得重新 `Arc::new`)
+    pub fn model_arc(&self) -> Arc<Model> {
+        Arc::clone(&self.model)
+    }
+
+    /// 文本主干只读视图
+    pub fn model(&self) -> &Model {
+        &self.model
     }
 
     /// **从模型目录整装**(两段键同源:文本 `model.language_model.*` 经
@@ -413,6 +508,10 @@ impl Vlm {
             idx_host: idx,
             cos: TensorOps::from_host(dtype, vec![l, half], &pack(&mcos)),
             sin: TensorOps::from_host(dtype, vec![l, half], &pack(&msin)),
+            cos_host: mcos,
+            sin_host: msin,
+            half,
+            dtype,
             tokens: l,
             delta: index.delta,
         })
@@ -458,6 +557,47 @@ impl Loadable for Vlm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// chunk 切片:m-RoPE/行号按行切,`has_image` 只在含视觉占位的块为真。
+    #[test]
+    fn chunk_tables_slice_and_image_flag() {
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let ins = VlmInputs {
+            pos: TensorOps::from_host(Dtype::F32, vec![4, 1], &f32b(&[0., 1., 2., 3.])),
+            idx: TensorOps::from_host(Dtype::F32, vec![4], &f32b(&[-1., 0., -1., 1.])),
+            idx_host: vec![-1., 0., -1., 1.],
+            cos: TensorOps::from_host(Dtype::F32, vec![4, 2], &f32b(&[0.; 8])),
+            sin: TensorOps::from_host(Dtype::F32, vec![4, 2], &f32b(&[0.; 8])),
+            cos_host: vec![0.; 8],
+            sin_host: vec![0.; 8],
+            half: 2,
+            dtype: Dtype::F32,
+            tokens: 4,
+            delta: 3,
+        };
+        let (_, _, _, has) = ins.chunk_tables(1, 2);
+        assert!(has, "chunk 1..3 含 idx=0");
+        let (_, _, _, no) = ins.chunk_tables(0, 1);
+        assert!(!no, "chunk 0..1 全文本");
+        let (_, _, _, tail) = ins.chunk_tables(3, 8);
+        assert!(tail, "越界钳到 tokens");
+    }
+
+    /// **27B 真实 config.json 的 VLM 超参可解析**(纯 JSON,不装权重/不占卡)。
+    /// 视觉接线第一刀的配置门:`vision_config` / `image_token_id` / mrope
+    /// 三族缺一,`VlmCfg::from_json` 必须响亮拒。
+    #[test]
+    fn cfg_27b_vision_parses_from_real_config() {
+        let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+            return; // 资源清单缺省 = skip(非失败)
+        };
+        let raw = owl_shared::file_loader::read(&std::path::Path::new(&dir).join("config.json"))
+            .expect("27B config.json");
+        let cfg = VlmCfg::from_json(&raw).expect("VlmCfg::from_json");
+        assert_eq!(cfg.hidden, 5120, "文本 hidden");
+        assert_eq!(cfg.vision.out_hidden, 5120, "塔 out_hidden 必须 = 文本 hidden");
+        assert_eq!(cfg.image_token, 248056, "image_token_id");
+    }
     use crate::testkit::{f32b, harvest};
 
     /// 4B 档模型目录(config.json 单源;可 `ckpt:qwen35-4b` 改指)

@@ -49,6 +49,7 @@ pub(crate) mod scheduler;
 pub(crate) mod spec_runtime;
 pub(crate) mod state;
 pub(crate) mod tp;
+pub(crate) mod vlm;
 // 测试分层(test-architecture.md):单元测试走 cfg(test);
 // e2e 场景面(源文件里的 pub async fn,无 #[test])走 feature `e2e`,
 // 由 crates/engine/tests/engine.e2e.rs 手动调用。

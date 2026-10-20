@@ -56,6 +56,13 @@ pub struct EngineKnobs {
     pub load: owl_shared::config::LoadCfg,
     /// **rope 外推/缩放**(`[model.rope]`;GGUF 档生效;缺省关)
     pub rope: owl_shared::config::RopeCfg,
+    /// **视觉塔**(`[model].vision`):装载 `model.visual.*` + 允许 VLM 请求。
+    /// 缺省 false = 纯文本路径逐字节不变(27B 视觉档显式开)。
+    pub vision: bool,
+    /// lm_head 量化方案(`[model].head_quant`;boot 投影到 tag filter)
+    pub head_quant: owl_shared::config::HeadQuant,
+    /// tag 过滤通配符(`[dispatch] tag_wildcard`;诊断 `*`)
+    pub tag_wildcard: bool,
     /// 步级探针(诊断面;Default = 全关)
     pub probes: crate::running::StepProbes,
     /// 块池容量覆写(None = 2 × 单会话容量;原 OWL_POOL_TOKENS)
@@ -255,6 +262,9 @@ impl Default for EngineKnobs {
         Self {
             load: owl_shared::config::LoadCfg::default(),
             rope: owl_shared::config::RopeCfg::default(),
+            vision: false,
+            head_quant: owl_shared::config::HeadQuant::Off,
+            tag_wildcard: false,
             probes: crate::running::StepProbes {
                 // 命中面/调试打印:env 覆盖(实测排障用 `OWL_PROBES_DEBUG=1`)
                 debug: owl_shared::env_reader::flag("OWL_DEBUG"),
@@ -512,6 +522,9 @@ impl EngineKnobs {
         Self {
             load: cfg.load.clone(),
             rope: cfg.model.rope.clone(),
+            vision: cfg.model.vision,
+            head_quant: cfg.model.head_quant,
+            tag_wildcard: cfg.dispatch.tag_wildcard,
             probes: crate::running::StepProbes::from_config(cfg),
             // ── **配置是唯一来源**(2026-10-19 统一)──
             // 本函数只做 `OwlConfig` → 旋钮的字段搬运,**不读任何 env**
@@ -667,6 +680,9 @@ pub struct Engine<D: DeviceClient> {
     face: DeviceHandle<D>,
     /// **共享账本单元**(与执行态 store 的 `Rel` 同一本;boot 造、随句柄传)
     ledger: owl_store::SharedLedger,
+    /// 本引擎句柄使用的**稳定** `LedgerCell`(TP rank1 预接管/幂等 adopt 的键;
+    /// `ledger_entry` 每次调用会包新 Arc,不能拿它做同一性判断)
+    ledger_cell: owl_iface::handle::LedgerCell,
     cfg: EngineConfig,
     /// boot 显存快照(准入预算装配的真源;S3b §23.3)
     boot: BootVram,
@@ -682,6 +698,13 @@ pub(crate) struct BootVram {
     live_at_new: u64,
 }
 
+impl BootVram {
+    /// 装载前 live 快照(TP 装配的 per-card 权重基线用)
+    pub(crate) fn live_at_new(&self) -> u64 {
+        self.live_at_new
+    }
+}
+
 /// **准入预算装配**(实测真源;设计卷 §23.3 表)。
 ///
 /// 纪律:能测的必须测;无设备账档(CPU mock)由**固定池档**放宽规则接管
@@ -691,6 +714,8 @@ fn assemble_budget(
     boot: &BootVram,
     cfg: &EngineConfig,
     pool: &StatePool,
+    weights_bytes: u64,
+    world: usize,
     live_loaded: u64,
     live_now: u64,
 ) -> Result<owl_store::BudgetInputs> {
@@ -716,11 +741,14 @@ fn assemble_budget(
     let gdn_pool = (pool.gdn_slots as u64).saturating_mul(pool.gdn_row_bytes() as u64);
     let snap_pool = pool.snapshot_pool_bytes() as u64;
     let draft_pool = pool.draft_pool_bytes() as u64;
-    let weights = live_loaded.saturating_sub(boot.live_at_new);
-    // 运行底价 = run 末 live − 装载后 live − 已归类的池面(KV/GDN/快照/草稿)
+    let weights = weights_bytes;
+    // 运行底价 = run 末 live − 装载后 live − **两 rank** 已归类池面
+    // (live 是进程级合计;单卡 world=1 退化为原式)
+    let pools_total = (kv_pool + gdn_pool + snap_pool + draft_pool)
+        .saturating_mul(world.max(1) as u64);
     let runtime_floor = live_now
         .saturating_sub(live_loaded)
-        .saturating_sub(kv_pool + gdn_pool + snap_pool + draft_pool);
+        .saturating_sub(pools_total);
     // 中层预算(host/盘):**唯一算式在 store**(`tier_budget_of`)—— boot 造账与
     // 本处预算入参必须同源(两处各算一遍 = 迟早漂;`Rel::open` 还会交叉校验兜底)。
     let tier_budget = owl_store::tier_budget_of(
@@ -844,8 +872,9 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // 注:`[graph] prefill_bucket` 的**真接线在 [`Self::run`]**(桶捕获需要
         // 模型与状态池;静止点律 ⇒ 只在 boot 做)。此处不再拒启(2026-10-15
         // M2b 落地;此前的"配了没实现就拒"临时门已被真接线取代)。
-        let face = DeviceHandle::new(face, Some(owl_store::ledger_entry(&ledger)));
-        Ok(Self { face, ledger, cfg, boot })
+        let ledger_cell = owl_store::ledger_entry(&ledger);
+        let face = DeviceHandle::new(face, Some(ledger_cell.clone()));
+        Ok(Self { face, ledger, ledger_cell, cfg, boot })
     }
 
     /// **接管已包好的句柄**(TP:两 rank 共用一本账;句柄由 `into_parts` 交出)。
@@ -853,12 +882,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
         cfg: EngineConfig,
         face: DeviceHandle<D>,
         ledger: owl_store::SharedLedger,
+        boot: BootVram,
     ) -> Result<Self> {
-        let boot = BootVram {
-            v_card_bytes: owl_shared::vram::free_bytes(),
-            live_at_new: owl_shared::vram::live_bytes(),
-        };
-        Ok(Self { face, ledger, cfg, boot })
+        let ledger_cell = face
+            .ledger_cell()
+            .unwrap_or_else(|| owl_store::ledger_entry(&ledger));
+        Ok(Self { face, ledger, ledger_cell, cfg, boot })
     }
 
     /// 本引擎的**账本单元**(TP 接管/诊断面)。
@@ -875,16 +904,11 @@ impl<D: DeviceClient + 'static> Engine<D> {
     /// 面类型 = 句柄(`DeviceHandle<D>`)—— 装载期的每一块都进事件账(Weight 类);
     /// `load` 旋钮来自配置(`[load]` 段;用户裁决 2026-10-19:不读 env)。
     pub fn loader(&mut self) -> ModelLoader<'_, DeviceHandle<D>> {
-        ModelLoader::new(&mut self.face, self.cfg.knobs.load.clone()).rope(
-            self.cfg.knobs.rope.clone(),
-            self.cfg.max_seq_tokens,
-        )
+        ModelLoader::new(&mut self.face, self.cfg.knobs.load.clone())
+            .rope(self.cfg.knobs.rope.clone(), self.cfg.max_seq_tokens)
+            .vision(self.cfg.knobs.vision)
     }
 
-    /// 模型交引擎:状态块/槽/Session 组建 + warmup —— 仍不跑任何 turn,
-    /// 返回执行态引擎(请求入口)。
-    // A3 同步隔离:引擎单线程模型(每卡一线程);Arc 仅作共享句柄,
-    // 不跨线程发送 —— clippy 的 Send+Sync 建议不适用。
     /// 模型交引擎:状态块/槽/Session 组建 + warmup —— 仍不跑任何 turn,
     /// 返回执行态引擎(请求入口)。
     // A3 同步隔离:引擎单线程模型(每卡一线程);Arc 仅作共享句柄,
@@ -892,18 +916,38 @@ impl<D: DeviceClient + 'static> Engine<D> {
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn run(self, loaded: LoadedModel) -> Result<RunningEngine<DeviceHandle<D>>> {
         let t_run = std::time::Instant::now();
-        let Engine { face, ledger, mut cfg, boot } = self;
+        let Engine { face, ledger, ledger_cell: _, mut cfg, boot } = self;
         let (rm, tokenizer) = loaded.into_parts();
+        // 池分配前的 live 快照 = 权重/杂项(不含池)。单卡直接当 per-card 基线;
+        // weights = 装载增量。TP2 由 `TpEngine` 取两 rank 合计后摊分。
+        let live_before_pool = owl_shared::vram::live_bytes();
+        let weights_bytes = live_before_pool.saturating_sub(boot.live_at_new);
         // 设备侧装配(单卡:tp = None;双 rank 走 `TpEngine` 的同一 `boot_rank`)
-        let dev = boot_rank(face, &mut cfg, rm, None, t_run).await?;
-        Ok(into_running(cfg, tokenizer, boot, dev, None, ledger)?)
+        let dev = boot_rank(face, &mut cfg, rm, None, live_before_pool, t_run).await?;
+        Ok(into_running(cfg, tokenizer, boot, dev, None, ledger, weights_bytes)?)
+    }
+
+    /// 本引擎账本单元(TP2 rank1 **装载前**接管用;与 `TpEngine` 的合流同源)
+    pub fn ledger_entry(&self) -> owl_iface::handle::LedgerCell {
+        self.ledger_cell.clone()
+    }
+
+    /// **装载前接管账本**(TP2 rank1;2026-10-20):
+    /// rank1 的模型/视觉塔装载事件必须直接进 rank0 的账本 —— 否则
+    /// `TpEngine::assemble` 的 boot-only `adopt_ledger` 会拒(已发事件进孤儿账)。
+    /// 幂等:同一本账重复接管 = Ok(`TpEngine` 后续再调一次)。
+    pub fn adopt_ledger(
+        &mut self,
+        cell: owl_iface::handle::LedgerCell,
+    ) -> Result<()> {
+        self.face.adopt_ledger(cell)
     }
 
     /// **拆件**(TP 双 rank 装配面:face/cfg/账本同源单持有;S4 ⑤-K2)
     pub(crate) fn into_parts(
         self,
-    ) -> (DeviceHandle<D>, EngineConfig, owl_store::SharedLedger) {
-        (self.face, self.cfg, self.ledger)
+    ) -> (DeviceHandle<D>, EngineConfig, owl_store::SharedLedger, BootVram) {
+        (self.face, self.cfg, self.ledger, self.boot)
     }
 
     /// 绑定设备序号(TP 探测面:UUID/BAR1/P2P 按 ordinal 查)
@@ -926,11 +970,21 @@ pub(crate) fn into_running<D: DeviceClient>(
     dev: RankDev<D>,
     peer: Option<RankDev<D>>,
     ledger: owl_store::SharedLedger,
+    weights_bytes: u64,
 ) -> Result<RunningEngine<D>> {
     // **store 装配(host 半;S3b §23.3)** —— 预算/策略/层布局/快照腿:
     // 单卡与 TP 都**只做一份**(host 账单一)。
     let live_loaded = owl_shared::vram::live_bytes();
-        let budget_inputs = assemble_budget(&boot, &cfg, &dev.pool, live_loaded, owl_shared::vram::live_bytes())?;
+    let world = if peer.is_some() { 2 } else { 1 };
+    let budget_inputs = assemble_budget(
+        &boot,
+        &cfg,
+        &dev.pool,
+        weights_bytes,
+        world,
+        live_loaded,
+        owl_shared::vram::live_bytes(),
+    )?;
         let admission_policy = owl_store::AdmissionPolicy::new(
             cfg.knobs.gdn_slots.max(1),
             cfg.knobs.admission_on_full,
@@ -1182,6 +1236,9 @@ pub(crate) struct RankDev<D: DeviceClient> {
     pub(crate) pool: StatePool,
     /// 图族(捕获完成 / eager 降级;每 rank 自成一族)
     pub(crate) graphs: GraphFleet<D>,
+    /// **视觉塔装配**(`[model].vision`;Some = VLM)。塔是 prefill-only 的
+    /// 额外权重;文本 `model` 与它是同一份 Arc(见 `Vlm::from_model`)。
+    pub(crate) vlm: Option<std::sync::Arc<owl_models::vlm::Vlm>>,
 }
 
 /// **rank 设备侧装配(唯实现)**:几何 → 环境 → spec 域 → KV 写者门 →
@@ -1195,6 +1252,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     cfg: &mut EngineConfig,
     rm: RankModel,
     tp: Option<owl_models::module::TpCtx>,
+    live_baseline_per_card: u64,
     t_run: std::time::Instant,
 ) -> Result<RankDev<DeviceHandle<D>>> {
         // **FI plan 自携开关:引擎 = 配置持有者 ⇒ 装配期下发**(2026-10-19 桶门立案)。
@@ -1313,7 +1371,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // spec 域装载(spec_runtime.rs:模式三态裁决 + 草稿器 + 草稿 rope;
         // E5-M2b/C7 —— depth>0 且检查点有 mtp.* → Mtp;dumb 诊断位 → Dumb;
         // 否则 Off 回落 DecodeBatch,无草稿器不白发 verify 税)
-        let spec = crate::spec_runtime::load_spec_runtime(
+        let mut spec = crate::spec_runtime::load_spec_runtime(
             &mut face,
             SpecBootInput {
                 depth_raw: cfg.knobs.draft.depth,
@@ -1330,6 +1388,31 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             },
         )
         .await?;
+
+        // **KernelSelectionEnv 快照**(2026-10-20):boot 事实投影给 picker。
+        // 必须在此处冻结(硬件/几何/量化/spec 已定,池/图尚未分配);之后
+        // `EnvProvider::op_env()` 只读这份快照,不再从散字段重算。
+        let features = owl_models::kernel_env::FeatureCaps {
+            vision: cfg.knobs.vision,
+            spec_depth: spec.depth,
+            tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
+            head_int8: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt8Row,
+            main_kv: Some(owl_models::kernel_env::KvCaps::from_env(&env)),
+            draft_kv: (spec.depth > 0)
+                .then(|| owl_models::kernel_env::KvCaps::from_env(&spec.draft_env)),
+            tag_wildcard: cfg.knobs.tag_wildcard,
+        };
+        if let Some(k) = owl_models::kernel_env::KernelSelectionEnv::from_env(&env, features) {
+            owl_shared::log_info!("kernel-env", "target: {}", k.describe());
+            env.kernel_env = Some(k);
+        }
+        // 草稿有自己的几何(hd=128 / grp):快照必须从 draft_env 单独投影。
+        if let Some(k) =
+            owl_models::kernel_env::KernelSelectionEnv::from_env(&spec.draft_env, features)
+        {
+            owl_shared::log_info!("kernel-env", "draft:  {}", k.describe());
+            spec.draft_env.kernel_env = Some(k);
+        }
 
         // B6.2:主 KV 池 fp8 承载(draft_kv_fp8 / kv.fp8 → env.kv.quant)
         // KV 池清单门(收口律机器门;E1 2026-10-17 改为**声明面投影**):
@@ -1367,6 +1450,8 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             draft_geom: spec.draft_geom,
             // 治理器按卡摊 `live`(TP2 下 LIVE 含两卡之和;2026-10-19 定谳)
             tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
+            // 两 rank 共用的池前 live 基线(消除顺序记账)
+            live_baseline_per_card: Some(live_baseline_per_card),
             // 草稿池 dtype 同源(量化族 BF16 / 未量化族 F16;见 spec_runtime::draft_dt)
             draft_dt: spec.draft_dt,
             spec_mode: spec.mode,
@@ -1644,6 +1729,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         }
 
     Ok(RankDev {
+        vlm: rm.vlm,
         model: rm.model,
         rope: rm.rope,
         spec: rm.spec,

@@ -14,6 +14,49 @@ use owl_iface::contract::ModelError;
 /// 而 append 场景所需的**末边界快照**永远在。
 const SNAP_EVERY: usize = 4;
 
+/// **单 rank VLM 备料**(V2/V3):塔图根 eval 成本 rank 的设备叶块。
+///
+/// 两 rank 的 host 表(cos/sin/idx)由同一个 `Vlm::prepare` 得到(输入相同);
+/// `merged` 是**本 rank** 的塔输出块(塔无 AR,两 rank 数值应逐位一致)。
+async fn prepare_vlm_rank<D: DeviceClient>(
+    dev: &mut crate::engine::RankDev<D>,
+    ids: &[u32],
+    images: &[owl_models::vlm::VlmImage],
+) -> Result<crate::vlm::VlmPrepared> {
+    let vlm = dev
+        .vlm
+        .clone()
+        .ok_or_else(|| ModelError::Msg("prefill: 图像输入但本 rank 无视觉塔".into()))?;
+    let grids: Vec<owl_models::layers::vision::GridThw> =
+        images.iter().map(|i| i.grid).collect();
+    let px: Vec<f32> = images
+        .iter()
+        .flat_map(|i| i.pixel_values.iter().copied())
+        .collect();
+    let req = vlm.prepare(ids, &grids, &[], &px)?;
+    let merged = match req.merged {
+        Some(m) => {
+            let dtype = m.dtype();
+            let shape = m.shape().to_vec();
+            let (b, arena) = {
+                let face = dev.graphs.session.face_mut();
+                owl_models::interpreters::eval_ops_scoped_env(
+                    m.step(),
+                    face,
+                    dev.env,
+                    dev.tp.as_ref(),
+                )
+                .await?
+            };
+            let leaf = owl_models::TensorOps::of_block(b.id, dtype, shape);
+            Some((b, arena, leaf))
+        }
+        None => None,
+    };
+    Ok(crate::vlm::VlmPrepared { ins: req.ins, merged })
+}
+
+
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
     /// 块表重写(write_bt;图烘焙 bt 指针,内容重写指针稳定图不重捕)
@@ -168,6 +211,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 );
             }
         }
+        // ── **VLM 首块备料**(2026-10-20 视觉接线 V2)──
+        // 塔只在 prefill 首步跑;`Vlm::prepare` 建 host 表 + 塔图根,这里
+        // **eval 成 turn 域设备叶**(merged),之后每个 chunk 只切表/注入。
+        let need_vlm = {
+            let act = self.turns.active()?;
+            act.vlm.is_none() && !act.images.is_empty()
+        };
+        if need_vlm {
+            let (ids, images) = {
+                let act = self.turns.active()?;
+                (act.prompt_ids.clone(), act.images.clone())
+            };
+            // **TP2:两 rank 各备一份**(host 表同源;merged 各 rank 设备块)。
+            let prep0 = prepare_vlm_rank(&mut self.dev, &ids, &images).await?;
+            let prep1 = match self.peer.as_mut() {
+                Some(p) => Some(prepare_vlm_rank(p, &ids, &images).await?),
+                None => None,
+            };
+            let act = self.turns.active_mut()?;
+            act.vlm = Some(prep0);
+            act.vlm_peer = prep1;
+        }
         // 调试门:prefill 块粒度(见 owl_shared::stepgate;`--step-gate` 控制)
         owl_shared::step_gate!("engine.prefill").await;
         // **锁①后半:块表按 chunk 增量长**(只在虚拟化档;2026-10-19)。
@@ -198,6 +263,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         // 部分驻留档的"过去"子集页链(host 面算好;两 rank 同值)
         let past_view = self.past_view_of(base, chunk_ids.len());
+        let (vlm0, vlm1) = {
+            let act = self.turns.active()?;
+            (act.vlm.as_ref(), act.vlm_peer.as_ref())
+        };
         let mut host0 = ChunkHost {
             boot_seq: self.boot_seq,
             probes: self.probes,
@@ -209,6 +278,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             prof: Some(&mut self.prof),
             cov: Some(&mut self.cov_pending),
             past_view: past_view.clone(),
+            vlm: vlm0,
         };
         let mut host1 = ChunkHost {
             boot_seq: self.boot_seq,
@@ -221,6 +291,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             prof: None, // peer:诊断账只在主 rank
             cov: None,
             past_view,
+            vlm: vlm1,
         };
         // ── ① 两 rank **并发**入队半(同一份设备侧代码,各自 rank 束)──────
         // ⚠️ 必须并发:单边先行 ⇒ 对端 AR 自旋 5s 超时 + 游标永久失步
@@ -348,6 +419,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         grew: bool,
     ) -> Result<TurnEvent> {
         let sid = self.turns.active()?.session_id;
+        // **VLM 位置增量**:m-RoPE 的 `delta` 只加到 **rope 位置**(pos 槽);
+        // `kv_len/kv_slot` 仍是真实 token 计数(加进 kv_len = 注意力长度错)。
+        let vlm_delta = self
+            .turns
+            .active()
+            .ok()
+            .and_then(|a| a.vlm.as_ref())
+            .map(|v| v.ins.delta)
+            .unwrap_or(0);
+        let pos_rope = usize::try_from(pos as i64 + vlm_delta).map_err(|_| {
+            ModelError::Msg(format!(
+                "decode: VLM 位置为负(pos={pos}, delta={vlm_delta})"
+            ))
+        })?;
         // 调试门:decode 步粒度
         owl_shared::step_gate!("engine.decode").await;
         let prof = self.probes.step_profile;
@@ -371,7 +456,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 两槽只在 `decode_xqa` 开时存在于图中(否则 `step` 会报未声明槽)。
         let mut step_slots: Vec<(&str, Vec<f32>)> = vec![
             ("frontier", vec![token as f32]),
-            ("pos", vec![pos as f32]),
+            ("pos", vec![pos_rope as f32]),
             ("kv_len", vec![(pos + 1) as f32]),
             ("kv_slot", vec![kv_slot as f32]),
             ("gdn_slot", vec![gdn_slot as f32]),
@@ -1161,6 +1246,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
     /// **eager verify 设备半**(P2.1-c,2026-10-19):旧 `RunningEngine::verify_forward`
     /// 的**逐字搬运**(仅 `self.dev.` → `self.`,宿主 `bt_chain` 改由调用方传入)
     /// —— 抽到 `RankDev` 才能**双 rank 镜像**(eager 前向含 AR,单 rank 跑必失步)。
+    /// `pos_delta` = VLM m-RoPE 偏移(只加 rope pos;slots/lens/FI 用 `base`)。
     pub(crate) async fn verify_forward_dev(
         &mut self,
         block: &[u32],
@@ -1168,6 +1254,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         gdn_slot: usize,
         want_logits: bool,
         bt_chain: &[u32],
+        pos_delta: i64,
     ) -> Result<(Vec<u32>, owl_iface::contract::Bytes, Option<Vec<f32>>)> {
         let t = block.len();
         let kv_caches = self.pool.kv_caches();
@@ -1213,10 +1300,17 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             vec![t],
             &block.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect::<Vec<u8>>(),
         );
+        // **VLM m-RoPE delta**(V5):只加到 rope 位置;KV slot/lens/FI ctx
+        // 仍是真实 token 位置(与 decode 的 `pos_rope` 同律)。
+        let rope_base = usize::try_from(base as i64 + pos_delta).map_err(|_| {
+            owl_iface::contract::ModelError::Msg(format!(
+                "verify eager: VLM 位置为负(base={base}, delta={pos_delta})"
+            ))
+        })?;
         let pos_t = TensorOps::from_host(
             Dtype::F32,
             vec![t],
-            &f32b(&(base..base + t).map(|v| v as f32).collect::<Vec<_>>()),
+            &f32b(&(rope_base..rope_base + t).map(|v| v as f32).collect::<Vec<_>>()),
         );
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let slots_t = TensorOps::from_host(

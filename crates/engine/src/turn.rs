@@ -73,6 +73,9 @@ pub struct TurnOpts {
     /// **本刀只实做 `Strict`** —— 非 `Strict` 在提交边界**响亮拒**(选择层
     /// B 轴未落地,地板语义无从兼现,§23.5)。
     pub dense_floor: Option<owl_store::TurnFloor>,
+    /// **VLM 图像输入**(2026-10-20 视觉接线):空 = 纯文本(逐字节旧行为)。
+    /// 首版单图;`VlmImage` 是服务面预处理的输出契约。
+    pub images: Vec<owl_models::vlm::VlmImage>,
 }
 
 /// turn 终了原因(OpenAI `finish_reason` 真源)
@@ -155,6 +158,11 @@ pub(crate) struct ActiveTurn {
     /// KV/prompt 推进指针(会话 turn 从 `cached_len` 起步 = 增量 prefill)
     pub(crate) fed: usize,
     pub(crate) decoded: String,
+    /// **VLM 图像输入 + 备料**(空/None = 纯文本)
+    pub(crate) images: Vec<owl_models::vlm::VlmImage>,
+    /// rank0 / rank1 的 VLM 备料(TP2 各备一份;merged 是本 rank 设备块)
+    pub(crate) vlm: Option<crate::vlm::VlmPrepared>,
+    pub(crate) vlm_peer: Option<crate::vlm::VlmPrepared>,
     /// spec 轮机器状态(**turn 生命周期**:随 ActiveTurn 创建、随 turn
     /// 终了销毁)。历史教训:这七件曾寄存引擎级,跨 turn 残留 ——
     /// spec_snap_valid 残留 true = 新 turn 用上 turn 快照折叠(GDN 污染,
