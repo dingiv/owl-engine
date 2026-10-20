@@ -169,3 +169,12 @@ OWL_MMQ2_WRAP(owl_mmq2_q5k_j64, GGML_TYPE_Q5_K, 64)
 OWL_MMQ2_WRAP(owl_mmq2_q5k_j128, GGML_TYPE_Q5_K, 128)
 OWL_MMQ2_WRAP(owl_mmq2_q6k_j64, GGML_TYPE_Q6_K, 64)
 OWL_MMQ2_WRAP(owl_mmq2_q6k_j128, GGML_TYPE_Q6_K, 128)
+// IQ 族(2026-10-20;REQ-GGUF-04):vendor2 的 mmq-config-ampere 已带 IQ4_XS/IQ3_S/
+// IQ3_XXS 的 J 档(布局 = Q8_0 ⇒ 激活量化走 D4)。IQ4_NL 是 32 元素块,
+// vendor2 目录里没有它的 MMQ 配置 ⇒ 不进本臂(仍走 cuBLAS/MMVQ)。
+OWL_MMQ2_WRAP(owl_mmq2_iq4xs_j64, GGML_TYPE_IQ4_XS, 64)
+OWL_MMQ2_WRAP(owl_mmq2_iq4xs_j128, GGML_TYPE_IQ4_XS, 128)
+OWL_MMQ2_WRAP(owl_mmq2_iq3s_j64, GGML_TYPE_IQ3_S, 64)
+OWL_MMQ2_WRAP(owl_mmq2_iq3s_j128, GGML_TYPE_IQ3_S, 128)
+OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j64, GGML_TYPE_IQ3_XXS, 64)
+OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j128, GGML_TYPE_IQ3_XXS, 128)

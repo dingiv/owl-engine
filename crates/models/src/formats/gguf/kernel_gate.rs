@@ -833,6 +833,12 @@ mod tests {
                 ("blk.0.ffn_down.weight", "Q4_K"),
                 ("blk.0.attn_gate.weight", "Q8_0"),
             ][..]),
+            // IQ 族 MMQ2(2026-10-20;REQ-GGUF-04):int8-MMA 臂的 IQ 分支
+            ("gguf:0.8b-iq4xs", &[("blk.0.attn_gate.weight", "IQ4_XS")][..]),
+            ("gguf:27b-iq3s", &[
+                ("blk.4.attn_gate.weight", "IQ3_S"),
+                ("blk.1.attn_gate.weight", "IQ3_XXS"),
+            ][..]),
         ] {
             if !resource_ok(res_key) {
                 eprintln!("skip: 资源清单缺 \"{res_key}\"");

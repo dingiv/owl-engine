@@ -652,8 +652,9 @@ pub mod gguf {
         let j = fam::mmq2_j(m);
         let (grid, block, smem) = fam::mmq2_geom(m, n, j);
         let shape = Shape { grid, block, smem };
-        let entry = fam::mmq2_entry_for(ty, m)
-            .unwrap_or_else(|| panic!("owl_gguf_mmq2: {} 未移植(已移植集 = Q8_0/Q4_K/Q5_K/Q6_K)", ty.name()));
+        let entry = fam::mmq2_entry_for(ty, m).unwrap_or_else(|| {
+            panic!("owl_gguf_mmq2: {} 未移植(已移植集 = {:?})", ty.name(), fam::PORTED)
+        });
         let pick = match entry {
             fam::MMQ2_Q8_0_J64 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q8_0J64>(shape),
             fam::MMQ2_Q8_0_J128 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q8_0J128>(shape),
@@ -663,6 +664,12 @@ pub mod gguf {
             fam::MMQ2_Q5K_J128 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q5KJ128>(shape),
             fam::MMQ2_Q6K_J64 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q6KJ64>(shape),
             fam::MMQ2_Q6K_J128 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q6KJ128>(shape),
+            fam::MMQ2_IQ4XS_J64 => KernelPick::of::<crate::ops::gguf::GgufMmq2Iq4XsJ64>(shape),
+            fam::MMQ2_IQ4XS_J128 => KernelPick::of::<crate::ops::gguf::GgufMmq2Iq4XsJ128>(shape),
+            fam::MMQ2_IQ3S_J64 => KernelPick::of::<crate::ops::gguf::GgufMmq2Iq3SJ64>(shape),
+            fam::MMQ2_IQ3S_J128 => KernelPick::of::<crate::ops::gguf::GgufMmq2Iq3SJ128>(shape),
+            fam::MMQ2_IQ3XXS_J64 => KernelPick::of::<crate::ops::gguf::GgufMmq2Iq3XxsJ64>(shape),
+            fam::MMQ2_IQ3XXS_J128 => KernelPick::of::<crate::ops::gguf::GgufMmq2Iq3XxsJ128>(shape),
             other => panic!("owl_gguf_mmq2: 入口 `{other}` 未声明"),
         };
         pick

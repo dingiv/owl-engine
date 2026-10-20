@@ -2729,22 +2729,24 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
 
-    const block_iq4_xs * bq = (const block_iq4_xs *) vbq;
-    const float d = __half2float(bq->d);
-
-    const int ls = ((bq->scales_l[iqs/2] >> (4*(iqs%2))) & 0xF) | (((bq->scales_h >> (2*iqs)) & 3) << 4);
-    const float db = d * (float)(ls - 32);
-
-    float sum = 0.0f;
-    const float d8 = __low2float(bq8_1[iqs].ds);
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq;
+    // **dp4a 版**(2026-10-20;对齐上游 `mul_mat_vec_q` 的 IQ4_XS 实现):
+    // 每 4 字节 nibble 走 `iq4_nl_table_lookup`(4 次 __byte_perm)得到 8 个 int8,
+    // 再与 q8_1 的 4 字节组做 dp4a —— 取代旧版"逐元素查表 + float FMA"
+    // (旧版 32 元素一条链,decode 实测比 Q4_K 慢 8%)。
     const int8_t * q8 = bq8_1[iqs].qs;
-    const uint8_t * qs = bq->qs + 16 * iqs;
-
-    for (int j = 0; j < 32; j++) {
-        uint8_t nibble = (j < 16) ? (qs[j] & 0xF) : (qs[j - 16] >> 4);
-        float val = db * (float)kvalues_iq4nl_cu[nibble];
-        sum += val * (float)q8[j] * d8;
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int2 v = iq4_nl_table_lookup(get_int_from_uint8(bq4->qs + 16 * iqs, j));
+        sumi = ggml_cuda_dp4a(v.x, *reinterpret_cast<const int *>(q8 + 4 * j), sumi);
+        sumi = ggml_cuda_dp4a(v.y, *reinterpret_cast<const int *>(q8 + 16 + 4 * j), sumi);
     }
 
-    return sum;
+    const int ls = ((bq4->scales_l[iqs / 2] >> (4 * (iqs % 2))) & 0xF) |
+                   (((bq4->scales_h >> (2 * iqs)) & 3) << 4);
+    sumi *= (ls - 32);
+
+    const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs].ds);
+    return d * (float) sumi;
 }

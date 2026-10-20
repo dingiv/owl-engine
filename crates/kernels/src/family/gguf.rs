@@ -364,6 +364,18 @@ pub const MMQ2_Q5K_J128: &str = "owl_mmq2_q5k_j128";
 pub const MMQ2_Q6K_J64: &str = "owl_mmq2_q6k_j64";
 /// Q6_K / J=128
 pub const MMQ2_Q6K_J128: &str = "owl_mmq2_q6k_j128";
+/// IQ4_XS / J=64(2026-10-20;REQ-GGUF-04 ⇒ prefill 的 int8-MMA 臂)
+pub const MMQ2_IQ4XS_J64: &str = "owl_mmq2_iq4xs_j64";
+/// IQ4_XS / J=128
+pub const MMQ2_IQ4XS_J128: &str = "owl_mmq2_iq4xs_j128";
+/// IQ3_S / J=64
+pub const MMQ2_IQ3S_J64: &str = "owl_mmq2_iq3s_j64";
+/// IQ3_S / J=128
+pub const MMQ2_IQ3S_J128: &str = "owl_mmq2_iq3s_j128";
+/// IQ3_XXS / J=64
+pub const MMQ2_IQ3XXS_J64: &str = "owl_mmq2_iq3xxs_j64";
+/// IQ3_XXS / J=128
+pub const MMQ2_IQ3XXS_J128: &str = "owl_mmq2_iq3xxs_j128";
 
 /// 每 CTA 的权重行数(上游 ampere 档 `I = 128`;分派门要求 `n % I == 0`)
 pub const MMQ2_I: usize = 128;
@@ -383,6 +395,9 @@ pub const fn mmq2_entry_for(ty: GgmlTy, m: usize) -> Option<&'static str> {
         GgmlTy::Q4K => (MMQ2_Q4K_J64, MMQ2_Q4K_J128),
         GgmlTy::Q5K => (MMQ2_Q5K_J64, MMQ2_Q5K_J128),
         GgmlTy::Q6K => (MMQ2_Q6K_J64, MMQ2_Q6K_J128),
+        GgmlTy::Iq4Xs => (MMQ2_IQ4XS_J64, MMQ2_IQ4XS_J128),
+        GgmlTy::Iq3S => (MMQ2_IQ3S_J64, MMQ2_IQ3S_J128),
+        GgmlTy::Iq3Xxs => (MMQ2_IQ3XXS_J64, MMQ2_IQ3XXS_J128),
         _ => return None,
     };
     Some(if m >= MMQ2_I { e128 } else { e64 })
@@ -393,6 +408,8 @@ pub const fn mmq2_quant_entry_for(ty: GgmlTy) -> Option<&'static str> {
     match ty {
         GgmlTy::Q4K | GgmlTy::Q5K => Some(MMQ2_QUANT_DS4),
         GgmlTy::Q8_0 | GgmlTy::Q6K => Some(MMQ2_QUANT_D4),
+        // IQ 族:vendor2 的 MMQ 配置声明 `SRAM_LAYOUT_Q8_0` ⇒ 与 Q8_0 同(D4)
+        GgmlTy::Iq4Xs | GgmlTy::Iq3S | GgmlTy::Iq3Xxs => Some(MMQ2_QUANT_D4),
         _ => None,
     }
 }
@@ -875,6 +892,33 @@ mod tests {
             }
         }
         assert_eq!(PORTED.len(), PORTED.iter().filter(|t| entry_for(**t).is_some()).count());
+    }
+
+    /// **能力表 ↔ driver 映射不许漂**(2026-10-20;IQ 落地时抓到的第二套规范).
+    ///
+    /// 旧行为:`driver::gguf::{gemm,dequant_rows,dequant_range}` 各自**另写一份
+    /// match** —— `PORTED`/`ROWS_PORTED` 加了型,driver 仍 `panic!("未移植")`。
+    /// 本门对三张能力表逐型跑一遍 picker(构造期即炸,不等到 GPU 发射)。
+    #[test]
+    fn driver_dispatch_covers_the_capability_tables() {
+        for ty in PORTED {
+            let _ = crate::driver::gguf::gemm(*ty, 1, 64);
+        }
+        for ty in ROWS_PORTED {
+            let qk = ty.block().0;
+            let _ = crate::driver::gguf::dequant_rows(*ty, 1, qk * 2);
+        }
+        for ty in ALL {
+            if range_entry_for(*ty).is_some() {
+                let _ = crate::driver::gguf::dequant_range(*ty, 1, 512);
+            }
+            // MMQ2 臂:J=64/128 两档都要能被 driver 选中
+            for m in [64usize, 128] {
+                if mmq2_entry_for(*ty, m).is_some() {
+                    let _ = crate::driver::gguf::mmq2(*ty, m, 256);
+                }
+            }
+        }
     }
 
     /// **块几何表 = gguf-py `GGML_QUANT_SIZES`**(逐条硬编码;改表必须改这里)。

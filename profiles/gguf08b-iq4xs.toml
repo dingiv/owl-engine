@@ -1,0 +1,57 @@
+# owl 引擎预设档 `gguf08b-iq4xs`(GGUF 0.8B IQ4_XS;2026-10-20 IQ 族性能档)
+#
+# 靶位 = `models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_XS.gguf`
+# (470 MiB;IQ4_XS×126 + Q6_K/Q8_0/Q5_K/F32 —— 全部在已移植集)。
+#
+# 用途:**IQ4_XS 的 prefill/decode 性能基线**(单 3090 Ti);
+# 同族 Q4_K_M 用 `--set model.dir=<Q4_K_M 路径>` 换权重 ⇒ 同口径对照。
+#
+# 起机(3090 Ti @41:00.0,按 UUID 钉卡):
+#   CUDA_VISIBLE_DEVICES=GPU-e565c505-4921-9979-2e0f-2b83490b7aed \
+#   target/release/server -p profiles/gguf08b-iq4xs.toml
+#
+# 测速:
+#   cd packages/llm_speedtest && uv run cli \
+#     --api-url http://127.0.0.1:8139/v1/chat/completions \
+#     --model qwen3.5-0.8b --flavor std
+
+[model]
+kind = "gguf"
+dir = "/home/div/Documents/codes/models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_XS.gguf"
+
+[runtime]
+bind = "127.0.0.1:8139"
+# 0.8B:压测档要覆盖 8k 点 ⇒ ctx 给 16k(池同量;0.8B 的 KV 很小)
+max_seq = 16384
+prefill_chunk = 1024
+
+[pool]
+# 池 = max_seq(全 ctx 常驻;与 legacy/gguf4b 同一条纪律)
+pool_tokens = 16384
+gdn_slots = 8
+snap_max = 4
+host_cache_mb = 512
+snap_host_mb = 128
+prefix_cache = true
+
+[sampling]
+# 性能档要确定性 ⇒ greedy(数值面不受采样影响)
+mode = "greedy"
+
+[kvmem]
+# 速度基线不开两扇门(选择层会改数据面;要测它另开一档)
+select_decode = false
+select_partial = false
+index = false
+coverage_probe = false
+
+[dispatch]
+# ⚠️ 诊断档:tag filter 通配 ⇒ 装配期**跳过**池写集审计(allowed=None)。
+# 为什么必须开:当前 tag 词表没有 layout facet ⇒ `kv.main.f16` 同时命中
+# Classic 与 kNHD 两种 KV 写者 ⇒ E14 双寻址拒启(与 IQ 无关的既有缺口;
+# 修法是给 tags.toml 加 `kv.layout.*` 互斥 facet 并从配置派生)。
+# 速度档只要"能发射 + 不混写":本档走 kNHD 路径,实测不混。
+tag_wildcard = true
+
+[log]
+level = "info"
