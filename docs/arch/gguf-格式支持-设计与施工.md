@@ -2038,9 +2038,51 @@ row-parallel 侧的切片/别名路径)。
 也从"上千块/GB 级"降到 **0–16 块**。
 
 **遗留(两件,均非本刀)**:
-1. **第二个长 turn 会撞宿主预算**(`宿主层越界 69 795 315 712 > 69 793 218 560`)
+1. ~~**第二个长 turn 会撞宿主预算**(`宿主层越界 69 795 315 712 > 69 793 218 560`)
    —— 上一 turn 的 28 245 个宿主 KV 块(≈56 GiB)躺在前缀缓存里没有逐出;
-   KV 腿 `host.put` 缺"先逐最冷再放"的政策(快照腿有,见 §23 早期);
+   KV 腿 `host.put` 缺"先逐最冷再放"的政策(快照腿有,见 §23 早期);~~
+   → **已解(§23.12)**:KV 腿补齐“宿主满先逐最冷” + `host_free_slots` 的 TP 单位修正;
 2. **900k 档的 needle 召回不稳定**(同 probe 单卡 52.8k 也有 MISS;TP 22.8k 命中)
    —— 属**选择层质量**,与显存/正确性无关;要判 1M 召回得换更强的 retrieval 口径
    (多针/问答对),需要单独一轮质量门。
+
+### 23.12 收尾:宿主逐出政策 + 盘块粒度(2026-10-20)
+
+**① KV 腿的“宿主满先逐最冷”**(解 §23.11 遗留 1)
+
+现象:第二个长 turn 在 `plan_offload → lend_slots` 撞
+`宿主层越界 69 795 315 712 > 69 793 218 560`;上一 turn 的 28 245 个宿主块
+(≈56 GiB)躺在前缀缓存里**没有任何人逐**。
+
+根因两条:
+
+- **单位错**:`BlockLeg::host_free_slots()` 除的是单平面页(`kv.block_bytes()`),
+  而宿主槽 = `planes × 单页` ⇒ TP2 把可用槽数**高估 2 倍** ⇒ 计划按“有位”出票,
+  借台借到一半才撞墙(实测差额 ≈1024 块 = 2 MiB);
+- **政策缺**:快照腿 `plan_snap_offload` 有“宿主满 ⇒ 先逐最冷”,KV 腿没有。
+
+修法(两层,同一政策):
+
+- 计划面 `plan_capacity` **轮零**:宿主位不够时 —— ①能整链搬盘就先搬盘
+  (内容留,`Sink::Disk`)②盘不够/无盘才丢最冷宿主链
+  (`host_prune_candidates`:最冷叶、从链尾向内削、遇设备块即止;前缀留着)
+  ⇒ 轮一才在腾出的位上出 `Sink::Host` 票。执行序 = 票序(Disk/Drop 在 Host 前);
+- 执行面 `Rel::plan_kv_offload`:计划失准(盘写失败/账漂)时先 `host_relieve`
+  (真删最冷)再借台,并记 `ops.host_relief_blocks`;engine 打点
+  `store.host.relief_blocks` + WARN —— **计划乐观不许隐身,也不许硬崩**;
+- **磁盘回填口** `Rel::host_fill`(盘 → 宿主,发生在 `plan_onload` 之前)同一政策:
+  宿主满先逐最冷(保护本链)再落 —— 裸 `host_put` 会在回填前撞 `Exhausted`,
+  把整单 onload 拖死;
+- `host_free_slots` 单位改为 `host.block_bytes()`(TP 下不再高估)。
+
+门(store lib **109→114**,新增 5 例):①`host_free_slots` 的 TP 单位 ②盘块的 TP 粒度
+③轮零的“先 Drop 冷宿主再 Host 设备链”票序 ④`plan_kv_offload` 的兜底让位
+⑤`host_fill` 的回填让位;另把 `BankPlan` 测试助手补上 `world`
+(279e827 之后 `cargo test -p owl-engine` 一直编不过的遗留)。
+
+**② 盘块粒度 = 宿主槽**(TP 可接盘)
+
+`attach_disk` 原先 `world > 1` 响亮拒,盘块按 `leg.slot_bytes()`(单平面)开层;
+但溢写取料口是 `host_take`(整个宿主槽 = `planes × 单页`)⇒ TP 下盘块字节不匹配
+(写 2×、读 1× = 静默截断)。改为 `leg.host_slot_bytes()` 并去掉世界守卫;
+用例 `disk_block_is_the_host_slot_under_tp` 钉死“计划字节 = 2 页、盘槽数按链块算”。
