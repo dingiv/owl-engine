@@ -1,0 +1,92 @@
+# ============================================================================
+# owl 引擎预设档 `gguf27b-1m` —— **GGUF × KVMem × YaRN × 1,048,576 tok**
+# 单卡 3090 Ti(24 GB),2026-10-20 长上下文冲击档
+# ============================================================================
+#
+# **一句话**:官方 Qwen3.8 的 1M 外推路线(YaRN factor 4.0)接进 owl:
+# 设备池只留 2 GiB 工作集、全量 KV(1M × 64 KiB = 64 GiB)在宿主,
+# rope 表按 YaRN 混合频率扩到 1,048,576。
+#
+# 靶位:`models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf`
+#   (262144 native;官方 "extensible up to 1,000,000 via YaRN")
+#
+# 起机:
+#   CUDA_VISIBLE_DEVICES=GPU-<3090Ti UUID> \
+#     target/release/server --flavor gguf27b-1m <用户档.toml>
+#
+# ── 实测(2026-10-20,单张 3090 Ti 41:00.0;greedy;needle 置 50%)──────────
+#   · **1 024 497 tok prompt:729.0 s**(≈1405 tok/s),needle **召回命中**;
+#     设备峰值 21.9 GB / 24 GB;宿主 KV 实占 **31 693 块 × 2 MiB ≈ 62 GiB**;
+#   · 499 277 tok:344.8 s(≈1448 tok/s),同样命中;
+#   · decode 26.6 ms/步(**与 ctx 无关** —— 视图只读选中 ~32 页);
+#   · 全程零 Xid、零 N4 未归还、零 Exhausted。
+#   分解(1M 档):前向 1002 chunk × 559 ms = 560 s + 边界 1002 × 164 ms = 164 s。
+#
+# ⚠️ **host RAM 门槛**:1M 需 ~64 GiB KV + 2 GiB 快照 + 1 GiB 索引 ≈ 67 GiB
+#   (宿主腿 `host_cache_mb=66560`;本机 123 GB 实测可用)。**机器小请降档**:
+#     · 524k:Yarn factor **2.0** + `max_seq=524288` + `host_cache_mb=33792`
+#       (实测 499k / 344.8 s;见 §二十三.7);
+#     · 262k:**不用 YaRN**,用 `gguf27b-262k` 档(短文本精度无损)。
+#
+# 📌 **YaRN 是静态外推**:官方说明"对短文本有轻微精度影响",所以**不要**拿本档
+#   跑日常短对话;`gguf27b-262k` 才是 262k 内的默认档。`[model.rope]` 只对 GGUF
+#   档生效(HF 家族档的 rope 事实在各自装载器里硬编码)。
+#
+# 需配套:`[model] dir`(GGUF 单文件)+ `[runtime] device`/`bind`。
+[model]
+kind = "gguf"
+
+[model.rope]
+# 官方配方:factor = 4.0 → 1M(2.0 → 524k);original = 0 ⇒ 用模型自带 262144;
+# beta_fast/slow 与 attention_factor 取 vLLM 缺省(32/1/1.0)。
+# 语义 = vLLM `YaRNScalingRotaryEmbedding`(频率 ramp 混合 + mscale)。
+yarn_factor = 4.0
+original_max = 0
+beta_fast = 32.0
+beta_slow = 1.0
+attention_factor = 1.0
+
+[runtime]
+# 1M:rope 表长 = max(模型 262144, original×4 = 1048576, max_seq) = 1048576
+max_seq = 1048576
+# chunk 1024(KVMem 定档;边界 = 召回节奏)。1M 下 1024 个边界。
+prefill_chunk = 1024
+
+[pool]
+# 设备池 = 工作集 + 前缀回灌面(1024 页 × 2 MiB = 2 GiB = 32768 tok;超卖 32×)
+pool_tokens = 32768
+gdn_slots = 1
+snap_max = 2
+vram_reserve_mb = 128
+# **宿主 KV 腿**:1M 全量 = 32768 块 × 2 MiB = 65536 MiB ⇒ 给 66560
+#(实测 1M 时 host_blocks = 31693 ≈ 62 GiB;快照腿另算 2048)
+host_cache_mb = 66560
+snap_host_mb = 2048
+# 虚拟化硬前提(下沉 = 缓存树 + 会话双持)
+prefix_cache = true
+
+[server]
+max_concurrency = 1
+
+[sampling]
+mode = "greedy"
+
+[dispatch]
+# f16 池(同容量 decode +8% / prefill +5%;fp8 省显存档见 gguf27b-262k)
+kv_fp8 = false
+gdn_chunked = true
+# 无白名单(与 gguf27b/262k 同律:按发射账并集生成,勿手抄)
+
+[kvmem]
+select_decode = true
+select_partial = true
+index = true
+pool_overcommit = true
+# 每 turn 工作集 1024 tok(= 32 页;保底 sink 2 + recent 4 + top-k 26)。
+# 1M 下 32768 个候选块只留 32 块(视图物化比 0.1%)—— 1M 的 needle 仍命中。
+workspace_per_req = 1024
+select_sink = 2
+select_recent = 4
+recall_every = 1
+coverage_probe = false
+analyze_at_ctx = 0
