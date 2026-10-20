@@ -329,6 +329,30 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
             "host_free_bytes": r.host_free_bytes,
             "policy": r.policy,
         },
+        // **合批事实**(B5.1):上限 / 已走批步数 / 批图在场。
+        // 服务面判据:`max_batch>1` 而 `steps` 不涨 = 批门从未成立
+        // (并发不足,或同会话被会话闸串行 —— 见 `session_gate` 模块头)。
+        "batch": {
+            "max_batch": snap.batch.max_batch,
+            "steps": snap.batch.steps,
+            "graph": snap.batch.graph,
+            // **准入容量**（物理空闲 + 可回收缓存 + 预留承诺 三者同时成立才放人）
+            // **排队快照**（按等待降序，最多 16）：turn / session / waited_ms
+            "queued": snap.batch.queued.iter().map(|(t, s, ms)| json!({
+                "turn": t,
+                "session": format!("{s:#x}"),
+                "waited_ms": ms,
+            })).collect::<Vec<_>>(),
+            "capacity": {
+                "free_pages": snap.batch.free_pages,
+                "cache_pages": snap.batch.cache_pages,
+                "reserved_pages": snap.batch.reserved_pages,
+                "usable_pages": snap.batch.usable_pages,
+                "n_slots": snap.batch.n_slots,
+                "n_mem": snap.batch.n_mem,
+                "n_eff": snap.batch.n_eff,
+            },
+        },
         // **事件账**(DeviceHandle 钩子的出借登记;第 3 刀)—— 与腿自报/块账房
         // 互为**独立来源**:三者对不上就是 bug(不是"取其一"的问题)。
         "events": {

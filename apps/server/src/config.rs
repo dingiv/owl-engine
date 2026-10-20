@@ -310,6 +310,9 @@ pub struct ServerConfig {
     pub quant: owl_shared::config::QuantScheme,
     /// 最大并发请求(server.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
     pub max_concurrency: usize,
+    /// **合批上限**([runtime] max_batch;1 = 串行现状)。服务面用它做两件事:
+    /// 会话闸的配套告警(隐式会话 + 合批 ⇒ 串行)与 `/debug/vram` 的如实报数。
+    pub max_batch: usize,
     /// **TP 通信数据腿:push 档**(runtime.tp_push;2026-10-18 §36.6)⇒ 交 `TpOpts`
     pub tp_push: bool,
     /// **TP AR 载荷 fp8 档**（runtime.tp_ar_f8；§47 第二步）⇒ 交 `TpOpts.ar_f8`
@@ -433,6 +436,7 @@ impl ServerConfig {
             tp_vocab_split: cfg.runtime.tp_vocab_split,
             tp_ar_fused: cfg.runtime.tp_ar_fused,
             max_concurrency: cfg.server.max_concurrency,
+            max_batch: cfg.runtime.max_batch,
             perf_dump: None,
             perf_level: cfg.probes.perf_level.to_u8(),
             log: cfg.log,
