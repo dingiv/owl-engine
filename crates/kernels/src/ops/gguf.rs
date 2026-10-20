@@ -202,6 +202,11 @@ pub struct GgufMmq2IQ4XSJ16;
 pub struct GgufMmq2IQ3SJ16;
 pub struct GgufMmq2IQ3XXSJ16;
 
+/// J=16,SRAM 布局 = Q3_K / Q2_K(2026-10-21 第二刀;小 m 专用)
+pub struct GgufMmq2Q3KJ16;
+pub struct GgufMmq2IQ2SJ16;
+pub struct GgufMmq2IQ2XSJ16;
+
 const MMQ2_PARAMS: &[Param] = &[
     // 名字逐字对 `.cu` 实例(`vx`/`vy`;2026-10-20 互证门修正)
     Param::t_in("vx", Dtype::U8, 2),
@@ -247,6 +252,9 @@ gguf_mmq2_spec!(GgufMmq2Q6KJ16, crate::family::gguf::MMQ2_Q6K_J16);
 gguf_mmq2_spec!(GgufMmq2IQ4XSJ16, crate::family::gguf::MMQ2_IQ4XS_J16);
 gguf_mmq2_spec!(GgufMmq2IQ3SJ16, crate::family::gguf::MMQ2_IQ3S_J16);
 gguf_mmq2_spec!(GgufMmq2IQ3XXSJ16, crate::family::gguf::MMQ2_IQ3XXS_J16);
+gguf_mmq2_spec!(GgufMmq2Q3KJ16, crate::family::gguf::MMQ2_Q3K_J16);
+gguf_mmq2_spec!(GgufMmq2IQ2SJ16, crate::family::gguf::MMQ2_IQ2S_J16);
+gguf_mmq2_spec!(GgufMmq2IQ2XSJ16, crate::family::gguf::MMQ2_IQ2XS_J16);
 
 // ---- **行窗解量化**(W-2d;dequant+cuBLAS 的喂料手)———————————————
 //
@@ -761,6 +769,9 @@ pub static MMQ2_Q6K_J16: KernelMeta = meta_of::<GgufMmq2Q6KJ16>();
 pub static MMQ2_IQ4XS_J16: KernelMeta = meta_of::<GgufMmq2IQ4XSJ16>();
 pub static MMQ2_IQ3S_J16: KernelMeta = meta_of::<GgufMmq2IQ3SJ16>();
 pub static MMQ2_IQ3XXS_J16: KernelMeta = meta_of::<GgufMmq2IQ3XXSJ16>();
+pub static MMQ2_Q3K_J16: KernelMeta = meta_of::<GgufMmq2Q3KJ16>();
+pub static MMQ2_IQ2S_J16: KernelMeta = meta_of::<GgufMmq2IQ2SJ16>();
+pub static MMQ2_IQ2XS_J16: KernelMeta = meta_of::<GgufMmq2IQ2XSJ16>();
 
 // ---- MMQ 的元数据表项 ----
 pub static MMQ_Q8_0: KernelMeta = meta_of::<GgufMmqQ8_0>();

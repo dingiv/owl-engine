@@ -664,7 +664,9 @@ pub mod gguf {
     /// **head 版 int8-MMA MMQ**(W-2f):几何 = `{grid:(n/128, m/J, 1), block:(32,8), smem}`
     pub fn mmq2(ty: GgmlTy, m: usize, n: usize) -> KernelPick {
         let j = fam::mmq2_j(m);
-        let (grid, block, smem) = fam::mmq2_geom(m, n, j);
+        // ⚠️ smem **逐型**(X 面 stride:76 / 84 / 100;见 `mmq2_sram_stride_for`)
+        let (grid, block, _) = fam::mmq2_geom(m, n, j);
+        let smem = fam::mmq2_smem_for(ty, j) as u32;
         let shape = Shape { grid, block, smem };
         let entry = fam::mmq2_entry_for(ty, m).unwrap_or_else(|| {
             panic!("owl_gguf_mmq2: {} 未移植(已移植集 = {:?})", ty.name(), fam::PORTED)
@@ -677,6 +679,9 @@ pub mod gguf {
             fam::MMQ2_IQ4XS_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2IQ4XSJ16>(shape),
             fam::MMQ2_IQ3S_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2IQ3SJ16>(shape),
             fam::MMQ2_IQ3XXS_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2IQ3XXSJ16>(shape),
+            fam::MMQ2_Q3K_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q3KJ16>(shape),
+            fam::MMQ2_IQ2S_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2IQ2SJ16>(shape),
+            fam::MMQ2_IQ2XS_J16 => KernelPick::of::<crate::ops::gguf::GgufMmq2IQ2XSJ16>(shape),
             fam::MMQ2_Q8_0_J64 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q8_0J64>(shape),
             fam::MMQ2_Q8_0_J128 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q8_0J128>(shape),
             fam::MMQ2_Q4K_J64 => KernelPick::of::<crate::ops::gguf::GgufMmq2Q4KJ64>(shape),

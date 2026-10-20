@@ -418,8 +418,18 @@ pub const fn mmq2_entry_for(ty: GgmlTy, m: usize) -> Option<&'static str> {
         GgmlTy::Iq4Xs => (MMQ2_IQ4XS_J16, MMQ2_IQ4XS_J64, MMQ2_IQ4XS_J128),
         GgmlTy::Iq3S => (MMQ2_IQ3S_J16, MMQ2_IQ3S_J64, MMQ2_IQ3S_J128),
         GgmlTy::Iq3Xxs => (MMQ2_IQ3XXS_J16, MMQ2_IQ3XXS_J64, MMQ2_IQ3XXS_J128),
+        // 2026-10-21 第二刀:**只挂 J=16**(小 m)。m > 16 仍回 tile ——
+        // MMQ 的 ntx = ceil(m/J) 按 token 窗重读权重,prefill 侧本刀不动。
+        GgmlTy::Q3K => (MMQ2_Q3K_J16, MMQ2_Q3K_J16, MMQ2_Q3K_J16),
+        GgmlTy::Iq2S => (MMQ2_IQ2S_J16, MMQ2_IQ2S_J16, MMQ2_IQ2S_J16),
+        GgmlTy::Iq2Xs => (MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J16),
         _ => return None,
     };
+    // 新族(J16 专用)只服务小 m:m > 16 交回 tile/MMVQ(见上注)
+    if matches!(ty, GgmlTy::Q3K | GgmlTy::Iq2S | GgmlTy::Iq2Xs) && m > MMQ2_SMALL_J
+    {
+        return None;
+    }
     Some(if m <= MMQ2_SMALL_J { e16 } else if m >= MMQ2_I { e128 } else { e64 })
 }
 
@@ -440,6 +450,8 @@ pub const fn mmq2_quant_entry_for_act(ty: GgmlTy, bf16: bool) -> Option<&'static
         GgmlTy::Q8_0 | GgmlTy::Q6K => false,
         // IQ 族:vendor2 的 MMQ 配置声明 `SRAM_LAYOUT_Q8_0` ⇒ 与 Q8_0 同(D4)
         GgmlTy::Iq4Xs | GgmlTy::Iq3S | GgmlTy::Iq3Xxs => false,
+        // 2026-10-21:`SRAM_LAYOUT_Q3_K` / `Q2_K`(布局 = Q8_0 的 D4 变体)
+        GgmlTy::Q3K | GgmlTy::Iq2S | GgmlTy::Iq2Xs | GgmlTy::Q2K => false,
         _ => return None,
     };
     Some(match (ds4, bf16) {
@@ -526,6 +538,38 @@ pub const MMQ2_IQ4XS_J16: &str = "owl_mmq2_iq4xs_j16";
 pub const MMQ2_IQ3S_J16: &str = "owl_mmq2_iq3s_j16";
 /// `owl_mmq2_iq3xxs_j16`(小 m;J=16)
 pub const MMQ2_IQ3XXS_J16: &str = "owl_mmq2_iq3xxs_j16";
+/// `owl_mmq2_q3k_j16`(小 m;J=16;SRAM 布局 = Q3_K)
+pub const MMQ2_Q3K_J16: &str = "owl_mmq2_q3k_j16";
+/// `owl_mmq2_iq2s_j16`(小 m;J=16;SRAM 布局 = Q3_K)
+pub const MMQ2_IQ2S_J16: &str = "owl_mmq2_iq2s_j16";
+/// `owl_mmq2_iq2xs_j16`(小 m;J=16;SRAM 布局 = Q3_K)
+pub const MMQ2_IQ2XS_J16: &str = "owl_mmq2_iq2xs_j16";
+
+/// **X 面 SRAM stride**(每 I 行占多少个 32bit 槽;逐型不同)。
+///
+/// 值 = `vendor2/mmq.cuh::ggml_cuda_mmq_get_sram_stride` 逐型对照
+/// (`MMQ_TILE_NE_K = 32`、`QI8_0 = QI8_1 = QI6_K = 8`):
+/// - `Q8_0` / `Q8_1` / `Q6_K` ⇒ 76;
+/// - **`Q3_K` 族(IQ2_S / IQ2_XS / Q3_K)** ⇒ `2·32 + 32/2 + 4` = **84**;
+/// - **`Q2_K`** ⇒ `2·32 + 32 + 4` = **100**。
+///
+/// 漏这条 = smem 少算 ⇒ 核内越界(静默错值,不是崩);故与 `MMQ2_SMEM_X` 同源。
+pub const fn mmq2_sram_stride_for(ty: GgmlTy) -> usize {
+    match ty {
+        GgmlTy::Q2K => 100,
+        GgmlTy::Q3K | GgmlTy::Iq2S | GgmlTy::Iq2Xs => 84,
+        _ => 76,
+    }
+}
+
+/// smem 字节(**按型**取 X 面 stride;其余项与 [`mmq2_smem`] 同式)。
+pub const fn mmq2_smem_for(ty: GgmlTy, j: usize) -> usize {
+    let nbs_ids = j * 4;
+    let nbs_x = MMQ2_I * mmq2_sram_stride_for(ty) * 4;
+    let nbs_y = j * MMQ2_Q8_1_BLOCK_BYTES;
+    let pad_to = MMQ2_THREADS * 4;
+    nbs_ids + nbs_x + nbs_y.div_ceil(pad_to) * pad_to
+}
 
 /// **token 分块 J**(唯一产地;`driver::gguf::mmq2` 与 `mmq2_entry_for` 同读)。
 ///

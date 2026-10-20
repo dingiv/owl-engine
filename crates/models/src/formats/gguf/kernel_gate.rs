@@ -1496,6 +1496,11 @@ mod m_scan {
             let wblk = TensorOps::from_host(Dtype::U8, vec![out_dim, in_dim / be * bb], bytes);
             let ds4 = matches!(ti.ty, GgmlTy::Q4K | GgmlTy::Q5K);
             for m in [2usize, 8, 17, 32, 64] {
+                // 2026-10-21 第二刀:Q3_K / IQ2_S / IQ2_XS / Q2_K 只挂 J=16
+                // (`m ≤ 16`)⇒ 大 m 交回 tile/MMVQ,本门不覆盖该档
+                if owl_kernels::family::gguf::mmq2_entry_for(ti.ty, m).is_none() {
+                    continue;
+                }
                 let xb: Vec<u8> = (0..m * in_dim)
                     .flat_map(|i| {
                         let v = (((i as f32) * 0.013).sin() * 1.4) as f32;

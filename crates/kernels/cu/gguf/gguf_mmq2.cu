@@ -212,3 +212,23 @@ OWL_MMQ2_WRAP(owl_mmq2_q6k_j16, GGML_TYPE_Q6_K, 16)
 OWL_MMQ2_WRAP(owl_mmq2_iq4xs_j16, GGML_TYPE_IQ4_XS, 16)
 OWL_MMQ2_WRAP(owl_mmq2_iq3s_j16, GGML_TYPE_IQ3_S, 16)
 OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j16, GGML_TYPE_IQ3_XXS, 16)
+
+// ---- J=16,SRAM 布局 = Q3_K(IQ2_S / IQ2_XS / Q3_K;2026-10-21 第二刀)----------------------
+//
+// 动机(verify 轮内 nsys 账):UD-IQ4_XS 混型档里 IQ2_S(7 张)/ IQ2_XS(2 张)/
+// Q3_K(9 张)/ Q2_K(1 张)此前**没有 MMQ2 实例** ⇒ 全落复用臂(tile):
+// IQ2_S 679 µs/张(42 GB/s)、IQ3_S 之外的 Q3_K 506 µs —— 四型合计只占权重
+// 8.2%,却吃掉 verify 轮 17% 的时间。它们的 MMQ 配置在 vendor2 里**本来就有**
+// (`mmq-config-ampere.cuh` 的 J=8..128 全档),只是没被适配层发射。
+//
+// ⚠️ 这族的 SRAM 布局是 `Q3_K`(X 面 stride 84,不是 76)
+// ⇒ smem 尺寸必须按型取(`family::gguf::mmq2_sram_stride_for`),否则溢出。
+// ⚠️ 只挂 J=16:小 m(verify/propose 的 2..16 行)。m > 16 仍回 tile ——
+// MMQ 的 ntx = ceil(m/J) 会按 token 窗**重读权重**(prefill 语义上仍是重复读),
+// 本刀不碰 prefill 侧。
+OWL_MMQ2_WRAP(owl_mmq2_q3k_j16, GGML_TYPE_Q3_K, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq2s_j16, GGML_TYPE_IQ2_S, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq2xs_j16, GGML_TYPE_IQ2_XS, 16)
+// ⚠️ Q2_K **不在本刀**:它的激活布局是 `MMQ_Q8_1_DS_LAYOUT_D2S6`
+// (`mmq.cuh::mmq_get_q8_1_ds_layout`),而本适配层的量化手只有 D4 / DS4 两族 ⇒
+// 硬接会出 inf(实测)。本档 Q2_K 只有 1 张(19 MB),留在 tile 臂。
