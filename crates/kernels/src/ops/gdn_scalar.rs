@@ -3,6 +3,7 @@
 //! 与 [`crate::ops::gdn_chunked`] 同形:两者都是 **GDN 前向的编排入口**,
 //! 共享 `GDN_STATE` 状态池(rw / f32)。槽序权威历史 = `client::gdn_scalar::SIG`。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Arg, Dtype, Law, OpError};
 use crate::bootcheck::CheckCtx;
 use crate::spec::check_from_params;
@@ -11,6 +12,7 @@ use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec,
 /// `gdn_scalar_delta_rule_fwd` —— GDN scalar 前向(单核 + cast 编排入口)
 pub struct GdnScalarDeltaRuleFwd;
 
+#[kernel_tags("dom.gdn", "role.attn", "phase.prefill")]
 impl KernelSpec for GdnScalarDeltaRuleFwd {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::gdn_scalar::GDN_SCALAR_FWD);
@@ -124,8 +126,6 @@ impl KernelSpec for GdnScalarDeltaRuleFwd {
 
 pub static GDN_SCALAR_FWD: KernelMeta = meta_of::<GdnScalarDeltaRuleFwd>();
 
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[&GDN_SCALAR_FWD];
 
 #[cfg(test)]
 mod tests {

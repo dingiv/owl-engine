@@ -1,6 +1,6 @@
 # 调试工具速查(owl server / engine)
 
-前提:服务已起(例:`cd packages/owl && ./target/release/server --flavor spec-dflash testdata/server/agent-27b.toml --log-level info`)。
+前提:服务已起(例:`cd packages/owl && ./target/release/server -p profiles/legacy/spec-dflash.toml testdata/server/agent-27b.toml --log-level info`)。
 下面例子默认端口 8137,按实际改。
 
 ## 1. 诊断端点(`GET`,全部只读)

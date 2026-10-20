@@ -163,6 +163,11 @@ pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     /// **本引擎的 rank 数**(1 = 单卡;2 = TP2)—— 治理器按卡摊 `live`
     /// (`vram::LIVE` 是进程级全局计数器,TP2 下含两卡之和;2026-10-19 定谳)
     pub tp_ranks: usize,
+    /// **池分配前的每卡 live 基线**(TP2:两 rank 共用同一快照)。
+    /// `None` = 旧路/测试,回退 `vram::live_bytes()/tp_ranks`。
+    /// 为什么必须固定:池是逐 rank 顺序分配的;rank1 计算时 rank0 池已进
+    /// `live`,全局 `/ranks` 会把 rank0 池的一半算到 rank1 头上,cap 被压低。
+    pub live_baseline_per_card: Option<u64>,
     /// **草稿池几何**(层数, hkv, hd;**分片后**;P2.1-b)。`None` = 非 DFlash2 档
     /// ⇒ 池不分配;`Some` ⇒ 用它替掉写死的 `DRAFT_POOL`(双 rank 下 hkv 减半)
     pub draft_geom: Option<(usize, usize, usize)>,
@@ -654,7 +659,9 @@ impl StatePool {
             // 会把预算算成负数(实测 `budget = -6.58G` ⇒ `cap = 0` ⇒ 池被压到 0,
             // KV 容量白白丢掉)。修:live 按 rank 数摊回单卡。
             // (两 rank 的权重/草稿/池是对称的 ⇒ 摊分是正确口径)
-            let live_per_card = owl_shared::vram::live_bytes() / plan.tp_ranks.max(1) as u64;
+            let live_per_card = plan
+                .live_baseline_per_card
+                .unwrap_or_else(|| owl_shared::vram::live_bytes() / plan.tp_ranks.max(1) as u64);
             let budget = (vram_total as f64 * plan.vram_target) as i64
                 - vram_reserve as i64
                 - fixed_after.total() as i64
@@ -709,6 +716,22 @@ impl StatePool {
         // "工作集装得下" 硬校验(见 engine 侧 `kvmem_boot_checks`)。
         let nb = if paged { pool_tokens.div_ceil(page) } else { nb };
         let nb = if plan.pool_overcommit { nb } else { nb.max(seq_blocks) };
+        // **非超卖档的硬门**(2026-10-20):池必须装得下整条上下文。cap 是预算
+        // 上限;若 cap < seq_tokens,说明本档在治理器预算下不可行 —— 不允许
+        // 再靠 `nb.max(seq_blocks)` 静默超预算(旧行为:日志说 cap 小,实际池
+        // 仍按 seq_tokens 分配)。显式拒,给出降 context / 开 overcommit 的出路。
+        if let Some(cap) = pool_cap {
+            let effective = nb.saturating_mul(page);
+            if !plan.pool_overcommit
+                && effective > cap.saturating_add(page.saturating_sub(1))
+            {
+                return Err(ModelError::Msg(format!(
+                    "非超卖档池预算不足:seq_tokens={seq_tokens}(effective={effective} tok) > \
+                     治理器 cap={cap} tok;本档装不下整条上下文。\
+                     修法:降 [runtime].max_seq / 减少 fixed/激活,或显式开 [kvmem] 超卖。"
+                )));
+            }
+        }
         // prefill 桶 padding dump 页(M2b;设计 §4.2 律②):物理多 1 页,
         // **管理面 nb 不变**(store 块腿/块表/页链槽容量都不受影响)。
         let dump_page = plan.prefill_dump_page.then_some(nb);

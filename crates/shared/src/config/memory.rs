@@ -26,7 +26,7 @@
 //!
 //! 取 `activation = 0.60 GiB`(512+512 桶档实测 0.4–0.6)、
 //! `stability_margin = 1.30 GiB`(覆盖已实测的泄漏曲线 + 激活抖动)⇒ 解出
-//! **128k**(与手写 `flavors/awq27b-3090-max.toml` 同档,便于 A/B 对拍)。
+//! **128k**(与手写 `profiles/legacy/awq27b-3090-max.toml` 同档,便于 A/B 对拍)。
 //! P2 的校准探测会把这套数字写回硬件档。
 
 use serde::Serialize;
@@ -70,6 +70,10 @@ pub struct MemoryInputs {
     pub snap_max: usize,
     /// 并发会话数(非超卖档池 = 上下文 × sessions;每会话一份整上下文预算)
     pub sessions: usize,
+    /// TP world(1/2;2 = 权/KV/GDN 按卡摊,视觉塔每 rank 全量)
+    pub tp_world: usize,
+    /// 本档是否装视觉塔(权重每 rank 全量)
+    pub vision: bool,
     pub activation_bytes: u64,
     pub activation_note: &'static str,
     pub stability_margin_bytes: u64,
@@ -133,8 +137,38 @@ pub fn activation_for(chunk: usize, tail_merge: usize) -> (u64, &'static str) {
 }
 
 /// 治理器预算与固定项(纯算式;`context` 求解与实际校验共用)
+/// 本档每卡权重(TP 摊分;视觉塔每 rank 全量)
+pub fn weights_bytes(inp: &MemoryInputs) -> u64 {
+    let p = inp.model;
+    let world = inp.tp_world.max(1) as u64;
+    let base = if world == 2 && p.weights_base_tp2_bytes > 0 {
+        p.weights_base_tp2_bytes
+    } else {
+        p.weights_base_bytes / world
+    };
+    let draft = if inp.spec_dflash {
+        if world == 2 && p.draft_weights_tp2_bytes > 0 {
+            p.draft_weights_tp2_bytes
+        } else {
+            p.draft_weights_bytes / world
+        }
+    } else {
+        0
+    };
+    base + draft + if inp.vision { p.vision_weights_bytes } else { 0 }
+}
+
+/// 本档每卡每 token KV(主池 + 草稿池都按 world 摊)
+pub fn per_tok_bytes(inp: &MemoryInputs) -> u64 {
+    let world = inp.tp_world.max(1) as u64;
+    (inp.model.kv_bytes_per_token(inp.kv_fp8)
+        + if inp.spec_dflash { inp.model.draft_bytes_per_token() } else { 0 })
+        / world
+}
+
 pub fn budget_parts(inp: &MemoryInputs) -> (FixedParts, u64, u64, usize) {
-    let gdn_row = inp.model.gdn_row_bytes();
+    let world = inp.tp_world.max(1) as u64;
+    let gdn_row = inp.model.gdn_row_bytes() / world;
     let fixed = FixedParts {
         gdn_grid: gdn_row * inp.gdn_slots as u64,
         gdn_snap: gdn_row * inp.snap_max as u64,
@@ -142,11 +176,10 @@ pub fn budget_parts(inp: &MemoryInputs) -> (FixedParts, u64, u64, usize) {
         warmup_misc: WARMUP_MISC_BYTES,
     };
     let target_total = (inp.total_bytes as f64 * inp.vram_target) as u64;
-    let weights = inp.model.weights_bytes(inp.spec_dflash);
+    let weights = weights_bytes(inp);
     let spend = inp.reserve_bytes + fixed.total() + weights;
     let budget = target_total.saturating_sub(spend);
-    let per_tok = inp.model.kv_bytes_per_token(inp.kv_fp8)
-        + if inp.spec_dflash { inp.model.draft_bytes_per_token() } else { 0 };
+    let per_tok = per_tok_bytes(inp);
     let cap = (budget / per_tok.max(1)) as usize;
     (fixed, target_total, budget.max(0), cap)
 }
@@ -170,12 +203,11 @@ pub fn solve_max(inp: &MemoryInputs, model_max: usize, overcommit: bool) -> Resu
             inp.vram_target * 100.0,
             inp.reserve_bytes as f64 / GB,
             fixed.total() as f64 / GB,
-            inp.model.weights_bytes(inp.spec_dflash) as f64 / GB,
+            crate::config::memory::weights_bytes(inp) as f64 / GB,
         ));
     }
     let usable = budget - reserve_for_pool;
-    let per_tok = inp.model.kv_bytes_per_token(inp.kv_fp8)
-        + if inp.spec_dflash { inp.model.draft_bytes_per_token() } else { 0 };
+    let per_tok = per_tok_bytes(inp);
     let sessions = inp.sessions.max(1) as u64;
     let raw = (usable / (per_tok.max(1) * sessions)) as usize;
     let rounded = raw / CONTEXT_ROUND_TOKENS * CONTEXT_ROUND_TOKENS;
@@ -208,8 +240,13 @@ pub fn estimate(
     non_overcommit: bool,
 ) -> Result<MemoryEstimate, String> {
     let (fixed, target_total, budget, cap) = budget_parts(inp);
-    let per_tok_main = inp.model.kv_bytes_per_token(inp.kv_fp8);
-    let per_tok_draft = if inp.spec_dflash { inp.model.draft_bytes_per_token() } else { 0 };
+    let world = inp.tp_world.max(1) as u64;
+    let per_tok_main = inp.model.kv_bytes_per_token(inp.kv_fp8) / world;
+    let per_tok_draft = if inp.spec_dflash {
+        inp.model.draft_bytes_per_token() / world
+    } else {
+        0
+    };
     let per_tok = per_tok_main + per_tok_draft;
     let pool_bytes = pool_tokens as u64 * per_tok;
     let mut notes: Vec<String> = Vec::new();
@@ -253,7 +290,7 @@ pub fn estimate(
         vram_target: format!("{:.0}%", inp.vram_target * 100.0),
         target_total_bytes: target_total,
         reserve_bytes: inp.reserve_bytes,
-        weights_bytes: inp.model.weights_bytes(inp.spec_dflash),
+        weights_bytes: weights_bytes(inp),
         fixed,
         fixed_bytes: fixed.total(),
         per_tok_main,
@@ -293,6 +330,8 @@ mod tests {
             gdn_slots: 1,
             snap_max,
             sessions: 1,
+            tp_world: 1,
+            vision: false,
             activation_bytes: act,
             activation_note: note,
             stability_margin_bytes: STABILITY_MARGIN_BYTES,
@@ -300,7 +339,7 @@ mod tests {
     }
 
     /// 3090 Ti + 27B/fp8/spec off/512+512:`context="max"` 必须解出 128k
-    /// (与手写 `flavors/awq27b-3090-max.toml` 同档,供 A/B 对拍)。
+    /// (与手写 `profiles/legacy/awq27b-3090-max.toml` 同档,供 A/B 对拍)。
     #[test]
     fn max_context_solves_to_128k_on_3090ti() {
         let inp = inputs(true, 512, 512, 0);

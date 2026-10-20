@@ -30,7 +30,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let mut t_rollback = std::time::Duration::ZERO;
         let mut t_propose = std::time::Duration::ZERO;
         let depth = self.dev.spec_rt.depth;
-        owl_shared::log_debug!("spec-round", "轮开始 token={token} pos={pos} depth={depth}");
+        // **VLM m-RoPE delta**(V5):图像提示经塔后,文本主干的 rope 位置
+        // 相对真实 token 位置有常量偏移;verify 行必须与 decode 同式
+        // (`pos_rope = pos + delta`),但 KV slots/lens 仍用真实位置。
+        let vlm_delta = self
+            .turns
+            .active()
+            .ok()
+            .and_then(|a| a.vlm.as_ref())
+            .map(|v| v.ins.delta)
+            .unwrap_or(0);
+        owl_shared::log_debug!("spec-round", "轮开始 token={token} pos={pos} depth={depth} vlm_delta={vlm_delta}");
 
         // ① 快照(轮首;恢复后仍有效 → 只在失效时拍)
         if !self.tspec()?.spec_snap_valid {
@@ -116,8 +126,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 s.block_table.clone()
             };
             let ids_f: Vec<f32> = block.iter().map(|&v| v as f32).collect();
+            let rope_base = usize::try_from(pos as i64 + vlm_delta).map_err(|_| {
+                ModelError::Msg(format!(
+                    "spec verify: VLM 位置为负(pos={pos}, delta={vlm_delta})"
+                ))
+            })?;
             let pos_f: Vec<f32> =
-                (pos..pos + block.len()).map(|p| p as f32).collect();
+                (rope_base..rope_base + block.len()).map(|p| p as f32).collect();
             if bt_chain.len() <= (pos + block.len() - 1) / page {
                 owl_shared::log_debug!("spec-dbg", "pos={pos} block={} bt_len={bt_len} page={page}", block.len(), bt_len = bt_chain.len());
             }
@@ -334,7 +349,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             let ts = std::time::Instant::now();
             let (ids, hidden, row_logits) =
-                self.verify_forward(&block, pos, gdn_slot, sampler_on).await?;
+                self.verify_forward(&block, pos, gdn_slot, sampler_on, vlm_delta).await?;
             t_verify = ts.elapsed();
             (ids, hidden, Vec::new(), true, row_logits)
         };
@@ -672,7 +687,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .chain(drafts[..m].iter().copied())
                     .collect();
                 owl_shared::log_debug!("spec-round", "回滚重放:eager verify_forward 起(peer 镜像)");
-                let (_, replay_hidden, _) = self.verify_forward(&replay, pos, gdn_slot, false).await?;
+                let (_, replay_hidden, _) =
+                    self.verify_forward(&replay, pos, gdn_slot, false, vlm_delta).await?;
                 owl_shared::log_debug!("spec-round", "回滚重放:eager verify_forward 完");
                 let face = self.dev.graphs.session.face_mut();
                 face.free(&[replay_hidden.id]).await?;
@@ -1459,6 +1475,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     match self.snap_offload(victim, slot).await {
                         Ok(()) => {
                             self.dev.pool.snap_clear_slot(slot);
+                            if let Some(pr) = self.peer.as_mut() {
+                                pr.pool.snap_clear_slot(slot);
+                            }
                             return Ok(slot);
                         }
                         Err(e) => {
@@ -1480,6 +1499,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     m.counter_add("store.snap.drop", 1, file!(), line!());
                 });
                 self.dev.pool.snap_clear_slot(slot);
+                if let Some(pr) = self.peer.as_mut() {
+                    pr.pool.snap_clear_slot(slot);
+                }
                 Ok(slot)
             }
         }
@@ -1492,20 +1514,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     pub(crate) async fn snap_offload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
         let ev0 = self.bank.rel.snap_host_evicted_bytes();
         let (pieces, table) = self.bank.rel.plan_snap_offload(key, slot)?;
-        let face = self.dev.graphs.session.face_mut();
-        let conn = match face
-            .swap(owl_iface::contract::SwapDir::Out, &pieces, Box::new(table))
+        let table = match self
+            .swap_all_ranks(owl_iface::contract::SwapDir::Out, &pieces, table)
             .await
         {
-            Ok(c) => c,
+            Ok(t) => t,
             Err(e) => {
                 self.bank.rel.abort_snap_offload(key);
-                return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "快照下沉 swap 失败:{e}"
-                )));
+                return Err(e);
             }
         };
-        let table = owl_store::reclaim_slot_table(conn)?;
         self.bank.rel.commit_snap_offload(key, table)?;
         let ev = self.bank.rel.snap_host_evicted_bytes().saturating_sub(ev0);
         if ev > 0 {
@@ -1544,23 +1562,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// **快照回灌**(宿主 → 设备槽;一条 swap 搬 N 片)。
     pub(crate) async fn snap_onload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
         let (pieces, table) = self.bank.rel.plan_snap_onload(key, slot)?;
-        let face = self.dev.graphs.session.face_mut();
-        let conn = match face
-            .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+        let table = match self
+            .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, table)
             .await
         {
-            Ok(c) => c,
+            Ok(t) => t,
             Err(e) => {
                 // 台子随失败的 connector 消失 ⇒ 内容已丢 ⇒ 条目一并删
                 self.bank.rel.abort_snap_onload(key);
-                return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "快照回灌 swap 失败:{e}"
-                )));
+                return Err(e);
             }
         };
-        let table = owl_store::reclaim_slot_table(conn)?;
         self.bank.rel.commit_snap_onload(key, table)?;
         self.dev.pool.snap_place(slot, key);
+        // **TP:peer 的池槽索引同刻对齐**(物理槽由 swap 两 rank 同步写入;
+        // 索引不镜像 ⇒ 后续逐出/复用判据在两侧漂移)
+        if let Some(pr) = self.peer.as_mut() {
+            pr.pool.snap_place(slot, key);
+        }
         // **触达入 store 账**(§30.6-②):store 的 `last_use` 是出序输入;
         // 池的 `last_use` 只是物理面。两处同刻更新 ⇒ 判据与池不再漂。
         self.bank.rel.state.touch(key);

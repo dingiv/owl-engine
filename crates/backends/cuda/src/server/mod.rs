@@ -131,8 +131,8 @@ pub struct GpuServer {
     kernels: KernelCache,
     /// 算子注册表(M4 cutover:foreign 分派唯一入口;boot 装配,P4 门)
     registry: Option<owl_kernels::registry::OpRegistry>,
-    /// 生产算子白名单(dispatch.allowed_ops;None/空 = 门关;2026-10-13 P4)
-    allowed_ops: Option<std::sync::Arc<Vec<String>>>,
+    /// 配置派生的 tag 过滤(2026-10-20;W4A16/GGUF/KV/feature 自动约束)
+    tag_filter: owl_kernels::tag_filter::TagFilter,
     /// 执行引擎(kernels::device;LaunchVal 值表发射 + 装载缓存)
     exec: owl_kernels::device::Exec,
     /// **发射账**(cuda.trace_ring > 0 时建;见 crate::trace 模块头)
@@ -209,7 +209,7 @@ impl GpuServer {
             kernels: KernelCache::new(),
 // (diag 自身随 Self 移动,克隆 include 后置)
             registry: None,
-            allowed_ops: diag.allowed_ops.clone(),
+            tag_filter: diag.tag_filter,
             exec: owl_kernels::device::Exec::new(),
             scratch_ledger: Vec::new(),
             peak_watermark_bytes: 0,
@@ -513,12 +513,19 @@ impl GpuServer {
                         scratch: &mut self.scratch_ledger,
                     };
                     let mut exec = std::mem::take(&mut self.exec);
-                    // 白名单硬门 + 池写集审计 + 装配期自检全在注册表 boot 内
-                    // (设计 §八 P4/P5:装配门全链一个入口,失败 = 拒启)
-                    let allowed: Option<Vec<&str>> = self
-                        .allowed_ops
-                        .as_ref()
-                        .map(|v| v.iter().map(|s| s.as_str()).collect());
+                    // **tag 派生激活集**(2026-10-20 退役 allowed_ops):
+                    // 池写集审计 + 装配期自检只跑本档 tag filter 放行的算子;
+                    // 通配符 = None(全量激活,诊断档)。
+                    let allowed: Option<Vec<&str>> = if self.tag_filter.is_wildcard() {
+                        None
+                    } else {
+                        Some(
+                            owl_kernels::ops::all()
+                                .filter(|m| self.tag_filter.allows(m))
+                                .map(|m| m.entry)
+                                .collect(),
+                        )
+                    };
                     // **图自携 plan restore 开关下发**(2026-10-18;配置驱动,
                     // 零 env):写完 registry 之前设,保证任何 plan/activate
                     // 都读到本 boot 的档位。
@@ -895,6 +902,10 @@ impl GpuServer {
                 ack.send(self.ctx().block_ledger())
             }
             Command::MemPoolTrim { ack } => ack.send(self.ctx_mut().mem_pool_trim()),
+            Command::MemPoolStats { ack } => ack.send(
+                crate::state::pool_ledger_snapshot()
+                    .ok_or_else(|| ModelError::Msg("mem_pool_stats: 池账不可读".into())),
+            ),
             Command::UploadAndLaunch { dst, chunks, msg, ack } => {
                 self.handle_upload_and_launch(dst, chunks, msg, ack)
             }
@@ -1000,11 +1011,55 @@ impl GpuServer {
         // ── 显存硬预算(2026-10-16):**主动拒发**,不去 malloc ──
         // 判据见 `crate::state::VramGuard::check`（驱动 free − reserve；可选叠
         // live 账上限）。拒发 = 结构化 `PoolExhausted` + 一条 WARN（带池账/驱动账）。
-        if let Err(e) = self.vram_guard.check(
-            n_bytes,
-            self.diag.vram_reserve_mb << 20,
-            self.diag.vram_budget_mb.map(|m| m << 20),
-        ) {
+        let guard_check = |g: &mut crate::state::VramGuard,
+                           reserve: u64,
+                           budget: Option<u64>|
+         -> Result<(), ModelError> { g.check(n_bytes, reserve, budget) };
+        let reserve_b = self.diag.vram_reserve_mb << 20;
+        let budget_b = self.diag.vram_budget_mb.map(|m| m << 20);
+        let first = guard_check(&mut self.vram_guard, reserve_b, budget_b);
+        if let Err(e) = first {
+            // **池缓存应急回收(2026-10-20 §23.9)**:`RELEASE_THRESHOLD=∞` 下
+            // 已 free 的块仍占物理显存 ⇒ "驱动 free 告急"常是**池缓存**不是 live。
+            // 拒发前先 trim 一次(块账不变),复判通过就放行;不通过才响亮拒。
+            // 先把四条流排空(异步 free 要等事件落地才进池的"空闲页"表),再 trim
+            for sid in [STREAM_H2D, STREAM_COMPUTE, STREAM_COMPUTE_AUX, STREAM_D2H] {
+                if let Ok(st) = self.ctx().stream(sid) {
+                    if let Err(e) = st.synchronize() {
+                        self.sink.logf(
+                            owl_shared::log::LVL_WARN,
+                            "vram-budget",
+                            format_args!("硬预算前排空失败(stream {sid}): {e:?}"),
+                        );
+                    }
+                }
+            }
+            let trimmed = self.ctx_mut().mem_pool_trim();
+            let freed = trimmed.as_ref().ok().copied().unwrap_or(0);
+            let retry_ok = trimmed.is_ok()
+                && freed > 0
+                && guard_check(&mut self.vram_guard, reserve_b, budget_b).is_ok();
+            if retry_ok {
+                self.sink.logf(
+                    owl_shared::log::LVL_INFO,
+                    "vram-budget",
+                    format_args!(
+                        "硬预算前回收默认池缓存 {freed}B({:.1}MiB)⇒ 复判通过(本次分配 {}B)",
+                        freed as f64 / 1048576.0,
+                        n_bytes
+                    ),
+                );
+            } else {
+                if trimmed.is_err() {
+                    self.sink.logf(
+                        owl_shared::log::LVL_WARN,
+                        "vram-budget",
+                        format_args!(
+                            "硬预算前池缓存回收失败:{}",
+                            trimmed.as_ref().err().map(|t| t.to_string()).unwrap_or_default()
+                        ),
+                    );
+                }
             let pool = crate::state::pool_ledger_snapshot()
                 .map(|(u, uh, r, rh)| {
                     format!("池 used={}MiB(高水 {}MiB)/reserved={}MiB(高水 {}MiB)", u >> 20, uh >> 20, r >> 20, rh >> 20)
@@ -1026,7 +1081,21 @@ impl GpuServer {
                     owl_shared::vram::live_bytes() >> 20
                 ),
             );
-            return ack.send(Err(e));
+                return ack.send(Err(e));
+            }
+        }
+        // **大额分配取证**(2026-10-20 §23.9):池 `used_high` 高出 live 基线 GB 级
+        // 时,先要知道"谁";≥256 MiB 的单笔在 info 级别点名(每 turn 至多几笔)。
+        if n_bytes >= (16 << 20) {
+            self.sink.logf(
+                owl_shared::log::LVL_INFO,
+                "alloc-big",
+                format_args!(
+                    "rank{} 大额分配 {:.1}MiB: name={name} elems={elems} zero={zero}",
+                    self.ctx().device_ordinal(),
+                    n_bytes as f64 / 1048576.0
+                ),
+            );
         }
         // 图外:路由 COMPUTE 流;zero = true 时流序清零(契约:Zeros = 清零
         // 分配;uninit 免 memset —— eager 大量 scratch alloc 同税)
@@ -1290,25 +1359,34 @@ impl GpuServer {
     /// 所以门放这里而不是 models(design §五「由上层统一调用」的落地,
     /// 实测唯一能同时管住两路的位置)。
     ///
-    /// 未建表算子(`meta() == None`,处于"仅引入"状态)= 放行但无门 ——
-    /// P4 的生产白名单硬门才会把"未建表进生产"变成拒启。
+    /// 未建表算子(`meta() == None`,处于"仅引入"状态):
+    /// - tag filter 关闭(诊断/测试)= 放行但无门;
+    /// - tag filter 在场(生产配置派生)= **拒发**(无法校验 tag)。
     fn admission_check(&self, msg: &LaunchMsg) -> Result<(), owl_kernels::contract::OpError> {
         use owl_kernels::bootcheck::{CheckCtx, Geom};
-        // ① 白名单硬门(deny-by-default;门关时跳过)
-        if let Some(list) = &self.allowed_ops {
-            if !list.iter().any(|n| n == &msg.kernel.name) {
-                return Err(owl_kernels::contract::OpError::Contract {
-                    op: msg.kernel.name.clone(),
-                    field: "allowed_ops",
-                    expect: format!("∈ 本档白名单({} 项;dispatch.allowed_ops)", list.len()),
-                    got: "未列入 —— 该算子未获准入进本生产档".into(),
-                });
-            }
-        }
+        // ① 旧 allowed_ops 白名单已退役;准入只走下面的配置派生 tag filter。
         // ② 算子自身准入声明(L3 哨兵;未建表 = 无声明 ⇒ 无检查)
         let Some(meta) = self.registry.as_ref().and_then(|r| r.meta(&msg.kernel.name)) else {
+            // tag filter 在场时,未建表 = 无法校验 tag ⇒ 生产档拒(不静默)
+            if !self.tag_filter.is_wildcard() {
+                return Err(owl_kernels::contract::OpError::Contract {
+                    op: msg.kernel.name.clone(),
+                    field: "tag_filter",
+                    expect: "已建表算子(有 KernelSpec::TAGS)".into(),
+                    got: "未建表 —— 无法做 tag 过滤".into(),
+                });
+            }
             return Ok(());
         };
+        // ②' 配置派生 tag 过滤(W4A16/GGUF/KV/feature;互斥 facet)
+        if let Some(facet) = self.tag_filter.denied_facet(meta) {
+            return Err(owl_kernels::contract::OpError::Contract {
+                op: msg.kernel.name.clone(),
+                field: "tag_filter",
+                expect: format!("facet `{facet}` 命中本档配置(允许=[{}])", self.tag_filter.describe()),
+                got: format!("算子 tags={:?}", meta.tag_ids()),
+            });
+        }
         let geom = Geom {
             grid: msg.grid,
             block: msg.block,

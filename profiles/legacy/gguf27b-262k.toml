@@ -14,7 +14,7 @@
 #
 # 起机:
 #   CUDA_VISIBLE_DEVICES=GPU-<3090Ti 的 UUID> \
-#     target/release/server --flavor gguf27b-262k <用户档.toml>
+#     target/release/server -p profiles/legacy/gguf27b-262k.toml <用户档.toml>
 #
 # 📌 **要 524k / 1M**:用 `gguf27b-1m` 档(YaRN 静态外推 factor 4.0;
 #   524k = factor 2.0 + host 33792,见该档注释与设计 §二十三.7)。
@@ -105,9 +105,8 @@ kv_fp8 = false
 # GDN prefill 臂 = chunked(T 并行分块 delta-rule;varlen 顺序扫描 2.42 ms/层
 # 对 chunked 0.65 ms/层)。**GGUF 档此前漏配**,已由 gguf27b 固化。
 gdn_chunked = true
-# 本档**不设** allowed_ops 白名单(门关):与 gguf27b 同理 —— 白名单要按
-# **发射账并集**生成(方法见 gguf4b.toml 的 [dispatch] 注释),而 KVMem 档的
-# 臂集额外包含选择层/下沉/回灌族(swap/写视图页表)。硬化时按同流程收账。
+# `allowed_ops` 已退役(2026-10-20):准入由配置派生 tag filter 自动完成;
+# 本档额外用到选择层/下沉/回灌族,但仍由同一套 tag facet 约束。
 
 [kvmem]
 # ── 虚拟化两扇门(**同时为真**;所有解锁类护栏的唯一判据)──

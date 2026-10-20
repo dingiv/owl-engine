@@ -2,7 +2,7 @@
 #
 # 纪律:档内**只列最优且非缺省**的选项 —— 引擎缺省即最优的一律不复述。
 # 站点/部署面(model.dir/dflash2_dir、bind、几何)由配套配置文件给,
-# 启动 = `server --flavor spec-dflash <site.toml>`。
+# 启动 = `server -p profiles/legacy/spec-dflash.toml <site.toml>`。
 # 详尽 why 在各设计卷;此处每键一行来源。
 
 [model]
@@ -99,39 +99,6 @@ fi_plan_restore = false   # 图不烘表 ⇒ host 是表的唯一权威(validate
 gdn_chunked = true
 # 生产算子白名单(P4 硬门,deny-by-default;与 kernels ops::PROD_SPEC_DFLASH
 # 逐项一致,由 apps/server 门测试锁死)。两族 fp8/f16 都在 ⇒ f16 档不必绕门。
-allowed_ops = [
-        "cublas_gemm_bf16", "cublas_gemm_f16",
-        "flashinfer_prefill_paged_f16", "flashinfer_prefill_paged_fp8kv", "gdn_chunked_delta_rule_fwd",
-        "marlin_gemm_w4a16_awq", "marlin_gemm_w4a16_bf16",
-        "owl_add_bf16", "owl_add_f16",
-        "owl_argmax_f32idx_f16", "owl_cast_bf16_f16",
-        # W4A8 档(2026-10-17;`[model] quant = "w4a8"` 时发射,否则白名单超集无害)
-        "marlin_gemm_w4a8_awq", "owl_quant_int8_row_f16", "owl_ct_repack_a8_u32",
-        "owl_cast_f16_bf16", "owl_concat_rows_f16",
-        "owl_concat_rows_f32", "owl_ct_repack_u32",
-        "owl_dflash_conv_bf16", "owl_dflash_select_bf16",
-        "owl_embed_f16", "owl_fused_add_rmsnorm_bf16",
-        "owl_fused_add_rmsnorm_f16", "owl_gdn_conv_fwd_f16",
-        "owl_gdn_conv_upd_dual_f16", "owl_gdn_decode_step_v2_f16",
-        "owl_gdn_gating_g_f16", "owl_gdn_l2norm_f16",
-        "owl_gdn_norm_act_f16", "owl_gdn_recurrence_varlen_gqa_f16",
-        "owl_gemv_dual_f16", "owl_gemv_i8w_f16", "owl_naive_attn_nc_bf16_v2",
-        "owl_narrow_strided_f16", "owl_norm_rope_bf16",
-        "owl_norm_rope_f16", "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
-        "owl_qknorm_rope_kv_insert_f16_knhd",
-        "owl_reshape_and_cache_fp8kv_knhd", "owl_rmsnorm_bf16",
-        "owl_rmsnorm_f16", "owl_sigmoid_f16",
-        "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_bf16",
-        "owl_silu_and_mul_f16", "owl_topk16_merge_f16",
-        "owl_topk16_split_f16",
-        "owl_xqa_decode", "owl_xqa_prefill", "owl_xqa_verify",
-        "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
-        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
-        "vllm_paged_attention_v2_f16_knhd_hd256bs32",
-        "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
-        "vllm_paged_attention_v2_reduce_f16_hd256",
-        "vllm_reshape_and_cache_bf16", "vllm_reshape_and_cache_f16_knhd",
-]
 
 [sampling]
 mode = "greedy"

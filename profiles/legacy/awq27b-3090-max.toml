@@ -82,26 +82,6 @@ fi_plan_restore = false
 # 无投机 ⇒ verify 面不建;显式关掉 v2 避免任何预填族歧义
 verify_v2 = false
 # 生产算子白名单(deny-by-default;本档实际用到的全集)
-allowed_ops = [
-        "cublas_gemm_f16", "flashinfer_prefill_paged_fp8kv",
-        "gdn_chunked_delta_rule_fwd",
-        "marlin_gemm_w4a16_awq",
-        "owl_add_f16",
-        "owl_argmax_f32idx_f16", "owl_cast_bf16_f16",
-        "owl_ct_repack_u32",
-        "owl_embed_f16", "owl_fused_add_rmsnorm_f16",
-        "owl_gdn_conv_fwd_f16", "owl_gdn_conv_upd_dual_f16",
-        "owl_gdn_decode_step_v2_f16", "owl_gdn_gating_g_f16",
-        "owl_gdn_l2norm_f16", "owl_gdn_norm_act_f16",
-        "owl_gdn_recurrence_varlen_gqa_f16", "owl_gemv_dual_f16", "owl_gemv_i8w_f16",
-        "owl_narrow_strided_f16", "owl_norm_rope_f16",
-        "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd", "owl_reshape_and_cache_fp8kv_knhd",
-        "owl_rmsnorm_f16", "owl_sigmoid_f16",
-        "owl_sigmoid_gate_mul_f16", "owl_silu_and_mul_f16",
-        "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
-        "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
-        "vllm_paged_attention_v2_reduce_f16_hd256",
-]
 
 [kvmem]
 # **不用 KVMem**:无选择层 / 无索引 / 无覆盖率探针

@@ -860,6 +860,18 @@ pub trait DeviceClient: Send {
         async { Err(ModelError::Msg("mem_pool_trim: 此后端未实现".into())) }
     }
 
+    /// **设备池账**(内存面;默认不支持):(used, used_high, reserved, reserved_high)。
+    ///
+    /// 为什么要它:`RELEASE_THRESHOLD=∞` 下**已 free 的块仍占物理显存**(池缓存);
+    /// 引擎块账只见 live ⇒ 物理 − live = 池缓存,这部分**不在任何账上**。
+    /// 双 rank 下它只长在 peer 一侧(2026-10-20 §23.9 实测 +3.3 GiB),
+    /// 不给治理面一个读数就只能瞎猜。
+    fn mem_pool_stats(
+        &mut self,
+    ) -> impl Future<Output = Result<(u64, u64, u64, u64), ModelError>> + Send {
+        async { Err(ModelError::Msg("mem_pool_stats: 此后端未实现".into())) }
+    }
+
     /// 设备内块→块拷贝(E2c:GDN 快照拍摄/恢复 —— 会话格 ↔ 快照缓冲
     /// D2D,免 PCIe 往返;双方偏移字节口径,长度 = 拷贝字节数)。
     /// 默认 = 不支持。

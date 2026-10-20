@@ -1,11 +1,13 @@
 //! Norm / MLP 门控 生产算子元数据。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
 
 /// `owl_rmsnorm_f16` —— RMSNorm(宏实例化;alpha 权重 + `w_off` 半段偏移)
 pub struct RmsnormF16;
 
+#[kernel_tags("dom.norm", "role.norm")]
 impl KernelSpec for RmsnormF16 {
     const ENTRY: &'static str = "owl_rmsnorm_f16";
     const SRC: &'static str = "cu/ln/rmsnorm.cu";
@@ -25,6 +27,7 @@ impl KernelSpec for RmsnormF16 {
 /// `owl_rmsnorm_bf16` —— 同上(BF16 域)
 pub struct RmsnormBf16;
 
+#[kernel_tags("dom.norm", "role.norm")]
 impl KernelSpec for RmsnormBf16 {
     const ENTRY: &'static str = "owl_rmsnorm_bf16";
     const SRC: &'static str = "cu/ln/rmsnorm.cu";
@@ -44,6 +47,7 @@ impl KernelSpec for RmsnormBf16 {
 /// `owl_fused_add_rmsnorm_f16` —— residual 原地 += mixed(副作用律)+ rmsnorm·w
 pub struct FusedAddRmsnormF16;
 
+#[kernel_tags("dom.norm", "role.norm")]
 impl KernelSpec for FusedAddRmsnormF16 {
     const ENTRY: &'static str = "owl_fused_add_rmsnorm_f16";
     const SRC: &'static str = "cu/ln/fused_add_rmsnorm.cu";
@@ -64,6 +68,7 @@ impl KernelSpec for FusedAddRmsnormF16 {
 /// `owl_fused_add_rmsnorm_bf16` —— 同上(BF16 域)
 pub struct FusedAddRmsnormBf16;
 
+#[kernel_tags("dom.norm", "role.norm")]
 impl KernelSpec for FusedAddRmsnormBf16 {
     const ENTRY: &'static str = "owl_fused_add_rmsnorm_bf16";
     const SRC: &'static str = "cu/ln/fused_add_rmsnorm.cu";
@@ -84,6 +89,7 @@ impl KernelSpec for FusedAddRmsnormBf16 {
 /// `owl_silu_and_mul_f16` —— SwiGLU 门控 silu(g)⊙u(双输入单输出)
 pub struct SiluAndMulF16;
 
+#[kernel_tags("dom.norm", "role.norm")]
 impl KernelSpec for SiluAndMulF16 {
     const ENTRY: &'static str = "owl_silu_and_mul_f16";
     const SRC: &'static str = "cu/ln/silu_and_mul.cu";
@@ -101,6 +107,7 @@ impl KernelSpec for SiluAndMulF16 {
 /// `owl_silu_and_mul_bf16` —— 同上(BF16 域)
 pub struct SiluAndMulBf16;
 
+#[kernel_tags("dom.norm", "role.norm")]
 impl KernelSpec for SiluAndMulBf16 {
     const ENTRY: &'static str = "owl_silu_and_mul_bf16";
     const SRC: &'static str = "cu/ln/silu_and_mul.cu";
@@ -122,16 +129,15 @@ pub static FUSED_ADD_RMSNORM_BF16: KernelMeta = meta_of::<FusedAddRmsnormBf16>()
 pub static SILU_AND_MUL_F16: KernelMeta = meta_of::<SiluAndMulF16>();
 pub static SILU_AND_MUL_BF16: KernelMeta = meta_of::<SiluAndMulBf16>();
 
-
 // ============================================================================
 // `ln.rs` 域 R1 补表
 // (R1 补表 2026-10-13:声明从登记表派生,签名由 `op_tables` 门逐参互证)
 // ============================================================================
 
-
 /// `owl_rmsnorm_f32` —— rmsnorm.cu(R1 补表)
 pub struct RmsnormF32;
 
+#[kernel_tags("dom.norm", "role.norm")]
 impl KernelSpec for RmsnormF32 {
     const ENTRY: &'static str = "owl_rmsnorm_f32";
     const SRC: &'static str = "cu/ln/rmsnorm.cu";
@@ -149,14 +155,3 @@ impl KernelSpec for RmsnormF32 {
 }
 
 pub static OWL_RMSNORM_F32: KernelMeta = meta_of::<RmsnormF32>();
-
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[
-    &RMSNORM_F16,
-    &RMSNORM_BF16,
-    &FUSED_ADD_RMSNORM_F16,
-    &FUSED_ADD_RMSNORM_BF16,
-    &SILU_AND_MUL_F16,
-    &SILU_AND_MUL_BF16,
-    &OWL_RMSNORM_F32,
-];

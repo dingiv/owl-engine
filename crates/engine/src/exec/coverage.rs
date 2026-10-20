@@ -660,22 +660,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                 (p.blocks, p.pieces, p.table)
             };
             if !blocks.is_empty() {
-                let conn = {
-                    let face = self.dev.graphs.session.face_mut();
-                    match face
-                        .swap(owl_iface::contract::SwapDir::Out, &pieces, Box::new(tbl))
-                        .await
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            owl_store::abort_offload(&mut self.bank.rel.leg, &blocks);
-                            return Err(owl_iface::contract::ModelError::Msg(format!(
-                                "选择层下沉 swap(Out) 失败:{e}"
-                            )));
-                        }
+                let tbl = match self
+                    .swap_all_ranks(owl_iface::contract::SwapDir::Out, &pieces, tbl)
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        owl_store::abort_offload(&mut self.bank.rel.leg, &blocks);
+                        return Err(e);
                     }
                 };
-                let tbl = owl_store::reclaim_slot_table(conn)?;
                 let n = owl_store::commit_offload(&mut self.bank.rel.leg, &blocks, tbl)?;
                 // 表写占位(**只对真沉下去的那些**;被跳过的块保留原槽)
                 let sunk_set: std::collections::HashSet<ChainHash> =
@@ -701,22 +695,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                 let p = owl_store::plan_onload(&mut self.bank.rel.leg, &hashes)?;
                 (p.chains, p.slots, p.pieces, p.table)
             };
-            let conn = {
-                let face = self.dev.graphs.session.face_mut();
-                match face
-                    .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(tbl))
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        owl_store::abort_onload(&mut self.bank.rel.leg, &cs, &slots);
-                        return Err(owl_iface::contract::ModelError::Msg(format!(
-                            "选择层回灌 swap(In) 失败:{e}"
-                        )));
-                    }
+            let tbl = match self
+                .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, tbl)
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    owl_store::abort_onload(&mut self.bank.rel.leg, &cs, &slots);
+                    return Err(e);
                 }
             };
-            let tbl = owl_store::reclaim_slot_table(conn)?;
             let got = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &slots, tbl)?;
             staged = got.len();
             // 槽写回表(同序:need 与 cs 同序)
@@ -1464,10 +1452,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             view_pages.truncate(cap);
         }
         let view_tokens = view_pages.len() * page;
-        {
-            let face = self.dev.graphs.session.face_mut();
-            self.dev.pool.write_select_view(face, &view_pages).await?;
-        }
+        self.write_select_view_all(&view_pages).await?;
         // B-3d:视图态落引擎(供 decode 每步展开);位置方案 A ⇒ 位置一律原样。
         // ⚠️ **只在 `select_decode` 档落** —— 否则 dense 对照臂也会用上视图,
         // 那就没有对照了(踩过:直觉写法会两臂同视图)。

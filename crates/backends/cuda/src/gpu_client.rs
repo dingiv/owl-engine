@@ -675,6 +675,10 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::MemPoolTrim { ack })?.await
     }
 
+    async fn mem_pool_stats(&mut self) -> Result<(u64, u64, u64, u64), ModelError> {
+        self.submit(move |ack| Command::MemPoolStats { ack })?.await
+    }
+
     /// 中间块回收(E2a):投递 Free 命令,账房移除 Owned 块归池
     async fn free(&mut self, ids: &[u64]) -> Result<(), ModelError> {
         let ids = ids.to_vec();

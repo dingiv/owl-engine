@@ -268,7 +268,28 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
             })
         })
         .collect();
+    let pools: Vec<Value> = snap
+        .pools
+        .iter()
+        .map(|(rank, r)| match r {
+            Ok((used, used_high, reserved, reserved_high)) => json!({
+                "rank": rank,
+                "used": used,
+                "used_high": used_high,
+                "reserved": reserved,
+                "reserved_high": reserved_high,
+                "used_mib": (*used as f64) / 1048576.0,
+                "used_high_mib": (*used_high as f64) / 1048576.0,
+                "reserved_mib": (*reserved as f64) / 1048576.0,
+                "reserved_high_mib": (*reserved_high as f64) / 1048576.0,
+                // 池缓存 = reserved − used(已 free 仍占物理)
+                "cached_mib": ((*reserved).saturating_sub(*used) as f64) / 1048576.0,
+            }),
+            Err(e) => json!({ "rank": rank, "error": e }),
+        })
+        .collect();
     json!({
+        "pools": pools,
         "tiers": {
             "gpu_used": r.tiers.gpu_used,
             "host_used": r.tiers.host_used,

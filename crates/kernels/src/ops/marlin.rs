@@ -5,6 +5,7 @@
 
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
+use owl_macros::kernel_tags;
 
 /// `marlin_gemm_w4a16_awq` —— AWQ(kU4 非对称,has_zp)臂:
 /// `[a, b(qpack), out, scales, zeros, ws, c_tmp, m, k, n, groupsize]`。
@@ -14,6 +15,7 @@ use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec,
 /// 仅激活与输出换 BF16 —— 另立 struct(B2 批次)。
 pub struct MarlinGemmW4a16Awq;
 
+#[kernel_tags("dom.marlin", "role.gemm", "quant.w4a16", "quant.awq")]
 impl KernelSpec for MarlinGemmW4a16Awq {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::marlin::GEMM_W4A16);
@@ -52,6 +54,7 @@ impl KernelSpec for MarlinGemmW4a16Awq {
 /// 激活量化核产出、全局因子已折入)。权重侧与 W4A16 同布局(零 repack)。
 pub struct MarlinGemmW4a8Awq;
 
+#[kernel_tags("dom.marlin", "role.gemm", "quant.w4a8", "quant.awq")]
 impl KernelSpec for MarlinGemmW4a8Awq {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::marlin::GEMM_W4A16);
     const ENTRY: &'static str = crate::family::marlin::GEMM_W4A8_AWQ;
@@ -91,6 +94,7 @@ impl KernelSpec for MarlinGemmW4a8Awq {
 /// DFlash2 草稿路径(权重原生 BF16)。
 pub struct MarlinGemmW4a16Bf16;
 
+#[kernel_tags("dom.marlin", "role.gemm", "quant.w4a16")]
 impl KernelSpec for MarlinGemmW4a16Bf16 {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::marlin::GEMM_W4A16);
@@ -120,6 +124,7 @@ impl KernelSpec for MarlinGemmW4a16Bf16 {
 /// `marlin_gemm_w4a16` —— f16 激活臂(对称 kU4;6 块 + 4 sz)
 pub struct MarlinGemmW4a16F16;
 
+#[kernel_tags("dom.marlin", "role.gemm", "quant.w4a16")]
 impl KernelSpec for MarlinGemmW4a16F16 {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::marlin::GEMM_W4A16);
@@ -147,8 +152,6 @@ pub static W4A16_BF16: KernelMeta = meta_of::<MarlinGemmW4a16Bf16>();
 pub static W4A16_F16: KernelMeta = meta_of::<MarlinGemmW4a16F16>();
 pub static W4A8_AWQ: KernelMeta = meta_of::<MarlinGemmW4a8Awq>();
 
-/// 本域全部已建表算子(**marlin 家族全建** ⇒ `names()` 可由本表派生)
-pub static METAS: &[&KernelMeta] = &[&W4A16_AWQ, &W4A16_BF16, &W4A16_F16, &W4A8_AWQ];
 
 #[cfg(test)]
 mod tests {

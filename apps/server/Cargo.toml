@@ -18,6 +18,9 @@ owl-iface = { path = "../../crates/backends/iface" }
 owl-shared = { path = "../../crates/shared" }
 # 诊断:/debug/vram —— store 三层账 + owner 维明细(第 0 刀;纯投影,不决策)
 owl-store = { path = "../../crates/store" }
+# 视觉塔输入契约(`VlmImage`)/图像预处理(png/jpeg)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
@@ -38,8 +41,6 @@ cupti = ["owl-cuda/cupti"]
 log = ["owl-shared/log", "owl-engine/log"]
 
 [dev-dependencies]
-# 生产白名单门测试:核对 flavor 清单与 kernels 实测台账(2026-10-13 P4)
-owl-kernels = { path = "../../crates/kernels" }
 # e2e 骨架用 prctl(PR_SET_PDEATHSIG):父进程被 SIGKILL 时子 server 必须随之
 # 退出(否则孤儿残留占端口+显存 → 后续整轮假绿;libc 已在 lock 内,零新增)
 libc = "0.2"

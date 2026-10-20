@@ -4,7 +4,7 @@
 # **自包含**:站点面(模型路径 / 端口)写死在本档 —— 不依赖任何本地档;
 # 换机器 = 改下面 [model] 的两行路径(其余不动)。
 #
-# 启动: ./target/release/server --flavor spec-dflash testdata/args/perf-ctxladder-27b.toml \
+# 启动: ./target/release/server -p profiles/legacy/spec-dflash.toml testdata/args/perf-ctxladder-27b.toml \
 #         --log-level info [--perf-level gpu]
 # 钉卡: CUDA_VISIBLE_DEVICES=<UUID>(建议)或 [runtime] device = { bdf = "41:00.0" }
 # 发射账(只在做宿主命令账时显式加回,缺省不开):[cuda] trace_ring = 65536

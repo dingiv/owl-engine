@@ -5,10 +5,12 @@
 
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
+use owl_macros::kernel_tags;
 
 /// `owl_layernorm_f32` —— LayerNorm(affine;two-pass mean/var,eps 入参)
 pub struct LayernormF32;
 
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.norm")]
 impl KernelSpec for LayernormF32 {
     const ENTRY: &'static str = "owl_layernorm_f32";
     const SRC: &'static str = "cu/vis/layernorm.cu";
@@ -28,6 +30,7 @@ impl KernelSpec for LayernormF32 {
 /// `owl_layernorm_f16` —— 同上(F16 域)
 pub struct LayernormF16;
 
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.norm")]
 impl KernelSpec for LayernormF16 {
     const ENTRY: &'static str = "owl_layernorm_f16";
     const SRC: &'static str = "cu/vis/layernorm.cu";
@@ -47,6 +50,7 @@ impl KernelSpec for LayernormF16 {
 /// `owl_layernorm_bf16` —— 同上(BF16 域)
 pub struct LayernormBf16;
 
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.norm")]
 impl KernelSpec for LayernormBf16 {
     const ENTRY: &'static str = "owl_layernorm_bf16";
     const SRC: &'static str = "cu/vis/layernorm.cu";
@@ -67,7 +71,6 @@ pub static LAYERNORM_F32: KernelMeta = meta_of::<LayernormF32>();
 pub static LAYERNORM_F16: KernelMeta = meta_of::<LayernormF16>();
 pub static LAYERNORM_BF16: KernelMeta = meta_of::<LayernormBf16>();
 
-
 // ============================================================================
 // 批二(2026-10-15):Gelu / BiasAdd / PosEmbedBilinear / AttnFull
 // 全部住 `cu/vis/vision_ops.cu`(Layernorm 单开 `cu/vis/layernorm.cu`)
@@ -75,6 +78,7 @@ pub static LAYERNORM_BF16: KernelMeta = meta_of::<LayernormBf16>();
 
 /// `owl_gelu_tanh_*` —— GELU(tanh 近似;塔 MLP)
 pub struct GeluTanhF32;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for GeluTanhF32 {
     const ENTRY: &'static str = "owl_gelu_tanh_f32";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -88,6 +92,7 @@ impl KernelSpec for GeluTanhF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 pub struct GeluTanhF16;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for GeluTanhF16 {
     const ENTRY: &'static str = "owl_gelu_tanh_f16";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -101,6 +106,7 @@ impl KernelSpec for GeluTanhF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 pub struct GeluTanhBf16;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for GeluTanhBf16 {
     const ENTRY: &'static str = "owl_gelu_tanh_bf16";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -116,6 +122,7 @@ impl KernelSpec for GeluTanhBf16 {
 
 /// `owl_gelu_erf_*` —— GELU(精确 erf;**merger 专用**,与 tanh 版不可互替)
 pub struct GeluErfF32;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for GeluErfF32 {
     const ENTRY: &'static str = "owl_gelu_erf_f32";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -129,6 +136,7 @@ impl KernelSpec for GeluErfF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 pub struct GeluErfF16;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for GeluErfF16 {
     const ENTRY: &'static str = "owl_gelu_erf_f16";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -142,6 +150,7 @@ impl KernelSpec for GeluErfF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 pub struct GeluErfBf16;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for GeluErfBf16 {
     const ENTRY: &'static str = "owl_gelu_erf_bf16";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -157,6 +166,7 @@ impl KernelSpec for GeluErfBf16 {
 
 /// `owl_bias_add_*` —— 行广播加(grid = (rows,1,1);cols 为标量)
 pub struct BiasAddF32;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for BiasAddF32 {
     const ENTRY: &'static str = "owl_bias_add_f32";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -171,6 +181,7 @@ impl KernelSpec for BiasAddF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 pub struct BiasAddF16;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for BiasAddF16 {
     const ENTRY: &'static str = "owl_bias_add_f16";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -185,6 +196,7 @@ impl KernelSpec for BiasAddF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 pub struct BiasAddBf16;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for BiasAddBf16 {
     const ENTRY: &'static str = "owl_bias_add_bf16";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -201,6 +213,7 @@ impl KernelSpec for BiasAddBf16 {
 
 /// `owl_pos_embed_bilinear_*` —— 4-tap 重采样(out[n,d] = Σ_k wts·table[idx])
 pub struct PosEmbedF32;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.rope")]
 impl KernelSpec for PosEmbedF32 {
     const ENTRY: &'static str = "owl_pos_embed_bilinear_f32";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -217,6 +230,7 @@ impl KernelSpec for PosEmbedF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 pub struct PosEmbedF16;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.rope")]
 impl KernelSpec for PosEmbedF16 {
     const ENTRY: &'static str = "owl_pos_embed_bilinear_f16";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -235,6 +249,7 @@ impl KernelSpec for PosEmbedF16 {
 
 /// `owl_vis_attn_full_*` —— 非因果 varlen 全注意力(逐图;hd=72;无 GQA)
 pub struct AttnFullF32;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.attn")]
 impl KernelSpec for AttnFullF32 {
     const ENTRY: &'static str = "owl_vis_attn_full_f32";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -255,6 +270,7 @@ impl KernelSpec for AttnFullF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 pub struct AttnFullF16;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.attn")]
 impl KernelSpec for AttnFullF16 {
     const ENTRY: &'static str = "owl_vis_attn_full_f16";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -277,6 +293,7 @@ impl KernelSpec for AttnFullF16 {
 
 /// `owl_image_scatter_*` —— VLM 图像 token 注入(out[t] = idx[t] ≥ 0 ? merged[idx[t]] : h[t])
 pub struct ImageScatterF32;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for ImageScatterF32 {
     const ENTRY: &'static str = "owl_image_scatter_f32";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -292,6 +309,7 @@ impl KernelSpec for ImageScatterF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 pub struct ImageScatterF16;
+#[kernel_tags("dom.vis", "feat.vision", "phase.prefill", "role.elem")]
 impl KernelSpec for ImageScatterF16 {
     const ENTRY: &'static str = "owl_image_scatter_f16";
     const SRC: &'static str = "cu/vis/vision_ops.cu";
@@ -322,25 +340,3 @@ pub static ATTN_FULL_F32: KernelMeta = meta_of::<AttnFullF32>();
 pub static ATTN_FULL_F16: KernelMeta = meta_of::<AttnFullF16>();
 pub static IMAGE_SCATTER_F32: KernelMeta = meta_of::<ImageScatterF32>();
 pub static IMAGE_SCATTER_F16: KernelMeta = meta_of::<ImageScatterF16>();
-
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[
-    &LAYERNORM_F32,
-    &LAYERNORM_F16,
-    &LAYERNORM_BF16,
-    &GELU_TANH_F32,
-    &GELU_TANH_F16,
-    &GELU_TANH_BF16,
-    &GELU_ERF_F32,
-    &GELU_ERF_F16,
-    &GELU_ERF_BF16,
-    &BIAS_ADD_F32,
-    &BIAS_ADD_F16,
-    &BIAS_ADD_BF16,
-    &POS_EMBED_F32,
-    &POS_EMBED_F16,
-    &ATTN_FULL_F32,
-    &ATTN_FULL_F16,
-    &IMAGE_SCATTER_F32,
-    &IMAGE_SCATTER_F16,
-];

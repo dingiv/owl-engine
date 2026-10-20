@@ -2,6 +2,7 @@
 //!
 //! 参数名/序/类型 = `.cu` 签名的逐字抄录(机器互证见 `tests/op_tables.rs`)。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param, PoolAccess};
 
@@ -21,6 +22,7 @@ use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, Kern
 /// 结构门:驱动件要求 `nwarp ≥ group` 且整除(否则回落旧核);核内 `__trap()` 兜底。
 pub struct NcAttnBf16V2;
 
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.bf16")]
 impl KernelSpec for NcAttnBf16V2 {
     const ENTRY: &'static str = "owl_naive_attn_nc_bf16_v2";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -97,6 +99,7 @@ const PAGED_V2_FP8_KNHD_PARAMS: &[Param] = &[
         Param::t_out("tmp_out", Dtype::F16, 1),
 ];
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_read", "phase.decode", "kv.main.fp8")]
 impl KernelSpec for PagedAttnV2Fp8KnhdHd256Bs32 {
     const ENTRY: &'static str = "vllm_paged_attention_v2_fp8_knhd_hd256bs32";
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
@@ -118,6 +121,7 @@ impl KernelSpec for PagedAttnV2Fp8KnhdHd256Bs32 {
 /// (exp_sums/max_logits + tmp_out → out;裸 decode 第二发)。
 pub struct PagedAttnV2ReduceF16Hd256;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.decode")]
 impl KernelSpec for PagedAttnV2ReduceF16Hd256 {
     const ENTRY: &'static str = "vllm_paged_attention_v2_reduce_f16_hd256";
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
@@ -145,6 +149,7 @@ impl KernelSpec for PagedAttnV2ReduceF16Hd256 {
 /// (B6.3 全零案:E10)。
 pub struct K0WriteFp8Knhd;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for K0WriteFp8Knhd {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
@@ -179,7 +184,6 @@ impl KernelSpec for K0WriteFp8Knhd {
     };
 }
 
-
 // ============================================================================
 // 池访问族补齐(2026-10-13 B1b):**生产里每一个池写者/读者都要有声明**
 // (E10「漏写者 ⇒ 槽区全零」/ E14 双寻址 / E15 契约腐烂 的机器面)
@@ -189,6 +193,7 @@ impl KernelSpec for K0WriteFp8Knhd {
 /// 主核(fp8/kNHD 池**读**;短 prefill 尾段)。23 参 = 8 块 + 12 i32 + 2 f32 + 输出。
 pub struct ChunkedPrefillFp8KnhdHd256;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for ChunkedPrefillFp8KnhdHd256 {
     const ENTRY: &'static str = "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256";
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
@@ -235,6 +240,7 @@ impl KernelSpec for ChunkedPrefillFp8KnhdHd256 {
 /// "池布局翻转"时会有一侧无声。
 pub struct K0WriteFp8Classic;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.fp8", "kv.draft.fp8")]
 impl KernelSpec for K0WriteFp8Classic {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
@@ -275,6 +281,7 @@ const K0_PARAMS: &[Param] = &[
 /// DFlash2 草稿池的权威写者;漏声明 = 草稿池静默全零(E10 同类)。
 pub struct K0WriteBf16;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.draft.bf16")]
 impl KernelSpec for K0WriteBf16 {
     const ENTRY: &'static str = "vllm_reshape_and_cache_bf16";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
@@ -309,6 +316,7 @@ impl KernelSpec for K0WriteBf16 {
 /// 自块直读保持 bf16)。fp8 草稿池档的生产读核。
 pub struct NcAttnFp8kvBf16;
 
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.fp8")]
 impl KernelSpec for NcAttnFp8kvBf16 {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_bf16";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -340,7 +348,6 @@ impl KernelSpec for NcAttnFp8kvBf16 {
     };
 }
 
-
 // ============================================================================
 // norm + rope 融合(driver::attn::norm_rope)
 // ============================================================================
@@ -349,6 +356,7 @@ impl KernelSpec for NcAttnFp8kvBf16 {
 /// 三发合一(x 是 per-head [value|gate] 半段拼接)
 pub struct NormRopeF16;
 
+#[kernel_tags("dom.attn", "role.attn", "role.norm", "role.rope")]
 impl KernelSpec for NormRopeF16 {
     const ENTRY: &'static str = "owl_norm_rope_f16";
     const SRC: &'static str = "cu/attn/norm_rope.cu";
@@ -373,6 +381,7 @@ impl KernelSpec for NormRopeF16 {
 /// `owl_norm_rope_bf16` —— 同上(x/w/out 为 BF16;cos/sin 共享 f16 表)
 pub struct NormRopeBf16;
 
+#[kernel_tags("dom.attn", "role.attn", "role.norm", "role.rope")]
 impl KernelSpec for NormRopeBf16 {
     const ENTRY: &'static str = "owl_norm_rope_bf16";
     const SRC: &'static str = "cu/attn/norm_rope.cu";
@@ -408,7 +417,6 @@ pub static K0_WRITE_BF16: KernelMeta = meta_of::<K0WriteBf16>();
 pub static NC_ATTN_FP8KV_BF16: KernelMeta = meta_of::<NcAttnFp8kvBf16>();
 pub static NORM_ROPE_F16: KernelMeta = meta_of::<NormRopeF16>();
 pub static NORM_ROPE_BF16: KernelMeta = meta_of::<NormRopeBf16>();
-
 
 // ============================================================================
 // R1 批次 1:attention 池读写变体族(用户裁决 2026-10-13:凡是用到都必须有声明)
@@ -451,10 +459,11 @@ const PAGED_V2_REDUCE_PARAMS: &[Param] = &[
 
 /// paged v2 变体描述符(表里只写差异项;ABI 由共享参数表承担)
 macro_rules! paged_v2_variant {
-    ($ty:ident, $entry:literal, $pool_dt:expr, $hd:expr, $page:expr, $dims:expr) => {
+    ($ty:ident, $entry:literal, $pool_dt:expr, $hd:expr, $page:expr, $dims:expr, $kv_tag:literal) => {
         #[doc = concat!("`", $entry, "`(paged attention v2 变体;ABI = PAGED_V2_PARAMS)")]
         pub struct $ty;
 
+        #[kernel_tags("dom.attn", "role.attn", "role.kv_read", "phase.decode", $kv_tag)]
         impl KernelSpec for $ty {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
@@ -479,23 +488,24 @@ macro_rules! paged_v2_variant {
     };
 }
 
-paged_v2_variant!(PagedV2F16Hd128Bs32, "vllm_paged_attention_v2_f16_hd128bs32", Dtype::F16, 128, &[32], &[128]);
-paged_v2_variant!(PagedV2F16Hd256Bs32, "vllm_paged_attention_v2_f16_hd256bs32", Dtype::F16, 256, &[32], &[256]);
-paged_v2_variant!(PagedV2F16KnhdHd128Bs32, "vllm_paged_attention_v2_f16_knhd_hd128bs32", Dtype::F16, 128, &[32], &[128]);
-paged_v2_variant!(PagedV2F16KnhdHd256Bs32, "vllm_paged_attention_v2_f16_knhd_hd256bs32", Dtype::F16, 256, &[32], &[256]);
-paged_v2_variant!(PagedV2F16KnhdHd128, "vllm_paged_attention_v2_f16_knhd_hd128", Dtype::F16, 128, &[16], &[128]);
-paged_v2_variant!(PagedV2F16KnhdHd256, "vllm_paged_attention_v2_f16_knhd_hd256", Dtype::F16, 256, &[16], &[256]);
-paged_v2_variant!(PagedV2Fp8Hd128, "vllm_paged_attention_v2_fp8_hd128", Dtype::F8E4M3, 128, &[16], &[128]);
-paged_v2_variant!(PagedV2Fp8Hd256, "vllm_paged_attention_v2_fp8_hd256", Dtype::F8E4M3, 256, &[16], &[256]);
-paged_v2_variant!(PagedV2Fp8Hd128Bs32, "vllm_paged_attention_v2_fp8_hd128bs32", Dtype::F8E4M3, 128, &[32], &[128]);
-paged_v2_variant!(PagedV2Fp8Hd256Bs32, "vllm_paged_attention_v2_fp8_hd256bs32", Dtype::F8E4M3, 256, &[32], &[256]);
-paged_v2_variant!(PagedV2Fp8KnhdHd128Bs32, "vllm_paged_attention_v2_fp8_knhd_hd128bs32", Dtype::F8E4M3, 128, &[32], &[128]);
-paged_v2_variant!(PagedV2Fp8KnhdHd256, "vllm_paged_attention_v2_fp8_knhd_hd256", Dtype::F8E4M3, 256, &[16], &[256]);
-paged_v2_variant!(PagedV2Fp8KnhdHd128, "vllm_paged_attention_v2_fp8_knhd_hd128", Dtype::F8E4M3, 128, &[16], &[128]);
+paged_v2_variant!(PagedV2F16Hd128Bs32, "vllm_paged_attention_v2_f16_hd128bs32", Dtype::F16, 128, &[32], &[128], "kv.main.f16");
+paged_v2_variant!(PagedV2F16Hd256Bs32, "vllm_paged_attention_v2_f16_hd256bs32", Dtype::F16, 256, &[32], &[256], "kv.main.f16");
+paged_v2_variant!(PagedV2F16KnhdHd128Bs32, "vllm_paged_attention_v2_f16_knhd_hd128bs32", Dtype::F16, 128, &[32], &[128], "kv.main.f16");
+paged_v2_variant!(PagedV2F16KnhdHd256Bs32, "vllm_paged_attention_v2_f16_knhd_hd256bs32", Dtype::F16, 256, &[32], &[256], "kv.main.f16");
+paged_v2_variant!(PagedV2F16KnhdHd128, "vllm_paged_attention_v2_f16_knhd_hd128", Dtype::F16, 128, &[16], &[128], "kv.main.f16");
+paged_v2_variant!(PagedV2F16KnhdHd256, "vllm_paged_attention_v2_f16_knhd_hd256", Dtype::F16, 256, &[16], &[256], "kv.main.f16");
+paged_v2_variant!(PagedV2Fp8Hd128, "vllm_paged_attention_v2_fp8_hd128", Dtype::F8E4M3, 128, &[16], &[128], "kv.main.fp8");
+paged_v2_variant!(PagedV2Fp8Hd256, "vllm_paged_attention_v2_fp8_hd256", Dtype::F8E4M3, 256, &[16], &[256], "kv.main.fp8");
+paged_v2_variant!(PagedV2Fp8Hd128Bs32, "vllm_paged_attention_v2_fp8_hd128bs32", Dtype::F8E4M3, 128, &[32], &[128], "kv.main.fp8");
+paged_v2_variant!(PagedV2Fp8Hd256Bs32, "vllm_paged_attention_v2_fp8_hd256bs32", Dtype::F8E4M3, 256, &[32], &[256], "kv.main.fp8");
+paged_v2_variant!(PagedV2Fp8KnhdHd128Bs32, "vllm_paged_attention_v2_fp8_knhd_hd128bs32", Dtype::F8E4M3, 128, &[32], &[128], "kv.main.fp8");
+paged_v2_variant!(PagedV2Fp8KnhdHd256, "vllm_paged_attention_v2_fp8_knhd_hd256", Dtype::F8E4M3, 256, &[16], &[256], "kv.main.fp8");
+paged_v2_variant!(PagedV2Fp8KnhdHd128, "vllm_paged_attention_v2_fp8_knhd_hd128", Dtype::F8E4M3, 128, &[16], &[128], "kv.main.fp8");
 
 /// `vllm_paged_attention_v2_reduce_f16_hd128` —— 分区归并(hd128 变体)
 pub struct PagedV2ReduceF16Hd128;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.decode")]
 impl KernelSpec for PagedV2ReduceF16Hd128 {
     const ENTRY: &'static str = "vllm_paged_attention_v2_reduce_f16_hd128";
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
@@ -504,7 +514,6 @@ impl KernelSpec for PagedV2ReduceF16Hd128 {
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
-
 
 pub static PAGED_V2_F16_HD128BS32: KernelMeta = meta_of::<PagedV2F16Hd128Bs32>();
 pub static PAGED_V2_F16_HD256BS32: KernelMeta = meta_of::<PagedV2F16Hd256Bs32>();
@@ -521,10 +530,10 @@ pub static PAGED_V2_FP8_KNHD_HD256: KernelMeta = meta_of::<PagedV2Fp8KnhdHd256>(
 pub static PAGED_V2_FP8_KNHD_HD128: KernelMeta = meta_of::<PagedV2Fp8KnhdHd128>();
 pub static PAGED_V2_REDUCE_F16_HD128: KernelMeta = meta_of::<PagedV2ReduceF16Hd128>();
 
-
 /// `owl_naive_decode_attn_f16` —— naive_decode_attn.cu(R1 补表;池声明见 POOL)
 pub struct NaiveDecodeAttnF16;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.decode", "kv.main.f16")]
 impl KernelSpec for NaiveDecodeAttnF16 {
     const ENTRY: &'static str = "owl_naive_decode_attn_f16";
     const SRC: &'static str = "cu/attn/naive_decode_attn.cu";
@@ -561,10 +570,10 @@ impl KernelSpec for NaiveDecodeAttnF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_naive_decode_attn_f32` —— naive_decode_attn.cu(R1 补表;池声明见 POOL)
 pub struct NaiveDecodeAttnF32;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.decode")]
 impl KernelSpec for NaiveDecodeAttnF32 {
     const ENTRY: &'static str = "owl_naive_decode_attn_f32";
     const SRC: &'static str = "cu/attn/naive_decode_attn.cu";
@@ -594,10 +603,10 @@ impl KernelSpec for NaiveDecodeAttnF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_naive_attn_nc_f16` —— naive_attn_nc.cu(R1 补表;池声明见 POOL)
 pub struct NaiveAttnNcF16;
 
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.f16")]
 impl KernelSpec for NaiveAttnNcF16 {
     const ENTRY: &'static str = "owl_naive_attn_nc_f16";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -624,10 +633,10 @@ impl KernelSpec for NaiveAttnNcF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_naive_attn_nc_bf16` —— naive_attn_nc.cu(R1 补表;池声明见 POOL)
 pub struct NaiveAttnNcBf16;
 
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.bf16")]
 impl KernelSpec for NaiveAttnNcBf16 {
     const ENTRY: &'static str = "owl_naive_attn_nc_bf16";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -654,10 +663,10 @@ impl KernelSpec for NaiveAttnNcBf16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_naive_attn_nc_fp8kv_f16` —— naive_attn_nc.cu(R1 补表;池声明见 POOL)
 pub struct NaiveAttnNcFp8KvF16;
 
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.fp8")]
 impl KernelSpec for NaiveAttnNcFp8KvF16 {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_f16";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -684,10 +693,10 @@ impl KernelSpec for NaiveAttnNcFp8KvF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_reshape_and_cache_f16` —— reshape_and_cache.cu(R1 补表;池声明见 POOL)
 pub struct VllmReshapeAndCacheF16;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for VllmReshapeAndCacheF16 {
     const ENTRY: &'static str = "vllm_reshape_and_cache_f16";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
@@ -714,10 +723,10 @@ impl KernelSpec for VllmReshapeAndCacheF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_reshape_and_cache_f16_knhd` —— reshape_and_cache.cu(R1 补表;池声明见 POOL)
 pub struct VllmReshapeAndCacheF16Knhd;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for VllmReshapeAndCacheF16Knhd {
     const ENTRY: &'static str = "vllm_reshape_and_cache_f16_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
@@ -744,10 +753,10 @@ impl KernelSpec for VllmReshapeAndCacheF16Knhd {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_reshape_and_cache_bf16_knhd` —— reshape_and_cache.cu(R1 补表;池声明见 POOL)
 pub struct VllmReshapeAndCacheBf16Knhd;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.bf16")]
 impl KernelSpec for VllmReshapeAndCacheBf16Knhd {
     const ENTRY: &'static str = "vllm_reshape_and_cache_bf16_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
@@ -774,10 +783,10 @@ impl KernelSpec for VllmReshapeAndCacheBf16Knhd {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_reshape_and_cache_fp8kv_bf16` —— reshape_and_cache_fp8kv.cu(R1 补表;池声明见 POOL)
 pub struct ReshapeAndCacheFp8KvBf16;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for ReshapeAndCacheFp8KvBf16 {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_bf16";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
@@ -804,10 +813,10 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_reshape_and_cache_fp8kv_bf16_knhd` —— reshape_and_cache_fp8kv.cu(R1 补表;池声明见 POOL)
 pub struct ReshapeAndCacheFp8KvBf16Knhd;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for ReshapeAndCacheFp8KvBf16Knhd {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_bf16_knhd";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
@@ -834,10 +843,10 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16Knhd {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_paged_attention_v1_f16_hd128` —— pagedattention_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmPagedAttentionV1F16Hd128;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_read", "phase.decode", "kv.main.f16")]
 impl KernelSpec for VllmPagedAttentionV1F16Hd128 {
     const ENTRY: &'static str = "vllm_paged_attention_v1_f16_hd128";
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
@@ -868,10 +877,10 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd128 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_paged_attention_v1_f16_hd128bs32` —— pagedattention_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmPagedAttentionV1F16Hd128bs32;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_read", "phase.decode", "kv.main.f16")]
 impl KernelSpec for VllmPagedAttentionV1F16Hd128bs32 {
     const ENTRY: &'static str = "vllm_paged_attention_v1_f16_hd128bs32";
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
@@ -902,10 +911,10 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd128bs32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_paged_attention_v1_f16_hd256` —— pagedattention_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmPagedAttentionV1F16Hd256;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_read", "phase.decode", "kv.main.f16")]
 impl KernelSpec for VllmPagedAttentionV1F16Hd256 {
     const ENTRY: &'static str = "vllm_paged_attention_v1_f16_hd256";
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
@@ -936,10 +945,10 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd256 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_paged_attention_v1_f16_hd256bs32` —— pagedattention_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmPagedAttentionV1F16Hd256bs32;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_read", "phase.decode", "kv.main.f16")]
 impl KernelSpec for VllmPagedAttentionV1F16Hd256bs32 {
     const ENTRY: &'static str = "vllm_paged_attention_v1_f16_hd256bs32";
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
@@ -970,10 +979,10 @@ impl KernelSpec for VllmPagedAttentionV1F16Hd256bs32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_chunked_prefill_paged_attn_opt_f16_hd128` —— prefill_paged_attn_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmChunkedPrefillPagedAttnOptF16Hd128;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16Hd128 {
     const ENTRY: &'static str = "vllm_chunked_prefill_paged_attn_opt_f16_hd128";
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
@@ -1011,10 +1020,10 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16Hd128 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_chunked_prefill_paged_attn_opt_f16_hd256` —— prefill_paged_attn_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmChunkedPrefillPagedAttnOptF16Hd256;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16Hd256 {
     const ENTRY: &'static str = "vllm_chunked_prefill_paged_attn_opt_f16_hd256";
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
@@ -1052,10 +1061,10 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16Hd256 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd128` —— prefill_paged_attn_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmChunkedPrefillPagedAttnOptF16KnhdHd128;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16KnhdHd128 {
     const ENTRY: &'static str = "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd128";
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
@@ -1093,10 +1102,10 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16KnhdHd128 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256` —— prefill_paged_attn_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmChunkedPrefillPagedAttnOptF16KnhdHd256;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16KnhdHd256 {
     const ENTRY: &'static str = "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256";
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
@@ -1134,10 +1143,10 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptF16KnhdHd256 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_chunked_prefill_paged_attn_opt_fp8_hd128` —— prefill_paged_attn_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmChunkedPrefillPagedAttnOptFp8Hd128;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd128 {
     const ENTRY: &'static str = "vllm_chunked_prefill_paged_attn_opt_fp8_hd128";
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
@@ -1175,10 +1184,10 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd128 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_chunked_prefill_paged_attn_opt_fp8_hd256` —— prefill_paged_attn_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmChunkedPrefillPagedAttnOptFp8Hd256;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd256 {
     const ENTRY: &'static str = "vllm_chunked_prefill_paged_attn_opt_fp8_hd256";
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
@@ -1216,10 +1225,10 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8Hd256 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd128` —— prefill_paged_attn_f16.cu(R1 补表;池声明见 POOL)
 pub struct VllmChunkedPrefillPagedAttnOptFp8KnhdHd128;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8KnhdHd128 {
     const ENTRY: &'static str = "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd128";
     const SRC: &'static str = "cu/attn/prefill_paged_attn_f16.cu";
@@ -1257,10 +1266,10 @@ impl KernelSpec for VllmChunkedPrefillPagedAttnOptFp8KnhdHd128 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_prefill_split_f16_hd256` —— prefill_split_f16.cu(R1 补表;池声明见 POOL)
 pub struct PrefillSplitF16Hd256;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for PrefillSplitF16Hd256 {
     const ENTRY: &'static str = "owl_prefill_split_f16_hd256";
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
@@ -1292,10 +1301,10 @@ impl KernelSpec for PrefillSplitF16Hd256 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_prefill_split_fp8kv_hd256` —— prefill_split_f16.cu(R1 补表;池声明见 POOL)
 pub struct PrefillSplitFp8KvHd256;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for PrefillSplitFp8KvHd256 {
     const ENTRY: &'static str = "owl_prefill_split_fp8kv_hd256";
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
@@ -1327,10 +1336,10 @@ impl KernelSpec for PrefillSplitFp8KvHd256 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_prefill_split_f16_knhd_hd256` —— prefill_split_f16.cu(R1 补表;池声明见 POOL)
 pub struct PrefillSplitF16KnhdHd256;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for PrefillSplitF16KnhdHd256 {
     const ENTRY: &'static str = "owl_prefill_split_f16_knhd_hd256";
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
@@ -1362,10 +1371,10 @@ impl KernelSpec for PrefillSplitF16KnhdHd256 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_prefill_split_fp8kv_knhd_hd256` —— prefill_split_f16.cu(R1 补表;池声明见 POOL)
 pub struct PrefillSplitFp8KvKnhdHd256;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for PrefillSplitFp8KvKnhdHd256 {
     const ENTRY: &'static str = "owl_prefill_split_fp8kv_knhd_hd256";
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
@@ -1397,10 +1406,10 @@ impl KernelSpec for PrefillSplitFp8KvKnhdHd256 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_prefill_split_reduce_f16_hd256` —— prefill_split_f16.cu(R1 补表;池声明见 POOL)
 pub struct PrefillSplitReduceF16Hd256;
 
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill")]
 impl KernelSpec for PrefillSplitReduceF16Hd256 {
     const ENTRY: &'static str = "owl_prefill_split_reduce_f16_hd256";
     const SRC: &'static str = "cu/attn/prefill_split_f16.cu";
@@ -1421,7 +1430,6 @@ impl KernelSpec for PrefillSplitReduceF16Hd256 {
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
-
 
 pub static OWL_NAIVE_DECODE_ATTN_F16: KernelMeta = meta_of::<NaiveDecodeAttnF16>();
 pub static OWL_NAIVE_DECODE_ATTN_F32: KernelMeta = meta_of::<NaiveDecodeAttnF32>();
@@ -1450,12 +1458,12 @@ pub static OWL_PREFILL_SPLIT_F16_KNHD_HD256: KernelMeta = meta_of::<PrefillSplit
 pub static OWL_PREFILL_SPLIT_FP8KV_KNHD_HD256: KernelMeta = meta_of::<PrefillSplitFp8KvKnhdHd256>();
 pub static OWL_PREFILL_SPLIT_REDUCE_F16_HD256: KernelMeta = meta_of::<PrefillSplitReduceF16Hd256>();
 
-
 /// `vllm_paged_attention_v2_f16_hd128` —— pagedattention_f16.cu(F 轮符号门抓出)
 ///
 /// page=16 档(packing 走此名;`driver.rs` 依 page 拾取)—— **原为未登记的活路径**,F 轮符号门抓出
 pub struct VllmPagedAttentionV2F16Hd128;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_read", "phase.decode", "kv.main.f16")]
 impl KernelSpec for VllmPagedAttentionV2F16Hd128 {
     const ENTRY: &'static str = "vllm_paged_attention_v2_f16_hd128";
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
@@ -1488,12 +1496,12 @@ impl KernelSpec for VllmPagedAttentionV2F16Hd128 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `vllm_paged_attention_v2_f16_hd256` —— pagedattention_f16.cu(F 轮符号门抓出)
 ///
 /// 同上
 pub struct VllmPagedAttentionV2F16Hd256;
 
+#[kernel_tags("dom.attn", "role.attn", "role.kv_read", "phase.decode", "kv.main.f16")]
 impl KernelSpec for VllmPagedAttentionV2F16Hd256 {
     const ENTRY: &'static str = "vllm_paged_attention_v2_f16_hd256";
     const SRC: &'static str = "cu/attn/pagedattention_f16.cu";
@@ -1526,12 +1534,12 @@ impl KernelSpec for VllmPagedAttentionV2F16Hd256 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_naive_attn_nc_f16_knhd` —— naive_attn_nc.cu(F 轮符号门抓出)
 ///
 /// ⚠️ 当前 0 调用点(暂不可达;候选:从 .cu 删除变体 —— 先按 R1「编出即有裁决」建表)
 pub struct NaiveAttnNcF16Knhd;
 
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.f16")]
 impl KernelSpec for NaiveAttnNcF16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_f16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1558,12 +1566,12 @@ impl KernelSpec for NaiveAttnNcF16Knhd {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_naive_attn_nc_bf16_knhd` —— naive_attn_nc.cu(F 轮符号门抓出)
 ///
 /// 同上
 pub struct NaiveAttnNcBf16Knhd;
 
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.bf16")]
 impl KernelSpec for NaiveAttnNcBf16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_bf16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1590,12 +1598,12 @@ impl KernelSpec for NaiveAttnNcBf16Knhd {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_naive_attn_nc_fp8kv_f16_knhd` —— naive_attn_nc.cu(F 轮符号门抓出)
 ///
 /// 同上
 pub struct NaiveAttnNcFp8KvF16Knhd;
 
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.fp8")]
 impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_f16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1622,12 +1630,12 @@ impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 /// `owl_naive_attn_nc_fp8kv_bf16_knhd` —— naive_attn_nc.cu(F 轮符号门抓出)
 ///
 /// 同上
 pub struct NaiveAttnNcFp8KvBf16Knhd;
 
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.fp8")]
 impl KernelSpec for NaiveAttnNcFp8KvBf16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_bf16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1654,7 +1662,6 @@ impl KernelSpec for NaiveAttnNcFp8KvBf16Knhd {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-
 pub static VLLM_PAGED_ATTENTION_V2_F16_HD128: KernelMeta = meta_of::<VllmPagedAttentionV2F16Hd128>();
 pub static VLLM_PAGED_ATTENTION_V2_F16_HD256: KernelMeta = meta_of::<VllmPagedAttentionV2F16Hd256>();
 pub static NAIVE_ATTN_NC_F16_KNHD: KernelMeta = meta_of::<NaiveAttnNcF16Knhd>();
@@ -1662,66 +1669,6 @@ pub static NAIVE_ATTN_NC_BF16_KNHD: KernelMeta = meta_of::<NaiveAttnNcBf16Knhd>(
 pub static NAIVE_ATTN_NC_FP8_KV_F16_KNHD: KernelMeta = meta_of::<NaiveAttnNcFp8KvF16Knhd>();
 pub static NAIVE_ATTN_NC_FP8_KV_BF16_KNHD: KernelMeta = meta_of::<NaiveAttnNcFp8KvBf16Knhd>();
 
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[
-    &NC_ATTN_BF16_V2,
-    &PAGED_V2_FP8_KNHD_HD256BS32,
-    &PAGED_V2_REDUCE_F16_HD256,
-    &K0_WRITE_FP8_KNHD,
-    &CHUNKED_PREFILL_FP8_KNHD_HD256,
-    &K0_WRITE_FP8_CLASSIC,
-    &K0_WRITE_BF16,
-    &NC_ATTN_FP8KV_BF16,
-    &NORM_ROPE_F16,
-    &NORM_ROPE_BF16,
-    // ---- R1 批次 1:paged v2 变体族 ----
-    &PAGED_V2_F16_HD128BS32,
-    &PAGED_V2_F16_HD256BS32,
-    &PAGED_V2_F16_KNHD_HD128BS32,
-    &PAGED_V2_F16_KNHD_HD256BS32,
-    &PAGED_V2_F16_KNHD_HD128,
-    &PAGED_V2_F16_KNHD_HD256,
-    &PAGED_V2_FP8_HD128,
-    &PAGED_V2_FP8_HD256,
-    &PAGED_V2_FP8_HD128BS32,
-    &PAGED_V2_FP8_HD256BS32,
-    &PAGED_V2_FP8_KNHD_HD128BS32,
-    &PAGED_V2_FP8_KNHD_HD256,
-    &PAGED_V2_FP8_KNHD_HD128,
-    &PAGED_V2_REDUCE_F16_HD128,
-    &OWL_NAIVE_DECODE_ATTN_F16,
-    &OWL_NAIVE_DECODE_ATTN_F32,
-    &OWL_NAIVE_ATTN_NC_F16,
-    &OWL_NAIVE_ATTN_NC_BF16,
-    &OWL_NAIVE_ATTN_NC_FP8KV_F16,
-    &VLLM_RESHAPE_AND_CACHE_F16,
-    &VLLM_RESHAPE_AND_CACHE_F16_KNHD,
-    &VLLM_RESHAPE_AND_CACHE_BF16_KNHD,
-    &OWL_RESHAPE_AND_CACHE_FP8KV_BF16,
-    &OWL_RESHAPE_AND_CACHE_FP8KV_BF16_KNHD,
-    &VLLM_PAGED_ATTENTION_V1_F16_HD128,
-    &VLLM_PAGED_ATTENTION_V1_F16_HD128BS32,
-    &VLLM_PAGED_ATTENTION_V1_F16_HD256,
-    &VLLM_PAGED_ATTENTION_V1_F16_HD256BS32,
-    &VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_HD128,
-    &VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_HD256,
-    &VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_KNHD_HD128,
-    &VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_F16_KNHD_HD256,
-    &VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_FP8_HD128,
-    &VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_FP8_HD256,
-    &VLLM_CHUNKED_PREFILL_PAGED_ATTN_OPT_FP8_KNHD_HD128,
-    &OWL_PREFILL_SPLIT_F16_HD256,
-    &OWL_PREFILL_SPLIT_FP8KV_HD256,
-    &OWL_PREFILL_SPLIT_F16_KNHD_HD256,
-    &OWL_PREFILL_SPLIT_FP8KV_KNHD_HD256,
-    &OWL_PREFILL_SPLIT_REDUCE_F16_HD256,
-    &VLLM_PAGED_ATTENTION_V2_F16_HD128,
-    &VLLM_PAGED_ATTENTION_V2_F16_HD256,
-    &NAIVE_ATTN_NC_F16_KNHD,
-    &NAIVE_ATTN_NC_BF16_KNHD,
-    &NAIVE_ATTN_NC_FP8_KV_F16_KNHD,
-    &NAIVE_ATTN_NC_FP8_KV_BF16_KNHD,
-];
 
 /// **谓词 ⇔ 声明一致性**(P4:收编 driver 谓词 —— 页配对律此前只住
 /// `driver::attn::paged_decode_ok`,现在与算子表的 `ShapeFamily` 声明互证:

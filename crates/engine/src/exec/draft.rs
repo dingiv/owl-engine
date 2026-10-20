@@ -1075,12 +1075,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// extend 后显式 free)。
     /// **eager verify(回滚/重放路)** —— 双 rank 镜像(P2.1-c):设备半在
     /// [`crate::engine::RankDev::verify_forward_dev`];单卡档 = 原路(零分支)。
+    /// `pos_delta` = VLM m-RoPE 偏移(只加 rope pos;KV slots/lens 用 `base`)。
     pub(crate) async fn verify_forward(
         &mut self,
         block: &[u32],
         base: usize,
         gdn_slot: usize,
         want_logits: bool,
+        pos_delta: i64,
     ) -> Result<(Vec<u32>, owl_iface::contract::Bytes, Option<Vec<f32>>)> {
         let bt_chain = {
             let act = self.turns.active()?;
@@ -1096,7 +1098,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let half_vocab = dev.model.logits_vocab();
         let out = match peer {
             None => {
-                dev.verify_forward_dev(block, base, gdn_slot, want_logits, &bt_chain)
+                dev.verify_forward_dev(block, base, gdn_slot, want_logits, &bt_chain, pos_delta)
                     .await?
             }
             Some(p) => {
@@ -1104,7 +1106,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let bt_p = bt_chain.clone();
                 let peer_fut = async move {
                     let r = p
-                        .verify_forward_dev(block, base, gdn_slot, want_logits, &bt_p)
+                        .verify_forward_dev(block, base, gdn_slot, want_logits, &bt_p, pos_delta)
                         .await;
                     if let Err(ref e) = r {
                         owl_shared::log_error!("spec-mirror", "peer verify_forward 失败: {e}");
@@ -1112,7 +1114,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     r
                 };
                 let (r0, r1) = crate::exec::join2(
-                    dev.verify_forward_dev(block, base, gdn_slot, want_logits, &bt_chain),
+                    dev.verify_forward_dev(block, base, gdn_slot, want_logits, &bt_chain, pos_delta),
                     peer_fut,
                 )
                 .await;

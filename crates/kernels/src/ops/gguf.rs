@@ -23,6 +23,7 @@
 
 use crate::contract::Dtype;
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
+use owl_macros::kernel_tags;
 
 /// `owl_gguf_gemm_q8_0` —— GGUF Q8_0 dequant-in-kernel GEMM(MMVQ)
 pub struct GgufGemmQ8_0;
@@ -50,6 +51,7 @@ const GEMM_PARAMS: &[Param] = &[
 
 macro_rules! gguf_gemm_spec {
     ($t:ty, $entry:expr) => {
+        #[kernel_tags("dom.gguf", "quant.gguf", "role.gemm")]
         impl KernelSpec for $t {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = crate::family::gguf::GEMM_SRC;
@@ -81,14 +83,16 @@ pub struct GgufMmq2QuantDs4;
 pub struct GgufMmq2QuantD4;
 
 const MMQ2_QUANT_PARAMS: &[Param] = &[
-    Param::t_in("x", Dtype::F16, 2),
-    Param::t_out("xq", Dtype::U8, 2),
+    // 名字逐字对 `.cu` 实例(`vx`/`vy`;2026-10-20 互证门修正)
+    Param::t_in("vx", Dtype::F16, 2),
+    Param::t_out("vy", Dtype::U8, 2),
     Param::i32("n_tokens"),
     Param::i32("ne0"),
 ];
 
 macro_rules! gguf_mmq2_quant_spec {
     ($t:ty, $entry:expr) => {
+        #[kernel_tags("dom.gguf", "quant.gguf", "role.elem")]
         impl KernelSpec for $t {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = crate::family::gguf::MMQ2_SRC;
@@ -121,8 +125,9 @@ pub struct GgufMmq2Q6KJ64;
 pub struct GgufMmq2Q6KJ128;
 
 const MMQ2_PARAMS: &[Param] = &[
-    Param::t_in("weights", Dtype::U8, 2),
-    Param::t_in("xq", Dtype::U8, 2),
+    // 名字逐字对 `.cu` 实例(`vx`/`vy`;2026-10-20 互证门修正)
+    Param::t_in("vx", Dtype::U8, 2),
+    Param::t_in("vy", Dtype::U8, 2),
     Param::t_out("out", Dtype::F16, 2),
     Param::i32("n"),
     Param::i32("m"),
@@ -131,6 +136,7 @@ const MMQ2_PARAMS: &[Param] = &[
 
 macro_rules! gguf_mmq2_spec {
     ($t:ty, $entry:expr) => {
+        #[kernel_tags("dom.gguf", "quant.gguf", "role.gemm")]
         impl KernelSpec for $t {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = crate::family::gguf::MMQ2_SRC;
@@ -166,7 +172,8 @@ pub struct GgufRangeQ5K;
 pub struct GgufRangeQ6K;
 
 const RANGE_PARAMS: &[Param] = &[
-    Param::t_in("weights", Dtype::U8, 2),
+    // 名字逐字对 `.cu` 实例(`w`,不是 `weights`;2026-10-20 互证门修正)
+    Param::t_in("w", Dtype::U8, 2),
     Param::t_out("out", Dtype::F16, 2),
     Param::i32("n0"),
     Param::i32("rows"),
@@ -175,6 +182,7 @@ const RANGE_PARAMS: &[Param] = &[
 
 macro_rules! gguf_range_spec {
     ($t:ty, $entry:expr) => {
+        #[kernel_tags("dom.gguf", "quant.gguf", "role.elem")]
         impl KernelSpec for $t {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = crate::family::gguf::SMEM_SRC;
@@ -199,6 +207,7 @@ gguf_range_spec!(GgufRangeQ6K, crate::family::gguf::RANGE_Q6K);
 /// `owl_gather_cols_f16`
 pub struct GgufGatherCols;
 
+#[kernel_tags("dom.gguf", "quant.gguf", "role.elem")]
 impl KernelSpec for GgufGatherCols {
     const ENTRY: &'static str = crate::family::gguf::GATHER_COLS_F16;
     const SRC: &'static str = crate::family::gguf::SMEM_SRC;
@@ -240,6 +249,7 @@ const MMQ_PARAMS: &[Param] = &[
 
 macro_rules! gguf_mmq_spec {
     ($t:ty, $entry:expr) => {
+        #[kernel_tags("dom.gguf", "quant.gguf", "role.gemm")]
         impl KernelSpec for $t {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = crate::family::gguf::MMQ_SRC;
@@ -284,6 +294,7 @@ const SMEM_PARAMS: &[Param] = &[
 
 macro_rules! gguf_smem_spec {
     ($t:ty, $entry:expr) => {
+        #[kernel_tags("dom.gguf", "quant.gguf", "role.gemm")]
         impl KernelSpec for $t {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = crate::family::gguf::SMEM_SRC;
@@ -317,6 +328,7 @@ pub struct GgufTileQ6K;
 
 macro_rules! gguf_tile_spec {
     ($t:ty, $entry:expr) => {
+        #[kernel_tags("dom.gguf", "quant.gguf", "role.gemm")]
         impl KernelSpec for $t {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = crate::family::gguf::TILE_SRC;
@@ -338,6 +350,7 @@ pub struct GgufQuantActF16;
 /// `owl_gguf_quant_act_bf16` —— 同上,bf16 入
 pub struct GgufQuantActBf16;
 
+#[kernel_tags("dom.gguf", "quant.gguf", "role.elem")]
 impl KernelSpec for GgufQuantActF16 {
     const ENTRY: &'static str = crate::family::gguf::QUANT_ACT_F16;
     const SRC: &'static str = crate::family::gguf::QUANT_SRC;
@@ -352,6 +365,7 @@ impl KernelSpec for GgufQuantActF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+#[kernel_tags("dom.gguf", "quant.gguf", "role.elem")]
 impl KernelSpec for GgufQuantActBf16 {
     const ENTRY: &'static str = crate::family::gguf::QUANT_ACT_BF16;
     const SRC: &'static str = crate::family::gguf::QUANT_SRC;
@@ -392,6 +406,7 @@ pub struct GgufQuantActF16Tiled;
 /// 同上,bf16 入
 pub struct GgufQuantActBf16Tiled;
 
+#[kernel_tags("dom.gguf", "quant.gguf", "role.elem")]
 impl KernelSpec for GgufQuantActF16Tiled {
     const ENTRY: &'static str = crate::family::gguf::QUANT_ACT_F16_TILED;
     const SRC: &'static str = crate::family::gguf::QUANT_SRC;
@@ -408,6 +423,7 @@ impl KernelSpec for GgufQuantActF16Tiled {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+#[kernel_tags("dom.gguf", "quant.gguf", "role.elem")]
 impl KernelSpec for GgufQuantActBf16Tiled {
     const ENTRY: &'static str = crate::family::gguf::QUANT_ACT_BF16_TILED;
     const SRC: &'static str = crate::family::gguf::QUANT_SRC;
@@ -454,6 +470,7 @@ const ROWS_PARAMS: &[Param] = &[
 
 macro_rules! gguf_rows_spec {
     ($t:ty, $entry:expr) => {
+        #[kernel_tags("dom.gguf", "quant.gguf", "role.elem", "phase.load")]
         impl KernelSpec for $t {
             const ENTRY: &'static str = $entry;
             const SRC: &'static str = crate::family::gguf::ROWS_SRC;
@@ -511,44 +528,3 @@ pub static SMEM_Q8_0: KernelMeta = meta_of::<GgufSmemQ8_0>();
 pub static SMEM_Q4K: KernelMeta = meta_of::<GgufSmemQ4K>();
 pub static SMEM_Q5K: KernelMeta = meta_of::<GgufSmemQ5K>();
 pub static SMEM_Q6K: KernelMeta = meta_of::<GgufSmemQ6K>();
-
-pub static METAS: &[&KernelMeta] = &[
-    &GEMM_Q8_0,
-    &GEMM_Q4K,
-    &GEMM_Q5K,
-    &GEMM_Q6K,
-    &TILE_Q8_0,
-    &TILE_Q4K,
-    &TILE_Q5K,
-    &TILE_Q6K,
-    &SMEM_Q8_0,
-    &SMEM_Q4K,
-    &SMEM_Q5K,
-    &SMEM_Q6K,
-    &MMQ_Q8_0,
-    &MMQ_Q4K,
-    &MMQ_Q5K,
-    &MMQ_Q6K,
-    &RANGE_Q8_0,
-    &RANGE_Q4K,
-    &RANGE_Q5K,
-    &RANGE_Q6K,
-    &GATHER_COLS_F16,
-    &MMQ2_QUANT_DS4,
-    &MMQ2_QUANT_D4,
-    &MMQ2_Q8_0_J64,
-    &MMQ2_Q8_0_J128,
-    &MMQ2_Q4K_J64,
-    &MMQ2_Q4K_J128,
-    &MMQ2_Q5K_J64,
-    &MMQ2_Q5K_J128,
-    &MMQ2_Q6K_J64,
-    &MMQ2_Q6K_J128,
-    &QUANT_ACT_F16,
-    &QUANT_ACT_BF16,
-    &QUANT_ACT_F16_TILED,
-    &QUANT_ACT_BF16_TILED,
-    &ROWS_Q4K,
-    &ROWS_Q5K,
-    &ROWS_Q6K,
-];

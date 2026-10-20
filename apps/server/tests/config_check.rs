@@ -15,6 +15,14 @@ fn repo(path: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(path)
 }
 
+fn profile(name: &str) -> std::path::PathBuf {
+    repo(&format!("profiles/{name}.toml"))
+}
+
+fn legacy(name: &str) -> std::path::PathBuf {
+    repo(&format!("profiles/legacy/{name}.toml"))
+}
+
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_server"))
         .args(args)
@@ -27,8 +35,8 @@ fn profile_check_reports_128k_and_memory_basis() {
     let site = repo("testdata/args/base.toml");
     let t0 = Instant::now();
     let out = run(&[
-        "--profile",
-        "awq27b-3090-max",
+        "-p",
+        profile("awq27b-3090-max").to_str().expect("路径"),
         "--site",
         site.to_str().expect("路径"),
         "--check",
@@ -59,8 +67,8 @@ fn profile_check_reports_128k_and_memory_basis() {
 fn print_config_json_carries_provenance_and_estimate() {
     let site = repo("testdata/args/base.toml");
     let out = run(&[
-        "--profile",
-        "awq27b-3090-max",
+        "-p",
+        profile("awq27b-3090-max").to_str().expect("路径"),
         "--site",
         site.to_str().expect("路径"),
         "--print-config",
@@ -80,15 +88,18 @@ fn print_config_json_carries_provenance_and_estimate() {
     // provenance:上下文/池都由 intent 派生(不是文件里的手写值)
     assert_eq!(v["provenance"]["pool.pool_tokens"]["kind"], "derived");
     assert_eq!(v["provenance"]["pool.pool_tokens"]["detail"], "非超卖:池 = 上下文");
-    assert_eq!(v["intent"]["profile"], "awq27b-3090-max");
+    assert_eq!(
+        v["intent"]["profile"],
+        profile("awq27b-3090-max").to_str().expect("路径")
+    );
 }
 
 #[test]
 fn explain_prints_origin_and_rule() {
     let site = repo("testdata/args/base.toml");
     let out = run(&[
-        "--profile",
-        "awq27b-3090-max",
+        "-p",
+        profile("awq27b-3090-max").to_str().expect("路径"),
         "--site",
         site.to_str().expect("路径"),
         "--explain",
@@ -105,8 +116,8 @@ fn explain_prints_origin_and_rule() {
 fn set_overrides_derived_value() {
     let site = repo("testdata/args/base.toml");
     let out = run(&[
-        "--profile",
-        "awq27b-3090-max",
+        "-p",
+        profile("awq27b-3090-max").to_str().expect("路径"),
         "--site",
         site.to_str().expect("路径"),
         "--set",
@@ -120,9 +131,15 @@ fn set_overrides_derived_value() {
 }
 
 #[test]
-fn legacy_flavor_still_works() {
+fn legacy_profile_still_works() {
     let site = repo("testdata/args/base.toml");
-    let out = run(&["--flavor", "awq27b", "--site", site.to_str().expect("路径"), "--check"]);
+    let out = run(&[
+        "-p",
+        legacy("awq27b").to_str().expect("路径"),
+        "--site",
+        site.to_str().expect("路径"),
+        "--check",
+    ]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("无 [intent]"), "旧档应走兼容分支:\n{s}");
@@ -131,11 +148,16 @@ fn legacy_flavor_still_works() {
 
 #[test]
 fn check_without_site_fails_loudly_with_report() {
-    let out = run(&["--profile", "awq27b-3090-max", "--check"]);
+    // 常用档现在是自包含的(带 model.dir);用历史档验证"缺站点资产"的响亮拒。
+    let out = run(&[
+        "-p",
+        legacy("spec-dflash").to_str().expect("路径"),
+        "--check",
+    ]);
     assert!(!out.status.success(), "缺站点档应失败(27B 无缺省资产)");
     let s = String::from_utf8_lossy(&out.stdout);
     // 报告仍打印(内存账在前),FAIL 行点名病因,末尾不是 OK
-    assert!(s.contains("max_seq=131072"), "报告应保留派生结果:\n{s}");
+    assert!(s.contains("max_seq="), "报告应保留派生结果:\n{s}");
     assert!(s.contains("[check] FAIL: 未配置 [model].dir"), "{s}");
     assert!(s.contains("未通过"), "{s}");
     assert!(!s.contains("[check] OK"), "不应给假绿:\n{s}");

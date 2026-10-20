@@ -50,6 +50,7 @@ pub mod f16c;
 pub mod formats;
 pub mod interpreters;
 pub mod kernel;
+pub mod kernel_env;
 pub mod layers;
 pub mod model;
 pub mod module;

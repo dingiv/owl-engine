@@ -56,7 +56,7 @@ pub use disk::{
 };
 pub use disk_index::ChainIndex;
 pub use error::{StoreError, StoreResult};
-pub use host::{HostBlock, HostTier};
+pub use host::{HostBlock, HostTier, SlotTable};
 pub use moves::{bytes_of, download_span, offload_to_host, onload_from_host, upload_span};
 pub use budget::{check_admission, Admission, AdmissionVerdict, BudgetInputs, TurnFloor, VramBudget};
 pub use id::{ChainHash, PrefixId, SnapKey, TOKENS_PER_BLOCK};

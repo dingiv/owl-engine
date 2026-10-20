@@ -4,12 +4,14 @@
 //! `client::cublas::parse_gemm` 的解析断言。现在**唯一真源 = 本表**
 //! (槽序由 `PARAMS` 派生),server 侧 `check` 同时校验发射端。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
 
 /// `cublas_gemm_f16` —— f16 GEMM(lm_head / 非量化线性层)
 pub struct CublasGemmF16;
 
+#[kernel_tags("dom.cublas", "role.gemm")]
 impl KernelSpec for CublasGemmF16 {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::cublas::GEMM_F16);
@@ -36,6 +38,7 @@ impl KernelSpec for CublasGemmF16 {
 /// `cublas_gemm_bf16` —— BF16 GEMM(DFlash2 草稿投影)
 pub struct CublasGemmBf16;
 
+#[kernel_tags("dom.cublas", "role.gemm")]
 impl KernelSpec for CublasGemmBf16 {
     /// 执行家族(声明驱动路由;见 `KernelSpec::FAMILY`)
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::cublas::GEMM_F16);
@@ -58,6 +61,7 @@ impl KernelSpec for CublasGemmBf16 {
 /// `cublas_gemm_f16_dst` —— **写列窗** f16 GEMM(W-2d;GGUF dequant+cuBLAS 臂)
 pub struct CublasGemmF16Dst;
 
+#[kernel_tags("dom.cublas", "role.gemm")]
 impl KernelSpec for CublasGemmF16Dst {
     const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::cublas::GEMM_F16);
     const ENTRY: &'static str = crate::family::cublas::GEMM_F16_DST;
@@ -83,8 +87,6 @@ pub static GEMM_F16: KernelMeta = meta_of::<CublasGemmF16>();
 pub static GEMM_F16_DST: KernelMeta = meta_of::<CublasGemmF16Dst>();
 pub static GEMM_BF16: KernelMeta = meta_of::<CublasGemmBf16>();
 
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[&GEMM_F16, &GEMM_BF16, &GEMM_F16_DST];
 
 #[cfg(test)]
 mod tests {

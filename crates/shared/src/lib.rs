@@ -23,7 +23,7 @@
 
 pub use owl_iface::signal;
 
-pub mod flavors;
+pub mod profiles;
 pub mod config;
 pub mod device;
 pub mod env_reader;

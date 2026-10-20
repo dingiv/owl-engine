@@ -199,6 +199,8 @@ pub struct TpEngine<D: DeviceClient> {
     cfg: EngineConfig,
     /// rank0 的 boot 显存快照(host 侧单份 ⇒ `into_running` 的预算装配用它)
     boot: crate::engine::BootVram,
+    /// 池前两 rank 合计 live 摊回单卡的权重/杂项字节(`into_running` 准入账)
+    weights_per_card: u64,
 }
 
 impl<D: DeviceClient + 'static> TpEngine<D> {
@@ -225,8 +227,10 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         // boot 快照(host 单份;`into_running` 的预算装配用它)
         let boot = engines[0].boot_vram();
         let mut it = engines.into_iter();
-        let (face0, mut cfg, cell0) = it.next().expect("world = 2 已守门").into_parts();
-        let (face1, _cfg1, cell1) = it.next().expect("world = 2 已守门").into_parts();
+        let (face0, mut cfg, cell0, _boot0) =
+            it.next().expect("world = 2 已守门").into_parts();
+        let (face1, _cfg1, cell1, _boot1) =
+            it.next().expect("world = 2 已守门").into_parts();
         // **合流自证**(可判):rank1 自己的那个单元在装配期**必须为空** ——
         // 非空就说明 rank1 在接管之前已经记过账(事件落进了没人读的孤儿账)。
         //
@@ -307,13 +311,34 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         init_staging_header(&mut face1, staging1.own(), staging1.layout, "tp.hdr.r1").await?;
         let ctx0 = staging0.ctx(plan0);
         let ctx1 = staging1.ctx(plan1);
+        // **池前 live 基线**(两 rank 共用;权重/杂项已就位,池未分配)。
+        // 这是治理器与准入账的唯一口径:消除"rank1 看到 rank0 池"的顺序相关。
+        let world_u64 = world.max(1) as u64;
+        let live_before_pool = owl_shared::vram::live_bytes();
+        let baseline_per_card = live_before_pool / world_u64;
+        let weights_per_card =
+            live_before_pool.saturating_sub(boot.live_at_new()) / world_u64;
         // ── 两 rank **顺序**装配(**零协调**)────────────────────────────
         // 装配期的 AR 已被 `eval_current_dry` 从 warmup/干跑里摘掉 ⇒ 每 rank
         // 独立完成,无需对端在场(确定性分片协议的"零协调"落实到装配面)。
-        let dev0 = boot_rank(face0, &mut cfg, rm0, Some(ctx0), std::time::Instant::now())
+        let dev0 = boot_rank(
+            face0,
+            &mut cfg,
+            rm0,
+            Some(ctx0),
+            baseline_per_card,
+            std::time::Instant::now(),
+        )
             .await
             .map_err(|e| ModelError::Msg(format!("TP rank0 装配失败:{e}")))?;
-        let dev1 = boot_rank(face1, &mut cfg, rm1, Some(ctx1), std::time::Instant::now())
+        let dev1 = boot_rank(
+            face1,
+            &mut cfg,
+            rm1,
+            Some(ctx1),
+            baseline_per_card,
+            std::time::Instant::now(),
+        )
             .await
             .map_err(|e| ModelError::Msg(format!("TP rank1 装配失败:{e}")))?;
         // ── 装配后自证:warmup 的 AR 已**对称配对**(produced == consumed、err = 0)──
@@ -348,7 +373,14 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
             TpRank { plan: plan0, staging: staging0, dev: dev0 },
             TpRank { plan: plan1, staging: staging1, dev: dev1 },
         ];
-        Ok(Self { ranks, tokenizer: tokenizer.expect("rank0 必在"), cfg, boot, ledger: cell0 })
+        Ok(Self {
+            ranks,
+            tokenizer: tokenizer.expect("rank0 必在"),
+            cfg,
+            boot,
+            weights_per_card,
+            ledger: cell0,
+        })
     }
 
     /// **进执行态**(S4 ⑤-K3):rank0 束 = 主设备面,rank1 束 = `peer`
@@ -358,7 +390,15 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         let mut it = self.ranks.into_iter();
         let r0 = it.next().ok_or_else(|| ModelError::Msg("TP run: rank0 缺".into()))?;
         let r1 = it.next().ok_or_else(|| ModelError::Msg("TP run: rank1 缺".into()))?;
-        crate::engine::into_running(self.cfg, self.tokenizer, boot, r0.dev, Some(r1.dev), self.ledger)
+        crate::engine::into_running(
+            self.cfg,
+            self.tokenizer,
+            boot,
+            r0.dev,
+            Some(r1.dev),
+            self.ledger,
+            self.weights_per_card,
+        )
     }
 
     /// rank 数(= world;v1 恒 2)
@@ -465,8 +505,9 @@ impl TpEngine<GpuClient> {
         );
         // ── ② staging 对称握手(**建图之前**)───────────────────────────
         let mut it = engines.into_iter();
-        let (face0, cfg, cell0) = it.next().expect("world = 2 已守门").into_parts();
-        let (mut face1, _cfg1, _cell1) = it.next().expect("world = 2 已守门").into_parts();
+        let (face0, cfg, cell0, boot0) = it.next().expect("world = 2 已守门").into_parts();
+        let (mut face1, _cfg1, _cell1, _boot1) =
+            it.next().expect("world = 2 已守门").into_parts();
         let mut face0 = face0;
         // **事件账合流(TP 纪律)**:两 rank 写**同一本**账(单卡档 = 同一本;
         // 分卡靠事件里的 `rank` 维,不靠两本账)。
@@ -491,9 +532,9 @@ impl TpEngine<GpuClient> {
             handshake_staging(&mut face0, &mut face1, &caps0.uuid, &caps1.uuid, layout, opts).await?;
         // ── ③ 通用装配(每 rank boot_rank;图捕获在此发生)──────────────
         let engines = vec![
-            Engine::from_handle(cfg.clone(), face0, cell0.clone())
+            Engine::from_handle(cfg.clone(), face0, cell0.clone(), boot0)
                 .map_err(|e| ModelError::Msg(format!("TP 重装 rank0 引擎壳失败:{e}")))?,
-            Engine::from_handle(cfg.clone(), face1, cell0.clone())
+            Engine::from_handle(cfg.clone(), face1, cell0.clone(), boot0)
                 .map_err(|e| ModelError::Msg(format!("TP 重装 rank1 引擎壳失败:{e}")))?,
         ];
         Self::assemble_with_staging(engines, loadeds, staging0, staging1)
@@ -543,8 +584,9 @@ impl TpEngine<GpuClient> {
             owl_cuda::comm::ar::HEADER_BYTES,
         );
         let mut it = engines.into_iter();
-        let (face0, cfg, cell0) = it.next().expect("world = 2 已守门").into_parts();
-        let (mut face1, _cfg1, _cell1) = it.next().expect("world = 2 已守门").into_parts();
+        let (face0, cfg, cell0, boot0) = it.next().expect("world = 2 已守门").into_parts();
+        let (mut face1, _cfg1, _cell1, _boot1) =
+            it.next().expect("world = 2 已守门").into_parts();
         let mut face0 = face0;
         face1.set_dev_rank(1);
         face1
@@ -560,9 +602,9 @@ impl TpEngine<GpuClient> {
             handshake_staging(&mut face0, &mut face1, &uuid, &uuid, layout, TpOpts::default())
                 .await?;
         let engines = vec![
-            Engine::from_handle(cfg.clone(), face0, cell0.clone())
+            Engine::from_handle(cfg.clone(), face0, cell0.clone(), boot0)
                 .map_err(|e| ModelError::Msg(format!("同卡档重装 rank0 引擎壳失败:{e}")))?,
-            Engine::from_handle(cfg.clone(), face1, cell0.clone())
+            Engine::from_handle(cfg.clone(), face1, cell0.clone(), boot0)
                 .map_err(|e| ModelError::Msg(format!("同卡档重装 rank1 引擎壳失败:{e}")))?,
         ];
         Self::assemble_with_staging(engines, loadeds, staging0, staging1)

@@ -44,7 +44,7 @@ async fn engine_offload(
         let p = plan_offload(leg, tail)?; // 纯 host(算片 + 借台);Busy = 零副作用
         (p.blocks, p.pieces, p.table)
     };
-    let conn = match face.swap(SwapDir::Out, &pieces, Box::new(table)).await {
+    let conn = match face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await {
         Ok(c) => c,
         Err(e) => {
             owl_store::abort_offload(leg, &blocks); // 内容已丢 ⇒ 条目一并删
@@ -65,7 +65,7 @@ async fn engine_onload(
         let p = plan_onload(leg, chains)?; // 纯 host(取内容 + 分配槽 + 组片)
         (p.chains, p.slots, p.pieces, p.table)
     };
-    let conn = match face.swap(SwapDir::In, &pieces, Box::new(table)).await {
+    let conn = match face.swap(SwapDir::In, &pieces[0], Box::new(table)).await {
         Ok(c) => c,
         Err(e) => {
             owl_store::abort_onload(leg, &cs, &slots); // 槽归还 + 条目删
@@ -262,7 +262,7 @@ async fn engine_offload_blocks(
     if blocks.is_empty() {
         return Ok((0, skipped.len()));
     }
-    let conn = match face.swap(SwapDir::Out, &pieces, Box::new(table)).await {
+    let conn = match face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await {
         Ok(c) => c,
         Err(e) => {
             owl_store::abort_offload(leg, &blocks);

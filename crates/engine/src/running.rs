@@ -163,6 +163,9 @@ pub struct RunningEngine<D: DeviceClient> {    /// 步级探针(boot 解析;不�
     pub(crate) turns: TurnLedger,
     /// H5 空转整理节拍(空转 pump 计数;每 `IDLE_HK_EVERY` 拍整理一次)
     pub(crate) idle_pumps: u64,
+    /// **默认池缓存回收的节拍**(§23.9:turn 收尾之后才 free 的页要在空转期再清一次;
+    /// 每 `IDLE_TRIM_EVERY` 一次,失败只 WARN 不打断空转)。
+    pub(crate) last_trim: Option<std::time::Instant>,
     /// N6/保洁 deny 的**累计**次数(限流日志用:首条 + 每 64 条打一次;
     /// 计数本身**不丢** —— 机读面 = `store.degrade` metrics)
     pub(crate) degrade_seen: u64,
@@ -702,6 +705,28 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         }
         let prompt = prompt.into();
+        // **VLM 输入门**(2026-10-20 视觉接线 V5):单图、非合批;图像 × 投机
+        // 已接(verify 的 rope pos 加 m-RoPE delta,slots/lens 仍用真实位置)。
+        // 图像路径的塔/表/prefill 见 execute_prefill;这里只做提交边界拒。
+        if !opts.images.is_empty() {
+            if self.dev.vlm.is_none() {
+                return Err(ModelError::Msg(
+                    "submit: 请求带图,但本档 [model].vision != true(引擎无视觉塔)".into(),
+                ));
+            }
+            if self.cfg.knobs.max_batch > 1 {
+                return Err(ModelError::Msg(
+                    "submit: VLM 图像首版不支持合批(max_batch > 1)".into(),
+                ));
+            }
+
+            if opts.images.len() != 1 {
+                return Err(ModelError::Msg(format!(
+                    "submit: 图像首版只支持单图(来 {} 张)",
+                    opts.images.len()
+                )));
+            }
+        }
         let prompt_ids = {
             // 诊断开关(knobs.raw_completion):裸续写,绕过 chat 模板 ——
             // 模型健康度鉴别(模板态病 vs 权重病)的 A/B 臂
@@ -992,6 +1017,10 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 走 `EngineKnobs` 显式配置字段。
     const IDLE_HK_EVERY: u64 = 16;
 
+    /// 空转期池缓存回收的最小间隔(空转 pump 很密;500ms 足够让 turn 收尾的
+    /// 大额临时块真正 free 之后再清一次)。
+    const IDLE_TRIM_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
     /// **统一节点入口**(store 立案 §三.A / §五.2;步 4 收编)。
     ///
     /// 纪律:节点只做三件事 —— ①按节点算需求 ②`store.plan` 取计划 ③`apply_verdict`
@@ -1038,6 +1067,30 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // `vram-hard-budget`。这里把 `Turn(t)` 名下"仍开着、不在池里"的块
                 // **强制归还驱动**(决策在 store `stale_of`,执行在句柄)。
                 self.n4_force_release(turn).await?;
+                // **池缓存回收**(2026-10-20 §23.9):`RELEASE_THRESHOLD=∞` ⇒ turn 内
+                // 的峰值缓存**永不**还 OS(peer 侧实测 3.3 GiB 长期挂着,长 prefill
+                // 因此提前撞 `vram-hard-budget`)。turn 收尾清一次:块账不变,
+                // 只把"已 free 的缓存页"还给驱动。
+                let freed = self.trim_pools().await;
+                // 让**紧随其后的 Idle 出口**再清一次:turn 收尾路径里还有一批
+                // 大额临时块是在 TurnEnd 之后才 free 的(实测 peer 3.0 GiB)。
+                self.last_trim = None;
+                for (rank, r) in freed {
+                    match r {
+                        Ok(0) => {}
+                        Ok(n) => owl_shared::log_info!(
+                            "store",
+                            "池缓存回收:turn {turn} rank{rank} 释放 {:.1} MiB(已 free 的池页还给驱动)",
+                            n as f64 / 1048576.0
+                        ),
+                        // 收尾路径的可失败调用:如实 WARN(不静默;也不升级为 turn 失败 ——
+                        // 显存多占一点不影响正确性,下一 turn 的压力旁路还会再试)
+                        Err(e) => owl_shared::log_warn!(
+                            "store",
+                            "池缓存回收失败(turn {turn} rank{rank}): {e}"
+                        ),
+                    }
+                }
                 Ok(())
             }
             // N5:会话关闭 —— 链已由会话表归还(store API),本节点只记账/归属复位
@@ -1109,6 +1162,68 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 判据:三者非零 = 有事件没入账 / 有窗未收 —— **可见**比"账看起来平"更重要。
     pub fn handle_probe(&self) -> (u64, u64, usize) {
         self.dev.graphs.dev_ctx_face().ledger_probe()
+    }
+
+    /// **默认池账(逐 rank;2026-10-20 §23.9)**:`/debug/vram` 的 `pools` 行。
+    ///
+    /// 为什么要它:`RELEASE_THRESHOLD=∞` 下**已 free 的块仍占物理显存**(池缓存);
+    /// 块账只见 live ⇒ "物理 − live" 这部分在双 rank 上只长在 peer 一侧
+    /// (实测 +3.3 GiB),不读数就只能瞎猜。
+    pub async fn pool_probe(
+        &mut self,
+    ) -> Vec<(u8, std::result::Result<(u64, u64, u64, u64), String>)> {
+        let mut out: Vec<(u8, std::result::Result<(u64, u64, u64, u64), String>)> = Vec::new();
+        let r = self
+            .dev
+            .graphs
+            .session
+            .face_mut()
+            .mem_pool_stats()
+            .await
+            .map_err(|e| e.to_string());
+        out.push((0, r));
+        if let Some(p) = self.peer.as_mut() {
+            let r = p
+                .graphs
+                .session
+                .face_mut()
+                .mem_pool_stats()
+                .await
+                .map_err(|e| e.to_string());
+            out.push((1, r));
+        }
+        out
+    }
+
+    /// **默认池缓存回收(逐 rank)** —— turn 收尾 / 压力旁路调。
+    ///
+    /// 语义:`cuMemPoolTrimTo(0)` 把池内**已 free 的缓存页**还给 OS(不改块账)。
+    /// 返回逐 rank 的 `(rank, Ok(释放字节)/Err(原因))` —— 失败**如实带出**
+    /// (调用方决定是否响亮;本函数不吞)。
+    pub async fn trim_pools(
+        &mut self,
+    ) -> Vec<(u8, std::result::Result<u64, String>)> {
+        let mut out: Vec<(u8, std::result::Result<u64, String>)> = Vec::new();
+        let r = self
+            .dev
+            .graphs
+            .session
+            .face_mut()
+            .mem_pool_trim()
+            .await
+            .map_err(|e| e.to_string());
+        out.push((0, r));
+        if let Some(p) = self.peer.as_mut() {
+            let r = p
+                .graphs
+                .session
+                .face_mut()
+                .mem_pool_trim()
+                .await
+                .map_err(|e| e.to_string());
+            out.push((1, r));
+        }
+        out
     }
 
     /// **块账房快照(逐 rank)**:`/debug/vram` 与事件账做**全等门**的右值。
@@ -1335,6 +1450,35 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///   显存已经回不来了 —— 这是硬错,不是可重试的软错);
     /// - 只碰 `Turn(t)` 归属 —— 图/池/会话各有归属,不会被误伤。
     async fn n4_force_release(&mut self, turn: u64) -> Result<()> {
+        let (n, bytes) = self.drain_turn_stale(turn, "turn_end").await?;
+        if n == 0 {
+            return Ok(());
+        }
+        owl_shared::log_info!(
+            "store",
+            "N4 兜底释放:turn {turn} {n} 块 / {} KiB 结清并归还驱动(逐 rank 归各自面)",
+            bytes / 1024
+        );
+        Ok(())
+    }
+
+    /// **提前释放(段边界)**:把 `Turn(t)` 名下**仍开着**的块逐 rank 结清。
+    ///
+    /// 为什么要有"提前"这一档(2026-10-20 用户裁决):turn 收尾才收口 = 长 prefill
+    /// 的残块在**整个 turn 内**累积(27B TP 实测 peer 每 chunk ≈94 MB,128k 就把
+    /// 12 GB 余量吃光)。客户端 `DeviceHandle` 是**唯一咽喉** —— 每次分配都进了
+    /// store 账(带 rank/owner),所以"该 chunk 的中间量已经死了"这件事客户端全知:
+    /// 在**下一个 chunk 起点**把上一 chunk 遗留的 `Turn(t)` 块结清即可。
+    ///
+    /// 判据(不动长命面):只碰 `Owner::Turn(t)` —— 权重/池/图/会话各有归属,
+    /// 且调用点保证此刻上一 chunk 的前向已全部入队(同流 free 保序)。
+    ///
+    /// 返回 `(块数, 字节)`。
+    pub(crate) async fn drain_turn_stale(
+        &mut self,
+        turn: u64,
+        tag: &'static str,
+    ) -> Result<(usize, usize)> {
         let owner = owl_iface::handle::Owner::Turn(turn);
         // **逐 rank 分账**:两 rank 共用一本账,但块在**各自的 server** 块表里 ——
         // 把 rank1 的 id 交给 rank0 的 server = 找不到 ⇒ 静默漏(实测 434/1010)。
@@ -1371,19 +1515,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             total.1 += bytes;
         }
         if total.0 == 0 {
-            return Ok(());
+            return Ok((0, 0));
         }
         owl_shared::metrics::with_metrics_store(|m| {
-            m.counter_add("store.turn_end.stale_blocks", total.0 as u64, file!(), line!());
-            m.counter_add("store.turn_end.stale_bytes", total.1 as u64, file!(), line!());
+            m.counter_add(&format!("store.{tag}.stale_blocks"), total.0 as u64, file!(), line!());
+            m.counter_add(&format!("store.{tag}.stale_bytes"), total.1 as u64, file!(), line!());
         });
-        owl_shared::log_info!(
-            "store",
-            "N4 兜底释放:turn {turn} {} 块 / {} KiB 结清并归还驱动(逐 rank 归各自面)",
-            total.0,
-            total.1 / 1024
-        );
-        Ok(())
+        Ok(total)
     }
 
     /// **store 报告面**(设计卷 §2.4 / §13.4 对账口):三层 + 两腿 +
@@ -1842,6 +1980,76 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(true)
     }
 
+    /// **宿主腿一条 swap 落到每个 rank**(2026-10-20;双卡 KVMem 立案 §23.8)。
+    ///
+    /// `pieces[p]` = store 用**第 p 个 rank 自己的块 id** 组的片(两侧池句柄是两套,
+    /// 不能靠偏移平移);宿主槽 = `world` 个平面,偏移由 store 的 `out/in_pieces`
+    /// 按 `plane × 单页字节` 落好。
+    /// 槽台 = **一次借台**,两条命令之间原箱传递 ⇒ 一次落账、一条链一份预算。
+    /// 单卡(`world = 1`)= 与历史逐字相同。
+    pub(crate) async fn swap_all_ranks(
+        &mut self,
+        dir: owl_iface::contract::SwapDir,
+        pieces: &[Vec<owl_iface::contract::SwapPiece>],
+        table: owl_store::SlotTable,
+    ) -> Result<owl_store::SlotTable> {
+        let world = self.bank.rel.world().max(1);
+        if pieces.len() != world {
+            return Err(owl_iface::contract::ModelError::EngineInvariant {
+                what: format!(
+                    "宿主腿 swap({dir:?}): 片组数 {} ≠ world {world}(store 组片与装配不一致)",
+                    pieces.len()
+                ),
+            });
+        }
+        let mut table = table;
+        for p in 0..world {
+            let pcs = &pieces[p];
+            let conn = match p {
+                0 => {
+                    self.dev
+                        .graphs
+                        .session
+                        .face_mut()
+                        .swap(dir, pcs, Box::new(table))
+                        .await
+                }
+                _ => match self.peer.as_mut() {
+                    Some(pr) => pr.graphs.session.face_mut().swap(dir, pcs, Box::new(table)).await,
+                    None => {
+                        return Err(owl_iface::contract::ModelError::EngineInvariant {
+                            what: format!(
+                                "宿主腿 swap({dir:?}): world = {world} 但 peer 束缺席(装配不一致)"
+                            ),
+                        })
+                    }
+                },
+            };
+            let conn = conn.map_err(|e| {
+                owl_iface::contract::ModelError::Msg(format!(
+                    "宿主腿 swap({dir:?}) rank{p} 失败(engine 编排): {e}"
+                ))
+            })?;
+            table = owl_store::reclaim_slot_table(conn)?;
+        }
+        Ok(table)
+    }
+
+    /// **视图页表写两 rank**(TP;槽号两侧一致 ⇒ 同一份页表)。
+    ///
+    /// 只写 rank0 的后果(实测):peer 的 attention 读捕获期旧视图 ⇒ ~8k 起输出退化。
+    pub(crate) async fn write_select_view_all(&mut self, pages: &[u32]) -> Result<()> {
+        {
+            let face = self.dev.graphs.session.face_mut();
+            self.dev.pool.write_select_view(face, pages).await?;
+        }
+        if let Some(pr) = self.peer.as_mut() {
+            let face = pr.graphs.session.face_mut();
+            pr.pool.write_select_view(face, pages).await?;
+        }
+        Ok(())
+    }
+
     /// **决策单执行**(§21 裁决:**搬运由 engine 编排**;store 只出计划与记账)。
     ///
     /// 逐条:取计划(纯 host)→ **engine 自己发 `face.swap`** → 回执取台 → 记账。
@@ -1869,20 +2077,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 Err(e) => return Err(e.into()),
                             }
                         };
-                        let face = self.dev.graphs.session.face_mut();
-                        let conn = match face
-                            .swap(owl_iface::contract::SwapDir::Out, &pieces, Box::new(table))
+                        let table = match self
+                            .swap_all_ranks(owl_iface::contract::SwapDir::Out, &pieces, table)
                             .await
                         {
-                            Ok(c) => c,
+                            Ok(t) => t,
                             Err(e) => {
                                 owl_store::abort_offload(&mut self.bank.rel.leg, &blocks);
-                                return Err(owl_iface::contract::ModelError::Msg(format!(
-                                    "换出 swap 失败(engine 编排):{e}"
-                                )));
+                                return Err(e);
                             }
                         };
-                        let table = owl_store::reclaim_slot_table(conn)?;
                         a.offloaded +=
                             owl_store::commit_offload(&mut self.bank.rel.leg, &blocks, table)?;
                     }
@@ -1918,6 +2122,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                         };
                         self.snap_offload(*key, slot).await?;
                         self.dev.pool.snap_clear_slot(slot);
+                        if let Some(pr) = self.peer.as_mut() {
+                            pr.pool.snap_clear_slot(slot);
+                        }
                         a.snap_offloaded += 1;
                     }
                     Sink::Drop => {
@@ -1931,6 +2138,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                         }
                         if let Some(slot) = slot {
                             self.dev.pool.snap_clear_slot(slot);
+                            if let Some(pr) = self.peer.as_mut() {
+                                pr.pool.snap_clear_slot(slot);
+                            }
                         }
                         a.snap_dropped += 1;
                     }
@@ -1954,20 +2164,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                     Err(e) => return Err(e.into()),
                 }
             };
-            let face = self.dev.graphs.session.face_mut();
-            let conn = match face
-                .swap(owl_iface::contract::SwapDir::In, &pieces, Box::new(table))
+            let table = match self
+                .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, table)
                 .await
             {
-                Ok(c) => c,
+                Ok(t) => t,
                 Err(e) => {
                     owl_store::abort_onload(&mut self.bank.rel.leg, &cs, &slots);
-                    return Err(owl_iface::contract::ModelError::Msg(format!(
-                        "回灌 swap 失败(engine 编排):{e}"
-                    )));
+                    return Err(e);
                 }
             };
-            let table = owl_store::reclaim_slot_table(conn)?;
             let _ = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &slots, table)?;
             self.stage.blocks += cs.len();
             self.stage.bytes += cs.len() * self.dev.pool.block_bytes();
@@ -2146,6 +2352,50 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // **[H5 Idle]**(步 4 入档):空转期每 N 拍做一次整理(冷面下沉/清池),
                 // 决策仍全在 store(`NeedWhy::Idle` = 零缺口也搬);无活跃 turn ⇒
                 // 只动缓存面,绝不碰活跃面。
+                // **池缓存回收(空转出口;§23.9)**:server 的泵循环 `Idle` 即断,
+                // `Node::Idle`(每 16 拍)到不了 ⇒ 在这里按时间节流清一次。
+                // `RELEASE_THRESHOLD=∞` 下 turn 收尾后 free 的 GB 级临时块
+                // 不主动还驱动就永远占着(实测 peer 侧 3.0 GiB)。
+                let due = self
+                    .last_trim
+                    .is_none_or(|t| t.elapsed() >= Self::IDLE_TRIM_EVERY);
+                if due {
+                    self.last_trim = Some(std::time::Instant::now());
+                    // 先排空再清:异步 free 要等流上事件落地才进池的"空闲页"表
+                    for (rank, r) in [
+                        (0u8, self.dev.graphs.session.face_mut().sync().await),
+                        match self.peer.as_mut() {
+                            Some(p) => (1u8, p.graphs.session.face_mut().sync().await),
+                            None => (1u8, Ok(())),
+                        },
+                    ] {
+                        if let Err(e) = r {
+                            owl_shared::log_warn!("store", "空转排空失败(rank{rank}): {e}");
+                        }
+                    }
+                    let freed = self.trim_pools().await;
+                    let total: u64 =
+                        freed.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
+                    if total > 0 {
+                        owl_shared::log_info!(
+                            "store",
+                            "空转池缓存回收 {:.1} MiB(逐 rank: {:?})",
+                            total as f64 / 1048576.0,
+                            freed
+                                .iter()
+                                .map(|(r, x)| (*r, x.as_ref().map(|n| n >> 20).unwrap_or(0)))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    for (rank, r) in freed {
+                        if let Err(e) = r {
+                            owl_shared::log_warn!(
+                                "store",
+                                "空转池缓存回收失败(rank{rank}): {e}"
+                            );
+                        }
+                    }
+                }
                 if let Some(k) = self.idle_tick() {
                     self.node(Node::Idle(k)).await?;
                 }

@@ -9,7 +9,7 @@
 #
 # 起机:
 #   CUDA_VISIBLE_DEVICES=GPU-<3090Ti 的 UUID> \
-#     target/release/server --flavor gguf27b <用户档.toml>
+#     target/release/server -p profiles/legacy/gguf27b.toml <用户档.toml>
 #   # 用户档只写 [model] dir/name + [runtime] device/bind 即可
 #
 # 测速(统一口径 = 工作区 `llm_speedtest`,与 vLLM / sglang / llama.cpp 可比):
@@ -25,12 +25,8 @@
 #   ⇒ prefill 领先 llama.cpp **+40%**;decode 落后它 12%(当前优化对象)
 #
 # ── 口径与纪律 ──────────────────────────────────────────────────────────
-# · 本档**不设** `[dispatch] allowed_ops` 白名单(门关):白名单要按**发射账并集**
-#   生成(方法见 `flavors/gguf4b.toml` 的 [dispatch] 注释),而 27B 的臂集与 4B
-#   不同(prefill 走 FI hd256 k/v 变体 + decode v2 hd256 族,GDN 层数 ×2)。
-#   硬化时按同流程收账 → 入 `owl_kernels::ops::PROD_GGUF27B_2026_10_19`
-#   + `apps/server/tests/ops_whitelist.rs` 的两处锁(教训:新 flavor 不进那两个门
-#   = 白名单**没被审计**)。
+# · `allowed_ops` 已退役(2026-10-20):准入由配置派生 tag filter 自动完成
+#   (`quant.gguf` + `kv.main.*` + feature facets);不再手抄核名清单。
 # · `prefill_chunk` 维持 **1024**(历史生产口径;改它 = 换测速靶位)。阶梯实测
 #   (仅换本旋钮):1024/964 · 2048/1020 · 4096/1059 · 8192/1067 —— 收益来自
 #   "每 chunk 解一遍 17.7 GB 权重"被摊薄;**要抬它须与 prefill 桶阶梯成对**

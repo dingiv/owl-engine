@@ -249,6 +249,15 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             let mut env = inp.base_env;
             env.kv.head_dim = g.hd;
             env.kv.grp = g.grp();
+            // **草稿池的存储真值**:主池 fp8 不代表草稿池 fp8。草稿池
+            // 默认 BF16;`draft_kv_fp8` 才切 e4m3。env 必须跟着走,
+            // 否则 KernelSelectionEnv 会把主池的 fp8 误报给草稿 picker。
+            env.kv.quant = if inp.draft_kv_fp8 {
+                owl_models::env::KvQuant::Fp8E4M3
+            } else {
+                owl_models::env::KvQuant::None
+            };
+            env.kv.dtype = draft_dt;
             (Some((g.layers, g.hkv, g.hd)), env)
         }
         _ => (None, inp.base_env),

@@ -1,0 +1,52 @@
+# owl 意图档 `tp27b-3080-184k`(2×3080 20G / TP2 / 27B + **视觉塔** + **DFlash2 d7**)
+#
+# ✅ 2026-10-20 视觉接线 V1–V5 已通:视觉塔 + TP2 图像 prefill + OpenAI
+#    `image_url`(data URL)+ **图像 × DFlash2 d7**。verify 的 rope 位置
+#    走 `pos + m-RoPE delta`,KV slots/lens 仍用真实 token 位置;带图为
+#    单图/非合批。真机:鸟/猫两图 spec-on 与 spec-off 的 128-token
+#    reasoning 逐字一致(见 docs/arch/vision-引擎与服务面-接线-设计与施工.md)。
+#
+# 账本:TP2 两 rank 共用池前 live 基线,`[vram-gov]` cap 不再按顺序分裂;
+#   非超卖池 = 184,320;真实 free ~2.4G/卡。主分支 N4 泄漏修复已在基线
+#   (4×12.5k prompt 压测 free 稳定);满 184K + draft 的瞬态余量仍薄,
+#   压测前建议降 174,080。短/中上下文实测正常。
+#
+# 卡位已写本档(本机 CUDA 序 [2, 3]);换机器请改 runtime.tp_ordinals。
+#   server -p profiles/tp27b-3080-184k.toml --check
+[intent]
+model       = "qwen3.8-27b-awq"
+hardware    = "3080-20g"
+goal        = "max-context"
+context     = 184320          # 与 vLLM qwen38_3080 同档(173K~184K)
+concurrency = 1
+spec        = "dflash"
+kv          = "fp8"
+kvmem       = "off"
+graphs      = "auto"          # TP2:自动降级为 eager/piecewise(无 FI 图)
+reuse       = "off"
+
+[runtime]
+bind = "127.0.0.1:8138"
+tp_ordinals = [2, 3]
+# TP2 无 prefill 桶;大块摊薄宿主税
+prefill_chunk = 1024
+prefill_tail_merge = 0
+
+[model]
+name = "qwen3.8-27b"
+dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+# 视觉塔装载(model.visual.*);文本主干与引擎共享同一份 Arc
+vision = true
+
+[pool]
+# spec 要快照(depth 7 回滚);reuse=off 的 snap_max=0 在此覆写
+snap_max = 1
+
+[spec]
+# P2.1 草稿双 rank 的显式闸门(tp.rs 缺省仍拒)
+tp_draft = true
+depth = 7
+
+[sampling]
+mode = "greedy"

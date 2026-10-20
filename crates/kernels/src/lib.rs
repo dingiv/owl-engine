@@ -23,6 +23,12 @@ pub mod cu_sig;
 /// 生产算子元数据表(P3;`impl KernelSpec` 声明,按域分模块)
 pub mod ops;
 
+/// tag → 算子倒排索引(2026-10-20;运行时显式构造,无全局)
+pub mod tag_index;
+
+/// 配置派生的选核 tag 过滤器(互斥 facet;无显式 allow_tags)
+pub mod tag_filter;
+
 /// 算子准入契约(单算子声明式元数据:参数表/形状族/池访问/数值律 +
 /// 编译期擦除 KernelMeta;2026-10-13 P3,**零 feature 门** —— models 经
 /// driver 的 KernelPick 消费同一份元数据,不需要 device 面)

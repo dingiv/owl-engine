@@ -19,9 +19,10 @@
 //! # 每个算子一个**命名 static**(单一提升点)
 //!
 //! 域文件里 `pub static X: KernelMeta = meta_of::<T>();` 是唯一的提升点:
-//! 域表(`ops::<域>::METAS`)与族表(`KernelFamily::ops()`)都引用同一个
-//! `&X` —— 若两处各自 `&meta_of::<T>()`,就会得到**两份不同的 KernelMeta**
-//! (内容相同、地址不同),"元数据同一性"比较随之失效。
+//! build.rs 扫描这些 static 生成总表(`ops_table.rs`),族表
+//! (`KernelFamily::ops()`)也引用同一个 `&X` —— 若两处各自
+//! `&meta_of::<T>()`,就会得到**两份不同的 KernelMeta**(内容相同、地址不同),
+//! "元数据同一性"比较随之失效。
 //!
 //! # 建表纪律
 //!
@@ -53,25 +54,10 @@ pub mod oracles;
 pub mod vis;
 pub mod xqa;
 
-/// 域表清单(每项 = 一个域的全部已建表算子;顺序 = 阅读序,无功能含义)
-pub static TABLES: &[&[&KernelMeta]] = &[
-    attn::METAS,
-    gdn::METAS,
-    gguf::METAS,
-    gdn_chunked::METAS,
-    gdn_scalar::METAS,
-    comm::METAS,
-    elems::METAS,
-    fused::METAS,
-    ln::METAS,
-    dflash::METAS,
-    load::METAS,
-    marlin::METAS,
-    cublas::METAS,
-    flashinfer::METAS,
-    xqa::METAS,
-    vis::METAS,
-];
+// 算子总表由构建期扫描 `pub static ... KernelMeta = meta_of::<T>();`
+// 生成(build.rs;2026-10-20)。手写 `TABLES` / 各域 `METAS` 已退役 ——
+// 宏生成的 impl 也在 static 提升点留下唯一一行,不会漏算子。
+include!(concat!(env!("OUT_DIR"), "/ops_table.rs"));
 
 /// 全部已建表算子(迭代序 = [`TABLES`] 序)
 pub fn all() -> impl Iterator<Item = &'static KernelMeta> {
@@ -265,8 +251,11 @@ pub fn audit_active(
 }
 
 // ============================================================================
-// 生产算子集(实测台账;`docs/arch/kernel-准入门槛-施工设计.md` §14.2)
+// 生产算子集(历史实测台账;`docs/arch/kernel-准入门槛-施工设计.md` §14.2)
 // ============================================================================
+//
+// **2026-10-20：运行时白名单已退役**——这些常量只保留为历史审计/回归证据；
+// 生产准入由配置派生的 `TagFilter` 完成，profile 不再手抄核名。
 //
 // 来源 = **真跑生产档 + `[cuda] launch_time` 逐发射记账**(不是代码阅读推断),
 // 2026-10-13 实测。用途三件:
@@ -275,7 +264,7 @@ pub fn audit_active(
 //   ② 池写集穷举审计的输入(`audit_active`);
 //   ③ P3 建表范围的依据(生产集 100% 建表 = 本表 ⊆ `all()`)。
 
-/// `--flavor spec-dflash` 实测发射集(**49 个**;27B AWQ + DFlash2 d7 + fp8 主池
+/// `-p profiles/legacy/spec-dflash.toml` 实测发射集(**49 个**;27B AWQ + DFlash2 d7 + fp8 主池
 /// + gdn_chunked + XQA verify/decode + int4 头;A5 后含 f16 主池族 4 项)
 ///
 /// **2026-10-14 A5 补丁**:追加 **f16 主池族**(4 个)。原先本集只锁 fp8 池
@@ -349,7 +338,7 @@ pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "vllm_reshape_and_cache_f16_knhd",
 ];
 
-/// `--flavor gguf4b` 实测发射集(30 个;GGUF 4B Q4_K_M 单卡,无投机/无 XQA)
+/// `-p profiles/legacy/gguf4b.toml` 实测发射集(30 个;GGUF 4B Q4_K_M 单卡,无投机/无 XQA)
 ///
 /// **来源 = 真实发射账**(不是手抄):`[cuda] trace_ring = 40000` 起机 →
 /// 依次打 11 / ~512 / ~1024 / ~2048 / ~4096 / ~8192 token 的请求 →
@@ -408,7 +397,7 @@ pub const PROD_GGUF4B_2026_10_19: &[&str] = &[
     "vllm_reshape_and_cache_f16_knhd",
 ];
 
-/// `--flavor awq27b` 实测发射集(27 个;裸 27B AWQ + fp8 主池,无草稿/XQA)
+/// `-p profiles/legacy/awq27b.toml` 实测发射集(27 个;裸 27B AWQ + fp8 主池,无草稿/XQA)
 pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
     "cublas_gemm_f16",
     "flashinfer_prefill_paged_fp8kv",
@@ -426,7 +415,7 @@ pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
     // 引擎态是 F16 ⇒ 装载期走**复合命令**(`UploadAndLaunch`,段复合)里的
     // bf16→f16 铸边界。**本表重启时缺它**,而 `launch_time` 记账只覆盖
     // `handle_launch`(复合口不进那条路径)⇒ "真跑 + 逐发射记账"的生成方法
-    // **系统性漏装载域算子**(现场:`--flavor awq27b` + 草稿档启动即被准入拒:
+    // **系统性漏装载域算子**(现场:`-p profiles/legacy/awq27b.toml` + 草稿档启动即被准入拒:
     // `Weight 'model.language_model.embed_tokens.weight': 段复合 contract
     // owl_cast_bf16_f16 … 未列入`)。
     "owl_cast_bf16_f16",
@@ -831,6 +820,8 @@ mod tests {
             (crate::family::marlin::GEMM_W4A16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
             (crate::family::cublas::GEMM_F16, &["a", "b", "out", "m", "k", "n", "nt"], &["F16x2", "F16x2", "F16x2", "U64", "U64", "U64", "U64"]),
             (crate::family::cublas::GEMM_BF16, &["a", "b", "out", "m", "k", "n", "nt"], &["BF16x2", "BF16x2", "BF16x2", "U64", "U64", "U64", "U64"]),
+            // 写列窗臂(W-2d;独立 PARSE_SLOTS_DST;此前漏登本锁)
+            (crate::family::cublas::GEMM_F16_DST, &["a", "b", "out", "m", "k", "n", "nt", "ldc", "off"], &["F16x2", "F16x2", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64"]),
             (crate::family::flashinfer::PREFILL_FI_FP8KV, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"], &["F16x2", "U32x1", "U32x1", "U32x1", "U32x1", "U32x1", "U32x1", "F16x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
             (crate::family::flashinfer::PREFILL_FI, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"], &["F16x2", "F16x5", "F16x4", "U32x1", "U32x1", "U32x1", "U32x1", "F16x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
             // 视觉塔注意力(ragged 非因果;2026-10-15):槽位与 native

@@ -225,12 +225,15 @@ pub struct OpRegistry {
     /// **名字 → 族下标**(boot 期一次建;`execute` 从"线性扫族×名"变 O(1),
     /// 2026-10-15 声明驱动路由)
     route: std::collections::HashMap<&'static str, usize>,
-    /// **名字 → 准入声明**(boot 期自 [`crate::ops::METAS`] 建一次;
+    /// **名字 → 准入声明**(boot 期自 [`crate::ops::TABLES`] 建一次;
     /// 发射期 check 走它 —— O(1),热路径零扫描)。
     ///
     /// ⚠️ 与 `names` **必须分离**:原生核有元数据但**不得**进 `names`
     /// (否则会被误分派到家族 `run`,原生 NVRTC 路径被截断)。
     metas: std::collections::HashMap<&'static str, &'static crate::spec::KernelMeta>,
+    /// **tag → 算子**倒排索引(boot 期从同一份 `ops::all()` 建;
+    /// 白名单派生/运维审计面用,发射热路径不查)。
+    tag_index: crate::tag_index::KernelTagIndex,
 }
 
 impl OpRegistry {
@@ -455,15 +458,46 @@ impl OpRegistry {
                 }
             }
             crate::ops::audit_active(Some(a))?;
-            eprintln!("[kernels] 生产白名单:{} 项生效(池写集审计通过)", a.len());
+            eprintln!("[kernels] tag 派生激活集:{} 项(池写集审计通过)", a.len());
         }
 
-        Ok(Self { families, names, route, metas })
+        // **tag 索引**(同一份声明面;未打 tag/未知 tag ⇒ 拒启,不静默)。
+        // 错误路径显式 close 已装配的族(否则 Drop 兜底会刷未收尾告警)。
+        let tag_index = match crate::tag_index::KernelTagIndex::build() {
+            Ok(i) => i,
+            Err(e) => {
+                close_all(families);
+                return Err(OpError::Contract {
+                    op: "tag_index".into(),
+                    field: "KernelSpec::TAGS",
+                    expect: "全部生产算子至少 1 个已知 tag(tags.toml)".into(),
+                    got: e.to_string(),
+                });
+            }
+        };
+        let tagged = tag_index.all().iter().filter(|m| !m.tags.is_empty()).count();
+        eprintln!(
+            "[kernels] tag 索引:{} 项词表 / {} 算子(已打 {})",
+            crate::spec::KERNEL_TAG_COUNT,
+            tag_index.all().len(),
+            tagged
+        );
+        Ok(Self { families, names, route, metas, tag_index })
     }
 
     /// **准入声明查询**(发射期 check 的唯一入口;未建表 = `None` = 仅引入)。
     pub fn meta(&self, name: &str) -> Option<&'static crate::spec::KernelMeta> {
         self.metas.get(name).copied()
+    }
+
+    /// **按 tag id 查算子**(`None` = 未知 tag;用于白名单派生/运维审计)
+    pub fn tagged(&self, tag_id: &str) -> Option<&[&'static crate::spec::KernelMeta]> {
+        self.tag_index.tagged_id(tag_id)
+    }
+
+    /// tag 索引只读视图
+    pub fn tag_index(&self) -> &crate::tag_index::KernelTagIndex {
+        &self.tag_index
     }
 
     /// **整体收尾**(析构的唯一官方出口):逐族 `close()`,返回首个错误。

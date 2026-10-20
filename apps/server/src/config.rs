@@ -21,17 +21,12 @@ const DEFAULT_MODEL_NAME: &str = "qwen3.5-0.8b";
 /// CLI 启动参数(唯一参数面;手写解析零 clap —— 启动参数爆炸的反面)
 #[derive(Clone, Debug, Default)]
 pub struct CliArgs {
-    /// 位置参数:配置文件路径(OWL_CONFIG env 兜底;都不给 = 纯 flavor/缺省)
+    /// 位置参数:可选覆盖文件(OWL_CONFIG env 兜底;都不给 = 纯缺省)
     pub config: Option<PathBuf>,
-    /// --flavor <NAME>:内置命名预设(行为面整数十行;旧档)
-    pub flavor: Option<String>,
-    /// --profile <NAME>:**意图档**(`profiles/<NAME>.toml`;6–10 行意图)
-    pub profile: Option<String>,
+    /// -p/--profile <PATH>:配置档**文件路径**(源码 `profiles/` 复制修改)
+    pub profile: Option<PathBuf>,
     /// --site <PATH>:站点层(路径/卡位/端口;`[site]` 或普通配置表)
     pub site: Option<PathBuf>,
-    /// --list-flavors / --list-profiles:列出可用档后退出
-    pub list_flavors: bool,
-    pub list_profiles: bool,
     /// --help:打印用法后退出
     pub help: bool,
     /// --check:预检(不加载权重;打印意图派生/内存账/文件校验)
@@ -75,22 +70,29 @@ impl CliArgs {
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--flavor" => {
-                    out.flavor = Some(
-                        it.next().ok_or("--flavor 需要值(--list-flavors 查可用档)")?,
+                    return Err(
+                        "--flavor 已移除:配置档统一为 `-p/--profile <profile_path>`\
+                         (源码 profiles/ 下可直接复制修改)"
+                            .into(),
                     );
                 }
-                "--profile" => {
-                    out.profile = Some(
-                        it.next().ok_or("--profile 需要值(--list-profiles 查可用档)")?,
-                    );
+                "--profile" | "-p" => {
+                    out.profile = Some(PathBuf::from(
+                        it.next().ok_or("-p/--profile 需要配置文件路径")?,
+                    ));
                 }
                 "--site" => {
                     out.site = Some(PathBuf::from(
                         it.next().ok_or("--site 需要路径(站点档:[site] 或普通配置表)")?,
                     ));
                 }
-                "--list-flavors" => out.list_flavors = true,
-                "--list-profiles" => out.list_profiles = true,
+                "--list-flavors" | "--list-profiles" => {
+                    return Err(
+                        "--list-flavors/--list-profiles 已移除:配置层不再做目录名查找;\
+                         直接从源码 profiles/ 复制文件,启动用 -p <profile_path>"
+                            .into(),
+                    );
+                }
                 "--check" => out.check = true,
                 "--print-config" => out.print_config = true,
                 "--format" => {
@@ -174,9 +176,6 @@ impl CliArgs {
                 }
             }
         }
-        if out.profile.is_some() && out.flavor.is_some() {
-            return Err("--profile 与 --flavor 互斥(意图档 vs 旧预设档;二选一)".into());
-        }
         Ok(out)
     }
 
@@ -216,17 +215,14 @@ impl CliArgs {
 }
 
 /// 使用说明(打印到 stderr;`--help` / 未知参数)
-pub(crate) const HELP: &str = "用法: server [CONFIG] [选项]\n\
-  --profile <NAME>       意图档(profiles/<NAME>.toml;6–10 行意图)\n\
-  --flavor <NAME>        旧预设档(flavors/<NAME>.toml;与 --profile 互斥)\n\
-  --site <PATH>          站点层(路径/卡位/端口;[site] 或普通配置表)\n\
+pub(crate) const HELP: &str = "用法: server -p <profile_path> [CONFIG] [选项]\n\
+  -p, --profile <PATH>   配置档文件路径(源码 profiles/ 下可复制修改)\n\
+  --site <PATH>          可选站点覆盖层(路径/卡位/端口)\n\
   --check                预检(不加载权重;打印派生/内存账/文件校验)\n\
   --print-config         打印生效配置(缺省 TOML;--format json 含来源/估算)\n\
   --format <toml|json>   --print-config 的输出格式\n\
   --explain <KEY>        解释单键(点路径;可重复)\n\
   --set <KEY=VALUE>      临时覆盖(点路径;可重复)\n\
-  --list-profiles        列出意图档\n\
-  --list-flavors         列出旧预设档\n\
   --log-level/-file      日志覆盖;--perf-level/--perf-dump 性能账\n\
   --step-gate[-ms|-us|-every]  单步/粘滞调试门\n";
 
@@ -343,17 +339,10 @@ impl ServerConfig {
     /// `cli` 携带 --perf-dump / --perf-level 两个 app 面覆盖。
     /// **只解析配置 + 意图派生 + 预检元数据**(不选卡、不碰 GPU;`--check` 用)
     ///
-    /// 层序:`--profile/--flavor` 基准 → 位置参数 CONFIG → `--site` → CLI
+    /// 层序:`-p/--profile` 路径 → 位置参数 CONFIG → `--site` → CLI
     /// (`--set` / 日志/性能/调试门)。`[intent]` 在同一函数里展开成低层键。
     pub fn load_resolved(args: &CliArgs) -> Result<ResolvedConfig, String> {
-        let base = match (&args.profile, &args.flavor) {
-            (Some(p), None) => Some(owl_shared::flavors::profile_path(p)?),
-            (None, Some(f)) => Some(owl_shared::flavors::preset_path(f)?),
-            (None, None) => None,
-            (Some(_), Some(_)) => {
-                return Err("--profile 与 --flavor 互斥(二选一)".into())
-            }
-        };
+        let base = args.profile.as_deref();
         let mut layers: Vec<&Path> = Vec::new();
         if let Some(p) = args.config.as_deref() {
             layers.push(p);
@@ -364,7 +353,10 @@ impl ServerConfig {
         let mut resolved =
             OwlConfig::load_resolved(base.as_deref(), &layers, &args.overrides())?;
         if let Some(m) = resolved.meta.as_mut() {
-            m.intent.profile = args.profile.clone().or_else(|| args.flavor.clone());
+            m.intent.profile = args
+                .profile
+                .as_ref()
+                .map(|p| p.display().to_string());
         }
         Ok(resolved)
     }
@@ -757,8 +749,8 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         }
     } else {
         out.push_str(
-            "[check] 无 [intent]:仅做配置解析/语义门 + 模型几何校验(旧 flavor/testdata 路径)。\n\
-             [check] 要内存账/意图派生,请用 --profile <NAME> 或写 [intent]。\n",
+            "[check] 无 [intent]:仅做配置解析/语义门 + 模型几何校验(低层档/覆盖路径)。\n\
+             [check] 要内存账/意图派生,请用 -p <profile_path> 或写 [intent]。\n",
         );
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool_tokens={:?} chunk={} tail={} \
@@ -789,7 +781,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         None => None,
     };
     match (dir_owned.as_deref(), profile) {
-        (Some(dir), Some(p)) => match check_model_dir(dir, p, c.runtime.max_seq) {
+        (Some(dir), Some(p)) => match check_model_dir(dir, p, c.runtime.max_seq, c.model.vision) {
             Ok(Some(note)) => out.push_str(&format!("[check] model dir: {note}\n")),
             Ok(None) => {}
             Err(e) => {
@@ -860,12 +852,27 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         "eager/piecewise"
     };
     out.push_str(&format!(
-        "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{} reuse={} batch={}\n",
+        "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{} reuse={} batch={} vision={}\n",
         if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
         c.spec.depth,
         if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
         c.runtime.max_batch,
+        if c.model.vision { "on" } else { "off" },
     ));
+    if c.model.vision {
+        if c.spec.depth > 0 {
+            out.push_str(
+                "[check] note: vision=on + spec>0:图像 × 投机已接(V5)—— verify 的 rope \
+                 pos = 真实位置 + m-RoPE delta,KV slots/lens 仍用真实位置;\
+                 带图为单图/非合批;文本+draft 同档可用\n",
+            );
+        } else {
+            out.push_str(
+                "[check] note: vision=on + spec=off:图像路径可用(单图;data URL;\
+                 TP2 两 rank 各备塔输出)\n",
+            );
+        }
+    }
 
     if let Some(m) = intent {
         for w in &m.warnings {
@@ -885,6 +892,7 @@ fn check_model_dir(
     dir: &Path,
     profile: &owl_shared::config::intent::ModelProfile,
     ctx: usize,
+    vision: bool,
 ) -> Result<Option<String>, String> {
     let p = dir.join("config.json");
     if !p.is_file() {
@@ -897,6 +905,20 @@ fn check_model_dir(
         .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
     let v: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
+    if vision {
+        if v.get("vision_config").is_none() {
+            return Err(format!(
+                "[model].vision = true,但 {} 的 config.json 无 vision_config(不是 VLM 检查点)",
+                dir.display()
+            ));
+        }
+        if v.get("image_token_id").and_then(|x| x.as_u64()).is_none() {
+            return Err(format!(
+                "[model].vision = true,但 {} 的 config.json 缺 image_token_id",
+                dir.display()
+            ));
+        }
+    }
     let g = v.get("text_config").unwrap_or(&v);
     let getu = |k: &str| g.get(k).and_then(|x| x.as_u64()).map(|n| n as usize);
     let geom = profile.geom;

@@ -1,0 +1,212 @@
+# owl 算子 tag 词表（唯一真源；build.rs 生成 KernelTag / KERNEL_TAGS / 位集）
+#
+# 纪律：
+# - tag 是“选核/审计能力面”，不是算子名的一部分；
+# - 分面命名空间（dom./quant./kv./phase./role./feat.），可前缀过滤；
+# - `facet = "..."` 标记**互斥组**（同组单选；无该组 tag = 通用算子放行）；
+# - 新增 tag 必须在这里登记；算子侧 #[kernel_tags(...)] 写错 = 编译期红
+#   （宏按 id 生成 KernelTag::DOM_ATTN 这类关联常量）。
+# - 每个生产算子至少 1 个 tag；全量覆盖由 ops::tests 机器锁。
+
+[[tag]]
+id = "dom.attn"
+desc = "attention 域（paged/chunked/XQA/NC/KV 读写）"
+
+[[tag]]
+id = "dom.gdn"
+desc = "GDN/线性注意力域（gating/norm/conv/recurrence/decode）"
+
+[[tag]]
+id = "dom.gguf"
+desc = "GGUF 量化域（MMQ/MMVQ/dequant/repack）"
+
+[[tag]]
+id = "dom.marlin"
+desc = "Marlin W4A16/W4A8 GEMM 域"
+
+[[tag]]
+id = "dom.vis"
+desc = "视觉塔域（ViT prefill）"
+
+[[tag]]
+id = "dom.elem"
+desc = "逐元素/视图/采样/铸边界域"
+
+[[tag]]
+id = "dom.comm"
+desc = "TP 通信域（allreduce stage/reduce/fused）"
+
+[[tag]]
+id = "dom.load"
+desc = "装载/重排/权重量化域"
+
+[[tag]]
+id = "dom.cublas"
+desc = "cuBLAS 封装域"
+
+[[tag]]
+id = "dom.flashinfer"
+desc = "FlashInfer 注意力域"
+
+[[tag]]
+id = "dom.xqa"
+desc = "XQA 注意力域（verify/decode/prefill）"
+
+[[tag]]
+id = "dom.fused"
+desc = "融合算子域（qknorm+rope+KV insert 等）"
+
+[[tag]]
+id = "dom.dflash"
+desc = "DFlash2 草稿域（conv/select/topk）"
+
+[[tag]]
+id = "dom.norm"
+desc = "归一化/激活域（rmsnorm/fused-add/silu）"
+
+[[tag]]
+id = "quant.w4a16"
+facet = "quant.weight"
+desc = "W4A16 权重量化（Marlin/AWQ）"
+
+[[tag]]
+id = "quant.w4a8"
+facet = "quant.weight"
+desc = "W4A8 权重量化（激活 int8）"
+
+[[tag]]
+id = "quant.gguf"
+facet = "quant.weight"
+desc = "GGUF 块量化（Q4_K/Q5_K/Q6_K/Q8_0 等）"
+
+[[tag]]
+id = "quant.int8"
+facet = "quant.head"
+desc = "INT8 权重量化（per-row / lm_head）"
+
+[[tag]]
+id = "quant.awq"
+desc = "AWQ 量化布局/语义"
+
+[[tag]]
+id = "kv.main.fp8"
+facet = "kv.main"
+desc = "主 KV 池 e4m3（fp8 存储）"
+
+[[tag]]
+id = "kv.main.f16"
+facet = "kv.main"
+desc = "主 KV 池 f16"
+
+[[tag]]
+id = "kv.main.bf16"
+facet = "kv.main"
+desc = "主 KV 池 bf16"
+
+[[tag]]
+id = "kv.draft.fp8"
+facet = "kv.draft"
+desc = "草稿 KV 池 e4m3"
+
+[[tag]]
+id = "kv.draft.f16"
+facet = "kv.draft"
+desc = "草稿 KV 池 f16"
+
+[[tag]]
+id = "kv.draft.bf16"
+facet = "kv.draft"
+desc = "草稿 KV 池 bf16"
+
+[[tag]]
+id = "phase.prefill"
+desc = "prefill 路径"
+
+[[tag]]
+id = "phase.decode"
+desc = "decode 路径"
+
+[[tag]]
+id = "phase.verify"
+desc = "投机 verify 路径"
+
+[[tag]]
+id = "phase.propose"
+desc = "投机 propose/草稿路径"
+
+[[tag]]
+id = "phase.load"
+desc = "装载期路径（repack/quant/dequant）"
+
+[[tag]]
+id = "role.attn"
+desc = "注意力计算"
+
+[[tag]]
+id = "role.gemm"
+desc = "GEMM/矩阵乘"
+
+[[tag]]
+id = "role.gemv"
+desc = "GEMV/单 token 矩阵向量乘"
+
+[[tag]]
+id = "role.norm"
+desc = "归一化/激活"
+
+[[tag]]
+id = "role.rope"
+desc = "RoPE/位置编码"
+
+[[tag]]
+id = "role.kv_write"
+desc = "KV 池写者"
+
+[[tag]]
+id = "role.kv_read"
+desc = "KV 池读者"
+
+[[tag]]
+id = "role.sample"
+desc = "采样/argmax/topk"
+
+[[tag]]
+id = "role.elem"
+desc = "逐元素/视图/铸边界"
+
+[[tag]]
+id = "role.comm"
+desc = "通信原语"
+
+[[tag]]
+id = "role.embed"
+desc = "embedding/查表"
+
+[[tag]]
+id = "feat.vision"
+facet = "feature.vision"
+desc = "视觉塔必需"
+
+[[tag]]
+id = "feat.dflash"
+facet = "feature.dflash"
+desc = "DFlash2 投机必需"
+
+[[tag]]
+id = "feat.tp"
+facet = "feature.tp"
+desc = "TP/双 rank 通信链"
+
+[[tag]]
+id = "feat.spec"
+facet = "feature.spec"
+desc = "投机解码链（propose/verify）"
+
+[[tag]]
+id = "feat.head"
+facet = "feature.head"
+desc = "lm_head / 词表头"
+
+[[tag]]
+id = "feat.graph"
+desc = "CUDA graph 捕获安全（声明性）"

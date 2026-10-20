@@ -292,8 +292,14 @@ pub struct ModelProfile {
     pub geom: ModelGeom,
     /// **装载后、池分配前的单卡 live**(字节;实测校准)
     pub weights_base_bytes: u64,
+    /// **TP2 单卡 live**(字节;实测校准;0 = 回退 `weights_base_bytes / 2`)
+    pub weights_base_tp2_bytes: u64,
     /// 草稿模型额外权重(字节;`spec = dflash` 时加)
     pub draft_weights_bytes: u64,
+    /// **TP2 草稿单卡权重**(0 = 回退 `draft_weights_bytes / 2`)
+    pub draft_weights_tp2_bytes: u64,
+    /// **视觉塔权重**(字节;**每 rank 全量复制**;`vision=false` 时不计)
+    pub vision_weights_bytes: u64,
     pub draft: Option<DraftGeom>,
     /// 实测校准(true = 有 `[vram-gov]` 现场;false = 保守估计)
     pub calibrated: bool,
@@ -351,8 +357,15 @@ pub const QWEN38_27B_AWQ: ModelProfile = ModelProfile {
     },
     // 16.26 GiB = 16,650 MiB(实测 live,含 int4 头节省后的权重/运行底价)
     weights_base_bytes: 16_650 << 20,
+    // TP2 3080 实测 `live=9.65G/card`(f16 head);本档 intent 派生 int4 head
+    // ⇒ −1.7G/2 = 8.80 GiB/card(与 3090-max 的 16.26→int4 同源)
+    weights_base_tp2_bytes: 9_011 << 20,
     // 17.52 − 16.26 = 1.26 GiB(DFlash2 W4A16 草稿权重 + 运行底价)
     draft_weights_bytes: 1_290 << 20,
+    // P2.1 草稿双 rank ⇒ 半份/卡(0.85G;全量 1.7G 的另一半在 rank1)
+    draft_weights_tp2_bytes: 870 << 20,
+    // 27B 视觉塔 model.visual.* ≈1.5G f16;**每 rank 全量**(TP2 不切视觉)
+    vision_weights_bytes: 1_536 << 20,
     draft: Some(DraftGeom { n_layers: 5, n_kv_heads: 8, head_dim: 128, kv_elems_per_token: 10240 }),
     calibrated: true,
 };
@@ -379,7 +392,10 @@ pub const QWEN35_08B: ModelProfile = ModelProfile {
         gdn_slot_elems: 274_432,
     },
     weights_base_bytes: 1_650 << 20,
+    weights_base_tp2_bytes: 0,
     draft_weights_bytes: 0,
+    draft_weights_tp2_bytes: 0,
+    vision_weights_bytes: 0,
     draft: None,
     calibrated: false,
 };

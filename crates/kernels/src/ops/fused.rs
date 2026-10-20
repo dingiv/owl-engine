@@ -1,5 +1,6 @@
 //! 融合核域生产算子(norm/rope/池插三发合一)。
 
+use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param, PoolAccess};
 
@@ -11,6 +12,7 @@ use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, Kern
 /// 声明(装配期写集穷举审计,P4)。
 pub struct QknormRopeKvInsertF16Fp8Knhd;
 
+#[kernel_tags("dom.fused", "role.norm", "role.rope", "role.kv_write", "phase.prefill", "kv.main.fp8")]
 impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd";
     const SRC: &'static str = "cu/fused/qknorm_insert.cu";
@@ -54,6 +56,7 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8Knhd {
 /// 变体同 ABI,只有池寻址不同)。classic 池档的融合插池写者。
 pub struct QknormRopeKvInsertF16Fp8;
 
+#[kernel_tags("dom.fused", "role.norm", "role.rope", "role.kv_write", "phase.prefill", "kv.main.fp8", "kv.draft.fp8")]
 impl KernelSpec for QknormRopeKvInsertF16Fp8 {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_fp8kv";
     const SRC: &'static str = "cu/fused/qknorm_insert.cu";
@@ -92,7 +95,6 @@ impl KernelSpec for QknormRopeKvInsertF16Fp8 {
     };
 }
 
-
 pub static QKNORM_ROPE_KV_INSERT_F16_FP8_KNHD: KernelMeta = meta_of::<QknormRopeKvInsertF16Fp8Knhd>();
 pub static QKNORM_ROPE_KV_INSERT_F16_FP8: KernelMeta = meta_of::<QknormRopeKvInsertF16Fp8>();
 
@@ -103,6 +105,7 @@ pub static QKNORM_ROPE_KV_INSERT_F16_FP8: KernelMeta = meta_of::<QknormRopeKvIns
 /// `owl_qknorm_rope_kv_insert_f16` —— 经典池 f16 插池(classic 布局,主池+草稿池双写)
 pub struct QknormRopeKvInsertF16;
 
+#[kernel_tags("dom.fused", "role.norm", "role.rope", "role.kv_write", "phase.prefill", "kv.main.f16", "kv.draft.f16")]
 impl KernelSpec for QknormRopeKvInsertF16 {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16";
     const SRC: &'static str = "cu/fused/qknorm_insert.cu";
@@ -149,6 +152,7 @@ impl KernelSpec for QknormRopeKvInsertF16 {
 /// `owl_qknorm_rope_kv_insert_f16_knhd` —— kNHD 单布局 f16 插池(主池 f16)
 pub struct QknormRopeKvInsertF16Knhd;
 
+#[kernel_tags("dom.fused", "role.norm", "role.rope", "role.kv_write", "phase.prefill", "kv.main.f16")]
 impl KernelSpec for QknormRopeKvInsertF16Knhd {
     const ENTRY: &'static str = "owl_qknorm_rope_kv_insert_f16_knhd";
     const SRC: &'static str = "cu/fused/qknorm_insert.cu";
@@ -193,13 +197,6 @@ impl KernelSpec for QknormRopeKvInsertF16Knhd {
 pub static QKNORM_ROPE_KV_INSERT_F16: KernelMeta = meta_of::<QknormRopeKvInsertF16>();
 pub static QKNORM_ROPE_KV_INSERT_F16_KNHD: KernelMeta = meta_of::<QknormRopeKvInsertF16Knhd>();
 
-/// 本域全部已建表算子
-pub static METAS: &[&KernelMeta] = &[
-    &QKNORM_ROPE_KV_INSERT_F16_FP8_KNHD,
-    &QKNORM_ROPE_KV_INSERT_F16_FP8,
-    &QKNORM_ROPE_KV_INSERT_F16,
-    &QKNORM_ROPE_KV_INSERT_F16_KNHD,
-];
 
 #[cfg(test)]
 mod tests {

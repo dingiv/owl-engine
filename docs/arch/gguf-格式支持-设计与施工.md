@@ -1878,3 +1878,169 @@ cos/sin          = cos/sin(pos·inv_freq) · (0.1·ln(factor)+1)·attention_fact
 **剩余杠杆**:1M 的边界税已占 22%(打分 O(块数):1024 边界 × 最多 32768 块),
 下一刀 = 打分/选择上 GPU 或 `recall_every` 分级(必须先过 needle 质量门);
 索引 D2H 片合并(~40 ms/边界)同理。
+
+### 23.8 双卡(YaRN 1M × TP2)立案:结论 = **KVMem 宿主腿只覆盖 rank0**(2026-10-20 晚)
+
+**目标**:把 §23.7 的 1M 档搬到 **2×3090 Ti(TP2)**,看能否吃到双卡 prefill。
+
+**一句话结论**:**暂时不行**,但不是 GGUF 分片/AR 的错 —— 是 **KVMem 的宿主腿
+(下沉/回灌/快照)全链只对 rank0 发命令**;rank1 的 KV/GDN 页从不搬走、也从不在
+回灌时恢复 ⇒ 超过设备池之后 peer 读到旧页(静默错值)。单卡 1M 不受影响。
+
+**装置**:`gguf27b-1m` 档 + `runtime.tp_ordinals=[0,1]`(UUID 钉两张 3090 Ti;
+⚠️ 数字 ordinal 会被 CUDA 序重排 —— 本机 `[1,2]` 实际指向 **3080+3090**,
+启动日志的 `[boot] 选卡(TP 档)` 是唯一身份自证);needle@50%,
+`chat_template_kwargs.enable_thinking=false`(否则"想太久"会被误判成坏 KV)。
+
+| 臂 | 宿主腿 | 池 | prompt tok | 结果 |
+|---|---|---|---:|---|
+| 单卡 GGUF(对照) | off | 8192 | 1329 | **HIT** |
+| **AWQ TP2**(对照:TP 基座) | off | 16384 | 8508 | **HIT** ⇒ TP 本体无罪 |
+| GGUF TP2 · **纯设备**(`prefix_cache=false`/`host=0`/`snap_host=0`) | **off** | 32768 | 10 525 / 15 996 / 22 796 | **HIT / HIT / HIT** |
+| GGUF TP2 · 宿主腿开(池 16k,**无下沉**) | on | 16384 | 8138 / 8258 | HIT / **MISS** |
+| GGUF TP2 · KVMem 虚拟化(池 8k,host 8 GiB) | on | 8192 | 10 525 / 17 567 / 24 655 | **MISS / MISS / MISS** |
+
+判读:①纯设备臂到 22.8k 全对 ⇒ **GGUF 分片/AR/长 ctx 预填充都正常**;
+②一旦宿主腿在场(哪怕池装得下、日志无"下沉"),~8.2k 起开始错 ——
+错点与 `host_blocks` 增长同步;③失败面 = 整段回答退化(重复数字/答非所问),
+不是 near-tie。`/debug/vram` 当时:`host_blocks=1506`、`slots_free=113`(下沉确实发生)。
+
+**代码面(全部是"只发 rank0"的同一族)**:
+
+| 位置 | 面 | 症状 |
+|---|---|---|
+| `exec/coverage.rs::reconcile_residency` ③ 下沉 `swap(Out)` | `self.dev...face` | rank1 页不沉、槽被复用 ⇒ 旧块被新块覆盖 |
+| `exec/phases.rs::execute_begin` 的 `pending_loads` 回灌 `swap(In)` | 同上 | rank1 页不恢复 ⇒ 回灌后 peer 读旧内容 |
+| `exec/coverage.rs` 视图页表 `write_select_view`(**唯一一处**;`prefill_chunk` 的按 rank 写是对的) | `self.dev.pool` | 选择层视图在 peer 上是捕获期旧表 |
+| `exec/spec.rs::snap_offload` / `snap_ensure_resident`(GDN 快照) | 同族 | 快照回灌后 peer 状态不一致(实测有 `快照 … 不在设备槽` 弃 turn) |
+| `store::Rel` | **一本 host 账**:`host_cache_mb` 只按一份算,链条目 = 1 页字节 | peer 的那半 KV 无处落 |
+
+**修法(建议,未施工)**:给宿主腿加 **planes = world** 维度 ——
+① `HostTier` 每链条目 = `planes × block_bytes`(`host_cache_mb` 语义不变 = 两 rank 合计);
+② `plan_offload/onload` 出 **per-plane 的 pieces + 独立槽台**,engine 对两 rank 各发一条
+`swap`,两回执齐了再一次 `commit`(abort 同理);
+③ GDN 快照照抄同一套(每 rank 一份,键仍 `SnapKey`);
+④ 视图页表写两侧(最小一刀,可先单独落)。
+门:同 prompt、同池,`world=1` vs `world=2` 两臂的 needle 命中 + `host_blocks` 对账
+(10k/32k/128k 三档)+ 现有 `N4 未归还清单` 为空。
+
+**今日可用的两条替代**(不改引擎):
+- **1M**:单卡 `gguf27b-1m`(§23.7,729 s,needle 命中);
+- **双卡长 ctx(无宿主腿)**:f16 池装多少跑多少 —— 2×24G 下
+  f16 ≈ 262k(16 GiB KV + 17.7 权重)/ fp8 ≈ 524k(8 GiB/rank)。**1M 必须等宿主腿双 rank 化**。
+
+### 23.9 施工:宿主腿 **planes = world**(2026-10-20 深夜,已落地)
+
+**改了什么**(单卡路径逐位不变 —— `world = 1` 时全部为恒等):
+
+| 层 | 文件 | 内容 |
+|---|---|---|
+| store | `leg.rs` | `BlockLeg::open_planes(cfg, world)`;宿主槽 = `world × 单页`;`attach_pool_peer`(peer 的 `PieceSpec`,块 id 每 rank 一套);`out/in_pieces(…, plane)` 带**平面基址** `plane × 单页` |
+| store | `leg.rs` | `BlockOutPlan/OutPlan/InPlan.pieces` → **每平面一组**(`Vec<Vec<SwapPiece>>`) |
+| store | `rel.rs` | `Rel::open_world(…, world)`、`attach_snap_layout_peer`、`snap_pieces(slot, plane)`、快照片同样按平面分组;`attach_disk` 对 `world > 1` **响亮拒**(盘层平面账未做) |
+| engine | `running.rs` | `swap_all_ranks(dir, &[Vec<SwapPiece>], table)`(槽台**原箱**在两条命令间传递 ⇒ 一次借台/一次落账)、`write_select_view_all`(视图页表写两 rank) |
+| engine | `engine.rs`/`session.rs` | boot 注册 peer 池布局与 peer 快照布局;`BankPlan.world` |
+| engine | `coverage.rs`/`phases.rs`/`spec.rs`/`running.rs` | 五处 swap 全走 `swap_all_ranks`;快照槽索引 `snap_place/clear` 镜像到 peer |
+
+**验证**(2×3090 Ti;GGUF 27B Q4_K_M;needle@50%):
+
+| 臂 | 结果 |
+|---|---|
+| 宿主腿开、**选择层关**(池 32768 tok / host 66560 MiB) | 52 826 tok **HIT**、87 648 tok **HIT**(修前 8.2k 起就坏) |
+| 宿主腿 + 选择层开(池 32768 / host 66560 / ws 1024) | 22 796 tok **HIT**;10 525/15 996 **HIT** |
+| 单卡同档(回归确认) | 10 525 **HIT**;52 826 MISS(**与修前一致** —— 选择层在该合成 prompt 上 52k 就会漏,不是回归) |
+
+⇒ **宿主腿的双 rank 搬运已经正确**:池超界后 KV 不再在 peer 上读旧页。
+
+**新堵点(下一刀)**:1M TP 预填在 **~128k token** 撞 `vram-hard-budget`
+(24 GB 卡 free 122 MiB)。实测指纹(同一 boot,逐 turn 查 nvidia-smi):
+
+| 档 | boot | 10.5k turn 后 | 35k turn 后 |
+|---|---|---|---|
+| rank0 | 11 807 MiB | 11 907(+100) | 11 909(+2) |
+| **rank1(peer)** | 11 805 MiB | 12 865(+**1060**) | 16 165(+**3300**) |
+| chunk 1024 同测 | | +1188 | +2404 |
+
+⇒ 增长与 **token 数**成正比(~0.13 MiB/token)、与 chunk 数无关,且**只在 peer**;
+`/debug/vram` 的引擎账(`gpu_used 23.9 GB`)看不见这 3.6 GB ⇒ 是 **peer 侧未入账的
+设备分配**(不是池、不是 KV 页 —— pool 槽 `slots_free` 健康、N4 清单为空)。
+下一刀 = 在 peer 上按分配点插桩(`/debug/blocks` 逐 rank + handle 事件),定位是
+FI plan 工作区 / 临时块 / 还是 VMM 未释放;修掉后 1M 双卡即可直接复跑本档。
+
+### 23.10 显存"入账"落地 + 1M 双卡的**真墙**定谳(2026-10-20)
+
+**先纠一个概念**(本轮的实测结论):双卡 1M 撞墙的 **不是** 池缓存,是 **N4 残留**。
+
+**入账(已落地)**:
+- `DeviceClient::mem_pool_stats` + `Command::MemPoolStats` → `/debug/vram.pools[]`
+  逐 rank 给 `used / used_high / reserved / reserved_high / cached`;
+  **物理 − live = 池缓存**第一次可见(`RELEASE_THRESHOLD=∞` 的代价面);
+- 回收面四处:①`Node::TurnEnd`(turn 收尾清一次);②`SchedulerOutput::Idle`(空转出口,
+  先 sync 后排空 —— server 泵循环 Idle 即断,`Node::Idle` 到不了);
+  ③`execute_begin`(新 turn 起点清上一轮残留);④**硬预算临门回收**
+  (`handle_alloc_inner`:guard 失败 ⇒ 四流排空 + `cuMemPoolTrimTo(0)` + 复判)。
+
+**实测**:
+- turn 收尾后 peer 的**池缓存** 3 040 MiB 在下一次 trim 时按数归还(日志
+  `池缓存回收:turn N rank1 释放 3040.0 MiB`);
+- 但 1M 预填仍在 **~128k token** 撞 `vram-hard-budget`,此时
+  `池 used=23 587MiB / reserved=23 616MiB` ⇒ **几乎全是 live,不是缓存**
+  (临门回收只捞到 32 MiB)。
+
+**真身(N4 清单点名,单卡同样存在但余量大)**:
+
+```text
+[WARN] [store] N4 未归还清单:turn 1 名下仍有 1920 块 / 11 759 616 KiB 开着
+  —— owl_sigmoid_gate_mul_f16 ×1902 / 11 966 349 312B ｜ ...
+```
+
+**只在 peer**:同一代码路径单卡 1M 的 boot 日志里 `N4 未归还清单` **一条都没有**
+(只有池清点),而 TP 的 peer 每 turn 都有 —— 说明是 **TP 分支**把
+`owl_sigmoid_gate_mul_f16` 的输出挡在了 arena 回收之外(嫌疑 = attention 输出在
+row-parallel 侧的切片/别名路径)。
+
+`owl_sigmoid_gate_mul_f16` **每 chunk(~1024 tok)约 15 块 / ≈94 MB 不归还**
+(122k = 128 chunk ⇒ ≈12 GiB)—— 单卡 24 GB 里这份残渣装得下(1M 峰值 21.9 GB),
+双卡 peer 只有 ~12 GB 余量 ⇒ **128k 就到底**。turn 收尾的 `N4 兜底释放`能结清
+(所以跨 turn 不涨),但 **turn 内**一路累积。
+
+⇒ **1M 双卡的最后一刀 = N4 逐 chunk 收口**(在 prefill 边界把上一 chunk 的
+`Turn(t)` 残块结清;判据 = 边界后 `used` 不随 chunk 单调爬坡,且单卡 1M 的
+峰值同步下降)。这一刀与 GGUF/TP 无关,是**存量 N4 尾巴**。
+
+**当前可用**:双卡 22k / 52k / 87k(turn 内不撞墙的区间)全绿且 needle 命中;
+1M 仍走单卡档。
+
+### 23.11 **提前释放**落地:段边界收口 —— 1M 双卡的显存墙拆掉(2026-10-20)
+
+**用户裁决的定位法**(本轮照做):设备分配的**唯一咽喉 = `DeviceHandle`(客户端)**
+——每次 alloc/free 都进 store 账(`Loan{rank, owner, name, bytes}`),GPU 服务器**内部**
+的分配我们不管、也不需要管。所以"该 chunk 的中间量已经死了"这件事客户端**全知**,
+要做的只是**别等到 turn 收尾才收**。
+
+**改动**:
+- `RunningEngine::drain_turn_stale(turn, tag)` —— 把 `n4_force_release` 的"逐 rank 结清"
+  抽成可复用口(metric 按 tag 分桶:`store.{tag}.stale_{blocks,bytes}`);
+- **prefill 段边界调用**(`execute_prefill`,`base > 0`):本 chunk `Turn(t)` 仍开着的块
+  = 上一 chunk 的残块 ⇒ 在**本 chunk 分配之前**逐 rank `free_settled`(同流保序);
+  `base == 0` 不动(turn 起点还有长命块要活过整轮);
+- 判据天然安全:只碰 `Owner::Turn(t)`(权重/池/图/会话各有归属)。
+
+**实测(2×3090 Ti,GGUF 27B Q4_K_M,池 32 768 tok,host 66 560 MiB)**:
+
+| prompt tok | 墙钟 | 吞吐 | 两卡显存(全程) | 触发 |
+|---:|---:|---:|---|---|
+| 852 872 | 479.6 s | **1778 tok/s** | 12 071→12 089 MiB **对称、全程平** | 0 次 `vram-budget` / 0 条 N4 |
+| 893 196 | 501.8 s | 1780 tok/s | 12 067→12 087 MiB **对称、全程平** | 同上 |
+
+修前:peer 每 chunk ≈94 MB 残块(**只在 peer**,单卡 1M 日志零 `N4 未归还`),
+128k 就把 24 GB 卡吃穿;修后 **900k 全程 ±20 MiB**。turn 收尾 `N4 兜底释放`
+也从"上千块/GB 级"降到 **0–16 块**。
+
+**遗留(两件,均非本刀)**:
+1. **第二个长 turn 会撞宿主预算**(`宿主层越界 69 795 315 712 > 69 793 218 560`)
+   —— 上一 turn 的 28 245 个宿主 KV 块(≈56 GiB)躺在前缀缓存里没有逐出;
+   KV 腿 `host.put` 缺"先逐最冷再放"的政策(快照腿有,见 §23 早期);
+2. **900k 档的 needle 召回不稳定**(同 probe 单卡 52.8k 也有 MISS;TP 22.8k 命中)
+   —— 属**选择层质量**,与显存/正确性无关;要判 1M 召回得换更强的 retrieval 口径
+   (多针/问答对),需要单独一轮质量门。

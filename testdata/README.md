@@ -6,12 +6,12 @@
 ## 1. 测试配置从哪来(层链 + 自动解析)
 
 ```
-flavor(可选,预设档名)  →  OWL_TEST_CONF(整轮环境档)  →  用例 overlay(按路径自动找)
+extends(可选,基准档路径)  →  OWL_TEST_CONF(整轮环境档)  →  用例 overlay(按路径自动找)
 ```
 
 | 层 | 放哪 | 干什么 | 进版本? |
 |---|---|---|---|
-| `flavor` | `flavors/<名>.toml`(仓库顶层) | 复用生产/档位预设:`flavor = "spec-dflash"` | ✅ |
+| `extends` | 任意路径(`profiles/legacy/...`) | 复用基准档:`extends = "profiles/legacy/spec-dflash.toml"` | ✅ |
 | 环境档 | 任意路径,用 **`OWL_TEST_CONF`** 指定 | 整轮共同口径(各会话/各 agent 一致) | 否(`conf/` 本地) |
 | **用例 overlay** | `testdata/cases/<crate>/<模块路径>/<用例名>.toml` | 只改**一个**用例;**删文件即还原** | 否(随手写/删) |
 
@@ -20,12 +20,12 @@ flavor(可选,预设档名)  →  OWL_TEST_CONF(整轮环境档)  →  用例 ov
   例:`crates/models/src/layers/gdn.rs::gpu_l2norm_matches_host`
   → `testdata/cases/models/layers/gdn/gpu_l2norm_matches_host.toml`;
 - **存在才加载**;三层全缺 = 引擎缺省;**天然按用例隔离**(不同模块同名不冲突);
-- 只写**差异项**(从 flavor/环境档继承);集成测试(`crates/*/tests/*.rs`)无 overlay;
-- 每层都走唯一 loader:键错/枚举错/`flavor`·`extends` 环 = **响亮拒**。
+- 只写**差异项**(从基准/环境档继承);集成测试(`crates/*/tests/*.rs`)无 overlay;
+- 每层都走唯一 loader:键错/枚举错/`extends` 环 = **响亮拒**。
 
 ```toml
 # testdata/conf/local.toml(整轮口径)
-flavor = "spec-dflash"
+extends = "profiles/legacy/spec-dflash.toml"
 
 [runtime]
 max_seq = 4096
@@ -75,7 +75,7 @@ OWL_TEST_CONF=testdata/conf/local.toml cargo test -p owl-models --lib   # 整轮
 | 诉求 | 动作 |
 |---|---|
 | 某用例要特殊几何/开关 | 丢一个 `testdata/cases/…/<用例>.toml`(只写差异) |
-| 整轮测试换口径 | 写 `testdata/conf/x.toml`(可含 `flavor`),`OWL_TEST_CONF=` 指它 |
+| 整轮测试换口径 | 写 `testdata/conf/x.toml`(可含 `extends`),`OWL_TEST_CONF=` 指它 |
 | 新检查点/金标 | 加一行 `resources.toml`,用例加 `needs = "<key>"` |
 | 换一张卡跑 | `OWL_TEST_DEVICE=<BDF> cargo test …` |
 | 跑全部 / 单个 | `cargo test -p <crate> --lib [用例名]` |

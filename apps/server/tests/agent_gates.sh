@@ -4,7 +4,7 @@
 # 用法:
 #   apps/server/tests/agent_gates.sh --base-url http://127.0.0.1:8137 --model qwen3.8-27b
 #
-# 前提:server 已在跑(生产档 = `--flavor spec-dflash testdata/server/agent-27b.toml`;
+# 前提:server 已在跑(生产档 = `-p profiles/legacy/spec-dflash.toml testdata/server/agent-27b.toml`;
 # 端口 8137 / CUDA ordinal 0,见该档头注)。脚本**不启 server、不杀进程**
 # (杀进程纪律:只杀自己的 PID —— 见 AGENTS.md / 设计 §八施工纪律)。
 #
