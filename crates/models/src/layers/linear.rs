@@ -384,6 +384,13 @@ pub struct Linear {
     /// **TP 角色标记**(S4 ③';构造期从规则表算一次 —— **纯标注,零决策**:
     /// 层不构造通信节点,只把它透传到图节点上,解释器统一追加 allreduce)
     tp_role: crate::plan::rules::WeightRule,
+    /// **输出 dtype 钉定**(`Some` = 本层产出恒铸到该 dtype;2026-10-20)。
+    ///
+    /// 唯一动机:GGUF 块型臂的 GEMM 核写 `half*`(F16),而 BF16 执行域
+    /// (DFlash2 草稿)下游一律按 BF16 读 —— 不铸就是**静默错值**。
+    /// HF 臂(`matmul` 声明随激活)本就不错,`cast_16` 同 dtype 直通 ⇒
+    /// 统一挂上无成本。缺省 `None` = 既有一切档位逐字节不变。
+    out_dt: Option<Dtype>,
 }
 
 impl Linear {
@@ -412,6 +419,7 @@ impl Linear {
             gguf_ty: None,
             gguf_col_index: None,
             tp_role: crate::plan::rules::rule_of(key),
+            out_dt: None,
         };
         let eligible = crate::formats::util::marlin_eligible(out_dim, in_dim);
         match plan {
@@ -453,6 +461,13 @@ impl Linear {
     /// "分片行数 < 全量行数"这一个判据决定 —— 单源 = `ModelSpec::head_vocab`。
     pub fn with_tp_rule(mut self, rule: crate::plan::rules::WeightRule) -> Self {
         self.tp_role = rule;
+        self
+    }
+
+    /// **输出 dtype 钉定**(唯一消费者 = DFlash2 草稿的 GGUF 块型臂;
+    /// 见字段 `out_dt` 的判据)。同 dtype 直通 ⇒ 挂上零成本。
+    pub fn with_out_dtype(mut self, dt: Dtype) -> Self {
+        self.out_dt = Some(dt);
         self
     }
 
@@ -626,10 +641,34 @@ impl Module for Linear {
     /// 插 zeros 槽;kU4 has_zp 内核,组大小 32)。
     fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         let _ = ctx; // 层**不读 ctx 的 TP 面**(S4 ③':决策在解释器)
+        // **输出 dtype 钉定 + GGUF 动态范围护栏**(仅显式声明者)
+        //
+        // GGUF 块型 GEMM 的输出核写 `half*`(F16 上限 65504),而 BF16 执行域
+        // (DFlash2 草稿)的层输出实测可达 ~6e4 ⇒ 直接落 F16 会饱和成 inf。
+        // 成对移位:`x·2⁻⁶ →(GEMM)→ f16→bf16 → ·2⁶`。2 的幂在 f16/bf16 上
+        // **精确**,相对精度仍由 F16 尾数决定 ⇒ 与"BF16 输出 GEMM"等价。
+        // `2⁶` = 64× 上限余量(1.7e7 以下不饱和);F16 次正规临界 6e-8·2⁶
+        // 远低于 bf16 自身粒度 ⇒ 无可见损失。
+        const GEMM_SCALE: f32 = 64.0;
+        let (xs, out_dt) = match self.out_dt {
+            Some(dt) if self.gguf_ty.is_some() && dt != Dtype::F16 => {
+                (crate::layers::scale16(xs, 1.0 / GEMM_SCALE), Some(dt))
+            }
+            other => (xs.clone(), other),
+        };
+        let y = self.forward_inner(&xs);
+        let y = match out_dt {
+            Some(dt) if self.gguf_ty.is_some() => {
+                let b = crate::layers::cast_16(&y, dt);
+                crate::layers::scale16(&b, GEMM_SCALE)
+            }
+            Some(dt) if y.dtype() != dt => crate::layers::cast_16(&y, dt),
+            _ => y,
+        };
         // ★ **S4 ③':TP 只给标记** —— 构造期已由规则表算好([`Self::tp_role`]),
         //   这里**纯透传**到图节点;解释器在求值尾部按标记统一追加 allreduce。
         //   (用户裁决 2026-10-17:感知下沉到解释器层,原子 layer 只留标记。)
-        self.forward_inner(xs).with_tp_role(self.tp_role)
+        y.with_tp_role(self.tp_role)
     }
 }
 

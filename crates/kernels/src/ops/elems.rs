@@ -315,6 +315,44 @@ pub static ADD_F16: KernelMeta = meta_of::<AddF16>();
 pub static ADD_BF16: KernelMeta = meta_of::<AddBf16>();
 pub static SIGMOID_F16: KernelMeta = meta_of::<SigmoidF16>();
 pub static SIGMOID_GATE_MUL_F16: KernelMeta = meta_of::<SigmoidGateMulF16>();
+/// `owl_scale_{f16,bf16}` —— 逐元素乘常数(成对指数移位;见 `cu/elems/scale.cu`
+/// 头注:GGUF 块型 GEMM 的 F16 输出上限 65504 × BF16 草稿域 = 必须缩放)
+pub struct ScaleF16;
+
+#[kernel_tags("dom.elem", "role.elem")]
+impl KernelSpec for ScaleF16 {
+    const ENTRY: &'static str = "owl_scale_f16";
+    const SRC: &'static str = "cu/elems/scale.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 0),
+        Param::i32("n"),
+        Param::f32("scale"),
+        Param::t_out("out", Dtype::F16, 0),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub struct ScaleBf16;
+
+#[kernel_tags("dom.elem", "role.elem")]
+impl KernelSpec for ScaleBf16 {
+    const ENTRY: &'static str = "owl_scale_bf16";
+    const SRC: &'static str = "cu/elems/scale.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::BF16, 0),
+        Param::i32("n"),
+        Param::f32("scale"),
+        Param::t_out("out", Dtype::BF16, 0),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static SCALE_F16: KernelMeta = meta_of::<ScaleF16>();
+pub static SCALE_BF16: KernelMeta = meta_of::<ScaleBf16>();
 pub static CAST_F16_BF16: KernelMeta = meta_of::<CastF16Bf16>();
 pub static CAST_BF16_F16: KernelMeta = meta_of::<CastBf16F16>();
 pub static CONCAT_ROWS_F16: KernelMeta = meta_of::<ConcatRowsF16>();

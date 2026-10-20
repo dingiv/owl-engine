@@ -350,6 +350,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.topk16_split" => ops::topk16_split(ax(0), ax(1)), // aux = [rows, nparts]
         "ops.topk16_merge" => ops::topk16_merge(ax(0)),        // aux = [rows]
         "ops.sigmoid_gate_mul" => attn::gate_mul(dt),
+        "elems.scale" => elems::scale(dt),
         "elems.cast_f16_bf16" => elems::cast_dir(false),
         "elems.cast_bf16_f16" => elems::cast_dir(true),
         "dflash.select" => dflash::select(ax(0) != 0), // aux = [bf16](输入侧;输出恒 f32)
@@ -1895,6 +1896,15 @@ pub mod elems {
         KernelPick {
             name: if to_f16 { "owl_cast_bf16_f16" } else { "owl_cast_f16_bf16" },
             shape: SENTINEL_1D,
+        }
+    }
+
+    /// 逐元素乘常数(F16 / BF16;成对指数移位,见 `cu/elems/scale.cu`)
+    pub fn scale(dt: DType) -> KernelPick {
+        match dt {
+            DType::F16 => KernelPick::of::<crate::ops::elems::ScaleF16>(SENTINEL_1D),
+            DType::BF16 => KernelPick::of::<crate::ops::elems::ScaleBf16>(SENTINEL_1D),
+            other => panic!("owl_scale 只有 f16/bf16 变体(dt={other:?})"),
         }
     }
 

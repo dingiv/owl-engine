@@ -179,6 +179,8 @@ pub enum SemanticKernel {
     TsStamp,
     /// f16 → bf16 铸边界(草稿装载)
     CastF16Bf16,
+    /// 逐元素乘常数(f16/bf16;GGUF 草稿 GEMM 的成对指数移位)
+    Scale,
     /// bf16 → f16 铸边界(草稿采样前)
     CastBf16F16,
     /// 设备侧贪心 argmax(采样;输出 [1] f32 索引数值)
@@ -343,6 +345,7 @@ impl SemanticKernel {
             SemanticKernel::CtRepackA8 => "load.ct_repack_a8",
             SemanticKernel::TsStamp => "ops.ts_stamp",
             SemanticKernel::CastF16Bf16 => "elems.cast_f16_bf16",
+            SemanticKernel::Scale => "elems.scale",
             SemanticKernel::CastBf16F16 => "elems.cast_bf16_f16",
             SemanticKernel::Argmax => "ops.argmax",
             SemanticKernel::Topk16 => "ops.topk16",
