@@ -36,14 +36,14 @@ mode = "single"
 device = ["42:00.0"]
 
 [runtime]
-max_seq = 221184
+max_seq = 196608  # 192k(main 线 `full.toml` 的固定开销比 feat 线大 ⇒ 上限略低)
 max_concurrency = 1
 
 [pool]
 pool_tokens = 0  # **0 = 自动**(= max_seq;父档 full.toml 有值,子档只能显式清零)
 gdn_slots = 1
 vram_target = 1.0   # 硬预算:不留空(0.99 曾静默禁用治理器)
-vram_reserve_mb = 384  # 池后还要留 per-turn 瞬态(34~300 MiB)+ 未入账固定开销(~1.6 GiB)
+vram_reserve_mb = 768  # 池后还要留 per-turn 瞬态(34~300 MiB)+ 未入账固定开销
 
 [spec]
 depth = 7
