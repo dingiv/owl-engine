@@ -1774,8 +1774,11 @@ fn boot_pool_plan(
 ) -> crate::state::PoolPlan {
     // **自动档**(2026-10-21):`[pool].pool_tokens` 未写 ⇒ 池 = 本档 ctx,
     // 由 `StatePool::alloc` 按显存预算校验并回报 `ctx_max`(不再 2× 单会话)。
-    let pool_auto = cfg.knobs.pool_tokens.is_none();
-    let pool_tokens = cfg.knobs.pool_tokens.unwrap_or(s);
+    // `pool_tokens` 缺省**或 0** ⇒ 自动(= 本档 max_seq)。0 是必要的逃生口:
+    // 档位走 `extends` 继承时,子档"不写"会继承父档的值,只有显式 `0` 能表达
+    // "本档要自动"(而 `PoolCfg::pinned_pool_tokens` 也把 0 视为未钉)。
+    let pool_auto = cfg.knobs.pool_tokens.map_or(true, |n| n == 0);
+    let pool_tokens = cfg.knobs.pool_tokens.filter(|n| *n > 0).unwrap_or(s);
     let plan = crate::state::PoolPlan {
         seq_tokens: s,
         pool_tokens,
