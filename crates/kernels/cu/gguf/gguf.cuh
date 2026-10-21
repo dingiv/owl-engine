@@ -573,7 +573,14 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
     return sumi*d5d8 + m5s8 / (QI5_1 / vdr);
 }
 
-#define VDR_Q8_0_Q8_1_MMVQ 2
+// **q8_0 解码档 VDR=4**(2026-10-21 实测;上游同代 = 2)
+//
+// VDR = 每条 lane 在一个 32B 块里吃几个 4B 整数。2 ⇒ 4 lane/块,单 lane
+// 只有 2 个 dp4a + 4 次 16-bit load,访存 ILP 不足;4 ⇒ 2 lane/块、单 lane
+// 4 个 dp4a + 16B,3090 Ti 单步 `decode.step` p50 **25.68→25.01ms(-2.6%)**、
+// std decode 38.61→39.62 t/s。8 与 4 持平(25.08ms,寄存器压力抵消);
+// 取 4。门 = `gpu_gguf_gemm_matches_cpu_reference`(m=1/4 都走 MMVQ)。
+#define VDR_Q8_0_Q8_1_MMVQ 4
 #define VDR_Q8_0_Q8_1_MMQ 8
 
 template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_q8_1_impl(

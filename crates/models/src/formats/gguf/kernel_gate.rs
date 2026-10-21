@@ -86,6 +86,8 @@ mod tests {
         let cases: &[(&str, &str, usize)] = &[
             ("blk.0.attn_gate.weight", "Q4_K", 3),
             ("blk.0.ssm_out.weight", "Q8_0", 4),
+            // decode 形状 = m1(VDR=4 的 q8_0 MMVQ 必须单独过门;2026-10-21)
+            ("blk.0.ssm_out.weight", "Q8_0", 1),
             ("blk.0.attn_qkv.weight", "Q6_K", 2),
             // 4B 的 **Q5_K 两张**(`attn_k` / `attn_output`)—— 2026-10-19 补:
             // 原先四型门漏了 Q5_K,而它正是 4B 与 27B 的**唯一型差**
