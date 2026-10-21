@@ -88,7 +88,7 @@
 //! | dispatch | gdn_chunked | bool / **true**(定谳;形状门自动回落) |
 //! | dispatch | gdn_scalar / kv_fp8 | flag / false |
 //! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
-//! | dispatch | **verify_arm / decode_arm** | **单值枚举** / "v2"(=decode "prefill")、fi、xqa、prefill(2026-10-21 取代三/两个布尔) |
+//! | dispatch | **verify_arm / decode_arm** | **单值枚举** / "v2" 缺省(fi、xqa、prefill 为候选;decode 无 prefill)(2026-10-21 取代三/两个布尔) |
 //! | dispatch | fi_cuda_graph | bool / false(图档瓦; FI 臂的配套件) |
 //! | dispatch | fi_plan_bake / fi_plan_restore | Option<usize>(0=取 max_seq)、bool / true |
 //! | dispatch | allowed_ops | **已退役**(旧键 `deny_unknown_fields` 拒启;准入走 tag filter) |
@@ -761,13 +761,18 @@ impl VerifyArm {
 
 /// **decode(T=1)注意力臂**（同律:单值、有序、互斥）。
 ///
-/// 取值：`prefill`(缺省，= v2 主核 + LSE 归并）· `fi`（需 `fi_plan_bake`）· `xqa`。
+/// 取值：`v2`(缺省，= 分页 **v2 主核 + LSE 归并**）· `fi`（需 `fi_plan_bake`）· `xqa`。
+///
+/// ⚠️ 缺省档**曾经叫 `prefill`**（历史日志标签"prefill族"的遗留）—— 那是错名：
+/// 该臂跑的是 `owl_paged_attention_v2*` + reduce 的 **decode 形状核**，
+/// 与 prefill 族（qo_len=T 单遍）毫无关系。2026-10-21 随单键化一并正名
+/// （与 [`VerifyArm::V2`] 同名同义:同一个 v2 分页族）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DecodeArm {
-    /// v2 主核（paged + LSE 归并；缺省）
+    /// v2 分页主核（flash-decoding:partials + LSE 归并；缺省）
     #[default]
-    Prefill,
+    V2,
     /// FI 图内臂（session 图分段捕获；**需 `fi_plan_bake`**）
     Fi,
     /// XQA 裸 decode 臂（kNHD fp8 池；feature `xqa`）
@@ -778,7 +783,7 @@ impl DecodeArm {
     /// 日志/自证行用短名（与 `attn.arm.decode.*` 的标签同字）
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Prefill => "prefill",
+            Self::V2 => "v2",
             Self::Fi => "fi",
             Self::Xqa => "xqa",
         }
@@ -817,7 +822,7 @@ pub struct DispatchCfg {
     /// decode(T=1)走的注意力臂 —— 同上，同样**单键**。
     ///
     /// 旧面 = `decode_fi` / `decode_xqa` 两个布尔(同为「谁先命中」语义)。
-    /// 取值:`"prefill"`(缺省，即 v2 主核)· `"fi"`(需 `fi_plan_bake`）· `"xqa"`。
+    /// 取值:`"v2"`(缺省，分页 v2 主核 + LSE 归并)· `"fi"`(需 `fi_plan_bake`)· `"xqa"`。
     #[serde(default)]
     pub decode_arm: DecodeArm,
     /// **decode 走"单图烘 plan"**(2026-10-18 图档单图 W3):
@@ -1308,7 +1313,7 @@ impl Default for DispatchCfg {
             prefill_split: false,
             force_naive_prefill: false,
             verify_arm: VerifyArm::V2,
-            decode_arm: DecodeArm::Prefill,
+            decode_arm: DecodeArm::V2,
             // piecewise 段驱动件:**缺省关**(2026-10-15 立项;A/B 先证机制
             // 零回归,定谱后再翻默认 —— 同 verify_xqa 的翻法)
             fi_plan_bake: None,
@@ -2038,10 +2043,10 @@ mod tests {
         }
         // decode 侧同律
         assert_eq!(
-            toml::from_str::<DispatchCfg>("decode_arm = \"prefill\"")
+            toml::from_str::<DispatchCfg>("decode_arm = \"v2\"")
                 .expect("解析")
                 .decode_arm,
-            DecodeArm::Prefill
+            DecodeArm::V2
         );
         // `fi` 臂 = 图内臂 + 窗外刷表 ⇒ 缺上界拒启(不静默补)
         let e = OwlConfig::from_toml_str("[dispatch]\nverify_arm = \"fi\"\n")

@@ -203,7 +203,9 @@ DFlash2 草稿 = 标准 `build_attn` + **非因果 mask**(`src/models/dflash.cpp
   `verify 面事实: FI 节点登记=true | 臂事实(attn.arm.verify.*):v2=32`
   —— **看臂事实、别看节点登记**(这条路子以后所有 A/B 都照此核对)。
 - ✅ **该坑已结构性消除**(同日 `3bff4ed`):三/两个布尔收成**单值枚举**
-  `[dispatch] verify_arm = "v2"|"fi"|"xqa"|"prefill"` / `decode_arm = "prefill"|"fi"|"xqa"`;
+  `[dispatch] verify_arm = "v2"|"fi"|"xqa"|"prefill"` / `decode_arm = "v2"|"fi"|"xqa"`
+  (**decode 侧没有 `prefill`**:它跑的是分页 v2 主核 + LSE 归并;
+  旧日志标签"prefill族"是错名,已随单键化正名为 `v2`);
   图面槽位与层内核选择共用同一个 `uses_fi()`,旧布尔键 `deny_unknown_fields` 拒启。
   现在"开了 FI 却跑 v2"**无法表示**。
 - 真开 FI 后(`verify=fi=32`),verify 图 GPU(`[verify-prof] pure`):

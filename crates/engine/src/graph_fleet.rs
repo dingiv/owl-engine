@@ -297,21 +297,22 @@ impl<D: DeviceClient> GraphFleet<D> {
         // ⚠️ 判据 = 建树期"FI 面是否真登记"(`*_fi_node`),**不是旋钮** ——
         // 按旋钮猜曾把"FI 根本没进图、跑的是回落臂"报成 "FI(单图)"(坑册 §58)。
         {
-            // 报法 = **节点事实 × 请求臂**:fi 节点登记而请求臂不是 fi(或反之)
-            // 都会在此行暴露 —— 这正是 2026-10-21 单键化前的静默坑。
-            let arm = |fi_node: bool, want: &str, node_short: &str| -> String {
+            // 报法 = **请求臂 + 节点事实**:`fi(图内FI)` = 臂是 fi 且图里真有 FI 槽;
+            // 若臂是 fi 但没有 `(图内FI)` 后缀 ⇒ 图/层两套真源打架(单键化前的
+            // 静默坑),这一行直接暴露。
+            let arm = |fi_node: bool, want: &str| -> String {
                 if fi_node {
-                    format!("FI(单图;臂={want})")
+                    format!("{want}(图内FI)")
                 } else {
-                    format!("{node_short}(臂={want})")
+                    want.to_string()
                 }
             };
             owl_shared::log_info!(
                 "boot",
                 "现役臂: prefill={} | verify={} | decode={} | spec=depth{} | kv_fp8={}",
                 if boot.knobs.env.attn.fi { "FI" } else { "自研读核" },
-                arm(verify_fi_node, boot.knobs.env.attn.verify_arm.as_str(), "节点无FI"),
-                arm(decode_fi_node, boot.knobs.env.attn.decode_arm.as_str(), "节点无FI"),
+                arm(verify_fi_node, boot.knobs.env.attn.verify_arm.as_str()),
+                arm(decode_fi_node, boot.knobs.env.attn.decode_arm.as_str()),
                 boot.spec.depth,
                 boot.pool.kv_fp8,
             );

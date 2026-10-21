@@ -834,7 +834,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         owl_shared::config::PrefillBucket::T512 => "FI(t512)",
         owl_shared::config::PrefillBucket::Geobuckets => "FI(全桶族)",
     };
-    // **单值臂**(2026-10-21):"prefill" = v2 主核(历史上叫 eager/piecewise)
+    // **单值臂**(2026-10-21):"v2" = 分页 v2 主核(历史上被误叫 prefill/eager)
     let decode = c.dispatch.decode_arm.as_str();
     out.push_str(&format!(
         "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{} reuse={} batch={} vision={}\n",

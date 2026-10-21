@@ -263,7 +263,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             b.set("graph.prefill_bucket", "off".into(), "intent.graphs = off");
             b.set("dispatch.fi_cuda_graph", false.into(), "intent.graphs = off");
             b.set("dispatch.fi_plan_restore", true.into(), "intent.graphs = off");
-            b.set("dispatch.decode_arm", "prefill".into(), "intent.graphs = off");
+            b.set("dispatch.decode_arm", "v2".into(), "intent.graphs = off");
             b.set("dispatch.verify_arm", "v2".into(), "intent.graphs = off");
             false
         }
@@ -286,7 +286,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                     b.set("graph.prefill_bucket", "off".into(), "graphs=auto 降级:不建 prefill 桶");
                     b.set("dispatch.fi_cuda_graph", false.into(), "graphs=auto 降级");
                     b.set("dispatch.fi_plan_restore", true.into(), "graphs=auto 降级");
-                    b.set("dispatch.decode_arm", "prefill".into(), "graphs=auto 降级");
+                    b.set("dispatch.decode_arm", "v2".into(), "graphs=auto 降级");
                     b.set("dispatch.verify_arm", "v2".into(), "graphs=auto 降级:verify 回 v2");
                     false
                 }
@@ -835,7 +835,7 @@ graphs = "auto"
         assert_eq!(get_bool(&v, "dispatch.fi_cuda_graph"), Some(false));
         assert_eq!(
             get(&v, "dispatch.decode_arm").and_then(|x| x.as_str()),
-            Some("prefill")
+            Some("v2")
         );
         assert_eq!(get_str_prefill_bucket(&v), "off");
     }
