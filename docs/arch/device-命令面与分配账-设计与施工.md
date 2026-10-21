@@ -930,3 +930,39 @@ fn flush(&mut self)                   // 一次提交 + 一次等待(空批 = �
 **门**:`owl-cpu/tests/command_face.rs` 11 条(含 queue/flush/空批/handle 拒)·
 `owl-cuda/tests/command_face_gate.rs` 4 条(含 **queued 两连发顺序 = o2=2a+b** 与往返账)·
 iface 11 · gpu_server 2 · workspace check 干净。
+
+## 13.7 第一刀:解释器逐节点发射转 `queue`(2026-10-21)
+
+### 改了什么(`crates/models/src/interpreters/eval.rs`)
+
+| 件 | 内容 |
+|---|---|
+| `EvalCtx::emit_launch` / `emit_launch_pooled` | 发射的**唯一入口**:有块池 ⇒ `queue`(攒批);无池 ⇒ 单条 `launch`(批长恒 1) |
+| 7 处 `launch` 站点 | 全部改走 `emit_launch`;**返回值本就全部丢弃**(输出块 = 实参末位 Block,客户端侧已定) |
+| `flush_batch()` | 累积批的提交口(空批零往返);错误**原样上抛**(不包 `Msg` ⇒ 保住 `is_fatal`) |
+| 命令面纪律落点 | 在**任何单条命令之前**先 flush:`alloc_out`(池未命中 / 池命中带 Zeros)、`release_block`(非池路径)、`flush_pool`、`htod`、tap 的 `dtoh` |
+| 收尾/错误路径 | 三个入口(`eval_ops_env` / `eval_ops_multi_env` / `eval_multi_scoped_inner`)都在返回前 flush;错误路径也 flush(否则句柄被"还有 N 条未提交"毒住) |
+
+**为什么按"有没有块池"分档**(不是随手开关,是实测判据):
+池开时逐节点 `alloc` 命中池 = **零命令** ⇒ 一连串发射能真的攒成批;
+池关时每个节点前面必有一次真 `alloc`(单条命令,必须保序)⇒ 批长退回 1,
+硬攒只是**多一次信封开销**(实测 +7%)。
+
+### A/B(真卡 3080 `01:00.0`;200 节点 `add` 链,N=256;三次取最好)
+
+| 块池预算 | 逐条 await(旧) | queue+flush(新) | Δ |
+|---|---:|---:|---:|
+| 64 MiB | 48.03 µs/节点 | **27.37 µs/节点** | **−43%** |
+| 0(缺省) | 96.87 µs/节点 | 96.87 µs/节点 | 0(设计如此) |
+
+旁证:**块池本身**就是最大的一刀(96.9 → 48.0 µs/节点,旧代码下已成立)——
+它把"每节点 alloc+free+launch 三次往返"压成"一次发射"。
+⇒ **下一刀 = 把 `OWL_BLOCK_POOL` 升格为配置键并默认开**(见 §13.8 待办),
+再用 27B 真模型复核显存峰值与 prefill 绝对值。
+
+### 门
+
+`crates/models/tests/eval_batch_gate.rs`(真卡 2 条):解释器批处理**数值不变**(含非 256 对齐尾块)
++ **"没有任何发射绕过 queue"**的回归哨(绕过 ⇒ 命令面"未提交"拒 ⇒ 红)·
+`eval_batch_bench.rs`(诊断,A/B 夹具;无 `OWL_TEST_DEVICE` 即 skip)·
+`owl-models` 282 · `owl-engine` 115 · CPU/GPU 命令面门全绿。
