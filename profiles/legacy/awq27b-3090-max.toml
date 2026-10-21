@@ -75,12 +75,12 @@ kv_fp8 = true
 # GDN prefill FLA 五核(大 T;形状门自动回落)
 gdn_chunked = true
 # FI 单图 decode:上界烘死(0 = 哨兵取 max_seq),表由引擎窗外每步刷
-decode_fi = true
+decode_arm = "fi"          # 单值臂(2026-10-21)
 fi_cuda_graph = true
 fi_plan_bake = 0
 fi_plan_restore = false
-# 无投机 ⇒ verify 面不建;显式关掉 v2 避免任何预填族歧义
-verify_v2 = false
+# 无投机 ⇒ verify 面不建;臂留 v2(缺省)以免任何预填族歧义
+verify_arm = "v2"
 # 生产算子白名单(deny-by-default;本档实际用到的全集)
 
 [kvmem]

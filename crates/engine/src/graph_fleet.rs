@@ -297,23 +297,21 @@ impl<D: DeviceClient> GraphFleet<D> {
         // ⚠️ 判据 = 建树期"FI 面是否真登记"(`*_fi_node`),**不是旋钮** ——
         // 按旋钮猜曾把"FI 根本没进图、跑的是回落臂"报成 "FI(单图)"(坑册 §58)。
         {
-            let arm = |fi_node: bool, xqa: bool, v2: bool| -> String {
+            // 报法 = **节点事实 × 请求臂**:fi 节点登记而请求臂不是 fi(或反之)
+            // 都会在此行暴露 —— 这正是 2026-10-21 单键化前的静默坑。
+            let arm = |fi_node: bool, want: &str, node_short: &str| -> String {
                 if fi_node {
-                    "FI(单图)".to_string()
-                } else if xqa {
-                    "XQA".to_string()
-                } else if v2 {
-                    "v2".to_string()
+                    format!("FI(单图;臂={want})")
                 } else {
-                    "prefill族".to_string()
+                    format!("{node_short}(臂={want})")
                 }
             };
             owl_shared::log_info!(
                 "boot",
                 "现役臂: prefill={} | verify={} | decode={} | spec=depth{} | kv_fp8={}",
                 if boot.knobs.env.attn.fi { "FI" } else { "自研读核" },
-                arm(verify_fi_node, boot.knobs.env.attn.verify_xqa, boot.knobs.env.attn.verify_v2),
-                arm(decode_fi_node, boot.knobs.env.attn.decode_xqa, false),
+                arm(verify_fi_node, boot.knobs.env.attn.verify_arm.as_str(), "节点无FI"),
+                arm(decode_fi_node, boot.knobs.env.attn.decode_arm.as_str(), "节点无FI"),
                 boot.spec.depth,
                 boot.pool.kv_fp8,
             );
@@ -435,7 +433,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         // (`xqa_seq` = kv_len 的 **u32 位型** —— 核按 `const uint32_t*` 读,
         //  直接写 f32 数值会拿到浮点位型;`xqa_sem` = 每轮写零)。
         // 槽只在 `decode_xqa` 开时才加 ⇒ 关时图拓扑与历史一致(零影响)。
-        let xqa_decode_on = knobs.env.attn.decode_xqa;
+        let xqa_decode_on = matches!(knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa);
         let xqa_decode_ctx = if xqa_decode_on { pool.xqa_ctx() } else { None };
         let xqa_dec_sem_n = if xqa_decode_on { pool.xqa_sem_n() } else { 0 };
         // B4:decode 图 taps(DFlash2 降级期逐 token 草稿同步的取数面;
@@ -444,7 +442,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let decode_taps = boot.spec.dflash_tap_count > 0;
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
         let fi_nb = pool.nb;
-        let dfi_on = knobs.env.attn.decode_fi; // 闭包 'static:先取值(同 xqa_decode_on 纪律)
+        let dfi_on = knobs.env.attn.decode_arm.uses_fi(); // 闭包 'static:先取值(同 xqa_decode_on 纪律)
         // **图档单图烘 plan 档**(2026-10-18;`[dispatch] fi_plan_bake`):
         // Some(ctx) = decode **不进 piecewise**,FI 核留图内,且喂 FI 的
         // `ctx_total` 用该上界烘死 ⇒ 烘出的调度表按上界枚举工作项(运行期
@@ -608,7 +606,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                     }
                     // FI 断点臂(session/T=1;`decode_fi`):表四件套(位型过线,
                     // u32 → f32)。init 与占位 ctx_total(=1 行)自洽:nb_pages=1
-                    if knobs.env.attn.decode_fi {
+                    if knobs.env.attn.decode_arm.uses_fi() {
                         v.push(InputSlot::f32("fi_q_cu", 2).init(vec![0.0, f32::from_bits(1)]));
                         v.push(InputSlot::f32("fi_indices", pool.nb)
                             .init((0..pool.nb).map(|i| f32::from_bits(i as u32)).collect()));
@@ -831,7 +829,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 配置层已校验二者配套)。verify 恒随 `[dispatch] fi_plan_bake`
         // (`fi_plan_bake_verify` 旋钮已随断点面一并退役)。
         let vfi_bake: Option<usize> = knobs.fi_plan_bake;
-        let fi_want = knobs.env.attn.verify_fi;
+        // **臂 = 单值**(2026-10-21):verify 面是否带 FI 四件套槽,只看
+        // `verify_arm`;从前是 `verify_fi` 布尔 + 层内 `verify_v2` 抢前的隐性组合。
+        let fi_want = knobs.env.attn.verify_arm.uses_fi();
         let mut vouts = vec![
             OutputSlot { name: "tok".into(), shape: vec![depth1, 1], dtype: Dtype::F32 },
             OutputSlot { name: "hid".into(), shape: vec![depth1, dims.hidden], dtype: dims.dtype },

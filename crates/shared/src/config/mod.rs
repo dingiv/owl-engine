@@ -88,7 +88,8 @@
 //! | dispatch | gdn_chunked | bool / **true**(定谳;形状门自动回落) |
 //! | dispatch | gdn_scalar / kv_fp8 | flag / false |
 //! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
-//! | dispatch | verify_v2 / decode_fi / verify_fi / fi_cuda_graph | bool / true、false、false、false(成套:图档瓦 + 窗刷表) |
+//! | dispatch | **verify_arm / decode_arm** | **单值枚举** / "v2"(=decode "prefill")、fi、xqa、prefill(2026-10-21 取代三/两个布尔) |
+//! | dispatch | fi_cuda_graph | bool / false(图档瓦; FI 臂的配套件) |
 //! | dispatch | fi_plan_bake / fi_plan_restore | Option<usize>(0=取 max_seq)、bool / true |
 //! | dispatch | allowed_ops | **已退役**(旧键 `deny_unknown_fields` 拒启;准入走 tag filter) |
 //! | dispatch | tag_wildcard | bool / false(诊断 `*`:跳过 tag 过滤) |
@@ -719,6 +720,76 @@ impl Default for LoadCfg {
     }
 }
 
+/// **verify(T=depth+1)注意力臂**（单值、有序、互斥;2026-10-21 取代三布尔面）。
+///
+/// 为什么不是布尔：臂选择原本是 `attention.rs` 里的**明文 `if` 序列**，
+/// 而配置是三个可自由组合的布尔 ⇒ 「开了 FI 却一直跑 v2」是**可表示**的
+/// 配置（实测截获，见路线图 §9.1）。枚举把「想要哪个臂」这件事收成一个值，
+/// 层内只做**线性尝试**（本级能力门不满足 → 下一级），不再有优先级坑。
+///
+/// 取值（`serde` 小写串）：`v2`(缺省) ·  `fi` ·  `xqa` ·  `prefill`。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VerifyArm {
+    /// v2 伪序列臂（T=depth+1 行各自一条页链；长 ctx 实测最慢但零附加前提）
+    #[default]
+    V2,
+    /// FI 断点臂（图内单发 + plan 表窗外刷；**需 `fi_plan_bake`**）
+    Fi,
+    /// XQA spec-dec 臂（kNHD fp8 池；feature `xqa`）
+    Xqa,
+    /// 预填族（qo_len=T 单遍；不走 v2，也不走 FI）
+    Prefill,
+}
+
+impl VerifyArm {
+    /// 日志/自证行用短名（与 `attn.arm.verify.*` 的标签同字）
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V2 => "v2",
+            Self::Fi => "fi",
+            Self::Xqa => "xqa",
+            Self::Prefill => "prefill",
+        }
+    }
+
+    /// 本臂是否使用 FI（= 图面必须带 FI 四件套槽 + plan 上界）
+    pub const fn uses_fi(self) -> bool {
+        matches!(self, Self::Fi)
+    }
+}
+
+/// **decode(T=1)注意力臂**（同律:单值、有序、互斥）。
+///
+/// 取值：`prefill`(缺省，= v2 主核 + LSE 归并）· `fi`（需 `fi_plan_bake`）· `xqa`。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DecodeArm {
+    /// v2 主核（paged + LSE 归并；缺省）
+    #[default]
+    Prefill,
+    /// FI 图内臂（session 图分段捕获；**需 `fi_plan_bake`**）
+    Fi,
+    /// XQA 裸 decode 臂（kNHD fp8 池；feature `xqa`）
+    Xqa,
+}
+
+impl DecodeArm {
+    /// 日志/自证行用短名（与 `attn.arm.decode.*` 的标签同字）
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Fi => "fi",
+            Self::Xqa => "xqa",
+        }
+    }
+
+    /// 本臂是否使用 FI（= session 图必须带 FI 四件套槽 + plan 上界）
+    pub const fn uses_fi(self) -> bool {
+        matches!(self, Self::Fi)
+    }
+}
+
 /// 解释器分派面(models EnvProvider 组装源;**正语义** —— true = 开,
 /// env 面的 NO_FUSE 反开关是兼容遗留,不入 toml)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -728,12 +799,27 @@ pub struct DispatchCfg {
     pub qkv_fuse: bool,
     pub prefill_split: bool,
     pub force_naive_prefill: bool,
-    /// verify(T=depth+1)走的注意力臂:true = v2 伪序列臂(现状缺省);
-    /// false = 回落 prefill 族(--split / --chunked_opt)。
-    /// 2026-10-13 立(长 ctx 衰减 D3 立案):v2 伪序列臂在 ctx 8192 实测
-    /// 4.63ms/层(fp8),而 prefill 族是 qo_len=8 单遍形态 —— 本开关是
-    /// 两族 A/B 的唯一入口,定谳后固化其一,不留双路径。
-    pub verify_v2: bool,
+    /// verify(T=depth+1)走的注意力臂 —— **单键、有序、互斥**(2026-10-21)。
+    ///
+    /// 旧面 = 三个布尔(`verify_v2` / `verify_xqa` / `verify_fi`)叠加，臂由
+    /// `attention.rs` **明文顺序**决定 ⇒ 「开了 `verify_fi` 却什么都没变」是可
+    /// 表示的真实配置(实测截获:`verify_v2` 缺省 true 抢前，FI 节点登记了但
+    /// 永不执行)。现改为**一个枚举**:想要哪个臂就只写哪一个值，不存在
+    /// 「两个开关谁先命中」。
+    ///
+    /// 取值(次序 = 图层尝试序，每级都在**能力门**不满足时显式落下一级):
+    /// - `"v2"`(缺省)·  `"fi"` · `"xqa"` · `"prefill"`
+    ///
+    /// 能力门:FI 需 `fi_plan_bake` 在场(否则拒启);XQA 需 feature `xqa`
+    /// + kNHD fp8 池(否则落 v2)。
+    #[serde(default)]
+    pub verify_arm: VerifyArm,
+    /// decode(T=1)走的注意力臂 —— 同上，同样**单键**。
+    ///
+    /// 旧面 = `decode_fi` / `decode_xqa` 两个布尔(同为「谁先命中」语义)。
+    /// 取值:`"prefill"`(缺省，即 v2 主核)· `"fi"`(需 `fi_plan_bake`）· `"xqa"`。
+    #[serde(default)]
+    pub decode_arm: DecodeArm,
     /// **decode 走"单图烘 plan"**(2026-10-18 图档单图 W3):
     /// `Some(ctx)` = ① decode **不进 piecewise**(FI 核留捕获图内);
     /// ② 喂 FI 的 `ctx_total` 用该上界烘死 ⇒ 图自携该上界的调度表。
@@ -759,21 +845,7 @@ pub struct DispatchCfg {
     /// `owl_kernels::family::flashinfer::configure_plan_env` **唯一**写入。
     #[serde(default)]
     pub fi_cuda_graph: bool,
-    /// **verify 走 FI 断点臂**(V1b;需 `verify_piecewise`)——FI+split 换掉 XQA
-    pub verify_fi: bool,
-    /// **decode(T=1)走 FI 断点臂**(V1c;session 常驻图改分段,断点挂 decode 核)
-    pub decode_fi: bool,
-    /// verify 臂改走 **XQA**(kNHD fp8 池 + spec-dec q=1+K;feature `xqa`)。
-    /// 2026-10-13 D3:XQA 单算子实测 ctx8192 0.495ms vs v2 2.673ms(5.40×),
-    /// 数值 max|XQA−host| 4.5e-4(v2 4.6e-4)。缺省 false(定谳后再翻)。
-    pub verify_xqa: bool,
-    /// 裸 decode(T=1)改走 **XQA**(第二份实例化 `M_TILESIZE=16`;feature `xqa`)。
-    /// 2026-10-13 ② 立案:kernels crate 单算子实测(kNHD fp8/q=1/3090 Ti)
-    /// ctx 512/2048/8192 = 1.90× / 2.25× / **1.46×** vs v2 主核+reduce
-    /// (`crates/kernels/tests/xqa_decode_probe.rs`)。
-    /// 与 `verify_xqa` **独立**(走不同图:decode 常驻捕获图 vs verify 桶形图)。
-    pub decode_xqa: bool,
-    /// prefill(chunked q=T)注意力改走 **XQA**(与 verify **同一份
+    /// prefill(chunked q=T)注意力改走 **XQA**(与 verify **同一份**
     /// `M_TILESIZE=32` 实例化**;feature `xqa`;自 `feat/prefill-graph` 合入)。
     ///
     /// ⚠️ **只作 FI 缺口交接臂,不许放到 FI 之前**(CUPTI 逐核同请求 A/B:
@@ -1235,8 +1307,8 @@ impl Default for DispatchCfg {
             qkv_fuse: true,
             prefill_split: false,
             force_naive_prefill: false,
-            verify_v2: true,
-            verify_xqa: false,
+            verify_arm: VerifyArm::V2,
+            decode_arm: DecodeArm::Prefill,
             // piecewise 段驱动件:**缺省关**(2026-10-15 立项;A/B 先证机制
             // 零回归,定谱后再翻默认 —— 同 verify_xqa 的翻法)
             fi_plan_bake: None,
@@ -1244,9 +1316,6 @@ impl Default for DispatchCfg {
             // FI plan 图档瓦(2026-10-18 图档单图立案):**缺省关** —— 图档单图的
             // 其余件(W2 关自携 / W3 单图)未落地前开它只是换瓦片口径,不产生图。
             fi_cuda_graph: false,
-            verify_fi: false,
-            decode_fi: false,
-            decode_xqa: false,
             xqa_prefill: false,
             fi_min_tokens: 1,
             // 2026-10-20:**定谳后翻默认**(FLA 五核,生产 spec-dflash 长期在跑;
@@ -1785,13 +1854,19 @@ impl OwlConfig {
         // **W5 意图配套门**（2026-10-18）：FI 臂只有"图内臂"一种承载（核留图内 +
         // `ctx_total` 烘上界 + 表由 `fi_plan_sync` 窗外刷）。缺上界 ⇒ 捕获期会拿
         // **占位 ctx** 烘表（文本连贯但错，历史踩过）⇒ 响亮拒绝，不给静默错值。
-        if (self.dispatch.decode_fi || self.dispatch.verify_fi)
-            && self.dispatch.fi_plan_bake.is_none()
-        {
-            return Err(
-                "[dispatch] decode_fi/verify_fi 需要 fi_plan_bake 在场（断点面已退役：FI 核只能走                 图内臂 + 窗外刷表）—— 要么设 `fi_plan_bake`（0 = 取 max_seq），要么关掉 FI 臂"
-                    .to_string(),
-            );
+        // **臂 × FI 前置件的一致性门**(2026-10-21 单键化):FI 臂(verify/decode
+        // 任一)只有在 `fi_plan_bake` 在场时才能捕获(图内臂 + 窗外刷表)。
+        // 拒启而不是自动补 —— 静默补一个上界会让 `ctx_total` 烘错。
+        for (key, uses_fi) in [
+            ("verify_arm", self.dispatch.verify_arm.uses_fi()),
+            ("decode_arm", self.dispatch.decode_arm.uses_fi()),
+        ] {
+            if uses_fi && self.dispatch.fi_plan_bake.is_none() {
+                return Err(format!(
+                    "[dispatch] {key} = \"fi\" 需要 `fi_plan_bake` 在场\
+                     (FI 核只能走图内臂 + 窗外刷表:上界要么写 0 = 取 max_seq,要么写 ≥ max_seq 的值)"
+                ));
+            }
         }
         if self.dispatch.fi_plan_bake.is_some() && !self.dispatch.fi_cuda_graph {
             return Err(
@@ -1935,6 +2010,51 @@ mod tests {
         OwlConfig::from_toml_str("[pool]\ngdn_slots = 8\n[server]\nmax_concurrency = 2\n")
             .expect("格多于并发 = 合规");
         OwlConfig::default().validate().expect("缺省档 8/8");
+    }
+
+    /// **注意力臂单键化(2026-10-21)**:verify/decode 各**一个**枚举值。
+    ///
+    /// 为什么钉这个门:旧面是三个/两个布尔 + 图层里一段明文 `if` 顺序 ⇒
+    /// `verify_fi = true` 配上缺省的 `verify_v2 = true` 是**可表示**的配置,
+    /// 而实际跑的是 v2(FI 整条臂白开,只有 boot 的 `臂事实` 能看出来)。
+    /// 本门三条:①枚举字面量 ②旧布尔键**拒启**(不再有第二套接口)
+    /// ③`fi` 臂缺 `fi_plan_bake` 拒启(不是静默补上界)。
+    #[test]
+    fn attn_arm_is_single_valued() {
+        use VerifyArm::{Fi, Prefill as VPre, V2, Xqa};
+        let arm = |t: &str| -> VerifyArm {
+            toml::from_str::<DispatchCfg>(t).expect("解析").verify_arm
+        };
+        assert_eq!(arm(""), V2, "缺省 = v2(生产基线零变化)");
+        assert_eq!(arm("verify_arm = \"v2\""), V2);
+        assert_eq!(arm("verify_arm = \"fi\""), Fi);
+        assert_eq!(arm("verify_arm = \"xqa\""), Xqa);
+        assert_eq!(arm("verify_arm = \"prefill\""), VPre);
+        // 旧面:三布尔键已被 deny_unknown_fields 拒绝(响亮,不是静默忽略)
+        for old in ["verify_v2 = false", "verify_fi = true", "verify_xqa = false"] {
+            let e = OwlConfig::from_toml_str(&format!("[dispatch]\n{old}\n"))
+                .expect_err("旧布尔键必须拒启");
+            assert!(e.contains("unknown field"), "拒语应点名账外键: {e}");
+        }
+        // decode 侧同律
+        assert_eq!(
+            toml::from_str::<DispatchCfg>("decode_arm = \"prefill\"")
+                .expect("解析")
+                .decode_arm,
+            DecodeArm::Prefill
+        );
+        // `fi` 臂 = 图内臂 + 窗外刷表 ⇒ 缺上界拒启(不静默补)
+        let e = OwlConfig::from_toml_str("[dispatch]\nverify_arm = \"fi\"\n")
+            .expect_err("fi 臂缺 fi_plan_bake 必须拒");
+        assert!(e.contains("fi_plan_bake"), "拒语应指向缺件: {e}");
+        let e = OwlConfig::from_toml_str("[dispatch]\ndecode_arm = \"fi\"\n")
+            .expect_err("decode fi 臂缺 fi_plan_bake 必须拒");
+        assert!(e.contains("fi_plan_bake"), "拒语应指向缺件: {e}");
+        // 配上就过(与生产 spec-dflash 档同形)
+        OwlConfig::from_toml_str(
+            "[dispatch]\nverify_arm = \"fi\"\ndecode_arm = \"fi\"\n             fi_cuda_graph = true\nfi_plan_bake = 0\nfi_plan_restore = false\n",
+        )
+        .expect("fi 臂 + 三件套 = 合规");
     }
 
     /// **A4 收口(2026-10-19)**:`lrfu:λ` 解析回配置面。

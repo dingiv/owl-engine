@@ -3520,9 +3520,7 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
             if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
                 knobs.fi_cuda_graph = true;
                 knobs.fi_plan_bake = Some(128); // ≥ max_seq(本门 max_seq_tokens=128)
-                knobs.env.attn.verify_fi = true;
-                knobs.env.attn.verify_xqa = false;
-                knobs.env.attn.verify_v2 = false;
+                knobs.env.attn.verify_arm = owl_shared::config::VerifyArm::Fi;
             }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
@@ -3618,9 +3616,7 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
             if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
                 knobs.fi_cuda_graph = true;
                 knobs.fi_plan_bake = Some(2048); // ≥ max_seq(本门 max_seq_tokens=2048)
-                knobs.env.attn.verify_fi = true;
-                knobs.env.attn.verify_xqa = false;
-                knobs.env.attn.verify_v2 = false;
+                knobs.env.attn.verify_arm = owl_shared::config::VerifyArm::Fi;
             }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
@@ -3728,12 +3724,12 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
             // XQA 臂开关(2026-10-13;恒等门用 —— spec ≡ 无 spec / 裸 decode
             // 臂不破文本,是 XQA 进生产的唯一红线)
             if owl_shared::env_reader::flag("OWL_GATE_XQA") {
-                knobs.env.attn.verify_xqa = true;
+                knobs.env.attn.verify_arm = owl_shared::config::VerifyArm::Xqa;
             }
             // 裸 decode XQA 臂(2026-10-13 ②):baseline 轮(spec_depth=0)
             // 就走它 ⇒ 本门同时是"decode 臂不破文本"的红线
             if owl_shared::env_reader::flag("OWL_GATE_DECODE_XQA") {
-                knobs.env.attn.decode_xqa = true;
+                knobs.env.attn.decode_arm = owl_shared::config::DecodeArm::Xqa;
             }
             if let Some(p) = owl_shared::env_reader::parse::<usize>("OWL_GATE_POOL") {
                 knobs.pool_tokens = Some(p);

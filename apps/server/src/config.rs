@@ -634,13 +634,7 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
         } else {
             "FI"
         },
-        if c.dispatch.decode_fi {
-            "FI(single)"
-        } else if c.dispatch.decode_xqa {
-            "XQA"
-        } else {
-            "eager"
-        },
+        c.dispatch.decode_arm.as_str(),
         if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
         c.graph.prefill_bucket,
     );
@@ -840,13 +834,8 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         owl_shared::config::PrefillBucket::T512 => "FI(t512)",
         owl_shared::config::PrefillBucket::Geobuckets => "FI(全桶族)",
     };
-    let decode = if c.dispatch.decode_fi {
-        "FI(单图)"
-    } else if c.dispatch.decode_xqa {
-        "XQA"
-    } else {
-        "eager/piecewise"
-    };
+    // **单值臂**(2026-10-21):"prefill" = v2 主核(历史上叫 eager/piecewise)
+    let decode = c.dispatch.decode_arm.as_str();
     out.push_str(&format!(
         "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{} reuse={} batch={} vision={}\n",
         if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },

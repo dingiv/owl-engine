@@ -1462,9 +1462,10 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             draft_dt: spec.draft_dt,
             spec_mode: spec.mode,
             spec_depth: spec.depth,
-            xqa_verify: cfg.knobs.env.attn.verify_xqa,
+            xqa_verify: matches!(cfg.knobs.env.attn.verify_arm, owl_shared::config::VerifyArm::Xqa),
             // B-3e-2:部分驻留档**不带 XQA**(页表语义不共戴;见上方醒目告知)
-            xqa_decode: cfg.knobs.env.attn.decode_xqa && !cfg.knobs.select_partial,
+            xqa_decode: matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
+                && !cfg.knobs.select_partial,
             xqa_prefill: cfg.knobs.env.attn.xqa_prefill,
             gdn_slots: cfg.knobs.gdn_slots,
             max_batch: cfg.knobs.max_batch,
@@ -1507,7 +1508,9 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             );
             std::process::exit(2);
         }
-        if cfg.knobs.select_partial && cfg.knobs.env.attn.decode_xqa {
+        if cfg.knobs.select_partial
+            && matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
+        {
             owl_shared::log_warn!(
                 "boot",
                 "部分驻留档:本档**关掉 XQA 裸 decode 臂**(其页表语义读整条会话链,遇占位符 = 非法地址;\n                    \
