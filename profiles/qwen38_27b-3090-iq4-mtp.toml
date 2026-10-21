@@ -1,15 +1,16 @@
-# owl 档 `gguf4b-mtp` —— 4B Q4_K_M 单文件自带 NextN MTP 头 / 16k。
+# owl 档 `qwen38_27b-3090-iq4-mtp` —— 27B AWQ 主干 + 外部 GGUF MTP 头 / 16k。
 extends = ["full.toml"]
 
 [server]
-bind = "127.0.0.1:8142"
+bind = "127.0.0.1:8141"
 
 [model]
-name = "qwen3.5-4b-gguf-mtp"
-path = "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf"
-format = "gguf"
-quant = "q4k"
-head_quant = "off"
+name = "qwen3.8-27b-awq+gguf-mtp"
+path = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+format = "awq"
+quant = "w4a16"
+head_quant = "rtn-int4-g32"
+mtp_dir = "/home/div/Documents/codes/models/unsloth/Qwen3.8-27B-GGUF/MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
 
 [parallel]
 mode = "single"
@@ -20,7 +21,7 @@ max_seq = 16384
 max_concurrency = 1
 
 [pool]
-pool_tokens = 16384
+pool_tokens = 16896
 gdn_slots = 1
 vram_target = 0.99
 vram_reserve_mb = 512

@@ -2158,7 +2158,7 @@ Q2_K/Q3_K/IQ1_S/IQ2_XXS/IQ2_XS/IQ2_S 挡住（**不在 IQ3/IQ4 范围**，另案
 ### 24.6 性能基线 + 两刀优化(单 3090 Ti,2026-10-20)
 
 **靶位**:`Qwen3.5-0.8B-IQ4_XS`(470 MiB)· 对照臂 = 同族 `Q4_K_M`(508 MiB)
-**档**:`profiles/gguf08b-iq4xs.toml`(ctx 16k / pool 16k / chunk 1024 / greedy / 诊断 tag 通配)
+**档**:`profiles/qwen35_0_8b-3090-iq4xs.toml`(ctx 16k / pool 16k / chunk 1024 / greedy / 诊断 tag 通配)
 **工具**:`llm_speedtest --flavor std`(512/1024/2048/4096/8192 × 3 轮,输出 256 tok,单并发)
 
 | 版本 | prefill (t/s avg) | decode (t/s avg) | TTFT avg |
@@ -2361,7 +2361,7 @@ q4_K **10.66 ms(≈903 GB/s,已贴墙)** / q8_0 **8.37 ms(≈855 GB/s,原 8.98/7
 - `cargo test -p owl-engine --lib gpu_gguf_4b_vlm_image_smoke`:
   4B Q4_K_M + mmproj-F16,单图 prefill 出非空文本;
 - 同法 `gpu_gguf_27b_vlm_image_smoke`:27B Q4_K_M + mmproj-Q8_0(覆盖 Q8_0 臂);
-- 服务面真机(4B,`profiles/gguf4b-vlm.toml`,`42:00.0`):OpenAI `image_url`
+- 服务面真机(4B,`profiles/qwen35_4b-3090-q4km-vlm.toml`,`42:00.0`):OpenAI `image_url`
   data URL,bird.png → `Galapagos penguin`(HF 金标同);文本题 `Paris` 正常。
 
 **未做/边界**:视频;多图 batch;图像前缀缓存;视觉塔量化(仍 f16 驻留);

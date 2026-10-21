@@ -1,34 +1,34 @@
-# owl 档 `gguf4b-vlm` —— 4B Q4_K_M + mmproj 视觉塔 / 8k。
+# owl 档 `qwen35_4b-3090-q4km-mtp` —— 4B Q4_K_M 单文件自带 NextN MTP 头 / 16k。
 extends = ["full.toml"]
 
 [server]
-bind = "127.0.0.1:8143"
+bind = "127.0.0.1:8142"
 
 [model]
-name = "qwen3.5-4b-gguf-vlm"
+name = "qwen3.5-4b-gguf-mtp"
 path = "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf"
 format = "gguf"
 quant = "q4k"
 head_quant = "off"
-vision = true
-vision_path = "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf"
 
 [parallel]
 mode = "single"
 device = ["42:00.0"]
 
 [runtime]
-max_seq = 8192
+max_seq = 16384
 max_concurrency = 1
 
 [pool]
-pool_tokens = 8192
+pool_tokens = 16384
 gdn_slots = 1
 vram_target = 0.99
 vram_reserve_mb = 512
 
 [spec]
-depth = 0
+depth = 3
+draft = "mtp"
+draft_kv_fp8 = false
 
 [kernel]
 kv_fp8 = true

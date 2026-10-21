@@ -1,6 +1,6 @@
 # 调试工具速查(owl server / engine)
 
-前提:服务已起(例:`cd packages/owl && ./target/release/server -p profiles/spec-dflash.toml testdata/server/agent-27b.toml --log-level info`)。
+前提:服务已起(例:`cd packages/owl && ./target/release/server -p profiles/qwen38_27b-3090-w4a16-dflash.toml testdata/server/agent-27b.toml --log-level info`)。
 下面例子默认端口 8137,按实际改。
 
 ## 1. 诊断端点(`GET`,全部只读)
@@ -21,7 +21,7 @@
   与 `prefill.chunk` 分「前向 / 边界」两半)、`prefill.graph`(桶图**发射**成本,异步 ⇒ 天然小)、
   `prefill.bucket.hit[.t<n>]` / `.bypass.pad` / `.pad_rows[_skipped]` / `prefill.eager.{chunks,tokens}`、
   `prefill.extend`(草稿 KV 物化)、`dflash.prefill.encode`(逐块 DFlash2 encode)。
-- **spec**:`spec.round[.deg|.spec]` / `spec.verify` / `spec.propose[.step|.read|.btwt]` / `spec.extend` / `spec.snap` / `spec.emit`。
+- **spec**:`spec.round[.deg|.spec]` / `spec.verify` / `spec.propose[.step|.read|.btwt]` / `spec.extend` / `spec.snap` / `spec.emit` / `spec.mtp.window.{rounds,full,visible_tokens}`。
 - **decode**:`decode.step[.deg]` / `decode.sync`。
 - 计数器(counter)与计时器(timer)共用一个 tag 空间:采样面是 `count/total/p50/p99`,事实面是 `counter`。
 

@@ -264,7 +264,7 @@ pub fn audit_active(
 //   ② 池写集穷举审计的输入(`audit_active`);
 //   ③ P3 建表范围的依据(生产集 100% 建表 = 本表 ⊆ `all()`)。
 
-/// `-p profiles/spec-dflash.toml` 实测发射集(**49 个**;27B AWQ + DFlash2 d7 + fp8 主池
+/// `-p profiles/qwen38_27b-3090-w4a16-dflash.toml` 实测发射集(**49 个**;27B AWQ + DFlash2 d7 + fp8 主池
 /// + gdn_chunked + XQA verify/decode + int4 头;A5 后含 f16 主池族 4 项)
 ///
 /// **2026-10-14 A5 补丁**:追加 **f16 主池族**(4 个)。原先本集只锁 fp8 池
@@ -397,7 +397,7 @@ pub const PROD_GGUF4B_2026_10_19: &[&str] = &[
     "vllm_reshape_and_cache_f16_knhd",
 ];
 
-/// `-p profiles/awq27b.toml` 实测发射集(27 个;裸 27B AWQ + fp8 主池,无草稿/XQA)
+/// `-p profiles/qwen38_27b-3090-w4a16.toml` 实测发射集(27 个;裸 27B AWQ + fp8 主池,无草稿/XQA)
 pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
     "cublas_gemm_f16",
     "flashinfer_prefill_paged_fp8kv",
@@ -415,7 +415,7 @@ pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
     // 引擎态是 F16 ⇒ 装载期走**复合命令**(`UploadAndLaunch`,段复合)里的
     // bf16→f16 铸边界。**本表重启时缺它**,而 `launch_time` 记账只覆盖
     // `handle_launch`(复合口不进那条路径)⇒ "真跑 + 逐发射记账"的生成方法
-    // **系统性漏装载域算子**(现场:`-p profiles/awq27b.toml` + 草稿档启动即被准入拒:
+    // **系统性漏装载域算子**(现场:`-p profiles/qwen38_27b-3090-w4a16.toml` + 草稿档启动即被准入拒:
     // `Weight 'model.language_model.embed_tokens.weight': 段复合 contract
     // owl_cast_bf16_f16 … 未列入`)。
     "owl_cast_bf16_f16",

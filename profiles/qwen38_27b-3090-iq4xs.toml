@@ -1,4 +1,4 @@
-# owl 档 `gguf27b-iq` —— 27B UD-IQ4_XS 单卡 / 12k(纯 GGUF 块型)。
+# owl 档 `qwen38_27b-3090-iq4xs` —— 27B UD-IQ4_XS 单卡 / 12k(纯 GGUF 块型)。
 extends = ["full.toml"]
 
 [server]

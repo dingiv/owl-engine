@@ -1,4 +1,4 @@
-# owl 档 `gguf27b-iq-dflash` —— 27B UD-IQ4_XS + DFlash2-GGUF d7 / 12k。
+# owl 档 `qwen38_27b-3090-iq4xs-dflash` —— 27B UD-IQ4_XS + DFlash2-GGUF d7 / 12k。
 extends = ["full.toml"]
 
 [server]

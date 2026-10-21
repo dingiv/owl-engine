@@ -1,0 +1,40 @@
+# owl 档 `qwen38_27b-3090-q4km-vlm` —— 27B Q4_K_M + mmproj-Q8_0 视觉塔 / 8k。
+extends = ["full.toml"]
+
+[server]
+bind = "127.0.0.1:8144"
+
+[model]
+name = "qwen3.8-27b-gguf-vlm"
+path = "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf"
+format = "gguf"
+quant = "q4k"
+head_quant = "off"
+vision = true
+vision_path = "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf"
+
+[parallel]
+mode = "single"
+device = ["42:00.0"]
+
+[runtime]
+max_seq = 8192
+max_concurrency = 1
+
+[pool]
+pool_tokens = 8192
+gdn_slots = 1
+vram_target = 0.99
+vram_reserve_mb = 512
+
+[spec]
+depth = 0
+
+[kernel]
+kv_fp8 = true
+verify_arm = "fi"
+decode_arm = "fi"
+fi_plan_bake = true
+fi_plan_restore = false
+fi_cuda_graph = true
+tag_wildcard = false

@@ -1,17 +1,17 @@
-# owl 档 `gguf27b-vlm` —— 27B Q4_K_M + mmproj-Q8_0 视觉塔 / 8k。
+# owl 档 `qwen35_4b-3090-q4km-vlm` —— 4B Q4_K_M + mmproj 视觉塔 / 8k。
 extends = ["full.toml"]
 
 [server]
-bind = "127.0.0.1:8144"
+bind = "127.0.0.1:8143"
 
 [model]
-name = "qwen3.8-27b-gguf-vlm"
-path = "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf"
+name = "qwen3.5-4b-gguf-vlm"
+path = "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf"
 format = "gguf"
 quant = "q4k"
 head_quant = "off"
 vision = true
-vision_path = "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf"
+vision_path = "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf"
 
 [parallel]
 mode = "single"
