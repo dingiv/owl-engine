@@ -20,6 +20,7 @@
 
 pub mod convention;
 pub mod dequant;
+pub mod dequant_source;
 pub mod kernel_gate;
 pub mod load_gate;
 pub mod meta;
@@ -32,6 +33,7 @@ pub mod transform;
 
 pub use convention::GgufConvention;
 pub use dequant::{dequant_all, dequant_row};
+pub use dequant_source::GgufDequantSource;
 /// 量化型词表(块几何 + 可跑性映射在同一处;`owl_kernels` 为权威住址)
 pub use owl_kernels::family::gguf::{GgmlTy, Q8_1_BLOCK_BYTES};
 pub use meta::{rope_facts, spec_from_gguf, GgufRopeFacts, GgufSpecReport};

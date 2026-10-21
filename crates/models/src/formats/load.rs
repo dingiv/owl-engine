@@ -50,6 +50,10 @@ pub struct LoadOpts {
     pub staging_mb: usize,
     /// 逐键字节 dump(原 `OWL_LOAD_DUMP`;诊断面)
     pub dump: bool,
+    /// **GGUF host 解量化装载**(2026-10-21;MTP 头首用)。
+    /// 缺省 false = 生产零解量化通道(`GgufSource`);true = 小件/异型头
+    /// 走 `GgufDequantSource`(f32 元素面 → 目标 F16)。
+    pub gguf_dequant: bool,
 }
 
 impl LoadOpts {
@@ -66,13 +70,14 @@ impl LoadOpts {
             debug_tap: false,
             staging_mb: 128,
             dump: false,
+            gguf_dequant: false,
         }
     }
 
     /// 非量化/固定档(无设备重排 + 零探针):裸 safetensors f16 直拷、
     /// W4A16-CPU 重排等"不需要能力裁决"的装载点。
     pub fn plain(dtype: crate::contract::Dtype) -> Self {
-        Self { dtype, shard: 1, slice_id: 0, device_repack: Some(false), verify: false, debug_tap: false, staging_mb: 128, dump: false }
+        Self { dtype, shard: 1, slice_id: 0, device_repack: Some(false), verify: false, debug_tap: false, staging_mb: 128, dump: false, gguf_dequant: false }
     }
 
     /// 装载 ctx(旋钮 → LoaderCtx;唯一产地)
@@ -205,12 +210,18 @@ where
         // 起点的**事实面**(超参 / 词表 / 模板)不在这里 —— 它们由引擎侧从
         // 同一索引取(刀 2/刀 3):本函数只管"键 → 字节"。
         CheckpointKind::Gguf => {
-            let sel = (opts.shard > 1).then_some(crate::formats::gguf::ShardSel {
-                id: opts.slice_id,
-                world: opts.shard,
-            });
-            let src = crate::formats::gguf::GgufSource::open_shard(path, sel)?;
-            load_component(face, comp, &src, opts).await
+            if opts.gguf_dequant {
+                // 小件/异型头(MTP)专用:host 解成 f32 → 目标 F16
+                let src = crate::formats::gguf::GgufDequantSource::open(path)?;
+                load_component(face, comp, &src, opts).await
+            } else {
+                let sel = (opts.shard > 1).then_some(crate::formats::gguf::ShardSel {
+                    id: opts.slice_id,
+                    world: opts.shard,
+                });
+                let src = crate::formats::gguf::GgufSource::open_shard(path, sel)?;
+                load_component(face, comp, &src, opts).await
+            }
         }
     }
 }
@@ -1565,6 +1576,7 @@ mod generic_entry_tests {
             debug_tap: false,
             staging_mb: 128,
             dump: false,
+            gguf_dequant: false,
         };
 
         // 对照臂:同一声明 + 同一源,直接 eval_load(不经起点探测/开箱)
@@ -1708,6 +1720,7 @@ mod generic_entry_tests {
             debug_tap: false,
             staging_mb: 128,
             dump: false,
+            gguf_dequant: false,
         };
         let src = crate::formats::awq::AwqSource::open_dir(&dir).expect("awq 源");
         let old = eval_load(&mk(), &mut face, &src, &opts.ctx()).await.expect("eval_load(awq)");

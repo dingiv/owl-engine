@@ -424,6 +424,11 @@ pub struct ModelCfg {
     /// (z-lab)喂引擎 = 草稿全噪声 AL=0;装载期家族嗅探拒启)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dflash2_dir: Option<String>,
+    /// **MTP 头覆盖路径**(2026-10-21;`None` = 用 `model.dir` 自带 mtp.* /
+    /// 同 GGUF 文件)。用于"主模型 + 外部 GGUF MTP 头"的验证档;
+    /// 支持目录( HF/AWQ )或 `.gguf` 单文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtp_dir: Option<String>,
     /// C1(2026-10-11):untied lm_head 头部量化方案(枚举严格;映射点
     /// 在 engine loader:HeadQuant → QuantPlan)。质量门台账见枚举值注。
     pub head_quant: HeadQuant,

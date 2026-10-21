@@ -834,13 +834,21 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
                 );
             }
             match c.model.dir.as_deref() {
-                Some(dir) => match check_mtp_head(Path::new(dir)) {
-                    Ok(note) => out.push_str(&format!("[check] draft: {note}\n")),
-                    Err(e) => {
-                        ok = false;
-                        out.push_str(&format!("[check] FAIL: {e}\n"));
+                Some(dir) => {
+                    let mtp = c
+                        .model
+                        .mtp_dir
+                        .as_deref()
+                        .map(Path::new)
+                        .unwrap_or_else(|| Path::new(dir));
+                    match check_mtp_head(mtp) {
+                        Ok(note) => out.push_str(&format!("[check] draft: {note}\n")),
+                        Err(e) => {
+                            ok = false;
+                            out.push_str(&format!("[check] FAIL: {e}\n"));
+                        }
                     }
-                },
+                }
                 None => out.push_str(
                     "[check] draft: MTP 头随检查点装载;缺 model.dir 时无法预检 mtp.* 键\n",
                 ),
@@ -912,6 +920,29 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
 /// （config 不声明 `num_nextn_predict_layers`，但权重存在）。这里只读索引，
 /// 不做权重装载；无索引（单文件档）时留到装载期结构化拒绝。
 fn check_mtp_head(dir: &Path) -> Result<String, String> {
+    // GGUF 单文件:NextN 块 = `blk.<n>.nextn.eh_proj.weight`
+    if dir.is_file() {
+        if dir.extension().and_then(|s| s.to_str()) != Some("gguf") {
+            return Err(format!(
+                "MTP 头 {} 既不是目录也不是 .gguf 单文件",
+                dir.display()
+            ));
+        }
+        let g = owl_models::formats::gguf::Gguf::open(dir)
+            .map_err(|e| format!("打开 GGUF {} 失败: {e}", dir.display()))?;
+        let n = g
+            .tensors
+            .iter()
+            .filter(|t| t.name.starts_with("blk.") && t.name.contains(".nextn.eh_proj."))
+            .count();
+        if n == 0 {
+            return Err(format!(
+                "spec.draft=mtp 但 {} 没有 blk.<n>.nextn.eh_proj.*（该 GGUF 不带 MTP 头）",
+                dir.display()
+            ));
+        }
+        return Ok(format!("{} ✓ GGUF MTP / {} 个 NextN 块", dir.display(), n));
+    }
     let p = dir.join("model.safetensors.index.json");
     if !p.is_file() {
         return Ok(format!(

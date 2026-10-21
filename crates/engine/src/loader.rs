@@ -87,6 +87,8 @@ pub struct ModelLoader<'a, D: DeviceClient> {
     max_seq: usize,
     /// 视觉塔(`[model].vision`;false = 纯文本路径逐字节不变)
     vision: bool,
+    /// MTP 头覆盖路径(目录或 `.gguf`;None = 检查点自带)
+    mtp_override: Option<std::path::PathBuf>,
 }
 
 impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
@@ -100,7 +102,14 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             rope: owl_shared::config::RopeCfg::default(),
             max_seq: 0,
             vision: false,
+            mtp_override: None,
         }
+    }
+
+    /// MTP 头覆盖(`[model].mtp_dir`;None = 检查点自带)
+    pub fn mtp_override(mut self, p: Option<std::path::PathBuf>) -> Self {
+        self.mtp_override = p;
+        self
     }
 
     /// **rope 外推档**(`[model.rope]` + `runtime.max_seq`;GGUF 装载用)。
@@ -325,6 +334,18 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         );
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
+        // MTP/NextN 头(2026-10-21):GGUF 单文件里 MTP 块 = `blk.<n>.nextn.*`
+        // + 同块全解码层;n = 解码层数。存在 ⇒ 把**同一文件**作为 mtp_dir
+        // 交给 spec_runtime 的 GGUF MTP 装载分支(单文件自给)。
+        let mtp_block = (0..=spec.layer_types.len())
+            .find(|i| src.gguf().index_of(&format!("blk.{i}.nextn.eh_proj.weight")).is_some());
+        let mtp_dir = mtp_block.map(|_| path.to_path_buf());
+        if let Some(b) = mtp_block {
+            owl_shared::log_info!(
+                "boot",
+                "GGUF 自带 MTP/NextN 块:blk.{b}.nextn.*（spec.draft=mtp 时由同一文件装载）"
+            );
+        }
         // 装载分相(启动时间是生产指标:哪一相贵要看得出来;测试档也上屏)
         eprintln!(
             "[gguf] 装载分相:容器+维度 {:.2}s + 计划/构造 {:.2}s + 权重 {:.2}s + 词表/rope {:.2}s = {:.2}s",
@@ -341,7 +362,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             spec,
             // 逐张量计划(GGUF):单一值表达不了 ⇒ None(见字段文档)
             quant_plan: None,
-            mtp_dir: None,
+            mtp_dir: self.mtp_override.clone().or(mtp_dir),
             vlm: None,
         })
     }
@@ -546,7 +567,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             rope,
             spec,
             quant_plan: Some(quant_plan),
-            mtp_dir: Some(dir.to_path_buf()),
+            mtp_dir: self.mtp_override.clone().or(Some(dir.to_path_buf())),
             vlm,
         })
 

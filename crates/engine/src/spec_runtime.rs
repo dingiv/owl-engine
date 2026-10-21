@@ -105,8 +105,10 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) family: SpecDraft,
     /// DFlash2 草稿检查点目录(None = 无该族草稿器)
     pub(crate) dflash2_dir: Option<&'a str>,
-    /// MTP 草稿检查点目录(检查点自带 mtp.* 时 Some)
+    /// MTP 草稿检查点目录 / GGUF 单文件(检查点自带 mtp.* 或 `blk.N.nextn.*` 时 Some)
     pub(crate) mtp_dir: Option<&'a std::path::Path>,
+    /// 主模型 spec(GGUF MTP 与 target 同维;路径档不读它)
+    pub(crate) spec: &'a owl_models::model::ModelSpec,
     /// 哑草稿诊断位(无真草稿器时的 Dumb 档)
     pub(crate) dumb: bool,
     /// 草稿池 e4m3(B6 偷显存;AL 有损需 A/B)
@@ -144,7 +146,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             SpecDraft::Mtp => {
                 if inp.mtp_dir.is_none() {
                     return Err(ModelError::Msg(
-                        "spec.draft = \"mtp\" 但当前检查点没有 mtp.* 头(27B AWQ 检查点自带;0.8B/外部草稿档请用 dflash2)"
+                        "spec.draft = \"mtp\" 但当前检查点没有 mtp.* / blk.N.nextn.* 头(27B AWQ/带 MTP 的 GGUF 自带;0.8B/外部草稿档请用 dflash2)"
                             .into(),
                     ));
                 }
@@ -190,23 +192,34 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     let drafter = match mode {
         SpecMode::Mtp => {
             let dir = inp.mtp_dir.ok_or_else(|| ModelError::EngineInvariant { what: "Mtp 模式缺 mtp_dir(模式裁决与输入不一致)".into() })?;
-            // MTP 头 = 检查点内 BF16 权重,经装载源归一到 F16;草稿池也按
-            // 目标模型 dtype(F16)分配。**不是** BF16 草稿池。
+            // MTP 头 = 检查点内 BF16 权重 / GGUF Q6_K 块,经装载源归一到 F16;
+            // 草稿池也按目标模型 dtype(F16)分配。**不是** BF16 草稿池。
             draft_dt = owl_models::contract::Dtype::F16;
-            // 声明构造走起点事实(同一份 27B 检查点的 spec;报告已由主模型装载
-            // 路径上屏,此处不重报);装载走通用入口
-            let (spec, _rep) = owl_models::model::ModelSpec::from_ckpt(
-                std::path::Path::new(dir),
-                owl_models::formats::spec::SpecSource::family(
-                    &owl_models::formats::qwen35::qwen3_8_27b(),
-                ),
-            )?;
-            // P2.1-a:草稿与主干同 TpPlan(单卡 ⇒ `sharded` 恒等)
-            let spec = shard_draft_plan(spec, inp.tp)?;
-            let mtp = owl_models::layers::mtp::MtpPredictor::from_spec(&spec);
-            let opts = draft_load_opts(face, owl_models::contract::Dtype::F16, inp.tp, &inp.load);
-            owl_models::formats::load::load_from_dir(std::path::Path::new(dir), face, &mtp, opts).await?;
-            owl_shared::log_info!("boot", "MTP 草稿头装载(spec depth={depth})");
+            let is_gguf = dir.extension().and_then(|s| s.to_str()) == Some("gguf");
+            let spec = if is_gguf {
+                // GGUF 单文件:MTP 与 target 同维(同一 spec);块号 = 解码层数
+                shard_draft_plan(inp.spec.clone(), inp.tp)?
+            } else {
+                // 声明构造走起点事实(同一份 27B 检查点的 spec;报告已由主模型
+                // 装载路径上屏,此处不重报);装载走通用入口
+                let (spec, _rep) = owl_models::model::ModelSpec::from_ckpt(
+                    dir,
+                    owl_models::formats::spec::SpecSource::family(
+                        &owl_models::formats::qwen35::qwen3_8_27b(),
+                    ),
+                )?;
+                // P2.1-a:草稿与主干同 TpPlan(单卡 ⇒ `sharded` 恒等)
+                shard_draft_plan(spec, inp.tp)?
+            };
+            let mtp = if is_gguf {
+                owl_models::layers::mtp::MtpPredictor::from_spec_gguf(&spec, spec.layer_types.len())
+            } else {
+                owl_models::layers::mtp::MtpPredictor::from_spec(&spec)
+            };
+            let mut opts = draft_load_opts(face, owl_models::contract::Dtype::F16, inp.tp, &inp.load);
+            opts.gguf_dequant = is_gguf;
+            owl_models::formats::load::load_from_dir(dir, face, &mtp, opts).await?;
+            owl_shared::log_info!("boot", "MTP 草稿头装载(spec depth={depth};{})", if is_gguf { "GGUF" } else { "HF/AWQ" });
             Some(Drafter::Mtp(Arc::new(mtp)))
         }
         SpecMode::DFlash2 => {

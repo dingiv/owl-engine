@@ -561,6 +561,7 @@ impl EngineKnobs {
                 family: cfg.spec.draft,
                 dumb: cfg.spec.dumb,
                 dflash2_dir: cfg.model.dflash2_dir.clone(),
+                mtp_dir: cfg.model.mtp_dir.as_ref().map(std::path::PathBuf::from),
                 kv_quant: if cfg.spec.draft_kv_fp8 {
                     owl_models::env::KvQuant::Fp8E4M3
                 } else {
@@ -672,6 +673,8 @@ pub struct DraftCfg {
     pub dumb: bool,
     /// DFlash2 草稿检查点目录(⚠️ W4A16 量化家族 syvai 系)
     pub dflash2_dir: Option<String>,
+    /// MTP 头覆盖路径(目录或 `.gguf`;None = 检查点自带)
+    pub mtp_dir: Option<std::path::PathBuf>,
     /// 草稿池 KV 存储(None = f16;Fp8E4M3 = 偷显存档,原 draft_kv_fp8 布尔)
     pub kv_quant: owl_models::env::KvQuant,
     /// verify taps 退回 last_hidden(排查开关)
@@ -690,6 +693,7 @@ impl Default for DraftCfg {
             family: owl_shared::config::SpecDraft::Auto,
             dumb: false,
             dflash2_dir: None,
+            mtp_dir: None,
             kv_quant: owl_models::env::KvQuant::None,
             notaps: false,
             tapdecl: false,
@@ -939,6 +943,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
     /// `load` 旋钮来自配置(`[load]` 段;用户裁决 2026-10-19:不读 env)。
     pub fn loader(&mut self) -> ModelLoader<'_, DeviceHandle<D>> {
         ModelLoader::new(&mut self.face, self.cfg.knobs.load.clone())
+            .mtp_override(self.cfg.knobs.draft.mtp_dir.clone())
             .rope(self.cfg.knobs.rope.clone(), self.cfg.max_seq_tokens)
             .vision(self.cfg.knobs.vision)
     }
@@ -1622,6 +1627,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             family: cfg.knobs.draft.family,
             dflash2_dir: cfg.knobs.draft.dflash2_dir.as_deref(),
             mtp_dir: rm.mtp_dir.as_deref(),
+            spec: &rm.spec,
             dumb: cfg.knobs.draft.dumb,
             draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
             notaps: cfg.knobs.draft.notaps,

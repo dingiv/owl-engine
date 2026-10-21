@@ -205,6 +205,42 @@ impl Loadable for crate::layers::dflash2::DFlash2Draft {
 /// base = "mtp",层序号恒 0 —— 键约定住 specs 家规的落点)。
 impl Loadable for crate::layers::mtp::MtpPredictor {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
+        if self.is_gguf() {
+            // GGUF 单文件:NextN 块 = `blk.<n>.nextn.*` + 同块全解码层。
+            // fc 的 in 维两半由 `GgufSource` 的虚拟键拆 Q6_K 行(零解量化);
+            // norm 走 `SourceFacts::GGUF`(w_off=false,文件已 +1)。
+            let b = self.gguf_block();
+            let g = crate::formats::gguf::GgufConvention::new();
+            return self
+                .fc_e()
+                .layout(ctx)
+                .map_keys(|_| format!("blk.{b}.nextn.eh_proj.e.weight"))
+                .chain(
+                    self.fc_h()
+                        .layout(ctx)
+                        .map_keys(|_| format!("blk.{b}.nextn.eh_proj.h.weight")),
+                )
+                .chain(
+                    self.layer()
+                        .layout(ctx)
+                        .map_keys(|k| g.layer_key(b, k)),
+                )
+                .chain(
+                    self.pre_fc_norm_hidden()
+                        .layout(ctx)
+                        .map_keys(|_| format!("blk.{b}.nextn.hnorm.weight")),
+                )
+                .chain(
+                    self.pre_fc_norm_embedding()
+                        .layout(ctx)
+                        .map_keys(|_| format!("blk.{b}.nextn.enorm.weight")),
+                )
+                .chain(
+                    self.norm_head()
+                        .layout(ctx)
+                        .map_keys(|_| format!("blk.{b}.nextn.shared_head_norm.weight")),
+                );
+        }
         let keys = Qwen35Convention::new("mtp");
         self.fc_e()
             .layout(ctx)
