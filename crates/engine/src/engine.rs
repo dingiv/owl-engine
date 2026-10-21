@@ -1387,6 +1387,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             spec_depth: spec.depth,
             tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
             head_int8: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt8Row,
+            head_int4: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt4G32,
             main_kv: Some(owl_models::kernel_env::KvCaps::from_env(&env)),
             draft_kv: (spec.depth > 0)
                 .then(|| owl_models::kernel_env::KvCaps::from_env(&spec.draft_env)),

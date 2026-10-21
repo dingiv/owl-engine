@@ -142,6 +142,21 @@ mod tests {
     }
 
     #[test]
+    fn w4a8_main_plus_int4_head_allows_both_weight_facets() {
+        // 头/草稿是**独立 plan**:主干 W4A8 与 aux W4A16 必须并集;
+        // 同 facet 内每个算子仍只带一个 tag,故不会产生双路由。
+        let f = TagFilter::from_tags(&[
+            KernelTag::QUANT_W4A8,
+            KernelTag::QUANT_AWQ,
+            KernelTag::QUANT_W4A16,
+        ]);
+        assert!(f.allows(meta("marlin_gemm_w4a8_awq")));
+        assert!(f.allows(meta("marlin_gemm_w4a16_awq")));
+        assert!(f.allows(meta("marlin_gemm_w4a16_bf16")));
+        assert!(!f.allows(meta("owl_gguf_gemm_q4k")));
+    }
+
+    #[test]
     fn main_and_draft_kv_facets_are_independent() {
         let f = TagFilter::from_tags(&[
             KernelTag::KV_MAIN_FP8,

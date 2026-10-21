@@ -76,6 +76,9 @@ pub struct FeatureCaps {
     pub tp_ranks: usize,
     /// lm_head 是否 int8 per-row(`owl_gemv_i8w_*` / `quant.int8` tag)
     pub head_int8: bool,
+    /// lm_head 是否 W4A16(AWQ)int4;与主干 W4A8/GGUF 共存时,
+    /// 允许集必须并入 `quant.w4a16`(头与主干是两个独立 plan)
+    pub head_int4: bool,
     /// 主 KV 池事实（None = 用当前 env；引擎 boot 显式给）
     pub main_kv: Option<KvCaps>,
     /// 草稿 KV 池事实（spec.depth>0 时给；None = 无草稿）
@@ -123,6 +126,12 @@ impl KernelSelectionEnv {
             }
             QuantPlan::Gguf(_) => tags.push(KernelTag::QUANT_GGUF),
             QuantPlan::F16 | QuantPlan::I8W => {}
+        }
+        // 头是独立 plan:主干 W4A8/GGUF 时,int4 头仍要放行 W4A16 核
+        // (`marlin_gemm_w4a16_awq`);主干 W4A16 时重复 push 无副作用。
+        if features.head_int4 {
+            tags.push(KernelTag::QUANT_W4A16);
+            tags.push(KernelTag::QUANT_AWQ);
         }
         let kv_tag = |kv: KvCaps, main: bool| -> KernelTag {
             match kv.quant {
@@ -345,6 +354,29 @@ mod tests {
         assert!(!allow("vllm_paged_attention_v2_f16_knhd_hd256bs32"));
         assert!(allow("owl_rmsnorm_f16"), "通用核无 quant/kv tag ⇒ 放行");
         assert!(allow("owl_gemv_i8w_f16"), "head int8 facet 命中");
+    }
+
+    #[test]
+    fn w4a8_main_with_int4_head_allows_aux_w4a16() {
+        use crate::module::QuantPlan;
+        let env = EnvProvider {
+            hw: HwEnv::Cuda(Arch::Sm86),
+            quant: QuantPlan::W4A8Awq,
+            ..EnvProvider::default()
+        };
+        let k = KernelSelectionEnv::from_env(
+            &env,
+            FeatureCaps { head_int4: true, ..FeatureCaps::default() },
+        )
+        .expect("CUDA");
+        let allow = |entry: &str| {
+            let m = owl_kernels::ops::meta(entry).unwrap_or_else(|| panic!("缺 {entry}"));
+            k.tag_filter.allows(m)
+        };
+        assert!(allow("marlin_gemm_w4a8_awq"), "主干 W4A8 必须放行");
+        assert!(allow("marlin_gemm_w4a16_awq"), "int4 头 W4A16 必须放行");
+        assert!(allow("marlin_gemm_w4a16_bf16"), "DFlash2 草稿 W4A16 必须放行");
+        assert!(!allow("owl_gguf_gemm_q4k"), "GGUF 仍应拒");
     }
 
     #[test]
