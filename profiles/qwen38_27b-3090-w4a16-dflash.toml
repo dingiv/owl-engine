@@ -1,7 +1,7 @@
-# owl 预设档 `spec-dflash` —— 27B AWQ + DFlash2 d7 单卡(16k;测试/取证用)
+# owl 预设档 `qwen38_27b-3090-w4a16-dflash` —— 27B AWQ + DFlash2 d7 单卡(16k;测试/取证用)
 #
 # 全量字段继承自 `full.toml`;本文件只写差异。
-# 校验:`server -p profiles/spec-dflash.toml --check`
+# 校验:`server -p profiles/qwen38_27b-3090-w4a16-dflash.toml --check`
 extends = ["full.toml"]
 
 [model]

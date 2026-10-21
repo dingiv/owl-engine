@@ -78,6 +78,9 @@
 //! | pool | disk_cache_mb / snap_disk_mb | usize / 0、0(**磁盘两层分片**;0 = 关层) |
 //! | pool | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
 //! | spec | depth / draft / dumb / draft_kv_fp8 | usize 0(off)、SpecDraft auto/mtp/dflash2、flag、flag |
+//! | spec | mtp_window / mtp_sink | usize / 0、64(MTP 草稿读视图;0 = full) |
+//! | spec | mtp_window_min_ctx | usize / 0(短 ctx 不压缩的门槛) |
+//! | spec | adaptive_depth / depth_min / depth_switch_ctx / adaptive_min_tpr | flag / false、3、49152、3.0(MTP 两档图族 + T1b 门) |
 //! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
 //! | spec | degrade_after / probe_every | usize / 6、8(降级首探窗口;旧 64 = 长尾税) |
 //! | sampling | mode | SamplerMode 枚举("greedy"\\|"sampling")/ sampling |
@@ -801,7 +804,7 @@ impl SpecDraft {
 /// 投机解码(spec 三态/草稿族/草稿池量化/B4 降级参数/verify 图诊断)
 ///
 /// ⚠️ 非 `Copy`(2026-10-21):`draft_path` 是 `Option<PathBuf>`。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpecCfg {
     pub depth: usize,
@@ -814,6 +817,29 @@ pub struct SpecCfg {
     pub draft_path: Option<PathBuf>,
     pub dumb: bool,
     pub draft_kv_fp8: bool,
+    /// **MTP 草稿注意力的滑动窗口(token;0 = 关闭,走全上下文)**。
+    /// 只作用于 MTP draft 的读;target verify 始终全上下文。
+    /// 页粒度由运行时按 `StatePool::geom.page` 向上取整;启动日志打印
+    /// effective 值。非 MTP 档写非 0 = boot 拒(不静默忽略)。
+    pub mtp_window: usize,
+    /// **MTP 草稿注意力 sink(token;只保留最老的前缀)**。
+    /// 仅 `mtp_window > 0` 时生效;按页向上取整。推荐 64。
+    /// `mtp_window=0` 时本值无消费者。
+    pub mtp_sink: usize,
+    /// 窗口生效的最小绝对上下文(token;0 = 不设额外门槛)。
+    /// 短 ctx 下草稿尾部仍需要完整历史;8k d7 实测 window=4032 会掉 AL。
+    pub mtp_window_min_ctx: usize,
+    /// **自适应 depth(仅 MTP)**：短 ctx 用 `depth`，长 ctx 回 `depth_min`。
+    /// 两档都必须在 boot 期预捕获 verify/fold/propose 图族；运行期只换图引用，
+    /// 禁止在线重捕。缺省 false（旧档逐字节不变）。
+    pub adaptive_depth: bool,
+    /// 自适应档的下限 depth（仅 `adaptive_depth = true` 时生效）。
+    pub depth_min: usize,
+    /// 切档 ctx 阈值（token 位置；`pos >= depth_switch_ctx` 用 `depth_min`）。
+    pub depth_switch_ctx: usize,
+    /// T1b 滚动降档门：窗口 `tokens/round = m+1` 低于它即回 `depth_min`。
+    /// 默认 3.0（MATH 32k d7 实测 4.98；DOCS 29.7k d7 实测 2.80）。
+    pub adaptive_min_tpr: f32,
     /// verify 图 taps 退回 last_hidden(排查开关)
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
@@ -1522,6 +1548,13 @@ impl Default for SpecCfg {
             draft_path: None,
             dumb: false,
             draft_kv_fp8: false,
+            mtp_window: 0,
+            mtp_sink: 64,
+            mtp_window_min_ctx: 0,
+            adaptive_depth: false,
+            depth_min: 3,
+            depth_switch_ctx: 49152,
+            adaptive_min_tpr: 3.0,
             notaps: false,
             tapdecl: false,
             degrade_after: 6,
@@ -2143,6 +2176,69 @@ impl OwlConfig {
                 "[spec] depth = {} 超结构上限 {} (verify 图行容量 {}=(depth+1);fold 记录/快照按它铺,改它需改 state/graph_fleet 的分配面)",
                 self.spec.depth, SPEC_DEPTH_MAX, SPEC_VERIFY_ROWS_MAX
             ));
+        }
+        // **MTP 窗口自洽**(2026-10-21):sink 是窗口之外的前缀;若 sink
+        // 吃掉了整个 window,配置语义不成立。window=0 时 sink 无消费者,
+        // 允许保留缺省 64(旧的 profile 无需补键)。
+        if self.spec.mtp_window > 0 && self.spec.mtp_sink >= self.spec.mtp_window {
+            return Err(format!(
+                "[spec] mtp_sink = {} 必须小于 mtp_window = {}(sink 是最老前缀,window 是最近窗口)",
+                self.spec.mtp_sink, self.spec.mtp_window
+            ));
+        }
+        // window 只服务 MTP；显式 DFlash2 / auto+draft_path 在配置面先拒，
+        // 不等到加载草稿才发现（boot 仍兜底 auto→Off/Dumb 的情况）。
+        if self.spec.mtp_window > 0 {
+            let dflash2_explicit = matches!(self.spec.draft, SpecDraft::Dflash2);
+            let dflash2_auto = matches!(self.spec.draft, SpecDraft::Auto)
+                && self
+                    .spec
+                    .draft_path
+                    .as_ref()
+                    .is_some_and(|p| !p.as_os_str().is_empty());
+            if dflash2_explicit || dflash2_auto {
+                return Err(
+                    "[spec] mtp_window 只服务 MTP；当前档是 DFlash2（显式或 auto+draft_path）。\n请删掉 mtp_window，或把 draft 改成 \"mtp\""
+                        .to_string(),
+                );
+            }
+            if self.spec.depth == 0 {
+                return Err(
+                    "[spec] mtp_window > 0 但 depth = 0（MTP 已关，窗口无消费者）"
+                        .to_string(),
+                );
+            }
+        }
+        // **自适应 depth 自洽**(2026-10-21):只在 MTP 上成立；两档图族在
+        // boot 期都要捕获，运行期不再重捕。阈值 0 = 永远走下限，语义不成立。
+        if self.spec.adaptive_depth {
+            if self.spec.depth == 0 {
+                return Err("[spec] adaptive_depth = true 但 depth = 0（无投机可切）".to_string());
+            }
+            if self.spec.depth_min == 0 {
+                return Err("[spec] adaptive_depth = true 但 depth_min = 0".to_string());
+            }
+            if self.spec.depth_min >= self.spec.depth {
+                return Err(format!(
+                    "[spec] adaptive_depth 需 depth_min < depth（实得 {} >= {}）",
+                    self.spec.depth_min, self.spec.depth
+                ));
+            }
+            if self.spec.depth_min > SPEC_DEPTH_MAX {
+                return Err(format!(
+                    "[spec] depth_min = {} 超结构上限 {}",
+                    self.spec.depth_min, SPEC_DEPTH_MAX
+                ));
+            }
+            if self.spec.depth_switch_ctx == 0 {
+                return Err("[spec] adaptive_depth = true 但 depth_switch_ctx = 0".to_string());
+            }
+            if !self.spec.adaptive_min_tpr.is_finite() || self.spec.adaptive_min_tpr <= 0.0 {
+                return Err(format!(
+                    "[spec] adaptive_min_tpr 必须 > 0 且有限（实得 {}）",
+                    self.spec.adaptive_min_tpr
+                ));
+            }
         }
         // **并行面自洽**(2026-10-21;卡位唯一真源 = `[parallel] device`)。
         //   · `layer` 暂未支持 ⇒ 拒(不许"配了但静默单卡");
@@ -2877,6 +2973,31 @@ mod auto_pool_tests {
         assert!(OwlConfig::from_toml_str("[spec]\ndraft = \"eagle\"\n").is_err());
     }
 
+    /// **自适应 depth 配置门**(2026-10-21):两档必须单调、阈值非零。
+    #[test]
+    fn adaptive_depth_validation() {
+        let ok = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\ndraft = \"mtp\"\nadaptive_depth = true\ndepth_min = 3\ndepth_switch_ctx = 49152\nadaptive_min_tpr = 4.0\n",
+        );
+        assert!(ok.is_ok(), "合法自适应档: {ok:?}");
+        assert_eq!(ok.as_ref().unwrap().spec.adaptive_min_tpr, 4.0);
+        let bad = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 3\ndraft = \"mtp\"\nadaptive_depth = true\ndepth_min = 3\n",
+        );
+        let e = bad.expect_err("depth_min 必须小于 depth");
+        assert!(e.contains("depth_min"), "{e}");
+        let bad = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\ndraft = \"mtp\"\nadaptive_depth = true\ndepth_min = 3\ndepth_switch_ctx = 0\n",
+        );
+        let e = bad.expect_err("阈值不能为 0");
+        assert!(e.contains("depth_switch_ctx"), "{e}");
+        let bad = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\ndraft = \"mtp\"\nadaptive_depth = true\ndepth_min = 3\nadaptive_min_tpr = 0.0\n",
+        );
+        let e = bad.expect_err("T1b 门必须 > 0");
+        assert!(e.contains("adaptive_min_tpr"), "{e}");
+    }
+
     /// **投机深度上限是真门**(2026-10-21):`depth ≤ SPEC_DEPTH_MAX`
     /// (结构性 = verify 图行容量 - 1;fold 记录/快照按它铺)——
     /// 超限**拒启**,不再像旧代码那样 `min(3/7)` 静默截断。
@@ -2890,6 +3011,34 @@ mod auto_pool_tests {
         assert!(e.contains("超结构上限"), "{e}");
         // 0 = 关投机,永远合法
         assert!(OwlConfig::from_toml_str("[spec]\ndepth = 0\n").is_ok());
+    }
+
+    /// MTP 窗口缺省/显式/自洽门(2026-10-21)
+    #[test]
+    fn mtp_window_defaults_and_validation() {
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 3\ndraft = \"mtp\"\n").expect("缺省");
+        assert_eq!((c.spec.mtp_window, c.spec.mtp_sink), (0, 64));
+        let c = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\ndraft = \"mtp\"\nmtp_window = 4032\nmtp_sink = 64\nmtp_window_min_ctx = 8192\n",
+        )
+        .expect("窗口档");
+        assert_eq!((c.spec.mtp_window, c.spec.mtp_sink), (4032, 64));
+        assert_eq!(c.spec.mtp_window_min_ctx, 8192);
+        let e = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 3\ndraft = \"mtp\"\nmtp_window = 64\nmtp_sink = 64\n",
+        )
+        .expect_err("sink 吃满 window 必拒");
+        assert!(e.contains("mtp_sink"), "{e}");
+        let e = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\ndraft = \"dflash2\"\nmtp_window = 4032\n",
+        )
+        .expect_err("DFlash2 配 window 必拒");
+        assert!(e.contains("只服务 MTP"), "{e}");
+        let e = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 0\ndraft = \"mtp\"\nmtp_window = 4032\n",
+        )
+        .expect_err("depth=0 配 window 必拒");
+        assert!(e.contains("depth = 0"), "{e}");
     }
 
     /// 显式值逐字节不变（旧档零行为差）

@@ -274,7 +274,7 @@ GGUF 草稿装载失败必须**拒启**（不静默降级成无 spec，避免“
 | — | `layers/linear.rs` / `mlp.rs` | `Linear::with_out_dtype`(输出 dtype 钉定)+ **GGUF 动态范围护栏**(见 8.3) |
 | — | `kernels/cu/elems/scale.cu`(新) | `owl_scale_{f16,bf16}`(逐元素乘常数;成对指数移位的执行体) |
 | P2 | `engine/spec_runtime.rs` / `engine.rs` / 4 个调用点 | 草稿源按**路径形态**判别(目录=HF / 文件=GGUF)+ `dflash_tap_ids`/`dflash_mask_token`/`dflash_rope` **单源化** + 5 处硬编码 taps 全替 |
-| P3 | `profiles/gguf27b-iq-dflash.toml`(新) | 27B UD-IQ4_XS + GGUF 草稿 d7 生产靶位 |
+| P3 | `profiles/qwen38_27b-3090-iq4xs-dflash.toml`(新) | 27B UD-IQ4_XS + GGUF 草稿 d7 生产靶位 |
 
 **实证到的三条事实(不再靠推断)**
 1. **草稿 norm 未烘焙 `+1`**:GGUF 与 HF BF16 检查点逐元素 **max|Δ| = 0**(5 类 norm + rank-3 conv base 全 0)⇒ 草稿源事实恒 `SourceFacts::HF`,且 `DFlash2Draft` 的 `RmsNorm::new`(plain ×w)两族通用;

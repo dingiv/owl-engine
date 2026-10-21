@@ -18,7 +18,7 @@
 **硬件/档位**:3090 Ti @ `41:00.0`(UUID `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`),
 27B `Qwen3.8-27B-UD-IQ4_XS.gguf`(13.3 GiB,64 层 = 16 full + 48 GDN,full_heads=(24,4,256),词表 248320)
 + GGUF 草稿 `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`(1.08 GiB,5 层,bf16 执行域)。
-档位 = `profiles/gguf27b-iq-dflash.toml`。**跑 std 矩阵必须加 `--set pool.prefix_cache=false`**
+档位 = `profiles/qwen38_27b-3090-iq4xs-dflash.toml`。**跑 std 矩阵必须加 `--set pool.prefix_cache=false`**
 (否则第二轮起撞既有不变量 `块已在宿主层` → 空响应;见 §7)。
 
 ### 1.1 spec=off(标准口径,`llm_speedtest --flavor std`,greedy)
@@ -182,7 +182,7 @@ DFlash2 草稿 = 标准 `build_attn` + **非因果 mask**(`src/models/dflash.cpp
 
 | 面 | 文件 |
 |---|---|
-| 档位 | `profiles/gguf27b-iq-dflash.toml`(spec d7;ctx 12288) |
+| 档位 | `profiles/qwen38_27b-3090-iq4xs-dflash.toml`(spec d7;ctx 12288) |
 | 草稿装载 | `crates/models/src/formats/gguf/{draft_meta.rs, draft.rs}` |
 | 草稿层 | `crates/models/src/layers/dflash2.rs`(`DraftFc::G`、`from_dims_keyed`) |
 | GEMM 臂 | `crates/models/src/layers/linear.rs`(`gguf_quant_gemm` 的分派顺序、`GGUF_MMQ2_MIN_M`、out_dt 移位) |

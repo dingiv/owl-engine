@@ -110,6 +110,8 @@ pub mod turn_end;
 pub mod coverage;
 /// **KV 池页的宿主解码面**(单源;f16 / fp8 e4m3 两侧)
 pub mod kvpage;
+/// **MTP 草稿注意力读视图**(Windowed-MTP;纯函数)
+pub mod mtp_window;
 
 #[cfg(test)]
 mod break_even_tests {

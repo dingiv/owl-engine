@@ -2,7 +2,7 @@
 //!
 //! **单一环境入口 `OWL_TEST_CONF`**(2026-10-18):指向一份"测试环境档"
 //! (TOML,引擎同款 `OwlConfig` 格式;可含 `flavor = "<预设名>"` 自带基准)。
-//! 它给整轮测试定共同口径 —— 例如 `flavor = "spec-dflash"` + 本机几何 ⇒
+//! 它给整轮测试定共同口径 —— 例如 `profile = "qwen38_27b-3090-w4a16-dflash"` + 本机几何 ⇒
 //! 各会话/各 agent 测出来的配置基本一致,不再各写一套。
 //!
 //! **用例 overlay 走约定路径(零 env)**:`testdata/cases/<crate>/<模块路径>/<用例名>.toml`

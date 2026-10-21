@@ -34,7 +34,7 @@
 /// 草稿器:一轮 = propose → (引擎做 verify) → observe。
 /// MTP 与 DFlash2 各一实现;verify/accept/状态回滚是引擎公共件。
 pub trait Drafter {
-    /// 本轮草稿数(自适应降档留位;v1 恒定:MTP=3,DFlash2=7)
+    /// 本轮草稿数（MTP 自适应档 = active depth；静态档 MTP=3 / DFlash2=7）
     fn depth(&self) -> usize;
     /// verify 块行数(depth + anchor 行;MTP=4,DFlash2=8)
     fn verify_width(&self) -> usize;
@@ -285,7 +285,7 @@ M0–M5 的组件/轮结构/图族仍在树上，但配置层一直没有入口�
 - `--check`：MTP 档读主检查点 `model.safetensors.index.json` 的 `mtp.*`
   键数（27B AWQ = 15），不再要求 `dflash2_dir`；显式 MTP 时忽略 DFlash2
   目录并打印提示。
-- 新增 `profiles/mtp27b-3090-16k.toml`（27B AWQ + MTP d3 / 16k）。
+- 新增 `profiles/qwen38_27b-3090-w4a16-mtp.toml`（27B AWQ + MTP d3 / 16k）。
 
 ### 10.2 环境/池一致性
 
@@ -310,7 +310,7 @@ M0–M5 的组件/轮结构/图族仍在树上，但配置层一直没有入口�
   - 主池 fp8（`OWL_GATE_FP8=1`）：同 93 tok 逐位一致，同一接受账。
 - 计数：`owl-shared` SpecDraft 解析、`owl-cuda` tag filter 6/6 绿。
 
-### 10.4 release 首测与 ctx 衰减定位（`mtp27b-3090-16k`，MATH 域，256 tok）
+### 10.4 release 首测与 ctx 衰减定位（`qwen38_27b-3090-w4a16-mtp`，MATH 域，256 tok）
 
 **先发现一个结构性双跑**：`execute_spec_round` 的 ⑤ 和 ⑦ 都调用了
 MTP propose，输入/输出完全相同 ⇒ 每轮白付一倍 propose。删除 ⑤ 的
@@ -347,7 +347,7 @@ prompt   MTP decode    round     verify    propose   propose.read
 - DFlash2 同档对照（生产草稿族的相对收益）；更长 ctx（32k/128k）与
   KVMem/视觉组合回归。
 - 采样域 rejection（当前 spec 轮恒 greedy；MTP 的采样 parity 未接）。
-- MTP 默认开关仍由 C7 数据裁决，当前只在 `profiles/mtp27b-3090-16k.toml`
+- MTP 默认开关仍由 C7 数据裁决，当前只在 `profiles/qwen38_27b-3090-w4a16-mtp.toml`
   显式启用。
 
 ---
@@ -490,3 +490,17 @@ MTP 头逐角色 Q6_K/Q8_0/Q4_K，host 解到 F16。
 目标输出仍连贯，但这不是逐位恒等。嫌疑 = target verify（FI T=4）
 与 decode（FI T=1）的数值路径差异，未必是 MTP 头；尚未用 dumb 草稿/
 no-FI 臂隔离。**在该分歧定谳前，GGUF MTP 只报“链路/性能”，不报“恒等门绿”。**
+
+---
+
+## 十二、长上下文抗衰减（2026-10-21 设计）
+
+长上下文基线、Windowed-MTP、自适应 depth 与 Phase 0 施工面见：
+[`mtp-长上下文抗衰减-设计与施工.md`](mtp-长上下文抗衰减-设计与施工.md)。
+
+一句话：d3 在 64k 仍净正，但 DOCS 域只剩 1.28×；d7 在 8k/32k 更强、64k 被 d3
+反超。Phase 0 先做 **sink=64 + W=4032 的 MTP 草稿读视图**（target verify 不动），
+Phase 1 再按 ctx/AL 切 d3/d7。
+
+下一阶段任务板/施工卡/环境纪律见
+[`mtp-长上下文抗衰减-下一阶段施工与交接.md`](mtp-长上下文抗衰减-下一阶段施工与交接.md)。

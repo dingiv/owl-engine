@@ -16,6 +16,8 @@ use owl_shared::config::SpecDraft;
 use crate::Result;
 use owl_iface::contract::ModelError;
 
+use crate::exec::mtp_window::MtpWindowCfg;
+
 /// E5-M2b:spec 模式三态(C7 回退挂钩)。裁决在 boot:
 /// depth>0 且检查点有 mtp.* → Mtp;dumb 诊断位 → Dumb(哑草稿 =
 /// anchor 重复);否则 Off(无草稿器不白发 verify 税)。
@@ -81,6 +83,14 @@ pub(crate) struct SpecRuntime {
     /// 草稿**权重/激活/池**的 dtype(单源 `qwen35::draft_exec_dt` = 恒 BF16;
     /// F16 路在 propose 残差流上溢出 —— 定谳见该函数注)
     pub draft_dt: owl_models::contract::Dtype,
+    /// MTP 草稿注意力窗口(0 = full;仅 MTP 有消费者)
+    pub mtp_window: MtpWindowCfg,
+    /// 自适应 depth（仅 MTP；`depth` = 上限，`depth_min` = 长 ctx 下限）
+    pub adaptive_depth: bool,
+    pub depth_min: usize,
+    pub depth_switch_ctx: usize,
+    /// T1b 滚动降档门（tokens/round；仅 adaptive 生效）
+    pub adaptive_min_tpr: f32,
     /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
     pub stats: SpecStats,
     /// taps/memory 探针落盘一次性门(OWL_DFLASH_PROBE;AL=0 排查)
@@ -96,6 +106,50 @@ pub(crate) struct SpecRuntime {
     pub carry_ms: f32,
     /// B4 保鲜 ctx(pos;涨过 25% 即作废,换档后旧采样失真)
     pub carry_ctx: usize,
+}
+
+impl SpecRuntime {
+    /// 本档需要预捕获的 depth 列表（升序；无自适应 = 单档）。
+    pub(crate) fn depth_candidates(&self) -> Vec<usize> {
+        depth_candidates_of(self.depth, self.adaptive_depth, self.depth_min)
+    }
+
+    /// 按当前绝对位置选本轮 active depth。
+    pub(crate) fn depth_for_pos(&self, pos: usize) -> usize {
+        depth_for_pos_of(
+            self.depth,
+            self.adaptive_depth,
+            self.depth_min,
+            self.depth_switch_ctx,
+            pos,
+        )
+    }
+}
+
+/// 纯函数（单测锚）：需要预捕获的 depth 列表。
+fn depth_candidates_of(depth: usize, adaptive: bool, depth_min: usize) -> Vec<usize> {
+    if depth == 0 {
+        vec![0]
+    } else if adaptive && depth_min > 0 && depth_min < depth {
+        vec![depth_min, depth]
+    } else {
+        vec![depth]
+    }
+}
+
+/// 纯函数（单测锚）：按绝对位置切档；越界/非法配置一律回上限，不 panic。
+fn depth_for_pos_of(
+    depth: usize,
+    adaptive: bool,
+    depth_min: usize,
+    switch_ctx: usize,
+    pos: usize,
+) -> usize {
+    if adaptive && depth_min > 0 && depth_min < depth && pos >= switch_ctx {
+        depth_min
+    } else {
+        depth
+    }
 }
 
 // ===========================================================================
@@ -120,6 +174,20 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) dumb: bool,
     /// 草稿池 e4m3(B6 偷显存;AL 有损需 A/B)
     pub(crate) draft_kv_fp8: bool,
+    /// MTP 草稿注意力窗口(tok;0 = 关)
+    pub(crate) mtp_window: usize,
+    /// MTP 草稿注意力 sink(tok;仅 window>0 生效)
+    pub(crate) mtp_sink: usize,
+    /// 窗口生效的最小绝对 ctx(tok;0 = 不设额外门槛)
+    pub(crate) mtp_window_min_ctx: usize,
+    /// 自适应 depth（仅 MTP；两档图族 boot 期预捕获）
+    pub(crate) adaptive_depth: bool,
+    /// 自适应档下限 depth
+    pub(crate) depth_min: usize,
+    /// 切档 ctx 阈值（pos >= 阈值用下限）
+    pub(crate) depth_switch_ctx: usize,
+    /// T1b 滚动降档门（tokens/round；仅 adaptive 生效）
+    pub(crate) adaptive_min_tpr: f32,
     /// **target 侧共享事实**(词表/层数/hidden;草稿不自带 —— 仅 GGUF 草稿
     /// 的声明校验与码本行数用)
     pub(crate) target: owl_models::formats::gguf::TargetFacts,
@@ -189,6 +257,77 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     // (depth 7 比 3 在 8k 上快 ~10%、512 上快 ~21%)。上限由 `[spec] depth`
     // 的校验面统一挡(`SPEC_DEPTH_MAX`,结构性行容量),此处不再截断。
     let depth = if mode == SpecMode::Off { 0 } else { inp.depth_raw };
+    // **MTP 窗口只服务 MTP**(2026-10-21):非 MTP/Off 写非 0 = boot 拒,
+    // 不静默忽略;window=0 时 sink 无消费者(允许缺省 64)。
+    let mtp_window = MtpWindowCfg {
+        window: inp.mtp_window,
+        sink: inp.mtp_sink,
+        min_ctx: inp.mtp_window_min_ctx,
+    };
+    // **自适应 depth 的 boot 门**（2026-10-21）：只在 MTP 上成立；两档
+    // 都必须在启动时预捕获，运行期只换图引用。配置面已做形状门，这里
+    // 再按**实际裁决出的模式**拒一次（auto 可能落到非 MTP）。
+    if inp.adaptive_depth {
+        if mode != SpecMode::Mtp {
+            return Err(ModelError::Msg(format!(
+                "[spec] adaptive_depth 只服务 MTP，但当前模式 = {:?}（depth={}, draft={:?}）",
+                mode, depth, inp.family
+            )));
+        }
+        if inp.depth_min == 0 || inp.depth_min >= depth {
+            return Err(ModelError::Msg(format!(
+                "[spec] adaptive_depth 需 0 < depth_min < depth（实得 depth_min={}, depth={}）",
+                inp.depth_min, depth
+            )));
+        }
+        if inp.depth_min > owl_shared::config::SPEC_DEPTH_MAX {
+            return Err(ModelError::Msg(format!(
+                "[spec] depth_min={} 超结构上限 {}",
+                inp.depth_min,
+                owl_shared::config::SPEC_DEPTH_MAX
+            )));
+        }
+        if inp.depth_switch_ctx == 0 {
+            return Err(ModelError::Msg(
+                "[spec] adaptive_depth 需 depth_switch_ctx > 0".into(),
+            ));
+        }
+        if !inp.adaptive_min_tpr.is_finite() || inp.adaptive_min_tpr <= 0.0 {
+            return Err(ModelError::Msg(format!(
+                "[spec] adaptive_min_tpr 必须 > 0 且有限（实得 {}）",
+                inp.adaptive_min_tpr
+            )));
+        }
+        owl_shared::log_info!(
+            "boot",
+            "spec adaptive depth: max={} min={} switch_ctx={} min_tpr={}（两档 verify/fold/propose 图族预捕获）",
+            depth,
+            inp.depth_min,
+            inp.depth_switch_ctx,
+            inp.adaptive_min_tpr
+        );
+    }
+    if mtp_window.active() {
+        if mode != SpecMode::Mtp {
+            return Err(ModelError::Msg(format!(
+                "[spec] mtp_window={} 只服务 MTP,但当前模式 = {:?}(depth={}, draft={:?});请关 window 或改用 mtp 档",
+                mtp_window.window, mode, depth, inp.family
+            )));
+        }
+        if mtp_window.sink >= mtp_window.window {
+            return Err(ModelError::Msg(format!(
+                "[spec] mtp_sink={} 必须小于 mtp_window={}",
+                mtp_window.sink, mtp_window.window
+            )));
+        }
+        owl_shared::log_info!(
+            "boot",
+            "MTP window: window={} sink={} min_ctx={} (page 对齐在 StatePool 分配后校验/打印)",
+            mtp_window.window,
+            mtp_window.sink,
+            mtp_window.min_ctx
+        );
+    }
     if mode != SpecMode::Off {
         owl_shared::log_info!("boot", "spec 模式 = {:?} depth={depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
             mode
@@ -417,6 +556,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         draft_geom,
         draft_env,
         draft_dt,
+        mtp_window,
+        adaptive_depth: inp.adaptive_depth,
+        depth_min: inp.depth_min,
+        depth_switch_ctx: inp.depth_switch_ctx,
+        adaptive_min_tpr: inp.adaptive_min_tpr,
         stats: SpecStats::default(),
         mem_dumped: false,
         mem_dumped2: false,
@@ -464,5 +608,24 @@ fn shard_draft_plan(
     match tp {
         Some(tp) if !tp.is_single() => owl_models::formats::qwen35::shard_draft_spec(spec, tp),
         _ => Ok(spec),
+    }
+}
+
+
+#[cfg(test)]
+mod adaptive_depth_tests {
+    use super::*;
+
+    #[test]
+    fn candidates_and_switch_are_monotone() {
+        assert_eq!(depth_candidates_of(3, false, 3), vec![3]);
+        assert_eq!(depth_candidates_of(7, true, 3), vec![3, 7]);
+        assert_eq!(depth_candidates_of(0, true, 3), vec![0]);
+        assert_eq!(depth_for_pos_of(7, true, 3, 49152, 0), 7);
+        assert_eq!(depth_for_pos_of(7, true, 3, 49152, 49151), 7);
+        assert_eq!(depth_for_pos_of(7, true, 3, 49152, 49152), 3);
+        assert_eq!(depth_for_pos_of(7, false, 3, 49152, 999999), 7);
+        // 非法 min >= max：不切，保持上限（boot 已拒，此处只证明纯函数不 panic）
+        assert_eq!(depth_for_pos_of(3, true, 3, 49152, 999999), 3);
     }
 }

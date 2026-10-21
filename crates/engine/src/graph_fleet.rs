@@ -38,6 +38,22 @@ pub(crate) fn record_close(slot: &mut Option<owl_iface::contract::ModelError>, r
     }
 }
 
+/// **一个 active depth 的完整图族**（自适应 depth 的容器单元）。
+///
+/// 为什么 fold/propose 也要按 depth 分：propose 图的链步数/输出宽度由
+/// `depth` 定形，fold 图又烘焙了**本 depth verify 图**的 `r{i}` 输出块；
+/// 只补 verify 两张图而共用 propose/fold ⇒ d3 轮仍付 d7 propose 税，
+/// 且 fold 会读到另一张 verify 图的陈旧记录。
+pub(crate) struct DepthGraphs<D: DeviceClient> {
+    pub depth: usize,
+    /// verify 桶形图(T = depth+1;None = eager fallback)
+    pub verify: Option<GraphPlan<D>>,
+    /// fold 桶形图族(index = m,0..depth)
+    pub fold: Vec<GraphPlan<D>>,
+    /// propose 桶形图族(index = m,0..=depth)
+    pub propose: Vec<GraphPlan<D>>,
+}
+
 /// 图族(组合叶;RunningEngine 持有)。字段 pub(crate) 供 exec 直读
 /// (`graphs.session.face_mut()` 等),相位扇出走方法。
 pub(crate) struct GraphFleet<D: DeviceClient> {
@@ -45,17 +61,10 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     pub session: GraphPlan<D>,
     /// 捕获三态结果(Captured = 回放态;EagerFallback = 同闭包直发)
     pub capture_outcome: PlanOutcome,
-    /// verify 桶形图(E5-M4;T = depth+1 定形,输出 tok/hid + fold 记录;
-    /// None = eager fallback 走旧 verify+重放路)
-    pub verify: Option<GraphPlan<D>>,
+    /// 按 depth 的 spec 图族（升序；无自适应 = 单元素）
+    pub depths: Vec<DepthGraphs<D>>,
     /// **合批 decode 图**(B5.1 M1b;T = max_batch 定形,行 = 会话;None = eager)
     pub batch: Option<GraphPlan<D>>,
-    /// fold 桶形图族(E5-M5;index = m,状态 = spec 快照 buf 就地,
-    /// slot 恒 0;重放后 restore 回写会话格)
-    pub fold: Vec<GraphPlan<D>>,
-    /// propose 桶形图族(E5-M5;index = m,extend m+1 行 + k-1 链步,
-    /// 输出 drafts;首轮 propose_first 保持 eager)
-    pub propose: Vec<GraphPlan<D>>,
     /// DFlash2 propose 单图(E5-DF4;encode 全 8 行 + 噪声块 + selector,
     /// 固定几何;None = eager 回退)
     pub dflash: Option<GraphPlan<D>>,
@@ -79,6 +88,85 @@ fn arm_facts(prefix: &str) -> String {
 
 
 impl<D: DeviceClient> GraphFleet<D> {
+    fn depth_slot(&self, depth: usize) -> Result<usize> {
+        self.depths
+            .iter()
+            .position(|d| d.depth == depth)
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: format!(
+                    "spec depth {depth} 图族缺席（已捕获: {:?}）",
+                    self.depths.iter().map(|d| d.depth).collect::<Vec<_>>()
+                ),
+            })
+    }
+
+    /// 只读 verify 面（boot 检查/装配期用；None = 该档捕获降级）。
+    pub(crate) fn verify_of(&self, depth: usize) -> Option<&GraphPlan<D>> {
+        self.depths
+            .iter()
+            .find(|d| d.depth == depth)
+            .and_then(|d| d.verify.as_ref())
+    }
+
+    /// 该档是否有 propose 图族（空 = eager propose）。
+    pub(crate) fn has_propose(&self, depth: usize) -> bool {
+        self.depths
+            .iter()
+            .find(|d| d.depth == depth)
+            .is_some_and(|d| !d.propose.is_empty())
+    }
+
+    /// 该档是否有 fold 图族（空 = eager fold/replay）。
+    pub(crate) fn has_fold(&self, depth: usize) -> bool {
+        self.depths
+            .iter()
+            .find(|d| d.depth == depth)
+            .is_some_and(|d| !d.fold.is_empty())
+    }
+
+    /// 热路径 verify 面（必须存在；缺失 = 装配不变量失守）。
+    pub(crate) fn verify_mut(&mut self, depth: usize) -> Result<&mut GraphPlan<D>> {
+        let i = self.depth_slot(depth)?;
+        self.depths[i]
+            .verify
+            .as_mut()
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: format!("spec depth {depth} verify 图缺席（捕获降级）"),
+            })
+    }
+
+    /// fold 桶（rows = 1..=depth；桶下标 = rows-1）。
+    pub(crate) fn fold_mut(&mut self, depth: usize, rows: usize) -> Result<&mut GraphPlan<D>> {
+        if rows == 0 || rows > depth {
+            return Err(ModelError::EngineInvariant {
+                what: format!("fold rows={rows} 越界（active depth={depth}）"),
+            });
+        }
+        let i = self.depth_slot(depth)?;
+        self.depths[i]
+            .fold
+            .get_mut(rows - 1)
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: format!("spec depth {depth} fold 图桶 rows={rows} 缺席"),
+            })
+    }
+
+    /// propose 桶（m = 0..=depth）。
+    pub(crate) fn propose_mut(&mut self, depth: usize, m: usize) -> Result<&mut GraphPlan<D>> {
+        if m > depth {
+            return Err(ModelError::EngineInvariant {
+                what: format!("propose m={m} 越界（active depth={depth}）"),
+            });
+        }
+        let i = self.depth_slot(depth)?;
+        self.depths[i]
+            .propose
+            .get_mut(m)
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: format!("spec depth {depth} propose 图桶 m={m} 缺席"),
+            })
+    }
+
     /// **整族退休**(TP 双 rank 装配面的收尾;S4 ⑤-K2):逐图 `GraphPlan::close`
     /// (销毁图 + 归还输入槽)。
     ///
@@ -88,16 +176,18 @@ impl<D: DeviceClient> GraphFleet<D> {
     pub(crate) async fn close(&mut self) -> Result<()> {
         let mut first: Option<owl_iface::contract::ModelError> = None;
         record_close(&mut first, self.session.close().await);
-        if let Some(g) = self.verify.as_mut() {
-            record_close(&mut first, g.close().await);
+        for d in self.depths.iter_mut() {
+            if let Some(g) = d.verify.as_mut() {
+                record_close(&mut first, g.close().await);
+            }
+            for g in d.fold.iter_mut() {
+                record_close(&mut first, g.close().await);
+            }
+            for g in d.propose.iter_mut() {
+                record_close(&mut first, g.close().await);
+            }
         }
         if let Some(g) = self.batch.as_mut() {
-            record_close(&mut first, g.close().await);
-        }
-        for g in self.fold.iter_mut() {
-            record_close(&mut first, g.close().await);
-        }
-        for g in self.propose.iter_mut() {
             record_close(&mut first, g.close().await);
         }
         if let Some(g) = self.dflash.as_mut() {
@@ -114,16 +204,18 @@ impl<D: DeviceClient> GraphFleet<D> {
     /// perf-framework.md §十.3)。
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
         self.session.set_phase(p);
-        if let Some(g) = self.verify.as_mut() {
-            g.set_phase(p);
+        for d in self.depths.iter_mut() {
+            if let Some(g) = d.verify.as_mut() {
+                g.set_phase(p);
+            }
+            for g in d.fold.iter_mut() {
+                g.set_phase(p);
+            }
+            for g in d.propose.iter_mut() {
+                g.set_phase(p);
+            }
         }
         if let Some(g) = self.batch.as_mut() {
-            g.set_phase(p);
-        }
-        for g in self.fold.iter_mut() {
-            g.set_phase(p);
-        }
-        for g in self.propose.iter_mut() {
             g.set_phase(p);
         }
         if let Some(g) = self.dflash.as_mut() {
@@ -157,11 +249,10 @@ pub(crate) struct FleetBoot<'a> {
 }
 
 impl<D: DeviceClient> GraphFleet<D> {
-    /// **图族总装配**(顺序有语义,勿重排 —— `extra_faces` 是 pop 消费的
-    /// 桶,fold 先 pop、dflash 次之、propose 末尾):
-    /// ① 主会话图(warmup+捕获)→ ② verify 桶形图(spec 且 ① Captured)
-    /// → ③ fold 族 / DFlash2 propose 单图 / MTP propose 族(全部依赖
-    /// verify 图的输出块)。
+    /// **图族总装配**（`extra_faces` 是 pop 消费桶；顺序有语义）：
+    /// ① 主会话图（warmup+捕获）→ ② 每档 verify（spec 且 ① Captured）
+    /// → ③ 每档 fold/propose（依赖本档 verify 输出块）→ ④ DFlash2 单图。
+    /// adaptive 档 = 多档循环；单档 = 历史顺序。
     ///
     /// 降级语义(A1.4):任何一环捕获失败只降级该环(对应回 eager 路),
     /// 不连锁;`capture_outcome` 只记主会话图(它决定回放态/直发态)。
@@ -181,25 +272,92 @@ impl<D: DeviceClient> GraphFleet<D> {
         };
         // V1c:decode_fi 开 ⇒ 同图走 piecewise,断点挂 decode 核
         let (session, capture_outcome, decode_fi_node) = Self::plan_session(face, &boot, t0).await?;
-        // ② verify 桶形图(spec 模式且主图捕获成功才有意义)
-        let (verify, verify_fi_node) = if boot.spec.depth > 0
-            && vface.is_some()
+        // ② verify 桶形图（自适应档可能有多张：每个 active depth 一张）。
+        // 先为每档领一张 face（第一张 = vface，其余从 extra_faces 头部取），
+        // 再逐档建 verify → fold/propose；图族不能跨 depth 复用（见 DepthGraphs 注）。
+        let depth_candidates = boot.spec.depth_candidates();
+        let mut verify_faces: Vec<D> = Vec::new();
+        if boot.spec.depth > 0
             && matches!(capture_outcome, PlanOutcome::Captured)
         {
-            let vface = vface.ok_or_else(|| ModelError::EngineInvariant { what: "vface 缺席(守卫与用法不一致)".into() })?;
-            let (v, fi_node) = Self::plan_verify(vface, &boot, t0).await?;
-            (v, fi_node)
+            if let Some(v) = vface {
+                verify_faces.push(v);
+            }
+            while verify_faces.len() < depth_candidates.len() {
+                let Some(f) = extra_faces.pop() else {
+                    return Err(ModelError::EngineInvariant {
+                        what: format!(
+                            "verify face 不足（需要 {} 档，实得 {}；检查 fleet_faces 预算）",
+                            depth_candidates.len(),
+                            verify_faces.len()
+                        ),
+                    });
+                };
+                verify_faces.push(f);
+            }
+        }
+        let mut depth_graphs: Vec<DepthGraphs<D>> = Vec::new();
+        let mut verify_fi_node = false;
+        if boot.spec.depth > 0 && !verify_faces.is_empty() {
+            let mut faces = verify_faces.into_iter();
+            for depth in depth_candidates {
+                let vface = faces.next().ok_or_else(|| ModelError::EngineInvariant {
+                    what: format!("verify face 缺席（depth={depth}）"),
+                })?;
+                let (verify, fi_node) = Self::plan_verify(vface, &boot, t0, depth).await?;
+                verify_fi_node |= fi_node;
+                let Some(vg) = verify.as_ref() else {
+                    if boot.spec.adaptive_depth {
+                        return Err(ModelError::Msg(format!(
+                            "[spec] adaptive_depth 要求 depth={depth} 的 verify 图捕获成功，\
+                             但该档降级为 eager；请查图捕获日志/显存预算"
+                        )));
+                    }
+                    depth_graphs.push(DepthGraphs {
+                        depth,
+                        verify: None,
+                        fold: Vec::new(),
+                        propose: Vec::new(),
+                    });
+                    continue;
+                };
+                let fold = Self::plan_fold_family(vg, &mut extra_faces, &boot, t0, depth).await?;
+                let propose =
+                    Self::plan_propose_family(vg, &mut extra_faces, &boot, t0, depth).await?;
+                if boot.spec.adaptive_depth {
+                    let want_fold = depth;
+                    let want_propose = depth + 1;
+                    if fold.len() != want_fold || propose.len() != want_propose {
+                        return Err(ModelError::Msg(format!(
+                            "[spec] adaptive_depth depth={depth} 图族不完整：\
+                             fold {}/{want_fold}，propose {}/{want_propose}；\
+                             这是启动期硬失败，避免运行期半档回退",
+                            fold.len(),
+                            propose.len()
+                        )));
+                    }
+                }
+                depth_graphs.push(DepthGraphs { depth, verify, fold, propose });
+            }
+        }
+        if boot.spec.adaptive_depth
+            && depth_graphs.len() != boot.spec.depth_candidates().len()
+        {
+            return Err(ModelError::Msg(format!(
+                "[spec] adaptive_depth 需要全部 depth 图族，实得 {} / {}（主会话图未捕获？）",
+                depth_graphs.len(),
+                boot.spec.depth_candidates().len()
+            )));
+        }
+        // ③b DFlash2 propose 单图（固定 depth = spec.depth；adaptive 只服务 MTP）。
+        let dflash = if let Some(vg) = depth_graphs
+            .iter()
+            .find(|g| g.depth == boot.spec.depth)
+            .and_then(|g| g.verify.as_ref())
+        {
+            Self::plan_dflash(vg, &mut extra_faces, &boot, t0).await?
         } else {
-            (None, false)
-        };
-        // ③ fold/DFlash2/MTP 族(全部以 verify 图输出块为烘焙叶)
-        let (fold, dflash, propose) = if let Some(vg) = verify.as_ref() {
-            let fold = Self::plan_fold_family(vg, &mut extra_faces, &boot, t0).await?;
-            let dflash = Self::plan_dflash(vg, &mut extra_faces, &boot, t0).await?;
-            let propose = Self::plan_propose_family(vg, &mut extra_faces, &boot, t0).await?;
-            (fold, dflash, propose)
-        } else {
-            (Vec::new(), None, Vec::new())
+            None
         };
         // ③.5 **合批 decode 图**(B5.1 M1b):T = max_batch 定形,行 = 会话。
         // 捕获失败只降级本环(eager 臂仍在执行器里),不连锁。
@@ -259,9 +417,23 @@ impl<D: DeviceClient> GraphFleet<D> {
         {
             let mb = |v: usize| v >> 20;
             let s = session.slab_bytes();
-            let v = verify.as_ref().map(|g| g.slab_bytes()).unwrap_or(0);
-            let fo: usize = fold.iter().map(|g| g.slab_bytes()).sum();
-            let pr: usize = propose.iter().map(|g| g.slab_bytes()).sum();
+            let v: usize = depth_graphs
+                .iter()
+                .filter_map(|g| g.verify.as_ref())
+                .map(|g| g.slab_bytes())
+                .sum();
+            let fo: usize = depth_graphs
+                .iter()
+                .flat_map(|g| g.fold.iter())
+                .map(|g| g.slab_bytes())
+                .sum();
+            let pr: usize = depth_graphs
+                .iter()
+                .flat_map(|g| g.propose.iter())
+                .map(|g| g.slab_bytes())
+                .sum();
+            let n_fold: usize = depth_graphs.iter().map(|g| g.fold.len()).sum();
+            let n_propose: usize = depth_graphs.iter().map(|g| g.propose.len()).sum();
             let df = dflash.as_ref().map(|g| g.slab_bytes()).unwrap_or(0);
             let total = s + v + fo + pr + df;
             owl_shared::log_info!(
@@ -270,9 +442,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                 mb(s),
                 mb(v),
                 mb(fo),
-                fold.len(),
+                n_fold,
                 mb(pr),
-                propose.len(),
+                n_propose,
                 mb(df),
                 mb(total),
                 owl_shared::vram::live_bytes() >> 20,
@@ -304,10 +476,8 @@ impl<D: DeviceClient> GraphFleet<D> {
         Ok(Self {
             session,
             capture_outcome,
-            verify,
+            depths: depth_graphs,
             batch,
-            fold,
-            propose,
             dflash,
         })
     }
@@ -723,6 +893,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         vface: D,
         boot: &FleetBoot<'_>,
         t0: T,
+        depth: usize,
     ) -> Result<(Option<GraphPlan<D>>, bool)> {
         let pool = boot.pool;
         let dims = boot.dims;
@@ -730,7 +901,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let spec_mode = boot.spec.mode;
-        let depth1 = boot.spec.depth + 1;
+        let depth1 = depth + 1;
         let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let model_v = Arc::clone(&boot.model);
         let rp_v = boot.rope.clone();
@@ -1024,6 +1195,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         extra_faces: &mut Vec<D>,
         boot: &FleetBoot<'_>,
         t0: T,
+        depth: usize,
     ) -> Result<Vec<GraphPlan<D>>> {
         let pool = boot.pool;
         let dims = boot.dims;
@@ -1040,7 +1212,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             })
             .collect::<Result<Vec<_>>>()?;
         let n_roots = pool.gdn_count() * 4;
-        for m in 0..boot.spec.depth {
+        for m in 0..depth {
             let m1 = m + 1;
             let model_f = Arc::clone(&boot.model);
             let gdn_caches = pool.gdn_caches();
@@ -1309,6 +1481,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         extra_faces: &mut Vec<D>,
         boot: &FleetBoot<'_>,
         _t0: T,
+        depth: usize,
     ) -> Result<Vec<GraphPlan<D>>> {
         let Some(Drafter::Mtp(mtp)) = boot.spec.drafter.as_ref() else {
             return Ok(Vec::new());
@@ -1320,7 +1493,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let env = boot.spec.draft_env;
         let tp = boot.tp.clone();
         let knobs = boot.knobs;
-        let spec_depth = boot.spec.depth;
+        let spec_depth = depth;
         let mut propose_graphs = Vec::new();
         let hid_blk = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
         // 链步 decode 读核 scratch(seqs=1;与 draft.rs eager 路同源):
@@ -1348,11 +1521,13 @@ impl<D: DeviceClient> GraphFleet<D> {
                 pins.push(InputSlot::f32(format!("c{j}_pos"), 1));
                 pins.push(InputSlot::f32(format!("c{j}_slots"), 1));
                 pins.push(InputSlot::f32(format!("c{j}_lens"), 1));
+                // Windowed-MTP：chain 每步自己的读表（window=0 时填完整链）
+                pins.push(InputSlot::f32(format!("c{j}_bt"), bt_nb));
             }
             pins.push(InputSlot::f32("seq_cu", 2).init(vec![0.0, m1 as f32]));
             let Some(pface) = extra_faces.pop() else {
                 return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "propose 图 face 耗尽(m={m}/depth={spec_depth}):extra_faces 预算 2*depth.max(1)+2 不足以覆盖 fold+dflash+propose 族"
+                    "propose 图 face 耗尽(m={m}/depth={spec_depth}):检查 fleet_faces(depths) 预算（每档 fold+propose + verify）"
                 )));
             };
             let (pg, pout) = GraphPlan::plan(
@@ -1395,6 +1570,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                         let pos_c = sc.input(&format!("c{j}_pos"))?;
                         let slots_c = sc.input(&format!("c{j}_slots"))?;
                         let lens_c = sc.input(&format!("c{j}_lens"))?;
+                        let bt_c = sc.input(&format!("c{j}_bt"))?;
                         chain.push((
                             pos_c,
                             KvBuffers {
@@ -1402,7 +1578,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                                 v_cache: kv_leaf.1.clone(),
                                 slots: slots_c.clone(),
                                 kv_lens: lens_c.clone(),
-                                block_tables: bt.clone(),
+                                block_tables: bt_c,
                             },
                         ));
                     }

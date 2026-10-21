@@ -1,4 +1,4 @@
-# owl 档 `awq27b-gguf-mtp-head` —— 27B AWQ 主干 + 外部 GGUF MTP 头 / 16k。
+# owl 档 `qwen38_27b-3090-iq4-mtp` —— 27B AWQ 主干 + 外部 GGUF MTP 头 / 16k。
 extends = ["full.toml"]
 
 [server]

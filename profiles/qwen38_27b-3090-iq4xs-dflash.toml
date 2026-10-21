@@ -1,11 +1,11 @@
-# owl 档 `gguf27b-iq` —— 27B UD-IQ4_XS 单卡 / 12k(纯 GGUF 块型)。
+# owl 档 `qwen38_27b-3090-iq4xs-dflash` —— 27B UD-IQ4_XS + DFlash2-GGUF d7 / 12k。
 extends = ["full.toml"]
 
 [server]
-bind = "127.0.0.1:8145"
+bind = "127.0.0.1:8147"
 
 [model]
-name = "qwen3.8-27b-gguf-iq4"
+name = "qwen3.8-27b-gguf-iq-dflash"
 path = "../models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf"
 format = "gguf"
 quant = "iq4"
@@ -25,11 +25,16 @@ gdn_slots = 1
 vram_target = 0.97
 vram_reserve_mb = 1024
 
+[spec]
+depth = 7
+draft = "dflash2"
+draft_path = "../models/z-lab/Qwen3.8-27B-Dflash2-gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+
 [kernel]
 kv_fp8 = false
-verify_arm = "v2"
-decode_arm = "v2"
-fi_plan_bake = false
-fi_plan_restore = true
-fi_cuda_graph = false
+verify_arm = "fi"
+decode_arm = "fi"
+fi_plan_bake = true
+fi_plan_restore = false
+fi_cuda_graph = true
 tag_wildcard = false

@@ -1,7 +1,7 @@
-# owl 预设档 `awq27b-3090-max` —— 单张 3090 Ti 24G / 128k / fp8 KV(最大上下文档)
+# owl 预设档 `qwen38_27b-3090-w4a16` —— 单张 3090 Ti 24G / 128k / fp8 KV(最大上下文档)
 #
 # 全量字段继承自 `full.toml`;本文件只写差异。
-# 校验:`server -p profiles/awq27b-3090-max.toml --check`
+# 校验:`server -p profiles/qwen38_27b-3090-w4a16.toml --check`
 extends = ["full.toml"]
 
 [model]

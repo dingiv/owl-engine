@@ -8,6 +8,14 @@ use owl_models::ModelError;
 /// 它约束的是"惩罚集有多大",过大会让长思考被无谓压制。
 const SPEC_HIST_KEEP: usize = 64;
 
+/// 自适应 depth 的观察窗（轮）：DOCS 29.7k 的 d7 尾部在第 8 轮后已足够
+/// 稳定；16 轮会把 d7 的税拖得过长。
+const SPEC_ADAPTIVE_WARMUP_ROUNDS: u32 = 8;
+/// 纯函数（单测锚）：滚动 tokens/round 是否低于降档门。
+fn adaptive_should_downshift(rounds: u32, tokens: u32, min_tpr: f32) -> bool {
+    rounds >= SPEC_ADAPTIVE_WARMUP_ROUNDS && (tokens as f32 / rounds as f32) < min_tpr
+}
+
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 投机轮执行(E5-M2b;施工方案 §9.2):快照 → 草稿到位 → verify
     /// (depth+1 行 prefill 通道,返回 ids + hidden 块)→ greedy 接受 →
@@ -21,7 +29,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         _kv_slots: [u32; 9],
         gdn_slot: usize,
         grew: bool,
+        depth: usize,
     ) -> Result<TurnEvent> {
+        if depth == 0 || depth > self.dev.spec_rt.depth {
+            return Err(ModelError::Msg(format!(
+                "spec round depth={depth} 越界（max={}）",
+                self.dev.spec_rt.depth
+            )));
+        }
         let sid = self.turns.active()?.session_id;
         if grew {
             let ts_bt = std::time::Instant::now();
@@ -35,7 +50,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let t_verify;
         let mut t_rollback = std::time::Duration::ZERO;
         let mut t_propose = std::time::Duration::ZERO;
-        let depth = self.dev.spec_rt.depth;
         // **VLM m-RoPE delta**(V5):图像提示经塔后,文本主干的 rope 位置
         // 相对真实 token 位置有常量偏移;verify 行必须与 decode 同式
         // (`pos_rope = pos + delta`),但 KV slots/lens 仍用真实位置。
@@ -80,7 +94,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let xqa_pt_v = self.xqa_pt_of(sid);
 
         let (ids, hidden, records, hidden_owned, row_logits, t_v) = self
-            .verify_round(&block, pos, gdn_slot, sampler_on, vlm_delta, &xqa_pt_v, sid)
+            .verify_round(&block, pos, gdn_slot, sampler_on, vlm_delta, &xqa_pt_v, sid, depth)
             .await?;
         t_verify = t_v;
         if prof {
@@ -132,6 +146,51 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // `spec.recent_*`(与本计数无关,不受影响)。
         mcnt("spec.sample.rounds", 1);
         mcnt("spec.sample.accepted", m as u64);
+        // 自适应 depth 的 active 事实（tag 有界：d3/d7；/debug/metrics 直读）
+        mcnt(&format!("spec.depth.d{depth}"), 1);
+        // **AL/成本降档门（T1b）**：滚动 tokens/round 低于阈值 ⇒ 只降不升。
+        // 静态 ctx 阈值在 DOCS 29.7k 会误选 d7；这个门用真实接受账补上。
+        if self.dev.spec_rt.adaptive_depth {
+            let min_depth = self.dev.spec_rt.depth_min;
+            let min_tpr = self.dev.spec_rt.adaptive_min_tpr;
+            let t = self.tspec()?;
+            t.adaptive_rounds = t.adaptive_rounds.saturating_add(1);
+            t.adaptive_tokens = t.adaptive_tokens.saturating_add((m + 1) as u32);
+            let avg = t.adaptive_tokens as f32 / t.adaptive_rounds as f32;
+            let ready = t.adaptive_rounds >= SPEC_ADAPTIVE_WARMUP_ROUNDS;
+            let low = adaptive_should_downshift(t.adaptive_rounds, t.adaptive_tokens, min_tpr);
+            let down = !t.adaptive_downshift && low && t.adaptive_low_windows >= 1;
+            // **per-round m 账**（T1b 校准用）:窗口内每轮一行，直接看 AL 形状。
+            owl_shared::log_info!(
+                "spec-adaptive",
+                "pos={pos} depth={depth} m={m} window_rounds={} window_tokens={} tpr={avg:.2} min_tpr={min_tpr:.2} ready={ready} low={low} low_windows={} down={down}",
+                t.adaptive_rounds,
+                t.adaptive_tokens,
+                t.adaptive_low_windows
+            );
+            if !t.adaptive_downshift {
+                if low {
+                    t.adaptive_low_windows = t.adaptive_low_windows.saturating_add(1);
+                } else if ready {
+                    t.adaptive_low_windows = 0;
+                }
+            }
+            if down {
+                t.adaptive_downshift = true;
+                mcnt("spec.adaptive.down", 1);
+                owl_shared::log_info!(
+                    "spec-adaptive",
+                    "pos={pos} 连续 2 窗 tokens/round={avg:.2} < {min_tpr:.2}（{} 轮）⇒ depth {} → {}（只降不升）",
+                    t.adaptive_rounds,
+                    depth,
+                    min_depth
+                );
+            } else if ready && !t.adaptive_downshift {
+                // 本窗不降：开下一个观察窗（累计平均会拖到 70+ 轮才看见尾部衰减）
+                t.adaptive_rounds = 0;
+                t.adaptive_tokens = 0;
+            }
+        }
         // B4 自适应降级态机(§6.24;DFlash2 专属 —— 同步机制走 dflash encode)
         // 2026-10-12 深夜重放 + 滚动 AL 窗口:连击 streak 会被"偶发 m=1"
         // 破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值 < 盈亏线即降级
@@ -327,7 +386,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .flatten()
                 {
                     let t_b = std::time::Instant::now();
-                    self.spec_fold_to(gdn_slot, &records, b - pos).await?;
+                    self.spec_fold_to(gdn_slot, &records, b - pos, depth).await?;
                     let t_fold1 = t_b.elapsed();
                     // 尾 token = 本轮已提交、尚未进 `act.out` 的那几枚
                     let tail = &toks[..b - 1 - pos];
@@ -357,7 +416,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     }
                 }
                 owl_shared::log_debug!("spec-round", "非边界:fold(m+1={}) 起", m + 1);
-                self.spec_fold_to(gdn_slot, &records, m + 1).await?;
+                self.spec_fold_to(gdn_slot, &records, m + 1, depth).await?;
                 owl_shared::log_debug!("spec-round", "非边界:fold 完");
             } else {
                 // eager fallback:旧路 —— 前缀重放(整模前向,已接受行
@@ -434,8 +493,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let taps: Vec<owl_iface::contract::Bytes> = (0..self.dev.spec_rt.dflash_tap_count)
                 .map(|i| {
                     self.dev.graphs
-                        .verify
-                        .as_ref()
+                        .verify_of(depth)
                         .ok_or_else(|| ModelError::EngineInvariant {
                             what: "dflash 模式要求 verify 图(taps 输出)".into(),
                         })?
@@ -458,14 +516,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             t_propose += ts.elapsed();
             self.tspec()?.spec_drafts_host = Some(d);
             }
-        } else if !self.dev.graphs.propose.is_empty() && !self.boot.probes.propose_eager {
+        } else if self.dev.graphs.has_propose(depth) && !self.boot.probes.propose_eager {
             let ts = std::time::Instant::now();
-            let d = self.propose_graph_step(m, &toks, pos).await?;
+            let d = self.propose_graph_step(m, &toks, pos, depth).await?;
             t_propose += ts.elapsed();
             self.tspec()?.spec_drafts_host = Some(d);
         } else if self.dev.spec_rt.drafter.is_some() {
             let ts = std::time::Instant::now();
-            let nd = self.propose_round(&hidden, m, &toks, pos).await?;
+            let nd = self.propose_round(&hidden, m, &toks, pos, depth).await?;
             t_propose += ts.elapsed();
             // 块 → host(轮首消费;块即焚)
             let mut buf = vec![0u8; 4 * depth];
@@ -597,16 +655,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         gdn_slot: usize,
         records: &[Bytes],
         rows: usize,
+        depth: usize,
     ) -> Result<()> {
-        debug_assert!(rows >= 1 && rows <= self.dev.spec_rt.depth, "fold 行数越界: {rows}");
+        if rows == 0 || rows > depth {
+            return Err(ModelError::Msg(format!(
+                "spec fold rows={rows} 越界（active depth={depth}）"
+            )));
+        }
         // ★ **双 rank 镜像**(P2.1-c,2026-10-19):fold 写的是**每 rank 自己的 GDN 池**
         // ⇒ 两 rank 必须同跑(否则下一轮 verify 读到本 rank 未 fold 的状态)。
         // 与 `capture_gdn_snap` 的双 rank 形态对齐(旧注释自认的缺口);单卡 = 原路。
-        if !self.dev.graphs.fold.is_empty() {
+        if self.dev.graphs.has_fold(depth) {
             let (dev, peer) = (&mut self.dev, self.peer.as_mut());
             crate::exec::mirror2!(dev, peer,
-                d => d.fold_step_dev(gdn_slot, rows),
-                p => p.fold_step_dev(gdn_slot, rows))?;
+                d => d.fold_step_dev(gdn_slot, rows, depth),
+                p => p.fold_step_dev(gdn_slot, rows, depth))?;
             return Ok(());
         }
         {
@@ -730,6 +793,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         vlm_delta: i64,
         xqa_pt_v: &[f32],
         sid: u64,
+        depth: usize,
     ) -> Result<(
         Vec<u32>,
         owl_iface::contract::Bytes,
@@ -740,7 +804,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     )> {
         let verify_elapsed;
         let (ids, hidden, records, hidden_owned, row_logits) =
-        if let Some(vg) = self.dev.graphs.verify.as_mut() {
+        if self.dev.graphs.verify_of(depth).is_some() {
+            let vg = self.dev.graphs.verify_mut(depth)?;
         let ts = std::time::Instant::now();
         let page = self.dev.pool.geom.page;
         let bt_chain = {
@@ -876,14 +941,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (tok_f, row_logits) = {
             let (dev, peer) = (&mut self.dev, self.peer.as_mut());
             match peer {
-                None => dev.verify_dev(&ins, fi_spec, sampler_on).await?,
+                None => dev.verify_dev(&ins, fi_spec, sampler_on, depth).await?,
                 Some(p) => {
                     // 两半都校验(纪律:`join2` 等另一半到底,吞错 = 挂住)
                     // 切档 ⇒ 两 rank 都要 logits 半表(rank0 拼接用);未切档
                     // = 原路(peer 不读 ⇒ 省那份 D2H 与 host 内存)。
                     let (r0, r1) = crate::exec::join2(
-                        dev.verify_dev(&ins, fi_spec, sampler_on || head_split),
-                        p.verify_dev(&ins, fi_spec, head_split),
+                        dev.verify_dev(&ins, fi_spec, sampler_on || head_split, depth),
+                        p.verify_dev(&ins, fi_spec, head_split, depth),
                     )
                     .await;
                     let (_, lg1) = r1?;
@@ -909,14 +974,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let t_read_v = std::time::Instant::now();
         let t_tok = std::time::Instant::now();
         // 后续（块句柄 / 探针）继续用主 rank 的图
-        let vg = self
-            .dev
-            .graphs
-            .verify
-            .as_mut()
-            .ok_or_else(|| ModelError::EngineInvariant {
-                what: "verify 图缺席(档位与装配不一致)".into(),
-            })?;
+        let vg = self.dev.graphs.verify_mut(depth)?;
         let t_lg = std::time::Instant::now();
         // E5 性能:verify 分相(step=上传+launch;read=同步+回读;
         // pure=同步后裸 replay+read = 图独占 GPU 时间)
@@ -1033,7 +1091,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             d
         } else if self.dev.spec_rt.drafter.is_some() {
             let ts = std::time::Instant::now();
-            self.propose_first(token, pos).await?;
+            self.propose_first(token, pos, depth).await?;
             spent = ts.elapsed();
             self.tspec()?.spec_drafts_host.take().ok_or_else(|| {
                 ModelError::EngineInvariant {
@@ -1724,5 +1782,24 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
     ) -> Result<()> {
         let face = self.graphs.session.face_mut();
         self.pool.capture_snap(face, gdn_slot, key, Some(slot)).await
+    }
+}
+
+
+#[cfg(test)]
+mod adaptive_tests {
+    use super::*;
+
+    #[test]
+    fn downshift_only_after_warmup_and_below_threshold() {
+        assert!(!adaptive_should_downshift(0, 0, 3.0));
+        assert!(!adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS - 1, 100, 3.0));
+        // DOCS 29.7k d7: 2.8 tokens/round -> 降
+        assert!(adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS, 23, 3.0));
+        // MATH 32k d7: 4.98 -> 不降
+        assert!(!adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS, 40, 3.0));
+        // 4.0 早降门
+        assert!(adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS, 28, 4.0));
+        assert!(!adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS, 36, 4.0));
     }
 }

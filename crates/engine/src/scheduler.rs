@@ -79,6 +79,8 @@ pub(crate) enum StepAction {
         kv_slots: [u32; 9],
         gdn_slot: usize,
         grew: bool,
+        /// 本轮 active depth（自适应档 = d3/d7；图族按它选）
+        depth: usize,
     },
     /// **跨会话合批 decode**(B5.1 M1;spec off):每行 = 一个会话的一步。
     /// 执行器一次 T=B 前向 + 逐行采样/事件(每行各自 `TurnEvent`)。
@@ -901,6 +903,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 每 probe_every 步发一轮真 SpecRound 探测(m≥1 → 解除降级,
         // 见 execute_spec_round 尾态机)。非降级 = 原调度,零变化。
         // B4 三态在 ActiveTurn.spec(turn 生命周期;2026-10-10 收口)
+        let active_depth = if self.dev.spec_rt.adaptive_depth
+            && self.turns.active()?.spec.adaptive_downshift
+        {
+            self.dev.spec_rt.depth_min
+        } else {
+            self.dev.spec_rt.depth_for_pos(pos)
+        };
         let spec = if self.dev.spec_rt.depth == 0 {
             0
         } else if !self.turns.active()?.spec.spec_degraded {
@@ -933,13 +942,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                 owl_shared::log_info!("spec-seed", "分母未测 ⇒ 本步发播种裸 decode(还欠 {} 步)", a.bare_seed_left);
                 0
             } else {
-                self.dev.spec_rt.depth
+                active_depth
             }
         } else if self.turns.active()?.spec.spec_steps_degraded
             >= self.turns.active()?.spec.spec_probe_every
         {
             self.turns.active_mut()?.spec.spec_steps_degraded = 0;
-            self.dev.spec_rt.depth
+            active_depth
         } else {
             0
         };
@@ -974,7 +983,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         match kv_slots {
             Some(kv_slots) => Ok(SchedulerOutput::Step {
                 begin,
-                action: StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew },
+                action: StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew, depth: spec },
             }),
             None => Ok(SchedulerOutput::Step {
                 begin,

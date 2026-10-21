@@ -1,4 +1,4 @@
-# owl 档 `gguf27b-vlm` —— 27B Q4_K_M + mmproj-Q8_0 视觉塔 / 8k。
+# owl 档 `qwen38_27b-3090-q4km-vlm` —— 27B Q4_K_M + mmproj-Q8_0 视觉塔 / 8k。
 extends = ["full.toml"]
 
 [server]

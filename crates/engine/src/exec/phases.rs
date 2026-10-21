@@ -1494,20 +1494,19 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
     /// **fold 设备半**(P2.1-c,2026-10-19):快照恢复 + fold 图入队
     /// —— 与 `spec_fold_to` 旧单 rank 体逐字同物;TP 镜像时两 rank 同跑
     /// (fold 写的是**每 rank 自己的 GDN 池**)。
-    pub(crate) async fn fold_step_dev(&mut self, gdn_slot: usize, rows: usize) -> Result<()> {
+    pub(crate) async fn fold_step_dev(
+        &mut self,
+        gdn_slot: usize,
+        rows: usize,
+        depth: usize,
+    ) -> Result<()> {
         owl_shared::log_debug!("spec-round", "fold:快照恢复起 rows={rows} slot={gdn_slot}");
         {
             let face = self.graphs.session.face_mut();
             self.pool.restore_spec_snap(face, gdn_slot).await?;
         }
         owl_shared::log_debug!("spec-round", "fold:图入队起 rows={rows}");
-        let fg = self
-            .graphs
-            .fold
-            .get_mut(rows - 1)
-            .ok_or_else(|| ModelError::EngineInvariant {
-                what: format!("fold 图桶 {rows} 缺席(装配与声明不一致)"),
-            })?;
+        let fg = self.graphs.fold_mut(depth, rows)?;
         let r = fg.step(&[("slots", &[gdn_slot as f32])]).await;
         owl_shared::log_debug!("spec-round", "fold:图入队完 rows={rows} ok={}", r.is_ok());
         r
@@ -1524,14 +1523,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         ins: &[(&str, &[f32])],
         fi: Option<owl_iface::contract::FiPlanSpec>,
         want_logits: bool,
+        depth: usize,
     ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
-        let vg = self
-            .graphs
-            .verify
-            .as_mut()
-            .ok_or_else(|| ModelError::EngineInvariant {
-                what: "verify 图缺席(档位与装配不一致)".into(),
-            })?;
+        let vg = self.graphs.verify_mut(depth)?;
         if let Some(spec) = fi {
             vg.face_mut().fi_plan_sync(spec).await?;
         }

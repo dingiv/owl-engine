@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 3090 单卡 W4A16 满血档启动(意图档 = `profiles/awq27b-3090-max.toml`)
+# 3090 单卡 W4A16 满血档启动(意图档 = `profiles/qwen38_27b-3090-w4a16.toml`)
 #
 #   · 行为面(上下文/池/FI 图/GDN chunked/无 KVMem)**全在意图档**;
 #   · 本脚本只做**站点面**:卡位(BDF)+ 端口 + 模型路径(--site 站点档);
@@ -24,7 +24,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$ROOT/target/release/server}"
-PROFILE="${PROFILE:-awq27b-3090-max}"
+PROFILE="${PROFILE:-qwen38_27b-3090-w4a16}"
 BDF="${BDF:-42:00.0}"
 PORT="${PORT:-8139}"
 LOG_LEVEL="${LOG_LEVEL:-info}"

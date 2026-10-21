@@ -1,4 +1,4 @@
-# owl 档 `gguf08b-iq4xs` —— 0.8B GGUF IQ4_XS / 16k(开发档)。
+# owl 档 `qwen35_0_8b-3090-iq4xs` —— 0.8B GGUF IQ4_XS / 16k(开发档)。
 extends = ["full.toml"]
 
 [server]
