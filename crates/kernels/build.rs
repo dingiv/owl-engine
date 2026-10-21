@@ -269,6 +269,17 @@ fn build_native_cubins(
     if env::var_os("OWL_CUBIN_SKIP").is_some() {
         println!("cargo:warning=owl-kernels: OWL_CUBIN_SKIP —— 跳过构建期 cubin(纯 NVRTC 基线)");
         std::fs::write(&manifest_path, EMPTY_ASSETS_RS).expect("write cubin_assets.rs");
+        // ⚠️ 跳过分支必须**同样产出**下面两个构建期物,否则 crate 编译失败
+        // (2026-10-21 实测:`cu_sig.rs` include! 的符号表与 `family/cubins.rs`
+        //  的 `env!("OWL_ASSET_FP")` 都缺席 ——「无 GPU 构建」这条路当时是断的)。
+        // 空表语义:资产面为空 ⇒ 各族装配期拒启(与 GDN_TRITON_BUILD=0 同口径)。
+        std::fs::write(
+            out_dir.join("cubin_symbols.rs"),
+            "// @generated (OWL_CUBIN_SKIP) —— 空符号表\n\
+             pub const ASSET_SYMBOLS: &[(&str, &[&str])] = &[];\n",
+        )
+        .expect("write cubin_symbols.rs");
+        println!("cargo:rustc-env=OWL_ASSET_FP=0000000000000000");
         return;
     }
     let nvcc = env::var("OWL_NVCC").unwrap_or_else(|_| "nvcc".into());
