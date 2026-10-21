@@ -1140,7 +1140,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     let face = self.graphs.session.face_mut();
                     let mut rbuf = vec![0u8; (n_tp + 1) * t * d_model * 2];
                     face.dtoh(&hfb, &mut rbuf).await?;
-                    if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_root.bin", &rbuf) {
+                    if let Err(e) = owl_shared::file_loader::write(&crate::probe_dump::probe_path("owl_dflash_root.bin"), &rbuf) {
                 owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
                     owl_shared::log_debug!("dflash-probe", "concat 父块落盘 /tmp/owl_dflash_root.bin t={t}");

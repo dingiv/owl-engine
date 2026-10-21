@@ -1225,6 +1225,12 @@ pub(crate) fn into_running<D: DeviceClient>(
     })
 }
 
+/// **图族 face 数**(spec depth → 句柄数):fold/propose 桶形图各需 depth×2 个
+/// 独立 face,再加 2 个常驻面。单源 —— 原来这算式内联在装配点。
+fn fleet_faces(depth: usize) -> usize {
+    2 * depth.max(1) + 2
+}
+
 /// **rank 束**(S4 ⑤-K2/K3):一个 rank 的**全部**状态 —— 模型件 + 执行环境 +
 /// 运行态 + 状态池 + 图族。`Engine::run`(单卡)与 `TpEngine`(双 rank)
 /// 共用同一装配(`boot_rank`)与同一执行码(设备侧体 = 本类型的方法)。
@@ -1838,7 +1844,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         let vface = face.face_clone();
         // E5-M5:fold/propose 桶形图族的 face 句柄(depth × 2)
         let extra_faces: Vec<DeviceHandle<D>> =
-            (0..2 * spec.depth.max(1) + 2).filter_map(|_| face.face_clone()).collect();
+            (0..fleet_faces(spec.depth)).filter_map(|_| face.face_clone()).collect();
         let graphs = GraphFleet::assemble(
             face,
             vface,

@@ -189,6 +189,10 @@ pub(crate) struct BootCtx {
     pub(crate) seq: u64,
 }
 
+/// **压力节点单次腾槽上限**(N6):一次最多腾这么多槽,避免"一口气搬空"
+/// 把正在跑的 turn 的工作集也冲掉。
+const PRESSURE_MAX_SLOTS: usize = 64;
+
 /// **生成预算的最小保留量**(tok):剩余额度低于它 = 真溢出(连一个像样的
 /// 工具调用/短答都放不下)⇒ 拒绝,让客户端压缩上下文。
 ///
@@ -563,7 +567,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     // 系统时钟回拨兜底 → 0(非失败路径;仅用于 dump 文件名)
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
-                let path = format!("/tmp/owl-prompt-{ms}.txt");
+                let path = crate::probe_dump::probe_path(&format!("owl-prompt-{ms}.txt"));
                 match std::fs::write(&path, &wrapped) {
                     Ok(_) => owl_shared::log_debug!("prompt-dump", "{path} ({}B)", wrapped.len()),
                     Err(e) => owl_shared::log_debug!("prompt-dump", "落盘失败 {e}"),
@@ -954,7 +958,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let per = self.dev.pool.block_bytes().max(1) as u64;
         let want = ((target - free) / per) as usize;
-        Some(want.clamp(1, 64))
+        Some(want.clamp(1, PRESSURE_MAX_SLOTS))
     }
 
     /// **H5 空转制的节拍推进**(Idle pump 计数;每 N 拍调 `node(Node::Idle)` 一次)

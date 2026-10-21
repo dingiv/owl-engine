@@ -14,6 +14,9 @@ use owl_models::TensorOps;
 use crate::graph_plan::f32b;
 use crate::scheduler::BeginPlan;
 
+/// **B4 降级探测周期上限**(tok):退避 ×2 后封顶,避免探针稀疏到失效。
+const DEGRADE_PROBE_MAX: usize = 512;
+
 /// **双 rank 镜像执行**(S6f):`dev` 必跑;`peer` 在场则**并发**跑同一动作。
 ///
 /// 为什么是宏而不是对象:两边的 future 都**借用各自 rank 的 `&mut`** ——
@@ -161,7 +164,7 @@ pub(crate) fn spec_degrade_transition(
     }
     let streak = streak + 1;
     if degraded {
-        (streak, true, (probe_every * 2).min(512))
+        (streak, true, (probe_every * 2).min(DEGRADE_PROBE_MAX))
     } else if threshold > 0 && streak >= threshold {
         (streak, true, probe_floor)
     } else {

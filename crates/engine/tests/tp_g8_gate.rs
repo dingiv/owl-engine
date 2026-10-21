@@ -239,7 +239,7 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     let tp = TpEngine::assemble_with(
         vec![e0, e1],
         vec![l0, l1],
-        owl_engine::TpOpts { push, ar_f8, ar_fused },
+        owl_engine::TpOpts { push, ar_f8, ar_fused, one_stage: false },
     )
         .await
         .expect("TP2 装配");

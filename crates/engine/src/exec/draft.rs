@@ -208,7 +208,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let n: usize = memory.shape().iter().product();
             let mut buf = vec![0u8; n * 2];
             face.dtoh(&outs[0], &mut buf).await?;
-            if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_mem.bin", &buf) {
+            if let Err(e) = owl_shared::file_loader::write(&crate::probe_dump::probe_path("owl_dflash_mem.bin"), &buf) {
                 owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
             owl_shared::log_debug!("dflash-probe", "memory 落盘 /tmp/owl_dflash_mem.bin t={t}");
@@ -313,7 +313,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 face.dtoh(&kb, &mut kbuf).await?;
             }
             if pos <= 18 {
-                if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_kpool.bin", &kbuf) {
+                if let Err(e) = owl_shared::file_loader::write(&crate::probe_dump::probe_path("owl_dflash_kpool.bin"), &kbuf) {
                 owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
                 owl_shared::log_debug!("dflash-probe", "草稿 K 池首块落盘 /tmp/owl_dflash_kpool.bin pos={pos}");
@@ -401,7 +401,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let n: usize = r.shape().iter().product();
                 let mut blk = vec![0u8; n * 2];
                 face.dtoh(&b, &mut blk).await?;
-                if let Err(e) = owl_shared::file_loader::write(format!("/tmp/owl_p{i}.bin"), &blk) {
+                if let Err(e) = owl_shared::file_loader::write(&crate::probe_dump::probe_path(&format!("owl_p{i}.bin")), &blk) {
                 owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
             }
@@ -410,13 +410,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let n: usize = hidden.shape().iter().product();
             let mut hbuf = vec![0u8; n * 2];
             face.dtoh(&b, &mut hbuf).await?;
-            if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_hid.bin", &hbuf) {
+            if let Err(e) = owl_shared::file_loader::write(&crate::probe_dump::probe_path("owl_dflash_hid.bin"), &hbuf) {
                 owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
             let mut m = Vec::new();
             m.extend_from_slice(&(pos as u32).to_le_bytes());
             m.extend_from_slice(&anchor.to_le_bytes());
-            if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_meta.bin", &m) {
+            if let Err(e) = owl_shared::file_loader::write(&crate::probe_dump::probe_path("owl_dflash_meta.bin"), &m) {
                 owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
             owl_shared::log_debug!("dflash-probe", "{} probe roots + hidden 落盘(逐根独立 eval)pos={pos} anchor={anchor}", probe_roots.len());
@@ -1246,7 +1246,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let n: usize = memory.shape().iter().product();
             let mut buf = vec![0u8; n * 2];
             face.dtoh(&outs[0], &mut buf).await?;
-            if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_mem.bin", &buf) {
+            if let Err(e) = owl_shared::file_loader::write(&crate::probe_dump::probe_path("owl_dflash_mem.bin"), &buf) {
                 owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
             }
             owl_shared::log_debug!("dflash-probe", "memory 落盘 /tmp/owl_dflash_mem.bin t={t}");

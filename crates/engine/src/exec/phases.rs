@@ -1214,7 +1214,7 @@ if self.dev.graphs.session.has_input("sel_pt") {
         let mut buf = vec![0u8; n];
         face.dtoh(&scratch, &mut buf).await?;
         let _ = face.free(&[scratch.id]).await;
-        std::fs::write(format!("/tmp/kv-{tag}.bin"), &buf)
+        std::fs::write(crate::probe_dump::probe_path(&format!("kv-{tag}.bin")), &buf)
             .map_err(|e| owl_iface::contract::ModelError::Msg(format!("kv dump 落盘: {e}")))?;
         let meta = format!(
             "tag={tag} slot={kv_slot} blk={blk} off={} hkv={hkv} hd={hd} page={page} row_bytes={row_bytes} page_bytes={n}\n",
@@ -1225,7 +1225,7 @@ if self.dev.graphs.session.has_input("sel_pt") {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/kv-meta.txt")
+                .open(crate::probe_dump::probe_path("kv-meta.txt"))
                 .map_err(|e| owl_iface::contract::ModelError::Msg(format!("kv meta: {e}")))?;
             f.write_all(meta.as_bytes())
                 .map_err(|e| owl_iface::contract::ModelError::Msg(format!("kv meta 写: {e}")))?;

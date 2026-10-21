@@ -293,8 +293,9 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let mut opts = LoadOpts::plain(spec.dtype);
         opts.shard = self.slice.1;
         opts.slice_id = self.slice.0;
-        opts.debug_tap = owl_shared::env_reader::flag("OWL_LOAD_DEBUG");
-        opts.verify = owl_shared::env_reader::flag("OWL_LOAD_VERIFY");
+        // 旋钮来自 `[load]`(配置面单源;用户裁决 2026-10-19:不读 env)
+        opts.debug_tap = self.load.debug_tap;
+        opts.verify = self.load.verify;
         let t_plan = t_open.elapsed();
         load_from_dir(path, self.face, &model, opts).await?;
         let model = Arc::new(model);

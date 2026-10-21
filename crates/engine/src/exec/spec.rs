@@ -2,6 +2,12 @@
 use super::*;
 use owl_models::ModelError;
 
+/// **采样惩罚的历史窗**(tok):只回看最近这么多已发 token。
+///
+/// 口径 = 与裸 decode 的 `hist` 同式(逐 token 追加、窗口截尾),不是配置项:
+/// 它约束的是"惩罚集有多大",过大会让长思考被无谓压制。
+const SPEC_HIST_KEEP: usize = 64;
+
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 投机轮执行(E5-M2b;施工方案 §9.2):快照 → 草稿到位 → verify
     /// (depth+1 行 prefill 通道,返回 ids + hidden 块)→ greedy 接受 →
@@ -63,7 +69,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         let mut hist: Vec<u32> = {
             let act = self.turns.active()?;
-            let tail = act.prompt_ids.len().saturating_sub(64);
+            let tail = act.prompt_ids.len().saturating_sub(SPEC_HIST_KEEP);
             act.prompt_ids[tail..].iter().chain(act.out.iter()).copied().collect()
         };
         let seed_base = {
