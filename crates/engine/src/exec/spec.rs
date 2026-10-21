@@ -25,7 +25,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let prof = self.boot.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
         let t_round = std::time::Instant::now();
-        let mut t_snap = std::time::Duration::ZERO;
+        let t_snap;
         let t_verify;
         let mut t_rollback = std::time::Duration::ZERO;
         let mut t_propose = std::time::Duration::ZERO;
@@ -767,7 +767,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         Option<Vec<f32>>,
         std::time::Duration,
     )> {
-        let mut verify_elapsed = std::time::Duration::ZERO;
+        let verify_elapsed;
         let (ids, hidden, records, hidden_owned, row_logits) =
         if let Some(vg) = self.dev.graphs.verify.as_mut() {
         let ts = std::time::Instant::now();

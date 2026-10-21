@@ -435,22 +435,13 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // ── GDN 序列表写持久槽(**布局 nt = ceil(t_pad/BT)、cu = t_real**)──
         // 图内 `nt` 是烘死的标量(布局口径);三张表的**内容**由本写定死:
         // cu=[0,t_real] ⇒ 行区间/递推落点都在真行上(§4.3e P-6b;假行不进序列)。
-        if let Some(gt) = self.pool.gdn_table_blocks() {
+        // 写槽动作归 `KvBank`(槽的拥有者);桶路只声明**口径**(nt = 布局、
+        // cu = 真行)与**流**(COMPUTE:与紧随的图发射同流,见 graph_plan::fill_slots)
+        {
             let nt = t_pad.div_ceil(owl_models::kernel::GDN_BT).max(1);
-            if nt > gt.nt_cap {
-                return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "GDN 序列表超槽容量:nt={nt} > nt_cap={}",
-                    gt.nt_cap
-                )));
-            }
-            let bytes = owl_models::kernel::gdn_table_host_bytes(t, nt);
-            let f32bits: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
-                .collect();
             let face = self.graphs.session.face_mut();
-            // 参数面 → COMPUTE(与紧随的图发射同流;见 graph_plan::fill_slots 注)
-            face.write_block_f32_on(owl_iface::contract::UpStream::Compute, &gt.table, 0, &f32bits)
+            self.pool
+                .write_gdn_tables(face, t, nt, crate::state::GdnTableStream::Compute)
                 .await?;
         }
         // ── **FI plan 表同步**(2026-10-19;桶路 × 单图档)──
@@ -750,56 +741,23 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // ⚠️ 预物化(eval 往返同步)而非 from_host 叶子:Htod 在 H2D 流、
         // FI 核在 COMPUTE 流,无跨流序 —— 异步竞态会让 FI 偶发读到半写入
         // 表(渐进腐败案,2026-10-03;09-28 upload_pinned 同病史)。
-        let u32le = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-        let fi_tensors;
+        let fi_leaves;
+        let fi_kv;
         let fi = if let Some(ft) = tb.fi.as_ref() {
-            let k_fi_leaf = self.pool.kv_fi_leaves();
-            // P-3(2026-10-15):表件写**持久槽**(地址恒定 ⇒ 图可直接烘;
-            // 旧实现每 chunk 4 次 `eval_ops(from_host)` = 4 次往返同步)。
-            // 写经 `write_blocks_f32` = 单条批量 HtodChunks 命令,回执 =
-            // 设备侧搬运完成的 host callback ⇒ **回执即落地**(无跨流竞态:
-            // 旧注释里"预物化"要的就是这个序;批量只是把 4 次压成 1 次)。
-            let fb = self
-                .pool
-                .fi_table_blocks()
-                .ok_or_else(|| ModelError::EngineInvariant { what: "FI 表槽未分配(池几何与档位不一致)".into() })?
-                .clone();
-            assert!(
-                ft.nb_used <= fb.nb_cap,
-                "FI 页链超槽容量:nb_used={} > nb_cap={}",
-                ft.nb_used,
-                fb.nb_cap
-            );
-            let bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|x| f32::from_bits(*x)).collect() };
-            let w_q_cu = bits(&ft.q_cu);
-            let w_idx = bits(&ft.indices);
-            let w_ind = bits(&ft.indptr);
-            let w_ll = bits(&ft.last_len);
+            // P-3:表件写**持久槽**(槽归 `KvBank` 所有 ⇒ 写入动作由它封装;
+            // 单条批量命令 + 回执即落地 = 无跨流竞态)
             let face = self.graphs.session.face_mut();
-            face.write_blocks_f32_on(
-                owl_iface::contract::UpStream::Compute,
-                &[
-                    (&fb.q_cu, 0, w_q_cu.as_slice()),
-                    (&fb.indices, 0, w_idx.as_slice()),
-                    (&fb.indptr, 0, w_ind.as_slice()),
-                    (&fb.last_len, 0, w_ll.as_slice()),
-                ],
-            )
-            .await?;
-            let q_cu = TensorOps::of_block(fb.q_cu.id, Dtype::U32, vec![2]);
-            let indices = TensorOps::of_block(fb.indices.id, Dtype::U32, vec![ft.nb_used]);
-            let indptr = TensorOps::of_block(fb.indptr.id, Dtype::U32, vec![2]);
-            let last_len = TensorOps::of_block(fb.last_len.id, Dtype::U32, vec![1]);
+            fi_leaves = self.pool.write_fi_tables(face, ft).await?;
             let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) =
-                k_fi_leaf.iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
-            fi_tensors = (kcs, vcs, q_cu, indices, indptr, last_len);
+                self.pool.kv_fi_leaves().iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
+            fi_kv = (kcs, vcs);
             Some(FiPrefillCtx {
-                kcs: &fi_tensors.0,
-                vcs: &fi_tensors.1,
-                q_cu: &fi_tensors.2,
-                indices: &fi_tensors.3,
-                indptr: &fi_tensors.4,
-                last_len: &fi_tensors.5,
+                kcs: &fi_kv.0,
+                vcs: &fi_kv.1,
+                q_cu: &fi_leaves.q_cu,
+                indices: &fi_leaves.indices,
+                indptr: &fi_leaves.indptr,
+                last_len: &fi_leaves.last_len,
             })
         } else {
             None
@@ -829,49 +787,15 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // (2026-10-03 渐进腐败案同病史,见上方 FI 表注)。
         // semaphores/scratch 两件取池里的真块:单块几何(`XqaPrefillRuntime`
         // 强制 `nbSubSeq=1`)下核**结构上不解引用**它们,传真块只为"不隐瞒"。
-        let xqa_tensors;
+        // XQA prefill 表三件:表件逐 chunk 物化、semaphores/scratch 取自池 ——
+        // 两件都归 `KvBank` 所有 ⇒ 组装由它封装(`prefill_xqa`)。
         let xqa_pf = if self.env().attn.xqa_prefill {
-            match (self.pool.xqa_ctx(), tb.xqa.as_ref()) {
-                (Some(px), Some(xt)) => {
+            match tb.xqa.as_ref() {
+                Some(xt) => {
                     let face = self.graphs.session.face_mut();
-                    let pt_b = owl_models::interpreters::eval_ops(
-                        TensorOps::from_host(
-                            Dtype::U32,
-                            vec![xt.page_table.len()],
-                            &u32le(&xt.page_table),
-                        )
-                        .step(),
-                        face,
-                    )
-                    .await?;
-                    let sl_b = owl_models::interpreters::eval_ops(
-                        TensorOps::from_host(Dtype::U32, vec![1], &u32le(&[xt.seq_len])).step(),
-                        face,
-                    )
-                    .await?;
-                    let mk_b = owl_models::interpreters::eval_ops(
-                        TensorOps::from_host(Dtype::U32, vec![xt.mask.len()], &u32le(&xt.mask))
-                            .step(),
-                        face,
-                    )
-                    .await?;
-                    xqa_tensors = (
-                        TensorOps::of_block(pt_b.id, Dtype::U32, vec![xt.page_table.len()]),
-                        TensorOps::of_block(sl_b.id, Dtype::U32, vec![1]),
-                        TensorOps::of_block(mk_b.id, Dtype::U32, vec![xt.mask.len()]),
-                    );
-                    Some(owl_models::module::XqaVerifyCtx {
-                        page_table: xqa_tensors.0.clone(),
-                        seq_lens: xqa_tensors.1.clone(),
-                        mask: xqa_tensors.2.clone(),
-                        semaphores: px.semaphores.clone(),
-                        scratch: px.scratch.clone(),
-                        q_seq_len: t,
-                        max_seq_len: px.max_seq_len,
-                        sm_count: px.sm_count,
-                    })
+                    self.pool.prefill_xqa(face, xt, t).await?
                 }
-                _ => None,
+                None => None,
             }
         } else {
             None
@@ -896,32 +820,18 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // `t_layout`(桶几何下的 t_pad)只进张量形状 —— 核的行区间与递推落点全
         // 由这三张表定 ⇒ 假行**不在序列里**。旧路:runtime 内部按 `t` 生成 ⇒
         // padding 假行推进递推态(探针 `gdn_bucket_pad_probe`:终态 Δ=3.6e-2)。
-        let gdn_nt = t.div_ceil(owl_models::kernel::GDN_BT).max(1);
-        let gdn_tbl_leaf;
-        let gdn_tables = match self.pool.gdn_table_blocks() {
-            Some(gt) => {
-                if gdn_nt > gt.nt_cap {
-                    return Err(owl_iface::contract::ModelError::Msg(format!(
-                        "GDN 序列表超槽容量:nt={gdn_nt} > nt_cap={}(seq_tokens/chunk 配置不一致)",
-                        gt.nt_cap
-                    )));
-                }
-                let bytes = owl_models::kernel::gdn_table_host_bytes(t, gdn_nt);
-                let f32bits: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
-                    .collect();
-                let face = self.graphs.session.face_mut();
-                face.write_block_f32(&gt.table, 0, &f32bits).await?;
-                gdn_tbl_leaf = TensorOps::of_block(
-                    gt.table.id,
-                    Dtype::U32,
-                    vec![owl_models::kernel::gdn_table_bytes(gdn_nt) / 4],
-                );
-                Some(owl_models::module::GdnTableSlot { table: &gdn_tbl_leaf, nt: gdn_nt })
-            }
-            None => None,
+        // 序列表槽归 `KvBank` 所有 ⇒ 铸表 + 写槽由它封装(`write_gdn_tables`)。
+        let gdn_tbl = {
+            let face = self.graphs.session.face_mut();
+            let nt = t.div_ceil(owl_models::kernel::GDN_BT).max(1);
+            self.pool
+                .write_gdn_tables(face, t, nt, crate::state::GdnTableStream::Default)
+                .await?
         };
+        let gdn_tables = gdn_tbl.as_ref().map(|g| owl_models::module::GdnTableSlot {
+            table: &g.leaf,
+            nt: g.nt,
+        });
         ctx.gdn_tables = gdn_tables;
         ctx.xqa = xqa_pf;
         // ── **VLM:本 chunk 的 m-RoPE / 图像注入**(2026-10-20)──

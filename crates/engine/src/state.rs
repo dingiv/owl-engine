@@ -236,6 +236,40 @@ impl StatePool {
     pub(crate) fn kvs(&self) -> &[KvBlocks] {
         self.kv.kvs()
     }
+
+    // ── 表件写入的**接口函数**(S6e)──
+    // 状态归 `KvBank` 所有 ⇒ 逻辑在 `impl KvBank`;这里只是池的对外接口
+    // (引擎拿的是 `StatePool`,不该为写三张表去拆组合)。
+
+    /// FI 表四件写入(见 [`KvBank::write_fi_tables`])。
+    pub(crate) async fn write_fi_tables<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        fi: &crate::exec::prefill_chunk::FiTables,
+    ) -> Result<FiTableLeaves> {
+        self.kv.write_fi_tables(face, fi).await
+    }
+
+    /// GDN 序列表写入(见 [`KvBank::write_gdn_tables`])。
+    pub(crate) async fn write_gdn_tables<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        t_real: usize,
+        nt: usize,
+        stream: GdnTableStream,
+    ) -> Result<Option<GdnTableSlotOwned>> {
+        self.kv.write_gdn_tables(face, t_real, nt, stream).await
+    }
+
+    /// XQA prefill 表三件(见 [`KvBank::prefill_xqa`])。
+    pub(crate) async fn prefill_xqa<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        xt: &crate::exec::prefill_chunk::XqaTables,
+        t: usize,
+    ) -> Result<Option<owl_models::module::XqaVerifyCtx>> {
+        self.kv.prefill_xqa(face, xt, t).await
+    }
 }
 
 /// **池几何 / 档位**(boot 期定型,运行期只读)。
@@ -304,6 +338,170 @@ impl KvBank {
     pub(crate) fn kvs(&self) -> &[KvBlocks] {
         &self.kvs
     }
+
+    /// **FI 表四件写入**(P-3):持久槽 ⇒ 地址恒定(图可直接烘);
+    /// 单条批量命令 + 回执即落地(旧实现每 chunk 4 次 `eval_ops(from_host)`
+    /// = 4 次往返同步)。
+    ///
+    /// 返回四件叶子(形状随本 chunk 实际用量;`nb_used` 只影响 indices 声明宽)。
+    pub(crate) async fn write_fi_tables<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        fi: &crate::exec::prefill_chunk::FiTables,
+    ) -> Result<FiTableLeaves> {
+        let fb = self.fi_tables.as_ref().ok_or_else(|| ModelError::EngineInvariant {
+            what: "FI 表槽未分配(池几何与档位不一致)".into(),
+        })?;
+        if fi.nb_used > fb.nb_cap {
+            return Err(ModelError::Msg(format!(
+                "FI 页链超槽容量:nb_used={} > nb_cap={}(池预算/几何不一致)",
+                fi.nb_used, fb.nb_cap
+            )));
+        }
+        let bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|x| f32::from_bits(*x)).collect() };
+        let (w_q_cu, w_idx) = (bits(&fi.q_cu), bits(&fi.indices));
+        let (w_ind, w_ll) = (bits(&fi.indptr), bits(&fi.last_len));
+        face.write_blocks_f32_on(
+            owl_iface::contract::UpStream::Compute,
+            &[
+                (&fb.q_cu, 0, w_q_cu.as_slice()),
+                (&fb.indices, 0, w_idx.as_slice()),
+                (&fb.indptr, 0, w_ind.as_slice()),
+                (&fb.last_len, 0, w_ll.as_slice()),
+            ],
+        )
+        .await?;
+        Ok(FiTableLeaves {
+            q_cu: TensorOps::of_block(fb.q_cu.id, Dtype::U32, vec![2]),
+            indices: TensorOps::of_block(fb.indices.id, Dtype::U32, vec![fi.nb_used]),
+            indptr: TensorOps::of_block(fb.indptr.id, Dtype::U32, vec![2]),
+            last_len: TensorOps::of_block(fb.last_len.id, Dtype::U32, vec![1]),
+        })
+    }
+
+    /// **GDN 序列表写入**(P-6b):三张 FLA 表(`cu|coff|idx`)按**本 chunk
+    /// 真行数 t** 铸,写进持久槽(地址恒定 ⇒ 图可烘)。
+    ///
+    /// 为什么必须按真行数:核的行区间与递推落点全由这三张表定 —— 按桶几何
+    /// `t_pad` 生成会把 padding 假行算进序列(递推态污染,`gdn_bucket_pad_probe`
+    /// 实测终态 Δ=3.6e-2 → 0)。
+    ///
+    /// 返回 `(表叶子, nt)`;无 GDN 层 = `None`。
+    /// `t_real` = 本块**真行数**(表的 `cu`/内容口径);`nt` = 布局口径的 chunk 数
+    /// (eager = `ceil(t_real/BT)`;桶路 = `ceil(t_pad/BT)` —— 图内烘的是它)。
+    /// `stream` = 写入流(eager 默认;桶路必须 COMPUTE,与紧随的图发射同流)。
+    pub(crate) async fn write_gdn_tables<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        t_real: usize,
+        nt: usize,
+        stream: GdnTableStream,
+    ) -> Result<Option<GdnTableSlotOwned>> {
+        let Some(gt) = self.gdn_tables.as_ref() else {
+            return Ok(None);
+        };
+        let nt = nt.max(1);
+        if nt > gt.nt_cap {
+            return Err(ModelError::Msg(format!(
+                "GDN 序列表超槽容量:nt={nt} > nt_cap={}(seq_tokens/chunk 配置不一致)",
+                gt.nt_cap
+            )));
+        }
+        let bytes = owl_models::kernel::gdn_table_host_bytes(t_real, nt);
+        let f32bits: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
+            .collect();
+        match stream {
+            GdnTableStream::Default => face.write_block_f32(&gt.table, 0, &f32bits).await?,
+            GdnTableStream::Compute => {
+                face.write_block_f32_on(
+                    owl_iface::contract::UpStream::Compute,
+                    &gt.table,
+                    0,
+                    &f32bits,
+                )
+                .await?
+            }
+        }
+        Ok(Some(GdnTableSlotOwned {
+            leaf: TensorOps::of_block(
+                gt.table.id,
+                Dtype::U32,
+                vec![owl_models::kernel::gdn_table_bytes(nt) / 4],
+            ),
+            nt,
+        }))
+    }
+
+    /// **XQA prefill 表三件**(页链 / 整请求长 / 因果位掩码)。
+    ///
+    /// 表件是**逐 chunk 物化**的临时块(`eval_ops` 往返同步;Htod 在 H2D 流、
+    /// 核在 COMPUTE 流,无跨流序 ⇒ 异步竞态会让核读到半写入表 —— 2026-10-03
+    /// 渐进腐败案同病史);semaphores/scratch 取池里的真块(单块几何下核
+    /// **结构上不解引用**它们,传真块只为"不隐瞒")。
+    ///
+    /// 无 XQA 资源面 = `None`(调用方按 `env.attn.xqa_prefill` 先行判门)。
+    pub(crate) async fn prefill_xqa<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        xt: &crate::exec::prefill_chunk::XqaTables,
+        t: usize,
+    ) -> Result<Option<owl_models::module::XqaVerifyCtx>> {
+        let Some(px) = self.xqa.clone() else {
+            return Ok(None);
+        };
+        let u32le = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let pt_b = eval_ops(
+            TensorOps::from_host(Dtype::U32, vec![xt.page_table.len()], &u32le(&xt.page_table))
+                .step(),
+            face,
+        )
+        .await?;
+        let sl_b = eval_ops(
+            TensorOps::from_host(Dtype::U32, vec![1], &u32le(&[xt.seq_len])).step(),
+            face,
+        )
+        .await?;
+        let mk_b = eval_ops(
+            TensorOps::from_host(Dtype::U32, vec![xt.mask.len()], &u32le(&xt.mask)).step(),
+            face,
+        )
+        .await?;
+        Ok(Some(owl_models::module::XqaVerifyCtx {
+            page_table: TensorOps::of_block(pt_b.id, Dtype::U32, vec![xt.page_table.len()]),
+            seq_lens: TensorOps::of_block(sl_b.id, Dtype::U32, vec![1]),
+            mask: TensorOps::of_block(mk_b.id, Dtype::U32, vec![xt.mask.len()]),
+            semaphores: px.semaphores.clone(),
+            scratch: px.scratch.clone(),
+            q_seq_len: t,
+            max_seq_len: px.max_seq_len,
+            sm_count: px.sm_count,
+        }))
+    }
+}
+
+/// FI 表四件叶子(形状随本 chunk 用量;`kcs/vcs` 由池的层视图另取)。
+pub(crate) struct FiTableLeaves {
+    pub q_cu: TensorOps,
+    pub indices: TensorOps,
+    pub indptr: TensorOps,
+    pub last_len: TensorOps,
+}
+
+/// GDN 序列表的写入流(桶路必须 COMPUTE:与紧随的图发射同流)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GdnTableStream {
+    /// 默认流(eager 路)
+    Default,
+    /// COMPUTE 流(桶图前刷表)
+    Compute,
+}
+
+/// GDN 序列表槽:叶子 + 本 chunk 的 chunk 数(`nt = ceil(t / BT)`)。
+pub(crate) struct GdnTableSlotOwned {
+    pub leaf: TensorOps,
+    pub nt: usize,
 }
 
 /// **GDN 户**:格状态 + 前缀快照池(仅非 full 层)。
