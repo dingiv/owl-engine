@@ -926,7 +926,10 @@ impl<D: DeviceClient + 'static> Engine<D> {
             live_at_new: owl_shared::vram::live_bytes(),
         };
         let ledger_cell = owl_store::ledger_entry(&ledger);
-        let face = DeviceHandle::new(face, Some(ledger_cell.clone()));
+        // 输出口注入(2026-10-21):`[device-handle]` 的告警/自愈面走统一日志门
+        // (level + tag 白黑名单);iface 不依赖 owl-shared ⇒ 在这里显式给。
+        let face = DeviceHandle::new(face, Some(ledger_cell.clone()))
+            .with_sink(owl_shared::log::sink());
         Ok(Self { face, ledger, ledger_cell, cfg, boot })
     }
 
@@ -1440,8 +1443,9 @@ fn boot_pool_floor(
             format!("{n} 页 = {} KiB/turn", (n * page_bytes) >> 10)
         }
     };
-    eprintln!(
-        "[turn-ws] 每 turn 工作集 = {} tok = {} 页 = {} KiB(页 {} tok / {} KiB)⇒ \
+    owl_shared::log_info!(
+        "turn-ws",
+        "每 turn 工作集 = {} tok = {} 页 = {} KiB(页 {} tok / {} KiB)⇒ \
          常驻 {} 块 = 保底 sink {} + recent {} + 召回 top-k {};准入地板 = {};\
          池下限 = {} 并发 × (工作集 {} + chunk {} = {} 页) = {} 页(池 {} 页){}\
          (改工作集只动 `[kvmem].workspace_per_req`;`select_blocks` 是派生量)",

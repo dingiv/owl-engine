@@ -12,6 +12,14 @@
 //!
 //! 全进程单引擎假设(与 slab_hint 同);非追踪面(CUDA ctx ~430MB、
 //! async 池惰性保留、捕获瞬态)= reserve 兜底,默认 300MB,梯子校准。
+//!
+//! # 与"探针账"的边界(2026-10-21 审查)
+//!
+//! 本模块是**治理账**:值参与决策(池容量 = f(total, live, reserve)),
+//! 缺了它引擎会算错预算 ⇒ 与 `[probes]` 无关,恒开、恒准。
+//! 探针账(`slab_hint::live_diag` 的活性/拒因)只用于**指认**,关掉不影响
+//! 行为。两类都住 `owl-shared`、都用私有原子,但**语义不同,不要合并**。
+//! 三个 static 均私有 + 只经函数访问(无 `pub static` 裸奔)。
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 

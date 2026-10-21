@@ -136,7 +136,7 @@ impl LrfuPolicy {
         let l = if lambda > 0.0 && lambda < 1.0 {
             lambda
         } else {
-            eprintln!("[store] LrfuPolicy:λ={lambda} 非法(须 0<λ<1)⇒ 取 0.9");
+            owl_shared::log_warn!("store", "LrfuPolicy:λ={lambda} 非法(须 0<λ<1)⇒ 取 0.9");
             0.9
         };
         Self {

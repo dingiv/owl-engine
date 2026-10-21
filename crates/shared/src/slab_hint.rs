@@ -242,225 +242,409 @@ static PROBE_REPORT: std::sync::Mutex<String> = std::sync::Mutex::new(String::ne
 // 复位口径与探针同窗(`probe_on(true)` 清台)⇒ 与"slab 峰值归因"同源可比。
 // 增量为 relaxed 原子加(每事件 ~1ns,常开不影响热路径形状)。
 pub mod live_diag {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    //! 活性回收账 —— **字段私有 + 方法访问**,不再对外暴露 `pub static AtomicU64`。
+    //!
+    //! 原形态(2026-10-16~21)把 12 个 `pub static` 摊在模块面上:`eval.rs` 直接
+    //! `NEW_BLOCKS.fetch_add(..)` ⇒ ① reset 与自增没有单一入口,② 任何 crate
+    //! 都能绕过口径写账,③ 计数器名字串(`counters()`)与字段各写一遍。
+    //! 现形态:**一个 [`Ledger`]** (`OnceLock` 不需要 —— 原子/Mutex 可 const 构造),
+    //! 外部只能经[`ledger`]取只读句柄或走薄包装函数。
+    //!
+    //! 开销不变:每次事件仍是一次 `Relaxed` 原子加(`~1ns`),热点形状不变。
 
-    /// 新块登记(`EvalCtx::track_new`;竞技场原生块)
-    pub static NEW_BLOCKS: AtomicU64 = AtomicU64::new(0);
-    /// 真回收(`release_block` 走到 `face.free` 的块数;池命中不算)
-    pub static FREE_BLOCKS: AtomicU64 = AtomicU64::new(0);
-    /// 拒因:父节点还有消费者(`pending > 0`)
-    pub static REFUSE_PENDING: AtomicU64 = AtomicU64::new(0);
-    /// 拒因:块仍有别名用户(`block_users > 0`)
-    pub static REFUSE_USERS: AtomicU64 = AtomicU64::new(0);
-    /// 拒因:父块即本节点输出(透传别名)
-    pub static REFUSE_ALIAS: AtomicU64 = AtomicU64::new(0);
-    /// 拒因:块非竞技场原生(`arena_set` 缺席 —— 池件/外部块)
-    pub static REFUSE_NOT_ARENA: AtomicU64 = AtomicU64::new(0);
-    /// 拒因:块在 keep 白名单(跨段存活)
-    pub static REFUSE_KEPT: AtomicU64 = AtomicU64::new(0);
-    /// 退场块不在 `block_users` 里 —— 实测 = **叶子/外部块**(图输入槽、持久件、
-    /// 池件的父块退场)的正常路径:它们本就不经 `track_new`/`track_alias`。
-    ///
-    /// ⚠️ **实测语义(2026-10-17 审查)**:生产 boot 实测 **2651** 次 ⇒
-    /// 原文案"记账缺席 —— 不该发生"**误导**(会让人去追一个不存在的 bug)。
-    /// 判据:唯一能绕过登记的就是 `Op::Block` 叶子(`Bytes::new(id, …)`)。
-    pub static REFUSE_NOT_TRACKED: AtomicU64 = AtomicU64::new(0);
-    /// **同一块被 `track_new` 两次**(记账重复 ⇒ users 恒多 1 ⇒ 永不归还;不该发生)
-    pub static DOUBLE_NEW: AtomicU64 = AtomicU64::new(0);
-    /// 别名登记时该块**已有归属**(`track_alias` 落到已计数块)。
-    ///
-    /// ⚠️ **实测语义(2026-10-17 审查)**:实现是"`users > 0` 就记一笔"
-    /// (`eval.rs::track_alias`),而生产块的常态正是"产者已置 1 → 视图再 +1"
-    /// ⇒ 本计数在生产 boot 里**恒非 0**(实测 672),**不是**"不该发生"。
-    /// 原文案("同一块被 track_alias 两次以上")与实现不符,属**假现场**一类;
-    /// 未改判定(改判定要按块记别名次数 = 新状态),此处先把话写实。
-    pub static ALIAS_MULTI: AtomicU64 = AtomicU64::new(0);
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     /// 回收出口的拒因(枚举 = 判定分支单点)
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Refuse {
+        /// 父节点还有消费者(`pending > 0`)
         Pending,
+        /// 块仍有别名用户(`block_users > 0`)
         Users,
+        /// 父块即本节点输出(透传别名)
         Alias,
+        /// 块非竞技场原生(`arena_set` 缺席 —— 池件/外部块)
         NotArena,
+        /// 块在 keep 白名单(跨段存活)
         Kept,
+        /// 退场块不在 `block_users` 里 —— 实测 = **叶子/外部块**(图输入槽、
+        /// 持久件、池件的父块退场)的正常路径:它们本就不经 `track_new`/`track_alias`。
+        ///
+        /// ⚠️ **实测语义(2026-10-17 审查)**:生产 boot 实测 **2651** 次 ⇒
+        /// 原文案"记账缺席 —— 不该发生"**误导**(会让人去追一个不存在的 bug)。
+        /// 判据:唯一能绕过登记的就是 `Op::Block` 叶子(`Bytes::new(id, …)`)。
         NotTracked,
     }
 
-    pub fn new_block() {
-        NEW_BLOCKS.fetch_add(1, Ordering::Relaxed);
-    }
+    impl Refuse {
+        /// 全部拒因(顺序 = 报告顺序;`reset`/遍历用)
+        const ALL: [Refuse; 6] = [
+            Refuse::Pending,
+            Refuse::Users,
+            Refuse::Alias,
+            Refuse::NotArena,
+            Refuse::Kept,
+            Refuse::NotTracked,
+        ];
 
-    /// `track_new` 的**重复登记**检测(`insert` 返回 false = 已在竞技场里);
-    /// 前 12 例连 id + 名字上屏(直指来源:哪个张量/哪条臂)
-    pub fn double_new(id: u64, node_id: u64, overrides: usize, memo_len: usize) {
-        let n = DOUBLE_NEW.fetch_add(1, Ordering::Relaxed);
-        if n < 12 {
-            let name = crate::slab_hint::probe_name_of(id)
-                .unwrap_or_else(|| "(未命名)".to_string());
-            eprintln!(
-                "[live-dup] block={id} node={node_id} overrides={overrides} memo={memo_len} name={name}"
-            );
-        }
-    }
-
-    /// 别名重复登记
-    pub fn alias_multi() {
-        ALIAS_MULTI.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn freed() {
-        FREE_BLOCKS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// **回收出口按名分账**(2026-10-16;定谳面):只记**决定点**
-    /// (`pending==0` 那一瞬)—— 即"这个块本来可以还了,最后结果是什么"。
-    /// 前 k-1 次消费**(仍有消费者)不算决定点,不入账(否则重复计)。
-    /// 账目 = (字节, 次数, 残余 users 最大值) 按 (出口, 名字) 聚合 ⇒
-    /// 一行报告就能指认"谁被 users 抬着 / 谁平白无故活着"。
-    pub static BY_NAME: std::sync::Mutex<std::collections::BTreeMap<(u8, String), (u64, u64, u64)>> =
-        std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-    fn code(r: Option<Refuse>) -> u8 {
-        match r {
-            None => 0,
-            Some(Refuse::Pending) => 1,
-            Some(Refuse::Users) => 2,
-            Some(Refuse::Alias) => 3,
-            Some(Refuse::NotArena) => 4,
-            Some(Refuse::Kept) => 5,
-            Some(Refuse::NotTracked) => 6,
-        }
-    }
-
-    fn label(c: u8) -> &'static str {
-        match c {
-            0 => "真回收",
-            1 => "pending",
-            2 => "users",
-            3 => "alias",
-            4 => "非竞技场",
-            5 => "keep",
-            _ => "未登记",
-        }
-    }
-
-    /// 决定点落账(`reason = None` = 真回收;`left_u` = 该刻残余 users)
-    pub fn outcome(block_id: u64, bytes: usize, reason: Option<Refuse>, left_u: usize) {
-        let name = crate::slab_hint::probe_name_of(block_id)
-            .unwrap_or_else(|| "(未命名)".to_string());
-        if let Ok(mut m) = BY_NAME.lock() {
-            let e = m.entry((code(reason), name)).or_insert((0, 0, 0));
-            e.0 += bytes as u64;
-            e.1 += 1;
-            e.2 = e.2.max(left_u as u64);
-        }
-    }
-
-    /// 按名分账的一行摘要(报告尾部追加;空 = 无账)
-    pub fn by_name_report() -> String {
-        let m = match BY_NAME.lock() {
-            Ok(m) => m,
-            Err(_) => return String::new(),
-        };
-        if m.is_empty() {
-            return String::new();
-        }
-        let mut parts: Vec<String> = Vec::new();
-        for c in [0u8, 2, 1, 3, 4, 5, 6] {
-            let rows: Vec<(&String, &(u64, u64, u64))> =
-                m.iter().filter(|((k, _), _)| *k == c).map(|((_, n), v)| (n, v)).collect();
-            if rows.is_empty() {
-                continue;
+        fn idx(self) -> usize {
+            match self {
+                Self::Pending => 0,
+                Self::Users => 1,
+                Self::Alias => 2,
+                Self::NotArena => 3,
+                Self::Kept => 4,
+                Self::NotTracked => 5,
             }
-            let tot: u64 = rows.iter().map(|(_, v)| v.0).sum();
-            let cnt: u64 = rows.iter().map(|(_, v)| v.1).sum();
-            let mut top: Vec<(&String, &(u64, u64, u64))> = rows.clone();
-            top.sort_unstable_by_key(|(_, v)| std::cmp::Reverse(v.0));
-            let tops = top
-                .iter()
-                .take(4)
-                .map(|(n, v)| format!("{n} {:.0}MB×{}", v.0 as f64 / 1048576.0, v.1))
-                .collect::<Vec<_>>()
-                .join(" / ");
-            let maxu = rows.iter().map(|(_, v)| v.2).max().unwrap_or(0);
-            parts.push(format!(
-                "{} {:.0}MB×{cnt}(残余users≤{maxu}): {tops}",
-                label(c),
-                tot as f64 / 1048576.0
-            ));
         }
-        format!(" ‖ 回收出口按名: {}", parts.join(" ｜ "))
+
+        /// 账目键/报告标签(单点:键与文案同源,防"改了标签忘改键")
+        fn code(self) -> u8 {
+            self.idx() as u8 + 1
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::Pending => "pending",
+                Self::Users => "users",
+                Self::Alias => "alias",
+                Self::NotArena => "非竞技场",
+                Self::Kept => "keep",
+                Self::NotTracked => "未登记",
+            }
+        }
+
+        fn by_code(c: u8) -> Option<Self> {
+            match c {
+                1 => Some(Self::Pending),
+                2 => Some(Self::Users),
+                3 => Some(Self::Alias),
+                4 => Some(Self::NotArena),
+                5 => Some(Self::Kept),
+                6 => Some(Self::NotTracked),
+                _ => None,
+            }
+        }
     }
 
+    /// 一次非消费快照(`/debug/metrics` 与回归断言用;**不清零**)
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Snapshot {
+        pub new_blocks: u64,
+        pub free_blocks: u64,
+        pub refuse_pending: u64,
+        pub refuse_users: u64,
+        pub refuse_alias: u64,
+        pub refuse_not_arena: u64,
+        pub refuse_kept: u64,
+        pub refuse_not_tracked: u64,
+        /// **非 0 即异常**(块被登记两遍 ⇒ users 恒多 1 ⇒ 永不中途回收)
+        pub dup_new: u64,
+        /// 别名登记落在**已计数块**上(生产常态,不是错误;见 [`Refuse`] 注)
+        pub alias_on_tracked: u64,
+    }
+
+    /// 活性回收账(**字段私有**;唯一实例见 [`LEDGER`])
+    pub struct Ledger {
+        new_blocks: AtomicU64,
+        free_blocks: AtomicU64,
+        /// 按 [`Refuse`] 索引的拒因计数(`ALL` 的顺序 = 索引)
+        refuse: [AtomicU64; 6],
+        double_new: AtomicU64,
+        alias_multi: AtomicU64,
+        /// **回收出口按名分账**(2026-10-16;定谳面):只记**决定点**
+        /// (`pending==0` 那一瞬)—— 即"这个块本来可以还了,最后结果是什么"。
+        /// 前 k-1 次消费**(仍有消费者)不算决定点,不入账(否则重复计)。
+        /// 账目 = (字节, 次数, 残余 users 最大值) 按 (出口码, 名字) 聚合。
+        by_name: Mutex<BTreeMap<(u8, String), (u64, u64, u64)>>,
+    }
+
+    impl Ledger {
+        const fn new() -> Self {
+            Self {
+                new_blocks: AtomicU64::new(0),
+                free_blocks: AtomicU64::new(0),
+                refuse: [
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                    AtomicU64::new(0),
+                ],
+                double_new: AtomicU64::new(0),
+                alias_multi: AtomicU64::new(0),
+                by_name: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn bump(&self, c: &AtomicU64) -> u64 {
+            c.fetch_add(1, Ordering::Relaxed)
+        }
+
+        /// 新块登记(`EvalCtx::track_new`;竞技场原生块)
+        pub fn new_block(&self) {
+            self.bump(&self.new_blocks);
+        }
+
+        /// 真回收(`release_block` 走到 `face.free` 的块数;池命中不算)
+        pub fn freed(&self) {
+            self.bump(&self.free_blocks);
+        }
+
+        /// `track_new` 的**重复登记**检测(`insert` 返回 false = 已在竞技场里);
+        /// 前 12 例连 id + 名字上屏(直指来源:哪个张量/哪条臂)
+        pub fn double_new(&self, id: u64, node_id: u64, overrides: usize, memo_len: usize) {
+            let n = self.bump(&self.double_new);
+            if n < 12 {
+                let name = crate::slab_hint::probe_name_of(id)
+                    .unwrap_or_else(|| "(未命名)".to_string());
+                crate::log_warn!(
+                    "live-dup",
+                    "块重复登记 block={id} node={node_id} overrides={overrides} memo={memo_len} name={name}"
+                );
+            }
+        }
+
+        /// 别名登记落在已计数块(生产常态;非 0 不代表错误)
+        pub fn alias_multi(&self) {
+            self.bump(&self.alias_multi);
+        }
+
+        pub fn refuse(&self, r: Refuse) {
+            self.bump(&self.refuse[r.idx()]);
+        }
+
+        /// 决定点落账(`reason = None` = 真回收;`left_u` = 该刻残余 users)
+        pub fn outcome(&self, block_id: u64, bytes: usize, reason: Option<Refuse>, left_u: usize) {
+            let name = crate::slab_hint::probe_name_of(block_id)
+                .unwrap_or_else(|| "(未命名)".to_string());
+            let key = (reason.map_or(0, Refuse::code), name);
+            if let Ok(mut m) = self.by_name.lock() {
+                let e = m.entry(key).or_insert((0, 0, 0));
+                e.0 += bytes as u64;
+                e.1 += 1;
+                e.2 = e.2.max(left_u as u64);
+            }
+        }
+
+        /// 清台(与 `probe_on(true)` 同步)
+        pub fn reset(&self) {
+            if let Ok(mut m) = self.by_name.lock() {
+                m.clear();
+            }
+            self.new_blocks.store(0, Ordering::Relaxed);
+            self.free_blocks.store(0, Ordering::Relaxed);
+            for r in Refuse::ALL {
+                self.refuse[r.idx()].store(0, Ordering::Relaxed);
+            }
+            self.double_new.store(0, Ordering::Relaxed);
+            self.alias_multi.store(0, Ordering::Relaxed);
+        }
+
+        /// **非消费快照**(2026-10-17 审查补):`take_report` 是"读后清零",
+        /// 而它只在**图规划期**被取一次 —— 之后才发生的重复登记/拒因就再没有
+        /// 出口(实测:一次 boot 的 `[live-dup]` 刷了 12 条,而报告里
+        /// `重复记账:new 0`)。本方法只读不清,供 `/debug/metrics` 之类的
+        /// **随时可查**面使用 ⇒ A1 那类"记账重复"回归从此可断言。
+        pub fn snapshot(&self) -> Snapshot {
+            let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+            Snapshot {
+                new_blocks: g(&self.new_blocks),
+                free_blocks: g(&self.free_blocks),
+                refuse_pending: g(&self.refuse[Refuse::Pending.idx()]),
+                refuse_users: g(&self.refuse[Refuse::Users.idx()]),
+                refuse_alias: g(&self.refuse[Refuse::Alias.idx()]),
+                refuse_not_arena: g(&self.refuse[Refuse::NotArena.idx()]),
+                refuse_kept: g(&self.refuse[Refuse::Kept.idx()]),
+                refuse_not_tracked: g(&self.refuse[Refuse::NotTracked.idx()]),
+                dup_new: g(&self.double_new),
+                alias_on_tracked: g(&self.alias_multi),
+            }
+        }
+
+        /// 按名分账的一行摘要(报告尾部追加;空 = 无账)
+        pub fn by_name_report(&self) -> String {
+            let m = match self.by_name.lock() {
+                Ok(m) => m,
+                Err(_) => return String::new(),
+            };
+            if m.is_empty() {
+                return String::new();
+            }
+            let mut parts: Vec<String> = Vec::new();
+            // 顺序:真回收 → users → pending → alias → 非竞技场 → keep → 未登记
+            let order: [u8; 7] = [0, 2, 1, 3, 4, 5, 6];
+            for c in order {
+                let rows: Vec<(&String, &(u64, u64, u64))> =
+                    m.iter().filter(|((k, _), _)| *k == c).map(|((_, n), v)| (n, v)).collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                let tot: u64 = rows.iter().map(|(_, v)| v.0).sum();
+                let cnt: u64 = rows.iter().map(|(_, v)| v.1).sum();
+                let mut top: Vec<(&String, &(u64, u64, u64))> = rows.clone();
+                top.sort_unstable_by_key(|(_, v)| std::cmp::Reverse(v.0));
+                let tops = top
+                    .iter()
+                    .take(4)
+                    .map(|(n, v)| format!("{n} {:.0}MB×{}", v.0 as f64 / 1048576.0, v.1))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                let maxu = rows.iter().map(|(_, v)| v.2).max().unwrap_or(0);
+                let label =
+                    if c == 0 { "真回收" } else { Refuse::by_code(c).map_or("?", Refuse::label) };
+                parts.push(format!(
+                    "{label} {:.0}MB×{cnt}(残余users≤{maxu}): {tops}",
+                    tot as f64 / 1048576.0
+                ));
+            }
+            format!(" ‖ 回收出口按名: {}", parts.join(" ｜ "))
+        }
+
+        /// 一行账(**读后清零**;与 `slab 峰值归因` 同窗 ⇒ 同源可比)
+        pub fn take_report(&self) -> String {
+            let s = self.snapshot();
+            self.reset();
+            format!(
+                "新块 {} / 真回收 {}(拒:pending {} users {} alias {} 非竞技场 {} keep {} 未登记 {})／重复记账:new {} alias {}",
+                s.new_blocks,
+                s.free_blocks,
+                s.refuse_pending,
+                s.refuse_users,
+                s.refuse_alias,
+                s.refuse_not_arena,
+                s.refuse_kept,
+                s.refuse_not_tracked,
+                s.dup_new,
+                s.alias_on_tracked,
+            ) + &self.by_name_report()
+        }
+    }
+
+    /// **唯一实例**(const 构造,无需 OnceLock;字段私有 ⇒ 只能经方法写)
+    static LEDGER: Ledger = Ledger::new();
+
+    /// 只读句柄(测试/多面共享同一账本;写仍走下面薄包装或 `&Ledger` 的方法)
+    pub fn ledger() -> &'static Ledger {
+        &LEDGER
+    }
+
+    /// 新块登记
+    pub fn new_block() {
+        LEDGER.new_block();
+    }
+    /// 重复登记检测(前 12 例上屏)
+    pub fn double_new(id: u64, node_id: u64, overrides: usize, memo_len: usize) {
+        LEDGER.double_new(id, node_id, overrides, memo_len);
+    }
+    /// 别名落在已计数块
+    pub fn alias_multi() {
+        LEDGER.alias_multi();
+    }
+    /// 真回收
+    pub fn freed() {
+        LEDGER.freed();
+    }
+    /// 决定点落账
+    pub fn outcome(block_id: u64, bytes: usize, reason: Option<Refuse>, left_u: usize) {
+        LEDGER.outcome(block_id, bytes, reason, left_u);
+    }
+    /// 拒因 +1
     pub fn refuse(r: Refuse) {
-        let _ = match r {
-            Refuse::Pending => REFUSE_PENDING.fetch_add(1, Ordering::Relaxed),
-            Refuse::Users => REFUSE_USERS.fetch_add(1, Ordering::Relaxed),
-            Refuse::Alias => REFUSE_ALIAS.fetch_add(1, Ordering::Relaxed),
-            Refuse::NotArena => REFUSE_NOT_ARENA.fetch_add(1, Ordering::Relaxed),
-            Refuse::Kept => REFUSE_KEPT.fetch_add(1, Ordering::Relaxed),
-            Refuse::NotTracked => REFUSE_NOT_TRACKED.fetch_add(1, Ordering::Relaxed),
-        };
+        LEDGER.refuse(r);
     }
-
-    /// 清台(与 `probe_on(true)` 同步)
+    /// 清台(与 `probe_on(true)` 同窗)
     pub fn reset() {
-        if let Ok(mut m) = BY_NAME.lock() {
-            m.clear();
-        }
-        for c in [
-            &NEW_BLOCKS,
-            &FREE_BLOCKS,
-            &REFUSE_PENDING,
-            &REFUSE_USERS,
-            &REFUSE_ALIAS,
-            &REFUSE_NOT_ARENA,
-            &REFUSE_KEPT,
-            &REFUSE_NOT_TRACKED,
-        ] {
-            c.store(0, Ordering::Relaxed);
-        }
+        LEDGER.reset();
     }
-
-    /// **非消费快照**(2026-10-17 审查补):上面 `take_report` 是"读后清零",
-    /// 而它只在**图规划期**被取一次 —— 之后才发生的重复登记/拒因就再没有出口
-    /// (实测:一次 boot 的 `[live-dup]` 刷了 12 条,而报告里 `重复记账:new 0`)。
-    /// 本函数只读不清,供 `/debug/metrics` 之类的**随时可查**面使用
-    /// ⇒ A1 那类"记账重复"回归从此可断言(counter == 0)。
-    pub fn counters() -> Vec<(&'static str, u64)> {
-        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
-        vec![
-            ("live.new_blocks", g(&NEW_BLOCKS)),
-            ("live.free_blocks", g(&FREE_BLOCKS)),
-            ("live.refuse.pending", g(&REFUSE_PENDING)),
-            ("live.refuse.users", g(&REFUSE_USERS)),
-            ("live.refuse.alias", g(&REFUSE_ALIAS)),
-            ("live.refuse.not_arena", g(&REFUSE_NOT_ARENA)),
-            ("live.refuse.kept", g(&REFUSE_KEPT)),
-            ("live.retire.untracked", g(&REFUSE_NOT_TRACKED)),
-            // **非 0 即异常**(块被登记两遍 ⇒ users 恒多 1 ⇒ 永不中途回收)
-            ("live.dup_new", g(&DOUBLE_NEW)),
-            ("live.alias.on_tracked", g(&ALIAS_MULTI)),
-        ]
+    /// 非消费快照
+    pub fn snapshot() -> Snapshot {
+        LEDGER.snapshot()
     }
-
-    /// 一行账(**读后清零**;与 `slab 峰值归因` 同窗 ⇒ 同源可比)
+    /// 报告尾部按名分账
+    pub fn by_name_report() -> String {
+        LEDGER.by_name_report()
+    }
+    /// 一行账(**读后清零**)
     pub fn take_report() -> String {
-        let g = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
-        format!(
-            "新块 {} / 真回收 {}(拒:pending {} users {} alias {} 非竞技场 {} keep {} 未登记 {})／重复记账:new {} alias {}",
-            g(&NEW_BLOCKS),
-            g(&FREE_BLOCKS),
-            g(&REFUSE_PENDING),
-            g(&REFUSE_USERS),
-            g(&REFUSE_ALIAS),
-            g(&REFUSE_NOT_ARENA),
-            g(&REFUSE_KEPT),
-            g(&REFUSE_NOT_TRACKED),
-            g(&DOUBLE_NEW),
-            g(&ALIAS_MULTI),
-        ) + &by_name_report()
+        LEDGER.take_report()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// 独立实例（不碰进程级 `LEDGER`）：自增/拒因/快照/清零全链
+        #[test]
+        fn ledger_counters_and_reset() {
+            let l = Ledger::new();
+            assert_eq!(l.snapshot(), Snapshot::default(), "新账本全零");
+            l.new_block();
+            l.new_block();
+            l.freed();
+            l.refuse(Refuse::Users);
+            l.refuse(Refuse::Kept);
+            l.alias_multi();
+            let s = l.snapshot();
+            assert_eq!((s.new_blocks, s.free_blocks), (2, 1));
+            assert_eq!((s.refuse_users, s.refuse_kept), (1, 1));
+            assert_eq!((s.refuse_pending, s.dup_new), (0, 0));
+            assert_eq!(s.alias_on_tracked, 1);
+
+            let rep = l.take_report();
+            assert!(rep.contains("新块 2 / 真回收 1"), "{rep}");
+            assert!(rep.contains("keep 1"), "{rep}");
+            assert_eq!(l.snapshot(), Snapshot::default(), "take_report = 读后清零");
+
+            l.refuse(Refuse::NotTracked);
+            l.reset();
+            assert_eq!(l.snapshot(), Snapshot::default(), "reset 清台");
+        }
+
+        /// 拒因码与标签是同一事实（改标签忘改码会让 by_name 分桶串位）
+        #[test]
+        fn refuse_codes_roundtrip() {
+            for r in Refuse::ALL {
+                assert_eq!(Refuse::by_code(r.code()), Some(r), "{r:?} 码回环失败");
+                assert!(!r.label().is_empty());
+            }
+            assert_eq!(Refuse::by_code(0), None, "0 = 真回收(非拒因)");
+            assert_eq!(Refuse::by_code(9), None);
+        }
+
+        /// 决定点按 (出口, 名) 聚合：字节累加、次数累加、残余 users 取最大
+        #[test]
+        fn outcome_aggregates_by_name() {
+            let l = Ledger::new();
+            l.outcome(1, 1_048_576, Some(Refuse::Users), 2);
+            l.outcome(2, 1_048_576, Some(Refuse::Users), 5);
+            l.outcome(3, 0, None, 0);
+            let rep = l.by_name_report();
+            assert!(rep.contains("users") && rep.contains("残余users≤5"), "{rep}");
+            assert!(rep.contains("2MB"), "两次 1MiB 合并 ⇒ 2MB: {rep}");
+            assert!(rep.contains("真回收"), "{rep}");
+        }
+    }
+
+    /// `/debug/metrics` 形态的名称→值表(tag 即契约,顺序稳定)
+    pub fn counters() -> Vec<(&'static str, u64)> {
+        let s = LEDGER.snapshot();
+        vec![
+            ("live.new_blocks", s.new_blocks),
+            ("live.free_blocks", s.free_blocks),
+            ("live.refuse.pending", s.refuse_pending),
+            ("live.refuse.users", s.refuse_users),
+            ("live.refuse.alias", s.refuse_alias),
+            ("live.refuse.not_arena", s.refuse_not_arena),
+            ("live.refuse.kept", s.refuse_kept),
+            ("live.retire.untracked", s.refuse_not_tracked),
+            // **非 0 即异常**(块被登记两遍 ⇒ users 恒多 1 ⇒ 永不中途回收)
+            ("live.dup_new", s.dup_new),
+            ("live.alias.on_tracked", s.alias_on_tracked),
+        ]
     }
 }
 

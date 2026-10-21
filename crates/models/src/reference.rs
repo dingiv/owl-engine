@@ -400,7 +400,11 @@ impl Interpreter for CpuInterpreter {
         shape: &Shape,
     ) -> Result<Value, ModelError> {
         if self.debug {
-            eprintln!("[dbg mm] a.shape={:?} a.len={} b.shape={:?} b.len={} shape={:?}", a.shape, a.f32.len(), b.shape, b.f32.len(), shape);
+            owl_shared::log_debug!(
+                "dbg-mm",
+                "a.shape={:?} a.len={} b.shape={:?} b.len={} shape={:?}",
+                a.shape, a.f32.len(), b.shape, b.f32.len(), shape
+            );
         }
         // k = 内维 = a 的元素数 / m(行主序)
         let m_rows = a.shape[0].max(1);

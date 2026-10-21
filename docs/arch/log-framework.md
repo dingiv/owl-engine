@@ -117,6 +117,8 @@ curl "127.0.0.1:8136/debug/log/tags/boot,gl-prof/-" # allow=boot,gl-prof;deny �
 | ③ | models 层内探针(`layers/**` 的 `[gdn-*]`/`[enc-forensic]`/`[m-sweep]`) | ≈90 | 待办 |
 | ④ | **`crates/kernels` Rust 面**(装配报告 / 自检 / `[gdn-diag]` / `[l3-audit]` / `[owl-fi]`) | **23** | ✅ 2026-10-21(见 §八) |
 | ⑤ | **`cu/**` C/C++ 面**(`[owl-fi]` / `[marlin-*]`)+ 一处无门设备 printf | **13** | ✅ 2026-10-21(见 §八) |
+| ⑥ | **engine 探针面**(`cov` / `recon` / `chain-inc` / `snap` / `idx` / `vram` / `pf-tap` / `live-diag` / `prefix` / `hook`) | **24** | ✅ 2026-10-21(§八 同律;bool 保留 = 采集,打印走 `log_debug!`) |
+| ⑦ | **models 装载报告**(`load` / `load-verify` / `dump` / `w4a16` / `gguf` / `dflash2` / `boot` / `store` / `disk` / `tp` / `turn-ws`) | **22** | ✅ 2026-10-21(装配/装载 → `info`;逐键 → `debug`) |
 | — | `crates/*/tests` + `examples` | 184 | **不动**(测试输出本就该直出;`skip:` 行见 §九) |
 | — | `build.rs`(kernels) | 45 | **不动**(构建期基础设施) |
 
@@ -212,13 +214,53 @@ tag 约定与 Rust 面同名同义:`owl-fi` / `marlin-cfg` / `marlin-v2` /
 `[probes] l3_audit`(登记去重集)、`gdn_diag/gdn_touch/…`(dtoh 回读/往返)、
 `trace_gate` / `step_gate` / `pf_fence`(路径与 A/B 语义)。
 
-### 8.6 未收编(下一轮,明账)
+### 8.6 保留裸打印(白名单;别再审这些)
+
+| 位置 | 为什么必须裸打 |
+|---|---|
+| `apps/server/src/main.rs`(12) | **拒启/参数非法/logger 初始化失败** —— logger 还没起来,或用户显式 `--help`/`--print-config` 的产品输出 |
+| `apps/server/src/config.rs`(4) | **选卡发生在 logger init 之前**(源码里已注明"logger 前 ⇒ 裸输出") |
+| `apps/server/src/config.rs`(2 `println!`) | `--print-config` 的 **stdout 产品**(要被 `jq`/测试解析,不许加前缀) |
+| `apps/cli/src/main.rs`(10) | 交互式 CLI 的**用户界面输出**(不是日志) |
+| `crates/backends/cuda/src/vmm.rs`(3) | 回滚失败 = **泄漏风险**,必须绕过级别门 |
+| `crates/backends/cuda/src/gpu_client.rs`(1) / `server/mod.rs`(1) | server 线程退出 / 回执槽越界 = 致命或编程错误 |
+| `crates/shared/src/env_reader.rs`(1) | 解析失败发生在 **logger init 之前**,且是"静默降级"的反面证据 |
+| `crates/shared/src/testkit/report.rs`(3) | 测试面出口**本尊**(见 §九) |
+| `crates/models/src/port_tests.rs`(2) | 文件由 `#[cfg(test)] mod port_tests;` 门控(非生产) |
+| `crates/kernels/*` 的 `#[cfg(test)]` 模块 | 测试输出 |
+
+判据: **错过这一行会不会让人看不见事故?** 会 ⇒ 允许裸打(纪律 2b 的扩展);
+只是"想知道细节" ⇒ 走 `log_*!` + level/tag。
+
+### 8.6b HAL 契约面(`owl-iface`)的注入(2026-10-21 补齐)
+
+`owl-iface` 也不能依赖 `owl-shared`(`owl-shared → owl-iface` 成环),但**可以**
+依赖叶子 `owl-sink` —— 于是 `DeviceHandle` 直接持一个 `LogSink`:
+
+```rust
+pub struct DeviceHandle<D: DeviceClient> { inner, ledger, ctx, sink }
+impl<D: DeviceClient> DeviceHandle<D> {
+    pub fn new(inner, ledger) -> Self      // sink = LogSink::none()(测试/纯转发的缺省)
+    pub fn with_sink(self, sink) -> Self   // 上层注入
+}
+```
+
+- **唯一注入点** = `engine` 构造句柄处(`on_with_ledger`):
+  `.with_sink(owl_shared::log::sink())`;
+- 克隆路径(`face_clone` / `loader_faces`)**同源携带**(克隆不改可见性);
+- `CtxScope` 也随身带一份(Drop 里的锁中毒告警要能落地);
+- 7 处 `[device-handle]` 全部收编:池排空/回填释放失败、捕获窗失败、
+  `graph_abort` 失败 → `WARN`;`PoolExhausted ⇒ 排空复用池` → `INFO`(自愈,不是故障);
+- `Ctx::bump` 按值收 `LogSink`(`MutexGuard` 独占借用时按引用会撞借用检查),
+  **未注入 = 静默但计数照记**(`hook_fail` 是机读面,不因日志静音而丢账);
+- 单测 `handle::tests::ctx_bump_goes_through_sink` 锁这两条。
+
+### 8.7 未收编(下一轮,明账)
 
 - `MARLIN_TIME` / `MARLIN_NO_M8` / `MARLIN_THREADS` / `MARLIN_NO_OVERRIDE`
   —— C++ 内 `getenv` 行为/计时旋钮(前者注释已写"测完即删");按"配置面
   显式化"处理,不与打印混在一起改;
-- `crates/*/src` 生产面余下 ~100 处裸 `eprintln!`(装配报告类可机械换
-  `log_info!`,拒启路径按纪律 2b 保留)。
+- 生产面已从 126 → **39**,全部是 §8.6 白名单(无待收编项)。
 
 ## 九、测试面:`skip:` / 探针行的唯一出口
 

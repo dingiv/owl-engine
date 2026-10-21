@@ -297,7 +297,7 @@ impl DfAttn {
         let row_kv = self.hkv * self.hd;
         // B6 偷显存:fp8 池 → K0 转换写(按输入 dtype 选 f16/bf16 变体)
         static DBG: std::sync::Once = std::sync::Once::new();
-        DBG.call_once(|| eprintln!("[boot] DfAttn dt={:?} kv_fp8={}", self.dt, self.kv_fp8));
+        DBG.call_once(|| owl_shared::log_info!("boot", "DfAttn dt={:?} kv_fp8={}", self.dt, self.kv_fp8));
         let k0_op = match (self.dt, self.kv_fp8) {
             (_, false) => crate::ops::SemanticKernel::K0Write,
             (Dtype::F16, true) => crate::ops::SemanticKernel::K0WriteFp8,

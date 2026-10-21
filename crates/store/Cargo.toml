@@ -9,6 +9,8 @@ description = "State store: KV/state virtualization across GPU / host / disk tie
 
 [dependencies]
 owl-iface = { path = "../backends/iface" }
+# 工具面(日志/探针出口)—— arch.md 律① 允许的两项之一(原先只用了 iface)
+owl-shared = { path = "../shared" }
 thiserror = { workspace = true }
 # 宿主块分配的**大页提示**(`madvise(MADV_HUGEPAGE)`;Linux)。
 # 为何住这里:本 crate 是宿主块的分配者 —— 缺页成本就出在分配出来的那页面上。

@@ -464,8 +464,9 @@ where
                 .take(6)
                 .map(|(by, nid, u, p, bid)| format!("{:.1}MB node{nid} block{bid} u={u} p={p}", *by as f64 / 1048576.0))
                 .collect();
-            eprintln!(
-                "[live-end] memo 剩 {} 节点 / {} MiB ‖ 节点 pending 直方图 [=0 {}, =1 {}, =2 {}, ≥3 {}] ‖ 块 users 直方图 [=0 {}, =1 {}, =2 {}, ≥3 {}] ‖ 最大残余: {}",
+            owl_shared::log_debug!(
+                "live-diag",
+                "memo 剩 {} 节点 / {} MiB ‖ 节点 pending 直方图 [=0 {}, =1 {}, =2 {}, ≥3 {}] ‖ 块 users 直方图 [=0 {}, =1 {}, =2 {}, ≥3 {}] ‖ 最大残余: {}",
                 ctx.memo.len(),
                 live_bytes >> 20,
                 hist[0], hist[1], hist[2], hist[3],
@@ -1065,7 +1066,7 @@ where
             }
             class = pick.name; // 类名 = 核名(报告里与图材料单同词表)
             if ctx.env.diag.resolve_trace {
-                eprintln!("[call] {:?} -> {} grid={:?} block={:?} smem={} n_elems={}",
+                owl_shared::log_debug!("interp-call", "{:?} -> {} grid={:?} block={:?} smem={} n_elems={}",
                     op, pick.name, pick.shape.grid, pick.shape.block, pick.shape.smem, n_elems);
             }
             // 统一构造(2026-10-13 P3 算子准入):

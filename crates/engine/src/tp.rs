@@ -800,8 +800,9 @@ async fn handshake_staging(
     // ⚠️ **与 push 互斥**(两者都改写数据腿;同时开只会让 push 静默不生效)。
     // 诊断面(2026-10-19):1-stage 的启用条件一次打全 —— 它是"融合核被走到"的
     // 唯一前提,而 §57 的教训正是"核写好了但一次没被走到"。
-    eprintln!(
-        "[tp] 1-stage 启用判据:opts.one_stage={} · push={} ⇒ arena {}",
+    owl_shared::log_info!(
+        "tp",
+        "1-stage 启用判据:opts.one_stage={} · push={} ⇒ arena {}",
         opts.one_stage,
         opts.push,
         if one_stage_enabled(&opts) && !opts.push { "装配" } else { "不装(走 v1 两段)" }

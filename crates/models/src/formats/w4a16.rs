@@ -131,8 +131,9 @@ impl W4A16Source {
                 dir.display()
             )));
         }
-        eprintln!(
-            "[w4a16] v2 mmap 索引 {} 项 @ {:?}(懒物化,无缓存)",
+        owl_shared::log_info!(
+            "w4a16",
+            "v2 mmap 索引 {} 项 @ {:?}(懒物化,无缓存)",
             index.len(),
             t0.elapsed()
         );
@@ -455,8 +456,9 @@ impl W4A16Source {
             cache.1 += nb;
         }
         drop(cache);
-        eprintln!(
-            "[w4a16] 物化 {base} (out={out}, k={k}) @ {:?}",
+        owl_shared::log_debug!(
+            "w4a16",
+            "物化 {base} (out={out}, k={k}) @ {:?}",
             t0.elapsed()
         );
         Ok(())

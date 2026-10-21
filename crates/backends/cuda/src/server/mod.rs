@@ -1219,17 +1219,24 @@ impl GpuServer {
                 // B6.5:live 分配音账(释放侧 = free_blocks)
                 owl_shared::vram::live_add(n_bytes as i64);
                 // **取证**(2026-10-19):只报大额(≥64 MiB)与累计,用来归因
-                // "装配后那几 GB 空闲去哪了"(`OWL_VRAM_DBG=1` 开;常态零输出)。
-                if n_bytes >= 64 << 20 && std::env::var_os("OWL_VRAM_DBG").is_some() {
+                // "装配后那几 GB 空闲去哪了"。
+                // 2026-10-21:**env `OWL_VRAM_DBG` 退场** —— 大额阈值本身已是
+                // 采集剪枝(常态零输出),可见性交给日志门(level=debug 或 tag
+                // `vram-big` 白名单)。
+                if n_bytes >= 64 << 20 {
                     static BIG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let t = BIG.fetch_add(n_bytes as u64, std::sync::atomic::Ordering::Relaxed)
                         + n_bytes as u64;
-                    eprintln!(
-                        "[vram-big] +{} MiB(累计 {} MiB)· live {} MiB · free {} MiB",
-                        n_bytes >> 20,
-                        t >> 20,
-                        owl_shared::vram::live_bytes() >> 20,
-                        owl_shared::vram::free_bytes() >> 20
+                    self.sink.logf(
+                        owl_shared::log::LVL_DEBUG,
+                        "vram-big",
+                        format_args!(
+                            "+{} MiB(累计 {} MiB)· live {} MiB · free {} MiB",
+                            n_bytes >> 20,
+                            t >> 20,
+                            owl_shared::vram::live_bytes() >> 20,
+                            owl_shared::vram::free_bytes() >> 20
+                        ),
                     );
                 }
                 if zero {

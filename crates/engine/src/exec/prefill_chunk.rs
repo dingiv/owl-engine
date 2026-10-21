@@ -559,9 +559,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 // 形状/元素数上屏(2026-10-17 三版;env 门控 —— 判读量级前
                 // **必须先看形状**(形状不同时量级不可比,踩过)
                 if i < 24 && host.probes.pf_taps {
-                    eprintln!(
-                        "[pf-tap] rank{} {} shape={:?} dtype={:?} n={n}",
-                        self.tp_rank(), names[i], r.shape(), r.dtype()
+                    owl_shared::log_debug!(
+                        "pf-tap",
+                        "rank{} {} shape={:?} dtype={:?} n={n}",
+                                self.tp_rank(), names[i], r.shape(), r.dtype()
                     );
                 }
                 // ⚠️ **按 dtype 定宽**(2026-10-17 三版):原硬编码 `n*2` ⇒
@@ -997,20 +998,25 @@ fn live_diag_end(on: bool, base: usize, t: usize) {
         return;
     }
     let peak = owl_shared::slab_hint::probe_end();
-    eprintln!(
-        "[live-diag] chunk@{base} t={t}:影子 arena 高水位 = {} MiB",
-        peak >> 20
+    owl_shared::log_debug!(
+        "live-diag",
+        "chunk@{base} t={t}:影子 arena 高水位 = {} MiB",
+peak >> 20
     );
     let rep = owl_shared::slab_hint::take_probe_report();
     if !rep.is_empty() {
-        eprintln!("[live-diag] 峰值构成:{rep}");
+        owl_shared::log_debug!(
+            "live-diag",
+            "峰值构成:{rep}");
     }
-    eprintln!(
-        "[live-diag] 回收出口:{}",
-        owl_shared::slab_hint::live_diag::take_report()
+    owl_shared::log_debug!(
+        "live-diag",
+        "回收出口:{}",
+owl_shared::slab_hint::live_diag::take_report()
     );
-    eprintln!(
-        "[live-diag] 引用计数推送 {} 次",
-        owl_shared::slab_hint::refs_pushed()
+    owl_shared::log_debug!(
+        "live-diag",
+        "引用计数推送 {} 次",
+owl_shared::slab_hint::refs_pushed()
     );
 }

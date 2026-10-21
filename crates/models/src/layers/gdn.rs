@@ -772,8 +772,9 @@ impl GatedDeltaNet {
         // - scalar:lmdeploy pre_sm90 port 单核(cast ×5 → 单 Call;对照臂)
         // - recurrence:现役 varlen 递推批核(基线/小 T)
         if ctx.trace_gate {
-            eprintln!(
-                "[gdn-gate] scalar={} chunked={} T={} slot_host={:?} dev_slot_present={}",
+            owl_shared::log_debug!(
+                "gdn-gate",
+                "scalar={} chunked={} T={} slot_host={:?} dev_slot_present={}",
                 ctx.env.gdn.scalar,
                 ctx.env.gdn.chunked,
                 tokens,

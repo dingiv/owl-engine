@@ -369,8 +369,9 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         }
         // 装载分相(启动时间是生产指标:哪一相贵要看得出来;测试档也上屏)
         let t_end = t_open.elapsed();
-        eprintln!(
-            "[gguf] 装载分相:容器+维度 {:.2}s + 计划/构造 {:.2}s + 权重 {:.2}s + 视觉 {:.2}s + 词表/rope {:.2}s = {:.2}s",
+        owl_shared::log_info!(
+            "gguf",
+            "装载分相:容器+维度 {:.2}s + 计划/构造 {:.2}s + 权重 {:.2}s + 视觉 {:.2}s + 词表/rope {:.2}s = {:.2}s",
             t_meta.as_secs_f32(),
             (t_plan - t_meta).as_secs_f32(),
             (t_load - t_plan).as_secs_f32(),

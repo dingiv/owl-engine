@@ -88,7 +88,11 @@ pub(crate) async fn remove_files(paths: Vec<PathBuf>) -> usize {
                 Ok(()) => n += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => n += 1,
                 Err(e) => {
-                    eprintln!("[disk] 删除失败({}):{e}(账已出,文件残留)", p.display());
+                    owl_shared::log_warn!(
+                        "disk",
+                        "删除失败({}):{e}(账已出,文件残留)",
+                        p.display()
+                    );
                 }
             }
         }

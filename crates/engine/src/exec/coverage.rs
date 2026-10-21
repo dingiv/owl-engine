@@ -622,8 +622,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                     }
                 }
             }
-            eprintln!(
-                "[recon] 候选 {n_blocks} · 表 {} · 可沉 {} · 待回灌 {} · **不可沉 {}** · refs(1/2/3+)={}/{}/{}",
+            owl_shared::log_debug!(
+                "recon",
+                "候选 {n_blocks} · 表 {} · 可沉 {} · 待回灌 {} · **不可沉 {}** · refs(1/2/3+)={}/{}/{}",
                 table.len(),
                 sink.len(),
                 need.len(),
@@ -1021,11 +1022,12 @@ impl<D: DeviceClient> RunningEngine<D> {
                     });
                     let top: Vec<String> =
                         ord.iter().take(5).map(|i| format!("{i}:{:.4}", m[*i])).collect();
-                    eprintln!(
-                        "[cov-dump] rowmass qi={qi} pos={pos} visible={} sum={:.4} top5={}",
-                        pos + 1,
-                        m.iter().sum::<f32>(),
-                        top.join(" ")
+                    owl_shared::log_debug!(
+                        "cov",
+                        "rowmass qi={qi} pos={pos} visible={} sum={:.4} top5={}",
+                                pos + 1,
+                                m.iter().sum::<f32>(),
+                                top.join(" ")
                     );
                     // 最后一行的**逐层**质量 + 峰/均比(平不平一眼看出)
                     if qi == pid.t - 1 {
@@ -1047,10 +1049,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 .map(|i| format!("{i}:{:.4}", ml[*i]))
                                 .collect();
                             let mean = ml.iter().sum::<f32>() / ml.len().max(1) as f32;
-                            eprintln!(
-                                "[cov-dump] rowlast 层={l} 峰/均={:.1} top3={}",
-                                ml[ol[0]] / mean.max(1e-12),
-                                tl.join(" ")
+                            owl_shared::log_debug!(
+                                "cov",
+                                "rowlast 层={l} 峰/均={:.1} top3={}",
+                                                ml[ol[0]] / mean.max(1e-12),
+                                                tl.join(" ")
                             );
                         }
                     }
@@ -1108,8 +1111,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 h
             };
             let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
-            eprintln!(
-                "[cov-dump] geom base={} t={} w={} ctx={ctx_tokens} page={page} blocks={n_blocks} layers={layers} hq={hq} hkv={hkv} hd={hd} analyze={analyze_now} last={last_boundary}",
+            owl_shared::log_debug!(
+                "cov",
+                "geom base={} t={} w={} ctx={ctx_tokens} page={page} blocks={n_blocks} layers={layers} hq={hq} hkv={hkv} hd={hd} analyze={analyze_now} last={last_boundary}",
                 pid.base, pid.t, pid.w
             );
             for qi in 0..pid.w {
@@ -1130,17 +1134,18 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .iter()
                     .map(|l| format!("{:08x}", (hf(&l[q_off..q_off + hq * hd]) & 0xffff_ffff) as u32))
                     .collect();
-                eprintln!(
-                    "[cov-dump] Q qi={qi} pos={} fnv={:016x} l2={:.4} per层l2=[{}] per层fnv=[{}] l0h0=[{:.5} {:.5} {:.5} {:.5}]",
-                    pid.base + (pid.t - pid.w) + qi,
-                    hf(&allq),
-                    l2(&allq),
-                    per_l.join(" "),
-                    per_l_fnv.join(" "),
-                    r0[0],
-                    r0[1],
-                    r0[2],
-                    r0[3]
+                owl_shared::log_debug!(
+                    "cov",
+                    "Q qi={qi} pos={} fnv={:016x} l2={:.4} per层l2=[{}] per层fnv=[{}] l0h0=[{:.5} {:.5} {:.5} {:.5}]",
+                        pid.base + (pid.t - pid.w) + qi,
+                        hf(&allq),
+                        l2(&allq),
+                        per_l.join(" "),
+                        per_l_fnv.join(" "),
+                        r0[0],
+                        r0[1],
+                        r0[2],
+                        r0[3]
                 );
             }
             if analyze_now {
@@ -1169,14 +1174,15 @@ impl<D: DeviceClient> RunningEngine<D> {
                         }
                         None => ("无条目".to_string(), String::new()),
                     };
-                    eprintln!(
-                        "[cov-dump] blk={lb} K fnv={:016x} l2={:.4} t0h0=[{:.5} {:.5} {:.5} {:.5}] ‖ IDX {idxn} {idxv}",
-                        hf(&allk),
-                        l2(&allk),
-                        k0[0],
-                        k0[1],
-                        k0[2],
-                        k0[3]
+                    owl_shared::log_debug!(
+                        "cov",
+                        "blk={lb} K fnv={:016x} l2={:.4} t0h0=[{:.5} {:.5} {:.5} {:.5}] ‖ IDX {idxn} {idxv}",
+                                hf(&allk),
+                                l2(&allk),
+                                k0[0],
+                                k0[1],
+                                k0[2],
+                                k0[3]
                     );
                 }
             }
@@ -1669,13 +1675,16 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             .step_by(stride)
             .map(|r| format!("{}:{:.1}", base + r, rows[r]))
             .collect();
-        eprintln!(
-            "[cov-dump] HID base={base} t={t} 首行={:.1} 末行={:.1} ‖ 尾16=[{}]",
-            rows[0],
-            rows[t - 1],
-            tail.join(" ")
+        owl_shared::log_debug!(
+            "cov",
+            "HID base={base} t={t} 首行={:.1} 末行={:.1} ‖ 尾16=[{}]",
+        rows[0],
+        rows[t - 1],
+        tail.join(" ")
         );
-        eprintln!("[cov-dump] PROF base={base} {}", prof.join(" "));
+        owl_shared::log_debug!(
+            "cov",
+            "PROF base={base} {}", prof.join(" "));
         let l2 = rows[t - 1];
         let last_seg = &buf[(t - 1) * row..t * row];
         let h = {
@@ -1692,9 +1701,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let v1 = dec(&last_seg[esz..2 * esz]);
         let v2 = dec(&last_seg[2 * esz..3 * esz]);
         let v3 = dec(&last_seg[3 * esz..4 * esz]);
-        eprintln!(
-            "[cov-dump] HID2 base={base} t={t} row={} fnv={h:016x} l2={l2:.4} first4=[{v0:.5} {v1:.5} {v2:.5} {v3:.5}]",
-            base + t - 1
+        owl_shared::log_debug!(
+            "cov",
+            "HID2 base={base} t={t} row={} fnv={h:016x} l2={l2:.4} first4=[{v0:.5} {v1:.5} {v2:.5} {v3:.5}]",
+        base + t - 1
         );
         Ok(())
     }

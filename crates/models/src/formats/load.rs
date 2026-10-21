@@ -265,8 +265,9 @@ where
     let t_fence = std::time::Instant::now();
     face.sync().await?;
     // 装载分相上屏(host 侧键循环 vs 设备追平栅栏;装载测速/瓶颈定谳用)
-    eprintln!(
-        "[load] eval_load 分相:键循环(host) {:.2}s + 总栅栏(设备追平) {:.2}s",
+    owl_shared::log_info!(
+        "load",
+        "eval_load 分相:键循环(host) {:.2}s + 总栅栏(设备追平) {:.2}s",
         t_fence.duration_since(t0).as_secs_f64(),
         t_fence.elapsed().as_secs_f64()
     );
@@ -472,16 +473,18 @@ impl LoadStaging {
             // 槽超过旋钮 = 不可流式栏(重排臂)抬上来的 —— 必须可见:
             // 这是 VRAM 代价,不是错误,但读者要知道钱花在哪
             if plan.cap_bytes > 0 && *slot > plan.cap_bytes {
-                eprintln!(
-                    "[load] ⚠ {} 槽 {:.1}MB > 旋钮 {}MB —— 该臂**不可流式**(重排整键上卡)\n        ⇒ 槽必须容下最大重排键(嘬平 = 装不进);要降本:换档/关 head_quant/或减小该键",
+                owl_shared::log_warn!(
+                    "load",
+                    "⚠ {} 槽 {:.1}MB > 旋钮 {}MB —— 该臂**不可流式**(重排整键上卡)\n        ⇒ 槽必须容下最大重排键(嘬平 = 装不进);要降本:换档/关 head_quant/或减小该键",
                     arm.tag(),
                     *slot as f64 / 1e6,
                     plan.cap_bytes >> 20
                 );
             }
         }
-        eprintln!(
-            "[load] 暂存区(固定预算):{};合计 {:.1}MB(上限 {})",
+        owl_shared::log_info!(
+            "load",
+            "暂存区(固定预算):{};合计 {:.1}MB(上限 {})",
             if rows.is_empty() { "(本档无暂存臂)".to_string() } else { rows.join(" | ") },
             total as f64 / 1e6,
             if plan.cap_bytes == 0 { "无(取声明峰值)".to_string() } else { format!("{}MB", plan.cap_bytes >> 20) }
@@ -560,7 +563,9 @@ impl LoadStaging {
         }
         match face.mem_pool_trim().await {
             Ok(0) => {}
-            Ok(n) => eprintln!("[load] 装载收尾池回收:还 OS {:.1}MB", n as f64 / 1e6),
+            Ok(n) => owl_shared::log_info!(
+                "load",
+                "装载收尾池回收:还 OS {:.1}MB", n as f64 / 1e6),
             Err(e) => owl_shared::log_warn!("load", "装载收尾池回收失败(显存面降级): {e}"),
         }
         Ok(())
@@ -680,8 +685,9 @@ async fn eval_want_sequential<D: DeviceClient, S: WeightSource + ?Sized>(
     }
     // 键循环分账(≈0.5s 时差 = 分组/分派壳成本;大时说明有未入账段)
     if tap.is_some() {
-        eprintln!(
-            "[load] 键循环分账:{} 组 / 总 {:.2}s = load_group 累计 {:.2}s + 壳成本 {:.2}s",
+        owl_shared::log_info!(
+            "load",
+            "键循环分账:{} 组 / 总 {:.2}s = load_group 累计 {:.2}s + 壳成本 {:.2}s",
             groups.len(),
             t0.elapsed().as_secs_f64(),
             t_group.as_secs_f64(),
@@ -786,8 +792,9 @@ pub async fn verify_loaded<D: DeviceClient>(
         checked += 1;
     }
     let skipped = manifest.entries().len() - checked;
-    eprintln!(
-        "[load-verify] checked={checked} skipped(rearrange)={skipped} mismatch={} {:.2}s",
+    owl_shared::log_info!(
+        "load-verify",
+        "checked={checked} skipped(rearrange)={skipped} mismatch={} {:.2}s",
         bad.len(),
         t0.elapsed().as_secs_f64()
     );
@@ -860,7 +867,9 @@ async fn load_direct<D: DeviceClient, S: WeightSource + ?Sized>(
                         format!("{:04X}(f16={:.5},bf16={:.5})", b, half::f16::from_bits(b).to_f32(), half::bf16::from_bits(b).to_f32())
                     })
                     .collect();
-                eprintln!("[dump] key={} want_dtype={:?} head={:?}", w.key, w.dtype, head);
+                owl_shared::log_debug!(
+                    "dump",
+                    "key={} want_dtype={:?} head={:?}", w.key, w.dtype, head);
             }
         }
         if verify {
@@ -957,8 +966,9 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
                 .acquire(face, StageArm::CastSegOut, seg_cap * w.dtype.size_bytes())
                 .await?
                 .ok_or_else(|| ModelError::Msg(LoadStaging::over_cap_msg(StageArm::CastSegOut, seg_cap * w.dtype.size_bytes(), out_cap)))?;
-            eprintln!(
-                "[load] 超槽键流式:{} {:.1}MB > 槽 {:.1}MB ⇒ {} 段",
+            owl_shared::log_info!(
+                "load",
+                "超槽键流式:{} {:.1}MB > 槽 {:.1}MB ⇒ {} 段",
                 w.key,
                 (n * esz) as f64 / 1e6,
                 (seg_cap * esz) as f64 / 1e6,
@@ -1233,8 +1243,9 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
                 owl_kernels::family::marlin::repack::pack_marlin_b_fused(&p32, &idx, rows * k / 8, &mut b_ref);
                 // 现场账(2026-10-17):GPU 块字数 n vs CPU 参考字数 b_ref.len()
                 // —— 分片档实测两者不等(⇒ 索引表/字数口径在分片维上错位)
-                eprintln!(
-                    "[load-verify] {} rows={rows} cols={cols} k={k} n={n} p32={} idx={} b_ref={}",
+                owl_shared::log_info!(
+                    "load-verify",
+                    "{} rows={rows} cols={cols} k={k} n={n} p32={} idx={} b_ref={}",
                     w.key, p32.len(), idx.len(), b_ref.len()
                 );
                 let mut bad = 0usize;
@@ -1242,7 +1253,9 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
                     let got = i32::from_le_bytes([w[0], w[1], w[2], w[3]]);
                     if got != b_ref[i] { bad += 1; }
                 }
-                eprintln!("[load-verify] {vi} {} 坏字 {bad}/{}", w.key, b_ref.len());
+                owl_shared::log_info!(
+                    "load-verify",
+                    "{vi} {} 坏字 {bad}/{}", w.key, b_ref.len());
                 assert_eq!(bad, 0, "GPU repack 端到端校验失败: {}", w.key);
             }
         }
@@ -1426,8 +1439,9 @@ impl LoadTap for StderrTap {
             .iter()
             .map(|(n, d)| format!("{n}={:.1}ms", d.as_secs_f64() * 1e3))
             .collect();
-        eprintln!(
-            "[load] {:<46} {:>9}B wall={:>7.1}ms spans={:>7.1}ms [{}]",
+        owl_shared::log_info!(
+            "load",
+            "{:<46} {:>9}B wall={:>7.1}ms spans={:>7.1}ms [{}]",
             rec.key,
             rec.bytes,
             rec.wall.as_secs_f64() * 1e3,
@@ -1525,7 +1539,8 @@ pub fn manifest_mem_ledger(manifest: &crate::module::LoadManifest, tag: &str) {
         e2.1 += bytes;
     }
     for (k, (n, b)) in agg {
-        eprintln!("[{tag}] {k}: {n} 项 {b} ({:.2} GB)", b as f64 / 1e9);
+        // tag 字面量契约:组件名进正文(调用方给 "draft-mem"/"gguf-draft-mem")
+        owl_shared::log_info!("load-ledger", "[{tag}] {k}: {n} 项 {b} ({:.2} GB)", b as f64 / 1e9);
     }
 }
 

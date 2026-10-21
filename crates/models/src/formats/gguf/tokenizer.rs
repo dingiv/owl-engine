@@ -207,8 +207,9 @@ pub fn build_vocab(g: &Gguf) -> Result<GgufVocab, ModelError> {
         }
     };
     // 分相上屏(启动时间是生产指标;`tokenizers` 建 BPE 是已知重相)
-    eprintln!(
-        "[gguf] 词表分相:读 tokens {:.2}s + 读其余 KV {:.2}s + 建 tokenizer {:.2}s",
+    owl_shared::log_info!(
+        "gguf",
+        "词表分相:读 tokens {:.2}s + 读其余 KV {:.2}s + 建 tokenizer {:.2}s",
         t_tokens.as_secs_f32(),
         (t_kv - t_tokens).as_secs_f32(),
         (t0.elapsed() - t_kv).as_secs_f32()
@@ -312,8 +313,9 @@ fn build_bpe(
         // `add_special_tokens` 返回实际新增数(0 合法:词面重复)
         let _ = tok.add_special_tokens(&added);
     }
-    eprintln!(
-        "[gguf] BPE 分相:词表图 {:.2}s + build {:.2}s + 装配/特殊 {:.2}s(merges {} / added {})",
+    owl_shared::log_info!(
+        "gguf",
+        "BPE 分相:词表图 {:.2}s + build {:.2}s + 装配/特殊 {:.2}s(merges {} / added {})",
         tb1.as_secs_f32(),
         (tb2 - tb1).as_secs_f32(),
         (tb0.elapsed() - tb2).as_secs_f32(),

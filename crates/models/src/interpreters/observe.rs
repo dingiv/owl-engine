@@ -223,8 +223,9 @@ impl Tap for StatsTap {
     fn on_stats(&mut self, id: u64, s: BlockStats) {
         let tag = self.pending.take();
         if self.log {
-            eprintln!(
-                "[tap s{}]{:<16} rms={:.6} zeros={:<5} min={:.3e} max={:.3e}",
+            owl_shared::log_debug!(
+                "tap",
+                "s{} {:<16} rms={:.6} zeros={:<5} min={:.3e} max={:.3e}",
                 self.step,
                 tag.as_deref().unwrap_or("-"),
                 s.rms,

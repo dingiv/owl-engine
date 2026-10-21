@@ -70,13 +70,20 @@ struct State {
     sink: owl_shared::log::LogSink,
     stop: AtomicBool,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    // ── 诊断计数(2026-10-21:**字段私有,随 State 走** —— 原来是 4 个
+    //    模块级 `static`,与状态分家 ⇒ 无 State 时也能被写、`stats()` 与
+    //    生命周期脱节)──
+    /// 回调收到的记录总数
+    total: AtomicU64,
+    /// 旁路缓冲满/拿不到锁而丢弃的记录
+    dropped: AtomicU64,
+    /// 排空批次数
+    batches: AtomicU64,
+    /// 图内记录数(`graph_id != 0`)
+    graph_recs: AtomicU64,
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
-static TOTAL: AtomicU64 = AtomicU64::new(0);
-static DROPPED: AtomicU64 = AtomicU64::new(0);
-static BATCHES: AtomicU64 = AtomicU64::new(0);
-static GRAPH_RECS: AtomicU64 = AtomicU64::new(0);
 
 /// CUPTI 驱动回调(只投递:memcpy 已由 shim 做完,这里只入缓冲)
 extern "C" fn on_kernel(rec: *const KernRec) {
@@ -85,16 +92,17 @@ extern "C" fn on_kernel(rec: *const KernRec) {
     }
     // SAFETY:`KernRec` 是 `#[repr(C)]` + Copy 的 plain struct,shim 侧已填齐
     let rec = unsafe { *rec };
-    TOTAL.fetch_add(1, Ordering::Relaxed);
-    if rec.graph_id != 0 {
-        GRAPH_RECS.fetch_add(1, Ordering::Relaxed);
-    }
+    // 未武装(回调不该发生,但 ABI 上可能)⇒ 连计数都不落,避免账目脱离生命周期
     let Some(st) = STATE.get() else { return };
+    st.total.fetch_add(1, Ordering::Relaxed);
+    if rec.graph_id != 0 {
+        st.graph_recs.fetch_add(1, Ordering::Relaxed);
+    }
     // 排空线程持锁期间 = 丢(绝不阻塞驱动线程);溢出同样丢
     match st.buf.try_lock() {
         Ok(mut v) if v.len() < CAP => v.push(rec),
         _ => {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            st.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -112,7 +120,7 @@ fn drain_once(st: &State) {
         }
         std::mem::take(&mut *v)
     };
-    BATCHES.fetch_add(1, Ordering::Relaxed);
+    st.batches.fetch_add(1, Ordering::Relaxed);
     for r in &batch {
         let name = cstr(&r.name);
         let dur = Duration::from_nanos(r.end_ns.saturating_sub(r.start_ns));
@@ -137,6 +145,10 @@ pub fn start(sink: owl_shared::log::LogSink) -> Result<(), String> {
         sink,
         stop: AtomicBool::new(false),
         worker: Mutex::new(None),
+        total: AtomicU64::new(0),
+        dropped: AtomicU64::new(0),
+        batches: AtomicU64::new(0),
+        graph_recs: AtomicU64::new(0),
     };
     STATE
         .set(st)
@@ -204,14 +216,17 @@ pub fn stop() {
     }
 }
 
-/// (总记录, 丢弃, 排空批数, 图内记录)
+/// (总记录, 丢弃, 排空批数, 图内记录)。未武装 = 全零(账随 `State` 生灭)
 pub fn stats() -> (u64, u64, u64, u64) {
-    (
-        TOTAL.load(Ordering::Relaxed),
-        DROPPED.load(Ordering::Relaxed),
-        BATCHES.load(Ordering::Relaxed),
-        GRAPH_RECS.load(Ordering::Relaxed),
-    )
+    match STATE.get() {
+        Some(st) => (
+            st.total.load(Ordering::Relaxed),
+            st.dropped.load(Ordering::Relaxed),
+            st.batches.load(Ordering::Relaxed),
+            st.graph_recs.load(Ordering::Relaxed),
+        ),
+        None => (0, 0, 0, 0),
+    }
 }
 
 /// 是否已武装

@@ -383,12 +383,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 self.coverage_analyze(sid, new_fed, last_boundary).await?;
                 if dbg {
                     let cov_ms = t_cov.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!(
-                        "[vram-b] 边界@{new_fed}: 快照 {snap_ms:.0}ms + B 轴 {cov_ms:.0}ms"
+                    owl_shared::log_debug!(
+                        "vram",
+                        "边界@{new_fed}: 快照 {snap_ms:.0}ms + B 轴 {cov_ms:.0}ms"
                     );
                 }
             } else if dbg {
-                eprintln!("[vram-b] 边界@{new_fed}: 选择层关,无索引/B 轴");
+                owl_shared::log_debug!(
+                    "vram",
+                    "边界@{new_fed}: 选择层关,无索引/B 轴");
             }
         }
         // **边界事件计时 → metrics**(2026-10-18 T1):前向已有 `prefill.chunk`
@@ -398,8 +401,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **逐 chunk 显存轨迹**(`OWL_VRAM_DBG=1`;262k 冲刺的取证面):
         // live/free 测在**边界之后** —— 判“中间件是否归还”。计时已改走 metrics。
         if self.boot.probes.vram_dbg {
-            eprintln!(
-                "[vram-c] chunk@{} t={} ⇒ live={} MiB · 驱动 free={} MiB",
+            owl_shared::log_debug!(
+                "vram",
+                "chunk@{} t={} ⇒ live={} MiB · 驱动 free={} MiB",
                 base,
                 chunk_ids.len(),
                 owl_shared::vram::live_bytes() >> 20,

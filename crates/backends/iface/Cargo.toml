@@ -7,6 +7,10 @@ description = "Backend HAL: unified GPU backend contract (memory/phase/stats); u
 
 [dependencies]
 owl-kernels = { path = "../../kernels" }
+# 输出口 ABI(叶子 crate,零依赖):本 crate 不能引 owl-shared
+# (`owl-shared → owl-iface` 成环),故走 owl-sink 的 LogSink 值类型,
+# 由上层(engine)在构造 DeviceHandle 时注入。
+owl-sink = { path = "../../sink" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

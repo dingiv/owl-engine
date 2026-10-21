@@ -42,6 +42,9 @@ use crate::contract::{
     BlockLedgerRow, Bytes, Connector, DeviceClient, Dtype, FiPlanSpec, GraphId, LaunchMsg,
     ModelError, PinnedRegion, Shape, SwapDir, SwapPiece, UpChunk, UpStream,
 };
+// 输出口(值语义 fn 指针包;未注入 = 全部静默)。本 crate 不能依赖 owl-shared
+// (`owl-shared → owl-iface`),故类型住叶子 crate `owl-sink`,由 engine 注入。
+use owl_sink::{LogSink, LVL_INFO, LVL_WARN};
 
 // ============================================================================
 // §1 归属与资产类别(与 store 的 TierLedger 同构;store 侧 impl 时做映射)
@@ -463,10 +466,13 @@ impl Ctx {
         }
     }
 
-    /// 记账失败:计数 + 一条裸日志(iface 无日志依赖;机读面 = `hook_fail`)。
-    fn bump(&mut self, what: &str, detail: String) {
+    /// 记账失败:计数 + 一条日志(机读面 = `hook_fail`;可见性 = 注入的 sink)。
+    ///
+    /// `sink` 按值传入(Copy):`Ctx` 常被 `MutexGuard` 独占借用,按引用传会与
+    /// 句柄字段的借用打架。
+    fn bump(&mut self, sink: LogSink, what: &str, detail: String) {
         self.hook_fail = self.hook_fail.saturating_add(1);
-        eprintln!("[device-handle] {what}:{detail}");
+        sink.logf(LVL_WARN, "device-handle", format_args!("{what}:{detail}"));
     }
 }
 
@@ -480,36 +486,45 @@ pub struct CtxScope {
     /// `None` = 空作用域(无账本的裸 client:没有归属可谈)。
     ctx: Option<Arc<Mutex<Ctx>>>,
     saved: (Owner, AssetClass),
+    /// 输出口(与句柄同源;`Drop` 里的告警要能落地 ⇒ 必须随身携带)
+    sink: LogSink,
 }
 
 impl CtxScope {
     /// 空作用域(裸 client 的缺省实现:进出都不改任何东西 —— 不是"静默失败",
     /// 而是**无账本 ⇒ 无归属可谈**)。
     pub fn noop() -> Self {
-        Self { ctx: None, saved: (Owner::default_owner(), AssetClass::Unclassified) }
+        Self {
+            ctx: None,
+            saved: (Owner::default_owner(), AssetClass::Unclassified),
+            sink: LogSink::none(),
+        }
     }
 }
 
 impl Drop for CtxScope {
     fn drop(&mut self) {
         let Some(ctx) = self.ctx.as_ref() else { return };
-        let mut c = lock_ctx(ctx);
+        let (mut c, poisoned) = lock_ctx(ctx);
         c.owner = self.saved.0;
         c.class = self.saved.1;
+        if poisoned {
+            c.bump(self.sink, "ctx-lock", "上下文锁中毒(已续用内部数据)".into());
+        }
     }
 }
 
 /// 上下文加锁(**锁中毒不许 panic 级联**:取回内层数据 + 计数可见)。
-fn lock_ctx(m: &Mutex<Ctx>) -> MutexGuard<'_, Ctx> {
+///
+/// 返回 `poisoned` 由调用方记账 —— 只有调用方手里有输出口(`LogSink`),
+/// 本函数刻意不做 I/O(与"锁助手不写日志"的分层一致)。
+fn lock_ctx(m: &Mutex<Ctx>) -> (MutexGuard<'_, Ctx>, bool) {
     let poisoned = m.is_poisoned();
-    let mut g = match m.lock() {
+    let g = match m.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    if poisoned {
-        g.bump("ctx-lock", "上下文锁中毒(已续用内部数据)".into());
-    }
-    g
+    (g, poisoned)
 }
 
 /// 按块聚合 `swap` 的片段 ⇒ 每逻辑块一条 [`MoveEvent`](整块下沉/回加载)。
@@ -541,12 +556,27 @@ pub struct DeviceHandle<D: DeviceClient> {
     inner: D,
     ledger: Option<LedgerCell>,
     ctx: Arc<Mutex<Ctx>>,
+    /// 输出口(2026-10-21):`[device-handle]` 的告警/自愈面走统一日志门。
+    /// 缺省 = [`LogSink::none`](静默;测试与纯转发场景);engine 构造时注入
+    /// 现成接线([`owl_shared::log::sink`] 的等价物 —— 本 crate 不依赖它)。
+    sink: LogSink,
 }
 
 impl<D: DeviceClient> DeviceHandle<D> {
-    /// 构造(唯一入口)。`ledger = None` = 纯转发(迁移态)。
+    /// 构造(唯一入口)。`ledger = None` = 纯转发(迁移态);`sink` 缺省静默。
     pub fn new(inner: D, ledger: Option<LedgerCell>) -> Self {
-        Self { inner, ledger, ctx: Arc::new(Mutex::new(Ctx::new())) }
+        Self { inner, ledger, ctx: Arc::new(Mutex::new(Ctx::new())), sink: LogSink::none() }
+    }
+
+    /// **注入输出口**(engine 构造期一次;缺省静默已足以跑测试)。
+    pub fn with_sink(mut self, sink: LogSink) -> Self {
+        self.sink = sink;
+        self
+    }
+
+    /// 当前输出口(诊断面/测试判据)
+    pub fn sink(&self) -> LogSink {
+        self.sink
     }
 
     // ── 上下文面(节点/相位调;`&self` 即可 —— 内部共享可变)──────────────
@@ -627,7 +657,7 @@ impl<D: DeviceClient> DeviceHandle<D> {
             c.class = class;
             saved
         };
-        CtxScope { ctx: Some(self.ctx.clone()), saved }
+        CtxScope { ctx: Some(self.ctx.clone()), saved, sink: self.sink }
     }
 
     /// 记账失败计数(诊断面;非零 = 有钩子调用失败过)。
@@ -801,7 +831,13 @@ impl<D: DeviceClient> DeviceHandle<D> {
     // ── 钩子(全部同步短锁;绝不跨 await 持锁)────────────────────────────
 
     fn ctx(&self) -> MutexGuard<'_, Ctx> {
-        lock_ctx(&self.ctx)
+        // 先取 sink(值) —— 否则 guard 借住 `&self` 后不能再读字段
+        let sink = self.sink;
+        let (mut g, poisoned) = lock_ctx(&self.ctx);
+        if poisoned {
+            g.bump(sink, "ctx-lock", "上下文锁中毒(已续用内部数据)".into());
+        }
+        g
     }
 
     /// 出生记账:事件入账 + 记进当前捕获窗(图销毁时整批补发归还)。
@@ -885,7 +921,11 @@ impl<D: DeviceClient> DeviceHandle<D> {
         }
         if let Err(e) = self.inner.free(&ids).await {
             // 释放失败**不许静默**:本块仍归池(不销账),下次再来
-            eprintln!("[device-handle] 池排空释放失败({} 块):{e}", ids.len());
+            self.sink.logf(
+                LVL_WARN,
+                "device-handle",
+                format_args!("池排空释放失败({} 块):{e}", ids.len()),
+            );
             // 回填入池可能**顶出旧块** —— 那些 id 必须真还驱动(否则又是泄漏)
             let evicted = {
                 let mut g = match cell.lock() {
@@ -900,7 +940,11 @@ impl<D: DeviceClient> DeviceHandle<D> {
             };
             if !evicted.is_empty() {
                 if let Err(e2) = self.inner.free(&evicted).await {
-                    eprintln!("[device-handle] 池回填顶出释放失败({} 块):{e2}", evicted.len());
+                    self.sink.logf(
+                        LVL_WARN,
+                        "device-handle",
+                        format_args!("池回填顶出释放失败({} 块):{e2}", evicted.len()),
+                    );
                 } else {
                     let frees: Vec<FreeEvent> =
                         evicted.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
@@ -1023,7 +1067,7 @@ impl<D: DeviceClient> DeviceHandle<D> {
             let mut c = self.ctx();
             c.events_sent = c.events_sent.saturating_add(n);
             if poisoned {
-                c.bump("ledger-lock", "事件入口锁中毒(已续用内部数据)".into());
+                c.bump(self.sink, "ledger-lock", "事件入口锁中毒(已续用内部数据)".into());
             }
         }
     }
@@ -1178,9 +1222,13 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
                         let n = w.ids.len();
                         self.ctx().window_unclosed += 1;
                         if n > 0 {
-                            eprintln!(
-                                "[device-handle] 捕获窗失败(窗内发射 {}):{n} 块去向由后端定,先不销账(graph_end 错:{e})",
-                                w.nodes
+                            self.sink.logf(
+                                LVL_WARN,
+                                "device-handle",
+                                format_args!(
+                                    "捕获窗失败(窗内发射 {}):{n} 块去向由后端定,先不销账(graph_end 错:{e})",
+                                    w.nodes
+                                ),
                             );
                         }
                         // 窗放回栈顶(调用方的 abort/显式 free 才收)
@@ -1222,10 +1270,14 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
                 Some(w) => {
                     self.ctx().window_unclosed += 1;
                     if !w.ids.is_empty() {
-                        eprintln!(
-                            "[device-handle] graph_abort 失败:{}(窗未收,{} 块去向未定)",
-                            r.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
-                            w.ids.len()
+                        self.sink.logf(
+                            LVL_WARN,
+                            "device-handle",
+                            format_args!(
+                                "graph_abort 失败:{}(窗未收,{} 块去向未定)",
+                                r.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
+                                w.ids.len()
+                            ),
                         );
                     }
                     self.ctx().windows.push(w);
@@ -1271,7 +1323,11 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
                 Err(e) if matches!(e, ModelError::PoolExhausted { .. }) => {
                     let n = self.drain_pool_to_driver().await;
                     if n > 0 {
-                        eprintln!("[device-handle] 分配遇 PoolExhausted ⇒ 排空复用池 {n} 块后重试");
+                        self.sink.logf(
+                            LVL_INFO,
+                            "device-handle",
+                            format_args!("分配遇 PoolExhausted ⇒ 排空复用池 {n} 块后重试"),
+                        );
                         self.inner.alloc(dtype, elems, name).await?
                     } else {
                         return Err(e);
@@ -1309,7 +1365,11 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
                 Err(e) if matches!(e, ModelError::PoolExhausted { .. }) => {
                     let n = self.drain_pool_to_driver().await;
                     if n > 0 {
-                        eprintln!("[device-handle] 分配遇 PoolExhausted ⇒ 排空复用池 {n} 块后重试");
+                        self.sink.logf(
+                            LVL_INFO,
+                            "device-handle",
+                            format_args!("分配遇 PoolExhausted ⇒ 排空复用池 {n} 块后重试"),
+                        );
                         self.inner.alloc_uninit(dtype, elems, name).await?
                     } else {
                         return Err(e);
@@ -1593,6 +1653,7 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
             inner: c,
             ledger: self.ledger.clone(),
             ctx: self.ctx.clone(),
+            sink: self.sink, // 同一输出口(克隆不改可见性)
         })
     }
 
@@ -1621,7 +1682,12 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
     fn loader_faces(&self, k: usize) -> Option<Vec<Self>> {
         self.inner.loader_faces(k).map(|v| {
             v.into_iter()
-                .map(|c| Self { inner: c, ledger: self.ledger.clone(), ctx: self.ctx.clone() })
+                .map(|c| Self {
+                    inner: c,
+                    ledger: self.ledger.clone(),
+                    ctx: self.ctx.clone(),
+                    sink: self.sink,
+                })
                 .collect()
         })
     }
@@ -1750,5 +1816,31 @@ mod tests {
         assert_eq!(out[1].id, 9);
         let back = swap_moves(SwapDir::In, &pieces);
         assert_eq!(back[0].dir, MoveDir::In);
+    }
+
+    /// **记账失败必须过注入的 sink**(2026-10-21):未注入 = 静默,但计数照记
+    /// (`hook_fail` 是机读面,不能因为日志静音而丢失)。
+    #[test]
+    fn ctx_bump_goes_through_sink() {
+        use std::sync::Mutex as StdMutex;
+        static SEEN: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+        fn rec(_l: u8, tag: &str, msg: &str) {
+            SEEN.lock().unwrap_or_else(|p| p.into_inner()).push(format!("{tag}:{msg}"));
+        }
+        fn yes(_l: u8, _t: &str) -> bool {
+            true
+        }
+        let sink = LogSink::new(Some(rec), Some(yes), None, None, None, None);
+        let mut c = Ctx::new();
+        c.bump(sink, "ctx-lock", "锁中毒".into());
+        assert_eq!(c.hook_fail, 1, "计数与日志同进");
+        let seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].starts_with("device-handle:ctx-lock:锁中毒"), "{seen:?}");
+        drop(seen);
+        // 未注入 = 静默,但计数照记(静默不等于丢账)
+        c.bump(LogSink::none(), "x", "y".into());
+        assert_eq!(c.hook_fail, 2);
+        assert_eq!(SEEN.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
     }
 }

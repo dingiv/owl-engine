@@ -1263,8 +1263,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 // **A1 取证**(`OWL_RECON_DBG=1`):注册口三数 —— 送入 / 入树 / 被逐。
                 // 入树为 0 就是"块永远 refs==1 ⇒ 不可沉"的直接原因。
                 if self.boot.probes.recon_dbg {
-                    eprintln!(
-                        "[chain-inc] 送 {} 片 · **入树 {}** · 被逐 {} · parent0={:?}",
+                    owl_shared::log_debug!(
+                        "chain-inc",
+                        "送 {} 片 · **入树 {}** · 被逐 {} · parent0={:?}",
                         blk_slices.len(),
                         up.inserted.len(),
                         up.evicted.len(),
@@ -1272,7 +1273,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     );
                 }
             } else if self.boot.probes.recon_dbg {
-                eprintln!("[chain-inc] 空:per_block={} 全被跳过", per_block.len());
+                owl_shared::log_debug!("chain-inc", "空:per_block={} 全被跳过", per_block.len());
             }
         }
         let reg_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
@@ -1300,8 +1301,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         if self.boot.probes.vram_dbg {
             let idx_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
-            eprintln!(
-                "[snap] fed={fed} 快照段 {snap_ms:.0}ms(含链/槽/拷贝/登记)· 增量登记 {:.0}ms · 索引 {:.0}ms",
+            owl_shared::log_debug!(
+                "snap",
+                "fed={fed} 快照段 {snap_ms:.0}ms(含链/槽/拷贝/登记)· 增量登记 {:.0}ms · 索引 {:.0}ms",
                 reg_ms - snap_ms,
                 idx_ms - reg_ms
             );
@@ -1460,8 +1462,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         self.sel.note_index(el);
         if self.boot.probes.idx_dbg {
             let host_ms = t_host.elapsed().as_secs_f64() * 1000.0;
-            eprintln!(
-                "[idx] 批 {} 块 / {layers} 层:总 {el:.1}ms = D2H {dtoh_ms:.1} + host {host_ms:.1} ({n_threads} 线程)",
+            owl_shared::log_debug!(
+                "idx",
+                "批 {} 块 / {layers} 层:总 {el:.1}ms = D2H {dtoh_ms:.1} + host {host_ms:.1} ({n_threads} 线程)",
                 todo.len()
             );
         }

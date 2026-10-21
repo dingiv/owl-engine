@@ -633,16 +633,18 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 let hi_old = (i + 8).min(s.tokens.len());
                                 let hi_new = (i + 8).min(prompt_ids.len());
                                 let (a, b) = (&s.tokens[lo..hi_old], &prompt_ids[lo..hi_new]);
-                                eprintln!(
-                                    "[dbg prefix] 守卫失配 session={id} cached_len={cached} 首个分叉 idx={i} \
+                                owl_shared::log_debug!(
+                                    "prefix",
+                                    "守卫失配 session={id} cached_len={cached} 首个分叉 idx={i} \
                                      旧(已入 KV)={a:?} ⇒ {:?} ‖ 新(本轮)={b:?} ⇒ {:?}",
                                     self.boot.tok.decode(a),
                                     self.boot.tok.decode(b)
                                 );
                             }
-                            None => eprintln!(
-                                "[dbg prefix] 守卫失配 session={id} cached_len={cached} 但前缀全同\
-                                 (长度不足?prompt={} )",
+                            None => owl_shared::log_debug!(
+                                "prefix",
+                                "守卫失配 session={id} cached_len={cached} 但前缀全同\
+                                 (长度不足?prompt={})",
                                 prompt_ids.len()
                             ),
                         }
@@ -2103,8 +2105,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let verdict = self.bank.rel.plan_need(need, &owl_store::Protected::default());
         if self.boot.probes.store_hook_dbg {
-            eprintln!(
-                "[hook] {:?} need={}槽/{}B free={}/{} host_free={} disk_free={} 整链候选={} 判 out={} in={} deny={:?}",
+            owl_shared::log_debug!(
+                "hook",
+                "{:?} need={}槽/{}B free={}/{} host_free={} disk_free={} 整链候选={} 判 out={} in={} deny={:?}",
                 need.why,
                 need.slots,
                 need.snap_bytes,

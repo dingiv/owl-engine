@@ -394,8 +394,9 @@ pub fn dflash2_draft(
         crate::formats::spec::SpecSource::family(&qwen3_8_27b()),
     )?;
     if !rep.mismatches.is_empty() {
-        eprintln!(
-            "[dflash2] 草稿 spec 失配 {} 条: {:?}",
+        owl_shared::log_warn!(
+            "dflash2",
+            "草稿 spec 失配 {} 条: {:?}",
             rep.mismatches.len(),
             rep.mismatches
         );
@@ -411,10 +412,11 @@ pub fn dflash2_draft(
         // ③ 中途尝试的 F16 执行域在 propose 残差流上溢出(INF/NaN)。
         // 修后实测 AL = 3.10 / 4.96(同机 W4A16 syvai = 2.86 / 5.42)——
         // **精度不抬 AL**(4-bit 草稿不是瓶颈)。
-        eprintln!(
-            "[boot] DFlash2 草稿 = 未量化原生家族(BF16 直载;AL 实测 3.10/4.96,\n         与 W4A16 家族同量级 —— 生产仍推荐 W4A16 省显存)"
+        owl_shared::log_info!(
+            "boot",
+            "DFlash2 草稿 = 未量化原生家族(BF16 直载;AL 实测 3.10/4.96,与 W4A16 家族同量级 —— 生产仍推荐 W4A16 省显存)"
         );
-        eprintln!("[boot] dflash draft-pool kv_fp8 = {kv_fp8}");
+        owl_shared::log_info!("boot", "dflash draft-pool kv_fp8 = {kv_fp8}");
     }
     let plan = if is_q {
         crate::module::QuantPlan::W4A16
@@ -444,8 +446,9 @@ pub fn dflash2_draft_sharded(
         crate::formats::spec::SpecSource::family(&qwen3_8_27b()),
     )?;
     if !rep.mismatches.is_empty() {
-        eprintln!(
-            "[dflash2] 草稿 spec 失配 {} 条: {:?}",
+        owl_shared::log_warn!(
+            "dflash2",
+            "草稿 spec 失配 {} 条: {:?}",
             rep.mismatches.len(),
             rep.mismatches
         );
