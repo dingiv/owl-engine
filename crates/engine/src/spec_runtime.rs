@@ -184,13 +184,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             }
         }
     };
-    let depth = if mode == SpecMode::Off {
-        0
-    } else if mode == SpecMode::DFlash2 {
-        inp.depth_raw.min(7)
-    } else {
-        inp.depth_raw.min(3)
-    };
+    // **深度 = 配置唯一真源**(2026-10-21):此前这里按族硬钳(DFlash2 `min(7)`、
+    // MTP `min(3)`),MTP 因此只能跑 3 步 —— 而实测第 4~7 步接受率仍 70~80%
+    // (depth 7 比 3 在 8k 上快 ~10%、512 上快 ~21%)。上限由 `[spec] depth`
+    // 的校验面统一挡(`SPEC_DEPTH_MAX`,结构性行容量),此处不再截断。
+    let depth = if mode == SpecMode::Off { 0 } else { inp.depth_raw };
     if mode != SpecMode::Off {
         owl_shared::log_info!("boot", "spec 模式 = {:?} depth={depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
             mode
