@@ -97,9 +97,13 @@ impl DiagOpts {
             free_legacy: c.free_legacy,
             sync_mask: mask,
             launch_time: c.launch_time,
-            // 硬预算:与池治理同一预留(1GiB);逻辑上限走显式配置(暂 None)
+            // 硬预算:与池治理同一预留(1GiB);逻辑上限走显式配置
             vram_reserve_mb: cfg.pool.vram_reserve_mb.max(1),
-            vram_budget_mb: cfg.pool.vram_budget_mb,            d2h_prof: c.d2h_prof,
+            // **`0` = 不限**(与 `[pool] vram_budget_mb` 注释"留空 = 只按驱动账判"同义;
+            // 各档普遍显式写 0)。写成 `Some(0)` = 0 字节硬预算 ⇒ 装载第一条就拒发,
+            // boot 直接死在 embed_tokens(2026-10-21 实测)。
+            vram_budget_mb: cfg.pool.vram_budget_mb.filter(|m| *m > 0),
+            d2h_prof: c.d2h_prof,
             gpu_prof: c.gpu_prof,
             graph_flags: c.graph_flags.to_bits(),
             capture_slab_mb: c.capture_slab_mb,

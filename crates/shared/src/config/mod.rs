@@ -567,9 +567,11 @@ pub struct PoolCfg {
     /// **关掉解释器活性中途回收**(诊断/对照臂;缺省 false = 开回收)。
     /// 原 `OWL_NO_RECLAIM` env。⚠️ 开会无界常驻(长请求 OOM),只作取证。
     pub no_reclaim: bool,
-    /// **驱动账逻辑上限 MiB**(`None` = 只按驱动账判;原 `OWL_VRAM_BUDGET_MB`)。
+    /// **驱动账逻辑上限 MiB**(`None` / **`0`** = 只按驱动账判;原 `OWL_VRAM_BUDGET_MB`)。
     /// 适合"这台卡只准 owl 用 N GB"的部署口径;与 `vram_target`(占比)
     /// 是两个不同量:本键是硬上限,超出即主动拒发。
+    /// ⚠️ `0` 与 `None` 同义(各档显式写 `0` 表示"不限")—— 归一点在
+    /// `DiagOpts` 构造(`state.rs`);**不要**把它当"0 字节预算"。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vram_budget_mb: Option<u64>,
 }
