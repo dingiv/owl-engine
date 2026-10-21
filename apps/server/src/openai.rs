@@ -21,7 +21,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 
 use owl_engine::{TurnEvent, TurnOpts, TurnSampler};
-use owl_shared::config::AgentCfg;
+use crate::config::AgentCfg;
 
 use crate::actor::{EngineReq, SinkEvent};
 use crate::agent_trace::{AgentTrace, OutcomeFacts, ReqFacts, TurnLedger, UsageFacts};

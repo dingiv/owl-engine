@@ -547,19 +547,25 @@ impl EngineKnobs {
             rope: cfg.model.rope.clone(),
             vision: cfg.model.vision,
             head_quant: cfg.model.head_quant,
-            tag_wildcard: cfg.dispatch.tag_wildcard,
+            tag_wildcard: cfg.kernel.tag_wildcard,
             probes: crate::running::StepProbes::from_config(cfg),
             // ── **配置是唯一来源**(2026-10-19 统一)──
             // 本函数只做 `OwlConfig` → 旋钮的字段搬运,**不读任何 env**
             // (探针档/生产档走同一条路 ⇒ 同一份配置 = 同一套条件)。
             // 测试面只保留"运行器级"env(选卡/资产路径/场景过滤),见
             // `docs/arch/配置面-单一来源.md`。
-            pool_tokens: cfg.pool.pool_tokens,
+            pool_tokens: cfg.pool.pinned_pool_tokens(),
             pool_cap_mb: cfg.pool.pool_cap_mb,
             draft: DraftCfg {
                 depth: cfg.spec.depth,
                 dumb: cfg.spec.dumb,
-                dflash2_dir: cfg.model.dflash2_dir.clone(),
+                // 空串 = 未设(TOML 里写 `draft_path = ""` 的语义)
+                dflash2_dir: cfg
+                    .spec
+                    .draft_path
+                    .as_ref()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.display().to_string()),
                 kv_quant: if cfg.spec.draft_kv_fp8 {
                     owl_models::env::KvQuant::Fp8E4M3
                 } else {
@@ -619,13 +625,13 @@ impl EngineKnobs {
             // 两个虚拟化分支的真值都由 `derive_turn_ws`(页宽已知)落 —— 这里
             // 只放 `dense_floor_of` 的三态占位。
             dense_floor: Self::dense_floor_of(&cfg.kvmem),
-            no_graph: cfg.graph.no_graph,
-            fi_cuda_graph: cfg.dispatch.fi_cuda_graph,
+            no_graph: !cfg.cuda.graph,
+            fi_cuda_graph: cfg.kernel.fi_cuda_graph,
             // 哨兵:0 = 取 max_seq(FI 调度表的图档上界 = 单序列 ctx 的天然上界;
             // 这样档位改 max_seq 时上界跟着走,不必两处手改)
-            fi_plan_bake: cfg.dispatch.fi_plan_bake.map(|b| if b == 0 { cfg.runtime.max_seq } else { b }),
-            fi_plan_restore: cfg.dispatch.fi_plan_restore,
-            ts_probe: cfg.dispatch.ts_probe,
+            fi_plan_bake: cfg.kernel.fi_plan_bake.then_some(cfg.runtime.max_seq),
+            fi_plan_restore: cfg.kernel.fi_plan_restore,
+            ts_probe: cfg.kernel.ts_probe,
             // S2b 正名:env 新名优先,旧名 `OWL_GDN_SLOTS` 兼容(旧档脚本不炸)
             gdn_slots: owl_shared::env_reader::parse("OWL_MAX_ACTIVE_TURNS")
                 .or_else(|| owl_shared::env_reader::parse("OWL_GDN_SLOTS"))

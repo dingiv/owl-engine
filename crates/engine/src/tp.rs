@@ -884,7 +884,9 @@ fn query_bar1_bytes() -> Result<std::collections::HashMap<String, u64>> {
 // ★ 1-stage 对称 arena(2026-10-18;`TP2-施工设计.md` §35)
 // ============================================================================
 
-/// 1-stage 开关(env `OWL_TP_1STAGE=1`;**缺省关** —— 2026-10-18 同会话 std A/B 定谳:
+/// 1-stage 开关(`runtime.tp_one_stage`;2026-10-21 收编,原 `OWL_TP_1STAGE` env
+/// 已退场 —— 引擎零 env,入口经 [`TpOpts::one_stage`] 显式传入。**缺省关** ——
+/// 2026-10-18 同会话 std A/B 定谳:
 /// **性能中性**(v1 1477.66 / 1-stage 1479.52,±0.4% 噪声内),而它每 rank 多占
 /// 64MiB(2 × 32MiB 槽)+ 6 笔 VMM 映射 ⇒ **没有理由让它当默认**。
 ///

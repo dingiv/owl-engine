@@ -743,6 +743,8 @@ cargo test -p owl-engine  --lib                  # 53
 # ② 1-stage 档的 L1 门(连跑,验证竞态修复;应 5/5 全绿)
 OWL_TP_TEST_DEV_A=2 OWL_TP_TEST_DEV_B=3 \
   OWL_0_8B_DIR=/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B \
+  # 注:引擎侧开关已收编 `runtime.tp_one_stage`(2026-10-21);
+  # 这里仍用 env 是因为**测试用例**从 env 显式组 `TpOpts`(owl 纪律:测试例外)
   OWL_TP_1STAGE=1 cargo test -p owl-engine --test tp_g8_gate -- --nocapture
 # ③ 生产 A/B(std 五点三轮;端口须避开别的会话 —— 纪律㉜)
 PORT=8143 TP2_CFG=/tmp/bench8141/tp2-w4a8-arf8.toml OUT_DIR=/tmp/owl-bench-x \

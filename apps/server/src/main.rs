@@ -60,7 +60,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::actor::EngineReq;
-use crate::config::{ModelKind, ServerConfig};
+use crate::config::{ModelFormat, ServerConfig};
 
 /// 引擎请求通道深度(pump 期间的提交在缓冲;收件与泵不相交纪律)
 const CHANNEL_CAPACITY: usize = 64;
@@ -532,18 +532,20 @@ async fn load_shard(
     world: usize,
 ) -> owl_engine::Result<owl_engine::LoadedModel> {
     let mut loader = engine.loader().slice(rank, world).vocab_split(config.tp_vocab_split);
-    match config.model_kind {
-        ModelKind::Awq27b => {
+    match config.model_format {
+        // AWQ pack-quantized 家族(cyankiwi 系;int4 权重已烘焙)
+        ModelFormat::Awq => {
             // 量化方案映射(唯一点 owl_engine::{head_plan_of, quant_plan_of})
             let head_plan = owl_engine::head_plan_of(config.head_quant);
-            let quant = owl_engine::quant_plan_of(config.quant);
+            let quant = owl_engine::quant_plan_of(config.model_format, config.quant);
             loader
                 .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan, quant)
                 .await
         }
-        ModelKind::Qwen35_08b => loader.load_qwen35_0_8b(&config.model_dir).await,
-        // GGUF 单文件档:超参/词表/模板/rope/权重全从 `model.dir` 那个文件取
-        ModelKind::Gguf => loader.load_gguf(&config.model_dir).await,
+        // 普通 HF safetensors(0.8B 开发档 / 转换后的 27B)
+        ModelFormat::Safetensors => loader.load_qwen35_0_8b(&config.model_dir).await,
+        // GGUF 单文件:超参/词表/模板/rope/权重全从 `model.path` 那个文件取
+        ModelFormat::Gguf => loader.load_gguf(&config.model_dir).await,
     }
 }
 
@@ -566,13 +568,13 @@ async fn actor_main(
             // ── 单卡档(原路径;分片 = 恒等)─────────────────────────────
             1 => {
                 // 装载 = 模型档分发(唯一点 owl_engine::{head_plan_of, quant_plan_of})
-                let model = match config.model_kind {
+                let model = match config.model_format {
                     // 量化方案映射在 `load_shard` 内部(唯一映射点)
-                    ModelKind::Awq27b => load_shard(&config, &mut engine, 0, 1).await?,
-                    ModelKind::Qwen35_08b => {
+                    ModelFormat::Awq => load_shard(&config, &mut engine, 0, 1).await?,
+                    ModelFormat::Safetensors => {
                         engine.loader().load_qwen35_0_8b(&config.model_dir).await?
                     }
-                    ModelKind::Gguf => {
+                    ModelFormat::Gguf => {
                         engine.loader().load_gguf(&config.model_dir).await?
                     }
                 };
@@ -606,10 +608,10 @@ async fn actor_main(
                         push: config.tp_push,
                         ar_f8: config.tp_ar_f8,
                         ar_fused: config.tp_ar_fused,
-                        // 1-stage 对称 arena(§35):结构更对但实测中性 ⇒ 缺省关。
-                        // 挂账:尚无配置键(`runtime.tp_one_stage`),故恒 false
-                        // (与"env 未设"同效,行为与合并前一致)。
-                        one_stage: false,
+                        // 1-stage 对称 arena(§35):结构更对但实测中性 ⇒ 缺省关;
+                        // 2026-10-21 起走配置键(原 env `OWL_TP_1STAGE` 已退场)。
+                        // 与 push 互斥、需 tp_ordinals —— `validate` 已拒非法组合。
+                        one_stage: config.tp_one_stage,
                     },
                 )
                 .await?;
@@ -623,6 +625,12 @@ async fn actor_main(
                     owl_shared::log_info!(
                         "boot",
                         "TP2 **push 档**已开(runtime.tp_push):数据腿 = 写对端槽(RW 别名)"
+                    );
+                }
+                if config.tp_one_stage {
+                    owl_shared::log_info!(
+                        "boot",
+                        "TP2 **1-stage 对称 arena**已开(runtime.tp_one_stage;§35 实验档)"
                     );
                 }
                 owl_shared::log_info!(
@@ -680,7 +688,7 @@ struct ConnCtx {
     tx: mpsc::Sender<EngineReq>,
     model_name: String,
     tpl: std::sync::Arc<chat_tpl::ChatTpl>,
-    agent: std::sync::Arc<owl_shared::config::AgentCfg>,
+    agent: std::sync::Arc<crate::config::AgentCfg>,
     /// `/debug/blocks` 的 GPU 命令出口(engine `face_clone()`;None = 不支持)
     dbg_face: DbgFace,
     /// `/debug/agent` 诊断环(G5②;显式依赖,不做全局变量)

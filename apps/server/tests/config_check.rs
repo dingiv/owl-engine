@@ -125,11 +125,12 @@ fn legacy_profile_still_works() {
 
 #[test]
 fn incomplete_profile_is_rejected_with_key_list() {
-    // **全字段显式**(2026-10-21):从完整档里删一个键 ⇒ 拒启并列出缺项。
-    let full = std::fs::read_to_string(profile("awq27b-3090-max")).expect("读完整档");
+    // **全字段显式**(2026-10-21):从**全量模板**里删一个键 ⇒ 拒启并列出缺项。
+    // (派生档现在是 `extends` 半份档,完整性由合并结果判 —— 不能拿它当残缺源)
+    let full = std::fs::read_to_string(profile("full")).expect("读全量档");
     let broken: String = full
         .lines()
-        .filter(|l| !l.trim_start().starts_with("tp_push ="))
+        .filter(|l| !l.trim_start().starts_with("gguf_tile ="))
         .collect::<Vec<_>>()
         .join("\n");
     let path = std::env::temp_dir().join("owl-incomplete-profile.toml");
@@ -138,5 +139,5 @@ fn incomplete_profile_is_rejected_with_key_list() {
     assert!(!out.status.success(), "缺字段应拒启");
     let s = format!("{}{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
     assert!(s.contains("未显式声明"), "应点名缺字段:\n{s}");
-    assert!(s.contains("runtime.tp_push"), "缺项应列出键路径:\n{s}");
+    assert!(s.contains("kernel.gguf_tile"), "缺项应列出键路径:\n{s}");
 }

@@ -126,7 +126,7 @@ fn gpu_ordinal() -> Option<usize> {
 async fn cpu_construct_and_load(cfg: &OwlConfig) {
     let mut engine = Engine::on(
         EngineConfig {
-            device_ordinal: cfg.runtime.device_ordinal.unwrap_or(0),
+            device_ordinal: 0, // CPU face 不看卡位(卡位改由 [parallel] device 表达)
             max_seq_tokens: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             knobs: EngineKnobs::from_config(cfg),
@@ -622,7 +622,7 @@ async fn snapshot_victim_follows_store_order() {
 async fn cpu_incremental_decode_multibyte(cfg: &OwlConfig) {
     let mut engine = Engine::on(
         EngineConfig {
-            device_ordinal: cfg.runtime.device_ordinal.unwrap_or(0),
+            device_ordinal: 0, // CPU face 不看卡位(卡位改由 [parallel] device 表达)
             max_seq_tokens: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             knobs: EngineKnobs::from_config(cfg),

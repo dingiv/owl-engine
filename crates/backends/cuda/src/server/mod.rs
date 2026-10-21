@@ -542,6 +542,10 @@ impl GpuServer {
                             fresh_scratch: self.diag.gdn_fresh_scratch,
                         },
                     });
+                    // C++ 适配器只认 `getenv("FI_DEBUG")`(上游 ABI 不动;与
+                    // `FI_CUDA_GRAPH` 同一桥法):配置 `[probes] fi_debug`
+                    // 是**唯一真源**,这里把两侧语义焊在同一个写点。
+                    std::env::set_var("FI_DEBUG", if self.diag.fi_debug { "1" } else { "0" });
                     let r = owl_kernels::registry::OpRegistry::boot_with(
                         &mut res,
                         &mut exec,

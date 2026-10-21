@@ -203,6 +203,7 @@ impl DeviceRes for TestRes {
 // §1 输入(27B 生产形状:nv=48 / nk=16 / kd=vd=128)
 // ============================================================================
 
+#[allow(dead_code)] // 全量档形状(nv=48/nk=16;TP1)留档,台子默认跟生产
 const NK: usize = 16;
 #[allow(dead_code)]
 const NV: usize = 48;

@@ -426,7 +426,7 @@ impl EnvProvider {
     /// 硬件档不在 config(引擎 boot 从 iface `op_env()` 合入)。
     /// 分派缺省:D1/D1-v2/qkv 融合生产默认开(2026-10-04 定谳)。
     pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
-        let d = &cfg.dispatch;
+        let d = &cfg.kernel;
         Self {
             attn: AttnEnv {
                 qkv_fuse: d.qkv_fuse,

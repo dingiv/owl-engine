@@ -10,14 +10,17 @@
 # 发射账(只在做宿主命令账时显式加回,缺省不开):[cuda] trace_ring = 65536
 
 [model]
-kind = "awq27b"
-dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+format = "awq"   # 原 kind = "awq27b"
+path = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
 name = "qwen3.8-27b"
 
 [runtime]
 max_seq = 40960
-bind = "127.0.0.1:8138"
 
 [pool]
 pool_tokens = 41216
+
+[spec]
+draft_path = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+[server]
+bind = "127.0.0.1:8138"

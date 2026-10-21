@@ -104,7 +104,7 @@ impl DiagOpts {
             graph_flags: c.graph_flags.to_bits(),
             capture_slab_mb: c.capture_slab_mb,
             trace_ring: c.trace_ring,
-            fi_plan_restore: cfg.dispatch.fi_plan_restore,
+            fi_plan_restore: cfg.kernel.fi_plan_restore,
             tag_filter: tag_filter_from_config(cfg),
             fi_debug: cfg.probes.fi_debug,
             l3_audit: cfg.probes.l3_audit,
@@ -122,22 +122,30 @@ impl DiagOpts {
 /// 这里只读配置事实，不探测硬件/不读 env。
 fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::tag_filter::TagFilter {
     use owl_kernels::spec::KernelTag as T;
-    use owl_shared::config::{HeadQuant, ModelKind, QuantScheme};
-    if cfg.dispatch.tag_wildcard {
+    use owl_shared::config::{HeadQuant, ModelFormat, QuantScheme};
+    if cfg.kernel.tag_wildcard {
         return owl_kernels::tag_filter::TagFilter::wildcard();
     }
     let mut tags: Vec<T> = Vec::new();
-    match cfg.model.kind {
-        ModelKind::Gguf => tags.push(T::QUANT_GGUF),
-        _ => match cfg.model.quant {
+    // GGUF 档:块型核(逐张量型去量化);其余按量化方案放行
+    match cfg.model.format {
+        ModelFormat::Gguf => tags.push(T::QUANT_GGUF),
+        ModelFormat::Safetensors | ModelFormat::Awq => match cfg.model.quant {
             QuantScheme::W4a16 => {
                 tags.push(T::QUANT_W4A16);
-                tags.push(T::QUANT_AWQ);
+                if cfg.model.format == ModelFormat::Awq {
+                    tags.push(T::QUANT_AWQ);
+                }
             }
             QuantScheme::W4a8 => {
                 tags.push(T::QUANT_W4A8);
-                tags.push(T::QUANT_AWQ);
+                if cfg.model.format == ModelFormat::Awq {
+                    tags.push(T::QUANT_AWQ);
+                }
             }
+            // validate 已拒;这里保守只放通用量化核
+            QuantScheme::W8a8i | QuantScheme::W8a8f | QuantScheme::W8a8
+            | QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3 => {}
         },
     }
     if cfg.model.head_quant == HeadQuant::RtnInt8Row {
@@ -149,7 +157,7 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
         tags.push(T::QUANT_W4A16);
         tags.push(T::QUANT_AWQ);
     }
-    if cfg.dispatch.kv_fp8 {
+    if cfg.kernel.kv_fp8 {
         tags.push(T::KV_MAIN_FP8);
     } else {
         tags.push(T::KV_MAIN_F16);
@@ -158,8 +166,9 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
         tags.push(T::FEAT_DFLASH);
         tags.push(T::FEAT_SPEC);
         // DFlash2 草稿自持 W4A16 权重(与主干 plan 独立;MTP = F16 不需)。
-        if cfg.model.dflash2_dir.is_some() {
+        if cfg.spec.draft_path.is_some() {
             tags.push(T::QUANT_W4A16);
+            tags.push(T::QUANT_AWQ);
         }
         // 草稿池默认 BF16；draft_kv_fp8 时 fp8。
         if cfg.spec.draft_kv_fp8 {
@@ -171,7 +180,7 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
     if cfg.model.vision {
         tags.push(T::FEAT_VISION);
     }
-    if cfg.runtime.tp_ordinals.as_ref().is_some_and(|v| v.len() > 1) {
+    if cfg.parallel.mode != owl_shared::config::ParallelMode::Single {
         tags.push(T::FEAT_TP);
     }
     owl_kernels::tag_filter::TagFilter::from_tags(&tags).with_prod_kv_layouts()
@@ -3211,7 +3220,7 @@ mod range_tests {
 #[cfg(test)]
 mod tag_filter_tests {
     use super::tag_filter_from_config;
-    use owl_shared::config::{HeadQuant, ModelKind, OwlConfig, QuantScheme};
+    use owl_shared::config::{HeadQuant, ModelFormat, OwlConfig, QuantScheme};
 
     fn allows(cfg: &OwlConfig, entry: &str) -> bool {
         let f = tag_filter_from_config(cfg);
@@ -3222,13 +3231,14 @@ mod tag_filter_tests {
     #[test]
     fn w4a16_fp8_vision_spec_head_filter() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a16;
         cfg.model.head_quant = HeadQuant::RtnInt8Row;
         cfg.model.vision = true;
-        cfg.dispatch.kv_fp8 = true;
+        cfg.kernel.kv_fp8 = true;
         cfg.spec.depth = 7;
-        cfg.runtime.tp_ordinals = Some(vec![2, 3]);
+        cfg.parallel.mode = owl_shared::config::ParallelMode::Tensor;
+        cfg.parallel.device = vec!["41:00.0".into(), "42:00.0".into()];
         assert!(allows(&cfg, "marlin_gemm_w4a16_awq"));
         assert!(!allows(&cfg, "marlin_gemm_w4a8_awq"));
         assert!(!allows(&cfg, "owl_gguf_gemm_q4k"));
@@ -3244,10 +3254,10 @@ mod tag_filter_tests {
     #[test]
     fn w4a8_main_with_int4_head_and_dflash_allows_aux_w4a16() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a8;
         cfg.model.head_quant = HeadQuant::RtnInt4G32;
-        cfg.model.dflash2_dir = Some("/tmp/dflash2".into());
+        cfg.spec.draft_path = Some("/tmp/dflash2".into());
         cfg.spec.depth = 7;
         assert!(allows(&cfg, "marlin_gemm_w4a8_awq"), "主干 W4A8");
         assert!(allows(&cfg, "marlin_gemm_w4a16_awq"), "int4 头 W4A16");
@@ -3258,7 +3268,7 @@ mod tag_filter_tests {
     #[test]
     fn w4a8_without_aux_keeps_w4a16_out() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a8;
         cfg.model.head_quant = HeadQuant::Off;
         cfg.spec.depth = 0;
@@ -3269,8 +3279,8 @@ mod tag_filter_tests {
     #[test]
     fn tag_wildcard_escapes_all_facets() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Gguf;
-        cfg.dispatch.tag_wildcard = true;
+        cfg.model.format = ModelFormat::Gguf;
+        cfg.kernel.tag_wildcard = true;
         assert!(allows(&cfg, "marlin_gemm_w4a16_awq"), "* 应全放行");
         assert!(allows(&cfg, "owl_gguf_gemm_q4k"));
     }
@@ -3278,8 +3288,8 @@ mod tag_filter_tests {
     #[test]
     fn gguf_filter() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Gguf;
-        cfg.dispatch.kv_fp8 = false;
+        cfg.model.format = ModelFormat::Gguf;
+        cfg.kernel.kv_fp8 = false;
         assert!(allows(&cfg, "owl_gguf_gemm_q4k"));
         assert!(!allows(&cfg, "marlin_gemm_w4a16_awq"));
         assert!(allows(&cfg, "owl_add_f16"));
