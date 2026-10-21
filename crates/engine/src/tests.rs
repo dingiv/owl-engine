@@ -3612,17 +3612,35 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
         // 域参数化(E5-DF3 AL 排查:PROSE 域 = DFlash2 结构性最差域,
         // xinfer p5 实测 accept 1.9%/AL 1.13;MATH 域 AL 4.49 —— OWL_GATE_PROMPT
         // 换域对照,缺省恒 = 原 42tok 长城门)
-        let prompt = owl_shared::env_reader::str_or("OWL_GATE_PROMPT", "用五十字介绍长城。");
+        let mut prompt = owl_shared::env_reader::str_or("OWL_GATE_PROMPT", "用五十字介绍长城。");
+        let mtp_window: usize =
+            owl_shared::env_reader::parse_or("OWL_GATE_MTP_WINDOW", 0);
+        // window 门必须让 ctx 真正超过 sink+window；否则仍是 full，等于没测。
+        if mtp_window > 0 {
+            prompt = prompt.repeat(500);
+        }
+        // 恒等门深度可参数化（T1 自适应档验收：d3/d7 各跑一次）。
+        let gate_depth: usize = owl_shared::env_reader::parse_or("OWL_GATE_SPEC_DEPTH", 3);
+        assert!((1..=owl_shared::config::SPEC_DEPTH_MAX).contains(&gate_depth),
+            "OWL_GATE_SPEC_DEPTH={gate_depth} 越界");
 
         /// **装载一次**(带 MTP 草稿;2026-10-13 用户令:不再每轮重载)
-        async fn boot_gate_engine(ordinal: usize, dir: &str) -> RunningEngine<crate::GpuFace> {
+        async fn boot_gate_engine(
+            ordinal: usize,
+            dir: &str,
+            max_seq_tokens: usize,
+            gate_depth: usize,
+        ) -> RunningEngine<crate::GpuFace> {
             let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
             // 24G 贴顶三旋钮(单会话门不需要多格/多快照/前缀缓存)
             knobs.gdn_slots = 1;
             knobs.snap_max = 1;
             knobs.prefix_cache = false;
             // 草稿档一律按投机配置 boot;baseline 轮靠运行时 spec_depth=0 回落
-            knobs.draft.depth = 3;
+            knobs.draft.depth = gate_depth;
+            // Windowed-MTP 恒等门开关（仅测试面 env；生产走配置）
+            knobs.draft.mtp_window = owl_shared::env_reader::parse_or("OWL_GATE_MTP_WINDOW", 0);
+            knobs.draft.mtp_sink = owl_shared::env_reader::parse_or("OWL_GATE_MTP_SINK", 64);
             knobs.cuda.capture_slab_mb = Some(160);
             // 生产主池是 fp8；MTP 链仍是独立 F16。开该门跑 fp8 主池 × F16
             // MTP 的恒等（与 mtp27b profile 同形；缺省 f16 档保持历史门）。
@@ -3635,14 +3653,14 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
             // `fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
             if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
                 knobs.fi_cuda_graph = true;
-                knobs.fi_plan_bake = Some(2048); // ≥ max_seq(本门 max_seq_tokens=2048)
+                knobs.fi_plan_bake = Some(max_seq_tokens); // ≥ max_seq(本门 max_seq_tokens)
                 knobs.env.attn.verify_arm = owl_shared::config::VerifyArm::Fi;
             }
             let mut engine = Engine::new(EngineConfig {
                 device_ordinal: ordinal,
                 // `_MIN_GEN_TOKENS = 1024` ⇒ room = max_seq − prompt 必须 ≥ 1024
                 // (老门 256 恒拒发 = 环境性红;2026-10-16 抬到 2048 —— 恒等门不比容量)
-                max_seq_tokens: 2048,
+                max_seq_tokens,
                 prefill_chunk: 64,
                 knobs,
             })
@@ -3678,18 +3696,19 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
         }
 
         // ── 装载**一次**,两轮:① 不投机 baseline ② 投机(用户令 2026-10-13) ──
-        let mut running = boot_gate_engine(ordinal, &dir).await;
+        let gate_seq = if mtp_window > 0 { 8192 } else { 2048 };
+        let mut running = boot_gate_engine(ordinal, &dir, gate_seq, gate_depth).await;
         let (ta, ta_tokens) = round(&mut running, 0, &prompt, "baseline").await;
-        let (tb, tb_tokens) = round(&mut running, 3, &prompt, "spec").await;
+        let (tb, tb_tokens) = round(&mut running, gate_depth, &prompt, "spec").await;
         eprintln!(
             "[spec-gate-27b] baseline({}tok)={ta:?}\n[spec-gate-27b] spec({}tok)={tb:?}",
             ta_tokens.len(),
             tb_tokens.len()
         );
-        assert_eq!(ta, tb, "恒等门 27B:greedy 真草稿 spec 文本 ≡ 无 spec");
-        assert_eq!(ta_tokens, tb_tokens, "恒等门 27B:token 账逐位一致");
+        assert_eq!(ta, tb, "恒等门 27B(d{gate_depth}):greedy 真草稿 spec 文本 ≡ 无 spec");
+        assert_eq!(ta_tokens, tb_tokens, "恒等门 27B(d{gate_depth}):token 账逐位一致");
         // 旋钮已全量显式化,无 env 清场需要
-    
+
         drop(running);
         std::thread::sleep(std::time::Duration::from_secs(10));
     }
@@ -4768,4 +4787,229 @@ pub async fn gpu_vlm_first_turn_probe_27b_textfirst() {
 /// 27B 的 F1 复现组(首轮带图)。
 pub async fn gpu_vlm_first_turn_probe_27b_imagefirst() {
     gpu_vlm_first_turn_probe_27b(true).await;
+}
+
+/// **MTP KV 行对拍**(T3 前置,2026-10-22)：`prefill_extend` 多行写 vs
+/// `t_rows=1` 单行写，用生产 `MtpPredictor::propose` 读回效果比较。
+///
+/// 不走 D2H：MTP 池块跨账本，`copy_block_at` 会拒；`propose` 是生产读路径。
+/// 步骤（base=0, n=4）：
+/// ① 多行写 row 0..n-1，逐行 `propose(k=1)` 记录 draft；
+/// ② 逐行 `t_rows=1` 写零 hidden（哨兵）⇒ draft 必须变化（证明单行写非 no-op）；
+/// ③ `t_rows=1` 写回原 hidden ⇒ draft 必须等于多行。
+///
+/// 门控 `OWL_E2E_ONLY=gpu_mtp_kv_parity` + `OWL_TEST_DEVICE` + ckpt:27b-awq。
+pub async fn gpu_mtp_kv_parity() {
+    use owl_iface::contract::{Bytes, Dtype};
+    use owl_models::tensor::TensorOps;
+
+    let Some(ordinal) = gpu_ordinal() else {
+        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
+        eprintln!("skip: ckpt:27b-awq 未设");
+        return;
+    };
+
+    async fn host_block(
+        running: &mut RunningEngine<crate::GpuFace>,
+        dtype: Dtype,
+        shape: Vec<usize>,
+        data: &[u8],
+    ) -> (Bytes, Vec<u64>) {
+        let t = TensorOps::from_host(dtype, shape, data);
+        let env = running.dev.spec_rt.draft_env;
+        let tp = running.dev.boot.tp.clone();
+        let face = running.dev.graphs.session.face_mut();
+        owl_models::interpreters::eval_ops_scoped_env(t.step(), face, env, tp.as_ref())
+            .await
+            .expect("host block eval")
+    }
+
+    async fn free_ids(running: &mut RunningEngine<crate::GpuFace>, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let face = running.dev.graphs.session.face_mut();
+        face.free(ids).await.expect("free");
+    }
+
+    async fn propose_one(
+        running: &mut RunningEngine<crate::GpuFace>,
+        sid: u64,
+        anchor: u32,
+        seed: &Bytes,
+        p: usize,
+    ) -> u32 {
+        let page = running.dev.pool.geom.page;
+        let dtype = running.dev.pool.geom.dims.dtype;
+        let hidden = running.dev.pool.geom.dims.hidden;
+        let bt = running
+            .bank
+            .sessions
+            .session(sid)
+            .expect("session")
+            .mtp_block_table
+            .clone();
+        let (kc, vc) = running.dev.pool.mtp_kv_leaf().expect("MTP KV");
+        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let slot_at = |p: usize| (bt[p / page] * page as u32 + (p % page) as u32) as f32;
+        let bt_step = TensorOps::from_host(
+            Dtype::F32,
+            vec![1, bt.len()],
+            &f32b(&bt.iter().map(|&b| b as f32).collect::<Vec<_>>()),
+        );
+        let kv = owl_models::module::KvBuffers {
+            k_cache: kc,
+            v_cache: vc,
+            slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot_at(p)])),
+            kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(p + 1) as f32])),
+            block_tables: bt_step,
+        };
+        let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[p as f32]));
+        let anchor_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[anchor as f32]));
+        let seed_view = TensorOps::of_block(seed.id, dtype, vec![1, hidden]);
+        let env = running.dev.spec_rt.draft_env;
+        let vocab = running.dev.boot.model.vocab_size();
+        let rope = running.dev.boot.rope.clone();
+        let attn_v2 = running.dev.pool.attn_v2_scratch();
+        let drafts = match running.dev.spec_rt.drafter.as_ref().expect("drafter") {
+            crate::spec_runtime::Drafter::Mtp(m) => m.propose(
+                &anchor_t,
+                &seed_view,
+                1,
+                &running.dev.boot.model.embed,
+                &rope,
+                &[kv],
+                &[pos_t],
+                vocab,
+                env,
+                attn_v2,
+            ),
+            _ => panic!("MTP only"),
+        };
+        let tp = running.dev.boot.tp.clone();
+        let (b, arena) = {
+            let face = running.dev.graphs.session.face_mut();
+            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, env, tp.as_ref())
+                .await
+                .expect("propose eval")
+        };
+        let mut buf = [0u8; 4];
+        {
+            let face = running.dev.graphs.session.face_mut();
+            face.dtoh(&b, &mut buf).await.expect("draft dtoh");
+            face.free(&arena).await.expect("free arena");
+            face.free(&[b.id]).await.expect("free root");
+        }
+        f32::from_le_bytes(buf) as u32
+    }
+
+    let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
+    knobs.gdn_slots = 1;
+    knobs.snap_max = 1;
+    knobs.prefix_cache = false;
+    knobs.draft.depth = 3;
+    knobs.cuda.capture_slab_mb = Some(160);
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 2048,
+        prefill_chunk: 64,
+        knobs,
+    })
+    .expect("构造");
+    let loaded = engine
+        .loader()
+        .load_qwen38_27b_awq(
+            dir.as_ref(),
+            dir.as_ref(),
+            owl_models::module::QuantPlan::F16,
+            owl_models::module::QuantPlan::W4A16Awq,
+        )
+        .await
+        .expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+    let (sid, _id) = running
+        .submit_session(Some(7), "mtp-kv-parity", 8)
+        .expect("submit");
+
+    let dims = running.dev.pool.geom.dims;
+    let page = running.dev.pool.geom.page;
+    let n = 4usize;
+    let base = 0usize;
+    let ids: Vec<u32> = (0..=n as u32).collect();
+    let hidden = dims.hidden;
+    let dtype = dims.dtype;
+
+    let row_bytes = |i: usize, zero: bool| -> Vec<u8> {
+        let mut v = Vec::with_capacity(hidden * 2);
+        for j in 0..hidden {
+            let val = if zero { 0.0 } else { (i * 1000 + j) as f32 * 0.001 };
+            v.extend_from_slice(&half::f16::from_f32(val).to_le_bytes());
+        }
+        v
+    };
+    let rows_bytes = |rows: usize, zero: bool| -> Vec<u8> {
+        let mut v = Vec::with_capacity(rows * hidden * 2);
+        for i in 0..rows {
+            v.extend_from_slice(&row_bytes(i, zero));
+        }
+        v
+    };
+
+    // ① 多行写。
+    let (hid_multi, arena_m) = host_block(&mut running, dtype, vec![n, hidden], &rows_bytes(n, false)).await;
+    running
+        .dev
+        .prefill_extend(&mut running.bank, sid, &hid_multi, n, &ids, base)
+        .await
+        .expect("multi-row prefill_extend");
+    free_ids(&mut running, &arena_m).await;
+    free_ids(&mut running, &[hid_multi.id]).await;
+
+    // ② 多行基线 draft。
+    let mut row_blocks: Vec<(Bytes, Vec<u64>)> = Vec::with_capacity(n);
+    let mut multi_drafts: Vec<u32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let (h, ha) = host_block(&mut running, dtype, vec![1, hidden], &row_bytes(i, false)).await;
+        let d = propose_one(&mut running, sid, ids[i + 1], &h, i).await;
+        multi_drafts.push(d);
+        row_blocks.push((h, ha));
+    }
+
+    // ③ 逐行哨兵 + 恢复。
+    for i in 0..n {
+        let row_ids = [ids[i], ids[i + 1]];
+        let (z, za) = host_block(&mut running, dtype, vec![1, hidden], &row_bytes(0, true)).await;
+        running
+            .dev
+            .prefill_extend(&mut running.bank, sid, &z, 1, &row_ids, base + i)
+            .await
+            .expect("sentinel t=1");
+        let dz = propose_one(&mut running, sid, ids[i + 1], &z, i).await;
+        assert_ne!(
+            dz, multi_drafts[i],
+            "t=1 写零 hidden 后 draft 未变：单行写疑似 no-op（row {i}）"
+        );
+        free_ids(&mut running, &za).await;
+        free_ids(&mut running, &[z.id]).await;
+
+        let h = row_blocks[i].0.clone();
+        running
+            .dev
+            .prefill_extend(&mut running.bank, sid, &h, 1, &row_ids, base + i)
+            .await
+            .expect("restore t=1");
+        let dr = propose_one(&mut running, sid, ids[i + 1], &h, i).await;
+        assert_eq!(dr, multi_drafts[i], "t=1 恢复后 draft != 多行（row {i}）");
+    }
+    for (h, ha) in &row_blocks {
+        free_ids(&mut running, ha).await;
+        free_ids(&mut running, &[h.id]).await;
+    }
+
+    eprintln!("[mtp-kv-parity] PASS n={n} page={page} t=1 vs 多行 draft 一致");
+    drop(running);
+    std::thread::sleep(std::time::Duration::from_secs(10));
 }

@@ -1,5 +1,6 @@
 //! 草稿器面(DFlash2 单图 encode+propose / eager / MTP 链 / verify 前向)
 use super::*;
+use super::mtp_window::{MtpWindowCfg, MtpWindowPlan};
 use owl_models::ModelError;
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
@@ -617,8 +618,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 首轮 propose(E5-M2b;m=0 特例):pair (h_{pos-1}, emb(anchor)) @
     /// 位置 pos-1 = M1 propose 本尊;seed hidden = prefill 末块 harvest。
     /// 产出 k 草稿块持久(spec_drafts)。
-    pub(crate) async fn propose_first(&mut self, anchor: u32, pos: usize) -> Result<()> {
-        let depth = self.dev.spec_rt.depth;
+    pub(crate) async fn propose_first(
+        &mut self,
+        anchor: u32,
+        pos: usize,
+        depth: usize,
+    ) -> Result<()> {
         let seed = self
             .tspec()?
             .spec_seed_hidden
@@ -631,22 +636,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (kc, vc) = self.dev.pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
         let page = self.dev.pool.geom.page;
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
-        let bt_t = TensorOps::from_host(
-            Dtype::F32,
-            vec![1, bt.len()],
-            &f32b(&bt.iter().map(|&b| b as f32).collect::<Vec<_>>()),
-        );
-        // 步 i:位置 pos-1+i,kv_len = pos+i(含自身)
+        let requested = self.dev.spec_rt.mtp_window;
+        let attn_v2 = self.dev.pool.attn_v2_scratch();
+        let windowed = requested.active() && attn_v2.is_some();
+        let cfg = if windowed { requested } else { MtpWindowCfg::default() };
+        let plan = MtpWindowPlan::new(&bt, page, cfg)?;
+        // 步 i:位置 pos-1+i,kv_len = 每步可见长度(含自身)
         let mut kvs = Vec::new();
         let mut pos_ts = Vec::new();
         for i in 0..depth {
             let p = pos - 1 + i;
+            let view = plan.row(p)?;
+            let bt_step = TensorOps::from_host(
+                Dtype::F32,
+                vec![1, view.blocks.len()],
+                &f32b(&view.blocks.iter().map(|&b| b as f32).collect::<Vec<_>>()),
+            );
             kvs.push(KvBuffers {
                 k_cache: kc.clone(),
                 v_cache: vc.clone(),
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(bt[p / page] * page as u32 + (p % page) as u32) as f32])),
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(p + 1) as f32])),
-                block_tables: bt_t.clone(),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[view.visible as f32])),
+                block_tables: bt_step,
             });
             pos_ts.push(TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[p as f32])));
         }
@@ -659,7 +670,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let rope = self.dev.boot.rope.clone();
             // 链步 decode 读核跟池布局:kNH 池必须走 v2(否则落 v1 classic
             // ↠ 布局错位、草稿全垃圾;2026-10-13 布局守卫捕获)
-            let attn_v2 = self.dev.pool.attn_v2_scratch();
             match self.dev.spec_rt.drafter.as_ref().ok_or_else(|| ModelError::EngineInvariant {
                 what: "drafter 句柄缺席(草稿档位不一致)".into(),
             })? {
@@ -700,8 +710,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         m: usize,
         toks: &[u32],
         pos: usize,
+        depth: usize,
     ) -> Result<owl_iface::contract::Bytes> {
-        let depth = self.dev.spec_rt.depth;
         // mtp 链表覆盖:extend F..F+m + 链 F'..F'+depth-2(F' = F+m+1)
         let fp = pos + m + 1;
         // 链步最远位 = fp+depth-2 → 链表需覆盖 token 数 fp+depth-1
@@ -709,6 +719,31 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (kc, vc) = self.dev.pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
         let page = self.dev.pool.geom.page;
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let requested = self.dev.spec_rt.mtp_window;
+        let extend_v2 = self
+            .dev
+            .pool
+            .verify_attn_v2_scratch()
+            .and_then(|s| s.prefix(m + 1));
+        let attn_v2 = self.dev.pool.attn_v2_scratch();
+        // boot 已对 window>0 拒缺 v2；这里仍保留显式 full fallback（例如
+        // scratch prefix 越界），绝不让 window 表配 full lens。
+        let windowed = requested.active() && extend_v2.is_some() && attn_v2.is_some();
+        let cfg = if windowed { requested } else { MtpWindowCfg::default() };
+        let plan = MtpWindowPlan::new(&bt, page, cfg)?;
+        let ext_views = plan.rows(pos, m + 1)?;
+        if cfg.active() {
+            let full_rows = ext_views.iter().filter(|v| v.blocks.len() >= bt.len()).count();
+            if full_rows == ext_views.len() {
+                mcnt("spec.mtp.window.full", 1);
+            } else {
+                mcnt("spec.mtp.window.rounds", 1);
+            }
+            mcnt(
+                "spec.mtp.window.visible_tokens",
+                ext_views.iter().map(|v| v.visible as u64).sum(),
+            );
+        }
         let bt_t = TensorOps::from_host(
             Dtype::F32,
             vec![1, bt.len()],
@@ -717,7 +752,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let slot_at = |p: usize| -> f32 { (bt[p / page] * page as u32 + (p % page) as u32) as f32 };
         // extend 批行建表([M+1])
         let slots_x: Vec<f32> = (0..=m).map(|i| slot_at(pos + i)).collect();
-        let lens_x: Vec<f32> = (0..=m).map(|i| (pos + i + 1) as f32).collect();
+        let lens_x: Vec<f32> = ext_views.iter().map(|v| v.visible as f32).collect();
         let pos_x: Vec<f32> = (0..=m).map(|i| (pos + i) as f32).collect();
         let extend_kv = KvBuffers {
             k_cache: kc.clone(),
@@ -740,25 +775,30 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let mut chain = Vec::new();
         for j in 1..depth {
             let p = fp + j - 1;
+            let view = plan.row(p)?;
+            let bt_step = TensorOps::from_host(
+                Dtype::F32,
+                vec![1, view.blocks.len()],
+                &f32b(&view.blocks.iter().map(|&b| b as f32).collect::<Vec<_>>()),
+            );
             let kv = KvBuffers {
                 k_cache: kc.clone(),
                 v_cache: vc.clone(),
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot_at(p)])),
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(p + 1) as f32])),
-                block_tables: bt_t.clone(),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[view.visible as f32])),
+                block_tables: bt_step,
             };
             let pt = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[p as f32]));
             chain.push((pt, kv));
         }
         let chain_refs: Vec<(&TensorOps, &KvBuffers)> =
             chain.iter().map(|(p, k)| (p, k)).collect();
-        // MTP extend 页表:每行都走同一条 MTP 页链(v2 伪序列语义);
-        // 复用 target verify 的 4 序列 scratch,按 m+1 取前缀视图。
-        // 行宽固定为池页数(会话链表只覆盖当前所需页,余页补零)。
+        // MTP extend 页表:每行一条读视图(短 ctx/关闭时 = 完整链表);
+        // 行宽固定为池页数,余页补零。
         let nb = self.dev.pool.geom.nb;
         let mut bt8_f = vec![0f32; (m + 1) * nb];
-        for r in 0..=m {
-            for (i, &b) in bt.iter().take(nb).enumerate() {
+        for (r, view) in ext_views.iter().enumerate() {
+            for (i, &b) in view.blocks.iter().take(nb).enumerate() {
                 bt8_f[r * nb + i] = b as f32;
             }
         }
@@ -767,11 +807,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             vec![m + 1, nb],
             &f32b(&bt8_f),
         );
-        let extend_v2 = self
-            .dev
-            .pool
-            .verify_attn_v2_scratch()
-            .and_then(|s| s.prefix(m + 1));
         let ts_build = std::time::Instant::now();
         // cu(E5-M5:eager 路自建合法;图态走 propose_graph_step 的输入槽)
         let cu_t = TensorOps::from_host(
@@ -786,7 +821,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let env = self.dev.spec_rt.draft_env;
             let vocab = self.dev.boot.model.vocab_size();
             let rope = self.dev.boot.rope.clone();
-            let attn_v2 = self.dev.pool.attn_v2_scratch(); // 同上:链步读核走 v2
             match self.dev.spec_rt.drafter.as_ref().ok_or_else(|| ModelError::EngineInvariant {
                 what: "drafter 句柄缺席(草稿档位不一致)".into(),
             })? {
@@ -826,8 +860,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         m: usize,
         toks: &[u32],
         pos: usize,
+        depth: usize,
     ) -> Result<Vec<u32>> {
-        let depth = self.dev.spec_rt.depth;
         let page = self.dev.pool.geom.page;
         let bt = {
             let sid = self.turns.active()?.session_id;
@@ -844,16 +878,31 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let fp = pos + m + 1;
         let slot_at =
             |p: usize| (bt[p / page] * page as u32 + (p % page) as u32) as f32;
+        let cfg = self.dev.spec_rt.mtp_window;
+        let plan = MtpWindowPlan::new(&bt, page, cfg)?;
+        let ext_views = plan.rows(pos, m + 1)?;
+        if cfg.active() {
+            let full_rows = ext_views.iter().filter(|v| v.blocks.len() >= bt.len()).count();
+            if full_rows == ext_views.len() {
+                mcnt("spec.mtp.window.full", 1);
+            } else {
+                mcnt("spec.mtp.window.rounds", 1);
+            }
+            mcnt(
+                "spec.mtp.window.visible_tokens",
+                ext_views.iter().map(|v| v.visible as u64).sum(),
+            );
+        }
         let tok_f: Vec<f32> = toks.iter().map(|&v| v as f32).collect();
         let pos_f: Vec<f32> = (pos..pos + m + 1).map(|p| p as f32).collect();
         let slots_f: Vec<f32> = (pos..pos + m + 1).map(slot_at).collect();
-        let lens_f: Vec<f32> = ((pos + 1)..=(pos + m + 1)).map(|p| p as f32).collect();
+        let lens_f: Vec<f32> = ext_views.iter().map(|v| v.visible as f32).collect();
         // 图槽容量 = (m+1) × 池页数(固定);会话链表只覆盖当前所需页,
-        // 必须补零到全宽 —— 直接按 bt.len() 装填会短于图槽容量。
+        // 必须补零到全宽。window 视图只改读表,lens 用压缩可见长度。
         let nb = self.dev.pool.geom.nb;
         let mut bt8_f = vec![0f32; (m + 1) * nb];
-        for r in 0..=m {
-            for (i, &b) in bt.iter().take(nb).enumerate() {
+        for (r, view) in ext_views.iter().enumerate() {
+            for (i, &b) in view.blocks.iter().take(nb).enumerate() {
                 bt8_f[r * nb + i] = b as f32;
             }
         }
@@ -864,23 +913,38 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             ("lens_ext", lens_f.as_slice()),
             ("v2_bt8", bt8_f.as_slice()),
         ];
-        let mut chain_bufs: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
+        let mut chain_bufs: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
         for j in 1..depth {
             let p = fp + j - 1;
+            let view = plan.row(p)?;
+            let mut bt_f = vec![0f32; nb];
+            for (i, &b) in view.blocks.iter().take(nb).enumerate() {
+                bt_f[i] = b as f32;
+            }
             chain_bufs.push((
                 vec![p as f32],
                 vec![slot_at(p)],
-                vec![(p + 1) as f32],
+                vec![view.visible as f32],
+                bt_f,
             ));
         }
-        let names: Vec<String> =
-            (0..chain_bufs.len()).flat_map(|j| [format!("c{j}_pos"), format!("c{j}_slots"), format!("c{j}_lens")]).collect();
-        for (j, (a, b, c)) in chain_bufs.iter().enumerate() {
-            ins.push((names[j * 3].as_str(), a.as_slice()));
-            ins.push((names[j * 3 + 1].as_str(), b.as_slice()));
-            ins.push((names[j * 3 + 2].as_str(), c.as_slice()));
+        let names: Vec<String> = (0..chain_bufs.len())
+            .flat_map(|j| {
+                [
+                    format!("c{j}_pos"),
+                    format!("c{j}_slots"),
+                    format!("c{j}_lens"),
+                    format!("c{j}_bt"),
+                ]
+            })
+            .collect();
+        for (j, (a, b, c, d)) in chain_bufs.iter().enumerate() {
+            ins.push((names[j * 4].as_str(), a.as_slice()));
+            ins.push((names[j * 4 + 1].as_str(), b.as_slice()));
+            ins.push((names[j * 4 + 2].as_str(), c.as_slice()));
+            ins.push((names[j * 4 + 3].as_str(), d.as_slice()));
         }
-        let pg = &mut self.dev.graphs.propose[m];
+        let pg = self.dev.graphs.propose_mut(depth, m)?;
         let t1 = std::time::Instant::now();
         pg.step(&ins).await?;
         let t_step = t1.elapsed();

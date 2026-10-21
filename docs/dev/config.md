@@ -223,8 +223,8 @@ ls profiles/
   视觉塔走 host 解量化(F16/F32/Q8_0… → F16),文本主干仍走 GGUF 零解量化
   通道;patch_embd 的两个时间片按 HF `[out][in][t][p][p]` **按 in 通道交错**
   还原(直接 concat = 静默错值)。
-  - `profiles/gguf4b-vlm.toml`(4B Q4_K_M + mmproj-F16,单卡 3090 Ti)
-  - `profiles/gguf27b-vlm.toml`(27B Q4_K_M + mmproj-Q8_0,单卡 3090 Ti)
+  - `profiles/qwen35_4b-3090-q4km-vlm.toml`(4B Q4_K_M + mmproj-F16,单卡 3090 Ti)
+  - `profiles/qwen38_27b-3090-q4km-vlm.toml`(27B Q4_K_M + mmproj-Q8_0,单卡 3090 Ti)
   - 把 `vision_path` 写到 HF/AWQ 档 = 响亮拒(塔权重在检查点目录);
     `vision = false` 却写 `vision_path` 同样拒。
 - 视觉塔装载 + 引擎图像 prefill + **OpenAI `image_url` / Rust 预处理**已接
@@ -232,8 +232,26 @@ ls profiles/
 - **MTP 头投机**（`[spec] draft = "mtp"`，2026-10-21）：27B AWQ 检查点自带
   15 个 `mtp.*` 键；`depth ≤ 7`。MTP 链是独立 **F16** 页池（不是主池 fp8），
   标准 attention 读写走 `kv.main.f16`/KnHD；`--check` 会预检权重索引的
-  `mtp.*`。验证档 `profiles/mtp27b-3090-16k.toml`；历史 DFlash2 档不受影响
+  `mtp.*`。验证档 `profiles/qwen38_27b-3090-w4a16-mtp.toml`；历史 DFlash2 档不受影响
   （`draft` 缺省 = auto，DFlash2 目录在场时仍优先 DFlash2）。
+  - **MTP 窗口（2026-10-21，Phase 0）**：`[spec] mtp_window = N`（0 = 关，默认）
+    只改 MTP **草稿读**的 KV 视图（最老 `mtp_sink` 个 token + 最近 N 个 token），
+    target verify 始终全上下文。按池页对齐，窗口只开给 MTP；配到
+    DFlash2/Off、缺 v2 scratch、或 `mtp_sink >= mtp_window` 都会 boot 拒。
+    生产 MTP 档 `profiles/qwen38_27b-3090-w4a16-mtp.toml` 已写
+    `mtp_window=4032` / `mtp_sink=64` / `mtp_window_min_ctx=12288`；A/B 回退用
+    `--set spec.mtp_window=0`。`full.toml` 只保留 schema 缺省 0/64/0。
+    `mtp_window_min_ctx` 是短 ctx 不压缩的门槛（8k prompt+输出会跨 8192，
+    取 12288 才真正保 full）。
+  - **自适应 depth（2026-10-21/22，T1a+T1b v2）**：`[spec] adaptive_depth = true`
+    （默认 false）+ `depth_min = 3` + `depth_switch_ctx = 49152` +
+    `adaptive_min_tpr = 3.0`。`depth` 为上限（建议 7）；`pos >= depth_switch_ctx`
+    回下限。两档 verify/fold/propose 图族 boot 期全量预捕获（d3+d7 共 24 face），
+    运行期只换引用；捕获不全 = boot 硬失败。T1b v2 = 每 8 轮窗口，连续 2 窗
+    `tokens/round < adaptive_min_tpr` 才只降不升到 `depth_min`。
+    A/B 命令见 `perf-runs/mtp-longctx-2026-10-21/REPORT.md` §8。
+    `qwen38_27b-3090-w4a16-mtp.toml` 保持静态 d3 + window；
+    `qwen38_27b-3090-iq4xs-mtp.toml`（GGUF 单卡）已开 window + T1b 自适应。
 - **图像 × 投机**(`spec.depth>0`)已接(V5):verify 的 rope 位置 =
   真实位置 + m-RoPE `delta`,KV slots/lens 仍用真实位置;带图请求仍限
   单图/非合批。无投机对照档 = `profiles/qwen38_27b-3080_tp2-w4a16-vlm.toml`;

@@ -1,4 +1,4 @@
-# owl 档 `gguf27b-mtp` —— 27B UD-IQ4_XS + 单文件 NextN MTP 头 / 12k。
+# owl 档 `qwen38_27b-3090-iq4xs-mtp` —— 27B UD-IQ4_XS + 单文件 NextN MTP 头 / 12k。
 extends = ["full.toml"]
 
 [server]
@@ -29,6 +29,17 @@ vram_reserve_mb = 512
 depth = 7
 draft = "mtp"
 draft_kv_fp8 = false
+# Windowed-MTP（Phase 0）：草稿读 sink=64 + 最近 4032 tok；target verify 全上下文。
+# 8k prompt+输出会跨 8192，min_ctx 取 12288 才真正保 full。
+mtp_window = 4032
+mtp_sink = 64
+mtp_window_min_ctx = 12288
+# T1b 自适应 depth：短 ctx 用 d7，长 ctx 回 d3；两档图族 boot 期预捕获。
+# 连续 2 窗 tokens/round < adaptive_min_tpr 才只降不升。
+adaptive_depth = true
+depth_min = 3
+depth_switch_ctx = 49152
+adaptive_min_tpr = 3.0
 
 [kernel]
 kv_fp8 = false

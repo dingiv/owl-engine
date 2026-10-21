@@ -582,6 +582,13 @@ impl EngineKnobs {
                 } else {
                     owl_models::env::KvQuant::None
                 },
+                mtp_window: cfg.spec.mtp_window,
+                mtp_sink: cfg.spec.mtp_sink,
+                mtp_window_min_ctx: cfg.spec.mtp_window_min_ctx,
+                adaptive_depth: cfg.spec.adaptive_depth,
+                depth_min: cfg.spec.depth_min,
+                depth_switch_ctx: cfg.spec.depth_switch_ctx,
+                adaptive_min_tpr: cfg.spec.adaptive_min_tpr,
                 notaps: cfg.spec.notaps,
                 tapdecl: cfg.spec.tapdecl,
                 tp_draft: cfg.spec.tp_draft,
@@ -680,7 +687,7 @@ impl EngineKnobs {
 /// 原 knobs 顶层六散字段收编;量化用 KvQuant 枚举,bool 和稀泥废除)
 #[derive(Clone, Debug)]
 pub struct DraftCfg {
-    /// 投机深度(0 = off;上限 3 / DFlash2 7)
+    /// 投机深度(0 = off;结构上限 7)
     pub depth: usize,
     /// 草稿族(auto/mtp/dflash2;显式选择见 `SpecDraft`)
     pub family: owl_shared::config::SpecDraft,
@@ -692,6 +699,20 @@ pub struct DraftCfg {
     pub mtp_dir: Option<std::path::PathBuf>,
     /// 草稿池 KV 存储(None = f16;Fp8E4M3 = 偷显存档,原 draft_kv_fp8 布尔)
     pub kv_quant: owl_models::env::KvQuant,
+    /// MTP 草稿注意力滑动窗口(tok;0 = 关;仅 MTP)
+    pub mtp_window: usize,
+    /// MTP 草稿注意力 sink(tok;最老前缀;仅 window>0 生效)
+    pub mtp_sink: usize,
+    /// 窗口生效的最小绝对 ctx(tok;0 = 不设额外门槛)
+    pub mtp_window_min_ctx: usize,
+    /// 自适应 depth（仅 MTP；两档图族 boot 期预捕获）
+    pub adaptive_depth: bool,
+    /// 自适应档下限 depth
+    pub depth_min: usize,
+    /// 切档 ctx 阈值（pos >= 阈值用下限）
+    pub depth_switch_ctx: usize,
+    /// T1b 滚动降档门（tokens/round）
+    pub adaptive_min_tpr: f32,
     /// verify taps 退回 last_hidden(排查开关)
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
@@ -710,6 +731,13 @@ impl Default for DraftCfg {
             dflash2_dir: None,
             mtp_dir: None,
             kv_quant: owl_models::env::KvQuant::None,
+            mtp_window: 0,
+            mtp_sink: 64,
+            mtp_window_min_ctx: 0,
+            adaptive_depth: false,
+            depth_min: 3,
+            depth_switch_ctx: 49152,
+            adaptive_min_tpr: 3.0,
             notaps: false,
             tapdecl: false,
         }
@@ -1258,10 +1286,20 @@ pub(crate) fn into_running<D: DeviceClient>(
     })
 }
 
-/// **图族 face 数**(spec depth → 句柄数):fold/propose 桶形图各需 depth×2 个
-/// 独立 face,再加 2 个常驻面。单源 —— 原来这算式内联在装配点。
-fn fleet_faces(depth: usize) -> usize {
-    2 * depth.max(1) + 2
+/// **图族 face 数**(spec depth 列表 → 句柄数)。
+///
+/// 每个 active depth 需要 fold(depth 张)+ propose(depth+1 张) + verify(1 张)；
+/// 自适应档两档 = 各自的 fold/propose + 两张 verify。另加 DFlash2 单图 1 张。
+/// 第一张 verify 用 `vface`，其余从本预算里领 ⇒ 预算只算**额外** verify。
+fn fleet_faces(depths: &[usize]) -> usize {
+    let mut n = 1; // DFlash2 propose 单图（非 DFlash2 档留空）
+    for (i, &d) in depths.iter().enumerate() {
+        n += d.max(1) + (d + 1);
+        if i > 0 {
+            n += 1; // 额外 depth 的 verify face
+        }
+    }
+    n
 }
 
 /// **rank 束**(S4 ⑤-K2/K3):一个 rank 的**全部**状态 —— 模型件 + 执行环境 +
@@ -1538,7 +1576,7 @@ fn boot_post_check<D: DeviceClient>(
     // 注:`dflash_tap_count > 0` ⟺ (DFlash2 模式 && !notaps)。
     if spec.mode == SpecMode::DFlash2
         && spec.dflash_tap_count > 0
-        && graphs.verify.is_none()
+        && graphs.verify_of(spec.depth).is_none()
     {
         return Err(owl_iface::contract::ModelError::Msg(
             "DFlash2 spec 需要 verify 图(taps 输出),但本档未建图\
@@ -1646,6 +1684,13 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             spec: &rm.spec,
             dumb: cfg.knobs.draft.dumb,
             draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
+            mtp_window: cfg.knobs.draft.mtp_window,
+            mtp_sink: cfg.knobs.draft.mtp_sink,
+            mtp_window_min_ctx: cfg.knobs.draft.mtp_window_min_ctx,
+            adaptive_depth: cfg.knobs.draft.adaptive_depth,
+            depth_min: cfg.knobs.draft.depth_min,
+            depth_switch_ctx: cfg.knobs.draft.depth_switch_ctx,
+            adaptive_min_tpr: cfg.knobs.draft.adaptive_min_tpr,
             // 草稿共享的 target 事实(GGUF 草稿声明校验 + 码本行数)
             target: owl_models::formats::gguf::TargetFacts {
                 vocab: rm.spec.vocab,
@@ -1837,6 +1882,37 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             StatePool::alloc(&mut face, dims, &rm.spec.layer_types, &plan).await?
         };
 
+        // **MTP window 的 v2 依赖门**(2026-10-21):window 只改 draft 读，
+        // 但必须走 v2 伪序列（decode T=1 / extend 多行 / chain）；缺
+        // `attn_v2_scratch` 或 `verify_attn_v2_scratch` 就会落 full lens
+        // 的 chunked 语义，window 表会静默错位 ⇒ boot 拒，不自动回退。
+        if spec.mtp_window.active() {
+            if pool.attn_v2_scratch().is_none()
+                || pool.verify_attn_v2_scratch().is_none()
+            {
+                return Err(owl_iface::contract::ModelError::Msg(
+                    "[spec] mtp_window > 0 需要 v2 注意力 scratch（attn_v2 + verify_attn_v2）；\
+                     当前池缺其一，window 读会落 chunked/full lens 语义 ⇒ 拒启"
+                        .into(),
+                ));
+            }
+            let page = pool.geom.page.max(1);
+            let sink_eff = spec.mtp_window.sink.div_ceil(page) * page;
+            let window_eff = spec.mtp_window.window.div_ceil(page) * page;
+            owl_shared::log_info!(
+                "boot",
+                "MTP window: window={} sink={} min_ctx={} page={} => sink_pages={} window_pages={} (effective sink={} window={})",
+                spec.mtp_window.window,
+                spec.mtp_window.sink,
+                spec.mtp_window.min_ctx,
+                page,
+                sink_eff / page,
+                window_eff / page,
+                sink_eff,
+                window_eff
+            );
+        }
+
         // **锁①:虚拟化档的池容量硬校验**(2026-10-19;响亮拒,不静默落空槽)。
         //
         // 几何一律从**池实况**取(`pool.geom.page`/`pool.geom.nb`),不另算一份。
@@ -1868,8 +1944,9 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // vface + extra_faces(pop 消费桶))
         let vface = face.face_clone();
         // E5-M5:fold/propose 桶形图族的 face 句柄(depth × 2)
+        let depth_candidates = spec.depth_candidates();
         let extra_faces: Vec<DeviceHandle<D>> =
-            (0..fleet_faces(spec.depth)).filter_map(|_| face.face_clone()).collect();
+            (0..fleet_faces(&depth_candidates)).filter_map(|_| face.face_clone()).collect();
         let graphs = GraphFleet::assemble(
             face,
             vface,

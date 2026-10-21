@@ -163,7 +163,7 @@ no_reclaim = false
 # [spec] —— 投机解码
 # ---------------------------------------------------------------------------
 [spec]
-# 深度(0 = 关;上限 3 / DFlash2 7)
+# 深度(0 = 关;结构上限 7)
 depth = 0
 # 草稿检查点目录(空 = 未配;depth>0 时必填)
 draft_path = ""
@@ -171,6 +171,19 @@ draft_path = ""
 dumb = false
 # 草稿池 fp8(关 = bf16)
 draft_kv_fp8 = false
+# MTP 窗口/sink 的全量 schema 缺省(0 = full)。**实际性能值写在具体 MTP 档**
+# (如 qwen38_27b-3090-w4a16-mtp.toml 的 4032/64)，不要在这里做调优。
+mtp_window = 0
+mtp_sink = 64
+# 窗口生效的最小绝对 ctx(0 = 不设额外门槛;短 ctx 保完整历史)
+mtp_window_min_ctx = 0
+# 自适应 depth(仅 MTP;短 ctx 用 depth,长 ctx 回 depth_min)。
+# 两档图族在 boot 期预捕获;缺省关 = 旧档逐字节不变。
+adaptive_depth = false
+depth_min = 3
+depth_switch_ctx = 49152
+# T1b 滚动降档门(tokens/round = m+1;仅 adaptive 生效)
+adaptive_min_tpr = 3.0
 # verify 图 taps 退回 last_hidden(排查开关)
 notaps = false
 # TAPDECL 二分臂(声明期 tapped 不挂输出槽)

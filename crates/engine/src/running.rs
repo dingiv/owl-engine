@@ -2346,12 +2346,12 @@ impl<D: DeviceClient> RunningEngine<D> {
                         }
                         r
                     }
-                    StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew } => {
+                    StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew, depth } => {
                         let saved = self.dev.phase();
                         self.set_phase(owl_models::env::EvalPhase::Spec);
                         owl_shared::timer_start!("engine.phase.spec");
                         let r =
-                            self.execute_spec_round(token, pos, kv_slots, gdn_slot, grew).await;
+                            self.execute_spec_round(token, pos, kv_slots, gdn_slot, grew, depth).await;
                         owl_shared::timer_end!("engine.phase.spec");
                         self.set_phase(saved);
                         r

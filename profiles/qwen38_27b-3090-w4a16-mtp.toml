@@ -1,4 +1,4 @@
-# owl 档 `mtp27b-3090-16k` —— 3090 Ti 单卡 27B AWQ + 检查点自带 MTP 头 / 16k。
+# owl 档 `qwen38_27b-3090-w4a16-mtp` —— 3090 Ti 单卡 27B AWQ + 检查点自带 MTP 头 / 16k。
 extends = ["full.toml"]
 
 [server]
@@ -29,6 +29,13 @@ vram_reserve_mb = 512
 depth = 3
 draft = "mtp"
 draft_kv_fp8 = false
+# Windowed-MTP (Phase 0;2026-10-21): 草稿读 sink=64 + 最近 4032 tok。
+# target verify 仍全上下文；--set spec.mtp_window=0 可回退 full。
+# 实测 64k: MATH decode +8.1% / AL -4.8%；DOCS 56.8k decode +18.5% / AL +18.9%。
+mtp_window = 4032
+mtp_sink = 64
+# 8k d7 实测 window=4032 会伤 AL；<8192 保 full。
+mtp_window_min_ctx = 12288
 
 [kernel]
 kv_fp8 = true

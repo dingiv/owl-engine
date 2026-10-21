@@ -219,6 +219,14 @@ pub(crate) struct TurnSpecState {
     pub(crate) bare_seed_step: bool,
     /// prefill 末行 hidden(首轮 propose 的 anchor_hidden;消费后置 None)
     pub(crate) spec_seed_hidden: Option<Bytes>,
+    /// 自适应 depth:本 turn 已观察的 spec 轮数/产出 token 数（滚动账；
+    /// 只服务 MTP adaptive，不与 B4 的 `recent_*` 混用）。
+    pub(crate) adaptive_rounds: u32,
+    pub(crate) adaptive_tokens: u32,
+    /// 自适应 depth:已决定降档（只降不升，避免抖动）。
+    pub(crate) adaptive_downshift: bool,
+    /// 连续低于门的观察窗数（2 窗才降，避免 16k 冷启动瞬态误切）。
+    pub(crate) adaptive_low_windows: u8,
 }
 
 /// 播种采样数(盈亏线分母;见 [`TurnSpecState::bare_seed_left`])。
