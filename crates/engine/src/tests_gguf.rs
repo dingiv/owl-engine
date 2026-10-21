@@ -30,6 +30,21 @@ use owl_shared::testkit::{resource, resource_ok};
 ///   ⇒ 比的是**两个不同的输入**(2026-10-19 实测:模板态首 token = ` thinking`,
 ///   裸态 = `" Paris"`,两边都"连贯"但根本不是同一道题)。
 /// - `sampler_enabled = false`:贪心(恒等门口径);temp=0 的对手也是 argmax。
+/// **测试侧 GGUF 臂集**(2026-10-21):引擎已零 env —— 本文件把 `OWL_GGUF_*`
+/// 当**用例入参**读一次,显式落到 `EngineKnobs.env.gguf`(语义与原 env 逐字一致:
+/// 未设 = 开,`=0` = 关)。A/B 探针因此仍能在同进程逐臂切换。
+fn gguf_arms_from_env() -> owl_models::env::GgufEnv {
+    let flag = |k: &str| !matches!(std::env::var(k).ok().as_deref(), Some("0"));
+    owl_models::env::GgufEnv {
+        tile: flag("OWL_GGUF_TILE"),
+        cublas: flag("OWL_GGUF_CUBLAS"),
+        mmq2: flag("OWL_GGUF_MMQ2"),
+        mmq: flag("OWL_GGUF_MMQ"),
+        smem: flag("OWL_GGUF_SMEM"),
+        cublas_tile: std::env::var("OWL_GGUF_CUBLAS_TILE").ok().and_then(|s| s.parse().ok()),
+    }
+}
+
 fn gguf_cfg(ordinal: usize, max_seq: usize, pool_tokens: usize, gdn_slots: usize) -> EngineConfig {
     let mut knobs = EngineKnobs { sampler_enabled: false, raw_completion: true, ..Default::default() };
     knobs.pool_tokens = Some(pool_tokens);
@@ -37,6 +52,8 @@ fn gguf_cfg(ordinal: usize, max_seq: usize, pool_tokens: usize, gdn_slots: usize
     knobs.host_cache_mb = 32;
     knobs.snap_host_mb = 0;
     knobs.snap_max = 0;
+    // 臂集 = env 入参(测试例外);生产由 `[dispatch] gguf_*` 给
+    knobs.env.gguf = gguf_arms_from_env();
     EngineConfig { device_ordinal: ordinal, max_seq_tokens: max_seq, prefill_chunk: 128, knobs }
 }
 
@@ -160,7 +177,6 @@ async fn smoke_scenario(key: &str, n_layers: usize, n_gdn: usize, want_first: &s
     // 装载 + 图捕获 + decode 是三条不同的分配路径(权重槽/图 slab/scratch),
     // 只有全走一遍才谈得上"全量记名"。
     if let Some(f) = running.face_clone() {
-        use owl_iface::contract::DeviceClient as _;
         let rep = f.client().ledger_report(8).await.expect("ledger_report");
         assert!(
             !rep.contains("(未命名!)"),
@@ -691,6 +707,7 @@ async fn gpu_gguf_prefill_single() {
     let ord = owl_cuda::test_device_ordinal();
     let mut cfg = gguf_cfg(ord, 8192, 8192, 1);
     cfg.prefill_chunk = chunk;
+    eprintln!("[gguf-prefill-single] 臂集 = {:?}", cfg.knobs.env.gguf);
     let mut engine = Engine::new(cfg).expect("引擎");
     let loaded = engine.loader().load_gguf(&path).await.expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");

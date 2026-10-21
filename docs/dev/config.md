@@ -23,28 +23,44 @@
 
 ```bash
 cp profiles/tp27b-3080-184k.toml ~/my-27b.toml
-$EDITOR ~/my-27b.toml          # 改 model.dir / runtime.bind / tp_ordinals
+$EDITOR ~/my-27b.toml          # 改 model.path / server.bind / [parallel] 卡位
 ./target/release/server -p ~/my-27b.toml
 ```
 
-`profiles/` 下全部是可直接用的**完整档**。历史 `legacy/` 目录已于
-2026-10-21 删除,`tp27b-3080-262k.toml`(引用已退役的顶层 `kv_fp8`)一并删除。
+`profiles/full.toml` 是**唯一全量档**(全部键 + 注释);其余档都用
+`extends = ["full.toml"]` 只写差异(见 §1.1)。
 
-## 1.1 配置档必须**全字段显式**（2026-10-21 裁决）
+历史 `legacy/` 目录已于 2026-10-21 删除。
 
-- 用 `-p <profile>` 给的档，**每一个键都必须在文件里写出来**；缺一个 ⇒ **拒启**
-  （错误里一次列出全部缺项）。代码缺省不再兜底 —— 旧行为让各会话跑在
-  "半份配置 + 旧缺省"上（4k / F16 KV / 无投机 / 无图），启动点不可复现。
-- 站点层（位置参数 / `--site`）与 CLI（`--set`）仍是**覆盖层**：它们只覆写，
-  不负责补全。
-- 生成完整档的最快方式：
+## 1.1 全字段显式 + `extends`（2026-10-21 裁决）
 
-  ```bash
-  server -p <旧档> --print-config > <新档>.toml
+- 用 `-p <profile>` 给的档，**合并 `extends` 之后**每个键都必须有值；缺一个 ⇒
+  **拒启**（一次列出全部缺项）。代码缺省不兜底 —— 旧行为让各会话跑在
+  "半份配置 + 旧缺省"上，启动点不可复现。
+- **继承**写在**根键**：
+
+  ```toml
+  extends = ["full.toml"]                 # 相对本文件;也接受绝对路径
+  extends = ["base.toml", "site.toml"]    # 数组:按序覆盖,后者胜
+  extends = "full.toml"                   # 单串也认
   ```
 
-- 卡位**必须显式**：`runtime.tp_ordinals = [a, b]`（TP 双卡）或
-  `[runtime.device] bdf/uuid/find_name`（单卡）。不再自动挑"任意空闲卡"。
+  被继承文件的**全部字段**先落地（可递归，带环检测/深度上限），本文件覆盖之；
+  于是子档只需写"与 base 不同的项"。**完整性按合并结果判**（父辈字段算数）。
+- 站点层（位置参数 / `--site`）与 CLI（`--set`）仍是**覆盖层**：只覆写，不补全。
+- 生成全量档：`server -p <档> --print-config > <新档>.toml`
+  （该路径**放行半份档** —— 它就是迁移工具）。
+- **卡位唯一真源 = `[parallel]`**：
+
+  ```toml
+  [parallel]
+  mode = "single"                       # single | tensor | layer(暂未支持)
+  device = ["41:00.0", "GPU-…"]         # BDF / UUID / 名字子串;"3090" 亦可
+  ```
+
+  - 空列表 = 自动挑空闲卡（single 1 张 / tensor 2 张）；
+  - 列表按**去重消费**：`["3090","3090"]` = 两张不同的 3090；
+  - **禁 CUDA 序号**（0/1/… 这种数字会被拒；4 位型号名如 3090 是名字）。
 
 ## 2. 层序(后面的覆盖前面的)
 
@@ -107,7 +123,7 @@ reuse       = "off"               # off | session | global;不写 = goal 决定
 | `goal=low-memory` | kvmem overcommit、复用 global、小激活面 |
 | `context=N` | `max_seq=N`;非超卖档 `pool_tokens=N` |
 | `context="max"` | 内存模型求解(§4) |
-| `concurrency=C` | `gdn_slots=C`、`server.max_concurrency=C`、`max_batch=min(C,8)` |
+| `concurrency=C` | `gdn_slots=C`、`runtime.max_concurrency=C`、`max_batch=min(C,8)` |
 | `spec=dflash` | `depth=7` + 草稿目录必填 + 草稿池 20KiB/token 进内存账 |
 | `kv=fp8/f16` | `dispatch.kv_fp8` |
 | `kvmem=off` | 选择层/索引/超卖四键全关 + 宿主/磁盘腿清零 |
@@ -155,14 +171,14 @@ max_seq      = usable / per_tok(向下取 4k)
 
 ```toml
 [site]
-model_dir = "/…/Qwen3.8-27B-AWQ-INT4"
-draft_dir = "/…/Qwen3.8-27B-DFlash2-W4A16"   # spec=dflash 时必填
-bind      = "127.0.0.1:8139"
-device    = { bdf = "42:00.0" }              # 或 uuid / find_name
+model_dir = "/…/Qwen3.8-27B-AWQ-INT4"          # → [model] path
+draft_dir = "/…/Qwen3.8-27B-DFlash2-W4A16"     # → [spec] draft_path
+bind      = "127.0.0.1:8139"                   # → [server] bind
+device    = "42:00.0"                          # → [parallel] device = ["42:00.0"]
 ```
 
-也接受普通配置表(`testdata/args/base.toml`:直接写 `[model].dir`/`[runtime].bind`)。
-卡位纪律不变:**用 BDF/UUID,不用 CUDA 数字序**。
+也接受普通配置表(直接写 `[model].path` / `[server].bind` / `[parallel].device`)。
+卡位纪律不变:**用 BDF/UUID/名字,不用 CUDA 数字序**。
 
 ## 6. 常用命令
 
@@ -178,7 +194,7 @@ server -p profiles/… --site … --print-config --format json | jq '.provenance
 server -p profiles/… --site … --explain runtime.max_seq
 
 # 临时覆盖(替代启动脚本的 extends 拼档;可重复)
-server -p profiles/… --site … --set runtime.max_seq=65536 --set runtime.device.bdf=41:00.0
+server -p profiles/… --site … --set runtime.max_seq=65536 --set 'parallel.device=["41:00.0"]'
 
 # 查看源码里的常用档
 ls profiles/
@@ -189,8 +205,8 @@ ls profiles/
 
 ## 7. 加新档
 
-1. **复制 `profiles/` 里最接近的档**到任意路径,再改:优先意图键,
-   必要的低层键作覆盖;
+1. **新建一个只写差异的档**:`extends = ["full.toml"]` + 要改的键
+   (或复制 `profiles/` 里最接近的档再改);
 2. 先 `--check`(无 GPU 也能跑),看清派生值与内存账;
 3. 真机 boot 后对照 `[vram-gov]` 与 `--print-config` 的估算;偏差大时先查
    `live`(权重是否换了家族)/ `fixed_after`(并发/快照);
@@ -214,13 +230,17 @@ ls profiles/
 
 ## 8. 兼容与挂账
 
-- **低层档(`profiles/awq27b.toml`、`spec-dflash.toml`)/ testdata 原样可跑**(无 `[intent]` ⇒ 解析器不介入);
+- **`profiles/` 全部档 = `extends = ["full.toml"]` + 差异**(无 `[intent]` ⇒ 派生器不介入);
+- **schema v2(2026-10-21)退役键**会给迁移提示:`[dispatch]`→`[kernel]`、
+  `[agent]` 解散、`[graph] no_graph`→`[cuda] graph`、`model.kind/dir`→`model.format/path`、
+  `model.dflash2_dir`→`spec.draft_path`、`runtime.tp_*`/`device*`→`[parallel]`、
+  `server.max_concurrency`→`runtime.max_concurrency`;
 - `OWL_MAX_SEQ` / `OWL_PREFILL_CHUNK` **已删除**(2026-10-20):它们会在
   意图派生后再改一次,造成 `max_seq` 与 `pool_tokens` 双源。临时调压请
   `--set runtime.max_seq=…`(池会跟随,除非显式给 `pool.pool_tokens`)。
-- **allowed_ops 已退役**(2026-10-20):配置按 `model.kind/quant/head_quant`、
-  `dispatch.kv_fp8`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生
-  tag filter;`[dispatch] tag_wildcard = true` 是诊断 `*` 逃生门。
+- **allowed_ops 已退役**(2026-10-20):配置按 `model.format/quant/head_quant`、
+  `kernel.kv_fp8`、`spec.depth`、`model.vision`、`parallel.mode` 自动派生
+  tag filter;`[kernel] tag_wildcard = true` 是诊断 `*` 逃生门。
 - **P2 未做**:旧档迁移器、`context=max` 校准探测、长跑泄漏余量曲线。
 - 配置层 `deny_unknown_fields` 仍全 module 生效;退役键有专门迁移提示。
 - 测试链(`#[owl_test]` / `OWL_TEST_CONF`)不变:同一 loader;

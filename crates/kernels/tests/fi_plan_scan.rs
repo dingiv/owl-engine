@@ -94,8 +94,10 @@ fn scan_plan_shape() {
     let mut res = TestRes::new(dev);
     println!("mode,t,ctx,nb_pages,padded,cta_tile_q,split,int_bytes");
     for graph in [0u32, 1u32] {
-        // C++ / Rust 两侧都是逐次 getenv（无 OnceLock）⇒ 逐档切档有效
-        std::env::set_var("FI_CUDA_GRAPH", if graph == 1 { "1" } else { "0" });
+        // 两侧同一次写点:C++ 读 env、Rust 读显式模式(2026-10-21 起不读 env)
+        let mode = graph == 1;
+        std::env::set_var("FI_CUDA_GRAPH", if mode { "1" } else { "0" });
+        owl_kernels::server::flashinfer::set_plan_mode(mode);
         for t in [1usize, 4, 8, 64] {
             for ctx in ladder() {
                 let (padded, cta, split, ib) = plan_one(&mut res, t, ctx);

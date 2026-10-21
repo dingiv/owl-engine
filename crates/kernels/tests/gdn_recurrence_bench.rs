@@ -70,6 +70,7 @@ impl TestRes {
         }
     }
     /// 块内**指定字节偏移**写入(表类块只初始化要读的行)
+    #[allow(dead_code)] // bench 复用样板:部分 runner 不走上传口
     fn up_at(&mut self, id: u64, off: usize, src: &[u8]) {
         let stream = self.stream.clone();
         let mut tmp = unsafe { stream.alloc::<u8>(src.len()) }.expect("tmp alloc");
@@ -202,6 +203,7 @@ impl DeviceRes for TestRes {
 // §1 输入(27B 生产形状:nv=48 / nk=16 / kd=vd=128)
 // ============================================================================
 
+#[allow(dead_code)] // 全量档形状(nv=48/nk=16;TP1)留档,台子默认跟生产
 const NK: usize = 16;
 #[allow(dead_code)]
 const NV: usize = 48;

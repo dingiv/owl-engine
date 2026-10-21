@@ -3,6 +3,8 @@
 >
 # W4A8 safetensors × prefill 桶 A/B（2026-10-21）
 
+> ⚠️ **2026-10-21 存证说明**:本卷引用的 `profiles/legacy/*` 已随「配置档全字段显式」裁决删除;数字与命令保持原样(当时现场),复跑请用 `profiles/` 下同名生产档。
+
 > 目的：判断 W4A8 主场景下 prefill CUDA Graph（`prefill_bucket`）是否值得保留。
 > 工作树：`perf-review @ main@23116c7`；单张 RTX 3090 Ti（42:00.0）。
 > 模型：`cyankiwi/Qwen3.8-27B-AWQ-INT4`，`model.quant = "w4a8"`。

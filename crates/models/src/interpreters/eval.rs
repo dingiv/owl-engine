@@ -76,28 +76,11 @@ fn perf_cnt(tag: &str, n: u64) {
     owl_shared::metrics::with_metrics_store(|s| s.counter_add(tag, n, file!(), line!()));
 }
 
-/// 块池预算(字节;**0 / 缺省 = 关**)。P1″ 2026-10-14。
+/// 块池预算 / 回收开关的**唯一来源** = `EnvProvider.interp`(2026-10-21
+/// 配置收编:原 `OWL_BLOCK_POOL` / `OWL_NO_RECLAIM` env 已退场)。
 ///
-/// `OWL_NO_RECLAIM=1` ⇒ 关掉活性中途回收(诊断/对照臂)。
-///
-/// **OnceLock 记忆化**(2026-10-17 审查):原为每个 `eval_ops` 现场
-/// `std::env::var`(取进程 env 锁 + 分配 String;求值入口 = 逐算子),而本文件
-/// 的兄弟旋钮(`block_pool_budget`)早有 OnceLock 先例 ⇒ 口径归位。语义:该旋钮
-/// **boot 期定谳**(进程内改 env 不再生效;诊断档本就如此用)。
-fn no_reclaim() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // env **单一访问口**(2026-10-17 审查 §六轮:原先直读 `std::env::var_os`,
-    // 绕过 `env_reader` —— 与 J1/J4 的收口纪律相悖,且测试面的 EnvGuard 不再生效)
-    *V.get_or_init(|| owl_shared::env_reader::flag("OWL_NO_RECLAIM"))
-}
-
-/// 门 = env `OWL_BLOCK_POOL`(与本文件的 `OWL_NO_RECLAIM` 同一「诊断/调优门」
-/// 先例),**`OnceLock` 缓存一次** ⇒ 热路径零 env 查询。
-/// 引擎侧后续应升格为 `OwlConfig` 键(本 lane 文件面不含 engine/,见报告)。
-fn block_pool_budget() -> usize {
-    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| owl_shared::env_reader::parse::<usize>("OWL_BLOCK_POOL").unwrap_or(0))
-}
+/// 两个旋钮都在**入口一次性定谳**(`[pool] block_pool_bytes / no_reclaim`)
+/// —— 解释器不再有任何 env 读取,热路径零查询。
 
 /// 分段秒表(`Call` 臂宿主链分段:resolve/build/alloc/lower/launch)
 struct LapTimer {
@@ -272,7 +255,7 @@ pub fn eval_ops_scoped_env<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
-    eval_ops_scoped_env_pool(t, face, env, tp, block_pool_budget())
+    eval_ops_scoped_env_pool(t, face, env, tp, env.interp.block_pool_bytes)
 }
 
 /// scoped 求值 + **显式块池预算**(0 = 关;P1″)。
@@ -294,7 +277,7 @@ where
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: count_pending(t), reclaim: !no_reclaim(), perf, env,
+                pending: count_pending(t), reclaim: !env.interp.no_reclaim, perf, env,
                 pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
             tp: tp.cloned(),
         };
@@ -426,7 +409,7 @@ where
         // `pending` 恒多算 ⇒ 中途活性回收整体失效(真回收 14/新块 1431 实测)。
         let pending = count_pending_multi(roots);
         let perf = PerfCtx::of(&env);
-        let pool_budget = block_pool_budget();
+        let pool_budget = env.interp.block_pool_bytes;
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
@@ -457,11 +440,11 @@ where
             }
         }
         ctx.flush_pool().await?;
-        // **活性收尾归因**(门:`OWL_LIVE_DIAG`;2026-10-19):
+        // **活性收尾归因**(门:`[probes] live_diag`;原 OWL_LIVE_DIAG;2026-10-19):
         // "真回收几乎为 0"时唯一要问的 = **memo 里还剩什么、靠什么吊着**:
         // 节点的 `pending`(预波消费者计数未归零)还是块的 `users`(别名/持有者)。
         // 打印前 6 大残块的 (bytes, users, pending, name) + 直方图 ⇒ 一眼定位。
-        if std::env::var_os("OWL_LIVE_DIAG").is_some() {
+        if ctx.env.diag.live_diag {
             let mut hist = [0usize; 4]; // pending==0 / ==1 / ==2 / >=3
             let mut users_hist = [0usize; 4];
             let mut live_bytes = 0usize;

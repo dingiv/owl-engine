@@ -1229,7 +1229,7 @@ mod edge_tests {
         l.chunk_pages = 32;
         let s = store(4, 0, 0); // 只剩 4 页，但超卖只看工作集
         let t = gen(1, 10, 200_000, 2_000_000);
-        let mut a = Admission::new();
+        let a = Admission::new();
         assert_eq!(a.cap_for(&l, &s, &t), 2_000_000, "超卖不夹生成");
         assert_eq!(a.capacity(&l, &s, &[], &t).n_mem, 0, "但设备侧仍按工作集算不进来");
     }

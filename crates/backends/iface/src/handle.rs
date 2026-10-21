@@ -963,7 +963,7 @@ impl<D: DeviceClient> DeviceHandle<D> {
                             "free: 幽灵归还 —— 账上无 id={id} 的在借登记(双 free 或未登记)"
                         )))
                     }
-                    Some((rank, true)) => {
+                    Some((_rank, true)) => {
                         return Err(ModelError::Msg(format!(
                             "free: 双 free —— id={id} 已在复用池(pooled)里,不能重复归还"
                         )))

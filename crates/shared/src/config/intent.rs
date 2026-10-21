@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{HeadQuant, ModelKind, QuantScheme};
+use super::{HeadQuant, ModelFormat, QuantScheme};
 
 // ============================================================================
 // §1 意图 schema
@@ -286,7 +286,7 @@ pub struct DraftGeom {
 pub struct ModelProfile {
     pub key: &'static str,
     pub aliases: &'static [&'static str],
-    pub kind: ModelKind,
+    pub format: ModelFormat,
     pub quant: QuantScheme,
     pub head_quant: HeadQuant,
     pub geom: ModelGeom,
@@ -341,7 +341,7 @@ impl ModelProfile {
 pub const QWEN38_27B_AWQ: ModelProfile = ModelProfile {
     key: "qwen3.8-27b-awq",
     aliases: &["27b-awq", "awq27b", "qwen3.8-27b"],
-    kind: ModelKind::Awq27b,
+    format: ModelFormat::Awq,
     quant: QuantScheme::W4a16,
     head_quant: HeadQuant::RtnInt4G32,
     geom: ModelGeom {
@@ -377,7 +377,7 @@ pub const QWEN38_27B_AWQ: ModelProfile = ModelProfile {
 pub const QWEN35_08B: ModelProfile = ModelProfile {
     key: "qwen3.5-0.8b",
     aliases: &["0.8b", "dev-08b"],
-    kind: ModelKind::Qwen35_08b,
+    format: ModelFormat::Safetensors,
     quant: QuantScheme::W4a16,
     head_quant: HeadQuant::Off,
     geom: ModelGeom {
@@ -452,9 +452,9 @@ pub const RTX_3080_20G: HardwareProfile = HardwareProfile {
 
 pub const HARDWARE: &[HardwareProfile] = &[RTX_3090TI_24G, RTX_3080_20G];
 
-/// 按 `[model].kind` 找注册表档(几何校验用;头部量化不同不影响几何)
-pub fn model_by_kind(kind: ModelKind) -> Option<&'static ModelProfile> {
-    MODELS.iter().find(|p| p.kind == kind)
+/// 按 `[model].format` 找注册表档(几何校验用;头部量化不同不影响几何)
+pub fn model_by_format(format: ModelFormat) -> Option<&'static ModelProfile> {
+    MODELS.iter().find(|p| p.format == format)
 }
 
 /// 硬件键 → 档(未命中 = Err 带清单)

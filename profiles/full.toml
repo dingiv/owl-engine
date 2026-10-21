@@ -1,0 +1,343 @@
+# ============================================================================
+# owl 全量配置模板(`full.toml`)
+# ============================================================================
+#
+# 本文件是**唯一全量档**:所有键都显式写出(缺一个就拒启 —— 启动点可复现)。
+# 其它档用顶部 `extends` 继承它,只写自己的差异:
+#
+#   extends = ["full.toml"]        # 相对本文件;也可写绝对路径;数组按序覆盖
+#   [model]
+#   path = "/path/to/checkpoint"
+#   [parallel]
+#   mode = "tensor"
+#   device = ["3090", "3090"]      # BDF / UUID / 名字子串(禁 CUDA 序号)
+#
+# 生成/校验:
+#   server -p profiles/full.toml --check
+#   server -p profiles/full.toml --print-config   # 生效值(+ 来源)
+#
+# 本文件里的值 = **一个可跑的单卡 27B AWQ 配置**(3090 Ti 24G / 128k);
+# 复制出去改站点事实即可(改完记得 `--check`)。
+# ============================================================================
+
+# 继承列表:按序覆盖(后者胜);相对路径 = 相对**声明它的这个文件**。
+extends = []
+
+# ---------------------------------------------------------------------------
+# [server] —— HTTP 服务面(监听 / 模板 / 工具解析)
+# ---------------------------------------------------------------------------
+[server]
+bind = "127.0.0.1:8137"
+# 模板路径覆盖:空 = 用模型快照 `<model.path>/chat_template.jinja`;
+# 相对路径 = 相对模型目录。
+template_path = ""
+# 工具三通道解析(关 = 工具文本原样进 content —— 诊断臂)
+parse_tool_calls = true
+# 工具格式(必须与模板同值):xml | json
+tool_call_format = "xml"
+# 有工具即关思考(模板同名变量)
+auto_disable_thinking_with_tools = false
+# 思考档位缺省(OpenAI 同名协议值;请求带 reasoning_effort 时以请求为准)
+reasoning_effort = ""
+
+# ---------------------------------------------------------------------------
+# [runtime] —— 引擎运行时(上下文 / 调度 / 准入 / 会话缺省)
+# ---------------------------------------------------------------------------
+[runtime]
+# 自动挑卡的空闲显存阈值(0..1;低于它就跳过该卡)
+gpu_min_free_ratio = 0.9
+# 并发闸门:在跑 + 排队上限;须 ≤ pool.gdn_slots(每会话一格 GDN 状态)
+max_concurrency = 1
+# 隐式默认会话(请求不带 session 时落到会话 0;false = 每请求临时会话)
+implicit_session = false
+# 未带 max_tokens 时的生成步数 / 夹紧上限
+default_max_new = 4096
+max_new_cap = 8192
+# 排队超时(毫秒;0 = 关)
+queue_wait_ms = 0
+# 上下文上限(token)
+max_seq = 131072
+# 预填块长 / 尾块合并阈值(剩余 ≤ chunk + tail_merge ⇒ 一口气吃完)
+prefill_chunk = 512
+prefill_tail_merge = 512
+# 跨会话合批上限(1 = 串行;>1 需 gdn_slots ≥ 它、单卡、无选择层)
+max_batch = 1
+# 相位时间片:每 slice_every 拍 decode 插一片 prefill(0 = 关)
+slice_every = 0
+slice_tokens = 0
+# 准入:给未来新人的预留 token / 在位者最小生成量 / 池保留页 / 队列上限
+newcomer_min_tokens = 4096
+min_gen_tokens = 256
+reserve_pages = 0
+max_queue = 0
+
+# ---------------------------------------------------------------------------
+# [parallel] —— 并行与卡位(唯一真源)
+# ---------------------------------------------------------------------------
+[parallel]
+# single | tensor(TP2) | layer(暂未支持 = 拒启)
+mode = "single"
+# 卡位:每项 = BDF("41:00.0")/ UUID("GPU-…")/ 名字子串("3090");
+# **禁 CUDA 序号**(序会漂)。空 = 自动挑空闲卡(single 1 张 / tensor 2 张);
+# 按列表序去重消费:["3090","3090"] = 两张不同的 3090。
+device = []
+# TP 通信数据腿:push(写对端)档(需 mode = tensor)
+tp_push = false
+# TP AR 载荷 fp8(两侧同档)
+tp_ar_f8 = false
+# lm_head 词表切(每 rank 只持半表;需 mode = tensor)
+tp_vocab_split = false
+# v1 两核融合档(AR 一核做完两段;需 mode = tensor)
+tp_ar_fused = false
+# 1-stage 对称 arena(结构更对但实测中性;需 mode = tensor,与 tp_push 互斥)
+tp_one_stage = false
+
+# ---------------------------------------------------------------------------
+# [model] —— 模型资产
+# ---------------------------------------------------------------------------
+[model]
+# 对外模型名(空 = GGUF 用文件名 / 其它用服务端缺省)
+name = "qwen3.8-27b"
+# 模型路径:目录(safetensors / awq)或 .gguf 单文件
+path = "../codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+# 权重摆放格式:safetensors | awq | gguf
+format = "awq"
+# 主干量化方案:
+#   safetensors/awq → w4a16 | w4a8 | w8a8i(暂未支持) | w8a8f(暂未支持)
+#   gguf            → q4k | iq4 | iq3
+quant = "w4a16"
+# lm_head 量化:off | rtn-int4-g32 | rtn-int8-row
+head_quant = "rtn-int4-g32"
+# 视觉塔(纯文本档勿开);vision_path 空 = 用检查点内置 model.visual.*
+vision = false
+vision_path = ""
+
+[model.rope]
+# YaRN 外推(1.0 = 关;2.0 → 524k,4.0 → 1M);只对 GGUF 档生效
+yarn_factor = 1.0
+# 0 = 用模型自带 context_length
+original_max = 0
+beta_fast = 32.0
+beta_slow = 1.0
+# 额外 attention 乘子(乘在 0.1·ln(factor)+1 上)
+attention_factor = 1.0
+
+# ---------------------------------------------------------------------------
+# [pool] —— 设备池与显存治理
+# ---------------------------------------------------------------------------
+[pool]
+# 设备 KV 池(token;0 / 留空 = 自动 = 2 × 单会话容量)
+pool_tokens = 131072
+# 并发上限(每活跃会话一格 GDN 状态;0 = 自动 = runtime.max_concurrency)
+gdn_slots = 1
+# 末段页对齐(前缀复用闭环;单块档多切一刀)
+prefill_align_tail = true
+# 生成相位页边界快照页步长(0 = 关)
+snap_decode_stride = 1
+# 前缀缓存可占设备池比例(inspector: 0..1)
+prefix_cache_share = 0.5
+# GDN 快照池槽数
+snap_max = 0
+# 宿主 KV 腿 / 快照腿 / 盘层两腿(MiB;0 = 关)
+host_cache_mb = 0
+snap_host_mb = 0
+disk_cache_mb = 0
+snap_disk_mb = 0
+# 盘层目录(给了配额就必须给;必须独占)
+disk_dir = ""
+# 临时块复用池上限(MiB;0 = 不限)
+pool_cap_mb = 256
+# 显存目标占比 / 预留 MiB
+vram_target = 0.99
+vram_reserve_mb = 256
+# 显存硬上限 MiB(留空 = 只按驱动账判)
+vram_budget_mb = 0
+# 前缀缓存开/关
+prefix_cache = false
+# 解释器块池预算(字节;0 = 关)
+block_pool_bytes = 0
+# 关活性中途回收(诊断;开会无界常驻)
+no_reclaim = false
+
+# ---------------------------------------------------------------------------
+# [spec] —— 投机解码
+# ---------------------------------------------------------------------------
+[spec]
+# 深度(0 = 关;上限 3 / DFlash2 7)
+depth = 0
+# 草稿检查点目录(空 = 未配;depth>0 时必填)
+draft_path = ""
+# 哑草稿诊断面(无草稿器时)
+dumb = false
+# 草稿池 fp8(关 = bf16)
+draft_kv_fp8 = false
+# verify 图 taps 退回 last_hidden(排查开关)
+notaps = false
+# TAPDECL 二分臂(声明期 tapped 不挂输出槽)
+tapdecl = false
+# TP 档放行投机(未验完的档不许静默放行)
+tp_draft = false
+# m=0 连击降级阈值(0 = 禁用)/ 降级后的探测窗口(tokens)
+degrade_after = 6
+probe_every = 8
+
+# ---------------------------------------------------------------------------
+# [sampling] —— 采样
+# ---------------------------------------------------------------------------
+[sampling]
+# greedy | sampling
+mode = "greedy"
+temp = 1.0
+topk = 20
+topp = 0.95
+rep_penalty = 1.0
+
+# ---------------------------------------------------------------------------
+# [load] —— 装载域(校验 / 观测 / 重排)
+# ---------------------------------------------------------------------------
+[load]
+verify = false
+debug_tap = false
+# 暂存槽上限 MiB(0 = 不设上限)
+staging_mb = 128
+# auto | device | cpu
+repack = "auto"
+dump = false
+
+# ---------------------------------------------------------------------------
+# [kvmem] —— 池虚拟化/选择层
+# ---------------------------------------------------------------------------
+[kvmem]
+select_decode = false
+select_partial = false
+index = false
+workspace_per_req = 2240
+select_sink = 2
+select_recent = 4
+recall_every = 1
+coverage_probe = false
+analyze_at_ctx = 0
+# lru | lrfu | lrfu:0.8
+evict_policy = "lru"
+pool_overcommit = false
+# 每 turn 工作集下限 MiB(留空 = 派生)
+dense_floor_mib = 0
+
+# ---------------------------------------------------------------------------
+# [kernel] —— 算子/臂选择(原 [dispatch])
+# ---------------------------------------------------------------------------
+[kernel]
+qkv_fuse = true
+prefill_split = false
+force_naive_prefill = false
+verify_v2 = false
+# 单图烘 plan(上界恒 = runtime.max_seq;true 需 fi_plan_restore = false + fi_cuda_graph = true)
+fi_plan_bake = true
+fi_plan_restore = false
+fi_cuda_graph = true
+verify_fi = false
+decode_fi = true
+verify_xqa = false
+decode_xqa = false
+xqa_prefill = false
+fi_min_tokens = 1
+gdn_chunked = true
+gdn_scalar = false
+gdn_fused_decode = true
+gdn_fused_decode_v2 = true
+kv_fp8 = true
+# GGUF 预填臂(缺省全开;关 = 回退下一臂)
+gguf_tile = true
+gguf_cublas = true
+gguf_mmq2 = true
+gguf_mmq = true
+gguf_smem = true
+# cuBLAS 臂行窗(留空 = 96 MiB 预算档)
+gguf_cublas_tile = 0
+resolve_trace = false
+host_argmax = false
+ts_probe = false
+tag_wildcard = false
+
+# ---------------------------------------------------------------------------
+# [probes] —— 诊断
+# ---------------------------------------------------------------------------
+[probes]
+step_profile = false
+# off | counters | host | gpu
+perf_level = "host"
+gdn_dump = false
+debug = false
+prefill_cksum = false
+fact_probe = false
+trace_gate = false
+dflash_probe = false
+propose_eager = false
+dflash_eager = false
+dflash_noencode = false
+dflash_dumb = false
+gdn_dump_all = false
+pf_bisect = false
+pf_stages = 0
+pf_fin_check = false
+raw_completion = false
+prompt_dump = false
+gdn_dbg = false
+pf_fence = false
+live_diag = false
+recon_dbg = false
+vram_dbg = false
+idx_dbg = false
+cov_dump = false
+store_hook_dbg = false
+pf_taps = false
+fi_debug = false
+l3_audit = false
+gdn_diag = false
+gdn_touch = ""
+gdn_zero_scratch = ""
+gdn_fresh_scratch = false
+# 单步/粘滞调试门(需 --features stepgate 构建)
+step_gate = "off"
+step_gate_ms = 50
+step_gate_us = 0
+step_gate_every = 1
+kv_dump_at = 0
+
+# ---------------------------------------------------------------------------
+# [cuda] —— 设备面(图 / 同步 / 实例化旗标 / 发射账)
+# ---------------------------------------------------------------------------
+[cuda]
+# 图捕获总闸(false = eager 直发,连 decode/verify/fold/propose 族一起关)
+graph = true
+srv_timing = false
+cap_prof = false
+launch_sync = false
+# 同步点分解掩码(0 = 生产;见 config::sync_bit)
+sync_mask = 0
+launch_time = false
+d2h_prof = false
+gpu_prof = false
+free_legacy = false
+# 捕获 slab 固定档 MiB(留空 = warmup 计量定量)
+capture_slab_mb = 0
+# 发射账容量(0 = 关)
+trace_ring = 0
+
+[cuda.graph_flags]
+# UPLOAD = 0b10(实例化后预热上传)
+upload = false
+# DEVICE_LAUNCH = 0b100(设备侧派发;派发税排查面)
+device_launch = false
+
+# ---------------------------------------------------------------------------
+# [log]
+# ---------------------------------------------------------------------------
+[log]
+# off | error | warn | info | debug | trace
+level = "warn"
+tags_allow = []
+tags_deny = []
+max_mb = 0
+keep = 0
+timestamp = false

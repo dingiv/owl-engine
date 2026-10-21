@@ -126,7 +126,7 @@ fn gpu_ordinal() -> Option<usize> {
 async fn cpu_construct_and_load(cfg: &OwlConfig) {
     let mut engine = Engine::on(
         EngineConfig {
-            device_ordinal: cfg.runtime.device_ordinal.unwrap_or(0),
+            device_ordinal: 0, // CPU face 不看卡位(卡位改由 [parallel] device 表达)
             max_seq_tokens: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             knobs: EngineKnobs::from_config(cfg),
@@ -140,6 +140,7 @@ async fn cpu_construct_and_load(cfg: &OwlConfig) {
 }
 
 /// **状态腿 mock 引擎**(§30 两门共用):snap_max 可调 + 状态腿宿主 64MiB。
+#[cfg(test)] // 只被单元档用例消费(e2e 档不编)
 async fn mock_snap_engine(
     snap_max: usize,
 ) -> RunningEngine<owl_iface::handle::DeviceHandle<owl_cpu::CpuFace>> {
@@ -171,6 +172,7 @@ async fn mock_snap_engine(
 /// **两腿统一调度器门(engine 侧;§30)**:store 的 `plan_need` 出 `Snap{Host}` 票
 /// 之后,engine 的执行臂(`apply_verdict`)真的把设备层快照沉到宿主 ——
 /// 验的是"判据唯一 + 执行闭环",不依赖 capture 的 churn 路径。
+#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
 #[tokio::test]
 async fn idle_node_offloads_device_snapshot_via_store_plan() {
     let mut running = mock_snap_engine(1).await;
@@ -208,6 +210,7 @@ async fn idle_node_offloads_device_snapshot_via_store_plan() {
 ///
 /// 验的是三件:①`plan_capacity` 的第三层出票 ②engine 的执行臂真写文件
 /// (原子 .tmp→rename)③回填把层账改回 Host(内容逐字节一致由 store 侧保证)。
+#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
 #[tokio::test]
 async fn disk_spill_and_fill_roundtrip() {
     let dir = std::env::temp_dir().join(format!("owl-disk-e2e-{}", std::process::id()));
@@ -333,6 +336,7 @@ async fn disk_spill_and_fill_roundtrip() {
 }
 /// **会话感知淘汰门(engine)**:turn 收口把 **KV 链块**与 **GDN 快照**都记到
 /// 会话名下(淘汰时同会话才能"从末端削")。
+#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
 #[tokio::test]
 async fn turn_records_session_ownership_for_kv_and_snaps() {
     let mut running = mock_snap_engine(2).await;
@@ -389,6 +393,7 @@ async fn turn_records_session_ownership_for_kv_and_snaps() {
 
 /// **S6.1 端到端门**:turn 收口写链索引 → 小宿主把链溢写到盘 →
 /// **重启后按索引重建树**(非设备层)→ **同 prompt 命中前缀**(跨重启复用成立)。
+#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
 #[tokio::test]
 async fn disk_chain_index_enables_cross_restart_reuse() {
     let dir = std::env::temp_dir().join(format!("owl-idx-e2e-{}", std::process::id()));
@@ -492,6 +497,7 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
 
 /// **启动回加载门(S6)**:进程重启(新 engine、同目录)后,盘上的内容被
 /// **扫目录回填账**——账先回来(条目可见),内容惰性读回。
+#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
 #[tokio::test]
 async fn disk_adopt_on_boot_restores_ledger() {
     let dir = std::env::temp_dir().join(format!("owl-disk-boot-{}", std::process::id()));
@@ -571,6 +577,7 @@ async fn disk_adopt_on_boot_restores_ledger() {
 /// 构造:store 里先登记 `k_a`(更冷)、后登记 `k_b`;池里故意**反着放**
 /// (先 place `k_b`、后 place `k_a`)⇒ 池内 LRU 会选 `k_b`,store 序第一是 `k_a`。
 /// 新实现必须选 `k_a`;旧实现在此会选 `k_b`。
+#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
 #[tokio::test]
 async fn snapshot_victim_follows_store_order() {
     use crate::state::SnapSlotPick;
@@ -615,7 +622,7 @@ async fn snapshot_victim_follows_store_order() {
 async fn cpu_incremental_decode_multibyte(cfg: &OwlConfig) {
     let mut engine = Engine::on(
         EngineConfig {
-            device_ordinal: cfg.runtime.device_ordinal.unwrap_or(0),
+            device_ordinal: 0, // CPU face 不看卡位(卡位改由 [parallel] device 表达)
             max_seq_tokens: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             knobs: EngineKnobs::from_config(cfg),
@@ -1558,7 +1565,7 @@ pub async fn gpu_08b_chunk_invariance_gate() {
 /// 一次探针跑 = **两个配置文件**描述全部行为面(与生产**同一条加载路**):
 ///
 /// ```text
-/// OWL_PROBE_FLAVOR=<name>    基准档(profiles/legacy/<name>.toml)
+/// OWL_PROBE_FLAVOR=<name>    基准档(profiles/<name>.toml)
 /// OWL_PROBE_OVERLAY=<path>   覆盖文件(可选;同 server 的 [CONFIG] 位置)
 /// ```
 ///
@@ -1573,7 +1580,7 @@ pub async fn gpu_08b_chunk_invariance_gate() {
 fn probe_engine_config(ordinal: usize, default_flavor: &str) -> EngineConfig {
     let flavor = owl_shared::env_reader::str("OWL_PROBE_FLAVOR")
         .unwrap_or_else(|| default_flavor.to_string());
-    let base = owl_shared::profiles::legacy_path(&flavor).expect("预设档路径");
+    let base = owl_shared::profiles::profile_path(&flavor).expect("预设档路径");
     let overlay = owl_shared::env_reader::str("OWL_PROBE_OVERLAY").map(std::path::PathBuf::from);
     let cfg = owl_shared::config::OwlConfig::load(Some(&base), overlay.as_deref())
         .expect("探针配置装载(账外键/非法值 = 拒)");
@@ -4288,6 +4295,7 @@ fn derive_turn_ws_sets_blocks_and_floor_from_one_source() {
 // ===========================================================================
 
 /// 排队中取消:精确命中该 turn,不碰同队其它 turn;重复取消 = None(幂等)。
+#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
 #[tokio::test]
 async fn cancel_queued_turn_is_precise() {
     let mut running = mock_snap_engine(1).await;
@@ -4319,6 +4327,7 @@ async fn cancel_queued_turn_is_precise() {
 }
 
 /// 按会话取消:只命中该会话的 turn(活跃或排队),同批别家不受影响。
+#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
 #[tokio::test]
 async fn cancel_session_targets_only_that_session() {
     let mut running = mock_snap_engine(1).await;
@@ -4352,6 +4361,7 @@ async fn cancel_session_targets_only_that_session() {
 
 /// **P0-2 队列上限**（submit 边界）：在飞总数（活跃 + 排队）达上限 ⇒ 拒，
 /// 且错误串带 `admission:` 前缀（服务面据此翻 429 `no_slot`）。
+#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
 #[tokio::test]
 async fn queue_bound_rejects_at_submit() {
     let mut knobs = EngineKnobs { sampler_enabled: false, ..Default::default() };
@@ -4497,16 +4507,15 @@ pub async fn gpu_vlm_image_baseline() {
             crate::turn::TurnOpts { images: vec![img], ..Default::default() },
         )
         .expect("提交");
-    let mut out = Ok(String::new());
-    loop {
+    let out: Result<String, String> = loop {
         match running.pump().await {
-            Ok(TurnEvent::Completed { turn, text, .. }) if turn == t => break out = Ok(text),
-            Ok(TurnEvent::Failed { turn, err }) if turn == t => break out = Err(err),
-            Ok(TurnEvent::Idle) => break out = Err("队列丢失".into()),
+            Ok(TurnEvent::Completed { turn, text, .. }) if turn == t => break Ok(text),
+            Ok(TurnEvent::Failed { turn, err }) if turn == t => break Err(err),
+            Ok(TurnEvent::Idle) => break Err("队列丢失".into()),
             Ok(_) => {}
-            Err(e) => break out = Err(e.to_string()),
+            Err(e) => break Err(e.to_string()),
         }
-    }
+    };
     match out {
         Ok(text) => {
             eprintln!("[test] VLM 基线文本(16×16 / FI 臂): {text}");
@@ -4538,13 +4547,9 @@ pub async fn gpu_vlm_image_baseline() {
                 crate::turn::TurnOpts { images: vec![small], ..Default::default() },
             )
             .expect("小网格提交");
-        let mut txt = String::new();
-        loop {
+        let txt = loop {
             match running.pump().await {
-                Ok(TurnEvent::Completed { turn, text, .. }) if turn == t1 => {
-                    txt = text;
-                    break;
-                }
+                Ok(TurnEvent::Completed { turn, text, .. }) if turn == t1 => break text,
                 Ok(TurnEvent::Failed { turn, err }) if turn == t1 => {
                     panic!("小网格(4×4)视觉路径失败 —— 应退 native 臂: {err}")
                 }
@@ -4552,7 +4557,7 @@ pub async fn gpu_vlm_image_baseline() {
                 Ok(_) => {}
                 Err(e) => panic!("小网格 pump 失败: {e}"),
             }
-        }
+        };
         eprintln!("[test] VLM 小网格文本(4×4 / native 臂): {txt}");
         assert!(!txt.trim().is_empty(), "小网格路径必须产出文本");
     }
@@ -4636,24 +4641,14 @@ pub async fn gpu_vlm_first_turn_probe(first_image: bool) {
                 crate::turn::TurnOpts { images, ..Default::default() },
             )
             .expect("提交");
-        let mut txt = String::new();
-        loop {
+        let txt = loop {
             match running.pump().await.expect("pump") {
-                TurnEvent::Completed { turn, text, .. } if turn == t => {
-                    txt = text;
-                    break;
-                }
-                TurnEvent::Failed { turn, err } if turn == t => {
-                    txt = format!("<FAILED {err}>");
-                    break;
-                }
-                TurnEvent::Idle => {
-                    txt = "<IDLE>".into();
-                    break;
-                }
+                TurnEvent::Completed { turn, text, .. } if turn == t => break text,
+                TurnEvent::Failed { turn, err } if turn == t => break format!("<FAILED {err}>"),
+                TurnEvent::Idle => break "<IDLE>".to_string(),
                 _ => {}
             }
-        }
+        };
         eprintln!(
             "[f1] 第{idx}轮 {} ⇒ {txt:?}",
             if with_img { "带图" } else { "纯文本" }
@@ -4749,24 +4744,14 @@ pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
                 crate::turn::TurnOpts { images, ..Default::default() },
             )
             .expect("提交");
-        let mut txt = String::new();
-        loop {
+        let txt = loop {
             match running.pump().await.expect("pump") {
-                TurnEvent::Completed { turn, text, .. } if turn == t => {
-                    txt = text;
-                    break;
-                }
-                TurnEvent::Failed { turn, err } if turn == t => {
-                    txt = format!("<FAILED {err}>");
-                    break;
-                }
-                TurnEvent::Idle => {
-                    txt = "<IDLE>".into();
-                    break;
-                }
+                TurnEvent::Completed { turn, text, .. } if turn == t => break text,
+                TurnEvent::Failed { turn, err } if turn == t => break format!("<FAILED {err}>"),
+                TurnEvent::Idle => break "<IDLE>".to_string(),
                 _ => {}
             }
-        }
+        };
         eprintln!(
             "[f1-27b] 第{idx}轮 {} ⇒ {txt:?}",
             if with_img { "带图" } else { "纯文本" }

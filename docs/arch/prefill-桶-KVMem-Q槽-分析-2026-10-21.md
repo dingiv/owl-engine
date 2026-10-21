@@ -3,6 +3,8 @@
 >
 # prefill 桶 × KVMem：Q 槽阻断分析（2026-10-21）
 
+> ⚠️ **2026-10-21 存证说明**:本卷引用的 `profiles/legacy/*` 已随「配置档全字段显式」裁决删除;数字与命令保持原样(当时现场),复跑请用 `profiles/` 下同名生产档。
+
 > 对象：`perf-review @ main@23116c7`，`prefill_plan.rs` / `exec/prefill_chunk.rs`。
 > 结论先行：**KVMem 档的 prefill 桶不是“没配”，是代码里被 `select_decode` 硬旁路；
 > 根因是桶图没有输出选择层需要的 Q 窗。** 桶能捕获、能回放，但 KVMem 下 100% 回 eager。

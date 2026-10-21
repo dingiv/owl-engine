@@ -2,47 +2,86 @@
 
 配置层只有一个概念:**profile = 一份 TOML 配置文件**。没有 "flavor"。
 
-## 规则(2026-10-21)
+## 规则(2026-10-21 · schema v2)
 
-- **全字段显式**:档里每个键都要写;缺一个 ⇒ 拒启(错误列出全部缺项)。
-  代码缺省不再兜底。生成完整档:`server -p <旧档> --print-config > <新档>.toml`。
-- **卡位必须显式**:`runtime.tp_ordinals = [a,b]`(TP)或 `[runtime.device] bdf/uuid/find_name`(单卡)。
+- **`full.toml` = 唯一全量档**:所有键 + 注释。新档一律**继承**它:
+
+  ```toml
+  extends = ["full.toml"]        # 根键;相对本文件;也接受绝对路径
+  # extends = ["a.toml", "b.toml"]   # 数组:按序覆盖,后者胜
+  ```
+
+  被继承文件先全部落地(可递归,带环检测),本文件覆盖之 ⇒ 子档**只写差异**。
+- **完整性按合并结果判**:合并后仍缺键 ⇒ 拒启(一次列出全部缺项)。
+  `--print-config` 是唯一放行半份档的路径(迁移工具)。
+- **卡位只走 `[parallel]`**:
+
+  ```toml
+  [parallel]
+  mode = "single"                    # single | tensor | layer(暂未支持)
+  device = []                        # 空 = 自动挑空闲卡
+  # device = ["41:00.0", "42:00.0"]  # BDF / UUID / 名字子串("3090" 也行)
+  ```
+
+  列表按**去重消费**;`["3090","3090"]` = 两张不同的 3090;**禁 CUDA 序号**。
 - 站点层(`--site`)与 `--set` 仍可覆盖(覆盖层不负责补全)。
 
 ## 用法
 
 ```bash
-# 常用档:复制到任意路径,改 model.dir / runtime.bind / tp_ordinals
-cp profiles/tp27b-3080-184k.toml ~/my-27b.toml
-$EDITOR ~/my-27b.toml
-./target/release/server -p ~/my-27b.toml
+# 新档:最小差异写法
+cat > ~/my-27b.toml <<'EOF'
+extends = ["/abs/path/to/profiles/full.toml"]
+
+[model]
+path = "/data/Qwen3.8-27B-AWQ-INT4"
+
+[parallel]
+mode = "tensor"
+device = ["3090", "3090"]
+EOF
+./target/release/server -p ~/my-27b.toml --check
 ```
 
-`-p/--profile` 只接受**文件路径**,不再做目录名查找;`--flavor` /
+也可以直接复制现成的档再改(它本来就是 `extends` + 差异):
+
+```bash
+cp profiles/tp27b-3080-184k.toml ~/my-27b.toml
+```
+
+`-p/--profile` 只接受**文件路径**,不做目录名查找;`--flavor` /
 `--list-flavors` / `--list-profiles` 已移除。
 
 ## 目录
 
 | 文件 | 说明 |
 |---|---|
-| `awq27b-3090-max.toml` | 3090 Ti 单卡 27B / 128k(意图档) |
-| `awq27b.toml` | 27B 低层档(无 intent;回归/取证与测试用) |
-| `spec-dflash.toml` | 27B + DFlash2 低层档(16k;测试/取证用) |
-| `tp27b-3080-184k.toml` | 2×3080 27B + 视觉 + DFlash2 d7 / 184k(意图档) |
+| `full.toml` | **全量模板**(所有键 + 注释;新档的 `extends` 基) |
+| `awq27b-3090-max.toml` | 3090 Ti 单卡 27B / 128k / fp8 KV(最大上下文档) |
+| `awq27b.toml` | 27B 单卡基线(4k;回归/取证与测试用) |
+| `spec-dflash.toml` | 27B + DFlash2 d7(16k;测试/取证用) |
+| `tp27b-3080-184k.toml` | 2×3080 27B + 视觉 + DFlash2 d7 / 184k |
 | `tp27b-3080-vlm-184k.toml` | 同上但 spec off(视觉对照) |
-| `tp27b-3080-262k.toml` | 2×3080 27B / 262k(低层档,小池 + 宿主腿) |
-| `tp27b-3080-262k-vlm.toml` | 2×3080 27B + 视觉 + d7 / **262k 全设备池**(单文件完整档) |
+| `tp27b-3080-262k-vlm.toml` | 2×3080 27B + 视觉 + d7 / **262k 全设备池** |
 
-常用档都只写"目标 + 必要覆盖";站点事实请复制后按机器补/改:
+## 站点事实(复制后按机器改)
 
 ```toml
 [model]
-dir = "/path/to/Qwen3.8-27B-AWQ-INT4"
-dflash2_dir = "/path/to/Qwen3.8-27B-DFlash2-W4A16"  # spec=dflash 时
+path = "/path/to/Qwen3.8-27B-AWQ-INT4"
+format = "awq"                  # safetensors | awq | gguf
+quant = "w4a16"                 # gguf 档写 q4k / iq4 / iq3
+vision_path = ""                # 留空 = 检查点内置视觉塔
 
-[runtime]
+[spec]
+draft_path = "/path/to/Qwen3.8-27B-DFlash2-W4A16"   # depth > 0 时必填
+
+[server]
 bind = "127.0.0.1:8138"
-tp_ordinals = [2, 3]        # 2×3080 档;单卡用 device.bdf / UUID
+
+[parallel]
+mode = "tensor"
+device = ["3080", "3080"]       # 或 BDF / UUID
 ```
 
 `--site` / 位置参数只是可选的覆盖层;不写也能用(只要 profile 里已含站点事实)。

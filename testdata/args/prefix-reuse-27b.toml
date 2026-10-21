@@ -18,16 +18,14 @@
 #   目标 = 本文件显式的 true ⇒ 探针判据 ④⑤(跨会话命中 + 真值等价)才可判。
 # ============================================================================
 [model]
-kind = "awq27b"
-dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+format = "awq"   # 原 kind = "awq27b"
+path = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
 name = "qwen3.8-27b"
 
 [runtime]
 # 生产 ctx(与 flavor 同值;显式写出 = 本档条件自证)
 max_seq = 16384
 prefill_chunk = 512
-bind = "127.0.0.1:8137"
 
 [pool]
 # **容量面全部继承 flavor**(2026-10-19 容量定档后):`prefix_cache=true` /
@@ -41,3 +39,8 @@ gdn_slots = 1
 # + `[dbg prefix]` 守卫读数。平时关(落盘 + 日志有成本)。
 prompt_dump = true
 debug = true
+
+[spec]
+draft_path = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+[server]
+bind = "127.0.0.1:8137"

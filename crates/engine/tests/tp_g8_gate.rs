@@ -236,10 +236,12 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     let ar_f8 = matches!(std::env::var("OWL_TP_AR_F8").as_deref(), Ok("1") | Ok("true"));
     // ★ **v1 两核融合档**(§11.2;测试例外同上)
     let ar_fused = matches!(std::env::var("OWL_TP_AR_FUSED").as_deref(), Ok("1") | Ok("true"));
+    // ★ **1-stage 档**(§35;2026-10-21 收编:TpOpts 不再读 env,测试侧显式给)
+    let one_stage = matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"));
     let tp = TpEngine::assemble_with(
         vec![e0, e1],
         vec![l0, l1],
-        owl_engine::TpOpts { push, ar_f8, ar_fused, one_stage: false },
+        owl_engine::TpOpts { push, ar_f8, ar_fused, one_stage },
     )
         .await
         .expect("TP2 装配");
@@ -281,9 +283,8 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     let n_fused = cnt("tp.ar.fused");
     // ⚠️ 1-stage 档的路径判据在 `tp_perf_split_probe`(那里断言 `tp.ar.1stage > 0 ∧ v1 = 0`);
     // 本条只管 push/v1 两档 —— **1-stage 开时 v1 本就该是 0**,别在这里拦(2026-10-19)
-    let one_stage_on = matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"));
-    eprintln!("[g8b] 路径判据:push={n_push} · v1={n_v1} · fused={n_fused}(OWL_TP_PUSH={push} · 融合={ar_fused} · 1-stage={one_stage_on})");
-    if one_stage_on {
+    eprintln!("[g8b] 路径判据:push={n_push} · v1={n_v1} · fused={n_fused}(OWL_TP_PUSH={push} · 融合={ar_fused} · 1-stage={one_stage})");
+    if one_stage {
         /* 走 tp_perf_split_probe 的判据 */
     } else if ar_fused {
         // **融合档的路径判据**(§11.2;2026-10-19):必须走到 fused,且 v1/push 都为 0
@@ -512,7 +513,19 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
     let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(&dir).await.expect("rank0 装载");
     let mut e1 = Engine::new_with_ledger(cfg_eager(ob), e0.ledger_cell(), 1).expect("engine rank1");
     let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(&dir).await.expect("rank1 装载");
-    let tp = TpEngine::assemble(vec![e0, e1], vec![l0, l1]).await.expect("装配");
+    // 2026-10-21:`TpOpts` 已无 env 读取(引擎零 env);本探针**显式**从 env 取
+    // 档位(测试例外),再交 `assemble_with` —— 否则 `OWL_TP_1STAGE=1` 只改
+    // 断言分支、不改装配,判据永远看到"没走新路径"却测的不是它。
+    let flag = |k: &str| matches!(std::env::var(k).as_deref(), Ok("1") | Ok("true"));
+    let opts = owl_engine::TpOpts {
+        push: flag("OWL_TP_PUSH"),
+        ar_f8: flag("OWL_TP_AR_F8"),
+        ar_fused: flag("OWL_TP_AR_FUSED"),
+        one_stage: flag("OWL_TP_1STAGE"),
+    };
+    let tp = TpEngine::assemble_with(vec![e0, e1], vec![l0, l1], opts)
+        .await
+        .expect("装配");
     let mut r = tp.run().expect("进执行态");
     // 预热一次(装载后的首跑含 lazy 初始化;不进计时)
     let _ = run_turn_plain(&mut r, 1, &prompt, 1).await.expect("预热 turn");

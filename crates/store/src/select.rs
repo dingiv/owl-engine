@@ -297,8 +297,6 @@ pub struct MeanKCollector {
     kv_heads: usize,
     /// `[layer][kv_head][dim]` 累加器。
     sums: Vec<f64>,
-    /// 逆 RoPE 的**暂存行**(避免每 token 分配;长度 = `dim`)。
-    scratch: Vec<f32>,
     /// 已喂 token 数(每 (层,头) 同一计数 ⇒ 一个标量)。
     count: usize,
 }
@@ -316,7 +314,6 @@ impl MeanKCollector {
             layers,
             kv_heads,
             sums: vec![0.0; layers * kv_heads * dim],
-            scratch: vec![0.0; dim],
             count: 0,
         })
     }

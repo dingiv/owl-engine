@@ -1,5 +1,7 @@
 # W4A16 safetensors × prefill 桶 A/B（2026-10-21）
 
+> ⚠️ **2026-10-21 存证说明**:本卷引用的 `profiles/legacy/*` 已随「配置档全字段显式」裁决删除;数字与命令保持原样(当时现场),复跑请用 `profiles/` 下同名生产档。
+
 > 目的：补测 W4A16 主场景下 prefill CUDA Graph（`prefill_bucket`）的真实差距。
 > 二进制：`/tmp/owl-server-baseline-perfreview-23116c7`（保留桶代码，
 > md5 `6855ef60…`；与 W4A8 A/B 同一基线树）。

@@ -10,19 +10,24 @@
 # ⚠️ 路径为本机资产(workspace models/ 下),换机需改。
 
 [model]
-dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+path = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
 name = "qwen3.8-27b"
 
 [runtime]
 # 2026-10-16 回归复跑:旧写法 `device = 1`(整数)在新 schema(DeviceSpec 表)
 # 下反序列化即拒启(P0-2 同族);测试资产改显式 ordinal,指向空闲卡(本 boot CUDA0=41:00)
-device_ordinal = 0
+# (原 [runtime] device_ordinal 已迁 [parallel] device)
 max_seq = 8448
 
 [pool]
 pool_tokens = 8704
 gdn_slots = 8
 
-[dispatch]
+[kernel]
 prefill_split = true
+
+[spec]
+draft_path = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+
+[parallel]
+device = []   # 原 device_ordinal = 0(CUDA 序号禁用;钉卡请写 BDF/UUID/名字)

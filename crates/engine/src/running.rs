@@ -34,8 +34,6 @@ pub(crate) enum Node {
     Need(owl_store::Need),
     /// **N4 TurnEnd**:池清点(池内块改归 `Cache`)+ 未归还清单(按名 WARN)
     TurnEnd(u64),
-    /// **N5 SessionClose**:会话关闭(链已由会话表经 store API 归还;节点只记账/复位)
-    SessionClose(u64),
     /// **N6 Pressure**:余量告急 ⇒ 零缺口也搬(先下沉、再驱逐)
     Pressure(usize),
     /// **H5 Idle**:空转整理(无活跃 turn;每 N 拍一次)
@@ -53,7 +51,6 @@ impl Node {
                 owl_store::NeedWhy::Pressure => "pressure",
             },
             Node::TurnEnd(_) => "turn_end",
-            Node::SessionClose(_) => "session_close",
             Node::Pressure(_) => "pressure",
             Node::Idle(_) => "idle",
         }
@@ -62,7 +59,7 @@ impl Node {
 
 
 /// 步级探针开关(诊断面;结构纯数据,Default = 全关)。
-/// **入口侧构造器** = [`StepProbes::from_env`](server config/测试用例
+/// **入口侧构造器** = [`StepProbes::from_config`](server config/测试用例
 /// 专用);引擎内部零 env 读取,经 EngineKnobs.probes 显式传入。
 /// 新增探针在此登记,禁止 exec 每步读 env。
 #[derive(Clone, Copy, Debug, Default)]
@@ -139,13 +136,13 @@ impl StepProbes {
             kv_dump_at: p
                 .kv_dump_at
                 .or_else(|| owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP")),
-            recon_dbg: owl_shared::env_reader::flag("OWL_RECON_DBG"),
-            vram_dbg: owl_shared::env_reader::flag("OWL_VRAM_DBG"),
-            idx_dbg: owl_shared::env_reader::flag("OWL_IDX_DBG"),
-            live_diag: owl_shared::env_reader::flag("OWL_LIVE_DIAG"),
-            cov_dump: owl_shared::env_reader::flag("OWL_COV_DUMP"),
-            store_hook_dbg: owl_shared::env_reader::flag("OWL_STORE_HOOK_DEBUG"),
-            pf_taps: owl_shared::env_reader::flag("OWL_PF_TAPS"),
+            recon_dbg: p.recon_dbg,
+            vram_dbg: p.vram_dbg,
+            idx_dbg: p.idx_dbg,
+            live_diag: p.live_diag,
+            cov_dump: p.cov_dump,
+            store_hook_dbg: p.store_hook_dbg,
+            pf_taps: p.pf_taps,
         }
     }
 }
@@ -932,7 +929,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 Ok(())
             }
             // N5:会话关闭 —— 链已由会话表归还(store API),本节点只记账/归属复位
-            Node::SessionClose(_s) => Ok(()),
         }
     }
 

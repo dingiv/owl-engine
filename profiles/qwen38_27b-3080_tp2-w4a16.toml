@@ -1,0 +1,41 @@
+# owl 预设档 `tp27b-3080-184k` —— 2×3080 27B + 视觉 + DFlash2 d7 / 184k
+#
+# 全量字段继承自 `full.toml`;本文件只写差异。卡位 = 名字子串(两张 3080);
+# 需要钉到具体卡时改成 BDF / UUID(禁 CUDA 序号)。
+extends = ["full.toml"]
+
+[model]
+name = "qwen3.8-27b"
+path = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+format = "awq"
+quant = "w4a16"
+head_quant = "rtn-int4-g32"
+vision = true
+
+[parallel]
+mode = "tensor"
+device = ["3080", "3080"]
+
+[runtime]
+max_seq = 184320
+max_concurrency = 1
+
+[spec]
+depth = 7
+draft_path = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+
+[pool]
+pool_tokens = 184320
+gdn_slots = 1
+snap_max = 1
+prefix_cache = false
+vram_target = 0.99
+vram_reserve_mb = 256
+
+[kernel]
+kv_fp8 = true
+# 本档走 piecewise(表由图自携 restore 烘入),不烘单图 plan
+fi_plan_bake = false
+fi_plan_restore = true
+decode_fi = false
+verify_fi = false

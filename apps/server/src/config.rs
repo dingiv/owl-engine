@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use owl_shared::config::{OwlConfig, ResolvedConfig};
-pub use owl_shared::config::ModelKind;
+pub use owl_shared::config::ModelFormat;
 
 // ── app 面缺省(总账外的 server 组装缺省;R2 命名常量)──
 const DEFAULT_MODEL_DIR: &str = concat!(
@@ -279,16 +279,71 @@ impl Devices {
     }
 }
 
+/// **服务面处理器视图**(`[runtime]` + `[server]` 的组装体;不是配置段)。
+///
+/// 为什么保留这个名字:模板/工具解析/会话缺省在 `openai.rs` / `load.rs` /
+/// `main.rs` 是**整包传递**的(处理一条请求要同时看"格式 + 缺省 + 上限");
+/// 拆成两个结构反而每次都要搬两份参数。配置面已按职责拆散
+/// (`[runtime] implicit_session/...` + `[server] parse_tool_calls/...`),
+/// 本结构只是它们在 app 层的投影。
+#[derive(Clone, Debug, Default)]
+pub struct AgentCfg {
+    /// 模板路径覆盖(None = 模型快照 `<model.path>/chat_template.jinja`)
+    pub template_path: Option<String>,
+    /// 隐式默认会话(请求不带 session 键时落到会话 0)
+    pub implicit_session: bool,
+    /// 未带 `max_tokens` 时的生成步数
+    pub default_max_new: usize,
+    /// `max_tokens` 夹紧上限
+    pub max_new_cap: usize,
+    /// 工具三通道解析
+    pub parse_tool_calls: bool,
+    /// 工具格式(必须与模板同值)
+    pub tool_call_format: owl_shared::config::ToolCallFormat,
+    /// 有工具即关思考
+    pub auto_disable_thinking_with_tools: bool,
+    /// 思考档位缺省(None = 模板自决)
+    pub reasoning_effort: Option<String>,
+    /// 排队超时毫秒(0 = 关)
+    pub queue_wait_ms: usize,
+}
+
+impl AgentCfg {
+    /// **唯一组装点**:`[runtime]` 的会话面 + `[server]` 的模板/工具面。
+    pub fn from_config(cfg: &OwlConfig) -> Self {
+        Self {
+            // 空串 = 未设(TOML 里写 `template_path = ""` 的语义)
+            template_path: cfg
+                .server
+                .template_path
+                .clone()
+                .filter(|s| !s.trim().is_empty()),
+            implicit_session: cfg.runtime.implicit_session,
+            default_max_new: cfg.runtime.default_max_new,
+            max_new_cap: cfg.runtime.max_new_cap,
+            parse_tool_calls: cfg.server.parse_tool_calls,
+            tool_call_format: cfg.server.tool_call_format,
+            auto_disable_thinking_with_tools: cfg.server.auto_disable_thinking_with_tools,
+            reasoning_effort: cfg
+                .server
+                .reasoning_effort
+                .clone()
+                .filter(|s| !s.trim().is_empty()),
+            queue_wait_ms: cfg.runtime.queue_wait_ms,
+        }
+    }
+}
+
 /// 服务配置(构造口 = [`ServerConfig::load_resolved`] + [`ServerConfig::from_resolved`];boot 后只读)
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    /// 监听地址(OWl_BIND 遗留键已废;runtime.bind)
+    /// 监听地址(`[server] bind`)
     pub bind: String,
-    /// 模型目录(model.dir;构造期已回退 workspace 资产缺省)
+    /// 模型路径(`[model] path`;目录或 .gguf 单文件;构造期回退 workspace 缺省)
     pub model_dir: PathBuf,
-    /// 模型档位(model.kind;非法值 loader 拒启)
-    pub model_kind: ModelKind,
-    /// 对外模型名(model.name;构造期已回退服务端缺省)
+    /// 模型格式(`[model] format`;装载器分档的唯一判据)
+    pub model_format: ModelFormat,
+    /// 对外模型名(`[model] name`;构造期已回退服务端缺省)
     pub model_name: String,
     /// 引擎旋钮(全量配置 engine/cuda/sampling module 的显式搬运)
     pub knobs: owl_engine::EngineKnobs,
@@ -304,7 +359,7 @@ pub struct ServerConfig {
     /// **主干量化方案**(model.quant;S2 2026-10-17;枚举严格 —— 原
     /// `w4a8: bool` 已退役,旧键响亮拒)
     pub quant: owl_shared::config::QuantScheme,
-    /// 最大并发请求(server.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
+    /// 最大并发请求(runtime.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
     pub max_concurrency: usize,
     /// **合批上限**([runtime] max_batch;1 = 串行现状)。服务面用它做两件事:
     /// 会话闸的配套告警(隐式会话 + 合批 ⇒ 串行)与 `/debug/vram` 的如实报数。
@@ -318,14 +373,18 @@ pub struct ServerConfig {
     pub tp_vocab_split: bool,
     /// **v1 两核融合档**（runtime.tp_ar_fused；§11.2）⇒ 交 `TpOpts.ar_fused`
     pub tp_ar_fused: bool,
+    /// **1-stage 对称 arena 档**（runtime.tp_one_stage；§35）⇒ 交 `TpOpts.one_stage`。
+    /// 缺省 false（实测中性）；与 `tp_push` 互斥、需 `tp_ordinals`（`validate` 拒启）。
+    pub tp_one_stage: bool,
     /// 性能账落盘基名(--perf-dump;None = 不落盘)
     pub perf_dump: Option<PathBuf>,
     /// 性能分级(probes.perf_level,可被 --perf-level 覆盖)
     pub perf_level: u8,
     /// 日志面([log] module;CLI 可覆盖 level/file)
     pub log: owl_shared::config::LogCfg,
-    /// agent 服务面([agent] module;模板覆盖/隐式会话/工具解析/档位)
-    pub agent: owl_shared::config::AgentCfg,
+    /// 服务面处理器要的模板/会话旋钮(**由 `[runtime]`+`[server]` 组装的 app 面
+    /// 视图**,不是配置段 —— 配置段已按职责拆散,这里只为处理器少搬参数)
+    pub agent: AgentCfg,
     /// 单步/粘滞调试门(probes.step_gate*;CLI 可覆盖;见 perf-framework.md §五)
     pub step_gate: owl_shared::stepgate::StepMode,
     pub step_gate_ms: u64,
@@ -350,8 +409,15 @@ impl ServerConfig {
         if let Some(p) = args.site.as_deref() {
             layers.push(p);
         }
+        // `--print-config` 是迁移工具:它要把半份旧档补成全量档 ⇒ 放行缺键;
+        // 其余路径(`--check` / boot / 测试)一律缺键拒启。
+        let completeness = if args.print_config {
+            owl_shared::config::Completeness::Tolerate
+        } else {
+            owl_shared::config::Completeness::Enforce
+        };
         let mut resolved =
-            OwlConfig::load_resolved(base, &layers, &args.overrides())?;
+            OwlConfig::load_resolved(base, &layers, &args.overrides(), completeness)?;
         if let Some(m) = resolved.meta.as_mut() {
             m.intent.profile = base.map(|p| p.display().to_string());
         }
@@ -368,7 +434,10 @@ impl ServerConfig {
         //          → 取首张(空规格 = 全部候选 ⇒ 自动挑空闲卡);
         //   TP   = `runtime.tp_ordinals` 显式双卡(零自动挑卡,见 resolve_tp_devices);
         //   命中全列日志,无候选/全被占/口径混填 = 响亮拒启。
-        let devices = resolve_devices(&resolved.config.runtime)?;
+        let devices = resolve_devices(
+        &resolved.config.parallel,
+        resolved.config.runtime.gpu_min_free_ratio,
+    )?;
         let mut out = Self::from_config(resolved.config);
         out.devices = devices;
         out.perf_dump = args.perf_dump.clone();
@@ -384,8 +453,8 @@ impl ServerConfig {
     /// (`Qwen_Qwen3.5-4B-Q4_K_M`),与"声明即事实"同律。
     ///
     /// 其余档位保持历史缺省(改它会动既有档位的对外面,不在本轮射程)。
-    fn default_model_name(kind: ModelKind, dir: Option<&std::path::Path>) -> String {
-        if kind == ModelKind::Gguf {
+    fn default_model_name(format: ModelFormat, dir: Option<&std::path::Path>) -> String {
+        if format == ModelFormat::Gguf {
             if let Some(stem) = dir.and_then(|d| d.file_stem()).and_then(|s| s.to_str()) {
                 if !stem.is_empty() {
                     return stem.to_string();
@@ -397,19 +466,22 @@ impl ServerConfig {
 
     /// app 面组装(已加载配置 → server 形态;测试可直接喂 default/定制)
     pub fn from_config(cfg: OwlConfig) -> Self {
+        // 先组装 app 面视图(要整份 cfg);后面按值搬移各 module
+        let agent = AgentCfg::from_config(&cfg);
         Self {
-            bind: cfg.runtime.bind.clone(),
+            bind: cfg.server.bind.clone(),
             model_dir: cfg
                 .model
-                .dir
+                .path
                 .clone()
+                .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR)),
-            model_kind: cfg.model.kind,
+            model_format: cfg.model.format,
             model_name: cfg
                 .model
                 .name
                 .clone()
-                .unwrap_or_else(|| Self::default_model_name(cfg.model.kind, cfg.model.dir.as_deref())),
+                .unwrap_or_else(|| Self::default_model_name(cfg.model.format, cfg.model.path.as_deref())),
             knobs: owl_engine::EngineKnobs::from_config(&cfg),
             // 占位:真值由 `load()` 的声明式选卡回填(设备表 + 卡锁都在那边)
             devices: Devices::placeholder(),
@@ -420,16 +492,17 @@ impl ServerConfig {
             prefill_chunk: cfg.runtime.prefill_chunk,
             head_quant: cfg.model.head_quant,
             quant: cfg.model.quant,
-            tp_push: cfg.runtime.tp_push,
-            tp_ar_f8: cfg.runtime.tp_ar_f8,
-            tp_vocab_split: cfg.runtime.tp_vocab_split,
-            tp_ar_fused: cfg.runtime.tp_ar_fused,
-            max_concurrency: cfg.server.max_concurrency,
+            tp_push: cfg.parallel.tp_push,
+            tp_ar_f8: cfg.parallel.tp_ar_f8,
+            tp_vocab_split: cfg.parallel.tp_vocab_split,
+            tp_ar_fused: cfg.parallel.tp_ar_fused,
+            tp_one_stage: cfg.parallel.tp_one_stage,
+            max_concurrency: cfg.runtime.max_concurrency,
             max_batch: cfg.runtime.max_batch,
             perf_dump: None,
             perf_level: cfg.probes.perf_level.to_u8(),
             log: cfg.log,
-            agent: cfg.agent,
+            agent,
             step_gate: cfg.probes.step_gate,
             step_gate_ms: cfg.probes.step_gate_ms,
             step_gate_us: cfg.probes.step_gate_us,
@@ -472,160 +545,131 @@ fn vram_free_ratio_map() -> Option<std::collections::HashMap<String, f64>> {
     }
 }
 
-/// **选卡总入口**:两条规范互斥 —— `runtime.tp_ordinals` 给值 ⇒ TP 双卡档
-/// (零自动挑卡);不给 ⇒ 单卡档(声明式选卡/自动挑空闲)。
-fn resolve_devices(rt: &owl_shared::config::RuntimeCfg) -> Result<Devices, String> {
-    // **卡位必须显式**(2026-10-21 用户裁决):不再自动挑"任意空闲卡" ——
-    // 自动挑卡随当下占用漂移,同一份配置在不同时刻会落到不同卡上(生产不可复现)。
-    // 允许的三种写法(互斥由后面的分支校验):
-    //   runtime.tp_ordinals = [a, b]      TP 双卡
-    //   [runtime.device] bdf/uuid/find_name   单卡(声明式选卡只在**已给规格**内挑)
-    //   runtime.device_ordinal = N        测试/特殊场景
-    if rt.tp_ordinals.is_none() && rt.device.is_empty() && rt.device_ordinal.is_none() {
-        return Err(
-            "选卡未指定:必须显式给 `runtime.tp_ordinals = [a, b]`(TP 双卡)或 \
-             `[runtime.device] bdf/uuid/find_name`(单卡)。\n\
-             卡位是启动参数,不再自动挑空闲卡 —— 用 `--site <site.toml>` 或 \
-             `--set runtime.device.bdf=01:00.0` 指定。"
-                .into(),
-        );
-    }
-    match &rt.tp_ordinals {
-        None => {
-            let (o, u) = resolve_device(rt)?;
-            Devices::new(vec![o], vec![u])
-        }
-        Some(ord) => resolve_tp_devices(rt, ord),
-    }
-}
-
-/// **TP 档选卡**(S6 2026-10-17;`runtime.tp_ordinals`)。
+/// **选卡总入口**(2026-10-21 起唯一真源 = `[parallel]`)。
 ///
-/// 与单卡档的差别 = **不做自动挑卡**:分片协议要的是"确定的双卡 + 确定的
-/// rank 序",而自动挑卡结果随当下占用漂移(同 uuid 会撞 `TpEngine::assemble`
-/// 的同卡护栏;挑到混插对会被 `PeerPlan::plan` 拒)。故此处:
-/// - 必须正好 2 项(v1 world = 2 边界),且互不相同;
-/// - 与 `device` / `device_ordinal` 互斥(同时给 = 拒启,不静默取一方 ——
-///   否则卡身份有两个真源);
-/// - 每项查 UUID 作身份(卡锁 + 日志);查不到 ⇒ 响亮 Err。
-fn resolve_tp_devices(
-    rt: &owl_shared::config::RuntimeCfg,
-    ord: &[usize],
-) -> Result<Devices, String> {
-    if !rt.device.is_empty() {
-        return Err(format!(
-            "选卡口径混填:`runtime.tp_ordinals = {ord:?}` 与 `runtime.device = {:?}` 互斥(TP 档不自动挑卡)",
-            rt.device
-        ));
-    }
-    if let Some(o) = rt.device_ordinal {
-        return Err(format!(
-            "选卡口径混填:`runtime.tp_ordinals = {ord:?}` 与 `runtime.device_ordinal = {o}` 互斥"
-        ));
-    }
-    if ord.len() != 2 {
-        return Err(format!("TP v1 只支持 world = 2(tp_ordinals 得 {} 项 {ord:?})", ord.len()));
-    }
-    if ord[0] == ord[1] {
-        return Err(format!(
-            "TP 两个 rank 指向同一张卡(ordinal {};双 rank 协议要求两张不同的卡)",
-            ord[0]
-        ));
-    }
-    let mut uuids = Vec::with_capacity(ord.len());
-    for &o in ord {
-        let uuid = owl_cuda::ffi::device_uuid(o)
-            .map(|b| owl_shared::device::uuid_display(&b))
-            .map_err(|e| format!("TP rank 的 device_ordinal={o} 的 UUID 查不到: {e:?}"))?;
-        uuids.push(uuid);
-    }
-    // 此刻 logger 尚未初始化(log 被丢弃)⇒ 裸 eprintln 保可见(仓规:boot 关键行恒输出)
-    eprintln!(
-        "[boot] 选卡(TP 档):rank0 = ordinal {} → {};rank1 = ordinal {} → {}(rank 序 = 列表序;logger 前 ⇒ 裸输出)",
-        ord[0], uuids[0], ord[1], uuids[1]
-    );
-    Devices::new(ord.to_vec(), uuids)
-}
-
-/// **声明式选卡**(2026-10-16):见 `owl_shared::device`。
-/// - `device_ordinal` 显式给 ⇒ 直通(测试/特殊场景;仍查 UUID 供锁用);
-/// - 否则按 `device` 规格从设备表里选(**空规格 = 全部候选**),
-///   再依次用 ①`gpu_lock`(owl 实例)②nvidia-smi 实占内存(阈值 `runtime.gpu_min_free_ratio`)
-///   剔掉不可用的卡,取**首张**;
-/// - 规格未命中任何设备 / 候选全被占 ⇒ 响亮 Err(带设备表或持有者),不静默降级。
-fn resolve_device(rt: &owl_shared::config::RuntimeCfg) -> Result<(usize, String), String> {
-    if let Some(o) = rt.device_ordinal {
-        let uuid = owl_cuda::ffi::device_uuid(o)
-            .map(|b| owl_shared::device::uuid_display(&b))
-            .map_err(|e| format!("device_ordinal={o} 的 UUID 查不到: {e:?}"))?;
-        // 此刻 logger 尚未初始化(log 被丢弃)⇒ 裸 eprintln 保可见(仓规:boot 关键行恒输出)
-        eprintln!("[boot] 选卡(显式 ordinal):{o} → {uuid}");
-        return Ok((o, uuid));
-    }
-    let rows = owl_cuda::ffi::device_rows()?;
-    let hit = rt.device.select(&rows);
-    if hit.is_empty() {
-        let table: Vec<String> = rows
-            .iter()
-            .map(|r| format!("{}[{}|{}]", r.ordinal, r.bdf, r.name))
-            .collect();
-        return Err(format!("device 规格未命中任何设备(spec={:?};设备表={table:?})", rt.device));
-    }
-    let live = owl_shared::gpu_lock::live_locks();
-    let free: Vec<&owl_shared::device::DeviceRow> = hit
+/// 语义:
+/// - `mode = "single"` ⇒ 一条 `device`(空 = 自动挑 1 张空闲卡);
+/// - `mode = "tensor"` ⇒ 两条(空 = 自动挑 2 张);
+/// - `mode = "layer"` 由 `validate` 拒(暂未支持)。
+///
+/// **卡位只用 BDF / UUID / 名字子串**(`DeviceSpec::parse` 拒 CUDA 序号);
+/// 列表按**去重消费**解析:`["3090","3090"]` = 两张不同的 3090。
+fn resolve_devices(par: &owl_shared::config::ParallelCfg, min_free_ratio: f64) -> Result<Devices, String> {
+    use owl_shared::config::ParallelMode;
+    let specs = par.device
         .iter()
-        .copied()
-        .filter(|r| !live.iter().any(|l| l.uuid == r.uuid))
-        .collect();
-    // ② 实占内存过滤(锁只认 owl 实例;别的进程/未持锁的旧实例也要避让)
-    let (free, mem_ok) = match vram_free_ratio_map() {
-        Some(m) => {
-            let mut keep = Vec::new();
-            let mut skipped: Vec<String> = Vec::new();
-            for r in free {
-                match m.get(&r.uuid) {
-                    Some(ratio) if *ratio < rt.gpu_min_free_ratio => {
-                        skipped.push(format!("{} {} free={:.0}%", r.uuid, r.bdf, ratio * 100.0));
-                    }
-                    _ => keep.push(r),
-                }
-            }
-            if !skipped.is_empty() {
-                eprintln!(
-                    "[boot] 选卡:按实占内存跳过 {} 台(阈值 {:.0}%):{skipped:?}",
-                    skipped.len(),
-                    rt.gpu_min_free_ratio * 100.0
-                );
-            }
-            (keep, true)
+        .map(|s| owl_shared::device::DeviceSpec::parse(s))
+        .collect::<Result<Vec<_>, String>>()?;
+    match par.mode {
+        ParallelMode::Single => {
+            let picked = pick_distinct(&specs, 1, min_free_ratio)?;
+            eprintln!(
+                "[boot] 选卡(mode=single, device={:?}):ordinal {} [{}|{}] {}",
+                par.device, picked[0].ordinal, picked[0].bdf, picked[0].name, picked[0].uuid
+            );
+            Devices::new(vec![picked[0].ordinal], vec![picked[0].uuid.clone()])
         }
-        // nvidia-smi 不可用 ⇒ 不阻断启动(锁过滤已生效),但响亮提示
-        None => {
-            eprintln!("[boot] 选卡:nvidia-smi 内存查询不可用 ⇒ 跳过实占内存过滤(只按卡锁避让)");
-            (free, false)
+        ParallelMode::Tensor => {
+            let picked = pick_distinct(&specs, 2, min_free_ratio)?;
+            eprintln!(
+                "[boot] 选卡(TP 档, device={:?}):rank0 = ordinal {} → {};rank1 = ordinal {} → {}(rank 序 = 列表序;logger 前 ⇒ 裸输出)",
+                par.device, picked[0].ordinal, picked[0].uuid, picked[1].ordinal, picked[1].uuid
+            );
+            Devices::new(
+                picked.iter().map(|r| r.ordinal).collect(),
+                picked.iter().map(|r| r.uuid.clone()).collect(),
+            )
         }
-    };
-    let _ = mem_ok;
-    let picked = free.first().copied().ok_or_else(|| {
-        let holders: Vec<String> = live
-            .iter()
-            .map(|l| format!("{} pid={} port={}", l.uuid, l.pid, l.port))
-            .collect();
-        format!("候选设备全部被占(spec={:?};持有者={holders:?})", rt.device)
-    })?;
-    eprintln!(
-        "[boot] 选卡:命中 {} 台(spec={:?})→ 取 ordinal {} [{}|{}] {};空闲候选 {} 台(logger 前 ⇒ 裸输出)",
-        hit.len(),
-        rt.device,
-        picked.ordinal,
-        picked.bdf,
-        picked.name,
-        picked.uuid,
-        free.len()
-    );
-    Ok((picked.ordinal, picked.uuid.clone()))
+        // validate 已拒;到这里 = 内部不变量破了 ⇒ 响亮拒(不静默降级成单卡)
+        ParallelMode::Layer => Err(
+            "[parallel] mode = \"layer\" 暂未支持(config 层守门漏了)".to_string(),
+        ),
+    }
 }
 
+/// **按序取 N 张互不相同的卡**(去重消费;`specs` 空 = 自动挑空闲卡)。
+///
+/// 每条 spec 只在"本列表尚未占用"的候选里取;取不满 ⇒ 响亮 Err 并列出
+/// 设备表 / 持有者 / 内存占比 —— 卡位错误必须在 boot 前说清楚。
+fn pick_distinct(
+    specs: &[owl_shared::device::DeviceSpec],
+    n: usize,
+    min_free_ratio: f64,
+) -> Result<Vec<owl_shared::device::DeviceRow>, String> {
+    let rows = owl_cuda::ffi::device_rows()?;
+    let live = owl_shared::gpu_lock::live_locks();
+    let mem = vram_free_ratio_map();
+    let wildcard = owl_shared::device::DeviceSpec::default();
+    let mut used: Vec<String> = Vec::new();
+    let mut out: Vec<owl_shared::device::DeviceRow> = Vec::new();
+    for i in 0..n {
+        // 第 i 条 spec(空列表 ⇒ 通配 = 自动挑)
+        let spec = specs.get(i).unwrap_or(&wildcard);
+        // 候选:命中 spec 且尚未占用
+        let hit: Vec<&owl_shared::device::DeviceRow> = rows
+            .iter()
+            .filter(|r| spec.matches(r) && !used.iter().any(|u| *u == r.uuid))
+            .collect();
+        if hit.is_empty() {
+            let table: Vec<String> = rows
+                .iter()
+                .map(|r| format!("{}[{}|{}|{}]", r.ordinal, r.bdf, r.name, r.uuid))
+                .collect();
+            return Err(format!(
+                "[parallel] device 第 {i} 项 = {} 未命中任何**未占用**设备(设备表={table:?})",
+                spec.describe()
+            ));
+        }
+        // ① 卡锁(owl 实例)
+        let free: Vec<&owl_shared::device::DeviceRow> =
+            hit.iter().copied().filter(|r| !live.iter().any(|l| l.uuid == r.uuid)).collect();
+        // ② 实占内存过滤(锁只认 owl;别的进程也要避让)
+        let free = match &mem {
+            Some(m) => {
+                let mut keep = Vec::new();
+                let mut skipped: Vec<String> = Vec::new();
+                for r in free {
+                    match m.get(&r.uuid) {
+                        Some(ratio) if *ratio < min_free_ratio => {
+                            skipped.push(format!("{} {} free={:.0}%", r.uuid, r.bdf, ratio * 100.0));
+                        }
+                        _ => keep.push(r),
+                    }
+                }
+                if !skipped.is_empty() {
+                    eprintln!(
+                        "[boot] 选卡:按实占内存跳过 {} 台(阈值 {:.0}%):{skipped:?}",
+                        skipped.len(),
+                        min_free_ratio * 100.0
+                    );
+                }
+                keep
+            }
+            None => {
+                if i == 0 {
+                    eprintln!(
+                        "[boot] 选卡:nvidia-smi 内存查询不可用 ⇒ 跳过实占内存过滤(只按卡锁避让)"
+                    );
+                }
+                free
+            }
+        };
+        let picked = free.into_iter().next().ok_or_else(|| {
+            let holders: Vec<String> = live
+                .iter()
+                .map(|l| format!("{} pid={} port={}", l.uuid, l.pid, l.port))
+                .collect();
+            format!(
+                "[parallel] device 第 {i} 项 = {} 的候选全部被占(spec 命中 {} 台;持有者={holders:?})",
+                spec.describe(),
+                hit.len()
+            )
+        })?;
+        used.push(picked.uuid.clone());
+        out.push(picked.clone());
+    }
+    Ok(out)
+}
 
 // ============================================================================
 // 预检 / 解释面(`--check` / `--print-config` / `--explain`;不加载权重)
@@ -646,21 +690,21 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
     let arms = format!(
         "prefill={} decode={} gdn={}",
         "eager",
-        if c.dispatch.decode_fi {
+        if c.kernel.decode_fi {
             "FI(single)"
-        } else if c.dispatch.decode_xqa {
+        } else if c.kernel.decode_xqa {
             "XQA"
         } else {
             "eager"
         },
-        if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
+        if c.kernel.gdn_chunked { "chunked" } else { "scalar" },
     );
     Some(format!(
         "[owl] profile={} card={} ctx={} pool={}({}) {} mem={}/{} (余 {}) reuse={} spec={} c={}",
         m.profile.as_deref().unwrap_or("(inline)"),
         m.intent.hardware.as_deref().unwrap_or("auto"),
         c.runtime.max_seq,
-        c.pool.pool_tokens.unwrap_or(0),
+        c.pool.pinned_pool_tokens().unwrap_or(0),
         gib(e.pool_bytes),
         arms,
         gib(e.used_bytes()),
@@ -668,7 +712,7 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
         gib(e.total_bytes.saturating_sub(e.used_bytes())),
         if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
         if c.spec.depth > 0 { format!("dflash{}", c.spec.depth) } else { "off".into() },
-        c.server.max_concurrency,
+        c.runtime.max_concurrency,
     ))
 }
 
@@ -709,13 +753,13 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             "[check] resolved: max_seq={} pool_tokens={} chunk={} tail={} \
              gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
             c.runtime.max_seq,
-            c.pool.pool_tokens.unwrap_or(0),
+            c.pool.pinned_pool_tokens().unwrap_or(0),
             c.runtime.prefill_chunk,
             c.runtime.prefill_tail_merge,
             c.pool.gdn_slots,
             c.runtime.max_batch,
-            c.server.max_concurrency,
-            c.dispatch.kv_fp8,
+            c.runtime.max_concurrency,
+            c.kernel.kv_fp8,
         ));
         if let Some(e) = r.estimate() {
             out.push_str(&format!(
@@ -747,7 +791,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
                 gib(e.fixed.graph_slab),
                 gib(e.fixed.warmup_misc),
             ));
-            if e.pool_tokens != c.pool.pool_tokens.unwrap_or(0) {
+            if e.pool_tokens != c.pool.pinned_pool_tokens().unwrap_or(0) {
                 out.push_str(
                     "[check] note: 估算池 ≠ 显式 pool_tokens(非超卖档引擎会把池下限抬到上下文)\n",
                 );
@@ -762,27 +806,27 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             "[check] resolved: max_seq={} pool_tokens={:?} chunk={} tail={} \
              gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
             c.runtime.max_seq,
-            c.pool.pool_tokens,
+            c.pool.pinned_pool_tokens(),
             c.runtime.prefill_chunk,
             c.runtime.prefill_tail_merge,
             c.pool.gdn_slots,
             c.runtime.max_batch,
-            c.server.max_concurrency,
-            c.dispatch.kv_fp8,
+            c.runtime.max_concurrency,
+            c.kernel.kv_fp8,
         ));
     }
 
     // ── 模型/草稿目录几何校验(目录不存在 ⇒ 告警跳过,CI 假路径可跑) ──
     let profile = match intent {
         Some(m) => Some(owl_shared::config::intent::model_profile(&m.intent.model)?),
-        None => owl_shared::config::intent::model_by_kind(c.model.kind),
+        None => owl_shared::config::intent::model_by_format(c.model.format),
     };
     // 27B 没有"缺省资产":不给 dir ⇒ 真启动必失败,`--check` 直接拒;
     // 0.8B 有 workspace 缺省资产,走它做几何校验。
     let default_08b = || PathBuf::from(DEFAULT_MODEL_DIR);
-    let dir_owned = match &c.model.dir {
+    let dir_owned = match &c.model.path {
         Some(d) => Some(d.clone()),
-        None if c.model.kind == ModelKind::Qwen35_08b => Some(default_08b()),
+        None if c.model.format == ModelFormat::Safetensors => Some(default_08b()),
         None => None,
     };
     match (dir_owned.as_deref(), profile) {
@@ -797,7 +841,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         (None, _) => {
             ok = false;
             out.push_str(
-                "[check] FAIL: 未配置 [model].dir / [site].model_dir —— 27B 档无法定位检查点\
+                "[check] FAIL: 未配置 [model] path / [site].model_dir —— 无法定位检查点\
                  (真启动必失败);请给站点档\n",
             );
         }
@@ -806,7 +850,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         }
     }
     if c.spec.depth > 0 {
-        match c.model.dflash2_dir.as_deref() {
+        match c.spec.draft_path.as_deref() {
             Some(dir) => match check_draft_dir(Path::new(dir)) {
                 Ok(note) => out.push_str(&format!("[check] draft dir: {note}\n")),
                 Err(e) => {
@@ -816,14 +860,14 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             },
             None => {
                 ok = false;
-                out.push_str("[check] FAIL: spec.depth > 0 但 model.dflash2_dir 为空\n");
+                out.push_str("[check] FAIL: spec.depth > 0 但 spec.draft_path 为空\n");
             }
         }
     }
 
     // ── 组合告警(不拒;`--check` 的 UX 价值就在把隐患提前说出来) ──
     if !c.kvmem.pool_overcommit {
-        if let Some(p) = c.pool.pool_tokens {
+        if let Some(p) = c.pool.pinned_pool_tokens() {
             if p < c.runtime.max_seq {
                 out.push_str(&format!(
                     "[check] WARN: pool_tokens={p} < max_seq={}:非超卖档引擎会把池下限抬到单会话上下文;\
@@ -836,16 +880,16 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
 
     // ── 臂摘要 ──
     let prefill = "eager";
-    let decode = if c.dispatch.decode_fi {
+    let decode = if c.kernel.decode_fi {
         "FI(单图)"
-    } else if c.dispatch.decode_xqa {
+    } else if c.kernel.decode_xqa {
         "XQA"
     } else {
         "eager/piecewise"
     };
     out.push_str(&format!(
         "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{} reuse={} batch={} vision={}\n",
-        if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
+        if c.kernel.gdn_chunked { "chunked" } else { "scalar" },
         c.spec.depth,
         if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
         c.runtime.max_batch,

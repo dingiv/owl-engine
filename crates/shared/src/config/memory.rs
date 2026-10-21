@@ -26,7 +26,7 @@
 //!
 //! 取 `activation = 0.60 GiB`(512+512 桶档实测 0.4–0.6)、
 //! `stability_margin = 1.30 GiB`(覆盖已实测的泄漏曲线 + 激活抖动)⇒ 解出
-//! **128k**(与手写 `profiles/legacy/awq27b-3090-max.toml` 同档,便于 A/B 对拍)。
+//! **128k**(与 `profiles/awq27b-3090-max.toml` 同档,便于 A/B 对拍)。
 //! P2 的校准探测会把这套数字写回硬件档。
 
 use serde::Serialize;
@@ -343,7 +343,7 @@ mod tests {
     }
 
     /// 3090 Ti + 27B/fp8/spec off/512+512:`context="max"` 必须解出 128k
-    /// (与手写 `profiles/legacy/awq27b-3090-max.toml` 同档,供 A/B 对拍)。
+    /// (与 `profiles/awq27b-3090-max.toml` 同档,供 A/B 对拍)。
     #[test]
     fn max_context_solves_to_128k_on_3090ti() {
         let inp = inputs(true, 512, 512, 0);
