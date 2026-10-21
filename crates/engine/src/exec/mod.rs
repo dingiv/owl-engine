@@ -48,6 +48,20 @@ macro_rules! mirror2 {
 
 pub(crate) use mirror2;
 
+/// **U32 位型走私**(引擎内唯一入口):把 u32 账以 f32 承载过线。
+///
+/// 池/表的数值面恒 f32(`bt`/`xqa_pt`/`fi_*` 同约定),页号/长度这些
+/// u32 只能**位型**过线;`from_bits` 与 `to_le_bytes` 两种编码都在这里,
+/// 不再各文件各写一个闭包。
+pub(crate) fn u32s_as_f32(v: &[u32]) -> Vec<f32> {
+    v.iter().map(|x| f32::from_bits(*x)).collect()
+}
+
+/// u32 → LE 字节(`TensorOps::from_host` 的 U32 表用)。
+pub(crate) fn u32s_le_bytes(v: &[u32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
 /// **手工 join 两 future**(S4 ⑤-K3):引擎 lib **不依赖 async 运行时/组合器**
 /// (只有 owl-* + half)—— 两 rank 的设备半必须**并发推进**(见
 /// `phases.rs` 的 TP 驱动注:单边先行会让对端的 AR 撞 5s 自旋超时)。

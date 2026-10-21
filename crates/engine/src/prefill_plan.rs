@@ -172,7 +172,6 @@ impl<D: DeviceClient> BucketGraph<D> {
         let Some(ft) = tb.fi.as_ref() else {
             return Ok(None); // 非 FI 档(FI 是桶图的前置面)
         };
-        let bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|x| f32::from_bits(*x)).collect() };
         // 页链槽:**声明容量对齐**(零点 = 页 0;indptr 划定的前缀之外结构上不读)
         let mut idx = ft.indices.clone();
         if idx.len() > self.fi_nb {
@@ -191,10 +190,10 @@ impl<D: DeviceClient> BucketGraph<D> {
             ("kv_lens", tb.lens.clone()),
             ("gdn_slot", vec![tb.gdn_slot]),
             ("seq_cu", tb.seq_cu.clone()),
-            ("fi_q_cu", bits(&ft.q_cu)),
-            ("fi_indices", bits(&idx)),
-            ("fi_indptr", bits(&ft.indptr)),
-            ("fi_last_len", bits(&ft.last_len)),
+            ("fi_q_cu", crate::exec::u32s_as_f32(&ft.q_cu)),
+            ("fi_indices", crate::exec::u32s_as_f32(&idx)),
+            ("fi_indptr", crate::exec::u32s_as_f32(&ft.indptr)),
+            ("fi_last_len", crate::exec::u32s_as_f32(&ft.last_len)),
         ];
         let refs: Vec<(&str, &[f32])> = fills.iter().map(|(n, v)| (*n, v.as_slice())).collect();
         self.plan.step(&refs).await?;

@@ -55,6 +55,9 @@ pub struct TpOpts {
     /// **v1 两核融合档**(§11.2;2026-10-19):AR 一核做完两段(只非 fp8 载荷)。
     /// 由入口显式传入(缺省关);两 rank 必须同档。
     pub ar_fused: bool,
+    /// **1-stage 对称 arena 档**(§35):结构更对但实测中性 ⇒ 缺省关。
+    /// 由入口显式传入(与 push 互斥),**不再读 `OWL_TP_1STAGE`**。
+    pub one_stage: bool,
 }
 
 /// staging 的双块与布局量(布局算术单源 = `owl_cuda::comm::ar::StagingLayout` ——
@@ -801,12 +804,12 @@ async fn handshake_staging(
     // 诊断面(2026-10-19):1-stage 的启用条件一次打全 —— 它是"融合核被走到"的
     // 唯一前提,而 §57 的教训正是"核写好了但一次没被走到"。
     eprintln!(
-        "[tp] 1-stage 启用判据:env OWL_TP_1STAGE={:?} · push={} ⇒ arena {}",
-        std::env::var("OWL_TP_1STAGE").ok(),
+        "[tp] 1-stage 启用判据:opts.one_stage={} · push={} ⇒ arena {}",
+        opts.one_stage,
         opts.push,
-        if one_stage_enabled() && !opts.push { "装配" } else { "不装(走 v1 两段)" }
+        if one_stage_enabled(&opts) && !opts.push { "装配" } else { "不装(走 v1 两段)" }
     );
-    let (arena0, arena1) = if one_stage_enabled() && !opts.push {
+    let (arena0, arena1) = if one_stage_enabled(&opts) && !opts.push {
         // 槽大小:按 staging 的 slot_bytes 会白占显存(0.8B 的 payload 只有 ~1MiB,
         // 而 SLOT_BYTES = 32MiB ⇒ 2 槽 = 64MiB/rank,实测在 3080 上直接
         // `cuMemSetAccess` OOM)。**上限 8MiB** —— 超出的载荷由 `eval::symmetric_out_slot`
@@ -895,8 +898,8 @@ fn query_bar1_bytes() -> Result<std::collections::HashMap<String, u64>> {
 ///
 /// 纪律:任何"结构更对但中性"的改动都该这样处置 —— **能力留在树里、默认走老的**,
 /// 直到有人量出它到底赚在哪(或亏在哪)。
-fn one_stage_enabled() -> bool {
-    matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"))
+fn one_stage_enabled(opts: &TpOpts) -> bool {
+    opts.one_stage
 }
 
 /// **1-stage 对称槽束握手**:每侧 **3 个独立块** —— 2 个 payload 槽(乒乓)+ 1 个 header。

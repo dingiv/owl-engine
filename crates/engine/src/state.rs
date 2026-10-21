@@ -392,9 +392,8 @@ impl KvBank {
                 fi.nb_used, fb.nb_cap
             )));
         }
-        let bits = |v: &[u32]| -> Vec<f32> { v.iter().map(|x| f32::from_bits(*x)).collect() };
-        let (w_q_cu, w_idx) = (bits(&fi.q_cu), bits(&fi.indices));
-        let (w_ind, w_ll) = (bits(&fi.indptr), bits(&fi.last_len));
+        let (w_q_cu, w_idx) = (crate::exec::u32s_as_f32(&fi.q_cu), crate::exec::u32s_as_f32(&fi.indices));
+        let (w_ind, w_ll) = (crate::exec::u32s_as_f32(&fi.indptr), crate::exec::u32s_as_f32(&fi.last_len));
         face.write_blocks_f32_on(
             owl_iface::contract::UpStream::Compute,
             &[
@@ -485,20 +484,19 @@ impl KvBank {
         let Some(px) = self.xqa.clone() else {
             return Ok(None);
         };
-        let u32le = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let pt_b = eval_ops(
-            TensorOps::from_host(Dtype::U32, vec![xt.page_table.len()], &u32le(&xt.page_table))
+            TensorOps::from_host(Dtype::U32, vec![xt.page_table.len()], &crate::exec::u32s_le_bytes(&xt.page_table))
                 .step(),
             face,
         )
         .await?;
         let sl_b = eval_ops(
-            TensorOps::from_host(Dtype::U32, vec![1], &u32le(&[xt.seq_len])).step(),
+            TensorOps::from_host(Dtype::U32, vec![1], &crate::exec::u32s_le_bytes(&[xt.seq_len])).step(),
             face,
         )
         .await?;
         let mk_b = eval_ops(
-            TensorOps::from_host(Dtype::U32, vec![xt.mask.len()], &u32le(&xt.mask)).step(),
+            TensorOps::from_host(Dtype::U32, vec![xt.mask.len()], &crate::exec::u32s_le_bytes(&xt.mask)).step(),
             face,
         )
         .await?;
@@ -2045,13 +2043,18 @@ impl KvBank {
                 XQA_SM_COUNT_FALLBACK
             }
         };
-        let xqa = if paged
-            && (plan.xqa_verify || plan.xqa_decode || plan.xqa_prefill)
-            && matches!(plan.kv, owl_models::env::KvQuant::Fp8E4M3)
-            && dims.hd == 256
-            && page == 32
-            && dims.hq / dims.hkv == 6
-        {
+        // **XQA 能力契约**(S6h):几何前提集中成表,不满足则**响亮告知**
+        // (原实现静默 `None` —— 换模型后 XQA 消失且无一行日志)。
+        let xqa_want = plan.xqa_verify || plan.xqa_decode || plan.xqa_prefill;
+        if xqa_want {
+            if let Err(why) = xqa_caps(&dims, page, plan.kv) {
+                owl_shared::log_warn!(
+                    "boot",
+                    "XQA 面被**几何契约**拒绝(本档请求了 XQA,但 {why})—— 该面关闭,其余档位不受影响"
+                );
+            }
+        }
+        let xqa = if paged && xqa_want && xqa_caps(&dims, page, plan.kv).is_ok() {
             let nb_i = nb;
             // 常量页表:单会话恒等链(0..nb)以 **i32 位型走私**进 f32 账叶
             let pt: Vec<f32> = (0..nb_i).map(|i| f32::from_bits(i as u32)).collect();
@@ -2240,6 +2243,27 @@ impl DraftBank {
 /// 本常量只在**查询不可用**时兜底(且回退时**响亮告警** —— 不静默:84 = sm86 双卡,
 /// 在 3080(68)上会让启发式系统性偏大)。
 const XQA_SM_COUNT_FALLBACK: usize = 84;
+
+/// **XQA 几何契约**(S6h):核只对 (hd=256, page=32, grp=6, fp8 e4m3) 实例化。
+///
+/// 单源:装配期**一处**判定;不满足返回原因(调用方**响亮告知**,不静默关脸)。
+fn xqa_caps(dims: &ModelDims, page: usize, kv: owl_models::env::KvQuant) -> std::result::Result<(), String> {
+    use owl_models::env::KvQuant;
+    if !matches!(kv, KvQuant::Fp8E4M3) {
+        return Err(format!("池量化 = {kv:?},契约要求 fp8 e4m3"));
+    }
+    if dims.hd != 256 {
+        return Err(format!("head_dim = {} ,契约要求 256", dims.hd));
+    }
+    if page != 32 {
+        return Err(format!("页宽 = {page} tok,契约要求 32"));
+    }
+    let grp = dims.hq / dims.hkv.max(1);
+    if grp != 6 {
+        return Err(format!("GQA 组 = {grp},契约要求 6"));
+    }
+    Ok(())
+}
 
 /// 按 dtype 清零分配(KV/GDN 状态块)。**设备侧 alloc + memset**,不走
 /// host 零向量 —— 曾用 `vec![0f32; n]` + to_le_bytes 逐元素造 64MB(rec
