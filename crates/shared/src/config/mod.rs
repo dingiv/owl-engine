@@ -111,8 +111,6 @@
 //! | dispatch | fi_min_tokens | usize / 1(FI 接管的 T 下限;128 = 复现旧行为) |
 //! | dispatch | xqa_prefill | flag / false(prefill 尾块走 XQA;主路径禁止开) |
 //! | graph | no_graph | flag / false(总闸:eager 直发,跳过**全部**图捕获) |
-//! | graph | prefill_bucket | off\|t512\|geobuckets / **off**(prefill 图**独立**
-//! |   |   | 开关:off = 今天行为;t512 = 只建 512 桶;geobuckets = 全桶族) |
 //! | agent | template_path | Option<String> / None(相对路径 = 相对 model.dir) |
 //! | agent | implicit_session | flag / false(AGT-09:不带 session 键 ⇒ 会话 0) |
 //! | agent | default_max_new / max_new_cap | usize / 4096、8192 |
@@ -1056,30 +1054,6 @@ pub mod sync_bit {
 pub struct GraphCfg {
     /// eager 直发,跳过图捕获(**总闸**:连 decode/verify/fold/propose 族一起关)
     pub no_graph: bool,
-    /// **prefill 图的独立档位**(P1;2026-10-15 立 —— 与总闸分离,可单关
-    /// prefill 而不动现役 decode 图族)。
-    ///
-    /// 分层而非 bool 的理由:回滚时要能**逐级降**,不必在"全开/全关"之间跳
-    /// - `off`(缺省):完全不建 prefill 图 = 今天行为,零影响;
-    /// - `t512`:只建 512 桶(最小面:显存最小、命中面 = 满块);
-    /// - `geobuckets`:全桶族 {32,64,128,256,512}(尾块也吃图,显存 ≈ 374 MiB)。
-    ///
-    /// 运行时另有**熔断**:某桶捕获失败/回放出错 ⇒ 该桶永久降级 eager
-    /// (只 warn 一次,不重试),与静态档位叠加。
-    pub prefill_bucket: PrefillBucket,
-}
-
-/// prefill 图档(见 [`GraphCfg::prefill_bucket`];serde 小写:off/t512/geobuckets)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PrefillBucket {
-    /// 不建 prefill 图(= 今天行为)
-    #[default]
-    Off,
-    /// 只建 t=512 桶(最小面)
-    T512,
-    /// 全桶族 {32,64,128,256,512}
-    Geobuckets,
 }
 
 /// 工具调用输出格式(agent.tool_call_format;**jinja 模板同名变量**)。
@@ -1367,6 +1341,48 @@ fn record_origins(v: &toml::Value, prefix: &str, origin: &Origin, out: &mut Orig
 /// 是**可操作**的那一半(点名新键 + 值域)—— 使用者不必去翻旧分支。
 ///
 /// 新增退役键 = 在表里加一行(`旧写法 → 新写法`)。
+/// **全字段显式校验**(配置档):把 `Default` 序列化出来的**全键表**当作 schema,
+/// 逐层比对文件里是否**每一个键都在场**;缺一个都拒启(列出全量,一次改完)。
+///
+/// 例外(自然豁免):`Option::None` 与 `skip_serializing_if` 的字段不出现在
+/// schema 里,因此**不要求**写(例如 `pool_tokens`、`runtime.device.*` 三件互斥)。
+fn check_explicit_complete(file_v: &toml::Value, path: &Path) -> Result<(), String> {
+    let schema = toml::Value::try_from(&OwlConfig::default())
+        .map_err(|e| format!("内部:schema 序列化失败 {e}"))?;
+    let mut missing: Vec<String> = Vec::new();
+    collect_missing(&schema, file_v, "", &mut missing);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    Err(format!(
+        "配置档 `{}` 未显式声明 {} 个字段(缺省不再隐式兜底 ⇒ 拒启):\n  {}\n\
+         生成完整档的最快方式:\n  server -p <旧档> --print-config > <新档>.toml",
+        path.display(),
+        missing.len(),
+        missing.join("\n  ")
+    ))
+}
+
+/// 递归比对:schema 有的键,文件里必须有。
+fn collect_missing(schema: &toml::Value, got: &toml::Value, prefix: &str, out: &mut Vec<String>) {
+    let toml::Value::Table(st) = schema else { return };
+    for (k, sv) in st {
+        let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+        match got.get(k) {
+            None => out.push(path),
+            Some(gv) => {
+                if let toml::Value::Table(_) = sv {
+                    // 表:只在文件也给了表时递归(标量覆盖整表 = 结构错误,交给反序列化)
+                    if let toml::Value::Table(_) = gv {
+                        collect_missing(sv, gv, &path, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
     if v.get("flavor").is_some() {
         return Err(
@@ -1651,6 +1667,15 @@ impl OwlConfig {
         let mut origins = Origins::new();
         let mut layer_names: Vec<String> = Vec::new();
         if let Some(b) = base {
+            // **配置档必须全字段显式**(2026-10-21 用户裁决):
+            // 缺任何键 = **拒启**,不再用代码缺省兜底(旧行为让各会话跑在
+            // "半份配置 + 旧缺省"上,启动点不可复现)。
+            //
+            // 站点层(`layers`)与 CLI 仍是**覆盖层**(它们只覆写,不负责补全)。
+            let mut file_v = toml::Value::Table(toml::map::Map::new());
+            let mut file_origins = Origins::new();
+            load_config_into(b, &mut file_v, 0, &mut Vec::new(), &mut file_origins)?;
+            check_explicit_complete(&file_v, b)?;
             load_config_into(b, &mut v, 0, &mut Vec::new(), &mut origins)?;
             layer_names.push(b.display().to_string());
         }
@@ -1811,38 +1836,6 @@ impl OwlConfig {
         // 单图烘 plan 档必须"图不烘表"(否则回放那次 memcpy 把同步进去的表盖掉
         // ⇒ 又回 inert 表)。**拒启**而不是自动纠正:静默改语义比拒启危险。
         //
-        // ✅ 2026-10-19 解禁:`[graph] prefill_bucket` × `[dispatch] fi_plan_bake`
-        // 不再是互斥对 —— **桶路也接了窗外 `fi_plan_sync`**(桶回放前由引擎把
-        // 本桶的 plan 表刷回共享 `int_ws`;见 `exec::prefill_chunk` 的回放点)。
-        //
-        // ⚠️ **但桶图 × FI 只有一种承载组合成立**(2026-10-19 桶门定谳,原注释
-        // "两条承载对桶图都成立"是**错的**):
-        // 桶图捕获期按 `t_pad` 烘 FI 节点(plan 形状 + 表内容),回放期
-        // `ctx = base + t` 可能 > `t_pad`(尾块)⇒
-        //   · 图自携(restore=true):表内容 = 捕获期 ctx=t_pad 的那份 ⇒ 尾块
-        //     读到截断的 KV 覆盖(0.8B 实测:输出退化成"重复、重复…");
-        //   · eager 瓦(cuda_graph=false):plan 形状随 ctx 跳变 ⇒ 图内 offsets/
-        //     padded/split 与窗外刷进去的表不同构(实测 IMA:核读 `q_indptr[5]`
-        //     —— 8 字节的 2 元表被按 6 元索引)。
-        // ⇒ 桶图硬配 `fi_plan_restore = false` + `fi_cuda_graph = true`。
-        if self.graph.prefill_bucket != PrefillBucket::Off {
-            if self.dispatch.fi_plan_restore {
-                return Err(
-                    "[graph] prefill_bucket 需要 fi_plan_restore = false \
-                     (图自携的是捕获期 ctx=t_pad 的表;尾块 ctx>t_pad 会读错 KV —— \
-                     由 host 每桶回放前 `fi_plan_sync` 刷精确表)"
-                        .to_string(),
-                );
-            }
-            if !self.dispatch.fi_cuda_graph {
-                return Err(
-                    "[graph] prefill_bucket 需要 fi_cuda_graph = true \
-                     (图档瓦让 plan 形状对 ctx 恒定;eager 瓦下形状随 ctx 跳变 ⇒ \
-                     图内烘的 offsets/padded/split 与窗外刷的表不同构)"
-                        .to_string(),
-                );
-            }
-        }
         if self.dispatch.fi_plan_bake.is_some() && self.dispatch.fi_plan_restore {
             return Err(
                 "[dispatch] fi_plan_bake 需要 fi_plan_restore = false \
@@ -2200,25 +2193,8 @@ mod extends_tests {
 }
 
 #[cfg(test)]
-mod prefill_bucket_tests {
+mod config_overlay_tests {
     use super::*;
-
-    /// 三档字面量 + 缺省 off + 非法值**结构化拒**(deny_unknown_fields 同族纪律:
-    /// 配置面不许有"写了但没人认"的值)
-    #[test]
-    fn prefill_bucket_parses_three_levels() {
-        let get = |toml: &str| -> PrefillBucket {
-            toml::from_str::<GraphCfg>(toml).expect("解析").prefill_bucket
-        };
-        assert_eq!(get(""), PrefillBucket::Off, "缺省 = off(= 今天行为)");
-        assert_eq!(get("prefill_bucket = \"off\""), PrefillBucket::Off);
-        assert_eq!(get("prefill_bucket = \"t512\""), PrefillBucket::T512);
-        assert_eq!(get("prefill_bucket = \"geobuckets\""), PrefillBucket::Geobuckets);
-        assert!(
-            toml::from_str::<GraphCfg>("prefill_bucket = \"t1024\"").is_err(),
-            "非法档位必须拒(不许静默落 off)"
-        );
-    }
 
     /// 基准文件 + 覆盖文件叠加(入口只给文件路径)
     #[test]

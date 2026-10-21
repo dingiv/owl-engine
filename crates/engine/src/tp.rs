@@ -254,7 +254,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         // ── v1 范围护栏(响亮拒;分相纪律的边界)──────────────────────
         // ① 投机草稿:verify/fold/propose 族图与草稿 prefill extend 是**双 rank
         //    未接线面**(S6+);
-        // ② prefill 桶族:桶出图尾自带读数(与"入队半零同步"分相冲突);
+        // ② prefill 桶族已退役(2026-10-21),不再有该面。
         // ③ 读数类探针:prefill 入队半里的 dtoh/sync 会撞 AR 自旋(见 on_peer 契约)。
         let k = &cfg.knobs;
         if k.draft.depth != 0 && !k.draft.tp_draft {
@@ -264,9 +264,6 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
                  (草稿 spec/权重按本 rank 计划分片 + 草稿池几何按分片 hkv)",
                 k.draft.depth
             ));
-        }
-        if k.prefill_bucket != owl_shared::config::PrefillBucket::Off {
-            return loud("TP v1 不支持 prefill 桶族(桶出图尾自带读数;入队/收割分相未覆盖)");
         }
         let bad_probes: Vec<&str> = [
             ("prefill_cksum", k.probes.prefill_cksum),

@@ -15,6 +15,15 @@
 > **修订记录**:2026-10-15 首轮(§0–§8 原样);2026-10-15 **二轮**(新增 §4.1c 源码级复核:
 > F-5…F-10 六条事实 ⇒ **P-4 删除、P-5 新增、padding 升为主路、数值口径分两层**;§0/§3.2/§5/§6/§8 随之改)。
 
+> **退役（2026-10-21）**：prefill 桶（`prefill_bucket` / `PrefillBuckets`）已在
+> `perf-review` 工作树删除（待合并/待提交）；备份分支 =
+> `backup/prefill-bucket-2026-10-21`（`main@23116c7`）。
+> 退役依据：W4A8 主场景实测 prefill 仅 **+0.9…+1.0%**、TTFT@8192 −27…−45 ms；
+> W4A16 + DFlash2 现场两对 **+1.1% / −2.2%**（不可复现，六点合计 −0.6%）；
+> 代价 555–900 MiB + 2.5 s boot + 一套图维护；历史 AWQ +3.6% 在当前
+> `chunk 1024 + tail_merge 1024` 形状下未复现。
+> 本文保留为历史设计与施工记录，不再代表现役代码。
+>
 ---
 
 ## 0. 先说结论(TL;DR)
@@ -890,3 +899,25 @@ needle 1.6k/4.9k/7.9k/9.3k 全对。
    ⇒ 桶路当前**没有绿的硬等价门**,本轮的证据是 27B 真机探针 + std;
 2. plan sync 首轮成本 ~1.5 ms/块(同 ctx 的第二轮起缓存命中)⇒ 可做请求级 plan 预热;
 3. 1400 t/s 未达(1358):差头寸 = 非 GEMM ~52 ms/块(attention 18.2 + GDN/FLA ~20 + norms/silu ~12)。
+
+### 9.6 KVMem × prefill 桶:Q 槽阻断(2026-10-21)
+
+**KVMem 档的 prefill 桶当前 100% 被旁路**,不是配置漏配:
+`exec/prefill_chunk.rs::bucket_prefill_chunk` 在 `select_decode=true` 时
+`return Ok(None)`(选择层是 KVMem 的硬前置),于是桶即使捕获也一次不回放。
+根因 = 选择层要每层全注意力 **post-RoPE Q 的末 8 行**,eager 路经
+`ctx.q_sink → eval_root_and_q → coverage_take_q`,桶图只输出 hidden/taps,
+没有 Q 窗出口。
+
+实测(单 3090 Ti,27B Q4_K_M,8k):
+- KVMem + geobuckets:6 桶 `Captured`(571 MiB),请求后
+  `bypass.diag=10 / hit=0 / eager.chunks=10`;
+- 非 KVMem eager vs geo:**1824.4 → 1841.8 t/s(+0.95%)**、
+  TTFT **4491.8 → 4449.4 ms(−42.5 ms)**,8/9 命中(尾块 569 tok 因
+  `t1024 pad=455 > 4` 正确回 eager)。
+
+修法 = 捕获期把每层 Q 的末 W 行 concat 成桶输出(`≈1.5 MiB/桶`),回放后走
+窗口版 `coverage_take_q_window` 填 `CoveragePending`;选择层仍在图外跑。
+详细代码路径、次要缺口(t1024 padding 护栏/阶梯顶 1024/GDN host 槽/
+`fi_plan_sync`/无绿硬门)与验收见
+[`prefill-桶-KVMem-Q槽-分析-2026-10-21.md`](prefill-桶-KVMem-Q槽-分析-2026-10-21.md)。

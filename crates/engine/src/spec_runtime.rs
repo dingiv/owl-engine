@@ -258,6 +258,16 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                 owl_models::env::KvQuant::None
             };
             env.kv.dtype = draft_dt;
+            // **草稿权重 plan 是独立事实**:DFlash2 量化族 = W4A16(非 AWQ),
+            // 未量化族 = F16。若沿用主干的 W4A8 tag,草稿 `marlin_gemm_w4a16_*`
+            // 会在 picker 的 tag 过滤处被拒(2026-10-21 W4A8 组合实测)。
+            env.quant = if owl_models::formats::qwen35::draft_is_quantized(
+                std::path::Path::new(dir),
+            )? {
+                owl_models::module::QuantPlan::W4A16
+            } else {
+                owl_models::module::QuantPlan::F16
+            };
             (Some((g.layers, g.hkv, g.hd)), env)
         }
         _ => (None, inp.base_env),

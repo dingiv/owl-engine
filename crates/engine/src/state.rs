@@ -196,10 +196,6 @@ pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     pub vram_reserve_mb: u64,
     /// GDN 画像 dump 全槽
     pub dump_all: bool,
-    /// **prefill 桶 padding 的 KV dump 页**(M2b,2026-10-15;设计 §4.2 律②)。
-    /// true ⇒ 主 KV 池多分配 **1 页**作"假行落的点"(不在管理面块表里 ⇒
-    /// 注意力结构上读不到);false ⇒ 池几何与历史逐字不变。
-    pub prefill_dump_page: bool,
     /// reset_gdn 后 GDN rec 格画像(诊断面;原 OWL_GDN_DBG)
     pub gdn_dbg: bool,
     /// **选择层视图块表槽**(B-2;`OWL_COVERAGE_PROBE=1` = 召回点探针档)。
@@ -309,7 +305,7 @@ pub(crate) struct PoolGeom {
     pub(crate) page: usize,
     /// **管理面**页数(store 块腿/会话块表/FI 页链槽只认这些)
     pub(crate) nb: usize,
-    /// **物理**页数(含 padding dump 页;= `nb + dump`)
+    /// **物理**页数(历史字段;prefill 桶退役后恒 = `nb`)
     pub(crate) nb_kv: usize,
     pub(crate) paged: bool,
     /// GDN 行容量(knobs.gdn_slots,boot 定谳;原自由函数 gdn_slots())
@@ -319,13 +315,6 @@ pub(crate) struct PoolGeom {
     /// B6.2:主 KV 池 fp8 e4m3 承载(true = 池块 U32 字节承载 1B/elem;
     /// 读核走 *_fp8 变体,写核 K0 转换写)
     pub(crate) kv_fp8: bool,
-    /// padding dump 页索引(假行 KV 槽落点;None = 本档无桶)
-    ///
-    /// 为什么假行不能落在真页:
-    /// 假行的 `slot` 若指向后面 chunk 还没写的真页 → ①KV 被脏值占位
-    /// (下个 chunk 真写会覆盖,但本层注意力若先读到就是错值)②末块尾部的位置
-    /// 可能在**块链之外**(越界槽号)。dump 页两种都堵死:恒不在链里,也恒可写。
-    dump_page: Option<usize>,
     /// 每页 token 折叠因子(页内行布局;legacy = 1)
     x: usize,
     /// GDN 画像 dump 全槽(knobs.gdn_dump_all)
@@ -698,13 +687,11 @@ impl PerTokBytes {
 /// 故取整到 **262MiB** 上界 —— 日志按 MiB 取整打印,常数不得骑在边界上)。
 /// ⚠️ 随图族变(depth / 臂换代 / 桶)⇒ 捕获后由 [`crate::graph_fleet`]
 /// 把**实测 Σ** 与本品对账,超了打 ⚠️(池上限可能偏大 ⇒ 请求级 OOM 风险)。
-/// ⚠️ **2026-10-19 两轮校准:262 → 320 → 640 MiB**(同日在两个旋钮上各加一次图):
-///   ① 桶族上线(`[graph] prefill_bucket = geobuckets`,五点阶梯):slab Σ = **296.5 MiB**
-///      (session 5 + verify 23 + fold 58 + dflash 5 + prefill桶 203)⇒ 262 会让
-///      "池上限"少算 34.5MiB(boot 的"图 slab 预算对账"warning 就是它);
-///   ② 阶梯尾档 +t1024(chunk 1024 生产档):桶族 Σ = **502.3 MiB** ⇒ 320 又不够。
-/// 总治理口径 400 → 778 MiB(WARMUP_MISC 138 不变),代价 = KV 池少 ~378MiB(≈7 页)。
-pub(crate) const GRAPH_SLAB_BUDGET: usize = 640 << 20;
+/// ⚠️ **2026-10-21 prefill 桶退役:640 → 320 MiB**。
+/// 历史:2026-10-19 为桶族(296.5)+ 尾档 t1024(502.3)把 262 抬到 640;
+/// 桶已删除,非桶图族(spec-dflash 实测 261MiB)回到 320 = 262 + 58MiB 余量。
+/// 总治理口径 778 → 458 MiB(WARMUP_MISC 138 不变),KV 池多 ~320MiB。
+pub(crate) const GRAPH_SLAB_BUDGET: usize = 320 << 20;
 
 /// warmup 瞬态 + 杂项(治理器之后、图之外的固定分配)。未单列实测;
 /// = 原一锅端 `400MiB` 减图项后的余量(总分不变 ⇒ 历史治理数字可比):
@@ -1142,10 +1129,6 @@ impl StatePool {
     }
 
     /// padding dump 页的 KV 平面槽基址(槽号 = 页号 × page;None = 无桶档)
-    pub(crate) fn dump_slot_base(&self) -> Option<usize> {
-        self.geom.dump_page.map(|p| p * self.geom.page)
-    }
-
     /// 逐层 KV cache 叶子句柄((k, v);slots/kv_lens/block_tables 由
     /// 调用方按步注入 —— 图闭包注输入槽,prefill 注 from_host 标量行)
     pub(crate) fn kv_caches(&self) -> Vec<(TensorOps, TensorOps)> {
@@ -1815,10 +1798,7 @@ impl<'a> AllocCtx<'a> {
                 )));
             }
         }
-        // prefill 桶 padding dump 页(M2b;设计 §4.2 律②):物理多 1 页,
-        // **管理面 nb 不变**(store 块腿/块表/页链槽容量都不受影响)。
-        let dump_page = plan.prefill_dump_page.then_some(nb);
-        let nb_kv = nb + dump_page.map(|_| 1).unwrap_or(0);
+        let nb_kv = nb;
 
         // FI 面启用 = 能力条件(paged + f16 池),不是开关;与 tables 块同源
         let fi_face = plan.fi_quant.is_some();
@@ -1826,7 +1806,7 @@ impl<'a> AllocCtx<'a> {
             plan,
             geom: PoolGeom {
                 dims, page, nb, nb_kv, paged, gdn_slots, fi_face, kv_fp8,
-                dump_page, x, dump_all, gdn_dbg,
+                x, dump_all, gdn_dbg,
             },
             kv_dt,
             kv_bytes_elem,
@@ -2416,21 +2396,19 @@ mod vram_budget_tests {
     /// 合计复现 boot 日志 `fixed_after=0.68G`(= 697MiB)。
     #[test]
     fn fixed_after_matches_production_and_keeps_historical_total() {
-        // ⚠️ 2026-10-19 校准后总分 400 → **458 MiB**(= 320 图 + 138 杂项):
-        // prefill 桶族(`prefill_bucket = geobuckets`)实测 slab Σ = 296.5MiB,
-        // 旧 262 的上界会让池多算 34.5MiB(长 ctx 请求 OOM 风险;boot 有对账 warning)。
-        // 代价 = KV 池少 ~58MiB(≈1 页)。历史数字与新数字都在本测里显式钉死。
+        // ⚠️ 2026-10-21 桶退役后:320 图 + 138 杂项 = **458 MiB**
+        // (非桶图族实测 261 + 59MiB 余量;KV 池多 ~320MiB)。
         assert_eq!(
             GRAPH_SLAB_BUDGET + WARMUP_MISC_BUDGET,
-            778 << 20,
-            "拆分不得改总分(2026-10-19 二轮校准:桶族 +t1024 ⇒ 图项 320→640;改预算同步本测)"
+            458 << 20,
+            "桶退役后预算校准(2026-10-21:640→320)"
         );
         let f = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1);
         assert_eq!(f.gdn_grid, 155_713_536);
         assert_eq!(f.gdn_snap, 155_713_536);
-        assert_eq!(f.graph_slab, 640 << 20, "图项 = 桶族含 t1024 的量级");
+        assert_eq!(f.graph_slab, 320 << 20, "图项 = 非桶图族 261 + 余量");
         assert_eq!(f.warmup_misc, 138 << 20);
-        assert_eq!(f.total(), 730_857_472 + (378 << 20), "boot 实测 fixed_after 随图项(262→640)+378MiB");
+        assert_eq!(f.total(), 730_857_472 + (58 << 20), "fixed_after = 历史 400MiB + 图项 58MiB");
     }
 
     /// 草稿池几何单源:逐 token 项与分配项同一来源(原两处各写一遍)

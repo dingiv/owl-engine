@@ -2086,3 +2086,25 @@ row-parallel 侧的切片/别名路径)。
 但溢写取料口是 `host_take`(整个宿主槽 = `planes × 单页`)⇒ TP 下盘块字节不匹配
 (写 2×、读 1× = 静默截断)。改为 `leg.host_slot_bytes()` 并去掉世界守卫;
 用例 `disk_block_is_the_host_slot_under_tp` 钉死“计划字节 = 2 页、盘槽数按链块算”。
+
+### 23.13 decode 单 token 定谳:q8_0 VDR=4(2026-10-21)
+
+**一句话**:GGUF × KVMem 单卡 3090 Ti 的单 token decode 已到带宽墙的 ~80%;
+本轮唯一确定收益 = **q8_0 MMVQ `VDR_Q8_0_Q8_1_MMVQ` 2→4**,`decode.step` p50
+**25.66→25.05 ms(−2.4%)**、客户端 decode **38.7→39.6 t/s(+2.3%)**;
+32k 点 p50 **25.61→25.00 ms(−2.4%)**。VDR=8 无额外收益(25.08 ms),取 4。
+
+**NSYS 单步(16k prompt + 64 输出,42:00.0)**:GPU busy **24.20 ms**/步;
+q4_K **10.66 ms(≈903 GB/s,已贴墙)** / q8_0 **8.37 ms(≈855 GB/s,原 8.98/797)**
+/ q6_K 1.76 ms(827) / attention 1.33 / quant_act 0.71 / GDN 0.45。
+每步权重 18.24 GB ⇒ 936 GB/s 地板 19.5 ms;剩余空间只在 q8_0 的 ~5%
+与 non-GEMM 尾巴(~2.4 ms)。
+
+**已否决**:q8_0 的「34B 块按 4B 对齐 + 移位拼接」逐 lane 方案虽过逐值门,
+但 p50 25.95→28.47 ms(更慢),已回退;要再做只能走整行 smem staging,
+预期只剩 0.2–0.4 ms,优先级低于投机解码。
+
+**下一刀**:DFlash2 GGUF(唯一破带宽地板杠杆)> quant_act 归并/复用
+(489 发/步、0.71 ms)> KVMem 首步 1.5 s 换页尖峰。
+完整数据/复现见
+[`docs/bench/gguf-kvmem-decode-nsys-2026-10-21.md`](../bench/gguf-kvmem-decode-nsys-2026-10-21.md)。

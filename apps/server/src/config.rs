@@ -351,12 +351,9 @@ impl ServerConfig {
             layers.push(p);
         }
         let mut resolved =
-            OwlConfig::load_resolved(base.as_deref(), &layers, &args.overrides())?;
+            OwlConfig::load_resolved(base, &layers, &args.overrides())?;
         if let Some(m) = resolved.meta.as_mut() {
-            m.intent.profile = args
-                .profile
-                .as_ref()
-                .map(|p| p.display().to_string());
+            m.intent.profile = base.map(|p| p.display().to_string());
         }
         Ok(resolved)
     }
@@ -478,6 +475,21 @@ fn vram_free_ratio_map() -> Option<std::collections::HashMap<String, f64>> {
 /// **选卡总入口**:两条规范互斥 —— `runtime.tp_ordinals` 给值 ⇒ TP 双卡档
 /// (零自动挑卡);不给 ⇒ 单卡档(声明式选卡/自动挑空闲)。
 fn resolve_devices(rt: &owl_shared::config::RuntimeCfg) -> Result<Devices, String> {
+    // **卡位必须显式**(2026-10-21 用户裁决):不再自动挑"任意空闲卡" ——
+    // 自动挑卡随当下占用漂移,同一份配置在不同时刻会落到不同卡上(生产不可复现)。
+    // 允许的三种写法(互斥由后面的分支校验):
+    //   runtime.tp_ordinals = [a, b]      TP 双卡
+    //   [runtime.device] bdf/uuid/find_name   单卡(声明式选卡只在**已给规格**内挑)
+    //   runtime.device_ordinal = N        测试/特殊场景
+    if rt.tp_ordinals.is_none() && rt.device.is_empty() && rt.device_ordinal.is_none() {
+        return Err(
+            "选卡未指定:必须显式给 `runtime.tp_ordinals = [a, b]`(TP 双卡)或 \
+             `[runtime.device] bdf/uuid/find_name`(单卡)。\n\
+             卡位是启动参数,不再自动挑空闲卡 —— 用 `--site <site.toml>` 或 \
+             `--set runtime.device.bdf=01:00.0` 指定。"
+                .into(),
+        );
+    }
     match &rt.tp_ordinals {
         None => {
             let (o, u) = resolve_device(rt)?;
@@ -632,12 +644,8 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
     let c = &r.config;
     let e = r.estimate()?;
     let arms = format!(
-        "prefill={} decode={} gdn={} bucket={:?}",
-        if c.graph.prefill_bucket == owl_shared::config::PrefillBucket::Off {
-            "eager"
-        } else {
-            "FI"
-        },
+        "prefill={} decode={} gdn={}",
+        "eager",
         if c.dispatch.decode_fi {
             "FI(single)"
         } else if c.dispatch.decode_xqa {
@@ -646,7 +654,6 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
             "eager"
         },
         if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
-        c.graph.prefill_bucket,
     );
     Some(format!(
         "[owl] profile={} card={} ctx={} pool={}({}) {} mem={}/{} (余 {}) reuse={} spec={} c={}",
@@ -700,7 +707,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         ));
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool_tokens={} chunk={} tail={} \
-             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={} bucket={:?}\n",
+             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
             c.runtime.max_seq,
             c.pool.pool_tokens.unwrap_or(0),
             c.runtime.prefill_chunk,
@@ -709,7 +716,6 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             c.runtime.max_batch,
             c.server.max_concurrency,
             c.dispatch.kv_fp8,
-            c.graph.prefill_bucket,
         ));
         if let Some(e) = r.estimate() {
             out.push_str(&format!(
@@ -754,7 +760,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         );
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool_tokens={:?} chunk={} tail={} \
-             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={} bucket={:?}\n",
+             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
             c.runtime.max_seq,
             c.pool.pool_tokens,
             c.runtime.prefill_chunk,
@@ -763,7 +769,6 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             c.runtime.max_batch,
             c.server.max_concurrency,
             c.dispatch.kv_fp8,
-            c.graph.prefill_bucket,
         ));
     }
 
@@ -817,15 +822,6 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     }
 
     // ── 组合告警(不拒;`--check` 的 UX 价值就在把隐患提前说出来) ──
-    if c.graph.prefill_bucket != owl_shared::config::PrefillBucket::Off
-        && c.runtime.prefill_chunk + c.runtime.prefill_tail_merge > 1024
-    {
-        out.push_str(&format!(
-            "[check] WARN: chunk+tail = {}+{} > 1024:尾块没有桶图 ⇒ eager(激活约 1.7G);\
-             贴顶档建议拆成 512+512 或 1024+0\n",
-            c.runtime.prefill_chunk, c.runtime.prefill_tail_merge
-        ));
-    }
     if !c.kvmem.pool_overcommit {
         if let Some(p) = c.pool.pool_tokens {
             if p < c.runtime.max_seq {
@@ -839,11 +835,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     }
 
     // ── 臂摘要 ──
-    let prefill = match c.graph.prefill_bucket {
-        owl_shared::config::PrefillBucket::Off => "eager",
-        owl_shared::config::PrefillBucket::T512 => "FI(t512)",
-        owl_shared::config::PrefillBucket::Geobuckets => "FI(全桶族)",
-    };
+    let prefill = "eager";
     let decode = if c.dispatch.decode_fi {
         "FI(单图)"
     } else if c.dispatch.decode_xqa {

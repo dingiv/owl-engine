@@ -20,7 +20,7 @@ crates/<crate>/src/<模块路径>.rs  +  用例名 <fn>
 max_seq = 2048
 
 # 也可自带基准(显式路径)
-# extends = "profiles/legacy/spec-dflash.toml"
+# extends = "profiles/spec-dflash.toml"
 ```
 
 - **存在才加载**；删除文件 = 还原；**不会影响任何兄弟用例**（天然隔离）；

@@ -7,7 +7,7 @@
 >
 > **2026-10-20 配置统一**:只有一个概念 —— **profile = 一份 TOML 配置文件**。
 > 没有 "flavor"。用户启动用 `-p <profile_path>`;源码 `profiles/` 下是可直接
-> 复制修改的常用档,历史低层档在 `profiles/legacy/`。
+> 复制修改的常用档;**所有档都是完整档**(全字段显式,缺一拒启,见 §1.1)。
 
 ## 1. 一个概念:profile
 
@@ -27,8 +27,24 @@ $EDITOR ~/my-27b.toml          # 改 model.dir / runtime.bind / tp_ordinals
 ./target/release/server -p ~/my-27b.toml
 ```
 
-`profiles/` 顶层是常用档;`profiles/legacy/` 是历史低层档(回归/取证),
-同样用 `-p profiles/legacy/<name>.toml` 显式路径启动。
+`profiles/` 下全部是可直接用的**完整档**。历史 `legacy/` 目录已于
+2026-10-21 删除,`tp27b-3080-262k.toml`(引用已退役的顶层 `kv_fp8`)一并删除。
+
+## 1.1 配置档必须**全字段显式**（2026-10-21 裁决）
+
+- 用 `-p <profile>` 给的档，**每一个键都必须在文件里写出来**；缺一个 ⇒ **拒启**
+  （错误里一次列出全部缺项）。代码缺省不再兜底 —— 旧行为让各会话跑在
+  "半份配置 + 旧缺省"上（4k / F16 KV / 无投机 / 无图），启动点不可复现。
+- 站点层（位置参数 / `--site`）与 CLI（`--set`）仍是**覆盖层**：它们只覆写，
+  不负责补全。
+- 生成完整档的最快方式：
+
+  ```bash
+  server -p <旧档> --print-config > <新档>.toml
+  ```
+
+- 卡位**必须显式**：`runtime.tp_ordinals = [a, b]`（TP 双卡）或
+  `[runtime.device] bdf/uuid/find_name`（单卡）。不再自动挑"任意空闲卡"。
 
 ## 2. 层序(后面的覆盖前面的)
 
@@ -96,8 +112,8 @@ reuse       = "off"               # off | session | global;不写 = goal 决定
 | `kv=fp8/f16` | `dispatch.kv_fp8` |
 | `kvmem=off` | 选择层/索引/超卖四键全关 + 宿主/磁盘腿清零 |
 | `kvmem=overcommit` | 四键全开 + 宿主腿 + 强制 prefix_cache |
-| `graphs=auto` | FI 单图 decode + prefill 桶族 + `fi_plan_bake=0` + 窗刷表 |
-| `graphs=off` | `no_graph=true`,FI 臂/桶全关 |
+| `graphs=auto` | FI 单图 decode + `fi_plan_bake=0` + 窗刷表（prefill 桶已退役） |
+| `graphs=off` | `no_graph=true`,FI 臂全关 |
 | `reuse=off` | 前缀缓存/快照全关(单会话最大上下文) |
 | `reuse=session` | 1 条快照 + 1G 状态腿 |
 | `reuse=global` | 4 条快照 + 4G KV 宿主腿 + 3G 状态腿 |
@@ -178,7 +194,7 @@ ls profiles/
 2. 先 `--check`(无 GPU 也能跑),看清派生值与内存账;
 3. 真机 boot 后对照 `[vram-gov]` 与 `--print-config` 的估算;偏差大时先查
    `live`(权重是否换了家族)/ `fixed_after`(并发/快照);
-4. 历史档在 `profiles/legacy/`;实验也用 `-p <path> <overlay.toml>` 或 `--set`。
+4. 实验档用 `-p <path> <overlay.toml>` 或 `--set`(不再有 legacy 目录)。
 
 ## 7.1 视觉塔(`[model].vision`)
 
@@ -198,7 +214,7 @@ ls profiles/
 
 ## 8. 兼容与挂账
 
-- **历史低层档 `profiles/legacy/` / testdata 原样可跑**(无 `[intent]` ⇒ 解析器不介入);
+- **低层档(`profiles/awq27b.toml`、`spec-dflash.toml`)/ testdata 原样可跑**(无 `[intent]` ⇒ 解析器不介入);
 - `OWL_MAX_SEQ` / `OWL_PREFILL_CHUNK` **已删除**(2026-10-20):它们会在
   意图派生后再改一次,造成 `max_seq` 与 `pool_tokens` 双源。临时调压请
   `--set runtime.max_seq=…`(池会跟随,除非显式给 `pool.pool_tokens`)。

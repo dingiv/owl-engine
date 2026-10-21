@@ -11,7 +11,7 @@ extends(可选,基准档路径)  →  OWL_TEST_CONF(整轮环境档)  →  用�
 
 | 层 | 放哪 | 干什么 | 进版本? |
 |---|---|---|---|
-| `extends` | 任意路径(`profiles/legacy/...`) | 复用基准档:`extends = "profiles/legacy/spec-dflash.toml"` | ✅ |
+| `extends` | 任意路径(`profiles/...`) | 复用基准档:`extends = "profiles/spec-dflash.toml"` | ✅ |
 | 环境档 | 任意路径,用 **`OWL_TEST_CONF`** 指定 | 整轮共同口径(各会话/各 agent 一致) | 否(`conf/` 本地) |
 | **用例 overlay** | `testdata/cases/<crate>/<模块路径>/<用例名>.toml` | 只改**一个**用例;**删文件即还原** | 否(随手写/删) |
 
@@ -25,7 +25,7 @@ extends(可选,基准档路径)  →  OWL_TEST_CONF(整轮环境档)  →  用�
 
 ```toml
 # testdata/conf/local.toml(整轮口径)
-extends = "profiles/legacy/spec-dflash.toml"
+extends = "profiles/spec-dflash.toml"
 
 [runtime]
 max_seq = 4096

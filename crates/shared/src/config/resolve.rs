@@ -260,7 +260,6 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     match intent.graphs {
         GraphIntent::Off => {
             b.set("graph.no_graph", true.into(), "intent.graphs = off(eager 直发)");
-            b.set("graph.prefill_bucket", "off".into(), "intent.graphs = off");
             b.set("dispatch.fi_cuda_graph", false.into(), "intent.graphs = off");
             b.set("dispatch.fi_plan_restore", true.into(), "intent.graphs = off");
             b.set("dispatch.decode_fi", false.into(), "intent.graphs = off");
@@ -283,7 +282,6 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                         "graphs=auto 已降级为 eager/piecewise:{reason}(仍保留 decode 普通图)"
                     ));
                     b.set("graph.no_graph", false.into(), "graphs=auto(降级:保留普通 decode 图)");
-                    b.set("graph.prefill_bucket", "off".into(), "graphs=auto 降级:不建 prefill 桶");
                     b.set("dispatch.fi_cuda_graph", false.into(), "graphs=auto 降级");
                     b.set("dispatch.fi_plan_restore", true.into(), "graphs=auto 降级");
                     b.set("dispatch.decode_fi", false.into(), "graphs=auto 降级");
@@ -293,11 +291,6 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                 }
                 None => {
                     b.set("graph.no_graph", false.into(), "graphs=auto");
-                    b.set(
-                        "graph.prefill_bucket",
-                        "geobuckets".into(),
-                        "graphs=auto:prefill 全桶族(尾块也吃图)",
-                    );
                     b.set("dispatch.decode_fi", true.into(), "graphs=auto:decode FI 单图");
                     b.set(
                         "dispatch.verify_fi",
@@ -706,7 +699,6 @@ mod tests {
         assert_eq!(c.dispatch.fi_cuda_graph, f.dispatch.fi_cuda_graph);
         assert_eq!(c.dispatch.fi_plan_bake, f.dispatch.fi_plan_bake);
         assert_eq!(c.dispatch.fi_plan_restore, f.dispatch.fi_plan_restore);
-        assert_eq!(c.graph.prefill_bucket, f.graph.prefill_bucket);
         assert_eq!(c.spec.depth, f.spec.depth);
         assert_eq!(c.kvmem.select_decode, f.kvmem.select_decode);
         assert_eq!(c.kvmem.select_partial, f.kvmem.select_partial);
@@ -837,14 +829,7 @@ graphs = "auto"
         );
         assert_eq!(get_bool(&v, "dispatch.fi_cuda_graph"), Some(false));
         assert_eq!(get_bool(&v, "dispatch.decode_fi"), Some(false));
-        assert_eq!(get_str_prefill_bucket(&v), "off");
-    }
-
-    fn get_str_prefill_bucket(v: &Value) -> String {
-        get(v, "graph.prefill_bucket")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string()
+        assert!(get(&v, "graph.prefill_bucket").is_none(), "prefill 桶已退役");
     }
 
     /// 旧档(无 intent)零变化:apply 返回 None 且不增删键
@@ -880,6 +865,6 @@ kvmem = "overcommit"
         assert_eq!(get_bool(&v, "kvmem.select_decode"), Some(true));
         assert_eq!(get_bool(&v, "kvmem.pool_overcommit"), Some(true));
         // 选择层档不得建 FI 桶图
-        assert_eq!(get_str_prefill_bucket(&v), "off");
+        assert!(get(&v, "graph.prefill_bucket").is_none(), "prefill 桶已退役");
     }
 }

@@ -130,6 +130,11 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
         tags.push(T::QUANT_INT8);
         tags.push(T::FEAT_HEAD);
     }
+    // 头是独立 plan:主干 W4A8/GGUF 时,int4 头仍要放行 W4A16 核。
+    if cfg.model.head_quant == HeadQuant::RtnInt4G32 {
+        tags.push(T::QUANT_W4A16);
+        tags.push(T::QUANT_AWQ);
+    }
     if cfg.dispatch.kv_fp8 {
         tags.push(T::KV_MAIN_FP8);
     } else {
@@ -138,6 +143,10 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
     if cfg.spec.depth > 0 {
         tags.push(T::FEAT_DFLASH);
         tags.push(T::FEAT_SPEC);
+        // DFlash2 草稿自持 W4A16 权重(与主干 plan 独立;MTP = F16 不需)。
+        if cfg.model.dflash2_dir.is_some() {
+            tags.push(T::QUANT_W4A16);
+        }
         // 草稿池默认 BF16；draft_kv_fp8 时 fp8。
         if cfg.spec.draft_kv_fp8 {
             tags.push(T::KV_DRAFT_FP8);
@@ -151,7 +160,7 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
     if cfg.runtime.tp_ordinals.as_ref().is_some_and(|v| v.len() > 1) {
         tags.push(T::FEAT_TP);
     }
-    owl_kernels::tag_filter::TagFilter::from_tags(&tags)
+    owl_kernels::tag_filter::TagFilter::from_tags(&tags).with_prod_kv_layouts()
 }
 
 // 流身份证(server 内部路由键;客户端不可见 —— 三固定流是 server 策略)
@@ -3222,6 +3231,31 @@ mod tag_filter_tests {
         assert!(allows(&cfg, "owl_layernorm_f16"));
         assert!(allows(&cfg, "owl_dflash_conv_bf16"));
         assert!(allows(&cfg, "owl_comm_ar_stage_f8_f16"));
+    }
+
+    #[test]
+    fn w4a8_main_with_int4_head_and_dflash_allows_aux_w4a16() {
+        let mut cfg = OwlConfig::default();
+        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.quant = QuantScheme::W4a8;
+        cfg.model.head_quant = HeadQuant::RtnInt4G32;
+        cfg.model.dflash2_dir = Some("/tmp/dflash2".into());
+        cfg.spec.depth = 7;
+        assert!(allows(&cfg, "marlin_gemm_w4a8_awq"), "主干 W4A8");
+        assert!(allows(&cfg, "marlin_gemm_w4a16_awq"), "int4 头 W4A16");
+        assert!(allows(&cfg, "marlin_gemm_w4a16_bf16"), "DFlash2 草稿 W4A16");
+        assert!(!allows(&cfg, "owl_gguf_gemm_q4k"), "GGUF 仍应拒");
+    }
+
+    #[test]
+    fn w4a8_without_aux_keeps_w4a16_out() {
+        let mut cfg = OwlConfig::default();
+        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.quant = QuantScheme::W4a8;
+        cfg.model.head_quant = HeadQuant::Off;
+        cfg.spec.depth = 0;
+        assert!(allows(&cfg, "marlin_gemm_w4a8_awq"));
+        assert!(!allows(&cfg, "marlin_gemm_w4a16_awq"), "无头/无草稿时不得放行 W4A16");
     }
 
     #[test]

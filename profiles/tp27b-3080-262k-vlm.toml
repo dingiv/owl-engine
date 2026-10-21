@@ -9,74 +9,184 @@
 # + Unclassified 0.87G + GDN/图 0.16G ⇒ used ≈ 19.19G / 20.48G,free ≈ 0.9G。
 # 视觉塔算子由 `feat.vision` tag + 配置派生 TagFilter 自动放行(无 allowed_ops)。
 #
-[model]
-name = "qwen3.8-27b"
-dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
-kind = "awq27b"
-# **W4A16**:权重 AWQ-INT4(g32 asym)+ **激活 f16**(本档口径;W4A8 质量门未过档)
-quant = "w4a16"
-# **lm_head int8 per-row**(P1.5-a;2026-10-20 起本档默认):
-#   装载期现算(`s_o = absmax/127`,q = RN-even(w/s)),头走
-#   `owl_gemv_i8w_{f16,bf16}`(**只吃 m=1**:prefill 也在末行窄切后调用 ⇒ 同一核)。
-#   判据:TP1 27B token 100%(344/344);TP2 词表切下 96.9%(744/768,唯一分歧
-#   步 = 21.6094 vs 21.6094 的 near-tie,margin 1.6e-2);decode 22.43 → 21.47 ms/tok
-#   (**−4.3%**,3080 对实测)。回退 = 删本行(缺省 off)或显式 `head_quant = "off"`。
-head_quant = "rtn-int8-row"
 
-# 视觉塔装载(model.visual.*;文本主干共享)
-vision = true
+# --- 以下为**完整档**（2026-10-21）：所有字段显式声明，缺一个就拒启。
+# 生成方式：server -p <旧档> --print-config > <新档>.toml
 
 [runtime]
-# **TP 档选卡 = 显式双 ordinal**(v1;与 device / device_ordinal 互斥 ——
-# 分片协议要"确定双卡 + 确定 rank 序",自动挑卡结果随占用漂移)。
-# 启动日志 `[boot] 选卡(TP 档):rank0 = ordinal N → GPU-…` 是身份自证。
-# 卡位已写本档(本机 CUDA 序 [2, 3]);换机器请改 `runtime.tp_ordinals`。
-# 测速几何(std 五点 512..8192 + 256 出 ⇒ 8448 够):与 awq27b 基准档同参
+bind = "127.0.0.1:8138"
+tp_ordinals = [
+    2,
+    3,
+]
+tp_push = false
+tp_ar_f8 = false
+tp_vocab_split = true
+tp_ar_fused = true
+gpu_min_free_ratio = 0.9
 max_seq = 262144
 prefill_chunk = 512
-bind = "127.0.0.1:8138"
-tp_ordinals = [2, 3]
-# **lm_head 词表切**(P1.1 2026-10-19;本档 2026-10-20 才真正打开 ——
-# 此前它只在门/专项档里开过,**生产档一直是每 rank 全表头**)。
-# 判据:`tp_vocab_split_gate` 27B 双卡全绿 —— 半表 124160 ×2 = 248320、
-# 逐步 max|Δ| = **0.000000**(行独立 ⇒ 数值中性)、token 逐位相同(8 tok)。
-# 收益(3080 对 @1024/256 ×3,两台冷启):decode 50.23 → **51.92(+3.4%)**。
-tp_vocab_split = true
-# **AR v1 两核融合**(§11.2;2026-10-19 就有,缺省关 ⇒ 生产一直在跑两核)。
-# A/B(2 冷启 × 3 轮,6/6 配对全正):48.87 → **50.23(+2.4%)**;
-# 0.8B `tp_g8_gate` 融合档 L1 逐位相同(v1=0 / fused=96)。
-tp_ar_fused = true
+max_batch = 1
+prefill_tail_merge = 0
+slice_every = 0
+slice_tokens = 0
+newcomer_min_tokens = 4096
+min_gen_tokens = 256
+reserve_pages = 0
+max_queue = 0
+
+[model]
+kind = "awq27b"
+vision = true
+dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+name = "qwen3.8-27b"
+dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+head_quant = "rtn-int8-row"
+quant = "w4a16"
+
+[model.rope]
+yarn_factor = 1.0
+original_max = 0
+beta_fast = 32.0
+beta_slow = 1.0
+attention_factor = 1.0
+
+[pool]
+pool_tokens = 262144
+gdn_slots = 1
+prefill_align_tail = true
+snap_decode_stride = 1
+prefix_cache_share = 0.5
+snap_max = 1
+host_cache_mb = 0
+pool_cap_mb = 256
+snap_host_mb = 0
+disk_cache_mb = 0
+snap_disk_mb = 0
+disk_dir = ""
+vram_target = 0.99
+vram_reserve_mb = 256
+prefix_cache = false
+
+[kvmem]
+select_decode = false
+select_partial = false
+index = false
+workspace_per_req = 2240
+select_sink = 2
+select_recent = 4
+recall_every = 1
+coverage_probe = false
+analyze_at_ctx = 0
+evict_policy = "lru"
+pool_overcommit = false
 
 [spec]
 depth = 7
+dumb = false
+draft_kv_fp8 = false
+notaps = false
+tapdecl = false
 tp_draft = true
-
-[pool]
-gdn_slots = 1
-snap_max = 1
-# 长 ctx 生产服务:**前缀缓存关** —— 池按 262k 全量给
-prefix_cache = false
-# **整池 = 全上下文**(常驻,无超卖;无宿主腿)
-pool_tokens = 262144
-# 99% 贴顶:留 256 MiB 守卫余量
-vram_target = 0.99
-vram_reserve_mb = 256
-# 无宿主腿
-host_cache_mb = 0
-snap_host_mb = 0
+degrade_after = 6
+probe_every = 8
 
 [sampling]
-# greedy = 恒等门口径(**测速档建议配 `--ignore-eos`**,否则随机词池
-# OOD 输入下模型常几个 token 就停 ⇒ decode 读数成伪影)
 mode = "greedy"
+temp = 1.0
+topk = 20
+topp = 0.949999988079071
+rep_penalty = 1.0
+
+[load]
+verify = false
+debug_tap = false
+staging_mb = 128
+repack = "auto"
+dump = false
+
+[dispatch]
+qkv_fuse = true
+prefill_split = false
+force_naive_prefill = false
+verify_v2 = true
+fi_plan_restore = true
+fi_cuda_graph = false
+verify_fi = false
+decode_fi = false
+verify_xqa = false
+decode_xqa = false
+xqa_prefill = false
+fi_min_tokens = 1
+gdn_chunked = true
+gdn_scalar = false
+gdn_fused_decode = true
+gdn_fused_decode_v2 = true
+kv_fp8 = true
+resolve_trace = false
+host_argmax = false
+ts_probe = false
+tag_wildcard = false
+
+[probes]
+step_profile = false
+perf_level = "host"
+gdn_dump = false
+debug = false
+prefill_cksum = false
+fact_probe = false
+trace_gate = false
+dflash_probe = false
+propose_eager = false
+dflash_eager = false
+dflash_noencode = false
+dflash_dumb = false
+gdn_dump_all = false
+pf_bisect = false
+pf_fin_check = false
+raw_completion = false
+prompt_dump = false
+gdn_dbg = false
+pf_fence = false
+step_gate = "off"
+step_gate_ms = 0
+step_gate_us = 0
+step_gate_every = 0
+
+[cuda]
+srv_timing = false
+cap_prof = false
+launch_sync = false
+sync_mask = 0
+launch_time = false
+d2h_prof = false
+gpu_prof = false
+free_legacy = false
+trace_ring = 0
+
+[cuda.graph_flags]
+upload = false
+device_launch = false
+
+[graph]
+no_graph = false
 
 [server]
 max_concurrency = 1
 
-[dispatch]
-# **主 KV e4m3 池**（262k 的唯一解，见卷首账）。
-# 旧 `allowed_ops` 大清单已退役：准入由配置派生的 tag filter 自动完成
-# （W4A16/GGUF/KV/vision/spec/TP/head），不再手抄核名。
-kv_fp8 = true
-prefill_split = false
+[agent]
+implicit_session = false
+default_max_new = 4096
+max_new_cap = 8192
+parse_tool_calls = true
+tool_call_format = "xml"
+auto_disable_thinking_with_tools = false
+queue_wait_ms = 0
+
+[log]
+level = "warn"
+tags_allow = []
+tags_deny = []
+max_mb = 0
+keep = 0
+timestamp = false

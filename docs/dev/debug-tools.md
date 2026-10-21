@@ -52,8 +52,8 @@ gdn_dbg = true       # reset_gdn 后 GDN rec 格画像
 debug = true         # 图捕获序列化走查
 ```
 
-**律:诊断在场 ⇒ 快路径让位,且**不静默**。** 例:prefill 桶图在 `pf_bisect/pf_stages/dflash_probe`
-在场时**全部让位 eager**(图形的诊断口径只在 eager 路),并打一次 WARN;要图就关诊断。
+**律:诊断在场 ⇒ 快路径让位,且**不静默**。** 例:prefill 桶图已于 2026-10-21 退役;
+历史行为是诊断档在场时让位 eager。现在 prefill 恒 eager,诊断面不再与桶冲突。
 
 ## 4. 常用取证组合
 
