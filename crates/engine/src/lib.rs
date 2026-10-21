@@ -42,7 +42,6 @@ pub(crate) mod disk_io;
 pub(crate) mod exec;
 pub(crate) mod graph_fleet;
 pub(crate) mod loader;
-pub(crate) mod prefill_plan;
 pub(crate) mod running;
 pub(crate) mod sampler;
 // **调度政策**:准入 + 相位两个独立状态机(纯数据/零 I/O;事实由引擎每拍注入)。

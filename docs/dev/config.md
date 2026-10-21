@@ -96,8 +96,8 @@ reuse       = "off"               # off | session | global;不写 = goal 决定
 | `kv=fp8/f16` | `dispatch.kv_fp8` |
 | `kvmem=off` | 选择层/索引/超卖四键全关 + 宿主/磁盘腿清零 |
 | `kvmem=overcommit` | 四键全开 + 宿主腿 + 强制 prefix_cache |
-| `graphs=auto` | FI 单图 decode + prefill 桶族 + `fi_plan_bake=0` + 窗刷表 |
-| `graphs=off` | `no_graph=true`,FI 臂/桶全关 |
+| `graphs=auto` | FI 单图 decode + `fi_plan_bake=0` + 窗刷表（prefill 桶已退役） |
+| `graphs=off` | `no_graph=true`,FI 臂全关 |
 | `reuse=off` | 前缀缓存/快照全关(单会话最大上下文) |
 | `reuse=session` | 1 条快照 + 1G 状态腿 |
 | `reuse=global` | 4 条快照 + 4G KV 宿主腿 + 3G 状态腿 |

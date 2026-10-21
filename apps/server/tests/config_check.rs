@@ -56,7 +56,7 @@ fn profile_check_reports_128k_and_memory_basis() {
         "budget 5.95G",
         "OK(estimated",
         "model dir:",
-        "arms: prefill=FI(全桶族)",
+        "arms: prefill=eager",
     ] {
         assert!(s.contains(needle), "check 输出缺 {needle:?}:\n{s}");
     }

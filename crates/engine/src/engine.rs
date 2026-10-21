@@ -219,8 +219,6 @@ pub struct EngineKnobs {
     /// spec 轮提交跨过页边界 ⇒ 用 fold 把 GDN 态回卷到边界拍一张再卷回;
     /// 本键节流(`边界页号 % stride == 0` 才拍)。0 = 关(旧行为:生成相位不拍)。
     pub snap_decode_stride: usize,
-    /// **prefill 图档位**(P1;`[graph] prefill_bucket`;缺省 `off` = 今天行为)
-    pub prefill_bucket: owl_shared::config::PrefillBucket,
     /// **FI plan 图档瓦**(`[dispatch] fi_cuda_graph`;2026-10-18 图档单图立案):
     /// 开 ⇒ 形状对 ctx 全域恒定(可烘图的先决条件)。装配期经
     /// `owl_kernels::family::flashinfer::configure_plan_env` 投递给核。
@@ -230,7 +228,7 @@ pub struct EngineKnobs {
     /// **图自携 FI plan restore**(`[dispatch] fi_plan_restore`;缺省 true):
     /// true = 捕获窗内把本 plan 表烘成图内 memcpy(桶图旧行为);
     /// false = 图不烘表 ⇒ **host 是唯一权威**,每个图回放前窗外 `fi_plan_sync`
-    /// (decode/verify 既有;2026-10-19 起 prefill 桶也走这条)。
+    /// (decode/verify 既有;prefill 桶已退役,2026-10-21)。
     pub fi_plan_restore: bool,
     /// TS 探针槽(原 OWL_TS_PROBE)
     pub ts_probe: bool,
@@ -315,7 +313,6 @@ impl Default for EngineKnobs {
             max_queue: 0,
             prefill_align_tail: true,
             snap_decode_stride: 1,
-            prefill_bucket: owl_shared::config::PrefillBucket::Off,
             fi_cuda_graph: false,
             fi_plan_bake: None,
             fi_plan_restore: true,
@@ -608,7 +605,6 @@ impl EngineKnobs {
             // 只放 `dense_floor_of` 的三态占位。
             dense_floor: Self::dense_floor_of(&cfg.kvmem),
             no_graph: cfg.graph.no_graph,
-            prefill_bucket: cfg.graph.prefill_bucket,
             fi_cuda_graph: cfg.dispatch.fi_cuda_graph,
             // 哨兵:0 = 取 max_seq(FI 调度表的图档上界 = 单序列 ctx 的天然上界;
             // 这样档位改 max_seq 时上界跟着走,不必两处手改)
@@ -891,9 +887,6 @@ impl<D: DeviceClient + 'static> Engine<D> {
             v_card_bytes: owl_shared::vram::free_bytes(),
             live_at_new: owl_shared::vram::live_bytes(),
         };
-        // 注:`[graph] prefill_bucket` 的**真接线在 [`Self::run`]**(桶捕获需要
-        // 模型与状态池;静止点律 ⇒ 只在 boot 做)。此处不再拒启(2026-10-15
-        // M2b 落地;此前的"配了没实现就拒"临时门已被真接线取代)。
         let ledger_cell = owl_store::ledger_entry(&ledger);
         let face = DeviceHandle::new(face, Some(ledger_cell.clone()));
         Ok(Self { face, ledger, ledger_cell, cfg, boot })
@@ -1312,31 +1305,6 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
                 ));
             }
         }
-        // **桶图 × FI plan 承载的定形门**(2026-10-19 桶门定谳):
-        // 桶图在捕获期按 `t_pad` 烘 FI 节点(plan 形状 + 表内容),而回放期
-        // `ctx = base + t` 可能 > `t_pad`(尾块)⇒ 只有"图档瓦(形状对 ctx 恒定)
-        // + 窗外刷表(内容对 ctx 精确)"这一组合同构才成立。
-        // - 图自携(restore=true):表内容 = 捕获期 ctx=t_pad 的那份 ⇒ 尾块读到
-        //   截断的 KV 覆盖(实测 0.8B:输出退化成"重复、重复…");
-        // - eager 瓦(cuda_graph=false):plan 形状随 ctx 跳变 ⇒ 图内烘的
-        //   offsets/padded/split 与窗外刷进去的表不同构(实测 IMA `q_indptr[5]`).
-        // 生产档(`[dispatch] fi_plan_restore=false` + `fi_cuda_graph=true`)本就满足;
-        // 这里把"凑巧"变成不变量(测试/直连档不许再走错组合)。
-        if cfg.knobs.prefill_bucket != owl_shared::config::PrefillBucket::Off {
-            if cfg.knobs.fi_plan_restore {
-                return Err(owl_iface::contract::ModelError::Msg(
-                    "prefill 桶图要求 `fi_plan_restore = false`(图不烘表,host 每桶回放前 \
-                     `fi_plan_sync` 刷精确表)—— 图自携的是捕获期 ctx=t_pad 的表,尾块\
-                     (ctx>t_pad)会读错 KV".into(),
-                ));
-            }
-            if !cfg.knobs.fi_cuda_graph {
-                return Err(owl_iface::contract::ModelError::Msg(
-                    "prefill 桶图要求 `fi_cuda_graph = true`(图档瓦让 plan 形状对 ctx \
-                     恒定)—— 否则图内烘的 offsets/padded/split 与窗外刷的表不同构".into(),
-                ));
-            }
-        }
         // **投机深度定形门**(2026-10-16):verify 块 = `depth + 1` 行,而首轮
         // 拼接核的输入槽数是**声明面事实**(`CONCAT_ROWS_SLOTS` = 8)⇒ depth 超界
         // 会在**首个 verify 步**才爆(且那时树已经 pad 到错槽数)。
@@ -1488,9 +1456,6 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             vram_target: cfg.knobs.vram_target,
             vram_reserve_mb: cfg.knobs.vram_reserve_mb,
             dump_all: cfg.knobs.gdn_dump_all,
-            // prefill 桶 padding 的 dump 页(M2b):档位非 off 才多分配那 1 页
-            prefill_dump_page: cfg.knobs.prefill_bucket
-                != owl_shared::config::PrefillBucket::Off,
             gdn_dbg: cfg.knobs.probes.gdn_dbg,
             // B-2:选择层视图面(**生产档也要** —— 视图是 decode 的消费方;
             // 与诊断面 `coverage_probe` 解耦)

@@ -18,7 +18,6 @@
 #
 # ⚠️ **TP v1 范围约束**(仍在;越界 `TpEngine::assemble` 响亮拒):
 #   ① 投机草稿 draft.depth = 0(草稿族双 rank 未接线)
-#   ② prefill 桶族 prefill_bucket = off(桶出图尾自带读数,撞入队半零同步)
 #   ③ 读数类探针 prefill_cksum / pf_fin_check / pf_fence / dflash_probe 全关
 #
 # ⚠️ **档内不改项**(与 `awq27b` 逐项同参,TP1/TP2 才可比):gdn_slots=1 /

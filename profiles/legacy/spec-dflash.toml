@@ -29,19 +29,6 @@ prefill_tail_merge = 1024
 # 草稿深度 7(降级首探窗口 probe_every 缺省即 8,见 config.rs 的取法)
 depth = 7
 
-[graph]
-# **prefill 桶图**(M2b/M3;2026-10-19 解禁 —— 桶路已接 `fi_plan_sync`,与单图档
-# 的 `fi_plan_bake` 不再互斥;`fi_plan_restore = false` ⇒ 桶回放前由引擎窗外刷表)。
-# 实测(单 3090 Ti,std 五点三轮,同二进制唯一差别 = 本键;稳态第 2/3 轮):
-#   prefill @8192 **1310.6 → 1358.0(+3.6%)** · TTFT@8192 6252→6034ms(−3.5%)
-#   小 ctx +0.5~2.8%;正确性:needle 1.6k/4.9k/7.9k/9.3k 全对 + 17/30 tok 与 eager 逐字同
-#   ⚠️ 教训:plan sync 的 `ctx_total` 必须 = **本块真实 ctx**(`base+t`);
-#      用 `t_pad` 会在长 ctx(≥~5k)读错 KV(实测 7860 tok 答错、4460 对)
-# 代价:图 slab **+203MiB**(总 296.5MiB;GRAPH_SLAB_BUDGET 已校准到 320MiB);
-#       桶命中率(27B std 相)~100%(整 512 块);pad > 4 行的尾块自动让位 eager。
-# 回退:删本节(或 `prefill_bucket = "off"`)。
-prefill_bucket = "geobuckets"
-
 [server]
 # 单会话语义:GDN 格锁 1 ⇒ 并发闸门必须 ≤1(validate 拒启)
 max_concurrency = 1

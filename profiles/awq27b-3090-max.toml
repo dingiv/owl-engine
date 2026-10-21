@@ -15,7 +15,7 @@ concurrency = 1                   # 单会话:gdn_slots = max_concurrency = max_
 spec        = "off"               # 草稿池 +20KiB/token ⇒ 上下文腰斩;投机另用 spec-dflash
 kv          = "fp8"               # 容量 ×2 + FI 读核
 kvmem       = "off"               # 池 ≥ 上下文,不要选择层/宿主/磁盘腿
-graphs      = "auto"              # FI 单图 decode + prefill 桶族;不可用自动降级并打印原因
+graphs      = "auto"              # FI 单图 decode;不可用自动降级并打印原因
 reuse       = "off"               # 单会话最大上下文档:快照/前缀缓存是纯开销
 
 [model]

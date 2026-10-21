@@ -42,8 +42,7 @@ cd packages/owl && cargo test -p server --test e2e -- --test-threads=1 --nocaptu
 - 场景体在 `crates/engine/src/tests.rs`(`pub async fn`,**不挂 `#[test]`**,由入口顺序调用);
   **新场景一律并入共享装载组**,自带装载只留给 boot 期配置不同的(草稿类型/池 dtype/图档)。
 - server e2e 配置 = `testdata/args/e2e-27b.toml`(**本地 gitignore 文件**,含本机绝对路径;换机要重写)。
-  它写了 `[graph] prefill_bucket = "geobuckets"` ⇒ 这条门**顺带覆盖桶图路**(正向证据:
-  `prefill.bucket.hit` > 0 / boot 日志 5 桶 Captured)。
+  prefill 桶已于 2026-10-21 退役；本门只覆盖 eager prefill + decode/verify 图。
 - ⚠️ **起 server 前先确认卡空**:端口被残留实例占用会让门"打到别人身上"= 假绿(门已内置占用探测 fail-fast)。
 
 ## 4. lint 门(人眼不查的规矩,机器查)

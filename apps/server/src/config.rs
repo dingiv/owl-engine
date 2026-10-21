@@ -632,12 +632,8 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
     let c = &r.config;
     let e = r.estimate()?;
     let arms = format!(
-        "prefill={} decode={} gdn={} bucket={:?}",
-        if c.graph.prefill_bucket == owl_shared::config::PrefillBucket::Off {
-            "eager"
-        } else {
-            "FI"
-        },
+        "prefill={} decode={} gdn={}",
+        "eager",
         if c.dispatch.decode_fi {
             "FI(single)"
         } else if c.dispatch.decode_xqa {
@@ -646,7 +642,6 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
             "eager"
         },
         if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
-        c.graph.prefill_bucket,
     );
     Some(format!(
         "[owl] profile={} card={} ctx={} pool={}({}) {} mem={}/{} (余 {}) reuse={} spec={} c={}",
@@ -700,7 +695,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         ));
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool_tokens={} chunk={} tail={} \
-             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={} bucket={:?}\n",
+             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
             c.runtime.max_seq,
             c.pool.pool_tokens.unwrap_or(0),
             c.runtime.prefill_chunk,
@@ -709,7 +704,6 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             c.runtime.max_batch,
             c.server.max_concurrency,
             c.dispatch.kv_fp8,
-            c.graph.prefill_bucket,
         ));
         if let Some(e) = r.estimate() {
             out.push_str(&format!(
@@ -754,7 +748,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         );
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool_tokens={:?} chunk={} tail={} \
-             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={} bucket={:?}\n",
+             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
             c.runtime.max_seq,
             c.pool.pool_tokens,
             c.runtime.prefill_chunk,
@@ -763,7 +757,6 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             c.runtime.max_batch,
             c.server.max_concurrency,
             c.dispatch.kv_fp8,
-            c.graph.prefill_bucket,
         ));
     }
 
@@ -817,15 +810,6 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     }
 
     // ── 组合告警(不拒;`--check` 的 UX 价值就在把隐患提前说出来) ──
-    if c.graph.prefill_bucket != owl_shared::config::PrefillBucket::Off
-        && c.runtime.prefill_chunk + c.runtime.prefill_tail_merge > 1024
-    {
-        out.push_str(&format!(
-            "[check] WARN: chunk+tail = {}+{} > 1024:尾块没有桶图 ⇒ eager(激活约 1.7G);\
-             贴顶档建议拆成 512+512 或 1024+0\n",
-            c.runtime.prefill_chunk, c.runtime.prefill_tail_merge
-        ));
-    }
     if !c.kvmem.pool_overcommit {
         if let Some(p) = c.pool.pool_tokens {
             if p < c.runtime.max_seq {
@@ -839,11 +823,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     }
 
     // ── 臂摘要 ──
-    let prefill = match c.graph.prefill_bucket {
-        owl_shared::config::PrefillBucket::Off => "eager",
-        owl_shared::config::PrefillBucket::T512 => "FI(t512)",
-        owl_shared::config::PrefillBucket::Geobuckets => "FI(全桶族)",
-    };
+    let prefill = "eager";
     let decode = if c.dispatch.decode_fi {
         "FI(单图)"
     } else if c.dispatch.decode_xqa {

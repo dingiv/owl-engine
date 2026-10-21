@@ -42,7 +42,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let prop_kv_lens: Vec<f32> = (0..8).map(|i| (fp + 1 + i) as f32).collect();
         let kv_len = vec![(fp + 8) as f32];
         let anchor = vec![bonus as f32];
-        let pg = self.dev.graphs.dflash.as_mut().ok_or_else(|| ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() })?;
+        let _pg = self.dev.graphs.dflash.as_mut().ok_or_else(|| ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() })?;
         let prof = self.probes.step_profile;
         // **归因探针(2026-10-18 propose 立案;仅 prof 档)**:发射前先把 COMPUTE 流
         // 排干 ⇒ 把"本相位墙钟"拆成三块,互不污染:
@@ -135,85 +135,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             );
         }
         Ok(out[..7].iter().map(|&v| v as u32).collect())
-    }
-
-
-    /// DFlash2 prefill encode(prefill chunk 全行草稿 KV 物化):taps
-    /// [T, hidden] 视图 → memory → 5 层 kv-only 写 @ base..base+T。
-    pub(crate) async fn prefill_dflash_encode(
-        &mut self,
-        tap_views: &[TensorOps],
-        base: usize,
-    ) -> Result<()> {
-        let d2 = match self.dev.spec_rt.drafter.as_ref() {
-            Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
-            _ => unreachable!("prefill_dflash_encode 非 dflash 模式"),
-        };
-        let rope = self.dev.spec_rt.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
-        let t = tap_views[0].shape()[0];
-        let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
-        let pos_t = TensorOps::from_host(
-            Dtype::F32,
-            vec![t],
-            &f32b(&(0..t).map(|i| (base + i) as f32).collect::<Vec<_>>()),
-        );
-        // 草稿池线性逻辑寻址(slot = 逻辑位;NC 前缀读 [0, prefix) 直排;
-        // bt 物理槽仅首 session 重合 —— slot≥1 案修,2026-10-10)
-        let (_bt_chain, _) = {
-            let act = self.turns.active()?;
-            let s = self.bank.sessions.session(act.session_id)?;
-            // GDN 行 = turn 域资源(§28)
-            (s.block_table.clone(), act.gdn_slot)
-        };
-        let _page = self.dev.pool.page;
-        let leaves = self.dev.pool.dflash_kv_leaves().ok_or_else(|| ModelError::EngineInvariant { what: "dflash KV 池句柄缺席(档位/池几何不一致)".into() })?;
-        let bt = self.dev.pool.bt_leaf_flat();
-        let kvs: Vec<KvBuffers> = leaves
-            .iter()
-            .map(|(k, v)| KvBuffers {
-                k_cache: k.clone(),
-                v_cache: v.clone(),
-                slots: TensorOps::from_host(
-                    Dtype::F32,
-                    vec![t],
-                    &f32b(&(0..t)
-                        .map(|i| crate::state::StatePool::draft_encode_slot(base, i))
-                        .collect::<Vec<_>>()),
-                ),
-                kv_lens: TensorOps::from_host(
-                    Dtype::F32,
-                    vec![t],
-                    &f32b(&(0..t).map(|i| (base + i + 1) as f32).collect::<Vec<_>>()),
-                ),
-                block_tables: bt.clone(),
-            })
-            .collect();
-        let ctx = ForwardCtx::minimal(t);
-        let memory = d2.project_memory(tap_views, &ctx);
-        let roots = d2.encode_kv(&memory, &pos_t, &kvs, &rope, &ctx);
-        {
-            let face = self.dev.graphs.session.face_mut();
-            let refs: Vec<&TensorOps> = roots.iter().collect();
-            // 副作用根口径:encode 的末位出参 = 契约 4 占位(核就地写池),没人读 ⇒ 收尾一并归还
-            // env = **草稿自己的**(hd/grp 取草稿几何;见 SpecRuntime::draft_env)
-            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.spec_rt.draft_env, self.dev.tp.as_ref()).await?;
-        }
-        // 探针:首回合 memory 落盘(python 重算 fc 对拍;真块 dtoh 合法。
-        // taps 由调用方从 concat 父块整块落盘 —— 切片视图 dtoh 整父块契约)
-        if self.probes.dflash_probe && !self.dev.spec_rt.mem_dumped {
-            self.dev.spec_rt.mem_dumped = true;
-            let face = self.dev.graphs.session.face_mut();
-            let refs: Vec<&TensorOps> = std::iter::once(&memory).collect();
-            let outs = owl_models::interpreters::eval_ops_multi(&refs, face, self.dev.tp.as_ref()).await?;
-            let n: usize = memory.shape().iter().product();
-            let mut buf = vec![0u8; n * 2];
-            face.dtoh(&outs[0], &mut buf).await?;
-            if let Err(e) = owl_shared::file_loader::write("/tmp/owl_dflash_mem.bin", &buf) {
-                owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
-            }
-            owl_shared::log_debug!("dflash-probe", "memory 落盘 /tmp/owl_dflash_mem.bin t={t}");
-        }
-        Ok(())
     }
 
 

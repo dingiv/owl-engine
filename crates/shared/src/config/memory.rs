@@ -33,7 +33,11 @@ use serde::Serialize;
 
 use super::intent::ModelProfile;
 
-/// 图 slab 预算(engine `GRAPH_SLAB_BUDGET`;桶族 6 档实测 541 MiB,预算 640)
+/// 图 slab 预算(保守值;engine `GRAPH_SLAB_BUDGET` 桶退役后 = 320)。
+///
+/// ⚠️ 这里**故意保留 640**:降到 320 会把 `context=max` 从 131072 抬到 143360,
+/// 贴近已知 144k/15 轮 reserve 泄漏带。等 144k 泄漏校准后再两边同步降;
+/// 当前 `--check` 对图项偏保守 320MiB(不影响安全,只少报可用池)。
 pub const GRAPH_SLAB_BYTES: u64 = 640 << 20;
 /// warmup 瞬态 + 杂项(engine `WARMUP_MISC_BUDGET`)
 pub const WARMUP_MISC_BYTES: u64 = 138 << 20;

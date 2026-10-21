@@ -59,9 +59,6 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     /// DFlash2 propose 单图(E5-DF4;encode 全 8 行 + 噪声块 + selector,
     /// 固定几何;None = eager 回退)
     pub dflash: Option<GraphPlan<D>>,
-    /// **prefill 桶族(M2b)**:一桶一张整段单图(含 KV 写 + FI 注意力);
-    /// 空 = 档位 off / 未建(该档全走 eager 原路)
-    pub prefill: crate::prefill_plan::PrefillBuckets<D>,
 }
 /// **臂事实**(2026-10-19 审查):boot 自证行原先只报"**面**登记"(`FI 节点登记=true`),
 /// 而**臂**由 models 侧顺序决定 —— 两者可以不一致(实测:flavor `verify_fi=true`
@@ -106,7 +103,6 @@ impl<D: DeviceClient> GraphFleet<D> {
         if let Some(g) = self.dflash.as_mut() {
             record_close(&mut first, g.close().await);
         }
-        record_close(&mut first, self.prefill.close().await);
         match first {
             Some(e) => Err(e),
             None => Ok(()),
@@ -118,7 +114,6 @@ impl<D: DeviceClient> GraphFleet<D> {
     /// perf-framework.md §十.3)。
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
         self.session.set_phase(p);
-        self.prefill.set_phase(p);
         if let Some(g) = self.verify.as_mut() {
             g.set_phase(p);
         }
@@ -177,10 +172,8 @@ impl<D: DeviceClient> GraphFleet<D> {
         boot: FleetBoot<'_>,
         t0: T,
     ) -> Result<Self> {
-        // ① 主会话图(先留一个句柄给 ④ 的 prefill 桶族 —— 桶族在最后建,
-        // 那时 `face`/`vface` 都已被消费)
-        let pface_src = face.face_clone();
-        // 合批 decode 图(B5.1):独立 face(与 prefill 桶不共享);捕获失败 ⇒ None
+        // ① 主会话图
+        // 合批 decode 图(B5.1):独立 face;捕获失败 ⇒ None
         let bface_src = if boot.knobs.max_batch > 1 && !boot.knobs.no_graph {
             face.face_clone()
         } else {
@@ -235,63 +228,6 @@ impl<D: DeviceClient> GraphFleet<D> {
         } else {
             None
         };
-        // ④ **prefill 桶族(M2b)**:最后建 —— 自己的槽面/自己的输出块,
-        // 与前面几族无共享羁绊;必须在家族 scratch 只增不减的律下**降序**捕
-        // (桶内部自己排;见 `prefill_plan` 模块头注硬纪律 #2)。
-        let prefill = if boot.knobs.prefill_bucket == owl_shared::config::PrefillBucket::Off {
-            crate::prefill_plan::PrefillBuckets::empty()
-        } else if boot.knobs.no_graph {
-            owl_shared::log_warn!(
-                "prefill-graph",
-                "[graph] no_graph = true ⇒ prefill 桶不建(桶属图族;要诊断桶请去掉该总闸)"
-            );
-            crate::prefill_plan::PrefillBuckets::empty()
-        } else if boot.knobs.env.attn.xqa_prefill {
-            // XQA prefill 臂在场 ⇒ 不建桶:桶图的槽面是 FI 四件套,XQA 要的是
-            // 页链/整请求长/位掩码三件 ⇒ 图内走 FI、eager 走 XQA(图 ≢ eager)。
-            // 响亮告知(不是静默降级)。
-            owl_shared::log_warn!(
-                "prefill-graph",
-                "dispatch.xqa_prefill 在场 ⇒ prefill 桶不建(桶图槽面 = FI 四件套;回 eager 原路)"
-            );
-            crate::prefill_plan::PrefillBuckets::empty()
-        } else if boot.pool.fi_face {
-            match pface_src {
-                None => {
-                    owl_shared::log_warn!(
-                        "prefill-graph",
-                        "face_clone 不可用 ⇒ prefill 桶不建(回 eager 原路)"
-                    );
-                    crate::prefill_plan::PrefillBuckets::empty()
-                }
-                Some(pf) => {
-                    let boot_pg = crate::prefill_plan::BucketBoot {
-                        env: boot.env,
-                        tp: boot.tp.clone(),
-                        model: Arc::clone(&boot.model),
-                        rope: boot.rope.clone(),
-                        pool: boot.pool,
-                        dims: boot.dims,
-                        taps: boot.spec.dflash_tap_count,
-                        ladder: crate::prefill_plan::ladder(boot.knobs.prefill_bucket),
-                        fi_plan_restore: boot.knobs.fi_plan_restore,
-                    };
-                    let buckets = crate::prefill_plan::PrefillBuckets::capture(&pf, &boot_pg).await;
-                    owl_shared::log_info!(
-                        "prefill-graph",
-                        "桶族摘要:t_pad 命中阶梯 = {}",
-                        buckets.summary()
-                    );
-                    buckets
-                }
-            }
-        } else {
-            owl_shared::log_warn!(
-                "prefill-graph",
-                "非 FI 档(pool.fi_face = false)⇒ prefill 桶不建(回 eager 原路)"
-            );
-            crate::prefill_plan::PrefillBuckets::empty()
-        };
         // **现役臂自证**(2026-10-16 立;2026-10-18 改**事实位**)。
         // ⚠️ 判据 = 建树期"FI 面是否真登记"(`*_fi_node`),**不是旋钮** ——
         // 按旋钮猜曾把"FI 根本没进图、跑的是回落臂"报成 "FI(单图)"(坑册 §58)。
@@ -328,11 +264,10 @@ impl<D: DeviceClient> GraphFleet<D> {
             let fo: usize = fold.iter().map(|g| g.slab_bytes()).sum();
             let pr: usize = propose.iter().map(|g| g.slab_bytes()).sum();
             let df = dflash.as_ref().map(|g| g.slab_bytes()).unwrap_or(0);
-            let pb = prefill.slab_bytes();
-            let total = s + v + fo + pr + df + pb;
+            let total = s + v + fo + pr + df;
             owl_shared::log_info!(
                 "boot",
-                "slab 总账:session {}MiB + verify {}MiB + fold {}MiB({}) + propose {}MiB({}) + dflash {}MiB + prefill桶 {}MiB({}) = {}MiB(Σ 已捕获图)‖ 引擎账 vram::live={}MiB(含池/权重/全部真分配)",
+                "slab 总账:session {}MiB + verify {}MiB + fold {}MiB({}) + propose {}MiB({}) + dflash {}MiB = {}MiB(Σ 已捕获图)‖ 引擎账 vram::live={}MiB(含池/权重/全部真分配)",
                 mb(s),
                 mb(v),
                 mb(fo),
@@ -340,8 +275,6 @@ impl<D: DeviceClient> GraphFleet<D> {
                 mb(pr),
                 propose.len(),
                 mb(df),
-                mb(pb),
-                prefill.summary(),
                 mb(total),
                 owl_shared::vram::live_bytes() >> 20,
             );
@@ -377,7 +310,6 @@ impl<D: DeviceClient> GraphFleet<D> {
             fold,
             propose,
             dflash,
-            prefill,
         })
     }
 

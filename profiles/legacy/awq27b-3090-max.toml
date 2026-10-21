@@ -7,8 +7,7 @@
 #   · FP8 KV 池(容量 ×2 + FI 读核;质量与生产 spec-dflash 同口径)
 #   · lm_head int4 g32(`rtn-int4-g32`;质量门已过,decode 头部 GEMM 减半)
 #   · GDN chunked 五核(prefill 大 T 5.5×;形状门自动回落,小 T 不受影响)
-#   · FI 单图 decode(`fi_plan_bake` 上界 + 窗外刷表)+ FI prefill 桶族
-#     (`geobuckets`:prefill +3.6%,尾块也吃图)
+#   · FI 单图 decode(`fi_plan_bake` 上界 + 窗外刷表)
 #   · prefill 尾块合并(消灭 ~250ms/chunk 的固定宿主税)
 #   · qkv 融合 / GDN decode 融合 D1-v2 / 页对齐 / 生成段边界快照(均已是缺省)
 #
@@ -39,10 +38,9 @@ head_quant = "rtn-int4-g32"
 [runtime]
 # 最大上下文(与 pool_tokens 必须相等 —— 不超卖)
 max_seq = 131072
-# chunk 512 + 尾合并 512:上界 1024 = **桶阶梯最大档** ⇒ 每个 chunk 都吃
-# prefill 桶图(1024+1024 会造出 2048 块:无桶 ⇒ eager 激活 ~1.6G + 失败时
-# 暂存不回收,实测 8k 后即撞 reserve)。512 的 marlin m 效率略低于 1024,
-# 但换来"尾模板(chat 模板 +6 tok)并进前一块、不付 250ms 尾块税"。
+# chunk 512 + 尾合并 512:上界 1024(不再受 prefill 桶阶梯约束;桶已退役)。
+# 512 的 marlin m 效率略低于 1024,但换来"尾模板(chat 模板 +6 tok)并进
+# 前一块、不付 250ms 尾块税"。
 prefill_chunk = 512
 prefill_tail_merge = 512
 # 单会话语义(也避免合批把上下文预算切碎)
@@ -64,10 +62,6 @@ prefix_cache = false
 prefix_cache_share = 0.5
 host_cache_mb = 0
 snap_host_mb = 0
-
-[graph]
-# FI prefill 全桶族(尾块也吃图;需 fi_cuda_graph + fi_plan_restore=false)
-prefill_bucket = "geobuckets"
 
 [dispatch]
 # FP8 池:容量 ×2 + FI/XQA 读核的前提
