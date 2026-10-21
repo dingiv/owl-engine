@@ -949,7 +949,8 @@ fn l3_audit_note(op: &str, slot: &'static str, rank: u8) {
         Err(_) => false,
     };
     if fresh {
-        eprintln!("[l3-audit] 声明0 实际{rank} {op}::{slot}");
+        // 采集面已在(`L3_AUDIT_SEEN` 去重);可见性交给日志门(level/tag)
+        crate::klog_debug!("l3-audit", "声明0 实际{rank} {op}::{slot}");
     }
 }
 

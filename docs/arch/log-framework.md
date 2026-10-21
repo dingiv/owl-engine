@@ -115,8 +115,9 @@ curl "127.0.0.1:8136/debug/log/tags/boot,gl-prof/-" # allow=boot,gl-prof;deny �
 | ①′ | **开机噪音面**:models(`formats/*`/`kernel.rs`)+ cuda(`state.rs`/`server/mod.rs`/`harvest.rs`/`launch.rs`)+ `shared/metrics.rs` | **50** | ✅ 2026-10-14 |
 | ② | engine 剩余(探针/分账/`[sched]`/`[*-prof]`/`[*-probe]`) | 58 | ✅ 2026-10-15 |
 | ③ | models 层内探针(`layers/**` 的 `[gdn-*]`/`[enc-forensic]`/`[m-sweep]`) | ≈90 | 待办 |
-| ⚠️ | **`crates/kernels`(13 处)**:kernels 的 **lib 零依赖律**禁止依赖 `owl-shared` | 13 | **挂账**:需 `LogSink` **注入**设计(fn 指针经 Exec/registry 初始化面显式传入,不破依赖图) |
-| — | `crates/*/tests` + `examples` | 184 | **不动**(测试输出本就该直出) |
+| ④ | **`crates/kernels` Rust 面**(装配报告 / 自检 / `[gdn-diag]` / `[l3-audit]` / `[owl-fi]`) | **23** | ✅ 2026-10-21(见 §八) |
+| ⑤ | **`cu/**` C/C++ 面**(`[owl-fi]` / `[marlin-*]`)+ 一处无门设备 printf | **13** | ✅ 2026-10-21(见 §八) |
+| — | `crates/*/tests` + `examples` | 184 | **不动**(测试输出本就该直出;`skip:` 行见 §九) |
 | — | `build.rs`(kernels) | 45 | **不动**(构建期基础设施) |
 
 **实测(2026-10-14,27B 生产档开机)**:收编批① / ①′ 之后
@@ -131,7 +132,108 @@ curl "127.0.0.1:8136/debug/log/tags/boot,gl-prof/-" # allow=boot,gl-prof;deny �
 ## 七、纪律
 
 1. tag **必须是字面量**(`&'static str`)—— 与 metrics 同款契约;
-2. 新增打印一律用宏,禁止新裸 `eprintln!`(测试/`build.rs`/**零依赖 crate** 除外);
+2. 新增打印一律用宏,禁止新裸 `eprintln!`(测试/`build.rs` 除外)。下层
+   (`crates/kernels`、`cu/**`)用 §八 的注入口 —— **没有"零依赖 crate 例外"了**;
 2b. **拒启/致命路径用裸 `eprintln!`**(必须绕过级别门 —— 静默的拒启是运维事故);
 3. 诊断转储(`[dump]`)走 `log_debug!` + 保留落盘失败可见;
 4. 日志宏**不进热路径**(逐 token/逐节点)—— 那是 metrics 的活。
+
+## 八、下层与 C/C++ 输出口(2026-10-21;kernels + `cu/**` 一次收编)
+
+### 8.1 为什么不能"kernels 依赖 owl-shared"
+
+`owl-shared → owl-iface → owl-kernels` 是既成边 ⇒ `kernels → shared` =
+**cyclic package dependency**(cargo 实测报错)。而 kernels 又必须出声。
+
+解法 = **把 `LogSink` 这个纯函数指针包搬到依赖图叶子**:
+
+```
+owl-shared ──► owl-iface ──► owl-kernels
+     │                            │
+     └──────► owl-sink ◄──────────┘        (零依赖 ABI crate,唯一 LogSink 定义)
+```
+
+`crates/sink`(package `owl-sink`)只装:级别常量 `LVL_*` / `level_name_of` /
+`LogSink`。`owl_shared::log` 与 `owl_kernels::sink` 都是它的**使用者**
+(不各持一份镜像结构 —— AGENTS.md 禁"接口不唯一")。
+
+### 8.2 三道门(与 Rust 侧逐条同构)
+
+| 门 | Rust(kernels) | C/C++(`cu/**`) |
+|---|---|---|
+| 编译期 | cargo feature `log`(缺省开);关 ⇒ `klog_*!` 空展开 | 同 feature → `build.rs` 决定是否 `-DOWL_LOG_ENABLED`;关 ⇒ `OWL_LOG_*(…)` = `((void)0)` |
+| 运行期分级 | `LogSink::enabled(level, tag)` | 同一函数(`owl_log_on` → 同一 `LogSink`) |
+| tag 过滤 | `/debug/log/tags/a,b/-x` | 同一个白黑名单(判据只有一套) |
+| 调用点 | 先准入再 `format_args!` | 先 `owl_log_on` 再 `vsnprintf`(1024B 栈缓冲,超长截断) |
+
+实测(对象级):`-DOWL_LOG_ENABLED` 关时目标文件**不含任何 `owl_log_*` 引用**
+(`nm -u` 为空;679B → 104B)。
+
+### 8.3 接线(唯一写点)
+
+```rust
+// owl-cuda::GpuServer boot(与既有采集旋钮同一处)
+owl_kernels::server::configure_diag(&DiagTune {
+    sink: self.sink,              // ← LogSink;C 与 Rust 同时可用
+    l3_audit: self.diag.l3_audit, // 采集
+    gdn: /* GdnDiag */,           // 采集
+})?;                              // 重入不同值 = 拒启(不静默覆盖)
+```
+
+`kernels::sink::configure` 是**唯一写点**(`OnceLock`,boot 后冻结;同值幂等、
+异值 `SinkError::AlreadyConfigured`)。C ABI `owl_log_on` / `owl_log_emit`
+只读它 —— 没有第二条注入路径。
+
+### 8.4 C 侧写法
+
+```c
+#include "owl_log.h"          // -Icu
+
+OWL_LOG_INFO("selfcheck", "%s ✓", name);          // 装配报告
+OWL_LOG_DEBUG("gdn-diag", "T=%d nz=%zu", t, nz);  // 探针(level=debug 才出)
+OWL_LOG_ERROR("owl-fi", "workspace 不足: 需 %zuB", need);  // 错误码路径
+if (OWL_LOG_ON(OWL_LVL_TRACE, "ar")) { /* 热循环里先问再组参 */ }
+OWL_DEV_PRINTF("...");   // __device__ 用;仅 OWL_LOG_DEVICE 编译门(默认关)
+```
+
+tag 约定与 Rust 面同名同义:`owl-fi` / `marlin-cfg` / `marlin-v2` /
+`marlin-time` / `selfcheck` / `xqa`。
+
+### 8.5 本轮一并退役的"纯打印开关"(裁决:**bool 管采集,日志管可见性**)
+
+| 退役项 | 原形态 | 现形态 |
+|---|---|---|
+| `[probes] fi_debug` | 配置键 → `DIAG` → C++ `getenv("FI_DEBUG")` | 删;`owl-fi` tag + level 决定 |
+| `FI_DEBUG` env 桥 | `std::env::set_var("FI_DEBUG", …)` | 删(不再有 env 参与) |
+| `MARLIN_CONFIG_DEBUG` / `MARLIN_DEBUG` | C++ 内 `getenv` 纯打印开关 | 删;`marlin-cfg` / `marlin-v2` tag |
+| `[knhd-chunked-W]` 设备 printf | 每次 prefill 无条件打 8 行 | 删(取证残留;设备面只留 `OWL_DEV_PRINTF`) |
+
+**保留为"采集"的 bool**(它们不是打印开关,是额外工作量):
+`[probes] l3_audit`(登记去重集)、`gdn_diag/gdn_touch/…`(dtoh 回读/往返)、
+`trace_gate` / `step_gate` / `pf_fence`(路径与 A/B 语义)。
+
+### 8.6 未收编(下一轮,明账)
+
+- `MARLIN_TIME` / `MARLIN_NO_M8` / `MARLIN_THREADS` / `MARLIN_NO_OVERRIDE`
+  —— C++ 内 `getenv` 行为/计时旋钮(前者注释已写"测完即删");按"配置面
+  显式化"处理,不与打印混在一起改;
+- `crates/*/src` 生产面余下 ~100 处裸 `eprintln!`(装配报告类可机械换
+  `log_info!`,拒启路径按纪律 2b 保留)。
+
+## 九、测试面:`skip:` / 探针行的唯一出口
+
+`cargo test` 按用例捕获 stderr ⇒ 测试输出**不能**走 logger(需要 init +
+level 门,缺省 WARN 会吞掉 skip 行 = 假绿)。故测试域有独立出口:
+
+```rust
+use owl_shared::testkit::report;
+
+report::skip("OWL_TEST_DEVICE 未设");           // → "skip: OWL_TEST_DEVICE 未设"
+report::note("gdn", format_args!("T={t}"));     // → "[gdn] T=512"
+owl_shared::test_note!("gdn", "T={t}");         // 宏形态(导出在 crate 根)
+```
+
+- `skip:` 前缀**只由 `report::skip` 给**(常量/`missing_reason` 返回正文);
+- `#[owl_test]` 的三个门(GPU / HF 对拍 / 资源清单)全部改走它 ——
+  270 处手写 `eprintln!("skip: …")` 已统一(2026-10-21);
+- 探针行统一 `[tag] 正文`(与生产 `log_*!` 渲染同形,跨用例 grep 通道一致)。

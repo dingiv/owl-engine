@@ -65,7 +65,7 @@ fn gguf_cfg(ordinal: usize, max_seq: usize, pool_tokens: usize, gdn_slots: usize
 /// 既验层型表推导,也验"列序表张数 = GDN 层数"(虚拟键的落点数)。
 async fn smoke_scenario(key: &str, n_layers: usize, n_gdn: usize, want_first: &str, cfg: EngineConfig) {
     if !resource_ok(key) {
-        eprintln!("skip: 资源清单缺 \"{key}\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"{key}\"");
         return;
     }
     let path = std::path::PathBuf::from(resource(key).expect("列了就有"));
@@ -227,7 +227,7 @@ async fn gpu_gguf_27b_smoke() {
 #[owl_test(gpu)]
 async fn gpu_gguf_iq4xs_0_8b_vs_q4km() {
     if !resource_ok("gguf:0.8b-iq4xs") || !resource_ok("gguf:0.8b-q4km") {
-        eprintln!("skip: 资源清单缺 \"gguf:0.8b-iq4xs\" / \"gguf:0.8b-q4km\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:0.8b-iq4xs\" / \"gguf:0.8b-q4km\"");
         return;
     }
     let ord = owl_cuda::test_device_ordinal();
@@ -305,11 +305,11 @@ async fn gpu_gguf_4b_vs_hf_4b() {
         "Q: What is 2+2?\nA:",
     ];
     let Some(hf_dir) = owl_shared::testkit::resource("tpl:hf4b") else {
-        eprintln!("skip: 资源清单缺 \"tpl:hf4b\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"tpl:hf4b\"");
         return;
     };
     if !resource_ok("gguf:4b") {
-        eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
         return;
     }
     let gguf_path = std::path::PathBuf::from(resource("gguf:4b").expect("列了就有"));
@@ -423,13 +423,13 @@ fn tp2_entry(key: &'static str, layers: usize, want_first: &'static str) {
             .map(|bdf| owl_cuda::resolve_ordinal_by_bdf(&bdf).unwrap_or_else(|e| panic!("{e}")))
     };
     let (Some(oa), Some(ob)) = (dev("OWL_GGUF_TP_DEV_A"), dev("OWL_GGUF_TP_DEV_B")) else {
-        eprintln!("skip: 需 OWL_GGUF_TP_DEV_A / OWL_GGUF_TP_DEV_B(两张空闲卡的 BDF)");
+        owl_shared::testkit::report::skip("需 OWL_GGUF_TP_DEV_A / OWL_GGUF_TP_DEV_B(两张空闲卡的 BDF)");
         return;
     };
     assert_ne!(oa, ob, "TP2 需要两张不同的卡");
     eprintln!("[gguf-tp2] 设备:A = ordinal {oa} / B = ordinal {ob}");
     if !resource_ok(key) {
-        eprintln!("skip: 资源清单缺 \"{key}\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"{key}\"");
         return;
     }
     // 大盘装配:大栈 + current_thread rt(与 tp_assemble_gate 同律)
@@ -625,7 +625,7 @@ async fn tp2_body(key: &str, layers: usize, want_first: &str, oa: usize, ob: usi
 #[owl_test(gpu)]
 async fn gpu_gguf_prefill_probe() {
     if !resource_ok("gguf:27b") {
-        eprintln!("skip: 资源清单缺 \"gguf:27b\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
         return;
     }
     let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));
@@ -705,7 +705,7 @@ async fn gpu_gguf_prefill_probe() {
 #[owl_test(gpu)]
 async fn gpu_gguf_prefill_4b_probe() {
     if !resource_ok("gguf:4b") {
-        eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
         return;
     }
     let path = std::path::PathBuf::from(resource("gguf:4b").expect("列了就有"));
@@ -756,7 +756,7 @@ async fn gpu_gguf_prefill_4b_probe() {
 #[owl_test(gpu)]
 async fn gpu_gguf_prefill_single() {
     if !resource_ok("gguf:27b") {
-        eprintln!("skip: 资源清单缺 \"gguf:27b\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
         return;
     }
     let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));
@@ -804,7 +804,7 @@ async fn gpu_gguf_4b_vlm_image_smoke() {
     use crate::turn::TurnOpts;
 
     if !resource_ok("gguf:4b") {
-        eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
         return;
     }
     // GPU 套件在同一进程串跑时，前一个 27B 测试的 `live` 账可能未随 drop 回落
@@ -823,7 +823,7 @@ async fn gpu_gguf_4b_vlm_image_smoke() {
     let mmproj = match resolve_mmproj_path(&path, None) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("skip: 同目录无唯一 mmproj: {e}");
+            owl_shared::testkit::report::skip(format_args!("同目录无唯一 mmproj: {e}"));
             return;
         }
     };
@@ -891,14 +891,14 @@ async fn gpu_gguf_27b_vlm_image_smoke() {
     use crate::turn::TurnOpts;
 
     if !resource_ok("gguf:27b") {
-        eprintln!("skip: 资源清单缺 \"gguf:27b\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
         return;
     }
     let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));
     let mmproj = match resolve_mmproj_path(&path, None) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("skip: 同目录无唯一 mmproj: {e}");
+            owl_shared::testkit::report::skip(format_args!("同目录无唯一 mmproj: {e}"));
             return;
         }
     };

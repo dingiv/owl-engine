@@ -52,7 +52,7 @@ fn add_msg(a: &Bytes, b: &Bytes, out: &Bytes, n: usize) -> LaunchMsg {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn composites_hold_stream_order_and_closed_set_validation() {
     if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut c = assemble();
@@ -147,7 +147,7 @@ async fn composites_hold_stream_order_and_closed_set_validation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn composites_are_rejected_during_capture() {
     if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut c = assemble();
@@ -202,7 +202,7 @@ async fn composites_are_rejected_during_capture() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn block_ledger_is_clean() {
     if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut c = assemble();

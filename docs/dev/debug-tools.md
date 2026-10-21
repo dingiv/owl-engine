@@ -36,7 +36,12 @@
 - **缺省级别 = warn**(2026-10-14 裁决):装配/装载报告默认静默,开机 ~10 行;要全量报告用 `--log-level info`(≈335 行)。
 - 运行期提级:`curl 127.0.0.1:8137/debug/log/level/info`(不必重启)。
 - **拒启类错误与就绪横幅恒输出**(裸 eprintln,不随级别静默)——"服务没起来"一定能在日志里看到原因。
-- ⚠️ `kernels` crate 的 `[kernels]/[selfcheck]/[xqa]` 13 处**尚未收编**(它不许依赖 `owl-shared`,需 `LogSink` 注入设计)⇒ 这部分始终直出。
+- **算子面(C++/CUDA 也算)**已收编(2026-10-21):`crates/kernels` 的
+  `[kernels]/[selfcheck]/[xqa]/[gdn-diag]/[l3-audit]/[owl-fi]` 与
+  `cu/**` 的 `[owl-fi]/[marlin-cfg]/[marlin-v2]/[marlin-time]` 走**同一条**
+  `LogSink` ⇒ 同一套 `--log-level` + `/debug/log/tags/…` 管得住。
+  编译期另有 cargo feature `log`(缺省开;关掉则 Rust 宏与 C 宏双双消失,
+  运行期零成本)。
 
 ## 3. 探针与诊断档(`[probes]` 配置,不是 env)
 
@@ -51,6 +56,14 @@ dflash_probe = true  # 草稿侧取证(concat 父块落盘等)
 gdn_dbg = true       # reset_gdn 后 GDN rec 格画像
 debug = true         # 图捕获序列化走查
 ```
+
+**探针开关的分工(2026-10-21 裁决):bool 管"采集/路径",日志管"可见性"。**
+
+- `l3_audit` / `gdn_diag` / `gdn_touch` / `trace_gate` / `pf_fence` … = **采集**
+  (多做一次 dtoh、插一次栅栏、走另一条 eager 路径)—— 影响行为与开销;
+- 打不打得出来 = `--log-level debug` 或 `/debug/log/tags/<tag,…>` ——
+  **不要**再为"只想看/不想看"新增探针 bool。本轮据此退役了
+  `[probes] fi_debug`(C++ 侧同源的 `FI_DEBUG` env 桥一并删除)。
 
 **律:诊断在场 ⇒ 快路径让位,且**不静默**。** 例:prefill 桶图已于 2026-10-21 退役;
 历史行为是诊断档在场时让位 eager。现在 prefill 恒 eager,诊断面不再与桶冲突。

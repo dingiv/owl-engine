@@ -1008,7 +1008,7 @@ mod tests {
     #[test]
     fn bench_scales_chain() {
         if !owl_shared::env_reader::flag("OWL_AWQ_IOBENCH") {
-            eprintln!("skip: OWL_AWQ_IOBENCH 未开");
+            owl_shared::testkit::report::skip("OWL_AWQ_IOBENCH 未开");
             return;
         }
         use owl_kernels::family::marlin::repack::pack_marlin_s;
@@ -1041,7 +1041,7 @@ mod tests {
     #[test]
     fn bench_raw_copy_paths() {
         if !owl_shared::env_reader::flag("OWL_AWQ_IOBENCH") {
-            eprintln!("skip: OWL_AWQ_IOBENCH 未开");
+            owl_shared::testkit::report::skip("OWL_AWQ_IOBENCH 未开");
             return;
         }
         let dir = std::path::PathBuf::from(owl_shared::testkit::resource("ckpt:27b-awq").unwrap_or_else(|| {

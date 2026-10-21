@@ -549,7 +549,7 @@ mod tests {
     /// 可调,也就没有"调容差蒙过去"的余地。
     fn parity_case(py: &str, key: &str, tname: &str) {
         let Some(path) = res(key) else {
-            eprintln!("skip: 资源清单缺 \"{key}\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"{key}\"");
             return;
         };
         let script = crate::testkit::manifest_dir().join("src/formats/gguf_dequant.py");
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn dequant_matches_gguf_py() {
         let Some(py) = py_root() else {
-            eprintln!("skip: gguf-py 源码树不在");
+            owl_shared::testkit::report::skip("gguf-py 源码树不在");
             return;
         };
         // 每型挑一张代表张量(4B:五型俱全;27B:补 Q5_K 无 ⇒ 只跑交集)
@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn dequant_iq_matches_gguf_py() {
         let Some(py) = py_root() else {
-            eprintln!("skip: gguf-py 源码树不在");
+            owl_shared::testkit::report::skip("gguf-py 源码树不在");
             return;
         };
         let cases: &[(&str, &str)] = &[

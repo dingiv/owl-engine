@@ -94,7 +94,7 @@ fn boot() -> GpuClient {
 #[tokio::test]
 async fn swap_out_then_in_is_byte_exact() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = boot();
@@ -160,7 +160,7 @@ async fn swap_out_then_in_is_byte_exact() {
 #[tokio::test]
 async fn swap_rejects_bounds_and_empty_loudly() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = boot();

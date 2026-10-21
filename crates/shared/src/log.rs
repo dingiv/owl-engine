@@ -50,15 +50,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // ============================================================================
 // §1 级别
 // ============================================================================
+//
+// 常量本体住叶子 crate `owl-sink`(下层 kernels 也要用,而它不能依赖本 crate
+// —— `owl-shared → owl-iface → owl-kernels` 的既成边)。此处 **re-export 不
+// 重定义**:数值只有一份事实(`owl_sink::LVL_*`),`Level::to_u8` 也引用它们。
 
-/// 级别常量(宏桥参;ERROR 最低、TRACE 最高 —— 阈值语义:记录 level <= 阈值)
-pub const LVL_ERROR: u8 = 0;
-pub const LVL_WARN: u8 = 1;
-pub const LVL_INFO: u8 = 2;
-pub const LVL_DEBUG: u8 = 3;
-pub const LVL_TRACE: u8 = 4;
-/// 静音(阈值取本值 = 一条都不记)
-pub const LVL_OFF: u8 = 9;
+pub use owl_sink::{LVL_DEBUG, LVL_ERROR, LVL_INFO, LVL_OFF, LVL_TRACE, LVL_WARN};
 
 /// 日志级别
 ///
@@ -108,16 +105,9 @@ impl Level {
         })
     }
 
-    /// 名称 ↔ u8(含 off)
+    /// 名称 ↔ u8(含 off);数值→名字的唯一实现住 `owl_sink`(与 C 侧同源)
     pub fn name_of(l: u8) -> &'static str {
-        match l {
-            LVL_ERROR => "error",
-            LVL_WARN => "warn",
-            LVL_INFO => "info",
-            LVL_DEBUG => "debug",
-            LVL_TRACE => "trace",
-            _ => "off",
-        }
+        owl_sink::level_name_of(l)
     }
 
     /// 阈值解析(含 `off`)
@@ -495,107 +485,26 @@ pub fn set_tags(allow: Vec<String>, deny: Vec<String>) -> bool {
 // ============================================================================
 //
 // 为什么需要:设备面(`crates/backends/cuda` 的 GPU server)与算子面
-// (`crates/kernels`,**lib 零依赖律** —— 不能依赖 owl-shared)都要能说话,
-// 但不能反过来依赖日志/指标 crate。正解 = **注入**:这类下层只持一个
-// **零状态可 Copy 的函数指针包**,由上层(GPU server 构造函数 / 引擎)
-// 显式传入。
+// (`crates/kernels`,依赖图最底层 —— 见下方图)都要能说话,但不能反过来依赖
+// 日志/指标 crate。正解 = **注入**:这类下层只持一个**零状态可 Copy 的
+// 函数指针包**,由上层(GPU server 构造函数 / 引擎)显式传入。
+//
+// ```text
+// owl-shared ──► owl-iface ──► owl-kernels      (既成债:kernels 是最底层)
+//      └──────► owl-sink ◄──────┘              (本口:两边都向下引叶子)
+// ```
+//
+// ⇒ 结构本体住叶子 crate `owl-sink`(与 kernels 同一份定义,不搞镜像;
+// AGENTS.md 禁「接口不唯一」)。本模块只负责 **实现接线**(logger + metrics)。
 //
 // 一个对象管三件事(都是「把事实抽出去」,不是新概念):
 // - `log(level, tag, msg)` —— 事件流(本模块);
-// - `timer(tag, dur)` / `count(tag, n)` —— 数值账(`crate::metrics`)。
+// - `timer(tag, dur)` / `count(tag, n)` —— 数值账(`crate::metrics`);
+// - `timing()` / `gpu_armed()` —— 分级门(是否值得起表/装采集器)。
 //
 // 未注入(= [`LogSink::none`])时全部静默且**零分支以外的开销**。
 
-/// 日志 + 计时下沉口(值语义;fn 指针不可捕获 ⇒ 实现方只能走进程级单例)
-#[derive(Clone, Copy, Default)]
-pub struct LogSink {
-    log: Option<fn(u8, &str, &str)>,
-    enabled: Option<fn(u8, &str) -> bool>,
-    timer: Option<fn(&str, Duration)>,
-    count: Option<fn(&str, u64)>,
-    /// 设备侧采集是否武装(`perf level = gpu`)—— 由下游(如 CUPTI)在构造期问一次
-    gpu: Option<fn() -> bool>,
-}
-
-impl LogSink {
-    /// 空口(全部丢弃;测试/无宿主场景)
-    pub const fn none() -> Self {
-        Self { log: None, enabled: None, timer: None, count: None, gpu: None }
-    }
-
-    /// 显式组装(各面可单独给)
-    pub const fn new(
-        log: Option<fn(u8, &str, &str)>,
-        enabled: Option<fn(u8, &str) -> bool>,
-        timer: Option<fn(&str, Duration)>,
-        count: Option<fn(&str, u64)>,
-        gpu: Option<fn() -> bool>,
-    ) -> Self {
-        Self { log, enabled, timer, count, gpu }
-    }
-
-    /// 是否未接线(免无谓 format)
-    #[inline]
-    pub fn is_none(&self) -> bool {
-        self.log.is_none() && self.timer.is_none() && self.count.is_none()
-    }
-
-    /// 级/tag 准入(未接 enabled = 一律不过 —— 「没接就不打」)
-    #[inline]
-    pub fn enabled(&self, level: u8, tag: &str) -> bool {
-        match self.enabled {
-            Some(f) => f(level, tag),
-            None => self.log.is_some(),
-        }
-    }
-
-    /// 记一行(先准入再 format —— 不过门时零分配)
-    #[inline]
-    pub fn logf(&self, level: u8, tag: &str, args: std::fmt::Arguments<'_>) {
-        if !self.enabled(level, tag) {
-            return;
-        }
-        if let Some(f) = self.log {
-            f(level, tag, &std::fmt::format(args));
-        }
-    }
-
-    /// 计时**是否值得起表**(接线存在 + metrics 已到 HOST 级)
-    /// —— `off` 档不该白付 `Instant::now()`
-    #[inline]
-    pub fn timing(&self) -> bool {
-        self.timer.is_some()
-            && crate::metrics::PERF_BUILD
-            && crate::metrics::level() >= crate::metrics::level::HOST
-    }
-
-    /// **设备侧采集是否武装**(`perf level = gpu`)。下游(如 CUPTI)在
-    /// 构造期问一次即决定是否装载采集器 —— 默认 `host` 档 ⇒ false ⇒
-    /// 采集器**根本不启动**(零开销)。
-    #[inline]
-    pub fn gpu_armed(&self) -> bool {
-        match self.gpu {
-            Some(f) => f(),
-            None => false,
-        }
-    }
-
-    /// 记一段耗时(落 metrics;tag 律 `<plane>.<class>[.<detail>]`)
-    #[inline]
-    pub fn timer(&self, tag: &str, d: Duration) {
-        if let Some(f) = self.timer {
-            f(tag, d);
-        }
-    }
-
-    /// 计数
-    #[inline]
-    pub fn count(&self, tag: &str, n: u64) {
-        if let Some(f) = self.count {
-            f(tag, n);
-        }
-    }
-}
+pub use owl_sink::LogSink;
 
 fn sink_log(level: u8, tag: &str, msg: &str) {
     if let Some(g) = LOGGER.get() {
@@ -615,6 +524,11 @@ fn sink_count(tag: &str, n: u64) {
     crate::metrics::with_metrics_store(|s| s.counter_add(tag, n, file!(), line!()));
 }
 
+/// 宿主计时分级门(metrics 到 HOST 级才值得起表)
+fn sink_timing_armed() -> bool {
+    crate::metrics::PERF_BUILD && crate::metrics::level() >= crate::metrics::level::HOST
+}
+
 /// 全局 logger + metrics 的现成接线(应用入口/引擎构造时取一次,显式下传)
 pub fn sink() -> LogSink {
     LogSink::new(
@@ -623,6 +537,7 @@ pub fn sink() -> LogSink {
         Some(sink_timer),
         Some(sink_count),
         Some(sink_gpu_armed),
+        Some(sink_timing_armed),
     )
 }
 

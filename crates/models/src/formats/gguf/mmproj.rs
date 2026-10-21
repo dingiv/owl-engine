@@ -498,7 +498,7 @@ mod tests {
             "gguf:4b",
             "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf",
         ) else {
-            eprintln!("skip: 4B mmproj 不在");
+            owl_shared::testkit::report::skip("4B mmproj 不在");
             return;
         };
         let g = Gguf::open(&path).expect("open mmproj");
@@ -520,7 +520,7 @@ mod tests {
             "gguf:27b",
             "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf",
         ) else {
-            eprintln!("skip: 27B mmproj 不在");
+            owl_shared::testkit::report::skip("27B mmproj 不在");
             return;
         };
         let g = Gguf::open(&path).expect("open mmproj");
@@ -540,7 +540,7 @@ mod tests {
             "gguf:27b",
             "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf",
         ) else {
-            eprintln!("skip: 27B mmproj 不在");
+            owl_shared::testkit::report::skip("27B mmproj 不在");
             return;
         };
         let src = MmprojSource::open(&path).expect("source");
@@ -561,7 +561,7 @@ mod tests {
             "gguf:4b",
             "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf",
         ) else {
-            eprintln!("skip: 4B mmproj 不在");
+            owl_shared::testkit::report::skip("4B mmproj 不在");
             return;
         };
         let src = MmprojSource::open(&path).expect("source");

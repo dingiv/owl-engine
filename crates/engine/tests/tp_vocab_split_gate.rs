@@ -178,12 +178,12 @@ async fn run_arm(dir: &Path, oa: usize, ob: usize, chunk: usize, vsplit: bool) -
 #[test]
 fn tp_vocab_split_gate() {
     let (Some(oa), Some(ob)) = (dev("OWL_TP_TEST_DEV_A"), dev("OWL_TP_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_TP_TEST_DEV_A / _B(TP2 双 rank;CUDA ordinal)");
+        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / _B(TP2 双 rank;CUDA ordinal)");
         return;
     };
     let dir = dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 27B 检查点不在 {dir:?}");
+        owl_shared::testkit::report::skip(format_args!("27B 检查点不在 {dir:?}"));
         return;
     }
     std::thread::Builder::new()

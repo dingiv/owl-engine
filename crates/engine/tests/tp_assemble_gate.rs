@@ -61,13 +61,13 @@ fn cfg_of(ordinal: usize) -> EngineConfig {
 #[test]
 fn tp_assemble_gate() {
     let (Some(oa), Some(ob)) = (dev("OWL_TP_TEST_DEV_A"), dev("OWL_TP_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
+        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
         return;
     };
     assert_ne!(oa, ob, "A/B 必须是两张不同卡");
     let dir = dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)");
+        owl_shared::testkit::report::skip(format_args!("0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)"));
         return;
     }
     // 大盘装配:大栈 + current_thread rt(与 tp_load_gate 同律)

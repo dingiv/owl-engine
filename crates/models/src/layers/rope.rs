@@ -405,7 +405,7 @@ mod f16_tests {
     #[tokio::test]
     async fn gpu_rope_f16_matches_host() {
         if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         }
         let (max_pos, hd, half, heads, tokens) = (64usize, 8usize, 4usize, 2usize, 3usize);

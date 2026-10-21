@@ -240,7 +240,7 @@ fn u64of(h: &[u8], off: usize) -> u64 {
 #[tokio::test]
 async fn ar_stress() {
     let (Some(oa), Some(ob)) = (dev("OWL_PEER_TEST_DEV_A"), dev("OWL_PEER_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)");
+        owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)");
         return;
     };
     assert_ne!(oa, ob);
@@ -352,7 +352,7 @@ async fn ar_stress() {
 #[tokio::test]
 async fn ar_stress_graph() {
     let (Some(oa), Some(ob)) = (dev("OWL_PEER_TEST_DEV_A"), dev("OWL_PEER_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B");
+        owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B");
         return;
     };
     let replays: u32 = std::env::var("OWL_STRESS_REPLAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
@@ -468,7 +468,7 @@ async fn ar_stress_graph() {
 #[tokio::test]
 async fn ce_sm_overlap_probe() {
     let (Some(oa), Some(ob)) = (dev("OWL_PEER_TEST_DEV_A"), dev("OWL_PEER_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B");
+        owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B");
         return;
     };
     let ce_n: u32 = std::env::var("OWL_OVL_CE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -580,7 +580,7 @@ async fn ce_sm_overlap_probe() {
 #[ignore = "probe:图内跨流重叠(真形状;需 P2P 对)"]
 async fn push_graph_overlap_probe() {
     let (Some(oa), Some(ob)) = (dev("OWL_PEER_TEST_DEV_A"), dev("OWL_PEER_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B");
+        owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B");
         return;
     };
     let chain: u32 =

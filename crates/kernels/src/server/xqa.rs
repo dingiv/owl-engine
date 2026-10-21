@@ -74,8 +74,9 @@ fn assemble_common(
     let consts = XqaConsts::from_slots(&slots)?;
     // 动态 smem 上限(原 `configureKernel()` 的 cudaFuncSetAttribute)
     crate::device::Exec::set_shared_limit(&kernel, consts.smem)?;
-    eprintln!(
-        "[xqa] 资产自描述 {variant}: smem={} ctaTile=({}, {}) headGrp={} cta=({},{},{}) rowsPerBlock={} multiBlock={} tokensPerPage={} headElems={}",
+    crate::klog_info!(
+        "xqa",
+        "资产自描述 {variant}: smem={} ctaTile=({}, {}) headGrp={} cta=({},{},{}) rowsPerBlock={} multiBlock={} tokensPerPage={} headElems={}",
         consts.smem, consts.cta_tile_x, consts.cta_tile_y, consts.head_grp,
         consts.cta_x, consts.cta_y, consts.cta_z, consts.rows_per_block,
         consts.allow_multi_block, consts.tokens_per_page, consts.valid_elems_per_head

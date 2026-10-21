@@ -842,8 +842,8 @@ impl<D: DeviceClient> GraphFleet<D> {
         // kcs/vcs = 主池叶子(FI 与其余臂同池;与 kv_caches 同源)
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
         let fi_nb = pool.geom.nb; // 闭包 'static:借 boot 的字段必须先取值(同 kv_caches 纪律)
-        // **decode FI 臂**(2026-10-21 单键化):闭包捕获 'static ⇒ 先取值
-        let dfi_on = knobs.env.attn.decode_arm.uses_fi();
+        // (2026-10-21 单键化后本闭包不再分 decode FI 臂 —— 此处曾取
+        //  `dfi_on`,已随 decode 路径收口删除;prefill 面走 fi_want/vfi_bake)
         // 图内臂把 FI plan 的 ctx 烘成上界(表由引擎每轮 sync 成精确值)
         let vfi_bake_c = vfi_bake;
         // **臂事实位**(2026-10-18,同 "槽在场≠节点在场" 律):FI 面是否真登记进本图

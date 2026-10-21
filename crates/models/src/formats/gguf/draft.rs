@@ -703,7 +703,7 @@ mod tests {
     /// 两档草稿(Q4_K_M / Q8_0)共用的声明门:同一套键面/形状/覆盖
     fn spec_gate_for(key: &str) {
         let Some(b) = boot_key(key) else {
-            eprintln!("skip: 资源清单缺 {key}");
+            owl_shared::testkit::report::skip(format_args!("资源清单缺 {key}"));
             return;
         };
         let s = &b.spec;
@@ -830,7 +830,7 @@ mod tests {
     #[test]
     fn spec_and_plan_cover_the_file() {
         let Some(b) = boot() else {
-            eprintln!("skip: 资源清单缺 gguf:draft-q4");
+            owl_shared::testkit::report::skip("资源清单缺 gguf:draft-q4");
             return;
         };
         let s = &b.spec;
@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn want_list_matches_file_tensors() {
         let Some(b) = boot() else {
-            eprintln!("skip: 资源清单缺 gguf:draft-q4");
+            owl_shared::testkit::report::skip("资源清单缺 gguf:draft-q4");
             return;
         };
         let d = b.draft(Dtype::BF16, false).expect("声明草稿");
@@ -917,7 +917,7 @@ mod tests {
     #[test]
     fn fc_tap_repack_matches_hf() {
         let (Some(b), Some(hf)) = (boot(), hf()) else {
-            eprintln!("skip: 缺 gguf:draft-q4 / ckpt:dflash2-bf16");
+            owl_shared::testkit::report::skip("缺 gguf:draft-q4 / ckpt:dflash2-bf16");
             return;
         };
         let s = b.spec.clone();
@@ -958,7 +958,7 @@ mod tests {
     #[test]
     fn norms_and_conv_bases_match_hf() {
         let (Some(b), Some(hf)) = (boot(), hf()) else {
-            eprintln!("skip: 缺 gguf:draft-q4 / ckpt:dflash2-bf16");
+            owl_shared::testkit::report::skip("缺 gguf:draft-q4 / ckpt:dflash2-bf16");
             return;
         };
         let src = GgufDraftSource::new(&b.gguf, b.spec.clone());
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn codebook_rows_match_hf() {
         let (Some(b), Some(hf)) = (boot(), hf()) else {
-            eprintln!("skip: 缺 gguf:draft-q4 / ckpt:dflash2-bf16");
+            owl_shared::testkit::report::skip("缺 gguf:draft-q4 / ckpt:dflash2-bf16");
             return;
         };
         let src = GgufDraftSource::new(&b.gguf, b.spec.clone());
@@ -1027,7 +1027,7 @@ mod tests {
     #[test]
     fn budget_is_within_cap() {
         let Some(b) = boot() else {
-            eprintln!("skip: 资源清单缺 gguf:draft-q4");
+            owl_shared::testkit::report::skip("资源清单缺 gguf:draft-q4");
             return;
         };
         let bytes: u64 = b.gguf.tensors.iter().map(|t| t.nbytes).sum();
@@ -1085,7 +1085,7 @@ mod tests {
     async fn gpu_gguf_draft_matches_hf_draft() {
         use crate::module::LoaderCtx;
         let (Some(b), Some(hf_dir)) = (boot(), resource("ckpt:dflash2-bf16")) else {
-            eprintln!("skip: 缺 gguf:draft-q4 / ckpt:dflash2-bf16");
+            owl_shared::testkit::report::skip("缺 gguf:draft-q4 / ckpt:dflash2-bf16");
             return;
         };
         let mut gpu = crate::testkit::gpu_client().await;

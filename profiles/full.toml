@@ -289,7 +289,6 @@ idx_dbg = false
 cov_dump = false
 store_hook_dbg = false
 pf_taps = false
-fi_debug = false
 l3_audit = false
 gdn_diag = false
 gdn_touch = ""

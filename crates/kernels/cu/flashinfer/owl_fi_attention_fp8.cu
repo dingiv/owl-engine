@@ -29,7 +29,7 @@ extern "C" int owl_fi_prefill_run_fp8kv(
                                           head_dim, page_size, total_num_rows, sm_scale,
                                           block_valid_mask, stream, "run_fp8kv");
   } catch (const std::exception& e) {
-    fprintf(stderr, "[owl-fi][run_fp8kv] %s\n", e.what());
+    OWL_LOG_ERROR("owl-fi", "[run_fp8kv] 异常: %s", e.what());
     return -103;
   }
 }

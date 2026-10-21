@@ -261,7 +261,7 @@ mod tests {
             ),
         ] {
             let Some(d) = dir(env, default) else {
-                eprintln!("skip: {default} 不在({env} 可指路)");
+                owl_shared::testkit::report::skip(format_args!("{default} 不在({env} 可指路)"));
                 continue;
             };
             let want = want_fn();
@@ -292,7 +292,7 @@ mod tests {
             ),
         ] {
             let Some(d) = dir(env, default) else {
-                eprintln!("skip: [{tag}] 草稿检查点不在({env} 可指路)");
+                owl_shared::testkit::report::skip(format_args!("[{tag}] 草稿检查点不在({env} 可指路)"));
                 continue;
             };
             let preset = crate::formats::qwen35::qwen3_8_27b();
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn matches_vlm_text_spec() {
         let Some(d) = dir("ckpt:qwen35-4b", "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B") else {
-            eprintln!("skip: 4B-VL 检查点不在");
+            owl_shared::testkit::report::skip("4B-VL 检查点不在");
             return;
         };
         let raw = owl_shared::file_loader::read(&d.join("config.json")).expect("config.json");

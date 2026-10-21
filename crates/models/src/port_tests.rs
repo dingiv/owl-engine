@@ -232,7 +232,7 @@ async fn gpu_prefill_paged_attn_f16_hd256_smoke8() {
 
 async fn gpu_prefill_paged_attn_f16_hd256_impl(t_ctx: usize) {
     if !gpu_enabled() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let (hq, hkv, hd, p, nb) = (8usize, 2usize, 256usize, 32usize, 1usize);

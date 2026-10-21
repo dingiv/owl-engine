@@ -72,7 +72,7 @@ async fn time_replays(client: &mut GpuClient, n_nodes: usize, elems: usize, tag:
 #[tokio::test]
 async fn graph_dispatch_rate_probe() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();

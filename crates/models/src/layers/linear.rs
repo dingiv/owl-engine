@@ -972,11 +972,11 @@ mod tests {
         use crate::module::QuantPlan;
         use crate::testkit::{gpu_client, gpu_enabled};
         if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         }
         let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
-            eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 27B 检查点目录)");
+            owl_shared::testkit::report::skip("ckpt:27b-awq 未设(cyankiwi 27B 检查点目录)");
             return;
         };
         // 真层:layer0.mlp.gate_proj(17408×5120)——两档都 marlin_eligible。

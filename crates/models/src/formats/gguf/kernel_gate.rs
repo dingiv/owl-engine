@@ -78,7 +78,7 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_gguf_gemm_matches_cpu_reference() {
         if !resource_ok("gguf:4b") {
-            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
             return;
         }
         let path = PathBuf::from(resource("gguf:4b").expect("resource_ok 已过"));
@@ -175,7 +175,7 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_gguf_mmq_matches_mmvq() {
         if !resource_ok("gguf:4b") {
-            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
             return;
         }
         let path = PathBuf::from(resource("gguf:4b").expect("resource_ok 已过"));
@@ -268,7 +268,7 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_gguf_smem_gemm_matches_mmvq() {
         if !resource_ok("gguf:4b") {
-            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
             return;
         }
         const MT: usize = owl_kernels::family::gguf::SMEM_MT;
@@ -368,7 +368,7 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_gguf_tile_gemm_matches_mmvq_bitwise() {
         if !resource_ok("gguf:4b") {
-            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
             return;
         }
         const MT: usize = owl_kernels::family::gguf::TILE_MT;
@@ -453,7 +453,7 @@ mod tests {
         let mut checked = 0usize;
         for (res_key, want_ty) in [("gguf:4b", "Q6_K"), ("gguf:27b", "Q4_K")] {
             if !resource_ok(res_key) {
-                eprintln!("skip: 资源清单缺 \"{res_key}\"");
+                owl_shared::testkit::report::skip("资源清单缺 \"{res_key}\"");
                 continue;
             }
             let path = PathBuf::from(resource(res_key).expect("resource_ok 已过"));
@@ -543,7 +543,7 @@ mod tests {
     async fn gpu_gguf_ssm_out_tiled_act_matches_grouped_reference() {
         use crate::formats::gguf::transform;
         if !resource_ok("gguf:4b") {
-            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
             return;
         }
         let path = PathBuf::from(resource("gguf:4b").expect("resource_ok 已过"));
@@ -705,7 +705,7 @@ mod tests {
     async fn gpu_gguf_ssm_out_gather_matches_tiled_act() {
         use crate::formats::gguf::transform;
         if !resource_ok("gguf:4b") {
-            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
             return;
         }
         let path = PathBuf::from(resource("gguf:4b").expect("resource_ok 已过"));
@@ -820,7 +820,7 @@ mod tests {
     async fn gpu_gguf_mmq2_matches_cublas() {
         use owl_kernels::family::gguf as famg;
         if !resource_ok("gguf:4b") {
-            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
             return;
         }
         let mut gpu = crate::testkit::gpu_client().await;
@@ -843,7 +843,7 @@ mod tests {
             ][..]),
         ] {
             if !resource_ok(res_key) {
-                eprintln!("skip: 资源清单缺 \"{res_key}\"");
+                owl_shared::testkit::report::skip("资源清单缺 \"{res_key}\"");
                 continue;
             }
             let g = Gguf::open(&PathBuf::from(resource(res_key).expect("列了就有"))).expect("open");
@@ -1045,7 +1045,7 @@ mod tests {
             ),
         ] {
             if !resource_ok(res_key) {
-                eprintln!("skip: 资源清单缺 \"{res_key}\"");
+                owl_shared::testkit::report::skip("资源清单缺 \"{res_key}\"");
                 continue;
             }
             let g = Gguf::open(&PathBuf::from(resource(res_key).expect("列了就有"))).expect("open");
@@ -1170,7 +1170,7 @@ mod tests {
         let mut gpu = crate::testkit::gpu_client().await;
         for (res_key, tname, want_ty, m) in cases.iter().copied() {
             if !resource_ok(res_key) {
-                eprintln!("skip: 资源清单缺 \"{res_key}\"");
+                owl_shared::testkit::report::skip("资源清单缺 \"{res_key}\"");
                 continue;
             }
             let g = Gguf::open(&PathBuf::from(resource(res_key).expect("列了就有")))
@@ -1387,7 +1387,7 @@ mod m_scan {
         use crate::formats::gguf::Q8_1_BLOCK_BYTES;
         use crate::ops::SemanticKernel;
         let Some(path) = owl_shared::testkit::resource("gguf:27b-iq4xs") else {
-            eprintln!("skip: 资源清单缺 gguf:27b-iq4xs");
+            owl_shared::testkit::report::skip("资源清单缺 gguf:27b-iq4xs");
             return;
         };
         let g = Gguf::open(&PathBuf::from(path)).expect("open 27B IQ4_XS");
@@ -1470,7 +1470,7 @@ mod m_scan {
         use crate::formats::gguf::Q8_1_BLOCK_BYTES;
         use crate::ops::SemanticKernel;
         let Some(path) = owl_shared::testkit::resource("gguf:27b-iq4xs") else {
-            eprintln!("skip: 资源清单缺 gguf:27b-iq4xs");
+            owl_shared::testkit::report::skip("资源清单缺 gguf:27b-iq4xs");
             return;
         };
         let g = Gguf::open(&PathBuf::from(path)).expect("open 27B IQ4_XS");
@@ -1647,7 +1647,7 @@ mod m_scan {
     #[owl_test(gpu)]
     async fn gpu_gguf_gemm_m_scan() {
         let Some(path) = owl_shared::testkit::resource("gguf:27b-iq4xs") else {
-            eprintln!("skip: 资源清单缺 gguf:27b-iq4xs");
+            owl_shared::testkit::report::skip("资源清单缺 gguf:27b-iq4xs");
             return;
         };
         let path = PathBuf::from(path);

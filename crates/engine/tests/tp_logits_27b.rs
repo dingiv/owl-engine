@@ -102,12 +102,12 @@ fn tp_logits_27b() {
         dev("OWL_TP_TEST_DEV_B"),
         dev("OWL_TP_TEST_DEV_C"),
     ) else {
-        eprintln!("skip: 需 OWL_TP_TEST_DEV_A(TP1 参考卡)/ _B / _C(TP2 双 rank)");
+        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A(TP1 参考卡)/ _B / _C(TP2 双 rank)");
         return;
     };
     let dir = dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 27B 检查点不在 {dir:?}");
+        owl_shared::testkit::report::skip(format_args!("27B 检查点不在 {dir:?}"));
         return;
     }
     std::thread::Builder::new()

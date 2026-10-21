@@ -1256,14 +1256,10 @@ OWL_INNER_KERNEL void chunked_prefill_paged_attention_opt_f16(
         for (int k = 0; k < NUM_VECS; k++) {
             *reinterpret_cast<O_vec*>(out + o_off + k * VEC_SIZE) = o_vec[k];
         }
-        if constexpr (KNHD) {
-            if (blockIdx.x == 0 && o_off < 8)
-                printf("[knhd-chunked-W] o_off=%lld o0=%04x o1=%04x L=%f acc=%f\n",
-                       (long long)o_off,
-                       (unsigned)reinterpret_cast<const uint16_t*>(&o_vec[0])[0],
-                       (unsigned)reinterpret_cast<const uint16_t*>(&o_vec[0])[1],
-                       L, acc_vec[0]);
-        }
+        // 2026-10-21 撤除:此处曾无条件设备端 printf(每发 prefill 打 8 行),
+        // 属 D1 取证残留。设备端 printf 无法回宿主 ⇒ 不在日志框架门内,
+        // 只许按 `cu/owl_log.h` 的 `OWL_DEV_PRINTF`(编译门 OWL_LOG_DEVICE)
+        // 一次性开启;长期探针一律走宿主面 `OWL_LOG_*`。
     }
 
     // Boundary threads are done; they still participate in __syncthreads below

@@ -15,6 +15,8 @@
 //   **单图限制**(n_seq == 1):ragged plan 的 host 端点 = [0, rows](无需回读设备表);
 //   多图走 native 臂(调用方/driver 已分流)。
 // ============================================================================
+// 算子侧唯一日志出口(编译门 OWL_LOG_ENABLED + 运行期 level/tag)
+#include "owl_log.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -84,9 +86,10 @@ extern "C" int owl_fi_attn_ragged_plan(
         /*num_colocated_ctas=*/0, /*uniform_q_len=*/(int64_t)0, stream, /*kv_dtype_bytes=*/2u);
     if (werr != cudaSuccess) return (int)werr;
     if (need_float > float_ws_size || need_int > int_ws_size || need_int > page_locked_size) {
-      fprintf(stderr,
-              "[owl-fi][ragged plan] workspace 不足:需 float=%zuB int=%zuB;现有 float=%zuB int=%zuB page_locked=%zuB(rows=%d)\n",
-              need_float, need_int, float_ws_size, int_ws_size, page_locked_size, rows);
+      OWL_LOG_ERROR("owl-fi",
+                    "[ragged plan] workspace 不足:需 float=%zuB int=%zuB;现有 float=%zuB "
+                    "int=%zuB page_locked=%zuB(rows=%d)",
+                    need_float, need_int, float_ws_size, int_ws_size, page_locked_size, rows);
       return -202;
     }
     PrefillPlanInfo plan_info;
@@ -105,7 +108,7 @@ extern "C" int owl_fi_attn_ragged_plan(
     *out_cta_tile_q = (int32_t)plan_info.cta_tile_q;
     return 0;
   } catch (const std::exception& e) {
-    fprintf(stderr, "[owl-fi][ragged plan] %s\n", e.what());
+    OWL_LOG_ERROR("owl-fi", "[ragged plan] 异常: %s", e.what());
     return -101;
   }
 }
@@ -199,12 +202,12 @@ extern "C" int owl_fi_attn_ragged_run_f16(
       case 256u:
         return (int)ragged_launch<256u, 64u>(params, stream);
       default:
-        fprintf(stderr, "[owl-fi][ragged run] 未实例化的 cta_tile_q=%lld\n",
-                (long long)plan_info.cta_tile_q);
+        OWL_LOG_ERROR("owl-fi", "[ragged run] 未实例化的 cta_tile_q=%lld",
+                      (long long)plan_info.cta_tile_q);
         return -205;
     }
   } catch (const std::exception& e) {
-    fprintf(stderr, "[owl-fi][ragged run] %s\n", e.what());
+    OWL_LOG_ERROR("owl-fi", "[ragged run] 异常: %s", e.what());
     return -102;
   }
 }

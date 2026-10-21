@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn golden_snapshot_templates() {
         let Some(dir) = owl_shared::testkit::resource("tpl:default") else {
-            eprintln!("skip: tpl:default 未设(指向 27B 快照目录)");
+            owl_shared::testkit::report::skip("tpl:default 未设(指向 27B 快照目录)");
             return;
         };
         let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -545,7 +545,7 @@ mod tests {
                 owl_shared::testkit::resource(gk),
                 owl_shared::testkit::resource(hk),
             ) else {
-                eprintln!("skip: 资源清单缺 {gk}/{hk}");
+                owl_shared::testkit::report::skip(format_args!("资源清单缺 {gk}/{hk}"));
                 continue;
             };
             let g = owl_models::formats::gguf::Gguf::open(std::path::Path::new(&gguf)).expect("开 GGUF");
@@ -584,7 +584,7 @@ mod tests {
             checked += 1;
         }
         if checked == 0 {
-            eprintln!("skip: 无 GGUF 模板资源(tpl:gguf9b / tpl:gguf27b)");
+            owl_shared::testkit::report::skip("无 GGUF 模板资源(tpl:gguf9b / tpl:gguf27b)");
         }
     }
 

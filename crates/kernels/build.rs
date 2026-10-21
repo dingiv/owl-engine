@@ -898,6 +898,28 @@ fn check_marlin_selector(sources: &[PathBuf]) {
     );
 }
 
+/// 诊断输出面编译门(与 cargo feature `log` 同源;缺省开)。
+///
+/// 三处消费者必须**同一判据**(否则 Rust 打得出来、C++ 打不出来 = 两套规范):
+/// - `klog_*!` 宏(kernels/src/sink.rs);
+/// - `cu/owl_log.h` 的 `OWL_LOG_*`(靠本函数下发的 `-DOWL_LOG_ENABLED`);
+/// - `cu/owl_log.h` 的 `OWL_LOG_DEV`(`OWL_LOG_DEVICE=1` 才开,一次性取证)。
+fn log_enabled() -> bool {
+    std::env::var_os("CARGO_FEATURE_LOG").is_some()
+}
+
+/// 交给 nvcc 的日志面宏(进指纹:开关变了必须重编)
+fn log_defines() -> Vec<String> {
+    let mut v = Vec::new();
+    if log_enabled() {
+        v.push("-DOWL_LOG_ENABLED=1".to_string());
+    }
+    if std::env::var_os("OWL_LOG_DEVICE").is_some() {
+        v.push("-DOWL_LOG_DEVICE=1".to_string());
+    }
+    v
+}
+
 fn build_marlin() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     // ------------------------------------------------------------------
@@ -936,12 +958,22 @@ fn build_marlin() {
                 base.join("vllm_marlin/sm80_kernel_s8_u4_float16.cu"),        // W4A8 s8→f16 × AWQ 非对称(kU4;生产 27B 走这条)
                 base.join("vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu"),       // W4A8 s8→bf16 × kU4(BF16 激活档)
             ];
-            let includes = [base.join("vllm_marlin"), base.join("vllm_marlin/shim")];
+            // `cu/` = owl_log.h 的住址(host .cu 与 flashinfer 共用同一头)
+            let includes = [
+                PathBuf::from("cu"),
+                base.join("vllm_marlin"),
+                base.join("vllm_marlin/shim"),
+            ];
+            let log_flags = log_defines();
             let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
             // ⚠️ `force` 不进指纹(一次性旁路,不是构建输入;进了会导致
             // "用 FORCE_BUILD 跑过一次之后,普通构建反而重编")
             check_marlin_selector(&sources);
-            let flags = format!("marlin arch=sm_{arch} nvcc={nvcc_m} ar={ar}");
+            let flags = format!(
+                "marlin arch=sm_{arch} nvcc={nvcc_m} ar={ar} log={} dev={}",
+                log_enabled(),
+                std::env::var_os("OWL_LOG_DEVICE").is_some()
+            );
             let mut deps: Vec<String> = sources.iter().map(|p| p.display().to_string()).collect();
             deps.extend(MARLIN_HEADERS.iter().map(|h| h.to_string()));
             if !force && stamp_hit(&lib_out, &deps, &flags) {
@@ -961,6 +993,7 @@ fn build_marlin() {
                     args.push("-I".into());
                     args.push(inc.to_str().unwrap().to_string());
                 }
+                args.extend(log_flags.iter().cloned());
                 args.extend([
                     format!("-arch=compute_{arch}"),
                     format!("-code=sm_{arch}"),
@@ -1055,8 +1088,11 @@ fn build_flashinfer() {
         let fi_dir = out_dir.join("flashinfer");
         std::fs::create_dir_all(&fi_dir).expect("mkdir flashinfer out");
         let lib = fi_dir.join("libowl_flashinfer.a");
+        let log_flags = log_defines();
         let flags = format!(
-            "fi arch=sm_86 nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.6.18 split=2tu"
+            "fi arch=sm_86 nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.6.18 split=2tu log={} dev={}",
+            log_enabled(),
+            std::env::var_os("OWL_LOG_DEVICE").is_some()
         );
         let mut deps: Vec<String> = vec![
             src_f16.to_string(),
@@ -1083,6 +1119,9 @@ fn build_flashinfer() {
                 let status = std::process::Command::new(&nvcc_m)
                     .args(["-O3", "-std=c++17", "-arch=sm_86"])
                     .arg(format!("-I{fi_include}"))
+                    // owl_log.h(算子侧唯一日志出口)+ 编译门
+                    .arg("-Icu")
+                    .args(&log_flags)
                     .arg("-c").arg(src).arg("-o").arg(&obj)
                     .status()
                     .expect("flashinfer: failed to spawn nvcc");

@@ -1077,7 +1077,7 @@ mod tests {
     #[tokio::test]
     async fn gpu_capture_reclaim_matches_eager() {
         let Some(ordinal) = owl_cuda::test_device_ordinal_opt() else {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         };
         let f_eager = owl_cuda::GpuClient::spawn(owl_cuda::DeviceSelector::Ordinal(ordinal))

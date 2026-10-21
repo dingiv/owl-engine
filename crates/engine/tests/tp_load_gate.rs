@@ -61,6 +61,7 @@ async fn load_once<F: DeviceClient>(
         debug_tap: false,
         staging_mb: 128,
         dump: false,
+        gguf_dequant: false,
     };
     load_from_dir(dir, face, &model, opts).await
 }
@@ -109,7 +110,7 @@ fn tp_load_gate() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("../../models/Qwen/Qwen3.5-0.8B"));
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)");
+        owl_shared::testkit::report::skip(format_args!("0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)"));
         return;
     }
     // 大盘装载:大栈 + current_thread rt(与 engine e2e 同律)

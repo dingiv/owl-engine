@@ -29,7 +29,7 @@ fn asset_dir() -> std::path::PathBuf {
 
 fn skip() -> bool {
     if std::env::var_os("OWL_CPU_MOCK").is_none() {
-        eprintln!("skip: OWL_CPU_MOCK 未设(CPU mock 冒烟按需开)");
+        owl_shared::testkit::report::skip("OWL_CPU_MOCK 未设(CPU mock 冒烟按需开)");
         return true;
     }
     false

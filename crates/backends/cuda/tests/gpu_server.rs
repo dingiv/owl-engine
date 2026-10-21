@@ -744,7 +744,7 @@ fn step_selector_bad_uuid() {
 #[tokio::test]
 async fn gpu_server_contract() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     // selector 负路径必须最先跑(cuInit 枚举失败路径;不能放在主 context
@@ -842,7 +842,7 @@ fn f16_to_f32(buf: &[u8]) -> Vec<f32> {
 #[tokio::test]
 async fn gpu_gemm_f16_matches_host() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = assemble();

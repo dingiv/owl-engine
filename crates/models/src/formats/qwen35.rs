@@ -635,11 +635,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn gpu_dflash2_draft_load_bench() {
         if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         }
         let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
-            eprintln!("skip: ckpt:dflash2 未设");
+            owl_shared::testkit::report::skip("ckpt:dflash2 未设");
             return;
         };
         let mut gpu = crate::testkit::gpu_client().await;
@@ -1661,7 +1661,7 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_dflash2_27b_loads_and_smokes() {
         let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
-            eprintln!("skip: ckpt:dflash2 未设(DFlash2 检查点目录)");
+            owl_shared::testkit::report::skip("ckpt:dflash2 未设(DFlash2 检查点目录)");
             return;
         };
         let dir = std::path::Path::new(&dir);

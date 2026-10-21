@@ -282,7 +282,7 @@ async fn read_hdr(client: &mut GpuClient, staging: &Bytes) -> Result<[u8; HDR], 
 #[tokio::test]
 async fn comm_ar_parity() {
     let (Some(oa), Some(ob)) = (dev("OWL_PEER_TEST_DEV_A"), dev("OWL_PEER_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)");
+        owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)");
         return;
     };
     assert_ne!(oa, ob, "A/B 必须是两张不同卡");

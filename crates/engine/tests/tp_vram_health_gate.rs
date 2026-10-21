@@ -47,12 +47,12 @@ fn tp_vram_health_gate() {
         std::env::var("OWL_TP_TEST_DEV_A").ok().and_then(|s| s.parse().ok()),
         std::env::var("OWL_TP_TEST_DEV_B").ok().and_then(|s| s.parse().ok()),
     ) else {
-        eprintln!("skip: 需 OWL_TP_TEST_DEV_A / _B(TP2 双 rank;CUDA ordinal)");
+        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / _B(TP2 双 rank;CUDA ordinal)");
         return;
     };
     let dir = dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)");
+        owl_shared::testkit::report::skip(format_args!("0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)"));
         return;
     }
     std::thread::Builder::new()

@@ -283,7 +283,7 @@ mod tests {
         ] {
             let p = Path::new(dir);
             if !p.join("config.json").exists() {
-                eprintln!("skip: {dir} 不在");
+                owl_shared::testkit::report::skip(format_args!("{dir} 不在"));
                 continue;
             }
             let c = CkptConfig::read(p).expect("读 config.json");

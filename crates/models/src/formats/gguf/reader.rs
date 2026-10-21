@@ -767,13 +767,13 @@ mod tests {
             .or_else(|| Some("/home/div/Documents/codes/repos/llama.cpp/gguf-py".to_string()))
             .filter(|p| Path::new(p).is_dir())
         else {
-            eprintln!("skip: gguf-py 源码树不在(OWL_GGUF_PY 可指路)");
+            owl_shared::testkit::report::skip("gguf-py 源码树不在(OWL_GGUF_PY 可指路)");
             return;
         };
         let script = crate::testkit::manifest_dir().join("src/formats/gguf_dump.py");
         for key in ["gguf:4b", "gguf:27b"] {
             let Some(path) = res(key) else {
-                eprintln!("skip: 资源清单缺 \"{key}\"");
+                owl_shared::testkit::report::skip("资源清单缺 \"{key}\"");
                 continue;
             };
             let g = Gguf::open(&path).unwrap_or_else(|e| panic!("[{key}] open: {e}"));

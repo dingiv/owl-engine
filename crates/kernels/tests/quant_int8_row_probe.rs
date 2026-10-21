@@ -175,7 +175,7 @@ fn cmp_i8(got: &[i8], want: &[i8], cols: usize, what: &str) {
 #[test]
 fn quant_int8_row_f16_matches_host() {
     let Some(dev_ok) = with_runner(|_| true) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     assert!(dev_ok);
@@ -206,7 +206,7 @@ fn quant_int8_row_f16_matches_host() {
 #[test]
 fn quant_int8_row_bf16_matches_host() {
     let Some(res) = with_runner(|_| ()) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let () = res;
@@ -234,7 +234,7 @@ fn quant_int8_row_bf16_matches_host() {
 #[test]
 fn mul_only_scales_q_invariant() {
     let Some(res) = with_runner(|_| ()) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let () = res;

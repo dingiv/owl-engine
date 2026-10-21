@@ -31,7 +31,7 @@ fn profile_check_reports_128k_and_memory_basis() {
     let t0 = Instant::now();
     let out = run(&[
         "-p",
-        profile("awq27b-3090-max").to_str().expect("路径"),
+        profile("qwen38_27b-3090-w4a16").to_str().expect("路径"),
         "--check",
     ]);
     let dt = t0.elapsed();
@@ -59,7 +59,7 @@ fn profile_check_reports_128k_and_memory_basis() {
 fn print_config_json_carries_provenance_and_estimate() {
     let out = run(&[
         "-p",
-        profile("awq27b-3090-max").to_str().expect("路径"),
+        profile("qwen38_27b-3090-w4a16").to_str().expect("路径"),
         "--print-config",
         "--format",
         "json",
@@ -83,7 +83,7 @@ fn print_config_json_carries_provenance_and_estimate() {
 fn explain_prints_origin_and_rule() {
     let out = run(&[
         "-p",
-        profile("awq27b-3090-max").to_str().expect("路径"),
+        profile("qwen38_27b-3090-w4a16").to_str().expect("路径"),
         "--explain",
         "runtime.max_seq",
     ]);
@@ -98,7 +98,7 @@ fn explain_prints_origin_and_rule() {
 fn set_overrides_derived_value() {
     let out = run(&[
         "-p",
-        profile("awq27b-3090-max").to_str().expect("路径"),
+        profile("qwen38_27b-3090-w4a16").to_str().expect("路径"),
         "--set",
         "runtime.max_seq=65536",
         "--check",
@@ -112,9 +112,11 @@ fn set_overrides_derived_value() {
 
 #[test]
 fn legacy_profile_still_works() {
+    // 旧档名 `awq27b` 已随 profile 重命名退场;此门守"无 [intent] 的档
+    // 仍走同一 CLI 分支"(兼容路径),档名取现役 3090 w4a16。
     let out = run(&[
         "-p",
-        profile("awq27b").to_str().expect("路径"),
+        profile("qwen38_27b-3090-w4a16").to_str().expect("路径"),
         "--check",
     ]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

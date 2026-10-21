@@ -107,7 +107,7 @@ fn inputs() -> (Vec<f16>, Vec<f16>) {
 #[test]
 fn fatbin_loads_and_exposes_all_variants() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     use std::collections::BTreeMap;
@@ -164,7 +164,7 @@ fn fatbin_loads_and_exposes_all_variants() {
 #[test]
 fn fatbin_launch_matches_host_reference() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(ord).expect("context");
@@ -199,7 +199,7 @@ fn fatbin_launch_matches_host_reference() {
 #[test]
 fn nvrtc_and_fatbin_agree_bitwise() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(ord).expect("context");
@@ -290,7 +290,7 @@ fn lcg_f16(n: usize, seed: u32) -> Vec<u16> {
 #[test]
 fn aot_equiv_rmsnorm_f16() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(ord).expect("ctx");
@@ -343,7 +343,7 @@ fn aot_equiv_rmsnorm_f16() {
 #[test]
 fn aot_equiv_argmax_ties() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(ord).expect("ctx");
@@ -389,7 +389,7 @@ fn aot_equiv_argmax_ties() {
 #[test]
 fn aot_equiv_paged_attention_v2_chain() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(ord).expect("ctx");

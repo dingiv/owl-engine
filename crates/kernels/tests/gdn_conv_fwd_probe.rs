@@ -233,7 +233,7 @@ fn check_f32(tag: &str, got: &[f32], want: &[f32]) {
 #[test]
 fn conv_fwd_single_chunk_matches_host_bitwise() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(ord).expect("context");
@@ -291,7 +291,7 @@ fn conv_fwd_single_chunk_matches_host_bitwise() {
 #[test]
 fn conv_fwd_chunked_state_matches_whole_run() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(ord).expect("context");
@@ -337,7 +337,7 @@ fn conv_fwd_chunked_state_matches_whole_run() {
 #[test]
 fn conv_fwd_batch_and_neg_slot() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(ord).expect("context");
@@ -408,7 +408,7 @@ fn conv_fwd_batch_and_neg_slot() {
 #[test]
 fn conv_fwd_latency_probe() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(ord).expect("context");

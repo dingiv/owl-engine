@@ -6,6 +6,9 @@ license.workspace = true
 description = "共用基建:signal 依赖追踪(re-export)+ testkit 算子对拍框架 + metrics 计时刻度"
 
 [dependencies]
+# 日志/计量下沉口(叶子 crate,零依赖)—— `LogSink` 的唯一定义处。
+# 下层(kernels)也引它,故结构本体不在本 crate(否则两套镜像)。
+owl-sink = { path = "../sink" }
 # 后端无关的依赖追踪(signal 实体;iface 零后端契约,不拖 CUDA 链 ——
 # models 依赖本 crate 的前提,2026-10-01 vestigial owl-cuda 依赖切除)
 owl-iface = { path = "../backends/iface" }

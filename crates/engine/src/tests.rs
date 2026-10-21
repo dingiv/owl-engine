@@ -39,7 +39,7 @@ use owl_iface::contract::DeviceClient;
 /// 树:`y = x + c → out = y + c`(x=c=1 ⇒ out=3)。
 pub async fn gpu_single_graph_capture_and_replay() {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     // 最小 GpuClient 装配(与 owl-cuda 的 gpu_server 测试同款:server 专职线程 + 管道)
@@ -670,7 +670,7 @@ async fn case_config_injection(cfg: &OwlConfig) {
 /// 的切块语义,而共享档是 `4096/32` → 实测红。切块敏感的用例一律自带装载。
 pub async fn gpu_schedule_decision_surface() {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -787,11 +787,11 @@ pub async fn gpu_schedule_decision_surface() {
 ///      --features e2e --test engine_e2e -- --test-threads=1 --nocapture`
 pub async fn gpu_08b_offload_probe() {
     if !owl_shared::env_reader::flag("OWL_OFFLOAD_PROBE") {
-        eprintln!("skip: OWL_OFFLOAD_PROBE 未设(S3-3b 实证按需开)");
+        owl_shared::testkit::report::skip("OWL_OFFLOAD_PROBE 未设(S3-3b 实证按需开)");
         return;
     }
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -810,7 +810,7 @@ pub async fn gpu_08b_offload_probe() {
 /// (0.8B 在 CPU 上装载 ~65s —— 按需开,不进默认套件。)
 pub async fn cpu_mock_offload_probe() {
     if !owl_shared::env_reader::flag("OWL_CPU_MOCK") || !owl_shared::env_reader::flag("OWL_OFFLOAD_PROBE") {
-        eprintln!("skip: OWL_CPU_MOCK / OWL_OFFLOAD_PROBE 未设(CPU mock 档按需开)");
+        owl_shared::testkit::report::skip("OWL_CPU_MOCK / OWL_OFFLOAD_PROBE 未设(CPU mock 档按需开)");
         return;
     }
     let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
@@ -926,11 +926,11 @@ async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D
 /// 档位:snap_max=1(逼出 churn)+ 状态腿宿主分片 64MiB(0.8B 一条快照 ≈19.3MiB)。
 pub async fn gpu_08b_state_leg_probe() {
     if !owl_shared::env_reader::flag("OWL_STATE_LEG_PROBE") {
-        eprintln!("skip: OWL_STATE_LEG_PROBE 未设(S2 状态腿探针按需开)");
+        owl_shared::testkit::report::skip("OWL_STATE_LEG_PROBE 未设(S2 状态腿探针按需开)");
         return;
     }
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -955,7 +955,7 @@ pub async fn cpu_mock_state_leg_probe() {
     if !owl_shared::env_reader::flag("OWL_CPU_MOCK")
         || !owl_shared::env_reader::flag("OWL_STATE_LEG_PROBE")
     {
-        eprintln!("skip: OWL_CPU_MOCK / OWL_STATE_LEG_PROBE 未设");
+        owl_shared::testkit::report::skip("OWL_CPU_MOCK / OWL_STATE_LEG_PROBE 未设");
         return;
     }
     let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
@@ -1420,17 +1420,17 @@ async fn select_decode_scenario() {
 /// **B-3d 探针**(自装载;`OWL_SELECT_DECODE=1` + `OWL_COVERAGE_PROBE=1` + `OWL_INDEX_PROBE=1`)。
 pub async fn gpu_08b_select_decode_probe() {
     if !owl_shared::env_reader::flag("OWL_SELECT_DECODE") {
-        eprintln!("skip: OWL_SELECT_DECODE 未设(B-3d 探针按需开)");
+        owl_shared::testkit::report::skip("OWL_SELECT_DECODE 未设(B-3d 探针按需开)");
         return;
     }
     if !owl_shared::env_reader::flag("OWL_COVERAGE_PROBE")
         || !owl_shared::env_reader::flag("OWL_INDEX_PROBE")
     {
-        eprintln!("skip: 需 OWL_COVERAGE_PROBE + OWL_INDEX_PROBE(召回/索引面)");
+        owl_shared::testkit::report::skip("需 OWL_COVERAGE_PROBE + OWL_INDEX_PROBE(召回/索引面)");
         return;
     }
     if gpu_ordinal().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     select_decode_scenario().await;
@@ -1441,7 +1441,7 @@ pub async fn gpu_08b_coverage_probe() {
     // 门 = **运行器级**(选卡 + 场景过滤);**行为面一律来自配置文件**
     // (`OWL_PROBE_FLAVOR` 基档 + `OWL_PROBE_OVERLAY` 覆盖件)
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设(哪张卡)");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设(哪张卡)");
         return;
     };
     let cfg = coverage_probe_config(ordinal);
@@ -1475,7 +1475,7 @@ pub async fn gpu_08b_coverage_probe() {
 /// --features e2e --test engine_e2e -- --test-threads=1 --nocapture`
 pub async fn gpu_08b_chunk_invariance_gate() {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设(哪张卡)");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设(哪张卡)");
         return;
     };
     // 两个切块:大档(A2 观测里一直是对的)与小档(错带内)。
@@ -1717,11 +1717,11 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
 /// **B-3e 探针**(自装载;`OWL_B3E_PROBE=1`)。
 pub async fn gpu_08b_stage_in_probe() {
     if !owl_shared::env_reader::flag("OWL_B3E_PROBE") {
-        eprintln!("skip: OWL_B3E_PROBE 未设(B-3e stage-in 探针按需开)");
+        owl_shared::testkit::report::skip("OWL_B3E_PROBE 未设(B-3e stage-in 探针按需开)");
         return;
     }
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let mut engine = Engine::new(stage_in_config(ordinal)).expect("构造");
@@ -1905,11 +1905,11 @@ async fn select_27b_scenario() {
 /// **B-5 Stage 2 探针入口**(自装载;`OWL_SELECT_27B=1`)。
 pub async fn gpu_27b_select_probe() {
     if !owl_shared::env_reader::flag("OWL_SELECT_27B") {
-        eprintln!("skip: OWL_SELECT_27B 未设(B-5 Stage2 探针按需开)");
+        owl_shared::testkit::report::skip("OWL_SELECT_27B 未设(B-5 Stage2 探针按需开)");
         return;
     }
     if owl_shared::testkit::resource("ckpt:27b-awq").is_none() || gpu_ordinal().is_none() {
-        eprintln!("skip: 需 ckpt:27b-awq + OWL_TEST_DEVICE");
+        owl_shared::testkit::report::skip("需 ckpt:27b-awq + OWL_TEST_DEVICE");
         return;
     }
     select_27b_scenario().await;
@@ -1918,11 +1918,11 @@ pub async fn gpu_27b_select_probe() {
 /// B-0 索引采集探针(自装载;`OWL_INDEX_PROBE=1`)。
 pub async fn gpu_08b_index_probe() {
     if !owl_shared::env_reader::flag("OWL_INDEX_PROBE") {
-        eprintln!("skip: OWL_INDEX_PROBE 未设(B-0 索引采集探针按需开)");
+        owl_shared::testkit::report::skip("OWL_INDEX_PROBE 未设(B-0 索引采集探针按需开)");
         return;
     }
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -1935,7 +1935,7 @@ pub async fn gpu_08b_index_probe() {
 /// **CPU mock 档的索引采集场景**(无卡:验链路;K 恒零 ⇒ 数值无意义)。
 pub async fn cpu_mock_index_probe() {
     if !owl_shared::env_reader::flag("OWL_CPU_MOCK") || !owl_shared::env_reader::flag("OWL_INDEX_PROBE") {
-        eprintln!("skip: OWL_CPU_MOCK / OWL_INDEX_PROBE 未设");
+        owl_shared::testkit::report::skip("OWL_CPU_MOCK / OWL_INDEX_PROBE 未设");
         return;
     }
     let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
@@ -2155,11 +2155,11 @@ async fn probe_run_turn<D: DeviceClient>(running: &mut RunningEngine<D>, prompt:
 /// - turn 期 live 峰值由 200µs 采样线程给(瞬态面)。
 pub async fn gpu_08b_budget_probe() {
     if !owl_shared::env_reader::flag("OWL_BUDGET_PROBE") {
-        eprintln!("skip: OWL_BUDGET_PROBE 未设(预算实测按需开)");
+        owl_shared::testkit::report::skip("OWL_BUDGET_PROBE 未设(预算实测按需开)");
         return;
     }
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -2348,7 +2348,7 @@ runtime_floor_bytes={runtime_floor} draft_pool_bytes={draft_pool} gdn_row_bytes=
 /// 本测试只验「两配置链路都活着且确定(各 ×2 逐字稳定)」。门控 OWL_TEST_DEVICE。
 pub async fn gpu_08b_fuse_text_parity() {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -2385,7 +2385,7 @@ pub async fn gpu_08b_fuse_text_parity() {
 
 pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -2444,7 +2444,7 @@ pub async fn gpu_two_turns_lifecycle(shared: Option<&mut RunningEngine<crate::Gp
 /// 测试覆盖,此处验 Some(id) 连续性 + 收口账推进。
 pub async fn gpu_session_continuity(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -2502,7 +2502,7 @@ pub async fn gpu_session_continuity(shared: Option<&mut RunningEngine<crate::Gpu
 /// turn2(前缀失配回退全量路径 @4k)。
 pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -2641,7 +2641,7 @@ pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<crate::G
 /// 断言:①两臂 prompt token 数一致 ②召回行为一致 ③**文本逐字一致**。
 pub async fn gpu_longctx_fi_direct_gate() {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let seq: usize = owl_shared::env_reader::parse_or("OWL_E2E_SEQ", 4096);
@@ -2737,7 +2737,7 @@ pub async fn gpu_w4a16_marlin_e2e() {
     // 套件统一约定(OWL_TEST_DEVICE):曾硬钉 ordinal 2 —— 与现役
     // vLLM 生产服务器(3080 对)撞卡时 OOM at capture slab(2026-10-06)
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir(); // 转换产物与 f16 同目录约定:../Qwen3.5-0.8B-W4A16
@@ -2746,7 +2746,7 @@ pub async fn gpu_w4a16_marlin_e2e() {
         .expect("assets")
         .join("Qwen3.5-0.8B-W4A16");
     if !w4a16_dir.exists() {
-        eprintln!("skip: W4A16 检查点不存在({:?}),先跑转换器", w4a16_dir);
+        owl_shared::testkit::report::skip(format_args!("W4A16 检查点不存在({:?}),先跑转换器", w4a16_dir));
         return;
     }
     let mut engine = Engine::new(EngineConfig {
@@ -2784,12 +2784,12 @@ pub async fn gpu_w4a16_marlin_e2e() {
 /// VRAM 预算:权重 ~17.5GB + KV/GDN 状态 ~1.3GB → 3090 Ti 24G。
 pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
-        eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
+        owl_shared::testkit::report::skip("ckpt:27b-awq 未设(cyankiwi 检查点目录)");
         return;
     };
     let dir = std::path::PathBuf::from(dir);
     if !dir.exists() {
-        eprintln!("skip: 检查点目录不存在({dir:?})");
+        owl_shared::testkit::report::skip(format_args!("检查点目录不存在({dir:?})"));
         return;
     }
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
@@ -2862,7 +2862,7 @@ pub async fn gpu_awq27b_marlin_e2e(shared: Option<&mut RunningEngine<crate::GpuF
 /// 直接行为证据(块链不同 ⇒ KV 物理槽不同)。
 pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -2951,7 +2951,7 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
 /// B 块链前缀与 A 物理共享;TTFT 可测下降。
 pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -3070,12 +3070,12 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFa
 /// 输出全文打印供人工判读;复读启发式是底线门不是质量门。
 pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<crate::GpuFace>>) {
     let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
-        eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
+        owl_shared::testkit::report::skip("ckpt:27b-awq 未设(cyankiwi 检查点目录)");
         return;
     };
     let dir = std::path::PathBuf::from(dir);
     if !dir.exists() {
-        eprintln!("skip: 检查点目录不存在({dir:?})");
+        owl_shared::testkit::report::skip(format_args!("检查点目录不存在({dir:?})"));
         return;
     }
     let ordinal = gpu_ordinal().expect("OWL_TEST_DEVICE");
@@ -3187,7 +3187,7 @@ pub async fn gpu_27b_chat_inference(shared: Option<&mut RunningEngine<crate::Gpu
 /// (互不污染);批臂 = 同时 submit 两 turn(调度面先各自 prefill,再合批)。
 pub async fn gpu_batch_decode_matches_serial() {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
@@ -3304,11 +3304,11 @@ pub async fn gpu_batch_decode_matches_serial() {
 /// 判据:① 输出逐字相同(语义门)② 批步数 > 0(真走批路径)③ 打印 t/s 比值。
 pub async fn gpu_batch_decode_bench_27b() {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
-        eprintln!("skip: ckpt:27b-awq 未设");
+        owl_shared::testkit::report::skip("ckpt:27b-awq 未设");
         return;
     };
     let max_new = 64usize;
@@ -3508,7 +3508,7 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
     /// 连续性一并覆盖)。哑草稿需 OWL_SPEC_DUMB=1(C7:无草稿器回落)。
     pub async fn gpu_spec_identity_gate() {
         let Some(ordinal) = gpu_ordinal() else {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         };
         let dir = asset_dir();
@@ -3602,11 +3602,11 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
     /// ckpt:27b-awq。
     pub async fn gpu_spec_identity_gate_27b() {
         let Some(ordinal) = gpu_ordinal() else {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         };
         let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
-            eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
+            owl_shared::testkit::report::skip("ckpt:27b-awq 未设(cyankiwi 检查点目录)");
             return;
         };
         // 域参数化(E5-DF3 AL 排查:PROSE 域 = DFlash2 结构性最差域,
@@ -3700,15 +3700,15 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
     /// 池)—— OOM 时降 max_seq_tokens/挪 24G 卡。
     pub async fn gpu_dflash2_identity_gate_27b() {
         let Some(ordinal) = gpu_ordinal() else {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         };
         let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
-            eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
+            owl_shared::testkit::report::skip("ckpt:27b-awq 未设(cyankiwi 检查点目录)");
             return;
         };
         let Some(ddir) = owl_shared::testkit::resource("ckpt:dflash2") else {
-            eprintln!("skip: ckpt:dflash2 未设(DFlash2 草稿目录)");
+            owl_shared::testkit::report::skip("ckpt:dflash2 未设(DFlash2 草稿目录)");
             return;
         };
         // 域参数化(E5-DF3 AL 排查:PROSE 域 = DFlash2 结构性最差域,
@@ -3936,7 +3936,7 @@ async fn drive_turn<D: DeviceClient>(running: &mut RunningEngine<D>, id: u64) ->
 /// 门控 OWL_TEST_DEVICE。诊断打印,不做硬断言(判决先看数)。
 pub async fn gpu_gdn_slot_cross_probe() {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let mut knobs = EngineKnobs { gdn_slots: 2, ..Default::default() };
@@ -3979,11 +3979,11 @@ pub async fn gpu_gdn_slot_cross_probe() {
 
 pub async fn gpu_decode_marginal_bench() {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
-        eprintln!("skip: ckpt:27b-awq 未设");
+        owl_shared::testkit::report::skip("ckpt:27b-awq 未设");
         return;
     };
     // 口径与恒等门一致(greedy 单会话三旋钮,显式 knobs)
@@ -4092,11 +4092,11 @@ pub async fn gpu_head_int8_gate() {
         return;
     }
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
-        eprintln!("skip: ckpt:27b-awq 未设");
+        owl_shared::testkit::report::skip("ckpt:27b-awq 未设");
         return;
     };
     async fn gen(
@@ -4440,12 +4440,12 @@ fn wait_histogram_and_eta_are_sane() {
 /// 判据:① 出非空文本;② `uploaded` 塔输出块在 scatter 时仍在账本(TEMP 探针)。
 pub async fn gpu_vlm_image_baseline() {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 0.8B 资产不在 {}", dir.display());
+        owl_shared::testkit::report::skip(format_args!("0.8B 资产不在 {}", dir.display()));
         return;
     }
     let mut engine = Engine::new(EngineConfig {
@@ -4582,12 +4582,12 @@ pub async fn gpu_vlm_image_baseline() {
 /// 两个场景各跑一次即构成 A/B(一个进程只能有一个"首轮")。
 pub async fn gpu_vlm_first_turn_probe(first_image: bool) {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let dir = asset_dir();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 0.8B 资产不在 {}", dir.display());
+        owl_shared::testkit::report::skip(format_args!("0.8B 资产不在 {}", dir.display()));
         return;
     }
     let mut engine = Engine::new(EngineConfig {
@@ -4675,11 +4675,11 @@ pub async fn gpu_vlm_first_turn_probe_imagefirst() {
 /// 是不是"只在 0.8B 上"必须真机回答。
 pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
     let Some(ordinal) = gpu_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
-        eprintln!("skip: ckpt:27b-awq 未配(testdata/resources.toml)");
+        owl_shared::testkit::report::skip("ckpt:27b-awq 未配(testdata/resources.toml)");
         return;
     };
     let dir = std::path::PathBuf::from(dir);

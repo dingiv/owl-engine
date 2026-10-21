@@ -312,7 +312,7 @@ fn max_dev(got: &[f32], want: &[f32]) -> f32 {
 #[allow(clippy::too_many_lines)]
 fn gdn_chunked_new_chain_matches_golden() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let dev: usize = owl_cuda::test_device_ordinal();
@@ -322,7 +322,7 @@ fn gdn_chunked_new_chain_matches_golden() {
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/gdn_fla/cases");
     if !std::path::Path::new(dir).join("c1_t64.q.bin").is_file() {
-        eprintln!("skip: 金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)");
+        owl_shared::testkit::report::skip(format_args!("金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)"));
         return;
     }
     // (tag, T, tight)
@@ -453,7 +453,7 @@ fn take_f32_unused() {}
 #[allow(clippy::too_many_lines)]
 fn gdn_chunked_nt_decomposition_identity() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let dev: usize = owl_cuda::test_device_ordinal();
@@ -642,7 +642,7 @@ fn gdn_chunked_nt_decomposition_identity() {
 #[allow(clippy::too_many_lines)]
 fn gdn_chunked_matches_varlen_fn_level() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let dev: usize = owl_cuda::test_device_ordinal();

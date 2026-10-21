@@ -218,7 +218,7 @@ fn with_registry_runner<R>(f: impl FnOnce(&mut dyn CheckRunner) -> R) -> Option<
 #[test]
 fn foreign_oracle_cublas_gemm_passes() {
     let Some(got) = with_registry_runner(|r| cb::run_case(r, &cb::case())) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let got = got.expect("cublas dispatch");
@@ -235,7 +235,7 @@ fn foreign_oracle_cublas_gemm_passes() {
 #[test]
 fn foreign_oracle_marlin_awq_passes() {
     let Some(got) = with_registry_runner(|r| ml::run_case(r, &ml::case())) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let got = got.expect("marlin dispatch");
@@ -252,7 +252,7 @@ fn foreign_oracle_marlin_awq_passes() {
 #[test]
 fn marlin_oracle_is_sensitive() {
     let Some(got) = with_registry_runner(|r| ml::run_case(r, &ml::case())) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let got = got.expect("marlin dispatch");
@@ -277,7 +277,7 @@ fn marlin_oracle_is_sensitive() {
 fn foreign_oracle_marlin_w4a8_passes() {
     let Some(got) = with_registry_runner(|r| ml::run_case_a8(r, &ml::case_a8(), ml::A8Neg::default()))
     else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let got = got.expect("marlin w4a8 dispatch");
@@ -296,7 +296,7 @@ fn foreign_oracle_marlin_w4a8_passes() {
 fn marlin_w4a8_oracle_is_sensitive() {
     let Some(got) = with_registry_runner(|r| ml::run_case_a8(r, &ml::case_a8(), ml::A8Neg::default()))
     else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let got = got.expect("marlin w4a8 dispatch");
@@ -356,7 +356,7 @@ fn marlin_w4a8_oracle_is_sensitive() {
 #[test]
 fn cublas_oracle_is_sensitive_to_layout() {
     let Some(got) = with_registry_runner(|r| cb::run_case(r, &cb::case())) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let got = got.expect("cublas dispatch");
@@ -377,7 +377,7 @@ fn oracles_pass_on_real_device() {
         let c = qk::QknormInsertOracle.run(r);
         (a, b, c)
     }) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let (k0r, ncr, qkr) = out;
@@ -401,7 +401,7 @@ fn oracles_pass_on_real_device() {
 #[test]
 fn qknorm_insert_oracle_is_sensitive() {
     let Some(res) = with_runner(|r| qk::run_case(r, &qk::case())) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let (q_out, kc, _vc) = res.expect("融合插池 run");
@@ -426,7 +426,7 @@ fn qknorm_insert_oracle_is_sensitive() {
 #[test]
 fn nc_oracle_is_sensitive_to_window() {
     let Some(got) = with_runner(|r| nc::run_case(r, &nc::case())) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let got = got.expect("NC run");
@@ -445,7 +445,7 @@ fn nc_oracle_is_sensitive_to_window() {
 #[test]
 fn k0_oracle_is_sensitive_to_layout() {
     let Some(pools) = with_runner(|r| k0::run_case(r, &k0::case())) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let (kc, vc) = pools.expect("K0 run");
@@ -491,7 +491,7 @@ fn probe_zp_hit_column() {
         }
         v
     }) else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let (mut a8_ok, mut a16_ok, mut same_mod8) = (0, 0, 0);

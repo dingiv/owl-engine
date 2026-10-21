@@ -397,7 +397,7 @@ mod f16_tests {
     #[tokio::test]
     async fn gpu_embed_f16_matches_host() {
         if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         }
         let (vocab, d) = (8usize, 16usize);

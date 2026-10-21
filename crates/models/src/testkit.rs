@@ -170,7 +170,8 @@ pub fn parity_enabled() -> bool {
 }
 
 pub fn skip_note() {
-    eprintln!("skip: OWL_HF_PARITY=1 未开(首次会同步 torch CPU 轮)");
+    // 唯一出口 = testkit::report(skip 前缀单点;与 #[owl_test(hf_parity)] 同文案)
+    owl_shared::testkit::report::skip(owl_shared::testkit::HF_PARITY_SKIP);
 }
 
 /// GPU 后端门控(`OWL_TEST_DEVICE` 已设且为 **BDF**;与 owl-cuda 同一约定)。

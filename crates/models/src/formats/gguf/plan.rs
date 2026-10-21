@@ -197,7 +197,7 @@ mod tests {
     fn histogram_and_portability_gate() {
         for key in ["gguf:4b", "gguf:27b"] {
             let Some(g) = open(key) else {
-                eprintln!("skip: 资源清单缺 \"{key}\"");
+                owl_shared::testkit::report::skip("资源清单缺 \"{key}\"");
                 continue;
             };
             let hist = require_portable(&g).unwrap_or_else(|e| panic!("[{key}] {e}"));
@@ -218,7 +218,7 @@ mod tests {
         use crate::model::Model;
         use crate::module::{Loadable, LoaderCtx, PlanSource, SourceFacts};
         let Some(g) = open("gguf:4b") else {
-            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
             return;
         };
         let (spec, _rep) = spec_from_gguf(&g).expect("spec");

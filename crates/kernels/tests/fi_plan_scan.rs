@@ -87,7 +87,7 @@ fn plan_one(res: &mut TestRes, t: usize, ctx: usize) -> (i64, i64, i32, usize) {
 #[test]
 fn scan_plan_shape() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let dev = owl_cuda::test_device_ordinal();

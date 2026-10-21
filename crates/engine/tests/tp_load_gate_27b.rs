@@ -97,6 +97,7 @@ async fn load_once(
         debug_tap: false,
         staging_mb: 128,
         dump: false,
+        gguf_dequant: false,
     };
     load_from_dir(dir, face, &model, opts).await
 }
@@ -150,7 +151,7 @@ fn entry_by_key<'a>(m: &'a LoadManifest, key: &str) -> Option<&'a LoadEntry> {
 fn tp_load_gate_27b() {
     let dir = dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 27B 检查点不在 {dir:?}(设 OWL_27B_DIR)");
+        owl_shared::testkit::report::skip(format_args!("27B 检查点不在 {dir:?}(设 OWL_27B_DIR)"));
         return;
     }
     std::thread::Builder::new()
@@ -327,7 +328,7 @@ fn read_all<S: owl_models::module::WeightSource + ?Sized>(
 fn tp_source_reads_27b() {
     let dir = dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 27B 检查点不在 {dir:?}(设 OWL_27B_DIR)");
+        owl_shared::testkit::report::skip(format_args!("27B 检查点不在 {dir:?}(设 OWL_27B_DIR)"));
         return;
     }
     std::thread::Builder::new()
@@ -469,7 +470,7 @@ async fn source_body(dir: &Path) {
 fn tp_repack_27b() {
     let dir = dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 27B 检查点不在 {dir:?}(设 OWL_27B_DIR)");
+        owl_shared::testkit::report::skip(format_args!("27B 检查点不在 {dir:?}(设 OWL_27B_DIR)"));
         return;
     }
     let ordinal: usize = std::env::var("OWL_TP_TEST_DEV")
@@ -530,6 +531,7 @@ async fn repack_body(dir: &Path, ordinal: usize) {
             debug_tap: false,
         staging_mb: 128,
         dump: false,
+        gguf_dequant: false,
         };
         let manifest = load_from_dir(dir, &mut face, &model, opts).await.expect("装载");
         // ② 参考:同一 want 的源矩形 → CPU marlin B
@@ -631,6 +633,7 @@ async fn load_draft_once(
         debug_tap: false,
         staging_mb: 128,
         dump: false,
+        gguf_dequant: false,
     };
     load_from_dir(dir, face, &draft, opts).await
 }
@@ -640,7 +643,7 @@ async fn load_draft_once(
 fn tp_load_gate_27b_draft() {
     let dir = draft_dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: DFlash2 草稿检查点不在 {dir:?}(设 OWL_DFLASH_DIR)");
+        owl_shared::testkit::report::skip(format_args!("DFlash2 草稿检查点不在 {dir:?}(设 OWL_DFLASH_DIR)"));
         return;
     }
     std::thread::Builder::new()

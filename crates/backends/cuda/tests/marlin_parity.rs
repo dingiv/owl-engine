@@ -222,7 +222,7 @@ async fn run_case(
 #[tokio::test]
 async fn marlin_w4a16_parity() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = assemble();
@@ -245,7 +245,7 @@ async fn marlin_w4a16_parity() {
 #[tokio::test]
 async fn marlin_w4a16_bf16_parity() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = assemble();
@@ -280,7 +280,7 @@ async fn marlin_w4a16_bf16_parity() {
 #[tokio::test]
 async fn marlin_golden_dump() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = assemble();
@@ -314,11 +314,11 @@ async fn marlin_golden_dump() {
 #[tokio::test]
 async fn marlin_shape_case() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let Some(spec) = owl_shared::env_reader::str("OWL_SWEEP_CASE") else {
-        eprintln!("skip: OWL_SWEEP_CASE 未设(m,n,k,g)");
+        owl_shared::testkit::report::skip("OWL_SWEEP_CASE 未设(m,n,k,g)");
         return;
     };
     let parts: Vec<usize> = spec.split(',').map(|v| v.parse().unwrap()).collect();
@@ -333,7 +333,7 @@ async fn marlin_shape_case() {
 #[tokio::test]
 async fn marlin_shape_sweep() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = assemble();
@@ -509,7 +509,7 @@ async fn run_awq_case_g(client: &mut GpuClient, m: usize, n: usize, k: usize, g:
 #[tokio::test]
 async fn marlin_w4a16_awq_parity() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = assemble();
@@ -570,7 +570,7 @@ async fn marlin_w4a16_awq_parity() {
 #[tokio::test]
 async fn ct_repack_a8_parity() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = assemble();
@@ -645,7 +645,7 @@ async fn ct_repack_a8_parity() {
 #[tokio::test]
 async fn ct_repack_parity() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = assemble();

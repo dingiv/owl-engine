@@ -201,7 +201,7 @@ fn run_one(ctx_c: &std::sync::Arc<CudaContext>, cfg: &Cfg) -> Vec<u16> {
 #[test]
 fn xqa_verify_geometry_scan() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let dev: usize = owl_cuda::test_device_ordinal();

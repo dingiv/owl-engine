@@ -109,7 +109,7 @@ static UNCLOSED_DROPS: AtomicU64 = AtomicU64::new(0);
 /// best-effort 兜底:记一次"未经 close 即 drop"并打 warning(不静默)。
 pub fn note_unclosed_drop(id: &str) {
     let n = UNCLOSED_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
-    eprintln!("[kernels] warning: 族 {id} 未经 close() 即被 drop(累计未收尾 {n})");
+    crate::klog_warn!("kernels", "族 {id} 未经 close() 即被 drop(累计未收尾 {n})");
 }
 
 /// 未收尾 drop 计数快照(测试/运维用)。
@@ -281,7 +281,7 @@ impl OpRegistry {
             .collect();
         let n = crate::server::selfcheck::run_selfchecks(active.into_iter(), res, exec, self)?;
         if n > 0 {
-            eprintln!("[kernels] 装配期自检:{n} 个算子通过(oracle 独立参考)");
+            crate::klog_info!("kernels", "装配期自检:{n} 个算子通过(oracle 独立参考)");
         }
         Ok(())
     }
@@ -420,8 +420,9 @@ impl OpRegistry {
             }
             // C) 空 ops() = 只能靠主名路由(未建表);不报错但必须可见
             if f.ops().is_empty() {
-                eprintln!(
-                    "[kernels] 族 {} 无已建表算子(只能靠主名路由;声明面零约束)",
+                crate::klog_info!(
+                    "kernels",
+                    "族 {} 无已建表算子(只能靠主名路由;声明面零约束)",
                     id.0
                 );
             }
@@ -432,8 +433,9 @@ impl OpRegistry {
         let n_declared = crate::ops::declared_count();
         let n_family = names.len();
         let undeclared = crate::ops::undeclared_symbols();
-        eprintln!(
-            "[kernels] 算子准入:已声明 {} 张(原生表 + 家族臂 {})/ 编出符号 {} 条(未声明 {})",
+        crate::klog_info!(
+            "kernels",
+            "算子准入:已声明 {} 张(原生表 + 家族臂 {})/ 编出符号 {} 条(未声明 {})",
             n_declared,
             n_family,
             crate::cu_sig::ASSET_SYMBOLS.iter().map(|(_, s)| s.len()).sum::<usize>(),
@@ -441,7 +443,11 @@ impl OpRegistry {
         );
         if !undeclared.is_empty() {
             // R1(F 轮换源:编出的符号 ⊆ 声明集)—— 未声明清单要可数、可见
-            eprintln!("[kernels] R1 编出但未声明的核符号 {} 条:{undeclared:?}", undeclared.len());
+            crate::klog_warn!(
+                "kernels",
+                "R1 编出但未声明的核符号 {} 条:{undeclared:?}",
+                undeclared.len()
+            );
         }
         // 装配期自检(设计 §5.5:独立 oracle,失败 = 拒启)。
         // 白名单在场 ⇒ 只跑生效算子(装配期成本按档位裁);否则跑全部已建表。
@@ -458,7 +464,7 @@ impl OpRegistry {
                 }
             }
             crate::ops::audit_active(Some(a))?;
-            eprintln!("[kernels] tag 派生激活集:{} 项(池写集审计通过)", a.len());
+            crate::klog_info!("kernels", "tag 派生激活集:{} 项(池写集审计通过)", a.len());
         }
 
         // **tag 索引**(同一份声明面;未打 tag/未知 tag ⇒ 拒启,不静默)。
@@ -476,8 +482,9 @@ impl OpRegistry {
             }
         };
         let tagged = tag_index.all().iter().filter(|m| !m.tags.is_empty()).count();
-        eprintln!(
-            "[kernels] tag 索引:{} 项词表 / {} 算子(已打 {})",
+        crate::klog_info!(
+            "kernels",
+            "tag 索引:{} 项词表 / {} 算子(已打 {})",
             crate::spec::KERNEL_TAG_COUNT,
             tag_index.all().len(),
             tagged
@@ -512,7 +519,7 @@ impl OpRegistry {
         let mut first: Option<OpError> = None;
         for f in families {
             if let Err(e) = f.close() {
-                eprintln!("[kernels] 族 close() 失败: {e}");
+                crate::klog_warn!("kernels", "族 close() 失败: {e}");
                 if first.is_none() {
                     first = Some(e);
                 }

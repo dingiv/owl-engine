@@ -304,7 +304,7 @@ mod tests {
         ];
         for (key, hidden, inter, n, fh, gh, tied) in want {
             let Some(path) = res(key) else {
-                eprintln!("skip: 资源清单缺 \"{key}\"");
+                owl_shared::testkit::report::skip("资源清单缺 \"{key}\"");
                 continue;
             };
             let g = Gguf::open(&path).expect("open");
@@ -354,7 +354,7 @@ mod tests {
             assert!(e.contains("未接通"), "应点名架构未接通: {e}");
             assert!(e.contains("dflash"), "{e}");
         } else {
-            eprintln!("skip: 资源清单缺 gguf:draft-q4");
+            owl_shared::testkit::report::skip("资源清单缺 gguf:draft-q4");
         }
     }
 }

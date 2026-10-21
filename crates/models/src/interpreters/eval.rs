@@ -1805,7 +1805,7 @@ mod dtype_guard_tests {
     #[tokio::test]
     async fn gpu_f16_semantic_matches_host() {
         if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         }
         use crate::testkit::gpu_client;

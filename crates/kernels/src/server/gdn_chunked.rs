@@ -106,12 +106,30 @@ pub struct GdnDiag {
 /// 诊断档快照(进程内单槽;boot 后冻结 —— 重入不覆盖)
 static DIAG: std::sync::OnceLock<GdnDiag> = std::sync::OnceLock::new();
 
-/// 唯一的诊断旋钮写入点(重入只警告不覆盖 —— boot 后冻结)
-pub fn configure_diag(d: GdnDiag) {
-    if DIAG.set(d.clone()).is_err() {
-        if DIAG.get() != Some(&d) {
-            eprintln!("[gdn] 诊断旋钮已冻结,忽略二次下发(首次 ≠ 本次)");
+/// 诊断档下发失败(重入且值不同)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagError {
+    /// boot 后冻结:首批值已生效,本次(不同的)下发被拒
+    AlreadyConfigured,
+}
+
+impl std::fmt::Display for DiagError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyConfigured => {
+                write!(f, "gdn: 诊断旋钮已冻结(boot 后一次),二次下发不同值被拒")
+            }
         }
+    }
+}
+impl std::error::Error for DiagError {}
+
+/// 唯一的诊断旋钮写入点(重入同值 = 幂等;异值 = 响亮 [`DiagError`])
+pub fn configure_diag(d: GdnDiag) -> Result<(), DiagError> {
+    match DIAG.set(d.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) if DIAG.get() == Some(&d) => Ok(()),
+        Err(_) => Err(DiagError::AlreadyConfigured),
     }
 }
 
@@ -523,13 +541,17 @@ impl KernelFamily for GdnChunkedRuntime {
             std::thread::sleep(std::time::Duration::from_millis(50));
             res.download(g_cum, &mut cb)?;
             let cnz2 = cb.iter().filter(|&&b| b != 0).count();
-            eprintln!("[gdn-diag] 回读判别: in_k 非零字节={knz}/{} | g_cum 非零字节 立即={cnz1} 睡50ms后={cnz2}",
-                kb.len());
+            crate::klog_debug!(
+                "gdn-diag",
+                "回读判别: in_k 非零字节={knz}/{} | g_cum 非零字节 立即={cnz1} 睡50ms后={cnz2}",
+                kb.len()
+            );
             let (gv, cv) = (f32s(&gb), f32s(&cb));
             let (gmn, gmx, gnz, _) = stat(&gv);
             let (cmn, cmx, cnz, _) = stat(&cv);
-            eprintln!(
-                "[gdn-diag] {diag_tag} T={t} NT={nt} raw g: min={gmn:.4} max={gmx:.4} nz={gnz}/{} | g_cum: min={cmn:.4} max={cmx:.4} nz={cnz}/{}",
+            crate::klog_debug!(
+                "gdn-diag",
+                "{diag_tag} T={t} NT={nt} raw g: min={gmn:.4} max={gmx:.4} nz={gnz}/{} | g_cum: min={cmn:.4} max={cmx:.4} nz={cnz}/{}",
                 gv.len(), cv.len()
             );
             // 逐 chunk(头 0):首/末值 —— 局部累计 = 每 chunk 首值≈0(锯齿);
@@ -548,7 +570,7 @@ impl KernelFamily for GdnChunkedRuntime {
                 .zip(&dev_last)
                 .map(|(a, b)| format!("{a:.2}/{b:.2}"))
                 .collect();
-            eprintln!("[gdn-diag] 头0 各 chunk g_cum 首/末: {}", tail.join(" "));
+            crate::klog_debug!("gdn-diag", "头0 各 chunk g_cum 首/末: {}", tail.join(" "));
             // host 重算(头 0):local cumsum(nats)与 local cumsum(log2)
             let mut loc_nats = vec![0f32; t];
             let mut loc_log2 = vec![0f32; t];
@@ -565,15 +587,20 @@ impl KernelFamily for GdnChunkedRuntime {
             let md = |w: &[f32]| -> f32 {
                 (0..t).map(|k| (cv[h0i(k)] - w[k]).abs()).fold(0f32, f32::max)
             };
-            eprintln!(
-                "[gdn-diag] 与 host 重算 max|Δ|: local-nats={:.3e} local-log2={:.3e}(×ln2 口径差)",
+            crate::klog_debug!(
+                "gdn-diag",
+                "与 host 重算 max|Δ|: local-nats={:.3e} local-log2={:.3e}(×ln2 口径差)",
                 md(&loc_nats),
                 md(&loc_log2)
             );
             let mut h0b = vec![0u8; hv * kd * vd * 4];
             res.download(state_t, &mut h0b)?;
             let (amn, amx, anz, _) = stat(&f32s(&h0b));
-            eprintln!("[gdn-diag] 入态 h0([V,K] 转置后): min={amn:.4} max={amx:.4} nz={anz}/{}", hv * kd * vd);
+            crate::klog_debug!(
+                "gdn-diag",
+                "入态 h0([V,K] 转置后): min={amn:.4} max={amx:.4} nz={anz}/{}",
+                hv * kd * vd
+            );
         }
 
         // ── 2. kkt:k/beta/g_cum → A(f32)【g 语义律:吃 cumsum 产物】──
@@ -660,7 +687,11 @@ impl KernelFamily for GdnChunkedRuntime {
                 let (_mn, mx, nz, _) = stat(&vs);
                 hline.push(format!("#{i_t}:{mx:.2}/{nz}"));
             }
-            eprintln!("[gdn-diag] {diag_tag} h_buf 逐 chunk(max|·|/非零数, blk={blk}B): {}", hline.join(" "));
+            crate::klog_debug!(
+                "gdn-diag",
+                "{diag_tag} h_buf 逐 chunk(max|·|/非零数, blk={blk}B): {}",
+                hline.join(" ")
+            );
             let mut hb = vec![0u8; hv * kd * vd * 4];
             res.download(state_out, &mut hb)?;
             let (hmn, hmx, hnz, _) = stat(&f32s(&hb));
@@ -671,8 +702,9 @@ impl KernelFamily for GdnChunkedRuntime {
                 .map(|c| bf16_to_f32(c[0], c[1]))
                 .collect();
             let (omn, omx, onz, _) = stat(&ov);
-            eprintln!(
-                "[gdn-diag] 终态 ht(fork [V,K]): min={hmn:.4} max={hmx:.4} nz={hnz}/{} | o(bf16→f32): min={omn:.4} max={omx:.4} nz={onz}/{}",
+            crate::klog_debug!(
+                "gdn-diag",
+                "终态 ht(fork [V,K]): min={hmn:.4} max={hmx:.4} nz={hnz}/{} | o(bf16→f32): min={omn:.4} max={omx:.4} nz={onz}/{}",
                 hv * kd * vd,
                 ov.len()
             );

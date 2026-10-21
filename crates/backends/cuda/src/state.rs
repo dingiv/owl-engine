@@ -67,8 +67,6 @@ pub struct DiagOpts {
     /// 由 `model.kind/quant/head_quant`、`dispatch.kv_fp8`、`spec`、`vision`、
     /// `runtime.tp_ordinals` 自动推导;`*`/Default = 全放行(诊断/测试)。
     pub tag_filter: owl_kernels::tag_filter::TagFilter,
-    /// **FlashInfer 诊断打印**(`[probes] fi_debug`;原 `FI_DEBUG` env)
-    pub fi_debug: bool,
     /// **L3 事实面审计**(`[probes] l3_audit`;原 `OWL_L3_AUDIT` env)
     pub l3_audit: bool,
     /// **GDN chunked 诊断旋钮**(`[probes] gdn_*`;原 `OWL_GDN_*` env)
@@ -100,7 +98,6 @@ impl Default for DiagOpts {
             vram_budget_mb: None,
             trace_ring: 0,
             tag_filter: owl_kernels::tag_filter::TagFilter::wildcard(),
-            fi_debug: false,
             l3_audit: false,
             gdn_diag: false,
             gdn_touch: String::new(),
@@ -142,7 +139,6 @@ impl DiagOpts {
             trace_ring: c.trace_ring,
             fi_plan_restore: cfg.kernel.fi_plan_restore,
             tag_filter: tag_filter_from_config(cfg),
-            fi_debug: cfg.probes.fi_debug,
             l3_audit: cfg.probes.l3_audit,
             gdn_diag: cfg.probes.gdn_diag,
             gdn_touch: cfg.probes.gdn_touch.clone().unwrap_or_default(),
@@ -3331,7 +3327,7 @@ mod tag_filter_tests {
     #[test]
     fn mtp_draft_uses_f16_pool_tags() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a16;
         cfg.spec.draft = owl_shared::config::SpecDraft::Mtp;
         cfg.spec.depth = 3;

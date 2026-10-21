@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn key_geometry_27b_is_pinned() {
         let Some(g) = open("gguf:27b") else {
-            eprintln!("skip: 资源清单缺 \"gguf:27b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
             return;
         };
         let d = facts(&g);
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn geometry_tiles_full_tensor_27b() {
         let Some(g) = open("gguf:27b") else {
-            eprintln!("skip: 资源清单缺 \"gguf:27b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
             return;
         };
         let d = facts(&g);

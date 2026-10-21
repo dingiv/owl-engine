@@ -91,7 +91,7 @@ fn grouped_full(src: &GgufSource, key: &str) -> (usize, usize, Vec<f32>) {
 #[test]
 fn gguf_shard_reads_equal_grouped_windows_all_keys() {
     if !resource_ok("gguf:27b") {
-        eprintln!("skip: 资源清单缺 \"gguf:27b\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
         return;
     }
     use owl_models::formats::gguf::shard::{geom_of, ShardSel, Shape, TensorFacts};
@@ -185,7 +185,7 @@ fn gguf_shard_reads_equal_grouped_windows_all_keys() {
 #[test]
 fn sharded_plan_shapes_match_source_elem_len() {
     if !resource_ok("gguf:27b") {
-        eprintln!("skip: 资源清单缺 \"gguf:27b\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
         return;
     }
     let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));

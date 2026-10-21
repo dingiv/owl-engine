@@ -763,7 +763,7 @@ mod tests {
     fn t1_tables_match_golden() {
         let goldens = golden_paths();
         if goldens.is_empty() {
-            eprintln!("skip: 金标不在(tools/vision_golden.py 生成)");
+            owl_shared::testkit::report::skip("金标不在(tools/vision_golden.py 生成)");
             return;
         }
         let (_, cfg) = visual_weights();
@@ -820,7 +820,7 @@ mod tests {
     async fn gpu_f16_tower_matches_golden() {
         let goldens = golden_paths();
         let Some(g) = goldens.first() else {
-            eprintln!("skip: 金标不在(tools/vision_golden.py 生成)");
+            owl_shared::testkit::report::skip("金标不在(tools/vision_golden.py 生成)");
             return;
         };
         let (weights, cfg) = visual_weights();
@@ -912,7 +912,7 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_f16_tower_bench_1280x736() {
         if !owl_shared::env_reader::flag("OWL_VIS_BENCH") {
-            eprintln!("skip: OWL_VIS_BENCH 未开(性能档不随常规测试跑)");
+            owl_shared::testkit::report::skip("OWL_VIS_BENCH 未开(性能档不随常规测试跑)");
             return;
         }
         let (weights, cfg) = visual_weights();
@@ -1031,7 +1031,7 @@ mod tests {
     async fn real_images_gpu_f16_match_golden() {
         let g = real_golden();
         if !g.exists() {
-            eprintln!("skip: 真图金标不在(tools/vision_image_check.py 生成)");
+            owl_shared::testkit::report::skip("真图金标不在(tools/vision_image_check.py 生成)");
             return;
         }
         let (weights, cfg) = visual_weights();
@@ -1098,12 +1098,12 @@ mod tests {
     #[tokio::test]
     async fn real_images_cpu_f32_match_golden() {
         if !owl_shared::env_reader::flag("OWL_VIS_CPU_REAL") {
-            eprintln!("skip: OWL_VIS_CPU_REAL 未开(debug 下逐图需数十分钟;用 --release)");
+            owl_shared::testkit::report::skip("OWL_VIS_CPU_REAL 未开(debug 下逐图需数十分钟;用 --release)");
             return;
         }
         let g = real_golden();
         if !g.exists() {
-            eprintln!("skip: 真图金标不在");
+            owl_shared::testkit::report::skip("真图金标不在");
             return;
         }
         let (weights, cfg) = visual_weights();
@@ -1146,7 +1146,7 @@ mod tests {
     async fn t2_layers_match_golden() {
         let goldens = golden_paths();
         if goldens.is_empty() {
-            eprintln!("skip: 金标不在(tools/vision_golden.py 生成)");
+            owl_shared::testkit::report::skip("金标不在(tools/vision_golden.py 生成)");
             return;
         }
         let (_, cfg) = visual_weights();

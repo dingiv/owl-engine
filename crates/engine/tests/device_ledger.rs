@@ -22,7 +22,7 @@ fn asset_dir() -> std::path::PathBuf {
 #[tokio::test(flavor = "current_thread")]
 async fn ledger_captures_load_pool_and_graph_phases() {
     if std::env::var_os("OWL_CPU_MOCK").is_none() {
-        eprintln!("skip: OWL_CPU_MOCK 未设(CPU mock 冒烟按需开)");
+        owl_shared::testkit::report::skip("OWL_CPU_MOCK 未设(CPU mock 冒烟按需开)");
         return;
     }
     let cfg = EngineConfig {

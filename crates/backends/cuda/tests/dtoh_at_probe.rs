@@ -18,7 +18,7 @@ fn pattern(n: usize) -> Vec<u8> {
 #[tokio::test]
 async fn dtoh_at_reads_the_requested_span() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();
@@ -72,7 +72,7 @@ async fn dtoh_at_reads_the_requested_span() {
 #[tokio::test]
 async fn dtoh_batch_and_htod_batch_round_trip() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let (tx, rx) = std::sync::mpsc::channel::<owl_cuda::Command>();

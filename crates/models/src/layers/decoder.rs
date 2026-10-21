@@ -313,7 +313,7 @@ mod tests {
     async fn pinned_roundtrip_probe() -> Result<(), crate::contract::ModelError> {
         use crate::contract::DeviceClient;
         if !crate::testkit::gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return Ok(());
         }
         eprintln!("[probe] boot...");

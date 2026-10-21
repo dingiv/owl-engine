@@ -115,20 +115,6 @@ fn plan_restore() -> bool {
     PLAN_RESTORE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 诊断打印开关(**与 C++ `owl_fi_debug` 同源**)。
-/// 2026-10-21 收编:原 `FI_DEBUG` env;现由后端 boot 期 [`set_debug`] 一次下发,
-/// C++ 侧仍读 env(同一写点同步写)。
-static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// 写 FI 诊断开关(plan 期打印;boot 期调用)
-pub fn set_debug(on: bool) {
-    DEBUG.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn fi_debug() -> bool {
-    DEBUG.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 impl FiRuntime {
     /// **本族身份**(族名 = 线契约名;字面量住 `family::flashinfer`,零门)
     pub const ID: OpId = OpId(crate::family::flashinfer::PREFILL_FI);
@@ -282,15 +268,14 @@ impl FiRuntime {
         }
         res.upload_invariant(int_ws.ptr, &entry.staged)?;
         self.active = Some(key);
-        if fi_debug() {
-            eprintln!(
-                "[owl-fi][plan] int_ws 激活(t={} padded={} tiles={} cap={})",
-                key.t,
-                entry.plan15[0].max(0),
-                entry.tiles,
-                capturing,
-            );
-        }
+        crate::klog_debug!(
+            "owl-fi",
+            "[plan] int_ws 激活(t={} padded={} tiles={} cap={})",
+            key.t,
+            entry.plan15[0].max(0),
+            entry.tiles,
+            capturing,
+        );
         Ok(())
     }}
 
@@ -718,14 +703,16 @@ impl FiRuntime {
         // (实测 T=8/ctx=3072:零值 43008/49152)。split 关时该数组不参与任何
         // 决策(plan 与 ctx 无关),所以这个单位错一直隐身。
         let nb_pages = ctx_total.div_ceil(geom.page.max(1)) as i32;
-        // ⚙ 诊断(`[probes] fi_debug`;原 OWL_FI_DEBUG=1):plan 重算时的
-        // **本轮** ctx_total(宿主标量槽是否真按步送到 —— piecewise 断点面取证)
-        if fi_debug() {
-            eprintln!(
-                "[fi-plan] ctx_total={} nb_pages={nb_pages} T={} page={}",
-                ctx_total, geom.total_rows, geom.page
-            );
-        }
+        // ⚙ 诊断(level=debug 或 tag `owl-fi`):plan 重算时的**本轮** ctx_total
+        // (宿主标量槽是否真按步送到 —— piecewise 断点面取证)。
+        // 2026-10-21:原 `[probes] fi_debug` 纯打印开关退役 → 可见性交给日志门。
+        crate::klog_debug!(
+            "owl-fi",
+            "[fi-plan] ctx_total={} nb_pages={nb_pages} T={} page={}",
+            ctx_total,
+            geom.total_rows,
+            geom.page
+        );
         let kv_indptr = [0i32, nb_pages];
         let (mut plan15, mut cta_tile_q, mut split_kv) = ([0i64; 15], 0i32, 0i32);
         let mut int_bytes: usize = 0;
@@ -800,9 +787,10 @@ impl FiRuntime {
         } else {
             None
         };
-        if padded > tiles && fi_debug() {
-            eprintln!(
-                "[owl-fi][mask] 图档 plan:T={} ctx={} padded={} tiles={} ⇒ 掩 {} 个尾部 CTA",
+        if padded > tiles {
+            crate::klog_debug!(
+                "owl-fi",
+                "[mask] 图档 plan:T={} ctx={} padded={} tiles={} ⇒ 掩 {} 个尾部 CTA",
                 geom.t,
                 ctx_total,
                 padded,

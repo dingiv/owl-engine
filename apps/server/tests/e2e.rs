@@ -292,7 +292,7 @@ fn content_of(v: &serde_json::Value) -> String {
 #[test]
 fn e2e_server_suite() {
     // if !owl_shared::env_reader::flag("OWL_E2E") {
-    //     eprintln!("skip: OWL_E2E 未设(需 GPU + 模型路径)");
+    //     owl_shared::testkit::report::skip("OWL_E2E 未设(需 GPU + 模型路径)");
     //     return;
     // }
     // 可失败辅助一律在此收口:失败即红(不丢句柄、不吞错误 —— 律 #1/#2)

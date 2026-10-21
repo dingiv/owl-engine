@@ -193,7 +193,7 @@ fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 fn gdn_bucket_pad_does_not_pollute_state() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let dev: usize = owl_cuda::test_device_ordinal();
@@ -237,7 +237,7 @@ fn gdn_bucket_pad_does_not_pollute_state() {
 #[test]
 fn gdn_bucket_pad_graph_posture_nt_layout_is_inert() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let dev: usize = owl_cuda::test_device_ordinal();

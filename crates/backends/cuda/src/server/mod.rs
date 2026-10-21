@@ -533,20 +533,33 @@ impl GpuServer {
                     owl_kernels::server::flashinfer::set_plan_restore(self.diag.fi_plan_restore);
                     // **服务端面诊断旋钮**(2026-10-21;原 OWL_GDN_* / FI_DEBUG /
                     // OWL_L3_AUDIT env 已退场):同一 boot 点从 DiagOpts 显式下发。
-                    owl_kernels::server::configure_diag(&owl_kernels::server::DiagTune {
-                        fi_debug: self.diag.fi_debug,
-                        l3_audit: self.diag.l3_audit,
-                        gdn: owl_kernels::server::gdn_chunked::GdnDiag {
-                            on: self.diag.gdn_diag,
-                            touch: self.diag.gdn_touch.clone(),
-                            zero_scratch: self.diag.gdn_zero_scratch.clone(),
-                            fresh_scratch: self.diag.gdn_fresh_scratch,
+                    // **输出口 + 采集旋钮一次下发**(boot 唯一写点)。
+                    // `sink` 接上后:算子面 `klog_*!`(Rust)与 `OWL_LOG_*`
+                    // (C/C++)同时可用,可见性由 logger 的 level/tag 管;
+                    // 失败 = 拒启(重入不同值 ⇒ 不静默覆盖)。
+                    if let Err(e) = owl_kernels::server::configure_diag(
+                        &owl_kernels::server::DiagTune {
+                            sink: self.sink,
+                            l3_audit: self.diag.l3_audit,
+                            gdn: owl_kernels::server::gdn_chunked::GdnDiag {
+                                on: self.diag.gdn_diag,
+                                touch: self.diag.gdn_touch.clone(),
+                                zero_scratch: self.diag.gdn_zero_scratch.clone(),
+                                fresh_scratch: self.diag.gdn_fresh_scratch,
+                            },
                         },
-                    });
-                    // C++ 适配器只认 `getenv("FI_DEBUG")`(上游 ABI 不动;与
-                    // `FI_CUDA_GRAPH` 同一桥法):配置 `[probes] fi_debug`
-                    // 是**唯一真源**,这里把两侧语义焊在同一个写点。
-                    std::env::set_var("FI_DEBUG", if self.diag.fi_debug { "1" } else { "0" });
+                    ) {
+                        let msg = format!("诊断面下发失败(拒启): {e}");
+                        self.sink.logf(
+                            owl_shared::log::LVL_ERROR,
+                            "kernels",
+                            format_args!("❌ {msg}"),
+                        );
+                        if let Some(boot) = self.boot.take() {
+                            let _ = boot.send(Err(msg.clone()));
+                        }
+                        return Err(msg);
+                    }
                     let r = owl_kernels::registry::OpRegistry::boot_with(
                         &mut res,
                         &mut exec,

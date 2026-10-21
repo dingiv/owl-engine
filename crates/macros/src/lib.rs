@@ -217,7 +217,7 @@ fn expand(opts: Opts, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let gpu_gate = if opts.gpu {
         quote! {
             if __owl_cfg.runtime.test_device.is_none() {
-                ::std::eprintln!("skip: OWL_TEST_DEVICE 未设");
+                ::owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
                 return;
             }
         }
@@ -227,7 +227,7 @@ fn expand(opts: Opts, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let parity_gate = if opts.hf_parity {
         quote! {
             if !::owl_shared::testkit::hf_parity_enabled() {
-                ::std::eprintln!("{}", ::owl_shared::testkit::HF_PARITY_SKIP);
+                ::owl_shared::testkit::report::skip(::owl_shared::testkit::HF_PARITY_SKIP);
                 return;
             }
         }
@@ -240,7 +240,7 @@ fn expand(opts: Opts, f: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         let checks = opts.needs.iter().map(|k| {
             quote! {
                 if !::owl_shared::testkit::resource_ok(#k) {
-                    ::std::eprintln!("{}", ::owl_shared::testkit::missing_reason(#k));
+                    ::owl_shared::testkit::report::skip(::owl_shared::testkit::missing_reason(#k));
                     return;
                 }
             }

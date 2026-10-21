@@ -24,7 +24,7 @@ fn asset_dir() -> std::path::PathBuf {
 #[tokio::test(flavor = "current_thread")]
 async fn cpu_mock_engine_boots_loads_and_runs_a_turn() {
     if std::env::var_os("OWL_CPU_MOCK").is_none() {
-        eprintln!("skip: OWL_CPU_MOCK 未设(CPU mock 冒烟按需开)");
+        owl_shared::testkit::report::skip("OWL_CPU_MOCK 未设(CPU mock 冒烟按需开)");
         return;
     }
     let cfg = EngineConfig {
@@ -48,7 +48,7 @@ async fn cpu_mock_engine_boots_loads_and_runs_a_turn() {
 #[tokio::test(flavor = "current_thread")]
 async fn cpu_mock_vram_wall_rejects_boot_loudly() {
     if std::env::var_os("OWL_CPU_MOCK").is_none() {
-        eprintln!("skip: OWL_CPU_MOCK 未设(CPU mock 冒烟按需开)");
+        owl_shared::testkit::report::skip("OWL_CPU_MOCK 未设(CPU mock 冒烟按需开)");
         return;
     }
     let cfg = EngineConfig {
@@ -76,7 +76,7 @@ async fn cpu_mock_vram_wall_rejects_boot_loudly() {
 #[tokio::test(flavor = "current_thread")]
 async fn cpu_mock_load_cost_breakdown() {
     if std::env::var_os("OWL_CPU_MOCK").is_none() {
-        eprintln!("skip: OWL_CPU_MOCK 未设");
+        owl_shared::testkit::report::skip("OWL_CPU_MOCK 未设");
         return;
     }
     let cfg = EngineConfig {

@@ -103,7 +103,7 @@ async fn e2e_body() {
     let dev = owl_cuda::test_device_ordinal_opt();
     let cpu_only = dev.is_none() && owl_shared::env_reader::flag("OWL_CPU_MOCK");
     if dev.is_none() && !cpu_only {
-        eprintln!("skip: OWL_TEST_DEVICE 未设(engine e2e 整档跳过)");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设(engine e2e 整档跳过)");
         return;
     }
     let dev = dev.unwrap_or(0);

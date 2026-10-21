@@ -84,7 +84,7 @@ unsafe fn launch6(
 #[test]
 fn comm_ar_smoke() {
     let Some(ord) = dev_ordinal() else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设(需一张空闲卡)");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设(需一张空闲卡)");
         return;
     };
     let ctx = CudaContext::new(ord).expect("建上下文");

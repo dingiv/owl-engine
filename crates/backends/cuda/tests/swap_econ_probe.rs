@@ -141,7 +141,7 @@ async fn swap_out_once(client: &mut GpuClient, block: u64, total: usize, n: usiz
 #[tokio::test]
 async fn swap_econ() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = boot();

@@ -27,7 +27,7 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_load_whole_4b_is_compressed() {
         if !resource_ok("gguf:4b") {
-            eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:4b\"");
             return;
         }
         let path = PathBuf::from(resource("gguf:4b").expect("resource_ok 已过"));

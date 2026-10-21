@@ -159,14 +159,14 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 fn tp_g8_gate() {
     let (Some(oa), Some(ob)) = (dev("OWL_TP_TEST_DEV_A"), dev("OWL_TP_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
+        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
         return;
     };
     assert_ne!(oa, ob, "A/B 必须是两张不同卡");
     let ref_dev = dev("OWL_TP_REF_DEV").unwrap_or(oa);
     let dir = dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)");
+        owl_shared::testkit::report::skip(format_args!("0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)"));
         return;
     }
     std::thread::Builder::new()
@@ -481,12 +481,12 @@ fn cfg_eager(ordinal: usize) -> EngineConfig {
 #[test]
 fn tp_perf_split_probe() {
     let (Some(oa), Some(ob)) = (dev("OWL_TP_TEST_DEV_A"), dev("OWL_TP_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B");
+        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B");
         return;
     };
     let dir = dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)");
+        owl_shared::testkit::report::skip(format_args!("0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)"));
         return;
     }
     let reps: usize = std::env::var("OWL_PERF_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);

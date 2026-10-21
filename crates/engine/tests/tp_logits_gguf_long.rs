@@ -118,12 +118,12 @@ fn stats(a: &[f32], b: &[f32]) -> (f32, f64) {
 #[ignore = "诊断仪(cos/生成段不是 TP1↔TP2 的判据;见文件头与设计 §23.8)"]
 fn tp_logits_gguf_long() {
     let (Some(oa), Some(ob)) = (dev("OWL_GGUF_TP_DEV_A"), dev("OWL_GGUF_TP_DEV_B")) else {
-        eprintln!("skip: 需 OWL_GGUF_TP_DEV_A / OWL_GGUF_TP_DEV_B(两张空闲卡的 BDF)");
+        owl_shared::testkit::report::skip("需 OWL_GGUF_TP_DEV_A / OWL_GGUF_TP_DEV_B(两张空闲卡的 BDF)");
         return;
     };
     assert_ne!(oa, ob, "TP2 需要两张不同的卡");
     if !resource_ok("gguf:27b") {
-        eprintln!("skip: 资源清单缺 \"gguf:27b\"");
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
         return;
     }
     let words: usize = std::env::var("OWL_GGUF_TP_WORDS").ok().and_then(|s| s.parse().ok()).unwrap_or(900);

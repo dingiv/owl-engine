@@ -224,7 +224,7 @@ mod tests {
 
         for key in ["gguf:4b", "gguf:27b"] {
             if !resource_ok(key) {
-                eprintln!("skip: 资源清单缺 \"{key}\"");
+                owl_shared::testkit::report::skip("资源清单缺 \"{key}\"");
                 continue;
             }
             let g = Gguf::open(&PathBuf::from(resource(key).expect("列了就有"))).expect("open");

@@ -48,7 +48,7 @@ fn record_cost(n: usize, pool: usize) -> (u64, u64, u64) {
 #[test]
 fn event_record_is_sub_10us() {
     if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let (p50, p99, mean) = record_cost(2000, 8);
@@ -65,7 +65,7 @@ fn event_record_is_sub_10us() {
 #[test]
 fn stream_wait_event_is_sub_10us() {
     if !owl_shared::env_reader::flag("OWL_TEST_DEVICE") {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let ctx = ffi::CudaContext::new(test_device_ordinal()).expect("开设备");

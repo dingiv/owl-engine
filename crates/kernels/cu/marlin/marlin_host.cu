@@ -10,6 +10,8 @@
 // use_fp32_reduce=false(C 全量写,无需预清零;C_tmp 不触碰)。
 
 #include <cuda_runtime.h>
+// 算子侧唯一日志出口(与 Rust `klog_*!` 共用一条 LogSink)
+#include "owl_log.h"
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -117,12 +119,6 @@ static PhaseAcc g_phase;
 static inline double now_us() {
   using namespace std::chrono;
   return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() / 1e3;
-}
-
-/// 调试开关:每进程一次 getenv。
-static bool env_flag(const char* name, int* cache) {
-  if (*cache < 0) *cache = getenv(name) ? 1 : 0;
-  return *cache != 0;
 }
 
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
@@ -423,14 +419,14 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
     int thread_k_blocks = thread_k / 16;
     int thread_n_blocks = thread_n / 16;
 
-    static int dbg_cfg = -1;
-    if (env_flag("MARLIN_CONFIG_DEBUG", &dbg_cfg))
-        fprintf(stderr,
-                "[marlin-cfg] m=%d n=%d k=%d -> tk=%d tn=%d threads=%d "
-                "m_blocks=%d m8=%d g_blocks=%d blocks=%d par=%d\n",
-                prob_m, prob_n, prob_k, thread_k, thread_n, num_threads,
-                thread_m_blocks, (int)m_block_size_8, group_blocks, blocks,
-                max_par);
+    // 选核决策面(诊断):可见性=level=debug 或 tag `marlin-cfg` 白名单。
+    // 2026-10-21:原 `MARLIN_CONFIG_DEBUG` env(纯打印开关)退役。
+    OWL_LOG_DEBUG("marlin-cfg",
+                  "m=%d n=%d k=%d -> tk=%d tn=%d threads=%d "
+                  "m_blocks=%d m8=%d g_blocks=%d blocks=%d par=%d",
+                  prob_m, prob_n, prob_k, thread_k, thread_n, num_threads,
+                  thread_m_blocks, (int)m_block_size_8, group_blocks, blocks,
+                  max_par);
 
     if (!is_valid_config(thread_tfg, thread_m_blocks, prob_m_split, prob_n,
                          prob_k, num_bits, group_size, has_act_order,
@@ -463,14 +459,13 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
     bool part_use_atomic_add =
         use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
 
-    static int dbg_v2 = -1;
-    if (env_flag("MARLIN_DEBUG", &dbg_v2))
-        std::fprintf(stderr,
-                     "[marlin-v2] split=%d tmb=%d cfg={k%d,n%d,t%d} m8=%d gb=%d "
-                     "blocks=%d smem=%d MNK=(%d,%d,%d) g=%d\n",
-                     prob_m_split, thread_m_blocks, thread_k, thread_n,
-                     num_threads, (int)m_block_size_8, group_blocks, blocks,
-                     max_shared_mem_new, prob_m, prob_n, prob_k, group_size);
+    // 发射参数面(诊断):原 `MARLIN_DEBUG` env 退役,同 marlin-cfg 口径
+    OWL_LOG_DEBUG("marlin-v2",
+                  "split=%d tmb=%d cfg={k%d,n%d,t%d} m8=%d gb=%d "
+                  "blocks=%d smem=%d MNK=(%d,%d,%d) g=%d",
+                  prob_m_split, thread_m_blocks, thread_k, thread_n,
+                  num_threads, (int)m_block_size_8, group_blocks, blocks,
+                  max_shared_mem_new, prob_m, prob_n, prob_k, group_size);
 
     kernel<<<blocks, num_threads, max_shared_mem_new, stream>>>(
         A_ptr, B_ptr, C_ptr, /*C_tmp*/ (int4*)c_tmp, /*bias*/ nullptr,
@@ -483,13 +478,12 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
     if (time_on) {
       g_phase.launch += now_us() - t_launch;
       if (++g_phase.n % 1024 == 0)
-        fprintf(stderr, "[marlin-time] n=%ld avg_us cfg=%.1f attr=%.1f launch=%.1f\n",
-                g_phase.n, g_phase.cfg / g_phase.n, g_phase.attr / g_phase.n,
-                g_phase.launch / g_phase.n);
+        OWL_LOG_DEBUG("marlin-time", "n=%ld avg_us cfg=%.1f attr=%.1f launch=%.1f",
+                      g_phase.n, g_phase.cfg / g_phase.n, g_phase.attr / g_phase.n,
+                      g_phase.launch / g_phase.n);
     }
     if (launch_err != cudaSuccess) {
-      std::fprintf(stderr, "[marlin-v2] launch error: %s\n",
-                   cudaGetErrorString(launch_err));
+      OWL_LOG_ERROR("marlin-v2", "launch error: %s", cudaGetErrorString(launch_err));
       return 6;
     }
 

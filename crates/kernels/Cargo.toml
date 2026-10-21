@@ -7,7 +7,13 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 
 [features]
 # 源码之家(sources)纯 include_str 零依赖 —— models 等上层引源不拖链接
-"default" = []
+# `log` = 诊断输出面编译门(2026-10-21):
+#   - on(缺省):Rust 侧 `klog_*!` 展开为 `LogSink::logf`;build.rs 给 C++ 定义
+#     `OWL_LOG_ENABLED`,`cu/owl_log.h` 的 `OWL_LOG_*` 生效;
+#   - off:`klog_*!` **空展开**(实参不求值)+ C 宏 `((void)0)` ⇒ 两侧逐字节零成本。
+# 运行期可见性另由 logger 的 level + tag 白黑名单控制(同一道 `LogSink::enabled`)。
+"default" = ["log"]
+"log" = []
 # cuBLAS 封装(f16 基线 F1;独立 feature —— 引源码之家不拖链接)
 # half:W-2d 的 `gemm_f16_dst` 用 f16 标量(alpha/beta;CUBLAS_COMPUTE_16F 口径)
 "cublas" = ["dep:cudarc", "dep:half"]
@@ -36,6 +42,10 @@ owl-cuda = { path = "../backends/cuda" }
 owl-macros = { path = "../macros" }
 
 [dependencies]
+# 输出口 ABI(叶子 crate,零依赖):kernels 不能依赖 owl-shared
+# (`owl-shared → owl-iface → owl-kernels` 成环),故 LogSink 住 owl-sink,
+# 两侧引同一个类型(不搞镜像结构)。
+owl-sink = { path = "../sink" }
 # 算子 tag 注入属性宏(`#[kernel_tags]`;仅编译期,零运行期依赖)
 owl-macros = { path = "../macros" }
 # 官方 cudarc:仅 device/cublas feature 使用(Exec/家族发射;feature 化,

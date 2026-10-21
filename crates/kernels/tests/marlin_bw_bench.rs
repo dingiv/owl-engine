@@ -204,7 +204,7 @@ fn bench_shape_a8(
 fn marlin_w4a8_vs_w4a16_lever() {
     let Some(dev) = owl_cuda::test_device_ordinal_opt()
     else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(dev).expect("ctx");
@@ -250,7 +250,7 @@ fn marlin_w4a8_vs_w4a16_lever() {
 fn marlin_bandwidth_27b_shapes() {
     let Some(dev) = owl_cuda::test_device_ordinal_opt()
     else {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
     let ctx = CudaContext::new(dev).expect("ctx");

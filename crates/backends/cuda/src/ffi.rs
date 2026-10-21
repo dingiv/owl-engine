@@ -269,7 +269,7 @@ mod device_rows_tests {
     #[test]
     fn device_rows_nonempty_and_consistent() {
         if std::env::var_os("OWL_TEST_DEVICE").is_none() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         }
         let rows = super::device_rows().expect("枚举设备表");

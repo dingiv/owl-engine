@@ -122,9 +122,9 @@ const MMQ2_QUANT_PARAMS: &[Param] = &[
     // 名字逐字对 `.cu` 实例(`vx`/`vy`;2026-10-20 互证门修正)
     Param::t_in("vx", Dtype::F16, 2),
     Param::t_out("vy", Dtype::U8, 2),
-    /// 行向步长 = **m_pad**(ceil(m/J)·J);尾行由核写 0(2026-10-21)
+    // 行向步长 = **m_pad**(ceil(m/J)·J);尾行由核写 0(2026-10-21)
     Param::i32("n_tokens"),
-    /// 真实 token 数(≥ 它的行 = 补齐行 ⇒ 写零)
+    // 真实 token 数(≥ 它的行 = 补齐行 ⇒ 写零)
     Param::i32("m_real"),
     Param::i32("ne0"),
 ];

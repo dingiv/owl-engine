@@ -1554,7 +1554,7 @@ mod generic_entry_tests {
     async fn generic_entry_open_preserves_manifest() {
         let dir = crate::testkit::manifest_dir().join("assets/Qwen3.5-0.8B");
         if !dir.is_dir() {
-            eprintln!("skip: {} 不在(模型库软链)", dir.display());
+            owl_shared::testkit::report::skip(format_args!("{} 不在(模型库软链)", dir.display()));
             return;
         }
         let spec = qwen3_5_0_8b();
@@ -1618,7 +1618,7 @@ mod generic_entry_tests {
                 .unwrap_or_else(|| "/home/div/Documents/codes/models/Qwen/Qwen3.5-9B".into()),
         );
         if !dir.is_dir() {
-            eprintln!("skip: 新档检查点不在({};ckpt:new 可指路)", dir.display());
+            owl_shared::testkit::report::skip(format_args!("新档检查点不在({};ckpt:new 可指路)", dir.display()));
             return;
         }
         // ① 起点探测(纯索引嗅探)
@@ -1687,14 +1687,14 @@ mod generic_entry_tests {
                 .unwrap_or_else(|| "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4".into()),
         );
         if !dir.is_dir() {
-            eprintln!("skip: 27B AWQ 检查点不在");
+            owl_shared::testkit::report::skip("27B AWQ 检查点不在");
             return;
         }
         // AWQ 源产 U32 marlin 块 ⇒ **必须 GPU face**(CpuFace 只认 F32/F16);
         // 且 27B AWQ 整装 ≈10G+ ⇒ 需 ≥24G 卡(20G 实测 layer40 OOM)。
         // 独立门 `OWL_L2_AWQ=1`(本机跑法:`OWL_L2_AWQ=1 OWL_TEST_DEVICE=<3090>`)。
         if std::env::var("OWL_L2_AWQ").ok().as_deref() != Some("1") {
-            eprintln!("skip: OWL_L2_AWQ=1 未开(27B AWQ 整装需 ≥24G 卡)");
+            owl_shared::testkit::report::skip("OWL_L2_AWQ=1 未开(27B AWQ 整装需 ≥24G 卡)");
             return;
         }
         if !crate::testkit::gpu_enabled() {

@@ -13,6 +13,11 @@
 /// kernels 不依赖 iface,契约老家即此;iface 经 re-export 续用旧路径)
 pub mod contract;
 
+/// 诊断输出口(唯一):Rust 侧 `klog_*!` 宏 + C/C++ 侧 `cu/owl_log.h`
+/// 共用同一条 `LogSink`(boot 期由后端经 [`server::DiagTune::sink`] 注入)。
+/// 编译门 = cargo feature `log`(缺省开;不开 = 两侧逐字节零成本)。
+pub mod sink;
+
 /// 登记表(list:native kernel 名字 → 源 + 槽序契约 + dtype 标注;
 /// 2026-10-12 自 models::kernel 迁入,同日由 native.rs 更名 list.rs ——
 /// "登记表"才是它的本体,native/foreign 之别交给 driver/registry)

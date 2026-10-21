@@ -382,7 +382,7 @@ mod tests {
             "/home/div/Documents/codes/repos/llama.cpp/build-new/bin/llama-tokenize".to_string()
         });
         if !PathBuf::from(&bin).is_file() {
-            eprintln!("skip: llama-tokenize 不在(OWL_LLAMA_TOKENIZE 可指路)");
+            owl_shared::testkit::report::skip("llama-tokenize 不在(OWL_LLAMA_TOKENIZE 可指路)");
             return;
         }
         let libdir = owl_shared::env_reader::str("OWL_LLAMA_LIBS").unwrap_or_else(|| {
@@ -401,7 +401,7 @@ mod tests {
         ];
         for key in ["gguf:4b", "gguf:27b"] {
             let Some(path) = res(key) else {
-                eprintln!("skip: 资源清单缺 \"{key}\"");
+                owl_shared::testkit::report::skip("资源清单缺 \"{key}\"");
                 continue;
             };
             let g = Gguf::open(&path).expect("open");
@@ -452,7 +452,7 @@ mod tests {
     fn vocab_facts_are_consistent() {
         for key in ["gguf:4b", "gguf:27b"] {
             let Some(path) = res(key) else {
-                eprintln!("skip: 资源清单缺 \"{key}\"");
+                owl_shared::testkit::report::skip("资源清单缺 \"{key}\"");
                 continue;
             };
             let g = Gguf::open(&path).expect("open");

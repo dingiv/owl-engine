@@ -30,7 +30,7 @@ async fn client_with(diag: DiagOpts) -> GpuClient {
 #[tokio::test]
 async fn logical_cap_refuses_before_cuda() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut c = client_with(DiagOpts { vram_budget_mb: Some(1), ..Default::default() }).await;
@@ -57,7 +57,7 @@ async fn logical_cap_refuses_before_cuda() {
 #[tokio::test]
 async fn driver_free_minus_reserve_refuses() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut c = client_with(DiagOpts { vram_reserve_mb: 1 << 20, ..Default::default() }).await;
@@ -74,7 +74,7 @@ async fn driver_free_minus_reserve_refuses() {
 #[tokio::test]
 async fn default_budget_still_allocates() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut c = client_with(DiagOpts::default()).await;

@@ -862,7 +862,7 @@ mod tests {
     async fn gpu_real_weights_text_prefill_smoke() {
         use crate::layers::rope::Rope;
         if !owl_shared::testkit::resource_flag("flag:vlm-real") {
-            eprintln!("skip: flag:vlm-real=1 未开(4B 整装 ~9.3G)");
+            owl_shared::testkit::report::skip("flag:vlm-real=1 未开(4B 整装 ~9.3G)");
             return;
         }
         if !crate::testkit::gpu_enabled() {
@@ -975,7 +975,7 @@ mod tests {
         use crate::layers::rope::Rope;
         use crate::testkit::{gpu_client, gpu_enabled, skip_note, st_read};
         if !owl_shared::testkit::resource_flag("flag:vlm-real") {
-            eprintln!("skip: flag:vlm-real=1 未开(4B 整装 ~9G)");
+            owl_shared::testkit::report::skip("flag:vlm-real=1 未开(4B 整装 ~9G)");
             return;
         }
         if !gpu_enabled() {
@@ -984,7 +984,7 @@ mod tests {
         }
         let golden = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/vlm_e2e.safetensors");
         if !golden.exists() {
-            eprintln!("skip: {} 不在(先跑 tools/vlm_e2e_golden.py)", golden.display());
+            owl_shared::testkit::report::skip(format_args!("{} 不在(先跑 tools/vlm_e2e_golden.py)", golden.display()));
             return;
         }
         let dir = ckpt_dir();
@@ -1126,7 +1126,7 @@ mod tests {
         use crate::formats::safetensors::SafeTensorsSource;
         use crate::module::WeightSource;
         if !owl_shared::testkit::resource_flag("flag:vlm-bench") {
-            eprintln!("skip: flag:vlm-bench=1 未开");
+            owl_shared::testkit::report::skip("flag:vlm-bench=1 未开");
             return;
         }
         if !crate::testkit::gpu_enabled() {

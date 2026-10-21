@@ -77,11 +77,12 @@ extern "C" int owl_fi_prefill_plan(
         /*uniform_q_len=*/(int64_t)0, stream, kv_bytes);
     if (werr != cudaSuccess) return (int)werr;
     if (need_float > float_ws_size || need_int > int_ws_size || need_int > page_locked_size) {
-      fprintf(stderr,
-              "[owl-fi][plan] workspace 不足:需 float=%zuB int=%zuB(page_locked 同尺寸);"
-              "现有 float=%zuB int=%zuB page_locked=%zuB(T=%d ctx=%d)\n",
-              need_float, need_int, float_ws_size, int_ws_size, page_locked_size, total_num_rows,
-              kv_h[batch_size]);
+      // 错误码路径(-202 上抛):ERROR 级直落日志(默认 warn 档也可见)
+      OWL_LOG_ERROR("owl-fi",
+                    "[plan] workspace 不足:需 float=%zuB int=%zuB(page_locked 同尺寸);"
+                    "现有 float=%zuB int=%zuB page_locked=%zuB(T=%d ctx=%d)",
+                    need_float, need_int, float_ws_size, int_ws_size, page_locked_size,
+                    total_num_rows, kv_h[batch_size]);
       return -202;
     }
 
@@ -97,14 +98,12 @@ extern "C" int owl_fi_prefill_plan(
         /*disable_split_kv=*/disable_split_kv,
         /*num_colocated_ctas=*/0, /*uniform_q_len=*/(int64_t)0, stream, kv_bytes);
     if (err != cudaSuccess) return (int)err;
-    if (owl_fi_debug()) {
-      fprintf(stderr,
-              "[owl-fi][plan] padded_batch=%lld total_rows=%lld split=%d cta_tile_q=%lld "
-              "kv_bytes=%u disable_split=%d need(float=%zuB int=%zuB)\n",
-              (long long)plan_info.padded_batch_size, (long long)plan_info.total_num_rows,
-              (int)plan_info.split_kv, (long long)plan_info.cta_tile_q, kv_bytes,
-              (int)disable_split_kv, need_float, need_int);
-    }
+    OWL_LOG_DEBUG("owl-fi",
+                  "[plan] padded_batch=%lld total_rows=%lld split=%d cta_tile_q=%lld "
+                  "kv_bytes=%u disable_split=%d need(float=%zuB int=%zuB)",
+                  (long long)plan_info.padded_batch_size, (long long)plan_info.total_num_rows,
+                  (int)plan_info.split_kv, (long long)plan_info.cta_tile_q, kv_bytes,
+                  (int)disable_split_kv, need_float, need_int);
     auto v = plan_info.ToVector();
     if (v.size() != 15) return -100;
     for (int i = 0; i < 15; ++i) out_plan15[i] = v[i];
@@ -113,7 +112,7 @@ extern "C" int owl_fi_prefill_plan(
     if (out_int_bytes) *out_int_bytes = need_int;
     return 0;
   } catch (const std::exception& e) {
-    fprintf(stderr, "[owl-fi][plan] %s\n", e.what());
+    OWL_LOG_ERROR("owl-fi", "[plan] 异常: %s", e.what());
     return -101;
   }
 }
@@ -134,7 +133,7 @@ extern "C" int owl_fi_prefill_run(
                                  batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
                                  total_num_rows, sm_scale, block_valid_mask, stream, "run");
   } catch (const std::exception& e) {
-    fprintf(stderr, "[owl-fi][run] %s\n", e.what());
+    OWL_LOG_ERROR("owl-fi", "[run] 异常: %s", e.what());
     return -102;
   }
 }

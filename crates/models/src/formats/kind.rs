@@ -209,7 +209,7 @@ mod tests {
             ),
         ] {
             let Some(d) = dir(env, default) else {
-                eprintln!("skip: {default} 不在(资源清单 {env})");
+                owl_shared::testkit::report::skip(format_args!("{default} 不在(资源清单 {env})"));
                 continue;
             };
             let det = detect(&d).expect("detect");
@@ -226,7 +226,7 @@ mod tests {
             "ckpt:27b-awq",
             "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4",
         ) else {
-            eprintln!("skip: 资源 ckpt:27b-awq 不在(testdata/resources.toml)");
+            owl_shared::testkit::report::skip("资源 ckpt:27b-awq 不在(testdata/resources.toml)");
             return;
         };
         let det = detect(&d).expect("detect");
@@ -265,7 +265,7 @@ mod tests {
         ] {
             let p = PathBuf::from(owl_shared::testkit::resource_or(key, default));
             if !p.is_file() {
-                eprintln!("skip: {default} 不在(资源清单 {key})");
+                owl_shared::testkit::report::skip(format_args!("{default} 不在(资源清单 {key})"));
                 continue;
             }
             let det = detect(&p).expect("detect(gguf 文件)");

@@ -720,7 +720,7 @@ fn bf16_parity(res: &mut TestRes, n: usize, rows: usize) {
 #[test]
 fn small_kernel_bench_and_parity() {
     let Some(mut res) = TestRes::new() else {
-        eprintln!("skip: 需 OWL_TEST_DEVICE=<CUDA ordinal>");
+        owl_shared::testkit::report::skip("需 OWL_TEST_DEVICE=<CUDA ordinal>");
         return;
     };
     println!("[bench] CUDA ordinal = {}(`*` = 生产几何)", res.ctx.ordinal());

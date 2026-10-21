@@ -1003,7 +1003,7 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
 #[ignore = "bench:AR 通道微基准(3080 对/3090 Ti 对;隔离测量)"]
 async fn comm_ar_channel_bench() {
     let (Some(oa), Some(ob)) = (dev("OWL_PEER_TEST_DEV_A"), dev("OWL_PEER_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)");
+        owl_shared::testkit::report::skip("需 OWL_PEER_TEST_DEV_A / OWL_PEER_TEST_DEV_B(两张可 P2P 的空闲卡)");
         return;
     };
     assert_ne!(oa, ob, "A/B 必须是两张不同卡");

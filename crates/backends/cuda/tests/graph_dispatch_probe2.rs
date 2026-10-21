@@ -34,7 +34,7 @@ fn le_i32(v: &[i32]) -> Vec<u8> {
 #[tokio::test]
 async fn marlin_graph_dispatch_probe() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = assemble();
@@ -145,7 +145,7 @@ extern "C" __global__ void probe_add_f32(
 #[tokio::test]
 async fn cublas_graph_dispatch_probe() {
     if owl_cuda::test_device_bdf().is_none() {
-        eprintln!("skip: OWL_TEST_DEVICE 未设");
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     }
     let mut client = assemble();

@@ -746,7 +746,7 @@ mod tests {
     #[test]
     fn fc_derived_keys_match_fused_authority() {
         let Some(dir) = draft_dir() else {
-            eprintln!("skip: ckpt:dflash2 未设");
+            owl_shared::testkit::report::skip("ckpt:dflash2 未设");
             return;
         };
         let src = W4A16Source::open_dir(&dir).expect("打开草稿目录");

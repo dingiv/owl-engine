@@ -750,7 +750,7 @@ mod tests {
             resource_ok("gguf:4b").then(|| resource("gguf:4b").unwrap()),
             resource_ok("tpl:hf4b").then(|| resource("tpl:hf4b").unwrap()),
         ) else {
-            eprintln!("skip: 资源清单缺 gguf:4b / tpl:hf4b");
+            owl_shared::testkit::report::skip("资源清单缺 gguf:4b / tpl:hf4b");
             return;
         };
         let src = GgufSource::open(std::path::Path::new(&gguf)).expect("open 源");
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn loud_rejections_and_channel_agreement() {
         if !resource_ok("gguf:4b") {
-            eprintln!("skip: 资源清单缺 gguf:4b");
+            owl_shared::testkit::report::skip("资源清单缺 gguf:4b");
             return;
         }
         let src = GgufSource::open(&PathBuf::from(resource("gguf:4b").unwrap())).expect("open");

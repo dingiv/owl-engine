@@ -341,11 +341,11 @@ mod tests {
     #[tokio::test]
     async fn gpu_mtp_head_loads_from_awq27b() {
         if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         }
         let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
-            eprintln!("skip: ckpt:27b-awq 未设(cyankiwi 检查点目录)");
+            owl_shared::testkit::report::skip("ckpt:27b-awq 未设(cyankiwi 检查点目录)");
             return;
         };
         let dir = Path::new(&dir);
@@ -467,7 +467,7 @@ mod wiring_tests {
     #[tokio::test]
     async fn gpu_mtp_propose_chain_wiring() {
         if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return;
         }
         let (hidden, inter, hq, hkv, hd, vocab) = (32usize, 32usize, 2usize, 1usize, 16usize, 11usize);

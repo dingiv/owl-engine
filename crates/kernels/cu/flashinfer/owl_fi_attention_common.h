@@ -13,6 +13,8 @@
 // 本头只放**模板与常量**,不放 `extern "C"` 定义(符号唯一性)。
 // ============================================================================
 #pragma once
+// 算子侧唯一日志出口(编译门 OWL_LOG_ENABLED + 运行期 level/tag)
+#include "owl_log.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -88,10 +90,6 @@ static bool owl_fi_cuda_graph() {
 /// mask 开关(诊断/取证;`FI_NO_MASK=1` 关掉 mask —— 用来量"白跑的尾部 CTA")
 static bool owl_fi_no_mask() {
   const char* e = getenv("FI_NO_MASK");
-  return e != nullptr && e[0] != '\0' && e[0] != '0';
-}
-static bool owl_fi_debug() {
-  const char* e = getenv("FI_DEBUG");
   return e != nullptr && e[0] != '\0' && e[0] != '0';
 }
 
@@ -226,15 +224,15 @@ static int owl_fi_run_impl(
     tmp_s = GetPtrFromBaseOffset<float>(float_ws, plan_info.s_offset);
   }
 
-  if (owl_fi_debug()) {
-    fprintf(stderr,
-            "[owl-fi][%s] hd=%d page=%d T=%d hq=%d hkv=%d split=%d cta=%lld padded=%lld "
-            "mask=%s graph=%d\n",
-            tag, head_dim, page_size, total_num_rows, num_qo_heads, num_kv_heads,
-            (int)plan_info.split_kv, (long long)plan_info.cta_tile_q,
-            (long long)plan_info.padded_batch_size,
-            params.block_valid_mask ? "on" : "off", (int)owl_fi_cuda_graph());
-  }
+  // 诊断面:可见性由日志门决定(level=debug 或 tag `owl-fi` 白名单);
+  // 2026-10-21 起 `[probes] fi_debug` / `FI_DEBUG` env 双开关退役。
+  OWL_LOG_DEBUG("owl-fi",
+                "[%s] hd=%d page=%d T=%d hq=%d hkv=%d split=%d cta=%lld padded=%lld "
+                "mask=%s graph=%d",
+                tag, head_dim, page_size, total_num_rows, num_qo_heads, num_kv_heads,
+                (int)plan_info.split_kv, (long long)plan_info.cta_tile_q,
+                (long long)plan_info.padded_batch_size,
+                params.block_valid_mask ? "on" : "off", (int)owl_fi_cuda_graph());
   return (int)owl_fi_dispatch(params, tmp_v, tmp_s, (uint32_t)plan_info.cta_tile_q, head_dim,
                               /*same_kv_strides=*/true, stream);
 }

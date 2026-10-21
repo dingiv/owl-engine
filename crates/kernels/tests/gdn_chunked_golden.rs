@@ -212,7 +212,7 @@ fn gdn_chunked_golden_stage_by_stage() {
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/gdn_fla/cases");
     if !std::path::Path::new(dir).join("c1_t64.q.bin").is_file() {
-        eprintln!("skip: 金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)");
+        owl_shared::testkit::report::skip(format_args!("金标 bin 不在({dir};`gen.py` 生成,或从主树 testdata/gdn_fla/cases 链接)"));
         return;
     }
 

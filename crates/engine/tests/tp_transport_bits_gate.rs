@@ -120,14 +120,14 @@ fn bits_diff(a: &[f32], b: &[f32]) -> (usize, f32) {
 #[test]
 fn tp_transport_bits_gate() {
     let (Some(oa), Some(ob)) = (dev("OWL_TP_TEST_DEV_A"), dev("OWL_TP_TEST_DEV_B")) else {
-        eprintln!("skip: 需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
+        owl_shared::testkit::report::skip("需 OWL_TP_TEST_DEV_A / OWL_TP_TEST_DEV_B(两张空闲卡的 CUDA ordinal)");
         return;
     };
     assert_ne!(oa, ob, "跨卡档需要两张不同卡");
     let same_dev = dev("OWL_TP_SAME_DEV").unwrap_or(oa);
     let dir = dir_of();
     if !dir.join("config.json").exists() {
-        eprintln!("skip: 0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)");
+        owl_shared::testkit::report::skip(format_args!("0.8B 检查点不在 {dir:?}(设 OWL_0_8B_DIR)"));
         return;
     }
     std::thread::Builder::new()

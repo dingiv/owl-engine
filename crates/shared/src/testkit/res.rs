@@ -124,16 +124,17 @@ pub fn resource_ok(key: &str) -> bool {
     }
 }
 
-/// skip 文案:`needs = "<key>"` 门未过的可读原因(点名 key + 清单路径)
+/// skip **正文**:`needs = "<key>"` 门未过的可读原因(点名 key + 清单路径)。
+/// 不含 `skip: ` 前缀 —— 前缀由 [`super::report::skip`] 单点给出。
 pub fn missing_reason(key: &str) -> String {
     let p = manifest_path();
     match table().get(key) {
-        None => format!("skip: 资源清单缺 \"{key}\"({} 未列或不存在)", p.display()),
+        None => format!("资源清单缺 \"{key}\"({} 未列或不存在)", p.display()),
         Some(Resource::Path(path)) => {
-            format!("skip: 资源 \"{key}\" 的路径不在:{path}(清单 {})", p.display())
+            format!("资源 \"{key}\" 的路径不在:{path}(清单 {})", p.display())
         }
         Some(Resource::Flag(false)) => {
-            format!("skip: 资源开关 \"{key}\" = false(清单 {})", p.display())
+            format!("资源开关 \"{key}\" = false(清单 {})", p.display())
         }
         Some(Resource::Flag(true)) => format!("资源 \"{key}\" 可用"),
     }

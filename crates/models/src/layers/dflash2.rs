@@ -1553,7 +1553,7 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_dflash2_golden_matches() {
         let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
-            eprintln!("skip: ckpt:dflash2 未设");
+            owl_shared::testkit::report::skip("ckpt:dflash2 未设");
             return;
         };
         use crate::module::{LoaderCtx, Loadable};
@@ -1914,7 +1914,7 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_dflash2_fc_m_sweep() {
         let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
-            eprintln!("skip: ckpt:dflash2 未设");
+            owl_shared::testkit::report::skip("ckpt:dflash2 未设");
             return;
         };
         use crate::module::LoaderCtx;
@@ -2647,11 +2647,11 @@ mod tests {
     #[tokio::test]
     async fn gpu_dflash2_stage_bench() -> Result<(), crate::contract::ModelError> {
         if !gpu_enabled() {
-            eprintln!("skip: OWL_TEST_DEVICE 未设");
+            owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
             return Ok(());
         }
         let Some(dir) = owl_shared::testkit::resource("ckpt:dflash2") else {
-            eprintln!("skip: ckpt:dflash2 未设");
+            owl_shared::testkit::report::skip("ckpt:dflash2 未设");
             return Ok(());
         };
         use crate::module::LoaderCtx;

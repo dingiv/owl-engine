@@ -1227,10 +1227,6 @@ pub struct ProbesCfg {
     pub store_hook_dbg: bool,
     #[serde(default)]
     pub pf_taps: bool,
-    /// **FlashInfer 诊断打印**(原 `FI_DEBUG` / `OWL_FI_DEBUG`):plan 重算时的
-    /// 本轮 ctx_total。C++ 侧仍读 env ⇒ 后端同一写点同步写
-    #[serde(default)]
-    pub fi_debug: bool,
     /// **L3 事实面审计**(原 `OWL_L3_AUDIT`;声明 rank=0 的槽实际阶数登记)
     #[serde(default)]
     pub l3_audit: bool,

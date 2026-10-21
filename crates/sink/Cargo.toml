@@ -1,0 +1,6 @@
+[package]
+name = "owl-sink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "日志/计量下沉口(LogSink):依赖图叶子的零依赖 ABI crate"
