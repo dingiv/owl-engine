@@ -70,6 +70,7 @@ evict_policy = "lru"
 pool_overcommit = false
 
 [spec]
+draft = "auto"
 depth = 0
 dumb = false
 draft_kv_fp8 = false

@@ -331,6 +331,12 @@ prompt   MTP decode    round     verify    propose   propose.read
   的 attention**（extend 批行 + 链步；T=m+1 小，但 KV 长度 = ctx）。
 - 8k 仍在 1.67× 净正，但 continuation 的边际已被这条 ctx 项吃掉；下一步
   优化 = 草稿侧窗口/压缩 KV（不能动 target verify，它已平坦）。
+- **草稿窗口试验（否决，未保留代码）**：原型把 MTP KV attention
+  限制到 2048/4096/6144，确实把 `propose.read` 压到 9–16ms，但同一固定
+  8k prompt 接受率崩塌：m0 从 **6/76** 升到 **97/144（4096）/
+  98/146（6144）**，decode 从 **75.4** 掉到 **45.8 / 41.3 t/s**。
+  窗口化 MTP KV 不可用；下一步只能做压缩 KV/更快的全历史核，不能再砍
+  历史。
 - **另一笔独立税**：`prefill.extend` 每次 **321–386ms**（512 档 0.64s /
   2k 1.12s / 8k 3.1s），是 TTFT 的大头；与 decode 衰减无关，但必须另案
   查（理论上 MTP extend 应 <1ms/chunk）。
