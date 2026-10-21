@@ -200,11 +200,11 @@ mod tests {
     #[test]
     fn detects_safetensors_family() {
         for (env, default, entries) in [
-            ("ckpt:0.8b", "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B", 488),
-            ("ckpt:qwen35-4b", "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B", 738),
+            ("ckpt:0.8b", concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-0.8B"), 488),
+            ("ckpt:qwen35-4b", concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-4B"), 738),
             (
                 "ckpt:dflash2-bf16",
-                "/home/div/Documents/codes/models/z-lab/Qwen3.8-27B-DFlash2",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/z-lab/Qwen3.8-27B-DFlash2"),
                 81,
             ),
         ] {
@@ -224,7 +224,7 @@ mod tests {
     fn detects_pack_quantized_family() {
         let Some(d) = dir(
             "ckpt:27b-awq",
-            "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"),
         ) else {
             owl_shared::testkit::report::skip("资源 ckpt:27b-awq 不在(testdata/resources.toml)");
             return;
@@ -252,13 +252,13 @@ mod tests {
             // 不留"默认路径不存在 ⇒ 静默 skip"的空档)
             (
                 "gguf:4b",
-                "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf"),
                 441,
                 ["F32", "Q4_K", "Q5_K", "Q6_K", "Q8_0"].as_slice(),
             ),
             (
                 "gguf:27b",
-                "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf"),
                 851,
                 ["F32", "Q4_K", "Q6_K", "Q8_0"].as_slice(),
             ),

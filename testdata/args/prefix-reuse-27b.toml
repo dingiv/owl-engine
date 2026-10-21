@@ -6,7 +6,7 @@
 #
 # 启动(CUDA 序与 nvidia-smi 序不同:1 = 3090 Ti;用 UUID 钉卡):
 #   cd packages/owl-worktrees/server-engine
-#   CUDA_VISIBLE_DEVICES=GPU-e565c505-4921-9979-2e0f-2b83490b7aed \
+#   CUDA_VISIBLE_DEVICES=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
 #     ./target/debug/server -p profiles/spec-dflash.toml testdata/args/prefix-reuse-27b.toml
 #
 # 门(三层前缀复用的判据器;退出码 0 = 三门全绿):
@@ -19,7 +19,7 @@
 # ============================================================================
 [model]
 format = "awq"   # 原 kind = "awq27b"
-path = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+path = "../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
 name = "qwen3.8-27b"
 
 [runtime]
@@ -41,6 +41,6 @@ prompt_dump = true
 debug = true
 
 [spec]
-draft_path = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+draft_path = "../../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 [server]
 bind = "127.0.0.1:8137"

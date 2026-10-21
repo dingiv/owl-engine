@@ -6,7 +6,7 @@ bind = "127.0.0.1:8147"
 
 [model]
 name = "qwen3.8-27b-gguf-iq-dflash"
-path = "/home/div/Documents/codes/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf"
+path = "../models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf"
 format = "gguf"
 quant = "iq4"
 head_quant = "off"
@@ -28,7 +28,7 @@ vram_reserve_mb = 1024
 [spec]
 depth = 7
 draft = "dflash2"
-draft_path = "/home/div/Documents/codes/models/z-lab/Qwen3.8-27B-Dflash2-gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+draft_path = "../models/z-lab/Qwen3.8-27B-Dflash2-gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
 
 [kernel]
 kv_fp8 = false

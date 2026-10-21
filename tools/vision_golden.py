@@ -36,7 +36,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 # ---- 参数 -----------------------------------------------------------------
-CKPT = Path(sys.argv[1] if len(sys.argv) > 1 else "/home/div/Documents/codes/models/Hcompany/Holo-3.1-9B")
+CKPT = Path(sys.argv[1] if len(sys.argv) > 1 else "./models/Hcompany/Holo-3.1-9B")
 OUT = Path(sys.argv[2] if len(sys.argv) > 2 else "testdata/vision_golden.safetensors")
 GRID = [int(v) for v in (sys.argv[3] if len(sys.argv) > 3 else "1,4,6").split(",")]
 SEED = int(sys.argv[4] if len(sys.argv) > 4 else 0)

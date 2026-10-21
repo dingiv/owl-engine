@@ -15,7 +15,7 @@
 
 ## 1. 基线(全部 2026-10-21 实测,单 3090 Ti,勿重测)
 
-**硬件/档位**:3090 Ti @ `41:00.0`(UUID `GPU-e565c505-4921-9979-2e0f-2b83490b7aed`),
+**硬件/档位**:3090 Ti @ `41:00.0`(UUID `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`),
 27B `Qwen3.8-27B-UD-IQ4_XS.gguf`(13.3 GiB,64 层 = 16 full + 48 GDN,full_heads=(24,4,256),词表 248320)
 + GGUF 草稿 `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`(1.08 GiB,5 层,bf16 执行域)。
 档位 = `profiles/gguf27b-iq-dflash.toml`。**跑 std 矩阵必须加 `--set pool.prefix_cache=false`**

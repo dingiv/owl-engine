@@ -100,7 +100,7 @@ Qwen3.8-27B-Q4_K_M.gguf = 18G(压缩驻留)
 | **gguf_varbuilder.rs**(236 行,按名取 QTensor + 形状/dtype 查询) | 同上目录 | 索引面设计参考 | OWNED |
 | **gguf_tokenizer.rs / chat_template.rs / normal_bindings.rs**(键映射) | `packages/mistral.rs/mistralrs-core/src/gguf/` | 词表/模板/键映射的**交叉验证**第二源 | FROZEN |
 | **`gguf.cuh` 的上游权威** | `repos/llama.cpp/ggml/src/ggml-cuda/`(本树内) | 类型定义(`block_q4_K` 等)与 `gguf-py` 解析器的**判据源** | REFERENCE |
-| **llama.cpp 可执行锚** | `repos/llama.cpp/build-new/bin/llama-cli`(build 10945,`LD_LIBRARY_PATH=/home/div/Documents/codes/packages/llama.cpp/build-master2/bin`) | 端到端 greedy token 对拍;`llama-quantize` 可本地产 IQ 样本 | REFERENCE |
+| **llama.cpp 可执行锚** | `repos/llama.cpp/build-new/bin/llama-cli`(build 10945,`LD_LIBRARY_PATH=/path/to/packages/llama.cpp/build-master2/bin`) | 端到端 greedy token 对拍;`llama-quantize` 可本地产 IQ 样本 | REFERENCE |
 | **`gguf-py`** | `repos/llama.cpp/gguf-py` | 解析/词表的**独立第三源**(对拍用) | REFERENCE |
 
 ---
@@ -231,7 +231,7 @@ impl PlanSource<'a> {
 # flavors/gguf-9b.toml(单卡 3090 Ti)
 [model]
 kind = "gguf"                 # 新增档;或 dir 探测自动认 GGUF
-dir  = "/home/div/Documents/codes/models/mradermacher/Holo-3.1-9B-GGUF/Holo-3.1-9B.Q5_K_M.gguf"
+dir  = "/path/to/models/mradermacher/Holo-3.1-9B-GGUF/Holo-3.1-9B.Q5_K_M.gguf"
 [runtime]
 max_seq = 32768
 ```

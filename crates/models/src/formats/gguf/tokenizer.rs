@@ -381,15 +381,23 @@ mod tests {
     #[test]
     fn tokenizes_like_llama_cpp() {
         let bin = owl_shared::env_reader::str("OWL_LLAMA_TOKENIZE").unwrap_or_else(|| {
-            "/home/div/Documents/codes/repos/llama.cpp/build-new/bin/llama-tokenize".to_string()
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../repos/llama.cpp/build-new/bin/llama-tokenize"
+            )
+            .to_string()
         });
         if !PathBuf::from(&bin).is_file() {
             owl_shared::testkit::report::skip("llama-tokenize 不在(OWL_LLAMA_TOKENIZE 可指路)");
             return;
         }
         let libdir = owl_shared::env_reader::str("OWL_LLAMA_LIBS").unwrap_or_else(|| {
-            "/home/div/Documents/codes/repos/llama.cpp/build-new/bin:/home/div/Documents/codes/packages/llama.cpp/build-master2/bin"
-                .to_string()
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../../repos/llama.cpp/build-new/bin:",
+                "/path/to/packages/llama.cpp/build-master2/bin"
+            )
+            .to_string()
         });
         let cases: &[&str] = &[
             "Hello, world!",

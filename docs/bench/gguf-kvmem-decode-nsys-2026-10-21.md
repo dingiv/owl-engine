@@ -148,7 +148,7 @@ OWL_TEST_DEVICE=41:00.0 cargo test -p owl-models --release \
 
 ```bash
 ./target/release/server -p profiles/legacy/gguf27b-262k.toml \
-  --set model.dir=/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf \
+  --set model.dir=/path/to/models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf \
   --set runtime.bind=127.0.0.1:8141 \
   --set runtime.device.bdf=42:00.0 --log-level info
 

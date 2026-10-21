@@ -538,7 +538,7 @@ mod tests {
     /// gguf-py 源码树(对拍锚的另一端);不在 = 调用方 skip。
     fn py_root() -> Option<String> {
         owl_shared::env_reader::str("OWL_GGUF_PY")
-            .or_else(|| Some("/home/div/Documents/codes/repos/llama.cpp/gguf-py".to_string()))
+            .or_else(|| Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../repos/llama.cpp/gguf-py").to_string()))
             .filter(|p| std::path::Path::new(p).is_dir())
     }
 

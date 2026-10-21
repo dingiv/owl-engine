@@ -2,12 +2,12 @@
 """selector 指纹切分(E5-DF3 收尾):golden hidden(已证全对)+ 公式 LM 表 +
 检查点码本/proj → host 复算 top16 与 walk → 与 golden drafts / owl cand 对表。
 用法: .venv/bin/python tools/select_fingerprint.py [owl_cand0_16 逗号分隔]"""
-import json, struct, sys
+import json, os, struct, sys
 
 import numpy as np
 import torch
 
-ROOT = "/home/div/Documents/codes"
+ROOT = os.environ.get("OWL_WS", ".")  # 工作区根(默认当前目录)
 p = f"{ROOT}/packages/owl/testdata/dflash2_golden.safetensors"
 with open(p, "rb") as f:
     n = struct.unpack("<Q", f.read(8))[0]

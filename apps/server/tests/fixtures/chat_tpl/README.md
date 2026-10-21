@@ -22,8 +22,8 @@ Rust 渲染器必须与之**逐字节相等** —— 这是"提示词面 = 上�
 
 ```bash
 # 单测(含金标;需指向模型快照 —— 机器资产,不在仓库内)
-OWL_TPL_DIR=/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4 \
-OWL_TPL_DIR_QWEN35=/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B \
+OWL_TPL_DIR=/path/to/models/cyankiwi/Qwen3.8-27B-AWQ-INT4 \
+OWL_TPL_DIR_QWEN35=/path/to/models/Qwen/Qwen3.5-0.8B \
   cargo test --release -p server --bin server chat_tpl
 ```
 未设 env = 自动跳过(与 GPU 用例同纪律)。

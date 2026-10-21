@@ -1630,7 +1630,7 @@ mod generic_entry_tests {
     async fn unseen_size_loads_without_code() {
         let dir = std::path::PathBuf::from(
             owl_shared::testkit::resource("ckpt:new")
-                .unwrap_or_else(|| "/home/div/Documents/codes/models/Qwen/Qwen3.5-9B".into()),
+                .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-9B").into()),
         );
         if !dir.is_dir() {
             owl_shared::testkit::report::skip(format_args!("新档检查点不在({};ckpt:new 可指路)", dir.display()));
@@ -1699,7 +1699,7 @@ mod generic_entry_tests {
     async fn generic_entry_covers_quantized_family() {
         let dir = std::path::PathBuf::from(
             owl_shared::testkit::resource("ckpt:27b-awq")
-                .unwrap_or_else(|| "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4".into()),
+                .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4").into()),
         );
         if !dir.is_dir() {
             owl_shared::testkit::report::skip("27B AWQ 检查点不在");

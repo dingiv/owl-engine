@@ -1045,7 +1045,7 @@ mod tests {
             return;
         }
         let dir = std::path::PathBuf::from(owl_shared::testkit::resource("ckpt:27b-awq").unwrap_or_else(|| {
-            "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4".into()
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4").into()
         }));
         let src = AwqSource::open_dir(&dir).expect("源");
         let want = owl_shared::env_reader::str("OWL_AWQ_IOBENCH_KEYS").unwrap_or_else(|| {

@@ -6,8 +6,8 @@ import json, struct, sys
 import numpy as np
 import torch
 
-CKPT = sys.argv[1] if len(sys.argv) > 1 else "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
-OUT = sys.argv[2] if len(sys.argv) > 2 else "/home/div/Documents/codes/packages/owl/testdata/dflash2_golden.safetensors"
+CKPT = sys.argv[1] if len(sys.argv) > 1 else "./models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+OUT = sys.argv[2] if len(sys.argv) > 2 else "./packages/owl/testdata/dflash2_golden.safetensors"
 H, INTER, NQ, NKV, HD, NL, G = 5120, 17408, 32, 8, 128, 5, 320
 FAN = NL * H
 BLOCK, TOPK, RANK, VOCAB, MASK = 8, 16, 256, 248320, 248070
@@ -98,7 +98,7 @@ def apply_rope(x, p, hd, nh=None):
 # ── 输入(round-2 稳态:prefix = 位置 0..18(memory 前 19 行),噪声 @ 19..26)──
 # ── 真实规模变体(owl AL=0 排查):深层残差规模 taps + 真实 embed/lm_head ──
 import os as _os
-TGT = _os.environ.get("OWL_TGT_DIR", "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4")
+TGT = _os.environ.get("OWL_TGT_DIR", "./models/cyankiwi/Qwen3.8-27B-AWQ-INT4")
 def read_index2(path):
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]

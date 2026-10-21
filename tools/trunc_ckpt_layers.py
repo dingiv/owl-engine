@@ -1,6 +1,6 @@
 import json, os, re, struct, sys, shutil
-SRC = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-DST_ROOT = "/home/div/Documents/codes/packages/owl-worktrees/w4a8-p1/target/t27b"
+SRC = "./models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+DST_ROOT = "./packages/owl-worktrees/w4a8-p1/target/t27b"
 N = int(sys.argv[1])
 DST = f"{DST_ROOT}-{N}"
 os.makedirs(DST, exist_ok=True)

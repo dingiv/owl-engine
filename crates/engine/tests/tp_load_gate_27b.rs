@@ -52,7 +52,7 @@ use owl_models::plan::tp::TpPlan;
 fn dir_of() -> PathBuf {
     std::env::var("OWL_27B_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"))
+        .unwrap_or_else(|_| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4")))
 }
 
 /// 四层 spec(真检查点 + 真维度,只截层表;前 4 层 = 3×GDN + 1×full)
@@ -588,7 +588,7 @@ async fn repack_body(dir: &Path, ordinal: usize) {
 fn draft_dir_of() -> PathBuf {
     std::env::var("OWL_DFLASH_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"))
+        .unwrap_or_else(|_| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/syvai/Qwen3.8-27B-DFlash2-W4A16")))
 }
 
 /// 草稿 spec(真检查点维度;层表截成前 2 层 ⇒ 秒级)

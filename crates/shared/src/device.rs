@@ -41,7 +41,7 @@ pub struct DeviceRow {
     pub name: String,
     /// PCI BDF(`0000:42:00.0`;允许只写 `42:00.0` 或 `42.0`)
     pub bdf: String,
-    /// 设备 UUID(如 `GPU-89dffb90-d810-7ce7-f649-60d781508f21`)
+    /// 设备 UUID(如 `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
     pub uuid: String,
 }
 
@@ -329,11 +329,15 @@ mod tests {
     /// UUID 显示/归一同源:128 位转规范串,再按各种写法都能匹配
     #[test]
     fn uuid_display_norm_roundtrip() {
-        let bytes: [u8; 16] = [0x89, 0xdf, 0xfb, 0x90, 0xd8, 0x10, 0x7c, 0xe7, 0xf6, 0x49, 0x60, 0xd7, 0x81, 0x50, 0x8f, 0x21];
+        // 合成 UUID(**非**真实卡):01234567-89ab-cdef-0123-456789abcdef
+        let bytes: [u8; 16] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+            0xef,
+        ];
         let disp = uuid_display(&bytes);
-        assert_eq!(disp, "GPU-89dffb90-d810-7ce7-f649-60d781508f21");
+        assert_eq!(disp, "GPU-01234567-89ab-cdef-0123-456789abcdef");
         let row = DeviceRow { ordinal: 2, name: "RTX 3090 Ti".into(), bdf: "0000:42:00.0".into(), uuid: disp.clone() };
-        for q in [disp.clone(), disp.to_uppercase(), disp.replace('-', ""), "89dffb90-d810-7ce7-f649-60d781508f21".into()] {
+        for q in [disp.clone(), disp.to_uppercase(), disp.replace('-', ""), "01234567-89ab-cdef-0123-456789abcdef".into()] {
             let s = DeviceSpec { uuid: Some(q.clone()), ..Default::default() };
             assert!(s.matches(&row), "写法 {q:?} 应命中");
         }

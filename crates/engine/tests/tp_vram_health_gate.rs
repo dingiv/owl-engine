@@ -15,7 +15,7 @@
 //!
 //! ```bash
 //! OWL_TP_TEST_DEV_A=2 OWL_TP_TEST_DEV_B=3 \
-//!   OWL_0_8B_DIR=/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B \
+//!   OWL_0_8B_DIR=/path/to/models/Qwen/Qwen3.5-0.8B \
 //!   cargo test -p owl-engine --test tp_vram_health_gate -- --nocapture
 //! ```
 

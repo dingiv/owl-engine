@@ -269,7 +269,7 @@ mod parity_probe {
     /// 真图探针(不是门;`--nocapture` 看前 8 个归一化值,与 Python 金标对望)。
     #[test]
     fn bird_probe() {
-        let Ok(bytes) = std::fs::read("/home/div/Documents/codes/assets/bird.png") else {
+        let Ok(bytes) = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../assets/bird.png")) else {
             return;
         };
         let v = from_bytes(&bytes).expect("bird");
@@ -292,7 +292,7 @@ mod parity_exact {
         let Ok(golden) = std::fs::read("/tmp/bird_pv.f32") else {
             return;
         };
-        let bytes = std::fs::read("/home/div/Documents/codes/assets/bird.png").expect("bird");
+        let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../assets/bird.png")).expect("bird");
         let v = from_bytes(&bytes).expect("preprocess");
         assert_eq!(v.pixel_values.len() * 4, golden.len(), "长度");
         let want: Vec<f32> = golden

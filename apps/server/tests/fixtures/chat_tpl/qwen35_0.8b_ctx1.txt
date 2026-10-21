@@ -31,7 +31,7 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 </IMPORTANT>
 
-You are pi, a coding agent. Work in /home/div/proj.<|im_end|>
+You are pi, a coding agent. Work in /work/proj.<|im_end|>
 <|im_start|>user
 列出当前目录,然后创建 hello.txt<|im_end|>
 <|im_start|>assistant

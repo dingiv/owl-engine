@@ -86,7 +86,7 @@ pub enum BackendFamily {
 /// 09-19 混插对事故判例)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceDesc {
-    /// PCI 总线 UUID(如 "GPU-e565c505-…"),与卡物理身份绑定
+    /// PCI 总线 UUID(如 "GPU-xxxxxxxx-…"),与卡物理身份绑定
     pub uuid: String,
     pub arch: Arch,
     /// 设备总显存(bytes)

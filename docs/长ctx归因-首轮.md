@@ -120,7 +120,7 @@ KV-split 开(verify 臂非 `single_block`)。KV 因 token-block 分裂被**重�
 ```bash
 # 实例(GPU2 = GPU-89dffb90-...;生产在 GPU1,不打扰)
 cd packages/worktrees/owl/perf
-CUDA_VISIBLE_DEVICES=GPU-89dffb90-d810-7ce7-f649-60d781508f21 \
+CUDA_VISIBLE_DEVICES=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
   ./target/release/server --flavor spec-dflash testdata/args/perf-ctxladder-27b.toml \
   --perf-level host --log-level info
 

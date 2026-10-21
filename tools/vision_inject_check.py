@@ -20,8 +20,8 @@ from PIL import Image
 from safetensors.torch import load_file
 from transformers import AutoProcessor
 
-CKPT = sys.argv[1] if len(sys.argv) > 1 else "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B"
-IMGS = Path(sys.argv[2] if len(sys.argv) > 2 else "/home/div/Documents/codes/assets")
+CKPT = sys.argv[1] if len(sys.argv) > 1 else "./models/Qwen/Qwen3.5-4B"
+IMGS = Path(sys.argv[2] if len(sys.argv) > 2 else "./assets")
 OURS = Path(sys.argv[3] if len(sys.argv) > 3 else "testdata")
 QUESTION = "What is in this image? Answer with one word."
 

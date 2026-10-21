@@ -674,7 +674,7 @@ mod tests {
     fn ckpt_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(
             owl_shared::testkit::resource("ckpt:qwen35-4b")
-                .unwrap_or_else(|| "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B".into()),
+                .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-4B").into()),
         )
     }
 

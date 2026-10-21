@@ -21,8 +21,8 @@ import json
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODEL = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-MODEL_QWEN35 = "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B"
+MODEL = "./models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+MODEL_QWEN35 = "./models/Qwen/Qwen3.5-0.8B"
 
 TOOLS = [
     {
@@ -104,7 +104,7 @@ CASES = {
     # ① tools 块 + 单轮 user(基础路径)
     "ctx1_tools": {
         "messages": [
-            {"role": "system", "content": "You are pi, a coding agent. Work in /home/div/proj."},
+            {"role": "system", "content": "You are pi, a coding agent. Work in /work/proj."},
             {"role": "user", "content": "列出当前目录,然后创建 hello.txt"},
         ],
         "tools": TOOLS,

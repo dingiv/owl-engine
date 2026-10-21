@@ -29,14 +29,14 @@
 ```bash
 # ① triton venv(不建 = `kernels/build.rs` 直接 panic:"gdn_chunked 六核 AOT
 #    需要 Python+triton 环境")。两条路,选一:
-uv sync --project /home/div/Documents/codes/packages/owl-worktrees/<新树>/crates/kernels
+uv sync --project /path/to/packages/owl-worktrees/<新树>/crates/kernels
 # 或(更快)把构建指到主树 venv —— build.rs 自带旋钮,不必复制 venv:
-export GDN_TRITON_PY=/home/div/Documents/codes/packages/owl/crates/kernels/.venv/bin/python
+export GDN_TRITON_PY=/path/to/packages/owl/crates/kernels/.venv/bin/python
 
 # ② 0.8B 测试资产(不建 = `engine --lib` 3 项红:"models/assets/Qwen3.5-0.8B/
 #    config.json: No such file"。2.5G,勿复制,软链即可):
-mkdir -p /home/div/Documents/codes/packages/owl-worktrees/<新树>/crates/models/assets
-for d in /home/div/Documents/codes/packages/owl/crates/models/assets/*; do
+mkdir -p /path/to/packages/owl-worktrees/<新树>/crates/models/assets
+for d in /path/to/packages/owl/crates/models/assets/*; do
   ln -sfn "$d" "$(dirname "$d")/../.."/crates/models/assets/$(basename "$d") 2>/dev/null || true
 done
 ```
@@ -49,8 +49,8 @@ done
 #    (被 git 追踪的那几个文件)⇒ cp 会嵌成 `testdata/testdata/`,顶层
 #    `resources.toml` 依然缺 ⇒ 需要资源清单的用例**静默 skip**(看起来全绿,
 #    实则少跑)。用 `-a ./.` 形式覆盖式拷:
-SRC=/home/div/Documents/codes/packages/owl
-DST=/home/div/Documents/codes/packages/owl-worktrees/<新树>
+SRC=/path/to/packages/owl
+DST=/path/to/packages/owl-worktrees/<新树>
 cp -a "$SRC/testdata/." "$DST/testdata/"
 # 验证(两行都必须有内容):
 #   ls "$DST/testdata/resources.toml"          # 资源清单(本机路径)

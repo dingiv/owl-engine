@@ -32,7 +32,7 @@ fn dev(name: &str) -> Option<usize> {
 fn dir_of() -> PathBuf {
     std::env::var("OWL_27B_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"))
+        .unwrap_or_else(|_| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4")))
 }
 
 fn knobs() -> EngineKnobs {

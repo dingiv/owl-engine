@@ -269,16 +269,16 @@ mod tests {
         let c = lock_dir_candidates(
             Some(OsString::from("/tmp/x")),
             Some(OsString::from("/run/user/1000")),
-            Some(PathBuf::from("/home/div")),
+            Some(PathBuf::from("/home/user")),
             Some(1000),
         );
         assert_eq!(c[0], PathBuf::from("/tmp/x"), "显式覆盖最优先");
         assert_eq!(c[1], PathBuf::from("/run/user/1000/owl/gpu-locks"), "XDG 运行期目录次之");
         assert_eq!(c[2], PathBuf::from("/run/user/1000/owl/gpu-locks"));
-        assert_eq!(c[3], PathBuf::from("/home/div/.owl/gpu-locks"), "HOME 兜底");
+        assert_eq!(c[3], PathBuf::from("/home/user/.owl/gpu-locks"), "HOME 兜底");
         // env 与 XDG 都缺 ⇒ 仍要有 /run 与 HOME 两级
-        let c2 = lock_dir_candidates(None, None, Some(PathBuf::from("/home/div")), Some(7));
+        let c2 = lock_dir_candidates(None, None, Some(PathBuf::from("/home/user")), Some(7));
         assert_eq!(c2[0], PathBuf::from("/run/user/7/owl/gpu-locks"));
-        assert_eq!(c2[1], PathBuf::from("/home/div/.owl/gpu-locks"));
+        assert_eq!(c2[1], PathBuf::from("/home/user/.owl/gpu-locks"));
     }
 }

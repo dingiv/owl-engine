@@ -2,7 +2,7 @@
   "messages": [
     {
       "role": "system",
-      "content": "You are pi, a coding agent. Work in /home/div/proj."
+      "content": "You are pi, a coding agent. Work in /work/proj."
     },
     {
       "role": "user",

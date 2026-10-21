@@ -48,7 +48,7 @@ mkdir -p "$OUT_DIR"
 PORT="${PORT:-8137}"
 API="http://127.0.0.1:${PORT}/v1/chat/completions"
 MODEL="${MODEL:-qwen3.8-27b}"
-SPEEDTEST="${SPEEDTEST:-/home/div/Documents/codes/packages/llm_speedtest}"
+SPEEDTEST="${SPEEDTEST:-packages/llm_speedtest}"
 
 ARM="${1:-ab}"
 shift || true

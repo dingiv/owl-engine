@@ -6,7 +6,7 @@ bind = "127.0.0.1:8142"
 
 [model]
 name = "qwen3.5-4b-gguf-mtp"
-path = "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf"
+path = "../models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf"
 format = "gguf"
 quant = "q4k"
 head_quant = "off"

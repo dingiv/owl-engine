@@ -278,8 +278,8 @@ mod tests {
     #[test]
     fn reads_real_checkpoints_when_present() {
         for dir in [
-            "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16",
-            "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/syvai/Qwen3.8-27B-DFlash2-W4A16"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"),
         ] {
             let p = Path::new(dir);
             if !p.join("config.json").exists() {

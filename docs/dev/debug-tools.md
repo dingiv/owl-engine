@@ -113,7 +113,7 @@ owl 的 `runtime.device` 是 **CUDA ordinal**(`cudaSetDevice` 的序),与 `nvidi
 nvidia-smi --query-gpu=index,name,pci.bus_id,memory.used --format=csv
 python3 - <<'PY'   # 打印 CUDA ordinal 序(与 owl 同序)
 import ctypes,glob
-rt=ctypes.CDLL(glob.glob('/home/div/Documents/codes/packages/comfyui-test/.venv/lib/python3*/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12')[0])
+rt=ctypes.CDLL(glob.glob('/path/to/packages/comfyui-test/.venv/lib/python3*/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12')[0])
 n=ctypes.c_int(); rt.cudaGetDeviceCount(ctypes.byref(n)); buf=ctypes.create_string_buffer(256)
 for i in range(n.value):
     rt.cudaDeviceGetPCIBusId(buf,256,i); print(f'CUDA ordinal {i}: {buf.value.decode()}')

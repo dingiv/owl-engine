@@ -17,19 +17,19 @@
 
 跑法(任一有 torch 的 venv;本机用 sglang-test 的):
 
-    /home/div/Documents/codes/packages/sglang-test/.venv/bin/python \
+    ./packages/sglang-test/.venv/bin/python \
         crates/models/src/formats/gguf_fp8_probe.py
 
 ⚠️ 需要 ~30 GB 主机内存(fp8 分片按需载 + 大张量解量化);卡不需要。
 """
 import json, sys, numpy as np, torch
 from pathlib import Path
-sys.path.insert(0, '/home/div/Documents/codes/repos/llama.cpp/gguf-py')
+sys.path.insert(0, './repos/llama.cpp/gguf-py')
 from gguf import GGUFReader
 from gguf.quants import dequantize
 
-FP8 = Path('/home/div/Documents/codes/models/Qwen/Qwen3.8-27B-FP8')
-GGUF = Path('/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf')
+FP8 = Path('./models/Qwen/Qwen3.8-27B-FP8')
+GGUF = Path('./models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf')
 IDX = json.load(open(FP8 / 'model.safetensors.index.json'))['weight_map']
 NK, NV, HD = 16, 48, 128
 VPR = NV // NK

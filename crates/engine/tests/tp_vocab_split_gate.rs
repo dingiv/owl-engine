@@ -23,7 +23,7 @@
 //!
 //! ```bash
 //! OWL_TP_TEST_DEV_A=2 OWL_TP_TEST_DEV_B=3 \
-//!   OWL_27B_DIR=/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4 \
+//!   OWL_27B_DIR=/path/to/models/cyankiwi/Qwen3.8-27B-AWQ-INT4 \
 //!   cargo test -p owl-engine --test tp_vocab_split_gate -- --nocapture
 //! ```
 //! `A`/`B` = TP2 双 rank 卡（**CUDA ordinal**;需同型号,3080 对即可）。
@@ -44,7 +44,7 @@ fn dir_of() -> PathBuf {
     std::env::var("OWL_27B_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from("/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4")
+            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"))
         })
 }
 

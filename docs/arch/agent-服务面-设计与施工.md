@@ -400,7 +400,7 @@ data: [DONE]
 > 注意 pi 会识别**上下文溢出**类错误并自动 compact+retry;**不要把限流/瞬时错误伪装成溢出**。
 >
 > **为什么必须两段都要(2026-10-15 实测)**:pi 每轮**重发全量上下文**(系统提示 + 工具
-> schema + 历史);在工作区根(`/home/div/Documents/codes`，`AGENTS.md` 28 KB)它单次
+> schema + 历史);在工作区根(`/path/to`，`AGENTS.md` 28 KB)它单次
 > 系统提示就 ≈ **26.4k tok**(pi 自己的对话窗口只够装 24.6k —— 因为 `models.json.maxTokens
 > = 8192` 把 32k 预算吃掉四分之一)。只做归一化 ⇒ 系统提示本身超的部分压不下去，pi
 > 会反复 compaction 仍发不出去;只做收缩 ⇒ 真溢出时无报错信息可识别。故两段共存:

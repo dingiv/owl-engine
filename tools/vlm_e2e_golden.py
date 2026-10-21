@@ -25,8 +25,8 @@ from PIL import Image
 from safetensors.torch import save_file
 from transformers import AutoProcessor
 
-CKPT = sys.argv[1] if len(sys.argv) > 1 else "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B"
-IMGS = Path(sys.argv[2] if len(sys.argv) > 2 else "/home/div/Documents/codes/assets")
+CKPT = sys.argv[1] if len(sys.argv) > 1 else "./models/Qwen/Qwen3.5-4B"
+IMGS = Path(sys.argv[2] if len(sys.argv) > 2 else "./assets")
 OUT = Path(sys.argv[3] if len(sys.argv) > 3 else "testdata/vlm_e2e.safetensors")
 N_TOK = int(sys.argv[4]) if len(sys.argv) > 4 else 16
 PICK = sys.argv[5] if len(sys.argv) > 5 else ""

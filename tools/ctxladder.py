@@ -23,7 +23,7 @@ import sys
 import time
 import urllib.request
 
-SPEEDTEST_DIR = pathlib.Path("/home/div/Documents/codes/packages/llm_speedtest")
+SPEEDTEST_DIR = pathlib.Path("./packages/llm_speedtest")
 
 
 def get(url: str, timeout: float = 60.0) -> str:

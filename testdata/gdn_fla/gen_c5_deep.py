@@ -13,7 +13,7 @@
 import json, os, sys
 import torch
 
-sys.path.insert(0, "/home/div/Documents/codes/packages/vllm")
+sys.path.insert(0, "./packages/vllm")
 from vllm.third_party.flash_linear_attention.ops.index import prepare_chunk_indices
 from vllm.third_party.flash_linear_attention.ops.cumsum import chunk_local_cumsum_scalar
 from vllm.third_party.flash_linear_attention.ops import chunk as fla_chunk

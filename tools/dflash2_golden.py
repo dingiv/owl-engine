@@ -6,8 +6,8 @@ import json, struct, sys
 import numpy as np
 import torch
 
-CKPT = sys.argv[1] if len(sys.argv) > 1 else "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
-OUT = sys.argv[2] if len(sys.argv) > 2 else "/home/div/Documents/codes/packages/owl/testdata/dflash2_golden.safetensors"
+CKPT = sys.argv[1] if len(sys.argv) > 1 else "./models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+OUT = sys.argv[2] if len(sys.argv) > 2 else "./packages/owl/testdata/dflash2_golden.safetensors"
 H, INTER, NQ, NKV, HD, NL, G = 5120, 17408, 32, 8, 128, 5, 320
 FAN = NL * H
 BLOCK, TOPK, RANK, VOCAB, MASK = 8, 16, 256, 248320, 248070

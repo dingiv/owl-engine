@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn matches_gguf_py() {
         let Some(py) = owl_shared::env_reader::str("OWL_GGUF_PY")
-            .or_else(|| Some("/home/div/Documents/codes/repos/llama.cpp/gguf-py".to_string()))
+            .or_else(|| Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../repos/llama.cpp/gguf-py").to_string()))
             .filter(|p| Path::new(p).is_dir())
         else {
             owl_shared::testkit::report::skip("gguf-py 源码树不在(OWL_GGUF_PY 可指路)");

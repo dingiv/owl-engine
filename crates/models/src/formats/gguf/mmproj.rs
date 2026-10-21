@@ -496,7 +496,7 @@ mod tests {
         let Some(path) = mmproj_path(
             "mmproj:4b",
             "gguf:4b",
-            "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf"),
         ) else {
             owl_shared::testkit::report::skip("4B mmproj 不在");
             return;
@@ -518,7 +518,7 @@ mod tests {
         let Some(path) = mmproj_path(
             "mmproj:27b",
             "gguf:27b",
-            "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf"),
         ) else {
             owl_shared::testkit::report::skip("27B mmproj 不在");
             return;
@@ -538,7 +538,7 @@ mod tests {
         let Some(path) = mmproj_path(
             "mmproj:27b",
             "gguf:27b",
-            "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf"),
         ) else {
             owl_shared::testkit::report::skip("27B mmproj 不在");
             return;
@@ -559,7 +559,7 @@ mod tests {
         let Some(path) = mmproj_path(
             "mmproj:4b",
             "gguf:4b",
-            "/home/div/Documents/codes/models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf"),
         ) else {
             owl_shared::testkit::report::skip("4B mmproj 不在");
             return;

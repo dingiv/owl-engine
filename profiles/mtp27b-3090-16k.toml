@@ -6,7 +6,7 @@ bind = "127.0.0.1:8140"
 
 [model]
 name = "qwen3.8-27b"
-path = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
 format = "awq"
 quant = "w4a16"
 head_quant = "rtn-int4-g32"

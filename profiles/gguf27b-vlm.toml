@@ -6,12 +6,12 @@ bind = "127.0.0.1:8144"
 
 [model]
 name = "qwen3.8-27b-gguf-vlm"
-path = "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf"
+path = "../models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf"
 format = "gguf"
 quant = "q4k"
 head_quant = "off"
 vision = true
-vision_path = "/home/div/Documents/codes/models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf"
+vision_path = "../models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf"
 
 [parallel]
 mode = "single"

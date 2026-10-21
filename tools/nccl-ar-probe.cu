@@ -27,7 +27,7 @@
 //        -I/usr/include -L<pkg>/lib -lnccl -lcudart -Wl,-rpath,<pkg>/lib
 //   /tmp/nccl-ar-probe <ordA> <ordB> [bytes ...]
 //
-//   <pkg>/lib 例:`/home/div/Documents/codes/packages/mistral-test/lib`(libnccl.so.2)。
+//   <pkg>/lib 例:`/path/to/packages/mistral-test/lib`(libnccl.so.2)。
 //
 // ⚠️ **两个 rank 必须是两个进程**(NCCL 的进程模型);本程序用 `fork` + 管道传
 // `ncclUniqueId`,单进程即可跑完,无需 MPI/launcher。

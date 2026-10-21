@@ -249,13 +249,13 @@ mod tests {
         for (env, default, want_fn, tag) in [
             (
                 "ckpt:0.8b",
-                "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-0.8B"),
                 crate::formats::qwen35::qwen3_5_0_8b as fn() -> ModelSpec,
                 "0.8B",
             ),
             (
                 "ckpt:27b-awq",
-                "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"),
                 crate::formats::qwen35::qwen3_8_27b as fn() -> ModelSpec,
                 "27B-AWQ",
             ),
@@ -282,12 +282,12 @@ mod tests {
         for (env, default, tag) in [
             (
                 "ckpt:dflash2",
-                "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/syvai/Qwen3.8-27B-DFlash2-W4A16"),
                 "W4A16",
             ),
             (
                 "ckpt:dflash2-bf16",
-                "/home/div/Documents/codes/models/z-lab/Qwen3.8-27B-DFlash2",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/z-lab/Qwen3.8-27B-DFlash2"),
                 "BF16",
             ),
         ] {
@@ -316,7 +316,7 @@ mod tests {
     /// 4B-VL:from_ckpt 的文本 spec == `VlmCfg::from_json` 的 text_spec(同一份 config 两条读法)
     #[test]
     fn matches_vlm_text_spec() {
-        let Some(d) = dir("ckpt:qwen35-4b", "/home/div/Documents/codes/models/Qwen/Qwen3.5-4B") else {
+        let Some(d) = dir("ckpt:qwen35-4b", concat!(env!("CARGO_MANIFEST_DIR"), "/../../models/Qwen/Qwen3.5-4B")) else {
             owl_shared::testkit::report::skip("4B-VL 检查点不在");
             return;
         };

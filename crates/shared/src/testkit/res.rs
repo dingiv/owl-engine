@@ -4,8 +4,8 @@
 //! 形态(TOML;`key = "路径"` 或 `"flag:x" = true`):
 //!
 //! ```toml
-//! "ckpt:27b-awq" = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-//! "ckpt:dflash2" = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+//! "ckpt:27b-awq" = "/path/to/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+//! "ckpt:dflash2" = "/path/to/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 //! "flag:hf-parity" = true
 //! ```
 //!
