@@ -185,6 +185,8 @@ impl MtpPredictor {
         vocab: usize,
         env: crate::env::EnvProvider,
         attn_v2: Option<crate::module::AttnV2Scratch>,
+        extend_v2: Option<crate::module::AttnV2Scratch>,
+        extend_bt8: Option<&TensorOps>,
     ) -> TensorOps {
         let m1 = tokens.shape[0];
         assert_eq!(hiddens.shape[0], m1, "extend 行数 = token 数");
@@ -194,6 +196,11 @@ impl MtpPredictor {
         );
         ctx.env = env;
         ctx.seq_cu = Some(seq_cu);
+        // MTP extend 的 T=m+1 很小,但历史 KV 是全长:走 v2 伪序列臂
+        // (每行一条页链 + 在线 softmax),而不是 chunked prefill 的
+        // per-query 全历史扫描。scratch/页表由 engine 注入;None = 旧路。
+        ctx.attn_v2 = extend_v2;
+        ctx.v2_bt8 = extend_bt8;
         let emb = embed.embed(tokens, m1);
         let x = self.fc_path(&emb, hiddens, &ctx);
         let x = self.layer().forward(&x, &ctx);

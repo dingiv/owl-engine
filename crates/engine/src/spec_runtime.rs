@@ -275,6 +275,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             env.quant = owl_models::module::QuantPlan::F16;
             env.kv.quant = owl_models::env::KvQuant::None;
             env.kv.dtype = draft_dt;
+            // MTP extend(T=m+1≤4)在层内走 v2 伪序列臂:草稿池 F16、
+            // 每行一条 MTP 页链、长 ctx 下远比 chunked prefill 的
+            // per-query 全历史扫描便宜。只影响草稿 env,主 verify 仍按
+            // 自己的 dispatch.verify_v2/FI 档。
+            env.attn.verify_v2 = true;
             (None, env)
         }
         Some(Drafter::DFlash2(_)) => {

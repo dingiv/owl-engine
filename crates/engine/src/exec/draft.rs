@@ -747,6 +747,26 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let chain_refs: Vec<(&TensorOps, &KvBuffers)> =
             chain.iter().map(|(p, k)| (p, k)).collect();
+        // MTP extend 页表:每行都走同一条 MTP 页链(v2 伪序列语义);
+        // 复用 target verify 的 4 序列 scratch,按 m+1 取前缀视图。
+        // 行宽固定为池页数(会话链表只覆盖当前所需页,余页补零)。
+        let nb = self.dev.pool.geom.nb;
+        let mut bt8_f = vec![0f32; (m + 1) * nb];
+        for r in 0..=m {
+            for (i, &b) in bt.iter().take(nb).enumerate() {
+                bt8_f[r * nb + i] = b as f32;
+            }
+        }
+        let bt8_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![m + 1, nb],
+            &f32b(&bt8_f),
+        );
+        let extend_v2 = self
+            .dev
+            .pool
+            .verify_attn_v2_scratch()
+            .and_then(|s| s.prefix(m + 1));
         let ts_build = std::time::Instant::now();
         // cu(E5-M5:eager 路自建合法;图态走 propose_graph_step 的输入槽)
         let cu_t = TensorOps::from_host(
@@ -768,6 +788,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 crate::spec_runtime::Drafter::Mtp(mtp) => mtp.propose_ext(
                     &tokens_t, &hiddens, &extend_pos, &extend_kv, &extend_slots, &extend_lens,
                     &cu_t, &chain_refs, &self.dev.boot.model.embed, &rope, vocab, env, attn_v2,
+                    extend_v2, Some(&bt8_t),
                 ),
                 crate::spec_runtime::Drafter::DFlash2(_) => unreachable!("DFlash2 走 dflash_propose"),
             }
@@ -822,11 +843,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let pos_f: Vec<f32> = (pos..pos + m + 1).map(|p| p as f32).collect();
         let slots_f: Vec<f32> = (pos..pos + m + 1).map(slot_at).collect();
         let lens_f: Vec<f32> = ((pos + 1)..=(pos + m + 1)).map(|p| p as f32).collect();
+        // 图槽容量 = (m+1) × 池页数(固定);会话链表只覆盖当前所需页,
+        // 必须补零到全宽 —— 直接按 bt.len() 装填会短于图槽容量。
+        let nb = self.dev.pool.geom.nb;
+        let mut bt8_f = vec![0f32; (m + 1) * nb];
+        for r in 0..=m {
+            for (i, &b) in bt.iter().take(nb).enumerate() {
+                bt8_f[r * nb + i] = b as f32;
+            }
+        }
         let mut ins: Vec<(&str, &[f32])> = vec![
             ("tok_ext", tok_f.as_slice()),
             ("pos_ext", pos_f.as_slice()),
             ("slots_ext", slots_f.as_slice()),
             ("lens_ext", lens_f.as_slice()),
+            ("v2_bt8", bt8_f.as_slice()),
         ];
         let mut chain_bufs: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
         for j in 1..depth {

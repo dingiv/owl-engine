@@ -1319,19 +1319,24 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 链步 decode 读核 scratch(seqs=1;与 draft.rs eager 路同源):
         // kNHD 池落 v1 = 布局错位 → 草稿垃圾(2026-10-13 守卫捕获)
         let attn_v2_pool = pool.attn_v2_scratch();
+        let extend_v2_pool = pool.verify_attn_v2_scratch();
         for m in 0..=spec_depth {
             // move 闭包逐个消耗 → 每轮取一份克隆
             let attn_v2_p = attn_v2_pool.clone();
+            let extend_v2_p = extend_v2_pool.as_ref().and_then(|s| s.prefix(m + 1));
             let m1 = m + 1;
             let model_p = Arc::clone(&boot.model);
             let mtp = Arc::clone(mtp);
             let rp_p = boot.rope.clone();
             let kv_leaf = pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
             let bt_leaf = pool.bt_mtp_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP 块表槽缺席(草稿档位不一致)".into() })?;
+            let bt_nb = *bt_leaf.shape().last().unwrap_or(&1);
             let hid = hid_blk.clone();
             let env_p = env;
             let vocab = boot.model.vocab_size();
             let mut pins = vec![InputSlot::f32("tok_ext", m1), InputSlot::f32("pos_ext", m1), InputSlot::f32("slots_ext", m1), InputSlot::f32("lens_ext", m1)];
+            // MTP extend 的 v2 伪序列页表(每行同一条 MTP 页链)
+            pins.push(InputSlot::f32("v2_bt8", m1 * bt_nb));
             for j in 0..spec_depth - 1 {
                 pins.push(InputSlot::f32(format!("c{j}_pos"), 1));
                 pins.push(InputSlot::f32(format!("c{j}_slots"), 1));
@@ -1368,6 +1373,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                     let slots_ext = sc.input("slots_ext")?.reshape(vec![m1]);
                     let lens_ext = sc.input("lens_ext")?.reshape(vec![m1]);
                     let seq_cu = sc.input("seq_cu")?;
+                    let v2_bt8 = sc.input("v2_bt8")?.reshape(vec![m1, bt_nb]);
                     let bt = bt_leaf.clone();
                     let kv_ext = KvBuffers {
                         k_cache: kv_leaf.0.clone(),
@@ -1410,6 +1416,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                         env_p,
                         // 图步链读核也走 v2(同 draft.rs:kNHD 池落 v1 = 错位)
                         attn_v2_p.clone(),
+                        extend_v2_p.clone(),
+                        Some(&v2_bt8),
                     );
                     sc.output("drafts", &droot)
                 },
