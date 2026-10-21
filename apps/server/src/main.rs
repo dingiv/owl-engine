@@ -336,7 +336,7 @@ async fn main() {
         .name("owl-engine".into())
         // **显式栈**(2026-10-17):缺省 2MiB 是 debug 档的暗雷 —— 27B + DFlash2
         // 草稿的装载/装配链在 debug 下帧深远超 release(实测
-        // `-p profiles/legacy/spec-dflash.toml testdata/args/e2e-27b.toml` 的 debug 二进制
+        // `-p profiles/spec-dflash.toml testdata/args/e2e-27b.toml` 的 debug 二进制
         // 在 DFlash2 草稿初始化处栈溢出 SIGABRT;`RUST_MIN_STACK=64M` 即复活)
         // ⇒ 本线程是**唯一**背全模型生命周期的线程,给足栈,别赌优化器。
         .stack_size(ENGINE_STACK_BYTES)

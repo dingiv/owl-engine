@@ -85,7 +85,7 @@ fn spawn_server() -> Result<ServerGuard, String> {
     let bin = env!("CARGO_BIN_EXE_server");
     let mut cmd = Command::new(bin);
     let spec = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../profiles/legacy/spec-dflash.toml");
+        .join("../../profiles/spec-dflash.toml");
     cmd.arg("-p")
         .arg(&spec)
         .arg(&cfg_path)

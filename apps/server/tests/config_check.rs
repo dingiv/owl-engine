@@ -19,10 +19,6 @@ fn profile(name: &str) -> std::path::PathBuf {
     repo(&format!("profiles/{name}.toml"))
 }
 
-fn legacy(name: &str) -> std::path::PathBuf {
-    repo(&format!("profiles/legacy/{name}.toml"))
-}
-
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_server"))
         .args(args)
@@ -135,7 +131,7 @@ fn legacy_profile_still_works() {
     let site = repo("testdata/args/base.toml");
     let out = run(&[
         "-p",
-        legacy("awq27b").to_str().expect("路径"),
+        profile("awq27b").to_str().expect("路径"),
         "--site",
         site.to_str().expect("路径"),
         "--check",
@@ -151,7 +147,7 @@ fn check_without_site_fails_loudly_with_report() {
     // 常用档现在是自包含的(带 model.dir);用历史档验证"缺站点资产"的响亮拒。
     let out = run(&[
         "-p",
-        legacy("spec-dflash").to_str().expect("路径"),
+        profile("spec-dflash").to_str().expect("路径"),
         "--check",
     ]);
     assert!(!out.status.success(), "缺站点档应失败(27B 无缺省资产)");

@@ -59,6 +59,25 @@ pub struct CliArgs {
     pub step_gate_every: Option<u64>,
 }
 
+/// **默认档查找**(唯一产地):`profiles/base.toml` 按"当前目录 → 可执行文件
+/// 邻近(≤3 级)"顺序找。找不到就返回 `None`(调用方打 WARN 并走代码缺省)。
+///
+/// 为什么不用 env:配置链的纪律是"路径显式";默认档只是**兜底约定**,
+/// 需要换档请显式 `-p`。
+fn find_default_profile() -> Option<std::path::PathBuf> {
+    const REL: &str = "profiles/base.toml";
+    let mut cands: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(REL)];
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..3 {
+            let Some(d) = dir else { break };
+            cands.push(d.join(REL));
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+    }
+    cands.into_iter().find(|p| p.is_file())
+}
+
 impl CliArgs {
     /// 手写解析(未知参数 = Err 拒启,不静默忽略 —— 与配置同纪律)
     pub fn parse<I: Iterator<Item = String>>(mut it: I) -> Result<Self, String> {
@@ -342,7 +361,25 @@ impl ServerConfig {
     /// 层序:`-p/--profile` 路径 → 位置参数 CONFIG → `--site` → CLI
     /// (`--set` / 日志/性能/调试门)。`[intent]` 在同一函数里展开成低层键。
     pub fn load_resolved(args: &CliArgs) -> Result<ResolvedConfig, String> {
-        let base = args.profile.as_deref();
+        // **默认档**(2026-10-21):未显式给 `-p` 且无位置参数 ⇒ 用 `profiles/base.toml`。
+        // 理由:代码缺省是"能跑"(4k / F16 KV / 无投机 / 无图),不是最佳生产点;
+        // 每次启动都该落同一份最佳档,而不是各会话各拼一半。
+        let default_profile = if args.profile.is_none() && args.config.is_none() {
+            find_default_profile()
+        } else {
+            None
+        };
+        let base = args.profile.as_deref().or(default_profile.as_deref());
+        match (args.profile.as_deref(), default_profile.as_deref()) {
+            (None, Some(p)) => eprintln!(
+                "[config] 未显式给档 ⇒ 使用默认档 {}(可用 -p <path> 覆盖)",
+                p.display()
+            ),
+            (None, None) if args.config.is_none() => eprintln!(
+                "[config] WARN 未找到 profiles/base.toml ⇒ 走**代码缺省**(4k/F16 KV/无投机),\n                 这不是最佳档;请从仓库根启动,或显式 -p <profile>"
+            ),
+            _ => {}
+        }
         let mut layers: Vec<&Path> = Vec::new();
         if let Some(p) = args.config.as_deref() {
             layers.push(p);
@@ -351,12 +388,9 @@ impl ServerConfig {
             layers.push(p);
         }
         let mut resolved =
-            OwlConfig::load_resolved(base.as_deref(), &layers, &args.overrides())?;
+            OwlConfig::load_resolved(base, &layers, &args.overrides())?;
         if let Some(m) = resolved.meta.as_mut() {
-            m.intent.profile = args
-                .profile
-                .as_ref()
-                .map(|p| p.display().to_string());
+            m.intent.profile = base.map(|p| p.display().to_string());
         }
         Ok(resolved)
     }
