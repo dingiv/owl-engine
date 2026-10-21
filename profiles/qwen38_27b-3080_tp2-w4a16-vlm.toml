@@ -13,6 +13,7 @@ vision = true
 
 [parallel]
 mode = "tensor"
+tp_ar_f8 = true
 device = ["3080", "3080"]
 tp_vocab_split = true
 tp_ar_fused = true
