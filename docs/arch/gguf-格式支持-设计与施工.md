@@ -79,7 +79,7 @@ Qwen3.8-27B-Q4_K_M.gguf = 18G(压缩驻留)
 | **REQ-GGUF-07** | **数值锚**:①层内 = 与 `candle-gb k_quants.rs` / `gguf-py` 对拍;②端到端 = **首 token 硬门 + 全序列软账 + 分叉点 margin 归因**(2026-10-19 实测定谳,见 §十三 13.4:量化档在 near-tie 处必然分叉 —— 硬门"逐 token 逐位"会把噪声记成错) | P0 | ① 五型逐位全等(已绿);② 首 token 与参考源一致 ≥ 6 题、全序列一致 ≥ 半数、每处分叉能由 oracle 侧 top-2 margin 解释(实测 0.14 / 0.013 nat) |
 | **REQ-GGUF-08** | **27B 生产档**:`Qwen3.8-27B-Q4_K_M` 在 3090 对上跑通并出 std 五点三轮读数 | P1 | 三线与现役 AWQ-INT4 档并列落 bench;零 Xid |
 | **REQ-GGUF-09** | **MoE 骨架**:`qwen35moe` 键面与 `QuantPlan::Gguf` 在 MoE 层的落点(观察者/路由专家) | P2 | 键面覆盖 + 单层对拍(不承诺 e2e) |
-| **REQ-GGUF-10** | **VL 塔(mmproj)**:`mmproj-*.gguf` 走同一族加载 | P2 | 4B-VL 四图 e2e 不回归 |
+| **REQ-GGUF-10** | **VL 塔(mmproj)**:`mmproj-*.gguf` 走同一族加载 | **✅ P2 已接(2026-10-21)** | 4B/27B mmproj 装载 + 单图 e2e;权重面与 HF `model.visual.*` 逐元素对拍;见 §23.14 |
 | **REQ-GGUF-11** | **格式转化器**(requirements §其他需求):GGUF ↔ owl 内部资产(HF safetensors / marlin)离线互转 | P2 | 转化产物装载后可跑;精度差异有表 |
 
 **非目标(明确不做)**:GGUF *写入*(owl 只读);`ggml_file`(旧 GGML 格式);
@@ -2108,3 +2108,66 @@ q4_K **10.66 ms(≈903 GB/s,已贴墙)** / q8_0 **8.37 ms(≈855 GB/s,原 8.98/7
 (489 发/步、0.71 ms)> KVMem 首步 1.5 s 换页尖峰。
 完整数据/复现见
 [`docs/bench/gguf-kvmem-decode-nsys-2026-10-21.md`](../bench/gguf-kvmem-decode-nsys-2026-10-21.md)。
+
+### 23.14 GGUF 视觉塔(mmproj)接通(2026-10-21)
+
+**一句话**:GGUF 文本主干 + 同目录 `mmproj-*.gguf` 的 Qwen3.5-VL 塔已接;
+4B/27B 两档单图 e2e 均出连贯文本;4B 真鸟图(服务面)出 `Galapagos penguin`,与 HF 金标同。
+
+**事实面(为什么不能复用 HF 的 `config.json` 路径)**:
+
+- mmproj 的 `general.architecture = "clip"`,`clip.projector_type = "qwen3vl_merger"`;
+- 没有 `vision_config`/`num_position_embeddings`/`temporal_patch_size` 三个 HF 键
+  ⇒ `num_pos` 从 `v.position_embd.weight` 行数取(2304),`temporal` 从
+  `v.patch_embd.weight` / `.weight.1` 两个时间片张量的在场性取(2);
+- 主 GGUF 没有 `image_token_id`/`video_token_id` 冗余键 ⇒ 从
+  `tokenizer.ggml.tokens` 按词面 `<|image_pad|>` / `<|video_pad|>` 查 id
+  (4B/27B 均 = 248056/248057);
+- mRoPE 段从主文件 `qwen35.rope.dimension_sections = [11,11,10,0]` 取前三段,
+  rotary/theta 复用 `rope_facts`。
+
+**权重面(`crates/models/src/formats/gguf/mmproj.rs`)**:
+
+| 塔键 | mmproj 张量 |
+|---|---|
+| `patch_embed.proj.weight` | `v.patch_embd.weight` ⊕ `.weight.1`(**按 in 通道交错**) |
+| `patch_embed.proj.bias` | `v.patch_embd.bias` |
+| `pos_embed.weight` | `v.position_embd.weight` |
+| `blocks.N.norm1/norm2` | `v.blk.N.ln1/ln2` |
+| `blocks.N.attn.qkv/proj` | `v.blk.N.attn_qkv/attn_out` |
+| `blocks.N.mlp.linear_fc1/fc2` | `v.blk.N.ffn_up/ffn_down` |
+| `merger.norm` | `v.post_ln` |
+| `merger.linear_fc1/fc2` | `mm.0/mm.2` |
+
+两条易错点已用真权重钉死:
+
+1. **patch_embd 不是首尾相接**:HF `Conv3d` 权重 `[out][in][t][p][p]` 与 mmproj
+   两个 `[p,p,in,out]` 张量的还原顺序 = `for out { for in { t0[in] + t1[in] } }`
+   (直接 concat 会静默错值);4B HF 权重逐元素 `max|Δ| = 2.98e-8`(bf16→f32 舍入);
+2. **mmproj 的 `position_embd` 是 `[hidden,num_pos]`(ggml 序)**,逻辑行主序已是
+   `[num_pos,hidden]`,不需要转置;全塔 333 张量对 HF `model.visual.*` 逐元素
+   对拍 `max|Δ| ≤ 2.98e-8`,块内/merger/pos 全部命中。
+
+**装载面**:
+
+- `[model].vision = true` + `[model].mmproj = "…/mmproj-*.gguf"`;
+  缺省在同目录找**唯一** `mmproj*.gguf`(多个/没有 = 响亮拒并列出候选);
+- 视觉塔走 `MmprojSource`(host 解量化 + 同键缓存,`LoadOpts::plain`),文本主干
+  仍是 `GgufSource` **零解量化**通道(REQ-GGUF-05 未被污染);
+- 塔权重每 rank 全量;文本主干与 `Model` 同一份 `Arc`(`Vlm::from_model`);
+- `[model].mmproj` 写在 HF/AWQ 档 = 响亮拒(视觉塔在检查点目录的
+  `model.visual.*`);`vision = false` 却写 `mmproj` 同样拒。
+
+**门**:
+
+- `cargo test -p owl-models mmproj --lib`:元数据 4B/27B、塔全键覆盖、
+  27B Q8_0 解量化非空非 NaN、patch 合成长度;
+- `cargo test -p owl-engine --lib gpu_gguf_4b_vlm_image_smoke`:
+  4B Q4_K_M + mmproj-F16,单图 prefill 出非空文本;
+- 同法 `gpu_gguf_27b_vlm_image_smoke`:27B Q4_K_M + mmproj-Q8_0(覆盖 Q8_0 臂);
+- 服务面真机(4B,`profiles/gguf4b-vlm.toml`,`42:00.0`):OpenAI `image_url`
+  data URL,bird.png → `Galapagos penguin`(HF 金标同);文本题 `Paris` 正常。
+
+**未做/边界**:视频;多图 batch;图像前缀缓存;视觉塔量化(仍 f16 驻留);
+27B mmproj 的 IQ 族(本仓 `dequant_all` 只接 F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K;
+现有 27B mmproj 是 Q8_0/F16,不需要)。

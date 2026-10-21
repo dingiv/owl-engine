@@ -48,6 +48,9 @@ pub struct VisionCfg {
     pub temporal: usize,
     pub merge: usize,
     pub in_channels: usize,
+    /// LayerNorm eps(HF `vision_config` 缺省 1e-6;GGUF mmproj 从
+    /// `clip.vision.attention.layer_norm_epsilon` 读)
+    pub eps: f32,
 }
 
 impl VisionCfg {
@@ -61,6 +64,12 @@ impl VisionCfg {
             vc.get(k).and_then(|x| x.as_u64()).map(|x| x as usize)
                 .ok_or_else(|| ModelError::Msg(format!("vision_config 缺 {k}")))
         };
+        let eps = vc
+            .get("layer_norm_epsilon")
+            .or_else(|| vc.get("layer_norm_eps"))
+            .and_then(|x| x.as_f64())
+            .map(|x| x as f32)
+            .unwrap_or(1e-6);
         Ok(VisionCfg {
             depth: g("depth")?,
             hidden: g("hidden_size")?,
@@ -72,6 +81,7 @@ impl VisionCfg {
             temporal: g("temporal_patch_size")?,
             merge: g("spatial_merge_size")?,
             in_channels: g("in_channels")?,
+            eps,
         })
     }
 
@@ -88,6 +98,7 @@ impl VisionCfg {
             temporal: 2,
             merge: 2,
             in_channels: 3,
+            eps: 1e-6,
         }
     }
 
@@ -120,7 +131,7 @@ impl VisionCfg {
     }
 
     pub fn eps(&self) -> f32 {
-        1e-6
+        self.eps
     }
 }
 

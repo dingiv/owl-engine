@@ -565,7 +565,7 @@ mod tests {
             crate::module::QuantPlan::F16,
             crate::module::QuantPlan::F16,
         ).expect("Model::new");
-        let mut opts = LoadOpts::plain(spec.dtype);
+        let opts = LoadOpts::plain(spec.dtype);
         // 逐键分相账:旋钮归 `[load] debug_tap`(生产入口按配置落;本 helper 不读 env)
         load_from_dir(dir, face, &model, opts).await?;
         Ok(model)
@@ -592,6 +592,7 @@ mod tests {
             debug_tap: false,
             staging_mb: 128,
             dump: false,
+            gguf_dequant: false,
         };
         let manifest = load_from_dir(dir, face, &draft, opts).await?;
         manifest_mem_ledger(&manifest, "draft-mem");

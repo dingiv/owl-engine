@@ -31,6 +31,7 @@ use crate::layers::mrope::{split_video_frames, token_types, MropeCfg};
 use crate::layers::vision::{GridThw, VisionCfg, VisionInputs, VisionTables, VisionTower};
 use crate::model::{Model, ModelSpec};
 use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, PlanSource, QuantPlan};
+use crate::formats::gguf::{mmproj_vision_cfg, rope_facts, token_id, Gguf};
 use crate::formats::qwen35::Qwen35Convention;
 use crate::TensorOps;
 
@@ -209,6 +210,74 @@ impl VlmCfg {
             image_token,
             video_token,
             text_prefix: "model.language_model".into(),
+            text_spec,
+        })
+    }
+
+    /// **从 GGUF 双文件读 VLM 超参**(2026-10-21):文本 `.gguf` 提供
+    /// text/mRoPE/占位 token,mmproj `.gguf` 提供视觉塔。
+    ///
+    /// 与 [`Self::from_json`] 同律:三处（塔宽 = 文本 hidden、mRoPE 段和、
+    /// 图像占位 token 在场）缺一/不符 = 响亮拒。GGUF 没有 `image_token_id`
+    /// 冗余键 ⇒ 从 `tokenizer.ggml.tokens` 按词面查 id（`<|image_pad|>`）。
+    ///
+    /// `text_spec` = 引擎已推导的文本 spec（含 MTP 块排除后的解码层数）。
+    pub fn from_gguf(
+        text: &Gguf,
+        mmproj: &Gguf,
+        text_spec: ModelSpec,
+    ) -> Result<VlmCfg, ModelError> {
+        let vision = mmproj_vision_cfg(mmproj)?;
+        if vision.out_hidden != text_spec.hidden {
+            return Err(ModelError::Msg(format!(
+                "GGUF VLM:塔 out_hidden {} ≠ 文本 hidden {}（装配不成立）",
+                vision.out_hidden, text_spec.hidden
+            )));
+        }
+        let rf = rope_facts(text)?;
+        let sections = text
+            .kv
+            .opt_u32s("qwen35.rope.dimension_sections")
+            .map_err(|e| ModelError::Msg(format!("GGUF VLM mRoPE: {e}")))?
+            .ok_or_else(|| {
+                ModelError::Msg(
+                    "GGUF VLM: 缺 `qwen35.rope.dimension_sections`（不是 Qwen3.5-VL？）".into(),
+                )
+            })?;
+        let sec = match sections.as_slice() {
+            [a, b, c] => [*a as usize, *b as usize, *c as usize],
+            [a, b, c, 0] => [*a as usize, *b as usize, *c as usize],
+            other => {
+                return Err(ModelError::Msg(format!(
+                    "GGUF VLM: rope.dimension_sections={other:?}（期望 [T,H,W] 或 [T,H,W,0]）"
+                )))
+            }
+        };
+        let mrope = MropeCfg::new(sec, rf.rotary_dim, rf.theta, vision.merge)?;
+        let image_token = token_id(text, "<|image_pad|>")?.ok_or_else(|| {
+            ModelError::Msg("GGUF VLM: 词表缺 `<|image_pad|>`（图像占位 token 不可定）".into())
+        })?;
+        let video_token = token_id(text, "<|video_pad|>")?;
+        if video_token == Some(image_token) {
+            return Err(ModelError::Msg(
+                "GGUF VLM: `<|image_pad|>` 与 `<|video_pad|>` 映射到同一 id".into(),
+            ));
+        }
+        let hidden = text_spec.hidden;
+        let layers = text_spec.layer_types.len();
+        if layers == 0 {
+            return Err(ModelError::Msg("GGUF VLM: 文本层数为 0".into()));
+        }
+        Ok(VlmCfg {
+            vision,
+            mrope,
+            hidden,
+            layers,
+            image_token,
+            video_token,
+            // GGUF 文本主干用 `GgufConvention`；本字段只服务 `Vlm::new` 的
+            // HF 装配，`from_model` 路径不读它。
+            text_prefix: String::new(),
             text_spec,
         })
     }

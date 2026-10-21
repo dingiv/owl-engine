@@ -10,5 +10,8 @@
 
 # ---- GGUF 起点族(2026-10-19)----
 # "gguf:9b"   = "<Holo-3.1-9B-Q5_K_M.gguf>"
+# "gguf:4b"   = "<Qwen3.5-4B-Q4_K_M.gguf>"
 # "gguf:27b"  = "<Qwen3.8-27B-Q4_K_M.gguf>"
 # "gguf:draft-q4" = "<Qwen3.8-27B-DFlash2-Q4_K_M.gguf>"
+# "mmproj:4b" = "<mmproj-Qwen3.5-4B-f16.gguf>"
+# "mmproj:27b" = "<mmproj-Qwen3.8-27B-Q8_0.gguf>"

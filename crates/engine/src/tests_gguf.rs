@@ -10,6 +10,7 @@
 //! | 冒烟(`gpu_gguf_4b_smoke`) | 装载过 + 出**连贯文本** + 步时合理 | 键漏接 / 错变换 / 词表错 / rope 错 / tied 头错(全是"能跑但输出垃圾") |
 //! | 对拍(`gpu_gguf_4b_greedy_vs_llamacpp`) | 同文件同 prompt greedy **逐 token** 与 llama.cpp 相同 | 数值口径漂移(权重/激活/归约序) |
 //! | TP2(`gpu_gguf_27b_tp2`) | 首 token 硬门 + 两 rank logits **逐位相同** + AR 对称 + 每 rank 半量驻留 | 分片几何(行置换 × 块对齐列切 × v-head 聚合)错 |
+//! | VLM(`gpu_gguf_{4b,27b}_vlm_image_smoke`) | mmproj 装载 + 单图 prefill 出非空文本 | 塔键映射/patch 时间片/mmproj 解量化/图像注入 |
 //!
 //! ⚠️ **为什么冒烟不是形式主义**:GGUF 档的错法**几乎全是静默错值**(行/列序、
 //! 段偏移、norm 的 ±1、乘错表)→ 输出会立刻退化成乱码/重复串。因此"连贯"
@@ -714,4 +715,156 @@ async fn gpu_gguf_prefill_single() {
         "[gguf-prefill-single] chunk={chunk} · prompt {ntok} tok · {dt:.3}s ⇒ {:.1} tok/s · 首 token {first:?}",
         ntok as f64 / dt.max(1e-9)
     );
+}
+
+/// **4B GGUF + mmproj 视觉塔冒烟**(2026-10-21):GGUF 文本主干 + 同目录
+/// `mmproj-*.gguf` 装配,单图 prefill 出非空文本。
+///
+/// 判据只要求"链路通 + 出文本":塔数值由 `mmproj::source_covers_tower_keys`
+/// 与 HF 权重面保证;这里抓的是**装载/注入/mRoPE/占位展开**的接线错误
+/// (任何一处错会立刻退化成空串或 `Failed`)。
+#[cfg(test)]
+#[owl_test(gpu)]
+async fn gpu_gguf_4b_vlm_image_smoke() {
+    use owl_models::formats::gguf::resolve_mmproj_path;
+    use crate::turn::TurnOpts;
+
+    if !resource_ok("gguf:4b") {
+        eprintln!("skip: 资源清单缺 \"gguf:4b\"");
+        return;
+    }
+    // GPU 套件在同一进程串跑时，前一个 27B 测试的 `live` 账可能未随 drop 回落
+    //（free 已还 OS，但 LIVE 计数是进程级；`[vram-gov]` 会把它当在驻留）。
+    // 4B 门单独跑/新进程跑；检测到已有大模型驻留就 skip，避免把测试隔离问题
+    // 误报成 4B VLM 失败。
+    let live = owl_shared::vram::live_bytes();
+    if live > (8u64 << 30) {
+        eprintln!(
+            "skip: 进程已有 {:.1}G 设备驻留（GPU 套件请单测跑 4B VLM；27B 门已跑过）",
+            live as f64 / (1u64 << 30) as f64
+        );
+        return;
+    }
+    let path = std::path::PathBuf::from(resource("gguf:4b").expect("列了就有"));
+    let mmproj = match resolve_mmproj_path(&path, None) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skip: 同目录无唯一 mmproj: {e}");
+            return;
+        }
+    };
+    let ord = owl_cuda::test_device_ordinal();
+    let mut cfg = gguf_cfg(ord, 2048, 2048, 1);
+    cfg.knobs.vision = true;
+    cfg.knobs.mmproj = Some(mmproj.clone());
+    let mut engine = Engine::new(cfg).expect("引擎构造");
+    let loaded = engine.loader().load_gguf(&path).await.expect("GGUF + mmproj 装载");
+    assert!(loaded.vlm.is_some(), "vision=true 必须有视觉塔(mmproj={})", mmproj.display());
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    // 先跑一轮纯文本,避开历史 F1 "首轮带图"变量(4B 是否复现另案)。
+    let (_, warm) = running
+        .submit_session(Some(1), "The capital of France is", 1)
+        .expect("warmup submit");
+    loop {
+        match running.pump().await.expect("warmup pump") {
+            TurnEvent::Token { turn, .. } if turn == warm => break,
+            TurnEvent::Completed { turn, .. } if turn == warm => break,
+            TurnEvent::Failed { turn, err } => panic!("warmup 失败: {err}"),
+            _ => {}
+        }
+    }
+
+    let l_img = 4usize; // grid (1,4,4) ⇒ (4/2)²
+    let patch_flat = 3 * 2 * 16 * 16;
+    let rows = 16usize;
+    let img = owl_models::vlm::VlmImage {
+        pixel_values: (0..rows * patch_flat)
+            .map(|i| 0.2 + (i % 7) as f32 * 0.01)
+            .collect(),
+        grid: (1, 4, 4),
+    };
+    let prompt = format!(
+        "<|im_start|>user\n<|vision_start|>{}<|vision_end|>What is in this image?<|im_end|>\n<|im_start|>assistant\n",
+        "<|image_pad|>".repeat(l_img)
+    );
+    let (_, t) = running
+        .submit_session_opts(Some(2), prompt.as_str(), 8, TurnOpts { images: vec![img], ..Default::default() })
+        .expect("image submit");
+    let mut text = String::new();
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Token { turn, delta } if turn == t => text.push_str(&delta),
+            TurnEvent::Completed { turn, .. } if turn == t => break,
+            TurnEvent::Failed { turn, err } if turn == t => panic!("GGUF VLM 失败: {err}"),
+            TurnEvent::Idle => panic!("turn {t} 队列丢失"),
+            _ => {}
+        }
+    }
+    eprintln!(
+        "[gguf-vlm] 4B + mmproj · grid (1,4,4) · {l_img} image tokens ⇒ {text:?}"
+    );
+    assert!(!text.trim().is_empty(), "GGUF 视觉 prefill 必须产出非空文本");
+}
+
+/// **27B GGUF + mmproj 视觉塔冒烟**(2026-10-21):生产 27B GGUF 主干 +
+/// `mmproj-Qwen3.8-27B-Q8_0.gguf`;27B mmproj 的线性层是 Q8_0,另外覆盖
+/// `MmprojSource` 的 Q8_0 解量化臂(4B f16 档覆盖不到)。
+#[cfg(test)]
+#[owl_test(gpu)]
+async fn gpu_gguf_27b_vlm_image_smoke() {
+    use owl_models::formats::gguf::resolve_mmproj_path;
+    use crate::turn::TurnOpts;
+
+    if !resource_ok("gguf:27b") {
+        eprintln!("skip: 资源清单缺 \"gguf:27b\"");
+        return;
+    }
+    let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));
+    let mmproj = match resolve_mmproj_path(&path, None) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skip: 同目录无唯一 mmproj: {e}");
+            return;
+        }
+    };
+    let ord = owl_cuda::test_device_ordinal();
+    let mut cfg = gguf_cfg(ord, 2048, 2048, 1);
+    cfg.knobs.vision = true;
+    cfg.knobs.mmproj = Some(mmproj.clone());
+    let mut engine = Engine::new(cfg).expect("引擎构造");
+    let loaded = engine.loader().load_gguf(&path).await.expect("27B GGUF + mmproj 装载");
+    assert!(loaded.vlm.is_some(), "vision=true 必须有视觉塔(mmproj={})", mmproj.display());
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let l_img = 4usize;
+    let patch_flat = 3 * 2 * 16 * 16;
+    let rows = 16usize;
+    let img = owl_models::vlm::VlmImage {
+        pixel_values: (0..rows * patch_flat)
+            .map(|i| 0.2 + (i % 7) as f32 * 0.01)
+            .collect(),
+        grid: (1, 4, 4),
+    };
+    let prompt = format!(
+        "<|im_start|>user\n<|vision_start|>{}<|vision_end|>What is in this image?<|im_end|>\n<|im_start|>assistant\n",
+        "<|image_pad|>".repeat(l_img)
+    );
+    let (_, t) = running
+        .submit_session_opts(Some(2), prompt.as_str(), 8, TurnOpts { images: vec![img], ..Default::default() })
+        .expect("image submit");
+    let mut text = String::new();
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Token { turn, delta } if turn == t => text.push_str(&delta),
+            TurnEvent::Completed { turn, .. } if turn == t => break,
+            TurnEvent::Failed { turn, err } if turn == t => panic!("27B GGUF VLM 失败: {err}"),
+            TurnEvent::Idle => panic!("turn {t} 队列丢失"),
+            _ => {}
+        }
+    }
+    eprintln!(
+        "[gguf-vlm] 27B + mmproj · grid (1,4,4) · {l_img} image tokens ⇒ {text:?}"
+    );
+    assert!(!text.trim().is_empty(), "27B GGUF 视觉 prefill 必须产出非空文本");
 }

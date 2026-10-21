@@ -59,6 +59,9 @@ pub struct EngineKnobs {
     /// **视觉塔**(`[model].vision`):装载 `model.visual.*` + 允许 VLM 请求。
     /// 缺省 false = 纯文本路径逐字节不变(27B 视觉档显式开)。
     pub vision: bool,
+    /// **GGUF 视觉塔单文件**(`[model].mmproj`;None = 同目录唯一候选)。
+    /// 仅 GGUF 档 + `vision = true` 消费。
+    pub mmproj: Option<std::path::PathBuf>,
     /// lm_head 量化方案(`[model].head_quant`;boot 投影到 tag filter)
     pub head_quant: owl_shared::config::HeadQuant,
     /// tag 过滤通配符(`[dispatch] tag_wildcard`;诊断 `*`)
@@ -278,6 +281,7 @@ impl Default for EngineKnobs {
             load: owl_shared::config::LoadCfg::default(),
             rope: owl_shared::config::RopeCfg::default(),
             vision: false,
+            mmproj: None,
             head_quant: owl_shared::config::HeadQuant::Off,
             tag_wildcard: false,
             probes: crate::running::StepProbes {
@@ -546,6 +550,7 @@ impl EngineKnobs {
             load: cfg.load.clone(),
             rope: cfg.model.rope.clone(),
             vision: cfg.model.vision,
+            mmproj: cfg.model.mmproj.clone(),
             head_quant: cfg.model.head_quant,
             tag_wildcard: cfg.dispatch.tag_wildcard,
             probes: crate::running::StepProbes::from_config(cfg),
@@ -946,6 +951,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
             .mtp_override(self.cfg.knobs.draft.mtp_dir.clone())
             .rope(self.cfg.knobs.rope.clone(), self.cfg.max_seq_tokens)
             .vision(self.cfg.knobs.vision)
+            .mmproj(self.cfg.knobs.mmproj.clone())
     }
 
     /// 模型交引擎:状态块/槽/Session 组建 + warmup —— 仍不跑任何 turn,

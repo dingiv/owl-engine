@@ -278,3 +278,25 @@ cargo build -p server
   --set 'runtime.tp_ordinals=[2,3]' --check
 # 期望:spec=dflash / vision=on(装载面) / draft dir ✓ / TP2 内存账跳过告警
 ```
+
+---
+
+## 9. GGUF 主干旁路(2026-10-21)
+
+HF/AWQ 档的塔在检查点目录(`model.visual.*`);GGUF 主文件**只带文本主干**,
+塔在**同目录 `mmproj-*.gguf`**。两档共用引擎侧全部接线(V1–V5),差别只在
+装载面:
+
+- 配置:`[model] vision = true` + `[model] mmproj = "…/mmproj-*.gguf"`
+  (缺省 = `model.dir` 同目录唯一 `mmproj*.gguf`;多个/没有 = 响亮拒);
+- 事实:`VlmCfg::from_gguf` 从主 GGUF 读 mRoPE sections + `<|image_pad|>` id,
+  从 mmproj 读 `clip.vision.*`(num_pos/temporal 由张量形状补);
+- 权重:`MmprojSource`(host 解量化到 F16;文本主干仍零解量化)+
+  `Vlm::from_model` 共享同一份文本 `Arc`;
+- patch_embd 的 `v.patch_embd.weight` / `.weight.1` 两个时间片必须按 HF
+  `[out][in][t][p][p]` **按 in 通道交错**(不是首尾相接);
+- 真机:4B Q4_K_M + mmproj-F16 / 27B Q4_K_M + mmproj-Q8_0 均过单图 e2e;
+  4B OpenAI `image_url`(data URL)鸟图 → `Galapagos penguin`(HF 金标同)。
+
+详见 `docs/arch/gguf-格式支持-设计与施工.md` §23.14 与
+`docs/dev/config.md` §7.1。

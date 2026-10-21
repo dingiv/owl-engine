@@ -38,7 +38,7 @@
 
 use crate::contract::ModelError;
 
-use super::reader::Gguf;
+use super::reader::{Gguf, GgufValue};
 
 /// token_type 码(GGUF 规范;`tokenizer.ggml.token_type`)
 pub const TT_NORMAL: u8 = 1;
@@ -127,6 +127,30 @@ fn pre_regex(pre: Option<&str>) -> Result<&'static str, ModelError> {
              ⇒ 拒建,禁拿默认正则猜;设计 R7)"
         ))),
     }
+}
+
+/// **按词面查 token id**(`tokenizer.ggml.tokens` 的下标 = id)。
+///
+/// 这是 VLM 接线用的**名解析**入口(主模型 GGUF 没有 `image_token_id`
+/// 这类冗余键;`<|image_pad|>` 的名字才是事实)。缺 tokens 键/型错 = 响亮拒;
+/// 词面不在 = `None`(调用方决定是否必填)。
+pub fn token_id(g: &Gguf, token: &str) -> Result<Option<u32>, ModelError> {
+    let bad = |m: String| ModelError::Msg(format!("gguf tokenizer: {}: {m}", g.path.display()));
+    let Some(v) = g.kv.get("tokenizer.ggml.tokens") else {
+        return Err(bad("缺 `tokenizer.ggml.tokens`(无法按词面查 id)".into()));
+    };
+    let GgufValue::Array(items) = v else {
+        return Err(bad(format!(
+            "`tokenizer.ggml.tokens` 类型不符(应 ARRAY):实得 {}",
+            v.type_name()
+        )));
+    };
+    for (i, item) in items.iter().enumerate() {
+        if matches!(item, GgufValue::String(s) if s == token) {
+            return Ok(Some(i as u32));
+        }
+    }
+    Ok(None)
 }
 
 /// **从 GGUF 造 tokenizer**(唯一入口;零文件依赖)。

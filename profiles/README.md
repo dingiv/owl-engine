@@ -29,6 +29,8 @@ $EDITOR ~/my-27b.toml
 | `awq27b.toml` | 27B 低层档(无 intent;回归/取证与测试用) |
 | `spec-dflash.toml` | 27B + DFlash2 低层档(16k;测试/取证用) |
 | `mtp27b-3090-16k.toml` | 3090 Ti 单卡 27B + 检查点 MTP 头 d3 / 16k(MTP 投机验证档) |
+| `gguf4b-vlm.toml` | 3090 Ti 单卡 4B GGUF + mmproj 视觉塔 / 8k(GGUF VLM 档) |
+| `gguf27b-vlm.toml` | 3090 Ti 单卡 27B GGUF + mmproj-Q8_0 视觉塔 / 8k(GGUF VLM 档) |
 | `tp27b-3080-184k.toml` | 2×3080 27B + 视觉 + DFlash2 d7 / 184k(意图档) |
 | `tp27b-3080-vlm-184k.toml` | 同上但 spec off(视觉对照) |
 | `tp27b-3080-262k.toml` | 2×3080 27B / 262k(低层档,小池 + 宿主腿) |

@@ -785,24 +785,33 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         None if c.model.kind == ModelKind::Qwen35_08b => Some(default_08b()),
         None => None,
     };
-    match (dir_owned.as_deref(), profile) {
-        (Some(dir), Some(p)) => match check_model_dir(dir, p, c.runtime.max_seq, c.model.vision) {
-            Ok(Some(note)) => out.push_str(&format!("[check] model dir: {note}\n")),
-            Ok(None) => {}
-            Err(e) => {
-                ok = false;
-                out.push_str(&format!("[check] FAIL: {e}\n"));
+    match dir_owned.as_deref() {
+        Some(dir) if dir.is_file() => {
+            match check_gguf_model(dir, profile, c.runtime.max_seq, c.model.vision, c.model.mmproj.as_deref()) {
+                Ok(note) => out.push_str(&format!("[check] model dir: {note}\n")),
+                Err(e) => {
+                    ok = false;
+                    out.push_str(&format!("[check] FAIL: {e}\n"));
+                }
             }
+        }
+        Some(dir) => match profile {
+            Some(p) => match check_model_dir(dir, p, c.runtime.max_seq, c.model.vision) {
+                Ok(Some(note)) => out.push_str(&format!("[check] model dir: {note}\n")),
+                Ok(None) => {}
+                Err(e) => {
+                    ok = false;
+                    out.push_str(&format!("[check] FAIL: {e}\n"));
+                }
+            },
+            None => out.push_str("[check] model dir: 注册表无该 kind ⇒ 几何校验跳过\n"),
         },
-        (None, _) => {
+        None => {
             ok = false;
             out.push_str(
                 "[check] FAIL: 未配置 [model].dir / [site].model_dir —— 27B 档无法定位检查点\
                  (真启动必失败);请给站点档\n",
             );
-        }
-        (Some(_), None) => {
-            out.push_str("[check] model dir: 注册表无该 kind ⇒ 几何校验跳过\n")
         }
     }
     if c.spec.depth > 0 {
@@ -897,7 +906,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         } else {
             out.push_str(
                 "[check] note: vision=on + spec=off:图像路径可用(单图;data URL;\
-                 TP2 两 rank 各备塔输出)\n",
+                 TP2 档两 rank 各备塔输出)\n",
             );
         }
     }
@@ -966,6 +975,78 @@ fn check_mtp_head(dir: &Path) -> Result<String, String> {
         ));
     }
     Ok(format!("{} ✓ MTP 头 / {} 个 mtp.* 键", dir.display(), n))
+}
+
+/// **GGUF 单文件几何 + 视觉塔预检**(2026-10-21;`--check` 专用)。
+///
+/// 与 [`check_model_dir`] 的分工:GGUF 没有 `config.json`,超参/词表/rope
+/// 全在文件内;视觉塔在**同目录 mmproj**。本函数只读索引,不装权重。
+fn check_gguf_model(
+    path: &Path,
+    profile: Option<&owl_shared::config::intent::ModelProfile>,
+    ctx: usize,
+    vision: bool,
+    mmproj: Option<&Path>,
+) -> Result<String, String> {
+    use owl_models::formats::gguf::{resolve_mmproj_path, rope_facts, spec_from_gguf, Gguf};
+    let g = Gguf::open(path).map_err(|e| format!("打开 GGUF {} 失败: {e}", path.display()))?;
+    let (spec, rep) = spec_from_gguf(&g).map_err(|e| format!("{} GGUF 超参: {e}", path.display()))?;
+    let rf = rope_facts(&g).map_err(|e| format!("{} GGUF rope: {e}", path.display()))?;
+    if let Some(p) = profile {
+        let geom = p.geom;
+        let (_, hkv, hd) = spec.full_heads;
+        for (what, got, want) in [
+            ("hidden", spec.hidden, geom.hidden),
+            ("layers", spec.layer_types.len(), geom.n_layers),
+            ("kv_heads", hkv, geom.n_kv_heads),
+            ("head_dim", hd, geom.head_dim),
+            ("vocab", spec.vocab, geom.vocab),
+        ] {
+            if got != want {
+                return Err(format!(
+                    "{} 与 intent.model={:?} 不匹配:{what}={got} 期望 {want}",
+                    path.display(),
+                    p.key
+                ));
+            }
+        }
+    }
+    let mut note = format!(
+        "{} ✓ GGUF {} · hidden={} layers={}(full {}) kv_heads={} hd={} vocab={} · ctx={}{}",
+        path.display(),
+        rep.arch,
+        spec.hidden,
+        spec.layer_types.len(),
+        spec.layer_types.iter().filter(|f| **f).count(),
+        spec.full_heads.1,
+        spec.full_heads.2,
+        spec.vocab,
+        rf.max_pos,
+        if ctx > rf.max_pos {
+            format!("（runtime.max_seq={ctx} > 模型 ctx；需 YaRN）")
+        } else {
+            String::new()
+        }
+    );
+    if vision {
+        let mm = resolve_mmproj_path(path, mmproj).map_err(|e| e.to_string())?;
+        let mg = Gguf::open(&mm).map_err(|e| format!("打开 mmproj {} 失败: {e}", mm.display()))?;
+        let vcfg = owl_models::vlm::VlmCfg::from_gguf(&g, &mg, spec).map_err(|e| e.to_string())?;
+        note.push_str(&format!(
+            " · vision={}（塔 {} 层 / hidden {} / out {} / image_token {}）",
+            mm.display(),
+            vcfg.vision.depth,
+            vcfg.vision.hidden,
+            vcfg.vision.out_hidden,
+            vcfg.image_token
+        ));
+    } else if mmproj.is_some() {
+        return Err(format!(
+            "{}:[model].mmproj 已设置但 [model].vision = false（配置自相矛盾）",
+            path.display()
+        ));
+    }
+    Ok(note)
 }
 
 fn check_model_dir(

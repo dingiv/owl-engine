@@ -14,7 +14,7 @@ use std::sync::Arc;
 use owl_iface::contract::{DeviceClient, ModelError};
 use owl_models::layers::rope::Rope;
 use owl_models::model::ModelSpec;
-use owl_models::formats::load::{load_from_dir, LoadOpts};
+use owl_models::formats::load::{load_component, load_from_dir, LoadOpts};
 use owl_models::formats::spec::{SpecReport, SpecSource};
 use owl_models::formats::{load_tokenizer, qwen3_5_0_8b, qwen3_8_27b, Qwen35Convention};
 use owl_models::tokenizer::Tokenizer;
@@ -87,6 +87,8 @@ pub struct ModelLoader<'a, D: DeviceClient> {
     max_seq: usize,
     /// 视觉塔(`[model].vision`;false = 纯文本路径逐字节不变)
     vision: bool,
+    /// GGUF 视觉塔单文件(`[model].mmproj`;None = 同目录唯一候选)
+    mmproj: Option<std::path::PathBuf>,
     /// MTP 头覆盖路径(目录或 `.gguf`;None = 检查点自带)
     mtp_override: Option<std::path::PathBuf>,
 }
@@ -102,6 +104,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             rope: owl_shared::config::RopeCfg::default(),
             max_seq: 0,
             vision: false,
+            mmproj: None,
             mtp_override: None,
         }
     }
@@ -133,6 +136,13 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     /// 缺省 false = 纯文本路径逐字节不变。
     pub fn vision(mut self, on: bool) -> Self {
         self.vision = on;
+        self
+    }
+
+    /// **GGUF 视觉塔单文件**(`[model].mmproj`;None = 同目录唯一
+    /// `mmproj*.gguf`)。仅 GGUF 档消费;HF/AWQ 档写本键 = 响亮拒。
+    pub fn mmproj(mut self, p: Option<std::path::PathBuf>) -> Self {
+        self.mmproj = p;
         self
     }
 
@@ -212,6 +222,12 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         preset: ModelSpec,
         rope: (usize, f32, usize),
     ) -> Result<LoadedModel> {
+        if self.vision || self.mmproj.is_some() {
+            return Err(ModelError::Msg(
+                "load_qwen35_hf:通用 HF 档尚未接视觉塔（视觉塔请走 0.8B/27B/GGUF 专用装载器）"
+                    .into(),
+            ));
+        }
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&preset))?;
         log_spec_report("qwen35-hf", &rep);
         let spec = self.shard_spec(spec)?;
@@ -334,6 +350,11 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         );
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
+        // 视觉塔(GGUF):文本文件 + 同目录 mmproj(2026-10-21)。
+        // 必须在 `src` 仍持有文本容器时做(超参/占位 token 同源)。
+        let t_vis0 = std::time::Instant::now();
+        let vlm = self.load_vision_gguf(src.gguf(), &spec, &model, spec.dtype).await?;
+        let t_vis = t_vis0.elapsed();
         // MTP/NextN 头(2026-10-21):GGUF 单文件里 MTP 块 = `blk.<n>.nextn.*`
         // + 同块全解码层;n = 解码层数。存在 ⇒ 把**同一文件**作为 mtp_dir
         // 交给 spec_runtime 的 GGUF MTP 装载分支(单文件自给)。
@@ -347,13 +368,15 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             );
         }
         // 装载分相(启动时间是生产指标:哪一相贵要看得出来;测试档也上屏)
+        let t_end = t_open.elapsed();
         eprintln!(
-            "[gguf] 装载分相:容器+维度 {:.2}s + 计划/构造 {:.2}s + 权重 {:.2}s + 词表/rope {:.2}s = {:.2}s",
+            "[gguf] 装载分相:容器+维度 {:.2}s + 计划/构造 {:.2}s + 权重 {:.2}s + 视觉 {:.2}s + 词表/rope {:.2}s = {:.2}s",
             t_meta.as_secs_f32(),
             (t_plan - t_meta).as_secs_f32(),
             (t_load - t_plan).as_secs_f32(),
-            (t_open.elapsed() - t_load).as_secs_f32(),
-            t_open.elapsed().as_secs_f32()
+            t_vis.as_secs_f32(),
+            t_end.saturating_sub(t_load).saturating_sub(t_vis).as_secs_f32(),
+            t_end.as_secs_f32()
         );
         Ok(LoadedModel {
             model,
@@ -363,7 +386,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             // 逐张量计划(GGUF):单一值表达不了 ⇒ None(见字段文档)
             quant_plan: None,
             mtp_dir: self.mtp_override.clone().or(mtp_dir),
-            vlm: None,
+            vlm,
         })
     }
 
@@ -379,6 +402,12 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         model: &Arc<Model>,
         dtype: owl_iface::contract::Dtype,
     ) -> Result<Option<Arc<Vlm>>> {
+        if self.mmproj.is_some() {
+            return Err(ModelError::Msg(
+                "[model].mmproj 仅用于 kind = \"gguf\"：HF/AWQ 档的视觉塔权重在检查点目录的 model.visual.*"
+                    .into(),
+            ));
+        }
         if !self.vision {
             return Ok(None);
         }
@@ -406,6 +435,55 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             "视觉塔已装载(model.visual.*;塔权重每 rank 全量,文本主干共用)"
         );
         Ok(Some(Arc::new(vlm)))
+    }
+
+    /// **GGUF 视觉塔装载**(2026-10-21):文本 `.gguf` 只提供 text/mRoPE/词表,
+    /// 塔权重从同目录 `mmproj-*.gguf` 取。
+    ///
+    /// `mmproj` 显式路径优先;缺省 = 同目录 **唯一** 的 `mmproj*.gguf`
+    /// (多个候选/没有 = 响亮拒,避免静默装错量化档)。
+    async fn load_vision_gguf(
+        &mut self,
+        text: &owl_models::formats::gguf::Gguf,
+        text_spec: &ModelSpec,
+        model: &Arc<Model>,
+        dtype: owl_iface::contract::Dtype,
+    ) -> Result<Option<Arc<Vlm>>> {
+        if !self.vision {
+            if self.mmproj.is_some() {
+                return Err(ModelError::Msg(
+                    "[model].mmproj 已设置但 [model].vision = false（配置自相矛盾）".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        let path = self.resolve_mmproj(text.path.as_path())?;
+        let mm = owl_models::formats::gguf::Gguf::open(&path).map_err(|e| {
+            ModelError::Msg(format!("GGUF 视觉塔:打开 {} 失败: {e}", path.display()))
+        })?;
+        let vcfg = VlmCfg::from_gguf(text, &mm, text_spec.clone())?;
+        let tower = VisionTower::new(vcfg.vision);
+        let src = owl_models::formats::gguf::MmprojSource::from_gguf(mm)?;
+        let mut opts = LoadOpts::plain(dtype);
+        opts.shard = 1;
+        opts.slice_id = 0;
+        opts.debug_tap = self.load.debug_tap;
+        opts.verify = self.load.verify;
+        opts.staging_mb = self.load.staging_mb;
+        opts.dump = self.load.dump;
+        load_component(self.face, &tower, &src, opts).await?;
+        let vlm = Vlm::from_model(Arc::clone(model), tower, vcfg)?;
+        owl_shared::log_info!(
+            "boot",
+            "GGUF 视觉塔已装载:{}（塔权重每 rank 全量，文本主干共用）",
+            path.display()
+        );
+        Ok(Some(Arc::new(vlm)))
+    }
+
+    /// mmproj 路径解析:显式优先;缺省只在**同目录唯一候选**时自动选。
+    fn resolve_mmproj(&self, text_path: &Path) -> Result<std::path::PathBuf> {
+        owl_models::formats::gguf::resolve_mmproj_path(text_path, self.mmproj.as_deref())
     }
 
     /// Qwen3.5-0.8B(维度/键基座从**检查点**读:config.json 优先 + 形状
@@ -451,6 +529,11 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         if self.vision {
             return Err(ModelError::Msg(
                 "[model].vision = true:0.8B 档尚未接视觉塔(仅 27B AWQ 档)".into(),
+            ));
+        }
+        if self.mmproj.is_some() {
+            return Err(ModelError::Msg(
+                "[model].mmproj 仅用于 kind = \"gguf\"（0.8B-W4A16 档无 mmproj 路径）".into(),
             ));
         }
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_5_0_8b()))?;

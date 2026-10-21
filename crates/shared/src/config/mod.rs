@@ -63,6 +63,7 @@
 //! | model | quant | QuantScheme 枚举("w4a16"\|"w4a8")/ w4a16(主干量化方案;|
 //! |   |   | W4A8 = 权重 a8 布局 + per-token int8 激活 + kS8×kU4 GEMM) |
 //! | model | vision | bool / **false**(VLM 视觉塔:装载 `model.visual.*`;纯文本档勿开) |
+//! | model | mmproj | Option<PathBuf> / None(GGUF 档视觉塔 `mmproj-*.gguf`;缺省同目录唯一候选) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32")/ off(C1;|
 //! |   |   | 竖式/gate 质量门后转正) |
 //! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
@@ -411,8 +412,18 @@ pub struct ModelCfg {
     /// `config.json:vision_config` 的 `model.visual.*` 权重,引擎可走 VLM
     /// prefill 面。**缺省 false = 纯文本路径逐字节不变**;检查点无
     /// `vision_config` 而置 true = 装载期响亮拒。
+    ///
+    /// **GGUF 档**(2026-10-21):`true` 时装 `mmproj` 指向的视觉塔;
+    /// GGUF 主文件本身不含 `model.visual.*`。
     #[serde(default)]
     pub vision: bool,
+    /// **GGUF 视觉塔单文件**(`mmproj-*.gguf`;2026-10-21)。
+    ///
+    /// 仅 `kind = "gguf"` + `vision = true` 时使用;缺省 = 在同目录找
+    /// **唯一**的 `mmproj*.gguf`(多个/没有 ⇒ 装载期响亮拒并列出候选)。
+    /// HF/AWQ 档写本键 = 配置错误(视觉塔权重在检查点目录里)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmproj: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

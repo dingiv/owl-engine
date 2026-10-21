@@ -199,8 +199,18 @@ ls profiles/
 
 ## 7.1 视觉塔(`[model].vision`)
 
-- `[model] vision = true` ⇒ 装载检查点 `config.json:vision_config` 的
-  `model.visual.*`(27B AWQ 档;0.8B 响亮拒)。
+- **HF/AWQ 档**:`[model] vision = true` ⇒ 装载检查点 `config.json:vision_config`
+  的 `model.visual.*`(27B AWQ 档;0.8B 响亮拒)。
+- **GGUF 档**(2026-10-21):文本 `.gguf` 只带主干;`vision = true` 时用
+  `[model] mmproj = "…/mmproj-*.gguf"` 指向视觉塔。缺省会在 `model.dir`
+  同目录找**唯一** `mmproj*.gguf`;多个候选/没有 = 装载期响亮拒并列出候选。
+  视觉塔走 host 解量化(F16/F32/Q8_0… → F16),文本主干仍走 GGUF 零解量化
+  通道;patch_embd 的两个时间片按 HF `[out][in][t][p][p]` **按 in 通道交错**
+  还原(直接 concat = 静默错值)。
+  - `profiles/gguf4b-vlm.toml`(4B Q4_K_M + mmproj-F16,单卡 3090 Ti)
+  - `profiles/gguf27b-vlm.toml`(27B Q4_K_M + mmproj-Q8_0,单卡 3090 Ti)
+  - 把 `mmproj` 写到 HF/AWQ 档 = 响亮拒(塔权重在检查点目录);
+    `vision = false` 却写 `mmproj` 同样拒。
 - 视觉塔装载 + 引擎图像 prefill + **OpenAI `image_url` / Rust 预处理**已接
   (data URL;单图;TP2 两 rank 各备塔输出)。
 - **MTP 头投机**（`[spec] draft = "mtp"`，2026-10-21）：27B AWQ 检查点自带
@@ -215,8 +225,11 @@ ls profiles/
   **262k 全设备池 + 视觉 + d7** = `profiles/tp27b-3080-262k-vlm.toml`
   (单文件完整档;视觉塔算子由 `feat.vision` tag + 配置派生 TagFilter 自动放行,
   不再手抄 `allowed_ops`/`VISION_OPS`)。
-- `--check` 会检查 `vision_config`/`image_token_id` 并打 WARN;详见
-  `docs/arch/vision-引擎与服务面-接线-设计与施工.md`。
+- `--check` 的 HF/AWQ 分支检查 `vision_config`/`image_token_id`;GGUF 分支改读
+  文件 KV(arch/hidden/layers/kv_heads/head_dim/vocab/ctx)并打开 `mmproj`
+  校验塔层数/out_hidden/`<|image_pad|>` id。详见
+  `docs/arch/vision-引擎与服务面-接线-设计与施工.md` 与
+  `docs/arch/gguf-格式支持-设计与施工.md` §23.14。
 
 ## 8. 兼容与挂账
 
