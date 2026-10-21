@@ -381,6 +381,7 @@ impl Vlm {
             debug_tap: ctx.debug_tap,
             staging_mb: 128,
             dump: false,
+            gguf_dequant: false,
         };
         crate::formats::load::load_from_dir(dir, face, &vlm, opts).await?;
         Ok(vlm)

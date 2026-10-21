@@ -55,6 +55,9 @@ pub struct TpOpts {
     /// **v1 两核融合档**(§11.2;2026-10-19):AR 一核做完两段(只非 fp8 载荷)。
     /// 由入口显式传入(缺省关);两 rank 必须同档。
     pub ar_fused: bool,
+    /// **1-stage 对称 arena 档**(§35):结构更对但实测中性 ⇒ 缺省关。
+    /// 由入口显式传入(与 push 互斥),**不再读 `OWL_TP_1STAGE`**。
+    pub one_stage: bool,
 }
 
 /// staging 的双块与布局量(布局算术单源 = `owl_cuda::comm::ar::StagingLayout` ——
@@ -251,7 +254,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         // ── v1 范围护栏(响亮拒;分相纪律的边界)──────────────────────
         // ① 投机草稿:verify/fold/propose 族图与草稿 prefill extend 是**双 rank
         //    未接线面**(S6+);
-        // ② prefill 桶族:桶出图尾自带读数(与"入队半零同步"分相冲突);
+        // ② prefill 桶族已退役(2026-10-21),不再有该面。
         // ③ 读数类探针:prefill 入队半里的 dtoh/sync 会撞 AR 自旋(见 on_peer 契约)。
         let k = &cfg.knobs;
         if k.draft.depth != 0 && !k.draft.tp_draft {
@@ -261,9 +264,6 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
                  (草稿 spec/权重按本 rank 计划分片 + 草稿池几何按分片 hkv)",
                 k.draft.depth
             ));
-        }
-        if k.prefill_bucket != owl_shared::config::PrefillBucket::Off {
-            return loud("TP v1 不支持 prefill 桶族(桶出图尾自带读数;入队/收割分相未覆盖)");
         }
         let bad_probes: Vec<&str> = [
             ("prefill_cksum", k.probes.prefill_cksum),
@@ -343,7 +343,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
             .map_err(|e| ModelError::Msg(format!("TP rank1 装配失败:{e}")))?;
         // ── 装配后自证:warmup 的 AR 已**对称配对**(produced == consumed、err = 0)──
         for (i, dev) in [&dev0, &dev1].into_iter().enumerate() {
-            let Some(tp_ctx) = dev.tp.as_ref() else {
+            let Some(tp_ctx) = dev.boot.tp.as_ref() else {
                 return loud(format!("TP rank{i} 装配后无 TpCtx(装配路径错)"));
             };
             let Some(mut f) = dev.graphs.face_clone() else {
@@ -413,7 +413,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
 
     /// 本 rank 的分片 spec(形状单源)
     pub fn spec(&self, rank: usize) -> &ModelSpec {
-        &self.ranks[rank].dev.spec
+        &self.ranks[rank].dev.boot.spec
     }
 
     /// 本 rank 的 staging(own/peer 双块 + 布局量)
@@ -658,7 +658,7 @@ async fn retire_rank(
             ModelError::Msg(format!("{tag} 收尾:face 句柄耗尽,无法 PeerRelease")),
             &mut first,
         ),
-        Some(mut face) => match dev.tp.as_ref() {
+        Some(mut face) => match dev.boot.tp.as_ref() {
             None => note(
                 ModelError::Msg(format!("{tag} 收尾:无 TpCtx(非 TP 态?)")),
                 &mut first,
@@ -687,7 +687,7 @@ async fn retire_rank(
 /// 单 rank 的 staging 游标三元组(`(produced, consumed, err)`;见
 /// [`RunningEngine::tp_staging_state`])。
 async fn staging_state_of(dev: &mut RankDev<DeviceHandle<GpuClient>>) -> Result<(u64, u64, u32)> {
-    let Some(tp) = dev.tp.clone() else {
+    let Some(tp) = dev.boot.tp.clone() else {
         return loud("TP staging: 无 TpCtx(装配路径错)");
     };
     let Some(mut f) = dev.graphs.face_clone() else {
@@ -722,7 +722,7 @@ impl RunningEngine<DeviceHandle<GpuClient>> {
     ///
     /// 与 [`TpEngine::shutdown`] 的分工:后者是"装配后未进执行态"的收尾
     /// (rank 束 = `TpRank`),本函数是"跑过 turn 的执行态"的收尾
-    /// (rank 束 = `RankDev`,staging 句柄在 `dev.tp` 里 —— 同一笔分配)。
+    /// (rank 束 = `RankDev`,staging 句柄在 `dev.boot.tp` 里 —— 同一笔分配)。
     /// 非 TP 态(无 peer 束)⇒ **响亮拒**(收尾路径错,不是静默空跑)。
     pub async fn shutdown_tp(mut self) -> Result<()> {
         if self.peer.is_none() {
@@ -801,12 +801,12 @@ async fn handshake_staging(
     // 诊断面(2026-10-19):1-stage 的启用条件一次打全 —— 它是"融合核被走到"的
     // 唯一前提,而 §57 的教训正是"核写好了但一次没被走到"。
     eprintln!(
-        "[tp] 1-stage 启用判据:env OWL_TP_1STAGE={:?} · push={} ⇒ arena {}",
-        std::env::var("OWL_TP_1STAGE").ok(),
+        "[tp] 1-stage 启用判据:opts.one_stage={} · push={} ⇒ arena {}",
+        opts.one_stage,
         opts.push,
-        if one_stage_enabled() && !opts.push { "装配" } else { "不装(走 v1 两段)" }
+        if one_stage_enabled(&opts) && !opts.push { "装配" } else { "不装(走 v1 两段)" }
     );
-    let (arena0, arena1) = if one_stage_enabled() && !opts.push {
+    let (arena0, arena1) = if one_stage_enabled(&opts) && !opts.push {
         // 槽大小:按 staging 的 slot_bytes 会白占显存(0.8B 的 payload 只有 ~1MiB,
         // 而 SLOT_BYTES = 32MiB ⇒ 2 槽 = 64MiB/rank,实测在 3080 上直接
         // `cuMemSetAccess` OOM)。**上限 8MiB** —— 超出的载荷由 `eval::symmetric_out_slot`
@@ -895,8 +895,8 @@ fn query_bar1_bytes() -> Result<std::collections::HashMap<String, u64>> {
 ///
 /// 纪律:任何"结构更对但中性"的改动都该这样处置 —— **能力留在树里、默认走老的**,
 /// 直到有人量出它到底赚在哪(或亏在哪)。
-fn one_stage_enabled() -> bool {
-    matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"))
+fn one_stage_enabled(opts: &TpOpts) -> bool {
+    opts.one_stage
 }
 
 /// **1-stage 对称槽束握手**:每侧 **3 个独立块** —— 2 个 payload 槽(乒乓)+ 1 个 header。

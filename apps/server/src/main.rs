@@ -41,7 +41,14 @@ mod chat_tpl;
 mod config;
 mod debug;
 mod http;
+// `/debug/load` 内源灌流(服务面并发现场测量)
+mod load;
+// 每拍遥测单元(忙时也能读队列/容量;避免 actor 被诊断查询阻塞)
+mod telemetry;
 mod openai;
+// 会话闸(per-session serialization;合批档 `max_batch>1` 的前置契约)
+mod session_gate;
+// 视觉输入(主分支 V1–V5)
 mod vision_processor;
 // 三通道流式解析器(增量文本 → 思考/正文/工具调用;agent 服务面 §4.5)
 mod toolcall;
@@ -302,6 +309,8 @@ async fn main() {
     // 此处只留信息行。
     let gdn_slots = config.knobs.gdn_slots;
     let max_concurrency = config.max_concurrency;
+    // 合批上限([runtime] max_batch;早于引擎线程 move 出来 —— 后面告警/诊断要用)
+    let max_batch = config.max_batch;
     owl_shared::log_info!("boot", "并发上限 {max_concurrency}(GDN 格 {gdn_slots};本地服务,排队超出请求)"
     );
 
@@ -317,13 +326,17 @@ async fn main() {
     let (tx, rx) = mpsc::channel::<EngineReq>(CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let shutdown_actor = shutdown.clone();
+    // **遥测单元**（泵循环写、HTTP 读；忙时也不阻塞）—— 建在这里:
+    // 引擎线程与 HTTP 面共用（actor 先 spawn,故必须先于它创建）
+    let telemetry = telemetry::Telemetry::new();
+    let telemetry_actor = telemetry.clone();
     // 兜底网的**独立句柄**(闭包会把 shutdown_actor move 走 ⇒ 网里要用另一个)
     let shutdown_net = shutdown.clone();
     std::thread::Builder::new()
         .name("owl-engine".into())
         // **显式栈**(2026-10-17):缺省 2MiB 是 debug 档的暗雷 —— 27B + DFlash2
         // 草稿的装载/装配链在 debug 下帧深远超 release(实测
-        // `-p profiles/legacy/spec-dflash.toml testdata/args/e2e-27b.toml` 的 debug 二进制
+        // `-p profiles/spec-dflash.toml testdata/args/e2e-27b.toml` 的 debug 二进制
         // 在 DFlash2 草稿初始化处栈溢出 SIGABRT;`RUST_MIN_STACK=64M` 即复活)
         // ⇒ 本线程是**唯一**背全模型生命周期的线程,给足栈,别赌优化器。
         .stack_size(ENGINE_STACK_BYTES)
@@ -348,7 +361,14 @@ async fn main() {
             // 收摊(释放卡锁 + 有序退出)。本网只兜**设计外**的恐慌(索引越界、
             // 第三方库 unwrap 之类),且**走同一条优雅收摊**,不硬退、不冒烟退出。
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                rt.block_on(actor_main(config, rx, &ready_tx, dbg_face_actor, shutdown_actor));
+                rt.block_on(actor_main(
+                    config,
+                    rx,
+                    &ready_tx,
+                    dbg_face_actor,
+                    shutdown_actor,
+                    telemetry_actor,
+                ));
             }));
             if let Err(p) = r {
                 let what = panic_payload_str(&p);
@@ -398,6 +418,35 @@ async fn main() {
     // → 跨会话状态污染。不足即拒启(账外组合不静默)。
     // 并发闸门(permit = max_concurrency;在跑 + 排队 ≤ 上限,超出排队等待)
     let concurrency_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+    // **会话闸**(B5.1 服务面):同会话串行 / 跨会话并行。
+    // 引擎在 `max_batch > 1` 时对同会话并发**硬拒**(共享 KV/GDN = 结构性互踩),
+    // 契约是"上层按会话串行" —— 本闸就是那一层(详见 `session_gate` 模块头)。
+    let session_gates = std::sync::Arc::new(session_gate::SessionGates::new());
+    // 口径告警(不拒启:语义仍然正确,只是这类客户端拿不到合批收益)
+    if max_batch > 1 && !agent.implicit_session {
+        if max_batch < max_concurrency {
+            owl_shared::log_info!(
+                "boot",
+                "并发上限 {max_concurrency} > 合批上限 {max_batch} ⇒ 同时最多 {max_batch} 个 turn \
+                 在批内,其余在**引擎队列**排队(TTFT 拉长,吞吐不塌;用 /debug/load 可现场量)"
+            );
+        } else if max_batch > max_concurrency {
+            owl_shared::log_warn!(
+                "boot",
+                "合批上限 {max_batch} > 并发上限 {max_concurrency} ⇒ 批位闲置(服务面进不来那么多) \
+                 —— 想让批吃满,`server.max_concurrency` 应 ≥ `runtime.max_batch`"
+            );
+        }
+    }
+    if max_batch > 1 && agent.implicit_session {
+        owl_shared::log_warn!(
+            "boot",
+            "隐式会话开着(implicit_session=true)且 max_batch={} —— 无 session 键的请求\
+             全落会话 0 ⇒ 会被会话闸串行(合批无收益)。要合批:客户端带 session 键,\
+             或关 implicit_session",
+            max_batch
+        );
+    }
 
     let listener = TcpListener::bind(&bind).await.expect("bind");
     // 就绪横幅**恒输出**(不经级别门):默认级别 = warn 时前面一行不出,
@@ -420,6 +469,11 @@ async fn main() {
                     // keep-alive 下连接会长时间存活,连接级 permit =
                     // 空闲连接占死并发位)
                     gate: concurrency_gate.clone(),
+                    // 会话闸(同会话串行;跨会话并行)
+                    sessions: session_gates.clone(),
+                    // 遥测单元(每拍快照;HTTP 零等待读)
+                    telemetry: telemetry.clone(),
+                    max_concurrency,
                 };
                 tokio::spawn(async move {
                     if let Err(e) = serve(stream, ctx).await {
@@ -500,6 +554,7 @@ async fn actor_main(
     ready: &std::sync::mpsc::Sender<Result<String, String>>,
     dbg_face: DbgFace,
     shutdown: shutdown::Shutdown,
+    telemetry: std::sync::Arc<telemetry::Telemetry>,
 ) {
     let built: owl_engine::Result<_> = async {
         let t0 = std::time::Instant::now();
@@ -550,6 +605,10 @@ async fn actor_main(
                         push: config.tp_push,
                         ar_f8: config.tp_ar_f8,
                         ar_fused: config.tp_ar_fused,
+                        // 1-stage 对称 arena(§35):结构更对但实测中性 ⇒ 缺省关。
+                        // 挂账:尚无配置键(`runtime.tp_one_stage`),故恒 false
+                        // (与"env 未设"同效,行为与合并前一致)。
+                        one_stage: false,
                     },
                 )
                 .await?;
@@ -599,7 +658,7 @@ async fn actor_main(
     } else {
         owl_shared::log_info!("boot", "face 克隆不可用 ⇒ /debug/blocks 回 503(该后端不支持)");
     }
-    actor::run_actor(&mut running, rx, config.perf_dump.clone(), shutdown).await;
+    actor::run_actor(&mut running, rx, config.perf_dump.clone(), shutdown, telemetry).await;
 }
 
 /// panic 载荷 → 可读串(`&str` / `String` 两型覆盖 std 惯例;其余给个兜底)
@@ -627,6 +686,12 @@ struct ConnCtx {
     trace: std::sync::Arc<agent_trace::AgentTrace>,
     /// 并发闸门(G5④:**每请求**获取;在跑 + 排队 ≤ max_concurrency)
     gate: std::sync::Arc<tokio::sync::Semaphore>,
+    /// **会话闸**(B5.1:同会话串行 / 跨会话并行;`session_gate` 模块头)
+    sessions: std::sync::Arc<session_gate::SessionGates>,
+    /// 服务面并发上限(`server.max_concurrency`;`/debug/load` 按它校验)
+    max_concurrency: usize,
+    /// 每拍遥测(`/debug/queue`;忙时不阻塞)
+    telemetry: std::sync::Arc<telemetry::Telemetry>,
 }
 
 /// 单连接服务(**keep-alive 请求循环**;G5④)。
@@ -667,8 +732,14 @@ async fn serve(mut stream: tokio::net::TcpStream, ctx: ConnCtx) -> std::io::Resu
             .await?;
             return Ok(());
         }
-        // 并发闸门:permit 在本请求处理期间持有(G5④:从连接级改成请求级)
-        let _permit = ctx.gate.acquire().await;
+        // 并发闸门:permit 在本请求处理期间持有(G5④:从连接级改成请求级)。
+        // **聊天面例外**(2026-10-21,P0):permit 延后到 `chat` 里、**会话闸之后**
+        // 再取 —— 否则同会话的排队请求会占着全局 permit 把别家会话饿住。
+        let chat_route = req.method == "POST" && req.path == "/v1/chat/completions";
+        // 廉价只读面（不碰引擎/设备）：不吃 permit —— 否则排队/容量观测会被
+        // "并发位"自己挡住（实测 1.19s，等于等一个 turn 跑完）。
+        let cheap = matches!(req.path.as_str(), "/debug/queue" | "/health" | "/v1/models");
+        let _permit = if chat_route || cheap { None } else { Some(ctx.gate.acquire().await) };
         handle(&mut stream, &req, &ctx).await?;
         served += 1;
         if close_after || served >= MAX_REQUESTS_PER_CONN {
@@ -707,6 +778,58 @@ async fn handle(
                 &ctx.tpl,
                 &ctx.agent,
                 &ctx.trace,
+                &ctx.sessions,
+                &ctx.gate,
+            )
+            .await?;
+        }
+        // **队列/容量快照**(忙时也能读;见 `telemetry` 模块头)
+        ("GET", "/debug/queue") => {
+            let snap = ctx.telemetry.read();
+            http::respond_json(
+                &mut stream,
+                200,
+                &json!({
+                    "queue_len": snap.queue_len,
+                    "active": snap.active,
+                    "batch_steps": snap.batch_steps,
+                    "max_batch": snap.max_batch,
+                    "graph": snap.has_graph,
+                    "queued": snap.queued.iter().map(|(t, s, ms)| json!({
+                        "turn": t, "session": format!("{s:#x}"), "waited_ms": ms,
+                    })).collect::<Vec<_>>(),
+                    "rejects": snap.rejects.iter().map(|(s, code, n)| json!({
+                        "session": format!("{s:#x}"), "code": code, "count": n,
+                    })).collect::<Vec<_>>(),
+                    "wait_hist": {
+                        "lt_50ms": snap.wait_hist[0],
+                        "lt_200ms": snap.wait_hist[1],
+                        "lt_1s": snap.wait_hist[2],
+                        "lt_5s": snap.wait_hist[3],
+                        "ge_5s": snap.wait_hist[4],
+                    },
+                    "capacity": snap.capacity.map(|c| json!({
+                        "free_pages": c.free_pages,
+                        "cache_pages": c.cache_pages,
+                        "reserved_pages": c.reserved_pages,
+                        "usable_pages": c.usable_pages,
+                        "n_slots": c.n_slots,
+                        "n_mem": c.n_mem,
+                        "n_eff": c.n_eff,
+                    })),
+                }),
+            )
+            .await?;
+        }
+        // **内源灌流面**(服务面并发能力的现场测量;见 `load` 模块头)
+        ("POST", "/debug/load") => {
+            load::load(
+                &mut stream,
+                &req.body,
+                ctx.tx.clone(),
+                &ctx.tpl,
+                &ctx.agent,
+                ctx.max_concurrency,
             )
             .await?;
         }

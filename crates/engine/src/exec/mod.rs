@@ -14,6 +14,57 @@ use owl_models::TensorOps;
 use crate::graph_plan::f32b;
 use crate::scheduler::BeginPlan;
 
+/// **B4 降级探测周期上限**(tok):退避 ×2 后封顶,避免探针稀疏到失效。
+const DEGRADE_PROBE_MAX: usize = 512;
+
+/// **双 rank 镜像执行**(S6f):`dev` 必跑;`peer` 在场则**并发**跑同一动作。
+///
+/// 为什么是宏而不是对象:两边的 future 都**借用各自 rank 的 `&mut`** ——
+/// 用闭包传会撞上 `for<'a> FnOnce(&'a mut RankDev) -> Future<'a>` 的高阶
+/// 生命周期(只能靠 Box 表达,热路径不划算)。宏展开保持零开销,同时把
+/// **纪律**收进一处:两半**都**校验(`join2` 等另一半到底,吞错 = 挂住)、
+/// 错误先报 peer、单卡直跑零分支。
+///
+/// 用法(先拆借再调用,避免 `&mut self` 双借):
+/// ```ignore
+/// let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+/// mirror2!(dev, peer,
+///     d => d.pool.write_bt(d.graphs.session.face_mut(), &table),
+///     p => p.pool.write_bt(p.graphs.session.face_mut(), &table))
+/// ```
+macro_rules! mirror2 {
+    ($dev:expr, $peer:expr, $d:ident => $fd:expr, $p:ident => $fp:expr) => {{
+        match $peer {
+            None => {
+                let $d = $dev;
+                $fd.await
+            }
+            Some($p) => {
+                let $d = $dev;
+                let (r0, r1) = $crate::exec::join2($fd, $fp).await;
+                r1?;
+                r0
+            }
+        }
+    }};
+}
+
+pub(crate) use mirror2;
+
+/// **U32 位型走私**(引擎内唯一入口):把 u32 账以 f32 承载过线。
+///
+/// 池/表的数值面恒 f32(`bt`/`xqa_pt`/`fi_*` 同约定),页号/长度这些
+/// u32 只能**位型**过线;`from_bits` 与 `to_le_bytes` 两种编码都在这里,
+/// 不再各文件各写一个闭包。
+pub(crate) fn u32s_as_f32(v: &[u32]) -> Vec<f32> {
+    v.iter().map(|x| f32::from_bits(*x)).collect()
+}
+
+/// u32 → LE 字节(`TensorOps::from_host` 的 U32 表用)。
+pub(crate) fn u32s_le_bytes(v: &[u32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
 /// **手工 join 两 future**(S4 ⑤-K3):引擎 lib **不依赖 async 运行时/组合器**
 /// (只有 owl-* + half)—— 两 rank 的设备半必须**并发推进**(见
 /// `phases.rs` 的 TP 驱动注:单边先行会让对端的 AR 撞 5s 自旋超时)。
@@ -113,7 +164,7 @@ pub(crate) fn spec_degrade_transition(
     }
     let streak = streak + 1;
     if degraded {
-        (streak, true, (probe_every * 2).min(512))
+        (streak, true, (probe_every * 2).min(DEGRADE_PROBE_MAX))
     } else if threshold > 0 && streak >= threshold {
         (streak, true, probe_floor)
     } else {

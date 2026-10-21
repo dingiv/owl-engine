@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use owl_iface::contract::DeviceClient;
 use owl_models::layers::rope::Rope;
+use owl_shared::config::SpecDraft;
 
 use crate::Result;
 use owl_iface::contract::ModelError;
@@ -107,10 +108,14 @@ pub(crate) struct SpecRuntime {
 pub(crate) struct SpecBootInput<'a> {
     /// 投机深度原始值(0 = 关)
     pub(crate) depth_raw: usize,
+    /// 草稿族(auto/mtp/dflash2;配置显式选择)
+    pub(crate) family: SpecDraft,
     /// DFlash2 草稿检查点目录(None = 无该族草稿器)
     pub(crate) dflash2_dir: Option<&'a str>,
-    /// MTP 草稿检查点目录(检查点自带 mtp.* 时 Some)
+    /// MTP 草稿检查点目录 / GGUF 单文件(检查点自带 mtp.* 或 `blk.N.nextn.*` 时 Some)
     pub(crate) mtp_dir: Option<&'a std::path::Path>,
+    /// 主模型 spec(GGUF MTP 与 target 同维;路径档不读它)
+    pub(crate) spec: &'a owl_models::model::ModelSpec,
     /// 哑草稿诊断位(无真草稿器时的 Dumb 档)
     pub(crate) dumb: bool,
     /// 草稿池 e4m3(B6 偷显存;AL 有损需 A/B)
@@ -146,15 +151,38 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
 ) -> Result<SpecRuntime> {
     let mode = if inp.depth_raw == 0 {
         SpecMode::Off
-    } else if inp.dflash2_dir.is_some() {
-        SpecMode::DFlash2
-    } else if inp.mtp_dir.is_some() {
-        SpecMode::Mtp
-    } else if inp.dumb {
-        SpecMode::Dumb
     } else {
-        owl_shared::log_info!("boot", "OWL_SPEC_DEPTH>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
-        SpecMode::Off
+        match inp.family {
+            SpecDraft::Mtp => {
+                if inp.mtp_dir.is_none() {
+                    return Err(ModelError::Msg(
+                        "spec.draft = \"mtp\" 但当前检查点没有 mtp.* / blk.N.nextn.* 头(27B AWQ/带 MTP 的 GGUF 自带;0.8B/外部草稿档请用 dflash2)"
+                            .into(),
+                    ));
+                }
+                SpecMode::Mtp
+            }
+            SpecDraft::Dflash2 => {
+                if inp.dflash2_dir.is_none() {
+                    return Err(ModelError::Msg(
+                        "spec.draft = \"dflash2\" 但 model.dflash2_dir 为空".into(),
+                    ));
+                }
+                SpecMode::DFlash2
+            }
+            SpecDraft::Auto => {
+                if inp.dflash2_dir.is_some() {
+                    SpecMode::DFlash2
+                } else if inp.mtp_dir.is_some() {
+                    SpecMode::Mtp
+                } else if inp.dumb {
+                    SpecMode::Dumb
+                } else {
+                    owl_shared::log_info!("boot", "spec.depth>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
+                    SpecMode::Off
+                }
+            }
+        }
     };
     let depth = if mode == SpecMode::Off {
         0
@@ -181,20 +209,34 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     let drafter = match mode {
         SpecMode::Mtp => {
             let dir = inp.mtp_dir.ok_or_else(|| ModelError::EngineInvariant { what: "Mtp 模式缺 mtp_dir(模式裁决与输入不一致)".into() })?;
-            // 声明构造走起点事实(同一份 27B 检查点的 spec;报告已由主模型装载
-            // 路径上屏,此处不重报);装载走通用入口
-            let (spec, _rep) = owl_models::model::ModelSpec::from_ckpt(
-                std::path::Path::new(dir),
-                owl_models::formats::spec::SpecSource::family(
-                    &owl_models::formats::qwen35::qwen3_8_27b(),
-                ),
-            )?;
-            // P2.1-a:草稿与主干同 TpPlan(单卡 ⇒ `sharded` 恒等)
-            let spec = shard_draft_plan(spec, inp.tp)?;
-            let mtp = owl_models::layers::mtp::MtpPredictor::from_spec(&spec);
-            let opts = draft_load_opts(face, owl_models::contract::Dtype::F16, inp.tp, &inp.load);
-            owl_models::formats::load::load_from_dir(std::path::Path::new(dir), face, &mtp, opts).await?;
-            owl_shared::log_info!("boot", "MTP 草稿头装载(spec depth={depth})");
+            // MTP 头 = 检查点内 BF16 权重 / GGUF Q6_K 块,经装载源归一到 F16;
+            // 草稿池也按目标模型 dtype(F16)分配。**不是** BF16 草稿池。
+            draft_dt = owl_models::contract::Dtype::F16;
+            let is_gguf = dir.extension().and_then(|s| s.to_str()) == Some("gguf");
+            let spec = if is_gguf {
+                // GGUF 单文件:MTP 与 target 同维(同一 spec);块号 = 解码层数
+                shard_draft_plan(inp.spec.clone(), inp.tp)?
+            } else {
+                // 声明构造走起点事实(同一份 27B 检查点的 spec;报告已由主模型
+                // 装载路径上屏,此处不重报);装载走通用入口
+                let (spec, _rep) = owl_models::model::ModelSpec::from_ckpt(
+                    dir,
+                    owl_models::formats::spec::SpecSource::family(
+                        &owl_models::formats::qwen35::qwen3_8_27b(),
+                    ),
+                )?;
+                // P2.1-a:草稿与主干同 TpPlan(单卡 ⇒ `sharded` 恒等)
+                shard_draft_plan(spec, inp.tp)?
+            };
+            let mtp = if is_gguf {
+                owl_models::layers::mtp::MtpPredictor::from_spec_gguf(&spec, spec.layer_types.len())
+            } else {
+                owl_models::layers::mtp::MtpPredictor::from_spec(&spec)
+            };
+            let mut opts = draft_load_opts(face, owl_models::contract::Dtype::F16, inp.tp, &inp.load);
+            opts.gguf_dequant = is_gguf;
+            owl_models::formats::load::load_from_dir(dir, face, &mtp, opts).await?;
+            owl_shared::log_info!("boot", "MTP 草稿头装载(spec depth={depth};{})", if is_gguf { "GGUF" } else { "HF/AWQ" });
             Some(Drafter::Mtp(Arc::new(mtp)))
         }
         SpecMode::DFlash2 => {
@@ -305,8 +347,23 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         }
     }
     // 草稿池几何(**分片后**;P2.1-b):从检查点声明 + 本 rank 计划算(不再用写死的 const)
-    let (draft_geom, draft_env) = match (&drafter, inp.dflash2_dir) {
-        (Some(Drafter::DFlash2(_)), Some(_)) => {
+    let (draft_geom, draft_env) = match &drafter {
+        Some(Drafter::Mtp(_)) => {
+            // MTP 草稿链池 = F16 独立页池(StatePool 按 dims.dtype 分配)。
+            // env 必须同步成 F16/no-quant:生产主池是 fp8,沿用主 env 会让
+            // naive_attn 选 fp8 读核,与 F16 mtp 池错位(草稿全垃圾)。
+            let mut env = inp.base_env;
+            env.quant = owl_models::module::QuantPlan::F16;
+            env.kv.quant = owl_models::env::KvQuant::None;
+            env.kv.dtype = draft_dt;
+            // MTP extend(T=m+1≤4)在层内走 v2 伪序列臂:草稿池 F16、
+            // 每行一条 MTP 页链、长 ctx 下远比 chunked prefill 的
+            // per-query 全历史扫描便宜。只影响草稿 env,主 verify 仍按
+            // 自己的 dispatch.verify_v2/FI 档。
+            env.attn.verify_arm = owl_shared::config::VerifyArm::V2;
+            (None, env)
+        }
+        Some(Drafter::DFlash2(_)) => {
             // GGUF 草稿:几何已在开箱时定(不重开容器);HF:从 config + 本 rank 计划算
             let g = match draft_geom_raw {
                 Some((layers, hkv, hd, hq)) => {
@@ -334,6 +391,19 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                 owl_models::env::KvQuant::None
             };
             env.kv.dtype = draft_dt;
+            // **草稿权重 plan 是独立事实**:DFlash2 量化族 = W4A16(非 AWQ),
+            // 未量化族 = F16。若沿用主干的 W4A8 tag,草稿 `marlin_gemm_w4a16_*`
+            // 会在 picker 的 tag 过滤处被拒(2026-10-21 W4A8 组合实测)。
+            let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant {
+                what: "DFlash2 模式缺 dflash2_dir(draft env 构造)".into(),
+            })?;
+            env.quant = if owl_models::formats::qwen35::draft_is_quantized(
+                std::path::Path::new(dir),
+            )? {
+                owl_models::module::QuantPlan::W4A16
+            } else {
+                owl_models::module::QuantPlan::F16
+            };
             (Some((g.layers, g.hkv, g.hd)), env)
         }
         _ => (None, inp.base_env),

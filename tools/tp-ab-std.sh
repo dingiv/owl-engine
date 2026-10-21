@@ -14,7 +14,7 @@
 #   tools/tp-ab-std.sh tp2 --extra --ignore-eos   # `--extra` 之后原样转给 cli
 #
 # 口径纪律(**改任一条都会让两臂不可比**):
-#   · 档位几何/白名单在 flavor(`profiles/legacy/tp27b.toml` vs `awq27b.toml`);
+#   · 档位几何/白名单在 flavor(`profiles/awq27b.toml` vs `awq27b-3090-max.toml`);
 #     运行档 `testdata/args/bench-27b-tp{1,2}.toml` 只管模型路径与卡位;
 #   · **TP1 与 TP2 必须逐项同参** —— 唯一允许的差别 = rank 数(单卡 vs 双卡);
 #   · `--ignore-eos` = greedy 档跑满 256 tok(否则 OOD 词池下提前停 ⇒ decode 成伪影);

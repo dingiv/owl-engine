@@ -22,7 +22,7 @@ use crate::layers::embedding::Embedding;
 use crate::layers::linear::Linear;
 use crate::layers::rmsnorm::RmsNorm;
 use crate::layers::rope::Rope;
-use crate::module::{ForwardCtx, KvBuffers, Module, QuantPlan};
+use crate::module::{ForwardCtx, KvBuffers, Module, QuantPlan, SourceFacts};
 use crate::TensorOps;
 
 pub struct MtpPredictor {
@@ -37,6 +37,10 @@ pub struct MtpPredictor {
     pre_fc_norm_embedding: RmsNorm,
     norm: RmsNorm,
     hidden: usize,
+    /// GGUF 档:NextN 块号(`blk.<n>.nextn.*`;非 GGUF = 0)
+    gguf_block: usize,
+    /// 键面/装载口径是否 GGUF(源 = `blk.N.nextn.*`,host 解到 F16)
+    gguf: bool,
 }
 
 impl MtpPredictor {
@@ -52,6 +56,33 @@ impl MtpPredictor {
             pre_fc_norm_embedding: RmsNorm::new_add_one("pre_fc_norm_embedding", hidden, eps),
             norm: RmsNorm::new_add_one("norm", hidden, eps),
             hidden,
+            gguf_block: 0,
+            gguf: false,
+        }
+    }
+
+    /// **GGUF 档构造**(2026-10-21):MTP 头在 GGUF 单文件里是
+    /// `blk.<n>.nextn.*` + 一个全解码层(4B/27B 实测 Q8_0/Q6_K/Q4_K 混型)。
+    /// 键映射住 `formats::qwen35` 的 Loadable;权重由
+    /// `GgufDequantSource` 在 host 解成 f32 后装 F16(与 AWQ MTP 同执行 dtype)。
+    ///
+    /// norm 用 GGUF 源事实(`w_off = false`:文件里的 gamma 已烘焙 +1)。
+    pub fn new_gguf(hidden: usize, inter: usize, hq: usize, hkv: usize, hd: usize, eps: f32, block: usize) -> Self {
+        // GGUF MTP 头按 **F16 解量化**装载（与 AWQ MTP 同执行 dtype）：
+        // 权重类型逐角色不同（Q6_K/Q8_0/Q4_K），统一走 F16 避免给
+        // DecoderLayer 引入逐线性 plan；norm 用 GGUF 源事实（已 +1）。
+        let layer_plan = crate::module::PlanSource::from(QuantPlan::F16)
+            .with_facts(SourceFacts::GGUF);
+        Self {
+            fc_e: Linear::new("fc_e", hidden, hidden, QuantPlan::F16),
+            fc_h: Linear::new("fc_h", hidden, hidden, QuantPlan::F16),
+            layer: DecoderLayer::new_full(hq, hkv, hd, hidden, inter, eps, layer_plan),
+            pre_fc_norm_hidden: RmsNorm::new_by_facts("pre_fc_norm_hidden", hidden, eps, SourceFacts::GGUF),
+            pre_fc_norm_embedding: RmsNorm::new_by_facts("pre_fc_norm_embedding", hidden, eps, SourceFacts::GGUF),
+            norm: RmsNorm::new_by_facts("norm", hidden, eps, SourceFacts::GGUF),
+            hidden,
+            gguf_block: block,
+            gguf: true,
         }
     }
 
@@ -68,8 +99,29 @@ impl MtpPredictor {
         )
     }
 
+    /// **GGUF 档声明构造**(块号 = target 解码层数,即 NextN 块下标)。
+    pub fn from_spec_gguf(spec: &crate::model::ModelSpec, block: usize) -> Self {
+        Self::new_gguf(
+            spec.hidden,
+            spec.inter,
+            spec.full_heads.0,
+            spec.full_heads.1,
+            spec.full_heads.2,
+            spec.eps,
+            block,
+        )
+    }
+
     pub fn hidden(&self) -> usize {
         self.hidden
+    }
+
+    pub fn is_gguf(&self) -> bool {
+        self.gguf
+    }
+
+    pub fn gguf_block(&self) -> usize {
+        self.gguf_block
     }
 
     /// fc 路径:pre_fc_norm×2 → 双子 GEMM(y = We·e + Wh·h;W 列半拆
@@ -185,6 +237,8 @@ impl MtpPredictor {
         vocab: usize,
         env: crate::env::EnvProvider,
         attn_v2: Option<crate::module::AttnV2Scratch>,
+        extend_v2: Option<crate::module::AttnV2Scratch>,
+        extend_bt8: Option<&TensorOps>,
     ) -> TensorOps {
         let m1 = tokens.shape[0];
         assert_eq!(hiddens.shape[0], m1, "extend 行数 = token 数");
@@ -194,6 +248,11 @@ impl MtpPredictor {
         );
         ctx.env = env;
         ctx.seq_cu = Some(seq_cu);
+        // MTP extend 的 T=m+1 很小,但历史 KV 是全长:走 v2 伪序列臂
+        // (每行一条页链 + 在线 softmax),而不是 chunked prefill 的
+        // per-query 全历史扫描。scratch/页表由 engine 注入;None = 旧路。
+        ctx.attn_v2 = extend_v2;
+        ctx.v2_bt8 = extend_bt8;
         let emb = embed.embed(tokens, m1);
         let x = self.fc_path(&emb, hiddens, &ctx);
         let x = self.layer().forward(&x, &ctx);

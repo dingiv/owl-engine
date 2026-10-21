@@ -125,6 +125,13 @@ pub struct EngineKnobs {
     pub evict_policy: owl_store::EvictPolicyKind,
     /// **分析边界目标 ctx**(诊断;0 = 最后一个边界)。`[kvmem].analyze_at_ctx`。
     pub coverage_analyze_at: usize,
+    /// **方案对照档**(`OWL_SCHEME_PROBE`;诊断):多读一份 V + host 算 A/B/dense。
+    /// 入口面一次性解析(引擎内部零 env 读取)。
+    pub coverage_scheme_probe: bool,
+    /// 方案对照的最小 ctx(`OWL_SCHEME_MIN_CTX`;0 = 每个边界都算)
+    pub coverage_scheme_min_ctx: usize,
+    /// **重诊断步进**(`OWL_COV_ANALYZE_EVERY`;None = 每边界都诊断)
+    pub coverage_analyze_every: Option<usize>,
     /// **每 turn 工作集的对外事实(配置面)** —— `[kvmem].workspace_per_req`(token;
     /// 含 sink/recent 保底)。装配期由 [`derive_turn_ws`] 派生下面三件:
     /// `select_blocks`(召回预算块数)/ `dense_floor`(准入地板字节)/ 池下限里的每 turn 页数。
@@ -199,6 +206,16 @@ pub struct EngineKnobs {
     /// 剩余 ≤ `prefill_chunk + 本值` ⇒ 本步吃完(消灭与尺寸无关的固定宿主税
     /// ~250ms/chunk 的尾块;缺省 0 = 关 = 旧行为)。见 `scheduler::prefill_step_chunk`。
     pub prefill_tail_merge: usize,
+    /// 相位时间片(0 = 关;`[runtime] slice_every/slice_tokens`)
+    pub slice_every: usize,
+    pub slice_tokens: usize,
+    /// 准入三旋钮(`[runtime]`;见 `sched_policy::Limits`)
+    pub newcomer_min_tokens: usize,
+    pub min_gen_tokens: usize,
+    /// 池保留页(0 = 自动 `min(nb/64, 8)`)
+    pub reserve_pages: usize,
+    /// 等待队列上限(0 = 无界;超出 ⇒ 429 `no_slot`)
+    pub max_queue: usize,
     /// **末段页对齐**(前缀复用闭环,2026-10-19;`[pool] prefill_align_tail`,
     /// 缺省 **true**)。块边界快照只在**页对齐**处拍 ⇒ 单块档(整个 prompt 落进
     /// 一个 chunk)L4 会把尾端不对齐地一口吃完 ⇒ 一个快照都没有 ⇒ 下一轮全量
@@ -209,8 +226,6 @@ pub struct EngineKnobs {
     /// spec 轮提交跨过页边界 ⇒ 用 fold 把 GDN 态回卷到边界拍一张再卷回;
     /// 本键节流(`边界页号 % stride == 0` 才拍)。0 = 关(旧行为:生成相位不拍)。
     pub snap_decode_stride: usize,
-    /// **prefill 图档位**(P1;`[graph] prefill_bucket`;缺省 `off` = 今天行为)
-    pub prefill_bucket: owl_shared::config::PrefillBucket,
     /// **FI plan 图档瓦**(`[dispatch] fi_cuda_graph`;2026-10-18 图档单图立案):
     /// 开 ⇒ 形状对 ctx 全域恒定(可烘图的先决条件)。装配期经
     /// `owl_kernels::family::flashinfer::configure_plan_env` 投递给核。
@@ -220,7 +235,7 @@ pub struct EngineKnobs {
     /// **图自携 FI plan restore**(`[dispatch] fi_plan_restore`;缺省 true):
     /// true = 捕获窗内把本 plan 表烘成图内 memcpy(桶图旧行为);
     /// false = 图不烘表 ⇒ **host 是唯一权威**,每个图回放前窗外 `fi_plan_sync`
-    /// (decode/verify 既有;2026-10-19 起 prefill 桶也走这条)。
+    /// (decode/verify 既有;prefill 桶已退役,2026-10-21)。
     pub fi_plan_restore: bool,
     /// TS 探针槽(原 OWL_TS_PROBE)
     pub ts_probe: bool,
@@ -283,6 +298,9 @@ impl Default for EngineKnobs {
             index_probe: false,
             coverage_probe: false,
             coverage_analyze_at: 0,
+            coverage_scheme_probe: false,
+            coverage_scheme_min_ctx: 0,
+            coverage_analyze_every: None,
             select_decode: false,
             select_partial: false,
             evict_policy: owl_store::EvictPolicyKind::Lru,
@@ -297,9 +315,14 @@ impl Default for EngineKnobs {
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
             prefill_tail_merge: 0,
+            slice_every: 0,
+            slice_tokens: 0,
+            newcomer_min_tokens: 4096,
+            min_gen_tokens: 256,
+            reserve_pages: 0,
+            max_queue: 0,
             prefill_align_tail: true,
             snap_decode_stride: 1,
-            prefill_bucket: owl_shared::config::PrefillBucket::Off,
             fi_cuda_graph: false,
             fi_plan_bake: None,
             fi_plan_restore: true,
@@ -535,8 +558,10 @@ impl EngineKnobs {
             pool_cap_mb: cfg.pool.pool_cap_mb,
             draft: DraftCfg {
                 depth: cfg.spec.depth,
+                family: cfg.spec.draft,
                 dumb: cfg.spec.dumb,
                 dflash2_dir: cfg.model.dflash2_dir.clone(),
+                mtp_dir: cfg.model.mtp_dir.as_ref().map(std::path::PathBuf::from),
                 kv_quant: if cfg.spec.draft_kv_fp8 {
                     owl_models::env::KvQuant::Fp8E4M3
                 } else {
@@ -563,6 +588,11 @@ impl EngineKnobs {
             index_probe: cfg.kvmem.index || cfg.kvmem.select_decode,
             coverage_probe: cfg.kvmem.coverage_probe,
             coverage_analyze_at: cfg.kvmem.analyze_at_ctx,
+            // 诊断面的两个 env 旋钮在**入口**一次性收编(引擎内部零 env 读取)
+            coverage_scheme_probe: owl_shared::env_reader::flag("OWL_SCHEME_PROBE"),
+            coverage_scheme_min_ctx: owl_shared::env_reader::parse::<usize>("OWL_SCHEME_MIN_CTX")
+                .unwrap_or(0),
+            coverage_analyze_every: owl_shared::env_reader::parse::<usize>("OWL_COV_ANALYZE_EVERY"),
             select_decode: cfg.kvmem.select_decode,
             select_partial: cfg.kvmem.select_partial,
             evict_policy: Self::evict_policy_of(&cfg.kvmem),
@@ -592,7 +622,6 @@ impl EngineKnobs {
             // 只放 `dense_floor_of` 的三态占位。
             dense_floor: Self::dense_floor_of(&cfg.kvmem),
             no_graph: cfg.graph.no_graph,
-            prefill_bucket: cfg.graph.prefill_bucket,
             fi_cuda_graph: cfg.dispatch.fi_cuda_graph,
             // 哨兵:0 = 取 max_seq(FI 调度表的图档上界 = 单序列 ctx 的天然上界;
             // 这样档位改 max_seq 时上界跟着走,不必两处手改)
@@ -607,6 +636,12 @@ impl EngineKnobs {
             // 用户裁决 2026-10-19:引擎行为参数只许配置文件显式声明)
             max_batch: cfg.runtime.max_batch,
             prefill_tail_merge: cfg.runtime.prefill_tail_merge,
+            slice_every: cfg.runtime.slice_every,
+            slice_tokens: cfg.runtime.slice_tokens,
+            newcomer_min_tokens: cfg.runtime.newcomer_min_tokens,
+            min_gen_tokens: cfg.runtime.min_gen_tokens,
+            reserve_pages: cfg.runtime.reserve_pages,
+            max_queue: cfg.runtime.max_queue,
             prefill_align_tail: cfg.pool.prefill_align_tail,
             snap_decode_stride: cfg.pool.snap_decode_stride,
             // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)
@@ -632,10 +667,14 @@ impl EngineKnobs {
 pub struct DraftCfg {
     /// 投机深度(0 = off;上限 3 / DFlash2 7)
     pub depth: usize,
+    /// 草稿族(auto/mtp/dflash2;显式选择见 `SpecDraft`)
+    pub family: owl_shared::config::SpecDraft,
     /// 哑草稿诊断面(无草稿器时)
     pub dumb: bool,
     /// DFlash2 草稿检查点目录(⚠️ W4A16 量化家族 syvai 系)
     pub dflash2_dir: Option<String>,
+    /// MTP 头覆盖路径(目录或 `.gguf`;None = 检查点自带)
+    pub mtp_dir: Option<std::path::PathBuf>,
     /// 草稿池 KV 存储(None = f16;Fp8E4M3 = 偷显存档,原 draft_kv_fp8 布尔)
     pub kv_quant: owl_models::env::KvQuant,
     /// verify taps 退回 last_hidden(排查开关)
@@ -651,8 +690,10 @@ impl Default for DraftCfg {
         Self {
             tp_draft: false,
             depth: 0,
+            family: owl_shared::config::SpecDraft::Auto,
             dumb: false,
             dflash2_dir: None,
+            mtp_dir: None,
             kv_quant: owl_models::env::KvQuant::None,
             notaps: false,
             tapdecl: false,
@@ -736,9 +777,9 @@ fn assemble_budget(
         ));
     }
     let block_bytes = pool.block_bytes();
-    let page = pool.page.max(1);
-    let kv_pool = (pool.nb as u64).saturating_mul(block_bytes as u64);
-    let gdn_pool = (pool.gdn_slots as u64).saturating_mul(pool.gdn_row_bytes() as u64);
+    let page = pool.geom.page.max(1);
+    let kv_pool = (pool.geom.nb as u64).saturating_mul(block_bytes as u64);
+    let gdn_pool = (pool.geom.gdn_slots as u64).saturating_mul(pool.gdn_row_bytes() as u64);
     let snap_pool = pool.snapshot_pool_bytes() as u64;
     let draft_pool = pool.draft_pool_bytes() as u64;
     let weights = weights_bytes;
@@ -785,10 +826,10 @@ fn assemble_budget(
         mb(weights),
         mb(runtime_floor),
         mb(kv_pool),
-        pool.nb,
+        pool.geom.nb,
         block_bytes,
         pool.gdn_row_bytes() as f64 / 1048576.0,
-        pool.gdn_slots,
+        pool.geom.gdn_slots,
         mb(snap_pool),
         mb(draft_pool),
         mb(cfg.knobs.host_cache_mb as u64 * 1048576),
@@ -869,9 +910,6 @@ impl<D: DeviceClient + 'static> Engine<D> {
             v_card_bytes: owl_shared::vram::free_bytes(),
             live_at_new: owl_shared::vram::live_bytes(),
         };
-        // 注:`[graph] prefill_bucket` 的**真接线在 [`Self::run`]**(桶捕获需要
-        // 模型与状态池;静止点律 ⇒ 只在 boot 做)。此处不再拒启(2026-10-15
-        // M2b 落地;此前的"配了没实现就拒"临时门已被真接线取代)。
         let ledger_cell = owl_store::ledger_entry(&ledger);
         let face = DeviceHandle::new(face, Some(ledger_cell.clone()));
         Ok(Self { face, ledger, ledger_cell, cfg, boot })
@@ -905,6 +943,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
     /// `load` 旋钮来自配置(`[load]` 段;用户裁决 2026-10-19:不读 env)。
     pub fn loader(&mut self) -> ModelLoader<'_, DeviceHandle<D>> {
         ModelLoader::new(&mut self.face, self.cfg.knobs.load.clone())
+            .mtp_override(self.cfg.knobs.draft.mtp_dir.clone())
             .rope(self.cfg.knobs.rope.clone(), self.cfg.max_seq_tokens)
             .vision(self.cfg.knobs.vision)
     }
@@ -997,11 +1036,11 @@ pub(crate) fn into_running<D: DeviceClient>(
         let bank = {
             let mut b = crate::session::SessionBank::new(
                 crate::session::BankPlan {
-                    nb: dev.pool.nb,
-                    page: dev.pool.page,
+                    nb: dev.pool.geom.nb,
+                    page: dev.pool.geom.page,
                     block_bytes: dev.pool.block_bytes(),
                     mtp_block_bytes: dev.pool.mtp_block_bytes(),
-                    paged: dev.pool.paged,
+                    paged: dev.pool.geom.paged,
                     mtp: dev.spec_rt.mode == SpecMode::Mtp,
                     prefix_cache: cfg.knobs.prefix_cache,
                     cache_share_permille: (cfg.knobs.prefix_cache_share * 1000.0)
@@ -1038,17 +1077,17 @@ pub(crate) fn into_running<D: DeviceClient>(
             owl_shared::log_info!("store", "驱逐策略 = {}", b.rel.evict_policy_name());
             if cfg.knobs.index_probe {
                 // B 轴索引几何:层 = 全注意力层数,头 = KV 头数,dim = head_dim
-                b.rel.attach_index(dev.pool.dims.hd, dev.pool.kvs.len(), dev.pool.dims.hkv)?;
+                b.rel.attach_index(dev.pool.geom.dims.hd, dev.pool.kvs().len(), dev.pool.geom.dims.hkv)?;
                 owl_shared::log_info!(
                     "boot",
                     "选择层索引:采集开(dim={} 层={} KV 头={};每块 {}B)",
-                    dev.pool.dims.hd,
-                    dev.pool.kvs.len(),
-                    dev.pool.dims.hkv,
+                    dev.pool.geom.dims.hd,
+                    dev.pool.kvs().len(),
+                    dev.pool.geom.dims.hkv,
                     b.rel.index.as_ref().map(|i| i.block_bytes()).unwrap_or(0)
                 );
             }
-            if dev.pool.paged && dev.pool.snap_capacity() > 0 {
+            if dev.pool.geom.paged && dev.pool.snap_capacity() > 0 {
                 let epoch = b.rel.attach_snap_layout(dev.pool.snap_pool_layout(0))?;
                 if let Some(pr) = peer.as_ref() {
                     b.rel.attach_snap_layout_peer(pr.pool.snap_pool_layout(0))?;
@@ -1066,7 +1105,7 @@ pub(crate) fn into_running<D: DeviceClient>(
             // 全量预读会把启动拖垮)。大小不符/超预算/重复 = 隔离并逐条 WARN。
             if (cfg.knobs.disk_cache_mb + cfg.knobs.snap_disk_mb) > 0 && !cfg.knobs.disk_dir.is_empty()
             {
-                let snap_disk_bytes = if dev.pool.paged && dev.pool.snap_capacity() > 0 {
+                let snap_disk_bytes = if dev.pool.geom.paged && dev.pool.snap_capacity() > 0 {
                     cfg.knobs.snap_disk_mb << 20
                 } else {
                     0 // 没快照池 ⇒ 状态腿盘分片无意义(不许静默吃掉配额)
@@ -1186,59 +1225,100 @@ pub(crate) fn into_running<D: DeviceClient>(
             b
         };
 
-    Ok(RunningEngine {
+    let boot = crate::running::BootCtx {
         probes: cfg.knobs.probes,
         tok: tokenizer,
         cfg,
-        sched_acc_ns: 0,
-        sched_cnt: 0,
-        boot_seq: BOOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
+        seq: BOOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
+    };
+    Ok(RunningEngine {
+        boot,
         turns: crate::turn::TurnLedger::new(),
-        idle_pumps: 0,
-        last_trim: None,
-        degrade_seen: 0,
         bank,
+        sel: crate::select::SelectRuntime::default(),
+        hk: crate::housekeeping::Housekeeping::default(),
         dev,
         peer,
-        cov_pending: None,
-        cov_last: None,
-        sel_view: None,
-        batch_steps_n: 0,
-        select_view_steps: 0,
-        sel_view_fallback: 0,
-        stage: crate::running::StageStats::default(),
-        partial: crate::running::PartialStats::default(),
-        prof: crate::running::BAxisProfile::default(),
-        sel_keep: Vec::new(),
     })
+}
+
+/// **图族 face 数**(spec depth → 句柄数):fold/propose 桶形图各需 depth×2 个
+/// 独立 face,再加 2 个常驻面。单源 —— 原来这算式内联在装配点。
+fn fleet_faces(depth: usize) -> usize {
+    2 * depth.max(1) + 2
 }
 
 /// **rank 束**(S4 ⑤-K2/K3):一个 rank 的**全部**状态 —— 模型件 + 执行环境 +
 /// 运行态 + 状态池 + 图族。`Engine::run`(单卡)与 `TpEngine`(双 rank)
 /// 共用同一装配(`boot_rank`)与同一执行码(设备侧体 = 本类型的方法)。
+///
+/// # 结构(2026-10-21 S4:装载期事实 / 运行态两分)
+///
+/// 一个 rank 的状态其实有**两种寿命**:
+/// - [`RankBoot`]:装载期定型,之后**只读**(权重/rope/几何/环境/tp/视觉塔);
+/// - 运行态:池([`StatePool`])/ 图族([`GraphFleet`])/ spec 域([`SpecRuntime`]),
+///   它们会分配、捕获、回放、换页 —— 只有这三件需要 `&mut`。
+///
+/// 分开之后,"谁能改什么" 在签名上就看得见:设备侧方法拿 `&self` 只能读权重/环境,
+/// 要动设备资源必须显式 `&mut` 那三件。
 pub(crate) struct RankDev<D: DeviceClient> {
-    // ── 每 rank 的模型件(权重是分片的)──
+    /// 装载期事实(只读)
+    pub(crate) boot: RankBoot,
+    /// **当前求值相位**(`env.phase` 的可变部分)。
+    ///
+    /// 为什么单独立出来:整份 `EnvProvider` 只在 `phase` 上可变 —— 其余
+    /// (量化/硬件档/几何/分页)是 boot 期事实。把这一位提成显式字段后,
+    /// `env()` = 只读基座 + 本相位(值语义交给解释器),
+    /// 相位游标由 [`Self::set_phase`] 单点推进。
+    pub(crate) phase: owl_models::env::EvalPhase,
+    /// 状态块池(KV/GDN/快照;按 dims 分配)
+    pub(crate) pool: StatePool,
+    /// 图族(捕获完成 / eager 降级;每 rank 自成一族)
+    pub(crate) graphs: GraphFleet<D>,
+    /// 引擎级 spec 运行态(模式/深度/草稿器)
+    pub(crate) spec_rt: SpecRuntime,
+}
+
+/// **装载期定型、运行期只读**的 rank 事实(权重是分片的,每 rank 一份)。
+///
+/// 纪律:本结构的字段**任何运行期代码都不许写**(只能在 `boot_rank` 构造);
+/// 因此字段可直接读,不需要 setter —— 只读性由类型 + 构造点保证。
+pub(crate) struct RankBoot {
     /// 模型声明树
     pub(crate) model: Arc<Model>,
     /// rope 表(Replicate;每 rank 一份设备表)
     pub(crate) rope: Rope,
     /// **分片 spec**(形状单源;池与层同源)
     pub(crate) spec: ModelSpec,
-    // ── 执行环境与运行态 ──
-    /// 解释器执行环境(池量化/几何/硬件档已合入)
+    /// 解释器执行环境**基座**(相位除外;相位住 `RankDev::phase`)
     pub(crate) env: owl_models::env::EnvProvider,
-    /// 引擎级 spec 运行态(模式/深度/草稿器)
-    pub(crate) spec_rt: SpecRuntime,
     /// 张量并行上下文(本 rank 的;`None` = 单卡)—— 执行面所有求值调用
     /// 把它传给解释器(行并行 allreduce 注入靠它;装配期填入,烘进每张图)
     pub(crate) tp: Option<owl_models::module::TpCtx>,
-    /// 状态块池(KV/GDN/快照;按 dims 分配)
-    pub(crate) pool: StatePool,
-    /// 图族(捕获完成 / eager 降级;每 rank 自成一族)
-    pub(crate) graphs: GraphFleet<D>,
     /// **视觉塔装配**(`[model].vision`;Some = VLM)。塔是 prefill-only 的
     /// 额外权重;文本 `model` 与它是同一份 Arc(见 `Vlm::from_model`)。
     pub(crate) vlm: Option<std::sync::Arc<owl_models::vlm::Vlm>>,
+}
+
+impl<D: DeviceClient> RankDev<D> {
+    /// 当前求值环境 = boot 基座 + 本相位(**值语义**;直接交给解释器)。
+    ///
+    /// 为什么不返回 `&EnvProvider`:解释器吃的是按值传的 env(相位要在调用点
+    /// 定住,不随后续 `set_phase` 漂移)。
+    pub(crate) fn env(&self) -> owl_models::env::EnvProvider {
+        self.boot.env.with_phase(self.phase)
+    }
+
+    /// 当前相位(相位栈保存/恢复用)。
+    pub(crate) fn phase(&self) -> owl_models::env::EvalPhase {
+        self.phase
+    }
+
+    /// 推进相位游标(不碰图族 —— 图族相位由引擎 [`crate::RunningEngine`]
+    /// 同步推进;两处语义不同,不能隐式联动)。
+    pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
+        self.phase = p;
+    }
 }
 
 /// **rank 设备侧装配(唯实现)**:几何 → 环境 → spec 域 → KV 写者门 →
@@ -1247,6 +1327,471 @@ pub(crate) struct RankDev<D: DeviceClient> {
 /// `tp` = 张量并行上下文(**必须在图捕获之前**传入 —— 捕获期拒三个 `Peer*`
 /// 命令;staging 的 VMM 握手由调用方在更早完成,见 `tp.rs`)。
 #[allow(clippy::arc_with_non_send_sync)]
+/// **boot 配置定形门**(S6a;纯判据,任何设备动作之前)。
+///
+/// 这些组合一旦放进运行期才爆,现场都很难查(0.8B 桶门 IMA / 首个 verify
+/// 步越界 / 图档瓦与表内容不同构)。集中在这里 = 坏配置毫秒级拒。
+fn boot_knobs_check<D: DeviceClient>(
+    face: &mut DeviceHandle<D>,
+    cfg: &EngineConfig,
+    tp: Option<&owl_models::module::TpCtx>,
+) -> Result<()> {
+    // **FI plan 自携开关:引擎 = 配置持有者 ⇒ 装配期下发**(2026-10-19 桶门立案)。
+    //
+    // 双源曾分叉:引擎旋钮 `knobs.fi_plan_restore`(桶图用它决定"图自携 vs
+    // host 步前刷表")与后端 `DiagOpts.fi_plan_restore`(家族用它决定"窗内
+    // 烘不烘 restore 节点")各读各的。测试档只设前者 ⇒ 家族按 false 跑
+    // ⇒ **图里没有 restore 节点、引擎又不刷表** ⇒ 回放读到上一个 plan 的
+    // 调度表 ⇒ 0.8B 桶门 IMA(`q_indptr[5]` 越界)/错值。
+    // 单源 = 引擎旋钮(生产两处同源于 `[dispatch]`,行为不变;测试/直连档
+    // 以后者为准)。写点必须在**图族装配之前**(boot_rank 内)。
+    face.configure_fi_plan(cfg.knobs.fi_plan_restore, cfg.knobs.fi_cuda_graph)?;
+    // **合批档自洽门**(B5.1;2026-10-20):每会话一格 GDN + 单卡 AR 语义未审
+    if cfg.knobs.max_batch > 1 {
+        if tp.is_some() {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "[runtime] max_batch > 1 与 TP 不共戴天(AR 的批语义未审;先单卡)".into(),
+            ));
+        }
+        if cfg.knobs.max_batch > 8 {
+            return Err(owl_iface::contract::ModelError::Msg(format!(
+                "max_batch({}) > 8:逐行 token 输出走 Concat 8 槽",
+                cfg.knobs.max_batch
+            )));
+        }
+        if cfg.knobs.gdn_slots < cfg.knobs.max_batch {
+            return Err(owl_iface::contract::ModelError::Msg(format!(
+                "gdn_slots({}) < max_batch({})—— 合批每会话要一格 GDN 状态",
+                cfg.knobs.gdn_slots, cfg.knobs.max_batch
+            )));
+        }
+        if cfg.knobs.select_decode || cfg.knobs.select_partial {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "max_batch > 1 与选择层视图不共戴天(M1 页表按行铺)".into(),
+            ));
+        }
+    }
+    // **投机深度定形门**(2026-10-16):verify 块 = `depth + 1` 行,而首轮
+    // 拼接核的输入槽数是**声明面事实**(`CONCAT_ROWS_SLOTS` = 8)⇒ depth 超界
+    // 会在**首个 verify 步**才爆(且那时树已经 pad 到错槽数)。
+    // 放在**任何设备动作之前**(连草稿器都不加载)⇒ 坏配置毫秒级拒。
+    if cfg.knobs.draft.depth >= owl_models::kernel::CONCAT_ROWS_SLOTS {
+        return Err(owl_iface::contract::ModelError::Msg(format!(
+            "[spec] depth = {} 超界:verify 行数 = depth+1 必须 ≤ {}(首轮拼接槽数);\
+             请调小 depth(或关 spec 走 dumb 草稿)",
+            cfg.knobs.draft.depth,
+            owl_models::kernel::CONCAT_ROWS_SLOTS
+        )));
+    }
+    Ok(())
+}
+
+/// **每 turn 工作集派生 + 池下限校验 + 自证行**(S6a)。
+///
+/// 语义:配置只写 `workspace_per_req`(token),这里派生成三件(页/字节/召回 top-k),
+/// 再按"并发 × (工作集 + chunk) ≤ 池页数"校验(仅虚拟化档)。
+fn boot_pool_floor(
+    cfg: &mut EngineConfig,
+    pool: &StatePool,
+    s: usize,
+    plan_pool_tokens: usize,
+) -> Result<()> {
+    let cfg: &mut EngineConfig = cfg;
+    let page_bytes = pool.block_bytes().max(1);
+    let (ws_pages, ws_bytes) = EngineKnobs::derive_turn_ws(
+        cfg.knobs.workspace_per_req,
+        pool.geom.page,
+        page_bytes,
+        &mut cfg.knobs,
+    )?;
+    // chunk 增量页 / 每 turn 页 / 并发下限(与下面的池校验**同一批数**)
+    let keep_pages = cfg.knobs.select_sink + cfg.knobs.select_recent;
+    let chunk_pages = cfg.prefill_chunk.div_ceil(pool.geom.page.max(1)).max(1);
+    let per_turn = ws_pages.max(1) + chunk_pages;
+    let n_active = cfg.knobs.gdn_slots.max(1);
+    let need = per_turn * n_active;
+    let vm_on = cfg.knobs.kvmem_virtualization;
+    // **boot 自证行**(装配期无条件打):工作集口径与三件派生一次打全 ——
+    // 配置里只写 token,这一行告诉你它变成了几页/几字节/多少找回预算。
+    // 打印用 `eprintln!`(取证行惯例):`log_*` 宏在无 `log` feature 的
+    // 测试/探针构建里被**编译剔除**(`if false`)—— 自证行必须在探针里可见。
+    //
+    // 地板一列打**装配后的真值**(A7):非虚拟化档 = `Strict`,虚拟化档 =
+    // 工作集页数或显式 MiB 换来的页数 —— 不再拿 `ws_bytes` 冒充地板。
+    let floor_desc = match cfg.knobs.dense_floor {
+        owl_store::TurnFloor::Strict => "Strict(全 ctx 页)".to_string(),
+        owl_store::TurnFloor::Pages(n) => {
+            format!("{n} 页 = {} KiB/turn", (n * page_bytes) >> 10)
+        }
+    };
+    eprintln!(
+        "[turn-ws] 每 turn 工作集 = {} tok = {} 页 = {} KiB(页 {} tok / {} KiB)⇒ \
+         常驻 {} 块 = 保底 sink {} + recent {} + 召回 top-k {};准入地板 = {};\
+         池下限 = {} 并发 × (工作集 {} + chunk {} = {} 页) = {} 页(池 {} 页){}\
+         (改工作集只动 `[kvmem].workspace_per_req`;`select_blocks` 是派生量)",
+        cfg.knobs.workspace_per_req,
+        ws_pages,
+        ws_bytes >> 10,
+        pool.geom.page,
+        page_bytes >> 10,
+        ws_pages,
+        cfg.knobs.select_sink,
+        cfg.knobs.select_recent,
+        ws_pages - keep_pages,
+        floor_desc,
+        n_active,
+        ws_pages,
+        chunk_pages,
+        per_turn,
+        need,
+        pool.geom.nb,
+        if !vm_on {
+            "(非虚拟化档:不做池下限校验)"
+        } else if pool.geom.nb >= need {
+            " ✓"
+        } else {
+            " ✗"
+        }
+    );
+    if cfg.knobs.kvmem_virtualization {
+        if pool.geom.nb < need {
+            return Err(owl_iface::contract::ModelError::Msg(format!(
+                "boot: 设备池 {} 页装不下 {n_active} 并发 × {per_turn} 页 = {need} 页\
+                 (每 turn = workspace_per_req {} tok = {} 页 + chunk {chunk_pages} 页;\
+                  其中工作集由 sink {} + recent {} + top-k {} 组成);\
+                 pool_tokens={} page={} —— 调大池 / 减工作集 / 降 gdn_slots\
+                 (响亮拒:跑起来必 Exhausted)",
+                pool.geom.nb,
+                cfg.knobs.workspace_per_req,
+                ws_pages,
+                cfg.knobs.select_sink,
+                cfg.knobs.select_recent,
+                cfg.knobs.select_blocks,
+                plan_pool_tokens,
+                pool.geom.page
+            )));
+        }
+        // **准入地板缺省 = 本 turn 工作集页数**(不是 0 页!)
+        //
+        // 地板语义 = "本 turn 至少多少 KV **页**直接驻留设备"。并发档下若给 0,
+        // N 个 turn 会各自被无条件准入、然后互抢池 ⇒ 抖动;给工作集页数
+        // = "每个进来的 turn 都先留出它自己那套",与上面的池下限算式**同源**
+        // (同一套页数)。显式给了 `[kvmem].dense_floor_mib` 则尊重显式值。
+        // (两件都**已由 `derive_turn_ws` 按池页宽填好** —— 这里不再二次算式。)
+        let _ = ws_bytes;
+        owl_shared::log_warn!(
+            "boot",
+            "KVMem 虚拟化档:**池 = {} tok / {} 页** vs 上下文 {} tok / {} 页 ⇒ 超卖 {:.2}×;\
+             并发上限 {} × 每 turn {} 页(工作集 {} tok=sink{}+recent{}+top-k{} + chunk {}) = {need} 页;\
+             每页 {} KiB;准入地板 = {} / turn;宿主 {} MiB",
+            pool.geom.nb * pool.geom.page,
+            pool.geom.nb,
+            s,
+            s.div_ceil(pool.geom.page.max(1)),
+            s as f64 / (pool.geom.nb * pool.geom.page).max(1) as f64,
+            n_active,
+            per_turn,
+            cfg.knobs.workspace_per_req,
+            cfg.knobs.select_sink,
+            cfg.knobs.select_recent,
+            cfg.knobs.select_blocks,
+            chunk_pages,
+            page_bytes / 1024,
+            floor_desc,
+            cfg.knobs.host_cache_mb + cfg.knobs.snap_host_mb,
+        );
+    }
+    Ok(())
+}
+
+/// **装配后门**(S6a):依赖"图族已建"的组合检查。
+fn boot_post_check<D: DeviceClient>(
+    spec: &crate::spec_runtime::SpecRuntime,
+    graphs: &GraphFleet<D>,
+    model: &Model,
+) -> Result<()> {
+    // ── DFlash2 spec × 无 verify 图 = **boot 拒启**(2026-10-14 修)──
+    // DFlash2 的 verify 路径**硬依赖 verify 图**(taps 取自图的输出槽,
+    // 见 `exec/spec.rs`)。捕获失败 / `[graph] no_graph = true`(含
+    // eager 诊断档)下 verify 图 = None ⇒ 原行为是**首个 spec 轮
+    // panic**(`dflash 模式要求 verify 图(taps 输出)`)→ 引擎线程退役
+    // (实测:第二个请求收到「引擎退役」)。即"捕获失败 → eager 逃生"
+    // 这条路径对 DFlash2 既不可用、也**死得太晚**(跑到一半才炸)。
+    // ⇒ 收口为**装配期拒启**:要跑该档就显式 `[spec] depth = 0`
+    // 或 `[spec] notaps = true`(退 last_hidden,不需要图)。
+    // 注:`dflash_tap_count > 0` ⟺ (DFlash2 模式 && !notaps)。
+    if spec.mode == SpecMode::DFlash2
+        && spec.dflash_tap_count > 0
+        && graphs.verify.is_none()
+    {
+        return Err(owl_iface::contract::ModelError::Msg(
+            "DFlash2 spec 需要 verify 图(taps 输出),但本档未建图\
+             ([graph] no_graph = true 或捕获失败)。请二选一:去掉 no_graph,\
+             或显式关闭该档([spec] depth = 0;或 [spec] notaps = true 退 last_hidden)"
+                .to_string(),
+        ));
+    }
+
+    // ── 词表切 × 草稿档（DFlash2/MTP）= **boot 拒启**（P1.1 × P2.1，2026-10-19）──
+    // 两族的草稿头都**共享 target 的 lm_head**（`dflash2.rs` 的 propose /
+    // `mtp.rs` 的 `embed.lm_head_matmul`），且选择面按**全量 vocab** 索引
+    // （DFlash2 码本 [vocab, rank] / MTP argmax stride = vocab）⇒ 词表切档下
+    // 草稿 logits 只剩半表：候选塌到半词表。
+    // **实测**（3080 对，depth=7）：AL 2.4 → 1.4 ⇒ B4 降级把 spec 档拖到裸
+    // decode（**104 → 40 t/s**）。该组合的解 = 草稿选择面半表化（两 rank 各出
+    // 候选 + host 合并 + 码本行偏移）——**未施工** ⇒ 此档**响亮拒**
+    // （静默放行 = 用户跑出“投机失效”的黑盒）。
+    // dumb 草稿无头 ⇒ 不受影响；`depth = 0` ⇒ 无草稿档。
+    // ── 词表切 × 草稿档：**DFlash2 图档已支持 / 其余仍拒**（P1.1 × P2.1）──
+    // 两族的草稿头都**共享 target 的 lm_head**（`dflash2.rs` / `mtp.rs`），
+    // 选择面按**全量 vocab** 索引 ⇒ 切档后草稿 logits 只剩半表（实测
+    // AL 2.4→1.4 ⇒ 降级裸 decode 104→40 t/s）。
+    // **已解**：DFlash2 **图档** —— propose 图出半表 top-16 候选 + proj，
+    // host 合并两 rank 候选（rank1 id + half），rank0 跑 select（全表域）。
+    // **仍拒**：MTP（未做）/ DFlash2 无图（eager 降级档，未做）。
+    if matches!(spec.mode, SpecMode::DFlash2 | SpecMode::Mtp)
+        && model.logits_vocab() != model.vocab_size()
+    {
+        let dflash_graph_ok =
+            spec.mode == SpecMode::DFlash2 && graphs.dflash.is_some();
+        if !dflash_graph_ok {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "词表切(runtime.tp_vocab_split)与**本草稿档**不兼容：".to_string()
+                    + "草稿头共享 target lm_head ⇒ 切档后草稿 logits 只剩半表。\
+                       已解 = DFlash2 **图档**（需 `[graph] no_graph = false` 且捕获成功）；\
+                       未解 = MTP / DFlash2 eager 降级档。\
+                       请二选一：关 runtime.tp_vocab_split，或换到已解档。",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// **执行环境 + spec 域 + 选核快照 + KV 清单门**(S6a)。
+///
+/// 纪律:引擎 = 环境事实来源(硬件档/几何/量化都在这里合入),算子层零探测。
+async fn boot_env_and_spec<D: DeviceClient + 'static>(
+    face: &mut DeviceHandle<D>,
+    cfg: &EngineConfig,
+    rm: &RankModel,
+    tp: Option<&owl_models::module::TpCtx>,
+) -> Result<(
+    ModelDims,
+    owl_models::env::EnvProvider,
+    Option<owl_models::env::KvQuant>,
+    crate::spec_runtime::SpecRuntime,
+)> {
+    let (hq, hkv, hd) = rm.spec.full_heads;
+    let (nk, hk, nv, hv) = rm.spec.gdn_heads;
+    let dims = ModelDims {
+        hq, hkv, hd, nk, hk, nv, hv,
+        hidden: rm.spec.hidden,
+        dtype: rm.spec.dtype,
+    };
+
+    // 解释器执行环境(EnvProvider;E1.5 抽象):旋钮携带(入口经
+    // from_config 填充)+ 硬件档自 iface op_env 合入(被动律:引擎 = 环境事实来源)
+    let mut env = cfg.knobs.env;
+    if let Some(oe) = face.op_env() {
+        env.hw = owl_models::env::HwEnv::Cuda(oe.hw.arch);
+    }
+    // 模型几何事实合入(2026-10-13 P4:算子准入的几何门对账面)——
+    // 与 hw 同律:引擎 = 环境事实来源,算子层零探测
+    env.kv.head_dim = hd;
+    env.kv.grp = hq.checked_div(hkv).unwrap_or(0);
+    // 逐张量计划(GGUF)不注入单值 —— 计划的**真源**已在构造期烧进层容器
+    // (`PlanSource::Keyed`);此字段只服务"单一方案"档位的一致性/准入面。
+    if let Some(q) = rm.quant_plan {
+        env.quant = q;
+    }
+    // FI 面启用(量化恒 = 主池;影子池已删,本值只作"启用 + 池量化"携带)
+    // FI 面启用条件 = **能力条件**(f16 池 + paged 页表),不是开关:
+    // 2026-10-13 起配置面无 flashinfer 选项,FI 恒启用(env.attn.fi 仅门/诊断用)
+    let fi_quant = if env.attn.fi
+        && env.kv.paged
+        && rm.spec.dtype == owl_models::tensor::Dtype::F16
+    {
+        Some(env.kv.quant)
+    } else {
+        None
+    };
+
+    // spec 域装载(spec_runtime.rs:模式三态裁决 + 草稿器 + 草稿 rope;
+    // E5-M2b/C7 —— depth>0 且检查点有 mtp.* → Mtp;dumb 诊断位 → Dumb;
+    // 否则 Off 回落 DecodeBatch,无草稿器不白发 verify 税)
+    let mut spec = crate::spec_runtime::load_spec_runtime(
+        face,
+        SpecBootInput {
+            depth_raw: cfg.knobs.draft.depth,
+            family: cfg.knobs.draft.family,
+            dflash2_dir: cfg.knobs.draft.dflash2_dir.as_deref(),
+            mtp_dir: rm.mtp_dir.as_deref(),
+            spec: &rm.spec,
+            dumb: cfg.knobs.draft.dumb,
+            draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
+            // 草稿共享的 target 事实(GGUF 草稿声明校验 + 码本行数)
+            target: owl_models::formats::gguf::TargetFacts {
+                vocab: rm.spec.vocab,
+                layers: rm.spec.layer_types.len(),
+                hidden: rm.spec.hidden,
+            },
+            notaps: cfg.knobs.draft.notaps,
+            // P2.1-a:本 rank 的 TP 计划(单卡 = None ⇒ 旧行为)
+            tp: tp.as_ref().map(|c| c.plan),
+            load: cfg.knobs.load.clone(),
+            // 草稿环境基底(已合入目标几何/硬件档;草稿只覆盖 hd/grp)
+            base_env: env,
+        },
+    )
+    .await?;
+
+    // **KernelSelectionEnv 快照**(2026-10-20):boot 事实投影给 picker。
+    // 必须在此处冻结(硬件/几何/量化/spec 已定,池/图尚未分配);之后
+    // `EnvProvider::op_env()` 只读这份快照,不再从散字段重算。
+    let features = owl_models::kernel_env::FeatureCaps {
+        vision: cfg.knobs.vision,
+        spec_depth: spec.depth,
+        tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
+        head_int8: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt8Row,
+        head_int4: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt4G32,
+        main_kv: Some(owl_models::kernel_env::KvCaps::from_env(&env)),
+        draft_kv: (spec.depth > 0)
+            .then(|| owl_models::kernel_env::KvCaps::from_env(&spec.draft_env)),
+        tag_wildcard: cfg.knobs.tag_wildcard,
+    };
+    if let Some(k) = owl_models::kernel_env::KernelSelectionEnv::from_env(&env, features) {
+        owl_shared::log_info!("kernel-env", "target: {}", k.describe());
+        env.kernel_env = Some(k);
+    }
+    // 草稿有自己的几何(hd=128 / grp):快照必须从 draft_env 单独投影。
+    // MTP 复用标准 attention 核，其 F16 链池声明在 `kv.main.*`
+    // 命名空间（KnHD）；因此草稿快照的 main_kv 事实 = 草稿自己的 F16 池，
+    // 而不是 target 的 fp8 池。DFlash2 仍按草稿池 tag 走。
+    let mut draft_features = features;
+    if spec.mode == SpecMode::Mtp {
+        draft_features.main_kv =
+            Some(owl_models::kernel_env::KvCaps::from_env(&spec.draft_env));
+    }
+    if let Some(k) =
+        owl_models::kernel_env::KernelSelectionEnv::from_env(&spec.draft_env, draft_features)
+    {
+        owl_shared::log_info!("kernel-env", "draft:  {}", k.describe());
+        spec.draft_env.kernel_env = Some(k);
+    }
+
+    // B6.2:主 KV 池 fp8 承载(draft_kv_fp8 / kv.fp8 → env.kv.quant)
+    // KV 池清单门(收口律机器门;E1 2026-10-17 改为**声明面投影**):
+    // 期望集从每个算子的 `POOL` 声明(`池名/布局/dtype`)投影出来,逐个
+    // 核 `.cu` 源在场;缺声明/缺源 = 装配失败(池 dtype 改造漏网即启动
+    // 即拦,不等 E2E 红灯)。原手抄核名清单已删(新池核忘写清单 ⇒ 门
+    // 静默变窄的那种形状)。
+    owl_models::kernel::kv_manifest_gate(
+        owl_models::kernel::kv_pool_dtype(env.kv.quant, dims.dtype),
+        env.attn.fi,
+    )?;
+    if env.kv.quant == owl_models::env::KvQuant::Fp8E4M3 {
+        owl_shared::log_info!("boot", "KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
+    }
+
+    Ok((dims, env, fi_quant, spec))
+}
+
+/// **PoolPlan 构造**(S6a):把配置/spec/几何折成池的分配需求。
+fn boot_pool_plan(
+    cfg: &EngineConfig,
+    s: usize,
+    env: &owl_models::env::EnvProvider,
+    spec: &crate::spec_runtime::SpecRuntime,
+    fi_quant: Option<owl_models::env::KvQuant>,
+    tp: Option<&owl_models::module::TpCtx>,
+    live_baseline_per_card: u64,
+) -> crate::state::PoolPlan {
+    let pool_tokens = cfg.knobs.pool_tokens.unwrap_or(2 * s);
+    let plan = crate::state::PoolPlan {
+        seq_tokens: s,
+        pool_tokens,
+        // **锁①门控**:只有虚拟化真的开着(配置显式 `select_decode` +
+        // `select_partial`)才允许池小于上下文 —— 否则链超出池容量必
+        // `Exhausted`(无洞可停,即无选择层可挤)。
+        pool_overcommit: cfg.knobs.kvmem_virtualization,
+        kv: env.kv.quant,
+        fi_quant,
+        draft_kv: if cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3 {
+            owl_models::env::KvQuant::Fp8E4M3
+        } else {
+            owl_models::env::KvQuant::None
+        },
+        // P2.1-b:草稿池几何(**分片后**;来自草稿声明 + 本 rank 计划)
+        draft_geom: spec.draft_geom,
+        // 治理器按卡摊 `live`(TP2 下 LIVE 含两卡之和;2026-10-19 定谳)
+        tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
+        // 两 rank 共用的池前 live 基线(消除顺序记账)
+        live_baseline_per_card: Some(live_baseline_per_card),
+        // 草稿池 dtype 同源(量化族 BF16 / 未量化族 F16;见 spec_runtime::draft_dt)
+        draft_dt: spec.draft_dt,
+        spec_mode: spec.mode,
+        spec_depth: spec.depth,
+        xqa_verify: matches!(cfg.knobs.env.attn.verify_arm, owl_shared::config::VerifyArm::Xqa),
+        // B-3e-2:部分驻留档**不带 XQA**(页表语义不共戴;见上方醒目告知)
+        xqa_decode: matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
+            && !cfg.knobs.select_partial,
+        xqa_prefill: cfg.knobs.env.attn.xqa_prefill,
+        gdn_slots: cfg.knobs.gdn_slots,
+        max_batch: cfg.knobs.max_batch,
+        snap_max: cfg.knobs.snap_max,
+        vram_target: cfg.knobs.vram_target,
+        vram_reserve_mb: cfg.knobs.vram_reserve_mb,
+        dump_all: cfg.knobs.gdn_dump_all,
+        gdn_dbg: cfg.knobs.probes.gdn_dbg,
+        // B-2:选择层视图面(**生产档也要** —— 视图是 decode 的消费方;
+        // 与诊断面 `coverage_probe` 解耦)
+        select_view: cfg.knobs.coverage_probe || cfg.knobs.select_decode,
+    };
+    plan
+}
+
+/// **KVMem 前置校验**(S6a):虚拟化三件套的自洽门(响亮拒,不静默降级)。
+fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
+    // **B-3e-2 前置校验**(响亮拒,不许静默):
+    // ① 部分驻留会让会话链**出洞**(占位符)⇒ 必须有"懂洞"的消费方
+    //    (视图页表)⇒ `select_decode` 必开;
+    // ② XQA 裸 decode 臂的页表直接来自会话链(`xqa_pt_of`)⇒ 洞 = u32::MAX 当页号 =
+    //    ILLEGAL_ADDRESS(27B Stage2 实测)。本档**自动关 XQA 并响亮告知**。
+    // **下沉的前提 = 缓存树在场**(2026-10-19 实测定谳):
+    // 下沉机制 = "缓存树 + 会话双持(refs==2) → decref → 缓存独占 → 下沉";
+    // 而 `session.rs` 的 `cache_cap = if paged && prefix_cache { .. } else { 0 }`
+    // ⇒ **prefix_cache 关着 ⇒ 缓存树禁用 ⇒ `insert_inc` 返空 ⇒ 块永远 refs==1
+    // ⇒ 结构性不可沉**(实测:每 chunk 送 4 片、入树 0、下沉 0 块)。
+    // 不许静默:开了 partial 却没开 prefix_cache = 配置错,拒启。
+    if cfg.knobs.select_partial && !cfg.knobs.prefix_cache {
+        return Err(owl_iface::contract::ModelError::Msg(
+            "boot: `[kvmem].select_partial = true` 要求 `[pool].prefix_cache = true` \
+             —— 下沉靠「缓存树 + 会话双持」(refs==2)才能 decref 放给宿主;\
+             关着 prefix_cache ⇒ 缓存树 cap=0 ⇒ 块永远 refs==1 ⇒ **一块都沉不下去** \
+             (响亮拒:跑起来会白跑一趟还报 '不可沉 N 块')"
+                .into(),
+        ));
+    }
+    if cfg.knobs.select_partial && !cfg.knobs.select_decode {
+        owl_shared::log_error!(
+            "boot",
+            "OWL_SELECT_PARTIAL=1 需同时开 OWL_SELECT_DECODE=1(链上出洞后必须有视图消费方)—— 拒绝启动"
+        );
+        std::process::exit(2);
+    }
+    if cfg.knobs.select_partial
+        && matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
+    {
+        owl_shared::log_warn!(
+            "boot",
+            "部分驻留档:本档**关掉 XQA 裸 decode 臂**(其页表语义读整条会话链,遇占位符 = 非法地址;\n                    \
+             视图×XQA 的对接是挂账,不在此刀)—— 本档走 v2 分页 decode"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     mut face: DeviceHandle<D>,
     cfg: &mut EngineConfig,
@@ -1255,268 +1800,20 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     live_baseline_per_card: u64,
     t_run: std::time::Instant,
 ) -> Result<RankDev<DeviceHandle<D>>> {
-        // **FI plan 自携开关:引擎 = 配置持有者 ⇒ 装配期下发**(2026-10-19 桶门立案)。
-        //
-        // 双源曾分叉:引擎旋钮 `knobs.fi_plan_restore`(桶图用它决定"图自携 vs
-        // host 步前刷表")与后端 `DiagOpts.fi_plan_restore`(家族用它决定"窗内
-        // 烘不烘 restore 节点")各读各的。测试档只设前者 ⇒ 家族按 false 跑
-        // ⇒ **图里没有 restore 节点、引擎又不刷表** ⇒ 回放读到上一个 plan 的
-        // 调度表 ⇒ 0.8B 桶门 IMA(`q_indptr[5]` 越界)/错值。
-        // 单源 = 引擎旋钮(生产两处同源于 `[dispatch]`,行为不变;测试/直连档
-        // 以后者为准)。写点必须在**图族装配之前**(boot_rank 内)。
-        face.configure_fi_plan(cfg.knobs.fi_plan_restore, cfg.knobs.fi_cuda_graph)?;
-        // **合批档自洽门**(B5.1;2026-10-20):每会话一格 GDN + 单卡 AR 语义未审
-        if cfg.knobs.max_batch > 1 {
-            if tp.is_some() {
-                return Err(owl_iface::contract::ModelError::Msg(
-                    "[runtime] max_batch > 1 与 TP 不共戴天(AR 的批语义未审;先单卡)".into(),
-                ));
-            }
-            if cfg.knobs.max_batch > 8 {
-                return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "max_batch({}) > 8:逐行 token 输出走 Concat 8 槽",
-                    cfg.knobs.max_batch
-                )));
-            }
-            if cfg.knobs.gdn_slots < cfg.knobs.max_batch {
-                return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "gdn_slots({}) < max_batch({})—— 合批每会话要一格 GDN 状态",
-                    cfg.knobs.gdn_slots, cfg.knobs.max_batch
-                )));
-            }
-            if cfg.knobs.select_decode || cfg.knobs.select_partial {
-                return Err(owl_iface::contract::ModelError::Msg(
-                    "max_batch > 1 与选择层视图不共戴天(M1 页表按行铺)".into(),
-                ));
-            }
-        }
-        // **桶图 × FI plan 承载的定形门**(2026-10-19 桶门定谳):
-        // 桶图在捕获期按 `t_pad` 烘 FI 节点(plan 形状 + 表内容),而回放期
-        // `ctx = base + t` 可能 > `t_pad`(尾块)⇒ 只有"图档瓦(形状对 ctx 恒定)
-        // + 窗外刷表(内容对 ctx 精确)"这一组合同构才成立。
-        // - 图自携(restore=true):表内容 = 捕获期 ctx=t_pad 的那份 ⇒ 尾块读到
-        //   截断的 KV 覆盖(实测 0.8B:输出退化成"重复、重复…");
-        // - eager 瓦(cuda_graph=false):plan 形状随 ctx 跳变 ⇒ 图内烘的
-        //   offsets/padded/split 与窗外刷进去的表不同构(实测 IMA `q_indptr[5]`).
-        // 生产档(`[dispatch] fi_plan_restore=false` + `fi_cuda_graph=true`)本就满足;
-        // 这里把"凑巧"变成不变量(测试/直连档不许再走错组合)。
-        if cfg.knobs.prefill_bucket != owl_shared::config::PrefillBucket::Off {
-            if cfg.knobs.fi_plan_restore {
-                return Err(owl_iface::contract::ModelError::Msg(
-                    "prefill 桶图要求 `fi_plan_restore = false`(图不烘表,host 每桶回放前 \
-                     `fi_plan_sync` 刷精确表)—— 图自携的是捕获期 ctx=t_pad 的表,尾块\
-                     (ctx>t_pad)会读错 KV".into(),
-                ));
-            }
-            if !cfg.knobs.fi_cuda_graph {
-                return Err(owl_iface::contract::ModelError::Msg(
-                    "prefill 桶图要求 `fi_cuda_graph = true`(图档瓦让 plan 形状对 ctx \
-                     恒定)—— 否则图内烘的 offsets/padded/split 与窗外刷的表不同构".into(),
-                ));
-            }
-        }
-        // **投机深度定形门**(2026-10-16):verify 块 = `depth + 1` 行,而首轮
-        // 拼接核的输入槽数是**声明面事实**(`CONCAT_ROWS_SLOTS` = 8)⇒ depth 超界
-        // 会在**首个 verify 步**才爆(且那时树已经 pad 到错槽数)。
-        // 放在**任何设备动作之前**(连草稿器都不加载)⇒ 坏配置毫秒级拒。
-        if cfg.knobs.draft.depth >= owl_models::kernel::CONCAT_ROWS_SLOTS {
-            return Err(owl_iface::contract::ModelError::Msg(format!(
-                "[spec] depth = {} 超界:verify 行数 = depth+1 必须 ≤ {}(首轮拼接槽数);\
-                 请调小 depth(或关 spec 走 dumb 草稿)",
-                cfg.knobs.draft.depth,
-                owl_models::kernel::CONCAT_ROWS_SLOTS
-            )));
-        }
+        boot_knobs_check(&mut face, cfg, tp.as_ref())?;
         let s = cfg.max_seq_tokens;
-        let (hq, hkv, hd) = rm.spec.full_heads;
-        let (nk, hk, nv, hv) = rm.spec.gdn_heads;
         // ⚠️ **已知缺口(§18.5 挂账①)**:CPU/mock 档若要跑引擎真前向,
         // `dtype` 不能简单归一为 F32 —— `kv_paged_policy(dtype)` 与
         // attn v2 scratch 注入都以**模型 dtype** 为前提(F32 ⇒ 无分页策略
         // ⇒ 走 legacy v1 臂 ⇒ attention.rs 的退役 panic)。所需修法:
         // 让分页策略/scratch 与执行域 dtype 解耦(单独一刀),不在 mock 刀里扫。
-        let dims = ModelDims {
-            hq, hkv, hd, nk, hk, nv, hv,
-            hidden: rm.spec.hidden,
-            dtype: rm.spec.dtype,
-        };
-
-        // 解释器执行环境(EnvProvider;E1.5 抽象):旋钮携带(入口经
-        // from_config 填充)+ 硬件档自 iface op_env 合入(被动律:引擎 = 环境事实来源)
-        let mut env = cfg.knobs.env;
-        if let Some(oe) = face.op_env() {
-            env.hw = owl_models::env::HwEnv::Cuda(oe.hw.arch);
-        }
-        // 模型几何事实合入(2026-10-13 P4:算子准入的几何门对账面)——
-        // 与 hw 同律:引擎 = 环境事实来源,算子层零探测
-        env.kv.head_dim = hd;
-        env.kv.grp = hq.checked_div(hkv).unwrap_or(0);
-        // 逐张量计划(GGUF)不注入单值 —— 计划的**真源**已在构造期烧进层容器
-        // (`PlanSource::Keyed`);此字段只服务"单一方案"档位的一致性/准入面。
-        if let Some(q) = rm.quant_plan {
-            env.quant = q;
-        }
-        // FI 面启用(量化恒 = 主池;影子池已删,本值只作"启用 + 池量化"携带)
-        // FI 面启用条件 = **能力条件**(f16 池 + paged 页表),不是开关:
-        // 2026-10-13 起配置面无 flashinfer 选项,FI 恒启用(env.attn.fi 仅门/诊断用)
-        let fi_quant = if env.attn.fi
-            && env.kv.paged
-            && rm.spec.dtype == owl_models::tensor::Dtype::F16
-        {
-            Some(env.kv.quant)
-        } else {
-            None
-        };
-
-        // spec 域装载(spec_runtime.rs:模式三态裁决 + 草稿器 + 草稿 rope;
-        // E5-M2b/C7 —— depth>0 且检查点有 mtp.* → Mtp;dumb 诊断位 → Dumb;
-        // 否则 Off 回落 DecodeBatch,无草稿器不白发 verify 税)
-        let mut spec = crate::spec_runtime::load_spec_runtime(
-            &mut face,
-            SpecBootInput {
-                depth_raw: cfg.knobs.draft.depth,
-                dflash2_dir: cfg.knobs.draft.dflash2_dir.as_deref(),
-                mtp_dir: rm.mtp_dir.as_deref(),
-                dumb: cfg.knobs.draft.dumb,
-                draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
-                notaps: cfg.knobs.draft.notaps,
-                // P2.1-a:本 rank 的 TP 计划(单卡 = None ⇒ 旧行为)
-                tp: tp.as_ref().map(|c| c.plan),
-                load: cfg.knobs.load.clone(),
-                // 草稿环境基底(已合入目标几何/硬件档;草稿只覆盖 hd/grp)
-                base_env: env,
-                // 草稿共享的 target 事实(GGUF 草稿声明校验 + 码本行数)
-                target: owl_models::formats::gguf::TargetFacts {
-                    vocab: rm.spec.vocab,
-                    layers: rm.spec.layer_types.len(),
-                    hidden: rm.spec.hidden,
-                },
-            },
-        )
-        .await?;
-
-        // **KernelSelectionEnv 快照**(2026-10-20):boot 事实投影给 picker。
-        // 必须在此处冻结(硬件/几何/量化/spec 已定,池/图尚未分配);之后
-        // `EnvProvider::op_env()` 只读这份快照,不再从散字段重算。
-        let features = owl_models::kernel_env::FeatureCaps {
-            vision: cfg.knobs.vision,
-            spec_depth: spec.depth,
-            tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
-            head_int8: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt8Row,
-            main_kv: Some(owl_models::kernel_env::KvCaps::from_env(&env)),
-            draft_kv: (spec.depth > 0)
-                .then(|| owl_models::kernel_env::KvCaps::from_env(&spec.draft_env)),
-            tag_wildcard: cfg.knobs.tag_wildcard,
-        };
-        if let Some(k) = owl_models::kernel_env::KernelSelectionEnv::from_env(&env, features) {
-            owl_shared::log_info!("kernel-env", "target: {}", k.describe());
-            env.kernel_env = Some(k);
-        }
-        // 草稿有自己的几何(hd=128 / grp):快照必须从 draft_env 单独投影。
-        if let Some(k) =
-            owl_models::kernel_env::KernelSelectionEnv::from_env(&spec.draft_env, features)
-        {
-            owl_shared::log_info!("kernel-env", "draft:  {}", k.describe());
-            spec.draft_env.kernel_env = Some(k);
-        }
-
-        // B6.2:主 KV 池 fp8 承载(draft_kv_fp8 / kv.fp8 → env.kv.quant)
-        // KV 池清单门(收口律机器门;E1 2026-10-17 改为**声明面投影**):
-        // 期望集从每个算子的 `POOL` 声明(`池名/布局/dtype`)投影出来,逐个
-        // 核 `.cu` 源在场;缺声明/缺源 = 装配失败(池 dtype 改造漏网即启动
-        // 即拦,不等 E2E 红灯)。原手抄核名清单已删(新池核忘写清单 ⇒ 门
-        // 静默变窄的那种形状)。
-        owl_models::kernel::kv_manifest_gate(
-            owl_models::kernel::kv_pool_dtype(env.kv.quant, dims.dtype),
-            env.attn.fi,
-        )?;
-        if env.kv.quant == owl_models::env::KvQuant::Fp8E4M3 {
-            owl_shared::log_info!("boot", "KV 池 fp8 e4m3(容量减半/ctx 翻倍;读核 *_fp8 变体)");
-        }
-
+        let (dims, env, fi_quant, spec) =
+            boot_env_and_spec(&mut face, cfg, &rm, tp.as_ref()).await?;
         // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
         // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 E2b:
         // 默认 = 2 × 单会话容量(两会话满载共存),knobs.pool_tokens 覆写
-        let pool_tokens = cfg.knobs.pool_tokens.unwrap_or(2 * s);
-        let plan = crate::state::PoolPlan {
-            seq_tokens: s,
-            pool_tokens,
-            // **锁①门控**:只有虚拟化真的开着(配置显式 `select_decode` +
-            // `select_partial`)才允许池小于上下文 —— 否则链超出池容量必
-            // `Exhausted`(无洞可停,即无选择层可挤)。
-            pool_overcommit: cfg.knobs.kvmem_virtualization,
-            kv: env.kv.quant,
-            fi_quant,
-            draft_kv: if cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3 {
-                owl_models::env::KvQuant::Fp8E4M3
-            } else {
-                owl_models::env::KvQuant::None
-            },
-            // P2.1-b:草稿池几何(**分片后**;来自草稿声明 + 本 rank 计划)
-            draft_geom: spec.draft_geom,
-            // 治理器按卡摊 `live`(TP2 下 LIVE 含两卡之和;2026-10-19 定谳)
-            tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
-            // 两 rank 共用的池前 live 基线(消除顺序记账)
-            live_baseline_per_card: Some(live_baseline_per_card),
-            // 草稿池 dtype 同源(量化族 BF16 / 未量化族 F16;见 spec_runtime::draft_dt)
-            draft_dt: spec.draft_dt,
-            spec_mode: spec.mode,
-            spec_depth: spec.depth,
-            xqa_verify: matches!(cfg.knobs.env.attn.verify_arm, owl_shared::config::VerifyArm::Xqa),
-            // B-3e-2:部分驻留档**不带 XQA**(页表语义不共戴;见上方醒目告知)
-            xqa_decode: matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
-                && !cfg.knobs.select_partial,
-            xqa_prefill: cfg.knobs.env.attn.xqa_prefill,
-            gdn_slots: cfg.knobs.gdn_slots,
-            max_batch: cfg.knobs.max_batch,
-            snap_max: cfg.knobs.snap_max,
-            vram_target: cfg.knobs.vram_target,
-            vram_reserve_mb: cfg.knobs.vram_reserve_mb,
-            dump_all: cfg.knobs.gdn_dump_all,
-            // prefill 桶 padding 的 dump 页(M2b):档位非 off 才多分配那 1 页
-            prefill_dump_page: cfg.knobs.prefill_bucket
-                != owl_shared::config::PrefillBucket::Off,
-            gdn_dbg: cfg.knobs.probes.gdn_dbg,
-            // B-2:选择层视图面(**生产档也要** —— 视图是 decode 的消费方;
-            // 与诊断面 `coverage_probe` 解耦)
-            select_view: cfg.knobs.coverage_probe || cfg.knobs.select_decode,
-        };
-        // **B-3e-2 前置校验**(响亮拒,不许静默):
-        // ① 部分驻留会让会话链**出洞**(占位符)⇒ 必须有"懂洞"的消费方
-        //    (视图页表)⇒ `select_decode` 必开;
-        // ② XQA 裸 decode 臂的页表直接来自会话链(`xqa_pt_of`)⇒ 洞 = u32::MAX 当页号 =
-        //    ILLEGAL_ADDRESS(27B Stage2 实测)。本档**自动关 XQA 并响亮告知**。
-        // **下沉的前提 = 缓存树在场**(2026-10-19 实测定谳):
-        // 下沉机制 = "缓存树 + 会话双持(refs==2) → decref → 缓存独占 → 下沉";
-        // 而 `session.rs` 的 `cache_cap = if paged && prefix_cache { .. } else { 0 }`
-        // ⇒ **prefix_cache 关着 ⇒ 缓存树禁用 ⇒ `insert_inc` 返空 ⇒ 块永远 refs==1
-        // ⇒ 结构性不可沉**(实测:每 chunk 送 4 片、入树 0、下沉 0 块)。
-        // 不许静默:开了 partial 却没开 prefix_cache = 配置错,拒启。
-        if cfg.knobs.select_partial && !cfg.knobs.prefix_cache {
-            return Err(owl_iface::contract::ModelError::Msg(
-                "boot: `[kvmem].select_partial = true` 要求 `[pool].prefix_cache = true` \
-                 —— 下沉靠「缓存树 + 会话双持」(refs==2)才能 decref 放给宿主;\
-                 关着 prefix_cache ⇒ 缓存树 cap=0 ⇒ 块永远 refs==1 ⇒ **一块都沉不下去** \
-                 (响亮拒:跑起来会白跑一趟还报 '不可沉 N 块')"
-                    .into(),
-            ));
-        }
-        if cfg.knobs.select_partial && !cfg.knobs.select_decode {
-            owl_shared::log_error!(
-                "boot",
-                "OWL_SELECT_PARTIAL=1 需同时开 OWL_SELECT_DECODE=1(链上出洞后必须有视图消费方)—— 拒绝启动"
-            );
-            std::process::exit(2);
-        }
-        if cfg.knobs.select_partial
-            && matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
-        {
-            owl_shared::log_warn!(
-                "boot",
-                "部分驻留档:本档**关掉 XQA 裸 decode 臂**(其页表语义读整条会话链,遇占位符 = 非法地址;\n                    \
-                 视图×XQA 的对接是挂账,不在此刀)—— 本档走 v2 分页 decode"
-            );
-        }
+        let plan = boot_pool_plan(cfg, s, &env, &spec, fi_quant, tp.as_ref(), live_baseline_per_card);
+        boot_kvmem_check(cfg)?;
         // **池骨架 = `Pool` 类**(boot 相位;不加这个上下文就会落“未分类”桶 ——
         // 可见但无用)。作用域 RAII:块分配途中任何早退都会还原上下文。
         let pool = {
@@ -1526,7 +1823,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
 
         // **锁①:虚拟化档的池容量硬校验**(2026-10-19;响亮拒,不静默落空槽)。
         //
-        // 几何一律从**池实况**取(`pool.page`/`pool.nb`),不另算一份。
+        // 几何一律从**池实况**取(`pool.geom.page`/`pool.geom.nb`),不另算一份。
         //
         // # 下限的算式(为什么乘 N_active)
         //
@@ -1543,110 +1840,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // **每 turn 工作集派生**(唯一产地;对外一个 token 数 ⇒ 内部三件)。
         // 位置 = 装配期(页几何已知)、**与虚拟化档无关** —— 诊断档(只跑选择器
         // 读数)也要同一口径,否则配置写了 token 却被静默忽略。
-        let page_bytes = pool.block_bytes().max(1);
-        let (ws_pages, ws_bytes) = EngineKnobs::derive_turn_ws(
-            cfg.knobs.workspace_per_req,
-            pool.page,
-            page_bytes,
-            &mut cfg.knobs,
-        )?;
-        // chunk 增量页 / 每 turn 页 / 并发下限(与下面的池校验**同一批数**)
-        let keep_pages = cfg.knobs.select_sink + cfg.knobs.select_recent;
-        let chunk_pages = cfg.prefill_chunk.div_ceil(pool.page.max(1)).max(1);
-        let per_turn = ws_pages.max(1) + chunk_pages;
-        let n_active = cfg.knobs.gdn_slots.max(1);
-        let need = per_turn * n_active;
-        let vm_on = cfg.knobs.kvmem_virtualization;
-        // **boot 自证行**(装配期无条件打):工作集口径与三件派生一次打全 ——
-        // 配置里只写 token,这一行告诉你它变成了几页/几字节/多少找回预算。
-        // 打印用 `eprintln!`(取证行惯例):`log_*` 宏在无 `log` feature 的
-        // 测试/探针构建里被**编译剔除**(`if false`)—— 自证行必须在探针里可见。
-        //
-        // 地板一列打**装配后的真值**(A7):非虚拟化档 = `Strict`,虚拟化档 =
-        // 工作集页数或显式 MiB 换来的页数 —— 不再拿 `ws_bytes` 冒充地板。
-        let floor_desc = match cfg.knobs.dense_floor {
-            owl_store::TurnFloor::Strict => "Strict(全 ctx 页)".to_string(),
-            owl_store::TurnFloor::Pages(n) => {
-                format!("{n} 页 = {} KiB/turn", (n * page_bytes) >> 10)
-            }
-        };
-        eprintln!(
-            "[turn-ws] 每 turn 工作集 = {} tok = {} 页 = {} KiB(页 {} tok / {} KiB)⇒ \
-             常驻 {} 块 = 保底 sink {} + recent {} + 召回 top-k {};准入地板 = {};\
-             池下限 = {} 并发 × (工作集 {} + chunk {} = {} 页) = {} 页(池 {} 页){}\
-             (改工作集只动 `[kvmem].workspace_per_req`;`select_blocks` 是派生量)",
-            cfg.knobs.workspace_per_req,
-            ws_pages,
-            ws_bytes >> 10,
-            pool.page,
-            page_bytes >> 10,
-            ws_pages,
-            cfg.knobs.select_sink,
-            cfg.knobs.select_recent,
-            ws_pages - keep_pages,
-            floor_desc,
-            n_active,
-            ws_pages,
-            chunk_pages,
-            per_turn,
-            need,
-            pool.nb,
-            if !vm_on {
-                "(非虚拟化档:不做池下限校验)"
-            } else if pool.nb >= need {
-                " ✓"
-            } else {
-                " ✗"
-            }
-        );
-        if cfg.knobs.kvmem_virtualization {
-            if pool.nb < need {
-                return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "boot: 设备池 {} 页装不下 {n_active} 并发 × {per_turn} 页 = {need} 页\
-                     (每 turn = workspace_per_req {} tok = {} 页 + chunk {chunk_pages} 页;\
-                      其中工作集由 sink {} + recent {} + top-k {} 组成);\
-                     pool_tokens={} page={} —— 调大池 / 减工作集 / 降 gdn_slots\
-                     (响亮拒:跑起来必 Exhausted)",
-                    pool.nb,
-                    cfg.knobs.workspace_per_req,
-                    ws_pages,
-                    cfg.knobs.select_sink,
-                    cfg.knobs.select_recent,
-                    cfg.knobs.select_blocks,
-                    plan.pool_tokens,
-                    pool.page
-                )));
-            }
-            // **准入地板缺省 = 本 turn 工作集页数**(不是 0 页!)
-            //
-            // 地板语义 = "本 turn 至少多少 KV **页**直接驻留设备"。并发档下若给 0,
-            // N 个 turn 会各自被无条件准入、然后互抢池 ⇒ 抖动;给工作集页数
-            // = "每个进来的 turn 都先留出它自己那套",与上面的池下限算式**同源**
-            // (同一套页数)。显式给了 `[kvmem].dense_floor_mib` 则尊重显式值。
-            // (两件都**已由 `derive_turn_ws` 按池页宽填好** —— 这里不再二次算式。)
-            let _ = ws_bytes;
-            owl_shared::log_warn!(
-                "boot",
-                "KVMem 虚拟化档:**池 = {} tok / {} 页** vs 上下文 {} tok / {} 页 ⇒ 超卖 {:.2}×;\
-                 并发上限 {} × 每 turn {} 页(工作集 {} tok=sink{}+recent{}+top-k{} + chunk {}) = {need} 页;\
-                 每页 {} KiB;准入地板 = {} / turn;宿主 {} MiB",
-                pool.nb * pool.page,
-                pool.nb,
-                s,
-                s.div_ceil(pool.page.max(1)),
-                s as f64 / (pool.nb * pool.page).max(1) as f64,
-                n_active,
-                per_turn,
-                cfg.knobs.workspace_per_req,
-                cfg.knobs.select_sink,
-                cfg.knobs.select_recent,
-                cfg.knobs.select_blocks,
-                chunk_pages,
-                page_bytes / 1024,
-                floor_desc,
-                cfg.knobs.host_cache_mb + cfg.knobs.snap_host_mb,
-            );
-        }
+        boot_pool_floor(cfg, &pool, s, plan.pool_tokens)?;
         if let Some(q) = fi_quant {
             owl_shared::log_info!("boot", "FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
                 q
@@ -1659,7 +1853,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         let vface = face.face_clone();
         // E5-M5:fold/propose 桶形图族的 face 句柄(depth × 2)
         let extra_faces: Vec<DeviceHandle<D>> =
-            (0..2 * spec.depth.max(1) + 2).filter_map(|_| face.face_clone()).collect();
+            (0..fleet_faces(spec.depth)).filter_map(|_| face.face_clone()).collect();
         let graphs = GraphFleet::assemble(
             face,
             vface,
@@ -1682,71 +1876,19 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 此刻固定面全部落位(权重 + 池 + 图 slab + 表件)⇒ 实测数字齐;
         // 装配失败 = 拒绝启动(A5.1:没有数字的项不许进预算式)。
 
-        // ── DFlash2 spec × 无 verify 图 = **boot 拒启**(2026-10-14 修)──
-        // DFlash2 的 verify 路径**硬依赖 verify 图**(taps 取自图的输出槽,
-        // 见 `exec/spec.rs`)。捕获失败 / `[graph] no_graph = true`(含
-        // eager 诊断档)下 verify 图 = None ⇒ 原行为是**首个 spec 轮
-        // panic**(`dflash 模式要求 verify 图(taps 输出)`)→ 引擎线程退役
-        // (实测:第二个请求收到「引擎退役」)。即"捕获失败 → eager 逃生"
-        // 这条路径对 DFlash2 既不可用、也**死得太晚**(跑到一半才炸)。
-        // ⇒ 收口为**装配期拒启**:要跑该档就显式 `[spec] depth = 0`
-        // 或 `[spec] notaps = true`(退 last_hidden,不需要图)。
-        // 注:`dflash_tap_count > 0` ⟺ (DFlash2 模式 && !notaps)。
-        if spec.mode == SpecMode::DFlash2
-            && spec.dflash_tap_count > 0
-            && graphs.verify.is_none()
-        {
-            return Err(owl_iface::contract::ModelError::Msg(
-                "DFlash2 spec 需要 verify 图(taps 输出),但本档未建图\
-                 ([graph] no_graph = true 或捕获失败)。请二选一:去掉 no_graph,\
-                 或显式关闭该档([spec] depth = 0;或 [spec] notaps = true 退 last_hidden)"
-                    .to_string(),
-            ));
-        }
-
-        // ── 词表切 × 草稿档（DFlash2/MTP）= **boot 拒启**（P1.1 × P2.1，2026-10-19）──
-        // 两族的草稿头都**共享 target 的 lm_head**（`dflash2.rs` 的 propose /
-        // `mtp.rs` 的 `embed.lm_head_matmul`），且选择面按**全量 vocab** 索引
-        // （DFlash2 码本 [vocab, rank] / MTP argmax stride = vocab）⇒ 词表切档下
-        // 草稿 logits 只剩半表：候选塌到半词表。
-        // **实测**（3080 对，depth=7）：AL 2.4 → 1.4 ⇒ B4 降级把 spec 档拖到裸
-        // decode（**104 → 40 t/s**）。该组合的解 = 草稿选择面半表化（两 rank 各出
-        // 候选 + host 合并 + 码本行偏移）——**未施工** ⇒ 此档**响亮拒**
-        // （静默放行 = 用户跑出“投机失效”的黑盒）。
-        // dumb 草稿无头 ⇒ 不受影响；`depth = 0` ⇒ 无草稿档。
-        // ── 词表切 × 草稿档：**DFlash2 图档已支持 / 其余仍拒**（P1.1 × P2.1）──
-        // 两族的草稿头都**共享 target 的 lm_head**（`dflash2.rs` / `mtp.rs`），
-        // 选择面按**全量 vocab** 索引 ⇒ 切档后草稿 logits 只剩半表（实测
-        // AL 2.4→1.4 ⇒ 降级裸 decode 104→40 t/s）。
-        // **已解**：DFlash2 **图档** —— propose 图出半表 top-16 候选 + proj，
-        // host 合并两 rank 候选（rank1 id + half），rank0 跑 select（全表域）。
-        // **仍拒**：MTP（未做）/ DFlash2 无图（eager 降级档，未做）。
-        if matches!(spec.mode, SpecMode::DFlash2 | SpecMode::Mtp)
-            && rm.model.logits_vocab() != rm.model.vocab_size()
-        {
-            let dflash_graph_ok =
-                spec.mode == SpecMode::DFlash2 && graphs.dflash.is_some();
-            if !dflash_graph_ok {
-                return Err(owl_iface::contract::ModelError::Msg(
-                    "词表切(runtime.tp_vocab_split)与**本草稿档**不兼容：".to_string()
-                        + "草稿头共享 target lm_head ⇒ 切档后草稿 logits 只剩半表。\
-                           已解 = DFlash2 **图档**（需 `[graph] no_graph = false` 且捕获成功）；\
-                           未解 = MTP / DFlash2 eager 降级档。\
-                           请二选一：关 runtime.tp_vocab_split，或换到已解档。",
-                ));
-            }
-        }
-
+        boot_post_check(&spec, &graphs, &rm.model)?;
+    let boot_env = env;
     Ok(RankDev {
-        vlm: rm.vlm,
-        model: rm.model,
-        rope: rm.rope,
-        spec: rm.spec,
-        env,
+        boot: RankBoot {
+            vlm: rm.vlm,
+            model: rm.model,
+            rope: rm.rope,
+            spec: rm.spec,
+            env: boot_env,
+            tp,
+        },
+        phase: boot_env.phase,
         spec_rt: spec,
-        tp,
         pool,
         graphs,
-    })
-}
-
+    })}

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use owl_shared::config::{OwlConfig, ResolvedConfig};
+use owl_shared::config::{OwlConfig, ResolvedConfig, SpecDraft};
 pub use owl_shared::config::ModelKind;
 
 // ── app 面缺省(总账外的 server 组装缺省;R2 命名常量)──
@@ -306,6 +306,9 @@ pub struct ServerConfig {
     pub quant: owl_shared::config::QuantScheme,
     /// 最大并发请求(server.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
     pub max_concurrency: usize,
+    /// **合批上限**([runtime] max_batch;1 = 串行现状)。服务面用它做两件事:
+    /// 会话闸的配套告警(隐式会话 + 合批 ⇒ 串行)与 `/debug/vram` 的如实报数。
+    pub max_batch: usize,
     /// **TP 通信数据腿:push 档**(runtime.tp_push;2026-10-18 §36.6)⇒ 交 `TpOpts`
     pub tp_push: bool,
     /// **TP AR 载荷 fp8 档**（runtime.tp_ar_f8；§47 第二步）⇒ 交 `TpOpts.ar_f8`
@@ -348,12 +351,9 @@ impl ServerConfig {
             layers.push(p);
         }
         let mut resolved =
-            OwlConfig::load_resolved(base.as_deref(), &layers, &args.overrides())?;
+            OwlConfig::load_resolved(base, &layers, &args.overrides())?;
         if let Some(m) = resolved.meta.as_mut() {
-            m.intent.profile = args
-                .profile
-                .as_ref()
-                .map(|p| p.display().to_string());
+            m.intent.profile = base.map(|p| p.display().to_string());
         }
         Ok(resolved)
     }
@@ -425,6 +425,7 @@ impl ServerConfig {
             tp_vocab_split: cfg.runtime.tp_vocab_split,
             tp_ar_fused: cfg.runtime.tp_ar_fused,
             max_concurrency: cfg.server.max_concurrency,
+            max_batch: cfg.runtime.max_batch,
             perf_dump: None,
             perf_level: cfg.probes.perf_level.to_u8(),
             log: cfg.log,
@@ -474,6 +475,21 @@ fn vram_free_ratio_map() -> Option<std::collections::HashMap<String, f64>> {
 /// **选卡总入口**:两条规范互斥 —— `runtime.tp_ordinals` 给值 ⇒ TP 双卡档
 /// (零自动挑卡);不给 ⇒ 单卡档(声明式选卡/自动挑空闲)。
 fn resolve_devices(rt: &owl_shared::config::RuntimeCfg) -> Result<Devices, String> {
+    // **卡位必须显式**(2026-10-21 用户裁决):不再自动挑"任意空闲卡" ——
+    // 自动挑卡随当下占用漂移,同一份配置在不同时刻会落到不同卡上(生产不可复现)。
+    // 允许的三种写法(互斥由后面的分支校验):
+    //   runtime.tp_ordinals = [a, b]      TP 双卡
+    //   [runtime.device] bdf/uuid/find_name   单卡(声明式选卡只在**已给规格**内挑)
+    //   runtime.device_ordinal = N        测试/特殊场景
+    if rt.tp_ordinals.is_none() && rt.device.is_empty() && rt.device_ordinal.is_none() {
+        return Err(
+            "选卡未指定:必须显式给 `runtime.tp_ordinals = [a, b]`(TP 双卡)或 \
+             `[runtime.device] bdf/uuid/find_name`(单卡)。\n\
+             卡位是启动参数,不再自动挑空闲卡 —— 用 `--site <site.toml>` 或 \
+             `--set runtime.device.bdf=01:00.0` 指定。"
+                .into(),
+        );
+    }
     match &rt.tp_ordinals {
         None => {
             let (o, u) = resolve_device(rt)?;
@@ -628,15 +644,11 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
     let c = &r.config;
     let e = r.estimate()?;
     let arms = format!(
-        "prefill={} decode={} gdn={} bucket={:?}",
-        if c.graph.prefill_bucket == owl_shared::config::PrefillBucket::Off {
-            "eager"
-        } else {
-            "FI"
-        },
+        "prefill={} decode={} gdn={}",
+        // prefill 桶已退役(2026-10-21 S6x):prefill 恒 eager;decode 走单键臂
+        "eager",
         c.dispatch.decode_arm.as_str(),
         if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
-        c.graph.prefill_bucket,
     );
     Some(format!(
         "[owl] profile={} card={} ctx={} pool={}({}) {} mem={}/{} (余 {}) reuse={} spec={} c={}",
@@ -690,7 +702,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         ));
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool_tokens={} chunk={} tail={} \
-             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={} bucket={:?}\n",
+             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
             c.runtime.max_seq,
             c.pool.pool_tokens.unwrap_or(0),
             c.runtime.prefill_chunk,
@@ -699,7 +711,6 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             c.runtime.max_batch,
             c.server.max_concurrency,
             c.dispatch.kv_fp8,
-            c.graph.prefill_bucket,
         ));
         if let Some(e) = r.estimate() {
             out.push_str(&format!(
@@ -744,7 +755,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         );
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool_tokens={:?} chunk={} tail={} \
-             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={} bucket={:?}\n",
+             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
             c.runtime.max_seq,
             c.pool.pool_tokens,
             c.runtime.prefill_chunk,
@@ -753,7 +764,6 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             c.runtime.max_batch,
             c.server.max_concurrency,
             c.dispatch.kv_fp8,
-            c.graph.prefill_bucket,
         ));
     }
 
@@ -791,31 +801,57 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         }
     }
     if c.spec.depth > 0 {
-        match c.model.dflash2_dir.as_deref() {
-            Some(dir) => match check_draft_dir(Path::new(dir)) {
-                Ok(note) => out.push_str(&format!("[check] draft dir: {note}\n")),
-                Err(e) => {
+        let dflash2 = match c.spec.draft {
+            SpecDraft::Dflash2 => true,
+            SpecDraft::Mtp => false,
+            SpecDraft::Auto => c.model.dflash2_dir.is_some(),
+        };
+        if dflash2 {
+            match c.model.dflash2_dir.as_deref() {
+                Some(dir) => match check_draft_dir(Path::new(dir)) {
+                    Ok(note) => out.push_str(&format!("[check] draft dir: {note}\n")),
+                    Err(e) => {
+                        ok = false;
+                        out.push_str(&format!("[check] FAIL: {e}\n"));
+                    }
+                },
+                None => {
                     ok = false;
-                    out.push_str(&format!("[check] FAIL: {e}\n"));
+                    out.push_str("[check] FAIL: spec.draft=dflash2 但 model.dflash2_dir 为空\n");
                 }
-            },
-            None => {
-                ok = false;
-                out.push_str("[check] FAIL: spec.depth > 0 但 model.dflash2_dir 为空\n");
+            }
+        } else if matches!(c.spec.draft, SpecDraft::Auto) && c.spec.dumb {
+            out.push_str("[check] draft: dumb(诊断哑草稿;不需要 MTP/DFlash2 资产)\n");
+        } else {
+            if c.model.dflash2_dir.is_some() {
+                out.push_str(
+                    "[check] note: spec.draft=mtp 忽略 model.dflash2_dir(显式选择优先)\n",
+                );
+            }
+            match c.model.dir.as_deref() {
+                Some(dir) => {
+                    let mtp = c
+                        .model
+                        .mtp_dir
+                        .as_deref()
+                        .map(Path::new)
+                        .unwrap_or_else(|| Path::new(dir));
+                    match check_mtp_head(mtp) {
+                        Ok(note) => out.push_str(&format!("[check] draft: {note}\n")),
+                        Err(e) => {
+                            ok = false;
+                            out.push_str(&format!("[check] FAIL: {e}\n"));
+                        }
+                    }
+                }
+                None => out.push_str(
+                    "[check] draft: MTP 头随检查点装载;缺 model.dir 时无法预检 mtp.* 键\n",
+                ),
             }
         }
     }
 
     // ── 组合告警(不拒;`--check` 的 UX 价值就在把隐患提前说出来) ──
-    if c.graph.prefill_bucket != owl_shared::config::PrefillBucket::Off
-        && c.runtime.prefill_chunk + c.runtime.prefill_tail_merge > 1024
-    {
-        out.push_str(&format!(
-            "[check] WARN: chunk+tail = {}+{} > 1024:尾块没有桶图 ⇒ eager(激活约 1.7G);\
-             贴顶档建议拆成 512+512 或 1024+0\n",
-            c.runtime.prefill_chunk, c.runtime.prefill_tail_merge
-        ));
-    }
     if !c.kvmem.pool_overcommit {
         if let Some(p) = c.pool.pool_tokens {
             if p < c.runtime.max_seq {
@@ -829,17 +865,14 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     }
 
     // ── 臂摘要 ──
-    let prefill = match c.graph.prefill_bucket {
-        owl_shared::config::PrefillBucket::Off => "eager",
-        owl_shared::config::PrefillBucket::T512 => "FI(t512)",
-        owl_shared::config::PrefillBucket::Geobuckets => "FI(全桶族)",
-    };
+    let prefill = "eager"; // 桶已退役
     // **单值臂**(2026-10-21):"v2" = 分页 v2 主核(历史上被误叫 prefill/eager)
     let decode = c.dispatch.decode_arm.as_str();
     out.push_str(&format!(
-        "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{} reuse={} batch={} vision={}\n",
+        "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{}({:?}) reuse={} batch={} vision={}\n",
         if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
         c.spec.depth,
+        c.spec.draft,
         if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
         c.runtime.max_batch,
         if c.model.vision { "on" } else { "off" },
@@ -873,6 +906,58 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
 }
 
 /// 模型 `config.json` 几何校验(读 `text_config`;与注册表逐项比对)
+/// **MTP 头预检**：27B AWQ 的检查点把 `mtp.*` 放在主 safetensors 索引里
+/// （config 不声明 `num_nextn_predict_layers`，但权重存在）。这里只读索引，
+/// 不做权重装载；无索引（单文件档）时留到装载期结构化拒绝。
+fn check_mtp_head(dir: &Path) -> Result<String, String> {
+    // GGUF 单文件:NextN 块 = `blk.<n>.nextn.eh_proj.weight`
+    if dir.is_file() {
+        if dir.extension().and_then(|s| s.to_str()) != Some("gguf") {
+            return Err(format!(
+                "MTP 头 {} 既不是目录也不是 .gguf 单文件",
+                dir.display()
+            ));
+        }
+        let g = owl_models::formats::gguf::Gguf::open(dir)
+            .map_err(|e| format!("打开 GGUF {} 失败: {e}", dir.display()))?;
+        let n = g
+            .tensors
+            .iter()
+            .filter(|t| t.name.starts_with("blk.") && t.name.contains(".nextn.eh_proj."))
+            .count();
+        if n == 0 {
+            return Err(format!(
+                "spec.draft=mtp 但 {} 没有 blk.<n>.nextn.eh_proj.*（该 GGUF 不带 MTP 头）",
+                dir.display()
+            ));
+        }
+        return Ok(format!("{} ✓ GGUF MTP / {} 个 NextN 块", dir.display(), n));
+    }
+    let p = dir.join("model.safetensors.index.json");
+    if !p.is_file() {
+        return Ok(format!(
+            "{} 无 model.safetensors.index.json —— 跳过 mtp.* 预检(装载期验证)",
+            dir.display()
+        ));
+    }
+    let raw = owl_shared::file_loader::read_to_string(&p)
+        .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
+    let n = v
+        .get("weight_map")
+        .and_then(|x| x.as_object())
+        .map(|m| m.keys().filter(|k| k.starts_with("mtp.")).count())
+        .unwrap_or(0);
+    if n == 0 {
+        return Err(format!(
+            "spec.draft=mtp 但 {} 的权重索引没有 mtp.* 键（该检查点不是 MTP 档；请改用 dflash2 或关 spec）",
+            dir.display()
+        ));
+    }
+    Ok(format!("{} ✓ MTP 头 / {} 个 mtp.* 键", dir.display(), n))
+}
+
 fn check_model_dir(
     dir: &Path,
     profile: &owl_shared::config::intent::ModelProfile,

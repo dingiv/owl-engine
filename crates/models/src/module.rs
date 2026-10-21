@@ -663,6 +663,32 @@ pub struct AttnV2Scratch {
     pub seqs: usize,
 }
 
+impl AttnV2Scratch {
+    /// 取前 `seqs` 条伪序列的**视图**(同一底层块,零拷贝)。
+    ///
+    /// 用途:MTP extend 的 T=m+1 随接受数变化,但复用 target verify 的
+    /// 4 序列 scratch(seqs=4)。核只写前 `seqs` 行,底层块更大 ⇒ 安全。
+    /// 返回 None = 越界/空(调用方回落 chunked,不静默截断)。
+    pub fn prefix(&self, seqs: usize) -> Option<Self> {
+        if seqs == 0 || seqs > self.seqs {
+            return None;
+        }
+        if seqs == self.seqs {
+            return Some(self.clone());
+        }
+        let es_row = *self.exp_sums.shape().last()?;
+        let ml_row = *self.max_logits.shape().last()?;
+        let to_row = *self.tmp_out.shape().last()?;
+        Some(Self {
+            exp_sums: self.exp_sums.slice_view(0, vec![seqs, es_row]),
+            max_logits: self.max_logits.slice_view(0, vec![seqs, ml_row]),
+            tmp_out: self.tmp_out.slice_view(0, vec![seqs, to_row]),
+            nparts: self.nparts,
+            seqs,
+        })
+    }
+}
+
 /// XQA verify/decode 面(2026-10-13 D3 立案;kNHD fp8 池 + spec-dec q=1+K)。
 /// 张量全由 engine/测试注入(层内零自建 —— 捕获期禁 Htod 同 FI 先例):
 /// - `page_table` **i32** `[1, nb]`(owl 现有 bt 是 f32 → 需 i32 孪生)

@@ -59,9 +59,6 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     /// DFlash2 propose 单图(E5-DF4;encode 全 8 行 + 噪声块 + selector,
     /// 固定几何;None = eager 回退)
     pub dflash: Option<GraphPlan<D>>,
-    /// **prefill 桶族(M2b)**:一桶一张整段单图(含 KV 写 + FI 注意力);
-    /// 空 = 档位 off / 未建(该档全走 eager 原路)
-    pub prefill: crate::prefill_plan::PrefillBuckets<D>,
 }
 /// **臂事实**(2026-10-19 审查):boot 自证行原先只报"**面**登记"(`FI 节点登记=true`),
 /// 而**臂**由 models 侧顺序决定 —— 两者可以不一致(实测:flavor `verify_fi=true`
@@ -106,7 +103,6 @@ impl<D: DeviceClient> GraphFleet<D> {
         if let Some(g) = self.dflash.as_mut() {
             record_close(&mut first, g.close().await);
         }
-        record_close(&mut first, self.prefill.close().await);
         match first {
             Some(e) => Err(e),
             None => Ok(()),
@@ -118,7 +114,6 @@ impl<D: DeviceClient> GraphFleet<D> {
     /// perf-framework.md §十.3)。
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
         self.session.set_phase(p);
-        self.prefill.set_phase(p);
         if let Some(g) = self.verify.as_mut() {
             g.set_phase(p);
         }
@@ -177,10 +172,8 @@ impl<D: DeviceClient> GraphFleet<D> {
         boot: FleetBoot<'_>,
         t0: T,
     ) -> Result<Self> {
-        // ① 主会话图(先留一个句柄给 ④ 的 prefill 桶族 —— 桶族在最后建,
-        // 那时 `face`/`vface` 都已被消费)
-        let pface_src = face.face_clone();
-        // 合批 decode 图(B5.1):独立 face(与 prefill 桶不共享);捕获失败 ⇒ None
+        // ① 主会话图
+        // 合批 decode 图(B5.1):独立 face;捕获失败 ⇒ None
         let bface_src = if boot.knobs.max_batch > 1 && !boot.knobs.no_graph {
             face.face_clone()
         } else {
@@ -235,64 +228,6 @@ impl<D: DeviceClient> GraphFleet<D> {
         } else {
             None
         };
-        // ④ **prefill 桶族(M2b)**:最后建 —— 自己的槽面/自己的输出块,
-        // 与前面几族无共享羁绊;必须在家族 scratch 只增不减的律下**降序**捕
-        // (桶内部自己排;见 `prefill_plan` 模块头注硬纪律 #2)。
-        let prefill = if boot.knobs.prefill_bucket == owl_shared::config::PrefillBucket::Off {
-            crate::prefill_plan::PrefillBuckets::empty()
-        } else if boot.knobs.no_graph {
-            owl_shared::log_warn!(
-                "prefill-graph",
-                "[graph] no_graph = true ⇒ prefill 桶不建(桶属图族;要诊断桶请去掉该总闸)"
-            );
-            crate::prefill_plan::PrefillBuckets::empty()
-        } else if boot.knobs.env.attn.xqa_prefill {
-            // XQA prefill 臂在场 ⇒ 不建桶:桶图的槽面是 FI 四件套,XQA 要的是
-            // 页链/整请求长/位掩码三件 ⇒ 图内走 FI、eager 走 XQA(图 ≢ eager)。
-            // 响亮告知(不是静默降级)。
-            owl_shared::log_warn!(
-                "prefill-graph",
-                "dispatch.xqa_prefill 在场 ⇒ prefill 桶不建(桶图槽面 = FI 四件套;回 eager 原路)"
-            );
-            crate::prefill_plan::PrefillBuckets::empty()
-        } else if boot.pool.fi_face {
-            match pface_src {
-                None => {
-                    owl_shared::log_warn!(
-                        "prefill-graph",
-                        "face_clone 不可用 ⇒ prefill 桶不建(回 eager 原路)"
-                    );
-                    crate::prefill_plan::PrefillBuckets::empty()
-                }
-                Some(pf) => {
-                    let boot_pg = crate::prefill_plan::BucketBoot {
-                        env: boot.env,
-                        tp: boot.tp.clone(),
-                        model: Arc::clone(&boot.model),
-                        rope: boot.rope.clone(),
-                        pool: boot.pool,
-                        dims: boot.dims,
-                        taps: boot.spec.dflash_tap_count,
-                        tap_ids: std::sync::Arc::clone(&boot.spec.dflash_tap_ids),
-                        ladder: crate::prefill_plan::ladder(boot.knobs.prefill_bucket),
-                        fi_plan_restore: boot.knobs.fi_plan_restore,
-                    };
-                    let buckets = crate::prefill_plan::PrefillBuckets::capture(&pf, &boot_pg).await;
-                    owl_shared::log_info!(
-                        "prefill-graph",
-                        "桶族摘要:t_pad 命中阶梯 = {}",
-                        buckets.summary()
-                    );
-                    buckets
-                }
-            }
-        } else {
-            owl_shared::log_warn!(
-                "prefill-graph",
-                "非 FI 档(pool.fi_face = false)⇒ prefill 桶不建(回 eager 原路)"
-            );
-            crate::prefill_plan::PrefillBuckets::empty()
-        };
         // **现役臂自证**(2026-10-16 立;2026-10-18 改**事实位**)。
         // ⚠️ 判据 = 建树期"FI 面是否真登记"(`*_fi_node`),**不是旋钮** ——
         // 按旋钮猜曾把"FI 根本没进图、跑的是回落臂"报成 "FI(单图)"(坑册 §58)。
@@ -314,7 +249,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 arm(verify_fi_node, boot.knobs.env.attn.verify_arm.as_str()),
                 arm(decode_fi_node, boot.knobs.env.attn.decode_arm.as_str()),
                 boot.spec.depth,
-                boot.pool.kv_fp8,
+                boot.pool.geom.kv_fp8,
             );
         }
         // **图显存总账**(2026-10-16;user 令"先归因"):所有已捕获图的 slab
@@ -328,11 +263,10 @@ impl<D: DeviceClient> GraphFleet<D> {
             let fo: usize = fold.iter().map(|g| g.slab_bytes()).sum();
             let pr: usize = propose.iter().map(|g| g.slab_bytes()).sum();
             let df = dflash.as_ref().map(|g| g.slab_bytes()).unwrap_or(0);
-            let pb = prefill.slab_bytes();
-            let total = s + v + fo + pr + df + pb;
+            let total = s + v + fo + pr + df;
             owl_shared::log_info!(
                 "boot",
-                "slab 总账:session {}MiB + verify {}MiB + fold {}MiB({}) + propose {}MiB({}) + dflash {}MiB + prefill桶 {}MiB({}) = {}MiB(Σ 已捕获图)‖ 引擎账 vram::live={}MiB(含池/权重/全部真分配)",
+                "slab 总账:session {}MiB + verify {}MiB + fold {}MiB({}) + propose {}MiB({}) + dflash {}MiB = {}MiB(Σ 已捕获图)‖ 引擎账 vram::live={}MiB(含池/权重/全部真分配)",
                 mb(s),
                 mb(v),
                 mb(fo),
@@ -340,8 +274,6 @@ impl<D: DeviceClient> GraphFleet<D> {
                 mb(pr),
                 propose.len(),
                 mb(df),
-                mb(pb),
-                prefill.summary(),
                 mb(total),
                 owl_shared::vram::live_bytes() >> 20,
             );
@@ -377,7 +309,6 @@ impl<D: DeviceClient> GraphFleet<D> {
             fold,
             propose,
             dflash,
-            prefill,
         })
     }
 
@@ -442,8 +373,6 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 仅多 5 个 [1,hidden] 输出槽写;非 dflash 走原 forward(拓扑不变)
         let decode_taps = boot.spec.dflash_tap_count > 0;
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
-        let fi_nb = pool.nb;
-        let dfi_on = knobs.env.attn.decode_arm.uses_fi(); // 闭包 'static:先取值(同 xqa_decode_on 纪律)
         // **图档单图烘 plan 档**(2026-10-18;`[dispatch] fi_plan_bake`):
         // Some(ctx) = decode **不进 piecewise**,FI 核留图内,且喂 FI 的
         // `ctx_total` 用该上界烘死 ⇒ 烘出的调度表按上界枚举工作项(运行期
@@ -451,6 +380,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 上界必须 ≥ 任何可能出现的 ctx(否则表的工作项数 < 运行期 chunk 数 ⇒
         // V1 那个 stride 错),由配置校验拒启兜底。
         let plan_bake: Option<usize> = knobs.fi_plan_bake;
+        // **单键臂 → 闭包常量**(2026-10-21 合并):闭包捕获 'static ⇒ 先取值
+        let dfi_on = knobs.env.attn.decode_arm.uses_fi();
+        let fi_nb = pool.geom.nb;
         // **臂事实位**(2026-10-18,同 verify 律):decode 侧 FI 面是否真登记。
         let dfi_node_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dfi_node_seen_c = dfi_node_seen.clone();
@@ -587,8 +519,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                         // 整段读到**别家 KV** —— 实测"答上一题"(§7.6 定谳,
                         // 2026-10-14)。init 保留恒等链(单会话行为不变);
                         // 槽尺寸 = 池 nb(与会话链上界一致,尾部补零)
-                        v.push(InputSlot::f32("xqa_pt", pool.nb).init(
-                            (0..pool.nb).map(|i| f32::from_bits(i as u32)).collect(),
+                        v.push(InputSlot::f32("xqa_pt", pool.geom.nb).init(
+                            (0..pool.geom.nb).map(|i| f32::from_bits(i as u32)).collect(),
                         ));
                     }
                     if knobs.select_decode {
@@ -597,8 +529,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                         // init = 恒等链 + 全量长(单会话且视图未启用时行为不变)
                         // 编码 = **数值 f32**(与 `write_bt` 同源:block_tables 在本族
                         // 声明为 F32 rank2;XQA 的位型编码是另一套,别混)
-                        v.push(InputSlot::f32("sel_pt", pool.nb).init(
-                            (0..pool.nb).map(|i| i as f32).collect(),
+                        v.push(InputSlot::f32("sel_pt", pool.geom.nb).init(
+                            (0..pool.geom.nb).map(|i| i as f32).collect(),
                         ));
                         v.push(InputSlot::f32("sel_len", 1).init(vec![1.0]));
                     }
@@ -609,8 +541,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                     // u32 → f32)。init 与占位 ctx_total(=1 行)自洽:nb_pages=1
                     if knobs.env.attn.decode_arm.uses_fi() {
                         v.push(InputSlot::f32("fi_q_cu", 2).init(vec![0.0, f32::from_bits(1)]));
-                        v.push(InputSlot::f32("fi_indices", pool.nb)
-                            .init((0..pool.nb).map(|i| f32::from_bits(i as u32)).collect()));
+                        v.push(InputSlot::f32("fi_indices", pool.geom.nb)
+                            .init((0..pool.geom.nb).map(|i| f32::from_bits(i as u32)).collect()));
                         v.push(InputSlot::f32("fi_indptr", 2).init(vec![0.0, f32::from_bits(1)]));
                         v.push(InputSlot::f32("fi_last_len", 1).init(vec![f32::from_bits(1)]));
                     }
@@ -892,8 +824,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                     // FI 表四件套(位型过线:u32 → f32;核按 i32* 读)。init 与
                     // 占位 ctx_total(=depth1)自洽:nb_pages = ceil(T/page) = 1
                     InputSlot::f32("fi_q_cu", 2).init(vec![0.0, f32::from_bits(depth1 as u32)]),
-                    InputSlot::f32("fi_indices", pool.nb)
-                        .init((0..pool.nb).map(|i| f32::from_bits(i as u32)).collect()),
+                    InputSlot::f32("fi_indices", pool.geom.nb)
+                        .init((0..pool.geom.nb).map(|i| f32::from_bits(i as u32)).collect()),
                     InputSlot::f32("fi_indptr", 2).init(vec![0.0, f32::from_bits(1)]),
                     InputSlot::f32("fi_last_len", 1).init(vec![f32::from_bits(depth1 as u32)]),
                 ],
@@ -909,7 +841,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         let fi_want_c = fi_want;
         // kcs/vcs = 主池叶子(FI 与其余臂同池;与 kv_caches 同源)
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
-        let fi_nb = pool.nb; // 闭包 'static:借 boot 的字段必须先取值(同 kv_caches 纪律)
+        let fi_nb = pool.geom.nb; // 闭包 'static:借 boot 的字段必须先取值(同 kv_caches 纪律)
+        // **decode FI 臂**(2026-10-21 单键化):闭包捕获 'static ⇒ 先取值
+        let dfi_on = knobs.env.attn.decode_arm.uses_fi();
         // 图内臂把 FI plan 的 ctx 烘成上界(表由引擎每轮 sync 成精确值)
         let vfi_bake_c = vfi_bake;
         // **臂事实位**(2026-10-18,同 "槽在场≠节点在场" 律):FI 面是否真登记进本图
@@ -1381,7 +1315,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         };
         let pool = boot.pool;
         let dims = boot.dims;
-        let env = boot.env;
+        // MTP 草稿层/链步池是 F16(StatePool 按目标 dims.dtype 分配),
+        // 不能用主 env(fp8 生产档会选到 fp8 读核)。
+        let env = boot.spec.draft_env;
         let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let spec_depth = boot.spec.depth;
@@ -1390,19 +1326,24 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 链步 decode 读核 scratch(seqs=1;与 draft.rs eager 路同源):
         // kNHD 池落 v1 = 布局错位 → 草稿垃圾(2026-10-13 守卫捕获)
         let attn_v2_pool = pool.attn_v2_scratch();
+        let extend_v2_pool = pool.verify_attn_v2_scratch();
         for m in 0..=spec_depth {
             // move 闭包逐个消耗 → 每轮取一份克隆
             let attn_v2_p = attn_v2_pool.clone();
+            let extend_v2_p = extend_v2_pool.as_ref().and_then(|s| s.prefix(m + 1));
             let m1 = m + 1;
             let model_p = Arc::clone(&boot.model);
             let mtp = Arc::clone(mtp);
             let rp_p = boot.rope.clone();
             let kv_leaf = pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
             let bt_leaf = pool.bt_mtp_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP 块表槽缺席(草稿档位不一致)".into() })?;
+            let bt_nb = *bt_leaf.shape().last().unwrap_or(&1);
             let hid = hid_blk.clone();
             let env_p = env;
             let vocab = boot.model.vocab_size();
             let mut pins = vec![InputSlot::f32("tok_ext", m1), InputSlot::f32("pos_ext", m1), InputSlot::f32("slots_ext", m1), InputSlot::f32("lens_ext", m1)];
+            // MTP extend 的 v2 伪序列页表(每行同一条 MTP 页链)
+            pins.push(InputSlot::f32("v2_bt8", m1 * bt_nb));
             for j in 0..spec_depth - 1 {
                 pins.push(InputSlot::f32(format!("c{j}_pos"), 1));
                 pins.push(InputSlot::f32(format!("c{j}_slots"), 1));
@@ -1439,6 +1380,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                     let slots_ext = sc.input("slots_ext")?.reshape(vec![m1]);
                     let lens_ext = sc.input("lens_ext")?.reshape(vec![m1]);
                     let seq_cu = sc.input("seq_cu")?;
+                    let v2_bt8 = sc.input("v2_bt8")?.reshape(vec![m1, bt_nb]);
                     let bt = bt_leaf.clone();
                     let kv_ext = KvBuffers {
                         k_cache: kv_leaf.0.clone(),
@@ -1481,6 +1423,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                         env_p,
                         // 图步链读核也走 v2(同 draft.rs:kNHD 池落 v1 = 错位)
                         attn_v2_p.clone(),
+                        extend_v2_p.clone(),
+                        Some(&v2_bt8),
                     );
                     sc.output("drafts", &droot)
                 },

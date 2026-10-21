@@ -87,6 +87,8 @@ pub struct ModelLoader<'a, D: DeviceClient> {
     max_seq: usize,
     /// 视觉塔(`[model].vision`;false = 纯文本路径逐字节不变)
     vision: bool,
+    /// MTP 头覆盖路径(目录或 `.gguf`;None = 检查点自带)
+    mtp_override: Option<std::path::PathBuf>,
 }
 
 impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
@@ -100,7 +102,14 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             rope: owl_shared::config::RopeCfg::default(),
             max_seq: 0,
             vision: false,
+            mtp_override: None,
         }
+    }
+
+    /// MTP 头覆盖(`[model].mtp_dir`;None = 检查点自带)
+    pub fn mtp_override(mut self, p: Option<std::path::PathBuf>) -> Self {
+        self.mtp_override = p;
+        self
     }
 
     /// **rope 外推档**(`[model.rope]` + `runtime.max_seq`;GGUF 装载用)。
@@ -293,8 +302,9 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let mut opts = LoadOpts::plain(spec.dtype);
         opts.shard = self.slice.1;
         opts.slice_id = self.slice.0;
-        opts.debug_tap = owl_shared::env_reader::flag("OWL_LOAD_DEBUG");
-        opts.verify = owl_shared::env_reader::flag("OWL_LOAD_VERIFY");
+        // 旋钮来自 `[load]`(配置面单源;用户裁决 2026-10-19:不读 env)
+        opts.debug_tap = self.load.debug_tap;
+        opts.verify = self.load.verify;
         let t_plan = t_open.elapsed();
         load_from_dir(path, self.face, &model, opts).await?;
         let model = Arc::new(model);
@@ -324,6 +334,18 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         );
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
+        // MTP/NextN 头(2026-10-21):GGUF 单文件里 MTP 块 = `blk.<n>.nextn.*`
+        // + 同块全解码层;n = 解码层数。存在 ⇒ 把**同一文件**作为 mtp_dir
+        // 交给 spec_runtime 的 GGUF MTP 装载分支(单文件自给)。
+        let mtp_block = (0..=spec.layer_types.len())
+            .find(|i| src.gguf().index_of(&format!("blk.{i}.nextn.eh_proj.weight")).is_some());
+        let mtp_dir = mtp_block.map(|_| path.to_path_buf());
+        if let Some(b) = mtp_block {
+            owl_shared::log_info!(
+                "boot",
+                "GGUF 自带 MTP/NextN 块:blk.{b}.nextn.*（spec.draft=mtp 时由同一文件装载）"
+            );
+        }
         // 装载分相(启动时间是生产指标:哪一相贵要看得出来;测试档也上屏)
         eprintln!(
             "[gguf] 装载分相:容器+维度 {:.2}s + 计划/构造 {:.2}s + 权重 {:.2}s + 词表/rope {:.2}s = {:.2}s",
@@ -340,9 +362,50 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             spec,
             // 逐张量计划(GGUF):单一值表达不了 ⇒ None(见字段文档)
             quant_plan: None,
-            mtp_dir: None,
+            mtp_dir: self.mtp_override.clone().or(mtp_dir),
             vlm: None,
         })
+    }
+
+
+    /// **视觉塔装载**(`[model].vision`;两档共用同一份 —— 0.8B 与 27B 的
+    /// 检查点都是 `Qwen3_5ForConditionalGeneration`,自带 `model.visual.*`)。
+    ///
+    /// 文本主干已装好(量化/分片/头计划)⇒ 只补视觉段;塔权重**每 rank 全量**
+    /// (Replicate;TP2 不切视觉),故 opts 固定 `shard = 1`。
+    async fn load_vision_into(
+        &mut self,
+        dir: &Path,
+        model: &Arc<Model>,
+        dtype: owl_iface::contract::Dtype,
+    ) -> Result<Option<Arc<Vlm>>> {
+        if !self.vision {
+            return Ok(None);
+        }
+        let raw = owl_shared::file_loader::read(&dir.join("config.json")).map_err(|e| {
+            ModelError::Msg(format!("视觉装载:config.json 读取失败({}): {e}", dir.display()))
+        })?;
+        let vcfg = VlmCfg::from_json(&raw)?;
+        let tower = VisionTower::new(vcfg.vision);
+        let mut topts = LoadOpts::new(self.face, dtype);
+        topts.shard = 1;
+        topts.slice_id = 0;
+        topts.debug_tap = self.load.debug_tap;
+        topts.verify = self.load.verify;
+        topts.staging_mb = self.load.staging_mb;
+        topts.dump = self.load.dump;
+        topts.device_repack = self
+            .load
+            .repack_device()
+            .map_err(ModelError::Msg)?
+            .or(topts.device_repack);
+        load_from_dir(dir, self.face, &tower, topts).await?;
+        let vlm = Vlm::from_model(Arc::clone(model), tower, vcfg)?;
+        owl_shared::log_info!(
+            "boot",
+            "视觉塔已装载(model.visual.*;塔权重每 rank 全量,文本主干共用)"
+        );
+        Ok(Some(Arc::new(vlm)))
     }
 
     /// Qwen3.5-0.8B(维度/键基座从**检查点**读:config.json 优先 + 形状
@@ -350,12 +413,6 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     // A3 同步隔离:引擎单线程模型;Arc 仅作共享句柄,不跨线程发送。
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn load_qwen35_0_8b(&mut self, dir: &Path) -> Result<LoadedModel> {
-        if self.vision {
-            return Err(ModelError::Msg(
-                "[model].vision = true:0.8B 档尚未接视觉塔(仅 27B AWQ 档;\
-                 视觉塔装载在 load_qwen38_27b_awq)".into(),
-            ));
-        }
         // **[相位上下文]装载 = `Weight` 类 + `System` 归属**(RAII:任何早退都还原)
         let _scope = self.face.scoped_ctx(
             owl_iface::handle::Owner::System,
@@ -378,7 +435,8 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let quant_plan = Some(owl_models::module::QuantPlan::F16);
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None, vlm: None })
+        let vlm = self.load_vision_into(dir, &model, spec.dtype).await?;
+        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None, vlm })
 
     }
 
@@ -412,7 +470,8 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let quant_plan = Some(owl_models::module::QuantPlan::W4A16);
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None, vlm: None })
+        let vlm = self.load_vision_into(dir, &model, spec.dtype).await?;
+        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None, vlm })
 
     }
 
@@ -495,37 +554,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
-        // ── **视觉塔**(`[model].vision`;2026-10-20 接线)──
-        // 文本主干已装好(量化/分片/头计划)⇒ 只补 `model.visual.*`;
-        // 塔权重**每 rank 全量**(Replicate;TP2 不切视觉),故 opts 固定 shard=1。
-        let vlm = if self.vision {
-            let raw = owl_shared::file_loader::read(&dir.join("config.json")).map_err(|e| {
-                ModelError::Msg(format!("视觉装载:config.json 读取失败({}): {e}", dir.display()))
-            })?;
-            let vcfg = VlmCfg::from_json(&raw)?;
-            let tower = VisionTower::new(vcfg.vision);
-            let mut topts = LoadOpts::new(self.face, spec.dtype);
-            topts.shard = 1;
-            topts.slice_id = 0;
-            topts.debug_tap = self.load.debug_tap;
-            topts.verify = self.load.verify;
-            topts.staging_mb = self.load.staging_mb;
-            topts.dump = self.load.dump;
-            topts.device_repack = self
-                .load
-                .repack_device()
-                .map_err(ModelError::Msg)?
-                .or(topts.device_repack);
-            load_from_dir(dir, self.face, &tower, topts).await?;
-            let vlm = Vlm::from_model(std::sync::Arc::clone(&model), tower, vcfg)?;
-            owl_shared::log_info!(
-                "boot",
-                "视觉塔已装载(model.visual.*;塔权重每 rank 全量,文本主干共用)"
-            );
-            Some(std::sync::Arc::new(vlm))
-        } else {
-            None
-        };
+        let vlm = self.load_vision_into(dir, &model, spec.dtype).await?;
         owl_shared::metrics::with_metrics_store(|s| {
             let _ = s.timer_end("load.27b.total", file!(), line!());
         });
@@ -538,7 +567,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             rope,
             spec,
             quant_plan: Some(quant_plan),
-            mtp_dir: Some(dir.to_path_buf()),
+            mtp_dir: self.mtp_override.clone().or(Some(dir.to_path_buf())),
             vlm,
         })
 

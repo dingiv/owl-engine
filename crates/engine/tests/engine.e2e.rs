@@ -169,6 +169,16 @@ async fn e2e_body() {
     // ── B-3d 选择层接进 decode(按需开:另加 `OWL_SELECT_DECODE=1`) ──
     run!(gpu_08b_select_decode_probe);
 
+    // ── VLM 图像输入基线(自装载:需要 `vision = true`)──
+    run!(gpu_vlm_image_baseline);
+
+    // ── 冷启动取证(fix/vlm F1;诊断,无硬断言;两个场景 = A/B)──
+    run!(gpu_vlm_first_turn_probe_textfirst);
+    run!(gpu_vlm_first_turn_probe_imagefirst);
+    // 同探针 × 27B(生产 VLM 档):0.8B 的结论不能外推
+    run!(gpu_vlm_first_turn_probe_27b_textfirst);
+    run!(gpu_vlm_first_turn_probe_27b_imagefirst);
+
     // ── piecewise 段驱动件(不装模型;纯 GraphPlan 面) ──
     run!(gpu_single_graph_capture_and_replay);
 

@@ -30,10 +30,18 @@ pub enum EngineReq {
         opts: owl_engine::TurnOpts,
         sink: mpsc::Sender<SinkEvent>,
     },
-    /// 取消活跃 turn(AGT-10:客户端断流 ⇒ 不再烧 GPU)。
-    /// **窄语义**:只终结**当前活跃** turn(GDN 格/块链正常回收,
-    /// 引擎可继续接新请求);无活跃 turn 时为 no-op。
-    Abort { session: u64 },
+    /// 取消 turn(AGT-10:客户端断流 ⇒ 不再烧 GPU;**B5.1:必须指名**)。
+    ///
+    /// `turn` 已知(Accepted 帧之后断流)= 精确终结该 turn;
+    /// 未知(断在受理帧之前)= 退化为按会话找(服务面已按会话串行 ⇒ 唯一)。
+    /// 都不会动同批其它会话的 turn(旧实现走 `abandon` = 杀本步执行 turn,
+    /// 合批档下会误杀别家)。
+    Abort {
+        session: u64,
+        turn: Option<u64>,
+        /// 回执(引擎已清完 ⇒ 服务面可释放会话闸;不发 = 延迟断言级 bug)
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
     /// **tokenize 旁路**(G5③;`POST /tokenize`):不落 turn、不碰池/图。
     /// 应答走 oneshot(取消安全:请求方走了则发失败,不许静默)。
     Tokenize {
@@ -41,6 +49,12 @@ pub enum EngineReq {
         /// 先套家族单轮包装(与裸文本提交同一律);false = 纯文本编码
         chat_wrap: bool,
         reply: tokio::sync::oneshot::Sender<Result<owl_engine::TokenizeReply, String>>,
+    },
+    /// **合批/队列事实旁路**(`POST /debug/load` 前后取差值;纯读,不落 turn)。
+    /// 为什么单列一条而不是复用 `VramReport`:后者要取**块账房**快照(设备命令),
+    /// 灌流测量要的是**几乎零成本**的事实口(前后各一次,不能污染读数)。
+    BatchStats {
+        reply: tokio::sync::oneshot::Sender<BatchStatsSnapshot>,
     },
     /// **store 账查询旁路**(`GET /debug/vram`;第 0/3 刀):不落 turn、不改状态。
     /// 应答 = 三层账 + **owner 维明细** + **事件账** + **块账房对账**(全等门)。
@@ -69,6 +83,43 @@ pub struct VramSnapshot {
     /// **默认池账(逐 rank)**:(used, used_high, reserved, reserved_high)。
     /// 与块账之差 = **池缓存**(已 free 仍占物理显存;`RELEASE_THRESHOLD=∞`)。
     pub pools: Vec<(u8, Result<(u64, u64, u64, u64), String>)>,
+    /// **合批事实**(B5.1 服务面):上限 / 已走批步数 / 批图是否在场。
+    /// 判据:开了 `max_batch>1` 却 `steps` 不涨 = 批门从未成立(要么并发不够,
+    /// 要么被会话闸串行) —— 这正是服务面最常见的"以为在合批"假象。
+    pub batch: BatchFacts,
+}
+
+/// 灌流测量用的轻量事实(见 [`EngineReq::BatchStats`])
+pub struct BatchStatsSnapshot {
+    pub max_batch: usize,
+    pub batch_steps: u64,
+    pub has_batch_graph: bool,
+    pub queue_len: usize,
+    /// 当前活跃 turn 数(**多活跃**:合批档 >1)
+    pub active: usize,
+    /// **排队快照**（最多 16 条，按等待降序）：`(turn, session, waited_ms)`
+    pub queued: Vec<(u64, u64, u64)>,
+    /// **拒绝分桶**（会话, 码, 次数；按次数降序）
+    pub rejects: Vec<(u64, String, u64)>,
+    /// 排队时长直方图
+    pub wait_hist: [u64; 5],
+}
+
+/// 合批事实(与 `/debug/vram` 同刻取;见 [`VramSnapshot::batch`])
+pub struct BatchFacts {
+    pub max_batch: usize,
+    pub steps: u64,
+    pub graph: bool,
+    /// **准入容量快照**（store 事实 + 判决输出；判"还能进几个"的现场）
+    pub free_pages: usize,
+    pub cache_pages: usize,
+    pub reserved_pages: usize,
+    pub usable_pages: usize,
+    pub n_slots: usize,
+    pub n_mem: usize,
+    pub n_eff: usize,
+    /// 排队快照（最多 16，按等待降序）：`(turn, session, waited_ms)`
+    pub queued: Vec<(u64, u64, u64)>,
 }
 
 /// 事件投递(律 #1:不许静默丢弃可失败返回值)。
@@ -97,6 +148,8 @@ pub enum SinkEvent {
         prompt_tokens: usize,
         /// 前缀命中量(usage `prompt_tokens_details.cached_tokens` 真源;AGT-12)
         cached_tokens: usize,
+        /// **实际生成预算**(准入夹紧后的值;与请求值不同 ⇒ 已如实夹紧)
+        max_new: usize,
     },
     Rejected { err: String },
     /// 定相后的**真实前缀命中量**校正帧(AGT-12):块级前缀缓存命中在
@@ -113,6 +166,7 @@ pub async fn run_actor<D: DeviceClient>(
     mut rx: mpsc::Receiver<EngineReq>,
     perf_dump: Option<std::path::PathBuf>,
     shutdown: crate::shutdown::Shutdown,
+    telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
 ) {
     // turn_id → 事件回流(sink;Completed/Failed 后摘除)
     let mut sinks: HashMap<u64, mpsc::Sender<SinkEvent>> = HashMap::new();
@@ -124,6 +178,9 @@ pub async fn run_actor<D: DeviceClient>(
     let mut pending_cache: HashMap<u64, usize> = HashMap::new();
     // AGT-10:客户端断开且尚未弃置(下一个 pump 边界前处理)
     let mut dropped = false;
+    // 遥测：容量快照降频（`movable_bytes` 要遍历前缀树，不能每拍）
+    let mut last_capacity: Option<crate::telemetry::CapacitySnapshot> = None;
+    let mut tele_tick: u64 = 0;
     loop {
         // ① 阻塞等首个请求(通道关 = 引擎退役)
         let Some(req) = rx.recv().await else { return };
@@ -135,6 +192,14 @@ pub async fn run_actor<D: DeviceClient>(
         // ③ 泵到排空,事件按 turn 路由
         let actor_prof = std::env::var_os("OWL_ACTOR_PROF").is_some();
         loop {
+            // **泵间收件**(2026-10-20 真机定谳):旧实现泵到 Idle 才回 outer 收件 ⇒
+            // 错峰到达的请求**永远等前一个 turn 跑完**才进引擎(实测:150ms 后到的 B
+            // 在 A 的 96 步 decode 期间一步未进 ⇒ 合批/时间片全成摆设)。
+            // 安全性:此处是**两拍之间**(pump 已完整返回),提交/取消都是 host 账操作,
+            // 不打断设备侧半推进态;`dropped` 处置仍在下一条。
+            while let Ok(req) = rx.try_recv() {
+                handle_req(running, &mut sinks, req).await;
+            }
             // AGT-10:断流 turn 在下一步之前弃置(≤1 采样步延迟)
             if dropped {
                 dropped = false;
@@ -148,6 +213,33 @@ pub async fn run_actor<D: DeviceClient>(
                         pending_cache.insert(t, cached);
                     }
                 }
+            }
+            // **遥测快照**（每拍；容量每 32 拍）—— HTTP 侧零等待读
+            {
+                tele_tick = tele_tick.wrapping_add(1);
+                if tele_tick.is_multiple_of(32) {
+                    let (f, c) = running.capacity_probe();
+                    last_capacity = Some(crate::telemetry::CapacitySnapshot {
+                        free_pages: f.free_pages,
+                        cache_pages: f.cache_pages,
+                        reserved_pages: f.reserved_pages,
+                        usable_pages: c.usable_pages,
+                        n_slots: c.n_slots,
+                        n_mem: c.n_mem,
+                        n_eff: c.n_eff,
+                    });
+                }
+                telemetry.publish(crate::telemetry::QueueSnapshot {
+                    queue_len: running.queue_len(),
+                    active: running.active_len(),
+                    batch_steps: running.batch_steps(),
+                    max_batch: running.max_batch(),
+                    has_graph: running.has_batch_graph(),
+                    queued: running.queued_snapshot(16),
+                    capacity: last_capacity,
+                    rejects: running.reject_snapshot(16),
+                    wait_hist: running.wait_hist(),
+                });
             }
             // P2.2 侦察(2026-10-19;env 门,临时诊断):拆"循环外 1.55ms/步" ——
             // pump(引擎侧)/dispatch(事件投递)/账务 三段。
@@ -288,15 +380,38 @@ async fn abandon_turn<D: DeviceClient>(
     }
 }
 
-/// 客户端主动 abort:[`EngineReq::Abort`] ⇒ 弃置**当前活跃** turn。
-/// 无活跃 turn = no-op 语义(`abandon` 自带,不报错 —— 竞态下 turn
-/// 可能刚自然终了)。`session` 仅作日志标识。
+/// 客户端主动 abort:[`EngineReq::Abort`] ⇒ **只弃该会话/该 turn**。
+/// 无活跃也无排队 = no-op(竞争下 turn 可能刚自然终了)。
 async fn drop_turn<D: DeviceClient>(
     running: &mut RunningEngine<D>,
     sinks: &mut HashMap<u64, mpsc::Sender<SinkEvent>>,
     session: u64,
+    turn: Option<u64>,
 ) {
-    abandon_turn(running, sinks, &format!("客户端 abort(session {session:#x})")).await;
+    let ev = match turn {
+        Some(t) => running.cancel_turn(t).await,
+        None => running.cancel_session(session).await,
+    };
+    let Some(ev) = ev else {
+        owl_shared::log_debug!(
+            "actor",
+            "abort 未命中(session {session:#x} turn {turn:?}) —— 可能刚自然终了"
+        );
+        return;
+    };
+    // 只投递该 turn 的 sink;不广播(合批档下广播 = 给别家会话发终态)
+    let tid = event_turn(&ev).unwrap_or(0);
+    match sinks.remove(&tid) {
+        Some(sink) => {
+            if !deliver(&sink, SinkEvent::Turn(ev)).await {
+                owl_shared::log_debug!(
+                    "actor",
+                    "abort 终态投递失败(turn {tid};请求方已断开 —— 终态本来就没人收)"
+                );
+            }
+        }
+        None => owl_shared::log_debug!("actor", "abort 终态无人接收(turn {tid})"),
+    }
 }
 
 /// 单条请求处置:Abort = 弃置活跃 turn;Tokenize = 旁路(不落 turn);
@@ -312,12 +427,34 @@ async fn handle_req<D: DeviceClient>(
     req: EngineReq,
 ) {
     match req {
-        EngineReq::Abort { session } => drop_turn(running, sinks, session).await,
+        EngineReq::Abort { session, turn, ack } => {
+            drop_turn(running, sinks, session, turn).await;
+            // 回执 = "该 turn 已从引擎账上消失"(会话闸据此释放;发送失败 =
+            // 请求方已走,无损失,但留痕)
+            if ack.send(()).is_err() {
+                owl_shared::log_debug!("actor", "abort 回执投递失败(请求方已断开)");
+            }
+        }
         EngineReq::Tokenize { text, chat_wrap, reply } => {
             let out = running.tokenize(&text, chat_wrap);
             if reply.send(out).is_err() {
                 // 请求方已断开(不许静默:这是可失败返回值)
                 owl_shared::log_debug!("actor", "tokenize 应答投递失败(请求方已断开)");
+            }
+        }
+        EngineReq::BatchStats { reply } => {
+            let snap = BatchStatsSnapshot {
+                max_batch: running.max_batch(),
+                batch_steps: running.batch_steps(),
+                has_batch_graph: running.has_batch_graph(),
+                queue_len: running.queue_len(),
+                active: running.active_len(),
+                queued: running.queued_snapshot(16),
+                rejects: running.reject_snapshot(16),
+                wait_hist: running.wait_hist(),
+            };
+            if reply.send(snap).is_err() {
+                owl_shared::log_debug!("actor", "batch stats 应答投递失败(请求方已断开)");
             }
         }
         EngineReq::VramReport { reply } => {
@@ -337,6 +474,22 @@ async fn handle_req<D: DeviceClient>(
                 open_window_blocks,
                 snap_evict,
                 pools,
+                batch: {
+                    let (facts, cap) = running.capacity_probe();
+                    BatchFacts {
+                        max_batch: running.max_batch(),
+                        steps: running.batch_steps(),
+                        graph: running.has_batch_graph(),
+                        free_pages: facts.free_pages,
+                        cache_pages: facts.cache_pages,
+                        reserved_pages: facts.reserved_pages,
+                        usable_pages: cap.usable_pages,
+                        n_slots: cap.n_slots,
+                        n_mem: cap.n_mem,
+                        n_eff: cap.n_eff,
+                        queued: running.queued_snapshot(16),
+                    }
+                },
             };
             if reply.send(snap).is_err() {
                 owl_shared::log_debug!("actor", "vram 账应答投递失败(请求方已断开)");
@@ -367,7 +520,13 @@ async fn accept<D: DeviceClient>(
             sinks.insert(tid, sink.clone());
             deliver(
                 &sink,
-                SinkEvent::Accepted { session: sid, turn: tid, prompt_tokens: pt, cached_tokens: cached },
+                SinkEvent::Accepted {
+                    session: sid,
+                    turn: tid,
+                    prompt_tokens: pt,
+                    cached_tokens: cached,
+                    max_new: running.turn_max_new(tid).unwrap_or(0),
+                },
             )
             .await;
         }

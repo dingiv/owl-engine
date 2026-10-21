@@ -560,6 +560,10 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     agent: &AgentCfg,
     // `/debug/agent` 诊断环(G5②):每轮必落一条(`TurnLedger` 的 Drop 是兜底网)
     trace: &Arc<AgentTrace>,
+    // **会话闸**(B5.1):同会话串行(引擎在 max_batch>1 时对同会话并发硬拒)
+    gates: &Arc<crate::session_gate::SessionGates>,
+    // **并发 permit**(P0):必须在会话闸**之后**取 —— 见 `serve()` 的注释
+    gate: &Arc<tokio::sync::Semaphore>,
 ) -> std::io::Result<()> {
     let mut req: ChatRequest = match serde_json::from_slice::<ChatRequest>(body) {
         Ok(r) => r,
@@ -630,6 +634,16 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         None if agent.implicit_session => Some(IMPLICIT_SESSION),
         None => None,
     };
+    // **会话闸**(B5.1 服务面契约):同一会话在引擎里**只许一个 turn**
+    // (引擎 `submit_session_opts` 在 max_batch>1 时对同会话并发**硬拒** ——
+    // 共享 KV/GDN = 结构性互踩,调度修不了)。闸覆盖 提交 → 终态 → 响应收尾;
+    // 跨会话不受影响(那正是合批的原料)。无会话(临时)= 不需要闸。
+    let _session_guard = match session {
+        Some(id) => Some(gates.acquire(id).await),
+        None => None,
+    };
+    // **并发位**：闸之后再占（同会话排队不占 permit；跨会话才竞争）
+    let _permit = gate.acquire().await;
     // G5②:诊断环开账(此后的每一条返回路径都可见 —— 显式 fail 或 Drop 兜底)
     let mut led = TurnLedger::new(trace);
     led.set_req(ReqFacts {
@@ -675,13 +689,24 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
 
     // 首笔:受理确认 / 提交拒绝(预算越界等,submit 边界落地)
     let mut usage = Usage::default();
+    // 预算被夹紧 ⇒ 响应头如实带出（`X-Owl-Max-New`；非私有 body 字段）
+    let mut clamped_max_new: Option<usize> = None;
     let turn = match sink_rx.recv().await {
-        Some(SinkEvent::Accepted { session, turn, prompt_tokens, cached_tokens }) => {
+        Some(SinkEvent::Accepted { session, turn, prompt_tokens, cached_tokens, max_new }) => {
             usage.prompt = prompt_tokens;
             usage.cached = cached_tokens;
+            // 预算被准入夹紧 ⇒ 如实留痕（客户端会看到 finish_reason=length）
+            if max_new < req.max_new(agent).0 {
+                clamped_max_new = Some(max_new);
+                owl_shared::log_warn!(
+                    "chat",
+                    "生成预算被夹紧:请求 {} → 实际 {max_new}(session {session:#x} turn {turn})",
+                    req.max_new(agent).0
+                );
+            }
             owl_shared::log_info!(
                 "chat",
-                "受理 session {session:#x} turn {turn}(stream={};tools={};think={};prompt={prompt_tokens};cached={cached_tokens})",
+                "受理 session {session:#x} turn {turn}(stream={};tools={};think={};prompt={prompt_tokens};cached={cached_tokens};max_new={max_new})",
                 mode == ReplyMode::Stream,
                 req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
                 req.enable_thinking(),
@@ -689,9 +714,19 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             Some((session, turn))
         }
         Some(SinkEvent::Rejected { err }) => {
-            // 预算越界 ⇒ 归一化为 pi 能认的 context-overflow 报文
-            // (否则 pi 不自动 compact;见 `error_json_for_reject` 注)
             led.fail(format!("提交被拒:{err}"));
+            // **容量拒绝**（引擎 submit 边界的 `admission:<code>`）⇒ 429；
+            // 其余（预算越界）仍走 pi 能认的 400 context-overflow 报文。
+            if let Some(code) = admission_code(&err) {
+                let retry = retry_after_secs(&err).to_string();
+                return http::respond_json_hdr(
+                    w,
+                    429,
+                    &error_json_rate_limit(code, "服务端容量不足（排队已满）—— 请按 Retry-After 退避重试"),
+                    &[("Retry-After", retry.as_str())],
+                )
+                .await;
+            }
             return http::respond_json(w, 400, &error_json_for_reject(err)).await
         }
         // 契约:首笔必为 Accepted/Rejected(actor 在 pump 前投递)⇒ 不会走到
@@ -729,16 +764,66 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             if let Err(e) = emit_items(w, mode, &id, model_name, &mut acc, &mut role_sent, $items)
                 .await
             {
-                abort_turn(&tx, turn.map(|(s, _)| s)).await;
+                // **先关 sink 再等回执**(2026-10-20 真机定谳):本任务若还持有
+                // `sink_rx` 等 abort 回执,actor 的投递就一直成功 ⇒ 它**察觉不到**
+                // 断流,会把整个 turn 跑完(实测:256 tok 的流断掉后仍烧满 5s+,
+                // 回执超时、会话闸也被拖住)。`close()` 让 actor 下一笔投递失败
+                // ⇒ 走既有 "断流 ⇒ 弃置"(≤1 采样步)。
+                sink_rx.close();
+                abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
                 return Err(e);
             }
         };
     }
     if mode == ReplyMode::Stream {
-        http::respond_sse_head(w).await?;
+        match clamped_max_new {
+            Some(m) => {
+                let v = m.to_string();
+                http::respond_sse_head_hdr(w, &[("X-Owl-Max-New", v.as_str())]).await?
+            }
+            None => http::respond_sse_head(w).await?,
+        }
     }
+    // **排队超时**(`[agent] queue_wait_ms`;0 = 关):提交后迟迟不见实质进展 ⇒
+    // 取消该 turn + 429（D2 的 R 档）。`started` = 已见到 prefill/token/终态。
+    let mut started = false;
     loop {
-        match sink_rx.recv().await {
+        let next = if !started && agent.queue_wait_ms > 0 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(agent.queue_wait_ms as u64),
+                sink_rx.recv(),
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    owl_shared::log_warn!(
+                        "chat",
+                        "排队超时 {}ms ⇒ 取消 turn 并回 429（session {:?}）",
+                        agent.queue_wait_ms,
+                        session
+                    );
+                    // 先关 sink（actor 下一笔投递失败 ⇒ 按断流弃置），再指名取消 + 等回执
+                    sink_rx.close();
+                    abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
+                    return respond_queue_timeout(w, mode).await;
+                }
+            }
+        } else {
+            sink_rx.recv().await
+        };
+        if matches!(
+            next,
+            Some(SinkEvent::Turn(
+                TurnEvent::Prefill { .. }
+                    | TurnEvent::Token { .. }
+                    | TurnEvent::Completed { .. }
+                    | TurnEvent::Failed { .. }
+            ))
+        ) {
+            started = true;
+        }
+        match next {
             Some(SinkEvent::Turn(TurnEvent::Token { delta, .. })) => {
                 usage.completion += 1;
                 led.first_token(); // TTFT(幂等)
@@ -835,26 +920,66 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                     }
                     ReplyMode::Aggregate => {
                         let msg = agg_message(&acc, splitter.tool_calls());
-                        http::respond_json(
-                            w,
-                            200,
-                            &completion_json(
-                                &id,
-                                model_name,
-                                &msg,
-                                reason,
-                                usage.prompt,
-                                usage.completion,
-                                usage.cached,
-                                usage.reasoning,
-                            ),
-                        )
-                        .await
+                        let body = completion_json(
+                            &id,
+                            model_name,
+                            &msg,
+                            reason,
+                            usage.prompt,
+                            usage.completion,
+                            usage.cached,
+                            usage.reasoning,
+                        );
+                        match clamped_max_new {
+                            Some(m) => {
+                                let v = m.to_string();
+                                http::respond_json_hdr(
+                                    w,
+                                    200,
+                                    &body,
+                                    &[("X-Owl-Max-New", v.as_str())],
+                                )
+                                .await
+                            }
+                            None => http::respond_json(w, 200, &body).await,
+                        }
                     }
                 };
             }
             Some(SinkEvent::Turn(TurnEvent::Failed { err, .. })) => {
                 led.fail(format!("turn 失败:{err}"));
+                // **准入拒绝**(`admission:<code>`)：用 OpenAI 协议内的标准手段
+                // 表达 —— 非流式 `429 + Retry-After`;流式头已发,走既有错误帧收口
+                // (不自造 SSE 事件类型)。
+                if let Some(code) = admission_code(&err) {
+                    let retry = retry_after_secs(&err).to_string();
+                    let msg = format!(
+                        "服务端容量不足（{code}）—— 在跑请求优先;请按 Retry-After 退避重试"
+                    );
+                    return match mode {
+                        ReplyMode::Aggregate => {
+                            http::respond_json_hdr(
+                                w,
+                                429,
+                                &error_json_rate_limit(code, &msg),
+                                &[("Retry-After", retry.as_str())],
+                            )
+                            .await
+                        }
+                        ReplyMode::Stream => {
+                            if let Err(e) = http::sse_data(w, &error_json(msg).to_string()).await {
+                                owl_shared::log_info!("chat", "准入错误帧写失败(客户端可能已断开): {e}");
+                            }
+                            if let Err(e) = http::sse_data(w, "[DONE]").await {
+                                owl_shared::log_info!("chat", "准入收尾帧写失败(客户端可能已断开): {e}");
+                            }
+                            if let Err(e) = http::sse_end(w).await {
+                                owl_shared::log_info!("chat", "准入终止块写失败(客户端可能已断开): {e}");
+                            }
+                            Ok(())
+                        }
+                    };
+                }
                 return match mode {
                     // SSE 中途错误:协议无标准错误帧,error json + DONE 收口
                     ReplyMode::Stream => {
@@ -906,12 +1031,94 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// 客户端写失败 ⇒ 请求引擎弃置该会话的活跃 turn(AGT-10)。
-/// 投递失败本身不可恢复(actor 已退役),但**不许静默**。
-async fn abort_turn(tx: &mpsc::Sender<EngineReq>, session: Option<u64>) {
+/// **429 错误体**（OpenAI 错误 schema：`type = rate_limit_error` + 稳定 `code`）。
+/// 准入拒绝用它 —— 客户端按 `Retry-After` 退避，不需要任何私有字段。
+pub fn error_json_rate_limit(code: &str, msg: &str) -> Value {
+    json!({
+        "error": {
+            "message": msg,
+            "type": "rate_limit_error",
+            "param": Value::Null,
+            "code": code,
+        }
+    })
+}
+
+/// **排队超时 → 429**（`[agent] queue_wait_ms`;D2 的 R 档）。
+///
+/// 非流式 = `429 + Retry-After`;流式头已发 ⇒ 既有错误帧收口（不自造事件）。
+async fn respond_queue_timeout<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    mode: ReplyMode,
+) -> std::io::Result<()> {
+    let msg = "排队超时:服务端容量不足 —— 请按 Retry-After 退避重试";
+    let body = error_json_rate_limit("queue_timeout", msg);
+    match mode {
+        ReplyMode::Aggregate => {
+            http::respond_json_hdr(w, 429, &body, &[("Retry-After", "5")]).await
+        }
+        ReplyMode::Stream => {
+            if let Err(e) = http::sse_data(w, &body.to_string()).await {
+                owl_shared::log_info!("chat", "排队超时帧写失败(客户端可能已断开): {e}");
+            }
+            if let Err(e) = http::sse_data(w, "[DONE]").await {
+                owl_shared::log_info!("chat", "排队超时收尾帧写失败(客户端可能已断开): {e}");
+            }
+            http::sse_end(w).await
+        }
+    }
+}
+
+/// **引擎给出的退避建议**（`admission:<code> retry_ms=<n>`；无则 `None`）
+pub fn admission_retry_ms(err: &str) -> Option<u64> {
+    err.split_whitespace()
+        .find_map(|w| w.strip_prefix("retry_ms="))
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+/// 退避秒数 = `ceil(ms/1000)`，夹在 1..=30（客户端不该被估成分钟级）
+pub fn retry_after_secs(err: &str) -> u64 {
+    admission_retry_ms(err)
+        .map(|ms| ms.div_ceil(1000).clamp(1, 30))
+        .unwrap_or(5)
+}
+
+/// **准入拒绝的错误码**（引擎 `Failed{err:"admission:<code>"}` 的协议面投影）。
+///
+/// 单源：服务面只认这个前缀 —— 不新造 SSE 事件类型、不加私有字段；
+/// 非流式翻 `429 + Retry-After`（OpenAI 协议内的标准手段），流式走既有
+/// 错误帧收口。空码/非法码 = `None`（不猜，走普通错误路径）。
+pub fn admission_code(err: &str) -> Option<&str> {
+    // 只取**第一个词**作为码（引擎的错误串是 `admission:<code> —— 人类可读细节`；
+    // 把整段当 `code` 会污染客户端可见的协议字段）。
+    err.strip_prefix("admission:")
+        .map(|rest| rest.trim())
+        .and_then(|rest| rest.split_whitespace().next())
+        .filter(|c| !c.is_empty())
+}
+
+/// 客户端写失败 ⇒ 请求引擎弃置**该 turn**(AGT-10;B5.1 起必须指名)。
+///
+/// 语义要点(合批档):
+/// - `turn` 已知(Accepted 之后)= 精确取消该 turn —— **不许**走"弃当前执行 turn"
+///   (那会杀掉同批别家会话的 turn);
+/// - `turn` 未知(断在受理帧之前)= 按会话找(会话闸保证该会话至多一个 turn);
+/// - **等 actor 回执再返回**:会话闸在本函数返回后才释放(函数尾),这样下一次
+///   同会话提交不会撞上引擎的"同会话并发"硬拒。回执超时只告警(不静默)。
+async fn abort_turn(tx: &mpsc::Sender<EngineReq>, session: Option<u64>, turn: Option<u64>) {
+    // 临时会话(None)= 无键可寻;引擎会在 sink drop 后自弃(actor 下一个投递点)
     let Some(session) = session else { return };
-    if tx.send(EngineReq::Abort { session }).await.is_err() {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    if tx.send(EngineReq::Abort { session, turn, ack: ack_tx }).await.is_err() {
         owl_shared::log_warn!("chat", "abort 投递失败(actor 已退役,引擎随进程退出)");
+        return;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            owl_shared::log_debug!("chat", "abort 回执通道关闭(actor 已退役)");
+        }
+        Err(_) => owl_shared::log_warn!("chat", "abort 回执超时(5s;引擎可能正忙) "),
     }
 }
 
@@ -1270,5 +1477,30 @@ mod tests {
         );
         // 未知字段:本端点开着 deny_unknown_fields(自有面,不背兼容史)
         assert!(serde_json::from_str::<TokenizeRequest>(r#"{"prompt":"x","nope":1}"#).is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{admission_code, admission_retry_ms, retry_after_secs};
+
+    #[test]
+    fn admission_prefix_is_the_only_protocol_surface() {
+        assert_eq!(admission_code("admission:no_memory"), Some("no_memory"));
+        assert_eq!(admission_code("admission: no_slot "), Some("no_slot"));
+        assert_eq!(admission_code("admission:"), None, "空码不许当拒绝语义");
+        assert_eq!(admission_code("boom"), None);
+        assert_eq!(admission_code("admission"), None, "缺冒号 = 普通错误");
+    }
+
+    /// 引擎的退避建议：`admission:<code> retry_ms=<n>` → 秒（1..=30）
+    #[test]
+    fn retry_after_comes_from_engine_estimate() {
+        assert_eq!(admission_retry_ms("admission:no_memory retry_ms=12000"), Some(12_000));
+        assert_eq!(retry_after_secs("admission:no_memory retry_ms=12000"), 12);
+        assert_eq!(retry_after_secs("admission:no_memory retry_ms=200"), 1, "不足 1s 夹到 1");
+        assert_eq!(retry_after_secs("admission:no_memory retry_ms=999999"), 30, "封顶 30");
+        assert_eq!(retry_after_secs("admission:no_slot"), 5, "无建议值 = 5s 保守");
     }
 }

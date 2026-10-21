@@ -479,7 +479,7 @@ mod bank_tests {
             prefix_cache,
             cache_share_permille: if prefix_cache { 500 } else { 0 },
             host_bytes: 0,
-            world: 1,
+            world: 1, // 测试：单卡平面（TP 宿主腿的 world 语义由 store 门覆盖）
         }
     }
 

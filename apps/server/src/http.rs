@@ -168,6 +168,7 @@ fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
         400 => "Bad Request",
+        429 => "Too Many Requests",
         404 => "Not Found",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
@@ -193,6 +194,28 @@ pub async fn respond_json<W: AsyncWriteExt + Unpin>(
     w.flush().await
 }
 
+/// JSON 应答 + 自定义头(准入拒绝用:`429` + `Retry-After`;OpenAI 协议内的标准手段)
+pub async fn respond_json_hdr<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    code: u16,
+    v: &Value,
+    headers: &[(&str, &str)],
+) -> io::Result<()> {
+    let body = serde_json::to_vec(v).map_err(io::Error::other)?;
+    let mut head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        status_text(code),
+        body.len()
+    );
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    w.write_all(head.as_bytes()).await?;
+    w.write_all(&body).await?;
+    w.flush().await
+}
+
 /// 纯文本应答(诊断面:/debug/perf 的树状报告 —— 人读优先,不过 JSON)
 pub async fn respond_text<W: AsyncWriteExt + Unpin>(
     w: &mut W,
@@ -209,12 +232,28 @@ pub async fn respond_text<W: AsyncWriteExt + Unpin>(
     w.flush().await
 }
 
-/// SSE 响应头(**chunked 定界**:流自带终止块,连接可复用 —— G5④)
-pub async fn respond_sse_head<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n";
+/// SSE 响应头(**chunked 定界**:流自带终止块,连接可复用 —— G5④)。
+/// `headers` = 附加头（如 `X-Owl-Max-New`；与 `respond_json_hdr` 同律）。
+pub async fn respond_sse_head_hdr<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    headers: &[(&str, &str)],
+) -> io::Result<()> {
+    let mut head = String::from(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n",
+    );
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
     w.write_all(head.as_bytes()).await?;
     w.flush().await
 }
+
+/// 无附加头的 SSE 头（旧调用点）
+pub async fn respond_sse_head<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
+    respond_sse_head_hdr(w, &[]).await
+}
+
 
 /// 一条 SSE data 事件(chunked 帧;json 文本须已单行化 —— serde_json 天然无换行)
 pub async fn sse_data<W: AsyncWriteExt + Unpin>(w: &mut W, data: &str) -> io::Result<()> {
@@ -305,6 +344,33 @@ mod tests {
         assert!(!r.keep_alive && !r.http_11, "1.0 缺省 = 关");
         let r = read1("GET /x HTTP/1.0\r\nConnection: keep-alive\r\n\r\n").await;
         assert!(r.keep_alive && !r.http_11, "1.0 显式 keep-alive 才复用");
+    }
+
+    /// SSE 头带自定义头（`X-Owl-Max-New`）：头在数据帧之前、且 chunked 定界不变
+    #[tokio::test]
+    async fn sse_head_carries_extra_headers() {
+        let mut out: Vec<u8> = Vec::new();
+        super::respond_sse_head_hdr(&mut out, &[("X-Owl-Max-New", "1234")])
+            .await
+            .expect("head");
+        let s = String::from_utf8(out).expect("utf8");
+        assert!(s.contains("Transfer-Encoding: chunked"), "{s}");
+        assert!(s.contains("X-Owl-Max-New: 1234"), "{s}");
+        assert!(s.ends_with("\r\n\r\n"), "{s}");
+    }
+
+    /// **准入 429 面**：`respond_json_hdr` 必须带标准头（客户端据此退避）
+    #[tokio::test]
+    async fn json_with_headers_carries_retry_after() {
+        let mut out: Vec<u8> = Vec::new();
+        let body = serde_json::json!({"error": {"message": "busy", "type": "rate_limit_error"}});
+        super::respond_json_hdr(&mut out, 429, &body, &[("Retry-After", "5")])
+            .await
+            .expect("429");
+        let s = String::from_utf8(out).expect("utf8");
+        assert!(s.starts_with("HTTP/1.1 429 Too Many Requests"), "{s}");
+        assert!(s.contains("Retry-After: 5"), "{s}");
+        assert!(s.contains("\"rate_limit_error\""), "{s}");
     }
 
     /// **G5④ SSE 帧**:chunked 长度行 + 后随 CRLF + 终止块 —— 不再 close 定界

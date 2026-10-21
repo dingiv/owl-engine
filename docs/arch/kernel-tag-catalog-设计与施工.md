@@ -93,11 +93,11 @@ registry.tag_index().counts();
 - `build.rs` 生成 `ops_table.rs`（212 张 / 16 域）与 `kernel_tags.rs`。
 - `crates/kernels/src/tag_index.rs`：倒排索引 + 结构化错误。
 - `OpRegistry` 持有 `tag_index`，boot 日志打印词表/算子数。
-- `cargo test -p owl-kernels --lib`：**110 passed / 0 failed**；
+- `cargo test -p owl-kernels --lib`：**115 passed / 0 failed**；
 - `cargo test -p owl-kernels --test op_tables`：**10 passed / 0 failed**；
 - `cargo test -p owl-shared`：104 passed / 0 failed；
-- `cargo test -p owl-models --lib kernel_env`：5/5；
-- `cargo test -p owl-cuda --lib tag_filter_tests`：3/3；
+- `cargo test -p owl-models --lib kernel_env`：6/6；
+- `cargo test -p owl-cuda --lib tag_filter_tests`：5/5；
 - `cargo test -p server --test config_check`：6/6。
 - 顺手修了三处存量门：`cublas_gemm_f16_dst` 漏登两处锁、GGUF q8_1 静态断言
   读错文件（`gguf_quant.cu` → `gguf.cuh`）。
@@ -128,11 +128,60 @@ runtime.tp_ordinals 双卡          → feat.tp
 - facet 之间 AND；
 - `*` / `TagFilter::wildcard()` = 全放行（诊断/兜底）。
 
+### 5.1 池布局门（2026-10-21 启动验收补）
+
+tag 只表达“池 dtype / 量化 / feature”，**不表达池布局**。历史声明面同一
+dtype 同时保留 classic 与 KnHD 两套写者（布局翻转面），若只按 tag 过滤，
+两套写者会同时活跃 ⇒ 装配门 E14 双寻址拒启。现 `TagFilter` 增加
+`main_layout` / `draft_layout` 两个布局门：
+
+- 生产档：主池 `PROD_MAIN_KV_LAYOUT = Knhd`；草稿池
+  `PROD_DRAFT_KV_LAYOUT = Classic`（DFlash2 自块直读仍走 classic 岛）；
+- 布局的唯一真源是 `PoolAccess.layout`，过滤器直接对声明面投影，不手抄核名；
+- 由 `TagFilter::with_prod_kv_layouts()` 在两处派生点统一挂载
+  （`owl-cuda` 的配置派生 + `KernelSelectionEnv`）；
+- 纯 host 单测 `every_active_pool_reader_has_a_same_instance_writer` 同时锁
+  E10（读者必须有同池同布局同 dtype 写者）与 E14（活跃写者布局唯一）。
+
+同日修正两处声明面漏配：
+- `owl_naive_attn_nc_*_knhd` 四变体（0 调用点）原误打 `kv.draft.*`，实际
+  对应主池 KnHD，已改 `kv.main.*` + `POOL(kv.main, Knhd)`；
+- classic 写核 `owl_reshape_and_cache_fp8kv`、
+  `owl_reshape_and_cache_fp8kv_bf16`、`vllm_reshape_and_cache_f16` 实为
+  草稿池写者，已收窄为 `kv.draft.*` + `POOL(kv.draft, Classic)`。
+
 落地两处：
 1. `KernelSelectionEnv::resolve`：pick 后按 `tag_filter` 校验，不符返回
    `ModelError::Msg`（不 panic）；
 2. `owl-cuda` server 的 `admission_check`：所有发射必经的最终门；
    `DiagOpts::from_config` 从 `OwlConfig` 自动派生，不读 env。
+
+### 5.2 辅助 plan 的量化 tag 并集（2026-10-21 W4A8 组合修）
+
+**问题**：主干 `model.quant = "w4a8"` 时，`TagFilter` 只允许
+`quant.w4a8`；但 `head_quant = "rtn-int4-g32"` 的 lm_head 和 DFlash2
+草稿都是 **W4A16** 权重，实际发射 `marlin_gemm_w4a16_awq` /
+`marlin_gemm_w4a16_bf16` ⇒ boot 准入拒。
+
+**修法**：允许集表达“本进程可能用到的 plan 并集”，而不是把主干
+quant 当成全进程唯一 quant：
+
+- `FeatureCaps.head_int4`（`KernelSelectionEnv`）与
+  `tag_filter_from_config`（`owl-cuda`）在 int4 头时补
+  `quant.w4a16 + quant.awq`；
+- `SpecRuntime::draft_env.quant` 按草稿检查点事实设为
+  `W4A16`（量化族）或 `F16`（未量化族），不再继承主干的 W4A8；
+- DFlash2 的全局准入集在 `model.dflash2_dir.is_some()` 时补
+  `quant.w4a16`。
+
+这是**准入允许集**，不是路由：每个算子仍只带一个 `quant.weight`
+tag，选核仍由层的 `QuantPlan`/op_id 决定；无 int4 头、无 DFlash2 的
+纯 W4A8 档仍拒绝 W4A16 核（单测 `w4a8_without_aux_keeps_w4a16_out`）。
+
+真机（2026-10-21，GPU2 单张 3090 Ti，4k 短档）：`model.quant=w4a8` +
+`head_quant=rtn-int4-g32` + DFlash2 `depth=7` 启动成功，tag 激活集 98 项，
+`marlin_gemm_w4a16_awq` / `marlin_gemm_w4a8_awq` 两个 selfcheck 均绿；
+`/health` 与一次 chat 请求均 200。
 
 典型结果：W4A16 档拒 `marlin_gemm_w4a8_awq` / `owl_gguf_gemm_q4k`；
 GGUF 档拒 marlin；fp8 KV 档拒 `vllm_paged_attention_v2_f16_*`；
@@ -147,6 +196,20 @@ vision 关时拒视觉核；spec 关时拒草稿核；通用 rmsnorm/add 始终�
   `pools::KV_MAIN` / `pools::KV_DRAFT` POOL 声明（机器门）。
 - `feat.graph` 由宏从 `CAPTURE = NoHostWork` 自动注入，`tag_index` 逐核双向锁。
 - `[dispatch] tag_wildcard = true` 提供 `*` 诊断逃生门。
+
+### 6.1 真机启动验收（2026-10-21）
+
+`profiles/tp27b-3080-262k-vlm.toml`（2×3080，主池 fp8 / 草稿 BF16 / d7 /
+vision）本机启动：
+
+```text
+[kernels] tag 派生激活集:134 项(池写集审计通过)
+[kernels] tag 索引:47 项词表 / 212 算子(已打 212)
+[boot] 就绪 http://127.0.0.1:8138
+```
+
+短文本请求返回 `ready`；`bird.png` 经 OpenAI `image_url` 返回 `Penguin`；
+日志零 `tag_filter` 拒绝、零装配失败。
 
 ## 7. 下一步（未做）
 

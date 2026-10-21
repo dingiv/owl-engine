@@ -76,7 +76,7 @@
 //! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
 //! | pool | disk_cache_mb / snap_disk_mb | usize / 0、0(**磁盘两层分片**;0 = 关层) |
 //! | pool | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
-//! | spec | depth / dumb / draft_kv_fp8 | usize 0(off)、flag、flag |
+//! | spec | depth / draft / dumb / draft_kv_fp8 | usize 0(off)、SpecDraft auto/mtp/dflash2、flag、flag |
 //! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
 //! | spec | degrade_after / probe_every | usize / 6、8(降级首探窗口;旧 64 = 长尾税) |
 //! | sampling | mode | SamplerMode 枚举("greedy"\\|"sampling")/ sampling |
@@ -112,8 +112,6 @@
 //! | dispatch | fi_min_tokens | usize / 1(FI 接管的 T 下限;128 = 复现旧行为) |
 //! | dispatch | xqa_prefill | flag / false(prefill 尾块走 XQA;主路径禁止开) |
 //! | graph | no_graph | flag / false(总闸:eager 直发,跳过**全部**图捕获) |
-//! | graph | prefill_bucket | off\|t512\|geobuckets / **off**(prefill 图**独立**
-//! |   |   | 开关:off = 今天行为;t512 = 只建 512 桶;geobuckets = 全桶族) |
 //! | agent | template_path | Option<String> / None(相对路径 = 相对 model.dir) |
 //! | agent | implicit_session | flag / false(AGT-09:不带 session 键 ⇒ 会话 0) |
 //! | agent | default_max_new / max_new_cap | usize / 4096、8192 |
@@ -241,6 +239,18 @@ impl GraphInstantiateFlags {
 // §2 config modules(每 module 管一个功能域;deny_unknown = 键名打错拒启)
 // ============================================================================
 
+fn default_gdn_slots() -> usize {
+    PoolCfg::default().gdn_slots
+}
+
+fn default_newcomer_min() -> usize {
+    4096
+}
+
+fn default_min_gen() -> usize {
+    256
+}
+
 fn default_max_batch() -> usize {
     1
 }
@@ -316,6 +326,26 @@ pub struct RuntimeCfg {
     /// 往返;4-token 的尾块也要 249ms)⇒ `<chunk` 的尾块是纯亏。
     /// 默认 **0 = 关 = 逐字节旧行为**(块长 = min(chunk, 剩余))。
     pub prefill_tail_merge: usize,
+    /// **相位时间片**:每 `slice_every` 拍 decode 之后插**一片** prefill
+    /// (0 = 关 = 旧行为:prefill 独占泵)。在位者 ITL 上界 ≈
+    /// `solo + slice_ms / (slice_every+1)`。见 `sched_policy` 模块头 P1。
+    #[serde(default)]
+    pub slice_every: usize,
+    /// 时间片单片 prefill token 数(0 = 用整 `prefill_chunk`)
+    #[serde(default)]
+    pub slice_tokens: usize,
+    /// **准入:给未来新人的预留**(token/人;反推在位者的生成封顶)
+    #[serde(default = "default_newcomer_min")]
+    pub newcomer_min_tokens: usize,
+    /// **准入:在位者的最小生成量**(低于它就不留新人预留 —— 在位者优先)
+    #[serde(default = "default_min_gen")]
+    pub min_gen_tokens: usize,
+    /// **准入:池保留页**(0 = 自动 `min(nb/64, 8)`)
+    #[serde(default)]
+    pub reserve_pages: usize,
+    /// **准入:等待队列上限**(0 = 无界;超出 ⇒ 新来者 429 `no_slot`)
+    #[serde(default)]
+    pub max_queue: usize,
     /// **测试设备门控值**(不入 toml;测试入口自填):`OWL_TEST_DEVICE` 的 **BDF**
     /// (如 `41:00.0`)。`Some` = GPU 门已过。**CUDA 序号禁用**(序会漂)。
     #[serde(skip)]
@@ -395,6 +425,11 @@ pub struct ModelCfg {
     /// (z-lab)喂引擎 = 草稿全噪声 AL=0;装载期家族嗅探拒启)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dflash2_dir: Option<String>,
+    /// **MTP 头覆盖路径**(2026-10-21;`None` = 用 `model.dir` 自带 mtp.* /
+    /// 同 GGUF 文件)。用于"主模型 + 外部 GGUF MTP 头"的验证档;
+    /// 支持目录( HF/AWQ )或 `.gguf` 单文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtp_dir: Option<String>,
     /// C1(2026-10-11):untied lm_head 头部量化方案(枚举严格;映射点
     /// 在 engine loader:HeadQuant → QuantPlan)。质量门台账见枚举值注。
     pub head_quant: HeadQuant,
@@ -412,7 +447,10 @@ pub struct PoolCfg {
     /// **虚拟化档可小于上下文**(`[kvmem].pool_overcommit`;boot 硬校验兜底)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_tokens: Option<usize>,
-    /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)
+    /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)。
+    /// **0 = 自动 = `[server].max_concurrency`**(并发数配几个就几格 —— 用户裁决
+    /// 2026-10-20);非 0 = 显式值(旧档逐字节不变)。
+    #[serde(default = "default_gdn_slots")]
     pub gdn_slots: usize,
     /// **末段页对齐**(缺省 `true`;前缀复用闭环)。
     ///
@@ -644,11 +682,27 @@ impl KvmemCfg {
     }
 }
 
-/// 投机解码(spec 三态/草稿池量化/B4 降级参数/verify 图诊断)
+/// **草稿族选择**(`[spec] draft`;2026-10-21 MTP 接回)。
+///
+/// `auto` = 保持历史裁决:有 `model.dflash2_dir` 走 DFlash2,否则检查点自带
+/// `mtp.*` 走 MTP;两者都没有则回落 DecodeBatch。显式 `mtp` / `dflash2`
+/// 用于同检查点两族并存时钉死，缺资产 = boot 响亮拒（不静默回退）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpecDraft {
+    #[default]
+    Auto,
+    Mtp,
+    Dflash2,
+}
+
+/// 投机解码(spec 三态/草稿族/草稿池量化/B4 降级参数/verify 图诊断)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpecCfg {
     pub depth: usize,
+    /// 草稿族(缺省 auto;显式选择见 [`SpecDraft`])
+    pub draft: SpecDraft,
     pub dumb: bool,
     pub draft_kv_fp8: bool,
     /// verify 图 taps 退回 last_hidden(排查开关)
@@ -1098,30 +1152,6 @@ pub mod sync_bit {
 pub struct GraphCfg {
     /// eager 直发,跳过图捕获(**总闸**:连 decode/verify/fold/propose 族一起关)
     pub no_graph: bool,
-    /// **prefill 图的独立档位**(P1;2026-10-15 立 —— 与总闸分离,可单关
-    /// prefill 而不动现役 decode 图族)。
-    ///
-    /// 分层而非 bool 的理由:回滚时要能**逐级降**,不必在"全开/全关"之间跳
-    /// - `off`(缺省):完全不建 prefill 图 = 今天行为,零影响;
-    /// - `t512`:只建 512 桶(最小面:显存最小、命中面 = 满块);
-    /// - `geobuckets`:全桶族 {32,64,128,256,512}(尾块也吃图,显存 ≈ 374 MiB)。
-    ///
-    /// 运行时另有**熔断**:某桶捕获失败/回放出错 ⇒ 该桶永久降级 eager
-    /// (只 warn 一次,不重试),与静态档位叠加。
-    pub prefill_bucket: PrefillBucket,
-}
-
-/// prefill 图档(见 [`GraphCfg::prefill_bucket`];serde 小写:off/t512/geobuckets)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PrefillBucket {
-    /// 不建 prefill 图(= 今天行为)
-    #[default]
-    Off,
-    /// 只建 t=512 桶(最小面)
-    T512,
-    /// 全桶族 {32,64,128,256,512}
-    Geobuckets,
 }
 
 /// 工具调用输出格式(agent.tool_call_format;**jinja 模板同名变量**)。
@@ -1166,6 +1196,10 @@ pub struct AgentCfg {
     /// 请求带 `reasoning_effort` 时以请求为准)。None = 不传 ⇒ 模板取自己的缺省
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// **排队超时(毫秒;0 = 关)**:提交后这么久还没看到第一个 prefill/token
+    /// ⇒ 取消该 turn 并回 `429 + Retry-After`(标准 OpenAI 语义;D2 的 R 档)。
+    #[serde(default)]
+    pub queue_wait_ms: usize,
 }
 
 impl Default for AgentCfg {
@@ -1179,6 +1213,7 @@ impl Default for AgentCfg {
             tool_call_format: ToolCallFormat::Xml,
             auto_disable_thinking_with_tools: false,
             reasoning_effort: None,
+            queue_wait_ms: 0,
         }
     }
 }
@@ -1239,6 +1274,12 @@ impl Default for RuntimeCfg {
             prefill_chunk: 512,
             max_batch: 1,
             prefill_tail_merge: 0,
+            slice_every: 0,
+            slice_tokens: 0,
+            newcomer_min_tokens: 4096,
+            min_gen_tokens: 256,
+            reserve_pages: 0,
+            max_queue: 0,
             test_device: None,
             server_url: None,
         }
@@ -1295,6 +1336,7 @@ impl Default for SpecCfg {
         Self {
             tp_draft: false,
             depth: 0,
+            draft: SpecDraft::Auto,
             dumb: false,
             draft_kv_fp8: false,
             notaps: false,
@@ -1395,6 +1437,48 @@ fn record_origins(v: &toml::Value, prefix: &str, origin: &Origin, out: &mut Orig
 /// 是**可操作**的那一半(点名新键 + 值域)—— 使用者不必去翻旧分支。
 ///
 /// 新增退役键 = 在表里加一行(`旧写法 → 新写法`)。
+/// **全字段显式校验**(配置档):把 `Default` 序列化出来的**全键表**当作 schema,
+/// 逐层比对文件里是否**每一个键都在场**;缺一个都拒启(列出全量,一次改完)。
+///
+/// 例外(自然豁免):`Option::None` 与 `skip_serializing_if` 的字段不出现在
+/// schema 里,因此**不要求**写(例如 `pool_tokens`、`runtime.device.*` 三件互斥)。
+fn check_explicit_complete(file_v: &toml::Value, path: &Path) -> Result<(), String> {
+    let schema = toml::Value::try_from(&OwlConfig::default())
+        .map_err(|e| format!("内部:schema 序列化失败 {e}"))?;
+    let mut missing: Vec<String> = Vec::new();
+    collect_missing(&schema, file_v, "", &mut missing);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    Err(format!(
+        "配置档 `{}` 未显式声明 {} 个字段(缺省不再隐式兜底 ⇒ 拒启):\n  {}\n\
+         生成完整档的最快方式:\n  server -p <旧档> --print-config > <新档>.toml",
+        path.display(),
+        missing.len(),
+        missing.join("\n  ")
+    ))
+}
+
+/// 递归比对:schema 有的键,文件里必须有。
+fn collect_missing(schema: &toml::Value, got: &toml::Value, prefix: &str, out: &mut Vec<String>) {
+    let toml::Value::Table(st) = schema else { return };
+    for (k, sv) in st {
+        let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+        match got.get(k) {
+            None => out.push(path),
+            Some(gv) => {
+                if let toml::Value::Table(_) = sv {
+                    // 表:只在文件也给了表时递归(标量覆盖整表 = 结构错误,交给反序列化)
+                    if let toml::Value::Table(_) = gv {
+                        collect_missing(sv, gv, &path, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
     if v.get("flavor").is_some() {
         return Err(
@@ -1625,6 +1709,26 @@ pub fn parse_cli_set(s: &str) -> Result<(String, toml::Value), String> {
     Ok((key.to_string(), val))
 }
 
+/// **自动派生**:`[pool].gdn_slots = 0` ⇒ `[server].max_concurrency`
+/// (并发数配几个就几格 —— 用户裁决 2026-10-20)。显式非 0 值逐字节不变。
+fn derive_auto_pool(v: &mut toml::Value) -> Result<(), String> {
+    let Some(root) = v.as_table_mut() else { return Ok(()) };
+    let concurrency = root
+        .get("server")
+        .and_then(|s| s.get("max_concurrency"))
+        .and_then(|c| c.as_integer())
+        .unwrap_or(8)
+        .max(1) as usize;
+    let Some(pool) = root.get_mut("pool").and_then(|p| p.as_table_mut()) else {
+        return Ok(());
+    };
+    let g = pool.get("gdn_slots").and_then(|g| g.as_integer()).unwrap_or(-1);
+    if g == 0 {
+        pool.insert("gdn_slots".into(), toml::Value::Integer(concurrency as i64));
+    }
+    Ok(())
+}
+
 impl OwlConfig {
 
     /// **统一 loader**(Default → 基准文件 → 覆盖文件;CLI 由入口决定前两者的
@@ -1659,6 +1763,15 @@ impl OwlConfig {
         let mut origins = Origins::new();
         let mut layer_names: Vec<String> = Vec::new();
         if let Some(b) = base {
+            // **配置档必须全字段显式**(2026-10-21 用户裁决):
+            // 缺任何键 = **拒启**,不再用代码缺省兜底(旧行为让各会话跑在
+            // "半份配置 + 旧缺省"上,启动点不可复现)。
+            //
+            // 站点层(`layers`)与 CLI 仍是**覆盖层**(它们只覆写,不负责补全)。
+            let mut file_v = toml::Value::Table(toml::map::Map::new());
+            let mut file_origins = Origins::new();
+            load_config_into(b, &mut file_v, 0, &mut Vec::new(), &mut file_origins)?;
+            check_explicit_complete(&file_v, b)?;
             load_config_into(b, &mut v, 0, &mut Vec::new(), &mut origins)?;
             layer_names.push(b.display().to_string());
         }
@@ -1676,6 +1789,7 @@ impl OwlConfig {
             layer_names.push("cli".into());
         }
         let meta = resolve::apply(&mut v, &mut origins)?;
+        derive_auto_pool(&mut v)?;
         reject_retired_keys(&v)?;
         let config: Self = v
             .try_into()
@@ -1704,6 +1818,7 @@ impl OwlConfig {
         let mut origins = Origins::new();
         record_origins(&v, "", &Origin::File("<inline>".into()), &mut origins);
         let meta = resolve::apply(&mut v, &mut origins)?;
+        derive_auto_pool(&mut v)?;
         reject_retired_keys(&v)?;
         let config: Self = v
             .try_into()
@@ -1817,38 +1932,6 @@ impl OwlConfig {
         // 单图烘 plan 档必须"图不烘表"(否则回放那次 memcpy 把同步进去的表盖掉
         // ⇒ 又回 inert 表)。**拒启**而不是自动纠正:静默改语义比拒启危险。
         //
-        // ✅ 2026-10-19 解禁:`[graph] prefill_bucket` × `[dispatch] fi_plan_bake`
-        // 不再是互斥对 —— **桶路也接了窗外 `fi_plan_sync`**(桶回放前由引擎把
-        // 本桶的 plan 表刷回共享 `int_ws`;见 `exec::prefill_chunk` 的回放点)。
-        //
-        // ⚠️ **但桶图 × FI 只有一种承载组合成立**(2026-10-19 桶门定谳,原注释
-        // "两条承载对桶图都成立"是**错的**):
-        // 桶图捕获期按 `t_pad` 烘 FI 节点(plan 形状 + 表内容),回放期
-        // `ctx = base + t` 可能 > `t_pad`(尾块)⇒
-        //   · 图自携(restore=true):表内容 = 捕获期 ctx=t_pad 的那份 ⇒ 尾块
-        //     读到截断的 KV 覆盖(0.8B 实测:输出退化成"重复、重复…");
-        //   · eager 瓦(cuda_graph=false):plan 形状随 ctx 跳变 ⇒ 图内 offsets/
-        //     padded/split 与窗外刷进去的表不同构(实测 IMA:核读 `q_indptr[5]`
-        //     —— 8 字节的 2 元表被按 6 元索引)。
-        // ⇒ 桶图硬配 `fi_plan_restore = false` + `fi_cuda_graph = true`。
-        if self.graph.prefill_bucket != PrefillBucket::Off {
-            if self.dispatch.fi_plan_restore {
-                return Err(
-                    "[graph] prefill_bucket 需要 fi_plan_restore = false \
-                     (图自携的是捕获期 ctx=t_pad 的表;尾块 ctx>t_pad 会读错 KV —— \
-                     由 host 每桶回放前 `fi_plan_sync` 刷精确表)"
-                        .to_string(),
-                );
-            }
-            if !self.dispatch.fi_cuda_graph {
-                return Err(
-                    "[graph] prefill_bucket 需要 fi_cuda_graph = true \
-                     (图档瓦让 plan 形状对 ctx 恒定;eager 瓦下形状随 ctx 跳变 ⇒ \
-                     图内烘的 offsets/padded/split 与窗外刷的表不同构)"
-                        .to_string(),
-                );
-            }
-        }
         if self.dispatch.fi_plan_bake.is_some() && self.dispatch.fi_plan_restore {
             return Err(
                 "[dispatch] fi_plan_bake 需要 fi_plan_restore = false \
@@ -2290,25 +2373,8 @@ mod extends_tests {
 }
 
 #[cfg(test)]
-mod prefill_bucket_tests {
+mod config_overlay_tests {
     use super::*;
-
-    /// 三档字面量 + 缺省 off + 非法值**结构化拒**(deny_unknown_fields 同族纪律:
-    /// 配置面不许有"写了但没人认"的值)
-    #[test]
-    fn prefill_bucket_parses_three_levels() {
-        let get = |toml: &str| -> PrefillBucket {
-            toml::from_str::<GraphCfg>(toml).expect("解析").prefill_bucket
-        };
-        assert_eq!(get(""), PrefillBucket::Off, "缺省 = off(= 今天行为)");
-        assert_eq!(get("prefill_bucket = \"off\""), PrefillBucket::Off);
-        assert_eq!(get("prefill_bucket = \"t512\""), PrefillBucket::T512);
-        assert_eq!(get("prefill_bucket = \"geobuckets\""), PrefillBucket::Geobuckets);
-        assert!(
-            toml::from_str::<GraphCfg>("prefill_bucket = \"t1024\"").is_err(),
-            "非法档位必须拒(不许静默落 off)"
-        );
-    }
 
     /// 基准文件 + 覆盖文件叠加(入口只给文件路径)
     #[test]
@@ -2327,4 +2393,72 @@ mod prefill_bucket_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+}
+
+#[cfg(test)]
+mod auto_pool_tests {
+    use super::*;
+
+    /// `[pool].gdn_slots = 0` ⇒ 自动 = `[server].max_concurrency`（并发数配几个几格）
+    #[test]
+    fn gdn_slots_auto_follows_concurrency() {
+        let c = OwlConfig::from_toml_str(
+            "[server]\nmax_concurrency = 3\n[pool]\ngdn_slots = 0\n",
+        )
+        .expect("合法档");
+        assert_eq!(c.pool.gdn_slots, 3);
+        // 缺省 server.max_concurrency = 8
+        let c = OwlConfig::from_toml_str("[pool]\ngdn_slots = 0\n").expect("合法档");
+        assert_eq!(c.pool.gdn_slots, 8);
+    }
+
+    #[test]
+    fn spec_draft_family_parses_strictly() {
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 3\ndraft = \"mtp\"\n")
+            .expect("mtp 档");
+        assert_eq!(c.spec.draft, SpecDraft::Mtp);
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\ndraft = \"dflash2\"\n")
+            .expect("dflash2 档");
+        assert_eq!(c.spec.draft, SpecDraft::Dflash2);
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 3\n").expect("缺省 auto");
+        assert_eq!(c.spec.draft, SpecDraft::Auto);
+        assert!(OwlConfig::from_toml_str("[spec]\ndraft = \"eagle\"\n").is_err());
+    }
+
+    /// 显式值逐字节不变（旧档零行为差）
+    #[test]
+    fn explicit_gdn_slots_is_untouched() {
+        let c = OwlConfig::from_toml_str(
+            "[server]\nmax_concurrency = 2\n[pool]\ngdn_slots = 6\n",
+        )
+        .expect("合法档");
+        assert_eq!(c.pool.gdn_slots, 6);
+    }
+
+    /// 准入三旋钮的缺省与显式值
+    #[test]
+    fn admission_knobs_defaults_and_overrides() {
+        let c = OwlConfig::from_toml_str("").expect("空档");
+        assert_eq!(c.runtime.newcomer_min_tokens, 4096);
+        assert_eq!(c.runtime.min_gen_tokens, 256);
+        assert_eq!(c.runtime.reserve_pages, 0, "0 = 自动");
+        assert_eq!(c.agent.queue_wait_ms, 0, "排队超时缺省关");
+        let c = OwlConfig::from_toml_str(
+            "[runtime]\nnewcomer_min_tokens = 2048\nmin_gen_tokens = 128\nreserve_pages = 4\n\
+             [agent]\nqueue_wait_ms = 15000\n",
+        )
+        .expect("合法档");
+        assert_eq!((c.runtime.newcomer_min_tokens, c.runtime.min_gen_tokens), (2048, 128));
+        assert_eq!(c.runtime.reserve_pages, 4);
+        assert_eq!(c.agent.queue_wait_ms, 15000);
+    }
+
+    /// 自动 gdn_slots 与 max_batch 的自洽门：并发 2 + 批 3 ⇒ 拒（批位吃不到）
+    #[test]
+    fn auto_gdn_slots_still_guards_max_batch() {
+        let e = OwlConfig::from_toml_str(
+            "[runtime]\nmax_batch = 3\n[server]\nmax_concurrency = 2\n[pool]\ngdn_slots = 0\n",
+        );
+        assert!(e.is_err(), "gdn_slots(auto)=2 < max_batch=3 应拒");
+    }
 }

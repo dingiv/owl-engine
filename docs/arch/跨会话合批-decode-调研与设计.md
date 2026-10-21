@@ -359,3 +359,16 @@ pub(crate) enum StepAction {
 5. **调度门**：全活跃都是 spec 相位 ⇒ `BatchSpecRound`；混合相位（prefill/裸步）回单 turn。
 6. **FI 批化（M2b）**：R1 已证图档形状恒定；需要 `[B+1]` qo/kv indptr、`[B]` last_len、
    `fi_plan_sync` 的逐行 ctx 字段。预计把 verify attention 从 2× 拉回 FI 档。
+
+### 7.5 服务面契约（2026-10-20,`feat/b5-batch`）
+
+合批落地后 `apps/server` 侧的接口收口（精确取消 / 会话闸 / 可观测）见
+`roadmap.local/26-10-20-B5.1-服务面契约-立案与施工.md`。三条要点：
+
+1. **同会话并发**：引擎在 `max_batch>1` 时硬拒 ⇒ 服务层必须有**会话闸**
+   （同会话串行 / 跨会话并行；无闸时并发同会话必 500，且 `implicit_session`
+   把所有无键请求并到会话 0）；
+2. **取消必须指名**：`EngineReq::Abort` 带 `turn` + 回执；断流路径要**先关 sink**
+   再等回执（否则 actor 察觉不到断流，会把 turn 跑完 —— 实测 4.88s → 0.089s）；
+3. **`/debug/vram → batch{max_batch,steps,graph}`**：判"是否真在合批"的唯一现场
+   （`max_batch>1` 而 `steps` 不涨 = 批门从未成立）。
