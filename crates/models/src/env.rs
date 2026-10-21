@@ -343,10 +343,26 @@ impl EvalPhase {
     }
 }
 
+/// **GGUF 块型臂的旋钮面**(models 侧消费;配置真源 = `[dispatch]`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GgufEnv {
+    /// 小 n 走 MMVQ 的张量字节上限(MiB;`0` = 关)
+    /// —— 语义见 `owl_shared::config::DispatchCfg::gguf_mmvq_l2_mib`
+    pub mmvq_l2_mib: usize,
+}
+
+impl Default for GgufEnv {
+    fn default() -> Self {
+        Self { mmvq_l2_mib: 4 }
+    }
+}
+
 /// 解释器执行环境完备描述(默认 = 生产基线 + 无硬件环境)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EnvProvider {
     pub gdn: GdnEnv,
+    /// GGUF 块型臂旋钮(小 n 判据等)
+    pub gguf: GgufEnv,
     pub hw: HwEnv,
     /// 量化方案(F16 / W4A16 / W4A16Awq;W4A8 = REQ-CTX-01 一 flag 宿主)
     pub quant: QuantPlan,
@@ -399,6 +415,9 @@ impl EnvProvider {
                 // 「FI 读核 vs 自研读核」同 boot 同分块的单变量对照(缺省 = 恒启用,
                 // 生产语义零变化;确认病灶后可撤)
                 fi: !owl_shared::env_reader::flag("OWL_DIAG_NO_FI"),
+            },
+            gguf: GgufEnv {
+                mmvq_l2_mib: d.gguf_mmvq_l2_mib,
             },
             gdn: GdnEnv {
                 chunked: d.gdn_chunked,

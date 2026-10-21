@@ -1031,7 +1031,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let mut fold_graphs = Vec::new();
-        let n_rec = pool.gdn_count() * 8;
+        let n_rec = pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX;
         let rec_blks: Vec<Bytes> = (0..n_rec)
             .map(|i| {
                 vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {

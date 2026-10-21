@@ -32,6 +32,43 @@ use crate::TensorOps;
 /// (128/512/1024)才谈得上复用。
 pub(crate) const GGUF_TILE_MIN_M: usize = 8;
 
+/// **L2 复用判据的字节上限**(2026-10-21 P1)。
+///
+/// 复用臂(tile)与 MMVQ 的分野不只是 token 窗:MMVQ 的网格是
+/// `(ceil(n/4), m)`、tile 是 `(ceil(n/4), ceil(m/16))`,**权重流量**则是
+/// MMVQ 按 token 重读(`m/ceil(m/16)` × )⇒ 大张量上 tile 稳赢。
+/// 但张量**整体装得进 L2** 时重读几乎免费,而 tile 在 `m ≤ TILE_MT` 时
+/// 只剩一个 token 窗、CTA 数被 n 限死 ⇒ 实测反过来输 6.7 倍:
+///
+/// | `ssm_alpha/beta`(n=48,k=5120,Q8_0;260 KB)| 每发 |
+/// |---|---:|
+/// | tile 臂(m=8,12 CTA) | **34.2 µs** |
+/// | MMVQ(网格 (12,8);decode 档 m=1 实测 5.1 µs) | ~5–8 µs |
+///
+/// ⇒ 96 发/轮 × 26 µs ≈ **2.5 ms/轮**(verify 47.3 ms 的 5%)。两臂**位级相同**
+/// (门 `kernel_gate::tile_gemm_matches_mmvq_bitwise`)⇒ 切臂零数值风险。
+///
+/// 阈值 = **配置项** `[dispatch] gguf_mmvq_l2_mib`(缺省 4 MiB;3090 Ti L2 = 6 MiB
+/// 留余量;`0` = 关 = 一律走复用臂)。
+pub(crate) const GGUF_MMVQ_L2_MIB_DEFAULT: usize = 4;
+
+/// `true` = **小张量 + 未用满 token 窗** ⇒ 让 MMVQ 赢(见 [`GGUF_MMVQ_L2_BYTES`])。
+///
+/// 判据两条(缺一不切):
+/// 1. `m ≤ TILE_MT` —— 否则 tile 的权重复用是真的省带宽(MMVQ 要重读 `m` 遍);
+/// 2. 整张量 `n·k·(块字节/块元素)` ≤ 4 MiB —— 重读落在 L2 上。
+fn gguf_prefers_mmvq_small_n(ty: GgmlTy, m: usize, n: usize, k: usize, l2_mib: usize) -> bool {
+    use owl_kernels::family::gguf::TILE_MT;
+    if l2_mib == 0 || m > TILE_MT {
+        return false;
+    }
+    let (blk_elems, blk_bytes) = ty.block();
+    if blk_elems == 0 {
+        return false;
+    }
+    n.saturating_mul(k) / blk_elems * blk_bytes <= (l2_mib << 20)
+}
+
 /// **复用臂开关**(诊断/对拍用;缺省开)。
 ///
 /// `OWL_GGUF_TILE=0` ⇒ 全档回 MMVQ(与 W-2 之前逐位相同)—— A/B 测 prefill
@@ -87,6 +124,7 @@ fn gguf_smem_arm_enabled() -> bool {
     !matches!(std::env::var("OWL_GGUF_SMEM").as_deref(), Ok("0"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gguf_quant_gemm(
     w: &Weight,
     ty: GgmlTy,
@@ -94,6 +132,7 @@ pub(crate) fn gguf_quant_gemm(
     out_dim: usize,
     in_dim: usize,
     col_index: Option<&Weight>,
+    mmvq_l2_mib: usize,
 ) -> TensorOps {
     // 形状律:xs = [.., in](空形状 = 声明失守 ⇒ **毒化**,不 panic)
     if xs.shape().is_empty() {
@@ -345,6 +384,8 @@ pub(crate) fn gguf_quant_gemm(
     // 读一遍权重)。两臂**位级相同**(同一 `vec_dot` 序 + 同一 warp reduce;
     // 门 = `kernel_gate::tile_gemm_matches_mmvq_bitwise`)⇒ 切换零数值风险。
     let gemm = if m >= GGUF_TILE_MIN_M
+        // 小张量 + 未用满窗 ⇒ MMVQ(实测快 6.7×;见 [`GGUF_MMVQ_L2_BYTES`])
+        && !gguf_prefers_mmvq_small_n(ty, m, out_dim, k, mmvq_l2_mib)
         && gguf_tile_arm_enabled()
         // 同上:复用臂的能力集是独立的(`tile_entry_for`),不查 = IQ 族崩
         && owl_kernels::family::gguf::tile_entry_for(ty).is_some()
@@ -668,7 +709,8 @@ impl Module for Linear {
             }
             other => (xs.clone(), other),
         };
-        let y = self.forward_inner(&xs);
+        // 小 n 判据的阈值走**配置**(`[dispatch] gguf_mmvq_l2_mib`;ctx 里带)
+        let y = self.forward_inner(&xs, ctx.env.gguf.mmvq_l2_mib);
         let y = match out_dt {
             Some(dt) if self.gguf_ty.is_some() => {
                 let b = crate::layers::cast_16(&y, dt);
@@ -686,10 +728,18 @@ impl Module for Linear {
 
 impl Linear {
     /// ctx 无关前向(Embedding::lm_head_matmul 复用;14 个调用点零改动)。
-    pub(crate) fn forward_inner(&self, xs: &TensorOps) -> TensorOps {
+    pub(crate) fn forward_inner(&self, xs: &TensorOps, mmvq_l2_mib: usize) -> TensorOps {
         // ---- **GGUF 块型臂**(2026-10-19):激活 → q8_1 → dequant-in-kernel GEMM ----
         if let Some(ty) = self.gguf_ty {
-            return gguf_quant_gemm(&self.w, ty, xs, self.out_dim, self.in_dim, self.gguf_col_index.as_ref());
+            return gguf_quant_gemm(
+                &self.w,
+                ty,
+                xs,
+                self.out_dim,
+                self.in_dim,
+                self.gguf_col_index.as_ref(),
+                mmvq_l2_mib,
+            );
         }
         // ---- W4A8 × AWQ 臂(S2):激活量化 → a8 GEMM ----
         //
@@ -1067,7 +1117,7 @@ mod tests {
 
         // ---- ② 前向面:量化(quant_int8_row) → a8 GEMM,7 父 ----
         let xs = TensorOps::zeros(Dtype::F16, vec![8, 256]);
-        let out = lin.forward_inner(&xs);
+        let out = lin.forward_inner(&xs, GGUF_MMVQ_L2_MIB_DEFAULT);
         // 外层是窄视图(与 a16 臂同款的 out_dim 裁切)
         let gemm = out.parents.first().expect("窄视图的父 = GEMM").clone();
         match &gemm.op {

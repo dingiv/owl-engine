@@ -305,7 +305,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let ts = std::time::Instant::now();
             // 记录齐 = 可折(图态桶 / eager fold_tree 两路都吃记录);
             // 不齐 = 旧"前缀重放"(整模前向)唯一可行路, 该档不做轮内边界快照
-            let foldable = records.len() == self.dev.pool.gdn_count() * 8;
+            let foldable =
+                records.len() == self.dev.pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX;
             if foldable {
                 // **消费方门**(2026-10-19,同 prefill 的 `snap_on` 判据):轮内页边界
                 // 快照的唯一消费者 = **前缀复用**(`restore_snap` 只在 prefix 命中时调);
@@ -544,7 +545,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             mrec("spec.snap", t_snap);
         }
         if t_rollback > std::time::Duration::ZERO {
-            let tag = if records.len() == self.dev.pool.gdn_count() * 8 {
+            let tag = if records.len()
+                == self.dev.pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX
+            {
                 "spec.fold"
             } else {
                 "spec.replay"
@@ -969,7 +972,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             tok_f.iter().map(|&v| v as u32).collect()
         };
         let hidden = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
-        let n_rec = self.dev.pool.gdn_count() * 8;
+        let n_rec = self.dev.pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX;
         let records: Vec<Bytes> = (0..n_rec)
             .map(|i| {
                 vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {

@@ -89,6 +89,8 @@
 //! | dispatch | gdn_scalar / kv_fp8 | flag / false |
 //! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
 //! | dispatch | **verify_arm / decode_arm** | **单值枚举** / "v2" 缺省(fi、xqa、prefill 为候选;decode 无 prefill)(2026-10-21 取代三/两个布尔) |
+//! | dispatch | **gguf_mmvq_l2_mib** | usize / **4**(0 = 关;GGUF 小 n(装得进 L2)且 `m ≤ TILE_MT` ⇒ 让 MMVQ 赢) |
+//! | spec | **depth** | usize / 0(off)/ **3**(MTP 与 DFlash2 均可到 7;上限 = `SPEC_DEPTH_MAX` = 7,超限**拒启**) |
 //! | dispatch | fi_cuda_graph | bool / false(图档瓦; FI 臂的配套件) |
 //! | dispatch | fi_plan_bake / fi_plan_restore | Option<usize>(0=取 max_seq)、bool / true |
 //! | dispatch | allowed_ops | **已退役**(旧键 `deny_unknown_fields` 拒启;准入走 tag filter) |
@@ -241,6 +243,11 @@ impl GraphInstantiateFlags {
 
 fn default_gdn_slots() -> usize {
     PoolCfg::default().gdn_slots
+}
+
+/// GGUF 小 n 判据缺省:4 MiB(见 `DispatchCfg::gguf_mmvq_l2_mib`)
+fn default_gguf_mmvq_l2_mib() -> usize {
+    4
 }
 
 fn default_newcomer_min() -> usize {
@@ -849,6 +856,17 @@ impl DecodeArm {
     }
 }
 
+/// **verify 图的行容量上限**(= `depth + 1` 的最大值;**单一产地**)。
+///
+/// 为什么是 8:spec 轮的 fold 记录/快照按 `gdn 层数 × 本值` 铺
+/// (`graph_fleet` 的 `n_rec`、`exec/spec.rs` 的可折叠判据、`state` 的快照行宽),
+/// 这是**结构性**上限 —— `[spec] depth` 超出即拒启(不静默截断;
+/// 2026-10-21 前该处是 `depth_raw.min(3/7)` 的硬钳,MTP 因此只能跑 3 步)。
+pub const SPEC_VERIFY_ROWS_MAX: usize = 8;
+
+/// **MTP/投机深度的上限**(= 行容量 - 1)
+pub const SPEC_DEPTH_MAX: usize = SPEC_VERIFY_ROWS_MAX - 1;
+
 /// 解释器分派面(models EnvProvider 组装源;**正语义** —— true = 开,
 /// env 面的 NO_FUSE 反开关是兼容遗留,不入 toml)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -856,6 +874,13 @@ impl DecodeArm {
 pub struct DispatchCfg {
     /// W2 qkv 融合(缺省真;2026-10-04 k-probe 硬门定谳)
     pub qkv_fuse: bool,
+    /// **GGUF 小 n 的 MMVQ 判据**(MiB;`0` = 关 = 一律走复用臂)。
+    ///
+    /// 语义:「整张量 ≤ 本值(装得进 L2)且 `m ≤ TILE_MT` ⇒ 让 MMVQ 赢」
+    /// (MMVQ 按 token 重读权重,但读的是 L2)。缺省 4 MiB(3090 Ti L2 = 6 MiB 留余量)
+    /// —— `ssm_alpha/beta`(n=48)每发 34.2 µs → 5.1 µs,verify −2.8 ms/轮。
+    #[serde(default = "default_gguf_mmvq_l2_mib")]
+    pub gguf_mmvq_l2_mib: usize,
     pub prefill_split: bool,
     pub force_naive_prefill: bool,
     /// verify(T=depth+1)走的注意力臂 —— **单键、有序、互斥**(2026-10-21)。
@@ -1352,6 +1377,7 @@ impl Default for DispatchCfg {
     fn default() -> Self {
         Self {
             qkv_fuse: true,
+            gguf_mmvq_l2_mib: default_gguf_mmvq_l2_mib(),
             prefill_split: false,
             force_naive_prefill: false,
             verify_arm: VerifyArm::V2,
@@ -1839,6 +1865,14 @@ impl OwlConfig {
     /// `exit(1)`),且**只有 server 一条入口守** —— 直接构造 engine 的路径
     /// (tests / cli)裸奔。
     pub fn validate(&self) -> Result<(), String> {
+        // **投机深度上限**(2026-10-21):verify 图行容量 `SPEC_VERIFY_ROWS_MAX` 是
+        // 结构性事实(fold 记录/快照按它铺)—— 超限**拒启**,不静默截断。
+        if self.spec.depth > SPEC_DEPTH_MAX {
+            return Err(format!(
+                "[spec] depth = {} 超结构上限 {} (verify 图行容量 {}=(depth+1);fold 记录/快照按它铺,改它需改 state/graph_fleet 的分配面)",
+                self.spec.depth, SPEC_DEPTH_MAX, SPEC_VERIFY_ROWS_MAX
+            ));
+        }
         // **选卡口径互斥**(2026-10-20;原本只在选卡函数里拒,`--check` 无 GPU 也能抓):
         //   `device`(声明式)与 `device_ordinal`(显式序)同时给 ⇒ 卡身份两个真源;
         //   `tp_ordinals` 与任一单卡口径同时给 ⇒ 同上。
@@ -2423,6 +2457,21 @@ mod auto_pool_tests {
         let c = OwlConfig::from_toml_str("[spec]\ndepth = 3\n").expect("缺省 auto");
         assert_eq!(c.spec.draft, SpecDraft::Auto);
         assert!(OwlConfig::from_toml_str("[spec]\ndraft = \"eagle\"\n").is_err());
+    }
+
+    /// **投机深度上限是真门**(2026-10-21):`depth ≤ SPEC_DEPTH_MAX`
+    /// (结构性 = verify 图行容量 - 1;fold 记录/快照按它铺)——
+    /// 超限**拒启**,不再像旧代码那样 `min(3/7)` 静默截断。
+    #[test]
+    fn spec_depth_over_structural_max_is_refused() {
+        assert_eq!(SPEC_DEPTH_MAX, 7);
+        let ok = OwlConfig::from_toml_str(&format!("[spec]\ndepth = {SPEC_DEPTH_MAX}\ndraft = \"mtp\"\n"));
+        assert!(ok.is_ok(), "上限内应可配: {ok:?}");
+        let bad = OwlConfig::from_toml_str(&format!("[spec]\ndepth = {}\n", SPEC_DEPTH_MAX + 1));
+        let e = bad.expect_err("超上限必拒");
+        assert!(e.contains("超结构上限"), "{e}");
+        // 0 = 关投机,永远合法
+        assert!(OwlConfig::from_toml_str("[spec]\ndepth = 0\n").is_ok());
     }
 
     /// 显式值逐字节不变（旧档零行为差）
