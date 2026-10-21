@@ -63,20 +63,34 @@ impl MtpPredictor {
 
     /// **GGUF 档构造**(2026-10-21):MTP 头在 GGUF 单文件里是
     /// `blk.<n>.nextn.*` + 一个全解码层(4B/27B 实测 Q8_0/Q6_K/Q4_K 混型)。
-    /// 键映射住 `formats::qwen35` 的 Loadable;权重由
-    /// `GgufDequantSource` 在 host 解成 f32 后装 F16(与 AWQ MTP 同执行 dtype)。
+    /// 键映射住 `formats::qwen35` 的 Loadable。
+    ///
+    /// `plan` 决定**权重驻留形态**(2026-10-21 二刀):
+    /// - `PlanSource::from(F16)` ⇒ 老路(`GgufDequantSource` 在 host 解成 f32
+    ///   再装 F16;MTP 头 ≈0.86 GB);
+    /// - **`PlanSource::keyed(逐键表, GgufConvention, GGUF)`** ⇒ **原生块**
+    ///   (Q6_K/Q8_0 原样驻留 ≈0.35 GB,GEMM 走 GGUF 臂)—— 省 0.5 GB 显存
+    ///   = fp8 池下多 ~16k 上下文,且草稿 GEMM 不再解量化。
     ///
     /// norm 用 GGUF 源事实(`w_off = false`:文件里的 gamma 已烘焙 +1)。
-    pub fn new_gguf(hidden: usize, inter: usize, hq: usize, hkv: usize, hd: usize, eps: f32, block: usize) -> Self {
-        // GGUF MTP 头按 **F16 解量化**装载（与 AWQ MTP 同执行 dtype）：
-        // 权重类型逐角色不同（Q6_K/Q8_0/Q4_K），统一走 F16 避免给
-        // DecoderLayer 引入逐线性 plan；norm 用 GGUF 源事实（已 +1）。
-        let layer_plan = crate::module::PlanSource::from(QuantPlan::F16)
-            .with_facts(SourceFacts::GGUF);
+    pub fn new_gguf(
+        hidden: usize,
+        inter: usize,
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        eps: f32,
+        block: usize,
+        plan: crate::module::PlanSource<'_>,
+    ) -> Self {
+        let p = plan.with_facts(SourceFacts::GGUF);
+        // fc 两半是**虚拟键**(源侧按 in 维拆 `nextn.eh_proj`);逐键查表取型
+        let fc_e_key = format!("blk.{block}.nextn.eh_proj.e.weight");
+        let fc_h_key = format!("blk.{block}.nextn.eh_proj.h.weight");
         Self {
-            fc_e: Linear::new("fc_e", hidden, hidden, QuantPlan::F16),
-            fc_h: Linear::new("fc_h", hidden, hidden, QuantPlan::F16),
-            layer: DecoderLayer::new_full(hq, hkv, hd, hidden, inter, eps, layer_plan),
+            fc_e: Linear::new("fc_e", hidden, hidden, p.at(&fc_e_key, hidden, hidden)),
+            fc_h: Linear::new("fc_h", hidden, hidden, p.at(&fc_h_key, hidden, hidden)),
+            layer: DecoderLayer::new_full(hq, hkv, hd, hidden, inter, eps, p.at_layer(block)),
             pre_fc_norm_hidden: RmsNorm::new_by_facts("pre_fc_norm_hidden", hidden, eps, SourceFacts::GGUF),
             pre_fc_norm_embedding: RmsNorm::new_by_facts("pre_fc_norm_embedding", hidden, eps, SourceFacts::GGUF),
             norm: RmsNorm::new_by_facts("norm", hidden, eps, SourceFacts::GGUF),
@@ -100,7 +114,13 @@ impl MtpPredictor {
     }
 
     /// **GGUF 档声明构造**(块号 = target 解码层数,即 NextN 块下标)。
-    pub fn from_spec_gguf(spec: &crate::model::ModelSpec, block: usize) -> Self {
+    ///
+    /// `plan` = 逐键计划表(原生块)或 `QuantPlan::F16`(host 解量化,老路)。
+    pub fn from_spec_gguf(
+        spec: &crate::model::ModelSpec,
+        block: usize,
+        plan: crate::module::PlanSource<'_>,
+    ) -> Self {
         Self::new_gguf(
             spec.hidden,
             spec.inter,
@@ -109,6 +129,7 @@ impl MtpPredictor {
             spec.full_heads.2,
             spec.eps,
             block,
+            plan,
         )
     }
 
@@ -134,6 +155,12 @@ impl MtpPredictor {
     ) -> TensorOps {
         let e = self.pre_fc_norm_embedding.forward(embedding, ctx);
         let h = self.pre_fc_norm_hidden.forward(target_hidden, ctx);
+        if self.fc_e.is_gguf() {
+            // **量化块档**(2026-10-21):fc 两半是原生的 Q6_K 块行
+            // ⇒ 必须走 `Linear` 的统一分派(GGUF 臂);裸 `matmul_nt` 只认
+            // F16 行主序张量,会把块字节当元素读(形状不符 ⇒ 毒化)。
+            return self.fc_e.forward(&e, ctx).add(&self.fc_h.forward(&h, ctx));
+        }
         let we = self.fc_e.weight_decl();
         let wh = self.fc_h.weight_decl();
         e.matmul_nt(&we).add(&h.matmul_nt(&wh))

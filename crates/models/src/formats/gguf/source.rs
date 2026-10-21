@@ -47,6 +47,29 @@ pub type Taken<T> = Result<Option<T>, ModelError>;
 /// 名字由 [`GgufConvention`](super::convention) 的 `ssm_out_perm` 局部键给。
 pub const PERM_TAIL: &str = ".ssm_out.perm";
 
+/// **虚拟键**:MTP 头的 `nextn.eh_proj` 按 **in 维两半**拆(`.e` / `.h`)。
+///
+/// 为什么需要:GGUF 里 fc 是**一整张** `blk.<n>.nextn.eh_proj.weight`
+/// (`[hidden, 2·hidden]`),而 MTP 数学要两个 `[hidden, hidden]` 的 Linear
+/// (`fc_e` 吃 embedding 侧、`fc_h` 吃 hidden 侧)。量化块下"取半行"是
+/// **块对齐的 strided gather**(半行 = 10 个 Q6_K 块),只能在按块搬运的
+/// 字节通道里做 —— 元素通道拿不到(会先解量化,白丢省显存的意义)。
+///
+/// 返回 `(物理键, 半号)`,半号 ∈ {0,1}。
+pub(crate) fn eh_half(key: &str) -> Option<(String, usize)> {
+    let head = key.strip_suffix(".weight")?;
+    let (pre, seg) = head.rsplit_once('.')?;
+    let half = match seg {
+        "e" => 0usize,
+        "h" => 1usize,
+        _ => return None,
+    };
+    if !pre.ends_with(".nextn.eh_proj") {
+        return None;
+    }
+    Some((format!("{pre}.weight"), half))
+}
+
 /// GGUF 权重源
 pub struct GgufSource {
     g: Gguf,
@@ -554,6 +577,20 @@ impl WeightSource for GgufSource {
         if let Some(t) = self.virtual_perm(key)? {
             return Ok(Some(t.len()));
         }
+        // 虚拟键:MTP `eh_proj` 的 in 维半张(交付量 = 半行字节 × 行数)
+        if let Some((phys, _)) = eh_half(key) {
+            let Some(t) = self.g.get_tensor(&phys) else {
+                return Ok(None);
+            };
+            let (be, bb) = t.ty.block();
+            let half_inner = t.inner() as usize / 2;
+            if half_inner % be != 0 {
+                return Err(ModelError::Msg(format!(
+                    "GgufSource: 虚拟键 `{key}` 的半行 {half_inner} 不是块宽 {be} 的整数倍(块对齐失守)"
+                )));
+            }
+            return Ok(Some(t.rows() as usize * (half_inner / be * bb)));
+        }
         // TP:本 rank 的交付量(量化 = 字节,原生 = 元素;装载面按 shape.product 对账)
         if let Some(g) = self.geom(key)? {
             return Ok(Some(g.len()));
@@ -571,6 +608,19 @@ impl WeightSource for GgufSource {
         // 虚拟键:U32 索引表(槽 dtype = U32)
         if self.virtual_perm(key)?.is_some() {
             return Ok(Some(Dtype::U32));
+        }
+        // 虚拟键:MTP `eh_proj` 半张 —— 只支持**量化块**(原生型走元素通道,勿在本路拆)
+        if let Some((phys, _)) = eh_half(key) {
+            return Ok(match self.g.get_tensor(&phys) {
+                None => None,
+                Some(t) if t.ty.native_dtype().is_some() => {
+                    return Err(ModelError::Msg(format!(
+                        "GgufSource: 虚拟键 `{key}` 的物理张量是原生型 {} —— 半拆只接量化块",
+                        t.ty.name()
+                    )))
+                }
+                Some(_) => Some(Dtype::U8),
+            });
         }
         Ok(match self.ty_of(key) {
             // 量化块 ⇒ **U8**(不透明字节;装载面走 esz=1 的元素通道,零转换)
@@ -606,6 +656,53 @@ impl WeightSource for GgufSource {
             }
             for (i, v) in slice.iter().enumerate() {
                 dst[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            return Ok(Some(()));
+        }
+        // 虚拟键:MTP `eh_proj` 的 in 维半张(按块搬:半行 = 连续块段)
+        if let Some((phys, half)) = eh_half(key) {
+            if dtype != Dtype::U8 {
+                return Err(ModelError::Msg(format!(
+                    "GgufSource: 虚拟键 `{key}` 只以 U8 块交付(实得 {dtype:?})"
+                )));
+            }
+            let Some(t) = self.g.get_tensor(&phys) else {
+                return Ok(None);
+            };
+            let (be, bb) = t.ty.block();
+            let rows = t.rows() as usize;
+            let inner = t.inner() as usize;
+            let half_inner = inner / 2;
+            if half_inner % be != 0 {
+                return Err(ModelError::Msg(format!(
+                    "GgufSource: 虚拟键 `{key}` 的半行 {half_inner} 不是块宽 {be} 的整数倍"
+                )));
+            }
+            let hb = half_inner / be * bb; // 半行字节
+            let row_bytes = inner / be * bb;
+            let total = rows * hb;
+            if offset + len > total {
+                return Err(ModelError::Msg(format!(
+                    "GgufSource: 虚拟键 `{key}` 请求 [{offset}, {}) 越界(共 {total}B)",
+                    offset + len
+                )));
+            }
+            if dst.len() < len {
+                return Err(ModelError::Msg(format!(
+                    "GgufSource: 虚拟键 `{key}` dst {}B < 需 {len}B",
+                    dst.len()
+                )));
+            }
+            let ix = self.g.index_of(&phys).unwrap();
+            let src = self.g.bytes(ix);
+            let mut done = 0usize;
+            while done < len {
+                let abs = offset + done;
+                let (r, c) = (abs / hb, abs % hb);
+                let n = (hb - c).min(len - done);
+                let s = r * row_bytes + half * hb + c;
+                dst[done..done + n].copy_from_slice(&src[s..s + n]);
+                done += n;
             }
             return Ok(Some(()));
         }

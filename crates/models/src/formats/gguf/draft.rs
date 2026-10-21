@@ -113,15 +113,23 @@ impl<'g> DraftGgufPlan<'g> {
 
 impl crate::module::PlanTable for DraftGgufPlan<'_> {
     fn plan_at(&self, key: &str, out_dim: usize, in_dim: usize) -> QuantPlan {
-        let Some(t) = self.g.get_tensor(key) else {
+        // **虚拟键**(MTP 头 `nextn.eh_proj` 的 in 维两半):按物理键取型,
+        // 形状核对换成"in 是物理内维的一半"(块对齐由源侧 `convert` 再验一次)。
+        let (phys, virt) = match super::source::eh_half(key) {
+            Some((p, _)) => (p, true),
+            None => (key.to_string(), false),
+        };
+        let Some(t) = self.g.get_tensor(&phys) else {
             self.note(key, "GGUF 草稿索引里没有该键(译表漏臂 / 文件不含该张量)");
             return QuantPlan::F16;
         };
-        if t.rows() as usize != out_dim || t.inner() as usize != in_dim {
+        let inner_ok = if virt { t.inner() as usize == in_dim * 2 } else { t.inner() as usize == in_dim };
+        if t.rows() as usize != out_dim || !inner_ok {
             self.note(
                 key,
                 &format!(
-                    "形状不符:索引 [rows {} × inner {}](ne {:?})vs 声明 [{out_dim} × {in_dim}]",
+                    "形状不符:索引[{}] [rows {} × inner {}](ne {:?})vs 声明 [{out_dim} × {in_dim}]",
+                    phys,
                     t.rows(),
                     t.inner(),
                     t.ne

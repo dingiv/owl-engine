@@ -365,15 +365,55 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                 // P2.1-a:草稿与主干同 TpPlan(单卡 ⇒ `sharded` 恒等)
                 shard_draft_plan(spec, inp.tp)?
             };
-            let mtp = if is_gguf {
-                owl_models::layers::mtp::MtpPredictor::from_spec_gguf(&spec, spec.layer_types.len())
+            // GGUF 档:MTP 头走**原生块**(逐键计划表)而不是 host 解到 F16 —
+            // 27B 头 = Q6_K 12 张 + Q8_0 3 张 ⇒ 0.35 GB(对 0.86 GB),
+            // 省下的 0.5 GB 直接还给 KV 池(fp8 池下 ≈ +16k 上下文),
+            // 且草稿 GEMM 不再付解量化。
+            // ⚠️ TP 档暂走 F16 头:原生块的 `eh_proj` 半拆只实现了**单卡全量**
+            // (分片下的行/列窗口是另一套块算术);TP 需要的形状由 `shard_draft_plan` 给。
+            let tp1 = inp.tp.as_ref().map_or(true, |p| p.world() == 1);
+            let (mtp, native_blocks) = if is_gguf && tp1 {
+                let g = owl_models::formats::gguf::Gguf::open(dir)?;
+                let table = owl_models::formats::gguf::DraftGgufPlan::new(&g);
+                let conv = owl_models::formats::gguf::GgufConvention::new();
+                let plan = owl_models::module::PlanSource::keyed(
+                    &table,
+                    &conv,
+                    owl_models::module::SourceFacts::GGUF,
+                );
+                let mtp = owl_models::layers::mtp::MtpPredictor::from_spec_gguf(
+                    &spec,
+                    spec.layer_types.len(),
+                    plan,
+                );
+                // 表里没解析到的键(型未移植/形状不符)会静默回落 F16 —— 必须上屏
+                use owl_models::module::PlanTable as _;
+                let un = table.take_unresolved();
+                if !un.is_empty() {
+                    owl_shared::log_warn!(
+                        "boot",
+                        "MTP 头有 {} 个键回落 F16(原生块表未解析):{:?}",
+                        un.len(),
+                        un
+                    );
+                }
+                (mtp, true)
             } else {
-                owl_models::layers::mtp::MtpPredictor::from_spec(&spec)
+                (
+                    owl_models::layers::mtp::MtpPredictor::from_spec(&spec),
+                    false,
+                )
             };
             let mut opts = draft_load_opts(face, owl_models::contract::Dtype::F16, inp.tp, &inp.load);
-            opts.gguf_dequant = is_gguf;
+            // 原生块路径:源直接给压缩块字节(槽 U8),不再走 host 解量化
+            opts.gguf_dequant = is_gguf && !native_blocks;
             owl_models::formats::load::load_from_dir(dir, face, &mtp, opts).await?;
-            owl_shared::log_info!("boot", "MTP 草稿头装载(spec depth={depth};{})", if is_gguf { "GGUF" } else { "HF/AWQ" });
+            owl_shared::log_info!(
+                "boot",
+                "MTP 草稿头装载(spec depth={depth};{};权重={})",
+                if is_gguf { "GGUF" } else { "HF/AWQ" },
+                if native_blocks { "原生块" } else { "F16" }
+            );
             Some(Drafter::Mtp(Arc::new(mtp)))
         }
         SpecMode::DFlash2 => {
@@ -486,13 +526,24 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     // 草稿池几何(**分片后**;P2.1-b):从检查点声明 + 本 rank 计划算(不再用写死的 const)
     let (draft_geom, draft_env) = match &drafter {
         Some(Drafter::Mtp(_)) => {
-            // MTP 草稿链池 = F16 独立页池(StatePool 按 dims.dtype 分配)。
-            // env 必须同步成 F16/no-quant:生产主池是 fp8,沿用主 env 会让
-            // naive_attn 选 fp8 读核,与 F16 mtp 池错位(草稿全垃圾)。
+            // MTP 草稿链池 = 独立页池,**存储 dtype 由 `[spec] draft_kv_fp8` 定**
+            // (2026-10-21:此前恒 F16 —— 那条 864 MiB@192k 就是这么白吃的):
+            // - fp8 ⇒ e4m3(U32 扁平字节账;每 token 2 KiB)
+            // - 否则 ⇒ `draft_dt`(F16;每 token 4 KiB)
+            // env 必须**与池同档**:池 F16 而 env 说 fp8(或反之)= 读写核错位
+            // ⇒ 草稿全垃圾(2026-10-13 守卫就抓过这条)。
             let mut env = inp.base_env;
             env.quant = owl_models::module::QuantPlan::F16;
-            env.kv.quant = owl_models::env::KvQuant::None;
-            env.kv.dtype = draft_dt;
+            env.kv.quant = if inp.draft_kv_fp8 {
+                owl_models::env::KvQuant::Fp8E4M3
+            } else {
+                owl_models::env::KvQuant::None
+            };
+            env.kv.dtype = if inp.draft_kv_fp8 {
+                owl_models::contract::Dtype::U32
+            } else {
+                draft_dt
+            };
             // MTP extend(T=m+1≤4)在层内走 v2 伪序列臂:草稿池 F16、
             // 每行一条 MTP 页链、长 ctx 下远比 chunked prefill 的
             // per-query 全历史扫描便宜。只影响草稿 env,主 verify 仍按
