@@ -1,0 +1,64 @@
+owl engine
+Copyright (c) 2026 dingiv456 <dingiv456@163.com>
+
+This product is dual-licensed under your choice of:
+
+  * the MIT License (see LICENSE-MIT), or
+  * the Apache License, Version 2.0 (see LICENSE-APACHE).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you shall be dual-licensed as above, without
+any additional terms or conditions.
+
+--------------------------------------------------------------------------------
+Third-party software included in this repository
+--------------------------------------------------------------------------------
+
+The files listed below are third-party code. They are NOT relicensed by the
+dual license above: each retains its original license, and the original
+copyright notices in those files must be preserved. See VENDOR.list.md for the
+pinned revisions and the in-tree modification log, and the per-directory
+LICENSE files for the full texts.
+
+1. FlashInfer — paged prefill CUDA kernels (header closure)
+   Files:      crates/kernels/cu/flashinfer/include/**
+   Source:     https://github.com/flashinfer-ai/flashinfer
+   Revision:   nightly-v0.6.18-20260819-317-gfdc56343
+   License:    Apache License 2.0
+   Copyright:  Copyright (c) 2023 by FlashInfer team.
+
+2. NVIDIA XQA — decode/verify attention CUDA kernels
+   Files:      crates/kernels/cu/xqa/**
+   Source:     FlashInfer csrc/xqa (Ampere closure), via
+               https://github.com/avesed/vllm-ampere-optimized
+   License:    Apache License 2.0
+   Copyright:  Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES.
+               All rights reserved.
+
+3. vLLM — Marlin W4A16/W4A8 GEMM kernels
+   Files:      crates/kernels/cu/marlin/vllm_marlin/**
+   Source:     https://github.com/vllm-project/vllm
+               (csrc/libtorch_stable/quantization/marlin)
+   License:    Apache License 2.0
+   Copyright:  Copyright (c) vLLM contributors.
+
+4. llama.cpp / ggml — MMQ (tensor-core quantized GEMM)
+   Files:      crates/kernels/cu/gguf/vendor/**   (llama.cpp @ 1b1e27cb49)
+               crates/kernels/cu/gguf/vendor2/**  (head revision dfcf18193)
+   Source:     https://github.com/ggml-org/llama.cpp
+   License:    MIT License (see the LICENSE files in those directories)
+   Copyright:  Copyright (c) 2023-2026 The ggml authors.
+
+5. CUDA Toolkit headers and libraries (not redistributed here)
+   The build requires a locally installed CUDA Toolkit (nvcc + driver API).
+   Its use is governed by the NVIDIA Software License Agreement.
+
+--------------------------------------------------------------------------------
+Rust dependencies
+--------------------------------------------------------------------------------
+
+This project depends on open-source Rust crates.
+A generated inventory (name, version, license, upstream) is kept in
+THIRD_PARTY_LICENSES.md. All of them are permissively licensed
+(MIT / Apache-2.0 / BSD / ISC / Zlib / Unlicense / Unicode-3.0);
+there is no copyleft (GPL/AGPL) dependency.
