@@ -1024,3 +1024,59 @@ eager 解码)。27B 的 prefill(每节点数百 µs GPU)与图回放 decode 都�
    `embed_tokens`(已修:`state.rs` 归一到 `None`,与档注释"留空 = 只按驱动账判"一致);
 2. `qwen38_27b-3080_tp2-w4a16.toml` 写 `[spec] depth = 7` 但未开 `tp_draft`
    ⇒ TP 档启动被拒(需 `--set spec.depth=0`,或按 P2.1 显式 `tp_draft = true`)。
+
+## 13.10 预填逐核账 + 两处定谳(2026-10-21 续)
+
+### (A)`srv.seg.fam` 123 µs ≠ 宿主开销,**是 GPU 背压**
+
+族维分相(`srv.fam.*`,核名前缀静态分类)与 C 侧分相探针(`MARLIN_TIME=1`)定谳:
+
+| 段(marlin 发射器内) | 每发射 |
+|---|---:|
+| `determine_exec_config` | **0.7 µs** |
+| `cudaFuncSetAttribute`(`ensure_smem` 缓存后) | 1.7–6.3 µs |
+| **`kernel<<<>>>` + `cudaGetLastError`** | **3.6 → 48.1 µs(n 越大越大)** |
+
+`kernel<<<>>>` 的耗时**随发射数单调上升** = 异步队列被灌满后驱动回压
+(CPU 发得比 GPU 跑得快)⇒ `srv.seg.fam` 的 123 µs 主要是**等 GPU**,不是可优化的
+宿主代码。旁证:把 3×`cudaDeviceGetAttribute` + `cudaFuncSetAttribute` 全部缓存后,
+`fam.marlin` 均值**一字不变**(仍 99 µs),prefill 吞吐一字不变。
+
+族维分布(4096 次发射):marlin 390 ms(95 µs/次)· cublas 103 ms(108 µs/次)·
+fi 75 ms(**470 µs/次**,160 次)· 其余小额。
+
+### (B)预填 GPU 逐核账(nsys,≈4k prompt,2×3080 生产档)
+
+| 核 | 占比 | 总量 | 次数 | 均值 |
+|---|---:|---:|---:|---:|
+| `marlin::Marlin`(W4A16 GEMM 主体) | **59.8%** | 3541 ms | 5824 | 608 µs |
+| **`owl_comm_ar_reduce_f16`(TP allreduce)** | **21.0%** | 1245 ms | 2048 | 608 µs |
+| `owl_gdn_recurrence_varlen_gqa_f16` | 8.0% | 472 ms | 768 | 615 µs |
+| `flashinfer::BatchPrefill…` | 2.1% | 125 ms | 256 | 487 µs |
+| `owl_ct_repack_u32`(装载期惰性 repack) | 1.6% | 97 ms | 706 | 137 µs |
+| `owl_comm_ar_stage_f16` | 1.5% | 87 ms | 2048 | 42 µs |
+| 其余(silu/norm/conv/narrow…) | ~4% | — | — | — |
+
+⇒ **AR 合计 22.5%**,是除 GEMM 外最大的一块(与 §42 的 PCIe 结论一致)。
+
+### (C)已落地:TP 档开 `tp_ar_f8`(**prefill +8.7%**,decode 中性)
+
+| 档 | prefill@2048 | prefill@8192 | decode |
+|---|---:|---:|---:|
+| 基线(f16 载荷) | 1572.0 t/s | 1513.9 | 45.1 |
+| **`tp_ar_f8 = true`** | **1709.6(+8.7%)** | **1647.7(+8.8%)** | 45.4 |
+| `tp_ar_fused = true` | 1570.7 | 1518.8 | 45.4 |
+| f8 + fused | 1709.0 | 1645.8 | 45.9 |
+
+- 门控在引擎里(载荷 ≥ 256 KiB 才走 fp8):prefill 单次 AR = 512 tok × 5120 × 2B ≈ 5 MiB
+  ⇒ 走 f8;decode = 10 KiB ⇒ 自动回落 f16 ⇒ **decode 零影响**(实测吻合);
+- 数值:g8 门(`OWL_TP_AR_F8=1`)**全绿**(L1 rank 间逐位相同、L2 首分歧互为 top-5);
+  27B 真机输出连贯(f8/f16 两档同一段话,仅截断位置差一个词);
+- 落地:`profiles/qwen38_27b-3080_tp2-w4a16{,-vlm}.toml` 的 `[parallel]` 加
+  `tp_ar_f8 = true`;要复现旧行为 ⇒ 删这一行或 `--set parallel.tp_ar_f8=false`。
+
+### 下一步候选(按账排)
+
+1. **marlin GEMM 效率**(59.8%):小批 tile 配置 / W4A8 激活量化 —— 需先量当前 TFLOPS 占比;
+2. GDN recurrence(8%):varlen 递推核的并行度;
+3. `owl_ct_repack_u32` 137 µs × 706:确认是否只在装载期发生;若发生在推理期则是 bug 级。
