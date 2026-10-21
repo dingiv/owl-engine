@@ -99,6 +99,19 @@ pub struct StepProbes {
     pub pf_fence: bool,
     /// KV 页差分落点(原 OWL_KV_DUMP,同上收编)
     pub kv_dump_at: Option<usize>,
+    /// **B 轴调和/显存/索引/落盘的排障打印**(原散落的 `OWL_RECON_DBG` /
+    /// `OWL_VRAM_DBG` / `OWL_IDX_DBG` / `OWL_LIVE_DIAG` / `OWL_COV_DUMP` /
+    /// `OWL_STORE_HOOK_DEBUG` / `OWL_PF_TAPS`)。
+    ///
+    /// 收编理由:引擎内部**零 env 读取**(显式依赖律)—— 这些开关只影响
+    /// 打印量,统一在入口一次性解析,散点不再各读各的。
+    pub recon_dbg: bool,
+    pub vram_dbg: bool,
+    pub idx_dbg: bool,
+    pub live_diag: bool,
+    pub cov_dump: bool,
+    pub store_hook_dbg: bool,
+    pub pf_taps: bool,
 }
 
 impl StepProbes {
@@ -126,6 +139,13 @@ impl StepProbes {
             kv_dump_at: p
                 .kv_dump_at
                 .or_else(|| owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP")),
+            recon_dbg: owl_shared::env_reader::flag("OWL_RECON_DBG"),
+            vram_dbg: owl_shared::env_reader::flag("OWL_VRAM_DBG"),
+            idx_dbg: owl_shared::env_reader::flag("OWL_IDX_DBG"),
+            live_diag: owl_shared::env_reader::flag("OWL_LIVE_DIAG"),
+            cov_dump: owl_shared::env_reader::flag("OWL_COV_DUMP"),
+            store_hook_dbg: owl_shared::env_reader::flag("OWL_STORE_HOOK_DEBUG"),
+            pf_taps: owl_shared::env_reader::flag("OWL_PF_TAPS"),
         }
     }
 }
@@ -2086,7 +2106,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(());
         }
         let verdict = self.bank.rel.plan_need(need, &owl_store::Protected::default());
-        if owl_shared::env_reader::flag("OWL_STORE_HOOK_DEBUG") {
+        if self.boot.probes.store_hook_dbg {
             eprintln!(
                 "[hook] {:?} need={}槽/{}B free={}/{} host_free={} disk_free={} 整链候选={} 判 out={} in={} deny={:?}",
                 need.why,

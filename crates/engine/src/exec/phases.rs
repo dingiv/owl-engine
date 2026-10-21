@@ -372,7 +372,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let snap_ms = t_snap.elapsed().as_secs_f64() * 1000.0;
             // **边界相位拆分**(`OWL_VRAM_DBG=1`;2026-10-19 A3):
             // 边界 = 快照拍摄(链哈希 + GDN 拷贝 + 登记)‖ 索引采集 ‖ B 轴(打分/选择/视图/调和)。
-            let dbg = std::env::var_os("OWL_VRAM_DBG").is_some();
+            let dbg = self.boot.probes.vram_dbg;
             // ── B 轴选择层(生产面 + 可选诊断面)──
             // 必须**晚于**边界事件:索引/快照刚登记完,候选块才齐(§8.4)。
             // 两扇门:`select_decode`(生产)= 打分/选择/视图/调和;
@@ -397,7 +397,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("prefill.bnd", t_bnd.elapsed());
         // **逐 chunk 显存轨迹**(`OWL_VRAM_DBG=1`;262k 冲刺的取证面):
         // live/free 测在**边界之后** —— 判“中间件是否归还”。计时已改走 metrics。
-        if std::env::var_os("OWL_VRAM_DBG").is_some() {
+        if self.boot.probes.vram_dbg {
             eprintln!(
                 "[vram-c] chunk@{} t={} ⇒ live={} MiB · 驱动 free={} MiB",
                 base,

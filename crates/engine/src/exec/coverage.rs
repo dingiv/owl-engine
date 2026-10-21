@@ -612,7 +612,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ⇒ 下一 chunk 的 `ensure_for_len` 必 `Exhausted`。这里把三条数打出来:
         // 可沉 / 待回灌 / 不可沉,以及**候选块的 refs 分布**(1=仅会话持,
         // 2=树+会话双持=可沉)。
-        if std::env::var_os("OWL_RECON_DBG").is_some() {
+        if self.boot.probes.recon_dbg {
             let mut hist = [0usize; 4];
             for (i, _h) in cands.iter().enumerate().take(n_blocks) {
                 if let Some(slot) = table.get(i).copied() {
@@ -871,9 +871,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 注意力输出(比"接进 decode 跑两遍"便宜得多,且**同一个口径**可比)
         // `OWL_SCHEME_MIN_CTX`(缺省 0 = 每个边界都算):只在这个 ctx 以上才算
         // ⇒ 规模档只跑最后一次(host 数学与 dense 成正比,小边界算了也白算)
-        let scheme_min = owl_shared::env_reader::parse::<usize>("OWL_SCHEME_MIN_CTX").unwrap_or(0);
+        let scheme_min = self.boot.cfg.knobs.coverage_scheme_min_ctx;
         let want_scheme = diag
-            && owl_shared::env_reader::flag("OWL_SCHEME_PROBE")
+            && self.boot.cfg.knobs.coverage_scheme_probe
             && ctx_tokens >= scheme_min;
         // **重诊断采样**(`OWL_COV_ANALYZE_EVERY`;三档):
         //
@@ -889,7 +889,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // = **O(ctx²)**(2026-10-19 相位账实测:0.8B/3072 tok 下重诊断 ≈ **250ms/边界**,
         // 占 B 轴 95%)。它产出的 mass/curve/oracle/paper_coverage **全是诊断读数**;
         // 打分/选择/视图/驻留(生产面)一步不省。
-        let analyze_every = owl_shared::env_reader::parse::<usize>("OWL_COV_ANALYZE_EVERY");
+        let analyze_every = self.boot.cfg.knobs.coverage_analyze_every;
         // **分析边界目标**(`[kvmem].analyze_at_ctx`;0 = 最后一个边界):
         // 本边界恰好落在该 ctx ⇒ 算诊断(即使它不是最后一个边界)。
         // 为什么:边界位置随 chunk 漂移 ⇒ 钉住 ctx 才能跨 chunk 比读数。
@@ -1014,7 +1014,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 let m = true_block_mass(&q_post, &k_post, (layers, hq, hkv, hd), page, pos + 1);
                 // ⚠️ **临时取证**(`OWL_COV_DUMP=1`;A2 定谳用,事后删):逐 query 行的
                 // 真实质量峰位 —— 报告里的 `mass` 是 W 行均值,掩盖“哪一行退化”。
-                if owl_shared::env_reader::flag("OWL_COV_DUMP") {
+                if self.boot.probes.cov_dump {
                     let mut ord: Vec<usize> = (0..m.len()).collect();
                     ord.sort_by(|a: &usize, b: &usize| {
                         m[*b].partial_cmp(&m[*a]).unwrap_or(std::cmp::Ordering::Equal)
@@ -1086,7 +1086,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ⚠️ **临时取证**(`OWL_COV_DUMP=1`;A2 定谳用,事后删):三面指纹 ——
         // ① Q 面(本边界末 W 行,post-RoPE 原样)**② 池内 K 回读**(定块)
         // **③ 索引账 Mean-K**(同块)—— 三者谁随 chunk 漂,谁就是 A2 的源。
-        if owl_shared::env_reader::flag("OWL_COV_DUMP") {
+        if self.boot.probes.cov_dump {
             let hf = |v: &[f32]| -> u64 {
                 let mut h = 0xcbf2_9ce4_8422_2325u64;
                 for x in v {
@@ -1640,8 +1640,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         base: usize,
         t: usize,
         d_model: usize,
+        cov_dump: bool,
     ) -> Result<()> {
-        if std::env::var_os("OWL_COV_DUMP").is_none() || t == 0 {
+        if !cov_dump || t == 0 {
             return Ok(());
         }
         let esz = self.pool.geom.dims.dtype.size_bytes();

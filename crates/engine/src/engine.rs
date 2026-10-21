@@ -125,6 +125,13 @@ pub struct EngineKnobs {
     pub evict_policy: owl_store::EvictPolicyKind,
     /// **分析边界目标 ctx**(诊断;0 = 最后一个边界)。`[kvmem].analyze_at_ctx`。
     pub coverage_analyze_at: usize,
+    /// **方案对照档**(`OWL_SCHEME_PROBE`;诊断):多读一份 V + host 算 A/B/dense。
+    /// 入口面一次性解析(引擎内部零 env 读取)。
+    pub coverage_scheme_probe: bool,
+    /// 方案对照的最小 ctx(`OWL_SCHEME_MIN_CTX`;0 = 每个边界都算)
+    pub coverage_scheme_min_ctx: usize,
+    /// **重诊断步进**(`OWL_COV_ANALYZE_EVERY`;None = 每边界都诊断)
+    pub coverage_analyze_every: Option<usize>,
     /// **每 turn 工作集的对外事实(配置面)** —— `[kvmem].workspace_per_req`(token;
     /// 含 sink/recent 保底)。装配期由 [`derive_turn_ws`] 派生下面三件:
     /// `select_blocks`(召回预算块数)/ `dense_floor`(准入地板字节)/ 池下限里的每 turn 页数。
@@ -293,6 +300,9 @@ impl Default for EngineKnobs {
             index_probe: false,
             coverage_probe: false,
             coverage_analyze_at: 0,
+            coverage_scheme_probe: false,
+            coverage_scheme_min_ctx: 0,
+            coverage_analyze_every: None,
             select_decode: false,
             select_partial: false,
             evict_policy: owl_store::EvictPolicyKind::Lru,
@@ -579,6 +589,11 @@ impl EngineKnobs {
             index_probe: cfg.kvmem.index || cfg.kvmem.select_decode,
             coverage_probe: cfg.kvmem.coverage_probe,
             coverage_analyze_at: cfg.kvmem.analyze_at_ctx,
+            // 诊断面的两个 env 旋钮在**入口**一次性收编(引擎内部零 env 读取)
+            coverage_scheme_probe: owl_shared::env_reader::flag("OWL_SCHEME_PROBE"),
+            coverage_scheme_min_ctx: owl_shared::env_reader::parse::<usize>("OWL_SCHEME_MIN_CTX")
+                .unwrap_or(0),
+            coverage_analyze_every: owl_shared::env_reader::parse::<usize>("OWL_COV_ANALYZE_EVERY"),
             select_decode: cfg.kvmem.select_decode,
             select_partial: cfg.kvmem.select_partial,
             evict_policy: Self::evict_policy_of(&cfg.kvmem),

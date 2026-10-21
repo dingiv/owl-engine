@@ -944,7 +944,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 let n: usize = r.shape().iter().product();
                 // 形状/元素数上屏(2026-10-17 三版;env 门控 —— 判读量级前
                 // **必须先看形状**(形状不同时量级不可比,踩过)
-                if i < 24 && owl_shared::env_reader::flag("OWL_PF_TAPS") {
+                if i < 24 && host.probes.pf_taps {
                     eprintln!(
                         "[pf-tap] rank{} {} shape={:?} dtype={:?} n={n}",
                         self.tp_rank(), names[i], r.shape(), r.dtype()
@@ -1095,12 +1095,12 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 (self.boot.model.last_hidden(&ci.ids_t, &ctx), None)
             };
             let d_model = hidden_full.shape()[1];
-            let ld = live_diag_begin();
+            let ld = live_diag_begin(host.probes.live_diag);
             let r_eval = self.eval_root_and_q(&hidden_full, cov_sink.as_ref()).await;
             live_diag_end(ld, base, t);
             let (hfb, arena1, cov_q) = r_eval?;
             // Q 回读(探针档;设备块当场 free;分析在块边界事件后做)
-            self.dump_hidden_row(&hfb, base, t, d_model).await?;
+            self.dump_hidden_row(&hfb, base, t, d_model, host.probes.cov_dump).await?;
             if let Some(qs) = cov_q {
                 if let Some(sel) = host.sel.as_deref_mut() {
                     let (pl, pc) = sel.analysis_pair();
@@ -1291,11 +1291,11 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             } else {
                 (self.boot.model.last_hidden(&ci.ids_t, &ctx), None)
             };
-            let ld = live_diag_begin();
+            let ld = live_diag_begin(host.probes.live_diag);
             let r_eval = self.eval_root_and_q(&tree, cov_sink.as_ref()).await;
             live_diag_end(ld, base, t);
             let (b, arena, cov_q) = r_eval?;
-            self.dump_hidden_row(&b, base, t, d.hidden).await?;
+            self.dump_hidden_row(&b, base, t, d.hidden, host.probes.cov_dump).await?;
             if let Some(qs) = cov_q {
                 if let Some(sel) = host.sel.as_deref_mut() {
                     let (pl, pc) = sel.analysis_pair();
@@ -1370,8 +1370,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
 //   - 引用计数推送次数(证明求值器真在推,不是面断了)。
 //
 // 用法:`OWL_LIVE_DIAG=1`,跑一个 prefill 档,看 `[live-diag]` 四行。
-fn live_diag_begin() -> bool {
-    if std::env::var_os("OWL_LIVE_DIAG").is_none() {
+fn live_diag_begin(on: bool) -> bool {
+    if !on {
         return false;
     }
     owl_shared::slab_hint::probe_on(true);

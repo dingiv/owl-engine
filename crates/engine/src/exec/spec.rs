@@ -1266,7 +1266,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 mcnt("store.chain.inc.evicted", up.evicted.len() as u64);
                 // **A1 取证**(`OWL_RECON_DBG=1`):注册口三数 —— 送入 / 入树 / 被逐。
                 // 入树为 0 就是"块永远 refs==1 ⇒ 不可沉"的直接原因。
-                if std::env::var_os("OWL_RECON_DBG").is_some() {
+                if self.boot.probes.recon_dbg {
                     eprintln!(
                         "[chain-inc] 送 {} 片 · **入树 {}** · 被逐 {} · parent0={:?}",
                         blk_slices.len(),
@@ -1275,7 +1275,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         parent0
                     );
                 }
-            } else if std::env::var_os("OWL_RECON_DBG").is_some() {
+            } else if self.boot.probes.recon_dbg {
                 eprintln!("[chain-inc] 空:per_block={} 全被跳过", per_block.len());
             }
         }
@@ -1302,7 +1302,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             self.collect_index_for_blocks(&todo).await?;
         }
-        if std::env::var_os("OWL_VRAM_DBG").is_some() {
+        if self.boot.probes.vram_dbg {
             let idx_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
                 "[snap] fed={fed} 快照段 {snap_ms:.0}ms(含链/槽/拷贝/登记)· 增量登记 {:.0}ms · 索引 {:.0}ms",
@@ -1462,7 +1462,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let el = t_index.elapsed().as_secs_f64() * 1000.0;
         self.sel.note_index(el);
-        if std::env::var_os("OWL_IDX_DBG").is_some() {
+        if self.boot.probes.idx_dbg {
             let host_ms = t_host.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
                 "[idx] 批 {} 块 / {layers} 层:总 {el:.1}ms = D2H {dtoh_ms:.1} + host {host_ms:.1} ({n_threads} 线程)",
