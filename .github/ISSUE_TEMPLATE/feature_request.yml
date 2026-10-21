@@ -1,0 +1,50 @@
+name: Feature / design proposal
+description: Propose a capability or a design change
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project is grown from **design volumes and gates**, not from a backlog.
+        A proposal is much easier to act on if it states the problem and the **gate**
+        that would prove it worked.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is currently impossible / slow / wrong? Include measurements if you have them.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What would you change, and at which seam (config / graph / kernels / store / serving)?
+    validations:
+      required: true
+  - type: textarea
+    id: gate
+    attributes:
+      label: Acceptance gate
+      description: How do we know it worked? A test, a numeric threshold, an A/B arm, an oracle parity check…
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including "do nothing" — is the current behaviour an intentional design decision?
+    validations:
+      required: false
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - single GPU only
+        - TP (multi-GPU, same node)
+        - affects the public config surface
+        - affects vendored third-party code (needs VENDOR.list.md entry)
+        - docs only
+    validations:
+      required: true

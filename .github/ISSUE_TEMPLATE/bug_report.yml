@@ -1,0 +1,69 @@
+name: Bug report
+description: Something is broken (wrong output, crash, refusal to boot, perf regression)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: please check the whitelist of known-by-design behaviours in
+        `SECURITY.md` §Known exposure and the "retracted conclusions" sections of the
+        design volumes — a surprising number of "bugs" are documented verdicts.
+  - type: input
+    id: version
+    attributes:
+      label: Commit / version
+      description: Output of `git rev-parse --short HEAD` (or the release tag)
+      placeholder: e.g. b0599db
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and software
+      description: GPU model(s) and count, driver version, CUDA toolkit version, OS, host RAM
+      placeholder: |
+        2× RTX 3090 Ti (no P2P patches), driver 5xx.xx, CUDA 12.x, Ubuntu 24.04, 128 GB RAM
+    validations:
+      required: true
+  - type: dropdown
+    id: engine-mode
+    attributes:
+      label: Configuration highlights
+      description: Which of these were enabled? (pick the closest)
+      options:
+        - single GPU, graph capture on (default)
+        - single GPU, graph capture off (`[cuda] graph = false`)
+        - TP=2 (`[parallel] mode = "tensor"`)
+        - speculative decoding (DFlash2 / MTP)
+        - GGUF path
+        - other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: The exact profile keys / commands. `--print-config` output is very helpful.
+      placeholder: |
+        1. server -p my.toml --check     # passes
+        2. server -p my.toml --log-level debug
+        3. curl ... /v1/chat/completions
+        4. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / metrics
+      description: |
+        Relevant `--log-level debug` lines (tags such as `kernels`, `owl-fi`, `device-handle`),
+        plus `/debug/metrics` snapshots before/after if this is a performance issue.
+      render: text
+    validations:
+      required: false

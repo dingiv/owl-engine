@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Build the workspace without a CUDA toolchain / GPU:
+  #   OWL_CUBIN_SKIP=1     – skip build-time cubins (empty asset table)
+  #   GDN_TRITON_BUILD=0   – skip the opt-in GDN AOT build (needs python+triton)
+  # Device paths refuse at runtime in this configuration; compilation still covers
+  # every crate, including the C/C++ adapters.
+  OWL_CUBIN_SKIP: "1"
+  GDN_TRITON_BUILD: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (no CUDA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (workspace + tests, locked)
+        run: cargo check --workspace --tests --locked
+
+  test:
+    name: unit tests (asset-free crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # These crates have no build-time CUDA assets, so they run in the
+      # no-cubin configuration. kernel/model/engine suites need real cubins
+      # (run them on a machine with a CUDA toolkit).
+      - name: cargo test
+        run: |
+          cargo test -p owl-sink   --lib --locked
+          cargo test -p owl-iface  --lib --locked
+          cargo test -p owl-shared --lib --locked
+          cargo test -p owl-store  --lib --locked
+
+  licenses:
+    name: licenses + sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+          arguments: --all-features
+
+  # Optional (not enabled by default): full build + unit tests on a runner with
+  # a CUDA toolkit. Uncomment and point `runs-on` at a self-hosted runner, or
+  # install CUDA on a hosted runner:
+  #
+  #  build-cuda:
+  #    runs-on: [self-hosted, linux, x64, cuda]
+  #    steps:
+  #      - uses: actions/checkout@v4
+  #      - uses: dtolnay/rust-toolchain@stable
+  #      - run: cargo test --workspace --lib --locked
