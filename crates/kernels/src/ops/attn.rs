@@ -236,19 +236,22 @@ impl KernelSpec for ChunkedPrefillFp8KnhdHd256 {
 }
 
 /// `owl_reshape_and_cache_fp8kv` —— K0 写池(**classic** 寻址 + fp8 池)。
-/// 与 kNHD 变体同参数表,只有寻址语义不同 —— 两者必须同时有声明,否则
-/// "池布局翻转"时会有一侧无声。
+/// 与 kNHD 变体同参数表,只有寻址语义不同。**生产归属 = 草稿池**
+/// (`K0WriteFp8`,f16 输入);主池生产路径已统一 kNHD,classic 主池只作历史/
+/// 测试面保留,不再同时声明为主池写者(E14 双寻址)。
 pub struct K0WriteFp8Classic;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.fp8", "kv.draft.fp8")]
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.draft.fp8")]
 impl KernelSpec for K0WriteFp8Classic {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
     const PARAMS: &'static [Param] = K0_PARAMS;
-    const POOL: &'static [PoolAccess] = &[
-        PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3),
-        PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3),
-    ];
+    // 主池生产路径已统一 KnHD；classic 臂只服务草稿池（K0WriteFp8）。
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_DRAFT,
+        LayoutTag::Classic,
+        Dtype::F8E4M3,
+    )];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
@@ -696,7 +699,7 @@ impl KernelSpec for NaiveAttnNcFp8KvF16 {
 /// `vllm_reshape_and_cache_f16` —— reshape_and_cache.cu(R1 补表;池声明见 POOL)
 pub struct VllmReshapeAndCacheF16;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.f16")]
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.draft.f16")]
 impl KernelSpec for VllmReshapeAndCacheF16 {
     const ENTRY: &'static str = "vllm_reshape_and_cache_f16";
     const SRC: &'static str = "cu/attn/reshape_and_cache.cu";
@@ -714,7 +717,7 @@ impl KernelSpec for VllmReshapeAndCacheF16 {
         Param::i32("x"),
         Param::t_out("out", Dtype::F16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         kv_dtype: Some(Dtype::F16), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
     };
@@ -786,7 +789,7 @@ impl KernelSpec for VllmReshapeAndCacheBf16Knhd {
 /// `owl_reshape_and_cache_fp8kv_bf16` —— reshape_and_cache_fp8kv.cu(R1 补表;池声明见 POOL)
 pub struct ReshapeAndCacheFp8KvBf16;
 
-#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.main.fp8")]
+#[kernel_tags("dom.attn", "role.attn", "role.kv_write", "phase.prefill", "kv.draft.fp8")]
 impl KernelSpec for ReshapeAndCacheFp8KvBf16 {
     const ENTRY: &'static str = "owl_reshape_and_cache_fp8kv_bf16";
     const SRC: &'static str = "cu/attn/reshape_and_cache_fp8kv.cu";
@@ -804,7 +807,7 @@ impl KernelSpec for ReshapeAndCacheFp8KvBf16 {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 1),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_MAIN, LayoutTag::Classic, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128, 256], page: &[16, 32, 64, 128], grp: None, tile: None,
     };
@@ -1537,9 +1540,11 @@ impl KernelSpec for VllmPagedAttentionV2F16Hd256 {
 /// `owl_naive_attn_nc_f16_knhd` —— naive_attn_nc.cu(F 轮符号门抓出)
 ///
 /// ⚠️ 当前 0 调用点(暂不可达;候选:从 .cu 删除变体 —— 先按 R1「编出即有裁决」建表)
+/// **池归属**:`*_knhd` 变体对应**主池** KnHD(写者 = `vllm_reshape_and_cache_f16_knhd`);
+/// 草稿池走 classic 变体 + `vllm_reshape_and_cache_bf16/f16`。
 pub struct NaiveAttnNcF16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.f16")]
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.main.f16")]
 impl KernelSpec for NaiveAttnNcF16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_f16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1557,7 +1562,7 @@ impl KernelSpec for NaiveAttnNcF16Knhd {
         Param::i32("x"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::F16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         kv_dtype: Some(Dtype::F16), head_dim: &[128], page: &[32], grp: None, tile: None,
     };
@@ -1571,7 +1576,7 @@ impl KernelSpec for NaiveAttnNcF16Knhd {
 /// 同上
 pub struct NaiveAttnNcBf16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.bf16")]
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.main.bf16")]
 impl KernelSpec for NaiveAttnNcBf16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_bf16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1589,7 +1594,7 @@ impl KernelSpec for NaiveAttnNcBf16Knhd {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::BF16)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::BF16)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         kv_dtype: Some(Dtype::BF16), head_dim: &[128], page: &[32], grp: None, tile: None,
     };
@@ -1603,7 +1608,7 @@ impl KernelSpec for NaiveAttnNcBf16Knhd {
 /// 同上
 pub struct NaiveAttnNcFp8KvF16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.fp8")]
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.main.fp8")]
 impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_f16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1621,7 +1626,7 @@ impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
         Param::i32("x"),
         Param::t_out("out", Dtype::F16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[32], grp: None, tile: None,
     };
@@ -1635,7 +1640,7 @@ impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
 /// 同上
 pub struct NaiveAttnNcFp8KvBf16Knhd;
 
-#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.draft.fp8")]
+#[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", "kv.main.fp8")]
 impl KernelSpec for NaiveAttnNcFp8KvBf16Knhd {
     const ENTRY: &'static str = "owl_naive_attn_nc_fp8kv_bf16_knhd";
     const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
@@ -1653,7 +1658,7 @@ impl KernelSpec for NaiveAttnNcFp8KvBf16Knhd {
         Param::i32("x"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
-    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
     const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
         kv_dtype: Some(Dtype::F8E4M3), head_dim: &[128], page: &[32], grp: None, tile: None,
     };

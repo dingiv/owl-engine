@@ -184,7 +184,7 @@ impl KernelSelectionEnv {
                 paged: env.kv.paged,
             },
             features,
-            tag_filter: TagFilter::from_tags(&tags),
+            tag_filter: TagFilter::from_tags(&tags).with_prod_kv_layouts(),
         })
     }
 

@@ -701,7 +701,11 @@ mod tests {
         audit_active(Some(FP8_DRAFT)).expect("fp8 草稿池档必须通过");
         // ⚠️ **knHD 与 classic 混在同一白名单 = 歧义**(池布局是配置选择,
         // 两种同时"活跃"就是 E14 双寻址的温床)⇒ 必须拒
-        let mixed: Vec<&str> = PROD.iter().chain(["owl_reshape_and_cache_fp8kv"].iter()).copied().collect();
+        let mixed: Vec<&str> = PROD
+            .iter()
+            .chain(["owl_qknorm_rope_kv_insert_f16_fp8kv"].iter())
+            .copied()
+            .collect();
         let e = audit_active(Some(&mixed)).unwrap_err();
         assert!(e.to_string().contains("布局唯一"), "{e}");
     }

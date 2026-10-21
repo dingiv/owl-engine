@@ -160,7 +160,7 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
     if cfg.runtime.tp_ordinals.as_ref().is_some_and(|v| v.len() > 1) {
         tags.push(T::FEAT_TP);
     }
-    owl_kernels::tag_filter::TagFilter::from_tags(&tags)
+    owl_kernels::tag_filter::TagFilter::from_tags(&tags).with_prod_kv_layouts()
 }
 
 // 流身份证(server 内部路由键;客户端不可见 —— 三固定流是 server 策略)
