@@ -959,8 +959,7 @@ iface 11 · gpu_server 2 · workspace check 干净。
 它把"每节点 alloc+free+launch 三次往返"压成"一次发射"。
 块池预算同一时刻已被 main 收编为配置键 `[pool] block_pool_bytes`(原 `OWL_BLOCK_POOL`
 env 退场),**缺省 0 = 关** ⇒ 本分支的分档判据自动跟随配置,零代码改动。
-⇒ **下一刀 = 让生产档显式声明 `block_pool_bytes`(建议 64–256 MiB)**,
-再用 27B 真模型复核显存峰值与 prefill 绝对值。
+真机 A/B(27B)结果见 §13.8 —— **结论是否定的:不改缺省,池保持关**。
 
 ### 门
 
@@ -968,3 +967,60 @@ env 退场),**缺省 0 = 关** ⇒ 本分支的分档判据自动跟随配置,�
 + **"没有任何发射绕过 queue"**的回归哨(绕过 ⇒ 命令面"未提交"拒 ⇒ 红)·
 `eval_batch_bench.rs`(诊断,A/B 夹具;无 `OWL_TEST_DEVICE` 即 skip;预算走 `OWL_BENCH_POOL_BYTES` 测试面注入)·
 `owl-models` 282 · `owl-engine` 115 · CPU/GPU 命令面门全绿。
+
+## 13.8 真机 A/B(27B):**宿主往返不在关键路径** ⇒ 池保持关(否定结论)
+
+### 配置
+
+- 两档均用现役生产档,`--set` 注入 `[pool] block_pool_bytes`,其余全同;
+- 3080 对档:`profiles/qwen38_27b-3080_tp2-w4a16.toml`(需 `--set spec.depth=0`;
+  该档写 `depth=7` 但未开 `tp_draft`,属档面缺陷,见 §13.9);
+- 3090 单卡档:`profiles/qwen38_27b-3090-w4a16-dflash.toml`(DFlash2 d7 真开)。
+
+### 结果(llm_speedtest 同口径;prefill 为 2048/512 prompt,decode 取 256 输出)
+
+| 场景 | 池 0(缺省) | 池 64 MiB | 池 256 MiB |
+|---|---:|---:|---:|
+| 3080 对 prefill@2048 | **1570.6 t/s** | 1548.8(−1.4%) | 1536.3(−2.2%) |
+| 3080 对 decode | 45.41 t/s | 45.55(+0.3%) | 45.30(−0.2%) |
+| 3090 DFlash2 prefill@512 | 1480.1 t/s | 1477.8(−0.2%) | — |
+| 3090 DFlash2 decode(第 2 轮) | 123.43 t/s | 125.80(+1.9%) | — |
+| 显存峰值(3080 对 / 3090) | 14619 / 21147 MiB | 14619 / 21147 MiB | 14604 / — |
+
+### 为什么没有收益(定谳)
+
+`srv.seg.*`(释放版 server 侧计时,2048 prompt 一趟 = 4096 次发射):
+
+| 段 | 总量 | 每次 |
+|---|---:|---:|
+| `srv.seg.fam`(家族/foreign 核执行) | 503.3 ms | **123 µs** |
+| `srv.seg.issue`(native 参数打包+发射) | 232.1 ms | 57 µs |
+| `srv.seg.alloc` | 38.7 ms | 9 µs |
+| **合计 server 侧宿主工作** | **~784 ms** | — |
+| 整趟 prefill 墙钟 | — | **1307 ms** |
+
+- **客户端往返(32.8 µs/条)被 GPU 异步队列完全吸收**:一次 chunk = 960 条发射 ×
+  33 µs ≈ 32 ms,而该 chunk 的 GPU 时间 ≈ 325 ms(4 chunk / 1.3 s)⇒ 宿主发得完,
+  GPU 跑不完 —— **墙钟 = GPU 时间**,砍往返不改变 GPU 时间;
+- server 自己的宿主角本身也只占 60%(784/1307),且它是异步喂 GPU,**不是瓶颈**;
+- 合成 A/B(§13.7,200 节点 × 64 元素小核)之所以 −43%,是因为那里**GPU 几乎为零**
+  (纯往返计时),不代表生产形状。
+
+⇒ **判据**:块池与累积批**只在"GPU 每核 < 宿主每命令"的形状上有价值**(小核/小 chunk/
+eager 解码)。27B 的 prefill(每节点数百 µs GPU)与图回放 decode 都不属于这类 ⇒
+**缺省保持 `block_pool_bytes = 0`**;代码保持中性(池关 ⇒ `emit_launch` 走单条)。
+
+### 真正的下一刀(据本账)
+
+1. server 侧 `srv.seg.fam` **123 µs/发射**(4096 次/趟 ⇒ 503 ms):注册表 execute 的
+   参数打包/校验/分派是**最大一块宿主成本**,且它在 actor 线程上串行;
+2. `srv.seg.issue` 57 µs/次(同上);
+3. 其后才是 GPU 核本身。
+（宿主往返不在其中 —— 已被本 A/B 排除。）
+
+## 13.9 顺带发现的两处档面缺陷(未在本刀修)
+
+1. `[pool] vram_budget_mb = 0` 被当成 **0 字节硬预算** ⇒ 生产档 boot 直接死在
+   `embed_tokens`(已修:`state.rs` 归一到 `None`,与档注释"留空 = 只按驱动账判"一致);
+2. `qwen38_27b-3080_tp2-w4a16.toml` 写 `[spec] depth = 7` 但未开 `tp_draft`
+   ⇒ TP 档启动被拒(需 `--set spec.depth=0`,或按 P2.1 显式 `tp_draft = true`)。
