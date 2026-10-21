@@ -624,18 +624,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 与 `capture_gdn_snap` 的双 rank 形态对齐(旧注释自认的缺口);单卡 = 原路。
         if !self.dev.graphs.fold.is_empty() {
             let (dev, peer) = (&mut self.dev, self.peer.as_mut());
-            match peer {
-                None => dev.fold_step_dev(gdn_slot, rows).await?,
-                Some(p) => {
-                    let (r0, r1) = crate::exec::join2(
-                        dev.fold_step_dev(gdn_slot, rows),
-                        p.fold_step_dev(gdn_slot, rows),
-                    )
-                    .await;
-                    r1?;
-                    r0?
-                }
-            }
+            crate::exec::mirror2!(dev, peer,
+                d => d.fold_step_dev(gdn_slot, rows),
+                p => p.fold_step_dev(gdn_slot, rows))?;
             return Ok(());
         }
         {
@@ -1014,21 +1005,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let ts = std::time::Instant::now();
         {
             let (dev, peer) = (&mut self.dev, self.peer.as_mut());
-            match peer {
-                None => {
-                    let face = dev.graphs.session.face_mut();
-                    dev.pool.capture_spec_snap(face, gdn_slot).await?
-                }
-                Some(p) => {
-                    let (r0, r1) = crate::exec::join2(
-                        dev.pool.capture_spec_snap(dev.graphs.session.face_mut(), gdn_slot),
-                        p.pool.capture_spec_snap(p.graphs.session.face_mut(), gdn_slot),
-                    )
-                    .await;
-                    r1?;
-                    r0?
-                }
-            }
+            crate::exec::mirror2!(dev, peer,
+                d => d.pool.capture_spec_snap(d.graphs.session.face_mut(), gdn_slot),
+                p => p.pool.capture_spec_snap(p.graphs.session.face_mut(), gdn_slot))?;
         }
         self.tspec()?.spec_snap_valid = true;
         Ok(ts.elapsed())
@@ -1232,18 +1211,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // store 的 state 账是 **host 单份** ⇒ 身份只登记一次(内容相同)。
             {
                 let (dev, peer) = (&mut self.dev, self.peer.as_mut());
-                match peer {
-                    None => dev.snap_dev(gdn_slot, key, slot).await?,
-                    Some(p) => {
-                        let (r0, r1) = join2(
-                            dev.snap_dev(gdn_slot, key, slot),
-                            p.snap_dev(gdn_slot, key, slot),
-                        )
-                        .await;
-                        r0?;
-                        r1?;
-                    }
-                }
+                crate::exec::mirror2!(dev, peer,
+                    d => d.snap_dev(gdn_slot, key, slot),
+                    p => p.snap_dev(gdn_slot, key, slot))?;
             }
             if self.boot.cfg.knobs.probes.debug {
                 owl_shared::log_debug!(

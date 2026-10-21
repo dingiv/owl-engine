@@ -143,18 +143,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (reset_gdn, restore_key, gdn_slot) = (b.reset_gdn, b.restore_key, b.gdn_slot);
         {
             let (dev, peer) = (&mut self.dev, self.peer.as_mut());
-            match peer {
-                None => dev.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table).await?,
-                Some(p) => {
-                    let (r0, r1) = join2(
-                        dev.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table),
-                        p.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table),
-                    )
-                    .await;
-                    r0?;
-                    r1?;
-                }
-            }
+            crate::exec::mirror2!(dev, peer,
+                d => d.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table),
+                p => p.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table))?;
         }
         Ok(())
     }
@@ -535,18 +526,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 条件 = 档位在场 + 本图确实带 FI 输入槽(臂身份自证,不猜)。
         let fi_bake = self.boot.cfg.knobs.fi_plan_bake;
         let (dev, peer) = (&mut self.dev, self.peer.as_mut());
-        match peer {
-            None => dev.decode_dev(&step_refs, grow_bt.as_deref(), fi_bake, pos).await?,
-            Some(p) => {
-                let (r0, r1) = join2(
-                    dev.decode_dev(&step_refs, grow_bt.as_deref(), fi_bake, pos),
-                    p.decode_dev(&step_refs, grow_bt.as_deref(), fi_bake, pos),
-                )
-                .await;
-                r0?;
-                r1?;
-            }
-        }
+        crate::exec::mirror2!(dev, peer,
+            d => d.decode_dev(&step_refs, grow_bt.as_deref(), fi_bake, pos),
+            p => p.decode_dev(&step_refs, grow_bt.as_deref(), fi_bake, pos))?;
         if kv_dump_at == Some(pos) {
             self.dump_kv_page(sid, kv_slot, "after").await?;
         }

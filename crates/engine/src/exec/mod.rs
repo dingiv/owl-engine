@@ -14,6 +14,40 @@ use owl_models::TensorOps;
 use crate::graph_plan::f32b;
 use crate::scheduler::BeginPlan;
 
+/// **双 rank 镜像执行**(S6f):`dev` 必跑;`peer` 在场则**并发**跑同一动作。
+///
+/// 为什么是宏而不是对象:两边的 future 都**借用各自 rank 的 `&mut`** ——
+/// 用闭包传会撞上 `for<'a> FnOnce(&'a mut RankDev) -> Future<'a>` 的高阶
+/// 生命周期(只能靠 Box 表达,热路径不划算)。宏展开保持零开销,同时把
+/// **纪律**收进一处:两半**都**校验(`join2` 等另一半到底,吞错 = 挂住)、
+/// 错误先报 peer、单卡直跑零分支。
+///
+/// 用法(先拆借再调用,避免 `&mut self` 双借):
+/// ```ignore
+/// let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+/// mirror2!(dev, peer,
+///     d => d.pool.write_bt(d.graphs.session.face_mut(), &table),
+///     p => p.pool.write_bt(p.graphs.session.face_mut(), &table))
+/// ```
+macro_rules! mirror2 {
+    ($dev:expr, $peer:expr, $d:ident => $fd:expr, $p:ident => $fp:expr) => {{
+        match $peer {
+            None => {
+                let $d = $dev;
+                $fd.await
+            }
+            Some($p) => {
+                let $d = $dev;
+                let (r0, r1) = $crate::exec::join2($fd, $fp).await;
+                r1?;
+                r0
+            }
+        }
+    }};
+}
+
+pub(crate) use mirror2;
+
 /// **手工 join 两 future**(S4 ⑤-K3):引擎 lib **不依赖 async 运行时/组合器**
 /// (只有 owl-* + half)—— 两 rank 的设备半必须**并发推进**(见
 /// `phases.rs` 的 TP 驱动注:单边先行会让对端的 AR 撞 5s 自旋超时)。

@@ -333,7 +333,41 @@ pub(crate) struct KvBank {
     fi_tables: Option<FiTableBlocks>,
 }
 
+/// **v2 分页 attention 的 PARTITION 长**(token;与核契约同源)。
+///
+/// `nparts = ceil(池 token 数 / 本值)` —— 三档 scratch 与叶子形状的**单源**。
+pub(crate) const V2_PARTITION_TOKENS: usize = 512;
+
 impl KvBank {
+    /// **v2 attention scratch 工厂**(decode / verify / 合批 三档同构)。
+    ///
+    /// 只差伪序列数 `seqs`(decode=1 / verify=depth+1 / 合批=max_batch)与标签;
+    /// 形状/dtype 规则写在这里,三处不再各抄一遍。
+    async fn alloc_attn_v2<D: DeviceClient>(
+        face: &mut D,
+        dims: ModelDims,
+        nparts: usize,
+        seqs: usize,
+        tag: &str,
+    ) -> Result<owl_models::module::AttnV2Scratch> {
+        let es = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32, &format!("{tag}.exp_sums")).await?;
+        let ml = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32, &format!("{tag}.max_logits")).await?;
+        let to = zero_block_dt(
+            face,
+            seqs * dims.hq * nparts * dims.hd,
+            dims.dtype,
+            &format!("{tag}.tmp_out"),
+        )
+        .await?;
+        Ok(owl_models::module::AttnV2Scratch {
+            exp_sums: block_leaf(&es.0, vec![seqs, dims.hq * nparts]),
+            max_logits: block_leaf(&ml.0, vec![seqs, dims.hq * nparts]),
+            tmp_out: block_leaf_dt(&to.0, vec![seqs * dims.hq * nparts * dims.hd], dims.dtype),
+            nparts,
+            seqs,
+        })
+    }
+
     /// 主 KV 池层视图(层数 = full-attention 层数)。
     pub(crate) fn kvs(&self) -> &[KvBlocks] {
         &self.kvs
@@ -1954,58 +1988,22 @@ impl KvBank {
         let page = ctx.geom.page;
         let nb = ctx.geom.nb;
         let paged = ctx.geom.paged;
-        // v2 decode scratch(E-decode):exp_sums/max_logits [1,hq,nparts]
-        // f32 + tmp_out [hq·nparts·hd] f16;nparts = ceil(nb·page/512)
-        // (PARTITION=512;boot 一次性持久块,不进竞技场收割面,图安全同 bt)
-        let attn_v2 = if paged {
-            let nparts = (nb * page).div_ceil(512);
-            let es = zero_block_dt(face, dims.hq * nparts, Dtype::F32, "attn2.exp_sums").await?;
-            let ml = zero_block_dt(face, dims.hq * nparts, Dtype::F32, "attn2.max_logits").await?;
-            let to = zero_block_dt(face, dims.hq * nparts * dims.hd, dims.dtype, "attn2.tmp_out").await?;
-            Some(owl_models::module::AttnV2Scratch {
-                exp_sums: block_leaf(&es.0, vec![1, dims.hq * nparts]),
-                max_logits: block_leaf(&ml.0, vec![1, dims.hq * nparts]),
-                tmp_out: block_leaf_dt(&to.0, vec![dims.hq * nparts * dims.hd], dims.dtype),
-                nparts,
-                seqs: 1,
-            })
-        } else {
-            None
-        };
-        // verify v2 scratch(§三十一:8 伪序列 partition 并行;seqs=depth1;
-        // 形状 = decode 版 × depth1,展平 [seq][head][part] 与 vLLM 核同构)
-        let verify_attn_v2 = if paged && plan.spec_depth > 0 {
-            let nparts = (nb * page).div_ceil(512);
-            let seqs = plan.spec_depth + 1;
-            let es = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32, "vattn2.exp_sums").await?;
-            let ml = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32, "vattn2.max_logits").await?;
-            let to = zero_block_dt(face, seqs * dims.hq * nparts * dims.hd, dims.dtype, "vattn2.tmp_out").await?;
-            Some(owl_models::module::AttnV2Scratch {
-                exp_sums: block_leaf(&es.0, vec![seqs, dims.hq * nparts]),
-                max_logits: block_leaf(&ml.0, vec![seqs, dims.hq * nparts]),
-                tmp_out: block_leaf_dt(&to.0, vec![seqs * dims.hq * nparts * dims.hd], dims.dtype),
-                nparts,
-                seqs,
-            })
-        } else {
-            None
-        };
-        // **批 decode scratch**(B5.1;seqs=max_batch):与 verify 版同式,
-        // 只是伪序列数 = 合批上限。None = max_batch=1(拓扑零变化)。
+        // v2 分页 attention scratch 三档(decode/verify/合批):同构,只差伪序列数
+        // —— 分配判据归 `KvBank::alloc_attn_v2`(单源,含 PARTITION 常量)。
+        let nparts = (nb * page).div_ceil(V2_PARTITION_TOKENS);
         let max_batch = plan.max_batch.max(1);
+        let attn_v2 = if paged {
+            Some(Self::alloc_attn_v2(face, dims, nparts, 1, "attn2").await?)
+        } else {
+            None
+        };
+        let verify_attn_v2 = if paged && plan.spec_depth > 0 {
+            Some(Self::alloc_attn_v2(face, dims, nparts, plan.spec_depth + 1, "vattn2").await?)
+        } else {
+            None
+        };
         let batch_attn_v2 = if paged && max_batch > 1 {
-            let nparts = (nb * page).div_ceil(512);
-            let seqs = max_batch;
-            let es = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32, "battn2.exp_sums").await?;
-            let ml = zero_block_dt(face, seqs * dims.hq * nparts, Dtype::F32, "battn2.max_logits").await?;
-            let to = zero_block_dt(face, seqs * dims.hq * nparts * dims.hd, dims.dtype, "battn2.tmp_out").await?;
-            Some(owl_models::module::AttnV2Scratch {
-                exp_sums: block_leaf(&es.0, vec![seqs, dims.hq * nparts]),
-                max_logits: block_leaf(&ml.0, vec![seqs, dims.hq * nparts]),
-                tmp_out: block_leaf_dt(&to.0, vec![seqs * dims.hq * nparts * dims.hd], dims.dtype),
-                nparts,
-                seqs,
-            })
+            Some(Self::alloc_attn_v2(face, dims, nparts, max_batch, "battn2").await?)
         } else {
             None
         };
