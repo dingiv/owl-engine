@@ -416,6 +416,12 @@ pub struct Linear {
 impl Linear {
     /// 权重槽叶子声明(刀3a':gdn b/a 直发自研 gemv 需绕过 Linear::forward
     /// 的 cublas 臂;仅 f16 直读态合法 —— 量化态调用方须走 forward)
+    /// 本层是否走 **GGUF 量化块臂**(计划面 `QuantPlan::Gguf(_)` ⇒ 槽 = 块字节)。
+    /// 消费者:MTP 的 `fc` 融合路径要按块臂走 `forward`(而非裸 `matmul_nt`)。
+    pub fn is_gguf(&self) -> bool {
+        self.gguf_ty.is_some()
+    }
+
     pub fn weight_decl(&self) -> TensorOps {
         self.w.decl()
     }
