@@ -604,6 +604,8 @@ mod tests {
             debug_tap: false,
             staging_mb: 128,
             dump: false,
+            // 草稿档恒走块型原样装载(解量化源只服务 MTP 头)
+            gguf_dequant: false,
         };
         let manifest = load_from_dir(dir, face, &draft, opts).await?;
         manifest_mem_ledger(&manifest, "draft-mem");

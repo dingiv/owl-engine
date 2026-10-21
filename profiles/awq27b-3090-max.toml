@@ -185,3 +185,13 @@ tags_deny = []
 max_mb = 0
 keep = 0
 timestamp = false
+
+# **意图档头**(2026-10-21):本档是"全字段完整 dump + 显式目标"两档并立里的后者 ——
+# 有 `[intent]` 时豁免全字段门(派生面确定性),且 `--check` 的内存估算需要它
+# (`profile_estimate_matches_boot_ledger` 门)。
+# 显式 `[model].{kind,quant,head_quant}` 必须与 intent 派生值同值(同值 = 无害复述)。
+[intent]
+model = "qwen3.8-27b-awq"
+hardware = "3090ti-24g"
+goal = "max-context"
+context = 131072

@@ -1785,6 +1785,28 @@ impl OwlConfig {
         layers: &[&Path],
         cli: &[(String, toml::Value)],
     ) -> Result<ResolvedConfig, String> {
+        Self::load_resolved_ex(base, layers, cli, true)
+    }
+
+    /// **`--print-config` 专用(宽松档)**:跳过"全字段显式"门。
+    ///
+    /// 理由:该门拒启时提示"用 `--print-config` 生成完整档",而生成器本身
+    /// 不能先被同一道门挡住(自举)。宽松档只服务"把半份档展开成完整档"
+    /// 这一件事,正常启动仍走 [`Self::load_resolved`](严格)。
+    pub fn load_resolved_for_print(
+        base: Option<&Path>,
+        layers: &[&Path],
+        cli: &[(String, toml::Value)],
+    ) -> Result<ResolvedConfig, String> {
+        Self::load_resolved_ex(base, layers, cli, false)
+    }
+
+    fn load_resolved_ex(
+        base: Option<&Path>,
+        layers: &[&Path],
+        cli: &[(String, toml::Value)],
+        strict_full_field: bool,
+    ) -> Result<ResolvedConfig, String> {
         let mut v = toml::Value::Table(toml::map::Map::new());
         let mut origins = Origins::new();
         let mut layer_names: Vec<String> = Vec::new();
@@ -1797,7 +1819,16 @@ impl OwlConfig {
             let mut file_v = toml::Value::Table(toml::map::Map::new());
             let mut file_origins = Origins::new();
             load_config_into(b, &mut file_v, 0, &mut Vec::new(), &mut file_origins)?;
-            check_explicit_complete(&file_v, b)?;
+            // **两档并立**(2026-10-21):
+            // ① **完整档**(无 `[intent]`)= 每一键都显式(可复现,不靠代码缺省);
+            // ② **意图档**(有 `[intent]`)= 显式声明**目标**(模型/硬件/ctx/目标),
+            //    其余由 `resolve::apply` **确定性派生** —— 派生面本身是单源,
+            //    故豁免全字段门(否则意图机制无法存在:`[model]` 全键与
+            //    `intent.model` 会成为两个真源)。
+            let is_intent = file_v.get("intent").is_some();
+            if strict_full_field && !is_intent {
+                check_explicit_complete(&file_v, b)?;
+            }
             load_config_into(b, &mut v, 0, &mut Vec::new(), &mut origins)?;
             layer_names.push(b.display().to_string());
         }
