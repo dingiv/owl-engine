@@ -140,6 +140,25 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|p| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32)
                 .collect();
             let lens_f: Vec<f32> = ((pos + 1)..=(pos + block.len())).map(|p| p as f32).collect();
+            // **部分驻留守卫**(2026-10-21):`select_partial` 下沉过的块在会话链上
+            // 是**宿主占位符**(u32::MAX)。verify 的 `bt8`/`slots` 直接取会话链 ⇒
+            // 占位符会被 v2/attention 核当成页号(乘页字节 = 天文地址)⇒ CUDA 700,
+            // 而且**污染整个上下文**(之后每个 turn 都炸)。这里**响亮拒发**本轮,
+            // 错误上抛到 pump(弃置该 turn,不再发射任何核)。
+            // 为什么不做"视图化 verify":方案 A 的视图把 KV 压成选中子集,而 verify
+            // 要按**原位置**逐行因果写 8 行 KV + 逐行长 lens —— 页表与 lens 的
+            // 语义还没定谱(设计卷 B-3e 挂账),先拒不发假绿。
+            let need_pages = (pos + block.len()).div_ceil(page);
+            if let Some((i, _)) = bt_chain
+                .iter()
+                .take(need_pages)
+                .enumerate()
+                .find(|(_, p)| **p == crate::scheduler::PENDING_LOAD_PLACEHOLDER)
+            {
+                return Err(ModelError::Msg(format!(
+                    "spec verify 需要第 {i} 块但它在宿主(部分驻留下沉过;pos={pos} 需 {need_pages} 页)                     ⇒ 拒发本轮。verify 的视图化页表未实现:请关 `[kvmem] select_partial`                     (只留 select_decode)或关投机"
+                )));
+            }
             // §三十一:bt8 = 页链 × depth1 平铺(8 伪序列共享页链;v2 臂用);
             // 补零到池 nb(会话链短于池时尾部补无效页 0,kv_lens 限界不读)
             let nb_total = self.dev.pool.nb.max(bt_chain.len());

@@ -1859,6 +1859,21 @@ impl OwlConfig {
         // **W5 意图配套门**（2026-10-18）：FI 臂只有"图内臂"一种承载（核留图内 +
         // `ctx_total` 烘上界 + 表由 `fi_plan_sync` 窗外刷）。缺上界 ⇒ 捕获期会拿
         // **占位 ctx** 烘表（文本连贯但错，历史踩过）⇒ 响亮拒绝，不给静默错值。
+        // **部分驻留 × 投机 = 不共戴**(2026-10-21 实测):`select_partial` 下沉过
+        // 的块在会话链上是宿主占位符,而 verify 的页表/槽位直接取会话链 ⇒
+        // 占位符被核当页号 = CUDA 700 + **上下文毒化**(之后每个 turn 都崩)。
+        // 视图化 verify 未实现(方案 A 的页表/lens 语义待定谱)⇒ 拒启,
+        // 而不是跑起来等你踩。
+        if self.kvmem.select_partial && self.spec.depth > 0 {
+            return Err(
+                "[kvmem] select_partial = true 与 [spec] depth > 0 不共戴\
+                 (下沉块的宿主占位符会进 verify 页表 ⇒ CUDA 700 且污染上下文;\
+                 视图化 verify 未实现)。请二选一:关 select_partial(只留 select_decode,\
+                 长 ctx decode 实测 35.0 t/s 与 dense 持平)或关投机。"
+                    .to_string(),
+            );
+        }
+
         // **臂 × FI 前置件的一致性门**(2026-10-21 单键化):FI 臂(verify/decode
         // 任一)只有在 `fi_plan_bake` 在场时才能捕获(图内臂 + 窗外刷表)。
         // 拒启而不是自动补 —— 静默补一个上界会让 `ctx_total` 烘错。
@@ -2060,6 +2075,24 @@ mod tests {
             "[dispatch]\nverify_arm = \"fi\"\ndecode_arm = \"fi\"\n             fi_cuda_graph = true\nfi_plan_bake = 0\nfi_plan_restore = false\n",
         )
         .expect("fi 臂 + 三件套 = 合规");
+    }
+
+    /// **部分驻留 × 投机 拒启**(2026-10-21):下沉块的宿主占位符会进 verify
+    /// 页表 ⇒ CUDA 700 + 上下文毒化。两条合法组合必须仍然放行。
+    #[test]
+    fn select_partial_rejects_spec() {
+        let base = "[kvmem]\nselect_partial = true\n";
+        let e = OwlConfig::from_toml_str(&format!("{base}[spec]\ndepth = 7\n"))
+            .expect_err("select_partial + spec 必须拒启");
+        assert!(e.contains("select_partial") && e.contains("depth"), "拒语要可行动: {e}");
+        // 关掉投机 = 合法(实测 8192 decode 40.2 t/s)
+        OwlConfig::from_toml_str(&format!("{base}[spec]\ndepth = 0\n"))
+            .expect("partial + 无投机 = 合规");
+        // 关掉 partial 只留视图 = 合法(实测 8192 decode 35.1 t/s)
+        OwlConfig::from_toml_str(
+            "[kvmem]\nselect_decode = true\n[spec]\ndepth = 7\n",
+        )
+        .expect("视图 + 投机 = 合规");
     }
 
     /// **A4 收口(2026-10-19)**:`lrfu:λ` 解析回配置面。
