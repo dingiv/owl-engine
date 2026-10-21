@@ -43,56 +43,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         owl_shared::log_debug!("spec-round", "轮开始 token={token} pos={pos} depth={depth} vlm_delta={vlm_delta}");
 
         // ① 快照(轮首;恢复后仍有效 → 只在失效时拍)
-        if !self.tspec()?.spec_snap_valid {
-            let ts = std::time::Instant::now();
-            // ★ **双 rank 镜像**(P2.1-c,2026-10-19):快照缓冲是**每 rank 各自的池**
-            // ⇒ 两边都要拍(只拍 rank0 ⇒ peer 恢复的是陈旧/未初始化态 ⇒ 重放
-            // logits 错 ⇒ m=0 回滚路输出与裸 decode 不一致)。单卡 = 原路。
-            {
-                let (dev, peer) = (&mut self.dev, self.peer.as_mut());
-                match peer {
-                    None => {
-                        let face = dev.graphs.session.face_mut();
-                        dev.pool.capture_spec_snap(face, gdn_slot).await?
-                    }
-                    Some(p) => {
-                        let (r0, r1) = crate::exec::join2(
-                            dev.pool.capture_spec_snap(dev.graphs.session.face_mut(), gdn_slot),
-                            p.pool.capture_spec_snap(p.graphs.session.face_mut(), gdn_slot),
-                        )
-                        .await;
-                        r1?;
-                        r0?
-                    }
-                }
-            }
-            self.tspec()?.spec_snap_valid = true;
-            t_snap = ts.elapsed();
-        }
+        t_snap = self.ensure_spec_snap(gdn_slot).await?;
 
         // ② 草稿到位(host 账;轮末 propose 图/eager dtoh 产出。首轮 =
         // prefill seed propose(eager);Dumb = anchor 重复)
-        let drafts: Vec<u32> = if let Some(mut d) = self.tspec()?.spec_drafts_host.take() {
-            // depth 联动截断(2026-10-09 depth=3 案):⑦ propose 恒产 7
-            // 草稿,depth<7 时下轮 block=1+7 行装不进 T=depth+1 捕获图
-            // (ids 8≠4 装填拒,pump 退役)。与轮首直调分支的
-            // d.truncate(depth) 同款,收口在消费点单处。
-            d.truncate(depth);
-            d
-        } else if let Some(crate::spec_runtime::Drafter::DFlash2(_)) = self.dev.spec_rt.drafter.as_ref() {
-            let ts = std::time::Instant::now();
-            let mut d = self.dflash_propose(token, pos).await?;
-            d.truncate(depth); // depth ≤ 7(草稿恒 7 产;T 图定形 depth+1)
-            t_propose += ts.elapsed();
-            d
-        } else if self.dev.spec_rt.drafter.is_some() {
-            let ts = std::time::Instant::now();
-            self.propose_first(token, pos).await?;
-            t_propose += ts.elapsed();
-            self.tspec()?.spec_drafts_host.take().ok_or_else(|| ModelError::EngineInvariant { what: "propose_first 未产出草稿(上游相位漂移)".into() })?
-        } else {
-            vec![token; depth] // Dumb:哑草稿 = anchor 重复
-        };
+        let (drafts, t_drafts) = self.acquire_drafts(token, pos, depth).await?;
+        t_propose += t_drafts;
 
         // ③ verify 块 [anchor, d1..dk] @ pos..pos+depth:图态(一次 replay
         // + fold 记录)或 eager fallback(旧 verify_forward)。fold 记录
@@ -117,242 +73,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // XQA 页表:在借 self.dev.graphs.verify 之前算好(自 sessions 取真块链)
         let xqa_pt_v = self.xqa_pt_of(sid);
 
-        let (ids, hidden, records, hidden_owned, row_logits) =
-            if let Some(vg) = self.dev.graphs.verify.as_mut() {
-            let ts = std::time::Instant::now();
-            let page = self.dev.pool.geom.page;
-            let bt_chain = {
-                let s = self.bank.sessions.session(sid)?;
-                s.block_table.clone()
-            };
-            let ids_f: Vec<f32> = block.iter().map(|&v| v as f32).collect();
-            let rope_base = usize::try_from(pos as i64 + vlm_delta).map_err(|_| {
-                ModelError::Msg(format!(
-                    "spec verify: VLM 位置为负(pos={pos}, delta={vlm_delta})"
-                ))
-            })?;
-            let pos_f: Vec<f32> =
-                (rope_base..rope_base + block.len()).map(|p| p as f32).collect();
-            if bt_chain.len() <= (pos + block.len() - 1) / page {
-                owl_shared::log_debug!("spec-dbg", "pos={pos} block={} bt_len={bt_len} page={page}", block.len(), bt_len = bt_chain.len());
-            }
-            let slots_f: Vec<f32> = (pos..pos + block.len())
-                .map(|p| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32)
-                .collect();
-            let lens_f: Vec<f32> = ((pos + 1)..=(pos + block.len())).map(|p| p as f32).collect();
-            // §三十一:bt8 = 页链 × depth1 平铺(8 伪序列共享页链;v2 臂用);
-            // 补零到池 nb(会话链短于池时尾部补无效页 0,kv_lens 限界不读)
-            let nb_total = self.dev.pool.geom.nb.max(bt_chain.len());
-            let bt8_f: Vec<f32> = (0..block.len())
-                .flat_map(|_| {
-                    bt_chain.iter().map(|&b| b as f32)
-                        .chain(std::iter::repeat_n(0f32, nb_total - bt_chain.len()))
-                })
-                .collect();
-            // XQA 臂:semaphores 每轮清零(KV-split 归约计数;**同流序先于图回放**;
-            // 参考实现 = torch sem.zero_();图内不做,故在轮侧发 memset)
-            // ⚠️ 必须用 **session face**(池块的账房;verify 图 face 是另一份
-            // 账本 → 传别家的块 id = 打到别的块上 → `pump: DeadBlock` 实测踩过)
-            // XQA seq_lens = **整请求总 KV 长**(含块内 depth+1 个位置;u32 位型走私)
-            let xqa_seq_v = [f32::from_bits((pos + block.len()) as u32)];
-            // semaphores 每轮写零(图输入槽;KV-split 归约计数)。
-            // `.max(1)` 与声明端同式 —— "无 XQA 面"时槽仍存在(= 1 元素),
-            // 避免零长写(挂账 #7)。
-            let xqa_sem_v: Vec<f32> = vec![0.0; self.dev.pool.xqa_sem_n().max(1)];
-            // **FI 断点臂**的逐轮值(该臂未开 ⇒ 空,不写槽):
-            // ① 宿主标量槽 `ctx_total`(= 本轮 kv 总长;plan 的 key)
-            // ② 表四件套(q_cu/indices/indptr/last_len;u32 位型过线)
-            let page_fi = self.dev.pool.geom.page;
-            let ctx_total_fi = pos + block.len();
-            // 门 = **槽在场**(槽属于**图**;判"某核在场"必须看节点/槽,不看旋钮)
-            let fi_slots_on = vg.has_input("fi_q_cu");
-            let (fi_q_cu_v, fi_idx_v, fi_indptr_v, fi_ll_v): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
-                if fi_slots_on {
-                    // ⚠️ **必须写本轮真值**(verify 不吃桶化):T=8 的 plan split
-                    // chunk 数必须与核运行期 `ceil_div(kv_len, chunk)` 一致,否则
-                    // partial 行 stride 与 `merge_indptr` 打架(同参 A/B:桶 2048
-                    // ⇒ 空文本/`!!!`、42.9 t/s;真值 ⇒ 连贯 71 t/s)。
-                    let nb_used = ctx_total_fi
-                        .div_ceil(page_fi)
-                        .min(bt_chain.len())
-                        .max(1);
-                    let mut idx = vec![0f32; self.dev.pool.geom.nb];
-                    for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
-                        idx[i] = f32::from_bits(*b);
-                    }
-                    (
-                        vec![0.0, f32::from_bits(block.len() as u32)],
-                        idx,
-                        vec![0.0, f32::from_bits(nb_used as u32)],
-                        vec![f32::from_bits((ctx_total_fi - (nb_used - 1) * page_fi) as u32)],
-                    )
-                } else {
-                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                };
-            let gdn_slot_v1 = [gdn_slot as f32];
-            let mut ins: Vec<(&str, &[f32])> = vec![
-                ("ids", ids_f.as_slice()),
-                ("pos", pos_f.as_slice()),
-                ("kv_slots", slots_f.as_slice()),
-                ("kv_lens", lens_f.as_slice()),
-                ("gdn_slot", gdn_slot_v1.as_slice()),
-                ("bt8", bt8_f.as_slice()),
-                ("xqa_seq", xqa_seq_v.as_slice()),
-                ("xqa_sem", xqa_sem_v.as_slice()),
-                // XQA 页表:会话真链(槽在 verify 图无条件声明;
-                // 不写 = 留着恒等链 = 读到别家 KV —— §7.6)
-                ("xqa_pt", xqa_pt_v.as_slice()),
-            ];
-            if !fi_q_cu_v.is_empty() {
-                ins.push(("fi_q_cu", fi_q_cu_v.as_slice()));
-                ins.push(("fi_indices", fi_idx_v.as_slice()));
-                ins.push(("fi_indptr", fi_indptr_v.as_slice()));
-                ins.push(("fi_last_len", fi_ll_v.as_slice()));
-            }
-            // **FI plan 表同步(W4)**:单图档(`fi_plan_bake`)的 verify 图里 FI 核
-            // 不带自携表 ⇒ 每轮必须由图外刷**当轮精确表**(t=depth+1,ctx=本轮总长)。
-            // 与 decode 同律:表必须与运行期 chunk 数一一对应(T=8 过供给会错)。
-            // 门 = **档位在场** + 槽在场（W5：verify 恒随 `fi_plan_bake`；槽只证
-            // "本图带 FI 面"，档位证"表刷新面有人消费"）。
-            // ★ **双 rank 镜像**(P2.1-c,2026-10-19):verify 图含 AR(T=depth+1 行的
-            // RowParallel)⇒ 两 rank 必须同跑(否则 AR 失步;`dumb` 档实测同样挂 ⇒
-            // 与草稿无关,卡点就在这一句)。单卡档 = 原路(零分支)。
-            // FI 表两 rank 各自的图都要刷 ⇒ 规格传进 `verify_dev`。
-            let fi_spec = if self.boot.cfg.knobs.fi_plan_bake.is_some() && fi_slots_on {
-                let d = self.dev.pool.geom.dims;
-                Some(owl_iface::contract::FiPlanSpec {
-                    t: block.len(),
-                    ctx_total: ctx_total_fi,
-                    hq: d.hq,
-                    hkv: d.hkv,
-                    hd: d.hd,
-                    page: self.dev.pool.geom.page,
-                })
-            } else {
-                None
-            };
-            let t_step_v = std::time::Instant::now();
-            owl_shared::log_debug!("spec-round", "verify 镜像:ins={} peer={} fi={}", ins.len(), self.peer.is_some(), fi_spec.is_some());
-            // P1.1 词表切:切档 ⇒ 两 rank 各出**半表行**、rank0 host 拼接成全表
-            // （实效判据：本 rank logits 宽 < 全量；tied 档装载期已响亮拒）
-            let head_split = self.head_split_active();
-            let half_vocab = self.dev.boot.model.logits_vocab();
-            let (tok_f, row_logits) = {
-                let (dev, peer) = (&mut self.dev, self.peer.as_mut());
-                match peer {
-                    None => dev.verify_dev(&ins, fi_spec, sampler_on).await?,
-                    Some(p) => {
-                        // 两半都校验(纪律:`join2` 等另一半到底,吞错 = 挂住)
-                        // 切档 ⇒ 两 rank 都要 logits 半表(rank0 拼接用);未切档
-                        // = 原路(peer 不读 ⇒ 省那份 D2H 与 host 内存)。
-                        let (r0, r1) = crate::exec::join2(
-                            dev.verify_dev(&ins, fi_spec, sampler_on || head_split),
-                            p.verify_dev(&ins, fi_spec, head_split),
-                        )
-                        .await;
-                        let (_, lg1) = r1?;
-                        let (tok0, lg0) = r0?;
-                        if head_split {
-                            let (a, b) = match (lg0, lg1) {
-                                (Some(a), Some(b)) => (a, b),
-                                _ => {
-                                    return Err(ModelError::EngineInvariant {
-                                        what: "词表切 verify:半表行缺席(装配/读面不一致)"
-                                            .into(),
-                                    })
-                                }
-                            };
-                            (tok0, Some(crate::running::concat_head_rows(&a, &b, half_vocab)?))
-                        } else {
-                            (tok0, lg0)
-                        }
-                    }
-                }
-            };
-            owl_shared::log_debug!("spec-round", "verify 完成:tok={}", tok_f.len());
-            let t_read_v = std::time::Instant::now();
-            let t_tok = std::time::Instant::now();
-            // 后续（块句柄 / 探针）继续用主 rank 的图
-            let vg = self
-                .dev
-                .graphs
-                .verify
-                .as_mut()
-                .ok_or_else(|| ModelError::EngineInvariant {
-                    what: "verify 图缺席(档位与装配不一致)".into(),
-                })?;
-            let t_lg = std::time::Instant::now();
-            // E5 性能:verify 分相(step=上传+launch;read=同步+回读;
-            // pure=同步后裸 replay+read = 图独占 GPU 时间)
-            if self.boot.probes.step_profile {
-                let t_v1 = std::time::Instant::now();
-                vg.replay().await?;
-                let _ = vg.read_output_f32("tok").await?;
-                owl_shared::log_info!("verify-prof", "step={:?} read={:?} pure={:?}",
-                    t_read_v - t_step_v,
-                    t_v1 - t_read_v,
-                    t_v1.elapsed()
-                );
-            }
-            mrec("spec.verify.step", t_read_v - t_step_v);
-            // 2026-10-15:把 `verify.read` 拆开 —— 首轮归因发现它比「设备时间 + 采样」
-            // 多出 ~19 ms/轮(且与采样档无关:greedy A/B 只差 0.75 ms),必须定位。
-            mrec("spec.verify.tokread", t_tok.elapsed());
-            mrec("spec.verify.lgread", t_lg.elapsed());
-            mrec("spec.verify.read", t_read_v.elapsed());
-            // P1.1:切档的设备 token 只是**半表局部** argmax ⇒ 从拼接后的全表行
-            // 重算全局 argmax(贪心接受判据的唯一依据);未切档 = 原值。
-            let ids: Vec<u32> = if head_split {
-                let lg = row_logits.as_ref().ok_or_else(|| ModelError::EngineInvariant {
-                    what: "词表切 verify:全表行 logits 缺席(greedy 判据无据)".into(),
-                })?;
-                let v = self.dev.boot.model.vocab_size();
-                if lg.len() < rows_n * v {
-                    return Err(ModelError::EngineInvariant {
-                        what: format!(
-                            "词表切 verify:行 logits 尺寸不符 {} < {}×{}",
-                            lg.len(),
-                            rows_n,
-                            v
-                        ),
-                    });
-                }
-                (0..rows_n)
-                    .map(|r| {
-                        lg[r * v..(r + 1) * v]
-                            .iter()
-                            .enumerate()
-                            .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
-                                if x > a.1 {
-                                    (i, x)
-                                } else {
-                                    a
-                                }
-                            })
-                            .0 as u32
-                    })
-                    .collect()
-            } else {
-                tok_f.iter().map(|&v| v as u32).collect()
-            };
-            let hidden = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
-            let n_rec = self.dev.pool.gdn_count() * 8;
-            let records: Vec<Bytes> = (0..n_rec)
-                .map(|i| {
-                    vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {
-                        what: format!("fold 记录槽 r{i} 缺席(图装配与声明不一致)"),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            t_verify = ts.elapsed();
-            (ids, hidden, records, false, row_logits) // 图输出槽:持久,不 free
-        } else {
-            let ts = std::time::Instant::now();
-            let (ids, hidden, row_logits) =
-                self.verify_forward(&block, pos, gdn_slot, sampler_on, vlm_delta).await?;
-            t_verify = ts.elapsed();
-            (ids, hidden, Vec::new(), true, row_logits)
-        };
+        let (ids, hidden, records, hidden_owned, row_logits, t_v) = self
+            .verify_round(&block, pos, gdn_slot, sampler_on, vlm_delta, &xqa_pt_v, sid)
+            .await?;
+        t_verify = t_v;
         if prof {
             owl_shared::log_info!("spec-prof", "pos={pos} verify={:?}", t0.unwrap().elapsed());
         }
@@ -1008,6 +732,345 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let mut v: Vec<f32> = table.iter().map(|&b| f32::from_bits(b)).collect();
         v.resize(nb, 0.0);
         v
+    }
+
+    /// **① 轮首快照**(S6d):GDN 态回滚缓冲;仅失效时拍。
+    ///
+    /// ★ **双 rank 镜像**(P2.1-c,2026-10-19):快照缓冲是**每 rank 各自的池**
+    /// ⇒ 两边都要拍(只拍 rank0 ⇒ peer 恢复的是陈旧/未初始化态 ⇒ 重放
+    /// logits 错 ⇒ m=0 回滚路输出与裸 decode 不一致)。单卡 = 原路。
+    ///
+    /// 返回本次拍照耗时(已有效 = ZERO)。
+    /// **③ verify 轮**(S6d):`[anchor, d1..dk]` 一次前向。
+    ///
+    /// 图态 = 一次 replay + fold 记录(每层 8 件);eager fallback = 旧
+    /// `verify_forward`。TP 档两 rank 必须同跑(verify 图含 AR,T=depth+1 行
+    /// RowParallel);词表切档 = 两 rank 各出半表、rank0 host 拼接。
+    ///
+    /// 返回 `(ids, hidden, records, hidden_owned, row_logits, 耗时)`。
+    /// `hidden_owned = true` ⇒ 调用方负责 free(eager 路的中间块)。
+    #[allow(clippy::type_complexity)]
+    async fn verify_round(
+        &mut self,
+        block: &[u32],
+        pos: usize,
+        gdn_slot: usize,
+        sampler_on: bool,
+        vlm_delta: i64,
+        xqa_pt_v: &[f32],
+        sid: u64,
+    ) -> Result<(
+        Vec<u32>,
+        owl_iface::contract::Bytes,
+        Vec<owl_iface::contract::Bytes>,
+        bool,
+        Option<Vec<f32>>,
+        std::time::Duration,
+    )> {
+        let mut verify_elapsed = std::time::Duration::ZERO;
+        let (ids, hidden, records, hidden_owned, row_logits) =
+        if let Some(vg) = self.dev.graphs.verify.as_mut() {
+        let ts = std::time::Instant::now();
+        let page = self.dev.pool.geom.page;
+        let bt_chain = {
+            let s = self.bank.sessions.session(sid)?;
+            s.block_table.clone()
+        };
+        let ids_f: Vec<f32> = block.iter().map(|&v| v as f32).collect();
+        let rope_base = usize::try_from(pos as i64 + vlm_delta).map_err(|_| {
+            ModelError::Msg(format!(
+                "spec verify: VLM 位置为负(pos={pos}, delta={vlm_delta})"
+            ))
+        })?;
+        let pos_f: Vec<f32> =
+            (rope_base..rope_base + block.len()).map(|p| p as f32).collect();
+        if bt_chain.len() <= (pos + block.len() - 1) / page {
+            owl_shared::log_debug!("spec-dbg", "pos={pos} block={} bt_len={bt_len} page={page}", block.len(), bt_len = bt_chain.len());
+        }
+        let slots_f: Vec<f32> = (pos..pos + block.len())
+            .map(|p| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32)
+            .collect();
+        let lens_f: Vec<f32> = ((pos + 1)..=(pos + block.len())).map(|p| p as f32).collect();
+        // §三十一:bt8 = 页链 × depth1 平铺(8 伪序列共享页链;v2 臂用);
+        // 补零到池 nb(会话链短于池时尾部补无效页 0,kv_lens 限界不读)
+        let nb_total = self.dev.pool.geom.nb.max(bt_chain.len());
+        let bt8_f: Vec<f32> = (0..block.len())
+            .flat_map(|_| {
+                bt_chain.iter().map(|&b| b as f32)
+                    .chain(std::iter::repeat_n(0f32, nb_total - bt_chain.len()))
+            })
+            .collect();
+        // XQA 臂:semaphores 每轮清零(KV-split 归约计数;**同流序先于图回放**;
+        // 参考实现 = torch sem.zero_();图内不做,故在轮侧发 memset)
+        // ⚠️ 必须用 **session face**(池块的账房;verify 图 face 是另一份
+        // 账本 → 传别家的块 id = 打到别的块上 → `pump: DeadBlock` 实测踩过)
+        // XQA seq_lens = **整请求总 KV 长**(含块内 depth+1 个位置;u32 位型走私)
+        let xqa_seq_v = [f32::from_bits((pos + block.len()) as u32)];
+        // semaphores 每轮写零(图输入槽;KV-split 归约计数)。
+        // `.max(1)` 与声明端同式 —— "无 XQA 面"时槽仍存在(= 1 元素),
+        // 避免零长写(挂账 #7)。
+        let xqa_sem_v: Vec<f32> = vec![0.0; self.dev.pool.xqa_sem_n().max(1)];
+        // **FI 断点臂**的逐轮值(该臂未开 ⇒ 空,不写槽):
+        // ① 宿主标量槽 `ctx_total`(= 本轮 kv 总长;plan 的 key)
+        // ② 表四件套(q_cu/indices/indptr/last_len;u32 位型过线)
+        let page_fi = self.dev.pool.geom.page;
+        let ctx_total_fi = pos + block.len();
+        // 门 = **槽在场**(槽属于**图**;判"某核在场"必须看节点/槽,不看旋钮)
+        let fi_slots_on = vg.has_input("fi_q_cu");
+        let (fi_q_cu_v, fi_idx_v, fi_indptr_v, fi_ll_v): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
+            if fi_slots_on {
+                // ⚠️ **必须写本轮真值**(verify 不吃桶化):T=8 的 plan split
+                // chunk 数必须与核运行期 `ceil_div(kv_len, chunk)` 一致,否则
+                // partial 行 stride 与 `merge_indptr` 打架(同参 A/B:桶 2048
+                // ⇒ 空文本/`!!!`、42.9 t/s;真值 ⇒ 连贯 71 t/s)。
+                let nb_used = ctx_total_fi
+                    .div_ceil(page_fi)
+                    .min(bt_chain.len())
+                    .max(1);
+                let mut idx = vec![0f32; self.dev.pool.geom.nb];
+                for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
+                    idx[i] = f32::from_bits(*b);
+                }
+                (
+                    vec![0.0, f32::from_bits(block.len() as u32)],
+                    idx,
+                    vec![0.0, f32::from_bits(nb_used as u32)],
+                    vec![f32::from_bits((ctx_total_fi - (nb_used - 1) * page_fi) as u32)],
+                )
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            };
+        let gdn_slot_v1 = [gdn_slot as f32];
+        let mut ins: Vec<(&str, &[f32])> = vec![
+            ("ids", ids_f.as_slice()),
+            ("pos", pos_f.as_slice()),
+            ("kv_slots", slots_f.as_slice()),
+            ("kv_lens", lens_f.as_slice()),
+            ("gdn_slot", gdn_slot_v1.as_slice()),
+            ("bt8", bt8_f.as_slice()),
+            ("xqa_seq", xqa_seq_v.as_slice()),
+            ("xqa_sem", xqa_sem_v.as_slice()),
+            // XQA 页表:会话真链(槽在 verify 图无条件声明;
+            // 不写 = 留着恒等链 = 读到别家 KV —— §7.6)
+            ("xqa_pt", xqa_pt_v),
+        ];
+        if !fi_q_cu_v.is_empty() {
+            ins.push(("fi_q_cu", fi_q_cu_v.as_slice()));
+            ins.push(("fi_indices", fi_idx_v.as_slice()));
+            ins.push(("fi_indptr", fi_indptr_v.as_slice()));
+            ins.push(("fi_last_len", fi_ll_v.as_slice()));
+        }
+        // **FI plan 表同步(W4)**:单图档(`fi_plan_bake`)的 verify 图里 FI 核
+        // 不带自携表 ⇒ 每轮必须由图外刷**当轮精确表**(t=depth+1,ctx=本轮总长)。
+        // 与 decode 同律:表必须与运行期 chunk 数一一对应(T=8 过供给会错)。
+        // 门 = **档位在场** + 槽在场（W5：verify 恒随 `fi_plan_bake`；槽只证
+        // "本图带 FI 面"，档位证"表刷新面有人消费"）。
+        // ★ **双 rank 镜像**(P2.1-c,2026-10-19):verify 图含 AR(T=depth+1 行的
+        // RowParallel)⇒ 两 rank 必须同跑(否则 AR 失步;`dumb` 档实测同样挂 ⇒
+        // 与草稿无关,卡点就在这一句)。单卡档 = 原路(零分支)。
+        // FI 表两 rank 各自的图都要刷 ⇒ 规格传进 `verify_dev`。
+        let fi_spec = if self.boot.cfg.knobs.fi_plan_bake.is_some() && fi_slots_on {
+            let d = self.dev.pool.geom.dims;
+            Some(owl_iface::contract::FiPlanSpec {
+                t: block.len(),
+                ctx_total: ctx_total_fi,
+                hq: d.hq,
+                hkv: d.hkv,
+                hd: d.hd,
+                page: self.dev.pool.geom.page,
+            })
+        } else {
+            None
+        };
+        let t_step_v = std::time::Instant::now();
+        owl_shared::log_debug!("spec-round", "verify 镜像:ins={} peer={} fi={}", ins.len(), self.peer.is_some(), fi_spec.is_some());
+        // P1.1 词表切:切档 ⇒ 两 rank 各出**半表行**、rank0 host 拼接成全表
+        // （实效判据：本 rank logits 宽 < 全量；tied 档装载期已响亮拒）
+        let head_split = self.head_split_active();
+        let half_vocab = self.dev.boot.model.logits_vocab();
+        let (tok_f, row_logits) = {
+            let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+            match peer {
+                None => dev.verify_dev(&ins, fi_spec, sampler_on).await?,
+                Some(p) => {
+                    // 两半都校验(纪律:`join2` 等另一半到底,吞错 = 挂住)
+                    // 切档 ⇒ 两 rank 都要 logits 半表(rank0 拼接用);未切档
+                    // = 原路(peer 不读 ⇒ 省那份 D2H 与 host 内存)。
+                    let (r0, r1) = crate::exec::join2(
+                        dev.verify_dev(&ins, fi_spec, sampler_on || head_split),
+                        p.verify_dev(&ins, fi_spec, head_split),
+                    )
+                    .await;
+                    let (_, lg1) = r1?;
+                    let (tok0, lg0) = r0?;
+                    if head_split {
+                        let (a, b) = match (lg0, lg1) {
+                            (Some(a), Some(b)) => (a, b),
+                            _ => {
+                                return Err(ModelError::EngineInvariant {
+                                    what: "词表切 verify:半表行缺席(装配/读面不一致)"
+                                        .into(),
+                                })
+                            }
+                        };
+                        (tok0, Some(crate::running::concat_head_rows(&a, &b, half_vocab)?))
+                    } else {
+                        (tok0, lg0)
+                    }
+                }
+            }
+        };
+        owl_shared::log_debug!("spec-round", "verify 完成:tok={}", tok_f.len());
+        let t_read_v = std::time::Instant::now();
+        let t_tok = std::time::Instant::now();
+        // 后续（块句柄 / 探针）继续用主 rank 的图
+        let vg = self
+            .dev
+            .graphs
+            .verify
+            .as_mut()
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: "verify 图缺席(档位与装配不一致)".into(),
+            })?;
+        let t_lg = std::time::Instant::now();
+        // E5 性能:verify 分相(step=上传+launch;read=同步+回读;
+        // pure=同步后裸 replay+read = 图独占 GPU 时间)
+        if self.boot.probes.step_profile {
+            let t_v1 = std::time::Instant::now();
+            vg.replay().await?;
+            let _ = vg.read_output_f32("tok").await?;
+            owl_shared::log_info!("verify-prof", "step={:?} read={:?} pure={:?}",
+                t_read_v - t_step_v,
+                t_v1 - t_read_v,
+                t_v1.elapsed()
+            );
+        }
+        mrec("spec.verify.step", t_read_v - t_step_v);
+        // 2026-10-15:把 `verify.read` 拆开 —— 首轮归因发现它比「设备时间 + 采样」
+        // 多出 ~19 ms/轮(且与采样档无关:greedy A/B 只差 0.75 ms),必须定位。
+        mrec("spec.verify.tokread", t_tok.elapsed());
+        mrec("spec.verify.lgread", t_lg.elapsed());
+        mrec("spec.verify.read", t_read_v.elapsed());
+        // P1.1:切档的设备 token 只是**半表局部** argmax ⇒ 从拼接后的全表行
+        // 重算全局 argmax(贪心接受判据的唯一依据);未切档 = 原值。
+        let ids: Vec<u32> = if head_split {
+            let lg = row_logits.as_ref().ok_or_else(|| ModelError::EngineInvariant {
+                what: "词表切 verify:全表行 logits 缺席(greedy 判据无据)".into(),
+            })?;
+            let v = self.dev.boot.model.vocab_size();
+            if lg.len() < block.len() * v {
+                return Err(ModelError::EngineInvariant {
+                    what: format!(
+                        "词表切 verify:行 logits 尺寸不符 {} < {}×{}",
+                        lg.len(),
+                        block.len(),
+                        v
+                    ),
+                });
+            }
+            (0..block.len())
+                .map(|r| {
+                    lg[r * v..(r + 1) * v]
+                        .iter()
+                        .enumerate()
+                        .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+                            if x > a.1 {
+                                (i, x)
+                            } else {
+                                a
+                            }
+                        })
+                        .0 as u32
+                })
+                .collect()
+        } else {
+            tok_f.iter().map(|&v| v as u32).collect()
+        };
+        let hidden = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
+        let n_rec = self.dev.pool.gdn_count() * 8;
+        let records: Vec<Bytes> = (0..n_rec)
+            .map(|i| {
+                vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {
+                    what: format!("fold 记录槽 r{i} 缺席(图装配与声明不一致)"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        verify_elapsed = ts.elapsed();
+        (ids, hidden, records, false, row_logits) // 图输出槽:持久,不 free
+    } else {
+        let ts = std::time::Instant::now();
+        let (ids, hidden, row_logits) =
+            self.verify_forward(&block, pos, gdn_slot, sampler_on, vlm_delta).await?;
+        verify_elapsed = ts.elapsed();
+        (ids, hidden, Vec::new(), true, row_logits)
+        };
+        Ok((ids, hidden, records, hidden_owned, row_logits, verify_elapsed))
+    }
+
+    async fn ensure_spec_snap(&mut self, gdn_slot: usize) -> Result<std::time::Duration> {
+        if self.tspec()?.spec_snap_valid {
+            return Ok(std::time::Duration::ZERO);
+        }
+        let ts = std::time::Instant::now();
+        {
+            let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+            match peer {
+                None => {
+                    let face = dev.graphs.session.face_mut();
+                    dev.pool.capture_spec_snap(face, gdn_slot).await?
+                }
+                Some(p) => {
+                    let (r0, r1) = crate::exec::join2(
+                        dev.pool.capture_spec_snap(dev.graphs.session.face_mut(), gdn_slot),
+                        p.pool.capture_spec_snap(p.graphs.session.face_mut(), gdn_slot),
+                    )
+                    .await;
+                    r1?;
+                    r0?
+                }
+            }
+        }
+        self.tspec()?.spec_snap_valid = true;
+        Ok(ts.elapsed())
+    }
+
+    /// **② 取本轮草稿**(S6d):轮末 propose 的产物优先;首轮走 eager propose;
+    /// Dumb 档 = anchor 重复。返回 (草稿, propose 耗时)。
+    async fn acquire_drafts(
+        &mut self,
+        token: u32,
+        pos: usize,
+        depth: usize,
+    ) -> Result<(Vec<u32>, std::time::Duration)> {
+        let mut spent = std::time::Duration::ZERO;
+        let drafts: Vec<u32> = if let Some(mut d) = self.tspec()?.spec_drafts_host.take() {
+            // depth 联动截断(2026-10-09 depth=3 案):⑦ propose 恒产 7
+            // 草稿,depth<7 时下轮 block=1+7 行装不进 T=depth+1 捕获图
+            // (ids 8≠4 装填拒,pump 退役)。与轮首直调分支的
+            // d.truncate(depth) 同款,收口在消费点单处。
+            d.truncate(depth);
+            d
+        } else if let Some(crate::spec_runtime::Drafter::DFlash2(_)) =
+            self.dev.spec_rt.drafter.as_ref()
+        {
+            let ts = std::time::Instant::now();
+            let mut d = self.dflash_propose(token, pos).await?;
+            d.truncate(depth); // depth ≤ 7(草稿恒 7 产;T 图定形 depth+1)
+            spent = ts.elapsed();
+            d
+        } else if self.dev.spec_rt.drafter.is_some() {
+            let ts = std::time::Instant::now();
+            self.propose_first(token, pos).await?;
+            spent = ts.elapsed();
+            self.tspec()?.spec_drafts_host.take().ok_or_else(|| {
+                ModelError::EngineInvariant {
+                    what: "propose_first 未产出草稿(上游相位漂移)".into(),
+                }
+            })?
+        } else {
+            vec![token; depth] // Dumb:哑草稿 = anchor 重复
+        };
+        Ok((drafts, spent))
     }
 
     pub(crate) async fn write_bt(&mut self, sid: u64) -> Result<()> {
