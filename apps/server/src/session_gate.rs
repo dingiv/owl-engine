@@ -59,7 +59,9 @@ impl SessionGates {
         m.lock_owned().await
     }
 
-    /// 当前在册会话数（诊断/门用；`/debug/agent` 之类可读）。
+    /// 当前在册会话数(单测断言"死项被清掉";生产观测面走
+    /// `telemetry::QueueSnapshot`,故仅测试档编译)
+    #[cfg(test)]
     pub fn tracked(&self) -> usize {
         match self.inner.lock() {
             Ok(g) => g.len(),

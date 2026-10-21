@@ -530,6 +530,18 @@ impl GpuServer {
                     // 零 env):写完 registry 之前设,保证任何 plan/activate
                     // 都读到本 boot 的档位。
                     owl_kernels::server::flashinfer::set_plan_restore(self.diag.fi_plan_restore);
+                    // **服务端面诊断旋钮**(2026-10-21;原 OWL_GDN_* / FI_DEBUG /
+                    // OWL_L3_AUDIT env 已退场):同一 boot 点从 DiagOpts 显式下发。
+                    owl_kernels::server::configure_diag(&owl_kernels::server::DiagTune {
+                        fi_debug: self.diag.fi_debug,
+                        l3_audit: self.diag.l3_audit,
+                        gdn: owl_kernels::server::gdn_chunked::GdnDiag {
+                            on: self.diag.gdn_diag,
+                            touch: self.diag.gdn_touch.clone(),
+                            zero_scratch: self.diag.gdn_zero_scratch.clone(),
+                            fresh_scratch: self.diag.gdn_fresh_scratch,
+                        },
+                    });
                     let r = owl_kernels::registry::OpRegistry::boot_with(
                         &mut res,
                         &mut exec,

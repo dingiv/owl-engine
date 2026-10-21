@@ -386,7 +386,6 @@ impl Command {
             Self::BlockLedgerDump { ack } => ack.created_at(),
             Self::MemPoolStats { ack } => ack.created_at(),
             Self::MemPoolTrim { ack } => ack.created_at(),
-            Self::MemPoolTrim { ack } => ack.created_at(),
             Self::UploadAndLaunch { ack, .. } => ack.created_at(),
             Self::LaunchAndHarvest { ack, .. } => ack.created_at(),
             Self::MemsetZero { ack, .. } => ack.created_at(),

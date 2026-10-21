@@ -36,7 +36,7 @@ print("[prefill-account] prompt = 6000 词(≈8k tok),max_tokens = 1")
 PY
 
 nsys profile --trace=cuda --sample=none --cpuctxsw=none --force-overwrite=true \
-  -o "$OUT/nsys" ./target/release/server -p "profiles/legacy/$FLAVOR.toml" "$CFG" --log-level warn \
+  -o "$OUT/nsys" ./target/release/server -p "profiles/$FLAVOR.toml" "$CFG" --log-level warn \
   > "$OUT/srv.log" 2>&1 &
 NSYS=$!
 ok=0

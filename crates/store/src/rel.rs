@@ -1423,7 +1423,7 @@ mod tests {
             r.release_table(&mut table).expect("归还");
         }
         let a = r.leg.tail_hash(&ta, 1).expect("A 身份");
-        let b = r.leg.tail_hash(&tb, 1).expect("B 身份");
+        let _b = r.leg.tail_hash(&tb, 1).expect("B 身份");
         // A 入宿主(宿主满);B 留设备(轮一沉不动它 —— 宿主没位)
         r.leg
             .put_host(a, crate::host::HostBlock::from_bytes(vec![7u8; BLOCK_BYTES]))

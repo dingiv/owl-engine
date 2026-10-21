@@ -30,8 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
-use owl_engine::{Engine, EngineConfig, EngineKnobs, RunningEngine, TpEngine};
-use owl_iface::contract::ModelError;
+use owl_engine::{Engine, EngineConfig, EngineKnobs, TpEngine};
 use owl_models::module::QuantPlan;
 
 const PROMPT: &str = "The capital of France is";

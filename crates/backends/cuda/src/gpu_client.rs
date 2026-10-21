@@ -365,8 +365,10 @@ impl DeviceClient for GpuClient {
         owl_kernels::server::flashinfer::set_plan_restore(self_carry);
         // C++ 适配器的图档瓦只认 `getenv("FI_CUDA_GRAPH")`(上游 ABI 不动)
         // ⇒ 与 `apps/server/main.rs` 同一写点、同一口径;此处是**通用入口**
-        // (测试/直连后端也走它,不再各设 env)。
+        // (测试/直连后端也走它,不再各设 env)。本侧 Rust 读面同步落值
+        // (2026-10-21:两份口径同一写点,不可能漂移)。
         std::env::set_var("FI_CUDA_GRAPH", if cuda_graph { "1" } else { "0" });
+        owl_kernels::server::flashinfer::set_plan_mode(cuda_graph);
         Ok(())
     }
 

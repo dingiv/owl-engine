@@ -340,8 +340,7 @@ impl KvStore {
     ///
     /// 返回 `(链尾, 整链块数, 最老锚的 last_use)`,按最老在前。
     pub fn host_chain_candidates(&self, protect: &[ChainHash]) -> Vec<(ChainHash, usize, u64)> {
-        use std::collections::BTreeMap;
-        // **锚必须是叶**(链尾):以任意宿主块为锚会退化成"根前缀"(span=1),
+            // **锚必须是叶**(链尾):以任意宿主块为锚会退化成"根前缀"(span=1),
         // 真机定谳:那样只把根块搬盘 ⇒ 重启只能重建 1-2 块前缀。
         // 条件:叶在宿主 **且** 从根到叶的整条链都在宿主(否则盘上只有半链)。
         let mut out: Vec<(ChainHash, usize, u64)> = Vec::new();

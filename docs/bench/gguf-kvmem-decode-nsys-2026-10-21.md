@@ -1,5 +1,7 @@
 # GGUF × KVMem 单卡 3090 Ti decode 定谳（NSYS + metrics，2026-10-21）
 
+> ⚠️ **2026-10-21 存证说明**:本卷引用的 `profiles/legacy/*` 已随「配置档全字段显式」裁决删除;数字与命令保持原样(当时现场),复跑请用 `profiles/` 下同名生产档。
+
 > 工作树：`packages/owl-worktrees/perf-review`，基线 `main@23116c7`（rebase 后）。
 > 模型：`Qwen3.8-27B-Q4_K_M.gguf`（18.96 GB，Q4_K 193 / Q8_0 288 / Q6_K 17 / F32 353）。
 > 卡：单张 RTX 3090 Ti（42:00.0；基线 NSYS 在 41:00.0，同型号）。

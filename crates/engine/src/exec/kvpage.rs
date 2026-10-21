@@ -61,22 +61,6 @@ impl KvPageFormat {
         page * hkv * hd * self.elem_bytes()
     }
 
-    /// 一个元素字节 → f32。
-    ///
-    /// `Fp8E4M3` 走 `owl_models::kernel::e4m3_decode`(单源);
-    /// `F16` 走 `half`(与池写核的 `__half` 同宽同序)。
-    #[inline]
-    pub(crate) fn elem_at(self, bytes: &[u8], off: usize) -> f32 {
-        match self {
-            Self::F16 => {
-                let b0 = bytes[off * 2];
-                let b1 = bytes[off * 2 + 1];
-                half::f16::from_le_bytes([b0, b1]).to_f32()
-            }
-            Self::Fp8E4M3 => owl_models::kernel::e4m3_decode(bytes[off]),
-        }
-    }
-
     /// 把一整页的某个 `(token, head)` 行解成 f32(长度 = `hd`)。
     ///
     /// 页内序 = `[token][head][dim]`(kNHD 的 `off_in_page` 段)——

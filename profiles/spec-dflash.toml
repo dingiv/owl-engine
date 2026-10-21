@@ -2,7 +2,7 @@
 #
 # 纪律:档内**只列最优且非缺省**的选项 —— 引擎缺省即最优的一律不复述。
 # 站点/部署面(model.dir/dflash2_dir、bind、几何)由配套配置文件给,
-# 启动 = `server -p profiles/legacy/spec-dflash.toml <site.toml>`。
+# 启动 = `server -p profiles/spec-dflash.toml <site.toml>`。
 # 详尽 why 在各设计卷;此处每键一行来源。
 
 # --- 以下为**完整档**（2026-10-21）：所有字段显式声明，缺一个就拒启。
@@ -58,6 +58,8 @@ disk_dir = ""
 vram_target = 0.99
 vram_reserve_mb = 512
 prefix_cache = true
+block_pool_bytes = 0
+no_reclaim = false
 
 [kvmem]
 select_decode = false
@@ -115,6 +117,11 @@ gdn_scalar = false
 gdn_fused_decode = true
 gdn_fused_decode_v2 = true
 kv_fp8 = true
+gguf_tile = true
+gguf_cublas = true
+gguf_mmq2 = true
+gguf_mmq = true
+gguf_smem = true
 resolve_trace = false
 host_argmax = false
 ts_probe = false
@@ -140,6 +147,17 @@ raw_completion = false
 prompt_dump = false
 gdn_dbg = false
 pf_fence = false
+live_diag = false
+recon_dbg = false
+vram_dbg = false
+idx_dbg = false
+cov_dump = false
+store_hook_dbg = false
+pf_taps = false
+fi_debug = false
+l3_audit = false
+gdn_diag = false
+gdn_fresh_scratch = false
 step_gate = "off"
 step_gate_ms = 0
 step_gate_us = 0

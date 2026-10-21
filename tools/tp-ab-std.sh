@@ -91,7 +91,7 @@ run_arm() {
     esac
   done
   sleep 3
-  setsid nohup ./target/release/server -p "profiles/legacy/$flavor.toml" "$cfg" --log-level warn \
+  setsid nohup ./target/release/server -p "profiles/$flavor.toml" "$cfg" --log-level warn \
     >> "$log" 2>&1 < /dev/null &
   local srv=$!
   local ok=0

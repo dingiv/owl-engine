@@ -31,7 +31,8 @@ struct RecLedger {
     /// (默认开会把 `free` 全部截进池,别的门就看不到"真归还")
     pool: Vec<(usize, u64)>,
     pool_on: bool,
-    /// 桩池的 rank(验 P0-1:非本 rank 不命中)
+    /// 桩池的 rank(口径说明;P0-1 的"非本 rank 不命中"由池命中断言覆盖)
+    #[allow(dead_code)]
     pool_rank: u8,
 }
 

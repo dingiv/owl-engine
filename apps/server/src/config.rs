@@ -350,8 +350,15 @@ impl ServerConfig {
         if let Some(p) = args.site.as_deref() {
             layers.push(p);
         }
+        // `--print-config` 是迁移工具:它要把半份旧档补成全量档 ⇒ 放行缺键;
+        // 其余路径(`--check` / boot / 测试)一律缺键拒启。
+        let completeness = if args.print_config {
+            owl_shared::config::Completeness::Tolerate
+        } else {
+            owl_shared::config::Completeness::Enforce
+        };
         let mut resolved =
-            OwlConfig::load_resolved(base, &layers, &args.overrides())?;
+            OwlConfig::load_resolved(base, &layers, &args.overrides(), completeness)?;
         if let Some(m) = resolved.meta.as_mut() {
             m.intent.profile = base.map(|p| p.display().to_string());
         }

@@ -97,12 +97,6 @@ pub struct BatchStatsSnapshot {
     pub queue_len: usize,
     /// 当前活跃 turn 数(**多活跃**:合批档 >1)
     pub active: usize,
-    /// **排队快照**（最多 16 条，按等待降序）：`(turn, session, waited_ms)`
-    pub queued: Vec<(u64, u64, u64)>,
-    /// **拒绝分桶**（会话, 码, 次数；按次数降序）
-    pub rejects: Vec<(u64, String, u64)>,
-    /// 排队时长直方图
-    pub wait_hist: [u64; 5],
 }
 
 /// 合批事实(与 `/debug/vram` 同刻取;见 [`VramSnapshot::batch`])
@@ -449,9 +443,6 @@ async fn handle_req<D: DeviceClient>(
                 has_batch_graph: running.has_batch_graph(),
                 queue_len: running.queue_len(),
                 active: running.active_len(),
-                queued: running.queued_snapshot(16),
-                rejects: running.reject_snapshot(16),
-                wait_hist: running.wait_hist(),
             };
             if reply.send(snap).is_err() {
                 owl_shared::log_debug!("actor", "batch stats 应答投递失败(请求方已断开)");

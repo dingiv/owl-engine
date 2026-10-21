@@ -73,25 +73,54 @@ fn cast_exec(
     )
 }
 
-/// 诊断门(2026-10-14 A13 立案;缺省关)。
+/// **服务端面诊断旋钮**(进程级;后端 boot 期一次下发 —— 零 env 读取)。
 ///
-/// ⚠️ **回读纪律(本轮两次踩中)**:本仪表用 `DeviceRes::download`
+/// ⚠️ **回读纪律(历史上两次踩中)**:本仪表用 `DeviceRes::download`
 /// (= `cuMemcpyDtoH`,**NULL 流**语义)—— 与 compute 流**无跨流序**,
 /// 不加 `res.stream()?.synchronize()` 会读到**旧值/全零**;即便加了
 /// sync,个别 run 仍观察到 stale(疑 host 跑在 GPU 前面)⇒ 判读时
 /// **同一量读两次比对**,不一致即弃用该次读数。
 ///
-/// 背景:chunked 臂(六核)在**同臂同 T、数据不同**时呈「末行 logits 塔平」
+/// 背景:chunked 臂(六核)曾在**同臂同 T、数据不同**时呈「末行 logits 塔平」
 /// 式的塔陷(same prompt:T=512 塔陷 / T=64 正确),而 varlen 臂恒健康。
-/// 本仪表只回答三个是非题(不猜):
+/// 下列仪表只回答三个是非题(不猜;2026-10-14 A13 立案,已结):
 ///   1. `g_cum` 是**chunk 局部**(每 chunk 从头累计,锯齿)还是**全局**累计?
 ///   2. `g_cum` 的**域**是 nats 还是 log2(host 双口径重算对拍)?
 ///   3. 跨 chunk 状态(h0→ht)有没有被 `exp(g_cum_last)` **清零**?
-static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+///
+/// 全部缺省 = 全关(生产语义);名单串语义与原 env 一致:
+/// `touch` / `zero_scratch` 为空串 = 关,`"1"` / `"all"` = 全部区,
+/// 否则逗号分隔区名。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GdnDiag {
+    /// 逐 call 打印前 N 次(原 `OWL_GDN_DIAG`)
+    pub on: bool,
+    /// 内容不变 dtoh+htod 往返(原 `OWL_GDN_TOUCH=<区名>`)
+    pub touch: String,
+    /// 每 call 前清零私有 scratch(原 `OWL_GDN_ZERO_SCRATCH`)
+    pub zero_scratch: String,
+    /// 每 call 新分配 scratch(原 `OWL_GDN_FRESH_SCRATCH`)
+    pub fresh_scratch: bool,
+}
+
+/// 诊断档快照(进程内单槽;boot 后冻结 —— 重入不覆盖)
+static DIAG: std::sync::OnceLock<GdnDiag> = std::sync::OnceLock::new();
+
+/// 唯一的诊断旋钮写入点(重入只警告不覆盖 —— boot 后冻结)
+pub fn configure_diag(d: GdnDiag) {
+    if DIAG.set(d.clone()).is_err() {
+        if DIAG.get() != Some(&d) {
+            eprintln!("[gdn] 诊断旋钮已冻结,忽略二次下发(首次 ≠ 本次)");
+        }
+    }
+}
+
+fn diag() -> &'static GdnDiag {
+    DIAG.get_or_init(GdnDiag::default)
+}
+
 fn diag_on() -> bool {
-    // 零依赖律:kernels crate 不得依赖 owl_shared ⇒ 就地读(与 driver.rs
-    // 的 OWL_RESOLVE_TRACE 同一先例;诊断面一次性 OnceLock,非热路径)
-    *DIAG.get_or_init(|| std::env::var_os("OWL_GDN_DIAG").is_some_and(|v| v != "0"))
+    diag().on
 }
 
 /// bf16 字节 → f32(零依赖律:本 crate 不带 half;bf16 = f32 高 16 位)
@@ -100,21 +129,25 @@ fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
     f32::from_bits((u16::from_le_bytes([lo, hi]) as u32) << 16)
 }
 
-/// 诊断:`OWL_GDN_ZERO_SCRATCH=1` ⇒ 每次调用前把全部私有 scratch 清零。
+/// 诊断:全 scratch 清零开关(`gdn_zero_scratch`;空串 = 关)。
 /// 动机:boot warmup 用**未初始化输入**跑过本 handler(实测 raw g=-200/T=512)
 /// ⇒ 未写区可能残留 inf/NaN;真实调用若读到该区即被毒(且任何布局扰动都会
 /// 改掉重叠关系 = "布局运气"）。
 fn zero_scratch_on() -> bool {
-    static Z: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *Z.get_or_init(|| std::env::var_os("OWL_GDN_ZERO_SCRATCH").is_some_and(|v| v != "0"))
+    !diag().zero_scratch.is_empty()
 }
 
-/// 诊断:`OWL_GDN_TOUCH=<区名>`(见调用点注)。**OnceLock 预判门**(2026-10-17 审查):
-/// 原写法每次 handler 调用都现场 `std::env::var`(未开档也读);与同文件
-/// `zero_scratch_on` 同款 —— 先判门,名单串只在门内读。
+/// 诊断:`gdn_touch` 区名单(见调用点注)。名单串只在门内读。
 fn touch_on() -> bool {
-    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *T.get_or_init(|| std::env::var_os("OWL_GDN_TOUCH").is_some())
+    !diag().touch.is_empty()
+}
+
+fn touch_spec() -> &'static str {
+    &diag().touch
+}
+
+fn zero_scratch_spec() -> &'static str {
+    &diag().zero_scratch
 }
 
 fn f32s(b: &[u8]) -> Vec<f32> {
@@ -150,11 +183,9 @@ fn ensure_one(
     bytes: usize,
     tag: &'static str,
 ) -> Result<u64, OpError> {
-    // 诊断(2026-10-14 A13):`OWL_GDN_FRESH_SCRATCH=1` ⇒ 每 call 新分配
+    // 诊断(2026-10-14 A13;`[probes] gdn_fresh_scratch`):⇒ 每 call 新分配
     // (alloc_zeros ⇒ 必零),用来判「复用 scratch 里有没有被读到 stale 区」
-    static FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let fresh = *FRESH
-        .get_or_init(|| std::env::var_os("OWL_GDN_FRESH_SCRATCH").is_some_and(|v| v != "0"));
+    let fresh = diag().fresh_scratch;
     if fresh {
         if let Some(old) = cur.take() {
             grave.push(old);
@@ -333,12 +364,12 @@ impl KernelFamily for GdnChunkedRuntime {
         let o_b16 =
             ensure_one(&mut st.o_b16, &mut st.grave, res, t * hv * vd * 2, "gdn.o_b16")?;
 
-        // ── 诊断:`OWL_GDN_TOUCH=<区名>` = **内容不变**的 dtoh+htod 往返搬运
+        // ── 诊断:`gdn_touch=<区名>` = **内容不变**的 dtoh+htod 往返搬运
         // (只为把 host 挡住 ⇒ 分离「stale 内容」与「host-ahead 时序」两假设:
         //  搬运后仍病 = 内容;搬运后变健康 = 时序窗口)──
         if touch_on() {
-            // 名单在门内读(诊断档才付费;与 zero_scratch_on 同款:先判门再读串)
-            let spec = std::env::var("OWL_GDN_TOUCH").unwrap_or_default();
+            // 名单在门内读(诊断档才付费)
+            let spec = touch_spec();
             let all = spec == "1" || spec == "all";
             let want = |n: &str| all || spec.split(',').any(|x| x.trim() == n);
             let bufs: [(u64, usize); 15] = [
@@ -374,9 +405,9 @@ impl KernelFamily for GdnChunkedRuntime {
 
         // ── 诊断:全 scratch 清零(见 zero_scratch_on 注)──
         if zero_scratch_on() {
-            // 区域过滤:OWL_GDN_ZERO_SCRATCH=1|all = 全清;或逗号名单
+            // 区域过滤:`gdn_zero_scratch=1|all` = 全清;或逗号名单
             // (h_buf/a/ai/w/u/v_new/o/g_cum/state/in*)= 只清该区(分区定位用)
-            let spec = std::env::var("OWL_GDN_ZERO_SCRATCH").unwrap_or_default();
+            let spec = zero_scratch_spec();
             let all = spec == "1" || spec == "all" || spec.is_empty();
             let want = |n: &str| all || spec.split(',').any(|x| x.trim() == n);
             let bufs: [(u64, usize); 15] = [

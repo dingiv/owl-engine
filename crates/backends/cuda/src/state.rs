@@ -67,6 +67,15 @@ pub struct DiagOpts {
     /// 由 `model.kind/quant/head_quant`、`dispatch.kv_fp8`、`spec`、`vision`、
     /// `runtime.tp_ordinals` 自动推导;`*`/Default = 全放行(诊断/测试)。
     pub tag_filter: owl_kernels::tag_filter::TagFilter,
+    /// **FlashInfer 诊断打印**(`[probes] fi_debug`;原 `FI_DEBUG` env)
+    pub fi_debug: bool,
+    /// **L3 事实面审计**(`[probes] l3_audit`;原 `OWL_L3_AUDIT` env)
+    pub l3_audit: bool,
+    /// **GDN chunked 诊断旋钮**(`[probes] gdn_*`;原 `OWL_GDN_*` env)
+    pub gdn_diag: bool,
+    pub gdn_touch: String,
+    pub gdn_zero_scratch: String,
+    pub gdn_fresh_scratch: bool,
 }
 
 impl DiagOpts {
@@ -90,14 +99,19 @@ impl DiagOpts {
             launch_time: c.launch_time,
             // 硬预算:与池治理同一预留(1GiB);逻辑上限走显式配置(暂 None)
             vram_reserve_mb: cfg.pool.vram_reserve_mb.max(1),
-            vram_budget_mb: owl_shared::env_reader::parse::<u64>("OWL_VRAM_BUDGET_MB"),
-            d2h_prof: c.d2h_prof,
+            vram_budget_mb: cfg.pool.vram_budget_mb,            d2h_prof: c.d2h_prof,
             gpu_prof: c.gpu_prof,
             graph_flags: c.graph_flags.to_bits(),
             capture_slab_mb: c.capture_slab_mb,
             trace_ring: c.trace_ring,
             fi_plan_restore: cfg.dispatch.fi_plan_restore,
             tag_filter: tag_filter_from_config(cfg),
+            fi_debug: cfg.probes.fi_debug,
+            l3_audit: cfg.probes.l3_audit,
+            gdn_diag: cfg.probes.gdn_diag,
+            gdn_touch: cfg.probes.gdn_touch.clone().unwrap_or_default(),
+            gdn_zero_scratch: cfg.probes.gdn_zero_scratch.clone().unwrap_or_default(),
+            gdn_fresh_scratch: cfg.probes.gdn_fresh_scratch,
         }
     }
 }
@@ -1303,12 +1317,6 @@ impl GpuCtx {
     /// 为什么由本项目负责:池属性 `RELEASE_THRESHOLD=UINT64_MAX`(性能面,
     /// 见上方池调优注释)⇒ free 后**永不自动还 OS**,装载期那批暂存块
     /// (27B 档 156MB)会一直占着,把跑图期余量吃掉。装载收尾调一次即可。
-    /// 默认池账(used/used_high/reserved/reserved_high;见 `DeviceClient::mem_pool_stats`)。
-    pub(super) fn mem_pool_stats(&self) -> Result<(u64, u64, u64, u64), ModelError> {
-        pool_ledger_snapshot()
-            .ok_or_else(|| ModelError::Msg("mem_pool_stats: 池账不可读".into()))
-    }
-
     pub(super) fn mem_pool_trim(&mut self) -> Result<u64, ModelError> {
         use cudarc::driver::sys as cs;
         // 池句柄 = 设备默认池(server 的 cudaMallocAsync 都走它)

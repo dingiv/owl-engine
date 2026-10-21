@@ -213,7 +213,7 @@ vision）本机启动：
 
 ## 7. 下一步（未做）
 
-1. 清理 `profiles/legacy/*` 的历史白名单注释（键已删，注释仍提到旧机制）。
+1. ~~清理 `profiles/legacy/*` 的历史白名单注释~~ ✅ 2026-10-21:legacy 目录整体删除（配置档全字段显式裁决），此项自动消失。
 2. 输出 `--print-tags` / boot 摘要的 tag 命中表，供运维审计。
 3. 若需要“一个语义多候选实现按 tag 打分”，再把 `KernelTagIndex` 的候选集
    接进 picker；当前 picker 是 op_id 单候选 + 准入校验。

@@ -70,6 +70,7 @@ impl TestRes {
         }
     }
     /// 块内**指定字节偏移**写入(表类块只初始化要读的行)
+    #[allow(dead_code)] // bench 复用样板:部分 runner 不走上传口
     fn up_at(&mut self, id: u64, off: usize, src: &[u8]) {
         let stream = self.stream.clone();
         let mut tmp = unsafe { stream.alloc::<u8>(src.len()) }.expect("tmp alloc");

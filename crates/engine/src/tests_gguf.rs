@@ -160,7 +160,6 @@ async fn smoke_scenario(key: &str, n_layers: usize, n_gdn: usize, want_first: &s
     // 装载 + 图捕获 + decode 是三条不同的分配路径(权重槽/图 slab/scratch),
     // 只有全走一遍才谈得上"全量记名"。
     if let Some(f) = running.face_clone() {
-        use owl_iface::contract::DeviceClient as _;
         let rep = f.client().ledger_report(8).await.expect("ledger_report");
         assert!(
             !rep.contains("(未命名!)"),

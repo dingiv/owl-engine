@@ -48,7 +48,7 @@ type Result<T> = std::result::Result<T, ModelError>;
 
 /// boot 旋钮(显式依赖律,2026-10-10:环境变量是隐式依赖,引擎内部
 /// **零 env 读取** —— env 派生数据由入口(server config)/ 测试用例经
-/// 本结构显式传入;[`EngineKnobs::from_env`] 是唯一的入口侧构造器,
+/// 本结构显式传入;[`EngineKnobs::from_config`] 是唯一的入口侧构造器,
 /// [`Default`] = 生产基线)。
 #[derive(Clone, Debug)]
 pub struct EngineKnobs {
@@ -266,7 +266,7 @@ pub struct EngineKnobs {
     pub pf_fin_check: bool,
     /// 设备诊断/调优选项(srv_timing/cap_prof/launch_sync/free_legacy/
     /// graph_flags/capture_slab_mb;原散点 OWL_* 直读 →
-    /// owl_cuda::DiagOpts 一体携带,入口经 DiagOpts::from_env 填充)
+    /// owl_cuda::DiagOpts 一体携带,入口经 DiagOpts::from_config 填充)
     pub cuda: owl_cuda::DiagOpts,
     /// 解释器执行环境(硬件档/KV 策略/量化/分派旋钮;Default = 生产基线)
     pub env: owl_models::env::EnvProvider,
@@ -654,7 +654,7 @@ impl EngineKnobs {
             pf_stages: cfg.probes.pf_stages,
             pf_fin_check: cfg.probes.pf_fin_check,
             cuda: owl_cuda::DiagOpts::from_config(cfg),
-            env: owl_models::env::EnvProvider::from_dispatch(&cfg.dispatch),
+            env: owl_models::env::EnvProvider::from_config(cfg),
         }
     }
 }

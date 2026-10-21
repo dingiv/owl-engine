@@ -143,10 +143,11 @@ async fn main() {
         }
     };
 
-    // **FI plan 档位投递**(配置 → 核):C++ 适配器与 kernels 的 FI server 都用
-    // `getenv("FI_CUDA_GRAPH")` 判档(上游 ABI 不动),而档位必须来自配置面
-    // ⇒ 入口 boot 期**唯一写者**。读侧唯一 = `kernels/src/server/flashinfer.rs`
-    // 的 `fi_cuda_graph()`(同键、同口径);此处零第二套判据。
+    // **FI plan 档位投递**(配置 → 核):C++ 适配器只认
+    // `getenv("FI_CUDA_GRAPH")`(上游 ABI 不动),而档位必须来自配置面
+    // ⇒ 入口 boot 期**唯一 env 写者**。Rust 读面自 2026-10-21 起**不读 env**
+    // —— 由后端 `GpuClient::configure_fi_plan`(引擎装配期)同一点落
+    // `set_plan_mode`,两份口径不可能漂移。
     // 必须在任何图捕获/plan 之前(boot 期一次)。
     std::env::set_var(
         "FI_CUDA_GRAPH",

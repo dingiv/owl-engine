@@ -356,7 +356,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     overcommit = get_bool(&out, "kvmem.pool_overcommit").unwrap_or(overcommit);
 
     // ── ⑥ context 求解(显式 max_seq/pool_tokens 优先) ──
-    let mut estimate = None;
+    let estimate;
     let (act, act_note) = memory::activation_for(
         get_usize(&out, "runtime.prefill_chunk").unwrap_or(512),
         get_usize(&out, "runtime.prefill_tail_merge").unwrap_or(0),
@@ -653,24 +653,37 @@ mod tests {
         (v, origins)
     }
 
-    fn load_profile(name: &str) -> (Value, Origins) {
-        let raw = std::fs::read_to_string(crate::profiles::profile_path(name).expect("profile"))
-            .expect("读 profile");
-        resolve_str(&raw)
-    }
+    /// 27B/3090 意图档(旧 `profiles/awq27b-3090-max.toml` 的 `[intent]` 块;
+    /// 2026-10-21 档已转全量显式,意图面留在本测试里做**派生器对照锚**)。
+    const INTENT_AWQ_3090_MAX: &str = r#"
+[intent]
+model       = "qwen3.8-27b-awq"
+hardware    = "3090ti-24g"
+goal        = "max-context"
+context     = "max"
+concurrency = 1
+spec        = "off"
+kv          = "fp8"
+kvmem       = "off"
+graphs      = "auto"
+reuse       = "off"
 
-    /// **P0 验收**:新 profile 的派生结果 = 手写 `profiles/legacy/awq27b-3090-max.toml`
-    /// 的逐键值（`allowed_ops` 已退役；准入由 tag filter 派生）。
+# 测速/恒等门口径(与仓库档一致;高级覆盖:意图档也允许写任意低层键)
+[sampling]
+mode = "greedy"
+"#;
+
+    /// **P0 验收**:意图派生结果 = 仓库全量档 `profiles/awq27b-3090-max.toml`
+    /// 的逐键值(准入由 tag filter 派生)。
     #[test]
     fn profile_matches_handwritten_flavor() {
-        let (p, _po) = load_profile("awq27b-3090-max");
-        let flavor = std::fs::read_to_string(
-            crate::profiles::legacy_path("awq27b-3090-max").expect("flavor"),
+        let (p, _po) = resolve_str(INTENT_AWQ_3090_MAX);
+        let c: crate::config::OwlConfig = p.try_into().expect("intent 反序列化");
+        let f = crate::config::OwlConfig::load(
+            Some(&crate::profiles::profile_path("awq27b-3090-max").expect("profile")),
+            None,
         )
-        .expect("读 flavor");
-        let f: crate::config::OwlConfig = toml::from_str(&flavor).expect("flavor 解析");
-        let c: crate::config::OwlConfig =
-            p.clone().try_into().expect("profile 反序列化");
+        .expect("全量档装载");
         // 模型面
         assert_eq!(c.model.kind, f.model.kind);
         assert_eq!(c.model.quant, f.model.quant);
@@ -711,9 +724,7 @@ mod tests {
     /// `--check` 的估算必须与手写档 boot 现场对齐(128k / 池 4G / fixed 0.90G)
     #[test]
     fn profile_estimate_matches_boot_ledger() {
-        let raw = std::fs::read_to_string(crate::profiles::profile_path("awq27b-3090-max").expect("profile"))
-            .expect("读");
-        let mut v: Value = toml::from_str(&raw).expect("toml");
+        let mut v: Value = toml::from_str(INTENT_AWQ_3090_MAX).expect("toml");
         let mut origins = Origins::new();
         let meta = super::apply(&mut v, &mut origins).expect("resolve").expect("intent");
         let e = meta.estimate.expect("estimate");

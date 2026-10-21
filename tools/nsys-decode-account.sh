@@ -29,7 +29,7 @@ sleep 2
 
 nsys profile --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none \
   --force-overwrite=true -o "$OUT/nsys" \
-  ./target/release/server -p "profiles/legacy/$FLAVOR.toml" "$CFG" --log-level warn \
+  ./target/release/server -p "profiles/$FLAVOR.toml" "$CFG" --log-level warn \
   > "$OUT/srv.log" 2>&1 &
 NSYS=$!
 

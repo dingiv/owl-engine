@@ -415,7 +415,7 @@ impl Module for Model {
     /// 整模单树(C5):embed → 层链 → final norm → tied lm_head
     fn forward(&self, ids: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         self.embed
-            .lm_head_matmul(&self.last_hidden(ids, ctx))
+            .lm_head_matmul(&self.last_hidden(ids, ctx), &ctx.env.gguf)
             .tag("logits")
     }
 }
@@ -445,7 +445,7 @@ impl Model {
         let last = crate::layers::narrow_strided(
             &hidden, 1, d, (t - 1) * d, d, vec![1, d],
         );
-        self.embed.lm_head_matmul(&last).tag("logits_last")
+        self.embed.lm_head_matmul(&last, &ctx.env.gguf).tag("logits_last")
     }
 }
 

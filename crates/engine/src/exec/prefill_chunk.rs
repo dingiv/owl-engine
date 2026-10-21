@@ -30,12 +30,16 @@ pub(crate) struct ChunkInputs {
     pub lens_leaf: TensorOps,
     pub gdn_slot: TensorOps,
     pub seq_cu: TensorOps,
-    pub bt_leaf: TensorOps,
 }
 
 impl ChunkInputs {
     /// 从池的层视图 + 本 chunk 的 host 表构造(纯 host 叶子;无设备往返)。
-    pub(crate) fn build(pool: &crate::state::StatePool, tb: &ChunkTables, t: usize, bt_leaf: TensorOps) -> Self {
+    pub(crate) fn build(
+        pool: &crate::state::StatePool,
+        tb: &ChunkTables,
+        t: usize,
+        bt_leaf: TensorOps,
+    ) -> Self {
         let slots_leaf = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.slots));
         let lens_leaf = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.lens));
         let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[tb.gdn_slot]));
@@ -70,7 +74,6 @@ impl ChunkInputs {
             lens_leaf,
             gdn_slot,
             seq_cu: TensorOps::from_host(Dtype::F32, vec![2], &f32b(&tb.seq_cu)),
-            bt_leaf,
         }
     }
 }
@@ -458,7 +461,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let face = self.graphs.session.face_mut();
             let nt = t.div_ceil(owl_models::kernel::GDN_BT).max(1);
             self.pool
-                .write_gdn_tables(face, t, nt, crate::state::GdnTableStream::Default)
+                .write_gdn_tables(face, t, nt)
                 .await?
         };
         let gdn_tables = gdn_tbl.as_ref().map(|g| owl_models::module::GdnTableSlot {
@@ -777,7 +780,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let blks = {
                 let env = self.env();
                 let face = self.graphs.session.face_mut();
-                let logits = self.boot.model.embed.lm_head_matmul(&hb_view);
+                let logits = self.boot.model.embed.lm_head_matmul(&hb_view, &env.gguf);
                 // 崩坏排查:末行 logits top-2(id+值)——近局翻转判别
                 if host.probes.dflash_probe {
                     let bs_seq = host.boot_seq;

@@ -6,8 +6,7 @@
 
 /// cuBLAS GEMM runtime(feature=cublas,随底座)
 #[cfg(feature = "cublas")]
-pub mod cublas;
-#[cfg(feature = "xqa")]
+pub mod cublas;#[cfg(feature = "xqa")]
 pub mod xqa;
 /// FlashInfer prefill runtime(feature=flashinfer,随底座)
 #[cfg(feature = "flashinfer")]
@@ -49,4 +48,27 @@ pub fn family_factories() -> Vec<FamilyFactory> {
         #[cfg(feature = "xqa")]
         xqa::XqaPrefillRuntime::assemble,
     ]
+}
+
+/// **服务端面诊断旋钮**(进程级快照;后端 boot 期一次下发 —— 本 crate 零 env)。
+///
+/// 2026-10-21 收编:原 `OWL_GDN_DIAG/TOUCH/ZERO_SCRATCH/FRESH_SCRATCH`、
+/// `FI_DEBUG`、`OWL_L3_AUDIT` 六类 env 全部退场 —— 唯一写点 = 后端
+/// (`owl_cuda::GpuServer::with_diag_sink`)经本结构显式下发。
+#[derive(Clone, Debug, Default)]
+pub struct DiagTune {
+    /// FlashInfer plan 期打印(原 `FI_DEBUG` / `OWL_FI_DEBUG`)
+    pub fi_debug: bool,
+    /// L3 事实面审计(原 `OWL_L3_AUDIT`)
+    pub l3_audit: bool,
+    /// GDN chunked 仪表(原 `OWL_GDN_*` 四键)
+    pub gdn: gdn_chunked::GdnDiag,
+}
+
+/// 唯一诊断写入点(boot 期一次;重入不覆盖 —— 诊断档本就该在启动时定谳)
+pub fn configure_diag(t: &DiagTune) {
+    crate::spec::set_l3_audit(t.l3_audit);
+    #[cfg(feature = "flashinfer")]
+    flashinfer::set_debug(t.fi_debug);
+    gdn_chunked::configure_diag(t.gdn.clone());
 }

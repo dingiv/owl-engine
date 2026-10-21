@@ -529,9 +529,6 @@ mod tests {
             has_batch_graph: true,
             queue_len: 0,
             active: 0,
-            queued: Vec::new(),
-            rejects: Vec::new(),
-            wait_hist: [0; 5],
         }
     }
 

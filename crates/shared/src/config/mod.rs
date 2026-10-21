@@ -495,6 +495,17 @@ pub struct PoolCfg {
     pub vram_target: f64,
     pub vram_reserve_mb: u64,
     pub prefix_cache: bool,
+    /// **解释器块池预算**(字节;0 = 关 = 逐节点 alloc/free 存量路径)。
+    /// 原 `OWL_BLOCK_POOL` env;P1″ 块竞技场(见 `interpreters::eval`)。
+    pub block_pool_bytes: usize,
+    /// **关掉解释器活性中途回收**(诊断/对照臂;缺省 false = 开回收)。
+    /// 原 `OWL_NO_RECLAIM` env。⚠️ 开会无界常驻(长请求 OOM),只作取证。
+    pub no_reclaim: bool,
+    /// **驱动账逻辑上限 MiB**(`None` = 只按驱动账判;原 `OWL_VRAM_BUDGET_MB`)。
+    /// 适合"这台卡只准 owl 用 N GB"的部署口径;与 `vram_target`(占比)
+    /// 是两个不同量:本键是硬上限,超出即主动拒发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram_budget_mb: Option<u64>,
 }
 
 /// **驱逐策略**(`[kvmem].evict_policy`;TOML 字符串)
@@ -841,6 +852,25 @@ pub struct DispatchCfg {
     pub gdn_fused_decode_v2: bool,
     /// KV 池 fp8(→ KvQuant::Fp8E4M3)
     pub kv_fp8: bool,
+    // ---- GGUF 预填臂(2026-10-21 收编;原 `OWL_GGUF_*` env)----
+    //
+    // 五个布尔 = **同一族**的臂开关:每次 `gguf_quant_gemm` 按 `m` 与臂集
+    // 顺序挑第一条满足门的臂。缺省全开 = 生产行为;关掉某臂 = 回退下一臂
+    // (A/B 与「怀疑某臂」时的一键回退)。
+    /// 复用臂(tile;`m ≥ 8`)
+    pub gguf_tile: bool,
+    /// dequant + cuBLAS 臂(`m ≥ 64`)
+    pub gguf_cublas: bool,
+    /// int8-MMA MMQ 臂(head 版;`m ≥ 64`)
+    pub gguf_mmq2: bool,
+    /// 官方 MMQ 臂(`m ≥ 32`)
+    pub gguf_mmq: bool,
+    /// smem 复用臂(`m ≥ 64`)
+    pub gguf_smem: bool,
+    /// cuBLAS 臂**行窗行数**(`None` = 96 MiB 预算档)。原
+    /// `OWL_GGUF_CUBLAS_TILE`;诊断/调参用,`0` 或 `None` = 预算档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gguf_cublas_tile: Option<usize>,
     pub resolve_trace: bool,
     pub host_argmax: bool,
     pub ts_probe: bool,
@@ -925,8 +955,11 @@ fn default_true() -> bool {
     true
 }
 
-/// 诊断探针族(全域布尔;boot 一次解析,热路径零 env)
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// 诊断探针族(boot 一次解析,热路径零 env)
+///
+/// ⚠️ 非 `Copy`(2026-10-21):`gdn_touch`/`gdn_zero_scratch` 是名单串,
+/// 收编 env 后必须持有 `String`。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProbesCfg {
     pub step_profile: bool,
@@ -960,6 +993,45 @@ pub struct ProbesCfg {
     /// 原 OWL_PF_FENCE)
     #[serde(default)]
     pub pf_fence: bool,
+    // ---- 2026-10-21 env 收编:下列键原为入口 `env_reader` 直读 ----
+    /// 解释器活性收尾归因打印(原 `OWL_LIVE_DIAG`;`models::eval` 消费)
+    #[serde(default)]
+    pub live_diag: bool,
+    /// B 轴调和 / 显存 / 索引 / 覆盖 / 落盘 / 桶 tap 的排障打印
+    /// (原 `OWL_RECON_DBG` / `OWL_VRAM_DBG` / `OWL_IDX_DBG` / `OWL_COV_DUMP` /
+    /// `OWL_STORE_HOOK_DEBUG` / `OWL_PF_TAPS`;引擎 `StepProbes` 消费)
+    #[serde(default)]
+    pub recon_dbg: bool,
+    #[serde(default)]
+    pub vram_dbg: bool,
+    #[serde(default)]
+    pub idx_dbg: bool,
+    #[serde(default)]
+    pub cov_dump: bool,
+    #[serde(default)]
+    pub store_hook_dbg: bool,
+    #[serde(default)]
+    pub pf_taps: bool,
+    /// **FlashInfer 诊断打印**(原 `FI_DEBUG` / `OWL_FI_DEBUG`):plan 重算时的
+    /// 本轮 ctx_total。C++ 侧仍读 env ⇒ 后端同一写点同步写
+    #[serde(default)]
+    pub fi_debug: bool,
+    /// **L3 事实面审计**(原 `OWL_L3_AUDIT`;声明 rank=0 的槽实际阶数登记)
+    #[serde(default)]
+    pub l3_audit: bool,
+    /// **GDN chunked 诊断**(原 `OWL_GDN_DIAG`;逐 call 打印前 48 次)
+    #[serde(default)]
+    pub gdn_diag: bool,
+    /// GDN 内容不变 dtoh+htod 往返区名单(原 `OWL_GDN_TOUCH`;
+    /// `None`/空 = 关,`"all"` = 全区,否则逗号名单)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gdn_touch: Option<String>,
+    /// GDN 每 call 前清零私有 scratch 区名单(原 `OWL_GDN_ZERO_SCRATCH`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gdn_zero_scratch: Option<String>,
+    /// GDN 每 call 新分配 scratch(原 `OWL_GDN_FRESH_SCRATCH`)
+    #[serde(default)]
+    pub gdn_fresh_scratch: bool,
     /// **单步/粘滞调试门**(2026-10-14;见 `crate::stepgate` 模块头):
     /// 解释器检查点的运行期档位。⚠️ 需以 `--features stepgate` 构建才生效;
     /// 未编入时入口会**可见地告警**(不静默失效)。
@@ -1207,6 +1279,9 @@ impl Default for PoolCfg {
             vram_target: 0.97,
             vram_reserve_mb: 1024,
             prefix_cache: true,
+            block_pool_bytes: 0,
+            no_reclaim: false,
+            vram_budget_mb: None,
         }
     }
 }
@@ -1276,6 +1351,13 @@ impl Default for DispatchCfg {
             gdn_fused_decode: true,
             gdn_fused_decode_v2: true,
             kv_fp8: false,
+            // GGUF 预填臂:缺省全开(生产行为;关掉 = 回退下一臂)
+            gguf_tile: true,
+            gguf_cublas: true,
+            gguf_mmq2: true,
+            gguf_mmq: true,
+            gguf_smem: true,
+            gguf_cublas_tile: None,
             tag_wildcard: false,
             resolve_trace: false,
             host_argmax: false,
@@ -1633,6 +1715,19 @@ fn derive_auto_pool(v: &mut toml::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// **配置档完整度策略**(2026-10-21)。
+///
+/// 背景:生产/预检要求「档必须全字段显式」(缺一拒启,启动点可复现);
+/// 而 `--print-config` 是**迁移工具** —— 它的用途正是把旧半份档补成全量档,
+/// 故必须放行半份输入(否则工具与其建议互相锁死)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Completeness {
+    /// 缺任何键 = 拒启(生产 / `--check` / 测试)
+    Enforce,
+    /// 允许半份档,输出含全部缺省(`--print-config` 专用)
+    Tolerate,
+}
+
 impl OwlConfig {
 
     /// **统一 loader**(Default → 基准文件 → 覆盖文件;CLI 由入口决定前两者的
@@ -1650,7 +1745,7 @@ impl OwlConfig {
     /// 每层都支援 `extends`(显式路径 → 该层的父层);名字查找已移除。
     /// 用途:`OWL_TEST_CONF → 用例 overlay` 这条测试链(见 `testkit::case`)。
     pub fn load_chain(base: Option<&Path>, layers: &[&Path]) -> Result<Self, String> {
-        Self::load_resolved(base, layers, &[]).map(|r| r.config)
+        Self::load_resolved(base, layers, &[], Completeness::Enforce).map(|r| r.config)
     }
 
     /// **带来源/意图解析的加载入口**(boot / `--check` / `--print-config` 同一函数)
@@ -1662,6 +1757,7 @@ impl OwlConfig {
         base: Option<&Path>,
         layers: &[&Path],
         cli: &[(String, toml::Value)],
+        completeness: Completeness,
     ) -> Result<ResolvedConfig, String> {
         let mut v = toml::Value::Table(toml::map::Map::new());
         let mut origins = Origins::new();
@@ -1675,7 +1771,9 @@ impl OwlConfig {
             let mut file_v = toml::Value::Table(toml::map::Map::new());
             let mut file_origins = Origins::new();
             load_config_into(b, &mut file_v, 0, &mut Vec::new(), &mut file_origins)?;
-            check_explicit_complete(&file_v, b)?;
+            if completeness == Completeness::Enforce {
+                check_explicit_complete(&file_v, b)?;
+            }
             load_config_into(b, &mut v, 0, &mut Vec::new(), &mut origins)?;
             layer_names.push(b.display().to_string());
         }
@@ -2089,7 +2187,7 @@ mod extends_tests {
         write(&site, "[runtime]\nmax_seq = 12345\n[pool]\nsnap_max = 2\n");
         let child = d.join("child.toml");
         write(&child, "extends = \"site.toml\"\n\n[spec]\ndepth = 5\n");
-        let base = crate::profiles::legacy_path("spec-dflash").expect("历史档");
+        let base = crate::profiles::profile_path("spec-dflash").expect("预设档");
         let c = OwlConfig::load(Some(&base), Some(&child)).expect("load");
         assert_eq!(c.spec.depth, 5, "子档覆盖基准/父档");
         assert_eq!(c.runtime.max_seq, 12345, "父档提供、基准未写者生效");
@@ -2161,7 +2259,7 @@ mod extends_tests {
     #[test]
     fn extends_绝对路径基准() {
         let d = tmp_dir("extends_abs");
-        let base = crate::profiles::legacy_path("spec-dflash").expect("历史档");
+        let base = crate::profiles::profile_path("spec-dflash").expect("预设档");
         let conf = d.join("test-conf.toml");
         write(
             &conf,
@@ -2203,7 +2301,7 @@ mod config_overlay_tests {
         file_loader::create_dir_all(&dir).expect("mkdir");
         let over = dir.join("over.toml");
         file_loader::write(&over, "[spec]\ndepth = 5\n").expect("w");
-        let base = crate::profiles::legacy_path("spec-dflash").expect("预设档");
+        let base = crate::profiles::profile_path("spec-dflash").expect("预设档");
         let c = OwlConfig::load(Some(&base), Some(&over)).expect("load");
         assert_eq!(c.spec.depth, 5, "覆盖文件优先");
         assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");

@@ -233,7 +233,7 @@ impl Embedding {
     /// nt 直读原始 [vocab, D] 布局(matmul_nt;零转置;untied 用独立槽)。
     /// C1:untied 量化臂经 Linear::forward_inner(marlin GEMV/GEMM;
     /// f16 臂 = 原语义 matmul_nt,零行为变更)
-    pub fn lm_head_matmul(&self, hidden: &TensorOps) -> TensorOps {
+    pub fn lm_head_matmul(&self, hidden: &TensorOps, arms: &crate::env::GgufEnv) -> TensorOps {
         // ⚠️ **分支键 = `lm_head.is_none()`(tied 事实),不是 `gguf_ty`**
         // (2026-10-19 27B 实测定谳):`gguf_ty` 说的是"**表**是不是量化块",
         // 而 tied/untied 说的是"**头**用不用这张表" —— 两件事正交。
@@ -262,11 +262,11 @@ impl Embedding {
         }
         match &self.lm_head {
             // untied:独立头(marlin / GGUF 量化 / f16 三臂都在 `Linear` 里)
-            Some(lin) => lin.forward_inner(hidden),
+            Some(lin) => lin.forward_inner(hidden, arms),
             // tied:**表兼头** —— 表是量化块(GGUF 档)时走同一套两发路径
             // (设计 §11.5 ②;与 `Linear` 的 GGUF 臂**同一实现**)
             None => match self.gguf_ty {
-                Some(ty) => gguf_quant_gemm(&self.w, ty, hidden, self.vocab, self.d_dim, None),
+                Some(ty) => gguf_quant_gemm(&self.w, ty, hidden, self.vocab, self.d_dim, None, arms),
                 None => hidden.matmul_nt(&self.w.decl()),
             },
         }
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(out.shape(), &[2, 4]);
 
         let hidden = TensorOps::from_host(Dtype::F32, vec![1, 4], &f32b(&[0.1; 4]));
-        let logits = harvest(&mut face, &emb.lm_head_matmul(&hidden)).await;
+        let logits = harvest(&mut face, &emb.lm_head_matmul(&hidden, &crate::env::GgufEnv::default())).await;
         assert_eq!(logits.len(), 16);
     }
 
@@ -358,7 +358,7 @@ mod tests {
                 // embed = Kernel 节点(CPU face 不执行);lm_head = 语义 matmul 可跑
                 let x_t = TensorOps::from_host(Dtype::F32, vec![1, d], &f32b(&x));
                 let y = want_y.clone(); // CPU 臂无 embed 执行,占位由 GPU 臂覆盖
-                let logits = harvest(&mut face, &emb.lm_head_matmul(&x_t)).await;
+                let logits = harvest(&mut face, &emb.lm_head_matmul(&x_t, &crate::env::GgufEnv::default())).await;
                 ("cpu", y, logits)
             } else {
                 let mut gpu = crate::testkit::gpu_client().await;
@@ -371,7 +371,7 @@ mod tests {
                 let ids_t = TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&ids));
                 let x_t = TensorOps::from_host(Dtype::F32, vec![1, d], &f32b(&x));
                 let y = harvest(&mut gpu, &emb.embed(&ids_t, tokens)).await;
-                let logits = harvest(&mut gpu, &emb.lm_head_matmul(&x_t)).await;
+                let logits = harvest(&mut gpu, &emb.lm_head_matmul(&x_t, &crate::env::GgufEnv::default())).await;
                 gpu.close().await.expect("server 关机");
                 ("gpu", y, logits)
             };
