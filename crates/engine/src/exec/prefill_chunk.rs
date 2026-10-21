@@ -16,6 +16,65 @@ use owl_iface::contract::ModelError;
 // (值逐字节相同 ⇒ 零行为变化,纯命令数下降)。
 //
 // ⚠️ 上游的图路(prefill-graph S0/S1)未取;本结构只服务 eager 路 + XQA 表件。
+/// **本 chunk 的设备输入束**(S6i):KV/GDN 逐层缓冲 + 五张逐行叶子 + 块表。
+///
+/// 为什么成对象:这些叶子全是**池缓冲的视图**(地址由 `StatePool` 拥有)——
+/// 执行函数只该拿"一手交齐"的束去建 `ForwardCtx`,不该逐行摊开 9 个 `let`
+/// 与两段 `map`(旧形 40 行,一改池几何就要在 5 处同步)。
+pub(crate) struct ChunkInputs {
+    pub kvs_step: Vec<KvBuffers>,
+    pub gdns_step: Vec<GdnBuffers>,
+    pub ids_t: TensorOps,
+    pub pos_t: TensorOps,
+    pub slots_leaf: TensorOps,
+    pub lens_leaf: TensorOps,
+    pub gdn_slot: TensorOps,
+    pub seq_cu: TensorOps,
+    pub bt_leaf: TensorOps,
+}
+
+impl ChunkInputs {
+    /// 从池的层视图 + 本 chunk 的 host 表构造(纯 host 叶子;无设备往返)。
+    pub(crate) fn build(pool: &crate::state::StatePool, tb: &ChunkTables, t: usize, bt_leaf: TensorOps) -> Self {
+        let slots_leaf = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.slots));
+        let lens_leaf = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.lens));
+        let gdn_slot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[tb.gdn_slot]));
+        let kvs_step = pool
+            .kv_caches()
+            .iter()
+            .map(|(k, v)| KvBuffers {
+                k_cache: k.clone(),
+                v_cache: v.clone(),
+                slots: slots_leaf.clone(),
+                kv_lens: lens_leaf.clone(),
+                block_tables: bt_leaf.clone(),
+            })
+            .collect();
+        let gdns_step = pool
+            .gdn_caches()
+            .iter()
+            .map(|g| GdnBuffers {
+                conv_q: g.conv_q.clone(),
+                conv_k: g.conv_k.clone(),
+                conv_v: g.conv_v.clone(),
+                rec: g.rec.clone(),
+                slots: gdn_slot.clone(),
+            })
+            .collect();
+        Self {
+            kvs_step,
+            gdns_step,
+            ids_t: TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.ids)),
+            pos_t: TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.pos)),
+            slots_leaf,
+            lens_leaf,
+            gdn_slot,
+            seq_cu: TensorOps::from_host(Dtype::F32, vec![2], &f32b(&tb.seq_cu)),
+            bt_leaf,
+        }
+    }
+}
+
 pub(crate) struct ChunkTables {
     pub ids: Vec<f32>,
     pub pos: Vec<f32>,
@@ -708,34 +767,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             }
             None => self.pool.bt_leaf_flat(),
         };
-        let slots_leaf = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.slots));
-        let lens_leaf = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.lens));
-        let gdn_slot_leaf = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[tb.gdn_slot]));
-        let kv_caches = self.pool.kv_caches();
-        let kvs_step: Vec<KvBuffers> = kv_caches
-            .iter()
-            .map(|(k, v)| KvBuffers {
-                k_cache: k.clone(),
-                v_cache: v.clone(),
-                slots: slots_leaf.clone(),
-                kv_lens: lens_leaf.clone(),
-                block_tables: bt_leaf.clone(),
-            })
-            .collect();
-        let gdn_caches = self.pool.gdn_caches();
-        let gdns_step: Vec<GdnBuffers> = gdn_caches
-            .iter()
-            .map(|g| GdnBuffers {
-                conv_q: g.conv_q.clone(),
-                conv_k: g.conv_k.clone(),
-                conv_v: g.conv_v.clone(),
-                rec: g.rec.clone(),
-                slots: gdn_slot_leaf.clone(),
-            })
-            .collect();
-        let ids_t = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.ids));
-        let pos_t = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&tb.pos));
-        let gdn_slot = gdn_slot_leaf.clone();
+        // **本 chunk 的设备输入束**(S6i):叶子全是池缓冲的视图(地址归池),
+        // 由 `ChunkInputs::build` 一次备齐 —— 执行函数不再逐行摊 9 个 let。
+        let ci = ChunkInputs::build(&self.pool, &tb, t, bt_leaf);
         // FlashInfer 表四件套(i32 设备;OWL_FLASHINFER=1 时非空,E1.5):
         // q_cu=[0,T] / indices=块链 / indptr=[0,nb] / last_len=末页有效数。
         // ⚠️ 预物化(eval 往返同步)而非 from_host 叶子:Htod 在 H2D 流、
@@ -767,7 +801,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // 8 字节 H2D / chunk**)—— 每次 8B 上传的**往返延迟 ~3.5ms**(issue 侧仅
         // 16µs)⇒ ~170ms/chunk 白烧。注入面本就存在(verify 图先例 E5-M4:
         // `ctx.seq_cu`),eager prefill 只是没接。
-        let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&tb.seq_cu));
+        let seq_cu = ci.seq_cu.clone();
         // ── B 轴选择层:Q 槽接入 ──
         // 只在**块边界 chunk**采(`(base+t) % page == 0`):分析期索引账才完整
         // (§8.4)。
@@ -807,7 +841,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             self.graphs.session.face_mut().sync().await?;
         }
         let mut ctx = ForwardCtx::model_prefill(
-            t, &pos_t, &kvs_step, &self.boot.rope, &gdns_step, &slots_leaf, &lens_leaf, &gdn_slot,
+            t, &ci.pos_t, &ci.kvs_step, &self.boot.rope, &ci.gdns_step, &ci.slots_leaf, &ci.lens_leaf, &ci.gdn_slot,
             // A13(2026-10-14):chunked/scalar 臂的 rec 态寻址吃这个 host 标量
             // —— 必须喂本会话真槽(曾恒 0 = 读写别人格 → 长 prompt 塌陷)
             Some(gdn_slot_v),
@@ -903,7 +937,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             ctx.gdn_tap = Some(std::rc::Rc::new(std::cell::RefCell::new(Vec::new())));
             let (fin, nodes) =
                 self.boot.model
-                    .prefill_bisect(&ids_t, &ctx, pf_stage_layer);
+                    .prefill_bisect(&ci.ids_t, &ctx, pf_stage_layer);
             let mut roots: Vec<TensorOps> = Vec::new();
             let mut names: Vec<String> = Vec::new();
             for (name, n) in &nodes {
@@ -1051,7 +1085,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.spec_rt.dflash_tap_count > 0 {
-                let (h, tp) = self.boot.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
+                let (h, tp) = self.boot.model.tapped_hidden(&ci.ids_t, &ctx, &[5, 19, 33, 47, 61]);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for t in &tp {
                     c = c.arg(t);
@@ -1070,7 +1104,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     .with_shape(d.dtype, vec![n * t, dd]);
                 (root, Some(tp))
             } else {
-                (self.boot.model.last_hidden(&ids_t, &ctx), None)
+                (self.boot.model.last_hidden(&ci.ids_t, &ctx), None)
             };
             let d_model = hidden_full.shape()[1];
             let ld = live_diag_begin();
@@ -1248,7 +1282,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.spec_rt.dflash_tap_count > 0 {
-                let (h, tp) = self.boot.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
+                let (h, tp) = self.boot.model.tapped_hidden(&ci.ids_t, &ctx, &[5, 19, 33, 47, 61]);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for tt in &tp {
                     c = c.arg(tt);
@@ -1267,7 +1301,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     .with_shape(d.dtype, vec![n * t, dd]);
                 (root, Some((tp, dd)))
             } else {
-                (self.boot.model.last_hidden(&ids_t, &ctx), None)
+                (self.boot.model.last_hidden(&ci.ids_t, &ctx), None)
             };
             let ld = live_diag_begin();
             let r_eval = self.eval_root_and_q(&tree, cov_sink.as_ref()).await;
