@@ -163,16 +163,18 @@ DFlash2 草稿 = 标准 `build_attn` + **非因果 mask**(`src/models/dflash.cpp
    `store: 不变量违反:块 ChainHash(…) 已在宿主层` ⇒ turn 弃置、空响应(既有 bug,未修,与本线无关)。
 2. **测量口径**:`llm_speedtest --temperature 0 --top-p 1 --presence-penalty 0 --frequency-penalty 0`
    (缺省 0.7 会走 host 采样器,decode 掉 30%)。
-3. **引擎自己的探针会双回放**:`probes.step_profile=true` 时 `[spec-prof]` 的
+3. **臂只看 `[dispatch] verify_arm/decode_arm`**(2026-10-21 单键化):boot 自证行
+   `verify=FI(单图;臂=fi)` 把「请求臂」与「节点事实」并排打;两者不一致时先看这一行。
+4. **引擎自己的探针会双回放**:`probes.step_profile=true` 时 `[spec-prof]` 的
    `verify`/`propose` **翻倍**;真实值看 `[verify-prof] pure` / `[dflash-prof] pure_gpu`。
-4. **nsys** 必须 `--cuda-graph-trace=node`;CorrId 分组对 graph 不稳(多数组只有 1 核),
+5. **nsys** 必须 `--cuda-graph-trace=node`;CorrId 分组对 graph 不稳(多数组只有 1 核),
    只有 **propose 组**(median 384 核)可靠 —— V1 要按"锚核 + 时序窗口"重新切。
-5. **`pkill -f` 会匹配自己的命令行**(把 shell 杀掉):用 `echo $! > /tmp/owl.pid` + `kill $(cat …)`。
-6. GPU 钉卡用 **UUID**;3080 两张被 ComfyUI 占用,别动。
-7. 内核改动流程:`cu/*.cu` 加 wrapper → `family/gguf.rs` 入口名 + 能力表 →
+6. **`pkill -f` 会匹配自己的命令行**(把 shell 杀掉):用 `echo $! > /tmp/owl.pid` + `kill $(cat …)`。
+7. GPU 钉卡用 **UUID**;3080 两张被 ComfyUI 占用,别动。
+8. 内核改动流程:`cu/*.cu` 加 wrapper → `family/gguf.rs` 入口名 + 能力表 →
    `ops/gguf.rs` 声明 + `pub static … meta_of::<T>()` → `driver.rs` 的分派臂;
    漏一处 = 构建期 `ops::source(…) 无该算子的准入声明` 或 `算子总表漏项`。
-8. 本工作树**不主动 push**;提交到 `feat/gguf`。
+9. 本工作树**不主动 push**;提交到 `feat/gguf`。
 
 ---
 
@@ -200,6 +202,10 @@ DFlash2 草稿 = 标准 `build_attn` + **非因果 mask**(`src/models/dflash.cpp
   实测截获:开 `verify_fi` 而忘关 `verify_v2` 时 boot 打印
   `verify 面事实: FI 节点登记=true | 臂事实(attn.arm.verify.*):v2=32`
   —— **看臂事实、别看节点登记**(这条路子以后所有 A/B 都照此核对)。
+- ✅ **该坑已结构性消除**(同日 `3bff4ed`):三/两个布尔收成**单值枚举**
+  `[dispatch] verify_arm = "v2"|"fi"|"xqa"|"prefill"` / `decode_arm = "prefill"|"fi"|"xqa"`;
+  图面槽位与层内核选择共用同一个 `uses_fi()`,旧布尔键 `deny_unknown_fields` 拒启。
+  现在"开了 FI 却跑 v2"**无法表示**。
 - 真开 FI 后(`verify=fi=32`),verify 图 GPU(`[verify-prof] pure`):
 
 | ctx | v2(旧 MMQ2) | FI(旧 MMQ2) | 结论 |
