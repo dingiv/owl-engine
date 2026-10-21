@@ -276,51 +276,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // = state@F+m —— [anchor, d1..dm] 的贡献在 verify 中已推进、被
         // restore 回滚,必须重放补回(已接受行 KV 覆写幂等 —— 同快照同
         // 输入确定性同值)。m=0 也要重放 anchor 一行。
-        // ⑤ extend + propose(同迭代消费 verify hidden;产出下轮草稿
-        // host 账)。图态 = 桶 m 一发;eager fallback = propose_round。
-        // (先于 fold:fold 图发射后的设备排队会与 eager alloc/launch
-        // 交织放大 —— M5 实测 eager propose 52.8ms ← 8.5ms,换序复原)
+        // ⑤ (已合并) 原此处先对 MTP 跑一次 propose，⑦ fed 提交后又跑一次
+        // —— 两个分支输入/输出完全相同，MTP 每轮白付一倍 propose 税
+        // （2026-10-21 定谳：8k ctx 时 propose 40.6ms/轮 = 2×19.4ms read）。
+        // 统一只在 ⑦ 跑一次；toks 仍在这里准备。
         let toks: Vec<u32> = {
             let mut t = drafts[..m].to_vec();
             t.push(bonus);
             t
         };
-        // DFlash2:propose 统一在 ⑦(fed 提交后)——此处跳过免双跑
-        let d2_arc = match self.dev.spec_rt.drafter.as_ref() {
-            Some(crate::spec_runtime::Drafter::DFlash2(_)) => None,
-            _ => Some(()),
-        };
-        if d2_arc.is_none() {
-            // skip(⑦ 统一 encode + propose)
-        } else if !self.dev.graphs.propose.is_empty() && !self.boot.probes.propose_eager {
-            let ts = std::time::Instant::now();
-            let d = self.propose_graph_step(m, &toks, pos).await?;
-            t_propose += ts.elapsed();
-            self.tspec()?.spec_drafts_host = Some(d);
-        } else if self.dev.spec_rt.drafter.is_some() {
-            let ts = std::time::Instant::now();
-            let nd = self.propose_round(&hidden, m, &toks, pos).await?;
-            t_propose += ts.elapsed();
-            // 块 → host(轮首消费;块即焚)
-            let mut buf = vec![0u8; 4 * depth];
-            {
-                let face = self.dev.graphs.session.face_mut();
-                face.dtoh(&nd, &mut buf).await?;
-                face.free(&[nd.id]).await?;
-            }
-            self.tspec()?.spec_drafts_host = Some(
-                buf.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
-                    .collect(),
-            );
-        }
         if hidden_owned {
             // eager 路的 hidden = 竞技场根块,收割后归池;图态 = 图输出槽
             // (持久复用,free = 炸图,M4 立案注记)
             let face = self.dev.graphs.session.face_mut();
             face.free(&[hidden.id]).await?;
         }
-        owl_shared::log_debug!("spec-round", "⑤ extend/propose 完成");
+        owl_shared::log_debug!("spec-round", "⑤ 草稿入参准备完成(propose 统一在⑦)");
         // ⑥ fold(尾部:图发射异步,restore 单命令;下一轮 verify 流序
         // 排其后,GPU ~1ms 藏于前端)
         //

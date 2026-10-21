@@ -268,3 +268,78 @@ lm_head 2.66ms(forward_last 单行)。round ≈ 15ms,AL=2 → ~133 t/s
 (基线 43,+210%)。**已知优化挂 M3**:greedy 域 d1 可免 propose
 (verify 行 0 argmax 免费产出,省一链步一 lm_head ≈ -3ms;采样域需
 rejection 才要真 d1,vLLM 保留是为 rejection 采样,owl greedy 专属可裁)。
+
+## 十、2026-10-21 当前主线接入（M6）
+
+M0–M5 的组件/轮结构/图族仍在树上，但配置层一直没有入口：`--check` 只要
+`spec.depth>0` 就硬要求 `model.dflash2_dir`，MTP-only 档无法预检；生产
+`kv_fp8=true` 时，MTP 链池是 F16，而 `propose`/`prefill_extend` 仍吃主 env
+（K0 选 fp8 核）⇒ 运行期 dtype 直接拒。M6 收口如下。
+
+### 10.1 配置与资产
+
+- 新增 `[spec] draft = "auto" | "mtp" | "dflash2"`（`SpecDraft`）。
+  - `auto`（缺省）：`model.dflash2_dir` 在场 → DFlash2；否则检查点
+    `mtp.*` → MTP；`dumb` → Dumb；都没有 → Off。
+  - 显式 `mtp` / `dflash2`：缺对应资产 = boot 结构化拒（不静默回退）。
+- `--check`：MTP 档读主检查点 `model.safetensors.index.json` 的 `mtp.*`
+  键数（27B AWQ = 15），不再要求 `dflash2_dir`；显式 MTP 时忽略 DFlash2
+  目录并打印提示。
+- 新增 `profiles/mtp27b-3090-16k.toml`（27B AWQ + MTP d3 / 16k）。
+
+### 10.2 环境/池一致性
+
+- MTP 头权重 = F16；`SpecRuntime::draft_env` 显式设为
+  `quant=F16 / kv.quant=None / kv.dtype=F16`，`draft_dt=F16`。
+- MTP 层复用**标准 attention**（不是 DFlash2 的 naive NC），其 F16
+  K0/paged-v2 核声明在 `kv.main.*` 命名空间，池布局仍是主池 KnHD；
+  因此草稿 `KernelSelectionEnv` 的 `main_kv` 也投影为 MTP 自己的 F16 池，
+  并同时放行 `kv.main.f16` + `kv.draft.f16`。
+- 三个消费点统一用 `spec_rt.draft_env`：`prefill_extend`（逐 chunk 物化）、
+  `propose_first`/`propose_round`（eager）、`plan_propose_family`
+  （m=0..3 图捕获）。主池 fp8 只服务 target，不再漏进 MTP 链。
+
+### 10.3 当前验收
+
+- `--check`：`spec=depth3(Mtp)`，MTP 头 15 键 ✓。
+- 真机 3090 Ti（GPU2）16k 档：boot 成功；`/health` 与 chat 200；
+  `spec.round=7 / spec.propose=16.3ms p50 / spec.verify=22.9ms p50`
+  （debug build，仅机制口径）。
+- **恒等门**（`OWL_E2E_ONLY=gpu_spec_identity_gate_27b`）：
+  - 主池 f16：93 tok 逐位一致，rounds=14 / sum_m=23 / full=4 / partial=7 / zero=3；
+  - 主池 fp8（`OWL_GATE_FP8=1`）：同 93 tok 逐位一致，同一接受账。
+- 计数：`owl-shared` SpecDraft 解析、`owl-cuda` tag filter 6/6 绿。
+
+### 10.4 release 首测与 ctx 衰减定位（`mtp27b-3090-16k`，MATH 域，256 tok）
+
+**先发现一个结构性双跑**：`execute_spec_round` 的 ⑤ 和 ⑦ 都调用了
+MTP propose，输入/输出完全相同 ⇒ 每轮白付一倍 propose。删除 ⑤ 的
+MTP 分支后（`spec.propose` 40.6 → 20.9ms @8k，read 2 次/轮 → 1 次/轮）：
+
+```text
+prompt   MTP decode    round     verify    propose   propose.read
+512      116.25        31.75     22.24     8.30      6.95
+2048     113.05        34.07     22.20     10.70     9.45
+8192      83.93        44.96     22.83     20.86     19.48   (all ms, 1 轮)
+```
+
+- no-spec 基线同域约 **50.3 t/s 全长度平坦**；MTP 512/2k 约 **2.3×/2.2×**，
+  8k 约 **1.67×**。
+- **ctx 衰减残差定位**：verify/snap/fold/emit 全部平坦；唯一随 ctx 增长的
+  是 `spec.propose.read`（6.95 → 9.45 → 19.48ms）。`propose.step`（图发射）
+  与 `btwt` 平坦 ⇒ 不是 host 装填，而是 **MTP 草稿前向对 MTP KV 全历史
+  的 attention**（extend 批行 + 链步；T=m+1 小，但 KV 长度 = ctx）。
+- 8k 仍在 1.67× 净正，但 continuation 的边际已被这条 ctx 项吃掉；下一步
+  优化 = 草稿侧窗口/压缩 KV（不能动 target verify，它已平坦）。
+- **另一笔独立税**：`prefill.extend` 每次 **321–386ms**（512 档 0.64s /
+  2k 1.12s / 8k 3.1s），是 TTFT 的大头；与 decode 衰减无关，但必须另案
+  查（理论上 MTP extend 应 <1ms/chunk）。
+- 这是 **MATH 域**；prose/std 随机域仍按 C7 分域护栏，不默认开。
+
+### 10.5 尚未做（性能/默认）
+
+- DFlash2 同档对照（生产草稿族的相对收益）；更长 ctx（32k/128k）与
+  KVMem/视觉组合回归。
+- 采样域 rejection（当前 spec 轮恒 greedy；MTP 的采样 parity 未接）。
+- MTP 默认开关仍由 C7 数据裁决，当前只在 `profiles/mtp27b-3090-16k.toml`
+  显式启用。
