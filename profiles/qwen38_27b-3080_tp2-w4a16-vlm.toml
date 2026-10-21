@@ -1,0 +1,42 @@
+# owl 预设档 `tp27b-3080-262k-vlm` —— 2×3080 27B + 视觉 + d7 / 262k 全设备池
+#
+# 全量字段继承自 `full.toml`;本文件只写差异。
+extends = ["full.toml"]
+
+[model]
+name = "qwen3.8-27b"
+path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+format = "awq"
+quant = "w4a16"
+head_quant = "rtn-int8-row"
+vision = true
+
+[parallel]
+mode = "tensor"
+device = ["3080", "3080"]
+tp_vocab_split = true
+tp_ar_fused = true
+
+[runtime]
+max_seq = 262144
+max_concurrency = 1
+
+[spec]
+depth = 7
+draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+
+[pool]
+pool_tokens = 262144
+gdn_slots = 1
+snap_max = 1
+prefix_cache = false
+vram_target = 0.99
+vram_reserve_mb = 256
+
+[kernel]
+kv_fp8 = true
+# 本档走 piecewise(表由图自携 restore 烘入),不烘单图 plan
+fi_plan_bake = false
+fi_plan_restore = true
+decode_arm = "v2"
+verify_arm = "v2"

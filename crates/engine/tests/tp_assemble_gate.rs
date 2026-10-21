@@ -109,7 +109,21 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
     eprintln!("[tp-gate] rank1 装载完成(1/2)");
 
     // ── ② 装配(分档 → staging 握手 → 每 rank boot_rank)────────────
-    let tp = TpEngine::assemble(vec![e0, e1], vec![l0, l1]).await.expect("TP 装配");
+    // 2026-10-21:`TpOpts` 零 env(收编 `runtime.tp_one_stage`)⇒ 本门**显式**
+    // 从 env 取档位(测试例外),保证 `OWL_TP_1STAGE=1` 真的装配 arena。
+    let flag = |k: &str| matches!(std::env::var(k).as_deref(), Ok("1") | Ok("true"));
+    let tp = TpEngine::assemble_with(
+        vec![e0, e1],
+        vec![l0, l1],
+        owl_engine::TpOpts {
+            push: flag("OWL_TP_PUSH"),
+            ar_f8: flag("OWL_TP_AR_F8"),
+            ar_fused: flag("OWL_TP_AR_FUSED"),
+            one_stage: flag("OWL_TP_1STAGE"),
+        },
+    )
+    .await
+    .expect("TP 装配");
 
     // ── ③ 形状单源:分片 spec == 全量的一半(CPU 侧读 config;零 GPU)──
     let (full, _rep) = ModelSpec::from_ckpt(&dir, SpecSource::family(&qwen3_5_0_8b()))

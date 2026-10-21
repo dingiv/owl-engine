@@ -1429,6 +1429,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // env 是值语义(相位已定住);先取出再借 face —— 否则 `env()` 的
         // `&self` 与 `face_mut()` 的可变借冲突。
         let env = self.env();
+        let gguf = env.gguf; // 臂集与 env 同源(值语义,避开 face_mut 的借用冲突)
         let face = self.graphs.session.face_mut();
         // P1.1:stride = **本 rank 的 logits 宽度**(词表切档 = 半表;用全量会越界)
         let vocab = self.boot.model.logits_vocab();
@@ -1441,7 +1442,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             owl_models::interpreters::eval_ops_scoped_env(hidden.step(), face, env, self.boot.tp.as_ref()).await?;
         // 树二:lm_head + 逐行 argmax(引用树一根块,不重建整模前向)
         let hview = TensorOps::of_block(hb.id, self.pool.geom.dims.dtype, vec![t, hd]);
-        let logits = self.boot.model.embed.lm_head_matmul(&hview);
+        let logits = self.boot.model.embed.lm_head_matmul(&hview, &gguf);
         let rows: Vec<TensorOps> =
             (0..t).map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab)).collect();
         let refs: Vec<&TensorOps> = rows.iter().collect();

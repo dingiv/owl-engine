@@ -124,13 +124,6 @@ pub(crate) fn scan_dir_sync<K: DiskKey>(dir: &Path) -> Vec<(K, PathBuf, usize)> 
     out
 }
 
-/// 扫一个目录(async 包装;运行期用)。
-pub(crate) async fn scan_dir<K: DiskKey + Send + 'static>(dir: PathBuf) -> Vec<(K, PathBuf, usize)> {
-    tokio::task::spawn_blocking(move || scan_dir_sync::<K>(&dir))
-        .await
-        .unwrap_or_default()
-}
-
 /// 扫一个目录里的 **`.idx` 索引文件**(S6.1;`(键, 路径)`)。名字形状 === `.bin` 的键规则。
 pub(crate) fn scan_index_sync<K: DiskKey>(dir: &Path) -> Vec<(K, PathBuf)> {
     let mut out = Vec::new();
@@ -155,17 +148,4 @@ pub(crate) fn scan_index_sync<K: DiskKey>(dir: &Path) -> Vec<(K, PathBuf)> {
 /// 文件是否存在(单次 `stat`;只用于"索引是否已写"的幂等判定 —— 不是数据 I/O)。
 pub(crate) fn exists(p: &Path) -> bool {
     std::fs::metadata(p).is_ok()
-}
-
-/// 两个目录一起扫(KV + 状态腿;boot 一次)。
-pub(crate) async fn scan_pair(
-    kv_dir: &Path,
-    snap_dir: &Path,
-) -> (
-    Vec<(owl_store::ChainHash, PathBuf, usize)>,
-    Vec<(owl_store::SnapKey, PathBuf, usize)>,
-) {
-    let kv = scan_dir::<owl_store::ChainHash>(kv_dir.to_path_buf()).await;
-    let snap = scan_dir::<owl_store::SnapKey>(snap_dir.to_path_buf()).await;
-    (kv, snap)
 }

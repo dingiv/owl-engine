@@ -963,7 +963,7 @@ impl<D: DeviceClient> DeviceHandle<D> {
                             "free: 幽灵归还 —— 账上无 id={id} 的在借登记(双 free 或未登记)"
                         )))
                     }
-                    Some((rank, true)) => {
+                    Some((_rank, true)) => {
                         return Err(ModelError::Msg(format!(
                             "free: 双 free —— id={id} 已在复用池(pooled)里,不能重复归还"
                         )))
@@ -1047,6 +1047,73 @@ impl<D: DeviceClient> DeviceHandle<D> {
 // 缺省实现会**静默换语义**(例:`alloc_uninit` 缺省 = 委托 `alloc` ⇒ 捕获窗内
 // 多烙 memset 节点;`htod_on` 缺省 = 退化 H2D 流 ⇒ 顺序义务错位)。
 impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
+    // ── 命令面(SDK ↔ server 的边界;2026-10-21)────────────────────
+    //
+    // 本层的记账抹子在**具名方法**上(alloc/free/htod/launch/…),而命令面是
+    // 底下 SDK 的唯一执行单位。两条路必须**不重叠**:
+    // - 引擎/模型一律走具名方法 ⇒ 记账完整(现有 ~1100 处调用点);
+    // - 命令面直调只用于"不产生/不销毁块"的控制命令 —— **分配/归还类响亮拒**,
+    //   否则绕过钩子 = 显存静默漏账(正是 2026-10-20 §79 那一类事故)。
+    fn exec(
+        &mut self,
+        cmd: crate::command::Command,
+    ) -> impl Future<Output = Result<crate::command::Outcome, ModelError>> + Send {
+        use crate::command::Command as C;
+        let blocked = matches!(cmd, C::Alloc { .. } | C::Free { .. } | C::Htod { .. });
+        async move {
+            if blocked {
+                return Err(ModelError::Msg(
+                    "DeviceHandle::exec: 分配/归还/装载命令必须走具名方法(alloc/alloc_uninit/htod/free),否则记账被绕过"
+                        .into(),
+                ));
+            }
+            self.inner.exec(cmd).await
+        }
+    }
+
+    /// **追加到待提交批**:分配/归还/装载命令一律拒(记账不可绕过);
+    /// 其余命令直通内层(GPU 面 = 纯 host 缓存,零往返)。
+    fn queue(&mut self, cmd: crate::command::Command) -> Result<usize, ModelError> {
+        use crate::command::Command as C;
+        if matches!(cmd, C::Alloc { .. } | C::Free { .. } | C::Htod { .. }) {
+            return Err(ModelError::Msg(
+                "DeviceHandle::queue: 分配/归还/装载命令必须走具名方法(记账不可绕过)"
+                    .into(),
+            ));
+        }
+        self.inner.queue(cmd)
+    }
+
+    /// 提交并等待本批(空批 = 零往返;直通内层 —— 本层在批内不记账,
+    /// 记录账只认具名方法这一条路)。
+    fn flush(
+        &mut self,
+    ) -> impl Future<Output = Result<crate::command::BatchOutcome, ModelError>> + Send {
+        self.inner.flush()
+    }
+
+    fn exec_batch(
+        &mut self,
+        cmds: Vec<crate::command::Command>,
+    ) -> impl Future<Output = Result<crate::command::BatchOutcome, ModelError>> + Send {
+        async move {
+            for cmd in &cmds {
+                if matches!(
+                    cmd,
+                    crate::command::Command::Alloc { .. }
+                        | crate::command::Command::Free { .. }
+                        | crate::command::Command::Htod { .. }
+                ) {
+                    return Err(ModelError::Msg(
+                        "DeviceHandle::exec_batch: 批内含分配/归还/装载命令 ⇒ 请逐条走具名方法(记账不可绕过)"
+                            .into(),
+                    ));
+                }
+            }
+            self.inner.exec_batch(cmds).await
+        }
+    }
+
     // ── 上下文面(泛型面:引擎内核按 `D: DeviceClient` 写,拿不到具名句柄类型
     //    ⇒ 这三条必须在 trait 上;具名的 [`DeviceHandle::set_owner`] 等是同一操作
     //    的具名入口,行为逐字一致)────────────────────────────────────

@@ -87,7 +87,7 @@ pub struct ModelLoader<'a, D: DeviceClient> {
     max_seq: usize,
     /// 视觉塔(`[model].vision`;false = 纯文本路径逐字节不变)
     vision: bool,
-    /// GGUF 视觉塔单文件(`[model].mmproj`;None = 同目录唯一候选)
+    /// GGUF 视觉塔单文件(`[model].vision_path`;None = 同目录唯一候选)
     mmproj: Option<std::path::PathBuf>,
     /// MTP 头覆盖路径(目录或 `.gguf`;None = 检查点自带)
     mtp_override: Option<std::path::PathBuf>,
@@ -139,7 +139,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         self
     }
 
-    /// **GGUF 视觉塔单文件**(`[model].mmproj`;None = 同目录唯一
+    /// **GGUF 视觉塔单文件**(`[model].vision_path`;None = 同目录唯一
     /// `mmproj*.gguf`)。仅 GGUF 档消费;HF/AWQ 档写本键 = 响亮拒。
     pub fn mmproj(mut self, p: Option<std::path::PathBuf>) -> Self {
         self.mmproj = p;
@@ -404,7 +404,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     ) -> Result<Option<Arc<Vlm>>> {
         if self.mmproj.is_some() {
             return Err(ModelError::Msg(
-                "[model].mmproj 仅用于 kind = \"gguf\"：HF/AWQ 档的视觉塔权重在检查点目录的 model.visual.*"
+                "[model].vision_path 仅用于 format = \"gguf\"：HF/AWQ 档的视觉塔权重在检查点目录的 model.visual.*"
                     .into(),
             ));
         }
@@ -452,7 +452,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         if !self.vision {
             if self.mmproj.is_some() {
                 return Err(ModelError::Msg(
-                    "[model].mmproj 已设置但 [model].vision = false（配置自相矛盾）".into(),
+                    "[model].vision_path 已设置但 [model].vision = false（配置自相矛盾）".into(),
                 ));
             }
             return Ok(None);
@@ -533,7 +533,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         }
         if self.mmproj.is_some() {
             return Err(ModelError::Msg(
-                "[model].mmproj 仅用于 kind = \"gguf\"（0.8B-W4A16 档无 mmproj 路径）".into(),
+                "[model].vision_path 仅用于 format = \"gguf\"（0.8B-W4A16 档无 mmproj 路径）".into(),
             ));
         }
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_5_0_8b()))?;

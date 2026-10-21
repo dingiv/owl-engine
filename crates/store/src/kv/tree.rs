@@ -363,15 +363,6 @@ impl PrefixTree {
         evicted
     }
 
-    /// **宿主层条目**(`slot = None`,不限叶;S6.1 的"整链搬盘"锚点面)。
-    pub(crate) fn host_entries(&self) -> Vec<(ChainHash, u64)> {
-        self.entries
-            .iter()
-            .filter(|(_, e)| e.slot.is_none())
-            .map(|(c, e)| (*c, e.access))
-            .collect()
-    }
-
     /// 叶条目(驱逐候选面;调用方按策略排序)。
     pub(crate) fn leaves(&self) -> Vec<(ChainHash, u64, Option<u32>)> {
         self.entries

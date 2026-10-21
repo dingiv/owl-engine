@@ -11,16 +11,28 @@
 use crate::command::{Ack, Command, Waiter};
 use crate::server::GpuServer;
 use crate::state::{DeviceSelector, STREAM_COMPUTE, STREAM_H2D};
-use owl_iface::contract::{Arg, Bytes, DeviceClient, GraphId, LaunchMsg};
-use owl_iface::contract::{Connector, Dtype, ModelError, Shape, SwapDir, SwapPiece};
+use owl_iface::contract::{Arg, Bytes, DeviceClient, LaunchMsg};
+use owl_iface::contract::{Connector, ModelError, SwapDir, SwapPiece};
+use owl_iface::command::{BatchOutcome, Command as DeviceCommand, Outcome};
 use std::future::Future;
 use std::sync::mpsc;
 
-#[derive(Clone)]
 pub struct GpuClient {
     tx: mpsc::Sender<Command>,
     /// 诊断下沉口(与 GPU server 同一只;`sink()` 组装时同传双方)
     sink: owl_shared::log::LogSink,
+    /// **累积批的待提交队列**(`queue` 追加 / `flush` 一次提交;2026-10-21)。
+    ///
+    /// 语义:队列**属于句柄**,不跨克隆(`face_clone`/`loader_faces` 出来的
+    /// 新句柄从空队列开始 —— 各句柄各攒各的,fl​ush 时各发各的批)。
+    pending: Vec<DeviceCommand>,
+}
+
+impl Clone for GpuClient {
+    /// 克隆 = **同一管道的新句柄**(队列不跟随 —— 见字段文档)。
+    fn clone(&self) -> Self {
+        Self { tx: self.tx.clone(), sink: self.sink, pending: Vec::new() }
+    }
 }
 
 /// 计时包封:记录 `submit → Ready` 的**等待**(分相 tag `srv.wait.<kind>`)。
@@ -59,12 +71,12 @@ impl GpuClient {
     /// client 构造函数:**纯句柄**(管道的 client 端;管道由外部组装者
     /// 创建后分别传入 server 与 client,双方都不自创管道)。
     pub fn new(tx: mpsc::Sender<Command>) -> Self {
-        Self { tx, sink: owl_shared::log::LogSink::none() }
+        Self { tx, sink: owl_shared::log::LogSink::none(), pending: Vec::new() }
     }
 
     /// 带下沉口构造(组装糖/spawn_with 用;两侧同 sink)
     pub fn with_sink(tx: mpsc::Sender<Command>, sink: owl_shared::log::LogSink) -> Self {
-        Self { tx, sink }
+        Self { tx, sink, pending: Vec::new() }
     }
 
     /// **块账按名清单**(诊断查询面;2026-10-16 全量记名)。
@@ -251,6 +263,19 @@ impl GpuClient {
     }
 }
 
+impl GpuClient {
+    /// 队列守卫:有待提交命令 ⇒ **结构化拒**(调用方先 `flush`)。
+    fn ensure_flushed(&self) -> Result<(), ModelError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        Err(ModelError::Msg(format!(
+            "命令面:还有 {} 条命令未提交(先 `flush()`;不隐式多跑一次往返)",
+            self.pending.len()
+        )))
+    }
+}
+
 /// 小工具 + **上传/写槽内核的固有实现面**(trait impl 之外;两个流选择口共用)。
 fn f32_bytes(data: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(data.len() * 4);
@@ -291,42 +316,6 @@ impl GpuClient {
         self.submit(move |ack| Command::HtodChunks { writes, stream: sid, ack })?.await
     }
 
-    /// **htod 内核**(落点流可选;2026-10-17):trait 的 `htod`(H2D 批量面)
-    /// 与 `htod_on`(流可选)共用本实现 —— 单机制,无第二套上传路径。
-    async fn htod_with_stream(
-        &mut self,
-        sid: u8,
-        dtype: Dtype,
-        shape: &Shape,
-        src: &[u8],
-        name: &str,
-    ) -> Result<Bytes, ModelError> {
-        // 字节直传(字节口径);Bytes.len = 元素数,按 shape 回填。
-        //
-        // ⚠️ **dtype 不再静默忽略**(2026-10-15 审查补):旧实现 `let _ = dtype;`
-        // ⇒ 调用方传错 dtype(非 f16 基线,如 U32 打包权重)时 `Bytes.len`
-        // 语义错而**无声**。这里做**交叉校验**(不拒非 F16 —— U32 是合法用法):
-        // `src` 字节数必须 ≥ `elems × dtype 字节宽`(多给容许:池块可含尾料)。
-        let elems: usize = shape.iter().product();
-        let nm = name.to_string();
-        let want = elems
-            .checked_mul(dtype.size_bytes())
-            .ok_or_else(|| ModelError::Msg(format!("htod: elems({elems})×dtype({dtype:?}) 溢出")))?;
-        if src.len() < want {
-            return Err(ModelError::Msg(format!(
-                "htod: src {}B < elems({elems})×dtype({dtype:?})={want}B —— dtype/shape 与字节数不一致",
-                src.len()
-            )));
-        }
-        let mut b = self
-            .submit(move |ack| Command::Htod { data: src.to_vec(), name: nm, stream: sid, ack })?
-            .await?;
-        // 事实面定形:服务端只回句柄(U8/未定形),dtype + 阶数由本面按 (dtype, shape) 回填
-        b.len = elems;
-        b.dtype = dtype;
-        b.rank = shape.len() as u8;
-        Ok(b)
-    }
 }
 
 impl DeviceClient for GpuClient {
@@ -348,12 +337,50 @@ impl DeviceClient for GpuClient {
         true
     }
 
-    async fn graph_begin(&mut self) -> Result<(), ModelError> {
-        self.submit(move |ack| Command::GraphBegin { ack })?.await
+    /// **单条设备命令**(契约唯一执行入口;2026-10-21)。
+    ///
+    /// 信箱里落的仍是既有细粒度信封 —— 载荷映射/回执变换全部收敛在
+    /// [`crate::command::envelope_of`](单一真源,服务端批的逐条派发也用它)。
+    async fn exec(&mut self, cmd: DeviceCommand) -> Result<Outcome, ModelError> {
+        // **队列非空 ⇒ 响亮拒**(用户裁决 2026-10-21):不许隐式多跑一次往返,
+        // 也不许在调用方不知情时改变顺序承诺。
+        self.ensure_flushed()?;
+        // 槽序契约前置校验(与 launch.rs 的"最后一个 Block"回传一致)。
+        // **响亮拒,不用 debug_assert**(2026-10-17 审查):无 Block 实参 = 调用点
+        // 违约,而 release 档 debug_assert 静默放行 ⇒ 服务端 `out_id` 退化成 0,
+        // 错在很远处才现形。命令面收口后,这条校验收在这一条咽喉。
+        if let DeviceCommand::Launch { msg } = &cmd {
+            if !msg.args.iter().any(|a| matches!(a, Arg::Block { .. })) {
+                return Err(ModelError::Msg(format!(
+                    "launch 契约违约:实参里没有任何 Block(核 {})",
+                    msg.kernel.name
+                )));
+            }
+        }
+        self.submit(move |ack| crate::command::envelope_of(cmd, ack))?.await
     }
 
-    async fn graph_end(&mut self) -> Result<GraphId, ModelError> {
-        self.submit(move |ack| Command::GraphEnd { ack })?.await
+    /// **原生批**:整批装进**一条**信箱消息(一次入队 + 一次回执)。
+    /// 服务端看见 Vec<Command>,逐条派发后统一回执(join 在 server 侧)。
+    async fn exec_batch(&mut self, cmds: Vec<DeviceCommand>) -> Result<BatchOutcome, ModelError> {
+        self.ensure_flushed()?;
+        self.submit(move |ack| Command::Batch { cmds, ack })?.await
+    }
+
+    /// **追加到待提交批**(不入信箱;结果见 `flush` 的 `outcomes[i]`)。
+    fn queue(&mut self, cmd: DeviceCommand) -> Result<usize, ModelError> {
+        let i = self.pending.len();
+        self.pending.push(cmd);
+        Ok(i)
+    }
+
+    /// **提交并等待本批**:一条信箱消息 + 一次回执(空批 = 零往返)。
+    async fn flush(&mut self) -> Result<BatchOutcome, ModelError> {
+        if self.pending.is_empty() {
+            return Ok(BatchOutcome::empty());
+        }
+        let cmds = std::mem::take(&mut self.pending);
+        self.submit(move |ack| Command::Batch { cmds, ack })?.await
     }
 
     /// **FI plan 自携开关**(引擎 boot 期下发;配置单源 `[dispatch] fi_plan_restore`)。
@@ -365,22 +392,11 @@ impl DeviceClient for GpuClient {
         owl_kernels::server::flashinfer::set_plan_restore(self_carry);
         // C++ 适配器的图档瓦只认 `getenv("FI_CUDA_GRAPH")`(上游 ABI 不动)
         // ⇒ 与 `apps/server/main.rs` 同一写点、同一口径;此处是**通用入口**
-        // (测试/直连后端也走它,不再各设 env)。
+        // (测试/直连后端也走它,不再各设 env)。本侧 Rust 读面同步落值
+        // (2026-10-21:两份口径同一写点,不可能漂移)。
         std::env::set_var("FI_CUDA_GRAPH", if cuda_graph { "1" } else { "0" });
+        owl_kernels::server::flashinfer::set_plan_mode(cuda_graph);
         Ok(())
-    }
-
-    async fn graph_launch(&mut self, graph: GraphId) -> Result<(), ModelError> {
-        self.submit(move |ack| Command::GraphLaunch { graph, ack })?.await
-    }
-
-    async fn graph_abort(&mut self) -> Result<(), ModelError> {
-        self.submit(move |ack| Command::GraphAbort { ack })?.await
-    }
-
-
-    async fn graph_destroy(&mut self, graph: GraphId) -> Result<(), ModelError> {
-        self.submit(move |ack| Command::GraphDestroy { graph, ack })?.await
     }
 
     /// **FI plan 表同步**(W3;见 `DeviceClient::fi_plan_sync` 与
@@ -397,25 +413,6 @@ impl DeviceClient for GpuClient {
     /// 都把窗内自产块整批移出块账房。
     fn window_blocks_auto_reclaimed(&self) -> bool {
         true
-    }
-
-    async fn alloc(&mut self, dtype: Dtype, elems: usize, name: &str) -> Result<Bytes, ModelError> {
-        let n_bytes = elems * dtype.size_bytes();
-        // 事实面:句柄自带 dtype(阶数未定形 = 0,由调用点 `view` 或张量视图定)
-        let nm = name.to_string();
-        let mut b = self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: true, name: nm, ack })?.await?;
-        b.dtype = dtype;
-        b.rank = 0;
-        Ok(b)
-    }
-
-    async fn alloc_uninit(&mut self, dtype: Dtype, elems: usize, name: &str) -> Result<Bytes, ModelError> {
-        let n_bytes = elems * dtype.size_bytes();
-        let nm = name.to_string();
-        let mut b = self.submit(move |ack| Command::Alloc { n_bytes, elems, zero: false, name: nm, ack })?.await?;
-        b.dtype = dtype;
-        b.rank = 0;
-        Ok(b)
     }
 
     async fn alloc_pinned(
@@ -552,40 +549,6 @@ impl DeviceClient for GpuClient {
         .await
     }
 
-    async fn htod(
-        &mut self,
-        dtype: Dtype,
-        shape: &Shape,
-        src: &[u8],
-        name: &str,
-    ) -> Result<Bytes, ModelError> {
-        self.htod_with_stream(STREAM_H2D as u8, dtype, shape, src, name).await
-    }
-
-    async fn htod_on(
-        &mut self,
-        stream: owl_iface::contract::UpStream,
-        dtype: Dtype,
-        shape: &Shape,
-        src: &[u8],
-        name: &str,
-    ) -> Result<Bytes, ModelError> {
-        let sid = match stream {
-            owl_iface::contract::UpStream::H2d => STREAM_H2D,
-            owl_iface::contract::UpStream::Compute => STREAM_COMPUTE,
-        } as u8;
-        self.htod_with_stream(sid, dtype, shape, src, name).await
-    }
-
-
-    async fn dtoh(&mut self, b: &Bytes, out: &mut [u8]) -> Result<(), ModelError> {
-        let id = b.id;
-        let want_bytes = out.len();
-        let bytes = self.submit(move |ack| Command::Dtoh { id, want_bytes, ack })?.await?;
-        out.copy_from_slice(&bytes);
-        Ok(())
-    }
-
     /// 批量分块读:单命令 `DtohBatch`(一次往返;回执 = 按序拼接)
     async fn dtoh_batch(
         &mut self,
@@ -612,22 +575,6 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::HtodChunks { writes, stream: STREAM_COMPUTE as u8, ack })?.await
     }
 
-    /// 带偏移读(状态存储搬出面;与 `dtoh` 同一条 server 路径)
-    async fn dtoh_at(
-        &mut self,
-        b: &Bytes,
-        off_bytes: usize,
-        out: &mut [u8],
-    ) -> Result<(), ModelError> {
-        let id = b.id;
-        let want_bytes = out.len();
-        let bytes = self
-            .submit(move |ack| Command::DtohAt { id, off_bytes, want_bytes, ack })?
-            .await?;
-        out.copy_from_slice(&bytes);
-        Ok(())
-    }
-
     /// **swap 一条命令**(设计卷 §15):N 片一次提交、一次 ack
     /// (回执 = 原箱奉还的连接器;搬完即落定 —— out 回执含 `conn.put` 完成)。
     async fn swap(
@@ -640,21 +587,6 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::Swap { dir, pieces, conn, ack })?.await
     }
 
-    async fn launch(&mut self, msg: LaunchMsg) -> Result<Bytes, ModelError> {
-        // 槽序契约前置校验(与 launch.rs 的"最后一个 Block"回传一致)。
-        // **响亮拒,不用 debug_assert**(2026-10-17 审查):无 Block 实参 = 调用点
-        // 违约,而 release 档 debug_assert 静默放行 ⇒ 服务端 `out_id` 退化成 0,
-        // 错在很远处才现形。这里每发射一次扫一遍实参(≤数十项),代价可忽略。
-        if !msg.args.iter().any(|a| matches!(a, Arg::Block { .. })) {
-            return Err(ModelError::Msg(format!(
-                "launch 契约违约:实参里没有任何 Block(核 {})",
-                msg.kernel.name
-            )));
-        }
-        self.submit(move |ack| Command::Launch { msg, ack })?.await
-    }
-
-    /// 设备 SM 数(CUDA:服务端 `cuDeviceGetAttribute`;客户端零 CUDA 依赖)
     async fn sm_count(&mut self) -> Result<usize, ModelError> {
         self.submit(move |ack| Command::DeviceSmCount { ack })?.await
     }
@@ -666,10 +598,6 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::BlockLedgerDump { ack })?.await
     }
 
-    async fn sync(&mut self) -> Result<(), ModelError> {
-        self.submit(move |ack| Command::Sync { ack })?.await
-    }
-
     /// **设备池回收**(装载收尾;默认 trait 口"不支持" ⇒ 这里给 GPU 实现)
     async fn mem_pool_trim(&mut self) -> Result<u64, ModelError> {
         self.submit(move |ack| Command::MemPoolTrim { ack })?.await
@@ -677,12 +605,6 @@ impl DeviceClient for GpuClient {
 
     async fn mem_pool_stats(&mut self) -> Result<(u64, u64, u64, u64), ModelError> {
         self.submit(move |ack| Command::MemPoolStats { ack })?.await
-    }
-
-    /// 中间块回收(E2a):投递 Free 命令,账房移除 Owned 块归池
-    async fn free(&mut self, ids: &[u64]) -> Result<(), ModelError> {
-        let ids = ids.to_vec();
-        self.submit(move |ack| Command::Free { ids, ack })?.await
     }
 
     /// **上传并计算**:一次 pinned 搬运 + 一次发射,序由 server 内部保证。

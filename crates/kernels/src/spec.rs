@@ -902,8 +902,10 @@ fn check_tensor_facts(op: &str, p: &Param, i: usize, a: &Arg) -> Result<(), OpEr
     if want_rank == 0 {
         // [临时审计 F5c] 声明 0 的槽,记录**实际喂进来的 rank** ——
         // 用途:找出哪些 "阶数无关" 其实在全部生产臂上都是固定阶数(可收紧)。
-        // 去重键 = (op, 槽名, rank);`OWL_L3_AUDIT=1` 才开(零成本关账)。
-        if *L3_AUDIT_ON.get_or_init(|| std::env::var_os("OWL_L3_AUDIT").is_some()) {
+        // 去重键 = (op, 槽名, rank);`[probes] l3_audit` 才开(零成本关账)。
+        if *L3_AUDIT_ON.get_or_init(|| {
+            L3_AUDIT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+        }) {
             l3_audit_note(op, p.name, got_rank);
         }
     }
@@ -926,7 +928,16 @@ fn check_tensor_facts(op: &str, p: &Param, i: usize, a: &Arg) -> Result<(), OpEr
 //   ② 只出现一个 rank 且跨档一致 ⇒ **候选收紧**(收紧前先确认其他 flavor
 //      不走同一张表,否则 F5a 未验路径会当场被门拦);
 //   ③ 槽本身是**占位/旗标**(如 `sinks` 槽恒不解引用)⇒ 诚实维持 0 。
-// 关账成本 = 一次原子读(OnceLock)。
+// 关账成本 = 一次原子读(OnceLock)。开关唯一写点 = [`set_l3_audit`]
+// (后端 boot 期由配置 `[probes] l3_audit` 下发;本 crate 零 env)。
+static L3_AUDIT_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 写 L3 事实面审计开关(boot 期一次;重入以最后一次为准)
+pub fn set_l3_audit(on: bool) {
+    L3_AUDIT_REQUESTED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 static L3_AUDIT_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static L3_AUDIT_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<(String, &'static str, u8)>>> =
     std::sync::OnceLock::new();

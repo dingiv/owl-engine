@@ -76,6 +76,8 @@ macro_rules! alloc_pinned {
 // ============================================================================
 
 pub use owl_kernels::contract::{numel, Arg, Bytes, Dtype, GraphId, KernelSource, LaunchMsg, Shape};
+// **设备命令面**(2026-10-21):SDK ↔ server 的唯一单位。见 [`crate::command`]。
+pub use crate::command::{BatchOutcome, Command, Outcome};
 
 // ============================================================================
 // 错误面:server 回执族(词汇权威在 iface;后端必须能表达)
@@ -346,6 +348,48 @@ pub struct FiPlanSpec {
 }
 
 pub trait DeviceClient: Send {
+    // ── 命令面(SDK ↔ server 的唯一执行入口;2026-10-21)────────────────
+    //
+    // **命令族只实现这两条**(能力自述/非核心命令另算);具名方法(alloc/launch/htod/…)是**缺省糖**,
+    // 内部构造 [`Command`] 调 `exec` —— 单一真源,调用点零改动。
+    //
+    // - `exec`:单条命令;`Ok` 的时机由后端语义决定(launch/alloc = 提交成功;
+    //   htod/dtoh/sync = 真实完成 —— 与旧契约逐条对齐);
+    // - `exec_batch`:**一条信箱消息**把整批交给后端(省掉逐条线程间往返),
+    //   `BatchOutcome.outcomes` 与投递顺序严格对应,失败不回滚已投递部分。
+    //   CPU/mock 面没有往返可省,逐条即序(segments = N)是合法实现。
+    fn exec(
+        &mut self,
+        cmd: Command,
+    ) -> impl Future<Output = Result<Outcome, ModelError>> + Send;
+
+    /// **批量执行**(原生批:后端看见整批;判据 = `segments` 与往返次数下降)。
+    fn exec_batch(
+        &mut self,
+        cmds: Vec<Command>,
+    ) -> impl Future<Output = Result<BatchOutcome, ModelError>> + Send;
+
+    // ── 累积批:`queue` / `flush`(2026-10-21 用户裁决)──────────────────
+    //
+    // 为什么还要这一对:`exec_batch(Vec)` 要求调用点**先把命令攒成一个 Vec**
+    // —— 而解释器逐节点发射的数据流里没有这个 Vec(命令夹在递归深处)。
+    // `queue` 把追加点下放到每一处调用点,`flush` 在作用域收尾一次提交 ⇒
+    // 具名调用可以**一处一处**地改成批,不必整段重写。
+    //
+    // 纪律(三条,都是显式的):
+    // - `queue` **不碰信箱、不产生往返**,返回批内下标(0 基)——
+    //   结果在 `flush()` 的 `outcomes[i]` 里(需要结果的命令不许"用完就丢");
+    // - **队列非空时 `exec` / `exec_batch` 响亮拒**(先 flush)——
+    //   不隐式多跑一次往返,也不隐式改变顺序承诺;
+    // - `flush` = 一条信箱消息(GPU)/ 逐条即序(CPU);**空队列 = 零往返空回执**。
+
+    /// 追加一条命令到本句柄的**待提交批**(不入信箱、不等待)。
+    /// 返回批内下标:结果见 [`DeviceClient::flush`] 回执的 `outcomes[i]`。
+    fn queue(&mut self, cmd: Command) -> Result<usize, ModelError>;
+
+    /// 提交并等待本批(空批 = 零往返)。
+    fn flush(&mut self) -> impl Future<Output = Result<BatchOutcome, ModelError>> + Send;
+
     // ── 归属/类别上下文(账本面;2026-10-19 步 3)────────────────────────
     //
     // 为什么在契约上:引擎内核按 `D: DeviceClient` 泛型写(N1/N4/N5 节点要设上下文,
@@ -400,15 +444,23 @@ pub trait DeviceClient: Send {
     /// - 不可嵌套/并发捕获;捕获期 Htod/Dtoh/Sync/GraphLaunch 拒绝
     /// - 数据须在图外先物化(Block 叶子)—— warmup 契约:先 eager 跑
     ///   同一声明树,验证逻辑正确后再捕获
-    fn graph_begin(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send;
+    fn graph_begin(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async { self.exec(Command::GraphBegin).await?.into_done("graph_begin") }
+    }
     /// 图捕获结束:实例化并登记,返回图 id(空捕获窗拒绝 —— 发射数须 > 0)
-    fn graph_end(&mut self) -> impl Future<Output = Result<GraphId, ModelError>> + Send;
+    fn graph_end(&mut self) -> impl Future<Output = Result<GraphId, ModelError>> + Send {
+        async { self.exec(Command::GraphEnd).await?.into_graph("graph_end") }
+    }
     /// 图重放(流序异步提交;写入捕获时的同一批池块 —— 块只增不减,
     /// 指针稳定,由 server 账房保证)
     fn graph_launch(
         &mut self,
         graph: GraphId,
-    ) -> impl Future<Output = Result<(), ModelError>> + Send;
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async move {
+            self.exec(Command::GraphLaunch { graph }).await?.into_done("graph_launch")
+        }
+    }
     /// **FI plan 开关下发**(2026-10-19;单源 = 引擎 `knobs`)
     ///
     /// - `self_carry`(`knobs.fi_plan_restore`):捕获窗内是否把本 plan 的调度表
@@ -453,18 +505,22 @@ pub trait DeviceClient: Send {
     /// 为什么必须有:`GraphPlan` 的捕获窗一旦出错(声明违约/launch 失败/
     /// slab 耗尽),窗内已切出的块就处于"无图可回放但已在账房"的孤儿态 ⇒
     /// 不做 abort 则**整条 slab 钉到进程结束**(最坏 GB 级,见设计 §4.3c)。
-    /// 缺省实现 = 结构化拒(无捕获能力的 face 永不进入此路径)。
+    /// 缺省实现 = `Command::GraphAbort`(后端自知"窗内自产块去哪了";
+    /// 无捕获能力的 face 由自己的 `exec` 响亮拒)。
     fn graph_abort(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
-        async { Err(ModelError::Msg("graph_abort: 该 face 无图捕获能力".into())) }
+        async { self.exec(Command::GraphAbort).await?.into_done("graph_abort") }
     }
     /// **销毁已登记图**(单图退休:LRU 驱逐 / plan `close()` 的底层)。
     /// 语义 = 排空回放 → 解除本图块租约 → 本图 slab 块移出账房。
-    /// 缺省实现 = 幂等空操作(无图后端语义上"无可销毁")。
+    /// 缺省实现 = `Command::GraphDestroy`(未知图 id 由后端定:响亮的
+    /// `Err` 或幂等 —— 两条语义**都不是静默**)
     fn graph_destroy(
         &mut self,
-        _graph: GraphId,
+        graph: GraphId,
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
-        async { Ok(()) }
+        async move {
+            self.exec(Command::GraphDestroy { graph }).await?.into_done("graph_destroy")
+        }
     }
     /// 清零分配:块登记 + COMPUTE 流序 memset 入队(异步;捕获期 slab
     /// 切块同款清零,Op::Zeros 语义的设备侧保证)。f16 基线(2026-09-26):
@@ -478,13 +534,21 @@ pub trait DeviceClient: Send {
     /// 靠它;默认值会让漏报静默(空名块在 dump 里单独计 "未命名!",
     /// 那是漏网信号,不是合法状态)。
     fn alloc(&mut self, dtype: Dtype, elems: usize, name: &str)
-        -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+        -> impl Future<Output = Result<Bytes, ModelError>> + Send
+    {
+        async move {
+            self.exec(Command::Alloc { dtype, elems, zero: true, name: name.to_string() })
+                .await?
+                .into_buf("alloc")
+        }
+    }
 
     /// 未初始化分配(S1,2026-09-30):scratch 输出块 = 随后 kernel
     /// **全量覆写**,不需要零化。GPU 后端覆写为无 memset 分配 ——
     /// 捕获窗内不烙 memset 节点(S1 实测定谳:decode 图 1207 memset
     /// 节点 = launch 税 + ~2ms GPU 时间双税),图外免流序清零。
-    /// 默认 = 委托 [`DeviceClient::alloc`](零化语义,保守正确)。
+    /// 默认 = `Command::Alloc { zero: false }`(**与 `alloc` 共用一条命令**,
+    /// 差别只在 zero 位 —— 不再"委托 alloc 再静默多烙 memset")。
     /// **契约**:调用方保证 kernel 全量覆写后才读;Zeros 语义走
     /// [`DeviceClient::alloc`](零化)。
     fn alloc_uninit(
@@ -492,11 +556,12 @@ pub trait DeviceClient: Send {
         dtype: Dtype,
         elems: usize,
         name: &str,
-    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send
-    where
-        Self: Sized,
-    {
-        async move { self.alloc(dtype, elems, name).await }
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        async move {
+            self.exec(Command::Alloc { dtype, elems, zero: false, name: name.to_string() })
+                .await?
+                .into_buf("alloc_uninit")
+        }
     }
     /// host 数据入块(H2D 流异步拷贝 + finish 回调携 ack):**回执即数据
     /// 落地**,后续 launch 跨流读安全(顺序语义,见 trait 级文档)。
@@ -507,23 +572,41 @@ pub trait DeviceClient: Send {
         shape: &Shape,
         src: &[u8],
         name: &str,
-    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        self.htod_on(UpStream::H2d, dtype, shape, src, name)
+    }
 
     /// **带流选择的整块上传**(2026-10-17):参数面(解释器 `from_host` 叶子 ——
     /// 小张量、马上被发射消费)走 [`UpStream::Compute`] ⇒ 同流 FIFO 天然有序;
-    /// 批量面(权重/装载)走 H2D 以免占住计算流。默认退化为 [`Self::htod`]。
+    /// 默认 = `Command::Htod { stream, .. }` —— **流选择是命令字段**,
+    /// 不会再退化到 H2D(旧的"缺省退化"陷阱已在命令面消灭)。
     fn htod_on(
         &mut self,
-        _stream: UpStream,
+        stream: UpStream,
         dtype: Dtype,
         shape: &Shape,
         src: &[u8],
         name: &str,
-    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send
-    where
-        Self: Sized,
-    {
-        self.htod(dtype, shape, src, name)
+    ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
+        let (shape, src, name) = (shape.clone(), src.to_vec(), name.to_string());
+        async move {
+            // **dtype/字节交叉校验**(2026-10-15 审查补;命令面收口后仍是唯一咽喉):
+            // 调用方传错 dtype(如 U32 打包权重)时 `Bytes.len` 语义会错而**无声**。
+            // 不拒非 F16(U32 是合法用法),只要求 src 字节 ≥ 元素×位宽。
+            let elems: usize = shape.iter().product();
+            let want = elems.checked_mul(dtype.size_bytes()).ok_or_else(|| {
+                ModelError::Msg(format!("htod: elems({elems})×dtype({dtype:?}) 溢出"))
+            })?;
+            if src.len() < want {
+                return Err(ModelError::Msg(format!(
+                    "htod: src {}B < elems({elems})×dtype({dtype:?})={want}B —— dtype/shape 与字节数不一致",
+                    src.len()
+                )));
+            }
+            self.exec(Command::Htod { dtype, shape, src, stream, name })
+                .await?
+                .into_buf("htod")
+        }
     }
 
     /// 块读出(**读语义**,2026-09-26 成文):issue 相排空 COMPUTE 后
@@ -531,22 +614,54 @@ pub trait DeviceClient: Send {
     /// 与 [`DeviceClient::sync`] 的分工:本命令为读数据;sync 为不读
     /// 数据的显式栅栏(计时/步边界/捕获前净空)
     fn dtoh(&mut self, b: &Bytes, out: &mut [u8])
-        -> impl Future<Output = Result<(), ModelError>> + Send;
+        -> impl Future<Output = Result<(), ModelError>> + Send
+    {
+        let (id, want) = (b.id, out.len());
+        async move {
+            let bytes = self
+                .exec(Command::Dtoh { id, off_bytes: 0, want_bytes: want })
+                .await?
+                .into_bytes("dtoh")?;
+            if bytes.len() != want {
+                return Err(ModelError::Msg(format!(
+                    "dtoh: 回执 {}B != 请求 {want}B",
+                    bytes.len()
+                )));
+            }
+            out.copy_from_slice(&bytes);
+            Ok(())
+        }
+    }
     /// **带偏移的设备→主机读**(状态存储的搬出面,2026-10-16):
     /// `dtoh` 只能读块前缀,而"逻辑块 = 层缓冲内的一个页"必须按**槽偏移**读
     /// (`off_bytes = slot × 每页字节`)⇒ 补这条。语义与 [`DeviceClient::dtoh`]
     /// 同(读语义:回执时 out = 块在全部先前已回执命令之后的那一段)。
     ///
-    /// 默认 = **响亮"未实现"**(后端逐个补齐;CPU 面已给实现供 store 单测)。
+    /// 默认 = `Command::Dtoh { off_bytes, .. }`(与 `dtoh` 共用一条命令 ——
+    /// 偏移是命令字段;`off_bytes = 0` 与 `dtoh` 逐字等价)。
     /// 批面(`DtohBatch`,一次命令搬一个块的全部层片段)是它的下一步 —— 见
     /// `docs/arch/store-状态存储-设计与迁移.md` §10.3 推论 B。
     fn dtoh_at(
         &mut self,
-        _b: &Bytes,
-        _off_bytes: usize,
-        _out: &mut [u8],
+        b: &Bytes,
+        off_bytes: usize,
+        out: &mut [u8],
     ) -> impl Future<Output = Result<(), ModelError>> + Send {
-        async { Err(ModelError::Msg("dtoh_at: 此后端未实现".into())) }
+        let (id, want) = (b.id, out.len());
+        async move {
+            let bytes = self
+                .exec(Command::Dtoh { id, off_bytes, want_bytes: want })
+                .await?
+                .into_bytes("dtoh_at")?;
+            if bytes.len() != want {
+                return Err(ModelError::Msg(format!(
+                    "dtoh_at: 回执 {}B != 请求 {want}B(off={off_bytes})",
+                    bytes.len()
+                )));
+            }
+            out.copy_from_slice(&bytes);
+            Ok(())
+        }
     }
     /// **批量分块读**(状态存储"整块搬出",2026-10-16):一次命令搬 N 段
     /// (`(块, 偏移字节, 长度字节)`),回执 = 各段按**入参顺序**拼接的字节。
@@ -654,17 +769,24 @@ pub trait DeviceClient: Send {
     /// 算子发射(COMPUTE 流,火后不理):Ok = 提交成功;同流保序,
     /// 与数据搬运的跨流先后靠回执时序/sync 建立(顺序语义,见 trait 级文档)
     fn launch(&mut self, msg: LaunchMsg)
-        -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+        -> impl Future<Output = Result<Bytes, ModelError>> + Send
+    {
+        async move { self.exec(Command::Launch { msg }).await?.into_buf("launch") }
+    }
 
     /// 全设备栅栏:三条流此前全部工作落定方回执(计时/步边界/捕获前净空)
-    fn sync(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send;
+    fn sync(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
+        async { self.exec(Command::Sync).await?.into_done("sync") }
+    }
 
     /// 中间块回收(E2a,2026-09-27):调用方声明这批块此后不再引用。
     /// 安全前提:回收前已收割所需数据(dtoh 回执即 COMPUTE 已排空);
     /// 图捕获期禁止(捕获块 = slab 切片,生命周期随图)。未知 id 容错
-    /// 跳过(幂等)。默认 = 无操作(无块账房的后端,如 CPU 面)。
-    fn free(&mut self, _ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
-        async move { Ok(()) }
+    /// 跳过(幂等)。默认 = `Command::Free`(无块账房的后端由自己的
+    /// `exec` 决定语义;命令面统一收口)。
+    fn free(&mut self, ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
+        let ids = ids.to_vec();
+        async move { self.exec(Command::Free { ids }).await?.into_done("free") }
     }
 
     /// **结清口径的归还**(N4 兜底;2026-10-20):调用方已把**借出登记结清**

@@ -40,6 +40,7 @@ pub(super) fn reject_closed(cmd: Command) {
             Command::DtohBatch { ack, .. } => closed!(ack),
             Command::Swap { ack, .. } => closed!(ack),
             Command::Free { ack, .. } => closed!(ack),
+            Command::Batch { ack, .. } => closed!(ack),
             Command::CopyBlock { ack, .. } => closed!(ack),
             Command::CopyBatch { ack, .. } => closed!(ack),
             Command::Launch { ack, .. } => closed!(ack),
@@ -66,7 +67,6 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::BlockLedgerDump { .. } => "block_ledger_dump",
             Command::MemPoolTrim { .. } => "mem_pool_trim",
             Command::MemPoolStats { .. } => "mem_pool_stats",
-            Command::MemPoolStats { .. } => "mem_pool_stats",
             Command::FiPlanSync { .. } => "FiPlanSync",
             Command::UploadAndLaunch { .. } => "upload_and_launch",
             Command::LaunchAndHarvest { .. } => "launch_and_harvest",
@@ -87,7 +87,6 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::AllocPinned { .. } => "AllocPinned",
             Command::LedgerReport { .. } => "LedgerReport",
             Command::LedgerJson { .. } => "LedgerJson",
-            Command::MemPoolStats { .. } => "MemPoolStats",
             Command::UploadPinned { .. } => "UploadPinned",
             Command::Free { .. } => "Free",
             Command::CopyBlock { .. } => "CopyBlock",
@@ -99,6 +98,7 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::PeerRelease { .. } => "PeerRelease",
             Command::CaptureRoute { .. } => "CaptureRoute",
             Command::CaptureJoin { .. } => "CaptureJoin",
+            Command::Batch { .. } => "Batch",
             Command::Close { .. } => "Close",
         };
         sink.logf(owl_shared::log::LVL_WARN, "owl-gpu", format_args!("捕获期拒绝: {} —— {why}", name(&cmd)));
@@ -149,6 +149,8 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::PeerAlloc { ack, .. } => reject!(ack),
             Command::PeerImport { ack, .. } => reject!(ack),
             Command::PeerRelease { ack, .. } => reject!(ack),
+            // 批外壳:本条路径不该到(捕获期由 `handle_batch` 逐条过白名单)
+            Command::Batch { ack, .. } => reject!(ack),
             Command::Close { ack } => ack.send(Ok(())), // 幂等
         }
     }

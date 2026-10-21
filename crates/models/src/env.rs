@@ -8,7 +8,7 @@
 //!
 //! **被动律**(charter A):环境必传参,kernels/解释器零探测 —— 本对象是
 //! 「引擎 = 事实来源」的载体;env 读取统一在 owl_shared::config loader,
-//! 本对象经 [`EnvProvider::from_dispatch`] 显式组装
+//! 本对象经 [`EnvProvider::from_config`] 显式组装
 //! (ops 工作流兼容面),组件内部禁止直读环境变量。
 //!
 //! **单一来源**:
@@ -287,6 +287,17 @@ pub struct DiagEnv {
     pub host_argmax: bool,
     /// 刀D 时间戳探针(OWL_TS_PROBE;层间 clock64 原地写 ts_buf)
     pub ts_probe: bool,
+    /// 解释器活性收尾归因打印(`[probes] live_diag`;原 OWL_LIVE_DIAG)
+    pub live_diag: bool,
+}
+
+/// 解释器内存治理(`[pool]`;原 `OWL_BLOCK_POOL` / `OWL_NO_RECLAIM` env)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InterpEnv {
+    /// 块池预算字节(0 = 关 = 逐节点 alloc/free)
+    pub block_pool_bytes: usize,
+    /// 关活性中途回收(诊断)
+    pub no_reclaim: bool,
 }
 
 /// GDN 分派旋钮
@@ -343,17 +354,34 @@ impl EvalPhase {
     }
 }
 
-/// **GGUF 块型臂的旋钮面**(models 侧消费;配置真源 = `[dispatch]`)
+/// **GGUF 块型臂的旋钮面**(models 侧消费;配置真源 = `[kernel]`/`[dispatch]`)
+///
+/// 纯数据、值语义;`Default` = 生产基线(五臂全开、行窗走预算档)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GgufEnv {
     /// 小 n 走 MMVQ 的张量字节上限(MiB;`0` = 关)
-    /// —— 语义见 `owl_shared::config::DispatchCfg::gguf_mmvq_l2_mib`
+    /// —— 语义见 `owl_shared::config::KernelCfg::gguf_mmvq_l2_mib`
     pub mmvq_l2_mib: usize,
+    pub tile: bool,
+    pub cublas: bool,
+    pub mmq2: bool,
+    pub mmq: bool,
+    pub smem: bool,
+    /// cuBLAS 臂行窗行数(None = 96 MiB 预算档)
+    pub cublas_tile: Option<usize>,
 }
 
 impl Default for GgufEnv {
     fn default() -> Self {
-        Self { mmvq_l2_mib: 4 }
+        Self {
+            mmvq_l2_mib: 4,
+            tile: true,
+            cublas: true,
+            mmq2: true,
+            mmq: true,
+            smem: true,
+            cublas_tile: None,
+        }
     }
 }
 
@@ -369,6 +397,8 @@ pub struct EnvProvider {
     pub kv: KvEnv,
     pub attn: AttnEnv,
     pub diag: DiagEnv,
+    /// 解释器内存治理(块池预算 / 回收开关)
+    pub interp: InterpEnv,
     /// 求值阶段(性能面定相;不影响计算语义)
     pub phase: EvalPhase,
     /// **boot 后冻结的选核环境快照**(引擎装配期填;None = 旧路/CPU)
@@ -395,11 +425,12 @@ impl EnvProvider {
         Self { hw: HwEnv::Cuda(arch), ..Self::default() }
     }
 
-    /// **入口侧组装器**:自全量配置 dispatch module 显式组装
+    /// **入口侧组装器**:自全量配置对象显式组装(唯一构造口)
     /// (owl_shared::config::OwlConfig;组件内部禁止直读环境变量)。
     /// 硬件档不在 config(引擎 boot 从 iface `op_env()` 合入)。
     /// 分派缺省:D1/D1-v2/qkv 融合生产默认开(2026-10-04 定谳)。
-    pub fn from_dispatch(d: &owl_shared::config::DispatchCfg) -> Self {
+    pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
+        let d = &cfg.kernel;
         Self {
             attn: AttnEnv {
                 qkv_fuse: d.qkv_fuse,
@@ -418,6 +449,12 @@ impl EnvProvider {
             },
             gguf: GgufEnv {
                 mmvq_l2_mib: d.gguf_mmvq_l2_mib,
+                tile: d.gguf_tile,
+                cublas: d.gguf_cublas,
+                mmq2: d.gguf_mmq2,
+                mmq: d.gguf_mmq,
+                smem: d.gguf_smem,
+                cublas_tile: d.gguf_cublas_tile,
             },
             gdn: GdnEnv {
                 chunked: d.gdn_chunked,
@@ -433,6 +470,11 @@ impl EnvProvider {
                 resolve_trace: d.resolve_trace,
                 host_argmax: d.host_argmax,
                 ts_probe: d.ts_probe,
+                live_diag: cfg.probes.live_diag,
+            },
+            interp: InterpEnv {
+                block_pool_bytes: cfg.pool.block_pool_bytes,
+                no_reclaim: cfg.pool.no_reclaim,
             },
             ..Self::default()
         }

@@ -296,7 +296,7 @@ pub fn allreduce(tp: &TpCtx, buf: &BytesView, plan: &ArPlan, out_kernels: &mut K
 |---|---|---|
 | AR 形态 | **v1 两段**(`ar_stage` 核 + `ar_reduce` 核;读对端槽)| 缺省 |
 | 写腿变体(push)| 写对端槽;**prefill +4.0%**(§37)| `runtime.tp_push = true` |
-| 融合核(1-stage)| ⚠️ **不可用**:L1 逐位门**间歇性失败**(§57.4)| `OWL_TP_1STAGE=1` |
+| 融合核(1-stage)| ⚠️ **不可用**:L1 逐位门**间歇性失败**(§57.4)| `runtime.tp_one_stage = true`(需 `tp_ordinals`,与 `tp_push` 互斥;2026-10-21 起取代 `OWL_TP_1STAGE`) |
 | 卡对 | 3090 Ti 对 = **ord 0/1**(`Static`,BAR1 32G)· 3080 对 = **ord 2/3**(`Window`,BAR1 256M)| flavor 的 `device_ordinal` |
 | 链路 | **PCIe Gen3 x16**(D2H 13.19 / H2D 13.07 / P2P 单向 12.7 GB/s = 理论 15.75 的 81%)| — |
 

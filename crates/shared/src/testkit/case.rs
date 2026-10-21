@@ -124,7 +124,7 @@ mod tests {
         let cfg = case_config("definitely_unset_case_xyz", "crates/shared/src/testkit/case.rs");
         assert_eq!(cfg, OwlConfig::default(), "未设 = 引擎缺省配置");
         // 臂 2:设环境档(extends 基准 + 覆盖)
-        let base = crate::profiles::legacy_path("spec-dflash").expect("历史档");
+        let base = crate::profiles::profile_path("spec-dflash").expect("预设档");
         let path = std::env::temp_dir().join(format!("owl_test_conf_{}.toml", std::process::id()));
         std::fs::write(
             &path,

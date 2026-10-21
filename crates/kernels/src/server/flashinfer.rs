@@ -44,10 +44,21 @@ struct PlanKey {
     page: usize,
 }
 
-/// 图档 plan 开关(与 C++ `owl_fi_cuda_graph` 同源:env `FI_CUDA_GRAPH`)。
-/// plan 期读一次(非热路径);两处必须一致,否则 PlanKey 与真数组错档。
+/// 图档 plan 开关(**与 C++ `owl_fi_cuda_graph` 同源**)。
+///
+/// 2026-10-21 收编:C++ 适配器只认 `getenv("FI_CUDA_GRAPH")`(上游 ABI 不动),
+/// 而本侧**不再自己读 env** —— 唯一写点 = 后端 [`set_plan_mode`]
+/// (C++ env 与本地原子同一次写入,两份口径不可能漂移)。
+/// plan 期读一次(非热路径)。
+static CUDA_GRAPH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 写图档 plan 开关(与 C++ env 同值一次落;boot 期调用)
+pub fn set_plan_mode(cuda_graph: bool) {
+    CUDA_GRAPH.store(cuda_graph, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn fi_cuda_graph() -> bool {
-    std::env::var_os("FI_CUDA_GRAPH").is_some_and(|v| !v.is_empty() && v != "0")
+    CUDA_GRAPH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// **plan 键归一化(纯函数;可单测)**:ctx 恒进键。
@@ -104,9 +115,18 @@ fn plan_restore() -> bool {
     PLAN_RESTORE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 诊断打印开关(与 C++ `owl_fi_debug` 同源:env `FI_DEBUG`)
+/// 诊断打印开关(**与 C++ `owl_fi_debug` 同源**)。
+/// 2026-10-21 收编:原 `FI_DEBUG` env;现由后端 boot 期 [`set_debug`] 一次下发,
+/// C++ 侧仍读 env(同一写点同步写)。
+static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 写 FI 诊断开关(plan 期打印;boot 期调用)
+pub fn set_debug(on: bool) {
+    DEBUG.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn fi_debug() -> bool {
-    std::env::var_os("FI_DEBUG").is_some_and(|v| !v.is_empty() && v != "0")
+    DEBUG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl FiRuntime {
@@ -698,9 +718,9 @@ impl FiRuntime {
         // (实测 T=8/ctx=3072:零值 43008/49152)。split 关时该数组不参与任何
         // 决策(plan 与 ctx 无关),所以这个单位错一直隐身。
         let nb_pages = ctx_total.div_ceil(geom.page.max(1)) as i32;
-        // ⚙ 诊断(OWL_FI_DEBUG=1):plan 重算时的**本轮** ctx_total(宿主标量槽
-        // 是否真按步送到 —— piecewise 断点面取证;缺省零输出)
-        if std::env::var_os("OWL_FI_DEBUG").is_some_and(|v| v != "0") {
+        // ⚙ 诊断(`[probes] fi_debug`;原 OWL_FI_DEBUG=1):plan 重算时的
+        // **本轮** ctx_total(宿主标量槽是否真按步送到 —— piecewise 断点面取证)
+        if fi_debug() {
             eprintln!(
                 "[fi-plan] ctx_total={} nb_pages={nb_pages} T={} page={}",
                 ctx_total, geom.total_rows, geom.page

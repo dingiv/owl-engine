@@ -488,7 +488,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 for (i, t) in taps.iter().enumerate() {
                     sc.output(format!("tap{i}"), t)?;
                 }
-                model.embed.lm_head_matmul(&hidden)
+                model.embed.lm_head_matmul(&hidden, &ctx.env.gguf)
             } else {
                 model.forward(&ids, &ctx)
             };
@@ -685,7 +685,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             ctx.attn_v2 = Some(scratch.clone());
             ctx.v2_bt8 = Some(&bt8);
             let hidden = model.last_hidden(&ids, &ctx);
-            let logits = model.embed.lm_head_matmul(&hidden);
+            let logits = model.embed.lm_head_matmul(&hidden, &ctx.env.gguf);
             sc.output("logits", &logits)?;
             let rows: Vec<TensorOps> = (0..batch)
                 .map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab))
@@ -964,7 +964,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                     (h.clone(), vec![h])
                 };
                 let _ = &taps;
-                let logits = model_v.embed.lm_head_matmul(&hidden);
+                let logits = model_v.embed.lm_head_matmul(&hidden, &ctx.env.gguf);
                 // A11(2026-10-14):per-row logits 出槽 —— 投机轮的
                 // **采样接受**需要各行目标分布(原先只出 argmax ⇒ spec 臂
                 // 完全不采样,请求温度/top_p/seed 失效 = 事实贪心;

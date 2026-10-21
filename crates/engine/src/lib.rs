@@ -92,14 +92,34 @@ pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use session::{AgentSession, SessionTable};
 pub use turn::{TurnEvent, TurnOpts, TurnSampler, TurnSpec};
 
-/// 主干量化方案映射(**唯一点**:配置枚举 → owl_models QuantPlan;
+/// 主干量化方案映射(**唯一点**:`(format, quant)` → owl_models `QuantPlan`;
 /// 同 [`head_plan_of`] 的范式 —— app 层不碰 owl_models,新方案 =
-/// 加枚举值 + 此处加臂 + 质量门台账)
-pub fn quant_plan_of(q: owl_shared::config::QuantScheme) -> owl_models::module::QuantPlan {
-    use owl_shared::config::QuantScheme::*;
-    match q {
-        W4a16 => owl_models::module::QuantPlan::W4A16Awq,
-        W4a8 => owl_models::module::QuantPlan::W4A8Awq,
+/// 加枚举值 + 此处加臂 + 质量门台账)。
+///
+/// 为什么同时要 `format`:同一个 `w4a16` 在 AWQ 档是 **pack-quantized 布局**
+/// (`W4A16Awq`),在普通 safetensors 档是**装载期重排**(`W4A16`)——
+/// 语义由"权重怎么摆"决定,量化只给比特数。GGUF 档则由块型直接给
+/// `Gguf(ty)`(实际逐张量型仍以文件为准)。
+pub fn quant_plan_of(
+    f: owl_shared::config::ModelFormat,
+    q: owl_shared::config::QuantScheme,
+) -> owl_models::module::QuantPlan {
+    use owl_shared::config::{ModelFormat as F, QuantScheme as Q};
+    match (f, q) {
+        (F::Gguf, Q::Q4k) => owl_models::module::QuantPlan::Gguf(owl_models::formats::gguf::GgmlTy::Q4K),
+        (F::Gguf, Q::Iq4) => owl_models::module::QuantPlan::Gguf(owl_models::formats::gguf::GgmlTy::Iq4Nl),
+        (F::Gguf, Q::Iq3) => owl_models::module::QuantPlan::Gguf(owl_models::formats::gguf::GgmlTy::Iq3Xxs),
+        // validate 已拦;这里回 F16 而不是 panic(防御:配置门漏了也不炸引擎)
+        (F::Gguf, _) => owl_models::module::QuantPlan::F16,
+        (F::Awq, Q::W4a16) => owl_models::module::QuantPlan::W4A16Awq,
+        (F::Awq, Q::W4a8) => owl_models::module::QuantPlan::W4A8Awq,
+        (F::Safetensors, Q::W4a16) => owl_models::module::QuantPlan::W4A16,
+        // 普通 safetensors 的 W4A8 尚无独立 plan(AWQ 布局是其唯一实现)
+        (F::Safetensors, Q::W4a8) => owl_models::module::QuantPlan::W4A8Awq,
+        // 未实现/错配(validate 已拒):保持 f16 直读,不 panic
+        (_, Q::W8a8i | Q::W8a8f | Q::W8a8 | Q::Q4k | Q::Iq4 | Q::Iq3) => {
+            owl_models::module::QuantPlan::F16
+        }
     }
 }
 

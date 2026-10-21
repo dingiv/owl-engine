@@ -115,7 +115,9 @@ fn batch_plan_shape_probe() {
 
     println!("mode,B,total_nb,nb_combo,padded,plan3,cta,split,int_bytes,shape_ok");
     for graph in [0u32, 1u32] {
-        std::env::set_var("FI_CUDA_GRAPH", if graph == 1 { "1" } else { "0" });
+        let mode = graph == 1;
+        std::env::set_var("FI_CUDA_GRAPH", if mode { "1" } else { "0" });
+        owl_kernels::server::flashinfer::set_plan_mode(mode);
         for (b, combos) in [(2usize, &combos_2), (4, &combos_4), (8, &combos_8)] {
             let mut baseline: Option<Sig> = None;
             for nb in combos {

@@ -115,7 +115,7 @@ fn gguf_shard_reads_equal_grouped_windows_all_keys() {
         let f = TensorFacts { ty: t.ty, rows: t.rows() as usize, inner: t.inner() as usize };
         let native = t.ty.native_dtype().is_some();
         // grouped 全量(行置换源侧已做;列 tiled → grouped 在这里补)
-        let (rows_f, inner_f, grouped) = if native {
+        let (_rows_f, inner_f, grouped) = if native {
             let v = full.take(key).expect("take").expect("原生键有值");
             (f.rows, f.inner, v)
         } else {

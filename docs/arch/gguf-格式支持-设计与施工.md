@@ -236,7 +236,7 @@ dir  = "/home/div/Documents/codes/models/mradermacher/Holo-3.1-9B-GGUF/Holo-3.1-
 max_seq = 32768
 ```
 
-`model.dir` 今天语义 = **目录**;GGUF 是**单文件** ⇒ 需在 `model` 模块加
+`model.path` 今天语义 = **目录**;GGUF 是**单文件** ⇒ 需在 `model` 模块加
 `ModelPath::{Dir, File}`(或 `kind` 决定解释法)。**词表与模板不再从 dir 找**。
 
 ---
@@ -663,7 +663,7 @@ Gemma 式)—— 这正是 owl `RmsNorm::new_add_one`(`×(1+w)`)的来处,而 HF
 
 | 件 | 内容 |
 |---|---|
-| `ModelKind::Gguf` | `model.kind = "gguf"`;`model.dir` = **`.gguf` 单文件**(不是目录) |
+| `ModelFormat::Gguf` | `model.format = "gguf"`;`model.path` = **`.gguf` 单文件**(不是目录) |
 | `ModelLoader::load_gguf` | ① `GgufSource::open`(容器 + spec 同源)② `GgufPlan` + `PlanSource::keyed(SourceFacts::GGUF)` + `Model::new`(**构造期取走未解析键,非空即拒**)③ `load_from_dir`(压缩块字节原样)④ 词表 `build_vocab`(文件自给;eos 吃文件给的 id)⑤ rope `rope_facts`(KV 三件套)⑥ 装载分相上屏 |
 | `ModelLoader::load_qwen35_hf` | **通用 Qwen3.5 HF 目录装载**(预设入参化;rope 三件套显式给)—— 为交叉源对拍而生,顺带让任意 Qwen3.5 HF 档能上引擎 |
 | `flavors/gguf4b.toml` | M1 靶位档(单卡 3090 Ti;`max_seq 32768` / `gdn_slots 1` / greedy;**刻意不设 `allowed_ops` 白名单** —— 生产硬化另刀) |
@@ -1576,7 +1576,7 @@ nvcc -DGGML_CUDA_USE_GRAPHS -DGGML_SCHED_MAX_COPIES=4 \
 
 ### 22.6 W-2g:GDN prefill 换 **chunked 臂**(2026-10-19)—— std avg 1504.7 → **1778.3(+18.2%)**
 
-**定性** = **配置漏配**,不是代码问题:`[dispatch] gdn_chunked` 缺省 `false`(走
+**定性** = **配置漏配**,不是代码问题:`[kernel] gdn_chunked` 缺省 `false`(走
 `varlen` **顺序扫描**),而 AWQ 生产档(`awq27b-262k/-kvmem`)早就开它;GGUF 档一直
 没开 ⇒ 每层 GDN 2.42 ms @T=1024 = prefill 的 18%。
 
@@ -2346,13 +2346,13 @@ q4_K **10.66 ms(≈903 GB/s,已贴墙)** / q8_0 **8.37 ms(≈855 GB/s,原 8.98/7
 
 **装载面**:
 
-- `[model].vision = true` + `[model].mmproj = "…/mmproj-*.gguf"`;
+- `[model].vision = true` + `[model].vision_path = "…/mmproj-*.gguf"`;
   缺省在同目录找**唯一** `mmproj*.gguf`(多个/没有 = 响亮拒并列出候选);
 - 视觉塔走 `MmprojSource`(host 解量化 + 同键缓存,`LoadOpts::plain`),文本主干
   仍是 `GgufSource` **零解量化**通道(REQ-GGUF-05 未被污染);
 - 塔权重每 rank 全量;文本主干与 `Model` 同一份 `Arc`(`Vlm::from_model`);
-- `[model].mmproj` 写在 HF/AWQ 档 = 响亮拒(视觉塔在检查点目录的
-  `model.visual.*`);`vision = false` 却写 `mmproj` 同样拒。
+- `[model].vision_path` 写在 HF/AWQ 档 = 响亮拒(视觉塔在检查点目录的
+  `model.visual.*`);`vision = false` 却写 `vision_path` 同样拒。
 
 **门**:
 

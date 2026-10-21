@@ -538,7 +538,7 @@ owl_shared::step_gate!("interp.node").await;
 
 ```bash
 # 启动参数(或配置 [probes] step_gate*)
-server -p profiles/legacy/spec-dflash.toml owl.toml --step-gate sticky --step-gate-ms 20 --step-gate-every 200
+server -p profiles/spec-dflash.toml owl.toml --step-gate sticky --step-gate-ms 20 --step-gate-every 200
 
 # 在线(HTTP;与 /debug/perf/level、/debug/log/level 同风格)
 curl /debug/step                          # 状态快照

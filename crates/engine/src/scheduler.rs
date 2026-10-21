@@ -96,6 +96,8 @@ pub(crate) struct RowSpec {
     /// 本步可见 KV 长(= pos + 1;批内各行独立)
     pub kv_len: usize,
     pub gdn_slot: usize,
+    /// 本步是否跨页(保洁需求面;生产路径不读,**测试**用于"页内不跨页"断言)
+    #[allow(dead_code)]
     pub grew: bool,
 }
 

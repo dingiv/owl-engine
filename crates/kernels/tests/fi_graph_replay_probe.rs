@@ -236,6 +236,7 @@ fn fi_graph_replay_m2a() {
     let dev: usize = owl_cuda::test_device_ordinal();
     // 本探针**自带图档 env**(独立二进制 ⇒ 无并行踩踏;与 C++ 侧同源同读法)
     std::env::set_var("FI_CUDA_GRAPH", "1");
+    owl_kernels::server::flashinfer::set_plan_mode(true);
     std::env::remove_var("FI_NO_MASK");
     println!("=== M2a:FI 图档 plan + 捕获/回放(FI_CUDA_GRAPH=1)===");
 

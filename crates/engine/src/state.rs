@@ -119,11 +119,12 @@ pub(crate) struct GdnLeaf {
     pub(crate) rec: TensorOps,
 }
 
-/// **每 token KV 字节**(纯函数;S4 ④ 提取 —— 池容量公式的被测点)。
+/// **每 token KV 字节**(纯函数;S4 ④ 提取 —— 池容量公式的**测试锚点**)。
 ///
 /// 口径(与 `StatePool::alloc` 同源):主池 = 每层每 token `2(K+V) × hkv × hd`
 /// × 元素宽(f16=2 / fp8=1);草稿池按 token 线性。**TP 分片自动生效**:
 /// `dims.hkv/hd` 来自 sharded spec ⇒ 每 rank 的 KV 体积按头数切分。
+#[cfg(test)] // 只被单测消费(池容量公式的锚点);生产路径另有 alloc 内联算式
 pub(crate) fn kv_per_tok_bytes(
     n_full: usize,
     dims: &ModelDims,
@@ -253,18 +254,6 @@ impl StatePool {
         }
     }
 
-    /// **刷 FI plan 表**(图窗外写者):`t` 行 × `ctx_total`。
-    ///
-    /// 门(档位 + 槽在场)仍由调用方判 —— 那是"图里有没有 FI 节点"的事实。
-    pub(crate) async fn sync_fi_plan<D: DeviceClient>(
-        &self,
-        face: &mut D,
-        t: usize,
-        ctx_total: usize,
-    ) -> Result<()> {
-        face.fi_plan_sync(self.fi_plan_spec(t, ctx_total)).await
-    }
-
     /// FI 表四件写入(见 [`KvBank::write_fi_tables`])。
     pub(crate) async fn write_fi_tables<D: DeviceClient>(
         &self,
@@ -280,9 +269,8 @@ impl StatePool {
         face: &mut D,
         t_real: usize,
         nt: usize,
-        stream: GdnTableStream,
     ) -> Result<Option<GdnTableSlotOwned>> {
-        self.kv.write_gdn_tables(face, t_real, nt, stream).await
+        self.kv.write_gdn_tables(face, t_real, nt).await
     }
 
     /// XQA prefill 表三件(见 [`KvBank::prefill_xqa`])。
@@ -439,13 +427,12 @@ impl KvBank {
     /// 返回 `(表叶子, nt)`;无 GDN 层 = `None`。
     /// `t_real` = 本块**真行数**(表的 `cu`/内容口径);`nt` = 布局口径的 chunk 数
     /// (eager = `ceil(t_real/BT)`;桶路 = `ceil(t_pad/BT)` —— 图内烘的是它)。
-    /// `stream` = 写入流(eager 默认;桶路必须 COMPUTE,与紧随的图发射同流)。
+    /// 写入流恒为默认流(桶路已退役 ⇒ 单一路径;原 `GdnTableStream` 参数删除)。
     pub(crate) async fn write_gdn_tables<D: DeviceClient>(
         &self,
         face: &mut D,
         t_real: usize,
         nt: usize,
-        stream: GdnTableStream,
     ) -> Result<Option<GdnTableSlotOwned>> {
         let Some(gt) = self.gdn_tables.as_ref() else {
             return Ok(None);
@@ -462,18 +449,7 @@ impl KvBank {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
             .collect();
-        match stream {
-            GdnTableStream::Default => face.write_block_f32(&gt.table, 0, &f32bits).await?,
-            GdnTableStream::Compute => {
-                face.write_block_f32_on(
-                    owl_iface::contract::UpStream::Compute,
-                    &gt.table,
-                    0,
-                    &f32bits,
-                )
-                .await?
-            }
-        }
+        face.write_block_f32(&gt.table, 0, &f32bits).await?;
         Ok(Some(GdnTableSlotOwned {
             leaf: TensorOps::of_block(
                 gt.table.id,
@@ -536,15 +512,6 @@ pub(crate) struct FiTableLeaves {
     pub indices: TensorOps,
     pub indptr: TensorOps,
     pub last_len: TensorOps,
-}
-
-/// GDN 序列表的写入流(桶路必须 COMPUTE:与紧随的图发射同流)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GdnTableStream {
-    /// 默认流(eager 路)
-    Default,
-    /// COMPUTE 流(桶图前刷表)
-    Compute,
 }
 
 /// GDN 序列表槽:叶子 + 本 chunk 的 chunk 数(`nt = ceil(t / BT)`)。
@@ -1157,16 +1124,6 @@ impl StatePool {
                 )
             })
             .collect()
-    }
-
-    /// GDN 序列表持久槽(P-6b;None = 无 GDN 层)
-    pub(crate) fn gdn_table_blocks(&self) -> Option<&GdnTableBlocks> {
-        self.kv.gdn_tables.as_ref()
-    }
-
-    /// FI 表件持久槽(P-3;None = 非 FI 档)
-    pub(crate) fn fi_table_blocks(&self) -> Option<&FiTableBlocks> {
-        self.kv.fi_tables.as_ref()
     }
 
     /// FlashInfer K/V 叶子(统一契约 P3:影子池删除,直读主池 kNHD;

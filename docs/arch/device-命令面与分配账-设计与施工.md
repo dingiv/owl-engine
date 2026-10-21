@@ -806,3 +806,221 @@ N7 装载/拆卸期)。⇒ 日志已改成**如实报数**(`drained` 恒 0 也�
 | 2026-10-19 | v0.3 | **步 2 完成**:store 侧 `impl AllocLedger`(`LedgerHandle`:出借登记 + 双持/幽灵拒 + 换层不注销)+ `TierLedger::move_owned` + `Owner` 复用 iface(单一真源)+ `Rel.ledger → Rc<RefCell<..>>`;三门全绿;澄清"事件账 vs 腿自报"互为校验 |
 | 2026-10-19 | v0.2 | **步 1 完成**:`iface/handle.rs` 落地(Owner/AssetClass/三事件/AllocLedger/Command+链式/Outcome/BatchOutcome/DeviceHandle + `alloc!`·`free!` 宏);`contract.rs` 仅把裸 client 的 `alloc!` 改名 `client_alloc!`;行为门 7 条全绿(真实 CpuFace 作内层);三条教训入档(宏归位 / `Outcome::Buf` / dev-dep 成环双实例) |
 | 2026-10-19 | v0.1 | 立项:三事同层(收编分配 / 账本接口 / 命令批发送);方案甲(`Rc<RefCell<dyn AllocLedger>>`)+ iface 薄包装(cuda 零改动);`Command` 链式构造 + `exec/batch` + `alloc!/free!` 宏;5 步施工序与判据 |
+
+---
+
+# §十三 步 6:SDK ↔ server 命令面收口(2026-10-21)
+
+> **裁决(用户)**:"它把每一个功能都作为一个函数给它展开了 —— 现在不这么搞。
+> 抽象一个 `Command` 结构体,它才真正表达要做什么;trait 改成
+> `exec(cmd)` / `exec_batch(cmds)`。" 范围 = **GpuClient(SDK)与 GpuServer 之间那一段**;
+> `DeviceHandle` 的上层形态**不动**(它的 `exec/batch` 命令面照旧)。
+> 覆盖面:**核心集先做**(alloc/free/launch/htod/dtoh/sync/graph)。
+
+## 13.1 问题(旧形态的三条结构病)
+
+1. **双词汇**:调用点用 35 个方法名,线与后端用 `cuda::Command` 枚举 —— 两套规范、
+   两处维护;新能力 = 新方法 + 新变体 + 新臂(三处)。
+2. **后端逐条实现**:每个后端把同一件事写一遍(GPU 走信封、CPU 走 Vec),
+   语义漂移只能靠门事后抓(历史上的 `alloc_uninit` 缺省=`alloc`、
+   `htod_on` 缺省退化 H2D 都是这类)。
+3. **批不可达**:`DeviceHandle::batch` 只能逐条 `await` —— 后端**看不见批**,
+   "省掉线程间同步"结构上做不到(FIXME 原文)。
+
+## 13.2 落地(7 个文件)
+
+| 件 | 内容 |
+|---|---|
+| `iface/src/command.rs`(**新**) | `Command`(核心 12 变体:Alloc/Free/Htod/Dtoh/Launch/Sync/Graph×5)·`Outcome`(Done/Buf/Bytes/Graph + **强类型访问器**,读错变体=响亮错)·`BatchOutcome`(逐条结果 + `first_err` + `segments`) |
+| `iface/src/contract.rs` | `DeviceClient` **必选面只剩 `exec` / `exec_batch`**;~35 个具名方法**全部降级为缺省糖**(内部构造 `Command` 调 `exec`)⇒ 调用点零改动、单一真源;`htod` 的 dtype/字节交叉校验收进糖的咽喉 |
+| `iface/src/handle.rs` | `DeviceHandle` 补两条 `exec/exec_batch`:非分配类**直通**;**Alloc/Free/Htod 响亮拒**(记账不可绕过 —— 引擎侧一律走具名方法,钩子在那里) |
+| `cuda/src/command.rs` | `Ack` 增 `Sink` 形态 + `adapt()`(子回执 `Result<Bytes/()/GraphId>` → 统一 `Result<Outcome>`);新增信封 `Command::Batch`;`envelope_of(cmd, ack)` = **命令→信封单一真源**(客户端 `exec` 与 server 批的逐条派发共用) |
+| `cuda/src/gpu_client.rs` | 删 13 条命令方法(alloc/alloc_uninit/htod/htod_on/dtoh/dtoh_at/launch/sync/free/graph×5),只留 `exec`/`exec_batch` + 能力面 + 非核心命令(swap/peer/复合口/池账…);launch 的"必须有 Block 实参"前置校验收进 `exec` |
+| `cuda/src/server/{mod,trace_map,capture_gate}.rs` | `handle_batch` + `BatchJoin`:**一条信箱消息装整批**,actor 线程逐条派发(捕获期每条独立过白名单),**全部子回执落定后一次回执**;`kind/created_at/发射账/CLOSING 负门`同步补 `Batch` |
+| `cpu/src/face.rs` | `exec` 目录(调既有覆写,零语义改动)+ `exec_batch` 逐条即序(`segments` 如实报 N) |
+
+### 语义(钉住)
+
+| 面 | 语义 |
+|---|---|
+| 顺序 | 批内 **FIFO**,与逐条发包**完全同序**(同一 actor 线程) |
+| 回执 | `exec` = 子语义原样(launch/alloc 提交即回;htod/dtoh/sync 真完成);`exec_batch` = **join**(异步子命令的完成也计入) |
+| 失败 | 逐条如实回;`first_err` = 最小失败下标;**已投递的不回滚** |
+| 段数 | GPU 原生批 `segments == 1`;CPU/mock 逐条 = N(不冒功) |
+| 事实面 | `dtype` 由命令携带(服务端只回 id + U8/rank0 占位,`envelope_of` 定形);`htod` 的 `len/rank` 同源 |
+
+## 13.3 实测门(全绿)
+
+| 门 | 判据 |
+|---|---|
+| `owl-cpu/tests/command_face.rs`(**新,8 条**) | 糖→命令逐字段(alloc zero 位 / htod 三流 / dtoh 偏移+回填 / launch,sync,free,graph_end / 变体不符响亮 / 批序 / dtype-字节校验 / handle 命令面记账拒) |
+| `owl-cuda/tests/command_face_gate.rs`(**新,2 条,真卡**) | 单条 alloc/htod/dtoh 端到端;**原生批 `segments==1`** + 结果对位;批内失败 `first_err=Some(0)` 且后继照跑;`DeviceHandle` 糖落到同一咽喉 |
+| `owl-iface` 11 · `owl-cpu` 20 · `owl-cuda::gpu_server` 2 | 既有面零回归 |
+| `cargo check --workspace --all-targets` | 干净(无新增警告) |
+
+## 13.4 坑与纪律(入档)
+
+1. **回执变换的方向**:要的是 `Ack<T>::adapt::<U>(f: U→T)`,不是 `map(T→U)` ——
+   信封适配是"子命令的窄类型 → 外壳的统一 `Outcome`"。
+2. **服务端回的是占位句柄**(U8/rank0):`dtype/len/rank` 必须由**命令侧**定形,
+   否则 `alloc` 的 `dtype` 会静默变 U8(本门当场抓到)。
+3. **同名 `exec` 的解析**:`DeviceHandle` 的固有 `exec(handle::Command)` 优先于
+   trait 的 `exec(command::Command)`。故 handle 的两条 trait 方法只做直通/硬拒,
+   引擎一律走具名方法 —— 这条边界**写进代码注释**,不是默契。
+4. **批的原生性判据 = `segments`**,不是"调用了一次 batch"。
+
+## 13.5 遗留(下一步)
+
+1. **词汇表扩面**:swap / peer / 复合口(upload_and_launch / launch_and_harvest)/
+   池账 / ledger dump 仍走具名方法 → 按同一张表补变体(每补一条 = 变体 + 一臂);
+2. **`handle::Command` 与 `command::Command` 合并**(当前两型:前者带 `AssetClass`
+   记账位,后者是线单位)—— 合并后 `DeviceHandle::exec` 可直接挂钩子;
+3. **批的原生合并**:服务端已看见 `Vec<Command>`,可做"N 段 htod 合成一次 DMA"/
+   "同核连续发射合并",收益按 `srv.seg.*` 与宿主税实测定档。
+
+## 13.6 同日追加:累积批 `queue` / `flush`(转写具名调用的桥)
+
+`exec_batch(Vec)` 要求调用点**先把命令攒成一个 Vec**;而解释器那种"逐节点发射"
+的数据流里没有这个 Vec(命令夹在递归深处)。故补一对**累积式**接口:
+
+```rust
+fn queue(&mut self, cmd: Command) -> Result<usize, ModelError>;  // 入队,不碰信箱;返回批内下标
+fn flush(&mut self)                   // 一次提交 + 一次等待(空批 = 零往返)
+```
+
+| 纪律 | 内容 |
+|---|---|
+| 排队零成本 | `queue` 只 append 到句柄的 `pending`(GPU 面不产生信箱消息) |
+| 结果定位 | `queue` 返回下标 ⇒ 结果在 `flush().outcomes[i]`(需要结果的命令不许"用完就丢") |
+| 队列非空时 `exec`/`exec_batch` | **响亮拒**(“还有 N 条未提交”)—— 不隐式多一次往返、不隐式重排 |
+| 句柄边界 | 队列**属于句柄**,不随 `face_clone`/`loader_faces` 复制(克隆从空队列开始) |
+| `DeviceHandle::queue` | 分配/归还/装载命令**拒**(记账不可绕过);控制/发射类直通 |
+| 空 `flush` | `BatchOutcome::empty()`(segments 0),不发空批发包 |
+
+### 宿主侧盘点(非测试代码,`grep` 实测;可批性判据 = 结果依赖 + 顺序承诺)
+
+| 命令族 | 站点 | 热点 | 结果依赖 | 判 |
+|---|---:|---|---|---|
+| `launch` | 7 | `interpreters/eval.rs` 逐节点(一次求值 ≈ 节点数,27B ≈ 960 条) | 7 处**全部丢弃返回值** | ★★★ 首选 |
+| `free` | 46 | eval `release_block` 单块(池内命中=零命令);`flush_pool` 已批量 | 无 | ★★ |
+| `dtoh` / `dtoh_at` | 50 / 1 | draft 探针循环、state 指纹、graph_plan 读槽、prefill 两处 | 返回数据 | ★★(`dtoh_batch` 已有,仅 4 处用) |
+| `memset_zero(_at)` | 3 | `state.rs::reset_gdn` 逐层×4 块循环;eval 池命中清零 | 无 | ★★★ |
+| `copy_block_at` / `copy_batch` | 3 / 4 | GDN 快照 | 无 | 已完成(4 处已批) |
+| `swap` | 7 | store 搬运(N 片一条命令) | 连接器回执 | 已完成 |
+| `htod`/`upload_pinned` | 4 / 7 | 权重装载逐张量 | 返回 id(被后续 launch 引用) | ★ 需分阶段 |
+| `alloc`/`alloc_uninit` | 15 | eval 池 miss;捕获期切片 | **返回 id,立刻被 launch 引用** | ★ 结构依赖 |
+
+### 实测往返账(真机 3080 `01:00.0`,256 条 `owl_add_f32` 小网格)
+
+| 姿势 | µs/条 | 整批 |
+|---|---:|---:|
+| 逐条 `exec(...).await` | **32.8** | 8394 µs |
+| `queue×256` + 一次 `flush` | **13.2**(−60%) | 3383 µs |
+
+⇒ 往返税 ≈ 19.6 µs/条(信箱投递 + waker 唤醒 + 客户端 poll)。剩余 13.2 µs/条
+= **server 侧 issue 成本**(核查找/参数打包/`cuLaunchKernel`),是**下一层**的账。
+
+### 转换计划(逐步,每一刀独立可回滚)
+
+1. `eval.rs` 的 7 处 `launch` → `queue`(作用域收尾 `flush`);
+2. `state.rs::reset_gdn` 的 memset 循环 → `queue`;
+3. draft/state 的 `dtoh` 循环 → `dtoh_batch` 语义(已有口);
+4. `alloc`/`htod` 两阶段化(先整批拿 id、再整批发射)—— 需要数据流改造,最后做。
+
+**门**:`owl-cpu/tests/command_face.rs` 11 条(含 queue/flush/空批/handle 拒)·
+`owl-cuda/tests/command_face_gate.rs` 4 条(含 **queued 两连发顺序 = o2=2a+b** 与往返账)·
+iface 11 · gpu_server 2 · workspace check 干净。
+
+## 13.7 第一刀:解释器逐节点发射转 `queue`(2026-10-21)
+
+### 改了什么(`crates/models/src/interpreters/eval.rs`)
+
+| 件 | 内容 |
+|---|---|
+| `EvalCtx::emit_launch` / `emit_launch_pooled` | 发射的**唯一入口**:有块池 ⇒ `queue`(攒批);无池 ⇒ 单条 `launch`(批长恒 1) |
+| 7 处 `launch` 站点 | 全部改走 `emit_launch`;**返回值本就全部丢弃**(输出块 = 实参末位 Block,客户端侧已定) |
+| `flush_batch()` | 累积批的提交口(空批零往返);错误**原样上抛**(不包 `Msg` ⇒ 保住 `is_fatal`) |
+| 命令面纪律落点 | 在**任何单条命令之前**先 flush:`alloc_out`(池未命中 / 池命中带 Zeros)、`release_block`(非池路径)、`flush_pool`、`htod`、tap 的 `dtoh` |
+| 收尾/错误路径 | 三个入口(`eval_ops_env` / `eval_ops_multi_env` / `eval_multi_scoped_inner`)都在返回前 flush;错误路径也 flush(否则句柄被"还有 N 条未提交"毒住) |
+
+**为什么按"有没有块池"分档**(不是随手开关,是实测判据):
+池开时逐节点 `alloc` 命中池 = **零命令** ⇒ 一连串发射能真的攒成批;
+池关时每个节点前面必有一次真 `alloc`(单条命令,必须保序)⇒ 批长退回 1,
+硬攒只是**多一次信封开销**(实测 +7%)。
+
+### A/B(真卡 3080 `01:00.0`;200 节点 `add` 链,N=256;三次取最好)
+
+| 块池预算 | 逐条 await(旧) | queue+flush(新) | Δ |
+|---|---:|---:|---:|
+| 64 MiB | 48.03 µs/节点 | **27.37 µs/节点** | **−43%** |
+| 0(缺省) | 96.87 µs/节点 | 96.87 µs/节点 | 0(设计如此) |
+
+旁证:**块池本身**就是最大的一刀(96.9 → 48.0 µs/节点,旧代码下已成立)——
+它把"每节点 alloc+free+launch 三次往返"压成"一次发射"。
+块池预算同一时刻已被 main 收编为配置键 `[pool] block_pool_bytes`(原 `OWL_BLOCK_POOL`
+env 退场),**缺省 0 = 关** ⇒ 本分支的分档判据自动跟随配置,零代码改动。
+真机 A/B(27B)结果见 §13.8 —— **结论是否定的:不改缺省,池保持关**。
+
+### 门
+
+`crates/models/tests/eval_batch_gate.rs`(真卡 2 条):解释器批处理**数值不变**(含非 256 对齐尾块)
++ **"没有任何发射绕过 queue"**的回归哨(绕过 ⇒ 命令面"未提交"拒 ⇒ 红)·
+`eval_batch_bench.rs`(诊断,A/B 夹具;无 `OWL_TEST_DEVICE` 即 skip;预算走 `OWL_BENCH_POOL_BYTES` 测试面注入)·
+`owl-models` 282 · `owl-engine` 115 · CPU/GPU 命令面门全绿。
+
+## 13.8 真机 A/B(27B):**宿主往返不在关键路径** ⇒ 池保持关(否定结论)
+
+### 配置
+
+- 两档均用现役生产档,`--set` 注入 `[pool] block_pool_bytes`,其余全同;
+- 3080 对档:`profiles/qwen38_27b-3080_tp2-w4a16.toml`(需 `--set spec.depth=0`;
+  该档写 `depth=7` 但未开 `tp_draft`,属档面缺陷,见 §13.9);
+- 3090 单卡档:`profiles/qwen38_27b-3090-w4a16-dflash.toml`(DFlash2 d7 真开)。
+
+### 结果(llm_speedtest 同口径;prefill 为 2048/512 prompt,decode 取 256 输出)
+
+| 场景 | 池 0(缺省) | 池 64 MiB | 池 256 MiB |
+|---|---:|---:|---:|
+| 3080 对 prefill@2048 | **1570.6 t/s** | 1548.8(−1.4%) | 1536.3(−2.2%) |
+| 3080 对 decode | 45.41 t/s | 45.55(+0.3%) | 45.30(−0.2%) |
+| 3090 DFlash2 prefill@512 | 1480.1 t/s | 1477.8(−0.2%) | — |
+| 3090 DFlash2 decode(第 2 轮) | 123.43 t/s | 125.80(+1.9%) | — |
+| 显存峰值(3080 对 / 3090) | 14619 / 21147 MiB | 14619 / 21147 MiB | 14604 / — |
+
+### 为什么没有收益(定谳)
+
+`srv.seg.*`(释放版 server 侧计时,2048 prompt 一趟 = 4096 次发射):
+
+| 段 | 总量 | 每次 |
+|---|---:|---:|
+| `srv.seg.fam`(家族/foreign 核执行) | 503.3 ms | **123 µs** |
+| `srv.seg.issue`(native 参数打包+发射) | 232.1 ms | 57 µs |
+| `srv.seg.alloc` | 38.7 ms | 9 µs |
+| **合计 server 侧宿主工作** | **~784 ms** | — |
+| 整趟 prefill 墙钟 | — | **1307 ms** |
+
+- **客户端往返(32.8 µs/条)被 GPU 异步队列完全吸收**:一次 chunk = 960 条发射 ×
+  33 µs ≈ 32 ms,而该 chunk 的 GPU 时间 ≈ 325 ms(4 chunk / 1.3 s)⇒ 宿主发得完,
+  GPU 跑不完 —— **墙钟 = GPU 时间**,砍往返不改变 GPU 时间;
+- server 自己的宿主角本身也只占 60%(784/1307),且它是异步喂 GPU,**不是瓶颈**;
+- 合成 A/B(§13.7,200 节点 × 64 元素小核)之所以 −43%,是因为那里**GPU 几乎为零**
+  (纯往返计时),不代表生产形状。
+
+⇒ **判据**:块池与累积批**只在"GPU 每核 < 宿主每命令"的形状上有价值**(小核/小 chunk/
+eager 解码)。27B 的 prefill(每节点数百 µs GPU)与图回放 decode 都不属于这类 ⇒
+**缺省保持 `block_pool_bytes = 0`**;代码保持中性(池关 ⇒ `emit_launch` 走单条)。
+
+### 真正的下一刀(据本账)
+
+1. server 侧 `srv.seg.fam` **123 µs/发射**(4096 次/趟 ⇒ 503 ms):注册表 execute 的
+   参数打包/校验/分派是**最大一块宿主成本**,且它在 actor 线程上串行;
+2. `srv.seg.issue` 57 µs/次(同上);
+3. 其后才是 GPU 核本身。
+（宿主往返不在其中 —— 已被本 A/B 排除。）
+
+## 13.9 顺带发现的两处档面缺陷(未在本刀修)
+
+1. `[pool] vram_budget_mb = 0` 被当成 **0 字节硬预算** ⇒ 生产档 boot 直接死在
+   `embed_tokens`(已修:`state.rs` 归一到 `None`,与档注释"留空 = 只按驱动账判"一致);
+2. `qwen38_27b-3080_tp2-w4a16.toml` 写 `[spec] depth = 7` 但未开 `tp_draft`
+   ⇒ TP 档启动被拒(需 `--set spec.depth=0`,或按 P2.1 显式 `tp_draft = true`)。

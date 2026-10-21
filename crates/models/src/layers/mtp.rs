@@ -201,7 +201,7 @@ impl MtpPredictor {
             ctx.attn_v2 = attn_v2.clone();
             let emb = embed.embed(&tok, 1);
             let out = self.forward_step(&emb, &h, &ctx);
-            let logits = embed.lm_head_matmul(&out);
+            let logits = embed.lm_head_matmul(&out, &ctx.env.gguf);
             let d = crate::ops::argmax_f32idx(&logits, vocab, 0);
             drafts.push(d.clone());
             tok = d;
@@ -259,7 +259,7 @@ impl MtpPredictor {
         let x = self.norm(&x, &ctx);
         // 末行窄切(slice_view 连续视图,零拷贝)= 链种子;argmax = d1
         let mut h = x.slice_view((m1 - 1) * self.hidden, vec![1, self.hidden]);
-        let logits = embed.lm_head_matmul(&h);
+        let logits = embed.lm_head_matmul(&h, &ctx.env.gguf);
         let mut tok = crate::ops::argmax_f32idx(&logits, vocab, 0);
         let mut drafts = vec![tok.clone()];
         // 链步(decode 形;自反馈同 propose)
@@ -269,7 +269,7 @@ impl MtpPredictor {
             c.attn_v2 = attn_v2.clone(); // 链步读核同 propose(布局守卫点)
             let emb = embed.embed(&tok, 1);
             let out = self.forward_step(&emb, &h, &c);
-            let lg = embed.lm_head_matmul(&out);
+            let lg = embed.lm_head_matmul(&out, &c.env.gguf);
             tok = crate::ops::argmax_f32idx(&lg, vocab, 0);
             drafts.push(tok.clone());
             h = out;
@@ -567,7 +567,7 @@ mod wiring_tests {
             let ctx = ForwardCtx::decode(1, &pos_t[i], &kvs[i], &rope);
             let emb = embed.embed(&tok, 1);
             let out = mtp.forward_step(&emb, &h, &ctx);
-            let logits = embed.lm_head_matmul(&out);
+            let logits = embed.lm_head_matmul(&out, &ctx.env.gguf);
             let d = crate::ops::argmax_f32idx(&logits, vocab, 0);
             want.push(harvest_drafts(&mut gpu, &d).await.remove(0));
             tok = d;

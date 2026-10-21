@@ -127,8 +127,8 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     let mut warnings: Vec<String> = Vec::new();
     let mut b = Builder::default();
     b.set(
-        "model.kind",
-        Value::String(kind_name(model.kind).into()),
+        "model.format",
+        Value::String(format_name(model.format).into()),
         "intent.model → 模型注册表",
     );
     b.set(
@@ -194,7 +194,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         ));
     }
     b.set("pool.gdn_slots", (c as i64).into(), "intent.concurrency → GDN 状态格");
-    b.set("server.max_concurrency", (c as i64).into(), "intent.concurrency → 并发闸门");
+    b.set("runtime.max_concurrency", (c as i64).into(), "intent.concurrency → 并发闸门");
     b.set("runtime.max_batch", (max_batch as i64).into(), "intent.concurrency → 合批上限(≤8)");
 
     match intent.spec {
@@ -219,10 +219,10 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
 
     match intent.kv {
         KvIntent::Fp8 => {
-            b.set("dispatch.kv_fp8", true.into(), "intent.kv = fp8(容量 ×2;FI 读核前提)");
+            b.set("kernel.kv_fp8", true.into(), "intent.kv = fp8(容量 ×2;FI 读核前提)");
         }
         KvIntent::F16 => {
-            b.set("dispatch.kv_fp8", false.into(), "intent.kv = f16");
+            b.set("kernel.kv_fp8", false.into(), "intent.kv = f16");
         }
     }
 
@@ -259,11 +259,12 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     // 图臂(自动降级必须打印原因)
     match intent.graphs {
         GraphIntent::Off => {
-            b.set("graph.no_graph", true.into(), "intent.graphs = off(eager 直发)");
-            b.set("dispatch.fi_cuda_graph", false.into(), "intent.graphs = off");
-            b.set("dispatch.fi_plan_restore", true.into(), "intent.graphs = off");
-            b.set("dispatch.decode_arm", "v2".into(), "intent.graphs = off");
-            b.set("dispatch.verify_arm", "v2".into(), "intent.graphs = off");
+            b.set("cuda.graph", false.into(), "intent.graphs = off(eager 直发)");
+            b.set("cuda.graph", false.into(), "intent.graphs = off(eager 直发)");
+            b.set("kernel.fi_cuda_graph", false.into(), "intent.graphs = off");
+            b.set("kernel.fi_plan_restore", true.into(), "intent.graphs = off");
+            b.set("kernel.decode_arm", "v2".into(), "intent.graphs = off");
+            b.set("kernel.verify_arm", "v2".into(), "intent.graphs = off");
             false
         }
         GraphIntent::Auto => {
@@ -281,26 +282,27 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                     warnings.push(format!(
                         "graphs=auto 已降级为 eager/piecewise:{reason}(仍保留 decode 普通图)"
                     ));
-                    b.set("graph.no_graph", false.into(), "graphs=auto(降级:保留普通 decode 图)");
-                    b.set("dispatch.fi_cuda_graph", false.into(), "graphs=auto 降级");
-                    b.set("dispatch.fi_plan_restore", true.into(), "graphs=auto 降级");
-                    b.set("dispatch.decode_arm", "v2".into(), "graphs=auto 降级");
-                    b.set("dispatch.verify_arm", "v2".into(), "graphs=auto 降级:verify 回 v2");
+                    b.set("cuda.graph", true.into(), "graphs=auto(降级:保留普通 decode 图)");
+                    b.set("cuda.graph", true.into(), "graphs=auto(降级:保留普通 decode 图)");
+                    b.set("kernel.fi_cuda_graph", false.into(), "graphs=auto 降级");
+                    b.set("kernel.fi_plan_restore", true.into(), "graphs=auto 降级");
+                    b.set("kernel.decode_arm", "v2".into(), "graphs=auto 降级");
+                    b.set("kernel.verify_arm", "v2".into(), "graphs=auto 降级:verify 回 v2");
                     false
                 }
                 None => {
-                    b.set("graph.no_graph", false.into(), "graphs=auto");
+                    b.set("cuda.graph", true.into(), "graphs=auto");
+                    b.set("cuda.graph", true.into(), "graphs=auto");
                     // **单键臂**(2026-10-21):"v2" = 分页 v2 主核;prefill 桶已退役
-                    // ⇒ 这里只给两臂的意图缺省(用户档可逐个覆盖)。
-                    b.set("dispatch.decode_arm", "fi".into(), "graphs=auto:decode FI 单图");
+                    b.set("kernel.decode_arm", "fi".into(), "graphs=auto:decode FI 单图");
                     if intent.spec == SpecIntent::Dflash {
-                        b.set("dispatch.verify_arm", "fi".into(), "graphs=auto:verify 走 FI(有投机时)");
+                        b.set("kernel.verify_arm", "fi".into(), "graphs=auto:verify 走 FI(有投机时)");
                     } else {
-                        b.set("dispatch.verify_arm", "v2".into(), "graphs=auto:无投机 ⇒ verify 臂不影响,留 v2");
+                        b.set("kernel.verify_arm", "v2".into(), "graphs=auto:无投机 ⇒ verify 臂不影响,留 v2");
                     }
-                    b.set("dispatch.fi_cuda_graph", true.into(), "graphs=auto:图档瓦(plan 形状恒定)");
-                    b.set("dispatch.fi_plan_bake", 0i64.into(), "graphs=auto:0 = 取 max_seq 上界");
-                    b.set("dispatch.fi_plan_restore", false.into(), "graphs=auto:表由窗外 fi_plan_sync 刷");
+                    b.set("kernel.fi_cuda_graph", true.into(), "graphs=auto:图档瓦(plan 形状恒定)");
+                    b.set("kernel.fi_plan_bake", true.into(), "graphs=auto:烘 plan 进图(上界 = max_seq)");
+                    b.set("kernel.fi_plan_restore", false.into(), "graphs=auto:表由窗外 fi_plan_sync 刷");
                     true
                 }
             }
@@ -356,7 +358,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     overcommit = get_bool(&out, "kvmem.pool_overcommit").unwrap_or(overcommit);
 
     // ── ⑥ context 求解(显式 max_seq/pool_tokens 优先) ──
-    let mut estimate = None;
+    let estimate;
     let (act, act_note) = memory::activation_for(
         get_usize(&out, "runtime.prefill_chunk").unwrap_or(512),
         get_usize(&out, "runtime.prefill_tail_merge").unwrap_or(0),
@@ -367,7 +369,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         reserve_bytes: (get_usize(&out, "pool.vram_reserve_mb").unwrap_or(1024) as u64) << 20,
         model,
         spec_dflash: intent.spec == SpecIntent::Dflash,
-        kv_fp8: get_bool(&out, "dispatch.kv_fp8").unwrap_or(false),
+        kv_fp8: get_bool(&out, "kernel.kv_fp8").unwrap_or(false),
         gdn_slots: get_usize(&out, "pool.gdn_slots").unwrap_or(8),
         snap_max: get_usize(&out, "pool.snap_max").unwrap_or(4),
         sessions: c,
@@ -378,7 +380,8 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         stability_margin_bytes: STABILITY_MARGIN_BYTES,
     };
     let explicit_ctx = origins.contains_key("runtime.max_seq");
-    let explicit_pool = origins.contains_key("pool.pool_tokens");
+    let explicit_pool = origins.contains_key("pool.pool_tokens")
+        && get_usize(&out, "pool.pool_tokens").is_some_and(|n| n > 0);
     let want_max = matches!(intent.context, ContextSpec::Max) && !explicit_ctx;
     // TP 的 weights/KV/GDN 按卡摊(27B TP2 权重是实测;视觉塔每 rank 全量)
     let (ctx, mut pool) = if want_max {
@@ -524,17 +527,28 @@ fn apply_site(value: &mut Value, origins: &mut Origins) -> Result<(), String> {
         .ok_or_else(|| format!("[site] 必须是表,得到 {}", super::toml_type_name(&site_v)))?;
     for (k, v) in site {
         let path = match k.as_str() {
-            "model_dir" => "model.dir",
-            "draft_dir" => "model.dflash2_dir",
-            "bind" => "runtime.bind",
-            "device" => "runtime.device",
+            "model_dir" => "model.path",
+            "draft_dir" => "spec.draft_path",
+            "bind" => "server.bind",
+            // 卡位单串 → `[parallel] device = [..]`(site 层只给一项)
+            "device" => "parallel.device",
             other => {
                 return Err(format!(
                     "[site].{other} 未登记(可用:model_dir | draft_dir | bind | device)"
                 ))
             }
         };
-        set_path(value, path, v.clone());
+        // `[site] device` 接受单串或数组:配置面统一是 `[parallel] device = [..]`
+        // (单串 = 一项,免去站点档记两种类型)。
+        let v = if path == "parallel.device" {
+            match v {
+                toml::Value::String(s) => toml::Value::Array(vec![toml::Value::String(s.clone())]),
+                other => other.clone(),
+            }
+        } else {
+            v.clone()
+        };
+        set_path(value, path, v);
         origins.insert(path.into(), Origin::Site("[site]".into()));
     }
     Ok(())
@@ -550,7 +564,7 @@ fn check_explicit_model(
         return Ok(());
     };
     for (key, want) in [
-        ("kind", kind_name(p.kind)),
+        ("format", format_name(p.format)),
         ("quant", quant_name(p.quant)),
         ("head_quant", head_name(p.head_quant)),
     ] {
@@ -569,12 +583,11 @@ fn check_explicit_model(
     Ok(())
 }
 
-fn kind_name(k: super::ModelKind) -> &'static str {
-    match k {
-        super::ModelKind::Qwen35_08b => "0.8b",
-        super::ModelKind::Awq27b => "awq27b",
-        // GGUF 档(本分支并入;main 的分档命名表无此项)
-        super::ModelKind::Gguf => "gguf",
+fn format_name(f: super::ModelFormat) -> &'static str {
+    match f {
+        super::ModelFormat::Safetensors => "safetensors",
+        super::ModelFormat::Awq => "awq",
+        super::ModelFormat::Gguf => "gguf",
     }
 }
 
@@ -582,6 +595,12 @@ fn quant_name(q: super::QuantScheme) -> &'static str {
     match q {
         super::QuantScheme::W4a16 => "w4a16",
         super::QuantScheme::W4a8 => "w4a8",
+        super::QuantScheme::W8a8i => "w8a8i",
+        super::QuantScheme::W8a8f => "w8a8f",
+        super::QuantScheme::W8a8 => "w8a8",
+        super::QuantScheme::Q4k => "q4k",
+        super::QuantScheme::Iq4 => "iq4",
+        super::QuantScheme::Iq3 => "iq3",
     }
 }
 
@@ -653,26 +672,39 @@ mod tests {
         (v, origins)
     }
 
-    fn load_profile(name: &str) -> (Value, Origins) {
-        let raw = std::fs::read_to_string(crate::profiles::profile_path(name).expect("profile"))
-            .expect("读 profile");
-        resolve_str(&raw)
-    }
+    /// 27B/3090 意图档(旧 `profiles/qwen38_27b-3090-w4a16.toml` 的 `[intent]` 块;
+    /// 2026-10-21 档已转全量显式,意图面留在本测试里做**派生器对照锚**)。
+    const INTENT_AWQ_3090_MAX: &str = r#"
+[intent]
+model       = "qwen3.8-27b-awq"
+hardware    = "3090ti-24g"
+goal        = "max-context"
+context     = "max"
+concurrency = 1
+spec        = "off"
+kv          = "fp8"
+kvmem       = "off"
+graphs      = "auto"
+reuse       = "off"
 
-    /// **P0 验收**:新 profile 的派生结果 = 手写 `profiles/legacy/awq27b-3090-max.toml`
-    /// 的逐键值（`allowed_ops` 已退役；准入由 tag filter 派生）。
+# 测速/恒等门口径(与仓库档一致;高级覆盖:意图档也允许写任意低层键)
+[sampling]
+mode = "greedy"
+"#;
+
+    /// **P0 验收**:意图派生结果 = 仓库全量档 `profiles/qwen38_27b-3090-w4a16.toml`
+    /// 的逐键值(准入由 tag filter 派生)。
     #[test]
     fn profile_matches_handwritten_flavor() {
-        let (p, _po) = load_profile("awq27b-3090-max");
-        let flavor = std::fs::read_to_string(
-            crate::profiles::legacy_path("awq27b-3090-max").expect("flavor"),
+        let (p, _po) = resolve_str(INTENT_AWQ_3090_MAX);
+        let c: crate::config::OwlConfig = p.try_into().expect("intent 反序列化");
+        let f = crate::config::OwlConfig::load(
+            Some(&crate::profiles::profile_path("qwen38_27b-3090-w4a16").expect("profile")),
+            None,
         )
-        .expect("读 flavor");
-        let f: crate::config::OwlConfig = toml::from_str(&flavor).expect("flavor 解析");
-        let c: crate::config::OwlConfig =
-            p.clone().try_into().expect("profile 反序列化");
+        .expect("全量档装载");
         // 模型面
-        assert_eq!(c.model.kind, f.model.kind);
+        assert_eq!(c.model.format, f.model.format);
         assert_eq!(c.model.quant, f.model.quant);
         assert_eq!(c.model.head_quant, f.model.head_quant);
         // 上下文/池
@@ -682,7 +714,7 @@ mod tests {
         assert_eq!(c.runtime.prefill_tail_merge, f.runtime.prefill_tail_merge);
         assert_eq!(c.runtime.max_batch, f.runtime.max_batch);
         assert_eq!(c.pool.gdn_slots, f.pool.gdn_slots);
-        assert_eq!(c.server.max_concurrency, f.server.max_concurrency);
+        assert_eq!(c.runtime.max_concurrency, f.runtime.max_concurrency);
         assert_eq!(c.pool.vram_target, f.pool.vram_target);
         assert_eq!(c.pool.vram_reserve_mb, f.pool.vram_reserve_mb);
         assert_eq!(c.pool.prefix_cache, f.pool.prefix_cache);
@@ -691,13 +723,13 @@ mod tests {
         assert_eq!(c.pool.host_cache_mb, f.pool.host_cache_mb);
         assert_eq!(c.pool.snap_host_mb, f.pool.snap_host_mb);
         // 臂/KV/图/投机
-        assert_eq!(c.dispatch.kv_fp8, f.dispatch.kv_fp8);
-        assert_eq!(c.dispatch.gdn_chunked, f.dispatch.gdn_chunked);
-        assert_eq!(c.dispatch.verify_arm, f.dispatch.verify_arm);
-        assert_eq!(c.dispatch.decode_arm, f.dispatch.decode_arm);
-        assert_eq!(c.dispatch.fi_cuda_graph, f.dispatch.fi_cuda_graph);
-        assert_eq!(c.dispatch.fi_plan_bake, f.dispatch.fi_plan_bake);
-        assert_eq!(c.dispatch.fi_plan_restore, f.dispatch.fi_plan_restore);
+        assert_eq!(c.kernel.kv_fp8, f.kernel.kv_fp8);
+        assert_eq!(c.kernel.gdn_chunked, f.kernel.gdn_chunked);
+        assert_eq!(c.kernel.decode_arm, f.kernel.decode_arm);
+        assert_eq!(c.kernel.verify_arm, f.kernel.verify_arm);
+        assert_eq!(c.kernel.fi_cuda_graph, f.kernel.fi_cuda_graph);
+        assert_eq!(c.kernel.fi_plan_bake, f.kernel.fi_plan_bake);
+        assert_eq!(c.kernel.fi_plan_restore, f.kernel.fi_plan_restore);
         assert_eq!(c.spec.depth, f.spec.depth);
         assert_eq!(c.kvmem.select_decode, f.kvmem.select_decode);
         assert_eq!(c.kvmem.select_partial, f.kvmem.select_partial);
@@ -710,9 +742,7 @@ mod tests {
     /// `--check` 的估算必须与手写档 boot 现场对齐(128k / 池 4G / fixed 0.90G)
     #[test]
     fn profile_estimate_matches_boot_ledger() {
-        let raw = std::fs::read_to_string(crate::profiles::profile_path("awq27b-3090-max").expect("profile"))
-            .expect("读");
-        let mut v: Value = toml::from_str(&raw).expect("toml");
+        let mut v: Value = toml::from_str(INTENT_AWQ_3090_MAX).expect("toml");
         let mut origins = Origins::new();
         let meta = super::apply(&mut v, &mut origins).expect("resolve").expect("intent");
         let e = meta.estimate.expect("estimate");
@@ -741,10 +771,10 @@ bind = "127.0.0.1:8140"
 device = { bdf = "42:00.0" }
 "#,
         );
-        assert_eq!(get(&v, "model.dir").and_then(|x| x.as_str()), Some("/models/27b"));
-        assert_eq!(get(&v, "runtime.bind").and_then(|x| x.as_str()), Some("127.0.0.1:8140"));
+        assert_eq!(get(&v, "model.path").and_then(|x| x.as_str()), Some("/models/27b"));
+        assert_eq!(get(&v, "server.bind").and_then(|x| x.as_str()), Some("127.0.0.1:8140"));
         assert_eq!(get(&v, "pool.pool_tokens").and_then(|x| x.as_integer()), Some(8192));
-        assert!(matches!(origins.get("runtime.bind"), Some(Origin::Site(_))));
+        assert!(matches!(origins.get("server.bind"), Some(Origin::Site(_))));
         let mut bad: Value = toml::from_str("[site]\nmodel_dirz = \"x\"\n").expect("toml");
         let e = super::apply(&mut bad, &mut Origins::new()).expect_err("未知 site 键拒");
         assert!(e.contains("model_dirz"), "{e}");
@@ -804,7 +834,7 @@ model = "qwen3.8-27b-awq"
 hardware = "3090ti-24g"
 context = 4096
 [model]
-kind = "0.8b"
+format = "safetensors"
 "#,
         )
         .expect("toml");
@@ -826,11 +856,8 @@ kv = "f16"
 graphs = "auto"
 "#,
         );
-        assert_eq!(get_bool(&v, "dispatch.fi_cuda_graph"), Some(false));
-        assert_eq!(
-            get(&v, "dispatch.decode_arm").and_then(|x| x.as_str()),
-            Some("v2")
-        );
+        assert_eq!(get_bool(&v, "kernel.fi_cuda_graph"), Some(false));
+        assert_eq!(get(&v, "kernel.decode_arm").and_then(|x| x.as_str()), Some("v2"));
         assert!(get(&v, "graph.prefill_bucket").is_none(), "prefill 桶已退役");
     }
 

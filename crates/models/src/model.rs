@@ -415,7 +415,7 @@ impl Module for Model {
     /// 整模单树(C5):embed → 层链 → final norm → tied lm_head
     fn forward(&self, ids: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         self.embed
-            .lm_head_matmul(&self.last_hidden(ids, ctx))
+            .lm_head_matmul(&self.last_hidden(ids, ctx), &ctx.env.gguf)
             .tag("logits")
     }
 }
@@ -445,7 +445,7 @@ impl Model {
         let last = crate::layers::narrow_strided(
             &hidden, 1, d, (t - 1) * d, d, vec![1, d],
         );
-        self.embed.lm_head_matmul(&last).tag("logits_last")
+        self.embed.lm_head_matmul(&last, &ctx.env.gguf).tag("logits_last")
     }
 }
 
@@ -1428,12 +1428,12 @@ mod tests {
             &[0.0, 1.0], &[0.0, 2.0, 3.0]).await;
         // 串行臂的逐会话 logits(重跑以取输出;状态已推进 ⇒ 用第二套缓冲)
         let (kvs_s2, gdns_s2) = model_bufs_f16(&mut gpu, 1, 3).await;
-        let sA = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
+        let s_a = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
             &[5.0, 9.0], &[0.0, 1.0], &[0.0, 1.0], &[1.0, 2.0], &[0.0], &[0.0, 2.0]).await;
-        let sB = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
+        let s_b = model_prefill_step(&mut gpu, &model, &rp, &kvs_s2, &gdns_s2,
             &[3.0], &[0.0], &[4.0], &[1.0], &[1.0], &[0.0, 1.0]).await;
-        assert_close(&batch_pre[..2 * VOCAB], &sA[..], 1e-5, "batch-prefill-A");
-        assert_close(&batch_pre[2 * VOCAB..], &sB[..], 1e-5, "batch-prefill-B");
+        assert_close(&batch_pre[..2 * VOCAB], &s_a[..], 1e-5, "batch-prefill-A");
+        assert_close(&batch_pre[2 * VOCAB..], &s_b[..], 1e-5, "batch-prefill-B");
 
         // ── verify 形(槽区不重叠):A 2 行(slot 2,3;pos 2,3)、
         //    B 3 行(slot 5..7;pos 1..3)──

@@ -21,7 +21,7 @@
 | **OpenAI `image_url`** | ✅ **V4 已接**(data URL;Qwen2VL 预处理;占位展开;真机两图) |
 | **图像预处理** | ✅ Rust 实现(2×2 块序);像素 max\|Δ\|≈2/255,端到端答案对拍过 |
 | **TP2 视觉** | ✅ **V3 已真机**(两 rank 各备塔输出;图像 prefill 通过) |
-| 配置档 | ✅ `tp27b-3080-vlm-184k`(视觉 / spec off 对照)/ `tp27b-3080-184k`(视觉 + DFlash2 d7)/ **`tp27b-3080-262k-vlm`(262k 全设备池)** |
+| 配置档 | ✅ `qwen38_27b-3080_tp2-w4a16-vlm`(视觉 / spec off 对照)/ `qwen38_27b-3080_tp2-w4a16`(视觉 + DFlash2 d7)/ **`qwen38_27b-3080_tp2-w4a16-vlm`(262k 全设备池)** |
 
 **一句话**:V1–V5 全通。模型层 + 引擎 prefill/decode + OpenAI `image_url` + TP2 图像 +
 **图像 × DFlash2 d7** 均已在 2×3080 真机过门;图像×spec 与 spec-off 的 128-token
@@ -155,15 +155,15 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
   `dflash_encode/propose`。
 - **图像 token 不参与草稿**:首版草稿仍只对文本 continuation 提案;图像
   只在 prefill 首步进塔。
-- **门(已过)**:同图、同 seed、greedy,`tp27b-3080-184k`(spec d7)与
-  `tp27b-3080-vlm-184k`(spec off)的 128-token reasoning 逐字一致:
+- **门(已过)**:同图、同 seed、greedy,`qwen38_27b-3080_tp2-w4a16`(spec d7)与
+  `qwen38_27b-3080_tp2-w4a16-vlm`(spec off)的 128-token reasoning 逐字一致:
   bird 484 chars / cat 493 chars;`spec.rounds=46, accepted=79,
   tokens=125`(AL≈1.72),零 Xid。
 
 
 ### 3.6 262k 全设备池 × 视觉 × DFlash2(2026-10-20)
 
-- `profiles/tp27b-3080-262k-vlm.toml`:262,144 tok 全设备池(非超卖)、
+- `profiles/qwen38_27b-3080_tp2-w4a16-vlm.toml`:262,144 tok 全设备池(非超卖)、
   fp8 主 KV(4 GiB/rank)+ BF16 草稿池(2.5 GiB/rank)、vision、d7、
   `vram_target=0.99` / reserve 256 MiB。
 - 真机(2×3080 TP2):boot 成功;`nvidia-smi` 19.19G/20.48G,
@@ -212,7 +212,7 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
 | `apps/server/src/vision_processor.rs` | V4 | 解码/缩放/normalize/patchify |
 | `apps/server/src/openai.rs` | V4 | `image_url` 解析 + 图像 part |
 | `apps/server/src/openai.rs` | V4 ✅ | 模板占位 `<|image_pad|>` 按 grid 展开 |
-| `profiles/tp27b-3080-184k.toml` | V1 ✅ | 双卡 + vision + draft 目标档 |
+| `profiles/qwen38_27b-3080_tp2-w4a16.toml` | V1 ✅ | 双卡 + vision + draft 目标档 |
 | `testdata/args/site-3080-tp2.toml` | V3 | TP2 卡序/路径站点档(本地) |
 
 ---
@@ -236,7 +236,7 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
 
 - [x] **V1**:`ModelCfg.vision` / `EngineKnobs.vision` / `ModelLoader::vision` /
       27B 塔装载 / `Vlm::from_model` / `RankDev.vlm` / `--check` /
-      `image_url` 显式拒 / `profiles/tp27b-3080-184k.toml`。
+      `image_url` 显式拒 / `profiles/qwen38_27b-3080_tp2-w4a16.toml`。
 - [x] **V2/V3/V4(已真机)**:`TurnOpts.images` / `ActiveTurn.vlm` /
       `VlmPrepared` / 首块塔 eval(merged 叶块)/ `chunk_tables` m-RoPE 切片 /
       `image_scatter` 注入 / decode `pos` 槽 = pos+delta(kv_len 不动)/
@@ -250,7 +250,7 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
 - [x] **V5:VLM × DFlash2 d7(真机过)**。
       verify 的 rope pos 加 `delta`,slots/lens 保持真实;eager verify/回滚
       同式;图像+spec 与 spec-off 的 128-token reasoning 逐字一致。
-      真机:`tp27b-3080-184k`,2×3080 TP2;bird 251 prompt / 64 tok 1.22s、
+      真机:`qwen38_27b-3080_tp2-w4a16`,2×3080 TP2;bird 251 prompt / 64 tok 1.22s、
       128 tok 1.65s;cat 269 prompt / 128 tok 2.23s;spec 46 轮、接受 79、
       125 tok、零 Xid。rank1 `[vram-gov]` cap 174,801 是**预算 cap**(TP
       顺序记账的产物,非实际池);非超卖 `nb.max(seq_blocks)` 把池钉回
@@ -259,8 +259,8 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
       **Rebase main `5b27d34` 后**:main 的 N4 泄漏修复已入基线;
       4 × 12.5k prompt(spec d7)压测 free 稳定 ~2.4G/卡,无 OOM。
 
-**当前能做什么**:`tp27b-3080-184k`(视觉 + spec d7)真机带图请求
-(data URL,单图;TP2);`tp27b-3080-vlm-184k`(spec off)作为无草稿对照;
+**当前能做什么**:`qwen38_27b-3080_tp2-w4a16`(视觉 + spec d7)真机带图请求
+(data URL,单图;TP2);`qwen38_27b-3080_tp2-w4a16-vlm`(spec off)作为无草稿对照;
 两者 `--check` 内存账分别 **18.92G / 19.63G(余 0.71G)** 与
 **16.24G / 19.63G(余 3.39G)**。
 **不能**做:http 图像 URL、多图/多并发图像;184K 满上下文 + draft 的
@@ -273,7 +273,7 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
 ```bash
 cd packages/owl-worktrees/perf-review
 cargo build -p server
-./target/debug/server --profile tp27b-3080-184k \
+./target/debug/server --profile qwen38_27b-3080_tp2-w4a16 \
   --site testdata/args/base.toml \
   --set 'runtime.tp_ordinals=[2,3]' --check
 # 期望:spec=dflash / vision=on(装载面) / draft dir ✓ / TP2 内存账跳过告警
@@ -287,8 +287,8 @@ HF/AWQ 档的塔在检查点目录(`model.visual.*`);GGUF 主文件**只带文�
 塔在**同目录 `mmproj-*.gguf`**。两档共用引擎侧全部接线(V1–V5),差别只在
 装载面:
 
-- 配置:`[model] vision = true` + `[model] mmproj = "…/mmproj-*.gguf"`
-  (缺省 = `model.dir` 同目录唯一 `mmproj*.gguf`;多个/没有 = 响亮拒);
+- 配置:`[model] vision = true` + `[model] vision_path = "…/mmproj-*.gguf"`
+  (缺省 = `model.path` 同目录唯一 `mmproj*.gguf`;多个/没有 = 响亮拒);
 - 事实:`VlmCfg::from_gguf` 从主 GGUF 读 mRoPE sections + `<|image_pad|>` id,
   从 mmproj 读 `clip.vision.*`(num_pos/temporal 由张量形状补);
 - 权重:`MmprojSource`(host 解量化到 F16;文本主干仍零解量化)+

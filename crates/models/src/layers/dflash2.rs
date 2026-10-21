@@ -544,7 +544,6 @@ pub struct CandidateSelector {
     a_code: Weight,
     /// successor_codebook [vocab, rank](B;后继)
     b_code: Weight,
-    vocab: usize,
     rank: usize,
     /// proj/码本 dtype(同日十四;BF16 原生检查点直载)
     dt: Dtype,
@@ -560,7 +559,6 @@ impl CandidateSelector {
                 .with_out_dtype(dt),
             a_code: Weight::new_typed("predecessor_codebook", vec![vocab, rank], dt),
             b_code: Weight::new_typed("successor_codebook", vec![vocab, rank], dt),
-            vocab,
             rank,
             dt,
         }
@@ -1098,7 +1096,7 @@ impl DFlash2Draft {
             &hidden.slice_view(self.hidden, vec![DEPTH, self.hidden]),
             Dtype::F16,
         );
-        let logits = embed.lm_head_matmul(&hidden_head);
+        let logits = embed.lm_head_matmul(&hidden_head, &ctx.env.gguf);
         let (cand, vals) = self.selector.topk_of_logits(&logits);
         let proj = self.selector.selector_proj(&hidden, ctx);
         (hidden, cand, vals, proj, logits)
@@ -1123,7 +1121,7 @@ impl DFlash2Draft {
             &hidden.slice_view(self.hidden, vec![DEPTH, self.hidden]),
             Dtype::F16,
         );
-        let logits = embed.lm_head_matmul(&hidden_head);
+        let logits = embed.lm_head_matmul(&hidden_head, &ctx.env.gguf);
         let (drafts, scores) = self.selector.select_with_logits(&hidden, anchor, &logits, ctx);
         (hidden, drafts, scores, logits)
     }
@@ -1827,9 +1825,11 @@ mod tests {
         // 已证全同 → gemm 各行输出应全同。三变体归因:无切片 / 0偏移切片 /
         // 1行偏移切片)
         {
-            let l_full = embed.lm_head_matmul(&hidden_t); // [8, vocab] 无切片
-            let l_zs =
-                embed.lm_head_matmul(&hidden_t.slice_view(0, vec![7, 5120]));
+            let l_full = embed.lm_head_matmul(&hidden_t, &crate::env::GgufEnv::default()); // [8, vocab] 无切片
+            let l_zs = embed.lm_head_matmul(
+                &hidden_t.slice_view(0, vec![7, 5120]),
+                &crate::env::GgufEnv::default(),
+            );
             let variants: [(String, TensorOps); 3] = [
                 ("full[8]".into(), l_full),
                 ("slice0[7]".into(), l_zs),

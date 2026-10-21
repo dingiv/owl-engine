@@ -84,6 +84,7 @@ impl AssetKind {
         matches!(self, AssetKind::Temp)
     }
 
+    /// 保留面(地板/行/元数据/权重/图/池骨架 —— 不参与临时块复用)
     pub fn is_reserved(self) -> bool {
         matches!(
             self,
@@ -637,7 +638,7 @@ mod tests {
     /// **缺口 4 门:临时池三条律**
     #[test]
     fn temp_pool_reuses_released_blocks_and_sweeps_owner() {
-        use owl_iface::handle::{AllocEvent, FreeEvent, Owner as IfOwner};
+        use owl_iface::handle::{AllocEvent, Owner as IfOwner};
         let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
         let mut b = LedgerBook::new(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
         // ① 入账(temp 类)+ 释放 ⇒ 入池(不回驱动),仍在借
@@ -1230,24 +1231,6 @@ impl LedgerBook {
     /// 出借条目数(`None` = 全部)。
     pub fn open_count_rank(&self, rank: Option<u8>) -> usize {
         self.open.values().filter(|l| rank.is_none_or(|r| l.rank == r)).count()
-    }
-
-    /// 记账失败:计数 + 一条裸日志(store 无日志依赖 ⇒ eprintln;机读面 = `hook_fail`)。
-    /// `OWL_LEDGER_DOUBLE=1` ⇒ 双 free 现场打调用栈(前 3 次;诊断探针,零行为)。
-    fn double_free_trace(id: u64, name: &str) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        if std::env::var_os("OWL_LEDGER_DOUBLE").is_none() {
-            return;
-        }
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-        if n > 3 {
-            return;
-        }
-        eprintln!(
-            "[double-free #{n}] id={id} name={name}\n{}",
-            std::backtrace::Backtrace::force_capture()
-        );
     }
 
     fn fail(&mut self, what: &str, detail: String) {

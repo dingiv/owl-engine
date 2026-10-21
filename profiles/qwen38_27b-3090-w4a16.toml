@@ -1,0 +1,31 @@
+# owl 预设档 `awq27b-3090-max` —— 单张 3090 Ti 24G / 128k / fp8 KV(最大上下文档)
+#
+# 全量字段继承自 `full.toml`;本文件只写差异。
+# 校验:`server -p profiles/awq27b-3090-max.toml --check`
+extends = ["full.toml"]
+
+[model]
+name = "qwen3.8-27b"
+path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+format = "awq"
+quant = "w4a16"
+head_quant = "rtn-int4-g32"
+
+[runtime]
+max_seq = 131072
+max_concurrency = 1
+
+[pool]
+pool_tokens = 131072
+gdn_slots = 1
+vram_target = 0.99
+vram_reserve_mb = 256
+
+[kernel]
+kv_fp8 = true
+decode_arm = "fi"
+fi_cuda_graph = true
+fi_plan_restore = false
+
+[parallel]
+device = ["3090"]

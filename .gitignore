@@ -45,3 +45,5 @@ perf-runs/
 # 进版本 = 真需要当"金标"的数据请显式 `git add -f`。
 docs/bench/data/
 *.local
+
+/models

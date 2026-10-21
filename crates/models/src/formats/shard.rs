@@ -419,7 +419,7 @@ mod tests {
     use crate::module::Want;
     use crate::module::Taken;
     use crate::plan::rules::rule_of; // 键表默认对照（声明规则覆盖的判据面）
-use crate::plan::rules::{SegKind, WeightRule};
+use crate::plan::rules::WeightRule;
 
     /// 内存源(全量 f32;`Vec` 值域即"源坐标系")
     struct MemSource {

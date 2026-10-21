@@ -17,7 +17,7 @@
 ```bash
 cd packages/owl && nsys profile --cuda-graph-trace=node --trace=cuda,nvtx,osrt \
   -o /tmp/owl-$(date +%H%M) --force-overwrite=true \
-  ./target/release/server -p profiles/legacy/spec-dflash.toml testdata/server/agent-27b.toml --log-level warn
+  ./target/release/server -p profiles/spec-dflash.toml testdata/server/agent-27b.toml --log-level warn
 # 另开:打 1-2 个请求(短输出),然后 Ctrl-C/停服,再用 nsys stats / GUI 看
 nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum /tmp/owl-*.nsys-rep
 ```

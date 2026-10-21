@@ -28,7 +28,7 @@ use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
 use owl_engine::{TurnEvent, TurnOpts, TurnSampler};
-use owl_shared::config::AgentCfg;
+use crate::config::AgentCfg;
 
 use crate::actor::{BatchStatsSnapshot, EngineReq, SinkEvent};
 use crate::chat_tpl::{ChatTpl, RenderArgs};
@@ -529,9 +529,6 @@ mod tests {
             has_batch_graph: true,
             queue_len: 0,
             active: 0,
-            queued: Vec::new(),
-            rejects: Vec::new(),
-            wait_hist: [0; 5],
         }
     }
 

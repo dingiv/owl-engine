@@ -31,6 +31,7 @@ use crate::ffi::{
 };
 use std::sync::Arc;
 use crate::command::{Ack, Command};
+use owl_iface::command::{BatchOutcome, Outcome};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
 use owl_iface::contract::{Arg, Bytes, Dtype, LaunchMsg};
@@ -530,6 +531,22 @@ impl GpuServer {
                     // 零 env):写完 registry 之前设,保证任何 plan/activate
                     // 都读到本 boot 的档位。
                     owl_kernels::server::flashinfer::set_plan_restore(self.diag.fi_plan_restore);
+                    // **服务端面诊断旋钮**(2026-10-21;原 OWL_GDN_* / FI_DEBUG /
+                    // OWL_L3_AUDIT env 已退场):同一 boot 点从 DiagOpts 显式下发。
+                    owl_kernels::server::configure_diag(&owl_kernels::server::DiagTune {
+                        fi_debug: self.diag.fi_debug,
+                        l3_audit: self.diag.l3_audit,
+                        gdn: owl_kernels::server::gdn_chunked::GdnDiag {
+                            on: self.diag.gdn_diag,
+                            touch: self.diag.gdn_touch.clone(),
+                            zero_scratch: self.diag.gdn_zero_scratch.clone(),
+                            fresh_scratch: self.diag.gdn_fresh_scratch,
+                        },
+                    });
+                    // C++ 适配器只认 `getenv("FI_DEBUG")`(上游 ABI 不动;与
+                    // `FI_CUDA_GRAPH` 同一桥法):配置 `[probes] fi_debug`
+                    // 是**唯一真源**,这里把两侧语义焊在同一个写点。
+                    std::env::set_var("FI_DEBUG", if self.diag.fi_debug { "1" } else { "0" });
                     let r = owl_kernels::registry::OpRegistry::boot_with(
                         &mut res,
                         &mut exec,
@@ -800,6 +817,33 @@ impl GpuServer {
         c.kind()
     }
 
+    /// **原生批:一条信箱消息装 N 条设备命令**(2026-10-21)。
+    ///
+    /// 语义三条:
+    /// - **同 ATOR 线程逐条派发** ⇒ 与逐条发包完全同序(FIFO,无重排);
+    /// - **一条回执 = 全部子回执落定**(join;子命令的异步完成也计入);
+    /// - **失败不回滚已投递部分** —— `first_err` 带下标,结果逐条如实回。
+    ///
+    /// 为什么在 server 侧 join 而不是客户端 join:批的价值 = 后端看见整批
+    /// (将来可做合并 DMA / 合并发射),客户端逐条 join 结构上做不到这一点。
+    fn handle_batch(
+        &mut self,
+        cmds: Vec<owl_iface::command::Command>,
+        ack: Ack<Result<BatchOutcome, ModelError>>,
+    ) {
+        let n = cmds.len();
+        if n == 0 {
+            ack.send(Ok(BatchOutcome::empty()));
+            return;
+        }
+        let join = Arc::new(BatchJoin::new(n, ack));
+        for (i, cmd) in cmds.into_iter().enumerate() {
+            let j = Arc::clone(&join);
+            let sub = Ack::sink(move |r: Result<Outcome, ModelError>| j.done(i, r));
+            self.dispatch_inner(crate::command::envelope_of(cmd, sub));
+        }
+    }
+
     fn dispatch_inner(&mut self, cmd: Command) {
         // **发射账**(2026-10-14):派发前记一条 —— 得到"host 视角的事实发射序
         // + 流归属 + 块地址"。关账(容量 0)= 此处一个 None 判定,零开销。
@@ -858,6 +902,8 @@ impl GpuServer {
                     self.handle_copy_block(src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack)
                 }
                 Command::CopyBatch { copies, ack } => self.handle_copy_batch(copies, ack),
+                // 批:逐条进 dispatch_inner ⇒ 捕获白名单对每条独立生效(不整批放行)
+                Command::Batch { cmds, ack } => self.handle_batch(cmds, ack),
                 other => Self::reject(other, self.sink),
             };
         }
@@ -894,6 +940,7 @@ impl GpuServer {
                 self.handle_copy_block(src, src_off_bytes, dst, dst_off_bytes, len_bytes, ack)
             }
             Command::CopyBatch { copies, ack } => self.handle_copy_batch(copies, ack),
+            Command::Batch { cmds, ack } => self.handle_batch(cmds, ack),
             Command::Launch { msg, ack } => self.handle_launch(msg, ack),
             // **E2b 接线**:复合 = 设备端事件序(record_tail + waitEvent),零 host 阻塞
             // 设备 SM 数:宿主面只读属性(无 GPU 活);失败 = 结构化拒(不猜)
@@ -2106,4 +2153,83 @@ fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+// ============================================================================
+// 原生批的 join 收口(2026-10-21)
+// ============================================================================
+
+/// **一批命令的收口器**:N 条子回执全部落定后,一次性回执整批。
+///
+/// 线程面:子回执可能来自 **actor 线程**(同步命令)或**驱动回调线程**
+/// (htod/dtoh 的完成回调)—— 故全部用 `Mutex`/原子;锁只在收口点短暂持有,
+/// 绝不跨设备调用。
+struct BatchJoin {
+    /// 整批回执(取走即空;`None` = 已回执,防双发)
+    ack: std::sync::Mutex<Option<Ack<Result<BatchOutcome, ModelError>>>>,
+    /// 逐条结果槽(下标 = 投递序)
+    slots: std::sync::Mutex<Vec<Option<Result<Outcome, ModelError>>>>,
+    /// 还差几条子回执
+    left: std::sync::atomic::AtomicUsize,
+}
+
+impl BatchJoin {
+    fn new(n: usize, ack: Ack<Result<BatchOutcome, ModelError>>) -> Self {
+        Self {
+            ack: std::sync::Mutex::new(Some(ack)),
+            slots: std::sync::Mutex::new((0..n).map(|_| None).collect()),
+            left: std::sync::atomic::AtomicUsize::new(n),
+        }
+    }
+
+    /// **子回执**:落槽 + 计数;最后一条负责整批收口。
+    fn done(&self, i: usize, r: Result<Outcome, ModelError>) {
+        {
+            let mut g = match self.slots.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if let Some(slot) = g.get_mut(i) {
+                *slot = Some(r);
+            } else {
+                // 槽位越界 = 收口器构造错(编程错误);回执照发不误,槽丢掉
+                eprintln!("[gpu-server] BatchJoin: 子回执下标 {i} 越界(槽长 {})", g.len());
+            }
+        }
+        if self
+            .left
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            != 1
+        {
+            return;
+        }
+        // 最后一条:取全部槽 → 整批回执
+        let slots = {
+            let mut g = match self.slots.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            std::mem::take(&mut *g)
+        };
+        let outcomes: Vec<Result<Outcome, ModelError>> = slots
+            .into_iter()
+            .enumerate()
+            .map(|(i, o)| {
+                o.unwrap_or_else(|| {
+                    Err(ModelError::Msg(format!(
+                        "exec_batch: 第 {i} 条无回执(后端漏发 —— 不静默补 Ok)"
+                    )))
+                })
+            })
+            .collect();
+        let first_err = outcomes.iter().position(|r| r.is_err());
+        let out = BatchOutcome { outcomes, first_err, segments: 1 };
+        let ack = match self.ack.lock() {
+            Ok(mut g) => g.take(),
+            Err(p) => p.into_inner().take(),
+        };
+        if let Some(ack) = ack {
+            ack.send(Ok(out));
+        }
+    }
 }

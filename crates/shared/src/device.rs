@@ -173,6 +173,71 @@ impl DeviceSpec {
     }
 }
 
+/// **单串 → DeviceSpec**(`[parallel] device = ["42:00.0", "GPU-…", "3090"]`)。
+///
+/// 分类规则(纯语法,不做存在性判断):
+/// - `GPU-…` 或 32 位十六进制(可带连字符)→ **uuid**;
+/// - 形如 `[domain:]bus:dev.func`(全十六进制,`:`/`.` 分隔)→ **bdf**;
+/// - 其余 → **find_name**(名字子串,大小写不敏感);
+/// - **纯十进制整数 = 拒**:CUDA 序号会漂(AGENTS.md 多次判例),卡位必须
+///   用 BDF / UUID / 名字。
+pub fn parse_device_spec(raw: &str) -> Result<DeviceSpec, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err("空串(卡位必须给 BDF / UUID / 名字子串)".into());
+    }
+    // 纯数字:**0..=99 视为 CUDA 序号**(本机 ordinal 恒在 0..16)⇒ 禁用;
+    // 4 位型号(3090/3080/4090…)是**名字子串**,放行。
+    // 判据出处:AGENTS.md 多起"数字序钉错卡"判例 —— 能写死成 BDF 就写死。
+    if t.chars().all(|c| c.is_ascii_digit()) {
+        if t.len() <= 2 {
+            return Err(format!(
+                "\"{t}\" 是 CUDA 序号 —— 禁用(FASTEST_FIRST 序会随驱动/换卡漂移);\
+                 请写 BDF(如 41:00.0)或 UUID、或名字子串(如 3090)"
+            ));
+        }
+        return Ok(DeviceSpec { find_name: Some(t.to_string()), ..Default::default() });
+    }
+    // UUID:GPU- 前缀,或 32 位十六进制(允许 8-4-4-4-12 连字符)
+    let hex_only: String = t.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if t.starts_with("GPU-") || t.starts_with("gpu-") || t.starts_with("MIG-")
+        || (hex_only.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+    {
+        return Ok(DeviceSpec { uuid: Some(t.to_string()), ..Default::default() });
+    }
+    // BDF:[domain:]bus:dev[.func] —— 两段或三段、全十六进制、分隔符只有 : 和 .
+    let bdf_like = {
+        let parts: Vec<&str> = t.split([':', '.']).filter(|p| !p.is_empty()).collect();
+        (parts.len() == 2 || parts.len() == 3 || parts.len() == 4)
+            && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+            && t.contains(':')
+    };
+    if bdf_like {
+        return Ok(DeviceSpec { bdf: Some(t.to_string()), ..Default::default() });
+    }
+    Ok(DeviceSpec { find_name: Some(t.to_string()), ..Default::default() })
+}
+
+impl DeviceSpec {
+    /// **单串解析**(`[parallel] device` 的每项;语义见 [`parse_device_spec`])
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        parse_device_spec(raw)
+    }
+
+    /// 规范显示(日志/错误信息用;空 spec = `<auto>`)
+    pub fn describe(&self) -> String {
+        if let Some(u) = &self.uuid {
+            u.clone()
+        } else if let Some(b) = &self.bdf {
+            b.clone()
+        } else if let Some(n) = &self.find_name {
+            format!("name~{n}")
+        } else {
+            "<auto>".into()
+        }
+    }
+}
+
 /// BDF 规范化:`0000:42:00.0` / `42:00.0` / `42:00` / `42.0` 一律可比
 /// (去 domain、大小写不敏感、`:` 与 `.` 等价、去前导零)
 pub fn bdf_norm(s: &str) -> String {

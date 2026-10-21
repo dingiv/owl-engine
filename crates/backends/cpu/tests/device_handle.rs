@@ -31,7 +31,8 @@ struct RecLedger {
     /// (默认开会把 `free` 全部截进池,别的门就看不到"真归还")
     pool: Vec<(usize, u64)>,
     pool_on: bool,
-    /// 桩池的 rank(验 P0-1:非本 rank 不命中)
+    /// 桩池的 rank(口径说明;P0-1 的"非本 rank 不命中"由池命中断言覆盖)
+    #[allow(dead_code)]
     pool_rank: u8,
 }
 
@@ -379,7 +380,6 @@ async fn face_clone_shares_context_and_ledger() {
 // (`auto_reclaimed = true` 的"后端整批回收 ⇒ 本层补发归还"三条契约),
 // 所以用一个最小 face:状态只有"发号 + 回收开关"。
 
-#[derive(Clone)]
 struct StubFace {
     /// 压力注入:第一次 `alloc` 返回 `PoolExhausted`(验 N6 自愈)
     fail_first_alloc: Arc<std::sync::atomic::AtomicBool>,
@@ -390,6 +390,22 @@ struct StubFace {
     nodes: Arc<AtomicU64>,
     /// 自述:窗内自产块由后端回收(契约三条)
     reclaimed: bool,
+    /// 累积批队列(`queue`/`flush`)
+    pending: Vec<owl_iface::command::Command>,
+}
+
+impl Clone for StubFace {
+    /// 克隆 = 同一组 Arc 的**新句柄**(队列不跟随 —— 与 GpuClient 同律)
+    fn clone(&self) -> Self {
+        Self {
+            fail_first_alloc: self.fail_first_alloc.clone(),
+            freed: self.freed.clone(),
+            ids: self.ids.clone(),
+            nodes: self.nodes.clone(),
+            reclaimed: self.reclaimed,
+            pending: Vec::new(),
+        }
+    }
 }
 
 impl StubFace {
@@ -400,6 +416,7 @@ impl StubFace {
             ids: Arc::new(AtomicU64::new(1)),
             nodes: Arc::new(AtomicU64::new(0)),
             reclaimed,
+            pending: Vec::new(),
         }
     }
     fn take_id(&self) -> u64 {
@@ -410,6 +427,73 @@ impl StubFace {
 impl DeviceClient for StubFace {
     fn window_blocks_auto_reclaimed(&self) -> bool {
         self.reclaimed
+    }
+    async fn exec(
+        &mut self,
+        cmd: owl_iface::command::Command,
+    ) -> Result<owl_iface::command::Outcome, owl_iface::contract::ModelError> {
+        use owl_iface::command::{Command as C, Outcome};
+        match cmd {
+            // 测试替身不在乎清零语义(存根面只看事件)
+            C::Alloc { dtype, elems, name, .. } => {
+                Ok(Outcome::Buf(self.alloc(dtype, elems, &name).await?))
+            }
+            C::Free { ids } => {
+                self.free(&ids).await?;
+                Ok(Outcome::Done)
+            }
+            C::Htod { dtype, shape, src, name, .. } => {
+                Ok(Outcome::Buf(self.htod(dtype, &shape, &src, &name).await?))
+            }
+            C::Dtoh { want_bytes, .. } => Ok(Outcome::Bytes(vec![0u8; want_bytes])),
+            C::Launch { msg } => Ok(Outcome::Buf(self.launch(msg).await?)),
+            C::Sync => {
+                self.sync().await?;
+                Ok(Outcome::Done)
+            }
+            C::GraphBegin => {
+                self.graph_begin().await?;
+                Ok(Outcome::Done)
+            }
+            C::GraphEnd => Ok(Outcome::Graph(self.graph_end().await?)),
+            C::GraphLaunch { graph } => {
+                self.graph_launch(graph).await?;
+                Ok(Outcome::Done)
+            }
+            C::GraphAbort => {
+                self.graph_abort().await?;
+                Ok(Outcome::Done)
+            }
+            C::GraphDestroy { graph } => {
+                self.graph_destroy(graph).await?;
+                Ok(Outcome::Done)
+            }
+        }
+    }
+    fn queue(
+        &mut self,
+        cmd: owl_iface::command::Command,
+    ) -> Result<usize, owl_iface::contract::ModelError> {
+        let i = self.pending.len();
+        self.pending.push(cmd);
+        Ok(i)
+    }
+    async fn flush(
+        &mut self,
+    ) -> Result<owl_iface::command::BatchOutcome, owl_iface::contract::ModelError> {
+        let cmds = std::mem::take(&mut self.pending);
+        self.exec_batch(cmds).await
+    }
+    async fn exec_batch(
+        &mut self,
+        cmds: Vec<owl_iface::command::Command>,
+    ) -> Result<owl_iface::command::BatchOutcome, owl_iface::contract::ModelError> {
+        let mut outcomes = Vec::with_capacity(cmds.len());
+        for c in cmds {
+            outcomes.push(self.exec(c).await);
+        }
+        let n = outcomes.len();
+        Ok(owl_iface::command::BatchOutcome::collect(outcomes, n))
     }
     async fn graph_begin(&mut self) -> Result<(), owl_iface::contract::ModelError> {
         self.nodes.store(0, Ordering::Relaxed);

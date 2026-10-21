@@ -4,20 +4,23 @@
 # **自包含**:站点面(模型路径 / 端口)写死在本档 —— 不依赖任何本地档;
 # 换机器 = 改下面 [model] 的两行路径(其余不动)。
 #
-# 启动: ./target/release/server -p profiles/legacy/spec-dflash.toml testdata/args/perf-ctxladder-27b.toml \
+# 启动: ./target/release/server -p profiles/spec-dflash.toml testdata/args/perf-ctxladder-27b.toml \
 #         --log-level info [--perf-level gpu]
 # 钉卡: CUDA_VISIBLE_DEVICES=<UUID>(建议)或 [runtime] device = { bdf = "41:00.0" }
 # 发射账(只在做宿主命令账时显式加回,缺省不开):[cuda] trace_ring = 65536
 
 [model]
-kind = "awq27b"
-dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+format = "awq"   # 原 kind = "awq27b"
+path = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
 name = "qwen3.8-27b"
 
 [runtime]
 max_seq = 40960
-bind = "127.0.0.1:8138"
 
 [pool]
 pool_tokens = 41216
+
+[spec]
+draft_path = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+[server]
+bind = "127.0.0.1:8138"

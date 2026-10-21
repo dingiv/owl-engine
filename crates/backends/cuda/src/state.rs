@@ -67,6 +67,15 @@ pub struct DiagOpts {
     /// 由 `model.kind/quant/head_quant`、`dispatch.kv_fp8`、`spec`、`vision`、
     /// `runtime.tp_ordinals` 自动推导;`*`/Default = 全放行(诊断/测试)。
     pub tag_filter: owl_kernels::tag_filter::TagFilter,
+    /// **FlashInfer 诊断打印**(`[probes] fi_debug`;原 `FI_DEBUG` env)
+    pub fi_debug: bool,
+    /// **L3 事实面审计**(`[probes] l3_audit`;原 `OWL_L3_AUDIT` env)
+    pub l3_audit: bool,
+    /// **GDN chunked 诊断旋钮**(`[probes] gdn_*`;原 `OWL_GDN_*` env)
+    pub gdn_diag: bool,
+    pub gdn_touch: String,
+    pub gdn_zero_scratch: String,
+    pub gdn_fresh_scratch: bool,
 }
 
 /// **诊断档的缺省 = 全放行**(2026-10-20 修一个静默坑):
@@ -91,6 +100,12 @@ impl Default for DiagOpts {
             vram_budget_mb: None,
             trace_ring: 0,
             tag_filter: owl_kernels::tag_filter::TagFilter::wildcard(),
+            fi_debug: false,
+            l3_audit: false,
+            gdn_diag: false,
+            gdn_touch: String::new(),
+            gdn_zero_scratch: String::new(),
+            gdn_fresh_scratch: false,
         }
     }
 }
@@ -114,16 +129,25 @@ impl DiagOpts {
             free_legacy: c.free_legacy,
             sync_mask: mask,
             launch_time: c.launch_time,
-            // 硬预算:与池治理同一预留(1GiB);逻辑上限走显式配置(暂 None)
+            // 硬预算:与池治理同一预留(1GiB);逻辑上限走显式配置
             vram_reserve_mb: cfg.pool.vram_reserve_mb.max(1),
-            vram_budget_mb: owl_shared::env_reader::parse::<u64>("OWL_VRAM_BUDGET_MB"),
+            // **`0` = 不限**(与 `[pool] vram_budget_mb` 注释"留空 = 只按驱动账判"同义;
+            // 各档普遍显式写 0)。写成 `Some(0)` = 0 字节硬预算 ⇒ 装载第一条就拒发,
+            // boot 直接死在 embed_tokens(2026-10-21 实测)。
+            vram_budget_mb: cfg.pool.vram_budget_mb.filter(|m| *m > 0),
             d2h_prof: c.d2h_prof,
             gpu_prof: c.gpu_prof,
             graph_flags: c.graph_flags.to_bits(),
             capture_slab_mb: c.capture_slab_mb,
             trace_ring: c.trace_ring,
-            fi_plan_restore: cfg.dispatch.fi_plan_restore,
+            fi_plan_restore: cfg.kernel.fi_plan_restore,
             tag_filter: tag_filter_from_config(cfg),
+            fi_debug: cfg.probes.fi_debug,
+            l3_audit: cfg.probes.l3_audit,
+            gdn_diag: cfg.probes.gdn_diag,
+            gdn_touch: cfg.probes.gdn_touch.clone().unwrap_or_default(),
+            gdn_zero_scratch: cfg.probes.gdn_zero_scratch.clone().unwrap_or_default(),
+            gdn_fresh_scratch: cfg.probes.gdn_fresh_scratch,
         }
     }
 }
@@ -134,22 +158,30 @@ impl DiagOpts {
 /// 这里只读配置事实，不探测硬件/不读 env。
 fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::tag_filter::TagFilter {
     use owl_kernels::spec::KernelTag as T;
-    use owl_shared::config::{HeadQuant, ModelKind, QuantScheme, SpecDraft};
-    if cfg.dispatch.tag_wildcard {
+    use owl_shared::config::{HeadQuant, ModelFormat, QuantScheme, SpecDraft};
+    if cfg.kernel.tag_wildcard {
         return owl_kernels::tag_filter::TagFilter::wildcard();
     }
     let mut tags: Vec<T> = Vec::new();
-    match cfg.model.kind {
-        ModelKind::Gguf => tags.push(T::QUANT_GGUF),
-        _ => match cfg.model.quant {
+    // GGUF 档:块型核(逐张量型去量化);其余按量化方案放行
+    match cfg.model.format {
+        ModelFormat::Gguf => tags.push(T::QUANT_GGUF),
+        ModelFormat::Safetensors | ModelFormat::Awq => match cfg.model.quant {
             QuantScheme::W4a16 => {
                 tags.push(T::QUANT_W4A16);
-                tags.push(T::QUANT_AWQ);
+                if cfg.model.format == ModelFormat::Awq {
+                    tags.push(T::QUANT_AWQ);
+                }
             }
             QuantScheme::W4a8 => {
                 tags.push(T::QUANT_W4A8);
-                tags.push(T::QUANT_AWQ);
+                if cfg.model.format == ModelFormat::Awq {
+                    tags.push(T::QUANT_AWQ);
+                }
             }
+            // validate 已拒;这里保守只放通用量化核
+            QuantScheme::W8a8i | QuantScheme::W8a8f | QuantScheme::W8a8
+            | QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3 => {}
         },
     }
     if cfg.model.head_quant == HeadQuant::RtnInt8Row {
@@ -161,7 +193,7 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
         tags.push(T::QUANT_W4A16);
         tags.push(T::QUANT_AWQ);
     }
-    if cfg.dispatch.kv_fp8 {
+    if cfg.kernel.kv_fp8 {
         tags.push(T::KV_MAIN_FP8);
     } else {
         tags.push(T::KV_MAIN_F16);
@@ -174,11 +206,12 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
         let dflash2 = match cfg.spec.draft {
             SpecDraft::Dflash2 => true,
             SpecDraft::Mtp => false,
-            SpecDraft::Auto => cfg.model.dflash2_dir.is_some(),
+            SpecDraft::Auto => cfg.spec.draft_path.is_some(),
         };
         if dflash2 {
             // DFlash2 草稿自持 W4A16 权重(与主干 plan 独立;MTP = F16 不需)。
             tags.push(T::QUANT_W4A16);
+            tags.push(T::QUANT_AWQ);
             if cfg.spec.draft_kv_fp8 {
                 tags.push(T::KV_DRAFT_FP8);
             } else {
@@ -196,7 +229,7 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
     if cfg.model.vision {
         tags.push(T::FEAT_VISION);
     }
-    if cfg.runtime.tp_ordinals.as_ref().is_some_and(|v| v.len() > 1) {
+    if cfg.parallel.mode != owl_shared::config::ParallelMode::Single {
         tags.push(T::FEAT_TP);
     }
     owl_kernels::tag_filter::TagFilter::from_tags(&tags).with_prod_kv_layouts()
@@ -1342,12 +1375,6 @@ impl GpuCtx {
     /// 为什么由本项目负责:池属性 `RELEASE_THRESHOLD=UINT64_MAX`(性能面,
     /// 见上方池调优注释)⇒ free 后**永不自动还 OS**,装载期那批暂存块
     /// (27B 档 156MB)会一直占着,把跑图期余量吃掉。装载收尾调一次即可。
-    /// 默认池账(used/used_high/reserved/reserved_high;见 `DeviceClient::mem_pool_stats`)。
-    pub(super) fn mem_pool_stats(&self) -> Result<(u64, u64, u64, u64), ModelError> {
-        pool_ledger_snapshot()
-            .ok_or_else(|| ModelError::Msg("mem_pool_stats: 池账不可读".into()))
-    }
-
     pub(super) fn mem_pool_trim(&mut self) -> Result<u64, ModelError> {
         use cudarc::driver::sys as cs;
         // 池句柄 = 设备默认池(server 的 cudaMallocAsync 都走它)
@@ -3242,7 +3269,7 @@ mod range_tests {
 #[cfg(test)]
 mod tag_filter_tests {
     use super::tag_filter_from_config;
-    use owl_shared::config::{HeadQuant, ModelKind, OwlConfig, QuantScheme};
+    use owl_shared::config::{HeadQuant, ModelFormat, OwlConfig, QuantScheme, SpecDraft};
 
     fn allows(cfg: &OwlConfig, entry: &str) -> bool {
         let f = tag_filter_from_config(cfg);
@@ -3253,15 +3280,17 @@ mod tag_filter_tests {
     #[test]
     fn w4a16_fp8_vision_spec_head_filter() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a16;
         cfg.model.head_quant = HeadQuant::RtnInt8Row;
         cfg.model.vision = true;
-        cfg.dispatch.kv_fp8 = true;
+        cfg.kernel.kv_fp8 = true;
         cfg.spec.depth = 7;
-        // 该门覆盖 DFlash2 草稿档；不给 dflash2_dir 会按 MTP(F16) 派生。
-        cfg.model.dflash2_dir = Some("/tmp/dflash2".into());
-        cfg.runtime.tp_ordinals = Some(vec![2, 3]);
+        // 该门覆盖 DFlash2 草稿档；不给 draft_path 会按 MTP(F16) 派生。
+        cfg.spec.draft = SpecDraft::Dflash2;
+        cfg.spec.draft_path = Some(std::path::PathBuf::from("/tmp/dflash2"));
+        cfg.parallel.mode = owl_shared::config::ParallelMode::Tensor;
+        cfg.parallel.device = vec!["41:00.0".into(), "42:00.0".into()];
         assert!(allows(&cfg, "marlin_gemm_w4a16_awq"));
         assert!(!allows(&cfg, "marlin_gemm_w4a8_awq"));
         assert!(!allows(&cfg, "owl_gguf_gemm_q4k"));
@@ -3277,10 +3306,10 @@ mod tag_filter_tests {
     #[test]
     fn w4a8_main_with_int4_head_and_dflash_allows_aux_w4a16() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a8;
         cfg.model.head_quant = HeadQuant::RtnInt4G32;
-        cfg.model.dflash2_dir = Some("/tmp/dflash2".into());
+        cfg.spec.draft_path = Some("/tmp/dflash2".into());
         cfg.spec.depth = 7;
         assert!(allows(&cfg, "marlin_gemm_w4a8_awq"), "主干 W4A8");
         assert!(allows(&cfg, "marlin_gemm_w4a16_awq"), "int4 头 W4A16");
@@ -3291,7 +3320,7 @@ mod tag_filter_tests {
     #[test]
     fn w4a8_without_aux_keeps_w4a16_out() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a8;
         cfg.model.head_quant = HeadQuant::Off;
         cfg.spec.depth = 0;
@@ -3314,8 +3343,8 @@ mod tag_filter_tests {
     #[test]
     fn tag_wildcard_escapes_all_facets() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Gguf;
-        cfg.dispatch.tag_wildcard = true;
+        cfg.model.format = ModelFormat::Gguf;
+        cfg.kernel.tag_wildcard = true;
         assert!(allows(&cfg, "marlin_gemm_w4a16_awq"), "* 应全放行");
         assert!(allows(&cfg, "owl_gguf_gemm_q4k"));
     }
@@ -3323,8 +3352,8 @@ mod tag_filter_tests {
     #[test]
     fn gguf_filter() {
         let mut cfg = OwlConfig::default();
-        cfg.model.kind = ModelKind::Gguf;
-        cfg.dispatch.kv_fp8 = false;
+        cfg.model.format = ModelFormat::Gguf;
+        cfg.kernel.kv_fp8 = false;
         assert!(allows(&cfg, "owl_gguf_gemm_q4k"));
         assert!(!allows(&cfg, "marlin_gemm_w4a16_awq"));
         assert!(allows(&cfg, "owl_add_f16"));

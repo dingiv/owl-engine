@@ -44,7 +44,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let prop_kv_lens: Vec<f32> = (0..8).map(|i| (fp + 1 + i) as f32).collect();
         let kv_len = vec![(fp + 8) as f32];
         let anchor = vec![bonus as f32];
-        let pg = self.dev.graphs.dflash.as_mut().ok_or_else(|| ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() })?;
+        // 档位门(实际图在下面按需再借;此处只判在场,故不持绑定)
+        if self.dev.graphs.dflash.is_none() {
+            return Err(ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() });
+        }
         let prof = self.boot.probes.step_profile;
         // **归因探针(2026-10-18 propose 立案;仅 prof 档)**:发射前先把 COMPUTE 流
         // 排干 ⇒ 把"本相位墙钟"拆成三块,互不污染:

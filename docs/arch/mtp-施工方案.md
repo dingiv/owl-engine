@@ -272,14 +272,14 @@ rejection 才要真 d1,vLLM 保留是为 rejection 采样,owl greedy 专属可�
 ## 十、2026-10-21 当前主线接入（M6）
 
 M0–M5 的组件/轮结构/图族仍在树上，但配置层一直没有入口：`--check` 只要
-`spec.depth>0` 就硬要求 `model.dflash2_dir`，MTP-only 档无法预检；生产
+`spec.depth>0` 就硬要求 `spec.draft_path`，MTP-only 档无法预检；生产
 `kv_fp8=true` 时，MTP 链池是 F16，而 `propose`/`prefill_extend` 仍吃主 env
 （K0 选 fp8 核）⇒ 运行期 dtype 直接拒。M6 收口如下。
 
 ### 10.1 配置与资产
 
 - 新增 `[spec] draft = "auto" | "mtp" | "dflash2"`（`SpecDraft`）。
-  - `auto`（缺省）：`model.dflash2_dir` 在场 → DFlash2；否则检查点
+  - `auto`（缺省）：`spec.draft_path` 在场 → DFlash2；否则检查点
     `mtp.*` → MTP；`dumb` → Dumb；都没有 → Off。
   - 显式 `mtp` / `dflash2`：缺对应资产 = boot 结构化拒（不静默回退）。
 - `--check`：MTP 档读主检查点 `model.safetensors.index.json` 的 `mtp.*`
@@ -349,3 +349,144 @@ prompt   MTP decode    round     verify    propose   propose.read
 - 采样域 rejection（当前 spec 轮恒 greedy；MTP 的采样 parity 未接）。
 - MTP 默认开关仍由 C7 数据裁决，当前只在 `profiles/mtp27b-3090-16k.toml`
   显式启用。
+
+---
+
+## 十·补、MTP extend v2 伪序列臂（2026-10-21 性能落地）
+
+### 10.1 问题
+
+MTP 的 extend 批行（`propose_ext` 的 `m+1` 行）走
+`ForwardCtx::attn_prefill`，但当时只注入了 `env/seq_cu`，
+`ctx.attn_v2=None` / `ctx.v2_bt8=None` ⇒ 落到 **chunked prefill** 核。
+T 虽然只有 ≤4，但核按每个 query 扫全历史 KV；8k ctx 下单次 extend
+约 8ms，成为 `propose.read` 随 ctx 增长的主项（512/2k/8k =
+6.95/9.45/19.55ms）。
+
+### 10.2 修法（工作树，5 文件 +77 行）
+
+| 面 | 文件 | 内容 |
+|---|---|---|
+| scratch 视图 | `crates/models/src/module.rs` | `AttnV2Scratch::prefix(seqs)`：复用 target verify 的 4 序列 scratch，取前 `m+1` 行零拷贝视图；越界返回 None（调用方回落旧路） |
+| 层注入 | `crates/models/src/layers/mtp.rs` | `propose_ext` 新增 `extend_v2` / `extend_bt8`，extend ctx 注入 `attn_v2` + `v2_bt8` |
+| 草稿 env | `crates/engine/src/spec_runtime.rs` | MTP 分支 `env.attn.verify_v2 = true`（只影响草稿 env；主 verify 仍按 FI/`verify_v2` 自己的档位） |
+| eager | `crates/engine/src/exec/draft.rs` | `propose_round` 构造 `[m+1, nb]` MTP 页表（每行同一条链，余页补零），取 `verify_attn_v2.prefix(m+1)` |
+| 图族 | `crates/engine/src/graph_fleet.rs` + `exec/draft.rs` | `propose` 桶图新增 `v2_bt8` 输入槽（`[m+1, nb]`）；`plan_propose_family` 按 m 取 scratch 前缀；`propose_graph_step` 每轮装填 |
+
+语义 = 每行一条伪序列：页表 = 同一条 MTP 链，`kv_lens[pos+i] =
+pos+i+1`，K0 先写本块，再由 v2 主核（在线 softmax + LSE 归并）读池。
+与 target verify 的 v2 伪序列臂同构，但池是 MTP 独立 F16 池。
+
+### 10.3 实测（release，MATH，256 tok）
+
+| prompt | 改前 decode | 改后 decode | 改前 round | 改后 round | 改前 propose | 改后 propose |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 115.73 | **118.84** | — | — | — | — |
+| 2048 | 107.18 | **118.29** | — | — | — | — |
+| 8192 | 76.72 | **108.33** | — | — | — | — |
+| 8192（单点固定 prompt） | 82.00 | **116.71** | 45.35 | **32.03** | 21.08 | **7.74** |
+
+8k 分相：`propose.read` **19.55 → 6.34 ms**，`propose.step` ~0.25ms，
+`verify` 22.9ms 不变；round 32ms ≈ verify 地板 + 小 propose。
+8k→512 的 decode 衰减从 **−34% ** 收窄到 **−2%**。
+
+### 10.4 恒等门
+
+f16 / fp8 主池各跑一次 `gpu_spec_identity_gate_27b`：
+
+```text
+spec stats: rounds=14 sum_m=23 full=4 partial=7 zero=3
+baseline 93 tok ≡ spec 93 tok（逐位）
+```
+
+m=0 / 部分接受 / 全接受三路均被覆盖。图捕获 m=0..3 四个桶全部
+`propose 桶形图捕获` 成功。
+
+### 10.5 同日排除
+
+- 草稿窗口化：`propose.read` 降但接受率崩塌（window 0: m0 6/76，
+  decode 75.4；window 4096: m0 97/144，decode 45.8）——保留全历史。
+- `spec.depth=2`：8k decode **98.9**（round 29.46ms，但 tokens/round
+  2.88），低于 depth3 116.7。
+- target `verify_xqa=true`：verify 28.67ms（FI 22.98），8k decode 98.3；
+  FI 仍优。
+- `prefill_split=true` 对 TTFT/decode 无收益；`prefill.extend` 的
+  321–386ms/次是 **host 墙时含 target prefill 排队**，nsys 下 MTP extend
+  GPU 仅约 0.35s/8k prompt（target Marlin prefill 6.2s 才是 TTFT 大头）。
+
+### 10.6 余量
+
+- `propose` 7.7ms 主要是 3 次共享 lm_head GEMV + MTP F16 权重，已接近
+  带宽墙；二期可评估 MTP 头 W4A16（§六挂账，省 ~600MB 权重）。
+- target verify 22.9ms 是 27B 权重带宽地板（~15.5ms 下界 + attention/
+  GDN），MTP 侧不再动它。
+
+---
+
+## 十一、GGUF MTP 实测（2026-10-21）
+
+### 11.1 支持面（工作树）
+
+GGUF 单文件里的 MTP 头 = `blk.<n>.nextn.*`（`eh_proj`/`enorm`/`hnorm`/
+`shared_head_norm`）+ 同块全解码层。新增：
+
+- `formats::gguf::dequant_source::GgufDequantSource`：host 把块解成 f32
+  （MTP 线性权重逐角色混 Q8_0/Q6_K/Q4_K；统一转 F16，与 AWQ MTP 同执行
+  dtype），`eh_proj` 按列半拆供 `fc_e/fc_h`。
+- `MtpPredictor::new_gguf/from_spec_gguf`：F16 plan + `SourceFacts::GGUF`
+  （norm gamma 已 +1 ⇒ `w_off=false`）。
+- `MtpPredictor` 的 Loadable 分支：GGUF 键映射到
+  `blk.<n>.nextn.*` / `blk.<n>.attn_*` / `ffn_*`。
+- `ModelCfg.mtp_dir`（可选）：主模型 + 外部 GGUF MTP 头的验证档；
+  `LoadedModel.mtp_dir` 支持目录或 `.gguf` 单文件。
+- `LoadOpts.gguf_dequant`：仅 MTP 头走 host 解量化；主模型仍走
+  `GgufSource` 零解量化生产通道。
+
+### 11.2 4B 纯 GGUF（同文件 MTP）
+
+靶位：`bartowski/Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf`
+（`blk.32.nextn.*`，MTP 层 Q8_0；单 3090 Ti；16k 档；depth=3）。
+
+| prompt | MTP decode | no-spec decode |
+|---:|---:|---:|
+| 512 | 173.8 | **198.8** |
+| 8192 | 139.0 | **188.6** |
+
+- MTP round ≈ **20.9 ms**（verify 15.0 + propose 5.0），
+  tokens/round ≈ **3.04**（AL≈2.0）。
+- TTFT@8k：MTP **1273 ms** vs no-spec **1141 ms**。
+- **结论：4B 上 MTP 净亏**（target 单步太便宜，verify 税压不过）。
+  这不是 GGUF MTP 装载失败 —— 链路跑通、AL>1，只是 4B 不适合投机。
+
+### 11.3 27B AWQ 主干 + GGUF MTP 头
+
+靶位：AWQ 27B（`mtp27b` 档）+ `[model].mtp_dir =
+models/unsloth/Qwen3.8-27B-GGUF/MTP/mtp-Qwen3.8-27B-Q4_0.gguf`；
+MTP 头逐角色 Q6_K/Q8_0/Q4_K，host 解到 F16。
+
+| prompt | GGUF MTP 头 | 原生 AWQ MTP 头 |
+|---:|---:|---:|
+| 512 | 116.1 | 118.3 |
+| 2048 | 115.6 | 117.5 |
+| 8192 | 104.3 | 106.7 |
+
+- GGUF 头 `spec.round` 218 轮 / 原生 213 轮（同 768 tok）⇒ AL 略低：
+  3.52 vs 3.61 tok/轮；propose/verify 分相基本同。
+- 结论：**27B GGUF MTP 头可用**，2–3% 的差距与 Q4_0 头量化/解量化损耗
+  一致；键映射、fc 半拆、norm `+1` 口径均被 AL 反证为正确。
+
+### 11.4 27B 纯 GGUF 目标 blocker
+
+`models/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf`
+自带 MTP 块，但主模型张量含 **IQ3_S/IQ4_XS/IQ3_XXS/IQ2_*** 等型；
+`feat/mtp-spec` 的 `PORTED` 只有 Q8_0/Q4_K/Q5_K/Q6_K，`load_gguf` 会在
+计划期响亮拒。要跑该文件需：
+1. 合入 `feat/gguf` 的 IQ3_S/IQ4_XS 内核（该 worktree 目前有未提交改动），或
+2. 用受支持的 27B GGUF 主干 + 外部 GGUF MTP 头（§11.3 已验证头侧）。
+
+### 11.5 未结：4B GGUF 的 spec≠no-spec 文本分歧
+
+4B MTP vs no-spec 同 prompt greedy 256 tok 在 **token ~171** 处分叉。
+目标输出仍连贯，但这不是逐位恒等。嫌疑 = target verify（FI T=4）
+与 decode（FI T=1）的数值路径差异，未必是 MTP 头；尚未用 dumb 草稿/
+no-FI 臂隔离。**在该分歧定谳前，GGUF MTP 只报“链路/性能”，不报“恒等门绿”。**

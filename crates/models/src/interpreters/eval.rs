@@ -11,6 +11,7 @@
 
 use crate::contract::{Bytes, Dtype, ModelError};
 use owl_iface::contract::Arg;
+use owl_iface::command::Command as DevCommand;
 use crate::ops::Op;
 use crate::tensor::TensorOps;
 use std::future::Future;
@@ -75,28 +76,11 @@ fn perf_cnt(tag: &str, n: u64) {
     owl_shared::metrics::with_metrics_store(|s| s.counter_add(tag, n, file!(), line!()));
 }
 
-/// 块池预算(字节;**0 / 缺省 = 关**)。P1″ 2026-10-14。
+/// 块池预算 / 回收开关的**唯一来源** = `EnvProvider.interp`(2026-10-21
+/// 配置收编:原 `OWL_BLOCK_POOL` / `OWL_NO_RECLAIM` env 已退场)。
 ///
-/// `OWL_NO_RECLAIM=1` ⇒ 关掉活性中途回收(诊断/对照臂)。
-///
-/// **OnceLock 记忆化**(2026-10-17 审查):原为每个 `eval_ops` 现场
-/// `std::env::var`(取进程 env 锁 + 分配 String;求值入口 = 逐算子),而本文件
-/// 的兄弟旋钮(`block_pool_budget`)早有 OnceLock 先例 ⇒ 口径归位。语义:该旋钮
-/// **boot 期定谳**(进程内改 env 不再生效;诊断档本就如此用)。
-fn no_reclaim() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // env **单一访问口**(2026-10-17 审查 §六轮:原先直读 `std::env::var_os`,
-    // 绕过 `env_reader` —— 与 J1/J4 的收口纪律相悖,且测试面的 EnvGuard 不再生效)
-    *V.get_or_init(|| owl_shared::env_reader::flag("OWL_NO_RECLAIM"))
-}
-
-/// 门 = env `OWL_BLOCK_POOL`(与本文件的 `OWL_NO_RECLAIM` 同一「诊断/调优门」
-/// 先例),**`OnceLock` 缓存一次** ⇒ 热路径零 env 查询。
-/// 引擎侧后续应升格为 `OwlConfig` 键(本 lane 文件面不含 engine/,见报告)。
-fn block_pool_budget() -> usize {
-    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| owl_shared::env_reader::parse::<usize>("OWL_BLOCK_POOL").unwrap_or(0))
-}
+/// 两个旋钮都在**入口一次性定谳**(`[pool] block_pool_bytes / no_reclaim`)
+/// —— 解释器不再有任何 env 读取,热路径零查询。
 
 /// 分段秒表(`Call` 臂宿主链分段:resolve/build/alloc/lower/launch)
 struct LapTimer {
@@ -218,7 +202,16 @@ where
                 pending: std::collections::HashMap::new(), reclaim: false, perf, env, pool: None,
             tp: tp.cloned(),
         };
-        let root = _eval_rec(t, &mut ctx).await?;
+        let root = match _eval_rec(t, &mut ctx).await {
+            Ok(r) => r,
+            Err(e) => {
+                // 错误路径也要把队列排空(否则句柄被"还有 N 条未提交"毒住,
+                // 后续 turn 的每条命令都被拒)
+                let _ = ctx.flush_batch().await;
+                return Err(e);
+            }
+        };
+        ctx.flush_batch().await?;
         // 非 scoped 口径:竞技场原样丢弃(块常驻,历史行为不变)
         Ok(root)
     })
@@ -262,7 +255,7 @@ pub fn eval_ops_scoped_env<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
-    eval_ops_scoped_env_pool(t, face, env, tp, block_pool_budget())
+    eval_ops_scoped_env_pool(t, face, env, tp, env.interp.block_pool_bytes)
 }
 
 /// scoped 求值 + **显式块池预算**(0 = 关;P1″)。
@@ -284,7 +277,7 @@ where
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
                 block_users: std::collections::HashMap::new(),
-                pending: count_pending(t), reclaim: !no_reclaim(), perf, env,
+                pending: count_pending(t), reclaim: !env.interp.no_reclaim, perf, env,
                 pool: (pool_budget > 0).then(|| BlockPool::new(pool_budget)),
             tp: tp.cloned(),
         };
@@ -347,8 +340,15 @@ where
         };
         let mut out = Vec::with_capacity(roots.len());
         for r in roots {
-            out.push(_eval_rec(r, &mut ctx).await?);
+            match _eval_rec(r, &mut ctx).await {
+                Ok(b) => out.push(b),
+                Err(e) => {
+                    let _ = ctx.flush_batch().await;
+                    return Err(e);
+                }
+            }
         }
+        ctx.flush_batch().await?;
         Ok(out)
     })
 }
@@ -409,7 +409,7 @@ where
         // `pending` 恒多算 ⇒ 中途活性回收整体失效(真回收 14/新块 1431 实测)。
         let pending = count_pending_multi(roots);
         let perf = PerfCtx::of(&env);
-        let pool_budget = block_pool_budget();
+        let pool_budget = env.interp.block_pool_bytes;
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
@@ -427,7 +427,7 @@ where
             match _eval_rec(r, &mut ctx).await {
                 Ok(b) => out.push(b),
                 Err(e) => {
-                    let _ = ctx.flush_pool().await;
+                    let _ = ctx.flush_pool().await; // flush_pool 内先提交累积批
                     let mut cand: Vec<u64> = std::mem::take(&mut ctx.arena);
                     cand.retain(|id| ctx.arena_set.contains(id));
                     cand.sort_unstable();
@@ -440,11 +440,11 @@ where
             }
         }
         ctx.flush_pool().await?;
-        // **活性收尾归因**(门:`OWL_LIVE_DIAG`;2026-10-19):
+        // **活性收尾归因**(门:`[probes] live_diag`;原 OWL_LIVE_DIAG;2026-10-19):
         // "真回收几乎为 0"时唯一要问的 = **memo 里还剩什么、靠什么吊着**:
         // 节点的 `pending`(预波消费者计数未归零)还是块的 `users`(别名/持有者)。
         // 打印前 6 大残块的 (bytes, users, pending, name) + 直方图 ⇒ 一眼定位。
-        if std::env::var_os("OWL_LIVE_DIAG").is_some() {
+        if ctx.env.diag.live_diag {
             let mut hist = [0usize; 4]; // pending==0 / ==1 / ==2 / >=3
             let mut users_hist = [0usize; 4];
             let mut live_bytes = 0usize;
@@ -480,6 +480,7 @@ where
         candidates.sort_unstable();
         candidates.dedup();
         if !candidates.is_empty() {
+            ctx.flush_batch().await?;
             ctx.face.free(&candidates).await?;
         }
         Ok(out)
@@ -600,6 +601,37 @@ where
         }
     }
 
+    /// **提交累积批**(2026-10-21):把 `queue` 攒下的发射一次交给后端。
+    ///
+    /// 调用纪律(命令面:**队列非空时 `exec` 响亮拒**):本函数必须在任何
+    /// "走单条命令"的动作(alloc/memset/free/htod/dtoh)之前调用 ——
+    /// 否则那条命令会被前端拒(这正是我们要的:不隐式重排、不隐式多跑往返)。
+    /// 空批 = 零往返(`flush` 内部判空)。
+    async fn flush_batch(&mut self) -> Result<(), ModelError> {
+        let r = self.face.flush().await?;
+        for (i, o) in r.outcomes.into_iter().enumerate() {
+            if let Err(e) = o {
+                // 下标进日志;错误**原样上抛**(不包成 Msg —— 保住 is_fatal 分类)
+                owl_shared::log_debug!("eval.batch", "累积批第 {i} 条命令失败:{e}");
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// **发射一条核**(命令面唯一入口;2026-10-21)。
+    ///
+    /// 分档判据 = **本口径有没有块池**:
+    /// - 有池(scoped 生产档):逐节点 `alloc` 命中池 = 零命令 ⇒ 发射可以**攒**
+    ///   进批,作用域收尾一次 `flush`(实测 48.0 → 28.0 µs/节点);
+    /// - 无池(plain/tap/捕获档):每个节点前面必有一次真 `alloc`(单条命令),
+    ///   批长恒 1 —— 硬攒只会多一次信封开销(实测 +7%),故走单条。
+    ///
+    /// 这条判据不改变**顺序承诺**:两条路的命令序都与源码顺序一致。
+    async fn emit_launch(&mut self, msg: owl_iface::contract::LaunchMsg) -> Result<(), ModelError> {
+        emit_launch_pooled(self.face, self.pool.is_some(), msg).await
+    }
+
     /// 输出块获取(**块池面**;P1″):命中池 = **零命令**复用死块;
     /// 未命中 = 落 server 真分配并登记容量。
     /// `zeroed`(`Op::Zeros` 语义)在命中时必须补一次设备侧 memset ——
@@ -658,10 +690,14 @@ where
             // 视图事实由调用点(张量节点)在发射时给出
             let b = Bytes::new(id, n_elems, dtype, 0);
             if zeroed {
+                // memset 是单条命令 ⇒ 先提交排着的发射(保序 + 命令面纪律)
+                self.flush_batch().await?;
                 self.face.memset_zero(&b, n_bytes).await?;
             }
             return Ok(b);
         }
+        // 真分配 = 单条命令 ⇒ 先提交排着的发射(否则被命令面拒,且顺序会错)
+        self.flush_batch().await?;
         let b = if zeroed {
             self.face.alloc(dtype, n_elems, name).await?
         } else {
@@ -679,11 +715,15 @@ where
             return Ok(());
         }
         owl_shared::slab_hint::live_diag::freed();
+        // 真归还 = 单条命令 ⇒ 先把引用该块的发射提交掉(否则 free 会插到它们前面)
+        self.flush_batch().await?;
         self.face.free(&[id]).await
     }
 
     /// 收尾:抽干池,**一条批量 free**(替代 N 条逐块 free)。
     async fn flush_pool(&mut self) -> Result<(), ModelError> {
+        // 先提交累积批(池块要被 free ⇒ 引用它们的发射必须已入设备流)
+        self.flush_batch().await?;
         let Some(mut p) = self.pool.take() else {
             return Ok(());
         };
@@ -701,6 +741,27 @@ where
         if !ids.is_empty() {
             self.face.free(&ids).await?;
         }
+        Ok(())
+    }
+}
+
+/// **发射一条核**(自由函数版:只借 `face`,不借整个 `EvalCtx`)。
+///
+/// 存在理由:`Op::Call` 的 TP allreduce 臂对 `ctx.tp` 持不可变借用,
+/// `ctx.emit_launch(..)` 会借整个 `ctx`(冲突);这里只借 `face` 一个字段。
+/// 判据同 [`EvalCtx::emit_launch`]:有块池 ⇒ 攒批;无池 ⇒ 单条(批长恒 1
+/// 只多一次信封开销)。
+async fn emit_launch_pooled<D: crate::contract::DeviceClient>(
+    face: &mut D,
+    pooled: bool,
+    msg: owl_iface::contract::LaunchMsg,
+) -> Result<(), ModelError> {
+    if pooled {
+        face.queue(DevCommand::Launch { msg })?;
+        Ok(())
+    } else {
+        // 输出块 = 实参末位 Block(客户端侧已定),返回值无用
+        let _ = face.launch(msg).await?;
         Ok(())
     }
 }
@@ -880,6 +941,7 @@ where
             } else {
                 owl_iface::contract::UpStream::H2d
             };
+            ctx.flush_batch().await?;
             let b = ctx.face.htod_on(stream, dtype, &shape, bytes, class).await?;
             ctx.track_new(b.id);
             b
@@ -947,14 +1009,14 @@ where
                 // bf16 臂(E5-DF3 同日十四;DFlash2 草稿非量化投影)
                 let nt = matches!(t.op, Op::MatmulNt);
                 let msg = crate::ops::lower_gemm(&ins, &out, n, k, m, nt, dtype == Dtype::BF16);
-                ctx.face.launch(msg).await?;
+                ctx.emit_launch(msg).await?;
             } else {
                 let msg = if matches!(t.op, Op::MatmulNt) {
                     crate::ops::lower_matmul_nt(&ins, &out, m, k, n)
                 } else {
                     crate::ops::lower_matmul(&ins, &out, m, k, n)
                 };
-                ctx.face.launch(msg).await?;
+                ctx.emit_launch(msg).await?;
             }
             out
         }
@@ -1068,7 +1130,7 @@ where
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.lower");
             }
-            ctx.face.launch(msg).await?;
+            ctx.emit_launch(msg).await?;
             if let Some(l) = lap.as_mut() {
                 l.lap("interp.host.seg.launch");
             }
@@ -1118,7 +1180,7 @@ where
                     n_bytes as u64,
                 )
                 .to_launch();
-                ctx.face.launch(call).await?;
+                ctx.emit_launch(call).await?;
                 owl_shared::metrics::with_metrics_store(|s| {
                     s.counter_add("tp.ar.1stage", 1, file!(), line!())
                 });
@@ -1207,7 +1269,7 @@ where
                             0,
                         )
                         .to_launch();
-                        ctx.face.launch(fused).await?;
+                        emit_launch_pooled(ctx.face, ctx.pool.is_some(), fused).await?;
                         return Ok(out);
                     }
                     // **两核档的路径判据**(融合档已在上分支 return ⇒ 到这里必是两核)
@@ -1234,7 +1296,7 @@ where
                     // 者之间(chunk128 ⇒ 1.3MB、decode ⇒ 10KB)。
                     .with_f8(tp.ar_f8 && n_bytes >= 262_144)
                     .to_launch();
-                    ctx.face.launch(stage).await?;
+                    emit_launch_pooled(ctx.face, ctx.pool.is_some(), stage).await?;
                     let reduce = owl_kernels::client::comm::ArReduceCall::new(
                         out.clone(),
                         tp.own.clone(),
@@ -1246,7 +1308,7 @@ where
                     )
                     .with_f8(tp.ar_f8 && n_bytes >= 262_144)
                     .to_launch();
-                    ctx.face.launch(reduce).await?;
+                    emit_launch_pooled(ctx.face, ctx.pool.is_some(), reduce).await?;
                     out // 别名:payload 原地累加(v1/push 两段路径:原地加在 payload 上)
                 }
                 None => out, // 单卡:无 TP 上下文
@@ -1342,6 +1404,11 @@ where
     // 未定义(scratch 块 eval 结束后可被池复用)。tap 无 launch/alloc
     // 权 —— 观测在结构上不可能改变计算(对照 harvest 重放污染)。
     // f16 基线(F5):观测读回按块 dtype 解码(f32 硬解码会读歪 rms)
+    // 观测窗口要读设备数据(dtoh = 单条命令)⇒ **先提交累积批**(保序)。
+    // tap 未武装是生产常态 ⇒ 这里零开销(一个 Option 判空)。
+    if ctx.tap.is_some() {
+        ctx.flush_batch().await?;
+    }
     if let Some(tap) = ctx.tap.as_deref_mut() {
         let ev = NodeEvent {
             id: t.id,
