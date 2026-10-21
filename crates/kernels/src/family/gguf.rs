@@ -397,9 +397,34 @@ pub const MMQ2_IQ3XXS_J64: &str = "owl_mmq2_iq3xxs_j64";
 /// IQ3_XXS / J=128
 pub const MMQ2_IQ3XXS_J128: &str = "owl_mmq2_iq3xxs_j128";
 
-/// 每 CTA 的权重行数(上游 ampere 档 `I = 128`;分派门要求 `n % I == 0`)
+/// 每 CTA 的权重行数(**J=16 档 = 64**、其余 = 128;与 `mmq-config-ampere` 同源)。
+///
+/// 2026-10-21 P6:verify 是 m=8 ⇒ J=16 ⇒ `ntx = 1` ⇒ CTA 数 = `n/I` 只有 40–136,
+/// 84 SM 的机器大片空闲(实测 40 CTA 时每 SM 10.2 GB/s ≈ 份额上限 ⇒ 加深流水
+/// 无用,**只能铺开 SM**)。把 J=16 档 I 减半(配 128 线程 / 4 warp)⇒ tile 数×2、
+/// SM 覆盖×2,仍是"一发一 tile"**无 fixup / 无工作区**。
+/// 不变量:`I = rows_per_warp(16) × nwarps` ⇒ 128 线程时 64、256 线程时 128。
+pub const fn mmq2_i(m: usize) -> usize {
+    if mmq2_j(m) == MMQ2_SMALL_J {
+        64
+    } else {
+        128
+    }
+}
+/// 每 CTA 线程数(与 I 联动;`nthreads = 2·I`)
+pub const fn mmq2_threads(m: usize) -> usize {
+    mmq2_i(m) * 2
+}
+/// 全宽档(J ≥ 64)的 I
 pub const MMQ2_I: usize = 128;
-/// 每 CTA 线程数(上游 `nthreads = 256`,occupancy 1)
+/// J=16 小 m 档的 I(P6:减半 ⇒ tile 数 ×2、SM 覆盖 ×2;`nthreads = 128`)
+///
+/// ⚠️ **再减到 32 不行**(2026-10-21 实测):`nthreads = 64` / 2 warp 时某个型的
+/// `load_tiles` 在 I < 64 上越界(起机 warmup 即 CUDA 700,报在随后的 FI 调用点)。
+/// 64 = `rows_per_warp(16) × 4 warp`,是这条路的**下界**(本档机器上正好 80 tile
+/// 铺 80 SM)。
+pub const MMQ2_SMALL_I: usize = 64;
+/// 全宽档的线程数
 pub const MMQ2_THREADS: usize = 256;
 /// 激活块:`block_q8_1_mmq` 字节数(16B 头 + 128 int8)
 pub const MMQ2_Q8_1_BLOCK_BYTES: usize = 144;
@@ -496,13 +521,13 @@ pub const MMQ2_TINY_J: usize = 8;
 
 /// 本臂适用门(单一产地;`linear.rs` 与门/测试同读这一份):
 /// ① 型已移植 ② `m ≥ MMQ2_SMALL_M`(decode 仍给 MMVQ;见该常量文档的实测表)
-/// ③ `n % 128 == 0`(上游 `I=128`,首版**不装 fallback**)
+/// ③ `n % mmq2_i(m) == 0`(J=16 档 64、其余 128;上游 `I` 就是 tile 宽)
 /// ④ `k % 128 == 0`(激活块 128 值)
 /// ⑤ 激活 dtype ∈ {F16, BF16}(BF16 = DFlash2 草稿执行域;量化手有对应变体)
 pub const fn mmq2_ok(ty: GgmlTy, m: usize, n: usize, k: usize) -> bool {
     mmq2_entry_for(ty, m).is_some()
         && m >= MMQ2_SMALL_M
-        && n % MMQ2_I == 0
+        && n % mmq2_i(m) == 0
         && k % MMQ2_QK == 0
 }
 
@@ -526,26 +551,31 @@ pub const fn mmq2_xq_bytes(m: usize, k: usize) -> usize {
 }
 
 /// **MMQ 发射几何**(上游 stream-k 支的"一 tile/block"形态):
-/// `grid = (ceil(n/I)·ceil(m/J), 1, 1)`、`block = (32, THREADS/32)`、
-/// `smem = J·4(ids) + X 面 + PAD(J·144, THREADS·4)`。
+/// `grid = (ceil(n/I)·ceil(m/J), 1, 1)`、`block = (32, nthreads/32)`、
+/// `smem = J·4(ids) + X 面 + PAD(J·144, nthreads·4)`。
+/// `I`/`nthreads` **按 J 档**(`mmq2_i` / `mmq2_threads`)。
 pub fn mmq2_geom(m: usize, n: usize, j: usize) -> ((u32, u32, u32), (u32, u32, u32), u32) {
     // ⚠️ 一维 grid:`ntiles = nty·ntx`(上游 stream-k 支在 tiles 效率 ≥90% 的形态 ——
     // 每 block 恰一个 tile、无 fixup)。核内用 blockIdx.x 走线性 tile 解码。
-    let nty = n.div_ceil(MMQ2_I).max(1);
+    let nty = n.div_ceil(mmq2_i(m)).max(1);
     let ntx = m.div_ceil(j).max(1);
     let gx = (nty * ntx) as u32;
     let gy = 1u32;
-    let block = (32u32, (MMQ2_THREADS / 32) as u32, 1u32);
+    let block = (32u32, (mmq2_threads(m) / 32) as u32, 1u32);
+    // smem 由调用方按型取(`mmq2_smem_for`),此处给的只是 X 面 stride=76 的档
     ((gx, gy, 1), block, mmq2_smem(j) as u32)
 }
 
 /// smem 字节(与 `vendor2/mmq.cuh::mmq_get_nbytes_shared` 逐项同式;
 /// 单测 `mmq2_smem_matches_formula` 钉住)
 pub const fn mmq2_smem(j: usize) -> usize {
+    // I / nthreads 按 J 档(J=16 ⇒ 64/128);与 config 表逐项同源
+    let i = if j == MMQ2_SMALL_J { MMQ2_SMALL_I } else { MMQ2_I };
+    let threads = i * 2;
     let nbs_ids = j * 4;
     let nbs_y = j * MMQ2_Q8_1_BLOCK_BYTES;
-    let pad_to = MMQ2_THREADS * 4;
-    nbs_ids + MMQ2_SMEM_X + nbs_y.div_ceil(pad_to) * pad_to
+    let pad_to = threads * 4;
+    nbs_ids + i * 76 * 4 + nbs_y.div_ceil(pad_to) * pad_to
 }
 
 
@@ -590,10 +620,12 @@ pub const fn mmq2_sram_stride_for(ty: GgmlTy) -> usize {
 
 /// smem 字节(**按型**取 X 面 stride;其余项与 [`mmq2_smem`] 同式)。
 pub const fn mmq2_smem_for(ty: GgmlTy, j: usize) -> usize {
+    let i = if j == MMQ2_SMALL_J { MMQ2_SMALL_I } else { MMQ2_I };
+    let threads = i * 2;
     let nbs_ids = j * 4;
-    let nbs_x = MMQ2_I * mmq2_sram_stride_for(ty) * 4;
+    let nbs_x = i * mmq2_sram_stride_for(ty) * 4;
     let nbs_y = j * MMQ2_Q8_1_BLOCK_BYTES;
-    let pad_to = MMQ2_THREADS * 4;
+    let pad_to = threads * 4;
     nbs_ids + nbs_x + nbs_y.div_ceil(pad_to) * pad_to
 }
 
