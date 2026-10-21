@@ -179,6 +179,8 @@ pub enum SemanticKernel {
     TsStamp,
     /// f16 → bf16 铸边界(草稿装载)
     CastF16Bf16,
+    /// 逐元素乘常数(f16/bf16;GGUF 草稿 GEMM 的成对指数移位)
+    Scale,
     /// bf16 → f16 铸边界(草稿采样前)
     CastBf16F16,
     /// 设备侧贪心 argmax(采样;输出 [1] f32 索引数值)
@@ -236,6 +238,10 @@ pub enum SemanticKernel {
     GgufMmq2QuantDs4,
     /// 同上(D4 布局;Q8_0/Q6_K)
     GgufMmq2QuantD4,
+    /// MMQ2 激活量化(BF16 入;DFlash2 草稿线 2026-10-21)
+    GgufMmq2QuantDs4Bf16,
+    /// MMQ2 激活量化(BF16 入;D4)
+    GgufMmq2QuantD4Bf16,
     /// **GGUF 行窗解量化**(W-2d):量化块行窗 `[n0, n0+rows)` → f16 `[rows, k]`
     /// (写进调用方给的 scratch;配 `Op::CallDst`)
     GgufCvtRange,
@@ -343,6 +349,7 @@ impl SemanticKernel {
             SemanticKernel::CtRepackA8 => "load.ct_repack_a8",
             SemanticKernel::TsStamp => "ops.ts_stamp",
             SemanticKernel::CastF16Bf16 => "elems.cast_f16_bf16",
+            SemanticKernel::Scale => "elems.scale",
             SemanticKernel::CastBf16F16 => "elems.cast_bf16_f16",
             SemanticKernel::Argmax => "ops.argmax",
             SemanticKernel::Topk16 => "ops.topk16",
@@ -361,6 +368,8 @@ impl SemanticKernel {
             SemanticKernel::GgufMmq2 => "gguf.mmq2",
             SemanticKernel::GgufMmq2QuantDs4 => "gguf.mmq2_quant_ds4",
             SemanticKernel::GgufMmq2QuantD4 => "gguf.mmq2_quant_d4",
+            SemanticKernel::GgufMmq2QuantDs4Bf16 => "gguf.mmq2_quant_ds4_bf16",
+            SemanticKernel::GgufMmq2QuantD4Bf16 => "gguf.mmq2_quant_d4_bf16",
             SemanticKernel::GgufCvtRange => "gguf.dequant_range",
             SemanticKernel::GgufGatherCols => "gguf.gather_cols",
             SemanticKernel::GgufCublasDst => "cublas.gemm_f16_dst",

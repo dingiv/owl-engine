@@ -45,6 +45,51 @@ pub mod vision;
 
 use crate::TensorOps;
 
+/// **逐元素乘常数**(f16/bf16;`2` 的幂 = 精确移位)。唯一消费者 =
+/// GGUF 块型 GEMM 的**成对指数移位**(见 `Linear::forward` 的 out_dt 臂)。
+pub(crate) fn scale16(x: &TensorOps, s: f32) -> TensorOps {
+    let shape = x.shape().to_vec();
+    let n: usize = shape.iter().product();
+    TensorOps::call(crate::ops::SemanticKernel::Scale)
+        .arg(x)
+        .arg_i32(n as i32)
+        .arg_f32(s)
+        .with_shape(x.dtype, shape)
+}
+
+/// **f16 ↔ bf16 铸边界**(两向;同 dtype 直通,零节点)。
+///
+/// 唯一实现,两个消费者:
+/// - 草稿路径(`dflash2::ensure_dt`,BF16 执行域的 cast 边界);
+/// - `Linear` 的**输出 dtype 钉定**(GGUF 块型臂的 GEMM 核写 `half*` ⇒
+///   BF16 草稿里必须铸回 BF16,否则下游按 BF16 读 F16 位型 = 静默错值)。
+///
+/// 其它 dtype 组合 = **调用方违约**(草稿执行域只有这两档),返回毒化节点
+/// 而不是 panic(图内错误走毒化链)。
+pub(crate) fn cast_16(x: &TensorOps, dt: crate::contract::Dtype) -> TensorOps {
+    use crate::contract::Dtype;
+    if x.dtype == dt {
+        return x.clone();
+    }
+    let variant = match (x.dtype, dt) {
+        (Dtype::F16, Dtype::BF16) => crate::ops::SemanticKernel::CastF16Bf16,
+        (Dtype::BF16, Dtype::F16) => crate::ops::SemanticKernel::CastBf16F16,
+        other => {
+            return TensorOps::poisoned(
+                dt,
+                x.shape().to_vec(),
+                format!("cast_16: 无 {other:?} 臂(草稿/GGUF 铸边界只接 f16↔bf16)"),
+            )
+        }
+    };
+    let shape = x.shape().to_vec();
+    let n: usize = shape.iter().product();
+    TensorOps::call(variant)
+        .arg(x)
+        .arg_i32(n as i32)
+        .with_shape(dt, shape)
+}
+
 /// 非连续窄切物化(owl_narrow_strided_{f32,f16}):行展平
 /// r ∈ [0, outer),dst[r·out_dim + d] = src[r·src_dim + start + d]。
 /// attention q gate 切分 / GDN qkv 投影列切分与 conv 权重行切分共用。

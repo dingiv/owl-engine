@@ -262,11 +262,13 @@ impl Embedding {
         }
         match &self.lm_head {
             // untied:独立头(marlin / GGUF 量化 / f16 三臂都在 `Linear` 里)
-            Some(lin) => lin.forward_inner(hidden),
+            // lm_head 的词表张量(≈0.8 GB)远大于小 n 判据阈值 ⇒ 传 0 = 关该判据
+            Some(lin) => lin.forward_inner(hidden, 0),
             // tied:**表兼头** —— 表是量化块(GGUF 档)时走同一套两发路径
             // (设计 §11.5 ②;与 `Linear` 的 GGUF 臂**同一实现**)
             None => match self.gguf_ty {
-                Some(ty) => gguf_quant_gemm(&self.w, ty, hidden, self.vocab, self.d_dim, None),
+                // 同上:头/表张量远大于阈值,0 = 关小 n 判据
+                Some(ty) => gguf_quant_gemm(&self.w, ty, hidden, self.vocab, self.d_dim, None, 0),
                 None => hidden.matmul_nt(&self.w.decl()),
             },
         }

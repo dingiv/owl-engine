@@ -36,7 +36,7 @@ use crate::layers::linear::Linear;
 use crate::layers::mlp::Mlp;
 use crate::layers::rmsnorm::RmsNorm;
 use crate::layers::rope::Rope;
-use crate::module::{ForwardCtx, KvBuffers, Module, QuantPlan, Weight};
+use crate::module::{ForwardCtx, KvBuffers, Module, PlanSource, QuantPlan, Weight};
 use crate::ops::SemanticKernel;
 use crate::TensorOps;
 
@@ -61,26 +61,22 @@ pub const TOP_K: usize = 16;
 pub const TOPK_NPARTS: usize = 16;
 /// selector 码本秩(selector_rank)
 pub const RANK: usize = 256;
-/// 噪声块 MASK token id(mask_token_id)
+/// 噪声块 MASK token id(mask_token_id;GGUF 未导出 ⇒ 家族兜底,见
+/// `formats::gguf::DraftSpec`)
 pub const MASK_TOKEN_ID: u32 = 248070;
+/// **27B 家族 target taps(0-based;HF `dflash_config.target_layer_ids`)**。
+///
+/// 单一事实源律(2026-10-20):HF 草稿档从这里取;GGUF 草稿档从
+/// `dflash.target_layers - 1` 取(文件声明优先)。**调用点禁止写死** ——
+/// taps 错一层 = AL 静默塌陷(不报错、不崩)。两者的一致性由
+/// `DraftSpec::from_gguf` 的 G0-b 对账门锁住。
+pub const DRAFT_TAP_IDS: [usize; 5] = [5, 19, 33, 47, 61];
 
 // 铸边界助手(E5-DF3 同日十四):dtype 相同直通;否则单发 cast 核。
-// 支持臂 = f16↔bf16(两向;f32 不在草稿路径)。
+// 支持臂 = f16↔bf16(两向;f32 不在草稿路径)。实现在 `layers::cast_16`
+// (与 `Linear::with_out_dtype` 共用同一份 —— 接口唯一)。
 pub(crate) fn ensure_dt(x: &TensorOps, dt: Dtype) -> TensorOps {
-    if x.dtype == dt {
-        return x.clone();
-    }
-    let variant = match (x.dtype, dt) {
-        (Dtype::F16, Dtype::BF16) => SemanticKernel::CastF16Bf16,
-        (Dtype::BF16, Dtype::F16) => SemanticKernel::CastBf16F16,
-        other => panic!("ensure_dt: 无 cast 臂 {other:?}(草稿路径仅 f16/bf16)"),
-    };
-    let shape = x.shape().to_vec();
-    let n: usize = shape.iter().product();
-    TensorOps::call(variant)
-        .arg(x)
-        .arg_i32(n as i32)
-        .with_shape(dt, shape)
+    crate::layers::cast_16(x, dt)
 }
 
 // ============================================================================
@@ -102,7 +98,11 @@ pub struct GroupedConv {
 // accessor 面(base/proj/q_proj/… 部分仅 specs/测试消费,当前臂未引用)
 #[allow(dead_code)]
 impl GroupedConv {
-    pub fn new(hidden: usize, block_size: usize, dt: Dtype) -> Self {
+    /// `proj_plan` = `kernel_projection` 的量化计划。
+    ///
+    /// ⚠️ HF 档恒 `F16`(检查点里该件是 BF16 原生);GGUF 混型档它可能是
+    /// 量化块 ⇒ 调用方按 `PlanSource::or_default` 解析(见 `DfLayer::new`)。
+    pub fn new(hidden: usize, block_size: usize, dt: Dtype, proj_plan: QuantPlan) -> Self {
         let groups = hidden / GROUP;
         Self {
             base: Weight::new_typed("base_kernel", vec![2, TAPS, hidden], dt),
@@ -110,8 +110,9 @@ impl GroupedConv {
                 "kernel_projection",
                 2 * TAPS * groups,
                 hidden,
-                QuantPlan::F16,
-            ),
+                proj_plan,
+            )
+            .with_out_dtype(dt),
             hidden,
             groups,
             block_size,
@@ -188,18 +189,35 @@ pub struct DfAttn {
 #[allow(dead_code)]
 impl DfAttn {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(hq: usize, hkv: usize, hd: usize, hidden: usize, eps: f32, plan: QuantPlan, dt: Dtype, kv_fp8: bool) -> Self {
+    pub fn new<'a>(
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        hidden: usize,
+        eps: f32,
+        plan: impl Into<PlanSource<'a>>,
+        dt: Dtype,
+        kv_fp8: bool,
+    ) -> Self {
+        // 计划 = 逐键来源(Uniform 臂忽略键);层内局部键是**声明面事实**
+        let p = plan.into();
         Self {
             // ⚠️ **草稿的 `q_proj` 无门控**(out = hq·hd),而规则表按键尾
             // `q_proj` 给的是**主模型**的 `SegmentedCol(QGate)`(Qwen3.5 主干的
             // gated attention)⇒ 双 rank 装载会在 `build_shard_pass` 的强校验处
             // 拒。这里**显式覆盖**为 `UniformCol`(切 out 维 = 每 rank 分头);
             // `shard = 1` 时规则不参与 ⇒ 零行为变化。
-            q_proj: Linear::new("q_proj", hq * hd, hidden, plan)
-                .with_tp_rule(crate::plan::rules::WeightRule::UniformCol),
-            k_proj: Linear::new("k_proj", hkv * hd, hidden, plan),
-            v_proj: Linear::new("v_proj", hkv * hd, hidden, plan),
-            o_proj: Linear::new("o_proj", hidden, hq * hd, plan),
+            // 输出 dtype 钉定 = 草稿激活域(BF16):GGUF 块型臂的 GEMM 核写
+            // F16 ⇒ 不铸会让下游 norm/attention 按 BF16 读 F16 位型(静默错值)
+            q_proj: Linear::new("q_proj", hq * hd, hidden, p.of("q_proj", hq * hd, hidden))
+                .with_tp_rule(crate::plan::rules::WeightRule::UniformCol)
+                .with_out_dtype(dt),
+            k_proj: Linear::new("k_proj", hkv * hd, hidden, p.of("k_proj", hkv * hd, hidden))
+                .with_out_dtype(dt),
+            v_proj: Linear::new("v_proj", hkv * hd, hidden, p.of("v_proj", hkv * hd, hidden))
+                .with_out_dtype(dt),
+            o_proj: Linear::new("o_proj", hidden, hq * hd, p.of("o_proj", hidden, hq * hd))
+                .with_out_dtype(dt),
             // draft q/k-norm = **plain ×w**(sglang dflash.py RMSNorm 无
             // offset,"matching HF Qwen3";曾误用 add_one —— 全 norms 系统性
             // ×(1+w) 毒化注意力温度与 selector 打分,AL=0 根因,2026-10-08 定谳)
@@ -395,7 +413,7 @@ pub struct DfLayer {
 
 impl DfLayer {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub fn new<'a>(
         hq: usize,
         hkv: usize,
         hd: usize,
@@ -403,17 +421,22 @@ impl DfLayer {
         inter: usize,
         eps: f32,
         block_size: usize,
-        plan: QuantPlan,
+        plan: impl Into<PlanSource<'a>>,
         dt: Dtype,
         kv_fp8: bool,
     ) -> Self {
+        let p = plan.into();
+        // conv 投影的计划:Uniform 档恒 F16(检查点原生);Keyed(GGUF)逐键
+        let conv_out = 2 * TAPS * (hidden / GROUP);
+        let attn_conv_plan = p.or_default("attn_conv_proj", conv_out, hidden, QuantPlan::F16);
+        let mlp_conv_plan = p.or_default("mlp_conv_proj", conv_out, hidden, QuantPlan::F16);
         Self {
             input_ln: RmsNorm::new("input_layernorm", hidden, eps),
-            attn_conv: GroupedConv::new(hidden, block_size, dt),
-            attn: DfAttn::new(hq, hkv, hd, hidden, eps, plan, dt, kv_fp8),
+            attn_conv: GroupedConv::new(hidden, block_size, dt, attn_conv_plan),
+            attn: DfAttn::new(hq, hkv, hd, hidden, eps, p, dt, kv_fp8),
             post_ln: RmsNorm::new("post_attention_layernorm", hidden, eps),
-            mlp_conv: GroupedConv::new(hidden, block_size, dt),
-            mlp: Mlp::new(hidden, inter, plan),
+            mlp_conv: GroupedConv::new(hidden, block_size, dt, mlp_conv_plan),
+            mlp: Mlp::new(hidden, inter, p).with_out_dtype(dt),
             hidden,
         }
     }
@@ -531,9 +554,10 @@ pub struct CandidateSelector {
 #[allow(dead_code)]
 impl CandidateSelector {
     /// `rank` = selector_rank(检查点家族 = RANK 256;tiny 测试参数化)。
-    pub fn new(hidden: usize, vocab: usize, rank: usize, dt: Dtype) -> Self {
+    pub fn new(hidden: usize, vocab: usize, rank: usize, dt: Dtype, proj_plan: QuantPlan) -> Self {
         Self {
-            proj: Linear::new("hidden_projection", rank, hidden, QuantPlan::F16),
+            proj: Linear::new("hidden_projection", rank, hidden, proj_plan)
+                .with_out_dtype(dt),
             a_code: Weight::new_typed("predecessor_codebook", vec![vocab, rank], dt),
             b_code: Weight::new_typed("successor_codebook", vec![vocab, rank], dt),
             vocab,
@@ -657,6 +681,15 @@ impl CandidateSelector {
 pub enum DraftFc {
     F16T(Weight),
     Q(Vec<Linear>),
+    /// GGUF 草稿源(2026-10-20 P1):五拆 Linear,权重槽 = `fc.weight` 的
+    /// **tap 列块**原始量化字节(源侧按行重排后交付 `fc_i.weight`)。
+    ///
+    /// 为什么必须五拆:GGUF 的 `fc.weight` 是 `[out=hidden, in=5·hidden]`,
+    /// 五个 tap 沿**内维**排布;量化块沿内维走,列切跨 `out` 维 ⇒ 无法在
+    /// 设备侧表达成「一个 GEMM × 列窗」(槽是扁平字节,没有行跨距)。
+    /// 源侧装载期按 tap 重排 = 纯 memcpy(5 × hidden × tap_row_bytes,
+    /// 与 fc 自身等量),设备驻留总量与单一 fc 相同。
+    G(Vec<Linear>),
 }
 
 pub struct DFlash2Draft {
@@ -763,32 +796,95 @@ impl DFlash2Draft {
         kv_fp8: bool,
     ) -> Self {
         let fc = match plan {
-            QuantPlan::W4A16 => DraftFc::Q((0..n_layers)
-                .map(|i| {
-                    Linear::new(
-                        match i {
-                            0 => "fc_0",
-                            1 => "fc_1",
-                            2 => "fc_2",
-                            3 => "fc_3",
-                            _ => "fc_4",
-                        },
-                        hidden,
-                        hidden,
-                        QuantPlan::W4A16,
-                    )
-                })
-                .collect()),
+            QuantPlan::W4A16 => DraftFc::Q(
+                (0..n_layers)
+                    .map(|i| Linear::new(fc_key(i), hidden, hidden, QuantPlan::W4A16))
+                    .collect(),
+            ),
             _ => DraftFc::F16T(Weight::new_transposed("fc", hidden, n_layers * hidden)),
         };
+        Self::assemble(
+            hidden,
+            inter,
+            hq,
+            hkv,
+            hd,
+            n_layers,
+            eps,
+            vocab,
+            fc,
+            plan.into(),
+            // HF:selector 投影恒 F16(检查点原生)
+            QuantPlan::F16,
+            dt,
+            kv_fp8,
+        )
+    }
+
+    /// **逐张量计划构造**(GGUF 草稿线;2026-10-20 P1)。
+    ///
+    /// 与 [`Self::new_with_plan_dt`] 的差别只有两处,都是**源族事实**:
+    /// 1. `plan` = `PlanSource::keyed`(GGUF 混型逐键);层内键经
+    ///    [`DraftGgufPlan`](crate::formats::gguf::draft) 译到 `blk.N.*`;
+    /// 2. `fc` 走 [`DraftFc::G`] —— 五拆 Linear,每层 `in = hidden`,
+    ///    源侧把 `fc.weight` 的 tap 列块重排成 `fc_i.weight`。
+    ///
+    /// `fc_plan` 由调用方按**源张量全形**(`[hidden, n_layers·hidden]`)查表
+    /// 得到并显式传入 —— 本函数不猜源键名(命名事实归起点层)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_dims_keyed(
+        hidden: usize,
+        inter: usize,
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        n_layers: usize,
+        eps: f32,
+        vocab: usize,
+        plan: crate::module::PlanSource<'_>,
+        fc_plan: QuantPlan,
+        selector_plan: QuantPlan,
+        dt: Dtype,
+        kv_fp8: bool,
+    ) -> Self {
+        let fc = DraftFc::G(
+            (0..n_layers)
+                .map(|i| Linear::new(fc_key(i), hidden, hidden, fc_plan).with_out_dtype(dt))
+                .collect(),
+        );
+        Self::assemble(
+            hidden, inter, hq, hkv, hd, n_layers, eps, vocab, fc, plan, selector_plan, dt, kv_fp8,
+        )
+    }
+
+    /// 共同装配体(fc 臂与计划来源均已定;
+    /// 「层计划按层号绑定」= 这条链路唯一知道层号的地方)
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        hidden: usize,
+        inter: usize,
+        hq: usize,
+        hkv: usize,
+        hd: usize,
+        n_layers: usize,
+        eps: f32,
+        vocab: usize,
+        fc: DraftFc,
+        plan: crate::module::PlanSource<'_>,
+        selector_plan: QuantPlan,
+        dt: Dtype,
+        kv_fp8: bool,
+    ) -> Self {
         Self {
             fc,
             hidden_norm: RmsNorm::new("hidden_norm", hidden, eps),
             layers: (0..n_layers)
-                .map(|_| DfLayer::new(hq, hkv, hd, hidden, inter, eps, BLOCK, plan, dt, kv_fp8))
+                .map(|i| {
+                    DfLayer::new(hq, hkv, hd, hidden, inter, eps, BLOCK, plan.at_layer(i), dt, kv_fp8)
+                })
                 .collect(),
             norm: RmsNorm::new("norm", hidden, eps),
-            selector: CandidateSelector::new(hidden, vocab, RANK, dt),
+            selector: CandidateSelector::new(hidden, vocab, RANK, dt, selector_plan),
             hidden,
             eps,
             vocab,
@@ -797,9 +893,15 @@ impl DFlash2Draft {
         }
     }
 
-    /// fc 形态观测面(specs Loadable 键映射分派用)
+    /// fc 形态观测面(specs Loadable 键映射分派用):W4A16 键族
     pub fn is_quant(&self) -> bool {
         matches!(self.fc, DraftFc::Q(_))
+    }
+
+    /// fc 形态观测面:GGUF 块字节臂(`fc_i.weight`;与 W4A16 的
+    /// `fc_i.qweight` 键族不同 —— Loadable 按本判据选键尾)
+    pub fn is_gguf_fc(&self) -> bool {
+        matches!(self.fc, DraftFc::G(_))
     }
 
     /// selector 的 `rank`（切档图输出槽形状读它 —— 与 `dtype()` 同性质的声明面）
@@ -870,6 +972,16 @@ impl DFlash2Draft {
             DraftFc::Q(lins) => {
                 // 五拆 marlin:fc_i 整块 GEMM 直吃 tap_i(matmul_nt [T,h]×[h,h];
                 // BF16 激活自动路由 marlin bf16 核,同日十二)
+                let mut acc = lins[0].forward(&inputs[0], ctx);
+                for (i, tap) in inputs.iter().enumerate().skip(1) {
+                    acc = acc.add(&lins[i].forward(tap, ctx));
+                }
+                acc
+            }
+            DraftFc::G(lins) => {
+                // 五拆 GGUF 块型(MMVQ/tile;权重字节原样)。动态范围护栏在
+                // `Linear::forward` 的 out_dt 臂(成对 2⁻⁶/2⁶ 移位)—— fc 的
+                // 输入是**未归一化的 target taps**,输出量级最大 ⇒ 不能省。
                 let mut acc = lins[0].forward(&inputs[0], ctx);
                 for (i, tap) in inputs.iter().enumerate().skip(1) {
                     acc = acc.add(&lins[i].forward(tap, ctx));
@@ -1034,6 +1146,13 @@ impl DFlash2Draft {
         }
     }
 
+    pub(crate) fn fc_g(&self) -> &[Linear] {
+        match &self.fc {
+            DraftFc::G(lins) => lins,
+            _ => unreachable!("fc_g 仅 G 形态"),
+        }
+    }
+
     /// 诊断口:fc_0 单发(E5-DF3 引擎排查;视图 vs 物化输入对拍用)
     pub fn debug_fc0(&self, tap: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         self.fc_q()[0].forward(tap, ctx)
@@ -1059,6 +1178,12 @@ impl DFlash2Draft {
 }
 
 // ---- 组件级装载(本地键;检查点键映射住 specs 家规:qwen35.rs impl Loadable)----
+/// fc 第 i 个 tap 的槽键(GGUF/W4A16 两族共用;`in` 侧都是 `hidden`)
+fn fc_key(i: usize) -> &'static str {
+    const KEYS: [&str; 8] = ["fc_0", "fc_1", "fc_2", "fc_3", "fc_4", "fc_5", "fc_6", "fc_7"];
+    KEYS[i]
+}
+
 impl crate::module::Loadable for GroupedConv {
     fn layout(&self, ctx: &crate::module::LoaderCtx) -> crate::module::LoaderOps {
         self.base.layout(ctx).chain(self.proj.layout(ctx))
@@ -1115,7 +1240,7 @@ mod tests {
     async fn gpu_dflash_conv_matches_host() {
         let (t, hidden, block) = (8usize, 64usize, 8usize);
         let groups = hidden / GROUP;
-        let conv = GroupedConv::new(hidden, block, Dtype::F16);
+        let conv = GroupedConv::new(hidden, block, Dtype::F16, QuantPlan::F16);
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
         // base [2, 2, hidden](tap0 ≈ 1 + 小扰动;tap1 小值)
         let base: Vec<f32> = (0..2 * TAPS * hidden)
@@ -1191,7 +1316,7 @@ mod tests {
     #[owl_test(gpu)]
     async fn gpu_dflash_selector_matches_host() {
         let (vocab, rank, rows) = (97usize, 16usize, DEPTH);
-        let sel = CandidateSelector::new(rank, vocab, rank, Dtype::F16); // hidden = rank(pred 维)
+        let sel = CandidateSelector::new(rank, vocab, rank, Dtype::F16, QuantPlan::F16); // hidden = rank(pred 维)
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
         let w_proj = gen(rank * rank, 3.0);
         let a_tab = gen(vocab * rank, 4.0);
@@ -1353,6 +1478,13 @@ mod tests {
                         let mut o = self.0.fc_q()[0].layout(_ctx);
                         for l in &self.0.fc_q()[1..] {
                             o = o.chain(l.layout(_ctx));
+                        }
+                        o
+                    }
+                    crate::formats::qwen35::FcShape::G => {
+                        let mut o = self.0.fc_g()[0].layout(_ctx).map_keys(|k| format!("{k}.weight"));
+                        for l in &self.0.fc_g()[1..] {
+                            o = o.chain(l.layout(_ctx).map_keys(|k| format!("{k}.weight")));
                         }
                         o
                     }
@@ -2337,7 +2469,7 @@ mod tests {
         // ---- ① conv bf16(全 bf16:x/delta/base/out;proj 线性 bf16 want)----
         let (t, hidden, block) = (8usize, 64usize, 8usize);
         let groups = hidden / GROUP;
-        let conv = GroupedConv::new(hidden, block, Dtype::BF16);
+        let conv = GroupedConv::new(hidden, block, Dtype::BF16, QuantPlan::F16);
         let base: Vec<f32> = (0..2 * TAPS * hidden)
             .map(|i| {
                 let (_s, tap, d) = (i / (TAPS * hidden), (i / hidden) % TAPS, i % hidden);
@@ -2418,7 +2550,7 @@ mod tests {
 
         // ---- ③ select bf16(proj/码本 bf16;tok 序与 host 同律)----
         let (vocab, rank, rows) = (97usize, 16usize, DEPTH);
-        let sel = CandidateSelector::new(rank, vocab, rank, Dtype::BF16);
+        let sel = CandidateSelector::new(rank, vocab, rank, Dtype::BF16, QuantPlan::F16);
         let w2 = gen(rank * rank, 3.0);
         let a_tab = gen(vocab * rank, 4.0);
         let b_tab = gen(vocab * rank, 5.0);

@@ -59,6 +59,13 @@ pub(crate) struct SpecRuntime {
     pub draft_rope: Option<Arc<Rope>>,
     /// DFlash2 target taps 数(dflash 模式 = 5;其余 0)
     pub dflash_tap_count: usize,
+    /// **DFlash2 taps 的 target 层号(0-based,升序)** —— 单一事实源:
+    /// HF 草稿 = 家族常量 `[5,19,33,47,61]`;GGUF 草稿 = `dflash.target_layers - 1`
+    /// (GGUF 侧是 1-based)。**禁止在调用点写死**:错一层 = AL 静默塌陷。
+    /// 无 spec / notaps ⇒ 空。
+    pub dflash_tap_ids: std::sync::Arc<Vec<usize>>,
+    /// 噪声块 mask token(GGUF 草稿可能未导出 → 家族兜底,见 DraftSpec)
+    pub dflash_mask_token: u32,
     /// **草稿池几何**(层数, hkv, hd;**分片后**;P2.1-b)—— 池分配/预算的单源。
     /// `None` = 非 DFlash2 档(池不分配)
     pub draft_geom: Option<(usize, usize, usize)>,
@@ -113,6 +120,9 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) dumb: bool,
     /// 草稿池 e4m3(B6 偷显存;AL 有损需 A/B)
     pub(crate) draft_kv_fp8: bool,
+    /// **target 侧共享事实**(词表/层数/hidden;草稿不自带 —— 仅 GGUF 草稿
+    /// 的声明校验与码本行数用)
+    pub(crate) target: owl_models::formats::gguf::TargetFacts,
     /// DFlash2 taps 退回 last_hidden(排查开关)
     pub(crate) notaps: bool,
     /// **本 rank 的 TP 计划**(P2.1-a;`None`/`is_single()` = 单卡 ⇒ 逐字节旧行为)。
@@ -174,13 +184,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             }
         }
     };
-    let depth = if mode == SpecMode::Off {
-        0
-    } else if mode == SpecMode::DFlash2 {
-        inp.depth_raw.min(7)
-    } else {
-        inp.depth_raw.min(3)
-    };
+    // **深度 = 配置唯一真源**(2026-10-21):此前这里按族硬钳(DFlash2 `min(7)`、
+    // MTP `min(3)`),MTP 因此只能跑 3 步 —— 而实测第 4~7 步接受率仍 70~80%
+    // (depth 7 比 3 在 8k 上快 ~10%、512 上快 ~21%)。上限由 `[spec] depth`
+    // 的校验面统一挡(`SPEC_DEPTH_MAX`,结构性行容量),此处不再截断。
+    let depth = if mode == SpecMode::Off { 0 } else { inp.depth_raw };
     if mode != SpecMode::Off {
         owl_shared::log_info!("boot", "spec 模式 = {:?} depth={depth}(注:spec 轮恒 greedy,采样 parity 挂 D4 device accept)",
             mode
@@ -189,6 +197,13 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     // 草稿器装载(C7;embed/lm_head 均共享 target)
     // 草稿 dtype:缺省 BF16(量化族/无草稿);DFlash2 分支按**检查点事实**改写
     let mut draft_dt = owl_models::contract::Dtype::BF16;
+    // DFlash2 草稿事实(HF / GGUF 两源共同填写;单一事实源)
+    let mut dflash_tap_ids: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(Vec::new());
+    let mut dflash_mask_token = owl_models::layers::dflash2::MASK_TOKEN_ID;
+    // (max_pos, rotary_dim, theta)
+    let mut draft_rope_facts: Option<(usize, usize, f32)> = None;
+    // (layers, hkv, hd, hq)
+    let mut draft_geom_raw: Option<(usize, usize, usize, usize)> = None;
     let drafter = match mode {
         SpecMode::Mtp => {
             let dir = inp.mtp_dir.ok_or_else(|| ModelError::EngineInvariant { what: "Mtp 模式缺 mtp_dir(模式裁决与输入不一致)".into() })?;
@@ -226,37 +241,73 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             // (draft_dt 在外层声明:下面按检查点事实改写)
             let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant { what: "DFlash2 模式缺 dflash2_dir(模式裁决与输入不一致)".into() })?;
             let t_draft = std::time::Instant::now();
-            // 声明:草稿检查点自己的 config(组件档)+ 起点格式探测 → fc 臂;
-            // 装载走通用入口(BF16 全程;设备重排 = 能力自述裁决)
-            let d2 = match inp.tp {
-                Some(tp) if !tp.is_single() => {
-                    owl_models::formats::qwen35::dflash2_draft_sharded(
-                        std::path::Path::new(dir),
-                        inp.draft_kv_fp8,
-                        tp,
-                    )?
-                }
-                _ => owl_models::formats::qwen35::dflash2_draft(
-                    std::path::Path::new(dir),
-                    inp.draft_kv_fp8,
-                )?,
-            };
             // 草稿装载 dtype = **草稿执行 dtype 单源**(恒 BF16;F16 路在
             // propose 残差流上溢出 —— 定谳见 `qwen35::draft_exec_dt` 注)
             draft_dt = owl_models::formats::qwen35::draft_exec_dt();
-            let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
-            let draft_manifest =
-                owl_models::formats::load::load_from_dir(std::path::Path::new(dir), face, &d2, opts).await?;
-            owl_models::formats::load::manifest_mem_ledger(&draft_manifest, "draft-mem");
-            owl_shared::log_info!("boot", "DFlash2 草稿装载(depth={depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
-            Some(Drafter::DFlash2(Arc::new(d2)))
+            let path = std::path::Path::new(dir);
+            // **草稿源枚举**(2026-10-20 DFlash2-GGUF 线):目录 = HF 检查点;
+            // 文件 = GGUF 草稿。一个配置键两种源 —— 由**路径形态**判别,
+            // 不新增配置项(`site.draft_dir` 原样可用)。
+            if path.is_file() {
+                if let Some(tp) = inp.tp {
+                    if !tp.is_single() {
+                        return Err(ModelError::Msg(
+                            "GGUF 草稿 v1 只支持单卡(TP 草稿分片挂 P4;请关 tp_draft 或换 HF 草稿)"
+                                .into(),
+                        ));
+                    }
+                }
+                let boot = owl_models::formats::gguf::GgufDraftBoot::open(path, inp.target)?;
+                let gs = &boot.spec;
+                owl_shared::log_info!(
+                    "boot",
+                    "GGUF 草稿:{} · {} 层 {}H/{}KV/{}D · taps {:?}(GGUF 1-based 原值已归一) · \
+                     block {} / conv {}·{} / selector rank {} top {} · mask {}",
+                    path.display(),
+                    gs.layers, gs.hq, gs.hkv, gs.hd, gs.tap_ids,
+                    gs.block, gs.conv_taps, gs.conv_group, gs.rank, gs.top_k, gs.mask_token
+                );
+                let d2 = boot.draft(draft_dt, inp.draft_kv_fp8)?;
+                let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
+                let manifest = boot.load(face, &d2, opts).await?;
+                owl_models::formats::load::manifest_mem_ledger(&manifest, "draft-mem");
+                dflash_tap_ids = std::sync::Arc::new(gs.tap_ids.clone());
+                dflash_mask_token = gs.mask_token;
+                draft_rope_facts = Some((gs.rope_max_pos, gs.hd, gs.rope_theta));
+                draft_geom_raw = Some((gs.layers, gs.hkv, gs.hd, gs.hq));
+                owl_shared::log_info!(
+                    "boot",
+                    "DFlash2 GGUF 草稿装载(depth={depth};块字节驻留 + 码本反量化) {:.2}s",
+                    t_draft.elapsed().as_secs_f32()
+                );
+                Some(Drafter::DFlash2(Arc::new(d2)))
+            } else {
+                // 声明:草稿检查点自己的 config(组件档)+ 起点格式探测 → fc 臂;
+                // 装载走通用入口(BF16 全程;设备重排 = 能力自述裁决)
+                let d2 = match inp.tp {
+                    Some(tp) if !tp.is_single() => {
+                        owl_models::formats::qwen35::dflash2_draft_sharded(path, inp.draft_kv_fp8, tp)?
+                    }
+                    _ => owl_models::formats::qwen35::dflash2_draft(path, inp.draft_kv_fp8)?,
+                };
+                let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
+                let draft_manifest =
+                    owl_models::formats::load::load_from_dir(path, face, &d2, opts).await?;
+                owl_models::formats::load::manifest_mem_ledger(&draft_manifest, "draft-mem");
+                dflash_tap_ids =
+                    std::sync::Arc::new(owl_models::layers::dflash2::DRAFT_TAP_IDS.to_vec());
+                dflash_mask_token = owl_models::layers::dflash2::MASK_TOKEN_ID;
+                owl_shared::log_info!("boot", "DFlash2 草稿装载(depth={depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
+                Some(Drafter::DFlash2(Arc::new(d2)))
+            }
         }
         _ => None,
     };
     // DFlash2 草稿 rope(θ 1e7;z-lab 检查点家族)
     let draft_rope = match &drafter {
         Some(Drafter::DFlash2(_)) => {
-            let dr = Rope::new(262_144, 128, 128, 1.0e7)?;
+            let (max_pos, dim, theta) = draft_rope_facts.unwrap_or((262_144, 128, 1.0e7));
+            let dr = Rope::new(max_pos, dim, dim, theta)?;
             let (shard, slice_id) = match inp.tp {
                 Some(tp) => (tp.world(), tp.rank()),
                 None => (1, 0),
@@ -277,7 +328,22 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         _ => None,
     };
     // DFlash2 target taps 数(dflash 模式 = 5 层;notaps 退 last_hidden = 0)
-    let dflash_tap_count = if mode == SpecMode::DFlash2 && !inp.notaps { 5 } else { 0 };
+    let dflash_tap_count = if mode == SpecMode::DFlash2 && !inp.notaps {
+        dflash_tap_ids.len()
+    } else {
+        0
+    };
+    if mode == SpecMode::DFlash2 && !inp.notaps {
+        // 层号合法性(启动期判死:`tapped_hidden` 的结构保证是"层号必在域内")
+        if let Some(&last) = dflash_tap_ids.last() {
+            if last >= inp.target.layers {
+                return Err(ModelError::Msg(format!(
+                    "DFlash2 taps {dflash_tap_ids:?} 越界(target {} 层)",
+                    inp.target.layers
+                )));
+            }
+        }
+    }
     // 草稿池几何(**分片后**;P2.1-b):从检查点声明 + 本 rank 计划算(不再用写死的 const)
     let (draft_geom, draft_env) = match &drafter {
         Some(Drafter::Mtp(_)) => {
@@ -292,18 +358,23 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             // 每行一条 MTP 页链、长 ctx 下远比 chunked prefill 的
             // per-query 全历史扫描便宜。只影响草稿 env,主 verify 仍按
             // 自己的 dispatch.verify_v2/FI 档。
-            env.attn.verify_v2 = true;
+            env.attn.verify_arm = owl_shared::config::VerifyArm::V2;
             (None, env)
         }
         Some(Drafter::DFlash2(_)) => {
-            let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant {
-                what: "DFlash2 模式缺 dflash2_dir(模式裁决与输入不一致)".into(),
-            })?;
-            let tp = inp.tp.unwrap_or_else(owl_models::plan::tp::TpPlan::single);
-            let g = owl_models::formats::qwen35::dflash2_draft_geom(
-                std::path::Path::new(dir),
-                tp,
-            )?;
+            // GGUF 草稿:几何已在开箱时定(不重开容器);HF:从 config + 本 rank 计划算
+            let g = match draft_geom_raw {
+                Some((layers, hkv, hd, hq)) => {
+                    owl_models::formats::qwen35::DraftGeom { layers, hq, hkv, hd }
+                }
+                None => {
+                    let dir = inp.dflash2_dir.ok_or_else(|| {
+                        ModelError::EngineInvariant { what: "DFlash2 模式缺 dflash2_dir".into() }
+                    })?;
+                    let tp = inp.tp.unwrap_or_else(owl_models::plan::tp::TpPlan::single);
+                    owl_models::formats::qwen35::dflash2_draft_geom(std::path::Path::new(dir), tp)?
+                }
+            };
             // 草稿算子环境 = 引擎 env + **草稿几何**(几何门对账的单一来源;
             // 主模型路径不消费本字段 ⇒ 逐字节不变)
             let mut env = inp.base_env;
@@ -321,6 +392,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             // **草稿权重 plan 是独立事实**:DFlash2 量化族 = W4A16(非 AWQ),
             // 未量化族 = F16。若沿用主干的 W4A8 tag,草稿 `marlin_gemm_w4a16_*`
             // 会在 picker 的 tag 过滤处被拒(2026-10-21 W4A8 组合实测)。
+            let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant {
+                what: "DFlash2 模式缺 dflash2_dir(draft env 构造)".into(),
+            })?;
             env.quant = if owl_models::formats::qwen35::draft_is_quantized(
                 std::path::Path::new(dir),
             )? {
@@ -338,6 +412,8 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         drafter,
         draft_rope,
         dflash_tap_count,
+        dflash_tap_ids,
+        dflash_mask_token,
         draft_geom,
         draft_env,
         draft_dt,

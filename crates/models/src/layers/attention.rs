@@ -519,7 +519,12 @@ impl Attention {
         // 门 = **两件套都在场**(`ctx.fi` 面 + `fi_plan_ctx` 上界):缺上界 ⇒ 本树
         // **不换** FI 臂(回落 v2/XQA),而不是拿占位 ctx 烘表 —— 后者是"文本连贯
         // 但错"的历史来源(实测踩过),也是 piecewise 断点臂退役后唯一的假绿口。
-        if tokens == 1 && ctx.env.kv.is_fp8() {
+        // **臂 = 单值**(2026-10-21):只有 `decode_arm = "fi"` 才走本臂;
+        // 从前是"fi 面在场就换"(面由 `decode_fi` 决定)⇒ 面/臂两套真源。
+        if tokens == 1
+            && ctx.env.kv.is_fp8()
+            && ctx.env.attn.decode_arm.uses_fi()
+        {
             if let (Some(fi), Some(fi_ctx_baked)) = (ctx.fi.as_ref(), ctx.fi_plan_ctx) {
                 let y = fi_core_node(
                     FiCoreGeom {
@@ -556,7 +561,7 @@ impl Attention {
         }
         // XQA 臂优先(2026-10-13 ②;T=1 裸 decode)。池/形状不匹配 ⇒
         // `ctx.xqa` 为 None ⇒ 自动回落 v2 主核(graceful,与 verify 臂同款纪律)。
-        if tokens == 1 && ctx.env.attn.decode_xqa {
+        if tokens == 1 && matches!(ctx.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa) {
             if let Some(x) = ctx.xqa.as_ref() {
                 note_arm("attn.arm.decode.xqa");
                 return self.decode_xqa_arm(q, gate, wr, kv, ctx, pol, x);
@@ -1213,7 +1218,14 @@ impl Attention {
                     // XQA 臂(2026-10-13 D3):kNHD fp8 池 + spec-dec q=1+K 单遍。
                     // 语义与 v2 伪序列臂等价(因果块 [anchor, d1..dk]),但 KV 只
                     // 读一遍 + GQA 内共享读;单算子实测 ctx8192 5.40×。
-                    if tokens <= 16 && ctx.env.attn.verify_xqa {
+                    // **臂 = 单值**(2026-10-21):XQA 只在 `verify_arm = "xqa"`;
+                    // 能力门(xqa 面/q 形状)不满足则**显式落下一级**(v2 →
+                    // 预填族),不是静默换臂 —— 落哪级由 boot 的 `attn.arm.verify.*`
+                    // 计数自证。
+                    let varm = ctx.env.attn.verify_arm;
+                    if tokens <= 16
+                        && matches!(varm, owl_shared::config::VerifyArm::Xqa)
+                    {
                         if let Some(x) = ctx.xqa.as_ref() {
                             if x.q_seq_len == tokens {
                                 note_arm("attn.arm.verify.xqa");
@@ -1224,7 +1236,16 @@ impl Attention {
                             }
                         }
                     }
-                    if tokens <= 16 && ctx.env.attn.verify_v2 {
+                    // v2 是 `xqa` 的**回落级**,也是 `v2` 的本臂;`fi` / `prefill`
+                    // 两臂都**不许**偷跑 v2(历史坑:`verify_v2` 缺省 true 曾把
+                    // FI 整条臂吃掉)。
+                    if tokens <= 16
+                        && !matches!(
+                            varm,
+                            owl_shared::config::VerifyArm::Fi
+                                | owl_shared::config::VerifyArm::Prefill
+                        )
+                    {
                         if let (Some(s2), Some(bt8)) =
                             (ctx.attn_v2.as_ref(), ctx.v2_bt8.as_ref())
                         {
@@ -1262,7 +1283,13 @@ impl Attention {
                         // 是 0.437 ms/层,而 t<128 回落核同形状 6.7 ms/层;
                         // 历史硬编码 128 的依据被该单测推翻 ⇒ 收成配置旋钮)
                         let fi_min_tokens = ctx.env.attn.fi_min_tokens;
-                        if let Some(fi) = &ctx.fi {
+                        // **verify 面的 FI 由臂单值定**(2026-10-21):`verify_bt8`
+                        // 在场 = 这是 verify 图,此时只有 `verify_arm = "fi"` 才许
+                        // 走 FI;`v2`/`xqa`/`prefill` 三臂都**跳过**它(从前 FI 在
+                        // 预填族里无条件先命中 ⇒ 「关掉 v2 就自动变 FI」的暗道)。
+                        // prefill 面(v2_bt8 缺席)行为不变:FI 仍是主臂。
+                        let fi_allowed = ctx.v2_bt8.is_none() || varm.uses_fi();
+                        if let Some(fi) = ctx.fi.as_ref().filter(|_| fi_allowed) {
                             if tokens >= fi_min_tokens {
                                 // 同一条臂服务 prefill 与 verify;`v2_bt8` 只在 verify 图声明
                                 note_arm(if ctx.v2_bt8.is_some() {
@@ -2579,16 +2606,14 @@ mod owl_port_tests {
         // 两臂 ctx 预构造(KvBuffers 非 Clone → 各自借用同一份池)
         let mut ctx_v2 = ForwardCtx::attn_prefill(t_len, &pos, &kv, &rp, &slots, &lens);
         let mut env_v2 = fp8_env();
-        env_v2.attn.verify_v2 = true;
-        env_v2.attn.verify_xqa = false;
+        env_v2.attn.verify_arm = owl_shared::config::VerifyArm::V2;
         ctx_v2.env = env_v2;
         ctx_v2.attn_v2 = Some(v2);
         ctx_v2.v2_bt8 = Some(&bt8);
 
         let mut ctx_x = ForwardCtx::attn_prefill(t_len, &pos, &kv, &rp, &slots, &lens);
         let mut env_x = fp8_env();
-        env_x.attn.verify_v2 = false;
-        env_x.attn.verify_xqa = true;
+        env_x.attn.verify_arm = owl_shared::config::VerifyArm::Xqa;
         ctx_x.env = env_x;
         ctx_x.xqa = Some(xqa);
 

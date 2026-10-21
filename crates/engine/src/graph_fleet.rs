@@ -232,23 +232,22 @@ impl<D: DeviceClient> GraphFleet<D> {
         // ⚠️ 判据 = 建树期"FI 面是否真登记"(`*_fi_node`),**不是旋钮** ——
         // 按旋钮猜曾把"FI 根本没进图、跑的是回落臂"报成 "FI(单图)"(坑册 §58)。
         {
-            let arm = |fi_node: bool, xqa: bool, v2: bool| -> String {
+            // 报法 = **请求臂 + 节点事实**:`fi(图内FI)` = 臂是 fi 且图里真有 FI 槽;
+            // 若臂是 fi 但没有 `(图内FI)` 后缀 ⇒ 图/层两套真源打架(单键化前的
+            // 静默坑),这一行直接暴露。
+            let arm = |fi_node: bool, want: &str| -> String {
                 if fi_node {
-                    "FI(单图)".to_string()
-                } else if xqa {
-                    "XQA".to_string()
-                } else if v2 {
-                    "v2".to_string()
+                    format!("{want}(图内FI)")
                 } else {
-                    "prefill族".to_string()
+                    want.to_string()
                 }
             };
             owl_shared::log_info!(
                 "boot",
                 "现役臂: prefill={} | verify={} | decode={} | spec=depth{} | kv_fp8={}",
                 if boot.knobs.env.attn.fi { "FI" } else { "自研读核" },
-                arm(verify_fi_node, boot.knobs.env.attn.verify_xqa, boot.knobs.env.attn.verify_v2),
-                arm(decode_fi_node, boot.knobs.env.attn.decode_xqa, false),
+                arm(verify_fi_node, boot.knobs.env.attn.verify_arm.as_str()),
+                arm(decode_fi_node, boot.knobs.env.attn.decode_arm.as_str()),
                 boot.spec.depth,
                 boot.pool.geom.kv_fp8,
             );
@@ -356,6 +355,8 @@ impl<D: DeviceClient> GraphFleet<D> {
         // `vocab_size()` 仍是词表全量(embed/tokenizer 面用)。
         let vocab = boot.model.logits_vocab();
         let knobs = boot.knobs;
+        // taps 层号表(闭包 'static ⇒ Arc 持有;单一事实源 = SpecRuntime)
+        let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let kv_caches = pool.kv_caches();
         let gdn_caches = pool.gdn_caches();
         let bt_leaf = pool.bt_leaf();
@@ -364,7 +365,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         // (`xqa_seq` = kv_len 的 **u32 位型** —— 核按 `const uint32_t*` 读,
         //  直接写 f32 数值会拿到浮点位型;`xqa_sem` = 每轮写零)。
         // 槽只在 `decode_xqa` 开时才加 ⇒ 关时图拓扑与历史一致(零影响)。
-        let xqa_decode_on = knobs.env.attn.decode_xqa;
+        let xqa_decode_on = matches!(knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa);
         let xqa_decode_ctx = if xqa_decode_on { pool.xqa_ctx() } else { None };
         let xqa_dec_sem_n = if xqa_decode_on { pool.xqa_sem_n() } else { 0 };
         // B4:decode 图 taps(DFlash2 降级期逐 token 草稿同步的取数面;
@@ -372,8 +373,6 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 仅多 5 个 [1,hidden] 输出槽写;非 dflash 走原 forward(拓扑不变)
         let decode_taps = boot.spec.dflash_tap_count > 0;
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
-        let fi_nb = pool.geom.nb;
-        let dfi_on = knobs.env.attn.decode_fi; // 闭包 'static:先取值(同 xqa_decode_on 纪律)
         // **图档单图烘 plan 档**(2026-10-18;`[dispatch] fi_plan_bake`):
         // Some(ctx) = decode **不进 piecewise**,FI 核留图内,且喂 FI 的
         // `ctx_total` 用该上界烘死 ⇒ 烘出的调度表按上界枚举工作项(运行期
@@ -381,6 +380,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 上界必须 ≥ 任何可能出现的 ctx(否则表的工作项数 < 运行期 chunk 数 ⇒
         // V1 那个 stride 错),由配置校验拒启兜底。
         let plan_bake: Option<usize> = knobs.fi_plan_bake;
+        // **单键臂 → 闭包常量**(2026-10-21 合并):闭包捕获 'static ⇒ 先取值
+        let dfi_on = knobs.env.attn.decode_arm.uses_fi();
+        let fi_nb = pool.geom.nb;
         // **臂事实位**(2026-10-18,同 verify 律):decode 侧 FI 面是否真登记。
         let dfi_node_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dfi_node_seen_c = dfi_node_seen.clone();
@@ -482,7 +484,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             // B4:降级期取数面 —— tapped_hidden 拿末层 hidden + 5 层 taps
             // (零额外前向;l m_head 与 forward 同式)。非 dflash 原路(位等价)
             let tree = if decode_taps {
-                let (hidden, taps) = model.tapped_hidden(&ids, &ctx, &[5, 19, 33, 47, 61]);
+                let (hidden, taps) = model.tapped_hidden(&ids, &ctx, tap_ids.as_slice());
                 for (i, t) in taps.iter().enumerate() {
                     sc.output(format!("tap{i}"), t)?;
                 }
@@ -537,7 +539,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                     }
                     // FI 断点臂(session/T=1;`decode_fi`):表四件套(位型过线,
                     // u32 → f32)。init 与占位 ctx_total(=1 行)自洽:nb_pages=1
-                    if knobs.env.attn.decode_fi {
+                    if knobs.env.attn.decode_arm.uses_fi() {
                         v.push(InputSlot::f32("fi_q_cu", 2).init(vec![0.0, f32::from_bits(1)]));
                         v.push(InputSlot::f32("fi_indices", pool.geom.nb)
                             .init((0..pool.geom.nb).map(|i| f32::from_bits(i as u32)).collect()));
@@ -729,6 +731,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let knobs = boot.knobs;
         let spec_mode = boot.spec.mode;
         let depth1 = boot.spec.depth + 1;
+        let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let model_v = Arc::clone(&boot.model);
         let rp_v = boot.rope.clone();
         let kv_caches = pool.kv_caches();
@@ -759,7 +762,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 配置层已校验二者配套)。verify 恒随 `[dispatch] fi_plan_bake`
         // (`fi_plan_bake_verify` 旋钮已随断点面一并退役)。
         let vfi_bake: Option<usize> = knobs.fi_plan_bake;
-        let fi_want = knobs.env.attn.verify_fi;
+        // **臂 = 单值**(2026-10-21):verify 面是否带 FI 四件套槽,只看
+        // `verify_arm`;从前是 `verify_fi` 布尔 + 层内 `verify_v2` 抢前的隐性组合。
+        let fi_want = knobs.env.attn.verify_arm.uses_fi();
         let mut vouts = vec![
             OutputSlot { name: "tok".into(), shape: vec![depth1, 1], dtype: Dtype::F32 },
             OutputSlot { name: "hid".into(), shape: vec![depth1, dims.hidden], dtype: dims.dtype },
@@ -837,6 +842,8 @@ impl<D: DeviceClient> GraphFleet<D> {
         // kcs/vcs = 主池叶子(FI 与其余臂同池;与 kv_caches 同源)
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
         let fi_nb = pool.geom.nb; // 闭包 'static:借 boot 的字段必须先取值(同 kv_caches 纪律)
+        // **decode FI 臂**(2026-10-21 单键化):闭包捕获 'static ⇒ 先取值
+        let dfi_on = knobs.env.attn.decode_arm.uses_fi();
         // 图内臂把 FI plan 的 ctx 烘成上界(表由引擎每轮 sync 成精确值)
         let vfi_bake_c = vfi_bake;
         // **臂事实位**(2026-10-18,同 "槽在场≠节点在场" 律):FI 面是否真登记进本图
@@ -945,7 +952,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 ctx.gdn_tap = Some(tap.clone());
                 let vocab = model_v.logits_vocab();
                 let (hidden, taps) = if dflash_tap_decl {
-                    let (h, t) = model_v.tapped_hidden(&ids, &ctx, &[5, 19, 33, 47, 61]);
+                    let (h, t) = model_v.tapped_hidden(&ids, &ctx, tap_ids.as_slice());
                     if dflash_taps {
                         for (i, t) in t.iter().enumerate() {
                             sc.output(format!("tap{i}"), t)?;
@@ -1024,7 +1031,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let mut fold_graphs = Vec::new();
-        let n_rec = pool.gdn_count() * 8;
+        let n_rec = pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX;
         let rec_blks: Vec<Bytes> = (0..n_rec)
             .map(|i| {
                 vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {

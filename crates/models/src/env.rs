@@ -260,20 +260,13 @@ pub struct AttnEnv {
     pub prefill_split: bool,
     /// 诊断二分:强制 naive 回退(paged 数值质量 A/B)
     pub force_naive_prefill: bool,
-    /// verify 臂选择(2026-10-13 D3):true = v2 伪序列臂;false = prefill 族
-    pub verify_v2: bool,
-    /// verify 臂改走 XQA(true 且 ctx.xqa 在场时优先于 verify_v2)
-    pub verify_xqa: bool,
-    /// **verify 图改段驱动件**(piecewise;注意力核 = 断点,在段间 eager 重放
-    /// ⇒ 核可以走"每轮按 ctx 重算 plan"的臂,如 FI split)。零断点 = 退化单图
-    /// **verify 走 FI 断点臂**(V1b):FI 核移出图 ⇒ split 档 plan 每轮按本轮 ctx
-    /// 重算(四件套走输入槽;`ctx_total` 走宿主标量槽)
-    pub verify_fi: bool,
-    /// **decode(T=1)走 FI 断点臂**(V1c):session 常驻图改分段捕获,
-    /// 断点挂 decode 核(四件套走输入槽 + `ctx_total` 宿主标量槽)
-    pub decode_fi: bool,
-    /// 裸 decode 走 XQA(第二份实例化 `M_TILESIZE=16`;shape/feature 不匹配自动回落 v2)
-    pub decode_xqa: bool,
+    /// **verify 臂(单值;2026-10-21 取代 verify_v2/verify_xqa/verify_fi 三布尔)**
+    ///
+    /// 图层按本字段**线性**选臂(每级能力门不满足 → 下一级),不再是
+    /// 「三个布尔谁先命中」;`plain` 缺省 = `V2`(生产基线零变化)。
+    pub verify_arm: owl_shared::config::VerifyArm,
+    /// **decode 臂(单值;取代 decode_fi/decode_xqa)**
+    pub decode_arm: owl_shared::config::DecodeArm,
     /// FI 接管的 T 下限(`dispatch.fi_min_tokens`;t ≥ 此值走 FI 主臂)
     pub fi_min_tokens: usize,
     /// prefill(chunked q=T)走 XQA(同一份 `M_TILESIZE=32` 实例化;缺省 false =
@@ -350,10 +343,26 @@ impl EvalPhase {
     }
 }
 
+/// **GGUF 块型臂的旋钮面**(models 侧消费;配置真源 = `[dispatch]`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GgufEnv {
+    /// 小 n 走 MMVQ 的张量字节上限(MiB;`0` = 关)
+    /// —— 语义见 `owl_shared::config::DispatchCfg::gguf_mmvq_l2_mib`
+    pub mmvq_l2_mib: usize,
+}
+
+impl Default for GgufEnv {
+    fn default() -> Self {
+        Self { mmvq_l2_mib: 4 }
+    }
+}
+
 /// 解释器执行环境完备描述(默认 = 生产基线 + 无硬件环境)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EnvProvider {
     pub gdn: GdnEnv,
+    /// GGUF 块型臂旋钮(小 n 判据等)
+    pub gguf: GgufEnv,
     pub hw: HwEnv,
     /// 量化方案(F16 / W4A16 / W4A16Awq;W4A8 = REQ-CTX-01 一 flag 宿主)
     pub quant: QuantPlan,
@@ -396,11 +405,8 @@ impl EnvProvider {
                 qkv_fuse: d.qkv_fuse,
                 prefill_split: d.prefill_split,
                 force_naive_prefill: d.force_naive_prefill,
-                verify_v2: d.verify_v2,
-                verify_xqa: d.verify_xqa,
-                verify_fi: d.verify_fi,
-                decode_fi: d.decode_fi,
-                decode_xqa: d.decode_xqa,
+                verify_arm: d.verify_arm,
+                decode_arm: d.decode_arm,
                 fi_min_tokens: d.fi_min_tokens,
                 xqa_prefill: d.xqa_prefill,
                 // FI **恒启用**(2026-10-13 用户令:移除开关,没有不启用的情况;
@@ -409,6 +415,9 @@ impl EnvProvider {
                 // 「FI 读核 vs 自研读核」同 boot 同分块的单变量对照(缺省 = 恒启用,
                 // 生产语义零变化;确认病灶后可撤)
                 fi: !owl_shared::env_reader::flag("OWL_DIAG_NO_FI"),
+            },
+            gguf: GgufEnv {
+                mmvq_l2_mib: d.gguf_mmvq_l2_mib,
             },
             gdn: GdnEnv {
                 chunked: d.gdn_chunked,

@@ -2087,6 +2087,202 @@ row-parallel 侧的切片/别名路径)。
 (写 2×、读 1× = 静默截断)。改为 `leg.host_slot_bytes()` 并去掉世界守卫;
 用例 `disk_block_is_the_host_slot_under_tp` 钉死“计划字节 = 2 页、盘槽数按链块算”。
 
+## 二十四、IQ 族落地：IQ4_NL / IQ4_XS / IQ3_XXS / IQ3_S（2026-10-20）
+
+### 24.1 R3（缺样本）已解
+
+本机存量（原先"零存量"的判断过期）：
+
+| 文件 | 型分布 | 用途 |
+|---|---|---|
+| `unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_XS.gguf` | IQ4_XS 126 · Q6_K 1 · Q8_0 36 · Q5_K 24 · F32 133 | **e2e 靶位**（其余型本仓已支持） |
+| `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf` | IQ3_S 127 · IQ3_XXS 77 · IQ4_XS 88 · IQ4_NL 1 · **Q2_K/Q3_K/IQ1_S/IQ2_× 也在场** | 单张量对拍 |
+
+⇒ `RequirePortable` 的目标是**逐型**的：0.8B-IQ4_XS 现在可整模跑；27B-UD 仍被
+Q2_K/Q3_K/IQ1_S/IQ2_XXS/IQ2_XS/IQ2_S 挡住（**不在 IQ3/IQ4 范围**，另案）。
+
+### 24.2 做了什么
+
+1. **CPU 金标**（`formats/gguf/dequant.rs`）：四型 `dequant_row` 逐循环译自
+   `ggml-quants.c`；码本表 `iq_tables.rs` 由脚本从 `ggml-common.h` **逐字生成**
+   （`iq3xxs_grid` 256 · `iq3s_grid` 512 · `kvalues_iq4nl` 16 · `ksigns_iq2xs` 128）。
+   门：`dequant_iq_matches_gguf_py` —— 四型**位级**一致（max|Δ| == 0），
+   0.8B 与 27B 各取一/三张真表。
+2. **设备面三条腿**（`cu/gguf/*.cu` + `family::gguf` + `ops/gguf.rs`）：
+   - 块解量化补 `dequantize_block_iq4_nl` / `dequantize_block_iq3_s`（32 线程协作，
+     与快照里 iq2/iq3xxs/iq4xs 同形）；
+   - **MMVQ**（decode）：`owl_gguf_gemm_iq{4nl,4xs,3xxs,3s}` + `VDR_*` 宏；
+   - **行解量化**（embedding 查表）：`owl_gguf_dequant_rows_iq*`；
+   - **行窗解量化**（prefill→cuBLAS）：`owl_gguf_dequant_range_iq*`
+     （IQ4_NL 的组宽 256 = 8 个 32 元素块，其余 = 1 个超块）。
+   `PORTED` / `ROWS_PORTED` / `range_entry_for` 同步；`mmq`/`mmq2`/`tile`/`smem`
+   四臂**刻意不加**（`None` ⇒ 自动回退，不静默）。
+
+### 24.3 门抓到的三个坑（都已修）
+
+1. **快照的 IQ3_S 码本表是另一张**：`iq3xs_grid_cu` 与规范的 `iq3s_grid`
+   逐项不同（512 项里 146 项连 4× 关系都不成立），且 vec_dot 的尺度写成
+   `(0.5+sc)*0.5`（规范式的 1/4）—— 两个错误**近似抵消**，只剩 ~2% 系统偏差
+   （GPU 门实测 1.8e-2）。修法：换规范表（改名 `iq3s_grid_cu`）+ 尺度改
+   `1+2*sc` ⇒ 误差回到 4e-4（与其它三型同档）。
+2. **`DiagOpts::default()` 的 tag filter 是"全拒"**（`#[derive(Default)]` ⇒
+   `TagFilter{allowed:0,wildcard:false}`），而字段文档写的是"Default = 全放行
+   （诊断/测试）" ⇒ **所有带 facet tag 的核（含全部 GGUF/kv/vision）在测试里
+   被准入门拒发**。修法：手写 `Default`，`tag_filter = wildcard()`（生产入口
+   `from_config` 覆盖）。
+3. **driver 里还有第二份映射**：`driver::gguf::{gemm,dequant_rows,dequant_range}`
+   各自一枚 `match`，`PORTED` 加了 IQ 但 driver 仍 `panic!("未移植")`。
+   修法：补 IQ 分支 + 新门 `driver_dispatch_covers_the_capability_tables`
+   （对三张能力表逐型跑 picker，构造期即炸）。
+
+### 24.4 门与实测
+
+| 门 | 判据 | 结果 |
+|---|---|---|
+| `dequant_iq_matches_gguf_py` | 位级（== 0） | 4/4 型 ✓ |
+| `gpu_gguf_iq_gemm_matches_cpu_reference` | `max|Δ|/max|ref| < 2e-2` | IQ4_XS 4.5e-4 · IQ3_XXS 4.1e-4 · IQ3_S 4.1e-4 · IQ4_NL 3.9e-4 |
+| `gpu_gguf_iq_rows_matches_reference`（合成表） | `< 5e-3` | 4/4 型 ≤ 3.8e-4 |
+| `gpu_gguf_cublas_dst_arm_matches_mmvq`（+IQ 例） | `< 3e-2` | 四型 m=128/512 均 ≤ 3.4e-3 |
+| `gpu_gguf_iq4xs_0_8b_vs_q4km`（e2e） | 首 token 一致 + I-3 驻留 | `" located"` 两臂一致；live 0.48 GiB ≤ 文件 0.46 + 64 MiB |
+| `owl-kernels --lib` | — | 111 绿 |
+
+### 24.5 挂账
+
+- **27B-UD-IQ3_S 整模**：需 Q2_K / Q3_K / IQ1_S / IQ2_{XXS,XS,S}（各是独立一刀，
+  码本表与 vec_dot 都在 `gguf.cuh` 里，缺口只在入口/行窗/查表三条腿与 CPU 金标）；
+- IQ **不进** MMQ/MMQ2/tile/smem 四臂：prefill 走 dequant+cuBLAS（实测已够），
+  decode 走 MMVQ；将来上 MMQ 需搬 `mmq-load-tiles` 的 IQ 分支；
+- `rows_qk()` 未扩 IQ（当前无调用点；embedding 走 `rows_geom`，已支持）；
+- **imatrix** 不在本仓范围（量化端的事）。
+
+### 24.6 性能基线 + 两刀优化(单 3090 Ti,2026-10-20)
+
+**靶位**:`Qwen3.5-0.8B-IQ4_XS`(470 MiB)· 对照臂 = 同族 `Q4_K_M`(508 MiB)
+**档**:`profiles/gguf08b-iq4xs.toml`(ctx 16k / pool 16k / chunk 1024 / greedy / 诊断 tag 通配)
+**工具**:`llm_speedtest --flavor std`(512/1024/2048/4096/8192 × 3 轮,输出 256 tok,单并发)
+
+| 版本 | prefill (t/s avg) | decode (t/s avg) | TTFT avg |
+|---|---:|---:|---:|
+| Q4_K_M(对照,MMQ2 + MMVQ) | 20 851 | **290.4** | 145 ms |
+| IQ4_XS 基线(cuBLAS prefill) | 18 782 | 266.3 | 158 ms |
+| IQ4_XS + **MMQ2**(int8 MMA) | 21 453 | 268.0 | 141 ms |
+| IQ4_XS + MMQ2 + **dp4a vec_dot** | **21 623** | **309.6** | 141 ms |
+
+⇒ 相对基线:**prefill +15.1% / decode +16.3%**;相对 Q4_K_M:prefill +3.7% / decode +6.6%
+(且权重少 7.5%)。
+
+**刀 1:MMQ2 的 IQ 分支**(`gguf_mmq2.cu` + `family::gguf` + `driver`)
+- vendor2 的 `mmq-config-ampere` 本就带 IQ4_XS/IQ3_S/IQ3_XXS(布局 = Q8_0 ⇒ 激活 D4),
+  缺的只是 6 个 `OWL_MMQ2_WRAP` 实例 + 能力表 + driver 分派;
+- 门:`gpu_gguf_mmq2_matches_cublas` 增 IQ 例 —— IQ4_XS/IQ3_S/IQ3_XXS 与 cuBLAS
+  相对偏差 2.9–3.6e-3(与 k-quant 同档)。
+
+**刀 2:IQ4_XS 的 vec_dot 换 dp4a**
+- 旧实现:每 32 元素逐元素查 `kvalues_iq4nl` + float FMA ⇒ decode 比 Q4_K 慢 8%;
+- 新实现(对齐上游 `mul_mat_vec_q`):`iq4_nl_table_lookup`(4× `__byte_perm`)
+  + `ggml_cuda_dp4a`,整数累加后只乘一次尺度 ⇒ decode **+15.5%**(266→310),
+  数值与 CPU 参考的偏差不变(4.5e-4,门 `gpu_gguf_iq_gemm_matches_cpu_reference`)。
+
+**顺带修的一个真 bug**:`linear.rs` 的 smem/tile 两臂**不查能力表** ——
+`m ∈ [8,64)` 的尾块与 `col_index` 面会走到 tile 臂 ⇒ IQ 族
+`panic!("owl_gguf_gemm_tile: IQ4_XS 未移植")`,**0.8B IQ4_XS 起机即崩**。
+修法 = 两臂各加 `smem_entry_for/tile_entry_for` 门(不支持就回退 MMVQ)。
+
+**下一步候选(按杠杆排序)**
+1. **decode 的每步开销**:310 tok/s = 3.2 ms/token ≈ 16 µs/核(200 核/token),
+   远高于带宽下限 ⇒ 先看 `--perf-dump` 的 host/gpu 分账,再决定是否补 decode 单图
+   (`single_baked=false`)或合并发射;
+2. **prefill 仍是算力墙**(8k 点 27.6k t/s ≈ 44 TFLOPS,int8 MMA 峰值 ~100):
+   尾块(m<64)回退 MMVQ、`ssm_out` 的 tiled 面也未进 MMQ2 —— 可给 MMQ2 补
+   **tiled 激活量化**变体(或沿用 W-2e 的 gather 后再进 MMQ2);
+3. IQ3_S/IQ3_XXS 的 vec_dot 仍是旧式逐元素(未 dp4a 化);IQ4_NL 缺 MMQ 配置。
+
+### 24.7 口径修正:decode 的 300 与 460(2026-10-20,用户质疑后复核)
+
+**质疑**:「decode 能上 300?测错了吧?」——**没测错,是口径来自采样参数**。
+复核用了三路独立测量:
+
+| 测量 | 条件 | 结果 |
+|---|---|---|
+| `llm_speedtest`(缺省) | `temperature=0.7 / top_p=0.9` | 266 → 310 t/s(两版) |
+| `llm_speedtest`(**greedy 口径**) | `temperature=0 --top-p 1 --presence/frequency 0` | **462 t/s** |
+| 独立 SSE 探针(urllib/requests 双路) | 逐 chunk 时间戳,256 个单 token chunk | **453–468 t/s**,ITL p50 **2.13 ms** |
+
+三路一致:服务端 decode 真实是 **~460 tok/s(2.1 ms/token)**;300 那一档是
+**host 采样器**吃掉的:
+
+> `engine/sampler.rs` 头注已写:「dtoh + host softmax」. `temperature>0` 时每 token
+> 把 **151k 维 logits(604 KB)D2H + host softmax** ⇒ 实测 **+1.2 ms/step**
+> (2.1 → 3.3 ms,decode 462 → 300)。0.8B 上这是 **36% 的步时**。
+
+**与 Q4_K_M 的同口径对照(采样中性)**:
+
+| | prefill avg | decode avg |
+|---|---:|---:|
+| Q4_K_M | 20 710 | 442.3 |
+| IQ4_XS(MMQ2 + dp4a) | **20 934** | **462.2** |
+
+**方法论修正(进 24.6 的脚注)**:测引擎吞吐必须显式给
+`--temperature 0 --top-p 1 --presence-penalty 0 --frequency-penalty 0`;
+要测"生产采样档"就单独标注 —— 两者不可混在一张表里比。
+
+**新的头号优化候选**:GPU 采样器(不 D2H 全词表;greedy 已有
+`owl_argmax_f32idx_f16`,temp/top-k/top-p 缺设备侧实现)。
+带宽天花板 ~1.9k tok/s(0.47 GB/step ÷ ~900 GB/s)⇒ 460 离墙仍远,
+次因是**每步发射数**(~200 核/token,`single_baked=false` 时无整步图)。
+
+### 24.8 27B UD 档解锁:补六型 + 真机装载(2026-10-20)
+
+**目标文件**(用户指定):
+
+| 文件 | 大小 | 型分布(新增部分加粗) |
+|---|---:|---|
+| `Qwen3.8-27B-UD-IQ4_XS.gguf` | 14 GiB | IQ4_XS 211 · IQ3_S 46 · IQ3_XXS 17 · **Q2_K** 1 · **Q3_K** 9 · **IQ2_XS** 2 · **IQ2_S** 7 · Q4_K/Q5_K/Q6_K/Q8_0/F32 |
+| `Qwen3.8-27B-UD-IQ3_S.gguf` | 12 GiB | IQ3_S 127 · IQ3_XXS 77 · IQ4_XS 88 · **IQ2_XXS** 12 · **IQ2_XS** 12 · **IQ2_S** 21 · **IQ1_S** 2 · **Q2_K** 6 · **Q3_K** 16 · Q4_K/Q5_K/Q6_K/Q8_0/F32 |
+
+**新增六型**(Q2_K / Q3_K / IQ2_XXS / IQ2_XS / IQ2_S / IQ1_S)全链:
+
+- CPU 金标 `dequant_row`:逐循环译自 `ggml-quants.c`;门
+  `dequant_iq_matches_gguf_py` 扩到 **10 例**,全部**位级一致(max|Δ| == 0)**
+  (0.8B IQ4_XS + 27B 两文件的 Q2_K/Q3_K/IQ2_*/IQ1_S/IQ3_*/IQ4_*)。
+- 设备面:块解量化补 `dequantize_block_iq2_s` / `dequantize_block_iq1_s`;
+  **MMVQ / 行解量化 / 行窗解量化**三条腿各 6 个入口;`PORTED`/`ROWS_PORTED`/
+  `rows_threads(Q2K,Q3K)=64`;driver 三处映射同步 + 能力表漂移门覆盖。
+- 门(全部真文件):
+  - IQ GEMM:六型 `max|Δ|/max|ref|` = 1.4e-4 … 4.9e-4;
+  - 行解量化(合成表):十型 ≤ 3.7e-4;
+  - cuBLAS 行窗 vs MMVQ:六型 m=128/512 ≤ 5.8e-3。
+
+**这一轮抓到的四个坑(都已修)**
+
+1. **IQ2_XXS 的 `qs` 是 `uint16_t[32]`**:C 里 `qs + 4*ib32` 按 u16 步进 ⇒
+   字节偏移 = `8*ib32`。按 4 字节步进时**首块恰好正确**、后 7 个 ib32 全错
+   (门在 5500 万号元素处抓到 —— 单块对拍会漏)。
+2. **Q2_K 的 `d/dmin` 在块尾**(结构体 = `scales, qs, union{d,dmin}`),
+   不是"头部两个 half"(抄错 = 把第一个尺度字节当 f16,量级飞到 1e6)。
+3. **IQ1_S 的 delta 重复计入**:`vec_dot_iq1_s_q8_1` 在循环里加了
+   `-1±0.125`,又通过 `ds.y*delta` 加一次 ⇒ 与 CPU 参考差 **4.5×**。
+   修法 = 循环只累原始 nibble,delta 由 `ds.y` 一次结清。
+4. **Q3_K/Q6_K 的合成测试**:`d` 在块尾 ⇒ 随机字节会造出 inf/NaN 尺度,
+   测试须按型写 `d` 的偏移(不是引擎 bug,但会假红)。
+
+**真机(单 3090 Ti 24 GiB)**
+
+| 模型 | 权重驻留 | 装载 | 输出 |
+|---|---:|---:|---|
+| UD-IQ4_XS | 13 274 MiB | 2.4 s | 连贯("…Likely complete the sentence") |
+| UD-IQ3_S | 11 165 MiB | 15.3 s(**冷读**;热盘应同 IQ4_XS 档) | 连贯("…likely \"Paris\"") |
+
+首轮 std 矩阵(IQ4_XS,采样中性,12k ctx):**prefill ≈ 1.6–1.8k t/s,
+decode ≈ 39–41 t/s**,TTFT@512 304 ms / @8192 5.1 s。
+
+**⚠️ 未决(压测才暴露,与 IQ 无关)**:第二/三轮起 host 层出现
+`store: 不变量违反:块 ChainHash(...) 已在宿主层` ⇒ turn 被弃置(HTTP 500)。
+触发条件 = **host 预算紧(2 GiB)+ 前缀缓存 + 长 ctx**;同一 block 被二次
+`HostTier::put`。可疑面:plan_capacity 轮零 `Drop`(宿主削减)与轮一 `Host`
+票在同拍内的块重叠(共享前缀的两条链),或 `host_relief` 与 `commit_offload`
+的次序。**下一刀先定位它**(有现成 trace:turn 8 起每个 turn 都复现)。
+
 ### 23.13 decode 单 token 定谳:q8_0 VDR=4(2026-10-21)
 
 **一句话**:GGUF × KVMem 单卡 3090 Ti 的单 token decode 已到带宽墙的 ~80%;

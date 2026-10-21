@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// 设备上下文诊断/调优选项(**显式依赖律,2026-10-10**:env 派生数据由
 /// 入口/测试经本结构显式传入,设备路径零 env 读取)。
 /// [`DiagOpts::from_config`] 是入口侧组装器(server config / 测试用例)。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DiagOpts {
     /// 逐命令/图节点计时(原 OWL_SRV_TIMING)
     pub srv_timing: bool,
@@ -67,6 +67,32 @@ pub struct DiagOpts {
     /// 由 `model.kind/quant/head_quant`、`dispatch.kv_fp8`、`spec`、`vision`、
     /// `runtime.tp_ordinals` 自动推导;`*`/Default = 全放行(诊断/测试)。
     pub tag_filter: owl_kernels::tag_filter::TagFilter,
+}
+
+/// **诊断档的缺省 = 全放行**(2026-10-20 修一个静默坑):
+/// `#[derive(Default)]` 会让 `tag_filter` 取 `TagFilter::default()` = **空允许集**
+/// ⇒ 所有带 facet tag 的核(含全部 GGUF/kv/vision 族)**被准入门拒发**。
+/// 而本结构自述的口径是"诊断/测试 = 全放行"(`tag_filter` 字段文档)。
+/// ⇒ 显式给 `wildcard()`,让二者一致;生产入口走 [`DiagOpts::from_config`] 覆盖。
+impl Default for DiagOpts {
+    fn default() -> Self {
+        Self {
+            srv_timing: false,
+            cap_prof: false,
+            free_legacy: false,
+            sync_mask: 0,
+            launch_time: false,
+            d2h_prof: false,
+            gpu_prof: false,
+            graph_flags: 0,
+            fi_plan_restore: false,
+            capture_slab_mb: None,
+            vram_reserve_mb: 0,
+            vram_budget_mb: None,
+            trace_ring: 0,
+            tag_filter: owl_kernels::tag_filter::TagFilter::wildcard(),
+        }
+    }
 }
 
 impl DiagOpts {

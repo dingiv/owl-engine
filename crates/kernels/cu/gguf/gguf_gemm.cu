@@ -96,3 +96,91 @@ extern "C" __global__ void owl_gguf_gemm_q6k(
     owl_gguf_mmvq_body<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
         weights, xq, out, m, n, k, k_padded, out_off, out_ld);
 }
+
+// ---- IQ 族(2026-10-20;REQ-GGUF-04):权重块字节直读 + q8_1 激活 ----
+//
+// `vec_dot_iq*_q8_1` 住在 `gguf.cuh`(逐块解 32/256 元素后与 q8_1 点积);
+// `VDR/QI` 的取值决定 warp 内分工(见 `gguf_mmvq_body` 的 `blocks_per_iter`)。
+// 数值门 = `kernel_gate` 的 IQ 对拍(参考 = CPU `dequant_row` 的 f64 GEMM)。
+
+extern "C" __global__ void owl_gguf_gemm_iq4nl(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_body<QK_IQ4_NL, QI_IQ4_NL, block_iq4_nl, VDR_IQ4_NL_Q8_1_MMVQ,
+                       vec_dot_iq4_nl_q8_1>(weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_iq4xs(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_body<QK_IQ4_XS, QI_IQ4_XS, block_iq4_xs, VDR_IQ4_XS_Q8_1_MMVQ,
+                       vec_dot_iq4_xs_q8_1>(weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_iq3xxs(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_body<QK_IQ3_XXS, QI_IQ3_XXS, block_iq3_xxs, VDR_IQ3_XXS_Q8_1_MMVQ,
+                       vec_dot_iq3_xxs_q8_1>(weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_iq3s(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_body<QK_IQ3_S, QI_IQ3_S, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ,
+                       vec_dot_iq3_s_q8_1>(weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+// ---- 27B UD 档补六型(2026-10-20):K-quant Q2_K/Q3_K + IQ2_XXS/IQ2_XS/IQ2_S/IQ1_S ----
+
+extern "C" __global__ void owl_gguf_gemm_q2k(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_body<QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_q3k(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_body<QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_iq2xxs(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_body<QK_K, QI_IQ2_XXS, block_iq2_xxs, VDR_IQ2_XXS_Q8_1_MMVQ, vec_dot_iq2_xxs_q8_1>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_iq2xs(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_body<QK_K, QI_IQ2_XS, block_iq2_xs, VDR_IQ2_XS_Q8_1_MMVQ, vec_dot_iq2_xs_q8_1>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_iq2s(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_body<QK_K, QI_IQ2_S, block_iq2_s, VDR_IQ2_S_Q8_1_MMVQ, vec_dot_iq2_s_q8_1>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_iq1s(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_body<QK_K, QI_IQ1_S, block_iq1_s, VDR_IQ1_S_Q8_1_MMVQ, vec_dot_iq1_s_q8_1>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}

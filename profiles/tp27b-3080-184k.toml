@@ -111,16 +111,17 @@ repack = "auto"
 dump = false
 
 [dispatch]
+# GGUF 小 n(装得进 L2)且 m ≤ TILE_MT ⇒ 让 MMVQ 赢;0 = 关
+# (2026-10-21 定谱:ssm_alpha/beta 每发 34.2→5.1 µs,verify −2.8 ms/轮)
+gguf_mmvq_l2_mib = 4
+# 单键臂(2026-10-21 合并:旧 verify_v2/verify_fi/verify_xqa + decode_fi/decode_xqa)
+verify_arm = "v2"
+decode_arm = "v2"
 qkv_fuse = true
 prefill_split = false
 force_naive_prefill = false
-verify_v2 = true
 fi_plan_restore = true
 fi_cuda_graph = false
-verify_fi = false
-decode_fi = false
-verify_xqa = false
-decode_xqa = false
 xqa_prefill = false
 fi_min_tokens = 1
 gdn_chunked = true

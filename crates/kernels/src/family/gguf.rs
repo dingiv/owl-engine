@@ -259,6 +259,27 @@ pub const GEMM_Q4K: &str = "owl_gguf_gemm_q4k";
 pub const GEMM_Q5K: &str = "owl_gguf_gemm_q5k";
 /// GEMM 入口(Q6_K)
 pub const GEMM_Q6K: &str = "owl_gguf_gemm_q6k";
+/// GEMM 入口(IQ4_NL;32 元素块 + 16 项码本)
+pub const GEMM_IQ4NL: &str = "owl_gguf_gemm_iq4nl";
+/// GEMM 入口(IQ4_XS;256 超块 + 码本 + 4bit 尺度)
+pub const GEMM_IQ4XS: &str = "owl_gguf_gemm_iq4xs";
+/// GEMM 入口(IQ3_XXS;256 超块 + 4×i8 码本 + 符号表)
+pub const GEMM_IQ3XXS: &str = "owl_gguf_gemm_iq3xxs";
+/// GEMM 入口(IQ3_S;256 超块 + 512 项码本)
+pub const GEMM_IQ3S: &str = "owl_gguf_gemm_iq3s";
+/// GEMM 入口(Q2_K;27B UD 档)
+pub const GEMM_Q2K: &str = "owl_gguf_gemm_q2k";
+/// GEMM 入口(Q3_K;27B UD 档)
+pub const GEMM_Q3K: &str = "owl_gguf_gemm_q3k";
+/// GEMM 入口(IQ2_XXS;27B UD 档)
+pub const GEMM_Iq2Xxs: &str = "owl_gguf_gemm_iq2xxs";
+/// GEMM 入口(IQ2_XS;27B UD 档)
+pub const GEMM_Iq2Xs: &str = "owl_gguf_gemm_iq2xs";
+/// GEMM 入口(IQ2_S;27B UD 档)
+pub const GEMM_Iq2S: &str = "owl_gguf_gemm_iq2s";
+/// GEMM 入口(IQ1_S;27B UD 档)
+pub const GEMM_Iq1S: &str = "owl_gguf_gemm_iq1s";
+
 /// 激活 → q8_1 入口(f16 入)
 pub const QUANT_ACT_F16: &str = "owl_gguf_quant_act_f16";
 /// 激活 → q8_1 入口(bf16 入)
@@ -269,6 +290,27 @@ pub const ROWS_Q4K: &str = "owl_gguf_dequant_rows_q4k";
 pub const ROWS_Q5K: &str = "owl_gguf_dequant_rows_q5k";
 /// 行解量化入口(Q6_K)
 pub const ROWS_Q6K: &str = "owl_gguf_dequant_rows_q6k";
+/// 行解量化入口(IQ4_NL)
+pub const ROWS_IQ4NL: &str = "owl_gguf_dequant_rows_iq4nl";
+/// 行解量化入口(IQ4_XS)
+pub const ROWS_IQ4XS: &str = "owl_gguf_dequant_rows_iq4xs";
+/// 行解量化入口(IQ3_XXS)
+pub const ROWS_IQ3XXS: &str = "owl_gguf_dequant_rows_iq3xxs";
+/// 行解量化入口(IQ3_S)
+pub const ROWS_IQ3S: &str = "owl_gguf_dequant_rows_iq3s";
+/// 行解量化入口(Q2_K)
+pub const ROWS_Q2K: &str = "owl_gguf_dequant_rows_q2k";
+/// 行解量化入口(Q3_K)
+pub const ROWS_Q3K: &str = "owl_gguf_dequant_rows_q3k";
+/// 行解量化入口(IQ2_XXS)
+pub const ROWS_Iq2Xxs: &str = "owl_gguf_dequant_rows_iq2xxs";
+/// 行解量化入口(IQ2_XS)
+pub const ROWS_Iq2Xs: &str = "owl_gguf_dequant_rows_iq2xs";
+/// 行解量化入口(IQ2_S)
+pub const ROWS_Iq2S: &str = "owl_gguf_dequant_rows_iq2s";
+/// 行解量化入口(IQ1_S)
+pub const ROWS_Iq1S: &str = "owl_gguf_dequant_rows_iq1s";
+
 /// 行解量化的资产 id
 pub const ROWS_SRC: &str = "cu/gguf/gguf_rows.cu";
 
@@ -280,6 +322,26 @@ pub const GEMM_TILE_Q4K: &str = "owl_gguf_gemm_tile_q4k";
 pub const GEMM_TILE_Q5K: &str = "owl_gguf_gemm_tile_q5k";
 /// 同上(Q6_K)
 pub const GEMM_TILE_Q6K: &str = "owl_gguf_gemm_tile_q6k";
+/// 同上(`q2k`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_Q2K: &str = "owl_gguf_gemm_tile_q2k";
+/// 同上(`q3k`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_Q3K: &str = "owl_gguf_gemm_tile_q3k";
+/// 同上(`iq1s`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ1S: &str = "owl_gguf_gemm_tile_iq1s";
+/// 同上(`iq2xxs`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ2XXS: &str = "owl_gguf_gemm_tile_iq2xxs";
+/// 同上(`iq2xs`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ2XS: &str = "owl_gguf_gemm_tile_iq2xs";
+/// 同上(`iq2s`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ2S: &str = "owl_gguf_gemm_tile_iq2s";
+/// 同上(`iq3xxs`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ3XXS: &str = "owl_gguf_gemm_tile_iq3xxs";
+/// 同上(`iq3s`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ3S: &str = "owl_gguf_gemm_tile_iq3s";
+/// 同上(`iq4nl`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ4NL: &str = "owl_gguf_gemm_tile_iq4nl";
+/// 同上(`iq4xs`;2026-10-21 UD 混型档)
+pub const GEMM_TILE_IQ4XS: &str = "owl_gguf_gemm_tile_iq4xs";
 /// 复用臂的资产 id
 pub const TILE_SRC: &str = "cu/gguf/gguf_tile.cu";
 
@@ -322,10 +384,47 @@ pub const MMQ2_Q5K_J128: &str = "owl_mmq2_q5k_j128";
 pub const MMQ2_Q6K_J64: &str = "owl_mmq2_q6k_j64";
 /// Q6_K / J=128
 pub const MMQ2_Q6K_J128: &str = "owl_mmq2_q6k_j128";
+/// IQ4_XS / J=64(2026-10-20;REQ-GGUF-04 ⇒ prefill 的 int8-MMA 臂)
+pub const MMQ2_IQ4XS_J64: &str = "owl_mmq2_iq4xs_j64";
+/// IQ4_XS / J=128
+pub const MMQ2_IQ4XS_J128: &str = "owl_mmq2_iq4xs_j128";
+/// IQ3_S / J=64
+pub const MMQ2_IQ3S_J64: &str = "owl_mmq2_iq3s_j64";
+/// IQ3_S / J=128
+pub const MMQ2_IQ3S_J128: &str = "owl_mmq2_iq3s_j128";
+/// IQ3_XXS / J=64
+pub const MMQ2_IQ3XXS_J64: &str = "owl_mmq2_iq3xxs_j64";
+/// IQ3_XXS / J=128
+pub const MMQ2_IQ3XXS_J128: &str = "owl_mmq2_iq3xxs_j128";
 
-/// 每 CTA 的权重行数(上游 ampere 档 `I = 128`;分派门要求 `n % I == 0`)
+/// 每 CTA 的权重行数(**J=16 档 = 64**、其余 = 128;与 `mmq-config-ampere` 同源)。
+///
+/// 2026-10-21 P6:verify 是 m=8 ⇒ J=16 ⇒ `ntx = 1` ⇒ CTA 数 = `n/I` 只有 40–136,
+/// 84 SM 的机器大片空闲(实测 40 CTA 时每 SM 10.2 GB/s ≈ 份额上限 ⇒ 加深流水
+/// 无用,**只能铺开 SM**)。把 J=16 档 I 减半(配 128 线程 / 4 warp)⇒ tile 数×2、
+/// SM 覆盖×2,仍是"一发一 tile"**无 fixup / 无工作区**。
+/// 不变量:`I = rows_per_warp(16) × nwarps` ⇒ 128 线程时 64、256 线程时 128。
+pub const fn mmq2_i(m: usize) -> usize {
+    if mmq2_j(m) == MMQ2_SMALL_J {
+        64
+    } else {
+        128
+    }
+}
+/// 每 CTA 线程数(与 I 联动;`nthreads = 2·I`)
+pub const fn mmq2_threads(m: usize) -> usize {
+    mmq2_i(m) * 2
+}
+/// 全宽档(J ≥ 64)的 I
 pub const MMQ2_I: usize = 128;
-/// 每 CTA 线程数(上游 `nthreads = 256`,occupancy 1)
+/// J=16 小 m 档的 I(P6:减半 ⇒ tile 数 ×2、SM 覆盖 ×2;`nthreads = 128`)
+///
+/// ⚠️ **再减到 32 不行**(2026-10-21 实测):`nthreads = 64` / 2 warp 时某个型的
+/// `load_tiles` 在 I < 64 上越界(起机 warmup 即 CUDA 700,报在随后的 FI 调用点)。
+/// 64 = `rows_per_warp(16) × 4 warp`,是这条路的**下界**(本档机器上正好 80 tile
+/// 铺 80 SM)。
+pub const MMQ2_SMALL_I: usize = 64;
+/// 全宽档的线程数
 pub const MMQ2_THREADS: usize = 256;
 /// 激活块:`block_q8_1_mmq` 字节数(16B 头 + 128 int8)
 pub const MMQ2_Q8_1_BLOCK_BYTES: usize = 144;
@@ -336,74 +435,222 @@ pub const MMQ2_SMEM_X: usize = MMQ2_I * 76 * 4;
 
 /// 型 → (量化入口, MMQ 入口 J64/J128);`None` = 本臂未移植
 pub const fn mmq2_entry_for(ty: GgmlTy, m: usize) -> Option<&'static str> {
-    let (e64, e128) = match ty {
-        GgmlTy::Q8_0 => (MMQ2_Q8_0_J64, MMQ2_Q8_0_J128),
-        GgmlTy::Q4K => (MMQ2_Q4K_J64, MMQ2_Q4K_J128),
-        GgmlTy::Q5K => (MMQ2_Q5K_J64, MMQ2_Q5K_J128),
-        GgmlTy::Q6K => (MMQ2_Q6K_J64, MMQ2_Q6K_J128),
+    let (e16, e64, e128) = match ty {
+        GgmlTy::Q8_0 => (MMQ2_Q8_0_J16, MMQ2_Q8_0_J64, MMQ2_Q8_0_J128),
+        GgmlTy::Q4K => (MMQ2_Q4K_J16, MMQ2_Q4K_J64, MMQ2_Q4K_J128),
+        GgmlTy::Q5K => (MMQ2_Q5K_J16, MMQ2_Q5K_J64, MMQ2_Q5K_J128),
+        GgmlTy::Q6K => (MMQ2_Q6K_J16, MMQ2_Q6K_J64, MMQ2_Q6K_J128),
+        GgmlTy::Iq4Xs => (MMQ2_IQ4XS_J16, MMQ2_IQ4XS_J64, MMQ2_IQ4XS_J128),
+        GgmlTy::Iq3S => (MMQ2_IQ3S_J16, MMQ2_IQ3S_J64, MMQ2_IQ3S_J128),
+        GgmlTy::Iq3Xxs => (MMQ2_IQ3XXS_J16, MMQ2_IQ3XXS_J64, MMQ2_IQ3XXS_J128),
+        // 2026-10-21 第二刀:**只挂 J=16**(小 m)。m > 16 仍回 tile ——
+        // MMQ 的 ntx = ceil(m/J) 按 token 窗重读权重,prefill 侧本刀不动。
+        GgmlTy::Q3K => (MMQ2_Q3K_J16, MMQ2_Q3K_J16, MMQ2_Q3K_J16),
+        GgmlTy::Iq2S => (MMQ2_IQ2S_J16, MMQ2_IQ2S_J16, MMQ2_IQ2S_J16),
+        GgmlTy::Iq2Xs => (MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J16),
         _ => return None,
     };
-    Some(if m >= MMQ2_I { e128 } else { e64 })
+    // 新族(J16 专用)只服务小 m:m > 16 交回 tile/MMVQ(见上注)
+    if matches!(ty, GgmlTy::Q3K | GgmlTy::Iq2S | GgmlTy::Iq2Xs) && m > MMQ2_SMALL_J
+    {
+        return None;
+    }
+    Some(if m <= MMQ2_SMALL_J {
+        e16
+    } else if m >= MMQ2_I {
+        e128
+    } else {
+        e64
+    })
 }
 
-/// 型 → 激活量化入口(DS4 = Q4_K/Q5_K;D4 = Q8_0/Q6_K)
+/// **BF16 激活**的量化入口(2026-10-21;DFlash2 草稿线)
+pub const MMQ2_QUANT_DS4_BF16: &str = "owl_mmq2_quant_q8_1_ds4_bf16";
+/// 同上(D4 布局)
+pub const MMQ2_QUANT_D4_BF16: &str = "owl_mmq2_quant_q8_1_d4_bf16";
+
+/// 型 → 激活量化入口(DS4 = Q4_K/Q5_K;D4 = Q8_0/Q6_K;`bf16 = 激活 dtype`)
 pub const fn mmq2_quant_entry_for(ty: GgmlTy) -> Option<&'static str> {
-    match ty {
-        GgmlTy::Q4K | GgmlTy::Q5K => Some(MMQ2_QUANT_DS4),
-        GgmlTy::Q8_0 | GgmlTy::Q6K => Some(MMQ2_QUANT_D4),
-        _ => None,
-    }
+    mmq2_quant_entry_for_act(ty, false)
 }
+
+/// 同上,**按激活 dtype**(`bf16 = true` ⇒ BF16 变体;布局 DS4/D4 与型绑定不变)
+pub const fn mmq2_quant_entry_for_act(ty: GgmlTy, bf16: bool) -> Option<&'static str> {
+    let ds4 = match ty {
+        GgmlTy::Q4K | GgmlTy::Q5K => true,
+        GgmlTy::Q8_0 | GgmlTy::Q6K => false,
+        // IQ 族:vendor2 的 MMQ 配置声明 `SRAM_LAYOUT_Q8_0` ⇒ 与 Q8_0 同(D4)
+        GgmlTy::Iq4Xs | GgmlTy::Iq3S | GgmlTy::Iq3Xxs => false,
+        // 2026-10-21:`SRAM_LAYOUT_Q3_K` / `Q2_K`(布局 = Q8_0 的 D4 变体)
+        GgmlTy::Q3K | GgmlTy::Iq2S | GgmlTy::Iq2Xs | GgmlTy::Q2K => false,
+        _ => return None,
+    };
+    Some(match (ds4, bf16) {
+        (true, false) => MMQ2_QUANT_DS4,
+        (true, true) => MMQ2_QUANT_DS4_BF16,
+        (false, false) => MMQ2_QUANT_D4,
+        (false, true) => MMQ2_QUANT_D4_BF16,
+    })
+}
+
+/// **小 m 下限**(2026-10-21 实测重定;原 = 64,只服务 prefill)。
+///
+/// 为什么降到 4:`mul_mat_q` 的 J=64 分块对 `m < J` **本就带边界**(`ntx =
+/// ceil(m/J)` + 核内行边界),数值与 MMVQ 相对差 ~6e-4(门 `gpu_gguf_mmq2_small_m`);
+/// 而 MMVQ 的网格是 `(n/n_warps, m)` ⇒ **权重流量 = m × 权重字节数**。
+/// 27B UD-IQ4_XS 实测(29 MB 的 IQ4_XS 张量):
+///
+/// | m | MMVQ | 复用臂(tile) | **MMQ2(J=64)** |
+/// |---|---|---|---|
+/// | 2 | 66 µs | — | 77 µs |
+/// | 8 | 238 µs | 153 µs | **81 µs** |
+/// | 32 | 941 µs | ~400 µs | **84 µs** |
+/// | 64 | 1885 µs | 450 µs | **83 µs** |
+///
+/// ⇒ 交叉点在 m≈4(2 时 MMVQ 仍略胜),verify(depth+1 ∈ [2,8])与小块 prefill 的
+/// 最优臂都是 **MMQ2**。m = 1(decode)不变:仍是 MMVQ(读一遍权重即地板)。
+pub const MMQ2_SMALL_M: usize = 4;
+
+/// **小 m 档的 token 分块**(J=16;判据见 [`mmq2_j`])
+pub const MMQ2_SMALL_J: usize = 16;
+
+/// **J=8 档的上界**(2026-10-21 第三刀):verify 的块 = depth+1 = **8 行**,
+/// 与 `mul_mat_q` 的最小 J 档(8)完全对齐 ⇒ 零 MMA 空转。
+/// 判据区间:`m ≤ 8` 走 J=8;`9..=16` 走 J=16(草稿 propose 的 8 行同吃 J=8)。
+pub const MMQ2_TINY_J: usize = 8;
 
 /// 本臂适用门(单一产地;`linear.rs` 与门/测试同读这一份):
-/// ① 型已移植 ② `m ≥ 64`(小批仍给 MMVQ/复用臂)
-/// ③ `n % 128 == 0`(上游 `I=128`,首版**不装 fallback**)
+/// ① 型已移植 ② `m ≥ MMQ2_SMALL_M`(decode 仍给 MMVQ;见该常量文档的实测表)
+/// ③ `n % mmq2_i(m) == 0`(J=16 档 64、其余 128;上游 `I` 就是 tile 宽)
 /// ④ `k % 128 == 0`(激活块 128 值)
+/// ⑤ 激活 dtype ∈ {F16, BF16}(BF16 = DFlash2 草稿执行域;量化手有对应变体)
 pub const fn mmq2_ok(ty: GgmlTy, m: usize, n: usize, k: usize) -> bool {
     mmq2_entry_for(ty, m).is_some()
-        && m >= 64
-        && n % MMQ2_I == 0
+        && m >= MMQ2_SMALL_M
+        && n % mmq2_i(m) == 0
         && k % MMQ2_QK == 0
 }
 
-/// 激活缓冲字节数(`[k/128][n_token]` × 144B)
+/// **激活缓冲的补齐行数**(`m_pad = ceil(m/J)·J`;2026-10-21 修越界)。
+///
+/// 为什么必须补齐:MMQ 核每 tile **无条件读 J 行**(`load_tiles` 的
+/// `tile_y` 循环按 `J·MMQ_TILE_Y_K` 取整到线程数),而 J 由 m 分段选
+/// (`m≤8 ⇒ J=8`、`9..16 ⇒ 16`、`17..127 ⇒ 64`、`≥128 ⇒ 128`)。缓冲若按 **m**
+/// 行铺,最后一个 k 块的最后一个 tile 就会读出缓冲尾(compute-sanitizer 实测
+/// `owl_mmq2_iq4xs_j8` 越界 **896 B**):短 ctx 时落进同段 slab 无害,**长 ctx /
+/// 虚拟化档的分配布局一变就踩未映射页 ⇒ CUDA 700 + 上下文毒化**。
+/// 补齐行由量化核写 0(见 `gguf_mmq2.cu::quant_body` 的 `m_real` 分支)。
+pub const fn mmq2_xq_tokens(m: usize) -> usize {
+    let j = mmq2_j(m);
+    m.div_ceil(j) * j
+}
+
+/// 激活缓冲字节数(`[k/128][m_pad]` × 144B)
 pub const fn mmq2_xq_bytes(m: usize, k: usize) -> usize {
-    (k / MMQ2_QK) * m * MMQ2_Q8_1_BLOCK_BYTES
+    (k / MMQ2_QK) * mmq2_xq_tokens(m) * MMQ2_Q8_1_BLOCK_BYTES
 }
 
 /// **MMQ 发射几何**(上游 stream-k 支的"一 tile/block"形态):
-/// `grid = (ceil(n/I)·ceil(m/J), 1, 1)`、`block = (32, THREADS/32)`、
-/// `smem = J·4(ids) + X 面 + PAD(J·144, THREADS·4)`。
+/// `grid = (ceil(n/I)·ceil(m/J), 1, 1)`、`block = (32, nthreads/32)`、
+/// `smem = J·4(ids) + X 面 + PAD(J·144, nthreads·4)`。
+/// `I`/`nthreads` **按 J 档**(`mmq2_i` / `mmq2_threads`)。
 pub fn mmq2_geom(m: usize, n: usize, j: usize) -> ((u32, u32, u32), (u32, u32, u32), u32) {
     // ⚠️ 一维 grid:`ntiles = nty·ntx`(上游 stream-k 支在 tiles 效率 ≥90% 的形态 ——
     // 每 block 恰一个 tile、无 fixup)。核内用 blockIdx.x 走线性 tile 解码。
-    let nty = n.div_ceil(MMQ2_I).max(1);
+    let nty = n.div_ceil(mmq2_i(m)).max(1);
     let ntx = m.div_ceil(j).max(1);
     let gx = (nty * ntx) as u32;
     let gy = 1u32;
-    let block = (32u32, (MMQ2_THREADS / 32) as u32, 1u32);
+    let block = (32u32, (mmq2_threads(m) / 32) as u32, 1u32);
+    // smem 由调用方按型取(`mmq2_smem_for`),此处给的只是 X 面 stride=76 的档
     ((gx, gy, 1), block, mmq2_smem(j) as u32)
 }
 
 /// smem 字节(与 `vendor2/mmq.cuh::mmq_get_nbytes_shared` 逐项同式;
 /// 单测 `mmq2_smem_matches_formula` 钉住)
 pub const fn mmq2_smem(j: usize) -> usize {
+    // I / nthreads 按 J 档(J=16 ⇒ 64/128);与 config 表逐项同源
+    let i = if j == MMQ2_SMALL_J { MMQ2_SMALL_I } else { MMQ2_I };
+    let threads = i * 2;
     let nbs_ids = j * 4;
     let nbs_y = j * MMQ2_Q8_1_BLOCK_BYTES;
-    let pad_to = MMQ2_THREADS * 4;
-    nbs_ids + MMQ2_SMEM_X + nbs_y.div_ceil(pad_to) * pad_to
+    let pad_to = threads * 4;
+    nbs_ids + i * 76 * 4 + nbs_y.div_ceil(pad_to) * pad_to
 }
 
+
 /// J 档(分派用;与 `mmq2_entry_for` 同一判据)
+/// `owl_mmq2_q8_0_j16`(小 m;J=16)
+pub const MMQ2_Q8_0_J16: &str = "owl_mmq2_q8_0_j16";
+/// `owl_mmq2_q4k_j16`(小 m;J=16)
+pub const MMQ2_Q4K_J16: &str = "owl_mmq2_q4k_j16";
+/// `owl_mmq2_q5k_j16`(小 m;J=16)
+pub const MMQ2_Q5K_J16: &str = "owl_mmq2_q5k_j16";
+/// `owl_mmq2_q6k_j16`(小 m;J=16)
+pub const MMQ2_Q6K_J16: &str = "owl_mmq2_q6k_j16";
+/// `owl_mmq2_iq4xs_j16`(小 m;J=16)
+pub const MMQ2_IQ4XS_J16: &str = "owl_mmq2_iq4xs_j16";
+/// `owl_mmq2_iq3s_j16`(小 m;J=16)
+pub const MMQ2_IQ3S_J16: &str = "owl_mmq2_iq3s_j16";
+/// `owl_mmq2_iq3xxs_j16`(小 m;J=16)
+pub const MMQ2_IQ3XXS_J16: &str = "owl_mmq2_iq3xxs_j16";
+/// `owl_mmq2_q3k_j16`(小 m;J=16;SRAM 布局 = Q3_K)
+pub const MMQ2_Q3K_J16: &str = "owl_mmq2_q3k_j16";
+/// `owl_mmq2_iq2s_j16`(小 m;J=16;SRAM 布局 = Q3_K)
+pub const MMQ2_IQ2S_J16: &str = "owl_mmq2_iq2s_j16";
+/// `owl_mmq2_iq2xs_j16`(小 m;J=16;SRAM 布局 = Q3_K)
+pub const MMQ2_IQ2XS_J16: &str = "owl_mmq2_iq2xs_j16";
+
+/// **X 面 SRAM stride**(每 I 行占多少个 32bit 槽;逐型不同)。
+///
+/// 值 = `vendor2/mmq.cuh::ggml_cuda_mmq_get_sram_stride` 逐型对照
+/// (`MMQ_TILE_NE_K = 32`、`QI8_0 = QI8_1 = QI6_K = 8`):
+/// - `Q8_0` / `Q8_1` / `Q6_K` ⇒ 76;
+/// - **`Q3_K` 族(IQ2_S / IQ2_XS / Q3_K)** ⇒ `2·32 + 32/2 + 4` = **84**;
+/// - **`Q2_K`** ⇒ `2·32 + 32 + 4` = **100**。
+///
+/// 漏这条 = smem 少算 ⇒ 核内越界(静默错值,不是崩);故与 `MMQ2_SMEM_X` 同源。
+pub const fn mmq2_sram_stride_for(ty: GgmlTy) -> usize {
+    match ty {
+        GgmlTy::Q2K => 100,
+        GgmlTy::Q3K | GgmlTy::Iq2S | GgmlTy::Iq2Xs => 84,
+        _ => 76,
+    }
+}
+
+/// smem 字节(**按型**取 X 面 stride;其余项与 [`mmq2_smem`] 同式)。
+pub const fn mmq2_smem_for(ty: GgmlTy, j: usize) -> usize {
+    let i = if j == MMQ2_SMALL_J { MMQ2_SMALL_I } else { MMQ2_I };
+    let threads = i * 2;
+    let nbs_ids = j * 4;
+    let nbs_x = i * mmq2_sram_stride_for(ty) * 4;
+    let nbs_y = j * MMQ2_Q8_1_BLOCK_BYTES;
+    let pad_to = threads * 4;
+    nbs_ids + nbs_x + nbs_y.div_ceil(pad_to) * pad_to
+}
+
+/// **token 分块 J**(唯一产地;`driver::gguf::mmq2` 与 `mmq2_entry_for` 同读)。
+///
+/// 三段(2026-10-21 实测重定):
+/// - `m ≤ MMQ2_SMALL_J(16)` ⇒ **J=16**:m=8 时 J=64 有 8/64 有用行(4× MMA 浪费),
+///   而 `ntx = ceil(m/J)` 两档都是 1 ⇒ **权重流量不变**,只砍无效算力;
+/// - `m < 128` ⇒ J=64;`m ≥ 128` ⇒ J=128。
 pub const fn mmq2_j(m: usize) -> usize {
-    if m >= MMQ2_I { 128 } else { 64 }
+    if m <= MMQ2_SMALL_J {
+        16
+    } else if m >= MMQ2_I {
+        128
+    } else {
+        64
+    }
 }
 
 /// **激活量化的几何**:`grid = (n_tokens, ceil(k/(4·BLK)), 1)`、`block = (BLK,1,1)`
 pub fn mmq2_quant_geom(m: usize, k: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
     const BLK: usize = 128;
     let gy = k.div_ceil(4 * BLK).max(1) as u32;
-    ((m.max(1) as u32, gy, 1), (BLK as u32, 1, 1))
+    // 行向 = **m_pad**(尾行写零;见 `mmq2_xq_tokens`)
+    ((mmq2_xq_tokens(m).max(1) as u32, gy, 1), (BLK as u32, 1, 1))
 }
 
 // ---- **行窗解量化**(W-2d;dequant+cuBLAS 臂的喂料手)--------------------------
@@ -415,6 +662,27 @@ pub const RANGE_Q4K: &str = "owl_gguf_dequant_range_q4k";
 pub const RANGE_Q5K: &str = "owl_gguf_dequant_range_q5k";
 /// 同上(Q6_K)
 pub const RANGE_Q6K: &str = "owl_gguf_dequant_range_q6k";
+/// 同上(IQ4_NL)
+pub const RANGE_IQ4NL: &str = "owl_gguf_dequant_range_iq4nl";
+/// 同上(IQ4_XS)
+pub const RANGE_IQ4XS: &str = "owl_gguf_dequant_range_iq4xs";
+/// 同上(IQ3_XXS)
+pub const RANGE_IQ3XXS: &str = "owl_gguf_dequant_range_iq3xxs";
+/// 同上(IQ3_S)
+pub const RANGE_IQ3S: &str = "owl_gguf_dequant_range_iq3s";
+/// 同上(Q2_K)
+pub const RANGE_Q2K: &str = "owl_gguf_dequant_range_q2k";
+/// 同上(Q3_K)
+pub const RANGE_Q3K: &str = "owl_gguf_dequant_range_q3k";
+/// 同上(IQ2_XXS)
+pub const RANGE_Iq2Xxs: &str = "owl_gguf_dequant_range_iq2xxs";
+/// 同上(IQ2_XS)
+pub const RANGE_Iq2Xs: &str = "owl_gguf_dequant_range_iq2xs";
+/// 同上(IQ2_S)
+pub const RANGE_Iq2S: &str = "owl_gguf_dequant_range_iq2s";
+/// 同上(IQ1_S)
+pub const RANGE_Iq1S: &str = "owl_gguf_dequant_range_iq1s";
+
 
 /// 型 → 行窗解量化入口(`None` = 未移植)
 pub const fn range_entry_for(ty: GgmlTy) -> Option<&'static str> {
@@ -423,6 +691,16 @@ pub const fn range_entry_for(ty: GgmlTy) -> Option<&'static str> {
         GgmlTy::Q4K => Some(RANGE_Q4K),
         GgmlTy::Q5K => Some(RANGE_Q5K),
         GgmlTy::Q6K => Some(RANGE_Q6K),
+        GgmlTy::Iq4Nl => Some(RANGE_IQ4NL),
+        GgmlTy::Iq4Xs => Some(RANGE_IQ4XS),
+        GgmlTy::Iq3Xxs => Some(RANGE_IQ3XXS),
+        GgmlTy::Iq3S => Some(RANGE_IQ3S),
+        GgmlTy::Q2K => Some(RANGE_Q2K),
+        GgmlTy::Q3K => Some(RANGE_Q3K),
+        GgmlTy::Iq2Xxs => Some(RANGE_Iq2Xxs),
+        GgmlTy::Iq2Xs => Some(RANGE_Iq2Xs),
+        GgmlTy::Iq2S => Some(RANGE_Iq2S),
+        GgmlTy::Iq1S => Some(RANGE_Iq1S),
         _ => None,
     }
 }
@@ -570,7 +848,24 @@ pub fn smem_geom(m: usize, n: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
 }
 
 /// **已移植的型**(加型 = `.cu` 加一行实例 + 本表加一项 + `ops/gguf.rs` 加一条声明)
-pub const PORTED: &[GgmlTy] = &[GgmlTy::Q8_0, GgmlTy::Q4K, GgmlTy::Q5K, GgmlTy::Q6K];
+pub const PORTED: &[GgmlTy] = &[
+    GgmlTy::Q8_0,
+    GgmlTy::Q4K,
+    GgmlTy::Q5K,
+    GgmlTy::Q6K,
+    // IQ 族(2026-10-20;REQ-GGUF-04):块解量化 + vec_dot 均在 `gguf.cuh`,
+    // 本仓补的是入口/行窗/查表三条腿(见 ops/gguf.rs 的逐型声明)
+    GgmlTy::Iq4Nl,
+    GgmlTy::Iq4Xs,
+    GgmlTy::Iq3Xxs,
+    GgmlTy::Iq3S,
+    GgmlTy::Q2K,
+    GgmlTy::Q3K,
+    GgmlTy::Iq2Xxs,
+    GgmlTy::Iq2Xs,
+    GgmlTy::Iq2S,
+    GgmlTy::Iq1S,
+];
 
 /// **已移植「行解量化」的型**(查表臂 = `token_embd` 用)。
 ///
@@ -578,7 +873,22 @@ pub const PORTED: &[GgmlTy] = &[GgmlTy::Q8_0, GgmlTy::Q4K, GgmlTy::Q5K, GgmlTy::
 /// Q8_0 有 GEMM(点积)入口,但本仓快照的 `gguf.cuh` **没有**
 /// `dequantize_block_q8_0`(只有 `q2_K`..`q6_K` 五个块解量化)⇒ 量化表若是
 /// Q8_0,**响亮拒**(设计纪律:解析得了 ≠ 跑得了)。
-pub const ROWS_PORTED: &[GgmlTy] = &[GgmlTy::Q4K, GgmlTy::Q5K, GgmlTy::Q6K];
+pub const ROWS_PORTED: &[GgmlTy] = &[
+    GgmlTy::Q4K,
+    GgmlTy::Q5K,
+    GgmlTy::Q6K,
+    // IQ 族:块解量化自带(32 线程),行解量化与 K-quant 同一条路
+    GgmlTy::Iq4Nl,
+    GgmlTy::Iq4Xs,
+    GgmlTy::Iq3Xxs,
+    GgmlTy::Iq3S,
+    GgmlTy::Q2K,
+    GgmlTy::Q3K,
+    GgmlTy::Iq2Xxs,
+    GgmlTy::Iq2Xs,
+    GgmlTy::Iq2S,
+    GgmlTy::Iq1S,
+];
 
 /// 型 → GEMM 入口名(**唯一映射**;`None` = 本仓未移植 ⇒ 调用方**响亮拒**)
 pub const fn entry_for(ty: GgmlTy) -> Option<&'static str> {
@@ -587,6 +897,16 @@ pub const fn entry_for(ty: GgmlTy) -> Option<&'static str> {
         GgmlTy::Q4K => Some(GEMM_Q4K),
         GgmlTy::Q5K => Some(GEMM_Q5K),
         GgmlTy::Q6K => Some(GEMM_Q6K),
+        GgmlTy::Iq4Nl => Some(GEMM_IQ4NL),
+        GgmlTy::Iq4Xs => Some(GEMM_IQ4XS),
+        GgmlTy::Iq3Xxs => Some(GEMM_IQ3XXS),
+        GgmlTy::Iq3S => Some(GEMM_IQ3S),
+        GgmlTy::Q2K => Some(GEMM_Q2K),
+        GgmlTy::Q3K => Some(GEMM_Q3K),
+        GgmlTy::Iq2Xxs => Some(GEMM_Iq2Xxs),
+        GgmlTy::Iq2Xs => Some(GEMM_Iq2Xs),
+        GgmlTy::Iq2S => Some(GEMM_Iq2S),
+        GgmlTy::Iq1S => Some(GEMM_Iq1S),
         _ => None,
     }
 }
@@ -598,6 +918,16 @@ pub const fn tile_entry_for(ty: GgmlTy) -> Option<&'static str> {
         GgmlTy::Q4K => Some(GEMM_TILE_Q4K),
         GgmlTy::Q5K => Some(GEMM_TILE_Q5K),
         GgmlTy::Q6K => Some(GEMM_TILE_Q6K),
+        GgmlTy::Q2K => Some(GEMM_TILE_Q2K),
+        GgmlTy::Q3K => Some(GEMM_TILE_Q3K),
+        GgmlTy::Iq1S => Some(GEMM_TILE_IQ1S),
+        GgmlTy::Iq2Xxs => Some(GEMM_TILE_IQ2XXS),
+        GgmlTy::Iq2Xs => Some(GEMM_TILE_IQ2XS),
+        GgmlTy::Iq2S => Some(GEMM_TILE_IQ2S),
+        GgmlTy::Iq3Xxs => Some(GEMM_TILE_IQ3XXS),
+        GgmlTy::Iq3S => Some(GEMM_TILE_IQ3S),
+        GgmlTy::Iq4Nl => Some(GEMM_TILE_IQ4NL),
+        GgmlTy::Iq4Xs => Some(GEMM_TILE_IQ4XS),
         _ => None,
     }
 }
@@ -642,6 +972,16 @@ pub const fn rows_entry_for(ty: GgmlTy) -> Option<&'static str> {
         GgmlTy::Q4K => Some(ROWS_Q4K),
         GgmlTy::Q5K => Some(ROWS_Q5K),
         GgmlTy::Q6K => Some(ROWS_Q6K),
+        GgmlTy::Iq4Nl => Some(ROWS_IQ4NL),
+        GgmlTy::Iq4Xs => Some(ROWS_IQ4XS),
+        GgmlTy::Iq3Xxs => Some(ROWS_IQ3XXS),
+        GgmlTy::Iq3S => Some(ROWS_IQ3S),
+        GgmlTy::Q2K => Some(ROWS_Q2K),
+        GgmlTy::Q3K => Some(ROWS_Q3K),
+        GgmlTy::Iq2Xxs => Some(ROWS_Iq2Xxs),
+        GgmlTy::Iq2Xs => Some(ROWS_Iq2Xs),
+        GgmlTy::Iq2S => Some(ROWS_Iq2S),
+        GgmlTy::Iq1S => Some(ROWS_Iq1S),
         _ => None,
     }
 }
@@ -654,6 +994,8 @@ pub const fn rows_entry_for(ty: GgmlTy) -> Option<&'static str> {
 pub const fn rows_threads(ty: GgmlTy) -> usize {
     match ty {
         GgmlTy::Q6K => 64,
+        // Q2_K/Q3_K 的块解量化按 `tid/32`、`tid/4` 分工 ⇒ 需 64 线程
+        GgmlTy::Q2K | GgmlTy::Q3K => 64,
         _ => 32,
     }
 }
@@ -750,6 +1092,33 @@ mod tests {
         assert_eq!(PORTED.len(), PORTED.iter().filter(|t| entry_for(**t).is_some()).count());
     }
 
+    /// **能力表 ↔ driver 映射不许漂**(2026-10-20;IQ 落地时抓到的第二套规范).
+    ///
+    /// 旧行为:`driver::gguf::{gemm,dequant_rows,dequant_range}` 各自**另写一份
+    /// match** —— `PORTED`/`ROWS_PORTED` 加了型,driver 仍 `panic!("未移植")`。
+    /// 本门对三张能力表逐型跑一遍 picker(构造期即炸,不等到 GPU 发射)。
+    #[test]
+    fn driver_dispatch_covers_the_capability_tables() {
+        for ty in PORTED {
+            let _ = crate::driver::gguf::gemm(*ty, 1, 64);
+        }
+        for ty in ROWS_PORTED {
+            let qk = ty.block().0;
+            let _ = crate::driver::gguf::dequant_rows(*ty, 1, qk * 2);
+        }
+        for ty in ALL {
+            if range_entry_for(*ty).is_some() {
+                let _ = crate::driver::gguf::dequant_range(*ty, 1, 512);
+            }
+            // MMQ2 臂:J=64/128 两档都要能被 driver 选中
+            for m in [64usize, 128] {
+                if mmq2_entry_for(*ty, m).is_some() {
+                    let _ = crate::driver::gguf::mmq2(*ty, m, 256);
+                }
+            }
+        }
+    }
+
     /// **块几何表 = gguf-py `GGML_QUANT_SIZES`**(逐条硬编码;改表必须改这里)。
     ///
     /// 抄录自 `llama.cpp/gguf-py/gguf/constants.py`(2026-10-19 本机树)。
@@ -807,11 +1176,35 @@ mod tests {
             ("Q5_K", GgmlTy::Q5K),
         ] {
             assert!(entry_for(t).is_some(), "{n} 应在已移植集(PORTED)");
+            assert!(range_entry_for(t).is_some(), "{n} 应有行窗解量化入口");
+        }
+        // IQ 族(2026-10-20;REQ-GGUF-04):三条腿全在(GEMM / 行解量化 / 行窗)
+        for (n, t) in [
+            ("IQ4_XS", GgmlTy::Iq4Xs),
+            ("IQ4_NL", GgmlTy::Iq4Nl),
+            ("IQ3_XXS", GgmlTy::Iq3Xxs),
+            ("IQ3_S", GgmlTy::Iq3S),
+        ] {
+            assert!(entry_for(t).is_some(), "{n} 应在已移植集(PORTED)");
+            assert!(rows_entry_for(t).is_some(), "{n} 应有行解量化入口");
+            assert!(range_entry_for(t).is_some(), "{n} 应有行窗解量化入口");
         }
         assert!(GgmlTy::F32.native_dtype().is_some());
         assert!(GgmlTy::Q4K.native_dtype().is_none(), "量化型不得走元素路径");
-        // 未移植者必须**无入口** ⇒ 可跑性响亮拒(设计 R3:IQ 样本未到)
-        for t in [GgmlTy::Iq4Xs, GgmlTy::Iq4Nl, GgmlTy::Tq1_0, GgmlTy::Mxfp4, GgmlTy::Q2K] {
+        // 未移植者必须**无入口** ⇒ 可跑性响亮拒(设计 R3)。
+        // ⚠️ 2026-10-21 修正:原清单拿 IQ1_S/IQ2_XXS/Q2_K 当"未移植",IQ 族落地
+        // (REQ-GGUF-04)后它们**已移植** ⇒ 陈旧断言。现在判据 = **PORTED 表自洽**:
+        // 有入口 ⇔ 在 PORTED(加型只改一处,不会再有第二份清单漂移)。
+        for t in ALL {
+            assert_eq!(
+                entry_for(*t).is_some(),
+                PORTED.contains(t),
+                "{:?}: 入口在场 ⇔ 在 PORTED(单一事实源)",
+                t
+            );
+        }
+        // 长尾型(**确实**未移植)抽点:必须无入口
+        for t in [GgmlTy::Tq1_0, GgmlTy::Mxfp4, GgmlTy::Nvfp4, GgmlTy::Q1_0, GgmlTy::Q2_0, GgmlTy::Iq1M] {
             assert!(entry_for(t).is_none(), "{:?} 不该有入口(未移植)", t);
         }
     }

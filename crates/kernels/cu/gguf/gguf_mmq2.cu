@@ -72,21 +72,47 @@ __device__ __forceinline__ float group_sum(float s) {
 
 /// `ds4 = true` ⇒ Q4_K/Q5_K(写 ds4[4] = half2(d, sum));
 /// `ds4 = false` ⇒ Q8_0/Q6_K(写 d4[4] = d)
-template <bool ds4>
+/// `bf16 = true` ⇒ 激活是 **BF16**(DFlash2 草稿执行域;2026-10-21)
+template <bool ds4, bool bf16>
 __device__ __forceinline__ void quant_body(const void * __restrict__ vx, void * __restrict__ vy,
-                                           int n_tokens, int ne0) {
+                                           int n_tokens, int m_real, int ne0) {
     const int64_t i0 = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * 4;
     if (i0 >= ne0) {
         return;
     }
     const int64_t row = blockIdx.x;              // token
-    const __half * x = reinterpret_cast<const __half *>(vx) + row * (int64_t) ne0;
-
-    // 4 个 f16 读成 2 个 half2(保持与上游 float4 相同的 lane→元素映射)
-    const __half2 h0 = *reinterpret_cast<const __half2 *>(x + i0 + 0);
-    const __half2 h1 = *reinterpret_cast<const __half2 *>(x + i0 + 2);
-    const float2 f0 = __half22float2(h0);
-    const float2 f1 = __half22float2(h1);
+    // **填充行写零**(2026-10-21 修):`m_real < n_tokens` 的行是 tile 补齐行 ——
+    // MMQ 核按 **J 行**读每个 k 块(不够就跨块/跨缓冲读),所以缓冲必须按
+    // `m_pad = ceil(m/J)·J` 铺且补齐行**内容为 0**(否则核读到的是下一个 k 块
+    // 的量化值,虽然落在被丢弃的 j 行上,但**越界读**在最后一个 k 块会踩出缓冲
+    // 尾巴 —— compute-sanitizer 实测 `owl_mmq2_iq4xs_j8` 越界 896 B)。
+    if (row >= (int64_t) m_real) {
+        block_q8_1_mmq * y = reinterpret_cast<block_q8_1_mmq *>(vy);
+        const int64_t k_block = i0 / 128;
+        const int64_t iqs = i0 % 128;
+        block_q8_1_mmq * yb = y + k_block * (int64_t) n_tokens + row;
+        reinterpret_cast<char4 *>(yb->qs)[iqs / 4] = make_char4(0, 0, 0, 0);
+        if (iqs % 32 == 0) {
+            if (ds4) {
+                yb->ds4[iqs / 32] = make_half2(__float2half(0.0f), __float2half(0.0f));
+            } else {
+                yb->d4[iqs / 32] = 0.0f;
+            }
+        }
+        return;
+    }
+    float2 f0, f1;
+    if constexpr (bf16) {
+        const __nv_bfloat16 * x =
+            reinterpret_cast<const __nv_bfloat16 *>(vx) + row * (int64_t) ne0;
+        f0 = make_float2(__bfloat162float(x[i0 + 0]), __bfloat162float(x[i0 + 1]));
+        f1 = make_float2(__bfloat162float(x[i0 + 2]), __bfloat162float(x[i0 + 3]));
+    } else {
+        const __half * x = reinterpret_cast<const __half *>(vx) + row * (int64_t) ne0;
+        // 4 个 f16 读成 2 个 half2(保持与上游 float4 相同的 lane→元素映射)
+        f0 = __half22float2(*reinterpret_cast<const __half2 *>(x + i0 + 0));
+        f1 = __half22float2(*reinterpret_cast<const __half2 *>(x + i0 + 2));
+    }
 
     float amax = fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)), fmaxf(fabsf(f1.x), fabsf(f1.y)));
     amax = group_amax(amax);
@@ -119,13 +145,30 @@ __device__ __forceinline__ void quant_body(const void * __restrict__ vx, void * 
 } // namespace owl_mmq2
 
 extern "C" __global__ void owl_mmq2_quant_q8_1_ds4(const void * __restrict__ vx,
-                                                    void * __restrict__ vy, int n_tokens, int ne0) {
-    owl_mmq2::quant_body<true>(vx, vy, n_tokens, ne0);
+                                                    void * __restrict__ vy, int n_tokens,
+                                                    int m_real, int ne0) {
+    owl_mmq2::quant_body<true, false>(vx, vy, n_tokens, m_real, ne0);
 }
 
 extern "C" __global__ void owl_mmq2_quant_q8_1_d4(const void * __restrict__ vx,
-                                                  void * __restrict__ vy, int n_tokens, int ne0) {
-    owl_mmq2::quant_body<false>(vx, vy, n_tokens, ne0);
+                                                  void * __restrict__ vy, int n_tokens,
+                                                  int m_real, int ne0) {
+    owl_mmq2::quant_body<false, false>(vx, vy, n_tokens, m_real, ne0);
+}
+
+// ---- BF16 激活变体(2026-10-21;DFlash2 草稿执行域)----
+//
+// 为什么要有:草稿的激活是 BF16(F16 装不下残差流),而 MMQ2 的量化手只吃 F16
+// ⇒ 草稿的全部 GEMM 被迫退回复用臂(tile),propose 的 1.07 GB 权重按 290 GB/s
+// 走。本变体让 MMQ2 直接吃 BF16(数值上只多一次 bf16→f32,精度不降)。
+extern "C" __global__ void owl_mmq2_quant_q8_1_ds4_bf16(
+    const void * __restrict__ vx, void * __restrict__ vy, int n_tokens, int m_real, int ne0) {
+    owl_mmq2::quant_body<true, true>(vx, vy, n_tokens, m_real, ne0);
+}
+
+extern "C" __global__ void owl_mmq2_quant_q8_1_d4_bf16(
+    const void * __restrict__ vx, void * __restrict__ vy, int n_tokens, int m_real, int ne0) {
+    owl_mmq2::quant_body<false, true>(vx, vy, n_tokens, m_real, ne0);
 }
 
 // ============================================================================
@@ -154,11 +197,16 @@ __device__ __forceinline__ uint3 owl_mmq2_fastdiv_init(uint32_t d) {
         const uint3 bp = owl_mmq2_fastdiv_init((uint32_t) (k / ggml_cuda_type_traits<ty>::qk));  \
         const uint3 ntx = owl_mmq2_fastdiv_init((uint32_t) ((m + jj - 1) / jj));                 \
         const uint3 one = make_uint3(1u, 0u, 1u);                                                \
-        /* ncols_dst = m(token 列数);stride_col_dst = n(输出行宽);                     */       \
-        /* ncols_y   = m(y 的"列"= token;y 布局 [k_block][token]);                     */       \
+        /* ncols_dst = m(真实 token 数);stride_col_dst = n(输出行宽);                   */       \
+        /* ncols_y   = **m_pad**(y 的 k 块步长:令牌行按 J 补齐,补齐行 = 0)。         */       \
+        /* ⚠️ 必须是补齐值:核每 tile 无条件读 J 行(load_tiles 的 tile_y 循环按       */       \
+        /*   `J*MMQ_TILE_Y_K` 取整到线程数);用 m 当步长会让**最后一个 k 块的最后一  */       \
+        /*   个 tile** 越界读(compute-sanitizer:iq4xs_j8 越界 896 B,长 ctx 时踩到  */       \
+        /*   未映射页 ⇒ 700 / 上下文毒化)。                                      */       \
+        const int m_pad = ((m + jj - 1) / jj) * jj;                                              \
         mul_mat_q<ty, jj, false>(                                                                \
             (const char *) vx, (const int *) vy, nullptr, nullptr, out, nullptr, nullptr,         \
-            bp, n, m, k / ggml_cuda_type_traits<ty>::qk, m, n, one, one, 0, 0, 0, one, one, 0, 0, 0, ntx); \
+            bp, n, m, k / ggml_cuda_type_traits<ty>::qk, m_pad, n, one, one, 0, 0, 0, one, one, 0, 0, 0, ntx); \
     }
 
 OWL_MMQ2_WRAP(owl_mmq2_q8_0_j64, GGML_TYPE_Q8_0, 64)
@@ -169,3 +217,51 @@ OWL_MMQ2_WRAP(owl_mmq2_q5k_j64, GGML_TYPE_Q5_K, 64)
 OWL_MMQ2_WRAP(owl_mmq2_q5k_j128, GGML_TYPE_Q5_K, 128)
 OWL_MMQ2_WRAP(owl_mmq2_q6k_j64, GGML_TYPE_Q6_K, 64)
 OWL_MMQ2_WRAP(owl_mmq2_q6k_j128, GGML_TYPE_Q6_K, 128)
+// IQ 族(2026-10-20;REQ-GGUF-04):vendor2 的 mmq-config-ampere 已带 IQ4_XS/IQ3_S/
+// IQ3_XXS 的 J 档(布局 = Q8_0 ⇒ 激活量化走 D4)。IQ4_NL 是 32 元素块,
+// vendor2 目录里没有它的 MMQ 配置 ⇒ 不进本臂(仍走 cuBLAS/MMVQ)。
+OWL_MMQ2_WRAP(owl_mmq2_iq4xs_j64, GGML_TYPE_IQ4_XS, 64)
+OWL_MMQ2_WRAP(owl_mmq2_iq4xs_j128, GGML_TYPE_IQ4_XS, 128)
+OWL_MMQ2_WRAP(owl_mmq2_iq3s_j64, GGML_TYPE_IQ3_S, 64)
+OWL_MMQ2_WRAP(owl_mmq2_iq3s_j128, GGML_TYPE_IQ3_S, 128)
+OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j64, GGML_TYPE_IQ3_XXS, 64)
+OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j128, GGML_TYPE_IQ3_XXS, 128)
+
+// ---- J=16(2026-10-21):小 m(verify depth+1 = 2..8、propose 8 行)专用档 ----
+// 复用同一 `mul_mat_q<ty, J, false>`(上游 J 表本就含 16)。J=64 在 m=8 时
+// 有 8/64 的有用行 ⇒ 4× 的 MMA 浪费;J=16 同样一次读权重(ntx=ceil(8/16)=1),
+// 但只算 16 行 ⇒ 实测 MMQ2 m=8 从 81 µs 降到 ~35 µs(29 MB 张量)。
+
+// ---- J=8 档 **已撤**(2026-10-21):compute-sanitizer 实证 `owl_mmq2_*_j8`
+// 在长 ctx / 虚拟化档**越界读**(verify 图 warmup 即报,错位 `+0x1210`),
+// 换回 J=16 后同一序列全清。J=8 只值 −4.1 ms/轮(−7%),不值得带未定谳的
+// 越界 ⇒ 撤档,`mmq2_j` 退化为 16/64/128 三段。复查路子:lineinfo 构建 +
+// compute-sanitizer 打源码行(J=8 的 `load_tiles`/`K_vram` 假设待查)。
+
+OWL_MMQ2_WRAP(owl_mmq2_q8_0_j16, GGML_TYPE_Q8_0, 16)
+OWL_MMQ2_WRAP(owl_mmq2_q4k_j16, GGML_TYPE_Q4_K, 16)
+OWL_MMQ2_WRAP(owl_mmq2_q5k_j16, GGML_TYPE_Q5_K, 16)
+OWL_MMQ2_WRAP(owl_mmq2_q6k_j16, GGML_TYPE_Q6_K, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq4xs_j16, GGML_TYPE_IQ4_XS, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq3s_j16, GGML_TYPE_IQ3_S, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j16, GGML_TYPE_IQ3_XXS, 16)
+
+// ---- J=16,SRAM 布局 = Q3_K(IQ2_S / IQ2_XS / Q3_K;2026-10-21 第二刀)----------------------
+//
+// 动机(verify 轮内 nsys 账):UD-IQ4_XS 混型档里 IQ2_S(7 张)/ IQ2_XS(2 张)/
+// Q3_K(9 张)/ Q2_K(1 张)此前**没有 MMQ2 实例** ⇒ 全落复用臂(tile):
+// IQ2_S 679 µs/张(42 GB/s)、IQ3_S 之外的 Q3_K 506 µs —— 四型合计只占权重
+// 8.2%,却吃掉 verify 轮 17% 的时间。它们的 MMQ 配置在 vendor2 里**本来就有**
+// (`mmq-config-ampere.cuh` 的 J=8..128 全档),只是没被适配层发射。
+//
+// ⚠️ 这族的 SRAM 布局是 `Q3_K`(X 面 stride 84,不是 76)
+// ⇒ smem 尺寸必须按型取(`family::gguf::mmq2_sram_stride_for`),否则溢出。
+// ⚠️ 只挂 J=16:小 m(verify/propose 的 2..16 行)。m > 16 仍回 tile ——
+// MMQ 的 ntx = ceil(m/J) 会按 token 窗**重读权重**(prefill 语义上仍是重复读),
+// 本刀不碰 prefill 侧。
+OWL_MMQ2_WRAP(owl_mmq2_q3k_j16, GGML_TYPE_Q3_K, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq2s_j16, GGML_TYPE_IQ2_S, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq2xs_j16, GGML_TYPE_IQ2_XS, 16)
+// ⚠️ Q2_K **不在本刀**:它的激活布局是 `MMQ_Q8_1_DS_LAYOUT_D2S6`
+// (`mmq.cuh::mmq_get_q8_1_ds_layout`),而本适配层的量化手只有 D4 / DS4 两族 ⇒
+// 硬接会出 inf(实测)。本档 Q2_K 只有 1 张(19 MB),留在 tile 臂。

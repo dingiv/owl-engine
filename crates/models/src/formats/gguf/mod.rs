@@ -22,6 +22,9 @@
 pub mod convention;
 pub mod dequant;
 pub mod dequant_source;
+pub mod draft;
+pub mod draft_meta;
+mod iq_tables;
 pub mod kernel_gate;
 pub mod load_gate;
 pub mod meta;
@@ -34,6 +37,8 @@ pub mod source;
 pub mod transform;
 
 pub use convention::GgufConvention;
+pub use draft::{DraftGgufConvention, DraftGgufPlan, GgufDraftBoot, GgufDraftSource};
+pub use draft_meta::{DraftSpec, TargetFacts};
 pub use dequant::{dequant_all, dequant_row};
 pub use dequant_source::GgufDequantSource;
 /// 量化型词表(块几何 + 可跑性映射在同一处;`owl_kernels` 为权威住址)

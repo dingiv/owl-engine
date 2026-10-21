@@ -27,6 +27,15 @@ impl Mlp {
             down_proj: Linear::new("down_proj", hidden, intermediate, p.of("down_proj", hidden, intermediate)),
         }
     }
+
+    /// **输出 dtype 钉定**(草稿 GGUF 臂;三条 Linear 统一;判据见
+    /// [`Linear::with_out_dtype`](crate::layers::linear::Linear::with_out_dtype))
+    pub fn with_out_dtype(mut self, dt: crate::contract::Dtype) -> Self {
+        self.gate_proj = self.gate_proj.with_out_dtype(dt);
+        self.up_proj = self.up_proj.with_out_dtype(dt);
+        self.down_proj = self.down_proj.with_out_dtype(dt);
+        self
+    }
 }
 
 impl Module for Mlp {

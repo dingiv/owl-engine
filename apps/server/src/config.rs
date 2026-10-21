@@ -350,8 +350,13 @@ impl ServerConfig {
         if let Some(p) = args.site.as_deref() {
             layers.push(p);
         }
-        let mut resolved =
-            OwlConfig::load_resolved(base, &layers, &args.overrides())?;
+        // `--print-config` = 完整档的**生成器** ⇒ 走宽松档(不被"全字段显式"
+        // 门自举挡住);`--check`/正常启动仍走严格档。
+        let mut resolved = if args.print_config {
+            OwlConfig::load_resolved_for_print(base, &layers, &args.overrides())?
+        } else {
+            OwlConfig::load_resolved(base, &layers, &args.overrides())?
+        };
         if let Some(m) = resolved.meta.as_mut() {
             m.intent.profile = base.map(|p| p.display().to_string());
         }
@@ -645,14 +650,9 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
     let e = r.estimate()?;
     let arms = format!(
         "prefill={} decode={} gdn={}",
+        // prefill 桶已退役(2026-10-21 S6x):prefill 恒 eager;decode 走单键臂
         "eager",
-        if c.dispatch.decode_fi {
-            "FI(single)"
-        } else if c.dispatch.decode_xqa {
-            "XQA"
-        } else {
-            "eager"
-        },
+        c.dispatch.decode_arm.as_str(),
         if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
     );
     Some(format!(
@@ -879,14 +879,9 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     }
 
     // ── 臂摘要 ──
-    let prefill = "eager";
-    let decode = if c.dispatch.decode_fi {
-        "FI(单图)"
-    } else if c.dispatch.decode_xqa {
-        "XQA"
-    } else {
-        "eager/piecewise"
-    };
+    let prefill = "eager"; // 桶已退役
+    // **单值臂**(2026-10-21):"v2" = 分页 v2 主核(历史上被误叫 prefill/eager)
+    let decode = c.dispatch.decode_arm.as_str();
     out.push_str(&format!(
         "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{}({:?}) reuse={} batch={} vision={}\n",
         if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },

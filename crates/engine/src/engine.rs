@@ -1636,6 +1636,12 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             spec: &rm.spec,
             dumb: cfg.knobs.draft.dumb,
             draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
+            // 草稿共享的 target 事实(GGUF 草稿声明校验 + 码本行数)
+            target: owl_models::formats::gguf::TargetFacts {
+                vocab: rm.spec.vocab,
+                layers: rm.spec.layer_types.len(),
+                hidden: rm.spec.hidden,
+            },
             notaps: cfg.knobs.draft.notaps,
             // P2.1-a:本 rank 的 TP 计划(单卡 = None ⇒ 旧行为)
             tp: tp.as_ref().map(|c| c.plan),
@@ -1732,9 +1738,10 @@ fn boot_pool_plan(
         draft_dt: spec.draft_dt,
         spec_mode: spec.mode,
         spec_depth: spec.depth,
-        xqa_verify: cfg.knobs.env.attn.verify_xqa,
+        xqa_verify: matches!(cfg.knobs.env.attn.verify_arm, owl_shared::config::VerifyArm::Xqa),
         // B-3e-2:部分驻留档**不带 XQA**(页表语义不共戴;见上方醒目告知)
-        xqa_decode: cfg.knobs.env.attn.decode_xqa && !cfg.knobs.select_partial,
+        xqa_decode: matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
+            && !cfg.knobs.select_partial,
         xqa_prefill: cfg.knobs.env.attn.xqa_prefill,
         gdn_slots: cfg.knobs.gdn_slots,
         max_batch: cfg.knobs.max_batch,
@@ -1779,7 +1786,9 @@ fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
         );
         std::process::exit(2);
     }
-    if cfg.knobs.select_partial && cfg.knobs.env.attn.decode_xqa {
+    if cfg.knobs.select_partial
+        && matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
+    {
         owl_shared::log_warn!(
             "boot",
             "部分驻留档:本档**关掉 XQA 裸 decode 臂**(其页表语义读整条会话链,遇占位符 = 非法地址;\n                    \

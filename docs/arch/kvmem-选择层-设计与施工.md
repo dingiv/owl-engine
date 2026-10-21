@@ -2145,3 +2145,54 @@ git stash pop         ⇒ 视图步 1 · 输出 2 字 · FAILED
 ⇒ 结论两条:**①行为未变**(优化只动速度)②262k 在单张 3090 Ti 上已进入
 **3.5 分钟**量级;§8.33 那张表里的"边界 5.3 min"其实是**索引 host 热路 + debug 构建**
 的合成假象,不是机制成本。
+
+---
+
+## §9 2026-10-21:**部分驻留 × 投机 = CUDA 700(已拒启)**;MMQ2 越界读(已修)
+
+### 9.1 现象
+
+`[kvmem] select_partial = true` + `[spec] depth = 7`,长 ctx(8192)第一次**真下沉**后:
+
+```
+[cov-probe] 部分驻留:下沉 192 块 · 回灌 0 块(表 224 项)
+[cov-probe] 部分驻留:下沉 0 块 · 回灌 12 块(表 256 项)
+[WARN] [actor] pump 错误: copy_batch: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, …)
+[INFO] [actor] 弃置 turn 4(…)
+```
+
+后果两层:**① 该 turn 丢**;**② CUDA context 毒化 —— 之后每个 turn 都报 700**
+(`copy_batch` / `swap(Out)` dtoh / `memset_zero` 轮着报),服务表面还活着。
+
+> 短 ctx 不炸是因为**懒沉**(池有余量就不沉,§上面 `lazy_keep`);必须凑到
+> "池将满 + 召回点下沉"才会触发。`select_decode` 单独开**不炸**(没有占位符)。
+
+### 9.2 根因
+
+下沉把会话链上的块改写成 **`PENDING_LOAD_PLACEHOLDER`(u32::MAX)**;decode 侧有
+视图(`sel_pt`)兜住,prefill 侧有 `past_view_of` 兜住,**verify 侧没有**:
+`exec/spec.rs` 的 `bt8`(v2 伪序列页表)、`slots_f`、FI 四件套**直接取会话链** ⇒
+占位符被核当页号(× 页字节 = 天文地址)⇒ 700。首个同步点(尾事件 / 下一次
+`copy_batch`)才报出来,所以错误信息指向的是"无辜的 copy"。
+
+### 9.3 处置(本刀)
+
+1. **配置面拒启**:`select_partial && spec.depth > 0` ⇒ 拒启,文案给出两条合法组合;
+2. **运行期守卫**(纵深):verify 若发现链上前 `ceil(ctx/page)` 块里有占位符,
+   **结构化拒发本轮**(弃置 turn,不发射任何核);
+3. 合法组合实测(8192,同池/同工作集 1024 tok):
+   - `select_decode` + spec d7:**35.1 t/s**,零 IMA;
+   - `select_partial` + spec off:**40.2 t/s**,零 IMA(与 dense 38.8–40 持平);
+   - 两者都开:拒启。
+4. **待办(挂账)**:视图化 verify —— 方案 A 的页表是"选中页 ++ 尾页",而 verify 要
+   **按原位置**写 8 行 KV + 逐行长 lens,页表与 lens 的契约未定谱;
+   定谱后才解禁 `select_partial + spec`。
+
+### 9.4 顺带修的:MMQ2 激活 tile 越界读(与 kvmem 无关,但被它显形)
+
+compute-sanitizer 在 boot warmup 就报 `owl_mmq2_iq4xs_j8` 越界读;两条根因都在
+"激活 tile 的 J 行"上(padding 按 m 铺 vs 核按 J 读;`tile_y` 装载循环按线程数取整),
+详见 `crates/kernels/cu/gguf/vendor2/README.md` 的补丁表(P2b)与
+`docs/arch/gguf-dflash2-验证提速-路线图.md` §9.9。
+**这两条越界读正是"长 ctx / 虚拟化档分配布局一变就炸"的那类**:短 ctx 落进同段
+slab 无害,长 ctx 踩到未映射页 ⇒ 700。修完 + J=8 档撤回后,同一序列 sanitizer 全清。

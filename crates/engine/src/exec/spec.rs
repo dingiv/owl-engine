@@ -305,7 +305,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let ts = std::time::Instant::now();
             // 记录齐 = 可折(图态桶 / eager fold_tree 两路都吃记录);
             // 不齐 = 旧"前缀重放"(整模前向)唯一可行路, 该档不做轮内边界快照
-            let foldable = records.len() == self.dev.pool.gdn_count() * 8;
+            let foldable =
+                records.len() == self.dev.pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX;
             if foldable {
                 // **消费方门**(2026-10-19,同 prefill 的 `snap_on` 判据):轮内页边界
                 // 快照的唯一消费者 = **前缀复用**(`restore_snap` 只在 prefix 命中时调);
@@ -544,7 +545,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             mrec("spec.snap", t_snap);
         }
         if t_rollback > std::time::Duration::ZERO {
-            let tag = if records.len() == self.dev.pool.gdn_count() * 8 {
+            let tag = if records.len()
+                == self.dev.pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX
+            {
                 "spec.fold"
             } else {
                 "spec.replay"
@@ -744,6 +747,28 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let s = self.bank.sessions.session(sid)?;
             s.block_table.clone()
         };
+        // **部分驻留守卫**(2026-10-21,合并自 feat/gguf 08790fa):`select_partial`
+        // 下沉过的块在会话链上是**宿主占位符**(u32::MAX)。verify 的 `bt8`/`slots`
+        // 直接取会话链 ⇒ 占位符被 v2/attention 核当页号(乘页字节 = 天文地址)
+        // ⇒ CUDA 700,且**污染整个上下文**(之后每个 turn 都炸)。响亮拒发本轮,
+        // 错误上抛到 pump(弃置该 turn,不发射任何核)。
+        // 为什么不做"视图化 verify":方案 A 的视图把 KV 压成选中子集,而 verify
+        // 要按**原位置**逐行因果写 8 行 KV + 逐行长 lens —— 页表与 lens 的语义
+        // 还没定谱(设计卷 B-3e 挂账),先拒不发假绿。
+        {
+            let page_g = self.dev.pool.geom.page.max(1);
+            let need_pages = (pos + block.len()).div_ceil(page_g);
+            if let Some((i, _)) = bt_chain
+                .iter()
+                .take(need_pages)
+                .enumerate()
+                .find(|(_, p)| **p == crate::scheduler::PENDING_LOAD_PLACEHOLDER)
+            {
+                return Err(ModelError::Msg(format!(
+                    "spec verify 需要第 {i} 块但它在宿主(部分驻留下沉过;pos={pos} 需 {need_pages} 页)                     ⇒ 拒发本轮。verify 的视图化页表未实现:请关 `[kvmem] select_partial`                     (只留 select_decode)或关投机"
+                )));
+            }
+        }
         let ids_f: Vec<f32> = block.iter().map(|&v| v as f32).collect();
         let rope_base = usize::try_from(pos as i64 + vlm_delta).map_err(|_| {
             ModelError::Msg(format!(
@@ -947,7 +972,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             tok_f.iter().map(|&v| v as u32).collect()
         };
         let hidden = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
-        let n_rec = self.dev.pool.gdn_count() * 8;
+        let n_rec = self.dev.pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX;
         let records: Vec<Bytes> = (0..n_rec)
             .map(|i| {
                 vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {

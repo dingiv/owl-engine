@@ -99,17 +99,18 @@ repack = "auto"
 dump = false
 
 [dispatch]
+# GGUF 小 n(装得进 L2)且 m ≤ TILE_MT ⇒ 让 MMVQ 赢;0 = 关
+# (2026-10-21 定谱:ssm_alpha/beta 每发 34.2→5.1 µs,verify −2.8 ms/轮)
+gguf_mmvq_l2_mib = 4
+# 单键臂(2026-10-21 合并:旧 verify_v2/verify_fi/verify_xqa + decode_fi/decode_xqa)
+verify_arm = "v2"
+decode_arm = "fi"
 qkv_fuse = true
 prefill_split = false
 force_naive_prefill = false
-verify_v2 = false
 fi_plan_bake = 0
 fi_plan_restore = false
 fi_cuda_graph = true
-verify_fi = false
-decode_fi = true
-verify_xqa = false
-decode_xqa = false
 xqa_prefill = false
 fi_min_tokens = 1
 gdn_chunked = true
@@ -184,3 +185,13 @@ tags_deny = []
 max_mb = 0
 keep = 0
 timestamp = false
+
+# **意图档头**(2026-10-21):本档是"全字段完整 dump + 显式目标"两档并立里的后者 ——
+# 有 `[intent]` 时豁免全字段门(派生面确定性),且 `--check` 的内存估算需要它
+# (`profile_estimate_matches_boot_ledger` 门)。
+# 显式 `[model].{kind,quant,head_quant}` 必须与 intent 派生值同值(同值 = 无害复述)。
+[intent]
+model = "qwen3.8-27b-awq"
+hardware = "3090ti-24g"
+goal = "max-context"
+context = 131072

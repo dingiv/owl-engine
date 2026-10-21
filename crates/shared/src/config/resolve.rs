@@ -262,8 +262,8 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             b.set("graph.no_graph", true.into(), "intent.graphs = off(eager 直发)");
             b.set("dispatch.fi_cuda_graph", false.into(), "intent.graphs = off");
             b.set("dispatch.fi_plan_restore", true.into(), "intent.graphs = off");
-            b.set("dispatch.decode_fi", false.into(), "intent.graphs = off");
-            b.set("dispatch.verify_fi", false.into(), "intent.graphs = off");
+            b.set("dispatch.decode_arm", "v2".into(), "intent.graphs = off");
+            b.set("dispatch.verify_arm", "v2".into(), "intent.graphs = off");
             false
         }
         GraphIntent::Auto => {
@@ -284,20 +284,20 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                     b.set("graph.no_graph", false.into(), "graphs=auto(降级:保留普通 decode 图)");
                     b.set("dispatch.fi_cuda_graph", false.into(), "graphs=auto 降级");
                     b.set("dispatch.fi_plan_restore", true.into(), "graphs=auto 降级");
-                    b.set("dispatch.decode_fi", false.into(), "graphs=auto 降级");
-                    b.set("dispatch.verify_fi", false.into(), "graphs=auto 降级");
-                    b.set("dispatch.verify_v2", true.into(), "graphs=auto 降级:verify 回 v2");
+                    b.set("dispatch.decode_arm", "v2".into(), "graphs=auto 降级");
+                    b.set("dispatch.verify_arm", "v2".into(), "graphs=auto 降级:verify 回 v2");
                     false
                 }
                 None => {
                     b.set("graph.no_graph", false.into(), "graphs=auto");
-                    b.set("dispatch.decode_fi", true.into(), "graphs=auto:decode FI 单图");
-                    b.set(
-                        "dispatch.verify_fi",
-                        (intent.spec == SpecIntent::Dflash).into(),
-                        "graphs=auto:verify FI(有投机时)",
-                    );
-                    b.set("dispatch.verify_v2", false.into(), "graphs=auto:verify 不走 v2");
+                    // **单键臂**(2026-10-21):"v2" = 分页 v2 主核;prefill 桶已退役
+                    // ⇒ 这里只给两臂的意图缺省(用户档可逐个覆盖)。
+                    b.set("dispatch.decode_arm", "fi".into(), "graphs=auto:decode FI 单图");
+                    if intent.spec == SpecIntent::Dflash {
+                        b.set("dispatch.verify_arm", "fi".into(), "graphs=auto:verify 走 FI(有投机时)");
+                    } else {
+                        b.set("dispatch.verify_arm", "v2".into(), "graphs=auto:无投机 ⇒ verify 臂不影响,留 v2");
+                    }
                     b.set("dispatch.fi_cuda_graph", true.into(), "graphs=auto:图档瓦(plan 形状恒定)");
                     b.set("dispatch.fi_plan_bake", 0i64.into(), "graphs=auto:0 = 取 max_seq 上界");
                     b.set("dispatch.fi_plan_restore", false.into(), "graphs=auto:表由窗外 fi_plan_sync 刷");
@@ -693,9 +693,8 @@ mod tests {
         // 臂/KV/图/投机
         assert_eq!(c.dispatch.kv_fp8, f.dispatch.kv_fp8);
         assert_eq!(c.dispatch.gdn_chunked, f.dispatch.gdn_chunked);
-        assert_eq!(c.dispatch.decode_fi, f.dispatch.decode_fi);
-        assert_eq!(c.dispatch.verify_fi, f.dispatch.verify_fi);
-        assert_eq!(c.dispatch.verify_v2, f.dispatch.verify_v2);
+        assert_eq!(c.dispatch.verify_arm, f.dispatch.verify_arm);
+        assert_eq!(c.dispatch.decode_arm, f.dispatch.decode_arm);
         assert_eq!(c.dispatch.fi_cuda_graph, f.dispatch.fi_cuda_graph);
         assert_eq!(c.dispatch.fi_plan_bake, f.dispatch.fi_plan_bake);
         assert_eq!(c.dispatch.fi_plan_restore, f.dispatch.fi_plan_restore);
@@ -828,7 +827,10 @@ graphs = "auto"
 "#,
         );
         assert_eq!(get_bool(&v, "dispatch.fi_cuda_graph"), Some(false));
-        assert_eq!(get_bool(&v, "dispatch.decode_fi"), Some(false));
+        assert_eq!(
+            get(&v, "dispatch.decode_arm").and_then(|x| x.as_str()),
+            Some("v2")
+        );
         assert!(get(&v, "graph.prefill_bucket").is_none(), "prefill 桶已退役");
     }
 

@@ -32,6 +32,43 @@ use crate::TensorOps;
 /// (128/512/1024)才谈得上复用。
 pub(crate) const GGUF_TILE_MIN_M: usize = 8;
 
+/// **L2 复用判据的字节上限**(2026-10-21 P1)。
+///
+/// 复用臂(tile)与 MMVQ 的分野不只是 token 窗:MMVQ 的网格是
+/// `(ceil(n/4), m)`、tile 是 `(ceil(n/4), ceil(m/16))`,**权重流量**则是
+/// MMVQ 按 token 重读(`m/ceil(m/16)` × )⇒ 大张量上 tile 稳赢。
+/// 但张量**整体装得进 L2** 时重读几乎免费,而 tile 在 `m ≤ TILE_MT` 时
+/// 只剩一个 token 窗、CTA 数被 n 限死 ⇒ 实测反过来输 6.7 倍:
+///
+/// | `ssm_alpha/beta`(n=48,k=5120,Q8_0;260 KB)| 每发 |
+/// |---|---:|
+/// | tile 臂(m=8,12 CTA) | **34.2 µs** |
+/// | MMVQ(网格 (12,8);decode 档 m=1 实测 5.1 µs) | ~5–8 µs |
+///
+/// ⇒ 96 发/轮 × 26 µs ≈ **2.5 ms/轮**(verify 47.3 ms 的 5%)。两臂**位级相同**
+/// (门 `kernel_gate::tile_gemm_matches_mmvq_bitwise`)⇒ 切臂零数值风险。
+///
+/// 阈值 = **配置项** `[dispatch] gguf_mmvq_l2_mib`(缺省 4 MiB;3090 Ti L2 = 6 MiB
+/// 留余量;`0` = 关 = 一律走复用臂)。
+pub(crate) const GGUF_MMVQ_L2_MIB_DEFAULT: usize = 4;
+
+/// `true` = **小张量 + 未用满 token 窗** ⇒ 让 MMVQ 赢(见 [`GGUF_MMVQ_L2_BYTES`])。
+///
+/// 判据两条(缺一不切):
+/// 1. `m ≤ TILE_MT` —— 否则 tile 的权重复用是真的省带宽(MMVQ 要重读 `m` 遍);
+/// 2. 整张量 `n·k·(块字节/块元素)` ≤ 4 MiB —— 重读落在 L2 上。
+fn gguf_prefers_mmvq_small_n(ty: GgmlTy, m: usize, n: usize, k: usize, l2_mib: usize) -> bool {
+    use owl_kernels::family::gguf::TILE_MT;
+    if l2_mib == 0 || m > TILE_MT {
+        return false;
+    }
+    let (blk_elems, blk_bytes) = ty.block();
+    if blk_elems == 0 {
+        return false;
+    }
+    n.saturating_mul(k) / blk_elems * blk_bytes <= (l2_mib << 20)
+}
+
 /// **复用臂开关**(诊断/对拍用;缺省开)。
 ///
 /// `OWL_GGUF_TILE=0` ⇒ 全档回 MMVQ(与 W-2 之前逐位相同)—— A/B 测 prefill
@@ -50,9 +87,13 @@ fn gguf_cublas_arm_enabled() -> bool {
     !matches!(std::env::var("OWL_GGUF_CUBLAS").as_deref(), Ok("0"))
 }
 
-/// **head 版 int8-MMA MMQ 的最小 token 数**(W-2f)。J=64 打底 ⇒ `m ≥ 64`;
-/// 更小的批留在 cuBLAS/MMQ(dp4a)/复用臂。
-pub(crate) const GGUF_MMQ2_MIN_M: usize = 64;
+/// **head 版 int8-MMA MMQ 的最小 token 数**(W-2f;2026-10-21 重定)。
+///
+/// 原 = 64(J=64 打底,只服务 prefill)。实测(27B UD-IQ4_XS,29 MB IQ4_XS 张量):
+/// MMVQ 的权重流量 = `m × 字节数` ⇒ m=8 时 238 µs,而复用臂 153 µs、
+/// **MMQ2 81 µs(m=8..64 近乎恒定)**;m=2 时 MMVQ 66 µs 仍胜 ⇒ 交叉点 ≈ 4。
+/// 详见 `family::gguf::MMQ2_SMALL_M` 的实测表。decode(m=1)不变。
+pub(crate) const GGUF_MMQ2_MIN_M: usize = owl_kernels::family::gguf::MMQ2_SMALL_M;
 
 /// int8-MMA MMQ 开关(诊断/对拍;缺省开)。`OWL_GGUF_MMQ2=0` ⇒ 回退 cuBLAS 臂。
 fn gguf_mmq2_arm_enabled() -> bool {
@@ -83,6 +124,7 @@ fn gguf_smem_arm_enabled() -> bool {
     !matches!(std::env::var("OWL_GGUF_SMEM").as_deref(), Ok("0"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gguf_quant_gemm(
     w: &Weight,
     ty: GgmlTy,
@@ -90,6 +132,7 @@ pub(crate) fn gguf_quant_gemm(
     out_dim: usize,
     in_dim: usize,
     col_index: Option<&Weight>,
+    mmvq_l2_mib: usize,
 ) -> TensorOps {
     // 形状律:xs = [.., in](空形状 = 声明失守 ⇒ **毒化**,不 panic)
     if xs.shape().is_empty() {
@@ -127,26 +170,34 @@ pub(crate) fn gguf_quant_gemm(
     // (llama.cpp)对 cuBLAS 的 66,而且**省掉"权重→f16 解量化"那 10.4%**
     // (设计 §21.2)。`OWL_GGUF_MMQ2=0` 一键回退。
     if m >= GGUF_MMQ2_MIN_M
-        && xs.dtype == Dtype::F16
+        // 激活 ∈ {F16, BF16}(BF16 = DFlash2 草稿域;量化手有 `*_bf16` 变体)
+        && matches!(xs.dtype, Dtype::F16 | Dtype::BF16)
         && col_index.is_none()
         && gguf_mmq2_arm_enabled()
         && owl_kernels::family::gguf::mmq2_ok(ty, m, out_dim, k)
     {
         use owl_kernels::family::gguf as famg;
-        let quant = if famg::mmq2_quant_entry_for(ty) == Some(famg::MMQ2_QUANT_DS4) {
-            SemanticKernel::GgufMmq2QuantDs4
-        } else {
-            SemanticKernel::GgufMmq2QuantD4
+        let bf16 = xs.dtype == Dtype::BF16;
+        let quant = match famg::mmq2_quant_entry_for_act(ty, bf16) {
+            Some(famg::MMQ2_QUANT_DS4) => SemanticKernel::GgufMmq2QuantDs4,
+            Some(famg::MMQ2_QUANT_DS4_BF16) => SemanticKernel::GgufMmq2QuantDs4Bf16,
+            Some(famg::MMQ2_QUANT_D4_BF16) => SemanticKernel::GgufMmq2QuantD4Bf16,
+            _ => SemanticKernel::GgufMmq2QuantD4,
         };
         // 激活 → q8_1_mmq([k/128][token] × 144B;展平成 U8 二秩)
+        // 行向 = **m_pad**(ceil(m/J)·J;尾行由量化核写 0)——
+        // 见 `family::gguf::mmq2_xq_tokens`:核每 tile 无条件读 J 行,
+        // 按 m 铺缓冲会让最后一个 k 块的尾 tile 越界读。
+        let m_pad = famg::mmq2_xq_tokens(m);
         let xq = TensorOps::call(quant)
             .arg(xs)
+            .arg_i32(m_pad as i32)
             .arg_i32(m as i32)
             .arg_i32(k as i32)
             .aux(&[m, k])
             .with_shape(
                 Dtype::U8,
-                vec![k / famg::MMQ2_QK, m * famg::MMQ2_Q8_1_BLOCK_BYTES],
+                vec![k / famg::MMQ2_QK, m_pad * famg::MMQ2_Q8_1_BLOCK_BYTES],
             );
         return TensorOps::call(SemanticKernel::GgufMmq2)
             .arg(&w.decl())
@@ -279,6 +330,9 @@ pub(crate) fn gguf_quant_gemm(
         && xs.dtype == Dtype::F16
         && col_index.is_none()
         && gguf_smem_arm_enabled()
+        // **能力表门**(2026-10-20):smem 臂只对 `smem_entry_for` 已移植的型成立;
+        // 不查表 = IQ 族走到这里必 `panic!("未移植")`(实测 IQ4_XS 0.8B 起机即崩)
+        && owl_kernels::family::gguf::smem_entry_for(ty).is_some()
     {
         return TensorOps::call(SemanticKernel::GgufGemmSmem)
             .arg(&w.decl())
@@ -329,7 +383,13 @@ pub(crate) fn gguf_quant_gemm(
     // 一行权重算一窗 token,权重流量 ÷ `TILE_MT`;decode 仍 MMVQ(本来就只该
     // 读一遍权重)。两臂**位级相同**(同一 `vec_dot` 序 + 同一 warp reduce;
     // 门 = `kernel_gate::tile_gemm_matches_mmvq_bitwise`)⇒ 切换零数值风险。
-    let gemm = if m >= GGUF_TILE_MIN_M && gguf_tile_arm_enabled() {
+    let gemm = if m >= GGUF_TILE_MIN_M
+        // 小张量 + 未用满窗 ⇒ MMVQ(实测快 6.7×;见 [`GGUF_MMVQ_L2_BYTES`])
+        && !gguf_prefers_mmvq_small_n(ty, m, out_dim, k, mmvq_l2_mib)
+        && gguf_tile_arm_enabled()
+        // 同上:复用臂的能力集是独立的(`tile_entry_for`),不查 = IQ 族崩
+        && owl_kernels::family::gguf::tile_entry_for(ty).is_some()
+    {
         SemanticKernel::GgufGemmTile
     } else {
         SemanticKernel::GgufGemm
@@ -377,6 +437,13 @@ pub struct Linear {
     /// **TP 角色标记**(S4 ③';构造期从规则表算一次 —— **纯标注,零决策**:
     /// 层不构造通信节点,只把它透传到图节点上,解释器统一追加 allreduce)
     tp_role: crate::plan::rules::WeightRule,
+    /// **输出 dtype 钉定**(`Some` = 本层产出恒铸到该 dtype;2026-10-20)。
+    ///
+    /// 唯一动机:GGUF 块型臂的 GEMM 核写 `half*`(F16),而 BF16 执行域
+    /// (DFlash2 草稿)下游一律按 BF16 读 —— 不铸就是**静默错值**。
+    /// HF 臂(`matmul` 声明随激活)本就不错,`cast_16` 同 dtype 直通 ⇒
+    /// 统一挂上无成本。缺省 `None` = 既有一切档位逐字节不变。
+    out_dt: Option<Dtype>,
 }
 
 impl Linear {
@@ -405,6 +472,7 @@ impl Linear {
             gguf_ty: None,
             gguf_col_index: None,
             tp_role: crate::plan::rules::rule_of(key),
+            out_dt: None,
         };
         let eligible = crate::formats::util::marlin_eligible(out_dim, in_dim);
         match plan {
@@ -446,6 +514,13 @@ impl Linear {
     /// "分片行数 < 全量行数"这一个判据决定 —— 单源 = `ModelSpec::head_vocab`。
     pub fn with_tp_rule(mut self, rule: crate::plan::rules::WeightRule) -> Self {
         self.tp_role = rule;
+        self
+    }
+
+    /// **输出 dtype 钉定**(唯一消费者 = DFlash2 草稿的 GGUF 块型臂;
+    /// 见字段 `out_dt` 的判据)。同 dtype 直通 ⇒ 挂上零成本。
+    pub fn with_out_dtype(mut self, dt: Dtype) -> Self {
+        self.out_dt = Some(dt);
         self
     }
 
@@ -619,19 +694,52 @@ impl Module for Linear {
     /// 插 zeros 槽;kU4 has_zp 内核,组大小 32)。
     fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         let _ = ctx; // 层**不读 ctx 的 TP 面**(S4 ③':决策在解释器)
+        // **输出 dtype 钉定 + GGUF 动态范围护栏**(仅显式声明者)
+        //
+        // GGUF 块型 GEMM 的输出核写 `half*`(F16 上限 65504),而 BF16 执行域
+        // (DFlash2 草稿)的层输出实测可达 ~6e4 ⇒ 直接落 F16 会饱和成 inf。
+        // 成对移位:`x·2⁻⁶ →(GEMM)→ f16→bf16 → ·2⁶`。2 的幂在 f16/bf16 上
+        // **精确**,相对精度仍由 F16 尾数决定 ⇒ 与"BF16 输出 GEMM"等价。
+        // `2⁶` = 64× 上限余量(1.7e7 以下不饱和);F16 次正规临界 6e-8·2⁶
+        // 远低于 bf16 自身粒度 ⇒ 无可见损失。
+        const GEMM_SCALE: f32 = 64.0;
+        let (xs, out_dt) = match self.out_dt {
+            Some(dt) if self.gguf_ty.is_some() && dt != Dtype::F16 => {
+                (crate::layers::scale16(xs, 1.0 / GEMM_SCALE), Some(dt))
+            }
+            other => (xs.clone(), other),
+        };
+        // 小 n 判据的阈值走**配置**(`[dispatch] gguf_mmvq_l2_mib`;ctx 里带)
+        let y = self.forward_inner(&xs, ctx.env.gguf.mmvq_l2_mib);
+        let y = match out_dt {
+            Some(dt) if self.gguf_ty.is_some() => {
+                let b = crate::layers::cast_16(&y, dt);
+                crate::layers::scale16(&b, GEMM_SCALE)
+            }
+            Some(dt) if y.dtype() != dt => crate::layers::cast_16(&y, dt),
+            _ => y,
+        };
         // ★ **S4 ③':TP 只给标记** —— 构造期已由规则表算好([`Self::tp_role`]),
         //   这里**纯透传**到图节点;解释器在求值尾部按标记统一追加 allreduce。
         //   (用户裁决 2026-10-17:感知下沉到解释器层,原子 layer 只留标记。)
-        self.forward_inner(xs).with_tp_role(self.tp_role)
+        y.with_tp_role(self.tp_role)
     }
 }
 
 impl Linear {
     /// ctx 无关前向(Embedding::lm_head_matmul 复用;14 个调用点零改动)。
-    pub(crate) fn forward_inner(&self, xs: &TensorOps) -> TensorOps {
+    pub(crate) fn forward_inner(&self, xs: &TensorOps, mmvq_l2_mib: usize) -> TensorOps {
         // ---- **GGUF 块型臂**(2026-10-19):激活 → q8_1 → dequant-in-kernel GEMM ----
         if let Some(ty) = self.gguf_ty {
-            return gguf_quant_gemm(&self.w, ty, xs, self.out_dim, self.in_dim, self.gguf_col_index.as_ref());
+            return gguf_quant_gemm(
+                &self.w,
+                ty,
+                xs,
+                self.out_dim,
+                self.in_dim,
+                self.gguf_col_index.as_ref(),
+                mmvq_l2_mib,
+            );
         }
         // ---- W4A8 × AWQ 臂(S2):激活量化 → a8 GEMM ----
         //
@@ -1009,7 +1117,7 @@ mod tests {
 
         // ---- ② 前向面:量化(quant_int8_row) → a8 GEMM,7 父 ----
         let xs = TensorOps::zeros(Dtype::F16, vec![8, 256]);
-        let out = lin.forward_inner(&xs);
+        let out = lin.forward_inner(&xs, GGUF_MMVQ_L2_MIB_DEFAULT);
         // 外层是窄视图(与 a16 臂同款的 out_dim 裁切)
         let gemm = out.parents.first().expect("窄视图的父 = GEMM").clone();
         match &gemm.op {

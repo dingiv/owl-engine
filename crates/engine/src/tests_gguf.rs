@@ -200,6 +200,62 @@ async fn gpu_gguf_27b_smoke() {
     smoke_scenario("gguf:27b", 64, 48, " Paris", gguf_cfg(ord, 4096, 4096, 1)).await;
 }
 
+/// **IQ 族 e2e 门**(2026-10-20;REQ-GGUF-04):0.8B IQ4_XS 装载 + 生成,
+/// 与**同族 Q4_K_M** 的首 token 对拍(跨量化档的"接线级"判据)+ 压缩驻留(I-3)。
+///
+/// 为什么拿 Q4_K_M 当参照臂:同 dims / 同 tokenizer / 同模型族,只差量化 ⇒
+/// 首 token 由整条 prefill 链(24 层 × 全部 IQ4_XS 权重 × 输出头)决定;
+/// 错码本/错尺度/错块位移都会在这里翻车(单元门已逐张量验过)。
+#[cfg(test)]
+#[owl_test(gpu)]
+async fn gpu_gguf_iq4xs_0_8b_vs_q4km() {
+    if !resource_ok("gguf:0.8b-iq4xs") || !resource_ok("gguf:0.8b-q4km") {
+        eprintln!("skip: 资源清单缺 \"gguf:0.8b-iq4xs\" / \"gguf:0.8b-q4km\"");
+        return;
+    }
+    let ord = owl_cuda::test_device_ordinal();
+    let prompt = "The capital of France is";
+    let mut firsts: Vec<(&str, String, f64)> = Vec::new();
+    for key in ["gguf:0.8b-q4km", "gguf:0.8b-iq4xs"] {
+        let path = std::path::PathBuf::from(resource(key).expect("列了就有"));
+        let file_gib = std::fs::metadata(&path).expect("stat").len() as f64 / (1u64 << 30) as f64;
+        let live0 = owl_shared::vram::live_bytes();
+        let mut engine = Engine::new(gguf_cfg(ord, 2048, 2048, 1)).expect("引擎");
+        let loaded = engine.loader().load_gguf(&path).await.expect("装载");
+        let live_gib =
+            owl_shared::vram::live_bytes().saturating_sub(live0) as f64 / (1u64 << 30) as f64;
+        assert_eq!(loaded.model.layers.len(), 24, "[{key}] 层数");
+        // 小模型有固定开销(池/norm 等 ~50 MiB)⇒ 判据 = 文件 + 64 MiB 余量,
+        // 而不是百分比(0.5 GiB 的 2% 只有 10 MiB,会把正常开销判成解量化驻留)
+        assert!(
+            live_gib <= file_gib + 0.0625,
+            "[{key}] 设备 live {live_gib:.2} GiB > 文件 {file_gib:.2} GiB + 64 MiB(权重被解量化驻留?)"
+        );
+        let mut running = engine.run(loaded).await.expect("装配");
+        // 首 token 单发(贪心;不走模板 —— 与裸文本口径一致)
+        let (_, tid) = running.submit_session(Some(9), prompt, 1).expect("submit");
+        let mut first = String::new();
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Token { turn, delta } if turn == tid => first.push_str(&delta),
+                TurnEvent::Completed { turn, .. } if turn == tid => break,
+                TurnEvent::Failed { turn, err } => panic!("[{key}] t{turn} 失败: {err}"),
+                TurnEvent::Idle => panic!("[{key}] turn {tid} 队列丢失"),
+                _ => {}
+            }
+        }
+        eprintln!(
+            "[gguf-iq-e2e] {key} {:.2} GiB / live {live_gib:.2} GiB · 首 token = {first:?}",
+            file_gib
+        );
+        firsts.push((key, first, live_gib / file_gib));
+    }
+    assert_eq!(
+        firsts[0].1, firsts[1].1,
+        "IQ4_XS 首 token 与 Q4_K_M 参照臂不符(错码本/错尺度/错块位移会给完全不同的 argmax)"
+    );
+}
+
 /// **交叉源对拍:同 dims,两源权重**(GGUF Q4_K_M ↔ HF 快照 f16;设计 REQ-GGUF-07)。
 ///
 /// # 判据为什么不是"逐 token 全序列相同"(2026-10-19 实测定谳)

@@ -135,3 +135,98 @@ extern "C" __global__ void owl_gguf_gemm_tile_q6k(
                             vec_dot_q6_K_q8_1, OWL_GGUF_TILE_MT>(
         weights, xq, out, m, n, k, k_padded, out_off, out_ld);
 }
+
+// ---- IQ / K-quant 补型(2026-10-21):UD 混型档(IQ4_XS / Q8_0 / Q4_K / Q5_K / IQ3_S …)
+// 在 m ≥ 8(verify / 小 prefill)也必须走复用臂 —— MMVQ 的网格是 (n/n_warps, m),
+// 权重流量 = m × 权重字节数;27B UD-IQ4_XS 的 verify(m=8)实测 175 ms 即此。
+// `vec_dot` 与 MMVQ 逐型同源(gguf.cuh)⇒ 输出仍与 MMVQ **位级相同**。
+
+extern "C" __global__ void owl_gguf_gemm_tile_q2k(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_tile_body<QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ,
+                            vec_dot_q2_K_q8_1, OWL_GGUF_TILE_MT>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_tile_q3k(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_tile_body<QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ,
+                            vec_dot_q3_K_q8_1, OWL_GGUF_TILE_MT>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_tile_iq1s(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_tile_body<QK_K, QI_IQ1_S, block_iq1_s, VDR_IQ1_S_Q8_1_MMVQ,
+                            vec_dot_iq1_s_q8_1, OWL_GGUF_TILE_MT>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_tile_iq2xxs(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_tile_body<QK_K, QI_IQ2_XXS, block_iq2_xxs, VDR_IQ2_XXS_Q8_1_MMVQ,
+                            vec_dot_iq2_xxs_q8_1, OWL_GGUF_TILE_MT>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_tile_iq2xs(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_tile_body<QK_K, QI_IQ2_XS, block_iq2_xs, VDR_IQ2_XS_Q8_1_MMVQ,
+                            vec_dot_iq2_xs_q8_1, OWL_GGUF_TILE_MT>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_tile_iq2s(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_tile_body<QK_K, QI_IQ2_S, block_iq2_s, VDR_IQ2_S_Q8_1_MMVQ,
+                            vec_dot_iq2_s_q8_1, OWL_GGUF_TILE_MT>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_tile_iq3xxs(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_tile_body<QK_IQ3_XXS, QI_IQ3_XXS, block_iq3_xxs, VDR_IQ3_XXS_Q8_1_MMVQ,
+                            vec_dot_iq3_xxs_q8_1, OWL_GGUF_TILE_MT>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_tile_iq3s(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_tile_body<QK_IQ3_S, QI_IQ3_S, block_iq3_s, VDR_IQ3_S_Q8_1_MMVQ,
+                            vec_dot_iq3_s_q8_1, OWL_GGUF_TILE_MT>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_tile_iq4nl(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_tile_body<QK_IQ4_NL, QI_IQ4_NL, block_iq4_nl, VDR_IQ4_NL_Q8_1_MMVQ,
+                            vec_dot_iq4_nl_q8_1, OWL_GGUF_TILE_MT>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
+
+extern "C" __global__ void owl_gguf_gemm_tile_iq4xs(
+    const void * __restrict__ weights, const void * __restrict__ xq,
+    __half * __restrict__ out, int m, int n, int k, int k_padded, int out_off,
+    int out_ld) {
+    owl_gguf_mmvq_tile_body<QK_IQ4_XS, QI_IQ4_XS, block_iq4_xs, VDR_IQ4_XS_Q8_1_MMVQ,
+                            vec_dot_iq4_xs_q8_1, OWL_GGUF_TILE_MT>(
+        weights, xq, out, m, n, k, k_padded, out_off, out_ld);
+}
