@@ -1,5 +1,6 @@
 /target
-Cargo.lock
+# Cargo.lock **入库**(应用/二进制仓):`cargo build --locked` 才能复现依赖树。
+# 公共库形态另行裁决时再移出。
 AGENTS.md
 *.local.md
 roadmap.local/
@@ -35,6 +36,8 @@ testdata/gdn_fla/cases/*
 # kernels build 中间物(链接面 = prebuilt/*.a;.o 为 FORCE_BUILD 中间产物)
 crates/kernels/cu/flashinfer/*.o
 /*.toml
+# 例外:许可证门配置必须入库(/*.toml 只用于挡本机 owl.toml)
+!/deny.toml
 
 docs/archive
 # perf 会话产物(2026-10-15):原始账太大、且是本地运行快照,不入库
@@ -47,3 +50,5 @@ docs/bench/data/
 *.local
 
 /models
+# 子 crate 里误生成的独立 lock(工作区统一用根 Cargo.lock)
+crates/*/Cargo.lock
