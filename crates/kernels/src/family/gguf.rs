@@ -410,19 +410,19 @@ pub const MMQ2_SMEM_X: usize = MMQ2_I * 76 * 4;
 
 /// 型 → (量化入口, MMQ 入口 J64/J128);`None` = 本臂未移植
 pub const fn mmq2_entry_for(ty: GgmlTy, m: usize) -> Option<&'static str> {
-    let (e8, e16, e64, e128) = match ty {
-        GgmlTy::Q8_0 => (MMQ2_Q8_0_J8, MMQ2_Q8_0_J16, MMQ2_Q8_0_J64, MMQ2_Q8_0_J128),
-        GgmlTy::Q4K => (MMQ2_Q4K_J8, MMQ2_Q4K_J16, MMQ2_Q4K_J64, MMQ2_Q4K_J128),
-        GgmlTy::Q5K => (MMQ2_Q5K_J8, MMQ2_Q5K_J16, MMQ2_Q5K_J64, MMQ2_Q5K_J128),
-        GgmlTy::Q6K => (MMQ2_Q6K_J8, MMQ2_Q6K_J16, MMQ2_Q6K_J64, MMQ2_Q6K_J128),
-        GgmlTy::Iq4Xs => (MMQ2_IQ4XS_J8, MMQ2_IQ4XS_J16, MMQ2_IQ4XS_J64, MMQ2_IQ4XS_J128),
-        GgmlTy::Iq3S => (MMQ2_IQ3S_J8, MMQ2_IQ3S_J16, MMQ2_IQ3S_J64, MMQ2_IQ3S_J128),
-        GgmlTy::Iq3Xxs => (MMQ2_IQ3XXS_J8, MMQ2_IQ3XXS_J16, MMQ2_IQ3XXS_J64, MMQ2_IQ3XXS_J128),
+    let (e16, e64, e128) = match ty {
+        GgmlTy::Q8_0 => (MMQ2_Q8_0_J16, MMQ2_Q8_0_J64, MMQ2_Q8_0_J128),
+        GgmlTy::Q4K => (MMQ2_Q4K_J16, MMQ2_Q4K_J64, MMQ2_Q4K_J128),
+        GgmlTy::Q5K => (MMQ2_Q5K_J16, MMQ2_Q5K_J64, MMQ2_Q5K_J128),
+        GgmlTy::Q6K => (MMQ2_Q6K_J16, MMQ2_Q6K_J64, MMQ2_Q6K_J128),
+        GgmlTy::Iq4Xs => (MMQ2_IQ4XS_J16, MMQ2_IQ4XS_J64, MMQ2_IQ4XS_J128),
+        GgmlTy::Iq3S => (MMQ2_IQ3S_J16, MMQ2_IQ3S_J64, MMQ2_IQ3S_J128),
+        GgmlTy::Iq3Xxs => (MMQ2_IQ3XXS_J16, MMQ2_IQ3XXS_J64, MMQ2_IQ3XXS_J128),
         // 2026-10-21 第二刀:**只挂 J=16**(小 m)。m > 16 仍回 tile ——
         // MMQ 的 ntx = ceil(m/J) 按 token 窗重读权重,prefill 侧本刀不动。
-        GgmlTy::Q3K => (MMQ2_Q3K_J8, MMQ2_Q3K_J16, MMQ2_Q3K_J16, MMQ2_Q3K_J16),
-        GgmlTy::Iq2S => (MMQ2_IQ2S_J8, MMQ2_IQ2S_J16, MMQ2_IQ2S_J16, MMQ2_IQ2S_J16),
-        GgmlTy::Iq2Xs => (MMQ2_IQ2XS_J8, MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J16),
+        GgmlTy::Q3K => (MMQ2_Q3K_J16, MMQ2_Q3K_J16, MMQ2_Q3K_J16),
+        GgmlTy::Iq2S => (MMQ2_IQ2S_J16, MMQ2_IQ2S_J16, MMQ2_IQ2S_J16),
+        GgmlTy::Iq2Xs => (MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J16),
         _ => return None,
     };
     // 新族(J16 专用)只服务小 m:m > 16 交回 tile/MMVQ(见上注)
@@ -430,9 +430,7 @@ pub const fn mmq2_entry_for(ty: GgmlTy, m: usize) -> Option<&'static str> {
     {
         return None;
     }
-    Some(if m <= MMQ2_TINY_J {
-        e8
-    } else if m <= MMQ2_SMALL_J {
+    Some(if m <= MMQ2_SMALL_J {
         e16
     } else if m >= MMQ2_I {
         e128
@@ -508,9 +506,23 @@ pub const fn mmq2_ok(ty: GgmlTy, m: usize, n: usize, k: usize) -> bool {
         && k % MMQ2_QK == 0
 }
 
-/// 激活缓冲字节数(`[k/128][n_token]` × 144B)
+/// **激活缓冲的补齐行数**(`m_pad = ceil(m/J)·J`;2026-10-21 修越界)。
+///
+/// 为什么必须补齐:MMQ 核每 tile **无条件读 J 行**(`load_tiles` 的
+/// `tile_y` 循环按 `J·MMQ_TILE_Y_K` 取整到线程数),而 J 由 m 分段选
+/// (`m≤8 ⇒ J=8`、`9..16 ⇒ 16`、`17..127 ⇒ 64`、`≥128 ⇒ 128`)。缓冲若按 **m**
+/// 行铺,最后一个 k 块的最后一个 tile 就会读出缓冲尾(compute-sanitizer 实测
+/// `owl_mmq2_iq4xs_j8` 越界 **896 B**):短 ctx 时落进同段 slab 无害,**长 ctx /
+/// 虚拟化档的分配布局一变就踩未映射页 ⇒ CUDA 700 + 上下文毒化**。
+/// 补齐行由量化核写 0(见 `gguf_mmq2.cu::quant_body` 的 `m_real` 分支)。
+pub const fn mmq2_xq_tokens(m: usize) -> usize {
+    let j = mmq2_j(m);
+    m.div_ceil(j) * j
+}
+
+/// 激活缓冲字节数(`[k/128][m_pad]` × 144B)
 pub const fn mmq2_xq_bytes(m: usize, k: usize) -> usize {
-    (k / MMQ2_QK) * m * MMQ2_Q8_1_BLOCK_BYTES
+    (k / MMQ2_QK) * mmq2_xq_tokens(m) * MMQ2_Q8_1_BLOCK_BYTES
 }
 
 /// **MMQ 发射几何**(上游 stream-k 支的"一 tile/block"形态):
@@ -536,26 +548,6 @@ pub const fn mmq2_smem(j: usize) -> usize {
     nbs_ids + MMQ2_SMEM_X + nbs_y.div_ceil(pad_to) * pad_to
 }
 
-/// `owl_mmq2_q8_0_j8`(m ≤ 8;J=8)
-pub const MMQ2_Q8_0_J8: &str = "owl_mmq2_q8_0_j8";
-/// `owl_mmq2_q4k_j8`(m ≤ 8;J=8)
-pub const MMQ2_Q4K_J8: &str = "owl_mmq2_q4k_j8";
-/// `owl_mmq2_q5k_j8`(m ≤ 8;J=8)
-pub const MMQ2_Q5K_J8: &str = "owl_mmq2_q5k_j8";
-/// `owl_mmq2_q6k_j8`(m ≤ 8;J=8)
-pub const MMQ2_Q6K_J8: &str = "owl_mmq2_q6k_j8";
-/// `owl_mmq2_iq4xs_j8`(m ≤ 8;J=8)
-pub const MMQ2_IQ4XS_J8: &str = "owl_mmq2_iq4xs_j8";
-/// `owl_mmq2_iq3s_j8`(m ≤ 8;J=8)
-pub const MMQ2_IQ3S_J8: &str = "owl_mmq2_iq3s_j8";
-/// `owl_mmq2_iq3xxs_j8`(m ≤ 8;J=8)
-pub const MMQ2_IQ3XXS_J8: &str = "owl_mmq2_iq3xxs_j8";
-/// `owl_mmq2_q3k_j8`(m ≤ 8;J=8)
-pub const MMQ2_Q3K_J8: &str = "owl_mmq2_q3k_j8";
-/// `owl_mmq2_iq2s_j8`(m ≤ 8;J=8)
-pub const MMQ2_IQ2S_J8: &str = "owl_mmq2_iq2s_j8";
-/// `owl_mmq2_iq2xs_j8`(m ≤ 8;J=8)
-pub const MMQ2_IQ2XS_J8: &str = "owl_mmq2_iq2xs_j8";
 
 /// J 档(分派用;与 `mmq2_entry_for` 同一判据)
 /// `owl_mmq2_q8_0_j16`(小 m;J=16)
@@ -612,9 +604,7 @@ pub const fn mmq2_smem_for(ty: GgmlTy, j: usize) -> usize {
 ///   而 `ntx = ceil(m/J)` 两档都是 1 ⇒ **权重流量不变**,只砍无效算力;
 /// - `m < 128` ⇒ J=64;`m ≥ 128` ⇒ J=128。
 pub const fn mmq2_j(m: usize) -> usize {
-    if m <= MMQ2_TINY_J {
-        8
-    } else if m <= MMQ2_SMALL_J {
+    if m <= MMQ2_SMALL_J {
         16
     } else if m >= MMQ2_I {
         128
@@ -627,7 +617,8 @@ pub const fn mmq2_j(m: usize) -> usize {
 pub fn mmq2_quant_geom(m: usize, k: usize) -> ((u32, u32, u32), (u32, u32, u32)) {
     const BLK: usize = 128;
     let gy = k.div_ceil(4 * BLK).max(1) as u32;
-    ((m.max(1) as u32, gy, 1), (BLK as u32, 1, 1))
+    // 行向 = **m_pad**(尾行写零;见 `mmq2_xq_tokens`)
+    ((mmq2_xq_tokens(m).max(1) as u32, gy, 1), (BLK as u32, 1, 1))
 }
 
 // ---- **行窗解量化**(W-2d;dequant+cuBLAS 臂的喂料手)--------------------------

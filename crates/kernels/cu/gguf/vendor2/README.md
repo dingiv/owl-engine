@@ -3,12 +3,13 @@
 > 本目录是第三方代码(MIT,见 `LICENSE`)。上游 =
 > 本机 `packages/llama.cpp` fork(即 §21 剖析的那个二进制之源码树)。
 >
-> **三处登记补丁**(2026-10-19 W-2f 接线;判据 = 门全部绿):
+> **四处登记补丁**(P1/P2 2026-10-19 W-2f;P2b 2026-10-21 越界读;判据 = 门全部绿):
 >
 > | # | 文件 | 改动 | 原因 |
 > |---|---|---|---|
 > | P1 | `mmq.cuh` | `mul_mat_q`:`__launch_bounds__(…) static __global__` → `static __device__ __forceinline__` | fatbin 只出**设备码**(宿主函数永不执行)⇒ 入口必须由本仓 `extern "C" __global__` wrapper 提供;`launch_bounds(256,1)` 搬到 wrapper |
 > | P2 | `mmq.cuh` | 内核 + `mul_mat_q_process_tile` + `write_back_{mma,dp4a}` 的 `dst`:`float*` → `__half*`(+`__float2half`),fixup 分支强转 | 本仓输出 f16 `[m,n]` 行主序,与上游 `dst[col*stride+row]` 布局逐位相同 ⇒ 省 f32 中间缓冲 |
+> | **P2b** | `mmq.cuh` | `mul_mat_q_process_tile`:`tile_y` 装载循环的 `by0[l]` 加 `l < J*MMQ_TILE_Y_K` 守卫(循环按 `nthreads` 取整,J=8/16 时越 896/768 B);超界格写 0 | 本仓 y 是**精确尺寸**的独立缓冲(非上游大 arena)⇒ 末 k 块读出缓冲尾。短 ctx 时落进同段 slab 无害;**长 ctx / 虚拟化档分配布局一变就踩未映射页 ⇒ CUDA 700 + 上下文毒化**(compute-sanitizer 实证,2026-10-21) |
 > | P3 | (无) | StreamK 取上游"tiles 效率 ≥90%"形态(一维 `grid=ntiles`、`tmp_fixup=nullptr`) | 零 fixup 核、零新机制 |
 >
 > 其余逐字未改。

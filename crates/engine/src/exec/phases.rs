@@ -510,6 +510,26 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // (视图 = 选中页 ++ 新生成尾部;无视图态 ⇒ 写全量链,与不开时等价)
         if self.dev.graphs.session.has_input("sel_pt") {
             let (pt, len) = self.select_view_step(sid, pos);
+            // **页表不变量守卫**(2026-10-21):视图页表只要有一项是
+            // ① 宿主占位符(`u32::MAX` 位型)② ≥ 池页数 —— 核就会把编号当
+            // 字节偏移去读,轻则错页、重则 CUDA 700(而且**污染整个上下文**,
+            // 之后每个 turn 都炸)。这一条把"静默越界"改成**结构化拒发**:
+            // 弃置本 turn、点名页号与 pos,不发射任何核。
+            let page = self.dev.pool.page.max(1);
+            let nb = self.dev.pool.nb;
+            let need = len.div_ceil(page).max(1);
+            // 表项是**页号的 f32 值**(`page as f32`);唯一例外 = 占位符走
+            // `f32::from_bits(u32::MAX)`(= NaN)。判据按**值**比,别按位型比
+            // (若按 `to_bits()` 比会把页号 1 的位型 0x3F800000 当越界,误伤正常步)。
+            let bad = pt.iter().take(need).copied().position(|v| {
+                v.is_nan() || v < 0.0 || v.fract() != 0.0 || v >= nb as f32
+            });
+            if let Some(i) = bad {
+                let raw = pt[i].to_bits();
+                return Err(ModelError::Msg(format!(
+                    "decode 视图页表失守:第 {i}/{need} 项 = {raw}(pos={pos} len={len} page={page} nb={nb})                     ⇒ 拒发(占位符/越界页号会被核当字节偏移读 = CUDA 700 上下文毒化)"
+                )));
+            }
             step_slots.push(("sel_pt", pt));
             step_slots.push(("sel_len", vec![len as f32]));
         }

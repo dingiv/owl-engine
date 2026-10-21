@@ -146,14 +146,19 @@ pub(crate) fn gguf_quant_gemm(
             _ => SemanticKernel::GgufMmq2QuantD4,
         };
         // 激活 → q8_1_mmq([k/128][token] × 144B;展平成 U8 二秩)
+        // 行向 = **m_pad**(ceil(m/J)·J;尾行由量化核写 0)——
+        // 见 `family::gguf::mmq2_xq_tokens`:核每 tile 无条件读 J 行,
+        // 按 m 铺缓冲会让最后一个 k 块的尾 tile 越界读。
+        let m_pad = famg::mmq2_xq_tokens(m);
         let xq = TensorOps::call(quant)
             .arg(xs)
+            .arg_i32(m_pad as i32)
             .arg_i32(m as i32)
             .arg_i32(k as i32)
             .aux(&[m, k])
             .with_shape(
                 Dtype::U8,
-                vec![k / famg::MMQ2_QK, m * famg::MMQ2_Q8_1_BLOCK_BYTES],
+                vec![k / famg::MMQ2_QK, m_pad * famg::MMQ2_Q8_1_BLOCK_BYTES],
             );
         return TensorOps::call(SemanticKernel::GgufMmq2)
             .arg(&w.decl())

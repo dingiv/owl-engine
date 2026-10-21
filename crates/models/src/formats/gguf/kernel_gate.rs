@@ -877,12 +877,17 @@ mod tests {
                     } else {
                         TensorOps::call(SemanticKernel::GgufMmq2QuantD4)
                     };
+                    let m_pad = famg::mmq2_xq_tokens(m);
                     let xq = quant
                         .arg(&x)
+                        .arg_i32(m_pad as i32)
                         .arg_i32(m as i32)
                         .arg_i32(inner as i32)
                         .aux(&[m, inner])
-                        .with_shape(Dtype::U8, vec![inner / famg::MMQ2_QK, m * famg::MMQ2_Q8_1_BLOCK_BYTES]);
+                        .with_shape(
+                            Dtype::U8,
+                            vec![inner / famg::MMQ2_QK, m_pad * famg::MMQ2_Q8_1_BLOCK_BYTES],
+                        );
                     let got = dtoh_raw(&mut gpu, &xq, famg::mmq2_xq_bytes(m, inner), "mmq2-xq").await;
                     let mut want = vec![0u8; got.len()];
                     let nkb = inner / famg::MMQ2_QK;
@@ -1533,12 +1538,14 @@ mod m_scan {
                 } else {
                     SemanticKernel::GgufMmq2QuantD4
                 };
+                let m_pad = owl_kernels::family::gguf::mmq2_xq_tokens(m);
                 let xq2 = TensorOps::call(q)
                     .arg(&x)
+                    .arg_i32(m_pad as i32)
                     .arg_i32(m as i32)
                     .arg_i32(in_dim as i32)
                     .aux(&[m, in_dim])
-                    .with_shape(Dtype::U8, vec![in_dim / 128, m * 144]);
+                    .with_shape(Dtype::U8, vec![in_dim / 128, m_pad * 144]);
                 let _ = j;
                 let y2 = TensorOps::call(SemanticKernel::GgufMmq2)
                     .arg(&wblk)
@@ -1583,10 +1590,11 @@ mod m_scan {
                     };
                     let xq2b = TensorOps::call(qb)
                         .arg(&x16)
+                        .arg_i32(m_pad as i32)
                         .arg_i32(m as i32)
                         .arg_i32(in_dim as i32)
                         .aux(&[m, in_dim])
-                        .with_shape(Dtype::U8, vec![in_dim / 128, m * 144]);
+                        .with_shape(Dtype::U8, vec![in_dim / 128, m_pad * 144]);
                     let y2b = TensorOps::call(SemanticKernel::GgufMmq2)
                         .arg(&wblk)
                         .arg(&xq2b)

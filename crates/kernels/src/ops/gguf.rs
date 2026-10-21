@@ -106,7 +106,7 @@ gguf_gemm_spec!(GgufGemmIq1S, crate::family::gguf::GEMM_Iq1S);
 // ---- **head 版 int8-MMA MMQ**(W-2f;设计 §二十二)---------------------------
 //
 // 槽序与 `.cu` 实例逐参对位:
-//   量化:`x[F16,2], xq[U8,2], n_tokens(i32), ne0(i32)`
+//   量化:`x[F16,2], xq[U8,2], n_tokens(i32)=m_pad, m_real(i32), ne0(i32)`
 //   GEMM:`weights[U8,2], xq[U8,2], out[F16,2], n(i32), m(i32), k(i32)`
 
 /// `owl_mmq2_quant_q8_1_ds4`(激活 → q8_1_mmq;DS4 布局)
@@ -122,7 +122,10 @@ const MMQ2_QUANT_PARAMS: &[Param] = &[
     // 名字逐字对 `.cu` 实例(`vx`/`vy`;2026-10-20 互证门修正)
     Param::t_in("vx", Dtype::F16, 2),
     Param::t_out("vy", Dtype::U8, 2),
+    /// 行向步长 = **m_pad**(ceil(m/J)·J);尾行由核写 0(2026-10-21)
     Param::i32("n_tokens"),
+    /// 真实 token 数(≥ 它的行 = 补齐行 ⇒ 写零)
+    Param::i32("m_real"),
     Param::i32("ne0"),
 ];
 
@@ -147,6 +150,7 @@ const MMQ2_QUANT_PARAMS_BF16: &[Param] = &[
     Param::t_in("vx", Dtype::BF16, 2),
     Param::t_out("vy", Dtype::U8, 2),
     Param::i32("n_tokens"),
+    Param::i32("m_real"),
     Param::i32("ne0"),
 ];
 macro_rules! gguf_mmq2_quant_spec_bf16 {
@@ -166,16 +170,6 @@ gguf_mmq2_quant_spec_bf16!(GgufMmq2QuantDs4Bf16, crate::family::gguf::MMQ2_QUANT
 gguf_mmq2_quant_spec_bf16!(GgufMmq2QuantD4Bf16, crate::family::gguf::MMQ2_QUANT_D4_BF16);
 
 /// `owl_mmq2_q8_0_j128` 等 8 个(type × J)
-pub struct GgufMmq2Q8_0_J8;
-pub struct GgufMmq2Q4K_J8;
-pub struct GgufMmq2Q5K_J8;
-pub struct GgufMmq2Q6K_J8;
-pub struct GgufMmq2Iq4Xs_J8;
-pub struct GgufMmq2Iq3S_J8;
-pub struct GgufMmq2Iq3Xxs_J8;
-pub struct GgufMmq2Q3K_J8;
-pub struct GgufMmq2Iq2S_J8;
-pub struct GgufMmq2Iq2Xs_J8;
 
 pub struct GgufMmq2Q8_0J64;
 /// 同上
@@ -242,16 +236,6 @@ macro_rules! gguf_mmq2_spec {
     };
 }
 
-gguf_mmq2_spec!(GgufMmq2Q8_0_J8, crate::family::gguf::MMQ2_Q8_0_J8);
-gguf_mmq2_spec!(GgufMmq2Q4K_J8, crate::family::gguf::MMQ2_Q4K_J8);
-gguf_mmq2_spec!(GgufMmq2Q5K_J8, crate::family::gguf::MMQ2_Q5K_J8);
-gguf_mmq2_spec!(GgufMmq2Q6K_J8, crate::family::gguf::MMQ2_Q6K_J8);
-gguf_mmq2_spec!(GgufMmq2Iq4Xs_J8, crate::family::gguf::MMQ2_IQ4XS_J8);
-gguf_mmq2_spec!(GgufMmq2Iq3S_J8, crate::family::gguf::MMQ2_IQ3S_J8);
-gguf_mmq2_spec!(GgufMmq2Iq3Xxs_J8, crate::family::gguf::MMQ2_IQ3XXS_J8);
-gguf_mmq2_spec!(GgufMmq2Q3K_J8, crate::family::gguf::MMQ2_Q3K_J8);
-gguf_mmq2_spec!(GgufMmq2Iq2S_J8, crate::family::gguf::MMQ2_IQ2S_J8);
-gguf_mmq2_spec!(GgufMmq2Iq2Xs_J8, crate::family::gguf::MMQ2_IQ2XS_J8);
 gguf_mmq2_spec!(GgufMmq2Q8_0J64, crate::family::gguf::MMQ2_Q8_0_J64);
 gguf_mmq2_spec!(GgufMmq2Q8_0J128, crate::family::gguf::MMQ2_Q8_0_J128);
 gguf_mmq2_spec!(GgufMmq2Q4KJ64, crate::family::gguf::MMQ2_Q4K_J64);
@@ -769,16 +753,6 @@ pub static MMQ2_QUANT_DS4: KernelMeta = meta_of::<GgufMmq2QuantDs4>();
 pub static MMQ2_QUANT_D4: KernelMeta = meta_of::<GgufMmq2QuantD4>();
 pub static MMQ2_QUANT_DS4_BF16: KernelMeta = meta_of::<GgufMmq2QuantDs4Bf16>();
 pub static MMQ2_QUANT_D4_BF16: KernelMeta = meta_of::<GgufMmq2QuantD4Bf16>();
-pub static MMQ2_Q8_0_J8: KernelMeta = meta_of::<GgufMmq2Q8_0_J8>();
-pub static MMQ2_Q4K_J8: KernelMeta = meta_of::<GgufMmq2Q4K_J8>();
-pub static MMQ2_Q5K_J8: KernelMeta = meta_of::<GgufMmq2Q5K_J8>();
-pub static MMQ2_Q6K_J8: KernelMeta = meta_of::<GgufMmq2Q6K_J8>();
-pub static MMQ2_IQ4XS_J8: KernelMeta = meta_of::<GgufMmq2Iq4Xs_J8>();
-pub static MMQ2_IQ3S_J8: KernelMeta = meta_of::<GgufMmq2Iq3S_J8>();
-pub static MMQ2_IQ3XXS_J8: KernelMeta = meta_of::<GgufMmq2Iq3Xxs_J8>();
-pub static MMQ2_Q3K_J8: KernelMeta = meta_of::<GgufMmq2Q3K_J8>();
-pub static MMQ2_IQ2S_J8: KernelMeta = meta_of::<GgufMmq2Iq2S_J8>();
-pub static MMQ2_IQ2XS_J8: KernelMeta = meta_of::<GgufMmq2Iq2Xs_J8>();
 pub static MMQ2_Q8_0_J64: KernelMeta = meta_of::<GgufMmq2Q8_0J64>();
 pub static MMQ2_Q8_0_J128: KernelMeta = meta_of::<GgufMmq2Q8_0J128>();
 pub static MMQ2_Q4K_J64: KernelMeta = meta_of::<GgufMmq2Q4KJ64>();

@@ -913,7 +913,16 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                // P3(owl,2026-10-21):**越界读守卫**。循环按线程数取整
+                // (`J*MMQ_TILE_Y_K` 不总是 `nthreads` 的倍数:J=8 → 288、
+                // J=16 → 576,而 nthreads=256)⇒ 末轮会读 `ceil(36J/256)*256`
+                // 个 int,**超出本 tile 36J**(J=8 越 224 int = 896 B)。
+                // 上游靠"y 在大 arena 里、尾巴有富余"没出事;本仓 y 是精确
+                // 尺寸的独立缓冲 ⇒ 最后一个 k 块会读出缓冲尾(实测长 ctx +
+                // 虚拟化档踩到未映射页 → CUDA 700 + 上下文毒化)。
+                // 补齐格写 0(与"补齐行 = 0"的量化契约同源,仍被 `vec_dot`
+                // 的无效 j 行丢弃,不影响数值)。
+                tile_y[l] = (l < J * MMQ_TILE_Y_K) ? by0[l] : 0;
             }
         }
 
@@ -929,7 +938,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                tile_y[l] = (l < J * MMQ_TILE_Y_K) ? by0[l] : 0; // P3(越界读守卫,见上)
             }
         }
 
