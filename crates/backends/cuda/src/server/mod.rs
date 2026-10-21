@@ -1480,7 +1480,11 @@ impl GpuServer {
                     .map_err(|e| e.to_string())
             })()
             .map_err(ModelError::Msg);
-            sink.timer("srv.seg.fam", t_fam.elapsed());
+            let dt = t_fam.elapsed();
+            sink.timer("srv.seg.fam", dt);
+            // **族维分解**(2026-10-21):`srv.seg.fam` 的 123µs/发射要能分账
+            // —— 按核名前缀归类(静态 tag,零分配)。
+            sink.timer(fam_tag(&msg.kernel.name), dt);
             return out;
         }
         // 下沉口(值语义,先拷贝;下面字段级解构不再借 self)
@@ -2145,6 +2149,23 @@ impl owl_kernels::device::DeviceRes for GpuRes<'_> {
 
     fn device_ordinal(&self) -> Result<i32, OpError> {
         Ok(self.ctx.device_ordinal() as i32)
+    }
+}
+
+/// **族维计时 tag**(核名前缀 → 静态标签;零分配,热路径安全)。
+///
+/// 族 = 注册表里的 foreign 臂(cublas/marlin/flashinfer/gdn/xqa/comm/gguf);
+/// 未识别前缀落 `other`(可见,不静默)。
+fn fam_tag(name: &str) -> &'static str {
+    match name.split('_').next().unwrap_or(name) {
+        "cublas" => "srv.fam.cublas",
+        "marlin" => "srv.fam.marlin",
+        "flashinfer" | "fi" => "srv.fam.fi",
+        "gdn" => "srv.fam.gdn",
+        "xqa" => "srv.fam.xqa",
+        "owl" => "srv.fam.owl",
+        "gguf" => "srv.fam.gguf",
+        _ => "srv.fam.other",
     }
 }
 

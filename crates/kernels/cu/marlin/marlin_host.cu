@@ -12,6 +12,8 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <chrono>
 
 #include "kernel.h"
 #include "marlin.cuh"
@@ -19,6 +21,109 @@
 using namespace MARLIN_NAMESPACE_NAME;
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// **热路径缓存**(2026-10-21):marlin 每次发射原先要打 4 个 CUDA 运行时调用
+// (3×cudaDeviceGetAttribute + cudaFuncSetAttribute),实测把单发射宿主成本抬到
+// ~95µs(27B prefill 一趟 4096 次 ⇒ 391ms)。这四样对 (dev, kernel, smem) 都是
+// **不变量** ⇒ 一次查询、之后走缓存。
+//
+// 线程面:TP2 = 同一进程里两个 server 线程各自发射 ⇒ 静态表加锁(临界区只有
+// 数组扫描,~ns 级;真 CUDA 调用仍在临界区外能做就放外)。
+// ---------------------------------------------------------------------------
+struct DevAttr {
+  int max_smem;   // cudaDevAttrMaxSharedMemoryPerBlockOptin
+  int cc;         // compute capability × 10 + minor
+  bool valid;
+};
+constexpr int kDevSlots = 16;             // 远大于本机卡数
+DevAttr g_dev_attr[kDevSlots] = {};
+std::mutex g_dev_mu;
+
+struct SmemSet {
+  int dev;
+  const void* kernel;
+  int smem;
+};
+constexpr int kSmemSlots = 64;
+SmemSet g_smem[kSmemSlots] = {};
+int g_smem_n = 0;
+std::mutex g_smem_mu;
+
+/// 设备不变属性(一次查询;越界 dev ⇒ 走未缓存路径,不静默截断)。
+static bool dev_attr(int dev, int* max_smem, int* cc) {
+  if (dev < 0 || dev >= kDevSlots) {
+    int m = 0;
+    if (cudaDeviceGetAttribute(&m, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) !=
+            cudaSuccess ||
+        m <= 0)
+      return false;
+    int maj = 0, min = 0;
+    cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, dev);
+    *max_smem = m;
+    *cc = maj * 10 + min;
+    return true;
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_dev_mu);
+    if (g_dev_attr[dev].valid) {
+      *max_smem = g_dev_attr[dev].max_smem;
+      *cc = g_dev_attr[dev].cc;
+      return true;
+    }
+  }
+  int m = 0;
+  if (cudaDeviceGetAttribute(&m, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) !=
+          cudaSuccess ||
+      m <= 0)
+    return false;
+  int maj = 0, min = 0;
+  cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev);
+  cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, dev);
+  {
+    std::lock_guard<std::mutex> lk(g_dev_mu);
+    g_dev_attr[dev] = DevAttr{m, maj * 10 + min, true};
+  }
+  *max_smem = m;
+  *cc = maj * 10 + min;
+  return true;
+}
+
+/// 动态 smem 上限:只在"本次要的比已设的更大"时才调 `cudaFuncSetAttribute`
+/// (同一 kernel 的常见形状 smem 恒定 ⇒ 装配后只剩一次)。
+static void ensure_smem(int dev, const void* kernel, int smem) {
+  {
+    std::lock_guard<std::mutex> lk(g_smem_mu);
+    int i = 0;
+    for (; i < g_smem_n; ++i)
+      if (g_smem[i].dev == dev && g_smem[i].kernel == kernel) break;
+    if (i < g_smem_n) {
+      if (g_smem[i].smem >= smem) return;  // 已覆盖本次需求
+      g_smem[i].smem = smem;               // 放大:记新值,下面真设一次
+    } else if (g_smem_n < kSmemSlots) {
+      g_smem[g_smem_n++] = SmemSet{dev, kernel, smem};
+    }
+    // 表满且未命中 ⇒ 落到下面每次都设(退化但**不静默**少设)
+  }
+  // CUDA 调用放在锁外(慢调用不挡其他发射)
+  cudaFuncSetAttribute((const void*)kernel,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+}
+
+// --- 临时分相探针(2026-10-21;MARLIN_TIME=1 开启,测完即删)------------------
+struct PhaseAcc { double cfg=0, attr=0, launch=0; long n=0; };
+static PhaseAcc g_phase;
+static inline double now_us() {
+  using namespace std::chrono;
+  return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() / 1e3;
+}
+
+/// 调试开关:每进程一次 getenv。
+static bool env_flag(const char* name, int* cache) {
+  if (*cache < 0) *cache = getenv(name) ? 1 : 0;
+  return *cache != 0;
+}
 
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
@@ -225,17 +330,10 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
   const int4* b_s_ptr = (const int4*)b_s;
   int* locks = (int*)workspace;
 
-  int max_shared_mem = 0;
-  cudaDeviceGetAttribute(&max_shared_mem,
-                         cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-  if (max_shared_mem <= 0) return 5;
-
-  int major_capability, minor_capability;
-  cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor,
-                         dev);
-  cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
-                         dev);
-  if (major_capability * 10 + minor_capability < 75) return 5;
+  // 设备属性(缓存;每 dev 一次)
+  int max_shared_mem = 0, cc = 0;
+  if (!dev_attr(dev, &max_shared_mem, &cc)) return 5;
+  if (cc < 75) return 5;
   int stages = 4;
 
   // a_type 运行时选择:kS8(W4A8,配 a_scales [M,1] fp32)/ kFloat16(W4A16)
@@ -263,6 +361,9 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
     int prob_m_split =
         par_count > 0 ? (par_count * (max_thread_m_blocks * 16)) : rest_m;
 
+    static int time_on = -1;
+    if (time_on < 0) time_on = getenv("MARLIN_TIME") ? 1 : 0;
+    double t_phase = time_on ? now_us() : 0;
     int thread_k = thread_k_init;
     int thread_n = thread_n_init;
 
@@ -322,7 +423,8 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
     int thread_k_blocks = thread_k / 16;
     int thread_n_blocks = thread_n / 16;
 
-    if (getenv("MARLIN_CONFIG_DEBUG"))
+    static int dbg_cfg = -1;
+    if (env_flag("MARLIN_CONFIG_DEBUG", &dbg_cfg))
         fprintf(stderr,
                 "[marlin-cfg] m=%d n=%d k=%d -> tk=%d tn=%d threads=%d "
                 "m_blocks=%d m8=%d g_blocks=%d blocks=%d par=%d\n",
@@ -343,8 +445,11 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
 
     if (kernel == MarlinDefault) return 3;
 
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         max_shared_mem_new);
+    double t_attr = time_on ? now_us() : 0;
+    g_phase.cfg += t_attr - t_phase;
+    ensure_smem(dev, (const void*)kernel, max_shared_mem_new);
+    double t_launch = time_on ? now_us() : 0;
+    g_phase.attr += t_launch - t_attr;
 
     constexpr bool use_atomic_add = false;
     // use_fp32_reduce 按激活位宽分派(S1 暗雷根治定谳,2026-09-30):
@@ -358,7 +463,8 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
     bool part_use_atomic_add =
         use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
 
-    if (getenv("MARLIN_DEBUG"))
+    static int dbg_v2 = -1;
+    if (env_flag("MARLIN_DEBUG", &dbg_v2))
         std::fprintf(stderr,
                      "[marlin-v2] split=%d tmb=%d cfg={k%d,n%d,t%d} m8=%d gb=%d "
                      "blocks=%d smem=%d MNK=(%d,%d,%d) g=%d\n",
@@ -374,6 +480,13 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
         part_use_atomic_add, use_fp32_reduce, max_shared_mem_new);
 
     cudaError_t launch_err = cudaGetLastError();
+    if (time_on) {
+      g_phase.launch += now_us() - t_launch;
+      if (++g_phase.n % 1024 == 0)
+        fprintf(stderr, "[marlin-time] n=%ld avg_us cfg=%.1f attr=%.1f launch=%.1f\n",
+                g_phase.n, g_phase.cfg / g_phase.n, g_phase.attr / g_phase.n,
+                g_phase.launch / g_phase.n);
+    }
     if (launch_err != cudaSuccess) {
       std::fprintf(stderr, "[marlin-v2] launch error: %s\n",
                    cudaGetErrorString(launch_err));
