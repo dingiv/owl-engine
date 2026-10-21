@@ -1341,6 +1341,48 @@ fn record_origins(v: &toml::Value, prefix: &str, origin: &Origin, out: &mut Orig
 /// 是**可操作**的那一半(点名新键 + 值域)—— 使用者不必去翻旧分支。
 ///
 /// 新增退役键 = 在表里加一行(`旧写法 → 新写法`)。
+/// **全字段显式校验**(配置档):把 `Default` 序列化出来的**全键表**当作 schema,
+/// 逐层比对文件里是否**每一个键都在场**;缺一个都拒启(列出全量,一次改完)。
+///
+/// 例外(自然豁免):`Option::None` 与 `skip_serializing_if` 的字段不出现在
+/// schema 里,因此**不要求**写(例如 `pool_tokens`、`runtime.device.*` 三件互斥)。
+fn check_explicit_complete(file_v: &toml::Value, path: &Path) -> Result<(), String> {
+    let schema = toml::Value::try_from(&OwlConfig::default())
+        .map_err(|e| format!("内部:schema 序列化失败 {e}"))?;
+    let mut missing: Vec<String> = Vec::new();
+    collect_missing(&schema, file_v, "", &mut missing);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    Err(format!(
+        "配置档 `{}` 未显式声明 {} 个字段(缺省不再隐式兜底 ⇒ 拒启):\n  {}\n\
+         生成完整档的最快方式:\n  server -p <旧档> --print-config > <新档>.toml",
+        path.display(),
+        missing.len(),
+        missing.join("\n  ")
+    ))
+}
+
+/// 递归比对:schema 有的键,文件里必须有。
+fn collect_missing(schema: &toml::Value, got: &toml::Value, prefix: &str, out: &mut Vec<String>) {
+    let toml::Value::Table(st) = schema else { return };
+    for (k, sv) in st {
+        let path = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+        match got.get(k) {
+            None => out.push(path),
+            Some(gv) => {
+                if let toml::Value::Table(_) = sv {
+                    // 表:只在文件也给了表时递归(标量覆盖整表 = 结构错误,交给反序列化)
+                    if let toml::Value::Table(_) = gv {
+                        collect_missing(sv, gv, &path, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
     if v.get("flavor").is_some() {
         return Err(
@@ -1625,6 +1667,15 @@ impl OwlConfig {
         let mut origins = Origins::new();
         let mut layer_names: Vec<String> = Vec::new();
         if let Some(b) = base {
+            // **配置档必须全字段显式**(2026-10-21 用户裁决):
+            // 缺任何键 = **拒启**,不再用代码缺省兜底(旧行为让各会话跑在
+            // "半份配置 + 旧缺省"上,启动点不可复现)。
+            //
+            // 站点层(`layers`)与 CLI 仍是**覆盖层**(它们只覆写,不负责补全)。
+            let mut file_v = toml::Value::Table(toml::map::Map::new());
+            let mut file_origins = Origins::new();
+            load_config_into(b, &mut file_v, 0, &mut Vec::new(), &mut file_origins)?;
+            check_explicit_complete(&file_v, b)?;
             load_config_into(b, &mut v, 0, &mut Vec::new(), &mut origins)?;
             layer_names.push(b.display().to_string());
         }

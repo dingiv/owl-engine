@@ -7,8 +7,7 @@
 >
 > **2026-10-20 配置统一**:只有一个概念 —— **profile = 一份 TOML 配置文件**。
 > 没有 "flavor"。用户启动用 `-p <profile_path>`;源码 `profiles/` 下是可直接
-> 复制修改的常用档;**默认档 = `profiles/base.toml`**(不带 `-p` 时自动加载,
-> 见 §1.1)。
+> 复制修改的常用档;**所有档都是完整档**(全字段显式,缺一拒启,见 §1.1)。
 
 ## 1. 一个概念:profile
 
@@ -28,21 +27,24 @@ $EDITOR ~/my-27b.toml          # 改 model.dir / runtime.bind / tp_ordinals
 ./target/release/server -p ~/my-27b.toml
 ```
 
-`profiles/` 下全部是可直接用的档(`base` 是默认档)。历史 `legacy/` 目录
-已于 2026-10-21 删除;仍在被测试/脚本使用的两份低层档已提升为
-`profiles/awq27b.toml` 与 `profiles/spec-dflash.toml`。
+`profiles/` 下全部是可直接用的**完整档**。历史 `legacy/` 目录已于
+2026-10-21 删除,`tp27b-3080-262k.toml`(引用已退役的顶层 `kv_fp8`)一并删除。
 
-## 1.1 默认档(`profiles/base.toml`)
+## 1.1 配置档必须**全字段显式**（2026-10-21 裁决）
 
-不带 `-p`、也没有位置参数时,server **自动加载** `profiles/base.toml`:
+- 用 `-p <profile>` 给的档，**每一个键都必须在文件里写出来**；缺一个 ⇒ **拒启**
+  （错误里一次列出全部缺项）。代码缺省不再兜底 —— 旧行为让各会话跑在
+  "半份配置 + 旧缺省"上（4k / F16 KV / 无投机 / 无图），启动点不可复现。
+- 站点层（位置参数 / `--site`）与 CLI（`--set`）仍是**覆盖层**：它们只覆写，
+  不负责补全。
+- 生成完整档的最快方式：
 
-- 查找顺序:当前目录 → 可执行文件邻近(≤3 级)的 `profiles/base.toml`;
-- 找到 ⇒ 打一行 `[config] 未显式给档 ⇒ 使用默认档 <path>`;
-- 找不到 ⇒ **WARN** 并走代码缺省(4k / F16 KV / 无投机 / 无图 —— 不是最佳档)。
+  ```bash
+  server -p <旧档> --print-config > <新档>.toml
+  ```
 
-默认档的职责:**写全站点事实**(模型路径/端口/卡位)+ **写最佳生产点**
-(FP8 KV / DFlash2 d7 / FI 单图 / int8 头 / 词表切 / AR 融合 / 262k 全设备池)。
-换硬件**不要改它**,用 `--site` 或 `--set` 覆盖(保持默认档单一事实源)。
+- 卡位**必须显式**：`runtime.tp_ordinals = [a, b]`（TP 双卡）或
+  `[runtime.device] bdf/uuid/find_name`（单卡）。不再自动挑"任意空闲卡"。
 
 ## 2. 层序(后面的覆盖前面的)
 

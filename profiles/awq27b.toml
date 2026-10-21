@@ -2,67 +2,179 @@
 # 原文注释:// 27B AWQ 生产档(24G 贴顶三旋钮:单会话门不需要多格/多快照/
 # 前缀缓存 —— 实测各省 ~300MB;greedy = 恒等门口径)
 # 需配套:model.dir(检查点目录)
+
+# --- 以下为**完整档**（2026-10-21）：所有字段显式声明，缺一个就拒启。
+# 生成方式：server -p <旧档> --print-config > <新档>.toml
+
+[runtime]
+bind = "127.0.0.1:8138"
+tp_push = false
+tp_ar_f8 = false
+tp_vocab_split = false
+tp_ar_fused = false
+gpu_min_free_ratio = 0.9
+max_seq = 4096
+prefill_chunk = 512
+max_batch = 1
+prefill_tail_merge = 0
+slice_every = 0
+slice_tokens = 0
+newcomer_min_tokens = 4096
+min_gen_tokens = 256
+reserve_pages = 0
+max_queue = 0
+
 [model]
 kind = "awq27b"
-# 主干量化方案(与 head_quant 同类档位 —— 声明即事实;行业记法 W{权重}A{激活}):
-#   "w4a16" = 权重 4bit AWQ g32-asym(zp)+ 激活 f16 = 今天行为(生产默认)
-#   "w4a8"  = 同源权重 a8 布局 + per-token int8 激活 + kS8×kU4 GEMM(int8 张量核):
-#             单卡 3090 Ti 实测 prefill +48~50% / TTFT −33% @32k,decode 不变;
-#             代价 = 装载 +14.5s(a8 重物化,设备重排核待补)+ 质量门待过 S3(非逐字同)
-# 施工/门/回滚见 docs/arch/W4A8-算子家族-设计与施工.md(§5.4 开关与回滚 / §6 S3-S4)
+vision = false
+dir = "/home/div/Documents/codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+name = "qwen3.8-27b"
+dflash2_dir = "/home/div/Documents/codes/models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+head_quant = "off"
 quant = "w4a16"
 
+[model.rope]
+yarn_factor = 1.0
+original_max = 0
+beta_fast = 32.0
+beta_slow = 1.0
+attention_factor = 1.0
+
 [pool]
-# ⚠️ 2026-10-19 驱动性修复:字段在 `7c5627f`(A 轴收官)已改名
-# `gdn_slots` → `gdn_slots`,而 flavor 文本没跟上 ⇒
-# `deny_unknown_fields` 直接**拒解析**(`预设档清单非空且全部可解析` 红)。
-# 语义不变:单会话语义 = 并发上限 1。
 gdn_slots = 1
-# ── **前缀复用三层账**(2026-10-19 容量定档;架构 = store 决策/engine 搬运)──
-# ① KV 腿宿主层(`host_cache_mb`):缓存块**下沉**而非丢弃 —— 容量算式
-#    `cache_cap = 份额×设备池 + 宿主槽`(住 store:`CachePolicy::Share`);
-#    宿主 0 时卸载即丢 ⇒ 复用面只剩设备侧那点(实测 13k 会话只复用到 1.5k tok)。
-# ② 份额(`prefix_cache_share`):缓存可占设备池的比例(0.75 ⇒ 528 页里 396 页);
-#    再 **+ 宿主槽全额**(跨层索引:沉到宿主的条目仍占名额)。
-# ③ 状态腿快照(`snap_max` + `snap_host_mb`):复用要求**边界快照在场**
-#    (GDN 态对不上就不能复用)。每条 152 MiB;`snap_host_mb > 0` 让旧快照
-#    **下沉**而不是被顶掉 ⇒ `reuse_face` 能回查到更早的边界。
-# ④ 生成相位逐页边界快照(`snap_decode_stride` 缺省 1;§9.1(7)):带 spec 时
-#    轮内 fold 回卷拍边界,不带 spec 那档走裸 decode 的逐页捕获 —— 两者均记
-#    `Transient`(逐出即丢),前缀段边界记 `Durable`(可下沉)。
-# VRAM 账(27B/24G):设备池 528 MiB + 快照 4×152=608 MiB(原 1×152);
-# 宿主账:KV 4096 MiB + 状态腿 3072 MiB(与 `[pool].host_cache_mb` 同源校验)。
-prefix_cache = true
+prefill_align_tail = true
+snap_decode_stride = 1
 prefix_cache_share = 0.75
-host_cache_mb = 4096
 snap_max = 4
+host_cache_mb = 4096
+pool_cap_mb = 256
 snap_host_mb = 3072
+disk_cache_mb = 0
+snap_disk_mb = 0
+disk_dir = ""
+vram_target = 0.97
+vram_reserve_mb = 1024
+prefix_cache = true
 
-[server]
-# **单会话语义**(D1 2026-10-17):`gdn_slots = 1` ⇒ 并发上限必须 = 1
-# —— 原档缺此项,缺省 8 > 1 格 ⇒ 本档**单独起不来**(§M1 记的那条);
-# 现由 `OwlConfig::validate` 在装载期拒(拒语点名“跨会话状态污染”)。
-max_concurrency = 1
-
-[sampling]
-mode = "greedy"
-
-[dispatch]
-# ⚠️ **2026-10-19 修复**:本档白名单是 **fp8 族**(`flashinfer_prefill_paged_fp8kv` /
-# `owl_qknorm_rope_kv_insert_f16_fp8kv_knhd` / `vllm_reshape_and_cache_fp8kv_knhd` …),
-# 而 `kv_fp8` 一直**没写** ⇒ 取缺省 false ⇒ 池是 f16、白名单是 fp8 ⇒
-# **首次发射即撞算子准入门**(`owl_qknorm_rope_kv_insert_f16_knhd 未列入`)⇒ 本档
-# **起不来**(实测;同族坑见 `docs/arch/W4A8-算子家族-设计与施工.md` §18.5 的
-# `awq27b` 缺 `owl_cast_bf16_f16` 一例 —— 白名单与池档位是**两处真源**,易漂)。
-# 生产口径 = fp8 池(与 spec-dflash 一致);要 f16 口径请显式 `kv_fp8 = false`
-# **并换成 f16 白名单**(bench 档 `testdata/args/bench-27b-std.toml` 就是这么做的)。
-kv_fp8 = true
-# 裸 27B 档白名单(实测 27 个;与 kernels `ops::PROD_AWQ27B_2026_10_13` 一致)
-
-# ── KVMem 选择层(B 轴)──
-# **高显存档:显式关掉**。池 ≥ 上下文长时,每个召回点都是纯开销
-# (没有超卖需求 ⇒ 没有东西可以下沉/回灌)。低显存档用 `awq27b-kvmem`。
 [kvmem]
 select_decode = false
 select_partial = false
 index = false
+workspace_per_req = 2240
+select_sink = 2
+select_recent = 4
+recall_every = 1
+coverage_probe = false
+analyze_at_ctx = 0
+evict_policy = "lru"
+pool_overcommit = false
+
+[spec]
+depth = 0
+dumb = false
+draft_kv_fp8 = false
+notaps = false
+tapdecl = false
+tp_draft = false
+degrade_after = 6
+probe_every = 8
+
+[sampling]
+mode = "greedy"
+temp = 1.0
+topk = 20
+topp = 0.949999988079071
+rep_penalty = 1.0
+
+[load]
+verify = false
+debug_tap = false
+staging_mb = 128
+repack = "auto"
+dump = false
+
+[dispatch]
+qkv_fuse = true
+prefill_split = false
+force_naive_prefill = false
+verify_v2 = true
+fi_plan_restore = true
+fi_cuda_graph = false
+verify_fi = false
+decode_fi = false
+verify_xqa = false
+decode_xqa = false
+xqa_prefill = false
+fi_min_tokens = 1
+gdn_chunked = true
+gdn_scalar = false
+gdn_fused_decode = true
+gdn_fused_decode_v2 = true
+kv_fp8 = true
+resolve_trace = false
+host_argmax = false
+ts_probe = false
+tag_wildcard = false
+
+[probes]
+step_profile = false
+perf_level = "host"
+gdn_dump = false
+debug = false
+prefill_cksum = false
+fact_probe = false
+trace_gate = false
+dflash_probe = false
+propose_eager = false
+dflash_eager = false
+dflash_noencode = false
+dflash_dumb = false
+gdn_dump_all = false
+pf_bisect = false
+pf_fin_check = false
+raw_completion = false
+prompt_dump = false
+gdn_dbg = false
+pf_fence = false
+step_gate = "off"
+step_gate_ms = 0
+step_gate_us = 0
+step_gate_every = 0
+
+[cuda]
+srv_timing = false
+cap_prof = false
+launch_sync = false
+sync_mask = 0
+launch_time = false
+d2h_prof = false
+gpu_prof = false
+free_legacy = false
+trace_ring = 0
+
+[cuda.graph_flags]
+upload = false
+device_launch = false
+
+[graph]
+no_graph = false
+
+[server]
+max_concurrency = 1
+
+[agent]
+implicit_session = false
+default_max_new = 4096
+max_new_cap = 8192
+parse_tool_calls = true
+tool_call_format = "xml"
+auto_disable_thinking_with_tools = false
+queue_wait_ms = 0
+
+[log]
+level = "warn"
+tags_allow = []
+tags_deny = []
+max_mb = 0
+keep = 0
+timestamp = false

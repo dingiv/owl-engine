@@ -2,12 +2,12 @@
 
 配置层只有一个概念:**profile = 一份 TOML 配置文件**。没有 "flavor"。
 
-## 默认档
+## 规则(2026-10-21)
 
-不带 `-p` 启动 ⇒ 自动加载 `profiles/base.toml`(查找顺序:当前目录 →
-可执行文件邻近 ≤3 级)。找不到会 WARN 并走代码缺省(不是最佳档)。
-
-换硬件/端口不改 base.toml,用 `--site` / `--set` 覆盖。
+- **全字段显式**:档里每个键都要写;缺一个 ⇒ 拒启(错误列出全部缺项)。
+  代码缺省不再兜底。生成完整档:`server -p <旧档> --print-config > <新档>.toml`。
+- **卡位必须显式**:`runtime.tp_ordinals = [a,b]`(TP)或 `[runtime.device] bdf/uuid/find_name`(单卡)。
+- 站点层(`--site`)与 `--set` 仍可覆盖(覆盖层不负责补全)。
 
 ## 用法
 
@@ -25,7 +25,6 @@ $EDITOR ~/my-27b.toml
 
 | 文件 | 说明 |
 |---|---|
-| **`base.toml`** | **默认档**(不带 `-p` 自动加载):2×3080 27B + FP8 KV + DFlash2 d7 + 视觉 + 262k |
 | `awq27b-3090-max.toml` | 3090 Ti 单卡 27B / 128k(意图档) |
 | `awq27b.toml` | 27B 低层档(无 intent;回归/取证与测试用) |
 | `spec-dflash.toml` | 27B + DFlash2 低层档(16k;测试/取证用) |

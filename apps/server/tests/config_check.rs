@@ -48,8 +48,7 @@ fn profile_check_reports_128k_and_memory_basis() {
     let s = String::from_utf8_lossy(&out.stdout);
     for needle in [
         "max_seq=131072",
-        "pool_tokens=131072",
-        "budget 5.95G",
+        "pool_tokens=Some(131072)",
         "OK(estimated",
         "model dir:",
         "arms: prefill=eager",
@@ -80,14 +79,10 @@ fn print_config_json_carries_provenance_and_estimate() {
         serde_json::from_slice(&out.stdout).expect("stdout 必须是合法 JSON");
     assert_eq!(v["config"]["runtime"]["max_seq"], 131072);
     assert_eq!(v["config"]["pool"]["pool_tokens"], 131072);
-    assert_eq!(v["estimate"]["pool_tokens"], 131072);
-    // provenance:上下文/池都由 intent 派生(不是文件里的手写值)
-    assert_eq!(v["provenance"]["pool.pool_tokens"]["kind"], "derived");
-    assert_eq!(v["provenance"]["pool.pool_tokens"]["detail"], "非超卖:池 = 上下文");
-    assert_eq!(
-        v["intent"]["profile"],
-        profile("awq27b-3090-max").to_str().expect("路径")
-    );
+    // **完整档语义**(2026-10-21):值来自文件本身,不再有 intent 派生
+    assert_eq!(v["provenance"]["pool.pool_tokens"]["kind"], "file");
+    // 完整档没有 [intent] ⇒ meta.intent 为空是预期(派生面已退役)
+    assert!(v["intent"].is_null() || v["intent"]["profile"].is_string());
 }
 
 #[test]
@@ -104,8 +99,8 @@ fn explain_prints_origin_and_rule() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("runtime.max_seq = 131072"), "{s}");
-    assert!(s.contains("derived:context=\"max\""), "应给派生规则:\n{s}");
-    assert!(s.contains("稳定裕度"), "应给内存依据:\n{s}");
+    // 完整档:来源必须是文件(file:…),不再是 derived
+    assert!(s.contains("来源: file:"), "应给文件来源:\n{s}");
 }
 
 #[test]
@@ -122,8 +117,9 @@ fn set_overrides_derived_value() {
     ]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("max_seq=65536"), "--set 应覆盖派生值:\n{s}");
-    assert!(s.contains("pool_tokens=65536"), "池应跟随显式上下文:\n{s}");
+    assert!(s.contains("max_seq=65536"), "--set 应覆盖文件值:\n{s}");
+    // 池在完整档里是**显式值** ⇒ 改上下文不会隐式跟着变(显式优先)
+    assert!(s.contains("pool_tokens=Some(131072)"), "池保持显式值:\n{s}");
 }
 
 #[test]
@@ -143,18 +139,19 @@ fn legacy_profile_still_works() {
 }
 
 #[test]
-fn check_without_site_fails_loudly_with_report() {
-    // 常用档现在是自包含的(带 model.dir);用历史档验证"缺站点资产"的响亮拒。
-    let out = run(&[
-        "-p",
-        profile("spec-dflash").to_str().expect("路径"),
-        "--check",
-    ]);
-    assert!(!out.status.success(), "缺站点档应失败(27B 无缺省资产)");
-    let s = String::from_utf8_lossy(&out.stdout);
-    // 报告仍打印(内存账在前),FAIL 行点名病因,末尾不是 OK
-    assert!(s.contains("max_seq="), "报告应保留派生结果:\n{s}");
-    assert!(s.contains("[check] FAIL: 未配置 [model].dir"), "{s}");
-    assert!(s.contains("未通过"), "{s}");
-    assert!(!s.contains("[check] OK"), "不应给假绿:\n{s}");
+fn incomplete_profile_is_rejected_with_key_list() {
+    // **全字段显式**(2026-10-21):从完整档里删一个键 ⇒ 拒启并列出缺项。
+    let full = std::fs::read_to_string(profile("awq27b-3090-max")).expect("读完整档");
+    let broken: String = full
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("tp_push ="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let path = std::env::temp_dir().join("owl-incomplete-profile.toml");
+    std::fs::write(&path, broken).expect("写残缺档");
+    let out = run(&["-p", path.to_str().expect("路径"), "--check"]);
+    assert!(!out.status.success(), "缺字段应拒启");
+    let s = format!("{}{}", String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
+    assert!(s.contains("未显式声明"), "应点名缺字段:\n{s}");
+    assert!(s.contains("runtime.tp_push"), "缺项应列出键路径:\n{s}");
 }
