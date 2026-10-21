@@ -241,6 +241,34 @@ impl StatePool {
     // 状态归 `KvBank` 所有 ⇒ 逻辑在 `impl KvBank`;这里只是池的对外接口
     // (引擎拿的是 `StatePool`,不该为写三张表去拆组合)。
 
+    /// **FI plan 表规格**(唯一构造点):`t` 行 × `ctx_total` 列,几何取自池。
+    ///
+    /// 三个刷表点(桶图 / decode / verify)原本各拼一份 `FiPlanSpec` ——
+    /// 任何几何口径变化都要三处同步。
+    pub(crate) fn fi_plan_spec(&self, t: usize, ctx_total: usize) -> owl_iface::contract::FiPlanSpec {
+        let d = self.geom.dims;
+        owl_iface::contract::FiPlanSpec {
+            t,
+            ctx_total,
+            hq: d.hq,
+            hkv: d.hkv,
+            hd: d.hd,
+            page: self.geom.page,
+        }
+    }
+
+    /// **刷 FI plan 表**(图窗外写者):`t` 行 × `ctx_total`。
+    ///
+    /// 门(档位 + 槽在场)仍由调用方判 —— 那是"图里有没有 FI 节点"的事实。
+    pub(crate) async fn sync_fi_plan<D: DeviceClient>(
+        &self,
+        face: &mut D,
+        t: usize,
+        ctx_total: usize,
+    ) -> Result<()> {
+        face.fi_plan_sync(self.fi_plan_spec(t, ctx_total)).await
+    }
+
     /// FI 表四件写入(见 [`KvBank::write_fi_tables`])。
     pub(crate) async fn write_fi_tables<D: DeviceClient>(
         &self,

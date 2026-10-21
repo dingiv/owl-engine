@@ -60,6 +60,24 @@ async fn prepare_vlm_rank<D: DeviceClient>(
 }
 
 
+/// **decode 单步的设备输入束**（S6j）：图上各输入槽的当步值。
+///
+/// 为什么成对象：槽值是**逐槽条件装填**的（xqa / fi / sel 三族各看
+/// "图里有没有这个槽"），旧形把 50 行摊在 `execute_decode` 中段，任何
+/// 新面（比如下一个 XQA 槽）都要在那个 400 行函数里找位置。现在：
+/// 装填归 `decode_step_inputs`，执行函数只拿 `refs()` 去入队。
+pub(crate) struct DecodeStepInputs {
+    slots: Vec<(&'static str, Vec<f32>)>,
+}
+
+impl DecodeStepInputs {
+    /// 入队引用面（`graph.step` 吃 `&[(&str, &[f32])]`）。
+    pub(crate) fn refs(&self) -> Vec<(&str, &[f32])> {
+        self.slots.iter().map(|(n, v)| (*n, v.as_slice())).collect()
+    }
+}
+
+
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
     /// 块表重写(write_bt;图烘焙 bt 指针,内容重写指针稳定图不重捕)
@@ -404,6 +422,78 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
 
     /// decode 单步执行(设备侧;host 派生量由决策面备齐)
+    /// 装填本步的输入束（判据 = **槽在场**，不看宿主旋钮：槽属于图）。
+    fn decode_step_inputs(
+        &mut self,
+        sid: u64,
+        token: u32,
+        pos: usize,
+        pos_rope: usize,
+        kv_slot: u32,
+        gdn_slot: usize,
+    ) -> Result<DecodeStepInputs> {
+let mut step_slots: Vec<(&str, Vec<f32>)> = vec![
+    ("frontier", vec![token as f32]),
+    ("pos", vec![pos_rope as f32]),
+    ("kv_len", vec![(pos + 1) as f32]),
+    ("kv_slot", vec![kv_slot as f32]),
+    ("gdn_slot", vec![gdn_slot as f32]),
+];
+if self.dev.graphs.session.has_input("xqa_seq") {
+    step_slots.push(("xqa_seq", vec![f32::from_bits((pos + 1) as u32)]));
+    let n = self.dev.graphs.session.input_len("xqa_sem").unwrap_or(0);
+    step_slots.push(("xqa_sem", vec![0.0; n]));
+    // XQA 页表 = 本会话真页链(不喂 = 图里恒等链 = 读到别家 KV;§7.6)
+    if self.dev.graphs.session.has_input("xqa_pt") {
+        step_slots.push(("xqa_pt", self.xqa_pt_of(sid)));
+    }
+}
+// **FI 图内臂每步 ingress**:**表四件套**(位型过线)。图里 `ctx_total`
+// 是**烘死的上界**(调度表形状),当步真值靠**表**(下面 `fi_plan_sync` 刷)。
+// ⚠️ 判据 = **槽在场**(与 xqa_seq 同款纪律):槽属于**图**;曾按"宿主标量
+// cell 在不在"判 ⇒ 单图档四件套一条不写 ⇒ 核读陈旧页表 ⇒ 输出 64 个空
+// token(2026-10-18 实测踩过)。
+if self.dev.graphs.session.has_input("fi_q_cu") {
+    let ctx_total = pos + 1;
+    // 四件套:真值(与承载无关 —— 图内/窗外都读同一批槽)
+    let page = self.dev.pool.geom.page;
+    let bt_chain = {
+        let s = self.bank.sessions.session(sid)?;
+        s.block_table.clone()
+    };
+    // ⚠️ **响亮拒(2026-10-19 审查)**:`.min(bt_chain.len())` 只防"链过长",
+    // 链过短时 `nb_used < ceil(ctx/page)` ⇒ `fi_last_len > page`(结构非法)
+    // ⇒ 核越界读页链。与 prefill 侧 `fi_tables` 同型,一并改成结构化 Err。
+    let need = ctx_total.div_ceil(page.max(1)).max(1);
+    if bt_chain.len() < need {
+        return Err(ModelError::Msg(format!(
+            "decode FI 表失守:块链 {} 页 < 本步需要 {need} 页(pos={pos} page={page} ctx={ctx_total})",
+            bt_chain.len()
+        )));
+    }
+    let nb_used = need;
+    let mut idx = vec![0f32; self.dev.pool.geom.nb];
+    for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
+        idx[i] = f32::from_bits(*b);
+    }
+    step_slots.push(("fi_q_cu", vec![0.0, f32::from_bits(1)]));
+    step_slots.push(("fi_indices", idx));
+    step_slots.push(("fi_indptr", vec![0.0, f32::from_bits(nb_used as u32)]));
+    step_slots.push((
+        "fi_last_len",
+        vec![f32::from_bits((ctx_total - (nb_used - 1) * page) as u32)],
+    ));
+}
+// **B-3d 选择层视图**:`select_decode` 档 ⇒ 页表与上下文长走视图输入槽
+// (视图 = 选中页 ++ 新生成尾部;无视图态 ⇒ 写全量链,与不开时等价)
+if self.dev.graphs.session.has_input("sel_pt") {
+    let (pt, len) = self.select_view_step(sid, pos);
+    step_slots.push(("sel_pt", pt));
+    step_slots.push(("sel_len", vec![len as f32]));
+}
+        Ok(DecodeStepInputs { slots: step_slots })
+    }
+
     pub(crate) async fn execute_decode(
         &mut self,
         token: u32,
@@ -448,67 +538,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // (核按 `const uint32_t*` 读;`(pos+1) as f32` 会拿到浮点位型);
         // `xqa_sem` 每轮清零(KV-split 归约计数 —— 参考实现 `sem.zero_()`)。
         // 两槽只在 `decode_xqa` 开时存在于图中(否则 `step` 会报未声明槽)。
-        let mut step_slots: Vec<(&str, Vec<f32>)> = vec![
-            ("frontier", vec![token as f32]),
-            ("pos", vec![pos_rope as f32]),
-            ("kv_len", vec![(pos + 1) as f32]),
-            ("kv_slot", vec![kv_slot as f32]),
-            ("gdn_slot", vec![gdn_slot as f32]),
-        ];
-        if self.dev.graphs.session.has_input("xqa_seq") {
-            step_slots.push(("xqa_seq", vec![f32::from_bits((pos + 1) as u32)]));
-            let n = self.dev.graphs.session.input_len("xqa_sem").unwrap_or(0);
-            step_slots.push(("xqa_sem", vec![0.0; n]));
-            // XQA 页表 = 本会话真页链(不喂 = 图里恒等链 = 读到别家 KV;§7.6)
-            if self.dev.graphs.session.has_input("xqa_pt") {
-                step_slots.push(("xqa_pt", self.xqa_pt_of(sid)));
-            }
-        }
-        // **FI 图内臂每步 ingress**:**表四件套**(位型过线)。图里 `ctx_total`
-        // 是**烘死的上界**(调度表形状),当步真值靠**表**(下面 `fi_plan_sync` 刷)。
-        // ⚠️ 判据 = **槽在场**(与 xqa_seq 同款纪律):槽属于**图**;曾按"宿主标量
-        // cell 在不在"判 ⇒ 单图档四件套一条不写 ⇒ 核读陈旧页表 ⇒ 输出 64 个空
-        // token(2026-10-18 实测踩过)。
-        if self.dev.graphs.session.has_input("fi_q_cu") {
-            let ctx_total = pos + 1;
-            // 四件套:真值(与承载无关 —— 图内/窗外都读同一批槽)
-            let page = self.dev.pool.geom.page;
-            let bt_chain = {
-                let s = self.bank.sessions.session(sid)?;
-                s.block_table.clone()
-            };
-            // ⚠️ **响亮拒(2026-10-19 审查)**:`.min(bt_chain.len())` 只防"链过长",
-            // 链过短时 `nb_used < ceil(ctx/page)` ⇒ `fi_last_len > page`(结构非法)
-            // ⇒ 核越界读页链。与 prefill 侧 `fi_tables` 同型,一并改成结构化 Err。
-            let need = ctx_total.div_ceil(page.max(1)).max(1);
-            if bt_chain.len() < need {
-                return Err(ModelError::Msg(format!(
-                    "decode FI 表失守:块链 {} 页 < 本步需要 {need} 页(pos={pos} page={page} ctx={ctx_total})",
-                    bt_chain.len()
-                )));
-            }
-            let nb_used = need;
-            let mut idx = vec![0f32; self.dev.pool.geom.nb];
-            for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
-                idx[i] = f32::from_bits(*b);
-            }
-            step_slots.push(("fi_q_cu", vec![0.0, f32::from_bits(1)]));
-            step_slots.push(("fi_indices", idx));
-            step_slots.push(("fi_indptr", vec![0.0, f32::from_bits(nb_used as u32)]));
-            step_slots.push((
-                "fi_last_len",
-                vec![f32::from_bits((ctx_total - (nb_used - 1) * page) as u32)],
-            ));
-        }
-        // **B-3d 选择层视图**:`select_decode` 档 ⇒ 页表与上下文长走视图输入槽
-        // (视图 = 选中页 ++ 新生成尾部;无视图态 ⇒ 写全量链,与不开时等价)
-        if self.dev.graphs.session.has_input("sel_pt") {
-            let (pt, len) = self.select_view_step(sid, pos);
-            step_slots.push(("sel_pt", pt));
-            step_slots.push(("sel_len", vec![len as f32]));
-        }
-        let step_refs: Vec<(&str, &[f32])> =
-            step_slots.iter().map(|(n, v)| (*n, v.as_slice())).collect();
+        // 图上各输入槽的当步值 → 输入束对象（S6j；见 `DecodeStepInputs`）
+        let si = self.decode_step_inputs(sid, token, pos, pos_rope, kv_slot, gdn_slot)?;
+        let step_refs: Vec<(&str, &[f32])> = si.refs();
         // ⚙ KV 页字节差分(OWL_KV_DUMP=<pos>,一次):写前/写后各 d2h 一页 ⇒
         // **写者的足迹**直接给出块内元素序(页面连续 vs 8B 小块 strided),
         // 不需要任何参考值(见 docs §11.11「写者 A/B」)。
@@ -1504,15 +1536,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // **FI plan 表同步**(W3):图内 FI 核的回放**不经过宿主处理器** ⇒ 表必须由
         // 图外每步显式刷新(否则读到别的写者留下的表 ⇒ 输出 64 个空 token,实测踩过)。
         if fi_bake.is_some() && self.graphs.session.has_input("fi_q_cu") {
-            let d = self.pool.geom.dims;
-            let spec = owl_iface::contract::FiPlanSpec {
-                t: 1,
-                ctx_total: ctx_pos + 1,
-                hq: d.hq,
-                hkv: d.hkv,
-                hd: d.hd,
-                page: self.pool.geom.page,
-            };
+            let spec = self.pool.fi_plan_spec(1, ctx_pos + 1);
             self.graphs.session.face_mut().fi_plan_sync(spec).await?;
         }
         self.graphs.session.step(refs).await

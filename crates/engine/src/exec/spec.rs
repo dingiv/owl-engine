@@ -861,15 +861,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 与草稿无关,卡点就在这一句)。单卡档 = 原路(零分支)。
         // FI 表两 rank 各自的图都要刷 ⇒ 规格传进 `verify_dev`。
         let fi_spec = if self.boot.cfg.knobs.fi_plan_bake.is_some() && fi_slots_on {
-            let d = self.dev.pool.geom.dims;
-            Some(owl_iface::contract::FiPlanSpec {
-                t: block.len(),
-                ctx_total: ctx_total_fi,
-                hq: d.hq,
-                hkv: d.hkv,
-                hd: d.hd,
-                page: self.dev.pool.geom.page,
-            })
+            Some(self.dev.pool.fi_plan_spec(block.len(), ctx_total_fi))
         } else {
             None
         };

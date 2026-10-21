@@ -512,19 +512,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // (桶捕获时同一值 —— 该 key 在 capture warmup 已算好并登记 graph_owned)。
         // `fi_plan_restore = true`(缺省)时整段跳过:桶图自携表,旧行为逐字节不变。
         if bg.needs_plan_sync {
-            let d = self.pool.geom.dims;
-            let spec = owl_iface::contract::FiPlanSpec {
-                t: t_pad,
-                // **本块的真实 ctx 上界**(= 本块末 token 的绝对位置;与 decode/verify
-                // 的 `pos+1` / `ctx_total_fi` 同义)。用 `t_pad` 是错的:FI 表的
-                // 工作项数随 ctx 走,表比真 ctx 小时长上下文会读错 KV(实测:
-                // 7860 tok needle 答错、4460 tok 正确 —— 与 ctx 阈值吻合)。
-                ctx_total: base + t,
-                hq: d.hq,
-                hkv: d.hkv,
-                hd: d.hd,
-                page: self.pool.geom.page,
-            };
+            let spec = self.pool.fi_plan_spec(t_pad, base + t);
             bg.plan.face_mut().fi_plan_sync(spec).await?;
         }
         // ── 回放(1 条 graph_launch)──
