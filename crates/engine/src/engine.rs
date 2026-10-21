@@ -558,6 +558,7 @@ impl EngineKnobs {
             pool_cap_mb: cfg.pool.pool_cap_mb,
             draft: DraftCfg {
                 depth: cfg.spec.depth,
+                family: cfg.spec.draft,
                 dumb: cfg.spec.dumb,
                 dflash2_dir: cfg.model.dflash2_dir.clone(),
                 kv_quant: if cfg.spec.draft_kv_fp8 {
@@ -665,6 +666,8 @@ impl EngineKnobs {
 pub struct DraftCfg {
     /// 投机深度(0 = off;上限 3 / DFlash2 7)
     pub depth: usize,
+    /// 草稿族(auto/mtp/dflash2;显式选择见 `SpecDraft`)
+    pub family: owl_shared::config::SpecDraft,
     /// 哑草稿诊断面(无草稿器时)
     pub dumb: bool,
     /// DFlash2 草稿检查点目录(⚠️ W4A16 量化家族 syvai 系)
@@ -684,6 +687,7 @@ impl Default for DraftCfg {
         Self {
             tp_draft: false,
             depth: 0,
+            family: owl_shared::config::SpecDraft::Auto,
             dumb: false,
             dflash2_dir: None,
             kv_quant: owl_models::env::KvQuant::None,
@@ -1615,6 +1619,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         face,
         SpecBootInput {
             depth_raw: cfg.knobs.draft.depth,
+            family: cfg.knobs.draft.family,
             dflash2_dir: cfg.knobs.draft.dflash2_dir.as_deref(),
             mtp_dir: rm.mtp_dir.as_deref(),
             dumb: cfg.knobs.draft.dumb,
@@ -1648,8 +1653,16 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         env.kernel_env = Some(k);
     }
     // 草稿有自己的几何(hd=128 / grp):快照必须从 draft_env 单独投影。
+    // MTP 复用标准 attention 核，其 F16 链池声明在 `kv.main.*`
+    // 命名空间（KnHD）；因此草稿快照的 main_kv 事实 = 草稿自己的 F16 池，
+    // 而不是 target 的 fp8 池。DFlash2 仍按草稿池 tag 走。
+    let mut draft_features = features;
+    if spec.mode == SpecMode::Mtp {
+        draft_features.main_kv =
+            Some(owl_models::kernel_env::KvCaps::from_env(&spec.draft_env));
+    }
     if let Some(k) =
-        owl_models::kernel_env::KernelSelectionEnv::from_env(&spec.draft_env, features)
+        owl_models::kernel_env::KernelSelectionEnv::from_env(&spec.draft_env, draft_features)
     {
         owl_shared::log_info!("kernel-env", "draft:  {}", k.describe());
         spec.draft_env.kernel_env = Some(k);

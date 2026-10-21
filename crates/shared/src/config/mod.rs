@@ -76,7 +76,7 @@
 //! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
 //! | pool | disk_cache_mb / snap_disk_mb | usize / 0、0(**磁盘两层分片**;0 = 关层) |
 //! | pool | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
-//! | spec | depth / dumb / draft_kv_fp8 | usize 0(off)、flag、flag |
+//! | spec | depth / draft / dumb / draft_kv_fp8 | usize 0(off)、SpecDraft auto/mtp/dflash2、flag、flag |
 //! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
 //! | spec | degrade_after / probe_every | usize / 6、8(降级首探窗口;旧 64 = 长尾税) |
 //! | sampling | mode | SamplerMode 枚举("greedy"\\|"sampling")/ sampling |
@@ -676,11 +676,27 @@ impl KvmemCfg {
     }
 }
 
-/// 投机解码(spec 三态/草稿池量化/B4 降级参数/verify 图诊断)
+/// **草稿族选择**(`[spec] draft`;2026-10-21 MTP 接回)。
+///
+/// `auto` = 保持历史裁决:有 `model.dflash2_dir` 走 DFlash2,否则检查点自带
+/// `mtp.*` 走 MTP;两者都没有则回落 DecodeBatch。显式 `mtp` / `dflash2`
+/// 用于同检查点两族并存时钉死，缺资产 = boot 响亮拒（不静默回退）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpecDraft {
+    #[default]
+    Auto,
+    Mtp,
+    Dflash2,
+}
+
+/// 投机解码(spec 三态/草稿族/草稿池量化/B4 降级参数/verify 图诊断)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpecCfg {
     pub depth: usize,
+    /// 草稿族(缺省 auto;显式选择见 [`SpecDraft`])
+    pub draft: SpecDraft,
     pub dumb: bool,
     pub draft_kv_fp8: bool,
     /// verify 图 taps 退回 last_hidden(排查开关)
@@ -1238,6 +1254,7 @@ impl Default for SpecCfg {
         Self {
             tp_draft: false,
             depth: 0,
+            draft: SpecDraft::Auto,
             dumb: false,
             draft_kv_fp8: false,
             notaps: false,
@@ -2230,6 +2247,19 @@ mod auto_pool_tests {
         // 缺省 server.max_concurrency = 8
         let c = OwlConfig::from_toml_str("[pool]\ngdn_slots = 0\n").expect("合法档");
         assert_eq!(c.pool.gdn_slots, 8);
+    }
+
+    #[test]
+    fn spec_draft_family_parses_strictly() {
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 3\ndraft = \"mtp\"\n")
+            .expect("mtp 档");
+        assert_eq!(c.spec.draft, SpecDraft::Mtp);
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\ndraft = \"dflash2\"\n")
+            .expect("dflash2 档");
+        assert_eq!(c.spec.draft, SpecDraft::Dflash2);
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 3\n").expect("缺省 auto");
+        assert_eq!(c.spec.draft, SpecDraft::Auto);
+        assert!(OwlConfig::from_toml_str("[spec]\ndraft = \"eagle\"\n").is_err());
     }
 
     /// 显式值逐字节不变（旧档零行为差）

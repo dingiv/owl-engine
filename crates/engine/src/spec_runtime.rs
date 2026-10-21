@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use owl_iface::contract::DeviceClient;
 use owl_models::layers::rope::Rope;
+use owl_shared::config::SpecDraft;
 
 use crate::Result;
 use owl_iface::contract::ModelError;
@@ -100,6 +101,8 @@ pub(crate) struct SpecRuntime {
 pub(crate) struct SpecBootInput<'a> {
     /// 投机深度原始值(0 = 关)
     pub(crate) depth_raw: usize,
+    /// 草稿族(auto/mtp/dflash2;配置显式选择)
+    pub(crate) family: SpecDraft,
     /// DFlash2 草稿检查点目录(None = 无该族草稿器)
     pub(crate) dflash2_dir: Option<&'a str>,
     /// MTP 草稿检查点目录(检查点自带 mtp.* 时 Some)
@@ -136,15 +139,38 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
 ) -> Result<SpecRuntime> {
     let mode = if inp.depth_raw == 0 {
         SpecMode::Off
-    } else if inp.dflash2_dir.is_some() {
-        SpecMode::DFlash2
-    } else if inp.mtp_dir.is_some() {
-        SpecMode::Mtp
-    } else if inp.dumb {
-        SpecMode::Dumb
     } else {
-        owl_shared::log_info!("boot", "OWL_SPEC_DEPTH>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
-        SpecMode::Off
+        match inp.family {
+            SpecDraft::Mtp => {
+                if inp.mtp_dir.is_none() {
+                    return Err(ModelError::Msg(
+                        "spec.draft = \"mtp\" 但当前检查点没有 mtp.* 头(27B AWQ 检查点自带;0.8B/外部草稿档请用 dflash2)"
+                            .into(),
+                    ));
+                }
+                SpecMode::Mtp
+            }
+            SpecDraft::Dflash2 => {
+                if inp.dflash2_dir.is_none() {
+                    return Err(ModelError::Msg(
+                        "spec.draft = \"dflash2\" 但 model.dflash2_dir 为空".into(),
+                    ));
+                }
+                SpecMode::DFlash2
+            }
+            SpecDraft::Auto => {
+                if inp.dflash2_dir.is_some() {
+                    SpecMode::DFlash2
+                } else if inp.mtp_dir.is_some() {
+                    SpecMode::Mtp
+                } else if inp.dumb {
+                    SpecMode::Dumb
+                } else {
+                    owl_shared::log_info!("boot", "spec.depth>0 但无草稿器(非 mtp/dflash2 检查点)→ C7 回落 DecodeBatch");
+                    SpecMode::Off
+                }
+            }
+        }
     };
     let depth = if mode == SpecMode::Off {
         0
@@ -164,6 +190,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     let drafter = match mode {
         SpecMode::Mtp => {
             let dir = inp.mtp_dir.ok_or_else(|| ModelError::EngineInvariant { what: "Mtp 模式缺 mtp_dir(模式裁决与输入不一致)".into() })?;
+            // MTP 头 = 检查点内 BF16 权重,经装载源归一到 F16;草稿池也按
+            // 目标模型 dtype(F16)分配。**不是** BF16 草稿池。
+            draft_dt = owl_models::contract::Dtype::F16;
             // 声明构造走起点事实(同一份 27B 检查点的 spec;报告已由主模型装载
             // 路径上屏,此处不重报);装载走通用入口
             let (spec, _rep) = owl_models::model::ModelSpec::from_ckpt(
@@ -237,8 +266,21 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     // DFlash2 target taps 数(dflash 模式 = 5 层;notaps 退 last_hidden = 0)
     let dflash_tap_count = if mode == SpecMode::DFlash2 && !inp.notaps { 5 } else { 0 };
     // 草稿池几何(**分片后**;P2.1-b):从检查点声明 + 本 rank 计划算(不再用写死的 const)
-    let (draft_geom, draft_env) = match (&drafter, inp.dflash2_dir) {
-        (Some(Drafter::DFlash2(_)), Some(dir)) => {
+    let (draft_geom, draft_env) = match &drafter {
+        Some(Drafter::Mtp(_)) => {
+            // MTP 草稿链池 = F16 独立页池(StatePool 按 dims.dtype 分配)。
+            // env 必须同步成 F16/no-quant:生产主池是 fp8,沿用主 env 会让
+            // naive_attn 选 fp8 读核,与 F16 mtp 池错位(草稿全垃圾)。
+            let mut env = inp.base_env;
+            env.quant = owl_models::module::QuantPlan::F16;
+            env.kv.quant = owl_models::env::KvQuant::None;
+            env.kv.dtype = draft_dt;
+            (None, env)
+        }
+        Some(Drafter::DFlash2(_)) => {
+            let dir = inp.dflash2_dir.ok_or_else(|| ModelError::EngineInvariant {
+                what: "DFlash2 模式缺 dflash2_dir(模式裁决与输入不一致)".into(),
+            })?;
             let tp = inp.tp.unwrap_or_else(owl_models::plan::tp::TpPlan::single);
             let g = owl_models::formats::qwen35::dflash2_draft_geom(
                 std::path::Path::new(dir),

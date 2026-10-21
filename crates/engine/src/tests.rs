@@ -3619,6 +3619,11 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
             // 草稿档一律按投机配置 boot;baseline 轮靠运行时 spec_depth=0 回落
             knobs.draft.depth = 3;
             knobs.cuda.capture_slab_mb = Some(160);
+            // 生产主池是 fp8；MTP 链仍是独立 F16。开该门跑 fp8 主池 × F16
+            // MTP 的恒等（与 mtp27b profile 同形；缺省 f16 档保持历史门）。
+            if owl_shared::env_reader::flag("OWL_GATE_FP8") {
+                knobs.env.kv.quant = owl_models::env::KvQuant::Fp8E4M3;
+            }
             // **FI 图内臂恒等门**(W5:piecewise/断点面已退役 ⇒ 臂 = 单图 + 窗外刷表)。
             // spec(verify FI 图内臂)与 baseline(spec_depth=0)贪心 token 流必须逐位
             // 一致:覆盖"FI 四件套走输入槽 + `ctx_total` 烘上界 + 每步/每轮

@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use owl_shared::config::{OwlConfig, ResolvedConfig};
+use owl_shared::config::{OwlConfig, ResolvedConfig, SpecDraft};
 pub use owl_shared::config::ModelKind;
 
 // ── app 面缺省(总账外的 server 组装缺省;R2 命名常量)──
@@ -806,17 +806,44 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         }
     }
     if c.spec.depth > 0 {
-        match c.model.dflash2_dir.as_deref() {
-            Some(dir) => match check_draft_dir(Path::new(dir)) {
-                Ok(note) => out.push_str(&format!("[check] draft dir: {note}\n")),
-                Err(e) => {
+        let dflash2 = match c.spec.draft {
+            SpecDraft::Dflash2 => true,
+            SpecDraft::Mtp => false,
+            SpecDraft::Auto => c.model.dflash2_dir.is_some(),
+        };
+        if dflash2 {
+            match c.model.dflash2_dir.as_deref() {
+                Some(dir) => match check_draft_dir(Path::new(dir)) {
+                    Ok(note) => out.push_str(&format!("[check] draft dir: {note}\n")),
+                    Err(e) => {
+                        ok = false;
+                        out.push_str(&format!("[check] FAIL: {e}\n"));
+                    }
+                },
+                None => {
                     ok = false;
-                    out.push_str(&format!("[check] FAIL: {e}\n"));
+                    out.push_str("[check] FAIL: spec.draft=dflash2 但 model.dflash2_dir 为空\n");
                 }
-            },
-            None => {
-                ok = false;
-                out.push_str("[check] FAIL: spec.depth > 0 但 model.dflash2_dir 为空\n");
+            }
+        } else if matches!(c.spec.draft, SpecDraft::Auto) && c.spec.dumb {
+            out.push_str("[check] draft: dumb(诊断哑草稿;不需要 MTP/DFlash2 资产)\n");
+        } else {
+            if c.model.dflash2_dir.is_some() {
+                out.push_str(
+                    "[check] note: spec.draft=mtp 忽略 model.dflash2_dir(显式选择优先)\n",
+                );
+            }
+            match c.model.dir.as_deref() {
+                Some(dir) => match check_mtp_head(Path::new(dir)) {
+                    Ok(note) => out.push_str(&format!("[check] draft: {note}\n")),
+                    Err(e) => {
+                        ok = false;
+                        out.push_str(&format!("[check] FAIL: {e}\n"));
+                    }
+                },
+                None => out.push_str(
+                    "[check] draft: MTP 头随检查点装载;缺 model.dir 时无法预检 mtp.* 键\n",
+                ),
             }
         }
     }
@@ -844,9 +871,10 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         "eager/piecewise"
     };
     out.push_str(&format!(
-        "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{} reuse={} batch={} vision={}\n",
+        "[check] arms: prefill={prefill} decode={decode} gdn={} spec=depth{}({:?}) reuse={} batch={} vision={}\n",
         if c.dispatch.gdn_chunked { "chunked" } else { "scalar" },
         c.spec.depth,
+        c.spec.draft,
         if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
         c.runtime.max_batch,
         if c.model.vision { "on" } else { "off" },
@@ -880,6 +908,35 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
 }
 
 /// 模型 `config.json` 几何校验(读 `text_config`;与注册表逐项比对)
+/// **MTP 头预检**：27B AWQ 的检查点把 `mtp.*` 放在主 safetensors 索引里
+/// （config 不声明 `num_nextn_predict_layers`，但权重存在）。这里只读索引，
+/// 不做权重装载；无索引（单文件档）时留到装载期结构化拒绝。
+fn check_mtp_head(dir: &Path) -> Result<String, String> {
+    let p = dir.join("model.safetensors.index.json");
+    if !p.is_file() {
+        return Ok(format!(
+            "{} 无 model.safetensors.index.json —— 跳过 mtp.* 预检(装载期验证)",
+            dir.display()
+        ));
+    }
+    let raw = owl_shared::file_loader::read_to_string(&p)
+        .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
+    let n = v
+        .get("weight_map")
+        .and_then(|x| x.as_object())
+        .map(|m| m.keys().filter(|k| k.starts_with("mtp.")).count())
+        .unwrap_or(0);
+    if n == 0 {
+        return Err(format!(
+            "spec.draft=mtp 但 {} 的权重索引没有 mtp.* 键（该检查点不是 MTP 档；请改用 dflash2 或关 spec）",
+            dir.display()
+        ));
+    }
+    Ok(format!("{} ✓ MTP 头 / {} 个 mtp.* 键", dir.display(), n))
+}
+
 fn check_model_dir(
     dir: &Path,
     profile: &owl_shared::config::intent::ModelProfile,

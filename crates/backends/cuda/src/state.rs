@@ -108,7 +108,7 @@ impl DiagOpts {
 /// 这里只读配置事实，不探测硬件/不读 env。
 fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::tag_filter::TagFilter {
     use owl_kernels::spec::KernelTag as T;
-    use owl_shared::config::{HeadQuant, ModelKind, QuantScheme};
+    use owl_shared::config::{HeadQuant, ModelKind, QuantScheme, SpecDraft};
     if cfg.dispatch.tag_wildcard {
         return owl_kernels::tag_filter::TagFilter::wildcard();
     }
@@ -143,15 +143,28 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
     if cfg.spec.depth > 0 {
         tags.push(T::FEAT_DFLASH);
         tags.push(T::FEAT_SPEC);
-        // DFlash2 草稿自持 W4A16 权重(与主干 plan 独立;MTP = F16 不需)。
-        if cfg.model.dflash2_dir.is_some() {
+        // 草稿族决定权重/KV tag：MTP = 检查点内 F16 头 + F16 mtp 链；
+        // DFlash2 = W4A16 外部草稿 + BF16/fp8 草稿池。
+        let dflash2 = match cfg.spec.draft {
+            SpecDraft::Dflash2 => true,
+            SpecDraft::Mtp => false,
+            SpecDraft::Auto => cfg.model.dflash2_dir.is_some(),
+        };
+        if dflash2 {
+            // DFlash2 草稿自持 W4A16 权重(与主干 plan 独立;MTP = F16 不需)。
             tags.push(T::QUANT_W4A16);
-        }
-        // 草稿池默认 BF16；draft_kv_fp8 时 fp8。
-        if cfg.spec.draft_kv_fp8 {
-            tags.push(T::KV_DRAFT_FP8);
+            if cfg.spec.draft_kv_fp8 {
+                tags.push(T::KV_DRAFT_FP8);
+            } else {
+                tags.push(T::KV_DRAFT_BF16);
+            }
         } else {
-            tags.push(T::KV_DRAFT_BF16);
+            // MTP 链池按目标模型 dtype 分配 = F16。MTP 层复用**标准
+            // attention**（不是 DFlash2 的 naive NC 核），写/读核声明在
+            // `kv.main.*` 命名空间（K0WriteKnhd / paged v2 f16），池布局
+            // 仍是主池 KnHD；因此主/草稿两面都要放行 F16（不是 bf16/fp8）。
+            tags.push(T::KV_MAIN_F16);
+            tags.push(T::KV_DRAFT_F16);
         }
     }
     if cfg.model.vision {
@@ -3220,6 +3233,8 @@ mod tag_filter_tests {
         cfg.model.vision = true;
         cfg.dispatch.kv_fp8 = true;
         cfg.spec.depth = 7;
+        // 该门覆盖 DFlash2 草稿档；不给 dflash2_dir 会按 MTP(F16) 派生。
+        cfg.model.dflash2_dir = Some("/tmp/dflash2".into());
         cfg.runtime.tp_ordinals = Some(vec![2, 3]);
         assert!(allows(&cfg, "marlin_gemm_w4a16_awq"));
         assert!(!allows(&cfg, "marlin_gemm_w4a8_awq"));
@@ -3256,6 +3271,18 @@ mod tag_filter_tests {
         cfg.spec.depth = 0;
         assert!(allows(&cfg, "marlin_gemm_w4a8_awq"));
         assert!(!allows(&cfg, "marlin_gemm_w4a16_awq"), "无头/无草稿时不得放行 W4A16");
+    }
+
+    #[test]
+    fn mtp_draft_uses_f16_pool_tags() {
+        let mut cfg = OwlConfig::default();
+        cfg.model.kind = ModelKind::Awq27b;
+        cfg.model.quant = QuantScheme::W4a16;
+        cfg.spec.draft = owl_shared::config::SpecDraft::Mtp;
+        cfg.spec.depth = 3;
+        assert!(allows(&cfg, "owl_naive_attn_nc_f16"), "MTP 链 = F16");
+        assert!(allows(&cfg, "vllm_reshape_and_cache_f16_knhd"), "MTP 写核走主池 KnHD f16");
+        assert!(!allows(&cfg, "owl_naive_attn_nc_bf16"), "MTP 不应派生 BF16 草稿池");
     }
 
     #[test]

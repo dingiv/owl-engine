@@ -1308,7 +1308,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         };
         let pool = boot.pool;
         let dims = boot.dims;
-        let env = boot.env;
+        // MTP 草稿层/链步池是 F16(StatePool 按目标 dims.dtype 分配),
+        // 不能用主 env(fp8 生产档会选到 fp8 读核)。
+        let env = boot.spec.draft_env;
         let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let spec_depth = boot.spec.depth;

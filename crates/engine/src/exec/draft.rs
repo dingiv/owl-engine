@@ -649,7 +649,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let seed_view =
             TensorOps::of_block(seed.id, self.dev.pool.geom.dims.dtype, vec![1, self.dev.pool.geom.dims.hidden]);
         let drafts = {
-            let env = self.dev.env();
+            let env = self.dev.spec_rt.draft_env;
             let vocab = self.dev.boot.model.vocab_size();
             let rope = self.dev.boot.rope.clone();
             // 链步 decode 读核跟池布局:kNH 池必须走 v2(否则落 v1 classic
@@ -666,9 +666,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         };
         let (b, arena) = {
-            let env = self.dev.env();
             let face = self.dev.graphs.session.face_mut();
-            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, env, self.dev.boot.tp.as_ref()).await?
+            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.dev.spec_rt.draft_env, self.dev.boot.tp.as_ref()).await?
         };
         {
             let face = self.dev.graphs.session.face_mut();
@@ -759,7 +758,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .collect::<Vec<u8>>(),
         );
         let drafts = {
-            let env = self.dev.env();
+            let env = self.dev.spec_rt.draft_env;
             let vocab = self.dev.boot.model.vocab_size();
             let rope = self.dev.boot.rope.clone();
             let attn_v2 = self.dev.pool.attn_v2_scratch(); // 同上:链步读核走 v2
@@ -776,9 +775,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("spec.propose.build", ts_build.elapsed());
         let ts_eval = std::time::Instant::now();
         let (b, arena) = {
-            let env = self.dev.env();
             let face = self.dev.graphs.session.face_mut();
-            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, env, self.dev.boot.tp.as_ref()).await?
+            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.dev.spec_rt.draft_env, self.dev.boot.tp.as_ref()).await?
         };
         mrec("spec.propose.eval", ts_eval.elapsed());
         {
@@ -1247,13 +1245,15 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             Some(crate::spec_runtime::Drafter::Mtp(m)) => m,
             _ => return Ok(()), // DFlash2 无链式 extend(草稿 KV 走 dflash_encode)
         };
+        // MTP 链池是 F16；主 env 生产是 fp8，必须显式用草稿 env
+        // （否则 K0 写核选 fp8 变体，槽 2 的 F16 cache 当场 dtype 拒绝）。
+        let env = self.spec_rt.draft_env;
         let root = mtp.extend_block(
             &tok_t, &hid_view, &pos_t, &kv, &slots_t, &lens_t, &cu_t,
-            &self.boot.model.embed, &self.boot.rope, self.env(),
+            &self.boot.model.embed, &self.boot.rope, env,
         );
         // 原为 `_b`(弃值)—— 那正是漏点的形状:根块没人读也没人还
         let (b, arena) = {
-            let env = self.env();
             let face = self.graphs.session.face_mut();
             owl_models::interpreters::eval_ops_scoped_env(root.step(), face, env, self.boot.tp.as_ref()).await?
         };

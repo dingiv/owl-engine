@@ -109,6 +109,7 @@ reuse       = "off"               # off | session | global;不写 = goal 决定
 | `context="max"` | 内存模型求解(§4) |
 | `concurrency=C` | `gdn_slots=C`、`server.max_concurrency=C`、`max_batch=min(C,8)` |
 | `spec=dflash` | `depth=7` + 草稿目录必填 + 草稿池 20KiB/token 进内存账 |
+| `[spec] draft` | `auto`（缺省，DFlash2 目录优先 → 检查点 MTP）\| `mtp` \| `dflash2`；显式档缺资产 = boot 拒 |
 | `kv=fp8/f16` | `dispatch.kv_fp8` |
 | `kvmem=off` | 选择层/索引/超卖四键全关 + 宿主/磁盘腿清零 |
 | `kvmem=overcommit` | 四键全开 + 宿主腿 + 强制 prefix_cache |
@@ -202,6 +203,11 @@ ls profiles/
   `model.visual.*`(27B AWQ 档;0.8B 响亮拒)。
 - 视觉塔装载 + 引擎图像 prefill + **OpenAI `image_url` / Rust 预处理**已接
   (data URL;单图;TP2 两 rank 各备塔输出)。
+- **MTP 头投机**（`[spec] draft = "mtp"`，2026-10-21）：27B AWQ 检查点自带
+  15 个 `mtp.*` 键；`depth ≤ 3`。MTP 链是独立 **F16** 页池（不是主池 fp8），
+  标准 attention 读写走 `kv.main.f16`/KnHD；`--check` 会预检权重索引的
+  `mtp.*`。验证档 `profiles/mtp27b-3090-16k.toml`；历史 DFlash2 档不受影响
+  （`draft` 缺省 = auto，DFlash2 目录在场时仍优先 DFlash2）。
 - **图像 × 投机**(`spec.depth>0`)已接(V5):verify 的 rope 位置 =
   真实位置 + m-RoPE `delta`,KV slots/lens 仍用真实位置;带图请求仍限
   单图/非合批。无投机对照档 = `profiles/tp27b-3080-vlm-184k.toml`;
