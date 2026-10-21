@@ -343,7 +343,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
             .map_err(|e| ModelError::Msg(format!("TP rank1 装配失败:{e}")))?;
         // ── 装配后自证:warmup 的 AR 已**对称配对**(produced == consumed、err = 0)──
         for (i, dev) in [&dev0, &dev1].into_iter().enumerate() {
-            let Some(tp_ctx) = dev.tp.as_ref() else {
+            let Some(tp_ctx) = dev.boot.tp.as_ref() else {
                 return loud(format!("TP rank{i} 装配后无 TpCtx(装配路径错)"));
             };
             let Some(mut f) = dev.graphs.face_clone() else {
@@ -413,7 +413,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
 
     /// 本 rank 的分片 spec(形状单源)
     pub fn spec(&self, rank: usize) -> &ModelSpec {
-        &self.ranks[rank].dev.spec
+        &self.ranks[rank].dev.boot.spec
     }
 
     /// 本 rank 的 staging(own/peer 双块 + 布局量)
@@ -658,7 +658,7 @@ async fn retire_rank(
             ModelError::Msg(format!("{tag} 收尾:face 句柄耗尽,无法 PeerRelease")),
             &mut first,
         ),
-        Some(mut face) => match dev.tp.as_ref() {
+        Some(mut face) => match dev.boot.tp.as_ref() {
             None => note(
                 ModelError::Msg(format!("{tag} 收尾:无 TpCtx(非 TP 态?)")),
                 &mut first,
@@ -687,7 +687,7 @@ async fn retire_rank(
 /// 单 rank 的 staging 游标三元组(`(produced, consumed, err)`;见
 /// [`RunningEngine::tp_staging_state`])。
 async fn staging_state_of(dev: &mut RankDev<DeviceHandle<GpuClient>>) -> Result<(u64, u64, u32)> {
-    let Some(tp) = dev.tp.clone() else {
+    let Some(tp) = dev.boot.tp.clone() else {
         return loud("TP staging: 无 TpCtx(装配路径错)");
     };
     let Some(mut f) = dev.graphs.face_clone() else {
@@ -722,7 +722,7 @@ impl RunningEngine<DeviceHandle<GpuClient>> {
     ///
     /// 与 [`TpEngine::shutdown`] 的分工:后者是"装配后未进执行态"的收尾
     /// (rank 束 = `TpRank`),本函数是"跑过 turn 的执行态"的收尾
-    /// (rank 束 = `RankDev`,staging 句柄在 `dev.tp` 里 —— 同一笔分配)。
+    /// (rank 束 = `RankDev`,staging 句柄在 `dev.boot.tp` 里 —— 同一笔分配)。
     /// 非 TP 态(无 peer 束)⇒ **响亮拒**(收尾路径错,不是静默空跑)。
     pub async fn shutdown_tp(mut self) -> Result<()> {
         if self.peer.is_none() {

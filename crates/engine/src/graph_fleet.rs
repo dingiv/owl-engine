@@ -255,7 +255,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 "dispatch.xqa_prefill 在场 ⇒ prefill 桶不建(桶图槽面 = FI 四件套;回 eager 原路)"
             );
             crate::prefill_plan::PrefillBuckets::empty()
-        } else if boot.pool.fi_face {
+        } else if boot.pool.geom.fi_face {
             match pface_src {
                 None => {
                     owl_shared::log_warn!(
@@ -288,7 +288,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         } else {
             owl_shared::log_warn!(
                 "prefill-graph",
-                "非 FI 档(pool.fi_face = false)⇒ prefill 桶不建(回 eager 原路)"
+                "非 FI 档(pool.geom.fi_face = false)⇒ prefill 桶不建(回 eager 原路)"
             );
             crate::prefill_plan::PrefillBuckets::empty()
         };
@@ -314,7 +314,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 arm(verify_fi_node, boot.knobs.env.attn.verify_xqa, boot.knobs.env.attn.verify_v2),
                 arm(decode_fi_node, boot.knobs.env.attn.decode_xqa, false),
                 boot.spec.depth,
-                boot.pool.kv_fp8,
+                boot.pool.geom.kv_fp8,
             );
         }
         // **图显存总账**(2026-10-16;user 令"先归因"):所有已捕获图的 slab
@@ -440,7 +440,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 仅多 5 个 [1,hidden] 输出槽写;非 dflash 走原 forward(拓扑不变)
         let decode_taps = boot.spec.dflash_tap_count > 0;
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
-        let fi_nb = pool.nb;
+        let fi_nb = pool.geom.nb;
         let dfi_on = knobs.env.attn.decode_fi; // 闭包 'static:先取值(同 xqa_decode_on 纪律)
         // **图档单图烘 plan 档**(2026-10-18;`[dispatch] fi_plan_bake`):
         // Some(ctx) = decode **不进 piecewise**,FI 核留图内,且喂 FI 的
@@ -585,8 +585,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                         // 整段读到**别家 KV** —— 实测"答上一题"(§7.6 定谳,
                         // 2026-10-14)。init 保留恒等链(单会话行为不变);
                         // 槽尺寸 = 池 nb(与会话链上界一致,尾部补零)
-                        v.push(InputSlot::f32("xqa_pt", pool.nb).init(
-                            (0..pool.nb).map(|i| f32::from_bits(i as u32)).collect(),
+                        v.push(InputSlot::f32("xqa_pt", pool.geom.nb).init(
+                            (0..pool.geom.nb).map(|i| f32::from_bits(i as u32)).collect(),
                         ));
                     }
                     if knobs.select_decode {
@@ -595,8 +595,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                         // init = 恒等链 + 全量长(单会话且视图未启用时行为不变)
                         // 编码 = **数值 f32**(与 `write_bt` 同源:block_tables 在本族
                         // 声明为 F32 rank2;XQA 的位型编码是另一套,别混)
-                        v.push(InputSlot::f32("sel_pt", pool.nb).init(
-                            (0..pool.nb).map(|i| i as f32).collect(),
+                        v.push(InputSlot::f32("sel_pt", pool.geom.nb).init(
+                            (0..pool.geom.nb).map(|i| i as f32).collect(),
                         ));
                         v.push(InputSlot::f32("sel_len", 1).init(vec![1.0]));
                     }
@@ -607,8 +607,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                     // u32 → f32)。init 与占位 ctx_total(=1 行)自洽:nb_pages=1
                     if knobs.env.attn.decode_fi {
                         v.push(InputSlot::f32("fi_q_cu", 2).init(vec![0.0, f32::from_bits(1)]));
-                        v.push(InputSlot::f32("fi_indices", pool.nb)
-                            .init((0..pool.nb).map(|i| f32::from_bits(i as u32)).collect()));
+                        v.push(InputSlot::f32("fi_indices", pool.geom.nb)
+                            .init((0..pool.geom.nb).map(|i| f32::from_bits(i as u32)).collect()));
                         v.push(InputSlot::f32("fi_indptr", 2).init(vec![0.0, f32::from_bits(1)]));
                         v.push(InputSlot::f32("fi_last_len", 1).init(vec![f32::from_bits(1)]));
                     }
@@ -887,8 +887,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                     // FI 表四件套(位型过线:u32 → f32;核按 i32* 读)。init 与
                     // 占位 ctx_total(=depth1)自洽:nb_pages = ceil(T/page) = 1
                     InputSlot::f32("fi_q_cu", 2).init(vec![0.0, f32::from_bits(depth1 as u32)]),
-                    InputSlot::f32("fi_indices", pool.nb)
-                        .init((0..pool.nb).map(|i| f32::from_bits(i as u32)).collect()),
+                    InputSlot::f32("fi_indices", pool.geom.nb)
+                        .init((0..pool.geom.nb).map(|i| f32::from_bits(i as u32)).collect()),
                     InputSlot::f32("fi_indptr", 2).init(vec![0.0, f32::from_bits(1)]),
                     InputSlot::f32("fi_last_len", 1).init(vec![f32::from_bits(depth1 as u32)]),
                 ],
@@ -904,7 +904,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let fi_want_c = fi_want;
         // kcs/vcs = 主池叶子(FI 与其余臂同池;与 kv_caches 同源)
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
-        let fi_nb = pool.nb; // 闭包 'static:借 boot 的字段必须先取值(同 kv_caches 纪律)
+        let fi_nb = pool.geom.nb; // 闭包 'static:借 boot 的字段必须先取值(同 kv_caches 纪律)
         // 图内臂把 FI plan 的 ctx 烘成上界(表由引擎每轮 sync 成精确值)
         let vfi_bake_c = vfi_bake;
         // **臂事实位**(2026-10-18,同 "槽在场≠节点在场" 律):FI 面是否真登记进本图

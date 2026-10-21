@@ -15,7 +15,9 @@ use owl_iface::contract::{DeviceClient, ModelError};
 use owl_models::tokenizer::Tokenizer;
 
 use crate::engine::{EngineConfig, RankDev};
+use crate::housekeeping::Housekeeping;
 use crate::scheduler::{SchedulerOutput, StepAction};
+use crate::select::SelectRuntime;
 use crate::session::SessionBank;
 use crate::turn::{Turn, TurnEvent, TurnLedger, TurnSpec, TurnSpecState};
 
@@ -138,237 +140,53 @@ pub struct TokenizeReply {
 
 /// 执行态引擎(请求入口)。
 ///
-/// # 结构(2026-10-14 拆分:35 字段万能袋 → 状态域组合)
+/// # 结构(2026-10-14 拆万能袋 → 2026-10-21 收户)
 ///
-/// 按状态域拆四户入组合,本体只留**跨域核心资产**(设备面/配置/
-/// 模型/池/环境/探针):
+/// 本体只留**跨域协调**要抓的把手,状态按域入组合:
+/// - [`BootCtx`]:boot 期定型、**运行期只读**(配置/分词器/探针/序号)
 /// - [`crate::turn::TurnLedger`]:排队/活跃/id 发号/事件队列
 /// - [`crate::session::SessionBank`]:会话账 + 双块账房(target/MTP)
-/// - [`crate::graph_fleet::GraphFleet`]:主会话图 + spec 三族图阵
-/// - [`crate::spec_runtime::SpecRuntime`]:spec 模式/草稿器/统计/B4 保鲜
+/// - [`crate::select::SelectRuntime`]:B 轴视图/覆盖率探针/驻留账
+/// - [`crate::housekeeping::Housekeeping`]:节拍与计数(调度计时/空转/回收/降级)
+/// - [`RankDev`]:rank0 设备束(池/图/模型/env/spec 运行态/tp)
+///
+/// 纪律:各户字段**私有**,外部只经方法读写 —— 状态有守门人,
+/// 方法离它操作的状态近(收户前的反例:`self.dev` 被解引 300+ 次、
+/// B 轴 9 字段的写者散在四个文件)。
 ///
 /// 生命周期分层:turn 域状态住 ActiveTurn(随 turn 生死);引擎级
 /// spec 状态住 SpecRuntime(跨 turn)—— 两层不混居(2026-10-10
 /// 生命周期收口教训)。
-pub struct RunningEngine<D: DeviceClient> {    /// 步级探针(boot 解析;不可变)
-    pub(crate) probes: StepProbes,
-    pub(crate) cfg: EngineConfig,
-    pub(crate) tok: Tokenizer,
-    /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
-    pub(crate) boot_seq: u64,
-    /// E5 性能:schedule 累计账(轮间 host 成本剖析)
-    pub(crate) sched_acc_ns: u64,
-    pub(crate) sched_cnt: usize,
+pub struct RunningEngine<D: DeviceClient> {
+    /// boot 期事实(只读;写入只在构造期)
+    pub(crate) boot: BootCtx,
     /// turn 运行账(turn.rs)
     pub(crate) turns: TurnLedger,
-    /// H5 空转整理节拍(空转 pump 计数;每 `IDLE_HK_EVERY` 拍整理一次)
-    pub(crate) idle_pumps: u64,
-    /// **默认池缓存回收的节拍**(§23.9:turn 收尾之后才 free 的页要在空转期再清一次;
-    /// 每 `IDLE_TRIM_EVERY` 一次,失败只 WARN 不打断空转)。
-    pub(crate) last_trim: Option<std::time::Instant>,
-    /// N6/保洁 deny 的**累计**次数(限流日志用:首条 + 每 64 条打一次;
-    /// 计数本身**不丢** —— 机读面 = `store.degrade` metrics)
-    pub(crate) degrade_seen: u64,
     /// 会话 + 块账房(session.rs;host 侧 —— 两 rank 共用一份)
     pub(crate) bank: SessionBank,
+    /// B 轴运行态(select.rs;字段私有,只经方法访问)
+    pub(crate) sel: SelectRuntime,
+    /// 保洁/遥测账(housekeeping.rs;字段私有,只经方法访问)
+    pub(crate) hk: Housekeeping,
     /// **rank0 设备束**(池/图/模型/env/spec 运行态/tp;S4 ⑤-K3 收编)
     pub(crate) dev: RankDev<D>,
     /// **TP peer 束(rank1;`None` = 单卡)** —— 设备侧程序镜像的目标
     /// (S4 ⑤-K3:同一份设备侧代码,换装到 peer 束上再跑一遍)
     pub(crate) peer: Option<RankDev<D>>,
-    /// **B 轴覆盖率探针**待分析面(Q 已回读;等块边界事件补齐索引账)
-    /// —— `OWL_COVERAGE_PROBE`;缺省 `None`(生产零开销)。
-    pub(crate) cov_pending: Option<crate::exec::coverage::CoveragePending>,
-    /// 覆盖率探针最近一次观测(测试/调试读数面;`None` = 未观测过)
-    pub(crate) cov_last: Option<crate::exec::coverage::CoverageReport>,
-    /// **B-3d 选择层视图态**(召回点产出;`select_decode` 档每步展开成视图页表)
-    pub(crate) sel_view: Option<SelectView>,
-    /// 视图**生效**的 decode 步数(证据面:该臂真的走了视图)
-    pub(crate) select_view_steps: usize,
-    /// 视图输入槽**回退为全量链**的步数(视图态缺位;与上者和 = decode 步数)
-    pub(crate) sel_view_fallback: usize,
-    /// **B-3e stage-in 实测账**(回灌延迟定档;见 `StageStats`)
-    pub(crate) stage: StageStats,
-    /// **B-3e-2 部分驻留账**(召回点下沉/回灌/不可沉计数)
-    pub(crate) partial: PartialStats,
-    /// **B 轴相位账**(性能面;纯计时零语义;`PartialStats` 同款读数面)
-    pub(crate) prof: BAxisProfile,
-    /// **上次完整召回的选择**(内容身份,时间序)。
-    ///
-    /// 用途:**廉价边界**的驻留调和用**冻结名单**,而不是重新打分 ——
-    /// 也**不能是"什么都不做"**:`ensure_for_len` 驱逐不了会话自己持有的页,
-    /// 链每 chunk 要新增 `chunk/page` 页,不腾就必然 `Exhausted`
-    /// (实测:池 96 页,链要到 100 页 ⇒ 耗尽)。
-    pub(crate) sel_keep: Vec<owl_store::ChainHash>,
-    /// **合批 decode 已执行步数**(B5.1 事实位;门用它证明批路径真被走到)
-    pub(crate) batch_steps_n: u64,
 }
 
-/// **stage-in 实测账**(B-3e;宿主 → 设备回灌的块数/字节/耗时)。
+/// **boot 期定型、运行期只读**的事实。
 ///
-/// 用途:把"恢复延迟"从论文口号变成我们的数字(论文 174ms@256K ⇒ 我们的
-/// **选中集**回灌:W 块 × 每块字节)。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct StageStats {
-    /// 回灌块数 / 字节
-    pub blocks: usize,
-    pub bytes: usize,
-    /// 回灌墙钟(ns;**含** `face.swap` 的发射与回执)
-    pub nanos: u64,
-    /// 来源拆分:召回前置(prefill 段边界)vs 决策单(verdict.in_)
-    pub from_prefill: usize,
-    pub from_verdict: usize,
-}
-
-#[cfg(any(test, feature = "e2e"))] // e2e 场景面也消费(渲染行/吞吐)
-impl StageStats {
-    /// 每块字节(0 = 无样本)。
-    pub fn bytes_per_block(&self) -> usize {
-        if self.blocks == 0 { 0 } else { self.bytes / self.blocks }
-    }
-    /// 吞吐(MB/s;0 = 无样本)。
-    pub fn mib_per_s(&self) -> f64 {
-        if self.nanos == 0 {
-            0.0
-        } else {
-            self.bytes as f64 / 1048576.0 / (self.nanos as f64 / 1e9)
-        }
-    }
-    /// 人类可读一行。
-    pub fn line(&self) -> String {
-        format!(
-            "stage-in:{} 块 / {:.1}MiB / {:.1}ms(每块 {:.0}KiB · {:.0}MiB/s;前置 {} 决策 {} )",
-            self.blocks,
-            self.bytes as f64 / 1048576.0,
-            self.nanos as f64 / 1e6,
-            self.bytes_per_block() as f64 / 1024.0,
-            self.mib_per_s(),
-            self.from_prefill,
-            self.from_verdict
-        )
-    }
-}
-
-/// **B-3e-2 部分驻留账**(召回点下沉 / 回灌 / 不可沉)。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PartialStats {
-    /// 召回点下沉的块数(会话放手 → 缓存独占 → 宿主)
-    pub sunk: usize,
-    /// 召回点回灌的块数(选中但内容在宿主)
-    pub staged: usize,
-    /// **本轮不可沉**的块数(还没进缓存树 ⇒ 无宿主键;见 §8.19 第 2b 项)
-    pub not_cacheable: usize,
-    /// **懒沉保留**的块数(池仍有余量 ⇒ 本轮不沉、整链常驻;2026-10-20)
-    pub lazy_keep: usize,
-    /// **prefill 子集表**生效的 chunk 数(= 链上有洞后才换表的次数;第 3 项证据)
-    pub prefill_subset: usize,
-}
-
-/// **B 轴相位账**(性能面;**纯计时,零语义**)——
-///
-/// 为什么单独立账:这块是 host 纯逻辑(索引/打分/选择/视图),它不在任何
-/// 设备核的计时里,却直接吃掉 prefill 的墙钟。相位口径与
-/// `coverage_analyze` / `collect_index_for_block` 的段落一一对应:
-///
-/// | 相位 | 含义 |
-/// |---|---|
-/// | `index_ms` | 索引采集(逐块:设备 K 回读 + host 逆 RoPE + 累加) |
-/// | `q_face_ms` | query 面取回(块边界 Q dtoh + 逐行逆 RoPE) |
-/// | `mass_ms` | 重诊断采样段(K/V 全量回读 + host 逐元素解码) |
-/// | `score_ms` | 打分(**生产面**;快路口径) |
-/// | `paper_ms` | 打分(论文口径保真对照;**诊断面**) |
-/// | `select_ms` | 选择(预算 + sink/recent) |
-/// | `view_ms` | 视图装配(页表写 + 引擎视图态) |
-/// | `reconcile_ms` | 召回点驻留调和(下沉/回灌) |
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BAxisProfile {
-    /// 走过的块边界数(每个边界 = 一次召回点)。
-    pub boundaries: usize,
-    /// 其中**完整召回**(打分+按分选择)的次数。
-    pub recall_full: usize,
-    /// 其中**廉价召回**(无打分近期选择)的次数。
-    pub recall_cheap: usize,
-    pub index_ms: f64,
-    pub q_face_ms: f64,
-    /// 查询面细分:设备往返(含读语义的 COMPUTE 排空)
-    pub q_toh_ms: f64,
-    /// 查询面细分:host 解码(f16→f32)
-    pub q_dec_ms: f64,
-    /// 查询面细分:Q 块 `free`(释放命令墙钟;从 `q_dec_ms` 窗口里剔出单记 ——
-    /// 原口径把释放命令算进"host 解码",读数虚高)
-    pub q_free_ms: f64,
-    /// 查询面细分:host 逆 RoPE(逐行)
-    pub q_derope_ms: f64,
-    /// 查询面细分:**真实质量**(诊断面;逐 query 行 × 层 × 头 扫全 ctx)
-    pub q_mass_ms: f64,
-    pub mass_ms: f64,
-    pub score_ms: f64,
-    pub paper_ms: f64,
-    pub select_ms: f64,
-    pub view_ms: f64,
-    pub reconcile_ms: f64,
-    pub total_ms: f64,
-}
-
-#[cfg(any(test, feature = "e2e"))]
-impl BAxisProfile {
-    /// 人类可读一行(各相位 + 占比)。
-    pub fn line(&self) -> String {
-        let pct = |v: f64| {
-            if self.total_ms > 0.0 { v / self.total_ms * 100.0 } else { 0.0 }
-        };
-        format!(
-            "B 轴相位 ×{} 边界:合计 {:.1}ms | 索引 {:.1}({:.0}%) 查询面 {:.1}({:.0}%) \
-             重诊断 {:.1}({:.0}%) 打分 {:.1}({:.0}%) 论文口径 {:.1}({:.0}%) \
-             选择 {:.1}({:.0}%) 视图 {:.1}({:.0}%) 调和 {:.1}({:.0}%) \
-             ‖ 查询面拆:{:.1} 设备往返 + {:.1} host 解码 + {:.1} 释放 {:.1} 逆RoPE + {:.1} 真实质量 \
-             ‖ 召回档:完整 {} · 廉价 {}",
-            self.boundaries,
-            self.total_ms,
-            self.index_ms, pct(self.index_ms),
-            self.q_face_ms, pct(self.q_face_ms),
-            self.mass_ms, pct(self.mass_ms),
-            self.score_ms, pct(self.score_ms),
-            self.paper_ms, pct(self.paper_ms),
-            self.select_ms, pct(self.select_ms),
-            self.view_ms, pct(self.view_ms),
-            self.reconcile_ms, pct(self.reconcile_ms),
-            self.q_toh_ms,
-            self.q_dec_ms - self.q_free_ms,
-            self.q_free_ms,
-            self.q_derope_ms,
-            self.q_mass_ms,
-            self.recall_full,
-            self.recall_cheap
-        )
-    }
-}
-
-#[cfg(any(test, feature = "e2e"))]
-impl PartialStats {
-    /// 人类可读一行。
-    pub fn line(&self) -> String {
-        format!(
-            "部分驻留:下沉 {} 块 · 回灌 {} 块 · 不可沉(未入缓存树){} 块 · 懒沉保留 {} 块 · prefill 子集表 {} 次",
-            self.sunk, self.staged, self.not_cacheable, self.lazy_keep, self.prefill_subset
-        )
-    }
-}
-
-/// **选择层视图态**(B-3d;方案 A = 原位置,不做 re-RoPE)。
-///
-/// 视图 = **选中块(时间序)++ 召回点之后新生成的尾部**:
-/// - 尾部必须带(否则模型看不见自己刚写的 token);
-/// - 尾部在会话链里天然连续,且召回点落在**块边界** ⇒ 尾部从整页起;
-/// - `kv_lens`(注意力上下文长)= 选中 token 数 + `pos+1 − recall_pos`。
-#[derive(Debug, Clone)]
-pub struct SelectView {
-    /// 选中块的物理页(时间序)。
-    pub pages: Vec<u32>,
-    /// 选中块的 token 数(= `pages.len() × page`)。
-    pub tokens: usize,
-    /// 召回点绝对位置(块边界;尾部从这里起)。
-    pub recall_pos: usize,
+/// 为什么单独立户:配置/分词器/探针/boot 序号原来各占一个字段,被 ~150 个
+/// 方法随手读 —— 但它们**没有写入者**(`cfg`/`tok`/`probes` 在运行期零赋值)。
+/// 收成只读结构后,"谁能改运行态"的边界在类型上就看得见:
+/// 要 `&mut` 的只有 turns / bank / sel / hk / dev / peer。
+pub(crate) struct BootCtx {
+    pub(crate) cfg: EngineConfig,
+    pub(crate) tok: Tokenizer,
+    pub(crate) probes: StepProbes,
+    /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
+    pub(crate) seq: u64,
 }
 
 /// **生成预算的最小保留量**(tok):剩余额度低于它 = 真溢出(连一个像样的
@@ -507,7 +325,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 本档 prefill 块长（探针排版用；与调度器取**同一份配置** ⇒ 不会对不上）
     #[cfg(any(test, feature = "e2e"))]
     pub(crate) fn cfg_prefill_chunk(&self) -> usize {
-        self.cfg.prefill_chunk
+        self.boot.cfg.prefill_chunk
     }
 
     /// 捕获三态结果(Captured = 回放态;EagerFallback = 同闭包直发)
@@ -527,13 +345,13 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// 合批 decode 已执行的步数(B5.1 事实位;门用 —— 0 = 批路径没被走到)
     pub fn batch_steps(&self) -> u64 {
-        self.batch_steps_n
+        self.hk.batch_steps()
     }
 
     /// 合批图是否在场(B5.1 M1b 事实位;false = 执行器走 eager 臂)
     /// 合批上限(`[runtime] max_batch`;1 = 串行现状)。服务面诊断/门用。
     pub fn max_batch(&self) -> usize {
-        self.cfg.knobs.max_batch
+        self.boot.cfg.knobs.max_batch
     }
 
     pub fn has_batch_graph(&self) -> bool {
@@ -563,7 +381,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **不读意图位**（`spec.head_split`）—— 意图可能被模型结构否定（tied 表
     /// 装载期已响亮拒；但“事实在模型里”才是拼接面的唯一判据）。
     pub(crate) fn head_split_active(&self) -> bool {
-        self.dev.model.logits_vocab() != self.dev.model.vocab_size()
+        self.dev.boot.model.logits_vocab() != self.dev.boot.model.vocab_size()
     }
 
     pub(crate) async fn read_full_logits(&mut self, name: &str) -> Result<Vec<f32>> {
@@ -571,7 +389,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         if !self.head_split_active() {
             return Ok(a);
         }
-        let half = self.dev.model.logits_vocab();
+        let half = self.dev.boot.model.logits_vocab();
         let p = self
             .peer
             .as_mut()
@@ -604,11 +422,11 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 编码失败**显式上抛**(不用会吞错误的 `encode` —— 空序列 ≡ “文本是空的”)。
     pub fn tokenize(&self, text: &str, chat_wrap: bool) -> std::result::Result<TokenizeReply, String> {
         let tokens = if chat_wrap {
-            self.tok.try_encode(&self.tok.chat_wrap(text))?
+            self.boot.tok.try_encode(&self.boot.tok.chat_wrap(text))?
         } else {
-            self.tok.try_encode(text)?
+            self.boot.tok.try_encode(text)?
         };
-        Ok(TokenizeReply { tokens, max_seq_tokens: self.cfg.max_seq_tokens })
+        Ok(TokenizeReply { tokens, max_seq_tokens: self.boot.cfg.max_seq_tokens })
     }
 
     /// 提交 turn(临时会话:每 turn 独立,终了即焚;行为同 M0.5)。
@@ -674,26 +492,26 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 为什么放在 submit 而不是 `schedule`：槽满时判决根本不跑（
         // `active.len() < max_batch` 的闸先关），队列会无界膨胀；submit 是
         // 唯一能看见"活跃 + 排队"总数的地方。0 = 无界（旧行为）。
-        let max_queue = self.cfg.knobs.max_queue;
+        let max_queue = self.boot.cfg.knobs.max_queue;
         if max_queue > 0 {
             let in_flight = self.turns.active.len() + self.turns.queue.len();
-            let cap = self.cfg.knobs.max_batch.max(1).saturating_add(max_queue);
+            let cap = self.boot.cfg.knobs.max_batch.max(1).saturating_add(max_queue);
             if in_flight >= cap {
                 // 退避建议（P3-c）：EWMA × 需要的波数（含自己）
                 let eta = self
                     .turns
-                    .eta_ms(self.cfg.knobs.max_batch.max(1), self.turns.queue.len());
+                    .eta_ms(self.boot.cfg.knobs.max_batch.max(1), self.turns.queue.len());
                 self.turns.note_reject(session.unwrap_or(0), "no_slot");
                 return Err(ModelError::Msg(format!(
                     "admission:no_slot retry_ms={eta} —— 在飞 {in_flight} 已达上限 {cap}\
                      （批位 {} + 队列 {max_queue}）",
-                    self.cfg.knobs.max_batch.max(1)
+                    self.boot.cfg.knobs.max_batch.max(1)
                 )));
             }
         }
         // **同会话并发守卫**(B5.1):合批档下两个同会话 turn 会共享同一份
         // KV/GDN 状态 ⇒ 结构性互踩。亮拒(上层应按会话串行)。
-        if self.cfg.knobs.max_batch > 1 {
+        if self.boot.cfg.knobs.max_batch > 1 {
             if let Some(id) = session {
                 if self.turns.active.iter().any(|a| a.session_id == id)
                     || self.turns.queue.iter().any(|t| t.session_id == id)
@@ -709,12 +527,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 已接(verify 的 rope pos 加 m-RoPE delta,slots/lens 仍用真实位置)。
         // 图像路径的塔/表/prefill 见 execute_prefill;这里只做提交边界拒。
         if !opts.images.is_empty() {
-            if self.dev.vlm.is_none() {
+            if self.dev.boot.vlm.is_none() {
                 return Err(ModelError::Msg(
                     "submit: 请求带图,但本档 [model].vision != true(引擎无视觉塔)".into(),
                 ));
             }
-            if self.cfg.knobs.max_batch > 1 {
+            if self.boot.cfg.knobs.max_batch > 1 {
                 return Err(ModelError::Msg(
                     "submit: VLM 图像首版不支持合批(max_batch > 1)".into(),
                 ));
@@ -732,14 +550,14 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 模型健康度鉴别(模板态病 vs 权重病)的 A/B 臂
             // §三十二:含 im_start = 上层已渲染完整 chat 模板(OpenAI 多轮
             // 面),跳过单轮 chat_wrap(整段历史塞单 user 消息 = 多轮崩根因)
-            let wrapped = if self.cfg.knobs.raw_completion || prompt.contains("<|im_start|>") {
+            let wrapped = if self.boot.cfg.knobs.raw_completion || prompt.contains("<|im_start|>") {
                 prompt.clone()
             } else {
-                self.tok.chat_wrap(&prompt)
+                self.boot.tok.chat_wrap(&prompt)
             };
             // 诊断:最终 prompt 落盘([probes] prompt_dump;§三十六 多轮"无记忆"
             // 幻觉定位面 —— dump 渲染+wrap 后送模型的完整 prompt 字节)
-            if self.probes.prompt_dump {
+            if self.boot.probes.prompt_dump {
                 let ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     // 系统时钟回拨兜底 → 0(非失败路径;仅用于 dump 文件名)
@@ -751,7 +569,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     Err(e) => owl_shared::log_debug!("prompt-dump", "落盘失败 {e}"),
                 }
             }
-            self.tok.encode(&wrapped)
+            self.boot.tok.encode(&wrapped)
         };
         if prompt_ids.is_empty() {
             return Err(ModelError::Msg("submit: 空 prompt".into()));
@@ -764,7 +582,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 开着的档位:地板进 `admission_gate`(准入判据 + 实得地板回吐),
         // 页数上限在准入处按**本档工作集**再校一遍(ctx 长度那时才知道)。
         if let Some(f) = opts.dense_floor {
-            if !f.is_strict() && !self.cfg.knobs.kvmem_virtualization {
+            if !f.is_strict() && !self.boot.cfg.knobs.kvmem_virtualization {
                 return Err(ModelError::Msg(
                     "submit: per-turn 非 Strict 地板需要**虚拟化两扇门**\
                      ([kvmem].select_decode = true **且** select_partial = true)——\
@@ -786,7 +604,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // 两侧 id 窗口**。渲染对称律的判据就是这一行:分叉在
                 // "assistant 轮边界" = 渲染/切分不对称;分叉在别处 = 客户端回填不同。
                 Some((id, cached, false)) => {
-                    if self.probes.debug {
+                    if self.boot.probes.debug {
                         let s = self.bank.sessions.get(id).expect("刚查过");
                         match s.first_divergence(&prompt_ids) {
                             Some(i) => {
@@ -797,8 +615,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 eprintln!(
                                     "[dbg prefix] 守卫失配 session={id} cached_len={cached} 首个分叉 idx={i} \
                                      旧(已入 KV)={a:?} ⇒ {:?} ‖ 新(本轮)={b:?} ⇒ {:?}",
-                                    self.tok.decode(a),
-                                    self.tok.decode(b)
+                                    self.boot.tok.decode(a),
+                                    self.boot.tok.decode(b)
                                 );
                             }
                             None => eprintln!(
@@ -821,7 +639,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 直接 400(实测:工作区里一句"1+1=?"都发不出去)。收缩后仍能跑,
         // `finish_reason=length` 由客户端自行续写/压缩。
         let base = prompt_ids.len().max(cached_hit);
-        let max_new = match budget_clamp(base, max_new, self.cfg.max_seq_tokens) {
+        let max_new = match budget_clamp(base, max_new, self.boot.cfg.max_seq_tokens) {
             Ok(m) => {
                 if m != max_new {
                     owl_shared::log_warn!(
@@ -829,7 +647,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         "预算收缩: prompt {} + 生成 {} > max_seq {} ⇒ 生成长度收缩到 {} tokens",
                         prompt_ids.len(),
                         max_new,
-                        self.cfg.max_seq_tokens,
+                        self.boot.cfg.max_seq_tokens,
                         m
                     );
                 }
@@ -843,7 +661,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     "submit: prompt {} + 生成 {} 超预算 {}",
                     prompt_ids.len(),
                     max_new,
-                    self.cfg.max_seq_tokens
+                    self.boot.cfg.max_seq_tokens
                 )));
             }
         };
@@ -1013,14 +831,10 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// **H5 空转整理的触发节拍**(每 N 次空转 pump 整理一次)。
     ///
-    /// 常量而非 env:引擎零 env 读取纪律(env 是隐式依赖);将来若要可调,
-    /// 走 `EngineKnobs` 显式配置字段。
-    const IDLE_HK_EVERY: u64 = 16;
-
-    /// 空转期池缓存回收的最小间隔(空转 pump 很密;500ms 足够让 turn 收尾的
-    /// 大额临时块真正 free 之后再清一次)。
-    const IDLE_TRIM_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
-
+    /// 常量而非 env:引擎零 env 读取纪律(env 是隐式依赖);判据已随字段
+    /// 迁入 [`crate::housekeeping::Housekeeping`](节拍与计数同屋),这里不再
+    /// 重复声明。
+    ///
     /// **统一节点入口**(store 立案 §三.A / §五.2;步 4 收编)。
     ///
     /// 纪律:节点只做三件事 —— ①按节点算需求 ②`store.plan` 取计划 ③`apply_verdict`
@@ -1074,7 +888,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 let freed = self.trim_pools().await;
                 // 让**紧随其后的 Idle 出口**再清一次:turn 收尾路径里还有一批
                 // 大额临时块是在 TurnEnd 之后才 free 的(实测 peer 3.0 GiB)。
-                self.last_trim = None;
+                self.hk.expire_trim();
                 for (rank, r) in freed {
                     match r {
                         Ok(0) => {}
@@ -1133,7 +947,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         if owl_shared::vram::total_bytes() == 0 {
             return None;
         }
-        let reserve = (self.cfg.knobs.vram_reserve_mb as u64) << 20;
+        let reserve = (self.boot.cfg.knobs.vram_reserve_mb as u64) << 20;
         let target = reserve.saturating_mul(2).max(1 << 30);
         if free >= target {
             return None;
@@ -1145,8 +959,7 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// **H5 空转制的节拍推进**(Idle pump 计数;每 N 拍调 `node(Node::Idle)` 一次)
     fn idle_tick(&mut self) -> Option<usize> {
-        self.idle_pumps = self.idle_pumps.wrapping_add(1);
-        if !self.idle_pumps.is_multiple_of(Self::IDLE_HK_EVERY) {
+        if !self.hk.note_idle_pump() {
             return None;
         }
         let total = self.bank.rel.leg.slots_total();
@@ -1268,7 +1081,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
-        self.dev.env.phase = p;
+        self.dev.set_phase(p);
         self.dev.graphs.set_phase(p);
     }
 
@@ -1291,7 +1104,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 块不算省槽**(回灌时照样占槽,少算就是回灌 Exhausted)。
     fn step_need(&mut self) -> Result<owl_store::Need> {
         use owl_store::NeedWhy;
-        let page = self.dev.pool.page.max(1);
+        let page = self.dev.pool.geom.page.max(1);
         let slots_for = |tokens: usize| tokens.div_ceil(page);
         // ① 待准入(队列 front)**且无活跃**:准入即要覆盖整个 prompt。
         // (有活跃时它只是排队 —— 准入需求留给 admission_gate,不许把
@@ -1318,12 +1131,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             let target = match Self::prefill_step_chunk(
                 act.fed,
                 act.prompt_ids.len(),
-                self.cfg.prefill_chunk,
-                self.cfg.knobs.prefill_tail_merge,
+                self.boot.cfg.prefill_chunk,
+                self.boot.cfg.knobs.prefill_tail_merge,
                 Self::prefill_align_page(
-                    self.cfg.knobs.prefill_align_tail,
-                    self.cfg.knobs.prefix_cache,
-                    self.dev.pool.page,
+                    self.boot.cfg.knobs.prefill_align_tail,
+                    self.boot.cfg.knobs.prefix_cache,
+                    self.dev.pool.geom.page,
                 ),
             ) {
                 Some(chunk) => act.fed + chunk,
@@ -1641,7 +1454,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // **只在真的能起 turn 时判**(无活跃 turn)。有活跃 turn 时队首只是在
         // 等位 —— 此刻"池被活跃面占着"是常态(它马上会退成缓存),照判会
         // 把正常排队的第二个请求误拒。准入 = "谁能**开始**"。
-        if self.turns.active.len() >= self.cfg.knobs.max_batch.max(1) {
+        if self.turns.active.len() >= self.boot.cfg.knobs.max_batch.max(1) {
             return Ok(());
         }
         self.sync_pool_account()?;
@@ -1650,7 +1463,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 t.id,
                 // 上界 = prompt + 生成长度 + spec 深度(安全方向:多算只是多腾几个槽)
                 t.prompt_ids.len() + t.spec.max_new + self.dev.spec_rt.depth,
-                t.opts.dense_floor.unwrap_or(self.cfg.knobs.dense_floor),
+                t.opts.dense_floor.unwrap_or(self.boot.cfg.knobs.dense_floor),
             )
         }) else {
             return Ok(());
@@ -1658,9 +1471,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         // **per-turn 地板的上限校验**(A7-bis):视图只能保持"本档工作集"那么多页
         // 常驻 ⇒ 请求地板 > 工作集 = 承诺无法兑现 ⇒ **响亮拒**(不静默夹）。
         // 只有 ctx 长度到了这里才知道,所以校在这里而不是 submit 处。
-        let page = self.dev.pool.page.max(1);
+        let page = self.dev.pool.geom.page.max(1);
         let page_bytes = self.dev.pool.block_bytes().max(1);
-        let ws_pages = self.cfg.knobs.select_blocks.max(1);
+        let ws_pages = self.boot.cfg.knobs.select_blocks.max(1);
         let req_pages = floor.floor_pages(ctx_tokens, page);
         if !floor.is_strict() && req_pages > ws_pages {
             let reason = format!(
@@ -1695,7 +1508,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 };
                 let waited = started.elapsed().as_millis() as u64;
                 // `>=`:上限 0 = 立刻按拒处理(不许"等 0 毫秒"变成再等一轮)
-                if waited >= self.cfg.knobs.admission_max_wait_ms() {
+                if waited >= self.boot.cfg.knobs.admission_max_wait_ms() {
                     self.reject_queued_turn(
                         turn_id,
                         format!("准入拒绝：排队 {waited}ms 仍无法腾位（{reason}）"),
@@ -1835,7 +1648,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         if tokens.is_empty() || !self.bank.rel.disk_enabled() {
             return Ok(());
         }
-        let page = self.dev.pool.page.max(1);
+        let page = self.dev.pool.geom.page.max(1);
         let full = tokens.len() / page;
         if full == 0 {
             return Ok(());
@@ -2213,6 +2026,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         // ② 回灌(Verdict.in_:逐条一条命令;H4 的批量形态在 execute_begin)
         let t_stage = std::time::Instant::now();
+        let mut moved_blocks = 0usize;
+        let mut moved_bytes = 0usize;
         for chain in &verdict.in_ {
             let (cs, slots, pieces, table) = {
                 match owl_store::plan_onload(&mut self.bank.rel.leg, std::slice::from_ref(chain)) {
@@ -2231,12 +2046,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                 }
             };
             let _ = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &slots, table)?;
-            self.stage.blocks += cs.len();
-            self.stage.bytes += cs.len() * self.dev.pool.block_bytes();
-            self.stage.from_verdict += cs.len();
+            moved_blocks += cs.len();
+            moved_bytes += cs.len() * self.dev.pool.block_bytes();
             a.onloaded += 1;
         }
-        self.stage.nanos += t_stage.elapsed().as_nanos() as u64;
+        self.sel.note_stage_in(
+            moved_blocks,
+            moved_bytes,
+            t_stage.elapsed().as_nanos() as u64,
+            crate::select::StageSrc::Verdict,
+        );
         Ok(a)
     }
 
@@ -2290,8 +2109,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             //
             // **日志限流**(2026-10-19;压力节点每拍都跑 ⇒ 不限流必刷屏):
             // 首条 + 每 64 条打一次,带累计数;计数本身逐次入 metrics,不丢。
-            self.degrade_seen = self.degrade_seen.saturating_add(1);
-            let n = self.degrade_seen;
+            let n = self.hk.note_degrade();
             if n == 1 || n.is_multiple_of(64) {
                 owl_shared::log_warn!(
                     "store",
@@ -2335,7 +2153,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         if let Some(ev) = self.turns.pending_events.pop_front() {
             return Ok(ev);
         }
-        let prof = self.cfg.knobs.probes.step_profile;
+        let prof = self.boot.cfg.knobs.probes.step_profile;
         // P2.2 侦察(2026-10-19):pump 内分段墙钟(pop-events / 头 / sched / exec / 尾)
         let t_ph0 = prof.then(std::time::Instant::now);
         // metrics 框架接线(2026-10-01 合并示范):schedule 分相计时入
@@ -2375,14 +2193,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         let t_sc1 = prof.then(std::time::Instant::now); // schedule 之后
         if let Some(ts) = t_sched {
             let d = ts.elapsed();
-            self.sched_acc_ns += d.as_nanos() as u64;
-            self.sched_cnt += 1;
-            if self.sched_cnt.is_multiple_of(16) {
+            if let Some((n, avg_ms, last_ms)) = self.hk.note_sched(d) {
                 owl_shared::log_info!("sched", "n={} avg={:.2}ms last={:.2}ms loophead={:.3}ms",
-                    self.sched_cnt,
-                    self.sched_acc_ns as f64 / self.sched_cnt as f64 / 1e6,
-                    d.as_secs_f64() * 1e3,
-                    loophead_ms
+                    n, avg_ms, last_ms, loophead_ms
                 );
             }
         }
@@ -2412,11 +2225,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // `Node::Idle`(每 16 拍)到不了 ⇒ 在这里按时间节流清一次。
                 // `RELEASE_THRESHOLD=∞` 下 turn 收尾后 free 的 GB 级临时块
                 // 不主动还驱动就永远占着(实测 peer 侧 3.0 GiB)。
-                let due = self
-                    .last_trim
-                    .is_none_or(|t| t.elapsed() >= Self::IDLE_TRIM_EVERY);
+                let due = self.hk.trim_due();
                 if due {
-                    self.last_trim = Some(std::time::Instant::now());
+                    self.hk.mark_trim();
                     // 先排空再清:异步 free 要等流上事件落地才进池的"空闲页"表
                     for (rank, r) in [
                         (0u8, self.dev.graphs.session.face_mut().sync().await),
@@ -2473,7 +2284,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         // 性能面:相位定相 + 包络 span(perf-framework.md §四)。
                         // 引擎 actor = current_thread 运行时 ⇒ 单线程栈配对安全;
                         // 解释器节点钩子按 env.phase 打 tag,两者同源。
-                        let saved = self.dev.env.phase;
+                        let saved = self.dev.phase();
                         self.set_phase(owl_models::env::EvalPhase::Prefill);
                         owl_shared::timer_start!("engine.phase.prefill");
                         let r = self.execute_prefill(chunk_ids, base, is_last).await;
@@ -2482,7 +2293,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         r
                     }
                     StepAction::Decode { token, pos, kv_slot, gdn_slot, grew } => {
-                        let saved = self.dev.env.phase;
+                        let saved = self.dev.phase();
                         self.set_phase(owl_models::env::EvalPhase::Decode);
                         owl_shared::timer_start!("engine.phase.decode");
                         let t_ex0 = t_ph0.map(|_| std::time::Instant::now());
@@ -2503,7 +2314,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         r
                     }
                     StepAction::BatchDecode { rows } => {
-                        let saved = self.dev.env.phase;
+                        let saved = self.dev.phase();
                         self.set_phase(owl_models::env::EvalPhase::Decode);
                         owl_shared::timer_start!("engine.phase.batch");
                         let n = rows.len();
@@ -2516,7 +2327,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         r
                     }
                     StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew } => {
-                        let saved = self.dev.env.phase;
+                        let saved = self.dev.phase();
                         self.set_phase(owl_models::env::EvalPhase::Spec);
                         owl_shared::timer_start!("engine.phase.spec");
                         let r =

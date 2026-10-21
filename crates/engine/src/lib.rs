@@ -41,6 +41,9 @@ pub(crate) mod engine;
 pub(crate) mod disk_io;
 pub(crate) mod exec;
 pub(crate) mod graph_fleet;
+// **状态域户**(2026-10-21 收户):选择层运行态 / 保洁账 —— 字段私有,
+// 只经语义方法读写(见各模块头)。
+pub(crate) mod housekeeping;
 pub(crate) mod loader;
 pub(crate) mod prefill_plan;
 pub(crate) mod running;
@@ -50,6 +53,7 @@ pub(crate) mod sampler;
 #[allow(dead_code)]
 pub(crate) mod sched_policy;
 pub(crate) mod scheduler;
+pub(crate) mod select;
 pub(crate) mod spec_runtime;
 pub(crate) mod state;
 pub(crate) mod tp;

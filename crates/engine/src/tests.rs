@@ -350,7 +350,7 @@ async fn turn_records_session_ownership_for_kv_and_snaps() {
         }
     }
     let toks = running.tokenize(&prompt, true).expect("tokenize").tokens;
-    let page = running.dev.pool.page.max(1);
+    let page = running.dev.pool.geom.page.max(1);
     let full = toks.len() / page;
     assert!(full >= 2, "prompt 应覆盖至少两块");
     let tail = running
@@ -714,7 +714,7 @@ pub async fn gpu_schedule_decision_surface() {
         act.out.push(7);
     }
 
-    let page = eng.dev.pool.page;
+    let page = eng.dev.pool.geom.page;
     match eng.schedule().unwrap() {
         SchedulerOutput::Step { begin, action } => {
             assert!(begin.is_none());
@@ -1102,11 +1102,12 @@ async fn coverage_run_and_report<D: DeviceClient>(
         }
     }
     let rep = running
-        .cov_last
-        .clone()
+        .sel
+        .cov_last()
+        .cloned()
         .expect("覆盖率探针无观测:prompt 未跨块边界 / coverage_probe 未开?");
     eprintln!("[cov] {}", rep.line());
-    eprintln!("[cov] {}", running.prof.line());
+    eprintln!("[cov] {}", running.sel.prof().line());
     let pairs: Vec<(usize, f32, f32)> = (0..rep.blocks)
         .map(|i| {
             let m = rep.mass.get(i).copied().unwrap_or(0.0);
@@ -1337,14 +1338,14 @@ async fn select_decode_scenario() {
                 _ => {}
             }
         };
-        let partial = running.partial;
+        let partial = running.sel.partial();
         (
-            running.select_view_steps,
-            running.sel_view_fallback,
+            running.sel.view_steps(),
+            running.sel.view_fallbacks(),
             partial,
             running
-                .cov_last
-                .as_ref()
+                .sel
+                .cov_last()
                 .map(|r| (r.recall.view_pages, r.recall.coverage, r.recall.materialize_ratio))
                 .unwrap_or((0, 0.0, 0.0)),
             text,
@@ -1664,7 +1665,7 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
         running.bank.rel.leg.report().ops.offload_bytes >> 10,
         rep2.kv.slots_free
     );
-    let _stage_before = running.stage.blocks;
+    let _stage_before = running.sel.stage().blocks;
     // ③ 会话 3:原 prompt 再召回 ⇒ 回灌
     {
         let (_, tid) = running.submit_session(Some(3), p1, 4).expect("submit");
@@ -1678,7 +1679,7 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
         }
     }
     let rep3 = running.store_report();
-    let st = running.stage;
+    let st = running.sel.stage();
     eprintln!("[b3e] {}", st.line());
     eprintln!(
         "[b3e] 轮 3 后:回灌 {} 次/{}KiB(命中面复用)· 宿主仍驻留 {:.2}MiB",
@@ -1855,30 +1856,30 @@ async fn select_27b_scenario() {
     if let Some(ttft) = ttft {
         let secs = ttft.as_secs_f64().max(1e-6);
         let n = prompt_tok.max(1);
-        let bnd = running.prof.boundaries.max(1);
+        let bnd = running.sel.boundaries().max(1);
         eprintln!(
             "[b5-27b] prefill: {n} tok / {secs:.2}s = **{:.0} tok/s** · 边界 {bnd} 次 · \
              平均 {:.0} ms/边界(B 轴 {:.0} ms/边界)",
             n as f64 / secs,
             secs * 1000.0 / bnd as f64,
-            running.prof.total_ms / bnd as f64
+            running.sel.prof().total_ms / bnd as f64
         );
     }
     let rep = running.store_report();
-    let st = running.stage;
-    let pt = running.partial;
-    let rec = running.cov_last.as_ref().map(|r| r.recall.clone()).unwrap_or_default();
+    let st = running.sel.stage();
+    let pt = running.sel.partial();
+    let rec = running.sel.cov_last().map(|r| r.recall.clone()).unwrap_or_default();
     eprintln!(
         "[b5-27b] 用时 {:.1}s · 视图步 {} · 回退 {} · 召回 {} 页(覆盖 {:.1}% 物化 {:.1}%)",
         t0.elapsed().as_secs_f32(),
-        running.select_view_steps,
-        running.sel_view_fallback,
+        running.sel.view_steps(),
+        running.sel.view_fallbacks(),
         rec.view_pages,
         rec.coverage * 100.0,
         rec.materialize_ratio * 100.0
     );
     eprintln!("[b5-27b] {} · {}", pt.line(), st.line());
-    eprintln!("[b5-27b] {}", running.prof.line());
+    eprintln!("[b5-27b] {}", running.sel.prof().line());
     eprintln!(
         "[b5-27b] 池 {}/{} 槽自由 · 宿主 KV 驻留 {:.2}GiB · 下沉 {} 次 {}GiB",
         rep.kv.slots_free,
@@ -1889,8 +1890,8 @@ async fn select_27b_scenario() {
     );
     eprintln!("[b5-27b] 输出({} 字):{}", text.chars().count(), text);
     assert!(pt.sunk > 0, "池 < ctx 却没下沉 ⇒ 池没被压到(超卖档没生效)");
-    assert!(running.select_view_steps > 0, "视图没驱动 decode");
-    assert_eq!(running.sel_view_fallback, 0, "视图回退(占位符/视图缺位?)");
+    assert!(running.sel.view_steps() > 0, "视图没驱动 decode");
+    assert_eq!(running.sel.view_fallbacks(), 0, "视图回退(占位符/视图缺位?)");
     assert!(text.chars().count() >= 4, "输出退化");
 }
 
@@ -1970,7 +1971,7 @@ fn offload_probe_config(ordinal: usize) -> EngineConfig {
 /// **store 演示台场景体(face 无关)** —— GPU 真卡档与 CPU mock 档**共用同一份
 /// 断言**(三门口 + 兜底驱逐 + 批面):§18 的 mock 价值就在"同一门"上。
 async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
-    // prompt 先算好(借用 `running.tok` 只在这里一次;下面要 &mut *running)
+    // prompt 先算好(借用 `running.boot.tok` 只在这里一次;下面要 &mut *running)
     let mk = |i: usize, target: usize| -> String {
         let mut body = String::new();
         let mut k = 0usize;
@@ -2015,7 +2016,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     // **27B 的真实几何**(16 全注意力层 × hkv4 × hd256 × 页 32 ⇒ 每块 ≈ 2.1MiB)
     // 与 W=64 的工作集,看是否同量级。
     {
-        let st = running.stage;
+        let st = running.sel.stage();
         eprintln!("[b3e] {}", st.line());
         let bpb27 = 16 * 32 * 4 * 256 * 2 * 2; // 每块 K+V 字节(27B)
         let wset = 64usize;
@@ -2041,8 +2042,8 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     // 本诊断此前正是踩了这个假现场,见设计卷 §16)。
     {
         let mut diag = |tag: &str, p: &str| {
-            let wrapped = running.tok.chat_wrap(p);
-            let ids = running.tok.encode(&wrapped);
+            let wrapped = running.boot.tok.chat_wrap(p);
+            let ids = running.boot.tok.encode(&wrapped);
             let hit = running.bank.rel.leg.match_prefix(&ids).expect("match");
             let rows: Vec<String> = hit
                 .hashes
@@ -2190,15 +2191,15 @@ pub async fn gpu_08b_budget_probe() {
     let (nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged) = {
         let pool = &running.dev.pool;
         (
-            pool.nb,
-            pool.nb_kv,
-            pool.page,
-            pool.kvs.len(),
+            pool.geom.nb,
+            pool.geom.nb_kv,
+            pool.geom.page,
+            pool.kvs().len(),
             pool.gdn_count(),
-            pool.kv_fp8,
-            pool.gdn_slots,
+            pool.geom.kv_fp8,
+            pool.geom.gdn_slots,
             pool.snap_capacity(),
-            pool.paged,
+            pool.geom.paged,
         )
     };
     let (block_bytes, gdn_row_bytes) = {
@@ -2535,14 +2536,14 @@ pub async fn gpu_longctx_4k_prefix_qa(shared: Option<&mut RunningEngine<crate::G
         }
         let cand = format!("{body}{}", filler(i));
         let full = format!("{cand}{question}");
-        if running.tok.encode(&full).len() + 32 > seq {
+        if running.boot.tok.encode(&full).len() + 32 > seq {
             break; // 留 32 token 生成余量(turn2 预算同享)
         }
         body = cand;
         i += 1;
     }
     let prompt_t1 = format!("{body}{question}");
-    let n_tok = running.tok.encode(&prompt_t1).len();
+    let n_tok = running.boot.tok.encode(&prompt_t1).len();
     eprintln!("[test] 长 ctx prompt = {n_tok} tok(填充 {i} 条)");
     assert!(
         nofill || n_tok > seq * 4 / 5,
@@ -2668,14 +2669,14 @@ pub async fn gpu_longctx_fi_direct_gate() {
         let mut i = 0usize;
         loop {
             let cand = format!("{body}{}", filler(i));
-            if running.tok.encode(&format!("{cand}{question}")).len() + 32 > seq {
+            if running.boot.tok.encode(&format!("{cand}{question}")).len() + 32 > seq {
                 break; // 留 32 token 生成余量
             }
             body = cand;
             i += 1;
         }
         let prompt = format!("{body}{question}");
-        let n_tok = running.tok.encode(&prompt).len();
+        let n_tok = running.boot.tok.encode(&prompt).len();
         assert!(n_tok > seq * 4 / 5, "长文应填满窗口 ≥80%,得 {n_tok}/{seq}");
         let t0 = std::time::Instant::now();
         let (_, t) = running
@@ -2881,7 +2882,7 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
     // prompt 要够长(短 prompt 一个整块都没有,判据会退化成空集)。
     let mut a_body = String::from("请记住下面的清单:");
     let mut i = 0usize;
-    while running.tok.encode(&a_body).len() < 80 {
+    while running.boot.tok.encode(&a_body).len() < 80 {
         a_body.push_str(&format!("第{i}则:信号强度{i}级。"));
         i += 1;
     }
@@ -2893,7 +2894,7 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
     let a_len_1 = running.session_len(101).expect("A 账在");
     assert!(a_len_1 > 0, "A 账本非空");
     // 判据 = 内容身份面:A 的链在缓存里(≥1 整块),且 B 的 turn 不动它。
-    let a_tokens: Vec<u32> = running.tok.encode(&running.tok.chat_wrap(a_prompt.as_str()));
+    let a_tokens: Vec<u32> = running.boot.tok.encode(&running.boot.tok.chat_wrap(a_prompt.as_str()));
     let a_hit_1 = running.bank.rel.leg.match_prefix(&a_tokens).expect("A 命中查询");
     assert!(a_hit_1.matched_blocks >= 1, "A 的历史应进缓存(内容身份)");
 
@@ -2913,8 +2914,9 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
     assert_eq!(running.session_len(101), Some(a_len_1), "B 的 turn 不得扰动 A 账本");
     // 隔离断言 ②:身份零串味(两段内容不同 ⇒ 链哈希不相交)
     let b_tokens: Vec<u32> = running
+        .boot
         .tok
-        .encode(&running.tok.chat_wrap("我的代号是贝塔。"));
+        .encode(&running.boot.tok.chat_wrap("我的代号是贝塔。"));
     let b_hit = running.bank.rel.leg.match_prefix(&b_tokens).expect("B 命中查询");
     assert!(
         b_hit.hashes.iter().all(|h| !a_hit_2.hashes.contains(h)),
@@ -2973,14 +2975,14 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFa
     };
     let mut body = String::from(marker);
     let mut i = 0usize;
-    while running.tok.encode(&format!("{body}{}", filler(i))).len() < 300 {
+    while running.boot.tok.encode(&format!("{body}{}", filler(i))).len() < 300 {
         body = format!("{body}{}", filler(i));
         i += 1;
     }
     let prompt_a = format!("{body}清单结束。按约定,暗号重复一遍:暗号是「");
     let prompt_b = format!("{body}这次换个问题:暗号里出现了什么动物?");
-    let n_a = running.tok.encode(&prompt_a).len();
-    let n_b = running.tok.encode(&prompt_b).len();
+    let n_a = running.boot.tok.encode(&prompt_a).len();
+    let n_b = running.boot.tok.encode(&prompt_b).len();
     eprintln!("[test] A prompt = {n_a} tok / B prompt = {n_b} tok(前缀共享)");
 
     let t0 = std::time::Instant::now();
@@ -3040,8 +3042,8 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFa
     // **S2(§25.1①)改判据**:会话在 turn 止**不持设备表**(历史 = 纯缓存)
     // ⇒ "物理共享"不再能从会话表读出(`block_table` 此时是空的);改为判
     // **内容身份共享**:同一份缓存块被两条链复用(这才是复用的真身)。
-    let a_ids = running.tok.encode(&running.tok.chat_wrap(prompt_a.as_str()));
-    let b_ids = running.tok.encode(&running.tok.chat_wrap(prompt_b.as_str()));
+    let a_ids = running.boot.tok.encode(&running.boot.tok.chat_wrap(prompt_a.as_str()));
+    let b_ids = running.boot.tok.encode(&running.boot.tok.chat_wrap(prompt_b.as_str()));
     let hit_a = running.bank.rel.leg.match_prefix(&a_ids).expect("A 命中查询");
     let hit_b = running.bank.rel.leg.match_prefix(&b_ids).expect("B 命中查询");
     let shared = hit_b.hashes.iter().filter(|h| hit_a.hashes.contains(h)).count();
@@ -4615,7 +4617,7 @@ async fn queue_bound_rejects_at_submit() {
         Ok(_) => panic!("在飞已达上限 2，第 3 个应被拒"),
     }
     // 无界档（max_queue=0）不拒 —— 旧行为不变
-    running.cfg.knobs.max_queue = 0;
+    running.boot.cfg.knobs.max_queue = 0;
     running.submit_session(Some(4), p, 8).expect("无界档不拒");
 }
 
@@ -4676,8 +4678,8 @@ pub async fn gpu_vlm_image_baseline() {
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载 0.8B+VLM");
     let mut running = engine.run(loaded).await.expect("装配");
 
-    let img_tok = running.dev.vlm.as_ref().expect("VLM 装配").cfg().image_token;
-    let n_img = match running.tok.try_encode("<|image_pad|>").expect("encode").as_slice() {
+    let img_tok = running.dev.boot.vlm.as_ref().expect("VLM 装配").cfg().image_token;
+    let n_img = match running.boot.tok.try_encode("<|image_pad|>").expect("encode").as_slice() {
         [one] => *one,
         other => panic!("<|image_pad|> 应恰 1 token,得 {other:?}"),
     };
@@ -4714,7 +4716,7 @@ pub async fn gpu_vlm_image_baseline() {
     // **用家族模板包装**(含 `<|im_start|>` ⇒ submit 不再二次 wrap):
     // 裸拼 ChatML 少 `<|im_end|>`/`assistant` 头 ⇒ 模型只会续写垃圾
     // (实测 "!4444444")—— 门要看"图有没有被看见",不是看拼装的脾气。
-    let prompt = running.tok.chat_wrap(&format!(
+    let prompt = running.boot.tok.chat_wrap(&format!(
         "<|vision_start|>{}<|vision_end|>请用一句话说明你看到了什么。",
         "<|image_pad|>".repeat(l_img)
     ));
@@ -4755,7 +4757,7 @@ pub async fn gpu_vlm_image_baseline() {
             grid: (1, 4, 4),
         };
         let l_small = 4usize;
-        let prompt = running.tok.chat_wrap(&format!(
+        let prompt = running.boot.tok.chat_wrap(&format!(
             "<|vision_start|>{}<|vision_end|>请用一句话说明你看到了什么。",
             "<|image_pad|>".repeat(l_small)
         ));
@@ -4835,11 +4837,11 @@ pub async fn gpu_vlm_first_turn_probe(first_image: bool) {
         "<|vision_start|>{}<|vision_end|>",
         "<|image_pad|>".repeat(l_img)
     );
-    let sys_img = running.tok.chat_format().render_chat(
+    let sys_img = running.boot.tok.chat_format().render_chat(
         &[("system", "你是助手,按约定回答。"), ("user", &format!("{img_part}{q}"))],
         false,
     );
-    let sys_text = running.tok.chat_format().render_chat(
+    let sys_text = running.boot.tok.chat_format().render_chat(
         &[("system", "你是助手,按约定回答。"), ("user", q)],
         false,
     );
@@ -4937,7 +4939,7 @@ pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
     let mut running = engine.run(loaded).await.expect("装配");
     eprintln!("[f1-27b] 装载+装配 {:?}", t0.elapsed());
     assert!(
-        running.dev.vlm.is_some(),
+        running.dev.boot.vlm.is_some(),
         "[model].vision = true 必须有视觉塔(27B)")
     ;
 
@@ -4953,11 +4955,11 @@ pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
         "<|vision_start|>{}<|vision_end|>",
         "<|image_pad|>".repeat(l_img)
     );
-    let sys_img = running.tok.chat_format().render_chat(
+    let sys_img = running.boot.tok.chat_format().render_chat(
         &[("system", "你是助手,按约定回答。"), ("user", &format!("{img_part}{q}"))],
         false,
     );
-    let sys_text = running.tok.chat_format().render_chat(
+    let sys_text = running.boot.tok.chat_format().render_chat(
         &[("system", "你是助手,按约定回答。"), ("user", q)],
         false,
     );

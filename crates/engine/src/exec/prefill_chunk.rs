@@ -302,9 +302,9 @@ pub(crate) struct ChunkHost<'a> {
     pub(crate) gdn_slot: usize,
     /// host 账房(草稿臂;peer 路 None)
     pub(crate) bank: Option<&'a mut SessionBank>,
-    /// **B 轴诊断账**(host 单份;peer 路 None —— 覆盖率探针只在主 rank 采集)
-    pub(crate) prof: Option<&'a mut crate::running::BAxisProfile>,
-    pub(crate) cov: Option<&'a mut Option<crate::exec::coverage::CoveragePending>>,
+    /// **B 轴运行态**(host 单份;peer 路 None —— 覆盖率探针只在主 rank 采集)。
+    /// 探针要的 `(prof, cov)` 通过 `analysis_pair()` 一次借出。
+    pub(crate) sel: Option<&'a mut crate::select::SelectRuntime>,
     /// **部分驻留的子集页链**(host 半算好传入:`past_view_of` 依赖
     /// `knobs.select_partial` 与 `sel_view` —— 都是 host 面)
     pub(crate) past_view: Option<(Vec<u32>, usize)>,
@@ -363,7 +363,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         if host.vlm.is_some() {
             return Ok(None);
         }
-        if !self.pool.paged || self.graphs.prefill.is_empty() {
+        if !self.pool.geom.paged || self.graphs.prefill.is_empty() {
             return Ok(None);
         }
         // 命中判定(向上取整;槽不匹配/未捕获都在 `usable` 里结构化拒)
@@ -422,10 +422,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             base,
             t,
             t_pad,
-            self.pool.page,
+            self.pool.geom.page,
             bt_chain,
             gdn_slot_v,
-            self.pool.fi_face,
+            self.pool.geom.fi_face,
             dump_slot,
         )?;
         // 注:FI 四件在**图路**走输入槽(`BucketGraph::replay` 里按布局长度装填)
@@ -462,7 +462,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // (桶捕获时同一值 —— 该 key 在 capture warmup 已算好并登记 graph_owned)。
         // `fi_plan_restore = true`(缺省)时整段跳过:桶图自携表,旧行为逐字节不变。
         if bg.needs_plan_sync {
-            let d = self.pool.dims;
+            let d = self.pool.geom.dims;
             let spec = owl_iface::contract::FiPlanSpec {
                 t: t_pad,
                 // **本块的真实 ctx 上界**(= 本块末 token 的绝对位置;与 decode/verify
@@ -473,7 +473,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 hq: d.hq,
                 hkv: d.hkv,
                 hd: d.hd,
-                page: self.pool.page,
+                page: self.pool.geom.page,
             };
             bg.plan.face_mut().fi_plan_sync(spec).await?;
         }
@@ -511,7 +511,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         base: usize,
         is_last: bool,
     ) -> Result<Option<PrefillTail>> {
-        let d = self.pool.dims;
+        let d = self.pool.geom.dims;
         let d_model = d.hidden;
         let hidden = TensorOps::of_block(root.id, d.dtype, vec![t, d_model]);
         let hidden = &hidden;
@@ -549,18 +549,20 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             .arg_usize(d_model)
             .with_shape(d.dtype, vec![1, d_model]);
         let (hb, arena2) = {
+            let env = self.env();
             let face = self.graphs.session.face_mut();
-            eval_ops_scoped_env(last.step(), face, self.env, self.tp.as_ref()).await?
+            eval_ops_scoped_env(last.step(), face, env, self.boot.tp.as_ref()).await?
         };
         let hb_view = TensorOps::of_block(hb.id, d.dtype, vec![1, d_model]);
         // P1.1:stride = 本 rank logits 宽(词表切档 = 半表;半表档 token 只是局部
         // argmax —— 消费面在 `harvest_prefill` 用拼接后的全表重算)
-        let vocab = self.model.logits_vocab();
+        let vocab = self.boot.model.logits_vocab();
         let (b, arena3) = {
+            let env = self.env();
             let face = self.graphs.session.face_mut();
-            let logits = self.model.embed.lm_head_matmul(&hb_view);
+            let logits = self.boot.model.embed.lm_head_matmul(&hb_view);
             let tok = owl_models::ops::argmax_f32idx(&logits, vocab, 0);
-            eval_ops_scoped_env(tok.step(), face, self.env, self.tp.as_ref()).await?
+            eval_ops_scoped_env(tok.step(), face, env, self.boot.tp.as_ref()).await?
         };
         if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
             let sid = host.sid;
@@ -587,7 +589,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
     /// rank,否则"单卡 vs 双卡"对拍拿到的是混合值(2026-10-17 实测踩到)。
     /// 单卡档恒 0(与历史 tag 语义等价)。
     fn tp_rank(&self) -> usize {
-        self.tp.as_ref().map(|t| t.plan.rank()).unwrap_or(0)
+        self.boot.tp.as_ref().map(|t| t.plan.rank()).unwrap_or(0)
     }
 
     /// fin 校验(dtoh 一块 hidden 打点):`pf_fin_check` 走 FNV 指纹(mfact),
@@ -663,7 +665,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
     ) -> Result<Option<PrefillTail>> {
         let t_chunk = std::time::Instant::now();
         let mut t_ext = std::time::Duration::ZERO;
-        let d = self.pool.dims;
+        let d = self.pool.geom.dims;
         let t = ids.len();
         // E2b:活跃会话块链 + GDN 格(逻辑位 → 物理槽由块表换算)
         // 块链/gdn 槽 = 主机侧事实(唯一取值点:调用方从账房取好传入)
@@ -691,12 +693,12 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             ids,
             base,
             t,
-            self.pool.paged,
-            self.pool.page,
+            self.pool.geom.paged,
+            self.pool.geom.page,
             &bt_chain,
             gdn_slot_v,
-            self.pool.fi_face,
-            self.env.attn.xqa_prefill,
+            self.pool.geom.fi_face,
+            self.env().attn.xqa_prefill,
             past_view.as_ref().map(|(pages, tokens)| (pages.as_slice(), *tokens)),
         )?;
         // **B-3e-2 第 3 项**:子集档 ⇒ 把本 chunk 的"过去表"写进池里的视图块,
@@ -817,8 +819,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // 缺省两门全关 ⇒ 槽恒 None、零开销。
         let cov_sink: Option<crate::exec::coverage::QSink> = ((host.knobs.coverage_probe
             || host.knobs.select_decode)
-            && self.pool.paged
-            && (base + t).is_multiple_of(self.pool.page))
+            && self.pool.geom.paged
+            && (base + t).is_multiple_of(self.pool.geom.page))
         .then(|| crate::exec::coverage::QSink::new(Vec::new()));
         // ── XQA prefill 表件(`dispatch.xqa_prefill`;缺省关)──
         // 三张 U32 位型表(页链/整请求长/因果位掩码)与 FI 四件套同路:
@@ -828,7 +830,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // semaphores/scratch 两件取池里的真块:单块几何(`XqaPrefillRuntime`
         // 强制 `nbSubSeq=1`)下核**结构上不解引用**它们,传真块只为"不隐瞒"。
         let xqa_tensors;
-        let xqa_pf = if self.env.attn.xqa_prefill {
+        let xqa_pf = if self.env().attn.xqa_prefill {
             match (self.pool.xqa_ctx(), tb.xqa.as_ref()) {
                 (Some(px), Some(xt)) => {
                     let face = self.graphs.session.face_mut();
@@ -881,7 +883,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             self.graphs.session.face_mut().sync().await?;
         }
         let mut ctx = ForwardCtx::model_prefill(
-            t, &pos_t, &kvs_step, &self.rope, &gdns_step, &slots_leaf, &lens_leaf, &gdn_slot,
+            t, &pos_t, &kvs_step, &self.boot.rope, &gdns_step, &slots_leaf, &lens_leaf, &gdn_slot,
             // A13(2026-10-14):chunked/scalar 臂的 rec 态寻址吃这个 host 标量
             // —— 必须喂本会话真槽(曾恒 0 = 读写别人格 → 长 prompt 塌陷)
             Some(gdn_slot_v),
@@ -942,9 +944,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         if let Some(s) = cov_sink.as_ref() {
             ctx.q_sink = Some(s);
         }
-        ctx.env = self.env;
+        ctx.env = self.env();
         ctx.trace_gate = host.knobs.probes.trace_gate;
-        let _vocab = self.model.vocab_size();
+        let _vocab = self.boot.model.vocab_size();
         // E5-DF4 逐层 bisect(OWL_PF_BISECT;非 dflash 路径):单遍 multi
         // eval 产出 48 层 taps + fin —— **fin 块直接作为主路输出**(bisect
         // 前向有 GDN 状态副作用,双执行会双推进;单执行 + 逐层 checksum
@@ -963,10 +965,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             if pf_state_check {
                 for (j, g) in gdn_leaves.iter().enumerate() {
                     for (sn, buf, nb) in [
-                        ("convq", &g.conv_q, self.pool.gdn_slots * d.nk * d.hk * 3),
-                        ("convk", &g.conv_k, self.pool.gdn_slots * d.nv * d.hv * 3),
-                        ("convv", &g.conv_v, self.pool.gdn_slots * d.nv * d.hv * 3),
-                        ("rec", &g.rec, self.pool.gdn_slots * d.nv * d.hk * d.hv),
+                        ("convq", &g.conv_q, self.pool.geom.gdn_slots * d.nk * d.hk * 3),
+                        ("convk", &g.conv_k, self.pool.geom.gdn_slots * d.nv * d.hv * 3),
+                        ("convv", &g.conv_v, self.pool.geom.gdn_slots * d.nv * d.hv * 3),
+                        ("rec", &g.rec, self.pool.geom.gdn_slots * d.nv * d.hk * d.hv),
                     ] {
                         let mut sb = vec![0u8; nb * 4];
                         {
@@ -982,7 +984,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     }
                 }
             }
-            let _ids_all: Vec<usize> = (0..self.model.layers.len()).collect();
+            let _ids_all: Vec<usize> = (0..self.boot.model.layers.len()).collect();
             // GDN 层内打点(M4 gdn_tap 现成):每 GDN 层 8 件
             // (q/k/v raw + q_n/k_n/v_c/g/beta)→ 定位 qkv-proj/l2norm/conv/gating
             // GDN 层内 8 件打点(gdn_tap)已启用:层六站展开 + 8 件随层带出
@@ -990,7 +992,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             // forward_bisect_stages 随 mixer 调用自然求值,不直挂 multi)
             ctx.gdn_tap = Some(std::rc::Rc::new(std::cell::RefCell::new(Vec::new())));
             let (fin, nodes) =
-                self.model
+                self.boot.model
                     .prefill_bisect(&ids_t, &ctx, pf_stage_layer);
             let mut roots: Vec<TensorOps> = Vec::new();
             let mut names: Vec<String> = Vec::new();
@@ -1002,8 +1004,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             names.push("fin".into());
             let refs: Vec<&TensorOps> = roots.iter().collect();
             let outs = {
+                let env = self.env();
                 let face = self.graphs.session.face_mut();
-                owl_models::interpreters::eval_ops_multi_env(&refs, face, self.env, self.tp.as_ref()).await?
+                owl_models::interpreters::eval_ops_multi_env(&refs, face, env, self.boot.tp.as_ref()).await?
             };
             for (i, r) in roots.iter().enumerate() {
                 let n: usize = r.shape().iter().product();
@@ -1100,10 +1103,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             if pf_state_check {
                 for (j, g) in gdn_leaves.iter().enumerate() {
                     for (sn, buf, nb) in [
-                        ("convq", &g.conv_q, self.pool.gdn_slots * d.nk * d.hk * 3),
-                        ("convk", &g.conv_k, self.pool.gdn_slots * d.nv * d.hv * 3),
-                        ("convv", &g.conv_v, self.pool.gdn_slots * d.nv * d.hv * 3),
-                        ("rec", &g.rec, self.pool.gdn_slots * d.nv * d.hk * d.hv),
+                        ("convq", &g.conv_q, self.pool.geom.gdn_slots * d.nk * d.hk * 3),
+                        ("convk", &g.conv_k, self.pool.geom.gdn_slots * d.nv * d.hv * 3),
+                        ("convv", &g.conv_v, self.pool.geom.gdn_slots * d.nv * d.hv * 3),
+                        ("rec", &g.rec, self.pool.geom.gdn_slots * d.nv * d.hk * d.hv),
                     ] {
                         let mut sb = vec![0u8; nb * 4];
                         {
@@ -1123,7 +1126,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         }
         let _face = self.graphs.session.face_mut();
         // P1.1:同桶图路(stride = 本 rank logits 宽;token 在收割半重算)
-        let vocab = self.model.logits_vocab();
+        let vocab = self.boot.model.logits_vocab();
         if is_last {
             // E3:末行设备 argmax(4B 回读,免 [T,V] 大 dtoh)。
             // E5-M5:树一 = hidden_full 根([T, hidden] 存活 → prefill
@@ -1138,7 +1141,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.spec_rt.dflash_tap_count > 0 {
-                let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
+                let (h, tp) = self.boot.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for t in &tp {
                     c = c.arg(t);
@@ -1157,7 +1160,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     .with_shape(d.dtype, vec![n * t, dd]);
                 (root, Some(tp))
             } else {
-                (self.model.last_hidden(&ids_t, &ctx), None)
+                (self.boot.model.last_hidden(&ids_t, &ctx), None)
             };
             let d_model = hidden_full.shape()[1];
             let ld = live_diag_begin();
@@ -1167,7 +1170,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             // Q 回读(探针档;设备块当场 free;分析在块边界事件后做)
             self.dump_hidden_row(&hfb, base, t, d_model).await?;
             if let Some(qs) = cov_q {
-                if let (Some(pl), Some(pc)) = (host.prof.as_deref_mut(), host.cov.as_deref_mut()) {
+                if let Some(sel) = host.sel.as_deref_mut() {
+                    let (pl, pc) = sel.analysis_pair();
                     self.coverage_take_q(qs, base, t, pl, pc).await?;
                 }
             }
@@ -1222,13 +1226,15 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 .arg_usize(d_model)
                 .with_shape(d.dtype, vec![1, d_model]);
             let (hb, arena2) = {
+                let env = self.env();
                 let face = self.graphs.session.face_mut();
-                eval_ops_scoped_env(last.step(), face, self.env, self.tp.as_ref()).await?
+                eval_ops_scoped_env(last.step(), face, env, self.boot.tp.as_ref()).await?
             };
             let hb_view = TensorOps::of_block(hb.id, d.dtype, vec![1, d_model]);
             let blks = {
+                let env = self.env();
                 let face = self.graphs.session.face_mut();
-                let logits = self.model.embed.lm_head_matmul(&hb_view);
+                let logits = self.boot.model.embed.lm_head_matmul(&hb_view);
                 // 崩坏排查:末行 logits top-2(id+值)——近局翻转判别
                 if host.probes.dflash_probe {
                     let bs_seq = host.boot_seq;
@@ -1273,8 +1279,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 owl_models::interpreters::eval_ops_multi_scoped_env(
                     &trees,
                     face,
-                    self.env,
-                    self.tp.as_ref(),
+                    env,
+                    self.boot.tp.as_ref(),
                 )
                 .await?
             };
@@ -1332,7 +1338,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 _bisect_fin_blk = Some(blk);
                 (decl, None)
             } else if self.spec_rt.dflash_tap_count > 0 {
-                let (h, tp) = self.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
+                let (h, tp) = self.boot.model.tapped_hidden(&ids_t, &ctx, &[5, 19, 33, 47, 61]);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for tt in &tp {
                     c = c.arg(tt);
@@ -1351,7 +1357,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     .with_shape(d.dtype, vec![n * t, dd]);
                 (root, Some((tp, dd)))
             } else {
-                (self.model.last_hidden(&ids_t, &ctx), None)
+                (self.boot.model.last_hidden(&ids_t, &ctx), None)
             };
             let ld = live_diag_begin();
             let r_eval = self.eval_root_and_q(&tree, cov_sink.as_ref()).await;
@@ -1359,7 +1365,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let (b, arena, cov_q) = r_eval?;
             self.dump_hidden_row(&b, base, t, d.hidden).await?;
             if let Some(qs) = cov_q {
-                if let (Some(pl), Some(pc)) = (host.prof.as_deref_mut(), host.cov.as_deref_mut()) {
+                if let Some(sel) = host.sel.as_deref_mut() {
+                    let (pl, pc) = sel.analysis_pair();
                     self.coverage_take_q(qs, base, t, pl, pc).await?;
                 }
             }

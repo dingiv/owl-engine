@@ -7,7 +7,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// `cached_len` 归到**块边界**(缓存里确实还有的整块数 —— 尾块随表释放,
     /// 内容丢,下次重算 ≤ 1 页)。
     pub(crate) fn release_turn_table(&mut self, session_id: u64) -> Result<()> {
-        let page = self.dev.pool.page.max(1);
+        let page = self.dev.pool.geom.page.max(1);
         let mut table = Vec::new();
         if let Some(s) = self.bank.sessions.get_mut(session_id) {
             table = std::mem::take(&mut s.block_table);
@@ -174,14 +174,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             s.commit_turn(&act.prompt_ids, &act.out);
             // E2c:块链登记前缀缓存(缓存持引用;会话释放后块仍驻留)。
             // S3-2:登记走 store 的块腿(引用配对在腿内自洽)
-            if self.dev.pool.paged {
+            if self.dev.pool.geom.paged {
                 // **会话感知**(2026-10-19):链块记到会话名下(淘汰时按会话从末端削)
                 let up = self.bank.rel.leg.register_chain_owned(
                     &s.tokens,
                     &s.block_table,
                     act.session_id,
                 )?;
-                if self.cfg.knobs.probes.debug {
+                if self.boot.cfg.knobs.probes.debug {
                     owl_shared::log_debug!(
                         "dbg prefix",
                         "register_chain: 块表={} 新入={} 逐出={}",
@@ -194,7 +194,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // **S6.1:盘上链索引**(turn 收口一次;内容可能还没溢写 ⇒ boot 按内容截断)。
         // 放在 `ephemeral` 焚毁之前 —— 会话 tokens 此刻还在。
-        if self.dev.pool.paged && self.bank.rel.disk_enabled() {
+        if self.dev.pool.geom.paged && self.bank.rel.disk_enabled() {
             let toks = self
                 .bank
                 .sessions
@@ -228,8 +228,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         self.close_admission(act.id);
         // **B-3d**:选择层视图态随 turn 收口(视图是 turn 域资源 —— 下一 turn
         // 的召回点重新产出;不清 = 用旧视图读新会话的块,静默错值)
-        self.sel_view = None;
-        let mut text = self.tok.decode(&act.out);
+        self.sel.clear_view();
+        let mut text = self.boot.tok.decode(&act.out);
         // stop 串命中(AGT-06):终了文本较交付给客户端的输出多了一截停止串 ⇒
         // 截回命中位置(char 边界安全,不命中则原样)
         if let Some(n) = act.trim_text_to {

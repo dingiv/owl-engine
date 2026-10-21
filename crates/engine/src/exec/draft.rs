@@ -14,7 +14,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         bonus: u32,
     ) -> Result<Vec<u32>> {
         let fp = pos + m + 1;
-        let _page = self.dev.pool.page;
+        let _page = self.dev.pool.geom.page;
         {
             let act = self.turns.active()?;
             let s = self.bank.sessions.session_mut(act.session_id)?;
@@ -43,7 +43,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let kv_len = vec![(fp + 8) as f32];
         let anchor = vec![bonus as f32];
         let pg = self.dev.graphs.dflash.as_mut().ok_or_else(|| ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() })?;
-        let prof = self.probes.step_profile;
+        let prof = self.boot.probes.step_profile;
         // **归因探针(2026-10-18 propose 立案;仅 prof 档)**:发射前先把 COMPUTE 流
         // 排干 ⇒ 把"本相位墙钟"拆成三块,互不污染:
         //   ① `drain`  = 排水耗时(上一相/回滚/fold 的残余 GPU 工作 —— 首读一直在吸收它,
@@ -165,7 +165,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // GDN 行 = turn 域资源(§28)
             (s.block_table.clone(), act.gdn_slot)
         };
-        let _page = self.dev.pool.page;
+        let _page = self.dev.pool.geom.page;
         let leaves = self.dev.pool.dflash_kv_leaves().ok_or_else(|| ModelError::EngineInvariant { what: "dflash KV 池句柄缺席(档位/池几何不一致)".into() })?;
         let bt = self.dev.pool.bt_leaf_flat();
         let kvs: Vec<KvBuffers> = leaves
@@ -196,15 +196,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let refs: Vec<&TensorOps> = roots.iter().collect();
             // 副作用根口径:encode 的末位出参 = 契约 4 占位(核就地写池),没人读 ⇒ 收尾一并归还
             // env = **草稿自己的**(hd/grp 取草稿几何;见 SpecRuntime::draft_env)
-            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.spec_rt.draft_env, self.dev.tp.as_ref()).await?;
+            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.spec_rt.draft_env, self.dev.boot.tp.as_ref()).await?;
         }
         // 探针:首回合 memory 落盘(python 重算 fc 对拍;真块 dtoh 合法。
         // taps 由调用方从 concat 父块整块落盘 —— 切片视图 dtoh 整父块契约)
-        if self.probes.dflash_probe && !self.dev.spec_rt.mem_dumped {
+        if self.boot.probes.dflash_probe && !self.dev.spec_rt.mem_dumped {
             self.dev.spec_rt.mem_dumped = true;
             let face = self.dev.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = std::iter::once(&memory).collect();
-            let outs = owl_models::interpreters::eval_ops_multi(&refs, face, self.dev.tp.as_ref()).await?;
+            let outs = owl_models::interpreters::eval_ops_multi(&refs, face, self.dev.boot.tp.as_ref()).await?;
             let n: usize = memory.shape().iter().product();
             let mut buf = vec![0u8; n * 2];
             face.dtoh(&outs[0], &mut buf).await?;
@@ -249,7 +249,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // GDN 行 = turn 域资源(§28)
             (s.block_table.clone(), act.gdn_slot)
         };
-        let page = self.dev.pool.page;
+        let page = self.dev.pool.geom.page;
         // 块表覆盖自保(⑦ propose 跑在 fp = pos+m+1 = 下轮 fed 位,先于
         // 下轮 scheduler 的 ensure_for_len —— 跨页时 bt 未长,曾于 pos+8
         // 越 page 界 panic)。**grew → write_bt 同步律**:块表增长必须
@@ -271,7 +271,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // GDN 行 = turn 域资源(§28)
             (s.block_table.clone(), act.gdn_slot)
         };
-        if self.probes.dflash_probe {
+        if self.boot.probes.dflash_probe {
             owl_shared::log_debug!("dflash-probe", "propose pos={pos} bt_len={} page={page}", bt_chain.len());
         }
         // 噪声块自槽(经寻址权威;线性逻辑位)
@@ -293,7 +293,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         ctx.env = self.dev.spec_rt.draft_env;
         // 探针:草稿池 K 前缀行 NaN 检查(定谳 encode vs NC 核;解析 dtype
         // 随草稿池 —— 同日十四后 = BF16)
-        if self.probes.dflash_probe {
+        if self.boot.probes.dflash_probe {
             let parse2: fn([u8; 2]) -> f32 = if d2.dtype() == Dtype::BF16 {
                 |c| half::bf16::from_le_bytes(c).to_f32()
             } else {
@@ -336,14 +336,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 前向)—— 隔离「草稿值泄漏」vs「轮管线污染」(2026-10-07 恒等门
         // AL=0 分歧排查;正式开关挂 C7)
         // OWL_DFLASH_DUMB=1:零副作用哑草稿(不进 GPU;② 直接 host 表)
-        if self.probes.dflash_dumb {
+        if self.boot.probes.dflash_dumb {
             return Ok(vec![anchor; 7]);
         }
         let mut probe_roots: Vec<TensorOps> = Vec::new();
-        let probe_on = self.probes.dflash_probe;
+        let probe_on = self.boot.probes.dflash_probe;
         let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(pos + 8) as f32]));
         let (hidden, drafts, _scores, logits) = d2.propose_block(
-            &toks_t, &pos_t, &anchor_t, &kvs, &rope, &self.dev.model.embed, &kv_len_t, &ctx,
+            &toks_t, &pos_t, &anchor_t, &kvs, &rope, &self.dev.boot.model.embed, &kv_len_t, &ctx,
             if probe_on { Some(&mut probe_roots) } else { None },
         );
         // ★ **peer 侧草稿树(按 peer 自己的块重建)**(P2.1-c,2026-10-19)
@@ -386,14 +386,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 ModelError::EngineInvariant { what: "peer 草稿 rope 缺席".into() }
             })?;
             let (_, d_p, _, _) = d2_p.propose_block(
-                &toks_t, &pos_t, &anchor_t, &kvs_p, rope_p, &p.model.embed, &kv_len_t, &ctx, None,
+                &toks_t, &pos_t, &anchor_t, &kvs_p, rope_p, &p.boot.model.embed, &kv_len_t, &ctx, None,
             );
             Ok(d_p)
         };
         // 探针:首个 propose 的 hidden + 全部探针根落盘(python 逐阶段对拍;
         // **逐根独立 eval** —— multi 后段会把早根块回收复用,dtoh 读到陈旧
         // 块(root0 曾读出 1e6 级垃圾假象);单链重执行确定性,值可信)
-        if self.probes.dflash_probe && !self.dev.spec_rt.hid_dumped {
+        if self.boot.probes.dflash_probe && !self.dev.spec_rt.hid_dumped {
             self.dev.spec_rt.hid_dumped = true;
             for (i, r) in probe_roots.iter().enumerate() {
                 let face = self.dev.graphs.session.face_mut();
@@ -422,14 +422,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             owl_shared::log_debug!("dflash-probe", "{} probe roots + hidden 落盘(逐根独立 eval)pos={pos} anchor={anchor}", probe_roots.len());
         }
         // 探针:logits 前 4 值 f16(NaN 定位;OWL_DFLASH_PROBE)
-        let logits_probe = if self.probes.dflash_probe {
+        let logits_probe = if self.boot.probes.dflash_probe {
             Some(logits.clone())
         } else {
             None
         };
         let (b, arena) = {
             let env0 = self.dev.spec_rt.draft_env;
-            let tp0 = self.dev.tp.clone();
+            let tp0 = self.dev.boot.tp.clone();
             // peer 树必须在借 face 之前建(`peer_tree` 要 `&mut p` 读池/模型)
             let peer_t = match self.peer.as_mut() {
                 Some(p) => Some(peer_tree(p)?),
@@ -446,7 +446,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     // ⇒ 两 rank 必须同跑(否则 AR 失步)。单卡档 = 原路。
                     // 读数只取主 rank(确定性 ⇒ 两 rank 同值);**两半都校验**。
                     let env1 = p.spec_rt.draft_env;
-                    let tp1 = p.tp.clone();
+                    let tp1 = p.boot.tp.clone();
                     let (f0, f1) = (dev.graphs.session.face_mut(), p.graphs.session.face_mut());
                     let peer_fut = async move {
                         let r = owl_models::interpreters::eval_ops_scoped_env(
@@ -483,7 +483,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let refs: Vec<&TensorOps> = roots.iter().collect();
             let outs = {
                 let face = self.dev.graphs.session.face_mut();
-                owl_models::interpreters::eval_ops_multi_env(&refs, face, self.dev.spec_rt.draft_env, self.dev.tp.as_ref()).await?
+                owl_models::interpreters::eval_ops_multi_env(&refs, face, self.dev.spec_rt.draft_env, self.dev.boot.tp.as_ref()).await?
             };
             for (i, pr) in probe_roots.iter().enumerate() {
                 let n: usize = pr.shape().iter().product();
@@ -558,7 +558,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                 .collect::<Vec<_>>()
         };
-        if self.probes.dflash_probe {
+        if self.boot.probes.dflash_probe {
             owl_shared::log_debug!("dflash-probe", "pos={pos} anchor={anchor} drafts={out:?}");
         }
         Ok(out)
@@ -582,7 +582,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 多编行下轮被自块写/重编覆盖,幂等安全;E5-DF4 与图路径同式)
         let rows = (m + 2).min(8);
         let rope = self.dev.spec_rt.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
-        let dtype = self.dev.pool.dims.dtype;
+        let dtype = self.dev.pool.geom.dims.dtype;
         let views: Vec<TensorOps> = taps
             .iter()
             .map(|b| TensorOps::of_block(b.id, dtype, vec![rows, d2.hidden()]))
@@ -594,7 +594,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             &f32b(&(0..rows).map(|i| (pos + i) as f32).collect::<Vec<_>>()),
         );
         // 编码槽表 = 线性逻辑位(pos..pos+rows;草稿池线性寻址,同 ②)
-        let _page = self.dev.pool.page;
+        let _page = self.dev.pool.geom.page;
         let leaves = self.dev.pool.dflash_kv_leaves().ok_or_else(|| ModelError::EngineInvariant { what: "dflash KV 池句柄缺席(档位/池几何不一致)".into() })?;
         let bt = self.dev.pool.bt_leaf_flat();
         let kvs: Vec<KvBuffers> = leaves
@@ -622,7 +622,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 三段 bisect(E5-DF3 同日十一):①memory 独立 eval ②multi 根=[memory]
         // ③encode multi → 各自读回行 0 |max|/池非零计,定位“in-multi 零、
         // standalone 有限”的分裂点(OWL_DFLASH_PROBE)
-        let probe = self.probes.dflash_probe;
+        let probe = self.boot.probes.dflash_probe;
         if probe {
             let b1 = {
                 let face = self.dev.graphs.session.face_mut();
@@ -645,7 +645,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let refs1 = vec![&memory];
             let o1 = {
                 let face = self.dev.graphs.session.face_mut();
-                owl_models::interpreters::eval_ops_multi(&refs1, face, self.dev.tp.as_ref()).await?
+                owl_models::interpreters::eval_ops_multi(&refs1, face, self.dev.boot.tp.as_ref()).await?
             };
             {
                 let mut vb = vec![0u8; rows * 5120 * 2];
@@ -667,7 +667,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.dev.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
             // 副作用根口径:encode 的末位出参 = 契约 4 占位(核就地写池),没人读 ⇒ 收尾一并归还
-            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.spec_rt.draft_env, self.dev.tp.as_ref()).await?;
+            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.dev.spec_rt.draft_env, self.dev.boot.tp.as_ref()).await?;
         }
         if probe {
             let (k0, _) = &leaves[0];
@@ -703,7 +703,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // mtp 链表:覆盖 pos-1(extend 行)+ pos..pos+depth-2(链步)
         let bt = self.mtp_chain_bt(pos + depth - 1)?;
         let (kc, vc) = self.dev.pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
-        let page = self.dev.pool.page;
+        let page = self.dev.pool.geom.page;
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let bt_t = TensorOps::from_host(
             Dtype::F32,
@@ -726,11 +726,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let anchor_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[anchor as f32]));
         let seed_view =
-            TensorOps::of_block(seed.id, self.dev.pool.dims.dtype, vec![1, self.dev.pool.dims.hidden]);
+            TensorOps::of_block(seed.id, self.dev.pool.geom.dims.dtype, vec![1, self.dev.pool.geom.dims.hidden]);
         let drafts = {
-            let env = self.dev.env;
-            let vocab = self.dev.model.vocab_size();
-            let rope = self.dev.rope.clone();
+            let env = self.dev.env();
+            let vocab = self.dev.boot.model.vocab_size();
+            let rope = self.dev.boot.rope.clone();
             // 链步 decode 读核跟池布局:kNH 池必须走 v2(否则落 v1 classic
             // ↠ 布局错位、草稿全垃圾;2026-10-13 布局守卫捕获)
             let attn_v2 = self.dev.pool.attn_v2_scratch();
@@ -738,15 +738,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 what: "drafter 句柄缺席(草稿档位不一致)".into(),
             })? {
                 crate::spec_runtime::Drafter::Mtp(mtp) => mtp.propose(
-                    &anchor_t, &seed_view, depth, &self.dev.model.embed, &rope, &kvs, &pos_ts,
+                    &anchor_t, &seed_view, depth, &self.dev.boot.model.embed, &rope, &kvs, &pos_ts,
                     vocab, env, attn_v2,
                 ),
                 crate::spec_runtime::Drafter::DFlash2(_) => unreachable!("DFlash2 不走 propose_first(seed 链)"),
             }
         };
         let (b, arena) = {
+            let env = self.dev.env();
             let face = self.dev.graphs.session.face_mut();
-            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.dev.env, self.dev.tp.as_ref()).await?
+            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, env, self.dev.boot.tp.as_ref()).await?
         };
         {
             let face = self.dev.graphs.session.face_mut();
@@ -781,7 +782,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 链步最远位 = fp+depth-2 → 链表需覆盖 token 数 fp+depth-1
         let bt = self.mtp_chain_bt(fp + depth - 1)?;
         let (kc, vc) = self.dev.pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
-        let page = self.dev.pool.page;
+        let page = self.dev.pool.geom.page;
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let bt_t = TensorOps::from_host(
             Dtype::F32,
@@ -806,7 +807,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             &f32b(&toks.iter().map(|&v| v as f32).collect::<Vec<_>>()),
         );
         let hiddens =
-            TensorOps::of_block(hidden.id, self.dev.pool.dims.dtype, vec![m + 1, self.dev.pool.dims.hidden]);
+            TensorOps::of_block(hidden.id, self.dev.pool.geom.dims.dtype, vec![m + 1, self.dev.pool.geom.dims.hidden]);
         let extend_pos = TensorOps::from_host(Dtype::F32, vec![m + 1], &f32b(&pos_x));
         let extend_slots = TensorOps::from_host(Dtype::F32, vec![m + 1], &f32b(&slots_x));
         let extend_lens = TensorOps::from_host(Dtype::F32, vec![m + 1], &f32b(&lens_x));
@@ -837,16 +838,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .collect::<Vec<u8>>(),
         );
         let drafts = {
-            let env = self.dev.env;
-            let vocab = self.dev.model.vocab_size();
-            let rope = self.dev.rope.clone();
+            let env = self.dev.env();
+            let vocab = self.dev.boot.model.vocab_size();
+            let rope = self.dev.boot.rope.clone();
             let attn_v2 = self.dev.pool.attn_v2_scratch(); // 同上:链步读核走 v2
             match self.dev.spec_rt.drafter.as_ref().ok_or_else(|| ModelError::EngineInvariant {
                 what: "drafter 句柄缺席(草稿档位不一致)".into(),
             })? {
                 crate::spec_runtime::Drafter::Mtp(mtp) => mtp.propose_ext(
                     &tokens_t, &hiddens, &extend_pos, &extend_kv, &extend_slots, &extend_lens,
-                    &cu_t, &chain_refs, &self.dev.model.embed, &rope, vocab, env, attn_v2,
+                    &cu_t, &chain_refs, &self.dev.boot.model.embed, &rope, vocab, env, attn_v2,
                 ),
                 crate::spec_runtime::Drafter::DFlash2(_) => unreachable!("DFlash2 走 dflash_propose"),
             }
@@ -854,8 +855,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("spec.propose.build", ts_build.elapsed());
         let ts_eval = std::time::Instant::now();
         let (b, arena) = {
+            let env = self.dev.env();
             let face = self.dev.graphs.session.face_mut();
-            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, self.dev.env, self.dev.tp.as_ref()).await?
+            owl_models::interpreters::eval_ops_scoped_env(drafts.step(), face, env, self.dev.boot.tp.as_ref()).await?
         };
         mrec("spec.propose.eval", ts_eval.elapsed());
         {
@@ -881,7 +883,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         pos: usize,
     ) -> Result<Vec<u32>> {
         let depth = self.dev.spec_rt.depth;
-        let page = self.dev.pool.page;
+        let page = self.dev.pool.geom.page;
         let bt = {
             let sid = self.turns.active()?.session_id;
             let s = self.bank.sessions.get_mut(sid).expect("账在");
@@ -948,7 +950,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         use owl_models::layers::dflash2::{DEPTH, TOP_K};
         let rows = DEPTH;
         let k = TOP_K;
-        let half = self.dev.model.logits_vocab();
+        let half = self.dev.boot.model.logits_vocab();
         // ① rank0 三槽（图输出；dtoh）。`topk` = 单缓冲:前段值区 ‖ 后段索引区。
         let (v0, c0, proj, dt) = {
             let pg = self
@@ -1036,7 +1038,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             drafts.step(),
             face,
             self.dev.spec_rt.draft_env,
-            self.dev.tp.as_ref(),
+            self.dev.boot.tp.as_ref(),
         )
         .await?;
         let mut buf = vec![0u8; 4 * rows];
@@ -1095,7 +1097,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let head_split = self.head_split_active();
         let (dev, peer) = (&mut self.dev, self.peer.as_mut());
         let want_logits = want_logits || head_split;
-        let half_vocab = dev.model.logits_vocab();
+        let half_vocab = dev.boot.model.logits_vocab();
         let out = match peer {
             None => {
                 dev.verify_forward_dev(block, base, gdn_slot, want_logits, &bt_chain, pos_delta)
@@ -1133,7 +1135,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         }
                     };
                     let full = crate::running::concat_head_rows(&a, &b, half_vocab)?;
-                    let v = dev.model.vocab_size();
+                    let v = dev.boot.model.vocab_size();
                     if full.len() < block.len() * v {
                         return Err(owl_iface::contract::ModelError::EngineInvariant {
                             what: format!(
@@ -1202,7 +1204,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         );
         // 草稿池线性逻辑寻址(slot = 逻辑位;NC 前缀读 [0, prefix) 直排;
         // bt 物理槽仅首 session 重合 —— slot≥1 案修,2026-10-10)
-        let _page = self.pool.page;
+        let _page = self.pool.geom.page;
         let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
         let bt = self.pool.bt_leaf_flat();
         let kvs: Vec<KvBuffers> = leaves
@@ -1232,7 +1234,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let face = self.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = roots.iter().collect();
             // 副作用根口径(同 encode 主路:末位出参是契约 4 占位,没人读)
-            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.spec_rt.draft_env, self.tp.as_ref()).await?;
+            owl_models::interpreters::eval_ops_side_effect_env(&refs, face, self.spec_rt.draft_env, self.boot.tp.as_ref()).await?;
         }
         // 探针:首回合 memory 落盘(python 重算 fc 对拍;真块 dtoh 合法。
         // taps 由调用方从 concat 父块整块落盘 —— 切片视图 dtoh 整父块契约)
@@ -1240,7 +1242,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             self.spec_rt.mem_dumped = true;
             let face = self.graphs.session.face_mut();
             let refs: Vec<&TensorOps> = std::iter::once(&memory).collect();
-            let outs = owl_models::interpreters::eval_ops_multi(&refs, face, self.tp.as_ref()).await?;
+            let outs = owl_models::interpreters::eval_ops_multi(&refs, face, self.boot.tp.as_ref()).await?;
             let n: usize = memory.shape().iter().product();
             let mut buf = vec![0u8; n * 2];
             face.dtoh(&outs[0], &mut buf).await?;
@@ -1267,8 +1269,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         if !matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) {
             return Ok(());
         }
-        let d = self.pool.dims;
-        let page = self.pool.page;
+        let d = self.pool.geom.dims;
+        let page = self.pool.geom.page;
         let bt = {
             bank.leg_mtp
                 .ensure_for_len(&mut bank.sessions.session_mut(sid)?.mtp_block_table, base + t_rows)?;
@@ -1326,12 +1328,13 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         };
         let root = mtp.extend_block(
             &tok_t, &hid_view, &pos_t, &kv, &slots_t, &lens_t, &cu_t,
-            &self.model.embed, &self.rope, self.env,
+            &self.boot.model.embed, &self.boot.rope, self.env(),
         );
         // 原为 `_b`(弃值)—— 那正是漏点的形状:根块没人读也没人还
         let (b, arena) = {
+            let env = self.env();
             let face = self.graphs.session.face_mut();
-            owl_models::interpreters::eval_ops_scoped_env(root.step(), face, self.env, self.tp.as_ref()).await?
+            owl_models::interpreters::eval_ops_scoped_env(root.step(), face, env, self.boot.tp.as_ref()).await?
         };
         mrec("spec.extend.eval", ts_eval.elapsed());
         mrec("spec.extend", t_all.elapsed());

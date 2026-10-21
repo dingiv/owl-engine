@@ -258,7 +258,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 .ensure_for_len(&mut s.block_table, pos + 1)?;
             s.block_table.len() != before
         };
-        let page = self.dev.pool.page;
+        let page = self.dev.pool.geom.page;
         let kv_slot = {
             let s = self.bank.sessions.session_mut(sid)?;
             let b = s.block_table[pos / page];
@@ -343,28 +343,28 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// **调度几何**（boot 静态；`sched_policy::Limits` 的注入面）
     pub(crate) fn admission_limits(&self) -> crate::sched_policy::Limits {
-        let page = self.dev.pool.page.max(1);
+        let page = self.dev.pool.geom.page.max(1);
         crate::sched_policy::Limits {
             page,
-            max_batch: self.cfg.knobs.max_batch.max(1),
-            gdn_slots: self.cfg.knobs.gdn_slots.max(1),
+            max_batch: self.boot.cfg.knobs.max_batch.max(1),
+            gdn_slots: self.boot.cfg.knobs.gdn_slots.max(1),
             // 引擎不知道服务面的请求上限 ⇒ 用格数当 n_target 的上界
             // （`n_target = min(max_batch, gdn_slots, max_concurrency)`）
-            max_concurrency: self.cfg.knobs.gdn_slots.max(1),
-            oversub: self.cfg.knobs.kvmem_virtualization,
-            workspace_pages: self.cfg.knobs.workspace_per_req.div_ceil(page),
-            chunk_pages: self.cfg.prefill_chunk.div_ceil(page),
+            max_concurrency: self.boot.cfg.knobs.gdn_slots.max(1),
+            oversub: self.boot.cfg.knobs.kvmem_virtualization,
+            workspace_pages: self.boot.cfg.knobs.workspace_per_req.div_ceil(page),
+            chunk_pages: self.boot.cfg.prefill_chunk.div_ceil(page),
             // 池保留：0 = 自动（按池比例、上限 8 页；小池不被"保留"吃光）
-            reserve_pages: if self.cfg.knobs.reserve_pages == 0 {
-                (self.dev.pool.nb / 64).min(8)
+            reserve_pages: if self.boot.cfg.knobs.reserve_pages == 0 {
+                (self.dev.pool.geom.nb / 64).min(8)
             } else {
-                self.cfg.knobs.reserve_pages
+                self.boot.cfg.knobs.reserve_pages
             },
-            slice_every: self.cfg.knobs.slice_every,
-            slice_tokens: self.cfg.knobs.slice_tokens,
-            newcomer_min_tokens: self.cfg.knobs.newcomer_min_tokens,
-            min_gen_tokens: self.cfg.knobs.min_gen_tokens,
-            max_queue: self.cfg.knobs.max_queue,
+            slice_every: self.boot.cfg.knobs.slice_every,
+            slice_tokens: self.boot.cfg.knobs.slice_tokens,
+            newcomer_min_tokens: self.boot.cfg.knobs.newcomer_min_tokens,
+            min_gen_tokens: self.boot.cfg.knobs.min_gen_tokens,
+            max_queue: self.boot.cfg.knobs.max_queue,
         }
     }
 
@@ -426,7 +426,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 let s = self.bank.sessions
                     .get_mut(turn.session_id)
                     .expect("submit 已建会话账");
-                if self.dev.pool.paged {
+                if self.dev.pool.geom.paged {
                     // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)。
                     // **S3b 收尾**:经 `Rel` 门面**一次问两腿**(块链 + 快照层)
                     // —— 少一条"引擎自己分别查两处"的旁路(§10.4 律⑤)。
@@ -446,7 +446,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                             }
                         }
                     }
-                    if self.cfg.knobs.probes.debug {
+                    if self.boot.cfg.knobs.probes.debug {
                         // 在场性 = **store 的层账**(设备/宿主都算);层号一并打出。
                         // 头尾都要看(2026-10-19):复用面只认**最靠近链头**的在场面 ⇒
                         // "前 4 全 '-'"曾把"链头那张缺位"误读成"全丢";故头 4 + 尾 6。
@@ -480,9 +480,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                         &hit,
                         &recall,
                         turn.prompt_ids.len(),
-                        self.dev.pool.page,
+                        self.dev.pool.geom.page,
                     );
-                    if self.cfg.knobs.probes.debug {
+                    if self.boot.cfg.knobs.probes.debug {
                         // 裁剪结果 = 复用面真值(块);页对齐后 = 可复用 token 数
                         let found = if m > 0 {
                             match self.bank.rel.state.locate(owl_store::SnapKey::at_boundary(hashes[m - 1])) {
@@ -496,7 +496,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         owl_shared::log_debug!(
                             "dbg prefix",
                             "复用面 m={m}/{matched_raw} 块(= {} tok)/ 落在边界层={found}",
-                            m * self.dev.pool.page
+                            m * self.dev.pool.geom.page
                         );
                     }
                     if m > 0 {
@@ -522,9 +522,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                         // 链哈希游标播种:身份从缓存哈希链接管(此后 prefill/
                         // decode 的边界快照键从游标出,不再碰物理块号)
                         s.chain.seed(m, hashes[m - 1]);
-                        s.cached_len = m * self.dev.pool.page;
+                        s.cached_len = m * self.dev.pool.geom.page;
                         (
-                            m * self.dev.pool.page,
+                            m * self.dev.pool.geom.page,
                             gdn_row,
                             Some(owl_store::SnapKey::at_boundary(hashes[m - 1])),
                             pending_loads,
@@ -557,16 +557,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                 let s = self.bank.sessions
                     .get_mut(turn.session_id)
                     .expect("submit 已建会话账");
-                let target = if self.cfg.knobs.kvmem_virtualization {
+                let target = if self.boot.cfg.knobs.kvmem_virtualization {
                     Self::prefill_step_chunk(
                         0,
                         turn.prompt_ids.len(),
-                        self.cfg.prefill_chunk,
-                        self.cfg.knobs.prefill_tail_merge,
+                        self.boot.cfg.prefill_chunk,
+                        self.boot.cfg.knobs.prefill_tail_merge,
                         Self::prefill_align_page(
-                            self.cfg.knobs.prefill_align_tail,
-                            self.cfg.knobs.prefix_cache,
-                            self.dev.pool.page,
+                            self.boot.cfg.knobs.prefill_align_tail,
+                            self.boot.cfg.knobs.prefix_cache,
+                            self.dev.pool.geom.page,
                         ),
                     )
                     .unwrap_or(1)
@@ -588,7 +588,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 请求未表达采样意图 ⇒ 完全走 knobs(flavor 语义不变)
             let (eff_sampler, sampler_on) = match opts.sampler {
                 Some(o) if !o.is_empty() => {
-                    let mut s = self.cfg.knobs.sampler;
+                    let mut s = self.boot.cfg.knobs.sampler;
                     if let Some(t) = o.temp {
                         s.temp = t;
                     }
@@ -601,7 +601,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     let on = s.temp > 0.0;
                     (s, on)
                 }
-                _ => (self.cfg.knobs.sampler, self.cfg.knobs.sampler_enabled),
+                _ => (self.boot.cfg.knobs.sampler, self.boot.cfg.knobs.sampler_enabled),
             };
             // **[N1 TurnBegin]**:turn 上设备 —— 归属 `Turn(id)`;类别 `Temp`
             //    (turn 域的一切分配都是临时面:激活/工作区/回退;常驻面在 boot 已归 System)
@@ -665,7 +665,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             .admit_wait
             .map(|(id, _)| self.turns.queue.front().map(|t| t.id) == Some(id))
             .unwrap_or(false);
-        if self.turns.active.len() < self.cfg.knobs.max_batch.max(1) && !admit_blocked {
+        if self.turns.active.len() < self.boot.cfg.knobs.max_batch.max(1) && !admit_blocked {
             // **准入（唯一放行口）**：纯状态机 + store 事实注入。
             // · Admit  → 启动（`start_one`）并入账；
             // · Hold   → 队首**留原位**，本拍只推已有活跃（不许停摆）；
@@ -764,14 +764,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ① 至少 2 个活跃且都在生成相位(无 prefill 欠账);
         // ② **无投机**(depth==0):spec 轮的 GDN 是顺序块 + 快照,批化是 M2;
         // ③ 单 rank(TP 的 AR 批语义未审,R8);④ 选择层视图关闭(页表需 per-row)。
-        if self.cfg.knobs.max_batch > 1
+        if self.boot.cfg.knobs.max_batch > 1
             && self.turns.active.len() >= 2
             && self.turns.active.iter().all(|a| a.fed >= a.prompt_ids.len())
             && self.dev.spec_rt.depth == 0
             && self.peer.is_none()
-            && self.sel_view.is_none()
+            && !self.sel.has_view()
         {
-            let n = self.turns.active.len().min(self.cfg.knobs.max_batch);
+            let n = self.turns.active.len().min(self.boot.cfg.knobs.max_batch);
             let mut rows = Vec::with_capacity(n);
             for i in 0..n {
                 rows.push(self.decode_row_of(i)?);
@@ -787,7 +787,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 多活跃时选**欠账最多的 prefill turn**(先把 prompt 灌完),否则
         // round-robin 推进生成相(单 turn 档 = 唯一活跃,行为不变)。
         // **相位决策**（`[runtime] slice_every > 0` 时走纯状态机；=0 走旧逻辑逐字节不变）
-        let pick_idx = if self.cfg.knobs.slice_every > 0 {
+        let pick_idx = if self.boot.cfg.knobs.slice_every > 0 {
             // 事实注入（引擎只提供事实，策略全在 `sched_policy::PhaseSched`）
             let facts: Vec<crate::sched_policy::TurnFacts> = self
                 .turns
@@ -813,8 +813,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                 })
                 .collect();
             let l = crate::sched_policy::Limits {
-                slice_every: self.cfg.knobs.slice_every,
-                slice_tokens: self.cfg.knobs.slice_tokens,
+                slice_every: self.boot.cfg.knobs.slice_every,
+                slice_tokens: self.boot.cfg.knobs.slice_tokens,
                 ..Default::default()
             };
             // `batch_ok = false`：批 decode 已在上面的批门处理过，这里只决定单拍相位。
@@ -857,12 +857,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             let chunk = Self::prefill_step_chunk(
                 base,
                 act.prompt_ids.len(),
-                self.cfg.prefill_chunk,
-                self.cfg.knobs.prefill_tail_merge,
+                self.boot.cfg.prefill_chunk,
+                self.boot.cfg.knobs.prefill_tail_merge,
                 Self::prefill_align_page(
-                    self.cfg.knobs.prefill_align_tail,
-                    self.cfg.knobs.prefix_cache,
-                    self.dev.pool.page,
+                    self.boot.cfg.knobs.prefill_align_tail,
+                    self.boot.cfg.knobs.prefix_cache,
+                    self.dev.pool.geom.page,
                 ),
             )
             .unwrap_or_else(|| remaining.max(1));
@@ -874,11 +874,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 .active
                 .iter()
                 .any(|a| a.fed >= a.prompt_ids.len());
-            let chunk = if self.cfg.knobs.slice_every > 0
-                && self.cfg.knobs.slice_tokens > 0
+            let chunk = if self.boot.cfg.knobs.slice_every > 0
+                && self.boot.cfg.knobs.slice_tokens > 0
                 && interleaving
             {
-                chunk.min(self.cfg.knobs.slice_tokens)
+                chunk.min(self.boot.cfg.knobs.slice_tokens)
             } else {
                 chunk
             };
@@ -950,7 +950,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let before = s.block_table.len();
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, need)?;
             let grew = s.block_table.len() != before;
-            let page = self.dev.pool.page;
+            let page = self.dev.pool.geom.page;
             let slot_at = |p: usize| {
                 let b = s.block_table[p / page];
                 b * page as u32 + (p % page) as u32
