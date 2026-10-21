@@ -144,8 +144,18 @@ pub(crate) fn kv_per_tok_bytes(
 #[derive(Clone, Debug)]
 pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     pub seq_tokens: usize,
-    /// 池容量(治理/钉值定谳后的 token 数)
+    /// 池容量(token;**`pool_auto = true` 时本值被忽略**,按 `seq_tokens` 自动)
     pub pool_tokens: usize,
+    /// **池容量自动派生**(`[pool].pool_tokens` 未写;2026-10-21 用户令:
+    /// "池子一般不需要手动指定 —— 算出来、把最大 ctx 显示出来")。
+    ///
+    /// 自动档语义:池 = 单会话 ctx(`ceil(seq_tokens/page)` 页)+ 页对齐;
+    /// 显存治理器的 `cap` 退化为**上限校验 + 报告**(`ctx_max = cap − page`);
+    /// `seq_tokens > ctx_max` ⇒ 拒启并给出可服务的最大 ctx。
+    pub pool_auto: bool,
+    /// 每 turn 工作集(token;`[kvmem].workspace_per_req`)——
+    /// 口径:`ctx` 常驻(**Strict** 准入)⊆ 池 ⇒ 可用 ctx 上限 = `cap − page`。
+    pub ws_tokens: usize,
     /// **允许池小于上下文**(锁①;`[kvmem].pool_overcommit`)。
     ///
     /// 关着时池有硬下限 `nb ≥ ceil(seq_tokens/page)` ⇒ **选择层只省访问面、
@@ -615,19 +625,25 @@ const DRAFT_POOL: DraftPoolGeom = DraftPoolGeom { layers: 5, hkv: 8, hd: 128 };
 #[derive(Debug, Clone, Copy)]
 struct PerTokBytes {
     main_kv: usize,
+    /// 草稿池(DFlash2;按层 × 几何 × elem 线性)
     draft_pool: usize,
+    /// **MTP 草稿链**(1 层 full 几何 × k+v;此前**根本没进预算** ⇒ `pool_tokens`
+    /// 是手写值时主池会吃满、MTP 池在预算外另占 864 MiB@192k ⇒ turn 级 OOM)
+    mtp_chain: usize,
 }
 
 impl PerTokBytes {
     /// `draft_elem` = `Some(池 elem 字节)` 当且仅当 DFlash2 档(草稿池按 token 线性;
     /// 页取整后略同)。**elem 来自 `KvQuant::size_bytes` 单一映射** —— 原先草稿池
     /// 项写死 2B,池改 fp8 时预算不会跟(= 声明没驱动算式)。
+    #[allow(clippy::too_many_arguments)]
     fn of(
         dims: &ModelDims,
         n_full: usize,
         kv_elem: usize,
         draft_elem: Option<usize>,
         draft_geom: Option<(usize, usize, usize)>,
+        mtp_kv_elem: Option<usize>,
     ) -> Self {
         // 几何单源:配置/声明给的 `draft_geom` 优先(分片后),否则单卡缺省
         let geom = draft_geom
@@ -636,15 +652,20 @@ impl PerTokBytes {
         PerTokBytes {
             main_kv: n_full * 2 * dims.hkv * dims.hd * kv_elem,
             draft_pool: draft_elem.map(|e| geom.per_tok_bytes(e)).unwrap_or(0),
+            // MTP 链 = **1 层 × full 几何 × (k+v)**;elem 由 `[spec] draft_kv_fp8` 定
+            mtp_chain: mtp_kv_elem.map(|e| 2 * dims.hkv * dims.hd * e).unwrap_or(0),
         }
     }
 
     fn total(self) -> usize {
-        self.main_kv + self.draft_pool
+        self.main_kv + self.draft_pool + self.mtp_chain
     }
 
     fn explain(self) -> String {
-        format!("主池 {}B + 草稿池 {}B", self.main_kv, self.draft_pool)
+        format!(
+            "主池 {}B + 草稿池 {}B + MTP 链 {}B",
+            self.main_kv, self.draft_pool, self.mtp_chain
+        )
     }
 }
 
@@ -967,8 +988,20 @@ impl StatePool {
     }
 
     /// MTP 草稿链 KV 叶子对(mtp 模式;None = 未启用)
+    ///
+    /// fp8 档(`[spec] draft_kv_fp8`)= **U32 扁平字节账**(元素数 = 字节/4;
+    /// 与主池/DFlash2 池同一承载律)—— 叶子注解必须跟着走,否则 L3 事实面
+    /// 会把"U32 字节账"当成元素账(旧实现恒传 `dims.dtype` = 注解撒谎)。
     pub(crate) fn mtp_kv_leaf(&self) -> Option<(TensorOps, TensorOps)> {
         let mk = self.draft.mtp_kvs.as_ref()?;
+        if self.draft.fp8 {
+            let d = &self.geom.dims;
+            let shape = vec![self.geom.nb * d.hkv * d.hd * self.geom.page / 4];
+            return Some((
+                block_leaf_dt(&mk.k_cache.0, shape.clone(), Dtype::U32),
+                block_leaf_dt(&mk.v_cache.0, shape, Dtype::U32),
+            ));
+        }
         Some((
             block_leaf_dt(&mk.k_cache.0, self.k_shape(), self.geom.dims.dtype),
             block_leaf_dt(&mk.v_cache.0, self.v_shape(), self.geom.dims.dtype),
@@ -1703,22 +1736,86 @@ impl<'a> AllocCtx<'a> {
         // + 20480(草稿池 bf16) = **53248B**;fixed_after 里图项实测 **261MiB**、
         // 非追踪实测 = 进程占用 20096MiB − 引擎账 19552MiB = **544MiB**(> reserve 512MB,
         // 即 reserve 量级正确但零余量 ⇒ 见 graph_fleet 的对账行)。
+        let mtp_mode = plan.spec_mode == crate::spec_runtime::SpecMode::Mtp;
         let per_tok = PerTokBytes::of(
             &dims,
             n_full,
             kv_bytes_elem,
             dflash.then(|| plan.draft_kv.size_bytes()),
             plan.draft_geom,
+            mtp_mode.then(|| plan.draft_kv.size_bytes()),
         );
         // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + warmup 分列)
         let gdn_slot_elems = dims.nk * dims.hk * 3 + dims.nv * dims.hv * 3 + dims.nv * dims.hk * dims.hv;
         let fixed_after = FixedAfter::of(n_gdn, gdn_slots, gdn_slot_elems, snap_max);
         let pool_cap = pool_cap(plan, &per_tok, &fixed_after);
-        let pool_tokens = match pool_cap {
-            Some(cap) => pool_tokens.min(cap),
-            None => pool_tokens,
+        // ── 池容量:**手写值** 或 **自动 = 本档 ctx**(2026-10-21)──
+        //
+        // 自动档把"池多大"从配置里拿掉:池只为 `max_seq` 分配(页对齐),
+        // 显存治理器的 `cap` 只做两件事 —— ① 兜底:`max_seq` 超预算即拒启;
+        // ② 报告:`ctx_max = cap − 1 页`(Strict 准入 = 整 ctx 常驻)。
+        let page_guess = 32usize; // 与 `kv_paged_policy` 同值(下面会再取权威值)
+        let ctx_max = pool_cap.map(|c| c.saturating_sub(page_guess));
+        let pool_tokens = if plan.pool_auto {
+            match ctx_max {
+                Some(m) if plan.seq_tokens > m => {
+                    return Err(ModelError::Msg(format!(
+                        "[pool] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
+                         本档 per_tok={}B ⇒ cap={:?} tok。修法:降 [runtime].max_seq 到 ≤ {}、\
+                         或降 per_tok(池 fp8 / 减草稿池)、或加 [pool].pool_tokens 显式钉(不推荐)。",
+                        plan.seq_tokens,
+                        m,
+                        per_tok.total(),
+                        pool_cap,
+                        m
+                    )));
+                }
+                _ => {}
+            }
+            plan.seq_tokens
+        } else {
+            match pool_cap {
+                Some(cap) => plan.pool_tokens.min(cap),
+                None => plan.pool_tokens,
+            }
         };
 
+        // ── **[ctx-max] 报告**(用户令:最大支持多少要直接显示)──
+        //
+        // 口径:`cap` = 预算允许的**池 token 数**(治理禁用时 None);
+        // `ctx_max` = 可服务的最长「prompt+生成」(Strict 准入 ⇒ 整 ctx 常驻,
+        // 扣 1 页对齐余量);`pool` = 本档实际分配的池。
+        match (pool_cap, ctx_max) {
+            (Some(cap), Some(m)) => {
+                let pool_mib = pool_tokens as u64 * per_tok.total() as u64 / (1 << 20);
+                let pct = 100.0 * plan.seq_tokens as f64 / m.max(1) as f64;
+                eprintln!(
+                    "[ctx-max] per_tok={}B(主池 {} + 草稿 {} + MTP 链 {}) ⇒ 预算 cap={} tok \
+                     ⇒ **本档最大 ctx ≈ {} tok**;当前 max_seq={}(占 {:.0}%)⇒ 池 {} tok / {} MiB{}",
+                    per_tok.total(),
+                    per_tok.main_kv,
+                    per_tok.draft_pool,
+                    per_tok.mtp_chain,
+                    cap,
+                    m,
+                    plan.seq_tokens,
+                    pct,
+                    pool_tokens,
+                    pool_mib,
+                    if plan.pool_auto { "(自动)" } else { "(手写)" }
+                );
+                if plan.seq_tokens + page_guess > m {
+                    eprintln!(
+                        "[ctx-max] ⚠️ max_seq 已到算式上限(剩 {} tok;再大要降 per_tok 或加卡)",
+                        m.saturating_sub(plan.seq_tokens)
+                    );
+                }
+            }
+            _ => eprintln!(
+                "[ctx-max] 显存治理禁用(vram_target=0 或 total 未知)⇒ 池按 max_seq={} tok 分配(自动档无上限校验)",
+                plan.seq_tokens
+            ),
+        }
         let pol = kv_paged_policy(dims.dtype);
         // 单会话容量(页数)= 旧实现的池下限;`pool_overcommit` 关时仍按它钉住
         let seq_blocks = seq_tokens.div_ceil(pol.as_ref().map_or(1, |p| p.page).max(1));
@@ -1783,7 +1880,11 @@ impl<'a> AllocCtx<'a> {
         let per_tok_bytes = per_tok.total();
         let vram_reserve = plan.vram_reserve_mb << 20;
         let vram_total = owl_shared::vram::total_bytes();
-        if plan.vram_target > 0.0 && plan.vram_target < 1.0 && vram_total > 0 {
+        // `vram_target = 0` = 治理禁用;**`1.0` 是合法档**(吃满总显存,`reserve`
+        // 仍是唯一缓冲)—— 旧条件写 `target < 1.0` 把 1.0 当"禁用" ⇒ 硬预算
+        // 静默失效(2026-10-21 实测:`target=1.0` 的档 boot 里根本没有 cap 行,
+        // 池怎么设都不校验,直到驱动 OOM)。
+        if plan.vram_target > 0.0 && vram_total > 0 {
             // ★ **TP 档的账要按卡算**(2026-10-19 定谳):`owl_shared::vram::LIVE` 是
             // **进程级全局计数器** —— TP2 下**两张卡的分配都加进同一个数**,
             // 而 `total`/`per_tok` 是**单卡**口径 ⇒ 拿"两卡之和"比"单卡总量"
@@ -2129,10 +2230,22 @@ impl DraftBank {
         // MTP 草稿链 KV(E5-M2b):独立页池(1 层,几何 = full 层同款,
         // 容量同 pool_tokens);不接前缀缓存 —— mtp KV 依赖 hidden,
         // 不可 token 哈希。仅 paged(链吃块表)。
+        //
+        // **fp8 承载**(2026-10-21):`[spec] draft_kv_fp8` 此前只对 DFlash2 生效,
+        // MTP 池恒 F16(= 64 KiB/token,192k 时白吃 864 MiB)。现按 `plan.draft_kv`
+        // 定,存储与主池同款:**U32 扁平字节账**(元素数 = 字节/4,1 B/elem)
+        // ⇒ 每 token 4 KiB → 2 KiB。读核由 `draft_env.kv.quant` 同步成 e4m3。
+        let mtp_elem_b = plan.draft_kv.size_bytes();
+        let mtp_elems = nb * dims.hkv * dims.hd * page;
+        let (mtp_e, mtp_dt) = if mtp_elem_b == 1 {
+            (mtp_elems / 4, Dtype::U32)
+        } else {
+            (mtp_elems, dims.dtype)
+        };
         let mtp_kvs = if mtp && paged {
             Some(KvBlocks {
-                k_cache: zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype, "mtp.kv.k").await?,
-                v_cache: zero_block_dt(face, nb * dims.hkv * dims.hd * page, dims.dtype, "mtp.kv.v").await?,
+                k_cache: zero_block_dt(face, mtp_e, mtp_dt, "mtp.kv.k").await?,
+                v_cache: zero_block_dt(face, mtp_e, mtp_dt, "mtp.kv.v").await?,
             })
         } else {
             None
@@ -2338,14 +2451,17 @@ mod vram_budget_tests {
     fn per_tok_matches_production_and_follows_declaration() {
         let d = dims_27b();
         // fp8 主池(1B/elem)+ 草稿池 bf16(2B/elem)
-        let bf16_draft = PerTokBytes::of(&d, 16, 1, Some(2), None);
+        let bf16_draft = PerTokBytes::of(&d, 16, 1, Some(2), None, None);
         assert_eq!((bf16_draft.main_kv, bf16_draft.draft_pool), (32768, 20480));
         assert_eq!(bf16_draft.total(), 53248, "生产档 per_tok(boot 日志实测)");
         // 草稿池 elem 由 `KvQuant::size_bytes` 驱动
-        let fp8_draft = PerTokBytes::of(&d, 16, 1, Some(1), None);
+        let fp8_draft = PerTokBytes::of(&d, 16, 1, Some(1), None, None);
         assert_eq!(fp8_draft.draft_pool, 10240, "草稿池 fp8 ⇒ 逐 token 减半");
         // 非投机档 = 纯主池(池 f16 2B/elem)
-        assert_eq!(PerTokBytes::of(&d, 16, 2, None, None).total(), 65536);
+        assert_eq!(PerTokBytes::of(&d, 16, 2, None, None, None).total(), 65536);
+        // MTP 链项(2026-10-21):fp8 = 2 KiB/token、f16 = 4 KiB/token —— 单列可验
+        assert_eq!(PerTokBytes::of(&d, 16, 1, None, None, Some(1)).mtp_chain, 2 * d.hkv * d.hd);
+        assert_eq!(PerTokBytes::of(&d, 16, 1, None, None, Some(2)).mtp_chain, 4 * d.hkv * d.hd);
     }
 
     /// 固定项:GDN 格/快照按几何算,图 slab + warmup 两常数之和**必须仍是

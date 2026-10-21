@@ -1772,10 +1772,15 @@ fn boot_pool_plan(
     tp: Option<&owl_models::module::TpCtx>,
     live_baseline_per_card: u64,
 ) -> crate::state::PoolPlan {
-    let pool_tokens = cfg.knobs.pool_tokens.unwrap_or(2 * s);
+    // **自动档**(2026-10-21):`[pool].pool_tokens` 未写 ⇒ 池 = 本档 ctx,
+    // 由 `StatePool::alloc` 按显存预算校验并回报 `ctx_max`(不再 2× 单会话)。
+    let pool_auto = cfg.knobs.pool_tokens.is_none();
+    let pool_tokens = cfg.knobs.pool_tokens.unwrap_or(s);
     let plan = crate::state::PoolPlan {
         seq_tokens: s,
         pool_tokens,
+        pool_auto,
+        ws_tokens: cfg.knobs.workspace_per_req,
         // **锁①门控**:只有虚拟化真的开着(配置显式 `select_decode` +
         // `select_partial`)才允许池小于上下文 —— 否则链超出池容量必
         // `Exhausted`(无洞可停,即无选择层可挤)。
@@ -1937,6 +1942,20 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 位置 = 装配期(页几何已知)、**与虚拟化档无关** —— 诊断档(只跑选择器
         // 读数)也要同一口径,否则配置写了 token 却被静默忽略。
         boot_pool_floor(cfg, &pool, s, plan.pool_tokens)?;
+    {
+        // **池的落账行**(2026-10-21):算式上限(`[ctx-max] cap`)与真实可服务
+        // 上限之间还差一块**未入账固定开销**(CUDA ctx + FI ws + 图 slab + 碎片,
+        // 本机实测 ≈1.6 GiB)+ 每 turn 瞬态(34~300 MiB)。本行只报池本身,
+        // 经验值留在 profile 档头/bench 卷(216k ✓ / 220k 差 17 MiB / 224k ✗)。
+        let pool_mib = (pool.geom.nb as u64 * pool.block_bytes() as u64) >> 20;
+        eprintln!(
+            "[ctx-max] 池落账 {} MiB({} tok × {} 页宽;工作集 {} tok 常驻,Strict 准入)",
+            pool_mib,
+            pool.geom.nb * pool.geom.page,
+            pool.geom.page,
+            cfg.knobs.workspace_per_req
+        );
+    }
         if let Some(q) = fi_quant {
             owl_shared::log_info!("boot", "FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
                 q
