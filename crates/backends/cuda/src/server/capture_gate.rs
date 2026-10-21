@@ -40,6 +40,7 @@ pub(super) fn reject_closed(cmd: Command) {
             Command::DtohBatch { ack, .. } => closed!(ack),
             Command::Swap { ack, .. } => closed!(ack),
             Command::Free { ack, .. } => closed!(ack),
+            Command::Batch { ack, .. } => closed!(ack),
             Command::CopyBlock { ack, .. } => closed!(ack),
             Command::CopyBatch { ack, .. } => closed!(ack),
             Command::Launch { ack, .. } => closed!(ack),
@@ -99,6 +100,7 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::PeerRelease { .. } => "PeerRelease",
             Command::CaptureRoute { .. } => "CaptureRoute",
             Command::CaptureJoin { .. } => "CaptureJoin",
+            Command::Batch { .. } => "Batch",
             Command::Close { .. } => "Close",
         };
         sink.logf(owl_shared::log::LVL_WARN, "owl-gpu", format_args!("捕获期拒绝: {} —— {why}", name(&cmd)));
@@ -149,6 +151,8 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::PeerAlloc { ack, .. } => reject!(ack),
             Command::PeerImport { ack, .. } => reject!(ack),
             Command::PeerRelease { ack, .. } => reject!(ack),
+            // 批外壳:本条路径不该到(捕获期由 `handle_batch` 逐条过白名单)
+            Command::Batch { ack, .. } => reject!(ack),
             Command::Close { ack } => ack.send(Ok(())), // 幂等
         }
     }

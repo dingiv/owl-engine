@@ -116,6 +116,8 @@ pub(super) fn entry_of(ctx: &GpuCtx, cmd: &Command) -> TraceEntry {
                 let ptrs = resolve(ids);
                 E::new("free", "").ids(ids.clone()).ptrs(ptrs)
             }
+            // 原生批:外壳只计一条(逐条的真实发射账由图内**内层信封**各自记)
+            Command::Batch { cmds, .. } => E::new("batch", "ctl").bytes(cmds.len()),
             Command::CopyBlock { src, dst, len_bytes, .. } => {
                 E::new("copy_block", "compute").bytes(*len_bytes).ids([*src, *dst])
             }

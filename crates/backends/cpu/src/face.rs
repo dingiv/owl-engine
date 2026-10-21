@@ -131,6 +131,9 @@ pub struct CpuFace {
     alloc_calls: u32,
     /// 图捕获态(`None` = 不在捕获窗)
     capture: Option<Vec<Recorded>>,
+    /// **累积批的待提交队列**(`queue` 追加 / `flush` 一次提交;2026-10-21)。
+    /// CPU 面没有信箱往返 ⇒ flush 逐条即序(segments 如实报 N)。
+    pending: Vec<owl_iface::command::Command>,
     /// 已实例化的图(`GraphId` → 录制序列)
     graphs: HashMap<u64, Vec<Recorded>>,
     next_graph: u64,
@@ -163,6 +166,7 @@ impl CpuFace {
             graphs: HashMap::new(),
             next_graph: 1,
             pinned_free: Vec::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -415,6 +419,118 @@ fn encode_from(dtype: Dtype, src: &[f32], dst: &mut [u8]) -> Result<(), ModelErr
 }
 
 impl DeviceClient for CpuFace {
+    /// **单条设备命令**(2026-10-21 契约收口):CPU 面 = 同步直调,
+    /// "完成即返回";具体语义仍由下方既有覆写承担(不另起一套)。
+    async fn exec(
+        &mut self,
+        cmd: owl_iface::command::Command,
+    ) -> Result<owl_iface::command::Outcome, ModelError> {
+        use owl_iface::command::{Command as C, Outcome};
+        // 队列非空 ⇒ 响亮拒(与 GPU 面同律;CPU 面虽无往返,顺序承诺一致)
+        if !self.pending.is_empty() {
+            return Err(ModelError::Msg(format!(
+                "命令面:还有 {} 条命令未提交(先 `flush()`)",
+                self.pending.len()
+            )));
+        }
+        match cmd {
+            C::Alloc { dtype, elems, zero, name } => {
+                let b = if zero {
+                    self.alloc(dtype, elems, &name).await?
+                } else {
+                    self.alloc_uninit(dtype, elems, &name).await?
+                };
+                Ok(Outcome::Buf(b))
+            }
+            C::Free { ids } => {
+                self.free(&ids).await?;
+                Ok(Outcome::Done)
+            }
+            C::Htod { dtype, shape, src, stream, name } => {
+                // CPU 面无流:承载点即"落地",流选择无语义(不是静默丢弃 ——
+                // 上游两条路径最终都落到同一同步拷贝)
+                let _ = stream;
+                Ok(Outcome::Buf(self.htod(dtype, &shape, &src, &name).await?))
+            }
+            C::Dtoh { id, off_bytes, want_bytes } => {
+                let b = Bytes::new(id, 0, Dtype::U8, 0);
+                let mut out = vec![0u8; want_bytes];
+                if off_bytes == 0 {
+                    self.dtoh(&b, &mut out).await?;
+                } else {
+                    self.dtoh_at(&b, off_bytes, &mut out).await?;
+                }
+                Ok(Outcome::Bytes(out))
+            }
+            C::Launch { msg } => Ok(Outcome::Buf(self.launch(msg).await?)),
+            C::Sync => {
+                self.sync().await?;
+                Ok(Outcome::Done)
+            }
+            C::GraphBegin => {
+                self.graph_begin().await?;
+                Ok(Outcome::Done)
+            }
+            C::GraphEnd => Ok(Outcome::Graph(self.graph_end().await?)),
+            C::GraphLaunch { graph } => {
+                self.graph_launch(graph).await?;
+                Ok(Outcome::Done)
+            }
+            C::GraphAbort => {
+                self.graph_abort().await?;
+                Ok(Outcome::Done)
+            }
+            C::GraphDestroy { graph } => {
+                self.graph_destroy(graph).await?;
+                Ok(Outcome::Done)
+            }
+        }
+    }
+
+    /// **追加到待提交批**(不入队任何设备动作;CPU 面纯 Host 缓存)。
+    fn queue(
+        &mut self,
+        cmd: owl_iface::command::Command,
+    ) -> Result<usize, ModelError> {
+        let i = self.pending.len();
+        self.pending.push(cmd);
+        Ok(i)
+    }
+
+    /// **提交并等待本批**:CPU 面逐条即序(segments = N,不冒功)。
+    async fn flush(&mut self) -> Result<owl_iface::command::BatchOutcome, ModelError> {
+        if self.pending.is_empty() {
+            return Ok(owl_iface::command::BatchOutcome::empty());
+        }
+        let cmds = std::mem::take(&mut self.pending);
+        let mut outcomes = Vec::with_capacity(cmds.len());
+        for cmd in cmds {
+            outcomes.push(self.exec(cmd).await);
+        }
+        let n = outcomes.len();
+        Ok(owl_iface::command::BatchOutcome::collect(outcomes, n))
+    }
+
+    /// **批**:CPU 面同线程、零信箱往返 ⇒ 逐条即序。
+    /// `segments` 如实报 N(不冒功报 1 —— 它衡量的是"投递段数",CPU 面就是 N)。
+    async fn exec_batch(
+        &mut self,
+        cmds: Vec<owl_iface::command::Command>,
+    ) -> Result<owl_iface::command::BatchOutcome, ModelError> {
+        if !self.pending.is_empty() {
+            return Err(ModelError::Msg(format!(
+                "命令面:还有 {} 条命令未提交(先 `flush()`)",
+                self.pending.len()
+            )));
+        }
+        let mut outcomes = Vec::with_capacity(cmds.len());
+        for cmd in cmds {
+            outcomes.push(self.exec(cmd).await);
+        }
+        let segments = outcomes.len();
+        Ok(owl_iface::command::BatchOutcome::collect(outcomes, segments))
+    }
+
     /// 进入捕获窗(不可嵌套;窗内只录不发)。
     async fn graph_begin(&mut self) -> Result<(), ModelError> {
         if !self.mock.graph_capture {

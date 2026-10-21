@@ -49,6 +49,7 @@
 /// 后端 Arch 标识(与 kernels 的 arch 分发表共用一套词汇)
 pub use owl_kernels::Arch;
 
+pub mod command;
 pub mod contract;
 /// **DeviceHandle:分配账 + 命令面**(2026-10-19;设计卷 device-命令面与分配账)
 pub mod handle;
@@ -59,6 +60,8 @@ pub use contract::{
     numel, Arg, Bytes, ConnSlot, Connector, DeviceClient, Dtype, GraphId, KernelSource, LaunchMsg,
     ModelError, Shape, SwapDir, SwapPiece,
 };
+// 设备命令面(SDK ↔ server 的唯一单位;2026-10-21)
+pub use command::{BatchOutcome, Command, Outcome};
 
 /// 缓冲令牌:(id, generation) 二元组。词汇权威在 iface(A1:
 /// 词汇类型归 iface;2026-09-23 从 signal 移入以断 shared(device)→cuda→iface 环)。

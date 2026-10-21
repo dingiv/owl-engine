@@ -7,6 +7,7 @@
 //! 并分别传入 [`GpuServer::new`](crate::GpuServer) 与
 //! [`GpuClient::new`](crate::GpuClient)。
 
+use owl_iface::command::{Command as DeviceCommand, Outcome};
 use owl_iface::contract::{Bytes, GraphId, LaunchMsg};
 use owl_iface::contract::{Connector, ModelError, SwapDir, SwapPiece};
 use std::future::Future;
@@ -316,6 +317,17 @@ pub enum Command {
     Sync {
         ack: Ack<Result<(), ModelError>>,
     },
+    /// **命令面原生批**(2026-10-21):一条信箱消息装 N 条**设备命令**,
+    /// 服务端在同一线程逐条派发、全部子回执落定后一次性回执。
+    ///
+    /// 为什么必须进这一层:批的唯一价值 = **省掉逐条的线程间往返**。
+    /// 若在客户端逐条发信封再 join,后端看不见批,,也无法做原生合并
+    /// (如 N 段 htod 合成一次 DMA)。回执 = `BatchOutcome`(逐条结果 +
+    /// `first_err` + `segments`)。
+    Batch {
+        cmds: Vec<owl_iface::command::Command>,
+        ack: Ack<Result<owl_iface::command::BatchOutcome, ModelError>>,
+    },
     /// 优雅关机:回执后进入 Closing —— 排空积压命令(结构化拒绝),
     /// 排空在飞完成回调,设备栅栏,线程退出
     Close {
@@ -365,6 +377,7 @@ impl Command {
             Self::PeerAlloc { .. } => "peer_alloc",
             Self::PeerImport { .. } => "peer_import",
             Self::PeerRelease { .. } => "peer_release",
+            Self::Batch { .. } => "batch",
             Self::Close { .. } => "close",
         }
     }
@@ -408,6 +421,7 @@ impl Command {
             Self::PeerAlloc { ack, .. } => ack.created_at(),
             Self::PeerImport { ack, .. } => ack.created_at(),
             Self::PeerRelease { ack, .. } => ack.created_at(),
+            Self::Batch { ack, .. } => ack.created_at(),
             Self::Close { ack, .. } => ack.created_at(),
         }
     }
@@ -427,7 +441,20 @@ struct Once<T> {
     created: std::time::Instant,
 }
 
-pub struct Ack<T>(Arc<Once<T>>);
+pub struct Ack<T> {
+    repr: AckRepr<T>,
+    /// 命令创建时刻(分相探针:server 出队时减它 = 入队→出队的唤醒延迟)
+    created: std::time::Instant,
+}
+
+/// 回执的两种形态:
+/// - `Once`:客户端 `pair()` 的对端(值存进 `Once`,唤醒 waker);
+/// - `Sink`:服务端/适配层的**续接回执** —— 收到值后立刻执行闭包
+///   (命令面外壳把子命令的具体载荷转成 `Outcome`,批的收口把逐条结果拼成批报)。
+enum AckRepr<T> {
+    Once(Arc<Once<T>>),
+    Sink(Box<dyn FnOnce(T) + Send>),
+}
 
 impl<T> Ack<T> {
     pub fn pair() -> (Self, Waiter<T>) {
@@ -436,19 +463,50 @@ impl<T> Ack<T> {
             waker: Mutex::new(None),
             created: std::time::Instant::now(),
         });
-        (Self(inner.clone()), Waiter(inner))
+        (
+            Self { repr: AckRepr::Once(inner.clone()), created: inner.created },
+            Waiter(inner),
+        )
+    }
+
+    /// **续接回执**(服务端内部用:子载荷 → 统一结果)。
+    /// `f` 在回执点执行一次,不跨线程共享(闭包本身随命令移动)。
+    pub fn sink(f: impl FnOnce(T) + Send + 'static) -> Self {
+        Self {
+            repr: AckRepr::Sink(Box::new(f)),
+            created: std::time::Instant::now(),
+        }
+    }
+
+    /// **回执适配**:返回一个接收 `U` 的 ack,收到后经 `f` 变成 `T` 再交给本 ack。
+    /// 用途 = 命令面外壳(子命令的 `Result<Bytes/()/GraphId>` → 统一 `Result<Outcome>`)。
+    pub fn adapt<U>(self, f: impl FnOnce(U) -> T + Send + 'static) -> Ack<U>
+    where
+        T: Send + 'static,
+        U: 'static,
+    {
+        let created = self.created;
+        Ack {
+            repr: AckRepr::Sink(Box::new(move |v: U| self.send(f(v)))),
+            created,
+        }
     }
 
     /// 命令创建时刻(分相探针:server 出队时减它 = 入队→出队的唤醒延迟)
     pub fn created_at(&self) -> std::time::Instant {
-        self.0.created
+        self.created
     }
 
-    /// server 侧回执:落值 + 唤醒 client Future
+    /// server 侧回执:落值 + 唤醒 client Future / 执行续接
     pub fn send(self, v: T) {
-        *self.0.value.lock().unwrap() = Some(v);
-        if let Some(w) = self.0.waker.lock().unwrap().take() {
-            w.wake();
+        match self.repr {
+            AckRepr::Once(o) => {
+                *o.value.lock().unwrap() = Some(v);
+                if let Some(w) = o.waker.lock().unwrap().take() {
+                    w.wake();
+                }
+            }
+            AckRepr::Sink(f) => f(v),
         }
     }
 }
@@ -468,5 +526,98 @@ impl<T: Send + 'static> Future for Waiter<T> {
             return Poll::Ready(v);
         }
         Poll::Pending
+    }
+}
+
+// ============================================================================
+// 命令面映射:设备命令(契约)→ 信箱信封(实现面)
+// ============================================================================
+
+/// **设备命令 → 信箱信封**(单一真源:客户端 `exec` 与服务端批的逐条派发
+/// **共用本函数**)。
+///
+/// 它做两件事,而且只在这里做:
+/// 1. **载荷映射**:`owl_iface::command::Command` → 既有细粒度信封;
+/// 2. **回执变换**:子命令的具体回执(`Result<Bytes/()/GraphId/…>`)
+///    → 统一的 `Result<Outcome>`。
+///
+/// 为什么映射在 cuda crate 而不在 iface:信封是 CUDA 后端的实现细节
+/// (流路由/阶段化回执),契约只认 `Command`/`Outcome`。
+///
+/// 补一条新设备命令 = 这里加一臂 + server `dispatch` 复用同一条信封,
+/// **不新增客户端方法、不新增 server 入口**。
+pub fn envelope_of(cmd: DeviceCommand, ack: Ack<Result<Outcome, ModelError>>) -> Command {
+    use owl_iface::contract::numel;
+
+    fn buf_ack(ack: Ack<Result<Outcome, ModelError>>) -> Ack<Result<Bytes, ModelError>> {
+        ack.adapt(|r: Result<Bytes, ModelError>| r.map(Outcome::Buf))
+    }
+    fn done_ack(ack: Ack<Result<Outcome, ModelError>>) -> Ack<Result<(), ModelError>> {
+        ack.adapt(|r: Result<(), ModelError>| r.map(|()| Outcome::Done))
+    }
+    fn bytes_ack(ack: Ack<Result<Outcome, ModelError>>) -> Ack<Result<Vec<u8>, ModelError>> {
+        ack.adapt(|r: Result<Vec<u8>, ModelError>| r.map(Outcome::Bytes))
+    }
+    fn graph_ack(ack: Ack<Result<Outcome, ModelError>>) -> Ack<Result<GraphId, ModelError>> {
+        ack.adapt(|r: Result<GraphId, ModelError>| r.map(Outcome::Graph))
+    }
+    let sid = |s: owl_iface::contract::UpStream| -> u8 {
+        (match s {
+            owl_iface::contract::UpStream::H2d => crate::state::STREAM_H2D,
+            owl_iface::contract::UpStream::Compute => crate::state::STREAM_COMPUTE,
+        }) as u8
+    };
+
+    match cmd {
+        DeviceCommand::Alloc { dtype, elems, zero, name } => Command::Alloc {
+            n_bytes: elems * dtype.size_bytes(),
+            elems,
+            zero,
+            name,
+            // 事实面定形(与旧 `GpuClient::alloc` 逐字同口径):服务端只回
+            // 句柄(U8/rank0 占位),dtype 由命令携带;rank 留给调用点 view 定形
+            ack: ack.adapt(move |r: Result<Bytes, ModelError>| {
+                r.map(|mut b| {
+                    b.dtype = dtype;
+                    b.rank = 0;
+                    Outcome::Buf(b)
+                })
+            }),
+        },
+        DeviceCommand::Free { ids } => Command::Free { ids, ack: done_ack(ack) },
+        DeviceCommand::Htod { dtype, shape, src, stream, name } => {
+            // 事实面(元素数/阶数)随命令走 —— 服务端只回 id,**由本面按命令定形**
+            // (与旧 `GpuClient::htod` 逐字同口径:U8/rank0 占位由信封携带)
+            let (elems, rank) = (numel(&shape), shape.len() as u8);
+            Command::Htod {
+                data: src,
+                name,
+                stream: sid(stream),
+                ack: ack.adapt(move |r: Result<Bytes, ModelError>| {
+                    r.map(|mut b| {
+                        b.len = elems;
+                        b.dtype = dtype;
+                        b.rank = rank;
+                        Outcome::Buf(b)
+                    })
+                }),
+            }
+        }
+        DeviceCommand::Dtoh { id, off_bytes, want_bytes } => {
+            if off_bytes == 0 {
+                Command::Dtoh { id, want_bytes, ack: bytes_ack(ack) }
+            } else {
+                Command::DtohAt { id, off_bytes, want_bytes, ack: bytes_ack(ack) }
+            }
+        }
+        DeviceCommand::Launch { msg } => Command::Launch { msg, ack: buf_ack(ack) },
+        DeviceCommand::Sync => Command::Sync { ack: done_ack(ack) },
+        DeviceCommand::GraphBegin => Command::GraphBegin { ack: done_ack(ack) },
+        DeviceCommand::GraphEnd => Command::GraphEnd { ack: graph_ack(ack) },
+        DeviceCommand::GraphLaunch { graph } => Command::GraphLaunch { graph, ack: done_ack(ack) },
+        DeviceCommand::GraphAbort => Command::GraphAbort { ack: done_ack(ack) },
+        DeviceCommand::GraphDestroy { graph } => {
+            Command::GraphDestroy { graph, ack: done_ack(ack) }
+        }
     }
 }
