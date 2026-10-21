@@ -957,12 +957,14 @@ iface 11 · gpu_server 2 · workspace check 干净。
 
 旁证:**块池本身**就是最大的一刀(96.9 → 48.0 µs/节点,旧代码下已成立)——
 它把"每节点 alloc+free+launch 三次往返"压成"一次发射"。
-⇒ **下一刀 = 把 `OWL_BLOCK_POOL` 升格为配置键并默认开**(见 §13.8 待办),
+块池预算同一时刻已被 main 收编为配置键 `[pool] block_pool_bytes`(原 `OWL_BLOCK_POOL`
+env 退场),**缺省 0 = 关** ⇒ 本分支的分档判据自动跟随配置,零代码改动。
+⇒ **下一刀 = 让生产档显式声明 `block_pool_bytes`(建议 64–256 MiB)**,
 再用 27B 真模型复核显存峰值与 prefill 绝对值。
 
 ### 门
 
 `crates/models/tests/eval_batch_gate.rs`(真卡 2 条):解释器批处理**数值不变**(含非 256 对齐尾块)
 + **"没有任何发射绕过 queue"**的回归哨(绕过 ⇒ 命令面"未提交"拒 ⇒ 红)·
-`eval_batch_bench.rs`(诊断,A/B 夹具;无 `OWL_TEST_DEVICE` 即 skip)·
+`eval_batch_bench.rs`(诊断,A/B 夹具;无 `OWL_TEST_DEVICE` 即 skip;预算走 `OWL_BENCH_POOL_BYTES` 测试面注入)·
 `owl-models` 282 · `owl-engine` 115 · CPU/GPU 命令面门全绿。

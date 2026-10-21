@@ -4,16 +4,17 @@
 //! 关键变量 = `OWL_BLOCK_POOL`(块池预算;池开 ⇒ 逐节点 alloc 退化为零命令,
 //! 发射才能真的攒成批;池关 ⇒ 每个节点前面必有一次 `flush`,批长退回 1)。
 //!
-//! 运行:
+//! 运行(块池预算走**配置键** `[pool] block_pool_bytes`;本夹具用
+//! `OWL_BENCH_POOL_BYTES` 走测试面注入,不改生产配置):
 //! ```text
-//! OWL_TEST_DEVICE=01:00.0 OWL_BLOCK_POOL=$((64<<20)) \
+//! OWL_TEST_DEVICE=01:00.0 OWL_BENCH_POOL_BYTES=$((64<<20)) \
 //!   cargo test -p owl-models --test eval_batch_bench -- --nocapture
 //! ```
 
 use owl_cuda::{test_device_ordinal_opt, Command as Envelope, DeviceSelector, GpuClient, GpuServer};
 use owl_iface::contract::{DeviceClient, Dtype};
 use owl_iface::handle::DeviceHandle;
-use owl_models::env::EnvProvider;
+use owl_models::env::{EnvProvider, InterpEnv};
 use owl_models::interpreters::eval_ops_scoped_env;
 use owl_models::tensor::TensorOps;
 
@@ -45,6 +46,15 @@ async fn eval_host_cost_probe() {
     };
     const N: usize = 256;
     const DEPTH: usize = 200;
+    // 块池预算(测试面注入;生产 = `[pool] block_pool_bytes`)
+    let budget: usize = std::env::var("OWL_BENCH_POOL_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let env = EnvProvider {
+        interp: InterpEnv { block_pool_bytes: budget, ..Default::default() },
+        ..Default::default()
+    };
 
     let bv: Vec<f32> = (0..N).map(|i| 1.0 + i as f32 * 1e-3).collect();
     let b = TensorOps::from_host(Dtype::F32, vec![N], &le_f32(&bv));
@@ -54,7 +64,7 @@ async fn eval_host_cost_probe() {
     }
 
     // 预热(核缓存/池暖机)
-    let (root, cands) = eval_ops_scoped_env(&x, &mut face, EnvProvider::default(), None)
+    let (root, cands) = eval_ops_scoped_env(&x, &mut face, env, None)
         .await
         .expect("warmup eval");
     face.free(&cands).await.expect("free cands");
@@ -62,7 +72,7 @@ async fn eval_host_cost_probe() {
     let mut best = f64::MAX;
     for _ in 0..3 {
         let t0 = std::time::Instant::now();
-        let (root, cands) = eval_ops_scoped_env(&x, &mut face, EnvProvider::default(), None)
+        let (root, cands) = eval_ops_scoped_env(&x, &mut face, env, None)
             .await
             .expect("eval");
         let dt = t0.elapsed().as_secs_f64();
@@ -73,7 +83,7 @@ async fn eval_host_cost_probe() {
     let per_node_us = best * 1e6 / (DEPTH + 1) as f64;
     println!(
         "[eval 账] 池预算={} MiB · {DEPTH} 节点 add:总 {:.2}ms / {:.2}µs 每节点",
-        std::env::var("OWL_BLOCK_POOL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) >> 20,
+        budget >> 20,
         best * 1e3,
         per_node_us
     );
