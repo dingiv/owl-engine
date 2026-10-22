@@ -143,11 +143,12 @@ impl<D: DeviceClient> GraphFleet<D> {
             });
         }
         let i = self.depth_slot(depth)?;
+        // 单图(按最大 rows=depth 捕获)覆盖全部 rows;行数由 `cu` 输入在回放时给。
         self.depths[i]
             .fold
-            .get_mut(rows - 1)
+            .first_mut()
             .ok_or_else(|| ModelError::EngineInvariant {
-                what: format!("spec depth {depth} fold 图桶 rows={rows} 缺席"),
+                what: format!("spec depth {depth} fold 图缺席（eager 路径应由 has_fold 拦）"),
             })
     }
 
@@ -271,7 +272,10 @@ impl<D: DeviceClient> GraphFleet<D> {
             None
         };
         // V1c:decode_fi 开 ⇒ 同图走 piecewise,断点挂 decode 核
-        let (session, capture_outcome, decode_fi_node) = Self::plan_session(face, &boot, t0).await?;
+        let (mut session, capture_outcome, decode_fi_node) =
+            Self::plan_session(face, &boot, t0).await?;
+        let mut phase = crate::engine::VramPhase::new();
+        phase.mark_info("graph:session", session.face_mut().mem_info().await);
         // ② verify 桶形图（自适应档可能有多张：每个 active depth 一张）。
         // 先为每档领一张 face（第一张 = vface，其余从 extra_faces 头部取），
         // 再逐档建 verify → fold/propose；图族不能跨 depth 复用（见 DepthGraphs 注）。
@@ -305,6 +309,10 @@ impl<D: DeviceClient> GraphFleet<D> {
                     what: format!("verify face 缺席（depth={depth}）"),
                 })?;
                 let (verify, fi_node) = Self::plan_verify(vface, &boot, t0, depth).await?;
+                phase.mark_info(
+                    &format!("graph:verify(depth={depth})"),
+                    session.face_mut().mem_info().await,
+                );
                 verify_fi_node |= fi_node;
                 let Some(vg) = verify.as_ref() else {
                     if boot.spec.adaptive_depth {
@@ -324,6 +332,10 @@ impl<D: DeviceClient> GraphFleet<D> {
                 let fold = Self::plan_fold_family(vg, &mut extra_faces, &boot, t0, depth).await?;
                 let propose =
                     Self::plan_propose_family(vg, &mut extra_faces, &boot, t0, depth).await?;
+                phase.mark_info(
+                    &format!("graph:fold+propose(depth={depth})"),
+                    session.face_mut().mem_info().await,
+                );
                 if boot.spec.adaptive_depth {
                     let want_fold = depth;
                     let want_propose = depth + 1;
@@ -386,6 +398,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         } else {
             None
         };
+        phase.mark_info("graph:batch", session.face_mut().mem_info().await);
         // **现役臂自证**(2026-10-16 立;2026-10-18 改**事实位**)。
         // ⚠️ 判据 = 建树期"FI 面是否真登记"(`*_fi_node`),**不是旋钮** ——
         // 按旋钮猜曾把"FI 根本没进图、跑的是回落臂"报成 "FI(单图)"(坑册 §58)。
@@ -458,7 +471,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             if total > budget {
                 owl_shared::log_warn!(
                     "boot",
-                    "⚠️ 图 slab 预算对账:实测 {:.1}MiB > 预算假设 {}MiB(+{:.1}MiB,图族/臂换代后预算偏小)⇒ 池上限可能偏大(请求级 OOM 风险):把 GRAPH_SLAB_BUDGET 校准为新实测值(engine/src/state.rs),或下调 pool_tokens",
+                    "⚠️ 图 slab 预算对账:实测 {:.1}MiB > 预算假设 {}MiB(+{:.1}MiB,图族/臂换代后预算偏小)⇒ 池上限可能偏大(请求级 OOM 风险):把 GRAPH_SLAB_BUDGET 校准为新实测值(engine/src/state.rs),或下调 max_seq / per_tok",
                     mbf(total),
                     mb(budget),
                     mbf(total - budget),
@@ -1212,7 +1225,23 @@ impl<D: DeviceClient> GraphFleet<D> {
             })
             .collect::<Result<Vec<_>>>()?;
         let n_roots = pool.gdn_count() * 4;
-        for m in 0..depth {
+        // **单图覆盖全部 rows(2026-10-22)**:fold 的 m 只影响 record/输出视图形状
+        // 与网格 tile 数(≤32 行恒 1 tile);conv/recurrence 核按设备侧 `cu=[0,rows]`
+        // 截断 ⇒ 按**最大 rows + 1** 捕一张,回放时写 `cu` 即可。
+        // 7 张桶图实测各 ~66 MiB 驱动侧 exec 内存,单图直接省 ~400 MiB。
+        //
+        // ⚠️ **必须多捕一行(2026-10-22 实测)**:按 `m1 = depth` 捕获时
+        // rows=depth 的折叠状态错(65k AL 2.18 vs 2.96);`m1 = depth+1` 后与
+        // 逐 m 桶图/eager 逐位一致(AL 2.955)。verify 记录块本身有 depth+1 行,
+        // 多捕一行不越界。动这个数之前先跑 65k AL 恒等门。
+        let mmax = depth;
+        let m1 = mmax + 1;
+        assert!(
+            m1 <= owl_shared::config::SPEC_VERIFY_ROWS_MAX,
+            "fold 单图: m1={m1} > SPEC_VERIFY_ROWS_MAX={}",
+            owl_shared::config::SPEC_VERIFY_ROWS_MAX
+        );
+        for m in [mmax] {
             let m1 = m + 1;
             let model_f = Arc::clone(&boot.model);
             let gdn_caches = pool.gdn_caches();
@@ -1293,7 +1322,12 @@ impl<D: DeviceClient> GraphFleet<D> {
             .await?;
             match fout {
                 PlanOutcome::Captured => {
-                    owl_shared::log_info!("boot", "fold 桶形图捕获(m={m}) +{:.2}s", t0.elapsed().as_secs_f32());
+                    owl_shared::log_info!(
+                        "boot",
+                        "fold 单图捕获(rows≤{};m={m}) +{:.2}s",
+                        depth,
+                        t0.elapsed().as_secs_f32()
+                    );
                     fold_graphs.push(fg);
                 }
                 other => owl_shared::log_info!("boot", "fold 图降级(m={m},{other:?})→ eager fold"),

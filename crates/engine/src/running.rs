@@ -1030,6 +1030,17 @@ impl<D: DeviceClient> RunningEngine<D> {
         out
     }
 
+    /// **设备显存实况**(只读;`/debug/vram` 的驱动残差):`(free, total)`。
+    pub async fn mem_info(&mut self) -> std::result::Result<(u64, u64), String> {
+        self.dev
+            .graphs
+            .session
+            .face_mut()
+            .mem_info()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// **默认池缓存回收(逐 rank)** —— turn 收尾 / 压力旁路调。
     ///
     /// 语义:`cuMemPoolTrimTo(0)` 把池内**已 free 的缓存页**还给 OS(不改块账)。

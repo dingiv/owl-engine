@@ -714,6 +714,76 @@ fn bf16_parity(res: &mut TestRes, n: usize, rows: usize) {
 }
 
 // ============================================================================
+// §5b embed int8(P8;q/s → f16,host f32 参考)
+// ============================================================================
+
+fn embed_i8_parity(res: &mut TestRes) {
+    let entry = "owl_embed_i8_f16";
+    let src = <owl_kernels::ops::elems::EmbedI8F16 as owl_kernels::spec::KernelSpec>::SRC;
+    let mut exec = Exec::new();
+    let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
+
+    let (vocab, d_dim, tokens) = (64usize, 512usize, 3usize);
+    // int8 位型(含负值);per-row scale 正数
+    let qb: Vec<u8> = (0..vocab * d_dim)
+        .map(|i| ((((i * 37 + 11) % 255) as i32) - 127) as i8 as u8)
+        .collect();
+    let scales: Vec<f32> = (0..vocab).map(|i| 0.001 + i as f32 * 0.0007).collect();
+    let ids: Vec<f32> = (0..tokens).map(|t| ((t * 17 + 3) % vocab) as f32).collect();
+
+    let bq = res.blk(qb.len(), "q");
+    res.up(bq, &qb);
+    let bs = res.blk(scales.len() * 4, "s");
+    res.up(bs, as_bytes_f32(&scales));
+    let bi = res.blk(tokens * 4, "ids");
+    res.up(bi, as_bytes_f32(&ids));
+    let bo = res.blk(tokens * d_dim * 2, "out");
+
+    let geom = geom_e::embed_i8(tokens);
+    let vals = [
+        LaunchVal::Ptr(res.ptr(bq)),
+        LaunchVal::Ptr(res.ptr(bs)),
+        LaunchVal::Ptr(res.ptr(bi)),
+        LaunchVal::U64(d_dim as u64),
+        LaunchVal::Ptr(res.ptr(bo)),
+    ];
+    fire(res, &mut exec, &f, entry, geom.shape.grid, geom.shape.block, 0, &vals);
+    res.sync();
+    let mut got = vec![0u8; tokens * d_dim * 2];
+    res.down(bo, &mut got);
+    let got = f16_from_bytes(&got);
+
+    let mut bad = 0usize;
+    let mut worst = 0f32;
+    for t in 0..tokens {
+        let id = ids[t] as usize;
+        for i in 0..d_dim {
+            let qi = qb[id * d_dim + i] as i8 as f32;
+            let want = half::f16::from_f32(qi * scales[id]);
+            let g = half::f16::from_bits(got[t * d_dim + i]);
+            if g.to_bits() != want.to_bits() {
+                bad += 1;
+                worst = worst.max((g.to_f32() - want.to_f32()).abs());
+            }
+        }
+    }
+    println!(
+        "  {entry:<32} grid={:?} block={:?} → {} (bad={bad}, worst={worst:e})",
+        geom.shape.grid, geom.shape.block, if bad == 0 { "✓ 逐位" } else { "✗" }
+    );
+    assert_eq!(bad, 0, "embed_i8 与 host f32 参考不一致(bad={bad}, worst={worst:e})");
+}
+
+#[test]
+fn embed_i8_parity_gate() {
+    let Some(mut res) = TestRes::new() else {
+        owl_shared::testkit::report::skip("需 OWL_TEST_DEVICE=<CUDA ordinal>");
+        return;
+    };
+    embed_i8_parity(&mut res);
+}
+
+// ============================================================================
 // §7 台子
 // ============================================================================
 

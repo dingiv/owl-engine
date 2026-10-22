@@ -1283,6 +1283,10 @@ pub enum QuantPlan {
     /// **不走 `Linear`**:`Linear` 已有四条臂(F16/W4A16/W4A16Awq/W4A8Awq),
     /// 再插一条会变成"万能类型";int8 头只有 lm_head 一个消费者 ⇒
     /// 由 `Embedding::head_i8` 单槽承载(回退 = 删槽,bf16 原路不动)。
+    ///
+    /// **表计划位也复用它**(P8,2026-10-22):`Model::new_with_embed` 传
+    /// `Some(I8W)` ⇒ `Embedding::set_table_plan` 建 int8 表槽(按调用位置
+    /// 区分,不与 `head_i8` 同槽);仅 untied。
     I8W,
 }
 

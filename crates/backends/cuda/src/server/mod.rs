@@ -966,6 +966,7 @@ impl GpuServer {
                 crate::state::pool_ledger_snapshot()
                     .ok_or_else(|| ModelError::Msg("mem_pool_stats: 池账不可读".into())),
             ),
+            Command::MemInfo { ack } => ack.send(self.ctx().mem_info()),
             Command::UploadAndLaunch { dst, chunks, msg, ack } => {
                 self.handle_upload_and_launch(dst, chunks, msg, ack)
             }

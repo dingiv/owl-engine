@@ -18,7 +18,6 @@ name = "qwen3.8-27b"
 max_seq = 40960
 
 [pool]
-pool_tokens = 41216
 
 [spec]
 draft_path = "../../models/syvai/Qwen3.8-27B-DFlash2-W4A16"

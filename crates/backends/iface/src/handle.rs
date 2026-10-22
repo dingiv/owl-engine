@@ -1635,6 +1635,12 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         self.inner.mem_pool_stats()
     }
 
+    fn mem_info(
+        &mut self,
+    ) -> impl Future<Output = Result<(u64, u64), ModelError>> + Send {
+        self.inner.mem_info()
+    }
+
     fn copy_block_at(
         &mut self,
         src: &Bytes,

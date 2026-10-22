@@ -242,9 +242,6 @@ pub(crate) struct BankPlan {
     pub mtp: bool,
     /// 前缀缓存开关(容量策略见 [`owl_store::CachePolicy`])
     pub prefix_cache: bool,
-    /// **前缀缓存份额**(千分比;`[pool].prefix_cache_share` × 1000)。
-    /// 容量算式住 store(`CachePolicy::Share`:份额 × 设备池 + 宿主槽全额)。
-    pub cache_share_permille: u16,
     /// target 腿宿主层预算(字节;0 = 关层,REQ C4 默认关)
     pub host_bytes: usize,
     /// **TP world**(2026-10-20):宿主腿每条链占 `world` 个平面
@@ -287,12 +284,11 @@ impl SessionBank {
         mtp_layout: Option<PoolLayout>,
         ledger: owl_store::SharedLedger,
     ) -> Result<Self> {
-        // **缓存容量 = store 自决**(2026-10-19 容量定档):engine 只给两件事实
-        // (设备页数/宿主预算)与一条**份额政策**,容量算式住在 store
-        // (`CachePolicy::Share`;含"宿主槽全额"的跨层索引语义)。
-        // 份额来自 `[pool].prefix_cache_share`(缺省 0.5 = 旧 `nb/2` 行为)。
+        // **缓存容量 = 整池**(2026-10-22 用户令:删 `prefix_cache_share`)。
+        // 前缀缓存可以持有全部设备页 + 宿主槽;新请求进来时按
+        // `KvStore::ensure_for_len` 逐出设备叶 → 宿主,宿主不够再走磁盘。
         let cache = if plan.paged && plan.prefix_cache {
-            owl_store::CachePolicy::Share { permille: plan.cache_share_permille }
+            owl_store::CachePolicy::Share { permille: 1000 }
         } else {
             owl_store::CachePolicy::Off
         };
@@ -477,7 +473,6 @@ mod bank_tests {
             paged: true,
             mtp,
             prefix_cache,
-            cache_share_permille: if prefix_cache { 500 } else { 0 },
             host_bytes: 0,
             world: 1, // 测试：单卡平面（TP 宿主腿的 world 语义由 store 门覆盖）
         }

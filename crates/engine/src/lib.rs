@@ -86,6 +86,15 @@ pub fn head_plan_of(hq: owl_shared::config::HeadQuant) -> owl_models::module::Qu
         owl_shared::config::HeadQuant::RtnInt8Row => QuantPlan::I8W,
     }
 }
+/// embedding 表量化映射(P8;`None` = 检查点原表计划,`Some(I8W)` = int8)。
+pub fn embed_plan_of(
+    eq: owl_shared::config::EmbedQuant,
+) -> Option<owl_models::module::QuantPlan> {
+    match eq {
+        owl_shared::config::EmbedQuant::F16 => None,
+        owl_shared::config::EmbedQuant::I8 => Some(owl_models::module::QuantPlan::I8W),
+    }
+}
 pub use running::{RunningEngine, TokenizeReply};
 pub use tp::{TpEngine, TpOpts, TpStaging};
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};

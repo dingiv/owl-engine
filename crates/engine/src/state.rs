@@ -144,22 +144,27 @@ pub(crate) fn kv_per_tok_bytes(
 #[derive(Clone, Debug)]
 pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     pub seq_tokens: usize,
-    /// 池容量(token;**`pool_auto = true` 时本值被忽略**,按 `seq_tokens` 自动)
+    /// 池容量(token;**`pool_auto = true` 时本值被忽略**,由 `StatePool::alloc`
+    /// 按剩余显存 cap 自动定;`seq_tokens` 只是单请求上限)
     pub pool_tokens: usize,
     /// **池容量自动派生**(`[pool].pool_tokens` 未写;2026-10-21 用户令:
     /// "池子一般不需要手动指定 —— 算出来、把最大 ctx 显示出来")。
     ///
-    /// 自动档语义:池 = 单会话 ctx(`ceil(seq_tokens/page)` 页)+ 页对齐;
-    /// 显存治理器的 `cap` 退化为**上限校验 + 报告**(`ctx_max = cap − page`);
-    /// `seq_tokens > ctx_max` ⇒ 拒启并给出可服务的最大 ctx。
+    /// 自动档语义(2026-10-22 晚):
+    /// - `prefix_cache=false`:池 = **min(cap, max_seq×并发 + 1 页)**(无缓存消费方);
+    /// - `prefix_cache=true`:池 = **cap**(整池都可被前缀缓存持有,新请求逐出)。
+    /// `seq_tokens` 做**上限校验**(`seq_tokens + page > cap` ⇒ 拒启并报 `ctx_max`)。
     pub pool_auto: bool,
-    /// 每 turn 工作集(token;`[kvmem].workspace_per_req`)——
-    /// 口径:`ctx` 常驻(**Strict** 准入)⊆ 池 ⇒ 可用 ctx 上限 = `cap − page`。
-    pub ws_tokens: usize,
+    /// **并发上限(= gdn_slots)**:无缓存档的自动池按
+    /// `max_seq × concurrency` 封顶(2026-10-22 用户令)。
+    pub concurrency: usize,
+    /// **前缀缓存开/关**:开 = 池取整卡 cap(整池都可被缓存持有,新请求
+    /// 逐出到 host/disk);关 = 池按 `max_seq × concurrency` 封顶。
+    pub prefix_cache: bool,
     /// **允许池小于上下文**(锁①;`[kvmem].pool_overcommit`)。
     ///
     /// 关着时池有硬下限 `nb ≥ ceil(seq_tokens/page)` ⇒ **选择层只省访问面、
-    /// 不省显存**。开着才允许 `pool_tokens` 真的压小,把 KV 挤到宿主。
+    /// 不省显存**。开着才允许池真的压小,把 KV 挤到宿主。
     /// ⚠️ 只有引擎侧已验过"虚拟化真的开着"才会传 true(engine 侧判据已行;
     /// 本件只执行事实,不做策略)。
     pub pool_overcommit: bool,
@@ -182,6 +187,8 @@ pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     /// **草稿池几何**(层数, hkv, hd;**分片后**;P2.1-b)。`None` = 非 DFlash2 档
     /// ⇒ 池不分配;`Some` ⇒ 用它替掉写死的 `DRAFT_POOL`(双 rank 下 hkv 减半)
     pub draft_geom: Option<(usize, usize, usize)>,
+    /// **DFlash2 草稿环窗口**(token;0 = 非 DFlash2)。环形池容量单源。
+    pub draft_window: usize,
     /// 草稿 dtype(与 `spec_runtime::draft_dt` 同源:恒 BF16 —— 单源
     /// `qwen35::draft_exec_dt`)
     pub draft_dt: Dtype,
@@ -308,6 +315,11 @@ pub(crate) struct PoolGeom {
     pub(crate) paged: bool,
     /// GDN 行容量(knobs.gdn_slots,boot 定谳;原自由函数 gdn_slots())
     pub(crate) gdn_slots: usize,
+    /// **DFlash2 草稿环容量**(token;0 = 非 DFlash2)。草稿池按它分配,
+    /// 写槽 = 逻辑位 % ring;NC 核只读最近 ring 个逻辑位。
+    pub(crate) draft_ring_tokens: usize,
+    /// 草稿环页数(分配/叶子形状)
+    pub(crate) draft_ring_pages: usize,
     /// FI 直读旗标(统一契约 P3:影子池删除,FI 直读主池 kNHD 叶子)
     pub(crate) fi_face: bool,
     /// B6.2:主 KV 池 fp8 e4m3 承载(true = 池块 U32 字节承载 1B/elem;
@@ -662,10 +674,17 @@ impl PerTokBytes {
     }
 
     fn explain(self) -> String {
-        format!(
-            "主池 {}B + 草稿池 {}B + MTP 链 {}B",
-            self.main_kv, self.draft_pool, self.mtp_chain
-        )
+        if self.draft_pool == 0 {
+            format!(
+                "主池 {}B + MTP 链 {}B + 草稿环(固定,见 fixed_after)",
+                self.main_kv, self.mtp_chain
+            )
+        } else {
+            format!(
+                "主池 {}B + 草稿池 {}B + MTP 链 {}B",
+                self.main_kv, self.draft_pool, self.mtp_chain
+            )
+        }
     }
 }
 
@@ -685,6 +704,21 @@ pub(crate) const GRAPH_SLAB_BUDGET: usize = 320 << 20;
 /// = 原一锅端 `400MiB` 减图项后的余量(总分不变 ⇒ 历史治理数字可比):
 /// 400 − 262 = 138MiB。
 const WARMUP_MISC_BUDGET: usize = 138 << 20;
+/// **池后未入账固定开销**(2026-10-22 实测):graph/plan workspace +
+/// cudaMallocAsync 保留 + CUDA ctx 之外的驱动碎片 + 首请求 Temp。
+/// 67k 档池后 free 比公式少 ~1.37G;2026-10-22 环档复测实际 ~1.79G
+/// (含 graph/plan/驱动碎片/首请求 Temp),取 1.75G + guard 0.125G。
+const POST_POOL_EXTRA_BUDGET: usize = 1792 << 20;
+/// 无投机 / MTP 的池后固定开销(DFlash2 的 1.5G 含草稿 encode/图;无草稿时
+/// 实测小一截 —— 128k 无 spec 档按 1.5G 会被误拒)。
+const POST_POOL_EXTRA_NO_SPEC: usize = 768 << 20;
+const POST_POOL_EXTRA_MTP: usize = 1280 << 20;
+/// **guard slack**(自动池留出的驱动 free 余量):池取满 cap 后
+/// `free == reserve`,首请求的 14KB 瞬态会被 `free − reserve` 判据拒。
+/// DFlash2 草稿图/encode 瞬态多留 256M;无 spec 64M。
+const GUARD_SLACK_DFLASH: usize = 128 << 20;
+const GUARD_SLACK_MTP: usize = 192 << 20;
+const GUARD_SLACK_NO_SPEC: usize = 64 << 20;
 
 /// **治理器之后的固定分配项**(原为一行 `n_gdn*slots*elems*4 + snap*… + 400MiB`)
 #[derive(Debug, Clone, Copy)]
@@ -701,31 +735,49 @@ struct FixedAfter {
     graph_slab: usize,
     /// warmup 瞬态 + 杂项(见 [`WARMUP_MISC_BUDGET`])
     warmup_misc: usize,
+    /// **池后未入账固定开销**(2026-10-22 实测):graph/plan workspace +
+    /// cudaMallocAsync 保留 + CUDA ctx 之外的驱动碎片 + 首请求 Temp。
+    /// `/debug/vram` 实测:67k 档池后 free 比 fixed_after 公式少 ~1.37G
+    /// (16k/67k 同量级;Unclassified 1.29G 是池前权重,已由 free 口径覆盖)。
+    post_pool_extra: usize,
+    /// **DFlash2 草稿环**(固定字节;0 = 非 DFlash2)。不再按 pool_tokens
+    /// 线性预留 —— 环容量 = 检查点 sliding_window。
+    draft_ring: usize,
+    /// **guard slack**(见常量):cap 之外再留的驱动 free 余量。
+    guard_slack: usize,
 }
 
 impl FixedAfter {
-    fn of(n_gdn: usize, gdn_slots: usize, gdn_slot_elems: usize, snap_max: usize) -> Self {
+    fn of(n_gdn: usize, gdn_slots: usize, gdn_slot_elems: usize, snap_max: usize,
+          post_pool_extra: usize, draft_ring: usize, guard_slack: usize) -> Self {
         let grid = n_gdn * gdn_slots * gdn_slot_elems * 4;
         FixedAfter {
             gdn_grid: grid,
             gdn_snap: snap_max * n_gdn * gdn_slot_elems * 4,
             graph_slab: GRAPH_SLAB_BUDGET,
             warmup_misc: WARMUP_MISC_BUDGET,
+            post_pool_extra,
+            draft_ring,
+            guard_slack,
         }
     }
 
     fn total(self) -> usize {
         self.gdn_grid + self.gdn_snap + self.graph_slab + self.warmup_misc
+            + self.post_pool_extra + self.draft_ring + self.guard_slack
     }
 
     fn explain(self) -> String {
         let mbf = |v: usize| v as f64 / 1048576.0;
         format!(
-            "gdn格 {:.0}MiB + gdn快照 {:.0}MiB + 图slab {:.0}MiB + warmup/杂项 {:.0}MiB",
+            "gdn格 {:.0}MiB + gdn快照 {:.0}MiB + 图slab {:.0}MiB + warmup/杂项 {:.0}MiB + 池后固定 {:.0}MiB + 草稿环 {:.0}MiB + guard {:.0}MiB",
             mbf(self.gdn_grid),
             mbf(self.gdn_snap),
             mbf(self.graph_slab),
-            mbf(self.warmup_misc)
+            mbf(self.warmup_misc),
+            mbf(self.post_pool_extra),
+            mbf(self.draft_ring),
+            mbf(self.guard_slack)
         )
     }
 }
@@ -927,25 +979,24 @@ impl StatePool {
     // 读),首 session 巧合重合,后续 session 全崩(slot≥1 案)。
     // 并发多 turn(B5 batch)共享线性空间会互踩 → B5 需 per-session 分区。
 
-    /// encode 行 i(基址 base)的草稿 K/V 槽(K0 写入位)
-    pub(crate) fn draft_encode_slot(base: usize, i: usize) -> f32 {
-        (base + i) as f32
+    /// **草稿环容量**(token;0 = 非 DFlash2;调用方只在 DFlash2 用)
+    pub(crate) fn draft_ring(&self) -> usize {
+        self.geom.draft_ring_tokens.max(1)
     }
 
-    /// propose 噪声块自槽(块内行 i;K/V 核输入直读,不入池)
-    pub(crate) fn draft_self_slot(pos: usize, i: usize) -> f32 {
-        (pos + i) as f32
+    /// encode 行 i(基址 base)的草稿 K/V 槽(K0 写入位;环形:逻辑位 % ring)
+    pub(crate) fn draft_encode_slot(ring: usize, base: usize, i: usize) -> f32 {
+        ((base + i) % ring.max(1)) as f32
     }
 
-    /// propose 前缀读窗:逻辑位 p(NC 线性直排)
-    pub(crate) fn draft_prefix_slot(p: usize) -> f32 {
-        p as f32
+    /// propose 噪声块自槽(块内行 i;环外 **self scratch**,见分配处)
+    pub(crate) fn draft_self_slot(ring: usize, _pos: usize, i: usize) -> f32 {
+        (ring.max(1) + i) as f32
     }
 
-    /// propose 读窗长(fp = 下轮 fed 位)
-    #[allow(dead_code)] // 草稿面预测助手(现无读者,保留供 NC v2 路径)
-    pub(crate) fn draft_kv_len(fp: usize) -> f32 {
-        (fp + 8) as f32
+    /// propose 读窗长(fp = 下轮 fed 位;只读最近 ring 个逻辑位)
+    pub(crate) fn draft_kv_len(ring: usize, fp: usize) -> f32 {
+        (fp.min(ring.max(1)) + 8) as f32
     }
 
     pub(crate) fn dflash_kv_leaves(&self) -> Option<Vec<(TensorOps, TensorOps)>> {
@@ -953,7 +1004,7 @@ impl StatePool {
         let (dkv, dhd) = (8usize, 128usize);
         // B6:fp8 草稿池 = U32 扁平字节账(主池同款)
         if self.draft.fp8 {
-            let shape = vec![self.geom.nb * dkv * dhd * self.geom.page / 4];
+            let shape = vec![self.geom.draft_ring_pages * dkv * dhd * self.geom.page / 4];
             return Some(ks
                 .iter()
                 .map(|kb| {
@@ -974,12 +1025,12 @@ impl StatePool {
                     // 被 L3 事实面当场抳住(2026-10-15)。
                     block_leaf_dt(
                         &kb.k_cache.0,
-                        vec![self.geom.nb, dkv, dhd / self.geom.x, self.geom.page, self.geom.x],
+                        vec![self.geom.draft_ring_pages, dkv, dhd / self.geom.x, self.geom.page, self.geom.x],
                         self.draft.dt,
                     ),
                     block_leaf_dt(
                         &kb.v_cache.0,
-                        vec![self.geom.nb, dkv, dhd, self.geom.page],
+                        vec![self.geom.draft_ring_pages, dkv, dhd, self.geom.page],
                         self.draft.dt,
                     ),
                 )
@@ -1690,13 +1741,14 @@ struct AllocCtx<'a> {
     n_gdn: usize,
     seq_tokens: usize,
     snap_max: usize,
+    /// 草稿环页数(0 = 非 DFlash2;分配/叶子形状)
+    draft_ring_pages: usize,
 }
 
 impl<'a> AllocCtx<'a> {
     /// **决策 + 预算 + 几何**(原 `alloc` 的前半;无任何设备调用)。
     fn build(dims: ModelDims, layer_types: &[bool], plan: &'a PoolPlan) -> Result<Self> {
         let seq_tokens = plan.seq_tokens;
-        let pool_tokens = plan.pool_tokens;
         // 布尔和稀泥废除(2026-10-10):量化 = KvQuant 枚举,投机形态 =
         // SpecMode 枚举(快照/MTP 链/草稿池三件由 mode 派生,互斥不再靠
         // 调用点自洽)
@@ -1737,7 +1789,7 @@ impl<'a> AllocCtx<'a> {
         // 非追踪实测 = 进程占用 20096MiB − 引擎账 19552MiB = **544MiB**(> reserve 512MB,
         // 即 reserve 量级正确但零余量 ⇒ 见 graph_fleet 的对账行)。
         let mtp_mode = plan.spec_mode == crate::spec_runtime::SpecMode::Mtp;
-        let per_tok = PerTokBytes::of(
+        let mut per_tok = PerTokBytes::of(
             &dims,
             n_full,
             kv_bytes_elem,
@@ -1747,7 +1799,45 @@ impl<'a> AllocCtx<'a> {
         );
         // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + warmup 分列)
         let gdn_slot_elems = dims.nk * dims.hk * 3 + dims.nv * dims.hv * 3 + dims.nv * dims.hk * dims.hv;
-        let fixed_after = FixedAfter::of(n_gdn, gdn_slots, gdn_slot_elems, snap_max);
+        let post_pool_extra = match plan.spec_mode {
+            crate::spec_runtime::SpecMode::DFlash2 => POST_POOL_EXTRA_BUDGET,
+            crate::spec_runtime::SpecMode::Mtp => POST_POOL_EXTRA_MTP,
+            _ => POST_POOL_EXTRA_NO_SPEC,
+        };
+        // **草稿环**(DFlash2):容量 = 检查点 sliding_window(2048 页对齐),
+        // 不再按 pool_tokens 线性预留。固定字节进 fixed_after。
+        let page_guess0 = 32usize;
+        let draft_geom_ring = plan
+            .draft_geom
+            .map(|(l, h, d)| DraftPoolGeom::from_geom(l, h, d))
+            .unwrap_or(DRAFT_POOL);
+        let draft_ring_tokens = if dflash {
+            // 窗口(取模)必须页对齐;另留 depth+1 个 **self scratch** 槽
+            // (propose 的 8 行噪声 K/V 写到这里,绝不能落进前缀环 ——
+            //  否则 NC 核读满 2048 环时会把 mask 噪声当上下文)。
+            plan.draft_window.max(page_guess0).div_ceil(page_guess0) * page_guess0
+        } else {
+            0
+        };
+        let draft_ring_slots = if dflash { draft_ring_tokens + 8 } else { 0 };
+        let draft_ring_pages = draft_ring_slots.div_ceil(page_guess0);
+        let draft_ring_bytes = if dflash {
+            draft_geom_ring.per_tok_bytes(plan.draft_kv.size_bytes()) * draft_ring_slots
+        } else {
+            0
+        };
+        if dflash {
+            // 草稿池不再逐 token;环字节已进 fixed_after。
+            per_tok.draft_pool = 0;
+        }
+        let guard_slack = match plan.spec_mode {
+            crate::spec_runtime::SpecMode::DFlash2 => GUARD_SLACK_DFLASH,
+            crate::spec_runtime::SpecMode::Mtp => GUARD_SLACK_MTP,
+            _ => GUARD_SLACK_NO_SPEC,
+        };
+        let fixed_after = FixedAfter::of(
+            n_gdn, gdn_slots, gdn_slot_elems, snap_max, post_pool_extra, draft_ring_bytes, guard_slack,
+        );
         let pool_cap = pool_cap(plan, &per_tok, &fixed_after);
         // ── 池容量:**手写值** 或 **自动 = 本档 ctx**(2026-10-21)──
         //
@@ -1756,23 +1846,39 @@ impl<'a> AllocCtx<'a> {
         // ② 报告:`ctx_max = cap − 1 页`(Strict 准入 = 整 ctx 常驻)。
         let page_guess = 32usize; // 与 `kv_paged_policy` 同值(下面会再取权威值)
         let ctx_max = pool_cap.map(|c| c.saturating_sub(page_guess));
+        // **自动池 = 剩余显存能装多少就装多少**(2026-10-22 用户令):
+        // 不再等于 max_seq;max_seq 只是**单请求上下文上限**,池取治理器 cap
+        // (页对齐向下)。前缀缓存/并发因此能用到整卡剩余,而不是只够一条 ctx。
+        let auto_cap = pool_cap.map(|c| (c / page_guess) * page_guess);
+        // **池按 max_seq × concurrency 封顶**(2026-10-22 用户令):
+        // 治理器 cap 只作上限;池不再把整卡剩余显存全部预分配。
+        // 页对齐:每会话 `ceil(max_seq/page)` 页,共 concurrency 份。
+        // +1 页 = 页对齐尾块/工作集余量;`[ctx-max]` 的 `pool_ctx_max = pool − page`
+        // 因此正好等于 `max_seq`。
+        let seq_pages = plan.seq_tokens.div_ceil(page_guess).saturating_add(1);
+        let ctx_tokens = seq_pages.saturating_mul(plan.concurrency.max(1)).saturating_mul(page_guess);
         let pool_tokens = if plan.pool_auto {
-            match ctx_max {
-                Some(m) if plan.seq_tokens > m => {
-                    return Err(ModelError::Msg(format!(
-                        "[pool] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
-                         本档 per_tok={}B ⇒ cap={:?} tok。修法:降 [runtime].max_seq 到 ≤ {}、\
-                         或降 per_tok(池 fp8 / 减草稿池)、或加 [pool].pool_tokens 显式钉(不推荐)。",
-                        plan.seq_tokens,
-                        m,
-                        per_tok.total(),
-                        pool_cap,
-                        m
-                    )));
+            match auto_cap {
+                Some(cap) => {
+                    if plan.seq_tokens.saturating_add(page_guess) > cap {
+                        let m = cap.saturating_sub(page_guess);
+                        return Err(ModelError::Msg(format!(
+                            "[pool] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
+                             本档 per_tok={}B ⇒ cap={} tok。修法:降 [runtime].max_seq 到 ≤ {}、\
+                             或降 per_tok(池 fp8 / 草稿环 / 更小主 KV)。",
+                            plan.seq_tokens,
+                            m,
+                            per_tok.total(),
+                            cap,
+                            m
+                        )));
+                    }
+                    // **缓存档**:整池给前缀缓存(旧行为;新请求逐出)。
+                    // **无缓存档**:只按 max_seq×并发 预分配,避免池页空转。
+                    if plan.prefix_cache { cap } else { cap.min(ctx_tokens) }
                 }
-                _ => {}
+                None => plan.seq_tokens,
             }
-            plan.seq_tokens
         } else {
             match pool_cap {
                 Some(cap) => plan.pool_tokens.min(cap),
@@ -1788,21 +1894,27 @@ impl<'a> AllocCtx<'a> {
         match (pool_cap, ctx_max) {
             (Some(cap), Some(m)) => {
                 let pool_mib = pool_tokens as u64 * per_tok.total() as u64 / (1 << 20);
-                let pct = 100.0 * plan.seq_tokens as f64 / m.max(1) as f64;
+                let pool_ctx_max = pool_tokens.saturating_sub(page_guess);
+                let pct = 100.0 * plan.seq_tokens as f64 / pool_tokens.max(1) as f64;
                 eprintln!(
-                    "[ctx-max] per_tok={}B(主池 {} + 草稿 {} + MTP 链 {}) ⇒ 预算 cap={} tok \
-                     ⇒ **本档最大 ctx ≈ {} tok**;当前 max_seq={}(占 {:.0}%)⇒ 池 {} tok / {} MiB{}",
+                    "[ctx-max] per_tok={}B(主池 {} + MTP 链 {};草稿环 {}MiB 固定) ⇒ 预算 cap={} tok \
+                     (上限 ctx≈{})⇒ **池 {} tok / {} MiB**(缓存={} ;max_seq×并发={}×{};自动/手写={}) \
+                     ⇒ 本池可服务 ctx≈{} tok;当前 max_seq={}(占池 {:.0}%)",
                     per_tok.total(),
                     per_tok.main_kv,
-                    per_tok.draft_pool,
                     per_tok.mtp_chain,
+                    fixed_after.draft_ring >> 20,
                     cap,
                     m,
-                    plan.seq_tokens,
-                    pct,
                     pool_tokens,
                     pool_mib,
-                    if plan.pool_auto { "(自动)" } else { "(手写)" }
+                    if plan.prefix_cache { "on(整池)" } else { "off(max_seq封顶)" },
+                    plan.seq_tokens,
+                    plan.concurrency.max(1),
+                    if plan.pool_auto { "auto" } else { "manual" },
+                    pool_ctx_max,
+                    plan.seq_tokens,
+                    pct,
                 );
                 if plan.seq_tokens + page_guess > m {
                     eprintln!(
@@ -1859,7 +1971,9 @@ impl<'a> AllocCtx<'a> {
         Ok(Self {
             plan,
             geom: PoolGeom {
-                dims, page, nb, nb_kv, paged, gdn_slots, fi_face, kv_fp8,
+                dims, page, nb, nb_kv, paged, gdn_slots,
+                draft_ring_tokens, draft_ring_pages,
+                fi_face, kv_fp8,
                 x, dump_all, gdn_dbg,
             },
             kv_dt,
@@ -1868,6 +1982,7 @@ impl<'a> AllocCtx<'a> {
             n_gdn,
             seq_tokens,
             snap_max,
+            draft_ring_pages,
         })
     }
 }
@@ -1894,17 +2009,33 @@ impl<'a> AllocCtx<'a> {
             let live_per_card = plan
                 .live_baseline_per_card
                 .unwrap_or_else(|| owl_shared::vram::live_bytes() / plan.tp_ranks.max(1) as u64);
-            let budget = (vram_total as f64 * plan.vram_target) as i64
-                - vram_reserve as i64
-                - fixed_after.total() as i64
-                - live_per_card as i64;
+            // **单卡口径用真实剩余显存**(2026-10-22 用户令:池 = 剩多少显存就多大)。
+            // `live` 只覆盖 Weight 类;草稿/repack 等未入账块会让 live 口径高估
+            // ~1.29G。`free` 来自 cuMemGetInfo,天然含所有已分配块。
+            // TP 档仍走 live 摊分(两卡对称;free 是最后写者的单卡快照,不适合当簇口径)。
+            let free = owl_shared::vram::free_bytes();
+            let (budget, mode) = if plan.tp_ranks <= 1 && free > 0 {
+                (
+                    free as i64 - vram_reserve as i64 - fixed_after.total() as i64,
+                    "free",
+                )
+            } else {
+                (
+                    (vram_total as f64 * plan.vram_target) as i64
+                        - vram_reserve as i64
+                        - fixed_after.total() as i64
+                        - live_per_card as i64,
+                    "live",
+                )
+            };
             let cap = (budget.max(0) as u64 / per_tok_bytes.max(1) as u64) as usize;
             // **A1 取证**(2026-10-19):治理器是"池能多大"的唯一产地;这条打出
             // 它的输入与产出(含主干 `FixedAfter`/`PerTokBytes` 的分解),免得再靠猜。
             // 用 `eprintln!`(取证行惯例):`log_*` 在无 `log` feature 的构建里被编译剔除,
             // 而本行必须在探针/测试里可见。
             eprintln!(
-                "[vram-gov] total={:.2}G free={:.2}G target={:.0}% reserve={}M fixed_after={:.2}G[{}] live={:.2}G(单卡口径;ranks={}) per_tok={}B[{}] ⇒ budget={:.2}G cap={} tok(manual={})",
+                "[vram-gov] mode={} total={:.2}G free={:.2}G target={:.0}% reserve={}M fixed_after={:.2}G[{}] live={:.2}G(单卡口径;ranks={}) per_tok={}B[{}] ⇒ budget={:.2}G cap={} tok(auto={})",
+                mode,
                 vram_total as f64 / 1073741824.0,
                 owl_shared::vram::free_bytes() as f64 / 1073741824.0,
                 plan.vram_target * 100.0,
@@ -1917,7 +2048,7 @@ impl<'a> AllocCtx<'a> {
                 per_tok.explain(),
                 budget as f64 / 1073741824.0,
                 cap,
-                plan.pool_tokens,
+                plan.pool_auto,
             );
             Some(cap)
         } else {
@@ -2264,7 +2395,7 @@ impl DraftBank {
             // B6 偷显存:草稿池 e4m3(OWL_DFLASH_KV_FP8;1B/elem,U32 字节承载)
             // 分配项与预算项共用 `KvQuant::size_bytes` + 几何单源 ⇒ 两处不会再漂
             let df_bytes_elem = plan.draft_kv.size_bytes();
-            let df_elems = geom.layer_elems(nb, page);
+            let df_elems = geom.layer_elems(ctx.draft_ring_pages, page);
             let (df_elems, df_dt) = if df_bytes_elem == 1 {
                 (df_elems / 4, Dtype::U32)
             } else {
@@ -2476,7 +2607,10 @@ mod vram_budget_tests {
             458 << 20,
             "桶退役后预算校准(2026-10-21:640→320)"
         );
-        let f = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1);
+        // 本门对拍历史固定项;池后固定项(2026-10-22)单列,传 0 保持旧总账。
+        let f = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1, 0, 0, 0);
+        assert_eq!(POST_POOL_EXTRA_BUDGET, 1792 << 20);
+        assert_eq!(POST_POOL_EXTRA_NO_SPEC, 768 << 20);
         assert_eq!(f.gdn_grid, 155_713_536);
         assert_eq!(f.gdn_snap, 155_713_536);
         assert_eq!(f.graph_slab, 320 << 20, "图项 = 非桶图族 261 + 余量");

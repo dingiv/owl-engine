@@ -108,6 +108,8 @@ format = "awq"
 quant = "w4a16"
 # lm_head 量化:off | rtn-int4-g32 | rtn-int8-row
 head_quant = "rtn-int4-g32"
+# embedding 表量化:f16(默认/对照) | i8(per-row;省 ~1.2G,仅 untied)
+embed_quant = "f16"
 # 视觉塔(纯文本档勿开);vision_path 空 = 用检查点内置 model.visual.*
 vision = false
 vision_path = ""
@@ -126,16 +128,17 @@ attention_factor = 1.0
 # [pool] —— 设备池与显存治理
 # ---------------------------------------------------------------------------
 [pool]
-# 设备 KV 池(token;0 / 留空 = 自动 = 2 × 单会话容量)
-pool_tokens = 131072
+# 主 KV 池 fp8 e4m3(32 KiB/token;容量翻倍)
+kv_fp8 = true
+# 设备 KV 池(2026-10-22;不再有手工容量键):
+#   prefix_cache=false → min(剩余显存 cap, max_seq×并发 + 1 页)
+#   prefix_cache=true  → cap(整池可被前缀缓存持有,新请求逐出到 host/disk)
 # 并发上限(每活跃会话一格 GDN 状态;0 = 自动 = runtime.max_concurrency)
 gdn_slots = 1
 # 末段页对齐(前缀复用闭环;单块档多切一刀)
 prefill_align_tail = true
 # 生成相位页边界快照页步长(0 = 关)
 snap_decode_stride = 1
-# 前缀缓存可占设备池比例(inspector: 0..1)
-prefix_cache_share = 0.5
 # GDN 快照池槽数
 snap_max = 0
 # 宿主 KV 腿 / 快照腿 / 盘层两腿(MiB;0 = 关)
@@ -153,7 +156,7 @@ vram_reserve_mb = 256
 # 显存硬上限 MiB(留空 = 只按驱动账判)
 vram_budget_mb = 0
 # 前缀缓存开/关
-prefix_cache = false
+prefix_cache = true
 # 解释器块池预算(字节;0 = 关)
 block_pool_bytes = 0
 # 关活性中途回收(诊断;开会无界常驻)
@@ -171,6 +174,8 @@ draft_path = ""
 dumb = false
 # 草稿池 fp8(关 = bf16)
 draft_kv_fp8 = false
+# DFlash2 草稿环窗口(token;0 = auto = 检查点声明,缺声明 = 家族 2048;当前核支持 2048)
+draft_window = 0
 # MTP 窗口/sink 的全量 schema 缺省(0 = full)。**实际性能值写在具体 MTP 档**
 # (如 qwen38_27b-3090-w4a16-mtp.toml 的 4032/64)，不要在这里做调优。
 mtp_window = 0
@@ -256,7 +261,6 @@ gdn_chunked = true
 gdn_scalar = false
 gdn_fused_decode = true
 gdn_fused_decode_v2 = true
-kv_fp8 = true
 # GGUF 小 n(装得进 L2)且 m ≤ TILE_MT ⇒ 让 MMVQ 赢(0 = 关)
 gguf_mmvq_l2_mib = 4
 # GGUF 预填臂(缺省全开;关 = 回退下一臂)

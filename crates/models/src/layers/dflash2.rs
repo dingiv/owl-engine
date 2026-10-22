@@ -55,6 +55,10 @@ pub const BLOCK: usize = 8;
 pub const DEPTH: usize = BLOCK - 1;
 /// selector 每 slot 候选数(selector_top_k)
 pub const TOP_K: usize = 16;
+/// **草稿 NC 注意力核当前的窗口能力**(必须与 `naive_attn_nc.cu` 的
+/// `OWL_NC_SLIDING_WINDOW` 同值)。环容量从检查点 `sliding_window` 读;
+/// 4k/8k 需要先给核加运行时 window(或模板实例),否则 boot 响亮拒。
+pub const NC_WINDOW: usize = 2048;
 
 /// top-16 的 split-K 分段数(2026-10-14 D2;实测 np=16 邻域最优:
 /// grid=rows×16 ≈ 单波 132 SM;见 crates/kernels/tests/topk16_probe.rs)

@@ -579,6 +579,21 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         head_plan: owl_models::module::QuantPlan,
         quant: owl_models::module::QuantPlan,
     ) -> Result<LoadedModel> {
+        self.load_qwen38_27b_awq_with_embed(dir, tokenizer_dir, head_plan, quant, None)
+            .await
+    }
+
+    /// **表计划覆盖入口**(P8,2026-10-22):`embed_plan = Some(I8W)` ⇒ embed 表
+    /// int8(q/s 派生键;省 ~1.2G);`None` = 走检查点原表计划。
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub async fn load_qwen38_27b_awq_with_embed(
+        &mut self,
+        dir: &Path,
+        tokenizer_dir: &Path,
+        head_plan: owl_models::module::QuantPlan,
+        quant: owl_models::module::QuantPlan,
+        embed_plan: Option<owl_models::module::QuantPlan>,
+    ) -> Result<LoadedModel> {
         // **[相位上下文]装载 = `Weight` 类 + `System` 归属**(RAII:任何早退都还原)
         let _scope = self.face.scoped_ctx(
             owl_iface::handle::Owner::System,
@@ -609,11 +624,12 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
                 )));
             }
         };
-        let model = Model::new(
+        let model = Model::new_with_embed(
             &spec,
             Qwen35Convention::new(convention_base(&rep)),
             quant_plan,
             head_plan,
+            embed_plan,
         )?;
         // 旋钮:设备重排 = 能力自述裁决(RepackPath::resolve 唯一收口)
         let mut opts = LoadOpts::new(self.face, spec.dtype);

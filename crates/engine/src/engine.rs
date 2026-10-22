@@ -68,15 +68,13 @@ pub struct EngineKnobs {
     pub tag_wildcard: bool,
     /// 步级探针(诊断面;Default = 全关)
     pub probes: crate::running::StepProbes,
-    /// 块池容量覆写(None = 2 × 单会话容量;原 OWL_POOL_TOKENS)
+    /// **测试专用**块池容量覆写(None = 生产自动:按剩余显存取满;
+    /// 原 `[pool].pool_tokens` 配置项已于 2026-10-22 删除)。
     pub pool_tokens: Option<usize>,
     /// 草稿域(深度/哑草稿/家族目录/池量化/verify 诊断)
     pub draft: DraftCfg,
     /// 前缀缓存(缺省开;原 OWL_PREFIX_CACHE≠"0")
     pub prefix_cache: bool,
-    /// **前缀缓存份额**(0..1;`[pool].prefix_cache_share`;缺省 0.5 = 旧 `nb/2`)。
-    /// 容量算式在 store(`CachePolicy::Share`),这里只是**政策输入**。
-    pub prefix_cache_share: f64,
     /// **宿主层预算 MiB**(状态存储三层的中层;缺省 **0 = 关层**,REQ C4)。
     /// 环境变量 `OWL_HOST_CACHE_MB`;S3-3b(回灌)接线前开了也没用
     pub host_cache_mb: usize,
@@ -292,7 +290,6 @@ impl Default for EngineKnobs {
             pool_tokens: None,
             draft: DraftCfg::default(),
             prefix_cache: true,
-            prefix_cache_share: 0.5,
             host_cache_mb: 0,
             snap_host_mb: 0,
             disk_cache_mb: 0,
@@ -501,7 +498,7 @@ impl EngineKnobs {
             }
         };
         format!(
-            "pool={:?} turns={} snap_max={} host={}M snap_host={}M disk={}M snap_disk={}M dir={:?} prefix_cache={}:{:.2} align_tail={} bnd_stride={} | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
+            "pool={:?} turns={} snap_max={} host={}M snap_host={}M disk={}M snap_disk={}M dir={:?} prefix_cache={} align_tail={} bnd_stride={} | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
             self.gdn_slots,
             self.snap_max,
@@ -511,7 +508,6 @@ impl EngineKnobs {
             self.snap_disk_mb,
             self.disk_dir,
             self.prefix_cache as u8,
-            self.prefix_cache_share,
             self.prefill_align_tail as u8,
             self.snap_decode_stride,
             if self.kvmem_virtualization { "ON" } else { "off" },
@@ -563,7 +559,8 @@ impl EngineKnobs {
             // (探针档/生产档走同一条路 ⇒ 同一份配置 = 同一套条件)。
             // 测试面只保留"运行器级"env(选卡/资产路径/场景过滤),见
             // `docs/arch/配置面-单一来源.md`。
-            pool_tokens: cfg.pool.pinned_pool_tokens(),
+            // 生产 = 自动(剩余显存);仅测试通过 `EngineKnobs` 直接覆写。
+            pool_tokens: None,
             pool_cap_mb: cfg.pool.pool_cap_mb,
             draft: DraftCfg {
                 depth: cfg.spec.depth,
@@ -582,6 +579,7 @@ impl EngineKnobs {
                 } else {
                     owl_models::env::KvQuant::None
                 },
+                draft_window: cfg.spec.draft_window,
                 mtp_window: cfg.spec.mtp_window,
                 mtp_sink: cfg.spec.mtp_sink,
                 mtp_window_min_ctx: cfg.spec.mtp_window_min_ctx,
@@ -594,7 +592,6 @@ impl EngineKnobs {
                 tp_draft: cfg.spec.tp_draft,
             },
             prefix_cache: cfg.pool.prefix_cache,
-            prefix_cache_share: cfg.pool.prefix_cache_share,
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
             host_cache_mb: cfg.pool.host_cache_mb,
             disk_cache_mb: cfg.pool.disk_cache_mb,
@@ -699,6 +696,8 @@ pub struct DraftCfg {
     pub mtp_dir: Option<std::path::PathBuf>,
     /// 草稿池 KV 存储(None = f16;Fp8E4M3 = 偷显存档,原 draft_kv_fp8 布尔)
     pub kv_quant: owl_models::env::KvQuant,
+    /// DFlash2 草稿环窗口(0 = auto = 检查点 sliding_window)
+    pub draft_window: usize,
     /// MTP 草稿注意力滑动窗口(tok;0 = 关;仅 MTP)
     pub mtp_window: usize,
     /// MTP 草稿注意力 sink(tok;最老前缀;仅 window>0 生效)
@@ -731,6 +730,7 @@ impl Default for DraftCfg {
             dflash2_dir: None,
             mtp_dir: None,
             kv_quant: owl_models::env::KvQuant::None,
+            draft_window: 0,
             mtp_window: 0,
             mtp_sink: 64,
             mtp_window_min_ctx: 0,
@@ -883,6 +883,63 @@ fn assemble_budget(
 
 /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
 static BOOT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// **boot 分相显存取证**(P5,2026-10-22):每个里程碑打一行 `[vram-phase]`。
+///
+/// 目的:把 `smi − store 账 − context` 的 ~0.9G 残差按阶段拆开
+/// (模块首载 / 草稿装载 / 池 / 图捕获与上传)。`used` = total − free
+/// (驱动口径,含所有库内部分配);`delta` = 与上一里程碑之差。
+/// 取证行用 `eprintln!`(无 log feature 的构建也要可见,与 `[ctx-max]` 同律)。
+pub(crate) struct VramPhase {
+    last_used: Option<u64>,
+}
+
+impl VramPhase {
+    pub(crate) fn new() -> Self {
+        Self { last_used: None }
+    }
+
+    pub(crate) async fn mark<D: DeviceClient + 'static>(
+        &mut self,
+        face: &mut DeviceHandle<D>,
+        tag: &str,
+    ) {
+        self.mark_info(tag, face.mem_info().await);
+    }
+
+    /// 已取得实况后的落账(避免调用点重复实现;`Err` 也如实打印)。
+    pub(crate) fn mark_info(
+        &mut self,
+        tag: &str,
+        info: std::result::Result<(u64, u64), owl_iface::contract::ModelError>,
+    ) {
+        match info {
+            Ok((free, total)) => {
+                let used = total.saturating_sub(free);
+                let delta = self
+                    .last_used
+                    .map(|p| used as i64 - p as i64)
+                    .unwrap_or(0);
+                eprintln!(
+                    "[vram-phase] {tag}: used={:.1}MiB free={:.1}MiB delta={:+.1}MiB live={:.1}MiB",
+                    used as f64 / 1048576.0,
+                    free as f64 / 1048576.0,
+                    delta as f64 / 1048576.0,
+                    owl_shared::vram::live_bytes() as f64 / 1048576.0,
+                );
+                self.last_used = Some(used);
+            }
+            Err(e) => eprintln!("[vram-phase] {tag}: 查询失败({e})"),
+        }
+    }
+}
+
+impl<D: DeviceClient + 'static> Engine<D> {
+    /// **设备显存实况**(只读;boot/诊断面):`(free, total)`。
+    pub async fn mem_info(&mut self) -> Result<(u64, u64)> {
+        self.face.mem_info().await
+    }
+}
 
 impl Engine<GpuClient> {
     /// 常规构造:按 cfg 绑定 GPU(ordinal)
@@ -1090,9 +1147,6 @@ pub(crate) fn into_running<D: DeviceClient>(
                     paged: dev.pool.geom.paged,
                     mtp: dev.spec_rt.mode == SpecMode::Mtp,
                     prefix_cache: cfg.knobs.prefix_cache,
-                    cache_share_permille: (cfg.knobs.prefix_cache_share * 1000.0)
-                        .round()
-                        .clamp(0.0, 1000.0) as u16,
                     // 宿主层预算(REQ C4:默认关;0 = 关层)—— 与预算入参**同源**
                     // (腿不得超总账;`Rel::open` 交叉校验)
                     host_bytes,
@@ -1688,6 +1742,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             spec: &rm.spec,
             dumb: cfg.knobs.draft.dumb,
             draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
+            draft_window: cfg.knobs.draft.draft_window,
             mtp_window: cfg.knobs.draft.mtp_window,
             mtp_sink: cfg.knobs.draft.mtp_sink,
             mtp_window_min_ctx: cfg.knobs.draft.mtp_window_min_ctx,
@@ -1772,18 +1827,17 @@ fn boot_pool_plan(
     tp: Option<&owl_models::module::TpCtx>,
     live_baseline_per_card: u64,
 ) -> crate::state::PoolPlan {
-    // **自动档**(2026-10-21):`[pool].pool_tokens` 未写 ⇒ 池 = 本档 ctx,
-    // 由 `StatePool::alloc` 按显存预算校验并回报 `ctx_max`(不再 2× 单会话)。
-    // `pool_tokens` 缺省**或 0** ⇒ 自动(= 本档 max_seq)。0 是必要的逃生口:
-    // 档位走 `extends` 继承时,子档"不写"会继承父档的值,只有显式 `0` 能表达
-    // "本档要自动"(而 `PoolCfg::pinned_pool_tokens` 也把 0 视为未钉)。
+    // **自动档**(2026-10-22):配置项已删除;生产恒自动 = `StatePool::alloc`
+    // 按剩余显存算出的 cap。`EngineKnobs.pool_tokens` 只作**测试覆写**
+    // (None/0 = 自动;>0 = 小池门)。
     let pool_auto = cfg.knobs.pool_tokens.map_or(true, |n| n == 0);
     let pool_tokens = cfg.knobs.pool_tokens.filter(|n| *n > 0).unwrap_or(s);
     let plan = crate::state::PoolPlan {
         seq_tokens: s,
         pool_tokens,
         pool_auto,
-        ws_tokens: cfg.knobs.workspace_per_req,
+        concurrency: cfg.knobs.gdn_slots.max(1),
+        prefix_cache: cfg.knobs.prefix_cache,
         // **锁①门控**:只有虚拟化真的开着(配置显式 `select_decode` +
         // `select_partial`)才允许池小于上下文 —— 否则链超出池容量必
         // `Exhausted`(无洞可停,即无选择层可挤)。
@@ -1797,6 +1851,7 @@ fn boot_pool_plan(
         },
         // P2.1-b:草稿池几何(**分片后**;来自草稿声明 + 本 rank 计划)
         draft_geom: spec.draft_geom,
+        draft_window: spec.draft_window,
         // 治理器按卡摊 `live`(TP2 下 LIVE 含两卡之和;2026-10-19 定谳)
         tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
         // 两 rank 共用的池前 live 基线(消除顺序记账)
@@ -1874,6 +1929,8 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     t_run: std::time::Instant,
 ) -> Result<RankDev<DeviceHandle<D>>> {
         boot_knobs_check(&mut face, cfg, tp.as_ref())?;
+        let mut phase = VramPhase::new();
+        phase.mark(&mut face, "boot-rank:权重已装载").await;
         let s = cfg.max_seq_tokens;
         // ⚠️ **已知缺口(§18.5 挂账①)**:CPU/mock 档若要跑引擎真前向,
         // `dtype` 不能简单归一为 F32 —— `kv_paged_policy(dtype)` 与
@@ -1882,17 +1939,41 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 让分页策略/scratch 与执行域 dtype 解耦(单独一刀),不在 mock 刀里扫。
         let (dims, env, fi_quant, spec) =
             boot_env_and_spec(&mut face, cfg, &rm, tp.as_ref()).await?;
+        phase.mark(&mut face, "env+spec(草稿/环境)").await;
         // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
-        // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 E2b:
-        // 默认 = 2 × 单会话容量(两会话满载共存),knobs.pool_tokens 覆写
+        // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 =
+        // min(剩余显存 cap, max_seq×并发 + 1 页)(knobs.pool_tokens 仅测试覆写)。
         let plan = boot_pool_plan(cfg, s, &env, &spec, fi_quant, tp.as_ref(), live_baseline_per_card);
         boot_kvmem_check(cfg)?;
+        // **池前 settle(2026-10-22)**:装载期临时块(store 复用池)与
+        // cudaMallocAsync 缓存会残留到 `free@池` 的读数里;不排空则同一档
+        // 不同 boot 的 cap 抖动(79k–116k)。先把它们还驱动/还 OS,再让
+        // `pool_cap` 读 free —— 这是“池前 materialize/结算”的收口。
+        let drained = face.drain_temp_pool().await;
+        let trimmed = face.mem_pool_trim().await.unwrap_or(0);
+        // **fresh free 回写**:`pool_cap` 读的是 `owl_shared::vram::free_bytes()`
+        // (缓存原子,由 VramGuard 采样)。装载期分配模式不同会让这个缓存停在
+        // 不同时刻 ⇒ 同一档 cap 抖 79k–116k。这里先 drain/trim,再 sync,
+        // 最后用 `cuMemGetInfo` 刷新缓存,让池看到**结算后的真值**。
+        if let Err(e) = face.sync().await {
+            eprintln!("[vram-pre-pool] sync 失败(继续):{e}");
+        }
+        if let Ok((free, _total)) = face.mem_info().await {
+            owl_shared::vram::free_set(free);
+        }
+        eprintln!(
+            "[vram-pre-pool] temp_drained={drained} 块 · driver_trimmed={} MiB ⇒ free={} MiB",
+            trimmed >> 20,
+            owl_shared::vram::free_bytes() >> 20
+        );
+        phase.mark(&mut face, "pre-pool settle").await;
         // **池骨架 = `Pool` 类**(boot 相位;不加这个上下文就会落“未分类”桶 ——
         // 可见但无用)。作用域 RAII:块分配途中任何早退都会还原上下文。
         let pool = {
             let _scope = face.scoped_ctx(Owner::System, AssetClass::Pool);
             StatePool::alloc(&mut face, dims, &rm.spec.layer_types, &plan).await?
         };
+        phase.mark(&mut face, "pool(KV/GDN 状态)").await;
 
         // **MTP window 的 v2 依赖门**(2026-10-21):window 只改 draft 读，
         // 但必须走 v2 伪序列（decode T=1 / extend 多行 / chain）；缺
@@ -1973,7 +2054,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         let depth_candidates = spec.depth_candidates();
         let extra_faces: Vec<DeviceHandle<D>> =
             (0..fleet_faces(&depth_candidates)).filter_map(|_| face.face_clone()).collect();
-        let graphs = GraphFleet::assemble(
+        let mut graphs = GraphFleet::assemble(
             face,
             vface,
             extra_faces,
@@ -1990,6 +2071,10 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             t_run,
         )
         .await?;
+        phase.mark_info(
+            "graphs(全部捕获图)",
+            graphs.session.face_mut().mem_info().await,
+        );
 
         // ── 准入预算组装 + 会话/块账房(S3b;§23.3)──
         // 此刻固定面全部落位(权重 + 池 + 图 slab + 表件)⇒ 实测数字齐;

@@ -328,7 +328,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             owl_shared::log_debug!("dflash-probe", "pos={pos} ids={:?} {}", &ids[..depth.min(ids.len())], hits.join(" "));
         }
 
-        owl_shared::log_debug!("spec-round", "接受完成 m={m} bonus={bonus} emitted={}", emitted.len());
+        // pos = 本轮入口位置(接受前)。带上它 ⇒ 不用 `step_profile`(会加
+        // ~30ms/轮同步读、实测把 AL 从 2.90 抬到 4.54)也能画 AL-vs-position。
+        owl_shared::log_debug!("spec-round", "pos={pos} 接受完成 m={m} bonus={bonus} emitted={}", emitted.len());
         // ⑤ 部分接受 → GDN 回滚 + 已接受前缀重放(v1 窗口重处理,施工
         // 方案 §四.4);快照无条件失效(下轮轮首重拍)。
         // 轮不变量:restore 只回到 state@F-1,而下一轮需要 state@fed'-1

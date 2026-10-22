@@ -32,6 +32,7 @@ pub(super) fn reject_closed(cmd: Command) {
             Command::BlockLedgerDump { ack } => closed!(ack),
             Command::MemPoolTrim { ack } => closed!(ack),
             Command::MemPoolStats { ack } => closed!(ack),
+            Command::MemInfo { ack } => closed!(ack),
             Command::FiPlanSync { ack, .. } => closed!(ack),
             Command::UploadAndLaunch { ack, .. } => closed!(ack),
             Command::LaunchAndHarvest { ack, .. } => closed!(ack),
@@ -67,6 +68,7 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::BlockLedgerDump { .. } => "block_ledger_dump",
             Command::MemPoolTrim { .. } => "mem_pool_trim",
             Command::MemPoolStats { .. } => "mem_pool_stats",
+            Command::MemInfo { .. } => "mem_info",
             Command::FiPlanSync { .. } => "FiPlanSync",
             Command::UploadAndLaunch { .. } => "upload_and_launch",
             Command::LaunchAndHarvest { .. } => "launch_and_harvest",
@@ -128,6 +130,7 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             // 池回收 = host 侧池操作(与图捕获无关的全局动作)⇒ 捕获期拒
             Command::MemPoolTrim { ack } => reject!(ack),
             Command::MemPoolStats { ack } => reject!(ack),
+            Command::MemInfo { ack } => reject!(ack),
             Command::UploadAndLaunch { ack, .. } => reject!(ack),
             Command::LaunchAndHarvest { ack, .. } => reject!(ack),
             Command::Dtoh { ack, .. } => reject!(ack),

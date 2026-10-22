@@ -372,6 +372,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.concat" => elems::concat(dt),
         "ops.rope" => elems::rope(dt, ax(0)),
         "ops.embed" => elems::embed(dt, ax(0)),
+        "elems.embed_i8" => elems::embed_i8(ax(0)),
         "attn.norm_rope" => attn::norm_rope(dt, ax(0), ax(1), ax(2)), // aux = [tokens, heads, hd]
         "attn.qkv_norm_rope_insert" => {
             let (tokens, hq, hkv, hd, half) = (ax(0), ax(1), ax(2), ax(3), ax(4));
@@ -2066,6 +2067,14 @@ pub mod elems {
     pub fn embed(dt: DType, tokens: usize) -> KernelPick {
         KernelPick {
             name: dt_name("embed", dt),
+            shape: Shape { grid: (tokens as u32, 1, 1), block: (512, 1, 1), smem: 0 },
+        }
+    }
+
+    /// int8 表查表 + per-row 反量化(2026-10-22;输出恒 f16,与 embed_f16 同几何)。
+    pub fn embed_i8(tokens: usize) -> KernelPick {
+        KernelPick {
+            name: "owl_embed_i8_f16",
             shape: Shape { grid: (tokens as u32, 1, 1), block: (512, 1, 1), smem: 0 },
         }
     }

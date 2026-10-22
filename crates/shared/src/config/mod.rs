@@ -66,12 +66,11 @@
 //! | model | vision / vision_path | bool / false + Option(视觉塔;GGUF 档 = `mmproj-*.gguf` 单文件) |
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
-//! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
+//! | pool | kv_fp8 | bool / false(主 KV 池 e4m3;32 KiB/token) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
-//! | pool | prefix_cache_share | f64 / 0.5(缓存可占设备池比例) |
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
-//! | pool | prefix_cache | bool / true |
+//! | pool | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
 //! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
 //! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
@@ -90,7 +89,7 @@
 //! | dispatch | prefill_split / force_naive | flag / false |
 //! | dispatch | ~~flashinfer~~ | **已移除(2026-10-13):FI 恒启用,无开关** |
 //! | dispatch | gdn_chunked | bool / **true**(定谳;形状门自动回落) |
-//! | dispatch | gdn_scalar / kv_fp8 | flag / false |
+//! | dispatch | gdn_scalar | flag / false |
 //! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
 //! | kernel | verify_arm / decode_arm | **单值枚举** / "v2" 缺省(fi、xqa、prefill 为候选;decode 无 prefill) |
 //! | kernel | gguf_mmvq_l2_mib | usize / **4**(0 = 关;GGUF 小 n 装得进 L2 ⇒ 让 MMVQ 赢) |
@@ -213,6 +212,21 @@ pub enum HeadQuant {
     RtnInt8Row,
     // 预留:GptqInt4G128(需自采 hidden states 产量化,另案)、
     // RtnInt8G128(中间档)——加值时同步 loader 映射与质量门台账
+}
+
+/// **embedding 表量化方案**(model.embed_quant;P8 2026-10-22)。
+///
+/// 27B 的 `embed_tokens` 是 2,425 MiB(f16);int8 per-row 后 ~1.2G,
+/// 查表走 `owl_embed_i8_f16`。只支持 untied(独立 lm_head);tied 档
+/// 构造期响亮拒。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbedQuant {
+    /// f16 表(检查点原样;对照/默认)
+    #[default]
+    F16,
+    /// per-row 对称 int8(q/s 派生键;装载期 RTN)
+    I8,
 }
 
 /// **主干量化方案**(model.quant;2026-10-17 由 `w4a8: bool` 升格 ——
@@ -517,6 +531,9 @@ pub struct ModelCfg {
     /// C1(2026-10-11):untied lm_head 头部量化方案(枚举严格;映射点
     /// 在 engine loader:HeadQuant → QuantPlan)。质量门台账见枚举值注。
     pub head_quant: HeadQuant,
+    /// **embedding 表量化**(P8 2026-10-22;默认 f16 = 行为不变)。
+    /// 映射点 = `engine::embed_plan_of`;`i8` 省 ~1.2G,需质量门。
+    pub embed_quant: EmbedQuant,
     /// **主干量化方案**(量化方案 = 配置枚举,loader 零硬编码;映射点 =
     /// `engine::quant_plan_of`)。**只作用于主干层** —— lm_head / 草稿 /
     /// mtp 各自独立 plan(选层排除在本仓是结构性的,不需要名字正则)。
@@ -527,11 +544,6 @@ pub struct ModelCfg {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PoolCfg {
-    /// 设备 KV 池(token;`None`/`0` = 自动 = 2 × 单会话容量)。
-    /// **虚拟化档可小于上下文**(`[kvmem].pool_overcommit`;boot 硬校验兜底)。
-    /// `0 = 自动` 与 `[pool] gdn_slots` 同款(继承链里"不想钉死"时写 0)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pool_tokens: Option<usize>,
     /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)。
     /// **0 = 自动 = `[runtime] max_concurrency`**(并发数配几个就几格 —— 用户裁决
     /// 2026-10-20);非 0 = 显式值(旧档逐字节不变)。
@@ -555,13 +567,10 @@ pub struct PoolCfg {
     /// 只在 `边界页号 % stride == 0` 的边界拍(快照 27B ≈ 152 MiB/条 ⇒ 拍得越密,
     /// 宿主下沉流量越大;1 = 每个页边界都拍)。
     pub snap_decode_stride: usize,
-    /// **前缀缓存份额**(0..1;`prefix_cache` 开时生效;缺省 0.5)。
-    ///
-    /// 语义 = "设备池里最多多少比例的页可以留在缓存树上等复用"
-    /// (再 **+ 宿主槽全额**:下沉到宿主的条目仍占条目名额)。
-    /// **容量算式住在 store**(`owl_store::CachePolicy::Share`)—— 它是显存
-    /// 管理者;配置只给这条政策输入。缺省 0.5 = 旧 `nb/2` 行为逐字不变。
-    pub prefix_cache_share: f64,
+    /// **主 KV 池 fp8**(→ `KvQuant::Fp8E4M3`;32 KiB/token,容量翻倍)。
+    /// 2026-10-22 从 `[kernel]` 移入:它决定池的**存储 dtype/几何**,
+    /// 与 `gdn_slots`/`snap_max` 同属池面,而不是算子臂。
+    pub kv_fp8: bool,
     /// GDN 快照池槽数
     pub snap_max: usize,
     /// **宿主 KV 腿**(MiB;0 = 关层)。下沉的落点之一。
@@ -761,7 +770,7 @@ pub struct KvmemCfg {
     /// **允许设备池小于上下文**(锁①;缺省关)。
     ///
     /// 关着时池有硬下限 `nb ≥ ceil(seq_tokens/page)`(`state.rs`)—— 即
-    /// **选择层只省访问面、不省显存**。开着才允许 `pool_tokens` 真的压小。
+    /// **选择层只省访问面、不省显存**。开着才允许池真的压小(池由剩余显存自动定)。
     /// 只有虚拟化开才被接受。
     #[serde(default)]
     pub pool_overcommit: bool,
@@ -817,6 +826,10 @@ pub struct SpecCfg {
     pub draft_path: Option<PathBuf>,
     pub dumb: bool,
     pub draft_kv_fp8: bool,
+    /// **DFlash2 草稿环窗口(token;0 = auto = 检查点 `sliding_window`)**。
+    /// 草稿池按这个窗口做环形缓冲(不再按 pool_tokens 全量物化);
+    /// 当前 NC 核只实例化 2048,写非 2048 = boot 拒(等核支持 4k/8k)。
+    pub draft_window: usize,
     /// **MTP 草稿注意力的滑动窗口(token;0 = 关闭,走全上下文)**。
     /// 只作用于 MTP draft 的读;target verify 始终全上下文。
     /// 页粒度由运行时按 `StatePool::geom.page` 向上取整;启动日志打印
@@ -1091,8 +1104,6 @@ pub struct KernelCfg {
     pub gdn_fused_decode: bool,
     /// D1-v2(缺省真;2026-10-04 三重验证后翻)
     pub gdn_fused_decode_v2: bool,
-    /// KV 池 fp8(→ KvQuant::Fp8E4M3)
-    pub kv_fp8: bool,
     // ---- GGUF 预填臂(2026-10-21 收编;原 `OWL_GGUF_*` env)----
     //
     // 五个布尔 = **同一族**的臂开关:每次 `gguf_quant_gemm` 按 `m` 与臂集
@@ -1480,24 +1491,11 @@ impl Default for RuntimeCfg {
     }
 }
 
-
-impl PoolCfg {
-    /// **生效的池容量**(`None` / `Some(0)` = 自动 ⇒ 返回 None)。
-    ///
-    /// 唯一消费口:引擎 `EngineKnobs`、`--check` 展示、`[intent]` 派生。
-    /// 为什么把 0 当自动:extends 链下"上一档钉了池、本档想回自动"只能靠一个
-    /// 显式值表达 —— 0 与 `gdn_slots = 0` 的同款约定一致。
-    pub fn pinned_pool_tokens(&self) -> Option<usize> {
-        self.pool_tokens.filter(|n| *n > 0)
-    }
-}
-
 impl Default for PoolCfg {
     fn default() -> Self {
         Self {
-            pool_tokens: None,
             gdn_slots: 8,
-            prefix_cache_share: 0.5,
+            kv_fp8: false,
             prefill_align_tail: true,
             snap_decode_stride: 1,
             snap_max: 4,
@@ -1548,6 +1546,7 @@ impl Default for SpecCfg {
             draft_path: None,
             dumb: false,
             draft_kv_fp8: false,
+            draft_window: 0,
             mtp_window: 0,
             mtp_sink: 64,
             mtp_window_min_ctx: 0,
@@ -1588,7 +1587,6 @@ impl Default for KernelCfg {
             gdn_scalar: false,
             gdn_fused_decode: true,
             gdn_fused_decode_v2: true,
-            kv_fp8: false,
             // GGUF 预填臂:缺省全开(生产行为;关掉 = 回退下一臂)
             gguf_tile: true,
             gguf_cublas: true,
@@ -1665,7 +1663,7 @@ fn record_origins(v: &toml::Value, prefix: &str, origin: &Origin, out: &mut Orig
 /// 逐层比对文件里是否**每一个键都在场**;缺一个都拒启(列出全量,一次改完)。
 ///
 /// 例外(自然豁免):`Option::None` 与 `skip_serializing_if` 的字段不出现在
-/// schema 里,因此**不要求**写(例如 `pool_tokens`、`runtime.device.*` 三件互斥)。
+/// schema 里,因此**不要求**写(例如 `runtime.device.*` 三件互斥)。
 fn check_explicit_complete(file_v: &toml::Value, path: &Path) -> Result<(), String> {
     let schema = toml::Value::try_from(&OwlConfig::default())
         .map_err(|e| format!("内部:schema 序列化失败 {e}"))?;
@@ -1720,7 +1718,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
         (
             "kernel",
             "allowed_ops",
-            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`dispatch.kv_fp8`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
+            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`pool.kv_fp8`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
         ),
         (
             "kernel",
@@ -1940,7 +1938,7 @@ impl ResolvedConfig {
             .map_err(|e| format!("生效配置序列化失败(print/explain 面): {e}"))?;
         resolve::get(&v, key)
             .cloned()
-            .ok_or_else(|| format!("键 {key:?} 不在生效配置里(点路径,如 pool.pool_tokens)"))
+            .ok_or_else(|| format!("键 {key:?} 不在生效配置里(点路径,如 pool.prefill_chunk)"))
     }
 
     /// 单键解释:`值 + 来源 + 派生规则`
@@ -1984,7 +1982,7 @@ pub fn parse_cli_set(s: &str) -> Result<(String, toml::Value), String> {
     })?;
     let key = k.trim();
     if key.is_empty() || key.split('.').any(|seg| seg.is_empty()) {
-        return Err(format!("--set {s:?} 非法键 {key:?}(点路径,如 pool.pool_tokens)"));
+        return Err(format!("--set {s:?} 非法键 {key:?}(点路径,如 pool.prefill_chunk)"));
     }
     let raw = raw.trim();
     let val = match toml::from_str::<toml::Value>(&format!("v = {raw}")) {
@@ -2320,12 +2318,6 @@ impl OwlConfig {
         }
         // **前缀缓存份额**:0..=1(0 = 不留缓存设备份额;1 = 可占满设备池)。
         // 越界 = 配置错(算式在 store,静默夹会让"我要 150% 池"变成别的东西)。
-        if !(0.0..=1.0).contains(&self.pool.prefix_cache_share) {
-            return Err(format!(
-                "[pool] prefix_cache_share({}) 越界:须 0..=1(份额 × 设备池 = 缓存可占页数)",
-                self.pool.prefix_cache_share
-            ));
-        }
         // **磁盘层的配置自洽**(S6):给了配额就必须给目录(否则"要磁盘"变成静默关层);
         // 给了目录但没配额 = 空目录守着不用(允许,但 boot 日志会显示关层)。
         // 目录给多个引擎共用 = 互相扫到对方的块 ⇒ 拒(独占是硬约束)。
@@ -2902,7 +2894,7 @@ mod extends_tests {
         assert_eq!(c.spec.depth, 5, "文件覆盖基准");
         assert_eq!(c.runtime.max_seq, 2048, "文件键到手");
         assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");
-        assert_eq!(c.kernel.kv_fp8, true, "基准行为面保留");
+        assert_eq!(c.pool.kv_fp8, true, "基准行为面保留");
         let _ = std::fs::remove_dir_all(&d);
     }
 

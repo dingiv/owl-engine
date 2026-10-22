@@ -20,7 +20,7 @@ depth = 7
 draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 
 [pool]
-pool_tokens = 16896
+kv_fp8 = true
 gdn_slots = 1
 snap_max = 4
 prefix_cache = true
@@ -30,7 +30,6 @@ host_cache_mb = 4096
 snap_host_mb = 3072
 
 [kernel]
-kv_fp8 = true
 decode_arm = "fi"
 verify_arm = "fi"
 fi_cuda_graph = true

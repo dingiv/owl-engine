@@ -32,6 +32,11 @@ pub struct Embedding {
     /// `GgufGemm`(同一张表两用 —— 4B 实测 `token_embd` = Q6_K 且
     /// `tie_word_embeddings=True`)。
     gguf_ty: Option<GgmlTy>,
+    /// **int8 表**(P8,2026-10-22):q [vocab, d] i8 + s [vocab] f32。
+    /// `Some` ⇒ 不装载 f16 表(`w` 仅占位),查表走 `owl_embed_i8_f16`。
+    /// 仅 untied(头有独立 lm_head;tied 的头无法直读 int8 表)。
+    w_i8q: Option<Weight>,
+    w_i8s: Option<Weight>,
 }
 
 /// int8 lm_head 的两块(行数随词表切 ⇒ 与 `head_vocab` 同源)
@@ -46,7 +51,7 @@ impl Embedding {
     /// 准备容器(局部键 "weight":C10 前缀源下 →
     /// `{base}.embed_tokens.weight`;单槽,tied 经 nt matmul 复用)
     pub fn new(vocab: usize, d_dim: usize) -> Embedding {
-        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: None, head_i8: None, d_dim, vocab, gguf_ty: None }
+        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: None, head_i8: None, d_dim, vocab, gguf_ty: None, w_i8q: None, w_i8s: None }
     }
 
     /// **tied + 计划定形**(2026-10-19 刀 7g):`QuantPlan::Gguf(ty)` ⇒ 槽 = 块字节
@@ -69,6 +74,22 @@ impl Embedding {
     /// ⇒ 装载期源侧响亮拒(「量化键只能以 U8 交付」)。tied/untied 是**头部**
     /// 的差别,与"表怎么存"无关 —— 两件事不许混。
     fn set_table_plan(&mut self, plan: QuantPlan) -> Result<(), crate::contract::ModelError> {
+        if matches!(plan, QuantPlan::I8W) {
+            // int8 表只服务 untied(头有自己的 lm_head;tied 头会拿这张表
+            // 做 nt matmul,而 int8 表没有 matmul 臂 —— 构造期响亮拒)。
+            if self.lm_head.is_none() {
+                return Err(crate::contract::ModelError::Msg(
+                    "Embedding: int8 表要求 untied 模型(独立 lm_head);\
+                     tied 头无法直读 int8 表".into(),
+                ));
+            }
+            // `w` = F16 占位(不声明/不装载):`embed` 的输出 dtype 由它携带,
+            // 不能留默认 F32(否则 dtype 守门拒 `owl_embed_i8_f16`)。
+            self.w = Weight::new_typed("weight", vec![self.vocab, self.d_dim], crate::tensor::Dtype::F16);
+            self.w_i8q = Some(Weight::new_typed("i8q", vec![self.vocab, self.d_dim], crate::tensor::Dtype::I8));
+            self.w_i8s = Some(Weight::new_typed("i8s", vec![self.vocab], crate::tensor::Dtype::F32));
+            return Ok(());
+        }
         let QuantPlan::Gguf(ty) = plan else { return Ok(()) };
         if owl_kernels::family::gguf::rows_entry_for(ty).is_none() {
             return Err(crate::contract::ModelError::Msg(format!(
@@ -126,6 +147,8 @@ impl Embedding {
                 d_dim,
                 vocab,
                 gguf_ty: None,
+                w_i8q: None,
+                w_i8s: None,
             };
         }
         let head = Linear::new("lm_head", head_vocab, d_dim, plan);
@@ -134,7 +157,7 @@ impl Embedding {
         } else {
             head
         };
-        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: Some(head), head_i8: None, d_dim, vocab, gguf_ty: None }
+        Embedding { w: Weight::new("weight", vec![vocab, d_dim]), lm_head: Some(head), head_i8: None, d_dim, vocab, gguf_ty: None, w_i8q: None, w_i8s: None }
     }
 
     /// **untied + 词表切 + 表/头两个独立计划**(并集:GGUF 27B 的真实形态 ——
@@ -201,7 +224,10 @@ impl Embedding {
 
     /// 装载完备性
     pub fn is_loaded(&self) -> bool {
-        self.w.is_loaded()
+        match (&self.w_i8q, &self.w_i8s) {
+            (Some(q), Some(s)) => q.is_loaded() && s.is_loaded(),
+            _ => self.w.is_loaded(),
+        }
     }
 
     /// 查表(Module 统一入口的实体;tokens 由 ctx 提供 —— 每步动态依赖)。
@@ -219,6 +245,17 @@ impl Embedding {
                 .arg_i32(self.vocab as i32)
                 .aux(&[ty.code() as usize, tokens, self.d_dim])
                 .with_shape(Dtype::F16, vec![tokens, self.d_dim]);
+        }
+        // **int8 表**(P8):查表 + per-row 反量化(输出恒 f16;与 f16 表同形)
+        if let (Some(q), Some(s)) = (&self.w_i8q, &self.w_i8s) {
+            let dt = self.w.dtype();
+            return TensorOps::call(crate::ops::SemanticKernel::EmbedI8)
+                .aux(&[tokens])
+                .arg(&q.decl())
+                .arg(&s.decl())
+                .arg(ids)
+                .arg_usize(self.d_dim)
+                .with_shape(dt, vec![tokens, self.d_dim]);
         }
         // 输出 dtype 跟随表 Weight(F5;LoaderCtx 自动跟随)
         let dt = self.w.dtype();
@@ -276,7 +313,13 @@ impl Embedding {
 impl Loadable for Embedding {
     /// tied 单槽:一个 Want 兼查表与 lm_head(nt matmul)
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
-        self.w.layout(ctx)
+        // int8 表:局部键 `i8q`/`i8s` 经 `KeyConvention::embed_key` 变成
+        // `...embed_tokens.i8q/.i8s`;AWQ 派生键解析器按 base=...embed_tokens
+        // 读 bf16/f16 源现算(见 awq_build 的 i8 分支)。
+        match (&self.w_i8q, &self.w_i8s) {
+            (Some(q), Some(s)) => q.layout(ctx).chain(s.layout(ctx)),
+            _ => self.w.layout(ctx),
+        }
     }
 
 }

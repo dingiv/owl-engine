@@ -28,7 +28,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 草稿池寻址一律经 StatePool 权威(slot≥1 案配套;分派点零推槽)
         use crate::state::StatePool as SP;
-        let slot_at = |p: usize| SP::draft_prefix_slot(p);
+        let ring = self.dev.pool.draft_ring();
         let _f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         // mask token 走 spec 运行态(单源:GGUF 草稿未导出该 KV ⇒ 家族兜底值已入账)
         let mask = self.dev.spec_rt.dflash_mask_token as f32;
@@ -36,14 +36,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .map(|i| if i == 0 { bonus as f32 } else { mask })
             .collect();
         let enc_pos: Vec<f32> = (0..8).map(|i| (pos + i) as f32).collect();
-        let enc_slots: Vec<f32> = (0..8).map(|i| slot_at(pos + i)).collect();
+        // 只有**已接受**行进环(pos..pos+m);verify 块多编的行(m+1..7)是
+        // 被拒草稿,写 self scratch —— 否则下轮前缀读满环时会把它们当上下文。
+        let enc_slots: Vec<f32> = (0..8)
+            .map(|i| {
+                if i <= m {
+                    SP::draft_encode_slot(ring, pos, i)
+                } else {
+                    SP::draft_self_slot(ring, pos, i)
+                }
+            })
+            .collect();
         // 逐行可见长(含自身;eager dflash_encode 同式 —— AL 劣化案修复)
         let enc_kv_lens: Vec<f32> = (0..8).map(|i| (pos + i + 1) as f32).collect();
         let prop_pos: Vec<f32> = (0..8).map(|i| (fp + i) as f32).collect();
-        let prop_slots: Vec<f32> = (0..8).map(|i| slot_at(fp + i)).collect();
+        // propose 自块 = 环外 scratch(不污染前缀环)
+        let prop_slots: Vec<f32> = (0..8)
+            .map(|i| SP::draft_self_slot(ring, fp, i))
+            .collect();
         // propose 噪声块逐行可见长(eager dflash_propose 同式 fp+1+i)
         let prop_kv_lens: Vec<f32> = (0..8).map(|i| (fp + 1 + i) as f32).collect();
-        let kv_len = vec![(fp + 8) as f32];
+        let kv_len = vec![SP::draft_kv_len(ring, fp)];
         let anchor = vec![bonus as f32];
         // 档位门(实际图在下面按需再借;此处只判在场,故不持绑定)
         if self.dev.graphs.dflash.is_none() {
@@ -203,7 +216,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 噪声块自槽(经寻址权威;线性逻辑位)
         let self_slots: Vec<f32> = (0..8usize)
-            .map(|i| crate::state::StatePool::draft_self_slot(pos, i))
+            .map(|i| crate::state::StatePool::draft_self_slot(self.dev.pool.draft_ring(), pos, i))
             .collect();
         let kvs: Vec<KvBuffers> = leaves
             .iter()
@@ -268,7 +281,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let mut probe_roots: Vec<TensorOps> = Vec::new();
         let probe_on = self.boot.probes.dflash_probe;
-        let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(pos + 8) as f32]));
+        let kv_len_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![1],
+            &f32b(&[crate::state::StatePool::draft_kv_len(self.dev.pool.draft_ring(), pos)]),
+        );
         let (hidden, drafts, _scores, logits) = d2.propose_block(
             &toks_t, &pos_t, &anchor_t, &kvs, &rope, &self.dev.boot.model.embed, &kv_len_t, &ctx,
             if probe_on { Some(&mut probe_roots) } else { None },
@@ -533,7 +550,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     Dtype::F32,
                     vec![rows],
                     &f32b(&(0..rows)
-                        .map(|i| crate::state::StatePool::draft_encode_slot(pos, i))
+                        .map(|i| {
+                            let ring = self.dev.pool.draft_ring();
+                            if i <= m {
+                                crate::state::StatePool::draft_encode_slot(ring, pos, i)
+                            } else {
+                                crate::state::StatePool::draft_self_slot(ring, pos, i)
+                            }
+                        })
                         .collect::<Vec<_>>()),
                 ),
                 kv_lens: TensorOps::from_host(
@@ -1235,7 +1259,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     Dtype::F32,
                     vec![t],
                     &f32b(&(0..t)
-                        .map(|i| crate::state::StatePool::draft_encode_slot(base, i))
+                        .map(|i| crate::state::StatePool::draft_encode_slot(self.pool.draft_ring(), base, i))
                         .collect::<Vec<_>>()),
                 ),
                 kv_lens: TensorOps::from_host(

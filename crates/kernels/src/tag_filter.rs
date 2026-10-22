@@ -12,7 +12,7 @@
 //! 用例：
 //! - `model.kind=gguf` ⇒ 允许集含 `quant.gguf` ⇒ marlin/W4A16 核被拒；
 //! - `model.quant=w4a16` ⇒ 允许集含 `quant.w4a16` ⇒ W4A8/GGUF 核被拒；
-//! - `dispatch.kv_fp8` ⇒ 允许集含 `kv.main.fp8` ⇒ f16 主池核被拒；
+//! - `pool.kv_fp8` ⇒ 允许集含 `kv.main.fp8` ⇒ f16 主池核被拒；
 //!   草稿池独立为 `kv.draft.*`，不会与主池 facet 混淆。
 //! - `model.vision` ⇒ 允许集含 `feat.vision` ⇒ 视觉核放行；
 //!   未开时视觉核被拒（配置声明与实际发射不一致会响亮暴露）。

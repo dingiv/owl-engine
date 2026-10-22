@@ -79,6 +79,8 @@ pub enum SemanticKernel {
     QuantInt8RowBf16,
     /// embedding 查表
     Embed,
+    /// int8 表查表 + per-row 反量化(P8;aux = [tokens],输出 f16)
+    EmbedI8,
 
     // ---- elems.* ----
     /// f16 → f32 铸(GDN scalar/chunked 臂层侧预铸)
@@ -301,6 +303,7 @@ impl SemanticKernel {
             SemanticKernel::QuantInt8RowF16 => "elems.quant_int8_row_f16",
             SemanticKernel::QuantInt8RowBf16 => "elems.quant_int8_row_bf16",
             SemanticKernel::Embed => "ops.embed",
+            SemanticKernel::EmbedI8 => "elems.embed_i8",
             SemanticKernel::CastF16F32 => "elems.cast_f16_f32",
             SemanticKernel::GemvDual => "elems.gemv_dual",
             SemanticKernel::GemvI8wBf16 => "elems.gemv_i8w_bf16",

@@ -227,11 +227,13 @@ impl AwqSource {
             };
             self.maps[we.map_ix].dontneed(we.start, we.nbytes);
             let (q8, s8) = rtn_i8_row_sym(&w_f32, out, k);
-            let bytes: Vec<u8> = if key.ends_with(".i8q") { q8 } else { s8 };
-            let n = bytes.len();
+            // **两键一次落缓存**:q/s 同源,分别按请求算会把整表(27B embed
+            // 5G 级 f32)重算两遍。q 键 = `{base}.i8q`,s 键 = `{base}.i8s`。
+            let qk = format!("{base}.i8q");
+            let sk = format!("{base}.i8s");
             let mut cache = self.cache_guard();
-            cache.0.insert(key.to_string(), Arc::from(bytes.into_boxed_slice()));
-            let _ = n;
+            cache.0.insert(qk, Arc::from(q8.into_boxed_slice()));
+            cache.0.insert(sk, Arc::from(s8.into_boxed_slice()));
             return Ok(cache.0.get(key).cloned());
         }
 

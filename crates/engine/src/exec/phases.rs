@@ -1507,7 +1507,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         }
         owl_shared::log_debug!("spec-round", "fold:图入队起 rows={rows}");
         let fg = self.graphs.fold_mut(depth, rows)?;
-        let r = fg.step(&[("slots", &[gdn_slot as f32])]).await;
+        // `cu` 必须每回复写:单图按最大 rows 捕获,核按 cu=[0,rows] 截断。
+        let r = fg
+            .step(&[("slots", &[gdn_slot as f32]), ("cu", &[0.0, rows as f32])])
+            .await;
         owl_shared::log_debug!("spec-round", "fold:图入队完 rows={rows} ok={}", r.is_ok());
         r
     }
