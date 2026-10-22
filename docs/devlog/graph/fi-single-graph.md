@@ -72,7 +72,7 @@ K=3/7 各一张 ⇒ **总计 < 0.4 G**（对比"每桶独立图"：7 桶 verify 
 
 1. **表必须与真实 ctx 精确对应**（§2.2）⇒ 桶化只允许发生在 **T=1**；verify 必须每轮刷精确表。
    （2026-10-18 反例留档：verify 桶 2048 ⇒ 空文本/`!!!`/42.9 t/s；回退即恢复 71 t/s。）
-2. 改 vendored `cu/flashinfer/*` 的语义须按 charter A4 显式认领并登记 `VENDOR.list.md`
+2. 改 vendored `cu/flashinfer/*` 的语义须按 charter A4 显式认领并登记 `THIRD_PARTY.md`
    —— **本设计不需要改核**（§2.3），若将来要"表用上界"再走该流程。
 3. 图档 plan 的 `padded=42` 对小 ctx 是白跑 CTA ⇒ W3 的门里必须量税（探针 per-call ms 同档可比）。
 4. `cuGraphExecUpdate`（cudarc `driver/sys`）**非必需**（形状恒定 ⇒ 桶少），留作后续优化项。

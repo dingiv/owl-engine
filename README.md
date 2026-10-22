@@ -1,31 +1,54 @@
 # owl
 
-A single-node LLM inference engine in Rust, built around two first-class ideas:
-**CUDA-graph capture as the model seam**, and **tensor-parallel communication as a
-first-class citizen**. Targets consumer RTX 30-series (sm_86) cards; loads AWQ-INT4 /
-W4A16 safetensors / GGUF checkpoints; ships graph replay, TP=2, speculative decoding
-(DFlash2 / MTP), fp8 KV cache and prefix caching.
+**Run the models you want fast, on the GPUs you already own — and keep the context.**
 
-> **Status: alpha.** Single machine, tuned for the author's hardware
-> (2× RTX 3090 Ti + 2× RTX 3080 20G). Production inference still runs on vLLM;
-> this project is grown milestone by milestone.
+| | What you get | Status |
+|---|---|---|
+| 🧮 | **VRAM-efficient local deployment** — a budget declared at boot that the process never exceeds; every allocation is ledgered by name and reconciled against the driver | ✅ |
+| 🚀 | **High performance** — CUDA-graph capture, block-level prefix cache, fused kernels (measured numbers to be published) | ✅ |
+| 📦 | **GGUF + SafeTensors** — AWQ-INT4, W4A16, Q4_K, IQ family are all supported | ✅ |
+| 🔗 | **Tensor parallelism (TP=2)** — one-shot allreduce over IPC / P2P | ✅ |
+| 🗄 | **Three-tier KV offload** — GPU pool → pinned host RAM → disk; blocks demote and come back on demand instead of being dropped | ✅ |
+| 🧠 | **KV-cache virtualization** — each turn materializes only its working set on the device; the full KV stays virtual and is recalled by attention-aware scoring | ✅ |
+| ⚡ | **Speculative decoding** — DFlash2 draft (d7) and MTP head, with spec-aware graph capture | ✅ |
+| 👁 | **Vision** — Qwen3.8-VL vision tower (m-RoPE, image scatter) served by the same engine | ✅ |
+| 🖥 | **CUDA + AMD (ROCm) ecosystems** — the backend is a vendor-agnostic HAL today; the second implementation is planned | 🎯 planned |
+| 🖼 | **Image KV transparent deletion** — drop an old screenshot from the history and keep the prefix cache hit (for GUI agents) | 🚧 upcoming |
+| 🧩 | **LoRA adapters + dynamic LoRA fine-tuning** — adapter registration, hot activation and rollback, with the full lifecycle (data → train → eval → serve) scoped in the design log | 🎯 planned |
+| 🔄 | **Model hot-swap** — drain in-flight turns, park the current model's weights (host RAM or disk) and bring another one up **on the same GPU**, so one deployment switches models without a restart | 🎯 planned |
+
+`✅ implemented` · `🎯 planned` · `🚧 in design`
+
+owl is a from-scratch LLM inference engine in Rust, built on one conviction: **the
+first hard limit of local AI is VRAM, so memory is a contract, not a gamble.** Declare
+the budget at boot, ledger every allocation, virtualize the KV cache across tiers, and
+treat quantization as the first lever — then **the context you can actually afford
+becomes the product**: long agent sessions, 100k+ windows, no OOM.
+
+> **Scope, honestly** — this is alpha, and narrow on purpose.
+>
+> - **Models: today one family — Qwen3.8 / Qwen3.5.** Production is the 27B hybrid
+>   (GDN linear + full attention), with AWQ-INT4 / W4A16 / GGUF checkpoints, a vision
+>   tower, and DFlash2 / MTP draft heads. A new architecture lands as a spec + layer
+>   set rather than a fork — but **if your checkpoint is not this family, owl cannot
+>   serve it yet.**
+> - **Status: single machine, alpha.** Tuned on RTX 30-series (sm_86); production
+>   inference still runs on vLLM. This project is grown milestone by milestone.
 >
 > The design log — axioms, measurements, verdicts and an explicit *retracted
-> conclusions* list — **is written in Chinese** and is the most useful part of this
-> repo. Start at [`docs/devlog/canon/charter.md`](docs/devlog/canon/charter.md); the English index is
-> [`docs/README.md`](docs/README.md).
+> conclusions* list — and is the most useful part of this repo.
+> Start at [`docs/devlog/canon/charter.md`](docs/devlog/canon/charter.md); the
+> English index is [`docs/README.md`](docs/README.md).
+>
+> Internally the project is organized around two first-class ideas — **CUDA-graph
+> capture as the model seam** and **tensor-parallel communication as a first-class
+> citizen** ([charter](docs/devlog/canon/charter.md) A1/A2). Those are architectural
+> choices, not the pitch.
 
-## 1. What this is / is not
+## 1. Capabilities
 
-| Is | Is not |
-|---|---|
-| A **research** engine for single-node, 1–2 GPU (sm_86 first) setups | A general multi-node serving framework |
-| A worked example of "write the design volume first, then build against a gate" | A feature-complete product |
-| An **experiment bench** for quantization × graph capture × TP × spec-decode | A training framework |
-| A documentation library where every key decision has measurements and a retraction list | An English-complete, batteries-included SDK |
-
-## 2. Capabilities (all implemented; see the docs index)
-
+- **Model family**: Qwen3.8 / Qwen3.5 — dense hybrid (GDN linear + full attention),
+  27B production / 0.8B dev, plus the VL vision tower — [`crates/models/src/formats/qwen35.rs`](crates/models/src/formats/qwen35.rs)
 - **Model formats**: AWQ-INT4 (pack-quantized, gs32 asymmetric), W4A16 safetensors,
   F16/BF16, GGUF (Q4_K / Q5_K / Q6_K / IQ family) — [`crates/models`](crates/models)
 - **Graph capture & replay**: decode / verify / fold / propose captured per family;
@@ -49,7 +72,25 @@ W4A16 safetensors / GGUF checkpoints; ships graph replay, TP=2, speculative deco
   *collection*, logging gates *visibility*) —
   [`docs/devlog/perf/log-framework.md`](docs/devlog/perf/log-framework.md)
 
-## 3. Requirements
+### How VRAM and context are handled
+
+| Mechanism | What it buys you |
+|---|---|
+| **Declared VRAM budget (hard contract)** | Budget declared at boot, held for the whole process life. The decomposition is closed — weights / KV pool / graph allowance / activation peak / workspace / comm buffers / runtime floor / margin — and **a missing measured number means refuse-to-start**. Every allocation is ledgered *by name* and periodically reconciled against the driver; overspend is fail-fast with a ledger snapshot. **The process never OOMs itself.** |
+| **Three-tier KV offload** | The KV pool is not a hard ceiling: blocks demote GPU → pinned host RAM → disk and return on demand, tracked by a content-addressed ledger (`crates/store` tiers). Running out of VRAM costs latency, not a failed request. |
+| **KV-cache virtualization (selection layer)** | A turn only materializes its working set on the device (bounded by `workspace_per_req`); everything else stays virtual and is recalled by attention-aware scoring — this is the path to 262k on a single consumer card. |
+| **Quantization as the first lever** | W4A16 / W4A8 / AWQ-INT4 / GGUF (Q4_K · IQ family) — every GB saved on weights is a GB handed back to context. |
+| **KV dtype knob** | fp16 (default) / fp8 / int8 — fp8 doubles the pool, at a measured accuracy cost. |
+| **Graph budget up front** | Capture memory is registered *before* any pool arithmetic (axiom A1.1), so capture OOM is a boot-time decision, not a runtime surprise. |
+| **Prefix cache** | 88% hit on same-session multi-turn, 89% on cross-session shared prefixes (1536/1732 blocks) — long agent sessions stop recomputing. |
+
+> The arithmetic is written down: single-card 262k KV needs 26.1 GB dense at fp16 /
+> 13.0 GB at fp8 for the 27B model — i.e. **262k is a virtualization (or TP) problem,
+> not a tuning problem** (`docs/devlog/memory/store.md` §2).
+
+## 2. Quick start
+
+### Prerequisites
 
 | Item | Requirement |
 |---|---|
@@ -62,7 +103,7 @@ W4A16 safetensors / GGUF checkpoints; ships graph replay, TP=2, speculative deco
 > ⚠️ **No authentication.** The server binds `127.0.0.1` by default. If you expose it to
 > a LAN, put your own reverse proxy and auth in front — see [`SECURITY.md`](SECURITY.md).
 
-## 4. Quick start
+### Build and run
 
 ```bash
 # 1) Build (release without `perf` = byte-for-byte zero cost for timers)
@@ -93,7 +134,7 @@ Configuration is **fully explicit**: `profiles/full.toml` is the annotated templ
 (every key has a comment); other profiles use `extends = ["full.toml"]` and list only
 their differences. See [`docs/devlog/dev/config.md`](docs/devlog/dev/config.md).
 
-## 5. Diagnostics and measurement
+## 3. Diagnostics and measurement
 
 The API and the diagnostics endpoints share **one port** (`[server] bind`, default
 `127.0.0.1:8135`).
@@ -117,7 +158,7 @@ Measurement discipline (and its traps) is documented in
 [`docs/devlog/dev/debug-tools.md`](docs/devlog/dev/debug-tools.md) and
 [`docs/devlog/dev/profiling.md`](docs/devlog/dev/profiling.md).
 
-## 6. Testing
+## 4. Testing
 
 ```bash
 cargo test --workspace --lib          # pure-CPU unit tests
@@ -131,7 +172,7 @@ cargo test -p owl-kernels --lib       # operator face (oracle parity included)
   plus convention-based overlays; asset paths come from `testdata/resources.toml`.
   See [`docs/devlog/dev/testing.md`](docs/devlog/dev/testing.md).
 
-## 7. Repository layout
+## 5. Repository layout
 
 ```
 crates/
@@ -153,7 +194,7 @@ tools/       Probe / bench / golden-generation scripts
 testdata/    Reproducible fixtures (weights and large data are not committed)
 ```
 
-## 8. Documentation
+## 6. Documentation
 
 | Entry | Content |
 |---|---|
@@ -166,19 +207,20 @@ testdata/    Reproducible fixtures (weights and large data are not committed)
 
 > Body documents are in **Chinese** — they are the project's design log.
 > Meta documents (this README, `CONTRIBUTING`, `SECURITY`, `docs/README.md`,
-> `VENDOR.list.md`, `NOTICE`) are in **English**.
+> `THIRD_PARTY.md`, `NOTICE`) are in **English**.
 
-## 9. Third party and licensing
+## 7. Third party and licensing
 
 - Code in this repository: **MIT OR Apache-2.0** (see `LICENSE-MIT` / `LICENSE-APACHE`).
 - Vendored CUDA sources are **not relicensed**: FlashInfer / NVIDIA XQA / vLLM-marlin
   are Apache-2.0, llama.cpp·ggml is MIT — attribution and pinned revisions are in
-  [`NOTICE`](NOTICE) and [`VENDOR.list.md`](VENDOR.list.md).
-- Full Rust dependency inventory (generated): [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
+  [`NOTICE`](NOTICE) and [`THIRD_PARTY.md`](THIRD_PARTY.md).
+- Third-party **non-Cargo** inventory (vendored / ported / referenced): [`THIRD_PARTY.md`](THIRD_PARTY.md); Cargo deps live in `Cargo.lock`.
 
-## 10. Disclaimer
+## 8. Disclaimer
 
 Provided **as is**, without warranty of any kind. It is built for single-machine
 experiments: no authentication, no multi-tenant isolation. Driver/kernel-level patches
 mentioned in the docs (e.g. GPU P2P) are **not** part of this repository; evaluate and
 deploy them yourself if you need them.
+

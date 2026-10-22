@@ -33,15 +33,15 @@ disclosed with credit (unless you ask to stay anonymous).
 ## Out of scope
 
 - **Vendored upstream code** (FlashInfer / NVIDIA XQA / vLLM-marlin / llama.cpp) —
-  report to those projects; this repo only follows them (see `VENDOR.list.md`);
+  report to those projects; this repo only follows them (see `THIRD_PARTY.md`);
 - Model behaviour (harmful or incorrect generations);
 - OOM / boot rejection caused by misconfiguration — that is the *intended* loud failure;
 - Physical access, host root, or driver defects.
 
 ## Supply chain
 
-- Dependency inventory and licenses: `THIRD_PARTY_LICENSES.md` (generated) and
+- Dependency inventory and licenses: `THIRD_PARTY.md` (Rust deps section is generated) and
   `Cargo.lock` (committed);
-- Vendored CUDA sources are pinned per `VENDOR.list.md`; every change must be recorded;
+- Vendored CUDA sources are pinned per `THIRD_PARTY.md`; every change must be recorded;
 - Admission rule for third-party CUDA libraries: `crates/backends/README.md`
   (**zero tolerance for untracked `cudaMalloc`**).

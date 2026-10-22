@@ -16,7 +16,7 @@ Third-party software included in this repository
 
 The files listed below are third-party code. They are NOT relicensed by the
 dual license above: each retains its original license, and the original
-copyright notices in those files must be preserved. See VENDOR.list.md for the
+copyright notices in those files must be preserved. See THIRD_PARTY.md for the
 pinned revisions and the in-tree modification log, and the per-directory
 LICENSE files for the full texts.
 
@@ -49,7 +49,28 @@ LICENSE files for the full texts.
    License:    MIT License (see the LICENSE files in those directories)
    Copyright:  Copyright (c) 2023-2026 The ggml authors.
 
-5. CUDA Toolkit headers and libraries (not redistributed here)
+5. Ported / derived kernel code (rewritten into our own files)
+   Parts of crates/kernels/ are ports of third-party kernels: they were rewritten
+   to this project's ABI but remain derivative works, and each file keeps its
+   upstream provenance header. Upstream projects and licenses:
+
+     xinfer                   MIT       (predecessor project; the Marlin kernel it
+                                        carries is Apache-2.0: IST-DASLab/marlin +
+                                        Neural Magic, vLLM-enhanced)
+     attention.rs             MIT       (its paged-attention files are file-level
+                                        from vLLM / FasterTransformer: Apache-2.0)
+     vLLM                     Apache-2.0
+     sglang                   Apache-2.0
+     lmdeploy (TurboMind)     Apache-2.0
+     IST-DASLab/marlin        Apache-2.0
+     NInfer                   Apache-2.0
+     Flash Linear Attention   MIT
+     llama.cpp / ggml         MIT       (also see item 4)
+
+   Landing paths per upstream are indexed in THIRD_PARTY.md §3. These are NOT
+   relicensed by the dual license above.
+
+6. CUDA Toolkit headers and libraries (not redistributed here)
    The build requires a locally installed CUDA Toolkit (nvcc + driver API).
    Its use is governed by the NVIDIA Software License Agreement.
 
@@ -58,7 +79,7 @@ Rust dependencies
 --------------------------------------------------------------------------------
 
 This project depends on open-source Rust crates.
-A generated inventory (name, version, license, upstream) is kept in
-THIRD_PARTY_LICENSES.md. All of them are permissively licensed
+The inventory is `Cargo.toml` + `Cargo.lock` (single source of truth); the gate is
+`cargo deny check licenses bans sources`. All of them are permissively licensed
 (MIT / Apache-2.0 / BSD / ISC / Zlib / Unlicense / Unicode-3.0);
 there is no copyleft (GPL/AGPL) dependency.

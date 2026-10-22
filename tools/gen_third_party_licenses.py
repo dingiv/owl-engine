@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""从 `cargo metadata` 生成 `THIRD_PARTY_LICENSES.md`。
+"""按需打印第三方 Rust 依赖的许可表(审计用;**仓内不落副本**)。
 
-用法（在仓库根）：
-    cargo metadata --format-version 1 --all-features \\
-      | python3 tools/gen_third_party_licenses.py > THIRD_PARTY_LICENSES.md
+用法(在仓库根):
 
-约定：
-- 只列**非 workspace 成员**的包（crates.io / git 依赖）；
-- 仓内 vendor 的 CUDA 源码不在此列 —— 归 `NOTICE` 与 `VENDOR.list.md`；
-- 输出稳定排序（名字小写、版本），便于 diff。
+    cargo metadata --format-version 1 --all-features \
+      | python3 tools/gen_third_party_licenses.py
+
+为什么不留副本:`Cargo.toml` / `Cargo.lock` 已经是依赖的**唯一真源**,抄一份到
+文档里 = 双账本(必然漂移)。许可证/来源门走 `cargo deny check licenses bans
+sources`(`deny.toml` 是 allow-list,CI 每次跑);本脚本只在需要"逐包看"时跑。
+
+约定:
+- 只列**非 workspace 成员**的包(crates.io / git 依赖);
+- 仓内 vendor / 移植 / 引用的第三方代码**不在**此列 —— 见 `THIRD_PARTY.md` §2/§3/§5;
+- 输出稳定排序(名字小写、版本),便于 diff。
 """
 import json
 import sys
@@ -34,33 +39,14 @@ def main() -> int:
         )
     rows.sort(key=lambda r: (r[0].lower(), r[1]))
 
-    out = [
-        "# Third-party Rust dependency licenses",
-        "",
-        "> **Generated file — do not edit by hand.** Regenerate with:",
-        "> ```bash",
-        "> cargo metadata --format-version 1 --all-features \\",
-        ">   | python3 tools/gen_third_party_licenses.py > THIRD_PARTY_LICENSES.md",
-        "> ```",
-        ">",
-        "> Only **crates.io / git dependencies** are listed. Vendored CUDA sources are",
-        "> attributed in `NOTICE` and `VENDOR.list.md`.",
-        "> Audit result: **no GPL/AGPL dependency**; `r-efi` merely offers",
-        "> `LGPL-2.1-or-later` as one of three choices and is absent from the",
-        "> x86_64-linux dependency tree.",
-        "",
-        f"**{len(rows)}** packages (workspace crates excluded).",
-        "",
-        "| crate | version | license | upstream |",
-        "|---|---|---|---|",
-    ]
+    out = [f"**{len(rows)}** packages (workspace crates excluded).", ""]
+    out += ["| crate | version | license | upstream |", "|---|---|---|---|"]
     for name, ver, lic, repo in rows:
         repo = repo.replace("https://github.com/", "gh:")
         out.append(f"| `{name}` | {ver} | {lic} | {repo} |")
-    out.append("")
-    sys.stdout.write("\n".join(out))
+    sys.stdout.write("\n".join(out) + "\n")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

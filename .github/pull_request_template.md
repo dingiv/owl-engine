@@ -18,7 +18,7 @@
 ## Third-party impact
 
 - [ ] No vendored code touched
-- [ ] Vendored code touched → registered in `VENDOR.list.md` + direction recorded in that
+- [ ] Vendored code touched → registered in `THIRD_PARTY.md` + direction recorded in that
       directory's `README.md` + `NOTICE` updated if the revision changed
 
 ## Notes for reviewers

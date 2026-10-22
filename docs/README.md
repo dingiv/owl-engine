@@ -23,7 +23,7 @@
 Progress: **0 / 81** reviewed.
 
 Body documents are written in **Chinese**; this index and all meta documents
-(`README`, `CONTRIBUTING`, `SECURITY`, `VENDOR.list.md`, `NOTICE`) are in **English**.
+(`README`, `CONTRIBUTING`, `SECURITY`, `THIRD_PARTY.md`, `NOTICE`) are in **English**.
 
 ## Newcomer reading path (five documents, in order)
 

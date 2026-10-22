@@ -67,13 +67,19 @@ The iron rule (`crates/backends/README.md`): any library that touches CUDA must 
 source-reviewed for **untracked allocations**. A library that calls `cudaMalloc` behind
 your back is either not used, or copied in and fixed.
 
-When adding a vendor:
+When adding a vendor (files copied verbatim into the tree):
 
-1. add a row to `VENDOR.list.md` (upstream, pinned revision, license, A4 class);
+1. add a row to `THIRD_PARTY.md` §2 (upstream, pinned revision, license, A4 class);
 2. add the attribution to `NOTICE`;
 3. if you change upstream files, record *what* and *which gate proves it* in that
    directory's `README.md`;
 4. **never relicense** vendored files — keep the upstream copyright headers.
+
+When **porting** an upstream kernel into our own files (rewritten to our ABI):
+
+1. keep the provenance header in the file (`溯源:` / `ported from` + upstream rev);
+2. add a row to `THIRD_PARTY.md` §3 (upstream, license, landing path, what was taken);
+3. a rewrite does not erase attribution — the upstream license still applies.
 
 ## 5. Tests and gates
 

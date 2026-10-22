@@ -5,7 +5,7 @@
 
 [licenses]
 # This repository is MIT OR Apache-2.0. The audit found **zero copyleft
-# dependencies** (see THIRD_PARTY_LICENSES.md). Anything not listed here fails the
+# dependencies** (Cargo.lock is the inventory; vendored/ported code is in THIRD_PARTY.md). Anything not listed here fails the
 # gate and forces an explicit decision.
 allow = [
     "MIT",

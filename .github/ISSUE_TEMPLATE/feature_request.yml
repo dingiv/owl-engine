@@ -44,7 +44,7 @@ body:
         - single GPU only
         - TP (multi-GPU, same node)
         - affects the public config surface
-        - affects vendored third-party code (needs VENDOR.list.md entry)
+        - affects vendored third-party code (needs THIRD_PARTY.md entry)
         - docs only
     validations:
       required: true

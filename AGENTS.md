@@ -2,12 +2,14 @@
 
 > 本文件是 **owl 包内的操作手册**(不是历史)。
 > 架构事实 = `docs/devlog/canon/charter.md`;文档总索引 = `docs/README.md`;
-> 依赖地图 = `VENDOR.list.md`;逐轮施工台账保存在本地工作区(不入库)。
+> 依赖地图 = `THIRD_PARTY.md`;逐轮施工台账保存在本地工作区(不入库)。
 > 本文件旧版全文(含 2026-09-22 → 10-16 压缩历史)归档在本地台账区。
 
 ## 一、本包是什么
 
-owl = graph 与 TP 一等公民的**从零架构推理引擎**(立项 2026-09-22)。
+owl = **在消费级硬件上跑本地模型的推理引擎**(立项 2026-09-22)。
+**对外定位 = 显存与上下文友好**(显存是本地部署的第一道硬限制);
+**内部架构裁决 = graph 与 TP 一等公民**(charter A1/A2 —— 是裁决,不是宣传语)。
 生产引擎仍是 vLLM;xinfer 冻结存档(判例库)。
 
 **里程碑**:M0 骨架 ✅ → M1 图治理最小闭环 ✅ → M2 TP2 comm ✅(双 3080 生产档)
@@ -24,7 +26,7 @@ owl = graph 与 TP 一等公民的**从零架构推理引擎**(立项 2026-09-22
 | `docs/devlog/graph/graph-model-seam.md` | 图 × 模型层接缝(改执行路径前先看) |
 | `docs/devlog/memory/store.md` | 状态存储三层(GPU 池 → host pinned → 磁盘) |
 | `crates/backends/README.md` | **第三方 CUDA 准入铁律**:能触 CUDA 的库必须源码审核账外分配;会私自 cudaMalloc 的库不用,或 copy 进来改造 |
-| `VENDOR.list.md` | 依赖 / 参考源地图(FROZEN / OWNED / REFERENCE / BINARY 四分类 + vendor 树索引) |
+| `THIRD_PARTY.md` | **Cargo 未声明的第三方**:树内 vendored(A4 四分类)· 移植派生 · 引用来源 + 维护纪律(Cargo 依赖见 `Cargo.lock`/`deny.toml`) |
 
 ## 三、工作纪律(硬约束,违反即返工)
 
