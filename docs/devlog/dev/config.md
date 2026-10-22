@@ -252,6 +252,16 @@ ls profiles/
     A/B 命令见本地实测档(未入库) §8。
     `qwen38_27b-3090-w4a16-mtp.toml` 保持静态 d3 + window；
     `qwen38_27b-3090-iq4xs-mtp.toml`（GGUF 单卡）已开 window + T1b 自适应。
+  - **DFlash2 lookup（2026-10-22，仅 DFlash2）**：`[spec] lookup = true`
+    （默认 false）+ `lookup_nmin = 6` / `lookup_nmax = 12` /
+    `lookup_nstrong = 6` / `lookup_agree = 0`。在当前请求的
+    `prompt_ids + out + 本轮 verify 块` 里找当前后缀最近一次出现，用其后继
+    token 覆盖草稿头（head-only；verify 图仍 depth+1 定形）。非 DFlash2 档
+    写 `lookup=true` = boot 拒；`nmax < nmin` / `nmax > 128` /
+    `nstrong > nmax` / `agree > SPEC_DEPTH_MAX` = 配置拒。
+    `profiles/qwen38_27b-3080_tp2-w4a16.toml` 已转正 `lookup=true`
+    （W4A8/VLM 继承）；回退 `--set spec.lookup=false`。
+    实测与实现见 `docs/devlog/perf/tp2-decode-fast.md` §10。
 - **图像 × 投机**(`spec.depth>0`)已接(V5):verify 的 rope 位置 =
   真实位置 + m-RoPE `delta`,KV slots/lens 仍用真实位置;带图请求仍限
   单图/非合批。无投机对照档 = `profiles/qwen38_27b-3080_tp2-w4a16-vlm.toml`;

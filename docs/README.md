@@ -134,6 +134,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/perf/w4a8-prefill-bucket-ab.md`](devlog/perf/w4a8-prefill-bucket-ab.md) — W4A8 × prefill buckets A/B
 - ⬜ [`devlog/perf/gguf-kvmem-decode-nsys.md`](devlog/perf/gguf-kvmem-decode-nsys.md) — GGUF × KVMem decode verdict (bandwidth wall)
 - ⬜ [`devlog/perf/tp2-decode-fast.md`](devlog/perf/tp2-decode-fast.md) — TP2 decode fast path + W4A8 attribution + draft-pool ring (2026-10-22)
+- ⬜ [`devlog/perf/dflash-optimization-handoff.md`](devlog/perf/dflash-optimization-handoff.md) — DFlash2 优化交接：lookup / W8A16 TC / 质量门 / NInfer K=1..15 (2026-10-23)
 
 ## J. Developer guide (how to change things)
 

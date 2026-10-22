@@ -194,6 +194,59 @@ std/decode 要 `awq27b`;配错 = 静默换引擎。
 - 尾发本身**已近带宽极限**:13 行 = 重流权重 44.6 MB / 64 µs ≈ **697 GB/s**(带宽 74%)。
 - 账:尾发 22.0 ms 里合法计算 8.2 ms,纯损失 6.5 ms(1.7%),而修法 ≥+32 ms ⇒ **净亏**。
 
+### N2b ⚠️ **prefill_chunk × Marlin M-split 的权重读放大**(2026-10-22 记)
+
+Marlin v2 host 发射器(`cu/marlin/marlin_host.cu`)的 `max_par=16`
+(`prob_n>4096`;小 n 为 128)、`max_thread_m_blocks=4`(64 行):
+
+- `m <= 1024` ⇒ 一次发射,权重只读一遍;
+- `m=2048` ⇒ 按 1024 拆 2 段;`m=4096` ⇒ 4 段;每段都从 HBM 重读一遍完整权重。
+- 当前生产 `prefill_chunk = 512`（`profiles/full.toml`），**不触发**；
+  但不要直接把 chunk 拉到 2048/4096 —— 那样单 chunk 的权重流量会 ×2/×4，
+  prefill 可能反而变慢。
+- 改 chunk 前的判据：跑一发 `MARLIN_TIME=1`（或 debug 日志 `marlin-v2`）
+  看 `split=` 段数；段数 >1 就必须把权重重读成本算进去。
+- 这不是“逐 token 重读”，是 **M-split 分段重读**；与 decode m=8 的
+  “m=1/m=8 同速”不是同一件事（后者已审计无放大，见
+  `tp2-decode-fast.md` §10.11）。
+
+### N2c ❌ W4A8 int8 m8(famp-marlin 移植)—— 已 port,无速度收益(2026-10-22)
+
+- 来源:`repos/vllm-ampere-optimized/flashampere/marlin` @ f2e081d
+  (4 处 int8/m8 布局修复 + kS8 m8 实例/selector)。
+- 已搬入并过门:m8 与 16-row **逐位相同**,oracle M=8 均
+  `噪声/信号 RMS=0.00016`;selector 372 refs / 378 instances。
+- 3080 真实形状 A/B:m8 在 m=7/8 **持平到 +1.5% 慢**(两条路都只读
+  一遍权重,m8 只多拆 tile);引擎 W4A8 round 35.49 vs 35.38、verify
+  26.50 vs 26.37,输出逐字同。
+- 裁决:默认 **off**,仅保留 `[kernel] marlin_w4a8_m8 = true` 实验开关;不转正。
+  详见 `kernels/w4a8-family.md` §20。
+
+### N2d ⚠️ W8A8 head(strict token 门未过;已被 W8A16 TC 支配)
+
+- `rtn-int8-row-a8`(per-token int8 激活)已实现;8-bit 算术从 dp4a
+  换成 **SM86 int8 Tensor Core**(`mma.m16n8k32.s8s8s32`;30 系无 fp8 TC):
+  kernel 7 tok **0.964 ms** / 8 tok **0.969 ms**(656–659 GB/s)。
+- spec m=7/8 质量门(6 prompt × 96 tok,DFlash2 d7,3080 TP2):
+  i8 vs a8 **401/576 = 0.6962**、逐字全等 4/6;f16 vs a8 0.6858。
+  早期 near-tie 翻转来自激活量化,不是 DFlash2/TP2。
+- **裁决:退回诊断/对照档**。N2e 的 W8A16 TC 同速(35.28 vs 35.31 ms/round)
+  且质量门 0.9896 ⇒ W8A8 在速度和质量上都不占优,不推荐。
+- 详见 `tp2-decode-fast.md` §10.13。
+
+### N2e ✅ W8A16 f16 Tensor Core(Marlin 同款反量化;2026-10-22)
+
+- 学 Marlin W4A16 的流水:HBM 读 int8 权重(1 B)→ shared 仍 int8 →
+  MMA fragment 在寄存器里 `int8 → half/bf16` → f16/bf16 TC。激活保持
+  f16/bf16,不做 W8A8 激活量化。
+- 核级(124160×5120):7 tok **980.5 µs** / 8 tok **983.8 µs**
+  (646–648 GB/s);旧 W8A16 FMA 1,451/2,070 µs ⇒ **−32%/−52%**。
+- 引擎 spec 同门:round 36.649→**35.281 ms**、propose 6.256→**5.970 ms**、
+  verify 28.617→**27.453 ms**;与 W8A8 TC 基本同速,但 f16 vs i8
+  **0.9896(过门)**。
+- 裁决:**默认 `rtn-int8-row` 已自动走 TC**;W8A8 不再推荐。详见
+  `tp2-decode-fast.md` §10.14。
+
 ### N3 ❌ 降级为挂账(两个 stall 是每进程一次性)
 
 - 取证(同 prompt 两请求):首个 FI attention 前 host 静默 9.51 ms → 0.00 ms;

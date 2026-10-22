@@ -59,8 +59,9 @@ cp profiles/qwen38_27b-3080_tp2-w4a16.toml ~/my-27b.toml
 | `full.toml` | **全量模板**(所有键 + 注释;新档的 `extends` 基) |
 | `qwen38_27b-3090-w4a16.toml` | 3090 Ti 单卡 27B AWQ / 128k / fp8 KV |
 | `qwen38_27b-3090-w4a16-dflash.toml` | 3090 Ti 单卡 27B AWQ + DFlash2 d7 / 16k |
-| `qwen38_27b-3080_tp2-w4a16.toml` | 2×3080 27B AWQ + 视觉 + DFlash2 d7 / 184k |
-| `qwen38_27b-3080_tp2-w4a16-vlm.toml` | 同上但 spec off(视觉对照) |
+| `qwen38_27b-3080_tp2-w4a16.toml` | 2×3080 27B AWQ + 视觉 + DFlash2 d7 / **262k**；**FI 单图快档 + `tp_draft` + 草稿池 ring**(std decode 139.8 t/s) |
+| `qwen38_27b-3080_tp2-w4a16-vlm.toml` | **兼容名**：与主档同配方(262k 视觉档；`extends` 主档) |
+| `qwen38_27b-3080_tp2-w4a8.toml` | 2×3080 27B **W4A8** + DFlash2 d7 / 262k；prefill **+45%** / decode −41%(长 prompt、RAG 档) |
 | `qwen38_27b-3090-w4a16-mtp.toml` | 3090 Ti 单卡 27B AWQ + 检查点 MTP 头 d3 / 16k |
 | `qwen38_27b-3090-iq4-mtp.toml` | 27B AWQ + 外部 GGUF MTP 头 d3 / 16k |
 | `qwen35_4b-3090-q4km-mtp.toml` | 4B Q4_K_M 自带 NextN MTP 头 d3 / 16k |
@@ -70,6 +71,44 @@ cp profiles/qwen38_27b-3080_tp2-w4a16.toml ~/my-27b.toml
 | `qwen38_27b-3090-iq4xs.toml` | 27B UD-IQ4_XS 纯块型 / 12k |
 | `qwen38_27b-3090-iq4xs-dflash.toml` | 27B UD-IQ4_XS + DFlash2-GGUF d7 / 12k |
 | `qwen35_0_8b-3090-iq4xs.toml` | 0.8B GGUF IQ4_XS / 16k(开发档) |
+
+> **TP2 快档口径(2026-10-22)**：`…-tp2-w4a16` / `…-tp2-w4a8` 都走
+> `decode_arm=verify_arm="fi"` + `fi_plan_bake=true` + `tp_draft=true`，
+> 并且**草稿池 ring**(草稿 config sliding_window=2048 ⇒ 池只留 2080 slots/20MiB)。
+> 实测(262k std)：W4A16 decode **138.1** / prefill 1616.8；W4A8 prefill
+> **2342.7(+44.9%)** / decode 82.1(−40.5%)。
+> **`tp_vocab_split` 仍不要开** —— 半表草稿 host 合并的负收益，与 head 精度无关。
+>
+> **head_quant 默认 int8(2026-10-22 用户裁决)**：`rtn-int8-row`(int4 头太小,
+> 质量优先)。**所有 27B AWQ 档**（full.toml 默认 + 3080 TP2 + 3090 w4a16/
+> dflash/mtp/iq4-mtp）已切 int8；GGUF 档保持 `off`。
+> **W8A16 多 token 快路已转正**（spec m=7/8 权重只读一遍）：同 prompt
+> round **33.4ms vs int4 29.2ms**、propose **6.7ms vs 5.1ms**；旧逐行
+> GEMV 的 57.0/18.7ms 已退役（mt7 专用 7 行）。速度档仍可 `--set model.head_quant=rtn-int4-g32`。
+>
+> **W4A8 Marlin int8 m8（2026-10-22）**：famp-marlin 的 kS8 8-row 已 port，
+> 3080 A/B 无收益 ⇒ `[kernel] marlin_w4a8_m8 = false` 默认；复验显式
+> `--set kernel.marlin_w4a8_m8=true`（详见 `kernels/w4a8-family.md` §20）。
+>
+> **W8A16 head 已上 f16 Tensor Core（2026-10-22 深夜）**：默认
+> `rtn-int8-row` 自动走 `gemm_i8w_a16_tc`：HBM 读 int8 权重、shared 仍
+> int8、MMA fragment 在寄存器里 `int8→half`、f16 MMA；激活保持 f16。
+> kernel 级 7/8 token **980.5/983.8µs**（旧 FMA 1,451/2,070；
+> 646–648 GB/s）。引擎 spec 同门 round **36.65→35.28ms**、propose
+> **6.26→5.97ms**、verify **28.62→27.45ms**；f16 vs i8 仍 **0.9896
+> （过门）**。无需新配置键。
+>
+> **W8A8 head 退回诊断档（2026-10-22 深夜）**：
+> `profiles/qwen38_27b-3080_tp2-w4a16-a8.toml` 仍可跑，但 W8A16 TC
+> 已同速（35.28 vs 35.31ms/round）且质量门 0.9896；W8A8 的 0.6962
+> 没有速度补偿 ⇒ **不推荐**。保留作 a8/int8-TC 对照。
+> 详见 `docs/devlog/perf/tp2-decode-fast.md` §10.13/§10.14。
+>
+> **DFlash2 lookup(2026-10-22 转正)**：主档 `[spec] lookup = true`。
+> copy 任务 AL 5.91→7.00 / decode ~238→286 t/s；32k 固定尾部 prose
+> AL 1.69→1.87、轮时持平；greedy 恒等门(d7,lookup on)已过。
+> 回退 `--set spec.lookup=false`；阈值 `lookup_nmin/nmax/nstrong/agree`
+> 见 `full.toml`。详见 `docs/devlog/perf/tp2-decode-fast.md` §10。
 
 ## MTP 窗口（Phase 0，生产 MTP 档已开）
 
@@ -92,7 +131,7 @@ A/B 回退：
 图族 boot 期全量预捕获（d3+d7 共 24 face），运行期只换图引用；捕获不全 =
 boot 硬失败。T1b v2：每 8 轮窗口，连续 2 窗 `tokens/round < adaptive_min_tpr`
 才只降不升到 `depth_min`。生产 MTP 档暂未转正，A/B 用 `--set`（见
-`perf-runs/mtp-longctx-2026-10-21/REPORT.md` §8）。
+本地实测档(未入库) §8）。
 
 ## 站点事实(复制后按机器改)
 

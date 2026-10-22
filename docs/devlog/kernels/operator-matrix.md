@@ -80,6 +80,16 @@ conv/delta/norm_act/elementwise)。decode(m=1)= 权重带宽瓶颈
 
 ### Q2 FP8 / W4A8(40 系第二梯队)
 
+> **硬件事实(2026-10-22 用户定调)**:30 系(GA102/SM86)只有
+> **int8 Tensor Core**(`mma.sync.m16n8k32.s8s8s32`),**没有 fp8 TC**。
+> 8-bit 路径(W8A8/W4A8)必须走 int8 IMMA;写 fp8 MMA 在 SM86 直接非法。
+> 本机 W8A8 head 已按此落地(`tp2-decode-fast.md` §10.13)。
+>
+> **但 W8A16 不需要 int8 IMMA**:它走 **f16/bf16 TC + 在线 int8→half
+> 反量化**(Marlin W4A16 同款流水),HBM 仍读 1 B/参数、激活不量化。
+> 本机实测 0.980/0.984 ms,和 W8A8 TC 同速且质量门 0.9896 ⇒
+> **默认 W8A16 TC**;W8A8 被支配(§10.14)。
+
 - FP8:cuBLASLt fp8 GEMM + 激活 scale 核(sm89 原生);精度优于 W4;
 - W4A8:Marlin-W4A8 / CUTLASS int8(P4 已有契约闭环资产);decode 无
   杠杆(推论 3),价值 = prefill int8 TC —— 排 FP8 后;
