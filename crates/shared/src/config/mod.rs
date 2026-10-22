@@ -65,7 +65,7 @@
 //! | model | quant | QuantScheme(safetensors/awq: w4a16\|w4a8;gguf: q4k\|iq4\|iq3) |
 //! | model | vision / vision_path | bool / false + Option(视觉塔;GGUF 档 = `mmproj-*.gguf` 单文件) |
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
-//! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
+//! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row"\|"rtn-int8-row-a8")/ off |
 //! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | prefix_cache_share | f64 / 0.5(缓存可占设备池比例) |
@@ -208,9 +208,15 @@ pub enum HeadQuant {
     /// 口径 A/B 恒等门已过(prose/数学逐字同,竖式同错=模型固有)
     RtnInt4G32,
     /// **per-row 对称 int8**(P1.5-a,2026-10-20):`s_o = absmax/127`,
-    /// `q = RN-even(w/s)`;装载期现算,头走 `owl_gemv_i8w_bf16`
-    /// (decode 单步 1.76 → ~0.89 ms)。质量门 = top-1 ≥99.9% + 贪心 256 逐字。
+    /// `q = RN-even(w/s)`;装载期现算。m=1 走 `owl_gemv_i8w_bf16`
+    /// (单步 1.76 → ~0.89 ms);spec m=7/8 走 `owl_gemv_i8w_mt_*`
+    /// (2026-10-22,权重只读一遍;8 token 2.07 ms / 7 token 1.45 ms)。
+    /// 质量门 = top-1 ≥99.9% + 贪心 256 逐字。
     RtnInt8Row,
+    /// **W8A8 头**(2026-10-22 实验档):权重同 `RtnInt8Row`,前向把 hidden
+    /// 按 token 量化成 int8 + f32 scale,内积走 `__dp4a`。目标 = 把 spec
+    /// 头从 ~1.5–2.1 ms 压到 ~1 ms;激活量化有一层额外误差,质量门同 int8。
+    RtnInt8RowA8,
     // 预留:GptqInt4G128(需自采 hidden states 产量化,另案)、
     // RtnInt8G128(中间档)——加值时同步 loader 映射与质量门台账
 }
@@ -817,6 +823,21 @@ pub struct SpecCfg {
     pub draft_path: Option<PathBuf>,
     pub dumb: bool,
     pub draft_kv_fp8: bool,
+    /// **DFlash2 lookup-augmented drafting(LABD)**：在当前请求的 token 历史里
+    /// 找当前后缀的最近一次出现，用其后续 token 覆盖/补齐草稿块。
+    /// 只服务 DFlash2（`draft=dflash2` 或 `auto`+`draft_path`）；MTP/Off 写了 = boot 拒。
+    /// 缺省 false（旧档逐字节不变）。
+    pub lookup: bool,
+    /// lookup 后缀最短匹配（token；含当前末 token）。vLLM 缺省 6。
+    pub lookup_nmin: usize,
+    /// lookup 后缀最长匹配（token）。vLLM 缺省 12（长于 12 会偏好更老的长匹配）。
+    pub lookup_nmax: usize,
+    /// 头块覆盖的强匹配阈值：`match_len >= lookup_nstrong` 直接覆盖。
+    /// vLLM 缺省 6（与 nmin 同值 = 任意 nmin 匹配都覆盖）。
+    pub lookup_nstrong: usize,
+    /// 头块弱匹配所需的草稿一致性：`match_len >= nmin && agree >= lookup_agree`。
+    /// vLLM 缺省 0（不要求一致，与 nstrong=nmin 配合）。
+    pub lookup_agree: usize,
     /// **MTP 草稿注意力的滑动窗口(token;0 = 关闭,走全上下文)**。
     /// 只作用于 MTP draft 的读;target verify 始终全上下文。
     /// 页粒度由运行时按 `StatePool::geom.page` 向上取整;启动日志打印
@@ -1002,6 +1023,12 @@ pub const SPEC_DEPTH_MAX: usize = SPEC_VERIFY_ROWS_MAX - 1;
 pub struct KernelCfg {
     /// W2 qkv 融合(缺省真;2026-10-04 k-probe 硬门定谳)
     pub qkv_fuse: bool,
+    /// **W4A8 Marlin int8 m8 8-row 解码**(2026-10-22;实验,缺省 false)。
+    ///
+    /// 来自 famp-marlin 的 kS8 `m_block_size_8` 路径;3080 实测与 16-row
+    /// 持平/略慢(权重都只读一遍)⇒ 默认关。仅作为 3090/形状复验的显式配置。
+    #[serde(default)]
+    pub marlin_w4a8_m8: bool,
     /// **GGUF 小 n 的 MMVQ 判据**(MiB;`0` = 关 = 一律走复用臂)。
     ///
     /// 语义:「整张量 ≤ 本值(装得进 L2)且 `m ≤ TILE_MT` ⇒ 让 MMVQ 赢」
@@ -1548,6 +1575,11 @@ impl Default for SpecCfg {
             draft_path: None,
             dumb: false,
             draft_kv_fp8: false,
+            lookup: false,
+            lookup_nmin: 6,
+            lookup_nmax: 12,
+            lookup_nstrong: 6,
+            lookup_agree: 0,
             mtp_window: 0,
             mtp_sink: 64,
             mtp_window_min_ctx: 0,
@@ -1568,6 +1600,7 @@ impl Default for KernelCfg {
     fn default() -> Self {
         Self {
             qkv_fuse: true,
+            marlin_w4a8_m8: false,
             gguf_mmvq_l2_mib: default_gguf_mmvq_l2_mib(),
             prefill_split: false,
             force_naive_prefill: false,
@@ -2176,6 +2209,40 @@ impl OwlConfig {
                 "[spec] depth = {} 超结构上限 {} (verify 图行容量 {}=(depth+1);fold 记录/快照按它铺,改它需改 state/graph_fleet 的分配面)",
                 self.spec.depth, SPEC_DEPTH_MAX, SPEC_VERIFY_ROWS_MAX
             ));
+        }
+        // **DFlash2 lookup 自洽**(2026-10-22):只服务 DFlash2;nmin/nmax/
+        // nstrong/agree 的代数关系在配置面先拒，boot 再按实际裁决模式兜底。
+        if self.spec.lookup {
+            if self.spec.depth == 0 {
+                return Err("[spec] lookup = true 但 depth = 0（无投机可查）".to_string());
+            }
+            if self.spec.lookup_nmin == 0 {
+                return Err("[spec] lookup_nmin 必须 >= 1".to_string());
+            }
+            if self.spec.lookup_nmax < self.spec.lookup_nmin {
+                return Err(format!(
+                    "[spec] lookup_nmax = {} 必须 >= lookup_nmin = {}",
+                    self.spec.lookup_nmax, self.spec.lookup_nmin
+                ));
+            }
+            if self.spec.lookup_nmax > 128 {
+                return Err(format!(
+                    "[spec] lookup_nmax = {} 超上限 128",
+                    self.spec.lookup_nmax
+                ));
+            }
+            if self.spec.lookup_nstrong > self.spec.lookup_nmax {
+                return Err(format!(
+                    "[spec] lookup_nstrong = {} 必须 <= lookup_nmax = {}",
+                    self.spec.lookup_nstrong, self.spec.lookup_nmax
+                ));
+            }
+            if self.spec.lookup_agree > SPEC_DEPTH_MAX {
+                return Err(format!(
+                    "[spec] lookup_agree = {} 超结构上限 {}",
+                    self.spec.lookup_agree, SPEC_DEPTH_MAX
+                ));
+            }
         }
         // **MTP 窗口自洽**(2026-10-21):sink 是窗口之外的前缀;若 sink
         // 吃掉了整个 window,配置语义不成立。window=0 时 sink 无消费者,
@@ -2958,6 +3025,25 @@ mod auto_pool_tests {
         // 缺省 server.max_concurrency = 8
         let c = OwlConfig::from_toml_str("[pool]\ngdn_slots = 0\n").expect("合法档");
         assert_eq!(c.pool.gdn_slots, 8);
+    }
+
+    #[test]
+    fn dflash2_lookup_validation() {
+        let ok = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\ndraft = \"dflash2\"\nlookup = true\nlookup_nmin = 6\nlookup_nmax = 12\nlookup_nstrong = 6\nlookup_agree = 0\n",
+        )
+        .expect("lookup 合法档");
+        assert!(ok.spec.lookup);
+        let bad = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\nlookup = true\nlookup_nmin = 13\nlookup_nmax = 12\n",
+        )
+        .expect_err("nmax < nmin 必拒");
+        assert!(bad.contains("lookup_nmax"), "{bad}");
+        let bad = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\nlookup = true\nlookup_nmax = 129\n",
+        )
+        .expect_err("nmax 超上限必拒");
+        assert!(bad.contains("128"), "{bad}");
     }
 
     #[test]

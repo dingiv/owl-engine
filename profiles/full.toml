@@ -58,6 +58,8 @@ queue_wait_ms = 0
 # 上下文上限(token)
 max_seq = 131072
 # 预填块长 / 尾块合并阈值(剩余 ≤ chunk + tail_merge ⇒ 一口气吃完)
+# ⚠️ 不要直接把 chunk 拉到 2048/4096：Marlin 在 m>1024 会按 max_par 拆 M，
+#    每段各重读一遍完整权重；当前 512 不触发。改前先看 marlin-v2 的 split=。
 prefill_chunk = 512
 prefill_tail_merge = 512
 # 跨会话合批上限(1 = 串行;>1 需 gdn_slots ≥ 它、单卡、无选择层)
@@ -106,8 +108,13 @@ format = "awq"
 #   safetensors/awq → w4a16 | w4a8 | w8a8i(暂未支持) | w8a8f(暂未支持)
 #   gguf            → q4k | iq4 | iq3
 quant = "w4a16"
-# lm_head 量化:off | rtn-int4-g32 | rtn-int8-row
-head_quant = "rtn-int4-g32"
+# lm_head 量化:off | rtn-int4-g32 | rtn-int8-row | rtn-int8-row-a8
+# 2026-10-22 用户裁决:int4 头太小,int8 为默认(质量优先;int4 仅显式覆盖)
+# int8 = W8A16:多 token 自动走 f16 Tensor Core(2026-10-22;HBM 读 int8、
+#   寄存器反量化、激活 f16),质量门 0.9896。
+# a8 = W8A8 诊断档:8-bit 走 SM86 int8 TC(无 fp8 TC);spec m=7/8
+#   质量门 0.6962(<0.95),且被 W8A16 TC 同速支配 ⇒ **不推荐**。
+head_quant = "rtn-int8-row"
 # 视觉塔(纯文本档勿开);vision_path 空 = 用检查点内置 model.visual.*
 vision = false
 vision_path = ""
@@ -171,6 +178,14 @@ draft_path = ""
 dumb = false
 # 草稿池 fp8(关 = bf16)
 draft_kv_fp8 = false
+# DFlash2 lookup-augmented drafting（LABD；仅 DFlash2 档可开）
+# 在当前请求 token 历史里找当前后缀的最近一次出现，用其后续 token 覆盖草稿头；
+# 缺省关 = 旧档逐字节不变。nmin/nmax/nstrong/agree 语义见 docs/devlog/perf/tp2-decode-fast.md §10。
+lookup = false
+lookup_nmin = 6
+lookup_nmax = 12
+lookup_nstrong = 6
+lookup_agree = 0
 # MTP 窗口/sink 的全量 schema 缺省(0 = full)。**实际性能值写在具体 MTP 档**
 # (如 qwen38_27b-3090-w4a16-mtp.toml 的 4032/64)，不要在这里做调优。
 mtp_window = 0
@@ -257,6 +272,8 @@ gdn_scalar = false
 gdn_fused_decode = true
 gdn_fused_decode_v2 = true
 kv_fp8 = true
+# W4A8 Marlin int8 m8 8-row 解码(实验;3080 A/B 无收益,默认关)
+marlin_w4a8_m8 = false
 # GGUF 小 n(装得进 L2)且 m ≤ TILE_MT ⇒ 让 MMVQ 赢(0 = 关)
 gguf_mmvq_l2_mib = 4
 # GGUF 预填臂(缺省全开;关 = 回退下一臂)
