@@ -3754,6 +3754,14 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
             knobs.draft.depth = owl_shared::env_reader::parse_or("OWL_SPEC_DEPTH", 7);
             knobs.cuda.capture_slab_mb = Some(160);
             knobs.draft.dflash2_dir = Some(ddir.to_string());
+            // DFlash2 lookup 恒等门臂(2026-10-22):greedy spec 仍须 ≡ 无 spec。
+            if owl_shared::env_reader::flag("OWL_GATE_LOOKUP") {
+                knobs.draft.lookup = true;
+                knobs.draft.lookup_nmin =
+                    owl_shared::env_reader::parse_or("OWL_GATE_LOOKUP_NMIN", 6);
+                knobs.draft.lookup_nmax =
+                    owl_shared::env_reader::parse_or("OWL_GATE_LOOKUP_NMAX", 12);
+            }
             // E19 定位开关(2026-10-13):knhd×fp8 池×int4 头×spec 语义回归
             // 复现(缺省关 = 原口径不变)。三项同开才复现 —— 单开任一项均绿:
             // 疑为“knHD 多序(seqs>1)读非位等”在窄边际下的贪心翻转。

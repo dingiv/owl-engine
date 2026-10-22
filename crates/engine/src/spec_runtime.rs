@@ -91,6 +91,12 @@ pub(crate) struct SpecRuntime {
     pub depth_switch_ctx: usize,
     /// T1b 滚动降档门（tokens/round；仅 adaptive 生效）
     pub adaptive_min_tpr: f32,
+    /// DFlash2 lookup-augmented drafting（LABD；仅 DFlash2）
+    pub lookup: bool,
+    pub lookup_nmin: usize,
+    pub lookup_nmax: usize,
+    pub lookup_nstrong: usize,
+    pub lookup_agree: usize,
     /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
     pub stats: SpecStats,
     /// taps/memory 探针落盘一次性门(OWL_DFLASH_PROBE;AL=0 排查)
@@ -188,6 +194,12 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) depth_switch_ctx: usize,
     /// T1b 滚动降档门（tokens/round；仅 adaptive 生效）
     pub(crate) adaptive_min_tpr: f32,
+    /// DFlash2 lookup-augmented drafting（LABD；仅 DFlash2）
+    pub(crate) lookup: bool,
+    pub(crate) lookup_nmin: usize,
+    pub(crate) lookup_nmax: usize,
+    pub(crate) lookup_nstrong: usize,
+    pub(crate) lookup_agree: usize,
     /// **target 侧共享事实**(词表/层数/hidden;草稿不自带 —— 仅 GGUF 草稿
     /// 的声明校验与码本行数用)
     pub(crate) target: owl_models::formats::gguf::TargetFacts,
@@ -307,6 +319,47 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             inp.adaptive_min_tpr
         );
     }
+    if inp.lookup {
+        if mode != SpecMode::DFlash2 {
+            return Err(ModelError::Msg(format!(
+                "[spec] lookup 只服务 DFlash2，但当前模式 = {:?}（depth={}, draft={:?}）",
+                mode, depth, inp.family
+            )));
+        }
+        if depth == 0 {
+            return Err(ModelError::Msg(
+                "[spec] lookup = true 但 depth = 0（无投机可查）".into(),
+            ));
+        }
+        if inp.lookup_nmin == 0 || inp.lookup_nmax < inp.lookup_nmin {
+            return Err(ModelError::Msg(format!(
+                "[spec] lookup 阈值非法：nmin={} nmax={}（需 1 <= nmin <= nmax）",
+                inp.lookup_nmin, inp.lookup_nmax
+            )));
+        }
+        if inp.lookup_nstrong > inp.lookup_nmax {
+            return Err(ModelError::Msg(format!(
+                "[spec] lookup_nstrong={} 必须 <= lookup_nmax={}",
+                inp.lookup_nstrong, inp.lookup_nmax
+            )));
+        }
+        if inp.lookup_nmax > 128 || inp.lookup_agree > owl_shared::config::SPEC_DEPTH_MAX {
+            return Err(ModelError::Msg(format!(
+                "[spec] lookup 越界：nmax={}（上限 128）agree={}（上限 {}）",
+                inp.lookup_nmax,
+                inp.lookup_agree,
+                owl_shared::config::SPEC_DEPTH_MAX
+            )));
+        }
+        owl_shared::log_info!(
+            "boot",
+            "DFlash2 lookup: nmin={} nmax={} nstrong={} agree={}（host 后缀查找 + 草稿头融合）",
+            inp.lookup_nmin,
+            inp.lookup_nmax,
+            inp.lookup_nstrong,
+            inp.lookup_agree
+        );
+    }
     if mtp_window.active() {
         if mode != SpecMode::Mtp {
             return Err(ModelError::Msg(format!(
@@ -335,6 +388,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     }
     // 草稿器装载(C7;embed/lm_head 均共享 target)
     // 草稿 dtype:缺省 BF16(量化族/无草稿);DFlash2 分支按**检查点事实**改写
+    // DFlash2 草稿池 ring(2026-10-22):检查点 config `sliding_window=2048`,
+    // NC 核只读最近 2048 行;池只留窗口+自块(页对齐)。MTP/线性档为 0。
+    let dflash_ring_cap =
+        owl_models::layers::dflash2::draft_ring_slots(inp.base_env.kv.page.max(1));
+
     let mut draft_dt = owl_models::contract::Dtype::BF16;
     // DFlash2 草稿事实(HF / GGUF 两源共同填写;单一事实源)
     let mut dflash_tap_ids: std::sync::Arc<Vec<usize>> = std::sync::Arc::new(Vec::new());
@@ -459,7 +517,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     "DFlash2 GGUF 草稿装载(depth={depth};块字节驻留 + 码本反量化) {:.2}s",
                     t_draft.elapsed().as_secs_f32()
                 );
-                Some(Drafter::DFlash2(Arc::new(d2)))
+                Some(Drafter::DFlash2(Arc::new(d2.with_ring_cap(dflash_ring_cap))))
             } else {
                 // 声明:草稿检查点自己的 config(组件档)+ 起点格式探测 → fc 臂;
                 // 装载走通用入口(BF16 全程;设备重排 = 能力自述裁决)
@@ -477,7 +535,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     std::sync::Arc::new(owl_models::layers::dflash2::DRAFT_TAP_IDS.to_vec());
                 dflash_mask_token = owl_models::layers::dflash2::MASK_TOKEN_ID;
                 owl_shared::log_info!("boot", "DFlash2 草稿装载(depth={depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
-                Some(Drafter::DFlash2(Arc::new(d2)))
+                Some(Drafter::DFlash2(Arc::new(d2.with_ring_cap(dflash_ring_cap))))
             }
         }
         _ => None,
@@ -612,6 +670,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         depth_min: inp.depth_min,
         depth_switch_ctx: inp.depth_switch_ctx,
         adaptive_min_tpr: inp.adaptive_min_tpr,
+        lookup: inp.lookup,
+        lookup_nmin: inp.lookup_nmin,
+        lookup_nmax: inp.lookup_nmax,
+        lookup_nstrong: inp.lookup_nstrong,
+        lookup_agree: inp.lookup_agree,
         stats: SpecStats::default(),
         mem_dumped: false,
         mem_dumped2: false,

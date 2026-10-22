@@ -476,6 +476,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ⑦ extend + propose(同迭代消费 verify hidden;产出下轮草稿
         // host 账)。DFlash2 = encode + 噪声块 propose;图态 = 桶 m 一发
         // (MTP);eager fallback = propose_round(MTP)。
+        // DFlash2 lookup 草稿:历史 = prompt_ids + out(含当前 token)
+        // + 本轮 verify 块 `toks`(ids[0..=m];末位 bonus 是下一轮 anchor)。
+        let lookup = self.dflash_lookup_for_tail(&toks)?;
         let d2_arc7 = match self.dev.spec_rt.drafter.as_ref() {
             Some(crate::spec_runtime::Drafter::DFlash2(d)) => Some(std::sync::Arc::clone(d)),
             _ => None,
@@ -485,7 +488,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // E5-DF4:图态优先(单图一轮 encode+propose;eager 回退 =
             // OWL_DFLASH_EAGER=1 或图降级)
             if self.dev.graphs.dflash.is_some() && !self.boot.probes.dflash_eager {
-                let d = self.dflash_graph_round(m, pos, toks[m]).await?;
+                let d = self
+                    .dflash_graph_round(m, pos, toks[m], lookup.as_ref())
+                    .await?;
                 t_propose += ts.elapsed();
                 self.tspec()?.spec_drafts_host = Some(d);
             } else {
@@ -508,7 +513,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             let fp = pos + m + 1;
             let bonus = toks[m];
-            let d = self.dflash_propose(bonus, fp).await?;
+            let d = self.dflash_propose(bonus, fp, lookup.as_ref()).await?;
             if self.boot.probes.dflash_probe && self.dev.spec_rt.stats.rounds < 3 {
                 let toks_txt = self.boot.tok.decode(&d);
                 owl_shared::log_debug!("dflash-probe", "pos={fp} bonus={bonus} drafts={d:?} txt={toks_txt:?}");
@@ -1085,7 +1090,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             self.dev.spec_rt.drafter.as_ref()
         {
             let ts = std::time::Instant::now();
-            let mut d = self.dflash_propose(token, pos).await?;
+            let lookup = self.dflash_lookup_for_tail(&[])?;
+            let mut d = self
+                .dflash_propose(token, pos, lookup.as_ref())
+                .await?;
             d.truncate(depth); // depth ≤ 7(草稿恒 7 产;T 图定形 depth+1)
             spent = ts.elapsed();
             d

@@ -589,6 +589,11 @@ impl EngineKnobs {
                 depth_min: cfg.spec.depth_min,
                 depth_switch_ctx: cfg.spec.depth_switch_ctx,
                 adaptive_min_tpr: cfg.spec.adaptive_min_tpr,
+                lookup: cfg.spec.lookup,
+                lookup_nmin: cfg.spec.lookup_nmin,
+                lookup_nmax: cfg.spec.lookup_nmax,
+                lookup_nstrong: cfg.spec.lookup_nstrong,
+                lookup_agree: cfg.spec.lookup_agree,
                 notaps: cfg.spec.notaps,
                 tapdecl: cfg.spec.tapdecl,
                 tp_draft: cfg.spec.tp_draft,
@@ -713,6 +718,12 @@ pub struct DraftCfg {
     pub depth_switch_ctx: usize,
     /// T1b 滚动降档门（tokens/round）
     pub adaptive_min_tpr: f32,
+    /// DFlash2 lookup-augmented drafting（LABD；仅 DFlash2）
+    pub lookup: bool,
+    pub lookup_nmin: usize,
+    pub lookup_nmax: usize,
+    pub lookup_nstrong: usize,
+    pub lookup_agree: usize,
     /// verify taps 退回 last_hidden(排查开关)
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
@@ -738,6 +749,11 @@ impl Default for DraftCfg {
             depth_min: 3,
             depth_switch_ctx: 49152,
             adaptive_min_tpr: 3.0,
+            lookup: false,
+            lookup_nmin: 6,
+            lookup_nmax: 12,
+            lookup_nstrong: 6,
+            lookup_agree: 0,
             notaps: false,
             tapdecl: false,
         }
@@ -1695,6 +1711,11 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             depth_min: cfg.knobs.draft.depth_min,
             depth_switch_ctx: cfg.knobs.draft.depth_switch_ctx,
             adaptive_min_tpr: cfg.knobs.draft.adaptive_min_tpr,
+            lookup: cfg.knobs.draft.lookup,
+            lookup_nmin: cfg.knobs.draft.lookup_nmin,
+            lookup_nmax: cfg.knobs.draft.lookup_nmax,
+            lookup_nstrong: cfg.knobs.draft.lookup_nstrong,
+            lookup_agree: cfg.knobs.draft.lookup_agree,
             // 草稿共享的 target 事实(GGUF 草稿声明校验 + 码本行数)
             target: owl_models::formats::gguf::TargetFacts {
                 vocab: rm.spec.vocab,
@@ -1718,7 +1739,11 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         vision: cfg.knobs.vision,
         spec_depth: spec.depth,
         tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
-        head_int8: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt8Row,
+        head_int8: matches!(
+            cfg.knobs.head_quant,
+            owl_shared::config::HeadQuant::RtnInt8Row
+                | owl_shared::config::HeadQuant::RtnInt8RowA8
+        ),
         head_int4: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt4G32,
         main_kv: Some(owl_models::kernel_env::KvCaps::from_env(&env)),
         draft_kv: (spec.depth > 0)
@@ -1951,12 +1976,14 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 本机实测 ≈1.6 GiB)+ 每 turn 瞬态(34~300 MiB)。本行只报池本身,
         // 经验值留在 profile 档头/bench 卷(216k ✓ / 220k 差 17 MiB / 224k ✗)。
         let pool_mib = (pool.geom.nb as u64 * pool.block_bytes() as u64) >> 20;
+        let draft_mib = pool.draft_pool_bytes() as u64 >> 20;
         eprintln!(
-            "[ctx-max] 池落账 {} MiB({} tok × {} 页宽;工作集 {} tok 常驻,Strict 准入)",
+            "[ctx-max] 池落账 {} MiB(主池 {} tok × {} 页宽;工作集 {} tok 常驻,Strict 准入) + 草稿池(MTP链/DFlash2 ring) {} MiB",
             pool_mib,
             pool.geom.nb * pool.geom.page,
             pool.geom.page,
-            cfg.knobs.workspace_per_req
+            cfg.knobs.workspace_per_req,
+            draft_mib
         );
     }
         if let Some(q) = fi_quant {

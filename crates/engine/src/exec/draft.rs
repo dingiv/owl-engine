@@ -1,5 +1,6 @@
 //! 草稿器面(DFlash2 单图 encode+propose / eager / MTP 链 / verify 前向)
 use super::*;
+use super::lookup::{fuse_lookup, suffix_lookup, LookupCfg, LookupProposal};
 use super::mtp_window::{MtpWindowCfg, MtpWindowPlan};
 use owl_models::ModelError;
 
@@ -13,6 +14,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         m: usize,
         pos: usize,
         bonus: u32,
+        lookup: Option<&LookupProposal>,
     ) -> Result<Vec<u32>> {
         let fp = pos + m + 1;
         let _page = self.dev.pool.geom.page;
@@ -27,8 +29,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         // 草稿池寻址一律经 StatePool 权威(slot≥1 案配套;分派点零推槽)
-        use crate::state::StatePool as SP;
-        let slot_at = |p: usize| SP::draft_prefix_slot(p);
+        // ring(2026-10-22):逻辑位 % ring_slots;captured Copy ⇒ 不借 self
+        let ring_slots = self.dev.pool.draft_ring_slots();
+        let slot_at = |p: usize| {
+            if ring_slots == 0 { p as f32 } else { (p % ring_slots) as f32 }
+        };
         let _f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         // mask token 走 spec 运行态(单源:GGUF 草稿未导出该 KV ⇒ 家族兜底值已入账)
         let mask = self.dev.spec_rt.dflash_mask_token as f32;
@@ -107,7 +112,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ★ **切档收割面**（P1.1 × P2.1,2026-10-19）:图本档只出半表候选
         // （`drafts` 槽不写）⇒ 走"读两 rank 候选 → host 合并 → rank0 select"。
         if self.head_split_active() {
-            return self.dflash_select_merged(bonus).await;
+            let mut d = self.dflash_select_merged(bonus).await?;
+            self.apply_dflash_lookup(&mut d, lookup);
+            return Ok(d);
         }
         let pg = self
             .dev
@@ -140,14 +147,65 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 b.elapsed()
             );
         }
-        Ok(out[..7].iter().map(|&v| v as u32).collect())
+        let mut drafts: Vec<u32> = out[..7].iter().map(|&v| v as u32).collect();
+        self.apply_dflash_lookup(&mut drafts, lookup);
+        Ok(drafts)
+    }
+
+    /// DFlash2 lookup 融合(草稿头;depth 截断)。仅 `lookup` 开启时由调用方传入。
+    fn apply_dflash_lookup(&self, drafts: &mut [u32], lookup: Option<&LookupProposal>) {
+        let Some(p) = lookup else { return };
+        let k = self.dev.spec_rt.depth.min(drafts.len());
+        if k == 0 {
+            return;
+        }
+        if fuse_lookup(&mut drafts[..k], p, LookupCfg::from_runtime(&self.dev.spec_rt)) {
+            mcnt("spec.lookup.hit", 1);
+        }
+    }
+
+    /// 当前请求的 token 历史 = `prompt_ids + out`(out 末位 = 当前 token)
+    /// + 本轮 verify 块 `tail`(首轮空;轮末 = `toks` = ids[0..=m],末位 bonus)。
+    /// 只在 `[spec] lookup = true` 且 DFlash2 档调用。
+    pub(crate) fn dflash_lookup_for_tail(
+        &self,
+        tail: &[u32],
+    ) -> Result<Option<LookupProposal>> {
+        if !self.dev.spec_rt.lookup {
+            return Ok(None);
+        }
+        let t0 = std::time::Instant::now();
+        let act = self.turns.active()?;
+        let mut hist =
+            Vec::with_capacity(act.prompt_ids.len() + act.out.len() + tail.len());
+        hist.extend_from_slice(&act.prompt_ids);
+        hist.extend_from_slice(&act.out);
+        hist.extend_from_slice(tail);
+        let k = self
+            .dev
+            .spec_rt
+            .depth
+            .min(owl_models::layers::dflash2::DEPTH);
+        let cfg = LookupCfg::from_runtime(&self.dev.spec_rt);
+        mcnt("spec.lookup.rounds", 1);
+        let p = suffix_lookup(&hist, k, cfg);
+        if let Some(p) = &p {
+            mcnt("spec.lookup.match", p.match_len as u64);
+        }
+        mrec("spec.lookup", t0.elapsed());
+        Ok(p)
     }
 
 
     /// DFlash2 propose(E5-DF3):噪声块 [anchor, MASK×7] @ pos..pos+7,
     /// 草稿 KV 窗口 [0, pos+8)(前缀 pos 行已物化 + 自块 8 行直读)。
     /// 返回 (草稿 host 表, 观测面块)。首轮(pos = fed)与轮末同式。
-    pub(crate) async fn dflash_propose(&mut self, anchor: u32, pos: usize) -> Result<Vec<u32>> {
+    pub(crate) async fn dflash_propose(
+        &mut self,
+        anchor: u32,
+        pos: usize,
+        lookup: Option<&LookupProposal>,
+    ) -> Result<Vec<u32>> {
         let d2 = match self.dev.spec_rt.drafter.as_ref() {
             Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
             _ => unreachable!("dflash_propose 非 dflash 模式"),
@@ -203,7 +261,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 噪声块自槽(经寻址权威;线性逻辑位)
         let self_slots: Vec<f32> = (0..8usize)
-            .map(|i| crate::state::StatePool::draft_self_slot(pos, i))
+            .map(|i| self.dev.pool.draft_dflash_self_slot(pos, i))
             .collect();
         let kvs: Vec<KvBuffers> = leaves
             .iter()
@@ -467,7 +525,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 owl_shared::log_debug!("dflash-probe", "slot0 lm_head top8 = {:?}", top);
             }
         }
-        let out = {
+        let mut out = {
             let face = self.dev.graphs.session.face_mut();
             // drafts 根 = select 单缓冲的 SliceView —— dtoh 回读整父块
             // [S·(K·K+1) f32],取前 S 个(dflash2.rs select 同坑,测试侧同修)
@@ -485,6 +543,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                 .collect::<Vec<_>>()
         };
+        self.apply_dflash_lookup(&mut out, lookup);
         if self.boot.probes.dflash_probe {
             owl_shared::log_debug!("dflash-probe", "pos={pos} anchor={anchor} drafts={out:?}");
         }
@@ -533,7 +592,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     Dtype::F32,
                     vec![rows],
                     &f32b(&(0..rows)
-                        .map(|i| crate::state::StatePool::draft_encode_slot(pos, i))
+                        .map(|i| self.dev.pool.draft_dflash_encode_slot(pos, i))
                         .collect::<Vec<_>>()),
                 ),
                 kv_lens: TensorOps::from_host(
@@ -1221,8 +1280,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             vec![t],
             &f32b(&(0..t).map(|i| (base + i) as f32).collect::<Vec<_>>()),
         );
-        // 草稿池线性逻辑寻址(slot = 逻辑位;NC 前缀读 [0, prefix) 直排;
-        // bt 物理槽仅首 session 重合 —— slot≥1 案修,2026-10-10)
+        // 草稿池 ring 寻址(2026-10-22):slot = 逻辑位 % ring_slots;NC 核
+        // 前缀读同样按 ring 映射(窗口 2048 + 自块)。bt 物理槽仅首 session
+        // 重合 —— slot≥1 案修,2026-10-10。
         let _page = self.pool.geom.page;
         let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
         let bt = self.pool.bt_leaf_flat();
@@ -1235,7 +1295,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     Dtype::F32,
                     vec![t],
                     &f32b(&(0..t)
-                        .map(|i| crate::state::StatePool::draft_encode_slot(base, i))
+                        .map(|i| self.pool.draft_dflash_encode_slot(base, i))
                         .collect::<Vec<_>>()),
                 ),
                 kv_lens: TensorOps::from_host(

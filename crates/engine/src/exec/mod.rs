@@ -112,6 +112,8 @@ pub mod coverage;
 pub mod kvpage;
 /// **MTP 草稿注意力读视图**(Windowed-MTP;纯函数)
 pub mod mtp_window;
+/// **DFlash2 lookup-augmented drafting**(LABD;宿主后缀查找 + 草稿头融合)
+pub mod lookup;
 
 #[cfg(test)]
 mod break_even_tests {
