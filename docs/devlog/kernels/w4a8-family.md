@@ -1,0 +1,759 @@
+# W4A8 算子家族 —— 设计与施工(2026-10-16 立项)
+
+> **标的**:激活 int8 × 权重 int4,走 **int8 张量核(IMMA mma.s8s8s32)**。
+> **一句话**:W4A8 = **同一份 int4 checkpoint 原地跑 + 运行时 per-token int8 激活**
+> ⇒ 权重侧零改动(与现有 kU4/kU4B8 布局逐字节一致),唯一新增件 = "激活在线量化核" + 一处装载期契约处理。
+> **本文定位**:设计/施工的**权威面**。工作日志与逐轮实测记在 `roadmap.local/W4A8-算子家族-立项调研.md`。
+
+---
+
+## 0. 结论速览
+
+| 项 | 结论 |
+|---|---|
+| 杠杆形状 | GA102 int8 张量核 = fp16(FP32-acc 半率)的 **4× 率** ⇒ 只动 **compute-bound** 的 prefill |
+| decode | **无杠杆**(m=1 是权重带宽墙,int8 激活不减权重流量)—— 与 operator-matrix 推论 3 一致 |
+| 权威实测(HyperQwen / sm86 同代) | `INT8_ACT=int8`:prefill **+27~30%**(+19% @51k),**decode 不变** |
+| ⚠️ 本仓期望修正 | N4 原预期 −45%(1297 → 2200-2500)**过于乐观**;现实第一波 ≈ **1650-1700 t/s** ⇒ **单靠 W4A8 过不了 2178 及格线**,要叠加其它杠杆 |
+| 唯一数值拦路 | int16-requant 后的 group scale 被核**按 unsigned 读**,而对称导出 ~50% 是负数 ⇒ 装载期**折号** |
+| 目标资产(第一波) | `crates/models/assets/Qwen3.5-0.8B-W4A16`(dense-only) |
+| 测试卡 | 单张 **3080**(CUDA ordinal 2 / 3;本仓暂无多卡,勿依赖) |
+
+---
+
+## 1. 杠杆账(为什么值)
+
+| 量 | 数 | 出处 |
+|---|---|---|
+| GA102 int8 张量核 | **160 TOPS = 2× fp16 半率墙**(等价:对 fp16-fp32acc 是 ~4× 算子率) | `优化候选总表` N4 判据 |
+| 本仓墙内占比 | GEMM **290/385 ms = 71%**,且是纯 fp32-acc fp16 张量核 ⇒ 只有"换算术"动得了 | 同上 |
+| 权威实测 | HyperQwen `docs/optimizations.md` #10:int8 prefill **+27-30%**、#4:40-64 并发 decode 也是 fp16 张量核墙(~63 TFLOPS @250W) | `repos/HyperQwen` |
+| 精度先例 | s32 整型累加、epilogue 才转 float ⇒ 比 fp16-acc 更精确;per-token 动态量化(无校准) | 上游 vLLM + HyperQwen |
+
+**推论(设计边界)**:①只做 prefill ②MoE(`marlin_moe_wna16` 的 s8 变体)是**第二波** ③激活量化本身有开销 ⇒
+**小形状/单请求尾段**要单独验(这是本仓"S1 之后再谈收益"的原因)。
+
+---
+
+## 2. 权威参考与可复用资产
+
+### 2.1 权威 = HyperQwen(`repos/HyperQwen`,syv-ai,vLLM 0.30 补丁系)
+
+它已有**生产级** W4A8:`VLLM_MARLIN_INPUT_DTYPE=int8`。三份补丁(**本仓照抄对象**):
+
+| 补丁 | 内容 | 对本仓的意义 |
+|---|---|---|
+| `marlin-int8-negative-scales` | 核读的是 `reinterpret_cast<uint16_t*>` 的 int16-requant scale;对称导出(AutoRound/compressed-tensors)**~50% 负 scale** ⇒ garbage。修法:**装载期折号** `s→-s、q→-q`(u4b8 码 `v→16-v`,clamp 15;`v==0`(q=-8)丢 1 LSB,极罕见) | ★ 本仓同类病灶的正解 |
+| `marlin-int8-asym-zp` | int8 激活路同时收 `kU4`(AWQ 零偏)与 `kU4B8`;**kS8×kU4 核本就编好,只是两句 assert 拒收** | 与本仓现状**逐字同型** |
+| `marlin-int8-layer-select` | 选层 env:`INCLUDE_RE=""`、**`EXCLUDE_RE="lm_head\|mtp"`(默认)** | 本仓对应:排除 int4 头 / MTP / 草稿层 |
+
+### 2.2 上游 vLLM(`packages/vllm`)
+
+kS8 预实例化核已生成(**dense 4 个 dtype 组合 + MoE 4 个**),`thread_m_blocks [1..4]` × `group_blocks [-1,2,4,8]`
+(g128 ⇒ `group_blocks=8`)**已覆盖本仓 checkpoint**。
+
+### 2.3 ⚠️ 参考可信度
+
+`packages/xinfer` 的 W4A8 前作(P4 预研 / P4-K / P4-T2)**仅作线索**:其 s8 GEMM 数值对拍
+`mean_rel=inf` 未解,且修法方向(自制 scale 归一)与权威结论(折号 + int16 requant)不同。
+**本仓一律以 HyperQwen + 上游 vLLM 源码为准**,不复刻 xinfer。
+
+---
+
+## 3. 机制与契约
+
+**数据流**(单层 linear):
+```
+激活 x[f16/bf16, (M,K)]
+  └─(新)per-token 动态量化核: amax(row) → scale=fp32[M,1] → x_i8 = cvt.rni.sat.s8(x/scale)
+       ↓                        ↓ a_scales(fp32[M,1])
+  marlin W4A8: A=int8 (lda/16)   B=int4(kU4/kU4B8, 冻结)   → s32 累加 → epilogue ×a_scales → f16/bf16
+```
+**契约要点**
+1. **权重侧不变**:W4A8 与 W4A16 共用同一份 int4 ⇒ repack/布局零改动(折号是**唯一**例外,见 §5.2)。
+2. **scale 契约**:scale 进核前须为 **int16-requant** 形态,且**符号不得为负** ⇒ 折号(装载期)是必需项,不是可选优化。
+3. **a_scales 是 fp32 per-token**;`C_tmp` 走 **fp32 往返**(int32 部分和位型,不许 f16 往返)。
+4. **`--use_fast_math` 不允许**(`127/absmax` 的近似倒数会踩 1 ulp tie 边界;上游亦不用)。
+
+---
+
+## 4. 本仓现状 vs 差距(逐项实证)
+
+| 面 | 现状 | 证据 |
+|---|---|---|
+| host 运行时分支 | ✅ `is_a_8bit` 全链(共享内存/lda 步进/`m_block_size_8` 自动 false) | `crates/kernels/cu/marlin/marlin_host.cu:81-378` |
+| W4A8 入口 | ✅ `A=int8(已量化), a_scales=fp32[M,1](per-token)` 已在 host | 同文件 **461 行**注释 |
+| s8 内核 | ✅ `sm80_kernel_s8_u4b8_float16.cu` vendored 且**已编译**("selector 引用之") | `crates/kernels/build.rs:665` |
+| 权重语义 | ✅ kU4(AWQ)/ kU4B8(GPTQ 对称)两臂 + 130 张声明表框架 | `crates/kernels/src/ops/marlin.rs` |
+| **装载期 scale 处理** | ❌ 无 int16 requant、无负号折叠 | grep `process_scales\|int16\|requant` 零命中 |
+| **激活量化核** | ❌ 无 op 声明、无实现 | `crates/kernels/src/ops/*.rs` 零命中 |
+| **选择器/声明/白名单/档位** | ❌ s8 臂未进 selector 语义、无 L3 声明、`allowed_ops` 未含、无开关 | — |
+
+---
+
+## 5. 设计
+
+### 5.1 接口(新增两件)
+
+1. **激活量化 op**(新家族臂):输入 `x`(f16/bf16,`[M,K]` 或 `[T,H]` 语义)、输出 `x_i8`(int8)与 `a_scales`(fp32 `[M,1]`);
+   实现 = port 上游 `dynamic_scaled_int8_quant_kernel`(per-token amax → scale → `cvt.rni.sat.s8`)。
+   **L3 声明**:dtype(int8/fp32)+ rank 必须与调用点唯一一致(本仓事实门会拒不一致者)。
+2. **marlin W4A8 臂**:沿用现有 host 入口,声明层加 `a_type=int8` + `a_scales` 两槽;
+   `allowed_ops` 白名单加名;档位开关默认 **off**。
+
+### 5.2 装载期契约(**折号**)
+
+- 条件(照 HyperQwen):`act_type == int8 && group_size != -1 && 无零偏` ⇒ 对 marlin pack 结果做
+  `s→-s、q→-q`(u4b8 码 `v→16-v`,clamp 15)。
+- **不可逆性**:折号后该权重副本**只能**服务 int8 激活路 ⇒ 必须在 pack 阶段生成**独立副本**
+  (或按档位决定是否折),不许原地改共享权重。
+- **判据**:折号前后 **fp16 激活臂输出逐位不变**(折号只服务 int8 路)。
+
+### 5.3 选层语义
+
+- 默认排除:`lm_head`、`mtp`/草稿层(对齐 HyperQwen `EXCLUDE_RE`);本仓另有 int4 头档位需一并排除。
+- 理由:int4 头走别的核;int8 权重层没有 s8 激活核(HyperQwen 同结论:只有 8-bit 权重无 int8-激活核)。
+
+### 5.4 开关与回滚
+
+- 档位 = **`[model] quant`**(`"w4a16"|"w4a8"`,默认 `"w4a16"`;S2 落地时先为 `[model] w4a8 = bool`,2026-10-17 按仓规升格为方案枚举 —— 见 §19)+ 选层 env/配置;**改档需重启**(与现有旋钮同纪律)。
+- 回滚:关档即回 W4A16 路(折号副本不被使用)⇒ 零残留;性能与精度门见 §6。
+
+---
+
+## 6. 施工(S1-S4;每步门绿才进下一步)
+
+| 步 | 内容 | 判据 |
+|---|---|---|
+| **S1** 算子对拍 | a) 资产体检:0.8B W4A16(`recipe.yaml` g128 sym)统计**负 scale 比例**(预期 ~50%);b) 折号(e);c) 激活量化核 + L3 声明;d) 探针:同层 s8 GEMM vs fp16 激活 GEMM;e) 选层语义 | 量化核与 host 参考**位级一致**(≤2/131072 tie-flip);GEMM **mean_rel < 2e-3**;**f16 臂 30/30 零回归** |
+| **S2** 引擎接线 | selector 臂 + 声明表 + `allowed_ops` + 档位(默认 off)+ eager/图两档 | 装配期自检 + 白名单门绿;两档输出一致 |
+| **S3** 精度门 | 长 ctx(8k/32k)与任务抽检(GSM8K 类)、spec 档影响 | ≈零损失(对标权威口径);decode 不劣化 |
+| **S4** 性能验收 | `llm_speedtest --flavor std` 五点三轮 **同二进制 A/B**(off/on);另测小形状/单请求 | prefill 相对 +25~30%(权威口径);**报告须写明"是否过 2178 线"**;decode ±2% 内 |
+
+---
+
+## 7. 风险与开放问题
+
+1. **收益上限**:权威同代实测只有 +27-30% ⇒ 需在立项时就把"过 2178"从承诺里去掉(见 §0 表)。
+2. **量化开销 vs 形状**:小 M/尾段可能被激活量化吃掉收益(单请求 prefill 是 3080 对的主战场,须实测)。
+3. **折号的边界**:`v==0`(q=-8)丢 1 LSB 的稀有情形需在 S1a 资产体检里统计出现率。
+4. **长 ctx 累积**:per-token scale 不跨 token 累积,但 attention/GEMM 混合路径的实际误差需金标。
+5. **与现有桶图/前缀缓存的关系**:W4A8 只换算子实现,不改调度 ⇒ 预期正交(需 S4 抽验)。
+6. **MoE 第二波**:`marlin_moe_wna16` 的 s8 变体(权威 MoE +19%)是否同轮做,取决于 S4 结果。
+
+---
+
+## 8. 实测附录:S1a 资产体检(2026-10-16;comfyui venv 的 safetensors 读只读尺度张量)
+
+| 资产 | 布局 | zero_point | group | scale 负值 | 折号需要? | 对应 kernel 臂 |
+|---|---|---|---|---|---|---|
+| `crates/models/assets/Qwen3.5-0.8B-W4A16`(**S1 标的**) | `weight_packed`(I32)+`weight_scale`+`weight_shape` | 无(对称) | **128**(行内组数 8/16/28) | **0 / 3 887 616** | ❌ 不需要 | kS8 × **kU4B8** |
+| `models/cyankiwi/Qwen3.8-27B-AWQ-INT4`(**生产**) | 同上 + **`weight_zero_point`** | **有(非对称)** | 128 | **0 / 393 871 360** | ❌ 不需要(条件 `not zero_points` 直接排除) | kS8 × **kU4** |
+| `models/syvai/Qwen3.8-27B-DFlash2-W4A16`(草稿) | `weight_packed`+`weight_scale` | 无(对称) | 128 | **0 / 13 516 800** | ❌ 不需要 | kS8 × **kU4B8** |
+
+**结论(改动关键路径)**
+1. **折号(§5.2)从"必需"降为"健壮性件"**:本仓三档 checkpoint 负 scale 全为 0 ⇒ 第一波**不需要折号**即可
+   打通数值;仍应在装载期实现为**按需触发**(检测到负 scale 才折,照 HyperQwen 的 `_neg.any()` 门),
+   否则未来换 checkpoint(如 AutoRound 导出)会静默出 garbage。**判据不变**:折号前后 f16 激活臂逐位不变。
+2. **关键路径变成两件**:
+   - **① `kS8 × kU4` 放行**(非对称 AQW 零偏权重 × int8 激活):即 HyperQwen `marlin-int8-asym-zp` 的
+     "两句 assert" —— 本仓对应 **selector/选择策略面**(不是数值面);**生产 27B AWQ 走这条**。
+   - **② 激活量化核**(per-token amax→scale→`cvt.rni.sat.s8`)+ L3 声明。
+3. **scale 形态待确认(S1c 的第一件事)**:权威口径里 int8 路径的 b_scales 是 **int16-requant** 形态
+   (核按 `uint16_t*` 读);本仓装载器现产 fp16 scale ⇒ 需在读写面上确认 int8 路径要哪种形态、
+   由谁做 requant(装载期 or host);这决定 S1 是否需要第三个改动点。
+
+---
+
+## 9. 语义定谳(A 步):scale 形态与归属(2026-10-16;权威源码 = `packages/vllm`)
+
+**W4A8 入口在本仓早已备好**(与 §4 的差距表一致,但更细):
+
+| 面 | 现状 |
+|---|---|
+| host FFI | ✅ `marlin_gemm_v2_w4a8_ffi(...)`(`marlin_host.cu:461` 起):`a_is_s8=true`、`a_scales` fp32[M,1]、**c_tmp 自管**(2026-09-30 "S1 暗雷" 修,slice_count>1 走 `global_reduce_fp32`) |
+| selector | ✅ `kernel_selector.h` 里 `kS8 × kU4B8` 臂齐全(threads/thread_m/n/k/stages/group_blocks 组合) |
+| **scale 语义** | ❌ 本仓装载器**未做** int8 路的 scale 变换(下面 §9.1) |
+
+### 9.1 权威配方(上游 `vllm/.../quantization/utils/marlin_utils.py:490`)
+
+```python
+def marlin_act_int8_process_scales(s):
+    a_scales_scale_factor = 1 / 4096 * s.max().float()   # 全局因子 → 折进 a_scales
+    s = s / s.max() * 4096                                # 归一到 [0, 4096]
+    s = s.round().to(torch.int16).view(s.dtype)           # int16 位型、cfloat 承载(核按 uint16_t* 读)
+    return s, a_scales_scale_factor
+```
+**这解释了两件事**:
+1. **为什么"unsigned 读"能工作**:归一后 scale 全非负 ⇒ 当 `uint16_t` 读即所写;未归一(fp16 位型,1.0fp16 = 0x3C00 ≈ 15360)当整数乘 = 垃圾
+   —— 即 xinfer `mean_rel=inf` 的真身。
+2. **为什么负 scale 是致命坑**:负值经 int16 位型即大数 ⇒ HyperQwen 的**折号**修法(本仓三档负值为 0,见 §8 ⇒ 第一波不挡路)。
+
+**还须配套**:`marlin_permute_scales(..., is_a_8bit=True)` 的 **scale 置换布局**在 int8 路与 f16 路不同(上游同文件
+`marlin_moe_permute_scales` 的 `is_a_8bit` 参数即此意)⇒ 本仓 Rust repack 需按 `is_a_8bit` 分叉。
+
+### 9.2 由此得到的 S1 缺口清单(**最终版**)
+
+| # | 缺口 | 归属 |
+|---|---|---|
+| ① | scale 变换三件套:permute(is_a_8bit)+ 归一/int16 位型 + 交出全局因子 | **装载期**(Rust `formats/w4a16.rs` 侧;须产 int8 路专用副本) |
+| ② | per-token int8 量化核(amax→scale→`cvt.rni.sat.s8`)+ L3 声明 | 新 op(kernels) |
+| ③ | 全局因子折进 a_scales(`scale_eff = per_token_scale × (1/4096)·b_max`) | 运行时接线(量化核出参或 host 侧预乘) |
+| ④ | `kS8 × kU4` 放行(生产 AWQ 非对称走这条) | **策略面**(本仓 selector/声明,对应 HyperQwen `asym-zp`) |
+| ⑤ | 折号(按需触发;本仓当前三档不需要) | 装载期(健壮性) |
+| ⑥ | 选层默认排除 `lm_head`/`mtp`/草稿/int4 头 | 接线 |
+
+⇒ **S1 的落点收敛为**:①(装载期,纯 Rust,可单测) → ②(量化核 + 门) → ④(策略) → S1d 对拍;
+⑤ 随 ① 一起实现但**按需触发**;③/⑥ 属 S2。
+
+---
+
+## 10. C 步定谳:`kS8 × kU4`(AWQ 非对称 × int8 激活)缺口四件(2026-10-16)
+
+| 面 | 本仓现状 | 上游权威 | 缺口 |
+|---|---|---|---|
+| 实例化核 | `vllm_marlin/` 四件:`f16_u4`(AWQ)、`f16_u4b8`(GPTQ)、`bf16_u4b8`、**`s8_u4b8`** | `packages/vllm/csrc/libtorch_stable/quantization/marlin/` 有 **`sm80_kernel_s8_u4_float16.cu`** 与 **`..._s8_u4_bfloat16.cu`** | **① 拷入两件 + `build.rs` 编译** |
+| selector | 96 个 `kS8` 臂**全是 kU4B8**;60 个裸 `kU4` 臂全是 f16/bf16 激活 | 上游 `kernel_selector.h` 含 `kS8 × kU4` 块 | **② 把上游该块并进来**(本仓 selector 是裁剪版) |
+| host | `marlin_gemm_v2_awq_ffi` 硬编 `a_is_s8=false`、无 `a_scales` 形参 | `marlin_mm` 本体已支持 `a_is_s8` + `use_zp` 共存 | **③ 新增 `marlin_gemm_v2_awq_w4a8_ffi`**(照 `marlin_gemm_v2_w4a8_ffi` 的 c_tmp 自管写法) |
+| Rust 面 | repack 的 int8 路 scale 置换**已 port**;但无 W4A8 声明/路由 | — | **④ 声明表 + 路由**(L3 槽:`a_scales` fp32[M,1] + A=int8) |
+
+**执行顺序(建议)**:①(纯搬运 + 编译门)→ ②(selector 并块,编译门 = 符号/实例可解析)→
+③(host 入口,门 = 编译过 + 与 `marlin_mm` 参数面自洽)→ ④(声明/路由,门 = 装配期自检 + L3 事实门)。
+**之后**才轮到 S1d 对拍探针(用 0.8B W4A16 **对称**档先打通 `s8_u4b8`,再用 27B AWQ 走 `s8_u4`)。
+
+**回归纪律**:①-④ 每一步都不得动现有 f16 路径 ⇒ 门 = `cargo test -p owl-kernels` 现有臂 + 装配期自检零变化。
+
+---
+
+## 11. 选择面纪律(2026-10-16;用户指认 `crates/kernels/src/device.rs` 一族)
+
+**wiring 一律走既有的"算子选择面",不新开旁路**:
+
+| 面 | 位置 | 现状 | 本线用法 |
+|---|---|---|---|
+| **架构选择** | `kernels/src/lib.rs` `pub enum Arch { Sm86, Sm89 }` | 已在 | W4A8 的**能力门**:`Arch::Sm86`(GA10x int8 IMMA 满率)/ `Sm89` 支持;其余 = **响亮拒绝** |
+| **能力契约** | 同文件 `pub trait QuantGemm { fn w4a16(&self,arch)->bool; fn w4a8(&self,arch)->bool; fn moe_wna16(&self,arch)->bool }` | **已声明、尚无 `impl`**(全仓 grep `impl QuantGemm` 零命中) | **首个实现体落这里**(marlin 后端):`w4a8(arch) = matches!(arch, Sm86 | Sm89)`;`w4a16 = true`;`moe_wna16` 第二波 |
+| 档位分派 | 同文件 `pub fn dispatch(arch) -> &'static str` | 已在 | 不必改(按 arch 返回后端名) |
+| 执行原语 | `kernels/src/device.rs`:`DeviceRes`(状态面) × `Exec`(机械面:`load_aot` 唯一装载入口 / `launch` / `memcpy_htod_bytes`) | 已在 | W4A8 的 launch 复用既有通道;**零运行期编译**纪律不变(NVRTC 已退役) |
+| 声明面 | `kernels/src/spec.rs`(`ParamKind`/`ScalarTy`)+ `driver.rs`(`KernelPick`,含 `naive_decode`/`gate_mul` 等同族范式)+ `ops/marlin.rs`(130 表) | 已在 | C④ 的落点:新表 + `KernelPick` 臂 |
+| **注意分工** | `Arch`(编译期枚举)= **选哪套核**;`cuda::ffi::device_rows()`(运行期枚举)= **选哪张卡** | — | 两者不可混用(§5.4 已有卡侧纪律) |
+
+**C③/C④ 由此重述(不新增机制,只新增实现)**:
+1. **C③ host**:`marlin_gemm_v2_awq_w4a8_ffi`(照 `marlin_gemm_v2_w4a8_ffi`:`a_is_s8=true` + `a_scales` + `use_zp=true`/`b_zeros` + c_tmp 自管);
+2. **C④-1**:`impl QuantGemm`(marlin 后端首个实现,含 arch 能力真相);
+3. **C④-2**:`ops/marlin.rs` 新声明表(ENTRY = 上述 host 符号;PARAMS 增 `a_scales` fp32[M,1] + A=int8 的 dtype/rank 事实);
+4. **C④-3**:`driver.rs` 的 `KernelPick` 臂 + 档位/白名单/选层(`lm_head`/`mtp`/草稿/int4 头排除);
+5. **门**:装配期自检 + L3 事实门 + **`w4a8(arch=false)` 的架构必须被响亮拒绝**(能力门反证)。
+
+---
+
+## 12. C④-2/C④-3 施工单(逐行落点;2026-10-16;C④-1 已落,此为下一刀)
+
+**现状锚点**(实测行号,`crates/kernels/src/family/marlin/mod.rs`):
+| 锚 | 行 | 内容 |
+|---|---|---|
+| 虚拟核名常量 | 32/36/41 | `GEMM_W4A16` / `GEMM_W4A16_AWQ` / `GEMM_W4A16_BF16`(ENTRY 用) |
+| 槽序真源 | 47 | `GEMM_W4A16_SLOTS`(server 侧 parse 断言比对的字符串) |
+| FFI 声明块 | ~200-250 | `fn marlin_gemm_v2_awq_ffi(...)`(C③ 新符号照它并列) |
+| 调度/call 点 | ~279 | 虚拟名 → host 符号的槽映射(新臂照它写) |
+
+**C④-2(声明面)**
+1. `family/marlin/mod.rs`:加 `pub const GEMM_W4A8_AWQ: &str = "marlin_gemm_w4a8_awq";`
+   + `GEMM_W4A8_AWQ_SLOTS`(**槽序**:`a, b, out, scales, zeros, a_scales, ws, c_tmp, m, k, n, groupsize`
+   —— 即在 `GEMM_W4A16_AWQ_SLOTS` 的 `zeros` 之后插 `a_scales`);
+2. 同文件:新增 `extern "C" { fn marlin_gemm_v2_awq_w4a8_ffi(a,b,c,c_tmp,b_scales,b_zeros,a_scales,prob_m,prob_n,prob_k,workspace,group_size,dev,stream,is_bf16) -> i32; }`
+   (与 C③ 的 C 签名逐字对齐;**注意 C 侧参数序 = m,n,k,而槽序 = m,k,n**,映射时别错位);
+3. `ops/marlin.rs`:新表 `MarlinGemmW4A8Awq`(照 `MarlinGemmW4a16Awq` 体例):
+   `FAMILY = OpId(marlin::GEMM_W4A16)`(同家族)、`ENTRY = GEMM_W4A8_AWQ`、`SRC = ""`(foreign);
+   `PARAMS`:`a(int8, 2)` / `b(U32, 2)` / `out(f16, 2)` / `scales(f16, 2)` / `zeros(U32, 2)` /
+   **`a_scales(f32, 2)`** / `ws(U32,1)` / `c_tmp(U32,1)` / `sz m,k,n,groupsize`;
+   `LAWS = [OutputFinite]`、`CAPTURE = NoHostWork`、`DETERMINISM = Deterministic`。
+
+**C④-3(调度面)**
+4. `family/marlin/mod.rs` 调度臂:虚拟名 `GEMM_W4A8_AWQ` → 调 `marlin_gemm_v2_awq_w4a8_ffi`
+   (槽→C 参数映射 + `c_tmp` 传空指针即可 —— host 侧自管,见 C③);
+5. 档位/白名单/选层:生产档开关(默认 off)+ 选层排除 `lm_head`/`mtp`/草稿/int4 头
+   (对齐 HyperQwen `EXCLUDE_RE` 语义)。
+
+**门(两条都要)**
+- 声明良构 + **槽序互证**:`GEMM_W4A8_AWQ_SLOTS` 与表 `PARAMS` 逐项一致(server 侧 parse 断言),
+  且与 C③ 的 C 形参序对齐(**m/n/k 换位**是第一雷);
+- **架构能力反证**:`MarlinBackend::w4a8` 在 <sm80 上必须 false(现由 §C④-1 的无通配 `match` 编译期逼问)。
+
+**已知不做**:稀疏/分批(A 的 m 维按调用形状走,与 W4A16 同式);MoE 的 s8 变体(`marlin_moe_wna16`)
+留第二波(§5/§7 已记)。
+
+---
+
+## 13. C④-3 实录(2026-10-16;调度面全部落地 + 两道新门)
+
+**落点(逐处)**
+| # | 位置 | 内容 |
+|---|---|---|
+| 1 | `client/marlin.rs` | `GEMM_W4A8_AWQ` 再导出 + `SIG_W4A8`(`T,T,O,T,T,T,T,T,sz,sz,sz,sz`)+ `PARSE_SLOTS_W4A8` + `parse_gemm_w4a8_awq`(zeros/a_scales 缺一即结构化拒)+ `MarlinCall::a_scales` 新槽 |
+| 2 | 同文件 | **`MarlinCall::ffi_mnk()`** —— 槽序 `m,k,n` → C 形参序 `(prob_m,prob_n,prob_k)` 的**唯一换位点**(四条 arms 全改走它;单测用 m=8/k=64/n=256 三互异值锁序) |
+| 3 | `server/marlin.rs` | 新臂 `run_w4a8_awq`(7 块;`c_tmp` **传空指针** —— C 侧 `a_is_s8` ⇒ `use_fp32_reduce` 恒真,host 流序自管;F2 ws/c_tmp 账长门照旧)|
+| 4 | `ops/marlin.rs` | `W4A8_AWQ` 提升点 + 入 `METAS`(⇒ 名进注册表、L3 事实面生效)+ 槽序/字节承载单测 |
+| 5 | `ops/mod.rs` | `slot_order_lock_family_ops` 锁表加行(名字锁 + 类型锁:`U8x2`/`F32x2`)—— **此门先红了一次**,正是设计意图(新族算子不进锁表就红) |
+| 6 | `client/mod.rs` | `parse_slots_are_exactly_declared` 两张清单加行(parse 表 ↔ 声明表逐位 + 覆盖率门) |
+| 7 | `models/src/ops.rs` | 词表新变体 `SemanticKernel::MarlinW4A8Awq`(`marlin.w4a8_awq`)+ `foreign_sig` 映射 + 四点同票单测 |
+| 8 | `driver.rs` | `"marlin.w4a8_awq" => marlin::w4a8_awq()`(**不按形状猜** —— 与 `w4a16` 的区别是语义不是 dtype/父数) |
+| 9 | `tests/op_tables.rs` | 生产臂锁表加行(W4A8 pick 必须携带准入声明) |
+| 10 | `tests/marlin_ffi_sig.rs`(**新**) | **C 薄壳 ⇔ Rust extern 形参序逐位互证**(4 对;**含 `/` 注:这是第三道门 —— `op_tables.rs` 两道门只覆盖 native，foreign 的跨语言手抄签名此前无人看**) |
+
+**新门两条(都做过注入雷试验证明能红)**
+- `marlin_ffi_sig.rs`:把 W4A8 extern 的 `prob_n/prob_k` 对调 ⇒ 两条测试全红(打印两边形参表);
+- `ffi_mnk()` 单测:换位点写反 ⇒ 红(值互异,不做“同值巧合”苟活)。
+
+**降级为 S2 的项**(原 §12 第 5 条)
+- 档位开关(默认 off)+ 选层排除 `lm_head`/`mtp`/草稿/int4 头:需要 **S1c 的激活量化核**在场才有意义
+  (无该核 = 开关落地就只能是谎或错值)⇒ 归 S2 接线,与装载侧/层侧一并定形态。
+
+**给 S1d 的硬约束**(已在此定下)
+- 对拍探针必须用 **m ≠ n ≠ k 且非 2 的幂对称**的形状(n/k 互换在 `n==k` 或两者同为 2 的幂时可静默通过
+  —— 这正是本条线头号雷,探针必须能当场把它震出来);
+- 判据同时看 `s8_u4b8`(对称档,先打通)**与** `s8_u4`(AWQ 非对称档,生产主路)。
+
+**当前状态**:C①-C④-3 全绿(`owl-kernels` lib 74/78/85 三档 feature 配置全过;
+`op_tables` 10/10;`marlin_ffi_sig` 2/2;`owl-models` 161/161;`owl-engine` 42/42)。
+算子面已达“可寻址 + 可校验 + 可拒错”,**唯一未完 = 真正跑一次**(待 S1b/S1c/S1d)。
+
+---
+
+## 14. S1b + S1d 实录(2026-10-16;a8 三件套与算子面**真机对拍全绿**)
+
+**结论**:W4A8 路的四个环节 —— `pack_marlin_b_a8`(权重 a8 tile 布局)、`pack_marlin_s_a8`
+(perm_single + int16 归一 + 交出全局因子)、`pack_marlin_z_a8`(无 n-interleave)、
+`MarlinRuntime::run_w4a8_awq`(FFI 发射)—— **一次对拍全部验证通过**(真机 3090Ti ordinal 0)。
+
+### 14.1 判据与实际读数
+
+| 项 | 读数 | 线 |
+|---|---|---|
+| 正例(经注册表 dispatch,host 显式反量化参考) | **噪声/信号 RMS = 1.8e-4**,max\|err\| = 0.040(输出量级 ≈38) | ≤ 2e-3(§6 S1d) |
+| 负例①不折全局因子(a_scales 只给 per-token) | **898.5** | > 2e-3 ⇒ 红 ✓ |
+| 负例②zp 全零(忽略零偏) | **0.431** | 红 ✓ |
+| 负例③B 用 a16 布局(tile 16×64 + 1024-PIPE) | **0.0223** | 红 ✓ |
+| 负例④zp 用 a16 布局(8-列组内置换) | **0.1368** | 红 ✓(首版曾假绿,见 §14.3) |
+
+⇒ **归一化(÷max×4096)与全局因子(max/4096)确实相互抵消**(否则负例①那种 4096/max 倍偏差会现形);
+**a8 的 B 布局确实必需**(负例③证明 a16 布局在此核上错)。
+
+### 14.2 两处口径修正(都是首跑踩出来的)
+
+- **误差是绝对量级的 ⇒ 判据要带地板**:W4A8 的 int16 尺度路径固有误差 ≈ `Σ|项|·2⁻¹³`
+  (与输出是否相消无关)⇒ 近零输出上相对误差天然放大。首版用例正好是"大项相消"型
+  (a∈[-100,100]、q−zp 正负交替),于是 `d/|want|` 在 0.0019 的输出上到 14%,**假红**。
+  定案:`noise_metrics_floor(got, want, floor_frac)`,地板 = `floor_frac × 信号 RMS`
+  (A16 臂仍走旧口径 `noise_metrics`,地板 1e-3 常量);用例改成**全同号**(q∈[8,15]、zp∈[0,7]、a>0)
+  使相对口径重新有意义。
+- **测试数据必须沿 perm 作用轴非退化**:首版 zp 用 `(i*3+1)%16`,在 groups=4 下沿 o 轴
+  **周期 4** —— `scale_perm`/interleave 类差异**逐字节隐形**(“zp a8 vs a16 布局”负例假绿)。
+  定案:数据生成一律按 `(轴, 组) → f(n,g)` 写,周期 > 32;并加单测
+  `repack::tests::z_a8_layout_differs_from_a16` 把"两条布局真不同"焊下来。
+
+### 14.3 zp 布局定谳(原记"不可观测" ⇒ **自纠:是我的测试数据退化**,当夜闭环)
+
+**先有现象**:把 `pack_marlin_z`(a16,带 n-interleave)喂给 W4A8 臂,输出与
+`pack_marlin_z_a8`(a8,无 interleave)**逐位相同** ⇒ 一度记为"内核对该差异不可观测"。
+
+**判别探针**(`oracles::marlin::zp_column_response`;测试 `probe_zp_hit_column`,
+`#[ignore]` 诊断门)—— zp 只在**一列**置值,看输出响应落在哪一列,直接读出
+「内核把这个 nibble 当成哪一列」:
+
+| 注入列 n0 | a8 布局命中 | a16 布局命中 | 结构 |
+|---|---|---|---|
+| 8 | **8** ✓ | 32 | n0/8: 1 → 4 |
+| 21 | **21** ✓ | 13 | 2 → 1 |
+| 37 | **37** ✓ | 21 | 4 → 2 |
+| 64 | **64** ✓ | 64(=) | 8 → 8 |
+| 100 | **100** ✓ | 84 | 12 → 10 |
+| 128 | **128** ✓ | 128(=) | 16 → 16 |
+| 200 | **200** ✓ | 224 | 25 → 28 |
+| 255 | **255** ✓ | 255(=) | 31 → 31 |
+
+**自命中率:a8 8/8;a16 3/8。所有错位恒满足 `hit % 8 == n0 % 8`(8/8)** ⇒
+
+> **a8 ↔ a16 的 zp 布局差 = 「组内位置(n%8)保持、组序号(n/8)错位」;
+> 内核按 a8 表读。**
+
+**首版负例为什么假绿**:用例的 zp 写成 `f(n mod 8, g)`(只依赖组内位置)—— 该置换对
+**值**天然隐形。这与 §14.2 的"周期 4"是**同一类坑**(数据沿 perm 作用轴退化),这次藏得更深:
+单测能证明两条布局**字节不同**(⇒ 不是死代码),但**有效值**相同 ⇒ 端到端看不见。
+
+**修正与硬化**:
+1. `case_a8` 的 zp 改成依赖 **组内位置 + 组序号 + 组号** 三者;
+2. 负例④(zp 用 a16 布局)重登场 —— 现在**红**(0.1368 ≫ 2e-3)⇒ `pack_marlin_z_a8` **真的**被验证;
+3. `probe_zp_hit_column` 留为常驻诊断门(带断言:a8 必 8/8、a16 必 < 8、错位必保持 n%8);
+4. 教训入册(**通用**):凡"布局类差异"的负例,数据必须沿 **该 perm 的完整作用轴**非退化 ——
+   **"字节不同" ≠ "有效值不同"**;唯一可信的判据是**单点置值看响应落点**(判别探针)。
+
+### 14.4 落档
+
+- `family/marlin/repack.rs`:`pack_marlin_z_a8` 新增 + `z_a8_layout_differs_from_a16` 单测;
+- `ops/oracles/marlin.rs`:`CaseA8` / `reference_a8` / `run_case_a8`(经 `run_raw` 细粒度口)/
+  `A8Neg`(4 个负例开关)/ `MarlinW4a8AwqOracle` / `TOL_A8=2e-3` / `noise_metrics_floor` /
+  **`zp_column_response`(判别探针)**;
+- `ops/marlin.rs`:W4A8 表挂 `SELFCHECK = MarlinW4a8AwqOracle`(**随白名单生效** ⇒ 现在零启动
+  成本;S2 把它纳入生产档那天自动获得启动期对拍门);
+- `tests/selfcheck_oracles.rs`:`foreign_oracle_marlin_w4a8_passes` + `marlin_w4a8_oracle_is_sensitive`
+  (4 负例)+ `probe_zp_hit_column`(`#[ignore]` 诊断门)。
+
+**剩下到生产的路**:S1c(激活量化核:`amax → scale → cvt.rni.sat.s8`,+ L3 声明)→
+S2(装载期产 int8 专用副本 + 档位/选层/白名单)→ S3(精度门)→ S4(std A/B)。
+
+---
+
+## 15. 杠杆实测 + 自检几何补债(2026-10-16;单 3080)
+
+### 15.1 W4A8 vs W4A16 核本体杠杆(`marlin_w4a8_vs_w4a16_lever`;3080,27B 真实形状)
+
+| shape | m | a16 µs | a8 µs | Δ时间 | a16 TF | a8 TF |
+|---|---|---|---|---|---|---|
+| 34816×5120(mlp gate+up) | 1 | 150.4 | 152.5 | +1.4% | 2.37 | 2.34 |
+| | 512 | 3211.4 | 1261.5 | **−60.7%** | 56.8 | **144.7** |
+| | 2048 | 11511.0 | 5045.0 | **−56.2%** | 63.4 | **144.7** |
+| | 4096 | 23018.9 | 10110.5 | **−56.1%** | 63.4 | **144.4** |
+| 5120×17408(mlp down) | 4096 | 11331.6 | 4987.3 | −56.0% | 64.4 | 146.4 |
+| 16384×5120(gdn qkvz) | 4096 | 10785.9 | 4727.5 | −56.2% | 63.7 | 145.4 |
+| 5120×6144(gdn o_proj) | 4096 | 4077.5 | 1760.2 | −56.8% | 63.2 | 146.4 |
+
+**读法**
+- prefill(m≥512):a8 GEMM = a16 的 **2.29×**(63 → 145 TFLOPS,±3% 稳定)——
+  正是 GA102 int8 张量核(≈2× fp16 率)该有的形状:**a8 吃满张量核,a16 不是**(卡在 dequant/寄存器面);
+- decode(m=1):反输 +1.4~5.2% —— 与"decode 只吃权重带宽、int8 激活不减权重流量"的预判一致;
+  且 a8 每发多一次 c_tmp 的 stream-ordered malloc/free(C 侧自管,**如实计入**)。
+- **端到端折算**:整体增益 = `1/(1 − 0.56·w)`,w = GEMM 占 prefill 墙的比例
+  ⇒ w=50% 时 **+28%(正是权威那个数)**;w=71% 时 **+66%**。
+  即权威的 "+27~30%" 是**份额折算**结果,不是核本体上限 —— **本机杠杆比权威数字大得多**。
+- 复现:`CUDA_DEVICE_ORDER=PCI_BUS_ID OWL_TEST_DEVICE=<3080> cargo test -p owl-kernels
+  --features marlin --test marlin_bw_bench -- --ignored --nocapture marlin_w4a8_vs`。
+
+### 15.2 自检几何补债:`slice_count > 1` 的归约路径**此前从未被覆盖**(两臂同病)
+
+`slice_count = prob_k / thread_k`(k 分片 × 多 warp 归约)。实测配置面(`MARLIN_DEBUG=1`):
+
+| 场景 | thread_k | prob_k | slice_count |
+|---|---|---|---|
+| 原 oracle(两臂) | 128 | 128 | **1(= 未覆盖)** |
+| 生产 27B prefill | 64 | 5120 | **80** |
+
+⇒ 原 oracle 几何**恰好避开整条 `global_reduce_fp32` 路**。修法:`K: 128 → 512`
+⇒ `slice_count = 4` ⇒ 归约路径进自检(参考实现成本 4×256×512 = 524k MAC,可忽略)。
+**a16(AWQ)生产臂同病同修** —— 它的自检同样一直只跑 slice_count=1。
+
+### 15.3 ⚠️ 夹具债:workspace **未零初始化** ⇒ 归约路径下自旋死等
+
+逼出 `slice_count>1` 后当场撞上:`oracle` 只 `alloc_block(ws)` 却**从不上传**
+—— 而内核在归约路径**用 workspace 里的 locks 做跨块同步**,喂进去的是 cudaMalloc
+垃圾 ⇒ **自旋等一个永不放出的锁**。
+
+**现场特征(记下来,以后一眼认)**:`nvidia-smi` 显示 **GPU util 100% 但功耗只有
+额定 1/3 左右**(实测 3080:121W/320W)+ 显存占用极小(仅测试进程的 context ~378MiB)。
+
+- **生产不受影响**:装载侧 `ws` 是 `Want` 声明的**零初始化**块(`layers/linear.rs`
+  "ws U32 零初始化"),契约在线的两侧一直成立 —— 债只在自检夹具。
+- 已修:两臂的 oracle 各加 `upload_block(&dws, &vec![0u8; ws_words*4])`,
+  并连跑 3 轮验证确定性(0.65s/轮,零挂起)。
+
+### 15.4 判据地板对 a16 臂也是必需的(两臂精度特性不同)
+
+`K=512` 后 a16 臂的逐元素判据红了(而 RMS 仍只有 5.1e-4):失败元素 `d=4.2e-4 vs
+|want|=0.0155`。根因不是 bug,是**上游设计**:a16 在 `slice_count>1` 时部分和经
+**f16 写穿 C** 再相加(`use_fp32_reduce=false`),近零输出上绝对误差被放大;
+a8 恰好相反(`a_is_s8 ⇒ use_fp32_reduce=true`,**f32 部分和**走 c_tmp)。
+⇒ 判据统一升到 `noise_metrics_floor`(地板 = 0.5×信号 RMS),旧的无地板版本删除
+(单一口径入口,免两套规范)。
+
+### 15.5 本轮门(工作树 = `c54ff16`(= main)+ 本线未提交改动)
+
+`owl-kernels` lib **74 / 86**(marlin,device)· `op_tables` **10/10** ·
+`marlin_ffi_sig` **2/2** · `selfcheck_oracles` **4 条 marlin 全绿 × 3 轮**
+(a16 RMS 5.1e-4 / a8 RMS 1.8e-4;两臂负例各自全红)· `owl-models` **161/161** ·
+`owl-engine` **42/42**。
+
+---
+
+## 16. S1c:激活 per-token int8 量化核(2026-10-16;真机对拍全绿)
+
+**这一步之前,W4A8 那条 GEMM 没有任何人喂得起**;现在喂料手到位。
+
+### 16.1 语义(与上游逐点对齐;三处本仓适配)
+
+上游权威 = `vllm` `csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu::dynamic_scaled_int8_quant_kernel`:
+
+| 点 | 上游 | 本仓 |
+|---|---|---|
+| 归约 | 每 token 一块 + `cub::BlockReduce` | 同几何(一 token 一 block,256 线程)+ **warp shuffle + 共享内存两级归约**(零外部依赖纪律,不引 cub) |
+| 尺度 | `scale = absmax/127`;`absmax==0 ⇒ inv_s=0` | 逐字同 |
+| 量化 | `cvt.rni.sat.s8.f32`(round-nearest-**even** + 饱和) | 同款 asm 逐字 |
+| 全局因子 | 调用侧 `a_scales *= input_global_scale` | **折进核的 `mul` 形参**(权重侧常量;省一次 m 元素乘的发射与缓冲 —— 设计卷 §9.2③ 的"或量化核出参")。⚠️ **S2 改判**:`mul` 由 host 标量改为**设备标量块 f32[1]** —— 该值是装载期由尺度数据算出的,走 host 标量要给装载器开一条「数据 → host 图标量」旁路;设备块与 vLLM 的 `input_global_scale` **同构**(层声明 want、装载器填),零旁路零额外发射 |
+
+**判据(探针 `tests/quant_int8_row_probe.rs`,3/3 绿)**:8 行刁钻用例(伪随机 / 全零 /
+大动态 / **舍入平局** / 极小白 / 交替符号 / 稀疏单峰 / 全等)× `cols ∈ {300(非块对齐), 512}`,
+host 独立参考**逐元素**对拍 —— q 逐字节一致、scales 逐行一致;
+外加不变量:**`mul` 只进 scales 出口**(q 逐字节不变、scales 线性跟随)。
+**能红证明**:把参考换成 round-half-away ⇒ 在 `1.5→2` 的平局上当场红(`gpu=2 host=3`)
+⇒ 门真在验 `cvt.rni` 的 ties-to-even。
+
+### 16.2 ⚠️ 暴露的一步:driver 词汇扩 `U8`(S2 的前置)
+
+S1c 是本仓**第一个"输出不是激活域 dtype"的算子**(出 int8 字节流)。撞上两处既有约束:
+
+1. `ddt()` 拒 U8("U8 是字节承载,不参与语义算子拾取");
+2. 是要有**输出块**的 —— 引擎按节点 dtype 分配瞬时块,故 int8 必须能当节点 dtype。
+
+定案(**不是旁路,是既有词汇的同律扩展**):
+- `driver::DType` **加 `U8`** —— 与既有 `U32`(装载域 ct packed 字节)同律:
+  非激活域,只有**声明里就写 U8** 的算子能收到;其余算子的 `match` 一律
+  `unimplemented!`(编译器强制逐个表态,响亮拒)。
+- `ddt(U8) → DType::U8` 放行。
+- **两档变体走两个 op_id**(`elems.quant_int8_row_{f16,bf16}`):输出恒 U8,
+  `dt` 载不了输入档 ⇒ 档位由 op_id 定(与既有 cast 对 `elems.cast_{f16_bf16,bf16_f16}`
+  **同律**);核名字面量出自声明表单源(`ops::elems::QUANT_INT8_ROW_*`)。
+- 出槽 `q` = U8 全块(引擎分配的瞬时块);`scales` = **调用方备块的写出槽**
+  (f32[rows],小块;同 xqa 的 `wr`/`scratch` 先例)。
+
+### 16.3 落档
+
+| 面 | 落点 |
+|---|---|
+| 核 | `cu/elems/quant_int8_row.cu`(`owl_quant_int8_row_{f16,bf16}`;模板兄弟) |
+| 声明 | `ops/elems.rs`:`QuantInt8Row{F16,Bf16}` 两张表 + `METAS` 入册(`SRC` = 新 `.cu` ⇒ build.rs 自动纳入,零第二份清单) |
+| 拾取 | `driver.rs`:`elems::quant_int8_row(name, rows)`(grid = rows / block = 256)+ 两条 op_id 臂 |
+| 词汇 | `driver::DType::U8` ✅ + `ddt` 放行 |
+| 词表/层 | `models::ops`:`SemanticKernel::QuantInt8Row{F16,Bf16}` + `op_id` + **声明助手 `quant_int8_row(x, scales, rows, cols, mul)`** + 四点同票测试 |
+| 门 | 探针 3/3(GPU)+ 注入雷能红 + `op_tables`/`marlin_ffi_sig`/`oracles` 全绿(词汇扩展的回归) |
+
+**S2 待定**(记账于本卷):`q` 是**首个 U8 输出节点**,要在真 slab/段账下实测其分配与回收;
+`scales` 的备块者(层 per-call 还是持久 max_rows 缓冲)随 S2 接线定型。
+
+---
+
+## 17. S2 施工实况(2026-10-16→17;装载域 a8 键族落地)
+
+### 17.1 先看 redesigned loader 的三条事实(决定了 S2 的形状)
+
+1. **主路径 `load_direct` 不用 staging 环** —— 它走 pinned 租约 +
+   `convert_chunk_into_bytes` 逐块搬运(`LoadStaging` 只服务 DeviceRearrange /
+   设备 cast 两臂)。⇒ **a8 的 CPU 打包天然落进通用 Direct 路,零新增暂存臂**;
+2. 源侧物化契约收口在 `resolve()` → `linear_bytes_for(base,key)` → 两种 sink
+   (`key_bytes` 整键 / `convert_chunk_into_bytes` 分块)。⇒ a8 只需**加键**,
+   loader 主体零改动;
+3. 27B 生产默认走**设备重排**(GPU repack 核;`RepackPath::resolve` 默认 Device),
+   而核侧**没有 a8 repack GPU 核** ⇒ a8 走 CPU 打包,耗时增量记档(见 §17.3)。
+
+### 17.2 a8 键族(S2b,`72cc817`)
+
+与 a16 键族**并列、同源不同布局**,层侧按 plan 二选一:
+
+| 键 | 线 dtype | 产出 |
+|---|---|---|
+| `{base}.qweight_a8` | U32 | `pack_marlin_b_a8`(32×32 tile) |
+| `{base}.scales_a8` | F16 | `pack_marlin_s_a8`(perm_single + int16 归一;int16 位型塞 2B 槽) |
+| `{base}.zeros_a8` | U32 | `pack_marlin_z_a8`(无 n-interleave) |
+| `{base}.a8_factor` | F32 | 全局因子 `max/4096`(f32[1] ⇒ 量化核的设备标量块) |
+
+纪律与 a16 臂齐平:首次出现即物化(双检 + `build_lock` + 原子插四件)、
+`is_derived_key` 同册、新增 `load.mat.a8` 分相计时。
+
+**门**:`awq_source_a8_keys_match_packers` —— 四件与**直接调用 a8 三件套**逐位相等
++ 线 dtype + 尺寸自查(B=(k/16, n·2) i32 / s=(k/g, n) 2B / zp=(k/g, n/8) i32 /
+factor=4B)。**首跑抓到一个真坑**:期望必须拿**检查点里真正存的 bf16 位型**做输入
+—— a8 的 int16 归一对尺度精度敏感,拿裸 f32 做期望会差一个 bf16 舍入(实测两侧
+值成对偏移)。
+
+### 17.3 S2 余量(下一轮)
+
+1. `QuantPlan::W4A8Awq` + `Linear` a8 臂(声明白 a8 键族 want、发 quant → a8 GEMM、
+   选层门);
+2. 引擎 **a8 scratch 注入**(`a_scales`[rows] f32;ForwardCtx 新字段,按
+   `prefill_chunk`/桶阶梯定尺 —— 同 FI `attn_v2` 先例;否掉"层内持久 + 常量上界"
+   是因为 `prefill_chunk` 可配(实测有 8192 档)、越界只能 panic,撞仓规);
+3. `allowed_ops`/flavor + 默认 off 开关;
+4. 验收门:同权重下 a8 Linear vs a16 Linear 端到端对拍(GPU)。
+
+### 17.4 a8 B 重排 GPU 核(S2c,`f8e00a3`)—— §17.1 第 3 条限制解除
+
+`owl_ct_repack_a8_u32`(`cu/load/marlin_repack_ct_a8.cu`):**与 a16 版同输入契约、
+同输出字数**(ct packed 进、`k·n/8` u32 出),只换 tile 几何与 nibble 排布:
+
+- 每 k-tile(32 k)段内,n 按 32 列一 tile、每 tile 128 word;
+  `nibble r → k_local = tc_row + r/2 + 16*(r%2)`、`n_local = (warp/2)*16 + th/4 + (warp%2)*8`
+  —— 参照实现 = **已真机验证的 `pack_marlin_b_a8`**(不凭图反推);
+- 几何 grid `(rows/32, cols/4)` / block 128 / shared `sh[32][33]`(1056B);
+- **装载域零改动**:`load_direct_device_rearrange` 算子无关(op_id → driver 出几何,
+  参数槽固定 `in/rows/cols/out`;输出字数与 a16 同额)⇒ a8 与生产默认的设备重排
+  **同一条快路**,先前"a8 只有 CPU 打包"的代价解除。
+
+**门**:`ct_repack_a8_parity` —— GPU vs CPU `pack_marlin_b_a8` **逐位**,
+5 档形状(64×128 → 17408×5120 = 1114 万字)**坏字 0/全**。
+
+⚠️ 顺带发现并修**既存测试腐化**:a16 版 `ct_repack_parity`(2026-10-01)自 L3 事实门
+落地起**一直是红的**(测试把输入块标 rank1、声明 rank2 ⇒ 准入拒)⇒ 那条老 parity 门
+**自那时起没被跑过**。两条测试的块事实已按真形状(f16 形状 + Arg rank)对齐。
+
+### 17.5 S2 验收门通过(2026-10-17)—— 全链真机跑通
+
+`gpu_w4a8_matches_w4a16_on_real_layer`(真 cyankiwi 27B 检查点,
+`model.language_model.layers.0.mlp.gate_proj`,17408×5120;两条 plan 同输入对拍):
+
+```
+[W4A16Awq] 装载 5 键            [W4A8Awq] 装载 6 键
+[load] 暂存区 raw.in 44.6MB ×2  ← 设备重排档真的跑了 owl_ct_repack_a8_u32
+[w4a8-ab] 噪声/信号 RMS = 0.00274(a16 信号 RMS=0.3703);a8 非有限 0
+```
+
+0.274% 正是 **int8 激活量化**(`1/(2·127) ≈ 4e-3`)+ int16 尺度舍入的理论量级
+⇒ 布局与接线**全对**(拿错 B 表 / `a_scales` 没接上 / 因子没折的量级都 ≫ 10⁻¹);
+阈值 1e-2(双缺 `OWL_TEST_DEVICE`/`OWL_AWQ27B_DIR` 即 skip)。
+
+链路:装载(a8 键族 + a8 repack GPU 核)→ `Linear::forward`(量化核 → kS8×kU4 GEMM)
+→ 回读 ✓。开关 = **配置字段** `[model] quant = "w4a8"`(默认 `"w4a16"`;显式参数下传,非 env 直读;2026-10-17 由 `w4a8 = bool` 升格,见 §19)。
+
+⚠️ 顺带修 **6 条既存 parity 腐化**:`marlin_parity.rs` 的 4 条(3 条共用
+`marlin_launch` + AWQ 臂)与 2 条 `ct_repack` —— **自 L3 事实门落地(313bd5d)起
+一直是红的**(测试块事实 rank/dtype 与 op_tables 声明不符,被准入硬门拒)
+⇒ 那些门自那天起**没被跑过**。现按声明逐槽对齐(rank/dtype),**8/8 全绿**
+(含 355s 的 shape sweep)。
+
+**S2 余量**:仅剩"整模生成级 A/B"(层级门已过),随后进 S3 精度门 / S4 std A/B。
+
+---
+
+## 18. S4 端到端 A/B(std 五点三轮;2026-10-17)—— **prefill +65.5%**
+
+### 18.1 口径
+
+- **同二进制、同配置、同卡**(3090Ti@41:00,空闲;UUID 钉卡)、**唯一变量 = `[model] quant`**(当时写作 `model.w4a8`);
+- flavor `spec-dflash` + `[spec] depth = 0`(纯非投机;隔离 W4A8 对主干 GEMM 的效应);
+  `prefill_bucket = geobuckets`、`gdn_chunked`、greedy、`llm_speedtest --flavor std`
+  (512/1024/2048/4096/8192 × 3 轮,输出 256 tok,单并发);
+- 起服:`OWL_LOAD_STAGING_MB=1024 ./target/release/server --flavor spec-dflash <cfg>`。
+
+### 18.2 读数
+
+| len | a16 prefill | a8 prefill | Δ | a16 TTFT | a8 TTFT | ΔTTFT | a16 dec | a8 dec | Δdec |
+|---|---|---|---|---|---|---|---|---|---|
+| 512 | 1361.2 | 2269.0 | **+66.7%** | 378.1 | 227.6 | −150.5 | 40.18 | 36.99 | −7.9% |
+| 1024 | 1361.4 | 2272.3 | **+66.9%** | 754.2 | 452.7 | −301.5 | 38.37 | 35.43 | −7.6% |
+| 2048 | 1345.7 | 2226.4 | **+65.4%** | 1523.9 | 921.9 | −602.0 | 36.53 | 33.51 | −8.3% |
+| 4096 | 1321.1 | 2171.4 | **+64.4%** | 3102.4 | 1888.4 | −1213.9 | 34.06 | 31.48 | −7.6% |
+| 8192 | 1288.7 | 2113.0 | **+64.0%** | 6359.0 | 3879.0 | −2480.0 | 31.56 | 28.97 | −8.2% |
+| **总均值** | **1335.6** | **2210.4** | **+65.5%** | 2423.5 | 1473.9 | **−949.6** | 36.14 | 33.28 | −7.9% |
+
+(同点 3 轮均值;单轮见 §18.4 原始表。decode 逐轮递减 = 池随 15 请求填满 ⇒
+nparts 涨,**两臂同序同参** ⇒ 对照有效;绝对值勿跨口径引用。)
+
+### 18.3 判读
+
+- **+65.5% 命中赛前投影**:核本体 −56%(§15.1)× GEMM 占 prefill 墙 ~71%
+  ⇒ `1/(1−0.56·0.71) = +66%` ✓✓ —— 投影方法与实测同时被验证;
+- **decode −7.9% = 真代价**(不是噪声:5 个点全部落在 −7.6…−8.3%,同号同量级):
+  量化核每层一次额外发射(m=1 时纯税)+ a8 GEMM m=1 的 +1.4…5%(§15.1);
+- 与"权威 +27~30%"的差异 = **份额**:本机 prefill 墙里 GEMM 占 ~71%,
+  而权威那篇的份额 ~50%(§15.1 已推)—— **同代杠杆一致,差距全在构成**。
+
+### 18.4 原始轮次表(自查用)
+
+| len | 轮 | a16 prefill | a8 prefill | Δ | a16 TTFT | a8 TTFT |
+|---|---|---|---|---|---|---|
+| 512 | 1 / 2 / 3 | 1357.0 / 1361.2 / 1365.2 | 2257.0 / 2271.5 / 2278.6 | +66.3 / +66.9 / +66.9% | 379.0 / 378.1 / 377.1 | 228.6 / 227.4 / 226.8 |
+| 1024 | 1 / 2 / 3 | 1363.7 / 1362.1 / 1358.4 | 2291.3 / 2258.2 / 2267.4 | +68.0 / +65.8 / +66.9% | 752.8 / 753.8 / 755.9 | 448.9 / 455.5 / 453.7 |
+| 2048 | 1 / 2 / 3 | 1347.1 / 1344.2 / 1345.7 | 2238.8 / 2224.5 / 2215.8 | +66.2 / +65.5 / +64.7% | 1522.2 / 1525.6 / 1523.9 | 916.8 / 922.7 / 926.3 |
+| 4096 | 1 / 2 / 3 | 1320.9 / 1321.2 / 1321.4 | 2182.7 / 2168.5 / 2162.8 | +65.2 / +64.1 / +63.7% | 3102.9 / 3102.4 / 3101.8 | 1878.5 / 1890.9 / 1895.9 |
+| 8192 | 1 / 2 / 3 | 1289.8 / 1287.6 / 1288.5 | 2120.2 / 2112.2 / 2106.6 | +64.4 / +64.0 / +63.5% | 6353.1 / 6364.1 / 6359.9 | 3865.8 / 3880.5 / 3890.7 |
+
+### 18.5 ⚠️ 整模才暴露的三处(层级门测不到,已修)= `b30eda4`
+
+1. **惯例表不认 a8 后缀**:`Qwen35Convention` 的量化后缀白名单少了 a8 四件 ⇒
+   虚拟合并键 `in_proj_qkvz.scales_a8` 直接 `unreachable!`(响亮拒 ✓ 但走不下去);
+2. **虚拟合并键缺 a8 分支**:`in_proj_qkvz`(= row-stack(in_proj_qkv, in_proj_z))
+   在 `build_linear_a8` 里无分支 ⇒ "数据源缺键";补法与 a16 臂同律(**源域行拼接**
+   后进 a8 三件套;全局因子取**合并后**尺度 max)。B 的设备档本就通
+   (`packed_raw` 的 Merged 视图由 a8 repack 核消费 ✓);
+3. **白名单双册缺口**(TOML + kernels 常量同票):`spec-dflash` 缺 a8 三件;
+   `awq27b` 缺 `owl_cast_bf16_f16`(27B 装载 embed bf16→f16 设备铸边界 ——
+   该档清单纯旧采样,pre-existing:该 flavor 起 27B 一直会拒)。
+
+### 18.6 ⚠️ 两条**给生产的预警**(都不是本线引入,但会咬人)
+
+1. **`OWL_LOAD_STAGING_MB` 必设**:redesigned loader(2026-10-16 收尾,已在 main)
+   的设备重排暂存槽规默认 128MB,而 27B 最大原始键 **635.7MB** ⇒ 新二进制起 27B
+   **必被响亮拒**(`暂存区 raw.in: 本键 635.7MB > 槽 134.2MB`)。本 A/B 用
+   `OWL_LOAD_STAGING_MB=1024` 解。**现役生产二进制(10-16 07:16)早于该 redesign
+   ⇒ 它没撞上;下次换新二进制重启同一配置会撞** —— 两条路:① 部署姿势带该 env;
+   ② 把默认值抬到 ≥ 最大原始键(~768MB)或给重排臂开流式。
+2. **`[spec] depth > 0` 且无草稿目录 = 池/核 dtype 不符**:`spec-dflash` 档自带
+   `depth = 7`;若配置未给 `dflash2_dir`,引擎仍按投机形态建池(f16)而注意力臂走
+   fp8 写核(声明 U32)⇒ 装配期硬拒(`key_cache 期望 U32 实得 F16`)。纯非投机
+   口径须显式 `[spec] depth = 0`(本 A/B 即如此)。
+
+---
+
+## 19. a8 档装载提速(2026-10-17)—— 开关升格为 `quant` + 装载增量 14.5s → 2.5s
+
+### 19.1 开关升格:`[model] w4a8 = bool` → `[model] quant = "w4a16"|"w4a8"`
+
+S2 落地时用了 `w4a8: bool`,**撞仓规**(“bool 传格式”;`shared/config.rs` 原有
+`head_quant` 的同类注释就在骂这个形状)。现升格为一等方案枚举:
+
+- `shared::config::QuantScheme`(`w4a16` = AWQ g32-asym + f16 激活 = 今天行为;
+  `w4a8` = a8 布局 + per-token int8 激活 + kS8×kU4 GEMM;预留 W8A8/W4A4);
+- 映射唯一点 = `owl_engine::quant_plan_of`(与 `head_plan_of` 同范式;
+  app 层不碰 `owl_models::QuantPlan`);
+- **旧键响亮拒**(不是静默忽略):`OwlConfig::load`/`from_toml_str` 前置
+  `reject_retired_keys` 门,拒语点名新键与值域 —— boot 实测
+  `[boot] 配置非法: [model] w4a8 退役键:… 改用 \`[model] quant = "w4a8"\`` + exit 1;
+- boot 自证行同步点名键名:`W4A8 档位开(model.quant = "w4a8"):…`;
+- loader 侧对非主干两位 plan **响亮拒**(`F16`/`W4A16` 喂 27B-AWQ 装载 = 静默降级
+  到全 f16,正是本仓禁止的错);
+- 质量门未过 ⇒ flavor(`awq27b`/`spec-dflash`)**显式声明 `quant = "w4a16"`**
+  (“声明即事实”),开闸 = 配置档覆盖,不改代码。
+
+### 19.2 装载增量收口(14.5s → 2.5s,−12.3s)
+
+**病因**(§17.3 第 3 条挂账的落地):a8 的 `scales_a8` 物化是**首版 naive 链**
+—— `bf16_par`(11MB f32 中转)+ 标量双循环转置(写 stride = out ⇒ 每写一行
+一条新 cache line)+ 逐 32-chunk `to_vec` perm(8.7 万次小分配)+ 独立 normalize
+遍历。27B 单键 **~65ms × ~150 键 ≈ 10s**;而 a16 臂在 **2026-10-16 定谳轮**
+就用“索引表 + 单遍直出字节”解决了同型问题(`load-speedup.md` §4.2/4.3)。
+
+**修法**(照 a16 臂同律,全在装载面):
+
+| 件 | 位置 | 说明 |
+|---|---|---|
+| `marlin_scales_index_a8(out, groups)` | `kernels/family/marlin/repack.rs` | a8 的源下标表(perm = **32 元素 `scale_perm_single`**,与 a16 的 64 元素表不同);按形状缓存,热路零除法 |
+| `bf16_parts_max(parts)` | `models/formats/awq.rs` | bf16 源直读的全局 max(全局因子 `max/4096` 的输入);与旧 `bf16_par→fold(f32::max)` 逐位同,零 f32 中转 |
+| `pack_scales_a8_bf16_into(..)` | 同上 | 单遍融合:索引表 gather + bf16→f32 + `round(v/max·4096)` clamp 正域 + LE 2B 直写;一分配一路过 |
+
+`pack_marlin_s_a8`(旧链)保留为**冻结参考**(还有 F16 兜底臂在用),
+两条门锁它:
+
+- `crates/kernels`:`marlin_scales_index_a8_matches_packer` —— 索引表 + 同算术
+  vs 旧链**逐位**(5 档形状,含 17408×160);
+- `crates/models`:`awq_source_a8_keys_match_packers` —— 真检查点 bf16 位型入,
+  四件(含因子)逐位 `+ 线 dtype/尺寸自查`;
+- 真机:`gpu_w4a8_matches_w4a16_on_real_layer`(真 27B 层)噪声/信号 0.274% 不变。
+
+**实测**(3090 Ti 单卡,`--flavor spec-dflash`;同档同卡,唯一变量 `quant`):
+
+| 口径 | a16 臂 | a8 臂(修前) | a8 臂(修后) |
+|---|---|---|---|
+| 权重装载 | 11.88s | **26.69s** | **14.39s** |
+| 物化合计(键账) | 1.96s / 291 项 | ~22.6s | **4.90s / 353 项** |
+| a8 单键均值 | — | ~70ms | **13.5ms** |
+| Δ vs a16 | — | **+14.5s** | **+2.5s** |
+
+⇒ **−12.3s(回收 85%)**。剩余 +2.5s = a8 本来多产的两个键(`zeros_a8`/
+`a8_factor`)+ 每键多一次 5.6MB 尺度写(结构成本,非浪费)。
+
+### 19.3 设备重排核:**不做**(判据)
+
+原计划“补 a8 设备重排核”是为收掉那 14.5s;但定谳显示这 14.5s 是**首版链实现
+低效**(a16 臂同日已用 CPU 索引表方案解决),不是“CPU 打不过 GPU”。
+真正的设备核要新开**多输入/多输出**算子契约(`ct scales` + `ct zp` 进、
+`s_a8` + `zeros_a8` + `factor` 出;现有 `DeviceRearrange` 是固定
+`in/rows/cols/out` 单出槽,不承载),再加白名单/几何/parity 一整套 ——
+换 **~2s** 余量,性价比不成立。**挂账**:若将来 a8 成为默认档且启动时间吃紧,
+再按“多出设备重排”立项(设计要点已在此节记录)。

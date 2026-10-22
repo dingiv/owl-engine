@@ -12,7 +12,7 @@ W4A16 safetensors / GGUF checkpoints; ships graph replay, TP=2, speculative deco
 >
 > The design log — axioms, measurements, verdicts and an explicit *retracted
 > conclusions* list — **is written in Chinese** and is the most useful part of this
-> repo. Start at [`docs/arch/charter.md`](docs/arch/charter.md); the English index is
+> repo. Start at [`docs/devlog/canon/charter.md`](docs/devlog/canon/charter.md); the English index is
 > [`docs/README.md`](docs/README.md).
 
 ## 1. What this is / is not
@@ -30,23 +30,24 @@ W4A16 safetensors / GGUF checkpoints; ships graph replay, TP=2, speculative deco
   F16/BF16, GGUF (Q4_K / Q5_K / Q6_K / IQ family) — [`crates/models`](crates/models)
 - **Graph capture & replay**: decode / verify / fold / propose captured per family;
   prefill runs eager with chunk buckets; `[cuda] graph = false` flips everything to
-  eager for A/B — [`docs/arch/graph-model-seam.md`](docs/arch/graph-model-seam.md)
+  eager for A/B — [`docs/devlog/graph/graph-model-seam.md`](docs/devlog/graph/graph-model-seam.md)
 - **TP=2**: one-shot allreduce, fused collective entry, two-tier peer modes;
   `--disable-custom-all-reduce` is a hard requirement on this hardware —
-  [`docs/arch/TP-实现方案综述.md`](docs/arch/TP-实现方案综述.md)
+  [`docs/devlog/comm/tp-overview.md`](docs/devlog/comm/tp-overview.md)
 - **Speculative decoding**: DFlash2 draft (d7) and MTP head; spec-aware graph capture —
-  [`docs/arch/spec-decode-调研与立项.md`](docs/arch/spec-decode-调研与立项.md)
-- **KV plane**: fp8 KV, paged kNHD layout, prefix cache, long context (1M study in
-  [`docs/qwen38/`](docs/qwen38))
+  [`docs/devlog/spec/spec-decode-survey.md`](docs/devlog/spec/spec-decode-survey.md)
+- **KV plane**: fp8 KV, paged kNHD layout, prefix cache, long context (the 1M study
+  lives in the external archive; the 27B operator inventory is
+  [`docs/devlog/kernels/qwen38-operator-inventory.md`](docs/devlog/kernels/qwen38-operator-inventory.md))
 - **Hybrid attention**: GDN / mamba linear layers with chunked and scalar arms —
-  [`docs/arch/attention-kernel-port.md`](docs/arch/attention-kernel-port.md)
+  [`docs/devlog/kernels/attention-port.md`](docs/devlog/kernels/attention-port.md)
 - **Serving**: OpenAI-compatible `/v1/chat/completions` (SSE), Jinja2-compatible chat
   templates, tool calling, multi-session concurrency —
-  [`docs/arch/agent-服务面-设计与施工.md`](docs/arch/agent-服务面-设计与施工.md)
+  [`docs/devlog/serving/agent-surface.md`](docs/devlog/serving/agent-surface.md)
 - **Diagnostics**: unified logging (level + tag filtering + tee to file), in-memory
   metrics (printed only on query), probe families (`[probes]`: booleans gate
   *collection*, logging gates *visibility*) —
-  [`docs/arch/log-framework.md`](docs/arch/log-framework.md)
+  [`docs/devlog/infra/log-framework.md`](docs/devlog/infra/log-framework.md)
 
 ## 3. Requirements
 
@@ -90,7 +91,7 @@ curl -s 127.0.0.1:8135/v1/chat/completions \
 
 Configuration is **fully explicit**: `profiles/full.toml` is the annotated template
 (every key has a comment); other profiles use `extends = ["full.toml"]` and list only
-their differences. See [`docs/dev/config.md`](docs/dev/config.md).
+their differences. See [`docs/devlog/dev/config.md`](docs/devlog/dev/config.md).
 
 ## 5. Diagnostics and measurement
 
@@ -113,8 +114,8 @@ curl -s 127.0.0.1:8135/debug/perf
 ```
 
 Measurement discipline (and its traps) is documented in
-[`docs/dev/debug-tools.md`](docs/dev/debug-tools.md) and
-[`docs/dev/profiling.md`](docs/dev/profiling.md).
+[`docs/devlog/dev/debug-tools.md`](docs/devlog/dev/debug-tools.md) and
+[`docs/devlog/dev/profiling.md`](docs/devlog/dev/profiling.md).
 
 ## 6. Testing
 
@@ -128,7 +129,7 @@ cargo test -p owl-kernels --lib       # operator face (oracle parity included)
   "passed"**.
 - Test configuration has a single entry point, `OWL_TEST_CONF` (an environment profile)
   plus convention-based overlays; asset paths come from `testdata/resources.toml`.
-  See [`docs/dev/testing.md`](docs/dev/testing.md).
+  See [`docs/devlog/dev/testing.md`](docs/devlog/dev/testing.md).
 
 ## 7. Repository layout
 
@@ -146,7 +147,7 @@ crates/
 apps/
   server     OpenAI-compatible SSE server (engine actor owns the device)
   cli        Terminal REPL client
-docs/        Design volumes and post-mortems (mostly Chinese)
+docs/        Index + devlog/ (design volumes and post-mortems, mostly Chinese)
 profiles/    Config profiles (annotated full template + diffs)
 tools/       Probe / bench / golden-generation scripts
 testdata/    Reproducible fixtures (weights and large data are not committed)
@@ -157,11 +158,11 @@ testdata/    Reproducible fixtures (weights and large data are not committed)
 | Entry | Content |
 |---|---|
 | [`docs/README.md`](docs/README.md) | **Index** (English nav) + per-document review status |
-| [`docs/arch/charter.md`](docs/arch/charter.md) | **Charter**: axioms, boundaries, ownership, borrowed materials |
-| [`docs/dev/`](docs/dev/) | Required for contributors: config / testing / debugging / profiling / fixtures |
-| [`docs/arch/`](docs/arch/) | Design volumes + construction post-mortems (59 files, incl. retractions) |
-| [`docs/bench/`](docs/bench/) | Cross-engine battles and tuning reports |
-| [`docs/qwen38/`](docs/qwen38/) | Model-specific volumes (27B / long context / mamba stack) |
+| [`docs/devlog/canon/charter.md`](docs/devlog/canon/charter.md) | **Charter**: axioms, boundaries, ownership, borrowed materials |
+| [`docs/devlog/dev/`](docs/devlog/dev/) | Required for contributors: config / testing / debugging / profiling / fixtures |
+| [`docs/devlog/`](docs/devlog/) | Design volumes + construction post-mortems, grouped by theme (79 files, incl. retractions) |
+| [`docs/devlog/bench/`](docs/devlog/bench/) | Cross-engine battles and tuning reports |
+| [`docs/devlog/kernels/`](docs/devlog/kernels/) | Model-specific volumes (27B operator inventory; long-context studies live in the external archive) |
 
 > Body documents are in **Chinese** — they are the project's design log.
 > Meta documents (this README, `CONTRIBUTING`, `SECURITY`, `docs/README.md`,

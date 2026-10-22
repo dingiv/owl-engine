@@ -1,0 +1,508 @@
+# 配置面体验优化 —— 设计与施工（2026-10-20 立项）
+
+> **2026-10-20 后续统一(以本节为准)**:`flavors/` 已合并进 `profiles/`;用户入口
+> 只保留 `-p/--profile <profile_path>`(显式文件路径,不做名字/目录查找);
+> `--flavor`、`--list-flavors`、`--list-profiles` 与顶层 `flavor` 键均已移除。
+> 低层档在 `profiles/`(历史 `legacy/` 已删,2026-10-21);下文保留当时的设计轨迹,若与本节冲突以本节为准。
+
+
+> **定位**：只动**上层使用面**（配置 schema / flavor / CLI / 站点档 / 预检与解释器），
+> 不动引擎内核语义。目标是把"用户说的是意图（3090、W4A16、最大上下文、最快），
+> 配置里写的是 30 个 bit + 30 行算子白名单"这件事，变成"意图 → 自动派生 → 可解释"。
+>
+> **证据来源**：2026-10-20 的 `awq27b-3090-max` 实战（见
+> `roadmap.local/26-10-20-awq27b-3090-max-flavor.md`）。本次为了做一个"单卡 3090
+> W4A16 最大上下文 + 满速"的档，实际经历了 4 次改上下文重启、1 次白名单漂移、
+> 1 次尾块 OOM、1 次启动脚本临时 `extends` 拼档。这些不是引擎问题，是**配置面
+> 没有意图层**。
+
+---
+
+## 0. TL;DR
+
+把配置面从"**手写低层键**"改成四段式：
+
+```
+Intent（意图） → Resolve（派生） → Verify（预检） → Explain（解释/溯源）
+```
+
+- **Intent**：`profiles/*.toml` 只写 6–8 个意图键（模型、目标、上下文、并发、
+  投机、KVMem、图），不再写 `fi_plan_*` / `allowed_ops` / 池容量。
+- **Resolve**：唯一派生器把意图展开成现有 `OwlConfig` 低层键（保留低层键作
+  advanced 覆盖）；含**内存模型**，`context = "max"` 自动求解。
+- **Verify**：加载权重**之前**就能 `--check`（模型 `config.json` 几何 + 内存账 +
+  约束门 + 白名单自动推导）；错误一次报全。
+- **Explain**：`--print-config` / `/debug/config` 带**逐键来源**
+  （default / profile / site / CLI），启动一行摘要（臂 + 上下文 + 池 + 估算 vs 实测）。
+
+**P0 验收（下一会话的唯一目标）**：
+`server --profile awq27b-3090-max --site <site.toml> --check` 能在**不加载 13GB 权重**
+的情况下打印"128k 上下文、4GiB 池、FI 图臂、估算余量 ±5%"，且 profile 文件
+≤ 25 行、**没有 `allowed_ops`**；真实启动 std 五点三轮全绿。
+
+---
+
+## 1. 案发现场（本次实战逐条）
+
+| # | 现象 | 代价 | 根因 |
+|---|---|---|---|
+| 1 | 做"3090 W4A16 最大上下文"档，需要手写 110 行 flavor：池/上下文/快照/前缀缓存/FI 图五件套/桶/尾合并/chunk/白名单 | 1 次会话 | 没有意图层；低层键直接暴露 |
+| 2 | `max_seq` 与 `pool_tokens` 必须相等（不超卖），但治理器另有 `cap`；`[vram-gov]` 不计 chunk 激活面 | **112k/128k/144k/160k 四次试错**，两次运行期 `PoolExhausted` | 内存模型不完整；没有 `context = "max"` |
+| 3 | `prefill_tail_merge=1024 + chunk=1024` 造出 2048 无桶块 → eager 1.6G 激活 → 8k 请求后 OOM | 1 次立案 | 派生关系（尾合并上界 ≤ 桶阶梯顶）无人校验 |
+| 4 | 翻 `gdn_chunked` 默认后，`awq27b` 首次 prefill 撞算子准入门 | 1 次修复 | `allowed_ops` 是**第二份真源**，与臂/池档手工同步 |
+| 5 | 同一份白名单在 4 个 flavor 里各抄一遍（spec-dflash / 262k / kvmem / bench） | 持续漂移 | 白名单没有从"臂集合"派生 |
+| 6 | 启动脚本要生成 `/tmp/xxx.toml` 写 `extends = base.toml` 才能叠加 BDF/端口 | 每个脚本一次 | CLI 没有 `--set key=value` |
+| 7 | `base.toml` 是本地未入库文件；新机器 clone 后任何 flavor 都起不来 | 首次部署 | 站点面（路径/卡位/端口）没有模板/CLI |
+| 8 | `gdn_slots` 改名曾让全部 flavor 解析失败（`deny_unknown`） | 历史事故 | 没有 schema 版本/别名/迁移器 |
+| 9 | `fi_plan_bake = 0` 是"取 max_seq"的哨兵；`Option<usize>` + 0 两义 | 阅读成本 | 哨兵值当枚举用 |
+| 10 | "虚拟化"要同时开 `select_decode + select_partial + index + pool_overcommit` 四键 | 易错 | 意图（KVMem=overcommit）没有单键 |
+| 11 | 并发一个概念三处名：`server.max_concurrency` / `pool.gdn_slots` / `runtime.max_batch` | 易错 | 没有意图键 `concurrency` |
+| 12 | 启动日志是长墙；`[boot] 现役臂`、`[vram-gov]`、`slab 总账` 分散 | 排障慢 | 没有"一行摘要 + 可机读 effective config" |
+| 13 | env 仍有残留（`OWL_MAX_ACTIVE_TURNS` / `OWL_SNAP_MAX` 等）与"env 退出配置链"裁决冲突 | 双源 | 迁移未收尾 |
+
+---
+
+## 2. 目标 / 非目标
+
+### 2.1 目标
+
+1. **意图可写**：新增一个档 = 写 6–8 行 `[intent]`，不写低层键、不写白名单。
+2. **上下文可自动**：`context = "max"` 由内存模型求解，启动前给出估算与依据。
+3. **派生可解释**：每个低层键都能回答"谁设的、为什么"。
+4. **错误可前置**：`--check` 在加载权重前发现 90% 的配置错（含白名单漂移、
+   耦合门、内存不足）。
+5. **旧档不破**：现有 `flavors/*.toml`、`testdata/args/*.toml` 原样可解析；
+   低层键保留为 advanced 覆盖（A/B 与诊断仍可用）。
+6. **单源**：白名单、并发、池/上下文、图臂组合都只保留**一个派生点**。
+
+### 2.2 非目标
+
+- 不在请求期自动调参（不做 runtime auto-tuner）。
+- 不隐藏高级键（`fi_*`、`spec`、`kvmem` 细节仍可显式覆盖）。
+- 不改引擎执行语义/内核；本设计只产出"同一份 `OwlConfig`"。
+- 不引入环境变量作为行为源（继续 `OWL_CONFIG` 路径兜底 + 测试域自读）。
+
+---
+
+## 3. 病根（一句话版）
+
+1. **意图缺失**：用户说"最大上下文/最快"，配置要求"你自己算池、自己挑臂、
+   自己抄白名单"。
+2. **派生手工**：`ctx ↔ pool ↔ chunk/tail ↔ bucket ↔ graph slab ↔ activation ↔
+   whitelist ↔ gdn_slots/max_batch` 是一张耦合图，现在全靠文档注释与人脑。
+3. **来源不可见**：四层叠加（Default → flavor → site → CLI）后，不知道某个值
+   从哪来；`extends` 只解决合并，不解决溯源。
+4. **单位/命名/哨兵不统一**：tokens / MiB / bytes / 0 哨兵 / 三个并发名。
+5. **校验太晚**：`deny_unknown` 只查键名；语义门在 config validate 的尾巴；
+   白名单/几何/内存要到装载后才炸。
+
+---
+
+## 4. 设计总览
+
+```
+                    ┌──────────────────────────────┐
+  profiles/*.toml → │ Intent（意图；6–8 键）        │
+  site.toml      → │  + Site（路径/卡/端口）        │
+  CLI --set      → │  + Overrides（逐键覆盖）       │
+                    └──────────────┬───────────────┘
+                                   │ resolve(intent, site, overrides)
+                                   ▼
+                    ┌──────────────────────────────┐
+                    │ Resolved（现有 OwlConfig 低层键）│
+                    │  + provenance（逐键来源）       │
+                    │  + estimates（内存/显存账）     │
+                    └──────────────┬───────────────┘
+                                   │ verify(resolved)
+                                   ▼
+              ┌─────────────────────────────────────────┐
+              │ Verify：约束门 / 白名单派生 / 内存模型     │
+              │ Explain：--print-config / 启动摘要 / API  │
+              └─────────────────────────────────────────┘
+```
+
+**关键纪律**（与现有显式配置哲学一致）：
+
+- 派生**不是隐式魔法**：`--print-config` 必须能打印派生后的完整低层键与来源；
+  `--check` 与真实启动走**同一个** resolver。
+- 派生结果可被 **advanced 覆盖**（低层键仍写在同一文件/CLI），覆盖后 provenance
+  显示 `override`，并重新跑约束门。
+- 任何"自动"（如 `context="max"`）都必须打印**依据**（weights / fixed / pool /
+  activation / reserve），失败要响亮，不许静默降级。
+
+---
+
+## 5. Intent schema（新增；低层键全部保留）
+
+### 5.1 文件形态
+
+`profiles/*.toml`（仓库顶层；与现有 `flavors/` 并存，迁移期 flavor = 旧档）：
+
+```toml
+# profiles/awq27b-3090-max.toml
+[intent]
+model      = "qwen3.8-27b-awq"   # 注册表键：kind + quant + head_quant
+hardware   = "3090ti-24g"        # 内存模型档；不写 = 从 device 自动识别
+goal       = "max-context"       # max-context | max-speed | balanced | low-memory
+context    = "max"               # 数字（token）或 "max"
+concurrency = 1                  # 会话数；派生 gdn_slots / max_concurrency / max_batch
+spec       = "off"               # off | dflash
+kv         = "fp8"               # fp8 | f16
+kvmem      = "off"               # off | overcommit
+graphs     = "auto"              # auto | off
+reuse      = "off"               # off | session | global（前缀缓存/快照）
+```
+
+`site.toml`（本机/站点；不入库也可）：
+
+```toml
+[site]
+model_dir   = "/.../Qwen3.8-27B-AWQ-INT4"
+draft_dir   = "/.../Qwen3.8-27B-DFlash2-W4A16"   # spec = dflash 时必填
+bind        = "127.0.0.1:8139"
+device      = { bdf = "42:00.0" }                # 或 uuid；单卡
+```
+
+CLI：
+
+```bash
+server --profile awq27b-3090-max --site ~/owl-site.toml \
+       --set pool.prefill_chunk=1024 --check
+```
+
+### 5.2 意图 → 低层键（派生表，P0 必须实现）
+
+| 意图 | 派生 | 规则/判据 |
+|---|---|---|
+| `model` | `[model] kind/quant/head_quant` | 注册表（`ModelProfile`）：27B-AWQ/W4A16/rtn-int4；0.8B；未来模型 |
+| `hardware` | 内存模型参数 | 卡总显存、可用余量、每 token KV 字节（按 kv 档/几何） |
+| `goal=max-context` | `context="max"`；`reuse` 默认 off；`prefill_chunk=512,tail=512` | 最大 ctx 优先；chunk/tail 受激活面约束 |
+| `goal=max-speed` | `reuse=global`（若 ctx 允许）；`fi_*` 全开；`prefill_chunk=1024,tail=0` | 速度优先；ctx 按内存模型 |
+| `goal=balanced` | 折中：`reuse=session`；FI 图开；ctx 取 2/3 max | — |
+| `goal=low-memory` | `kvmem=overcommit`；`reuse=global`；池 < ctx | 需 host/disk 腿 |
+| `context=N` | `runtime.max_seq=N`；`pool.pool_tokens=N`（非超卖） | 非超卖档两者相等（当前手写要求） |
+| `context="max"` | `N = solve(内存模型)` | 见 §7 |
+| `concurrency=C` | `pool.gdn_slots=C`；`server.max_concurrency=C`；`runtime.max_batch=C` | **单键三处同源**（当前三处手写） |
+| `spec=off` | `[spec] depth=0`；不要求 draft_dir | — |
+| `spec=dflash` | `depth=7`；`model.dflash2_dir=draft_dir`；草稿池账 +20KiB/token | ctx 重新求解 |
+| `kv=fp8` | `dispatch.kv_fp8=true`；白名单 fp8 族 | 关 = f16 族 |
+| `kvmem=off` | `select_decode/select_partial/index/pool_overcommit=false`；host/disk 腿=0 | 单键替四键 |
+| `kvmem=overcommit` | 四键全开 + `host_cache_mb/snap_host_mb/disk_*` 必要腿 | 需虚拟化两扇门 |
+| `graphs=auto` | `no_graph=false`；`fi_cuda_graph=true`；`fi_plan_bake=0`；`fi_plan_restore=false`；`decode_fi/verify_fi=true`；`verify_v2=false`（有 spec） | 需 `kv=fp8` + 单卡 + 非 select_decode；否则自动降级并**打印原因** |
+| `graphs=off` | `no_graph=true`；FI 臂 off | 诊断/对照 |
+| `reuse=off` | `prefix_cache=false`；`snap_max=0`；`snap_host_mb=0` | 单会话最大 ctx 的默认 |
+| `reuse=session` | `prefix_cache=true`；`snap_max=1`；`snap_host_mb=1GiB`（可选） | 同会话续写 |
+| `reuse=global` | `prefix_cache=true`；`snap_max=4`；`snap_host_mb=3GiB` | 跨会话前缀 |
+
+**不派生、必须显式/高级**：`allowed_ops`（改为派生，见 §8）、`cuda.*` 诊断、
+`probes.*`、`tp_*`（TP 另案）、`log.*`、`agent.*`、`load.*`。
+
+### 5.3 与现有 `flavors/` 的关系
+
+- 迁移期：`--flavor <old>` 仍走旧文件；`--profile <new>` 走 intent。
+- 旧 flavor 文件可被**自动降级**为"低层覆盖层"（等价于 `[advanced]` 段）。
+- 新档一律用 `profiles/`；旧档在 P2 做一次机械迁移（`flavor` → `profile`）。
+
+---
+
+## 6. Resolver（唯一派生点）
+
+### 6.1 模块与接口
+
+```
+crates/shared/src/config/
+  intent.rs      // Intent 结构 + 注册表（ModelProfile / HardwareProfile）
+  resolve.rs     // resolve(intent, site, overrides) -> Resolved + Provenance
+  memory.rs      // 内存模型：estimate(...) -> MemoryEstimate
+  derive_ops.rs  // 臂集合 -> allowed_ops（§8）
+  explain.rs     // 逐键来源/摘要
+```
+
+- `Resolved` = 现有 `OwlConfig`（字段零改动；派生只填值）。
+- `Provenance` = `BTreeMap<String, Origin>`，`Origin = Default | Profile(name) |
+  Site(path) | Cli(--set) | Derived(rule)`。
+- **唯一入口**：`ServerConfig::load` 改为 `resolve(...)`；`--check` 走同一函数。
+- 低层键覆盖：profile 里仍可写任意 `[runtime]/[pool]/...`（advanced），
+  覆盖后 provenance = `Profile`，且**重新跑约束门**。
+
+### 6.2 派生顺序（有依赖，不可乱）
+
+1. model → 几何/权重字节/白名单族；
+2. hardware/device → 卡显存/余量；
+3. spec/kv/kvmem/reuse → 每 token 字节、草稿池、快照/宿主腿；
+4. context（数字或 max）→ pool_tokens；
+5. chunk/tail → 桶上界与激活估算；
+6. graph 臂（FI/XQA）→ slab 估算 + 白名单；
+7. concurrency → gdn_slots/max_batch/max_concurrency；
+8. 校验（§7.3）→ 失败则**不产生 Resolved**。
+
+### 6.3 chunk/tail（prefill 桶退役后）
+
+prefill 桶已于 2026-10-21 退役（备份分支 `backup/prefill-bucket-2026-10-21`）。
+chunk/tail 不再受桶顶 1024 的约束；仍受激活面/显存预算约束（见 §7）。
+历史“1024+1024 会造 2054 块 ⇒ 无桶 ⇒ eager”的 OOM 根因随桶删除而失效。
+
+---
+
+## 7. 内存模型（`context="max"` 的核心）
+
+### 7.1 公式
+
+```
+available = card_total − cuda_ctx − weights − fixed − activation − reserve
+pool_tokens_max = floor(available / bytes_per_token)
+context_max = min(model_max, floor(pool_tokens_max / page) * page)
+```
+
+- `weights`：模型注册表按 checkpoint 张量精确求和（AWQ/FP8/头量化分别算）；
+- `fixed`：GDN 格（concurrency × row）、快照池（snap_max × 152MiB）、图 slab
+  （按臂/桶族实测或 `GRAPH_SLAB_BUDGET`）、warmup/杂项；
+- `activation`：按 `(chunk, tail, graph, model)` 的**实测表**（本次：512 档
+  ≈0.4–0.6GiB，1024 档 ≈0.8–1.2GiB，2048 无桶 ≈1.6GiB）；先查表，缺省用保守
+  上界，并标记 `estimated=true`；
+- `bytes_per_token`：`layers_full × 2 × hkv × hd × elem_bytes`（fp8=1, f16=2）
+  + 草稿池（spec：`draft_layers × 2 × hkv_d × hd_d × 2B`）；
+- `reserve`：默认 512MiB（当前 `256` 在 160k 时被泄漏打穿）。
+
+### 7.2 24G/27B 的校验（本档实测对照）
+
+| ctx | pool | 估算可用 | 实测 |
+|---:|---:|---:|---|
+| 112k | 3.5G | 2.8G 余 | std 15/15 绿 |
+| 128k | 4.0G | 2.4G 余 | **15/15 绿（本档）** |
+| 144k | 4.5G | 1.9G 余 | 15/15 绿 |
+| 160k | 5.0G | 1.4G 余 | ~15 轮后撞 reserve（存量 turn 临时块泄漏） |
+
+⇒ 内存模型必须把 **activation + reserve** 算进去；`context="max"` 在
+`reserve=512M` 下应给出 ≈144k（若暂时忽略泄漏），P1 加"长跑泄漏余量"档。
+
+### 7.3 校验门（一次报全）
+
+- `pool_tokens ≥ max_seq`（非超卖）/ 虚拟化档例外；
+- `gdn_slots = max_batch = max_concurrency`（意图派生后必须相等）；
+- `fi_plan_restore=false ⇒ fi_plan_bake=Some`；`select_decode ⇒ 非 max_batch`；
+- `kvmem=overcommit ⇒ 虚拟化两扇门 + 宿主腿 > 0`；
+- `spec≠off ⇒ draft_dir 在场`；
+- `allowed_ops` ⊇ 派生臂集合（§8）；
+- 估算 `available > reserve`（否则拒绝并给出"降 ctx / 减 chunk / 关 reuse"建议）。
+
+---
+
+## 8. `allowed_ops` 自动派生（消除第二份真源）
+
+**现状**：4 个 flavor 各抄一份 30 行白名单；改一个默认（`gdn_chunked`）就要
+同步 1 个 flavor，否则首次 prefill 撞门。
+
+**设计**：
+
+1. 内核侧已有"臂 → 算子"的登记（`kernels::ops` 的 `PROD_*` / 家族表 /
+   `audit_active`）。新增 `ops_for(arms, model_geom, kv_dtype) -> BTreeSet<&str>`：
+   - 臂集合 = resolver 产出的 `DecodeArm/VerifyArm/PrefillArm/GdnArm/TopkArm/...`；
+   - 模型几何（hq/hkv/hd/nk/nv/page）；
+   - KV dtype（fp8/f16）→ 选 `*_fp8kv_*` / `*_knhd` 变体。
+2. `allowed_ops` 缺省 = 派生集合；profile **不再写**白名单。
+3. 高级覆盖：`[dispatch] allowed_ops = [...]` 仍可写（A/B/审计），但
+   `--check` 会 diff："缺少 X（臂 A 需要）/ 多余 Y（不再发射）"。
+4. boot 自证：`[boot] 算子: 派生 N / 实发 M / 未列 0`。
+
+---
+
+## 9. CLI / UX
+
+```bash
+# 1) 预检（不装权重；读 model config.json 几何 + 内存模型 + 约束门）
+server --profile awq27b-3090-max --site ~/owl-site.toml --check
+
+# 2) 打印生效配置（TOML / JSON）+ 逐键来源
+server --profile ... --site ... --print-config --format json
+# 3) 解释单个键：为什么是这个值 / 被谁覆盖
+server --profile ... --site ... --explain pool.pool_tokens
+# 4) 临时覆盖（替掉启动脚本的 extends 拼档）
+server --profile ... --site ... --set pool.prefill_chunk=512
+# 5) 列表 + 说明（当前 --list-flavors 只有名字）
+server --list-profiles --verbose
+# 6) 旧档迁移
+server --migrate-config old.toml --to profile > new.toml
+```
+
+**启动摘要**（一行/一屏，示例）：
+
+```
+[owl] profile=awq27b-3090-max  card=3090Ti/24G  ctx=131072  pool=4.0G
+      arms: prefill=FI(6 buckets) decode=FI(1 graph) gdn=chunked kv=fp8
+      mem: weights 16.6G + fixed 0.7G + pool 4.0G + act 0.5G + reserve 0.5G = 22.3G / 23.6G
+      reuse=off spec=off concurrency=1  (resolved by profile; 0 site/CLI overrides)
+```
+
+`GET /debug/config` 返回同样的 JSON（含 provenance）+ 估算 vs `[vram-gov]` 实测。
+
+---
+
+## 10. 兼容与迁移
+
+| 项 | 策略 |
+|---|---|
+| 旧 `flavors/*.toml` | 原样可解析；`--flavor` 保留；P2 机械迁移到 `profiles/` |
+| 低层键 | 全部保留；profile 里写低层键 = advanced 覆盖（provenance=Profile） |
+| 改名（`gdn_slots` 类） | `#[serde(alias = "旧名")]` 收一个版本 + 弃用警告；P2 移除 |
+| `fi_plan_bake = 0` | 新枚举 `auto`（0 继续兼容） |
+| env 残留 | `OWL_MAX_ACTIVE_TURNS/OWL_SNAP_MAX` → 配置键；env 只留 `OWL_CONFIG` |
+| `deny_unknown` | 保留；`--check` 的报错附"你是不是想写 X" |
+| 版本 | `config_version = 2` 可选；`--migrate-config` 输出 v2 |
+
+---
+
+## 11. 施工分解（下一会话 = P0）
+
+### P0（一个会话，必须完成）
+
+1. `crates/shared/src/config/intent.rs`：`Intent` / `ModelProfile`(27B-AWQ、
+   0.8B) / `HardwareProfile`(3090Ti-24G、3080-20G) / 默认值表。
+2. `resolve.rs`：§5.2 派生表 + 固定顺序 + `Provenance`。
+3. `memory.rs`：§7 公式 + 本次实测校准表（112/128/144/160k 四行）。
+4. `--check` / `--print-config` / `--explain`（`apps/server/src/config.rs`）；
+   `--set key=value`（深合并到 TOML）。
+5. 新 profile `profiles/awq27b-3090-max.toml` ≤ 25 行、无 `allowed_ops`；
+   与现 `flavors/awq27b-3090-max.toml` **同档同参**（A/B 对拍）。
+6. 门：
+   - `resolve` 单测：意图表逐行断言派生值；`context="max"` 给出 128–144k；
+   - `--check` e2e：不加载权重、< 2s、打印依据；
+   - 真实 boot + std 五点三轮：与手写 flavor 同档（prefill ≥1400、decode ≥47）；
+   - 旧 6 个 flavor + `testdata/args/*.toml` 全部仍可解析。
+
+**P0 不做**：白名单派生（P1）、boot 摘要美化、迁移器、旧档迁移。
+
+### P1（第二个会话）
+
+- `derive_ops.rs`（§8）+ boot 自证；
+- 启动摘要 + `/debug/config` + provenance API；
+- 约束门多错一次报全；
+- `--list-profiles --verbose`（从 profile 注释/description 读）。
+
+### P2（第三个会话）
+
+- `--migrate-config` + 旧 flavor → profile 机械迁移；
+- `context="max"` 的**校准探测**（可选 `--calibrate`：真实 boot 试 2–3 个档，
+  写回 `hardware` 校准表）；
+- 长跑泄漏余量档（把 turn 临时块泄漏的实测曲线纳入 reserve）；
+- 别名清理 + `config_version=2`。
+
+### 文件清单（P0）
+
+| 文件 | 动作 |
+|---|---|
+| `crates/shared/src/config.rs` | 拆出 `config/` 模块；`OwlConfig` 字段不变；loader 接 resolver |
+| `crates/shared/src/config/{intent,resolve,memory}.rs` | 新增 |
+| `crates/shared/src/flavors.rs` | `preset_dir` 同时发现 `profiles/`；列出 description |
+| `apps/server/src/config.rs` | `--profile/--site/--check/--print-config/--explain/--set` |
+| `apps/server/src/main.rs` | 启动摘要（一行版） |
+| `profiles/awq27b-3090-max.toml` | 新增（≤25 行） |
+| `testdata/args/base.toml` | 改为 `[site]` 模板（仍本地） |
+| `tools/serve-w4a16-3090.sh` | 删掉临时 `extends`，改用 `--profile --site --set` |
+| `config.md` | 重写为"意图 → 派生 → 预检" |
+
+---
+
+## 12. 风险与未决
+
+| # | 风险 | 缓解 |
+|---|---|---|
+| R1 | 内存模型估算偏差（activation/泄漏） ⇒ `context="max"` 过乐观 | P0 用本次四档实测校准；`--check` 标 `estimated`；boot 后把实测写回日志/API；P2 加校准探测 |
+| R2 | 派生被当成"黑魔法" | `--print-config`/`--explain` 强制给出每键来源与依据；resolved 与 boot 同一函数 |
+| R3 | 白名单派生漏 op（新臂/新几何） | P1 保留高级 `allowed_ops` 覆盖 + `--check` diff + boot 自证；派生集合由内核登记表演绎 |
+| R4 | 旧档语义漂移 | 默认**先不迁移**；旧 flavor 走旧路径；P2 迁移器 + 逐档对拍 |
+| R5 | 站点面（路径/卡位/端口）仍是本地文件 | `--set`/`--site` + `[site]` 模板；CI 用假路径只跑 `--check` |
+| R6 | 自动降级（如 `kv=fp16` 时 FI 图不可用）被静默 | 派生时**打印原因**并写 provenance（`Derived(fallback: ...)`）；`--check` 警告 |
+| R7 | 长跑 turn 临时块泄漏尚未修 | 与本设计解耦；`reserve` 默认 512M + P2 纳入实测；另案修 TurnEnd |
+
+---
+
+## 13. 交接清单（下一会话从这里开始）
+
+1. **先读**：本文；`config.md`；`crates/shared/src/config.rs` 顶部总表；
+   `apps/server/src/config.rs`；`flavors/awq27b-3090-max.toml`；
+   `roadmap.local/26-10-20-awq27b-3090-max-flavor.md`（实战证据）。
+2. **第一件事**：写 `intent.rs` + `resolve.rs` 的**纯函数**与单测（无 GPU），
+   把 §5.2 表逐行落成断言；`context="max"` 用 §7 的校准表先给出 128k。
+3. **第二件事**：`--check` / `--print-config`（不需要权重；用 `model/config.json`
+   几何 + 注册表字节数）。
+4. **第三件事**：`profiles/awq27b-3090-max.toml` + 真实 boot + std 对拍
+   （与手写 flavor 同档；记录 `[vram-gov]` 实际 vs 估算）。
+5. **不要做**：白名单派生（P1）、旧档迁移（P2）、引擎执行面改动。
+6. **验收命令**：
+   ```bash
+   cargo test -p owl-shared config::resolve
+   ./target/release/server --profile awq27b-3090-max --site testdata/args/base.toml --check
+   ./target/release/server --profile awq27b-3090-max --site testdata/args/base.toml \
+       --print-config --format json | jq '.provenance["pool.pool_tokens"], .estimates'
+   OWL_TEST_DEVICE=42:00.0 ... std 五点三轮（与 flavor 对拍）
+   ```
+
+---
+
+## 14. P0 落地实录(2026-10-20)
+
+> 本节是**事实记录**(与上面设计稿的差异以此为准);P1/P2 仍未开工。
+
+### 14.1 交付物
+
+| 文件 | 状态 |
+|---|---|
+| `crates/shared/src/config/{intent,memory,resolve}.rs` | 新增;`config.rs` → `config/mod.rs`(路径 `crate::config::OwlConfig` 不变) |
+| `crates/shared/src/config/mod.rs` | 新增 `ResolvedConfig` / `load_resolved` / `parse_cli_set` / `Origins`;配置类型补 `Serialize`;删 `OWL_MAX_SEQ` / `OWL_PREFILL_CHUNK` 两个二次覆盖 |
+| `crates/shared/src/flavors.rs` | 新增 `profiles/` 发现(`profile_names/profile_path`) |
+| `apps/server/src/config.rs` | CLI 新增 `--profile/--site/--check/--print-config/--format/--explain/--set/--list-profiles/--help`;`--check` 走 `load_resolved`(不选卡);CLI 日志/性能/调试门改为同一配置层 |
+| `apps/server/src/main.rs` | 预检分支在选卡/装权重之前;旧 flavor 路径不变 |
+| `profiles/awq27b-3090-max.toml` | 新增;25 行(含注释),无 `allowed_ops` |
+| `tools/serve-w4a16-3090.sh` | 删临时 TOML/`extends`;改 `--profile --site --set`;加 `CHECK=1` |
+| `apps/server/tests/config_check.rs` | 新增 6 项黑盒门(check/print/explain/set/legacy/缺站点档拒) |
+
+### 14.2 与设计稿的偏差(实测校准)
+
+1. **`context="max"` 先给 128k,不是 144k**:
+   `stability_margin` 取 **1.30G**(覆盖 160k 跑 15 轮后泄漏撞 reserve 的曲线),
+   `activation` 取 `0.60G / 1.05G / 1.70G`(`512 档 / 1024 档 / 无桶`)。
+   3090 Ti + 27B + FP8 + spec off + `512+512` 的账:
+   `total 23.60G×99% − reserve 0.25G − fixed 0.90G − live 16.26G = budget 5.95G;
+   − act 0.60G − margin 1.30G = 4.05G ⇒ 131072 tok`。
+   144k 仍可 `--set runtime.max_seq=147456`(显式优先;`--check` 会告警余量不足)。
+2. **`total` 用治理器口径**(`[vram-gov] total=`),不是 nvidia-smi 标称:
+   3090 Ti = 23.60G、3080 20G = 19.63G;`weights_base` 取 boot `live=`
+   (27B AWQ-int4 = 16.26G;spec dflash = +1.26G 草稿权重)。
+3. **CLI 的日志/性能/调试门也进配置层**(不再是 `ServerConfig` 的二次覆盖)
+   ⇒ `--print-config` 与 boot 同源;`--set` 用点路径(`runtime.prefill_chunk`,
+   不是 `pool.prefill_chunk`——后者会被 `deny_unknown_fields` 拒)。
+4. **模型几何校验**读 `config.json.text_config`:hidden/layers/kv_heads/hd/vocab/
+   max_pos 与注册表逐项比对;草稿目录要求 `DFlash2DraftModel` + `pack-quantized`
+   (BF16 源直接拒,防历史 AL=0 事故)。目录不存在只**告警跳过**(CI 假路径可跑)。
+5. **启动一行摘要**(P1 提前)：意图档 boot 前打印
+   `[owl] profile=… ctx=… pool=… mem=…/… arms=…`；`--check` 仍是完整报告。
+   **`--check` 一次报全**：模型目录/草稿族错误收集进报告（不中途返回），
+   有 FAIL 则退出码 1；27B 缺站点档 = 直接 FAIL（0.8B 有 workspace 缺省资产）。
+6. **`allowed_ops` 仍为空 = 准入门关**(P1 才派生);新 profile 刻意不写白名单。
+   旧 flavor 的白名单漂移(缺 `owl_gemv_i8w_f16` / `PROD_AWQ27B` 缺
+   `gdn_chunked_delta_rule_fwd`)已顺手对齐 —— `ops_whitelist` 门重绿。
+7. **并发 C**:`pool_tokens` 是**全局**容量 ⇒ 非超卖档 `pool = 上下文 × C`,
+   单会话上下文按 `usable / (per_tok × C)` 求解(C=2 ⇒ 每会话 64k / 池 128k)。
+   `max_batch = min(C, 8)`;≥2 活跃的批路走 v2 注意力(FI 只服务 T=1 单行),
+   这条会写进 `--check` 的 WARN。
+
+### 14.3 验收(2026-10-20,单 3090 Ti / BDF 42:00.0)
+
+```text
+--check(不装权重)            : 12ms;max_seq=131072 / pool=131072 / budget 5.95G / cap 194938
+--print-config --format json : provenance["pool.pool_tokens"]=derived, estimate.pool_tokens=131072
+真机 boot [vram-gov]         : total=23.60G fixed_after=0.90G live=16.26G budget=5.95G
+                              per_tok=32768B cap=194835 tok(manual=131072)—— 与估算逐项一致
+现役臂                       : prefill=FI | verify=prefill族 | decode=FI(单图) | spec=depth0 | kv_fp8=true
+std 五点三轮(15/15)          : prefill avg 1436.41(1378–1483)/ decode avg 47.55(46.9–47.8)
+                              —— 与手写 flavor 的 1435 / 47.5 同档
+单测                         : owl-shared 102/102;server config_check 5/5;旧 flavor 全部可解析
+```
+
+### 14.4 遗留(明确不在 P0)
+
+- `derive_ops`(白名单从臂集合派生)、`/debug/config`、`--list-profiles --verbose` = P1;
+- `--migrate-config`、`context=max` 校准探测、泄漏余量曲线、别名清理 = P2;
+- TP 档内存模型未按卡校准(`context=max` 明确拒;显式 context 只跳过内存账);
+- 已知 turn 收尾临时块泄漏仍未修(本设计用 margin 兜,不冒充已解决)。

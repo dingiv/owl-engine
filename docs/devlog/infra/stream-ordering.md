@@ -1,0 +1,333 @@
+# 三流事件序 —— GPU server 跨流同步设计与迁移
+
+> 立项 2026-10-16(用户令:"优化 GPU server 三流并行架构;装载期瓶颈在同步开销,
+> 拷贝流与计算流之间没有同步机制")。**本文只做设计,不含施工**;施工按 §6 刀序
+> 另轮开工,每刀独立可验可回滚。
+> 用户裁决(2026-10-16 二次):
+> ① 对外口 = **闭集 1:1 两条复合命令** `UploadAndLaunch` / `LaunchAndHarvest`;
+> ② **固定暂存环槽下沉 server**(`StagingPool`);③ `handle_sync` 语义**保持原样**。
+> 相关:`async-runtime.md`(DeviceClient 契约)、`pitfalls-cuda.md` §25/§26/§9/N3、
+> `charter.md` A3(同步隔离)/A4(vendor)/A5(显存预算)。
+
+## 1. 病根(侦察账,均为代码/实测事实)
+
+| 事实 | 出处 |
+|---|---|
+| 三条 **non-blocking** 固定流:`STREAM_H2D=0` / `STREAM_COMPUTE=1` / `STREAM_D2H=2`;无默认流、无动态建流 | `server/state.rs:90-93`;pitfalls §25 |
+| 跨流**唯一的"序" = host 全排空**:`handle_sync` 逐流 `synchronize()`(阻塞 actor 至全完成) | `server/mod.rs:1111` |
+| 全仓**零 CUDA event 原语**;cudarc 自带 event-tracking **启动即关**(CAPTURE_ISOLATION/图内事件污染) | pitfalls §26 |
+| ⇒ 装载每键必排空 **≈1.9ms/键**(4B ≈700 键 ⇒ 装载墙时内 ~1.3s 纯栅栏) | 装载提速两轮实测 |
+| **删栅栏裸奔 = 确定性错值**(异流无内在序)⇒"同流免栅栏"推理不成立 | 2026-10-16 实测 |
+| 捕获恒单流(COMPUTE);捕获期 Htod/Dtoh/Sync 全拒(放行仅 Launch/Alloc/MemsetZero/GraphEnd/Close) | `server/mod.rs:571-581`;pitfalls §9/§24 |
+| launch fire-and-forget:错误在**下次 sync/dtoh** 暴露(N3) | pitfalls N3 |
+
+⇒ 装载剩下的那 ~1s 不是"栅栏太贵",而是**没有比栅栏更便宜的正确手段**。
+
+## 2. 需求与设计立场
+
+| # | 需求 | 判据 |
+|---|---|---|
+| R1 | 三条跨界依赖(H2D↔COMPUTE、COMPUTE→H2D 复用、COMPUTE→D2H 回读)必须有**设备端 happens-before** | 删逐键 host 排空后数值门逐位不变 |
+| R2 | 热路径**零 host 排空**(host 只提交,设备按事件排队) | 装载墙时 4B 2.2s → 目标 ≤1.2s;`srv.sync` ≈0 |
+| R3 | **默认路径零行为变化**;捕获期不引入不可捕获节点;错误收割点不消失 | 全 e2e 逐位不变;捕获期带复合命令 ⇒ 响亮拒 |
+
+**设计立场(本版核心修订)**:跨流序**不暴露给客户端**。
+上一版草案曾打算在命令面挂 `Deps::Streams([...])` —— 那是把流身份泄漏到上层、
+且要靠"唯一规范律"去防漏标,属于**用纪律换结构**。本版改为:
+**序由"意图复合"保证,策略由 server 独占** —— 客户端只说"我要上传并算 / 我要算完回读",
+不出现流、不出现事件、不出现槽。
+
+## 3. 设计
+
+### 3.1 server 内部:尾事件 + 事件池(不出 actor)
+
+```
+tail_event[H2D|COMPUTE|D2H] : CUevent      ← 每条流"当前尾部"
+event_pool[EVENT_POOL_N]    : CUevent      ← round-robin(规避"重录挂在等待中的事件"UB)
+ev_inflight                 : 在飞等待记账(池耗尽 = 响亮拒,禁静默复用)
+
+命令处理(dispatch_inner 统一收口):
+  ① 复合命令按自身语义取 `Deps`(server 内部量,客户端不可见)
+  ② 依赖非空 ⇒ cuStreamWaitEvent(目标流, tail_event[dep])
+  ③ 工作量入队(现状不变)
+  ④ cuEventRecord(event_pool.next(), 目标流) → tail_event[目标流] 更新
+```
+
+池化不是优化而是**正确性**:CUDA 语义里"事件被 A 流等待、同时 B 流重录"= UB。
+事件一律 `CU_EVENT_DISABLE_TIMING`(sys 常量在位),计时另开探针。
+
+### 3.2 对外口:闭集 1:1 两条复合命令
+
+```rust
+/// **上传并计算**:一条命令 = 一次搬运 + 一次发射;序由 server 内部保证。
+/// transfer = 上载族变体(Htod / HtodChunk / UploadPinned …),1:1 不允许多发。
+Command::UploadAndLaunch { transfer: TransferSpec, launch: LaunchMsg,
+                           staging: StagingHint, ack: Ack<Result<Bytes, ModelError>> }
+
+/// **计算并回读**:launch → (wait compute) → dtoh(D2H 流);ack 仍"入队即回",
+/// 回读产物由回执/回调送达 —— **不得退化成"每次调用全排空"**。
+Command::LaunchAndHarvest { launch: LaunchMsg, harvest: HarvestSpec,
+                            ack: Ack<Result<Bytes, ModelError>> }
+```
+
+**闭集纪律**(防"在线格式写小作文"):两条命令各有固定形状与校验,不提供
+"任意步骤序列"的通用壳。多步序列(DFlash2 分段路:upload→repack→copy)由
+**多条 1:1 复合**串起来,靠 §3.3 的池与事件自动接序。
+
+组成变体(transfer / harvest)各自闭集:transfer ∈ {整块 Htod, 块偏移 chunk,
+pinned 租约},harvest ∈ {整块 Dtoh, 块区间 Dtoh}。新增变体 = 显式加一臂 + 门。
+
+### 3.3 暂存环槽下沉 server(`StagingPool`,用户裁决 ②)
+
+**为什么下沉**:槽的分配/轮转/"写等读"判序,全在持有流的一侧才可判;而且
+槽 = server 的内存 ⇒ **天然进 A5 账本**(loader 侧暂存区其实是绕过账本的旁路)。
+
+```
+StagingPool(server 内部,常驻)
+  环槽: N 槽 × slot_bytes(启动按声明/配置定形;入账本 + 一行上屏)
+  借还: 复合命令带 StagingHint{ binding: 参数槽位, need_bytes }
+        ⇒ server 选空闲槽(轮转)→ 搬运进槽 → 事件的"消费完成"登记到槽
+        ⇒ **槽归还 = 事务完成(事件)**,不依赖客户端轮转
+  超槽: need_bytes > slot_bytes ⇒ 响亮拒(带需求/槽规/旋钮;分块流式留后续刀)
+```
+
+装载域由此**拆掉客户端侧 `LoadStaging`**(它已验证可用,但归属不对):
+客户端只给"我要把这批字节放进槽并用它发射",槽 id、轮转、复用判序全部消失。
+
+### 3.4 DeviceClient 契约面(客户端 API)
+
+```rust
+// 两条唯一入口(需跨流序的场合只用它们)
+fn upload_and_launch(&mut self, up: TransferArg, msg: LaunchMsg, hint: StagingHint)
+    -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+fn launch_and_harvest(&mut self, msg: LaunchMsg, hv: HarvestArg)
+    -> impl Future<Output = Result<Bytes, ModelError>> + Send;
+
+// 旧口 upload_pinned / launch / copy_block_at / dtoh 保持原样 = "无跨流依赖"场合
+// (引擎 eager 路径、仅 device 内计算等);两条复合口不取代它们,而是**表达意图**。
+```
+
+### 3.5 调用链:装载期新旧对比(calltree)
+
+```
+旧(现状;每键一台 host 排空 ≈1.9ms)
+  eval_want_sequential → load_group → 两臂
+    ├─ upload_native_range → face.upload_pinned(H2D,异步)
+    ├─ face.sync()         → 三流 synchronize   ← ❗全排空
+    ├─ launch(cast|repack) → COMPUTE
+    └─ face.sync() / (分段路: copy_block_at + sync)
+
+新(目标;host 零排空,客户端零槽管理)
+  eval_want_sequential → load_group → 两臂
+    ├─ face.upload_and_launch(upload→槽, launch(读槽), hint{slot})
+    │     server: 取槽 → H2D → event → COMPUTE wait → launch → 记尾事件
+    │              → 该槽登记"读到哪条事件为止才可复用"
+    └─ (分段路:upload_and_launch ×N + 段贴回,同一槽环自动接序)
+  装载末:唯一栅栏(错误收割 N3 + 池清算)
+```
+
+### 3.6 不变量与风险
+
+| # | 不变量/风险 | 处置 |
+|---|---|---|
+| I1 | 捕获期不得出现 wait/event 节点(`streamWaitEvent` 不可捕获) | 复合命令在捕获期**结构化拒绝**(与 Htod/Dtoh 同款白名单);捕获恒单流不变 |
+| I2 | 等待中的事件不可重录(UB,不报错) | 事件池 + 在飞记账;耗尽 = 响亮拒 |
+| I3 | 错误收割点减少(N3) | 装载末保留唯一栅栏;per-key 归因降级(缺键/形状错仍即时报,核错误归装载末)写进 `async-runtime.md §2.4` |
+| I4 | A4:event/池 API 只经 `cuda/src/ffi.rs` 受控再导出 | cudarc 0.19.9 已供 `result::event::{create,record,destroy,synchronize}` + `CudaEvent`(record/synchronize/is_complete)+ `result::stream::wait_event(unsafe)`;不自造 FFI |
+| I5 | 池/槽的显存账(A5) | `StagingPool` 容量 = 启动定形 + 入账本 + 可 `TrimTo`;装载墙时账目对照 |
+| I6 | 复合命令吞掉错误归因 | ack 报**结构化阶段**(transfer / launch / harvest 哪一步失败) |
+| I7 | 性能反噬(事件本身比 1.9ms 贵) | E1 先做**纯记账**(只录事件,零等待),量清 µs 底噪再上 E2 |
+| I8 | `LaunchAndHarvest` 退化成隐式全排空 | 契约写死:harvest = D2H 流异步 + 回调收口,禁 `device_synchronize` |
+
+## 4. 粒度裁决:流级(本轮)vs 句柄级(预留)
+
+流级 = "排在目标流当前尾部之后"(server 内部 3 个 tail_event);
+句柄级 token = "排在该块/槽的最后写者之后"。本轮取**流级 + 槽归还绑定事件**
+(槽是唯一的句柄级退化点);未来要更细,在同一事件池上再包一层 token 表即可升级。
+
+## 5. 验收门(设计与施工共用)
+
+| 类 | 门 | 判据 |
+|---|---|---|
+| 数值 | 4B VLM 四图 e2e / 0.8B 真权重 smoke / 27B 单卡门 / DFlash2 草稿 A/B | **逐位不变** |
+| 压测 | 同载荷 **×20 重跑逐位一致** | 零错值(抓概率竞态;上次错值虽确定性,门要更严) |
+| 性能 | 装载墙时(4B/27B);`srv.sync` 计数;`srv.upload_and_launch` 分相 | 4B 2.2s → ≤1.2s;`srv.sync` ~700 → 2 |
+| 负门 | 捕获期发复合命令 / 槽超规 / 池耗尽 | **必须结构化报错** |
+| 回归 | 既有全 e2e(engine 0.8B 双 turn 等) | 绿 |
+
+## 6. 刀序(每刀独立可验、可回滚)
+
+| 刀 | 内容 | 门 |
+|---|---|---|
+| **E1** | ffi 受控再导出(event 面)+ `tail_event`/`event_pool` + **纯记账**(只录不等待) | 全 e2e 绿;µs 底噪实测;捕获期不炸 |
+| **E2** | 两条复合命令的**壳 + 校验 + 白名单**(内部仍退化为"旧两步 + 一次尾事件"),`StagingPool` 常驻(容量/账目/借还) | 全 e2e **逐位不变**;槽/池账目上屏;负门(捕获/超规/耗尽) |
+| **E3** | **装载域接入**:两臂改用 `upload_and_launch`,**拆掉 loader 侧 `LoadStaging`**,删逐键 sync | §5 全表(含 ×20 压测 + 墙时) |
+| **E4** | 引擎域按需接入(KV 写、采样 `launch_and_harvest`、spec 快照) | **单独一轮**;decode tok/s 不退化 + 长跑稳定 |
+
+## 7. 未决/挂账
+
+1. `handle_sync` 瘦身("事件 join 后只排空 COMPUTE")**本轮不做**(用户裁决 ③);
+2. 槽**超规分块流式**(need > slot_bytes 时按段搬)—— 装载侧已实现过的算法,下沉后需重做一版;
+3. E4 的引擎域接入点清单:先做一次"谁在等谁"的实证测绘(建议 E3 后单独立项);
+4. N3 错误归因降级的契约文本随 E3 落地。
+
+## 8. 施工状态
+
+### E1 已落(2026-10-16;分支 `feat/stream-events`,**零语义变化**)
+
+| 触点 | 文件 | 内容 |
+|---|---|---|
+| ffi 受控再导出 | `cuda/src/ffi.rs` | `event_create/record/synchronize/destroy`(证据行 cudarc 0.19.9 result.rs:1224/1238/1288/1302)+ `sys::{CUevent, CUevent_flags}`(sys/mod.rs:423/43) |
+| 事件池 + 尾事件 | `cuda/src/state.rs` | `TailEvent`(Send 包装,与 `GraphHolder` 同律)/ `event_pool[8]`(`CU_EVENT_DISABLE_TIMING`)/ `record_tail(sid)`(**捕获期跳过**)/ `tail_event(sid)`(E2 消费口)/ `destroy_events()`(收摊) |
+| 记账接线 | `cuda/src/server/mod.rs` | `cmd_stream(&Command) -> Option<StreamId>`(命令→流权威表);`dispatch` 在 handler 之后记尾事件(失败只响亮、不改命令回执);`timing_acc()` 收口分相累加(`srv.ev_record` 与命令分相同表) |
+| 收摊 | `server/mod.rs::shutdown_fence` | 流栅栏之后 `destroy_events()` |
+| 底噪探针 | `cuda/tests/event_record_cost.rs` | 裸 context + 8 事件轮转 ×2000 次,门 = p50 < 10µs(超了 ⇒ E2 必须改批量记账) |
+
+**门**:见 commit 与 roadmap;底噪量法 —— 测试内直接跑探针(不依赖日志等级)。
+
+### E2 开局:两条底噪都量到手(2026-10-16)
+
+| 原语 | 实测(3080) | 对比 |
+|---|---|---|
+| `cuEventRecord` | p50 **170~740ns**(两跑) | 要省的 host 全排空 **1.9ms/键** |
+| `cuStreamWaitEvent`(跨流等待提交) | p50 **180ns** / p99 230ns | 同上 |
+
+⇒ E3 换刀的两侧代价都是**百纳秒级、零 host 阻塞** —— 比要删的那道排空便宜 **4 个数量级**,
+路线成立、且不必上"批量记账"。探针门:`cuda/tests/event_record_cost.rs`(两测,阈值 10µs)。
+
+**实现路径发现(E2 的 `UploadAndLaunch` 内部怎么接序)**:
+
+- **P1(完成回调链)**:server 已有 `Finish` 派发通道(host 回调 → 派发线程执行闭包)。
+  `UploadAndLaunch` = 上传命令的完成回调里提交发射 —— **语义正确的 host 序**,
+  零新机制,且与"两步依次"行为等价 ⇒ 可作 E2 第一版(壳/校验/负门先立起来);
+- **P2(设备端事件序)**:`H2D → record(尾事件) → COMPUTE waitEvent` —— 目标形态,
+  E3 的切换点(现在两侧底噪都在手上,切它无风险)。
+
+### E2a 已落(2026-10-16;线格式闭集 + 校验位 + 负门;**行为零变化**)
+
+- `Command::{UploadAndLaunch, LaunchAndHarvest}`(闭集 1:1):
+  `UploadAndLaunch{buf(pinned 租约), dst, offset_bytes, len_bytes, msg}` /
+  `LaunchAndHarvest{msg, id, want_bytes}`;
+- 四张表全接:`Command::kind()` / `created_at()` / `cmd_name()` 分相标签 /
+  `server::cmd_stream`(**改位图** —— 复合可触多条流,每条被触流各记尾事件);
+- **负门在位**:捕获期**结构化拒**(与 Htod/Dtoh 同款白名单)、Closing 态回
+  `ServerClosed`(不在任何一张表里漏 arm ⇒ 编译期强制);
+- 客户端:**`GpuClient` 固有面**两个方法(`upload_and_launch` / `launch_and_harvest`);
+- 接线**故意留白且响亮**:两条复合命令当前回
+  `E2a 未接线(线格式/校验/负门已在位;接线 = E2b)` —— 半成品不装成功。
+
+**门**:workspace `--all-targets` 0 error;`owl-engine --lib` 40/40;
+engine 0.8B e2e(捕获在)绿;探针门两测绿(record p50 350ns、wait p50 180ns)。
+
+### E2b 已落(2026-10-16;复合命令**真接线**,设备端事件序)
+
+- **抽核心(单机制)**:
+  - `server/harvest.rs::enqueue_upload_pinned(...) -> Result<()>`(63 行核心;
+    `handle_upload_pinned` 变 3 行壳);
+  - `server/mod.rs::enqueue_launch(...) -> Result<Bytes>`(78 行核心;
+    `handle_launch_inner` 变 2 行壳);
+  ⇒ 复合命令与命令壳共用**同一条**上传/发射路径,不留第二套;
+- **`state.rs::wait_stream_on_tail(stream, dep)`**(E3 的序消费口):
+  `cuStreamWaitEvent` 设备端排队、**零 host 阻塞**;捕获期**防御性拒**、
+  `dep` 无尾事件 ⇒ 响亮拒(不静默跳过 —— 跳过等于丢序);
+- **两条复合的序**(P2 目标形态**直落**,跳过原计划的 P1 回调链 —— 两个动作
+  都只是"入队",事件等待比回调接线更简单):
+  ```
+  UploadAndLaunch : enqueue(H2D) → record_tail(H2D) → COMPUTE waitEvent → enqueue(COMPUTE)
+  LaunchAndHarvest: enqueue(COMPUTE) → record_tail(COMPUTE) → D2H waitEvent → Dtoh(复用外层 ack)
+  ```
+  后者**闭集校验**:`id` 必须 = 本 launch 输出块(槽序末位 `Arg::Block`),不符**响亮拒**;
+- **顺带修掉 E2a 的一个真 bug**:当时 python `replace` 全局替换,把两条"未接线"臂
+  同时插进了**捕获白名单** ⇒ 捕获期本应走 `reject!` 的负门被改成了"未接线"错误。
+  现已移除(负门恢复:捕获期复合 ⇒ 结构化拒,并由新探针用例锁住)。
+
+**门(`crates/backends/cuda/tests/composite_launch_probe.rs`,2 测)**:
+① 序守恒:`UploadAndLaunch` 上传的块被**紧接着**的核读到(数值逐位对);
+② 回读:`LaunchAndHarvest` 等到核写完(数值逐位对);
+③ 复合 #1 输出独立复读校验(序丢即错);
+④ 闭集校验负门(id ≠ 输出块 ⇒ 拒,文案点名);
+⑤ 捕获期负门:两条复合均被白名单拒(顺带佐证 `AllocPinned` 也在拒列)。
+
+**回归**:workspace `--all-targets` 0 error;`owl-engine --lib` 40/40;
+engine 0.8B e2e(图捕获在)绿;4B VLM 四图 280/5388/74035/21655 逐项不变;
+底噪探针两测绿。
+
+### 下一步(E3:装载域换刀;再 E4)
+
+1. **装载两臂改用复合口**(`upload_and_launch` / 分段路的 `launch_and_harvest`),
+   **删逐键 `face.sync()`** —— 目标 4B 2.2s → ≤1.2s;
+2. `StagingPool` 常驻 server(槽借还锚在尾事件上;客户端不再管槽 —— 拆 loader 侧 `LoadStaging`);
+3. 事件池容量改"在飞等待上界 + 记账"(耗尽 = 响亮拒);
+4. trait 加宽(`DeviceClient` 默认"不支持" + `GpuClient` 实现)⇒ 泛型调用点可用;
+5. 门:数值四门 + **×20 重跑逐位一致**压测门 + 墙时账。
+
+### 旧的下一步(E2b 接线;再 E3)
+
+1. **接线**(P1 完成回调链先落,语义等价"两步依次"):`handle_upload_and_launch`
+   = 上传完成后在派发线程提交发射;`handle_launch_and_harvest` = 发射后等 COMPUTE
+   尾事件 → D2H 回读。**校验**:`LaunchAndHarvest.id` 必须 = 本 launch 输出块;
+2. `StagingPool` 常驻(容量/账目/借还锚在尾事件上);
+3. 事件池容量改"在飞等待上界 + 记账"(耗尽 = 响亮拒);
+4. trait 加宽(`DeviceClient` 默认"不支持" + `GpuClient` 实现)⇒ 泛型调用点可用;
+5. 负门测试用例(捕获期复合命令 / 槽超规 / 池耗尽)+ 复合命令探针用例。
+
+### 旧的下一步(E2 剩余)
+
+1. 命令面闭集两条:`UploadAndLaunch` / `LaunchAndHarvest`(壳 + 校验 + 捕获白名单 + 结构化阶段错误);
+2. `StagingPool` 常驻(容量/账目/借还绑定尾事件);
+3. 事件池容量改"在飞等待上界 + 记账"(耗尽 = 响亮拒);
+4. 门:全 e2e 逐位不变 + 负门(捕获期复合命令 / 槽超规 / 池耗尽)。
+
+## 9. E3 结案:换刀撞出的**真 bug** —— alloc 清零与 H2D 搬运的跨流序缺失
+
+**定谳(2026-10-16)**:E3 换刀后 `A_log`(F32 源、16 元素、**未改动**的 F16C 直路)
+设备块全 0。根因**不在装载器**,而是 server 侧一个**一直被旧装载器的逐键 `sync()`
+无意兜住的真缺陷**:
+
+- `alloc{zero:true}` 的清零 = **COMPUTE 流上的设备侧异步 `memset_zeros`**;
+- host→device 搬运(`UploadPinned` / `Htod*`)在 **H2D 流** ⇒ **两流无序**;
+- ⇒ **晚到的 memset 会把刚落地的搬运抹成 0**;
+- 命中面 = **搬运极快的小键**(32B 的 A_log:写完 + `sync()` 后立刻回读仍是 0);
+  大键(ms 级拷贝)与 cast 臂输出(同流核写)**都安全** ⇒ 恰好只有 18 个 A_log 中招,
+  与观测逐项吻合。
+
+### 破案路径(证据链,全部实测)
+
+| 步 | 手段 | 结论 |
+|---|---|---|
+| 1 | 逐键回读门(`gpu_vram_manifest_checksum`,302 键 vs 独立锚) | 点名 **只错 A_log** |
+| 2 | 在 F16C 内插探针:写完立刻 dtoh | **= 0** ⇒ 写没落地(不是事后被覆盖) |
+| 3 | 同处打印租约内容 / 块 id / check_range | 租约非零、id 正常、边界通过 ⇒ 源与目标解析都没问题 |
+| 4 | 槽尺寸扫描(16/128MB) | 都一样错 ⇒ 与尺寸类无关 |
+| 5 | **二分**:只让单发路走复合 / 只让流式路走复合 | **单发路复合 = 触发者**;流式路无关 |
+| 6 | 两种复合流策略(H2D+事件 / 同流) | 都触发 ⇒ **与"序缺"同族,不是事件机制错** |
+| 7 | **新增 `/debug/blocks` 块账本快照** | 302 活块 **零重叠、零重复 id** ⇒ 排除 id 复用/地址重叠 |
+| 8 | 代码走查 `handle_alloc_inner` | **memset 在 COMPUTE 流** ✓ 定谳 |
+
+### 修法(给清零上依赖,不牺牲并行)
+
+`GpuCtx::{note_zeroing, wait_zeroing, clear_zeroing}`:alloc 清零后记一个事件;四处
+H2D 写口(`try_htod` / `enqueue_upload_pinned_on` / `handle_htod_chunks` /
+`handle_htod_chunk`)拷贝前等它一次 —— **设备端等待、零 host 阻塞**,
+且**只等本块那一次**(不等整条 COMPUTE 尾,不做无谓串行)。
+
+### 门(实测)
+
+修复前 302 键 **✗18** → 修复后 **302/302 绿**;4B 四图 e2e **逐项不变**(280/5388/
+74035/21655);0.8B smoke **×10 逐位相同**;DFlash2 草稿 A/B(重排臂)**逐位 0 差**;
+engine 0.8B e2e 绿;**27B 单卡整装 19.3s + 三问正常生成(16~17 tok/s)**;
+复合口四测 + 账本不变量门 + 底噪两测全绿。
+
+### E3 收益(比预期小,已挂账)
+
+4B 整装 **2.2s → 2.0s**(~10%);27B 19.8→19.3s(噪声档)。旧测"逐键 host 排空 ≈1.9ms"
+在此场景**未兑现** ⇒ 挂账:`srv.sync` 分相 + 装载分相(`OWL_LOAD_DEBUG`)复量,
+判断是"排空与 DMA 重叠"还是"旧测值偏高"。
+
+### 教训(写死)
+
+1. **跨流"隐式序"的洞,会被任何"减少 host sync"的改动引爆** ——
+   旧装载器的逐键 `sync()` 一直在替 server 兜洞,兜得越久越像"性能税";
+2. **新加设备侧异步写(本例的 alloc memset)必须显式上依赖**,别让调用方用 sync 兜;
+3. **观测面先于结论**:块账本快照(`/debug/blocks`)一步就判掉了两个最诱人的假设
+   (id 复用/地址重叠),该面值得长期留用(已配不变量门)。
