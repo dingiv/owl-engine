@@ -298,6 +298,7 @@ extern "C" {
         dev: i32,
         stream: usize,
         is_bf16: i32,
+        w4a8_m8: i32,
     ) -> i32;
 }
 
@@ -412,6 +413,7 @@ pub unsafe fn gemm_v2_awq_w4a8_raw(
     groupsize: i32,
     dev: i32,
     stream: usize,
+    w4a8_m8: bool,
 ) -> Result<(), i32> {
     let err = marlin_gemm_v2_awq_w4a8_ffi(
         a as *const c_void,
@@ -429,6 +431,7 @@ pub unsafe fn gemm_v2_awq_w4a8_raw(
         dev,
         stream,
         0, // is_bf16 = false(f16 档;bf16 档待接)
+        if w4a8_m8 { 1 } else { 0 },
     );
     if err == 0 { Ok(()) } else { Err(err) }
 }

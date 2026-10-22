@@ -969,6 +969,13 @@ fn build_marlin() {
                 base.join("vllm_marlin/sm80_kernel_s8_u4_float16.cu"),        // W4A8 s8→f16 × AWQ 非对称(kU4;生产 27B 走这条)
                 base.join("vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu"),       // W4A8 s8→bf16 × kU4(BF16 激活档)
             ];
+            // **源文件必须在增量命中分支之外登记**(2026-10-22 实测):
+            // 原先 `rerun-if-changed` 只写在 else(重建)分支 ⇒ 一旦 stamp 命中,
+            // 改 `marlin_host.cu` 不会触发 build.rs 重跑,旧 `.a` 静默留用。
+            // 探针/宿主代码的改动会“看起来没生效”,正是本修正的起因。
+            for src in &sources {
+                println!("cargo:rerun-if-changed={}", src.display());
+            }
             // `cu/` = owl_log.h 的住址(host .cu 与 flashinfer 共用同一头)
             let includes = [
                 PathBuf::from("cu"),
@@ -992,7 +999,6 @@ fn build_marlin() {
             } else {
             let mut objs = Vec::new();
             for src in &sources {
-                println!("cargo:rerun-if-changed={}", src.display());
                 let obj = obj_dir.join(src.file_name().unwrap()).with_extension("o");
                 let mut args = vec![
                     "-c".to_string(),

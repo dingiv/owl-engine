@@ -115,7 +115,10 @@ static void ensure_smem(int dev, const void* kernel, int smem) {
 
 // --- 临时分相探针(2026-10-21;MARLIN_TIME=1 开启,测完即删)------------------
 struct PhaseAcc { double cfg=0, attr=0, launch=0; long n=0; };
-static PhaseAcc g_phase;
+// **TP2 是同进程双 rank 线程** ⇒ 文件级 static 会把两 rank 的发射混算(伪“单调上升”);
+// thread_local + 每 256 条窗口(2026-10-22,分支 d2b1277 实测修正)。
+thread_local PhaseAcc g_phase;
+thread_local long g_phase_total = 0;
 static inline double now_us() {
   using namespace std::chrono;
   return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count() / 1e3;
@@ -302,7 +305,8 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
               const void* a_s, bool a_is_s8, const void* b_z, bool use_zp,
               int prob_m, int prob_n, int prob_k, int lda, void* workspace,
               int num_groups, int group_size, int dev, cudaStream_t stream,
-              int thread_k_init, int thread_n_init, int sms, bool is_bf16) {
+              int thread_k_init, int thread_n_init, int sms, bool is_bf16,
+              bool allow_w4a8_m8) {
   if (prob_m <= 0 || prob_n <= 0 || prob_k <= 0) return 4;
 
   constexpr bool has_act_order = false;
@@ -346,6 +350,9 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
   vllm::ScalarType c_type = is_bf16 ? vllm::kBFloat16 : vllm::kFloat16;
   vllm::ScalarType s_type = c_type;
 
+  // ⚠️ max_par 决定 M 方向拆几段:**每段都会重读一遍完整权重**。
+  // 生产 prefill_chunk=512(一次发射,权重 1×);把 chunk 拉到 2048/4096
+  // 会变成 2/4 段、权重 ×2/×4。改 chunk 前先看 marlin-v2 日志的 split=。
   int max_par = 16;
   if (prob_n <= 4096) max_par = 16 * 8;
   int max_shared_mem_new = max_shared_mem;
@@ -366,9 +373,18 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
     int thread_m_blocks = div_ceil(prob_m_split, 16) < max_thread_m_blocks
                               ? div_ceil(prob_m_split, 16)
                               : max_thread_m_blocks;
-    // 隔离开关:MARLIN_NO_M8=1 强制走非 m8 路径(定位 m8 相关问题用)
-    bool m_block_size_8 = prob_m_split <= 8 && a_type.size_bits() == 16 &&
-                          !getenv("MARLIN_NO_M8");
+    // 隔离开关:MARLIN_NO_M8=1 强制走非 m8 路径(定位 m8 相关问题用)。
+    // 2026-10-22:famp-marlin 的 int8 m8 路径已移入(4 处 m16n8k32 布局修复;
+    // 仅 grouped 路,per-channel int8 m8 未验证)。**默认关**:3080 上
+    // W4A8 m=7/8 A/B 与 16-row 持平/略慢(famp 的 m8 是给 16-bit 激活的;
+    // int8 m8 在 3080 没赢)。要复验时显式开 `[kernel] marlin_w4a8_m8 = true`。
+    // 配置面 `[kernel] marlin_w4a8_m8`(默认 false)显式传入;`MARLIN_NO_M8=1`
+    // 仍保留为**诊断**总开关(定位 m8 相关问题用)。
+    const bool w4a8_m8 =
+        allow_w4a8_m8 && a_type == vllm::kS8 && group_blocks > 0;
+    bool m_block_size_8 =
+        prob_m_split <= 8 && (a_type.size_bits() == 16 || w4a8_m8) &&
+        !getenv("MARLIN_NO_M8");
 
     exec_config_t exec_cfg;
     thread_config_t thread_tfg;
@@ -477,10 +493,15 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
     cudaError_t launch_err = cudaGetLastError();
     if (time_on) {
       g_phase.launch += now_us() - t_launch;
-      if (++g_phase.n % 1024 == 0)
-        OWL_LOG_DEBUG("marlin-time", "n=%ld avg_us cfg=%.1f attr=%.1f launch=%.1f",
-                      g_phase.n, g_phase.cfg / g_phase.n, g_phase.attr / g_phase.n,
-                      g_phase.launch / g_phase.n);
+      g_phase.n += 1;
+      g_phase_total += 1;
+      if (g_phase.n % 256 == 0) {
+        // 窗口均值(每 256 条重算);n = 本线程累计条数
+        OWL_LOG_DEBUG("marlin-time", "n=%ld win_us cfg=%.1f attr=%.1f launch=%.1f",
+                      g_phase_total, g_phase.cfg / 256.0, g_phase.attr / 256.0,
+                      g_phase.launch / 256.0);
+        g_phase = PhaseAcc{};
+      }
     }
     if (launch_err != cudaSuccess) {
       OWL_LOG_ERROR("marlin-v2", "launch error: %s", cudaGetErrorString(launch_err));
@@ -551,7 +572,8 @@ int marlin_gemm_v2_ffi(const void* A, const void* B, void* C, void* c_tmp,
                    /*a_s=*/nullptr, /*a_is_s8=*/false, /*b_z=*/nullptr,
                    /*use_zp=*/false, prob_m, prob_n, prob_k, prob_k,
                    workspace, num_groups, group_size, dev,
-                   (cudaStream_t)stream, -1, -1, sms, /*is_bf16=*/false);
+                   (cudaStream_t)stream, -1, -1, sms, /*is_bf16=*/false,
+                   /*allow_w4a8_m8=*/false);
 }
 
 // BF16 激活/输出变体(E5-DF3 同日十二:草稿路径 BF16 化,对齐 sglang。
@@ -567,7 +589,8 @@ int marlin_gemm_v2_bf16_ffi(const void* A, const void* B, void* C, void* c_tmp,
                    /*a_s=*/nullptr, /*a_is_s8=*/false, /*b_z=*/nullptr,
                    /*use_zp=*/false, prob_m, prob_n, prob_k, prob_k,
                    workspace, num_groups, group_size, dev,
-                   (cudaStream_t)stream, -1, -1, sms, /*is_bf16=*/true);
+                   (cudaStream_t)stream, -1, -1, sms, /*is_bf16=*/true,
+                   /*allow_w4a8_m8=*/false);
 }
 
 // W4A8 变体:A = int8(已量化),a_scales = fp32 [M,1](per-token)。
@@ -600,7 +623,7 @@ int marlin_gemm_v2_w4a8_ffi(const void* A, const void* B, void* C,
                       /*b_z=*/nullptr, /*use_zp=*/false,
                       prob_m, prob_n, prob_k, prob_k, workspace, num_groups,
                       group_size, dev, (cudaStream_t)stream, -1, -1, sms,
-                      /*is_bf16=*/is_bf16 != 0);
+                      /*is_bf16=*/is_bf16 != 0, /*allow_w4a8_m8=*/false);
   cudaFreeAsync(c_tmp_own, (cudaStream_t)stream);
   return err;
 }
@@ -620,7 +643,7 @@ int marlin_gemm_v2_awq_ffi(const void* A, const void* B, void* C,
                    const_cast<void*>(b_zeros), /*use_zp=*/true,
                    prob_m, prob_n, prob_k, prob_k, workspace, num_groups,
                    group_size, dev, (cudaStream_t)stream, -1, -1, sms,
-                   /*is_bf16=*/false);
+                   /*is_bf16=*/false, /*allow_w4a8_m8=*/false);
 }
 
 // **配置可注**(2026-10-19 P5-Q2):与 awq_ffi 逐字同一路,只把 thread_k/thread_n
@@ -639,7 +662,7 @@ int marlin_gemm_v2_awq_cfg_ffi(const void* A, const void* B, void* C,
                    const_cast<void*>(b_zeros), /*use_zp=*/true,
                    prob_m, prob_n, prob_k, prob_k, workspace, num_groups,
                    group_size, dev, (cudaStream_t)stream, thread_k, thread_n, sms,
-                   /*is_bf16=*/false);
+                   /*is_bf16=*/false, /*allow_w4a8_m8=*/false);
 }
 
 // W4A8 × AWQ **非对称**变体:A = int8(已量化)+ a_scales fp32[M,1];B = kU4 + b_zeros。
@@ -650,7 +673,7 @@ int marlin_gemm_v2_awq_w4a8_ffi(const void* A, const void* B, void* C,
                                 const void* b_zeros, const void* a_scales,
                                 int prob_m, int prob_n, int prob_k,
                                 void* workspace, int group_size, int dev,
-                                uintptr_t stream, int is_bf16) {
+                                uintptr_t stream, int is_bf16, int w4a8_m8) {
   int sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   int num_groups = (group_size == -1) ? 1 : prob_k / group_size;
@@ -667,7 +690,7 @@ int marlin_gemm_v2_awq_w4a8_ffi(const void* A, const void* B, void* C,
                       const_cast<void*>(b_zeros), /*use_zp=*/true,
                       prob_m, prob_n, prob_k, prob_k, workspace, num_groups,
                       group_size, dev, (cudaStream_t)stream, -1, -1, sms,
-                      /*is_bf16=*/is_bf16 != 0);
+                      /*is_bf16=*/is_bf16 != 0, /*allow_w4a8_m8=*/w4a8_m8 != 0);
   cudaFreeAsync(c_tmp_own, (cudaStream_t)stream);
   return err;
 }

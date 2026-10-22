@@ -19,8 +19,8 @@ use super::{f16_bits, f16_to_f32};
 
 // 自检几何(**必须满足 marlin 打包约束** `k%128==0 && n%256==0` ——
 // 2026-10-13 实测:小形状会被 packer 直接 assert 掉):
-// m=4(多行)、n=256(16 个 word 行)、k=128(1 个 k-tile)、g=32 ⇒ 4 组
-const M: usize = 4;
+// m=8(W4A8 m8 形状;m8 tile 由 `[kernel] marlin_w4a8_m8 = true` 显式开)、n=256、k=128、g=32 ⇒ 4 组
+const M: usize = 8;
 const N: usize = 256;
 /// ⚠️ **K 的用途不只是形状**:内核的 `slice_count = prob_k / thread_k`
 /// (k 分片)× 多 warp 归约路径 —— `thread_k ∈ {64,128}` ⇒ **K=128 时

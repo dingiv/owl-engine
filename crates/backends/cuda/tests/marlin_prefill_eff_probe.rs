@@ -110,6 +110,7 @@ fn launch_w4a8(
             s_p as *const u16, z_p as *const i32, asc_p as *const f32,
             std::ptr::null(), m as i32, n as i32, k as i32,
             ws_p as *mut i32, G, ctx.ordinal() as i32, cu,
+            false,
         )
         .expect("marlin w4a8 launch")
     };
