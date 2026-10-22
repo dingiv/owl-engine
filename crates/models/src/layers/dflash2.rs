@@ -163,6 +163,28 @@ impl GroupedConv {
 }
 
 // ============================================================================
+// DFlash2 草稿池 ring 常量(2026-10-22)
+//
+// 草稿 config:`layer_types = sliding_attention×5`、`sliding_window = 2048`、
+// `use_sliding_window = true`。NC 核的前缀读已经是滑窗 2048(自块恒全可见);
+// 但池按 `max_seq` 全长分配 = 10240B/token(TP2 每 rank),184k 白吃 1.8GiB。
+// ring 只保留 **窗口 + 自块** 的槽,写者/读者都按 `p % ring_cap` 映射。
+//
+// `ring_cap` = 向上取整到页的 `2048 + 8`;页宽 32 时 = 2080(65 页)。
+// 约束(核内 `__trap`):`ring_cap >= 2048 + T`(T = 自块行数,DFlash2 = 8)。
+// ============================================================================
+
+pub const DRAFT_SLIDING_WINDOW: usize = 2048;
+pub const DRAFT_BLOCK: usize = 8;
+
+/// 草稿 ring 槽数(页对齐;`page` = 草稿池页宽 = 主池页宽,通常 32)
+pub fn draft_ring_slots(page: usize) -> usize {
+    let need = DRAFT_SLIDING_WINDOW + DRAFT_BLOCK;
+    let p = page.max(1);
+    need.div_ceil(p) * p
+}
+
+// ============================================================================
 // DfAttn:草稿注意力(普通 qwen3 款 —— 无 q⊕gate 门控,q 独立投影;
 // owl Attention 是 Qwen3Next 门控款,草稿不通用,另立此件)。
 // 双臂:encode_kv(kv-only 物化,无 q 无注意力)/ propose(8 行双向块)。
@@ -183,6 +205,9 @@ pub struct DfAttn {
     dt: Dtype,
     /// B6 偷显存:前缀池 e4m3(写/读走 fp8kv 变体;默认 false)
     kv_fp8: bool,
+    /// **草稿池 ring 槽数**(0 = 线性全池;>0 = 逻辑位 `% ring_cap`)。
+    /// 由引擎按 `draft_ring_slots(page)` 设置(检查点滑窗 2048 + 自块 8)。
+    ring_cap: usize,
 }
 
 // accessor 面(q_proj/k_proj/v_proj/o_proj/q_norm/k_norm 当前臂未引用)
@@ -229,7 +254,13 @@ impl DfAttn {
             hidden,
             dt,
             kv_fp8,
+            ring_cap: 0,
         }
+    }
+
+    /// 引擎设置草稿 ring 槽数(0 = 线性;DFlash2 生产 = 2080)
+    pub(crate) fn set_ring_cap(&mut self, cap: usize) {
+        self.ring_cap = cap;
     }
 
     /// classic 池几何(页宽 / interleave 因子;叶子 shape [nb, hkv, hd/x, page, x])
@@ -368,6 +399,7 @@ impl DfAttn {
         .arg_i32(self.hd as i32)
         .arg_i32(page as i32)
         .arg_i32(x as i32)
+        .arg_i32(self.ring_cap as i32)
         .with_shape(self.dt, vec![t, row_q]);
         self.o_proj.forward(&y, ctx)
     }
@@ -709,6 +741,14 @@ pub struct DFlash2Draft {
 }
 
 impl DFlash2Draft {
+    /// 引擎设置草稿 ring 槽数(0 = 线性;DFlash2 生产 = `draft_ring_slots(page)`)
+    pub fn with_ring_cap(mut self, cap: usize) -> Self {
+        for l in &mut self.layers {
+            l.attn.set_ring_cap(cap);
+        }
+        self
+    }
+
     /// 几何 = 检查点 config(5 层 32H/8KV/128;hidden 5120;inter 17408;
     /// eps 1e-6;vocab 248320)。plan 恒 F16(检查点全 BF16,装载源
     /// bf16→f16 归一;W4A16 版 = 二期)。dt = F16(存量测试面)。
@@ -2312,6 +2352,7 @@ mod tests {
         .arg_i32(hd as i32)
         .arg_i32(page as i32)
         .arg_i32(x as i32)
+        .arg_i32(0) // 测试面:线性槽(ring 由引擎档设置)
         .with_shape(Dtype::F16, vec![2, hq * hd]);
         let got_nc = harvest_f16(&mut gpu, &y_nc).await;
         let y = attn.o_proj().forward(&y_nc, &ctx);

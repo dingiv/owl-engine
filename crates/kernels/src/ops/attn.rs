@@ -40,6 +40,7 @@ impl KernelSpec for NcAttnBf16V2 {
         Param::i32("page"),
         // ABI 占位形参(历史遗留:q_tokens 已由 grid.y 承担;签名不动)
         Param::i32("x"),
+        Param::i32("ring_cap"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::BF16)];
@@ -335,6 +336,7 @@ impl KernelSpec for NcAttnFp8kvBf16 {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
+        Param::i32("ring_cap"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3)];
@@ -625,6 +627,7 @@ impl KernelSpec for NaiveAttnNcF16 {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
+        Param::i32("ring_cap"),
         Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F16)];
@@ -655,6 +658,7 @@ impl KernelSpec for NaiveAttnNcBf16 {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
+        Param::i32("ring_cap"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::BF16)];
@@ -685,6 +689,7 @@ impl KernelSpec for NaiveAttnNcFp8KvF16 {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
+        Param::i32("ring_cap"),
         Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::F8E4M3)];
@@ -1560,6 +1565,7 @@ impl KernelSpec for NaiveAttnNcF16Knhd {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
+        Param::i32("ring_cap"),
         Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
@@ -1592,6 +1598,7 @@ impl KernelSpec for NaiveAttnNcBf16Knhd {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
+        Param::i32("ring_cap"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::BF16)];
@@ -1624,6 +1631,7 @@ impl KernelSpec for NaiveAttnNcFp8KvF16Knhd {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
+        Param::i32("ring_cap"),
         Param::t_out("out", Dtype::F16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
@@ -1656,6 +1664,7 @@ impl KernelSpec for NaiveAttnNcFp8KvBf16Knhd {
         Param::i32("d_dim"),
         Param::i32("page"),
         Param::i32("x"),
+        Param::i32("ring_cap"),
         Param::t_out("out", Dtype::BF16, 2),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
@@ -1719,7 +1728,7 @@ mod tests {
     fn nc_v2_slot_order_derives_from_params() {
         assert_eq!(
             meta_of::<NcAttnBf16V2>().args_str(),
-            "T,T,T,T,T,T,i32,i32,i32,i32,i32,O"
+            "T,T,T,T,T,T,i32,i32,i32,i32,i32,i32,O"
         );
     }
 
