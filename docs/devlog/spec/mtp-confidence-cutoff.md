@@ -1,10 +1,10 @@
 # MTP 置信度截断 —— T2 设计与施工
 
-> 2026-10-22 · 工作树 `packages/owl-worktrees/mtp-spec`
+> 2026-10-22 · 工作树 `工作树 mtp-spec`
 > 关联：
 > - `mtp-longctx-handoff.md` §6（T2）
 > - `mtp-longctx-windowed.md` §5（T1a/T1b 两档图族）
-> - `perf-runs/mtp-longctx-2026-10-21/REPORT.md` §8/§9（greedy + 采样基线）
+> - 本地实测档(未入库) §8/§9（greedy + 采样基线）
 
 ---
 

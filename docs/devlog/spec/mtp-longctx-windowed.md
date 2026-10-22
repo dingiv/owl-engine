@@ -1,10 +1,10 @@
 # MTP 长上下文抗衰减 —— Windowed-MTP + 自适应深度 设计与施工
 
 > 2026-10-21 · 设计稿 v1
-> 工作树：`packages/owl-worktrees/mtp-spec` @ `9bb7414`
+> 工作树：`工作树 mtp-spec` @ `9bb7414`
 > **本轮施工范围 = Phase 0（Windowed-MTP 读视图）+ T1a/T1b（自适应 depth）。**
 > Phase 2（置信度截断）只锁接口/约束，等 T1 数据后再开工。
-> 基线原始数据（本地未入库）：`perf-runs/mtp-longctx-2026-10-21/REPORT.md`。
+> 基线原始数据（本地未入库）：本地实测档(未入库)。
 
 ---
 
@@ -44,7 +44,7 @@ Phase 1 再做 d3/d7 自适应，解决“8k 吃 d7、64k 回落 d3”的交叉�
 - 采样：greedy（`temperature=0`，`top_p=1.0`）；`ignore_eos`；输出 256 tok；并发 1。
 - MATH：随机数字词池；DOCS：工作区文档拼接的固定长文本（真实文本，非重复）。
 
-完整表见 `perf-runs/mtp-longctx-2026-10-21/REPORT.md`。
+完整表见本地实测档(未入库)。
 
 ### 1.2 关键读数
 
@@ -701,7 +701,7 @@ OWL_E2E_ONLY=gpu_spec_identity_gate_27b \
 
 # 曲线（临时脚本；Phase 0 可收编为 tools/mtp_ctx_curve.py）
 python3 /tmp/mtp_curve.py \
-  --out perf-runs/mtp-longctx-2026-10-21/spec-window \
+  --out <out-dir>/spec-window \
   --length 65536 --rounds 2
 ```
 
@@ -711,7 +711,7 @@ python3 /tmp/mtp_curve.py \
 
 - **Windowed-MTP**：arXiv 2607.21535，NVIDIA；sink=64 + W=4032；
   draft block table 视图；1M/d7 per-step −28%~−44%，AL ±10%。
-- **SGLang adaptive spec**：`packages/sglang/python/sglang/srt/speculative/adaptive_spec_params.py`
+- **SGLang adaptive spec**：`sglang`(外部存档)
   （EMA + hysteresis + 预捕获图）。
 - **SGLang DFlash draft window**：`dflash_worker_v2.py` 的
   `--speculative-dflash-draft-window-size`（recent-only；本轮 MTP 不复用其配置）。

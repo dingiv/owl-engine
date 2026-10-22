@@ -29,7 +29,7 @@
 | decode t/s | 40.4–40.6 | 40.4–40.9 | 40.5–41.0 | 39.9–40.2 | 38.8–39.2 |
 | TTFT ms | 303 | 560 | 1124 | 2264 | 4620 |
 
-均值:**prefill 1783 / decode 40.05**。原始数据 `docs/bench/data/gguf27b-iq4xs-std-nospec-2026-10-21.json`。
+均值:**prefill 1783 / decode 40.05**。原始数据本地原始数据(未入库)。
 
 ### 1.2 spec=d7(同一工具/参数)
 
@@ -74,7 +74,7 @@
 
 ---
 
-## 3. 调研:llama.cpp(`packages/llama.cpp`,分支 `dflash-optimize`)用的是谁
+## 3. 调研:llama.cpp(`llama.cpp`(外部存档),分支 `dflash-optimize`)用的是谁
 
 ### 3.1 量化 GEMM(按 token 数三段分派,`ggml/src/ggml-cuda/ggml-cuda.cu:1975-2005`)
 
@@ -153,7 +153,7 @@ DFlash2 草稿 = 标准 `build_attn` + **非因果 mask**(`src/models/dflash.cpp
 3. **一致性**:spec-on 与 spec-off 的贪心输出前 64 token 逐字节一致(既有口径);
 4. **回归**:`cargo test -p owl-models --lib`(295 绿)、`-p owl-engine --lib`(76 绿)、
    `-p owl-kernels --lib`(111 绿);
-5. 数据落盘 `docs/bench/data/gguf27b-iq4xs-std-spec-2026-10-2X.json`。
+5. 数据落盘本地原始数据(未入库)。
 
 ---
 
@@ -277,7 +277,7 @@ nsys 运行时 API 账(单轮 58.5 ms):
 
 ### 9.5 std 五项三轮(spec d7,v2 verify,**含刀 B**)
 
-`docs/bench/data/gguf27b-iq4xs-std-spec-2026-10-21b.json`(五点三轮)+
+本地原始数据(未入库)(五点三轮)+
 `…-std-spec-hi-2026-10-21b.json`(4096/8192 补测三轮):
 
 | 点 | 旧(spec d7) | 新 | 相对无投机(40.05) |

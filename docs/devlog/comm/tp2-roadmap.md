@@ -71,7 +71,7 @@ decode 已落刀:③④ 小核治理(−1.41ms/步,已验)
 |---|---|---|---|
 | **P0.0** | **RankDev × 主线骶架对账(TP 上主干的前置)**—— 见下方专节 | 28 文件 / 94 冲突块的干跑已做;验收 = 构建 + 五道门 + 排名词复现 | TP 上主干 |
 | **P0.1** | **prefill 逐核账** ✅ **已完成(2026-10-19)**:新工具 `tools/prefill-account.sh` + `tools/prefill_account.py`(8k prompt + 出 1 token ⇒ eager 段逐核) | 见下表 | ✅ **结论见 P1.4** |
-| **P0.2** | **W4A8 A/B** ✅ **已完成(2026-10-19 两次独立运行,合并前后各一次,逐点吻合)**:TP2 下 **prefill +45.7%**(1430–1511 → 2017–2203 t/s)、**TTFT@8k −31%**(5502 → 3765 ms)、**decode −12.4%**(44.0–44.9 → 38.3–39.6)| 配置级(`[model] quant = "w4a8"`);数据 `docs/bench/data/owl-w4a8-2026-10-19/`(base/a8 + merge-rerun)| ✅ **比 AR 大得多的 prefill 杠杆**(M2 ≥1620 直接跨过,M3 1750 也已过);⚠️ **decode 退化 12.4% 是 TP2 特有**(单卡实测"decode 不变")⇒ **待排查**(候选:量化核的发起开销/小 m 效率/图外每步量化,见 P0.1 的逐核账) |
+| **P0.2** | **W4A8 A/B** ✅ **已完成(2026-10-19 两次独立运行,合并前后各一次,逐点吻合)**:TP2 下 **prefill +45.7%**(1430–1511 → 2017–2203 t/s)、**TTFT@8k −31%**(5502 → 3765 ms)、**decode −12.4%**(44.0–44.9 → 38.3–39.6)| 配置级(`[model] quant = "w4a8"`);数据本地原始数据(未入库)(base/a8 + merge-rerun)| ✅ **比 AR 大得多的 prefill 杠杆**(M2 ≥1620 直接跨过,M3 1750 也已过);⚠️ **decode 退化 12.4% 是 TP2 特有**(单卡实测"decode 不变")⇒ **待排查**(候选:量化核的发起开销/小 m 效率/图外每步量化,见 P0.1 的逐核账) |
 | **P0.3** | **host 尾巴 2.1ms 定谳**:`[probes] step_profile = true` + 在 `phases.rs` 的采样收口段加临时计时(记了要拆)| 每步 `fill+launch` vs 尾巴的分布 | 上限 **decode +10%** |
 
 #### P0.0 详案:RankDev × 主线骶架对账(2026-10-19 立案;干跑已做)
@@ -141,7 +141,7 @@ BAR1 详查 + `test_device_bdf`;注意 git 会把我方函数的闭合括号当*
   max 归约可交换、`cvt.rni.sat.s8` 逐元素 ⇒ 门 `quant_int8_row_probe` 3/3 逐元素一致):
   **6.45 → 2.73 µs/次**(-58%),每步 2228 → 951 µs ⇒ 设备 Σ 22027 → **20779 µs**;
 - 端到端(同条件对照,均带别的会话 vLLM 干扰):`base 1475.5/44.30` vs `a8-v2 **2155.9/41.38**`
-  ⇒ **prefill +46.1% / decode −6.6%**(原 −12.4%)。数据 `docs/bench/data/owl-w4a8-2026-10-19/quant-kernel-v2/`;
+  ⇒ **prefill +46.1% / decode −6.6%**(原 −12.4%)。数据本地原始数据(未入库);
 - ⚠️ **W4A8 在 m=1 的 marlin 无收益**(35.48 vs 34.84 µs/次,基础事实)⇒ decode 的**天花板 = base**;
   剩余 −6.6% = quant 950 µs(76%) + marlin +189 + AR +79 ⇒ 再压只能靠"消核"(融合 norm/silu,
   预计再拿 ~+1.8%,边际递减;或按负载选档 —— `[model] quant` 已是零成本开关)。
@@ -669,7 +669,7 @@ Classic 岛写读者),并**剔掉**本档用不到的 Classic 主池/fp8-Knhd �
 
 | 项 | 值 |
 |---|---|
-| worktree | `packages/owl-worktrees/w4a8-p1`(分支 `feat/w4a8-p1`)|
+| worktree | `工作树 w4a8-p1`(分支 `feat/w4a8-p1`)|
 | 主干 | `main` = `c41b308`(**= 本分支头;前轮 P0.4/P0.5/P1.1-a/P2.1 已合主干**)|
 | 工作区 | **本轮 P1.1 第二步 16 文件未提交**(`models`:module/linear/shard/model;`shared`:config;`engine`:loader/graph_fleet/running/engine/exec×4/`tests/tp_g8_gate`;`apps/server`:config/main)+ **新门 1 个未跟踪**(`tests/tp_vocab_split_gate.rs`)—— 已全门验证 + std 实测 + 27B 对拍 |
 | ⚠️ 别的会话 | 本机**3090 对(ord 0/1)**被占(别的 agent 在跑 server)—— 双 3080(ord **2/3**)= 本线基准对 |
@@ -734,7 +734,7 @@ Classic 岛写读者),并**剔掉**本档用不到的 Classic 主池/fp8-Knhd �
 ### 11.4 复现/验证清单(命令级)
 
 ```bash
-cd packages/owl-worktrees/w4a8-p1
+cd <worktree>/w4a8-p1
 # ① 全量编译(含测试目标!)+ 三门
 cargo check --workspace --all-targets
 cargo test -p owl-kernels --lib --all-features   # 92
@@ -771,7 +771,7 @@ python3 tools/nsys_decode_account.py <tag> [...]
 
 **已完成**:① P0.4 对账(merge main → 分支 = `20cd14a`,0 冲突;11 门全绿);② **P0.5 fp8 载荷路治理**
 (prefill **+3.9%** 五点一致;三个真 bug:逐字节粒度 / 对称律从未成立 / 奇数 n 未对齐 + shuffle 发散;
-新判据 = `ar_transport_gate` 的 **G1b f8 腿**)。详见实录卷 **§61**;std 数据 `docs/bench/data/owl-tp-2026-10-19-p04/`。
+新判据 = `ar_transport_gate` 的 **G1b f8 腿**)。详见实录卷 **§61**;std 数据本地原始数据(未入库)。
 
 **下一刀不变**:**v1 两核融合**(§11.2 的细案)—— 但**有一条新情报**:
 fp8 路的 stage/reduce 现在都是 16 B 粒度,而 §59.1 的"单核 11.13µs"是在 **f16** 档量的;

@@ -1,6 +1,6 @@
 # testdata —— 测试资产与"快速测试系统"索引
 
-> **规范**:`docs/dev/testing.md`(测试工作流 v2) · **设计**:`docs/arch/owl-test-macro.md`
+> **规范**:`docs/devlog/dev/testing.md`(测试工作流 v2) · **设计**:`docs/devlog/perf/test-macro.md`
 > **一句话**:用例只写被测逻辑;配置/资源/设备**按约定自动解析**,不读 env、不抄配置、不互相污染。
 
 ## 1. 测试配置从哪来(层链 + 自动解析)

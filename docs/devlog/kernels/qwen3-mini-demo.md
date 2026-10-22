@@ -1,7 +1,7 @@
 # Qwen3.5-0.8B mini-demo —— 层与算子实施清单
 
 > 2026-09-25 立项。目标:在 owl 新架构(models 声明式 layers + owl-cpu/owl-cuda
-> 双后端)上跑通 `models/Qwen/Qwen3.5-0.8B` 文本主干 decode。
+> 双后端)上跑通 `/path/to/models/Qwen/Qwen3.5-0.8B` 文本主干 decode。
 > 上游:`async-runtime.md`(四层架构)、`charter.md`(公理);
 > 施工现场:`crates/models/src/layers/`(试水批已落)。
 > **策略:小步迁移(2026-09-25 用户裁决)—— 每层带对拍落地,禁止一把梭。**
@@ -267,7 +267,7 @@ model.norm [1024]                                    ×1(终局 norm)
 | 2026-09-25 | 立项:结构盘点(488 张量反推)+ 试水批落地(linear/rmsnorm/mlp/embedding/rope + Mul 算子),`tests/layers.rs` 5/5 绿 |
 | 2026-09-25 | 垫子层:`models::kernels` 注册表(owl-kernels cu/ → 登记 → layers 按名组合);kernel 源零内嵌;owl-kernels cudarc feature 化 |
 | 2026-09-26 | **HF parity 管道落地**(crates/models:pyproject uv 项目 + src/layers/<层名>.py(就近)(common.py 复用框架)+ tests/{common/mod.rs,parity_hf.rs} 测试套件;进程边界 safetensors 交换,OWL_HF_PARITY=1 门控);首战即修文档语义:Qwen3.5 全系 norm = 零中心 ×(1+w)(含主干),"主干 ×w"作废;顺带发现 Qwen3_5RMSNormGated = M-c gdn norm 的 HF 参照 |
-| 2026-09-26 | M-b attention 层落地(narrow/naive-attn/sigmoid);四雷回溯(u32 错位/槽序/Block len/matmul 多行 k);src 重组(12 碎文件→9,client/types/shape/error→contract.rs,plan/actions→ops.rs,module/loader→module.rs,interpreter 拆 reference.rs);API 稳定化快速批:C1/C2/C3/C6/C8/C12/C13 落地(详见 roadmap.local/api-stabilize-plan.md) |
+| 2026-09-26 | M-b attention 层落地(narrow/naive-attn/sigmoid);四雷回溯(u32 错位/槽序/Block len/matmul 多行 k);src 重组(12 碎文件→9,client/types/shape/error→contract.rs,plan/actions→ops.rs,module/loader→module.rs,interpreter 拆 reference.rs);API 稳定化快速批:C1/C2/C3/C6/C8/C12/C13 落地(详见本地台账区) |
 | 2026-09-26 | **M-d2 批 8 Model 主干落地**:`src/specs/qwen35.rs`(specs/ 每档一文件;ModelSpec.hybrid_3to1 / qwen3_5_0_8b 真档预设 + Model 整模单树 C5 + 分组件 C10 装载)+ module.rs(PrefixedSource / Weight::layout_as / ForwardCtx kvs-gdns 序列 + model_decode)+ embedding tied 单源键双 Want(局部键 "w"→"weight",三处测试同步);fixture 四层 GPU 两步 vs host 1e-4 ✓;52/52;新律 §四 20/21/22 |
 
 | 2026-09-26 | **批 8 拆分**:model.rs(共有主干机制)与 specs/qwen35.rs(Qwen3.5 特有参数事实:0.8B 维度 + 3:1 层型表)分离;specs/mod.rs 立拆分律;新律 §四 23;53/53 + GPU 两步 ✓ |
@@ -280,5 +280,5 @@ model.norm [1024]                                    ×1(终局 norm)
   new_with_prefix 前缀装载 = C10 原型;forward_inner 主干循环 = C5 原型;
   mamba_cache/KV per-layer 分派 = ForwardCtx 序列派生原型)——
   本 crate layers/* 与 kernels(cu/)均自此移植;
-- 旁证:`packages/xinfer/crates/core/src/models`(qwen3_5.rs 同构实现,
+- 旁证:`xinfer`(外部存档)(qwen3_5.rs 同构实现,
   candle 命令式;结构对照用,勿引代码)

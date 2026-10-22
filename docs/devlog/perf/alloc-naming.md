@@ -409,7 +409,7 @@ kernels 侧 probe 手册里早就是这个写法)。
 
 - **已证非本特性引入**:`git stash` 到干净的 `d380d21` 重跑同一条 → 同样红
   (也说明与本轮 slab_hint/cuda/server 改动无关);
-- 现场:`OWL_DFLASH2_DIR=models/syvai/Qwen3.8-27B-DFlash2-W4A16`(ct 格式
+- 现场:`OWL_DFLASH2_DIR=/path/to/models/syvai/Qwen3.8-27B-DFlash2-W4A16`(ct 格式
   `weight_packed`/`weight_scale`/`weight_shape`,153 键),装载走
   **设备重排臂**(日志 `[draft-mem] U32/DeviceRearrange { op: CtRepack, … }`);
   参考侧 = `W4A16Source::dequant_linear("fc")`(host 解量化 `weight_packed`)。

@@ -2,11 +2,11 @@
 
 > ⚠️ **2026-10-21 存证说明**:本卷引用的 `profiles/legacy/*` 已随「配置档全字段显式」裁决删除;数字与命令保持原样(当时现场),复跑请用 `profiles/` 下同名生产档。
 
-> 工作树：`packages/owl-worktrees/perf-review`，基线 `main@23116c7`（rebase 后）。
+> 工作树：`工作树 perf-review`，基线 `main@23116c7`（rebase 后）。
 > 模型：`Qwen3.8-27B-Q4_K_M.gguf`（18.96 GB，Q4_K 193 / Q8_0 288 / Q6_K 17 / F32 353）。
 > 卡：单张 RTX 3090 Ti（42:00.0；基线 NSYS 在 41:00.0，同型号）。
 > 档：`profiles/legacy/gguf27b-262k.toml`（KVMem on，f16 池 32768 tok，host 17408 MiB）。
-> 采样：greedy，`--ignore-eos`，固定 prompt seed；客户端 = `packages/llm_speedtest`。
+> 采样：greedy，`--ignore-eos`，固定 prompt seed；客户端 = `llm_speedtest`(外部存档)。
 
 ## 一、结论（先看这五条）
 
@@ -152,7 +152,7 @@ OWL_TEST_DEVICE=41:00.0 cargo test -p owl-models --release \
   --set runtime.bind=127.0.0.1:8141 \
   --set runtime.device.bdf=42:00.0 --log-level info
 
-cd packages/llm_speedtest && uv run cli \
+cd <llm_speedtest> && uv run cli \
   --api-url http://127.0.0.1:8141/v1/chat/completions \
   --model Qwen3.8-27B-Q4_K_M --lengths 16384 --rounds 1 \
   --output-length 256 --ignore-eos --temperature 0 --top-p 1 \

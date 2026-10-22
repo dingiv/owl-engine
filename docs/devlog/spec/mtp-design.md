@@ -172,7 +172,7 @@ W4A16 权重可再省 600MB(二期;先 f16 简单正确)。
 
 ## 九、M2b 源码定谳与管线修订(2026-10-06,vLLM 源码级对证后增补)
 
-> 对证源:`packages/vllm` `vllm/v1/spec_decode/llm_base_proposer.py`
+> 对证源:`vllm`(外部存档) `vllm/v1/spec_decode/llm_base_proposer.py`
 > `set_inputs_first_pass`(EAGLE/MTP 共用轮结构)+ `qwen3_next_mtp.py`
 > (模块同构互证)。本节取代 §四 中与本文冲突的记号。
 

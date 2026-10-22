@@ -25,4 +25,4 @@ max_seq = 2048
 
 - **存在才加载**；删除文件 = 还原；**不会影响任何兄弟用例**（天然隔离）；
 - 集成测试（`crates/*/tests/*.rs`）无 `/src/` 段 ⇒ 没有 overlay；
-- 本目录**不进版本**（本地临时档）；规范见 `docs/dev/testing.md`。
+- 本目录**不进版本**（本地临时档）；规范见 `docs/devlog/dev/testing.md`。

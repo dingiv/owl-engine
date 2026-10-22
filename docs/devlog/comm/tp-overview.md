@@ -202,9 +202,9 @@ SHM 兜底 6-12GB/s。
 ## 出处
 
 - 本机 vLLM/llama/exl3/mistral 读数:`vllm.md`、`qwen38-single-3090.md`、
-  `nex-3080对-三引擎会战.md`、`docs/exllamav3/*`、`docs/llama.cpp/p2p-allreduce-后端-施工文档.md`
-- 驱动/链接现实与 192MB 墙:`docs/llama.cpp/v3基线不通-立案排查.md` §十、`vmm-p2p-3080会战-测试报告.md`、
-  `docs/llama.cpp/3080-p2p驱动攻坚-setAccess205-定位实录.md`、`p2p-build/README.md`
-- 本机逐核归因(胶水 36%):`roadmap.local/代差分析与演进路线.md`(2026-10-01)
-- GDN/27B 结构:`models/cyankiwi/Qwen3.8-27B-AWQ-INT4/config.json`
+  `nex-3080对-三引擎会战.md`、外部存档:exllamav3 卷宗、外部存档:llama.cpp《p2p-allreduce-后端-施工文档》
+- 驱动/链接现实与 192MB 墙:外部存档:llama.cpp《v3基线不通-立案排查》§十、`vmm-p2p-3080会战-测试报告.md`、
+  外部存档:llama.cpp《3080-p2p驱动攻坚-setAccess205-定位实录》、外部存档:驱动补丁仓
+- 本机逐核归因(胶水 36%):本地台账《代差分析与演进路线》(2026-10-01)
+- GDN/27B 结构:`/path/to/models/cyankiwi/Qwen3.8-27B-AWQ-INT4/config.json`
 - 公理侧:`charter.md` §二 A2;骨架:`crates/backends/comm/src/lib.rs`

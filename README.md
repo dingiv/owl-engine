@@ -47,7 +47,7 @@ W4A16 safetensors / GGUF checkpoints; ships graph replay, TP=2, speculative deco
 - **Diagnostics**: unified logging (level + tag filtering + tee to file), in-memory
   metrics (printed only on query), probe families (`[probes]`: booleans gate
   *collection*, logging gates *visibility*) —
-  [`docs/devlog/infra/log-framework.md`](docs/devlog/infra/log-framework.md)
+  [`docs/devlog/perf/log-framework.md`](docs/devlog/perf/log-framework.md)
 
 ## 3. Requirements
 
@@ -160,9 +160,9 @@ testdata/    Reproducible fixtures (weights and large data are not committed)
 | [`docs/README.md`](docs/README.md) | **Index** (English nav) + per-document review status |
 | [`docs/devlog/canon/charter.md`](docs/devlog/canon/charter.md) | **Charter**: axioms, boundaries, ownership, borrowed materials |
 | [`docs/devlog/dev/`](docs/devlog/dev/) | Required for contributors: config / testing / debugging / profiling / fixtures |
-| [`docs/devlog/`](docs/devlog/) | Design volumes + construction post-mortems, grouped by theme (79 files, incl. retractions) |
-| [`docs/devlog/bench/`](docs/devlog/bench/) | Cross-engine battles and tuning reports |
-| [`docs/devlog/kernels/`](docs/devlog/kernels/) | Model-specific volumes (27B operator inventory; long-context studies live in the external archive) |
+| [`docs/devlog/`](docs/devlog/) | Design volumes + construction post-mortems, grouped by theme (81 files, incl. retractions) |
+| [`docs/devlog/perf/`](docs/devlog/perf/) | Performance & engineering: framework, optimization candidates, device/pitfall ledgers, bench reports |
+| [`docs/devlog/kernels/`](docs/devlog/kernels/) | Operator kernels: admission gates, contract, quantization families, operator inventory |
 
 > Body documents are in **Chinese** — they are the project's design log.
 > Meta documents (this README, `CONTRIBUTING`, `SECURITY`, `docs/README.md`,

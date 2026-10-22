@@ -799,7 +799,7 @@ OWL_TP_TEST_DEV_A=0 OWL_TP_TEST_DEV_B=1 OWL_0_8B_DIR=<…/Qwen3.5-0.8B> \
 
 ### 20.0 你的位置
 
-- worktree:`packages/owl-worktrees/w4a8-p1`(分支 `feat/w4a8-p1`);**当前 28 文件改动未提交**
+- worktree:`工作树 w4a8-p1`(分支 `feat/w4a8-p1`);**当前 28 文件改动未提交**
   (含 `crates/engine/src/tp.rs`、`crates/engine/tests/tp_{assemble,g8}_gate.rs` 三个新文件);
   提交须等用户点头(工作区纪律)。
 - 真机:TP 门用 **3080 对 = CUDA ordinal 2/3**;`OWL_0_8B_DIR=<…/Qwen/Qwen3.5-0.8B>`
@@ -1405,7 +1405,7 @@ AR 核 = 单 block 256 线程;载荷 5.24MB 时有效带宽仅 ~400MB/s,对 P2P 
 - **prefill 236 → 1353 = 5.73×**;TP2 从 **0.244×** TP1 翻到 **1.396×**。
 - **decode 38.65 → 43.55(+12.7%)**;TP2/TP1 = **1.363×**。
 - TTFT 三点**全点反超 TP1**(312KB 级 AR 载荷落在 couldn't-be-better 区)。
-- 数据:`docs/bench/data/owl-tp-2026-10-17/tp{1,2}-arfix-std.{csv,json}`(gitignored 本地档)。
+- 数据:本地原始数据(未入库)(gitignored 本地档)。
 
 ### 25.7 剩余杠杆(与 2000 t/s 的距离;本节是下一刀的入口)
 
@@ -1422,7 +1422,7 @@ AR 核 = 单 block 256 线程;载荷 5.24MB 时有效带宽仅 ~400MB/s,对 P2P 
      (`state.rs::peer_import`:"只授本端设备 R")⇒ 经它写对端 staging 当场
      `CUDA_ERROR_ILLEGAL_ADDRESS`(基准 `OWL_ARB_PUSH=1` 探针 0.9s 内响亮失败)。
      ⇒ 要评估 push **必须先落"可写对端映射"(RW import)**,而该面正是
-     **3080 类 `cuMemSetAccess` 老雷区**(见 `docs/llama.cpp/3080-p2p驱动攻坚-setAccess205-定位实录.md`)。
+     **3080 类 `cuMemSetAccess` 老雷区**(见外部存档:llama.cpp《3080-p2p驱动攻坚-setAccess205-定位实录》)。
    - 预期收益:远程**写**是 posted、远程**读**要往返 ⇒ 若写侧能到 13.2GB/s,
      AR 税 ≈ 100µs/token ⇒ prefill ~1600 t/s(仍需重叠才够 2000)。
 2. **重叠(结构性)**:AR 在关键路径上(GEMM → AR → 下一层 GEMM)。链路的唯一
@@ -1516,7 +1516,7 @@ AR 核 = 单 block 256 线程;载荷 5.24MB 时有效带宽仅 ~400MB/s,对 P2P 
 ### 26.3 参照实现侦察:两条路的写法(源码在树,逐条核对)
 
 **vLLM `csrc/custom_all_reduce.cuh` + `custom_collective_common.cuh`**(本工作区
-`packages/vllm`;SGLang 有同源分支):
+`vllm`(外部存档);SGLang 有同源分支):
 
 | 设计点 | vLLM 做法 | owl 现状 | 判定 |
 |---|---|---|---|
@@ -1608,7 +1608,7 @@ Cargo.toml 里已写明理由)。⇒ **通信的尺子与门都住在通信包�
   ⚠️ 依赖方向:`owl-cuda` 依赖 `owl-comm` ⇒ 若要在 `owl-comm/tests` 里直接起
   2 rank,需要 `owl-comm` 的 **dev-dependency 回指 `owl-cuda`**(Cargo 允许
   dev 环),或把真机套件放在 `owl-cuda/tests/` 并在命名上归口(取一,别两套)。
-  **本节的读数快照先落在 `docs/bench/data/owl-ar-audit-2026-10-17/`。**
+  **本节的读数快照先落在本地原始数据(未入库)。**
 
 ---
 
@@ -2229,7 +2229,7 @@ M1 多流能捕获(两条独立链都在图里)· **M2 join 保序**(第三条�
 NCCL 464.0µs ≈ `C2`(纯搬运极限 465.7µs)⇒ **它的协议开销 ≈ 0**,原因就是
 **world=2 恒 1-stage**。
 
-**参照(源码核实)**:`packages/vllm/csrc/custom_all_reduce.cuh`
+**参照(源码核实)**:`vllm`(外部存档)
 ```cuda
 if (world_size_ == 2) { KL(ngpus, cross_device_reduce_1stage); }
 // 核体:result[idx] = packed_reduce((const P**)&dp.ptrs[0], idx);
@@ -2408,7 +2408,7 @@ vs v1 的 21.93 —— 归约路径不同,属预期)。
 
 **push 协议的前置 = "可写对端映射"**:`peer_import` 现在授 `PROT_READ`,要写必须授
 `PROT_READWRITE`。`tools/vmm-peer-probe.cu` 已写好该臂(`VMMPROBE_RW=1`),**默认不开** ——
-它是 3080 `cuMemSetAccess` 老雷区的邻居(`docs/llama.cpp/3080-p2p驱动攻坚-setAccess205...`),
+它是 3080 `cuMemSetAccess` 老雷区的邻居(外部存档:llama.cpp《3080-p2p驱动攻坚-setAccess205-定位实录》),
 **跑之前必须确认没有别的 agent 占卡**(硬重置会殃及)。
 判据:①RW 授予成功与否(响亮读错误码);②VMM 写向双向带宽是否仍达 12GB/s 量级。
 若成立 ⇒ push 协议(融合核换指针对绑 + 对称槽,§25.7 第 1 条)的期望收益:
@@ -4008,7 +4008,7 @@ TP2 = 651.1 − 57.0 = 594.1 µs/token ⇒ 1683 t/s ⇒ **1.74×**(vs TP1 = 966.
 ### 54. ★★★★★ 逐点对表:**vLLM 的 AR 与我们到底差在哪**(2026-10-19;用户要求读源码)
 
 **用户口径**:"去看 vLLM 的源代码,特别是一些细节的地方,它做的很不一样的地方 —— 它到底差在什么地方?"
-本节是**源码级**对表(`packages/vllm` @ `e20bccc642`),并给出每条的**我方实测代价**。
+本节是**源码级**对表(`vllm`(外部存档) @ `e20bccc642`),并给出每条的**我方实测代价**。
 
 #### 54.1 一次 allreduce 的**结构**(这是最大的一条)
 
@@ -4301,7 +4301,7 @@ TP2 每卡流量只有 TP1 的 **0.576×**(见 §58.3 的 lm_head),decode 却只
 
 #### 58.3 权重字节账(为什么"每卡该减半"只减到 0.576×)
 
-`models/cyankiwi/Qwen3.8-27B-AWQ-INT4`(64 层;hidden 5120;inter 17408;vocab 248320;48 线性注意力 + 16 全注意力):
+`/path/to/models/cyankiwi/Qwen3.8-27B-AWQ-INT4`(64 层;hidden 5120;inter 17408;vocab 248320;48 线性注意力 + 16 全注意力):
 
 | 组 | 字节 | TP2 切法 |
 |---|---:|---|
@@ -4528,7 +4528,7 @@ TP2 步 = **11.47**(减半的 marlin) + **8.8ms 完全不缩的固定项**(31%) 
 
 ⚠️ **本卷已入库**(2026-10-19 起:`tp2-log.md`,与施工设计/路线图同行)—— 逐刀细账、
 被推翻的中间结论、纪律沉淀都在本文件;入库面 = 本卷 + `tp2-design.md`(§0–§9 + §10)
-+ `tp2-roadmap.md`(执行面);`roadmap.local/` 仍作本地草稿区。
++ `tp2-roadmap.md`(执行面);本地台账区仍作草稿区。
 
 ---
 

@@ -86,7 +86,7 @@ SPEC_DEC=1 / 其余 0。**编译只需补 `--expt-relaxed-constexpr`**(实测 12
 "生产基线"做选型会把结论方向搞反(**§14.1 教训**)。
 XQA prefill 因此只作 **FI 缺口交接臂**(`dispatch.xqa_prefill`,缺省关;
 t<128 处 9.4× 于回落核),命令与全部证据见
-`docs/arch/prefill-graph-施工.md` **§14**。
+`docs/devlog/perf/session-2026-10-14.md` §1.1/§1.2。
 
 ### ⚠️ KV-split 的 semaphores 数组必须按 `gridDim.y × batch` 分配
 

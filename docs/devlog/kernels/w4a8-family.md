@@ -3,7 +3,7 @@
 > **标的**:激活 int8 × 权重 int4,走 **int8 张量核(IMMA mma.s8s8s32)**。
 > **一句话**:W4A8 = **同一份 int4 checkpoint 原地跑 + 运行时 per-token int8 激活**
 > ⇒ 权重侧零改动(与现有 kU4/kU4B8 布局逐字节一致),唯一新增件 = "激活在线量化核" + 一处装载期契约处理。
-> **本文定位**:设计/施工的**权威面**。工作日志与逐轮实测记在 `roadmap.local/W4A8-算子家族-立项调研.md`。
+> **本文定位**:设计/施工的**权威面**。工作日志与逐轮实测记在本地台账《W4A8-算子家族-立项调研》。
 
 ---
 
@@ -27,7 +27,7 @@
 |---|---|---|
 | GA102 int8 张量核 | **160 TOPS = 2× fp16 半率墙**(等价:对 fp16-fp32acc 是 ~4× 算子率) | `优化候选总表` N4 判据 |
 | 本仓墙内占比 | GEMM **290/385 ms = 71%**,且是纯 fp32-acc fp16 张量核 ⇒ 只有"换算术"动得了 | 同上 |
-| 权威实测 | HyperQwen `docs/optimizations.md` #10:int8 prefill **+27-30%**、#4:40-64 并发 decode 也是 fp16 张量核墙(~63 TFLOPS @250W) | `repos/HyperQwen` |
+| 权威实测 | HyperQwen `docs/optimizations.md` #10:int8 prefill **+27-30%**、#4:40-64 并发 decode 也是 fp16 张量核墙(~63 TFLOPS @250W) | `HyperQwen`(外部存档) |
 | 精度先例 | s32 整型累加、epilogue 才转 float ⇒ 比 fp16-acc 更精确;per-token 动态量化(无校准) | 上游 vLLM + HyperQwen |
 
 **推论(设计边界)**:①只做 prefill ②MoE(`marlin_moe_wna16` 的 s8 变体)是**第二波** ③激活量化本身有开销 ⇒
@@ -37,7 +37,7 @@
 
 ## 2. 权威参考与可复用资产
 
-### 2.1 权威 = HyperQwen(`repos/HyperQwen`,syv-ai,vLLM 0.30 补丁系)
+### 2.1 权威 = HyperQwen(`HyperQwen`(外部存档),syv-ai,vLLM 0.30 补丁系)
 
 它已有**生产级** W4A8:`VLLM_MARLIN_INPUT_DTYPE=int8`。三份补丁(**本仓照抄对象**):
 
@@ -47,14 +47,14 @@
 | `marlin-int8-asym-zp` | int8 激活路同时收 `kU4`(AWQ 零偏)与 `kU4B8`;**kS8×kU4 核本就编好,只是两句 assert 拒收** | 与本仓现状**逐字同型** |
 | `marlin-int8-layer-select` | 选层 env:`INCLUDE_RE=""`、**`EXCLUDE_RE="lm_head\|mtp"`(默认)** | 本仓对应:排除 int4 头 / MTP / 草稿层 |
 
-### 2.2 上游 vLLM(`packages/vllm`)
+### 2.2 上游 vLLM(`vllm`(外部存档))
 
 kS8 预实例化核已生成(**dense 4 个 dtype 组合 + MoE 4 个**),`thread_m_blocks [1..4]` × `group_blocks [-1,2,4,8]`
 (g128 ⇒ `group_blocks=8`)**已覆盖本仓 checkpoint**。
 
 ### 2.3 ⚠️ 参考可信度
 
-`packages/xinfer` 的 W4A8 前作(P4 预研 / P4-K / P4-T2)**仅作线索**:其 s8 GEMM 数值对拍
+`xinfer`(外部存档) 的 W4A8 前作(P4 预研 / P4-K / P4-T2)**仅作线索**:其 s8 GEMM 数值对拍
 `mean_rel=inf` 未解,且修法方向(自制 scale 归一)与权威结论(折号 + int16 requant)不同。
 **本仓一律以 HyperQwen + 上游 vLLM 源码为准**,不复刻 xinfer。
 
@@ -148,8 +148,8 @@ kS8 预实例化核已生成(**dense 4 个 dtype 组合 + MoE 4 个**),`thread_m
 | 资产 | 布局 | zero_point | group | scale 负值 | 折号需要? | 对应 kernel 臂 |
 |---|---|---|---|---|---|---|
 | `crates/models/assets/Qwen3.5-0.8B-W4A16`(**S1 标的**) | `weight_packed`(I32)+`weight_scale`+`weight_shape` | 无(对称) | **128**(行内组数 8/16/28) | **0 / 3 887 616** | ❌ 不需要 | kS8 × **kU4B8** |
-| `models/cyankiwi/Qwen3.8-27B-AWQ-INT4`(**生产**) | 同上 + **`weight_zero_point`** | **有(非对称)** | 128 | **0 / 393 871 360** | ❌ 不需要(条件 `not zero_points` 直接排除) | kS8 × **kU4** |
-| `models/syvai/Qwen3.8-27B-DFlash2-W4A16`(草稿) | `weight_packed`+`weight_scale` | 无(对称) | 128 | **0 / 13 516 800** | ❌ 不需要 | kS8 × **kU4B8** |
+| `/path/to/models/cyankiwi/Qwen3.8-27B-AWQ-INT4`(**生产**) | 同上 + **`weight_zero_point`** | **有(非对称)** | 128 | **0 / 393 871 360** | ❌ 不需要(条件 `not zero_points` 直接排除) | kS8 × **kU4** |
+| `/path/to/models/syvai/Qwen3.8-27B-DFlash2-W4A16`(草稿) | `weight_packed`+`weight_scale` | 无(对称) | 128 | **0 / 13 516 800** | ❌ 不需要 | kS8 × **kU4B8** |
 
 **结论(改动关键路径)**
 1. **折号(§5.2)从"必需"降为"健壮性件"**:本仓三档 checkpoint 负 scale 全为 0 ⇒ 第一波**不需要折号**即可
@@ -165,7 +165,7 @@ kS8 预实例化核已生成(**dense 4 个 dtype 组合 + MoE 4 个**),`thread_m
 
 ---
 
-## 9. 语义定谳(A 步):scale 形态与归属(2026-10-16;权威源码 = `packages/vllm`)
+## 9. 语义定谳(A 步):scale 形态与归属(2026-10-16;权威源码 = `vllm`(外部存档))
 
 **W4A8 入口在本仓早已备好**(与 §4 的差距表一致,但更细):
 
@@ -212,7 +212,7 @@ def marlin_act_int8_process_scales(s):
 
 | 面 | 本仓现状 | 上游权威 | 缺口 |
 |---|---|---|---|
-| 实例化核 | `vllm_marlin/` 四件:`f16_u4`(AWQ)、`f16_u4b8`(GPTQ)、`bf16_u4b8`、**`s8_u4b8`** | `packages/vllm/csrc/libtorch_stable/quantization/marlin/` 有 **`sm80_kernel_s8_u4_float16.cu`** 与 **`..._s8_u4_bfloat16.cu`** | **① 拷入两件 + `build.rs` 编译** |
+| 实例化核 | `vllm_marlin/` 四件:`f16_u4`(AWQ)、`f16_u4b8`(GPTQ)、`bf16_u4b8`、**`s8_u4b8`** | `vllm`(外部存档) 有 **`sm80_kernel_s8_u4_float16.cu`** 与 **`..._s8_u4_bfloat16.cu`** | **① 拷入两件 + `build.rs` 编译** |
 | selector | 96 个 `kS8` 臂**全是 kU4B8**;60 个裸 `kU4` 臂全是 f16/bf16 激活 | 上游 `kernel_selector.h` 含 `kS8 × kU4` 块 | **② 把上游该块并进来**(本仓 selector 是裁剪版) |
 | host | `marlin_gemm_v2_awq_ffi` 硬编 `a_is_s8=false`、无 `a_scales` 形参 | `marlin_mm` 本体已支持 `a_is_s8` + `use_zp` 共存 | **③ 新增 `marlin_gemm_v2_awq_w4a8_ffi`**(照 `marlin_gemm_v2_w4a8_ffi` 的 c_tmp 自管写法) |
 | Rust 面 | repack 的 int8 路 scale 置换**已 port**;但无 W4A8 声明/路由 | — | **④ 声明表 + 路由**(L3 槽:`a_scales` fp32[M,1] + A=int8) |

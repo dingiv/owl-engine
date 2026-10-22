@@ -1,11 +1,11 @@
 # prefill CUDA Graph —— 设计与实现方案(2026-10-15 立项设计;首轮)
 
 > 定位:本文件是 **prefill 图**的**设计**文档(不含施工记录)。设计输入有三份,均已入档:
-> ① 分支 `feat/prefill-graph` 的实测台账(`packages/worktrees/owl/prefill-graph/docs/arch/prefill-graph-施工.md`,
+> ① 分支 `feat/prefill-graph` 的实测台账(`工作树 prefill-graph(旧位置)/docs/arch/prefill-graph-施工.md`,
 >    850 行,S0–S1.5-b + §12 设备侧定谳 + §13/§14/§15 真收益/判死);
 > ② 本仓**现役**图机制(`crates/engine/src/graph_plan.rs` 5 处在用 + `crates/backends/cuda/src/state.rs` 捕获面);
 > ③ 本轮新取的两把核尺子(`crates/kernels/tests/{fi,xqa}_prefill_probe.rs`)与已落的 `ChunkTables` / FI plan 硬门。
-> ④ **参考实现**(2026-10-15 二轮指定)= `packages/worktrees/owl/prefill-graph`(分支
+> ④ **参考实现**(2026-10-15 二轮指定)= `工作树 prefill-graph(旧位置)`(分支
 >    `feat/prefill-graph` @ `dc7027e`,54 个未提交文件;S1/S1.5 已把**整模图跑成 `Captured`**,
 >    `prefill_plan.rs` 214 行 = 槽面 + 根 concat 的现成骨架,`slab_hint.rs` 的 `SlabArena`
 >    + 影子探针 = M1 的现成实现)。本设计**参考**它,但二轮把它的前提逐条按源码复核过。
@@ -397,7 +397,7 @@ arena"。**输入/输出槽不参与归还**;`Carved` 的捕获后 free 仍是 n
 **为什么单列**:G2 捕获窗白名单只管 client 来的 `Command`(Htod/Dtoh/Sync 拒),
 而家族 `run()` 在同一 actor 线程里**直接调 `DeviceRes`** ⇒ **白名单对它无效**。
 旧口径是"家族 grave 律"(代码原话:"捕获窗内由家族 grave 律保证不再分配")= **靠自律**。
-实测定谳(`roadmap.local/代差分析与演进路线.md:222`,2026-10-03 深夜):cuBLAS gemv
+实测定谳(本地台账区,2026-10-03 深夜):cuBLAS gemv
 splitK 在捕获流上内部 `malloc` ⇒ 图里烙下 **192 对 `MEM_ALLOC/MEM_FREE`(3088B)** 节点
 (回放期重分配 + 派发税);修法 = `cublasSetWorkspace` **预绑进程级驻留工作区**。
 

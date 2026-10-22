@@ -1,6 +1,6 @@
 # HyperQwen 对标调研 —— 单 24G 卡 Qwen3.8-27B 服务的可摘清单
 
-> 2026-10-10。对象:`repos/HyperQwen`(syv-ai,Apache-2.0)= vLLM 0.30.0 +
+> 2026-10-10。对象:`HyperQwen`(外部存档)(syv-ai,Apache-2.0)= vLLM 0.30.0 +
 > ~50 补丁系列 + 模型准备管线,单 RTX 3090(250W)服务 Qwen3.8-27B。
 > 作者与 syvai(Qwen3.8-27B-DFlash2-W4A16 草稿检查点来源)同源,
 > **fast-variant 模型在 Hub 公开**(`syvai/qwen3.8-27b-3090-fast-variant`)。
@@ -32,7 +32,7 @@ submit/emit 往返(引擎内轮账 43ms)。他们没有这层(V2 runner 直接�
 - 收益:decode server 口径 36.8 → ~100+(3×),**不动内核**。
 
 ### ② KVarN KV 压缩(ctx 战线主矛盾)
-华为 CSL,Apache-2.0,**参考实现就在 repos/HyperQwen/kvarn/files/**
+华为 CSL,Apache-2.0,**参考实现就在 HyperQwen(外部存档)/kvarn/files/**
 (Triton 核 + backend):Hadamard 旋转 + 迭代方差归一 + **4-bit K / 2-bit V,
 128-token tile**。他们的数:**240k ctx @ 单 3090**(E 档 268k 池 /
 245760 max_len,decode 代价 ~47%)。

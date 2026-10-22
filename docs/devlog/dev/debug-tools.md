@@ -1,6 +1,6 @@
 # 调试工具速查(owl server / engine)
 
-前提:服务已起(例:`cd packages/owl && ./target/release/server -p profiles/qwen38_27b-3090-w4a16-dflash.toml testdata/server/agent-27b.toml --log-level info`)。
+前提:服务已起(例:`./target/release/server -p profiles/qwen38_27b-3090-w4a16-dflash.toml testdata/server/agent-27b.toml --log-level info`)。
 下面例子默认端口 8137,按实际改。
 
 ## 1. 诊断端点(`GET`,全部只读)
@@ -91,7 +91,7 @@ python3 -c "import json;a={r['tag']:r for r in json.load(open('/tmp/a.json'))['r
 3. **可复现吗**:同二进制同序列复跑一遍(单次 ≠ 结论)。
 4. **卡被占了吗**:启动需要**全空卡**(27B 档 boot 瞬时峰值 ~23.9G/24.5G,占几百 MB 就会权重装载 OOM)。
 5. **要细节** ⇒ `/debug/log/level/info`;要分相 ⇒ metrics 差分;要逐核 ⇒ `profiling.md` 的 nsys。
-6. 记档:结论 + 原始产物路径(`/tmp/...` 会被清,关键产物拷到 `roadmap.local/artifacts/`)。
+6. 记档:结论 + 原始产物路径(`/tmp/...` 会被清,关键产物拷到本地台账区)。
 
 ## 6. 杀进程纪律(**反面教材**)
 
@@ -113,7 +113,7 @@ owl 的 `runtime.device` 是 **CUDA ordinal**(`cudaSetDevice` 的序),与 `nvidi
 nvidia-smi --query-gpu=index,name,pci.bus_id,memory.used --format=csv
 python3 - <<'PY'   # 打印 CUDA ordinal 序(与 owl 同序)
 import ctypes,glob
-rt=ctypes.CDLL(glob.glob('/path/to/packages/comfyui-test/.venv/lib/python3*/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12')[0])
+rt=ctypes.CDLL(glob.glob('/path/to/<venv>/lib/python3*/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12')[0])
 n=ctypes.c_int(); rt.cudaGetDeviceCount(ctypes.byref(n)); buf=ctypes.create_string_buffer(256)
 for i in range(n.value):
     rt.cudaDeviceGetPCIBusId(buf,256,i); print(f'CUDA ordinal {i}: {buf.value.decode()}')

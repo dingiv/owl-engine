@@ -1059,7 +1059,7 @@ Rust 侧以为"split 关 ⇒ ctx 与 plan 无关"⇒ 把 ctx 从键里抹成 0 �
 (`chunked knhd`),3.2× 是**回落臂的代价**,与"FI 进图"无关。
 修掉一行(`fi_cell` 不许乘 `pw_on`)后同参 A/B:整轮 GPU 时间 **−5.0%(对 ctx 平坦)**、
 发射税 10.9-12.0 → 0.2-0.3 ms、`reasoning_content` 三档 ctx **逐字节恒等**、
-971 轮 soak σ=0.11 ms。账:`perf-runs/2026-10-18-baseline/诊断-W4-verify单图-负收益-归因.md`。
+971 轮 soak σ=0.11 ms。账:本地实测档(未入库)。
 
 **三条律**:
 

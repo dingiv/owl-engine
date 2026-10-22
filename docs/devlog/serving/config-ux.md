@@ -11,7 +11,7 @@
 > 配置里写的是 30 个 bit + 30 行算子白名单"这件事，变成"意图 → 自动派生 → 可解释"。
 >
 > **证据来源**：2026-10-20 的 `awq27b-3090-max` 实战（见
-> `roadmap.local/26-10-20-awq27b-3090-max-flavor.md`）。本次为了做一个"单卡 3090
+> 本地台账《26-10-20-awq27b-3090-max-flavor》）。本次为了做一个"单卡 3090
 > W4A16 最大上下文 + 满速"的档，实际经历了 4 次改上下文重启、1 次白名单漂移、
 > 1 次尾块 OOM、1 次启动脚本临时 `extends` 拼档。这些不是引擎问题，是**配置面
 > 没有意图层**。
@@ -421,7 +421,7 @@ server --migrate-config old.toml --to profile > new.toml
 
 1. **先读**：本文；`config.md`；`crates/shared/src/config.rs` 顶部总表；
    `apps/server/src/config.rs`；`flavors/awq27b-3090-max.toml`；
-   `roadmap.local/26-10-20-awq27b-3090-max-flavor.md`（实战证据）。
+   本地台账《26-10-20-awq27b-3090-max-flavor》（实战证据）。
 2. **第一件事**：写 `intent.rs` + `resolve.rs` 的**纯函数**与单测（无 GPU），
    把 §5.2 表逐行落成断言；`context="max"` 用 §7 的校准表先给出 128k。
 3. **第二件事**：`--check` / `--print-config`（不需要权重；用 `model/config.json`

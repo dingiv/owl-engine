@@ -9,7 +9,7 @@
    上游 0.112/0.568/1.176/2.432/4.829 ms @ctx 512/2048/4096/8192/16384,
    旧 fork 0.152/0.798/1.657/3.405/6.816 ⇒ **1.36–1.41×**(f16 池 1.8×);
    引擎内 CUPTI 逐核注意力 **49.6 vs 63.0 ms(−21%)**。
-2. fork 的 **plan/split-kv 是坏的**(`docs/arch/prefill-graph-施工.md` §15.3
+2. fork 的 **plan/split-kv 是坏的**(`docs/devlog/perf/session-2026-10-14.md` §1.2
    单测复现 `max|FI−host|=1.39`),且它是一条**个人分支**;上游 plan 用
    **q 瓦片伪批**(本形状 `padded_batch_size=48` ⇒ 192 CTA)把单请求铺满 SM。
 
@@ -27,5 +27,5 @@
 | `owl_fi_attention.cu` | owl adapter(换源记录见文件头注:plan 前置 `PrefillPlanWorkspaceSize` 尺寸校验 / `kv_dtype_bytes` / params 改逐字段赋值 / 模板加 `SAME_KV_STRIDES` / fp8 免宏) |
 | `bench/` | 候选核单测台架(不参与构建):`FI_SRC=$(cd .. && pwd) ./run.sh`(f16)/ `FP8=1 ...`(fp8 池) |
 
-**全案**:`docs/arch/prefill-attention-换核-候选单测.md`(§1 三候选数字表 /
+**全案**:`docs/devlog/kernels/prefill-attention-swap.md`(§1 三候选数字表 /
 §3 集成配方 / §6 落地与验收证据)。

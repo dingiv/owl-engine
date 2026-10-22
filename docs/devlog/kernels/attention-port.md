@@ -2,7 +2,7 @@
 
 > 版本:v0.1(2026-09-22)。裁决依据:graph-model-seam.md §五·3
 > (保留 attention-rs 裸 kernel,只 port kernel 不 port 运行时;
-> flashinfer 后续引入)。参照源:`packages/xinfer/vendor/attention.rs`
+> flashinfer 后续引入)。参照源:`xinfer`(外部存档)
 > (rev c0f19f2,冻结只读)。
 
 ## 一、资产盘点(实测)

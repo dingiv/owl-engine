@@ -1,15 +1,15 @@
 # MTP 长上下文抗衰减 —— 下一阶段施工与交接
 
 > 2026-10-21 · 交接文档
-> 工作树：`packages/owl-worktrees/mtp-spec`
+> 工作树：`工作树 mtp-spec`
 > 分支：`feat/mtp-spec` @ `9bb7414`
 > **Phase 0（Windowed-MTP）+ T1a/T1b v2（自适应 depth）已落地；本文接续未完成验证与 Phase 2。**
 >
 > 阅读顺序：
-> 1. `packages/owl/AGENTS.md`
+> 1. `AGENTS.md`
 > 2. `mtp-longctx-windowed.md`（总设计与 Phase 0 细节）
 > 3. 本文（任务板 / 施工卡 / 交接纪律）
-> 4. `perf-runs/mtp-longctx-2026-10-21/REPORT.md`（本地原始数据，未入库）
+> 4. 本地实测档(未入库)（本地原始数据，未入库）
 
 ---
 
@@ -167,7 +167,7 @@ cargo test -p owl-engine --features e2e --test engine_e2e
 
 ### 2.1 外部会话会击杀 GPU 进程
 
-本机存在另一个 `packages/owl-worktrees/gguf` 会话，其脚本在启动前执行：
+本机存在另一个 `工作树 gguf` 会话，其脚本在启动前执行：
 
 ```bash
 for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do
@@ -201,7 +201,7 @@ ss -ltnp | grep -E ':8140|:8141'
 ### 2.3 构建
 
 ```bash
-cd packages/owl-worktrees/mtp-spec
+cd <worktree>/mtp-spec
 GDN_TRITON_PY=/path/to/owl/crates/kernels/.venv/bin/python \
   cargo build --release -p server --features perf
 ```
@@ -258,14 +258,14 @@ GDN_TRITON_PY=/path/to/owl/crates/kernels/.venv/bin/python \
 
 # 64k MATH（2 轮；W=4032 已有基线）
 python3 tools/mtp_curve.py --url http://127.0.0.1:8141 \
-  --out perf-runs/mtp-longctx-2026-10-21/w6144 \
+  --out <out-dir>/w6144 \
   --length 65536 --rounds 2
 
 # 64k DOCS（1–2 轮；prompt-file 同 REPORT）
 python3 tools/mtp_curve.py --url http://127.0.0.1:8141 \
-  --out perf-runs/mtp-longctx-2026-10-21/w6144-docs \
+  --out <out-dir>/w6144-docs \
   --length 65536 --rounds 1 --domain prose \
-  --prompt-file perf-runs/mtp-longctx-2026-10-21/corpus-docs.txt
+  --prompt-file 本地实测档(未入库)/corpus-docs.txt
 
 # 再对 W=8192 重复
 ```
@@ -568,7 +568,7 @@ AWQ/GGUF MTP 头装载后统一 F16。
 ### 14.1 标准曲线
 
 - 单 3090 Ti，greedy（`temperature=0`, `top_p=1.0`），`ignore_eos`，256 tok，c=1。
-- MATH：随机数字词池；DOCS：`perf-runs/.../corpus-docs.txt`（真实长文本）。
+- MATH：随机数字词池；DOCS：本地实测档(未入库)（真实长文本）。
 - 每点 2 轮；64k 至少 1 轮 + 复跑一次。
 - 读 `usage.completion_tokens`，不要数 SSE chunk。
 - 采服务端 `/debug/metrics` 前后差分：
@@ -600,12 +600,12 @@ AWQ/GGUF MTP 头装载后统一 F16。
 
 ## 15. 交接清单（下一会话开始前）
 
-- [ ] 读 `packages/owl/AGENTS.md` + 设计文档 + 本文。
+- [ ] 读 `AGENTS.md` + 设计文档 + 本文。
 - [ ] `git status` 确认大量未提交改动是预期的；**不要 reset**。
 - [ ] `nvidia-smi` 查外部会话；优先 GPU2 `42:00.0`；端口避让 8140。
 - [ ] 构建 release（`GDN_TRITON_PY`）。
 - [x] 跑 T0：W=6144/8192 64k MATH/DOCS（4032 最优）。
-- [x] 把 T0 数据写入 `perf-runs/.../REPORT.md` 与设计文档 §4.13。
+- [x] 把 T0 数据写入本地实测档(未入库) 与设计文档 §4.13。
 - [x] T1b v2：两连低窗，DOCS 29.7k 68.91 / 16k 105.23。
 - [ ] 若 T0 确认 4032 最优，保持 profile；否则更新 profile 并重跑恒等门。
 - [ ] T1：先做静态 ctx 阈值（d7→d3），再考虑 EMA。
@@ -642,8 +642,8 @@ mtp-draft-kv-catchup.md
 mtp-confidence-cutoff.md
 mtp-longctx-windowed.md
 mtp-longctx-handoff.md
-perf-runs/mtp-longctx-2026-10-21/REPORT.md
-perf-runs/mtp-longctx-2026-10-21/{spec,spec-d7,nospec,spec-docs,nospec-docs,window-test,window-test2,window-docs}/
+本地实测档(未入库)/REPORT.md
+本地实测档(未入库)/{spec,spec-d7,nospec,spec-docs,nospec-docs,window-test,window-test2,window-docs}/
 
 # 代码
 tools/mtp_curve.py
@@ -670,7 +670,7 @@ profiles/qwen38_27b-3090-iq4xs-mtp.toml
 ## 18. 给下一会话的开场白
 
 ```text
-工作树 = packages/owl-worktrees/mtp-spec（feat/mtp-spec，未提交）。
+工作树 = 工作树 mtp-spec（feat/mtp-spec，未提交）。
 先读 mtp-longctx-windowed.md 与
 mtp-longctx-handoff.md。
 

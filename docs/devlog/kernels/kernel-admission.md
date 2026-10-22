@@ -869,7 +869,7 @@ impl KernelPick {
 **迁移动作**:
 - `gdn_scalar`:`build.sh` 的 `nvcc -cubin` → `nvcc -c` + `ar` → `libowl_gdn_scalar.a` + 一个 C host 入口包装 launch;build.rs 加 `rustc-link-lib`;删 `include_bytes!`/`load_cubin`/Rust 侧编排。
 - `gdn_chunked`:七核 cubin **作为数据内嵌进 `.a`**(`ld -r -b binary` 或 `xxd -i`),`.a` 导出 `owl_gdn_chunked_fwd(...)`(内部 `cuModuleLoadData` + 六核流水);删 `json`/`manifest`/自研 loader/Rust 侧编排。
-- 可选(另案):`GDN_FORCE_BUILD=1` 走 triton 重编(源从 `packages/vllm/vllm/third_party/flash_linear_attention` vendor 到 owl `cu/gdn/fla/`,采集脚本 `testdata/gdn_fla/harvest_fork.py` 一并搬)。
+- 可选(另案):`GDN_FORCE_BUILD=1` 走 triton 重编(源从 `vllm`(外部存档) vendor 到 owl `cu/gdn/fla/`,采集脚本 `testdata/gdn_fla/harvest_fork.py` 一并搬)。
 
 ### 15.2 R5:源码归**算子自托管**;`sources.rs` 集中表淘汰
 
@@ -1378,7 +1378,7 @@ marlin selector ⊆ 实例化 ✓(258 变体引用 / 258 个已实例化)
 处置:**去掉 `.gitignore` 条目 + 资产入库**(13 cubin + provenance json +
 manifest,1.7 MB);新增 `assets/README.md` 记**来源/复现配方/根治工单**
 (源是 Triton `.py`,构建期编译需 triton+torch ≈1.8 GB 开发期依赖;
-源当前在 `packages/vllm` 检出里 = owl 树外,故先入库止血)。
+源当前在 `vllm`(外部存档) 检出里 = owl 树外,故先入库止血)。
 
 #### 15.10.3 终态:资产面一览
 

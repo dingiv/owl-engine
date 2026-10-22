@@ -1,7 +1,7 @@
 # chat_tpl 金标(HF oracle 逐字节面)
 
 > 用途:`apps/server/src/chat_tpl.rs` 渲染器的 **G0 验收门**
-> (设计:`docs/arch/agent-服务面-设计与施工.md` §5 G0 / §7.1)。
+> (设计:`docs/devlog/serving/agent-surface.md` §5 G0 / §7.1)。
 
 ## 金标是什么
 

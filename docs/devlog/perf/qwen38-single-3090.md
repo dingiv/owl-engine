@@ -33,7 +33,7 @@ metrics counter 差分(闭合模型逐桶校验)。随机词池域。
 
 spec-dflash flavor(slots1+fp8+d7+syvai 草稿),3090Ti 单卡,greedy,
 `model.head_quant=true` = 装载期 RTN int4 g32 sym(检查点不动,AwqSource
-F16 兜底臂;marlin kU4)。全案卷 = roadmap.local/perf-roadmap-2026-10-08.md
+F16 兜底臂;marlin kU4)。全案卷 = 本地台账《perf-roadmap-2026-10-08》
 2026-10-11 会话补录。
 
 | 域 | f16 头 | int4 头 | Δ |

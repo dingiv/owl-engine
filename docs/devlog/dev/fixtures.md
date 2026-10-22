@@ -32,12 +32,12 @@ owl 的测试分三层,**别混用**:单元(纯函数/CPU)→ 设备门(`*_gpu_*
 
 ```bash
 # ① engine e2e:0.8B/27B 全场景,一次装载共跑(17 场景 ≈ 89s)
-cd packages/owl && OWL_TEST_DEVICE=41:00.0 OWL_AWQ27B_DIR=<27B-AWQ> OWL_DFLASH2_DIR=<draft> \
+OWL_TEST_DEVICE=41:00.0 OWL_AWQ27B_DIR=<27B-AWQ> OWL_DFLASH2_DIR=<draft> \
   CARGO_BUILD_JOBS=8 cargo test -p owl-engine --features e2e --test engine_e2e -- --test-threads=1 --nocapture
 # 过滤单场景:OWL_E2E_ONLY=longctx / schedule_decision / fuse_text_parity ...
 
 # ② server e2e:真 server 黑盒(L1 协议 / L2 语义 / L3 答案),端口 8135
-cd packages/owl && cargo test -p server --test e2e -- --test-threads=1 --nocapture
+cargo test -p server --test e2e -- --test-threads=1 --nocapture
 ```
 - 场景体在 `crates/engine/src/tests.rs`(`pub async fn`,**不挂 `#[test]`**,由入口顺序调用);
   **新场景一律并入共享装载组**,自带装载只留给 boot 期配置不同的(草稿类型/池 dtype/图档)。

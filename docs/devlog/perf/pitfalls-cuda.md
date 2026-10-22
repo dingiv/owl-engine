@@ -2,7 +2,7 @@
 
 > 2026-09-25 汇总。**本文件已合并并取代**(原文件已删):
 > `cuda-death-rules.md`(十姿势判例)、
-> `roadmap.local/{cuda-graph-session, session-graph, memory-backend, README}.md`
+> 本地台账区
 > (旧世界四份审查报告)。对账对象 = **新声明式 gpu_server**
 > (`crates/backends/cuda/src/{server,state,command,launch,gpu_client}.rs`,
 > 2026-09-24/25 重写:三固定流 + 命令信封 + host 回调完成通知 + 图捕获护栏)。
@@ -42,7 +42,7 @@ birth-pin、park 全是为它发明的。新实现釜底抽薪:
 | 9 跨流捕获边界未 join | ✅ | 捕获恒单流(COMPUTE),其他流命令捕获期全拒(姿势 9 防线"单流先行"落地) |
 | 10 capture 期 host 暂存回收 → DMA 悬空 | ✅ | 捕获期 Htod 拒绝;htod 码头随 finish 回调释放(host 回调 = 搬运完成点) |
 
-## 三、roadmap.local 审查发现逐条对账
+## 三、本地台账审查发现逐条对账
 
 ### cuda-graph-session.md(危险清单)
 

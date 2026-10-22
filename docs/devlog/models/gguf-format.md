@@ -1,6 +1,6 @@
 # GGUF 格式支持 —— 设计与施工
 
-> 立项:2026-10-19(worktree `packages/owl-worktrees/gguf`,分支 `feat/gguf`)。
+> 立项:2026-10-19(worktree `工作树 gguf`,分支 `feat/gguf`)。
 > 上游:`operator-matrix.md` §Q4 + §七(三型专列矩阵)、
 > `loader-interpreter.md`(起点族范式)、
 > `charter.md` A5(严格显存预算)/A6(池分配者契约)/A1(图治理)。
@@ -33,7 +33,7 @@
 |---|---|---|
 | D1 | **两段式**:M1 = 小档(9B 单卡)全链贯通;M2 = 27B 上双卡生产档 | §七 刀序 |
 | D2 | **一步到位 MMQ**:dequant-in-kernel(**无 f16 中间态**),不走"载入期 dequant→f16" | §四 L3 |
-| D3 | **按 GGUF 标准操作**:超参 + 内嵌词表 + chat template 全自给;借力 `packages/mistral.rs` / `packages/xinfer` | §四 L1/L2、§三 |
+| D3 | **按 GGUF 标准操作**:超参 + 内嵌词表 + chat template 全自给;借力 `mistral.rs`(外部存档) / `xinfer`(外部存档) | §四 L1/L2、§三 |
 | D4 | 首轮量化型 = **Q4_K_M / IQ4 / IQ3**(+ 目标文件实际含的 F32/Q8_0/Q6_K/Q5_K) | §二 REQ-GGUF-04 |
 
 ### 1.3 ⚠️ 为什么 D2 是**被逼出来的**(显存算术,一个都不能省)
@@ -91,17 +91,17 @@ Qwen3.8-27B-Q4_K_M.gguf = 18G(压缩驻留)
 
 | 素材 | 位置 | 用法 | 所有权 |
 |---|---|---|---|
-| **gguf.cuh**(152 KB,llama.cpp 派生:全部 K-quant/IQ 的 `dequantize_block_*` + `vec_dot_*`) | `repos/attention.rs/src/kernels/src/gguf/gguf.cuh` | **CUDA 侧主料**:整 file port 进 `crates/kernels/cu/gguf/` | FROZEN 快照,可 copy 改造(owl 已port过 attention-rs 的 FI 适配器有先例) |
+| **gguf.cuh**(152 KB,llama.cpp 派生:全部 K-quant/IQ 的 `dequantize_block_*` + `vec_dot_*`) | `attention.rs(外部存档)/src/kernels/src/gguf/gguf.cuh` | **CUDA 侧主料**:整 file port 进 `crates/kernels/cu/gguf/` | FROZEN 快照,可 copy 改造(owl 已port过 attention-rs 的 FI 适配器有先例) |
 | **gguf_gemm.cu**(654 行:`gguf_gemm_kernel` / `gguf_gemm_prefill_kernel` / IQ4_NL 专用 / `quant_type` 分派) | 同上目录 | 内核族骨架;**必改三点**(§四 L3 硬律) | 同上 |
-| **k_quants.rs**(3199 行,全型 CPU dequant + 参考 GEMM) | `repos/candle-gb/candle-core/src/quantized/k_quants.rs` | **层内金标**:block 解量化逐位对拍;block 结构体定义可抄 | FROZEN,只作参照(不引入 candle 依赖) |
-| **gguf_file.rs**(623 行,纯 host 解析:header/KV/tensor table) | `repos/candle-gb/candle-core/src/quantized/gguf_file.rs` | 解析器骨架(去掉 candle 错误类型) | FROZEN |
-| **archive.rs**(2127 行,含对齐/分片/边界校验/字符串长度上限) | `packages/mistral.rs/mistralrs-quant/src/gguf/archive.rs` | 解析器的**防御性校验**取材(MAX_STRING_LENGTH / MAX_ARRAY_ELEMENTS / 深度上限) | FROZEN |
-| **gguf_helper.rs**(753 行:**内嵌词表 → `tokenizers::Tokenizer`**) | `packages/xinfer/crates/core/src/utils/gguf_helper.rs` | **词表复刻主料**(直接对口 owl 已依赖的 `tokenizers` 0.21) | OWNED(我们自己的历史产物),可 port |
+| **k_quants.rs**(3199 行,全型 CPU dequant + 参考 GEMM) | `candle-gb(外部存档)/candle-core/src/quantized/k_quants.rs` | **层内金标**:block 解量化逐位对拍;block 结构体定义可抄 | FROZEN,只作参照(不引入 candle 依赖) |
+| **gguf_file.rs**(623 行,纯 host 解析:header/KV/tensor table) | `candle-gb(外部存档)/candle-core/src/quantized/gguf_file.rs` | 解析器骨架(去掉 candle 错误类型) | FROZEN |
+| **archive.rs**(2127 行,含对齐/分片/边界校验/字符串长度上限) | `mistral.rs`(外部存档) | 解析器的**防御性校验**取材(MAX_STRING_LENGTH / MAX_ARRAY_ELEMENTS / 深度上限) | FROZEN |
+| **gguf_helper.rs**(753 行:**内嵌词表 → `tokenizers::Tokenizer`**) | `xinfer`(外部存档) | **词表复刻主料**(直接对口 owl 已依赖的 `tokenizers` 0.21) | OWNED(我们自己的历史产物),可 port |
 | **gguf_varbuilder.rs**(236 行,按名取 QTensor + 形状/dtype 查询) | 同上目录 | 索引面设计参考 | OWNED |
-| **gguf_tokenizer.rs / chat_template.rs / normal_bindings.rs**(键映射) | `packages/mistral.rs/mistralrs-core/src/gguf/` | 词表/模板/键映射的**交叉验证**第二源 | FROZEN |
-| **`gguf.cuh` 的上游权威** | `repos/llama.cpp/ggml/src/ggml-cuda/`(本树内) | 类型定义(`block_q4_K` 等)与 `gguf-py` 解析器的**判据源** | REFERENCE |
-| **llama.cpp 可执行锚** | `repos/llama.cpp/build-new/bin/llama-cli`(build 10945,`LD_LIBRARY_PATH=/path/to/packages/llama.cpp/build-master2/bin`) | 端到端 greedy token 对拍;`llama-quantize` 可本地产 IQ 样本 | REFERENCE |
-| **`gguf-py`** | `repos/llama.cpp/gguf-py` | 解析/词表的**独立第三源**(对拍用) | REFERENCE |
+| **gguf_tokenizer.rs / chat_template.rs / normal_bindings.rs**(键映射) | `mistral.rs`(外部存档) | 词表/模板/键映射的**交叉验证**第二源 | FROZEN |
+| **`gguf.cuh` 的上游权威** | `llama.cpp(外部存档)/ggml/src/ggml-cuda/`(本树内) | 类型定义(`block_q4_K` 等)与 `gguf-py` 解析器的**判据源** | REFERENCE |
+| **llama.cpp 可执行锚** | 外部存档:llama.cpp 构建(`llama-cli`,build 10945;运行时需 `LD_LIBRARY_PATH=<llama.cpp 构建目录>/bin`) | 端到端 greedy token 对拍;`llama-quantize` 可本地产 IQ 样本 | REFERENCE |
+| **`gguf-py`** | `llama.cpp(外部存档)/gguf-py` | 解析/词表的**独立第三源**(对拍用) | REFERENCE |
 
 ---
 
@@ -396,7 +396,7 @@ std 会战表;刀 10 = MoE 键面骨架(REQ-GGUF-09,仅覆盖 + 单层对拍)。
 | `formats/gguf/transform.rs` | §十一 六类变换的**逐键描述符**(`xf_for(键, dims)`)+ V-head 逆重排公式 + q8_1 **块粒度**置换表;5 单测(含公式互逆/往返) |
 | `formats/gguf/source.rs` | `GgufSource: WeightSource` —— 量化键**字节原样**(I-3 压缩驻留,元素面**响亮拒**);行置换在字节面做(按行搬块,零重量化);`ssm_a` 的 `ln(-x)` 与 1-D 元素置换在元素面;`ssm_out` 的列置换**源不动字节**(由调用方在激活侧做) |
 
-**门 = HF 快照对拍**(`models/Qwen/Qwen3.5-4B` 的 bf16 源,16 张量):
+**门 = HF 快照对拍**(`/path/to/models/Qwen/Qwen3.5-4B` 的 bf16 源,16 张量):
 
 ```
 [blk.0.ssm_alpha/beta/dt_bias]  精确 0        (V-head 行置换 ✓)
@@ -500,7 +500,7 @@ std 会战表;刀 10 = MoE 键面骨架(REQ-GGUF-09,仅覆盖 + 单层对拍)。
 > **为什么必须有这一章**:GGUF 转换器(`llama.cpp/conversion/qwen.py`)写文件时对
 > qwen35 做了**六类变换**;读回来必须逐类**逆变换**,否则**静默错值**
 > (GDN 深谷爆炸那类)。本节每条都有**实测证据**(4B Q4_K_M × 其 HF 快照
-> `models/Qwen/Qwen3.5-4B`),不是推测。
+> `/path/to/models/Qwen/Qwen3.5-4B`),不是推测。
 
 ### 11.1 变换来源(权威 = 转换器源码)
 
@@ -678,8 +678,8 @@ Gemma 式)—— 这正是 owl `RmsNorm::new_add_one`(`×(1+w)`)的来处,而 HF
 prompt ids = [760, 6511, 314, 9338, 369] ≡ llama.cpp `/tokenize`(逐位)
 ```
 
-**std 五点三轮(`packages/llm_speedtest --flavor std`;单 3090 Ti,`41:00.0`)**
-—— 原始数据 `docs/bench/data/gguf4b-std-2026-10-19.json`:
+**std 五点三轮(`llm_speedtest(外部存档) --flavor std`;单 3090 Ti,`41:00.0`)**
+—— 原始数据本地原始数据(未入库):
 
 | 点 | 512 | 1024 | 2048 | 4096 | 8192 |
 |---|---|---|---|---|---|
@@ -793,7 +793,7 @@ llama.cpp 实测 argmax,top-1 领先次高 ≥ 2.5 nat ⇒ 不是 near-tie):
 
 ### 14.4 27B 的**独立第三方**逐张量核验(FP8 原始检查点)
 
-`models/Qwen/Qwen3.8-27B-FP8`(原始精度)+ **llama.cpp 转换器的写侧公式**
+`/path/to/models/Qwen/Qwen3.8-27B-FP8`(原始精度)+ **llama.cpp 转换器的写侧公式**
 (不是我读侧的逆公式)+ `gguf-py` 的解量化 := 三源独立。执行面 =
 `crates/models/src/formats/gguf_fp8_probe.py`(**dev 工具**,非 CI 门;
 为什么不做成 Rust 门:参照源是 block-wise fp8 + `weight_scale_inv`,
@@ -1089,7 +1089,7 @@ prefill 实测(1001-token prompt):
 
 | 件 | 来源 | 状态 |
 |---|---|---|
-| 块结构 / `dequantize_block_*` / `vec_dot_*` | llama.cpp(`ggml-cuda.cu` 时代,经 `repos/attention.rs` 快照 → 本仓 `gguf.cuh`) | ✅ 已在用(MMVQ/行解量化) |
+| 块结构 / `dequantize_block_*` / `vec_dot_*` | llama.cpp(`ggml-cuda.cu` 时代,经 `attention.rs`(外部存档) 快照 → 本仓 `gguf.cuh`) | ✅ 已在用(MMVQ/行解量化) |
 | MMVQ 内核 | 同上(`gguf_gemm.cu`) | ✅ |
 | **MMQ(tensor-core prefill)** | llama.cpp **官方** | ⬜ **本刀:已 vendoring + 编译通过** |
 | 自研 smem 复用臂(W-2b) | 本仓 | ⚠️ 保留为 MMQ 未覆盖形态的回退(它比 MMVQ 快 2.5×,比 MMQ 预期慢 3-5×) |
@@ -1137,7 +1137,7 @@ revision/文件/shim 差异/接线清单)· 适配壳 `vendor/common.cuh` 把
 
 | 候选 | 值不值得 | 备注 |
 |---|---|---|
-| **ik_llama.cpp**(本地 `repos/ik_llama.cpp` 已有) | 值得(官方接入后对照) | ikawrakow 的 fork,MMQ/注意力有一批 Ampere 优化;同一套块结构 ⇒ 可当"官方 MMQ 更快版本"直接替换块 |
+| **ik_llama.cpp**(本地 `ik_llama.cpp`(外部存档) 已有) | 值得(官方接入后对照) | ikawrakow 的 fork,MMQ/注意力有一批 Ampere 优化;同一套块结构 ⇒ 可当"官方 MMQ 更快版本"直接替换块 |
 | llamafile `tinyblas.cu` | 观察 | 走 BLAS 路(权重解成 tile 再 GEMM),与本仓"压缩驻留"约束冲突(需 f16 tile 缓冲) |
 | vLLM gguf-plugin | 不取 | 也是 dequant + cuBLAS 路(显存放大),与 I-3 冲突 |
 | Marlin(EXL/AWQ 生态) | 不适用 | 面向 4bit 分组量化布局,GGUF 的 K-quant 超块不匹配 |
@@ -1401,7 +1401,7 @@ chunk 的收益与桶无关,它来自"每 chunk 解一遍 17.7 GB 权重"被摊�
 
 ## 二十一、对手实测:llama.cpp 的 nsys 算子分布(2026-10-19)
 
-**方法**:`packages/llama.cpp/build-master2/bin/llama-server`(与本仓对照同一二进制/同一
+**方法**:`llama.cpp`(外部存档)(与本仓对照同一二进制/同一
 GGUF/同一张 3090 Ti 41:00.0)挂 `nsys profile --trace=cuda`;发 3 个 ≈833-token 与
 1 个 3216-token 的纯 prefill 请求(`max_tokens=1`),**按 GPU busy 切窗**;再把
 "prefill 段"与"decode 步"分开(decode = 第一发 `mul_mat_vec_q` 起)。
@@ -1483,10 +1483,10 @@ dp4a 档实测 27B prefill 557 t/s(§20 之前)。**103 TFLOPS 的 matmul 只存
 ```bash
 # 直接用 fork 自己的树编译(零改动、零 shell):
 nvcc -DGGML_CUDA_USE_GRAPHS -DGGML_SCHED_MAX_COPIES=4 \
-     -I packages/llama.cpp/ggml/src -I packages/llama.cpp/ggml/include \
+     -I llama.cpp(外部存档)/ggml/src -I llama.cpp(外部存档)/ggml/include \
      -O3 -std=c++17 "--generate-code=arch=compute_86,code=[sm_86]" \
      -use_fast_math -extended-lambda -x cu -c \
-     packages/llama.cpp/ggml/src/ggml-cuda/mmq.cu -o /tmp/mmq_fork.o
+     llama.cpp(外部存档)/ggml/src/ggml-cuda/mmq.cu -o /tmp/mmq_fork.o
 # ⇒ 214 KB .o,**一次通过**(依赖闭包 = mmq.cuh + mmq-load-tiles + mmq-vec-dot
 #   + vecdotq + mma + common.cuh + ggml-common.h + ggml 头)
 ```

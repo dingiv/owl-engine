@@ -5,7 +5,7 @@
 > 目标是 2×3080 20G 上跑 27B AWQ-INT4 + **视觉塔** + **DFlash2 d7**,
 > 上下文 184,320(与 vLLM `qwen38_3080` 同档)。
 >
-> 工作树:`packages/owl-worktrees/perf-review`(分支 `perf-review`)。
+> 工作树:`工作树 perf-review`(分支 `perf-review`)。
 > **本文是施工台账**:每完成一项就在 §7 勾掉,不另起散记。
 
 ---
@@ -271,7 +271,7 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
 ## 8. 复现命令(当前)
 
 ```bash
-cd packages/owl-worktrees/perf-review
+cd <worktree>/perf-review
 cargo build -p server
 ./target/debug/server --profile qwen38_27b-3080_tp2-w4a16 \
   --site testdata/args/base.toml \

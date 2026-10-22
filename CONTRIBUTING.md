@@ -45,7 +45,7 @@ This is exactly what CI does (`.github/workflows/ci.yml`).
    logging via `log_*!` (lower layers: `klog_*!` / `OWL_LOG_*` on the C/C++ side);
    timings and counters via `metrics`.
 
-> Long form (in Chinese): `docs/arch/charter.md`, `docs/arch/common-dev-pitfall.md`.
+> Long form (in Chinese): `docs/devlog/canon/charter.md`, `docs/devlog/perf/pitfalls-general.md`.
 
 ## 3. Diagnostics and probes (read before adding a print)
 
@@ -59,7 +59,7 @@ This is exactly what CI does (`.github/workflows/ci.yml`).
   No new bare `fprintf`; error-code paths use `OWL_LOG_ERROR`.
 
 The whitelist of allowed bare `eprintln!` (boot rejection, CLI output, pre-logger) is in
-`docs/arch/log-framework.md` §8.6.
+`docs/devlog/perf/log-framework.md` §8.6.
 
 ## 4. Third-party code and CUDA libraries
 

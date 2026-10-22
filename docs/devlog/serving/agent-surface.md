@@ -4,11 +4,11 @@
 > 状态:**M-A ✅ 达成**(pi ↔ owl 生产档跑通工具闭环,§7.7);M-B/M-C 需求已列,待排期。
 > 定位:**owl 第一次面向"真实 agent 客户端"的服务面收口** —— 客户 =
 > 本机 `pi` coding agent(provider 类型 `openai-completions`)。
-> **待办台账** = `roadmap.local/agent-服务面-剩余工作项-2026-10-14.md`(本文只记设计与判据,
+> **待办台账** = 本地台账《agent-服务面-剩余工作项-2026-10-14》(本文只记设计与判据,
 > 剩余工作项、量级、执行序住那里)。
 > 承接:`multi-session.md`(S0 会话/并发面)、
 > `requirements.md` v1.0(需求基线,本专项新增 `REQ-AGT-*` 族)、
-> `roadmap.local/phase4-agent-session.md`(引擎侧会话面,已落地)。
+> 本地台账《phase4-agent-session》(引擎侧会话面,已落地)。
 > 纪律(charter):本专项**只改 `apps/server/`**(协议面 + 模板面),
 > 不动 kernels / 不动解释器热路径 / 不动图捕获面;渲染走**快照自带
 > `chat_template.jinja`**,不在 Rust 里长第二份模板。
@@ -1300,7 +1300,7 @@ pi 的**历史重发不受影响**(共享段尾 = 上轮生成末页,已由 (8) 
 
 ## §9.2 G5 服务面能力缺口实录(2026-10-19;server/engine 服务层专项)
 
-立案 = `roadmap.local/agent-服务面-剩余工作项-2026-10-14.md` §G 的 **G5** 行:
+立案 = 本地台账《agent-服务面-剩余工作项-2026-10-14》 §G 的 **G5** 行:
 keep-alive ・`/v1/completions` ・`/tokenize` ・Responses API ・`/debug/agent` ・
 undo/rollback ・`reasoning_tokens`。**施工序**(风险从低到高):
 ① `reasoning_tokens` ② `/debug/agent` ③ `/tokenize` ④ keep-alive(唯一动协议面 ——
@@ -1526,13 +1526,13 @@ chunk 帧两项)。
 | 2026-10-19 | v0.11 | **G5(2)`/debug/agent` 诊断环落地**(最近 8 轮:请求事实 / prompt 头尾快照 / usage 真账 / 结局 / 解析器结构轨迹;`TurnLedger` Drop 兑底网;接 `ConnCtx`);门 = wire smoke 4 项断言 + 单测 43/43 + 真机四场景 —— 见 §3.6 / §9.2(2) |
 | 2026-10-19 | v0.10 | **G5(1)`reasoning_tokens` 落地**(解析器相位归因;流式/非流式两形态单源;门 = wire smoke 两形态断言 + server 单测 37/37;真机 0.8B 四场景实测)—— 见 §3.5 / §9.2(1) |
 | 2026-10-14 | v0.9 | **§7.11:A7/A8 深挖** —— 定谳到 **prefill 末行 logits 的布局相关错读**(布局运气律:所有变量都是扰动而非因;`prefill_split` 由核发射账证伪)⇒ 真凶 = 释放块**设备地址复用**(UAF 类),**未根治**,已落 plain-eval 缓解 + 立案 A13;**A11 spec 臂采样化落地**(verify 出 logits 槽 + 抽-比式接受,分布精确,单测+真机);G4 口径定谳(token 级只在 spec-off);pi 真机进步到"发 `<tool_call>` 未闭合"(残余归 D2) |\n| 2026-10-14 | v0.8 | **第二批交付**:AGT-06(per-turn 采样/stop/seed,引擎侧 `TurnOpts`)/07(reasoning_effort 直通)/09(implicit_session)/10(abort)/11(chunked)/12(cached_tokens 真值含块级命中)/13(定档维持 16k);B1-B4(`[agent]` 配置模块 + e2e agent L1 七段 + `agent_gates.sh`);A3/A4/A5 ✅;D1 ✅(**两层前缀复用 + G4 真值门**:同会话 88% / 跨会话 89%)、D3(agent 域 AL 2.68)、D4(4 并发无并行);**新增 §7.8 A8 = spec 臂 token 级非路径稳定**(与 A7 疑同源,恒等/真值门一律 spec-off 跑);实测数字全部入 §7.9。 |
-| 2026-10-14 | v0.7 | 清 A 组引擎债三项:**A1 拒启可见**(四项真机实测)/ **A2 `snap_max=0` 不再 panic**(真机 4/4、零 503)/ **A6 think 别名**(+单测);生产档回归绿(wire 17/17、lag 4/4、pi 全链 1 次成功)。**新增 A7:工具调用遵循度实测 1/9**(模型倾向直接作答+幻觉完成,日志证明非解析丢失)= 现第一优先,台账见 `roadmap.local/agent-服务面-剩余工作项-2026-10-14.md`。 |
+| 2026-10-14 | v0.7 | 清 A 组引擎债三项:**A1 拒启可见**(四项真机实测)/ **A2 `snap_max=0` 不再 panic**(真机 4/4、零 503)/ **A6 think 别名**(+单测);生产档回归绿(wire 17/17、lag 4/4、pi 全链 1 次成功)。**新增 A7:工具调用遵循度实测 1/9**(模型倾向直接作答+幻觉完成,日志证明非解析丢失)= 现第一优先,台账见本地台账《agent-服务面-剩余工作项-2026-10-14》。 |
 | 2026-10-14 | v0.6 | **T7 PASS + §7.7 结案**:病灶 = `rep_penalty` 逐元素施加 ⇒ `1.15^k` 指数累积(短输出无感、长思考必崩),已修(去重 + 默认 1.0,单测 7/7);真机生产形状(froggeric + spec d7 + fp8/XQA)pi↔owl 全链跑通,产物文件落地。**M-A 达成**。另记:本轮另修引擎 3 项(XQA 页表恒等链 × 多会话、配置错误静默 exit、`snap_max=0` panic 立案)。 |
 | 2026-10-14 | v0.5 | **§7.6 结案并修复**:定谳更正为 **XQA 页表恒等链**(fp8 只是触发条件 —— XQA 前置为 fp8 池;V11 消歧);修法 = 页表改走图输入槽 + `xqa_pt_of` 会话真链,三处触点;验证 = 生产形状 lag 4/4 + 27B 冒烟 17/17 + XQA 恒等探针;agent 档收回生产形状;影响面(多请求接受率/质量读数需复核)已记账。 |
 | 2026-10-14 | v0.4 | **V1–V8 二分定谳:T7 拦路虎 = `kv_fp8`(fp8 KV 池跨请求污染)**;f16 池规避后 `lag_probe` 4/4 + **27B 真机 wire 冒烟 17/17**。服务面侧 M-A 收口;新增 §7.7(模板/模型侧第二阻塞:froggeric 模板下工具提示复读塌陷,上游原版模板可出正确 tool_call)+ 两条连带立案(`snap_max=0` 运行期 panic、f16 池白名单缺口)。可用档 = `testdata/server/agent-27b.toml`。 |
 | 2026-10-14 | v0.3.1 | **T7 真机冒烟暴露拦路虎(§7.6)**:27B spec-dflash 档多请求「一轮滞后」污染(0.8B 无 / prompt dump 证明服务端无罪 / lane C、GDN 格、session 均排除);另发现 `depth=0` 首请求 panic(`state.rs:859 池非空`)。**M-A 代码面(P0 四项)全部完成并 26 单测 + 17/17 wire 冒烟通过**;G3 待引擎侧修复。 |
 | 2026-10-14 | v0.3 | **T3/T4/T6 完工**:`openai.rs` 全面重写(原样透传 + 结构化校验 + 三通道 SSE + 400 面 + `normalize_tool_calls`)、boot 期装载模板(失败拒启)、`render_prompt` 退役、`agent_wire_smoke.py` **17/17 全绿**;单测 26 全绿。**M-A 只剩 T7(pi 真机冒烟)**。 |
-| 2026-10-14 | v0.2.1 | **T1/T2 完工**:`chat_tpl.rs`(9 例)+ `toolcall.rs`(12 例)= 21/21 全绿;G0 金标门入仓(`apps/server/tests/fixtures/chat_tpl/` + `gen_fixtures.py`);新增事实 5-8。代码在图 `feat/agent-serving`(worktree `packages/worktrees/owl/agent-serving`)。 |
+| 2026-10-14 | v0.2.1 | **T1/T2 完工**:`chat_tpl.rs`(9 例)+ `toolcall.rs`(12 例)= 21/21 全绿;G0 金标门入仓(`apps/server/tests/fixtures/chat_tpl/` + `gen_fixtures.py`);新增事实 5-8。代码在图 `feat/agent-serving`(worktree `工作树 agent-serving(旧位置)`)。 |
 | 2026-10-14 | v0.2 | **T0(G0)实测 PASS**:minijinja 兼容层定案(trim/lstrip blocks + pycompat + HF `tojson` 语义 + raise_exception 注入);4 用例 + 0.8B 模板逐字节相等;踩坑入契约(`chat_template_kwargs` 展平、`<function=>` 5-token、单 token 标记面、渲染 <1ms);回退方案退役。 |
 | 2026-10-14 | v0.1.1 | 名词澄清:`minijinja` = **Rust crate**(PyPI 同名包为 PyO3 绑定,不用);G0 oracle 改用本机 venv 内的 HF `apply_chat_template`(逐字节真值面);`tojson` 走 `json` feature,`raise_exception` 确认两边都需注入。 |
 | 2026-10-14 | v0.1 | 立项:pi wire 契约取证(pi-ai v1.0.4)+ 现状对账(15 项)+ REQ-AGT-01..14 + §4.3 渲染对称律 + M-A 任务单 T0~T7。用户裁决:①M-A 最小闭环;②模板路线 = minijinja 直读快照;③与 `prefill-graph` 并行、用另一张 3090 Ti(CUDA ordinal 0)/端口 8137。 |

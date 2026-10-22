@@ -506,7 +506,7 @@ mean_{l,h} softmax≈(q_{l,h}·k̄_{l,g}/√d)   ← 打分主体是「窗 W × 
 
 **(4)延迟门(纯 host;`crates/store` release bench)**
 
-真实 27B 几何(**16 全注意力层** / hq24 / hkv4 / hd256;`models/cyankiwi/Qwen3.8-27B-AWQ-INT4`),
+真实 27B 几何(**16 全注意力层** / hq24 / hkv4 / hd256;`/path/to/models/cyankiwi/Qwen3.8-27B-AWQ-INT4`),
 query 窗 8,候选块 = 全 ctx 块:
 
 | 块数(≈ctx) | 论文口径(softmax 均值,逐 token) | **快路(折叠 + logit 面)** |

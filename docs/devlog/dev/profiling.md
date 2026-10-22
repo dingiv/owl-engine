@@ -6,7 +6,7 @@
 |---|---|
 | "这一步/这一相花了多少" | **引擎内 metrics**(`/debug/metrics/*`,host 墙时口径)—— 真值,零客户端污染 |
 | "哪个核慢、核间空隙多大、图里在跑什么" | **nsys**(逐核时间线) |
-| "端到端快不快、用户等多久" | `packages/llm_speedtest`(统一口径,跨引擎可比) |
+| "端到端快不快、用户等多久" | `llm_speedtest`(外部存档)(统一口径,跨引擎可比) |
 | "显存账" | boot 日志 `slab 峰值归因:` 行 + `nvidia-smi`/`[vram-trace]` 行 |
 
 ⚠️ **客户端逐帧计时会污染 decode**:Python 逐 SSE 帧消费曾把 28.5ms/步量成 51.3ms。
@@ -15,7 +15,7 @@
 ## 1. nsys
 
 ```bash
-cd packages/owl && nsys profile --cuda-graph-trace=node --trace=cuda,nvtx,osrt \
+nsys profile --cuda-graph-trace=node --trace=cuda,nvtx,osrt \
   -o /tmp/owl-$(date +%H%M) --force-overwrite=true \
   ./target/release/server -p profiles/qwen38_27b-3090-w4a16-dflash.toml testdata/server/agent-27b.toml --log-level warn
 # 另开:打 1-2 个请求(短输出),然后 Ctrl-C/停服,再用 nsys stats / GUI 看
@@ -38,10 +38,10 @@ nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum /tmp/owl-*.nsys-rep
 - 27B AWQ-INT4 marlin m=1:44.6MB/46µs ⇒ ~1021GB/s ⇒ **decode 的 GEMM 侧零空间**;剩余空间在
   非 GEMM 尾巴(state/胶水/gap)。
 
-## 3. 统一测速口径(`packages/llm_speedtest`)
+## 3. 统一测速口径(`llm_speedtest`(外部存档))
 
 ```bash
-cd packages/llm_speedtest
+cd <llm_speedtest>(外部存档:工作区测速工具)
 uv run cli --api-url http://127.0.0.1:8137/v1/chat/completions --model qwen3.8-27b \
   --flavor std --notes "<谁在什么档上跑>" --json /tmp/x.json --csv /tmp/x.csv
 # 小 prompt / 单 chunk 面:--lengths 32,64,96,128,192,256,480 --rounds 3 --output-length 256

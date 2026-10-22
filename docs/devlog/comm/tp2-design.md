@@ -236,7 +236,7 @@ pub fn allreduce(tp: &TpCtx, buf: &BytesView, plan: &ArPlan, out_kernels: &mut K
 | 残留 | 实况 | 建议处置 |
 |---|---|---|
 | `crates/backends/iface/src/lib.rs`(312 行)的 A6 声明面 | `Backend`/`Pool`/`Device` traits + `PoolId/PoolKind/PoolConfig/PoolUsage/MemStats/MemPhase/DeviceDesc` + peer 三件套;**全仓零实现零调用**:`PoolConfig`/`PoolUsage`/`MemStats`/`malloc_peer_shared`/`enable_peer_access`/`map_remote` 全部 **0 引用**,无 `impl Device for`/`impl Pool for`,iface 自带 0 个测试 | **加头注降级为"历史设计记录(非规范)"**(其注释是 A6 的设计出处);头注写清 **当前规范 = `owl-cuda::command` + `GpuCtx` 账房** |
-| `crates/backends/utils`(`owl-backend-utils`) | **不在 workspace members 里**(根本不参与编译),且引用**已退役**的 `CudaDevice`(`shared/src/testkit/mod.rs:12` 自述:"旧治理世界 CudaDevice/CudaPool …随声明式重构退役") | **删或归档 `docs/archive/`** —— 已是坏引用死码 |
+| `crates/backends/utils`(`owl-backend-utils`) | **不在 workspace members 里**(根本不参与编译),且引用**已退役**的 `CudaDevice`(`shared/src/testkit/mod.rs:12` 自述:"旧治理世界 CudaDevice/CudaPool …随声明式重构退役") | **删或归档 本地归档区** —— 已是坏引用死码 |
 | `crates/backends/rocm` | 仅 README 占位 | 留(charter:rocm = 未来厂商栈占位) | |
 
 ### 7.1 已关闭(2026-10-16,用户"关掉 D2-D6";默认值即裁决)
@@ -273,7 +273,7 @@ pub fn allreduce(tp: &TpCtx, buf: &BytesView, plan: &ArPlan, out_kernels: &mut K
 | 图回放下的 credit 协议死锁 | 中 | 自旋超时 + 结构化失败;protocol 单测含"乱序/慢对端"注入 |
 | 双 actor 重构面过大 | 高 | C5 单列一刀;先 TP2 只跑 **一条** 请求(不碰 scheduler 并发面) |
 | 20G 卡装不下(权重+池+图) | 中 | §6 预算表逐项实测;必要时 262k→64k 或 v1 只在 3090 对验数值、3080 对验容量 |
-| 驱动/内核升级掀桌 | 已知 | p2p-build 弹药链(四次教训);门里带驱动指纹记录 |
+| 驱动/内核升级掀桌 | 已知 | 外部存档:驱动补丁仓弹药链(四次教训);门里带驱动指纹记录 |
 
 ---
 ## 10. ★ 当前形态(收口;2026-10-19)
@@ -424,7 +424,7 @@ agent 会话会互相击杀**(症状 = 客户端 `ConnectError` + 服务端零�
 ### 10.8 未决(按优先级)
 
 > **执行面**(阶段划分 / 每刀的判据与量法 / 里程碑 / 进度勾选表)→
-> **`tp2-roadmap.md`**(本目录,随库入库;2026-10-19 立;本地草稿区 `roadmap.local/` 仍可用)。本节只列"还剩什么"。
+> **`tp2-roadmap.md`**(本目录,随库入库;2026-10-19 立;本地草稿区(本地台账)仍可用)。本节只列"还剩什么"。
 
 1. **decode 剩下四把刀**(**§58.7/§58.10;每把都有实测分母**)——
    ①**lm_head 按词表切**(`TpSplit::ColParallel`;−1.76ms / +8%,**数值中性**,副产品每卡省 1.18 GiB)

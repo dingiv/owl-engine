@@ -38,7 +38,7 @@
 |---|---|---|
 | 卡 | 3090Ti@41:00/42:00(BAR1 32G)· 3080@01:00/C1:00(BAR1 **256MiB**,无 ReBAR) | `nvidia-smi -q` 本机实测 |
 | 驱动 | **615.71.09**(aikitoria fork 自编,`div@s8030` Release Build) | `/proc/driver/nvidia/version` |
-| 在位模块 | `modules-615-reserve-param` md5 **a8e5167d**(混插+探针+预算保留参数化),运行时 `nv_dynbar1_reserve_mb=48` | `p2p-build/README.md` §现役快照 |
+| 在位模块 | `modules-615-reserve-param` md5 **a8e5167d**(混插+探针+预算保留参数化),运行时 `nv_dynbar1_reserve_mb=48` | 外部存档:驱动补丁仓 §现役快照 |
 | 主干分支 | `615.71.09-p2p-3080-20g` @ `e0609f7d`(5 笔:duanyll×2 + 律v3 + 探针 + 混插;已推 fork) | 同上 |
 | 六对带宽 | **13.2 GB/s 双向零 mismatch**(64MB/128MB;含混插四对) | v3基线§十 / 混插§14.9 |
 | 律 v3(窗口) | GSP 按 **2MB 粒度**绑定 aperture ⇒ 死区 = `range0 mod 2M`;修法 = 2M VA placement floor + 64K PTE 解耦(align3) | v3基线 §10.1 |
@@ -47,7 +47,7 @@
 | 3090 对 | **无墙**(32G BAR1 不走动态窗口) | vmm-p2p 报告:182 |
 | 硬重置红线 | **595/v1 时代**"3080 发起端"邮箱路径专属(method3:528);615 align3+混插后六对双向全绿 ⇒ **红线已被现役驱动解除**,但保留能力探测黑名单开关(vLLM/mistral"合成流量全绿≠引擎可用"教训) | gpu2-p2p悬案 / 混插§14.9 |
 | 混插两路 | 3090→3080 = **窗口**(residue=0)· 3080→3090 = **静态**(原路) | AGENTS.md / 混插§14.5 |
-| 驱动升级风险 | apt/unattended-upgrade 会自动顶内核+装官方驱动包 ⇒ vermagic 失配失联(**已上演四次**);换内核/驱动后需 `make clean` 重编同 commit 弹药 | p2p-build README(09-26/10-12 两条) |
+| 驱动升级风险 | apt/unattended-upgrade 会自动顶内核+装官方驱动包 ⇒ vermagic 失配失联(**已上演四次**);换内核/驱动后需 `make clean` 重编同 commit 弹药 | 外部存档:驱动补丁仓(09-26/10-12 两条) |
 | NCCL | 已除名(A2.5);但**读数可参考**:vLLM 3080 对 P2P(NCCL IPC 形态)prefill +28.5% | nex-3080 会战:120-140 |
 | SHM 兜底 | host 中转有效带宽 ≈ 6-12 GB/s;llama.cpp 实测 prefill/dec 2538/**131.7** | p2p-allreduce 文档头 |
 
@@ -58,7 +58,7 @@
 
 ## 2. 27B → TP 切分面(精确几何)
 
-`models/cyankiwi/Qwen3.8-27B-AWQ-INT4/config.json`(text_config)实测:
+`/path/to/models/cyankiwi/Qwen3.8-27B-AWQ-INT4/config.json`(text_config)实测:
 
 ```
 hidden 5120 · layers 64 · inter 17408 · vocab 248320
@@ -342,13 +342,13 @@ prefill@8192 每 rank 10.7GB → 串行 0.81s(必须与 GEMM 重叠)。
 - 骨架:`crates/backends/comm/src/lib.rs`(CommCap/CommBackend/CommRouter/Topology)
 - iface 窄口:`crates/backends/iface/src/lib.rs`(MemStats 107-108 / malloc_peer_shared 259 /
   enable_peer_access 285 / map_remote 290 / DeviceDesc 64)
-- 驱动与窗口机制:`p2p-build/README.md`、`docs/llama.cpp/v3基线不通-立案排查.md` §十、
-  `docs/llama.cpp/method3-动态BAR1-P2P-施工文档.md`(§一 原理 / §十四 混插 / §14.7 红线)、
-  `docs/llama.cpp/vmm-p2p-3080会战-测试报告.md`(§七/§八 十坑)、
-  `docs/llama.cpp/3080-p2p驱动攻坚-setAccess205-定位实录.md`(F0/F1/F2)
-- 单进程引擎封死机理:`docs/llama.cpp/p2p-allreduce-后端-施工文档.md`(设计完成待施工)、
-  `docs/llama.cpp/patch3-besteffort-cudaMalloc-施工文档.md`
+- 驱动与窗口机制:外部存档:驱动补丁仓、外部存档:llama.cpp《v3基线不通-立案排查》§十、
+  外部存档:llama.cpp《method3-动态BAR1-P2P-施工文档》(§一 原理 / §十四 混插 / §14.7 红线)、
+  外部存档:llama.cpp《vmm-p2p-3080会战-测试报告》(§七/§八 十坑)、
+  外部存档:llama.cpp《3080-p2p驱动攻坚-setAccess205-定位实录》(F0/F1/F2)
+- 单进程引擎封死机理:外部存档:llama.cpp《p2p-allreduce-后端-施工文档》(设计完成待施工)、
+  外部存档:llama.cpp《patch3-besteffort-cudaMalloc-施工文档》
 - 对标读数:`vllm.md`(TP2 三线表)、`qwen38-single-3090.md`(单卡)、
-  `nex-3080对-三引擎会战.md`(+28.5%)、`docs/exllamav3/*.md`(A/B 后端律)
-- owl 自身归因:`roadmap.local/代差分析与演进路线.md`(2026-10-01 逐核分账)、
-  回归读数见 `docs/bench/data/owl-main-regress-2026-10-16/`
+  `nex-3080对-三引擎会战.md`(+28.5%)、外部存档:exllamav3 卷宗(A/B 后端律)
+- owl 自身归因:本地台账《代差分析与演进路线》(2026-10-01 逐核分账)、
+  回归读数见本地原始数据(未入库)

@@ -1,7 +1,6 @@
 /target
 # Cargo.lock **入库**(应用/二进制仓):`cargo build --locked` 才能复现依赖树。
 # 公共库形态另行裁决时再移出。
-AGENTS.md
 *.local.md
 roadmap.local/
 target

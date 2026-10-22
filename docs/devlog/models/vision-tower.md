@@ -1,7 +1,7 @@
 # 视觉塔(Qwen3.5-VL ViT)接入 owl —— 设计与 CPU 对拍方案
 
-> 2026-10-15 立项;worktree `packages/worktrees/owl/vision-tower`(分支 `feat/vision-tower` @ `c18c0be`)。
-> 定位:本文件是**视觉塔**的设计文档(实现与施工记录另起 / 记 `roadmap.local`)。
+> 2026-10-15 立项;worktree `工作树 vision-tower(旧位置)`(分支 `feat/vision-tower` @ `c18c0be`)。
+> 定位:本文件是**视觉塔**的设计文档(实现与施工记录另起 / 记本地台账区)。
 > 设计输入三份,全部已核:
 > ① **HF 参考实现**(`transformers` 5.19.0,**已装进 `crates/models/.venv`**;逐条摘录见 §1,行号指向
 >    `transformers/models/qwen3_5/modeling_qwen3_5.py` 与 `transformers/vision_utils.py`);
@@ -366,7 +366,7 @@ OWL_TEST_DEVICE=2 cargo test -p owl-models --lib    # GPU 门测试要指定空�
 ## 10. M3-opt:换用 FlashInfer(FA2 家族)非因果注意力 + 切 4B 档(2026-10-15 收尾)
 
 **两条用户裁决的落地**:
-① **目标档切 `models/Qwen/Qwen3.5-4B`**(自带 `model.visual.*` 297 张量 ⇒ 完整 VLM;
+① **目标档切 `/path/to/models/Qwen/Qwen3.5-4B`**(自带 `model.visual.*` 297 张量 ⇒ 完整 VLM;
 塔 = 24 层 / hidden 1024 / **head_dim 64** / out 2560;总权重 9.3G ⇒ 单张 3080 装得下 + KV 有余);
 ② **视觉塔不再自写算子**:注意力改走 owl 已 vendored 的 **FlashInfer FA2 家族**
 `BatchPrefillWithRaggedKVCacheDispatched` + `MaskMode::kNone`(非分页 dense K/V、varlen、非因果)

@@ -5,7 +5,7 @@
 > - [`crates/backends/README.md`](crates/backends/README.md) — **CUDA admission rule**
 >   (any CUDA-touching library must be source-reviewed for untracked allocations;
 >   if it calls `cudaMalloc` behind your back, don't use it — or copy it in and fix it);
-> - [`docs/arch/charter.md`](docs/arch/charter.md) A4 — the four ownership classes.
+> - [`docs/devlog/canon/charter.md`](docs/devlog/canon/charter.md) A4 — the four ownership classes.
 >
 > 2026-10-21: this file used to be a placeholder; it is now materialized.
 
@@ -40,10 +40,10 @@
 
 | Source | Used for | Where |
 |---|---|---|
-| vLLM (production incumbent) | Baseline comparison / piecewise and degradation semantics | `docs/bench/`, construction volumes |
-| candle / attention-rs / mistral.rs | Early material evaluation | `docs/arch/charter.md` §3 (historical; **not** dependencies today) |
-| llama.cpp (head) | MMQ / GGUF semantics comparison | `docs/llama.cpp/` |
-| FlashInfer upstream | plan semantics / variant comparison | `docs/arch/prefill-attention-换核-候选单测.md` |
+| vLLM (production incumbent) | Baseline comparison / piecewise and degradation semantics | `docs/devlog/perf/`, construction volumes |
+| candle / attention-rs / mistral.rs | Early material evaluation | `docs/devlog/canon/charter.md` §3 (historical; **not** dependencies today) |
+| llama.cpp (head) | MMQ / GGUF semantics comparison | 外部存档(llama.cpp 卷宗) |
+| FlashInfer upstream | plan semantics / variant comparison | `docs/devlog/kernels/prefill-attention-swap.md` |
 
 > None of these are in this repo's dependency graph (`Cargo.toml` contains only
 > workspace-local `path` dependencies).

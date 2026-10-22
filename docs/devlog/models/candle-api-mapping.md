@@ -1,7 +1,7 @@
 # candle_core::Tensor API → owl 翻译映射表
 
 > 版本:v0.1(2026-09-22,T1 机械普查产物)。
-> 参照源:`packages/xinfer/crates/core/src`(**108 个 .rs 文件,只读**)。
+> 参照源:`xinfer`(外部存档)(**108 个 .rs 文件,只读**)。
 > owl 侧现状(2026-09-22 快照):`crates/nn/src/tensor.rs`(Tensor 仅 f32;
 > 现有方法 shape/dtype/device_ptr/token/elems/dims/reshape/t2/transpose/narrow/
 > broadcast_as/persistent/to_vec)+ `crates/nn/src/ops.rs`(fill_from_host/

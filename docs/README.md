@@ -12,8 +12,15 @@
 > Layout (2026-10-22): every body document lives under `devlog/`, grouped by theme;
 > filenames are ASCII slugs (no numbering, no dates). Cross-references inside
 > documents are **name-only** by convention — no directory paths.
+>
+> **No hard-coded paths to things a reader cannot see.** References to anything
+> outside this repository, or to git-ignored locations, are written with one of
+> these markers instead of a path:
+> `外部存档` (external archive) · `本地台账` (local work ledger) ·
+> `本地实测档` (local measurement archive) · `本地原始数据` (local raw data) ·
+> `/path/to/models/…` (weights you supply) · `<worktree>/…` (git worktree).
 
-Progress: **0 / 80** reviewed.
+Progress: **0 / 81** reviewed.
 
 Body documents are written in **Chinese**; this index and all meta documents
 (`README`, `CONTRIBUTING`, `SECURITY`, `VENDOR.list.md`, `NOTICE`) are in **English**.
@@ -105,35 +112,30 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/serving/session-plan.md`](devlog/serving/session-plan.md) — Session orchestration surface
 - ⬜ [`devlog/serving/config-ux.md`](devlog/serving/config-ux.md) — Configuration UX (fully explicit fields)
 
-## I. Performance framework and comparisons
+## I. Performance and engineering (framework · device · pitfalls · bench reports)
 
 - ⬜ [`devlog/perf/perf-framework.md`](devlog/perf/perf-framework.md) — Performance framework: metrics + interpreter hooks
 - ⬜ [`devlog/perf/optimization-candidates.md`](devlog/perf/optimization-candidates.md) — Optimization candidate ledger: prefill/decode candidates, verdicts, closed doors
 - ⬜ [`devlog/perf/decode-cycle.md`](devlog/perf/decode-cycle.md) — decode cycle breakthrough (vLLM/SGLang comparison)
 - ⬜ [`devlog/perf/hyperqwen-survey.md`](devlog/perf/hyperqwen-survey.md) — Single-24G-card 27B serving benchmark (gap verdict)
+- ⬜ [`devlog/perf/device-command-ledger.md`](devlog/perf/device-command-ledger.md) — DeviceHandle: allocation ledger + command face
+- ⬜ [`devlog/perf/stream-ordering.md`](devlog/perf/stream-ordering.md) — GPU-server cross-stream ordering
+- ⬜ [`devlog/perf/alloc-naming.md`](devlog/perf/alloc-naming.md) — Named allocations + OOM dump
+- ⬜ [`devlog/perf/log-framework.md`](devlog/perf/log-framework.md) — logger: event-stream outlet (level + tag + tee)
+- ⬜ [`devlog/perf/test-architecture.md`](devlog/perf/test-architecture.md) — Test architecture (two classes, single entry point)
+- ⬜ [`devlog/perf/test-macro.md`](devlog/perf/test-macro.md) — #[owl_test] procedural macro
+- ⬜ [`devlog/perf/pitfalls-general.md`](devlog/perf/pitfalls-general.md) — Common development pitfalls
+- ⬜ [`devlog/perf/pitfalls-cuda.md`](devlog/perf/pitfalls-cuda.md) — CUDA/Graph pitfall ledger
+- ⬜ [`devlog/perf/owl-phase1-nn.md`](devlog/perf/owl-phase1-nn.md) — owl speed compilation (phase-1 nn path)
+- ⬜ [`devlog/perf/qwen38-single-3090.md`](devlog/perf/qwen38-single-3090.md) — 27B single-card engine battle
+- ⬜ [`devlog/perf/v1-fi-switch.md`](devlog/perf/v1-fi-switch.md) — All three attention phases moved to FI
+- ⬜ [`devlog/perf/session-2026-10-14.md`](devlog/perf/session-2026-10-14.md) — 2026-10-14 prefill attention kernel swap: closing notes
+- ⬜ [`devlog/perf/w4a16-prefill-bucket-ab.md`](devlog/perf/w4a16-prefill-bucket-ab.md) — W4A16 × prefill buckets A/B (no benefit, verdict)
+- ⬜ [`devlog/perf/w4a8-prefill-bucket-ab.md`](devlog/perf/w4a8-prefill-bucket-ab.md) — W4A8 × prefill buckets A/B
+- ⬜ [`devlog/perf/gguf-kvmem-decode-nsys.md`](devlog/perf/gguf-kvmem-decode-nsys.md) — GGUF × KVMem decode verdict (bandwidth wall)
+- ⬜ [`devlog/perf/tp2-decode-fast.md`](devlog/perf/tp2-decode-fast.md) — TP2 decode fast path + W4A8 attribution + draft-pool ring (2026-10-22)
 
-## J. Infrastructure: device, logging, testing, pitfalls
-
-- ⬜ [`devlog/infra/device-command-ledger.md`](devlog/infra/device-command-ledger.md) — DeviceHandle: allocation ledger + command face
-- ⬜ [`devlog/infra/stream-ordering.md`](devlog/infra/stream-ordering.md) — GPU-server cross-stream ordering
-- ⬜ [`devlog/infra/alloc-naming.md`](devlog/infra/alloc-naming.md) — Named allocations + OOM dump
-- ⬜ [`devlog/infra/log-framework.md`](devlog/infra/log-framework.md) — logger: event-stream outlet (level + tag + tee)
-- ⬜ [`devlog/infra/test-architecture.md`](devlog/infra/test-architecture.md) — Test architecture (two classes, single entry point)
-- ⬜ [`devlog/infra/test-macro.md`](devlog/infra/test-macro.md) — #[owl_test] procedural macro
-- ⬜ [`devlog/infra/pitfalls-general.md`](devlog/infra/pitfalls-general.md) — Common development pitfalls
-- ⬜ [`devlog/infra/pitfalls-cuda.md`](devlog/infra/pitfalls-cuda.md) — CUDA/Graph pitfall ledger
-
-## K. Bench reports
-
-- ⬜ [`devlog/bench/owl-phase1-nn.md`](devlog/bench/owl-phase1-nn.md) — owl speed compilation (phase-1 nn path)
-- ⬜ [`devlog/bench/qwen38-single-3090.md`](devlog/bench/qwen38-single-3090.md) — 27B single-card engine battle
-- ⬜ [`devlog/bench/v1-fi-switch.md`](devlog/bench/v1-fi-switch.md) — All three attention phases moved to FI
-- ⬜ [`devlog/bench/session-2026-10-14.md`](devlog/bench/session-2026-10-14.md) — 2026-10-14 prefill attention kernel swap: closing notes
-- ⬜ [`devlog/bench/w4a16-prefill-bucket-ab.md`](devlog/bench/w4a16-prefill-bucket-ab.md) — W4A16 × prefill buckets A/B (no benefit, verdict)
-- ⬜ [`devlog/bench/w4a8-prefill-bucket-ab.md`](devlog/bench/w4a8-prefill-bucket-ab.md) — W4A8 × prefill buckets A/B
-- ⬜ [`devlog/bench/gguf-kvmem-decode-nsys.md`](devlog/bench/gguf-kvmem-decode-nsys.md) — GGUF × KVMem decode verdict (bandwidth wall)
-
-## L. Developer guide (how to change things)
+## J. Developer guide (how to change things)
 
 - ⬜ [`devlog/dev/README.md`](devlog/dev/README.md) — Developer entry point (navigation for this directory)
 - ⬜ [`devlog/dev/config.md`](devlog/dev/config.md) — Config chain: intent → derive → preflight → explain

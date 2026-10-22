@@ -2,10 +2,10 @@
 
 > 目标:回答"长上下文的 prefill/decode 变慢,到底是哪些算子/步骤在耗"。
 > 方法:`llm_speedtest`(黑盒)+ 引擎自带仪器(host 分相 → CUPTI 逐核)。
-> 实例:`packages/worktrees/owl/perf` 自建二进制(`--features perf,cupti`,
+> 实例:`工作树 perf(旧位置)` 自建二进制(`--features perf,cupti`,
 > commit `c18c0be` + 本 worktree 配置),**GPU2 单卡 3090 Ti**,生产形状
 > (flavor `spec-dflash`:fp8 池 + XQA + DFlash2 d7),几何放大到 40960/41216。
-> 原始数据:`perf-runs/ladder-h1/`(host 档)、`perf-runs/ladder-gpu2/`(CUPTI 档)。
+> 原始数据:本地实测档(未入库)(host 档)、本地实测档(未入库)(CUPTI 档)。
 
 ---
 
@@ -119,13 +119,13 @@ KV-split 开(verify 臂非 `single_block`)。KV 因 token-block 分裂被**重�
 
 ```bash
 # 实例(GPU2 = GPU-89dffb90-...;生产在 GPU1,不打扰)
-cd packages/worktrees/owl/perf
+cd <worktree>/perf
 CUDA_VISIBLE_DEVICES=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
   ./target/release/server --flavor spec-dflash testdata/args/perf-ctxladder-27b.toml \
   --perf-level host --log-level info
 
 # 梯子(逐点跑 llm_speedtest + 抓 epoch perf/发射账)
-python3 tools/ctxladder.py --out perf-runs/<name> \
+python3 tools/ctxladder.py --out <out-dir> \
   --lengths 512,2048,8192,16384,32768 --rounds 1 --notes "<档位说明>"
 
 # 逐核档:CUPTI 必须在 boot 武装 ⇒ 重启实例并加 --perf-level gpu

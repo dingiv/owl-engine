@@ -1009,7 +1009,7 @@ compute-sanitizer 才排除。与其每次靠仪器挖,不如在唯一咽喉把�
 ## 十八、双路独立审查整改(2026-10-15;fork 子代理 + 父会话复核)
 
 两路 **fork 子代理**(继承本轮全部调查史)分别审 `crates/kernels/**` 与 CUDA 后端
-`server/**`;报告存 `roadmap.local/26-10-15-审查-{kernels,server}.md`。
+`server/**`;报告存本地台账《26-10-15-审查-{kernels,server}》。
 **父会话逐条复核**后落地"简单项",复杂项留新会话(见 §18.4)。
 
 ### 18.1 本轮落地(9 项)
@@ -1023,7 +1023,7 @@ compute-sanitizer 才排除。与其每次靠仪器挖,不如在唯一咽喉把�
 | 5 | **`note_device` 守门 + 入账挪到发射成功后**:`note_enabled()`(缺省 false,GpuRes 覆写)⇒ 关账不建载荷 | `kernels/device.rs`、`server/mod.rs` | 关账零分配;账与事实一致 |
 | 6 | **GDN 两族 `slot` 跨参校验**(host 标量乘进状态块指针,唯一未校验处):`check()` 覆写 + `checked_mul` + 账长比较 | `ops/gdn_{chunked,scalar}.rs` | **正例 2 + 负例 2** 单测(越界拒 / 未知块拒 / 边界格放行) |
 | 7 | **门补强三处**:① `no_runtime_compile` **删白名单短路**(一行同时含 `Ptx::from_binary` 与禁词即被豁免 = 一行级绕过)+ ROOTS 自检(顶层带 Cargo.toml 的目录必须在扫描面);② `slot_order_lock` **扩 dtype/rank 类型签名锁**;③ 名字门**补正例半边**(清单改从 `ops::all()` **派生**,不再手写) | 三处门 | 各门自测 + "混合行必报"反证 + 名字门 2/2 |
-| 8 | **清理**:`src/server.rs.bak`(2000 行死文件)→ `docs/archive/`;`cu_sig.rs` 误导 FIXME(删它会断掉表↔签名互证门);`crate::list` 死引 ×5;`cmd_name` 与 `Command::kind()` **合一**;`carve_block` 区间防溢出(`range_fits`);`gpu_client::htod` **dtype 交叉校验**(不再 `let _ = dtype`);注释漂移(捕获护栏清单/名字住址/gdn parse 边界);fmt nit | — | 编译 + 门 |
+| 8 | **清理**:`src/server.rs.bak`(2000 行死文件)→ 本地归档区;`cu_sig.rs` 误导 FIXME(删它会断掉表↔签名互证门);`crate::list` 死引 ×5;`cmd_name` 与 `Command::kind()` **合一**;`carve_block` 区间防溢出(`range_fits`);`gpu_client::htod` **dtype 交叉校验**(不再 `let _ = dtype`);注释漂移(捕获护栏清单/名字住址/gdn parse 边界);fmt nit | — | 编译 + 门 |
 | 9 | **删死字段** `DiagOpts::legacy_sync`(复核结论见 §18.2) | `state.rs`、`harvest.rs` | 编译 + 单测 |
 
 ### 18.2 复核纠正的一条审查结论(不成立)

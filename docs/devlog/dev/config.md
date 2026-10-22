@@ -249,7 +249,7 @@ ls profiles/
     回下限。两档 verify/fold/propose 图族 boot 期全量预捕获（d3+d7 共 24 face），
     运行期只换引用；捕获不全 = boot 硬失败。T1b v2 = 每 8 轮窗口，连续 2 窗
     `tokens/round < adaptive_min_tpr` 才只降不升到 `depth_min`。
-    A/B 命令见 `perf-runs/mtp-longctx-2026-10-21/REPORT.md` §8。
+    A/B 命令见本地实测档(未入库) §8。
     `qwen38_27b-3090-w4a16-mtp.toml` 保持静态 d3 + window；
     `qwen38_27b-3090-iq4xs-mtp.toml`（GGUF 单卡）已开 window + T1b 自适应。
 - **图像 × 投机**(`spec.depth>0`)已接(V5):verify 的 rope 位置 =

@@ -118,7 +118,7 @@ mmq.cu + 22 模板实例 + per-arch mmq-config)。
   有),GGUF 内嵌词表读取挂账(llama-vocab 复刻,工程不小)。
 
 **对拍基建已有**:llama.cpp 源码树 + llama-test 工具链在工作区,GGUF
-数值锚可直接用 llama.cpp 生成;docs/llama.cpp 坏文件结案实录 = 先例坑位
+数值锚可直接用 llama.cpp 生成;外部存档:llama.cpp 卷宗(坏文件结案) = 先例坑位
 (type/对齐/版本)已知,本次是读不是写。
 
 ### Q4++ 格式即生态律(2026-09-26,mmq.cu 证据)

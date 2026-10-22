@@ -1,8 +1,8 @@
 # E5-DFlash2 施工方案 —— 语义定谳与 owl 落地设计
 
-> 2026-10-07。上游参考:packages/sglang `srt/models/dflash.py`(1175 行,
+> 2026-10-07。上游参考:sglang(外部存档) `srt/models/dflash.py`(1175 行,
 > sglang-dflash-patch 分支)+ `kernels/ops/speculative/dflash.py` +
-> dflash_worker_v2;检查点:models/z-lab/Qwen3.8-27B-DFlash2(BF16 3.85GB,
+> dflash_worker_v2;检查点:/path/to/models/z-lab/Qwen3.8-27B-DFlash2(BF16 3.85GB,
 > 81 张量,1.92B 参数;W4A16/GGUF 备选在库)。
 > 前置:M5 管线(verify/accept/fold/restore/桶形图/extend)drafter 无关,
 > 全部复用;本文只写 DFlash2 特有件。

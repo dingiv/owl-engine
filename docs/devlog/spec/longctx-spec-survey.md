@@ -3,7 +3,7 @@
 > 触发:用户判断"对 ctx 长度的敏感性太大,而且我们的投机核心是仿 xinfer 的社区实现,不是正规军"
 > ⇒ 要①把衰减归因钉死 ②去社区找方案。
 > 本文 = 两边对账 + 候选清单(带判据)。数据全部来自本 worktree 的实测
-> (`longctx-attribution.md` + `perf-runs/`)。
+> (`longctx-attribution.md` + 本地实测档(未入库))。
 
 ---
 

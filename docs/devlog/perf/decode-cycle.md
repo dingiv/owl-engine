@@ -4,7 +4,7 @@
 > **28.5ms**(nsys lm-start-to-lm-start,python 客户端口径 20 t/s 系同污染相对值),
 > vLLM 同模型同卡 **21.3ms**(46.9 t/s,同工具)。差 7.2ms。本文 = 对比、归因、方案。
 
-## 一、对标:vLLM Qwen3-Next decode 步结构(repos/vllm 实读)
+## 一、对标:vLLM Qwen3-Next decode 步结构(vllm(外部存档) 实读)
 
 GDN 层(`vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`,1748 行):
 

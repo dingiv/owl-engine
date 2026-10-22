@@ -1,6 +1,6 @@
 # Owl 立项总设 —— graph 与 TP 一等公民的推理引擎
 
-> 版本:v0.1(2026-09-22 立项)。需求基线:继承 `packages/xinfer/docs/arch/requirements.md`
+> 版本:v0.1(2026-09-22 立项)。需求基线:继承 `xinfer`(外部存档)
 > v1.0 全部定量目标(prefill 7656 / decode 157 / ctx 262k,及格/达标/冲刺三线不变),
 > 本文档不重复指标表,只写**架构层裁决**。
 > 关系:生产 = vLLM(不动);对照与判例库 = xinfer(冻结存档);本项目 = 从架构层
@@ -161,10 +161,10 @@
 
 | 原材料 | 来源 | 用法 | 所有权 |
 |---|---|---|---|
-| candle fork(图安全焊缝) | repos/candle-gb @ 23a6f38 | 张量底座,只读快照 | 冻结 |
-| attention-rs @ c0f19f2 | repos/attention.rs | paged attention/fused rope/moe kernel | 冻结 |
+| candle fork(图安全焊缝) | candle-gb(外部存档) @ 23a6f38 | 张量底座,只读快照 | 冻结 |
+| attention-rs @ c0f19f2 | attention.rs(外部存档) | paged attention/fused rope/moe kernel | 冻结 |
 | mistral.rs   |  全库 | copy 源码 | 冻结 |
-| marlin-ffi / moe-marlin-ffi | packages/xinfer(P3 产物) | W4A16/W4A8/moe GEMM 主力算子 | **我们自己写的,活跃** |
+| marlin-ffi / moe-marlin-ffi | xinfer(外部存档,P3 产物) | W4A16/W4A8/moe GEMM 主力算子 | **我们自己写的,活跃** |
 | cudarc fork @ 2e81793 | 经 candle 传递 | driver API(graph/池) | 冻结 |
 | DFlash2 草稿 | models/syvai 等 | 投机解码草稿 | 数据 |
 | GDN port 规格 | requirements REQ-DEC-05 | turbomind delta_rule 移植任务书 | 任务 |
@@ -174,7 +174,7 @@
 ## 四、crate 划分
 
 ```
-packages/owl/
+
 ├── crates/signal      M0 期名 —— 已**并入 iface**(`owl-iface::signal`):依赖追踪栈
 │                      (thread-local;零后端语义)。**M2 桩,当前零调用点**
 ├── crates/graph       图运行时:预算登记/捕获治理/定影协议/降级(公理 A1 落点)

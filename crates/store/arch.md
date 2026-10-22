@@ -1,6 +1,6 @@
 # owl-store(状态存储)模块约束
 
-> **来源**:`docs/arch/store-状态存储-设计与迁移.md`(立项卷,唯一权威;本文件只做落地约束的浓缩)。
+> **来源**:`docs/devlog/memory/store.md`(立项卷,唯一权威;本文件只做落地约束的浓缩)。
 > **code-master 标记**:本 crate 的约束写在这里与各文件头;行内偏离用 `// CMA:`。
 
 ## 这个 crate 是什么
@@ -44,7 +44,7 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
 
 1. `Rel` 关系层(**要两条腿齐备**;只有 KV 一条腿时立它 = 半空门面)—— 待 S2/S2b 状态腿;
 2. 盘层(§15.4 的 disk connector;`Carrier::Disk` 位已留);
-3. 挂账清单集中在本包 `docs/arch/store-状态存储-设计与迁移.md` **§20**。
+3. 挂账清单集中在本包 `docs/devlog/memory/store.md` **§20**。
 
 ## 律(违反即 `// CMA:` 标记)
 

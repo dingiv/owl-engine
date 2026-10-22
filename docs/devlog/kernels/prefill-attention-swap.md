@@ -73,7 +73,7 @@ f16 变体未单独测 —— 因为生产池是 fp8)。
 ## 3. 集成配方(work order;下一会话可直接照做)
 
 **① 换源(已备)** `crates/kernels/cu/fi2/`
-- `include/flashinfer/**` = 上游 nightly-0.6.18(`repos/flashinfer` @ `fdc56343`,
+- `include/flashinfer/**` = 上游 nightly-0.6.18(`flashinfer`(外部存档) @ `fdc56343`,
   2026-09-17)的 **paged prefill 头闭包 25 文件 / 0.85 MB**(闭包复现法:`nvcc -M`
   扫一个含 `BatchPrefillWithPagedKVCacheDispatched` 的 TU;清单见 `cu/fi2/README.md`)。
   **自足已验证**:只用这 25 头即可编译并复现全部数字。
@@ -136,7 +136,7 @@ f16 变体未单独测 —— 因为生产池是 fp8)。
 ## 6. **已换源落地**(2026-10-14;用户"可以,开始替换")
 
 **动作**:把 owl 的 FI 从 `guoqingbao/flashinfer` fork @2026-08-07 **换成上游
-nightly-0.6.18**(`repos/flashinfer` @`fdc56343`),**ABI 逐字未变**
+nightly-0.6.18**(`flashinfer`(外部存档) @`fdc56343`),**ABI 逐字未变**
 (`owl_fi_prefill_plan` / `_run` / `_run_fp8kv` 三个 C 入口、15×int64 的 plan blob、
 槽序、`FI_SPLIT_KV`/`FI_DEBUG` 旋钮全保留)⇒ **Rust 侧(family/server/探针)零改动**。
 

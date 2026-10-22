@@ -1,6 +1,6 @@
 # MTP 草稿 KV 追赶 —— T3 前置设计与施工
 
-> 2026-10-22 · 工作树 `packages/owl-worktrees/mtp-spec`
+> 2026-10-22 · 工作树 `工作树 mtp-spec`
 > 分支 `feat/mtp-spec` · 关联：
 > - `mtp-longctx-handoff.md` §7（T3）
 > - `mtp-longctx-windowed.md` §5（T1 自适应 depth）

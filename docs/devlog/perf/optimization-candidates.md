@@ -1,7 +1,7 @@
 # 优化候选总表 —— 性能工作清单(prefill / decode)
 
-> **来源与定位**:本卷是 `roadmap.local/优化候选总表-2026-10-14.md`(453 行,
-> 「下一会话的直接入口」)与 `roadmap.local/perf-roadmap-2026-10-08.md`(2079 行,
+> **来源与定位**:本卷是本地台账《优化候选总表-2026-10-14》(453 行,
+> 「下一会话的直接入口」)与本地台账《perf-roadmap-2026-10-08》(2079 行,
 > 逐轮补录与已关闭项)的**摘要收编**(2026-10-22 入库)。
 > **本地全本仍是活台账**(不入 git,持续更新);本卷保留的是**判据与定谳**——
 > 尤其是「已关死、禁止重挖」清单与测量纪律。新读数先落本地全本,定谳再回写本卷。
@@ -39,7 +39,7 @@ cargo build --release -p server --features perf
 cargo build --release -p server --features perf,cupti
 ./target/release/server --flavor spec-dflash <cfg> --log-level warn --perf-level gpu
 # 统一口径测速(五点三轮)
-packages/llm_speedtest: uv run cli --api-url <端点> --model <名> --flavor std
+llm_speedtest(外部存档): uv run cli --api-url <端点> --model <名> --flavor std
 ```
 
 **口径警告**:① 测轮时/decode 必须用 `testdata/args/spec-27b-prod.toml`
@@ -143,9 +143,9 @@ std/decode 要 `awq27b`;配错 = 静默换引擎。
 
 ### D6 并发批桶(B5.1)—— 3-5 天,std 聚合 ≥2×
 
-- 立项已在 `roadmap.local/b5-concurrent-batch-立项.md`;B5.0 核级证可已完成;
+- 立项已在本地台账《b5-concurrent-batch-立项》;B5.0 核级证可已完成;
   设计与裁决见 `cross-session-batch.md`。**2026-10-22 状态:施工中**
-  (worktree `packages/owl-worktrees/server-engine` / 分支 `feat/b5-batch`)。
+  (worktree `工作树 server-engine` / 分支 `feat/b5-batch`)。
 
 ### D7 B4 域自适应
 
@@ -208,14 +208,14 @@ std/decode 要 `awq27b`;配错 = 静默换引擎。
 - 代价:激活在线量化核 + per-token scale + 精度门(长 ctx 累积)⇒ 立项 + 金标 + 抽检。
 - 预期:prefill 385 → ~200-230 ms;1297 → **~2200-2500 t/s(过 2178 及格线)**。
 - **2026-10-22 状态:✅ 已交付** —— 算子家族与接线见 `w4a8-family.md`;
-  TP2 上 prefill **+47%**(2026-10-22 TP2 快档实测,数据 `docs/bench/data/`);单独成档(非默认,
+  TP2 上 prefill **+47%**(2026-10-22 TP2 快档实测,数据本地原始数据(未入库));单独成档(非默认,
   因 decode 回退)。
 
 ### M1–M3 小肉(2026-10-19 账)
 
 - M1 `gdn_norm_act`(warp-per-unit,估 −2 ms/块):**✅ 已落**(`f1f4c6b`);
 - M2 `owl_concat_rows`(48 GB/s 跨步读,估 ~0.3%):**挂账**(收益小);
-- M3 FLA(8 ms):见 `roadmap.local/26-10-19-prefill-8192-头寸分析.md`。
+- M3 FLA(8 ms):见本地台账《26-10-19-prefill-8192-头寸分析》。
 
 ### P1 ❌ 作废(归因定谳;下列数字是 `srv.op.*` 下发耗时,非设备时间)
 
@@ -343,4 +343,4 @@ std/decode 要 `awq27b`;配错 = 静默换引擎。
 5. **32k 墙的非 GPU 空窗 48.5%** —— 2026-10-17 定为首要下一刀
    (与 decode 的 2.5× 结构空档同族;见 `decode-cycle.md`);
 6. **int8-QK prefill**:判决暂不做(天花板 +4.1%),卷 =
-   `roadmap.local/26-10-17-int8-QK-prefill-调研.md`(触发条件已写)。
+   本地台账《26-10-17-int8-QK-prefill-调研》(触发条件已写)。

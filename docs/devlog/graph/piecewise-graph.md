@@ -525,7 +525,7 @@ OWL_GATE_PIECEWISE=1 OWL_GATE_XQA=1 OWL_E2E_ONLY=dflash2_identity cargo test ...
 
 **为什么要换小模型**:0.8B 是 **f16 池**、且 XQA 不可用(hq/hkv≠6)⇒ 参考臂天然是 **v2 decode**,
 正好把"fp8 行写者/读法"这一大类嫌疑**裁掉一层**;且 boot ~10s(27B 是 ~90s)⇒ 追凶迭代快一个量级。
-落点:`testdata/args/dec08-{base,fi}.toml`(kind="0.8b", `dir=models/Qwen/Qwen3.5-0.8B`,
+落点:`testdata/args/dec08-{base,fi}.toml`(kind="0.8b", `dir=/path/to/models/Qwen/Qwen3.5-0.8B`,
 greedy, `depth=0`,`max_seq=2048`(⚠️ `_MIN_GEN_TOKENS=1024` ⇒ max_seq 太小会恒拒发),
 `pool_tokens=4096`);run:`FLAVOR=awq27b CVD=<空闲 3080 uuid> bash tools/pw-ab-greedy.sh …`
 (harness 的 flavor/CVD 已参数化;⚠️ GPU1/2 是主会话实例,别动,用 GPU0/3 的 3080)。
