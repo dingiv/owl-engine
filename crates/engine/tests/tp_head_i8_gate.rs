@@ -4,10 +4,19 @@
 //! 1. **结构**:词表切档下每 rank 的 logits 宽 = `vocab/2`(i8 头与 bf16 头
 //!    同源 ⇒ 派生键 `lm_head.i8q/i8s` 确实按 `UniformCol` 切了行;宽度不等
 //!    = 装载规则/头槽不一致);
-//! 2. **可跑**:TP2 装配 + 双 rank 图捕获 + 一个 turn 全链(i8 头走
-//!    `owl_gemv_i8w_{f16,bf16}`,prefill 与 decode 同核);
+//! 2. **可跑**:TP2 装配 + 双 rank 图捕获 + 一个 turn 全链(i8 头
+//!    m=1 走 `owl_gemv_i8w_*`,spec verify m=8 / DFlash2 propose m=7
+//!    走 `owl_gemv_i8w_mt_*`;W8A8 臂同路走 `*_a8_*`);
 //! 3. **数值**:与 bf16 头的 **token 级**一致率 ≥ 0.95(两进程各跑一臂再比;
 //!    同进程连跑两臂 = 两次 27B 装载,第二次被 VRAM 池守卫拒)。
+//!
+//! # spec 臂(2026-10-22 质量门)
+//!
+//! `OWL_TP_HEAD_SPEC=1` 时按生产 DFlash2 d7 启动:target verify = 8 行,
+//! draft propose 复用 target lm_head = 7 行 ⇒ 这正是 W8A8 的 m=7/8 路径。
+//! `OWL_TP_HEAD_DRAFT` 可覆盖草稿目录;缺省取 target 同级的 syvai 档。
+//! 结束时打印 `spec.rounds` / `spec.m0..m7`,轮次 > 0 即证明 verify 走了
+//! m=8(DFlash2 的 verify 行数 = depth+1,不是 1)。
 //!
 //! # 运行(两进程 + 一次比对)
 //!
@@ -17,6 +26,11 @@
 //! OWL_TP_TEST_DEV_A=2 OWL_TP_TEST_DEV_B=3 OWL_TP_HEAD_ARM=i8 \
 //!   cargo test -p owl-engine --test tp_head_i8_gate -- --nocapture
 //! OWL_TP_HEAD_ARM=compare cargo test -p owl-engine --test tp_head_i8_gate -- --nocapture
+//! OWL_TP_HEAD_ARM=a8 ...       # W8A8 臂
+//! OWL_TP_HEAD_ARM=compare_a8 ... # i8 vs a8 一致率
+//! OWL_TP_HEAD_SPEC=1 OWL_TP_HEAD_ARM=i8 ...   # spec m=7/8 质量门
+//! OWL_TP_HEAD_SPEC=1 OWL_TP_HEAD_ARM=a8 ...
+//! OWL_TP_HEAD_ARM=compare_a8 ...
 //! ```
 //! `A`/`B` = TP2 双 rank 卡(**CUDA ordinal**;本机 3080 对 = `2,3`)。
 //! 臂文件 = `$OWL_TP_HEAD_OUT`(缺省 `/tmp/owl-tp-head-<arm>.txt`)。
@@ -25,11 +39,15 @@ use std::path::{Path, PathBuf};
 
 use owl_engine::{Engine, EngineConfig, EngineKnobs, TpEngine};
 use owl_models::module::QuantPlan;
+use owl_shared::config::HeadQuant;
 
-const PROMPTS: [&str; 3] = [
+const PROMPTS: [&str; 6] = [
     "用五十字介绍长城。",
     "一个水池有甲乙两个进水管，甲管单独注满需要 6 小时，乙管单独注满需要 4 小时。两管同时打开，多少小时可以注满？",
     "用 Rust 写一个求中位数的函数。",
+    "解释快速排序的基本思想，并给一个包含 8 个元素的例子。",
+    "写一个 Python 脚本读取 CSV 文件，统计其中某一列的平均值，并处理空值。",
+    "请用三百字说明为什么长上下文推理中固定尾部比随机前缀更难，并给出一个例子。",
 ];
 
 fn dir_of() -> PathBuf {
@@ -40,20 +58,64 @@ fn dir_of() -> PathBuf {
         })
 }
 
-/// 两臂同参:greedy(设备 argmax)+ 关前缀缓存(同 `tp_vocab_split_gate`)
-fn knobs() -> EngineKnobs {
+fn spec_on() -> bool {
+    matches!(std::env::var("OWL_TP_HEAD_SPEC").as_deref(), Ok("1") | Ok("true"))
+}
+
+fn draft_dir_of(dir: &Path) -> PathBuf {
+    std::env::var("OWL_TP_HEAD_DRAFT").map(PathBuf::from).unwrap_or_else(|_| {
+        let models = dir
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or_else(|| Path::new("."));
+        models.join("syvai/Qwen3.8-27B-DFlash2-W4A16")
+    })
+}
+
+/// 臂 → 配置头方案。**必须与 loader 的 head_plan 同源**:tag filter 从
+/// `EngineKnobs.head_quant` 投影;只传 loader plan 而这里留 Off,会在
+/// 装配期被 `owl_gemv_i8w_*` 的 QUANT_INT8 facet 响亮拒。
+fn head_quant_of(plan: QuantPlan) -> HeadQuant {
+    match plan {
+        QuantPlan::F16 => HeadQuant::Off,
+        QuantPlan::I8W => HeadQuant::RtnInt8Row,
+        QuantPlan::I8W8 => HeadQuant::RtnInt8RowA8,
+        other => panic!("tp_head_i8_gate 不支持 head plan {other:?}"),
+    }
+}
+
+/// 两臂同参:greedy(设备 argmax)+ 关前缀缓存(同 `tp_vocab_split_gate`)。
+/// spec 臂按生产 DFlash2 d7:草稿双 rank 放行 + 单快照 + 160MB capture slab。
+fn knobs_for(plan: QuantPlan, dir: &Path) -> EngineKnobs {
     let mut k = EngineKnobs::default();
     k.sampler_enabled = false;
     k.prefix_cache = false;
+    k.head_quant = head_quant_of(plan);
+    if spec_on() {
+        let draft = draft_dir_of(dir);
+        assert!(draft.join("config.json").exists(), "DFlash2 草稿目录不在: {draft:?}");
+        k.draft.depth = std::env::var("OWL_TP_HEAD_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7);
+        k.draft.dflash2_dir = Some(draft.display().to_string());
+        k.draft.tp_draft = true;
+        // 质量门隔离:lookup 是 host 侧草稿增强,不改变 head 路径;默认关,
+        // 需要跟生产档同参时显式 OWL_TP_HEAD_LOOKUP=1。
+        k.draft.lookup = std::env::var("OWL_TP_HEAD_LOOKUP").as_deref() == Ok("1");
+        k.snap_max = 1;
+        k.cuda.capture_slab_mb = Some(160);
+        k.vram_reserve_mb = 256;
+    }
     k
 }
 
-fn cfg_of(ordinal: usize, chunk: usize) -> EngineConfig {
+fn cfg_of(ordinal: usize, chunk: usize, knobs: EngineKnobs) -> EngineConfig {
     EngineConfig {
         device_ordinal: ordinal,
         max_seq_tokens: 1024,
         prefill_chunk: chunk,
-        knobs: knobs(),
+        knobs,
     }
 }
 
@@ -78,7 +140,7 @@ async fn run_arm(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
-    let mut e0 = Engine::new(cfg_of(oa, chunk)).expect("engine(r0)");
+    let mut e0 = Engine::new(cfg_of(oa, chunk, knobs_for(plan, dir))).expect("engine(r0)");
     let m0 = e0
         .loader()
         .slice(0, 2)
@@ -87,7 +149,12 @@ async fn run_arm(
         .await
         .expect("rank0 分片装载");
     // rank1:账本/设备序**装载前**从 rank0 接过(TP 合流纪律)
-    let mut e1 = Engine::new_with_ledger(cfg_of(ob, chunk), e0.ledger_cell(), 1).expect("engine(r1)");
+    let mut e1 = Engine::new_with_ledger(
+        cfg_of(ob, chunk, knobs_for(plan, dir)),
+        e0.ledger_cell(),
+        1,
+    )
+    .expect("engine(r1)");
     let m1 = e1
         .loader()
         .slice(1, 2)
@@ -99,23 +166,33 @@ async fn run_arm(
         .await
         .expect("TP2 装配");
     // ★ 词表切的结构判据(装配侧形状单源):两 rank 头等宽、合计 = 全词表;
-    // int8 与 bf16 两臂**同形**(派生键按 `UniformCol` 切行 ⇒ 槽宽不变)
-    if vsplit {
-        let (sp0, sp1) = (tp.spec(0), tp.spec(1));
-        assert_eq!(sp0.head_vocab, sp1.head_vocab, "两 rank 半表不等");
-        assert_eq!(sp0.head_vocab * 2, sp0.vocab, "半表 × 2 ≠ 全词表");
-        eprintln!(
-            "[tp-head] 词表切:头每 rank {} 行(全表 {})",
-            sp0.head_vocab, sp0.vocab
-        );
-    }
+    // int8 与 bf16 两臂**同形**(派生键按 `UniformCol` 切行 ⇒ 槽宽不变)。
+    // 宽度**不靠**运行时 logits 槽读回:spec 档槽里可能是 8 行 verify logits。
+    let width = {
+        let sp0 = tp.spec(0);
+        if vsplit {
+            let sp1 = tp.spec(1);
+            assert_eq!(sp0.head_vocab, sp1.head_vocab, "两 rank 半表不等");
+            assert_eq!(sp0.head_vocab * 2, sp0.vocab, "半表 × 2 ≠ 全词表");
+            eprintln!(
+                "[tp-head] 词表切:头每 rank {} 行(全表 {})",
+                sp0.head_vocab, sp0.vocab
+            );
+        } else {
+            assert_eq!(sp0.head_vocab, sp0.vocab, "不切档时头应 = 全词表");
+        }
+        sp0.head_vocab
+    };
     let mut r = tp.run().expect("TP2 进执行态");
     assert!(r.has_peer(), "TP2 执行态必须带 peer 束");
 
-    // 诊断:逐步打 top-2 边际(判"首分歧是否 near-tie";OWL_TP_HEAD_TOP2=1)
-    let top2 = std::env::var("OWL_TP_HEAD_TOP2").as_deref() == Ok("1");
+    // metrics 是进程级 OnceLock:必须在 turn 之前 init,否则 spec.* 全 0。
+    let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
+
+    // 诊断:逐步打 top-2 边际(判"首分歧是否 near-tie";OWL_TP_HEAD_TOP2=1)。
+    // spec 档 logits 槽可能是 [8, vocab] verify 块,跨行扫 top2 无意义 ⇒ 跳过。
+    let top2 = std::env::var("OWL_TP_HEAD_TOP2").as_deref() == Ok("1") && !spec_on();
     let mut out = Vec::new();
-    let mut width = 0usize;
     for (i, p) in PROMPTS.iter().enumerate() {
         let sid = 7 + i as u64;
         let (sid, turn) = r
@@ -137,25 +214,22 @@ async fn run_arm(
                     n_tok += 1;
                 }
                 t_last = now;
-                let a = r
-                    .read_output_f32("logits")
-                    .await
-                    .expect("rank0 logits")
-                    .expect("logits 槽");
-                let mut full = a;
-                if vsplit {
-                    let b = r
-                        .read_peer_output_f32("logits")
-                        .await
-                        .expect("rank1 logits")
-                        .expect("logits 槽");
-                    assert_eq!(full.len(), b.len(), "切档:两 rank 半表长度不等");
-                    width = full.len();
-                    full.extend_from_slice(&b); // rank0 低半 ++ rank1 高半
-                } else {
-                    width = full.len();
-                }
                 if top2 {
+                    let a = r
+                        .read_output_f32("logits")
+                        .await
+                        .expect("rank0 logits")
+                        .expect("logits 槽");
+                    let mut full = a;
+                    if vsplit {
+                        let b = r
+                            .read_peer_output_f32("logits")
+                            .await
+                            .expect("rank1 logits")
+                            .expect("logits 槽");
+                        assert_eq!(full.len(), b.len(), "切档:两 rank 半表长度不等");
+                        full.extend_from_slice(&b); // rank0 低半 ++ rank1 高半
+                    }
                     let mut best = (0usize, f32::NEG_INFINITY);
                     let mut second = (0usize, f32::NEG_INFINITY);
                     for (j, &v) in full.iter().enumerate() {
@@ -193,19 +267,52 @@ async fn run_arm(
         );
     }
     let _ = r.shutdown_tp().await;
+    if spec_on() {
+        let cnt = |t: &str| -> u64 {
+            owl_shared::metrics::query_metrics(
+                &owl_shared::metrics::MetricsFilter::new().tag(t),
+            )
+            .iter()
+            .map(|x| x.counter)
+            .sum()
+        };
+        let rounds = cnt("spec.rounds");
+        let hist: Vec<u64> = (0..=7).map(|m| cnt(&format!("spec.m{m}"))).collect();
+        eprintln!("[tp-head] spec 账:rounds={rounds} m 直方图 [m0..m7]={hist:?}");
+        for tag in ["spec.round", "spec.verify", "spec.propose"] {
+            let r = owl_shared::metrics::query_metrics(
+                &owl_shared::metrics::MetricsFilter::new().tag(tag),
+            );
+            if let Some(r) = r.first() {
+                eprintln!(
+                    "[tp-head] {tag}: avg {:.3} ms · p50 {:.3} ms · n={}",
+                    r.avg.as_secs_f64() * 1e3,
+                    r.p50.as_secs_f64() * 1e3,
+                    r.count,
+                );
+            }
+        }
+        assert!(rounds > 0, "spec 臂零轮:没有走到 m=8 verify / m=7 propose");
+        assert_eq!(
+            hist.iter().sum::<u64>(),
+            rounds,
+            "spec.m 直方图与 rounds 不闭合:历史轮/降级轮混入"
+        );
+    }
     (out, width)
 }
 
 #[test]
 fn tp_head_i8_gate() {
     let arm = std::env::var("OWL_TP_HEAD_ARM").unwrap_or_default();
-    let n: usize = std::env::var("OWL_TP_HEAD_N").ok().and_then(|s| s.parse().ok()).unwrap_or(48);
+    let n: usize = std::env::var("OWL_TP_HEAD_N").ok().and_then(|s| s.parse().ok()).unwrap_or(96);
     let vsplit = match std::env::var("OWL_TP_HEAD_VSPLIT").as_deref() {
         Ok("0") | Ok("false") => false,
         _ => true,
     };
     // ── 比对臂(零 GPU):读两臂 token → 一致率 ───────────────────────
-    if arm == "compare" {
+    if arm == "compare" || arm == "compare_a8" {
+        let (left, right) = if arm == "compare_a8" { ("i8", "a8") } else { ("f16", "i8") };
         let read = |a: &str| -> Vec<(String, Vec<u32>)> {
             std::fs::read_to_string(art(a))
                 .unwrap_or_else(|e| panic!("读 {a} 臂失败({}):{e} —— 先跑两臂", art(a).display()))
@@ -219,7 +326,7 @@ fn tp_head_i8_gate() {
                 })
                 .collect()
         };
-        let (a, b) = (read("f16"), read("i8"));
+        let (a, b) = (read(left), read(right));
         assert_eq!(a.len(), b.len(), "两臂 prompt 数不等");
         let (mut agree, mut total, mut exact) = (0usize, 0usize, 0usize);
         for ((pa, ta), (_pb, tb)) in a.iter().zip(b.iter()) {
@@ -261,7 +368,8 @@ fn tp_head_i8_gate() {
     let plan = match arm.as_str() {
         "f16" => QuantPlan::F16,
         "i8" => QuantPlan::I8W,
-        other => panic!("OWL_TP_HEAD_ARM 只认 f16|i8|compare(得 {other:?})"),
+        "a8" => QuantPlan::I8W8,
+        other => panic!("OWL_TP_HEAD_ARM 只认 f16|i8|a8|compare|compare_a8(得 {other:?})"),
     };
     std::thread::Builder::new()
         .stack_size(128 << 20)
