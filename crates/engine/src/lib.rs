@@ -84,6 +84,7 @@ pub fn head_plan_of(hq: owl_shared::config::HeadQuant) -> owl_models::module::Qu
         owl_shared::config::HeadQuant::Off => QuantPlan::F16,
         owl_shared::config::HeadQuant::RtnInt4G32 => QuantPlan::W4A16Awq,
         owl_shared::config::HeadQuant::RtnInt8Row => QuantPlan::I8W,
+        owl_shared::config::HeadQuant::RtnInt8RowA8 => QuantPlan::I8W8,
     }
 }
 pub use running::{RunningEngine, TokenizeReply};

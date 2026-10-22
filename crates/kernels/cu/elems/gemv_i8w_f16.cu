@@ -31,6 +31,22 @@
 // 契约:`w` [rows, cols] int8 行主 · `scale` [rows] f32 · `x` [tokens, cols] f16 ·
 //       i32 rows, cols · `y` [tokens, rows] f16(末参 = 输出)。
 // 约束:`cols % 16 == 0`(几何侧断言;5120/4096/2048 均满足)。
+//
+// # 多 token 快路(2026-10-22;spec verify 的 M=7/8 主路)
+//
+// 上面的 m=1 核把 `grid.y` 当 token:每个 token 的 block 都从头读一遍权重
+// ⇒ M=8 时权重流量 ×8(0.635 GB → 5.08 GB)。spec verify 恰好是 8 行、
+// DFlash2 propose 是 7 行,这就是 int8 头比 int4 慢 ~150% 的根因。
+//
+// 本快路把 **token 也分块**:一个 block 一次读权重,同时算 `TOK_TILE` 个 token。
+// `ROWS_PER_WARP=4` ⇒ 每读一个权重字节,复用到 4 行 × 8 token = 32 个累加器;
+// 另有 `<T,7>` 专用实例(DFlash2 propose 固定 7 行,少算 1 行)。
+// 权重只读一遍,x 先落 shared(按 32 位字做 `k + (k>>5)` swizzle,消除
+// lane 间 16-float 步长的 bank conflict)。m=1 仍走上面的线性核(prefill 末行)。
+//
+// 几何:TOK_TILE=8 · ROWS_PER_WARP=4 · WARPS=8(32 行/块) · K_TILE=512。
+// shared = 8 × (K_TILE+32) × 4 B = 17 KiB(固定 8 行, nt<8 的尾部补 0;
+// 按 TOK_TILE 而不是 nt 分配 —— 按 nt 会让第 8 行写穿动态 shared)。
 // ============================================================================
 
 #include <cuda_fp16.h>
@@ -105,4 +121,156 @@ extern "C" __global__ void owl_gemv_i8w_bf16(
     const __nv_bfloat16* __restrict__ x, const int rows, const int cols,
     __nv_bfloat16* __restrict__ y) {
     owl_gemv_i8w_body<__nv_bfloat16>(w, scale, x, rows, cols, y);
+}
+
+// ---------------------------------------------------------------------------
+// 多 token 快路(cu 侧常量必须与 Rust driver 的 GEMV_I8W_MT_* 同步)
+// ---------------------------------------------------------------------------
+#define OWL_GEMV_I8W_MT_TOK_TILE 8
+#define OWL_GEMV_I8W_MT_ROWS_PER_WARP 4
+#define OWL_GEMV_I8W_MT_WARPS 8
+#define OWL_GEMV_I8W_MT_K_TILE 512
+// 尾部留 32 个 float 给 `k + (k>>5)` swizzle(k=511 → 542)
+#define OWL_GEMV_I8W_MT_XSTRIDE (OWL_GEMV_I8W_MT_K_TILE + 32)
+
+template <typename T, int TOK_N>
+__device__ __forceinline__ void owl_gemv_i8w_mt_body(
+    const signed char* __restrict__ w,  // [rows, cols] int8(行主)
+    const float* __restrict__ scale,    // [rows]
+    const T* __restrict__ x,            // [tokens, cols]
+    const int rows,
+    const int cols,
+    const int tokens,
+    T* __restrict__ y) {                // [tokens, rows]
+    extern __shared__ float xs[];       // [TOK_TILE][XSTRIDE]
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int token0 = (int)blockIdx.y * TOK_N;
+    int nt = tokens - token0;
+    if (nt > TOK_N) nt = TOK_N;
+    // driver 保证 rows % (WARPS*ROWS_PER_WARP) == 0 ⇒ 本 block 32 行全有效。
+    const int row0 = ((int)blockIdx.x * OWL_GEMV_I8W_MT_WARPS + warp)
+                     * OWL_GEMV_I8W_MT_ROWS_PER_WARP;
+
+    float acc[OWL_GEMV_I8W_MT_ROWS_PER_WARP][TOK_N];
+#pragma unroll
+    for (int r = 0; r < OWL_GEMV_I8W_MT_ROWS_PER_WARP; ++r) {
+#pragma unroll
+        for (int t = 0; t < TOK_N; ++t) acc[r][t] = 0.0f;
+    }
+
+    for (int k0 = 0; k0 < cols; k0 += OWL_GEMV_I8W_MT_K_TILE) {
+        int kt = cols - k0;
+        if (kt > OWL_GEMV_I8W_MT_K_TILE) kt = OWL_GEMV_I8W_MT_K_TILE;
+        // **固定装 8 个 token**:nt<8 的尾部 token 补 0,内层就不必逐 t 判 nt。
+        // 逐 token 的 2D 循环(不除 kt;曾用 idx/kt,ptxas 会展开成整段除法)。
+#pragma unroll
+        for (int t = 0; t < TOK_N; ++t) {
+            const bool has = (t < nt);
+            // t>=nt 时把行钳到 0:即使 ptxas 把 LDG 提到 select 之前,
+            // 地址也仍在 x[0] 内(实测 t=7 的越界指针在 capture 里炸过)。
+            const int tt = has ? t : 0;
+            const T* xrow = x + (size_t)(token0 + tt) * cols + k0;
+            float* srow = xs + t * OWL_GEMV_I8W_MT_XSTRIDE;
+            for (int k = tid; k < kt; k += (int)blockDim.x) {
+                srow[k + (k >> 5)] = has ? owl_i8w_to_f<T>(xrow[k]) : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        if (row0 < rows) {
+            for (int base = lane * OWL_GEMV_I8W_CHUNK; base < kt;
+                 base += 32 * OWL_GEMV_I8W_CHUNK) {
+                uint4 wv[OWL_GEMV_I8W_MT_ROWS_PER_WARP];
+#pragma unroll
+                for (int r = 0; r < OWL_GEMV_I8W_MT_ROWS_PER_WARP; ++r) {
+                    wv[r] = *reinterpret_cast<const uint4*>(
+                        w + (size_t)(row0 + r) * cols + k0 + base);
+                }
+#pragma unroll
+                for (int i = 0; i < OWL_GEMV_I8W_CHUNK; ++i) {
+                    const int k = base + i;
+                    const int xoff = k + (k >> 5);
+                    float xv[TOK_N];
+#pragma unroll
+                    for (int t = 0; t < TOK_N; ++t) {
+                        xv[t] = xs[t * OWL_GEMV_I8W_MT_XSTRIDE + xoff];
+                    }
+#pragma unroll
+                    for (int r = 0; r < OWL_GEMV_I8W_MT_ROWS_PER_WARP; ++r) {
+                        const signed char* b =
+                            reinterpret_cast<const signed char*>(&wv[r]);
+                        const float wf = (float)b[i];
+#pragma unroll
+                        for (int t = 0; t < TOK_N; ++t) {
+                            acc[r][t] = __fmaf_rn(wf, xv[t], acc[r][t]);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (row0 < rows) {
+        // 与 m=1 核逐位同序:先乘本行 scale,再做 lane 归约。
+#pragma unroll
+        for (int r = 0; r < OWL_GEMV_I8W_MT_ROWS_PER_WARP; ++r) {
+            const float s = scale[row0 + r];
+#pragma unroll
+            for (int t = 0; t < TOK_N; ++t) acc[r][t] *= s;
+        }
+#pragma unroll
+        for (int r = 0; r < OWL_GEMV_I8W_MT_ROWS_PER_WARP; ++r) {
+#pragma unroll
+            for (int t = 0; t < TOK_N; ++t) {
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    acc[r][t] += __shfl_down_sync(0xffffffff, acc[r][t], off);
+                }
+            }
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < OWL_GEMV_I8W_MT_ROWS_PER_WARP; ++r) {
+#pragma unroll
+                for (int t = 0; t < TOK_N; ++t) {
+                    if (t < nt) {
+                        y[(size_t)(token0 + t) * rows + row0 + r] =
+                            owl_i8w_from_f<T>(acc[r][t]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ void owl_gemv_i8w_mt_f16(
+    const signed char* __restrict__ w, const float* __restrict__ scale,
+    const __half* __restrict__ x, const int rows, const int cols,
+    const int tokens, __half* __restrict__ y) {
+    owl_gemv_i8w_mt_body<__half, 8>(w, scale, x, rows, cols, tokens, y);
+}
+
+extern "C" __global__ void owl_gemv_i8w_mt_bf16(
+    const signed char* __restrict__ w, const float* __restrict__ scale,
+    const __nv_bfloat16* __restrict__ x, const int rows, const int cols,
+    const int tokens, __nv_bfloat16* __restrict__ y) {
+    owl_gemv_i8w_mt_body<__nv_bfloat16, 8>(w, scale, x, rows, cols, tokens, y);
+}
+
+// DFlash2 propose 固定 7 行:专用 7-token 实例,少一个累加器/一行 shared。
+extern "C" __global__ void owl_gemv_i8w_mt7_f16(
+    const signed char* __restrict__ w, const float* __restrict__ scale,
+    const __half* __restrict__ x, const int rows, const int cols,
+    const int tokens, __half* __restrict__ y) {
+    owl_gemv_i8w_mt_body<__half, 7>(w, scale, x, rows, cols, tokens, y);
+}
+
+extern "C" __global__ void owl_gemv_i8w_mt7_bf16(
+    const signed char* __restrict__ w, const float* __restrict__ scale,
+    const __nv_bfloat16* __restrict__ x, const int rows, const int cols,
+    const int tokens, __nv_bfloat16* __restrict__ y) {
+    owl_gemv_i8w_mt_body<__nv_bfloat16, 7>(w, scale, x, rows, cols, tokens, y);
 }

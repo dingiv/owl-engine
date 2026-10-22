@@ -311,6 +311,293 @@ impl KernelSpec for GemvI8wBf16 {
 }
 
 pub static GEMV_I8W_BF16: KernelMeta = meta_of::<GemvI8wBf16>();
+
+/// `owl_gemv_i8w_mt_{f16,bf16}` —— **多 token int8 权重 GEMV**
+/// (2026-10-22;spec verify M=7/8 主路)。
+///
+/// 与单 token 版**语义逐位相同**;差别只在调度:一个 block 一次读权重、
+/// 同时算 `TOK_TILE` 个 token,`ROWS_PER_WARP=4` 让一个权重字节复用到
+/// 4 行 × 8 token。`tokens` 是新增的显式标量(token tile 的边界)。
+pub struct GemvI8wMtF16;
+
+#[kernel_tags("dom.elem", "role.gemv", "quant.int8", "feat.head", "phase.decode")]
+impl KernelSpec for GemvI8wMtF16 {
+    const ENTRY: &'static str = "owl_gemv_i8w_mt_f16";
+    const SRC: &'static str = "cu/elems/gemv_i8w_f16.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("w", Dtype::I8, 2),
+        Param::t_in("scale", Dtype::F32, 1),
+        Param::t_in("x", Dtype::F16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::i32("tokens"),
+        Param::t_out("y", Dtype::F16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static GEMV_I8W_MT_F16: KernelMeta = meta_of::<GemvI8wMtF16>();
+
+/// 同上,bf16 激活变体(生产 target verify / lm_head 走这条)。
+pub struct GemvI8wMtBf16;
+
+#[kernel_tags("dom.elem", "role.gemv", "quant.int8", "feat.head", "phase.decode")]
+impl KernelSpec for GemvI8wMtBf16 {
+    const ENTRY: &'static str = "owl_gemv_i8w_mt_bf16";
+    const SRC: &'static str = "cu/elems/gemv_i8w_f16.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("w", Dtype::I8, 2),
+        Param::t_in("scale", Dtype::F32, 1),
+        Param::t_in("x", Dtype::BF16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::i32("tokens"),
+        Param::t_out("y", Dtype::BF16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static GEMV_I8W_MT_BF16: KernelMeta = meta_of::<GemvI8wMtBf16>();
+
+/// `owl_gemv_i8w_mt7_{f16,bf16}` —— **7-token 专用实例**（DFlash2 propose
+/// 固定 7 行；2026-10-22）。语义/参数与 8-token 版逐字相同，仅少算第 8 行。
+pub struct GemvI8wMt7F16;
+
+#[kernel_tags("dom.elem", "role.gemv", "quant.int8", "feat.head", "phase.decode")]
+impl KernelSpec for GemvI8wMt7F16 {
+    const ENTRY: &'static str = "owl_gemv_i8w_mt7_f16";
+    const SRC: &'static str = "cu/elems/gemv_i8w_f16.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("w", Dtype::I8, 2),
+        Param::t_in("scale", Dtype::F32, 1),
+        Param::t_in("x", Dtype::F16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::i32("tokens"),
+        Param::t_out("y", Dtype::F16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static GEMV_I8W_MT7_F16: KernelMeta = meta_of::<GemvI8wMt7F16>();
+
+/// 同上，bf16 激活变体。
+pub struct GemvI8wMt7Bf16;
+
+#[kernel_tags("dom.elem", "role.gemv", "quant.int8", "feat.head", "phase.decode")]
+impl KernelSpec for GemvI8wMt7Bf16 {
+    const ENTRY: &'static str = "owl_gemv_i8w_mt7_bf16";
+    const SRC: &'static str = "cu/elems/gemv_i8w_f16.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("w", Dtype::I8, 2),
+        Param::t_in("scale", Dtype::F32, 1),
+        Param::t_in("x", Dtype::BF16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::i32("tokens"),
+        Param::t_out("y", Dtype::BF16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static GEMV_I8W_MT7_BF16: KernelMeta = meta_of::<GemvI8wMt7Bf16>();
+
+// ============================================================================
+// W8A8 head:per-token 激活量化 + dp4a 多 token GEMV(2026-10-22)
+// ============================================================================
+
+/// `owl_quant_i8_act_scale_{f16,bf16}` —— 每 token absmax → f32 scale。
+pub struct QuantI8ActScaleF16;
+
+#[kernel_tags("dom.elem", "role.elem", "quant.int8", "feat.head", "phase.decode")]
+impl KernelSpec for QuantI8ActScaleF16 {
+    const ENTRY: &'static str = "owl_quant_i8_act_scale_f16";
+    const SRC: &'static str = "cu/elems/quant_i8_act.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::t_out("scale", Dtype::F32, 1),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static QUANT_I8_ACT_SCALE_F16: KernelMeta = meta_of::<QuantI8ActScaleF16>();
+
+pub struct QuantI8ActScaleBf16;
+
+#[kernel_tags("dom.elem", "role.elem", "quant.int8", "feat.head", "phase.decode")]
+impl KernelSpec for QuantI8ActScaleBf16 {
+    const ENTRY: &'static str = "owl_quant_i8_act_scale_bf16";
+    const SRC: &'static str = "cu/elems/quant_i8_act.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::BF16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::t_out("scale", Dtype::F32, 1),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static QUANT_I8_ACT_SCALE_BF16: KernelMeta = meta_of::<QuantI8ActScaleBf16>();
+
+/// `owl_quant_i8_act_q_{f16,bf16}` —— 吃 scale,写 RN-even i8。
+pub struct QuantI8ActQF16;
+
+#[kernel_tags("dom.elem", "role.elem", "quant.int8", "feat.head", "phase.decode")]
+impl KernelSpec for QuantI8ActQF16 {
+    const ENTRY: &'static str = "owl_quant_i8_act_q_f16";
+    const SRC: &'static str = "cu/elems/quant_i8_act.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::t_in("scale", Dtype::F32, 1),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::t_out("q", Dtype::I8, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static QUANT_I8_ACT_Q_F16: KernelMeta = meta_of::<QuantI8ActQF16>();
+
+pub struct QuantI8ActQBf16;
+
+#[kernel_tags("dom.elem", "role.elem", "quant.int8", "feat.head", "phase.decode")]
+impl KernelSpec for QuantI8ActQBf16 {
+    const ENTRY: &'static str = "owl_quant_i8_act_q_bf16";
+    const SRC: &'static str = "cu/elems/quant_i8_act.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::BF16, 2),
+        Param::t_in("scale", Dtype::F32, 1),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::t_out("q", Dtype::I8, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static QUANT_I8_ACT_Q_BF16: KernelMeta = meta_of::<QuantI8ActQBf16>();
+
+/// `owl_gemv_i8w_a8_mt{,_7}_{f16,bf16}` —— W8A8 dp4a 多头 GEMV。
+macro_rules! gemv_i8w_a8_spec {
+    ($name:ident, $entry:literal, $src_ty:ident) => {
+        pub struct $name;
+        #[kernel_tags("dom.elem", "role.gemv", "quant.int8", "feat.head", "phase.decode")]
+        impl KernelSpec for $name {
+            const ENTRY: &'static str = $entry;
+            const SRC: &'static str = "cu/elems/gemv_i8w_a8.cu";
+            const PARAMS: &'static [Param] = &[
+                Param::t_in("w", Dtype::I8, 2),
+                Param::t_in("sw", Dtype::F32, 1),
+                Param::t_in("xq", Dtype::I8, 2),
+                Param::t_in("sx", Dtype::F32, 1),
+                Param::i32("rows"),
+                Param::i32("cols"),
+                Param::i32("tokens"),
+                Param::t_out("y", Dtype::$src_ty, 2),
+            ];
+            const LAWS: &'static [Law] = &[Law::OutputFinite];
+            const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+            const DETERMINISM: Determinism = Determinism::Deterministic;
+        }
+    };
+}
+
+gemv_i8w_a8_spec!(GemvI8wA8MtF16, "owl_gemv_i8w_a8_mt_f16", F16);
+gemv_i8w_a8_spec!(GemvI8wA8MtBf16, "owl_gemv_i8w_a8_mt_bf16", BF16);
+gemv_i8w_a8_spec!(GemvI8wA8Mt7F16, "owl_gemv_i8w_a8_mt7_f16", F16);
+gemv_i8w_a8_spec!(GemvI8wA8Mt7Bf16, "owl_gemv_i8w_a8_mt7_bf16", BF16);
+
+pub static GEMV_I8W_A8_MT_F16: KernelMeta = meta_of::<GemvI8wA8MtF16>();
+pub static GEMV_I8W_A8_MT_BF16: KernelMeta = meta_of::<GemvI8wA8MtBf16>();
+pub static GEMV_I8W_A8_MT7_F16: KernelMeta = meta_of::<GemvI8wA8Mt7F16>();
+pub static GEMV_I8W_A8_MT7_BF16: KernelMeta = meta_of::<GemvI8wA8Mt7Bf16>();
+
+/// `owl_gemm_i8w_a8_tc_{f16,bf16}` —— **W8A8 多头 int8 Tensor Core**
+/// (`mma.sync.m16n8k32.s8s8s32`;SM86 有 int8 TC、没有 fp8 TC)。
+///
+/// 语义与 dp4a 版**逐位相同**(同一个 int8 点积、同一个 per-token scale);
+/// 区别是权重走 64 行/CTA 的 shared 暂存 + 16B 连续装载,不再每 warp 散读。
+/// `tokens` 仍为显式标量(2..=8;M 固定补到 16)。
+macro_rules! gemm_i8w_a8_tc_spec {
+    ($name:ident, $entry:literal, $src_ty:ident) => {
+        pub struct $name;
+        #[kernel_tags("dom.elem", "role.gemv", "quant.int8", "feat.head", "phase.decode")]
+        impl KernelSpec for $name {
+            const ENTRY: &'static str = $entry;
+            const SRC: &'static str = "cu/elems/gemm_i8w_a8_tc.cu";
+            const PARAMS: &'static [Param] = &[
+                Param::t_in("w", Dtype::I8, 2),
+                Param::t_in("sw", Dtype::F32, 1),
+                Param::t_in("q", Dtype::I8, 2),
+                Param::t_in("sx", Dtype::F32, 1),
+                Param::i32("rows"),
+                Param::i32("cols"),
+                Param::i32("tokens"),
+                Param::t_out("y", Dtype::$src_ty, 2),
+            ];
+            const LAWS: &'static [Law] = &[Law::OutputFinite];
+            const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+            const DETERMINISM: Determinism = Determinism::Deterministic;
+        }
+    };
+}
+
+gemm_i8w_a8_tc_spec!(GemmI8wA8TcF16, "owl_gemm_i8w_a8_tc_f16", F16);
+gemm_i8w_a8_tc_spec!(GemmI8wA8TcBf16, "owl_gemm_i8w_a8_tc_bf16", BF16);
+
+pub static GEMM_I8W_A8_TC_F16: KernelMeta = meta_of::<GemmI8wA8TcF16>();
+pub static GEMM_I8W_A8_TC_BF16: KernelMeta = meta_of::<GemmI8wA8TcBf16>();
+
+/// `owl_gemm_i8w_a16_tc_{f16,bf16}` —— **W8A16 多头 f16/bf16 Tensor Core**
+///
+/// HBM 读 int8 权重;B 在 shared 仍是 int8,MMA fragment 在寄存器里
+/// `int8 → half/bf16`。激活保持 f16/bf16,不做 W8A8 的激活量化。
+/// 目标 = Marlin W4A16 同款“压缩读 + 近端反量化”流水,但权重是 8-bit。
+macro_rules! gemm_i8w_a16_tc_spec {
+    ($name:ident, $entry:literal, $src_ty:ident) => {
+        pub struct $name;
+        #[kernel_tags("dom.elem", "role.gemv", "quant.int8", "feat.head", "phase.decode")]
+        impl KernelSpec for $name {
+            const ENTRY: &'static str = $entry;
+            const SRC: &'static str = "cu/elems/gemm_i8w_a16_tc.cu";
+            const PARAMS: &'static [Param] = &[
+                Param::t_in("w", Dtype::I8, 2),
+                Param::t_in("sw", Dtype::F32, 1),
+                Param::t_in("x", Dtype::$src_ty, 2),
+                Param::i32("rows"),
+                Param::i32("cols"),
+                Param::i32("tokens"),
+                Param::t_out("y", Dtype::$src_ty, 2),
+            ];
+            const LAWS: &'static [Law] = &[Law::OutputFinite];
+            const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+            const DETERMINISM: Determinism = Determinism::Deterministic;
+        }
+    };
+}
+
+gemm_i8w_a16_tc_spec!(GemmI8wA16TcF16, "owl_gemm_i8w_a16_tc_f16", F16);
+gemm_i8w_a16_tc_spec!(GemmI8wA16TcBf16, "owl_gemm_i8w_a16_tc_bf16", BF16);
+
+pub static GEMM_I8W_A16_TC_F16: KernelMeta = meta_of::<GemmI8wA16TcF16>();
+pub static GEMM_I8W_A16_TC_BF16: KernelMeta = meta_of::<GemmI8wA16TcBf16>();
 pub static ADD_F16: KernelMeta = meta_of::<AddF16>();
 pub static ADD_BF16: KernelMeta = meta_of::<AddBf16>();
 pub static SIGMOID_F16: KernelMeta = meta_of::<SigmoidF16>();

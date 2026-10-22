@@ -38,7 +38,9 @@ struct TestRes {
 
 impl TestRes {
     fn new() -> Option<Self> {
-        let ordinal = owl_shared::env_reader::parse::<usize>("OWL_TEST_DEVICE")?;
+        // 测试域唯一门控 = OWL_TEST_DEVICE(BDF);经 owl-cuda 统一解析,
+        // 不再直吃 CUDA ordinal(FASTEST_FIRST 序会漂)。
+        let ordinal = owl_cuda::test_device_ordinal_opt()?;
         let ctx = CudaContext::new(ordinal).expect("ctx");
         ctx.bind_to_thread().expect("bind");
         let stream = ctx.default_stream();
@@ -322,7 +324,110 @@ fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, rows: us
     let gbs1 = bytes / (us1 * 1e-6) / 1e9;
     println!(
         "  rows={rows:<7} cols={cols:<5} grid={grid:?}  M=1 {us1:>8.1} µs({gbs1:>6.1} GB/s) · \
-         M=8 {us8:>8.1} µs({gbs8:>6.1} GB/s)  数值 max|Δ|/max = {worst:.2e} @{at}"
+         8发/同grid {us8:>8.1} µs({gbs8:>6.1} GB/s)  数值 max|Δ|/max = {worst:.2e} @{at}"
+    );
+}
+
+/// **多 token 快路 A/B**:同一份权重/输入,旧核(grid.y=tokens,每 token 重读权重)
+/// vs 新核(权重一次,TOK_TILE=8)对比;输出逐位一致 + 吞吐。
+fn bench_mt(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
+    let mut exec = Exec::new();
+    let src = <owl_kernels::ops::elems::GemvI8wF16 as owl_kernels::spec::KernelSpec>::SRC;
+    let f_old = exec
+        .load_aot(res, src, "owl_gemv_i8w_f16", OpId(owl_kernels::spec::NATIVE))
+        .expect("old 资产");
+    let prod = owl_kernels::driver::elems::gemv_i8w(rows, cols, tokens);
+    let f_new = exec
+        .load_aot(res, src, prod.name, OpId(owl_kernels::spec::NATIVE))
+        .expect("mt 资产");
+
+    // 同一份 per-row 对称 int8 权重
+    let mut wq = vec![0i8; rows * cols];
+    let mut sc = vec![0f32; rows];
+    for r in 0..rows {
+        let mut mx = 0.0f32;
+        let mut row = vec![0f32; cols];
+        for k in 0..cols {
+            let u = rnd(0x71u32.wrapping_add(r as u32), r * cols + k);
+            let v = (u - 0.5) * 0.08 * if u > 0.99 { 4.0 } else { 1.0 };
+            row[k] = v;
+            mx = mx.max(v.abs());
+        }
+        let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+        sc[r] = s;
+        for k in 0..cols {
+            wq[r * cols + k] = (row[k] / s).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    let x: Vec<u16> = (0..tokens * cols)
+        .map(|i| f16::from_f32((rnd(0x72u32.wrapping_add(i as u32), i) - 0.5) * 0.1).to_bits())
+        .collect();
+
+    let bw = res.blk(rows * cols, "w");
+    let bs = res.blk(rows * 4, "scale");
+    let bx = res.blk(tokens * cols * 2, "x");
+    let byo = res.blk(tokens * rows * 2, "y_old");
+    let byn = res.blk(tokens * rows * 2, "y_new");
+    res.up(bw, &wq.iter().map(|v| *v as u8).collect::<Vec<u8>>());
+    res.up(bs, &sc.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    res.up(bx, &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let (pw, ps, px, pyo, pyn) = (res.ptr(bw), res.ptr(bs), res.ptr(bx), res.ptr(byo), res.ptr(byn));
+
+    // 旧核:grid.y = tokens,每个 token 各读一遍权重
+    let old_grid = (rows.div_ceil(8) as u32, tokens as u32, 1);
+    let old_block = (256, 1, 1);
+    let old_smem = (cols * 2) as u32;
+    let old_vals = [
+        LaunchVal::Ptr(pw),
+        LaunchVal::Ptr(ps),
+        LaunchVal::Ptr(px),
+        LaunchVal::I32(rows as i32),
+        LaunchVal::I32(cols as i32),
+        LaunchVal::Ptr(pyo),
+    ];
+    fire(res, &mut exec, &f_old, "owl_gemv_i8w_f16", old_grid, old_block, old_smem, &old_vals);
+
+    // 新核:driver 在 tokens=7 时选 mt7,其余 >1 选 mt8
+    let (new_grid, new_block, new_smem) = (prod.shape.grid, prod.shape.block, prod.shape.smem);
+    let new_vals = [
+        LaunchVal::Ptr(pw),
+        LaunchVal::Ptr(ps),
+        LaunchVal::Ptr(px),
+        LaunchVal::I32(rows as i32),
+        LaunchVal::I32(cols as i32),
+        LaunchVal::I32(tokens as i32),
+        LaunchVal::Ptr(pyn),
+    ];
+    fire(res, &mut exec, &f_new, prod.name, new_grid, new_block, new_smem, &new_vals);
+    res.sync();
+
+    let mut yo = vec![0u8; tokens * rows * 2];
+    let mut yn = vec![0u8; tokens * rows * 2];
+    res.down(byo, &mut yo);
+    res.down(byn, &mut yn);
+    let mut max_abs = 0.0f32;
+    let mut max_ref = 0.0f32;
+    let mut diff = 0usize;
+    for v in 0..tokens * rows {
+        let o = f16::from_bits(u16::from_le_bytes([yo[v*2], yo[v*2+1]])).to_f32();
+        let n = f16::from_bits(u16::from_le_bytes([yn[v*2], yn[v*2+1]])).to_f32();
+        if yo[v*2] != yn[v*2] || yo[v*2+1] != yn[v*2+1] { diff += 1; }
+        max_abs = max_abs.max((o - n).abs());
+        max_ref = max_ref.max(o.abs());
+    }
+    assert!(
+        max_abs <= (max_ref * 1e-3).max(1e-6),
+        "多 token 快路与旧核偏差过大:max|Δ|={max_abs} / max|ref|={max_ref}(diff {diff})"
+    );
+    let us_old = time_us(res, &mut exec, &f_old, "owl_gemv_i8w_f16", old_grid, old_block, old_smem, &old_vals, 10, 1);
+    let us_new = time_us(res, &mut exec, &f_new, prod.name, new_grid, new_block, new_smem, &new_vals, 30, 1);
+    let wbytes = (rows * cols) as f64;
+    println!(
+        "  rows={rows:<7} cols={cols:<5} tokens={tokens}  old {us_old:>8.1} µs({:>6.1} GB/s) · \
+         mt {us_new:>8.1} µs({:>6.1} GB/s) · speedup {:.2}×",
+        wbytes / (us_old * 1e-6) / 1e9,
+        wbytes / (us_new * 1e-6) / 1e9,
+        us_old / us_new
     );
 }
 
@@ -339,4 +444,423 @@ fn gemv_i8w_bench() {
     for (rows, cols) in [(124160usize, 5120usize), (32768, 5120), (124160, 2048)] {
         bench_one(&mut res, entry, src, rows, cols);
     }
+}
+
+#[test]
+fn gemv_i8w_mt_bench() {
+    let Some(mut res) = TestRes::new() else {
+        eprintln!("未设 OWL_TEST_DEVICE(BDF)⇒ skip");
+        return;
+    };
+    let rows = owl_shared::env_reader::parse_or("OWL_MT_ROWS", 124160usize);
+    let tokens = owl_shared::env_reader::parse_or("OWL_MT_TOKENS", 8usize);
+    println!("\n═══ 多 token 快路(tokens={tokens};旧核 vs 权重只读一遍;rows={rows})");
+    bench_mt(&mut res, rows, 5120, tokens);
+}
+
+/// **W8A8 head A/B**:per-token int8 激活量化 + dp4a 多头 GEMV。
+/// - 小形状(rows<=1024)与 host 整数点积对拍;
+/// - 生产形状只量时间(host 全量点积 5B 次,不跑)。
+fn bench_a8(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
+    let mut exec = Exec::new();
+    let fscale = exec
+        .load_aot(res, "cu/elems/quant_i8_act.cu", "owl_quant_i8_act_scale_f16", OpId(owl_kernels::spec::NATIVE))
+        .expect("a8 scale 资产");
+    let fq = exec
+        .load_aot(res, "cu/elems/quant_i8_act.cu", "owl_quant_i8_act_q_f16", OpId(owl_kernels::spec::NATIVE))
+        .expect("a8 q 资产");
+    let prod = owl_kernels::driver::elems::gemv_i8w_a8_f16(rows, cols, tokens);
+    let fg = exec
+        .load_aot(res, "cu/elems/gemv_i8w_a8.cu", prod.name, OpId(owl_kernels::spec::NATIVE))
+        .expect("a8 gemv 资产");
+
+    // 权重:与 W8A16 台同分布
+    let mut wq = vec![0i8; rows * cols];
+    let mut sw = vec![0f32; rows];
+    for r in 0..rows {
+        let mut mx = 0.0f32;
+        let mut row = vec![0f32; cols];
+        for k in 0..cols {
+            let u = rnd(0x71u32.wrapping_add(r as u32), r * cols + k);
+            let v = (u - 0.5) * 0.08 * if u > 0.99 { 4.0 } else { 1.0 };
+            row[k] = v;
+            mx = mx.max(v.abs());
+        }
+        let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+        sw[r] = s;
+        for k in 0..cols {
+            wq[r * cols + k] = (row[k] / s).round_ties_even().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    // 激活 + host 量化参考
+    let x: Vec<u16> = (0..tokens * cols)
+        .map(|i| f16::from_f32((rnd(0x72u32.wrapping_add(i as u32), i) - 0.5) * 0.1).to_bits())
+        .collect();
+    let xf: Vec<f32> = x.iter().map(|b| f16::from_bits(*b).to_f32()).collect();
+    let mut qh = vec![0i8; tokens * cols];
+    let mut sx = vec![0f32; tokens];
+    for t in 0..tokens {
+        let mut mx = 0.0f32;
+        for k in 0..cols {
+            mx = mx.max(xf[t * cols + k].abs());
+        }
+        let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+        sx[t] = s;
+        for k in 0..cols {
+            qh[t * cols + k] = (xf[t * cols + k] / s).round_ties_even().clamp(-127.0, 127.0) as i8;
+        }
+    }
+
+    let bw = res.blk(rows * cols, "w");
+    let bsw = res.blk(rows * 4, "sw");
+    let bx = res.blk(tokens * cols * 2, "x");
+    let bq = res.blk(tokens * cols, "q");
+    let bsx = res.blk(tokens * 4, "sx");
+    let by = res.blk(tokens * rows * 2, "y");
+    res.up(bw, &wq.iter().map(|v| *v as u8).collect::<Vec<u8>>());
+    res.up(bsw, &sw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    res.up(bx, &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let (pw, psw, px, pq, psx, py) = (
+        res.ptr(bw), res.ptr(bsw), res.ptr(bx), res.ptr(bq), res.ptr(bsx), res.ptr(by),
+    );
+
+    let scale_vals = [
+        LaunchVal::Ptr(px),
+        LaunchVal::I32(tokens as i32),
+        LaunchVal::I32(cols as i32),
+        LaunchVal::Ptr(psx),
+    ];
+    let q_vals = [
+        LaunchVal::Ptr(px),
+        LaunchVal::Ptr(psx),
+        LaunchVal::I32(tokens as i32),
+        LaunchVal::I32(cols as i32),
+        LaunchVal::Ptr(pq),
+    ];
+    let g_vals = [
+        LaunchVal::Ptr(pw),
+        LaunchVal::Ptr(psw),
+        LaunchVal::Ptr(pq),
+        LaunchVal::Ptr(psx),
+        LaunchVal::I32(rows as i32),
+        LaunchVal::I32(cols as i32),
+        LaunchVal::I32(tokens as i32),
+        LaunchVal::Ptr(py),
+    ];
+    let scale_grid = (tokens as u32, 1, 1);
+    let q_grid = (tokens as u32, 1, 1);
+    fire(res, &mut exec, &fscale, "owl_quant_i8_act_scale_f16", scale_grid, (256,1,1), 0, &scale_vals);
+    fire(res, &mut exec, &fq, "owl_quant_i8_act_q_f16", q_grid, (256,1,1), 0, &q_vals);
+    fire(res, &mut exec, &fg, prod.name, prod.shape.grid, prod.shape.block, prod.shape.smem, &g_vals);
+    res.sync();
+
+    // 小形状:与 host 整数点积对拍(权重/激活都是同一份 int8)
+    if rows <= 1024 {
+        let mut got = vec![0u8; tokens * rows * 2];
+        res.down(by, &mut got);
+        let mut max_abs = 0.0f32;
+        let mut max_ref = 0.0f32;
+        for t in 0..tokens {
+            for r in 0..rows {
+                let mut acc: i64 = 0;
+                for k in 0..cols {
+                    acc += (wq[r * cols + k] as i64) * (qh[t * cols + k] as i64);
+                }
+                let want = acc as f32 * (sw[r] * sx[t]);
+                let got = f16::from_bits(u16::from_le_bytes([got[(t * rows + r) * 2], got[(t * rows + r) * 2 + 1]])).to_f32();
+                max_abs = max_abs.max((got - want).abs());
+                max_ref = max_ref.max(want.abs());
+            }
+        }
+        assert!(max_abs <= (max_ref * 1e-3).max(1e-5), "W8A8 host 对拍:max|Δ|={max_abs}/max|ref|={max_ref}");
+        eprintln!("  W8A8 host 对拍 rows={rows} cols={cols}: max|Δ|/max|ref| = {:.2e}", max_abs / max_ref.max(1e-6));
+    }
+
+    let us_scale = time_us(res, &mut exec, &fscale, "owl_quant_i8_act_scale_f16", scale_grid, (256,1,1), 0, &scale_vals, 20, 1);
+    let us_q = time_us(res, &mut exec, &fq, "owl_quant_i8_act_q_f16", q_grid, (256,1,1), 0, &q_vals, 20, 1);
+    let us_g = time_us(res, &mut exec, &fg, prod.name, prod.shape.grid, prod.shape.block, prod.shape.smem, &g_vals, 20, 1);
+    println!(
+        "  W8A8 rows={rows:<7} cols={cols:<5} tokens={tokens}  scale {us_scale:>7.1} µs · q {us_q:>7.1} µs · gemv {us_g:>7.1} µs · total {:.1} µs",
+        us_scale + us_q + us_g
+    );
+}
+
+#[test]
+fn gemv_i8w_a8_bench() {
+    let Some(mut res) = TestRes::new() else { return; };
+    println!("\n═══ W8A8 head(per-token int8 激活 + dp4a)");
+    bench_a8(&mut res, 64, 128, 8); // host 对拍
+    let rows = owl_shared::env_reader::parse_or("OWL_A8_ROWS", 124160usize);
+    let tokens = owl_shared::env_reader::parse_or("OWL_A8_TOKENS", 7usize);
+    bench_a8(&mut res, rows, 5120, tokens);
+}
+
+/// **W8A8 int8 Tensor Core 台**(`mma.m16n8k32.s8s8s32`)。
+///
+/// 判据:
+/// 1. 小形状与 host 整数点积**逐位**相同(f16 输出 bit 比,不是容差);
+/// 2. 生产形状只量时间(0.635 GB 权重;目标 ≥ dp4a 的 477 GB/s)。
+fn bench_tc(res: &mut TestRes, rows: usize, cols: usize, tokens: usize, parity: bool) {
+    let mut exec = Exec::new();
+    let prod = owl_kernels::driver::elems::gemm_i8w_a8_tc_f16(rows, cols, tokens);
+    let fg = exec
+        .load_aot(
+            res,
+            "cu/elems/gemm_i8w_a8_tc.cu",
+            prod.name,
+            OpId(owl_kernels::spec::NATIVE),
+        )
+        .expect("tc 资产");
+
+    let mut wq = vec![0i8; rows * cols];
+    let mut sw = vec![0f32; rows];
+    for r in 0..rows {
+        let mut mx = 0.0f32;
+        let mut row = vec![0f32; cols];
+        for k in 0..cols {
+            let u = rnd(0x81u32.wrapping_add(r as u32), r * cols + k);
+            let v = (u - 0.5) * 0.08 * if u > 0.99 { 4.0 } else { 1.0 };
+            row[k] = v;
+            mx = mx.max(v.abs());
+        }
+        let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+        sw[r] = s;
+        for k in 0..cols {
+            wq[r * cols + k] = (row[k] / s).round_ties_even().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    let x: Vec<u16> = (0..tokens * cols)
+        .map(|i| f16::from_f32((rnd(0x82u32.wrapping_add(i as u32), i) - 0.5) * 0.1).to_bits())
+        .collect();
+    let xf: Vec<f32> = x.iter().map(|b| f16::from_bits(*b).to_f32()).collect();
+    let mut qh = vec![0i8; tokens * cols];
+    let mut sx = vec![0f32; tokens];
+    for t in 0..tokens {
+        let mut mx = 0.0f32;
+        for k in 0..cols {
+            mx = mx.max(xf[t * cols + k].abs());
+        }
+        let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+        sx[t] = s;
+        for k in 0..cols {
+            qh[t * cols + k] = (xf[t * cols + k] / s).round_ties_even().clamp(-127.0, 127.0) as i8;
+        }
+    }
+
+    let bw = res.blk(rows * cols, "tc.w");
+    let bsw = res.blk(rows * 4, "tc.sw");
+    let bq = res.blk(tokens * cols, "tc.q");
+    let bsx = res.blk(tokens * 4, "tc.sx");
+    let by = res.blk(tokens * rows * 2, "tc.y");
+    res.up(bw, &wq.iter().map(|v| *v as u8).collect::<Vec<u8>>());
+    res.up(bsw, &sw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    res.up(bq, &qh.iter().map(|v| *v as u8).collect::<Vec<u8>>());
+    res.up(bsx, &sx.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let (pw, psw, pq, psx, py) = (
+        res.ptr(bw), res.ptr(bsw), res.ptr(bq), res.ptr(bsx), res.ptr(by),
+    );
+    let vals = [
+        LaunchVal::Ptr(pw),
+        LaunchVal::Ptr(psw),
+        LaunchVal::Ptr(pq),
+        LaunchVal::Ptr(psx),
+        LaunchVal::I32(rows as i32),
+        LaunchVal::I32(cols as i32),
+        LaunchVal::I32(tokens as i32),
+        LaunchVal::Ptr(py),
+    ];
+    fire(
+        res,
+        &mut exec,
+        &fg,
+        prod.name,
+        prod.shape.grid,
+        prod.shape.block,
+        prod.shape.smem,
+        &vals,
+    );
+    res.sync();
+
+    if parity {
+        let mut got = vec![0u8; tokens * rows * 2];
+        res.down(by, &mut got);
+        let mut bad = 0usize;
+        for t in 0..tokens {
+            for r in 0..rows {
+                let mut acc: i64 = 0;
+                for k in 0..cols {
+                    acc += (wq[r * cols + k] as i64) * (qh[t * cols + k] as i64);
+                }
+                let want = f16::from_f32(acc as f32 * (sw[r] * sx[t])).to_bits();
+                let hit = u16::from_le_bytes([got[(t * rows + r) * 2], got[(t * rows + r) * 2 + 1]]);
+                if want != hit {
+                    if bad < 5 {
+                        eprintln!(
+                            "  TC bad t{t} r{r}: want {want:04x} got {hit:04x}"
+                        );
+                    }
+                    bad += 1;
+                }
+            }
+        }
+        assert_eq!(bad, 0, "TC 与 host 整数点积不逐位一致({bad} 项)");
+        eprintln!("  TC host 对拍 rows={rows} cols={cols} tokens={tokens}: 逐位一致 ✓");
+    }
+
+    let us = time_us(
+        res,
+        &mut exec,
+        &fg,
+        prod.name,
+        prod.shape.grid,
+        prod.shape.block,
+        prod.shape.smem,
+        &vals,
+        30,
+        1,
+    );
+    let wbytes = (rows * cols) as f64;
+    println!(
+        "  TC rows={rows:<7} cols={cols:<5} tokens={tokens}  {us:>7.1} µs({:>6.1} GB/s)",
+        wbytes / (us * 1e-6) / 1e9
+    );
+}
+
+#[test]
+fn gemm_i8w_a8_tc_bench() {
+    let Some(mut res) = TestRes::new() else {
+        eprintln!("未设 OWL_TEST_DEVICE(BDF)⇒ skip");
+        return;
+    };
+    println!("\n═══ W8A8 int8 Tensor Core(mma.m16n8k32.s8s8s32)");
+    bench_tc(&mut res, 64, 512, 8, true);
+    let rows = owl_shared::env_reader::parse_or("OWL_TC_ROWS", 124160usize);
+    let tokens = owl_shared::env_reader::parse_or("OWL_TC_TOKENS", 8usize);
+    bench_tc(&mut res, rows, 5120, tokens, false);
+}
+
+/// **W8A16 f16 Tensor Core 台**：int8 权重 HBM 读 + 寄存器反量化 + f16 MMA。
+///
+/// 判据：小形状与 host 参考一致；生产形状量时间（权重 0.635 GB）。
+/// 这是“学 Marlin W4A16”的同款流水，只是权重 8-bit、激活仍 f16。
+fn bench_a16_tc(res: &mut TestRes, rows: usize, cols: usize, tokens: usize, parity: bool) {
+    let mut exec = Exec::new();
+    let prod = owl_kernels::driver::elems::gemm_i8w_a16_tc_f16(rows, cols, tokens);
+    let fg = exec
+        .load_aot(
+            res,
+            "cu/elems/gemm_i8w_a16_tc.cu",
+            prod.name,
+            OpId(owl_kernels::spec::NATIVE),
+        )
+        .expect("a16 tc 资产");
+
+    let mut wq = vec![0i8; rows * cols];
+    let mut sw = vec![0f32; rows];
+    for r in 0..rows {
+        let mut mx = 0.0f32;
+        let mut row = vec![0f32; cols];
+        for k in 0..cols {
+            let u = rnd(0x91u32.wrapping_add(r as u32), r * cols + k);
+            let v = (u - 0.5) * 0.08 * if u > 0.99 { 4.0 } else { 1.0 };
+            row[k] = v;
+            mx = mx.max(v.abs());
+        }
+        let s = if mx > 0.0 { mx / 127.0 } else { 1.0 };
+        sw[r] = s;
+        for k in 0..cols {
+            wq[r * cols + k] = (row[k] / s).round_ties_even().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    let x: Vec<u16> = (0..tokens * cols)
+        .map(|i| f16::from_f32((rnd(0x92u32.wrapping_add(i as u32), i) - 0.5) * 0.1).to_bits())
+        .collect();
+
+    let bw = res.blk(rows * cols, "a16.w");
+    let bsw = res.blk(rows * 4, "a16.sw");
+    let bx = res.blk(tokens * cols * 2, "a16.x");
+    let by = res.blk(tokens * rows * 2, "a16.y");
+    res.up(bw, &wq.iter().map(|v| *v as u8).collect::<Vec<u8>>());
+    res.up(bsw, &sw.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    res.up(bx, &x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let (pw, psw, px, py) = (res.ptr(bw), res.ptr(bsw), res.ptr(bx), res.ptr(by));
+    let vals = [
+        LaunchVal::Ptr(pw),
+        LaunchVal::Ptr(psw),
+        LaunchVal::Ptr(px),
+        LaunchVal::I32(rows as i32),
+        LaunchVal::I32(cols as i32),
+        LaunchVal::I32(tokens as i32),
+        LaunchVal::Ptr(py),
+    ];
+    fire(
+        res,
+        &mut exec,
+        &fg,
+        prod.name,
+        prod.shape.grid,
+        prod.shape.block,
+        prod.shape.smem,
+        &vals,
+    );
+    res.sync();
+
+    if parity {
+        let mut got = vec![0u8; tokens * rows * 2];
+        res.down(by, &mut got);
+        let mut max_abs = 0.0f32;
+        let mut max_ref = 0.0f32;
+        for t in 0..tokens {
+            for r in 0..rows {
+                let mut acc: f32 = 0.0;
+                for k in 0..cols {
+                    let xv = f16::from_bits(x[t * cols + k]).to_f32();
+                    acc += xv * (wq[r * cols + k] as f32);
+                }
+                let want = acc * sw[r];
+                let got = f16::from_bits(u16::from_le_bytes([got[(t * rows + r) * 2], got[(t * rows + r) * 2 + 1]])).to_f32();
+                max_abs = max_abs.max((got - want).abs());
+                max_ref = max_ref.max(want.abs());
+            }
+        }
+        assert!(
+            max_abs <= (max_ref * 1e-3).max(1e-5),
+            "W8A16 TC host 对拍: max|Δ|={max_abs}/max|ref|={max_ref}"
+        );
+        eprintln!(
+            "  A16TC host 对拍 rows={rows} cols={cols} tokens={tokens}: max|Δ|/max|ref| = {:.2e}",
+            max_abs / max_ref.max(1e-6)
+        );
+    }
+
+    let us = time_us(
+        res,
+        &mut exec,
+        &fg,
+        prod.name,
+        prod.shape.grid,
+        prod.shape.block,
+        prod.shape.smem,
+        &vals,
+        30,
+        1,
+    );
+    let wbytes = (rows * cols) as f64;
+    println!(
+        "  A16TC rows={rows:<7} cols={cols:<5} tokens={tokens}  {us:>7.1} µs({:>6.1} GB/s)",
+        wbytes / (us * 1e-6) / 1e9
+    );
+}
+
+#[test]
+fn gemm_i8w_a16_tc_bench() {
+    let Some(mut res) = TestRes::new() else {
+        eprintln!("未设 OWL_TEST_DEVICE(BDF)⇒ skip");
+        return;
+    };
+    println!("\n═══ W8A16 f16 Tensor Core(int8 权重 + 寄存器反量化 + f16 MMA)");
+    bench_a16_tc(&mut res, 64, 512, 8, true);
+    let rows = owl_shared::env_reader::parse_or("OWL_A16TC_ROWS", 124160usize);
+    let tokens = owl_shared::env_reader::parse_or("OWL_A16TC_TOKENS", 8usize);
+    bench_a16_tc(&mut res, rows, 5120, tokens, false);
 }

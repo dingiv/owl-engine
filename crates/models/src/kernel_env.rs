@@ -125,7 +125,7 @@ impl KernelSelectionEnv {
                 tags.push(KernelTag::QUANT_AWQ);
             }
             QuantPlan::Gguf(_) => tags.push(KernelTag::QUANT_GGUF),
-            QuantPlan::F16 | QuantPlan::I8W => {}
+            QuantPlan::F16 | QuantPlan::I8W | QuantPlan::I8W8 => {}
         }
         // 头是独立 plan:主干 W4A8/GGUF 时,int4 头仍要放行 W4A16 核
         // (`marlin_gemm_w4a16_awq`);主干 W4A16 时重复 push 无副作用。

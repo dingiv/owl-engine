@@ -1,0 +1,14 @@
+# owl 预设档 `qwen38_27b-3080_tp2-w4a16-a8` —— W8A8 head 实验档
+#
+# ⚠️ **诊断/对照档,不推荐生产**:W8A16 TC 已同速且质量更好。
+# 只覆盖 head_quant:权重仍是同一个 int8 lm_head,前向额外做 per-token
+# int8 激活量化;8-bit 算术走 **SM86 int8 Tensor Core**
+# (`mma.m16n8k32.s8s8s32`;30 系没有 fp8 TC),dp4a 只作形状回退。
+# 核级 7 tok **0.964ms** / 8 tok **0.969ms**;spec 同门 round 35.31ms。
+# **spec m=7/8 质量门: i8 vs a8 0.6962、逐字全等 4/6** ⇒ strict 未过。
+# W8A16 TC 同门 round **35.28ms**、质量 0.9896 ⇒ W8A8 被同速支配。
+# 详见 docs/devlog/perf/tp2-decode-fast.md §10.13/§10.14。
+extends = ["qwen38_27b-3080_tp2-w4a16.toml"]
+
+[model]
+head_quant = "rtn-int8-row-a8"

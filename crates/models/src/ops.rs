@@ -90,6 +90,20 @@ pub enum SemanticKernel {
     /// 同上 × **f16 激活**(执行 dtype = f16 的档:W4A16Awq/F16 权重的 27B)——
     /// 两档必须各有一个 op_id:driver 的拾取键就是 op_id,核实例按激活 dtype 分家。
     GemvI8wF16,
+    /// W8A8 head:per-token 激活 int8 量化(scale / q 两发;2026-10-22)
+    QuantI8ActScaleF16,
+    QuantI8ActScaleBf16,
+    QuantI8ActQF16,
+    QuantI8ActQBf16,
+    /// W8A8 head:int8 权重 × int8 激活 dp4a(多 token;aux = [rows, cols, tokens])
+    GemvI8wA8F16,
+    GemvI8wA8Bf16,
+    /// W8A8 head:int8 Tensor Core(多 token;M 补到 16,aux 同 dp4a)
+    GemmI8wA8TcF16,
+    GemmI8wA8TcBf16,
+    /// W8A16 head:f16/bf16 Tensor Core + 在线 int8→half 反量化
+    GemmI8wA16TcF16,
+    GemmI8wA16TcBf16,
 
     // ---- attn.*(aux 序见各变体)----
     /// KV 散写(classic 布局;aux = [tokens])
@@ -305,6 +319,16 @@ impl SemanticKernel {
             SemanticKernel::GemvDual => "elems.gemv_dual",
             SemanticKernel::GemvI8wBf16 => "elems.gemv_i8w_bf16",
             SemanticKernel::GemvI8wF16 => "elems.gemv_i8w_f16",
+            SemanticKernel::QuantI8ActScaleF16 => "elems.quant_i8_act_scale_f16",
+            SemanticKernel::QuantI8ActScaleBf16 => "elems.quant_i8_act_scale_bf16",
+            SemanticKernel::QuantI8ActQF16 => "elems.quant_i8_act_q_f16",
+            SemanticKernel::QuantI8ActQBf16 => "elems.quant_i8_act_q_bf16",
+            SemanticKernel::GemvI8wA8F16 => "elems.gemv_i8w_a8_f16",
+            SemanticKernel::GemvI8wA8Bf16 => "elems.gemv_i8w_a8_bf16",
+            SemanticKernel::GemmI8wA8TcF16 => "elems.gemm_i8w_a8_tc_f16",
+            SemanticKernel::GemmI8wA8TcBf16 => "elems.gemm_i8w_a8_tc_bf16",
+            SemanticKernel::GemmI8wA16TcF16 => "elems.gemm_i8w_a16_tc_f16",
+            SemanticKernel::GemmI8wA16TcBf16 => "elems.gemm_i8w_a16_tc_bf16",
             SemanticKernel::K0Write => "attn.k0_write",
             SemanticKernel::K0WriteKnhd => "attn.k0_write_knhd",
             SemanticKernel::K0WriteFp8Knhd => "attn.k0_write_fp8_knhd",

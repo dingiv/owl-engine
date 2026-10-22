@@ -69,6 +69,8 @@ pub struct DiagOpts {
     pub tag_filter: owl_kernels::tag_filter::TagFilter,
     /// **L3 事实面审计**(`[probes] l3_audit`;原 `OWL_L3_AUDIT` env)
     pub l3_audit: bool,
+    /// **W4A8 Marlin int8 m8**(`[kernel] marlin_w4a8_m8`;默认 false)
+    pub marlin_w4a8_m8: bool,
     /// **GDN chunked 诊断旋钮**(`[probes] gdn_*`;原 `OWL_GDN_*` env)
     pub gdn_diag: bool,
     pub gdn_touch: String,
@@ -98,6 +100,7 @@ impl Default for DiagOpts {
             vram_budget_mb: None,
             trace_ring: 0,
             tag_filter: owl_kernels::tag_filter::TagFilter::wildcard(),
+            marlin_w4a8_m8: false,
             l3_audit: false,
             gdn_diag: false,
             gdn_touch: String::new(),
@@ -139,6 +142,7 @@ impl DiagOpts {
             trace_ring: c.trace_ring,
             fi_plan_restore: cfg.kernel.fi_plan_restore,
             tag_filter: tag_filter_from_config(cfg),
+            marlin_w4a8_m8: cfg.kernel.marlin_w4a8_m8,
             l3_audit: cfg.probes.l3_audit,
             gdn_diag: cfg.probes.gdn_diag,
             gdn_touch: cfg.probes.gdn_touch.clone().unwrap_or_default(),
@@ -180,7 +184,10 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
             | QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3 => {}
         },
     }
-    if cfg.model.head_quant == HeadQuant::RtnInt8Row {
+    if matches!(
+        cfg.model.head_quant,
+        HeadQuant::RtnInt8Row | HeadQuant::RtnInt8RowA8
+    ) {
         tags.push(T::QUANT_INT8);
         tags.push(T::FEAT_HEAD);
     }

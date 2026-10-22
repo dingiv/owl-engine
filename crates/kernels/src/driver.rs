@@ -340,6 +340,29 @@ pub fn resolve(req: OpReq) -> KernelPick {
         // aux = [rows, cols, tokens](P1.5-a:int8 权重 lm_head)
         "elems.gemv_i8w_bf16" => elems::gemv_i8w_bf16(ax(0), ax(1), ax(2)),
         "elems.gemv_i8w_f16" => elems::gemv_i8w(ax(0), ax(1), ax(2)),
+        // W8A8 head:aux = [tokens, cols] / [rows, cols, tokens]
+        "elems.quant_i8_act_scale_f16" => {
+            elems::quant_i8_act_scale_f16(ax(0), ax(1))
+        }
+        "elems.quant_i8_act_scale_bf16" => {
+            elems::quant_i8_act_scale_bf16(ax(0), ax(1))
+        }
+        "elems.quant_i8_act_q_f16" => elems::quant_i8_act_q_f16(ax(0), ax(1)),
+        "elems.quant_i8_act_q_bf16" => elems::quant_i8_act_q_bf16(ax(0), ax(1)),
+        "elems.gemv_i8w_a8_f16" => elems::gemv_i8w_a8_f16(ax(0), ax(1), ax(2)),
+        "elems.gemv_i8w_a8_bf16" => elems::gemv_i8w_a8_bf16(ax(0), ax(1), ax(2)),
+        "elems.gemm_i8w_a8_tc_f16" => {
+            elems::gemm_i8w_a8_tc_f16(ax(0), ax(1), ax(2))
+        }
+        "elems.gemm_i8w_a8_tc_bf16" => {
+            elems::gemm_i8w_a8_tc_bf16(ax(0), ax(1), ax(2))
+        }
+        "elems.gemm_i8w_a16_tc_f16" => {
+            elems::gemm_i8w_a16_tc_f16(ax(0), ax(1), ax(2))
+        }
+        "elems.gemm_i8w_a16_tc_bf16" => {
+            elems::gemm_i8w_a16_tc_bf16(ax(0), ax(1), ax(2))
+        }
         "ops.narrow" => elems::narrow(dt),
         "ops.ts_stamp" => ops::ts_stamp(),
         "ops.argmax" => ops::argmax(),
@@ -1985,10 +2008,21 @@ pub mod elems {
     /// 一 warp 一行、**8 warp/块**(块内共用一份 x 行缓存,`smem = cols·2 B`);
     /// 每 lane 一次读 16 B(16 个 int8)⇒ 要求 `cols % 16 == 0`。
     /// **bf16 激活**变体(生产 lm_head 用;几何与 f16 版逐字相同)
+    ///
+    /// `tokens > 1` 走多 token 快路(2026-10-22):权重只读一遍,一次算
+    /// 7/8 个 spec 行;`tokens == 1` 保持上面的线性核(prefill 末行)。
     pub fn gemv_i8w_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
         assert!(cols % 16 == 0, "gemv_i8w 要求 cols % 16 == 0(每 lane 16 B 对齐),得 {cols}");
+        assert!(tokens > 0, "gemv_i8w 的 tokens 必须 > 0");
+        if gemv_i8w_mt_eligible(rows, tokens) {
+            return if tokens == GEMV_I8W_MT7_TOK_TILE {
+                gemv_i8w_mt7_bf16(rows, cols, tokens)
+            } else {
+                gemv_i8w_mt_bf16(rows, cols, tokens)
+            };
+        }
         KernelPick::of::<crate::ops::elems::GemvI8wBf16>(Shape {
-            grid: (rows.div_ceil(8) as u32, tokens as u32, 1),
+            grid: (rows.div_ceil(8) as u32, 1, 1),
             block: (256, 1, 1),
             smem: (cols * 2) as u32,
         })
@@ -1996,10 +2030,255 @@ pub mod elems {
 
     pub fn gemv_i8w(rows: usize, cols: usize, tokens: usize) -> KernelPick {
         assert!(cols % 16 == 0, "gemv_i8w 要求 cols % 16 == 0(每 lane 16 B 对齐),得 {cols}");
+        assert!(tokens > 0, "gemv_i8w 的 tokens 必须 > 0");
+        if gemv_i8w_mt_eligible(rows, tokens) {
+            return if tokens == GEMV_I8W_MT7_TOK_TILE {
+                gemv_i8w_mt7(rows, cols, tokens)
+            } else {
+                gemv_i8w_mt(rows, cols, tokens)
+            };
+        }
         KernelPick::of::<crate::ops::elems::GemvI8wF16>(Shape {
-            grid: (rows.div_ceil(8) as u32, tokens as u32, 1),
+            grid: (rows.div_ceil(8) as u32, 1, 1),
             block: (256, 1, 1),
             smem: (cols * 2) as u32,
+        })
+    }
+
+    /// 多 token int8 GEMV 的 cu 侧几何镜像(改 `.cu` 头注常量必须同步)。
+    const GEMV_I8W_MT_TOK_TILE: usize = 8;
+    /// DFlash2 propose 固定 7 行:专用实例少算 1 行。
+    const GEMV_I8W_MT7_TOK_TILE: usize = 7;
+    const GEMV_I8W_MT_ROWS_PER_WARP: usize = 4;
+    const GEMV_I8W_MT_WARPS: usize = 8;
+    const GEMV_I8W_MT_K_TILE: usize = 512;
+    const GEMV_I8W_MT_XSTRIDE: usize = GEMV_I8W_MT_K_TILE + 32;
+
+    /// 多 token 快路是否可用(行数必须被 32 行/块整除;否则回退 m=1 核,
+    /// 由 m=1 核按 token 逐发——慢但正确)。模型侧也用它决定是否传 tokens。
+    pub fn gemv_i8w_mt_eligible(rows: usize, tokens: usize) -> bool {
+        tokens > 1
+            && rows % (GEMV_I8W_MT_WARPS * GEMV_I8W_MT_ROWS_PER_WARP) == 0
+    }
+
+    fn gemv_i8w_mt_shape(rows: usize, _cols: usize, tokens: usize, tok_tile: usize) -> Shape {
+        // _cols 只决定 cu 侧 kt,不改变 CTA 几何。
+        Shape {
+            grid: (
+                rows
+                    .div_ceil(GEMV_I8W_MT_WARPS * GEMV_I8W_MT_ROWS_PER_WARP)
+                    as u32,
+                tokens.div_ceil(tok_tile) as u32,
+                1,
+            ),
+            block: (256, 1, 1),
+            // 核固定装 tok_tile 行(nt<tok_tile 补 0)⇒ smem 必须按 tok_tile 算;
+            // 按 nt 算会让最后一行写穿动态 shared(tokens=7 capture 炸过)。
+            smem: (tok_tile * GEMV_I8W_MT_XSTRIDE * 4) as u32,
+        }
+    }
+
+    fn gemv_i8w_mt_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::GemvI8wMtBf16>(
+            gemv_i8w_mt_shape(rows, cols, tokens, GEMV_I8W_MT_TOK_TILE),
+        )
+    }
+
+    fn gemv_i8w_mt(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::GemvI8wMtF16>(
+            gemv_i8w_mt_shape(rows, cols, tokens, GEMV_I8W_MT_TOK_TILE),
+        )
+    }
+
+    fn gemv_i8w_mt7_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::GemvI8wMt7Bf16>(
+            gemv_i8w_mt_shape(rows, cols, tokens, GEMV_I8W_MT7_TOK_TILE),
+        )
+    }
+
+    fn gemv_i8w_mt7(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::GemvI8wMt7F16>(
+            gemv_i8w_mt_shape(rows, cols, tokens, GEMV_I8W_MT7_TOK_TILE),
+        )
+    }
+
+    // ---- W8A8 head（2026-10-22）----
+    const GEMV_I8W_A8_K_TILE: usize = 512;
+    // K_TILE/4 个 group + K_TILE/16 的 swizzle 余量 + 1
+    const GEMV_I8W_A8_XSTRIDE: usize =
+        GEMV_I8W_A8_K_TILE / 4 + GEMV_I8W_A8_K_TILE / 16 + 1;
+
+    pub fn quant_i8_act_scale_f16(rows: usize, _cols: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::QuantI8ActScaleF16>(Shape {
+            grid: (rows.max(1) as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    pub fn quant_i8_act_scale_bf16(rows: usize, _cols: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::QuantI8ActScaleBf16>(Shape {
+            grid: (rows.max(1) as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    pub fn quant_i8_act_q_f16(rows: usize, _cols: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::QuantI8ActQF16>(Shape {
+            grid: (rows.max(1) as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    pub fn quant_i8_act_q_bf16(rows: usize, _cols: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::QuantI8ActQBf16>(Shape {
+            grid: (rows.max(1) as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    fn gemv_i8w_a8_mt_shape(rows: usize, tokens: usize, tok_tile: usize) -> Shape {
+        Shape {
+            grid: (
+                rows
+                    .div_ceil(GEMV_I8W_MT_WARPS * GEMV_I8W_MT_ROWS_PER_WARP)
+                    as u32,
+                tokens.div_ceil(tok_tile) as u32,
+                1,
+            ),
+            block: (256, 1, 1),
+            smem: (tok_tile * GEMV_I8W_A8_XSTRIDE * 4) as u32,
+        }
+    }
+
+    pub fn gemv_i8w_a8_f16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        assert!(cols % 16 == 0, "gemv_i8w_a8 要求 cols % 16 == 0,得 {cols}");
+        assert!(tokens > 1, "W8A8 只接 tokens>1(spec 头)");
+        assert!(
+            gemv_i8w_mt_eligible(rows, tokens),
+            "W8A8 只接 rows % 32 == 0 的 spec 头"
+        );
+        if tokens == GEMV_I8W_MT7_TOK_TILE {
+            KernelPick::of::<crate::ops::elems::GemvI8wA8Mt7F16>(
+                gemv_i8w_a8_mt_shape(rows, tokens, GEMV_I8W_MT7_TOK_TILE),
+            )
+        } else {
+            KernelPick::of::<crate::ops::elems::GemvI8wA8MtF16>(
+                gemv_i8w_a8_mt_shape(rows, tokens, GEMV_I8W_MT_TOK_TILE),
+            )
+        }
+    }
+
+    pub fn gemv_i8w_a8_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        assert!(cols % 16 == 0, "gemv_i8w_a8 要求 cols % 16 == 0,得 {cols}");
+        assert!(tokens > 1, "W8A8 只接 tokens>1(spec 头)");
+        assert!(
+            gemv_i8w_mt_eligible(rows, tokens),
+            "W8A8 只接 rows % 32 == 0 的 spec 头"
+        );
+        if tokens == GEMV_I8W_MT7_TOK_TILE {
+            KernelPick::of::<crate::ops::elems::GemvI8wA8Mt7Bf16>(
+                gemv_i8w_a8_mt_shape(rows, tokens, GEMV_I8W_MT7_TOK_TILE),
+            )
+        } else {
+            KernelPick::of::<crate::ops::elems::GemvI8wA8MtBf16>(
+                gemv_i8w_a8_mt_shape(rows, tokens, GEMV_I8W_MT_TOK_TILE),
+            )
+        }
+    }
+
+    // ---- W8A8 int8 Tensor Core（2026-10-22）----
+    /// `mma.m16n8k32.s8s8s32`：一个 CTA 覆盖 64 个权重行，B 先经
+    /// shared 暂存（16B/row 连续），8 warp 各取 8 行。
+    ///
+    /// `smem` = A(16×528) + B(64×528) + out(8×64×2) = **43264 B**；
+    /// 43KB < 48KB 默认顶，且 2 block/SM（86KB）仍可驻留。
+    const GEMM_I8W_A8_TC_ROWS_PER_BLOCK: usize = 64;
+
+    /// TC 头快路是否可用：int8 IMMA 要求 K 32 对齐；M=16 只接 2..=8 token。
+    pub fn gemm_i8w_a8_tc_eligible(_rows: usize, cols: usize, tokens: usize) -> bool {
+        cols % 32 == 0 && (2..=8).contains(&tokens)
+    }
+
+    pub fn gemm_i8w_a8_tc_f16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        assert!(
+            gemm_i8w_a8_tc_eligible(rows, cols, tokens),
+            "W8A8 TC 要求 cols % 32 == 0 且 2 <= tokens <= 8（得 cols={cols}, tokens={tokens}）"
+        );
+        KernelPick::of::<crate::ops::elems::GemmI8wA8TcF16>(Shape {
+            grid: (
+                rows.div_ceil(GEMM_I8W_A8_TC_ROWS_PER_BLOCK) as u32,
+                1,
+                1,
+            ),
+            block: (256, 1, 1),
+            // 核内是 **static shared**(A/B/out 共 43264 B < 48KB 默认顶);
+            // 这里不能再报一次 dynamic smem,否则 static+dynamic 双算会越界。
+            smem: 0,
+        })
+    }
+
+    pub fn gemm_i8w_a8_tc_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        assert!(
+            gemm_i8w_a8_tc_eligible(rows, cols, tokens),
+            "W8A8 TC 要求 cols % 32 == 0 且 2 <= tokens <= 8（得 cols={cols}, tokens={tokens}）"
+        );
+        KernelPick::of::<crate::ops::elems::GemmI8wA8TcBf16>(Shape {
+            grid: (
+                rows.div_ceil(GEMM_I8W_A8_TC_ROWS_PER_BLOCK) as u32,
+                1,
+                1,
+            ),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    // ---- W8A16 f16/bf16 Tensor Core（2026-10-22 深夜）----
+    /// 权重 HBM 读 int8;B shared 仍 int8;MMA fragment 在寄存器里
+    /// `int8 → half/bf16`。M=16(7/8 token 补零),N=8 行/warp,CTA 64 行,
+    /// K_TILE=256。
+    ///
+    /// 静态 shared = A(16×264×2) + B(64×272) + out(8×64×2) ≈ 26.3 KB
+    /// ⇒ 3 block/SM;`smem=0`(核内 static,不能再报 dynamic)。
+    const GEMM_I8W_A16_TC_ROWS_PER_BLOCK: usize = 64;
+
+    pub fn gemm_i8w_a16_tc_eligible(_rows: usize, cols: usize, tokens: usize) -> bool {
+        cols % 16 == 0 && (2..=8).contains(&tokens)
+    }
+
+    pub fn gemm_i8w_a16_tc_f16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        assert!(
+            gemm_i8w_a16_tc_eligible(rows, cols, tokens),
+            "W8A16 TC 要求 cols % 16 == 0 且 2 <= tokens <= 8（得 cols={cols}, tokens={tokens}）"
+        );
+        KernelPick::of::<crate::ops::elems::GemmI8wA16TcF16>(Shape {
+            grid: (
+                rows.div_ceil(GEMM_I8W_A16_TC_ROWS_PER_BLOCK) as u32,
+                1,
+                1,
+            ),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    pub fn gemm_i8w_a16_tc_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
+        assert!(
+            gemm_i8w_a16_tc_eligible(rows, cols, tokens),
+            "W8A16 TC 要求 cols % 16 == 0 且 2 <= tokens <= 8（得 cols={cols}, tokens={tokens}）"
+        );
+        KernelPick::of::<crate::ops::elems::GemmI8wA16TcBf16>(Shape {
+            grid: (
+                rows.div_ceil(GEMM_I8W_A16_TC_ROWS_PER_BLOCK) as u32,
+                1,
+                1,
+            ),
+            block: (256, 1, 1),
+            smem: 0,
         })
     }
 
