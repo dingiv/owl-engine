@@ -1,9 +1,38 @@
 # DFlash2 优化交接（2026-10-23）
 
+> **2026-10-23 P0 续（AR fused 已结）**：给 `tp_head_i8_gate` 加
+> `OWL_TP_AR_FUSED` → 显式 `TpOpts`；K7 N=192 受控 A/B
+> round **34.750→34.586ms（−0.47%）**、verify **27.237→27.002ms（−0.86%）**，
+> token 逐位相同；生产同参 `tp_ar_f8=1` 复测 round −0.61%、verify −0.66%。
+> nsys 核时 AR **198.0→173.3ms（−12.5%）**，但 fused 只省一次发射、
+> 不省跨卡数据腿 ⇒ **不是 18%→9% 的减半**。生产档已开
+> `[parallel] tp_ar_fused = true`；f8 大载荷仍走两核。**AR-2 也已落地**：
+> 小包(80KB)走单 block、v1 produced/consumed 相对游标、无尾部 rendezvous；
+> K7 1k round **34.586→33.316ms(−3.7%)**、verify **27.002→25.975ms(−3.8%)**；
+> f8 档 round **34.392→32.968ms(−4.1%)**、verify **26.978→25.764ms(−4.5%)**，
+> token 逐位相同；80KB AR 核时 19.4µs（SGLang 9.3µs 是 10KB 口径，不能直接套）。
+> 生产档已开 `tp_ar2=true`。独立算子台（`ar_channel_bench`，图内 N=64）：
+> AR2 10KB 10.81 / 80KB 20.29 / 160KB 29.49 / 256KB 41.71µs；1-stage
+> 12.5 / 18.9 / 26.9 / 34.7µs（80KB+ 更快，10KB 输 AR2；但 27B 生产
+> 1-stage 路径历史不触发）。下一步 = GDN fold/tap 输出槽，暂缓 Marlin。
+> 详见 `allreduce-sglang-gap-2026-10-23.md` / `verify-op-optimization.md` §5。
+
+> **2026-10-23 续**：K=1..15 单 block、target live P+1、proposal_q +
+> 稀疏拒绝采样、32K fixed-tail 质量门已完成/实测。见
+> [`dflash-k15-proposalq.md`](dflash-k15-proposalq.md)。一句结论：
+> K=15 能跑但比 K7 慢（52.7ms/AL1.81 vs ~35ms/AL1.98），默认仍 d7；
+> 32K W8A16 TC f16/i8 **64/64 全等**；采样 temp0.1 **384/384 全等**，
+> temp0.7 322/384（采样放大，非 0.95 等价门）。
+> masked-compute P+1 已实现且语义逐位一致，但 **verify 无可见收益**
+> （K15 42.19→41.65ms，K7 27.66→27.70ms；权重带宽主导），只省末轮 propose。
+> **verify 算子优化已起步**：Marlin m8 tile + MLP gate/up 合并，
+> K7 verify 27.66→27.28ms、32K 68.79→68.37ms，见
+> [`verify-op-optimization.md`](verify-op-optimization.md)。
+
 > 给下一个会话的**唯一入口文档**。先读本文，再读
 > `docs/devlog/perf/tp2-decode-fast.md` §10.13/§10.14。
-> 当前分支 `main`，**未 push**；工作树代码已分批提交（见 §7）。
-> 当前没有 owl server 在跑，GPU 全空。
+> 当前分支 `main`，**未 push**；本轮（K15/proposal_q/verify-op/AR fused）
+> 改动**未提交**，见顶部新注。当前没有 owl server 在跑，GPU 全空。
 
 ## 0. 一句话状态
 

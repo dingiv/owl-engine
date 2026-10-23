@@ -45,9 +45,12 @@ tp_ar_fused = true
 # rendezvous/wait_done/blocks_done 与全线程 system fence。
 # K7 1k(无 push): round 34.586→**33.316ms(−3.7%)**、verify 27.002→**25.975ms(−3.8%)**;
 # f8 档 34.392→**32.968ms(−4.1%)**、verify 26.978→**25.764ms(−4.5%)**;
+# **本档 push=true 同参**: round 33.907→**33.708ms(−0.6%)**、verify
+# 26.532→**26.250ms(−1.1%)**; push 与 AR2 收益部分重叠,token 仍逐位相同。
 # 大包/prefill 仍走 fused/v1(f8 腿不变)。
 # 回退 = 删本行或 `--set parallel.tp_ar2=false`。
 tp_ar2 = true
+tp_vocab_split = true
 device = ["3080", "3080"]
 
 [runtime]
