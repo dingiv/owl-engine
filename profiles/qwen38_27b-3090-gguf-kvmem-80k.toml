@@ -4,5 +4,10 @@
 # 口径，90K coherent needle 实测命中 BLUEBIRD-42。
 extends = ["qwen38_27b-3090-gguf-kvmem-64k.toml"]
 
+[pool]
+# 压池到 ~85.5K，使 90K 上下文真正触发 host 下沉；仍留 80K view + chunk
+# （2576 页 < 池 2674 页）。
+vram_reserve_mb = 1500
+
 [kvmem]
 workspace_per_req = 81920
