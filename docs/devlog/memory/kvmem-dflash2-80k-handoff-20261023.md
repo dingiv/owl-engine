@@ -424,3 +424,21 @@ docs/...                           本节 + design §10 + selection §10
 
 单测：engine 132 / shared 122 / store 116 全绿。
 GPU 冒烟：80k 8192 连贯；260k 8192 spec on 零 IMA。
+
+### 12.9 needle 位置扫描：有效检索距离 ≈ 45k，不是选择层
+
+固定 90k 上下文、workspace 8192、同一 needle prompt，只移动 code 位置：
+
+| code 位置 | 逻辑块 | 选中? | stage-in 后哈希 | 回答 |
+|---:|---:|---|---|---|
+| 10k | 312 | 是（312–319） | `48c9a8f016f32bbf` | `No` |
+| 30k | 937 | 是（937–945） | `d89ce44a7cda9636` | `No` |
+| 45k | 1406 | 是（1406–1412） | `3a1b75c757a99f20` | `BLUEBIRD-…`（16 tok 截断，已答出码） |
+| 60k | 1875 | 是（1875–1879） | `3d43be8a9c338d4e` | `…secret code is explicitly stated as:`（16 tok 截断，倾向答出） |
+
+补充：30k 位置 + workspace **16384**（512 块，块 937–945 连续选中，
+哈希同上）仍答 `I cannot provide a secret code…`。
+
+⇒ 选块、页表、stage-in 三件全部正确；**失败边界在“query 到 code 的相对距离
+≈ 45–60k”**。8192 → 16384 工作集不能恢复，说明不是保留块太少。
+下一刀应查 RoPE/YaRN/长距离 attention，而不是继续加 top-k 或改选择器。

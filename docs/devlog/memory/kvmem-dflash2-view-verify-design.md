@@ -491,3 +491,15 @@ key 模长归一），但 2240 工作集下输出仍退化。受控 A/B 定谳�
 （`--kvmem-query-last 64`，最多 512）。8 行时结尾
 `"Reply with only the code, no explanation. Code:"` 会把 `"secret"` 挤出窗；
 64 行把完整问句纳回。该改动不改变 90k 的 `No`（见 10.1），但属于上游口径修正。
+
+### 10.3 needle 位置扫描（90k 上下文）
+
+| code 位置 | 相对距离 | 选中块 | 结果 |
+|---:|---:|---|---|
+| 10k | 80k | 312 | No |
+| 30k | 60k | 937 | No（16k 工作集也 No） |
+| 45k | 45k | 1406 | 答出 BLUEBIRD |
+| 60k | 30k | 1875 | 开始答出 |
+
+块选中且 stage-in 哈希一致 ⇒ 不是选择/搬运；有效检索距离边界约 **45–60k**。
+下一步查 RoPE/YaRN/长距离 attention，不要继续加 workspace。
