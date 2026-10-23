@@ -78,6 +78,8 @@ pub(crate) struct CoveragePending {
     /// 而分析面**只用末 8 行** ⇒ 查询面相位 **302ms/边界(占 B 轴 112%)** ——
     /// 128× 白烧。改为只回读末 W 行(仍一条批命令)⇒ 字节数与解码量同降。
     pub(crate) w: usize,
+    /// **廉价边界**(不打分):不采 Q/不做 query 面;只更新视图/驻留账。
+    pub(crate) cheap: bool,
     /// post-RoPE Q:`[层][w × hq × hd]`(层序 = 全注意力层出现序)。
     pub(crate) q: Vec<Vec<f32>>,
 }
@@ -1081,6 +1083,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(());
         }
         let d = self.dev.pool.geom.dims;
+        let cheap = pid.cheap;
         let (hq, hkv, hd, layers) = (d.hq, d.hkv, d.hd, pid.layers);
         let page = self.dev.pool.geom.page;
         if (hq, hkv, hd) != (pid.hq, pid.hkv, pid.hd) {
@@ -1119,7 +1122,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // **query 窗**(论文 §4.3:当前 step 的 query;**单 token 的注意力太局
         // 部**,末 token 常只盯前几个字)。取本 chunk **末 W 行**,逐行去 RoPE +
         // 逐行真实质量,再对窗取均值 —— 与论文 Eq.10 的 `Σ_m` 同构。
-        let w = W_QUERY_TOKENS.min(pid.t);
+        let w = if cheap { 0 } else { W_QUERY_TOKENS.min(pid.t) };
         let first = pid.t - w;
         // **口径单源硬断**:待分析面只留了末 `w` 行(`coverage_take_q` 按同一
         // `W_QUERY_TOKENS` 切片)⇒ 两侧不得各写一个数,否则行列错位 = 静默错值。
@@ -1225,8 +1228,10 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         }
         let denom = w as f32;
-        for a in mass.iter_mut() {
-            *a /= denom;
+        if denom > 0.0 {
+            for a in mass.iter_mut() {
+                *a /= denom;
+            }
         }
         self.sel.note_q_face(t_qface.elapsed().as_secs_f64() * 1000.0);
         let pos = ctx_tokens - 1;
@@ -1960,6 +1965,29 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         Ok(())
     }
 
+    /// **廉价边界**的待分析面:不采 Q、不做 query 面,只让 `coverage_analyze`
+    /// 走视图/驻留账的廉价路径(`recall_every > 1` 时 15/16 的边界走这里)。
+    pub(crate) fn coverage_mark_cheap(
+        &self,
+        base: usize,
+        t: usize,
+        cov: &mut Option<crate::exec::coverage::CoveragePending>,
+    ) -> Result<()> {
+        let d = self.pool.geom.dims;
+        *cov = Some(CoveragePending {
+            base,
+            t,
+            hq: d.hq,
+            hkv: d.hkv,
+            hd: d.hd,
+            layers: self.pool.kvs().len(),
+            w: 0,
+            cheap: true,
+            q: Vec::new(),
+        });
+        Ok(())
+    }
+
     /// **Q 回读**(Q-2 第二段):设备 Q 块 → host f32(`[层][t·hq·hd]`),块当场 free。
     ///
     /// 只接**块边界 chunk**(调用方判 `(base+t) % page == 0`):分析期索引账
@@ -2029,6 +2057,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             hd,
             layers: q.len(),
             w,
+            cheap: false,
             q,
         });
         // 计时归入“查询面”(Q 回读 + 解码;逆 RoPE 在 `coverage_analyze`)

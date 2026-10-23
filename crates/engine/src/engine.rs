@@ -1541,7 +1541,10 @@ fn boot_pool_floor(
     // chunk 增量页 / 每 turn 页 / 并发下限(与下面的池校验**同一批数**)
     let keep_pages = cfg.knobs.select_sink + cfg.knobs.select_recent;
     let chunk_pages = cfg.prefill_chunk.div_ceil(pool.geom.page.max(1)).max(1);
-    let per_turn = ws_pages.max(1) + chunk_pages;
+    // `recall_every > 1` 时，召回点之间视图尾部最多长 `recall_every` 个
+    // chunk（选择集冻结，尾部持续追加）⇒ 池下限必须留这段尾部。
+    let recall_tail_pages = chunk_pages * cfg.knobs.recall_every.max(1);
+    let per_turn = ws_pages.max(1) + recall_tail_pages;
     let n_active = cfg.knobs.gdn_slots.max(1);
     let need = per_turn * n_active;
     let vm_on = cfg.knobs.kvmem_virtualization;
@@ -1562,7 +1565,7 @@ fn boot_pool_floor(
         "turn-ws",
         "每 turn 工作集 = {} tok = {} 页 = {} KiB(页 {} tok / {} KiB)⇒ \
          常驻 {} 块 = 保底 sink {} + recent {} + 召回 top-k {};准入地板 = {};\
-         池下限 = {} 并发 × (工作集 {} + chunk {} = {} 页) = {} 页(池 {} 页){}\
+         池下限 = {} 并发 × (工作集 {} + 召回间隔尾 {} 页 = {} 页) = {} 页(池 {} 页){}\
          (改工作集只动 `[kvmem].workspace_per_req`;`select_blocks` 是派生量)",
         cfg.knobs.workspace_per_req,
         ws_pages,
@@ -1576,7 +1579,7 @@ fn boot_pool_floor(
         floor_desc,
         n_active,
         ws_pages,
-        chunk_pages,
+        recall_tail_pages,
         per_turn,
         need,
         pool.geom.nb,

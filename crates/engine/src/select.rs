@@ -412,7 +412,7 @@ impl SelectRuntime {
         self.prof.total_ms += ms;
     }
 
-    #[cfg(any(test, feature = "e2e"))]
+    /// B 轴相位账只读面(生产诊断也读；纯计时，零语义)。
     pub(crate) fn prof(&self) -> &BAxisProfile {
         &self.prof
     }

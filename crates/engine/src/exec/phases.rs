@@ -289,6 +289,40 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             (act.vlm.as_ref(), act.vlm_peer.as_ref())
         };
+        // **廉价边界省 Q**：只有完整召回/诊断边界才需要 query 面。
+        // 与 `coverage_analyze` 同一份调度算式（末边界预测 + recall_every）——
+        // 不能在两处各写一个数。
+        let q_needed = if self.boot.cfg.knobs.select_decode || self.boot.cfg.knobs.coverage_probe {
+            let new_fed = base + chunk_ids.len();
+            let prompt_len = self
+                .turns
+                .active
+                .first()
+                .map(|a| a.prompt_ids.len())
+                .unwrap_or(new_fed);
+            let next_end = Self::prefill_step_chunk(
+                new_fed,
+                prompt_len,
+                self.boot.cfg.prefill_chunk,
+                self.boot.cfg.knobs.prefill_tail_merge,
+                Self::prefill_align_page(
+                    self.boot.cfg.knobs.prefill_align_tail,
+                    self.boot.cfg.knobs.prefix_cache,
+                    self.dev.pool.geom.page,
+                ),
+            )
+            .map(|n| new_fed + n)
+            .unwrap_or(new_fed);
+            let last_boundary =
+                next_end == new_fed || !next_end.is_multiple_of(self.dev.pool.geom.page);
+            self.boot.cfg.knobs.coverage_probe
+                || last_boundary
+                // `coverage_analyze` 先 `note_boundary()` 再取模；这里预判要
+                // 用**下一个**边界序号，否则 k>1 时会在完整召回边界漏采 Q。
+                || (self.sel.boundaries() + 1) % self.boot.cfg.knobs.recall_every.max(1) == 0
+        } else {
+            false
+        };
         let mut host0 = ChunkHost {
             boot_seq: self.boot.seq,
             probes: self.boot.probes,
@@ -299,6 +333,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             bank: Some(&mut self.bank),
             sel: Some(&mut self.sel),
             past_view: past_view.clone(),
+            q_needed,
             vlm: vlm0,
         };
         let mut host1 = ChunkHost {
@@ -311,6 +346,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             bank: None, // peer:镜像路不给账房(草稿臂在本路响亮拒)
             sel: None,  // peer:诊断账只在主 rank
             past_view,
+            q_needed,
             vlm: vlm1,
         };
         // ── ① 两 rank **并发**入队半(同一份设备侧代码,各自 rank 束)──────
@@ -434,6 +470,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     bank: None,
                     sel: None,
                     past_view: replay_past,
+                    q_needed: false,
                     vlm: vlm_replay,
                 };
                 self.dev
@@ -451,6 +488,25 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 base,
                 chunk_ids.len(),
                 self.sel.view().map(|v| v.pages.len()).unwrap_or(0)
+            );
+        }
+        if is_last && self.boot.probes.dflash_probe {
+            let p = self.sel.prof();
+            owl_shared::log_info!(
+                "kvmem-prof",
+                "boundaries={} full={} cheap={} | index={:.1} qface={:.1} mass={:.1} score={:.1} paper={:.1} select={:.1} view={:.1} reconcile={:.1} | total={:.1}ms",
+                p.boundaries,
+                p.recall_full,
+                p.recall_cheap,
+                p.index_ms,
+                p.q_face_ms,
+                p.mass_ms,
+                p.score_ms,
+                p.paper_ms,
+                p.select_ms,
+                p.view_ms,
+                p.reconcile_ms,
+                p.total_ms
             );
         }
         // **边界事件计时 → metrics**(2026-10-18 T1):前向已有 `prefill.chunk`
