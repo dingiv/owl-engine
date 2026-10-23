@@ -1253,6 +1253,40 @@ impl StatePool {
             .collect()
     }
 
+    /// **前缀无感删除可用?**(f16 + kNHD 分页;fp8 需 dequant→requant,未做)
+    pub(crate) fn k_shift_supported(&self) -> bool {
+        self.geom.paged && !self.geom.kv_fp8 && self.geom.dims.dtype == Dtype::F16
+    }
+
+    /// 池内 K 的 Δ-rope 几何(`[nb, hkv, hd/x, page, x]` 四维 + `half`)
+    pub(crate) fn k_shift_geom(
+        &self,
+        half: usize,
+    ) -> crate::Result<owl_models::layers::kvshift::KvShiftGeom> {
+        if !self.k_shift_supported() {
+            return Err(ModelError::Msg(format!(
+                "k_shift_geom: 本池不支持 K 重转(paged={} kv_fp8={} dtype={:?})",
+                self.geom.paged, self.geom.kv_fp8, self.geom.dims.dtype
+            )));
+        }
+        let g = owl_models::layers::kvshift::KvShiftGeom {
+            hkv: self.geom.dims.hkv,
+            hd: self.geom.dims.hd,
+            page: self.geom.page,
+            x: self.geom.x,
+            half,
+        };
+        g.check().map_err(ModelError::Msg)?;
+        Ok(g)
+    }
+
+    /// 逐层 KV cache K 的**块句柄**(门/诊断:按槽偏移 D2H 读 K 字节)。
+    /// 生产路径不读,只服务于机械门与取证工具。
+    #[allow(dead_code)]
+    pub(crate) fn kv_k_blocks(&self) -> Vec<owl_iface::contract::Bytes> {
+        self.kvs().iter().map(|b| b.k_cache.0.clone()).collect()
+    }
+
     /// 块表叶子(模式相关:paged [1,nb] / legacy [1];run 图闭包用)
     pub(crate) fn bt_leaf(&self) -> TensorOps {
         if self.geom.paged {
@@ -1364,6 +1398,20 @@ impl StatePool {
         if i < self.gdn.snaps.keys.len() {
             self.gdn.snaps.keys[i] = Some(key);
             self.gdn.snaps.last_use[i] = tick;
+        }
+    }
+
+    /// **快照键重挂**(前缀无感删除;2026-10-23):槽上那条快照换身份。
+    ///
+    /// 只动账 —— 内容零搬运(删除是"搬运记忆",状态本身不必重算)。
+    /// `false` = 槽上没有旧键(账/槽不平;调用方查账已确认,属结构性异常)。
+    pub(crate) fn snap_rekey(&mut self, old: SnapKey, new: SnapKey) -> bool {
+        match self.gdn.snaps.keys.iter().position(|k| *k == Some(old)) {
+            Some(i) => {
+                self.gdn.snaps.keys[i] = Some(new);
+                true
+            }
+            None => false,
         }
     }
 

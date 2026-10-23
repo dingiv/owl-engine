@@ -73,9 +73,28 @@ pub struct TurnOpts {
     /// **本刀只实做 `Strict`** —— 非 `Strict` 在提交边界**响亮拒**(选择层
     /// B 轴未落地,地板语义无从兼现,§23.5)。
     pub dense_floor: Option<owl_store::TurnFloor>,
-    /// **VLM 图像输入**(2026-10-20 视觉接线):空 = 纯文本(逐字节旧行为)。
-    /// 首版单图;`VlmImage` 是服务面预处理的输出契约。
-    pub images: Vec<owl_models::vlm::VlmImage>,
+    /// **VLM 图像输入**(2026-10-20 视觉接线;2026-10-23 多图):空 = 纯文本
+    /// (逐字节旧行为)。`VlmImage` 是服务面预处理的输出契约;`evict` =
+    /// 客户端声明「这张图将来可能被删」(前缀无感删除的唯一触发面)。
+    pub images: Vec<TurnImage>,
+}
+
+/// 一张输入图像 + **可删除标记**(前缀无感删除;2026-10-23 用户裁决)。
+///
+/// 引擎**不自作主张**:只有带标记、且 `[pool] image_evict = true` 的图像段
+/// 才会被补 pad 到页对齐并进删除候选;未标记 = 零行为差异。
+#[derive(Clone, Debug)]
+pub struct TurnImage {
+    /// 像素 + 网格(服务面预处理产物)
+    pub image: owl_models::vlm::VlmImage,
+    /// 客户端标记:将来可能从历史里删掉这张图
+    pub evict: bool,
+}
+
+impl From<owl_models::vlm::VlmImage> for TurnImage {
+    fn from(image: owl_models::vlm::VlmImage) -> Self {
+        Self { image, evict: false }
+    }
 }
 
 /// turn 终了原因(OpenAI `finish_reason` 真源)
@@ -119,6 +138,12 @@ pub(crate) struct Turn {
     pub(crate) ephemeral: bool,
     pub(crate) spec: TurnSpec,
     pub(crate) prompt_ids: Vec<u32>,
+    /// 本轮 prompt 的图像段(含 pad;本轮坐标)—— 收口写回会话账
+    pub(crate) img_spans: Vec<crate::img_evict::ImgSpan>,
+    /// 本轮 prompt 的 pad 区间(升序;与 `img_spans` 同一次写回)
+    pub(crate) img_pads: Vec<(usize, usize)>,
+    /// **前缀无感删除命中**(本轮识别到的删除;`None` = 普通 turn)
+    pub(crate) deletion: Option<crate::img_evict::TextDelete>,
     /// per-turn 可选项(AGT-06)
     pub(crate) opts: TurnOpts,
     /// 提交时前缀命中量(usage `cached_tokens` 真源;AGT-12)
@@ -163,7 +188,12 @@ pub(crate) struct ActiveTurn {
     pub(crate) fed: usize,
     pub(crate) decoded: String,
     /// **VLM 图像输入 + 备料**(空/None = 纯文本)
-    pub(crate) images: Vec<owl_models::vlm::VlmImage>,
+    pub(crate) images: Vec<TurnImage>,
+    /// 本轮 prompt 里各图像段(含 pad;**本轮坐标**)—— turn 收口写回会话账,
+    /// 下一轮的删除识别就用它(未标记的段也记,便于诊断;只有 `evict` 能吸收)
+    pub(crate) img_spans: Vec<crate::img_evict::ImgSpan>,
+    /// 本轮 prompt 的 pad 区间(收口与 `img_spans` 一起写回)
+    pub(crate) img_pads: Vec<(usize, usize)>,
     /// rank0 / rank1 的 VLM 备料(TP2 各备一份;merged 是本 rank 设备块)
     pub(crate) vlm: Option<crate::vlm::VlmPrepared>,
     pub(crate) vlm_peer: Option<crate::vlm::VlmPrepared>,

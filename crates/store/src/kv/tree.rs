@@ -327,7 +327,10 @@ impl PrefixTree {
         let mut evicted = Vec::new();
         // 本趟被跳过的非设备叶(不删条目 —— 容量驱逐那趟还要它们)
         let mut deferred: Vec<(ChainHash, u64)> = Vec::new();
-        let mut guard = self.leaf_lru.len() * 2 + 8;
+        // 守卫 = 请求量 + 基线:逐掉一片后父块会**追加**到 leaf_lru 尾部,
+        // 深链要能在**同一次调用**里一路走上去(旧 guard 只有 ~10 步,深链一次
+        // 只能塌 10 块 ⇒ 容量裁剪要拖很多拍)。
+        let mut guard = n + self.leaf_lru.len() * 2 + 8;
         while n > 0 && guard > 0 {
             guard -= 1;
             let Some((hash, access)) = self.leaf_lru.pop_front() else { break };
@@ -379,6 +382,34 @@ impl PrefixTree {
             e.access = access;
         }
         self.touch_leaf(chain);
+    }
+
+    /// **可整枝塌缩的块数**(前缀无感删除/整枝驱逐用):从 `tail` 往上,只要
+    /// 每一层都**没有兄弟**(父的 `children == 1`)就继续;遇到分叉点(父有别的
+    /// 孩子)立即停 —— **分叉点以上是共享前缀,永远不动**。
+    ///
+    /// 语义 = "从叶往根连续可逐的块数"(含 `tail` 自己;`tail` 不在树/不是叶 ⇒ 0)。
+    /// 执行侧的 [`KvStore::prune_branch`] 会再逐块校验引用(活跃会话持有则停),
+    /// 所以本函数只做**结构**判定(纯读,零副作用)。
+    pub(crate) fn collapsible_span(&self, tail: ChainHash) -> usize {
+        let Some(e) = self.entries.get(&tail) else { return 0 };
+        if e.children > 0 {
+            return 0; // 非叶不可逐
+        }
+        let mut span = 1usize;
+        let mut cur = tail;
+        while let Some(e) = self.entries.get(&cur) {
+            let Some(parent) = e.parent else { break };
+            // 父只能有这一个孩子 ⇒ 逐掉 cur 后父才成为叶
+            match self.entries.get(&parent) {
+                Some(pe) if pe.children == 1 => {
+                    span += 1;
+                    cur = parent;
+                }
+                _ => break,
+            }
+        }
+        span
     }
 
     /// 单条移除(host 条目被逐时用;返回其绑定槽,`None` = 本来就在 host)。
@@ -476,6 +507,52 @@ mod tests {
         let m = t.matched_blocks(&toks(8));
         assert_eq!(m.matched_blocks, 2, "host 条目仍按内容命中");
         assert_eq!(m.blocks.last().and_then(|b| b.slot), None, "设备上没有副本");
+    }
+
+    /// **树形分叉**（前缀缓存是树）：两条链共享前缀、末尾分叉。
+    ///
+    /// 判据：
+    /// 1. 共享块是**同一内容身份**（不是复制），两条链各自都能整链命中；
+    /// 2. 只有叶可逐 ⇒ **最冷的叶先走**（不按深度）；
+    /// 3. 某分支的叶逐光后，它让出的共享父块**只有在另一枝也走了之后**才变成叶
+    ///    ⇒ 共享前缀在任一分支活着时**不会被逐**。
+    #[test]
+    fn branches_share_prefix_and_evict_leaf_first() {
+        let bs = 4;
+        let mut t = PrefixTree::new(bs, 16);
+        let base = toks(8); // 前两块
+        let mut a = base.clone();
+        a.extend([100u32, 101, 102, 103]); // A 的第三块
+        let mut b = base.clone();
+        b.extend([200u32, 201, 202, 203]); // B 的第三块
+        t.insert(&a, &[10, 11, 12]);
+        t.insert(&b, &[20, 21, 22]);
+        let ha = t.matched_blocks(&a);
+        let hb = t.matched_blocks(&b);
+        assert_eq!((ha.matched_blocks, hb.matched_blocks), (3, 3), "两枝各自整链命中");
+        assert_eq!(ha.blocks[0].chain, hb.blocks[0].chain, "共享块 = 同一身份");
+        assert_eq!(ha.blocks[1].chain, hb.blocks[1].chain);
+        assert_ne!(ha.blocks[2].chain, hb.blocks[2].chain, "分叉点身份不同");
+        // 刚用过 A ⇒ B 的尾叶最冷 ⇒ 先逐它
+        let _ = t.matched_blocks(&a);
+        let ev = t.evict_device(1);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].1, Some(22), "先逐最冷的叶(B 的尾巴)");
+        assert_eq!(t.matched_blocks(&a).matched_blocks, 3, "A 不受影响");
+        assert_eq!(t.matched_blocks(&b).matched_blocks, 2, "B 只剩共享前缀");
+        let shared_tail = hb.blocks[1].chain;
+        assert_eq!(
+            t.get(shared_tail).expect("共享块在").children,
+            1,
+            "A 还挂着 ⇒ 共享块仍非叶(不可逐)"
+        );
+        // 再逐 A 的尾叶 ⇒ 两枝都没了 ⇒ 共享前缀才变叶
+        let ev = t.evict_device(1);
+        assert_eq!(ev[0].1, Some(12), "接着逐 A 的尾叶");
+        assert!(
+            t.leaves().iter().any(|(h, _, _)| *h == shared_tail),
+            "两枝尽 ⇒ 共享前缀成为可逐的叶"
+        );
     }
 
     #[test]

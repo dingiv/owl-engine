@@ -74,6 +74,14 @@ pub struct EngineKnobs {
     pub draft: DraftCfg,
     /// 前缀缓存(缺省开;原 OWL_PREFIX_CACHE≠"0")
     pub prefix_cache: bool,
+    /// **整枝塌缩**(`[kvmem].bulk_drop_when_tier_full`;缺省 false = 保守)。
+    pub bulk_drop_when_tier_full: bool,
+    /// **前缀无感删除(图像段)**(`[pool].image_evict`;缺省关)。
+    ///
+    /// 开 = 客户端给图像打可删标记时:页对齐 pad + 删除后后缀 K 重转
+    /// (`R(−S)`),不重算删点之后的 token。依赖 `prefix_cache` + f16 分页池
+    /// + 视觉档(boot 门;任缺 = 拒启)。
+    pub image_evict: bool,
     /// **前缀缓存份额**(0..1;`[pool].prefix_cache_share`;缺省 0.5 = 旧 `nb/2`)。
     /// 容量算式在 store(`CachePolicy::Share`),这里只是**政策输入**。
     pub prefix_cache_share: f64,
@@ -292,6 +300,8 @@ impl Default for EngineKnobs {
             pool_tokens: None,
             draft: DraftCfg::default(),
             prefix_cache: true,
+            bulk_drop_when_tier_full: false,
+            image_evict: false,
             prefix_cache_share: 0.5,
             host_cache_mb: 0,
             snap_host_mb: 0,
@@ -599,6 +609,8 @@ impl EngineKnobs {
                 tp_draft: cfg.spec.tp_draft,
             },
             prefix_cache: cfg.pool.prefix_cache,
+            bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
+            image_evict: cfg.pool.image_evict,
             prefix_cache_share: cfg.pool.prefix_cache_share,
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
             host_cache_mb: cfg.pool.host_cache_mb,
@@ -1137,6 +1149,8 @@ pub(crate) fn into_running<D: DeviceClient>(
             );
             // **B-4 驱逐策略装配**(boot 一次;缺省 LRU ⇒ 与历史逐字一致)
             b.rel.set_evict_policy(cfg.knobs.evict_policy.build());
+            // 整枝塌缩(2026-10-23):宿主/磁盘**装不下整链**时允许一张票丢整段
+            b.rel.set_bulk_drop_when_tier_full(cfg.knobs.bulk_drop_when_tier_full);
             owl_shared::log_info!("store", "驱逐策略 = {}", b.rel.evict_policy_name());
             if cfg.knobs.index_probe {
                 // B 轴索引几何:层 = 全注意力层数,头 = KV 头数,dim = head_dim
@@ -1288,6 +1302,31 @@ pub(crate) fn into_running<D: DeviceClient>(
             b
         };
 
+    // **前缀无感删除的 boot 门**(2026-10-23):开了就必须具备执行面 ——
+    // ① 视觉塔(图像段识别 / m-RoPE 位置自证)② f16 分页池(池内 K 原地重转;
+    // fp8 需 dequant→rotate→requant,未做)③ 前缀缓存(按内容取回旧链)。
+    // 任缺 = **拒启**(静默降级 = 客户端以为删了不重算、实际每轮全量重灌)。
+    if cfg.knobs.image_evict {
+        if dev.boot.vlm.is_none() {
+            return Err(ModelError::Msg(
+                "[pool] image_evict = true 需要 [model].vision = true(图像段识别依赖视觉档)"
+                    .into(),
+            ));
+        }
+        if !dev.pool.geom.paged || !dev.pool.k_shift_supported() {
+            return Err(ModelError::Msg(format!(
+                "[pool] image_evict = true 需要 f16 分页 KV 池(paged={} kv_fp8={} dtype={:?});\
+                 fp8 池的 dequant→requant 未做",
+                dev.pool.geom.paged, dev.pool.geom.kv_fp8, dev.pool.geom.dims.dtype
+            )));
+        }
+        owl_shared::log_info!(
+            "boot",
+            "前缀无感删除:开(可删图像段页对齐 pad + 删除后缀 K 重转;页 {} tok)",
+            dev.pool.geom.page
+        );
+    }
+
     let boot = crate::running::BootCtx {
         probes: cfg.knobs.probes,
         tok: tokenizer,
@@ -1296,6 +1335,7 @@ pub(crate) fn into_running<D: DeviceClient>(
     };
     Ok(RunningEngine {
         boot,
+        img_evict: crate::running::ImgEvictLedger::default(),
         turns: crate::turn::TurnLedger::new(),
         bank,
         sel: crate::select::SelectRuntime::default(),

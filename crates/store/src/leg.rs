@@ -710,6 +710,47 @@ impl BlockLeg {
         out
     }
 
+    /// **可整枝塌缩的块数**(纯读;计划器给 Drop 票定 `span` 用)。
+    pub fn collapsible_span(&self, tail: crate::id::ChainHash) -> usize {
+        self.kv.collapsible_span(tail)
+    }
+
+    /// **整枝塌缩**(批量过期;宿主副本一并丢)。见 [`KvStore::prune_branch`]。
+    pub fn prune_branch(
+        &mut self,
+        tail: crate::id::ChainHash,
+        max_blocks: usize,
+    ) -> StoreResult<usize> {
+        // 宿主副本要按**丢弃前**的链序清(root→tail;`.rev()` = 叶→根)
+        let chain: Vec<crate::id::ChainHash> =
+            self.kv.chain_of(tail).iter().map(|b| b.chain).collect();
+        let dropped = self.kv.prune_branch(tail, max_blocks)?;
+        for h in chain.iter().rev().take(dropped) {
+            match self.host.evict(*h) {
+                Ok(_) => {}
+                Err(crate::error::StoreError::Unknown(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// **废弃链身份**(前缀无感删除;见 [`KvStore::drop_chain`])。
+    ///
+    /// 宿主副本一并丢掉(内容已被原地改写 ⇒ 再回灌就是错值)。
+    pub fn drop_chain(&mut self, chain: crate::id::ChainHash) -> StoreResult<bool> {
+        let dropped = self.kv.drop_chain(chain)?;
+        if dropped {
+            // 宿主副本**不在场是常态**(多数块只住设备)⇒ Unknown 幂等,不许冒泡
+            match self.host.evict(chain) {
+                Ok(_) => {}
+                Err(crate::error::StoreError::Unknown(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(dropped)
+    }
+
     /// 登记一条链(turn 收口;缓存取一份绑定引用)。
     ///
     /// ⚠️ 登记**内部会因容量驱逐**(`cache_cap`)—— 被逐的宿主条目必须把宿主副本

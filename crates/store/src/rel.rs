@@ -260,6 +260,8 @@ pub struct Rel {
     pub admission: Admission,
     budget: VramBudget,
     evict: Box<dyn EvictPolicy>,
+    /// 整枝塌缩开关(见 [`Self::set_bulk_drop_when_tier_full`])。
+    bulk_drop_when_tier_full: bool,
     /// 状态腿的设备布局(快照 = 「槽 × 片」;engine 在 boot 注册,§25.2)。
     snap_layout: Option<crate::leg::PoolLayout>,
     /// **peer 快照布局**(TP;快照槽既写两 rank ⇒ 各自块 id)。
@@ -363,6 +365,7 @@ impl Rel {
             admission: Admission::new(),
             budget,
             evict: Box::new(LruPolicy),
+            bulk_drop_when_tier_full: false,
             snap_layout: None,
             snap_layout_peer: None,
             snap_bytes: 0,
@@ -390,7 +393,7 @@ impl Rel {
             .into_iter()
             .filter(|c| c.tier == Tier::Gpu)
             .collect();
-        crate::hooks::order_candidates(self.evict.as_ref(), cands, &self.state)
+        crate::hooks::order_snap_victims(self.evict.as_ref(), cands, &self.state)
             .into_iter()
             .filter_map(|c| c.snap)
             .collect()
@@ -731,6 +734,21 @@ impl Rel {
         Ok((m, hit))
     }
 
+    /// **整枝塌缩开关**(boot 一次;`[kvmem].bulk_drop_when_tier_full`)。
+    pub fn set_bulk_drop_when_tier_full(&mut self, on: bool) {
+        self.bulk_drop_when_tier_full = on;
+    }
+
+    /// **整枝塌缩**(批量过期;见 [`KvStore::prune_branch`])。
+    pub fn prune_branch(&mut self, tail: ChainHash, max_blocks: usize) -> StoreResult<usize> {
+        self.leg.prune_branch(tail, max_blocks)
+    }
+
+    /// **废弃链身份**(前缀无感删除的"改写即失效";见 `KvStore::drop_chain`)。
+    pub fn drop_chain(&mut self, chain: ChainHash) -> StoreResult<bool> {
+        self.leg.drop_chain(chain)
+    }
+
     /// **登记一条前缀链**(turn 收口 L3):缓存取一份绑定引用,容量驱逐同步丢宿主副本。
     ///
     /// 只做 KV 腿;快照腿由 [`StateStore::return_row`] 登记(两腿独立 —— 裁决②)。
@@ -781,6 +799,7 @@ impl Rel {
             host_snap_slots: self.snap_host_free_slots(),
             disk_kv_slots: self.disk.as_ref().map(|d| d.free_slots()).unwrap_or(0),
             disk_snap_slots: self.snap_disk.as_ref().map(|d| d.free_slots()).unwrap_or(0),
+            bulk_drop_when_tier_full: self.bulk_drop_when_tier_full,
         };
         crate::hooks::plan_capacity(
             &self.leg,
@@ -963,6 +982,11 @@ impl Rel {
         self.snap_host.put(key, buf)?;
         self.state.set_tier(key, Tier::Host)?;
         Ok(())
+    }
+
+    /// **快照键重挂**(前缀无感删除;见 [`StateStore::rekey_snap`])。
+    pub fn rekey_snap(&mut self, old: SnapKey, new: SnapKey) -> bool {
+        self.state.rekey_snap(old, new)
     }
 
     /// **快照下沉回滚**(搬运失败):宿主缓冲随失败的 connector 释放,层不动。
@@ -1674,10 +1698,12 @@ mod tests {
         );
     }
 
-    /// **会话感知淘汰门(2026-10-19)**:同一会话内**深度大者先逐**(末端先走),
-    /// 即使它"最新"也一样;会话之间按会话冷热;无归属排最后。
+    /// **快照淘汰门(2026-10-23 改判)**:快照**不走** KV 块的"末端先削"结构档 ——
+    /// 每条快照按自己的边界身份独立键控,逐浅的不会让深的失效;而"深度大者先逐"
+    /// 会先逐掉**最有用的一条**(会话上一轮尾巴 = 增量续写/前缀无感删除的 GDN
+    /// 恢复点)。现行 = **Transient 最前 + 其余按新鲜度(LRU)**。
     #[test]
-    fn session_tail_first_eviction_order() {
+    fn snap_victim_order_is_recency_based() {
         let mut r = rel(4);
         let k = |n: u64| SnapKey::at_boundary(ChainHash::new(n));
         // 会话 1:depth 1/2/3(先登记 ⇒ last_use 小)
@@ -1702,15 +1728,169 @@ mod tests {
                 d,
             );
         }
-        // 把会话 1 的**末端**触达成最新(旧策略会最后才逐它;新策略必须最先)
+        // 把会话 1 的**末端**触达成最新:它既是"上一轮尾巴"(增量续写的复用面),
+        // 也是前缀无感删除的 GDN 恢复点 ⇒ 必须**最后**被逐(旧策略会最先逐它)
         r.state.touch(k(102));
         let order = r.snap_victim_order(&[]);
-        // **全局深度降序**:A(depth3) → A2/B2(同层,冷者 A 先) → A1/B1
+        // 纯新鲜度:登记序 = 100,101,200,201;102 被触达 ⇒ 最后
         assert_eq!(
             order,
-            vec![k(102), k(101), k(201), k(100), k(200)],
-            "每会话先从自己的末端削(深度全局降序),同层冷会话先"
+            vec![k(100), k(101), k(200), k(201), k(102)],
+            "快照出序 = 新鲜度(LRU):刚用过的尾巴最后逐,深度不参与"
         );
+    }
+
+    /// **整枝塌缩**(2026-10-23):无宿主档下,一条 D 块冷链**一轮一张票、`span = D`**
+    /// —— 不再是"一轮一块"(旧行为见台账 2026-10-23)。
+    #[test]
+    fn cold_deep_branch_collapses_in_one_planning_round() {
+        // **无宿主/无磁盘档**:只剩 Drop 轮(有宿主时同义:整链一张 span 票)
+        let mut i = inputs();
+        i.host_bytes = 0;
+        let mut cfg = kv_cfg(64, 32);
+        cfg.host_bytes = 0; // 两条腿的宿主预算必须一致(装配期交叉校验)
+        let mut r = Rel::open(
+            i.clone(),
+            AdmissionPolicy::new(4, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+        )
+        .expect("装配");
+        r.leg
+            .attach_pool(crate::leg::PoolLayout {
+                class: crate::leg::BlockClass::KvPage,
+                epoch: 0,
+                pieces: vec![crate::leg::PieceSpec {
+                    buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                    stride_bytes: BLOCK_BYTES,
+                }],
+            })
+            .expect("布局");
+
+        let tokens = toks(8 * 32); // 8 块
+        let mut table = Vec::new();
+        r.ensure_for_len(&mut table, tokens.len()).expect("块表");
+        r.register_chain(&tokens, &table).expect("登记");
+        r.release_table(&mut table).expect("归还");
+
+        let need = |slots: usize| crate::hooks::Need {
+            slots,
+            snap_bytes: 0,
+            why: crate::hooks::NeedWhy::Pressure,
+        };
+        let v = r.plan_need(need(8), &Protected::default());
+        let tickets: Vec<_> = v
+            .out
+            .iter()
+            .filter_map(|o| match o {
+                crate::hooks::EvictOut::Kv { chain, sink: crate::hooks::Sink::Drop, span } => {
+                    Some((*chain, *span))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tickets.len(), 1, "一条深链 ⇒ 一张票:{v:?}");
+        assert_eq!(tickets[0].1, 8, "span = 整枝块数(一轮塌干净):{v:?}");
+        // 执行
+        let n = r.leg.prune_branch(tickets[0].0, tickets[0].1).expect("整枝塌缩");
+        assert_eq!(n, 8, "实际丢 8 块");
+        // 缓存已空 ⇒ 再要也不会有 KV 票
+        let v2 = r.plan_need(need(8), &Protected::default());
+        assert!(
+            !v2.out.iter().any(|o| matches!(o, crate::hooks::EvictOut::Kv { .. })),
+            "缓存空 ⇒ 没有 KV 票:{v2:?}"
+        );
+    }
+
+    /// **有分层时不许整枝丢**(2026-10-23):宿主/磁盘可为内容留一条命时,Drop 票
+    /// 保持逐块(让链先缩小到装得进宿主,再由下沉/搬盘接走);整枝塌缩只用于
+    /// **没有分层可搬**的档位。
+    #[test]
+    fn drop_span_stays_one_when_a_content_preserving_tier_exists() {
+        let mut r = rel(4); // host 8MiB ⇒ ~21 块;建一条 30 块的链(装不下)
+        let tokens = toks(30 * 32);
+        let mut table = Vec::new();
+        r.ensure_for_len(&mut table, tokens.len()).expect("块表");
+        r.register_chain(&tokens, &table).expect("登记");
+        r.release_table(&mut table).expect("归还");
+
+        let v = r.plan_need(
+            crate::hooks::Need { slots: 30, snap_bytes: 0, why: crate::hooks::NeedWhy::Pressure },
+            &Protected::default(),
+        );
+        let drops: Vec<usize> = v
+            .out
+            .iter()
+            .filter_map(|o| match o {
+                crate::hooks::EvictOut::Kv { sink: crate::hooks::Sink::Drop, span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        assert!(!drops.is_empty(), "宿主装不下整链 ⇒ 应走 Drop:{v:?}");
+        assert!(drops.iter().all(|s| *s == 1), "有分层时 Drop 必须逐块(内容优先保留):{v:?}");
+    }
+
+    /// **整枝开关打开**(`bulk_drop_when_tier_full = true`):宿主装不下整链时,
+    /// 允许一张票丢整段(否则要 O(深度) 个调度轮)。
+    #[test]
+    fn bulk_flag_lets_a_tier_short_chain_collapse_in_one_round() {
+        let mut r = rel(4); // host ✓ ~21 槽;30 块链装不下
+        r.set_bulk_drop_when_tier_full(true);
+        let tokens = toks(30 * 32);
+        let mut table = Vec::new();
+        r.ensure_for_len(&mut table, tokens.len()).expect("块表");
+        r.register_chain(&tokens, &table).expect("登记");
+        r.release_table(&mut table).expect("归还");
+        let v = r.plan_need(
+            crate::hooks::Need { slots: 30, snap_bytes: 0, why: crate::hooks::NeedWhy::Pressure },
+            &Protected::default(),
+        );
+        let drops: Vec<usize> = v
+            .out
+            .iter()
+            .filter_map(|o| match o {
+                crate::hooks::EvictOut::Kv { sink: crate::hooks::Sink::Drop, span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drops, vec![30], "开关打开 + 装不下 ⇒ 一轮整枝:{v:?}");
+        assert!(r.leg.prune_branch(r.leg.tail_hash(&tokens, 30).expect("尾"), 30).is_ok());
+    }
+
+    /// **分叉点停住**:共享前缀 + 两条尾巴 ⇒ 塌缩一条尾巴**只丢它自己**,
+    /// 共享前缀不动(它还有另一个孩子)。
+    #[test]
+    fn prune_branch_stops_at_the_branch_point() {
+        let mut r = rel(4);
+        let a = toks(2 * 32); // 共享前缀(2 块)
+        let mut b = a.clone();
+        b.extend((900u32..932).collect::<Vec<_>>()); // 第 3 个**整块**(分支 B)
+        let mut c = a.clone();
+        c.extend((940u32..972).collect::<Vec<_>>()); // 第 3 个整块(分支 C)
+        for t in [&a[..], &b[..], &c[..]] {
+            let mut table = Vec::new();
+            r.ensure_for_len(&mut table, t.len()).expect("块表");
+            r.register_chain(t, &table).expect("登记");
+            r.release_table(&mut table).expect("归还");
+        }
+        let tail_b = r.leg.tail_hash(&b, 3).expect("B 尾");
+        let tail_c = r.leg.tail_hash(&c, 3).expect("C 尾");
+        let tail_a = r.leg.tail_hash(&a, 2).expect("A 尾");
+        assert_eq!(r.leg.collapsible_span(tail_b), 1, "B 尾的父有 2 个孩子 ⇒ 只塌 1 块");
+        assert_eq!(r.leg.collapsible_span(tail_a), 0, "共享前缀非叶 ⇒ 不可塌");
+        let n = r.leg.prune_branch(tail_b, 4).expect("塌缩 B");
+        assert_eq!(n, 1, "分叉点停住:只丢 B 的尾巴");
+        // B 只剩共享前缀;C 整链不受影响
+        let hb = r.match_prefix(&b).expect("B 命中");
+        assert_eq!(hb.0.matched_blocks, 2, "B 剩共享前缀");
+        let hc = r.match_prefix(&c).expect("C 命中");
+        assert_eq!(hc.0.matched_blocks, 3, "C 完整");
+        // B 已走 ⇒ C 的尾巴成了"唯一子链":塌它时共享前缀跟着一起走(合法:
+        // 逐掉唯一孩子后父成为叶)。3 块 = C 尾 + 共享 2 块。
+        let n = r.leg.prune_branch(tail_c, 4).expect("塌缩 C");
+        assert_eq!(n, 3, "唯一枝尽 ⇒ 共享前缀可整段塌(3 块)");
+        assert_eq!(r.leg.collapsible_span(tail_a), 0, "共享前缀已不在树");
+        assert_eq!(r.match_prefix(&a).expect("A 查询").0.matched_blocks, 0, "缓存已空");
     }
 
     /// **KV 归属门**:`register_chain_owned` 记会话;深度 = 从根到该块的块数。

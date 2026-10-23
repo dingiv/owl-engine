@@ -221,6 +221,29 @@ impl StateStore {
         self.snaps.get(&key).map(|s| s.tier)
     }
 
+    /// **快照键重挂**(前缀无感删除;2026-10-23):同一条快照换一个边界身份。
+    ///
+    /// 用途:删掉中段之后,后缀的链身份整体变了(父链哈希变)—— 但**状态内容
+    /// 仍在原槽**(删除是"搬运记忆",不是重算)。重挂只动账,内容零搬运。
+    ///
+    /// 语义边界(响亮):
+    /// - `old` 不在账 / 不在 `Gpu` 层 ⇒ `false`(调用方当"没重挂",不许猜);
+    /// - `new` 已在账 ⇒ `false`(拒绝覆盖 —— 否则账与槽位映射会分叉)。
+    pub fn rekey_snap(&mut self, old: SnapKey, new: SnapKey) -> bool {
+        if self.snaps.contains_key(&new) {
+            return false;
+        }
+        match self.snaps.get(&old) {
+            Some(e) if e.tier == Tier::Gpu => {}
+            _ => return false,
+        }
+        let Some(e) = self.snaps.remove(&old) else {
+            return false;
+        };
+        self.snaps.insert(new, e);
+        true
+    }
+
     /// 触达快照(命中新鲜度)。
     pub fn touch(&mut self, key: SnapKey) {
         self.tick += 1;
@@ -330,6 +353,29 @@ mod tests {
         assert_eq!(s.borrow_row().expect("再借"), 0, "还回的行号应可复用");
         s.return_row(r1, None).expect("无快照也行");
         assert_eq!(s.rows_free(), 1);
+    }
+
+    /// **快照键重挂**(前缀无感删除):只动账;三个响亮拒绝各一例。
+    #[test]
+    fn rekey_snap_moves_account_without_copy() {
+        let mut s = StateStore::new(1, 1);
+        let old = SnapKey::at_boundary(ChainHash::new(1));
+        let new = SnapKey::at_boundary(ChainHash::new(2));
+        assert!(!s.rekey_snap(old, new), "不在账 ⇒ false(不许猜)");
+        s.register_snap(old, 4096, Tier::Gpu, SnapDurability::Durable);
+        assert!(s.rekey_snap(old, new), "设备层在账 ⇒ 重挂");
+        assert_eq!(s.locate(old), None, "旧键必须消失");
+        assert_eq!(s.locate(new), Some(Tier::Gpu), "新键拿同一份账");
+        assert_eq!(s.snap_bytes(new), Some(4096), "字节随账走");
+        // 目标已存在 ⇒ 不许覆盖(账与槽位映射会分叉)
+        let third = SnapKey::at_boundary(ChainHash::new(3));
+        s.register_snap(third, 1, Tier::Gpu, SnapDurability::Durable);
+        assert!(!s.rekey_snap(third, new), "目标已在账 ⇒ false");
+        // 非设备层 ⇒ 不动(宿主/盘的键映射不在本方法职责内)
+        let host = SnapKey::at_boundary(ChainHash::new(4));
+        s.register_snap(host, 1, Tier::Host, SnapDurability::Durable);
+        assert!(!s.rekey_snap(host, SnapKey::at_boundary(ChainHash::new(5))), "非 Gpu 层 ⇒ false");
+        assert_eq!(s.locate(host), Some(Tier::Host));
     }
 
     #[test]

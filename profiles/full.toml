@@ -163,6 +163,12 @@ vram_reserve_mb = 256
 vram_budget_mb = 0
 # 前缀缓存开/关
 prefix_cache = false
+# **前缀无感删除**(图像段;2026-10-23):客户端给图像打 `owl_evict` 标记时,
+# 引擎把图像段补 pad 到页对齐并记为删除候选;下一轮若该段真的被删 ⇒ 保留后缀
+# 页 + 后缀 K 乘 R(−S)(位置帧平移),不重算删点之后的 token。
+# **引擎不自作主张**:没有标记的图一律走旧路径。需 prefix_cache = true 且
+# f16 KV(kv_fp8 = false)。缺省关 = 逐字节旧行为。
+image_evict = false
 # 解释器块池预算(字节;0 = 关)
 block_pool_bytes = 0
 # 关活性中途回收(诊断;开会无界常驻)
@@ -249,6 +255,13 @@ coverage_probe = false
 analyze_at_ctx = 0
 # lru | lrfu | lrfu:0.8
 evict_policy = "lru"
+# **整枝塌缩**(2026-10-23):Drop 轮是否允许"一张票丢一整段"(叶→分叉点)。
+# 缺省 false = 保守:只要宿主/磁盘有空位就逐块(先缩小到装得进宿主,再由
+# 下沉/搬盘接走,内容优先保留);没有分层的档位本来就走整枝。
+# 开 = 当链**这一轮搬不走**(宿主剩余槽 < 链长)时允许整枝丢 —— 避免
+# "宿主/磁盘长期满 + 深冷枝"要 O(深度) 个调度轮才腾干净。
+# 淘汰只看时间(新鲜度),不看内容"贵不贵"。
+bulk_drop_when_tier_full = false
 pool_overcommit = false
 # 每 turn 工作集下限 MiB(留空 = 派生)
 dense_floor_mib = 0

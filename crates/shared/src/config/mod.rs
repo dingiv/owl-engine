@@ -72,6 +72,7 @@
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true |
+//! | pool | image_evict | bool / false(**前缀无感删除**:客户端给可删图像打标记 ⇒ 引擎页对齐 + 删除即位置帧平移) |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
 //! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
 //! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
@@ -103,6 +104,7 @@
 //! | kvmem | select_decode / select_partial / index / pool_overcommit | flag / false(overcommit = 四键全开) |
 //! | kvmem | workspace_per_req / select_sink / select_recent / recall_every | usize / 2240、2、4、1 |
 //! | kvmem | coverage_probe / analyze_at_ctx / evict_policy / dense_floor_mib | 见字段注(lru\|lrfu[:λ]) |
+//! | kvmem | bulk_drop_when_tier_full | bool / false(整枝塌缩:宿主/磁盘装不下时允许一次丢整段) |
 //! | probes | step_profile / perf_level / gdn_dump / debug / prefill_cksum / fact_probe | flag / false |
 //! | probes | step_gate / step_gate_ms / step_gate_us / step_gate_every | StepMode("off"\|"sticky"\|"single") / 50 / 0(覆盖 ms) / 1 |
 //! | log | level / tags_allow / tags_deny / file / max_mb / keep / timestamp | 见模块 |
@@ -599,6 +601,18 @@ pub struct PoolCfg {
     pub vram_target: f64,
     pub vram_reserve_mb: u64,
     pub prefix_cache: bool,
+    /// **前缀无感删除(图像段)** —— 2026-10-23 用户裁决:引擎**不自作主张**,
+    /// 必须由客户端显式给图像打「将来可能被删」标记(`TurnImage::evict`)且本键开。
+    ///
+    /// 开 = 对**带标记**的图像段做两件事:
+    /// ① 页对齐 pad(段首落页边界、整段整页 —— 删除后块表拼接零搬运);
+    /// ② 下一轮若识别到「历史里正好少了这一段」,保留后缀页 + 只把后缀 K
+    ///    乘 `R(−S)`(位置帧平移),不重算前缀之后的任何 token。
+    ///
+    /// 关 = 逐字节旧行为(标记被忽略;带了标记也**响亮拒**,不静默降级)。
+    /// 依赖:`prefix_cache = true`(内容寻址取旧链)与 f16 KV(paged kNHD;
+    /// fp8 池需 dequant→requant,未做)。
+    pub image_evict: bool,
     /// **解释器块池预算**(字节;0 = 关 = 逐节点 alloc/free 存量路径)。
     /// 原 `OWL_BLOCK_POOL` env;P1″ 块竞技场(见 `interpreters::eval`)。
     pub block_pool_bytes: usize,
@@ -761,6 +775,16 @@ pub struct KvmemCfg {
     /// LRFU(召回点选中的块抬 keep-score)⇒ 出序时"又冷又没被注意力用过"的先下沉。
     /// λ 参数在此解析(A4 收口,2026-10-19)。
     pub evict_policy: EvictPolicyCfg,
+    /// **整枝塌缩**(2026-10-23):Drop 轮是否允许"一张票丢一整段"。
+    ///
+    /// 缺省 `false` = 保守:只要宿主/磁盘层还有空位,就保持逐块(先让链缩小到
+    /// 装得进宿主 → 轮一下沉/轮 1.5 搬盘,内容优先保留)。**没有分层**的档位
+    /// 本来就走整枝(没地方可搬)。
+    ///
+    /// 开 = 当这条链**这一轮搬不走**时(宿主剩余槽 < 链长,且磁盘也接不了)
+    /// 允许整枝丢 —— 避免"宿主/磁盘长期满 + 深冷枝"时要 O(深度) 个调度轮才腾干净。
+    /// 语义前提(用户裁决 2026-10-23):淘汰只看**时间**(新鲜度),不看内容"贵不贵"。
+    pub bulk_drop_when_tier_full: bool,
     /// **准入地板**(MiB;`None` = 跟随虚拟化姿态)。
     ///
     /// 语义 = "本 turn 至少要有多少 **KV 页**直接驻留在设备"
@@ -1552,6 +1576,7 @@ impl Default for PoolCfg {
             vram_target: 0.97,
             vram_reserve_mb: 1024,
             prefix_cache: true,
+            image_evict: false,
             block_pool_bytes: 0,
             no_reclaim: false,
             vram_budget_mb: None,
@@ -1575,6 +1600,7 @@ impl Default for KvmemCfg {
             coverage_probe: false,
             analyze_at_ctx: 0,
             evict_policy: EvictPolicyCfg::Lru,
+            bulk_drop_when_tier_full: false,
             dense_floor_mib: None,
             pool_overcommit: false,
         }
@@ -2421,6 +2447,16 @@ impl OwlConfig {
                 "[pool] prefix_cache_share({}) 越界:须 0..=1(份额 × 设备池 = 缓存可占页数)",
                 self.pool.prefix_cache_share
             ));
+        }
+        // **前缀无感删除的依赖门**(2026-10-23):删除路径靠**内容寻址**取回旧链,
+        // 没有前缀缓存就没有旧链可拼接 ⇒ 开着 `image_evict` 却没开 `prefix_cache`
+        // 是"配了但永远不会生效",按静默降级拒启。
+        if self.pool.image_evict && !self.pool.prefix_cache {
+            return Err(
+                "[pool] image_evict = true 需要 prefix_cache = true\
+                 (删除路径要按内容身份取回旧链,前缀缓存关掉就没有可拼接的旧链)"
+                    .to_string(),
+            );
         }
         // **磁盘层的配置自洽**(S6):给了配额就必须给目录(否则"要磁盘"变成静默关层);
         // 给了目录但没配额 = 空目录守着不用(允许,但 boot 日志会显示关层)。

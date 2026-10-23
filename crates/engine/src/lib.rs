@@ -44,6 +44,8 @@ pub(crate) mod graph_fleet;
 // **状态域户**(2026-10-21 收户):选择层运行态 / 保洁账 —— 字段私有,
 // 只经语义方法读写(见各模块头)。
 pub(crate) mod housekeeping;
+/// 前缀无感删除:host 纯函数面(识别 / 页对齐 pad / 位置自证)
+pub(crate) mod img_evict;
 pub(crate) mod loader;
 pub(crate) mod running;
 pub(crate) mod sampler;
@@ -91,7 +93,7 @@ pub use running::{RunningEngine, TokenizeReply};
 pub use tp::{TpEngine, TpOpts, TpStaging};
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use session::{AgentSession, SessionTable};
-pub use turn::{TurnEvent, TurnOpts, TurnSampler, TurnSpec};
+pub use turn::{TurnEvent, TurnImage, TurnOpts, TurnSampler, TurnSpec};
 
 /// 主干量化方案映射(**唯一点**:`(format, quant)` → owl_models `QuantPlan`;
 /// 同 [`head_plan_of`] 的范式 —— app 层不碰 owl_models,新方案 =
