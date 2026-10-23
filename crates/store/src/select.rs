@@ -568,7 +568,8 @@ impl Default for ScoreTuning {
 /// |---|---|---|
 /// | [`Self::SoftmaxMean`] | **论文原样**(推荐;偏差不偏) | 全在 `0.073~0.132`(**≈1/块数**,平局成片) |
 /// | [`Self::LogitMean`] | 排序/阈值/预算用(logit 面取均) | 随 logits 自然展开 |
-/// | [`Self::CosineMean`] | **KVMem 产品口径**(逐 (层, KV 头) 余弦取均) | `[-1, 1]` |
+/// | [`Self::CosineMean`] | KVMem 余弦(组内 query head 先取均) | `[-1, 1]` |
+/// | [`Self::CosineMax`] | **KVMem 产品脚本默认**(组内 query head 取最大余弦) | `[-1, 1]` |
 ///
 /// ∇ 选哪一:凡“只要 top-k 名单”的调用方两者等价(建议留 SoftmaxMean);
 /// 凡“要拿分值做阈值/预算/权重”的(B-4 在线预算、按分排序的报表)
@@ -588,6 +589,12 @@ pub enum ScoreMode {
     /// 用的是余弦。`q̄` 已按 query 窗与 GQA 组折叠;query 模长对同一轮所有候选是
     /// 常数,但 cos 仍显式除以它(与产品逐位同构)。
     CosineMean,
+    /// **KVMem 产品脚本默认**:组内逐 query head 算余弦,取最大,再对
+    /// (层, KV 头) 取均(上游 `GqaScoreAggregation::Max`)。
+    ///
+    /// 与 [`Self::CosineMean`] 的差别只在 GQA 组内:mean 先平均 query head
+    /// (会稀释“某一个头已经找到针”的信号),max 保留该头的强信号。
+    CosineMax,
 }
 
 /// **8 路展开点积**(B-1 热路):8 个独立标量累加器 + `chunks_exact(8)`
@@ -667,10 +674,14 @@ pub fn score_blocks(
     //
     // ⇒ 打分从「窗 W × 头 hq × 层 × KV 头」次行扫描降到 **「层 × KV 头」一次**(本档 6×;
     // 与窗折叠叠加 = 48×),且两者都**不是近似**(仅 FP 重排;逐位同参考式)。
-    if matches!(tuning.mode, ScoreMode::LogitMean | ScoreMode::CosineMean) {
+    if matches!(
+        tuning.mode,
+        ScoreMode::LogitMean | ScoreMode::CosineMean | ScoreMode::CosineMax
+    ) {
         let q = face.collapsed_sum()?;
         let hq = face.q_heads;
-        let cosine = tuning.mode == ScoreMode::CosineMean;
+        let cosine = matches!(tuning.mode, ScoreMode::CosineMean | ScoreMode::CosineMax);
+        let gqa_max = tuning.mode == ScoreMode::CosineMax;
         // ① 按 KV 头分组(头的归属表)
         let mut q_heads_of: Vec<Vec<usize>> = vec![Vec::new(); kv_heads];
         for (h, g_raw) in gqa.iter().enumerate() {
@@ -728,9 +739,20 @@ pub fn score_blocks(
                     if hs.is_empty() {
                         continue;
                     }
-                    let w = hs.len() as f32 / hq as f32;
+                    let w = if gqa_max { 1.0 } else { hs.len() as f32 / hq as f32 };
                     let ql = &qbar[(l * kv_heads + g) * dim..(l * kv_heads + g + 1) * dim];
                     let qnorm = dot8(ql, ql).sqrt();
+                    // max 档:组内每个 query head 的 (向量, 模长);mean 档为空
+                    let qmax: Vec<(&[f32], f32)> = if gqa_max {
+                        hs.iter()
+                            .map(|h| {
+                                let qh = &q[(l * hq + *h) * dim..(l * hq + *h + 1) * dim];
+                                (qh, dot8(qh, qh).sqrt())
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     for (ci, chunk) in cands.chunks(TILE_ROWS).enumerate() {
                         for (ri, b) in chunk.iter().enumerate() {
                             match index.entry_at(*b, l, g) {
@@ -748,7 +770,12 @@ pub fn score_blocks(
                             if !have[ri] {
                                 continue;
                             }
-                            let s = if cosine {
+                            let s = if gqa_max {
+                                let knorm = dot8(row, row).sqrt();
+                                qmax.iter()
+                                    .map(|(qh, qn)| dot8(row, qh) / (qn * knorm + 1e-6))
+                                    .fold(f32::NEG_INFINITY, f32::max)
+                            } else if cosine {
                                 let knorm = dot8(row, row).sqrt();
                                 dot8(row, ql) / (qnorm * knorm + 1e-6)
                             } else {
@@ -770,6 +797,7 @@ pub fn score_blocks(
             // 共享引用在闭包外绑定(`&Vec` 是 Copy ⇒ 每片各持一份引用,不搬走本体)
             let q_heads_ref = &q_heads_of;
             let qbar_ref = &qbar;
+            let q_ref = &q;
             let index_ref = index;
             std::thread::scope(|scope| {
                 let mut hs = Vec::with_capacity(nthreads);
@@ -789,10 +817,21 @@ pub fn score_blocks(
                                 if hsv.is_empty() {
                                     continue;
                                 }
-                                let w = hsv.len() as f32 / hq as f32;
+                                let w = if gqa_max { 1.0 } else { hsv.len() as f32 / hq as f32 };
                                 let ql = &qbar_ref[(l * kv_heads + g) * dim
                                     ..(l * kv_heads + g + 1) * dim];
                                 let qnorm = dot8(ql, ql).sqrt();
+                                let qmax: Vec<(&[f32], f32)> = if gqa_max {
+                                    hsv.iter()
+                                        .map(|h| {
+                                            let qh = &q_ref[(l * hq + *h) * dim
+                                                ..(l * hq + *h + 1) * dim];
+                                            (qh, dot8(qh, qh).sqrt())
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
                                 for (ci, chunk) in sub.chunks(TILE_ROWS).enumerate() {
                                     for (ri, b) in chunk.iter().enumerate() {
                                         match index_ref.entry_at(*b, l, g) {
@@ -812,7 +851,14 @@ pub fn score_blocks(
                                         if !have[ri] {
                                             continue;
                                         }
-                                        let s = if cosine {
+                                        let s = if gqa_max {
+                                            let knorm = dot8(row, row).sqrt();
+                                            qmax.iter()
+                                                .map(|(qh, qn)| {
+                                                    dot8(row, qh) / (qn * knorm + 1e-6)
+                                                })
+                                                .fold(f32::NEG_INFINITY, f32::max)
+                                        } else if cosine {
                                             let knorm = dot8(row, row).sqrt();
                                             dot8(row, ql) / (qnorm * knorm + 1e-6)
                                         } else {
@@ -1488,6 +1534,42 @@ mod tests {
         )
         .expect("logit");
         assert!(logit[1] > logit[0] * 5.0, "对照:logit 面被模长放大 {logit:?}");
+    }
+
+    /// **GQA max**:两个 query head 分别对准 A/B 时,mean 会把两者都拉平;
+    /// max 必须保留“各自最强头”的信号(上游 `GqaScoreAggregation::Max`)。
+    #[test]
+    fn cosine_max_keeps_best_query_head() {
+        let mut ix = MeanKIndex::new(2, 1, 1).expect("索引");
+        let a = ChainHash::new(1);
+        let b = ChainHash::new(2);
+        ix.register(a, vec![entry(0, 0, [1.0, 0.0])]).expect("A");
+        ix.register(b, vec![entry(0, 0, [0.0, 1.0])]).expect("B");
+        // 组内两个 query head:head0 → A,head1 → B
+        let mut face = QueryFace::new(2, 1, 2);
+        face.push_token(vec![1.0, 0.0, 0.0, 1.0]).expect("面");
+        let gqa = [0u16, 0u16];
+        let mean = score_blocks(
+            &ix,
+            &face,
+            &[a, b],
+            &gqa,
+            ScoreTuning { scale: 0.0, mode: ScoreMode::CosineMean },
+        )
+        .expect("mean");
+        let max = score_blocks(
+            &ix,
+            &face,
+            &[a, b],
+            &gqa,
+            ScoreTuning { scale: 0.0, mode: ScoreMode::CosineMax },
+        )
+        .expect("max");
+        assert!((mean[0] - 0.7071).abs() < 1e-3, "mean A = {}", mean[0]);
+        assert!((mean[1] - 0.7071).abs() < 1e-3, "mean B = {}", mean[1]);
+        assert!((max[0] - 1.0).abs() < 1e-4, "max A = {}", max[0]);
+        assert!((max[1] - 1.0).abs() < 1e-4, "max B = {}", max[1]);
+        assert!(max[0] > mean[0] + 0.2 && max[1] > mean[1] + 0.2);
     }
 
     /// **B-1 延迟规模门**(纯 host 算术,无设备):27B 几何(48 层 × 8 KV 头

@@ -1373,16 +1373,21 @@ impl<D: DeviceClient> RunningEngine<D> {
         //    (实测:池 96 页、链要 100 页 ⇒ "KV 块池耗尽")。
         // ⇒ 正解:**冻结上次完整召回的选择 + 收进 sink/新尾部**,下游调和/视图照走。
         // ── **B-1 召回点**:打分(快路口径)+ 选择(预算/sink/recent)+ 实时读数 ──
-        // 快路 = `ScoreMode::CosineMean`(KVMem 产品口径):两层线性折叠
+        // 快路 = `CosineMax` / `CosineMean`(KVMem 产品口径):两层线性折叠
         // (窗 Σ_m + GQA 头 Σ_h)后逐 (层, KV 头) 算余弦,便宜 50×~24×。
         let t_sc = std::time::Instant::now();
         let scores = if recall_now {
+            let mode = if self.boot.cfg.knobs.gqa_max {
+                owl_store::ScoreMode::CosineMax
+            } else {
+                owl_store::ScoreMode::CosineMean
+            };
             owl_store::score_blocks(
                 index,
                 &face,
                 &cands,
                 &gqa,
-                owl_store::ScoreTuning { scale: 0.0, mode: owl_store::ScoreMode::CosineMean },
+                owl_store::ScoreTuning { scale: 0.0, mode },
             )?
         } else {
             Vec::new()

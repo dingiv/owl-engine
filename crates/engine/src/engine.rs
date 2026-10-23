@@ -141,6 +141,9 @@ pub struct EngineKnobs {
     /// **verify 视图带宽上限**(token;0 = 跟随 `workspace_per_req`)。
     /// 只裁剪 verify 的 KV 视图;decode 视图仍用完整工作集。
     pub verify_view_tokens: usize,
+    /// **GQA 聚合 = max**(`[kvmem].gqa_aggregation`;上游默认)。
+    /// false = mean(组内查询头先取均)。
+    pub gqa_max: bool,
     /// **召回预算**(块数)= `ceil(workspace_per_req/page) − sink − recent`。
     /// **派生量**(唯一产地 = [`derive_turn_ws`],装配期写;测试档可直接构)。
     /// 视图 = 保底 + 按分 top-k ⇒ 这是"选择层丢多少"的内部旋钮。
@@ -310,6 +313,7 @@ impl Default for EngineKnobs {
             evict_policy: owl_store::EvictPolicyKind::Lru,
             workspace_per_req: 2240,
             verify_view_tokens: 0,
+            gqa_max: true,
             select_blocks: 64,
             select_sink: 2,
             select_recent: 4,
@@ -627,6 +631,10 @@ impl EngineKnobs {
             evict_policy: Self::evict_policy_of(&cfg.kvmem),
             workspace_per_req: cfg.kvmem.workspace_per_req,
             verify_view_tokens: cfg.kvmem.verify_view_tokens,
+            gqa_max: matches!(
+                cfg.kvmem.gqa_aggregation,
+                owl_shared::config::GqaAggregationCfg::Max
+            ),
             // `select_blocks` = 派生量(装配期 `derive_turn_ws` 按池页宽写);
             // 此处保留构造器缺省,测试档可直接覆盖。
             select_blocks: 64,

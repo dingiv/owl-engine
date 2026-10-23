@@ -2266,3 +2266,9 @@ coherent filler + code@10k + 90k 上下文 + 80,544 池部分驻留：workspace=
 workspace 8192 → AL 3.00 且连贯；2240 → m=0×6 且退化。
 ⇒ 裁剪 verify 视图不安全；16k 需核级 8 行共享 K/V 读；默认定档 **8192**，
 2240 仅短上下文/紧显存档。选择层与此无关。
+
+### 10.8 GQA max 移植（2026-10-23）
+
+`ScoreMode::CosineMax`：逐 query head 余弦取组内最大，再对 (层, KV 头) 取均。
+90k d7 同 prompt：mean AL=1.30/输出退化；max 连贯且未触发降级。
+默认 `[kvmem].gqa_aggregation = "max"`（上游产品默认），mean 可配置回退。

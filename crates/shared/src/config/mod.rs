@@ -739,6 +739,8 @@ pub struct KvmemCfg {
     /// 非 0 时 verify 只取**视图尾部最近 N token**(选中块按时间序 + 尾部),
     /// decode 仍用完整 `workspace_per_req` —— 用“草稿验证看近处”换 AL。
     pub verify_view_tokens: usize,
+    /// **GQA 查询头聚合**:`mean` | `max`(上游产品脚本默认 `max`)。
+    pub gqa_aggregation: GqaAggregationCfg,
     /// 保底 sink(时间序最前的若干块;论文 always-retained)。
     pub select_sink: usize,
     /// 保底 recent(时间序最后的若干块)。
@@ -795,6 +797,18 @@ impl KvmemCfg {
     pub fn virtualization_enabled(&self) -> bool {
         self.select_decode && self.select_partial
     }
+}
+
+/// **GQA 查询头聚合**(KVMem 产品口径;`[kvmem].gqa_aggregation`)。
+///
+/// - `mean` = 每个 KV 头先把组内 query head 取均,再与 k̄ 做余弦;
+/// - `max` = 组内逐 query head 算余弦,取最大(上游 `start-ninfer` 默认)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GqaAggregationCfg {
+    Mean,
+    #[default]
+    Max,
 }
 
 /// **草稿族选择**(`[spec] draft`;2026-10-21 MTP 接回)。
@@ -1539,6 +1553,7 @@ impl Default for KvmemCfg {
             workspace_per_req: 2240,
             // 0 = verify 与 decode 同视图(旧行为,逐位不变)
             verify_view_tokens: 0,
+            gqa_aggregation: GqaAggregationCfg::Max,
             select_sink: 2,
             select_recent: 4,
             recall_every: 1,

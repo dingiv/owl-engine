@@ -40,6 +40,8 @@ workspace_per_req = 8192
 # verify 视图带宽上限（token；0 = 跟随 workspace）。实验档：只裁 verify，
 # decode 仍用 workspace；16k+8k 实测 AL 1.90 但输出退化，生产保持 0。
 # verify_view_tokens = 8192
+# GQA 聚合：max = 上游产品默认（组内 query head 取最大余弦）
+gqa_aggregation = "max"
 select_sink = 2
 select_recent = 4
 recall_every = 1

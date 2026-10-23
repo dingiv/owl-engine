@@ -525,3 +525,9 @@ workspace=2240 仍答 `- 42`（已召回），8192 答完整 `BLUEBIRD-42`。
 裁剪 verify 视图只降带宽，不保质量；16k 档要根治必须让 8 行 verify
 共享同一份 K/V 读（核级），配置层做不到。定档 **8192**；`verify_view_tokens`
 仅实验（默认 0），2240 只用于短上下文/紧显存。
+
+### 10.6 GQA max
+
+`ScoreMode::CosineMax` 已移植（逐 query head 余弦取组内最大）。
+90k d7 同 prompt：mean AL=1.30 且输出退化；max 输出连贯、未触发降级。
+默认定档 `gqa_aggregation = "max"`（上游产品默认）；mean 可配置回退。

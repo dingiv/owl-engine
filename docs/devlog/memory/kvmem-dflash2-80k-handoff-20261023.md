@@ -492,3 +492,27 @@ workspace=8192 → 输出 "BLUEBIRD-42"
 3. **定档 8192**：同 prompt 下 AL 3.00、输出连贯，均优于 2240（m=0×6、
    输出退化）。2240 只留作短上下文/极紧显存档，不用于 90k 质量档。
    切换仍走配置：`--set kvmem.workspace_per_req=2240`。
+
+### 12.13 GQA max 已移植（上游产品默认）
+
+`repos/kvmem/kvmem/src/host/mean_key_retrieval.cpp` 的
+`GqaScoreAggregation::Max`：组内逐 query head 算余弦，取最大，再对
+(层, KV 头) 取均。owl 原 `CosineMean` 先把组内 query head 取均，
+会稀释“某一个头已经找到针”的信号。
+
+已落地：
+
+```text
+crates/store/src/select.rs       ScoreMode::CosineMax + 单测
+[kvmem].gqa_aggregation = "max"  # mean | max；上游默认 max
+```
+
+90k、DFlash2 d7、同随机词 prompt 对照：
+
+| GQA | 输出 | spec |
+|---|---|---|
+| mean | `I will not generate the requested text.` | AL=1.30 < 2.40，降级 |
+| **max** | `I'll answer…jumbled collection…`（连贯） | 未触发 spec-degrade |
+
+⇒ GQA max 不仅对齐上游，还**同时改善选择质量与 AL**；
+owl 默认已切 max。mean 保留为配置回退（`--set kvmem.gqa_aggregation=mean`）。
