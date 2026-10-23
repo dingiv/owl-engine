@@ -1,0 +1,8 @@
+# GGUF × KVMem · 论文 24GB 消费档的 80K execution view。
+#
+# 64K profile 在 90K 上下文上仍丢针；80K 是论文 Table 3 的 80K execution view
+# 口径，90K coherent needle 实测命中 BLUEBIRD-42。
+extends = ["qwen38_27b-3090-gguf-kvmem-64k.toml"]
+
+[kvmem]
+workspace_per_req = 81920
