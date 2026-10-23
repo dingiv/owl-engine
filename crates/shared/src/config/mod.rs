@@ -1223,6 +1223,10 @@ pub struct ProbesCfg {
     pub fact_probe: bool,
     pub trace_gate: bool,
     pub dflash_probe: bool,
+    /// 末边界额外哈希一个**逻辑块**的 K/V 页(诊断面;定位 stage-in 内容是否
+    /// 与首次写入一致)。`None` = 不哈希。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_hash_block: Option<usize>,
     pub propose_eager: bool,
     pub dflash_eager: bool,
     pub dflash_noencode: bool,
@@ -2390,19 +2394,27 @@ impl OwlConfig {
         // **W5 意图配套门**（2026-10-18）：FI 臂只有"图内臂"一种承载（核留图内 +
         // `ctx_total` 烘上界 + 表由 `fi_plan_sync` 窗外刷）。缺上界 ⇒ 捕获期会拿
         // **占位 ctx** 烘表（文本连贯但错，历史踩过）⇒ 响亮拒绝，不给静默错值。
-        // **部分驻留 × 投机 = 不共戴**(2026-10-21 实测):`select_partial` 下沉过
-        // 的块在会话链上是宿主占位符,而 verify 的页表/槽位直接取会话链 ⇒
-        // 占位符被核当页号 = CUDA 700 + **上下文毒化**(之后每个 turn 都崩)。
-        // 视图化 verify 未实现(方案 A 的页表/lens 语义待定谱)⇒ 拒启,
-        // 而不是跑起来等你踩。
-        if self.kvmem.select_partial && self.spec.depth > 0 {
-            return Err(
-                "[kvmem] select_partial = true 与 [spec] depth > 0 不共戴\
-                 (下沉块的宿主占位符会进 verify 页表 ⇒ CUDA 700 且污染上下文;\
-                 视图化 verify 未实现)。请二选一:关 select_partial(只留 select_decode,\
-                 长 ctx decode 实测 35.0 t/s 与 dense 持平)或关投机。"
-                    .to_string(),
-            );
+        // **部分驻留 × 投机 = 视图化 verify 档**(2026-10-23):
+        // `select_partial` 下沉过的块在会话链上是宿主占位符;verify 必须走
+        // **逐行视图页表**(`exec/spec.rs::verify_view_tables`)。第一版只实现
+        // v2 臂;FI/XQA 的逐行页表未实现 ⇒ 响亮拒,不静默跑错。
+        if self.kvmem.select_partial {
+            if !matches!(self.kernel.decode_arm, DecodeArm::V2) {
+                return Err(
+                    "[kvmem] select_partial = true 目前只支持 [kernel] decode_arm = \"v2\":\
+                     FI/XQA 的页表直接读会话链,遇宿主占位符会 CUDA 700 + 上下文毒化。\
+                     请改 v2(或关 select_partial)。"
+                        .to_string(),
+                );
+            }
+            if self.spec.depth > 0 && !matches!(self.kernel.verify_arm, VerifyArm::V2) {
+                return Err(
+                    "[kvmem] select_partial = true 与 [spec] depth > 0 目前只支持\
+                     verify_arm = \"v2\":FI/XQA 的逐行视图页表未实现。\
+                     请改 v2(或关 select_partial / 关投机)。"
+                        .to_string(),
+                );
+            }
         }
 
         // **臂 × FI 前置件的一致性门**(2026-10-21 单键化):FI 臂(verify/decode
@@ -2605,17 +2617,32 @@ mod tests {
         .expect("fi 臂 + 三件套 = 合规");
     }
 
-    /// **部分驻留 × 投机 拒启**(2026-10-21):下沉块的宿主占位符会进 verify
-    /// 页表 ⇒ CUDA 700 + 上下文毒化。两条合法组合必须仍然放行。
+    /// **部分驻留 × 投机 = v2-only**(2026-10-23):视图化 verify 已落地,
+    /// v2/v2 放行;FI/XQA 的逐行页表未实现 ⇒ 拒启。
     #[test]
-    fn select_partial_rejects_spec() {
-        let base = "[kvmem]\nselect_partial = true\n";
-        let e = OwlConfig::from_toml_str(&format!("{base}[spec]\ndepth = 7\n"))
-            .expect_err("select_partial + spec 必须拒启");
-        assert!(e.contains("select_partial") && e.contains("depth"), "拒语要可行动: {e}");
+    fn select_partial_spec_requires_v2() {
+        let base = "[kvmem]\nselect_partial = true\nselect_decode = true\n\
+                    [spec]\ndepth = 7\n";
+        OwlConfig::from_toml_str(&format!(
+            "{base}[kernel]\nverify_arm = \"v2\"\ndecode_arm = \"v2\"\n"
+        ))
+        .expect("partial + spec + v2/v2 = 合规(视图化 verify)");
+        // FI 臂 = 单表,不支持逐行视图
+        let e = OwlConfig::from_toml_str(&format!(
+            "{base}[kernel]\nverify_arm = \"fi\"\ndecode_arm = \"v2\"\n\
+             fi_plan_bake = true\nfi_cuda_graph = true\nfi_plan_restore = false\n"
+        ))
+        .expect_err("partial + spec + fi verify 必须拒启");
+        assert!(e.contains("v2") && e.contains("select_partial"), "拒语要可行动: {e}");
+        let e = OwlConfig::from_toml_str(&format!(
+            "{base}[kernel]\nverify_arm = \"v2\"\ndecode_arm = \"fi\"\n\
+             fi_plan_bake = true\nfi_cuda_graph = true\nfi_plan_restore = false\n"
+        ))
+        .expect_err("partial + spec + fi decode 必须拒启");
+        assert!(e.contains("v2") && e.contains("select_partial"), "拒语要可行动: {e}");
         // 关掉投机 = 合法(实测 8192 decode 40.2 t/s)
-        OwlConfig::from_toml_str(&format!("{base}[spec]\ndepth = 0\n"))
-            .expect("partial + 无投机 = 合规");
+        let no_spec = base.replace("depth = 7", "depth = 0");
+        OwlConfig::from_toml_str(&no_spec).expect("partial + 无投机 = 合规");
         // 关掉 partial 只留视图 = 合法(实测 8192 decode 35.1 t/s)
         OwlConfig::from_toml_str(
             "[kvmem]\nselect_decode = true\n[spec]\ndepth = 7\n",

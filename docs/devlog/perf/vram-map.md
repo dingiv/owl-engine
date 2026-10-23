@@ -244,6 +244,12 @@ fold 族原先按 `m=0..depth-1` 捕 7 张图(每张约 66M 驱动 exec)。fold 
 8. **配置面(2026-10-22)**:`prefix_cache_share` 已退役 —— 前缀缓存可占**整池**,
    新请求按 `ensure_for_len` 逐出设备叶到宿主,宿主不够再走磁盘;
    `kv_fp8` 从 `[kernel]` 移入 `[pool]`(池存储 dtype/几何归池面)。
+9. ✅ **`/debug/vram` 的 host_used 已修(2026-10-23)**:原实现只取
+   `TierLedger.host_used`(仅 Index 行),腿自报的 `Host KvBlock`/`Host Snap`
+   只进 `rows/owners`、不进总数 —— 260k kvmem 档报 **204MiB**,实际
+   **4.93GiB**。现 `host_used`/`disk_used` 从**合并后的 rows** 按层求和;
+   `gpu_used` 仍只算账本预留面(腿的 KvBlock/Snap/Row 在 `Pool` 预留内,
+   重算会双计)。门:`report_host_used_includes_leg_host_blocks`。
 
 ---
 

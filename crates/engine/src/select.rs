@@ -176,6 +176,8 @@ impl PartialStats {
 pub struct SelectView {
     /// 选中块的物理页(时间序)。
     pub pages: Vec<u32>,
+    /// 选中块的内容身份(与 `pages` 同序;2026-10-23 驻留校验用)。
+    pub blocks: Vec<ChainHash>,
     /// 选中块的 token 数(= `pages.len() × page`)。
     pub tokens: usize,
     /// 召回点绝对位置(块边界;尾部从这里起)。

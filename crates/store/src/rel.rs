@@ -1035,6 +1035,25 @@ impl Rel {
         }
         tiers.owners.extend(legs.owners);
         tiers.owners.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.owner.cmp(&b.owner)));
+        // **host/盘总账 = 合并后 rows 的层和**(2026-10-23 修)。
+        //
+        // 原实现只取 ledger 的 `host_used`:腿自报的 Host KvBlock / Host Snap
+        // 只进了 `rows`/`owners`,没进总数 ⇒ `/debug/vram` 在 260k kvmem 档
+        // 报 host_used≈204MiB,而实际 host 驻留≈5GiB(误导内存排查)。
+        // GPU 不重算:腿的 KvBlock/Snap/Row 在 `Pool` 预留块**内部**,
+        // `gpu_used` 的语义是「账本预留面」,重算会把同一批字节算两遍。
+        tiers.host_used = tiers
+            .rows
+            .iter()
+            .filter(|r| r.tier == crate::tier::Tier::Host)
+            .map(|r| r.bytes)
+            .sum();
+        tiers.disk_used = tiers
+            .rows
+            .iter()
+            .filter(|r| r.tier == crate::tier::Tier::Disk)
+            .map(|r| r.bytes)
+            .sum();
         StoreReport {
             tiers,
             kv: self.leg.kv_stats(),
@@ -1935,6 +1954,30 @@ mod tests {
         assert_eq!(rep.kv.cached_blocks, 1, "缓存面 1 块(腿报)");
         assert_eq!(rep.kv.gpu_bytes, BLOCK_BYTES, "设备绑定面 1 块");
         assert_eq!(rep.tiers.gpu_used, 0, "语义账不重复记 KV 块");
+    }
+
+    /// **host 总账必须含腿自报的 Host KvBlock**(2026-10-23)。
+    ///
+    /// 原 `report()` 只取 ledger 的 `host_used`(Index 行),腿的 Host KvBlock
+    /// 只进 rows/owners ⇒ 260k kvmem 档报 204MiB,实际约 5GiB。
+    #[test]
+    fn report_host_used_includes_leg_host_blocks() {
+        let mut r = rel(2);
+        let chain = ChainHash::new(7);
+        r.leg
+            .host_put(chain, crate::host::HostBlock::zeroed(BLOCK_BYTES))
+            .expect("放一块进 host");
+        let rep = r.report();
+        assert_eq!(rep.tiers.host_used, BLOCK_BYTES, "host 总账应含腿自报块");
+        assert_eq!(rep.host_resident_bytes, BLOCK_BYTES, "腿自报同源");
+        assert!(
+            rep.tiers.rows.iter().any(|r| r.tier == Tier::Host
+                && r.kind == AssetKind::KvBlock
+                && r.bytes == BLOCK_BYTES),
+            "报告应有 Host/KvBlock 行:{:?}",
+            rep.tiers.rows
+        );
+        assert_eq!(rep.tiers.gpu_used, 0, "GPU 预留面语义不因 host 行走样");
     }
 
     /// **B-0 门(store 侧)**:索引几何注册 + 登记入账(host/Index 行)+ 出账平衡。

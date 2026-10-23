@@ -1,0 +1,54 @@
+# 27B AWQ W4A16 + DFlash2 d7 + KVMem 部分驻留（3090 Ti 24G;2026-10-23）
+#
+# 目的：同时使用 KVMem overcommit（select_partial）与 DFlash2。
+# 前置：verify 视图化（`exec/spec.rs::verify_view_tables`）已落地；
+#       select_partial 档只允许 v2 decode/verify（FI/XQA 页表读会话链）。
+#
+# 工作集 8192 tok（256 页 = sink 2 + recent 4 + top-k 250）：
+#   2240 tok（70 页）在 90k 上下文会把可见历史压到 2.2k，80,480 池下
+#   top-k 被近期块占满，输出退化成 "Yes/user/assistant"；8192 tok 恢复
+#   连贯。16k 也可用但 verify 轮 194ms、AL 1.6（8192 为 115ms / AL 3.0）。
+#
+# 起服：
+#   ./target/release/server -p profiles/qwen38_27b-3090-w4a16-dflash-kvmem.toml \
+#     --log-level info
+#
+# 预检：
+#   ./target/release/server -p profiles/qwen38_27b-3090-w4a16-dflash-kvmem.toml --check
+extends = ["qwen38_27b-3090-w4a16-dflash.toml"]
+
+[runtime]
+max_seq = 262144
+max_concurrency = 1
+
+[pool]
+prefix_cache = true
+host_cache_mb = 10240
+snap_host_mb = 1024
+snap_max = 1
+kv_fp8 = true
+vram_reserve_mb = 512
+
+[kvmem]
+select_decode = true
+select_partial = true
+index = true
+pool_overcommit = true
+workspace_per_req = 8192
+select_sink = 2
+select_recent = 4
+recall_every = 1
+evict_policy = "lru"
+
+[kernel]
+decode_arm = "v2"
+verify_arm = "v2"
+fi_cuda_graph = false
+fi_plan_bake = false
+fi_plan_restore = true
+
+[server]
+bind = "127.0.0.1:8141"
+
+[parallel]
+device = ["41:00.0"]

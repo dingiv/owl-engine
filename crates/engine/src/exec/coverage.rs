@@ -38,6 +38,7 @@
 
 use super::*;
 use crate::running::RunningEngine;
+use owl_models::ops::PlanNode;
 use std::cell::RefCell;
 
 /// Q 输出槽(探针档;索引 = **全注意力层序号** `fi_kvi`,与池 `kvs` 同序)。
@@ -49,9 +50,14 @@ pub(crate) type QSink = RefCell<Vec<Option<TensorOps>>>;
 pub(crate) const POS_SCHEME: &str = "A(原位置稀疏)";
 
 /// **query 窗宽**(本 chunk 末 W 行一起当 query;论文的 step 级 query 面对应到
-/// 我们的 chunk 边界 = 末 W 行)。取 8:末行注意力太局部(常只盯前几个字),
-/// 而 W 太大则混入与“当前问题”无关的行。
-const W_QUERY_TOKENS: usize = 8;
+/// 我们的 chunk 边界 = 末 W 行)。
+///
+/// **2026-10-23 定谳:8 太小**。10k needle + 结尾
+/// `"Reply with only the code, no explanation. Code:"` 时,末 8 行只剩
+/// `"only the code, no explanation. Code:"` —— `"secret"` 被挤出窗,选择层
+/// 直接答 `No`(召回失败)。上游 KVMem 的 query 是 last-user span,最多 512,
+/// 缺省回退 64(`--kvmem-query-last 64`);取 64 把完整问句纳回窗。
+const W_QUERY_TOKENS: usize = 64;
 
 /// 待分析面(Q 已回读成 host f32;等块边界事件补齐索引账)。
 #[derive(Debug)]
@@ -524,6 +530,50 @@ fn decode_row(dt: Dtype, buf: &[u8]) -> Vec<f32> {
     }
 }
 
+/// **当前 pos 的选择层视图快照**(纯 host;decode/verify 共用)。
+///
+/// `pages` = 选中块(时间序) ++ 尾部页(`recall_pos/page ..= pos/page`);
+/// `len` = 视图内 token 数;`recall_pos` = 尾部起点(块边界)。
+#[derive(Clone, Debug)]
+pub(crate) struct SelectViewAt {
+    pub pages: Vec<u32>,
+    pub len: usize,
+}
+
+/// **视图页链 + 视图长度**(纯 host;decode 与 verify 的唯一语义来源)。
+///
+/// `selected` = 选中块物理页(时间序);`selected_tokens` = 选中 token 数;
+/// `chain` = 会话真页链;`recall_pos` = 召回点(块边界);`pos` = 目标位置。
+///
+/// 返回 `(选中页 ++ 尾部页(recall_pos/page ..= pos/page), len)`;`len` 是视图内
+/// token 数。`pos < recall_pos` ⇒ `None`(视图不覆盖)。
+///
+/// 本函数**不校验占位符/容量**:decode 允许截尾兜底;verify 必须结构化拒发。
+pub(crate) fn view_pages_at(
+    selected: &[u32],
+    selected_tokens: usize,
+    chain: &[u32],
+    recall_pos: usize,
+    pos: usize,
+    page: usize,
+) -> Option<(Vec<u32>, usize)> {
+    if pos < recall_pos {
+        return None;
+    }
+    let page = page.max(1);
+    let tail_lo = recall_pos / page;
+    let tail_hi = pos / page;
+    let mut pages = Vec::with_capacity(selected.len() + tail_hi.saturating_sub(tail_lo) + 1);
+    pages.extend_from_slice(selected);
+    for lb in tail_lo..=tail_hi {
+        if let Some(p) = chain.get(lb) {
+            pages.push(*p);
+        }
+    }
+    let len = selected_tokens + (pos + 1).saturating_sub(recall_pos);
+    Some((pages, len))
+}
+
 /// 选择预算(环境旋钮;缺省 64 块 + sink 2 / recent 4)。
 impl<D: DeviceClient> RunningEngine<D> {
     /// 召回预算(`OWL_SELECT_BLOCKS` / `OWL_SELECT_SINK` / `OWL_SELECT_RECENT`;
@@ -778,6 +828,99 @@ impl<D: DeviceClient> RunningEngine<D> {
         Some((pages, tokens))
     }
 
+    /// **调试探针**:读一页 K(第一层)的字节哈希(视图页内容校验)。
+    ///
+    /// 只在 `probes.dflash_probe` 的末边界调用;不参与生产路径。
+    async fn probe_view_page_hash(&mut self, page_id: usize, tag: &str) -> Result<u64> {
+        let d = &self.dev.pool.geom.dims;
+        let page = self.dev.pool.geom.page.max(1);
+        let esize = if self.dev.pool.geom.kv_fp8 { 1 } else { d.dtype.size_bytes() };
+        let n = d.hkv * d.hd * esize * page;
+        let caches = self.dev.pool.kv_caches();
+        let face = self.dev.graphs.session.face_mut();
+        let scratch = face
+            .alloc(owl_iface::contract::Dtype::U32, n / 4, &format!("probe.view_page.{tag}"))
+            .await?;
+        let mut h: u64 = 0xcbf29ce484222325;
+        for (k, v) in caches {
+            for leaf in [k, v] {
+                let pool_id = match leaf.op() {
+                    owl_models::ops::Op::Block { id } => *id,
+                    _ => continue,
+                };
+                let src = owl_iface::contract::Bytes::new(
+                    pool_id,
+                    n / 4,
+                    owl_iface::contract::Dtype::U32,
+                    0,
+                );
+                face.copy_block_at(&src, page_id * n, &scratch, 0, n).await?;
+                let mut buf = vec![0u8; n];
+                face.dtoh(&scratch, &mut buf).await?;
+                for b in buf {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+        let _ = face.free(&[scratch.id]).await;
+        Ok(h)
+    }
+
+    /// **当前 pos 的视图快照**(纯 host;decode 与 verify 共用)。
+    ///
+    /// - 无视图态 / `pos < recall_pos` ⇒ `None`(走全量链);
+    /// - 有视图 ⇒ `选中页 ++ 尾部页(recall_pos/page ..= pos/page)`;
+    /// - `len` 是视图内 token 数(selected + 尾部)。
+    ///
+    /// 本函数**不截断**:容量/占位符由调用方按自己的契约校验
+    /// (decode 保留旧的“截尾 + 告警”;verify 则结构化拒发)。
+    pub(crate) fn select_view_at(&self, sid: u64, pos: usize) -> Option<SelectViewAt> {
+        let v = self.sel.view()?;
+        if pos < v.recall_pos {
+            return None;
+        }
+        let page = self.dev.pool.geom.page.max(1);
+        let chain: Vec<u32> = self
+            .bank
+            .sessions
+            .get(sid)
+            .map(|s| s.block_table.clone())
+            .unwrap_or_default();
+        let (pages, len) = view_pages_at(&v.pages, v.tokens, &chain, v.recall_pos, pos, page)?;
+        // **视图驻留校验**(2026-10-23):`pages` 是召回点的物理页快照;
+        // 若之后被逐出/复用,这里会指到别的块。只读 carrier(不搬) —
+        // 生产靠后续 pin 修,先让探针把失守点名。
+        if self.boot.probes.dflash_probe {
+            if v.blocks.len() != v.pages.len() {
+                owl_shared::log_error!(
+                    "view-diag",
+                    "视图块/页长度不符:blocks={} pages={}",
+                    v.blocks.len(), v.pages.len()
+                );
+            } else {
+                for (b, &pg) in v.blocks.iter().zip(v.pages.iter()) {
+                    match self.bank.rel.leg.carrier_of(*b) {
+                        Ok(owl_store::Carrier::Device(slot)) if slot == pg => {}
+                        Ok(owl_store::Carrier::Device(slot)) => owl_shared::log_error!(
+                            "view-diag",
+                            "视图页失守:block={b:?} 视图页={pg} 现槽={slot} pos={pos}"
+                        ),
+                        Ok(c) => owl_shared::log_error!(
+                            "view-diag",
+                            "视图页不在设备:block={b:?} 视图页={pg} carrier={c:?} pos={pos}"
+                        ),
+                        Err(e) => owl_shared::log_error!(
+                            "view-diag",
+                            "视图页 carrier 查询失败:block={b:?} 视图页={pg} pos={pos}: {e}"
+                        ),
+                    }
+                }
+            }
+        }
+        Some(SelectViewAt { pages, len })
+    }
+
     /// **B-3d 每步视图展开**:`(sel_pt, sel_len)` 两个输入槽的值。
     ///
     /// - 无视图态(召回点未发生 / 已收口)⇒ **全量链 + `pos+1`**(与不开视图
@@ -788,15 +931,13 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///   少块 —— 选择层的账必须响)。
     pub(crate) fn select_view_step(&mut self, sid: u64, pos: usize) -> (Vec<f32>, usize) {
         let nb = self.dev.pool.geom.nb;
-        let page = self.dev.pool.geom.page.max(1);
         let chain: Vec<u32> = self
             .bank
             .sessions
             .get(sid)
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
-        let view = self.sel.view().cloned();
-        let Some(v) = view else {
+        let Some(v) = self.select_view_at(sid, pos) else {
             // **占位符守卫**(B-3e-2):部分驻留档下"无视图"是致命的 —— 会话链里
             // 有 `PENDING_LOAD_PLACEHOLDER`(u32::MAX),当页号读 = 静默错页。
             // 响亮打出哨兵(调用方看日志即知:召回点没跑 / 视图被清)。
@@ -815,16 +956,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             return (pt, pos + 1);
         };
         self.sel.note_view_step();
-        // 尾部:召回点是块边界 ⇒ 从 recall_pos/page 起到 pos/page
-        let tail_lo = v.recall_pos / page;
-        let tail_hi = pos / page;
-        let mut pages = v.pages.clone();
-        for lb in tail_lo..=tail_hi {
-            if let Some(p) = chain.get(lb) {
-                pages.push(*p);
-            }
-        }
-        let len = v.tokens + (pos + 1).saturating_sub(v.recall_pos);
+        let mut pages = v.pages;
+        let len = v.len;
         if pages.len() > nb {
             owl_shared::log_warn!(
                 "cov-probe",
@@ -832,6 +965,17 @@ impl<D: DeviceClient> RunningEngine<D> {
                 pages.len(), nb
             );
             pages.truncate(nb);
+        }
+        if self.boot.probes.dflash_probe {
+            owl_shared::log_info!(
+                "view-diag",
+                "decode pos={} len={} pages={} first={:?} last={:?}",
+                pos,
+                len,
+                pages.len(),
+                &pages[..pages.len().min(6)],
+                &pages[pages.len().saturating_sub(6)..]
+            );
         }
         let mut pt = vec![0.0f32; nb];
         for (i, p) in pages.iter().enumerate() {
@@ -1214,8 +1358,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         //    (实测:池 96 页、链要 100 页 ⇒ "KV 块池耗尽")。
         // ⇒ 正解:**冻结上次完整召回的选择 + 收进 sink/新尾部**,下游调和/视图照走。
         // ── **B-1 召回点**:打分(快路口径)+ 选择(预算/sink/recent)+ 实时读数 ──
-        // 快路 = `ScoreMode::LogitMean`:两层线性折叠(窗 Σ_m + GQA 头 Σ_h),
-        // 与论文口径**仅 FP 重排**(排序相同)但便宜 50×~24×(见 store 台账)。
+        // 快路 = `ScoreMode::CosineMean`(KVMem 产品口径):两层线性折叠
+        // (窗 Σ_m + GQA 头 Σ_h)后逐 (层, KV 头) 算余弦,便宜 50×~24×。
         let t_sc = std::time::Instant::now();
         let scores = if recall_now {
             owl_store::score_blocks(
@@ -1223,7 +1367,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 &face,
                 &cands,
                 &gqa,
-                owl_store::ScoreTuning { scale: 0.0, mode: owl_store::ScoreMode::LogitMean },
+                owl_store::ScoreTuning { scale: 0.0, mode: owl_store::ScoreMode::CosineMean },
             )?
         } else {
             Vec::new()
@@ -1233,6 +1377,29 @@ impl<D: DeviceClient> RunningEngine<D> {
         let (budget_blocks, sink, recent) = self.recall_budget();
         let t_sel = std::time::Instant::now();
         let scored: Vec<(owl_store::ChainHash, f32)> = cands.iter().copied().zip(scores.iter().copied()).collect();
+        if self.boot.probes.dflash_probe && recall_now {
+            let mut top = scored.clone();
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(b.0.raw().cmp(&a.0.raw())));
+            let s: Vec<String> = top.iter().take(8).map(|(h, v)| format!("{}:{:.9}", h.raw(), v)).collect();
+            // query 面指纹(补 P1 取证:同一 ctx 的 top8 不同,先看 q 是否已经不同)
+            let qh = face
+                .collapsed_sum()
+                .map(|q| {
+                    let mut h = 0xcbf2_9ce4_8422_2325u64;
+                    for x in q {
+                        for b in x.to_le_bytes() {
+                            h ^= b as u64;
+                            h = h.wrapping_mul(0x100_0000_01b3);
+                        }
+                    }
+                    h
+                })
+                .unwrap_or(0);
+            owl_shared::log_info!(
+                "view-diag",
+                "top8 ctx={} qfnv={:016x} {}", ctx_tokens, qh, s.join(" ")
+            );
+        }
         let budget = owl_store::SelectBudget::new(budget_blocks.min(n_blocks), sink, recent);
         let set = if recall_now {
             let s = owl_store::select(&scored, &cands, budget);
@@ -1383,9 +1550,73 @@ impl<D: DeviceClient> RunningEngine<D> {
         if self.boot.cfg.knobs.select_decode {
             self.sel.set_view(crate::select::SelectView {
                 pages: view_pages.clone(),
+                blocks: set.blocks.clone(),
                 tokens: view_tokens,
                 recall_pos: ctx_tokens,
             });
+            if self.boot.probes.dflash_probe {
+                let n = set.blocks.len();
+                let mut bh: u64 = 0xcbf29ce484222325;
+                for b in &set.blocks {
+                    bh ^= b.raw();
+                    bh = bh.wrapping_mul(0x100000001b3);
+                }
+                owl_shared::log_info!(
+                    "view-diag",
+                    "set_view ctx={} pages={} tokens={} blocks={} bhash={:016x} bfirst={:?} blast={:?} first={:?} last={:?}",
+                    ctx_tokens,
+                    view_pages.len(),
+                    view_tokens,
+                    n,
+                    bh,
+                    &set.blocks[..n.min(4)],
+                    &set.blocks[n.saturating_sub(4)..],
+                    &view_pages[..view_pages.len().min(6)],
+                    &view_pages[view_pages.len().saturating_sub(6)..]
+                );
+                if last_boundary {
+                    let bids: Vec<usize> = set
+                        .blocks
+                        .iter()
+                        .filter_map(|b| cands.iter().position(|c| c == b))
+                        .collect();
+                    owl_shared::log_info!(
+                        "view-diag",
+                        "bids ctx={} n={} {:?}",
+                        ctx_tokens,
+                        bids.len(),
+                        bids
+                    );
+                    if let Some(tb) = self.boot.probes.view_hash_block {
+                        if let Some(&pg) = bt_after.get(tb) {
+                            match self.probe_view_page_hash(pg as usize, "target").await {
+                                Ok(h) => owl_shared::log_info!(
+                                    "view-diag",
+                                    "target-hash block={} page={} hash={:016x}",
+                                    tb, pg, h
+                                ),
+                                Err(e) => owl_shared::log_error!(
+                                    "view-diag",
+                                    "target-hash block={tb} page={pg} 失败: {e}"
+                                ),
+                            }
+                        }
+                    }
+                    if let Some(&pg) = view_pages.get(2) {
+                        match self.probe_view_page_hash(pg as usize, "idx2").await {
+                            Ok(h) => owl_shared::log_info!(
+                                "view-diag",
+                                "view-page-hash idx=2 page={} hash={:016x}",
+                                pg, h
+                            ),
+                            Err(e) => owl_shared::log_error!(
+                                "view-diag",
+                                "view-page-hash idx=2 page={pg} 失败: {e}"
+                            ),
+                        }
+                    }
+                }
+            }
         }
         self.sel.note_view(t_view.elapsed().as_secs_f64() * 1000.0);
         // ── B-3c-pre 方案对照(A vs B,各自与 dense 比;host 单 query)──
@@ -1783,5 +2014,43 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // 计时归入“查询面”(Q 回读 + 解码;逆 RoPE 在 `coverage_analyze`)
         prof.q_face_ms += t_q.elapsed().as_secs_f64() * 1000.0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::view_pages_at;
+
+    #[test]
+    fn view_pages_at_selected_plus_tail() {
+        let chain = vec![10, 11, 12, 13, 14];
+        let selected = vec![1, 2];
+        // recall=96（页 3 起），pos=100：尾页只有 12；len = 64 + 5
+        assert_eq!(
+            view_pages_at(&selected, 64, &chain, 96, 100, 32),
+            Some((vec![1, 2, 13], 69))
+        );
+        // 同一页内到 pos=127：len = 64 + 32
+        assert_eq!(
+            view_pages_at(&selected, 64, &chain, 96, 127, 32),
+            Some((vec![1, 2, 13], 96))
+        );
+        // 跨页到 pos=128：尾部追加 13，len = 64 + 33
+        assert_eq!(
+            view_pages_at(&selected, 64, &chain, 96, 128, 32),
+            Some((vec![1, 2, 13, 14], 97))
+        );
+        // 召回点之前：视图不覆盖
+        assert_eq!(view_pages_at(&selected, 64, &chain, 96, 95, 32), None);
+    }
+
+    #[test]
+    fn view_pages_at_page_zero_is_treated_as_one() {
+        // page=0 时按 1 处理（与调用方 max(1) 同律），不 panic。
+        let chain = vec![7, 8];
+        assert_eq!(
+            view_pages_at(&[], 0, &chain, 0, 1, 0),
+            Some((vec![7, 8], 2))
+        );
     }
 }

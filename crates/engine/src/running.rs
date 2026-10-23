@@ -84,6 +84,8 @@ pub struct StepProbes {
     pub trace_gate: bool,
     /// E3 收编(原热路径散落 var_os;boot 解析一次):DFlash2 诊断/回退族
     pub dflash_probe: bool,
+    /// 末边界额外哈希一个逻辑块的 K/V 页(诊断面;stage-in 内容校验)
+    pub view_hash_block: Option<usize>,
     pub propose_eager: bool,
     pub dflash_eager: bool,
     pub dflash_noencode: bool,
@@ -126,6 +128,7 @@ impl StepProbes {
             probe_every: cfg.spec.probe_every,
             trace_gate: p.trace_gate,
             dflash_probe: p.dflash_probe,
+            view_hash_block: p.view_hash_block,
             propose_eager: p.propose_eager,
             dflash_eager: p.dflash_eager,
             dflash_noencode: p.dflash_noencode,

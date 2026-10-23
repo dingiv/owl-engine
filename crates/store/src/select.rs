@@ -568,6 +568,7 @@ impl Default for ScoreTuning {
 /// |---|---|---|
 /// | [`Self::SoftmaxMean`] | **论文原样**(推荐;偏差不偏) | 全在 `0.073~0.132`(**≈1/块数**,平局成片) |
 /// | [`Self::LogitMean`] | 排序/阈值/预算用(logit 面取均) | 随 logits 自然展开 |
+/// | [`Self::CosineMean`] | **KVMem 产品口径**(逐 (层, KV 头) 余弦取均) | `[-1, 1]` |
 ///
 /// ∇ 选哪一:凡“只要 top-k 名单”的调用方两者等价(建议留 SoftmaxMean);
 /// 凡“要拿分值做阈值/预算/权重”的(B-4 在线预算、按分排序的报表)
@@ -580,6 +581,13 @@ pub enum ScoreMode {
     /// 逐 (层,头) 的**原始 logit**(`q̃·k̄/√d`)直接对 (层,头) 与 token 取均;
     /// 未登记候选 = `-inf`(不静默当 0)。
     LogitMean,
+    /// **KVMem 产品口径**:逐 (层, KV 头) 先算 `cos(q̄, k̄)`,再对 (层, KV 头) 取均。
+    ///
+    /// 与 [`Self::LogitMean`] 的差别只在 **key 模长归一**:logit 面下高范数块会
+    /// 仅凭 `||k̄||` 胜出;产品实现(`repos/kvmem/kvmem/src/host/mean_key_retrieval.cpp`)
+    /// 用的是余弦。`q̄` 已按 query 窗与 GQA 组折叠;query 模长对同一轮所有候选是
+    /// 常数,但 cos 仍显式除以它(与产品逐位同构)。
+    CosineMean,
 }
 
 /// **8 路展开点积**(B-1 热路):8 个独立标量累加器 + `chunks_exact(8)`
@@ -659,9 +667,10 @@ pub fn score_blocks(
     //
     // ⇒ 打分从「窗 W × 头 hq × 层 × KV 头」次行扫描降到 **「层 × KV 头」一次**(本档 6×;
     // 与窗折叠叠加 = 48×),且两者都**不是近似**(仅 FP 重排;逐位同参考式)。
-    if tuning.mode == ScoreMode::LogitMean {
+    if matches!(tuning.mode, ScoreMode::LogitMean | ScoreMode::CosineMean) {
         let q = face.collapsed_sum()?;
         let hq = face.q_heads;
+        let cosine = tuning.mode == ScoreMode::CosineMean;
         // ① 按 KV 头分组(头的归属表)
         let mut q_heads_of: Vec<Vec<usize>> = vec![Vec::new(); kv_heads];
         for (h, g_raw) in gqa.iter().enumerate() {
@@ -721,6 +730,7 @@ pub fn score_blocks(
                     }
                     let w = hs.len() as f32 / hq as f32;
                     let ql = &qbar[(l * kv_heads + g) * dim..(l * kv_heads + g + 1) * dim];
+                    let qnorm = dot8(ql, ql).sqrt();
                     for (ci, chunk) in cands.chunks(TILE_ROWS).enumerate() {
                         for (ri, b) in chunk.iter().enumerate() {
                             match index.entry_at(*b, l, g) {
@@ -738,7 +748,13 @@ pub fn score_blocks(
                             if !have[ri] {
                                 continue;
                             }
-                            a[ci * TILE_ROWS + ri] += dot8(row, ql) * (scale * w);
+                            let s = if cosine {
+                                let knorm = dot8(row, row).sqrt();
+                                dot8(row, ql) / (qnorm * knorm + 1e-6)
+                            } else {
+                                dot8(row, ql) * scale
+                            };
+                            a[ci * TILE_ROWS + ri] += s * w;
                             sn[ci * TILE_ROWS + ri] += 1;
                         }
                     }
@@ -776,6 +792,7 @@ pub fn score_blocks(
                                 let w = hsv.len() as f32 / hq as f32;
                                 let ql = &qbar_ref[(l * kv_heads + g) * dim
                                     ..(l * kv_heads + g + 1) * dim];
+                                let qnorm = dot8(ql, ql).sqrt();
                                 for (ci, chunk) in sub.chunks(TILE_ROWS).enumerate() {
                                     for (ri, b) in chunk.iter().enumerate() {
                                         match index_ref.entry_at(*b, l, g) {
@@ -795,7 +812,13 @@ pub fn score_blocks(
                                         if !have[ri] {
                                             continue;
                                         }
-                                        a_out[ci * TILE_ROWS + ri] += dot8(row, ql) * (scale * w);
+                                        let s = if cosine {
+                                            let knorm = dot8(row, row).sqrt();
+                                            dot8(row, ql) / (qnorm * knorm + 1e-6)
+                                        } else {
+                                            dot8(row, ql) * scale
+                                        };
+                                        a_out[ci * TILE_ROWS + ri] += s * w;
                                         sn_out[ci * TILE_ROWS + ri] += 1;
                                     }
                                 }
@@ -1436,6 +1459,35 @@ mod tests {
         )
         .expect("缺块");
         assert_eq!(miss2[0], f32::NEG_INFINITY, "logit 口径下缺块 = -inf ⇒ 永不入选");
+    }
+
+    /// **CosineMean**:key 模长归一后,同方向不同范数的块必须同分。
+    ///
+    /// 产品实现(`repos/kvmem/.../mean_key_retrieval.cpp`)用余弦;旧 `LogitMean`
+    /// 会把高范数块抬成 top-k(仅凭 `||k̄||` 胜出)。
+    #[test]
+    fn cosine_mode_removes_key_norm_bias() {
+        let mut ix = MeanKIndex::new(2, 1, 1).expect("索引");
+        let a = ChainHash::new(1);
+        let b = ChainHash::new(2);
+        // 同方向、模长 1 vs 10;旧 logit 面 b 是 a 的 10 倍
+        ix.register(a, vec![entry(0, 0, [1.0, 0.0])]).expect("A");
+        ix.register(b, vec![entry(0, 0, [10.0, 0.0])]).expect("B");
+        let mut face = QueryFace::new(2, 1, 1);
+        face.push_token(vec![1.0, 0.0]).expect("面");
+        let cos = score_blocks(
+            &ix, &face, &[a, b], &[0],
+            ScoreTuning { scale: 0.0, mode: ScoreMode::CosineMean },
+        )
+        .expect("cosine");
+        assert!((cos[0] - 1.0).abs() < 1e-4, "A cos = {}", cos[0]);
+        assert!((cos[1] - 1.0).abs() < 1e-4, "B cos = {} (模长必须被归一)", cos[1]);
+        let logit = score_blocks(
+            &ix, &face, &[a, b], &[0],
+            ScoreTuning { scale: 0.0, mode: ScoreMode::LogitMean },
+        )
+        .expect("logit");
+        assert!(logit[1] > logit[0] * 5.0, "对照:logit 面被模长放大 {logit:?}");
     }
 
     /// **B-1 延迟规模门**(纯 host 算术,无设备):27B 几何(48 层 × 8 KV 头

@@ -1908,6 +1908,26 @@ fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
         );
         std::process::exit(2);
     }
+    // **视图化 verify 的臂门**(2026-10-23):`select_partial` 的链上有宿主占位符,
+    // FI/XQA 的页表仍直接读会话链。配置层已拒;这里兜测试/手工构造的 EngineKnobs。
+    if cfg.knobs.select_partial {
+        if !matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::V2) {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "boot: `[kvmem] select_partial = true` 只支持 decode_arm = v2 \
+                 (FI/XQA 页表读会话链,遇宿主占位符 = CUDA 700)"
+                    .into(),
+            ));
+        }
+        if cfg.knobs.draft.depth > 0
+            && !matches!(cfg.knobs.env.attn.verify_arm, owl_shared::config::VerifyArm::V2)
+        {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "boot: `[kvmem] select_partial = true` + 投机只支持 verify_arm = v2 \
+                 (FI/XQA 的逐行视图页表未实现)"
+                    .into(),
+            ));
+        }
+    }
     if cfg.knobs.select_partial
         && matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
     {

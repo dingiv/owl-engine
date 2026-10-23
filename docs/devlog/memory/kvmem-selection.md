@@ -429,7 +429,7 @@ host 点积 ⇒ `block_mass` ⇒ `coverage_curve`。
 
 - **旋钮**:`OWL_COVERAGE_PROBE=1`(**与 `OWL_INDEX_PROBE=1` 同开** —— 打分要有索引);
   诊断档 ⇒ prefill 桶图**让位 eager**(与 `pf_bisect` 同律,响亮告知一次);
-- **query 面** = 本 chunk **末 W=8 行**(论文 step 级 query;单 token 注意力太局部 —
+- **query 面** = 本 chunk **末 W=8 行**（2026-10-23 已改 64；以下为当时口径）(论文 step 级 query;单 token 注意力太局部 —
   末 token 常只盯前几个字)⇒ 逐行去 RoPE + 逐行真实质量,再取均(与 Eq.10 的 `Σ_m` 同构);
 - **真实质量** = post-RoPE `q` × 池内 post-RoPE `K` 逐 (层,查询头) 因果 softmax
   → `block_mass` → (层,头) 均;GQA 映射 = 核内同律 `g = h/(hq/hkv)`;
@@ -507,7 +507,7 @@ mean_{l,h} softmax≈(q_{l,h}·k̄_{l,g}/√d)   ← 打分主体是「窗 W × 
 **(4)延迟门(纯 host;`crates/store` release bench)**
 
 真实 27B 几何(**16 全注意力层** / hq24 / hkv4 / hd256;`/path/to/models/cyankiwi/Qwen3.8-27B-AWQ-INT4`),
-query 窗 8,候选块 = 全 ctx 块:
+query 窗 8（当时）,候选块 = 全 ctx 块:
 
 | 块数(≈ctx) | 论文口径(softmax 均值,逐 token) | **快路(折叠 + logit 面)** |
 |---|---|---|
@@ -2196,3 +2196,53 @@ compute-sanitizer 在 boot warmup 就报 `owl_mmq2_iq4xs_j8` 越界读;两条根
 `gguf-dflash2-roadmap.md` §9.9。
 **这两条越界读正是"长 ctx / 虚拟化档分配布局一变就炸"的那类**:短 ctx 落进同段
 slab 无害,长 ctx 踩到未映射页 ⇒ 700。修完 + J=8 档撤回后,同一序列 sanitizer 全清。
+
+---
+
+## 10. 2026-10-23 生产口径修订：CosineMean + 工作集
+
+### 10.1 打分口径
+
+对照 `repos/kvmem/kvmem/src/host/mean_key_retrieval.cpp`：产品 KVMem 的块分是
+**逐 (层, KV 头) 余弦**（query 先在 query 窗与 GQA 组内取均），不是 owl 原来的
+`LogitMean` 点积。两者只差 key 模长归一；长上下文下高范数块会仅凭 `||k̄||`
+占据 top-k，这是可复现的策略偏差。
+
+新增 `ScoreMode::CosineMean`：
+
+```text
+q̄_{l,g} = mean_{query rows, h∈G(g)} q
+s_b     = mean_{l,g} cos(q̄_{l,g}, k̄_{l,b,g})
+```
+
+生产快路已切 `CosineMean`；`LogitMean` / `SoftmaxMean` 保留作对照与单测。
+GQA 聚合目前仍是 **mean**；上游脚本默认 `max`，尚未 port（需逐 query head
+扫描，成本 ×|G|）。
+
+### 10.2 工作集才是 80k 退化的主因
+
+80,480 池、90k 上下文：
+
+| workspace | top-k 块 | 输出 |
+|---:|---:|---|
+| 2240 | 64 | `Yes / user / assistant`（退化） |
+| 8192 | 250 | 连贯 |
+| 16384 | 506 | 连贯，但 verify 轮 194ms / AL 1.60 |
+
+`2240` 只留 2.2k 可见历史，sink 2 + recent 4 仅 192 tok；选择层不是“分算错”，
+而是**没有预算保留足够历史**。profile 已改 `workspace_per_req = 8192`。
+8192 档 DFlash2 `AL=3.00` 仍低于盈亏线 4.07，会降级裸 decode；这是下一刀
+（verify 视图行数/带宽），不要靠继续加工作集解决。
+
+### 10.3 取证口径
+
+逐边界打印 `top8` + `qfnv` + `set_view bhash` 后，80k/76k 首次分叉在 **74752**：
+74240 两档 `bhash/qfnv/top8` 全同；74240 时 76k 池先满开始 partial 下沉，
+80k 仍 dense，74752 起 prefill 输入视图不同。**先分叉的是输入轨迹，不是选择器。**
+
+### 10.4 选择层反证（2026-10-23）
+
+90k needle（code 在 token 10,000 = 块 312）最终 `bids` 含 312–319；
+块 312 的 K/V 页哈希在 40k 与 90k 都是 `48c9a8f016f32bbf`。40k 答
+`BLUEBIRD-42`，90k 答 `No` ⇒ **选中了正确块、搬运也没坏**，是 80k 相对
+距离下的模型检索失败。80k 池退化的修复是工作集 2240→8192，不是改 top-k。

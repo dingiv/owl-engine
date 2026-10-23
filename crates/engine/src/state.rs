@@ -1860,18 +1860,36 @@ impl<'a> AllocCtx<'a> {
         let pool_tokens = if plan.pool_auto {
             match auto_cap {
                 Some(cap) => {
-                    if plan.seq_tokens.saturating_add(page_guess) > cap {
+                    // **超卖档**(`select_decode + select_partial`)允许
+                    // `max_seq > cap`:池只装得下上下文的一部分,其余靠选择层
+                    // 下沉(链上占位符 + 视图页表)。非超卖档仍响亮拒 ——
+                    // 否则链超出池容量必 `Exhausted`。
+                    if !plan.pool_overcommit
+                        && plan.seq_tokens.saturating_add(page_guess) > cap
+                    {
                         let m = cap.saturating_sub(page_guess);
                         return Err(ModelError::Msg(format!(
                             "[pool] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
                              本档 per_tok={}B ⇒ cap={} tok。修法:降 [runtime].max_seq 到 ≤ {}、\
-                             或降 per_tok(池 fp8 / 草稿环 / 更小主 KV)。",
+                             或降 per_tok(池 fp8 / 草稿环 / 更小主 KV)、或显式开 [kvmem] 超卖。",
                             plan.seq_tokens,
                             m,
                             per_tok.total(),
                             cap,
                             m
                         )));
+                    }
+                    if plan.pool_overcommit
+                        && plan.seq_tokens.saturating_add(page_guess) > cap
+                    {
+                        owl_shared::log_info!(
+                            "pool",
+                            "超卖档:max_seq={} > 自动池 cap={} tok ⇒ 池按 cap 分配,\
+                             其余 {} tok 由选择层下沉到宿主/盘",
+                            plan.seq_tokens,
+                            cap,
+                            plan.seq_tokens.saturating_sub(cap)
+                        );
                     }
                     // **缓存档**:整池给前缀缓存(旧行为;新请求逐出)。
                     // **无缓存档**:只按 max_seq×并发 预分配,避免池页空转。
