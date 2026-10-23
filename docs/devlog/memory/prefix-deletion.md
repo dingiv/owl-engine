@@ -487,7 +487,7 @@ vLLM 那边的重转核**至今没落地**（PR 仍 open、env 门仍在、RFC �
 | 记账 | `AgentSession::{img_spans,pads}`；`store::{Rel,StateStore}::rekey_snap` + `StatePool::snap_rekey`（层分派见 §5quater：设备/宿主/盘三层都重挂） |
 | **改写即失效** | `KvStore::drop_chain` / `Rel::drop_chain`：重转后**废弃被改后缀块的旧链身份**（vLLM `_maybe_evict_cached_block` 同义）。漏了它 = 别的会话按旧 token 命中同一批槽读旋转过的 K（真机：第二会话 logits 全 NaN，诊断面越界 panic 崩服务） |
 | **显存释放**（2026-10-23 用户口径"删了图显存要跟着降"） | 拼接之后**删点之后的整条旧链都不可达**了 ⇒ `drop_chain` 从 `a/page` 到 `matched_blocks` 全量废弃（被删段 + 被重转后缀 + 未复用尾巴），并把**这些边界的 GDN 快照**（设备/宿主）一并丢。引用归零的槽立刻回自由队列，本轮后续 prefill 就能用。实测 16 轮滑窗：`KvBlock` 稳定 **29 条 / 10MiB**、`Snap` **4 条 / 77MiB**（不释放时 209 条 / 82MiB + 323MiB 快照）。 |
-| 残余开销（认账） | ① 幸存图的页对齐 pad（每图 ≈30 tok，窗口 3 图 ≈90 tok）；② 被删图的 `pad_before` 块（≤31 tok，落在前缀里，删不掉——页对齐的构造性代价）；③ 旧链前缀条目保留（身份不变，可继续给别的会话用）。 |
+| 残余开销（认账；**定谳见 §5octies**） | ① 标记图的预付款 `pad_before+pad_after` ≤62 tok/张（窗口 3 张 ≈93 tok）；② 被删图的 `pad_before` **≤31 tok**（期望 15.5）落在前缀里删不掉——页对齐的构造性代价，**token 口径、不产生专用块**；③ 旧链前缀条目保留（身份不变，可继续给别的会话用）。 |
 | 观测 | `RunningEngine::img_evict`（`absorbed` + `ImgEvictTrace{a,b,keep_blocks,shift,pages,rekeyed}`）+ counters |
 
 **门（真机）**：
@@ -714,3 +714,40 @@ PR 只给"引擎管道 + `_post_add_requests` 钩子"，旋转留给 runner，�
 **监控面（只打印，不判死）**：真机跑成功 harness 时记录 `cached/prefill`、吸收率、
 `rebase` 次数、旋转耗时；有质量的模型上再补"任务成功率 vs 无删除基线"的对比
 （模型侧既有红修好之前**不可得**）。
+
+### 5octies. 残余 pad 定谳：**接受**（2026-10-24 用户裁决）+ 块尺寸口径
+
+**一句话**：残余是 **≤31 个 token/次（期望 15.5）**，不是"一整页的显存"，也**不产生可回收的专属块**
+（`pad_before` 恒 <32 ⇒ 那些 pad 与存活文本同块，块本来就要留）。整个会话的量级：
+
+| 口径 | 值 |
+|---|---|
+| 单次删除残余 | `pad_before = (32 − len%32) % 32` ∈ [0,31]，期望 **15.5 tok** |
+| 200 轮的 agent 会话 | 最坏 200×31 = **6.2k tok**；期望 200×15.5 ≈ **3.1k tok** |
+| 对照 | 一张真截图 ≈ **1k+ tok**（本仓 448px 合成图实测 224 tok）⇒ **整个会话的残余 < 三张截图** |
+| 代价性质 | 前缀命中（**不重算**）⇒ 只吃 `pool_tokens`/ctx 预算，不吃算力、不占专属显存 |
+
+**裁决**：接受。**不为它上 cascade** —— cascade（允许非页对齐删除 + 边界块内逐 token 搬移）
+的代价是**每次删除搬 O(后缀) 的 K**（27B 16 页后缀 ≈ 8 MiB/rank 读+写），收益却是"平均 15 个
+token 的上下文预算"，差 500 倍量级。vLLM #43374 把这条级联推给 runner，我们不接。
+
+**块尺寸基准表**（`page = 32 tok` 为硬编码口径；`sched_policy::Limits::page = 32`）：
+
+```
+block_bytes = n_full × 2(K,V) × (hkv ÷ TP) × hd × 32 × elem_bytes
+```
+
+| 档 | n_full | hkv/rank | hd | elem | 每 token | 每块（32 tok） |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.8B 单卡 | 6 | 2 | 256 | 2 | 12 KiB | **384 KiB**（K 192 + V 192） |
+| 27B TP2 f16 | 16 | 2 | 256 | 2 | 32 KiB/rank | **1 MiB/rank**（K 512 KiB + V 512 KiB） |
+| 27B fp8（本特性不支持） | 16 | 2 | 256 | 1 | 16 KiB/rank | 512 KiB/rank |
+
+对账：0.8B `KvBlock 29 条 / 10 MiB`（29×384 KiB = 10.9 MiB ✓）；
+27B 池 `256 槽 × 1 MiB = 256 MiB/rank` ✓。**linear-attention 层没有 KV 块**（状态在 GDN
+格/快照里，27B 一条快照 75.9 MiB —— 删段快照才是显存大户）。
+
+**口径修正（本轮一并落）**：
+1. 旋转只碰 **K**：`StatePool::k_block_bytes()` 单列（`block_bytes()` 是 K+V）⇒
+   27B/TP2 实测"16 页"= **8 MiB(K)/rank**（旧日志按 K+V 记成 16 MiB，带宽口径差 2×）。
+2. 一张 448px 图 = 224 tok = 7 块 ⇒ 27B 7 MiB/rank、0.8B 2.6 MiB。

@@ -107,7 +107,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let blocks_t = TensorOps::from_host(Dtype::F32, vec![blocks.len()], &blocks_bytes);
         let t0 = std::time::Instant::now();
         let n_layers = self.dev.pool.kv_caches().len();
-        let bytes = plan.pages.len() * self.dev.pool.block_bytes();
+        // **K only**(本核不碰 V;口径见 `StatePool::k_block_bytes`)
+        let bytes = plan.pages.len() * self.dev.pool.k_block_bytes();
         for (k, _v) in self.dev.pool.kv_caches() {
             let node = k_shift(&k, &cos_t, &sin_t, &blocks_t, geom);
             // env 是**方法调用**(整 &self.dev 借用)⇒ 必须在 face_mut 之前取值,
@@ -129,7 +130,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         owl_shared::counter_add!("image_evict.rotate.bytes", bytes as u64);
         owl_shared::log_info!(
             "img-evict",
-            "后缀 K 重转 R(−{}) · 层 {} · 页 {} / {:.1} MiB / {:.2} ms",
+            "后缀 K 重转 R(−{}) · 层 {} · 页 {} / {:.1} MiB(K) / {:.2} ms",
             plan.shift,
             n_layers,
             plan.pages.len(),

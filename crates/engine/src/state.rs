@@ -758,6 +758,21 @@ impl StatePool {
         total / self.geom.nb_kv.max(1)
     }
 
+    /// **单逻辑块的 K 字节**(旋转面的长度真源;`block_bytes()` 是 **K+V**)。
+    ///
+    /// 为什么要单独一个:`elems.kv_rope_shift` **只碰 K**(V 无位置)——
+    /// 拿 `block_bytes()` 当"旋转字节数"会把账记成 2× 并压低带宽口径
+    /// (27B/TP2 实测:16 页 = 8 MiB/rank,不是 16 MiB)。
+    pub(crate) fn k_block_bytes(&self) -> usize {
+        let total: usize = self
+            .kv
+            .kvs
+            .iter()
+            .map(|kv| kv.k_cache.1 * elem_bytes(kv.k_cache.0.dtype))
+            .sum();
+        total / self.geom.nb_kv.max(1)
+    }
+
     /// **主池布局**(engine 注册给 store 的 id 级描述;设计卷 §10.3 推论 A)。
     /// 每层 k/v 各一项;`stride_bytes` = 每页字节(槽步长)。
     pub(crate) fn pool_layout(&self, epoch: u64) -> owl_store::PoolLayout {
