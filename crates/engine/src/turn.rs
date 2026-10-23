@@ -74,7 +74,7 @@ pub struct TurnOpts {
     /// B 轴未落地,地板语义无从兼现,§23.5)。
     pub dense_floor: Option<owl_store::TurnFloor>,
     /// **VLM 图像输入**(2026-10-20 视觉接线):空 = 纯文本(逐字节旧行为)。
-    /// 首版单图;`VlmImage` 是服务面预处理的输出契约。
+    /// **单请求可多图**(按内容序;2026-10-23);`VlmImage` 是服务面预处理的输出契约。
     pub images: Vec<owl_models::vlm::VlmImage>,
 }
 

@@ -544,9 +544,10 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         }
         let prompt = prompt.into();
-        // **VLM 输入门**(2026-10-20 视觉接线 V5):单图、非合批;图像 × 投机
-        // 已接(verify 的 rope pos 加 m-RoPE delta,slots/lens 仍用真实位置)。
-        // 图像路径的塔/表/prefill 见 execute_prefill;这里只做提交边界拒。
+        // **VLM 输入门**(2026-10-20 视觉接线 V5;2026-10-23 多图):
+        // 单请求可带多图(按内容序),但图像 × 合批仍拒;图像 × 投机已接
+        // (verify 的 rope pos 加 m-RoPE delta,slots/lens 用真实位置)。
+        // 邻接多图的 m-RoPE 由 `MropeCfg::rope_index` 按 grid 顺序分段。
         if !opts.images.is_empty() {
             if self.dev.boot.vlm.is_none() {
                 return Err(ModelError::Msg(
@@ -557,13 +558,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 return Err(ModelError::Msg(
                     "submit: VLM 图像首版不支持合批(max_batch > 1)".into(),
                 ));
-            }
-
-            if opts.images.len() != 1 {
-                return Err(ModelError::Msg(format!(
-                    "submit: 图像首版只支持单图(来 {} 张)",
-                    opts.images.len()
-                )));
             }
         }
         let prompt_ids = {

@@ -941,11 +941,11 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             out.push_str(
                 "[check] note: vision=on + spec>0:图像 × 投机已接(V5)—— verify 的 rope \
                  pos = 真实位置 + m-RoPE delta,KV slots/lens 仍用真实位置;\
-                 带图为单图/非合批;文本+draft 同档可用\n",
+                 带图为单请求多图/非合批;文本+draft 同档可用\n",
             );
         } else {
             out.push_str(
-                "[check] note: vision=on + spec=off:图像路径可用(单图;data URL;\
+                "[check] note: vision=on + spec=off:图像路径可用(单请求多图;data URL;\
                  TP2 两 rank 各备塔输出)\n",
             );
         }

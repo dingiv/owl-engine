@@ -473,13 +473,16 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // ── **VLM:本 chunk 的 m-RoPE / 图像注入**(2026-10-20)──
         // 行号表/余弦表按 chunk 行号切;`has_image=false` 的块只装 rope
         // (image_scatter 不必跑全 -1 表)。塔输出 `merged` 是 turn 域设备叶。
-        let (vlm_cos, vlm_sin, vlm_idx);
+        let (vlm_cos, vlm_sin, vlm_idx, vlm_pos);
         if let Some(v) = host.vlm {
-            let (cos, sin, idx, has_image) = v.ins.chunk_tables(base, t);
+            let (cos, sin, idx, pos, has_image) = v.ins.chunk_tables(base, t);
             vlm_cos = cos;
             vlm_sin = sin;
             vlm_idx = idx;
+            vlm_pos = pos;
             ctx = ctx.with_vlm_rope(&vlm_cos, &vlm_sin);
+            // cos/sin 是本 chunk 的行表 ⇒ rope 的行号也必须是本 chunk 局部号
+            ctx.pos = Some(&vlm_pos);
             if has_image {
                 if let Some((_, _, merged)) = &v.merged {
                     ctx = ctx.with_vlm_image(merged, &vlm_idx);
