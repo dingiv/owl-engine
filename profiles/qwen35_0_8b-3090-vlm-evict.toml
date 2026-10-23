@@ -1,0 +1,62 @@
+# owl 档 `qwen35_0_8b-3090-vlm-evict` —— 0.8B HF(F16)+ 视觉 + **前缀无感删除**（LAN 联调档）
+#
+# 用途：给"真 agent / 局域网 Python 客户端"演示 **图片 KV 无感删除**：
+#   - 图像段可打 `owl_evict: true`（引擎只对**带标记**的段补页对齐 pad）；
+#   - 下一轮历史里删掉该图 ⇒ 后缀页保留 + 后缀 K 乘 R(−S)，删点之后**不重算**；
+#   - 用 `usage.prompt_tokens_details.cached_tokens` 观察命中面。
+#
+# 约束（boot 会校验，缺一拒启）：
+#   `[pool] image_evict = true` 需要 `prefix_cache = true` + f16 KV（`kv_fp8 = false`）
+#   + `[model] vision = true`。
+#
+# 设备：单卡 3090 Ti（BDF 钉卡；禁用 CUDA 序号）。
+# ⚠️ 0.8B 有既有红：**boot 后第一轮就带图**会吐退化串（F1，另案）⇒ 先发一轮纯文本。
+extends = ["full.toml"]
+
+[server]
+# 局域网可访问（⚠️ 无鉴权，只在可信内网使用）
+bind = "0.0.0.0:8135"
+
+[model]
+name = "qwen3.5-0.8b-vlm"
+path = "../models/Qwen/Qwen3.5-0.8B"
+format = "safetensors"
+quant = "w4a16" # 本装载器走 F16（safetensors 档忽略该键，留档保持 schema 完整）
+head_quant = "off"
+vision = true
+
+[parallel]
+mode = "single"
+device = ["42:00.0"]
+
+[runtime]
+max_seq = 8192
+max_concurrency = 1
+# 不带 `session` 键的请求也落到隐式会话 0（否则每轮都是临时会话 ⇒ 永远无前缀复用）
+implicit_session = true
+
+[pool]
+gdn_slots = 1
+# **快照池**：删除路径要在"上一轮 prompt 的最后一个页边界"恢复 GDN 态。
+# 2026-10-23 两项修正后 4 槽就够：①快照淘汰改为**新鲜度优先**（快照按边界身份
+# 独立键控，"末端先削"会先逐掉最该留的尾巴）；②删除时**连带释放删段边界的
+# 快照**。实测 16 轮滑窗：4 槽 = 77MiB，prefill 恒定、无掉命中（16 槽是 323MiB）。
+# 多会话并发时才需要按"并发会话数 × 2"上调。
+snap_max = 4
+prefix_cache = true
+# f16 KV 是 image_evict 的硬前提（fp8 的 dequant→rotate→requant 未做）
+kv_fp8 = false
+# **本档的主开关**：前缀无感删除（图像段）
+image_evict = true
+vram_target = 0.8
+vram_reserve_mb = 1024
+
+[kernel]
+verify_arm = "v2"
+decode_arm = "v2"
+fi_plan_bake = false
+fi_plan_restore = true
+fi_cuda_graph = false
+
+[spec]
+depth = 0

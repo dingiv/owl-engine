@@ -20,7 +20,6 @@ name = "qwen3.8-27b"
 max_seq = 8448
 
 [pool]
-pool_tokens = 8704
 gdn_slots = 8
 
 [kernel]

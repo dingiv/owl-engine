@@ -49,6 +49,13 @@ pub struct AgentSession {
     /// 物理块链(E2b 真块表):逻辑块序 → 物理块 id;块池共享,
     /// 跨 turn 存续(会话存活期间块不归还)
     pub block_table: Vec<u32>,
+    /// **图像段账**(前缀无感删除;2026-10-23):上轮 prompt 里各图像占位段
+    /// (含页对齐 pad)的会话坐标 + 网格 + 客户端可删标记。
+    /// 生命周期跟随 `tokens`:turn 收口由 `set_img_spans` 写回,`reset` 清空。
+    pub img_spans: Vec<crate::img_evict::ImgSpan>,
+    /// **pad 区间账**(padded 坐标,升序):`unpad(tokens, pads)` = 客户端可见
+    /// 序列。与 `img_spans` 同一次写回(两处各写一份 = 下一轮 diff 拿错坐标)。
+    pub pads: Vec<(usize, usize)>,
     /// E5:LRU 逐出账(SessionTable.tick 触达时间;越小越老)
     /// MTP 草稿链块链(E5-M2b):独立页池的第二链;mtp 模式由
     /// propose 路径 ensure_for_len,与 target 链同步跨 turn 存续
@@ -76,6 +83,8 @@ impl AgentSession {
             mtp_block_table: Vec::new(),
             last_use: 0,
             chain: ChainCursor::new(),
+            img_spans: Vec::new(),
+            pads: Vec::new(),
         }
     }
 
@@ -103,6 +112,21 @@ impl AgentSession {
         self.cached_len = 0;
         self.tokens.clear();
         self.chain.reset();
+        self.img_spans.clear();
+        self.pads.clear();
+    }
+
+    /// **图像段账写回**(turn 收口;坐标 = `tokens` 的 prompt 段坐标)。
+    ///
+    /// 只由 `commit_turn` 的调用点写(单一产地):spans 与 `tokens` 必须
+    /// 描述同一份 prompt —— 两处各写一份 = 下一轮删除识别拿错坐标。
+    pub fn set_img_spans(
+        &mut self,
+        spans: Vec<crate::img_evict::ImgSpan>,
+        pads: Vec<(usize, usize)>,
+    ) {
+        self.img_spans = spans;
+        self.pads = pads;
     }
 
     /// 会话 KV 预算校验:全量 prompt + 本 turn 生成长度 ≤ 槽区容量
@@ -242,9 +266,6 @@ pub(crate) struct BankPlan {
     pub mtp: bool,
     /// 前缀缓存开关(容量策略见 [`owl_store::CachePolicy`])
     pub prefix_cache: bool,
-    /// **前缀缓存份额**(千分比;`[pool].prefix_cache_share` × 1000)。
-    /// 容量算式住 store(`CachePolicy::Share`:份额 × 设备池 + 宿主槽全额)。
-    pub cache_share_permille: u16,
     /// target 腿宿主层预算(字节;0 = 关层,REQ C4 默认关)
     pub host_bytes: usize,
     /// **TP world**(2026-10-20):宿主腿每条链占 `world` 个平面
@@ -287,12 +308,11 @@ impl SessionBank {
         mtp_layout: Option<PoolLayout>,
         ledger: owl_store::SharedLedger,
     ) -> Result<Self> {
-        // **缓存容量 = store 自决**(2026-10-19 容量定档):engine 只给两件事实
-        // (设备页数/宿主预算)与一条**份额政策**,容量算式住在 store
-        // (`CachePolicy::Share`;含"宿主槽全额"的跨层索引语义)。
-        // 份额来自 `[pool].prefix_cache_share`(缺省 0.5 = 旧 `nb/2` 行为)。
+        // **缓存容量 = 整池**(2026-10-22 用户令:删 `prefix_cache_share`)。
+        // 前缀缓存可以持有全部设备页 + 宿主槽;新请求进来时按
+        // `KvStore::ensure_for_len` 逐出设备叶 → 宿主,宿主不够再走磁盘。
         let cache = if plan.paged && plan.prefix_cache {
-            owl_store::CachePolicy::Share { permille: plan.cache_share_permille }
+            owl_store::CachePolicy::Share { permille: 1000 }
         } else {
             owl_store::CachePolicy::Off
         };
@@ -477,7 +497,6 @@ mod bank_tests {
             paged: true,
             mtp,
             prefix_cache,
-            cache_share_permille: if prefix_cache { 500 } else { 0 },
             host_bytes: 0,
             world: 1, // 测试：单卡平面（TP 宿主腿的 world 语义由 store 门覆盖）
         }

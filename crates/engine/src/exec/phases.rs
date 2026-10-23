@@ -21,7 +21,7 @@ const SNAP_EVERY: usize = 4;
 async fn prepare_vlm_rank<D: DeviceClient>(
     dev: &mut crate::engine::RankDev<D>,
     ids: &[u32],
-    images: &[owl_models::vlm::VlmImage],
+    images: &[crate::turn::TurnImage],
 ) -> Result<crate::vlm::VlmPrepared> {
     let vlm = dev
         .boot
@@ -29,10 +29,10 @@ async fn prepare_vlm_rank<D: DeviceClient>(
         .clone()
         .ok_or_else(|| ModelError::Msg("prefill: 图像输入但本 rank 无视觉塔".into()))?;
     let grids: Vec<owl_models::layers::vision::GridThw> =
-        images.iter().map(|i| i.grid).collect();
+        images.iter().map(|i| i.image.grid).collect();
     let px: Vec<f32> = images
         .iter()
-        .flat_map(|i| i.pixel_values.iter().copied())
+        .flat_map(|i| i.image.pixel_values.iter().copied())
         .collect();
     let req = vlm.prepare(ids, &grids, &[], &px)?;
     let merged = match req.merged {
@@ -89,6 +89,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 性能面:本轮 epoch 起点(/debug/perf?epoch=1 = 只看本轮;不 reset,
         // 历史样本仍可全量查询 —— perf-framework.md §三)
         owl_shared::metrics::mark_epoch();
+        // **删后旧身份的盘层快照收尾**(重挂 / 丢弃):必须在**任何快照恢复之前**
+        // —— 新链的恢复键可能落在盘层,回灌按新键查文件。
+        if let Some(rr) = b.rerope.as_ref() {
+            if !rr.snap_disk.is_empty() {
+                self.execute_snap_disk_ops(&rr.snap_disk).await?;
+            }
+        }
         // 快照就位(host 侧:store 层账 + 必要时一条 swap 回灌)——
         // **必须在设备半之前**:两 rank 的快照恢复都要用就位后的槽。
         let restore_slot = if !b.reset_gdn {
@@ -164,6 +171,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             crate::exec::mirror2!(dev, peer,
                 d => d.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table),
                 p => p.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table))?;
+        }
+        // **前缀无感删除的设备半**(2026-10-23):拼接后的后缀 K 原地重转。
+        // 顺序 = `write_bt` 之后、任何 prefill/decode 读 KV 之前。
+        if let Some(rr) = b.rerope.as_ref() {
+            self.execute_k_shift(rr).await?;
         }
         Ok(())
     }
@@ -275,11 +287,61 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let s = self.bank.sessions.session(act.session_id)?;
             (s.block_table.clone(), act.gdn_slot)
         };
+        // **KVMem 最终 query replay**:末 chunk 前拍 GDN 快照。最终召回
+        // 之后要回到这里，用新视图重跑本 chunk，否则末 token 的 hidden
+        // 仍是旧视图算出的（选中块进不了当前 query）。
+        let replay_armed = is_last && base > 0 && self.boot.cfg.knobs.query_replay;
+        if replay_armed {
+            let (pool, graphs) = (&mut self.dev.pool, &mut self.dev.graphs);
+            pool.capture_replay_snap(graphs.session.face_mut(), gdn_slot).await?;
+        }
         // 部分驻留档的"过去"子集页链(host 面算好;两 rank 同值)
         let past_view = self.past_view_of(base, chunk_ids.len());
         let (vlm0, vlm1) = {
             let act = self.turns.active()?;
             (act.vlm.as_ref(), act.vlm_peer.as_ref())
+        };
+        // **廉价边界省 Q**：只有完整召回/诊断边界才需要 query 面。
+        // 与 `coverage_analyze` 同一份调度算式（末边界预测 + recall_every）——
+        // 不能在两处各写一个数。
+        let q_needed = if self.boot.cfg.knobs.select_decode || self.boot.cfg.knobs.coverage_probe {
+            let new_fed = base + chunk_ids.len();
+            let prompt_len = self
+                .turns
+                .active
+                .first()
+                .map(|a| a.prompt_ids.len())
+                .unwrap_or(new_fed);
+            let msg_snaps = self
+                .turns
+                .active
+                .first()
+                .map(|a| a.msg_snaps.as_slice())
+                .unwrap_or(&[]);
+            let next_end = Self::prefill_step_chunk_msg(
+                new_fed,
+                prompt_len,
+                self.boot.cfg.prefill_chunk,
+                self.boot.cfg.knobs.prefill_tail_merge,
+                Self::prefill_align_page(
+                    self.boot.cfg.knobs.prefill_align_tail,
+                    self.boot.cfg.knobs.prefix_cache,
+                    self.dev.pool.geom.page,
+                ),
+                msg_snaps,
+                self.boot.cfg.knobs.snap_msg_min_span,
+            )
+            .map(|n| new_fed + n)
+            .unwrap_or(new_fed);
+            let last_boundary =
+                next_end == new_fed || !next_end.is_multiple_of(self.dev.pool.geom.page);
+            self.boot.cfg.knobs.coverage_probe
+                || last_boundary
+                // `coverage_analyze` 先 `note_boundary()` 再取模；这里预判要
+                // 用**下一个**边界序号，否则 k>1 时会在完整召回边界漏采 Q。
+                || (self.sel.boundaries() + 1) % self.boot.cfg.knobs.recall_every.max(1) == 0
+        } else {
+            false
         };
         let mut host0 = ChunkHost {
             boot_seq: self.boot.seq,
@@ -291,6 +353,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             bank: Some(&mut self.bank),
             sel: Some(&mut self.sel),
             past_view: past_view.clone(),
+            q_needed,
             vlm: vlm0,
         };
         let mut host1 = ChunkHost {
@@ -303,6 +366,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             bank: None, // peer:镜像路不给账房(草稿臂在本路响亮拒)
             sel: None,  // peer:诊断账只在主 rank
             past_view,
+            q_needed,
             vlm: vlm1,
         };
         // ── ① 两 rank **并发**入队半(同一份设备侧代码,各自 rank 束)──────
@@ -330,7 +394,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         };
         // 主 rank 收割(**两 rank 都已入队之后**才读;borrow 已释放)
-        let last_row = self.harvest_prefill(tail0, boot_seq).await?;
+        let mut last_row = self.harvest_prefill(tail0, boot_seq).await?;
         let t_bnd = std::time::Instant::now();
         // E2c:块边界跨越 → GDN 快照拍摄(快照身份 = 边界块**内容身份**;
         // 物理块号会被回收复用,不可作键)
@@ -344,7 +408,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .first()
                 .map(|a| a.prompt_ids.len())
                 .unwrap_or(new_fed);
-            let next_end = Self::prefill_step_chunk(
+            let msg_snaps = self
+                .turns
+                .active
+                .first()
+                .map(|a| a.msg_snaps.as_slice())
+                .unwrap_or(&[]);
+            let next_end = Self::prefill_step_chunk_msg(
                 new_fed,
                 prompt_len,
                 self.boot.cfg.prefill_chunk,
@@ -354,21 +424,35 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
+                msg_snaps,
+                self.boot.cfg.knobs.snap_msg_min_span,
             )
             .map(|n| new_fed + n)
             .unwrap_or(new_fed);
             let last_boundary =
                 next_end == new_fed || !next_end.is_multiple_of(self.dev.pool.geom.page);
+            let msg_snap = self
+                .turns
+                .active
+                .first()
+                .is_some_and(|a| a.msg_snaps.binary_search(&new_fed).is_ok());
             // GDN 快照**节奏化**(2026-10-20):末边界 + 每 `SNAP_EVERY` 个 chunk 一个锚点。
             // 冷 prefill 每边界都拍 = 槽满后每拍一次 DtoH(159 MB ≈ 31 ms);
             // 复用只需要**末边界**(append 场景)与稀疏锚点(分叉场景)。
             let every = self.boot.cfg.prefill_chunk.max(1) * SNAP_EVERY;
-            let snap_keep = last_boundary || new_fed.is_multiple_of(every);
+            let snap_keep = last_boundary || new_fed.is_multiple_of(every) || msg_snap;
+            // **索引采集节奏**：与 `coverage_analyze` 的完整召回同拍 ——
+            // 廉价边界只攒身份/页号，不触发 D2H；下次完整召回前一次补齐。
+            // `coverage_probe` 诊断档要求每边界都有索引 ⇒ 全采。
+            let index_every = self.boot.cfg.knobs.index_cadence();
+            let index_now = self.boot.cfg.knobs.coverage_probe
+                || last_boundary
+                || (self.sel.boundaries() + 1) % index_every == 0;
             // GDN 快照拍摄(**唯一入口** `capture_gdn_snap`:链推进 + 增量登记 +
             // 索引采集 + 快照;内部已 TP 感知 —— peer 在场时两 rank 各拍各自的池,
             // store 的 state 账仍单份)。
             let t_snap = std::time::Instant::now();
-            self.capture_gdn_snap(sid, new_fed, snap_keep).await?;
+            self.capture_gdn_snap(sid, new_fed, snap_keep, index_now).await?;
             let snap_ms = t_snap.elapsed().as_secs_f64() * 1000.0;
             // **边界相位拆分**(`OWL_VRAM_DBG=1`;2026-10-19 A3):
             // 边界 = 快照拍摄(链哈希 + GDN 拷贝 + 登记)‖ 索引采集 ‖ B 轴(打分/选择/视图/调和)。
@@ -393,6 +477,86 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     "vram",
                     "边界@{new_fed}: 选择层关,无索引/B 轴");
             }
+        }
+        // ── **KVMem 最终 query replay**(P0;2026-10-23)──────────────
+        //
+        // 论文 §5.2:最终 recall/视图装配后，在**新视图**上重跑 current
+        // query，再 decode。这里 current query = 末个 prefill chunk。
+        // GDN 已回到 chunk 起点；KV 槽/链不动（重跑只覆盖同位置 K/V）。
+        if replay_armed && is_last {
+            if self.peer.is_some() {
+                return Err(ModelError::Msg(
+                    "query_replay:当前只支持单卡(TP replay 另立刀)".into(),
+                ));
+            }
+            {
+                let (pool, graphs) = (&mut self.dev.pool, &mut self.dev.graphs);
+                pool.restore_replay_snap(graphs.session.face_mut(), gdn_slot).await?;
+            }
+            let replay_bt = self.bank.sessions.session(sid)?.block_table.clone();
+            let replay_past = self.past_view_of(base, chunk_ids.len());
+            let mut replay_knobs = self.boot.cfg.knobs.clone();
+            replay_knobs.select_decode = false;
+            replay_knobs.coverage_probe = false;
+            let vlm_replay = self.turns.active()?.vlm.as_ref();
+            let tail = {
+                let mut host = ChunkHost {
+                    boot_seq: self.boot.seq,
+                    probes: self.boot.probes,
+                    knobs: &replay_knobs,
+                    sid,
+                    bt_chain: &replay_bt,
+                    gdn_slot,
+                    bank: None,
+                    sel: None,
+                    past_view: replay_past,
+                    q_needed: false,
+                    vlm: vlm_replay,
+                };
+                self.dev
+                    .prefill_chunk_enqueue(&mut host, &chunk_ids, base, true)
+                    .await?
+            };
+            let replay_row = self.harvest_prefill(tail, boot_seq).await?;
+            if replay_row.is_some() {
+                last_row = replay_row;
+            }
+            owl_shared::log_info!(
+                "kvmem-replay",
+                "query replay:ctx={} base={} t={} view={} 页(新视图上重跑末 chunk)",
+                new_fed,
+                base,
+                chunk_ids.len(),
+                self.sel.view().map(|v| v.pages.len()).unwrap_or(0)
+            );
+        }
+        if is_last && self.boot.probes.dflash_probe {
+            let p = self.sel.prof();
+            owl_shared::log_info!(
+                "kvmem-prof",
+                "boundaries={} full={} cheap={} | index={:.1} qface={:.1} mass={:.1} score={:.1} paper={:.1} select={:.1} view={:.1} reconcile={:.1} | total={:.1}ms",
+                p.boundaries,
+                p.recall_full,
+                p.recall_cheap,
+                p.index_ms,
+                p.q_face_ms,
+                p.mass_ms,
+                p.score_ms,
+                p.paper_ms,
+                p.select_ms,
+                p.view_ms,
+                p.reconcile_ms,
+                p.total_ms
+            );
+            owl_shared::log_info!(
+                "kvmem-prof",
+                "qface 拆：toh={:.1} dec={:.1} free={:.1} derope={:.1} mass={:.1}",
+                p.q_toh_ms,
+                p.q_dec_ms - p.q_free_ms,
+                p.q_free_ms,
+                p.q_derope_ms,
+                p.q_mass_ms
+            );
         }
         // **边界事件计时 → metrics**(2026-10-18 T1):前向已有 `prefill.chunk`
         // (prefill_chunk.rs 内部记),这里补“边界那一半”(快照 + 召回/打分/调和)
@@ -617,6 +781,7 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     &[],
                     owl_store::SnapDurability::Transient,
                     true,
+                    true,
                 )
                 .await?;
             }
@@ -705,7 +870,12 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     .filter(|(_, &v)| v.is_finite())
                     .map(|(i, &v)| (v, i as u32))
                     .collect();
-                top.select_nth_unstable_by(7, |a, b| b.0.total_cmp(&a.0));
+                // 诊断面**不许 panic**:全非有限/空 logits(实测 NaN 步)时
+                // `select_nth_unstable_by(7)` 会越界崩引擎 —— 先按实际长度夹紧。
+                if !top.is_empty() {
+                    let k = top.len().saturating_sub(1).min(7);
+                    top.select_nth_unstable_by(k, |a, b| b.0.total_cmp(&a.0));
+                }
                 top.truncate(8);
                 top.sort_by(|a, b| b.0.total_cmp(&a.0));
                 let pretty: Vec<String> = top
@@ -765,7 +935,12 @@ if self.dev.graphs.session.has_input("sel_pt") {
                         .filter(|(_, &v)| v.is_finite())
                         .map(|(i, &v)| (v, i as u32))
                         .collect();
-                    top.select_nth_unstable_by(7, |a, b| b.0.total_cmp(&a.0));
+                    // 诊断面**不许 panic**:全非有限/空 logits(实测 NaN 步)时
+                    // `select_nth_unstable_by(7)` 会越界崩引擎 —— 先按实际长度夹紧。
+                    if !top.is_empty() {
+                        let k = top.len().saturating_sub(1).min(7);
+                    top.select_nth_unstable_by(k, |a, b| b.0.total_cmp(&a.0));
+                    }
                     top.truncate(8);
                     top.sort_by(|a, b| b.0.total_cmp(&a.0));
                     let pretty: Vec<String> = top
@@ -1025,6 +1200,7 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     fed,
                     &[],
                     owl_store::SnapDurability::Transient,
+                    true,
                     true,
                 )
                 .await?;
@@ -1507,7 +1683,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         }
         owl_shared::log_debug!("spec-round", "fold:图入队起 rows={rows}");
         let fg = self.graphs.fold_mut(depth, rows)?;
-        let r = fg.step(&[("slots", &[gdn_slot as f32])]).await;
+        // `cu` 必须每回复写:单图按最大 rows 捕获,核按 cu=[0,rows] 截断。
+        let r = fg
+            .step(&[("slots", &[gdn_slot as f32]), ("cu", &[0.0, rows as f32])])
+            .await;
         owl_shared::log_debug!("spec-round", "fold:图入队完 rows={rows} ok={}", r.is_ok());
         r
     }

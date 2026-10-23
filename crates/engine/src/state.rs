@@ -153,9 +153,8 @@ pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     /// 显存治理器的 `cap` 退化为**上限校验 + 报告**(`ctx_max = cap − page`);
     /// `seq_tokens > ctx_max` ⇒ 拒启并给出可服务的最大 ctx。
     pub pool_auto: bool,
-    /// 每 turn 工作集(token;`[kvmem].workspace_per_req`)——
-    /// 口径:`ctx` 常驻(**Strict** 准入)⊆ 池 ⇒ 可用 ctx 上限 = `cap − page`。
-    pub ws_tokens: usize,
+    /// **最终 query replay**(KVMem §5.2):需要专用 GDN 回滚缓冲。
+    pub query_replay: bool,
     /// **允许池小于上下文**(锁①;`[kvmem].pool_overcommit`)。
     ///
     /// 关着时池有硬下限 `nb ≥ ceil(seq_tokens/page)` ⇒ **选择层只省访问面、
@@ -541,6 +540,8 @@ pub(crate) struct GdnBank {
 pub(crate) struct DraftBank {
     /// spec 快照(E5-M2:投机轮回滚缓冲;`OWL_SPEC_DEPTH>0` 时分配)
     spec_snap: Option<SpecSnapBuf>,
+    /// **最终 query replay** 的 GDN 回滚缓冲(`[kvmem].query_replay`)。
+    replay_snap: Option<SpecSnapBuf>,
     /// MTP 草稿链 KV 池(E5-M2b;独立页池,1 层)
     mtp_kvs: Option<KvBlocks>,
     /// DFlash2 草稿 KV 池(E5-DF2;独立页池,5 层草稿几何 8/128)
@@ -1253,6 +1254,40 @@ impl StatePool {
             .collect()
     }
 
+    /// **前缀无感删除可用?**(f16 + kNHD 分页;fp8 需 dequant→requant,未做)
+    pub(crate) fn k_shift_supported(&self) -> bool {
+        self.geom.paged && !self.geom.kv_fp8 && self.geom.dims.dtype == Dtype::F16
+    }
+
+    /// 池内 K 的 Δ-rope 几何(`[nb, hkv, hd/x, page, x]` 四维 + `half`)
+    pub(crate) fn k_shift_geom(
+        &self,
+        half: usize,
+    ) -> crate::Result<owl_models::layers::kvshift::KvShiftGeom> {
+        if !self.k_shift_supported() {
+            return Err(ModelError::Msg(format!(
+                "k_shift_geom: 本池不支持 K 重转(paged={} kv_fp8={} dtype={:?})",
+                self.geom.paged, self.geom.kv_fp8, self.geom.dims.dtype
+            )));
+        }
+        let g = owl_models::layers::kvshift::KvShiftGeom {
+            hkv: self.geom.dims.hkv,
+            hd: self.geom.dims.hd,
+            page: self.geom.page,
+            x: self.geom.x,
+            half,
+        };
+        g.check().map_err(ModelError::Msg)?;
+        Ok(g)
+    }
+
+    /// 逐层 KV cache K 的**块句柄**(门/诊断:按槽偏移 D2H 读 K 字节)。
+    /// 生产路径不读,只服务于机械门与取证工具。
+    #[allow(dead_code)]
+    pub(crate) fn kv_k_blocks(&self) -> Vec<owl_iface::contract::Bytes> {
+        self.kvs().iter().map(|b| b.k_cache.0.clone()).collect()
+    }
+
     /// 块表叶子(模式相关:paged [1,nb] / legacy [1];run 图闭包用)
     pub(crate) fn bt_leaf(&self) -> TensorOps {
         if self.geom.paged {
@@ -1364,6 +1399,20 @@ impl StatePool {
         if i < self.gdn.snaps.keys.len() {
             self.gdn.snaps.keys[i] = Some(key);
             self.gdn.snaps.last_use[i] = tick;
+        }
+    }
+
+    /// **快照键重挂**(前缀无感删除;2026-10-23):槽上那条快照换身份。
+    ///
+    /// 只动账 —— 内容零搬运(删除是"搬运记忆",状态本身不必重算)。
+    /// `false` = 槽上没有旧键(账/槽不平;调用方查账已确认,属结构性异常)。
+    pub(crate) fn snap_rekey(&mut self, old: SnapKey, new: SnapKey) -> bool {
+        match self.gdn.snaps.keys.iter().position(|k| *k == Some(old)) {
+            Some(i) => {
+                self.gdn.snaps.keys[i] = Some(new);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1623,6 +1672,64 @@ impl StatePool {
         Ok(())
     }
 
+    /// **最终 query replay**:会话格 GDN → 专用 replay 缓冲。
+    pub(crate) async fn capture_replay_snap<D: DeviceClient>(
+        &mut self,
+        face: &mut D,
+        gdn_slot: usize,
+    ) -> Result<()> {
+        let n = self.gdn.gdns.len();
+        let snap = self.draft.replay_snap.as_mut().ok_or_else(|| {
+            ModelError::Msg("replay 快照缓冲未分配([kvmem].query_replay 未开?)".into())
+        })?;
+        let mut copies: Vec<(owl_iface::Bytes, usize, owl_iface::Bytes, usize, usize)> =
+            Vec::with_capacity(n * 4);
+        for (li, g) in self.gdn.gdns.iter().enumerate() {
+            let quads = [
+                (&g.conv_q.0, g.conv_q.1),
+                (&g.conv_k.0, g.conv_k.1),
+                (&g.conv_v.0, g.conv_v.1),
+                (&g.rec.0, g.rec.1),
+            ];
+            for (j, (src, elems)) in quads.iter().enumerate() {
+                let row = elems / self.geom.gdn_slots;
+                let dst = &snap.bufs[li * 4 + j];
+                copies.push(((*src).clone(), gdn_slot * row * 4, dst.0.clone(), 0usize, row * 4));
+            }
+        }
+        face.copy_batch(copies.as_slice()).await?;
+        Ok(())
+    }
+
+    /// **最终 query replay**:replay 缓冲 → 会话格 GDN(反向 D2D)。
+    pub(crate) async fn restore_replay_snap<D: DeviceClient>(
+        &mut self,
+        face: &mut D,
+        gdn_slot: usize,
+    ) -> Result<()> {
+        let n = self.gdn.gdns.len();
+        let snap = self.draft.replay_snap.as_ref().ok_or_else(|| {
+            ModelError::Msg("replay 快照缓冲未分配([kvmem].query_replay 未开?)".into())
+        })?;
+        let mut copies: Vec<(owl_iface::Bytes, usize, owl_iface::Bytes, usize, usize)> =
+            Vec::with_capacity(n * 4);
+        for (li, g) in self.gdn.gdns.iter().enumerate() {
+            let quads = [
+                (&g.conv_q.0, g.conv_q.1),
+                (&g.conv_k.0, g.conv_k.1),
+                (&g.conv_v.0, g.conv_v.1),
+                (&g.rec.0, g.rec.1),
+            ];
+            for (j, (dst, elems)) in quads.iter().enumerate() {
+                let row = elems / self.geom.gdn_slots;
+                let src = &snap.bufs[li * 4 + j];
+                copies.push((src.0.clone(), 0usize, (*dst).clone(), gdn_slot * row * 4, row * 4));
+            }
+        }
+        face.copy_batch(copies.as_slice()).await?;
+        Ok(())
+    }
+
     /// 活跃会话块表 → 持久 bt 块(设备)。图烘焙的是 bt 指针,内容随
     /// 会话切换/块链增长重写(指针稳定 = 图不重捕);f32 过线(契约 5)
     pub(crate) async fn write_bt<D: DeviceClient>(
@@ -1708,7 +1815,6 @@ impl<'a> AllocCtx<'a> {
     /// **决策 + 预算 + 几何**(原 `alloc` 的前半;无任何设备调用)。
     fn build(dims: ModelDims, layer_types: &[bool], plan: &'a PoolPlan) -> Result<Self> {
         let seq_tokens = plan.seq_tokens;
-        let pool_tokens = plan.pool_tokens;
         // 布尔和稀泥废除(2026-10-10):量化 = KvQuant 枚举,投机形态 =
         // SpecMode 枚举(快照/MTP 链/草稿池三件由 mode 派生,互斥不再靠
         // 调用点自洽)
@@ -2356,8 +2462,22 @@ impl DraftBank {
         } else {
             None
         };
+        // 最终 query replay 的 GDN 回滚缓冲(当前仅 spec off 档启用)
+        let replay_snap = if plan.query_replay && paged {
+            let mut bufs = Vec::new();
+            for _ in 0..n_gdn {
+                bufs.push(zero_block(face, dims.nk * dims.hk * 3, "gdn.replay.conv_q").await?);
+                bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.replay.conv_k").await?);
+                bufs.push(zero_block(face, dims.nv * dims.hv * 3, "gdn.replay.conv_v").await?);
+                bufs.push(zero_block(face, dims.nv * dims.hk * dims.hv, "gdn.replay.rec").await?);
+            }
+            Some(SpecSnapBuf { bufs })
+        } else {
+            None
+        };
         Ok(DraftBank {
             spec_snap,
+            replay_snap,
             mtp_kvs,
             dflash_kvs,
             bt_mtp,

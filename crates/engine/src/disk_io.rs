@@ -78,6 +78,25 @@ pub(crate) async fn read_block(path: PathBuf, bytes: usize) -> Result<Vec<u8>, S
     }
 }
 
+/// 把一块内容改名(盘层快照重挂;语义同 [`write_block`] 的原子性)。
+///
+/// 失败**不改账** —— 调用方保留旧键(旧文件、旧路径仍在),按响亮日志走。
+pub(crate) async fn rename_block(from: PathBuf, to: PathBuf) -> Result<(), String> {
+    let label = format!("{} → {}", from.display(), to.display());
+    let joined = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        if let Some(dir) = to.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::rename(&from, &to)
+    })
+    .await;
+    match joined {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("磁盘改名失败({label}):{e}")),
+        Err(e) => Err(format!("磁盘改名任务 join 失败({label}):{e}")),
+    }
+}
+
 /// 删除一批文件(磁盘驱逐;返回真删掉的文件数)。**不报错上抛**:
 /// 文件不在(已被外部清掉)也算腾出成功 —— 账由调用方按计划出。
 pub(crate) async fn remove_files(paths: Vec<PathBuf>) -> usize {

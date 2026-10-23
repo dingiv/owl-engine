@@ -607,6 +607,10 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::MemPoolStats { ack })?.await
     }
 
+    async fn mem_info(&mut self) -> Result<(u64, u64), ModelError> {
+        self.submit(move |ack| Command::MemInfo { ack })?.await
+    }
+
     /// **上传并计算**:一次 pinned 搬运 + 一次发射,序由 server 内部保证。
     /// (E2a:线格式/校验/负门在位;接线 = E2b —— 目前 server 侧响亮拒。)
     async fn upload_and_launch(

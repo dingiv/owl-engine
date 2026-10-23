@@ -34,7 +34,7 @@ use crate::contract::{Dtype, ModelError};
 use crate::layers::decoder::DecoderLayer;
 use crate::layers::embedding::Embedding;
 use crate::layers::rmsnorm::RmsNorm;
-use crate::module::{ForwardCtx, KeyConvention, Loadable, LoaderCtx, LoaderOps, Module, PlanSource};
+use crate::module::{ForwardCtx, KeyConvention, Loadable, LoaderCtx, LoaderOps, Module, PlanSource, QuantPlan};
 use crate::TensorOps;
 
 // ============================================================================
@@ -164,6 +164,18 @@ impl Model {
         plan: impl Into<PlanSource<'a>>,
         head_plan: impl Into<PlanSource<'a>>,
     ) -> Result<Model, ModelError> {
+        Self::new_with_embed(spec, keys, plan, head_plan, None)
+    }
+
+    /// **表计划覆盖**(P8,2026-10-22):`embed_plan = Some(I8W)` ⇒ embed 表
+    /// 走 int8(q/s 派生键),不再装载 f16 表。仅 untied(构造期门)。
+    pub fn new_with_embed<'a>(
+        spec: &ModelSpec,
+        keys: impl KeyConvention + Send + Sync + 'static,
+        plan: impl Into<PlanSource<'a>>,
+        head_plan: impl Into<PlanSource<'a>>,
+        embed_plan: Option<QuantPlan>,
+    ) -> Result<Model, ModelError> {
         let plan: PlanSource<'a> = plan.into();
         let head: PlanSource<'a> = head_plan.into();
         let mut layers = Vec::with_capacity(spec.layer_types.len());
@@ -194,19 +206,17 @@ impl Model {
         // **tied 臂**:表真的要按计划定形 —— GGUF 的 `token_embd` 是量化块
         // (4B = Q6_K)⇒ 槽= 块字节 + 查表自带解量化;HF 一切档位= f16 表。
         // 键 = `KeyConvention::embed_key`(“词表键”的唯一出口)。
+        let table_plan = embed_plan
+            .unwrap_or_else(|| plan.at(&keys.embed_key("weight"), spec.vocab, spec.hidden));
         let embed = if spec.tied {
-            Embedding::new_by_plan(
-                spec.vocab,
-                spec.hidden,
-                plan.at(&keys.embed_key("weight"), spec.vocab, spec.hidden),
-            )?
+            Embedding::new_by_plan(spec.vocab, spec.hidden, table_plan)?
         } else {
             // P1.1:head_vocab < vocab ⇒ 词表切;GGUF 档表/头**两个独立计划**
             Embedding::new_untied_head_two_plans(
                 spec.vocab,
                 spec.head_vocab,
                 spec.hidden,
-                plan.at(&keys.embed_key("weight"), spec.vocab, spec.hidden),
+                table_plan,
                 head.head(spec.head_vocab, spec.hidden),
             )?
         };

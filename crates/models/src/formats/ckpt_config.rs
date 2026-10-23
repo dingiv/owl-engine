@@ -57,6 +57,8 @@ pub struct DflashFacts {
     pub conv_kernel_size: Option<usize>,
     pub selector_rank: Option<usize>,
     pub selector_top_k: Option<usize>,
+    /// 草稿注意力滑窗(`dflash_config.sliding_window`;DFlash2 环容量单源)
+    pub sliding_window: Option<usize>,
     pub target_layer_ids: Vec<usize>,
 }
 
@@ -118,6 +120,7 @@ impl CkptConfig {
             conv_kernel_size: u(d, "conv_kernel_size"),
             selector_rank: u(d, "selector_rank"),
             selector_top_k: u(d, "selector_top_k"),
+            sliding_window: u(d, "sliding_window"),
             target_layer_ids: d
                 .get("target_layer_ids")
                 .and_then(|x| x.as_array())

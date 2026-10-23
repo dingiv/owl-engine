@@ -172,6 +172,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 跨 turn 连续。临时会话终了即焚(表不随 turn 数无界增长)
         if let Some(s) = self.bank.sessions.get_mut(act.session_id) {
             s.commit_turn(&act.prompt_ids, &act.out);
+            // **图像段账写回**(前缀无感删除;2026-10-23):与 `tokens` 同一次
+            // 收口 —— 两处各写一份 = 下一轮删除识别拿错坐标。
+            s.set_img_spans(act.img_spans.clone(), act.img_pads.clone());
             // E2c:块链登记前缀缓存(缓存持引用;会话释放后块仍驻留)。
             // S3-2:登记走 store 的块腿(引用配对在腿内自洽)
             if self.dev.pool.geom.paged {
@@ -203,6 +206,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .unwrap_or_default();
             if !toks.is_empty() {
                 self.write_chain_index(&toks).await?;
+            }
+        }
+        // **索引暂存排空**：正常 prefill 的末边界已清空；这里兜底
+        // abort/短轮 —— 必须在 `release_turn_table` 之前采，物理页还在。
+        if self.boot.cfg.knobs.index_probe {
+            let n_pending = self.sel.pending_index_len();
+            let pending = self.sel.take_index_pending();
+            if !pending.is_empty() {
+                owl_shared::log_debug!(
+                    "idx",
+                    "turn 收口排空索引暂存:{n_pending} 块"
+                );
+                self.collect_index_for_blocks(&pending).await?;
             }
         }
         if act.ephemeral {

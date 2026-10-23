@@ -84,6 +84,8 @@ pub struct StepProbes {
     pub trace_gate: bool,
     /// E3 收编(原热路径散落 var_os;boot 解析一次):DFlash2 诊断/回退族
     pub dflash_probe: bool,
+    /// 末边界额外哈希一个逻辑块的 K/V 页(诊断面;stage-in 内容校验)
+    pub view_hash_block: Option<usize>,
     pub propose_eager: bool,
     pub dflash_eager: bool,
     pub dflash_noencode: bool,
@@ -126,6 +128,7 @@ impl StepProbes {
             probe_every: cfg.spec.probe_every,
             trace_gate: p.trace_gate,
             dflash_probe: p.dflash_probe,
+            view_hash_block: p.view_hash_block,
             propose_eager: p.propose_eager,
             dflash_eager: p.dflash_eager,
             dflash_noencode: p.dflash_noencode,
@@ -177,6 +180,10 @@ pub struct TokenizeReply {
 pub struct RunningEngine<D: DeviceClient> {
     /// boot 期事实(只读;写入只在构造期)
     pub(crate) boot: BootCtx,
+    /// **前缀无感删除的观测账**(2026-10-23):决策事实(删除区间/保留块/
+    /// 平移量/被重转的物理页)。落账在 `scheduler::apply_image_delete`;
+    /// 门与运维共用这一份(**不许再从日志里反推**)。
+    pub(crate) img_evict: ImgEvictLedger,
     /// turn 运行账(turn.rs)
     pub(crate) turns: TurnLedger,
     /// 会话 + 块账房(session.rs;host 侧 —— 两 rank 共用一份)
@@ -192,6 +199,36 @@ pub struct RunningEngine<D: DeviceClient> {
     pub(crate) peer: Option<RankDev<D>>,
 }
 
+/// **前缀无感删除的观测账**(进程内;`Default` = 从未吸收过删除)。
+#[derive(Default, Debug, Clone)]
+pub struct ImgEvictLedger {
+    /// 累计吸收次数(一次 turn 最多一次)
+    pub absorbed: u64,
+    /// 最近一次的决策事实(`None` = 还没吸收过)
+    pub last: Option<ImgEvictTrace>,
+}
+
+/// 最近一次删除的事实(G1 机械门 / 运维取证用)。
+///
+/// 字段目前只被引擎门与未来 `/debug/*` 面板读取;生产热路径不读 ⇒ 这里显式
+/// 允许 dead_code(它是**观测面**的事实契约,不是死代码)。
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ImgEvictTrace {
+    /// 删除区间(旧 token 坐标;页对齐)
+    pub a: usize,
+    /// 删除区间终点(不含;整页数)
+    pub b: usize,
+    /// 复用后缀的整块数
+    pub keep_blocks: usize,
+    /// 位置平移量 `S`(正 = 后缀前移;K 乘 `R(−S)`)
+    pub shift: i64,
+    /// 被原地重转的**物理页**(= 复用后缀页,逻辑序)
+    pub pages: Vec<u32>,
+    /// 设备层快照重挂条数
+    pub rekeyed: usize,
+}
+
 /// **boot 期定型、运行期只读**的事实。
 ///
 /// 为什么单独立户:配置/分词器/探针/boot 序号原来各占一个字段,被 ~150 个
@@ -202,6 +239,9 @@ pub(crate) struct BootCtx {
     pub(crate) cfg: EngineConfig,
     pub(crate) tok: Tokenizer,
     pub(crate) probes: StepProbes,
+    /// 消息开启标记的 token 序列（`[pool].snap_msg_delim` 或模型
+    /// `ChatFormat.im_open` 在 boot 期 tokenize 的结果；只读）。
+    pub(crate) msg_open_ids: Vec<u32>,
     /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
     pub(crate) seq: u64,
 }
@@ -499,6 +539,126 @@ impl<D: DeviceClient> RunningEngine<D> {
         )
     }
 
+    /// **页对齐 pad 律 + 删除重建**(前缀无感删除;2026-10-23)。
+    ///
+    /// 三件事(纯 host、零设备 IO):
+    /// 1. 若会话账里有上轮的图像段:把 `tokens` 剥掉 pad 得到"客户端可见序列",
+    ///    在**文本坐标**里识别"这一轮正好删了一段已标记图像";
+    /// 2. 命中 ⇒ **重建**:`old[..a]`(含旧 pad 块)++ 客户端删点之后的文本
+    ///    —— 删点之前逐字节不变是**构造性保证**(纯 diff 做不到,见模块头注);
+    /// 3. 对整条序列跑 pad 律(继承旧 pad 区间,幂等)。
+    ///
+    /// 未开档 ⇒ 只记 spans(网格/诊断用),**一个 pad 都不加**(逐字节旧行为)。
+    /// 返回 `(ids, spans, pads, deletion)`;`deletion` 交给调度面做取链/拼接。
+    fn image_pad_law(
+        &self,
+        session: Option<u64>,
+        ids: Vec<u32>,
+        images: &[crate::turn::TurnImage],
+    ) -> Result<(
+        Vec<u32>,
+        Vec<crate::img_evict::ImgSpan>,
+        Vec<(usize, usize)>,
+        Option<crate::img_evict::TextDelete>,
+    )> {
+        // 本轮**一张图都没有**也要往下走:删掉历史里**最后一张**图时,新 prompt
+        // 就是纯文本 —— 吸收路径仍必须能识别(否则"删最后一张"永远重算)。
+        let Some(vlm) = self.dev.boot.vlm.as_ref() else {
+            return if images.is_empty() {
+                Ok((ids, Vec::new(), Vec::new(), None))
+            } else {
+                Err(ModelError::Msg(
+                    "image_pad_law: 请求带图但本 rank 无视觉档(提交门应已拒)".into(),
+                ))
+            };
+        };
+        let image_token = vlm.cfg().image_token;
+        let grids: Vec<owl_models::layers::vision::GridThw> =
+            images.iter().map(|i| i.image.grid).collect();
+        let marks: Vec<bool> = images.iter().map(|i| i.evict).collect();
+        if images.is_empty() && !self.boot.cfg.knobs.image_evict {
+            return Ok((ids, Vec::new(), Vec::new(), None));
+        }
+        let page = if self.boot.cfg.knobs.image_evict {
+            self.dev.pool.geom.page
+        } else {
+            0
+        };
+        let one = |text: &str| -> Option<u32> {
+            match self.boot.tok.try_encode(text) {
+                Ok(v) if v.len() == 1 => Some(v[0]),
+                _ => None,
+            }
+        };
+        let (vs, ve, pad) = if page == 0 {
+            (None, None, 0u32)
+        } else {
+            let pad = one("\n").ok_or_else(|| {
+                ModelError::Msg(
+                    "image_pad_law: `\n` 不是单 token —— 页对齐 pad 律要求恰 1 token 的 pad"
+                        .into(),
+                )
+            })?;
+            (one("<|vision_start|>"), one("<|vision_end|>"), pad)
+        };
+
+        // ── ① 删除识别 + 重建(只在"档位开 + 会话账里有上轮图像段") ──
+        let mut deletion = None;
+        let mut input = ids;
+        let mut inherited: Vec<(usize, usize)> = Vec::new();
+        if page > 0 {
+            if let Some(sid) = session {
+                if let Some(s) = self.bank.sessions.get(sid) {
+                    if !s.tokens.is_empty() && !s.img_spans.is_empty() {
+                        let old_text = crate::img_evict::unpad(&s.tokens, &s.pads)
+                            .map_err(ModelError::Msg)?;
+                        if let Some(hit) =
+                            crate::img_evict::detect_text_delete(&old_text, &input, &s.img_spans)
+                        {
+                            let rebuilt = crate::img_evict::rebuild_after_delete(
+                                &s.tokens, &input, &hit,
+                            )
+                            .map_err(ModelError::Msg)?;
+                            // 只继承**删点之前**的 pad 块(删点之后由本轮的 pad 律重算)
+                            inherited = s
+                                .pads
+                                .iter()
+                                .copied()
+                                .filter(|(_, hi)| *hi <= hit.a)
+                                .collect();
+                            if hit.a % page != 0 {
+                                owl_shared::log_warn!(
+                                    "img-evict",
+                                    "识别命中但删点 {} 不落页边界(页 {})⇒ 不吸收",
+                                    hit.a,
+                                    page
+                                );
+                            } else {
+                                input = rebuilt;
+                                deletion = Some(hit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── ② pad 律(幂等;继承旧 pad 区间) ──
+        let seq = crate::img_evict::pad_image_spans(
+            &input,
+            &marks,
+            &grids,
+            image_token,
+            vs,
+            ve,
+            page,
+            pad,
+            &inherited,
+        )
+        .map_err(ModelError::Msg)?;
+        Ok((seq.ids, seq.spans, seq.pads, deletion))
+    }
+
     /// 同 [`Self::submit_session_ex`],但携带 per-turn 可选项(采样参数/停止串/种子;
     /// AGT-06)。`ignore_eos` 在 `opts` 内。
     pub fn submit_session_opts(
@@ -559,8 +719,28 @@ impl<D: DeviceClient> RunningEngine<D> {
                     "submit: VLM 图像首版不支持合批(max_batch > 1)".into(),
                 ));
             }
+            // **可删标记必须有人接**(前缀无感删除;2026-10-23):客户端打了
+            // `owl_evict` 而引擎档没开 = 静默失约(用户以为删了不重算,
+            // 实际每轮全量重灌)⇒ 提交边界**响亮拒**,不静默忽略。
+            if self.boot.cfg.knobs.image_evict {
+                if !self.dev.pool.k_shift_supported() {
+                    return Err(ModelError::Msg(format!(
+                        "submit: [pool] image_evict = true 但本池不支持 K 重转\
+                         (paged={} kv_fp8={} dtype={:?})",
+                        self.dev.pool.geom.paged,
+                        self.dev.pool.geom.kv_fp8,
+                        self.dev.pool.geom.dims.dtype
+                    )));
+                }
+            } else if opts.images.iter().any(|i| i.evict) {
+                return Err(ModelError::Msg(
+                    "submit: 图像带 evict(可删)标记,但本档 [pool] image_evict = false\
+                     —— 要么把档位打开,要么去掉标记(不许静默忽略)"
+                        .into(),
+                ));
+            }
         }
-        let prompt_ids = {
+        let raw_ids = {
             // 诊断开关(knobs.raw_completion):裸续写,绕过 chat 模板 ——
             // 模型健康度鉴别(模板态病 vs 权重病)的 A/B 臂
             // §三十二:含 im_start = 上层已渲染完整 chat 模板(OpenAI 多轮
@@ -586,9 +766,31 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
             self.boot.tok.encode(&wrapped)
         };
+        // **前缀无感删除的页对齐 pad 律**(2026-10-23):只对**带标记**的图像段
+        // 做(且只在 `[pool] image_evict` 开时)—— 未标记/未开档 = 逐字节旧行为。
+        // 产出的 `spans` 随 turn 走到收口,写回会话账(下一轮删除识别的唯一输入)。
+        let (prompt_ids, img_spans, img_pads, deletion) =
+            self.image_pad_law(session, raw_ids, &opts.images)?;
         if prompt_ids.is_empty() {
             return Err(ModelError::Msg("submit: 空 prompt".into()));
         }
+        // **消息边界快照点**(2026-10-24):页对齐 token offset，供
+        // `prefill_step_chunk_msg` 切块与 `capture_gdn_snap` 的 snap_keep
+        // 共用。`open_ids` 来自配置/模型声明，不在扫描函数里写死。
+        let msg_snaps = if self.boot.cfg.knobs.snap_msg_boundary
+            && self.boot.cfg.knobs.prefix_cache
+            && self.dev.pool.geom.paged
+            && self.dev.pool.snap_capacity() > 0
+        {
+            crate::msg_boundary::message_snap_points(
+                &prompt_ids,
+                &self.boot.msg_open_ids,
+                self.dev.pool.geom.page,
+                self.boot.cfg.knobs.snap_msg_min_gap,
+            )
+        } else {
+            Vec::new()
+        };
         // 准入地板(S3b §23.5 / A7-bis 接线 2026-10-19):
         //
         // 非 Strict 地板 = "允许选择层按需物化" ⇒ **必须有执行面**才收:
@@ -720,6 +922,10 @@ impl<D: DeviceClient> RunningEngine<D> {
             ephemeral,
             spec: TurnSpec { prompt, max_new, ignore_eos: opts.ignore_eos },
             prompt_ids,
+            msg_snaps,
+            img_spans,
+            img_pads,
+            deletion,
             opts,
             cached: cached_hit,
             submitted_ms: now_ms(),
@@ -1024,6 +1230,17 @@ impl<D: DeviceClient> RunningEngine<D> {
         out
     }
 
+    /// **设备显存实况**(只读;`/debug/vram` 的驱动残差):`(free, total)`。
+    pub async fn mem_info(&mut self) -> std::result::Result<(u64, u64), String> {
+        self.dev
+            .graphs
+            .session
+            .face_mut()
+            .mem_info()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// **默认池缓存回收(逐 rank)** —— turn 收尾 / 压力旁路调。
     ///
     /// 语义:`cuMemPoolTrimTo(0)` 把池内**已 free 的缓存页**还给 OS(不改块账)。
@@ -1144,7 +1361,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 首 turn 会少腾槽 ⇒ 批步中途 Exhausted 把整批打掉)
         let mut need = 0usize;
         for act in self.turns.actives() {
-            let target = match Self::prefill_step_chunk(
+            let target = match Self::prefill_step_chunk_msg(
                 act.fed,
                 act.prompt_ids.len(),
                 self.boot.cfg.prefill_chunk,
@@ -1154,6 +1371,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
+                &act.msg_snaps,
+                self.boot.cfg.knobs.snap_msg_min_span,
             ) {
                 Some(chunk) => act.fed + chunk,
                 None => act.fed + self.dev.spec_rt.depth + 1, // 生成相位(act.fed = pos)
@@ -1926,7 +2145,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ① 换出/驱逐(**两腿同单**:KV 链/叶 + GDN 快照;§30)
         for item in &verdict.out {
             match item {
-                owl_store::EvictOut::Kv { chain, sink, .. } => match sink {
+                owl_store::EvictOut::Kv { chain, sink, span } => match sink {
                     Sink::Host => {
                         let relief0 = self.bank.rel.leg.host_relief_blocks();
                         let (blocks, pieces, table) = {
@@ -1975,8 +2194,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                         a.offloaded +=
                             owl_store::commit_offload(&mut self.bank.rel.leg, &blocks, table)?;
                     }
-                    Sink::Drop => match self.bank.rel.leg.drop_cached(*chain) {
-                        Ok(()) => a.dropped += 1,
+                    // **整枝塌缩**:一张票可带 `span` 块(叶→根,到分叉点为止);
+                    // 逐块校验引用(活跃面停),丢掉的块数如实记账。
+                    Sink::Drop => match self.bank.rel.leg.prune_branch(*chain, (*span).max(1)) {
+                        Ok(n) => a.dropped += n,
                         Err(owl_store::StoreError::Busy(_)) => a.skipped_busy += 1,
                         Err(e) => return Err(e.into()),
                     },

@@ -221,6 +221,30 @@ impl StateStore {
         self.snaps.get(&key).map(|s| s.tier)
     }
 
+    /// **快照键重挂**(前缀无感删除;2026-10-23):同一条快照换一个边界身份。
+    ///
+    /// 用途:删掉中段之后,后缀的链身份整体变了(父链哈希变)—— 但**状态内容
+    /// 仍在原槽/原缓冲/原文件**(删除是"搬运记忆",不是重算)。重挂只动账,
+    /// 内容零搬运;层随条目**原样跟着走**(设备/宿主/盘三层一视同仁)。
+    ///
+    /// 注:本方法只管**账**。内容侧的重挂由调用方分头做
+    /// (`Rel::rekey_snap` 管宿主、engine 的盘层重挂走 plan/commit + rename、
+    /// 设备槽由池按 key 重标记)—— 三者都做完才算"新身份完整在场"。
+    ///
+    /// 语义边界(响亮):
+    /// - `old` 不在账 ⇒ `false`(调用方当"没重挂",不许猜);
+    /// - `new` 已在账 ⇒ `false`(拒绝覆盖 —— 否则账与槽位/文件映射会分叉)。
+    pub fn rekey_snap(&mut self, old: SnapKey, new: SnapKey) -> bool {
+        if self.snaps.contains_key(&new) {
+            return false;
+        }
+        let Some(e) = self.snaps.remove(&old) else {
+            return false;
+        };
+        self.snaps.insert(new, e);
+        true
+    }
+
     /// 触达快照(命中新鲜度)。
     pub fn touch(&mut self, key: SnapKey) {
         self.tick += 1;
@@ -330,6 +354,35 @@ mod tests {
         assert_eq!(s.borrow_row().expect("再借"), 0, "还回的行号应可复用");
         s.return_row(r1, None).expect("无快照也行");
         assert_eq!(s.rows_free(), 1);
+    }
+
+    /// **快照键重挂**(前缀无感删除):只动账;三个响亮拒绝各一例。
+    #[test]
+    fn rekey_snap_moves_account_without_copy() {
+        let mut s = StateStore::new(1, 1);
+        let old = SnapKey::at_boundary(ChainHash::new(1));
+        let new = SnapKey::at_boundary(ChainHash::new(2));
+        assert!(!s.rekey_snap(old, new), "不在账 ⇒ false(不许猜)");
+        s.register_snap(old, 4096, Tier::Gpu, SnapDurability::Durable);
+        assert!(s.rekey_snap(old, new), "设备层在账 ⇒ 重挂");
+        assert_eq!(s.locate(old), None, "旧键必须消失");
+        assert_eq!(s.locate(new), Some(Tier::Gpu), "新键拿同一份账");
+        assert_eq!(s.snap_bytes(new), Some(4096), "字节随账走");
+        // 目标已存在 ⇒ 不许覆盖(账与槽位映射会分叉)
+        let third = SnapKey::at_boundary(ChainHash::new(3));
+        s.register_snap(third, 1, Tier::Gpu, SnapDurability::Durable);
+        assert!(!s.rekey_snap(third, new), "目标已在账 ⇒ false");
+        // 宿主/盘层也重挂(内容侧由 `Rel::rekey_snap` / 盘层 plan+commit 负责)
+        let host = SnapKey::at_boundary(ChainHash::new(4));
+        s.register_snap(host, 1, Tier::Host, SnapDurability::Durable);
+        let host_new = SnapKey::at_boundary(ChainHash::new(5));
+        assert!(s.rekey_snap(host, host_new), "宿主层在账 ⇒ 重挂");
+        assert_eq!(s.locate(host_new), Some(Tier::Host), "层随账走");
+        // 盘层同理
+        let disk = SnapKey::at_boundary(ChainHash::new(6));
+        s.register_snap(disk, 1, Tier::Disk, SnapDurability::Durable);
+        assert!(s.rekey_snap(disk, SnapKey::at_boundary(ChainHash::new(7))));
+        assert_eq!(s.locate(SnapKey::at_boundary(ChainHash::new(7))), Some(Tier::Disk));
     }
 
     #[test]

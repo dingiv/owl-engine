@@ -568,7 +568,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     })
                     .collect();
                 let mut top: Vec<(f32, usize)> = row0.into_iter().collect();
-                top.select_nth_unstable_by(7, |a, b| b.0.total_cmp(&a.0));
+                // 诊断面**不许 panic**:全非有限/空 logits(实测 NaN 步)时
+                // `select_nth_unstable_by(7)` 会越界崩引擎 —— 先按实际长度夹紧。
+                if !top.is_empty() {
+                    let k = top.len().saturating_sub(1).min(7);
+                    top.select_nth_unstable_by(k, |a, b| b.0.total_cmp(&a.0));
+                }
                 top.truncate(8);
                 top.sort_by(|a, b| b.0.total_cmp(&a.0));
                 owl_shared::log_debug!("dflash-probe", "slot0 lm_head top8 = {:?}", top);

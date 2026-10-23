@@ -8,7 +8,7 @@
 //! budget       = target_total − reserve − fixed − live(权重/运行底价)
 //! cap          = budget / per_tok                （治理器会夹池到这个上限）
 //! usable       = budget − activation − stability_margin
-//! pool_tokens  = usable / per_tok                （再按 4k 向下取整）
+//! cap          = budget / per_tok                （治理器上限;物理池 = min(cap, ctx×并发)）
 //! ```
 //!
 //! 治理器**不**知道 `activation`(chunk 工作集)与长跑泄漏,所以手写档要么
@@ -101,7 +101,7 @@ pub struct MemoryEstimate {
     pub stability_margin_bytes: u64,
     /// 治理器预算(不含 activation/margin)
     pub budget_bytes: u64,
-    /// 治理器池上限(= budget / per_tok;手写值超过它会被静默夹)
+    /// 治理器池上限(= budget / per_tok;物理池不会超过它)
     pub cap_tokens: usize,
     pub pool_tokens: usize,
     pub pool_bytes: u64,
@@ -234,9 +234,10 @@ pub fn solve_max(inp: &MemoryInputs, model_max: usize, overcommit: bool) -> Resu
     }
 }
 
-/// 用**最终**配置值算一份完整估算(显式 ctx/pool 也走这里)
+/// 用**最终**配置值算一份完整估算(显式 ctx 也走这里)
 ///
-/// `context_tokens`/`pool_tokens` 由 resolver 定;本函数只负责对账与告警。
+/// `context_tokens` 由 resolver 定;`pool_tokens` 只是逻辑下限(物理池 = min(cap, ctx×并发))。
+/// 本函数只负责对账与告警。
 pub fn estimate(
     inp: &MemoryInputs,
     context_tokens: usize,
@@ -264,10 +265,11 @@ pub fn estimate(
             context_tokens, cap, budget as f64 / GB, per_tok
         ));
     }
-    // ② 显式池超过 cap:治理器会**静默夹**,这里显式告警(不拒 —— 高级覆盖可能是有意的)
+    // ② 逻辑池(上下文×并发)超过 cap:物理池会被夹到 cap;超卖档属预期
+    // ③ 逻辑池小于 cap:物理池按逻辑池(上下文×并发)封顶,不再吃满整卡
     if pool_tokens > cap {
         notes.push(format!(
-            "pool_tokens {} > 治理器上限 {} ⇒ 启动会被夹到 {} tok(显式覆盖请自行确认)",
+            "逻辑池 {} tok > 治理器上限 {} tok ⇒ 物理池自动取 {} tok(超卖档属预期)",
             pool_tokens, cap, cap
         ));
     }

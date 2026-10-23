@@ -38,9 +38,9 @@
 
 | # | 状态 | 落点 | 几何/粒度 | dtype | 容量与上限 | 可共享 |
 |---|---|---|---|---|---|---|
-| ① | **attention KV** | `engine/src/state.rs::StatePool.kvs` | paged classic `kc [nb,Hkv,hd/x,page,x]`、`vc [nb,Hkv,hd,page]`;策略表 `models::module::kv_paged_policy(dtype)` 分发(legacy token-major 为回退) | 随 `spec.dtype` 或 fp8(U32 承载 1B/elem,元素数 ÷4) | `nb=ceil(pool_tokens/page)`(+1 dump page);`pool_tokens` 缺省 = **2× 单会话容量**,再被 `vram_target` 预算夹 | ✅ 块级 ref-count(≥2 = 前缀共享) |
+| ① | **attention KV** | `engine/src/state.rs::StatePool.kvs` | paged classic `kc [nb,Hkv,hd/x,page,x]`、`vc [nb,Hkv,hd,page]`;策略表 `models::module::kv_paged_policy(dtype)` 分发(legacy token-major 为回退) | 随 `spec.dtype` 或 fp8(U32 承载 1B/elem,元素数 ÷4) | `nb=ceil(pool_tokens/page)`;2026-10-22 起 `pool_tokens` 配置项删除 ⇒ `nb = 剩余显存自动 cap`(页对齐;`max_seq` 只是单请求上限) | ✅ 块级 ref-count(≥2 = 前缀共享) |
 | ② | **GDN/线性注意力状态** | `StatePool.gdns`(每 GDN 层 4 块:`conv_q/conv_k/conv_v/rec`) | 行宽 = `elems/gdn_slots`;**一格一会话** | **恒 f32** | 格数 = `knobs.gdn_slots`(缺省 8)⇒ **并发上限被格数钉死**(`session.rs` 耗尽报错);27B `rec` ≈ 1MiB/格/层 × 18 层 | ❌ 独占;可**快照** |
-| ③ | **草稿 KV** | `StatePool.mtp_kvs` / `StatePool.dflash_kvs` | MTP:1 层独立页池;DFlash2:5 层 × (8 头 × hd128) | MTP = 主池 dtype;DFlash2 = BF16 或 fp8(`OWL_DFLASH_KV_FP8`) | 两者都**按 `pool_tokens` 全额预留**(无按需/降级账) | ❌(MTP **不接前缀缓存** —— 依赖 hidden,不可 token 哈希) |
+| ③ | **草稿 KV** | `StatePool.mtp_kvs` / `StatePool.dflash_kvs` | MTP:1 层独立页池;DFlash2:5 层 × (8 头 × hd128) | MTP = 主池 dtype;DFlash2 = BF16 或 fp8(`OWL_DFLASH_KV_FP8`) | MTP 按池容量全额预留;**DFlash2 2026-10-22 起按检查点 `sliding_window` 环形**(2048 → 固定 ~40MiB;写槽 = 逻辑位 % 窗口;自块/被拒行走环外 scratch) | ❌(MTP **不接前缀缓存** —— 依赖 hidden,不可 token 哈希) |
 | ④ | **视觉塔** | `models/src/layers/vision.rs` + `models/src/vlm.rs` | 塔权重 `model.visual.*` + **每图一次前向**;输出 `[n_img,D]` 经 `image_scatter` 注入文本序列 | — | 图像 token 的 KV **落进主池**(⇒ 天然可前缀复用);塔自身无驻留 KV | ✅(经文本池) |
 | ⑤ | **GDN 快照池** | `StatePool.snaps`(snap_max)+ `spec_snap` | key = **链尾物理块 id**(内容身份);行宽同 ②;D2D 行拷贝 | f32 | `snap_max` 槽,**LRU 换 key 覆盖写**(零 alloc) | —(是"状态续跑"的钥匙) |
 
@@ -65,8 +65,8 @@
    两条腿在不在"的统一判定与统一换出序 ⇒ 混合架构只能要么全在、要么全无),
    **②各自只有显存一层** ⇒ 谁都换不出去。llama.cpp 侧的完整判例在册
    (外部存档:llama.cpp《mtmd-hybrid-缓存失效-排查实录》——中部断前缀 = 全量重灌)。
-3. **草稿池无账**:③ 的两个池都按 `pool_tokens` 全额预留,不吃"按需/切分/降级"
-   的治理 ⇒ 有 draft 的档位相当于第二个主池。
+3. **草稿池无账**:MTP ③ 仍按池容量全额预留;DFlash2 已改环形
+   (固定 ~40MiB,不再随 ctx 线性)。
    附带:**固定面 17.9G live**(权重账面 13.7G,实际 ~17.5G,**~2G 待审计**)
    —— 归因六件套已就位,可先清(见 §6 刀序 S0)。
 
@@ -568,6 +568,64 @@ XQA 路径 = `xqa_seq`/页表),因此有一条更便宜的路:
 4. **磁盘格式**:是否与 llama.cpp 的 checkpoint 形态对齐(跨引擎可读)—— 二期再议;
 5. **草稿池的前缀语义**:MTP 不可 token 哈希(依赖 hidden)⇒ 它的"命中"需要别的身份
    (e.g. hidden 指纹);S5 立项时单独设计。
+
+### 树形分叉与前缀缓存的淘汰规则（2026-10-23）
+
+**结构**：前缀缓存是**内容身份树**（`hash_block(parent, tokens)`，见 `kv/tree.rs`）——
+一个节点 = 一个 32-token 块；不同后续分叉 = 同一节点的多个**孩子**。共享前缀是
+**同一条目**（一份池引用），不是复制。跨会话/跨分支命中走这条树。
+
+**淘汰只有两条规则**：
+
+1. **只有叶可逐**（结构律）：父节点被逐 ⇒ 整条子树孤儿化，所以 `PrefixTree`
+   只把 `children == 0` 的条目放进候选。共享前缀在**任一分支还活着**时都不是叶
+   ⇒ 不会被逐；直到最后一枝也走了，它才变成叶、成为候选。
+2. **叶之间按"这一枝有多冷"排**（策略律）：会话之间按该会话最冷的候选（冷会话
+   先，无主最后），会话内交给 `EvictPolicy`（缺省 LRU = `last_use` 最老先走）。
+
+> ⚠️ **2026-10-23 改判**：旧实现把 `depth` 当**全局主键**（深者先逐）。它的本意是
+> "同一会话先削末端"，但在树形分叉下 `depth` 与冷热**无关**：会把**刚用过的活
+> 尾巴**先逐掉、却留下一条更冷更短的枝（与快照面同一天修掉的是同一个病）。
+> `depth` 仍记账（诊断），**不再参与排序**。门：
+> `hooks::tests::{branch_victim_is_the_coldest_not_the_deepest, cold_session_is_evicted_before_hot_one}`
+> + `kv::tree::tests::branches_share_prefix_and_evict_leaf_first`。
+
+**整枝塌缩（批量过期，2026-10-23）**：Drop 票的 `span` 现在可以 >1 ——
+`PrefixTree::collapsible_span(tail)` 从叶往上只走"**父无兄弟**"的唯一子链（遇分叉点
+即停），`KvStore::prune_branch(tail, span)` 一次丢完整段（每步仍逐叶、仍校验槽引用
+== 1，活跃面停）。**只在没有宿主/磁盘层可搬时启用**（`room.host_kv_slots == 0 &&
+room.disk_kv_slots == 0`）：有分层时保持逐块，让链先缩小到装得进宿主、再由下沉/搬盘
+接走（内容优先保留，判例 `drop_span_stays_one_when_a_content_preserving_tier_exists`）；
+没有分层时逐块要 O(深度) 个调度轮（旧行为），整枝一次丢才合理（判例
+`cold_deep_branch_collapses_in_one_planning_round` + `prune_branch_stops_at_the_branch_point`）。
+容量裁剪（`trim`/`ensure_for_len` 兜底）的守卫也从 `2·叶数+8` 改成 `n + 2·叶数+8`，
+深链能在**同一次调用**里一路走上去（旧守卫 ~10 步就要拖很多拍）。
+
+**整枝塌缩开关**（`[kvmem].bulk_drop_when_tier_full`，缺省 `false`）：有宿主/磁盘层
+且**这一轮装得下整链**时保持逐块（内容优先保留：缩小 → 下沉 → 搬盘）；**装不下
+整链**且开关打开时才允许一张 `span = collapsible_span` 的票整段丢。没有分层的档位
+本来就走整枝。**淘汰只看时间**（新鲜度/LRU），不做"内容贵不贵"的加权（2026-10-23
+用户裁决：缓存的价值就是"多快会被再用"，不引入第二套价值判断）。
+
+**分支复用的另一个闸门（GDN）**：命中（`match_prefix`）是纯树查询，分支能命中多少
+块就能报多少；但**复用面**还要 `reuse_face` 在"最后一个命中边界"上有 **GDN 快照**
+（混合模型的递推态不能从 KV 反推）。所以：
+
+- 分叉点落在**上一轮的页对齐尾边界**（最常见的"前缀 + 不同尾巴"形态）⇒ 命中即复用。
+  实测（0.8B）：A 只发共享前缀（155 tok，尾边界 128 拍快照）；B/C 各自加不同尾巴
+  （163 tok）⇒ 两者都 `cached=128`，**跨会话跨分支**共用同一份前缀。
+- 分叉点落在**块中间**（在一条消息内部改字）⇒ `match_prefix` 仍能命中整块前缀，
+  但那个边界没有快照 ⇒ `reuse_face` 把复用面裁到 0（全量重灌）。这是**命中率**
+  限制，不是正确性问题；候选改进 = "分支锚点"快照（在消息边界预拍）另案。
+
+### 快照槽位出序（2026-10-23 改判）
+
+快照槽满时的出序**不再沿用 KV 块的"同会话末端先削"**：KV 块是父链结构（父被逐
+⇒ 子不可达），快照按自己的**边界身份独立键控**，逐浅的不会让深的失效；而"末端
+先削"恰好会先逐掉最有用的一条 —— **会话上一轮的尾巴**（增量续写的前缀复用面 +
+前缀无感删除的 GDN 恢复点）。现行 `hooks::order_snap_victims` = **Transient 最前 +
+其余按 `EvictPolicy`（缺省 LRU）**；KV 腿的出序不变。实测：滑窗 3 图 12 轮，
+修复前第 7 轮命中塌到 0，修复后每轮 `cached` 稳定 +32 / `prefill` 恒定。
 
 ## 8. 施工单(S0 → S2b;每步 = 交付物 + 门 + 证据)
 
@@ -2626,11 +2684,11 @@ engine **59**(+ `disk_chain_index_enables_cross_restart_reuse`:turn 写索引 �
 26–27B 双卡档"装载 20 s + 每请求 2.7 s + 卡常被同侪占",不适合频繁验证存储层。改用:
 
 ```text
-0.8B + 单卡(ordinal 3, 3080 20G) + 池 16 页 + host/disk 各 16 MiB + prefix_cache_share 0.9
+0.8B + 单卡(ordinal 3, 3080 20G) + 池 16 页 + host/disk 各 16 MiB(当时 prefix_cache_share=0.9;2026-10-22 已退役)
 ⇒ 每请求 0.2 s,几次请求就把"设备→宿主→磁盘"三级全部触发,重启也在 1 s 级
 ```
 
-**纪律**:①配额要容得下最长链(见 §31.8 配置律);②`prefix_cache_share` 拿高
+**纪律**:①配额要容得下最长链(见 §31.8 配置律);②缓存可占整池(2026-10-22 起)
 (0.9)可让设备池更快紧;③同 prompt 发两次看 `usage.prompt_tokens_details.cached_tokens`
 (第一次 0、第二次 >0 即命中);④停服务用 `ss -ltnp | grep <port>` 拿**真 pid**
 (`setsid bash -c '…server…' &` 的 `$!` 是 bash,不是 server)。

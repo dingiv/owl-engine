@@ -976,7 +976,10 @@ pub async fn cpu_mock_state_leg_probe() {
 /// (账 = host/Index)。门 = ①索引块数/体量(报告 + `Index` 行)②幂等(重复边界不重复登记)
 /// ③**位置不变性**(同一段内容在不同起始位置 ⇒ 同一 `k̄`)—— 后者需要真 K,
 /// 故在 GPU 档打印对照值(CPU mock 的 K 恒零,只验链路)。
-async fn index_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
+async fn index_probe_scenario<D: DeviceClient>(
+    running: &mut RunningEngine<D>,
+    expect_nonzero: bool,
+) {
     let _before = running.bank.rel.index_bytes();
     // 生成段要够长:页边界(32)才出块 ⇒ 才触发采集
     let (_, tid) = running
@@ -1012,6 +1015,13 @@ async fn index_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
     );
     assert!(blocks > 0, "开采集后应有块进索引(块边界事件未触发?)");
     assert_eq!(after, blocks * per_block, "索引体量 = 块数 × 每块字节");
+    if expect_nonzero {
+        // 真卡档:索引必须来自真实 K（全零 = GPU 路径/切片偏移失守）
+        let ix = running.bank.rel.index.as_ref().expect("索引账在场");
+        let first = ix.evict_candidates(&[]).first().map(|(h, _, _)| *h).expect("至少一块");
+        let row = ix.block_k_bar(first).expect("块索引面");
+        assert!(row.iter().any(|v| *v != 0), "索引面全零:GPU Mean-K 输出未落地");
+    }
     assert!(
         rep.tiers.rows.iter().any(|r| r.kind == owl_store::AssetKind::Index),
         "报告应有 Index 行(host 层)"
@@ -1929,7 +1939,7 @@ pub async fn gpu_08b_index_probe() {
     let mut engine = Engine::new(index_probe_config(ordinal)).expect("构造");
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
-    index_probe_scenario(&mut running).await;
+    index_probe_scenario(&mut running, true).await;
 }
 
 /// **CPU mock 档的索引采集场景**(无卡:验链路;K 恒零 ⇒ 数值无意义)。
@@ -1946,7 +1956,7 @@ pub async fn cpu_mock_index_probe() {
     let mut engine = Engine::on(index_probe_config(0), face).expect("构造(CPU mock)");
     let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
-    index_probe_scenario(&mut running).await;
+    index_probe_scenario(&mut running, false).await;
 }
 
 /// 索引探针档(小池 + 开采集;prompt 短 ⇒ 靠 decode 页边界出块)
@@ -1955,6 +1965,9 @@ fn index_probe_config(ordinal: usize) -> EngineConfig {
     knobs.pool_tokens = Some(256);
     knobs.gdn_slots = 8;
     knobs.index_probe = true;
+    // **廉价边界暂存路径**（P1）：每 4 个边界才完整采集一次；
+    // 本测试的 prompt 会跨多个边界，从而覆盖 push/take/末边界排空。
+    knobs.recall_every = 4;
     // 索引账落在 store 的 **host 层总账**上(与 KV/快照分片共用总账;
     // 索引自己的淘汰序 = 近期 + 累积频率,见 `MeanKIndex::evict_candidates`)
     knobs.snap_host_mb = 64;
@@ -4286,6 +4299,23 @@ fn dense_floor_mib_converts_up_to_pages() {
     assert_eq!(EngineKnobs::dense_floor_with_mib(0, mib), TurnFloor::Pages(0));
 }
 
+/// **快照重挂层分派**(前缀无感删除):四层各一条路,账不平 = 不重挂。
+/// 这是`plan_image_delete` 的唯一判据(设备槽在场与否由调用方传入)。
+#[test]
+fn snap_rekey_target_dispatch_law() {
+    use crate::scheduler::{snap_rekey_target, RekeyTarget};
+    use owl_store::Tier;
+    assert_eq!(snap_rekey_target(Some(Tier::Gpu), true), RekeyTarget::Device);
+    assert_eq!(
+        snap_rekey_target(Some(Tier::Gpu), false),
+        RekeyTarget::Skip,
+        "账说设备、槽上没有 ⇒ 击罒不平:不重挂"
+    );
+    assert_eq!(snap_rekey_target(Some(Tier::Host), false), RekeyTarget::Host);
+    assert_eq!(snap_rekey_target(Some(Tier::Disk), false), RekeyTarget::Disk);
+    assert_eq!(snap_rekey_target(None, true), RekeyTarget::Skip, "不在账 ⇒ 不重挂");
+}
+
 /// **装配期单源派生**:一个 `workspace_per_req` 同时落 `select_blocks` 与
 /// 地板页数;显式 MiB 优先(页宽由池给)。三件同源 = 不再各处各算一遍。
 #[test]
@@ -4316,6 +4346,22 @@ fn derive_turn_ws_sets_blocks_and_floor_from_one_source() {
     let mut k = EngineKnobs { kvmem_virtualization: true, ..Default::default() };
     k.workspace_per_req = 64; // 2 页 < sink2+recent4 = 6 页
     assert!(EngineKnobs::derive_turn_ws(64, 32, page_bytes, &mut k).is_err());
+    // ⑤ verify 视图只能裁、不能放大
+    let mut k = EngineKnobs { kvmem_virtualization: true, ..Default::default() };
+    k.workspace_per_req = 640;
+    k.verify_view_tokens = 1024;
+    assert!(EngineKnobs::derive_turn_ws(640, 32, page_bytes, &mut k).is_err());
+}
+
+/// **索引暂存批上限**:选择可以 r16，但索引 D2H 不能跟着 16 chunk 攒
+/// （64 页/批是池下限里的驻留尾上限）。r1/r4/r16 三档钉住派生。
+#[test]
+fn index_cadence_caps_pending_batch() {
+    let mut k = EngineKnobs::default();
+    for (recall, want) in [(1, 1), (2, 2), (4, 4), (6, 4), (16, 4)] {
+        k.recall_every = recall;
+        assert_eq!(k.index_cadence(), want, "recall_every={recall}");
+    }
 }
 
 // ===========================================================================
@@ -4532,7 +4578,7 @@ pub async fn gpu_vlm_image_baseline() {
             Some(6),
             prompt.as_str(),
             8,
-            crate::turn::TurnOpts { images: vec![img], ..Default::default() },
+            crate::turn::TurnOpts { images: vec![img.into()], ..Default::default() },
         )
         .expect("提交");
     let out: Result<String, String> = loop {
@@ -4572,7 +4618,7 @@ pub async fn gpu_vlm_image_baseline() {
                 Some(9),
                 prompt.as_str(),
                 8,
-                crate::turn::TurnOpts { images: vec![small], ..Default::default() },
+                crate::turn::TurnOpts { images: vec![small.into()], ..Default::default() },
             )
             .expect("小网格提交");
         let txt = loop {
@@ -4657,7 +4703,7 @@ pub async fn gpu_vlm_first_turn_probe(first_image: bool) {
     for (idx, with_img) in plan.into_iter().enumerate() {
         let idx = idx + 1;
         let (prompt, images) = if with_img {
-            (sys_img.clone(), vec![mk_img(0.2)])
+            (sys_img.clone(), vec![mk_img(0.2).into()])
         } else {
             (sys_text.clone(), Vec::new())
         };
@@ -4760,7 +4806,7 @@ pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
     for (idx, with_img) in plan.into_iter().enumerate() {
         let idx = idx + 1;
         let (prompt, images) = if with_img {
-            (sys_img.clone(), vec![mk_img(0.2)])
+            (sys_img.clone(), vec![mk_img(0.2).into()])
         } else {
             (sys_text.clone(), Vec::new())
         };
@@ -4785,6 +4831,371 @@ pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
             if with_img { "带图" } else { "纯文本" }
         );
     }
+}
+
+
+/// **前缀无感删除门**(2026-10-23;设计卷 `memory/prefix-deletion.md`)。
+///
+/// 场景 = GUI agent 的一步:历史里有两张截图(turn 1),harness 把**旧的
+/// 第一张**抽掉(turn 2),其余全部前移。
+///
+/// # 判据(硬)
+///
+/// 1. `image_evict.absorbed == 1` —— 删除**被吸收**,不是退回全量重算;
+/// 2. 删除区间 == 第一张图的**整段**(含页对齐 pad),起点/长度都是整页;
+/// 3. **G1 机械等价**:被复用后缀页的每层 K == `R(−S)·` 删除前(配对量级 ≤4 ulp)
+///    —— 退回重算会因 hidden 不同而**完全不等**,所以这条是**正判别**;
+/// 4. 吸收轮 prefill 事件数很小(只喂新尾部;后缀零重算);
+/// 5. 两轮文本都非空。
+///
+/// ⚠️ 0.8B「boot 后第一轮就带图」有既有红(F1,另案)⇒ 门先跑**纯文本预热轮**。
+pub async fn gpu_image_evict_gate() {
+    let Some(ordinal) = gpu_ordinal() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    if !dir.join("config.json").exists() {
+        owl_shared::testkit::report::skip(format_args!("0.8B 资产不在 {}", dir.display()));
+        return;
+    }
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 768,
+        prefill_chunk: 64,
+        knobs: EngineKnobs {
+            vision: true,
+            prefix_cache: true,
+            image_evict: true,
+            // 钉小池(门只跑 ~700 tok;auto 池算式在本机会被"预算可服务上限"
+            // 拒 —— 与本特性无关的既有面)
+            pool_tokens: Some(2048),
+            ..Default::default()
+        },
+    })
+    .expect("构造");
+    let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载 0.8B+VLM");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let page = running.dev.pool.geom.page;
+    assert!(page >= 32 && page % 32 == 0, "页宽异常: {page}");
+    let (hkv, hd) = {
+        let d = &running.dev.pool.geom.dims;
+        (d.hkv, d.hd)
+    };
+    let per_page_bytes = hkv * hd * page * 2; // f16
+    let image_token = running
+        .dev
+        .boot
+        .vlm
+        .as_ref()
+        .expect("VLM 必须装配")
+        .cfg()
+        .image_token;
+    let one = |r: &RunningEngine<crate::GpuFace>, t: &str| -> u32 {
+        let v = r.boot.tok.try_encode(t).expect("encode");
+        assert_eq!(v.len(), 1, "{t} 应恰 1 token(得 {v:?})");
+        v[0]
+    };
+    let (vs, ve) = (one(&running, "<|vision_start|>"), one(&running, "<|vision_end|>"));
+    let pad_id = one(&running, "\n");
+
+    // ── 预热轮(纯文本;消掉 F1 的"首轮+图"变量) ──
+    {
+        let (_s, t) = running
+            .submit_session(Some(5), "请用一句话说明你在做什么。", 6)
+            .expect("预热提交");
+        let text = drive_turn(&mut running, t).await;
+        assert!(!text.trim().is_empty(), "纯文本预热轮必须出文本");
+    }
+
+    // 图:grid (1,16,16) ⇒ 占位 (16/2)·(16/2) = 64 tok(网格 ≥ 16×16 是 FI ragged 门)
+    let l_img = 64usize;
+    let mk_img = |salt: f32| owl_models::vlm::VlmImage {
+        pixel_values: (0..256 * 3 * 2 * 16 * 16)
+            .map(|i| salt + (i % 7) as f32 * 0.01)
+            .collect(),
+        grid: (1, 16, 16),
+    };
+    let item = |_i: usize| format!("<|vision_start|>{}<|vision_end|>", "<|image_pad|>".repeat(l_img));
+    let p_text = |n: usize| {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&format!("观察点{i}:屏幕无异常,日志正常,继续。\n"));
+        }
+        s
+    };
+    let q1 = "请用一句话说明你看到了什么。";
+    let mid = "中间这段文字会留在历史里。\n";
+    // ── turn 1:两张截图(都打可删标记) ──
+    let prompt1 = running.boot.tok.chat_format().render_chat(
+        &[
+            ("system", "你是助手,按约定回答。"),
+            (
+                "user",
+                &format!("{}{}{}{}{}{q1}", p_text(2), item(0), mid, item(1), p_text(1)),
+            ),
+        ],
+        false,
+    );
+    let imgs1 = vec![
+        crate::turn::TurnImage { image: mk_img(0.2), evict: true },
+        crate::turn::TurnImage { image: mk_img(0.6), evict: true },
+    ];
+    let (sid, t1) = running
+        .submit_session_opts(
+            Some(7),
+            prompt1.as_str(),
+            8,
+            crate::turn::TurnOpts { images: imgs1, ..Default::default() },
+        )
+        .expect("t1 提交");
+    let text1 = drive_turn(&mut running, t1).await;
+    assert!(!text1.trim().is_empty(), "t1 必须出文本(视觉基线)");
+
+    // ── 测试侧复算 pad 律(与引擎同一份纯函数;用来验"删的正是第一段") ──
+    let grids = [(1usize, 16usize, 16usize), (1usize, 16usize, 16usize)];
+    let ids1 = running.boot.tok.encode(&prompt1);
+    let seq1 = crate::img_evict::pad_image_spans(
+        &ids1,
+        &[true, true],
+        &grids,
+        image_token,
+        Some(vs),
+        Some(ve),
+        page,
+        pad_id,
+        &[],
+    )
+    .expect("测试侧 pad");
+    let (padded1, spans1) = (seq1.ids, seq1.spans);
+    assert_eq!(spans1.len(), 2);
+    assert_eq!(spans1[0].start % page, 0, "段首必须页对齐");
+    assert_eq!((spans1[0].end - spans1[0].start) % page, 0, "段长必须整页");
+    let del = spans1[0];
+    {
+        let s = running.bank.sessions.session(sid).expect("会话账");
+        assert_eq!(
+            &s.tokens[..padded1.len()],
+            &padded1[..],
+            "引擎内部 prompt 与测试侧 pad 律必须逐字节一致"
+        );
+        assert_eq!(s.img_spans.len(), 2, "会话账必须记住两段");
+        assert_eq!(s.img_spans[0].start, spans1[0].start);
+        assert_eq!(s.img_spans[0].end, spans1[0].end);
+    }
+    // 旧链槽位(内容树;turn 收口后会话不持表)
+    let old_tokens = running.bank.sessions.session(sid).expect("会话账").tokens.clone();
+    let (hit, _) = running.bank.rel.match_prefix(&old_tokens).expect("旧链命中");
+    assert!(
+        hit.matched_blocks >= (del.end / page) + 1,
+        "旧链块数 {} 不足以覆盖删点({})",
+        hit.matched_blocks,
+        del.end / page
+    );
+
+    // ── 读 K(全层;删点之后的整段 —— 吸收后这些页要被原地重转) ──
+    // 一条 `dtoh_batch` 读完一个槽的全部层(逐层一次往返会把门拖成分钟级)。
+    async fn read_slot(
+        running: &mut RunningEngine<crate::GpuFace>,
+        slot: u32,
+        per_page_bytes: usize,
+    ) -> Vec<Vec<u8>> {
+        let handles = running.dev.pool.kv_k_blocks();
+        let off = slot as usize * per_page_bytes;
+        let pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> =
+            handles.iter().map(|b| (b, off, per_page_bytes)).collect();
+        let all = {
+            let face = running.dev.graphs.session.face_mut();
+            face.dtoh_batch(&pieces).await.expect("D2H K")
+        };
+        all.chunks_exact(per_page_bytes).map(|c| c.to_vec()).collect()
+    }
+    let mut k_before: std::collections::HashMap<u32, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
+    for slot in hit.slots.iter().skip(del.start / page).flatten().copied() {
+        let per_layer = read_slot(&mut running, slot, per_page_bytes).await;
+        k_before.insert(slot, per_layer);
+    }
+
+    // ── turn 2:harness 抽掉**第一张**截图(其余全部前移) ──
+    let q2 = "现在屏幕上还有什么?";
+    let prompt2 = running.boot.tok.chat_format().render_chat(
+        &[
+            ("system", "你是助手,按约定回答。"),
+            (
+                "user",
+                &format!("{}{}{}{}{q1}", p_text(2), mid, item(1), p_text(1)),
+            ),
+            ("assistant", &text1),
+            ("user", q2),
+        ],
+        false,
+    );
+    // 幸存图的**标记必须保持不变**:pad 律由 `evict` 决定,标记一变 ⇒ pad 数变
+    // ⇒ 前缀身份断(这是"标记一旦打上就冻结"的硬约束,见设计卷)
+    let imgs2 = vec![crate::turn::TurnImage { image: mk_img(0.6), evict: true }];
+    let (_, t2) = running
+        .submit_session_opts(
+            Some(7),
+            prompt2.as_str(),
+            8,
+            crate::turn::TurnOpts { images: imgs2, ..Default::default() },
+        )
+        .expect("t2 提交");
+    let mut prefill_events = 0usize;
+    let text2 = loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Prefill { turn, .. } if turn == t2 => prefill_events += 1,
+            TurnEvent::Completed { turn, text, .. } if turn == t2 => break text,
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+            TurnEvent::Idle => panic!("t2 队列丢失"),
+            _ => {}
+        }
+    };
+    assert!(!text2.trim().is_empty(), "t2 必须出文本");
+
+    // ① 吸收(不是退回重算)
+    let trace = running.img_evict.last.clone().expect("必须吸收删除(退回重算 = 本门失败)");
+    assert_eq!(running.img_evict.absorbed, 1, "一次删除只许吸收一次(Δ 一次性)");
+    // ② 删的正是第一张图的整段
+    assert_eq!(trace.a, del.start, "删除起点必须是第一段的段首");
+    assert_eq!(trace.b, del.end, "删除终点必须是第一段的段尾(含 pad)");
+    assert_eq!(trace.a % page, 0, "删点必须页对齐");
+    assert_eq!((trace.b - trace.a) % page, 0, "删除长度必须整页");
+    assert!(trace.keep_blocks >= 1, "后缀至少要保留一页");
+    assert_eq!(trace.pages.len(), trace.keep_blocks);
+    // ③ 吸收轮只喂新尾部
+    assert!(
+        prefill_events <= 3,
+        "吸收轮 prefill 事件 {prefill_events} 次 —— 后缀被重算了?(期间应只喂新尾部)"
+    );
+
+    // ④ **G6b 改写即失效**:被重转后缀在内容树里的**旧身份必须已废弃** ——
+    // 否则别的会话按旧 token 命中同一批槽,会读到旋转过的 K(静默错值;实测 NaN)。
+    {
+        let (hit_old, _) = running.bank.rel.match_prefix(&old_tokens).expect("旧链查询");
+        // 删点之后**整条旧链**都不可达了:被删段的 KV 已显式释放(用户口径:
+        // 删了图显存要跟着降),后缀页被原地重转(旧身份失真),尾巴是孤儿。
+        // ⇒ 旧 tokens 现在只能命中**前缀**。
+        assert_eq!(
+            hit_old.matched_blocks,
+            del.start / page,
+            "旧身份必须止于删点之前(得 {} 块;删段/后缀旧条目未释放)",
+            hit_old.matched_blocks
+        );
+    }
+
+    // ⑤ **G1 机械等价**:复用后缀页每层 K == R(−S)·删除前(配对量级 ≤4 ulp)
+    let mrope_delta = {
+        let vlm = running.dev.boot.vlm.as_ref().expect("VLM");
+        owl_models::layers::kvshift::delta_table(&vlm.cfg().mrope, -trace.shift)
+    };
+    let half = mrope_delta.0.len();
+    let geom = running.dev.pool.k_shift_geom(half).expect("K 重转几何");
+    let mut worst = 0f32;
+    for &slot in &trace.pages {
+        let Some(before) = k_before.get(&slot) else {
+            panic!("后缀页 {slot} 不在删除前的读取集里(页序错?)");
+        };
+        let after_all = read_slot(&mut running, slot, per_page_bytes).await;
+        for (li, after) in after_all.iter().enumerate() {
+            // host 参考:同一页原地乘 R(−S)
+            let mut expect = before[li]
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<u16>>();
+            owl_models::layers::kvshift::k_shift_host_f16(
+                &mut expect,
+                &mrope_delta.0,
+                &mrope_delta.1,
+                &[0u32],
+                geom,
+            )
+            .expect("host 参考");
+            // 判据 = **配对量级**的 4 ulp(rotate-half 的配对是
+            // `(d, d+half)`;抵销情形按**输入**量级取 ulp —— 按输出去取会爆)
+            let dg_units = geom.half / geom.x;
+            let n_el = after.len() / 2;
+            for i in 0..n_el {
+                let a = &after[i * 2..i * 2 + 2];
+                let av = f32::from(half::f16::from_bits(u16::from_le_bytes([a[0], a[1]])));
+                let ev = f32::from(half::f16::from_bits(expect[i]));
+                let dg = (i / (geom.page * geom.x)) % (geom.hd / geom.x);
+                let partner = if dg < dg_units {
+                    i + geom.half * geom.page
+                } else {
+                    i - geom.half * geom.page
+                };
+                let pv = before[li]
+                    .chunks_exact(2)
+                    .nth(partner)
+                    .map(|b| f32::from(half::f16::from_bits(u16::from_le_bytes([b[0], b[1]]))))
+                    .unwrap_or(0.0);
+                let scale = av.abs().max(ev.abs()).max(pv.abs()).max(1e-3);
+                let ulp = scale * 2f32.powi(-10);
+                worst = worst.max((av - ev).abs() / (4.0 * ulp));
+                assert!(
+                    (av - ev).abs() <= 4.0 * ulp,
+                    "层 {li} 页 {slot} 元素 {i}: K 重转与 host 参考不符({av} vs {ev};配对 {pv};第 {worst:.2} × 4ulp)"
+                );
+            }
+        }
+    }
+    // ── G5 臂:**引擎不自作主张** —— 删一张**未标记**的图 ⇒ 必须退回旧路径 ──
+    let q3 = "还有别的吗?";
+    // 用**另一个会话**(8):同会话里换标记会改 pad 律(标记冻结律)。
+    let g5_prompt1 = running.boot.tok.chat_format().render_chat(
+        &[
+            ("system", "你是助手,按约定回答。"),
+            ("user", &format!("{}{}{}{q1}", p_text(1), item(2), p_text(1))),
+        ],
+        false,
+    );
+    let (_, g5t1) = running
+        .submit_session_opts(
+            Some(8),
+            g5_prompt1.as_str(),
+            6,
+            crate::turn::TurnOpts {
+                images: vec![crate::turn::TurnImage { image: mk_img(0.9), evict: false }],
+                ..Default::default()
+            },
+        )
+        .expect("G5 t1 提交");
+    let g5_text1 = drive_turn(&mut running, g5t1).await;
+    assert!(!g5_text1.trim().is_empty(), "G5 t1 必须出文本");
+    // 删掉这张**未标记**的图 ⇒ 不许吸收
+    let g5_prompt2 = running.boot.tok.chat_format().render_chat(
+        &[
+            ("system", "你是助手,按约定回答。"),
+            ("user", &format!("{}{}{q1}", p_text(1), p_text(1))),
+            ("assistant", &g5_text1),
+            ("user", q3),
+        ],
+        false,
+    );
+    let (_, g5t2) = running
+        .submit_session_opts(Some(8), g5_prompt2.as_str(), 6, crate::turn::TurnOpts::default())
+        .expect("G5 t2 提交");
+    let g5_text2 = drive_turn(&mut running, g5t2).await;
+    assert!(!g5_text2.trim().is_empty(), "G5 t2(删未标记图)必须出文本");
+    assert_eq!(
+        running.img_evict.absorbed, 1,
+        "未标记的图被删时**不许**吸收(引擎不自作主张)"
+    );
+
+    eprintln!(
+        "[test] 前缀无感删除:删 [{}, {})={} tok · 保留后缀 {} 页 · S={} · 重挂 {} · 轮时 prefill 事件 {} · K 最差 {:.2}×4ulp",
+        trace.a,
+        trace.b,
+        trace.b - trace.a,
+        trace.keep_blocks,
+        trace.shift,
+        trace.rekeyed,
+        prefill_events,
+        worst
+    );
 }
 
 /// 27B 的 F1 控制组(首轮纯文本)。

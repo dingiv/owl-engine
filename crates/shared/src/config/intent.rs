@@ -343,7 +343,7 @@ pub const QWEN38_27B_AWQ: ModelProfile = ModelProfile {
     aliases: &["27b-awq", "awq27b", "qwen3.8-27b"],
     format: ModelFormat::Awq,
     quant: QuantScheme::W4a16,
-    head_quant: HeadQuant::RtnInt4G32,
+    head_quant: HeadQuant::RtnInt8Row,
     geom: ModelGeom {
         hidden: 5120,
         n_layers: 64,

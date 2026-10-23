@@ -116,17 +116,17 @@ reuse       = "off"               # off | session | global;不写 = goal 决定
 
 | 意图 | 派生 |
 |---|---|
-| `model` | `[model] kind/quant/head_quant`(与显式值冲突 = 拒) |
+| `model` | `[model] kind/quant/head_quant/embed_quant`(与显式值冲突 = 拒) |
 | `goal=max-context` | 复用 off、`512+512`、`vram_target=0.99`、`reserve=256M` |
 | `goal=max-speed` | 复用 global、`1024+0`、贴顶 |
 | `goal=balanced` | 复用 session、`512+512`、0.97 |
 | `goal=low-memory` | kvmem overcommit、复用 global、小激活面 |
-| `context=N` | `max_seq=N`;非超卖档 `pool_tokens=N` |
+| `context=N` | `max_seq=N`(物理池:无缓存→min(cap,N×并发+1页);缓存开→cap) |
 | `context="max"` | 内存模型求解(§4) |
 | `concurrency=C` | `gdn_slots=C`、`runtime.max_concurrency=C`、`max_batch=min(C,8)` |
-| `spec=dflash` | `depth=7` + 草稿目录必填 + 草稿池 20KiB/token 进内存账 |
+| `spec=dflash` | `depth=7` + 草稿目录必填 + **草稿环固定 ~40MiB**(窗口 2048,见下) |
 | `[spec] draft` | `auto`（缺省，DFlash2 目录优先 → 检查点 MTP）\| `mtp` \| `dflash2`；显式档缺资产 = boot 拒 |
-| `kv=fp8/f16` | `dispatch.kv_fp8` |
+| `kv=fp8/f16` | `pool.kv_fp8` |
 | `kvmem=off` | 选择层/索引/超卖四键全关 + 宿主/磁盘腿清零 |
 | `kvmem=overcommit` | 四键全开 + 宿主腿 + 强制 prefix_cache |
 | `graphs=auto` | FI 单图 decode + `fi_plan_bake=0` + 窗刷表（prefill 桶已退役） |
@@ -157,14 +157,24 @@ max_seq      = usable / per_tok(向下取 4k)
   144k/160k 的实测曲线见设计卷 §7.2)。
 - 3090 Ti + 27B AWQ-INT4 + FP8 KV + spec off + `512+512` ⇒ **128k / 池 4G**,
   与 `profiles/qwen38_27b-3090-w4a16.toml` 同档(实测 prefill 1436 / decode 47.55)。
-- **并发 C**:`pool_tokens` 是**全局**容量 ⇒ 非超卖档 `pool = 上下文 × C`,
-  单会话上下文按 `usable / (per_tok × C)` 求解(例:C=2 ⇒ 每会话 64k / 池 128k)。
+- **并发 C**:无缓存→min(`[vram-gov]` cap, 上下文 × C + 1 页);缓存开→cap(整池给缓存);
+  非超卖档只要求池装得下**单会话整条上下文**(Strict 准入),多会话共享池。
   `max_batch=C(≤8)` 自动启用合批;**≥2 活跃 turn 的批路走 v2 注意力**
   (FI 臂只服务 T=1 单行),`--check` 会写明这条告警。
+- **2026-10-22 起池容量无配置项**:单卡口径 `budget = free(cuMemGetInfo)
+  − reserve − fixed_after`;`fixed_after` 含 `post_pool_extra`(图/plan/
+  cudaMallocAsync 保留/驱动碎片/首请求 Temp 的实测固定项)与 `guard slack`。
+  `max_seq` 超过治理器 `cap − 1 页` 直接拒启,并报可服务的 `ctx_max`。
+- **DFlash2 草稿环**:`[spec].draft_window`(0 = auto = 检查点
+  `dflash_config.sliding_window`)。草稿 KV 不再按池容量全量物化,
+  而是 **窗口大小的环形缓冲**(2048 → 固定 ~40MiB;写槽 = 逻辑位 % 窗口;
+  propose 自块/被拒行写环外 scratch)。当前 NC 核只实例化 **2048**,
+  写 4k/8k 会 boot 拒(等核加运行时 window);环容量本身已按检查点/配置取值,
+  不写死。
 
-**显式覆盖优先**:`--set runtime.max_seq=147456`(或 `--set pool.pool_tokens=…`)
-不再求解;若超过治理器 `cap`,`--check` 硬拒;若只是余量 < 1.30G,`--check`
-**告警但不拒**(144k 实测可跑,长跑泄漏是另一案)。
+**显式覆盖优先**:`--set runtime.max_seq=147456` 不再求解;若超过引擎
+治理器 `cap − 1 页`,boot 硬拒并报 `ctx_max`;若只是 `--check` 估算余量
+< 1.30G,`--check` **告警但不拒**(长跑泄漏是另一案)。
 
 ## 5. 站点层(`--site`)
 
@@ -189,7 +199,7 @@ device    = "42:00.0"                          # → [parallel] device = ["42:00
 server -p profiles/qwen38_27b-3090-w4a16.toml --site testdata/args/base.toml --check
 
 # 生效配置 + 逐键来源 / 内存估算(JSON)
-server -p profiles/… --site … --print-config --format json | jq '.provenance["pool.pool_tokens"]'
+server -p profiles/… --site … --print-config --format json | jq '.provenance["runtime.max_seq"]'
 
 # 单键解释:值 / 来源 / 派生规则
 server -p profiles/… --site … --explain runtime.max_seq
@@ -274,6 +284,24 @@ ls profiles/
   `vision-wiring.md` 与
   `gguf-format.md` §23.14。
 
+## 7.2 前缀无感删除(图像段;2026-10-23)
+
+**两个面缺一不可**(引擎不自作主张):
+
+| 面 | 形态 | 说明 |
+|---|---|---|
+| 引擎配置 | `[pool] image_evict = false` | 缺省关 = 逐字节旧行为。开 ⇒ boot 门要求**视觉档 + f16 分页 KV + 前缀缓存**,任缺**拒启** |
+| 客户端标记 | 图像 content part `"owl_evict": true` | 「这张图将来可能从历史里删」。未标记 = 零行为差异;带标记但档位没开 = 提交**响亮拒** |
+
+- **生效形态**:带标记的图像段被补 `\n` 到「段首页对齐 + 整段整页」;下一轮若
+  历史里**正好删掉这一段**,引擎保留后缀页 + 只把后缀 K 乘 `R(−S)`(位置帧平移),
+  **不重算删点之后的 token**。
+- **标记冻结律**:一张图打了标记后,留在历史期间标记必须保持不变(pad 数由标记
+  决定,改标记 ⇒ 前缀身份断 ⇒ 退化为重算,不会错值)。
+- **不适用**:`kv_fp8 = true` 档(boot 拒;fp8 的 dequant→rotate→requant 另案)。
+- 语义:删点**之前**逐位等价;删点**之后**是**搬运记忆**(后缀 KV/GDN 仍带着被删
+  图的上下文)。设计与门:`memory/prefix-deletion.md`。
+
 ## 8. 兼容与挂账
 
 - **`profiles/` 全部档 = `extends = ["full.toml"]` + 差异**(无 `[intent]` ⇒ 派生器不介入);
@@ -282,10 +310,10 @@ ls profiles/
   `model.dflash2_dir`→`spec.draft_path`、`runtime.tp_*`/`device*`→`[parallel]`、
   `server.max_concurrency`→`runtime.max_concurrency`;
 - `OWL_MAX_SEQ` / `OWL_PREFILL_CHUNK` **已删除**(2026-10-20):它们会在
-  意图派生后再改一次,造成 `max_seq` 与 `pool_tokens` 双源。临时调压请
-  `--set runtime.max_seq=…`(池会跟随,除非显式给 `pool.pool_tokens`)。
+  意图派生后再改一次,造成 `max_seq` 双源。临时调压请
+  `--set runtime.max_seq=…`(池自动跟随剩余显存)。
 - **allowed_ops 已退役**(2026-10-20):配置按 `model.format/quant/head_quant`、
-  `kernel.kv_fp8`、`spec.depth`、`model.vision`、`parallel.mode` 自动派生
+  `pool.kv_fp8`、`spec.depth`、`model.vision`、`parallel.mode` 自动派生
   tag filter;`[kernel] tag_wildcard = true` 是诊断 `*` 逃生门。
 - **P2 未做**:旧档迁移器、`context=max` 校准探测、长跑泄漏余量曲线。
 - 配置层 `deny_unknown_fields` 仍全 module 生效;退役键有专门迁移提示。
