@@ -380,7 +380,7 @@ OWL_TEST_DEVICE=2 cargo test -p owl-models --lib    # GPU 门测试要指定空�
 | 适配器(nvcc 编入 `libowl_flashinfer.a`,**3 TU**) | `cu/flashinfer/owl_fi_attn_ragged.cu`(plan + run;plan 期写规范 int32 段界 `[0, rows]`) |
 | 家族/线契约 | `family/flashinfer.rs`(`ATTN_RAGGED_F16` 常量 + extern)· `client/flashinfer.rs`(`parse_attn_ragged`;`NamedSlots` 新增 `f32`/`i32` 取用面)· `server/flashinfer.rs`(`run_attn_ragged` + ragged plan 缓存 + `fi.ragged_cu` scratch) |
 | 声明 | `ops/flashinfer.rs`:`FiAttnRaggedF16`(FOREIGN;`FAMILY` = **FI 族 id**;槽位与 native `vis::AttnFullF16` **逐字同构**) |
-| 分流 | `driver.rs`:`vis.attn_full` ⇒ **f16 + 单图 → FI ragged**;其余(f32 锚 / 多图)→ native 臂 |
+| 分流 | `driver.rs`:`vis.attn_full` ⇒ **f16 + hd64/72 → vLLM FA2 varlen**(hd64→hdim64,hd72→hdim96);单图/多图同一核;f32/小形状才走 native |
 | 塔/测试 | `VisionCfg::from_json`(超参从 `config.json` 读,零手工抄数;`visual_weights()` 顺带返回 cfg)· 金标两档改由 **4B** 生成 |
 
 ### 10.2 结果(1280×736 = 3680 patch / 920 merged;3080 20G)

@@ -46,7 +46,8 @@ reasoning **逐字一致**。
 
 ### 非目标
 
-- 视频输入 / 多图 batch / 图像 tokenizer 的 HF 全兼容(先单图 data URL);
+- 视频输入 / 多图 batch(max_batch > 1)/ 图像 tokenizer 的 HF 全兼容
+  (单请求多图已支持;batch 未支持);
 - 图像预处理性能优化(先正确,后 CUDA/半精度);
 - 视觉塔量化(权重 1.5G f16,先不动;后续另立)。
 
@@ -60,7 +61,8 @@ reasoning **逐字一致**。
    - `image_scatter` 把 `merged [N,D]` 按 `idx [L]` 写进 embedding(`-1` = 文本);
    - `VisionTables::build` 的 `grid_thw` 与 patch 序 = processor 的 2×2 块序。
 3. **m-RoPE**:`VlmInputs` 给 `[L, half]` cos/sin;prefill 的每个 chunk
-   必须切对应行;decode 的新 token 用 **`pos + delta`**(`VlmInputs.delta`),
+   必须切对应行,且 **rope 的 pos 必须是本 chunk 局部 0..t**(cos/sin 是
+   chunk 行表);decode 的新 token 用 **`pos + delta`**(`VlmInputs.delta`),
    但 **KV slot/length 仍用真实 token 计数**(不能把 delta 加进 `kv_len`)。
 4. **模型层 dtype**:塔 f16;`Vlm::inputs` 的 cos/sin 按 dtype 打包。
 5. **图像预处理是正确性的一半**:HF `Qwen2VLImageProcessorFast`
@@ -98,16 +100,18 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
        → ActiveTurn.vlm = VlmPrepared { cos/sin/idx host, merged leaf, delta }
   → ChunkHost.vlm = Some(&VlmPrepared)
   → prefill_chunk_enqueue:
-       (cos,sin,idx) = prep.chunk_tables(base, t)
+       (cos,sin,idx,pos) = prep.chunk_tables(base, t)
        ctx = ctx.with_vlm_rope(&cos,&sin)
+       ctx.pos = Some(&pos)        // 本 chunk 局部行号,不是 base+i
        if chunk 有图像行: ctx = ctx.with_vlm_image(merged, &idx)
   → 桶图路:host.vlm.is_some() ⇒ 强制 eager(bucket 图不烘塔)
 ```
 
 - `VlmInputs` 增加 `cos_host/sin_host`(idx_host 已有),供 chunk 切片;
   `VlmPrepared` 只持 host 表 + `merged` 叶块所有权。
-- **prefill ctx 的 `pos`**:行号 = `base+i`(引擎现有 `pos_t` 已是它);
-  m-RoPE 表只覆盖 rope,不覆盖 positions/`kv_len`。
+- **prefill ctx 的 `pos`**:非 VLM 仍是 `base+i`(引擎现有 `pos_t`);
+  VLM 面切成 chunk 局部 `0..t`(与 cos/sin 行表同源);`positions/kv_len`
+  仍用全局真实值。
 - **decode**:`execute_decode` 里 `pos` 输入槽 = `pos + delta`,
   `kv_len = pos+1`、`kv_slot` 不变;VLM 首版 **`[spec] depth = 0`**
   (spec 的 verify/fold 位置账另开 V5)。
@@ -139,7 +143,8 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
 - **预处理门**:与 `tools/vision_image_check.py` 的
   `Qwen3VLProcessor` 输出逐元素对拍(索引/权重/pixel_values),四张真图
   端到端答案与 HF 一致。
-- 图像缓存/并发:首版一请求一图,串行;不做图像前缀缓存。
+- 图像缓存/并发:单请求可多图(按内容序);图像请求仍串行,`max_batch > 1`
+  硬拒;暂不做图像前缀缓存。
 
 ### 3.5 与 DFlash2 共存(V5,✅ 已落)
 
@@ -206,8 +211,8 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
 | `crates/engine/src/exec/phases.rs` | V2/V5 | decode `pos` 槽 = pos+delta;eager verify 的 `pos_t` = base+delta |
 | `crates/engine/src/exec/spec.rs` | V5 | verify 图 `pos_f` = pos+i+delta;slots/lens 真值 |
 | `crates/engine/src/exec/draft.rs` | V5 | `verify_forward(..., pos_delta)` 双 rank 透传 |
-| `crates/engine/src/running.rs` | V5 | 移除“图像×spec 必拒”;保留单图/非合批门 |
-| `crates/engine/src/scheduler.rs` | V2 | 图像 turn 的门(单图/非合批) |
+| `crates/engine/src/running.rs` | V5/多图 | 移除“图像×spec 必拒”与单图硬门;保留非合批门 |
+| `crates/engine/src/scheduler.rs` | V2 | 图像 turn 的门(非合批;单请求多图) |
 | `crates/engine/src/tp.rs` | V3 | 两 rank 图像 prefill/塔复制 |
 | `apps/server/src/vision_processor.rs` | V4 | 解码/缩放/normalize/patchify |
 | `apps/server/src/openai.rs` | V4 | `image_url` 解析 + 图像 part |
@@ -260,11 +265,11 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
       4 × 12.5k prompt(spec d7)压测 free 稳定 ~2.4G/卡,无 OOM。
 
 **当前能做什么**:`qwen38_27b-3080_tp2-w4a16`(视觉 + spec d7)真机带图请求
-(data URL,单图;TP2);`qwen38_27b-3080_tp2-w4a16-vlm`(spec off)作为无草稿对照;
+(data URL,单请求多图;TP2);`qwen38_27b-3080_tp2-w4a16-vlm`(spec off)作为无草稿对照;
 两者 `--check` 内存账分别 **18.92G / 19.63G(余 0.71G)** 与
 **16.24G / 19.63G(余 3.39G)**。
-**不能**做:http 图像 URL、多图/多并发图像;184K 满上下文 + draft 的
-瞬态余量薄(真实 free ~2.7G/卡,建议先降 174,080 压测)。
+**不能**做:http 图像 URL、`max_batch > 1` 的多图并发、图像前缀缓存;
+184K 满上下文 + draft 的瞬态余量薄(真实 free ~2.7G/卡,建议先降 174,080 压测)。
 
 ---
 
@@ -295,8 +300,71 @@ HF/AWQ 档的塔在检查点目录(`model.visual.*`);GGUF 主文件**只带文�
   `Vlm::from_model` 共享同一份文本 `Arc`;
 - patch_embd 的 `v.patch_embd.weight` / `.weight.1` 两个时间片必须按 HF
   `[out][in][t][p][p]` **按 in 通道交错**(不是首尾相接);
-- 真机:4B Q4_K_M + mmproj-F16 / 27B Q4_K_M + mmproj-Q8_0 均过单图 e2e;
-  4B OpenAI `image_url`(data URL)鸟图 → `Galapagos penguin`(HF 金标同)。
+- 真机:4B Q4_K_M + mmproj-F16 / 27B Q4_K_M + mmproj-Q8_0 均过单图与
+  单请求多图 e2e;4B OpenAI `image_url`(data URL)鸟图 → `Galapagos penguin`
+  (HF 金标同)。
 
 详见 `gguf-format.md` §23.14 与
 `config.md` §7.1。
+
+---
+
+## 10. 单请求多图与视觉注意力(2026-10-23,现行)
+
+### 10.1 准入与语义
+
+- **单请求可多图**:`running.rs` 不再拒 `images.len() != 1`;图片按
+  `messages` 内容序收集、预处理、拼进同一 prompt。
+- **仍拒 `max_batch > 1` 的带图合批**;图像请求串行。
+- **m-RoPE**:相邻图/视频帧的连续视觉 token 段内,按 `grid` 顺序逐个消费
+  (`vision_position_ids` + `advance`),不再把整段当单图。
+- **chunk**:cos/sin 是 chunk 行表,rope 的 `pos` 必须同步使用本 chunk
+  `0..t` 局部行号;全局 positions / KV slot / kv_len 不变。
+- **历史重发**:当前不做图像前缀缓存;客户端重发历史图片会重新进塔、重新占
+  context(已知性能限制,非正确性问题)。
+
+### 10.2 修复记录(根因)
+
+1. **chunk pos 越表**:`VlmInputs::chunk_tables` 返回 chunk 局部 cos/sin,
+   但 `ctx.pos` 仍是全局 `base..base+t`;`owl_norm_rope_*` 用 `pos[t]` 索引
+   行表 ⇒ 第二个 chunk 起越界/错行。修法:`chunk_tables` 返回 `0..n` 局部
+   pos,`prefill_chunk` 在 VLM 面覆盖 `ctx.pos`。
+2. **ragged/paged workspace 互踩**:视觉塔 FI ragged 与文本 paged FI 共用
+   `int_ws`;文本 prefill 会覆盖 ragged plan,而 ragged plan 缓存后不重刷 ⇒
+   同一图片第二次起读到文本 plan。修法:独立 `fi.ragged_int_ws`(8 MiB)+
+   plan H2D 后 stream sync。
+3. **相邻多图 m-RoPE**:旧 `rope_index` 把一个连续 `TYPE_IMAGE` run 当单图;
+   修法见 10.1。
+
+### 10.3 视觉注意力收敛
+
+- `driver::attn_full` 现在把 **f16 + hd64/72 的单图/多图统一交给 vLLM FA2
+  varlen**:hd64 → `run_mha_fwd_hdim64`,hd72 → `run_mha_fwd_hdim96`;
+  `batch = n_seq`,`cu_seqlens` 逐图,`max_seqlen` 取真实最大段长。
+- FA2 的 cu 按 **block id + 形状** 缓存,每请求只上传一次;未缓存时禁止在
+  capture 内 download/upload。
+- **FI ragged 代码暂时保留但不再被 driver 选中**;只有 f32 / `rows < 64`
+  回落 native。
+- **不涉及文本 attention**:文本 prefill/decode/verify 仍是 FI paged/XQA;
+  MTP/DFlash2 propose 仍是各自 draft 路径。FA2 只替换视觉塔的
+  `vis.attn_full`。
+
+### 10.4 实测
+
+| 配置 | 请求 | 结果 |
+|---|---|---|
+| 4B Q4 / 3080 / spec off | 2×1024、4×1024、2×1408 | 通过;2×1408 约 2.2s/次,4×1024 约 0.7s |
+| 4B Q4 / 3080 / MTP d3 | 2×1024、64 token ×3 | 通过 |
+| 27B Q4 / 3090 / spec off | 2×1024、2×1408 | 通过;2×1408 约 4.5s/次 |
+| 27B AWQ / 3090 / MTP d3 | 2×1024、64 token | 通过 |
+| 27B AWQ / 3090 / DFlash2 d7 | 2×1024、64 token | 通过(窗口 AL 低时既有降级逻辑生效) |
+
+- 相邻多图 m-RoPE / `Vlm::inputs` 单测在 `mrope` / `vlm` 测试模块;
+  driver 分流单测覆盖 hd64/hd72 单图与多图。
+- 4B FA2 hdim64 与旧 FI ragged 同速(2×1408 均约 2.2s),因此没有性能回退。
+
+### 10.5 剩余限制
+
+- `max_batch > 1` 的带图合批仍拒;
+- 图像前缀缓存/历史图片去重未做;
+- FI ragged 是未选中的 legacy 代码,确认后应整体删除,避免两套维护面。
