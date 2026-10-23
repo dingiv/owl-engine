@@ -2253,3 +2253,9 @@ code 在 10k/30k 时块被选中且 stage-in 哈希与 40k 一致，但随机词
 90k 回答 `No`；code 在 45k/60k 时答出。30k 位置即使 workspace 加到 16384
 （512 块）仍 `No`。**改用 coherent filler 后，10k/30k 都答出 BLUEBIRD-42**。
 ⇒ 随机词 word salad 是 OOD；选择器/页表/搬运/距离均已排除。
+
+### 10.6 2240 工作集对照（coherent）
+
+coherent filler + code@10k + 90k 上下文 + 80,544 池部分驻留：workspace=2240
+仍答 `- 42`（已召回）。8192 是 OOD/随机词输入的稳健性余量，不是选择正确性
+的硬前提。

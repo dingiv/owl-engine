@@ -505,3 +505,10 @@ key 模长归一），但 2240 工作集下输出仍退化。受控 A/B 定谳�
 改用 coherent filler 后，90k 上下文中 code 在 10k/30k 均答出
 `BLUEBIRD-42`（相对距离 80k/60k）⇒ 随机词 word salad 是 OOD 测试，
 不是距离/选择问题。质量门改用 coherent NIAH。
+
+### 10.4 2240 工作集对照
+
+coherent filler + code@10k + 90k 上下文 + 80,544 池（部分驻留）：
+workspace=2240 仍答 `- 42`（已召回），8192 答完整 `BLUEBIRD-42`。
+⇒ 8192 是 OOD/随机词稳健性余量，不是召回硬前提；不要把它写成
+“2240 选错块”。选择器在 coherent NIAH 下 2240 也是对的。

@@ -456,3 +456,15 @@ filler 对照表明这**不是距离上限**。8192 → 16384 工作集不能恢
 OOD/对抗测试**，它让 10k/30k needle 失败，不能用来判“选择层选错”或
 “有效距离 45–60k”。选择器、页表、stage-in 全部无罪。
 质量门（NIAH/召回）应改用 coherent filler；随机词只保留作确定性冒烟。
+
+### 12.11 2240 工作集的 coherent needle 对照
+
+同一 coherent filler、90k 上下文、code 在 10k，池压到 80,544（部分驻留）：
+
+```text
+workspace=2240 → 输出 "- 42"（已召回 BLUEBIRD-42）
+workspace=8192 → 输出 "BLUEBIRD-42"
+```
+
+⇒ **2240 也能召回 coherent needle**；8192 是随机词/OOD 输入的稳健性余量，
+不是召回正确性的硬前提。profile 保留 8192，但注释已写明这一点。
