@@ -47,6 +47,8 @@ snap_max = 4
 prefix_cache = true
 # **本档的主开关**：前缀无感删除（图像段）
 image_evict = true
+# 叠转上限（到顶 ⇒ 下一轮删除改走整段重建；实测 32 轮 ≈ 13.7 ulp 最差元素）
+image_evict_delta_limit = 32
 vram_target = 0.8
 vram_reserve_mb = 1024
 

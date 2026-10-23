@@ -514,8 +514,8 @@ vLLM 那边的重转核**至今没落地**（PR 仍 open、env 门仍在、RFC �
 1. **27B / TP2 复测**：需要 `kv_fp8 = false` 档（当前 fp8 池 ⇒ boot 拒；fp8 的
    dequant→rotate→requant 另案 C2）。TP2 对称路径已写（同页表两 rank），未真机。
 2. **G6 的 COW**：现在 refs>1 直接整轮放弃；跨会话共享常态下会丢吸收机会。
-3. **漂移上限**：`delta_limit` + raw-K 重建（KVMem 已设计）未接；当前依赖快照
-   边界，多轮连删会逐轮叠旋转（f16 每次重转，误差可累积）。
+3. ~~**漂移上限**~~ ⇒ **已落地（见 §5quinquies）**：叠转轮数上限 + 到顶整段
+   重建（不是 raw-K 影子副本 —— 那要双份 KV；重建走全量 prefill，一次归零）。
 4. ~~**宿主/盘层快照重挂**~~ ⇒ **已落地（见下 §5quater）**。
 5. **多图 × 投机（DFlash2）**：0.8B 无 spec；27B 上需单独验证 verify 行与位置帧不混。
 
@@ -554,3 +554,44 @@ vLLM 那边的重转核**至今没落地**（PR 仍 open、env 门仍在、RFC �
 拒且原样不动"）/ `state::rekey_snap_moves_account_without_copy`（宿主/盘层随
 账走）。**未真机**：多会话把尾巴挤到宿主再删图这条端到端路径仍待 27B 档
 （§7 挂账 1）顺带验。
+
+### 5quinquies. 叠转漂移上限（2026-10-23 第三刀）
+
+问题：每次删除都是"**在已经重转过的 K 上**再乘 `R(−S)`"。f16 每轮约 0.4~0.6 ulp
+舍入，多轮叠转按随机游走累积 ⇒ 无上限时漂移可以长到几十 ulp。
+
+**选择：轮数上限 + 到顶整段重建**（不是 raw-K 影子副本）：
+- 影子副本要**双份 K**（与"删图省显存"的口径直接冲突），且 KVMem 的 raw-K 机器
+  本来就没接；
+- "重建"在本特性里有一个天然形态 = **全量 prefill**：`plan_fresh`（释放旧表 +
+  `rebase()`，`reset_gdn` 由 `cached_len == 0` 自动为真）⇒ 漂移与计数同时归零。
+  代价 = 一次全量 prefill（与一次冷启动同量纲），频率 = 每 `delta_limit` 次删除一次。
+
+落点：
+- `[pool] image_evict_delta_limit`（u32，**缺省 32**，`0` = 不限）→
+  `EngineKnobs::image_evict_delta_limit`；
+- `AgentSession::rot_rounds`（**单产地**：`apply_image_delete` 自增、
+  `rebase()` 归零；`reset()` **不清**它 —— 前缀命中的续写路径也调 `reset()`，
+  那不是重建）；
+- `scheduler::image_evict_rebase_due`（纯读；只对本轮**确实又要删图**的 turn
+  生效，否则白扔前缀命中）→ `plan_fresh`；
+- 观测：`ImgEvictLedger::rebased`（累计重建次数）+ `ImgEvictTrace::rot_rounds`
+  + counter `image_evict.rebase`。
+
+**叠转实测**（门 `kernels::kv_rope_k_shift_drift_under_repeats`：同页 N 次
+`R(−40)` ⇔ 一次 `R(−40N)`，差 = 纯 f16 累积舍入；配对量级取 ulp）：
+
+| N | 最差元素误差 | 折算 |
+|---:|---:|---:|
+| 4 | 2.52 ulp | 0.63 ulp/轮 |
+| 16 | 7.71 ulp | 0.48 ulp/轮 |
+| 32 | **13.73 ulp** | 0.43 ulp/轮 |
+| 64 | 25.21 ulp | 0.39 ulp/轮 |
+
+≈ `0.9·√N`（随机游走，不是线性）。缺省取 **32**（≈13.7 ulp 最差元素；
+单轮门 `G1` 的判据是 4 ulp，所以 32 轮仍在同一量级）。
+
+**门（真机）**：`gpu_image_evict_gate` 的 G7 臂（`image_evict_delta_limit = 1`）：
+会话 9 双重删除 —— 第一次吸收（`rot_rounds == 1`），第二次**不许**再吸收
+（`absorbed` 不变）且 `rot_rounds == 0` + `img_evict.rebased == 1`（证明真的走了
+整段重建，而不是"没认出来就退回旧路径"）。

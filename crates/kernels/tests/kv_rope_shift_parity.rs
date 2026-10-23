@@ -95,44 +95,43 @@ fn pool_init(n: usize) -> Vec<u16> {
         .collect()
 }
 
-#[owl_test(gpu)]
-fn kv_rope_k_shift_matches_host() {
-    let ctx = CudaContext::new(1).expect("ctx");
-    ctx.bind_to_thread().expect("bind");
-    let stream = ctx.default_stream();
-    let f = compile(
-        &ctx,
-        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_kv_rope_k_shift_f16")).as_str(),
-        "owl_kv_rope_k_shift_f16",
+/// **一次上传 → N 次发射 → 回读**(N 次同一 Δ;叠转门的执行面)。
+///
+/// 抽成模块级是为了让"单次对拍"与"叠转积累"共用同一条发射路径 ——
+/// 两处各写一份核参就是两套规范。
+#[allow(clippy::too_many_arguments)]
+fn run_shift_n(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    f: &cudarc::driver::CudaFunction,
+    base: &[u16],
+    pool_elems: usize,
+    cos1: &[f32],
+    sin1: &[f32],
+    blocks: &[u32],
+    rounds: usize,
+) -> Vec<u16> {
+    let mut d_k = unsafe { stream.alloc::<u16>(pool_elems) }.unwrap();
+    stream.memcpy_htod(base, &mut d_k).unwrap();
+    let mut d_c = unsafe { stream.alloc::<u16>(HALF) }.unwrap();
+    let mut d_s = unsafe { stream.alloc::<u16>(HALF) }.unwrap();
+    let cb: Vec<u16> = cos1.iter().map(|v| half_bits(*v)).collect();
+    let sb: Vec<u16> = sin1.iter().map(|v| half_bits(*v)).collect();
+    stream.memcpy_htod(&cb, &mut d_c).unwrap();
+    stream.memcpy_htod(&sb, &mut d_s).unwrap();
+    let mut d_b = unsafe { stream.alloc::<f32>(blocks.len()) }.unwrap();
+    let bl: Vec<f32> = blocks.iter().map(|b| *b as f32).collect();
+    stream.memcpy_htod(&bl, &mut d_b).unwrap();
+    let (kp, cp, sp, bp) = (
+        d_k.device_ptr(stream).0,
+        d_c.device_ptr(stream).0,
+        d_s.device_ptr(stream).0,
+        d_b.device_ptr(stream).0,
     );
-    let pool_elems = NB * HKV * HD * PAGE;
-    let base = pool_init(pool_elems);
-    // 页列表:跨页/非序(2,0,4)—— 逻辑序无关是契约的一部分
-    let blocks: [u32; 3] = [2, 0, 4];
-
-    // `run` = 一次完整"上传池 → 发射 → 回读"
-    let run = |cos1: &[f32], sin1: &[f32], blocks: &[u32]| -> Vec<u16> {
-        let mut d_k = unsafe { stream.alloc::<u16>(pool_elems) }.unwrap();
-        stream.memcpy_htod(&base, &mut d_k).unwrap();
-        let mut d_c = unsafe { stream.alloc::<u16>(HALF) }.unwrap();
-        let mut d_s = unsafe { stream.alloc::<u16>(HALF) }.unwrap();
-        let cb: Vec<u16> = cos1.iter().map(|v| half_bits(*v)).collect();
-        let sb: Vec<u16> = sin1.iter().map(|v| half_bits(*v)).collect();
-        stream.memcpy_htod(&cb, &mut d_c).unwrap();
-        stream.memcpy_htod(&sb, &mut d_s).unwrap();
-        let mut d_b = unsafe { stream.alloc::<f32>(blocks.len()) }.unwrap();
-        let bl: Vec<f32> = blocks.iter().map(|b| *b as f32).collect();
-        stream.memcpy_htod(&bl, &mut d_b).unwrap();
-        let (kp, cp, sp, bp) = (
-            d_k.device_ptr(&stream).0,
-            d_c.device_ptr(&stream).0,
-            d_s.device_ptr(&stream).0,
-            d_b.device_ptr(&stream).0,
-        );
-        let (hkv, hd, page, x, half) =
-            ((HKV) as u64, (HD) as u64, (PAGE) as u64, (X) as u64, (HALF) as u64);
-        let units = blocks.len() * HKV * (HALF / X);
-        let mut b = stream.launch_builder(&f);
+    let (hkv, hd, page, x, half) =
+        ((HKV) as u64, (HD) as u64, (PAGE) as u64, (X) as u64, (HALF) as u64);
+    let units = blocks.len() * HKV * (HALF / X);
+    for _ in 0..rounds {
+        let mut b = stream.launch_builder(f);
         b.arg(&cp)
             .arg(&sp)
             .arg(&bp)
@@ -150,10 +149,94 @@ fn kv_rope_k_shift_matches_host() {
             })
         }
         .unwrap();
-        stream.synchronize().unwrap();
-        let mut out = vec![0u16; pool_elems];
-        stream.memcpy_dtoh(&d_k, &mut out).unwrap();
-        out
+    }
+    stream.synchronize().unwrap();
+    let mut out = vec![0u16; pool_elems];
+    stream.memcpy_dtoh(&d_k, &mut out).unwrap();
+    out
+}
+
+/// **叠转累积误差门**(`image_evict_delta_limit` 的事实依据,2026-10-23)。
+///
+/// 同一页连续 `N` 次 `R(−S)` 与一次 `R(−N·S)` 数学等价 ⇒ 差 = **纯 f16 累积
+/// 舍入**。判据:配对量级 ≤ `N` ulp(每轮 ≤1 ulp 的上界);并打印实测系数,
+/// 供"一条链允许被重转多少次"定值。实测参考见
+/// `docs/devlog/memory/prefix-deletion.md` §5quinquies。
+#[owl_test(gpu)]
+fn kv_rope_k_shift_drift_under_repeats() {
+    let ctx = CudaContext::new(1).expect("ctx");
+    ctx.bind_to_thread().expect("bind");
+    let stream = ctx.default_stream();
+    let f = compile(
+        &ctx,
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_kv_rope_k_shift_f16")).as_str(),
+        "owl_kv_rope_k_shift_f16",
+    );
+    let pool_elems = NB * HKV * HD * PAGE;
+    let base = pool_init(pool_elems);
+    let blocks: [u32; 3] = [2, 0, 4];
+    let s_step = 40i64; // 与引擎门同量级的平移
+    let dg_per_half = HALF / X;
+    for &rounds in &[4usize, 16, 32, 64] {
+        let (c1, s1) = delta_row(s_step);
+        let many = run_shift_n(&stream, &f, &base, pool_elems, &c1, &s1, &blocks, rounds);
+        let (cn, sn) = delta_row(s_step * rounds as i64);
+        let once = run_shift_n(&stream, &f, &base, pool_elems, &cn, &sn, &blocks, 1);
+        let mut worst_ulp = 0f32;
+        let mut bad = 0usize;
+        for &b in &blocks {
+            let b = b as usize;
+            for h in 0..HKV {
+                for dg in 0..dg_per_half {
+                    for t in 0..PAGE {
+                        for d in 0..X {
+                            let lo = k_off(b, h, dg * X + d) + t * X;
+                            let hi = k_off(b, h, dg * X + d + HALF) + t * X;
+                            let scale = [many[lo], many[hi], once[lo], once[hi]]
+                                .iter()
+                                .map(|v| h2f(*v).abs())
+                                .fold(0f32, f32::max)
+                                .max(1e-3);
+                            let ulp = 2f32.powi(-10) * scale;
+                            for i in [lo, hi] {
+                                let e = (h2f(many[i]) - h2f(once[i])).abs();
+                                worst_ulp = worst_ulp.max(e / ulp);
+                                if e > rounds as f32 * ulp {
+                                    bad += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(bad, 0, "N={rounds}: 叠转误差超过 N ulp 上界({bad} 个元素)");
+        eprintln!(
+            "[drift] N={rounds:>3} · 最差 {:.2} ulp(= {:.2} ulp/轮)· 判据 ≤ {rounds} ulp",
+            worst_ulp,
+            worst_ulp / rounds as f32
+        );
+    }
+}
+
+#[owl_test(gpu)]
+fn kv_rope_k_shift_matches_host() {
+    let ctx = CudaContext::new(1).expect("ctx");
+    ctx.bind_to_thread().expect("bind");
+    let stream = ctx.default_stream();
+    let f = compile(
+        &ctx,
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_kv_rope_k_shift_f16")).as_str(),
+        "owl_kv_rope_k_shift_f16",
+    );
+    let pool_elems = NB * HKV * HD * PAGE;
+    let base = pool_init(pool_elems);
+    // 页列表:跨页/非序(2,0,4)—— 逻辑序无关是契约的一部分
+    let blocks: [u32; 3] = [2, 0, 4];
+
+    // `run` = 一次完整"上传池 → 发射 → 回读"
+    let run = |cos1: &[f32], sin1: &[f32], blocks: &[u32]| -> Vec<u16> {
+        run_shift_n(&stream, &f, &base, pool_elems, cos1, sin1, blocks, 1)
     };
 
     // ① Δ = 0 ⇒ 逐字节空操作

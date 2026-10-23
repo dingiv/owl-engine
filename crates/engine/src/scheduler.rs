@@ -498,12 +498,27 @@ impl<D: DeviceClient> RunningEngine<D> {
             // **前缀无感删除**(2026-10-23):先试"历史里正好少了一段**已标记**
             // 图像"。命中 ⇒ 后缀页保留 + K 重转 + 零重算;不命中 ⇒ 逐字节旧路径
             // (G5 兜底,`plan_image_delete` 全程纯读,失败零副作用)。
+            // **漂移上限**(2026-10-23):叠转次数到顶 ⇒ 本轮**整段重建**(全量
+            // prefill,漂移与计数归零),不在漂移上继续加。只对本轮真要删图
+            // 的 turn 生效 —— 否则白扔前缀命中。
             let (cached_len, restore_key, pending_loads, rerope) =
-                match self.plan_image_delete(&turn)? {
-                    Some(p) => self.apply_image_delete(p, &turn)?,
-                    None => {
-                        let (c, r, pl) = self.plan_prefix_reuse(&turn)?;
-                        (c, r, pl, None)
+                if self.image_evict_rebase_due(&turn)? {
+                    self.img_evict.rebased += 1;
+                    owl_shared::counter_add!("image_evict.rebase", 1);
+                    owl_shared::log_info!(
+                        "img-evict",
+                        "叠转到顶(delta_limit={})⇒ 本轮整段重建(全量 prefill)",
+                        self.boot.cfg.knobs.image_evict_delta_limit
+                    );
+                    let (c, r, pl) = self.plan_fresh(&turn)?;
+                    (c, r, pl, None)
+                } else {
+                    match self.plan_image_delete(&turn)? {
+                        Some(p) => self.apply_image_delete(p, &turn)?,
+                        None => {
+                            let (c, r, pl) = self.plan_prefix_reuse(&turn)?;
+                            (c, r, pl, None)
+                        }
                     }
                 };
             // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
@@ -611,6 +626,45 @@ impl<D: DeviceClient> RunningEngine<D> {
                 },
             });
             Ok(begin)
+    }
+
+    /// **漂移到顶?**(纯读;2026-10-23):本会话链被 Δ-rope 重转的次数已到
+    /// `image_evict_delta_limit` ⇒ 本轮改走**整段重建**。
+    ///
+    /// 只在"本轮确实又要删图"时生效 —— 其它 turn 照常前缀命中(不白扔复用面)。
+    /// `limit = 0` = 不限(逐字节旧行为)。
+    fn image_evict_rebase_due(&self, turn: &crate::turn::Turn) -> Result<bool> {
+        if !self.boot.cfg.knobs.image_evict || turn.deletion.is_none() {
+            return Ok(false);
+        }
+        let limit = self.boot.cfg.knobs.image_evict_delta_limit;
+        if limit == 0 {
+            return Ok(false);
+        }
+        let s = self.bank.sessions.session(turn.session_id)?;
+        Ok(s.rot_rounds >= limit)
+    }
+
+    /// **Fresh 起跑**(零复用):释放旧块表/旧 MTP 链 + 会话账归零(含叠转计数)。
+    ///
+    /// 两条路共用:普通前缀未命中 / 漂移到顶的**整段重建**。单产地律:
+    /// `rot_rounds` 只在 `apply_image_delete`(自增)与本函数的 `rebase()`
+    /// (归零)被写。
+    fn plan_fresh(
+        &mut self,
+        turn: &crate::turn::Turn,
+    ) -> Result<(usize, Option<owl_store::SnapKey>, Vec<(usize, owl_store::ChainHash)>)> {
+        let s = self
+            .bank
+            .sessions
+            .get_mut(turn.session_id)
+            .expect("submit 已建会话账");
+        let mut table = std::mem::take(&mut s.block_table);
+        self.bank.rel.leg.release_table(&mut table)?;
+        let mut mold = std::mem::take(&mut s.mtp_block_table);
+        self.bank.leg_mtp.release_table(&mut mold)?;
+        s.rebase();
+        Ok((0, None, Vec::new()))
     }
 
     /// **前缀无感删除的决策**(纯 host;`Ok(None)` = 不吸收,零副作用)。
@@ -918,6 +972,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         s.tokens.clear();
         s.tokens.extend_from_slice(&turn.prompt_ids[..d.cached_len]);
         s.chain.seed(d.cached_len / page, d.tail_hash);
+        // 叠转计数(漂移上限的真源):只在本函数自增
+        s.rot_rounds = s.rot_rounds.saturating_add(1);
+        let rot_rounds = s.rot_rounds;
         // **观测账**(门与运维的唯一事实面;日志只是它的附属)
         self.img_evict.absorbed += 1;
         self.img_evict.last = Some(crate::running::ImgEvictTrace {
@@ -927,6 +984,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             shift: d.rerope.shift,
             pages: d.rerope.pages.clone(),
             rekeyed: d.rekeyed,
+            rot_rounds,
         });
         Ok((d.cached_len, d.restore_key, Vec::new(), Some(d.rerope)))
     }
@@ -1045,20 +1103,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                     pending_loads,
                 ))
             } else {
-                let mut table = std::mem::take(&mut s.block_table);
-                self.bank.rel.leg.release_table(&mut table)?;
-                let mut mold = std::mem::take(&mut s.mtp_block_table);
-                self.bank.leg_mtp.release_table(&mut mold)?;
-                s.reset();
-                Ok((0, None, Vec::new()))
+                self.plan_fresh(turn)
             }
         } else {
-            let mut table = std::mem::take(&mut s.block_table);
-            self.bank.rel.leg.release_table(&mut table)?;
-            let mut mold = std::mem::take(&mut s.mtp_block_table);
-            self.bank.leg_mtp.release_table(&mut mold)?;
-            s.reset();
-            Ok((0, None, Vec::new()))
+            self.plan_fresh(turn)
         }
     }
 

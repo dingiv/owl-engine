@@ -201,6 +201,8 @@ pub struct RunningEngine<D: DeviceClient> {
 pub struct ImgEvictLedger {
     /// 累计吸收次数(一次 turn 最多一次)
     pub absorbed: u64,
+    /// 累计**整段重建**次数(叠转到顶 `image_evict_delta_limit`;漂移归零)
+    pub rebased: u64,
     /// 最近一次的决策事实(`None` = 还没吸收过)
     pub last: Option<ImgEvictTrace>,
 }
@@ -222,8 +224,11 @@ pub struct ImgEvictTrace {
     pub shift: i64,
     /// 被原地重转的**物理页**(= 复用后缀页,逻辑序)
     pub pages: Vec<u32>,
-    /// 设备层快照重挂条数
+    /// 快照重挂条数(设备 + 宿主;盘层异步另计)
     pub rekeyed: usize,
+    /// **本会话链累计被重转的次数**(漂移账;到 `image_evict_delta_limit`
+    /// 后下一轮删除触发整段重建)
+    pub rot_rounds: u32,
 }
 
 /// **boot 期定型、运行期只读**的事实。

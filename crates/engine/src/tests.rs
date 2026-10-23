@@ -4838,6 +4838,9 @@ pub async fn gpu_image_evict_gate() {
             vision: true,
             prefix_cache: true,
             image_evict: true,
+            // **叠转上限降到 1**:让 G7 臂第一次删除吸收(rot=1)、第二次删除
+            // 必然到顶 ⇒ 整段重建(门要的是"到顶真的重建",不是数值)
+            image_evict_delta_limit: 1,
             prefix_cache_share: 1.0,
             // 钉小池(门只跑 ~700 tok;auto 池算式在本机会被"预算可服务上限"
             // 拒 —— 与本特性无关的既有面)
@@ -5156,6 +5159,106 @@ pub async fn gpu_image_evict_gate() {
         running.img_evict.absorbed, 1,
         "未标记的图被删时**不许**吸收(引擎不自作主张)"
     );
+
+    // ── G7 臂:**叠转上限**(delta_limit=1)── 第二次删除必须整段重建 ──
+    //
+    // 会话 9:turn 1 两张可删图 ⇒ turn 2 删第一张(吸收,rot=1 ⇒ 到顶)⇒
+    // turn 3 删第二张时**不许**再叠转,改走全量 prefill(漂移与计数归零)。
+    {
+        let g7_p1 = running.boot.tok.chat_format().render_chat(
+            &[
+                ("system", "你是助手,按约定回答。"),
+                (
+                    "user",
+                    &format!("{}{}{}{}{}{q1}", p_text(1), item(0), mid, item(1), p_text(1)),
+                ),
+            ],
+            false,
+        );
+        let (_, g7t1) = running
+            .submit_session_opts(
+                Some(9),
+                g7_p1.as_str(),
+                6,
+                crate::turn::TurnOpts {
+                    images: vec![
+                        crate::turn::TurnImage { image: mk_img(0.2), evict: true },
+                        crate::turn::TurnImage { image: mk_img(0.3), evict: true },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .expect("G7 t1 提交");
+        let g7_text1 = drive_turn(&mut running, g7t1).await;
+        assert!(!g7_text1.trim().is_empty(), "G7 t1 必须出文本");
+        let absorbed_after_t1 = running.img_evict.absorbed;
+
+        // turn 2:删第一张(吸收;rot_rounds = 1 = limit ⇒ 到顶)
+        let g7_p2 = running.boot.tok.chat_format().render_chat(
+            &[
+                ("system", "你是助手,按约定回答。"),
+                ("user", &format!("{}{}{}{}{q1}", p_text(1), mid, item(1), p_text(1))),
+                ("assistant", &g7_text1),
+                ("user", q2),
+            ],
+            false,
+        );
+        let (_, g7t2) = running
+            .submit_session_opts(
+                Some(9),
+                g7_p2.as_str(),
+                6,
+                crate::turn::TurnOpts {
+                    images: vec![crate::turn::TurnImage { image: mk_img(0.3), evict: true }],
+                    ..Default::default()
+                },
+            )
+            .expect("G7 t2 提交");
+        let g7_text2 = drive_turn(&mut running, g7t2).await;
+        assert!(!g7_text2.trim().is_empty(), "G7 t2 必须出文本");
+        assert_eq!(
+            running.img_evict.absorbed,
+            absorbed_after_t1 + 1,
+            "第一次删除应当被吸收(没到顶)"
+        );
+        assert_eq!(
+            running.bank.sessions.session(9).expect("会话 9").rot_rounds,
+            1,
+            "吸收一轮 ⇒ 叠转计数 1"
+        );
+
+        // turn 3:删第二张 —— 到顶 ⇒ 整段重建(不吸收、cached_len = 0)
+        let q4 = "再确认一次。";
+        let g7_p3 = running.boot.tok.chat_format().render_chat(
+            &[
+                ("system", "你是助手,按约定回答。"),
+                ("user", &format!("{}{}{}", p_text(1), mid, p_text(1))),
+                ("assistant", &g7_text2),
+                ("user", q4),
+            ],
+            false,
+        );
+        let (_, g7t3) = running
+            .submit_session_opts(Some(9), g7_p3.as_str(), 6, crate::turn::TurnOpts::default())
+            .expect("G7 t3 提交");
+        let g7_text3 = drive_turn(&mut running, g7t3).await;
+        assert!(!g7_text3.trim().is_empty(), "G7 t3(重建)必须出文本");
+        // 判据要看**重建的痕迹**,不是 turn 收口后的 cached_len(turn 收口会把
+        // cached_len 写成新链长度 —— 任何路径都不是 0):
+        //   ① 叠转计数归零(只有 rebase 路径会清零;不吸收的旧路径会留着 1);
+        //   ② 计数器 `image_evict.rebase` 涨了 1(决策面的唯一事实)。
+        let s9 = running.bank.sessions.session(9).expect("会话 9");
+        assert_eq!(s9.rot_rounds, 0, "重建 ⇒ 叠转计数归零");
+        assert_eq!(
+            running.img_evict.rebased, 1,
+            "到顶必须走一次整段重建(观测账 img_evict.rebased)"
+        );
+        assert_eq!(
+            running.img_evict.absorbed,
+            absorbed_after_t1 + 1,
+            "到顶那一轮**不许**再吸收(叠转上限是硬门)"
+        );
+    }
 
     eprintln!(
         "[test] 前缀无感删除:删 [{}, {})={} tok · 保留后缀 {} 页 · S={} · 重挂 {} · 轮时 prefill 事件 {} · K 最差 {:.2}×4ulp",

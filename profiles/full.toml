@@ -169,6 +169,11 @@ prefix_cache = false
 # **引擎不自作主张**:没有标记的图一律走旧路径。需 prefix_cache = true 且
 # f16 KV(kv_fp8 = false)。缺省关 = 逐字节旧行为。
 image_evict = false
+# **叠转上限**(2026-10-23):一条链允许被 K 重转的次数;到顶后**下一轮删除
+# 触发一次整段重建**(全量 prefill + GDN 重置,漂移与计数归零)。
+# f16 每轮约 0.4~0.6 ulp,实测 N=4/16/32/64 ⇒ 2.5/7.7/13.7/25.2 ulp(最差元素;
+# 门 `kv_rope_k_shift_drift_under_repeats`)。缺省 32 ≈ 13.7 ulp;0 = 不限。
+image_evict_delta_limit = 32
 # 解释器块池预算(字节;0 = 关)
 block_pool_bytes = 0
 # 关活性中途回收(诊断;开会无界常驻)

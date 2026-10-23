@@ -73,6 +73,7 @@
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true |
 //! | pool | image_evict | bool / false(**前缀无感删除**:客户端给可删图像打标记 ⇒ 引擎页对齐 + 删除即位置帧平移) |
+//! | pool | image_evict_delta_limit | u32 / 32(一条链允许被重转的次数;到顶后下一轮删除触发整段重建;0 = 不限) |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
 //! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
 //! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
@@ -613,6 +614,15 @@ pub struct PoolCfg {
     /// 依赖:`prefix_cache = true`(内容寻址取旧链)与 f16 KV(paged kNHD;
     /// fp8 池需 dequant→requant,未做)。
     pub image_evict: bool,
+    /// **漂移上限 = 一条链允许被重转的次数**(`[pool].image_evict_delta_limit`;
+    /// 缺省 **32**;`0` = 不限)。
+    ///
+    /// 每次删除都是"在已经重转过的 K 上再乘 R(−S)" —— f16 每轮约 0.4~0.6 ulp
+    /// 舍入,多次叠转按随机游走累积(实测 N=4/16/32/64 ⇒ 2.5/7.7/13.7/25.2 ulp,
+    /// 门 `kv_rope_k_shift_drift_under_repeats`)。到顶后**下一轮删除触发一次
+    /// 整段重建**(全量 prefill,`reset_gdn`;漂移归零、计数归零),而不是
+    /// 在漂移上继续加。只在本键开(`image_evict`)时生效。
+    pub image_evict_delta_limit: u32,
     /// **解释器块池预算**(字节;0 = 关 = 逐节点 alloc/free 存量路径)。
     /// 原 `OWL_BLOCK_POOL` env;P1″ 块竞技场(见 `interpreters::eval`)。
     pub block_pool_bytes: usize,
@@ -1577,6 +1587,7 @@ impl Default for PoolCfg {
             vram_reserve_mb: 1024,
             prefix_cache: true,
             image_evict: false,
+            image_evict_delta_limit: 32,
             block_pool_bytes: 0,
             no_reclaim: false,
             vram_budget_mb: None,

@@ -82,6 +82,11 @@ pub struct EngineKnobs {
     /// (`R(−S)`),不重算删点之后的 token。依赖 `prefix_cache` + f16 分页池
     /// + 视觉档(boot 门;任缺 = 拒启)。
     pub image_evict: bool,
+    /// **漂移上限 = 一条链允许被重转的次数**(`[pool].image_evict_delta_limit`;
+    /// 缺省 32;`0` = 不限)。到顶后**下一轮删除触发一次整段重建**(全量
+    /// prefill + `reset_gdn`)—— 漂移与计数同时归零(不在漂移上继续加)。
+    /// 32 的依据:叠转实测 13.7 ulp(最差元素,`drift_under_repeats` 门)。
+    pub image_evict_delta_limit: u32,
     /// **前缀缓存份额**(0..1;`[pool].prefix_cache_share`;缺省 0.5 = 旧 `nb/2`)。
     /// 容量算式在 store(`CachePolicy::Share`),这里只是**政策输入**。
     pub prefix_cache_share: f64,
@@ -302,6 +307,7 @@ impl Default for EngineKnobs {
             prefix_cache: true,
             bulk_drop_when_tier_full: false,
             image_evict: false,
+            image_evict_delta_limit: 32,
             prefix_cache_share: 0.5,
             host_cache_mb: 0,
             snap_host_mb: 0,
@@ -611,6 +617,7 @@ impl EngineKnobs {
             prefix_cache: cfg.pool.prefix_cache,
             bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
             image_evict: cfg.pool.image_evict,
+            image_evict_delta_limit: cfg.pool.image_evict_delta_limit,
             prefix_cache_share: cfg.pool.prefix_cache_share,
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
             host_cache_mb: cfg.pool.host_cache_mb,
