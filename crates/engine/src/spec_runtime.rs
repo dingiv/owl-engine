@@ -72,7 +72,9 @@ pub(crate) struct SpecRuntime {
     /// `None` = 非 DFlash2 档(池不分配)
     pub draft_geom: Option<(usize, usize, usize)>,
     /// **草稿环窗口**(token;DFlash2 = 检查点 sliding_window / 配置覆盖)。
-    /// 0 = 非 DFlash2。
+    /// 0 = 非 DFlash2。⚠️ 当前 main 的 NC ring 固定 2048（K15 前），
+    /// 本字段保留给后续可配窗口；不要在热路径依赖它。
+    #[allow(dead_code)]
     pub draft_window: usize,
     /// **草稿算子环境**(2026-10-19):池面之外的另一半几何事实 ——
     /// `head_dim`/`grp` 取**草稿自己的**(DFlash2 = 128 / hq÷hkv),其余字段

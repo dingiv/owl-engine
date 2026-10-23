@@ -4850,7 +4850,6 @@ pub async fn gpu_image_evict_gate() {
             vision: true,
             prefix_cache: true,
             image_evict: true,
-            prefix_cache_share: 1.0,
             // 钉小池(门只跑 ~700 tok;auto 池算式在本机会被"预算可服务上限"
             // 拒 —— 与本特性无关的既有面)
             pool_tokens: Some(2048),
