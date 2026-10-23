@@ -20,6 +20,10 @@ use std::pin::Pin;
 use super::observe::{BlockRef, BlockStats, NodeEvent, Tap, Want};
 use super::planner::BlockPool;
 
+/// AR-2 小包上限:verify m=8 × hidden 5120 × f16 = 80KiB;
+/// 256KiB 覆盖 verify/propose,且远小于 prefill chunk(1.3MB)。
+const TP_AR2_MAX_BYTES: usize = 256 * 1024;
+
 // ============================================================================
 // §0 性能钩子(perf-framework.md §四)
 // ============================================================================
@@ -1254,6 +1258,33 @@ where
                     // **融合档**(§11.2;缺省关 —— 配置显式开):一核做完两段。
                     // 只非 fp8 载荷(fp8 腿仍两核 —— 阈值与 `ar_f8` 同源)。
                     let f8_leg = tp.ar_f8 && n_bytes >= 262_144;
+                    // **AR-2(2026-10-23)**:小包 graph 专用 barrier-only。
+                    // 只走非 fp8、≤256KiB;verify m=8 = 80KB 必须覆盖;大包/预填充仍走 fused 或两核。
+                    // 10KB decode 实测 SGLang 一阶段 9.3µs vs owl fused+push 26.3µs;
+                    // 目标 = 去掉 produced/consumed 信用/尾部 rendezvous/全线程 fence。
+                    let ar2_leg = tp.ar2 && !f8_leg && n_bytes <= TP_AR2_MAX_BYTES;
+                    if ar2_leg {
+                        owl_shared::metrics::with_metrics_store(|s| {
+                            s.counter_add("tp.ar.ar2", 1, file!(), line!())
+                        });
+                        // AR-2 固定 v1 数据腿(写本端、读对端):协议用
+                        // produced/consumed 游标,不依赖 push;避免 push 时
+                        // 写对端与 header 语义混淆。
+                        let call = owl_kernels::client::comm::ArFusedCall::new(
+                            out.clone(),
+                            tp.own.clone(),
+                            tp.peer.clone(),
+                            tp.own.clone(),
+                            tp.peer.clone(),
+                            n_bytes as u64,
+                            tp.slot_bytes,
+                            0,
+                        )
+                        .with_barrier(true)
+                        .to_launch();
+                        emit_launch_pooled(ctx.face, ctx.pool.is_some(), call).await?;
+                        return Ok(out);
+                    }
                     if tp.ar_fused && !f8_leg {
                         owl_shared::metrics::with_metrics_store(|s| {
                             s.counter_add("tp.ar.fused", 1, file!(), line!())
@@ -1480,6 +1511,7 @@ mod tp_injection_tests {
             push: false,
             ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
             ar_fused: false, // 测试档:两核路(融合档由配置开)
+            ar2: false, // 测试档:不走 barrier-only
         };
         let err = eval_ops_scoped_env(
             &row_node(),
@@ -1519,6 +1551,7 @@ mod tp_injection_tests {
             push: false,
             ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
             ar_fused: false, // 测试档:两核路(融合档由配置开)
+            ar2: false, // 测试档:不走 barrier-only
         };
         let err = eval_ops_scoped_env(
             &row_node(),

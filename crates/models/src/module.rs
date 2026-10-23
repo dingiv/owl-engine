@@ -168,6 +168,9 @@ pub struct TpCtx {
     /// ★ **v1 两核融合档**(§11.2;2026-10-19):`true` ⇒ 一核做完两段
     /// (`ArFusedCall`);**只非 fp8 载荷**(fp8 腿仍两核)。缺省 false。
     pub ar_fused: bool,
+    /// ★ **barrier-only AR-2**(2026-10-23):小包 graph 专用;与 fused 同线格式,
+    /// 复用 v1 produced/consumed 相对游标,单 block 去掉尾部 rendezvous。
+    pub ar2: bool,
 }
 
 impl TpCtx {

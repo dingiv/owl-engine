@@ -31,13 +31,23 @@
 //! OWL_TP_HEAD_SPEC=1 OWL_TP_HEAD_ARM=i8 ...   # spec m=7/8 质量门
 //! OWL_TP_HEAD_SPEC=1 OWL_TP_HEAD_ARM=a8 ...
 //! OWL_TP_HEAD_ARM=compare_a8 ...
+//!
+//! # 32K fixed-tail / 采样档（2026-10-23）
+//!
+//! ```bash
+//! python3 tools/fixedtail_prompt.py --length 32768 --out /tmp/fixedtail32k.txt
+//! OWL_TP_HEAD_SPEC=1 OWL_TP_HEAD_PROMPT_FILE=/tmp/fixedtail32k.txt \
+//! OWL_TP_HEAD_CTX=35000 OWL_TP_HEAD_N=64 OWL_TP_HEAD_ARM=i8 ... # 再跑 f16 后 compare
+//! OWL_TP_HEAD_SAMPLE=1 OWL_TP_HEAD_TEMP=0.1 OWL_TP_HEAD_SEED=12345 ... # 采样门
+//! OWL_TP_HEAD_DEPTH=15 ... # K=15 单 block（默认 depth=7）
+//! OWL_TP_AR_FUSED=1 OWL_TP_AR2=1 OWL_TP_AR_F8=1 ... # TP AR 融合/AR-2 / 生产同参
 //! ```
 //! `A`/`B` = TP2 双 rank 卡(**CUDA ordinal**;本机 3080 对 = `2,3`)。
 //! 臂文件 = `$OWL_TP_HEAD_OUT`(缺省 `/tmp/owl-tp-head-<arm>.txt`)。
 
 use std::path::{Path, PathBuf};
 
-use owl_engine::{Engine, EngineConfig, EngineKnobs, TpEngine};
+use owl_engine::{Engine, EngineConfig, EngineKnobs, TpEngine, TpOpts};
 use owl_models::module::QuantPlan;
 use owl_shared::config::HeadQuant;
 
@@ -86,9 +96,43 @@ fn head_quant_of(plan: QuantPlan) -> HeadQuant {
 
 /// 两臂同参:greedy(设备 argmax)+ 关前缀缓存(同 `tp_vocab_split_gate`)。
 /// spec 臂按生产 DFlash2 d7:草稿双 rank 放行 + 单快照 + 160MB capture slab。
+fn sample_on() -> bool {
+    matches!(std::env::var("OWL_TP_HEAD_SAMPLE").as_deref(), Ok("1") | Ok("true"))
+}
+
+fn flag(k: &str) -> bool {
+    matches!(std::env::var(k).as_deref(), Ok("1") | Ok("true"))
+}
+
+/// TP 装配档:默认全关(与旧 `assemble` 等价);`OWL_TP_AR_FUSED=1` /
+/// `OWL_TP_AR2=1` 显式开融合/小包 AR-2,供 nsys/round A/B 使用。
+fn tp_opts() -> TpOpts {
+    TpOpts {
+        push: flag("OWL_TP_PUSH"),
+        ar_f8: flag("OWL_TP_AR_F8"),
+        ar_fused: flag("OWL_TP_AR_FUSED"),
+        ar2: flag("OWL_TP_AR2"),
+        one_stage: flag("OWL_TP_1STAGE"),
+    }
+}
+
 fn knobs_for(plan: QuantPlan, dir: &Path) -> EngineKnobs {
     let mut k = EngineKnobs::default();
-    k.sampler_enabled = false;
+    k.sampler_enabled = sample_on();
+    if sample_on() {
+        k.sampler.temp = std::env::var("OWL_TP_HEAD_TEMP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.7);
+        k.sampler.topk = std::env::var("OWL_TP_HEAD_TOPK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        k.sampler.topp = std::env::var("OWL_TP_HEAD_TOPP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.95);
+    }
     k.prefix_cache = false;
     k.head_quant = head_quant_of(plan);
     if spec_on() {
@@ -111,9 +155,13 @@ fn knobs_for(plan: QuantPlan, dir: &Path) -> EngineKnobs {
 }
 
 fn cfg_of(ordinal: usize, chunk: usize, knobs: EngineKnobs) -> EngineConfig {
+    let max_seq = std::env::var("OWL_TP_HEAD_CTX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1024);
     EngineConfig {
         device_ordinal: ordinal,
-        max_seq_tokens: 1024,
+        max_seq_tokens: max_seq,
         prefill_chunk: chunk,
         knobs,
     }
@@ -135,6 +183,7 @@ async fn run_arm(
     plan: QuantPlan,
     vsplit: bool,
     n: usize,
+    prompts: &[String],
 ) -> (Vec<Vec<u32>>, usize) {
     let chunk: usize = std::env::var("OWL_TP_HEAD_CHUNK")
         .ok()
@@ -162,7 +211,7 @@ async fn run_arm(
         .load_qwen38_27b_awq(dir, dir, plan, QuantPlan::W4A16Awq)
         .await
         .expect("rank1 分片装载");
-    let tp = TpEngine::assemble(vec![e0, e1], vec![m0, m1])
+    let tp = TpEngine::assemble_with(vec![e0, e1], vec![m0, m1], tp_opts())
         .await
         .expect("TP2 装配");
     // ★ 词表切的结构判据(装配侧形状单源):两 rank 头等宽、合计 = 全词表;
@@ -185,6 +234,11 @@ async fn run_arm(
     };
     let mut r = tp.run().expect("TP2 进执行态");
     assert!(r.has_peer(), "TP2 执行态必须带 peer 束");
+    let opts = tp_opts();
+    eprintln!(
+        "[tp-head] TpOpts: push={} ar_f8={} ar_fused={} ar2={} one_stage={}",
+        opts.push, opts.ar_f8, opts.ar_fused, opts.ar2, opts.one_stage
+    );
 
     // metrics 是进程级 OnceLock:必须在 turn 之前 init,否则 spec.* 全 0。
     let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());
@@ -193,11 +247,23 @@ async fn run_arm(
     // spec 档 logits 槽可能是 [8, vocab] verify 块,跨行扫 top2 无意义 ⇒ 跳过。
     let top2 = std::env::var("OWL_TP_HEAD_TOP2").as_deref() == Ok("1") && !spec_on();
     let mut out = Vec::new();
-    for (i, p) in PROMPTS.iter().enumerate() {
+    for (i, p) in prompts.iter().enumerate() {
         let sid = 7 + i as u64;
-        let (sid, turn) = r
-            .submit_session_ex(Some(sid), *p, n, true)
-            .expect("submit");
+        let opts = if sample_on() {
+            owl_engine::turn::TurnOpts {
+                ignore_eos: true,
+                sampler: Some(owl_engine::turn::TurnSampler {
+                    temp: Some(std::env::var("OWL_TP_HEAD_TEMP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.7)),
+                    topk: Some(std::env::var("OWL_TP_HEAD_TOPK").ok().and_then(|s| s.parse().ok()).unwrap_or(20)),
+                    topp: Some(std::env::var("OWL_TP_HEAD_TOPP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.95)),
+                }),
+                seed: Some(std::env::var("OWL_TP_HEAD_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(12345)),
+                ..Default::default()
+            }
+        } else {
+            owl_engine::turn::TurnOpts { ignore_eos: true, ..Default::default() }
+        };
+        let (sid, turn) = r.submit_session_opts(Some(sid), p, n, opts).expect("submit");
         let prompt_len = r.turn_prompt_len(turn).expect("prompt 长度");
         // 逐步计时(decode 段):首 token 到末 token 的墙钟 ⇒ ms/tok。
         // 24B 的 int8 头收益 ≈ 0.87 ms/tok(1.76 → 0.89),要分辨它需 ≥256 tok。
@@ -277,8 +343,41 @@ async fn run_arm(
             .sum()
         };
         let rounds = cnt("spec.rounds");
-        let hist: Vec<u64> = (0..=7).map(|m| cnt(&format!("spec.m{m}"))).collect();
-        eprintln!("[tp-head] spec 账:rounds={rounds} m 直方图 [m0..m7]={hist:?}");
+        let hist: Vec<u64> = (0..=owl_shared::config::SPEC_DEPTH_MAX)
+            .map(|m| cnt(&format!("spec.m{m}")))
+            .collect();
+        let n_v1 = cnt("tp.ar.v1");
+        let n_fused = cnt("tp.ar.fused");
+        let n_push = cnt("tp.ar.push");
+        let n_ar2 = cnt("tp.ar.ar2");
+        eprintln!(
+            "[tp-head] spec 账:rounds={rounds} m 直方图 [m0..m{}]={hist:?} q={} none={} reject={}",
+            owl_shared::config::SPEC_DEPTH_MAX,
+            cnt("spec.q.round"),
+            cnt("spec.q.none"),
+            cnt("spec.reject")
+        );
+        eprintln!(
+            "[tp-head] AR 路径账:v1={n_v1} fused={n_fused} ar2={n_ar2} push={n_push}"
+        );
+        if opts.ar2 {
+            assert!(n_ar2 > 0, "开了 ar2 但一次都没走到");
+            // 预填充/propose 的大包仍走 fused;这里只要求小包路径真的进 ar2。
+            // 未开 fused 时,大包/预填充走 v1 两核也是预期。
+        } else if opts.ar_fused {
+            assert!(n_fused > 0, "开了 ar_fused 但一次都没走到");
+            // fp8 大载荷腿仍走两核(融合核只非 fp8)⇒ ar_f8 档允许 v1 存在,
+            // 但 decode 小载荷必须已走 fused(上面的 n_fused > 0)。
+            if !opts.ar_f8 {
+                assert_eq!(n_v1, 0, "融合档下不应走 v1 两核");
+            }
+        } else {
+            assert!(n_v1 > 0, "未开融合时应有 v1 两核路径");
+            assert_eq!(n_fused, 0, "未开融合却走了 fused 路径");
+        }
+        if !opts.ar2 {
+            assert_eq!(n_ar2, 0, "未开 ar2 却走了 barrier 路径");
+        }
         for tag in ["spec.round", "spec.verify", "spec.propose"] {
             let r = owl_shared::metrics::query_metrics(
                 &owl_shared::metrics::MetricsFilter::new().tag(tag),
@@ -365,6 +464,10 @@ fn tp_head_i8_gate() {
         owl_shared::testkit::report::skip(format_args!("27B 检查点不在 {dir:?}"));
         return;
     }
+    let prompts: Vec<String> = match std::env::var("OWL_TP_HEAD_PROMPT_FILE") {
+        Ok(f) => vec![std::fs::read_to_string(&f).unwrap_or_else(|e| panic!("读 prompt 文件 {f} 失败:{e}"))],
+        Err(_) => PROMPTS.iter().map(|s| (*s).to_string()).collect(),
+    };
     let plan = match arm.as_str() {
         "f16" => QuantPlan::F16,
         "i8" => QuantPlan::I8W,
@@ -378,7 +481,7 @@ fn tp_head_i8_gate() {
                 .build()
                 .expect("rt")
                 .block_on(async move {
-                    let (toks, width) = run_arm(&dir, oa, ob, plan, vsplit, n).await;
+                    let (toks, width) = run_arm(&dir, oa, ob, plan, vsplit, n, &prompts).await;
                     let vocab = 248320usize;
                     if vsplit {
                         assert_eq!(width * 2, vocab, "运行时 logits 宽 ×2 ≠ 词表({width}×2 vs {vocab})");
@@ -387,7 +490,7 @@ fn tp_head_i8_gate() {
                         assert_eq!(width, vocab, "不切档时 logits 宽应 = 全词表({width} vs {vocab})");
                     }
                     let mut out = String::new();
-                    for (p, t) in PROMPTS.iter().zip(toks.iter()) {
+                    for (p, t) in prompts.iter().zip(toks.iter()) {
                         out.push_str(&format!(
                             "{}\t{}\n",
                             p.replace('\t', " "),

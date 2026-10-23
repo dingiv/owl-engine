@@ -34,6 +34,20 @@ vision = true
 [parallel]
 mode = "tensor"
 tp_ar_f8 = true
+# **AR 一核融合(2026-10-23 转正)**:decode 小载荷(<256KiB)走
+# `owl_comm_ar_fused_{f16,bf16}`;大载荷仍按 `tp_ar_f8` 走两核 f8 腿
+# (融合核只非 fp8)。K7 1k 受控 A/B:round −0.5~−0.6%、verify −0.7~−0.9%、
+# token 逐位相同;nsys 核时 AR 198.0→173.3ms(−12.5%)。
+# 回退 = 删本行或 `--set parallel.tp_ar_fused=false`。
+tp_ar_fused = true
+# **AR-2 barrier-only(2026-10-23 转正)**:verify/propose 的 80KB 小包走
+# 单 block、v1 produced/consumed 相对游标 + release/acquire;去掉尾部
+# rendezvous/wait_done/blocks_done 与全线程 system fence。
+# K7 1k(无 push): round 34.586→**33.316ms(−3.7%)**、verify 27.002→**25.975ms(−3.8%)**;
+# f8 档 34.392→**32.968ms(−4.1%)**、verify 26.978→**25.764ms(−4.5%)**;
+# 大包/prefill 仍走 fused/v1(f8 腿不变)。
+# 回退 = 删本行或 `--set parallel.tp_ar2=false`。
+tp_ar2 = true
 device = ["3080", "3080"]
 
 [runtime]

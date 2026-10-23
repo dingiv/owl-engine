@@ -58,7 +58,7 @@
 //! | runtime | test_device / server_url | 测试域 / CLI(不入 toml) |
 //! | parallel | mode | ParallelMode 枚举 single\|tensor\|layer / single(layer 暂未支持=拒) |
 //! | parallel | device | [String] 卡位(BDF / UUID / find-name;**禁 CUDA 序号**);空 = 自动挑空闲卡 |
-//! | parallel | tp_push / tp_ar_f8 / tp_vocab_split / tp_ar_fused / tp_one_stage | TP 档(见字段注) |
+//! | parallel | tp_push / tp_ar_f8 / tp_vocab_split / tp_ar_fused / tp_ar2 / tp_one_stage | TP 档(见字段注) |
 //! | model | format | ModelFormat 枚举 safetensors\|awq\|gguf / safetensors |
 //! | model | path / name | Option<PathBuf> / None(模型目录或 .gguf 单文件) |
 //! | model | awq27b_dir | Option<String> / None(27B AWQ 检查点门控) |
@@ -416,6 +416,12 @@ pub struct ParallelCfg {
     /// 少发一个核 ≈ decode +4%。**只非 fp8 载荷**；两 rank 同装配。
     #[serde(default)]
     pub tp_ar_fused: bool,
+    /// **barrier-only AR-2**(2026-10-23)：小包(≤256KiB)/非 fp8 的 graph AR
+    /// 走单 block、v1 produced/consumed 相对游标 + release/acquire；去掉尾部
+    /// rendezvous、`wait_done/blocks_done` 与全线程 system fence。
+    /// 需 `mode = "tensor"`；与 `tp_one_stage` 互斥。缺省 false；两 rank 同装配。
+    #[serde(default)]
+    pub tp_ar2: bool,
     /// **1-stage 对称 arena 档**(§35 2026-10-18)：staging 换对称 arena，结构更对
     /// 但实测**中性** ⇒ 缺省关。互斥与前提(validate 拒启，不静默失效)：
     /// 与 `tp_push` 互斥；需 `mode = "tensor"`。
@@ -432,6 +438,7 @@ impl Default for ParallelCfg {
             tp_ar_f8: false,
             tp_vocab_split: false,
             tp_ar_fused: false,
+            tp_ar2: false,
             tp_one_stage: false,
         }
     }
@@ -2347,6 +2354,20 @@ impl OwlConfig {
         for d in &par.device {
             crate::device::DeviceSpec::parse(d).map_err(|e| format!("[parallel] device = {d:?}: {e}"))?;
         }
+        if par.tp_ar2 {
+            if par.mode != ParallelMode::Tensor {
+                return Err(
+                    "[parallel] tp_ar2 = true 需 mode = \"tensor\"(单卡档无 TP 通信,开关无效)"
+                        .to_string(),
+                );
+            }
+            if par.tp_one_stage {
+                return Err(
+                    "[parallel] tp_ar2 与 tp_one_stage 互斥(AR-2 走 staging 两段 barrier,不是对称 arena)"
+                        .to_string(),
+                );
+            }
+        }
         if par.tp_one_stage {
             if par.mode != ParallelMode::Tensor {
                 return Err(
@@ -2770,6 +2791,34 @@ mod prefill_tail_merge_tests {
         let c2 = OwlConfig::from_toml_str("[runtime]\nprefill_tail_merge = 1024\n").expect("解析");
         assert_eq!(c2.runtime.prefill_tail_merge, 1024);
         assert!(OwlConfig::from_toml_str("[runtime]\nprefill_tail_merge = -1\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod tp_ar2_tests {
+    use super::*;
+
+    #[test]
+    fn tp_ar2_defaults_off_and_requires_tensor() {
+        let c = OwlConfig::from_toml_str("[runtime]\nmax_seq = 128\n").expect("解析");
+        assert!(!c.parallel.tp_ar2, "AR-2 缺省必须关");
+        let e = OwlConfig::from_toml_str("[parallel]\ntp_ar2 = true\n").expect_err("单卡必须拒");
+        assert!(e.contains("tensor"), "拒语应点名 tensor: {e}");
+        let c = OwlConfig::from_toml_str(
+            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\ntp_ar2 = true\n",
+        )
+        .expect("TP2 + AR-2 合法");
+        assert!(c.parallel.tp_ar2);
+    }
+
+    #[test]
+    fn tp_ar2_rejects_one_stage() {
+        let e = OwlConfig::from_toml_str(
+            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\n\
+             tp_ar2 = true\ntp_one_stage = true\n",
+        )
+        .expect_err("必须拒");
+        assert!(e.contains("互斥"), "拒语应点名互斥: {e}");
     }
 }
 

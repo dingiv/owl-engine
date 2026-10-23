@@ -16,6 +16,9 @@ pub const COMM_AR_1STAGE: &str = "comm_ar_1stage";
 /// foreign-kernel 虚拟核名(**v1 两核融合**;§11.2 2026-10-19 —— 一核做完
 /// stage+reduce 同一协议,载荷仍是私有块)
 pub const COMM_AR_FUSED: &str = "comm_ar_fused";
+/// foreign-kernel 虚拟核名(**小包 barrier-only AR-2**;2026-10-23)
+/// 与 fused 同族(同 8 槽线格式),发射名走 `owl_comm_ar_barrier_*`。
+pub const COMM_AR_BARRIER: &str = "comm_ar_barrier";
 
 /// foreign 分派谓词(server `handle_launch` 前置检查)
 pub fn is_foreign(name: &str) -> bool {
@@ -23,6 +26,7 @@ pub fn is_foreign(name: &str) -> bool {
         || name == COMM_AR_REDUCE
         || name == COMM_AR_1STAGE
         || name == COMM_AR_FUSED
+        || name == COMM_AR_BARRIER
 }
 
 /// payload dtype → stage 发射名(**单源**;client 与 driver 共读)。
@@ -99,6 +103,18 @@ pub fn fused_entry(dt: crate::driver::DType) -> &'static str {
     }
 }
 
+/// payload dtype → **barrier-only AR-2** 发射名(单源;2026-10-23)。
+/// 只给小包 graph 档;大包/预填充仍走 fused 或两核。
+pub fn barrier_entry(dt: crate::driver::DType) -> &'static str {
+    use crate::driver::DType;
+    match dt {
+        DType::F32 => asset::BARRIER_F32,
+        DType::F16 => asset::BARRIER_F16,
+        DType::BF16 => asset::BARRIER_BF16,
+        other => panic!("comm.ar_barrier: 不支持 dtype {other:?}(f32/f16/bf16 三实例)"),
+    }
+}
+
 /// 设备码资产 + 发射常量(源在树 ⇒ build.rs 目录扫描自动纳入;
 /// 资产 id 与 `ops::comm` 的 `SRC` **同值** —— 改一处必改另一处,门会红)。
 pub mod asset {
@@ -132,6 +148,14 @@ pub mod asset {
     pub const FUSED_F32: &str = "owl_comm_ar_fused_f32";
     pub const FUSED_F16: &str = "owl_comm_ar_fused_f16";
     pub const FUSED_BF16: &str = "owl_comm_ar_fused_bf16";
+
+    /// **barrier-only AR-2**(2026-10-23):与 fused 同 8 槽线格式,
+    /// 但只做“写对端 → 起 barrier → 读本端加 → 止 barrier”;
+    /// 无 produced/consumed 信用、无尾部 rendezvous、无全线程 system fence。
+    pub const BARRIER_SRC: &str = "cu/comm/ar_barrier.cu";
+    pub const BARRIER_F32: &str = "owl_comm_ar_barrier_f32";
+    pub const BARRIER_F16: &str = "owl_comm_ar_barrier_f16";
+    pub const BARRIER_BF16: &str = "owl_comm_ar_barrier_bf16";
 
     /// 发射几何(v1 单 block 256 线程;设计 §3.2 —— 单写者游标的前提)
     ///

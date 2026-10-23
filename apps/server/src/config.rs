@@ -373,6 +373,8 @@ pub struct ServerConfig {
     pub tp_vocab_split: bool,
     /// **v1 两核融合档**（runtime.tp_ar_fused；§11.2）⇒ 交 `TpOpts.ar_fused`
     pub tp_ar_fused: bool,
+    /// **barrier-only AR-2**（runtime.tp_ar2；2026-10-23）⇒ 交 `TpOpts.ar2`
+    pub tp_ar2: bool,
     /// **1-stage 对称 arena 档**（runtime.tp_one_stage；§35）⇒ 交 `TpOpts.one_stage`。
     /// 缺省 false（实测中性）；与 `tp_push` 互斥、需 `tp_ordinals`（`validate` 拒启）。
     pub tp_one_stage: bool,
@@ -496,6 +498,7 @@ impl ServerConfig {
             tp_ar_f8: cfg.parallel.tp_ar_f8,
             tp_vocab_split: cfg.parallel.tp_vocab_split,
             tp_ar_fused: cfg.parallel.tp_ar_fused,
+            tp_ar2: cfg.parallel.tp_ar2,
             tp_one_stage: cfg.parallel.tp_one_stage,
             max_concurrency: cfg.runtime.max_concurrency,
             max_batch: cfg.runtime.max_batch,

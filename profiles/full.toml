@@ -91,6 +91,8 @@ tp_ar_f8 = false
 tp_vocab_split = false
 # v1 两核融合档(AR 一核做完两段;需 mode = tensor)
 tp_ar_fused = false
+# barrier-only AR-2(小包 graph;≤64KiB/非 fp8;需 mode = tensor,与 tp_one_stage 互斥)
+tp_ar2 = false
 # 1-stage 对称 arena(结构更对但实测中性;需 mode = tensor,与 tp_push 互斥)
 tp_one_stage = false
 

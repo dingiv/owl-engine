@@ -608,6 +608,7 @@ async fn actor_main(
                         push: config.tp_push,
                         ar_f8: config.tp_ar_f8,
                         ar_fused: config.tp_ar_fused,
+                        ar2: config.tp_ar2,
                         // 1-stage 对称 arena(§35):结构更对但实测中性 ⇒ 缺省关;
                         // 2026-10-21 起走配置键(原 env `OWL_TP_1STAGE` 已退场)。
                         // 与 push 互斥、需 tp_ordinals —— `validate` 已拒非法组合。
@@ -625,6 +626,12 @@ async fn actor_main(
                     owl_shared::log_info!(
                         "boot",
                         "TP2 **push 档**已开(runtime.tp_push):数据腿 = 写对端槽(RW 别名)"
+                    );
+                }
+                if config.tp_ar2 {
+                    owl_shared::log_info!(
+                        "boot",
+                        "TP2 **barrier-only AR-2**已开(tp_ar2;小包 graph ≤64KiB/非 fp8)"
                     );
                 }
                 if config.tp_one_stage {

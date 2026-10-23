@@ -241,7 +241,13 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     let tp = TpEngine::assemble_with(
         vec![e0, e1],
         vec![l0, l1],
-        owl_engine::TpOpts { push, ar_f8, ar_fused, one_stage },
+        owl_engine::TpOpts {
+            push,
+            ar_f8,
+            ar_fused,
+            ar2: matches!(std::env::var("OWL_TP_AR2").as_deref(), Ok("1") | Ok("true")),
+            one_stage,
+        },
     )
         .await
         .expect("TP2 装配");
@@ -521,6 +527,7 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
         push: flag("OWL_TP_PUSH"),
         ar_f8: flag("OWL_TP_AR_F8"),
         ar_fused: flag("OWL_TP_AR_FUSED"),
+        ar2: flag("OWL_TP_AR2"),
         one_stage: flag("OWL_TP_1STAGE"),
     };
     let tp = TpEngine::assemble_with(vec![e0, e1], vec![l0, l1], opts)

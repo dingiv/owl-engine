@@ -242,6 +242,10 @@ mod tests {
             (crate::family::comm::asset::FUSED_F16, crate::client::comm::PARSE_SLOTS_FUSED),
             (crate::family::comm::asset::FUSED_BF16, crate::client::comm::PARSE_SLOTS_FUSED),
             (crate::family::comm::asset::FUSED_F32, crate::client::comm::PARSE_SLOTS_FUSED),
+            // barrier-only AR-2(2026-10-23):与 fused 同 8 槽线格式
+            (crate::family::comm::asset::BARRIER_F16, crate::client::comm::PARSE_SLOTS_FUSED),
+            (crate::family::comm::asset::BARRIER_BF16, crate::client::comm::PARSE_SLOTS_FUSED),
+            (crate::family::comm::asset::BARRIER_F32, crate::client::comm::PARSE_SLOTS_FUSED),
             // fp8 载荷档(§47 第二步;线格式与常规档**逐字同形** —— 只是核名不同)
             (crate::family::comm::asset::STAGE_F8_F16, crate::client::comm::PARSE_SLOTS),
             (crate::family::comm::asset::STAGE_F8_BF16, crate::client::comm::PARSE_SLOTS),
@@ -332,6 +336,10 @@ mod tests {
             crate::family::comm::asset::FUSED_F16,
             crate::family::comm::asset::FUSED_BF16,
             crate::family::comm::asset::FUSED_F32,
+            // barrier-only AR-2(2026-10-23)
+            crate::family::comm::asset::BARRIER_F16,
+            crate::family::comm::asset::BARRIER_BF16,
+            crate::family::comm::asset::BARRIER_F32,
         ]);
         #[cfg(feature = "cublas")]
         want.extend([

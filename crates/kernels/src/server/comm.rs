@@ -348,6 +348,10 @@ pub struct CommArFusedRuntime {
     k_f32: Option<K>,
     k_f16: Option<K>,
     k_bf16: Option<K>,
+    /// barrier-only AR-2(2026-10-23;与 fused 同族/同线格式)
+    b_f32: Option<K>,
+    b_f16: Option<K>,
+    b_bf16: Option<K>,
 }
 
 impl CommArFusedRuntime {
@@ -367,6 +371,9 @@ impl KernelFamily for CommArFusedRuntime {
             k_f32: Some(exec.load_aot(res, asset::FUSED_SRC, asset::FUSED_F32, Self::ID)?),
             k_f16: Some(exec.load_aot(res, asset::FUSED_SRC, asset::FUSED_F16, Self::ID)?),
             k_bf16: Some(exec.load_aot(res, asset::FUSED_SRC, asset::FUSED_BF16, Self::ID)?),
+            b_f32: Some(exec.load_aot(res, asset::BARRIER_SRC, asset::BARRIER_F32, Self::ID)?),
+            b_f16: Some(exec.load_aot(res, asset::BARRIER_SRC, asset::BARRIER_F16, Self::ID)?),
+            b_bf16: Some(exec.load_aot(res, asset::BARRIER_SRC, asset::BARRIER_BF16, Self::ID)?),
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -378,7 +385,12 @@ impl KernelFamily for CommArFusedRuntime {
         exec: &mut Exec,
     ) -> Result<Bytes, OpError> {
         let (call, out) = ArFusedCall::parse(msg)?;
-        let k = pick(Self::ID, call.payload().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?;
+        let barrier = msg.kernel.name.contains("ar_barrier");
+        let k = if barrier {
+            pick(Self::ID, call.payload().dtype, &self.b_f32, &self.b_f16, &self.b_bf16)?
+        } else {
+            pick(Self::ID, call.payload().dtype, &self.k_f32, &self.k_f16, &self.k_bf16)?
+        };
         // ── 尺寸自证(与两核同律)──
         let pl_len = res.resolve_len(call.payload().id)?;
         let own_len = res.resolve_len(call.own().id)?;
@@ -392,10 +404,15 @@ impl KernelFamily for CommArFusedRuntime {
         let peer_p = res.resolve(call.peer().id)?;
         let w_p = res.resolve(call.data_w().id)?;
         let r_p = res.resolve(call.data_r().id)?;
-        let grid = ar_reduce_grid(call.payload().dtype, call.bytes());
+        // barrier-only AR-2:单 block(协议只有线程 0 的一对 flag;
+        // 小包 10KB 由 512 线程单 block 足够;多 block 需 per-block barrier,暂不做)
+        // AR-2 单 block:多 block 的全局 blocks_done+单 poller 实测反而更慢
+        // (2026-10-23 bench: 80KB 31.6µs vs 单 block 20.2µs);SGLang 式 per-block
+        // signal plane 才是下一步,当前先固定 1 block。
+        let grid = if barrier { (1, 1, 1) } else { ar_reduce_grid(call.payload().dtype, call.bytes()) };
         launch_ar_fused(
             Self::ID,
-            "ar_fused",
+            if barrier { "ar_barrier" } else { "ar_fused" },
             res,
             exec,
             k,

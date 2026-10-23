@@ -90,6 +90,8 @@
 //!
 //! **阶梯档不用重编译**:`OWL_ARB_SIZES=4096,10240,...`(逗号分隔字节)+ 
 //! `OWL_ARB_DTYPE=f16|f32|bf16` + `OWL_ARB_K=200`。
+//! **AR-2 臂**:`OWL_ARB_AR2=1`(≤256KiB;与 `OWL_ARB_GRAPH=1` 同跑,打印
+//! `[arb-ar2]` 的图内 µs/次)。
 //! `OWL_ARB_PUSH=1` 打开**推送臂探针**(远程写;当前**预期失败** ——
 //! `peer_import` 的别名是只读授予,见 §25.7)。
 
@@ -99,7 +101,7 @@ use owl_cuda::{
     Bytes, Command, DeviceClient as _, DeviceSelector, Dtype, GpuClient, GpuServer, ModelError,
     Shape,
 };
-use owl_kernels::client::comm::{ArReduceCall, ArStageCall};
+use owl_kernels::client::comm::{Ar1StageCall, ArFusedCall, ArReduceCall, ArStageCall};
 use std::time::Instant;
 
 const HDR: usize = 64;
@@ -107,6 +109,7 @@ const SLOT: u64 = 32 << 20; // 设计值(施工设计 §6;与生产同参)
 const N_SLOTS: u32 = 2;
 const MAGIC: u32 = 0x4F57_4C41; // "OWLA"
 const HUGE: u64 = 1u64 << 62; // "永真 credit/I2"哨兵(单边探针用)
+const SLOT_1S: usize = 256 * 1024; // 1-stage 臂的对称 slot(≤256KiB 档)
 
 // ============================================================================
 // 组装 / 工具(与 comm_ar_parity.rs 同构)
@@ -275,6 +278,57 @@ async fn emit_ar_bind(
     Ok(())
 }
 
+/// **AR-2 单发**(2026-10-23):barrier-only 小包;固定 v1 数据腿
+/// (data_w=own, data_r=peer),复用 fused 同 8 槽线格式,只换发射名。
+async fn emit_ar2(
+    client: &mut GpuClient,
+    payload: &Bytes,
+    own: &Bytes,
+    peer: &Bytes,
+    bytes: u64,
+    layout: &StagingLayout,
+) -> Result<(), ModelError> {
+    let msg = ArFusedCall::new(
+        payload.clone(),
+        own.clone(),
+        peer.clone(),
+        own.clone(),
+        peer.clone(),
+        bytes,
+        layout.slot_bytes,
+        0,
+    )
+    .with_barrier(true)
+    .to_launch();
+    client.launch(msg).await?;
+    Ok(())
+}
+
+/// **1-stage 单发**(对称 slot):`out = src + peer_data`,header 走 produced/consumed。
+async fn emit_1stage(
+    client: &mut GpuClient,
+    payload: &Bytes,
+    src: &Bytes,
+    own: &Bytes,
+    peer: &Bytes,
+    peer_data: &Bytes,
+    bytes: u64,
+) -> Result<(), ModelError> {
+    // slot 由 peer_alloc 给出时是 U8;1-stage 的 src/peer_data 声明为 F16
+    // ⇒ 只重声明 dtype/rank,id/指针不变。
+    let msg = Ar1StageCall::new(
+        payload.clone(),
+        src.clone().view(Dtype::F16, 1),
+        own.clone(),
+        peer.clone(),
+        peer_data.clone(),
+        bytes,
+    )
+    .to_launch();
+    client.launch(msg).await?;
+    Ok(())
+}
+
 /// 单边探针的发射面:只发一个相位(另一相位由哨兵 header 旁路)
 async fn emit_one(
     client: &mut GpuClient,
@@ -399,6 +453,14 @@ fn mbps(bytes: u64, us: f64) -> f64 {
 // 基准
 // ============================================================================
 
+/// 1-stage 臂的对称 slot/别名(只分配一次;每个 case 复用)
+struct OneStageSyms {
+    slot_a: Bytes,
+    slot_b: Bytes,
+    alias_b_on_a: Bytes,
+    alias_a_on_b: Bytes,
+}
+
 /// 单档探针(主表与 `OWL_ARB_SIZES` 阶梯共用**同一条量法** —— 不留第二套尺子)
 #[allow(clippy::too_many_arguments)]
 async fn run_case(
@@ -410,6 +472,7 @@ async fn run_case(
     alias_a_on_b: &Bytes,
     inbox_a: &Bytes,
     inbox_b: &Bytes,
+    one_stage: &OneStageSyms,
     layout: &StagingLayout,
     bytes: usize,
     dt: Dtype,
@@ -995,6 +1058,118 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         b.graph_destroy(gb).await.expect("destroy B");
     }
 
+    // ── ★ **AR-2 图内回放**(2026-10-23):与 v1 图内同尺,只换核 ──────
+    // 独立开关 OWL_ARB_AR2=1;只测 ≤256KiB(生产 AR-2 门;大包仍 v1/fused)。
+    if std::env::var("OWL_ARB_AR2").is_ok() && (bytes as u64) <= 256 * 1024 {
+        let n: usize = std::env::var("OWL_ARB_GRAPH_N")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        // AR-2 游标在 header 48/56;set_hdr 会清零整 64B(含 48..64)。
+        set_hdr(a, staging_a, 0, 0).await.expect("A hdr(AR2)");
+        set_hdr(b, staging_b, 0, 0).await.expect("B hdr(AR2)");
+        a.graph_begin().await.expect("graph_begin A2");
+        for _ in 0..n {
+            emit_ar2(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout)
+                .await.expect("A AR2 发射");
+        }
+        let ga2 = a.graph_end().await.expect("graph_end A2");
+        b.graph_begin().await.expect("graph_begin B2");
+        for _ in 0..n {
+            emit_ar2(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout)
+                .await.expect("B AR2 发射");
+        }
+        let gb2 = b.graph_end().await.expect("graph_end B2");
+        {
+            let (ra, rb) = tokio::join!(a.graph_launch(ga2), b.graph_launch(gb2));
+            ra.expect("AR2 warm A"); rb.expect("AR2 warm B");
+            let (sa, sb) = tokio::join!(a.sync(), b.sync());
+            sa.expect("AR2 warm sync A"); sb.expect("AR2 warm sync B");
+        }
+        let t0 = Instant::now();
+        {
+            let (ra, rb) = tokio::join!(a.graph_launch(ga2), b.graph_launch(gb2));
+            ra.expect("AR2 replay A"); rb.expect("AR2 replay B");
+            let (sa, sb) = tokio::join!(a.sync(), b.sync());
+            sa.expect("AR2 sync A"); sb.expect("AR2 sync B");
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / (n as f64);
+        eprintln!(
+            "[arb-ar2] {bytes:>9} B n={n:<4} **AR-2 图内 = {us:8.2} µs/次**(真设备时延)"
+        );
+        assert_eq!(read_err(a, &staging_a).await, 0, "AR2 A err 非 0");
+        assert_eq!(read_err(b, &staging_b).await, 0, "AR2 B err 非 0");
+        a.graph_destroy(ga2).await.expect("AR2 destroy A");
+        b.graph_destroy(gb2).await.expect("AR2 destroy B");
+    }
+
+    // ── ★ **1-stage 图内回放**(对称 slot;2026-10-23)──────────────
+    // 语义:out = src + peer_data;src/peer_data 是对称 slot,不再经 staging 拷贝。
+    // 只在 OWL_ARB_1STAGE=1 且 bytes≤256KiB 时跑。
+    if std::env::var("OWL_ARB_1STAGE").is_ok() && (bytes as u64) <= SLOT_1S as u64 {
+        let n: usize = std::env::var("OWL_ARB_GRAPH_N")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+        set_hdr(a, staging_a, 0, 0).await.expect("A hdr(1stage)");
+        set_hdr(b, staging_b, 0, 0).await.expect("B hdr(1stage)");
+        a.graph_begin().await.expect("graph_begin A1s");
+        for _ in 0..n {
+            emit_1stage(
+                a,
+                &payload_a,
+                &one_stage.slot_a,
+                &staging_a,
+                &alias_b_on_a,
+                &one_stage.alias_b_on_a,
+                bytes as u64,
+            )
+            .await
+            .expect("A 1stage 发射");
+        }
+        let ga1s = a.graph_end().await.expect("graph_end A1s");
+        b.graph_begin().await.expect("graph_begin B1s");
+        for _ in 0..n {
+            emit_1stage(
+                b,
+                &payload_b,
+                &one_stage.slot_b,
+                &staging_b,
+                &alias_a_on_b,
+                &one_stage.alias_a_on_b,
+                bytes as u64,
+            )
+            .await
+            .expect("B 1stage 发射");
+        }
+        let gb1s = b.graph_end().await.expect("graph_end B1s");
+        {
+            let (ra, rb) = tokio::join!(a.graph_launch(ga1s), b.graph_launch(gb1s));
+            ra.expect("1s warm A"); rb.expect("1s warm B");
+            let (sa, sb) = tokio::join!(a.sync(), b.sync());
+            sa.expect("1s warm sync A"); sb.expect("1s warm sync B");
+        }
+        let t0 = Instant::now();
+        {
+            let (ra, rb) = tokio::join!(a.graph_launch(ga1s), b.graph_launch(gb1s));
+            ra.expect("1s replay A"); rb.expect("1s replay B");
+            let (sa, sb) = tokio::join!(a.sync(), b.sync());
+            sa.expect("1s sync A"); sb.expect("1s sync B");
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / (n as f64);
+        eprintln!(
+            "[arb-1stage] {bytes:>9} B n={n:<4} **1-stage 图内 = {us:8.2} µs/次**(真设备时延)"
+        );
+        assert_eq!(read_err(a, &staging_a).await, 0, "1stage A err 非 0");
+        assert_eq!(read_err(b, &staging_b).await, 0, "1stage B err 非 0");
+        // 路径存在性:slot 两侧都清零 ⇒ 1-stage 的 out 应为全 0
+        // (不是数值门;真数值门在 tp_g8_gate / ar_transport_gate)。
+        let mut za = vec![0u8; bytes];
+        a.dtoh(&payload_a, &mut za).await.expect("1s dtoh A");
+        assert!(za.iter().all(|&x| x == 0), "1-stage A 输出非 0(路径没写?)");
+        let mut zb = vec![0u8; bytes];
+        b.dtoh(&payload_b, &mut zb).await.expect("1s dtoh B");
+        assert!(zb.iter().all(|&x| x == 0), "1-stage B 输出非 0(路径没写?)");
+        a.graph_destroy(ga1s).await.expect("1s destroy A");
+        b.graph_destroy(gb1s).await.expect("1s destroy B");
+    }
+
     a.free(&[payload_a.id]).await.expect("free a");
     b.free(&[payload_b.id]).await.expect("free b");
 }
@@ -1044,6 +1219,32 @@ async fn comm_ar_channel_bench() {
         .await
         .expect("B inbox peer_alloc");
 
+    // 1-stage 对称 slot(256KiB;只给 ≤256KiB 档;无 header)
+    let (slot_a, cred_slot_a) = a
+        .peer_alloc(SLOT_1S, "arb:1s-slot-a")
+        .await
+        .expect("A 1s slot");
+    let (slot_b, cred_slot_b) = b
+        .peer_alloc(SLOT_1S, "arb:1s-slot-b")
+        .await
+        .expect("B 1s slot");
+    let alias_slot_b_on_a = a
+        .peer_import(cred_slot_b, SLOT_1S, &ub, "arb:1s-alias-b@a")
+        .await
+        .expect("A 1s alias");
+    let alias_slot_a_on_b = b
+        .peer_import(cred_slot_a, SLOT_1S, &ua, "arb:1s-alias-a@b")
+        .await
+        .expect("B 1s alias");
+    a.memset_zero(&slot_a, SLOT_1S).await.expect("A 1s zero");
+    b.memset_zero(&slot_b, SLOT_1S).await.expect("B 1s zero");
+    let one_stage = OneStageSyms {
+        slot_a: slot_a.clone(),
+        slot_b: slot_b.clone(),
+        alias_b_on_a: alias_slot_b_on_a.clone(),
+        alias_a_on_b: alias_slot_a_on_b.clone(),
+    };
+
     eprintln!(
         "[arb] devices: A=ord{oa}({ua}) B=ord{ob}({ub}) slot={}MiB×{N_SLOTS} AR 档={}",
         SLOT >> 20,
@@ -1072,7 +1273,7 @@ async fn comm_ar_channel_bench() {
     });
     if let Some(ladder) = env_ladder {
         for (bytes, dt, k) in ladder {
-            run_case(&mut a, &mut b, &staging_a, &staging_b, &alias_b_on_a, &alias_a_on_b, &inbox_a, &inbox_b, &layout, bytes, dt, k)
+            run_case(&mut a, &mut b, &staging_a, &staging_b, &alias_b_on_a, &alias_a_on_b, &inbox_a, &inbox_b, &one_stage, &layout, bytes, dt, k)
                 .await;
         }
         eprintln!("[arb] done");
@@ -1101,7 +1302,7 @@ async fn comm_ar_channel_bench() {
     ];
 
     for (bytes, dt, k) in cases.iter().chain(f32_cases.iter()) {
-        run_case(&mut a, &mut b, &staging_a, &staging_b, &alias_b_on_a, &alias_a_on_b, &inbox_a, &inbox_b, &layout, *bytes, *dt, *k).await;
+        run_case(&mut a, &mut b, &staging_a, &staging_b, &alias_b_on_a, &alias_a_on_b, &inbox_a, &inbox_b, &one_stage, &layout, *bytes, *dt, *k).await;
     }
 
     // ── 收尾:两侧 header 复原(不留 HUGE 哨兵给下一轮)──────────

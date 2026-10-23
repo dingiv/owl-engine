@@ -375,6 +375,77 @@ impl KernelSpec for CommArFusedF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+// ============================================================================
+// barrier-only AR-2(2026-10-23;与 fused 同 8 槽线格式)
+// 只给小包 graph:起/止 barrier + release/acquire;无信用/尾部 rendezvous。
+// ============================================================================
+
+/// `owl_comm_ar_barrier_f16`
+pub struct CommArBarrierF16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
+impl KernelSpec for CommArBarrierF16 {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_FUSED);
+    const ENTRY: &'static str = "owl_comm_ar_barrier_f16";
+    const SRC: &'static str = "cu/comm/ar_barrier.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_out("payload", Dtype::F16, 0),
+        Param::t_out("own", Dtype::U8, 1),
+        Param::t_in("peer", Dtype::U8, 1),
+        Param::t_out("data_w", Dtype::U8, 1),
+        Param::t_in("data_r", Dtype::U8, 1),
+        Param::sz("bytes"),
+        Param::sz("slot_bytes"),
+        Param::sz("slab_off"),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+/// `owl_comm_ar_barrier_bf16`
+pub struct CommArBarrierBf16;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
+impl KernelSpec for CommArBarrierBf16 {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_FUSED);
+    const ENTRY: &'static str = "owl_comm_ar_barrier_bf16";
+    const SRC: &'static str = "cu/comm/ar_barrier.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_out("payload", Dtype::BF16, 0),
+        Param::t_out("own", Dtype::U8, 1),
+        Param::t_in("peer", Dtype::U8, 1),
+        Param::t_out("data_w", Dtype::U8, 1),
+        Param::t_in("data_r", Dtype::U8, 1),
+        Param::sz("bytes"),
+        Param::sz("slot_bytes"),
+        Param::sz("slab_off"),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+/// `owl_comm_ar_barrier_f32`
+pub struct CommArBarrierF32;
+#[kernel_tags("dom.comm", "role.comm", "feat.tp")]
+impl KernelSpec for CommArBarrierF32 {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::comm::COMM_AR_FUSED);
+    const ENTRY: &'static str = "owl_comm_ar_barrier_f32";
+    const SRC: &'static str = "cu/comm/ar_barrier.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_out("payload", Dtype::F32, 0),
+        Param::t_out("own", Dtype::U8, 1),
+        Param::t_in("peer", Dtype::U8, 1),
+        Param::t_out("data_w", Dtype::U8, 1),
+        Param::t_in("data_r", Dtype::U8, 1),
+        Param::sz("bytes"),
+        Param::sz("slot_bytes"),
+        Param::sz("slab_off"),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 pub static AR_STAGE_F16: KernelMeta = meta_of::<CommArStageF16>();
 pub static AR_STAGE_BF16: KernelMeta = meta_of::<CommArStageBf16>();
 pub static AR_STAGE_F32: KernelMeta = meta_of::<CommArStageF32>();
@@ -388,6 +459,10 @@ pub static AR_1STAGE_F32: KernelMeta = meta_of::<CommAr1StageF32>();
 pub static AR_FUSED_F16: KernelMeta = meta_of::<CommArFusedF16>();
 pub static AR_FUSED_BF16: KernelMeta = meta_of::<CommArFusedBf16>();
 pub static AR_FUSED_F32: KernelMeta = meta_of::<CommArFusedF32>();
+// **barrier-only AR-2**(2026-10-23):与 fused 同族,发射名区分
+pub static AR_BARRIER_F16: KernelMeta = meta_of::<CommArBarrierF16>();
+pub static AR_BARRIER_BF16: KernelMeta = meta_of::<CommArBarrierBf16>();
+pub static AR_BARRIER_F32: KernelMeta = meta_of::<CommArBarrierF32>();
 // **fp8 载荷档**(§47 第二步;2026-10-19)—— 登记进表才进 `ops::all()` 的预加载面
 pub static AR_STAGE_F8_F16: KernelMeta = meta_of::<CommArStageF8F16>();
 pub static AR_STAGE_F8_BF16: KernelMeta = meta_of::<CommArStageF8Bf16>();
