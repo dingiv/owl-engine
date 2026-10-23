@@ -1007,11 +1007,19 @@ impl DecodeArm {
 
 /// **verify 图的行容量上限**(= `depth + 1` 的最大值;**单一产地**)。
 ///
-/// 为什么是 8:spec 轮的 fold 记录/快照按 `gdn 层数 × 本值` 铺
-/// (`graph_fleet` 的 `n_rec`、`exec/spec.rs` 的可折叠判据、`state` 的快照行宽),
+/// 为什么是 16:DFlash2 NInfer 路线 K=1..15 ⇒ W=K+1 最大 16。
+/// 它只约束 verify 图/输入槽/`kv_slots` 的行数；GDN fold 记录是另一个
+/// 常量 [`SPEC_FOLD_RECORDS_PER_LAYER`]（8 件/层），不要混用。
 /// 这是**结构性**上限 —— `[spec] depth` 超出即拒启(不静默截断;
 /// 2026-10-21 前该处是 `depth_raw.min(3/7)` 的硬钳,MTP 因此只能跑 3 步)。
-pub const SPEC_VERIFY_ROWS_MAX: usize = 8;
+pub const SPEC_VERIFY_ROWS_MAX: usize = 16;
+
+/// **每层 GDN fold 记录件数**(conv 三 raw + 递推五件;与 verify 行数无关)。
+///
+/// 历史上它和 `SPEC_VERIFY_ROWS_MAX` 都是 8，被误当同一常量使用；
+/// DFlash2 K=1..15 把行容量抬到 16 后必须解耦，否则会去找不存在的
+/// r{16..31} 输出槽。
+pub const SPEC_FOLD_RECORDS_PER_LAYER: usize = 8;
 
 /// **MTP/投机深度的上限**(= 行容量 - 1)
 pub const SPEC_DEPTH_MAX: usize = SPEC_VERIFY_ROWS_MAX - 1;
@@ -2203,10 +2211,10 @@ impl OwlConfig {
     /// (tests / cli)裸奔。
     pub fn validate(&self) -> Result<(), String> {
         // **投机深度上限**(2026-10-21):verify 图行容量 `SPEC_VERIFY_ROWS_MAX` 是
-        // 结构性事实(fold 记录/快照按它铺)—— 超限**拒启**,不静默截断。
+        // 结构性事实(verify 图 T=depth+1;DFlash2 W=K+1 上限)—— 超限**拒启**,不静默截断。
         if self.spec.depth > SPEC_DEPTH_MAX {
             return Err(format!(
-                "[spec] depth = {} 超结构上限 {} (verify 图行容量 {}=(depth+1);fold 记录/快照按它铺,改它需改 state/graph_fleet 的分配面)",
+                "[spec] depth = {} 超结构上限 {} (verify 图行容量 {}=depth+1;DFlash2 K=1..15 的 W=K+1 上限;改它需同步 verify 图/拼接槽/kv_slots)",
                 self.spec.depth, SPEC_DEPTH_MAX, SPEC_VERIFY_ROWS_MAX
             ));
         }
@@ -3085,7 +3093,7 @@ mod auto_pool_tests {
     }
 
     /// **投机深度上限是真门**(2026-10-21):`depth ≤ SPEC_DEPTH_MAX`
-    /// (结构性 = verify 图行容量 - 1;fold 记录/快照按它铺)——
+    /// (结构性 = verify 图行容量 - 1;DFlash2 W=K+1 上限)——
     /// 超限**拒启**,不再像旧代码那样 `min(3/7)` 静默截断。
     #[test]
     fn spec_depth_over_structural_max_is_refused() {

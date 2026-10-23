@@ -114,6 +114,7 @@ pub mod kvpage;
 pub mod mtp_window;
 /// **DFlash2 lookup-augmented drafting**(LABD;宿主后缀查找 + 草稿头融合)
 pub mod lookup;
+pub mod proposal_q;
 
 #[cfg(test)]
 mod break_even_tests {

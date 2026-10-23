@@ -693,7 +693,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 for t in &tp {
                     c = c.arg(t);
                 }
-                for _ in tp.len()..7 {
+                for _ in tp.len()..(owl_models::kernel::CONCAT_ROWS_SLOTS - 1) {
                     c = c.arg(&h);
                 }
                 let n = tp.len() + 1;
@@ -890,7 +890,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 for tt in &tp {
                     c = c.arg(tt);
                 }
-                for _ in tp.len()..7 {
+                for _ in tp.len()..(owl_models::kernel::CONCAT_ROWS_SLOTS - 1) {
                     c = c.arg(&h);
                 }
                 let n = tp.len() + 1;

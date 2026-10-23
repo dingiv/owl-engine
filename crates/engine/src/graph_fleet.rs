@@ -65,8 +65,8 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     pub depths: Vec<DepthGraphs<D>>,
     /// **合批 decode 图**(B5.1 M1b;T = max_batch 定形,行 = 会话;None = eager)
     pub batch: Option<GraphPlan<D>>,
-    /// DFlash2 propose 单图(E5-DF4;encode 全 8 行 + 噪声块 + selector,
-    /// 固定几何;None = eager 回退)
+    /// DFlash2 propose 单图(E5-DF4;encode 全 W 行 + 噪声块 + selector,
+    /// W=K+1 运行时定形;None = eager 回退)
     pub dflash: Option<GraphPlan<D>>,
 }
 /// **臂事实**(2026-10-19 审查):boot 自证行原先只报"**面**登记"(`FI 节点登记=true`),
@@ -861,7 +861,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 .map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab))
                 .collect();
             let mut root = TensorOps::call(owl_models::ops::SemanticKernel::Concat);
-            for i in 0..8 {
+            for i in 0..owl_models::kernel::CONCAT_ROWS_SLOTS {
                 root = root.arg(rows.get(i).unwrap_or(&rows[0]));
             }
             let root = root
@@ -957,8 +957,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                 vouts.push(OutputSlot { name: format!("tap{i}"), shape: vec![depth1, dims.hidden], dtype: dims.dtype });
             }
         }
-        for i in 0..gdn_caches.len() * 8 {
-            let (_gi, f) = (i / 8, i % 8);
+        for i in 0..gdn_caches.len() * owl_shared::config::SPEC_FOLD_RECORDS_PER_LAYER {
+            let (_gi, f) = (i / owl_shared::config::SPEC_FOLD_RECORDS_PER_LAYER, i % owl_shared::config::SPEC_FOLD_RECORDS_PER_LAYER);
             let shape = match f {
                 0 | 1 => vec![depth1, key_dim],
                 2 => vec![depth1, value_dim],
@@ -1147,7 +1147,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                     .map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab))
                     .collect();
                 let mut root = TensorOps::call(owl_models::ops::SemanticKernel::Concat);
-                for i in 0..8 {
+                for i in 0..owl_models::kernel::CONCAT_ROWS_SLOTS {
                     root = root.arg(rows.get(i).unwrap_or(&rows[0]));
                 }
                 let root = root
@@ -1203,7 +1203,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let tp = boot.tp.clone();
         let knobs = boot.knobs;
         let mut fold_graphs = Vec::new();
-        let n_rec = pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX;
+        let n_rec = pool.gdn_count() * owl_shared::config::SPEC_FOLD_RECORDS_PER_LAYER;
         let rec_blks: Vec<Bytes> = (0..n_rec)
             .map(|i| {
                 vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {
@@ -1261,7 +1261,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                         .iter()
                         .enumerate()
                         .map(|(i, b)| {
-                            let shape = match i % 8 {
+                            let shape = match i % owl_shared::config::SPEC_FOLD_RECORDS_PER_LAYER {
                                 0 | 1 => vec![m1, d.nk * d.hk],
                                 2 => vec![m1, d.nv * d.hv],
                                 3 | 4 => vec![m1, d.nk, d.hk],
@@ -1302,8 +1302,8 @@ impl<D: DeviceClient> GraphFleet<D> {
         Ok(fold_graphs)
     }
 
-    /// ③b DFlash2 propose **单图**(E5-DF4;encode 全 8 行 + 噪声块 +
-    /// selector 固定几何;多编行下轮被自块写/重编覆盖,幂等安全)。
+    /// ③b DFlash2 propose **单图**(E5-DF4;encode 全 W=K+1 行 + 噪声块 +
+    /// selector 运行时定形;多编行下轮被自块写/重编覆盖,幂等安全)。
     /// 输入槽 = tokens/anchor/enc_pos/enc_slots/prop_pos/prop_slots/
     /// kv_len;烘焙叶 = verify taps 槽 + 草稿池叶。prefix_len 曾为
     /// 宿主烘焙标量,已改核内读 kv_len 张量(契约 5)。
@@ -1335,6 +1335,8 @@ impl<D: DeviceClient> GraphFleet<D> {
         let model_df = Arc::clone(&boot.model);
         let rp_df = boot.spec.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
         let d2g = Arc::clone(d2);
+        let block = d2.block();
+        let depth = d2.depth();
         // **切档形态**（P1.1 × P2.1）:propose 图只出"半表 top-16 候选 + proj" ——
         // host 合并两 rank 候选后由 rank0 跑 select（全表域）。判据 = 事实
         // （本 rank logits 宽 < 全量），与引擎侧 `head_split_active` 同律。
@@ -1351,26 +1353,30 @@ impl<D: DeviceClient> GraphFleet<D> {
             tp,
             GraphPlanDesc {
                 inputs: vec![
-                    InputSlot::f32("tokens", 8),
+                    InputSlot::f32("tokens", block),
                     InputSlot::f32("anchor", 1),
-                    InputSlot::f32("enc_pos", 8),
-                    InputSlot::f32("enc_slots", 8),
-                    InputSlot::f32("enc_kv_lens", 8),
-                    InputSlot::f32("prop_pos", 8),
-                    InputSlot::f32("prop_slots", 8),
-                    InputSlot::f32("prop_kv_lens", 8),
+                    InputSlot::f32("enc_pos", block),
+                    InputSlot::f32("enc_slots", block),
+                    InputSlot::f32("enc_kv_lens", block),
+                    InputSlot::f32("prop_pos", block),
+                    InputSlot::f32("prop_slots", block),
+                    InputSlot::f32("prop_kv_lens", block),
                     InputSlot::f32("kv_len", 1),
                 ],
                 outputs: {
-                    let mut o = vec![OutputSlot::f32("drafts", &[7 * (16 * 16 + 1)])];
+                    let mut o = if head_split {
+                        vec![OutputSlot::f32("topk", &[2 * depth * owl_models::layers::dflash2::TOP_K])]
+                    } else {
+                        // 单缓冲：drafts[0..depth] ‖ scores[depth..]；topk 另块。
+                        vec![
+                            OutputSlot::f32("sel", &[depth * (16 * 16 + 1)]),
+                            OutputSlot::f32("topk_all", &[2 * depth * owl_models::layers::dflash2::TOP_K]),
+                        ]
+                    };
                     if head_split {
-                        // 切档:topk 单缓冲（值区 112 + 索引区 112 = 224）——
-                        // **输出槽形状 = 整父块**（`slice_view` 输出整缓冲的
-                        // 既有契约;见原 `drafts` 注），故声明 2*7*TOP_K。
-                        o.push(OutputSlot::f32("topk", &[2 * 7 * owl_models::layers::dflash2::TOP_K]));
                         o.push(OutputSlot {
                             name: "sel_proj".into(),
-                            shape: vec![7, sel_rank],
+                            shape: vec![depth, sel_rank],
                             dtype: d2g.dtype(),
                         });
                     }
@@ -1394,7 +1400,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             move |sc: &PlanCtx| -> Result<()> {
                 let taps: Vec<TensorOps> = tap_blks
                     .iter()
-                    .map(|b| TensorOps::of_block(b.id, Dtype::F16, vec![8, hidd]))
+                    .map(|b| TensorOps::of_block(b.id, Dtype::F16, vec![block, hidd]))
                     .collect();
                 let tokens = sc.input("tokens")?;
                 let anchor = sc.input("anchor")?;
@@ -1406,7 +1412,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 let prop_pos = sc.input("prop_pos")?;
                 let prop_slots = sc.input("prop_slots")?;
                 // propose 噪声块逐行可见长(fp+1+i;原绑标量
-                // kv_len,1 值槽供 8 行读 = 1~7 行越界垃圾)
+                // kv_len,1 值槽供 W 行读 = 越界垃圾)
                 let prop_kv_lens = sc.input("prop_kv_lens")?;
                 let kv_len = sc.input("kv_len")?;
                 let bt = bt_leaf.clone();
@@ -1430,7 +1436,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                         block_tables: bt.clone(),
                     })
                     .collect();
-                let mut ctx = ForwardCtx::minimal(8);
+                let mut ctx = ForwardCtx::minimal(block);
                 // 草稿 ctx 的环境与图环境同源(层侧读 ctx.env 时零分歧)
                 ctx.env = env;
                 let mem = d2g.project_memory(&taps, &ctx);
@@ -1452,18 +1458,21 @@ impl<D: DeviceClient> GraphFleet<D> {
                     sc.output("sel_proj", &proj)?;
                     Ok(())
                 } else {
-                    let (_h, drafts, _s, _l) = d2g.propose_block(
+                    let (_h, _drafts, scores, _l, _cand, topk) = d2g.propose_block(
                         &tokens, &prop_pos, &anchor, &prop_kvs, &rp_df,
                         &model_df.embed, &kv_len, &ctx, None,
                     );
-                    sc.output("drafts", &drafts)
+                    // `scores` 是 select 单缓冲的尾部视图；声明槽按整父块
+                    // 宽度，host 从 sel[0..depth] 取 drafts、其后取 scores。
+                    sc.output("sel", &scores)?;
+                    sc.output("topk_all", &topk)
                 }
             },
         )
         .await?;
         match dout {
             PlanOutcome::Captured => {
-                owl_shared::log_info!("boot", "dflash propose 图捕获(encode+propose 单图,固定 8 行) +{:.2}s", t0.elapsed().as_secs_f32());
+                owl_shared::log_info!("boot", "dflash propose 图捕获(encode+propose 单图,W={block} 行) +{:.2}s", t0.elapsed().as_secs_f32());
                 Ok(Some(dg))
             }
             other => {

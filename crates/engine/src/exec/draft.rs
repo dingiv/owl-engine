@@ -17,12 +17,25 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         lookup: Option<&LookupProposal>,
     ) -> Result<Vec<u32>> {
         let fp = pos + m + 1;
+        let depth = self.dev.spec_rt.depth;
+        let block = depth + 1;
+        self.tspec()?.spec_q_host = None;
+        let sampler_on = self.turns.active()?.sampler_on;
+        let (q_temp, q_seed) = if sampler_on {
+            let act = self.turns.active()?;
+            (
+                act.sampler.temp,
+                act.seed.unwrap_or_else(|| act.id.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            )
+        } else {
+            (0.0, 0)
+        };
         let _page = self.dev.pool.geom.page;
         {
             let act = self.turns.active()?;
             let s = self.bank.sessions.session_mut(act.session_id)?;
             let before = s.block_table.len();
-            self.bank.rel.leg.ensure_for_len(&mut s.block_table, fp + 8)?;
+            self.bank.rel.leg.ensure_for_len(&mut s.block_table, fp + block)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
                 self.write_bt(sid).await?;
@@ -37,18 +50,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let _f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         // mask token 走 spec 运行态(单源:GGUF 草稿未导出该 KV ⇒ 家族兜底值已入账)
         let mask = self.dev.spec_rt.dflash_mask_token as f32;
-        let tokens_f: Vec<f32> = (0..8)
+        let tokens_f: Vec<f32> = (0..block)
             .map(|i| if i == 0 { bonus as f32 } else { mask })
             .collect();
-        let enc_pos: Vec<f32> = (0..8).map(|i| (pos + i) as f32).collect();
-        let enc_slots: Vec<f32> = (0..8).map(|i| slot_at(pos + i)).collect();
+        let enc_pos: Vec<f32> = (0..block).map(|i| (pos + i) as f32).collect();
+        let enc_slots: Vec<f32> = (0..block).map(|i| slot_at(pos + i)).collect();
         // 逐行可见长(含自身;eager dflash_encode 同式 —— AL 劣化案修复)
-        let enc_kv_lens: Vec<f32> = (0..8).map(|i| (pos + i + 1) as f32).collect();
-        let prop_pos: Vec<f32> = (0..8).map(|i| (fp + i) as f32).collect();
-        let prop_slots: Vec<f32> = (0..8).map(|i| slot_at(fp + i)).collect();
+        let enc_kv_lens: Vec<f32> = (0..block).map(|i| (pos + i + 1) as f32).collect();
+        let prop_pos: Vec<f32> = (0..block).map(|i| (fp + i) as f32).collect();
+        let prop_slots: Vec<f32> = (0..block).map(|i| slot_at(fp + i)).collect();
         // propose 噪声块逐行可见长(eager dflash_propose 同式 fp+1+i)
-        let prop_kv_lens: Vec<f32> = (0..8).map(|i| (fp + 1 + i) as f32).collect();
-        let kv_len = vec![(fp + 8) as f32];
+        let prop_kv_lens: Vec<f32> = (0..block).map(|i| (fp + 1 + i) as f32).collect();
+        let kv_len = vec![(fp + block) as f32];
         let anchor = vec![bonus as f32];
         // 档位门(实际图在下面按需再借;此处只判在场,故不持绑定)
         if self.dev.graphs.dflash.is_none() {
@@ -122,14 +135,25 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .dflash
             .as_mut()
             .ok_or_else(|| ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() })?;
-        let out = pg.read_output_f32("drafts").await?;
+        let sel = pg.read_output_f32("sel").await?;
+        let out = &sel[..depth];
+        // proposal_q（采样档）：`sel` 后段是 scores；`topk_all` 是选择器
+        // 候选（值区‖索引区）。两槽都由 dflash 图同轮产出。
+        let q_slots = if sampler_on && pg.has_output("sel") && pg.has_output("topk_all") {
+            Some((
+                sel[depth..depth + depth * 16 * 16].to_vec(),
+                pg.read_output_f32("topk_all").await?,
+            ))
+        } else {
+            None
+        };
         // 纯 GPU 判别(E5-DF4 性能;2026-10-18 立案改三段):排水后首次执行 vs 二次执行
         if let (Some(t_drain), Some(t0v), Some(t1v)) = (t_drain0, t0, t1) {
             let t2 = std::time::Instant::now();
             let first = t2 - t1v; // 首次发射+读(流已排干 ⇒ 纯本图)
             pg.replay().await?;
             // 失败已 `?` 上报;成功值此处不需要(仅为同步点)
-            let _ = pg.read_output_f32("drafts").await?;
+            let _ = pg.read_output_f32("sel").await?;
             owl_shared::log_info!(
                 "dflash-prof",
                 "drain={:?} first_gpu={first:?} pure_gpu={:?}",
@@ -147,8 +171,34 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 b.elapsed()
             );
         }
-        let mut drafts: Vec<u32> = out[..7].iter().map(|&v| v as u32).collect();
+        if let Some((scores, topk)) = q_slots {
+            let cand_u: Vec<u32> = topk[depth * 16..2 * depth * 16]
+                .iter()
+                .map(|&v| v as u32)
+                .collect();
+            let mut q = super::proposal_q::DraftQ::from_scores(
+                &scores,
+                &cand_u,
+                depth,
+                q_temp,
+                q_seed,
+                fp,
+            )?;
+            let before = q.drafts().to_vec();
+            self.apply_dflash_lookup(q.drafts_mut(), lookup);
+            let after = q.drafts().to_vec();
+            for (i, (&a, &b)) in before.iter().zip(after.iter()).enumerate() {
+                if a != b {
+                    q.force_one_hot(i, b);
+                }
+            }
+            let d = q.drafts().to_vec();
+            self.tspec()?.spec_q_host = Some(q);
+            return Ok(d);
+        }
+        let mut drafts: Vec<u32> = out.iter().map(|&v| v as u32).collect();
         self.apply_dflash_lookup(&mut drafts, lookup);
+        self.tspec()?.spec_q_host = None;
         Ok(drafts)
     }
 
@@ -181,11 +231,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         hist.extend_from_slice(&act.prompt_ids);
         hist.extend_from_slice(&act.out);
         hist.extend_from_slice(tail);
-        let k = self
-            .dev
-            .spec_rt
-            .depth
-            .min(owl_models::layers::dflash2::DEPTH);
+        let k = self.dev.spec_rt.depth;
         let cfg = LookupCfg::from_runtime(&self.dev.spec_rt);
         mcnt("spec.lookup.rounds", 1);
         let p = suffix_lookup(&hist, k, cfg);
@@ -212,14 +258,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         let rope = self.dev.spec_rt.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
-        // 噪声块 token/位置表(8 行定形)
+        self.tspec()?.spec_q_host = None;
+        let depth = d2.depth();
+        let block = d2.block();
+        // 噪声块 token/位置表(W = K+1 行)
         let mut toks = vec![anchor as f32];
-        toks.resize(8, self.dev.spec_rt.dflash_mask_token as f32);
-        let toks_t = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&toks));
+        toks.resize(block, self.dev.spec_rt.dflash_mask_token as f32);
+        let toks_t = TensorOps::from_host(Dtype::F32, vec![block], &f32b(&toks));
         let pos_t = TensorOps::from_host(
             Dtype::F32,
-            vec![8],
-            &f32b(&(0..8).map(|i| (pos + i) as f32).collect::<Vec<_>>()),
+            vec![block],
+            &f32b(&(0..block).map(|i| (pos + i) as f32).collect::<Vec<_>>()),
         );
         let anchor_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[anchor as f32]));
         // 草稿 KV 叶子;自块槽表 = **物理槽 pos..pos+8**(sglang
@@ -244,7 +293,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             let s = self.bank.sessions.session_mut(act.session_id)?;
             let before = s.block_table.len();
-            self.bank.rel.leg.ensure_for_len(&mut s.block_table, pos + 8)?;
+            self.bank.rel.leg.ensure_for_len(&mut s.block_table, pos + block)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
                 self.write_bt(sid).await?;
@@ -260,7 +309,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             owl_shared::log_debug!("dflash-probe", "propose pos={pos} bt_len={} page={page}", bt_chain.len());
         }
         // 噪声块自槽(经寻址权威;线性逻辑位)
-        let self_slots: Vec<f32> = (0..8usize)
+        let self_slots: Vec<f32> = (0..block)
             .map(|i| self.dev.pool.draft_dflash_self_slot(pos, i))
             .collect();
         let kvs: Vec<KvBuffers> = leaves
@@ -268,12 +317,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .map(|(k, v)| KvBuffers {
                 k_cache: k.clone(),
                 v_cache: v.clone(),
-                slots: TensorOps::from_host(Dtype::F32, vec![8], &f32b(&self_slots)),
-                kv_lens: TensorOps::from_host(Dtype::F32, vec![8], &f32b(&(0..8).map(|i| (pos + 1 + i) as f32).collect::<Vec<_>>())),
+                slots: TensorOps::from_host(Dtype::F32, vec![block], &f32b(&self_slots)),
+                kv_lens: TensorOps::from_host(Dtype::F32, vec![block], &f32b(&(0..block).map(|i| (pos + 1 + i) as f32).collect::<Vec<_>>())),
                 block_tables: bt.clone(),
             })
             .collect();
-        let mut ctx = ForwardCtx::minimal(8);
+        let mut ctx = ForwardCtx::minimal(block);
         // 草稿算子环境:几何 = **草稿自己**(hd=128 / GQA 比),其余随引擎 env
         ctx.env = self.dev.spec_rt.draft_env;
         // 探针:草稿池 K 前缀行 NaN 检查(定谳 encode vs NC 核;解析 dtype
@@ -322,12 +371,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // AL=0 分歧排查;正式开关挂 C7)
         // OWL_DFLASH_DUMB=1:零副作用哑草稿(不进 GPU;② 直接 host 表)
         if self.boot.probes.dflash_dumb {
-            return Ok(vec![anchor; 7]);
+            return Ok(vec![anchor; depth]);
         }
         let mut probe_roots: Vec<TensorOps> = Vec::new();
         let probe_on = self.boot.probes.dflash_probe;
-        let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(pos + 8) as f32]));
-        let (hidden, drafts, _scores, logits) = d2.propose_block(
+        let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(pos + block) as f32]));
+        let (hidden, drafts, _scores, logits, _cand, _topk) = d2.propose_block(
             &toks_t, &pos_t, &anchor_t, &kvs, &rope, &self.dev.boot.model.embed, &kv_len_t, &ctx,
             if probe_on { Some(&mut probe_roots) } else { None },
         );
@@ -348,11 +397,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|(k, v)| KvBuffers {
                     k_cache: k.clone(),
                     v_cache: v.clone(),
-                    slots: TensorOps::from_host(Dtype::F32, vec![8], &f32b(&self_slots)),
+                    slots: TensorOps::from_host(Dtype::F32, vec![block], &f32b(&self_slots)),
                     kv_lens: TensorOps::from_host(
                         Dtype::F32,
-                        vec![8],
-                        &f32b(&(0..8).map(|i| (pos + 1 + i) as f32).collect::<Vec<_>>()),
+                        vec![block],
+                        &f32b(&(0..block).map(|i| (pos + 1 + i) as f32).collect::<Vec<_>>()),
                     ),
                     block_tables: bt_p.clone(),
                 })
@@ -370,7 +419,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let rope_p = p.spec_rt.draft_rope.as_ref().ok_or_else(|| {
                 ModelError::EngineInvariant { what: "peer 草稿 rope 缺席".into() }
             })?;
-            let (_, d_p, _, _) = d2_p.propose_block(
+            let (_, d_p, _, _, _, _) = d2_p.propose_block(
                 &toks_t, &pos_t, &anchor_t, &kvs_p, rope_p, &p.boot.model.embed, &kv_len_t, &ctx, None,
             );
             Ok(d_p)
@@ -529,7 +578,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.dev.graphs.session.face_mut();
             // drafts 根 = select 单缓冲的 SliceView —— dtoh 回读整父块
             // [S·(K·K+1) f32],取前 S 个(dflash2.rs select 同坑,测试侧同修)
-            let mut buf = vec![0u8; 7196];
+            let mut buf = vec![0u8; depth * (16 * 16 + 1) * 4];
             face.dtoh(&b, &mut buf).await?;
             // 根块 = drafts 的 **select 单缓冲**(`b` 是它的 SliceView)——
             // harvest 完就是 turn 域死块:必须与 arena 一起还,否则每轮漏一条
@@ -539,11 +588,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             ids.push(b.id);
             face.free(&ids).await?;
             buf.chunks_exact(4)
-                .take(7) // 父块 = select 单缓冲(SliceView dtoh 回整块);草稿仅前 7
+                .take(depth) // 父块 = select 单缓冲(SliceView dtoh 回整块);草稿仅前 K
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                 .collect::<Vec<_>>()
         };
+        // eager 草稿路的 q：不在这里二次求值选择器树 —— 该树含 RowParallel
+        // AR，单边重跑会与 peer 失步挂住（2026-10-23 实测）。首轮/无图档
+        // 走旧的「目标抽样 == draft」等价式；图档在 `dflash_graph_round`
+        // 用同图输出的 scores/topk 建 q。
         self.apply_dflash_lookup(&mut out, lookup);
+        self.tspec()?.spec_q_host = None;
         if self.boot.probes.dflash_probe {
             owl_shared::log_debug!("dflash-probe", "pos={pos} anchor={anchor} drafts={out:?}");
         }
@@ -564,9 +618,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         m: usize,
         pos: usize,
     ) -> Result<()> {
-        // 行数钉 8(verify 块全行;taps 块仅 8 行,m=7 时 m+2=9 越界读 ——
-        // 多编行下轮被自块写/重编覆盖,幂等安全;E5-DF4 与图路径同式)
-        let rows = (m + 2).min(8);
+        // 行数 = verify 块全行 W(运行时 K+1;taps 块仅 W 行,m=K 时
+        // m+2=K+2 越界读 —— 多编行下轮被自块写/重编覆盖,幂等安全)
+        let rows = (m + 2).min(d2.block());
         let rope = self.dev.spec_rt.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
         let dtype = self.dev.pool.geom.dims.dtype;
         let views: Vec<TensorOps> = taps
@@ -1025,8 +1079,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 为什么正确:全局 top-16 ⊆ 两半各自 top-16 的并集（截断性质）。
     /// 为什么 rank0:读数面单点（与全合一档同构）；peer 的图输出照旧丢弃。
     async fn dflash_select_merged(&mut self, bonus: u32) -> Result<Vec<u32>> {
-        use owl_models::layers::dflash2::{DEPTH, TOP_K};
-        let rows = DEPTH;
+        use owl_models::layers::dflash2::TOP_K;
+        let rows = self.dev.spec_rt.depth;
         let k = TOP_K;
         let half = self.dev.boot.model.logits_vocab();
         // ① rank0 三槽（图输出；dtoh）。`topk` = 单缓冲:前段值区 ‖ 后段索引区。

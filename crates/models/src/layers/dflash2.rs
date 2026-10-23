@@ -141,6 +141,11 @@ impl GroupedConv {
             .with_shape(self.dt, vec![t, self.hidden])
     }
 
+    /// 运行时改块宽（conv 位置掩码模数）。
+    pub(crate) fn set_block_size(&mut self, block: usize) {
+        self.block_size = block;
+    }
+
     /// prepare(sglang 同名):coeffs = proj(x) → (conv_in(x), delta)。
     /// 返回 (卷积后输入, 输出侧系数 delta)。
     pub fn prepare(&self, x: &TensorOps, ctx: &ForwardCtx) -> (TensorOps, TensorOps) {
@@ -175,11 +180,14 @@ impl GroupedConv {
 // ============================================================================
 
 pub const DRAFT_SLIDING_WINDOW: usize = 2048;
+/// 检查点缺省块宽（兼容旧档；运行时由 `with_block_size` 覆盖）。
 pub const DRAFT_BLOCK: usize = 8;
+/// 运行时块宽上限 = K_max + 1 = 16（NInfer 路线 K=1..15）。
+pub const BLOCK_MAX: usize = 16;
 
 /// 草稿 ring 槽数(页对齐;`page` = 草稿池页宽 = 主池页宽,通常 32)
 pub fn draft_ring_slots(page: usize) -> usize {
-    let need = DRAFT_SLIDING_WINDOW + DRAFT_BLOCK;
+    let need = DRAFT_SLIDING_WINDOW + BLOCK_MAX;
     let p = page.max(1);
     need.div_ceil(p) * p
 }
@@ -493,6 +501,12 @@ impl DfLayer {
             .with_shape(mixed.dtype, mixed.shape().to_vec())
     }
 
+    /// 运行时改块宽（conv 位置掩码模数；权重无 block 维度）。
+    pub(crate) fn set_block_size(&mut self, block: usize) {
+        self.attn_conv.set_block_size(block);
+        self.mlp_conv.set_block_size(block);
+    }
+
     /// 层前向(sglang DFlashDecoderLayer.forward 逐式):双流残差。
     /// 返回 (h_local, residual) —— h_local **未加**残差(下游 fused
     /// add 消费;sglang 返回约定)。
@@ -606,7 +620,7 @@ impl CandidateSelector {
     /// 拆分动机（为什么单独存在）:切档下两 rank 各持半表，**全局 top-16 ⊆
     /// 两半各自 top-16 的并集** ⇒ 图只出候选（896B），host 合并后再跑
     /// [`Self::select_from_candidates`]（全表域，码本全量）。
-    pub fn topk_of_logits(&self, logits: &TensorOps) -> (TensorOps, TensorOps) {
+    pub fn topk_of_logits(&self, logits: &TensorOps) -> (TensorOps, TensorOps, TensorOps) {
         let rows = logits.shape()[0];
         // stride 的唯一真源 = 张量**声明形状**（lm_head 输出 = 本 rank 头行数）
         let logits_stride = logits.shape()[1];
@@ -629,7 +643,7 @@ impl CandidateSelector {
             .with_shape(Dtype::F32, vec![2 * rows * TOP_K]); // 值区 + 索引区(两段连续)
         let cand = topk.slice_view(rows * TOP_K, vec![rows, TOP_K]); // 索引区
         let vals = topk.slice_view(0, vec![rows, TOP_K]); // 值区(unary)
-        (cand, vals)
+        (cand, vals, topk)
     }
 
     /// **selector 的 proj 腿**:`hidden_projection(pred)[rows, RANK]`(dtype 随 hidden)。
@@ -680,7 +694,7 @@ impl CandidateSelector {
         ctx: &ForwardCtx,
     ) -> (TensorOps, TensorOps) {
         let rows = logits.shape()[0];
-        let (cand, vals) = self.topk_of_logits(logits);
+        let (cand, vals, _topk) = self.topk_of_logits(logits);
         let proj = self.selector_proj(hidden, ctx);
         self.select_from_candidates(&cand, &vals, &proj, anchor, rows)
     }
@@ -729,6 +743,12 @@ pub struct DFlash2Draft {
     norm: RmsNorm,
     selector: CandidateSelector,
     hidden: usize,
+    /// 运行时物理块宽 W = K + 1（K = 本轮草稿数；NInfer 路线 1..=15）。
+    /// 检查点 `block_size` 只是家族缺省，不是权重维度 —— conv 按位掩码，
+    /// 没有 per-position 权重，故 W 可运行时选。
+    block: usize,
+    /// 运行时草稿数 K = W - 1。
+    depth: usize,
     eps: f32,
     #[allow(dead_code)]
     vocab: usize,
@@ -747,6 +767,32 @@ impl DFlash2Draft {
             l.attn.set_ring_cap(cap);
         }
         self
+    }
+
+    /// **运行时草稿宽度**（NInfer 路线）：`block = K + 1`，K=1..15。
+    /// 只改 conv 位置掩码/对位与 selector 行数；权重无 block 维度。
+    pub fn with_block_size(mut self, block: usize) -> Self {
+        assert!(
+            (2..=crate::layers::dflash2::BLOCK_MAX).contains(&block),
+            "DFlash2 block_size={block} 越界（2..={}；配置层已校验 depth<=15）",
+            crate::layers::dflash2::BLOCK_MAX
+        );
+        self.block = block;
+        self.depth = block - 1;
+        for l in &mut self.layers {
+            l.set_block_size(block);
+        }
+        self
+    }
+
+    /// 运行块宽 W（= K + 1）。
+    pub fn block(&self) -> usize {
+        self.block
+    }
+
+    /// 运行草稿数 K（= W - 1）。
+    pub fn depth(&self) -> usize {
+        self.depth
     }
 
     /// 几何 = 检查点 config(5 层 32H/8KV/128;hidden 5120;inter 17408;
@@ -924,6 +970,8 @@ impl DFlash2Draft {
             norm: RmsNorm::new("norm", hidden, eps),
             selector: CandidateSelector::new(hidden, vocab, RANK, dt, selector_plan),
             hidden,
+            block: BLOCK,
+            depth: DEPTH,
             eps,
             vocab,
             dt,
@@ -1080,7 +1128,7 @@ impl DFlash2Draft {
     ) -> TensorOps {
         assert_eq!(kvs.len(), self.layers.len(), "草稿 KV 层数");
         // cast 边界①:embed 查表(f16 表,target 共享)→ 草稿主干入口(bf16)
-        let mut x = ensure_dt(&embed.embed(tokens, BLOCK), self.dt);
+        let mut x = ensure_dt(&embed.embed(tokens, self.block), self.dt);
         // probe 不拆链(2026-10-17 审查):原先 `probe` 布尔 + `as_mut().unwrap()`
         // 两处 —— "判据在场"由派生布尔维持,不是结构保证
         if let Some(pl) = probe_layers.as_deref_mut() {
@@ -1133,11 +1181,11 @@ impl DFlash2Draft {
     ) -> (TensorOps, TensorOps, TensorOps, TensorOps, TensorOps) {
         let hidden = self.forward_hidden(tokens, pos, kvs, rope, embed, kv_len_t, ctx, probe_layers);
         let hidden_head = ensure_dt(
-            &hidden.slice_view(self.hidden, vec![DEPTH, self.hidden]),
+            &hidden.slice_view(self.hidden, vec![self.depth, self.hidden]),
             Dtype::F16,
         );
         let logits = embed.lm_head_matmul(&hidden_head, &ctx.env.gguf);
-        let (cand, vals) = self.selector.topk_of_logits(&logits);
+        let (cand, vals, _topk) = self.selector.topk_of_logits(&logits);
         let proj = self.selector.selector_proj(&hidden, ctx);
         (hidden, cand, vals, proj, logits)
     }
@@ -1153,17 +1201,20 @@ impl DFlash2Draft {
         kv_len_t: &TensorOps,
         ctx: &ForwardCtx,
         probe_layers: Option<&mut Vec<TensorOps>>,
-    ) -> (TensorOps, TensorOps, TensorOps, TensorOps) {
+    ) -> (TensorOps, TensorOps, TensorOps, TensorOps, TensorOps, TensorOps) {
         let hidden = self.forward_hidden(tokens, pos, kvs, rope, embed, kv_len_t, ctx, probe_layers);
         // cast 边界②:hidden(草稿 dtype)→ lm_head 入口 f16(cublas/topk
         // 链保持 f16 不动,sglang 同位 .to(f16) 式;索引量 f32 契约不变)
         let hidden_head = ensure_dt(
-            &hidden.slice_view(self.hidden, vec![DEPTH, self.hidden]),
+            &hidden.slice_view(self.hidden, vec![self.depth, self.hidden]),
             Dtype::F16,
         );
         let logits = embed.lm_head_matmul(&hidden_head, &ctx.env.gguf);
-        let (drafts, scores) = self.selector.select_with_logits(&hidden, anchor, &logits, ctx);
-        (hidden, drafts, scores, logits)
+        let (cand, vals, topk) = self.selector.topk_of_logits(&logits);
+        let proj = self.selector.selector_proj(&hidden, ctx);
+        let (drafts, scores) =
+            self.selector.select_from_candidates(&cand, &vals, &proj, anchor, self.depth);
+        (hidden, drafts, scores, logits, cand, topk)
     }
 
     /// fused add + norm(DfLayer 同款;独立于层以复用 norm 容器)
@@ -1713,7 +1764,7 @@ mod tests {
         // propose(probe_roots)
         let mut probe_roots: Vec<TensorOps> = Vec::new();
         let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b2(&[(19 + BLOCK) as f32]));
-        let (hidden_t, drafts_t, _scores, logits_t) = draft.propose_block(
+        let (hidden_t, drafts_t, _scores, logits_t, _cand, _topk) = draft.propose_block(
             &ids_t, &pos_t, &anchor_t, &kvs, &rope, &embed, &kv_len_t, &ctx,
             Some(&mut probe_roots),
         );

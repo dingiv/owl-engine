@@ -1455,7 +1455,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // `t < 8` 时**静默用第 0 行补齐** —— 若属"固定 8 行图族"的按设计补齐,
         // 应写成显式的 pad(并断言 t≥1);若属越界,静默回退会生成**错树**
         // 且极难查。当前语义未定谳,故先挂牌不改行为(改动可能误伤 pad 路径)。
-        for i in 0..8 {
+        for i in 0..owl_models::kernel::CONCAT_ROWS_SLOTS {
             root = root.arg(refs.get(i).copied().unwrap_or(refs[0]));
         }
         let root = root.arg_usize(t).arg_usize(1).arg_usize(1).with_shape(Dtype::F32, vec![t, 1]);

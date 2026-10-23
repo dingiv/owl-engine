@@ -76,7 +76,7 @@ pub(crate) enum StepAction {
     SpecRound {
         token: u32,
         pos: usize,
-        kv_slots: [u32; 9],
+        kv_slots: [u32; owl_shared::config::SPEC_VERIFY_ROWS_MAX + 1],
         gdn_slot: usize,
         grew: bool,
         /// 本轮 active depth（自适应档 = d3/d7；图族按它选）
@@ -910,7 +910,15 @@ impl<D: DeviceClient> RunningEngine<D> {
         } else {
             self.dev.spec_rt.depth_for_pos(pos)
         };
-        let spec = if self.dev.spec_rt.depth == 0 {
+        // **target live 宽度 = P+1**（NInfer 同律）：proposal 仍算满 W=K+1，
+        // target 图也仍是 T=K+1（owl 图定形），但 P< K 时只提交前 P+1 行。
+        // rem=1 时直接裸 decode；P 的截断在 `execute_spec_round` 内做
+        // （那里有 `max_new - out.len()` 与 fold/发射账）。
+        let remaining_out = {
+            let act = self.turns.active()?;
+            act.max_new.saturating_sub(act.out.len())
+        };
+        let spec = if self.dev.spec_rt.depth == 0 || remaining_out <= 1 {
             0
         } else if !self.turns.active()?.spec.spec_degraded {
             // **分母与 ctx 配对**(2026-10-17):裸步成本**并非** ctx 不变 ——
@@ -969,7 +977,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             if spec > 0 {
                 // 槽表 = verify 块位(pos..pos+spec);余槽补 0(消费面
                 // 自算物理槽,此表仅 decode 回退臂消费 depth+1 个)
-                let mut kv_slots = [0u32; 9];
+                let mut kv_slots = [0u32; owl_shared::config::SPEC_VERIFY_ROWS_MAX + 1];
                 for (i, sl) in kv_slots.iter_mut().enumerate() {
                     if i <= spec {
                         *sl = slot_at(pos + i);

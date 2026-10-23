@@ -129,13 +129,13 @@ pub(crate) fn narrow_strided(
     .with_shape(dt, shape)
 }
 
-/// 行栈 concat(PF1a;owl_concat_rows_f16,arity 8):n 份同形 [r, d]
-/// → [n·r, d]。n ≤ 8(展开路径 = 测试锚封顶;生产 prefill 走 PF1b 批核
-/// varlen 核,大 T 不经此核)。n < 8 多余指针位重复首块(核内防读)。
+/// 行栈 concat(PF1a;owl_concat_rows_f16,arity 16):n 份同形 [r, d]
+/// → [n·r, d]。n ≤ 16(展开路径 = 测试锚封顶;生产 prefill 走 PF1b 批核
+/// varlen 核,大 T 不经此核)。n < 16 多余指针位重复首块(核内防读)。
 /// dtype 跟随首输入(f16)。
 pub fn concat_rows(inputs: &[&TensorOps], r: usize, d: usize) -> TensorOps {
     let n = inputs.len();
-    assert!((1..=8).contains(&n), "concat_rows: arity 封顶 8,得 {n}");
+    assert!((1..=crate::kernel::CONCAT_ROWS_SLOTS).contains(&n), "concat_rows: arity 封顶 {},得 {n}", crate::kernel::CONCAT_ROWS_SLOTS);
     let dt = inputs[0].dtype;
     let mut k = if dt == crate::tensor::Dtype::F16 {
         TensorOps::call(crate::ops::SemanticKernel::Concat) // 哨兵:逐元素核,自动 1D ceil/256
@@ -143,7 +143,7 @@ pub fn concat_rows(inputs: &[&TensorOps], r: usize, d: usize) -> TensorOps {
         // f32 语义锚链同通道
         TensorOps::call(crate::ops::SemanticKernel::Concat)
     };
-    for i in 0..8 {
+    for i in 0..crate::kernel::CONCAT_ROWS_SLOTS {
         k = k.arg(inputs.get(i).copied().unwrap_or(inputs[0]));
     }
     k.arg_usize(n)

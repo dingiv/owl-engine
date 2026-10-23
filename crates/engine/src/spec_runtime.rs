@@ -517,7 +517,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     "DFlash2 GGUF 草稿装载(depth={depth};块字节驻留 + 码本反量化) {:.2}s",
                     t_draft.elapsed().as_secs_f32()
                 );
-                Some(Drafter::DFlash2(Arc::new(d2.with_ring_cap(dflash_ring_cap))))
+                Some(Drafter::DFlash2(Arc::new(
+                    d2.with_ring_cap(dflash_ring_cap).with_block_size(depth + 1),
+                )))
             } else {
                 // 声明:草稿检查点自己的 config(组件档)+ 起点格式探测 → fc 臂;
                 // 装载走通用入口(BF16 全程;设备重排 = 能力自述裁决)
@@ -535,7 +537,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     std::sync::Arc::new(owl_models::layers::dflash2::DRAFT_TAP_IDS.to_vec());
                 dflash_mask_token = owl_models::layers::dflash2::MASK_TOKEN_ID;
                 owl_shared::log_info!("boot", "DFlash2 草稿装载(depth={depth};1.92B BF16 激活,sglang 对齐) {:.2}s", t_draft.elapsed().as_secs_f32());
-                Some(Drafter::DFlash2(Arc::new(d2.with_ring_cap(dflash_ring_cap))))
+                Some(Drafter::DFlash2(Arc::new(
+                    d2.with_ring_cap(dflash_ring_cap).with_block_size(depth + 1),
+                )))
             }
         }
         _ => None,

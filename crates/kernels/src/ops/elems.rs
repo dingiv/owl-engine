@@ -173,14 +173,15 @@ impl KernelSpec for CastBf16F16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-/// **首轮拼接的输入槽数**(`owl_concat_rows_{f16,f32}` = `i0..i{7}`;arity 固定)。
+/// **首轮拼接的输入槽数**(`owl_concat_rows_{f16,f32}` = `i0..i{15}`;arity 固定)。
 ///
-/// 8 = **核声明面的事实**(两张表都恰好 8 槽)–—— 调用方(engine 的“固定槽树”
-/// 把 t 行 pad 到 8 槽)与装配期门**都取本常量**,不许各写一个字面量;
+/// 16 = **核声明面的事实**(两张表都恰好 16 槽)—— DFlash2 K=1..15
+/// 单 block 的 verify 行数 = K+1 最大 16。调用方(engine 的“固定槽树”
+/// 把 t 行 pad 到 16 槽)与装配期门**都取本常量**,不许各写一个字面量;
 /// 改核时本处跟着改,`concat_rows_slots_lock` 拿两张表逐槽核。
-pub const CONCAT_ROWS_SLOTS: usize = 8;
+pub const CONCAT_ROWS_SLOTS: usize = 16;
 
-/// `owl_concat_rows_f16` —— 8 路行拼接(arity 8 = 固定)
+/// `owl_concat_rows_f16` —— 16 路行拼接(arity 16 = 固定)
 pub struct ConcatRowsF16;
 
 #[kernel_tags("dom.elem", "role.elem")]
@@ -196,6 +197,14 @@ impl KernelSpec for ConcatRowsF16 {
         Param::t_in("i5", Dtype::F16, 0),
         Param::t_in("i6", Dtype::F16, 0),
         Param::t_in("i7", Dtype::F16, 0),
+        Param::t_in("i8", Dtype::F16, 0),
+        Param::t_in("i9", Dtype::F16, 0),
+        Param::t_in("i10", Dtype::F16, 0),
+        Param::t_in("i11", Dtype::F16, 0),
+        Param::t_in("i12", Dtype::F16, 0),
+        Param::t_in("i13", Dtype::F16, 0),
+        Param::t_in("i14", Dtype::F16, 0),
+        Param::t_in("i15", Dtype::F16, 0),
         Param::sz("n"),
         Param::sz("r"),
         Param::sz("d"),
@@ -222,6 +231,14 @@ impl KernelSpec for ConcatRowsF32 {
         Param::t_in("i5", Dtype::F32, 0),
         Param::t_in("i6", Dtype::F32, 0),
         Param::t_in("i7", Dtype::F32, 0),
+        Param::t_in("i8", Dtype::F32, 0),
+        Param::t_in("i9", Dtype::F32, 0),
+        Param::t_in("i10", Dtype::F32, 0),
+        Param::t_in("i11", Dtype::F32, 0),
+        Param::t_in("i12", Dtype::F32, 0),
+        Param::t_in("i13", Dtype::F32, 0),
+        Param::t_in("i14", Dtype::F32, 0),
+        Param::t_in("i15", Dtype::F32, 0),
         Param::sz("n"),
         Param::sz("r"),
         Param::sz("d"),

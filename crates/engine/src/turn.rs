@@ -182,6 +182,8 @@ pub(crate) struct TurnSpecState {
     pub(crate) spec_snap_valid: bool,
     /// 已 propose 草稿(host 账;轮末产出轮首消费)
     pub(crate) spec_drafts_host: Option<Vec<u32>>,
+    /// 与 `spec_drafts_host` 同轮的 proposal q（DFlash2 采样档）。
+    pub(crate) spec_q_host: Option<crate::exec::proposal_q::DraftQ>,
     /// B4:m=0 连击计数(成功轮归零)
     pub(crate) spec_zero_streak: usize,
     /// B4:降级态(true = 调度发裸 Decode;草稿池逐 token 同步)
