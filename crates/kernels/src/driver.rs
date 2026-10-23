@@ -1923,6 +1923,13 @@ pub mod vis {
         // (`[owl-fi][ragged run] 未实例化的 cta_tile_q=…`),错误从模型深处冒上来
         // 且信息量极低。小形状走 **native 臂**是等价且更省事的路
         // (一 block 32 行 × 一头,块内共享 smem tile)。
+        // **vLLM 原版 FA2 varlen（2026-10-23）**：27B 视觉塔 hd=72 直接走
+        // vLLM 的 `run_mha_fwd_hdim96`（kHeadDim=96，params.d=72，零填充在核内），
+        // 不再走 native 的标量慢核，也不做 Python 侧 head pad。
+        #[cfg(feature = "flashinfer")]
+        if dt == DType::F16 && n_seq == 1 && head_dim == 72 && rows >= 64 {
+            return KernelPick::of::<crate::ops::flashinfer::Fa2VarlenF16>(super::FOREIGN);
+        }
         if dt == DType::F16 && n_seq == 1 && head_dim == 64 && rows >= 64 {
             return KernelPick {
                 name: crate::family::flashinfer::ATTN_RAGGED_F16,
@@ -2418,6 +2425,13 @@ mod tests {
         assert_eq!(p.name, "owl_vis_attn_full_f16", "rows < 64 必须退 native");
         assert_eq!(p.shape.grid, (1, 12, 1), "native:ceil(16/32) 行块");
         // 其他维度不满足 ⇒ native(既有判据不动)
+        #[cfg(feature = "flashinfer")]
+        assert_eq!(
+            vis::attn_full(DType::F16, 256, 16, 72, 1).name,
+            crate::family::flashinfer::FA2_VARLEN_F16,
+            "27B 塔 hd72 必须走 vLLM FA2 hdim96"
+        );
+        #[cfg(not(feature = "flashinfer"))]
         assert_eq!(vis::attn_full(DType::F16, 256, 12, 72, 1).name, "owl_vis_attn_full_f16");
         assert_eq!(vis::attn_full(DType::F32, 256, 12, 64, 1).name, "owl_vis_attn_full_f32");
         assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 2).name, "owl_vis_attn_full_f16");

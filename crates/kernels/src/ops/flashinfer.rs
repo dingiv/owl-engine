@@ -154,6 +154,35 @@ impl KernelSpec for FiAttnRaggedF16 {
 
 pub static FI_ATTN_RAGGED_F16: KernelMeta = meta_of::<FiAttnRaggedF16>();
 
+/// **vLLM 原版 FA2 varlen forward**（2026-10-23；hd=72→kHeadDim 96）。
+/// 与 `FiAttnRaggedF16` **同槽位**（q/k/v/cu/out/rows/heads/head_dim/n_seq/scale）；
+/// server 按 kernel 名分流到 `owl_fa2_varlen_fwd_f16`。
+pub struct Fa2VarlenF16;
+#[kernel_tags("dom.flashinfer", "role.attn", "phase.prefill")]
+impl KernelSpec for Fa2VarlenF16 {
+    const FAMILY: crate::contract::OpId =
+        crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
+    const ENTRY: &'static str = crate::family::flashinfer::FA2_VARLEN_F16;
+    const SRC: &'static str = "";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 3),
+        Param::t_in("k", Dtype::F16, 3),
+        Param::t_in("v", Dtype::F16, 3),
+        Param::t_in("cu_seqlens", Dtype::F32, 1),
+        Param::t_out("out", Dtype::F16, 3),
+        Param::sz("rows"),
+        Param::sz("heads"),
+        Param::sz("head_dim"),
+        Param::i32("n_seq"),
+        Param::f32("scale"),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+pub static FA2_VARLEN_F16: KernelMeta = meta_of::<Fa2VarlenF16>();
+
+
 
 #[cfg(test)]
 mod tests {

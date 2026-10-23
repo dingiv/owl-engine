@@ -1,0 +1,16 @@
+compat/c10/cuda/CUDAException.h
+vendor/flash_attn/src/block_info.h
+vendor/flash_attn/src/cuda_check.h
+vendor/flash_attn/src/dropout.h
+vendor/flash_attn/src/flash_fwd_kernel.h
+vendor/flash_attn/src/flash_fwd_launch_template.h
+vendor/flash_attn/src/flash.h
+vendor/flash_attn/src/hardware_info.h
+vendor/flash_attn/src/kernel_traits.h
+vendor/flash_attn/src/mask.h
+vendor/flash_attn/src/namespace_config.h
+vendor/flash_attn/src/philox.cuh
+vendor/flash_attn/src/rotary.h
+vendor/flash_attn/src/softmax.h
+vendor/flash_attn/src/static_switch.h
+vendor/flash_attn/src/utils.h

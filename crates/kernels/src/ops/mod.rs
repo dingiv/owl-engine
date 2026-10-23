@@ -831,6 +831,8 @@ mod tests {
             // 视觉塔注意力(ragged 非因果;2026-10-15):槽位与 native
             // `vis::AttnFullF16` **逐字同构**(driver 按 dtype/图数在两臂间分流)
             (crate::family::flashinfer::ATTN_RAGGED_F16, &["q", "k", "v", "cu_seqlens", "out", "rows", "heads", "head_dim", "n_seq", "scale"], &["F16x3", "F16x3", "F16x3", "F32x1", "F16x3", "U64", "U64", "U64", "I32", "F32"]),
+            // vLLM 原版 FA2 varlen（hd72→96；2026-10-23）：同槽位同类型
+            (crate::family::flashinfer::FA2_VARLEN_F16, &["q", "k", "v", "cu_seqlens", "out", "rows", "heads", "head_dim", "n_seq", "scale"], &["F16x3", "F16x3", "F16x3", "F32x1", "F16x3", "U64", "U64", "U64", "I32", "F32"]),
             (crate::family::xqa::VERIFY_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
             (crate::family::xqa::DECODE_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
             // prefill 臂:与 verify/decode **同一张 PARAMS 表**(同资产同槽序;
