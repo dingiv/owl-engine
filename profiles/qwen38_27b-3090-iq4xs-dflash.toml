@@ -20,7 +20,7 @@ max_seq = 12288
 max_concurrency = 1
 
 [pool]
-pool_tokens = 12288
+kv_fp8 = false
 gdn_slots = 1
 vram_target = 0.97
 vram_reserve_mb = 1024
@@ -31,7 +31,6 @@ draft = "dflash2"
 draft_path = "../models/z-lab/Qwen3.8-27B-Dflash2-gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
 
 [kernel]
-kv_fp8 = false
 verify_arm = "fi"
 decode_arm = "fi"
 fi_plan_bake = true

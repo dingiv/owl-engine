@@ -20,7 +20,7 @@ max_seq = 16384
 max_concurrency = 1
 
 [pool]
-pool_tokens = 16384
+kv_fp8 = true
 gdn_slots = 1
 vram_target = 0.99
 vram_reserve_mb = 512
@@ -31,7 +31,6 @@ draft = "mtp"
 draft_kv_fp8 = false
 
 [kernel]
-kv_fp8 = true
 verify_arm = "fi"
 decode_arm = "fi"
 fi_plan_bake = true

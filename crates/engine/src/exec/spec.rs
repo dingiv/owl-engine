@@ -10,6 +10,17 @@ const SPEC_HIST_KEEP: usize = 64;
 
 /// 自适应 depth 的观察窗（轮）：DOCS 29.7k 的 d7 尾部在第 8 轮后已足够
 /// 稳定；16 轮会把 d7 的税拖得过长。
+/// **verify 的逐行视图表**(KVMem 部分驻留档;v2 臂)。
+///
+/// 只在会话链真的含 `PENDING_LOAD_PLACEHOLDER` 时构造;无洞时保持旧 dense
+/// 路径(逐字不变)。`bt8` 是 `[rows, nb]`,每行一条视图页链;`lens` 是视图内
+/// token 数(不是逻辑 pos);`slots` 仍是会话链物理页的扁平槽号(K/V 写入位)。
+struct VerifyViewTables {
+    bt8: Vec<f32>,
+    lens: Vec<f32>,
+    slots: Vec<f32>,
+}
+
 const SPEC_ADAPTIVE_WARMUP_ROUNDS: u32 = 8;
 /// 本轮 target live 草稿数 P：预算 rem 个 token 时最多 P+1 个提交行。
 /// rem=1 ⇒ P=0（裸 decode，调用方不应发 spec）；rem>=2 ⇒ P=min(K, rem-1)。
@@ -386,7 +397,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             owl_shared::log_debug!("dflash-probe", "pos={pos} ids={:?} {}", &ids[..depth.min(ids.len())], hits.join(" "));
         }
 
-        owl_shared::log_debug!("spec-round", "接受完成 m={m} bonus={bonus} emitted={}", emitted.len());
+        // pos = 本轮入口位置(接受前)。带上它 ⇒ 不用 `step_profile`(会加
+        // ~30ms/轮同步读、实测把 AL 从 2.90 抬到 4.54)也能画 AL-vs-position。
+        owl_shared::log_debug!("spec-round", "pos={pos} 接受完成 m={m} bonus={bonus} emitted={}", emitted.len());
         // ⑤ 部分接受 → GDN 回滚 + 已接受前缀重放(v1 窗口重处理,施工
         // 方案 §四.4);快照无条件失效(下轮轮首重拍)。
         // 轮不变量:restore 只回到 state@F-1,而下一轮需要 state@fed'-1
@@ -454,6 +467,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         b,
                         tail,
                         owl_store::SnapDurability::Transient,
+                        true,
                         true,
                     )
                     .await?;
@@ -836,19 +850,158 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     pub(crate) fn xqa_pt_of(&self, sid: u64) -> Vec<f32> {
         let empty: &[u32] = &[];
         let table = self.bank.sessions.get(sid).map(|s| s.block_table.as_slice()).unwrap_or(empty);
-        let nb = self.dev.pool.geom.nb.max(table.len());
-        let mut v: Vec<f32> = table.iter().map(|&b| f32::from_bits(b)).collect();
+        // 槽容量 = 池页数。overcommit 档的会话链会大于池(select_partial),
+        // XQA 此时已禁用;仍按槽容量截断,避免 verify 输入装填越界。
+        let nb = self.dev.pool.geom.nb.max(1);
+        let mut v: Vec<f32> = table.iter().take(nb).map(|&b| f32::from_bits(b)).collect();
         v.resize(nb, 0.0);
         v
     }
 
-    /// **① 轮首快照**(S6d):GDN 态回滚缓冲;仅失效时拍。
+    /// **verify 的逐行视图表**(KVMem 部分驻留档;v2 臂)。
     ///
-    /// ★ **双 rank 镜像**(P2.1-c,2026-10-19):快照缓冲是**每 rank 各自的池**
-    /// ⇒ 两边都要拍(只拍 rank0 ⇒ peer 恢复的是陈旧/未初始化态 ⇒ 重放
-    /// logits 错 ⇒ m=0 回滚路输出与裸 decode 不一致)。单卡 = 原路。
+    /// 判据:
+    /// - 会话链 `[0, ceil((pos+rows)/page))` **无占位符** ⇒ `None`(旧 dense 路径);
+    /// - 有洞 + 有视图 ⇒ 逐行 `bt8/lens/slots`;
+    /// - 有洞 + 无视图 / `pos < recall_pos` / 页越界 / 视图超容量 ⇒ 结构化 Err。
     ///
-    /// 返回本次拍照耗时(已有效 = ZERO)。
+    /// `len_r = selected_tokens + (p + 1 - recall_pos)` 是**视图内 token 数**;
+    /// `bt8[r]` 是选中页 ++ 尾部页(到 `p/page`),零填充到 `nb`。
+    /// `slots[r]` 仍是会话链物理页的扁平槽号 —— 新 token 的 K/V 写入位不变。
+    fn verify_view_tables(
+        &self,
+        sid: u64,
+        pos: usize,
+        rows: usize,
+        page: usize,
+        nb: usize,
+    ) -> Result<Option<VerifyViewTables>> {
+        let page = page.max(1);
+        let chain = self.bank.sessions.session(sid)?.block_table.clone();
+        let need_pages = pos.saturating_add(rows).div_ceil(page);
+        if chain.len() < need_pages {
+            return Err(ModelError::Msg(format!(
+                "spec verify 视图:会话链 {} 页 < 本轮回需要的 {need_pages} 页(pos={pos} rows={rows} page={page})",
+                chain.len()
+            )));
+        }
+        let has_hole = chain[..need_pages]
+            .iter()
+            .any(|p| *p == crate::scheduler::PENDING_LOAD_PLACEHOLDER);
+        if !has_hole {
+            return Ok(None);
+        }
+        let view = self.sel.view().ok_or_else(|| {
+            ModelError::Msg(format!(
+                "spec verify:会话链前 {need_pages} 页含宿主占位符,但选择层视图缺席\
+                 (pos={pos} recall=?)。部分驻留档必须每步有视图;拒发本轮。"
+            ))
+        })?;
+        if pos < view.recall_pos {
+            return Err(ModelError::Msg(format!(
+                "spec verify:pos={pos} < 视图召回点 {} —— 视图不覆盖本轮,不能用它兜洞",
+                view.recall_pos
+            )));
+        }
+        // 选中页必须是设备页且不越界(写视图时已校验,这里防账漂)。
+        for &pg in &view.pages {
+            if pg == crate::scheduler::PENDING_LOAD_PLACEHOLDER || pg as usize >= nb {
+                return Err(ModelError::Msg(format!(
+                    "spec verify 视图:选中页 {pg} 非法(占位符或 ≥ 池页数 {nb})"
+                )));
+            }
+        }
+        // **所有行共用同一张页表**(= 最后一行,尾部最长),只让 `kv_lens` 逐行
+        // 变短。dense verify 本来就是 8 行同表 + 逐行 lens;逐行不同页表虽然
+        // v2 签名支持,但会把“尾部页边界”变成 8 份输入,且实测在 DFlash2
+        // 接受行上暴露错值。同表 + 逐行 lens 与 dense 路径同构。
+        let last = pos.saturating_add(rows.saturating_sub(1));
+        let (pages, _) = crate::exec::coverage::view_pages_at(
+            &view.pages,
+            view.tokens,
+            &chain,
+            view.recall_pos,
+            last,
+            page,
+        )
+        .ok_or_else(|| {
+            ModelError::Msg(format!(
+                "spec verify 视图:pos={last} 在召回点 {} 之前,视图不覆盖",
+                view.recall_pos
+            ))
+        })?;
+        let mut pages = pages;
+        // **verify 带宽上限**:只裁 verify 读的页链尾部;decode 仍用完整工作集。
+        let verify_cap = self.boot.cfg.knobs.verify_view_tokens;
+        let _ = crate::exec::coverage::cap_view_pages(&mut pages, page, verify_cap);
+        let view_cap_tokens = pages.len().saturating_mul(page);
+        if pages.len() > nb {
+            return Err(ModelError::Msg(format!(
+                "spec verify 视图超容量:{} 页 > 池 {nb}(pos={last};选中 {}),\
+                 需先重选/回灌",
+                pages.len(),
+                view.pages.len()
+            )));
+        }
+        for (i, &pg) in pages.iter().enumerate() {
+            if pg == crate::scheduler::PENDING_LOAD_PLACEHOLDER || pg as usize >= nb {
+                return Err(ModelError::Msg(format!(
+                    "spec verify 视图:第 {i} 页={pg} 非法(占位符或 ≥ 池页数 {nb};pos={last})"
+                )));
+            }
+        }
+        let mut bt8 = vec![0.0f32; rows.saturating_mul(nb)];
+        let mut lens = vec![0.0f32; rows];
+        let mut slots = vec![0.0f32; rows];
+        for r in 0..rows {
+            let p = pos + r;
+            let raw_len = view.tokens + (p + 1).saturating_sub(view.recall_pos);
+            let len = raw_len.min(view_cap_tokens);
+            if verify_cap == 0 && raw_len > view_cap_tokens {
+                return Err(ModelError::Msg(format!(
+                    "spec verify 视图:len={raw_len} > 页容量 {view_cap_tokens}(pos={p}),视图账不平"
+                )));
+            }
+            let row = &mut bt8[r * nb..(r + 1) * nb];
+            for (i, &pg) in pages.iter().enumerate() {
+                row[i] = pg as f32;
+            }
+            lens[r] = len as f32;
+            let pg = *chain.get(p / page).ok_or_else(|| {
+                ModelError::Msg(format!(
+                    "spec verify 视图:写入页 {} 越界(链 {} 页,pos={p})",
+                    p / page,
+                    chain.len()
+                ))
+            })?;
+            if pg == crate::scheduler::PENDING_LOAD_PLACEHOLDER || pg as usize >= nb {
+                return Err(ModelError::Msg(format!(
+                    "spec verify 视图:写入页 {}={pg} 非法(pos={p})",
+                    p / page
+                )));
+            }
+            slots[r] = (pg * page as u32 + (p % page) as u32) as f32;
+        }
+        if self.boot.probes.dflash_probe {
+            owl_shared::log_info!(
+                "view-diag",
+                "verify pos={} rows={} recall={} selected={} view_tokens={} cap={} pages={} len0={} slot0={} first={:?} last={:?}",
+                pos,
+                rows,
+                view.recall_pos,
+                view.pages.len(),
+                view.tokens,
+                verify_cap,
+                pages.len(),
+                lens.first().copied().unwrap_or(-1.0),
+                slots.first().copied().unwrap_or(-1.0),
+                &pages[..pages.len().min(6)],
+                &pages[pages.len().saturating_sub(6)..]
+            );
+        }
+        Ok(Some(VerifyViewTables { bt8, lens, slots }))
+    }
+
     /// **③ verify 轮**(S6d):`[anchor, d1..dk]` 一次前向。
     ///
     /// 图态 = 一次 replay + fold 记录(每层 8 件);eager fallback = 旧
@@ -878,38 +1031,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         std::time::Duration,
     )> {
         let verify_elapsed;
+        // **视图化 verify(2026-10-23)**:先在 `vg` 借用之前取视图表 ——
+        // `verify_view_tables` 只读 bank/sel;有洞 + 有视图 = 逐行表,
+        // 无洞 = None(旧 dense 路径逐字不变)。
+        let page = self.dev.pool.geom.page.max(1);
+        let view_tables =
+            self.verify_view_tables(sid, pos, block.len(), page, self.dev.pool.geom.nb)?;
+        if view_tables.is_some() {
+            // 证据面:本轮回真的走了逐行视图(而不是 dense 表)。
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("spec.verify.view", 1, file!(), line!());
+            });
+        }
         let (ids, hidden, records, hidden_owned, row_logits) =
         if self.dev.graphs.verify_of(depth).is_some() {
             let vg = self.dev.graphs.verify_mut(depth)?;
         let target_rows = target_rows.clamp(1, block.len());
         let ts = std::time::Instant::now();
-        let page = self.dev.pool.geom.page;
         let bt_chain = {
             let s = self.bank.sessions.session(sid)?;
             s.block_table.clone()
         };
-        // **部分驻留守卫**(2026-10-21,合并自 feat/gguf 08790fa):`select_partial`
-        // 下沉过的块在会话链上是**宿主占位符**(u32::MAX)。verify 的 `bt8`/`slots`
-        // 直接取会话链 ⇒ 占位符被 v2/attention 核当页号(乘页字节 = 天文地址)
-        // ⇒ CUDA 700,且**污染整个上下文**(之后每个 turn 都炸)。响亮拒发本轮,
-        // 错误上抛到 pump(弃置该 turn,不发射任何核)。
-        // 为什么不做"视图化 verify":方案 A 的视图把 KV 压成选中子集,而 verify
-        // 要按**原位置**逐行因果写 8 行 KV + 逐行长 lens —— 页表与 lens 的语义
-        // 还没定谱(设计卷 B-3e 挂账),先拒不发假绿。
-        {
-            let page_g = self.dev.pool.geom.page.max(1);
-            let need_pages = (pos + block.len()).div_ceil(page_g);
-            if let Some((i, _)) = bt_chain
-                .iter()
-                .take(need_pages)
-                .enumerate()
-                .find(|(_, p)| **p == crate::scheduler::PENDING_LOAD_PLACEHOLDER)
-            {
-                return Err(ModelError::Msg(format!(
-                    "spec verify 需要第 {i} 块但它在宿主(部分驻留下沉过;pos={pos} 需 {need_pages} 页)                     ⇒ 拒发本轮。verify 的视图化页表未实现:请关 `[kvmem] select_partial`                     (只留 select_decode)或关投机"
-                )));
-            }
-        }
         let ids_f: Vec<f32> = block.iter().map(|&v| v as f32).collect();
         let rope_base = usize::try_from(pos as i64 + vlm_delta).map_err(|_| {
             ModelError::Msg(format!(
@@ -921,19 +1063,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if bt_chain.len() <= (pos + block.len() - 1) / page {
             owl_shared::log_debug!("spec-dbg", "pos={pos} block={} bt_len={bt_len} page={page}", block.len(), bt_len = bt_chain.len());
         }
-        let slots_f: Vec<f32> = (pos..pos + block.len())
-            .map(|p| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32)
-            .collect();
-        let lens_f: Vec<f32> = ((pos + 1)..=(pos + block.len())).map(|p| p as f32).collect();
-        // §三十一:bt8 = 页链 × depth1 平铺(8 伪序列共享页链;v2 臂用);
-        // 补零到池 nb(会话链短于池时尾部补无效页 0,kv_lens 限界不读)
-        let nb_total = self.dev.pool.geom.nb.max(bt_chain.len());
-        let bt8_f: Vec<f32> = (0..block.len())
-            .flat_map(|_| {
-                bt_chain.iter().map(|&b| b as f32)
-                    .chain(std::iter::repeat_n(0f32, nb_total - bt_chain.len()))
-            })
-            .collect();
+        // **视图化 verify**:有洞时用逐行视图表;无洞时用旧 dense 表
+        // (8 伪序列共享会话链,逐字不变)。
+        let (slots_f, lens_f, bt8_f) = if let Some(v) = &view_tables {
+            (v.slots.clone(), v.lens.clone(), v.bt8.clone())
+        } else {
+            let slots_f: Vec<f32> = (pos..pos + block.len())
+                .map(|p| (bt_chain[p / page] * page as u32 + (p % page) as u32) as f32)
+                .collect();
+            let lens_f: Vec<f32> =
+                ((pos + 1)..=(pos + block.len())).map(|p| p as f32).collect();
+            // §三十一:bt8 = 页链 × depth1 平铺(8 伪序列共享页链;v2 臂用);
+            // 补零到池 nb(会话链短于池时尾部补无效页 0,kv_lens 限界不读)
+            let nb_total = self.dev.pool.geom.nb.max(bt_chain.len());
+            let bt8_f: Vec<f32> = (0..block.len())
+                .flat_map(|_| {
+                    bt_chain.iter().map(|&b| b as f32)
+                        .chain(std::iter::repeat_n(0f32, nb_total - bt_chain.len()))
+                })
+                .collect();
+            (slots_f, lens_f, bt8_f)
+        };
         // XQA 臂:semaphores 每轮清零(KV-split 归约计数;**同流序先于图回放**;
         // 参考实现 = torch sem.zero_();图内不做,故在轮侧发 memset)
         // ⚠️ 必须用 **session face**(池块的账房;verify 图 face 是另一份
@@ -950,7 +1100,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let page_fi = self.dev.pool.geom.page;
         let ctx_total_fi = pos + target_rows;
         // 门 = **槽在场**(槽属于**图**;判"某核在场"必须看节点/槽,不看旋钮)
-        let fi_slots_on = vg.has_input("fi_q_cu");
+        // 槽恒在 verify 图里声明(拓扑恒常);真正的“FI 臂是否消费”看单值臂。
+        // **必须把槽在场与臂在场分开**:v2 档槽也在,但表不能按会话链铺
+        // (overcommit 时链长 > 池页数,旧代码会写越 idx ⇒ panic)。
+        let fi_slots_on = vg.has_input("fi_q_cu")
+            && self.boot.cfg.knobs.env.attn.verify_arm.uses_fi();
+        if fi_slots_on && view_tables.is_some() {
+            return Err(ModelError::Msg(
+                "spec verify:FI 臂不支持逐行视图页表(select_partial);\
+                 请设 [kernel] verify_arm = \"v2\""
+                    .into(),
+            ));
+        }
         let (fi_q_cu_v, fi_idx_v, fi_indptr_v, fi_ll_v): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
             if fi_slots_on {
                 // ⚠️ **必须写本轮真值**(verify 不吃桶化):T=8 的 plan split
@@ -1119,6 +1280,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         verify_elapsed = ts.elapsed();
         (ids, hidden, records, false, row_logits) // 图输出槽:持久,不 free
     } else {
+        if view_tables.is_some() {
+            return Err(ModelError::Msg(
+                "spec verify:eager 路径不支持逐行视图页表(select_partial + 有洞);\
+                 请开 verify 图(不要 [graph] no_graph)"
+                    .into(),
+            ));
+        }
         let ts = std::time::Instant::now();
         let (ids, hidden, row_logits) =
             self.verify_forward(&block, pos, gdn_slot, sampler_on, vlm_delta).await?;
@@ -1128,6 +1296,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         Ok((ids, hidden, records, hidden_owned, row_logits, verify_elapsed))
     }
 
+    /// **① 轮首快照**(S6d):GDN 态回滚缓冲;仅失效时拍。
+    ///
+    /// ★ **双 rank 镜像**(P2.1-c,2026-10-19):快照缓冲是**每 rank 各自的池**
+    /// ⇒ 两边都要拍(只拍 rank0 ⇒ peer 恢复的是陈旧/未初始化态 ⇒ 重放
+    /// logits 错 ⇒ m=0 回滚路输出与裸 decode 不一致)。单卡 = 原路。
+    ///
+    /// 返回本次拍照耗时(已有效 = ZERO)。
     async fn ensure_spec_snap(&mut self, gdn_slot: usize) -> Result<std::time::Duration> {
         if self.tspec()?.spec_snap_valid {
             return Ok(std::time::Duration::ZERO);
@@ -1186,6 +1361,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
     pub(crate) async fn write_bt(&mut self, sid: u64) -> Result<()> {
+        // **视图态:不写全量 bt**(2026-10-23)。部分驻留档的链上有宿主占位符;
+        // decode 走 `sel_pt`、verify 走逐行 `bt8`,全量 `bt` 不是权威。
+        // 之前 spec 轮 `grew`/DFlash2 propose 仍无条件写 ⇒ 撞占位符守卫。
+        if self.sel.has_view() && self.dev.graphs.session.has_input("sel_pt") {
+            return Ok(());
+        }
         let table = self.bank.sessions.session(sid)?.block_table.clone();
         // ★ **双 rank 镜像**(P2.1-c,2026-10-19):页表是**每 rank 各自**的设备块 ⇒
         // TP 档必须两边都写(否则 peer 的寻址停代)。单卡档 = 原路(零分支)。
@@ -1234,6 +1415,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         sid: u64,
         fed: usize,
         snap_keep: bool,
+        index_now: bool,
     ) -> Result<()> {
         // **前缀段**(prefill chunk 边界)专用:prompt 页边界有跨会话共享价值
         // ⇒ Durable(可下沉宿主)。生成段边界另走
@@ -1250,6 +1432,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             &[],
             owl_store::SnapDurability::Durable,
             snap_keep,
+            index_now,
         )
         .await
     }
@@ -1266,6 +1449,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         tail: &[u32],
         durability: owl_store::SnapDurability,
         snap_keep: bool,
+        index_now: bool,
     ) -> Result<()> {
         // 快照面开关(只门住第 ④ 步;前三步照走)。
         //
@@ -1436,7 +1620,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 }
                 todo.push((*hash, *blk, phys as usize));
             }
-            self.collect_index_for_blocks(&todo).await?;
+            if index_now {
+                // 完整召回前一次补齐：把廉价边界攒下的项一起送进一次 D2H。
+                let mut all = self.sel.take_index_pending();
+                all.append(&mut todo);
+                self.collect_index_for_blocks(&all).await?;
+            } else {
+                // 廉价边界：只记身份/页号，不触发 D2H（块在调和时受保护）。
+                self.sel.push_index_pending(todo);
+            }
         }
         if self.boot.probes.vram_dbg {
             let idx_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
@@ -1445,6 +1637,202 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 "fed={fed} 快照段 {snap_ms:.0}ms(含链/槽/拷贝/登记)· 增量登记 {:.0}ms · 索引 {:.0}ms",
                 reg_ms - snap_ms,
                 idx_ms - reg_ms
+            );
+        }
+        Ok(())
+    }
+
+    /// **B-0 索引采集（GPU 版；2026-10-23）**。
+    ///
+    /// 池内 K **不回读**：逐块 × 逐层发射 `owl_mean_k_block_{f16,fp8}`，
+    /// 核内完成逆 RoPE + page 个 token 的 Mean-K 归约；D2H 只有
+    /// `[blocks][layers][hkv][hd]` f16（27B 几何 = 32 KiB/块）。
+    ///
+    /// 辅助面（物理页号 + cos/sin）打成一个 U8 块一次上传，再用
+    /// `BlockSlice` 切给核；输出块最后登记为 `out`（槽序契约 4）。
+    async fn collect_index_gpu(
+        &mut self,
+        todo: &[&(owl_store::ChainHash, usize, usize)],
+        dim: usize,
+        layers: usize,
+        kv_heads: usize,
+    ) -> Result<()> {
+        let page = self.dev.pool.geom.page;
+        let (hkv, hd) = (self.dev.pool.geom.dims.hkv, self.dev.pool.geom.dims.hd);
+        let half = self.dev.boot.rope.rotary_dim() / 2;
+        if half == 0 || 2 * half > hd {
+            return Err(ModelError::Msg(format!(
+                "Mean-K 索引：rotary half={half} 与 head_dim={hd} 不自洽"
+            )));
+        }
+        let n = todo.len();
+        let fp8 = self.dev.pool.geom.kv_fp8;
+        let entry = if fp8 { "owl_mean_k_block_fp8" } else { "owl_mean_k_block_f16" };
+        // 池格式与索引几何必须同口径（f16 走 `__half`，bf16 尚未建臂）
+        let per_block_elems = layers * kv_heads * dim;
+        let out_elems = n * per_block_elems;
+        let k_dtype = if fp8 { Dtype::U32 } else { Dtype::F16 };
+        let k_layers: Vec<(u64, Dtype)> = self
+            .dev
+            .pool
+            .kvs()
+            .iter()
+            .take(layers)
+            .map(|kv| {
+                let dt = kv.k_cache.0.dtype;
+                (kv.k_cache.0.id, dt)
+            })
+            .collect();
+        if k_layers.len() != layers {
+            return Err(ModelError::Msg(format!(
+                "Mean-K 索引：池层数 {} ≠ 索引层数 {layers}",
+                k_layers.len()
+            )));
+        }
+        for (id, dt) in &k_layers {
+            if *dt != k_dtype {
+                return Err(ModelError::Msg(format!(
+                    "Mean-K 索引：层块 id={id} dtype={dt:?}，期望 {k_dtype:?}"
+                )));
+            }
+        }
+        let t_index = std::time::Instant::now();
+        // 辅助块 = phys[n] u32 + cos[n*page*half] f32 + sin[n*page*half] f32
+        let phys_bytes = n * 4;
+        let rope_elems = n * page * half;
+        let cos_off = phys_bytes;
+        let sin_off = cos_off + rope_elems * 4;
+        let aux_len = sin_off + rope_elems * 4;
+        let mut aux = Vec::with_capacity(aux_len);
+        for (_, _, phys) in todo {
+            aux.extend_from_slice(&(*phys as u32).to_le_bytes());
+        }
+        let mut sin = Vec::with_capacity(rope_elems * 4);
+        for (_, blk, _) in todo {
+            for t in 0..page {
+                let pos = blk * page + t;
+                let Some((c, s)) = self.dev.boot.rope.cos_sin_at(pos) else {
+                    return Err(ModelError::Msg(format!(
+                        "Mean-K 索引：rope 表不含位置 {pos}（表长 {}）",
+                        self.dev.boot.rope.max_pos()
+                    )));
+                };
+                for v in c {
+                    aux.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in s {
+                    sin.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        aux.extend_from_slice(&sin);
+        let t_upload = std::time::Instant::now();
+        let face = self.dev.graphs.session.face_mut();
+        let aux_b = face
+            .htod(Dtype::U8, &vec![aux_len], &aux, "kvmem.index.aux")
+            .await?;
+        let out_b = match face.alloc_uninit(Dtype::F16, out_elems, "kvmem.index.mean_k").await {
+            Ok(b) => b,
+            Err(e) => {
+                if let Err(fe) = face.free(&[aux_b.id]).await {
+                    return Err(ModelError::Msg(format!(
+                        "Mean-K 索引：输出分配失败 {e}；辅助块释放失败 {fe}"
+                    )));
+                }
+                return Err(e);
+            }
+        };
+        let t_launch = std::time::Instant::now();
+        let src = owl_models::kernel::source(entry).to_string();
+        let launch_res: Result<()> = async {
+            for (layer, (id, dt)) in k_layers.iter().enumerate() {
+                let msg = owl_iface::contract::LaunchMsg {
+                    kernel: owl_iface::contract::KernelSource {
+                        name: entry.to_string(),
+                        source: src.clone(),
+                    },
+                    args: vec![
+                        owl_iface::contract::Arg::block(*id, *dt, 1),
+                        owl_iface::contract::Arg::block_slice(
+                            aux_b.id, cos_off as u64, rope_elems as u64, Dtype::F32, 2,
+                        ),
+                        owl_iface::contract::Arg::block_slice(
+                            aux_b.id, sin_off as u64, rope_elems as u64, Dtype::F32, 2,
+                        ),
+                        owl_iface::contract::Arg::block_slice(
+                            aux_b.id, 0, n as u64, Dtype::U32, 1,
+                        ),
+                        owl_iface::contract::Arg::I32(page as i32),
+                        owl_iface::contract::Arg::I32(hkv as i32),
+                        owl_iface::contract::Arg::I32(hd as i32),
+                        owl_iface::contract::Arg::I32(half as i32),
+                        owl_iface::contract::Arg::I32(layer as i32),
+                        owl_iface::contract::Arg::I32(layers as i32),
+                        owl_iface::contract::Arg::block(out_b.id, Dtype::F16, 2),
+                    ],
+                    grid: (n as u32, hkv as u32, 1),
+                    block: (hd as u32, 1, 1),
+                    shared_mem: 0,
+                    out_elems,
+                };
+                let got = face.launch(msg).await?;
+                if got.id != out_b.id {
+                    return Err(ModelError::Msg(format!(
+                        "Mean-K 索引：发射回执输出块 {} ≠ 预期 {}",
+                        got.id, out_b.id
+                    )));
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let t_dtoh = std::time::Instant::now();
+        let dtoh_res = match launch_res {
+            Ok(()) => {
+                let mut bytes = vec![0u8; out_elems * 2];
+                face.dtoh(&out_b, &mut bytes).await.map(|()| bytes)
+            }
+            Err(e) => Err(e),
+        };
+        let free_res = face.free(&[aux_b.id, out_b.id]).await;
+        let bytes = match (dtoh_res, free_res) {
+            (Ok(b), Ok(())) => b,
+            (Ok(_), Err(fe)) => return Err(fe),
+            (Err(e), Ok(())) => return Err(e),
+            (Err(e), Err(fe)) => {
+                return Err(ModelError::Msg(format!(
+                    "Mean-K 索引：采集失败 {e}；且 scratch 释放失败 {fe}"
+                )))
+            }
+        };
+        if bytes.len() != out_elems * 2 {
+            return Err(ModelError::Msg(format!(
+                "Mean-K 索引：回读 {}B ≠ {out_elems}×2B",
+                bytes.len()
+            )));
+        }
+        let t_reg = std::time::Instant::now();
+        let mut off = 0usize;
+        for (hash, _, _) in todo {
+            let end = off + per_block_elems * 2;
+            let flat: Vec<u16> = bytes[off..end]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            self.bank.rel.index_register_flat(*hash, flat)?;
+            off = end;
+        }
+        let el = t_index.elapsed().as_secs_f64() * 1000.0;
+        self.sel.note_index(el);
+        if self.boot.probes.idx_dbg {
+            let upload_ms = t_launch.duration_since(t_upload).as_secs_f64() * 1000.0;
+            let launch_ms = t_dtoh.duration_since(t_launch).as_secs_f64() * 1000.0;
+            let dtoh_ms = t_reg.duration_since(t_dtoh).as_secs_f64() * 1000.0;
+            let reg_ms = t_reg.elapsed().as_secs_f64() * 1000.0;
+            owl_shared::log_debug!(
+                "idx",
+                "GPU 批 {} 块 / {layers} 层：总 {el:.1}ms = 上传 {upload_ms:.1} + 发射 {launch_ms:.1} + D2H {dtoh_ms:.1} + 登记 {reg_ms:.1}",
+                n
             );
         }
         Ok(())
@@ -1490,6 +1878,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .collect();
         if todo.is_empty() {
             return Ok(());
+        }
+        if self.boot.cfg.knobs.index_gpu {
+            return self.collect_index_gpu(&todo, dim, layers, kv_heads).await;
         }
         let t_index = std::time::Instant::now();
         let page_bytes = fmt.page_bytes(page, hkv, hd);

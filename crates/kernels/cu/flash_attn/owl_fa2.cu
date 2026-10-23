@@ -12,8 +12,9 @@
 //   72 → **96**；`HEADDIM_SWITCH(params.d)` 选 `kHeadDim=96`，同时保留
 //   `params.d=72`，`Is_even_K=false`，核内把 72 之后的 24 列按 0 处理。
 //   这正是 vLLM Qwen3.5-ViT（hd72）实际走的路径，**不是 Python 侧 pad**。
+// hd=64（4B 塔）直接用 `run_mha_fwd_hdim64`，_d_rounded=64，Is_even_K=true。
 //
-// 契约：q/k/v/out 均 [total_q, heads, 72] f16 连续；cu_seqlens int32
+// 契约：q/k/v/out 均 [total_q, heads, head_dim] f16 连续；cu_seqlens int32
 // [batch+1]（patch 级）；lse f32 [heads, total_q]（FA2 的 unpadded LSE 形状）。
 // ============================================================================
 #include <cstdio>
@@ -35,7 +36,7 @@ extern "C" int owl_fa2_varlen_fwd_f16(
     int heads, int head_dim, float scale,
     cudaStream_t stream) {
   if (batch <= 0 || total_q <= 0 || max_seqlen <= 0 || heads <= 0 ||
-      head_dim != 72 || q_ptr == nullptr || k_ptr == nullptr ||
+      (head_dim != 64 && head_dim != 72) || q_ptr == nullptr || k_ptr == nullptr ||
       v_ptr == nullptr || out_ptr == nullptr || lse_ptr == nullptr ||
       cu_dev == nullptr) {
     return (int)cudaErrorInvalidValue;
@@ -67,16 +68,9 @@ extern "C" int owl_fa2_varlen_fwd_f16(
   p.d = head_dim;
   p.d_rounded = ((head_dim + 31) / 32) * 32; // 72 -> 96（vLLM 同式）
   p.total_q = total_q;
-  // 视觉契约的 cu 是 f32（native/FI 旧槽），FA2 要 int32；单图 ⇒ [0, total_q]。
-  // 写进 runtime 的 fa2_cu scratch，并在同一 COMPUTE 流上先 H2D 再发射。
-  {
-    const int32_t hcu[2] = {0, total_q};
-    // 8B 端点表用**同步** H2D：源是栈上数组，cudaMemcpyAsync 的 pageable
-    // 源生命周期不保证；每层 8B 的同步成本远小于一次误读 cu 的错值风险。
-    cudaError_t ce = cudaMemcpy(cu_dev, hcu, sizeof(hcu),
-                                cudaMemcpyHostToDevice);
-    if (ce != cudaSuccess) return (int)ce;
-  }
+  // 视觉契约的 cu 是 f32（native/FI 旧槽），FA2 要 int32；由 runtime 在
+  // **每个 tower 请求的 cu 块**变化时转好并上传到 fa2_cu（batch 段界）。
+  // 核内不再覆盖 cu：多图时否则会把真实分段写成 [0,total_q]。
   p.cu_seqlens_q = cu_dev;
   p.cu_seqlens_k = cu_dev;
   p.scale_softmax = scale;
@@ -95,6 +89,10 @@ extern "C" int owl_fa2_varlen_fwd_f16(
   p.num_splits = 0;
   p.seqlenq_ngroups_swapped = false;
 
-  run_mha_fwd_hdim96<cutlass::half_t, false>(p, stream);
+  if (head_dim == 64) {
+    run_mha_fwd_hdim64<cutlass::half_t, false>(p, stream);
+  } else {
+    run_mha_fwd_hdim96<cutlass::half_t, false>(p, stream);
+  }
   return (int)cudaGetLastError();
 }

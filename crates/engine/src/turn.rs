@@ -74,8 +74,9 @@ pub struct TurnOpts {
     /// B 轴未落地,地板语义无从兼现,§23.5)。
     pub dense_floor: Option<owl_store::TurnFloor>,
     /// **VLM 图像输入**(2026-10-20 视觉接线;2026-10-23 多图):空 = 纯文本
-    /// (逐字节旧行为)。`VlmImage` 是服务面预处理的输出契约;`evict` =
-    /// 客户端声明「这张图将来可能被删」(前缀无感删除的唯一触发面)。
+    /// (逐字节旧行为)。**单请求可多图**(按内容序);`VlmImage` 是服务面
+    /// 预处理的输出契约;`evict` = 客户端声明「这张图将来可能被删」
+    /// (前缀无感删除的唯一触发面)。
     pub images: Vec<TurnImage>,
 }
 
@@ -138,6 +139,8 @@ pub(crate) struct Turn {
     pub(crate) ephemeral: bool,
     pub(crate) spec: TurnSpec,
     pub(crate) prompt_ids: Vec<u32>,
+    /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
+    pub(crate) msg_snaps: Vec<usize>,
     /// 本轮 prompt 的图像段(含 pad;本轮坐标)—— 收口写回会话账
     pub(crate) img_spans: Vec<crate::img_evict::ImgSpan>,
     /// 本轮 prompt 的 pad 区间(升序;与 `img_spans` 同一次写回)
@@ -162,6 +165,8 @@ pub(crate) struct ActiveTurn {
     pub(crate) gdn_slot: usize,
     pub(crate) ephemeral: bool,
     pub(crate) prompt_ids: Vec<u32>,
+    /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
+    pub(crate) msg_snaps: Vec<usize>,
     pub(crate) max_new: usize,
     /// 忽略 EOS 跑满预算(TurnSpec 透传;测速口径)
     pub(crate) ignore_eos: bool,

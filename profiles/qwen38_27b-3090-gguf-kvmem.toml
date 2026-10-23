@@ -1,0 +1,50 @@
+# GGUF × KVMem 档：Qwen3.8-27B Q4_K_M，单卡 3090 Ti。
+# 设备池由剩余显存自动派生（vram_reserve_mb 压小池 ⇒ 超卖），非驻留 KV 落宿主。
+extends = ["qwen38_27b-3090-gguf.toml"]
+
+[server]
+bind = "127.0.0.1:8143"
+
+[runtime]
+max_seq = 131072
+max_concurrency = 1
+
+[pool]
+kv_fp8 = false
+# query replay 用专用 GDN 回滚缓冲。
+# ⚠️ snap_max=0 会结构性关闭 GDN 边界快照 ⇒ `prefix_cache=true` 只是
+# 名义开启：reuse_face 找不到边界快照，cached_tokens 恒 0（agent 10K
+# 实测同会话/跨会话全 0）。本档只用于冷长上下文/query replay 实验；
+# agent 多轮请用 snap_max>=4 + snap_host_mb>0（见 devlog/serving/agent-prefix-10k.md）。
+# 早期注释：前缀快照暂关，避免最终边界快照与 replay 后的 GDN 状态不一致
+# （后续做 snapshot refresh 再开）。
+snap_max = 0
+host_cache_mb = 10240
+snap_host_mb = 1024
+prefix_cache = true
+vram_reserve_mb = 1024
+
+[kvmem]
+select_decode = true
+select_partial = true
+index = true
+pool_overcommit = true
+workspace_per_req = 8192
+verify_view_tokens = 0
+gqa_aggregation = "max"
+# 论文 §5.2 的 query replay（当前仅 spec off；60k 单轮实测不改变输出，
+# 保留作 step-level/长会话基础件）
+query_replay = true
+select_sink = 2
+select_recent = 4
+recall_every = 1
+coverage_probe = false
+analyze_at_ctx = 0
+evict_policy = "lru"
+
+[kernel]
+decode_arm = "v2"
+verify_arm = "v2"
+
+[spec]
+depth = 0

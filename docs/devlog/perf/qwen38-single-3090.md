@@ -705,7 +705,7 @@ K.10 把三条律写下来后,按律把配置面收口,**期间发现合并(`5f7
 | **`gguf27b-mtp`(默认)** | `max_seq = pool = 98304`,f16,`vram_target=1.0`/`reserve=128` | **ctx 顶满**(硬预算上限):96k / 51.8 t/s / 100–120 s TTFT / 6.0 GiB 池 |
 | 64k(临时) | `--set runtime.max_seq=66048 --set pool.pool_tokens=66048` | 更"均衡"的档:57.5 t/s / 59 s TTFT |
 | 32k(临时) | `--set runtime.max_seq=34816 --set pool.pool_tokens=34816` | 交互优先:67.9 t/s / 24 s TTFT |
-| 128k(极端) | `--set dispatch.kv_fp8=true --set runtime.max_seq=140000 --set pool.pool_tokens=140000` | 批处理/离线;38.4 t/s / 3 min TTFT(**f16 装不下**) |
+| 128k(极端) | `--set pool.kv_fp8=true --set runtime.max_seq=140000 --set pool.pool_tokens=140000` | 批处理/离线;38.4 t/s / 3 min TTFT(**f16 装不下**) |
 
 > TP2(双 3090)随手可翻倍:`max_seq` 到 131072 用 **f16**(8 GiB 池,fp8 不收),
 > 且 prefill 约 ×2 ⇒ 128k 的 TTFT 会从 3 min 掉到 ~1.5 min。

@@ -247,9 +247,9 @@ pub fn resolve(req: OpReq) -> KernelPick {
             req.shapes.get(1).map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0),
         ),
         // q 的 shapes[0] = [rows, heads, head_dim];标量槽 = [rows, heads, head_dim, n_seq]
-        // **两臂分流(2026-10-15 用户裁决:别自写算子)**:f16 + 单图 ⇒ 走
-        // vendored FlashInfer 的 ragged 非因果 prefill(FA2 家族,vLLM ViT 同路算法);
-        // 其余(f32 锚/多图)⇒ native 臂。
+        // **分流(2026-10-15 用户裁决:别自写算子;2026-10-23 统一 FA2)**:
+        // f16 + hd64/72 → vLLM FA2 varlen;均用 cu_seqlens 支持单图/多图。
+        // 其余(f32 锚/小形状)⇒ native 臂。
         // 行数取 h 的 shapes[0] = [L, D](VLM 注入)
         "vis.image_scatter" => vis::image_scatter(
             dt,
@@ -401,6 +401,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
             req.scalars,
         ),
         "ops.embed" => elems::embed(dt, ax(0)),
+        "elems.embed_i8" => elems::embed_i8(ax(0)),
         "attn.norm_rope" => attn::norm_rope(dt, ax(0), ax(1), ax(2)), // aux = [tokens, heads, hd]
         "attn.qkv_norm_rope_insert" => {
             let (tokens, hq, hkv, hd, half) = (ax(0), ax(1), ax(2), ax(3), ax(4));
@@ -1914,13 +1915,14 @@ pub mod vis {
 
     /// `attn_full`:非因果 varlen(视觉塔)。
     ///
-    /// **两臂(按 dtype + 图数分流;见 `resolve` 的 `vis.attn_full` 臂)**:
-    /// - f16 + 单图 ⇒ **FlashInfer ragged 非因果 prefill**(foreign 家族臂;
-    ///   grid/smem 由家族 runtime 自算 ⇒ `FOREIGN` 哨兵);
+    /// **三臂(按 dtype + head_dim 分流;单图/多图同一 varlen 核)**:
+    /// - f16 + hd64 ⇒ **FlashInfer ragged 非因果 prefill**(单图/多图 varlen;
+    ///   foreign 家族臂;grid/smem 由家族 runtime 自算 ⇒ `FOREIGN` 哨兵);
+    /// - f16 + hd72 ⇒ **vLLM FA2 varlen**(单图/多图;kHeadDim=96);
     /// - 其余 ⇒ native(一 block **32 行** × 一头 = 8 warp × 4 行;
     ///   块内共享 smem K/V tile,每 warp 把同一 K/V 行复用于 4 个 q 行;
     ///   grid = (ceil(rows/32), heads),smem = 2·TILE(64)·head_dim·sizeof(T))。
-    pub fn attn_full(dt: DType, rows: usize, heads: usize, head_dim: usize, n_seq: i64) -> KernelPick {
+    pub fn attn_full(dt: DType, rows: usize, heads: usize, head_dim: usize, _n_seq: i64) -> KernelPick {
         // FI ragged 适配器只实例化 hd=64 ⇒ 条件里必须带上(否则静默按 64 维算)。
         //
         // **`rows >= 64` 也是硬条件(2026-10-21 实测)**:FI 的**规划器**按
@@ -1929,18 +1931,12 @@ pub mod vis {
         // (`[owl-fi][ragged run] 未实例化的 cta_tile_q=…`),错误从模型深处冒上来
         // 且信息量极低。小形状走 **native 臂**是等价且更省事的路
         // (一 block 32 行 × 一头,块内共享 smem tile)。
-        // **vLLM 原版 FA2 varlen（2026-10-23）**：27B 视觉塔 hd=72 直接走
-        // vLLM 的 `run_mha_fwd_hdim96`（kHeadDim=96，params.d=72，零填充在核内），
-        // 不再走 native 的标量慢核，也不做 Python 侧 head pad。
+        // **vLLM 原版 FA2 varlen（2026-10-23）**：视觉塔统一走 FA2：
+        // hd=64 -> hdim64；hd=72 -> hdim96（params.d=72，零填充在核内）；
+        // 单图/多图都用 varlen cu_seqlens。FI ragged 暂留但不再被本分派选中。
         #[cfg(feature = "flashinfer")]
-        if dt == DType::F16 && n_seq == 1 && head_dim == 72 && rows >= 64 {
+        if dt == DType::F16 && (head_dim == 64 || head_dim == 72) && rows >= 64 {
             return KernelPick::of::<crate::ops::flashinfer::Fa2VarlenF16>(super::FOREIGN);
-        }
-        if dt == DType::F16 && n_seq == 1 && head_dim == 64 && rows >= 64 {
-            return KernelPick {
-                name: crate::family::flashinfer::ATTN_RAGGED_F16,
-                shape: super::FOREIGN,
-            };
         }
         let elem = match dt {
             DType::F32 => 4usize,
@@ -2409,6 +2405,14 @@ pub mod elems {
             shape: Shape { grid: (tokens as u32, 1, 1), block: (512, 1, 1), smem: 0 },
         }
     }
+
+    /// int8 表查表 + per-row 反量化(2026-10-22;输出恒 f16,与 embed_f16 同几何)。
+    pub fn embed_i8(tokens: usize) -> KernelPick {
+        KernelPick {
+            name: "owl_embed_i8_f16",
+            shape: Shape { grid: (tokens as u32, 1, 1), block: (512, 1, 1), smem: 0 },
+        }
+    }
 }
 
 // ============================================================================
@@ -2449,30 +2453,31 @@ pub mod load {
 mod tests {
     use super::*;
 
-    /// **视觉塔非因果注意力的两臂分流**(2026-10-21 `fix/vlm`):
+    /// **视觉塔非因果注意力的分流**(2026-10-21 `fix/vlm`;2026-10-23 多图):
     /// `rows < 64` 必须走 native —— FI ragged 的规划器会给出 {64,128,256}
     /// 之外的 `cta_tile_q`,适配器当场 `-205`(小图实测)。
     #[test]
     fn vis_attn_full_arm_split_is_shape_driven() {
-        let fi = crate::family::flashinfer::ATTN_RAGGED_F16;
-        // 大形状 + f16 + 单图 + hd=64 ⇒ FI
-        assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 1).name, fi);
-        assert_eq!(vis::attn_full(DType::F16, 64, 12, 64, 1).name, fi, "边界 64 仍走 FI");
-        // 小形状 ⇒ native
+        // 大形状 + f16 + hd64/72 ⇒ FA2(单图/多图同一 varlen)
+        #[cfg(feature = "flashinfer")]
+        {
+            let fa2 = crate::family::flashinfer::FA2_VARLEN_F16;
+            assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 1).name, fa2);
+            assert_eq!(vis::attn_full(DType::F16, 64, 12, 64, 1).name, fa2, "边界 64");
+            assert_eq!(vis::attn_full(DType::F16, 256, 16, 72, 1).name, fa2, "hd72");
+            assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 2).name, fa2, "多图 hd64");
+            assert_eq!(vis::attn_full(DType::F16, 512, 16, 72, 2).name, fa2, "多图 hd72");
+        }
+        #[cfg(not(feature = "flashinfer"))]
+        {
+            assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 1).name, "owl_vis_attn_full_f16");
+            assert_eq!(vis::attn_full(DType::F16, 256, 16, 72, 1).name, "owl_vis_attn_full_f16");
+        }
+        // 小形状 ⇒ native(FI/FA2 的 cta/hdim 约束不划算)
         let p = vis::attn_full(DType::F16, 16, 12, 64, 1);
         assert_eq!(p.name, "owl_vis_attn_full_f16", "rows < 64 必须退 native");
         assert_eq!(p.shape.grid, (1, 12, 1), "native:ceil(16/32) 行块");
-        // 其他维度不满足 ⇒ native(既有判据不动)
-        #[cfg(feature = "flashinfer")]
-        assert_eq!(
-            vis::attn_full(DType::F16, 256, 16, 72, 1).name,
-            crate::family::flashinfer::FA2_VARLEN_F16,
-            "27B 塔 hd72 必须走 vLLM FA2 hdim96"
-        );
-        #[cfg(not(feature = "flashinfer"))]
-        assert_eq!(vis::attn_full(DType::F16, 256, 12, 72, 1).name, "owl_vis_attn_full_f16");
         assert_eq!(vis::attn_full(DType::F32, 256, 12, 64, 1).name, "owl_vis_attn_full_f32");
-        assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 2).name, "owl_vis_attn_full_f16");
     }
 
     #[test]

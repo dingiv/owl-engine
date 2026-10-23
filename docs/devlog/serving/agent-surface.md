@@ -1052,9 +1052,9 @@ DAG(lm_head gemm → argmax)核对**命令序是否与求值序一致**(gemm 的
 - **`owl_store::CachePolicy`**(新):`Off` / `Cap(n)`(测试精确档)/ `Share{permille}`
   —— 容量 = `份额 × 设备池 + 宿主槽全额`(跨层索引:沉到宿主的条目仍占名额)。
   旧 `nb/2` 的算式从 engine(`session.rs`)移入 store;engine 只传**政策输入**
-  (`[pool].prefix_cache_share`,缺省 0.5 = 旧行为逐字不变)。
+  (2026-10-22 起 `prefix_cache_share` 已退役:缓存可占整池,新请求逐出到 host/disk)。
 - flavor 三层账(`spec-dflash`/`awq27b`):`prefix_cache=true` ·
-  `prefix_cache_share=0.75` · `host_cache_mb=4096`(KV 腿宿主:缓存**下沉**而非丢弃) ·
+  `host_cache_mb=4096`(KV 腿宿主:缓存**下沉**而非丢弃) ·
   `snap_max=4` · `snap_host_mb=3072`(状态腿宿主:旧快照下沉 ⇒ `reuse_face`
   能回查到更早的边界)。
 - **末段页对齐**(`Scheduler::prefill_step_chunk` 加 `page` 参数 + 新旋钮
@@ -1237,7 +1237,7 @@ DMA 已到 PCIe 上限,要再降只剩"宿主内容 pin"(被形态律 1 否)。
 | 键 | 现值 | 事实 |
 |---|---|---|
 | `pool_tokens` | 16896(528 MiB) | **预算上限是 85251 tok(4.23 GB)**([vram-gov] 行:卡 23.6G、fixed 1.12G、live 17.52G ⇒ budget 4.23G)⇒ 池只用了 1/8。**当前 16k ctx 下不是约束**(单会话 512 页 ≤ 528;实测 13.4k 命中 98%);改 ctx(32k/64k)才需同步扩 |
-| `prefix_cache_share` | 0.75 | 缓存可占 396 页 ≈ 12.7k tok;单链命中 98% 已证充分 |
+| `prefix_cache_share` | 已退役 | 2026-10-22 起缓存可占整池 |
 | `snap_max` | 4(637 MiB 显存) | 设备槽 = 链头边界的常驻位;透明档逐出优先丢 Transient ⇒ **保留 4** |
 | `snap_host_mb` | 3072(20 槽) | **原本是硬天花板**(满即拒 ⇒ 新快照被丢);修政策后 = 有界 LRU ⇒ **保留 3072** |
 | `prefill_tail_merge` | 1024 | TTFT 赢(516 tok:651→406 ms);粒度代价见 (9.4)F1 |
@@ -1289,7 +1289,7 @@ pi 的**历史重发不受影响**(共享段尾 = 上轮生成末页,已由 (8) 
 
 #### (10.5) 定档结论 + 未做
 
-- **不动尺寸**:`snap_max=4` / `snap_host_mb=3072` / `prefix_cache_share=0.75` / `pool_tokens=16896`
+- **不动尺寸**:`snap_max=4` / `snap_host_mb=3072` / `pool_tokens=16896`
   —— 修政策后实测均充分(上表)。
 - **改的是政策**(无新旋钮、无需配档):宿主梯**有界 LRU** + 真值帧**次序**。
 - 未做:①F1 两条候选;②启动期预热宿主梯;③ctx 升档时池/份额的联动算式(现在写在

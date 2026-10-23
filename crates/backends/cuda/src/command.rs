@@ -278,6 +278,11 @@ pub enum Command {
     MemPoolStats {
         ack: Ack<Result<(u64, u64, u64, u64), ModelError>>,
     },
+    /// **设备显存实况**(只读;`cuMemGetInfo`):(free, total) 字节。
+    /// boot 分相取证与 `/debug/vram` 驱动残差;纯查询、不碰设备状态。
+    MemInfo {
+        ack: Ack<Result<(u64, u64), ModelError>>,
+    },
     /// **设备 SM 数查询**(宿主面只读;`cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)`)。
     /// 与 `BlockLedgerDump` 同族:无 GPU 活、无流、捕获期可放行(恒定值,不碰设备状态)。
     DeviceSmCount {
@@ -354,6 +359,7 @@ impl Command {
             Self::BlockLedgerDump { .. } => "block_ledger_dump",
             Self::MemPoolTrim { .. } => "mem_pool_trim",
             Self::MemPoolStats { .. } => "mem_pool_stats",
+            Self::MemInfo { .. } => "mem_info",
             Self::UploadAndLaunch { .. } => "upload_and_launch",
             Self::LaunchAndHarvest { .. } => "launch_and_harvest",
             Self::HtodChunk { .. } => "htod_chunk",
@@ -398,6 +404,7 @@ impl Command {
             Self::DeviceSmCount { ack } => ack.created_at(),
             Self::BlockLedgerDump { ack } => ack.created_at(),
             Self::MemPoolStats { ack } => ack.created_at(),
+            Self::MemInfo { ack } => ack.created_at(),
             Self::MemPoolTrim { ack } => ack.created_at(),
             Self::UploadAndLaunch { ack, .. } => ack.created_at(),
             Self::LaunchAndHarvest { ack, .. } => ack.created_at(),

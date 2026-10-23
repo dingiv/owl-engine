@@ -117,6 +117,8 @@ quant = "w4a16"
 # a8 = W8A8 诊断档:8-bit 走 SM86 int8 TC(无 fp8 TC);spec m=7/8
 #   质量门 0.6962(<0.95),且被 W8A16 TC 同速支配 ⇒ **不推荐**。
 head_quant = "rtn-int8-row"
+# embedding 表量化:f16(默认/对照) | i8(per-row;省 ~1.2G,仅 untied)
+embed_quant = "f16"
 # 视觉塔(纯文本档勿开);vision_path 空 = 用检查点内置 model.visual.*
 vision = false
 vision_path = ""
@@ -135,18 +137,31 @@ attention_factor = 1.0
 # [pool] —— 设备池与显存治理
 # ---------------------------------------------------------------------------
 [pool]
-# 设备 KV 池(token;0 / 留空 = 自动 = 2 × 单会话容量)
-pool_tokens = 131072
+# 主 KV 池 fp8 e4m3(32 KiB/token;容量翻倍)
+kv_fp8 = true
+# 设备 KV 池(2026-10-22;不再有手工容量键):
+#   prefix_cache=false → min(剩余显存 cap, max_seq×并发 + 1 页)
+#   prefix_cache=true  → cap(整池可被前缀缓存持有,新请求逐出到 host/disk)
 # 并发上限(每活跃会话一格 GDN 状态;0 = 自动 = runtime.max_concurrency)
 gdn_slots = 1
 # 末段页对齐(前缀复用闭环;单块档多切一刀)
 prefill_align_tail = true
 # 生成相位页边界快照页步长(0 = 关)
 snap_decode_stride = 1
-# 前缀缓存可占设备池比例(inspector: 0..1)
-prefix_cache_share = 0.5
 # GDN 快照池槽数
 snap_max = 0
+# 消息边界快照（缺省关；agent 档开）。开 = 在消息开启标记前取页对齐边界，
+# prefill 在边界切块并拍 Durable 快照，供同 system/tool 前缀跨会话复用。
+# 依赖 prefix_cache=true + snap_max>0；无消费者 = boot 告警。
+snap_msg_boundary = false
+# 消息开启标记文本覆盖（空 = 用模型 ChatFormat.im_open，如 Qwen <|im_start|>）
+# 引擎 boot 时 tokenize；扫描函数只收 open_ids 参数，不写死字面量。
+snap_msg_delim = ""
+# 后续消息边界的稀疏间隔（token；第一条边界无条件保留）
+snap_msg_min_gap = 2048
+# 距当前 fed 小于本值（token）的边界不单独切块；0 = 不设下限（推荐，
+# 否则边界落在 chunk 起点附近会被跳过，system 前缀反而丢）
+snap_msg_min_span = 0
 # 宿主 KV 腿 / 快照腿 / 盘层两腿(MiB;0 = 关)
 host_cache_mb = 0
 snap_host_mb = 0
@@ -162,7 +177,7 @@ vram_reserve_mb = 256
 # 显存硬上限 MiB(留空 = 只按驱动账判)
 vram_budget_mb = 0
 # 前缀缓存开/关
-prefix_cache = false
+prefix_cache = true
 # **前缀无感删除**(图像段;2026-10-23):客户端给图像打 `owl_evict` 标记时,
 # 引擎把图像段补 pad 到页对齐并记为删除候选;下一轮若该段真的被删 ⇒ 保留后缀
 # 页 + 后缀 K 乘 R(−S)(位置帧平移),不重算删点之后的 token。
@@ -191,6 +206,8 @@ draft_path = ""
 dumb = false
 # 草稿池 fp8(关 = bf16)
 draft_kv_fp8 = false
+# DFlash2 草稿环窗口(token;0 = auto = 检查点声明,缺声明 = 家族 2048;当前核支持 2048)
+draft_window = 0
 # DFlash2 lookup-augmented drafting（LABD；仅 DFlash2 档可开）
 # 在当前请求 token 历史里找当前后缀的最近一次出现，用其后续 token 覆盖草稿头；
 # 缺省关 = 旧档逐字节不变。nmin/nmax/nstrong/agree 语义见 docs/devlog/perf/tp2-decode-fast.md §10。
@@ -252,7 +269,15 @@ dump = false
 select_decode = false
 select_partial = false
 index = false
+# 索引采集走 GPU 块级 Mean-K（false = 旧 host 整页回读，golden/排障）
+index_gpu = true
 workspace_per_req = 2240
+# verify 视图带宽上限（token；0 = 跟随 workspace；只裁 verify，decode 不动）
+verify_view_tokens = 0
+# GQA 聚合：mean | max（KVMem 产品脚本默认 max）
+gqa_aggregation = "max"
+# 最终 query replay（KVMem §5.2；当前仅 spec.depth=0）
+query_replay = false
 select_sink = 2
 select_recent = 4
 recall_every = 1
@@ -291,7 +316,6 @@ gdn_chunked = true
 gdn_scalar = false
 gdn_fused_decode = true
 gdn_fused_decode_v2 = true
-kv_fp8 = true
 # W4A8 Marlin int8 m8 8-row 解码(实验;3080 A/B 无收益,默认关)
 marlin_w4a8_m8 = false
 # GGUF 小 n(装得进 L2)且 m ≤ TILE_MT ⇒ 让 MMVQ 赢(0 = 关)

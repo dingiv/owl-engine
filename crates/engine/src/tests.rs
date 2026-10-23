@@ -976,7 +976,10 @@ pub async fn cpu_mock_state_leg_probe() {
 /// (账 = host/Index)。门 = ①索引块数/体量(报告 + `Index` 行)②幂等(重复边界不重复登记)
 /// ③**位置不变性**(同一段内容在不同起始位置 ⇒ 同一 `k̄`)—— 后者需要真 K,
 /// 故在 GPU 档打印对照值(CPU mock 的 K 恒零,只验链路)。
-async fn index_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
+async fn index_probe_scenario<D: DeviceClient>(
+    running: &mut RunningEngine<D>,
+    expect_nonzero: bool,
+) {
     let _before = running.bank.rel.index_bytes();
     // 生成段要够长:页边界(32)才出块 ⇒ 才触发采集
     let (_, tid) = running
@@ -1012,6 +1015,13 @@ async fn index_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
     );
     assert!(blocks > 0, "开采集后应有块进索引(块边界事件未触发?)");
     assert_eq!(after, blocks * per_block, "索引体量 = 块数 × 每块字节");
+    if expect_nonzero {
+        // 真卡档:索引必须来自真实 K（全零 = GPU 路径/切片偏移失守）
+        let ix = running.bank.rel.index.as_ref().expect("索引账在场");
+        let first = ix.evict_candidates(&[]).first().map(|(h, _, _)| *h).expect("至少一块");
+        let row = ix.block_k_bar(first).expect("块索引面");
+        assert!(row.iter().any(|v| *v != 0), "索引面全零:GPU Mean-K 输出未落地");
+    }
     assert!(
         rep.tiers.rows.iter().any(|r| r.kind == owl_store::AssetKind::Index),
         "报告应有 Index 行(host 层)"
@@ -1929,7 +1939,7 @@ pub async fn gpu_08b_index_probe() {
     let mut engine = Engine::new(index_probe_config(ordinal)).expect("构造");
     let loaded = engine.loader().load_qwen35_0_8b(&dir).await.expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
-    index_probe_scenario(&mut running).await;
+    index_probe_scenario(&mut running, true).await;
 }
 
 /// **CPU mock 档的索引采集场景**(无卡:验链路;K 恒零 ⇒ 数值无意义)。
@@ -1946,7 +1956,7 @@ pub async fn cpu_mock_index_probe() {
     let mut engine = Engine::on(index_probe_config(0), face).expect("构造(CPU mock)");
     let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
-    index_probe_scenario(&mut running).await;
+    index_probe_scenario(&mut running, false).await;
 }
 
 /// 索引探针档(小池 + 开采集;prompt 短 ⇒ 靠 decode 页边界出块)
@@ -1955,6 +1965,9 @@ fn index_probe_config(ordinal: usize) -> EngineConfig {
     knobs.pool_tokens = Some(256);
     knobs.gdn_slots = 8;
     knobs.index_probe = true;
+    // **廉价边界暂存路径**（P1）：每 4 个边界才完整采集一次；
+    // 本测试的 prompt 会跨多个边界，从而覆盖 push/take/末边界排空。
+    knobs.recall_every = 4;
     // 索引账落在 store 的 **host 层总账**上(与 KV/快照分片共用总账;
     // 索引自己的淘汰序 = 近期 + 累积频率,见 `MeanKIndex::evict_candidates`)
     knobs.snap_host_mb = 64;
@@ -4333,6 +4346,22 @@ fn derive_turn_ws_sets_blocks_and_floor_from_one_source() {
     let mut k = EngineKnobs { kvmem_virtualization: true, ..Default::default() };
     k.workspace_per_req = 64; // 2 页 < sink2+recent4 = 6 页
     assert!(EngineKnobs::derive_turn_ws(64, 32, page_bytes, &mut k).is_err());
+    // ⑤ verify 视图只能裁、不能放大
+    let mut k = EngineKnobs { kvmem_virtualization: true, ..Default::default() };
+    k.workspace_per_req = 640;
+    k.verify_view_tokens = 1024;
+    assert!(EngineKnobs::derive_turn_ws(640, 32, page_bytes, &mut k).is_err());
+}
+
+/// **索引暂存批上限**:选择可以 r16，但索引 D2H 不能跟着 16 chunk 攒
+/// （64 页/批是池下限里的驻留尾上限）。r1/r4/r16 三档钉住派生。
+#[test]
+fn index_cadence_caps_pending_batch() {
+    let mut k = EngineKnobs::default();
+    for (recall, want) in [(1, 1), (2, 2), (4, 4), (6, 4), (16, 4)] {
+        k.recall_every = recall;
+        assert_eq!(k.index_cadence(), want, "recall_every={recall}");
+    }
 }
 
 // ===========================================================================
@@ -4841,7 +4870,6 @@ pub async fn gpu_image_evict_gate() {
             // **叠转上限降到 1**:让 G7 臂第一次删除吸收(rot=1)、第二次删除
             // 必然到顶 ⇒ 整段重建(门要的是"到顶真的重建",不是数值)
             image_evict_delta_limit: 1,
-            prefix_cache_share: 1.0,
             // 钉小池(门只跑 ~700 tok;auto 池算式在本机会被"预算可服务上限"
             // 拒 —— 与本特性无关的既有面)
             pool_tokens: Some(2048),
@@ -5321,7 +5349,6 @@ pub async fn gpu_image_evict_spec_identity_gate() {
             // 恒等门口径 = 贪心
             sampler_enabled: false,
             pool_tokens: Some(2048),
-            prefix_cache_share: 1.0,
             ..Default::default()
         };
         if spec {

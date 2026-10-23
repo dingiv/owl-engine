@@ -270,6 +270,27 @@ impl KernelSpec for EmbedF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+/// `owl_embed_i8_f16` —— int8 embedding 查表 + per-row 反量化
+/// (2026-10-22;表 = `rtn_i8_row_sym` 的 q[i8]/s[f32],输出 f16)。
+/// 与 `owl_embed_f16` 同几何;向量支 `D % 8 == 0`。
+pub struct EmbedI8F16;
+
+#[kernel_tags("dom.elem", "role.embed")]
+impl KernelSpec for EmbedI8F16 {
+    const ENTRY: &'static str = "owl_embed_i8_f16";
+    const SRC: &'static str = "cu/elems/embed_i8.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::I8, 2),
+        Param::t_in("s", Dtype::F32, 1),
+        Param::t_in("ids", Dtype::F32, 0),
+        Param::sz("d_dim"),
+        Param::t_out("out", Dtype::F16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 /// `owl_argmax_f32idx_f16` —— 设备侧贪心采样(argmax;输出 f32 承载索引)
 pub struct ArgmaxF32IdxF16;
 
@@ -665,6 +686,7 @@ pub static CAST_BF16_F16: KernelMeta = meta_of::<CastBf16F16>();
 pub static CONCAT_ROWS_F16: KernelMeta = meta_of::<ConcatRowsF16>();
 pub static CONCAT_ROWS_F32: KernelMeta = meta_of::<ConcatRowsF32>();
 pub static EMBED_F16: KernelMeta = meta_of::<EmbedF16>();
+pub static EMBED_I8_F16: KernelMeta = meta_of::<EmbedI8F16>();
 pub static ARGMAX_F32IDX_F16: KernelMeta = meta_of::<ArgmaxF32IdxF16>();
 pub static TOPK16_F16: KernelMeta = meta_of::<Topk16F16>();
 
@@ -1146,6 +1168,83 @@ impl KernelSpec for QuantInt8RowBf16 {
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
+
+/// `owl_mean_k_block_f16` —— KVMem Mean-K 块级归约（f16 主池）。
+///
+/// 输入 = kNHD 池页（`[nb,page,hkv,hd]`）+ 该块的 cos/sin（rotate-half，
+/// f32）+ 物理页号表；每线程对一个 dim 做 page 个 token 的逆 RoPE 累加，
+/// 出口 f16 均值（布局 `[block][layer][hkv][hd]`）。只读池，不写池。
+pub struct MeanKBlockF16;
+
+#[kernel_tags("dom.elem", "role.elem", "role.kv_read", "phase.prefill", "kv.main.f16")]
+impl KernelSpec for MeanKBlockF16 {
+    const ENTRY: &'static str = "owl_mean_k_block_f16";
+    const SRC: &'static str = "cu/elems/mean_k.cu";
+    const PARAMS: &'static [Param] = &[
+        // 池句柄按扁平字节账传（f16 = 元素账；核内按 kNHD 元素序寻址）
+        Param::t_in("key_cache", Dtype::F16, 1),
+        Param::t_in("cos_t", Dtype::F32, 2),
+        Param::t_in("sin_t", Dtype::F32, 2),
+        Param::t_in("phys", Dtype::U32, 1),
+        Param::i32("page"),
+        Param::i32("hkv"),
+        Param::i32("hd"),
+        Param::i32("half"),
+        Param::i32("layer"),
+        Param::i32("layers"),
+        Param::t_out("out", Dtype::F16, 2),
+    ];
+    const POOL: &'static [PoolAccess] =
+        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F16)];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_mean_k_block_fp8` —— 同上，主池 e4m3（1B/elem，裸 e4m3 无 scale）。
+pub struct MeanKBlockFp8;
+
+#[kernel_tags("dom.elem", "role.elem", "role.kv_read", "phase.prefill", "kv.main.fp8")]
+impl KernelSpec for MeanKBlockFp8 {
+    const ENTRY: &'static str = "owl_mean_k_block_fp8";
+    const SRC: &'static str = "cu/elems/mean_k.cu";
+    const PARAMS: &'static [Param] = &[
+        // fp8 池以 U32 承载（bytes/4）；核内按字节元素序寻址
+        Param::t_in("key_cache", Dtype::U32, 1),
+        Param::t_in("cos_t", Dtype::F32, 2),
+        Param::t_in("sin_t", Dtype::F32, 2),
+        Param::t_in("phys", Dtype::U32, 1),
+        Param::i32("page"),
+        Param::i32("hkv"),
+        Param::i32("hd"),
+        Param::i32("half"),
+        Param::i32("layer"),
+        Param::i32("layers"),
+        Param::t_out("out", Dtype::F16, 2),
+    ];
+    const POOL: &'static [PoolAccess] =
+        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::F8E4M3)];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
+    };
+}
+
+pub static OWL_MEAN_K_BLOCK_F16: KernelMeta = meta_of::<MeanKBlockF16>();
+pub static OWL_MEAN_K_BLOCK_FP8: KernelMeta = meta_of::<MeanKBlockFp8>();
 
 #[cfg(test)]
 mod tests {

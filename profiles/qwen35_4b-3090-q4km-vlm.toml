@@ -22,7 +22,7 @@ max_seq = 8192
 max_concurrency = 1
 
 [pool]
-pool_tokens = 8192
+kv_fp8 = true
 gdn_slots = 1
 vram_target = 0.99
 vram_reserve_mb = 512
@@ -31,7 +31,6 @@ vram_reserve_mb = 512
 depth = 0
 
 [kernel]
-kv_fp8 = true
 verify_arm = "fi"
 decode_arm = "fi"
 fi_plan_bake = true

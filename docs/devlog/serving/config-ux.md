@@ -185,7 +185,7 @@ server --profile awq27b-3090-max --site ~/owl-site.toml \
 | `concurrency=C` | `pool.gdn_slots=C`；`server.max_concurrency=C`；`runtime.max_batch=C` | **单键三处同源**（当前三处手写） |
 | `spec=off` | `[spec] depth=0`；不要求 draft_dir | — |
 | `spec=dflash` | `depth=7`；`model.dflash2_dir=draft_dir`；草稿池账 +20KiB/token | ctx 重新求解 |
-| `kv=fp8` | `dispatch.kv_fp8=true`；白名单 fp8 族 | 关 = f16 族 |
+| `kv=fp8` | `pool.kv_fp8=true`；白名单 fp8 族 | 关 = f16 族 |
 | `kvmem=off` | `select_decode/select_partial/index/pool_overcommit=false`；host/disk 腿=0 | 单键替四键 |
 | `kvmem=overcommit` | 四键全开 + `host_cache_mb/snap_host_mb/disk_*` 必要腿 | 需虚拟化两扇门 |
 | `graphs=auto` | `no_graph=false`；`fi_cuda_graph=true`；`fi_plan_bake=0`；`fi_plan_restore=false`；`decode_fi/verify_fi=true`；`verify_v2=false`（有 spec） | 需 `kv=fp8` + 单卡 + 非 select_decode；否则自动降级并**打印原因** |

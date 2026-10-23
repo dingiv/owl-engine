@@ -994,6 +994,17 @@ pub trait DeviceClient: Send {
         async { Err(ModelError::Msg("mem_pool_stats: 此后端未实现".into())) }
     }
 
+    /// **设备显存实况**(只读):`(free, total)` 字节。
+    ///
+    /// 为什么必须走设备线程:查询(`cuMemGetInfo`)要求**当前上下文**在调用
+    /// 线程上;只有 server 线程持有 CUDA ctx。boot 分相取证(`[vram-phase]`)
+    /// 与 `/debug/vram` 的驱动残差都吃这口。默认 = 不支持(CPU/mock 后端)。
+    fn mem_info(
+        &mut self,
+    ) -> impl Future<Output = Result<(u64, u64), ModelError>> + Send {
+        async { Err(ModelError::Msg("mem_info: 此后端未实现".into())) }
+    }
+
     /// 设备内块→块拷贝(E2c:GDN 快照拍摄/恢复 —— 会话格 ↔ 快照缓冲
     /// D2D,免 PCIe 往返;双方偏移字节口径,长度 = 拷贝字节数)。
     /// 默认 = 不支持。

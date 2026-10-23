@@ -463,7 +463,7 @@ impl EnvProvider {
                 fused_decode_v2: d.gdn_fused_decode_v2,
             },
             kv: KvEnv {
-                quant: if d.kv_fp8 { KvQuant::Fp8E4M3 } else { KvQuant::None },
+                quant: if cfg.pool.kv_fp8 { KvQuant::Fp8E4M3 } else { KvQuant::None },
                 ..KvEnv::default()
             },
             diag: DiagEnv {

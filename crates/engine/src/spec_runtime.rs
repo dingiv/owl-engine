@@ -71,6 +71,11 @@ pub(crate) struct SpecRuntime {
     /// **草稿池几何**(层数, hkv, hd;**分片后**;P2.1-b)—— 池分配/预算的单源。
     /// `None` = 非 DFlash2 档(池不分配)
     pub draft_geom: Option<(usize, usize, usize)>,
+    /// **草稿环窗口**(token;DFlash2 = 检查点 sliding_window / 配置覆盖)。
+    /// 0 = 非 DFlash2。⚠️ 当前 main 的 NC ring 固定 2048（K15 前），
+    /// 本字段保留给后续可配窗口；不要在热路径依赖它。
+    #[allow(dead_code)]
+    pub draft_window: usize,
     /// **草稿算子环境**(2026-10-19):池面之外的另一半几何事实 ——
     /// `head_dim`/`grp` 取**草稿自己的**(DFlash2 = 128 / hq÷hkv),其余字段
     /// (硬件档/池量化/分派旋钮)与引擎 env 同源。
@@ -180,6 +185,8 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) dumb: bool,
     /// 草稿池 e4m3(B6 偷显存;AL 有损需 A/B)
     pub(crate) draft_kv_fp8: bool,
+    /// 草稿环窗口(0 = auto = 检查点 sliding_window)
+    pub(crate) draft_window: usize,
     /// MTP 草稿注意力窗口(tok;0 = 关)
     pub(crate) mtp_window: usize,
     /// MTP 草稿注意力 sink(tok;仅 window>0 生效)
@@ -400,7 +407,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     // (max_pos, rotary_dim, theta)
     let mut draft_rope_facts: Option<(usize, usize, f32)> = None;
     // (layers, hkv, hd, hq)
-    let mut draft_geom_raw: Option<(usize, usize, usize, usize)> = None;
+    let mut draft_geom_raw: Option<(usize, usize, usize, usize, usize)> = None;
     let drafter = match mode {
         SpecMode::Mtp => {
             let dir = inp.mtp_dir.ok_or_else(|| ModelError::EngineInvariant { what: "Mtp 模式缺 mtp_dir(模式裁决与输入不一致)".into() })?;
@@ -511,7 +518,8 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                 dflash_tap_ids = std::sync::Arc::new(gs.tap_ids.clone());
                 dflash_mask_token = gs.mask_token;
                 draft_rope_facts = Some((gs.rope_max_pos, gs.hd, gs.rope_theta));
-                draft_geom_raw = Some((gs.layers, gs.hkv, gs.hd, gs.hq));
+                draft_geom_raw = Some((gs.layers, gs.hkv, gs.hd, gs.hq,
+                    gs.sliding_window.unwrap_or(owl_models::layers::dflash2::NC_WINDOW)));
                 owl_shared::log_info!(
                     "boot",
                     "DFlash2 GGUF 草稿装载(depth={depth};块字节驻留 + 码本反量化) {:.2}s",
@@ -586,7 +594,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         }
     }
     // 草稿池几何(**分片后**;P2.1-b):从检查点声明 + 本 rank 计划算(不再用写死的 const)
-    let (draft_geom, draft_env) = match &drafter {
+    let (draft_geom, draft_window, draft_env) = match &drafter {
         Some(Drafter::Mtp(_)) => {
             // MTP 草稿链池 = 独立页池,**存储 dtype 由 `[spec] draft_kv_fp8` 定**
             // (2026-10-21:此前恒 F16 —— 那条 864 MiB@192k 就是这么白吃的):
@@ -611,13 +619,13 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             // per-query 全历史扫描便宜。只影响草稿 env,主 verify 仍按
             // 自己的 dispatch.verify_v2/FI 档。
             env.attn.verify_arm = owl_shared::config::VerifyArm::V2;
-            (None, env)
+            (None, 0, env)
         }
         Some(Drafter::DFlash2(_)) => {
             // GGUF 草稿:几何已在开箱时定(不重开容器);HF:从 config + 本 rank 计划算
             let g = match draft_geom_raw {
-                Some((layers, hkv, hd, hq)) => {
-                    owl_models::formats::qwen35::DraftGeom { layers, hq, hkv, hd }
+                Some((layers, hkv, hd, hq, window)) => {
+                    owl_models::formats::qwen35::DraftGeom { layers, hq, hkv, hd, window }
                 }
                 None => {
                     let dir = inp.dflash2_dir.ok_or_else(|| {
@@ -654,9 +662,20 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             } else {
                 owl_models::module::QuantPlan::F16
             };
-            (Some((g.layers, g.hkv, g.hd)), env)
+            // 环窗口:配置覆盖优先(0=auto=检查点);当前 NC 核只实例化 2048
+            let window = if inp.draft_window > 0 { inp.draft_window } else { g.window };
+            let cap = owl_models::layers::dflash2::NC_WINDOW;
+            if window != cap {
+                return Err(ModelError::Msg(format!(
+                    "[spec] draft_window={} 与草稿 NC 核当前窗口 {} 不一致:环容量必须等于核窗口。\
+                     4k/8k 需先给 `owl_naive_attn_nc_*` 加运行时 window(或模板实例);\
+                     当前只支持 {}。",
+                    window, cap, cap
+                )));
+            }
+            (Some((g.layers, g.hkv, g.hd)), window, env)
         }
-        _ => (None, inp.base_env),
+        _ => (None, 0, inp.base_env),
     };
     Ok(SpecRuntime {
         depth,
@@ -667,6 +686,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         dflash_tap_ids,
         dflash_mask_token,
         draft_geom,
+        draft_window,
         draft_env,
         draft_dt,
         mtp_window,

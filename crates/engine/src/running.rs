@@ -84,6 +84,8 @@ pub struct StepProbes {
     pub trace_gate: bool,
     /// E3 收编(原热路径散落 var_os;boot 解析一次):DFlash2 诊断/回退族
     pub dflash_probe: bool,
+    /// 末边界额外哈希一个逻辑块的 K/V 页(诊断面;stage-in 内容校验)
+    pub view_hash_block: Option<usize>,
     pub propose_eager: bool,
     pub dflash_eager: bool,
     pub dflash_noencode: bool,
@@ -126,6 +128,7 @@ impl StepProbes {
             probe_every: cfg.spec.probe_every,
             trace_gate: p.trace_gate,
             dflash_probe: p.dflash_probe,
+            view_hash_block: p.view_hash_block,
             propose_eager: p.propose_eager,
             dflash_eager: p.dflash_eager,
             dflash_noencode: p.dflash_noencode,
@@ -244,6 +247,9 @@ pub(crate) struct BootCtx {
     pub(crate) cfg: EngineConfig,
     pub(crate) tok: Tokenizer,
     pub(crate) probes: StepProbes,
+    /// 消息开启标记的 token 序列（`[pool].snap_msg_delim` 或模型
+    /// `ChatFormat.im_open` 在 boot 期 tokenize 的结果；只读）。
+    pub(crate) msg_open_ids: Vec<u32>,
     /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
     pub(crate) seq: u64,
 }
@@ -706,9 +712,10 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         }
         let prompt = prompt.into();
-        // **VLM 输入门**(2026-10-20 视觉接线 V5;2026-10-23 多图):图像 × 投机
-        // 已接(verify 的 rope pos 加 m-RoPE delta,slots/lens 仍用真实位置)。
-        // 图像路径的塔/表/prefill 见 execute_prefill;这里只做提交边界拒。
+        // **VLM 输入门**(2026-10-20 视觉接线 V5;2026-10-23 多图):
+        // 单请求可带多图(按内容序),但图像 × 合批仍拒;图像 × 投机已接
+        // (verify 的 rope pos 加 m-RoPE delta,slots/lens 用真实位置)。
+        // 邻接多图的 m-RoPE 由 `MropeCfg::rope_index` 按 grid 顺序分段。
         if !opts.images.is_empty() {
             if self.dev.boot.vlm.is_none() {
                 return Err(ModelError::Msg(
@@ -775,6 +782,23 @@ impl<D: DeviceClient> RunningEngine<D> {
         if prompt_ids.is_empty() {
             return Err(ModelError::Msg("submit: 空 prompt".into()));
         }
+        // **消息边界快照点**(2026-10-24):页对齐 token offset，供
+        // `prefill_step_chunk_msg` 切块与 `capture_gdn_snap` 的 snap_keep
+        // 共用。`open_ids` 来自配置/模型声明，不在扫描函数里写死。
+        let msg_snaps = if self.boot.cfg.knobs.snap_msg_boundary
+            && self.boot.cfg.knobs.prefix_cache
+            && self.dev.pool.geom.paged
+            && self.dev.pool.snap_capacity() > 0
+        {
+            crate::msg_boundary::message_snap_points(
+                &prompt_ids,
+                &self.boot.msg_open_ids,
+                self.dev.pool.geom.page,
+                self.boot.cfg.knobs.snap_msg_min_gap,
+            )
+        } else {
+            Vec::new()
+        };
         // 准入地板(S3b §23.5 / A7-bis 接线 2026-10-19):
         //
         // 非 Strict 地板 = "允许选择层按需物化" ⇒ **必须有执行面**才收:
@@ -906,6 +930,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             ephemeral,
             spec: TurnSpec { prompt, max_new, ignore_eos: opts.ignore_eos },
             prompt_ids,
+            msg_snaps,
             img_spans,
             img_pads,
             deletion,
@@ -1213,6 +1238,17 @@ impl<D: DeviceClient> RunningEngine<D> {
         out
     }
 
+    /// **设备显存实况**(只读;`/debug/vram` 的驱动残差):`(free, total)`。
+    pub async fn mem_info(&mut self) -> std::result::Result<(u64, u64), String> {
+        self.dev
+            .graphs
+            .session
+            .face_mut()
+            .mem_info()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// **默认池缓存回收(逐 rank)** —— turn 收尾 / 压力旁路调。
     ///
     /// 语义:`cuMemPoolTrimTo(0)` 把池内**已 free 的缓存页**还给 OS(不改块账)。
@@ -1333,7 +1369,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 首 turn 会少腾槽 ⇒ 批步中途 Exhausted 把整批打掉)
         let mut need = 0usize;
         for act in self.turns.actives() {
-            let target = match Self::prefill_step_chunk(
+            let target = match Self::prefill_step_chunk_msg(
                 act.fed,
                 act.prompt_ids.len(),
                 self.boot.cfg.prefill_chunk,
@@ -1343,6 +1379,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
+                &act.msg_snaps,
+                self.boot.cfg.knobs.snap_msg_min_span,
             ) {
                 Some(chunk) => act.fed + chunk,
                 None => act.fed + self.dev.spec_rt.depth + 1, // 生成相位(act.fed = pos)

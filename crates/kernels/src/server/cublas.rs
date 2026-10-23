@@ -10,9 +10,14 @@ use crate::registry::{FamilyGuard, KernelFamily};
 use crate::family::cublas::OwlCublas;
 
 
-#[derive(Default)]
 pub struct CublasRuntime {
     blas: Option<OwlCublas>,
+    /// **私有工作区**（C1 刀1.5）：必须由 runtime **持有**到句柄销毁；
+    /// 旧实现分配后丢弃 = 悬垂指针（k-probe 失败的真因候选）。
+    /// 4 MiB 取代 cuBLAS 内部默认工作区（实测首 gemm 后 ~0.8 GiB 未入账）。
+    /// 4MB 工作区(2026-10-22 预绑;只由 cublas 内部按指针消费,host 侧不再读)。
+    #[allow(dead_code)]
+    ws: Option<crate::device::ScratchBuf>,
 }
 
 impl CublasRuntime {
@@ -39,15 +44,15 @@ impl KernelFamily for CublasRuntime {
         let stream = res.stream()?;
         let blas = OwlCublas::new(stream.clone())
             .map_err(|e| OpError::Asset { op: GEMM_F16.into(), detail: format!("cublas handle: {e}") })?;
-        // ⚠️ C1 刀1.5 律(SetWorkspace 预绑)**悬置中**(2026-10-12 review C 案
-        // 定形):M4 cutover 时为 bisect k-probe 失败临时禁用,原 4MB ws
-        // 分配后丢弃(死账面)—— 现已删除分配,句柄裸奄(默认池行为)。
-        // 结案路径:诊断定谳非毒源后,此处补 `res.alloc(4<<20, "cublas.ws")`
-        // + `blas.set_workspace(ptr, bytes)`(OwlCublas::set_workspace 已备);
-        // 定谳为毒源则本注释升级为永久禁用依据。捕获期 gemv splitK 在
-        // 悬置期间会走池分配(MEM_ALLOC/FREE 节点回归)—— 图捕获联调前
-        // 必须先结本案。
-        Ok(FamilyGuard::boxed(CublasRuntime { blas: Some(blas) }))
+        // C1 刀1.5 律:**装配期预绑私有工作区**,避免 cuBLAS 首次 gemv splitK
+        // 在捕获/首次 gemm 时内部再分配(~0.8 GiB 实测未入账)。工作区由
+        // runtime 持有(旧实现分配后丢弃 = 悬垂指针,k-probe 失败真因候选)。
+        let ws = res
+            .alloc(4 << 20, "cublas.ws")
+            .map_err(|e| OpError::Asset { op: GEMM_F16.into(), detail: format!("cublas ws: {e}") })?;
+        blas.set_workspace(ws.ptr, ws.bytes)
+            .map_err(|e| OpError::Asset { op: GEMM_F16.into(), detail: format!("cublas set ws: {e}") })?;
+        Ok(FamilyGuard::boxed(CublasRuntime { blas: Some(blas), ws: Some(ws) }))
     }
 
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {

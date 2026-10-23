@@ -112,7 +112,7 @@ model.kind=gguf                  → quant.gguf
 model.quant=w4a16                → quant.w4a16
 model.quant=w4a8                 → quant.w4a8
 model.head_quant=rtn-int8-row    → quant.int8 + feat.head
-dispatch.kv_fp8=true             → kv.main.fp8（false → kv.main.f16）
+pool.kv_fp8=true                 → kv.main.fp8（false → kv.main.f16）
 spec.depth>0                     → feat.dflash + feat.spec（草稿池 → kv.draft.fp8/bf16）
 model.vision=true                → feat.vision
 runtime.tp_ordinals 双卡          → feat.tp

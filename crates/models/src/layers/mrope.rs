@@ -164,32 +164,38 @@ impl MropeCfg {
                     cur += run_len as i64;
                 }
                 TYPE_IMAGE | TYPE_VIDEO => {
-                    let (grids, idx, kind) = if ty == TYPE_IMAGE {
+                    let (grids, grid_start, kind) = if ty == TYPE_IMAGE {
                         (&images, img_it, "图像")
                     } else {
                         (&videos, vid_it, "视频")
                     };
-                    let grid = *grids.get(idx).ok_or_else(|| {
-                        ModelError::Msg(format!(
-                            "rope_index: {kind}段(起点 {i},长 {run_len})无对应网格(已用 {idx} 张)"
-                        ))
-                    })?;
+                    // 一段连续视觉 token 可能包含**多张相邻图/多帧**;
+                    // 按 grid 顺序逐个消费,而不是把整段当成单图。
+                    let mut grid_idx = grid_start;
+                    let mut used = 0usize;
+                    while used < run_len {
+                        let grid = *grids.get(grid_idx).ok_or_else(|| {
+                            ModelError::Msg(format!(
+                                "rope_index: {kind}段(起点 {i},长 {run_len})无对应网格(已用 {grid_idx} 张)"
+                            ))
+                        })?;
+                        let vp = self.vision_position_ids(cur, grid)?;
+                        let vlen = vp.len();
+                        if used + vlen > run_len {
+                            return Err(ModelError::Msg(format!(
+                                "rope_index: {kind}段 token 数 {run_len} 不足网格 {grid:?} 展开 {vlen}（已用 {used}）"
+                            )));
+                        }
+                        pos.extend(vp);
+                        used += vlen;
+                        cur += self.advance(grid);
+                        grid_idx += 1;
+                    }
                     if ty == TYPE_IMAGE {
-                        img_it += 1;
+                        img_it = grid_idx;
                     } else {
-                        vid_it += 1;
+                        vid_it = grid_idx;
                     }
-                    let vp = self.vision_position_ids(cur, grid)?;
-                    // 网格 token 数必须与 prompt 里的占位 token 数逐位对齐
-                    // (HF 不查 = 静默错位;此处响亮拒绝)
-                    if vp.len() != run_len {
-                        return Err(ModelError::Msg(format!(
-                            "rope_index: {kind}段 token 数 {run_len} ≠ 网格 {grid:?} 展开 {}",
-                            vp.len()
-                        )));
-                    }
-                    cur += self.advance(grid);
-                    pos.extend(vp);
                 }
                 other => {
                     return Err(ModelError::Msg(format!(
@@ -333,6 +339,24 @@ mod tests {
         assert_eq!(out.pos, want, "位置号逐 token");
         // delta = max + 1 − L = 7 + 1 − 11 = −3
         assert_eq!(out.delta, -3);
+    }
+
+    /// **相邻多图**:同一连续 image run 里按 grid 顺序消费
+    /// (旧实现把整段当单图 ⇒ 第二张起直接拒/错位)。
+    #[test]
+    fn rope_index_multiple_adjacent_images() {
+        let c = cfg4b();
+        let ids = vec![248056u32; 6 + 2];
+        let tt = token_types(&ids, 248056, Some(248057));
+        let out = c
+            .rope_index(&ids, &tt, &[(1, 4, 6), (1, 2, 4)], &[])
+            .expect("相邻两图");
+        assert_eq!(out.pos.len(), 8);
+        assert_eq!(out.pos[0], [0, 0, 0], "图一 T/H/W 起点");
+        assert_eq!(out.pos[5], [0, 1, 2], "图一末行");
+        assert_eq!(out.pos[6], [3, 3, 3], "图二起点 = 图一段末 advance=3");
+        assert_eq!(out.pos[7], [3, 3, 4], "图二末行");
+        assert_eq!(out.delta, -3, "maxpos 4 + 1 - L 8");
     }
 
     /// 响亮拒绝:占位 token 数与网格不符 / 网格缺失 / 类型非法

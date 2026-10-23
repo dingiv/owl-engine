@@ -1,8 +1,8 @@
 //! FlashInfer paged prefill runtime(FFI 直调链路;plan/run 分离)。
 //!
-//! init:workspace 预钉(float 64MB + int 32MB;构造期,捕获内首次初始化
-//! 事故类结构性消灭)。run:plan(每形状缓存,键 = 形状七元组)→ run
-//! (f16/fp8kv 按名路由)。
+//! init:workspace 预钉(float 64MB + int 32MB + **ragged int 8MB**;构造期,
+//! 捕获内首次初始化事故类结构性消灭)。run:plan(每形状缓存,键 = 形状七元组)
+//! → run(f16/fp8kv 按名路由;视觉 ragged 臂用独立 int workspace)。
 
 use std::collections::HashMap;
 
@@ -12,7 +12,7 @@ use crate::device::ScratchBuf;
 use crate::client::flashinfer::{parse_prefill, PREFILL_FI};
 use crate::family::flashinfer::{
     owl_fi_prefill_plan, owl_fi_prefill_run, owl_fi_prefill_run_fp8kv,
-    FI_FLOAT_WS_BYTES, FI_HOST_STAGING_BYTES, FI_INT_WS_BYTES,
+    FI_FLOAT_WS_BYTES, FI_HOST_STAGING_BYTES, FI_INT_WS_BYTES, FI_RAGGED_INT_WS_BYTES,
 };
 use crate::registry::{FamilyGuard, KernelFamily};
 
@@ -153,6 +153,9 @@ struct PlanEntry {
 pub struct FiRuntime {
     float_ws: Option<ScratchBuf>,
     int_ws: Option<ScratchBuf>,
+    /// 视觉塔 ragged 臂专用 int plan 表(与 paged `int_ws` 隔离;见
+    /// [`FI_RAGGED_INT_WS_BYTES`] 的说明)
+    ragged_int_ws: Option<ScratchBuf>,
     /// plan **共享** staging(plan 内部用;只是计量/复制的中转 —— 不要指望它
     /// 的内容在半途稳定,快照见 [`PlanEntry::staged`])
     host_staging: Vec<u8>,
@@ -169,23 +172,42 @@ pub struct FiRuntime {
     last_capturing: bool,
     /// 入表序号发生器(容量治理)
     stamp: u64,
-    /// 视觉塔 ragged 臂的 plan 缓存(2026-10-15;键 = (rows, heads, head_dim))
+    /// 视觉塔 ragged 臂的 plan 缓存(键 = 形状 + cu block id；block id 单调不复用)
     plan_ragged: Option<(RaggedKey, [i64; 15])>,
-    /// 视觉塔 ragged 的**规范 int32 段界**([0, rows];plan 期写一次,回放期只读)
+    /// 视觉塔 ragged 的**规范 int32 段界**(plan 期写一次,回放期只读)
     ragged_cu: Option<ScratchBuf>,
     /// vLLM FA2 varlen 的 unpadded LSE 擦写区（`[heads, total_q] f32`；
     /// 8 MiB 覆盖视觉单图上限；见 `FA2_LSE_BYTES`）
     fa2_lse: Option<ScratchBuf>,
-    /// FA2 的 int32 cu_seqlens scratch（视觉契约的 cu 是 f32；单图 [0, rows]）
+    /// FA2 的 int32 cu_seqlens scratch（视觉契约的 cu 是 f32；多图逐段）
     fa2_cu: Option<ScratchBuf>,
+    /// FA2 cu 的上传缓存键(cu block id + 形状;同一 tower 请求逐层复用)
+    fa2_key: Option<Fa2Key>,
 }
-/// 视觉塔 ragged plan 键(单图契约 ⇒ 三件即可)
+/// 视觉塔 ragged plan 键
 #[derive(Clone, Copy, PartialEq)]
 struct RaggedKey {
     rows: usize,
     heads: usize,
     head_dim: usize,
+    n_seq: usize,
+    /// `VlmTables.cu` 的块 id(账本内单调、不复用)
+    cu_id: u64,
 }
+
+/// FA2 cu 缓存键
+#[derive(Clone, Copy, PartialEq)]
+struct Fa2Key {
+    rows: usize,
+    n_seq: usize,
+    heads: usize,
+    head_dim: usize,
+    max_seqlen: usize,
+    cu_id: u64,
+}
+
+/// 视觉 cu_seqlens 设备 scratch: 1024 段(`n_seq <= 1023`)
+const VIS_CU_BYTES: usize = 4096;
 
 
 /// plan 条目表容量软上限(超过就驱逐**非图归属**的最旧条目)
@@ -289,14 +311,17 @@ impl Default for FiRuntime {
         Self {
             float_ws: None,
             int_ws: None,
+            ragged_int_ws: None,
             host_staging: vec![0u8; FI_HOST_STAGING_BYTES],
             plans: HashMap::new(),
             active: None,
             last_capturing: false,
-            stamp: 0,plan_ragged: None,
+            stamp: 0,
+            plan_ragged: None,
             ragged_cu: None,
             fa2_lse: None,
             fa2_cu: None,
+            fa2_key: None,
         }
     }
 }
@@ -311,8 +336,8 @@ impl KernelFamily for FiRuntime {
     /// 见 `KernelFamily::names()` 的 id ∪ ops 律)
 
 
-    /// 构造函数:workspace 预钉(float 64MB + int 32MB;构造期,
-    /// 捕获内首次初始化事故类结构性消灭)
+    /// 构造函数:workspace 预钉(float 64MB + int 32MB + ragged int 8MB;
+    /// 构造期,捕获内首次初始化事故类结构性消灭)
     fn assemble(
         res: &mut dyn crate::device::DeviceRes,
         _exec: &mut crate::device::Exec,
@@ -320,17 +345,20 @@ impl KernelFamily for FiRuntime {
         let me = FiRuntime {
             float_ws: Some(res.alloc(FI_FLOAT_WS_BYTES, "fi.float_ws")?),
             int_ws: Some(res.alloc(FI_INT_WS_BYTES, "fi.int_ws")?),
+            ragged_int_ws: Some(res.alloc(FI_RAGGED_INT_WS_BYTES, "fi.ragged_int_ws")?),
             host_staging: vec![0u8; FI_HOST_STAGING_BYTES],
             plans: HashMap::new(),
             active: None,
             last_capturing: false,
-            stamp: 0,plan_ragged: None,
-            ragged_cu: Some(res.alloc(64, "fi.ragged_cu")?),
+            stamp: 0,
+            plan_ragged: None,
+            ragged_cu: Some(res.alloc(VIS_CU_BYTES, "fi.ragged_cu")?),
             fa2_lse: Some(res.alloc(
                 crate::family::flashinfer::FA2_LSE_BYTES,
                 "fa2.lse",
             )?),
-            fa2_cu: Some(res.alloc(64, "fa2.cu")?),
+            fa2_cu: Some(res.alloc(VIS_CU_BYTES, "fa2.cu")?),
+            fa2_key: None,
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -519,7 +547,7 @@ impl KernelFamily for FiRuntime {
 
 impl FiRuntime {
     /// 一次调用 = 一层注意力(q/k/v [rows, heads, head_dim] f16 连续)。
-    /// plan 每形状一次(窗口外;捕获期命中 ⇒ 与 paged 臂同律),**单图契约**。
+    /// plan 每 (形状, cu block) 一次(窗口外;捕获期命中 ⇒ 与 paged 臂同律),单图/多图。
     fn run_attn_ragged(
         &mut self,
         msg: &LaunchMsg,
@@ -532,26 +560,32 @@ impl FiRuntime {
         let q = r(&call.q)?;
         let k = r(&call.k)?;
         let v = r(&call.v)?;
-        let _ = r(&call.cu)?; // 保留解析/账面对位(FI 臂用 plan 期写的规范 int32 段界)
+        let cu_f32_addr = r(&call.cu)?; // f32 varlen 段界(视觉契约);plan 期转 int32
         let out = r(&crate::client::flashinfer::BlockRef { id: call.out.id, byte_offset: 0 })?;
         let float_ws = self.float_ws.as_ref().ok_or_else(|| OpError::Asset {
             op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
             detail: "workspace 未装配".into(),
         })?;
-        let int_ws = self.int_ws.as_ref().ok_or_else(|| OpError::Asset {
+        let int_ws = self.ragged_int_ws.as_ref().ok_or_else(|| OpError::Asset {
             op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
-            detail: "workspace 未装配".into(),
+            detail: "ragged int workspace 未装配".into(),
         })?;
         let stream = res.stream()?;
-        if call.n_seq != 1 {
+        if call.n_seq == 0 {
             return Err(OpError::Contract {
                 op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
                 field: "n_seq",
-                expect: "1(单图契约;多图走 native vis.attn_full 臂)".into(),
-                got: format!("{}", call.n_seq),
+                expect: ">= 1(单图/多图 varlen)".into(),
+                got: "0".into(),
             });
         }
-        let key = RaggedKey { rows: call.rows, heads: call.heads, head_dim: call.head_dim };
+        let key = RaggedKey {
+            rows: call.rows,
+            heads: call.heads,
+            head_dim: call.head_dim,
+            n_seq: call.n_seq,
+            cu_id: call.cu.id,
+        };
         let cu_dev_ptr = self
             .ragged_cu
             .as_ref()
@@ -575,6 +609,45 @@ impl FiRuntime {
                 op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
                 detail: "ragged cu scratch 未装配".into(),
             })?;
+            let cu_need = (call.n_seq + 1) * 4;
+            if cu_need > cu_dev.bytes {
+                return Err(OpError::Contract {
+                    op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
+                    field: "ragged_cu",
+                    expect: format!("≥ (n_seq+1)×4 = {cu_need} B"),
+                    got: format!("{} B(n_seq={})", cu_dev.bytes, call.n_seq),
+                });
+            }
+            let mut cu_raw = vec![0u8; cu_need];
+            res.download(cu_f32_addr, &mut cu_raw).map_err(|e| OpError::Launch {
+                op: msg.kernel.name.clone(),
+                stage: crate::contract::Stage::Load,
+                detail: format!("ragged cu download: {e}"),
+            })?;
+            let mut cu_host = Vec::with_capacity(call.n_seq + 1);
+            for c in cu_raw.chunks_exact(4) {
+                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                if !v.is_finite() || v < 0.0 || v.fract() != 0.0 || v > call.rows as f32 {
+                    return Err(OpError::Contract {
+                        op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
+                        field: "cu_seqlens",
+                        expect: format!("0..rows={} 的整数", call.rows),
+                        got: format!("{v}"),
+                    });
+                }
+                cu_host.push(v as i32);
+            }
+            if cu_host.first().copied() != Some(0)
+                || cu_host.last().copied() != Some(call.rows as i32)
+                || cu_host.windows(2).any(|w| w[1] <= w[0])
+            {
+                return Err(OpError::Contract {
+                    op: crate::family::flashinfer::ATTN_RAGGED_F16.into(),
+                    field: "cu_seqlens",
+                    expect: format!("[0, ..., {}] 严格递增", call.rows),
+                    got: format!("{cu_host:?}"),
+                });
+            }
             let rc = unsafe {
                 crate::family::flashinfer::owl_fi_attn_ragged_plan(
                     float_ws.ptr as *mut std::ffi::c_void,
@@ -586,6 +659,8 @@ impl FiRuntime {
                     plan15.as_mut_ptr(),
                     &mut cta_tile_q,
                     cu_dev.ptr as *mut i32,
+                    cu_host.as_ptr(),
+                    call.n_seq as i32,
                     call.rows as i32,
                     call.heads as i32,
                     call.head_dim as i32,
@@ -596,9 +671,17 @@ impl FiRuntime {
                 return Err(OpError::Launch {
                     op: msg.kernel.name.clone(),
                     stage: crate::contract::Stage::Load,
-                    detail: format!("ragged plan err {rc}(rows={} heads={} hd={})", call.rows, call.heads, call.head_dim),
+                    detail: format!("ragged plan err {rc}(rows={} n_seq={} heads={} hd={})", call.rows, call.n_seq, call.heads, call.head_dim),
                 });
             }
+            // plan 内部的 H2D 源是共享的 `host_staging`;这里等它真正读完再允许
+            // 下一次 plan 重写该缓冲(形状切换时否则会静默把旧源改写掉)。
+            // 只在 plan 未命中时付一次同步,不在每层热路径。
+            stream.synchronize().map_err(|e| OpError::Launch {
+                op: msg.kernel.name.clone(),
+                stage: crate::contract::Stage::Load,
+                detail: format!("ragged plan stream sync: {e}"),
+            })?;
             self.plan_ragged = Some((key, plan15));
         }
         let plan15 = self.plan_ragged.as_ref().map(|(_, p)| *p).expect("plan 缓存");
@@ -879,29 +962,29 @@ impl FiRuntime {
 // ============================================================================
 
 impl FiRuntime {
-    /// 一次调用 = 一层 attention。q/k/v `[rows, heads, 72]` f16，
+    /// 一次调用 = 一层 attention。q/k/v `[rows, heads, 64|72]` f16，
     /// cu_seqlens patch 级 int32，LSE 用本 runtime 的 `fa2_lse` 擦写区。
-    /// **单图契约**：`n_seq == 1`；多图仍走 native（driver 分流）。
+    /// **单图/多图**：`batch=n_seq`，`cu_seqlens` 逐图；cu 按 block id 缓存上传。
     fn run_fa2_varlen(
         &mut self,
         msg: &LaunchMsg,
         res: &mut dyn crate::device::DeviceRes,
     ) -> Result<Bytes, OpError> {
         let call = crate::client::flashinfer::parse_attn_ragged(msg)?;
-        if call.n_seq != 1 {
-            return Err(OpError::Contract {
-                op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
-                field: "n_seq",
-                expect: "1(单图；多图走 native)".into(),
-                got: format!("{}", call.n_seq),
-            });
-        }
-        if call.head_dim != 72 {
+        if call.head_dim != 64 && call.head_dim != 72 {
             return Err(OpError::Contract {
                 op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
                 field: "head_dim",
-                expect: "72(vLLM kHeadDim=96 路径)".into(),
+                expect: "64(hdim64) / 72(hdim96)".into(),
                 got: format!("{}", call.head_dim),
+            });
+        }
+        if call.n_seq == 0 {
+            return Err(OpError::Contract {
+                op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
+                field: "n_seq",
+                expect: ">= 1(单图/多图 varlen)".into(),
+                got: "0".into(),
             });
         }
         let r = |b: &crate::client::flashinfer::BlockRef| {
@@ -910,7 +993,7 @@ impl FiRuntime {
         let q = r(&call.q)?;
         let k = r(&call.k)?;
         let v = r(&call.v)?;
-        let _ = r(&call.cu)?; // 旧 f32 契约槽：FA2 用 fa2_cu（int32）重写
+        let cu_f32_addr = r(&call.cu)?; // f32 varlen 段界;
         let out = r(&crate::client::flashinfer::BlockRef {
             id: call.out.id,
             byte_offset: 0,
@@ -922,14 +1005,101 @@ impl FiRuntime {
             })?;
             (l.ptr, l.bytes)
         };
-        let cu_dev = self
-            .fa2_cu
-            .as_ref()
-            .ok_or_else(|| OpError::Asset {
-                op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
-                detail: "fa2.cu 擦写区未装配".into(),
-            })?
-            .ptr;
+        let cu_scratch = self.fa2_cu.as_ref().ok_or_else(|| OpError::Asset {
+            op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
+            detail: "fa2.cu 擦写区未装配".into(),
+        })?;
+        let stream = res.stream()?;
+        // cu 缓存键 = cu block id(账本内单调、不复用)+ 形状。
+        // 同一 tower 请求的 27 层共用一次上传;新请求的 block id 必然变化。
+        let cached = self.fa2_key.filter(|k| {
+            k.cu_id == call.cu.id
+                && k.rows == call.rows
+                && k.n_seq == call.n_seq
+                && k.heads == call.heads
+                && k.head_dim == call.head_dim
+        });
+        if cached.is_none() && res.capturing().unwrap_or(false) {
+            return Err(OpError::Launch {
+                op: msg.kernel.name.clone(),
+                stage: crate::contract::Stage::Load,
+                detail: "FA2 cu 未缓存而处于捕获窗(需 download/upload)⇒ 拒捕回 eager".into(),
+            });
+        }
+        let max_seqlen = match cached {
+            Some(k) => k.max_seqlen,
+            None => {
+                let need = (call.n_seq + 1) * 4;
+                if need > cu_scratch.bytes {
+                    return Err(OpError::Contract {
+                        op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
+                        field: "fa2_cu",
+                        expect: format!("≥ (n_seq+1)×4 = {need} B"),
+                        got: format!("{} B(n_seq={})", cu_scratch.bytes, call.n_seq),
+                    });
+                }
+                let mut raw = vec![0u8; need];
+                res.download(cu_f32_addr, &mut raw).map_err(|e| OpError::Launch {
+                    op: msg.kernel.name.clone(),
+                    stage: crate::contract::Stage::Load,
+                    detail: format!("fa2 cu download: {e}"),
+                })?;
+                let mut cu_host = Vec::with_capacity(call.n_seq + 1);
+                for c in raw.chunks_exact(4) {
+                    let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    if !v.is_finite() || v < 0.0 || v.fract() != 0.0 || v > call.rows as f32 {
+                        return Err(OpError::Contract {
+                            op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
+                            field: "cu_seqlens",
+                            expect: format!("0..rows={} 的整数", call.rows),
+                            got: format!("{v}"),
+                        });
+                    }
+                    cu_host.push(v as i32);
+                }
+                if cu_host.first().copied() != Some(0)
+                    || cu_host.last().copied() != Some(call.rows as i32)
+                    || cu_host.windows(2).any(|w| w[1] <= w[0])
+                {
+                    return Err(OpError::Contract {
+                        op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
+                        field: "cu_seqlens",
+                        expect: format!("[0, ..., {}] 严格递增", call.rows),
+                        got: format!("{cu_host:?}"),
+                    });
+                }
+                let max_seqlen = cu_host
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]) as usize)
+                    .max()
+                    .unwrap_or(0);
+                let cu_bytes: Vec<u8> = cu_host
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                res.upload(cu_scratch.ptr, &cu_bytes).map_err(|e| OpError::Launch {
+                    op: msg.kernel.name.clone(),
+                    stage: crate::contract::Stage::Load,
+                    detail: format!("fa2 cu upload: {e}"),
+                })?;
+                // upload 是流序异步拷贝;源是本函数栈上 `cu_bytes`。等它
+                // 真正读完再返回,避免 27 层逐层复用时源已释放。
+                stream.synchronize().map_err(|e| OpError::Launch {
+                    op: msg.kernel.name.clone(),
+                    stage: crate::contract::Stage::Load,
+                    detail: format!("fa2 cu upload sync: {e}"),
+                })?;
+                self.fa2_key = Some(Fa2Key {
+                    rows: call.rows,
+                    n_seq: call.n_seq,
+                    heads: call.heads,
+                    head_dim: call.head_dim,
+                    max_seqlen,
+                    cu_id: call.cu.id,
+                });
+                max_seqlen
+            }
+        };
         let need = call.heads.saturating_mul(call.rows).saturating_mul(4);
         if need > lse_bytes {
             return Err(OpError::Contract {
@@ -939,7 +1109,6 @@ impl FiRuntime {
                 got: format!("{lse_bytes} B"),
             });
         }
-        let stream = res.stream()?;
         res.note_device(
             "fam_ffi_launch",
             &msg.kernel.name,
@@ -953,10 +1122,10 @@ impl FiRuntime {
                 v as *const std::ffi::c_void,
                 out as *mut std::ffi::c_void,
                 lse_ptr as *mut f32,
-                cu_dev as *mut i32,
-                1,
+                cu_scratch.ptr as *mut i32,
+                call.n_seq as i32,
                 call.rows as i32,
-                call.rows as i32,
+                max_seqlen as i32,
                 call.heads as i32,
                 call.head_dim as i32,
                 call.scale,

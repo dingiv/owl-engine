@@ -258,6 +258,8 @@ pub(crate) struct ChunkHost<'a> {
     /// **部分驻留的子集页链**(host 半算好传入:`past_view_of` 依赖
     /// `knobs.select_partial` 与 `sel_view` —— 都是 host 面)
     pub(crate) past_view: Option<(Vec<u32>, usize)>,
+    /// 本边界是否需要 Q 面(完整召回/诊断);false = 廉价边界,省 Q D2H+逆RoPE。
+    pub(crate) q_needed: bool,
     /// **VLM 备料**(Some = 本 turn 有图;prefill 绑 m-RoPE/image,桶图让位)
     pub(crate) vlm: Option<&'a crate::vlm::VlmPrepared>,
 }
@@ -411,8 +413,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // 它才是打分的输入;`coverage_probe` 只是诊断面(额外算真实质量)。
         // 拆之前两条耦合在一起 ⇒ 低显存档想开功能就**必须**背诊断的账。
         // 缺省两门全关 ⇒ 槽恒 None、零开销。
-        let cov_sink: Option<crate::exec::coverage::QSink> = ((host.knobs.coverage_probe
-            || host.knobs.select_decode)
+        let cov_sink: Option<crate::exec::coverage::QSink> = (host.q_needed
             && self.pool.geom.paged
             && (base + t).is_multiple_of(self.pool.geom.page))
         .then(|| crate::exec::coverage::QSink::new(Vec::new()));
@@ -473,13 +474,16 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // ── **VLM:本 chunk 的 m-RoPE / 图像注入**(2026-10-20)──
         // 行号表/余弦表按 chunk 行号切;`has_image=false` 的块只装 rope
         // (image_scatter 不必跑全 -1 表)。塔输出 `merged` 是 turn 域设备叶。
-        let (vlm_cos, vlm_sin, vlm_idx);
+        let (vlm_cos, vlm_sin, vlm_idx, vlm_pos);
         if let Some(v) = host.vlm {
-            let (cos, sin, idx, has_image) = v.ins.chunk_tables(base, t);
+            let (cos, sin, idx, pos, has_image) = v.ins.chunk_tables(base, t);
             vlm_cos = cos;
             vlm_sin = sin;
             vlm_idx = idx;
+            vlm_pos = pos;
             ctx = ctx.with_vlm_rope(&vlm_cos, &vlm_sin);
+            // cos/sin 是本 chunk 的行表 ⇒ rope 的行号也必须是本 chunk 局部号
+            ctx.pos = Some(&vlm_pos);
             if has_image {
                 if let Some((_, _, merged)) = &v.merged {
                     ctx = ctx.with_vlm_image(merged, &vlm_idx);
@@ -721,6 +725,14 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     let (pl, pc) = sel.analysis_pair();
                     self.coverage_take_q(qs, base, t, pl, pc).await?;
                 }
+            } else if !host.q_needed
+                && self.pool.geom.paged
+                && (base + t).is_multiple_of(self.pool.geom.page)
+            {
+                if let Some(sel) = host.sel.as_deref_mut() {
+                    let (_pl, pc) = sel.analysis_pair();
+                    self.coverage_mark_cheap(base, t, pc)?;
+                }
             }
             // E5 崩坏排查·轻探针(OWL_PF_FIN_CHECK;bisect 900 dtoh 强掩蔽
             // 0/10,本探针仅 1 dtoh —— 近零扰判决:fin 翻 = 前向内部腐坏;
@@ -915,6 +927,14 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 if let Some(sel) = host.sel.as_deref_mut() {
                     let (pl, pc) = sel.analysis_pair();
                     self.coverage_take_q(qs, base, t, pl, pc).await?;
+                }
+            } else if !host.q_needed
+                && self.pool.geom.paged
+                && (base + t).is_multiple_of(self.pool.geom.page)
+            {
+                if let Some(sel) = host.sel.as_deref_mut() {
+                    let (_pl, pc) = sel.analysis_pair();
+                    self.coverage_mark_cheap(base, t, pc)?;
                 }
             }
             {

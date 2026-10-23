@@ -20,7 +20,7 @@
 > `本地实测档` (local measurement archive) · `本地原始数据` (local raw data) ·
 > `/path/to/models/…` (weights you supply) · `<worktree>/…` (git worktree).
 
-Progress: **0 / 81** reviewed.
+Progress: **0 / 83** reviewed.
 
 Body documents are written in **Chinese**; this index and all meta documents
 (`README`, `CONTRIBUTING`, `SECURITY`, `THIRD_PARTY.md`, `NOTICE`) are in **English**.
@@ -81,6 +81,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/models/new-format-checklist.md`](devlog/models/new-format-checklist.md) — New-format onboarding checklist
 - ⬜ [`devlog/models/vision-tower.md`](devlog/models/vision-tower.md) — Vision tower integration + CPU parity harness
 - ⬜ [`devlog/models/vision-wiring.md`](devlog/models/vision-wiring.md) — Vision tower × engine/serving wiring
+- ⬜ [`devlog/models/vision-multi-image-handoff-20261024.md`](devlog/models/vision-multi-image-handoff-20261024.md) — Vision multi-image handoff: FA2 convergence, 4B MTP restore_spec_snap blocker
 - ⬜ [`devlog/models/model-hot-swap.md`](devlog/models/model-hot-swap.md) — Model hot-swap proposal
 - ⬜ [`devlog/models/lora-lifecycle.md`](devlog/models/lora-lifecycle.md) — LoRA lifecycle proposal
 
@@ -107,6 +108,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 ## H. Serving, sessions and configuration
 
 - ⬜ [`devlog/serving/agent-surface.md`](devlog/serving/agent-surface.md) — Agent serving surface (pi integration)
+- ⬜ [`devlog/serving/agent-prefix-10k.md`](devlog/serving/agent-prefix-10k.md) — Agent 10K multi-turn prefix hit rate: snapshot verdict, message-boundary anchors, probe
 - ⬜ [`devlog/serving/multi-session.md`](devlog/serving/multi-session.md) — Multi-session and concurrency
 - ⬜ [`devlog/serving/cross-session-batch.md`](devlog/serving/cross-session-batch.md) — Cross-session batched decode (B5.1)
 - ⬜ [`devlog/serving/session-plan.md`](devlog/serving/session-plan.md) — Session orchestration surface

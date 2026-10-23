@@ -38,9 +38,9 @@
 
 | # | 状态 | 落点 | 几何/粒度 | dtype | 容量与上限 | 可共享 |
 |---|---|---|---|---|---|---|
-| ① | **attention KV** | `engine/src/state.rs::StatePool.kvs` | paged classic `kc [nb,Hkv,hd/x,page,x]`、`vc [nb,Hkv,hd,page]`;策略表 `models::module::kv_paged_policy(dtype)` 分发(legacy token-major 为回退) | 随 `spec.dtype` 或 fp8(U32 承载 1B/elem,元素数 ÷4) | `nb=ceil(pool_tokens/page)`(+1 dump page);`pool_tokens` 缺省 = **2× 单会话容量**,再被 `vram_target` 预算夹 | ✅ 块级 ref-count(≥2 = 前缀共享) |
+| ① | **attention KV** | `engine/src/state.rs::StatePool.kvs` | paged classic `kc [nb,Hkv,hd/x,page,x]`、`vc [nb,Hkv,hd,page]`;策略表 `models::module::kv_paged_policy(dtype)` 分发(legacy token-major 为回退) | 随 `spec.dtype` 或 fp8(U32 承载 1B/elem,元素数 ÷4) | `nb=ceil(pool_tokens/page)`;2026-10-22 起 `pool_tokens` 配置项删除 ⇒ `nb = 剩余显存自动 cap`(页对齐;`max_seq` 只是单请求上限) | ✅ 块级 ref-count(≥2 = 前缀共享) |
 | ② | **GDN/线性注意力状态** | `StatePool.gdns`(每 GDN 层 4 块:`conv_q/conv_k/conv_v/rec`) | 行宽 = `elems/gdn_slots`;**一格一会话** | **恒 f32** | 格数 = `knobs.gdn_slots`(缺省 8)⇒ **并发上限被格数钉死**(`session.rs` 耗尽报错);27B `rec` ≈ 1MiB/格/层 × 18 层 | ❌ 独占;可**快照** |
-| ③ | **草稿 KV** | `StatePool.mtp_kvs` / `StatePool.dflash_kvs` | MTP:1 层独立页池;DFlash2:5 层 × (8 头 × hd128) | MTP = 主池 dtype;DFlash2 = BF16 或 fp8(`OWL_DFLASH_KV_FP8`) | 两者都**按 `pool_tokens` 全额预留**(无按需/降级账) | ❌(MTP **不接前缀缓存** —— 依赖 hidden,不可 token 哈希) |
+| ③ | **草稿 KV** | `StatePool.mtp_kvs` / `StatePool.dflash_kvs` | MTP:1 层独立页池;DFlash2:5 层 × (8 头 × hd128) | MTP = 主池 dtype;DFlash2 = BF16 或 fp8(`OWL_DFLASH_KV_FP8`) | MTP 按池容量全额预留;**DFlash2 2026-10-22 起按检查点 `sliding_window` 环形**(2048 → 固定 ~40MiB;写槽 = 逻辑位 % 窗口;自块/被拒行走环外 scratch) | ❌(MTP **不接前缀缓存** —— 依赖 hidden,不可 token 哈希) |
 | ④ | **视觉塔** | `models/src/layers/vision.rs` + `models/src/vlm.rs` | 塔权重 `model.visual.*` + **每图一次前向**;输出 `[n_img,D]` 经 `image_scatter` 注入文本序列 | — | 图像 token 的 KV **落进主池**(⇒ 天然可前缀复用);塔自身无驻留 KV | ✅(经文本池) |
 | ⑤ | **GDN 快照池** | `StatePool.snaps`(snap_max)+ `spec_snap` | key = **链尾物理块 id**(内容身份);行宽同 ②;D2D 行拷贝 | f32 | `snap_max` 槽,**LRU 换 key 覆盖写**(零 alloc) | —(是"状态续跑"的钥匙) |
 
@@ -65,8 +65,8 @@
    两条腿在不在"的统一判定与统一换出序 ⇒ 混合架构只能要么全在、要么全无),
    **②各自只有显存一层** ⇒ 谁都换不出去。llama.cpp 侧的完整判例在册
    (外部存档:llama.cpp《mtmd-hybrid-缓存失效-排查实录》——中部断前缀 = 全量重灌)。
-3. **草稿池无账**:③ 的两个池都按 `pool_tokens` 全额预留,不吃"按需/切分/降级"
-   的治理 ⇒ 有 draft 的档位相当于第二个主池。
+3. **草稿池无账**:MTP ③ 仍按池容量全额预留;DFlash2 已改环形
+   (固定 ~40MiB,不再随 ctx 线性)。
    附带:**固定面 17.9G live**(权重账面 13.7G,实际 ~17.5G,**~2G 待审计**)
    —— 归因六件套已就位,可先清(见 §6 刀序 S0)。
 
@@ -2684,11 +2684,11 @@ engine **59**(+ `disk_chain_index_enables_cross_restart_reuse`:turn 写索引 �
 26–27B 双卡档"装载 20 s + 每请求 2.7 s + 卡常被同侪占",不适合频繁验证存储层。改用:
 
 ```text
-0.8B + 单卡(ordinal 3, 3080 20G) + 池 16 页 + host/disk 各 16 MiB + prefix_cache_share 0.9
+0.8B + 单卡(ordinal 3, 3080 20G) + 池 16 页 + host/disk 各 16 MiB(当时 prefix_cache_share=0.9;2026-10-22 已退役)
 ⇒ 每请求 0.2 s,几次请求就把"设备→宿主→磁盘"三级全部触发,重启也在 1 s 级
 ```
 
-**纪律**:①配额要容得下最长链(见 §31.8 配置律);②`prefix_cache_share` 拿高
+**纪律**:①配额要容得下最长链(见 §31.8 配置律);②缓存可占整池(2026-10-22 起)
 (0.9)可让设备池更快紧;③同 prompt 发两次看 `usage.prompt_tokens_details.cached_tokens`
 (第一次 0、第二次 >0 即命中);④停服务用 `ss -ltnp | grep <port>` 拿**真 pid**
 (`setsid bash -c '…server…' &` 的 `$!` 是 bash,不是 server)。

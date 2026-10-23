@@ -71,6 +71,7 @@ cp profiles/qwen38_27b-3080_tp2-w4a16.toml ~/my-27b.toml
 | `qwen38_27b-3090-iq4xs.toml` | 27B UD-IQ4_XS 纯块型 / 12k |
 | `qwen38_27b-3090-iq4xs-dflash.toml` | 27B UD-IQ4_XS + DFlash2-GGUF d7 / 12k |
 | `qwen35_0_8b-3090-iq4xs.toml` | 0.8B GGUF IQ4_XS / 16k(开发档) |
+| `qwen38_27b-3090-gguf-agent.toml` | 27B GGUF Q4_K_M / 32k；agent 10K 多轮：`prefix_cache` + `snap_max=4` + 快照宿主 + 消息边界快照，命中 99%+ |
 
 > **TP2 快档口径(2026-10-22)**：`…-tp2-w4a16` / `…-tp2-w4a8` 都走
 > `decode_arm=verify_arm="fi"` + `fi_plan_bake=true` + `tp_draft=true`，

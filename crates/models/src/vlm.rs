@@ -309,16 +309,18 @@ pub struct VlmInputs {
 }
 
 impl VlmInputs {
-    /// **chunk 切片**(引擎 prefill 每块用):返回 `(cos, sin, idx, has_image)`。
+    /// **chunk 切片**(引擎 prefill 每块用):返回
+    /// `(cos, sin, idx, pos, has_image)`。
     ///
-    /// `base..base+t` 是 prompt 行号区间;行号表/余弦表按行切;`
-    /// `has_image` = 本块含 ≥1 个视觉占位(`idx >= 0`),否则调用方跳过
-    /// `image_scatter`(省一次无意义的全 `-1` 扫描)。
+    /// `base..base+t` 是 prompt 行号区间;行号表/余弦表按行切;`pos` 是
+    /// **本 chunk 局部行号 0..n**(rope 核按 `pos[t]` 索引 cos/sin 行表,
+    /// 不能传全局 `base+t`);`has_image` = 本块含 ≥1 个视觉占位(`idx >= 0`),
+    /// 否则调用方跳过 `image_scatter`(省一次无意义的全 `-1` 扫描)。
     pub fn chunk_tables(
         &self,
         base: usize,
         t: usize,
-    ) -> (TensorOps, TensorOps, TensorOps, bool) {
+    ) -> (TensorOps, TensorOps, TensorOps, TensorOps, bool) {
         let lo = base.min(self.tokens);
         let hi = base.saturating_add(t).min(self.tokens);
         let n = hi.saturating_sub(lo);
@@ -337,10 +339,18 @@ impl VlmInputs {
         let idx = &self.idx_host[lo..hi];
         let has_image = idx.iter().any(|&x| x >= 0.0);
         let idx_bytes: Vec<u8> = idx.iter().flat_map(|x| x.to_le_bytes()).collect();
+        // **rope 的 pos 必须相对本 chunk 的行表**(2026-10-23):
+        // `chunk_tables` 的 cos/sin 是 `[n, half]` 行表，核按 `pos[t]` 取行；
+        // 若 pos 仍传全局 `base+t`，第二个 chunk 起会越出本 chunk 表
+        // （首 chunk 恰好 base=0 而正确，多 chunk 全错）。
+        let pos_bytes: Vec<u8> = (0..n)
+            .flat_map(|i| (i as f32).to_le_bytes())
+            .collect();
         (
             TensorOps::from_host(self.dtype, vec![n, self.half], &pack(cos)),
             TensorOps::from_host(self.dtype, vec![n, self.half], &pack(sin)),
             TensorOps::from_host(Dtype::F32, vec![n], &idx_bytes),
+            TensorOps::from_host(Dtype::F32, vec![n], &pos_bytes),
             has_image,
         )
     }
@@ -628,9 +638,10 @@ impl Loadable for Vlm {
 mod tests {
     use super::*;
 
-    /// chunk 切片:m-RoPE/行号按行切,`has_image` 只在含视觉占位的块为真。
-    #[test]
-    fn chunk_tables_slice_and_image_flag() {
+    /// chunk 切片:m-RoPE/行号按行切,`has_image` 只在含视觉占位的块为真;
+    /// **pos 必须是本 chunk 的局部行号**(cos/sin 是 chunk 行表)。
+    #[tokio::test]
+    async fn chunk_tables_slice_and_image_flag() {
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let ins = VlmInputs {
             pos: TensorOps::from_host(Dtype::F32, vec![4, 1], &f32b(&[0., 1., 2., 3.])),
@@ -645,12 +656,17 @@ mod tests {
             tokens: 4,
             delta: 3,
         };
-        let (_, _, _, has) = ins.chunk_tables(1, 2);
+        let (_, _, _, pos, has) = ins.chunk_tables(1, 2);
         assert!(has, "chunk 1..3 含 idx=0");
-        let (_, _, _, no) = ins.chunk_tables(0, 1);
+        let mut face = owl_cpu::CpuFace::new();
+        let got = harvest(&mut face, &pos).await;
+        assert_eq!(got, vec![0.0, 1.0], "chunk pos 必须从 0 起(局部行号)");
+        let (_, _, _, _, no) = ins.chunk_tables(0, 1);
         assert!(!no, "chunk 0..1 全文本");
-        let (_, _, _, tail) = ins.chunk_tables(3, 8);
+        let (_, _, _, pos, tail) = ins.chunk_tables(3, 8);
         assert!(tail, "越界钳到 tokens");
+        let got = harvest(&mut face, &pos).await;
+        assert_eq!(got, vec![0.0], "尾块 pos 同样从 0 起");
     }
 
     /// **27B 真实 config.json 的 VLM 超参可解析**(纯 JSON,不装权重/不占卡)。
@@ -732,6 +748,19 @@ mod tests {
         let short = vec![248056u32; 5];
         assert!(vlm.inputs(&short, &[(1, 4, 6)], &[], Dtype::F16).is_err(), "占位 5 ≠ 6 应拒");
         assert!(vlm.inputs(&ids, &[(1, 4, 6), (1, 2, 2)], &[], Dtype::F16).is_err(), "多给网格应拒");
+    }
+
+    /// **相邻多图**:占位 token → 塔行号连续;m-RoPE 两张图分别推进。
+    #[test]
+    fn inputs_multiple_adjacent_images() {
+        let c = cfg4b();
+        let vlm = Vlm::new(c, QuantPlan::F16, QuantPlan::F16).expect("装配");
+        let ids = vec![248056u32; 6 + 2];
+        let ins = vlm
+            .inputs(&ids, &[(1, 4, 6), (1, 2, 4)], &[], Dtype::F16)
+            .expect("相邻两图 inputs");
+        assert_eq!(ins.idx_host, (0..8).map(|i| i as f32).collect::<Vec<_>>());
+        assert_eq!(ins.delta, -3, "两图最大位置 4 + 1 - 8");
     }
 
     /// image_scatter:CPU face vs host 手算锚 + 越界响亮拒(第三份独立副本)

@@ -288,8 +288,53 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
             Err(e) => json!({ "rank": rank, "error": e }),
         })
         .collect();
+    // **块账房逐名汇总**(诊断:谁在占显存;按字节降序 top 40)
+    let block_rows: Vec<Value> = {
+        let mut by: std::collections::BTreeMap<&str, (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for (_rank, rows) in &snap.blocks {
+            if let Ok(rows) = rows {
+                for r in rows {
+                    let e = by.entry(r.name.as_str()).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += r.bytes;
+                }
+            }
+        }
+        let mut v: Vec<(&str, usize, usize)> = by.into_iter().map(|(n, (c, b))| (n, c, b)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v.iter().take(40).map(|(n, c, b)| json!({"name": n, "count": c, "bytes": b,
+            "mib": (*b as f64) / 1048576.0})).collect()
+    };
+    // **驱动残差**(P5):物理 − free − store live − 池缓存。这一项就是
+    // CUDA ctx / 模块 / cuBLAS / 图 exec / 分配器元数据 —— 块账拦不住的部分。
+    let device_json = match &snap.device {
+        Ok((free, total)) => {
+            let pool_cached: u64 = snap
+                .pools
+                .iter()
+                .filter_map(|(_, row)| row.as_ref().ok().map(|(u, _, res, _)| res.saturating_sub(*u)))
+                .sum();
+            let residual = total
+                .saturating_sub(*free)
+                .saturating_sub(r.tiers.gpu_used as u64)
+                .saturating_sub(pool_cached);
+            json!({
+                "free": free,
+                "total": total,
+                "pool_cached": pool_cached,
+                "residual": residual,
+                "free_mib": (*free as f64) / 1048576.0,
+                "total_mib": (*total as f64) / 1048576.0,
+                "residual_mib": (residual as f64) / 1048576.0,
+            })
+        }
+        Err(e) => json!({ "error": e }),
+    };
     json!({
+        "device": device_json,
         "pools": pools,
+        "blocks_top": block_rows,
         "tiers": {
             "gpu_used": r.tiers.gpu_used,
             "host_used": r.tiers.host_used,

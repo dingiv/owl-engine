@@ -490,6 +490,26 @@ async fn main() {
     }
 }
 
+/// boot 分相显存取证行(`[vram-phase]`;P5):`used=total−free` 驱动口径,
+/// `delta` = 与上一里程碑之差。与引擎内 `VramPhase` 同一格式。
+fn vram_phase(tag: &str, info: owl_engine::Result<(u64, u64)>, last: &mut Option<u64>) {
+    match info {
+        Ok((free, total)) => {
+            let used = total.saturating_sub(free);
+            let delta = last.map(|p| used as i64 - p as i64).unwrap_or(0);
+            eprintln!(
+                "[vram-phase] {tag}: used={:.1}MiB free={:.1}MiB delta={:+.1}MiB live={:.1}MiB",
+                used as f64 / 1048576.0,
+                free as f64 / 1048576.0,
+                delta as f64 / 1048576.0,
+                owl_shared::vram::live_bytes() as f64 / 1048576.0,
+            );
+            *last = Some(used);
+        }
+        Err(e) => eprintln!("[vram-phase] {tag}: 查询失败({e})"),
+    }
+}
+
 /// 单 rank 引擎壳构造(设备绑定;装载走 [`load_shard`])。
 fn engine_of(
     config: &ServerConfig,
@@ -538,8 +558,15 @@ async fn load_shard(
             // 量化方案映射(唯一点 owl_engine::{head_plan_of, quant_plan_of})
             let head_plan = owl_engine::head_plan_of(config.head_quant);
             let quant = owl_engine::quant_plan_of(config.model_format, config.quant);
+            let embed_plan = owl_engine::embed_plan_of(config.embed_quant);
             loader
-                .load_qwen38_27b_awq(&config.model_dir, &config.model_dir, head_plan, quant)
+                .load_qwen38_27b_awq_with_embed(
+                    &config.model_dir,
+                    &config.model_dir,
+                    head_plan,
+                    quant,
+                    embed_plan,
+                )
                 .await
         }
         // 普通 HF safetensors(0.8B 开发档 / 转换后的 27B)
@@ -563,6 +590,8 @@ async fn actor_main(
         let t0 = std::time::Instant::now();
         let world = config.devices.world();
         let mut engine = engine_of(&config, config.devices.device())?;
+        let mut phase_used: Option<u64> = None;
+        vram_phase("server:context", engine.mem_info().await, &mut phase_used);
         owl_shared::log_info!("boot", "设备绑定 {:.2}s", t0.elapsed().as_secs_f32());
         match world {
             // ── 单卡档(原路径;分片 = 恒等)─────────────────────────────
@@ -579,6 +608,7 @@ async fn actor_main(
                     }
                 };
                 owl_shared::log_info!("boot", "权重/tokenizer/rope 装载 {:.2}s", t0.elapsed().as_secs_f32());
+                vram_phase("server:weights", engine.mem_info().await, &mut phase_used);
                 let running = engine.run(model).await?;
                 owl_shared::log_info!("boot", "引擎装配(run)总计 {:.2}s", t0.elapsed().as_secs_f32());
                 Ok(running)
@@ -594,6 +624,7 @@ async fn actor_main(
                 let model0 = load_shard(&config, &mut engine, 0, 2).await?;
                 let mut engine1 = engine_of_tp(&config, ord[1], &engine, 1)?;
                 let model1 = load_shard(&config, &mut engine1, 1, 2).await?;
+                vram_phase("server:tp-weights", engine.mem_info().await, &mut phase_used);
                 owl_shared::log_info!(
                     "boot",
                     "TP2 分片装载(rank0 ordinal {} / rank1 ordinal {}):{:.2}s",

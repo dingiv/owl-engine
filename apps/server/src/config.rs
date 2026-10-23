@@ -104,7 +104,7 @@ impl CliArgs {
                 }
                 "--explain" => {
                     out.explain.push(
-                        it.next().ok_or("--explain 需要键(点路径,如 pool.pool_tokens)")?,
+                        it.next().ok_or("--explain 需要键(点路径,如 runtime.max_seq)")?,
                     );
                 }
                 "--set" => {
@@ -356,6 +356,8 @@ pub struct ServerConfig {
     pub prefill_chunk: usize,
     /// lm_head 头部量化方案(model.head_quant;C1 2026-10-11;枚举严格)
     pub head_quant: owl_shared::config::HeadQuant,
+    /// embedding 表量化(model.embed_quant;P8 2026-10-22;默认 f16)
+    pub embed_quant: owl_shared::config::EmbedQuant,
     /// **主干量化方案**(model.quant;S2 2026-10-17;枚举严格 —— 原
     /// `w4a8: bool` 已退役,旧键响亮拒)
     pub quant: owl_shared::config::QuantScheme,
@@ -489,10 +491,11 @@ impl ServerConfig {
             devices: Devices::placeholder(),
             // 上下文/块长:**单一来源 = 配置**(2026-10-20 删除 OWL_MAX_SEQ /
             // OWL_PREFILL_CHUNK —— 它们会在意图派生后再改一次 ⇒ max_seq 与
-            // pool_tokens 失配/池夹死的双源;要临时调请 `--set`）。
+            // max_seq 失配的双源;要临时调请 `--set`）。
             max_seq: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
             head_quant: cfg.model.head_quant,
+            embed_quant: cfg.model.embed_quant,
             quant: cfg.model.quant,
             tp_push: cfg.parallel.tp_push,
             tp_ar_f8: cfg.parallel.tp_ar_f8,
@@ -697,11 +700,10 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
         if c.kernel.gdn_chunked { "chunked" } else { "scalar" },
     );
     Some(format!(
-        "[owl] profile={} card={} ctx={} pool={}({}) {} mem={}/{} (余 {}) reuse={} spec={} c={}",
+        "[owl] profile={} card={} ctx={} pool=auto({}) {} mem={}/{} (余 {}) reuse={} spec={} c={}",
         m.profile.as_deref().unwrap_or("(inline)"),
         m.intent.hardware.as_deref().unwrap_or("auto"),
         c.runtime.max_seq,
-        c.pool.pinned_pool_tokens().unwrap_or(0),
         gib(e.pool_bytes),
         arms,
         gib(e.used_bytes()),
@@ -747,16 +749,15 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             m.intent.graphs.name(),
         ));
         out.push_str(&format!(
-            "[check] resolved: max_seq={} pool_tokens={} chunk={} tail={} \
+            "[check] resolved: max_seq={} pool=auto(剩余显存;boot 报 cap) chunk={} tail={} \
              gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
             c.runtime.max_seq,
-            c.pool.pinned_pool_tokens().unwrap_or(0),
             c.runtime.prefill_chunk,
             c.runtime.prefill_tail_merge,
             c.pool.gdn_slots,
             c.runtime.max_batch,
             c.runtime.max_concurrency,
-            c.kernel.kv_fp8,
+            c.pool.kv_fp8,
         ));
         if let Some(e) = r.estimate() {
             out.push_str(&format!(
@@ -771,7 +772,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
                 gib(e.total_bytes.saturating_sub(e.used_bytes())),
             ));
             out.push_str(&format!(
-                "[check] governor: budget {} cap {} tok; pool {} {} cap\n",
+                "[check] governor: budget {} cap {} tok; logical_pool {} {} cap\n",
                 gib(e.budget_bytes),
                 e.cap_tokens,
                 e.pool_tokens,
@@ -788,11 +789,9 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
                 gib(e.fixed.graph_slab),
                 gib(e.fixed.warmup_misc),
             ));
-            if e.pool_tokens != c.pool.pinned_pool_tokens().unwrap_or(0) {
-                out.push_str(
-                    "[check] note: 估算池 ≠ 显式 pool_tokens(非超卖档引擎会把池下限抬到上下文)\n",
-                );
-            }
+            out.push_str(
+                "[check] note: 估算池 = 逻辑下限(上下文×并发);物理池 = 无缓存→min(cap, ctx×并发+1页),缓存开→cap\n",
+            );
         }
     } else {
         out.push_str(
@@ -800,16 +799,15 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
              [check] 要内存账/意图派生,请用 -p <profile_path> 或写 [intent]。\n",
         );
         out.push_str(&format!(
-            "[check] resolved: max_seq={} pool_tokens={:?} chunk={} tail={} \
+            "[check] resolved: max_seq={} pool=auto(剩余显存;boot 报 cap) chunk={} tail={} \
              gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
             c.runtime.max_seq,
-            c.pool.pinned_pool_tokens(),
             c.runtime.prefill_chunk,
             c.runtime.prefill_tail_merge,
             c.pool.gdn_slots,
             c.runtime.max_batch,
             c.runtime.max_concurrency,
-            c.kernel.kv_fp8,
+            c.pool.kv_fp8,
         ));
     }
 
@@ -912,17 +910,6 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     }
 
     // ── 组合告警(不拒;`--check` 的 UX 价值就在把隐患提前说出来) ──
-    if !c.kvmem.pool_overcommit {
-        if let Some(p) = c.pool.pinned_pool_tokens() {
-            if p < c.runtime.max_seq {
-                out.push_str(&format!(
-                    "[check] WARN: pool_tokens={p} < max_seq={}:非超卖档引擎会把池下限抬到单会话上下文;\
-                     并发满上下文仍可能 Exhausted\n",
-                    c.runtime.max_seq
-                ));
-            }
-        }
-    }
 
     // ── 臂摘要 ──
     let prefill = "eager";
@@ -941,11 +928,11 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             out.push_str(
                 "[check] note: vision=on + spec>0:图像 × 投机已接(V5)—— verify 的 rope \
                  pos = 真实位置 + m-RoPE delta,KV slots/lens 仍用真实位置;\
-                 带图不支持合批(max_batch=1);文本+draft 同档可用\n",
+                 带图为单请求多图/非合批;文本+draft 同档可用\n",
             );
         } else {
             out.push_str(
-                "[check] note: vision=on + spec=off:图像路径可用(多图;data URL;\
+                "[check] note: vision=on + spec=off:图像路径可用(单请求多图;data URL;\
                  TP2 两 rank 各备塔输出;`[pool] image_evict` = 前缀无感删除)\n",
             );
         }

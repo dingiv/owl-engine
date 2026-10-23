@@ -29,7 +29,7 @@ prefill_chunk = 512
 
 [pool]
 # **容量面全部继承 flavor**(2026-10-19 容量定档后):`prefix_cache=true` /
-# `prefix_cache_share=0.75` / `host_cache_mb=4096` / `snap_max=4` / `snap_host_mb=2048`
+# `host_cache_mb=4096` / `snap_max=4` / `snap_host_mb=2048`
 # 都在 `profiles/qwen38_27b-3090-w4a16-dflash.toml` 里(三层账与 VRAM 算式见该档注释)。
 # 本测装**不再覆盖**它们 —— 测的就是生产档的真实容量策略。
 gdn_slots = 1

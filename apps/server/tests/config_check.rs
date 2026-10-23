@@ -45,7 +45,7 @@ fn profile_check_reports_128k_and_memory_basis() {
     let s = String::from_utf8_lossy(&out.stdout);
     for needle in [
         "max_seq=131072",
-        "pool_tokens=Some(131072)",
+        "pool=auto",
         "OK(estimated",
         "model dir:",
         "arms: prefill=eager",
@@ -72,9 +72,8 @@ fn print_config_json_carries_provenance_and_estimate() {
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout 必须是合法 JSON");
     assert_eq!(v["config"]["runtime"]["max_seq"], 131072);
-    assert_eq!(v["config"]["pool"]["pool_tokens"], 131072);
-    // **完整档语义**(2026-10-21):值来自文件本身,不再有 intent 派生
-    assert_eq!(v["provenance"]["pool.pool_tokens"]["kind"], "file");
+    // 2026-10-22:池容量配置项删除;池由 [vram-gov] 按剩余显存自动定。
+    assert!(v["config"]["pool"].get("pool_tokens").is_none());
     // 完整档没有 [intent] ⇒ meta.intent 为空是预期(派生面已退役)
     assert!(v["intent"].is_null() || v["intent"]["profile"].is_string());
 }
@@ -106,8 +105,8 @@ fn set_overrides_derived_value() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("max_seq=65536"), "--set 应覆盖文件值:\n{s}");
-    // 池在完整档里是**显式值** ⇒ 改上下文不会隐式跟着变(显式优先)
-    assert!(s.contains("pool_tokens=Some(131072)"), "池保持显式值:\n{s}");
+    // 池容量无配置项;改 max_seq 只改单请求上限,物理池仍自动。
+    assert!(s.contains("pool=auto"), "池应为自动:\n{s}");
 }
 
 #[test]

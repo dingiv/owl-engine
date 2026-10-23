@@ -64,7 +64,7 @@ pub struct DiagOpts {
     /// 命令(launch/htod/dtoh/alloc/free/memset/copy;见 `crate::trace`)。
     pub trace_ring: usize,
     /// **配置派生的 tag 过滤**(2026-10-20;不显式列 allow_tags)。
-    /// 由 `model.kind/quant/head_quant`、`dispatch.kv_fp8`、`spec`、`vision`、
+    /// 由 `model.kind/quant/head_quant`、`pool.kv_fp8`、`spec`、`vision`、
     /// `runtime.tp_ordinals` 自动推导;`*`/Default = 全放行(诊断/测试)。
     pub tag_filter: owl_kernels::tag_filter::TagFilter,
     /// **L3 事实面审计**(`[probes] l3_audit`;原 `OWL_L3_AUDIT` env)
@@ -196,7 +196,7 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
         tags.push(T::QUANT_W4A16);
         tags.push(T::QUANT_AWQ);
     }
-    if cfg.kernel.kv_fp8 {
+    if cfg.pool.kv_fp8 {
         tags.push(T::KV_MAIN_FP8);
     } else {
         tags.push(T::KV_MAIN_F16);
@@ -1369,6 +1369,16 @@ impl GpuCtx {
         }
         rows.sort_by_key(|r| r.id);
         Ok(rows)
+    }
+
+    /// **设备显存实况**(只读;`DeviceClient::mem_info`):`(free, total)` 字节。
+    ///
+    /// `cuMemGetInfo` 只需当前上下文在场(本线程);纯查询、不碰设备状态。
+    /// boot 分相取证与 `/debug/vram` 驱动残差共用。
+    pub(super) fn mem_info(&self) -> Result<(u64, u64), ModelError> {
+        cudarc::driver::result::mem_get_info()
+            .map(|(free, total)| (free as u64, total as u64))
+            .map_err(|e| ModelError::Msg(format!("mem_info: {e:?}")))
     }
 
     /// **默认池回收**(内存面;见 `DeviceClient::mem_pool_trim`):
@@ -3287,7 +3297,7 @@ mod tag_filter_tests {
         cfg.model.quant = QuantScheme::W4a16;
         cfg.model.head_quant = HeadQuant::RtnInt8Row;
         cfg.model.vision = true;
-        cfg.kernel.kv_fp8 = true;
+        cfg.pool.kv_fp8 = true;
         cfg.spec.depth = 7;
         // 该门覆盖 DFlash2 草稿档；不给 draft_path 会按 MTP(F16) 派生。
         cfg.spec.draft = SpecDraft::Dflash2;
@@ -3356,7 +3366,7 @@ mod tag_filter_tests {
     fn gguf_filter() {
         let mut cfg = OwlConfig::default();
         cfg.model.format = ModelFormat::Gguf;
-        cfg.kernel.kv_fp8 = false;
+        cfg.pool.kv_fp8 = false;
         assert!(allows(&cfg, "owl_gguf_gemm_q4k"));
         assert!(!allows(&cfg, "marlin_gemm_w4a16_awq"));
         assert!(allows(&cfg, "owl_add_f16"));

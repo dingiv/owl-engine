@@ -36,7 +36,6 @@ max_concurrency = 1
 implicit_session = true
 
 [pool]
-pool_tokens = 16384
 gdn_slots = 1
 # **快照池**：删除路径要在"上一轮 prompt 的最后一个页边界"恢复 GDN 态。
 # 2026-10-23 两项修正后 4 槽就够：①快照淘汰改为**新鲜度优先**（快照按边界身份
@@ -45,6 +44,8 @@ gdn_slots = 1
 # 多会话并发时才需要按"并发会话数 × 2"上调。
 snap_max = 4
 prefix_cache = true
+# f16 KV 是 image_evict 的硬前提（fp8 的 dequant→rotate→requant 未做）
+kv_fp8 = false
 # **本档的主开关**：前缀无感删除（图像段）
 image_evict = true
 # 叠转上限（到顶 ⇒ 下一轮删除改走整段重建；实测 32 轮 ≈ 13.7 ulp 最差元素）
@@ -53,8 +54,6 @@ vram_target = 0.8
 vram_reserve_mb = 1024
 
 [kernel]
-# f16 KV 是 image_evict 的硬前提（fp8 的 dequant→rotate→requant 未做）
-kv_fp8 = false
 verify_arm = "v2"
 decode_arm = "v2"
 fi_plan_bake = false

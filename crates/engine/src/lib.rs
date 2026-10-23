@@ -44,6 +44,8 @@ pub(crate) mod graph_fleet;
 // **状态域户**(2026-10-21 收户):选择层运行态 / 保洁账 —— 字段私有,
 // 只经语义方法读写(见各模块头)。
 pub(crate) mod housekeeping;
+/// 消息边界 → 页对齐 GDN 快照点(纯 host;2026-10-24)
+pub(crate) mod msg_boundary;
 /// 前缀无感删除:host 纯函数面(识别 / 页对齐 pad / 位置自证)
 pub(crate) mod img_evict;
 pub(crate) mod loader;
@@ -87,6 +89,15 @@ pub fn head_plan_of(hq: owl_shared::config::HeadQuant) -> owl_models::module::Qu
         owl_shared::config::HeadQuant::RtnInt4G32 => QuantPlan::W4A16Awq,
         owl_shared::config::HeadQuant::RtnInt8Row => QuantPlan::I8W,
         owl_shared::config::HeadQuant::RtnInt8RowA8 => QuantPlan::I8W8,
+    }
+}
+/// embedding 表量化映射(P8;`None` = 检查点原表计划,`Some(I8W)` = int8)。
+pub fn embed_plan_of(
+    eq: owl_shared::config::EmbedQuant,
+) -> Option<owl_models::module::QuantPlan> {
+    match eq {
+        owl_shared::config::EmbedQuant::F16 => None,
+        owl_shared::config::EmbedQuant::I8 => Some(owl_models::module::QuantPlan::I8W),
     }
 }
 pub use running::{RunningEngine, TokenizeReply};

@@ -51,7 +51,7 @@ static cudaError_t ragged_launch(Params& params, cudaStream_t stream) {
 
 // ---------------------------------------------------------------------------
 // plan(host;每形状一次 —— 与 paged 臂同型:窗口外算,捕获期命中缓存)
-//   qo_indptr_h = [0, rows];kv_indptr_h = [0, rows](单图 vanilla 自注意力)
+//   qo_indptr_h / kv_indptr_h = 调用方给的 cu_seqlens(int32;多图逐段)
 // ---------------------------------------------------------------------------
 extern "C" int owl_fi_attn_ragged_plan(
     void* float_ws, size_t float_ws_size,
@@ -59,27 +59,31 @@ extern "C" int owl_fi_attn_ragged_plan(
     void* page_locked, size_t page_locked_size,
     int64_t* out_plan15,
     int32_t* out_cta_tile_q,
-    int32_t* out_cu_dev,      // 设备端 int32 段界([0, rows];plan 期写一次,回放期只读)
+    int32_t* out_cu_dev,      // 设备端 int32 段界(plan 期写一次,回放期只读)
+    const int32_t* cu_host,   // [n_seq+1] 主机段界(来自 VlmTables.cu f32 转 int32)
+    int32_t n_seq,
     int32_t rows, int32_t num_heads, int32_t head_dim,
     cudaStream_t stream) {
   try {
     if (rows <= 0 || num_heads <= 0 || head_dim <= 0) return -203;
-    if (out_cu_dev == nullptr) return -206;
+    if (out_cu_dev == nullptr || cu_host == nullptr) return -206;
+    if (n_seq <= 0) return -208;
+    if (cu_host[0] != 0 || cu_host[n_seq] != rows) return -209;
+    for (int i = 1; i <= n_seq; ++i) {
+      if (cu_host[i] <= cu_host[i - 1]) return -209;
+    }
     // ⚠️ 核读的是 **IdType(int32)** 段界;owl 的 `cu_seqlens` 张量是 f32(索引 f32 过线律)
-    // ⇒ 这里在 plan 期写一份规范 int32(单图 ⇒ 恒 [0, rows]),**回放期零转换零回读**。
+    // ⇒ plan 期把调用方转好的 int32 段界写到设备 scratch,回放期零转换零回读。
     {
-      const int32_t cu_host[2] = {0, rows};
-      cudaError_t cerr = cudaMemcpyAsync(out_cu_dev, cu_host, sizeof(cu_host),
+      cudaError_t cerr = cudaMemcpyAsync(out_cu_dev, cu_host, sizeof(int32_t) * (n_seq + 1),
                                          cudaMemcpyHostToDevice, stream);
       if (cerr != cudaSuccess) return (int)cerr;
     }
-    const int32_t qo_h[2] = {0, rows};
-    const int32_t kv_h[2] = {0, rows};
     // kv_dtype_bytes = 2(f16 ragged K/V;只影响选瓦启发式)
     size_t need_float = 0, need_int = 0;
     cudaError_t werr = PrefillPlanWorkspaceSize<RaggedId>(
-        need_float, need_int, const_cast<int32_t*>(qo_h), const_cast<int32_t*>(kv_h),
-        (uint32_t)rows, /*batch_size=*/1u, (uint32_t)num_heads, (uint32_t)num_heads,
+        need_float, need_int, const_cast<int32_t*>(cu_host), const_cast<int32_t*>(cu_host),
+        (uint32_t)rows, (uint32_t)n_seq, (uint32_t)num_heads, (uint32_t)num_heads,
         (uint32_t)head_dim, (uint32_t)head_dim, /*page_size=*/1u,
         /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half),
         /*window_left=*/-1, /*fixed_split_size=*/0, /*disable_split_kv=*/true,
@@ -88,15 +92,15 @@ extern "C" int owl_fi_attn_ragged_plan(
     if (need_float > float_ws_size || need_int > int_ws_size || need_int > page_locked_size) {
       OWL_LOG_ERROR("owl-fi",
                     "[ragged plan] workspace 不足:需 float=%zuB int=%zuB;现有 float=%zuB "
-                    "int=%zuB page_locked=%zuB(rows=%d)",
-                    need_float, need_int, float_ws_size, int_ws_size, page_locked_size, rows);
+                    "int=%zuB page_locked=%zuB(rows=%d n_seq=%d)",
+                    need_float, need_int, float_ws_size, int_ws_size, page_locked_size, rows, n_seq);
       return -202;
     }
     PrefillPlanInfo plan_info;
     cudaError_t err = PrefillPlan<RaggedId>(
         float_ws, float_ws_size, int_ws, page_locked, int_ws_size, plan_info,
-        const_cast<int32_t*>(qo_h), const_cast<int32_t*>(kv_h), (uint32_t)rows,
-        /*batch_size=*/1u, (uint32_t)num_heads, (uint32_t)num_heads, (uint32_t)head_dim,
+        const_cast<int32_t*>(cu_host), const_cast<int32_t*>(cu_host), (uint32_t)rows,
+        (uint32_t)n_seq, (uint32_t)num_heads, (uint32_t)num_heads, (uint32_t)head_dim,
         (uint32_t)head_dim, /*page_size=*/1u, /*enable_cuda_graph=*/false,
         /*sizeof_dtype_o=*/sizeof(half), /*window_left=*/-1, /*fixed_split_size=*/0,
         /*disable_split_kv=*/true, /*num_colocated_ctas=*/0, /*uniform_q_len=*/(int64_t)0,
@@ -125,7 +129,7 @@ extern "C" int owl_fi_attn_ragged_run_f16(
     int32_t rows, int32_t num_heads, int32_t head_dim, int32_t n_seq, float scale,
     cudaStream_t stream) {
   try {
-    if (n_seq != 1) return -204;  // 单图契约(多图由 driver 分流到 native 臂)
+    if (n_seq <= 0) return -204;
     // ⚠️ 本适配器只实例化 HEAD_DIM=64(视觉塔 4B/9B 之外的 hd 走 native 臂)——
     // 不匹配时**响亮拒绝**,绝不静默按 64 维算(2026-10-15 实测踩过:假红/错值)
     if (head_dim != 64) return -207;

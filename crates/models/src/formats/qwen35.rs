@@ -335,6 +335,8 @@ pub struct DraftGeom {
     pub hkv: usize,
     /// 注意力头维(草稿 = 128;与池几何同一事实)
     pub hd: usize,
+    /// 草稿注意力滑窗(检查点 `dflash_config.sliding_window`;环容量单源)
+    pub window: usize,
 }
 
 impl DraftGeom {
@@ -355,7 +357,12 @@ pub fn dflash2_draft_geom(
     )?;
     let spec = shard_draft_spec(spec, tp)?;
     let (hq, hkv, hd) = spec.full_heads;
-    Ok(DraftGeom { layers: spec.layer_types.len(), hq, hkv, hd })
+    // 环窗口 = 检查点声明(单一真源);缺声明 = NC 核当前能力(2048)
+    let window = crate::formats::ckpt_config::CkptConfig::read(dir)?
+        .dflash
+        .and_then(|d| d.sliding_window)
+        .unwrap_or(crate::layers::dflash2::NC_WINDOW);
+    Ok(DraftGeom { layers: spec.layer_types.len(), hq, hkv, hd, window })
 }
 
 /// 草稿检查点是否**量化族**(单一真源;`dflash2_draft` 与 `load_dflash2_draft` 共用)。

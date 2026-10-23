@@ -66,12 +66,11 @@
 //! | model | vision / vision_path | bool / false + Option(视觉塔;GGUF 档 = `mmproj-*.gguf` 单文件) |
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row"\|"rtn-int8-row-a8")/ off |
-//! | pool | pool_tokens | Option<usize> / None(=2×单会话) |
+//! | pool | kv_fp8 | bool / false(主 KV 池 e4m3;32 KiB/token) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
-//! | pool | prefix_cache_share | f64 / 0.5(缓存可占设备池比例) |
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
-//! | pool | prefix_cache | bool / true |
+//! | pool | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
 //! | pool | image_evict | bool / false(**前缀无感删除**:客户端给可删图像打标记 ⇒ 引擎页对齐 + 删除即位置帧平移) |
 //! | pool | image_evict_delta_limit | u32 / 32(一条链允许被重转的次数;到顶后下一轮删除触发整段重建;0 = 不限) |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
@@ -92,17 +91,17 @@
 //! | dispatch | prefill_split / force_naive | flag / false |
 //! | dispatch | ~~flashinfer~~ | **已移除(2026-10-13):FI 恒启用,无开关** |
 //! | dispatch | gdn_chunked | bool / **true**(定谳;形状门自动回落) |
-//! | dispatch | gdn_scalar / kv_fp8 | flag / false |
+//! | dispatch | gdn_scalar | flag / false |
 //! | dispatch | resolve_trace / host_argmax / ts_probe | flag / false |
 //! | kernel | verify_arm / decode_arm | **单值枚举** / "v2" 缺省(fi、xqa、prefill 为候选;decode 无 prefill) |
 //! | kernel | gguf_mmvq_l2_mib | usize / **4**(0 = 关;GGUF 小 n 装得进 L2 ⇒ 让 MMVQ 赢) |
 //! | kernel | gguf_tile / gguf_cublas / gguf_mmq2 / gguf_mmq / gguf_smem | bool / 全 true |
 //! | kernel | fi_cuda_graph | bool / false(图档瓦;FI 臂的配套件) |
 //! | kernel | fi_plan_bake / fi_plan_restore | bool / false、true(烘 plan 进图;上界恒 = max_seq) |
-//! | spec | depth | usize / 0;上限 = `SPEC_DEPTH_MAX` = 7(超限拒启) |
+//! | spec | depth | usize / 0;上限 = `SPEC_DEPTH_MAX` = 15(超限拒启) |
 //! | dispatch | allowed_ops | **已退役**(旧键 `deny_unknown_fields` 拒启;准入走 tag filter) |
 //! | dispatch | tag_wildcard | bool / false(诊断 `*`:跳过 tag 过滤) |
-//! | kvmem | select_decode / select_partial / index / pool_overcommit | flag / false(overcommit = 四键全开) |
+//! | kvmem | select_decode / select_partial / index / index_gpu / pool_overcommit | flag / false、true(index_gpu 缺省 true) |
 //! | kvmem | workspace_per_req / select_sink / select_recent / recall_every | usize / 2240、2、4、1 |
 //! | kvmem | coverage_probe / analyze_at_ctx / evict_policy / dense_floor_mib | 见字段注(lru\|lrfu[:λ]) |
 //! | kvmem | bulk_drop_when_tier_full | bool / false(整枝塌缩:宿主/磁盘装不下时允许一次丢整段) |
@@ -222,6 +221,21 @@ pub enum HeadQuant {
     RtnInt8RowA8,
     // 预留:GptqInt4G128(需自采 hidden states 产量化,另案)、
     // RtnInt8G128(中间档)——加值时同步 loader 映射与质量门台账
+}
+
+/// **embedding 表量化方案**(model.embed_quant;P8 2026-10-22)。
+///
+/// 27B 的 `embed_tokens` 是 2,425 MiB(f16);int8 per-row 后 ~1.2G,
+/// 查表走 `owl_embed_i8_f16`。只支持 untied(独立 lm_head);tied 档
+/// 构造期响亮拒。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbedQuant {
+    /// f16 表(检查点原样;对照/默认)
+    #[default]
+    F16,
+    /// per-row 对称 int8(q/s 派生键;装载期 RTN)
+    I8,
 }
 
 /// **主干量化方案**(model.quant;2026-10-17 由 `w4a8: bool` 升格 ——
@@ -533,6 +547,9 @@ pub struct ModelCfg {
     /// C1(2026-10-11):untied lm_head 头部量化方案(枚举严格;映射点
     /// 在 engine loader:HeadQuant → QuantPlan)。质量门台账见枚举值注。
     pub head_quant: HeadQuant,
+    /// **embedding 表量化**(P8 2026-10-22;默认 f16 = 行为不变)。
+    /// 映射点 = `engine::embed_plan_of`;`i8` 省 ~1.2G,需质量门。
+    pub embed_quant: EmbedQuant,
     /// **主干量化方案**(量化方案 = 配置枚举,loader 零硬编码;映射点 =
     /// `engine::quant_plan_of`)。**只作用于主干层** —— lm_head / 草稿 /
     /// mtp 各自独立 plan(选层排除在本仓是结构性的,不需要名字正则)。
@@ -543,11 +560,6 @@ pub struct ModelCfg {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PoolCfg {
-    /// 设备 KV 池(token;`None`/`0` = 自动 = 2 × 单会话容量)。
-    /// **虚拟化档可小于上下文**(`[kvmem].pool_overcommit`;boot 硬校验兜底)。
-    /// `0 = 自动` 与 `[pool] gdn_slots` 同款(继承链里"不想钉死"时写 0)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pool_tokens: Option<usize>,
     /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)。
     /// **0 = 自动 = `[runtime] max_concurrency`**(并发数配几个就几格 —— 用户裁决
     /// 2026-10-20);非 0 = 显式值(旧档逐字节不变)。
@@ -571,15 +583,31 @@ pub struct PoolCfg {
     /// 只在 `边界页号 % stride == 0` 的边界拍(快照 27B ≈ 152 MiB/条 ⇒ 拍得越密,
     /// 宿主下沉流量越大;1 = 每个页边界都拍)。
     pub snap_decode_stride: usize,
-    /// **前缀缓存份额**(0..1;`prefix_cache` 开时生效;缺省 0.5)。
-    ///
-    /// 语义 = "设备池里最多多少比例的页可以留在缓存树上等复用"
-    /// (再 **+ 宿主槽全额**:下沉到宿主的条目仍占条目名额)。
-    /// **容量算式住在 store**(`owl_store::CachePolicy::Share`)—— 它是显存
-    /// 管理者;配置只给这条政策输入。缺省 0.5 = 旧 `nb/2` 行为逐字不变。
-    pub prefix_cache_share: f64,
+    /// **主 KV 池 fp8**(→ `KvQuant::Fp8E4M3`;32 KiB/token,容量翻倍)。
+    /// 2026-10-22 从 `[kernel]` 移入:它决定池的**存储 dtype/几何**,
+    /// 与 `gdn_slots`/`snap_max` 同属池面,而不是算子臂。
+    pub kv_fp8: bool,
     /// GDN 快照池槽数
     pub snap_max: usize,
+    /// **消息边界快照**(缺省 `false` = 逐字节旧行为)。
+    ///
+    /// 开 = 在消息开启标记前取**页对齐**边界，prefill 在边界切块并拍一张
+    /// Durable 快照。目的 = 让同 system/tool 前缀在不同 session/子代理之间
+    /// 也能复用（当前粗锚点每 `SNAP_EVERY=4` 个 chunk 才拍一次，固定 system
+    /// 结尾常有 ≤2K token 的复用损失）。依赖 `prefix_cache=true` +
+    /// `snap_max>0`；无消费者时 boot 告警。
+    pub snap_msg_boundary: bool,
+    /// 消息开启标记的**文本覆盖**（空 = 用模型的 `ChatFormat.im_open`，
+    /// 如 Qwen 系 `<|im_start|>`）。引擎 boot 时把它 tokenize 成 id 序列；
+    /// 扫描代码只认参数 `open_ids`，不写死任何字面量。
+    pub snap_msg_delim: String,
+    /// 后续消息边界的稀疏间隔（token）。第一条边界无条件保留（通常是
+    /// system 结束），之后距上一条不足本值的边界跳过，避免 10K 多消息
+    /// 场景一次拍出几十张 27B 快照（152 MiB/张）。
+    pub snap_msg_min_gap: usize,
+    /// 消息边界切块的**最小步长**（token）。距当前 `fed` 太近的边界不单独
+    /// 切块，避免 20-token 消息制造大量小 prefill chunk。
+    pub snap_msg_min_span: usize,
     /// **宿主 KV 腿**(MiB;0 = 关层)。下沉的落点之一。
     pub host_cache_mb: usize,
     /// **复用池容量上限**(MiB;缺口 4 收尾 P1-1;缺省 256,0 = 不限)。
@@ -745,6 +773,11 @@ pub struct KvmemCfg {
     pub select_partial: bool,
     /// **索引采集**(打分的前置件;`select_decode` 蕴含它,单独开无意义)。
     pub index: bool,
+    /// **索引采集走设备块级 Mean-K 归约**(缺省 `true`)。
+    ///
+    /// `true` = 池内 K 不回读，GPU 逐块算逆 RoPE 均值，只 D2H 32 KiB/块；
+    /// `false` = 旧 host 路径（整页 K D2H + host 逆 RoPE），保留作 golden/排障。
+    pub index_gpu: bool,
     /// **每 turn 工作集(对外口径;`token` 数)** —— 一个**活跃 turn** 在设备 KV
     /// 池里最多**常驻**多少 KV(含 `select_sink` / `select_recent` 保底)。
     ///
@@ -759,6 +792,24 @@ pub struct KvmemCfg {
     /// 缺省 = 2240 tok(= 70 页 × 32 tok = 保底 6 + 召回 64 块,与旧 `select_blocks=64` 等值)。
     /// 页宽契约 = 32 token(设计卷 §1 铁律②)。
     pub workspace_per_req: usize,
+    /// **verify 视图带宽上限(token;0 = 跟随 `workspace_per_req`)**。
+    ///
+    /// 只影响 DFlash2/投机 verify 读的 KV 面,不影响 decode 的视图:
+    /// verify 需要 `depth+1` 行同时扫上下文,视图越长,每轮的 KV 带宽/时延
+    /// 越线性增长(90k 实测:2.2k→16k 视图,verify 轮 ≈51→194ms,AL 3.0→1.6)。
+    /// 非 0 时 verify 只取**视图尾部最近 N token**(选中块按时间序 + 尾部),
+    /// decode 仍用完整 `workspace_per_req` —— 用“草稿验证看近处”换 AL。
+    pub verify_view_tokens: usize,
+    /// **GQA 查询头聚合**:`mean` | `max`(上游产品脚本默认 `max`)。
+    pub gqa_aggregation: GqaAggregationCfg,
+    /// **最终 query replay**(KVMem §5.2;缺省关)。
+    ///
+    /// 末个 prefill chunk 前拍 GDN 快照；最终召回/视图装配后恢复快照，
+    /// 用新视图重跑该 chunk，再 decode。否则最后一个 query 的 hidden 仍是
+    /// 旧视图算出的，选中块再对也进不了当前 query。
+    ///
+    /// 当前只支持 `spec.depth = 0`(草稿环 replay 另立刀)。
+    pub query_replay: bool,
     /// 保底 sink(时间序最前的若干块;论文 always-retained)。
     pub select_sink: usize,
     /// 保底 recent(时间序最后的若干块)。
@@ -808,7 +859,7 @@ pub struct KvmemCfg {
     /// **允许设备池小于上下文**(锁①;缺省关)。
     ///
     /// 关着时池有硬下限 `nb ≥ ceil(seq_tokens/page)`(`state.rs`)—— 即
-    /// **选择层只省访问面、不省显存**。开着才允许 `pool_tokens` 真的压小。
+    /// **选择层只省访问面、不省显存**。开着才允许池真的压小(池由剩余显存自动定)。
     /// 只有虚拟化开才被接受。
     #[serde(default)]
     pub pool_overcommit: bool,
@@ -825,6 +876,18 @@ impl KvmemCfg {
     pub fn virtualization_enabled(&self) -> bool {
         self.select_decode && self.select_partial
     }
+}
+
+/// **GQA 查询头聚合**(KVMem 产品口径;`[kvmem].gqa_aggregation`)。
+///
+/// - `mean` = 每个 KV 头先把组内 query head 取均,再与 k̄ 做余弦;
+/// - `max` = 组内逐 query head 算余弦,取最大(上游 `start-ninfer` 默认)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GqaAggregationCfg {
+    Mean,
+    #[default]
+    Max,
 }
 
 /// **草稿族选择**(`[spec] draft`;2026-10-21 MTP 接回)。
@@ -864,6 +927,10 @@ pub struct SpecCfg {
     pub draft_path: Option<PathBuf>,
     pub dumb: bool,
     pub draft_kv_fp8: bool,
+    /// **DFlash2 草稿环窗口(token;0 = auto = 检查点 `sliding_window`)**。
+    /// 草稿池按这个窗口做环形缓冲(不再按 pool_tokens 全量物化);
+    /// 当前 NC 核只实例化 2048,写非 2048 = boot 拒(等核支持 4k/8k)。
+    pub draft_window: usize,
     /// **DFlash2 lookup-augmented drafting(LABD)**：在当前请求的 token 历史里
     /// 找当前后缀的最近一次出现，用其后续 token 覆盖/补齐草稿块。
     /// 只服务 DFlash2（`draft=dflash2` 或 `auto`+`draft_path`）；MTP/Off 写了 = boot 拒。
@@ -1167,8 +1234,6 @@ pub struct KernelCfg {
     pub gdn_fused_decode: bool,
     /// D1-v2(缺省真;2026-10-04 三重验证后翻)
     pub gdn_fused_decode_v2: bool,
-    /// KV 池 fp8(→ KvQuant::Fp8E4M3)
-    pub kv_fp8: bool,
     // ---- GGUF 预填臂(2026-10-21 收编;原 `OWL_GGUF_*` env)----
     //
     // 五个布尔 = **同一族**的臂开关:每次 `gguf_quant_gemm` 按 `m` 与臂集
@@ -1288,6 +1353,10 @@ pub struct ProbesCfg {
     pub fact_probe: bool,
     pub trace_gate: bool,
     pub dflash_probe: bool,
+    /// 末边界额外哈希一个**逻辑块**的 K/V 页(诊断面;定位 stage-in 内容是否
+    /// 与首次写入一致)。`None` = 不哈希。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_hash_block: Option<usize>,
     pub propose_eager: bool,
     pub dflash_eager: bool,
     pub dflash_noencode: bool,
@@ -1556,27 +1625,18 @@ impl Default for RuntimeCfg {
     }
 }
 
-
-impl PoolCfg {
-    /// **生效的池容量**(`None` / `Some(0)` = 自动 ⇒ 返回 None)。
-    ///
-    /// 唯一消费口:引擎 `EngineKnobs`、`--check` 展示、`[intent]` 派生。
-    /// 为什么把 0 当自动:extends 链下"上一档钉了池、本档想回自动"只能靠一个
-    /// 显式值表达 —— 0 与 `gdn_slots = 0` 的同款约定一致。
-    pub fn pinned_pool_tokens(&self) -> Option<usize> {
-        self.pool_tokens.filter(|n| *n > 0)
-    }
-}
-
 impl Default for PoolCfg {
     fn default() -> Self {
         Self {
-            pool_tokens: None,
             gdn_slots: 8,
-            prefix_cache_share: 0.5,
+            kv_fp8: false,
             prefill_align_tail: true,
             snap_decode_stride: 1,
             snap_max: 4,
+            snap_msg_boundary: false,
+            snap_msg_delim: String::new(),
+            snap_msg_min_gap: 2048,
+            snap_msg_min_span: 0,
             host_cache_mb: 0,
             snap_host_mb: 0,
             disk_cache_mb: 0,
@@ -1603,8 +1663,13 @@ impl Default for KvmemCfg {
             select_decode: false,
             select_partial: false,
             index: false,
+            index_gpu: true,
             // 2240 tok = 70 页 × 32 tok = 保底 6 + 召回 64 块(与旧 `select_blocks=64` 等值)
             workspace_per_req: 2240,
+            // 0 = verify 与 decode 同视图(旧行为,逐位不变)
+            verify_view_tokens: 0,
+            gqa_aggregation: GqaAggregationCfg::Max,
+            query_replay: false,
             select_sink: 2,
             select_recent: 4,
             recall_every: 1,
@@ -1627,6 +1692,7 @@ impl Default for SpecCfg {
             draft_path: None,
             dumb: false,
             draft_kv_fp8: false,
+            draft_window: 0,
             lookup: false,
             lookup_nmin: 6,
             lookup_nmax: 12,
@@ -1673,7 +1739,6 @@ impl Default for KernelCfg {
             gdn_scalar: false,
             gdn_fused_decode: true,
             gdn_fused_decode_v2: true,
-            kv_fp8: false,
             // GGUF 预填臂:缺省全开(生产行为;关掉 = 回退下一臂)
             gguf_tile: true,
             gguf_cublas: true,
@@ -1750,7 +1815,7 @@ fn record_origins(v: &toml::Value, prefix: &str, origin: &Origin, out: &mut Orig
 /// 逐层比对文件里是否**每一个键都在场**;缺一个都拒启(列出全量,一次改完)。
 ///
 /// 例外(自然豁免):`Option::None` 与 `skip_serializing_if` 的字段不出现在
-/// schema 里,因此**不要求**写(例如 `pool_tokens`、`runtime.device.*` 三件互斥)。
+/// schema 里,因此**不要求**写(例如 `runtime.device.*` 三件互斥)。
 fn check_explicit_complete(file_v: &toml::Value, path: &Path) -> Result<(), String> {
     let schema = toml::Value::try_from(&OwlConfig::default())
         .map_err(|e| format!("内部:schema 序列化失败 {e}"))?;
@@ -1805,7 +1870,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
         (
             "kernel",
             "allowed_ops",
-            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`dispatch.kv_fp8`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
+            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`pool.kv_fp8`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
         ),
         (
             "kernel",
@@ -2025,7 +2090,7 @@ impl ResolvedConfig {
             .map_err(|e| format!("生效配置序列化失败(print/explain 面): {e}"))?;
         resolve::get(&v, key)
             .cloned()
-            .ok_or_else(|| format!("键 {key:?} 不在生效配置里(点路径,如 pool.pool_tokens)"))
+            .ok_or_else(|| format!("键 {key:?} 不在生效配置里(点路径,如 pool.prefill_chunk)"))
     }
 
     /// 单键解释:`值 + 来源 + 派生规则`
@@ -2069,7 +2134,7 @@ pub fn parse_cli_set(s: &str) -> Result<(String, toml::Value), String> {
     })?;
     let key = k.trim();
     if key.is_empty() || key.split('.').any(|seg| seg.is_empty()) {
-        return Err(format!("--set {s:?} 非法键 {key:?}(点路径,如 pool.pool_tokens)"));
+        return Err(format!("--set {s:?} 非法键 {key:?}(点路径,如 pool.prefill_chunk)"));
     }
     let raw = raw.trim();
     let val = match toml::from_str::<toml::Value>(&format!("v = {raw}")) {
@@ -2453,12 +2518,6 @@ impl OwlConfig {
         }
         // **前缀缓存份额**:0..=1(0 = 不留缓存设备份额;1 = 可占满设备池)。
         // 越界 = 配置错(算式在 store,静默夹会让"我要 150% 池"变成别的东西)。
-        if !(0.0..=1.0).contains(&self.pool.prefix_cache_share) {
-            return Err(format!(
-                "[pool] prefix_cache_share({}) 越界:须 0..=1(份额 × 设备池 = 缓存可占页数)",
-                self.pool.prefix_cache_share
-            ));
-        }
         // **前缀无感删除的依赖门**(2026-10-23):删除路径靠**内容寻址**取回旧链,
         // 没有前缀缓存就没有旧链可拼接 ⇒ 开着 `image_evict` 却没开 `prefix_cache`
         // 是"配了但永远不会生效",按静默降级拒启。
@@ -2541,19 +2600,27 @@ impl OwlConfig {
         // **W5 意图配套门**（2026-10-18）：FI 臂只有"图内臂"一种承载（核留图内 +
         // `ctx_total` 烘上界 + 表由 `fi_plan_sync` 窗外刷）。缺上界 ⇒ 捕获期会拿
         // **占位 ctx** 烘表（文本连贯但错，历史踩过）⇒ 响亮拒绝，不给静默错值。
-        // **部分驻留 × 投机 = 不共戴**(2026-10-21 实测):`select_partial` 下沉过
-        // 的块在会话链上是宿主占位符,而 verify 的页表/槽位直接取会话链 ⇒
-        // 占位符被核当页号 = CUDA 700 + **上下文毒化**(之后每个 turn 都崩)。
-        // 视图化 verify 未实现(方案 A 的页表/lens 语义待定谱)⇒ 拒启,
-        // 而不是跑起来等你踩。
-        if self.kvmem.select_partial && self.spec.depth > 0 {
-            return Err(
-                "[kvmem] select_partial = true 与 [spec] depth > 0 不共戴\
-                 (下沉块的宿主占位符会进 verify 页表 ⇒ CUDA 700 且污染上下文;\
-                 视图化 verify 未实现)。请二选一:关 select_partial(只留 select_decode,\
-                 长 ctx decode 实测 35.0 t/s 与 dense 持平)或关投机。"
-                    .to_string(),
-            );
+        // **部分驻留 × 投机 = 视图化 verify 档**(2026-10-23):
+        // `select_partial` 下沉过的块在会话链上是宿主占位符;verify 必须走
+        // **逐行视图页表**(`exec/spec.rs::verify_view_tables`)。第一版只实现
+        // v2 臂;FI/XQA 的逐行页表未实现 ⇒ 响亮拒,不静默跑错。
+        if self.kvmem.select_partial {
+            if !matches!(self.kernel.decode_arm, DecodeArm::V2) {
+                return Err(
+                    "[kvmem] select_partial = true 目前只支持 [kernel] decode_arm = \"v2\":\
+                     FI/XQA 的页表直接读会话链,遇宿主占位符会 CUDA 700 + 上下文毒化。\
+                     请改 v2(或关 select_partial)。"
+                        .to_string(),
+                );
+            }
+            if self.spec.depth > 0 && !matches!(self.kernel.verify_arm, VerifyArm::V2) {
+                return Err(
+                    "[kvmem] select_partial = true 与 [spec] depth > 0 目前只支持\
+                     verify_arm = \"v2\":FI/XQA 的逐行视图页表未实现。\
+                     请改 v2(或关 select_partial / 关投机)。"
+                        .to_string(),
+                );
+            }
         }
 
         // **臂 × FI 前置件的一致性门**(2026-10-21 单键化):FI 臂(verify/decode
@@ -2756,17 +2823,32 @@ mod tests {
         .expect("fi 臂 + 三件套 = 合规");
     }
 
-    /// **部分驻留 × 投机 拒启**(2026-10-21):下沉块的宿主占位符会进 verify
-    /// 页表 ⇒ CUDA 700 + 上下文毒化。两条合法组合必须仍然放行。
+    /// **部分驻留 × 投机 = v2-only**(2026-10-23):视图化 verify 已落地,
+    /// v2/v2 放行;FI/XQA 的逐行页表未实现 ⇒ 拒启。
     #[test]
-    fn select_partial_rejects_spec() {
-        let base = "[kvmem]\nselect_partial = true\n";
-        let e = OwlConfig::from_toml_str(&format!("{base}[spec]\ndepth = 7\n"))
-            .expect_err("select_partial + spec 必须拒启");
-        assert!(e.contains("select_partial") && e.contains("depth"), "拒语要可行动: {e}");
+    fn select_partial_spec_requires_v2() {
+        let base = "[kvmem]\nselect_partial = true\nselect_decode = true\n\
+                    [spec]\ndepth = 7\n";
+        OwlConfig::from_toml_str(&format!(
+            "{base}[kernel]\nverify_arm = \"v2\"\ndecode_arm = \"v2\"\n"
+        ))
+        .expect("partial + spec + v2/v2 = 合规(视图化 verify)");
+        // FI 臂 = 单表,不支持逐行视图
+        let e = OwlConfig::from_toml_str(&format!(
+            "{base}[kernel]\nverify_arm = \"fi\"\ndecode_arm = \"v2\"\n\
+             fi_plan_bake = true\nfi_cuda_graph = true\nfi_plan_restore = false\n"
+        ))
+        .expect_err("partial + spec + fi verify 必须拒启");
+        assert!(e.contains("v2") && e.contains("select_partial"), "拒语要可行动: {e}");
+        let e = OwlConfig::from_toml_str(&format!(
+            "{base}[kernel]\nverify_arm = \"v2\"\ndecode_arm = \"fi\"\n\
+             fi_plan_bake = true\nfi_cuda_graph = true\nfi_plan_restore = false\n"
+        ))
+        .expect_err("partial + spec + fi decode 必须拒启");
+        assert!(e.contains("v2") && e.contains("select_partial"), "拒语要可行动: {e}");
         // 关掉投机 = 合法(实测 8192 decode 40.2 t/s)
-        OwlConfig::from_toml_str(&format!("{base}[spec]\ndepth = 0\n"))
-            .expect("partial + 无投机 = 合规");
+        let no_spec = base.replace("depth = 7", "depth = 0");
+        OwlConfig::from_toml_str(&no_spec).expect("partial + 无投机 = 合规");
         // 关掉 partial 只留视图 = 合法(实测 8192 decode 35.1 t/s)
         OwlConfig::from_toml_str(
             "[kvmem]\nselect_decode = true\n[spec]\ndepth = 7\n",
@@ -3073,7 +3155,7 @@ mod extends_tests {
         assert_eq!(c.spec.depth, 5, "文件覆盖基准");
         assert_eq!(c.runtime.max_seq, 2048, "文件键到手");
         assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");
-        assert_eq!(c.kernel.kv_fp8, true, "基准行为面保留");
+        assert_eq!(c.pool.kv_fp8, true, "基准行为面保留");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -3108,7 +3190,7 @@ mod config_overlay_tests {
         assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");
         let c2 = OwlConfig::load(Some(&base), None).expect("load base only");
         assert_eq!(c2.spec.depth, 7, "spec-dflash 预设 = d7");
-        assert_eq!(c2.model.head_quant, HeadQuant::RtnInt4G32, "C1 int4 头");
+        assert_eq!(c2.model.head_quant, HeadQuant::RtnInt8Row, "C1 int8 头");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3193,7 +3275,7 @@ mod auto_pool_tests {
     /// 超限**拒启**,不再像旧代码那样 `min(3/7)` 静默截断。
     #[test]
     fn spec_depth_over_structural_max_is_refused() {
-        assert_eq!(SPEC_DEPTH_MAX, 7);
+        assert_eq!(SPEC_DEPTH_MAX, 15);
         let ok = OwlConfig::from_toml_str(&format!("[spec]\ndepth = {SPEC_DEPTH_MAX}\ndraft = \"mtp\"\n"));
         assert!(ok.is_ok(), "上限内应可配: {ok:?}");
         let bad = OwlConfig::from_toml_str(&format!("[spec]\ndepth = {}\n", SPEC_DEPTH_MAX + 1));
