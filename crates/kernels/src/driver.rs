@@ -1911,8 +1911,9 @@ pub mod vis {
     /// **两臂(按 dtype + 图数分流;见 `resolve` 的 `vis.attn_full` 臂)**:
     /// - f16 + 单图 ⇒ **FlashInfer ragged 非因果 prefill**(foreign 家族臂;
     ///   grid/smem 由家族 runtime 自算 ⇒ `FOREIGN` 哨兵);
-    /// - 其余 ⇒ native(一 block 8 行 × 一头,块内共享 smem K/V tile;
-    ///   grid = (ceil(rows/8), heads),smem = 2·TILE(64)·head_dim·sizeof(T))。
+    /// - 其余 ⇒ native(一 block **32 行** × 一头 = 8 warp × 4 行;
+    ///   块内共享 smem K/V tile,每 warp 把同一 K/V 行复用于 4 个 q 行;
+    ///   grid = (ceil(rows/32), heads),smem = 2·TILE(64)·head_dim·sizeof(T))。
     pub fn attn_full(dt: DType, rows: usize, heads: usize, head_dim: usize, n_seq: i64) -> KernelPick {
         // FI ragged 适配器只实例化 hd=64 ⇒ 条件里必须带上(否则静默按 64 维算)。
         //
@@ -1921,7 +1922,7 @@ pub mod vis {
         // 更小的 tile(小图/少 patch)时 run 直接 `return -205`
         // (`[owl-fi][ragged run] 未实例化的 cta_tile_q=…`),错误从模型深处冒上来
         // 且信息量极低。小形状走 **native 臂**是等价且更省事的路
-        // (一 block 8 行 × 一头,块内共享 smem tile)。
+        // (一 block 32 行 × 一头,块内共享 smem tile)。
         if dt == DType::F16 && n_seq == 1 && head_dim == 64 && rows >= 64 {
             return KernelPick {
                 name: crate::family::flashinfer::ATTN_RAGGED_F16,
@@ -1939,8 +1940,10 @@ pub mod vis {
             _ => unreachable!("上面已拒"),
         };
         const TILE: usize = 64;
+        // 与 `cu/vis/vision_ops.cu` 的 `WARPS(8) × RPW(4)` 同步:32 行/block。
+        const ROWS_PER_BLOCK: usize = 32;
         let smem = (2 * TILE * head_dim.max(1) * elem) as u32;
-        let row_blocks = rows.div_ceil(8).max(1) as u32;
+        let row_blocks = rows.div_ceil(ROWS_PER_BLOCK).max(1) as u32;
         KernelPick {
             name,
             shape: Shape { grid: (row_blocks, heads.max(1) as u32, 1), block: (256, 1, 1), smem },
@@ -2413,9 +2416,9 @@ mod tests {
         // 小形状 ⇒ native
         let p = vis::attn_full(DType::F16, 16, 12, 64, 1);
         assert_eq!(p.name, "owl_vis_attn_full_f16", "rows < 64 必须退 native");
-        assert_eq!(p.shape.grid, (2, 12, 1), "native:ceil(16/8) 行块");
+        assert_eq!(p.shape.grid, (1, 12, 1), "native:ceil(16/32) 行块");
         // 其他维度不满足 ⇒ native(既有判据不动)
-        assert_eq!(vis::attn_full(DType::F16, 256, 12, 128, 1).name, "owl_vis_attn_full_f16");
+        assert_eq!(vis::attn_full(DType::F16, 256, 12, 72, 1).name, "owl_vis_attn_full_f16");
         assert_eq!(vis::attn_full(DType::F32, 256, 12, 64, 1).name, "owl_vis_attn_full_f32");
         assert_eq!(vis::attn_full(DType::F16, 256, 12, 64, 2).name, "owl_vis_attn_full_f16");
     }
