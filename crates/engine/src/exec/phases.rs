@@ -408,11 +408,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 复用只需要**末边界**(append 场景)与稀疏锚点(分叉场景)。
             let every = self.boot.cfg.prefill_chunk.max(1) * SNAP_EVERY;
             let snap_keep = last_boundary || new_fed.is_multiple_of(every);
+            // **索引采集节奏**：与 `coverage_analyze` 的完整召回同拍 ——
+            // 廉价边界只攒身份/页号，不触发 D2H；下次完整召回前一次补齐。
+            // `coverage_probe` 诊断档要求每边界都有索引 ⇒ 全采。
+            let index_every = self.boot.cfg.knobs.index_cadence();
+            let index_now = self.boot.cfg.knobs.coverage_probe
+                || last_boundary
+                || (self.sel.boundaries() + 1) % index_every == 0;
             // GDN 快照拍摄(**唯一入口** `capture_gdn_snap`:链推进 + 增量登记 +
             // 索引采集 + 快照;内部已 TP 感知 —— peer 在场时两 rank 各拍各自的池,
             // store 的 state 账仍单份)。
             let t_snap = std::time::Instant::now();
-            self.capture_gdn_snap(sid, new_fed, snap_keep).await?;
+            self.capture_gdn_snap(sid, new_fed, snap_keep, index_now).await?;
             let snap_ms = t_snap.elapsed().as_secs_f64() * 1000.0;
             // **边界相位拆分**(`OWL_VRAM_DBG=1`;2026-10-19 A3):
             // 边界 = 快照拍摄(链哈希 + GDN 拷贝 + 登记)‖ 索引采集 ‖ B 轴(打分/选择/视图/调和)。
@@ -507,6 +514,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 p.view_ms,
                 p.reconcile_ms,
                 p.total_ms
+            );
+            owl_shared::log_info!(
+                "kvmem-prof",
+                "qface 拆：toh={:.1} dec={:.1} free={:.1} derope={:.1} mass={:.1}",
+                p.q_toh_ms,
+                p.q_dec_ms - p.q_free_ms,
+                p.q_free_ms,
+                p.q_derope_ms,
+                p.q_mass_ms
             );
         }
         // **边界事件计时 → metrics**(2026-10-18 T1):前向已有 `prefill.chunk`
@@ -731,6 +747,7 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     act.fed,
                     &[],
                     owl_store::SnapDurability::Transient,
+                    true,
                     true,
                 )
                 .await?;
@@ -1140,6 +1157,7 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     fed,
                     &[],
                     owl_store::SnapDurability::Transient,
+                    true,
                     true,
                 )
                 .await?;

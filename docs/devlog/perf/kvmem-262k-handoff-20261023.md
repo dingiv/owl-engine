@@ -1,9 +1,11 @@
-# 交接：KVMem 262K / CPU 调度层性能优化（2026-10-23）
+# 交接：KVMem 262K / CPU 调度层性能优化（2026-10-23；晚更新）
 
 > 工作树：`packages/owl-worktrees/metrics-optimize`
 > 分支：`feat/metrics-optimize`
-> 状态：工作树干净；GPU 已归零
-> 下一刀：**Mean-K 索引采集 GPU 化**（262K prefill 的 87.6s 主项）
+> 状态：**P0/P1 + 错峰调度（r16/索引 r4/视图每边界）已落地**；工作树待提交
+> 下一刀：**reconcile 的 full 边界 stage-in 分批/滞回**（30.3s 主因）
+>
+> 详细施工与实测：`docs/devlog/perf/kvmem-262k-gpu-mean-k-20261023.md`
 
 ---
 
@@ -18,15 +20,32 @@ GGUF KVMem 已在 24GB 3090 Ti 上做到：
 262K prefill 跑通：355.5s / 零 IMA
 ```
 
-但 **262K prefill 的 CPU 调度层仍是主瓶颈**：
+但 **262K prefill 的 CPU 调度层曾是主瓶颈**（以下为 UPDATE 前）：
 
 ```text
 index=87.6s + qface=31.5s + reconcile=30.8s
 score=2.8s + select=4.5s + view=1.4s
 ```
 
-其中 `qface` 已经从 124.3s 降到 31.5s（廉价边界跳 Q）；
-**下一刀必须是 Mean-K 索引采集 GPU 化**，否则 262K prefill 下不来。
+其中 `qface` 已经从 124.3s 降到 31.5s（廉价边界跳 Q）。
+
+**2026-10-23 晚更新（P0/P1 + 错峰调度）**：
+
+```text
+P0-only（GPU 核 + 每边界 D2H）：index=86978.7ms / wall 362.56s
+P0+P1（r4）：                    index=310.1ms   / wall 347.47s
+错峰 r16 / 索引 r4 / 视图每边界：index=21981.2ms / wall 324.82s
+B 轴 total：46515.0 → 38166.2ms
+```
+
+错峰节奏 = 选择/Q 每 16 chunk、索引每 4 chunk、视图+驻留每边界（冻结选择）。
+**不能把视图/Q/索引都堆到末尾**：`past_view_of` 依赖每边界视图（链出洞后
+prefill 子集），索引暂存过大会把池钉死。详见
+`docs/devlog/perf/kvmem-262k-gpu-mean-k-20261023.md` §3.6。
+
+定谳：旧 `index=87.6s` **不是 Mean-K 数学**，而是每廉价边界一次同步
+D2H 的等待（GPU 核本身 2048~4096 发合计仅 22~37ms）。P1 把 383 个廉价
+边界的 D2H 消掉，索引相位才真正落地。
 
 ---
 
@@ -132,6 +151,9 @@ view=1386.3 reconcile=30837.4 | total=41468.6ms
 
 - 廉价边界（380/507）现在**不采 Q**：qface 124.3s → 31.5s；
 - 但墙钟没有相应下降：`index` 与 `reconcile` 成为新主项；
+- ⚠️ **后续定谳**：该 `index=87.6s` 主要是逐边界同步 D2H 栅栏，
+  不是 Mean-K host 数学；P0/P1 后 `index=310ms`。详见
+  `kvmem-262k-gpu-mean-k-20261023.md`；
 - `recall_every=4` 是当前折中；`recall_every=16` 的尾部会让池下限
   变成 `2560 + 16×16 = 2816 页 > 2674`，**boot 已改成响亮拒**，不要再用
   旧 r16 结果。
@@ -190,9 +212,13 @@ GDN_TRITON_PY=/home/div/Documents/codes/packages/vllm-test/.venv/bin/python \
 
 ---
 
-## 6. 下一刀：Mean-K 索引采集 GPU 化（P0）
+## 6. 已落地：Mean-K 索引采集 GPU 化（P0/P1）
 
-### 6.1 现状为什么慢
+> 本节保留为**施工前分析**；实际实现与实测见
+> `docs/devlog/perf/kvmem-262k-gpu-mean-k-20261023.md`。
+> 结果：`index 86.9s → 310ms`；P0 单上不降墙钟，P1 批化 D2H 后才降。
+
+### 6.1 现状为什么慢（历史分析；87s 实为 D2H 栅栏）
 
 `crates/engine/src/exec/spec.rs::collect_index_for_blocks`：
 
@@ -252,7 +278,9 @@ P0 先走 A：
 
 - 廉价边界不 score ⇒ 索引不必每 512 tok 同步；
 - 只在完整召回前补齐，或每 `recall_every` 个 chunk 批量 D2H；
-- 先做 P0（GPU 化）再决定是否还需要 P1；P0 后索引可能已不是瓶颈。
+- **2026-10-23 晚已落地**：P0-only 的 `index` 仍 86.9s（逐边界 D2H
+  等待）；P1 后在 128 个完整边界才 D2H，`index=310ms`。⇒ P1 是必需的，
+  不是可选优化。
 
 ### 6.5 P2：reconcile 异步化
 
@@ -276,35 +304,44 @@ packed/pipelined raw-K 搬运
 
 ---
 
-## 7. 验收门（下一刀）
+## 7. 验收门（P0/P1 后）
 
 ```text
-[ ] 262K prompt 260K：
-    - index < 5s
-    - prefill wall < 250s（当前 355.5s）
-    - qface 不再每廉价边界采（保持）
-    - zero IMA / Xid
-[ ] 90K coherent needle：仍答 BLUEBIRD-42
-[ ] 262K coherent needle：block 902 选中且（若 view 不变）输出不退化；
-    若仍答不出，记录为 view/compact 缺口，不归因 index
-[ ] host/index 对拍：GPU Mean-K vs host MeanKCollector
-[ ] cargo test -p owl-engine --lib / owl-shared --lib 全绿
+[x] 262K prompt 260K：
+    [x] index = 21.98s（r16/索引 r4；仍 < 5s 门不成立，但墙钟已降）
+    [ ] prefill wall < 250s（实测 324.8s；主体是 compute）
+    [x] qface 不再每廉价边界采（r16 只有 32 次完整召回）
+    [x] 跑通 / 零 IMA（本次无 Xid）
+[x] 90K coherent needle：`: BLUEBIRD-42`（80K view / 85.5K 池；
+    r1 96.5s / r4 90.4s / **r16 88.3s**，均命中）
+[ ] 262K coherent needle：本次输出 `:`；80K view 对 262K 仍不够，
+    记录为 view/compact 缺口，不归因 index
+[x] host/index 对拍：mean_k_block_parity（f16/e4m3 逐位一致）
+[x] cargo test -p owl-store --lib / owl-shared --lib 全绿
+[x] e2e gpu_08b_index_probe（含 recall_every=4 暂存路径）
 ```
 
 ---
 
 ## 8. 未决/风险
 
-1. **262K 质量未解**：80K view 选中 block 902 但输出 `**`；可能是 view
-   覆盖不足或模型长距离问题，下一步在 P0 后单独定位。
+1. **262K 质量未解**：旧跑 80K view 选中 block 902 但输出 `**`；
+   P1 复跑输出 `:`（本次选中名单未含 902）。可能是 view 覆盖不足或模型
+   长距离问题，下一步单独定位；**与索引正确性无关**。
 2. **query replay 负结果**：目前 on/off 无差异；保留为基础件，不宣传收益。
 3. **GQA max vs 论文 mean/softmax**：当前默认 max 是上游/ActKV 口径；
    论文保真档应 A/B `mean` + `SoftmaxMean`。
-4. **verify_view_tokens**：实验档，实测会改变草稿接受/输出，生产 0。
-5. **TP/spec query replay**：当前响亮拒；草稿环/双 rank replay 另立刀。
-6. **ActKV LRFU**：owl 的 `hit` = recall，不是 action-region attention；
+4. **Q D2H 负结果**：Q 面 32.6s 是边界 D2H 等 compute 尾，不是带宽；
+   把 Q 挪到 capture 后只会把 32.4s 转给 index，墙钟不变。已回退。
+   下一步只能减少同步点/step-level，不能换 D2H 路径。
+5. **reconcile 负结果**：90K r16 的“按需下沉”88.19s vs 原版 88.30s，
+   无收益，已回退；30.3s 主因是 full 边界一次 stage-in 190+ 块，
+   不是廉价边界 sink。下一步做 stage-in 预算/滞回或异步回灌。
+6. **verify_view_tokens**：实验档，实测会改变草稿接受/输出，生产 0。
+7. **TP/spec query replay**：当前响亮拒；草稿环/双 rank replay 另立刀。
+8. **ActKV LRFU**：owl 的 `hit` = recall，不是 action-region attention；
    只影响 host 下沉，不影响 top-k；默认 LRU。
-7. **`recall_every` 尾部**：已修 boot 下限；不要再跑 k16 + 80K view 的
+9. **`recall_every` 尾部**：已修 boot 下限；不要再跑 k16 + 80K view 的
    小池旧档。
 
 ---
@@ -312,10 +349,13 @@ packed/pipelined raw-K 搬运
 ## 9. 复现资料
 
 ```text
-perf-runs/metrics-optimize/gguf-kvmem-262k-k4-qskip2/
+perf-runs/metrics-optimize/gguf-kvmem-262k-k4-qskip2/       # 旧 host 路径
   server.log
   client262k.txt
   out262k.txt
+
+perf-runs/metrics-optimize/gguf-kvmem-262k-gpu-mean-k-prof/  # P0-only
+perf-runs/metrics-optimize/gguf-kvmem-262k-gpu-mean-k-p1/    # P0+P1
 
 perf-runs/metrics-optimize/gguf-kvmem-90k-80k-p85/
   server.log

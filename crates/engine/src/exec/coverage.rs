@@ -1523,7 +1523,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 先沉后升:沉的这一步**腾出的槽**正是升要用的槽。
         if self.boot.cfg.knobs.select_partial {
             let t_rec = std::time::Instant::now();
-            let (sunk, staged) = self.reconcile_residency(sid, &cands, &set.blocks, n_blocks).await?;
+            // **廉价边界的索引暂存块**还没采 Mean-K，物理页必须留到下一次
+            // 完整召回；把它们并进 keep，调和就不会先沉走。
+            let mut reconcile_keep = set.blocks.clone();
+            reconcile_keep.extend(self.sel.pending_index_hashes());
+            let (sunk, staged) =
+                self.reconcile_residency(sid, &cands, &reconcile_keep, n_blocks).await?;
             self.sel.note_reconcile(t_rec.elapsed().as_secs_f64() * 1000.0);
             self.sel.note_sunk(sunk);
             self.sel.note_staged(staged);

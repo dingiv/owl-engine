@@ -205,6 +205,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 self.write_chain_index(&toks).await?;
             }
         }
+        // **索引暂存排空**：正常 prefill 的末边界已清空；这里兜底
+        // abort/短轮 —— 必须在 `release_turn_table` 之前采，物理页还在。
+        if self.boot.cfg.knobs.index_probe {
+            let n_pending = self.sel.pending_index_len();
+            let pending = self.sel.take_index_pending();
+            if !pending.is_empty() {
+                owl_shared::log_debug!(
+                    "idx",
+                    "turn 收口排空索引暂存:{n_pending} 块"
+                );
+                self.collect_index_for_blocks(&pending).await?;
+            }
+        }
         if act.ephemeral {
             // 终了即焚:块链归还账房 + 会话表移除(GDN 格随之释放)
             self.burn_ephemeral(act.session_id);

@@ -618,6 +618,27 @@ impl Rel {
         )
     }
 
+    /// **登记一块的扁平索引段**(GPU Mean-K 出口):与 [`Self::index_register`]
+    /// 同账同语义，只是段已是 `[layer][kv_head][dim]` 规范序。
+    pub fn index_register_flat(
+        &mut self,
+        block: ChainHash,
+        flat: Vec<u16>,
+    ) -> StoreResult<()> {
+        let ix = self
+            .index
+            .as_mut()
+            .ok_or_else(|| StoreError::Invariant("选择层索引未注册(engine 应在 boot 调 attach_index)".into()))?;
+        let bytes = ix.block_bytes();
+        ix.register_flat(block, flat)?;
+        crate::tier::book_lock(&self.ledger).tiers_mut().add_owned(
+            crate::tier::Owner::Cache,
+            Tier::Host,
+            AssetKind::Index,
+            bytes,
+        )
+    }
+
     /// 丢一块的索引(出账)。
     pub fn index_drop(&mut self, block: ChainHash) -> StoreResult<()> {
         let ix = self

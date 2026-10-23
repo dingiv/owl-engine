@@ -11,3 +11,6 @@ vram_reserve_mb = 1500
 
 [kvmem]
 workspace_per_req = 81920
+# 90K 实测：r16 仍命中 BLUEBIRD-42，墙钟 96.5→88.3s；
+# 选择/Q 每 16 chunk，索引每 4 chunk，视图/驻留每边界（冻结选择）⇒ 不堆到末尾
+recall_every = 16

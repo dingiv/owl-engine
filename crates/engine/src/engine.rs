@@ -80,11 +80,14 @@ pub struct EngineKnobs {
     pub host_cache_mb: usize,
     /// **选择层索引采集(B 轴 B-0;缺省关)**。`OWL_INDEX_PROBE=1` / `[kvmem].index`。
     ///
-    /// 开则:块边界(与 GDN 快照同处)回读该页 K → host 逆 RoPE 求 Mean-K →
-    /// 登记进 store 的索引账(`AssetKind::Index`,host 层)。
-    /// ⚠️ 一期是**回读**形态(每页 ~3MB D2H,一次性建索引);核内累加是后续优化。
+    /// 开则:块边界(与 GDN 快照同处)采集 Mean-K 并登记进 store 的索引账
+    /// (`AssetKind::Index`,host 层)。缺省走 GPU 块级归约(`index_gpu=true`)，
+    /// 只回读索引；旧 host 整页回读路径保留作 golden/排障。
     /// `select_decode` 蕴含它(打分的前置件)。
     pub index_probe: bool,
+    /// **索引采集设备化**(缺省 true):GPU 块级 Mean-K，只回读索引；
+    /// false = 旧 host 整页回读路径（golden/排障）。`[kvmem].index_gpu`。
+    pub index_gpu: bool,
     /// **选择层覆盖率探针 —— 诊断面**(缺省关)。`OWL_COVERAGE_PROBE=1`。
     ///
     /// 开则额外做**真重诊断**:K/V 全量回读 + host 逐元素解码 +
@@ -305,6 +308,7 @@ impl Default for EngineKnobs {
             disk_dir: String::new(),
             pool_cap_mb: 256,
             index_probe: false,
+            index_gpu: true,
             coverage_probe: false,
             coverage_analyze_at: 0,
             coverage_scheme_probe: false,
@@ -434,6 +438,16 @@ impl EngineKnobs {
     }
 
 
+    /// **索引采集节奏（chunk 数）**：索引 D2H 批不能跟 `recall_every` 一样大 ——
+    /// 暂存块在调和时受保护，r16 会把 256 块钉在池里（90K 实测池耗尽）。
+    /// 上限 4 个 chunk（27B：64 页 = 2 MiB 索引输出），既散开同步点，
+    /// 又保证 `workspace + 64 页` 装得进 2676 页池。
+    pub(crate) fn index_cadence(&self) -> usize {
+        const INDEX_BATCH_CHUNKS_MAX: usize = 4;
+        self.recall_every.max(1).min(INDEX_BATCH_CHUNKS_MAX)
+    }
+
+
     /// **每 turn 工作集的派生(唯一产地)** —— 对外一个 token 数,内部三件:
     /// 工作集页数 / 召回预算(块)/ 准入地板(**页数**,A7 起)。
     ///
@@ -515,7 +529,7 @@ impl EngineKnobs {
             }
         };
         format!(
-            "pool={:?} turns={} snap_max={} host={}M snap_host={}M disk={}M snap_disk={}M dir={:?} prefix_cache={} align_tail={} bnd_stride={} | kvmem={}[idx={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
+            "pool={:?} turns={} snap_max={} host={}M snap_host={}M disk={}M snap_disk={}M dir={:?} prefix_cache={} align_tail={} bnd_stride={} | kvmem={}[idx={} gpu={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
             self.gdn_slots,
             self.snap_max,
@@ -529,6 +543,7 @@ impl EngineKnobs {
             self.snap_decode_stride,
             if self.kvmem_virtualization { "ON" } else { "off" },
             self.index_probe as u8,
+            self.index_gpu as u8,
             self.coverage_probe as u8,
             self.select_decode as u8,
             self.select_partial as u8,
@@ -622,6 +637,7 @@ impl EngineKnobs {
             // ⚠️ `index` **蕴含于 `select_decode`**(打分的前置件;少了它
             // 选择层无从算分)—— 这条只是在旋钮上取并,不是第二个配置项。
             index_probe: cfg.kvmem.index || cfg.kvmem.select_decode,
+            index_gpu: cfg.kvmem.index_gpu,
             coverage_probe: cfg.kvmem.coverage_probe,
             coverage_analyze_at: cfg.kvmem.analyze_at_ctx,
             // 诊断面的两个 env 旋钮在**入口**一次性收编(引擎内部零 env 读取)
@@ -1541,10 +1557,18 @@ fn boot_pool_floor(
     // chunk 增量页 / 每 turn 页 / 并发下限(与下面的池校验**同一批数**)
     let keep_pages = cfg.knobs.select_sink + cfg.knobs.select_recent;
     let chunk_pages = cfg.prefill_chunk.div_ceil(pool.geom.page.max(1)).max(1);
-    // `recall_every > 1` 时，召回点之间视图尾部最多长 `recall_every` 个
-    // chunk（选择集冻结，尾部持续追加）⇒ 池下限必须留这段尾部。
-    let recall_tail_pages = chunk_pages * cfg.knobs.recall_every.max(1);
-    let per_turn = ws_pages.max(1) + recall_tail_pages;
+    // **驻留尾预算 = max(视图尾, 索引暂存尾)**：
+    // - 生产档（`coverage_probe=false`）视图只在**末边界**装配 ⇒ 视图尾 1 chunk；
+    // - 索引暂存不能跟着 `recall_every` 长大（r16 会把 256 块钉在池里）⇒
+    //   `index_cadence` 上限 4 chunk；这些块在调和 keep 里受保护。
+    let view_tail_pages = if cfg.knobs.coverage_probe {
+        chunk_pages * cfg.knobs.recall_every.max(1)
+    } else {
+        chunk_pages
+    };
+    let index_tail_pages = chunk_pages * cfg.knobs.index_cadence();
+    let resident_tail_pages = view_tail_pages.max(index_tail_pages);
+    let per_turn = ws_pages.max(1) + resident_tail_pages;
     let n_active = cfg.knobs.gdn_slots.max(1);
     let need = per_turn * n_active;
     let vm_on = cfg.knobs.kvmem_virtualization;
@@ -1565,7 +1589,7 @@ fn boot_pool_floor(
         "turn-ws",
         "每 turn 工作集 = {} tok = {} 页 = {} KiB(页 {} tok / {} KiB)⇒ \
          常驻 {} 块 = 保底 sink {} + recent {} + 召回 top-k {};准入地板 = {};\
-         池下限 = {} 并发 × (工作集 {} + 召回间隔尾 {} 页 = {} 页) = {} 页(池 {} 页){}\
+         池下限 = {} 并发 × (工作集 {} + 驻留尾 {} 页[视图 {} / 索引 {}] = {} 页) = {} 页(池 {} 页){}\
          (改工作集只动 `[kvmem].workspace_per_req`;`select_blocks` 是派生量)",
         cfg.knobs.workspace_per_req,
         ws_pages,
@@ -1579,7 +1603,9 @@ fn boot_pool_floor(
         floor_desc,
         n_active,
         ws_pages,
-        recall_tail_pages,
+        resident_tail_pages,
+        view_tail_pages,
+        index_tail_pages,
         per_turn,
         need,
         pool.geom.nb,

@@ -212,6 +212,12 @@ pub(crate) struct SelectRuntime {
     partial: PartialStats,
     /// B 轴相位账(纯计时,零语义)
     prof: BAxisProfile,
+    /// **廉价边界暂存的索引采集项**(`(内容身份, 逻辑块, 物理页)`)。
+    ///
+    /// `recall_every > 1` 时廉价边界不完整召回，索引也不必每次同步 D2H；
+    /// 只把身份/页号攒着，到下一次完整召回前一次补齐。暂存块在调和时
+    /// **受保护**(不沉走) ⇒ 物理页在本轮内仍有效。
+    index_pending: Vec<(ChainHash, usize, usize)>,
 }
 
 /// **stage-in 来源**(块数拆分;两者互斥记账)。
@@ -241,6 +247,31 @@ impl SelectRuntime {
     /// 清视图(turn 收口:视图是 turn 域资源,留着 = 用旧视图读新会话)。
     pub(crate) fn clear_view(&mut self) {
         self.view = None;
+    }
+
+    // ── 索引采集暂存(廉价边界不 D2H;完整召回前补齐)──────────────────
+
+    /// 暂存本边界的索引采集项(物理页在本轮内受调和保护)。
+    pub(crate) fn push_index_pending(
+        &mut self,
+        items: impl IntoIterator<Item = (ChainHash, usize, usize)>,
+    ) {
+        self.index_pending.extend(items);
+    }
+
+    /// 取走全部暂存项(完整召回前一次采集)。
+    pub(crate) fn take_index_pending(&mut self) -> Vec<(ChainHash, usize, usize)> {
+        std::mem::take(&mut self.index_pending)
+    }
+
+    /// 暂存块数(turn 收口排空判据/诊断)。
+    pub(crate) fn pending_index_len(&self) -> usize {
+        self.index_pending.len()
+    }
+
+    /// 暂存块身份(调和保护面:这些块还没采索引,不许沉走)。
+    pub(crate) fn pending_index_hashes(&self) -> impl Iterator<Item = ChainHash> + '_ {
+        self.index_pending.iter().map(|(h, _, _)| *h)
     }
 
     pub(crate) fn note_view_step(&mut self) {

@@ -410,6 +410,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         tail,
                         owl_store::SnapDurability::Transient,
                         true,
+                        true,
                     )
                     .await?;
                     owl_shared::log_debug!("spec-round", "边界:snap_tail 完");
@@ -1333,6 +1334,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         sid: u64,
         fed: usize,
         snap_keep: bool,
+        index_now: bool,
     ) -> Result<()> {
         // **前缀段**(prefill chunk 边界)专用:prompt 页边界有跨会话共享价值
         // ⇒ Durable(可下沉宿主)。生成段边界另走
@@ -1349,6 +1351,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             &[],
             owl_store::SnapDurability::Durable,
             snap_keep,
+            index_now,
         )
         .await
     }
@@ -1365,6 +1368,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         tail: &[u32],
         durability: owl_store::SnapDurability,
         snap_keep: bool,
+        index_now: bool,
     ) -> Result<()> {
         // 快照面开关(只门住第 ④ 步;前三步照走)。
         //
@@ -1535,7 +1539,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 }
                 todo.push((*hash, *blk, phys as usize));
             }
-            self.collect_index_for_blocks(&todo).await?;
+            if index_now {
+                // 完整召回前一次补齐：把廉价边界攒下的项一起送进一次 D2H。
+                let mut all = self.sel.take_index_pending();
+                all.append(&mut todo);
+                self.collect_index_for_blocks(&all).await?;
+            } else {
+                // 廉价边界：只记身份/页号，不触发 D2H（块在调和时受保护）。
+                self.sel.push_index_pending(todo);
+            }
         }
         if self.boot.probes.vram_dbg {
             let idx_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
@@ -1544,6 +1556,202 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 "fed={fed} 快照段 {snap_ms:.0}ms(含链/槽/拷贝/登记)· 增量登记 {:.0}ms · 索引 {:.0}ms",
                 reg_ms - snap_ms,
                 idx_ms - reg_ms
+            );
+        }
+        Ok(())
+    }
+
+    /// **B-0 索引采集（GPU 版；2026-10-23）**。
+    ///
+    /// 池内 K **不回读**：逐块 × 逐层发射 `owl_mean_k_block_{f16,fp8}`，
+    /// 核内完成逆 RoPE + page 个 token 的 Mean-K 归约；D2H 只有
+    /// `[blocks][layers][hkv][hd]` f16（27B 几何 = 32 KiB/块）。
+    ///
+    /// 辅助面（物理页号 + cos/sin）打成一个 U8 块一次上传，再用
+    /// `BlockSlice` 切给核；输出块最后登记为 `out`（槽序契约 4）。
+    async fn collect_index_gpu(
+        &mut self,
+        todo: &[&(owl_store::ChainHash, usize, usize)],
+        dim: usize,
+        layers: usize,
+        kv_heads: usize,
+    ) -> Result<()> {
+        let page = self.dev.pool.geom.page;
+        let (hkv, hd) = (self.dev.pool.geom.dims.hkv, self.dev.pool.geom.dims.hd);
+        let half = self.dev.boot.rope.rotary_dim() / 2;
+        if half == 0 || 2 * half > hd {
+            return Err(ModelError::Msg(format!(
+                "Mean-K 索引：rotary half={half} 与 head_dim={hd} 不自洽"
+            )));
+        }
+        let n = todo.len();
+        let fp8 = self.dev.pool.geom.kv_fp8;
+        let entry = if fp8 { "owl_mean_k_block_fp8" } else { "owl_mean_k_block_f16" };
+        // 池格式与索引几何必须同口径（f16 走 `__half`，bf16 尚未建臂）
+        let per_block_elems = layers * kv_heads * dim;
+        let out_elems = n * per_block_elems;
+        let k_dtype = if fp8 { Dtype::U32 } else { Dtype::F16 };
+        let k_layers: Vec<(u64, Dtype)> = self
+            .dev
+            .pool
+            .kvs()
+            .iter()
+            .take(layers)
+            .map(|kv| {
+                let dt = kv.k_cache.0.dtype;
+                (kv.k_cache.0.id, dt)
+            })
+            .collect();
+        if k_layers.len() != layers {
+            return Err(ModelError::Msg(format!(
+                "Mean-K 索引：池层数 {} ≠ 索引层数 {layers}",
+                k_layers.len()
+            )));
+        }
+        for (id, dt) in &k_layers {
+            if *dt != k_dtype {
+                return Err(ModelError::Msg(format!(
+                    "Mean-K 索引：层块 id={id} dtype={dt:?}，期望 {k_dtype:?}"
+                )));
+            }
+        }
+        let t_index = std::time::Instant::now();
+        // 辅助块 = phys[n] u32 + cos[n*page*half] f32 + sin[n*page*half] f32
+        let phys_bytes = n * 4;
+        let rope_elems = n * page * half;
+        let cos_off = phys_bytes;
+        let sin_off = cos_off + rope_elems * 4;
+        let aux_len = sin_off + rope_elems * 4;
+        let mut aux = Vec::with_capacity(aux_len);
+        for (_, _, phys) in todo {
+            aux.extend_from_slice(&(*phys as u32).to_le_bytes());
+        }
+        let mut sin = Vec::with_capacity(rope_elems * 4);
+        for (_, blk, _) in todo {
+            for t in 0..page {
+                let pos = blk * page + t;
+                let Some((c, s)) = self.dev.boot.rope.cos_sin_at(pos) else {
+                    return Err(ModelError::Msg(format!(
+                        "Mean-K 索引：rope 表不含位置 {pos}（表长 {}）",
+                        self.dev.boot.rope.max_pos()
+                    )));
+                };
+                for v in c {
+                    aux.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in s {
+                    sin.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        aux.extend_from_slice(&sin);
+        let t_upload = std::time::Instant::now();
+        let face = self.dev.graphs.session.face_mut();
+        let aux_b = face
+            .htod(Dtype::U8, &vec![aux_len], &aux, "kvmem.index.aux")
+            .await?;
+        let out_b = match face.alloc_uninit(Dtype::F16, out_elems, "kvmem.index.mean_k").await {
+            Ok(b) => b,
+            Err(e) => {
+                if let Err(fe) = face.free(&[aux_b.id]).await {
+                    return Err(ModelError::Msg(format!(
+                        "Mean-K 索引：输出分配失败 {e}；辅助块释放失败 {fe}"
+                    )));
+                }
+                return Err(e);
+            }
+        };
+        let t_launch = std::time::Instant::now();
+        let src = owl_models::kernel::source(entry).to_string();
+        let launch_res: Result<()> = async {
+            for (layer, (id, dt)) in k_layers.iter().enumerate() {
+                let msg = owl_iface::contract::LaunchMsg {
+                    kernel: owl_iface::contract::KernelSource {
+                        name: entry.to_string(),
+                        source: src.clone(),
+                    },
+                    args: vec![
+                        owl_iface::contract::Arg::block(*id, *dt, 1),
+                        owl_iface::contract::Arg::block_slice(
+                            aux_b.id, cos_off as u64, rope_elems as u64, Dtype::F32, 2,
+                        ),
+                        owl_iface::contract::Arg::block_slice(
+                            aux_b.id, sin_off as u64, rope_elems as u64, Dtype::F32, 2,
+                        ),
+                        owl_iface::contract::Arg::block_slice(
+                            aux_b.id, 0, n as u64, Dtype::U32, 1,
+                        ),
+                        owl_iface::contract::Arg::I32(page as i32),
+                        owl_iface::contract::Arg::I32(hkv as i32),
+                        owl_iface::contract::Arg::I32(hd as i32),
+                        owl_iface::contract::Arg::I32(half as i32),
+                        owl_iface::contract::Arg::I32(layer as i32),
+                        owl_iface::contract::Arg::I32(layers as i32),
+                        owl_iface::contract::Arg::block(out_b.id, Dtype::F16, 2),
+                    ],
+                    grid: (n as u32, hkv as u32, 1),
+                    block: (hd as u32, 1, 1),
+                    shared_mem: 0,
+                    out_elems,
+                };
+                let got = face.launch(msg).await?;
+                if got.id != out_b.id {
+                    return Err(ModelError::Msg(format!(
+                        "Mean-K 索引：发射回执输出块 {} ≠ 预期 {}",
+                        got.id, out_b.id
+                    )));
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let t_dtoh = std::time::Instant::now();
+        let dtoh_res = match launch_res {
+            Ok(()) => {
+                let mut bytes = vec![0u8; out_elems * 2];
+                face.dtoh(&out_b, &mut bytes).await.map(|()| bytes)
+            }
+            Err(e) => Err(e),
+        };
+        let free_res = face.free(&[aux_b.id, out_b.id]).await;
+        let bytes = match (dtoh_res, free_res) {
+            (Ok(b), Ok(())) => b,
+            (Ok(_), Err(fe)) => return Err(fe),
+            (Err(e), Ok(())) => return Err(e),
+            (Err(e), Err(fe)) => {
+                return Err(ModelError::Msg(format!(
+                    "Mean-K 索引：采集失败 {e}；且 scratch 释放失败 {fe}"
+                )))
+            }
+        };
+        if bytes.len() != out_elems * 2 {
+            return Err(ModelError::Msg(format!(
+                "Mean-K 索引：回读 {}B ≠ {out_elems}×2B",
+                bytes.len()
+            )));
+        }
+        let t_reg = std::time::Instant::now();
+        let mut off = 0usize;
+        for (hash, _, _) in todo {
+            let end = off + per_block_elems * 2;
+            let flat: Vec<u16> = bytes[off..end]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            self.bank.rel.index_register_flat(*hash, flat)?;
+            off = end;
+        }
+        let el = t_index.elapsed().as_secs_f64() * 1000.0;
+        self.sel.note_index(el);
+        if self.boot.probes.idx_dbg {
+            let upload_ms = t_launch.duration_since(t_upload).as_secs_f64() * 1000.0;
+            let launch_ms = t_dtoh.duration_since(t_launch).as_secs_f64() * 1000.0;
+            let dtoh_ms = t_reg.duration_since(t_dtoh).as_secs_f64() * 1000.0;
+            let reg_ms = t_reg.elapsed().as_secs_f64() * 1000.0;
+            owl_shared::log_debug!(
+                "idx",
+                "GPU 批 {} 块 / {layers} 层：总 {el:.1}ms = 上传 {upload_ms:.1} + 发射 {launch_ms:.1} + D2H {dtoh_ms:.1} + 登记 {reg_ms:.1}",
+                n
             );
         }
         Ok(())
@@ -1589,6 +1797,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .collect();
         if todo.is_empty() {
             return Ok(());
+        }
+        if self.boot.cfg.knobs.index_gpu {
+            return self.collect_index_gpu(&todo, dim, layers, kv_heads).await;
         }
         let t_index = std::time::Instant::now();
         let page_bytes = fmt.page_bytes(page, hkv, hd);

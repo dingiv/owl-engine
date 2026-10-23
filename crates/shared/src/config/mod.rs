@@ -99,7 +99,7 @@
 //! | spec | depth | usize / 0;上限 = `SPEC_DEPTH_MAX` = 7(超限拒启) |
 //! | dispatch | allowed_ops | **已退役**(旧键 `deny_unknown_fields` 拒启;准入走 tag filter) |
 //! | dispatch | tag_wildcard | bool / false(诊断 `*`:跳过 tag 过滤) |
-//! | kvmem | select_decode / select_partial / index / pool_overcommit | flag / false(overcommit = 四键全开) |
+//! | kvmem | select_decode / select_partial / index / index_gpu / pool_overcommit | flag / false、true(index_gpu 缺省 true) |
 //! | kvmem | workspace_per_req / select_sink / select_recent / recall_every | usize / 2240、2、4、1 |
 //! | kvmem | coverage_probe / analyze_at_ctx / evict_policy / dense_floor_mib | 见字段注(lru\|lrfu[:λ]) |
 //! | probes | step_profile / perf_level / gdn_dump / debug / prefill_cksum / fact_probe | flag / false |
@@ -717,6 +717,11 @@ pub struct KvmemCfg {
     pub select_partial: bool,
     /// **索引采集**(打分的前置件;`select_decode` 蕴含它,单独开无意义)。
     pub index: bool,
+    /// **索引采集走设备块级 Mean-K 归约**(缺省 `true`)。
+    ///
+    /// `true` = 池内 K 不回读，GPU 逐块算逆 RoPE 均值，只 D2H 32 KiB/块；
+    /// `false` = 旧 host 路径（整页 K D2H + host 逆 RoPE），保留作 golden/排障。
+    pub index_gpu: bool,
     /// **每 turn 工作集(对外口径;`token` 数)** —— 一个**活跃 turn** 在设备 KV
     /// 池里最多**常驻**多少 KV(含 `select_sink` / `select_recent` 保底)。
     ///
@@ -1557,6 +1562,7 @@ impl Default for KvmemCfg {
             select_decode: false,
             select_partial: false,
             index: false,
+            index_gpu: true,
             // 2240 tok = 70 页 × 32 tok = 保底 6 + 召回 64 块(与旧 `select_blocks=64` 等值)
             workspace_per_req: 2240,
             // 0 = verify 与 decode 同视图(旧行为,逐位不变)

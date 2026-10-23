@@ -145,6 +145,23 @@ impl MeanKIndex {
         for e in entries {
             flat.extend_from_slice(&e.k_bar);
         }
+        self.register_flat(block, flat)
+    }
+
+    /// **扁平段登记**(GPU Mean-K 出口;`[layer][kv_head][dim]` 规范序)。
+    ///
+    /// 与 [`Self::register`] 同账同语义，只是免去 N×hkv×dim 个 `MeanKEntry`
+    /// 的逐条堆分配：调用方（设备核回读）保证段长 = `层×头×dim` 且行序
+    /// 为规范序。段长不符 = 响亮拒，不静默截断。
+    pub fn register_flat(&mut self, block: ChainHash, flat: Vec<u16>) -> StoreResult<()> {
+        let want = self.entries_per_block() * self.dim;
+        if flat.len() != want {
+            return Err(StoreError::Invariant(format!(
+                "扁平索引段长不符:{} ≠ 层×头×dim {}",
+                flat.len(),
+                want
+            )));
+        }
         self.tick += 1;
         let tick = self.tick;
         match self.blocks.get_mut(&block) {
@@ -1333,6 +1350,20 @@ mod tests {
 
     fn entry(layer: u16, kv_head: u16, v: [f32; 2]) -> MeanKEntry {
         MeanKEntry { layer, kv_head, k_bar: v.iter().map(|x| f32_to_f16(*x)).collect() }
+    }
+
+    /// **GPU Mean-K 出口**:扁平段与逐条 `register` 同账同形状；段长错 = 响亮拒。
+    #[test]
+    fn register_flat_matches_register() {
+        let mut a = idx();
+        let mut b = idx();
+        let h = ChainHash::new(7);
+        let entries = vec![entry(0, 0, [1.0, 2.0]), entry(0, 1, [3.0, 4.0])];
+        let flat: Vec<u16> = entries.iter().flat_map(|e| e.k_bar.iter().copied()).collect();
+        a.register(h, entries).expect("逐条");
+        b.register_flat(h, flat).expect("扁平");
+        assert_eq!(a.block_k_bar(h), b.block_k_bar(h));
+        assert!(b.register_flat(ChainHash::new(8), vec![0; 3]).is_err());
     }
 
     #[test]
