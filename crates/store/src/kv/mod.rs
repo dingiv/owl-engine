@@ -282,6 +282,73 @@ impl KvStore {
         m
     }
 
+    /// **可整枝塌缩的块数**(纯读;见 [`crate::kv::tree::PrefixTree::collapsible_span`])。
+    ///
+    /// 计划器据此给 Drop 票定 `span`(一次塌一整条"无兄弟"的尾巴,直到分叉点)。
+    pub fn collapsible_span(&self, tail: ChainHash) -> usize {
+        self.tree.collapsible_span(tail)
+    }
+
+    /// **整枝塌缩**(批量过期;从 `tail` 往上,最多 `max_blocks`)。
+    ///
+    /// 每一步都要求:①仍是叶(有子即停,结构律不破);②槽引用 == 1(活跃会话
+    /// 持有的块**不 evict** —— 停);③条目在树。返回**实际丢掉的块数**。
+    ///
+    /// 为什么必须成批:逐块命令在长枝上要 O(深度) 个调度轮(实测 8 块枝一轮只
+    /// 出 1 张票);成批之后 = 一次调用(与"整链下沉/搬盘"的 `span` 语义对齐)。
+    pub fn prune_branch(&mut self, tail: ChainHash, max_blocks: usize) -> StoreResult<usize> {
+        let mut dropped = 0usize;
+        let mut cur = Some(tail);
+        while dropped < max_blocks {
+            let Some(h) = cur else { break };
+            let Some(e) = self.tree.get(h) else { break };
+            if e.children > 0 {
+                break; // 非叶(不该发生:调用方从叶起,逐一块后父才成叶)
+            }
+            if let Some(slot) = e.slot {
+                if self.pool.refs(slot) != 1 {
+                    break; // 活跃面:只逐缓存独占块
+                }
+            }
+            let parent = e.parent;
+            if !self.drop_chain(h)? {
+                break;
+            }
+            dropped += 1;
+            // 下一块 = 父(逐掉它唯一的子之后,父才是叶)
+            cur = match parent {
+                Some(p) if self.tree.get(p).map(|x| x.children) == Some(0) => Some(p),
+                _ => None,
+            };
+        }
+        Ok(dropped)
+    }
+
+    /// **废弃一条链身份**(前缀无感删除:原地重转之后,旧身份的 K 不再成立)。
+    ///
+    /// 为什么必须显式废:内容树的条目是"槽里存的就是这串 token 的 K"的承诺;
+    /// 删中段后我们把后缀页的 K **原地重转**了 ⇒ 旧身份的条目已失真。若留着,
+    /// 别的会话按旧 token 命中同一批槽 ⇒ 读到旋转过的 K(**静默错值**;实测
+    /// 0.8B 连开两会话直接 NaN)。
+    ///
+    /// 语义边界:
+    /// - **只掉树里的绑定引用**(`slot` 有值 ⇒ `decref`);调用方须已给这些槽
+    ///   加了**自己的**会话引用,否则引用归零 = 槽被回收;
+    /// - 宿主副本由 `Rel::drop_chain` 一并丢(内容已不成立);
+    /// - 不碰槽内容(那是调用方的事);不在树 = `false`(幂等)。
+    pub fn drop_chain(&mut self, chain: ChainHash) -> StoreResult<bool> {
+        match self.tree.remove(chain) {
+            Some(slot) => {
+                if let Some(slot) = slot {
+                    self.pool.decref(slot)?;
+                }
+                self.evicted += 1;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// 登记一条链的前缀(**整块才登记**;`table` = 该会话的逻辑块 → 槽)。
     ///
     /// 新进树的条目 ⇒ 缓存持一份绑定引用(`incref`);被容量逐出的条目 ⇒

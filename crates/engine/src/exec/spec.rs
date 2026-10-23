@@ -22,6 +22,15 @@ struct VerifyViewTables {
 }
 
 const SPEC_ADAPTIVE_WARMUP_ROUNDS: u32 = 8;
+/// 本轮 target live 草稿数 P：预算 rem 个 token 时最多 P+1 个提交行。
+/// rem=1 ⇒ P=0（裸 decode，调用方不应发 spec）；rem>=2 ⇒ P=min(K, rem-1)。
+fn live_depth_for_budget(depth: usize, remaining: usize) -> usize {
+    if remaining <= 1 {
+        0
+    } else {
+        depth.min(remaining - 1)
+    }
+}
 /// 纯函数（单测锚）：滚动 tokens/round 是否低于降档门。
 fn adaptive_should_downshift(rounds: u32, tokens: u32, min_tpr: f32) -> bool {
     rounds >= SPEC_ADAPTIVE_WARMUP_ROUNDS && (tokens as f32 / rounds as f32) < min_tpr
@@ -37,7 +46,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         &mut self,
         token: u32,
         pos: usize,
-        _kv_slots: [u32; 9],
+        _kv_slots: [u32; owl_shared::config::SPEC_VERIFY_ROWS_MAX + 1],
         gdn_slot: usize,
         grew: bool,
         depth: usize,
@@ -80,6 +89,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // prefill seed propose(eager);Dumb = anchor 重复)
         let (drafts, t_drafts) = self.acquire_drafts(token, pos, depth).await?;
         t_propose += t_drafts;
+        // proposal q 与草稿同轮产出；lookup 改写后 reconcile 成 one-hot。
+        let mut proposal_q = self.tspec()?.spec_q_host.take();
+        if let Some(q) = proposal_q.as_mut() {
+            let _ = q.reconcile(&drafts);
+            mcnt("spec.q.round", 1);
+        } else {
+            mcnt("spec.q.none", 1);
+        }
+        // target live = P+1：proposal 仍满 W=K+1；预算不足时 target 的
+        // GDN/FI 只算前 P+1 行（verify_round 的 target_rows），也只提交这些行。
+        let live = {
+            let act = self.turns.active()?;
+            let rem = act.max_new.saturating_sub(act.out.len());
+            live_depth_for_budget(depth, rem)
+        };
+        if live < depth {
+            mcnt("spec.tail.cap", 1);
+        }
 
         // ③ verify 块 [anchor, d1..dk] @ pos..pos+depth:图态(一次 replay
         // + fold 记录)或 eager fallback(旧 verify_forward)。fold 记录
@@ -105,7 +132,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let xqa_pt_v = self.xqa_pt_of(sid);
 
         let (ids, hidden, records, hidden_owned, row_logits, t_v) = self
-            .verify_round(&block, pos, gdn_slot, sampler_on, vlm_delta, &xqa_pt_v, sid, depth)
+            .verify_round(
+                &block,
+                pos,
+                gdn_slot,
+                sampler_on,
+                vlm_delta,
+                &xqa_pt_v,
+                sid,
+                depth,
+                live + 1,
+            )
             .await?;
         t_verify = t_v;
         if prof {
@@ -130,24 +167,45 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     vocab
                 )));
             }
-            let mut s: Vec<u32> = Vec::with_capacity(rows_n);
-            let mut scratch: Vec<f32> = Vec::with_capacity(vocab);
-            for i in 0..rows_n {
-                scratch.clear();
-                scratch.extend_from_slice(&lg[i * vocab..(i + 1) * vocab]);
-                // RNG:与裸 decode 同构(位置定序 ⇒ 可复现;不用轮内计数,
-                // 免得降级态换路后抽点错位)
-                let mut rng =
-                    seed_base ^ ((pos + i) as u64).wrapping_mul(0xBF58476D1CE4E5B9);
-                let tok = crate::sampler::sample(&mut scratch, &sampler_cfg, &mut rng, &hist);
-                s.push(tok);
-                hist.push(tok); // 已发出的 token 进惩罚集(与逐 token 解码同语义)
+            if let Some(q) = proposal_q.as_ref() {
+                // NInfer 路线：min(1,p/q) 接受；拒绝时从 max(p-q,0) 抽 correction。
+                let (m, emitted, bonus) = super::proposal_q::accept_rejection(
+                    lg,
+                    vocab,
+                    live + 1,
+                    &drafts[..live],
+                    live,
+                    q,
+                    &sampler_cfg,
+                    &mut hist,
+                    seed_base,
+                    pos,
+                )?;
+                if m < live {
+                    mcnt("spec.reject", 1);
+                }
+                (m, emitted, bonus)
+            } else {
+                // 非 DFlash2（MTP/Dumb）：旧「目标抽样 == draft」等价式。
+                let mut s: Vec<u32> = Vec::with_capacity(live + 1);
+                let mut scratch: Vec<f32> = Vec::with_capacity(vocab);
+                for i in 0..=live {
+                    scratch.clear();
+                    scratch.extend_from_slice(&lg[i * vocab..(i + 1) * vocab]);
+                    // RNG:与裸 decode 同构(位置定序 ⇒ 可复现;不用轮内计数,
+                    // 免得降级态换路后抽点错位)
+                    let mut rng =
+                        seed_base ^ ((pos + i) as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+                    let tok = crate::sampler::sample(&mut scratch, &sampler_cfg, &mut rng, &hist);
+                    s.push(tok);
+                    hist.push(tok); // 已发出的 token 进惩罚集(与逐 token 解码同语义)
+                }
+                let m = spec_sampled_accept_prefix(&drafts[..live], &s[..live]);
+                (m, s[..=m].to_vec(), s[m])
             }
-            let m = spec_sampled_accept_prefix(&drafts, &s[..depth]);
-            (m, s[..=m].to_vec(), s[m])
         } else {
-            // **argmax/greedy 路**:直接拿 verify 行的 ids 比(drafts[i] == ids[i])
-            let m = (0..depth).take_while(|&i| drafts[i] == ids[i]).count();
+            // **argmax/greedy 路**:只比 target live 前 P 个 draft
+            let m = (0..live).take_while(|&i| drafts[i] == ids[i]).count();
             (m, ids[..=m].to_vec(), ids[m])
         };
         // **AL 计数提到分支外**(2026-10-19 修):两条路(采样/argmax)都要记 ——
@@ -378,7 +436,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 记录齐 = 可折(图态桶 / eager fold_tree 两路都吃记录);
             // 不齐 = 旧"前缀重放"(整模前向)唯一可行路, 该档不做轮内边界快照
             let foldable =
-                records.len() == self.dev.pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX;
+                records.len() == self.dev.pool.gdn_count() * owl_shared::config::SPEC_FOLD_RECORDS_PER_LAYER;
             if foldable {
                 // **消费方门**(2026-10-19,同 prefill 的 `snap_on` 判据):轮内页边界
                 // 快照的唯一消费者 = **前缀复用**(`restore_snap` 只在 prefix 命中时调);
@@ -490,6 +548,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ⑦ extend + propose(同迭代消费 verify hidden;产出下轮草稿
         // host 账)。DFlash2 = encode + 噪声块 propose;图态 = 桶 m 一发
         // (MTP);eager fallback = propose_round(MTP)。
+        // **预算尽则不再 propose**:tail 轮的 target 只算到 live 行，
+        // 未算的 tap 行不能给下一轮满 W 草稿；此轮已是末轮，直接省掉。
+        let round_done = {
+            let act = self.turns.active()?;
+            act.out.len().saturating_add(toks.len()) >= act.max_new
+        };
+        if !round_done {
+        // DFlash2 lookup 草稿:历史 = prompt_ids + out(含当前 token)
+        // + 本轮 verify 块 `toks`(ids[0..=m];末位 bonus 是下一轮 anchor)。
+        let lookup = self.dflash_lookup_for_tail(&toks)?;
         let d2_arc7 = match self.dev.spec_rt.drafter.as_ref() {
             Some(crate::spec_runtime::Drafter::DFlash2(d)) => Some(std::sync::Arc::clone(d)),
             _ => None,
@@ -499,7 +567,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // E5-DF4:图态优先(单图一轮 encode+propose;eager 回退 =
             // OWL_DFLASH_EAGER=1 或图降级)
             if self.dev.graphs.dflash.is_some() && !self.boot.probes.dflash_eager {
-                let d = self.dflash_graph_round(m, pos, toks[m]).await?;
+                let d = self
+                    .dflash_graph_round(m, pos, toks[m], lookup.as_ref())
+                    .await?;
                 t_propose += ts.elapsed();
                 self.tspec()?.spec_drafts_host = Some(d);
             } else {
@@ -522,7 +592,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             let fp = pos + m + 1;
             let bonus = toks[m];
-            let d = self.dflash_propose(bonus, fp).await?;
+            let d = self.dflash_propose(bonus, fp, lookup.as_ref()).await?;
             if self.boot.probes.dflash_probe && self.dev.spec_rt.stats.rounds < 3 {
                 let toks_txt = self.boot.tok.decode(&d);
                 owl_shared::log_debug!("dflash-probe", "pos={fp} bonus={bonus} drafts={d:?} txt={toks_txt:?}");
@@ -551,6 +621,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
                     .collect(),
             );
+        }
+        } else {
+            self.tspec()?.spec_drafts_host = None;
+            mcnt("spec.propose.skip", 1);
         }
         if hidden_owned {
             // eager 路的 hidden = 竞技场根块,收割后归池;图态 = 图输出槽
@@ -618,7 +692,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         if t_rollback > std::time::Duration::ZERO {
             let tag = if records.len()
-                == self.dev.pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX
+                == self.dev.pool.gdn_count() * owl_shared::config::SPEC_FOLD_RECORDS_PER_LAYER
             {
                 "spec.fold"
             } else {
@@ -701,7 +775,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .iter()
             .enumerate()
             .map(|(i, b)| {
-                let shape = match i % 8 {
+                let shape = match i % owl_shared::config::SPEC_FOLD_RECORDS_PER_LAYER {
                     0 | 1 => vec![m1, key_dim],
                     2 => vec![m1, value_dim],
                     3 | 4 => vec![m1, d.nk, d.hk],
@@ -947,6 +1021,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         xqa_pt_v: &[f32],
         sid: u64,
         depth: usize,
+        target_rows: usize,
     ) -> Result<(
         Vec<u32>,
         owl_iface::contract::Bytes,
@@ -971,6 +1046,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (ids, hidden, records, hidden_owned, row_logits) =
         if self.dev.graphs.verify_of(depth).is_some() {
             let vg = self.dev.graphs.verify_mut(depth)?;
+        let target_rows = target_rows.clamp(1, block.len());
         let ts = std::time::Instant::now();
         let bt_chain = {
             let s = self.bank.sessions.session(sid)?;
@@ -1013,7 +1089,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ⚠️ 必须用 **session face**(池块的账房;verify 图 face 是另一份
         // 账本 → 传别家的块 id = 打到别的块上 → `pump: DeadBlock` 实测踩过)
         // XQA seq_lens = **整请求总 KV 长**(含块内 depth+1 个位置;u32 位型走私)
-        let xqa_seq_v = [f32::from_bits((pos + block.len()) as u32)];
+        let xqa_seq_v = [f32::from_bits((pos + target_rows) as u32)];
         // semaphores 每轮写零(图输入槽;KV-split 归约计数)。
         // `.max(1)` 与声明端同式 —— "无 XQA 面"时槽仍存在(= 1 元素),
         // 避免零长写(挂账 #7)。
@@ -1022,7 +1098,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ① 宿主标量槽 `ctx_total`(= 本轮 kv 总长;plan 的 key)
         // ② 表四件套(q_cu/indices/indptr/last_len;u32 位型过线)
         let page_fi = self.dev.pool.geom.page;
-        let ctx_total_fi = pos + block.len();
+        let ctx_total_fi = pos + target_rows;
         // 门 = **槽在场**(槽属于**图**;判"某核在场"必须看节点/槽,不看旋钮)
         // 槽恒在 verify 图里声明(拓扑恒常);真正的“FI 臂是否消费”看单值臂。
         // **必须把槽在场与臂在场分开**:v2 档槽也在,但表不能按会话链铺
@@ -1051,7 +1127,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     idx[i] = f32::from_bits(*b);
                 }
                 (
-                    vec![0.0, f32::from_bits(block.len() as u32)],
+                    vec![0.0, f32::from_bits(target_rows as u32)],
                     idx,
                     vec![0.0, f32::from_bits(nb_used as u32)],
                     vec![f32::from_bits((ctx_total_fi - (nb_used - 1) * page_fi) as u32)],
@@ -1060,12 +1136,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             };
         let gdn_slot_v1 = [gdn_slot as f32];
+        let gdn_cu_v = [0.0f32, target_rows as f32];
         let mut ins: Vec<(&str, &[f32])> = vec![
             ("ids", ids_f.as_slice()),
             ("pos", pos_f.as_slice()),
             ("kv_slots", slots_f.as_slice()),
             ("kv_lens", lens_f.as_slice()),
             ("gdn_slot", gdn_slot_v1.as_slice()),
+            ("gdn_cu", gdn_cu_v.as_slice()),
             ("bt8", bt8_f.as_slice()),
             ("xqa_seq", xqa_seq_v.as_slice()),
             ("xqa_sem", xqa_sem_v.as_slice()),
@@ -1089,7 +1167,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 与草稿无关,卡点就在这一句)。单卡档 = 原路(零分支)。
         // FI 表两 rank 各自的图都要刷 ⇒ 规格传进 `verify_dev`。
         let fi_spec = if self.boot.cfg.knobs.fi_plan_bake.is_some() && fi_slots_on {
-            Some(self.dev.pool.fi_plan_spec(block.len(), ctx_total_fi))
+            Some(self.dev.pool.fi_plan_spec(target_rows, ctx_total_fi))
         } else {
             None
         };
@@ -1191,7 +1269,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             tok_f.iter().map(|&v| v as u32).collect()
         };
         let hidden = vg.output_block("hid").ok_or_else(|| ModelError::EngineInvariant { what: "verify 图输出槽 hid 缺席(图装配与声明不一致)".into() })?;
-        let n_rec = self.dev.pool.gdn_count() * owl_shared::config::SPEC_VERIFY_ROWS_MAX;
+        let n_rec = self.dev.pool.gdn_count() * owl_shared::config::SPEC_FOLD_RECORDS_PER_LAYER;
         let records: Vec<Bytes> = (0..n_rec)
             .map(|i| {
                 vg.output_block(&format!("r{i}")).ok_or_else(|| ModelError::EngineInvariant {
@@ -1260,7 +1338,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             self.dev.spec_rt.drafter.as_ref()
         {
             let ts = std::time::Instant::now();
-            let mut d = self.dflash_propose(token, pos).await?;
+            let lookup = self.dflash_lookup_for_tail(&[])?;
+            let mut d = self
+                .dflash_propose(token, pos, lookup.as_ref())
+                .await?;
             d.truncate(depth); // depth ≤ 7(草稿恒 7 产;T 图定形 depth+1)
             spent = ts.elapsed();
             d
@@ -2192,5 +2273,21 @@ mod adaptive_tests {
         // 4.0 早降门
         assert!(adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS, 28, 4.0));
         assert!(!adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS, 36, 4.0));
+    }
+}
+
+
+#[cfg(test)]
+mod live_depth_tests {
+    use super::live_depth_for_budget;
+
+    #[test]
+    fn cap_reserves_bonus_slot() {
+        assert_eq!(live_depth_for_budget(15, 0), 0);
+        assert_eq!(live_depth_for_budget(15, 1), 0);
+        assert_eq!(live_depth_for_budget(15, 2), 1);
+        assert_eq!(live_depth_for_budget(15, 8), 7);
+        assert_eq!(live_depth_for_budget(15, 16), 15);
+        assert_eq!(live_depth_for_budget(7, 100), 7);
     }
 }

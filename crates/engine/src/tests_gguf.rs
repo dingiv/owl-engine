@@ -863,7 +863,7 @@ async fn gpu_gguf_4b_vlm_image_smoke() {
         "<|image_pad|>".repeat(l_img)
     );
     let (_, t) = running
-        .submit_session_opts(Some(2), prompt.as_str(), 8, TurnOpts { images: vec![img], ..Default::default() })
+        .submit_session_opts(Some(2), prompt.as_str(), 8, TurnOpts { images: vec![img.into()], ..Default::default() })
         .expect("image submit");
     let mut text = String::new();
     loop {
@@ -925,7 +925,7 @@ async fn gpu_gguf_27b_vlm_image_smoke() {
         "<|image_pad|>".repeat(l_img)
     );
     let (_, t) = running
-        .submit_session_opts(Some(2), prompt.as_str(), 8, TurnOpts { images: vec![img], ..Default::default() })
+        .submit_session_opts(Some(2), prompt.as_str(), 8, TurnOpts { images: vec![img.into()], ..Default::default() })
         .expect("image submit");
     let mut text = String::new();
     loop {

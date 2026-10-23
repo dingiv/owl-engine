@@ -1,42 +1,7 @@
-# owl 预设档 `qwen38_27b-3080_tp2-w4a16-vlm` —— 2×3080 27B + 视觉 + d7 / 262k 全设备池
+# owl 预设档 `qwen38_27b-3080_tp2-w4a16-vlm` —— 2×3080 27B + 视觉 / **262k**
 #
-# 全量字段继承自 `full.toml`;本文件只写差异。
-extends = ["full.toml"]
-
-[model]
-name = "qwen3.8-27b"
-path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-format = "awq"
-quant = "w4a16"
-head_quant = "rtn-int8-row"
-vision = true
-
-[parallel]
-mode = "tensor"
-tp_ar_f8 = true
-device = ["3080", "3080"]
-tp_vocab_split = true
-tp_ar_fused = true
-
-[runtime]
-max_seq = 262144
-max_concurrency = 1
-
-[spec]
-depth = 7
-draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
-
-[pool]
-kv_fp8 = true
-gdn_slots = 1
-snap_max = 1
-prefix_cache = false
-vram_target = 0.99
-vram_reserve_mb = 256
-
-[kernel]
-# 本档走 piecewise(表由图自携 restore 烘入),不烘单图 plan
-fi_plan_bake = false
-fi_plan_restore = true
-decode_arm = "v2"
-verify_arm = "v2"
+# **2026-10-22 合并**:主档 `qwen38_27b-3080_tp2-w4a16` 已升到 262k + 视觉
+# (`vision = true`)+ FI 单图快档 + 草稿池 ring;本档不再单独维护 int8 头 /
+# 词表切(实测 spec 档负收益)⇒ 只保留 `extends` 作为**兼容名**。
+# 仍需要独立 262k 视觉档的外部引用可以继续用本文件名;内容与主档一致。
+extends = ["qwen38_27b-3080_tp2-w4a16.toml"]

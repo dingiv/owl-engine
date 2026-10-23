@@ -82,6 +82,17 @@ fn fused_entry_dt(dt: Dtype) -> &'static str {
     }
 }
 
+/// payload dtype → **barrier-only AR-2** 发射名(单源同上;2026-10-23)
+fn barrier_entry_dt(dt: Dtype) -> &'static str {
+    use crate::driver::DType as D;
+    match dt {
+        Dtype::F32 => crate::family::comm::barrier_entry(D::F32),
+        Dtype::F16 => crate::family::comm::barrier_entry(D::F16),
+        Dtype::BF16 => crate::family::comm::barrier_entry(D::BF16),
+        other => panic!("comm_ar_barrier: 非法 payload dtype {other:?}(f32/f16/bf16)"),
+    }
+}
+
 /// stage 的 parse 槽名(声明序;F3 成对律 —— `client::tests::
 /// parse_slots_are_exactly_declared` 与 `ops` 的槽序锁双双锁死)
 ///
@@ -225,6 +236,8 @@ pub struct ArFusedCall {
     bytes: u64,
     slot_bytes: u64,
     slab_off: u64,
+    /// **barrier-only AR-2**(2026-10-23):同一 8 槽线格式,只换发射名。
+    barrier: bool,
 }
 
 impl ArFusedCall {
@@ -240,7 +253,13 @@ impl ArFusedCall {
         slot_bytes: u64,
         slab_off: u64,
     ) -> Self {
-        Self { payload, own, peer, data_w, data_r, bytes, slot_bytes, slab_off }
+        Self { payload, own, peer, data_w, data_r, bytes, slot_bytes, slab_off, barrier: false }
+    }
+
+    /// 切到 barrier-only AR-2(同一线格式;只换发射名)。
+    pub fn with_barrier(mut self, barrier: bool) -> Self {
+        self.barrier = barrier;
+        self
     }
 
     /// 反序列化(8 槽;按名取址)
@@ -260,15 +279,21 @@ impl ArFusedCall {
             bytes: s.u64("bytes")?,
             slot_bytes: s.u64("slot_bytes")?,
             slab_off: s.u64("slab_off")?,
+            barrier: false,
         };
         Ok((me, payload))
     }
 
     /// 组装发射消息(几何由 runtime 自持 ⇒ grid/block 全零哨兵)
     pub fn to_launch(&self) -> LaunchMsg {
+        let entry = if self.barrier {
+            barrier_entry_dt(self.payload.dtype)
+        } else {
+            fused_entry_dt(self.payload.dtype)
+        };
         LaunchMsg {
             kernel: crate::contract::KernelSource {
-                name: fused_entry_dt(self.payload.dtype).to_string(),
+                name: entry.to_string(),
                 source: String::new(),
             },
             args: vec![

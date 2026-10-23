@@ -133,6 +133,15 @@ impl ChatRequest {
                                 "messages[{i}].content[{j}]:图像 URL 只支持 data:image/...;base64(暂不支持 http)"
                             ));
                         }
+                        // **可删标记**(前缀无感删除;2026-10-23):只认布尔
+                        // (非布尔 = 协议错,必须在受理前结构化拒,不许静默当真)
+                        if let Some(v) = part.get("owl_evict") {
+                            if !v.is_boolean() && !v.is_null() {
+                                return Err(format!(
+                                    "messages[{i}].content[{j}].owl_evict 必须是布尔值(得 {v})"
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -225,7 +234,12 @@ impl ChatRequest {
     ///
     /// 仅 data URL;`vision_processor` 负责 Qwen2VL 的 resize/patchify。
     /// 无图像 = 空(纯文本逐字节旧行为)。
-    pub fn images(&self) -> Result<Vec<owl_models::vlm::VlmImage>, String> {
+    ///
+    /// **可删标记**(前缀无感删除;2026-10-23 用户裁决):图像 content part 上
+    /// 的 `owl_evict: true` = 「这张图将来可能从历史里被删」。引擎**不自作
+    /// 主张**:只有打了标 + `[pool] image_evict = true` 才补页对齐 pad 并
+    /// 进删除候选;没打标 = 零行为差异。
+    pub fn images(&self) -> Result<Vec<owl_engine::TurnImage>, String> {
         let mut out = Vec::new();
         for (i, m) in self.messages.iter().enumerate() {
             let Some(arr) = m.get("content").and_then(|c| c.as_array()) else {
@@ -245,9 +259,18 @@ impl ChatRequest {
                     .ok_or_else(|| {
                         format!("messages[{i}].content[{j}].image_url.url 缺失或非字符串")
                     })?;
-                let img = crate::vision_processor::from_data_url(url)
+                let image = crate::vision_processor::from_data_url(url)
                     .map_err(|e| format!("messages[{i}].content[{j}] 图像预处理失败: {e}"))?;
-                out.push(img);
+                let evict = match part.get("owl_evict") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(other) => {
+                        return Err(format!(
+                            "messages[{i}].content[{j}].owl_evict 必须是布尔值(得 {other})"
+                        ))
+                    }
+                };
+                out.push(owl_engine::TurnImage { image, evict });
             }
         }
         Ok(out)
@@ -525,7 +548,7 @@ impl Agg {
 /// 把模板里的每个 `<|image_pad|>` 展开成 `grid_h*grid_w/4` 个。
 ///
 /// 顺序 = `images` 序(内容序)。少/多占位 = 400(不许静默错位)。
-fn expand_image_pads(prompt: &str, images: &[owl_models::vlm::VlmImage]) -> Result<String, String> {
+fn expand_image_pads(prompt: &str, images: &[owl_engine::TurnImage]) -> Result<String, String> {
     const PAD: &str = "<|image_pad|>";
     let mut out = String::with_capacity(prompt.len());
     let mut rest = prompt;
@@ -534,7 +557,7 @@ fn expand_image_pads(prompt: &str, images: &[owl_models::vlm::VlmImage]) -> Resu
             .find(PAD)
             .ok_or_else(|| format!("模板缺第 {i} 张图的 <|image_pad|> 占位"))?;
         out.push_str(&rest[..pos]);
-        let n = (img.grid.1 * img.grid.2) / 4;
+        let n = (img.image.grid.1 * img.image.grid.2) / 4;
         for _ in 0..n {
             out.push_str(PAD);
         }
@@ -1311,6 +1334,26 @@ mod tests {
 
     fn req(msgs: Value) -> ChatRequest {
         serde_json::from_value(json!({"messages": msgs})).expect("parse")
+    }
+
+    /// **可删标记只认布尔**(前缀无感删除):非布尔 = 400,不许静默当真/当假
+    #[test]
+    fn owl_evict_must_be_bool() {
+        let base = json!({"role":"user","content":[
+            {"type":"text","text":"hi"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
+        ]});
+        let plain = req(json!([base.clone()]));
+        assert!(plain.validate().is_ok(), "无标记应通过");
+        let mut with_flag = base.clone();
+        with_flag["content"][1]["owl_evict"] = json!(true);
+        let flagged = req(json!([with_flag]));
+        assert!(flagged.validate().is_ok(), "布尔标记应通过");
+        let mut bad = base.clone();
+        bad["content"][1]["owl_evict"] = json!("yes");
+        let bad = req(json!([bad]));
+        let e = bad.validate().expect_err("非布尔必须结构化拒");
+        assert!(e.contains("owl_evict"), "错误必须点名字段(得 {e})");
     }
 
     /// vLLM 同款:字符串 arguments → 对象;dict/array 原样;空串 → {}

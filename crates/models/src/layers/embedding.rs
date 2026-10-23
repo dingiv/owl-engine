@@ -45,6 +45,8 @@ pub struct HeadI8 {
     s: Weight,
     rows: usize,
     rule: crate::plan::rules::WeightRule,
+    /// W8A8:前向额外做 per-token 激活 int8 量化 + dp4a。
+    a8: bool,
 }
 
 impl Embedding {
@@ -128,7 +130,7 @@ impl Embedding {
     /// **untied + 词表切**(P1.1):embed 表**全量**,lm_head 只建 `head_vocab` 行。
     pub fn new_untied_head(vocab: usize, head_vocab: usize, d_dim: usize, plan: QuantPlan) -> Embedding {
         // int8 头(§72/§73):不进 `Linear`(见 QuantPlan::I8W 的裁决注记)
-        if matches!(plan, QuantPlan::I8W) {
+        if matches!(plan, QuantPlan::I8W | QuantPlan::I8W8) {
             let rule = if head_vocab < vocab {
                 crate::plan::rules::WeightRule::UniformCol
             } else {
@@ -139,6 +141,7 @@ impl Embedding {
                 s: Weight::new_typed("i8s", vec![head_vocab], crate::tensor::Dtype::F32),
                 rows: head_vocab,
                 rule,
+                a8: matches!(plan, QuantPlan::I8W8),
             });
             return Embedding {
                 w: Weight::new("weight", vec![vocab, d_dim]),
@@ -281,19 +284,86 @@ impl Embedding {
         if let Some(h) = &self.head_i8 {
             let sh = hidden.shape();
             let tokens: usize = sh[..sh.len() - 1].iter().product();
+            // W8A8:权重同 int8;只把 hidden 按 token 量化成 int8 再乘。
+            // - m=7/8 且 K 32 对齐 ⇒ **int8 Tensor Core**(SM86 有 int8 TC,
+            //   没有 fp8 TC;M 补到 16,权重仍只读一遍);
+            // - 其余多 token 形状 ⇒ dp4a 多头核(回退);
+            // - m=1(prefill 末行/MTP)保持 W8A16,避免小 shape 量化开销。
+            let tc = owl_kernels::driver::elems::gemm_i8w_a8_tc_eligible(
+                h.rows,
+                self.d_dim,
+                tokens,
+            );
+            let dp4a = owl_kernels::driver::elems::gemv_i8w_mt_eligible(h.rows, tokens);
+            if h.a8 && tokens > 1 && (tc || dp4a) {
+                use crate::ops::SemanticKernel as K;
+                let (ks, kq) = match hidden.dtype {
+                    crate::tensor::Dtype::BF16 => (K::QuantI8ActScaleBf16, K::QuantI8ActQBf16),
+                    crate::tensor::Dtype::F16 => (K::QuantI8ActScaleF16, K::QuantI8ActQF16),
+                    other => panic!("W8A8 头:激活 dtype 只可能是 f16/bf16,实得 {other:?}"),
+                };
+                let kg = match (hidden.dtype, tc) {
+                    (crate::tensor::Dtype::BF16, true) => K::GemmI8wA8TcBf16,
+                    (crate::tensor::Dtype::F16, true) => K::GemmI8wA8TcF16,
+                    (crate::tensor::Dtype::BF16, false) => K::GemvI8wA8Bf16,
+                    (crate::tensor::Dtype::F16, false) => K::GemvI8wA8F16,
+                    (other, _) => panic!("W8A8 头:激活 dtype 只可能是 f16/bf16,实得 {other:?}"),
+                };
+                let scale = TensorOps::call(ks)
+                    .arg(hidden)
+                    .arg_i32(tokens as i32)
+                    .arg_i32(self.d_dim as i32)
+                    .aux(&[tokens, self.d_dim])
+                    .with_shape(crate::tensor::Dtype::F32, vec![tokens]);
+                let q = TensorOps::call(kq)
+                    .arg(hidden)
+                    .arg(&scale)
+                    .arg_i32(tokens as i32)
+                    .arg_i32(self.d_dim as i32)
+                    .aux(&[tokens, self.d_dim])
+                    .with_shape(crate::tensor::Dtype::I8, vec![tokens, self.d_dim]);
+                return TensorOps::call(kg)
+                    .arg(&h.q.decl())
+                    .arg(&h.s.decl())
+                    .arg(&q)
+                    .arg(&scale)
+                    .arg_i32(h.rows as i32)
+                    .arg_i32(self.d_dim as i32)
+                    .arg_i32(tokens as i32)
+                    .aux(&[h.rows, self.d_dim, tokens])
+                    .with_shape(hidden.dtype, vec![tokens, h.rows]);
+            }
             // **激活 dtype 定实例**(2026-10-20:单一 op_id 会撞 dtype 守门 ——
-            // 执行 dtype = f16 的档(W4A16Awq/F16 27B)拿到 bf16 核 = 输出域不符)
-            let kern = match hidden.dtype {
-                crate::tensor::Dtype::BF16 => crate::ops::SemanticKernel::GemvI8wBf16,
-                crate::tensor::Dtype::F16 => crate::ops::SemanticKernel::GemvI8wF16,
-                other => panic!("int8 头:GEMV 输出 dtype 只可能是 f16/bf16,实得 {other:?}"),
+            // 执行 dtype = f16 的档(W4A16Awq/F16 27B)拿到 bf16 核 = 输出域不符)。
+            // 2026-10-22:多 token 且 K 16 对齐 ⇒ W8A16 f16/bf16 Tensor Core
+            // (HBM 读 int8;B 在寄存器里反量化;激活不量化);否则回 multi-token FMA。
+            let a16tc = owl_kernels::driver::elems::gemm_i8w_a16_tc_eligible(
+                h.rows,
+                self.d_dim,
+                tokens,
+            );
+            let kern = match (hidden.dtype, a16tc) {
+                (crate::tensor::Dtype::BF16, true) => {
+                    crate::ops::SemanticKernel::GemmI8wA16TcBf16
+                }
+                (crate::tensor::Dtype::F16, true) => {
+                    crate::ops::SemanticKernel::GemmI8wA16TcF16
+                }
+                (crate::tensor::Dtype::BF16, false) => crate::ops::SemanticKernel::GemvI8wBf16,
+                (crate::tensor::Dtype::F16, false) => crate::ops::SemanticKernel::GemvI8wF16,
+                (other, _) => panic!("int8 头:GEMV 输出 dtype 只可能是 f16/bf16,实得 {other:?}"),
             };
-            return TensorOps::call(kern)
+            let call = TensorOps::call(kern)
                 .arg(&h.q.decl())
                 .arg(&h.s.decl())
                 .arg(hidden)
                 .arg_i32(h.rows as i32)
-                .arg_i32(self.d_dim as i32)
+                .arg_i32(self.d_dim as i32);
+            // 多 token 核多一个 tokens 标量槽;driver 的几何门是唯一判据,模型侧不另立。
+            let mt = !a16tc
+                && owl_kernels::driver::elems::gemv_i8w_mt_eligible(h.rows, tokens);
+            let call = if mt || a16tc { call.arg_i32(tokens as i32) } else { call };
+            return call
                 .aux(&[h.rows, self.d_dim, tokens])
                 .with_shape(hidden.dtype, vec![tokens, h.rows]);
         }

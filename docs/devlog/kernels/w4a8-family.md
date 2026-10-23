@@ -757,3 +757,65 @@ S2 落地时用了 `w4a8: bool`,**撞仓规**(“bool 传格式”;`shared/confi
 `in/rows/cols/out` 单出槽,不承载),再加白名单/几何/parity 一整套 ——
 换 **~2s** 余量,性价比不成立。**挂账**:若将来 a8 成为默认档且启动时间吃紧,
 再按“多出设备重排”立项(设计要点已在此节记录)。
+
+## 20. W4A8 int8 8-row(m8)移植 —— **已 port,默认关**(2026-10-22)
+
+### 20.1 来源与搬入件
+
+现役 Marlin W4A4/A8 核来自 **vLLM** `csrc/libtorch_stable/quantization/marlin`
+(local fork);`repos/vllm-ampere-optimized` 不是现役核来源,但它有
+**famp-marlin** 副本(`flashampere/marlin/csrc/marlin/`,@ f2e081d),
+内含上游未收的 **kS8 × m_block_size_8** 8-row 路径。
+
+已搬入:
+
+| 件 | 变化 |
+|---|---|
+| `cu/marlin/vllm_marlin/marlin_template.h` | famp 的 4 处 int8/m8 布局修复(fetch 手工 gather / `mma_trans` / 分组 scale fold / c_sh_wr 偏移)+ epilogue per-row scale |
+| `cu/marlin/marlin_host.cu` | `m_block_size_8` 增加 kS8 grouped 条件;**默认 false**,显式 `[kernel] marlin_w4a8_m8 = true` 才开 |
+| `cu/marlin/vllm_marlin/kernel_selector.h` | 追加 18 条 `kS8 × kU4/kU4B8`(g32/64/128,m8=true)条目 |
+| `cu/marlin/vllm_marlin/sm80_kernel_s8_{u4,u4b8}_float16.cu` | famp generator 的 m8=true 实例(每档 3 个 thread 配置 × 4 group) |
+| 门 | `marlin_w4a8_m8_parity`(m=8,host 参考 + m8 vs 16-row 逐位比较);oracle M=8 |
+
+### 20.2 门(全绿)
+
+- `marlin_w4a8_m8_parity`(3080):m8 与 16-row **逐位相同**
+  (`max|Δ|/max=0`),两者 vs host 参考 `1.41e-4`。
+- `foreign_oracle_marlin_w4a8_passes`:M=8,默认 16-row 与
+  `marlin_w4a8_m8=true` 均 `噪声/信号 RMS=0.00016`。
+- selector ⊆ 实例化机器门:372 refs / 378 instances ✓。
+
+### 20.3 速度 A/B:**没有赢,默认关**
+
+3080 真实 27B 形状(`marlin_w4a8_vs_w4a16_lever`,m=7/8):
+
+| shape | m | m8 µs | 16-row µs | m8 差 |
+|---|---:|---:|---:|---:|
+| 34816×5120 | 7 | 156.1 | **153.8** | +1.5% |
+| 34816×5120 | 8 | 155.9 | **154.2** | +1.1% |
+| 5120×17408 | 7 | 82.6 | **81.7** | +1.1% |
+| 5120×17408 | 8 | 82.6 | **81.8** | +1.0% |
+| 16384×5120 | 7 | 77.6 | **77.3** | +0.4% |
+| 16384×5120 | 8 | 77.7 | **77.4** | +0.4% |
+| 5120×6144 | 7 | 33.6 | **33.5** | +0.3% |
+| 5120×6144 | 8 | 33.7 | **33.6** | +0.3% |
+
+引擎 W4A8 spec(同 prompt,greedy,256 tok):
+
+| 档 | `spec.round` | `spec.verify` | `spec.propose` | 输出 |
+|---|---:|---:|---:|---|
+| m8 on | 35.494 | 26.499 | 6.857 | — |
+| 16-row | **35.377** | **26.373** | 6.883 | **逐字相同** |
+
+结论:**m8 路正确,但 3080 上不省权重流量**(两条路都只读一遍权重),
+8-row 只多拆 tile/多开销。默认 **off**;复验/3090 试:
+`[kernel] marlin_w4a8_m8 = true`(仅实验,不作为生产配置面)。
+
+### 20.4 CUTLASS 裁决(同轮)
+
+- `repos/cutlass` 有 `MmaMixedInputTensorOp` / `OpMultiplyAddMixedInputUpcast`,
+  但 int4×f16 的 mixed-input 示例(`55/86`)是 **Hopper/Blackwell**,不是
+  SM86;W4A8 的 int4×int8 在 SM80 没有现成路径。
+- 我们这种 AWQ g32/asym-zp + per-row scale + m1/7/8 的布局,CUTLASS
+  需要自写 collective/epilogue/repack,是**新后端项目**,不是替换 `.cu`。
+- **不换 CUTLASS**;Marlin 的 W4A16/W4A8 继续用。

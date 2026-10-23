@@ -732,6 +732,27 @@ impl<D: DeviceClient> GraphPlan<D> {
         }
         let gid = self.face.graph_end().await;
 
+        // **AR-2 游标复位(2026-10-23)**:graph capture 前会跑一遍 eager warmup,
+        // 两 rank 的 AR-2 专用游标可能差拍;捕获窗本身不执行 kernel。图捕获成功
+        // 后把本端 header 48..64(AR-2 prod/cons)清零,第一次回放
+        // 从 0 起跑。只清本端,对端经只读别名读;v1/fused 的 0/8/32 不动。
+        if gid.is_ok() {
+            if let Some(tp) = self.tp.as_ref() {
+                if tp.ar2 {
+                    self.face
+                        .memset_zero_at(&tp.own, 48, 16)
+                        .await
+                        .map_err(|e| ModelError::Msg(format!("AR-2 游标复位失败: {e}")))?;
+                    // 复位是 host 侧命令,必须真正落地后再让第一次回放跑;
+                    // 否则回放可能先于 memset(尤其双 rank 队列不同步)。
+                    self.face
+                        .sync()
+                        .await
+                        .map_err(|e| ModelError::Msg(format!("AR-2 游标复位 sync 失败: {e}")))?;
+                }
+            }
+        }
+
         match (win_err, gid) {
             (None, Ok(graph)) => {
                 self.mode = Mode::Captured { graph };

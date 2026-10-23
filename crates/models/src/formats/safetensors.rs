@@ -76,7 +76,7 @@ impl SafeTensorsSource {
         let Some(base) = key.strip_suffix(".weight") else {
             return Ok(None);
         };
-        let Some((b1, b2)) = crate::formats::split_qkvz(base) else {
+        let Some((b1, b2)) = crate::formats::split_merged(base) else {
             return Ok(None);
         };
         let idx = self.idx()?;

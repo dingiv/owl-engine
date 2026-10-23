@@ -75,6 +75,14 @@ pub struct EngineKnobs {
     pub draft: DraftCfg,
     /// 前缀缓存(缺省开;原 OWL_PREFIX_CACHE≠"0")
     pub prefix_cache: bool,
+    /// **整枝塌缩**(`[kvmem].bulk_drop_when_tier_full`;缺省 false = 保守)。
+    pub bulk_drop_when_tier_full: bool,
+    /// **前缀无感删除(图像段)**(`[pool].image_evict`;缺省关)。
+    ///
+    /// 开 = 客户端给图像打可删标记时:页对齐 pad + 删除后后缀 K 重转
+    /// (`R(−S)`),不重算删点之后的 token。依赖 `prefix_cache` + f16 分页池
+    /// + 视觉档(boot 门;任缺 = 拒启)。
+    pub image_evict: bool,
     /// **宿主层预算 MiB**(状态存储三层的中层;缺省 **0 = 关层**,REQ C4)。
     /// 环境变量 `OWL_HOST_CACHE_MB`;S3-3b(回灌)接线前开了也没用
     pub host_cache_mb: usize,
@@ -301,6 +309,8 @@ impl Default for EngineKnobs {
             pool_tokens: None,
             draft: DraftCfg::default(),
             prefix_cache: true,
+            bulk_drop_when_tier_full: false,
+            image_evict: false,
             host_cache_mb: 0,
             snap_host_mb: 0,
             disk_cache_mb: 0,
@@ -619,11 +629,18 @@ impl EngineKnobs {
                 depth_min: cfg.spec.depth_min,
                 depth_switch_ctx: cfg.spec.depth_switch_ctx,
                 adaptive_min_tpr: cfg.spec.adaptive_min_tpr,
+                lookup: cfg.spec.lookup,
+                lookup_nmin: cfg.spec.lookup_nmin,
+                lookup_nmax: cfg.spec.lookup_nmax,
+                lookup_nstrong: cfg.spec.lookup_nstrong,
+                lookup_agree: cfg.spec.lookup_agree,
                 notaps: cfg.spec.notaps,
                 tapdecl: cfg.spec.tapdecl,
                 tp_draft: cfg.spec.tp_draft,
             },
             prefix_cache: cfg.pool.prefix_cache,
+            bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
+            image_evict: cfg.pool.image_evict,
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
             host_cache_mb: cfg.pool.host_cache_mb,
             disk_cache_mb: cfg.pool.disk_cache_mb,
@@ -751,6 +768,12 @@ pub struct DraftCfg {
     pub depth_switch_ctx: usize,
     /// T1b 滚动降档门（tokens/round）
     pub adaptive_min_tpr: f32,
+    /// DFlash2 lookup-augmented drafting（LABD；仅 DFlash2）
+    pub lookup: bool,
+    pub lookup_nmin: usize,
+    pub lookup_nmax: usize,
+    pub lookup_nstrong: usize,
+    pub lookup_agree: usize,
     /// verify taps 退回 last_hidden(排查开关)
     pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
@@ -777,6 +800,11 @@ impl Default for DraftCfg {
             depth_min: 3,
             depth_switch_ctx: 49152,
             adaptive_min_tpr: 3.0,
+            lookup: false,
+            lookup_nmin: 6,
+            lookup_nmax: 12,
+            lookup_nstrong: 6,
+            lookup_agree: 0,
             notaps: false,
             tapdecl: false,
         }
@@ -1184,9 +1212,9 @@ pub(crate) fn into_running<D: DeviceClient>(
                     block_bytes: dev.pool.block_bytes(),
                     mtp_block_bytes: dev.pool.mtp_block_bytes(),
                     paged: dev.pool.geom.paged,
-                    mtp: dev.spec_rt.mode == SpecMode::Mtp,
                     prefix_cache: cfg.knobs.prefix_cache,
-                    // 宿主层预算(REQ C4:默认关;0 = 关层)—— 与预算入参**同源**
+                    mtp: dev.spec_rt.mode == SpecMode::Mtp,
+                                // 宿主层预算(REQ C4:默认关;0 = 关层)—— 与预算入参**同源**
                     // (腿不得超总账;`Rel::open` 交叉校验)
                     host_bytes,
                     // **TP 宿主腿平面数 = world**(单卡 1;双 rank 2 —— 两个 rank
@@ -1214,6 +1242,8 @@ pub(crate) fn into_running<D: DeviceClient>(
             );
             // **B-4 驱逐策略装配**(boot 一次;缺省 LRU ⇒ 与历史逐字一致)
             b.rel.set_evict_policy(cfg.knobs.evict_policy.build());
+            // 整枝塌缩(2026-10-23):宿主/磁盘**装不下整链**时允许一张票丢整段
+            b.rel.set_bulk_drop_when_tier_full(cfg.knobs.bulk_drop_when_tier_full);
             owl_shared::log_info!("store", "驱逐策略 = {}", b.rel.evict_policy_name());
             if cfg.knobs.index_probe {
                 // B 轴索引几何:层 = 全注意力层数,头 = KV 头数,dim = head_dim
@@ -1365,6 +1395,31 @@ pub(crate) fn into_running<D: DeviceClient>(
             b
         };
 
+    // **前缀无感删除的 boot 门**(2026-10-23):开了就必须具备执行面 ——
+    // ① 视觉塔(图像段识别 / m-RoPE 位置自证)② f16 分页池(池内 K 原地重转;
+    // fp8 需 dequant→rotate→requant,未做)③ 前缀缓存(按内容取回旧链)。
+    // 任缺 = **拒启**(静默降级 = 客户端以为删了不重算、实际每轮全量重灌)。
+    if cfg.knobs.image_evict {
+        if dev.boot.vlm.is_none() {
+            return Err(ModelError::Msg(
+                "[pool] image_evict = true 需要 [model].vision = true(图像段识别依赖视觉档)"
+                    .into(),
+            ));
+        }
+        if !dev.pool.geom.paged || !dev.pool.k_shift_supported() {
+            return Err(ModelError::Msg(format!(
+                "[pool] image_evict = true 需要 f16 分页 KV 池(paged={} kv_fp8={} dtype={:?});\
+                 fp8 池的 dequant→requant 未做",
+                dev.pool.geom.paged, dev.pool.geom.kv_fp8, dev.pool.geom.dims.dtype
+            )));
+        }
+        owl_shared::log_info!(
+            "boot",
+            "前缀无感删除:开(可删图像段页对齐 pad + 删除后缀 K 重转;页 {} tok)",
+            dev.pool.geom.page
+        );
+    }
+
     let boot = crate::running::BootCtx {
         probes: cfg.knobs.probes,
         tok: tokenizer,
@@ -1373,6 +1428,7 @@ pub(crate) fn into_running<D: DeviceClient>(
     };
     Ok(RunningEngine {
         boot,
+        img_evict: crate::running::ImgEvictLedger::default(),
         turns: crate::turn::TurnLedger::new(),
         bank,
         sel: crate::select::SelectRuntime::default(),
@@ -1819,6 +1875,11 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             depth_min: cfg.knobs.draft.depth_min,
             depth_switch_ctx: cfg.knobs.draft.depth_switch_ctx,
             adaptive_min_tpr: cfg.knobs.draft.adaptive_min_tpr,
+            lookup: cfg.knobs.draft.lookup,
+            lookup_nmin: cfg.knobs.draft.lookup_nmin,
+            lookup_nmax: cfg.knobs.draft.lookup_nmax,
+            lookup_nstrong: cfg.knobs.draft.lookup_nstrong,
+            lookup_agree: cfg.knobs.draft.lookup_agree,
             // 草稿共享的 target 事实(GGUF 草稿声明校验 + 码本行数)
             target: owl_models::formats::gguf::TargetFacts {
                 vocab: rm.spec.vocab,
@@ -1842,7 +1903,11 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         vision: cfg.knobs.vision,
         spec_depth: spec.depth,
         tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
-        head_int8: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt8Row,
+        head_int8: matches!(
+            cfg.knobs.head_quant,
+            owl_shared::config::HeadQuant::RtnInt8Row
+                | owl_shared::config::HeadQuant::RtnInt8RowA8
+        ),
         head_int4: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt4G32,
         main_kv: Some(owl_models::kernel_env::KvCaps::from_env(&env)),
         draft_kv: (spec.depth > 0)
@@ -1905,8 +1970,6 @@ fn boot_pool_plan(
         seq_tokens: s,
         pool_tokens,
         pool_auto,
-        concurrency: cfg.knobs.gdn_slots.max(1),
-        prefix_cache: cfg.knobs.prefix_cache,
         // **锁①门控**:只有虚拟化真的开着(配置显式 `select_decode` +
         // `select_partial`)才允许池小于上下文 —— 否则链超出池容量必
         // `Exhausted`(无洞可停,即无选择层可挤)。
@@ -1921,7 +1984,6 @@ fn boot_pool_plan(
         },
         // P2.1-b:草稿池几何(**分片后**;来自草稿声明 + 本 rank 计划)
         draft_geom: spec.draft_geom,
-        draft_window: spec.draft_window,
         // 治理器按卡摊 `live`(TP2 下 LIVE 含两卡之和;2026-10-19 定谳)
         tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
         // 两 rank 共用的池前 live 基线(消除顺序记账)
@@ -2136,12 +2198,14 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 本机实测 ≈1.6 GiB)+ 每 turn 瞬态(34~300 MiB)。本行只报池本身,
         // 经验值留在 profile 档头/bench 卷(216k ✓ / 220k 差 17 MiB / 224k ✗)。
         let pool_mib = (pool.geom.nb as u64 * pool.block_bytes() as u64) >> 20;
+        let draft_mib = pool.draft_pool_bytes() as u64 >> 20;
         eprintln!(
-            "[ctx-max] 池落账 {} MiB({} tok × {} 页宽;工作集 {} tok 常驻,Strict 准入)",
+            "[ctx-max] 池落账 {} MiB(主池 {} tok × {} 页宽;工作集 {} tok 常驻,Strict 准入) + 草稿池(MTP链/DFlash2 ring) {} MiB",
             pool_mib,
             pool.geom.nb * pool.geom.page,
             pool.geom.page,
-            cfg.knobs.workspace_per_req
+            cfg.knobs.workspace_per_req,
+            draft_mib
         );
     }
         if let Some(q) = fi_quant {

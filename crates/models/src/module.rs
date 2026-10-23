@@ -168,6 +168,9 @@ pub struct TpCtx {
     /// ★ **v1 两核融合档**(§11.2;2026-10-19):`true` ⇒ 一核做完两段
     /// (`ArFusedCall`);**只非 fp8 载荷**(fp8 腿仍两核)。缺省 false。
     pub ar_fused: bool,
+    /// ★ **barrier-only AR-2**(2026-10-23):小包 graph 专用;与 fused 同线格式,
+    /// 复用 v1 produced/consumed 相对游标,单 block 去掉尾部 rendezvous。
+    pub ar2: bool,
 }
 
 impl TpCtx {
@@ -1278,7 +1281,8 @@ pub enum QuantPlan {
     Gguf(crate::formats::gguf::GgmlTy),
     /// **int8 per-row 头**(P1.5-a,2026-10-20):只对 **lm_head** 有意义
     /// (装载期现算:`s_o = absmax/127`,`q = RN-even(w/s)`;头走
-    /// `owl_gemv_i8w_{f16,bf16}`,prefill 也在末行窄切后调用 ⇒ m 恒 1)。
+    /// `owl_gemv_i8w_{f16,bf16}`(m=1)或 2026-10-22 起的
+    /// `owl_gemv_i8w_mt{,7}_{f16,bf16}`(spec m=7/8,权重只读一遍))。
     ///
     /// **不走 `Linear`**:`Linear` 已有四条臂(F16/W4A16/W4A16Awq/W4A8Awq),
     /// 再插一条会变成"万能类型";int8 头只有 lm_head 一个消费者 ⇒
@@ -1288,6 +1292,10 @@ pub enum QuantPlan {
     /// `Some(I8W)` ⇒ `Embedding::set_table_plan` 建 int8 表槽(按调用位置
     /// 区分,不与 `head_i8` 同槽);仅 untied。
     I8W,
+    /// **W8A8 头**(2026-10-22):权重同 `I8W`(per-row int8),前向额外做
+    /// per-token int8 激活量化 + `__dp4a`。只对 lm_head 有意义;
+    /// 仅用于 spec m>1,prefill/MTP 的 m=1 仍走 `I8W`。
+    I8W8,
 }
 
 /// **逐张量量化计划表**(混型源的计划来源;2026-10-19 GGUF 轮)。
@@ -1417,6 +1425,15 @@ impl<'a> PlanSource<'a> {
     /// 源事实(norm 语义 / 融合键分段)
     pub fn facts(&self) -> SourceFacts {
         self.facts
+    }
+
+    /// Uniform 臂的计划(Keyed 臂 = None)。层构造器据此决定是否使用
+    /// 合并虚拟键(如 MLP gate_up_proj 仅 W4A16/AWQ 目标档启用)。
+    pub fn uniform_plan(&self) -> Option<QuantPlan> {
+        match self.kind {
+            PlanKind::Uniform(p) => Some(p),
+            PlanKind::Keyed { .. } => None,
+        }
     }
 
     /// 绑定层号(`Model::new` 每层造一份;Uniform 臂原样返回)

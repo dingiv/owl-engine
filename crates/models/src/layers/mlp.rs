@@ -6,33 +6,91 @@
 //! 容器 + LoaderOps 装载形态(子层描述 chain 聚合)。
 
 use super::linear::Linear;
-use crate::module::{Loadable, LoaderCtx, LoaderOps, PlanSource};
+use crate::module::{Loadable, LoaderCtx, LoaderOps, PlanSource, QuantPlan};
 use crate::module::{ForwardCtx, Module};
 use crate::TensorOps;
 
 pub struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
+    /// 未合并臂（F16/GGUF/DFlash2 等）
+    gate_proj: Option<Linear>,
+    up_proj: Option<Linear>,
+    /// 合并臂（W4A16/AWQ 目标档）：单 Linear out=2·inter，装载期虚拟行堆叠
+    gate_up: Option<Linear>,
     down_proj: Linear,
+    /// 本 rank 的 intermediate（TP 分片后；merged 段长声明用）
+    inter: usize,
 }
 
 impl Mlp {
     /// 准备容器(hidden = 1024, intermediate = 3584 —— 0.8B 实测配置;
     /// `plan` = 量化计划构造期注入,尺寸门控在 Linear 内定形)
     pub fn new<'a>(hidden: usize, intermediate: usize, plan: impl Into<PlanSource<'a>>) -> Mlp {
+        Self::new_with(hidden, intermediate, plan.into(), false)
+    }
+
+    /// **合并 gate+up 的目标档构造**：仅 Uniform W4A16/W4A16Awq 时启用；
+    /// 其余计划自动回退拆键（DFlash2/GGUF/F16 路径零行为变化）。
+    pub fn new_merged<'a>(
+        hidden: usize,
+        intermediate: usize,
+        plan: impl Into<PlanSource<'a>>,
+    ) -> Mlp {
         let p = plan.into();
-        Mlp {
-            gate_proj: Linear::new("gate_proj", intermediate, hidden, p.of("gate_proj", intermediate, hidden)),
-            up_proj: Linear::new("up_proj", intermediate, hidden, p.of("up_proj", intermediate, hidden)),
-            down_proj: Linear::new("down_proj", hidden, intermediate, p.of("down_proj", hidden, intermediate)),
+        let merge = matches!(
+            p.uniform_plan(),
+            Some(QuantPlan::W4A16 | QuantPlan::W4A16Awq)
+        );
+        Self::new_with(hidden, intermediate, p, merge)
+    }
+
+    fn new_with<'a>(
+        hidden: usize,
+        intermediate: usize,
+        p: PlanSource<'a>,
+        merge: bool,
+    ) -> Mlp {
+        let down_proj =
+            Linear::new("down_proj", hidden, intermediate, p.of("down_proj", hidden, intermediate));
+        if merge {
+            Mlp {
+                gate_proj: None,
+                up_proj: None,
+                gate_up: Some(Linear::new(
+                    "gate_up_proj",
+                    2 * intermediate,
+                    hidden,
+                    p.of("gate_up_proj", 2 * intermediate, hidden),
+                )),
+                down_proj,
+                inter: intermediate,
+            }
+        } else {
+            Mlp {
+                gate_proj: Some(Linear::new(
+                    "gate_proj",
+                    intermediate,
+                    hidden,
+                    p.of("gate_proj", intermediate, hidden),
+                )),
+                up_proj: Some(Linear::new(
+                    "up_proj",
+                    intermediate,
+                    hidden,
+                    p.of("up_proj", intermediate, hidden),
+                )),
+                gate_up: None,
+                down_proj,
+                inter: intermediate,
+            }
         }
     }
 
     /// **输出 dtype 钉定**(草稿 GGUF 臂;三条 Linear 统一;判据见
     /// [`Linear::with_out_dtype`](crate::layers::linear::Linear::with_out_dtype))
     pub fn with_out_dtype(mut self, dt: crate::contract::Dtype) -> Self {
-        self.gate_proj = self.gate_proj.with_out_dtype(dt);
-        self.up_proj = self.up_proj.with_out_dtype(dt);
+        self.gate_proj = self.gate_proj.map(|l| l.with_out_dtype(dt));
+        self.up_proj = self.up_proj.map(|l| l.with_out_dtype(dt));
+        self.gate_up = self.gate_up.map(|l| l.with_out_dtype(dt));
         self.down_proj = self.down_proj.with_out_dtype(dt);
         self
     }
@@ -40,8 +98,33 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
-        let gate = self.gate_proj.forward(xs, ctx);
-        let up = self.up_proj.forward(xs, ctx);
+        if let Some(gu) = &self.gate_up {
+            let both = gu.forward(xs, ctx);
+            let rows = both.shape()[0];
+            let inter = both.shape()[1] / 2;
+            let h = if both.dtype == crate::tensor::Dtype::F16
+                || both.dtype == crate::tensor::Dtype::BF16
+            {
+                TensorOps::call(crate::ops::SemanticKernel::SiluAndMulMerged)
+                    .aux(&[rows, inter])
+                    .arg(&both)
+                    .arg_usize(rows)
+                    .arg_usize(inter)
+                    .with_shape(both.dtype, vec![rows, inter])
+            } else {
+                // F32 锚链（合并臂只给 W4A16/AWQ，理论上不可达；保持显式）
+                let gate = both.slice_view(0, vec![rows, inter]);
+                let up = both.slice_view(rows * 2 * inter - rows * inter, vec![rows, inter]);
+                gate.silu().mul(&up)
+            };
+            return self.down_proj.forward(&h, ctx);
+        }
+        let (gp, up) = match (&self.gate_proj, &self.up_proj) {
+            (Some(g), Some(u)) => (g, u),
+            _ => unreachable!("Mlp: 拆键臂缺 gate/up（构造不变量失守）"),
+        };
+        let gate = gp.forward(xs, ctx);
+        let up = up.forward(xs, ctx);
         // silu(gate) * up(门控)—— C1 融合:silu_and_mul 单发(float 中间,
         // 双发中间量化消除);f32 语义组合保留(CPU 锚)。BF16 臂(E5-DF3
         // 同日十四;DFlash2 草稿 MLP)同吃融合核(owl_silu_and_mul_bf16)
@@ -62,9 +145,18 @@ impl Module for Mlp {
 
 impl Loadable for Mlp {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
-        self.gate_proj.layout(ctx)
-            .chain(self.up_proj.layout(ctx))
-            .chain(self.down_proj.layout(ctx))
+        match (&self.gate_up, &self.gate_proj, &self.up_proj) {
+            (Some(gu), None, None) => gu
+                .layout(ctx)
+                // 合并权重的段长事实（本 rank 的 gate|up；与 GDN qkvz 同律）
+                .with_segments_for("gate_up_proj", vec![self.inter, self.inter])
+                .chain(self.down_proj.layout(ctx)),
+            (None, Some(g), Some(u)) => g
+                .layout(ctx)
+                .chain(u.layout(ctx))
+                .chain(self.down_proj.layout(ctx)),
+            _ => unreachable!("Mlp: layout 臂不唯一（gate_up 与 gate/up 混存）"),
+        }
     }
 
 }

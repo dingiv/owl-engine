@@ -110,12 +110,13 @@ OWL_POS_EMBED_KERNEL(owl_pos_embed_bilinear_f16, __half, (const __half* table, c
 // 版一(2026-10-15 首版):一 warp 一行 × 一头 ⇒ 每行独立扫全 KV:
 //   实测 1280×736(3680 patch)⇒ **50.7 ms/层**(3680² × 72 × 16 头 × 2(K+V) ≈ 62 GB
 //   的 L2/DRAM 重读)⇒ 占整塔 92% ⇒ 必须共享 K/V。
-// 版二(本版):**一 block 8 行(8 warp)× 一头**,K/V 按 **TILE=64 key** 协作装 smem,
-//   8 行共享 ⇒ K/V 重读量 ÷8 + smem 广播。行区间按 `cu_seqlens` 逐 warp 裁
-//   (块内 8 行可跨图;越界 key 跳过)。
+// 版二(2026-10-15):一 block 8 行(8 warp)× 一头,K/V 按 TILE=64 key 协作装 smem。
+// 版三(2026-10-23):**一 block 32 行(8 warp × 4 行)× 一头**,每 warp 将同一 K/V
+//   行复用于 4 个 q 行 ⇒ K/V 重读量再 ÷4;K/V tile 用 16B 向量装载。
+//   行区间按 `cu_seqlens` 逐子行裁(块内可跨图;越界 key 跳过)。
 //
 //   q [rows, heads, head_dim] / k,v 同形 / cu_seqlens [n_seq+1](f32 段界)
-//   grid = (ceil(rows/8), heads);block 256;动态 smem = 2·TILE·head_dim·sizeof(T)
+//   grid = (ceil(rows/32), heads);block 256;动态 smem = 2·TILE·head_dim·sizeof(T)
 //   在线 softmax(一遍);lane 持 dim = lane, lane+32, lane+64(f32 累计)
 // ============================================================================
 
@@ -125,26 +126,32 @@ OWL_POS_EMBED_KERNEL(owl_pos_embed_bilinear_f16, __half, (const __half* table, c
 extern "C" __global__ void NAME PARAMS { \
     constexpr int TILE = OWL_VIS_ATTN_TILE; \
     constexpr int WARPS = 8; \
+    constexpr int RPW = 4; /* 每 warp 4 行:32 行/block,复写 K/V smem */ \
     extern __shared__ char vsm[]; \
     T* ks = reinterpret_cast<T*>(vsm); \
     T* vv = ks + (size_t)TILE * head_dim; \
     const int warp = (int)(threadIdx.x >> 5); \
     const int lane = (int)(threadIdx.x & 31u); \
-    const size_t row = (size_t)blockIdx.x * WARPS + (size_t)warp; \
+    const size_t row0 = (size_t)blockIdx.x * (WARPS * RPW) + (size_t)warp * RPW; \
     const int head = blockIdx.y; \
-    const bool valid = (row < rows); \
-    \
-    /* 本 warp 的 key 区间(逐行查 cu_seqlens;块内可跨图) */ \
-    int s = 0, e = 0; \
-    if (valid) { \
-        for (int t = 0; t < n_seq; ++t) { \
-            const int a = (int)cu_seqlens[t], b = (int)cu_seqlens[t + 1]; \
-            if ((int)row >= a && (int)row < b) { s = a; e = b; break; } \
+    bool valid[RPW]; \
+    int s[RPW], e[RPW]; \
+    /* 每个子行独立查 cu_seqlens(块内可跨图) */ \
+    _Pragma("unroll") \
+    for (int rr = 0; rr < RPW; ++rr) { \
+        const size_t row = row0 + (size_t)rr; \
+        valid[rr] = (row < rows); \
+        s[rr] = 0; e[rr] = 0; \
+        if (valid[rr]) { \
+            for (int t = 0; t < n_seq; ++t) { \
+                const int a = (int)cu_seqlens[t], b = (int)cu_seqlens[t + 1]; \
+                if ((int)row >= a && (int)row < b) { s[rr] = a; e[rr] = b; break; } \
+            } \
         } \
     } \
     /* 块级 K/V 扫描区间 = 首行与末行各自所属图的并(段界单调) */ \
-    const size_t row_lo = (size_t)blockIdx.x * WARPS; \
-    const size_t row_hi = row_lo + WARPS - 1; \
+    const size_t row_lo = (size_t)blockIdx.x * (WARPS * RPW); \
+    const size_t row_hi = row_lo + (WARPS * RPW) - 1; \
     int block_lo = 0, block_hi = (int)rows; \
     for (int t = 0; t < n_seq; ++t) { \
         const int a = (int)cu_seqlens[t], b = (int)cu_seqlens[t + 1]; \
@@ -153,67 +160,109 @@ extern "C" __global__ void NAME PARAMS { \
     } \
     if (block_lo > block_hi) { block_hi = block_lo; } \
     \
-    float qv[3]; \
-    for (int r = 0; r < 3; ++r) { \
-        const int d = lane + 32 * r; \
-        qv[r] = (valid && d < (int)head_dim) \
-                    ? vis_to_float(q[((size_t)row * heads + (size_t)head) * head_dim + d]) \
-                    : 0.0f; \
+    float qv[RPW][3]; \
+    _Pragma("unroll") \
+    for (int rr = 0; rr < RPW; ++rr) { \
+        const size_t row = row0 + (size_t)rr; \
+        _Pragma("unroll") \
+        for (int r = 0; r < 3; ++r) { \
+            const int d = lane + 32 * r; \
+            qv[rr][r] = (valid[rr] && d < (int)head_dim) \
+                        ? vis_to_float(q[((size_t)row * heads + (size_t)head) * head_dim + d]) \
+                        : 0.0f; \
+        } \
     } \
-    float m = -3.0e38f; \
-    float l = 0.0f; \
-    float acc[3] = {0.0f, 0.0f, 0.0f}; \
+    float m[RPW], l[RPW], acc[RPW][3]; \
+    _Pragma("unroll") \
+    for (int rr = 0; rr < RPW; ++rr) { \
+        m[rr] = -3.0e38f; \
+        l[rr] = 0.0f; \
+        _Pragma("unroll") \
+        for (int r = 0; r < 3; ++r) { acc[rr][r] = 0.0f; } \
+    } \
+    /* 16B 向量装载 K/V tile(2026-10-23):native 慢核的主因之一是 \
+       每元素 2B scalar load;hd=72 正好 9×16B,可整行向量化。 */ \
+    constexpr int VEC = 16 / (int)sizeof(T); \
+    const int vecs = (int)head_dim / VEC; \
+    const bool vec_ok = ((int)head_dim % VEC) == 0; \
     for (int t0 = block_lo; t0 < block_hi; t0 += TILE) { \
         __syncthreads(); \
         /* 协作装载 tile(越块尾补 0;补 0 的 key 被行区间裁掉) */ \
-        for (int idx = (int)threadIdx.x; idx < TILE * (int)head_dim; idx += (int)blockDim.x) { \
-            const int j = idx / (int)head_dim; \
-            const int d = idx - j * (int)head_dim; \
-            const int tg = t0 + j; \
-            if (tg < block_hi) { \
-                const size_t off = ((size_t)tg * heads + (size_t)head) * head_dim + (size_t)d; \
-                ks[idx] = k[off]; \
-                vv[idx] = v[off]; \
-            } else { \
-                ks[idx] = vis_from_float<T>(0.0f); \
-                vv[idx] = vis_from_float<T>(0.0f); \
+        if (vec_ok) { \
+            for (int idx = (int)threadIdx.x; idx < TILE * vecs; idx += (int)blockDim.x) { \
+                const int j = idx / vecs; \
+                const int vcol = idx - j * vecs; \
+                const int tg = t0 + j; \
+                uint4 kk = make_uint4(0u, 0u, 0u, 0u); \
+                uint4 vv4 = make_uint4(0u, 0u, 0u, 0u); \
+                if (tg < block_hi) { \
+                    const size_t off = ((size_t)tg * heads + (size_t)head) * head_dim + (size_t)vcol * VEC; \
+                    kk = *reinterpret_cast<const uint4*>(k + off); \
+                    vv4 = *reinterpret_cast<const uint4*>(v + off); \
+                } \
+                const size_t so = (size_t)j * head_dim + (size_t)vcol * VEC; \
+                *reinterpret_cast<uint4*>(ks + so) = kk; \
+                *reinterpret_cast<uint4*>(vv + so) = vv4; \
+            } \
+        } else { \
+            for (int idx = (int)threadIdx.x; idx < TILE * (int)head_dim; idx += (int)blockDim.x) { \
+                const int j = idx / (int)head_dim; \
+                const int d = idx - j * (int)head_dim; \
+                const int tg = t0 + j; \
+                if (tg < block_hi) { \
+                    const size_t off = ((size_t)tg * heads + (size_t)head) * head_dim + (size_t)d; \
+                    ks[idx] = k[off]; \
+                    vv[idx] = v[off]; \
+                } else { \
+                    ks[idx] = vis_from_float<T>(0.0f); \
+                    vv[idx] = vis_from_float<T>(0.0f); \
+                } \
             } \
         } \
         __syncthreads(); \
         for (int j = 0; j < TILE; ++j) { \
             const int tg = t0 + j; \
-            if (tg < s || tg >= e) { continue; } \
-            float part = 0.0f; \
+            float kf[3], vf[3]; \
+            _Pragma("unroll") \
             for (int r = 0; r < 3; ++r) { \
                 const int d = lane + 32 * r; \
-                if (d < (int)head_dim) { \
-                    part += qv[r] * vis_to_float(ks[(size_t)j * head_dim + (size_t)d]); \
+                const bool in = d < (int)head_dim; \
+                kf[r] = in ? vis_to_float(ks[(size_t)j * head_dim + (size_t)d]) : 0.0f; \
+                vf[r] = in ? vis_to_float(vv[(size_t)j * head_dim + (size_t)d]) : 0.0f; \
+            } \
+            _Pragma("unroll") \
+            for (int rr = 0; rr < RPW; ++rr) { \
+                if (!valid[rr] || tg < s[rr] || tg >= e[rr]) { continue; } \
+                float part = 0.0f; \
+                _Pragma("unroll") \
+                for (int r = 0; r < 3; ++r) { part += qv[rr][r] * kf[r]; } \
+                for (int off = 16; off > 0; off >>= 1) { \
+                    part += __shfl_xor_sync(0xffffffffu, part, off); \
                 } \
-            } \
-            for (int off = 16; off > 0; off >>= 1) { \
-                part += __shfl_xor_sync(0xffffffffu, part, off); \
-            } \
-            const float sc = part * scale; \
-            const float m_new = fmaxf(m, sc); \
-            const float corr = __expf(m - m_new); \
-            const float e_w = __expf(sc - m_new); \
-            l = l * corr + e_w; \
-            for (int r = 0; r < 3; ++r) { \
-                const int d = lane + 32 * r; \
-                if (d < (int)head_dim) { \
-                    acc[r] = acc[r] * corr + e_w * vis_to_float(vv[(size_t)j * head_dim + (size_t)d]); \
+                const float sc = part * scale; \
+                const float m_new = fmaxf(m[rr], sc); \
+                const float corr = __expf(m[rr] - m_new); \
+                const float e_w = __expf(sc - m_new); \
+                l[rr] = l[rr] * corr + e_w; \
+                _Pragma("unroll") \
+                for (int r = 0; r < 3; ++r) { \
+                    acc[rr][r] = acc[rr][r] * corr + e_w * vf[r]; \
                 } \
+                m[rr] = m_new; \
             } \
-            m = m_new; \
         } \
     } \
-    if (valid) { \
-        const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f; \
+    _Pragma("unroll") \
+    for (int rr = 0; rr < RPW; ++rr) { \
+        if (!valid[rr]) { continue; } \
+        const size_t row = row0 + (size_t)rr; \
+        const float inv = (l[rr] > 0.0f) ? (1.0f / l[rr]) : 0.0f; \
+        _Pragma("unroll") \
         for (int r = 0; r < 3; ++r) { \
             const int d = lane + 32 * r; \
             if (d < (int)head_dim) { \
                 out[((size_t)row * heads + (size_t)head) * head_dim + (size_t)d] = \
-                    vis_from_float<T>(acc[r] * inv); \
+                    vis_from_float<T>(acc[rr][r] * inv); \
             } \
         } \
     } \

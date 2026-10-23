@@ -67,21 +67,18 @@ fn uniform(state: &mut u64) -> f32 {
     ((xorshift(state) >> 40) as f32) / (1u64 << 24) as f32
 }
 
-/// logits → 采样 token(repeat-penalty → temperature → top-k → softmax →
-/// top-p 截断 → 多项式)。`history` = 已生成 token(惩罚集;空 = 无惩罚)。
-/// NaN/Inf 视作 -inf(坏位不进分布);k/p 越界按全词表。
-pub fn sample(logits: &mut [f32], cfg: &SamplerCfg, rng: &mut u64, history: &[u32]) -> u32 {
+/// logits → 目标分布（**与 [`sample`] 同一套变换**：repeat-penalty →
+/// temperature → top-k → softmax → top-p 重均摊）。返回降序 `(token, prob)`。
+///
+/// 仅保留有正质量的截断集（top-k/top-p 之后 ≤ topk 项）；`temp <= 0` 返回
+/// 单点 one-hot。投机拒绝采样需要这个稀疏表示：目标分布 p 的支撑最多
+/// topk（缺省 20）项，残差 `max(p-q,0)` 也只在这个支撑上有值。
+pub fn distribution(logits: &mut [f32], cfg: &SamplerCfg, history: &[u32]) -> Vec<(u32, f32)> {
     let n = logits.len();
     debug_assert!(n > 0);
     // ── repetition penalty(在 temperature 之前;llama.cpp 同语义:正除负乘)──
     //
-    // **去重律**:每个**不同** token 只施加一次。原实现按 `history` 逐元素施加
-    // ⇒ 同一 token 出现 k 次被罚 k 次 = `rep_penalty^k` **指数累积**(k=10 → ÷4,
-    // k=30 → ÷66,k=60 → 基本禁掉);短输出无感(常见词 ≤2 次),而长思考/长输出
-    // 里换行/标点/常用词重复几十次 ⇒ 分布塌成复读与词沙拉(2026-10-14 pi 真机
-    // 定谳,`rep_penalty=1.0` 即恢复)。llama.cpp 用 candidates 位集去重,
-    // 此处用「拷贝 + 排序去重」(history = 64 + 本 turn 已生成,量级 10³,
-    // 排序 ~50µs,远低于采样本体;若将来成瓶颈可换 epoch 戳表复用缓冲)。
+    // **去重律**:每个**不同** token 只施加一次（详见 `sample` 历史注记）。
     if cfg.rep_penalty > 1.0 && !history.is_empty() {
         let mut uniq: Vec<u32> = history.to_vec();
         uniq.sort_unstable();
@@ -104,7 +101,7 @@ pub fn sample(logits: &mut [f32], cfg: &SamplerCfg, rng: &mut u64, history: &[u3
                 best = i;
             }
         }
-        return best as u32;
+        return vec![(best as u32, 1.0)];
     }
 
     // ── top-k 选择(k=20 量级:有界 Vec + 线性 min 追踪;替换稀疏,
@@ -158,17 +155,22 @@ pub fn sample(logits: &mut [f32], cfg: &SamplerCfg, rng: &mut u64, history: &[u3
     for (p, _) in keep.iter_mut() {
         *p += spread; // 截断质量重均摊到保留集(和恒 1)
     }
+    keep.iter().map(|(p, t)| (*t, *p)).collect()
+}
 
-    // ── 多项式抽样 ──
+/// logits → 采样 token（[`distribution`] + 多项式抽样）。
+/// repeat-penalty 会原地修改 `logits`（与旧行为一致）。
+pub fn sample(logits: &mut [f32], cfg: &SamplerCfg, rng: &mut u64, history: &[u32]) -> u32 {
+    let keep = distribution(logits, cfg, history);
     let u = uniform(rng);
     let mut acc = 0f32;
-    for (p, idx) in keep.iter() {
-        acc += p;
+    for (idx, p) in keep.iter() {
+        acc += *p;
         if u < acc {
             return *idx;
         }
     }
-    keep.last().map(|(_, idx)| *idx).unwrap_or(0)
+    keep.last().map(|(idx, _)| *idx).unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -36,6 +36,12 @@ typedef unsigned long long uint64_t;
 
 #define OWL_NC_SLIDING_WINDOW 2048
 
+// **草稿 ring 槽映射**(2026-10-22):0 = 线性(既有全池路径);>0 = 逻辑位对 ring
+// 取模。ring_cap 必须 >= 滑窗 + 自块(T),否则不同逻辑位会撞槽(核内 __trap)。
+__device__ __forceinline__ int nc_ring_slot(int srow, int ring_cap) {
+    return ring_cap > 0 ? (srow % ring_cap) : srow;
+}
+
 // ---------------------------------------------------------------------------
 // 4) 非因果块 attention(naive;测试 + eager 回退臂)
 //
@@ -66,7 +72,7 @@ extern "C" __global__ void owl_naive_attn_nc_f16(
     const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
                                        // E5-DF4 图化:运行时读,曾宿主烘焙)
     int q_heads, int kv_heads, int d_dim,
-    int page, int x,
+    int page, int x, int ring_cap,
     __half* __restrict__ out) {        // [T, Hq, D]
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -76,6 +82,8 @@ extern "C" __global__ void owl_naive_attn_nc_f16(
     const int hd_x = d_dim / x;
     const int kv_len = (int)kv_len_p[0];
     const int prefix_len = kv_len - gridDim.x;
+    // ring 门:窗口 + 自块必须互不覆盖(违反 = 硬错,不静默错槽)
+    if (ring_cap != 0 && ring_cap < OWL_NC_SLIDING_WINDOW + (int)gridDim.x) { __trap(); }
 
     const __half* qs = q + ((long long)t * q_heads + h) * d_dim;
     const float scale = rsqrtf((float)d_dim);
@@ -94,8 +102,9 @@ extern "C" __global__ void owl_naive_attn_nc_f16(
     for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             kv = __half2float(kc[((long long)b * kv_heads + kvh) * hd_x * page * x
                                  + (long long)(d / x) * page * x + off * x + d % x]);
         } else {
@@ -121,8 +130,9 @@ extern "C" __global__ void owl_naive_attn_nc_f16(
         __syncthreads();
         float p = s_p;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             p *= __half2float(vc[((long long)b * kv_heads + kvh) * d_dim * page
                                  + (long long)d * page + off]);
         } else {
@@ -144,7 +154,7 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16(
     const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
                                        // E5-DF4 图化:运行时读,曾宿主烘焙)
     int q_heads, int kv_heads, int d_dim,
-    int page, int x,
+    int page, int x, int ring_cap,
     __half* __restrict__ out) {        // [T, Hq, D]
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -154,6 +164,8 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16(
     const int hd_x = d_dim / x;
     const int kv_len = (int)kv_len_p[0];
     const int prefix_len = kv_len - gridDim.x;
+    // ring 门:窗口 + 自块必须互不覆盖(违反 = 硬错,不静默错槽)
+    if (ring_cap != 0 && ring_cap < OWL_NC_SLIDING_WINDOW + (int)gridDim.x) { __trap(); }
 
     const __half* qs = q + ((long long)t * q_heads + h) * d_dim;
     const float scale = rsqrtf((float)d_dim);
@@ -172,8 +184,9 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16(
     for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             // B6 偷显存:前缀池 e4m3 读入即转(元素序 = 字节序)
             __nv_fp8_e4m3 ke; ke.__x = kc[((long long)b * kv_heads + kvh) * hd_x * page * x
                                  + (long long)(d / x) * page * x + off * x + d % x];
@@ -201,8 +214,9 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16(
         __syncthreads();
         float p = s_p;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             __nv_fp8_e4m3 ve; ve.__x = vc[((long long)b * kv_heads + kvh) * d_dim * page
                                  + (long long)d * page + off];
             p *= __half2float(__half(ve));
@@ -225,7 +239,7 @@ extern "C" __global__ void owl_naive_attn_nc_bf16(
     const __nv_bfloat16* __restrict__ vc,
     const float* __restrict__ kv_len_p,
     int q_heads, int kv_heads, int d_dim,
-    int page, int x,
+    int page, int x, int ring_cap,
     __nv_bfloat16* __restrict__ out) {
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -235,6 +249,8 @@ extern "C" __global__ void owl_naive_attn_nc_bf16(
     const int hd_x = d_dim / x;
     const int kv_len = (int)kv_len_p[0];
     const int prefix_len = kv_len - gridDim.x;
+    // ring 门:窗口 + 自块必须互不覆盖(违反 = 硬错,不静默错槽)
+    if (ring_cap != 0 && ring_cap < OWL_NC_SLIDING_WINDOW + (int)gridDim.x) { __trap(); }
 
     const __nv_bfloat16* qs = q + ((long long)t * q_heads + h) * d_dim;
     const float scale = rsqrtf((float)d_dim);
@@ -253,8 +269,9 @@ extern "C" __global__ void owl_naive_attn_nc_bf16(
     for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             kv = __bfloat162float(kc[((long long)b * kv_heads + kvh) * hd_x * page * x
                                      + (long long)(d / x) * page * x + off * x + d % x]);
         } else {
@@ -280,8 +297,9 @@ extern "C" __global__ void owl_naive_attn_nc_bf16(
         __syncthreads();
         float p = s_p;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             p *= __bfloat162float(vc[((long long)b * kv_heads + kvh) * d_dim * page
                                      + (long long)d * page + off]);
         } else {
@@ -303,7 +321,7 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16(
     const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
                                        // E5-DF4 图化:运行时读,曾宿主烘焙)
     int q_heads, int kv_heads, int d_dim,
-    int page, int x,
+    int page, int x, int ring_cap,
     __nv_bfloat16* __restrict__ out) {        // [T, Hq, D]
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -313,6 +331,8 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16(
     const int hd_x = d_dim / x;
     const int kv_len = (int)kv_len_p[0];
     const int prefix_len = kv_len - gridDim.x;
+    // ring 门:窗口 + 自块必须互不覆盖(违反 = 硬错,不静默错槽)
+    if (ring_cap != 0 && ring_cap < OWL_NC_SLIDING_WINDOW + (int)gridDim.x) { __trap(); }
 
     const __nv_bfloat16* qs = q + ((long long)t * q_heads + h) * d_dim;
     const float scale = rsqrtf((float)d_dim);
@@ -331,8 +351,9 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16(
     for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             // B6 偷显存:前缀池 e4m3 读入即转(元素序 = 字节序)
             __nv_fp8_e4m3 ke; ke.__x = kc[((long long)b * kv_heads + kvh) * hd_x * page * x
                                  + (long long)(d / x) * page * x + off * x + d % x];
@@ -360,8 +381,9 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16(
         __syncthreads();
         float p = s_p;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             __nv_fp8_e4m3 ve; ve.__x = vc[((long long)b * kv_heads + kvh) * d_dim * page
                                  + (long long)d * page + off];
             p *= __bfloat162float(__float2bfloat16_rn(float(ve)));
@@ -385,7 +407,7 @@ extern "C" __global__ void owl_naive_attn_nc_f16_knhd(
     const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
                                        // E5-DF4 图化:运行时读,曾宿主烘焙)
     int q_heads, int kv_heads, int d_dim,
-    int page, int x,
+    int page, int x, int ring_cap,
     __half* __restrict__ out) {        // [T, Hq, D]
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -395,6 +417,8 @@ extern "C" __global__ void owl_naive_attn_nc_f16_knhd(
     const int hd_x = d_dim / x;
     const int kv_len = (int)kv_len_p[0];
     const int prefix_len = kv_len - gridDim.x;
+    // ring 门:窗口 + 自块必须互不覆盖(违反 = 硬错,不静默错槽)
+    if (ring_cap != 0 && ring_cap < OWL_NC_SLIDING_WINDOW + (int)gridDim.x) { __trap(); }
 
     const __half* qs = q + ((long long)t * q_heads + h) * d_dim;
     const float scale = rsqrtf((float)d_dim);
@@ -413,8 +437,9 @@ extern "C" __global__ void owl_naive_attn_nc_f16_knhd(
     for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             kv = __half2float(kc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d]);
         } else {
             const int st = srow - prefix_len;
@@ -439,8 +464,9 @@ extern "C" __global__ void owl_naive_attn_nc_f16_knhd(
         __syncthreads();
         float p = s_p;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             p *= __half2float(vc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d]);
         } else {
             const int st = srow - prefix_len;
@@ -462,7 +488,7 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16_knhd(
     const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
                                        // E5-DF4 图化:运行时读,曾宿主烘焙)
     int q_heads, int kv_heads, int d_dim,
-    int page, int x,
+    int page, int x, int ring_cap,
     __half* __restrict__ out) {        // [T, Hq, D]
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -472,6 +498,8 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16_knhd(
     const int hd_x = d_dim / x;
     const int kv_len = (int)kv_len_p[0];
     const int prefix_len = kv_len - gridDim.x;
+    // ring 门:窗口 + 自块必须互不覆盖(违反 = 硬错,不静默错槽)
+    if (ring_cap != 0 && ring_cap < OWL_NC_SLIDING_WINDOW + (int)gridDim.x) { __trap(); }
 
     const __half* qs = q + ((long long)t * q_heads + h) * d_dim;
     const float scale = rsqrtf((float)d_dim);
@@ -490,8 +518,9 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16_knhd(
     for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             // B6 偷显存:前缀池 e4m3 读入即转(元素序 = 字节序)
             __nv_fp8_e4m3 ke; ke.__x = kc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d];
             kv = __half2float(__half(ke));
@@ -518,8 +547,9 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_f16_knhd(
         __syncthreads();
         float p = s_p;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             __nv_fp8_e4m3 ve; ve.__x = vc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d];
             p *= __half2float(__half(ve));
         } else {
@@ -542,7 +572,7 @@ extern "C" __global__ void owl_naive_attn_nc_bf16_knhd(
     const __nv_bfloat16* __restrict__ vc,
     const float* __restrict__ kv_len_p,
     int q_heads, int kv_heads, int d_dim,
-    int page, int x,
+    int page, int x, int ring_cap,
     __nv_bfloat16* __restrict__ out) {
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -552,6 +582,8 @@ extern "C" __global__ void owl_naive_attn_nc_bf16_knhd(
     const int hd_x = d_dim / x;
     const int kv_len = (int)kv_len_p[0];
     const int prefix_len = kv_len - gridDim.x;
+    // ring 门:窗口 + 自块必须互不覆盖(违反 = 硬错,不静默错槽)
+    if (ring_cap != 0 && ring_cap < OWL_NC_SLIDING_WINDOW + (int)gridDim.x) { __trap(); }
 
     const __nv_bfloat16* qs = q + ((long long)t * q_heads + h) * d_dim;
     const float scale = rsqrtf((float)d_dim);
@@ -570,8 +602,9 @@ extern "C" __global__ void owl_naive_attn_nc_bf16_knhd(
     for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             kv = __bfloat162float(kc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d]);
         } else {
             const int st = srow - prefix_len;
@@ -596,8 +629,9 @@ extern "C" __global__ void owl_naive_attn_nc_bf16_knhd(
         __syncthreads();
         float p = s_p;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             p *= __bfloat162float(vc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d]);
         } else {
             const int st = srow - prefix_len;
@@ -619,7 +653,7 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16_knhd(
     const float* __restrict__ kv_len_p, // [1] 全窗 = 前缀 + T(契约 5;
                                        // E5-DF4 图化:运行时读,曾宿主烘焙)
     int q_heads, int kv_heads, int d_dim,
-    int page, int x,
+    int page, int x, int ring_cap,
     __nv_bfloat16* __restrict__ out) {        // [T, Hq, D]
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -629,6 +663,8 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16_knhd(
     const int hd_x = d_dim / x;
     const int kv_len = (int)kv_len_p[0];
     const int prefix_len = kv_len - gridDim.x;
+    // ring 门:窗口 + 自块必须互不覆盖(违反 = 硬错,不静默错槽)
+    if (ring_cap != 0 && ring_cap < OWL_NC_SLIDING_WINDOW + (int)gridDim.x) { __trap(); }
 
     const __nv_bfloat16* qs = q + ((long long)t * q_heads + h) * d_dim;
     const float scale = rsqrtf((float)d_dim);
@@ -647,8 +683,9 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16_knhd(
     for (int srow = srow_begin; srow < kv_len; ++srow) {
         float kv;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             // B6 偷显存:前缀池 e4m3 读入即转(元素序 = 字节序)
             __nv_fp8_e4m3 ke; ke.__x = kc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d];
             kv = __bfloat162float(__float2bfloat16_rn(float(ke)));
@@ -675,8 +712,9 @@ extern "C" __global__ void owl_naive_attn_nc_fp8kv_bf16_knhd(
         __syncthreads();
         float p = s_p;
         if (srow < prefix_len) {
-            const int b = srow / page;
-            const int off = srow % page;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int b = slot / page;
+            const int off = slot % page;
             __nv_fp8_e4m3 ve; ve.__x = vc[((long long)(b * page + off) * kv_heads + kvh) * d_dim + d];
             p *= __bfloat162float(__float2bfloat16_rn(float(ve)));
         } else {
@@ -779,7 +817,7 @@ __device__ __forceinline__ void nc_attn_loop(
     const T* __restrict__ vc,
     const float* __restrict__ kv_len_p,
     int q_heads, int kv_heads, int d_dim,
-    int page, int x,
+    int page, int x, int ring_cap,
     T* __restrict__ out) {
     const int t = blockIdx.x;
     const int kvh = blockIdx.y;   // ← GQA:一个 CTA = 一个 kv-head(其全部 q-head)
@@ -802,6 +840,8 @@ __device__ __forceinline__ void nc_attn_loop(
     const int hd_x = d_dim / x;
     const int kv_len = (int)kv_len_p[0];
     const int prefix_len = kv_len - gridDim.x;
+    // ring 门:窗口 + 自块必须互不覆盖(违反 = 硬错,不静默错槽)
+    if (ring_cap != 0 && ring_cap < OWL_NC_SLIDING_WINDOW + (int)gridDim.x) { __trap(); }
     const float scale = rsqrtf((float)d_dim);
 
     const T* qs = q + ((long long)t * q_heads + h) * d_dim;
@@ -831,8 +871,9 @@ __device__ __forceinline__ void nc_attn_loop(
     // online-softmax 的累加重排 ⇒ 装配期 oracle 门(2e-2)当场红 ⇒ 保持串行序。
     for (int srow = lo; srow < hi; ++srow) {
         const bool pre = (srow < prefix_len);
-        const int b = pre ? (srow / page) : 0;
-        const int off = pre ? (srow % page) : 0;
+        const int slot = pre ? nc_ring_slot(srow, ring_cap) : srow;
+        const int b = pre ? (slot / page) : 0;
+        const int off = pre ? (slot % page) : 0;
         float dot = 0.0f;
         if (DPL == 4 && (x % 4) == 0) {
             // 合曲路径:4 个连续 dim 落在同一 x 组(池)/ 本身就连续(自块)
@@ -946,17 +987,17 @@ extern "C" __global__ void owl_naive_attn_nc_bf16_v2(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_self,
     const __nv_bfloat16* __restrict__ v_self, const __nv_bfloat16* __restrict__ kc,
     const __nv_bfloat16* __restrict__ vc, const float* __restrict__ kv_len_p,
-    int q_heads, int kv_heads, int d_dim, int page, int x,
+    int q_heads, int kv_heads, int d_dim, int page, int x, int ring_cap,
     __nv_bfloat16* __restrict__ out) {
     const int dpl = d_dim >> 5;
     if (dpl == 4) {
         nc_attn_loop<__nv_bfloat16, 4>(q, k_self, v_self, kc, vc, kv_len_p, q_heads, kv_heads,
-                                       d_dim, page, x, out);
+                                       d_dim, page, x, ring_cap, out);
     } else if (dpl == 8) {
         nc_attn_loop<__nv_bfloat16, 8>(q, k_self, v_self, kc, vc, kv_len_p, q_heads, kv_heads,
-                                       d_dim, page, x, out);
+                                       d_dim, page, x, ring_cap, out);
     } else {
         nc_attn_loop<__nv_bfloat16, 0>(q, k_self, v_self, kc, vc, kv_len_p, q_heads, kv_heads,
-                                       d_dim, page, x, out);
+                                       d_dim, page, x, ring_cap, out);
     }
 }

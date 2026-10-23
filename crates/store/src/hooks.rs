@@ -191,6 +191,9 @@ pub struct Room {
     pub disk_kv_slots: usize,
     /// 状态腿磁盘**还能装几张快照**(0 = 盘层关)。
     pub disk_snap_slots: usize,
+    /// **整枝塌缩开关**(`[kvmem].bulk_drop_when_tier_full`):链这一轮搬不走时
+    /// 是否允许一张票丢整段。`false` = 只逐块(内容优先保留)。
+    pub bulk_drop_when_tier_full: bool,
 }
 
 /// **相一:判**(纯 host、零 I/O)。给需求 ⇒ 谁走、谁进、还是拒。
@@ -470,8 +473,30 @@ pub fn plan_capacity(
                     if got_slots >= kv_goal {
                         continue;
                     }
-                    v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Drop, span: 1 });
-                    got_slots += 1;
+                    // **整枝塌缩**（2026-10-23）：一张票 = 从叶往上到**分叉点**的整段
+                    // （只走"父无兄弟"的唯一子链；共享前缀永远不动）。执行侧
+                    // `prune_branch` 再逐块校验引用（活跃会话持有则停）。
+                    // **整枝塌缩只在"没有分层可搬"时启用**(2026-10-23):
+                    // 有宿主/磁盘层时保持逐块(既有语义:先让链缩小到装得进宿主,
+                    // 再由轮一/轮 1.5 搬走 —— 内容不丢);没有分层时逐块要 O(深度)
+                    // 个调度轮,整枝一次丢才合理。
+                    // 何时允许整枝：
+                    // · **没有分层可搬**（宿主/磁盘都没有）⇒ 只能丢，一次丢干净；
+                    // · 或开了 `bulk_drop_when_tier_full` **且这条链这一轮搬不走**
+                    //   （`collapsible_span > 宿主剩余槽`：逐层律要求整链才搬，装不下
+                    //   就等于搬不走 ⇒ 再逐块只会拖 O(深度) 个调度轮）。
+                    // 有分层且装得下 ⇒ 保持逐块（轮一/轮 1.5 会把内容搬走）。
+                    let span_full = kv.collapsible_span(tail);
+                    let no_tier = room.host_kv_slots == 0 && room.disk_kv_slots == 0;
+                    let tier_cannot_take = span_full > kv_host_room;
+                    let bulk = no_tier || (room.bulk_drop_when_tier_full && tier_cannot_take);
+                    let span = if bulk {
+                        span_full.clamp(1, kv_goal - got_slots)
+                    } else {
+                        1
+                    };
+                    v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Drop, span });
+                    got_slots += span;
                 }
                 Leg::State => {
                     let Some(key) = c.snap else { continue };
@@ -536,13 +561,18 @@ pub(crate) fn order_candidates(
     }
     policy.order(&mut first);
 
-    // ② **会话档**(2026-10-19 会话感知淘汰):
-    //    同一会话内**深度大者先逐**(末端先走 —— 保留前缀,不让"头部被逐 ⇒ 后面全垃圾");
-    //    会话之间按"该会话最冷的候选"(越冷越先);无归属(session = 0)排最后。
-    // ③ **策略档**:同一 (会话, 深度) 组内才交给 `EvictPolicy`(LRU / LRFU / 召回信号)。
+    // ② **会话档 + 策略档（2026-10-23 改判：去掉"深度为主键"）**
     //
-    // 为什么 depth 优先于策略:策略是"跨会话的新鲜度",而"从末端削"是**单会话内**的
-    // 结构约束 —— 结构约束先满足,新鲜度只在同层同深度的候选间决胜负。
+    // 前缀缓存是**树**（内容身份 = 父链哈希）：一个节点可以有多个孩子 = 分叉。
+    // 在这种结构里做淘汰，只有两条规则站得住：
+    //   1. **只有叶可逐**（结构律，由 `PrefixTree` 保证 —— 逐父节点会孤儿化整条子树）；
+    //   2. **叶之间按"这一枝有多冷"排**（策略律；LRU 缺省 = 历史更久的那枝先走）。
+    //
+    // 旧实现把 `depth` 当**全局主键**（深者先逐），它的本意是"每个会话先削自己的
+    // 末端"，但在树形分叉下 depth 与"冷热"无关：会把**刚用过的活尾巴**先逐掉，
+    // 却留下一条更冷、更短的枝（与快照面 2026-10-23 修掉的是同一个病）。
+    // 现在：会话之间按"该会话最冷的候选"（冷会话先，无主最后）；**会话内交给
+    // `EvictPolicy`（缺省 LRU）**。`depth` 仍记账（诊断/口径），但不再参与排序。
     let mut sess_cold: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     for c in &rest {
         let e = sess_cold.entry(c.session).or_insert(u64::MAX);
@@ -550,19 +580,13 @@ pub(crate) fn order_candidates(
             *e = c.last_use;
         }
     }
-    let mut groups: std::collections::BTreeMap<(u64, usize), Vec<EvictCandidate>> =
+    let mut groups: std::collections::BTreeMap<u64, Vec<EvictCandidate>> =
         std::collections::BTreeMap::new();
     for c in rest {
-        groups.entry((c.session, c.depth)).or_default().push(c);
+        groups.entry(c.session).or_default().push(c);
     }
-    let mut keys: Vec<(u64, usize)> = groups.keys().copied().collect();
-    // **深度在前、会话在后**(2026-10-19 用户语义精修):先按**全局深度降序**
-    // —— 每个会话都先削自己的**最深边界**(末端),浅的(前缀)留到最后 ⇒
-    // "优先留存已计算的前缀内容" 对**每个会话**成立,而不是"最冷会话被一路削光"。
-    // 同一深度层内才按会话冷热(冷者先),再交给策略对象。
-    keys.sort_by_key(|(s, d)| {
-        (std::cmp::Reverse(*d), *s == crate::policy::NO_SESSION, *sess_cold.get(s).unwrap_or(&u64::MAX))
-    });
+    let mut keys: Vec<u64> = groups.keys().copied().collect();
+    keys.sort_by_key(|s| (*s == crate::policy::NO_SESSION, *sess_cold.get(s).unwrap_or(&u64::MAX)));
     let mut ordered: Vec<EvictCandidate> = Vec::with_capacity(groups.values().map(|g| g.len()).sum());
     for k in keys {
         if let Some(mut g) = groups.remove(&k) {
@@ -573,7 +597,97 @@ pub(crate) fn order_candidates(
     first.into_iter().chain(ordered).collect()
 }
 
+/// **快照槽位出序**(专用;2026-10-23 —— 与 KV 块的"末端先削"脱钩)。
+///
+/// 为什么不能沿用 [`order_candidates`] 的会话深度档:那条规则是为 **KV 块**
+/// 立的(父块被逐 ⇒ 子链不可达),对**快照**并不成立 —— 每条快照按自己的边界
+/// 身份独立键控,逐掉浅的不会让深的失效。而"深度大者先逐"恰好会**先逐掉
+/// 最有用的一条**:会话**上一轮的尾巴**既是指令续写的前缀复用面,也是
+/// 前缀无感删除的 GDN 恢复点(实测:滑窗 6 轮后 `snap_max=4/16` 都把尾巴
+/// 逐掉 ⇒ 删除退化为全量重算)。
+///
+/// 现行语义 = **事实档 + 新鲜度**:
+/// 1. `Transient`(生成段快照,逐出零代价)最前;
+/// 2. 其余按 `EvictPolicy`(缺省 LRU = `last_use`)—— 刚拍/刚用的尾巴自然
+///    最后被逐,冷会话先走。
+pub(crate) fn order_snap_victims(
+    policy: &dyn EvictPolicy,
+    cands: Vec<EvictCandidate>,
+    state: &StateStore,
+) -> Vec<EvictCandidate> {
+    let mut transient: Vec<EvictCandidate> = Vec::new();
+    let mut durable: Vec<EvictCandidate> = Vec::new();
+    for c in cands {
+        let t = c
+            .snap
+            .map(|k| state.snap_durability(k) == Some(SnapDurability::Transient))
+            .unwrap_or(false);
+        if t {
+            transient.push(c);
+        } else {
+            durable.push(c);
+        }
+    }
+    policy.order(&mut transient);
+    policy.order(&mut durable);
+    transient.into_iter().chain(durable).collect()
+}
+
 // **自证(§30.4)**:判据唯一由本文件的 `plan_capacity` 承担 ——
 // `Rel::plan_need` 是唯一生产入口,`Rel::plan_evict`/旧 `hooks::plan` 已删除;
 // `KvStore::ensure_for_len` 保留为**兜底**(报告面 `ops.ensure_evicted > 0`
 // = 调度器失职的告警信号,不是另一套判据)。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::id::ChainHash;
+    use crate::policy::EvictPolicyKind;
+
+    fn cand(session: u64, depth: usize, last_use: u64, chain: u64) -> EvictCandidate {
+        EvictCandidate {
+            leg: Leg::Kv,
+            tier: Tier::Gpu,
+            bytes: 1,
+            last_use,
+            chain: Some(ChainHash::new(chain)),
+            snap: None,
+            session,
+            depth,
+        }
+    }
+
+    /// **树形分叉的出序**（2026-10-23 改判）：叶之间按**冷热**（历史更久的那枝先），
+    /// 不按深度 —— 深度与"这一枝有多冷"无关，深度优先会把刚用过的活尾巴先逐掉。
+    #[test]
+    fn branch_victim_is_the_coldest_not_the_deepest() {
+        let state = StateStore::new(1, 1);
+        let policy = EvictPolicyKind::Lru.build();
+        let cands = vec![
+            cand(1, 90, 100, 1), // 很深,但刚用过(活尾巴)
+            cand(1, 3, 5, 2),    // 很浅,但最冷(旧分叉)
+            cand(1, 50, 200, 3), // 更深更新
+        ];
+        let order = order_candidates(policy.as_ref(), cands, &state);
+        assert_eq!(
+            order[0].chain,
+            Some(ChainHash::new(2)),
+            "先逐最冷的那枝(不按深度)"
+        );
+        assert_eq!(order[2].chain, Some(ChainHash::new(3)), "最新的最后走");
+    }
+
+    /// 会话之间：**冷会话先走**（无主最后），会话内仍是新鲜度。
+    #[test]
+    fn cold_session_is_evicted_before_hot_one() {
+        let state = StateStore::new(1, 1);
+        let policy = EvictPolicyKind::Lru.build();
+        let cands = vec![
+            cand(7, 40, 900, 1),  // 热会话
+            cand(9, 2, 10, 2),    // 冷会话
+            cand(7, 80, 950, 3),
+        ];
+        let order = order_candidates(policy.as_ref(), cands, &state);
+        assert_eq!(order[0].chain, Some(ChainHash::new(2)), "冷会话先走");
+    }
+}

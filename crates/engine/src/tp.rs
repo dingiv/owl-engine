@@ -55,6 +55,10 @@ pub struct TpOpts {
     /// **v1 两核融合档**(§11.2;2026-10-19):AR 一核做完两段(只非 fp8 载荷)。
     /// 由入口显式传入(缺省关);两 rank 必须同档。
     pub ar_fused: bool,
+    /// **barrier-only AR-2**(2026-10-23):小包 graph 专用;与 fused 同线格式。
+    /// 复用 v1 的 produced/consumed 相对游标 + 双槽,但去掉尾部 rendezvous、
+    /// wait_done/blocks_done 与全线程 system fence。peer 只读别名即可。
+    pub ar2: bool,
     /// **1-stage 对称 arena 档**(§35):结构更对但实测中性 ⇒ 缺省关。
     /// 由入口显式传入(与 push 互斥),**不再读 `OWL_TP_1STAGE`**。
     pub one_stage: bool,
@@ -77,6 +81,8 @@ pub struct TpStaging {
     ar_f8: bool,
     /// **v1 两核融合档**(与 `TpOpts::ar_fused` 同值;§11.2)
     ar_fused: bool,
+    /// **barrier-only AR-2**(与 `TpOpts::ar2` 同值;2026-10-23)
+    ar2: bool,
     pub(crate) layout: StagingLayout,
 }
 
@@ -116,6 +122,7 @@ impl TpStaging {
             push: self.push,
             ar_f8: self.ar_f8,
             ar_fused: self.ar_fused,
+            ar2: self.ar2,
         }
     }
 }
@@ -774,7 +781,10 @@ async fn handshake_staging(
     // ★ **push 档 ⇒ 别名授 RW**(§36.6/§36.7):push 的两核要把本端 payload
     // **写进对端槽**(`st.global` 跨 PCIe),只读授予会当场 ILLEGAL_ADDRESS。
     // v1 保持只读(现役行为零变化;RW 只是**访问级别**不同,不额外占窗口预算)。
-    let (peer0, peer1) = if opts.push {
+    // AR-2 固定 v1 数据腿(写本端/读对端),不写对端 header ⇒ 不需要 RW;
+    // 只有 push 要写对端数据槽时才授 RW。
+    let peer_rw = opts.push;
+    let (peer0, peer1) = if peer_rw {
         let p0 = face0
             .peer_import_rw(cred1, bytes, uuid1.to_string(), "tp.peer.rw.r0")
             .await
@@ -783,7 +793,11 @@ async fn handshake_staging(
             .peer_import_rw(cred0, bytes, uuid0.to_string(), "tp.peer.rw.r1")
             .await
             .map_err(|e| ModelError::Msg(format!("TP staging RW 导入失败(rank1 ← rank0):{e}")))?;
-        owl_shared::log_info!("tp", "TP2 staging 别名已授 **PROT_READWRITE**(push 档;写对端槽)");
+        owl_shared::log_info!(
+            "tp",
+            "TP2 staging 别名已授 **PROT_READWRITE**(push={};写对端槽)",
+            opts.push
+        );
         (p0, p1)
     } else {
         let p0 = face0
@@ -819,8 +833,8 @@ async fn handshake_staging(
         (None, None)
     };
     Ok((
-        TpStaging { own: own0, peer: peer0, arena: arena0, push: opts.push, ar_f8: opts.ar_f8, ar_fused: opts.ar_fused, layout },
-        TpStaging { own: own1, peer: peer1, arena: arena1, push: opts.push, ar_f8: opts.ar_f8, ar_fused: opts.ar_fused, layout },
+        TpStaging { own: own0, peer: peer0, arena: arena0, push: opts.push, ar_f8: opts.ar_f8, ar_fused: opts.ar_fused, ar2: opts.ar2, layout },
+        TpStaging { own: own1, peer: peer1, arena: arena1, push: opts.push, ar_f8: opts.ar_f8, ar_fused: opts.ar_fused, ar2: opts.ar2, layout },
     ))
 }
 

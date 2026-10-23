@@ -173,6 +173,11 @@ pub struct FiRuntime {
     plan_ragged: Option<(RaggedKey, [i64; 15])>,
     /// 视觉塔 ragged 的**规范 int32 段界**([0, rows];plan 期写一次,回放期只读)
     ragged_cu: Option<ScratchBuf>,
+    /// vLLM FA2 varlen 的 unpadded LSE 擦写区（`[heads, total_q] f32`；
+    /// 8 MiB 覆盖视觉单图上限；见 `FA2_LSE_BYTES`）
+    fa2_lse: Option<ScratchBuf>,
+    /// FA2 的 int32 cu_seqlens scratch（视觉契约的 cu 是 f32；单图 [0, rows]）
+    fa2_cu: Option<ScratchBuf>,
 }
 /// 视觉塔 ragged plan 键(单图契约 ⇒ 三件即可)
 #[derive(Clone, Copy, PartialEq)]
@@ -290,6 +295,8 @@ impl Default for FiRuntime {
             last_capturing: false,
             stamp: 0,plan_ragged: None,
             ragged_cu: None,
+            fa2_lse: None,
+            fa2_cu: None,
         }
     }
 }
@@ -319,6 +326,11 @@ impl KernelFamily for FiRuntime {
             last_capturing: false,
             stamp: 0,plan_ragged: None,
             ragged_cu: Some(res.alloc(64, "fi.ragged_cu")?),
+            fa2_lse: Some(res.alloc(
+                crate::family::flashinfer::FA2_LSE_BYTES,
+                "fa2.lse",
+            )?),
+            fa2_cu: Some(res.alloc(64, "fa2.cu")?),
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -353,6 +365,9 @@ impl KernelFamily for FiRuntime {
         // 视觉塔注意力(ragged 非因果;2026-10-15)—— 独立契约,先分流
         if msg.kernel.name == crate::family::flashinfer::ATTN_RAGGED_F16 {
             return self.run_attn_ragged(msg, res);
+        }
+        if msg.kernel.name == crate::family::flashinfer::FA2_VARLEN_F16 {
+            return self.run_fa2_varlen(msg, res);
         }
         let call = parse_prefill(msg)?;
         let r = |b: &crate::client::flashinfer::BlockRef| {
@@ -856,5 +871,105 @@ impl FiRuntime {
             fi_cuda_graph(),
         );
         self.activate(key, res)
+    }
+}
+
+// ============================================================================
+// 视觉塔：vLLM 原版 FA2 varlen（hd72 → kHeadDim 96）
+// ============================================================================
+
+impl FiRuntime {
+    /// 一次调用 = 一层 attention。q/k/v `[rows, heads, 72]` f16，
+    /// cu_seqlens patch 级 int32，LSE 用本 runtime 的 `fa2_lse` 擦写区。
+    /// **单图契约**：`n_seq == 1`；多图仍走 native（driver 分流）。
+    fn run_fa2_varlen(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+    ) -> Result<Bytes, OpError> {
+        let call = crate::client::flashinfer::parse_attn_ragged(msg)?;
+        if call.n_seq != 1 {
+            return Err(OpError::Contract {
+                op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
+                field: "n_seq",
+                expect: "1(单图；多图走 native)".into(),
+                got: format!("{}", call.n_seq),
+            });
+        }
+        if call.head_dim != 72 {
+            return Err(OpError::Contract {
+                op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
+                field: "head_dim",
+                expect: "72(vLLM kHeadDim=96 路径)".into(),
+                got: format!("{}", call.head_dim),
+            });
+        }
+        let r = |b: &crate::client::flashinfer::BlockRef| {
+            res.resolve(b.id).map(|p| p + b.byte_offset)
+        };
+        let q = r(&call.q)?;
+        let k = r(&call.k)?;
+        let v = r(&call.v)?;
+        let _ = r(&call.cu)?; // 旧 f32 契约槽：FA2 用 fa2_cu（int32）重写
+        let out = r(&crate::client::flashinfer::BlockRef {
+            id: call.out.id,
+            byte_offset: 0,
+        })?;
+        let (lse_ptr, lse_bytes) = {
+            let l = self.fa2_lse.as_ref().ok_or_else(|| OpError::Asset {
+                op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
+                detail: "fa2.lse 擦写区未装配".into(),
+            })?;
+            (l.ptr, l.bytes)
+        };
+        let cu_dev = self
+            .fa2_cu
+            .as_ref()
+            .ok_or_else(|| OpError::Asset {
+                op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
+                detail: "fa2.cu 擦写区未装配".into(),
+            })?
+            .ptr;
+        let need = call.heads.saturating_mul(call.rows).saturating_mul(4);
+        if need > lse_bytes {
+            return Err(OpError::Contract {
+                op: crate::family::flashinfer::FA2_VARLEN_F16.into(),
+                field: "fa2_lse",
+                expect: format!("≥ heads×rows×4 = {need} B"),
+                got: format!("{lse_bytes} B"),
+            });
+        }
+        let stream = res.stream()?;
+        res.note_device(
+            "fam_ffi_launch",
+            &msg.kernel.name,
+            0,
+            &[q, k, v, out, lse_ptr],
+        );
+        let rc = unsafe {
+            crate::family::flashinfer::owl_fa2_varlen_fwd_f16(
+                q as *const std::ffi::c_void,
+                k as *const std::ffi::c_void,
+                v as *const std::ffi::c_void,
+                out as *mut std::ffi::c_void,
+                lse_ptr as *mut f32,
+                cu_dev as *mut i32,
+                1,
+                call.rows as i32,
+                call.rows as i32,
+                call.heads as i32,
+                call.head_dim as i32,
+                call.scale,
+                stream.cu_stream() as *mut std::ffi::c_void,
+            )
+        };
+        if rc != 0 {
+            return Err(OpError::Launch {
+                op: msg.kernel.name.clone(),
+                stage: crate::contract::Stage::Compute,
+                detail: format!("fa2 varlen err {rc}"),
+            });
+        }
+        Ok(Bytes::new(call.out.id, msg.out_elems, Dtype::F16, 2))
     }
 }

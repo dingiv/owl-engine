@@ -217,6 +217,10 @@ mod tests {
     /// 每个 parse 的名字表与声明表**集合逐字相等**(顺序另锁)
     #[test]
     fn parse_slots_are_exactly_declared() {
+        // FA2 varlen 表始终存在（ops 声明面），client 模块本身在 flashinfer
+        // feature 下才编；测试面显式列同一张槽名表，保证“声明面全覆盖”。
+        const FA2_SLOTS: &[&str] =
+            &["q", "k", "v", "cu_seqlens", "out", "rows", "heads", "head_dim", "n_seq", "scale"];
         let mut cases: Vec<(&str, &[&str])> = vec![
             (
                 crate::family::gdn_chunked::GDN_CHUNKED_FWD,
@@ -242,6 +246,10 @@ mod tests {
             (crate::family::comm::asset::FUSED_F16, crate::client::comm::PARSE_SLOTS_FUSED),
             (crate::family::comm::asset::FUSED_BF16, crate::client::comm::PARSE_SLOTS_FUSED),
             (crate::family::comm::asset::FUSED_F32, crate::client::comm::PARSE_SLOTS_FUSED),
+            // barrier-only AR-2(2026-10-23):与 fused 同 8 槽线格式
+            (crate::family::comm::asset::BARRIER_F16, crate::client::comm::PARSE_SLOTS_FUSED),
+            (crate::family::comm::asset::BARRIER_BF16, crate::client::comm::PARSE_SLOTS_FUSED),
+            (crate::family::comm::asset::BARRIER_F32, crate::client::comm::PARSE_SLOTS_FUSED),
             // fp8 载荷档(§47 第二步;线格式与常规档**逐字同形** —— 只是核名不同)
             (crate::family::comm::asset::STAGE_F8_F16, crate::client::comm::PARSE_SLOTS),
             (crate::family::comm::asset::STAGE_F8_BF16, crate::client::comm::PARSE_SLOTS),
@@ -291,6 +299,7 @@ mod tests {
             (crate::family::xqa::PREFILL_XQA, crate::client::xqa::PARSE_SLOTS),
         ]);
 
+        cases.push((crate::family::flashinfer::FA2_VARLEN_F16, FA2_SLOTS));
         for (entry, want) in cases.iter() {
             let m = crate::ops::meta(entry).unwrap_or_else(|| panic!("{entry} 未建表"));
             assert_eq!(
@@ -312,6 +321,8 @@ mod tests {
             crate::family::gdn_chunked::GDN_CHUNKED_FWD,
             crate::family::gdn_scalar::GDN_SCALAR_FWD,
         ];
+        // FA2 varlen（声明面常驻；parse 面在 flashinfer feature）
+        want.push(crate::family::flashinfer::FA2_VARLEN_F16);
         want.extend([
             crate::family::comm::asset::STAGE_F16,
             crate::family::comm::asset::STAGE_BF16,
@@ -332,6 +343,10 @@ mod tests {
             crate::family::comm::asset::FUSED_F16,
             crate::family::comm::asset::FUSED_BF16,
             crate::family::comm::asset::FUSED_F32,
+            // barrier-only AR-2(2026-10-23)
+            crate::family::comm::asset::BARRIER_F16,
+            crate::family::comm::asset::BARRIER_BF16,
+            crate::family::comm::asset::BARRIER_F32,
         ]);
         #[cfg(feature = "cublas")]
         want.extend([

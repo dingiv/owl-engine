@@ -58,19 +58,20 @@
 //! | runtime | test_device / server_url | 测试域 / CLI(不入 toml) |
 //! | parallel | mode | ParallelMode 枚举 single\|tensor\|layer / single(layer 暂未支持=拒) |
 //! | parallel | device | [String] 卡位(BDF / UUID / find-name;**禁 CUDA 序号**);空 = 自动挑空闲卡 |
-//! | parallel | tp_push / tp_ar_f8 / tp_vocab_split / tp_ar_fused / tp_one_stage | TP 档(见字段注) |
+//! | parallel | tp_push / tp_ar_f8 / tp_vocab_split / tp_ar_fused / tp_ar2 / tp_one_stage | TP 档(见字段注) |
 //! | model | format | ModelFormat 枚举 safetensors\|awq\|gguf / safetensors |
 //! | model | path / name | Option<PathBuf> / None(模型目录或 .gguf 单文件) |
 //! | model | awq27b_dir | Option<String> / None(27B AWQ 检查点门控) |
 //! | model | quant | QuantScheme(safetensors/awq: w4a16\|w4a8;gguf: q4k\|iq4\|iq3) |
 //! | model | vision / vision_path | bool / false + Option(视觉塔;GGUF 档 = `mmproj-*.gguf` 单文件) |
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
-//! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
+//! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row"\|"rtn-int8-row-a8")/ off |
 //! | pool | kv_fp8 | bool / false(主 KV 池 e4m3;32 KiB/token) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
+//! | pool | image_evict | bool / false(**前缀无感删除**:客户端给可删图像打标记 ⇒ 引擎页对齐 + 删除即位置帧平移) |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
 //! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
 //! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
@@ -96,12 +97,13 @@
 //! | kernel | gguf_tile / gguf_cublas / gguf_mmq2 / gguf_mmq / gguf_smem | bool / 全 true |
 //! | kernel | fi_cuda_graph | bool / false(图档瓦;FI 臂的配套件) |
 //! | kernel | fi_plan_bake / fi_plan_restore | bool / false、true(烘 plan 进图;上界恒 = max_seq) |
-//! | spec | depth | usize / 0;上限 = `SPEC_DEPTH_MAX` = 7(超限拒启) |
+//! | spec | depth | usize / 0;上限 = `SPEC_DEPTH_MAX` = 15(超限拒启) |
 //! | dispatch | allowed_ops | **已退役**(旧键 `deny_unknown_fields` 拒启;准入走 tag filter) |
 //! | dispatch | tag_wildcard | bool / false(诊断 `*`:跳过 tag 过滤) |
 //! | kvmem | select_decode / select_partial / index / index_gpu / pool_overcommit | flag / false、true(index_gpu 缺省 true) |
 //! | kvmem | workspace_per_req / select_sink / select_recent / recall_every | usize / 2240、2、4、1 |
 //! | kvmem | coverage_probe / analyze_at_ctx / evict_policy / dense_floor_mib | 见字段注(lru\|lrfu[:λ]) |
+//! | kvmem | bulk_drop_when_tier_full | bool / false(整枝塌缩:宿主/磁盘装不下时允许一次丢整段) |
 //! | probes | step_profile / perf_level / gdn_dump / debug / prefill_cksum / fact_probe | flag / false |
 //! | probes | step_gate / step_gate_ms / step_gate_us / step_gate_every | StepMode("off"\|"sticky"\|"single") / 50 / 0(覆盖 ms) / 1 |
 //! | log | level / tags_allow / tags_deny / file / max_mb / keep / timestamp | 见模块 |
@@ -207,9 +209,15 @@ pub enum HeadQuant {
     /// 口径 A/B 恒等门已过(prose/数学逐字同,竖式同错=模型固有)
     RtnInt4G32,
     /// **per-row 对称 int8**(P1.5-a,2026-10-20):`s_o = absmax/127`,
-    /// `q = RN-even(w/s)`;装载期现算,头走 `owl_gemv_i8w_bf16`
-    /// (decode 单步 1.76 → ~0.89 ms)。质量门 = top-1 ≥99.9% + 贪心 256 逐字。
+    /// `q = RN-even(w/s)`;装载期现算。m=1 走 `owl_gemv_i8w_bf16`
+    /// (单步 1.76 → ~0.89 ms);spec m=7/8 走 `owl_gemv_i8w_mt_*`
+    /// (2026-10-22,权重只读一遍;8 token 2.07 ms / 7 token 1.45 ms)。
+    /// 质量门 = top-1 ≥99.9% + 贪心 256 逐字。
     RtnInt8Row,
+    /// **W8A8 头**(2026-10-22 实验档):权重同 `RtnInt8Row`,前向把 hidden
+    /// 按 token 量化成 int8 + f32 scale,内积走 `__dp4a`。目标 = 把 spec
+    /// 头从 ~1.5–2.1 ms 压到 ~1 ms;激活量化有一层额外误差,质量门同 int8。
+    RtnInt8RowA8,
     // 预留:GptqInt4G128(需自采 hidden states 产量化,另案)、
     // RtnInt8G128(中间档)——加值时同步 loader 映射与质量门台账
 }
@@ -424,6 +432,12 @@ pub struct ParallelCfg {
     /// 少发一个核 ≈ decode +4%。**只非 fp8 载荷**；两 rank 同装配。
     #[serde(default)]
     pub tp_ar_fused: bool,
+    /// **barrier-only AR-2**(2026-10-23)：小包(≤256KiB)/非 fp8 的 graph AR
+    /// 走单 block、v1 produced/consumed 相对游标 + release/acquire；去掉尾部
+    /// rendezvous、`wait_done/blocks_done` 与全线程 system fence。
+    /// 需 `mode = "tensor"`；与 `tp_one_stage` 互斥。缺省 false；两 rank 同装配。
+    #[serde(default)]
+    pub tp_ar2: bool,
     /// **1-stage 对称 arena 档**(§35 2026-10-18)：staging 换对称 arena，结构更对
     /// 但实测**中性** ⇒ 缺省关。互斥与前提(validate 拒启，不静默失效)：
     /// 与 `tp_push` 互斥；需 `mode = "tensor"`。
@@ -440,6 +454,7 @@ impl Default for ParallelCfg {
             tp_ar_f8: false,
             tp_vocab_split: false,
             tp_ar_fused: false,
+            tp_ar2: false,
             tp_one_stage: false,
         }
     }
@@ -595,6 +610,18 @@ pub struct PoolCfg {
     pub vram_target: f64,
     pub vram_reserve_mb: u64,
     pub prefix_cache: bool,
+    /// **前缀无感删除(图像段)** —— 2026-10-23 用户裁决:引擎**不自作主张**,
+    /// 必须由客户端显式给图像打「将来可能被删」标记(`TurnImage::evict`)且本键开。
+    ///
+    /// 开 = 对**带标记**的图像段做两件事:
+    /// ① 页对齐 pad(段首落页边界、整段整页 —— 删除后块表拼接零搬运);
+    /// ② 下一轮若识别到「历史里正好少了这一段」,保留后缀页 + 只把后缀 K
+    ///    乘 `R(−S)`(位置帧平移),不重算前缀之后的任何 token。
+    ///
+    /// 关 = 逐字节旧行为(标记被忽略;带了标记也**响亮拒**,不静默降级)。
+    /// 依赖:`prefix_cache = true`(内容寻址取旧链)与 f16 KV(paged kNHD;
+    /// fp8 池需 dequant→requant,未做)。
+    pub image_evict: bool,
     /// **解释器块池预算**(字节;0 = 关 = 逐节点 alloc/free 存量路径)。
     /// 原 `OWL_BLOCK_POOL` env;P1″ 块竞技场(见 `interpreters::eval`)。
     pub block_pool_bytes: usize,
@@ -780,6 +807,16 @@ pub struct KvmemCfg {
     /// LRFU(召回点选中的块抬 keep-score)⇒ 出序时"又冷又没被注意力用过"的先下沉。
     /// λ 参数在此解析(A4 收口,2026-10-19)。
     pub evict_policy: EvictPolicyCfg,
+    /// **整枝塌缩**(2026-10-23):Drop 轮是否允许"一张票丢一整段"。
+    ///
+    /// 缺省 `false` = 保守:只要宿主/磁盘层还有空位,就保持逐块(先让链缩小到
+    /// 装得进宿主 → 轮一下沉/轮 1.5 搬盘,内容优先保留)。**没有分层**的档位
+    /// 本来就走整枝(没地方可搬)。
+    ///
+    /// 开 = 当这条链**这一轮搬不走**时(宿主剩余槽 < 链长,且磁盘也接不了)
+    /// 允许整枝丢 —— 避免"宿主/磁盘长期满 + 深冷枝"时要 O(深度) 个调度轮才腾干净。
+    /// 语义前提(用户裁决 2026-10-23):淘汰只看**时间**(新鲜度),不看内容"贵不贵"。
+    pub bulk_drop_when_tier_full: bool,
     /// **准入地板**(MiB;`None` = 跟随虚拟化姿态)。
     ///
     /// 语义 = "本 turn 至少要有多少 **KV 页**直接驻留在设备"
@@ -865,6 +902,21 @@ pub struct SpecCfg {
     /// 草稿池按这个窗口做环形缓冲(不再按 pool_tokens 全量物化);
     /// 当前 NC 核只实例化 2048,写非 2048 = boot 拒(等核支持 4k/8k)。
     pub draft_window: usize,
+    /// **DFlash2 lookup-augmented drafting(LABD)**：在当前请求的 token 历史里
+    /// 找当前后缀的最近一次出现，用其后续 token 覆盖/补齐草稿块。
+    /// 只服务 DFlash2（`draft=dflash2` 或 `auto`+`draft_path`）；MTP/Off 写了 = boot 拒。
+    /// 缺省 false（旧档逐字节不变）。
+    pub lookup: bool,
+    /// lookup 后缀最短匹配（token；含当前末 token）。vLLM 缺省 6。
+    pub lookup_nmin: usize,
+    /// lookup 后缀最长匹配（token）。vLLM 缺省 12（长于 12 会偏好更老的长匹配）。
+    pub lookup_nmax: usize,
+    /// 头块覆盖的强匹配阈值：`match_len >= lookup_nstrong` 直接覆盖。
+    /// vLLM 缺省 6（与 nmin 同值 = 任意 nmin 匹配都覆盖）。
+    pub lookup_nstrong: usize,
+    /// 头块弱匹配所需的草稿一致性：`match_len >= nmin && agree >= lookup_agree`。
+    /// vLLM 缺省 0（不要求一致，与 nstrong=nmin 配合）。
+    pub lookup_agree: usize,
     /// **MTP 草稿注意力的滑动窗口(token;0 = 关闭,走全上下文)**。
     /// 只作用于 MTP draft 的读;target verify 始终全上下文。
     /// 页粒度由运行时按 `StatePool::geom.page` 向上取整;启动日志打印
@@ -1034,11 +1086,19 @@ impl DecodeArm {
 
 /// **verify 图的行容量上限**(= `depth + 1` 的最大值;**单一产地**)。
 ///
-/// 为什么是 8:spec 轮的 fold 记录/快照按 `gdn 层数 × 本值` 铺
-/// (`graph_fleet` 的 `n_rec`、`exec/spec.rs` 的可折叠判据、`state` 的快照行宽),
+/// 为什么是 16:DFlash2 NInfer 路线 K=1..15 ⇒ W=K+1 最大 16。
+/// 它只约束 verify 图/输入槽/`kv_slots` 的行数；GDN fold 记录是另一个
+/// 常量 [`SPEC_FOLD_RECORDS_PER_LAYER`]（8 件/层），不要混用。
 /// 这是**结构性**上限 —— `[spec] depth` 超出即拒启(不静默截断;
 /// 2026-10-21 前该处是 `depth_raw.min(3/7)` 的硬钳,MTP 因此只能跑 3 步)。
-pub const SPEC_VERIFY_ROWS_MAX: usize = 8;
+pub const SPEC_VERIFY_ROWS_MAX: usize = 16;
+
+/// **每层 GDN fold 记录件数**(conv 三 raw + 递推五件;与 verify 行数无关)。
+///
+/// 历史上它和 `SPEC_VERIFY_ROWS_MAX` 都是 8，被误当同一常量使用；
+/// DFlash2 K=1..15 把行容量抬到 16 后必须解耦，否则会去找不存在的
+/// r{16..31} 输出槽。
+pub const SPEC_FOLD_RECORDS_PER_LAYER: usize = 8;
 
 /// **MTP/投机深度的上限**(= 行容量 - 1)
 pub const SPEC_DEPTH_MAX: usize = SPEC_VERIFY_ROWS_MAX - 1;
@@ -1050,6 +1110,12 @@ pub const SPEC_DEPTH_MAX: usize = SPEC_VERIFY_ROWS_MAX - 1;
 pub struct KernelCfg {
     /// W2 qkv 融合(缺省真;2026-10-04 k-probe 硬门定谳)
     pub qkv_fuse: bool,
+    /// **W4A8 Marlin int8 m8 8-row 解码**(2026-10-22;实验,缺省 false)。
+    ///
+    /// 来自 famp-marlin 的 kS8 `m_block_size_8` 路径;3080 实测与 16-row
+    /// 持平/略慢(权重都只读一遍)⇒ 默认关。仅作为 3090/形状复验的显式配置。
+    #[serde(default)]
+    pub marlin_w4a8_m8: bool,
     /// **GGUF 小 n 的 MMVQ 判据**(MiB;`0` = 关 = 一律走复用臂)。
     ///
     /// 语义:「整张量 ≤ 本值(装得进 L2)且 `m ≤ TILE_MT` ⇒ 让 MMVQ 赢」
@@ -1547,6 +1613,7 @@ impl Default for PoolCfg {
             vram_target: 0.97,
             vram_reserve_mb: 1024,
             prefix_cache: true,
+            image_evict: false,
             block_pool_bytes: 0,
             no_reclaim: false,
             vram_budget_mb: None,
@@ -1575,6 +1642,7 @@ impl Default for KvmemCfg {
             coverage_probe: false,
             analyze_at_ctx: 0,
             evict_policy: EvictPolicyCfg::Lru,
+            bulk_drop_when_tier_full: false,
             dense_floor_mib: None,
             pool_overcommit: false,
         }
@@ -1591,6 +1659,11 @@ impl Default for SpecCfg {
             dumb: false,
             draft_kv_fp8: false,
             draft_window: 0,
+            lookup: false,
+            lookup_nmin: 6,
+            lookup_nmax: 12,
+            lookup_nstrong: 6,
+            lookup_agree: 0,
             mtp_window: 0,
             mtp_sink: 64,
             mtp_window_min_ctx: 0,
@@ -1611,6 +1684,7 @@ impl Default for KernelCfg {
     fn default() -> Self {
         Self {
             qkv_fuse: true,
+            marlin_w4a8_m8: false,
             gguf_mmvq_l2_mib: default_gguf_mmvq_l2_mib(),
             prefill_split: false,
             force_naive_prefill: false,
@@ -2212,12 +2286,46 @@ impl OwlConfig {
     /// (tests / cli)裸奔。
     pub fn validate(&self) -> Result<(), String> {
         // **投机深度上限**(2026-10-21):verify 图行容量 `SPEC_VERIFY_ROWS_MAX` 是
-        // 结构性事实(fold 记录/快照按它铺)—— 超限**拒启**,不静默截断。
+        // 结构性事实(verify 图 T=depth+1;DFlash2 W=K+1 上限)—— 超限**拒启**,不静默截断。
         if self.spec.depth > SPEC_DEPTH_MAX {
             return Err(format!(
-                "[spec] depth = {} 超结构上限 {} (verify 图行容量 {}=(depth+1);fold 记录/快照按它铺,改它需改 state/graph_fleet 的分配面)",
+                "[spec] depth = {} 超结构上限 {} (verify 图行容量 {}=depth+1;DFlash2 K=1..15 的 W=K+1 上限;改它需同步 verify 图/拼接槽/kv_slots)",
                 self.spec.depth, SPEC_DEPTH_MAX, SPEC_VERIFY_ROWS_MAX
             ));
+        }
+        // **DFlash2 lookup 自洽**(2026-10-22):只服务 DFlash2;nmin/nmax/
+        // nstrong/agree 的代数关系在配置面先拒，boot 再按实际裁决模式兜底。
+        if self.spec.lookup {
+            if self.spec.depth == 0 {
+                return Err("[spec] lookup = true 但 depth = 0（无投机可查）".to_string());
+            }
+            if self.spec.lookup_nmin == 0 {
+                return Err("[spec] lookup_nmin 必须 >= 1".to_string());
+            }
+            if self.spec.lookup_nmax < self.spec.lookup_nmin {
+                return Err(format!(
+                    "[spec] lookup_nmax = {} 必须 >= lookup_nmin = {}",
+                    self.spec.lookup_nmax, self.spec.lookup_nmin
+                ));
+            }
+            if self.spec.lookup_nmax > 128 {
+                return Err(format!(
+                    "[spec] lookup_nmax = {} 超上限 128",
+                    self.spec.lookup_nmax
+                ));
+            }
+            if self.spec.lookup_nstrong > self.spec.lookup_nmax {
+                return Err(format!(
+                    "[spec] lookup_nstrong = {} 必须 <= lookup_nmax = {}",
+                    self.spec.lookup_nstrong, self.spec.lookup_nmax
+                ));
+            }
+            if self.spec.lookup_agree > SPEC_DEPTH_MAX {
+                return Err(format!(
+                    "[spec] lookup_agree = {} 超结构上限 {}",
+                    self.spec.lookup_agree, SPEC_DEPTH_MAX
+                ));
+            }
         }
         // **MTP 窗口自洽**(2026-10-21):sink 是窗口之外的前缀;若 sink
         // 吃掉了整个 window,配置语义不成立。window=0 时 sink 无消费者,
@@ -2314,6 +2422,20 @@ impl OwlConfig {
         for d in &par.device {
             crate::device::DeviceSpec::parse(d).map_err(|e| format!("[parallel] device = {d:?}: {e}"))?;
         }
+        if par.tp_ar2 {
+            if par.mode != ParallelMode::Tensor {
+                return Err(
+                    "[parallel] tp_ar2 = true 需 mode = \"tensor\"(单卡档无 TP 通信,开关无效)"
+                        .to_string(),
+                );
+            }
+            if par.tp_one_stage {
+                return Err(
+                    "[parallel] tp_ar2 与 tp_one_stage 互斥(AR-2 走 staging 两段 barrier,不是对称 arena)"
+                        .to_string(),
+                );
+            }
+        }
         if par.tp_one_stage {
             if par.mode != ParallelMode::Tensor {
                 return Err(
@@ -2362,6 +2484,16 @@ impl OwlConfig {
         }
         // **前缀缓存份额**:0..=1(0 = 不留缓存设备份额;1 = 可占满设备池)。
         // 越界 = 配置错(算式在 store,静默夹会让"我要 150% 池"变成别的东西)。
+        // **前缀无感删除的依赖门**(2026-10-23):删除路径靠**内容寻址**取回旧链,
+        // 没有前缀缓存就没有旧链可拼接 ⇒ 开着 `image_evict` 却没开 `prefix_cache`
+        // 是"配了但永远不会生效",按静默降级拒启。
+        if self.pool.image_evict && !self.pool.prefix_cache {
+            return Err(
+                "[pool] image_evict = true 需要 prefix_cache = true\
+                 (删除路径要按内容身份取回旧链,前缀缓存关掉就没有可拼接的旧链)"
+                    .to_string(),
+            );
+        }
         // **磁盘层的配置自洽**(S6):给了配额就必须给目录(否则"要磁盘"变成静默关层);
         // 给了目录但没配额 = 空目录守着不用(允许,但 boot 日志会显示关层)。
         // 目录给多个引擎共用 = 互相扫到对方的块 ⇒ 拒(独占是硬约束)。
@@ -2758,6 +2890,34 @@ mod prefill_tail_merge_tests {
 }
 
 #[cfg(test)]
+mod tp_ar2_tests {
+    use super::*;
+
+    #[test]
+    fn tp_ar2_defaults_off_and_requires_tensor() {
+        let c = OwlConfig::from_toml_str("[runtime]\nmax_seq = 128\n").expect("解析");
+        assert!(!c.parallel.tp_ar2, "AR-2 缺省必须关");
+        let e = OwlConfig::from_toml_str("[parallel]\ntp_ar2 = true\n").expect_err("单卡必须拒");
+        assert!(e.contains("tensor"), "拒语应点名 tensor: {e}");
+        let c = OwlConfig::from_toml_str(
+            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\ntp_ar2 = true\n",
+        )
+        .expect("TP2 + AR-2 合法");
+        assert!(c.parallel.tp_ar2);
+    }
+
+    #[test]
+    fn tp_ar2_rejects_one_stage() {
+        let e = OwlConfig::from_toml_str(
+            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\n\
+             tp_ar2 = true\ntp_one_stage = true\n",
+        )
+        .expect_err("必须拒");
+        assert!(e.contains("互斥"), "拒语应点名互斥: {e}");
+    }
+}
+
+#[cfg(test)]
 mod tp_one_stage_tests {
     use super::*;
 
@@ -2996,7 +3156,7 @@ mod config_overlay_tests {
         assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");
         let c2 = OwlConfig::load(Some(&base), None).expect("load base only");
         assert_eq!(c2.spec.depth, 7, "spec-dflash 预设 = d7");
-        assert_eq!(c2.model.head_quant, HeadQuant::RtnInt4G32, "C1 int4 头");
+        assert_eq!(c2.model.head_quant, HeadQuant::RtnInt8Row, "C1 int8 头");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3017,6 +3177,25 @@ mod auto_pool_tests {
         // 缺省 server.max_concurrency = 8
         let c = OwlConfig::from_toml_str("[pool]\ngdn_slots = 0\n").expect("合法档");
         assert_eq!(c.pool.gdn_slots, 8);
+    }
+
+    #[test]
+    fn dflash2_lookup_validation() {
+        let ok = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\ndraft = \"dflash2\"\nlookup = true\nlookup_nmin = 6\nlookup_nmax = 12\nlookup_nstrong = 6\nlookup_agree = 0\n",
+        )
+        .expect("lookup 合法档");
+        assert!(ok.spec.lookup);
+        let bad = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\nlookup = true\nlookup_nmin = 13\nlookup_nmax = 12\n",
+        )
+        .expect_err("nmax < nmin 必拒");
+        assert!(bad.contains("lookup_nmax"), "{bad}");
+        let bad = OwlConfig::from_toml_str(
+            "[spec]\ndepth = 7\nlookup = true\nlookup_nmax = 129\n",
+        )
+        .expect_err("nmax 超上限必拒");
+        assert!(bad.contains("128"), "{bad}");
     }
 
     #[test]
@@ -3058,11 +3237,11 @@ mod auto_pool_tests {
     }
 
     /// **投机深度上限是真门**(2026-10-21):`depth ≤ SPEC_DEPTH_MAX`
-    /// (结构性 = verify 图行容量 - 1;fold 记录/快照按它铺)——
+    /// (结构性 = verify 图行容量 - 1;DFlash2 W=K+1 上限)——
     /// 超限**拒启**,不再像旧代码那样 `min(3/7)` 静默截断。
     #[test]
     fn spec_depth_over_structural_max_is_refused() {
-        assert_eq!(SPEC_DEPTH_MAX, 7);
+        assert_eq!(SPEC_DEPTH_MAX, 15);
         let ok = OwlConfig::from_toml_str(&format!("[spec]\ndepth = {SPEC_DEPTH_MAX}\ndraft = \"mtp\"\n"));
         assert!(ok.is_ok(), "上限内应可配: {ok:?}");
         let bad = OwlConfig::from_toml_str(&format!("[spec]\ndepth = {}\n", SPEC_DEPTH_MAX + 1));

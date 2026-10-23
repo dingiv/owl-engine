@@ -27,7 +27,7 @@
 
 use crate::contract::{Dtype, ModelError};
 use crate::formats::mmap::{copy_par, open_raw_index, Mmap, RawEntry};
-use crate::formats::split_qkvz;
+use crate::formats::split_merged;
 use crate::formats::util::{f32_bytes_to_f16, marlin_eligible};
 use owl_kernels::family::marlin::v2_workspace_len;
 
@@ -218,7 +218,7 @@ impl AwqSource {
         if let Some(base) = key.strip_suffix(".packed_raw") {
             // 刀2 虚拟合并:in_proj_qkvz.packed_raw = 两子基 weight_packed
             // 行堆叠(同 k,字节拼接;要求两子均 Ct 形态 —— cyankiwi 满足)
-            if let Some((b1, b2)) = split_qkvz(base) {
+            if let Some((b1, b2)) = split_merged(base) {
                 if let (Some(e1), Some(e2)) = (
                     self.index.get(&format!("{b1}.weight_packed")),
                     self.index.get(&format!("{b2}.weight_packed")),
@@ -1098,7 +1098,7 @@ mod tests {
             }
             // ④ 合并虚拟键的两子基直拷(理想:零中间缓冲)
             if let Some(base) = key.strip_suffix(".packed_raw") {
-                if let Some((b1, b2)) = crate::formats::split_qkvz(base) {
+                if let Some((b1, b2)) = crate::formats::split_merged(base) {
                     let (e1, e2) = (
                         src.index.get(&format!("{b1}.weight_packed")).cloned(),
                         src.index.get(&format!("{b2}.weight_packed")).cloned(),

@@ -262,6 +262,16 @@ ls profiles/
     A/B 命令见本地实测档(未入库) §8。
     `qwen38_27b-3090-w4a16-mtp.toml` 保持静态 d3 + window；
     `qwen38_27b-3090-iq4xs-mtp.toml`（GGUF 单卡）已开 window + T1b 自适应。
+  - **DFlash2 lookup（2026-10-22，仅 DFlash2）**：`[spec] lookup = true`
+    （默认 false）+ `lookup_nmin = 6` / `lookup_nmax = 12` /
+    `lookup_nstrong = 6` / `lookup_agree = 0`。在当前请求的
+    `prompt_ids + out + 本轮 verify 块` 里找当前后缀最近一次出现，用其后继
+    token 覆盖草稿头（head-only；verify 图仍 depth+1 定形）。非 DFlash2 档
+    写 `lookup=true` = boot 拒；`nmax < nmin` / `nmax > 128` /
+    `nstrong > nmax` / `agree > SPEC_DEPTH_MAX` = 配置拒。
+    `profiles/qwen38_27b-3080_tp2-w4a16.toml` 已转正 `lookup=true`
+    （W4A8/VLM 继承）；回退 `--set spec.lookup=false`。
+    实测与实现见 `docs/devlog/perf/tp2-decode-fast.md` §10。
 - **图像 × 投机**(`spec.depth>0`)已接(V5):verify 的 rope 位置 =
   真实位置 + m-RoPE `delta`,KV slots/lens 仍用真实位置;带图请求仍限
   单图/非合批。无投机对照档 = `profiles/qwen38_27b-3080_tp2-w4a16-vlm.toml`;
@@ -273,6 +283,24 @@ ls profiles/
   校验塔层数/out_hidden/`<|image_pad|>` id。详见
   `vision-wiring.md` 与
   `gguf-format.md` §23.14。
+
+## 7.2 前缀无感删除(图像段;2026-10-23)
+
+**两个面缺一不可**(引擎不自作主张):
+
+| 面 | 形态 | 说明 |
+|---|---|---|
+| 引擎配置 | `[pool] image_evict = false` | 缺省关 = 逐字节旧行为。开 ⇒ boot 门要求**视觉档 + f16 分页 KV + 前缀缓存**,任缺**拒启** |
+| 客户端标记 | 图像 content part `"owl_evict": true` | 「这张图将来可能从历史里删」。未标记 = 零行为差异;带标记但档位没开 = 提交**响亮拒** |
+
+- **生效形态**:带标记的图像段被补 `\n` 到「段首页对齐 + 整段整页」;下一轮若
+  历史里**正好删掉这一段**,引擎保留后缀页 + 只把后缀 K 乘 `R(−S)`(位置帧平移),
+  **不重算删点之后的 token**。
+- **标记冻结律**:一张图打了标记后,留在历史期间标记必须保持不变(pad 数由标记
+  决定,改标记 ⇒ 前缀身份断 ⇒ 退化为重算,不会错值)。
+- **不适用**:`kv_fp8 = true` 档(boot 拒;fp8 的 dequant→rotate→requant 另案)。
+- 语义:删点**之前**逐位等价;删点**之后**是**搬运记忆**(后缀 KV/GDN 仍带着被删
+  图的上下文)。设计与门:`memory/prefix-deletion.md`。
 
 ## 8. 兼容与挂账
 

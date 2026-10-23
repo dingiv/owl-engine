@@ -1,0 +1,20 @@
+# owl 预设档 `qwen38_27b-3080_tp2-w4a8` —— 2×3080 27B **W4A8**(激活 int8)+ DFlash2 d7 / **262k**
+#
+# 与 `qwen38_27b-3080_tp2-w4a16` **唯一差异 = `[model] quant`**;其余(FI 单图快档 /
+# `tp_draft` / 262k / 草稿池 ring / fp8 KV / **int8 头** / 无词表切)全部继承 ——
+# 不要在本档开 `tp_vocab_split`(半表草稿 host 合并负收益)。
+#
+# **实测(2026-10-22,同二进制/同卡对/同档,std 五点三轮 math,输出 256)**
+#
+#   档     | prefill(中位) | TTFT@8192 | decode(中位) | decode 范围
+#   w4a16  | 1616.8 t/s     | 5068.3 ms | 138.1 t/s    | 82.7–202.8
+#   w4a8   | **2342.7**     | **3421.2**| 82.1 t/s     | 44.2–168.9
+#   Δ      | **+44.9%**     | **−32.5%**| −40.5%       | —
+#
+# 读法(262k std 十五点;与 184k 同量级):W4A8 的 marlin 单核在 m=512 是 2.3–2.5×,prefill/TTFT 大幅赢;但 decode 是
+# m=1 权重带宽墙 + 每层激活量化开销,且 spec 的 AL 在 W4A8 上更低 ⇒ decode 明显回退。
+# **选档:长 prompt / RAG / 文档输入用本档;短对话/低延迟 decode 用 w4a16。**
+extends = ["qwen38_27b-3080_tp2-w4a16.toml"]
+
+[model]
+quant = "w4a8"

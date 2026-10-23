@@ -106,12 +106,17 @@ pub mod e4_api;
 pub mod spec;
 pub mod draft;
 pub mod prefill_chunk;
+/// 前缀无感删除:设备半(后缀 K 原地重转)
+pub mod img_evict;
 pub mod turn_end;
 pub mod coverage;
 /// **KV 池页的宿主解码面**(单源;f16 / fp8 e4m3 两侧)
 pub mod kvpage;
 /// **MTP 草稿注意力读视图**(Windowed-MTP;纯函数)
 pub mod mtp_window;
+/// **DFlash2 lookup-augmented drafting**(LABD;宿主后缀查找 + 草稿头融合)
+pub mod lookup;
+pub mod proposal_q;
 
 #[cfg(test)]
 mod break_even_tests {

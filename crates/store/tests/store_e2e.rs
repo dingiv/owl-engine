@@ -109,6 +109,7 @@ fn plan_kv(l: &BlockLeg, need: Need) -> owl_store::Verdict {
         host_snap_slots: 0,
         disk_kv_slots: 0,
         disk_snap_slots: 0,
+        bulk_drop_when_tier_full: false,
     };
     plan_capacity(l, &state, &LruPolicy, need, &[], &[], room)
 }
@@ -177,10 +178,13 @@ async fn offload_and_batch_reload_without_gpu() {
     // engine 式执行:逐条取计划 → swap → 记账
     let mut offloaded = 0usize;
     for item in &verdict.out {
-        let EvictOut::Kv { chain, sink, .. } = item else { continue };
+        let EvictOut::Kv { chain, sink, span } = item else { continue };
         match sink {
             Sink::Host => offloaded += engine_offload(&mut l, &mut face, *chain).await.expect("换出"),
-            Sink::Drop => l.drop_cached(*chain).expect("驱逐"),
+            Sink::Drop => {
+                let n = l.prune_branch(*chain, (*span).max(1)).expect("驱逐");
+                assert!(n >= 1, "整枝票至少丢一块");
+            }
             Sink::Disk => panic!("本档未接盘层"),
         }
     }

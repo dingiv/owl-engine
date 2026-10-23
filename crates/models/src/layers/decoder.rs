@@ -46,7 +46,7 @@ impl DecoderLayer {
             input_ln: RmsNorm::new_by_facts("input_layernorm", hidden, eps, facts),
             post_ln: RmsNorm::new_by_facts("post_attention_layernorm", hidden, eps, facts),
             mixer: TokenMixer::Full(Attention::new(hq, hkv, hd, hidden, eps, src)),
-            mlp: Mlp::new(hidden, inter, src),
+            mlp: Mlp::new_merged(hidden, inter, src),
             hidden,
         }
     }
@@ -60,7 +60,7 @@ impl DecoderLayer {
             input_ln: RmsNorm::new_by_facts("input_layernorm", hidden, eps, facts),
             post_ln: RmsNorm::new_by_facts("post_attention_layernorm", hidden, eps, facts),
             mixer: TokenMixer::Gdn(GatedDeltaNet::new(nk, hk_dim, nv, hv_dim, hidden, eps, src)),
-            mlp: Mlp::new(hidden, inter, src),
+            mlp: Mlp::new_merged(hidden, inter, src),
             hidden,
         }
     }

@@ -57,3 +57,44 @@ extern "C" __global__ void owl_silu_and_mul_bf16(
         out[i] = __float2bfloat16((gf / (1.0f + expf(-gf))) * uf);
     }
 }
+
+// ----------------------------------------------------------------------------
+// owl_silu_and_mul_merged_f16/_bf16:输入单块 [rows, 2*inter](gate 半区在前、
+// up 半区在后),输出 [rows, inter]。MLP gate+up 合并 GEMM 的配套核
+// (2026-10-23 verify 算子优化;省一次 GEMM 发射)。
+// ----------------------------------------------------------------------------
+extern "C" __global__ void owl_silu_and_mul_merged_f16(
+    const __half* __restrict__ x,
+    size_t rows,
+    size_t inter,
+    __half* __restrict__ out)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t n = rows * inter;
+    if (i < n) {
+        const size_t r = i / inter;
+        const size_t c = i % inter;
+        const size_t base = r * 2 * inter + c;
+        const float gf = __half2float(x[base]);
+        const float uf = __half2float(x[base + inter]);
+        out[i] = __float2half((gf / (1.0f + expf(-gf))) * uf);
+    }
+}
+
+extern "C" __global__ void owl_silu_and_mul_merged_bf16(
+    const __nv_bfloat16* __restrict__ x,
+    size_t rows,
+    size_t inter,
+    __nv_bfloat16* __restrict__ out)
+{
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t n = rows * inter;
+    if (i < n) {
+        const size_t r = i / inter;
+        const size_t c = i % inter;
+        const size_t base = r * 2 * inter + c;
+        const float gf = __bfloat162float(x[base]);
+        const float uf = __bfloat162float(x[base + inter]);
+        out[i] = __float2bfloat16((gf / (1.0f + expf(-gf))) * uf);
+    }
+}

@@ -969,6 +969,13 @@ fn build_marlin() {
                 base.join("vllm_marlin/sm80_kernel_s8_u4_float16.cu"),        // W4A8 s8→f16 × AWQ 非对称(kU4;生产 27B 走这条)
                 base.join("vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu"),       // W4A8 s8→bf16 × kU4(BF16 激活档)
             ];
+            // **源文件必须在增量命中分支之外登记**(2026-10-22 实测):
+            // 原先 `rerun-if-changed` 只写在 else(重建)分支 ⇒ 一旦 stamp 命中,
+            // 改 `marlin_host.cu` 不会触发 build.rs 重跑,旧 `.a` 静默留用。
+            // 探针/宿主代码的改动会“看起来没生效”,正是本修正的起因。
+            for src in &sources {
+                println!("cargo:rerun-if-changed={}", src.display());
+            }
             // `cu/` = owl_log.h 的住址(host .cu 与 flashinfer 共用同一头)
             let includes = [
                 PathBuf::from("cu"),
@@ -992,7 +999,6 @@ fn build_marlin() {
             } else {
             let mut objs = Vec::new();
             for src in &sources {
-                println!("cargo:rerun-if-changed={}", src.display());
                 let obj = obj_dir.join(src.file_name().unwrap()).with_extension("o");
                 let mut args = vec![
                     "-c".to_string(),
@@ -1084,12 +1090,22 @@ fn build_flashinfer() {
         // (复用 vendored FA2 家族核,零自研核;见该 .cu 头注)
         let src_ragged = "cu/flashinfer/owl_fi_attn_ragged.cu";
         let src_hdr = "cu/flashinfer/owl_fi_attention_common.h";
+        // vLLM vendored FA2 forward（2026-10-23）：**原版核体** + 本仓 host 胶水。
+        // FA2 源在 `cu/flash_attn/vendor/`；CUTLASS 是**独立的共享家族**
+        // `cu/cutlass/`（workspace CUTLASS 4.8.0；仅编译闭包）。
+        let src_fa2 = "cu/flash_attn/owl_fa2.cu";
+        let fa2_src = "cu/flash_attn/vendor/flash_attn/src";
+        let fa2_cutlass = "cu/cutlass/include";
+        let fa2_compat = "cu/flash_attn/compat";
         let fi_include = env::var("FLASHINFER_INCLUDE")
             .unwrap_or_else(|_| "cu/flashinfer/include".into());
-        for f in [src_f16, src_fp8, src_ragged, src_hdr] {
+        for f in [src_f16, src_fp8, src_ragged, src_hdr, src_fa2] {
             println!("cargo:rerun-if-changed={f}");
         }
         println!("cargo:rerun-if-changed={fi_include}");
+        println!("cargo:rerun-if-changed={fa2_src}");
+        println!("cargo:rerun-if-changed={fa2_cutlass}");
+        println!("cargo:rerun-if-changed={fa2_compat}");
         println!("cargo:rerun-if-env-changed=FLASHINFER_FORCE_BUILD");
         println!("cargo:rerun-if-env-changed=FLASHINFER_INCLUDE");
         println!("cargo:rerun-if-env-changed=FLASHINFER_NVCC");
@@ -1110,8 +1126,12 @@ fn build_flashinfer() {
             src_fp8.to_string(),
             src_ragged.to_string(),
             src_hdr.to_string(),
+            src_fa2.to_string(),
         ];
         all_files(&fi_include, &mut deps);
+        all_files(fa2_src, &mut deps);
+        all_files(fa2_cutlass, &mut deps);
+        all_files(fa2_compat, &mut deps);
         deps.sort();
         if !force && stamp_hit(&lib, &deps, &flags) {
             println!("cargo:warning=owl-kernels: libowl_flashinfer.a 增量命中(零 nvcc)");
@@ -1139,6 +1159,24 @@ fn build_flashinfer() {
                 assert!(status.success(), "flashinfer: nvcc failed on {src}");
                 objs.push(obj);
             }
+            // FA2 hdim96（72 维输入；vLLM 原版 run_mha_fwd_hdim96）
+            let obj_fa2 = fi_dir.join("owl_fa2.o");
+            let status = std::process::Command::new(&nvcc_m)
+                .args(["-O3", "-std=c++17", "-arch=sm_86", "--expt-relaxed-constexpr"])
+                .args([
+                    "-DFLASHATTENTION_DISABLE_DROPOUT",
+                    "-DFLASHATTENTION_DISABLE_SOFTCAP",
+                    "-DFLASHATTENTION_DISABLE_LOCAL",
+                    "-DFLASHATTENTION_DISABLE_ALIBI",
+                ])
+                .arg(format!("-I{fa2_compat}"))
+                .arg(format!("-I{fa2_src}"))
+                .arg(format!("-I{fa2_cutlass}"))
+                .arg("-c").arg(src_fa2).arg("-o").arg(&obj_fa2)
+                .status()
+                .expect("flash-attn: failed to spawn nvcc");
+            assert!(status.success(), "flash-attn: nvcc failed on {src_fa2}");
+            objs.push(obj_fa2);
             let _ = std::fs::remove_file(&lib);
             let mut ar_cmd = std::process::Command::new(&ar);
             ar_cmd.args(["rcs"]).arg(&lib);
@@ -1149,7 +1187,7 @@ fn build_flashinfer() {
             assert!(status.success(), "flashinfer: ar failed");
             stamp_write(&lib, &deps, &flags);
             println!(
-                "cargo:warning=owl-kernels: built libowl_flashinfer.a from source (in-tree headers, 3 TU)"
+                "cargo:warning=owl-kernels: built libowl_flashinfer.a from source (in-tree FI 3 TU + vLLM FA2 hdim96)"
             );
         }
         let cuda_lib = env::var("CUDA_HOME")

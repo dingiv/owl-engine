@@ -772,7 +772,7 @@ N7 装载/拆卸期)。⇒ 日志已改成**如实报数**(`drained` 恒 0 也�
 
 ### 12.17 收尾小刀(回收池 P0+P1-1+P2):2026-10-19
 
-按 本地台账《26-10-19-回收池-收尾工作单》 打掉 6 条:
+按本地台账《26-10-19-回收池-收尾工作单》 打掉 6 条:
 
 | # | 内容 | 门 |
 |---|---|---|
@@ -1035,12 +1035,23 @@ eager 解码)。27B 的 prefill(每节点数百 µs GPU)与图回放 decode 都�
 |---|---:|
 | `determine_exec_config` | **0.7 µs** |
 | `cudaFuncSetAttribute`(`ensure_smem` 缓存后) | 1.7–6.3 µs |
-| **`kernel<<<>>>` + `cudaGetLastError`** | **3.6 → 48.1 µs(n 越大越大)** |
+| **`kernel<<<>>>` + `cudaGetLastError`** | **4.2–4.9 µs(自由)→ 64 / 88 / 403 µs(阻塞)** |
 
-`kernel<<<>>>` 的耗时**随发射数单调上升** = 异步队列被灌满后驱动回压
-(CPU 发得比 GPU 跑得快)⇒ `srv.seg.fam` 的 123 µs 主要是**等 GPU**,不是可优化的
-宿主代码。旁证:把 3×`cudaDeviceGetAttribute` + `cudaFuncSetAttribute` 全部缓存后,
-`fam.marlin` 均值**一字不变**(仍 99 µs),prefill 吞吐一字不变。
+**⚠️ 测量更正(2026-10-22)**:首版把累加器写成文件级 `static`,而 TP2 是
+**同进程双 rank 线程**共用 ⇒ 旧的“3.6 → 48 µs 单调上升”是**两 rank 混算 +
+从进程起算的累计平均**的伪曲线。改成 `thread_local` + 每 256 条窗口重算后,
+单 rank 逐窗(两 rank 完全对称):
+
+```text
+launch 逐窗(µs): 4.2  4.5  4.6  64.2  31.0  82.5  2.9  395.3
+attr   逐窗(µs): 3.5  0.1  1.4   0.1   0.1   0.8  0.1    0.1
+cfg    逐窗(µs): 0.7  0.8  1.0   1.0   0.8   0.7  0.6    0.6
+```
+
+⇒ **机制确认**:前 ~768–1024 条自由入队(~4.5 µs/条),随后 `cuLaunchKernel`
+**阻塞到 GPU 排空一个槽**(平均 30–90 µs,最紧 ~400 µs ≈ 单核 GPU 时间量级)
+—— CUDA pending-launch 队列(~1024)被灌满后的驱动回压。`attr/cfg` 两段全程
+<1.5 µs ⇒ `srv.seg.fam` 的 123 µs **绝大部分是“等发射槽”**,不是可优化的宿主代码。
 
 族维分布(4096 次发射):marlin 390 ms(95 µs/次)· cublas 103 ms(108 µs/次)·
 fi 75 ms(**470 µs/次**,160 次)· 其余小额。
@@ -1080,3 +1091,39 @@ fi 75 ms(**470 µs/次**,160 次)· 其余小额。
 1. **marlin GEMM 效率**(59.8%):小批 tile 配置 / W4A8 激活量化 —— 需先量当前 TFLOPS 占比;
 2. GDN recurrence(8%):varlen 递推核的并行度;
 3. `owl_ct_repack_u32` 137 µs × 706:确认是否只在装载期发生;若发生在推理期则是 bug 级。
+
+## 13.11 TP2 decode 快档 + W4A8 定档(2026-10-22)
+
+> 完整 A/B(四臂 / 五点三轮 / W4A8 / VLM 262k / 草稿池 ring)=
+> `tp2-decode-fast`(名引用)。
+
+- **FI 单图 + `tp_draft` 转正**:`profiles/qwen38_27b-3080_tp2-w4a16.toml`
+  `decode_arm/verify_arm="fi"` + `fi_plan_bake=true` + `tp_draft=true`;
+  std decode **46.2 → 138.1 t/s @262k**(184k 139.8;裸 FI 56.6,+21.7%),
+  prefill 1616.8(持平,−1.8%)。**草稿池 ring**:`per_tok 26624→16384`、
+  草稿池 1800→20MiB、`[ctx-max] 322k→442k`;262k 与 184k 性能持平。
+- **W4A8 独立档**:`profiles/qwen38_27b-3080_tp2-w4a8.toml`(只换
+  `[model] quant`);262k std prefill **+44.9%** / TTFT@8192 **−32.5%**,decode
+  **−40.5%**(184k 同量级 +47.4/−47.4)⇒ 长 prompt / RAG 档。
+- **head int8 快路(2026-10-22 晚)**:旧逐行 GEMV(`grid.y=tokens`)
+  在 spec 档确实慢(`92/60`、`140/85` @512/2048);新 `owl_gemv_i8w_mt_*`
+  权重只读一遍(mt7 专用 7 行),同 prompt round **33.4 vs int4 29.2ms**、
+  propose **6.7 vs 5.1ms**(旧逐行 57.0/18.7),32K round 39.0/propose 10.1。
+  int8 仍比 int4 每轮 +5ms,但不再是“不可当快档”的负收益;
+  `tp_vocab_split` 的半表草稿 host 合并仍是负收益,不要开。
+- **W4A8 int8 m8(2026-10-22)**:famp-marlin 的 4 处布局修复 + kS8 m8
+  已 port,门全绿(m8/16-row 逐位同);但 3080 m=7/8 A/B 无收益
+  (35.49 vs 35.38 round),默认关,仅 `[kernel] marlin_w4a8_m8 = true` 实验。
+- **W8A16 head f16 Tensor Core(2026-10-22 深夜)**:默认
+  `rtn-int8-row` 多 token 自动走 `gemm_i8w_a16_tc`;HBM 读 int8 权重、
+  shared 仍 int8、MMA fragment 寄存器里 `int8→half`、f16 MMA。核级
+  7/8 tok **0.980/0.984ms**(646–648 GB/s;旧 FMA 1.451/2.070)。
+  spec 同门 round **36.65→35.28ms**、propose **6.26→5.97ms**、verify
+  **28.62→27.45ms**;f16 vs i8 **0.9896(过门)**。默认已吃 TC 速度。
+- **W8A8 head 退回诊断档**:`rtn-int8-row-a8`/a8 profile 仍可跑
+  (SM86 int8 TC 0.964/0.969ms),但 W8A16 TC 同速(35.28 vs 35.31ms/round)
+  且质量 0.9896;W8A8 质量门 0.6962 ⇒ **不推荐**。详见
+  `tp2-decode-fast.md` §10.13/§10.14。
+- **未采纳**:`[spec] method`(与 main 的 `draft=auto` 两套 schema);
+  `tp_ar_fused`(噪声内 + 字段注写“只非 fp8”)。**已接**:
+  marlin `thread_local` + 每 256 条窗口均值(探针-only,见 §13.10(A) 更正)。

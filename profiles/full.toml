@@ -58,6 +58,8 @@ queue_wait_ms = 0
 # 上下文上限(token)
 max_seq = 131072
 # 预填块长 / 尾块合并阈值(剩余 ≤ chunk + tail_merge ⇒ 一口气吃完)
+# ⚠️ 不要直接把 chunk 拉到 2048/4096：Marlin 在 m>1024 会按 max_par 拆 M，
+#    每段各重读一遍完整权重；当前 512 不触发。改前先看 marlin-v2 的 split=。
 prefill_chunk = 512
 prefill_tail_merge = 512
 # 跨会话合批上限(1 = 串行;>1 需 gdn_slots ≥ 它、单卡、无选择层)
@@ -89,6 +91,8 @@ tp_ar_f8 = false
 tp_vocab_split = false
 # v1 两核融合档(AR 一核做完两段;需 mode = tensor)
 tp_ar_fused = false
+# barrier-only AR-2(小包 graph;≤64KiB/非 fp8;需 mode = tensor,与 tp_one_stage 互斥)
+tp_ar2 = false
 # 1-stage 对称 arena(结构更对但实测中性;需 mode = tensor,与 tp_push 互斥)
 tp_one_stage = false
 
@@ -106,8 +110,13 @@ format = "awq"
 #   safetensors/awq → w4a16 | w4a8 | w8a8i(暂未支持) | w8a8f(暂未支持)
 #   gguf            → q4k | iq4 | iq3
 quant = "w4a16"
-# lm_head 量化:off | rtn-int4-g32 | rtn-int8-row
-head_quant = "rtn-int4-g32"
+# lm_head 量化:off | rtn-int4-g32 | rtn-int8-row | rtn-int8-row-a8
+# 2026-10-22 用户裁决:int4 头太小,int8 为默认(质量优先;int4 仅显式覆盖)
+# int8 = W8A16:多 token 自动走 f16 Tensor Core(2026-10-22;HBM 读 int8、
+#   寄存器反量化、激活 f16),质量门 0.9896。
+# a8 = W8A8 诊断档:8-bit 走 SM86 int8 TC(无 fp8 TC);spec m=7/8
+#   质量门 0.6962(<0.95),且被 W8A16 TC 同速支配 ⇒ **不推荐**。
+head_quant = "rtn-int8-row"
 # embedding 表量化:f16(默认/对照) | i8(per-row;省 ~1.2G,仅 untied)
 embed_quant = "f16"
 # 视觉塔(纯文本档勿开);vision_path 空 = 用检查点内置 model.visual.*
@@ -157,6 +166,12 @@ vram_reserve_mb = 256
 vram_budget_mb = 0
 # 前缀缓存开/关
 prefix_cache = true
+# **前缀无感删除**(图像段;2026-10-23):客户端给图像打 `owl_evict` 标记时,
+# 引擎把图像段补 pad 到页对齐并记为删除候选;下一轮若该段真的被删 ⇒ 保留后缀
+# 页 + 后缀 K 乘 R(−S)(位置帧平移),不重算删点之后的 token。
+# **引擎不自作主张**:没有标记的图一律走旧路径。需 prefix_cache = true 且
+# f16 KV(kv_fp8 = false)。缺省关 = 逐字节旧行为。
+image_evict = false
 # 解释器块池预算(字节;0 = 关)
 block_pool_bytes = 0
 # 关活性中途回收(诊断;开会无界常驻)
@@ -176,6 +191,14 @@ dumb = false
 draft_kv_fp8 = false
 # DFlash2 草稿环窗口(token;0 = auto = 检查点声明,缺声明 = 家族 2048;当前核支持 2048)
 draft_window = 0
+# DFlash2 lookup-augmented drafting（LABD；仅 DFlash2 档可开）
+# 在当前请求 token 历史里找当前后缀的最近一次出现，用其后续 token 覆盖草稿头；
+# 缺省关 = 旧档逐字节不变。nmin/nmax/nstrong/agree 语义见 docs/devlog/perf/tp2-decode-fast.md §10。
+lookup = false
+lookup_nmin = 6
+lookup_nmax = 12
+lookup_nstrong = 6
+lookup_agree = 0
 # MTP 窗口/sink 的全量 schema 缺省(0 = full)。**实际性能值写在具体 MTP 档**
 # (如 qwen38_27b-3090-w4a16-mtp.toml 的 4032/64)，不要在这里做调优。
 mtp_window = 0
@@ -245,6 +268,13 @@ coverage_probe = false
 analyze_at_ctx = 0
 # lru | lrfu | lrfu:0.8
 evict_policy = "lru"
+# **整枝塌缩**(2026-10-23):Drop 轮是否允许"一张票丢一整段"(叶→分叉点)。
+# 缺省 false = 保守:只要宿主/磁盘有空位就逐块(先缩小到装得进宿主,再由
+# 下沉/搬盘接走,内容优先保留);没有分层的档位本来就走整枝。
+# 开 = 当链**这一轮搬不走**(宿主剩余槽 < 链长)时允许整枝丢 —— 避免
+# "宿主/磁盘长期满 + 深冷枝"要 O(深度) 个调度轮才腾干净。
+# 淘汰只看时间(新鲜度),不看内容"贵不贵"。
+bulk_drop_when_tier_full = false
 pool_overcommit = false
 # 每 turn 工作集下限 MiB(留空 = 派生)
 dense_floor_mib = 0
@@ -269,6 +299,8 @@ gdn_chunked = true
 gdn_scalar = false
 gdn_fused_decode = true
 gdn_fused_decode_v2 = true
+# W4A8 Marlin int8 m8 8-row 解码(实验;3080 A/B 无收益,默认关)
+marlin_w4a8_m8 = false
 # GGUF 小 n(装得进 L2)且 m ≤ TILE_MT ⇒ 让 MMVQ 赢(0 = 关)
 gguf_mmvq_l2_mib = 4
 # GGUF 预填臂(缺省全开;关 = 回退下一臂)

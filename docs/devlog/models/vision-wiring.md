@@ -177,6 +177,24 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
 
 ---
 
+## 3.9 多图 + 可删标记(2026-10-23)
+
+- **多图**:引擎不再拒多图(`running.rs` 的单图门已删);`expand_image_pads` 按内容序
+  逐图展开 `<|image_pad|>`(grid_h·grid_w/4),`Vlm::prepare` 的 grids 按出现序对齐。
+- **可删标记**:图像 content part 上 `"owl_evict": true` = 这张图将来可能被删
+  (`owl_engine::TurnImage { image, evict }`)。只有 `[pool] image_evict = true` 时
+  才做页对齐 pad + 删除吸收;带标记但档位没开 = 400(不许静默忽略)。
+  细节:`memory/prefix-deletion.md` §3.0/§3.2bis。
+
+示例:
+
+```json
+{"role":"user","content":[
+  {"type":"text","text":"看看这张截图"},
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,..."},"owl_evict":true}
+]}
+```
+
 ## 4. 施工顺序与验收
 
 | 阶段 | 内容 | 验收 |

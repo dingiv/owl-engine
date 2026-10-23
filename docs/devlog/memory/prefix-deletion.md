@@ -12,6 +12,48 @@
 |---|---|
 | 2026-10-20 | 首轮：图像窗口旋转（**已否决**，见 §9 附录 A） |
 | 2026-10-21 | **改判**：窗口/滑窗整段作废；改为「页对齐图像块 + 删除即位置帧平移 + 后缀 Δ-rope」，与 KVMem B-2 合流 |
+| 2026-10-23 | **v1 落地**（0.8B VLM 全链）：识别原语改判为「文本坐标 diff + 删除重建」（§3.0），配置门 + 客户端标记（§3.2bis），G1/G2/G5 真机门绿（§5bis） |
+
+> ⚠️ **2026-10-23 实现订正（读旧稿前必看）**：§3.3 里的「LCP + LCS 求删除区间」
+> **不成立**（真实 agent 的新 prompt 还会**追加**上一轮回答与新问题 ⇒ LCS 会把
+> 仍然存活的后缀算进删除区，长度不落整页 ⇒ 永不吸收），且 §3.2 的 pad 律在
+> 删除侧**不能纯 diff**（pad 是引擎插的，客户端从不发）。**现行实现**见 §3.0 /
+> §3.2bis；其余（位置帧平移、Δ-rope、记账、门）不变。
+
+---
+
+## 3.0 现行识别原语（2026-10-23 v1）
+
+```text
+① 文本坐标 diff：old_text = unpad(会话 tokens, 会话 pad 区间)
+   对每个**页对齐的已标记段** [a,b)：
+     old_text[..ta] == raw[..ta]                 # 删点之前的文本逐 token 相同
+     k = common_prefix(old_text[tb..], raw[ta..])  # 删点之后**逐 token 相同**的后缀
+② 重建：new_padded = old_padded[..a] ++ raw[ta..]   # 删点之前**按构造**逐字节不变
+   （旧的 before-pad 块留在前缀里 —— 这是"删除落页边界"的机械前提）
+③ 重跑 pad 律：对整条序列（含继承的 pad 区间；幂等）
+④ 调度面：k_pad = common_prefix(old[b..], new[a..]) ⇒ keep = k_pad / page
+⑤ 位置同移自证：用**真正喂前向的同一份** `MropeCfg::rope_index` 两侧各算一遍，
+   逐 token 逐分量验 `old[b+j] − new[a+j] == S`；失败 = 不吸收（零副作用）
+```
+
+- 识别/重建在 **submit**（纯 host；`Turn::deletion`）；取链/拼接/旋转在 **schedule/begin**。
+- **标记冻结律**：一张图一旦打了可删标记，它留在历史期间标记必须**保持不变**
+  （pad 数由 `evict` 决定；改标记 ⇒ 前缀身份断 ⇒ 退化为重算，不会错值）。
+- 文本坐标账 = `AgentSession::{img_spans, pads}`（与 `tokens` 同一次写回）。
+
+## 3.2bis 配置门 + 客户端标记（用户裁决 2026-10-23）
+
+引擎**不自作主张**，两个面缺一不可：
+
+| 面 | 形态 | 语义 |
+|---|---|---|
+| 引擎配置 | `[pool] image_evict = false`（`profiles/full.toml`） | 开 = 生效；boot 门要求 视觉档 + f16 分页池 + 前缀缓存（任缺 **拒启**） |
+| 客户端标记 | 图像 content part 上的 `"owl_evict": true` | 「这张图将来可能被删」；未标记 = 零行为差异 |
+
+- 带标记但**档位没开** ⇒ 提交边界**响亮拒**（不许静默忽略）。
+- 没带标记的图被删 ⇒ 走今天路径（重算），**不吸收**（G5 真机臂已验）。
+- 删掉历史里**最后一张图**（新 prompt 纯文本）也能吸收（`images` 为空不短路）。
 
 ---
 
@@ -39,6 +81,12 @@
    ⇒ **删除 = 位置帧平移的一个 producer**，不另立系统。
 6. **语义边界（必须先认账）**：被删块**之后**的 KV 是"当年看得见被删内容"时算出的
    ⇒ 这是**搬运记忆**，不是重算。删点**之前**是**真等价**（可做逐位门）。
+7. **三条路线，别混**（2026-10-23 复核社区后的定论，细节见 §7bis-六）：
+   (a) **压缩位置 + 重转 K** = 本卷（vLLM #43374 同族）；
+   (b) 压缩位置 + **不转** = 数值错（vLLM RFC #57672 实测 needle 93.3%→6.7%）；
+   (c) **留空位**（survivors 保原位置）= vLLM #53876 路线：零旋转/零漂移/前缀缓存
+   不需失效，但位置空间只增不减（超训练范围要重建）。本卷选 (a)（用户口径：
+   其余全部前移），(c) 记为下一轮 A/B 候选（能一并解除 fp8 / 漂移 / 共享块约束）。
 
 ---
 
@@ -201,7 +249,7 @@ token 的页内偏移不变** ⇒ 后续图像块的"起点是否页对齐"不�
 | 门 | 判据 | 备注 |
 |---|---|---|
 | **G0 核门** | `Δ=0` 逐字节不变；`Δ≠0` 与 host 参考**配对量级 ≤2 ulp**；未列页一字未动 | ✅ 已交付（`kernels/tests/kv_rope_shift_parity.rs`，真机绿） |
-| **G1 机械等价** | 删除后后缀每层 K == `R(−S)·` 删除前同一批页的 K | 错页/错 Δ/错层都会打出 ≫2 ulp |
+| **G1 机械等价** | 删除后后缀每层 K == `R(−S)·` 删除前同一批页的 K | 错页/错 Δ/错层都会打出 ≫2 ulp。**2026-10-23 真机**:0.8B 全层最差 **0.25 × 4ulp**(配对量级) |
 | **G2 命中** | `cached_tokens` = `L`（删点页对齐）；删点之后**零 prefill** | `/debug/vram` + `usage` |
 | **G3 延迟** | 旋转段 ≤2 ms @20k/27B；整步 TTFT ≈ "只喂新 token" | 与"不删"对照 |
 | **G4 语义** | 删点之前**逐位**一致；删点之后 top-1 一致率 / `cos`（**只监控**） | 语义非等价是已知前提 |
@@ -249,7 +297,27 @@ token 的页内偏移不变** ⇒ 后续图像块的"起点是否页对齐"不�
 
 ---
 
-## 7bis. 相关工作（2026-10-21 调研；社区已有人做，且**共识缺口 = 那枚重转核**）
+## 7bis. 相关工作（2026-10-21 调研；2026-10-23 复核）
+
+> **2026-10-23 复核结论（一手读 PR/issue 全文）**：这条线**至今没有任何一件被正式合并**，
+> 与 10-21 的判断一致，而且分叉更清楚了 —— 见 §七bis-六的"三条路线"与状态表。
+> 唯一合入的是 **kvpress 的 `KeyRerotationPress`**（库内工具，不是推理引擎路径）。
+
+### 〇、2026-10-23 状态复核（全部一手）
+
+| 工作 | 状态（2026-10-23） | 关键事实 |
+|---|---|---|
+| vLLM **#43372** `truncate_session` | **open**（needs-rebase；2026-06 起冲突） | 只做**尾部截断**（无 RoPE 后果）；`_post_add_requests` 空钩子在此 PR |
+| vLLM **#43374** 会话中段驱逐 | **open**（needs-rebase；最后更新 2026-09-19） | env 门 `VLLM_ENABLE_EXPERIMENTAL_SESSION_EVICTION`；**重转留给 runner**；明确写 "a future in-tree RoPE re-rotation kernel" 是缺件 |
+| vLLM **#53871** 块对齐驱逐原语 | **open**（reviewer 2026-10-22 说"今天看") | 区间**向内取整**到整块；把被改块从 prefix-cache 索引摘掉；多 KV group/混合 block size 直接 assert |
+| vLLM **#53876** 有界会话（保留/驱逐/consolidation） | **open draft** | **survivors 保原位置**（留空位）；同模型同 harness 实测：保位置在**同延迟下准确率更高**；mRoPE 逐 token 位置表切片；超训练范围前 self-preempt 重灌 |
+| vLLM **RFC #57672** RSQR（raw survivor + 查询侧旋转） | **open，0 评论** | 精确定量：纠正式 in-place 连转 fp32 漂移 ~6e-6、**有界不累积**（8e-6–3e-5 振荡），softmax 概率差 1.3e-6；**"不转"在 needle 任务上 93.3%→6.7%**（重转是必需的）；单次旋转比逐步重转快 2.95–3.96× |
+| vLLM **RFC #51948** | open | #53871/#53876 的上位 RFC |
+| NVIDIA **kvpress** `KeyRerotationPress` | ✅ 已合入（库） | 与我们的核逐式相同；HF 张量 + 全量 gather，不适用分页池 |
+
+**⇒ 结论不变**：引擎侧的"分页池内原地重转 + 删后前缀缓存仍成立"这条路，
+**社区至今没人合入**；我们填的仍是同一个洞。
+
 
 ### 一、直接同题：「删中段 + 位置重转」
 
@@ -275,7 +343,15 @@ vLLM 那边的重转核**至今没落地**（PR 仍 open、env 门仍在、RFC �
    （保 m-RoPE 位置数学）。⇒ 对应我们的 §3.2 页对齐 pad 律 + 原子删除判据。
 3. **Δ 一次性**：`num_tokens_evicted` 传给 runner 后必须清零，否则 preempt/resume 会**重复施加**旋转 ⇒ KV 损坏。
    ⇒ 落成 **G7**（`frames.pos` 是唯一真源）。
-4. **先证后动（预检三段式）**：`Scheduler.evict_token_range()` 在**改任何状态之前**依次校验
+4. **改写即失效（2026-10-23 我们踩出来的第 5 条）**：vLLM 在 `evict_and_compact` 里对被改块
+   调 `BlockPool._maybe_evict_cached_block`（把旧内容从 prefix-cache 索引摘掉）。
+   **我们 v1 漏了这一步**，后果是：删中段并原地重转之后，内容树里**旧身份的条目仍在**，
+   别的会话按旧 token 命中同一批槽 ⇒ 读到旋转过的 K ⇒ **静默错值**（真机实测：连开两个
+   相同 prompt 的会话，第二个直接 logits 全 NaN，诊断面还崩了服务）。
+   修法 = `KvStore::drop_chain`（`Rel::drop_chain` 连带丢宿主副本），在 incref 之后、
+   返回之前废弃被重转后缀块的旧身份；**旧链能命中的面止于删点末尾**（被删段自身的 K
+   没被改写，仍然成立）。落成门 **G6b**。
+5. **先证后动（预检三段式）**：`Scheduler.evict_token_range()` 在**改任何状态之前**依次校验
    「请求状态 → 多模态原子性 → 共享块资格」，任一步抛错则**请求原样不动**。
    ⇒ 我们照抄这条顺序纪律（与 KVMem/Admission 的"先判决、后动手"同源），写进 P0：
    `diff/自证` → `共享块资格` → `页表拼接`，**前两步都是纯读**。
@@ -303,6 +379,20 @@ vLLM 那边的重转核**至今没落地**（PR 仍 open、env 门仍在、RFC �
 
 > 纪律：**二手引用一律标注**。落地前若要引用其结论（例如"vLLM 那条线不压缩位置"），
 > 先回去读一手，别拿评论区一句话当设计依据。
+
+### 六、三条路线（2026-10-23；别把 (b) 当捷径）
+
+| 路线 | 位置 | K | 代价 / 风险 | 代表 |
+|---|---|---|---|---|
+| **(a) 压缩 + 重转** | survivors 前移 `S` | 乘 `R(−S)` | 每次删除 O(后缀) 旋转；共享块/前缀缓存必须**改写即失效**；fp8 需 dequant→requant | **本卷** · vLLM #43374（把核留给 runner）· RFC #57672 |
+| **(b) 压缩 + 不转** | 前移 | 不动 | **数值错**：needle 任务 93.3%→6.7%（RFC #57672 实测） | —— |
+| **(c) 留空位** | survivors **保原位置**（位置空间出洞） | 不动 | 前缀缓存天然成立、零漂移、无共享块问题；但位置只增不减（超训练范围要 consolidation 重灌） | vLLM #53876 |
+
+- RFC #57672 的漂移定量：纠正式连转 fp32 **有界**（8e-6–3e-5 振荡，不累积），
+  但**bf16/fp16 未测**；本卷用 f16 K + 单次删除，属"一次性旋转"，不在该风险带上。
+- #53876 的实测（保位置 vs 压缩+重转，同模型同 harness）：**保位置准确率更好、延迟相同**。
+  这是 (a)/(c) 之争的关键证据 —— 本卷 v1 选 (a) 是**用户口径**（"其余全部前移"），
+  (c) 留作下一轮 A/B（若转 (c)，可一并解除 fp8 / 漂移 / 共享块三条约束）。
 
 ### 五、结论
 
@@ -348,3 +438,84 @@ vLLM 那边的重转核**至今没落地**（PR 仍 open、env 门仍在、RFC �
 | V3 | 塔输出块被段边界 `drain_turn_stale` 当残块 free ⇒ 第 2 chunk `image_scatter` `DeadBlock` | ✅ 已修（main，`drain_owner_except` 例外集） |
 | V4 | 小网格 → FI ragged `cta_tile_q` 缺口 ⇒ `err -205` | ✅ 已修（main，`rows >= 64` 自动退 native） |
 | F1 | boot 后**第一轮就带图**吐退化串（0.8B 特有；27B 不复现） | ⏳ `fix/vlm` 另案（P2） |
+
+---
+
+## 5bis. v1 施工状态（2026-10-23）
+
+**已落地**（工作树 `feat/image-kv-evict`；本卷 §3.0/§3.2bis 即现行形态）：
+
+| 面 | 落点 |
+|---|---|
+| 核 | `kernels/cu/elems/kv_rope_shift.cu` + `ops::KvRopeKShiftF16` + `driver::elems::kv_rope_shift`（自 image-rotation 实验档收编） |
+| 模型 | `models::layers::kvshift`（`delta_table` 与 prefill 同源 / `k_shift` `Op::CallDst` / host 参考） |
+| 配置 | `[pool] image_evict` + boot 门 + `EngineKnobs::image_evict` |
+| 服务面 | image part `owl_evict` → `TurnImage.evict`；**多图**（去掉单图硬拒） |
+| 识别/pad | `engine::img_evict`（纯函数：`pad_image_spans` / `unpad` / `detect_text_delete` / `rebuild_after_delete` / `positions_shift`） |
+| 引擎 | `submit` 识别+重建；`scheduler::plan_image_delete`（先证后动：位置自证 → 取链 → **G6 refs==1** → 快照可分 → 才 incref）；`exec::img_evict::execute_k_shift`（两 rank 对称，`R(−S)`） |
+| 记账 | `AgentSession::{img_spans,pads}`；`store::{Rel,StateStore}::rekey_snap` + `StatePool::snap_rekey`（只重挂**设备层**快照） |
+| **改写即失效** | `KvStore::drop_chain` / `Rel::drop_chain`：重转后**废弃被改后缀块的旧链身份**（vLLM `_maybe_evict_cached_block` 同义）。漏了它 = 别的会话按旧 token 命中同一批槽读旋转过的 K（真机：第二会话 logits 全 NaN，诊断面越界 panic 崩服务） |
+| **显存释放**（2026-10-23 用户口径"删了图显存要跟着降"） | 拼接之后**删点之后的整条旧链都不可达**了 ⇒ `drop_chain` 从 `a/page` 到 `matched_blocks` 全量废弃（被删段 + 被重转后缀 + 未复用尾巴），并把**这些边界的 GDN 快照**（设备/宿主）一并丢。引用归零的槽立刻回自由队列，本轮后续 prefill 就能用。实测 16 轮滑窗：`KvBlock` 稳定 **29 条 / 10MiB**、`Snap` **4 条 / 77MiB**（不释放时 209 条 / 82MiB + 323MiB 快照）。 |
+| 残余开销（认账） | ① 幸存图的页对齐 pad（每图 ≈30 tok，窗口 3 图 ≈90 tok）；② 被删图的 `pad_before` 块（≤31 tok，落在前缀里，删不掉——页对齐的构造性代价）；③ 旧链前缀条目保留（身份不变，可继续给别的会话用）。 |
+| 观测 | `RunningEngine::img_evict`（`absorbed` + `ImgEvictTrace{a,b,keep_blocks,shift,pages,rekeyed}`）+ counters |
+
+**门（真机）**：
+
+| 门 | 结果 |
+|---|---|
+| 核 ⇔ host（`kernels/tests/kv_rope_shift_parity.rs`，3090 Ti） | ✅ Δ=0 逐字节 / Δ≠0 配对量级 ≤2 ulp / 未列页不动 / 往返 |
+| 算子准入（`op_tables`） | ✅ 10/10 |
+| CPU 纯测（`engine::img_evict` 5 例 + `kvshift` 4 例 + store `rekey`） | ✅ |
+| **G1/G2/G5 引擎门**（`engine.e2e::gpu_image_evict_gate`，0.8B VLM） | ✅ 删 `[64,160)`=96 tok（整页）· 保留后缀 **4 页** · `S=40` · 设备层快照重挂 **2** 条 · 旧身份废弃 **4** 条 · 吸收轮 **prefill 事件 1 次**（退回重算会是 4+）· **K 最差 0.25×4ulp**；未标记图被删 ⇒ 不吸收 |
+| **G6b 改写即失效** | ✅ 旧链能命中的面**止于删点末尾**（`matched_blocks == b/page`）；连开 4 个相同 prompt 的会话逐个删图 ⇒ 全部吸收、零 NaN、零崩溃（修复前第 2 个会话即崩） |
+| 既有回归 | ✅ `engine --lib` 142 / `models --lib`(kvshift 4) / `store --lib` 115 / `kernels op_tables` 10 |
+
+### 5ter. 真实前端形态（滑窗 N 张图）实测（2026-10-23）
+
+场景（`apps/server/tests/image_evict_sliding_probe.py`，真 HTTP/真图）：
+
+```text
+每轮: 新增一条 user 消息 [文本, 新截图(owl_evict), 文本]
+      会话里图数 > N 时, 把**最老那张图的 content part 删掉**(文字全留)
+      每轮发全量历史, session 固定
+```
+
+0.8B / 单 3090 Ti / keep=3 / 12 轮（**特性开**）：
+
+| 轮 | prompt | cached | prefill | prefill 占比 |
+|---|---:|---:|---:|---:|
+| 1 | 144 | 0 | 144 | 100% |
+| 2 | 272 | 128 | 144 | 53% |
+| 3 | 400 | 256 | 144 | 36% |
+| 4（首次删图） | 432 | 288 | **144** | 33% |
+| 6 | 496 | 352 | 144 | 29% |
+| 9 | 592 | 448 | 144 | 24% |
+| 12 | 688 | 544 | **144** | **21%** |
+
+- **每轮 prefill 恒 144 token**（= 新增尾巴：新图 96 + 文本 + 回答），
+  与历史长度无关；cached 每轮 +32（上一轮尾巴又进复用面）。
+- 对照臂（不打 `owl_evict`，同对话）：第 4 轮起 `cached=0` ⇒ 每轮全量重灌
+  （turn 8：424 tok / 100%）；8 轮累计 prefill ≈ **2298 vs 1152**（特性 ≈ 一半，
+  且差距随轮数线性拉开）。
+- 代价：页对齐 pad 让 prompt 变大（turn 8：560 vs 424，+136 tok ≈ 3 张图各 +45），
+  与"省下的重算"是不同量纲（显存 vs 计算）。
+
+**这一轮同时修掉一颗命中率地雷**：快照槽位出序原为"同会话末端先削"（为 KV 块的
+可达性立的规则），对**快照**并不成立（每条快照按自己的边界身份独立键控）——
+它恰好先逐掉"上一轮尾巴" = 删除路径的 GDN 恢复点。实测：滑窗 6 轮后
+`keep=0`（退回全量重算），`snap_max` 从 4 加到 16 也只是把崩点从第 7 轮推迟。
+修法 = `hooks::order_snap_victims`（`snap_victim_order` 专用）：**Transient 最前 +
+其余按新鲜度**；KV 块仍走原结构档。修复后 12 轮全部吸收（`snap_max=4` 也够，
+16 更从容）。门：`rel::tests::snap_victim_order_is_recency_based`（原
+`session_tail_first_eviction_order` 随之改判）。
+
+**仍在挂账**（与 §7 一致，按优先级）：
+
+1. **27B / TP2 复测**：需要 `kv_fp8 = false` 档（当前 fp8 池 ⇒ boot 拒；fp8 的
+   dequant→rotate→requant 另案 C2）。TP2 对称路径已写（同页表两 rank），未真机。
+2. **G6 的 COW**：现在 refs>1 直接整轮放弃；跨会话共享常态下会丢吸收机会。
+3. **漂移上限**：`delta_limit` + raw-K 重建（KVMem 已设计）未接；当前依赖快照
+   边界，多轮连删会逐轮叠旋转（f16 每次重转，误差可累积）。
+4. **宿主/盘层快照重挂**：只重挂设备层；宿主/盘层仍按旧键能回灌，但新链身份上
+   没有条目（下一轮复用面可能变短）。
+5. **多图 × 投机（DFlash2）**：0.8B 无 spec；27B 上需单独验证 verify 行与位置帧不混。

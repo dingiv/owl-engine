@@ -152,6 +152,9 @@ pub fn run_case(r: &mut dyn CheckRunner, c: &Case) -> Result<Vec<f32>, OpError> 
         LaunchVal::I32(HD as i32),
         LaunchVal::I32(PAGE as i32),
         LaunchVal::I32(X as i32),
+        // ring_cap = 0 ⇒ 线性槽(本 oracle 是既有 v2 语义;草稿 ring 走
+        // `DfAttn::propose_attn` 的 ring_cap=2080,另由引擎恒等门覆盖)
+        LaunchVal::I32(0),
         LaunchVal::Ptr(d_out.ptr),
     ];
     // ⚠️ grid = **(T, HKV)**、block = **4·HD**、smem = `nwarp·(d_dim+2)·4`

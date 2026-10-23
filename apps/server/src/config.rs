@@ -375,6 +375,8 @@ pub struct ServerConfig {
     pub tp_vocab_split: bool,
     /// **v1 两核融合档**（runtime.tp_ar_fused；§11.2）⇒ 交 `TpOpts.ar_fused`
     pub tp_ar_fused: bool,
+    /// **barrier-only AR-2**（runtime.tp_ar2；2026-10-23）⇒ 交 `TpOpts.ar2`
+    pub tp_ar2: bool,
     /// **1-stage 对称 arena 档**（runtime.tp_one_stage；§35）⇒ 交 `TpOpts.one_stage`。
     /// 缺省 false（实测中性）；与 `tp_push` 互斥、需 `tp_ordinals`（`validate` 拒启）。
     pub tp_one_stage: bool,
@@ -499,6 +501,7 @@ impl ServerConfig {
             tp_ar_f8: cfg.parallel.tp_ar_f8,
             tp_vocab_split: cfg.parallel.tp_vocab_split,
             tp_ar_fused: cfg.parallel.tp_ar_fused,
+            tp_ar2: cfg.parallel.tp_ar2,
             tp_one_stage: cfg.parallel.tp_one_stage,
             max_concurrency: cfg.runtime.max_concurrency,
             max_batch: cfg.runtime.max_batch,
@@ -925,12 +928,12 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             out.push_str(
                 "[check] note: vision=on + spec>0:图像 × 投机已接(V5)—— verify 的 rope \
                  pos = 真实位置 + m-RoPE delta,KV slots/lens 仍用真实位置;\
-                 带图为单图/非合批;文本+draft 同档可用\n",
+                 带图不支持合批(max_batch=1);文本+draft 同档可用\n",
             );
         } else {
             out.push_str(
-                "[check] note: vision=on + spec=off:图像路径可用(单图;data URL;\
-                 TP2 两 rank 各备塔输出)\n",
+                "[check] note: vision=on + spec=off:图像路径可用(多图;data URL;\
+                 TP2 两 rank 各备塔输出;`[pool] image_evict` = 前缀无感删除)\n",
             );
         }
     }

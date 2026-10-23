@@ -42,6 +42,13 @@ pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
 /// `cu/flashinfer/owl_fi_attn_ragged.cu`。**单图契约**(n_seq == 1;多图由 driver 分流到 native 臂)。
 pub const ATTN_RAGGED_F16: &str = "flashinfer_attn_ragged_f16";
 
+/// **vLLM 原版 FA2 varlen forward**（2026-10-23）：hd=72 → 内核 kHeadDim=96，
+/// 与 vLLM Qwen3.5-ViT 同路径。源在 `cu/flash_attn/vendor/`，本仓只写 host 胶水。
+pub const FA2_VARLEN_F16: &str = "flash_attn_varlen_f16";
+/// FA2 的 unpadded LSE 擦写区：`[heads, total_q] f32`（16384×16 → 1 MiB；
+/// 8 MiB 覆盖到 131072 行，视觉单图远小于此）。
+pub const FA2_LSE_BYTES: usize = 8 * 1024 * 1024;
+
 /// 槽序契约(LaunchMsg.args):
 /// `[T q, T k_fi, T v_fi, T q_cu_seqlens, T indices, T indptr, T last_len,
 ///   T wr(树序依赖边,K0-dual 先于读池;FI 不解引用),
@@ -63,7 +70,10 @@ pub const FI_HOST_STAGING_BYTES: usize = 32 * 1024 * 1024;
 
 /// foreign 分派谓词(server handle_launch 前置检查)
 pub fn is_foreign(name: &str) -> bool {
-    name == PREFILL_FI || name == PREFILL_FI_FP8KV || name == ATTN_RAGGED_F16
+    name == PREFILL_FI
+        || name == PREFILL_FI_FP8KV
+        || name == ATTN_RAGGED_F16
+        || name == FA2_VARLEN_F16
 }
 
 extern "C" {
@@ -166,6 +176,23 @@ extern "C" {
         num_heads: i32,
         head_dim: i32,
         n_seq: i32,
+        scale: f32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+
+    /// vLLM FA2 varlen forward（f16;hd=72;非因果;单图/多图 varlen）
+    pub fn owl_fa2_varlen_fwd_f16(
+        q: *const std::ffi::c_void,
+        k: *const std::ffi::c_void,
+        v: *const std::ffi::c_void,
+        out: *mut std::ffi::c_void,
+        lse: *mut f32,
+        cu_dev: *mut i32,
+        batch: i32,
+        total_q: i32,
+        max_seqlen: i32,
+        heads: i32,
+        head_dim: i32,
         scale: f32,
         stream: *mut std::ffi::c_void,
     ) -> i32;

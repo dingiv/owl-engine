@@ -21,7 +21,7 @@ const SNAP_EVERY: usize = 4;
 async fn prepare_vlm_rank<D: DeviceClient>(
     dev: &mut crate::engine::RankDev<D>,
     ids: &[u32],
-    images: &[owl_models::vlm::VlmImage],
+    images: &[crate::turn::TurnImage],
 ) -> Result<crate::vlm::VlmPrepared> {
     let vlm = dev
         .boot
@@ -29,10 +29,10 @@ async fn prepare_vlm_rank<D: DeviceClient>(
         .clone()
         .ok_or_else(|| ModelError::Msg("prefill: 图像输入但本 rank 无视觉塔".into()))?;
     let grids: Vec<owl_models::layers::vision::GridThw> =
-        images.iter().map(|i| i.grid).collect();
+        images.iter().map(|i| i.image.grid).collect();
     let px: Vec<f32> = images
         .iter()
-        .flat_map(|i| i.pixel_values.iter().copied())
+        .flat_map(|i| i.image.pixel_values.iter().copied())
         .collect();
     let req = vlm.prepare(ids, &grids, &[], &px)?;
     let merged = match req.merged {
@@ -164,6 +164,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             crate::exec::mirror2!(dev, peer,
                 d => d.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table),
                 p => p.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table))?;
+        }
+        // **前缀无感删除的设备半**(2026-10-23):拼接后的后缀 K 原地重转。
+        // 顺序 = `write_bt` 之后、任何 prefill/decode 读 KV 之前。
+        if let Some(rr) = b.rerope.as_ref() {
+            self.execute_k_shift(rr).await?;
         }
         Ok(())
     }
@@ -837,7 +842,12 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     .filter(|(_, &v)| v.is_finite())
                     .map(|(i, &v)| (v, i as u32))
                     .collect();
-                top.select_nth_unstable_by(7, |a, b| b.0.total_cmp(&a.0));
+                // 诊断面**不许 panic**:全非有限/空 logits(实测 NaN 步)时
+                // `select_nth_unstable_by(7)` 会越界崩引擎 —— 先按实际长度夹紧。
+                if !top.is_empty() {
+                    let k = top.len().saturating_sub(1).min(7);
+                    top.select_nth_unstable_by(k, |a, b| b.0.total_cmp(&a.0));
+                }
                 top.truncate(8);
                 top.sort_by(|a, b| b.0.total_cmp(&a.0));
                 let pretty: Vec<String> = top
@@ -897,7 +907,12 @@ if self.dev.graphs.session.has_input("sel_pt") {
                         .filter(|(_, &v)| v.is_finite())
                         .map(|(i, &v)| (v, i as u32))
                         .collect();
-                    top.select_nth_unstable_by(7, |a, b| b.0.total_cmp(&a.0));
+                    // 诊断面**不许 panic**:全非有限/空 logits(实测 NaN 步)时
+                    // `select_nth_unstable_by(7)` 会越界崩引擎 —— 先按实际长度夹紧。
+                    if !top.is_empty() {
+                        let k = top.len().saturating_sub(1).min(7);
+                    top.select_nth_unstable_by(k, |a, b| b.0.total_cmp(&a.0));
+                    }
                     top.truncate(8);
                     top.sort_by(|a, b| b.0.total_cmp(&a.0));
                     let pretty: Vec<String> = top
@@ -1588,7 +1603,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // `t < 8` 时**静默用第 0 行补齐** —— 若属"固定 8 行图族"的按设计补齐,
         // 应写成显式的 pad(并断言 t≥1);若属越界,静默回退会生成**错树**
         // 且极难查。当前语义未定谳,故先挂牌不改行为(改动可能误伤 pad 路径)。
-        for i in 0..8 {
+        for i in 0..owl_models::kernel::CONCAT_ROWS_SLOTS {
             root = root.arg(refs.get(i).copied().unwrap_or(refs[0]));
         }
         let root = root.arg_usize(t).arg_usize(1).arg_usize(1).with_shape(Dtype::F32, vec![t, 1]);

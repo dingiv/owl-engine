@@ -200,6 +200,7 @@ impl GpuServer {
         debug: bool,
         sink: owl_shared::log::LogSink,
     ) -> Self {
+        let marlin_w4a8_m8 = diag.marlin_w4a8_m8;
         Self {
             actor_tag: ACTOR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             rx,
@@ -211,7 +212,7 @@ impl GpuServer {
 // (diag 自身随 Self 移动,克隆 include 后置)
             registry: None,
             tag_filter: diag.tag_filter,
-            exec: owl_kernels::device::Exec::new(),
+            exec: owl_kernels::device::Exec::new().with_marlin_w4a8_m8(marlin_w4a8_m8),
             scratch_ledger: Vec::new(),
             peak_watermark_bytes: 0,
             peak_snapshots: 0,
