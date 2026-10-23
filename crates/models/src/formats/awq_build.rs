@@ -14,7 +14,7 @@
 
 use crate::formats::awq::{is_a8_key, AwqSource, IdxKind, QuantForm, CACHE_CAP_BYTES};
 use crate::contract::ModelError;
-use crate::formats::split_qkvz;
+use crate::formats::split_merged;
 use crate::formats::util::marlin_eligible;
 use crate::module::Taken;
 use crate::formats::util::{bf16_par, i32s_le_bytes, i32s_par, u16s_le_bytes};
@@ -251,7 +251,7 @@ impl AwqSource {
         // **源域合并后一次构建**(marlin s/z 是全 flat 64-chunk 置换,
         // 构建产物域内拼接错序;源域 packed/scales/zp 均行主序,concat
         // 合法)。要求两子均 Ct 形态(cyankiwi 满足;F16 兜底混态不支持)。
-        if let Some((b1, b2)) = split_qkvz(base) {
+        if let Some((b1, b2)) = split_merged(base) {
             let suffix = &key[base.len()..];
             let Some((n1, k1, f1)) = self.linear_form(&b1) else { return Ok(None) };
             let Some((n2, k2, f2)) = self.linear_form(&b2) else { return Ok(None) };
@@ -609,7 +609,7 @@ impl AwqSource {
         // ---- 刀2 虚拟合并键(in_proj_qkvz = row-stack(qkv, z))的 a8 分支 ----
         // 与 a16 臂同律:**源域行拼接**(scales/zp/nibble 均行主序 ⇒ concat 合法),
         // 拼完再进 a8 三件套 —— 全局因子取**合并后**尺度的 max(一层一个 a_scales)
-        if let Some((b1, b2)) = split_qkvz(base) {
+        if let Some((b1, b2)) = split_merged(base) {
             let Some((n1, k1, f1)) = self.linear_form(&b1) else {
                 return Err(ModelError::Msg(format!("awq/a8: 子基 {b1} 形态不可解")));
             };

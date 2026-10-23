@@ -345,7 +345,7 @@ impl W4A16Source {
     fn linear_bytes_for(&self, base: &str, key: &str) -> Taken<Arc<[u8]>> {
         // 刀2 虚拟合并:in_proj_qkvz = row-stack(in_proj_qkv, in_proj_z)
         // (同 k 行堆叠 = 字节拼接;两子基各自走完整建管)
-        if let Some((b1, b2)) = crate::formats::split_qkvz(base) {
+        if let Some((b1, b2)) = crate::formats::split_merged(base) {
             let suffix = &key[base.len()..];
             let Some(s1) = self.linear_bytes_for(&b1, &format!("{b1}{suffix}"))? else { return Ok(None) };
             let Some(s2) = self.linear_bytes_for(&b2, &format!("{b2}{suffix}"))? else { return Ok(None) };

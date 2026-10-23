@@ -1420,6 +1420,15 @@ impl<'a> PlanSource<'a> {
         self.facts
     }
 
+    /// Uniform 臂的计划(Keyed 臂 = None)。层构造器据此决定是否使用
+    /// 合并虚拟键(如 MLP gate_up_proj 仅 W4A16/AWQ 目标档启用)。
+    pub fn uniform_plan(&self) -> Option<QuantPlan> {
+        match self.kind {
+            PlanKind::Uniform(p) => Some(p),
+            PlanKind::Keyed { .. } => None,
+        }
+    }
+
     /// 绑定层号(`Model::new` 每层造一份;Uniform 臂原样返回)
     pub fn at_layer(self, i: usize) -> Self {
         match self.kind {

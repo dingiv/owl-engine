@@ -126,8 +126,45 @@ pub static RMSNORM_F16: KernelMeta = meta_of::<RmsnormF16>();
 pub static RMSNORM_BF16: KernelMeta = meta_of::<RmsnormBf16>();
 pub static FUSED_ADD_RMSNORM_F16: KernelMeta = meta_of::<FusedAddRmsnormF16>();
 pub static FUSED_ADD_RMSNORM_BF16: KernelMeta = meta_of::<FusedAddRmsnormBf16>();
+/// `owl_silu_and_mul_merged_f16` —— gate/up 合并块 `[rows,2*inter]` 单输入版
+pub struct SiluAndMulMergedF16;
+
+#[kernel_tags("dom.norm", "role.norm")]
+impl KernelSpec for SiluAndMulMergedF16 {
+    const ENTRY: &'static str = "owl_silu_and_mul_merged_f16";
+    const SRC: &'static str = "cu/ln/silu_and_mul.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::sz("rows"),
+        Param::sz("inter"),
+        Param::t_out("out", Dtype::F16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub struct SiluAndMulMergedBf16;
+
+#[kernel_tags("dom.norm", "role.norm")]
+impl KernelSpec for SiluAndMulMergedBf16 {
+    const ENTRY: &'static str = "owl_silu_and_mul_merged_bf16";
+    const SRC: &'static str = "cu/ln/silu_and_mul.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::BF16, 2),
+        Param::sz("rows"),
+        Param::sz("inter"),
+        Param::t_out("out", Dtype::BF16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 pub static SILU_AND_MUL_F16: KernelMeta = meta_of::<SiluAndMulF16>();
 pub static SILU_AND_MUL_BF16: KernelMeta = meta_of::<SiluAndMulBf16>();
+pub static SILU_AND_MUL_MERGED_F16: KernelMeta = meta_of::<SiluAndMulMergedF16>();
+pub static SILU_AND_MUL_MERGED_BF16: KernelMeta = meta_of::<SiluAndMulMergedBf16>();
 
 // ============================================================================
 // `ln.rs` 域 R1 补表

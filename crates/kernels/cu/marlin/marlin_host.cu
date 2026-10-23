@@ -146,6 +146,15 @@ thread_config_t large_batch_thread_configs[] = {
     {64, 128, 128},
     {128, 64, 128}};
 
+// M8 小批专用顺序(2026-10-23 verify 算子优化):3080/3090 实测
+// m=1/7/8 的 n=5120/17408 形状,{64,128,128} 比 {128,128,256} 快
+// 1~6%(n=5120 约 +5~6%,n=17408 约 +1%)。m8 路径 thread_m_blocks=1,
+// 仍保持 {128,128,256}/{128,64,128} 兜底;非 m8 路径顺序不变。
+thread_config_t small_batch_m8_thread_configs[] = {
+    {64, 128, 128},
+    {128, 128, 256},
+    {128, 64, 128}};
+
 typedef struct {
   int blocks_per_sm;
   thread_config_t tb_cfg;
@@ -262,13 +271,30 @@ exec_config_t determine_exec_config(
     bool has_zp, bool is_zp_float, int is_a_8bit, int stages,
     int max_shared_mem, int sms) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
-  thread_config_t* thread_configs = thread_m_blocks > 1
-                                        ? large_batch_thread_configs
-                                        : small_batch_thread_configs;
+  // M8 优先档(2026-10-23):{64,128,128} 在 3080/3090 的 m1/7/8 ×
+  // n5120/17408 全形状实测不劣于 auto,且 n5120 快 5~6%。直接用完整
+  // max_shared_mem 判一次(不走下面的 −512 保守余量),命中即返回。
+  if (m_block_size_8 && thread_m_blocks == 1) {
+    thread_config_t m8_cfg = thread_config_t{64, 128, 128};
+    if (is_valid_config(m8_cfg, thread_m_blocks, prob_m, prob_n, prob_k,
+                        num_bits, group_size, has_act_order, is_k_full,
+                        has_zp, is_zp_float, is_a_8bit, stages,
+                        max_shared_mem)) {
+      exec_cfg = exec_config_t{1, m8_cfg};
+      return exec_cfg;
+    }
+  }
+  thread_config_t* thread_configs =
+      thread_m_blocks > 1
+          ? large_batch_thread_configs
+          : (m_block_size_8 ? small_batch_m8_thread_configs
+                            : small_batch_thread_configs);
   int thread_configs_size =
       thread_m_blocks > 1
           ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
-          : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
+          : (m_block_size_8
+                 ? sizeof(small_batch_m8_thread_configs) / sizeof(thread_config_t)
+                 : sizeof(small_batch_thread_configs) / sizeof(thread_config_t));
 
   for (int i = 0; i < thread_configs_size; i++) {
     thread_config_t th_config = thread_configs[i];

@@ -74,8 +74,8 @@ impl KeyConvention for Qwen35Convention {
         let (sub, suffix) = match local {
             // 层共用件:双 norm 无子前缀
             "input_layernorm" | "post_attention_layernorm" => ("", ".weight"),
-            // mlp
-            "gate_proj" | "up_proj" | "down_proj" => ("mlp.", ".weight"),
+            // mlp（gate_up_proj = 合并虚拟键，W4A16/AWQ 目标档）
+            "gate_proj" | "up_proj" | "gate_up_proj" | "down_proj" => ("mlp.", ".weight"),
             // GDN mixer(norm = 层内门控归一化,非 final norm;刀2:qkvz
             // 虚拟合并键 → linear_attn.in_proj_qkvz,由装载源合成)
             "in_proj_qkvz" | "in_proj_b" | "in_proj_a" | "out_proj" | "conv1d"

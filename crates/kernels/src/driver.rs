@@ -418,6 +418,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
             ln::fused_add_rmsnorm(dt, rows, n)
         }
         "mlp.silu_and_mul" => mlp::silu_and_mul(dt, ax(0)),
+        "mlp.silu_and_mul_merged" => mlp::silu_and_mul_merged(dt, ax(0), ax(1)), // aux = [rows, inter]
         "load.ct_repack" => {
             let rows = req.shapes.first().map(|s| s[0]).unwrap_or(0);
             let cols = req.shapes.first().map(|s| s.get(1).copied().unwrap_or(0)).unwrap_or(0);
@@ -1796,6 +1797,18 @@ pub mod mlp {
 
     /// silu_and_mul:out = silu(g) ⊙ u(双输入单输出;f16 half2 向量化,
     /// bf16 标量)。aux = [n](g/u 同形 [·, n])。
+    pub fn silu_and_mul_merged(dt: DType, rows: usize, inter: usize) -> KernelPick {
+        let n = rows.saturating_mul(inter);
+        KernelPick {
+            name: match dt {
+                DType::F16 => "owl_silu_and_mul_merged_f16",
+                DType::BF16 => "owl_silu_and_mul_merged_bf16",
+                other => panic!("owl_silu_and_mul_merged 无 {other:?} 变体(dt={dt:?})"),
+            },
+            shape: Shape { grid: (n.div_ceil(256) as u32, 1, 1), block: (256, 1, 1), smem: 0 },
+        }
+    }
+
     pub fn silu_and_mul(dt: DType, n: usize) -> KernelPick {
         let name = match dt {
             DType::F16 => "owl_silu_and_mul_f16",

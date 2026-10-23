@@ -69,6 +69,8 @@ pub enum SemanticKernel {
     Narrow,
     /// 行拼接
     Concat,
+    /// gate/up 合并块的 silu_and_mul（单输入 [rows,2*inter]）
+    SiluAndMulMerged,
     /// partial rope
     Rope,
     /// 激活 per-token int8 量化(W4A8 喂料手;S1c:行 absmax → scale → 饱和
@@ -369,6 +371,7 @@ impl SemanticKernel {
             SemanticKernel::AttnFull => "vis.attn_full",
             SemanticKernel::ImageScatter => "vis.image_scatter",
             SemanticKernel::SiluAndMul => "mlp.silu_and_mul",
+            SemanticKernel::SiluAndMulMerged => "mlp.silu_and_mul_merged",
             SemanticKernel::CtRepack => "load.ct_repack",
             SemanticKernel::CtRepackA8 => "load.ct_repack_a8",
             SemanticKernel::TsStamp => "ops.ts_stamp",

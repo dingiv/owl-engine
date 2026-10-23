@@ -57,6 +57,8 @@ pub enum SegKind {
     QKVZ,
     /// `conv1d` 的通道 `= q ⊕ k ⊕ v`(三段;`conv_dim = 2K + V`)
     ConvQKV,
+    /// `gate_up_proj = gate ⊕ up`(MLP 两段;各 intermediate)
+    GateUp,
 }
 
 impl SegKind {
@@ -69,6 +71,7 @@ impl SegKind {
             SegKind::QGate => Ok(vec![hq * hd, hq * hd]),
             SegKind::QKVZ => Ok(vec![k_dim, k_dim, v_dim, v_dim]),
             SegKind::ConvQKV => Ok(vec![k_dim, k_dim, v_dim]),
+            SegKind::GateUp => Ok(vec![spec.inter, spec.inter]),
         }
     }
 }
@@ -180,6 +183,10 @@ pub fn rule_of(key: &str) -> WeightRule {
     // 匹配用**最短唯一尾巴**(want 键是层内短键、改键后是全局键 —— 两种形态通吃;
     // 键名已按层代码逐条核实:见 `gdn.rs` / `attention.rs` 的 `Linear::new` 实参)
     // ── MLP ──
+    // 合并虚拟键：两段各 intermediate（W4A16/AWQ 目标档；DFlash2 仍用拆键）
+    if tail(k, "gate_up_proj") {
+        return WeightRule::SegmentedCol(SegKind::GateUp);
+    }
     if tail(k, "gate_proj") || tail(k, "up_proj") {
         return WeightRule::UniformCol;
     }

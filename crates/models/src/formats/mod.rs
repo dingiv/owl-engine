@@ -46,6 +46,19 @@ pub(crate) fn split_qkvz(base: &str) -> Option<(String, String)> {
     Some((format!("{prefix}in_proj_qkv"), format!("{prefix}in_proj_z")))
 }
 
+/// **MLP gate+up 虚拟合并键**:{base}gate_up_proj = row-stack(gate_proj, up_proj)。
+/// 与 qkvz 同律：两源同 k，行堆叠 = 字节拼接；层侧声明单 merged Linear，
+/// 输出 `[T, 2I]`，再走 `SiluAndMulMerged`（省一次 GEMM 发射/改善小 N tile）。
+pub(crate) fn split_gate_up(base: &str) -> Option<(String, String)> {
+    let prefix = base.strip_suffix("gate_up_proj")?;
+    Some((format!("{prefix}gate_proj"), format!("{prefix}up_proj")))
+}
+
+/// 两段行堆叠合并键的统一入口（qkvz / gate_up）。
+pub(crate) fn split_merged(base: &str) -> Option<(String, String)> {
+    split_qkvz(base).or_else(|| split_gate_up(base))
+}
+
 pub use awq::AwqSource;
 pub use kind::{detect, CheckpointKind, Detection, QuantScheme};
 pub use load::{eval_load, load_component, load_from_dir, LoadOpts};
