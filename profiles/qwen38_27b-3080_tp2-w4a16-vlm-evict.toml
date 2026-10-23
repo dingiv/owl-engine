@@ -27,17 +27,18 @@ depth = 0
 lookup = false
 
 [pool]
-pool_tokens = 8192
+# 池大小由 vram 预算自动派生(`[pool].pool_tokens` 已于 2026-10-22 上游删除)
 gdn_slots = 1
 snap_max = 2
 prefix_cache = true
 image_evict = true
 image_evict_delta_limit = 32
+# f16 KV(image_evict 的硬前提;main 起该键在 `[pool]`)
+kv_fp8 = false
 vram_target = 0.9
 vram_reserve_mb = 1024
 
 [kernel]
-kv_fp8 = false
 verify_arm = "v2"
 decode_arm = "v2"
 fi_plan_bake = false

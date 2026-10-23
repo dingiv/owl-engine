@@ -845,11 +845,22 @@ t1(两图,8 tok)           [99484, 95952, 16, 97628, 101843, 95979, 100016, 3709
 与 spec 都无关。该红由 main 的 `b5ca7ebb feat(vlm): support single-request multi-image prompts`
 （多图 + 逐 chunk 局部 rope 表）修好；合并后本门自动转绿。
 
-**27B / DFlash2 / TP2 行为门（真机，2×3080，`qwen38_27b-3080_tp2-w4a16-vlm-dflash-evict`）**：
-spec depth 7 + lookup + tp_draft 全开，滑窗 keep=2（真 HTTP、真删图）：cached 256→448、
-prefill 恒 304、`后缀 K 重转 … 9 页 / 4.5 MiB(K) / 1.07–1.14 ms`、零崩零 Xid。
-（该档的 `spec-degrade m=0` 属**退化文本下**的正常降级；27B 多图 greedy 退化是合并前观测，
-main 的多图修复后需复测。）
+**27B / DFlash2 / TP2 真机（2×3080）—— 合并 main 后复测（2026-10-24）**：
+
+| 项 | 结果 |
+|---|---|
+| 27B 多图退化（合并前的红） | **基本治好**：keep=3 滑窗 turn 1–4 全部连贯文本（合并前 turn 2 起就是 `!!!!`）；turn 5 偶见 `< < <` 苗头（降级观察项，另案） |
+| spec on/off **文本恒等**（`--no-think`、greedy、每轮 24 tok） | **四轮逐字节一致**（spec off = 普通档，spec on = `qwen38_27b-3080_tp2-w4a16-vlm-dflash-evict`，depth 7 + lookup + tp_draft） |
+| 删除吸收（真 HTTP、每轮删最老图） | `删 [32,256)=224 tok · 保留后缀 19 页/640 tok · S=42 · 重挂 2` |
+| 旋转（合批后） | `层 16 · 页 19 / 9.5 MiB(K) / 1.16 ms` |
+| 命中面 | cached 256→640，prefill 恒 **272** |
+| 稳定性 | 零崩、零 Xid |
+
+⇒ **D 项在 27B/DFlash2/TP2 上也成立**（旋转后的位置帧对 verify 行无影响），与 0.8B 的
+token 级门互证。
+
+**（附）合并 main 后的配置 schema 迁移**：`[kernel] kv_fp8` → `[pool] kv_fp8`；
+`[pool] pool_tokens` 已删除（池大小由 VRAM 预算/`max_seq` 派生）。本卷两个 evict 档已改。
 
 ## 6bis. 两条收尾定谳（2026-10-24）
 
