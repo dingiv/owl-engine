@@ -4286,6 +4286,23 @@ fn dense_floor_mib_converts_up_to_pages() {
     assert_eq!(EngineKnobs::dense_floor_with_mib(0, mib), TurnFloor::Pages(0));
 }
 
+/// **快照重挂层分派**(前缀无感删除):四层各一条路,账不平 = 不重挂。
+/// 这是`plan_image_delete` 的唯一判据(设备槽在场与否由调用方传入)。
+#[test]
+fn snap_rekey_target_dispatch_law() {
+    use crate::scheduler::{snap_rekey_target, RekeyTarget};
+    use owl_store::Tier;
+    assert_eq!(snap_rekey_target(Some(Tier::Gpu), true), RekeyTarget::Device);
+    assert_eq!(
+        snap_rekey_target(Some(Tier::Gpu), false),
+        RekeyTarget::Skip,
+        "账说设备、槽上没有 ⇒ 击罒不平:不重挂"
+    );
+    assert_eq!(snap_rekey_target(Some(Tier::Host), false), RekeyTarget::Host);
+    assert_eq!(snap_rekey_target(Some(Tier::Disk), false), RekeyTarget::Disk);
+    assert_eq!(snap_rekey_target(None, true), RekeyTarget::Skip, "不在账 ⇒ 不重挂");
+}
+
 /// **装配期单源派生**:一个 `workspace_per_req` 同时落 `select_blocks` 与
 /// 地板页数;显式 MiB 优先(页宽由池给)。三件同源 = 不再各处各算一遍。
 #[test]

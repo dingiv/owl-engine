@@ -79,6 +79,44 @@ pub(crate) struct ReropePlan {
     pub pages: Vec<u32>,
     /// 位置平移量 `S`(正 = 后缀前移);核施加 `R(−S)`
     pub shift: i64,
+    /// **盘层快照的一次性收尾**(重挂 / 丢弃旧身份)。
+    ///
+    /// 盘内容要真 `rename`/`remove`,而决策面是纯 host —— 故计划只**记账**,
+    /// 真 I/O 在 `execute_begin` **最前**(快照恢复之前)由阻塞池做。
+    pub snap_disk: Vec<SnapDiskOp>,
+}
+
+/// 盘层快照的删除收尾动作(决策面出票,执行面照办)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SnapDiskOp {
+    /// 同一条快照换边界身份(`rename` 旧文件 → 新路径 + 两本账换键)
+    Rekey { old: owl_store::SnapKey, new: owl_store::SnapKey },
+    /// 旧身份的盘上副本整条丢弃(链已不可达,文件与账一并走)
+    Drop { key: owl_store::SnapKey },
+}
+
+/// 快照重挂的**层分派**(纯;门与文档的唯一真源)。
+///
+/// 分派律(每层只给一条路,不允许两边都算一份):
+/// - 设备:账 + 两 rank 槽标记(内容本就在槽上);
+/// - 宿主:账 + 驻留内容一起换键(`HostTier::rekey`,零搬运);
+/// - 盘:只出票(真 `rename` 在异步段,见 `exec::img_evict`);
+/// - 其余(不在账 / 账说设备但槽上没有)= 不重挂(账不平不许猜)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RekeyTarget {
+    Device,
+    Host,
+    Disk,
+    Skip,
+}
+
+pub(crate) fn snap_rekey_target(tier: Option<owl_store::Tier>, dev_slot: bool) -> RekeyTarget {
+    match tier {
+        Some(owl_store::Tier::Gpu) if dev_slot => RekeyTarget::Device,
+        Some(owl_store::Tier::Host) => RekeyTarget::Host,
+        Some(owl_store::Tier::Disk) => RekeyTarget::Disk,
+        _ => RekeyTarget::Skip,
+    }
 }
 
 /// 本步动作(相位决策;执行器无脑照办)
@@ -711,6 +749,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let mut boundary_new: Option<owl_store::SnapKey> = None;
         let mut rekeyed = 0usize;
+        let mut disk_ops: Vec<SnapDiskOp> = Vec::new();
         for i in 0..keep {
             let lo = (a_blocks + i) * page;
             let h = cur
@@ -720,20 +759,38 @@ impl<D: DeviceClient> RunningEngine<D> {
                 })?;
             let k_old = owl_store::SnapKey::at_boundary(hit.hashes[del.b / page + i]);
             let k_new = owl_store::SnapKey::at_boundary(h);
-            // **只重挂设备层快照**(宿主/盘层的键映射本刀不动:内容照样能
-            // `snap_ensure_resident` 回灌,只是新链身份上暂时没有条目)
-            if self.bank.rel.state.locate(k_old) == Some(owl_store::Tier::Gpu)
-                && self.dev.pool.snap_slot_of(k_old).is_some()
-                && self.bank.rel.rekey_snap(k_old, k_new)
-            {
-                let _ = self.dev.pool.snap_rekey(k_old, k_new);
-                if let Some(p) = self.peer.as_mut() {
-                    let _ = p.pool.snap_rekey(k_old, k_new);
+            // **按层分派重挂**(2026-10-23 扩):设备 = 两 rank 槽重标 + 账;
+            // 宿主 = 内容+账一起(零搬运);盘 = 出票,异步段做真 rename。
+            let tier = self.bank.rel.state.locate(k_old);
+            let target = snap_rekey_target(tier, self.dev.pool.snap_slot_of(k_old).is_some());
+            let ok = match target {
+                RekeyTarget::Device => {
+                    if self.bank.rel.rekey_snap(k_old, k_new) {
+                        let _ = self.dev.pool.snap_rekey(k_old, k_new);
+                        if let Some(p) = self.peer.as_mut() {
+                            let _ = p.pool.snap_rekey(k_old, k_new);
+                        }
+                        true
+                    } else {
+                        false
+                    }
                 }
+                RekeyTarget::Host => self.bank.rel.rekey_snap(k_old, k_new),
+                RekeyTarget::Disk => {
+                    disk_ops.push(SnapDiskOp::Rekey { old: k_old, new: k_new });
+                    true
+                }
+                RekeyTarget::Skip => false,
+            };
+            if ok {
                 rekeyed += 1;
             }
             if del.b / page + i == bi {
-                boundary_new = if self.bank.rel.state.locate(k_new).is_some() {
+                // 盘层的新键要到执行面才入账 ⇒ 这里按"已出票"认账
+                let pending_disk = disk_ops
+                    .iter()
+                    .any(|o| matches!(o, SnapDiskOp::Rekey { old, new } if *old == k_old && *new == k_new));
+                boundary_new = if self.bank.rel.state.locate(k_new).is_some() || pending_disk {
                     Some(k_new)
                 } else {
                     None
@@ -795,6 +852,17 @@ impl<D: DeviceClient> RunningEngine<D> {
                         freed_snaps += 1;
                     }
                 }
+                Some(owl_store::Tier::Disk) => {
+                    // 盘上那份也是旧身份的 GDN 态:已出票重挂的**别丢**;其余
+                    // 整条丢弃(文件 + 两本账)。真删文件在异步段。
+                    let queued = disk_ops.iter().any(|o| {
+                        matches!(o, SnapDiskOp::Rekey { old, .. } if *old == key)
+                    });
+                    if !queued {
+                        disk_ops.push(SnapDiskOp::Drop { key });
+                        freed_snaps += 1;
+                    }
+                }
                 _ => {}
             }
         }
@@ -804,7 +872,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         owl_shared::counter_add!("image_evict.tokens", (del.b - del.a) as u64);
         owl_shared::log_info!(
             "img-evict",
-            "前缀无感删除:删 [{}, {})={} tok(a={} 页对齐,整 {} 页)· 保留后缀 {} 页 / {} tok · 位置平移 S={} · 快照重挂 {} 条 · 旧身份废弃 {} · 删段快照释放 {} 条",
+            "前缀无感删除:删 [{}, {})={} tok(a={} 页对齐,整 {} 页)· 保留后缀 {} 页 / {} tok · 位置平移 S={} · 快照重挂 {} 条(盘层待搬 {}) · 旧身份废弃 {} · 删段快照释放 {} 条",
             del.a,
             del.b,
             del.b - del.a,
@@ -814,6 +882,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             cached_len,
             shift,
             rekeyed,
+            disk_ops.len(),
             invalidated,
             freed_snaps
         );
@@ -825,7 +894,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             cached_len,
             tail_hash: cur.tail(),
             restore_key,
-            rerope: ReropePlan { pages, shift },
+            rerope: ReropePlan { pages, shift, snap_disk: disk_ops },
         }))
     }
 

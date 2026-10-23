@@ -89,6 +89,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 性能面:本轮 epoch 起点(/debug/perf?epoch=1 = 只看本轮;不 reset,
         // 历史样本仍可全量查询 —— perf-framework.md §三)
         owl_shared::metrics::mark_epoch();
+        // **删后旧身份的盘层快照收尾**(重挂 / 丢弃):必须在**任何快照恢复之前**
+        // —— 新链的恢复键可能落在盘层,回灌按新键查文件。
+        if let Some(rr) = b.rerope.as_ref() {
+            if !rr.snap_disk.is_empty() {
+                self.execute_snap_disk_ops(&rr.snap_disk).await?;
+            }
+        }
         // 快照就位(host 侧:store 层账 + 必要时一条 swap 回灌)——
         // **必须在设备半之前**:两 rank 的快照恢复都要用就位后的槽。
         let restore_slot = if !b.reset_gdn {

@@ -355,6 +355,50 @@ impl<K: DiskKey> DiskTier<K> {
     /// 溢写失败回滚(调用方删 tmp;本层无账变化 —— 幂等)。
     pub fn abort_spill(&self, _plan: &SpillPlanOf<K>) {}
 
+    /// **重挂计划**(前缀无感删除的盘层半):`(旧路径, 新路径)`。
+    ///
+    /// store 侧**零 I/O**:真正的 `rename` 由 engine 的阻塞池做
+    /// (`disk_io::rename_block`),回执后 [`Self::commit_rekey`] 改账。
+    /// 响亮拒:`old` 不在账 / `new` 已在账(不许覆盖)。
+    pub fn plan_rekey(&self, old: K, new: K) -> StoreResult<(PathBuf, PathBuf)> {
+        if self.resident.contains_key(&new) {
+            return Err(StoreError::Invariant(format!(
+                "盘层重挂:{new:?} 已在账(不许覆盖)"
+            )));
+        }
+        if !self.resident.contains_key(&old) {
+            return Err(StoreError::Unknown(format!("盘层重挂:{old:?} 不在账")));
+        }
+        Ok((self.path_for(old), self.path_for(new)))
+    }
+
+    /// **重挂落账**(`rename` 成功后):同一条内容换键,字节数不变。
+    ///
+    /// 目标键若在计划与回执之间被别人登记 ⇒ 拒,并把旧条目**原样放回**
+    /// (不留半改的账)。
+    pub fn commit_rekey(&mut self, old: K, new: K) -> StoreResult<()> {
+        let e = self
+            .resident
+            .remove(&old)
+            .ok_or_else(|| StoreError::Unknown(format!("盘层重挂落账:{old:?} 不在账")))?;
+        if self.resident.contains_key(&new) {
+            self.resident.insert(old, e);
+            return Err(StoreError::Invariant(format!(
+                "盘层重挂落账:{new:?} 已在账"
+            )));
+        }
+        self.tick += 1;
+        self.resident.insert(
+            new,
+            DiskEntry {
+                path: self.path_for(new),
+                last_use: self.tick,
+                ..e
+            },
+        );
+        Ok(())
+    }
+
     /// **回填计划**(读盘由调用方做;不在账 = 响亮拒)。
     pub fn plan_fill(&self, key: K) -> StoreResult<FillPlanOf<K>> {
         let e = self
@@ -469,6 +513,34 @@ mod tests {
         assert_eq!(DiskTier::<SnapKey>::key_of_file("snap-0000000000000007.bin"), Some(s));
         // 腿前缀不串(kv 文件不能被 snap 层解析)
         assert_eq!(DiskTier::<SnapKey>::key_of_file("kv-0000000000000007.bin"), None);
+    }
+
+    /// **重挂**(前缀无感删除的盘层半):计划给路径、落账换键;字节不变。
+    #[test]
+    fn rekey_plans_paths_and_moves_the_account() {
+        let mut d = tier(2 * BLK);
+        let a = ChainHash::new(1);
+        let b = ChainHash::new(2);
+        assert!(
+            matches!(d.plan_rekey(a, b), Err(StoreError::Unknown(_))),
+            "不在账 ⇒ 拒"
+        );
+        let p = d.plan_spill(a).expect("计划");
+        d.commit_spill(&p).expect("落账");
+        let (from, to) = d.plan_rekey(a, b).expect("重挂计划");
+        assert!(from.ends_with(d.file_name(a)), "旧路径按旧键算出:{from:?}");
+        assert!(to.ends_with(d.file_name(b)), "新路径按新键算出:{to:?}");
+        d.commit_rekey(a, b).expect("重挂落账");
+        assert!(!d.contains(a), "旧键消失");
+        assert_eq!(d.path_of(b), Some(d.path_for(b).as_path()), "新键拿到内容路径");
+        assert_eq!(d.used_bytes(), BLK, "字节随账走(没有复制)");
+        assert_eq!(d.resident_count(), 1);
+        // 目标已在账 ⇒ 计划与落账都拒(不许覆盖)
+        let p2 = d.plan_spill(a).expect("再写回旧键");
+        d.commit_spill(&p2).expect("落账");
+        assert!(matches!(d.plan_rekey(a, b), Err(StoreError::Invariant(_))));
+        assert!(matches!(d.commit_rekey(a, b), Err(StoreError::Invariant(_))));
+        assert!(d.contains(a) && d.contains(b), "拒绝不许半改");
     }
 
     #[test]

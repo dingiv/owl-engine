@@ -453,7 +453,7 @@ vLLM 那边的重转核**至今没落地**（PR 仍 open、env 门仍在、RFC �
 | 服务面 | image part `owl_evict` → `TurnImage.evict`；**多图**（去掉单图硬拒） |
 | 识别/pad | `engine::img_evict`（纯函数：`pad_image_spans` / `unpad` / `detect_text_delete` / `rebuild_after_delete` / `positions_shift`） |
 | 引擎 | `submit` 识别+重建；`scheduler::plan_image_delete`（先证后动：位置自证 → 取链 → **G6 refs==1** → 快照可分 → 才 incref）；`exec::img_evict::execute_k_shift`（两 rank 对称，`R(−S)`） |
-| 记账 | `AgentSession::{img_spans,pads}`；`store::{Rel,StateStore}::rekey_snap` + `StatePool::snap_rekey`（只重挂**设备层**快照） |
+| 记账 | `AgentSession::{img_spans,pads}`；`store::{Rel,StateStore}::rekey_snap` + `StatePool::snap_rekey`（层分派见 §5quater：设备/宿主/盘三层都重挂） |
 | **改写即失效** | `KvStore::drop_chain` / `Rel::drop_chain`：重转后**废弃被改后缀块的旧链身份**（vLLM `_maybe_evict_cached_block` 同义）。漏了它 = 别的会话按旧 token 命中同一批槽读旋转过的 K（真机：第二会话 logits 全 NaN，诊断面越界 panic 崩服务） |
 | **显存释放**（2026-10-23 用户口径"删了图显存要跟着降"） | 拼接之后**删点之后的整条旧链都不可达**了 ⇒ `drop_chain` 从 `a/page` 到 `matched_blocks` 全量废弃（被删段 + 被重转后缀 + 未复用尾巴），并把**这些边界的 GDN 快照**（设备/宿主）一并丢。引用归零的槽立刻回自由队列，本轮后续 prefill 就能用。实测 16 轮滑窗：`KvBlock` 稳定 **29 条 / 10MiB**、`Snap` **4 条 / 77MiB**（不释放时 209 条 / 82MiB + 323MiB 快照）。 |
 | 残余开销（认账） | ① 幸存图的页对齐 pad（每图 ≈30 tok，窗口 3 图 ≈90 tok）；② 被删图的 `pad_before` 块（≤31 tok，落在前缀里，删不掉——页对齐的构造性代价）；③ 旧链前缀条目保留（身份不变，可继续给别的会话用）。 |
@@ -516,6 +516,41 @@ vLLM 那边的重转核**至今没落地**（PR 仍 open、env 门仍在、RFC �
 2. **G6 的 COW**：现在 refs>1 直接整轮放弃；跨会话共享常态下会丢吸收机会。
 3. **漂移上限**：`delta_limit` + raw-K 重建（KVMem 已设计）未接；当前依赖快照
    边界，多轮连删会逐轮叠旋转（f16 每次重转，误差可累积）。
-4. **宿主/盘层快照重挂**：只重挂设备层；宿主/盘层仍按旧键能回灌，但新链身份上
-   没有条目（下一轮复用面可能变短）。
+4. ~~**宿主/盘层快照重挂**~~ ⇒ **已落地（见下 §5quater）**。
 5. **多图 × 投机（DFlash2）**：0.8B 无 spec；27B 上需单独验证 verify 行与位置帧不混。
+
+
+### 5quater. 三层快照重挂（2026-10-23 第二刀）
+
+问题：v1 只重挂设备层。宿主/盘的快照按**旧边界身份**留在账上 ⇒
+① 删后新链的恢复键指不到它（`restore_key` 退回旧键，而旧键在同一轮
+⑥ 里被当"旧身份"丢掉了 ⇒ 恢复点悬空）；② 多会话下 A 会话的尾巴早被挤到
+宿主/盘，A 一删图就静默退回全量重算。
+
+落点（**每层一条路**，不设第二条旁路）：
+
+| 层 | 内容动作 | 账动作 | 落点 |
+|---|---|---|---|
+| Gpu | 零搬运（槽上内容就是它） | `rel.rekey_snap` + 两 rank `pool.snap_rekey` | `plan_image_delete` 同步 |
+| Host | 零搬运（`HostTier::rekey` 只挪驻留表条目） | `rel.rekey_snap`（内部先 host 后 state） | 同上 |
+| Disk | 真 `rename`（文件名 = 键） | `plan_rekey_snap_disk` → `commit_rekey_snap_disk` | `execute_begin` **最前**（异步阻塞池） |
+
+- 分派律收在一处：`scheduler::snap_rekey_target(tier, dev_slot)`（纯函数，
+  门 `snap_rekey_target_dispatch_law`）。**账说设备但槽上没有 = 账/槽不平 ⇒
+  不重挂**（不许猜）。
+- 盘层票（`SnapDiskOp::{Rekey,Drop}`）随 `ReropePlan.snap_disk` 下发，
+  **必须在任何快照恢复之前**跑完 —— 否则 `snap_ensure_resident(新键)` 按新
+  键查文件时盘上还叫旧名。
+- ⑥ 的旧身份清理补上**盘层手臂**：已出票重挂的跳过（别把刚重挂的又删了），
+  其余整条丢（文件 + 盘账 + 状态账）。v1 对盘层是 `_ => {}`，等于把死身份
+  永远压在盘预算上。
+- 失败语义（响亮）：盘 rename 失败 ⇒ 账不动（旧键仍有效），warn 级日志；
+  若这个键正是恢复键，`snap_ensure_resident` 会响亮拒 ⇒ 该 turn 失败
+  （不静默当"恢复过了"）。
+
+门（store）：`host::rekey_moves_content_without_copy` /
+`disk::rekey_plans_paths_and_moves_the_account` /
+`rel::rekey_snap_moves_host_content_without_copy`（含"账说宿主、驻留表没有 ⇒
+拒且原样不动"）/ `state::rekey_snap_moves_account_without_copy`（宿主/盘层随
+账走）。**未真机**：多会话把尾巴挤到宿主再删图这条端到端路径仍待 27B 档
+（§7 挂账 1）顺带验。
