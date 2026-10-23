@@ -501,5 +501,7 @@ key 模长归一），但 2240 工作集下输出仍退化。受控 A/B 定谳�
 | 45k | 45k | 1406 | 答出 BLUEBIRD |
 | 60k | 30k | 1875 | 开始答出 |
 
-块选中且 stage-in 哈希一致 ⇒ 不是选择/搬运；有效检索距离边界约 **45–60k**。
-下一步查 RoPE/YaRN/长距离 attention，不要继续加 workspace。
+块选中且 stage-in 哈希一致 ⇒ 不是选择/搬运。**但“45–60k 距离上限”已撤回**：
+改用 coherent filler 后，90k 上下文中 code 在 10k/30k 均答出
+`BLUEBIRD-42`（相对距离 80k/60k）⇒ 随机词 word salad 是 OOD 测试，
+不是距离/选择问题。质量门改用 coherent NIAH。

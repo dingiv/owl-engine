@@ -2249,6 +2249,7 @@ GQA 聚合目前仍是 **mean**；上游脚本默认 `max`，尚未 port（需�
 
 ### 10.5 needle 距离扫描（90k）
 
-code 在 10k/30k 时块被选中且 stage-in 哈希与 40k 一致，但 90k 回答 `No`；
-code 在 45k/60k 时答出。30k 位置即使 workspace 加到 16384（512 块）仍 `No`。
-⇒ 有效检索距离边界约 **45–60k**；选择器/页表/搬运均已排除。
+code 在 10k/30k 时块被选中且 stage-in 哈希与 40k 一致，但随机词 filler 下
+90k 回答 `No`；code 在 45k/60k 时答出。30k 位置即使 workspace 加到 16384
+（512 块）仍 `No`。**改用 coherent filler 后，10k/30k 都答出 BLUEBIRD-42**。
+⇒ 随机词 word salad 是 OOD；选择器/页表/搬运/距离均已排除。

@@ -439,6 +439,20 @@ GPU 冒烟：80k 8192 连贯；260k 8192 spec on 零 IMA。
 补充：30k 位置 + workspace **16384**（512 块，块 937–945 连续选中，
 哈希同上）仍答 `I cannot provide a secret code…`。
 
-⇒ 选块、页表、stage-in 三件全部正确；**失败边界在“query 到 code 的相对距离
-≈ 45–60k”**。8192 → 16384 工作集不能恢复，说明不是保留块太少。
-下一刀应查 RoPE/YaRN/长距离 attention，而不是继续加 top-k 或改选择器。
+⇒ 在**随机词 filler** 下，10k/30k 失败、45k/60k 通过；但 12.10 的 coherent
+filler 对照表明这**不是距离上限**。8192 → 16384 工作集不能恢复，说明不是
+保留块太少。
+
+### 12.10 更正：随机词 filler 是 OOD，不是距离/选择问题
+
+同一 90k 上下文、同一问题，改用 **coherent filler**（自然段落重复）：
+
+| code 位置 | 相对距离 | 回答 |
+|---:|---:|---|
+| 10k | 80k | `The secret code is BLUEBIRD-42.` |
+| ~30k | ~60k | `The secret code is BLUEBIRD-42.` |
+
+⇒ 模型在 90k 上下文、80k 相对距离下仍能命中；**随机词 word salad 是
+OOD/对抗测试**，它让 10k/30k needle 失败，不能用来判“选择层选错”或
+“有效距离 45–60k”。选择器、页表、stage-in 全部无罪。
+质量门（NIAH/召回）应改用 coherent filler；随机词只保留作确定性冒烟。
