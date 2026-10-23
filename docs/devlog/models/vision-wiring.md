@@ -390,6 +390,8 @@ HF/AWQ 档的塔在检查点目录(`model.visual.*`);GGUF 主文件**只带文�
   4B 单图、27B MTP/DFlash2 多图仍正常。
 - 当前定位:不是 FA2 多图核本身;优先查 main 的 spec snapshot / 多图 prompt
   交互。在定谳前,4B MTP 不建议用于多图长输出。
+- 复现、代码地图与首批实验见
+  [`vision-multi-image-handoff-20261024.md`](vision-multi-image-handoff-20261024.md)。
 
 ### 10.6 剩余限制
 
