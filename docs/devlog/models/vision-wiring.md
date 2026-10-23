@@ -372,7 +372,7 @@ HF/AWQ 档的塔在检查点目录(`model.visual.*`);GGUF 主文件**只带文�
 | 配置 | 请求 | 结果 |
 |---|---|---|
 | 4B Q4 / 3080 / spec off | 2×1024、4×1024、2×1408 | 通过;2×1408 约 2.2s/次,4×1024 约 0.7s |
-| 4B Q4 / 3080 / MTP d3 | 2×1024、64 token ×3 | 通过 |
+| 4B Q4 / 3080 / MTP d3 | 2×1024、64 token ×3 | 分支基线通过;**合并 main 后复现,见 10.5** |
 | 27B Q4 / 3090 / spec off | 2×1024、2×1408 | 通过;2×1408 约 4.5s/次 |
 | 27B AWQ / 3090 / MTP d3 | 2×1024、64 token | 通过 |
 | 27B AWQ / 3090 / DFlash2 d7 | 2×1024、64 token | 通过(窗口 AL 低时既有降级逻辑生效) |
@@ -381,7 +381,17 @@ HF/AWQ 档的塔在检查点目录(`model.visual.*`);GGUF 主文件**只带文�
   driver 分流单测覆盖 hd64/hd72 单图与多图。
 - 4B FA2 hdim64 与旧 FI ragged 同速(2×1408 均约 2.2s),因此没有性能回退。
 
-### 10.5 剩余限制
+### 10.5 合并 main 后的 4B MTP 复核(待查)
+
+- 本分支(合并 main 前)4B Q4_K_M + MTP(d3) 单请求 2 图、64-token 连发 3 次
+  全通过(FA2 hdim64);旧 FI ragged 多图的 `restore_spec_snap` illegal 不再出现。
+- **合并 main 后**(main 引入 message-boundary snapshot / image-evict 等改动)
+  同一请求再次在 `restore_spec_snap` 触发 `CUDA_ERROR_ILLEGAL_ADDRESS`;
+  4B 单图、27B MTP/DFlash2 多图仍正常。
+- 当前定位:不是 FA2 多图核本身;优先查 main 的 spec snapshot / 多图 prompt
+  交互。在定谳前,4B MTP 不建议用于多图长输出。
+
+### 10.6 剩余限制
 
 - `max_batch > 1` 的带图合批仍拒;
 - 图像前缀缓存/历史图片去重未做;
