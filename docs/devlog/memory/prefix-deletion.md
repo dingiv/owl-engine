@@ -817,3 +817,39 @@ block_bytes = n_full × 2(K,V) × (hkv ÷ TP) × hd × 32 × elem_bytes
 
 **门**：`engine e2e` 图像门新增 `rotate_us` 打印 + 粗上限（<5 ms；旧逐层口径 ~1.1 ms 在 0.8B
 上也会过，但 27B 的 6.3 ms 会被抓住）。
+
+### 5undecies. 多图 × 投机 verify 行（D 项，2026-10-24）：门已建，**被既有红挡住**
+
+**要证什么**：删除把后缀位置整体前移 `S`；verify 行（anchor + k 草稿）必须用**新**位置帧
++ **新** m-RoPE delta。判据 = **spec on/off 的贪心 token 流逐位相同**（verify 行拿错位置 ⇒
+接受判据用错位置的 logits ⇒ 必然分叉）。门：`engine e2e::gpu_image_evict_spec_identity_gate`
+（0.8B + `dumb` 草稿；verify 位置路径与 DFlash2 同一份 `verify_forward(.., pos, .., vlm_delta)`）。
+
+**判决：被既有红挡住（与删除无关）**。三门诊断（同一门内的开关）：
+
+| 诊断 | 结果 | 含义 |
+|---|---|---|
+| `OWL_GATE_SAME=1`（两臂**同构**、spec 都关、带图） | **分叉** | 同一配置/同一 prompt **跨 boot 不可复现** |
+| `OWL_GATE_TEXT=1`（纯文本两轮，同构两臂） | **逐位相同** | 确定性本身没问题 ⇒ 病在 **VLM 路径** |
+| `OWL_GATE_UNMARKED=1`（图不标记 ⇒ 无 pad） | 仍分叉 | 与 pad 律无关，也不是 spec 特有 |
+| 默认（带图 + spec on/off 对照臂，不删） | 分叉（首 token 起） | spec 差异**无法归因**于 verify 行/旋转 |
+
+⇒ **既有红（新记）**：0.8B **VLM 路径的贪心输出跨 boot 不可复现**（单 boot 内多轮是稳定的：
+滑窗探针 16 轮行为一致）。这条红挡住一切"跨 boot 的视觉 A/B"（不只是本门）。
+门现在的行为 = **自诊断**：对照臂分叉 ⇒ `skip` 并打印判据；等这条红修好，门自动开始
+断言删除臂（无需改代码）。
+
+**27B / DFlash2 / TP2 行为门（真机，2×3080，`qwen38_27b-3080_tp2-w4a16-vlm-dflash-evict`）**：
+spec depth 7 + lookup + tp_draft 全开，滑窗 keep=2（真 HTTP、真删图）：
+
+| 轮 | prompt | cached | prefill | 说明 |
+|---|---:|---:|---:|---|
+| 1–3 | 272→624 | 256→320 | 304 | 递增复用 |
+| 4–5 | 688→752 | 384→448 | 304 | **各删一张**(吸收) |
+
+- `[img-evict] 删 [96,320)=224 tok · 保留后缀 9 页/384 tok · S=42 · 重挂 1`
+- `[img-evict] 后缀 K 重转 R(−42) · 层 16 · 页 9 / 4.5 MiB(K) / 1.07–1.14 ms`（合批后）
+- 零崩、零 Xid；`spec-degrade m=0` 属**退化文本下**的正常降级（27B 多图 greedy 既有红）。
+
+⇒ 结论：**插件的管道在 spec 档下是通的**（删除/旋转/继续投机都能跑）；**数值恒等**这一步
+等 VLM 跨 boot 复现性修好后再落（门已就位）。

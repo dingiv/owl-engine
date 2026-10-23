@@ -175,6 +175,9 @@ async fn e2e_body() {
     // ── **前缀无感删除**(图像段;2026-10-23):两图 → 删旧图 → 后缀 K 原地重转 ──
     run!(gpu_image_evict_gate);
 
+    // ── **多图 × 投机 verify 行**(D 项):spec on/off 贪心 token 逐位相同 ──
+    run!(gpu_image_evict_spec_identity_gate);
+
     // ── 冷启动取证(fix/vlm F1;诊断,无硬断言;两个场景 = A/B)──
     run!(gpu_vlm_first_turn_probe_textfirst);
     run!(gpu_vlm_first_turn_probe_imagefirst);

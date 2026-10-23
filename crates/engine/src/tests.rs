@@ -5288,6 +5288,337 @@ pub async fn gpu_image_evict_gate() {
     );
 }
 
+/// **多图 × 投机 verify 行**(D 项;2026-10-24)。
+///
+/// 删除之后后缀 K 被整体前移 `S`(位置帧变),而 verify 行是"anchor + k 个草稿"
+/// 的多行前向 —— 它们必须用**新的**位置帧 + **新的** m-RoPE delta 跑;否则接受
+/// 判据会拿错位置的 logits 去比。
+///
+/// 判据:**spec on / off 的贪心 token 流逐位相同**(0.8B 无 DFlash2 ⇒ 用 `dumb`
+/// 草稿;verify 位置路径与 DFlash2 是同一份 `verify_forward(.., pos, .., vlm_delta)`。
+/// DFlash2 自身的草稿池/ring 另有 27B/TP2 行为门,见设计卷 §5undecies)。
+pub async fn gpu_image_evict_spec_identity_gate() {
+    let Some(ordinal) = gpu_ordinal() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    if !dir.join("config.json").exists() {
+        owl_shared::testkit::report::skip(format_args!("0.8B 资产不在 {}", dir.display()));
+        return;
+    }
+    /// 跑一遍"两图 → 删第一张"的灰心流,返回 (turn2 生成 token, 是否吸收, 旋转页数)
+    async fn arm(
+        spec: bool,
+        ordinal: usize,
+        dir: &std::path::Path,
+        no_delete: bool,
+    ) -> (Vec<u32>, bool, usize) {
+        let mut knobs = EngineKnobs {
+            vision: true,
+            prefix_cache: true,
+            image_evict: true,
+            // 恒等门口径 = 贪心
+            sampler_enabled: false,
+            pool_tokens: Some(2048),
+            prefix_cache_share: 1.0,
+            ..Default::default()
+        };
+        if spec {
+            knobs.draft.depth = 3;
+            knobs.draft.dumb = true;
+        }
+        let mut engine = Engine::new(EngineConfig {
+            device_ordinal: ordinal,
+            max_seq_tokens: 768,
+            prefill_chunk: 64,
+            knobs,
+        })
+        .expect("构造");
+        let loaded = engine.loader().load_qwen35_0_8b(dir).await.expect("装载 0.8B+VLM");
+        let mut running = engine.run(loaded).await.expect("装配");
+        let page = running.dev.pool.geom.page;
+        let image_token = running.dev.boot.vlm.as_ref().expect("VLM").cfg().image_token;
+        let one = |r: &RunningEngine<crate::GpuFace>, t: &str| -> u32 {
+            let v = r.boot.tok.try_encode(t).expect("encode");
+            assert_eq!(v.len(), 1, "{t} 应恰 1 token");
+            v[0]
+        };
+        let (vs, ve) = (one(&running, "<|vision_start|>"), one(&running, "<|vision_end|>"));
+        let pad_id = one(&running, "\n");
+        // 纯文本预热轮(0.8B「boot 后首轮带图」既有红 F1)
+        {
+            let (_s, t) = running
+                .submit_session(Some(500), "请用一句话说明你在做什么。", 6)
+                .expect("预热提交");
+            let _ = drive_turn(&mut running, t).await;
+        }
+        let marked = !owl_shared::env_reader::flag("OWL_GATE_UNMARKED");
+        let text_only = owl_shared::env_reader::flag("OWL_GATE_TEXT");
+        let mk_img = |salt: f32| owl_models::vlm::VlmImage {
+            pixel_values: (0..256 * 3 * 2 * 16 * 16)
+                .map(|i| salt + (i % 7) as f32 * 0.01)
+                .collect(),
+            grid: (1, 16, 16),
+        };
+        let item = |_i: usize| {
+            format!("<|vision_start|>{}<|vision_end|>", "<|image_pad|>".repeat(64))
+        };
+        let p_text = |n: usize| {
+            let mut s = String::new();
+            for i in 0..n {
+                s.push_str(&format!("观察点{i}:屏幕无异常,日志正常,继续。\n"));
+            }
+            s
+        };
+        // `chat_format()` 借 `boot` ⇒ 每次用完即弃(块作用域),不跨 &mut 持有
+        let q = "请用一句话说明你看到了什么。";
+        let mid = "中间这段文字会留在历史里。\n";
+        // 让 image0 的文本起点**落在页边界**(G4 同款;这里为了位置帧干净)
+        let fill: String;
+        let prompt1: String;
+        if text_only {
+            // 纯文本两轮(同一会话):判"跨 boot 的贪心是否确定"
+            fill = p_text(1);
+            prompt1 = {
+                let c = running.boot.tok.chat_format();
+                c.render_chat(
+                    &[
+                        ("system", "你是助手,按约定回答。"),
+                        ("user", &format!("{}{q}", fill)),
+                    ],
+                    false,
+                )
+            };
+        } else {
+        let (f0, p0) = {
+            let fill_ids = running.boot.tok.try_encode(&p_text(3)).expect("filler");
+            let mut chosen = None;
+            for k in 0..=fill_ids.len() {
+                let fill = running.boot.tok.decode(&fill_ids[..k]);
+                let p = {
+                    let c = running.boot.tok.chat_format();
+                    c.render_chat(
+                        &[
+                            ("system", "你是助手,按约定回答。"),
+                            (
+                                "user",
+                                &format!("{}{}{}{}{}{q}", fill, item(0), mid, item(1), p_text(1)),
+                            ),
+                        ],
+                        false,
+                    )
+                };
+                let ids = running.boot.tok.try_encode(&p).expect("编码");
+                let sq = crate::img_evict::pad_image_spans(
+                    &ids,
+                    &[true, true],
+                    &[(1usize, 16usize, 16usize), (1usize, 16usize, 16usize)],
+                    image_token,
+                    Some(vs),
+                    Some(ve),
+                    page,
+                    pad_id,
+                    &[],
+                )
+                .expect("试算 pad");
+                if sq.spans.len() == 2 && sq.spans[0].text_start % page == 0 {
+                    chosen = Some((fill, p));
+                    break;
+                }
+            }
+            chosen.expect("找不到页对齐前缀")
+        };
+        fill = f0;
+        prompt1 = p0;
+        }
+        let (sid, t1) = running
+            .submit_session_opts(
+                Some(501),
+                prompt1.as_str(),
+                8,
+                crate::turn::TurnOpts {
+                    images: if text_only {
+                        Vec::new()
+                    } else {
+                        vec![
+                            crate::turn::TurnImage { image: mk_img(0.2), evict: marked },
+                            crate::turn::TurnImage { image: mk_img(0.6), evict: marked },
+                        ]
+                    },
+                    ignore_eos: true,
+                    ..Default::default()
+                },
+            )
+            .expect("t1 提交");
+        // t1(padded prompt 长度 + 生成段)—— 判断分叉是否**在第一张图那轮就有**
+        let mut plen1 = 0usize;
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Prefill { turn, total, .. } if turn == t1 => plen1 = total,
+                TurnEvent::Completed { turn, .. } if turn == t1 => break,
+                TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+                TurnEvent::Idle => panic!("t1 队列丢失"),
+                _ => {}
+            }
+        }
+        let gen1: Vec<u32> = running
+            .bank
+            .sessions
+            .get(sid)
+            .map(|s| s.tokens[plen1.min(s.tokens.len())..].to_vec())
+            .unwrap_or_default();
+        eprintln!("[D] t1 生成(len={}) {gen1:?}", gen1.len());
+        let text1 = running
+            .bank
+            .sessions
+            .get(sid)
+            .map(|s| s.tokens[plen1.min(s.tokens.len())..].iter().map(|t| *t).collect::<Vec<_>>())
+            .map(|_| String::new())
+            .unwrap_or_default();
+        // 文本由 token 账反解(仅供 prompt2 回填;与客户端回同一份文本同等语义)
+        let text1 = {
+            let ids: Vec<u32> = running
+                .bank
+                .sessions
+                .get(sid)
+                .map(|s| s.tokens[plen1.min(s.tokens.len())..].to_vec())
+                .unwrap_or_default();
+            running.boot.tok.decode(&ids)
+        };
+        assert!(!text1.trim().is_empty(), "t1 必须出文本");
+        // turn 2:删第一张(对照臂 = 原样保留两图)
+        let (prompt2, imgs2) = {
+            let c = running.boot.tok.chat_format();
+            if text_only {
+                (
+                    c.render_chat(
+                        &[
+                            ("system", "你是助手,按约定回答。"),
+                            ("user", &format!("{}{q}", fill)),
+                            ("assistant", &text1),
+                            ("user", "现在屏幕上还有什么?"),
+                        ],
+                        false,
+                    ),
+                    Vec::new(),
+                )
+            } else if no_delete {
+                (
+                    c.render_chat(
+                        &[
+                            ("system", "你是助手,按约定回答。"),
+                            (
+                                "user",
+                                &format!("{}{}{}{}{}{q}", fill, item(0), mid, item(1), p_text(1)),
+                            ),
+                            ("assistant", &text1),
+                            ("user", "现在屏幕上还有什么?"),
+                        ],
+                        false,
+                    ),
+                    if text_only {
+                        Vec::new()
+                    } else {
+                        vec![
+                            crate::turn::TurnImage { image: mk_img(0.2), evict: marked },
+                            crate::turn::TurnImage { image: mk_img(0.6), evict: marked },
+                        ]
+                    },
+                )
+            } else {
+                (
+                    c.render_chat(
+                        &[
+                            ("system", "你是助手,按约定回答。"),
+                            ("user", &format!("{}{}{}{}{q}", fill, mid, item(1), p_text(1))),
+                            ("assistant", &text1),
+                            ("user", "现在屏幕上还有什么?"),
+                        ],
+                        false,
+                    ),
+                    if text_only {
+                        Vec::new()
+                    } else {
+                        vec![crate::turn::TurnImage { image: mk_img(0.6), evict: marked }]
+                    },
+                )
+            }
+        };
+        let (_, t2) = running
+            .submit_session_opts(
+                Some(501),
+                prompt2.as_str(),
+                8,
+                crate::turn::TurnOpts { images: imgs2, ignore_eos: true, ..Default::default() },
+            )
+            .expect("t2 提交");
+        // 记 padded prompt 长度(= 生成段起点);不能拿"尾部 8"当生成段(spec 可能多吐)
+        let mut plen2 = 0usize;
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Prefill { turn, total, .. } if turn == t2 => plen2 = total,
+                TurnEvent::Completed { turn, .. } if turn == t2 => break,
+                TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+                TurnEvent::Idle => panic!("t2 队列丢失"),
+                _ => {}
+            }
+        }
+        let absorbed = running.img_evict.absorbed == 1;
+        let pages = running.img_evict.last.as_ref().map(|t| t.pages.len()).unwrap_or(0);
+        let toks = running
+            .bank
+            .sessions
+            .get(sid)
+            .map(|s| s.tokens[plen2.min(s.tokens.len())..].to_vec())
+            .unwrap_or_default();
+        (toks, absorbed, pages)
+    }
+    // ① **先立对照臂(不删)**:判"分叉是删除引起,还是 spec×VLM 既有红"。
+    // 既有红在场时,删除臂的恒等判据**不可用**(两臂都跑在同一个坏地基上)⇒
+    // 门自我诊断并 skip(修好那条红之后本门自动接管)。
+    // 诊断臂:两臂同构(spec 都关)⇒ 判"图像多轮路径本身是否确定"
+    let spec_a = !owl_shared::env_reader::flag("OWL_GATE_SAME");
+    let (c_on, c_abs_on, _) = arm(spec_a, ordinal, &dir, true).await;
+    let (c_off, c_abs_off, _) = arm(false, ordinal, &dir, true).await;
+    assert!(!c_abs_on && !c_abs_off, "对照臂(不删)不该有吸收");
+    eprintln!("[D] 对照臂(不删)on  {c_on:?}\n[D] 对照臂(不删)off {c_off:?}");
+    if owl_shared::env_reader::flag("OWL_GATE_SAME") {
+        assert_eq!(
+            c_on, c_off,
+            "同构两臂也不一致 ⇒ 路径本身跨 boot 不确定(OWL_GATE_TEXT=1 可判是否 VLM 侧)"
+        );
+        eprintln!("[D] 同构两臂一致 ⇒ 之前的差异不是随机性");
+        return;
+    }
+    if owl_shared::env_reader::flag("OWL_GATE_UNMARKED") {
+        assert_eq!(
+            c_on, c_off,
+            "无 pad(不标记)对照臂也分叉 ⇒ 纯 spec×VLM 既有红(与 pad 律无关)"
+        );
+        eprintln!("[D] 无 pad 对照臂恒等 ⇒ 分叉来自 pad 律 × spec(本特性范围)");
+        return;
+    }
+    if c_on != c_off {
+        owl_shared::testkit::report::skip(
+            "既有红:VLM 跨 boot 不可复现(无删除对照臂已分叉;OWL_GATE_SAME=1 同构两臂也分叉、\
+             OWL_GATE_TEXT=1 纯文本则逐位相同)⇒ spec 差异无法归因于 verify 行/旋转,删除臂判据暂不可用",
+        );
+        return;
+    }
+    // ② 删除臂
+    let (a, abs_a, pa) = arm(true, ordinal, &dir, false).await;
+    let (b, abs_b, pb) = arm(false, ordinal, &dir, false).await;
+    assert!(abs_a && abs_b, "两臂都必须吸收删除(on={abs_a} off={abs_b})");
+    assert!(pa > 0 && pb > 0, "两臂都必须真的旋转过(on={pa} off={pb} 页)");
+    eprintln!("[D] 删除臂 on  len={} {a:?}\n[D] 删除臂 off len={} {b:?}", a.len(), b.len());
+    assert_eq!(a.len(), b.len(), "两臂生成 token 数必须一致(max_new=8)");
+    assert_eq!(
+        a, b,
+        "spec on/off 的贪心 token 必须逐位相同(verify 行 × 旋转后的位置帧)"
+    );
+}
+
 /// 27B 的 F1 控制组(首轮纯文本)。
 pub async fn gpu_vlm_first_turn_probe_27b_textfirst() {
     gpu_vlm_first_turn_probe_27b(false).await;

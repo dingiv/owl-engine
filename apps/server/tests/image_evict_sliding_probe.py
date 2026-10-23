@@ -49,11 +49,13 @@ COLORS = [(200, 40, 40), (40, 80, 200), (40, 180, 80), (220, 180, 40),
           (160, 60, 200), (40, 190, 190), (240, 120, 40), (120, 120, 240)]
 
 
-def chat(base: str, session: str, messages, max_tokens: int, model=MODEL):
+def chat(base: str, session: str, messages, max_tokens: int, model=MODEL, think=True):
     body = json.dumps({
         "model": model, "session": session, "messages": messages,
         "max_tokens": max_tokens, "temperature": 0,
-        "chat_template_kwargs": {},  # 思考默认开（答案可能在 reasoning_content）
+        # 思考默认开（答案在 reasoning_content；**harness 回填必须回同一份**，
+        # 否则下一轮前缀守卫失配 ⇒ cached=0，删除路径根本走不到）
+        "chat_template_kwargs": {} if think else {"enable_thinking": False},
     }).encode()
     req = urllib.request.Request(base.rstrip("/") + "/v1/chat/completions",
                                  data=body, headers={"Content-Type": "application/json"})
@@ -94,6 +96,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--size", type=int, default=256)
     ap.add_argument("--no-evict", action="store_true", help="对照臂：不打 owl_evict")
+    ap.add_argument("--no-think", action="store_true", help="关思考（答案进 content；前缀守卫才稳）")
     a = ap.parse_args()
 
     imgs = [png(a.size, a.size, COLORS[k % len(COLORS)], stripe=64) for k in range(a.turns)]
@@ -112,7 +115,7 @@ def main():
             part,
             {"type": "text", "text": "请用一句话描述你看到了什么。"},
         ]})
-        resp, ms = chat(a.base, a.session, msgs, a.max_tokens, a.model)
+        resp, ms = chat(a.base, a.session, msgs, a.max_tokens, a.model, think=not a.no_think)
         u = resp.get("usage", {})
         cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
         prompt = u.get("prompt_tokens", 0)
@@ -124,7 +127,7 @@ def main():
               f"prefill={prompt - cached:4d} ({(prompt - cached) / max(prompt, 1):5.1%}) "
               f"{ms:7.0f}ms  text={text[:48]!r}")
         # 客户端把模型的回答放回历史（真实 agent 形态）
-        msgs.append({"role": "assistant", "content": msg.get("content") or ""})
+        msgs.append({"role": "assistant", "content": msg.get("content") or msg.get("reasoning_content") or ""})
 
     total = (time.time() - t_all0) * 1000.0
     print(f"\n合计 {a.turns} 轮 / {total / 1000:.1f}s")

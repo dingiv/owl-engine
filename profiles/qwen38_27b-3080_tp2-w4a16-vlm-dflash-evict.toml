@@ -1,0 +1,18 @@
+# owl 预设档 `qwen38_27b-3080_tp2-w4a16-vlm-dflash-evict` —— 27B + DFlash2 投机 + **前缀无感删除**
+#
+# 用途:D 项 —— **多图 × 投机 verify 行** 的真机验证。删图之后后缀 K 被整体
+# 前移 `S`(位置帧变),而 DFlash2 的 verify 行是"anchor + k 个草稿"的多行前向:
+# 它们必须以**新的**位置帧 + **新的** m-RoPE delta 跑,否则接受判据会拿错位置
+# 的 logits 去比。
+#
+# 与 `qwen38_27b-3080_tp2-w4a16-vlm-evict.toml` 的差别只有 [spec]:
+#   depth = 7(DFlash2 草稿)、lookup = true、tp_draft = true;
+# 其余(f16 KV / 8192 池 / prefix_cache / image_evict / snap_max 2)全部继承。
+extends = ["qwen38_27b-3080_tp2-w4a16-vlm-evict.toml"]
+
+[spec]
+depth = 7
+draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+# 父档(evict)显式关了 lookup;本档开回来(要求 depth ≥ 1)
+lookup = true
+tp_draft = true
