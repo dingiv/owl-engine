@@ -574,6 +574,21 @@ pub(crate) fn view_pages_at(
     Some((pages, len))
 }
 
+/// **verify 视图裁剪**(纯函数;`cap_tokens=0` = 不裁)。
+///
+/// 只保留页链的**尾部** `ceil(cap_tokens/page)` 页(选中块按时间序 + 尾部),
+/// 让 verify 的 `depth+1` 行只扫最近 N token;decode 视图不走这里。
+pub(crate) fn cap_view_pages(pages: &mut Vec<u32>, page: usize, cap_tokens: usize) -> usize {
+    if cap_tokens == 0 || pages.is_empty() {
+        return pages.len();
+    }
+    let cap_pages = cap_tokens.div_ceil(page.max(1)).max(1);
+    if pages.len() > cap_pages {
+        pages.drain(..pages.len() - cap_pages);
+    }
+    pages.len()
+}
+
 /// 选择预算(环境旋钮;缺省 64 块 + sink 2 / recent 4)。
 impl<D: DeviceClient> RunningEngine<D> {
     /// 召回预算(`OWL_SELECT_BLOCKS` / `OWL_SELECT_SINK` / `OWL_SELECT_RECENT`;
@@ -2042,6 +2057,19 @@ mod view_tests {
         );
         // 召回点之前：视图不覆盖
         assert_eq!(view_pages_at(&selected, 64, &chain, 96, 95, 32), None);
+    }
+
+    #[test]
+    fn cap_view_pages_keeps_recent_tail() {
+        let mut pages = vec![1, 2, 3, 4, 5];
+        assert_eq!(super::cap_view_pages(&mut pages, 32, 64), 2);
+        assert_eq!(pages, vec![4, 5], "只留尾部 2 页");
+        let mut keep = vec![1, 2, 3];
+        assert_eq!(super::cap_view_pages(&mut keep, 32, 0), 3, "0 = 不裁");
+        assert_eq!(keep, vec![1, 2, 3]);
+        let mut one = vec![7, 8, 9];
+        assert_eq!(super::cap_view_pages(&mut one, 32, 1), 1, "cap<页宽 = 1 页");
+        assert_eq!(one, vec![9]);
     }
 
     #[test]

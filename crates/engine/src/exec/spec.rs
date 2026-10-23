@@ -855,6 +855,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 view.recall_pos
             ))
         })?;
+        let mut pages = pages;
+        // **verify 带宽上限**:只裁 verify 读的页链尾部;decode 仍用完整工作集。
+        let verify_cap = self.boot.cfg.knobs.verify_view_tokens;
+        let _ = crate::exec::coverage::cap_view_pages(&mut pages, page, verify_cap);
+        let view_cap_tokens = pages.len().saturating_mul(page);
         if pages.len() > nb {
             return Err(ModelError::Msg(format!(
                 "spec verify 视图超容量:{} 页 > 池 {nb}(pos={last};选中 {}),\
@@ -875,11 +880,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let mut slots = vec![0.0f32; rows];
         for r in 0..rows {
             let p = pos + r;
-            let len = view.tokens + (p + 1).saturating_sub(view.recall_pos);
-            if len > pages.len().saturating_mul(page) {
+            let raw_len = view.tokens + (p + 1).saturating_sub(view.recall_pos);
+            let len = raw_len.min(view_cap_tokens);
+            if verify_cap == 0 && raw_len > view_cap_tokens {
                 return Err(ModelError::Msg(format!(
-                    "spec verify 视图:len={len} > 页容量 {}(pos={p}),视图账不平",
-                    pages.len() * page
+                    "spec verify 视图:len={raw_len} > 页容量 {view_cap_tokens}(pos={p}),视图账不平"
                 )));
             }
             let row = &mut bt8[r * nb..(r + 1) * nb];
@@ -905,12 +910,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if self.boot.probes.dflash_probe {
             owl_shared::log_info!(
                 "view-diag",
-                "verify pos={} rows={} recall={} selected={} view_tokens={} pages={} len0={} slot0={} first={:?} last={:?}",
+                "verify pos={} rows={} recall={} selected={} view_tokens={} cap={} pages={} len0={} slot0={} first={:?} last={:?}",
                 pos,
                 rows,
                 view.recall_pos,
                 view.pages.len(),
                 view.tokens,
+                verify_cap,
                 pages.len(),
                 lens.first().copied().unwrap_or(-1.0),
                 slots.first().copied().unwrap_or(-1.0),

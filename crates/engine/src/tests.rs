@@ -4308,6 +4308,11 @@ fn derive_turn_ws_sets_blocks_and_floor_from_one_source() {
     let mut k = EngineKnobs { kvmem_virtualization: true, ..Default::default() };
     k.workspace_per_req = 64; // 2 页 < sink2+recent4 = 6 页
     assert!(EngineKnobs::derive_turn_ws(64, 32, page_bytes, &mut k).is_err());
+    // ⑤ verify 视图只能裁、不能放大
+    let mut k = EngineKnobs { kvmem_virtualization: true, ..Default::default() };
+    k.workspace_per_req = 640;
+    k.verify_view_tokens = 1024;
+    assert!(EngineKnobs::derive_turn_ws(640, 32, page_bytes, &mut k).is_err());
 }
 
 // ===========================================================================

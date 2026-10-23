@@ -731,6 +731,14 @@ pub struct KvmemCfg {
     /// 缺省 = 2240 tok(= 70 页 × 32 tok = 保底 6 + 召回 64 块,与旧 `select_blocks=64` 等值)。
     /// 页宽契约 = 32 token(设计卷 §1 铁律②)。
     pub workspace_per_req: usize,
+    /// **verify 视图带宽上限(token;0 = 跟随 `workspace_per_req`)**。
+    ///
+    /// 只影响 DFlash2/投机 verify 读的 KV 面,不影响 decode 的视图:
+    /// verify 需要 `depth+1` 行同时扫上下文,视图越长,每轮的 KV 带宽/时延
+    /// 越线性增长(90k 实测:2.2k→16k 视图,verify 轮 ≈51→194ms,AL 3.0→1.6)。
+    /// 非 0 时 verify 只取**视图尾部最近 N token**(选中块按时间序 + 尾部),
+    /// decode 仍用完整 `workspace_per_req` —— 用“草稿验证看近处”换 AL。
+    pub verify_view_tokens: usize,
     /// 保底 sink(时间序最前的若干块;论文 always-retained)。
     pub select_sink: usize,
     /// 保底 recent(时间序最后的若干块)。
@@ -1529,6 +1537,8 @@ impl Default for KvmemCfg {
             index: false,
             // 2240 tok = 70 页 × 32 tok = 保底 6 + 召回 64 块(与旧 `select_blocks=64` 等值)
             workspace_per_req: 2240,
+            // 0 = verify 与 decode 同视图(旧行为,逐位不变)
+            verify_view_tokens: 0,
             select_sink: 2,
             select_recent: 4,
             recall_every: 1,

@@ -138,6 +138,9 @@ pub struct EngineKnobs {
     /// `select_blocks`(召回预算块数)/ `dense_floor`(准入地板字节)/ 池下限里的每 turn 页数。
     /// **零 env 覆盖**(配置是唯一来源,见 §8.27)。
     pub workspace_per_req: usize,
+    /// **verify 视图带宽上限**(token;0 = 跟随 `workspace_per_req`)。
+    /// 只裁剪 verify 的 KV 视图;decode 视图仍用完整工作集。
+    pub verify_view_tokens: usize,
     /// **召回预算**(块数)= `ceil(workspace_per_req/page) − sink − recent`。
     /// **派生量**(唯一产地 = [`derive_turn_ws`],装配期写;测试档可直接构)。
     /// 视图 = 保底 + 按分 top-k ⇒ 这是"选择层丢多少"的内部旋钮。
@@ -306,6 +309,7 @@ impl Default for EngineKnobs {
             select_partial: false,
             evict_policy: owl_store::EvictPolicyKind::Lru,
             workspace_per_req: 2240,
+            verify_view_tokens: 0,
             select_blocks: 64,
             select_sink: 2,
             select_recent: 4,
@@ -445,6 +449,12 @@ impl EngineKnobs {
         let page = page_tokens.max(1);
         let keep = knobs.select_sink + knobs.select_recent;
         let ws_pages = workspace_tokens.div_ceil(page).max(1);
+        if knobs.verify_view_tokens > workspace_tokens {
+            return Err(owl_iface::contract::ModelError::Msg(format!(
+                "boot: verify_view_tokens={} > workspace_per_req={} —— verify 只能裁剪、不能放大 decode 视图",
+                knobs.verify_view_tokens, workspace_tokens
+            )));
+        }
         if ws_pages < keep {
             return Err(owl_iface::contract::ModelError::Msg(format!(
                 "boot: 每 turn 工作集不自洽 —— workspace_per_req={} tok = {} 页 < 保底                  (sink {} + recent {} = {} 页);要么调大工作集,要么调小保底",
@@ -616,6 +626,7 @@ impl EngineKnobs {
             select_partial: cfg.kvmem.select_partial,
             evict_policy: Self::evict_policy_of(&cfg.kvmem),
             workspace_per_req: cfg.kvmem.workspace_per_req,
+            verify_view_tokens: cfg.kvmem.verify_view_tokens,
             // `select_blocks` = 派生量(装配期 `derive_turn_ws` 按池页宽写);
             // 此处保留构造器缺省,测试档可直接覆盖。
             select_blocks: 64,
@@ -1565,6 +1576,23 @@ fn boot_pool_floor(
             " ✗"
         }
     );
+    owl_shared::log_info!(
+        "turn-ws",
+        "verify 视图上限 = {} tok(0 = 跟随 workspace;只裁 verify,decode 不动)",
+        if cfg.knobs.verify_view_tokens == 0 {
+            cfg.knobs.workspace_per_req
+        } else {
+            cfg.knobs.verify_view_tokens
+        }
+    );
+    if cfg.knobs.verify_view_tokens > 0 {
+        owl_shared::log_warn!(
+            "turn-ws",
+            "verify_view_tokens={} 是实验档:只裁 verify 视图,实测会改变草稿接受/输出;\
+             生产保持 0(16k+8k 实测 AL 1.90 但输出退化)",
+            cfg.knobs.verify_view_tokens
+        );
+    }
     if cfg.knobs.kvmem_virtualization {
         if pool.geom.nb < need {
             return Err(owl_iface::contract::ModelError::Msg(format!(

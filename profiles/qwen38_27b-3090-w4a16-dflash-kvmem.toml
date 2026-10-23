@@ -8,8 +8,8 @@
 #   2240 tok（70 页）在 90k 上下文会把可见历史压到 2.2k，80,480 池下
 #   随机词 word salad 输出退化成 "Yes/user/assistant"；8192 tok 恢复连贯。
 #   注意：coherent NIAH 下 2240 也能召回（针块选中），8192 是 OOD 稳健性
-#   余量，不是召回正确性的硬前提。16k 也可用但 verify 轮 194ms、AL 1.6
-#   （8192 为 115ms / AL 3.0）。
+#   余量，不是召回正确性的硬前提。90k spec on 实测 2240 出现 m=0×6/输出
+#   退化；8192 为 AL 3.00 / 输出连贯，故默认 8192。16k 轮 194ms / AL 1.60。
 #
 # 起服：
 #   ./target/release/server -p profiles/qwen38_27b-3090-w4a16-dflash-kvmem.toml \
@@ -37,6 +37,9 @@ select_partial = true
 index = true
 pool_overcommit = true
 workspace_per_req = 8192
+# verify 视图带宽上限（token；0 = 跟随 workspace）。实验档：只裁 verify，
+# decode 仍用 workspace；16k+8k 实测 AL 1.90 但输出退化，生产保持 0。
+# verify_view_tokens = 8192
 select_sink = 2
 select_recent = 4
 recall_every = 1
