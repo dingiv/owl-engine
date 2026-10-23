@@ -5265,6 +5265,17 @@ pub async fn gpu_image_evict_gate() {
     }
 
     eprintln!(
+        "[G3] 旋转段 {} µs({} 页 / {} 层;逐层发射的旧口径 ≈1.1 ms)",
+        trace.rotate_us,
+        trace.keep_blocks,
+        running.dev.pool.kv_caches().len()
+    );
+    assert!(
+        trace.rotate_us < 5_000,
+        "旋转段 {} µs —— 发射没合批?(旧口径 ~1.1ms,批量应远低于此)",
+        trace.rotate_us
+    );
+    eprintln!(
         "[test] 前缀无感删除:删 [{}, {})={} tok · 保留后缀 {} 页 · S={} · 重挂 {} · 轮时 prefill 事件 {} · K 最差 {:.2}×4ulp",
         trace.a,
         trace.b,

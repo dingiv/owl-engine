@@ -9,7 +9,7 @@
 
 use owl_iface::contract::{DeviceClient, Dtype, ModelError};
 use owl_models::layers::kvshift::{delta_table, k_shift};
-use owl_models::interpreters::eval_ops_scoped_env;
+use owl_models::interpreters::eval_ops_side_effect_env_pool;
 use owl_models::TensorOps;
 
 use crate::scheduler::{ReropePlan, SnapDiskOp};
@@ -109,23 +109,58 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let n_layers = self.dev.pool.kv_caches().len();
         // **K only**(本核不碰 V;口径见 `StatePool::k_block_bytes`)
         let bytes = plan.pages.len() * self.dev.pool.k_block_bytes();
-        for (k, _v) in self.dev.pool.kv_caches() {
-            let node = k_shift(&k, &cos_t, &sin_t, &blocks_t, geom);
-            // env 是**方法调用**(整 &self.dev 借用)⇒ 必须在 face_mut 之前取值,
-            // 否则与 graphs 的可变借用打架(`prepare_vlm_rank` 同款顺序)。
+        // **每 rank 一条批量发射**(2026-10-24):16 层攒进**一条**信箱消息。
+        // 旧口径 = 逐层 `eval_ops_scoped_env` ⇒ 每层一次往返(27B/TP2 实测
+        // 6.3 ms 里 ~95% 是发射,GPU 只占零点几毫秒)。多根 side-effect 口径
+        // 一次求值全部层;预算只用来**打开累积批**(本算子无临时块)。
+        const BATCH_POOL: usize = 1 << 20;
+        let roots: Vec<TensorOps> = self
+            .dev
+            .pool
+            .kv_caches()
+            .iter()
+            .map(|(k, _v)| k_shift(&k, &cos_t, &sin_t, &blocks_t, geom))
+            .collect();
+        {
+            let refs: Vec<&TensorOps> = roots.iter().collect();
             let env = self.dev.env();
             let face = self.dev.graphs.session.face_mut();
-            let _ = eval_ops_scoped_env(node.step(), face, env, self.dev.boot.tp.as_ref()).await?;
+            let _ = eval_ops_side_effect_env_pool(
+                &refs,
+                face,
+                env,
+                self.dev.boot.tp.as_ref(),
+                BATCH_POOL,
+            )
+            .await?;
         }
+        drop(roots);
         // TP2:**同一份 Δ 表 / 同一份页列表**(物理槽两 rank 同号;旋转对称)
         if let Some(peer) = self.peer.as_mut() {
             let geom_p = peer.pool.k_shift_geom(half)?;
-            for (k, _v) in peer.pool.kv_caches() {
-                let node = k_shift(&k, &cos_t, &sin_t, &blocks_t, geom_p);
+            let roots_p: Vec<TensorOps> = peer
+                .pool
+                .kv_caches()
+                .iter()
+                .map(|(k, _v)| k_shift(&k, &cos_t, &sin_t, &blocks_t, geom_p))
+                .collect();
+            {
+                let refs: Vec<&TensorOps> = roots_p.iter().collect();
                 let env = peer.env();
                 let face = peer.graphs.session.face_mut();
-                let _ = eval_ops_scoped_env(node.step(), face, env, peer.boot.tp.as_ref()).await?;
+                let _ = eval_ops_side_effect_env_pool(
+                    &refs,
+                    face,
+                    env,
+                    peer.boot.tp.as_ref(),
+                    BATCH_POOL,
+                )
+                .await?;
             }
+        }
+        let elapsed_us = t0.elapsed().as_micros() as u64;
+        if let Some(t) = self.img_evict.last.as_mut() {
+            t.rotate_us = elapsed_us;
         }
         owl_shared::counter_add!("image_evict.rotate.bytes", bytes as u64);
         owl_shared::log_info!(

@@ -950,6 +950,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             pages: d.rerope.pages.clone(),
             rekeyed: d.rekeyed,
             rot_rounds,
+            rotate_us: 0,
         });
         Ok((d.cached_len, d.restore_key, Vec::new(), Some(d.rerope)))
     }

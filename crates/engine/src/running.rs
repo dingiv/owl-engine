@@ -229,6 +229,9 @@ pub struct ImgEvictTrace {
     /// **本会话链累计被重转的次数**(漂移账;到 `image_evict_delta_limit`
     /// 后下一轮删除触发整段重建)
     pub rot_rounds: u32,
+    /// **旋转段墙钟(µs,两 rank 合计)** —— 执行面在 `execute_k_shift` 回填。
+    /// 口径:G3 的门与运维面板直接读它(别再从日志里抠)。
+    pub rotate_us: u64,
 }
 
 /// **boot 期定型、运行期只读**的事实。

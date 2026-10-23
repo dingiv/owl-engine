@@ -30,7 +30,8 @@ pub mod planner;
 
 pub use eval::{
     eval, eval_ops, eval_ops_env, eval_ops_multi, eval_ops_multi_env, eval_ops_multi_scoped_env,
-    eval_ops_scoped, eval_ops_scoped_env, eval_ops_side_effect_env, eval_ops_tap,
+    eval_ops_scoped, eval_ops_scoped_env, eval_ops_side_effect_env,
+    eval_ops_side_effect_env_pool, eval_ops_tap,
 };
 // 段求值面(piecewise)已随 W5 退役(2026-10-18)—— 见 `eval.rs` 同名注。
 pub use generate::{eval_generate, GenSpec, Sampling};

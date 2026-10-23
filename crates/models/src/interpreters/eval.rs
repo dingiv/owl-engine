@@ -372,7 +372,7 @@ pub fn eval_ops_multi_scoped_env<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
-    eval_multi_scoped_inner(roots, face, env, tp, true)
+    eval_multi_scoped_inner(roots, face, env, tp, true, None)
 }
 
 /// **副作用根口径**(2026-10-19 泄漏定谳):与
@@ -393,16 +393,37 @@ pub fn eval_ops_side_effect_env<'a, D>(
 where
     D: crate::contract::DeviceClient + 'a,
 {
-    eval_multi_scoped_inner(roots, face, env, tp, false)
+    eval_multi_scoped_inner(roots, face, env, tp, false, None)
 }
 
-/// 多根 scoped 的**唯一实现体**(两个公共口 = `keep_roots` 两档)。
+/// **多根 side-effect + 显式块池预算**(0 = 关;>0 = 发射走**累积批**)。
+///
+/// 与 [`eval_ops_side_effect_env`] 同口径(根只用于触发执行,收尾即还),但
+/// 显式给出块池预算 ⇒ `pool_budget > 0` 时逐节点走 `queue`、作用域收尾一次
+/// `flush` —— **N 个根只花一条信箱往返**。用途:池内原地算子族(如 K 重转
+/// 逐层一发)在 `[interp] block_pool_bytes = 0` 的档位也要批量发射
+/// (27B/TP2 实测:16 层 × 2 rank 逐发 ≈ 6.3 ms,其中发射占 ~95%)。
+pub fn eval_ops_side_effect_env_pool<'a, D>(
+    roots: &'a [&'a TensorOps],
+    face: &'a mut D,
+    env: crate::env::EnvProvider,
+    tp: Option<&'a crate::module::TpCtx>,
+    pool_budget: usize,
+) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
+where
+    D: crate::contract::DeviceClient + 'a,
+{
+    eval_multi_scoped_inner(roots, face, env, tp, false, Some(pool_budget))
+}
+
+/// 多根 scoped 的**唯一实现体**(三个公共口 = `keep_roots` 两档 + 预算覆盖)。
 fn eval_multi_scoped_inner<'a, D>(
     roots: &'a [&'a TensorOps],
     face: &'a mut D,
     env: crate::env::EnvProvider,
     tp: Option<&'a crate::module::TpCtx>,
     keep_roots: bool,
+    pool_budget: Option<usize>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, ModelError>> + Send + 'a>>
 where
     D: crate::contract::DeviceClient + 'a,
@@ -413,7 +434,8 @@ where
         // `pending` 恒多算 ⇒ 中途活性回收整体失效(真回收 14/新块 1431 实测)。
         let pending = count_pending_multi(roots);
         let perf = PerfCtx::of(&env);
-        let pool_budget = env.interp.block_pool_bytes;
+        // 预算覆盖:显式给值优先(批量发射的开关就是它 > 0),否则按档位环境
+        let pool_budget = pool_budget.unwrap_or(env.interp.block_pool_bytes);
         let mut ctx =
             EvalCtx { face, memo: std::collections::HashMap::new(), tap: None, arena: Vec::new(),
                 arena_set: std::collections::HashSet::new(),
