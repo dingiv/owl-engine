@@ -1049,6 +1049,72 @@ mod tests {
         assert_eq!(tc.len(), 1);
     }
 
+    /// **死枝自走**(2026-10-24 前缀无感删除):把"与活链划清界限"的那一块身份
+    /// 摘掉之后,它的**父块自动变叶**(`PrefixTree::remove` 里 children 归零 ⇒
+    /// 进 `leaf_lru`)⇒ 下一次容量驱逐**优先收它**,活链的兄弟分支一根不动。
+    ///
+    /// 这就是"不主动删、只让它变成可回收的死枝"的机械证明。
+    ///
+    /// 结构(内容身份树;分叉点共享同一块身份):
+    /// ```
+    ///   F ── d1 ── d2        ← 死枝(删段+旧后缀);d2 = "被原地改写/划清界限"的那块
+    ///    └── s               ← 活链(新链后缀)
+    /// ```
+    /// 注:登记更长的链会把同内容块**重绑**到新槽(旧槽引用归零),这是树的既有语义。
+    #[test]
+    fn dead_branch_becomes_leaf_and_is_collected_first() {
+        // 池给足(建树阶段的容量驱逐会干扰结构);压力留到后面显式施加
+        let mut m = kv(10, 12);
+        let fork: Vec<u32> = toks(32); // F:1 块
+        let mk = |extra: u32| {
+            let mut t = fork.clone();
+            t.extend(extra..extra + 32);
+            t
+        };
+        let (t_d1, t_d2, t_s) = (mk(1000), {
+            let mut t = mk(1000);
+            t.extend(2000..2032);
+            t
+        }, mk(3000));
+
+        for toks_ in [&fork, &t_d1, &t_d2, &t_s] {
+            let mut tab = Vec::new();
+            m.ensure_for_len(&mut tab, toks_.len()).expect("建链");
+            m.register_chain(toks_, &tab).expect("登记");
+            m.release_table(&mut tab).expect("还表(= turn 收尾)");
+        }
+        let (d1, d2, s) = (
+            m.tail_hash(&t_d1, 2).expect("d1"),
+            m.tail_hash(&t_d2, 3).expect("d2"),
+            m.tail_hash(&t_s, 2).expect("s"),
+        );
+        let fork_h = m.tail_hash(&fork, 1).expect("F");
+
+        eprintln!("[dbg] cands={:?}", m.evict_candidates(&[]).iter().map(|c| c.chain).collect::<Vec<_>>());
+        let leaf_has = |m: &KvStore, h| m.evict_candidates(&[]).iter().any(|c| c.chain == Some(h));
+        assert!(leaf_has(&m, d2), "d2 是叶");
+        assert!(leaf_has(&m, s), "s 是叶");
+        assert!(!leaf_has(&m, d1), "d1 还不是叶(下面挂着 d2)");
+        assert!(!leaf_has(&m, fork_h), "分叉点 F 有活孩子 ⇒ 不是叶");
+
+        // **划清界限**:d2 的身份被摘(等价于"被原地改写的那几页")
+        assert!(m.drop_chain(d2).expect("摘 d2"), "d2 在树里");
+        assert!(leaf_has(&m, d1), "摘掉孩子 ⇒ d1 自动变叶 ⇒ 可回收");
+        assert!(!leaf_has(&m, fork_h), "F 仍有活孩子 s ⇒ 不该变叶");
+
+        // 逼一次容量驱逐:要的块数 = 当前空槽 + 1 ⇒ 必须逐 1 个叶
+        let free = m.slots_free();
+        let mut extra = Vec::new();
+        let evicted = m
+            .ensure_for_len(&mut extra, (free + 1) * crate::id::TOKENS_PER_BLOCK)
+            .expect("腾槽");
+        assert!(!evicted.is_empty(), "必须发生驱逐(空槽 {free})");
+        assert_eq!(evicted[0].0, d1, "收的必须是死枝 d1(叶 + 更冷),不是活链 s");
+        assert_eq!(m.locate(d1), None, "死枝 d1 已被回收");
+        assert!(m.locate(s).is_some(), "活链 s 一根不动");
+        assert!(m.locate(fork_h).is_some(), "分叉点 F 不动");
+    }
+
     /// 叶级候选面(驱逐/退化下沉)**仍只出叶**且 protect 有效。
     #[test]
     fn evict_candidates_are_leaves_only_and_protect_wins() {

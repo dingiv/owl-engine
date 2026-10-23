@@ -486,7 +486,7 @@ vLLM 那边的重转核**至今没落地**（PR 仍 open、env 门仍在、RFC �
 | 引擎 | `submit` 识别+重建；`scheduler::plan_image_delete`（先证后动：位置自证 → 取链 → **G6 refs==1** → 快照可分 → 才 incref）；`exec::img_evict::execute_k_shift`（两 rank 对称，`R(−S)`） |
 | 记账 | `AgentSession::{img_spans,pads}`；`store::{Rel,StateStore}::rekey_snap` + `StatePool::snap_rekey`（层分派见 §5quater：设备/宿主/盘三层都重挂） |
 | **改写即失效** | `KvStore::drop_chain` / `Rel::drop_chain`：重转后**废弃被改后缀块的旧链身份**（vLLM `_maybe_evict_cached_block` 同义）。漏了它 = 别的会话按旧 token 命中同一批槽读旋转过的 K（真机：第二会话 logits 全 NaN，诊断面越界 panic 崩服务） |
-| **显存释放**（2026-10-23 用户口径"删了图显存要跟着降"） | 拼接之后**删点之后的整条旧链都不可达**了 ⇒ `drop_chain` 从 `a/page` 到 `matched_blocks` 全量废弃（被删段 + 被重转后缀 + 未复用尾巴），并把**这些边界的 GDN 快照**（设备/宿主）一并丢。引用归零的槽立刻回自由队列，本轮后续 prefill 就能用。实测 16 轮滑窗：`KvBlock` 稳定 **29 条 / 10MiB**、`Snap` **4 条 / 77MiB**（不释放时 209 条 / 82MiB + 323MiB 快照）。 |
+| **显存回收**（2026-10-24 改判：**不主动删**） | 只摘**被原地重转**那几页的旧身份（`K` 已失真，旧身份命中 = 错值，正确性）；被删段与未复用的旧尾巴**内容没变 ⇒ 一个都不动**，它们与活链划清界限后成为**死枝**：`PrefixTree::remove` 把父块 children 归零 ⇒ 自动进 `leaf_lru` ⇒ 下一次容量驱逐按"叶 + 冷"自己收（store 门 `dead_branch_becomes_leaf_and_is_collected_first`）。⚠️ 旧口径（主动 `drop_chain` 整条后缀 + 丢删段快照，实测 `KvBlock 29 条/10MiB`、`Snap 4 条/77MiB`）已退役：那是绕过回收器的越权删除。 |
 | 残余开销（认账；**定谳见 §5octies**） | ① 标记图的预付款 `pad_before+pad_after` ≤62 tok/张（窗口 3 张 ≈93 tok）；② 被删图的 `pad_before` **≤31 tok**（期望 15.5）落在前缀里删不掉——页对齐的构造性代价，**token 口径、不产生专用块**；③ 旧链前缀条目保留（身份不变，可继续给别的会话用）。 |
 | 观测 | `RunningEngine::img_evict`（`absorbed` + `ImgEvictTrace{a,b,keep_blocks,shift,pages,rekeyed}`）+ counters |
 
@@ -498,7 +498,7 @@ vLLM 那边的重转核**至今没落地**（PR 仍 open、env 门仍在、RFC �
 | 算子准入（`op_tables`） | ✅ 10/10 |
 | CPU 纯测（`engine::img_evict` 5 例 + `kvshift` 4 例 + store `rekey`） | ✅ |
 | **G1/G2/G5 引擎门**（`engine.e2e::gpu_image_evict_gate`，0.8B VLM） | ✅ 删 `[64,160)`=96 tok（整页）· 保留后缀 **4 页** · `S=40` · 设备层快照重挂 **2** 条 · 旧身份废弃 **4** 条 · 吸收轮 **prefill 事件 1 次**（退回重算会是 4+）· **K 最差 0.25×4ulp**；未标记图被删 ⇒ 不吸收 |
-| **G6b 改写即失效** | ✅ 旧链能命中的面**止于删点末尾**（`matched_blocks == b/page`）；连开 4 个相同 prompt 的会话逐个删图 ⇒ 全部吸收、零 NaN、零崩溃（修复前第 2 个会话即崩） |
+| **G6b 改写即失效** | ✅ 旧历史能**穿过被删段**，在**第一页被旋转的后缀**处断（`matched_blocks == b/page`；被删段内容未改写 ⇒ 留作死枝，2026-10-24 收窄）；连开 4 个相同 prompt 的会话逐个删图 ⇒ 全部吸收、零 NaN、零崩溃（修复前第 2 个会话即崩） |
 | 既有回归 | ✅ `engine --lib` 142 / `models --lib`(kvshift 4) / `store --lib` 115 / `kernels op_tables` 10 |
 
 ### 5ter. 真实前端形态（滑窗 N 张图）实测（2026-10-23）
@@ -751,3 +751,38 @@ block_bytes = n_full × 2(K,V) × (hkv ÷ TP) × hd × 32 × elem_bytes
 1. 旋转只碰 **K**：`StatePool::k_block_bytes()` 单列（`block_bytes()` 是 K+V）⇒
    27B/TP2 实测"16 页"= **8 MiB(K)/rank**（旧日志按 K+V 记成 16 MiB，带宽口径差 2×）。
 2. 一张 448px 图 = 224 tok = 7 块 ⇒ 27B 7 MiB/rank、0.8B 2.6 MiB。
+
+### 5novies. 显存回收定谳：**只划清界限，不主动删**（2026-10-24 用户裁决）
+
+**store 的淘汰原则（现行，无定时器）**——判定全在 store，engine 只执行：
+
+| 面 | 规则 |
+|---|---|
+| 候选集 | `KvStore::evict_candidates` = `tree.leaves()` **只取叶** − `protect`（活跃 turn / 正在搬运的链）。非叶永远不入候选 |
+| 排序 | `hooks::order_candidates`：① `Transient` 快照最前；② 其余按**会话**分组（组间 = 该会话最冷候选，**冷会话先、无主最后**），组内 = `EvictPolicy`（缺省 LRU） |
+| 触发 | 容量（`cache_cap = prefix_cache_share × 池`）/ 预算压力（`Rel::plan_need` → `plan_capacity` 出票 → engine 搬）/ 宿主/盘/快照池满。**没有"过了多久就删"的时钟**，LRU 只是相对顺序 |
+| 语义 | 缓存淘汰只减**缓存那份绑定**（`decref`），**绝不把会话正在用的页抽走**；`refs==1` 是**下沉/搬盘**的约束，不是淘汰的约束 |
+
+**所以删除路径不需要任何标记**：被删段天然就是"最坏那一头"（旧链、`last_use` 旧），
+它缺的只是**结构资格** —— 而"摘掉被旋转页的旧身份"这一步恰好让它的父块
+`children` 归零 ⇒ **自动变叶** ⇒ 进 `leaf_lru`（`PrefixTree::remove` 的既有行为）
+⇒ 下一次容量驱逐优先收它。旧后缀则成了一条断根的死链，从自己的叶往上塌。
+
+**⑥ 收窄（本轮落地）**：
+
+| 段 | 内容状态 | 处置 |
+|---|---|---|
+| `[b/page, b/page+keep)` 被**原地旋转**过的后缀页 | K 已失真 | **硬弃旧身份**（正确性；vLLM `_maybe_evict_cached_block` 同义） |
+| `[a/page, b/page)` 被删段 | 未改写 | **不动**（死枝，交回收器） |
+| `(b/page+keep, matched)` 未复用的旧尾巴 | 未改写 | **不动**（同上） |
+| 这些边界的 GDN 快照 | 内容有效 | **不动**（快照池自己的 LRU 收） |
+
+**代价（如实记）**：吸收轮的"显存立刻降"没有了 —— 回收变成 LRU/容量驱动
+（池有 `prefix_cache_share` 上限，不会被撑爆，但也不会立刻掉）。换来的是**不抢别人的
+缓存**：被删段对"还想要那版历史"的会话依然可命中（内容本来就没变）。
+
+**门**：
+1. `store::kv::tests::dead_branch_becomes_leaf_and_is_collected_first` —— 摘掉死枝中间块
+   ⇒ 父块自动变叶 ⇒ 一次容量驱逐收它，**活链兄弟与分叉点一根不动**；
+2. `engine e2e` G6b —— 旧历史能穿过被删段，在**第一页被旋转的后缀**处断（`b/page`）；
+3. 前缀照旧命中（G2 不回退）。

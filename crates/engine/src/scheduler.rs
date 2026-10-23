@@ -869,55 +869,21 @@ impl<D: DeviceClient> RunningEngine<D> {
             table.push(slot);
             pages.push(slot);
         }
-        // ⑥ **改写即失效 + 显存释放**(2026-10-23 用户口径:删了图,显存要跟着降)。
+        // ⑥ **划清界限,不主动删**(2026-10-24 用户裁决)。
         //
-        // 删点之后的**整条旧链**在拼接后都不可达了 —— 不只是被重转的 `keep` 页:
-        //   · 被删段自身的页(内容没改写,但历史里已经没有它了);
-        //   · 被重转后缀页(旧身份的 K 已失真,必须废弃);
-        //   · 后缀里没被复用的尾巴(不足一页/遇占位) —— 孤儿。
-        // 全部 `drop_chain` ⇒ 树不再持有这些槽 ⇒ 引用归零的槽**立刻回自由队列**
-        // (本轮后续 prefill 就能复用它们)。⚠️ 前缀 [0, a) 的条目**不动**(身份不变)。
+        // 只摘**被原地重转**的那几块的旧身份 —— 它们的 K 已经变了,旧身份一旦被
+        // 命中就是错值(正确性,不是策略;vLLM `_maybe_evict_cached_block` 同义)。
+        // 被删段 `[a,b)` 与未被复用的旧尾巴**一个都不动**:内容没被改写,对"还想要
+        // 那版历史"的会话依然有效 ⇒ 它们是**死枝**(与活链划清界限),由回收器按
+        // 结构律(叶可逐)+ 冷度(LRU)自己收 —— 这里不越权替它做决定。
+        //
+        // 副作用(结构性,正好合意):重转页的旧身份一摘,被删段就成了**叶子**,
+        // 而它下面的老尾巴变成一条断根的死链(叶→根仍可逐)⇒ 下一次回收就能收干净。
         let mut invalidated = 0usize;
-        let mut freed_snaps = 0usize;
-        for i in a_blocks..hit.matched_blocks {
-            let old_chain = hit.hashes[i];
-            if self.bank.rel.drop_chain(old_chain)? {
+        let first = del.b / page;
+        for i in first..first + keep {
+            if self.bank.rel.drop_chain(hit.hashes[i])? {
                 invalidated += 1;
-            }
-            // 该边界上的 GDN 快照同样不可达(键 = 边界身份);设备/宿主副本一并丢,
-            // 否则每条 20MiB(0.8B)/152MiB(27B)的槽会永远给"已不存在的边界"占着。
-            let key = owl_store::SnapKey::at_boundary(old_chain);
-            match self.bank.rel.state.locate(key) {
-                Some(owl_store::Tier::Gpu) => {
-                    if let Some(slot) = self.dev.pool.snap_slot_of(key) {
-                        self.dev.pool.snap_clear_slot(slot);
-                        if let Some(pr) = self.peer.as_mut() {
-                            pr.pool.snap_clear_slot(slot);
-                        }
-                        let _ = self.bank.rel.drop_snap_host(key);
-                        if self.bank.rel.state.drop_snap(key).is_ok() {
-                            freed_snaps += 1;
-                        }
-                    }
-                }
-                Some(owl_store::Tier::Host) => {
-                    let _ = self.bank.rel.drop_snap_host(key);
-                    if self.bank.rel.state.drop_snap(key).is_ok() {
-                        freed_snaps += 1;
-                    }
-                }
-                Some(owl_store::Tier::Disk) => {
-                    // 盘上那份也是旧身份的 GDN 态:已出票重挂的**别丢**;其余
-                    // 整条丢弃(文件 + 两本账)。真删文件在异步段。
-                    let queued = disk_ops.iter().any(|o| {
-                        matches!(o, SnapDiskOp::Rekey { old, .. } if *old == key)
-                    });
-                    if !queued {
-                        disk_ops.push(SnapDiskOp::Drop { key });
-                        freed_snaps += 1;
-                    }
-                }
-                _ => {}
             }
         }
         let cached_len = (a_blocks + keep) * page;
@@ -926,7 +892,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         owl_shared::counter_add!("image_evict.tokens", (del.b - del.a) as u64);
         owl_shared::log_info!(
             "img-evict",
-            "前缀无感删除:删 [{}, {})={} tok(a={} 页对齐,整 {} 页)· 保留后缀 {} 页 / {} tok · 位置平移 S={} · 快照重挂 {} 条(盘层待搬 {}) · 旧身份废弃 {} · 删段快照释放 {} 条",
+            "前缀无感删除:删 [{}, {})={} tok(a={} 页对齐,整 {} 页)· 保留后缀 {} 页 / {} tok · 位置平移 S={} · 快照重挂 {} 条(盘层待搬 {}) · 旋转页旧身份废弃 {} · 主动删段 0(死枝交回收器)",
             del.a,
             del.b,
             del.b - del.a,
@@ -937,8 +903,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             shift,
             rekeyed,
             disk_ops.len(),
-            invalidated,
-            freed_snaps
+            invalidated
         );
         Ok(Some(ImageDelete {
             table,

@@ -5053,11 +5053,15 @@ pub async fn gpu_image_evict_gate() {
         // 删点之后**整条旧链**都不可达了:被删段的 KV 已显式释放(用户口径:
         // 删了图显存要跟着降),后缀页被原地重转(旧身份失真),尾巴是孤儿。
         // ⇒ 旧 tokens 现在只能命中**前缀**。
+        // **2026-10-24 收窄**:我们只摘「被旋转页」的旧身份(正确性);被删段与
+        // 未复用的老尾巴内容没变 ⇒ 留作死枝交回收器。所以旧历史现在能**穿过
+        // 被删段**,在**第一个被旋转的页**处断 ✓(那里 K 已失真)。
         assert_eq!(
             hit_old.matched_blocks,
-            del.start / page,
-            "旧身份必须止于删点之前(得 {} 块;删段/后缀旧条目未释放)",
-            hit_old.matched_blocks
+            trace.b / page,
+            "旧身份必须止于第一页被旋转的后缀(得 {} 块;b/page={})",
+            hit_old.matched_blocks,
+            trace.b / page
         );
     }
 
