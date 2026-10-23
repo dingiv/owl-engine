@@ -1,0 +1,45 @@
+# owl 预设档 `qwen38_27b-3080_tp2-w4a16-vlm-evict` —— 2×3080 27B + 视觉 + **前缀无感删除**
+#
+# 用途:把「图像 KV 无感删除」从 0.8B 推到**真生产模型 + TP2 双 rank**
+# (删除后的后缀 K 重转必须在两 rank 对称执行;单卡档验不到这条)。
+#
+# 与主档的差别(其余全部继承 `qwen38_27b-3080_tp2-w4a16.toml`):
+#   - `kv_fp8 = false` —— image_evict 的硬前提(fp8 的 dequant→rotate→requant 未做);
+#   - 池缩到 8192 tok(f16 KV 每 token 64 KiB ⇒ 512 MiB;262k 档是 fp8 才装得下);
+#   - `prefix_cache = true` + `snap_max = 2`(删除路径要按边界身份恢复 GDN 态);
+#   - `spec.depth = 0`(本档先验删除路径;投机 verify 行另档);
+#   - FI plan / cuda graph 关掉(v2 臂):FI 的 plan 按 ctx 烘表,f16 小池档没必要。
+#
+# 端口 8136(与 0.8B 联调档 8135、现役引擎 8080 错开)。
+extends = ["qwen38_27b-3080_tp2-w4a16.toml"]
+
+[server]
+bind = "0.0.0.0:8136"
+
+[runtime]
+max_seq = 8192
+max_concurrency = 1
+
+[spec]
+# 先不带投机(D 项「多图 × DFlash2 verify 行」另档验)
+depth = 0
+# 父档开了 lookup(要求 depth ≥ 1)⇒ 本档必须显式关
+lookup = false
+
+[pool]
+pool_tokens = 8192
+gdn_slots = 1
+snap_max = 2
+prefix_cache = true
+image_evict = true
+image_evict_delta_limit = 32
+vram_target = 0.9
+vram_reserve_mb = 1024
+
+[kernel]
+kv_fp8 = false
+verify_arm = "v2"
+decode_arm = "v2"
+fi_plan_bake = false
+fi_plan_restore = true
+fi_cuda_graph = false

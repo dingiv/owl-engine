@@ -19,7 +19,7 @@
 """
 import argparse, base64, json, struct, sys, time, urllib.request, zlib
 
-MODEL = "qwen3.5-0.8b-vlm"
+MODEL = "qwen3.5-0.8b-vlm"  # 可用 --model 覆盖(27B 等)
 
 
 def png(w: int, h: int, rgb, stripe=None) -> str:
@@ -49,9 +49,9 @@ COLORS = [(200, 40, 40), (40, 80, 200), (40, 180, 80), (220, 180, 40),
           (160, 60, 200), (40, 190, 190), (240, 120, 40), (120, 120, 240)]
 
 
-def chat(base: str, session: str, messages, max_tokens: int):
+def chat(base: str, session: str, messages, max_tokens: int, model=MODEL):
     body = json.dumps({
-        "model": MODEL, "session": session, "messages": messages,
+        "model": model, "session": session, "messages": messages,
         "max_tokens": max_tokens, "temperature": 0,
         "chat_template_kwargs": {},  # 思考默认开（答案可能在 reasoning_content）
     }).encode()
@@ -87,6 +87,7 @@ def drop_oldest_image(msgs):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:8135")
+    ap.add_argument("--model", default=MODEL, help="OpenAI model 名(缺省 0.8B)")
     ap.add_argument("--session", default="slide-demo")
     ap.add_argument("--turns", type=int, default=6)
     ap.add_argument("--keep", type=int, default=3, help="会话里保留几张图（滑动窗口）")
@@ -111,7 +112,7 @@ def main():
             part,
             {"type": "text", "text": "请用一句话描述你看到了什么。"},
         ]})
-        resp, ms = chat(a.base, a.session, msgs, a.max_tokens)
+        resp, ms = chat(a.base, a.session, msgs, a.max_tokens, a.model)
         u = resp.get("usage", {})
         cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
         prompt = u.get("prompt_tokens", 0)
