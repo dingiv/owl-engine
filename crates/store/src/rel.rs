@@ -1006,8 +1006,76 @@ impl Rel {
     }
 
     /// **快照键重挂**(前缀无感删除;见 [`StateStore::rekey_snap`])。
+    ///
+    /// 按层分派:**设备**只动账(槽由引擎按 key 重标);**宿主**连内容一起
+    /// 重挂(`HostTier::rekey`,零搬运);**盘**不由本方法做 —— 盘内容要真
+    /// `rename`,归 engine 的异步 I/O(`plan_rekey_snap_disk` →
+    /// `disk_io::rename_block` → `commit_rekey_snap_disk`),本方法对盘层返 `false`。
+    ///
+    /// 拒绝(全列,均**不动任何东西**):
+    /// - `old` 不在账 ⇒ `false`;
+    /// - `new` 已在账 ⇒ `false`(不许覆盖);
+    /// - 宿主层账与驻留表不平(账说在宿主、表里没有)⇒ `false`(不许猜)。
     pub fn rekey_snap(&mut self, old: SnapKey, new: SnapKey) -> bool {
-        self.state.rekey_snap(old, new)
+        if self.state.locate(new).is_some() {
+            return false;
+        }
+        match self.state.locate(old) {
+            Some(Tier::Gpu) => self.state.rekey_snap(old, new),
+            Some(Tier::Host) => {
+                if self.snap_host.rekey(old, new).is_err() {
+                    return false;
+                }
+                // 前置已查 new 不在账 ⇒ 这里失败只可能是并发错账(单线程不会)
+                self.state.rekey_snap(old, new)
+            }
+            Some(Tier::Disk) | None => false,
+        }
+    }
+
+    /// **盘层快照重挂:计划**(`(旧路径, 新路径)`;真 I/O 归 engine 阻塞池)。
+    pub fn plan_rekey_snap_disk(
+        &self,
+        old: SnapKey,
+        new: SnapKey,
+    ) -> StoreResult<(std::path::PathBuf, std::path::PathBuf)> {
+        if self.state.locate(new).is_some() {
+            return Err(StoreError::Invariant(format!("盘层重挂:{new:?} 已在账")));
+        }
+        let Some(d) = self.snap_disk.as_ref() else {
+            return Err(StoreError::Unknown("盘层重挂:未接盘层".into()));
+        };
+        d.plan_rekey(old, new)
+    }
+
+    /// **盘层快照重挂:落账**(rename 成功后):盘账 + 状态账一起换键。
+    pub fn commit_rekey_snap_disk(&mut self, old: SnapKey, new: SnapKey) -> StoreResult<()> {
+        let Some(d) = self.snap_disk.as_mut() else {
+            return Err(StoreError::Unknown("盘层重挂落账:未接盘层".into()));
+        };
+        d.commit_rekey(old, new)?;
+        if !self.state.rekey_snap(old, new) {
+            return Err(StoreError::Invariant(format!(
+                "盘层重挂落账:状态账拒了 {old:?} → {new:?}(账不平)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// **盘层快照定向丢弃:计划**(路径;不在盘层 = `None`)。
+    ///
+    /// 删除后整条旧链都不可达 —— 盘上那份"旧边界的 GDN 态"同样成了孤儿,
+    /// 不丢就会把盘预算永远压在死身份上。
+    pub fn plan_drop_snap_disk(&self, key: SnapKey) -> Option<std::path::PathBuf> {
+        self.snap_disk.as_ref()?.path_of(key).map(|p| p.to_path_buf())
+    }
+
+    /// **盘层快照定向丢弃:落账**(文件删掉或本来就不在)。
+    pub fn commit_drop_snap_disk(&mut self, key: SnapKey) -> StoreResult<()> {
+        if let Some(d) = self.snap_disk.as_mut() {
+            d.commit_evict(&[key]);
+        }
+        self.state.drop_snap(key).map(|_| ())
     }
 
     /// **快照下沉回滚**(搬运失败):宿主缓冲随失败的 connector 释放,层不动。
@@ -1778,6 +1846,57 @@ mod tests {
             vec![k(100), k(101), k(200), k(201), k(102)],
             "快照出序 = 新鲜度(LRU):刚用过的尾巴最后逐,深度不参与"
         );
+    }
+
+    /// **快照键重挂**(前缀无感删除):宿主层连内容一起换身份(零搬运),
+    /// 设备层只动账(槽是池的活);目标已在账 / 账表不平 ⇒ 拒且原样不动。
+    #[test]
+    fn rekey_snap_moves_host_content_without_copy() {
+        // 宿主腿要有预算(snap_host = 总量 − KV 腿分片);默认测试账本全给 KV 腿
+        let mut i = inputs();
+        i.host_bytes = 16 << 20;
+        let mut cfg = kv_cfg(64, 32);
+        cfg.host_bytes = 8 << 20;
+        let mut r = Rel::open(
+            i.clone(),
+            AdmissionPolicy::new(4, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+        )
+        .expect("装配");
+        // 宿主层块粒度 = 一条快照字节(attach 前是占位 1 字节)
+        r.attach_snap_layout(crate::leg::PoolLayout {
+            class: crate::leg::BlockClass::GdnRow,
+            epoch: 1,
+            pieces: vec![crate::leg::PieceSpec {
+                buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                stride_bytes: BLOCK_BYTES,
+            }],
+        })
+        .expect("状态腿布局");
+        let old = SnapKey::at_boundary(ChainHash::new(0xA1));
+        let new = SnapKey::at_boundary(ChainHash::new(0xA2));
+        r.state.register_snap(old, BLOCK_BYTES, Tier::Host, SnapDurability::Durable);
+        let buf = r.snap_host.acquire().expect("借缓冲");
+        r.snap_host.put(old, buf).expect("驻留");
+        assert!(r.rekey_snap(old, new), "宿主层重挂");
+        assert_eq!(r.state.locate(new), Some(Tier::Host), "账随键走");
+        assert!(r.snap_host.get(old).is_none(), "旧键内容必须已换身份");
+        assert!(r.snap_host.get(new).is_some(), "新键拿到同一份内容");
+        assert_eq!(r.snap_host.used_bytes(), BLOCK_BYTES, "零搬运");
+        // 设备层只动账
+        let g_old = SnapKey::at_boundary(ChainHash::new(0xB1));
+        let g_new = SnapKey::at_boundary(ChainHash::new(0xB2));
+        r.state.register_snap(g_old, BLOCK_BYTES, Tier::Gpu, SnapDurability::Durable);
+        assert!(r.rekey_snap(g_old, g_new));
+        assert_eq!(r.state.locate(g_new), Some(Tier::Gpu));
+        // 目标已在账 ⇒ 拒(不许覆盖)
+        assert!(!r.rekey_snap(g_new, new));
+        // 账说宿主、驻留表里没有 ⇒ 拒(不许猜),且账原样不动
+        let h = SnapKey::at_boundary(ChainHash::new(0xC1));
+        r.state.register_snap(h, BLOCK_BYTES, Tier::Host, SnapDurability::Durable);
+        assert!(!r.rekey_snap(h, SnapKey::at_boundary(ChainHash::new(0xC2))));
+        assert_eq!(r.state.locate(h), Some(Tier::Host), "拒时必须原样不动");
     }
 
     /// **整枝塌缩**(2026-10-23):无宿主档下,一条 D 块冷链**一轮一张票、`span = D`**

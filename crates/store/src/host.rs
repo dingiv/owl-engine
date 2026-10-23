@@ -286,6 +286,26 @@ impl<K: HostKey> HostTier<K> {
         Ok(bytes)
     }
 
+    /// **键重挂**(前缀无感删除的宿主半;2026-10-23):驻留内容换一个身份。
+    ///
+    /// 只动账 —— 内容零搬运(删除是"搬运记忆":状态内容对平移后的位置帧依然
+    /// 成立,变的只是它的**身份** = 块边界哈希)。两条响亮拒与
+    /// [`crate::state::StateStore::rekey_snap`] 同律:`old` 不在账 / `new` 已在账
+    /// (覆盖会让两处身份指向同一份内容,账与槽位映射随即分叉)。
+    pub fn rekey(&mut self, old: K, new: K) -> StoreResult<()> {
+        if self.resident.contains_key(&new) {
+            return Err(StoreError::Invariant(format!(
+                "宿主层重挂:{new:?} 已在账(不许覆盖)"
+            )));
+        }
+        let buf = self
+            .resident
+            .remove(&old)
+            .ok_or_else(|| StoreError::Unknown(format!("宿主层重挂:{old:?} 不在账")))?;
+        self.resident.insert(new, buf);
+        Ok(())
+    }
+
     /// 驻留块号(驱逐序输入;调用方按策略排序)。
     pub fn resident_blocks(&self) -> Vec<K> {
         self.resident.keys().copied().collect()
@@ -496,6 +516,37 @@ mod tests {
         }
         assert!(t.free_bytes() <= DEFAULT_FREE_CAP * 512, "小块池必须有上限");
         assert_eq!(t.used_bytes(), 0);
+    }
+
+    /// **键重挂**(前缀无感删除):内容零搬运;两条响亮拒各一例。
+    #[test]
+    fn rekey_moves_content_without_copy() {
+        let mut t: HostTier = HostTier::new(256, 4096).expect("构造");
+        let b = t.acquire().expect("块");
+        t.put(ChainHash::new(1), b).expect("驻留");
+        assert!(
+            matches!(
+                t.rekey(ChainHash::new(9), ChainHash::new(2)),
+                Err(StoreError::Unknown(_))
+            ),
+            "不在账 ⇒ 拒(不许猜)"
+        );
+        let b2 = t.acquire().expect("块");
+        t.put(ChainHash::new(2), b2).expect("驻留");
+        assert!(
+            matches!(
+                t.rekey(ChainHash::new(1), ChainHash::new(2)),
+                Err(StoreError::Invariant(_))
+            ),
+            "目标已在账 ⇒ 拒(不许覆盖)"
+        );
+        t.rekey(ChainHash::new(1), ChainHash::new(3)).expect("重挂");
+        assert_eq!(
+            t.resident_blocks(),
+            vec![ChainHash::new(2), ChainHash::new(3)],
+            "旧键消失、新键在场"
+        );
+        assert_eq!(t.used_bytes(), 512, "字节随账走(没有复制)");
     }
 
     #[test]
