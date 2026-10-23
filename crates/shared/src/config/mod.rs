@@ -588,6 +588,25 @@ pub struct PoolCfg {
     pub kv_fp8: bool,
     /// GDN 快照池槽数
     pub snap_max: usize,
+    /// **消息边界快照**(缺省 `false` = 逐字节旧行为)。
+    ///
+    /// 开 = 在消息开启标记前取**页对齐**边界，prefill 在边界切块并拍一张
+    /// Durable 快照。目的 = 让同 system/tool 前缀在不同 session/子代理之间
+    /// 也能复用（当前粗锚点每 `SNAP_EVERY=4` 个 chunk 才拍一次，固定 system
+    /// 结尾常有 ≤2K token 的复用损失）。依赖 `prefix_cache=true` +
+    /// `snap_max>0`；无消费者时 boot 告警。
+    pub snap_msg_boundary: bool,
+    /// 消息开启标记的**文本覆盖**（空 = 用模型的 `ChatFormat.im_open`，
+    /// 如 Qwen 系 `<|im_start|>`）。引擎 boot 时把它 tokenize 成 id 序列；
+    /// 扫描代码只认参数 `open_ids`，不写死任何字面量。
+    pub snap_msg_delim: String,
+    /// 后续消息边界的稀疏间隔（token）。第一条边界无条件保留（通常是
+    /// system 结束），之后距上一条不足本值的边界跳过，避免 10K 多消息
+    /// 场景一次拍出几十张 27B 快照（152 MiB/张）。
+    pub snap_msg_min_gap: usize,
+    /// 消息边界切块的**最小步长**（token）。距当前 `fed` 太近的边界不单独
+    /// 切块，避免 20-token 消息制造大量小 prefill chunk。
+    pub snap_msg_min_span: usize,
     /// **宿主 KV 腿**(MiB;0 = 关层)。下沉的落点之一。
     pub host_cache_mb: usize,
     /// **复用池容量上限**(MiB;缺口 4 收尾 P1-1;缺省 256,0 = 不限)。
@@ -1604,6 +1623,10 @@ impl Default for PoolCfg {
             prefill_align_tail: true,
             snap_decode_stride: 1,
             snap_max: 4,
+            snap_msg_boundary: false,
+            snap_msg_delim: String::new(),
+            snap_msg_min_gap: 2048,
+            snap_msg_min_span: 0,
             host_cache_mb: 0,
             snap_host_mb: 0,
             disk_cache_mb: 0,

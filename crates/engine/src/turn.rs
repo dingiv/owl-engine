@@ -138,6 +138,8 @@ pub(crate) struct Turn {
     pub(crate) ephemeral: bool,
     pub(crate) spec: TurnSpec,
     pub(crate) prompt_ids: Vec<u32>,
+    /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
+    pub(crate) msg_snaps: Vec<usize>,
     /// 本轮 prompt 的图像段(含 pad;本轮坐标)—— 收口写回会话账
     pub(crate) img_spans: Vec<crate::img_evict::ImgSpan>,
     /// 本轮 prompt 的 pad 区间(升序;与 `img_spans` 同一次写回)
@@ -162,6 +164,8 @@ pub(crate) struct ActiveTurn {
     pub(crate) gdn_slot: usize,
     pub(crate) ephemeral: bool,
     pub(crate) prompt_ids: Vec<u32>,
+    /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
+    pub(crate) msg_snaps: Vec<usize>,
     pub(crate) max_new: usize,
     /// 忽略 EOS 跑满预算(TurnSpec 透传;测速口径)
     pub(crate) ignore_eos: bool,

@@ -44,6 +44,8 @@ pub(crate) mod graph_fleet;
 // **状态域户**(2026-10-21 收户):选择层运行态 / 保洁账 —— 字段私有,
 // 只经语义方法读写(见各模块头)。
 pub(crate) mod housekeeping;
+/// 消息边界 → 页对齐 GDN 快照点(纯 host;2026-10-24)
+pub(crate) mod msg_boundary;
 /// 前缀无感删除:host 纯函数面(识别 / 页对齐 pad / 位置自证)
 pub(crate) mod img_evict;
 pub(crate) mod loader;

@@ -266,6 +266,14 @@ pub struct EngineKnobs {
     pub max_batch: usize,
     /// spec 快照轮回滚缓冲槽数(缺省 4;原 OWL_SNAP_MAX)
     pub snap_max: usize,
+    /// 消息边界快照总开关(`[pool].snap_msg_boundary`;缺省 false)
+    pub snap_msg_boundary: bool,
+    /// 消息开启标记文本覆盖(空 = 模型 `ChatFormat.im_open`)
+    pub snap_msg_delim: String,
+    /// 后续消息边界稀疏间隔(token)
+    pub snap_msg_min_gap: usize,
+    /// 消息边界切块最小步长(token)
+    pub snap_msg_min_span: usize,
     /// VRAM 预算目标占比(缺省 0.97;原 OWL_VRAM_TARGET)
     pub vram_target: f64,
     /// VRAM 预留 MiB(缺省 1024;原 OWL_VRAM_RESERVE_MB)
@@ -356,6 +364,10 @@ impl Default for EngineKnobs {
             gdn_slots: 8,
             max_batch: 1,
             snap_max: 4,
+            snap_msg_boundary: false,
+            snap_msg_delim: String::new(),
+            snap_msg_min_gap: 2048,
+            snap_msg_min_span: 0,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
             raw_completion: false,
@@ -721,6 +733,10 @@ impl EngineKnobs {
             snap_decode_stride: cfg.pool.snap_decode_stride,
             // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)
             snap_max: owl_shared::env_reader::parse("OWL_SNAP_MAX").unwrap_or(cfg.pool.snap_max),
+            snap_msg_boundary: cfg.pool.snap_msg_boundary,
+            snap_msg_delim: cfg.pool.snap_msg_delim.clone(),
+            snap_msg_min_gap: cfg.pool.snap_msg_min_gap,
+            snap_msg_min_span: cfg.pool.snap_msg_min_span,
             vram_target: cfg.pool.vram_target,
             vram_reserve_mb: cfg.pool.vram_reserve_mb,
             raw_completion: cfg.probes.raw_completion,
@@ -1420,9 +1436,65 @@ pub(crate) fn into_running<D: DeviceClient>(
         );
     }
 
+    // **消息边界快照的分隔符解析**(2026-10-24):
+    // 代码里不写死 `<|im_start|>`;优先用显式 `[pool].snap_msg_delim`,
+    // 空串则回退模型声明 `ChatFormat.im_open`。这里 boot 期只 tokenize 一次,
+    // 运行期扫 prompt_ids 时只传 `&[u32]`。
+    let msg_snap_on = cfg.knobs.snap_msg_boundary
+        && cfg.knobs.prefix_cache
+        && cfg.knobs.snap_max > 0;
+    if cfg.knobs.snap_msg_boundary && !msg_snap_on {
+        owl_shared::log_warn!(
+            "boot",
+            "snap_msg_boundary=true 但 prefix_cache/snap_max 无快照消费者 ⇒ \
+             消息边界快照关闭(不会切块、不会拍快照)"
+        );
+    }
+    let msg_open_ids = if msg_snap_on {
+        let delim = if cfg.knobs.snap_msg_delim.is_empty() {
+            tokenizer.chat_format().im_open.clone()
+        } else {
+            cfg.knobs.snap_msg_delim.clone()
+        };
+        if delim.is_empty() {
+            owl_shared::log_warn!(
+                "boot",
+                "snap_msg_boundary=true 但分割串为空且模型 ChatFormat.im_open 为空 \
+                 ⇒ 回退旧的粗锚点策略(消息边界快照不生效)"
+            );
+            Vec::new()
+        } else {
+            let ids = tokenizer.try_encode(&delim).map_err(|e| {
+                ModelError::Msg(format!(
+                    "[pool].snap_msg_delim 无法 tokenize({delim:?}): {e}"
+                ))
+            })?;
+            if ids.is_empty() {
+                owl_shared::log_warn!(
+                    "boot",
+                    "snap_msg_boundary=true 但分割串 {delim:?} 编码为空 \
+                     ⇒ 回退旧的粗锚点策略"
+                );
+            } else {
+                owl_shared::log_info!(
+                    "boot",
+                    "消息边界快照:开 · delim={delim:?} → {} token {:?} · min_gap={} · min_span={}",
+                    ids.len(),
+                    ids,
+                    cfg.knobs.snap_msg_min_gap,
+                    cfg.knobs.snap_msg_min_span
+                );
+            }
+            ids
+        }
+    } else {
+        Vec::new()
+    };
+
     let boot = crate::running::BootCtx {
         probes: cfg.knobs.probes,
         tok: tokenizer,
+        msg_open_ids,
         cfg,
         seq: BOOT_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1,
     };

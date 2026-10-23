@@ -312,7 +312,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .first()
                 .map(|a| a.prompt_ids.len())
                 .unwrap_or(new_fed);
-            let next_end = Self::prefill_step_chunk(
+            let msg_snaps = self
+                .turns
+                .active
+                .first()
+                .map(|a| a.msg_snaps.as_slice())
+                .unwrap_or(&[]);
+            let next_end = Self::prefill_step_chunk_msg(
                 new_fed,
                 prompt_len,
                 self.boot.cfg.prefill_chunk,
@@ -322,6 +328,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
+                msg_snaps,
+                self.boot.cfg.knobs.snap_msg_min_span,
             )
             .map(|n| new_fed + n)
             .unwrap_or(new_fed);
@@ -400,7 +408,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .first()
                 .map(|a| a.prompt_ids.len())
                 .unwrap_or(new_fed);
-            let next_end = Self::prefill_step_chunk(
+            let msg_snaps = self
+                .turns
+                .active
+                .first()
+                .map(|a| a.msg_snaps.as_slice())
+                .unwrap_or(&[]);
+            let next_end = Self::prefill_step_chunk_msg(
                 new_fed,
                 prompt_len,
                 self.boot.cfg.prefill_chunk,
@@ -410,16 +424,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
+                msg_snaps,
+                self.boot.cfg.knobs.snap_msg_min_span,
             )
             .map(|n| new_fed + n)
             .unwrap_or(new_fed);
             let last_boundary =
                 next_end == new_fed || !next_end.is_multiple_of(self.dev.pool.geom.page);
+            let msg_snap = self
+                .turns
+                .active
+                .first()
+                .is_some_and(|a| a.msg_snaps.binary_search(&new_fed).is_ok());
             // GDN 快照**节奏化**(2026-10-20):末边界 + 每 `SNAP_EVERY` 个 chunk 一个锚点。
             // 冷 prefill 每边界都拍 = 槽满后每拍一次 DtoH(159 MB ≈ 31 ms);
             // 复用只需要**末边界**(append 场景)与稀疏锚点(分叉场景)。
             let every = self.boot.cfg.prefill_chunk.max(1) * SNAP_EVERY;
-            let snap_keep = last_boundary || new_fed.is_multiple_of(every);
+            let snap_keep = last_boundary || new_fed.is_multiple_of(every) || msg_snap;
             // **索引采集节奏**：与 `coverage_analyze` 的完整召回同拍 ——
             // 廉价边界只攒身份/页号，不触发 D2H；下次完整召回前一次补齐。
             // `coverage_probe` 诊断档要求每边界都有索引 ⇒ 全采。

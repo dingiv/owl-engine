@@ -260,12 +260,34 @@ impl<D: DeviceClient> RunningEngine<D> {
         if align_tail && prefix_cache { pool_page } else { 0 }
     }
 
+    /// 旧行为入口（测试用；生产统一走 [`Self::prefill_step_chunk_msg`]）。
+    #[cfg(test)]
     pub(crate) fn prefill_step_chunk(
         fed: usize,
         prompt_len: usize,
         chunk_cfg: usize,
         tail_merge: usize,
         page: usize,
+    ) -> Option<usize> {
+        Self::prefill_step_chunk_msg(fed, prompt_len, chunk_cfg, tail_merge, page, &[], 0)
+    }
+
+    /// 同 [`Self::prefill_step_chunk`],但允许在**消息边界页点**提前切块。
+    ///
+    /// `msg_snaps` = 页对齐的消息边界快照点（升序；由
+    /// `msg_boundary::message_snap_points` 产出）。本函数只做“取第一个远离
+    /// `fed` 足够远的点”这一段纯算术；分割符/角色/快照预算都不在这里。
+    ///
+    /// `min_span` = 距 `fed` 小于本值的边界不单独切（防止 20-token 消息
+    /// 把 prefill 打碎）。`msg_snaps` 为空 = 逐字节旧行为。
+    pub(crate) fn prefill_step_chunk_msg(
+        fed: usize,
+        prompt_len: usize,
+        chunk_cfg: usize,
+        tail_merge: usize,
+        page: usize,
+        msg_snaps: &[usize],
+        min_span: usize,
     ) -> Option<usize> {
         let remaining = prompt_len.checked_sub(fed)?;
         if remaining == 0 {
@@ -282,6 +304,21 @@ impl<D: DeviceClient> RunningEngine<D> {
             let last_boundary = (fed + step) / page * page;
             if last_boundary > fed {
                 step = last_boundary - fed;
+            }
+        }
+        // 消息边界：只在**正常步长内部**提前切，不扩大 step。
+        // 取第一个 `>= fed + min_span` 且 `< fed + step` 的点；`== end`
+        // 不需要切（该块本来就在边界结束，snap_keep 会认它）。
+        if !msg_snaps.is_empty() {
+            let lower = fed.saturating_add(min_span);
+            let end = fed + step;
+            // `b > fed` 是硬条件：上一块恰好在消息边界结束时，本块 fed 就等于
+            // 该点；再切一次会得到 step=0（零元素 prefill ⇒ 算子准入失败）。
+            if let Some(&b) = msg_snaps
+                .iter()
+                .find(|&&b| b > fed && b >= lower && b < end)
+            {
+                step = b - fed;
             }
         }
         Some(step)
@@ -518,7 +555,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .get_mut(turn.session_id)
                     .expect("submit 已建会话账");
                 let target = if self.boot.cfg.knobs.kvmem_virtualization {
-                    Self::prefill_step_chunk(
+                    Self::prefill_step_chunk_msg(
                         0,
                         turn.prompt_ids.len(),
                         self.boot.cfg.prefill_chunk,
@@ -528,6 +565,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                             self.boot.cfg.knobs.prefix_cache,
                             self.dev.pool.geom.page,
                         ),
+                        &turn.msg_snaps,
+                        self.boot.cfg.knobs.snap_msg_min_span,
                     )
                     .unwrap_or(1)
                 } else {
@@ -582,6 +621,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 started_ms,
                 ephemeral: turn.ephemeral,
                 prompt_ids: turn.prompt_ids,
+                msg_snaps: turn.msg_snaps,
                 max_new: turn.spec.max_new,
                 ignore_eos,
                 sampler: eff_sampler,
@@ -1266,7 +1306,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let remaining = act.prompt_ids.len() - base;
             // 块长:配置块长 ∩ 剩余(E1 paged 核后无 256 窗钳制;
             // 全局注意力语义,长 ctx 安全)
-            let chunk = Self::prefill_step_chunk(
+            let chunk = Self::prefill_step_chunk_msg(
                 base,
                 act.prompt_ids.len(),
                 self.boot.cfg.prefill_chunk,
@@ -1276,6 +1316,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
+                &act.msg_snaps,
+                self.boot.cfg.knobs.snap_msg_min_span,
             )
             .unwrap_or_else(|| remaining.max(1));
             // 时间片档：**只在"有人正在 decode"时**才把 prefill 切小 ——
@@ -1469,6 +1511,51 @@ mod prefill_tail_merge_tests {
         assert_eq!(R::prefill_step_chunk(8192, 8244, 512, 0, 32), Some(32));
         // 关对齐(page = 0)= 纯 L4
         assert_eq!(R::prefill_step_chunk(0, 83, 512, 512, 0), Some(83));
+    }
+
+    /// 消息边界切块:只在正常 step 内部提前切;点等于 end/太近/已过都不切。
+    #[test]
+    fn msg_boundary_cuts_inside_normal_step() {
+        let page = 32;
+        // 9728 + 512 = 10240;边界 9920 在中间 ⇒ 切到 9920(192 tok)。
+        assert_eq!(
+            R::prefill_step_chunk_msg(9728, 12000, 512, 0, page, &[9920], 0),
+            Some(192)
+        );
+        // 距 fed 192 < min_span 256 ⇒ 不切,保留正常 512。
+        assert_eq!(
+            R::prefill_step_chunk_msg(9728, 12000, 512, 0, page, &[9920], 256),
+            Some(512)
+        );
+        // 点在 normal step 之外(== end)⇒ 不额外切。
+        assert_eq!(
+            R::prefill_step_chunk_msg(9728, 12000, 512, 0, page, &[10240], 0),
+            Some(512)
+        );
+        // 点已经 <= fed ⇒ 忽略；点恰等于 fed 也必须忽略（step=0 会炸算子）。
+        assert_eq!(
+            R::prefill_step_chunk_msg(9728, 12000, 512, 0, page, &[9696], 0),
+            Some(512)
+        );
+        assert_eq!(
+            R::prefill_step_chunk_msg(9728, 12000, 512, 0, page, &[9728], 0),
+            Some(512)
+        );
+        // 多个点:取第一个 >= fed+min_span 的。
+        assert_eq!(
+            R::prefill_step_chunk_msg(9728, 12000, 512, 0, page, &[9792, 9920], 128),
+            Some(192)
+        );
+        // 与 L4 尾块合并共存:step 原本 564,边界 8192 ⇒ 切到 512。
+        assert_eq!(
+            R::prefill_step_chunk_msg(7680, 8244, 512, 1024, page, &[8192], 0),
+            Some(512)
+        );
+        // 空点集 = 旧行为。
+        assert_eq!(
+            R::prefill_step_chunk_msg(9728, 12000, 512, 0, page, &[], 0),
+            Some(512)
+        );
     }
 
     /// **生成相位页边界快照的一轮判定**(`decode_boundary_in`)——

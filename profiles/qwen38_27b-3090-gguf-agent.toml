@@ -9,6 +9,7 @@
 #   snap_host_mb = 2048   # 槽满时 durable 快照可下沉，跨会话仍可复用
 #   host_cache_mb = 2048  # 跨会话缓存块受压时可下沉
 #   implicit_session = true  # pi 不发 session 键
+#   snap_msg_boundary = true  # 消息边界页点补拍（system/tool 前缀分叉）
 #
 # 判据（同轮入仓的探针）：
 #   python3 apps/server/tests/agent_prefix_10k_probe.py \
@@ -34,6 +35,13 @@ snap_max = 4
 snap_host_mb = 2048
 host_cache_mb = 2048
 vram_reserve_mb = 512
+# 消息边界快照：delim 空 = 模型 ChatFormat.im_open（不写死字面量）；
+# 第一条边界无条件保留，后续每 2048 tok 一条；min_span=0 保证边界
+# 落在 chunk 起点附近时也会被切到（否则 system 前缀会被跳过）。
+snap_msg_boundary = true
+snap_msg_delim = ""
+snap_msg_min_gap = 2048
+snap_msg_min_span = 0
 
 [kvmem]
 select_decode = false

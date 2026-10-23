@@ -239,6 +239,9 @@ pub(crate) struct BootCtx {
     pub(crate) cfg: EngineConfig,
     pub(crate) tok: Tokenizer,
     pub(crate) probes: StepProbes,
+    /// 消息开启标记的 token 序列（`[pool].snap_msg_delim` 或模型
+    /// `ChatFormat.im_open` 在 boot 期 tokenize 的结果；只读）。
+    pub(crate) msg_open_ids: Vec<u32>,
     /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
     pub(crate) seq: u64,
 }
@@ -770,6 +773,23 @@ impl<D: DeviceClient> RunningEngine<D> {
         if prompt_ids.is_empty() {
             return Err(ModelError::Msg("submit: 空 prompt".into()));
         }
+        // **消息边界快照点**(2026-10-24):页对齐 token offset，供
+        // `prefill_step_chunk_msg` 切块与 `capture_gdn_snap` 的 snap_keep
+        // 共用。`open_ids` 来自配置/模型声明，不在扫描函数里写死。
+        let msg_snaps = if self.boot.cfg.knobs.snap_msg_boundary
+            && self.boot.cfg.knobs.prefix_cache
+            && self.dev.pool.geom.paged
+            && self.dev.pool.snap_capacity() > 0
+        {
+            crate::msg_boundary::message_snap_points(
+                &prompt_ids,
+                &self.boot.msg_open_ids,
+                self.dev.pool.geom.page,
+                self.boot.cfg.knobs.snap_msg_min_gap,
+            )
+        } else {
+            Vec::new()
+        };
         // 准入地板(S3b §23.5 / A7-bis 接线 2026-10-19):
         //
         // 非 Strict 地板 = "允许选择层按需物化" ⇒ **必须有执行面**才收:
@@ -901,6 +921,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             ephemeral,
             spec: TurnSpec { prompt, max_new, ignore_eos: opts.ignore_eos },
             prompt_ids,
+            msg_snaps,
             img_spans,
             img_pads,
             deletion,
@@ -1339,7 +1360,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 首 turn 会少腾槽 ⇒ 批步中途 Exhausted 把整批打掉)
         let mut need = 0usize;
         for act in self.turns.actives() {
-            let target = match Self::prefill_step_chunk(
+            let target = match Self::prefill_step_chunk_msg(
                 act.fed,
                 act.prompt_ids.len(),
                 self.boot.cfg.prefill_chunk,
@@ -1349,6 +1370,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
+                &act.msg_snaps,
+                self.boot.cfg.knobs.snap_msg_min_span,
             ) {
                 Some(chunk) => act.fed + chunk,
                 None => act.fed + self.dev.spec_rt.depth + 1, // 生成相位(act.fed = pos)
