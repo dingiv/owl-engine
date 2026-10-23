@@ -1,0 +1,40 @@
+# GGUF × KVMem 档：Qwen3.8-27B Q4_K_M，单卡 3090 Ti。
+# 设备池由剩余显存自动派生（vram_reserve_mb 压小池 ⇒ 超卖），非驻留 KV 落宿主。
+extends = ["qwen38_27b-3090-gguf.toml"]
+
+[server]
+bind = "127.0.0.1:8143"
+
+[runtime]
+max_seq = 131072
+max_concurrency = 1
+
+[pool]
+kv_fp8 = false
+snap_max = 1
+host_cache_mb = 10240
+snap_host_mb = 1024
+prefix_cache = true
+vram_reserve_mb = 1024
+
+[kvmem]
+select_decode = true
+select_partial = true
+index = true
+pool_overcommit = true
+workspace_per_req = 8192
+verify_view_tokens = 0
+gqa_aggregation = "max"
+select_sink = 2
+select_recent = 4
+recall_every = 1
+coverage_probe = false
+analyze_at_ctx = 0
+evict_policy = "lru"
+
+[kernel]
+decode_arm = "v2"
+verify_arm = "v2"
+
+[spec]
+depth = 0

@@ -1,0 +1,31 @@
+# GGUF 基线档：Qwen3.8-27B Q4_K_M，单卡 3090 Ti，32k，无 KVMem。
+# 用于和 gguf-kvmem 档做同模型/同卡对照。
+extends = ["full.toml"]
+
+[server]
+bind = "127.0.0.1:8142"
+
+[model]
+name = "qwen3.8-27b-gguf"
+path = "../models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf"
+format = "gguf"
+quant = "q4k"
+head_quant = "off"
+
+[runtime]
+max_seq = 32768
+max_concurrency = 1
+
+[pool]
+kv_fp8 = false
+snap_max = 0
+host_cache_mb = 0
+snap_host_mb = 0
+prefix_cache = false
+vram_reserve_mb = 512
+
+[spec]
+depth = 0
+
+[parallel]
+device = ["41:00.0"]
