@@ -123,7 +123,8 @@ pub static PREFILL_FI_FP8KV: KernelMeta = meta_of::<FiPrefillFp8kv>();
 //      槽位与 native `vis::AttnFullF16` **逐字同构**(driver 按 dtype/图数选臂)。
 // ============================================================================
 
-/// `flashinfer_attn_ragged_f16` —— 非因果 varlen 自注意力(单图;dense K/V;hd ∈ {64})
+/// `flashinfer_attn_ragged_f16` —— legacy 非因果 varlen(单图/多图;dense K/V;hd=64)；
+/// 现由 FA2 `FA2_VARLEN_F16` 取代，driver 不再选择本臂。
 pub struct FiAttnRaggedF16;
 
 #[kernel_tags("dom.flashinfer", "role.attn", "phase.decode")]

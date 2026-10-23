@@ -39,14 +39,16 @@ pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
 /// **视觉塔注意力**(2026-10-15):ragged(**非分页**)非因果 prefill。
 /// 复用同一份 vendored FlashInfer FA2 家族核(`BatchPrefillWithRaggedKVCacheDispatched`
 /// + `MaskMode::kNone`),与 vLLM 的 ViT 走同路算法;胶水住
-/// `cu/flashinfer/owl_fi_attn_ragged.cu`。**单图契约**(n_seq == 1;多图由 driver 分流到 native 臂)。
+/// `cu/flashinfer/owl_fi_attn_ragged.cu`。**legacy 单图/多图 varlen**；
+/// 2026-10-23 起视觉塔统一走 FA2，本常量保留但不再被 driver 选中。
 pub const ATTN_RAGGED_F16: &str = "flashinfer_attn_ragged_f16";
 
-/// **vLLM 原版 FA2 varlen forward**（2026-10-23）：hd=72 → 内核 kHeadDim=96，
-/// 与 vLLM Qwen3.5-ViT 同路径。源在 `cu/flash_attn/vendor/`，本仓只写 host 胶水。
+/// **vLLM 原版 FA2 varlen forward**（2026-10-23）：视觉塔统一入口，
+/// hd=64 → kHeadDim=64，hd=72 → kHeadDim=96；与 vLLM Qwen3.5-ViT 同路径。
+/// 源在 `cu/flash_attn/vendor/`，本仓只写 host 胶水。
 pub const FA2_VARLEN_F16: &str = "flash_attn_varlen_f16";
 /// FA2 的 unpadded LSE 擦写区：`[heads, total_q] f32`（16384×16 → 1 MiB；
-/// 8 MiB 覆盖到 131072 行，视觉单图远小于此）。
+/// 8 MiB 覆盖到 131072 行，视觉远小于此）。
 pub const FA2_LSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// 槽序契约(LaunchMsg.args):
@@ -63,6 +65,12 @@ pub const PREFILL_FI_SLOTS: &str =
 
 /// FI plan workspace 尺寸(设备 int;server 句柄懒分配)
 pub const FI_INT_WS_BYTES: usize = 32 * 1024 * 1024;
+/// **视觉塔 ragged 臂专用 int workspace**(2026-10-23):paged prefill 与视觉塔
+/// 共用同一个 `int_ws` 时,每次文本 prefill 都会把 ragged plan 表覆盖掉;
+/// ragged plan 按形状缓存后不会重刷 ⇒ **同一图片第二次起的注意力读到文本 plan**
+/// (首图与后续图输出不同、且图像 token 语义错)。单独一份后 plan 常驻。
+/// 8 MiB 对视觉 rows ≤ 16k 的 request/tile 表是数量级余量;不足时 plan 结构化拒。
+pub const FI_RAGGED_INT_WS_BYTES: usize = 8 * 1024 * 1024;
 /// FI plan workspace 尺寸(设备 float;split-kv tmp_v/tmp_s)
 pub const FI_FLOAT_WS_BYTES: usize = 64 * 1024 * 1024;
 /// FI page-locked/host 暂冲(H2D staging;PrefillPlan 用)
@@ -143,7 +151,7 @@ extern "C" {
         block_valid_mask: *const c_void,
         stream: *mut c_void,
     ) -> i32;
-    /// 视觉塔 ragged plan(host;每形状一次)
+    /// 视觉塔 ragged plan(host;每 (rows,heads,hd,cu) 一次；多图按 cu 分段)
     pub fn owl_fi_attn_ragged_plan(
         float_ws: *mut std::ffi::c_void,
         float_ws_size: usize,
@@ -154,13 +162,15 @@ extern "C" {
         out_plan15: *mut i64,
         out_cta_tile_q: *mut i32,
         out_cu_dev: *mut i32,
+        cu_host: *const i32,
+        n_seq: i32,
         rows: i32,
         num_heads: i32,
         head_dim: i32,
         stream: *mut std::ffi::c_void,
     ) -> i32;
 
-    /// 视觉塔 ragged run(f16;非因果;单图)
+    /// 视觉塔 ragged run(f16;非因果;单图/多图 varlen)
     pub fn owl_fi_attn_ragged_run_f16(
         q: *const std::ffi::c_void,
         k: *const std::ffi::c_void,
