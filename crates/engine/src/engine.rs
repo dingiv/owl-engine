@@ -2013,6 +2013,31 @@ fn boot_pool_plan(
 
 /// **KVMem 前置校验**(S6a):虚拟化三件套的自洽门(响亮拒,不静默降级)。
 fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
+    // **前缀复用的快照面自洽门(2026-10-24)**:
+    // `reuse_face` 的可复用边界必须有一张 GDN 快照;混合模型(Qwen3.8 的
+    // GDN 层)不能从 KV 反推这个递推态。因此 `prefix_cache=true` 却让
+    // `snap_max=0` 不是"省显存",而是**结构性命中率 0**(实测 10K 多轮
+    // `cached_tokens=0`,而同 prompt 在 snap_max=4 下 99.7%)。
+    // 不硬拒:纯 attention 档没有 GDN 快照消费方,仍可合法复用 KV;
+    // 但必须响亮告警,不能再静默白跑。
+    if cfg.knobs.prefix_cache && cfg.knobs.snap_max == 0 {
+        owl_shared::log_warn!(
+            "boot",
+            "prefix_cache=true 但 snap_max=0:混合/GDN 模型的边界快照不存在 \
+             ⇒ reuse_face 会被裁到 0 ⇒ cached_tokens 结构性恒 0。\
+             要前缀复用请设 snap_max>=1(agent 10K 建议 4 + snap_host_mb>0)"
+        );
+    } else if cfg.knobs.prefix_cache
+        && cfg.knobs.snap_max == 1
+        && cfg.knobs.snap_host_mb == 0
+    {
+        owl_shared::log_warn!(
+            "boot",
+            "snap_max=1 且 snap_host_mb=0:生成段 Transient 快照会顶掉唯一的 \
+             durable 前缀边界(无宿主可下沉)⇒ 同会话续写可能仍命中最新尾快照, \
+             但跨会话固定前缀会掉到 0。agent 档建议 snap_max>=4 或 snap_host_mb>0"
+        );
+    }
     // **B-3e-2 前置校验**(响亮拒,不许静默):
     // ① 部分驻留会让会话链**出洞**(占位符)⇒ 必须有"懂洞"的消费方
     //    (视图页表)⇒ `select_decode` 必开;
