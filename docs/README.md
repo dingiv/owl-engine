@@ -135,6 +135,8 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/perf/gguf-kvmem-decode-nsys.md`](devlog/perf/gguf-kvmem-decode-nsys.md) — GGUF × KVMem decode verdict (bandwidth wall)
 - ⬜ [`devlog/perf/tp2-decode-fast.md`](devlog/perf/tp2-decode-fast.md) — TP2 decode fast path + W4A8 attribution + draft-pool ring (2026-10-22)
 - ⬜ [`devlog/perf/vram-map.md`](devlog/perf/vram-map.md) — VRAM map + ledger blind spots + kernel-family allocator audit (2026-10-22)
+- ⬜ [`devlog/perf/kvmem-262k-cpu-20261023.md`](devlog/perf/kvmem-262k-cpu-20261023.md) — KVMem 262K CPU 调度层相位账（2026-10-23）
+- ⬜ [`devlog/perf/kvmem-262k-handoff-20261023.md`](devlog/perf/kvmem-262k-handoff-20261023.md) — KVMem 262K 交接：下一刀 GPU Mean-K（2026-10-23）
 
 ## J. Developer guide (how to change things)
 
