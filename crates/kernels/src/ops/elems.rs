@@ -2,7 +2,10 @@
 
 use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
-use crate::spec::{meta_of, CaptureEvidence, Determinism, KernelMeta, KernelSpec, Param};
+use crate::spec::{
+    meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param,
+    PoolAccess,
+};
 
 /// `owl_narrow_strided_f16` —— 窄切物化(逐 token 视图;`outer/src_dim/start/out_dim` 四标量)
 pub struct NarrowStridedF16;
@@ -995,6 +998,54 @@ impl KernelSpec for RopeHalfPartialF32 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+
+/// `owl_kv_rope_k_shift_f16` —— **前缀无感删除**的池内 K 的 Δ-rope
+/// (2026-10-23;从 image-rotation 实验档收编)。
+///
+/// 语义:把 `blocks` 列出的物理页里的 K 整体乘 `R(Δ)`(rotate-half 配对
+/// `(i, i+half)`,**单行** cos/sin 表广播到全部分页);V 不动。
+///
+/// **为什么不复用 rope 核**:池 K 是 kNHD 分页 `[nb,hkv,hd/x,page,x]`
+/// (`StatePool::k_shape_kv`)—— token 在倒数第二维,**不存在 token-major
+/// `[tokens, heads, head_dim]` 视图**;硬拆只会把一次原地乘变成四趟搬运。
+///
+/// **原地写**:`k` 既是读也是写(`Op::CallDst` + 本表 `t_out` 槽),每线程只碰
+/// 自己那一对 ⇒ 无竞争、无 scratch。`kv.main` 池写者(f16 档;fp8 需
+/// dequant→rotate→requant,未做 ⇒ 调用方亮拒)。
+pub struct KvRopeKShiftF16;
+
+#[kernel_tags("dom.elem", "role.rope", "role.kv_write", "phase.decode", "kv.main.f16")]
+impl KernelSpec for KvRopeKShiftF16 {
+    const ENTRY: &'static str = "owl_kv_rope_k_shift_f16";
+    const SRC: &'static str = "cu/elems/kv_rope_shift.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("cos1", Dtype::F16, 1),
+        Param::t_in("sin1", Dtype::F16, 1),
+        Param::t_in("blocks", Dtype::F32, 1),
+        Param::sz("hkv"),
+        Param::sz("hd"),
+        Param::sz("page"),
+        Param::sz("x"),
+        Param::sz("half"),
+        Param::t_out("k", Dtype::F16, 5),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F16,
+    )];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
+    };
+}
+
 /// `probe_ts_f16` —— ts_probe.cu(R1 补表)
 pub struct ProbeTsF16;
 
@@ -1030,6 +1081,8 @@ pub static OWL_NARROW_STRIDED_F32: KernelMeta = meta_of::<NarrowStridedF32>();
 pub static OWL_ROPE_HALF_PARTIAL_F16: KernelMeta = meta_of::<RopeHalfPartialF16>();
 pub static OWL_ROPE_HALF_PARTIAL_F32: KernelMeta = meta_of::<RopeHalfPartialF32>();
 pub static PROBE_TS_F16: KernelMeta = meta_of::<ProbeTsF16>();
+/// 前缀无感删除的池内 Δ-rope(`driver::elems::kv_rope_shift`)
+pub static KV_ROPE_K_SHIFT_F16: KernelMeta = meta_of::<KvRopeKShiftF16>();
 
 pub static QUANT_INT8_ROW_F16: KernelMeta = meta_of::<QuantInt8RowF16>();
 pub static QUANT_INT8_ROW_BF16: KernelMeta = meta_of::<QuantInt8RowBf16>();

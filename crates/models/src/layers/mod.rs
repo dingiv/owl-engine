@@ -30,6 +30,8 @@ pub mod dflash2;
 pub mod decoder;
 pub mod embedding;
 pub mod gdn;
+/// 前缀无感删除的 KV 基元(Δ 表 + 池内 K 原地重转)
+pub mod kvshift;
 pub mod layernorm;
 pub mod linear;
 pub mod mlp;

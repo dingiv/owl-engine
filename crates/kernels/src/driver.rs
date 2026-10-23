@@ -394,6 +394,12 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "elems.cast_f16_f32" => elems::cast_f16_f32(dt),
         "ops.concat" => elems::concat(dt),
         "ops.rope" => elems::rope(dt, ax(0)),
+        // 前缀无感删除:池内 K 的 Δ-rope(物理页列表原地重转)
+        "elems.kv_rope_shift" => elems::kv_rope_shift(
+            dt,
+            req.shapes.get(2).and_then(|s| s.first().copied()).unwrap_or(0),
+            req.scalars,
+        ),
         "ops.embed" => elems::embed(dt, ax(0)),
         "attn.norm_rope" => attn::norm_rope(dt, ax(0), ax(1), ax(2)), // aux = [tokens, heads, hd]
         "attn.qkv_norm_rope_insert" => {
@@ -2340,6 +2346,38 @@ pub mod elems {
             name: dt_name("rope", dt),
             shape: Shape { grid: (tokens as u32, 1, 1), block: (128, 1, 1), smem: 0 },
         }
+    }
+
+    /// **前缀无感删除的池内 Δ-rope**(2026-10-23,自 image-rotation 收编)。
+    ///
+    /// 几何:一 block 一**单元** = (物理页 × kv 头 × 半维组 `dg`);
+    /// `page·x` 个线程 = 单元内 `(tok, j)` 逐点对。单元数 = `nblocks·hkv·half/x`
+    /// (nblocks 自 `blocks` 张量首维取 —— 与标量槽不重复声明)。
+    ///
+    /// 参数量纲:标量槽序 = `hkv, hd, page, x, half`(与表同源),`dt` 恒 F16
+    /// (fp8 主池不支持 —— 调用方先拒)。
+    pub fn kv_rope_shift(dt: DType, nblocks: usize, scalars: &[i64]) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "kv_rope_shift 只有 f16 档,得 {dt:?}");
+        let s = |i: usize| -> usize {
+            *scalars.get(i).unwrap_or_else(|| {
+                panic!("kv_rope_shift: 标量槽 {i} 缺失(需 hkv/hd/page/x/half 五个)")
+            }) as usize
+        };
+        let (hkv, hd, page, x, half) = (s(0), s(1), s(2), s(3), s(4));
+        assert!(x > 0 && half % x == 0, "kv_rope_shift: 要求 half % x == 0(half={half} x={x})");
+        assert!(2 * half <= hd, "kv_rope_shift: 2·half={} 超 head_dim {hd}", 2 * half);
+        let threads = page * x;
+        assert!(
+            threads > 0 && threads <= 1024,
+            "kv_rope_shift: block 尺寸 page·x = {threads} 非法(需 ∈ (0, 1024])"
+        );
+        let units = nblocks * hkv * (half / x);
+        assert!(units > 0, "kv_rope_shift: 零单元(空页列表?)");
+        KernelPick::of::<crate::ops::elems::KvRopeKShiftF16>(Shape {
+            grid: (units as u32, 1, 1),
+            block: (threads as u32, 1, 1),
+            smem: 0,
+        })
     }
 
     /// 激活 per-token int8 量化(W4A8 喂料手;S1c)。
