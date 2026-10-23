@@ -144,6 +144,8 @@ pub struct EngineKnobs {
     /// **GQA 聚合 = max**(`[kvmem].gqa_aggregation`;上游默认)。
     /// false = mean(组内查询头先取均)。
     pub gqa_max: bool,
+    /// **最终 query replay**(`[kvmem].query_replay`;KVMem §5.2)。
+    pub query_replay: bool,
     /// **召回预算**(块数)= `ceil(workspace_per_req/page) − sink − recent`。
     /// **派生量**(唯一产地 = [`derive_turn_ws`],装配期写;测试档可直接构)。
     /// 视图 = 保底 + 按分 top-k ⇒ 这是"选择层丢多少"的内部旋钮。
@@ -314,6 +316,7 @@ impl Default for EngineKnobs {
             workspace_per_req: 2240,
             verify_view_tokens: 0,
             gqa_max: true,
+            query_replay: false,
             select_blocks: 64,
             select_sink: 2,
             select_recent: 4,
@@ -635,6 +638,7 @@ impl EngineKnobs {
                 cfg.kvmem.gqa_aggregation,
                 owl_shared::config::GqaAggregationCfg::Max
             ),
+            query_replay: cfg.kvmem.query_replay,
             // `select_blocks` = 派生量(装配期 `derive_turn_ws` 按池页宽写);
             // 此处保留构造器缺省,测试档可直接覆盖。
             select_blocks: 64,
@@ -1878,6 +1882,7 @@ fn boot_pool_plan(
         // `select_partial`)才允许池小于上下文 —— 否则链超出池容量必
         // `Exhausted`(无洞可停,即无选择层可挤)。
         pool_overcommit: cfg.knobs.kvmem_virtualization,
+        query_replay: cfg.knobs.query_replay,
         kv: env.kv.quant,
         fi_quant,
         draft_kv: if cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3 {
@@ -1943,6 +1948,20 @@ fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
             "OWL_SELECT_PARTIAL=1 需同时开 OWL_SELECT_DECODE=1(链上出洞后必须有视图消费方)—— 拒绝启动"
         );
         std::process::exit(2);
+    }
+    if cfg.knobs.query_replay {
+        if !cfg.knobs.select_decode {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "boot: `[kvmem].query_replay = true` 要求 select_decode = true                 (replay 必须在新视图上重跑)"
+                    .into(),
+            ));
+        }
+        if cfg.knobs.draft.depth > 0 {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "boot: `[kvmem].query_replay = true` 当前只支持 spec.depth = 0                 (草稿环 replay 另立刀)"
+                    .into(),
+            ));
+        }
     }
     // **视图化 verify 的臂门**(2026-10-23):`select_partial` 的链上有宿主占位符,
     // FI/XQA 的页表仍直接读会话链。配置层已拒;这里兜测试/手工构造的 EngineKnobs。

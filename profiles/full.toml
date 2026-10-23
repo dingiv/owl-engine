@@ -234,6 +234,8 @@ workspace_per_req = 2240
 verify_view_tokens = 0
 # GQA 聚合：mean | max（KVMem 产品脚本默认 max）
 gqa_aggregation = "max"
+# 最终 query replay（KVMem §5.2；当前仅 spec.depth=0）
+query_replay = false
 select_sink = 2
 select_recent = 4
 recall_every = 1

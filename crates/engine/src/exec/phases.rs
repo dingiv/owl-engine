@@ -275,6 +275,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let s = self.bank.sessions.session(act.session_id)?;
             (s.block_table.clone(), act.gdn_slot)
         };
+        // **KVMem 最终 query replay**:末 chunk 前拍 GDN 快照。最终召回
+        // 之后要回到这里，用新视图重跑本 chunk，否则末 token 的 hidden
+        // 仍是旧视图算出的（选中块进不了当前 query）。
+        let replay_armed = is_last && base > 0 && self.boot.cfg.knobs.query_replay;
+        if replay_armed {
+            let (pool, graphs) = (&mut self.dev.pool, &mut self.dev.graphs);
+            pool.capture_replay_snap(graphs.session.face_mut(), gdn_slot).await?;
+        }
         // 部分驻留档的"过去"子集页链(host 面算好;两 rank 同值)
         let past_view = self.past_view_of(base, chunk_ids.len());
         let (vlm0, vlm1) = {
@@ -330,7 +338,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         };
         // 主 rank 收割(**两 rank 都已入队之后**才读;borrow 已释放)
-        let last_row = self.harvest_prefill(tail0, boot_seq).await?;
+        let mut last_row = self.harvest_prefill(tail0, boot_seq).await?;
         let t_bnd = std::time::Instant::now();
         // E2c:块边界跨越 → GDN 快照拍摄(快照身份 = 边界块**内容身份**;
         // 物理块号会被回收复用,不可作键)
@@ -393,6 +401,57 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     "vram",
                     "边界@{new_fed}: 选择层关,无索引/B 轴");
             }
+        }
+        // ── **KVMem 最终 query replay**(P0;2026-10-23)──────────────
+        //
+        // 论文 §5.2:最终 recall/视图装配后，在**新视图**上重跑 current
+        // query，再 decode。这里 current query = 末个 prefill chunk。
+        // GDN 已回到 chunk 起点；KV 槽/链不动（重跑只覆盖同位置 K/V）。
+        if replay_armed && is_last {
+            if self.peer.is_some() {
+                return Err(ModelError::Msg(
+                    "query_replay:当前只支持单卡(TP replay 另立刀)".into(),
+                ));
+            }
+            {
+                let (pool, graphs) = (&mut self.dev.pool, &mut self.dev.graphs);
+                pool.restore_replay_snap(graphs.session.face_mut(), gdn_slot).await?;
+            }
+            let replay_bt = self.bank.sessions.session(sid)?.block_table.clone();
+            let replay_past = self.past_view_of(base, chunk_ids.len());
+            let mut replay_knobs = self.boot.cfg.knobs.clone();
+            replay_knobs.select_decode = false;
+            replay_knobs.coverage_probe = false;
+            let vlm_replay = self.turns.active()?.vlm.as_ref();
+            let tail = {
+                let mut host = ChunkHost {
+                    boot_seq: self.boot.seq,
+                    probes: self.boot.probes,
+                    knobs: &replay_knobs,
+                    sid,
+                    bt_chain: &replay_bt,
+                    gdn_slot,
+                    bank: None,
+                    sel: None,
+                    past_view: replay_past,
+                    vlm: vlm_replay,
+                };
+                self.dev
+                    .prefill_chunk_enqueue(&mut host, &chunk_ids, base, true)
+                    .await?
+            };
+            let replay_row = self.harvest_prefill(tail, boot_seq).await?;
+            if replay_row.is_some() {
+                last_row = replay_row;
+            }
+            owl_shared::log_info!(
+                "kvmem-replay",
+                "query replay:ctx={} base={} t={} view={} 页(新视图上重跑末 chunk)",
+                new_fed,
+                base,
+                chunk_ids.len(),
+                self.sel.view().map(|v| v.pages.len()).unwrap_or(0)
+            );
         }
         // **边界事件计时 → metrics**(2026-10-18 T1):前向已有 `prefill.chunk`
         // (prefill_chunk.rs 内部记),这里补“边界那一半”(快照 + 召回/打分/调和)

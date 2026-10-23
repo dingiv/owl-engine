@@ -11,7 +11,9 @@ max_concurrency = 1
 
 [pool]
 kv_fp8 = false
-snap_max = 1
+# query replay 用专用 GDN 回滚缓冲；前缀快照暂关，避免最终边界快照
+# 与 replay 后的 GDN 状态不一致（后续做 snapshot refresh 再开）。
+snap_max = 0
 host_cache_mb = 10240
 snap_host_mb = 1024
 prefix_cache = true
@@ -25,6 +27,9 @@ pool_overcommit = true
 workspace_per_req = 8192
 verify_view_tokens = 0
 gqa_aggregation = "max"
+# 论文 §5.2 的 query replay（当前仅 spec off；60k 单轮实测不改变输出，
+# 保留作 step-level/长会话基础件）
+query_replay = true
 select_sink = 2
 select_recent = 4
 recall_every = 1

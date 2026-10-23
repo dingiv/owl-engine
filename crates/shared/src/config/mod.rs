@@ -741,6 +741,14 @@ pub struct KvmemCfg {
     pub verify_view_tokens: usize,
     /// **GQA 查询头聚合**:`mean` | `max`(上游产品脚本默认 `max`)。
     pub gqa_aggregation: GqaAggregationCfg,
+    /// **最终 query replay**(KVMem §5.2;缺省关)。
+    ///
+    /// 末个 prefill chunk 前拍 GDN 快照；最终召回/视图装配后恢复快照，
+    /// 用新视图重跑该 chunk，再 decode。否则最后一个 query 的 hidden 仍是
+    /// 旧视图算出的，选中块再对也进不了当前 query。
+    ///
+    /// 当前只支持 `spec.depth = 0`(草稿环 replay 另立刀)。
+    pub query_replay: bool,
     /// 保底 sink(时间序最前的若干块;论文 always-retained)。
     pub select_sink: usize,
     /// 保底 recent(时间序最后的若干块)。
@@ -1554,6 +1562,7 @@ impl Default for KvmemCfg {
             // 0 = verify 与 decode 同视图(旧行为,逐位不变)
             verify_view_tokens: 0,
             gqa_aggregation: GqaAggregationCfg::Max,
+            query_replay: false,
             select_sink: 2,
             select_recent: 4,
             recall_every: 1,
