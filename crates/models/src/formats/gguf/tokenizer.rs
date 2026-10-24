@@ -21,10 +21,10 @@
 //!
 //! # 模板为什么只**读出**、不在此渲染
 //!
-//! 仓内已有 HF 级 minijinja 渲染器(`apps/server/src/chat_tpl.rs`,含
-//! `trim_blocks/lstrip_blocks` + pycompat + HF `tojson` 四项兼容层,§3.2/§7.1
-//! 已对 HF 逐字节验过)。**再放第二套 Jinja 进 models = 接口不唯一** ⇒ 本模块
-//! 只把模板原文交出去(它是 GGUF 的事实),渲染归 serving 面同一实现。
+//! 仓内已有 HF 级渲染器(`apps/server/src/chat_tpl.rs`,委托
+//! `hf-chat-template`;兼容层由该 crate 提供,§3.2/§7.1 已对 HF 逐字节验过)。
+//! **再放第二套 Jinja 进 models = 接口不唯一** ⇒ 本模块只把模板原文交出去
+//! (它是 GGUF 的事实),渲染归 serving 面同一实现。
 //!
 //! # 编码语义(与 HF/llama.cpp 对齐的三处)
 //!

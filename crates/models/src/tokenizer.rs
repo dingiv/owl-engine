@@ -6,8 +6,8 @@
 //! `formats::qwen35::load_tokenizer`)。tokenizer.json 本身是每份模型快照
 //! 自带资产,与权重同目录加载。
 //!
-//! 挂账:serving 层读快照内 chat_template.jinja + minijinja 渲染,才是
-//! 模板真通用;ChatFormat 前后缀对是纯文本单轮路径的通用表达。
+//! 挂账:serving 层读快照内 chat_template.jinja + `hf-chat-template` 渲染,
+//! 才是模板真通用;ChatFormat 前后缀对是纯文本单轮路径的通用表达。
 
 use crate::contract::ModelError;
 use std::path::Path;
