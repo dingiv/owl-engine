@@ -34,7 +34,7 @@ use crate::command::{Ack, Command};
 use owl_iface::command::{BatchOutcome, Outcome};
 use crate::launch::issue_launch;
 use crate::state::{DeviceSelector, GpuCtx, KernelCache, Staging};
-use owl_iface::contract::{Arg, Bytes, Dtype, LaunchMsg};
+use owl_iface::contract::{Arg, Bytes, Dtype, LaunchMsg, VramAccount};
 use crate::state::{STREAM_COMPUTE, STREAM_COMPUTE_AUX, STREAM_D2H, STREAM_H2D};
 
 /// 发射账三表(拆分自本文件的同源三表;见模块头)
@@ -121,6 +121,9 @@ pub struct GpuServer {
     /// 原 OWL_SRV_TIMING/CAP_PROF/LAUNCH_SYNC/FREE_LEGACY/GRAPH_FLAGS/
     /// CAPTURE_SLAB_MB/CUDA_HOME 散点直读 → DiagOpts 一体携带)
     diag: crate::state::DiagOpts,
+    /// **VRAM 账（本设备一份；2026-10-24）**：与 `GpuClient` 共持，引擎
+    /// boot 只读它的快照。旧 `owl_shared::vram` 全局三元组仅作诊断镜像。
+    vram: Arc<VramAccount>,
     /// **VRAM 硬预算守卫**（缓存化的 `cuMemGetInfo`；见 `state::VramGuard`
     /// 类型文档：逐 alloc 真查 = 86.8µs × 1426/chunk = 121ms 宿主税）。
     /// 状态归本结构体（不放全局）：只有本 server 一条分配咽喉。
@@ -200,6 +203,28 @@ impl GpuServer {
         debug: bool,
         sink: owl_shared::log::LogSink,
     ) -> Self {
+        Self::with_diag_sink_vram(
+            rx,
+            selector,
+            boot,
+            diag,
+            debug,
+            sink,
+            Arc::new(VramAccount::new()),
+        )
+    }
+
+    /// 与 [`Self::with_diag_sink`] 相同，但**显式接收设备账**（`GpuClient::spawn_with`
+    /// 用它把 server/client 绑到同一份 `VramAccount`）。
+    pub(crate) fn with_diag_sink_vram(
+        rx: mpsc::Receiver<Command>,
+        selector: DeviceSelector,
+        boot: Option<mpsc::Sender<Result<(), String>>>,
+        diag: crate::state::DiagOpts,
+        debug: bool,
+        sink: owl_shared::log::LogSink,
+        vram: Arc<VramAccount>,
+    ) -> Self {
         let marlin_w4a8_m8 = diag.marlin_w4a8_m8;
         Self {
             actor_tag: ACTOR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -230,6 +255,7 @@ impl GpuServer {
                 }
             },
             diag,
+            vram,
             vram_guard: crate::state::VramGuard::new(),
             sink,
         }
@@ -495,7 +521,13 @@ impl GpuServer {
     /// 事件循环主入口(server 线程生命周期 = 循环生命周期)。
     /// 首行上线设备(本线程 bind_to_thread 一次到位)+ 起派发线程。
     pub fn run(mut self) -> Result<(), String> {
-        let ctx = GpuCtx::new(&self.selector, self.diag.clone(), self.actor_tag as u32, self.sink);
+        let ctx = GpuCtx::new(
+            &self.selector,
+            self.diag.clone(),
+            self.actor_tag as u32,
+            self.sink,
+            self.vram.clone(),
+        );
         match ctx {
             Ok(c) => {
                 self.ctx = Some(c);
@@ -1074,12 +1106,13 @@ impl GpuServer {
         // 判据见 `crate::state::VramGuard::check`（驱动 free − reserve；可选叠
         // live 账上限）。拒发 = 结构化 `PoolExhausted` + 一条 WARN（带池账/驱动账）。
         let guard_check = |g: &mut crate::state::VramGuard,
+                           vram: &VramAccount,
                            reserve: u64,
                            budget: Option<u64>|
-         -> Result<(), ModelError> { g.check(n_bytes, reserve, budget) };
+         -> Result<(), ModelError> { g.check(n_bytes, reserve, budget, vram) };
         let reserve_b = self.diag.vram_reserve_mb << 20;
         let budget_b = self.diag.vram_budget_mb.map(|m| m << 20);
-        let first = guard_check(&mut self.vram_guard, reserve_b, budget_b);
+        let first = guard_check(&mut self.vram_guard, &self.vram, reserve_b, budget_b);
         if let Err(e) = first {
             // **池缓存应急回收(2026-10-20 §23.9)**:`RELEASE_THRESHOLD=∞` 下
             // 已 free 的块仍占物理显存 ⇒ "驱动 free 告急"常是**池缓存**不是 live。
@@ -1100,7 +1133,7 @@ impl GpuServer {
             let freed = trimmed.as_ref().ok().copied().unwrap_or(0);
             let retry_ok = trimmed.is_ok()
                 && freed > 0
-                && guard_check(&mut self.vram_guard, reserve_b, budget_b).is_ok();
+                && guard_check(&mut self.vram_guard, &self.vram, reserve_b, budget_b).is_ok();
             if retry_ok {
                 self.sink.logf(
                     owl_shared::log::LVL_INFO,
@@ -1220,6 +1253,7 @@ impl GpuServer {
                 owl_shared::slab_hint::meter_add(n_bytes as u64);
                 // B6.5:live 分配音账(释放侧 = free_blocks)
                 owl_shared::vram::live_add(n_bytes as i64);
+                self.vram.live_add(n_bytes as i64);
                 // **取证**(2026-10-19):只报大额(≥64 MiB)与累计,用来归因
                 // "装配后那几 GB 空闲去哪了"。
                 // 2026-10-21:**env `OWL_VRAM_DBG` 退场** —— 大额阈值本身已是

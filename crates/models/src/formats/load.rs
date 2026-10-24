@@ -256,10 +256,25 @@ where
     } else {
         crate::formats::shard::build_shard_pass(&mut want, ctx)?
     };
+    // 冷盘预取(2026-10-24):单卡档把全部将读源区间交给源的预取口,
+    // 让页缓存 I/O 与后续 CPU 物化重叠。分片档先不预取(会读到别的 rank
+    // 的区间);源默认 no-op,只有 mmap 源覆写。
+    // 单卡(1) 或 TP2 的 rank0(0):只让 rank0 预取**全量**源区间
+    // 一次(两 rank 的切片并集 = 全量),rank1 直接吃 rank0 填的页缓存;
+    // 若两 rank 都预取会读 2× 数据,反而更慢。
+    if ctx.shard == 1 || ctx.slice_id == 0 {
+        let keys: Vec<&str> = want.wants().iter().map(|w| w.key.as_str()).collect();
+        src.prefetch(&keys);
+    }
     let sharded = crate::formats::shard::ShardedSource::new(src, spans);
     let tap = if ctx.debug_tap { Some(std::sync::Mutex::new(Box::new(StderrTap) as Box<dyn LoadTap>)) } else { None }; // 观测:ctx.debug_tap 门控,缺省零开销
     let t0 = std::time::Instant::now();
-    let manifest = eval_want(&want, face, &sharded, tap.as_ref(), ctx.verify, ctx.staging_mb).await?;
+    let load_result =
+        eval_want(&want, face, &sharded, tap.as_ref(), ctx.verify, ctx.staging_mb).await;
+    // 预取线程必须在装载返回前收口(装载后不得继续占盘/占线程);
+    // 错误也 join,避免后台线程在失败路径上泄漏。
+    src.prefetch_finish();
+    let manifest = load_result?;
     // 上载栅栏:全部 DMA 落定后方可进入计算域(upload_pinned 入队即回执,
     // 完成语义由本栅栏一次总代价兜底)
     let t_fence = std::time::Instant::now();

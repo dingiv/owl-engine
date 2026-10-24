@@ -58,7 +58,7 @@ pub mod signal;
 // 契约面顶层再导出(前后端共同依赖;见 contract 模块文档)
 pub use contract::{
     numel, Arg, Bytes, ConnSlot, Connector, DeviceClient, Dtype, GraphId, KernelSource, LaunchMsg,
-    ModelError, Shape, SwapDir, SwapPiece,
+    ModelError, Shape, SwapDir, SwapPiece, VramAccount, VramSnapshot,
 };
 // 设备命令面(SDK ↔ server 的唯一单位;2026-10-21)
 pub use command::{BatchOutcome, Command, Outcome};
@@ -341,4 +341,45 @@ pub trait Device: Clone + Send + Sync + 'static {
 
     /// 按 id 取回池对象(重拿句柄用)
     fn pool(&self, id: PoolId) -> Result<Self::Pool, BackendError>;
+}
+
+#[cfg(test)]
+mod vram_account_tests {
+    use super::contract::{VramAccount, VramSnapshot};
+    use std::sync::Arc;
+
+    #[test]
+    fn account_snapshot_tracks_mixed_updates() {
+        let a = VramAccount::new();
+        a.total_set(24 << 30);
+        a.free_set(16 << 30);
+        a.live_add(100);
+        assert_eq!(
+            a.snapshot(),
+            VramSnapshot { total: 24 << 30, live: 100, free: 16 << 30 }
+        );
+    }
+
+    #[test]
+    fn account_live_is_thread_safe_and_clamps_negative() {
+        let a = Arc::new(VramAccount::new());
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let a = a.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        a.live_add(1);
+                        a.live_add(-1);
+                    }
+                    a.live_add(7);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("vram account 线程");
+        }
+        assert_eq!(a.live_bytes(), 56);
+        a.live_add(-1_000);
+        assert_eq!(a.live_bytes(), 0, "负值必须夹到 0(不返回巨大 u64)");
+    }
 }

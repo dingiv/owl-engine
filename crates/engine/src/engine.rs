@@ -35,7 +35,7 @@ use std::sync::Arc;
 use owl_cuda::{DeviceSelector, GpuClient};
 use owl_models::layers::rope::Rope;
 use owl_models::model::{Model, ModelSpec};
-use owl_iface::contract::{DeviceClient, ModelError};
+use owl_iface::contract::{DeviceClient, ModelError, VramSnapshot};
 use owl_iface::handle::{AssetClass, DeviceHandle, Owner};
 
 use crate::graph_fleet::{FleetBoot, GraphFleet};
@@ -873,7 +873,9 @@ pub(crate) struct BootVram {
     /// 开卡后 `cuMemGetInfo` free(字节;CUDA ctx 已在 free 里扣掉 —— 不进底价)。
     /// 无设备账档(CPU mock)= 0。
     v_card_bytes: u64,
-    /// `Engine::new` 时刻的引擎 live 账(权重 = 装载后 − 此值)。
+    /// 本卡 total(用于 `[vram-gov]` 与治理禁用判定;2026-10-24)
+    total_bytes: u64,
+    /// `Engine::new` 时刻的**本卡**引擎 live 账(权重 = 装载后 − 此值)。
     live_at_new: u64,
 }
 
@@ -950,7 +952,7 @@ fn assemble_budget(
         kv_face_bytes: kv_pool as usize,
     };
     let mb = |b: u64| b as f64 / 1048576.0;
-    if owl_shared::vram::total_bytes() > 0 && weights == 0 {
+    if boot.total_bytes > 0 && weights == 0 {
         // 有设备账却算出权重 0 = 测量病(不是"没权重");不许静默
         owl_shared::log_warn!(
             "boot",
@@ -1101,9 +1103,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
         ledger: owl_store::SharedLedger,
     ) -> Result<Self> {
         // boot 显存快照(准入预算的真源;S3b §23.3)—— 必须在任何池/权重之前取
+        // 2026-10-24:改读**本设备** account(TP2 两 rank 不再互相覆盖)
+        let vram: VramSnapshot = face.vram_snapshot();
         let boot = BootVram {
-            v_card_bytes: owl_shared::vram::free_bytes(),
-            live_at_new: owl_shared::vram::live_bytes(),
+            v_card_bytes: vram.free,
+            total_bytes: vram.total,
+            live_at_new: vram.live,
         };
         let ledger_cell = owl_store::ledger_entry(&ledger);
         // 输出口注入(2026-10-21):`[device-handle]` 的告警/自愈面走统一日志门
@@ -1158,7 +1163,8 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let (rm, tokenizer) = loaded.into_parts();
         // 池分配前的 live 快照 = 权重/杂项(不含池)。单卡直接当 per-card 基线;
         // weights = 装载增量。TP2 由 `TpEngine` 取两 rank 合计后摊分。
-        let live_before_pool = owl_shared::vram::live_bytes();
+        // 2026-10-24:读本设备快照(per-device account)。
+        let live_before_pool = face.vram_snapshot().live;
         let weights_bytes = live_before_pool.saturating_sub(boot.live_at_new);
         // 设备侧装配(单卡:tp = None;双 rank 走 `TpEngine` 的同一 `boot_rank`)
         let dev = boot_rank(face, &mut cfg, rm, None, live_before_pool, t_run).await?;
@@ -2064,6 +2070,7 @@ fn boot_pool_plan(
     fi_quant: Option<owl_models::env::KvQuant>,
     tp: Option<&owl_models::module::TpCtx>,
     live_baseline_per_card: u64,
+    vram: VramSnapshot,
 ) -> crate::state::PoolPlan {
     // **自动档**(2026-10-22):配置项已删除;生产恒自动 = `StatePool::alloc`
     // 按剩余显存算出的 cap。`EngineKnobs.pool_tokens` 只作**测试覆写**
@@ -2090,8 +2097,10 @@ fn boot_pool_plan(
         draft_geom: spec.draft_geom,
         // 治理器按卡摊 `live`(TP2 下 LIVE 含两卡之和;2026-10-19 定谳)
         tp_ranks: tp.as_ref().map(|c| c.plan.world()).unwrap_or(1),
-        // 两 rank 共用的池前 live 基线(消除顺序记账)
+        // 两 rank 各自的池前 live 基线（per-device 账）
         live_baseline_per_card: Some(live_baseline_per_card),
+        // 本 rank 的 total/free/live 快照（池容量唯一读数）
+        vram,
         // 草稿池 dtype 同源(量化族 BF16 / 未量化族 F16;见 spec_runtime::draft_dt)
         draft_dt: spec.draft_dt,
         spec_mode: spec.mode,
@@ -2238,7 +2247,6 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
         // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 =
         // min(剩余显存 cap, max_seq×并发 + 1 页)(knobs.pool_tokens 仅测试覆写)。
-        let plan = boot_pool_plan(cfg, s, &env, &spec, fi_quant, tp.as_ref(), live_baseline_per_card);
         boot_kvmem_check(cfg)?;
         // **池前 settle(2026-10-22)**:装载期临时块(store 复用池)与
         // cudaMallocAsync 缓存会残留到 `free@池` 的读数里;不排空则同一档
@@ -2246,20 +2254,34 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // `pool_cap` 读 free —— 这是“池前 materialize/结算”的收口。
         let drained = face.drain_temp_pool().await;
         let trimmed = face.mem_pool_trim().await.unwrap_or(0);
-        // **fresh free 回写**:`pool_cap` 读的是 `owl_shared::vram::free_bytes()`
-        // (缓存原子,由 VramGuard 采样)。装载期分配模式不同会让这个缓存停在
-        // 不同时刻 ⇒ 同一档 cap 抖 79k–116k。这里先 drain/trim,再 sync,
-        // 最后用 `cuMemGetInfo` 刷新缓存,让池看到**结算后的真值**。
+        // **fresh free 回写**:`pool_cap` 读本 rank 的 `VramSnapshot`(由
+        // `mem_info` 写入设备 account;全局 free 仅诊断镜像)。装载期分配
+        // 模式不同会让缓存停在不同时刻 ⇒ 同一档 cap 抖 79k–116k。这里先
+        // drain/trim,再 sync,最后用 `cuMemGetInfo` 刷新设备账,让池看到
+        // **结算后的真值**。
         if let Err(e) = face.sync().await {
             eprintln!("[vram-pre-pool] sync 失败(继续):{e}");
         }
         if let Ok((free, _total)) = face.mem_info().await {
             owl_shared::vram::free_set(free);
         }
+        // **本 rank 的池前快照**(2026-10-24):`mem_info` 已把 free/total 写进
+        // 设备 account;池容量只读这份,不再读进程级全局 FREE。
+        let vram = face.vram_snapshot();
         eprintln!(
             "[vram-pre-pool] temp_drained={drained} 块 · driver_trimmed={} MiB ⇒ free={} MiB",
             trimmed >> 20,
-            owl_shared::vram::free_bytes() >> 20
+            vram.free >> 20
+        );
+        let plan = boot_pool_plan(
+            cfg,
+            s,
+            &env,
+            &spec,
+            fi_quant,
+            tp.as_ref(),
+            live_baseline_per_card,
+            vram,
         );
         phase.mark(&mut face, "pre-pool settle").await;
         // **池骨架 = `Pool` 类**(boot 相位;不加这个上下文就会落“未分类”桶 ——

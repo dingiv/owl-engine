@@ -17,6 +17,76 @@
 //!   server 回执族 = 本模块 [`ModelError`]。
 
 use std::future::Future;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+// ============================================================================
+// 显存账:每设备一份(2026-10-24 TP2 并行 boot)
+// ============================================================================
+//
+// 旧实现是 `owl-shared::vram` 的进程级三元组(TOTAL/LIVE/FREE)。TP2 两 rank
+// 并行 boot 时它们会互相覆盖/相加,池容量读到别的卡的数。这里把账做成**值**
+// (`VramAccount` 由设备 server/client 共持),引擎 boot 只收 `VramSnapshot`。
+//
+// `owl-shared::vram` 仍保留旧函数作**诊断聚合镜像**;决策路径(池容量/预算/
+// boot 基线)只许读本模块的 per-device 快照。
+
+/// 单设备显存账(原子;server 的分配咽喉写,client/engine 读快照)。
+#[derive(Debug, Default)]
+pub struct VramAccount {
+    total: AtomicU64,
+    live: AtomicI64,
+    free: AtomicU64,
+}
+
+/// 某一时刻的单设备显存快照(纯值;可跨线程传)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VramSnapshot {
+    pub total: u64,
+    pub live: u64,
+    pub free: u64,
+}
+
+impl VramAccount {
+    pub const fn new() -> Self {
+        Self {
+            total: AtomicU64::new(0),
+            live: AtomicI64::new(0),
+            free: AtomicU64::new(0),
+        }
+    }
+
+    pub fn total_set(&self, bytes: u64) {
+        self.total.store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    pub fn live_add(&self, delta: i64) {
+        self.live.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    pub fn live_bytes(&self) -> u64 {
+        self.live.load(Ordering::Relaxed).max(0) as u64
+    }
+
+    pub fn free_set(&self, bytes: u64) {
+        self.free.store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn free_bytes(&self) -> u64 {
+        self.free.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> VramSnapshot {
+        VramSnapshot {
+            total: self.total_bytes(),
+            live: self.live_bytes(),
+            free: self.free_bytes(),
+        }
+    }
+}
 
 // ============================================================================
 // 分配点宏:位置自动带入(`alloc!` / `htod!` 等五臂)
@@ -348,6 +418,15 @@ pub struct FiPlanSpec {
 }
 
 pub trait DeviceClient: Send {
+    /// **本设备显存快照**(boot/预算决策的唯一读数;2026-10-24)。
+    ///
+    /// 默认 = 零值(CPU/mock/旧手工 face;引擎把它当“治理禁用”)。
+    /// GPU 后端的 `GpuServer` 与 `GpuClient` 共持同一份 [`VramAccount`],
+    /// 因此这里读到的是**本卡**的 total/free/live,不混入 TP 对端。
+    fn vram_snapshot(&self) -> VramSnapshot {
+        VramSnapshot::default()
+    }
+
     // ── 命令面(SDK ↔ server 的唯一执行入口;2026-10-21)────────────────
     //
     // **命令族只实现这两条**(能力自述/非核心命令另算);具名方法(alloc/launch/htod/…)是**缺省糖**,

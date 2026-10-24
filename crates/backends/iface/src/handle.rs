@@ -1091,6 +1091,10 @@ impl<D: DeviceClient> DeviceHandle<D> {
 // 缺省实现会**静默换语义**(例:`alloc_uninit` 缺省 = 委托 `alloc` ⇒ 捕获窗内
 // 多烙 memset 节点;`htod_on` 缺省 = 退化 H2D 流 ⇒ 顺序义务错位)。
 impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
+    fn vram_snapshot(&self) -> crate::contract::VramSnapshot {
+        self.inner.vram_snapshot()
+    }
+
     // ── 命令面(SDK ↔ server 的边界;2026-10-21)────────────────────
     //
     // 本层的记账抹子在**具名方法**上(alloc/free/htod/launch/…),而命令面是

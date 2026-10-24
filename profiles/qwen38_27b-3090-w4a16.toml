@@ -16,6 +16,7 @@ max_seq = 131072
 max_concurrency = 1
 
 [pool]
+image_evict_pad = "。"
 kv_fp8 = true
 gdn_slots = 1
 vram_target = 0.99

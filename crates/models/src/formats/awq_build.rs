@@ -213,20 +213,26 @@ impl AwqSource {
                 )));
             };
             let wb = &self.maps[we.map_ix][we.start..we.start + we.nbytes];
-            let w_f32: Vec<f32> = match we.dtype {
-                safetensors::Dtype::BF16 => bf16_par(wb),
-                safetensors::Dtype::F16 => wb
-                    .chunks_exact(2)
-                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                    .collect(),
-                safetensors::Dtype::F32 => wb
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-                _ => return Err(ModelError::Msg(format!("awq: {base} i8 源 dtype 不支持"))),
+            // BF16 头占整载 2.9s(2026-10-24 冷/热载实测):旧链先展开
+            // 5.1GB f32,再逐元素除/round。BF16 直接两遍(行 amax + 量化)
+            // —— 读源 2.54GB×2,不建 f32 中间态;语义与旧链逐位同源。
+            let (q8, s8) = if we.dtype == safetensors::Dtype::BF16 {
+                rtn_i8_row_sym_bf16(wb, out, k)
+            } else {
+                let w_f32: Vec<f32> = match we.dtype {
+                    safetensors::Dtype::F16 => wb
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect(),
+                    safetensors::Dtype::F32 => wb
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                    _ => return Err(ModelError::Msg(format!("awq: {base} i8 源 dtype 不支持"))),
+                };
+                rtn_i8_row_sym(&w_f32, out, k)
             };
             self.maps[we.map_ix].dontneed(we.start, we.nbytes);
-            let (q8, s8) = rtn_i8_row_sym(&w_f32, out, k);
             // **两键一次落缓存**:q/s 同源,分别按请求算会把整表(27B embed
             // 5G 级 f32)重算两遍。q 键 = `{base}.i8q`,s 键 = `{base}.i8s`。
             let qk = format!("{base}.i8q");
@@ -1033,6 +1039,101 @@ pub(crate) fn rtn_i8_row_sym(w: &[f32], out: usize, k: usize) -> (Vec<u8>, Vec<u
     (q, sb)
 }
 
+/// **BF16 源 → per-row int8 对称**:与 `rtn_i8_row_sym(bf16_par(..))` 逐位同源,
+/// 但不建 5.1GB f32 中间数组 —— 两遍直读 BF16(行 amax / 量化)。
+pub(crate) fn rtn_i8_row_sym_bf16(bytes: &[u8], out: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
+    use rayon::prelude::*;
+    assert_eq!(bytes.len(), out * k * 2, "bf16 源字节数 = out*k*2");
+    let sc: Vec<f32> = (0..out)
+        .into_par_iter()
+        .map(|o| {
+            let row = &bytes[o * k * 2..(o + 1) * k * 2];
+            // 第一遍只做**位型 abs-max**：BF16 正域编码单调 ⇒ 清符号位后的
+            // u16 最大者就是 absmax（无需逐元素展开 f32/abs）。最后才把
+            // 这一个位型展宽成 f32 求 scale，与旧式逐位一致。
+            let mut max_bits = 0u16;
+            for b in row.chunks_exact(2) {
+                max_bits = max_bits.max(u16::from_le_bytes([b[0], b[1]]) & 0x7fff);
+            }
+            let amax = f32::from_bits((max_bits as u32) << 16);
+            if amax > 0.0 { amax / 127.0 } else { 1.0 }
+        })
+        .collect();
+    let mut q = vec![0u8; out * k];
+    q.par_chunks_mut(k).enumerate().for_each(|(o, dst)| {
+        let s = sc[o];
+        let row = &bytes[o * k * 2..(o + 1) * k * 2];
+        quant_i8_row_bf16(row, dst, s);
+    });
+    let mut sb = Vec::with_capacity(out * 4);
+    for v in &sc {
+        sb.extend_from_slice(&v.to_le_bytes());
+    }
+    (q, sb)
+}
+
+/// 单行 BF16 → i8（`q = RN-even(v/s)`，clamp ±127）。
+/// AVX2 加速（除法/round/饱和都是逐元素精确同式）；其余架构/尾部走标量。
+#[inline]
+fn quant_i8_row_bf16(row: &[u8], dst: &mut [u8], s: f32) {
+    debug_assert_eq!(row.len(), dst.len() * 2);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: 调用前已做运行期 AVX2 检测；row/dst 长度由 debug_assert
+            // 与生产调用点保证（out*k*2 / out*k）。
+            unsafe { quant_i8_row_bf16_avx2(row, dst, s) };
+            return;
+        }
+    }
+    quant_i8_row_bf16_scalar(row, dst, s);
+}
+
+fn quant_i8_row_bf16_scalar(row: &[u8], dst: &mut [u8], s: f32) {
+    for (i, b) in row.chunks_exact(2).enumerate() {
+        let bits = u16::from_le_bytes([b[0], b[1]]);
+        let v = f32::from_bits((bits as u32) << 16);
+        let qi = (v / s).round_ties_even().clamp(-127.0, 127.0);
+        dst[i] = (qi as i8) as u8;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quant_i8_row_bf16_avx2(row: &[u8], dst: &mut [u8], s: f32) {
+    use std::arch::x86_64::*;
+    let n = dst.len();
+    let mut i = 0usize;
+    // SAFETY: 循环条件保证 [i, i+8) 在 row（2*n 字节）与 dst（n 字节）内；
+    // loadu/storeu 允许未对齐。
+    unsafe {
+        let sv = _mm256_set1_ps(s);
+        let lo = _mm256_set1_ps(-127.0);
+        let hi = _mm256_set1_ps(127.0);
+        while i + 8 <= n {
+            let bits = _mm_loadu_si128(row.as_ptr().add(i * 2).cast::<__m128i>());
+            let w = _mm256_cvtepu16_epi32(bits);
+            let f = _mm256_castsi256_ps(_mm256_slli_epi32(w, 16));
+            let q = _mm256_div_ps(f, sv);
+            let r = _mm256_round_ps(
+                q,
+                (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC) as i32,
+            );
+            let r = _mm256_min_ps(_mm256_max_ps(r, lo), hi);
+            let iv = _mm256_cvttps_epi32(r);
+            let mut tmp = [0i32; 8];
+            _mm256_storeu_si256(tmp.as_mut_ptr().cast::<__m256i>(), iv);
+            for (j, v) in tmp.iter().enumerate() {
+                dst[i + j] = (*v as i8) as u8;
+            }
+            i += 8;
+        }
+    }
+    if i < n {
+        quant_i8_row_bf16_scalar(&row[i * 2..], &mut dst[i..], s);
+    }
+}
+
 /// AWQ 非对称反量化(host rayon;非 eligible 小线性专用):
 /// W[o, i] = (nibble_i(q_packed[o, i/8]) − zp[o, g]) × scale[o, g],g = i/32。
 /// 输出 f16 LE [out × k]。
@@ -1067,4 +1168,49 @@ pub(crate) fn dequant_u4_awq_f16_bytes(
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod i8_row_tests {
+    use super::*;
+
+    /// AVX2 与标量逐位同门：统一用 `rtn_i8_row_sym_bf16`（内部按 CPU 分派），
+    /// 再与逐元素标量参考对拍。覆盖 0 / 极值 / 恰好半程（ties-even）附近。
+    #[test]
+    fn bf16_i8_row_avx2_matches_scalar_including_ties() {
+        let (out, k) = (37usize, 1031usize); // k 非 8 倍数：同时锁尾部
+        let mut vals = Vec::with_capacity(out * k);
+        for i in 0..out * k {
+            let x = match i % 13 {
+                0 => 0.0,
+                1 => 127.0,
+                2 => -127.0,
+                3 => 0.5,
+                4 => -0.5,
+                5 => 1.5,
+                6 => -1.5,
+                _ => ((i as f32 * 0.019).sin() * 9.0) + (i % 7) as f32 * 0.125,
+            };
+            vals.push(x);
+        }
+        let bf: Vec<u8> = vals
+            .iter()
+            .flat_map(|f| ((f.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let (q, _) = rtn_i8_row_sym_bf16(&bf, out, k);
+        for o in 0..out {
+            let row = &bf[o * k * 2..(o + 1) * k * 2];
+            let amax = row
+                .chunks_exact(2)
+                .fold(0f32, |m, b| {
+                    m.max(f32::from_bits(
+                        (u16::from_le_bytes([b[0], b[1]]) as u32) << 16,
+                    ).abs())
+                });
+            let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            let mut want = vec![0u8; k];
+            quant_i8_row_bf16_scalar(row, &mut want, s);
+            assert_eq!(&q[o * k..(o + 1) * k], &want[..], "row {o} 逐位");
+        }
+    }
 }

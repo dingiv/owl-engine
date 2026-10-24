@@ -12,13 +12,15 @@ use crate::command::{Ack, Command, Waiter};
 use crate::server::GpuServer;
 use crate::state::{DeviceSelector, STREAM_COMPUTE, STREAM_H2D};
 use owl_iface::contract::{Arg, Bytes, DeviceClient, LaunchMsg};
-use owl_iface::contract::{Connector, ModelError, SwapDir, SwapPiece};
+use owl_iface::contract::{Connector, ModelError, SwapDir, SwapPiece, VramAccount, VramSnapshot};
 use owl_iface::command::{BatchOutcome, Command as DeviceCommand, Outcome};
 use std::future::Future;
 use std::sync::mpsc;
 
 pub struct GpuClient {
     tx: mpsc::Sender<Command>,
+    /// 本设备显存账（与 `GpuServer` 共持；2026-10-24）
+    vram: std::sync::Arc<VramAccount>,
     /// 诊断下沉口(与 GPU server 同一只;`sink()` 组装时同传双方)
     sink: owl_shared::log::LogSink,
     /// **累积批的待提交队列**(`queue` 追加 / `flush` 一次提交;2026-10-21)。
@@ -31,7 +33,12 @@ pub struct GpuClient {
 impl Clone for GpuClient {
     /// 克隆 = **同一管道的新句柄**(队列不跟随 —— 见字段文档)。
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone(), sink: self.sink, pending: Vec::new() }
+        Self {
+            tx: self.tx.clone(),
+            vram: self.vram.clone(),
+            sink: self.sink,
+            pending: Vec::new(),
+        }
     }
 }
 
@@ -70,13 +77,31 @@ impl<T: Send + 'static> Future for TimedWaiter<T> {
 impl GpuClient {
     /// client 构造函数:**纯句柄**(管道的 client 端;管道由外部组装者
     /// 创建后分别传入 server 与 client,双方都不自创管道)。
+    ///
+    /// ⚠️ 手工组装路径下本句柄持有一份**独立空账**;需要与 server 共账
+    /// (引擎 boot 读快照)时用 [`Self::spawn_with`] 或
+    /// [`Self::with_sink_vram`]。
     pub fn new(tx: mpsc::Sender<Command>) -> Self {
-        Self { tx, sink: owl_shared::log::LogSink::none(), pending: Vec::new() }
+        Self {
+            tx,
+            vram: std::sync::Arc::new(VramAccount::new()),
+            sink: owl_shared::log::LogSink::none(),
+            pending: Vec::new(),
+        }
     }
 
     /// 带下沉口构造(组装糖/spawn_with 用;两侧同 sink)
     pub fn with_sink(tx: mpsc::Sender<Command>, sink: owl_shared::log::LogSink) -> Self {
-        Self { tx, sink, pending: Vec::new() }
+        Self::with_sink_vram(tx, sink, std::sync::Arc::new(VramAccount::new()))
+    }
+
+    /// 带下沉口 + **显式设备账**(server/client 共持同一份;测试/手工组装用)
+    pub fn with_sink_vram(
+        tx: mpsc::Sender<Command>,
+        sink: owl_shared::log::LogSink,
+        vram: std::sync::Arc<VramAccount>,
+    ) -> Self {
+        Self { tx, vram, sink, pending: Vec::new() }
     }
 
     /// **块账按名清单**(诊断查询面;2026-10-16 全量记名)。
@@ -154,7 +179,16 @@ impl GpuClient {
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<Command>();
         let (boot_tx, boot_rx) = mpsc::channel::<Result<(), String>>();
-        let server = GpuServer::with_diag_sink(rx, selector, Some(boot_tx), diag, debug, sink);
+        let vram = std::sync::Arc::new(VramAccount::new());
+        let server = GpuServer::with_diag_sink_vram(
+            rx,
+            selector,
+            Some(boot_tx),
+            diag,
+            debug,
+            sink,
+            vram.clone(),
+        );
         std::thread::Builder::new()
             .spawn(move || {
                 // server 收摊 → 账房/图注册表随 ctx 析构,派发线程排空后退出。
@@ -172,7 +206,7 @@ impl GpuClient {
         boot_rx
             .recv()
             .map_err(|e| format!("server boot 通道关闭: {e}"))??;
-        Ok(Self::with_sink(tx, sink))
+        Ok(Self::with_sink_vram(tx, sink, vram))
     }
 
     // ── peer 面(TP2 S1 壳子;设计 `docs/arch/TP2-施工设计.md` §2)────────
@@ -319,6 +353,9 @@ impl GpuClient {
 }
 
 impl DeviceClient for GpuClient {
+    fn vram_snapshot(&self) -> VramSnapshot {
+        self.vram.snapshot()
+    }
     /// 执行环境提供(被动律:感知在本侧/boot,kernels 零探测)。
     /// arch 占位 Sm86 —— boot 时从 driver API/CC 查询接真感知,接口零改动。
     fn op_env(&self) -> Option<owl_kernels::driver::OpEnv> {

@@ -53,6 +53,7 @@ impl GpuServer {
             n,
             self.diag.vram_reserve_mb << 20,
             self.diag.vram_budget_mb.map(|m| m << 20),
+            &self.vram,
         ) {
             self.sink.logf(
                 owl_shared::log::LVL_WARN,
@@ -478,6 +479,7 @@ impl GpuServer {
         };
         if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
             owl_shared::vram::free_set(free as u64);
+            self.vram.free_set(free as u64);
         }
         let mut ack = Some(ack);
         match self.try_dtoh_batch(&stream, &pieces, total) {
@@ -593,6 +595,7 @@ impl GpuServer {
         };
         if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
             owl_shared::vram::free_set(free as u64);
+            self.vram.free_set(free as u64);
         }
         let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
             match self.pool.take(total) {
@@ -785,6 +788,7 @@ impl GpuServer {
         // cuMemGetInfo µs 级,收割频度下零税)
         if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
             owl_shared::vram::free_set(free as u64);
+            self.vram.free_set(free as u64);
         }
         if let Some(t) = t_d2h {
             self.sink.logf(owl_shared::log::LVL_DEBUG, "d2h-prof", format_args!("序={:?} n={want_bytes}", t.elapsed()));

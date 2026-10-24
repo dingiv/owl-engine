@@ -82,7 +82,7 @@ pub(crate) enum Resolved {
 }
 
 pub struct AwqSource {
-    pub(crate) maps: Vec<Mmap>,
+    pub(crate) maps: Vec<Arc<Mmap>>,
     pub(crate) index: HashMap<String, RawEntry>,
     /// 懒物化字节缓存(键 → 字节;容量清空驱逐)
     #[allow(clippy::type_complexity)] // 行块缓存(字节镜像 + 计数)
@@ -97,6 +97,8 @@ pub struct AwqSource {
     /// 设备重排模式(装载域 set;true = CPU 构建走轻路径:量化大键的
     /// marlin B 由 GPU repack 产出,CPU 仅产 scales/zeros/packed_raw_ct)
     pub(crate) device_repack: std::cell::Cell<bool>,
+    /// 后台冷盘预取句柄(2026-10-24;`prefetch_finish` 收口 join)
+    prefetch_thread: Mutex<Option<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl AwqSource {
@@ -108,12 +110,13 @@ impl AwqSource {
             t0.elapsed()
         );
         Ok(Self {
-            maps,
+            maps: maps.into_iter().map(Arc::new).collect(),
             index,
             cache: Mutex::new((HashMap::new(), 0)),
             idx_cache: Mutex::new(HashMap::new()),
             build_locks: (0..16).map(|_| Mutex::new(())).collect(),
             device_repack: std::cell::Cell::new(false),
+            prefetch_thread: Mutex::new(None),
         })
     }
 
@@ -150,6 +153,119 @@ impl AwqSource {
         }
     }
 
+
+    /// **冷盘预取**(2026-10-24):把本档将读的源区间按文件偏移合并后,
+    /// 后台 `pread` 填页缓存。实现只读索引/`linear_form`,**绝不 resolve**
+    /// (否则会把派生键提前物化,反而拖慢装载)。
+    fn prefetch_ranges(&self, keys: &[&str]) {
+        // 幂等:若上一次预取还没收口,先 join 再换批,避免线程泄漏。
+        self.prefetch_join();
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::new(); // (map, start, end)
+        let push_entry = |ranges: &mut Vec<(usize, usize, usize)>, e: &RawEntry| {
+            if e.nbytes > 0 {
+                ranges.push((e.map_ix, e.start, e.start + e.nbytes));
+            }
+        };
+        let add_base = |ranges: &mut Vec<(usize, usize, usize)>, base: &str| {
+            let Some((_, _, form)) = self.linear_form(base) else { return };
+            match form {
+                QuantForm::Ct { pe, se, ze } => {
+                    push_entry(ranges, pe);
+                    push_entry(ranges, se);
+                    push_entry(ranges, ze);
+                }
+                QuantForm::F16 { we } => push_entry(ranges, we),
+            }
+        };
+        for key in keys {
+            if key.ends_with(".marlin_ws") || key.ends_with(".marlin_ctmp") {
+                continue;
+            }
+            if let Some(e) = self.index.get(*key) {
+                push_entry(&mut ranges, e);
+            }
+            let base = [
+                ".qweight", ".scales", ".zeros", ".packed_raw", ".packed_raw_ct",
+                ".i8q", ".i8s", ".weight", ".qweight_a8", ".scales_a8", ".zeros_a8",
+                ".a8_factor",
+            ]
+            .iter()
+            .find_map(|suffix| key.strip_suffix(suffix));
+            let Some(base) = base else { continue };
+            if let Some((b1, b2)) = split_merged(base) {
+                add_base(&mut ranges, &b1);
+                add_base(&mut ranges, &b2);
+            } else {
+                add_base(&mut ranges, base);
+            }
+        }
+        if ranges.is_empty() {
+            return;
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize, usize)> = Vec::with_capacity(ranges.len());
+        for (map, start, end) in ranges {
+            match merged.last_mut() {
+                Some((m, _, last_end)) if *m == map && start <= *last_end => {
+                    *last_end = (*last_end).max(end);
+                }
+                _ => merged.push((map, start, end)),
+            }
+        }
+        let total: usize = merged.iter().map(|(_, s, e)| e - s).sum();
+        let segs = merged.len();
+        let maps = self.maps.clone();
+        let t0 = std::time::Instant::now();
+        // 2 条读流、按源段轮转（文件 0/2/4 与 1/3）。实测优于 1 流
+        //（I/O 不饱和）与 3/5 流（NVMe 队列争用）；按字节贪心重排反而
+        // 打乱文件顺序，冷载慢 ~1.4s。buffered pread ~2.1GB/s/流，
+        // 双流与 CPU 物化重叠后把冷载压到 max(I/O, CPU)。
+        let flows = segs.min(2).max(1);
+        let mut buckets: Vec<Vec<(usize, usize, usize)>> = (0..flows).map(|_| Vec::new()).collect();
+        for (i, r) in merged.into_iter().enumerate() {
+            buckets[i % flows].push(r);
+        }
+        let mut handles = Vec::with_capacity(flows);
+        for bucket in buckets {
+            let maps = maps.clone();
+            handles.push(std::thread::spawn(move || {
+                for (map, start, end) in bucket {
+                    if let Err(e) = maps[map].readahead(start, end - start) {
+                        owl_shared::log_warn!(
+                            "load",
+                            "预取读失败(map {} @{} {}B): {e}(回退按需缺页)",
+                            map, start, end - start
+                        );
+                    }
+                }
+            }));
+        }
+        *self.prefetch_thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(handles);
+        owl_shared::log_info!(
+            "load",
+            "预取源区间:{} 段 / {:.2}GB · {} 读流 · 后台启动 {:.1}ms(冷盘 I/O 与物化重叠)",
+            segs,
+            total as f64 / 1e9,
+            flows,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    /// 等后台预取收口（装载键循环结束处调用；保证不把 I/O 线程带进服务期）。
+    fn prefetch_join(&self) {
+        if let Some(handles) = self
+            .prefetch_thread
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            for h in handles {
+                if h.join().is_err() {
+                    owl_shared::log_warn!("load", "预取线程 panic(已忽略;按需缺页仍可装载)");
+                }
+            }
+        }
+    }
 
     /// 键解析(唯一入口;懒物化在此触发)。
     ///
@@ -313,6 +429,14 @@ impl AwqSource {
     }
 }
 
+impl Drop for AwqSource {
+    fn drop(&mut self) {
+        // 源被丢弃时预取线程仍在跑的路径(装载早退/测试):收口,别把
+        // 后台读盘带进服务期或下一个装载。
+        self.prefetch_join();
+    }
+}
+
 pub(crate) enum KeyData {
     Owned(Vec<u8>),
     Shared(Arc<[u8]>),
@@ -328,6 +452,14 @@ impl KeyData {
 }
 
 impl WeightSource for AwqSource {
+    fn prefetch(&self, keys: &[&str]) {
+        self.prefetch_ranges(keys);
+    }
+
+    fn prefetch_finish(&self) {
+        self.prefetch_join();
+    }
+
     fn take(&self, key: &str) -> Taken<Vec<f32>> {
         let Some(n) = self.elem_len(key)? else {
             return Ok(None);
@@ -686,6 +818,24 @@ mod tests {
             file.extend_from_slice(&b);
         }
         owl_shared::file_loader::write(dir.join(file_name), file).expect("写 ct 检查点");
+    }
+
+    /// **BF16→int8 head 直读链**与旧 `bf16_par + rtn_i8_row_sym` 逐位同源。
+    #[test]
+    fn i8_head_bf16_fused_matches_f32_chain() {
+        use crate::formats::awq_build::{rtn_i8_row_sym, rtn_i8_row_sym_bf16};
+        let (out, k) = (64usize, 128usize);
+        let vals: Vec<f32> = (0..out * k)
+            .map(|i| {
+                let x = (i as f32 * 0.0173).sin() * 3.7 + (i % 17) as f32 * 0.011;
+                if i % 31 == 0 { 0.0 } else { x }
+            })
+            .collect();
+        let bf = f32_to_bf16_bytes(&vals);
+        let old = rtn_i8_row_sym(&bf16_par(&bf), out, k);
+        let new = rtn_i8_row_sym_bf16(&bf, out, k);
+        assert_eq!(old.0, new.0, "int8 q 逐位");
+        assert_eq!(old.1, new.1, "row scale 逐位");
     }
 
     /// **合并虚拟键直写对拍**(2026-10-16 装载提速):

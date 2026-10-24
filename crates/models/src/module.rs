@@ -762,6 +762,14 @@ pub trait WeightSource {
         false
     }
 
+    /// **装载前预取**(可选;默认 no-op)。`keys` = 本档将消费的键,顺序
+    /// 与装载循环一致。mmap 源可在后台把底层区间读入页缓存,让冷盘 I/O
+    /// 与 CPU 物化重叠;实现必须廉价、只读、无副作用(不得 resolve/物化)。
+    fn prefetch(&self, _keys: &[&str]) {}
+
+    /// 等 [`Self::prefetch`] 的后台 I/O 收口(默认 no-op)。
+    fn prefetch_finish(&self) {}
+
     fn take(&self, key: &str) -> Taken<Vec<f32>>;
 
     /// 区间取数(流式大张量:分块转换上传,主机在途 = 单块)。
@@ -1593,13 +1601,40 @@ pub trait Loadable {
 // §7 Weight:跨设备权重(空包指针 + 布局标注)
 // ============================================================================
 
+/// `Weight.dtype` 的原子编码（2026-10-24;TP2 并行装载要求 `Model: Sync`）。
+/// 只做 in-process 值域往返,不跨进程序列化。
+fn dtype_code(dt: Dtype) -> usize {
+    match dt {
+        Dtype::F32 => 0,
+        Dtype::BF16 => 1,
+        Dtype::F16 => 2,
+        Dtype::F8E4M3 => 3,
+        Dtype::F8E5M2 => 4,
+        Dtype::I8 => 5,
+        Dtype::U32 => 6,
+        Dtype::U8 => 7,
+    }
+}
+
+fn dtype_of(code: usize) -> Dtype {
+    match code {
+        0 => Dtype::F32,
+        1 => Dtype::BF16,
+        2 => Dtype::F16,
+        3 => Dtype::F8E4M3,
+        4 => Dtype::F8E5M2,
+        5 => Dtype::I8,
+        6 => Dtype::U32,
+        _ => Dtype::U8,
+    }
+}
+
 /// 跨设备权重:布局标注 + 空包指针。未装载时 decl() → 毒值声明
 /// (forward 全程 total,零 panic 零 expect)。
 ///
 /// 与 Tensor<D> 同构(2026-09-25 拍板:句柄落线 A)—— **容器只持句柄,
 /// 存放归设备**:CpuFace 解析为 host 值块,GpuClient 解析为显存池块,
 /// 层代码零设备感知。
-#[derive(Clone)]
 pub struct Weight {
     key: &'static str,
     shape: Shape,
@@ -1612,11 +1647,31 @@ pub struct Weight {
     scales_arm: bool,
     /// 装载 dtype(F5 整模切换):layout 期从 LoaderCtx 写入,decl 按此
     /// 出声明 —— 默认 F32(CPU 单元面);f16 模型经 LoaderCtx 自动跟随,
-    /// 层构造器零涟漪(Cell 内部可变;Weight 使用面恒 &self)
-    dtype: std::cell::Cell<Dtype>,
+    /// 层构造器零涟漪(原子内部可变;Weight 使用面恒 &self)。
+    ///
+    /// **2026-10-24 TP2 并行装载**:原 `Cell<Dtype>` 让 `Model` 非 `Sync`
+    /// ⇒ `LoadedModel` 不能跨线程返回,双 rank 只能串行。此处只改声明
+    /// 存储层(原子 Relaxed),语义不变,换来 `Model: Send + Sync`。
+    dtype: std::sync::atomic::AtomicUsize,
     /// dtype 覆盖(E3 量化臂:qweight U32 / scales F16 不随 LoaderCtx
     /// 整模 dtype 漂移;Some = layout 期钉死)
     dtype_override: Option<Dtype>,
+}
+
+impl Clone for Weight {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key,
+            shape: self.shape.clone(),
+            transposed: self.transposed,
+            cell: self.cell.clone(),
+            scales_arm: self.scales_arm,
+            dtype: std::sync::atomic::AtomicUsize::new(
+                self.dtype.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            dtype_override: self.dtype_override,
+        }
+    }
 }
 
 impl Weight {
@@ -1627,7 +1682,7 @@ impl Weight {
             shape,
             transposed: false,
             cell: SlotCell::default(),
-            dtype: std::cell::Cell::new(Dtype::F32),
+            dtype: std::sync::atomic::AtomicUsize::new(dtype_code(Dtype::F32)),
             dtype_override: None,
             scales_arm: false,
         }
@@ -1641,7 +1696,7 @@ impl Weight {
             shape,
             transposed: false,
             cell: SlotCell::default(),
-            dtype: std::cell::Cell::new(dtype),
+            dtype: std::sync::atomic::AtomicUsize::new(dtype_code(dtype)),
             dtype_override: Some(dtype),
             scales_arm: false,
         }
@@ -1668,7 +1723,7 @@ impl Weight {
             shape,
             transposed: false,
             cell: SlotCell::default(),
-            dtype: std::cell::Cell::new(Dtype::F16),
+            dtype: std::sync::atomic::AtomicUsize::new(dtype_code(Dtype::F16)),
             dtype_override: None,
             scales_arm: true,
         }
@@ -1677,7 +1732,7 @@ impl Weight {
     /// 转置权重:源 [rows, cols] 行主序 → 装载声明 [cols, rows]
     /// (Linear 惯例:forward 直 matmul,decode 零转置)
     pub fn new_transposed(key: &'static str, rows: usize, cols: usize) -> Self {
-        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default(), dtype: std::cell::Cell::new(Dtype::F32), dtype_override: None, scales_arm: false }
+        Self { key, shape: vec![cols, rows], transposed: true, cell: SlotCell::default(), dtype: std::sync::atomic::AtomicUsize::new(dtype_code(Dtype::F32)), dtype_override: None, scales_arm: false }
     }
 
     /// 装载生命周期:按语境声明需求(元数据直出 + 回填口;零 src 零数据)
@@ -1696,7 +1751,7 @@ impl Weight {
         } else {
             self.dtype_override.unwrap_or(ctx.dtype)
         };
-        self.dtype.set(dtype);
+        self.dtype.store(dtype_code(dtype), std::sync::atomic::Ordering::Relaxed);
         LoaderOps::want(Want {
             key: key.into(),
             dtype,
@@ -1721,7 +1776,7 @@ impl Weight {
         ctx: &LoaderCtx,
     ) -> LoaderOps {
         let dtype = self.dtype_override.unwrap_or(ctx.dtype);
-        self.dtype.set(dtype);
+        self.dtype.store(dtype_code(dtype), std::sync::atomic::Ordering::Relaxed);
         LoaderOps::want(Want {
             key: key.into(),
             dtype,
@@ -1735,7 +1790,7 @@ impl Weight {
 
     /// 权重声明(未装载 → 毒值声明;of_block:eval 时 Block 叶子零操作)
     pub fn decl(&self) -> TensorOps {
-        let dt = self.dtype.get();
+        let dt = dtype_of(self.dtype.load(std::sync::atomic::Ordering::Relaxed));
         match self.cell.loaded() {
             Some(b) => TensorOps::of_block(b.id, dt, self.shape.clone()),
             None => TensorOps::poisoned(
@@ -1748,7 +1803,7 @@ impl Weight {
 
     /// 装载 dtype 访问器(核名路由用;layout 前 = 默认 F32)
     pub fn dtype(&self) -> Dtype {
-        self.dtype.get()
+        dtype_of(self.dtype.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -1826,6 +1881,13 @@ mod tests {
     use super::*;
     use crate::layers::linear::Linear;
     use crate::testkit::{f32b, f32_of, Src};
+
+    /// TP2 并行装载的前提:`Model` 必须能跨线程移动/共享(Weight.dtype 原子化)。
+    #[test]
+    fn model_is_send_sync_for_tp_parallel_load() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<crate::model::Model>();
+    }
 
     /// RepackPath 裁决序单测(收口唯一性;env 支不入进程内单测 ——
     /// env 是全局态,并行测试互扰;该支由 specs 装载路径 + 运维 A/B 人工覆盖)

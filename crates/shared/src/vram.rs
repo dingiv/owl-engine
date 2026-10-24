@@ -10,8 +10,9 @@
 //! - 引擎 StatePool::alloc 读 `total/live` → 池容量 =
 //!   min(手工上限, (target×total − live − reserve)/每 token 字节)。
 //!
-//! 全进程单引擎假设(与 slab_hint 同);非追踪面(CUDA ctx ~430MB、
-//! async 池惰性保留、捕获瞬态)= reserve 兜底,默认 300MB,梯子校准。
+//! **2026-10-24:决策路径已迁到 per-device `VramAccount`**(`owl-iface`);
+//! 本文件的全局三元组只保留为**诊断聚合镜像**(`graph_fleet`/日志),
+//! 不再参与池容量/预算。全进程单引擎假设只对这份镜像成立。
 //!
 //! # 与"探针账"的边界(2026-10-21 审查)
 //!
@@ -22,6 +23,10 @@
 //! 三个 static 均私有 + 只经函数访问(无 `pub static` 裸奔)。
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+/// 每设备显存账的类型权威在 `owl-iface`（设备 server/client 共持）。
+/// 本模块的旧全局函数保留为**诊断聚合镜像**，不再参与池容量决策。
+pub use owl_iface::contract::{VramAccount, VramSnapshot};
 
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicI64 = AtomicI64::new(0);

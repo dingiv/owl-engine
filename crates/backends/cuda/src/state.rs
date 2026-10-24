@@ -735,10 +735,11 @@ impl VramGuard {
         n_bytes: usize,
         reserve_bytes: u64,
         budget_bytes: Option<u64>,
+        vram: &owl_iface::contract::VramAccount,
     ) -> Result<(), ModelError> {
         // ② 逻辑上限（可选；纯账，零驱动）
         if let Some(cap) = budget_bytes {
-            let live = owl_shared::vram::live_bytes();
+            let live = vram.live_bytes();
             let after = live.saturating_add(n_bytes as u64);
             if after > cap {
                 return Err(ModelError::PoolExhausted {
@@ -749,7 +750,7 @@ impl VramGuard {
             }
         }
         // ① 驱动账：先看估计，够用且不陈旧就**不查驱动**
-        let live = owl_shared::vram::live_bytes();
+        let live = vram.live_bytes();
         let now = std::time::Instant::now();
         let need_sample = match Self::estimate_free(self.sample, live, now) {
             None => true,
@@ -764,6 +765,7 @@ impl VramGuard {
         if need_sample {
             if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
                 let free = free as u64;
+                vram.free_set(free);
                 owl_shared::vram::free_set(free);
                 self.sample = Some((std::time::Instant::now(), free, live));
             }
@@ -962,6 +964,8 @@ pub(super) struct GpuCtx {
     pub(super) cap_prof: bool,
     /// 诊断下沉口(注入面):日志 + 分相计时都走它(cuda 不依赖日志 crate)
     pub(super) sink: owl_shared::log::LogSink,
+    /// 本设备显存账(与 GpuServer/GpuClient 共持;2026-10-24)
+    pub(super) vram: std::sync::Arc<owl_iface::contract::VramAccount>,
 }
 
 /// **捕获窗内发射材料的登记表**(2026-10-15;A1.6 的落地,materials 账)。
@@ -1137,6 +1141,7 @@ impl GpuCtx {
         diag: DiagOpts,
         ledger: u32,
         sink: owl_shared::log::LogSink,
+        vram: std::sync::Arc<owl_iface::contract::VramAccount>,
     ) -> Result<Self, String> {
         let ordinal = selector.resolve()?;
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("{e:?}"))?;
@@ -1145,10 +1150,14 @@ impl GpuCtx {
         match cudarc::driver::result::device::get(ordinal as i32)
             .and_then(|dev| unsafe { cudarc::driver::result::device::total_mem(dev) })
         {
-            Ok(bytes) => owl_shared::vram::total_set(bytes as u64),
+            Ok(bytes) => {
+                vram.total_set(bytes as u64);
+                owl_shared::vram::total_set(bytes as u64);
+            }
             Err(e) => sink.logf(owl_shared::log::LVL_INFO, "boot", format_args!("vram total 查询失败(治理禁用): {e:?}")),
         }
         if let Ok((free, _)) = cudarc::driver::result::mem_get_info() {
+            vram.free_set(free as u64);
             owl_shared::vram::free_set(free as u64);
         }
         // G0 护栏:关 event-tracking(坑 A)。多流 + event tracking 会让
@@ -1306,6 +1315,7 @@ impl GpuCtx {
             peer_alloc_cap: owl_shared::device::PEER_ALLOC_HARD_CAP,
             ledger,
             sink,
+            vram,
             smem_optin,
         })
     }
@@ -1376,9 +1386,12 @@ impl GpuCtx {
     /// `cuMemGetInfo` 只需当前上下文在场(本线程);纯查询、不碰设备状态。
     /// boot 分相取证与 `/debug/vram` 驱动残差共用。
     pub(super) fn mem_info(&self) -> Result<(u64, u64), ModelError> {
-        cudarc::driver::result::mem_get_info()
-            .map(|(free, total)| (free as u64, total as u64))
-            .map_err(|e| ModelError::Msg(format!("mem_info: {e:?}")))
+        let (free, total) = cudarc::driver::result::mem_get_info()
+            .map_err(|e| ModelError::Msg(format!("mem_info: {e:?}")))?;
+        let (free, total) = (free as u64, total as u64);
+        self.vram.free_set(free);
+        self.vram.total_set(total);
+        Ok((free, total))
     }
 
     /// **默认池回收**(内存面;见 `DeviceClient::mem_pool_trim`):
@@ -1692,6 +1705,7 @@ impl GpuCtx {
         let slab = unsafe { stream.alloc::<u8>(slab_cap) }
             .map_err(|e| ModelError::Msg(format!("graph_begin: 捕获 slab 分配失败({}MiB) {e:?}", slab_cap >> 20)))?;
         owl_shared::vram::live_add(slab_cap as i64); // B6.5(直配不走 handle_alloc)
+        self.vram.live_add(slab_cap as i64);
         // **取证**(2026-10-19;`OWL_VRAM_DBG=1`):图捕获 slab 是"每图一份、
         // 按 warmup 计量满额" ⇒ 多图叠加会静默吃掉 GB 级
         // ("满额 × 图数 = VRAM 爆的工程债")。打印每次捕获量与累计。
@@ -2475,6 +2489,7 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
             }
         }
         owl_shared::vram::live_add(-freed_bytes);
+        self.vram.live_add(-freed_bytes);
         n
     }
 
@@ -2604,6 +2619,7 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         );
         self.peer_shared_bytes += mapped;
         owl_shared::vram::live_add(mapped as i64);
+        self.vram.live_add(mapped as i64);
         Ok((id, fd, mapped))
     }
 
@@ -2687,6 +2703,7 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                     }
                     self.peer_shared_bytes = self.peer_shared_bytes.saturating_sub(s.map.bytes as u64);
                     owl_shared::vram::live_add(-(s.map.bytes as i64));
+                    self.vram.live_add(-(s.map.bytes as i64));
                     if let Err(er) = crate::vmm::release(s.map) {
                         errs.push(format!("id={id}(shared): {er}"));
                     }

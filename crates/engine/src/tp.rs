@@ -234,12 +234,14 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
                 loadeds.len()
             ));
         }
-        // boot 快照(host 单份;`into_running` 的预算装配用它)
-        let boot = engines[0].boot_vram();
+        // boot 快照(host 单份;`into_running` 的预算装配用 rank0)
+        let boot0 = engines[0].boot_vram();
+        let boot1 = engines[1].boot_vram();
+        let boot = boot0;
         let mut it = engines.into_iter();
-        let (face0, mut cfg, cell0, _boot0) =
+        let (face0, mut cfg0, cell0, _boot0) =
             it.next().expect("world = 2 已守门").into_parts();
-        let (face1, _cfg1, cell1, _boot1) =
+        let (face1, mut cfg1, cell1, _boot1) =
             it.next().expect("world = 2 已守门").into_parts();
         // **合流自证**(可判):rank1 自己的那个单元在装配期**必须为空** ——
         // 非空就说明 rank1 在接管之前已经记过账(事件落进了没人读的孤儿账)。
@@ -263,7 +265,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         //    未接线面**(S6+);
         // ② prefill 桶族已退役(2026-10-21),不再有该面。
         // ③ 读数类探针:prefill 入队半里的 dtoh/sync 会撞 AR 自旋(见 on_peer 契约)。
-        let k = &cfg.knobs;
+        let k = &cfg0.knobs;
         if k.draft.depth != 0 && !k.draft.tp_draft {
             return loud(format!(
                 "TP v1 不支持投机草稿(draft.depth = {};双 rank 草稿族未接线)。\
@@ -318,36 +320,27 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         init_staging_header(&mut face1, staging1.own(), staging1.layout, "tp.hdr.r1").await?;
         let ctx0 = staging0.ctx(plan0);
         let ctx1 = staging1.ctx(plan1);
-        // **池前 live 基线**(两 rank 共用;权重/杂项已就位,池未分配)。
-        // 这是治理器与准入账的唯一口径:消除"rank1 看到 rank0 池"的顺序相关。
-        let world_u64 = world.max(1) as u64;
-        let live_before_pool = owl_shared::vram::live_bytes();
-        let baseline_per_card = live_before_pool / world_u64;
-        let weights_per_card =
-            live_before_pool.saturating_sub(boot.live_at_new()) / world_u64;
-        // ── 两 rank **顺序**装配(**零协调**)────────────────────────────
+        // **池前 live 基线**(per-device!2026-10-24):每 rank 读自己的 account
+        // 快照 —— 不再把进程级 LIVE 除以 world。两 rank 的权重/杂项对称,
+        // 但并行 boot 时共享全局账会串值,这里必须各算各的。
+        let snap0 = face0.vram_snapshot();
+        let snap1 = face1.vram_snapshot();
+        let baseline0 = snap0.live;
+        let baseline1 = snap1.live;
+        let weights0 = baseline0.saturating_sub(boot0.live_at_new());
+        let weights1 = baseline1.saturating_sub(boot1.live_at_new());
+        let weights_per_card = (weights0.saturating_add(weights1)) / world.max(1) as u64;
+        // ── 两 rank **并行**装配(per-device 账落地后;2026-10-24)──────────
         // 装配期的 AR 已被 `eval_current_dry` 从 warmup/干跑里摘掉 ⇒ 每 rank
         // 独立完成,无需对端在场(确定性分片协议的"零协调"落实到装配面)。
-        let dev0 = boot_rank(
-            face0,
-            &mut cfg,
-            rm0,
-            Some(ctx0),
-            baseline_per_card,
-            std::time::Instant::now(),
-        )
-            .await
-            .map_err(|e| ModelError::Msg(format!("TP rank0 装配失败:{e}")))?;
-        let dev1 = boot_rank(
-            face1,
-            &mut cfg,
-            rm1,
-            Some(ctx1),
-            baseline_per_card,
-            std::time::Instant::now(),
-        )
-            .await
-            .map_err(|e| ModelError::Msg(format!("TP rank1 装配失败:{e}")))?;
+        let t_boot = std::time::Instant::now();
+        let (r0, r1) = tokio::join!(
+            boot_rank(face0, &mut cfg0, rm0, Some(ctx0), baseline0, t_boot),
+            boot_rank(face1, &mut cfg1, rm1, Some(ctx1), baseline1, t_boot),
+        );
+        let dev0 = r0.map_err(|e| ModelError::Msg(format!("TP rank0 装配失败:{e}")))?;
+        let dev1 = r1.map_err(|e| ModelError::Msg(format!("TP rank1 装配失败:{e}")))?;
+        let cfg = cfg0;
         // ── 装配后自证:warmup 的 AR 已**对称配对**(produced == consumed、err = 0)──
         for (i, dev) in [&dev0, &dev1].into_iter().enumerate() {
             let Some(tp_ctx) = dev.boot.tp.as_ref() else {

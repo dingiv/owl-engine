@@ -24,7 +24,7 @@
 //! U4B8 语义 W = (q-8) × scale。
 
 use crate::contract::{Dtype, ModelError};
-use crate::formats::mmap::{open_raw_index, Mmap, RawEntry};
+use crate::formats::mmap::{copy_par, open_raw_index, Mmap, RawEntry};
 use crate::formats::util::{
     checked_len, f16_bytes_to_bf16_bytes, f32_bytes_to_f16, i32s_le_bytes, i32s_par,
     marlin_eligible, marlin_n_pack, scales_par, u16s_le_bytes,
@@ -56,7 +56,7 @@ enum Resolved {
 }
 
 pub struct W4A16Source {
-    maps: Vec<Mmap>,
+    maps: Vec<Arc<Mmap>>,
     index: HashMap<String, RawEntry>,
     /// 懒物化字节缓存(键 → 字节;容量清空驱逐)
     #[allow(clippy::type_complexity)] // 行块缓存(字节镜像 + 计数)
@@ -71,6 +71,8 @@ pub struct W4A16Source {
     /// —— DFlash2 草稿提速(2026-10-13):草稿原被钉在 CPU 两步
     /// unpack+gather(66 张量 × ~0.68s ≈ 24.6s)。
     device_repack: std::cell::Cell<bool>,
+    /// 后台冷盘预取句柄(2026-10-24;草稿 W4A16 冷载 4.7s 的对症)
+    prefetch_thread: Mutex<Option<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl W4A16Source {
@@ -138,12 +140,13 @@ impl W4A16Source {
             t0.elapsed()
         );
         Ok(Self {
-            maps,
+            maps: maps.into_iter().map(Arc::new).collect(),
             index,
             cache: Mutex::new((HashMap::new(), 0)),
             idx_cache: Mutex::new(HashMap::new()),
             build_lock: Mutex::new(()),
             device_repack: std::cell::Cell::new(false),
+            prefetch_thread: Mutex::new(None),
         })
     }
 
@@ -151,6 +154,99 @@ impl W4A16Source {
     /// —— 与 awq.rs 同款接口(裁决唯一产地 = module::RepackPath::resolve)
     pub fn set_device_repack(&self, on: bool) {
         self.device_repack.set(on);
+    }
+
+    /// **冷盘预取**(2026-10-24):把本档要读的 source 区间按文件偏移合并后
+    /// 后台 `pread` 填页缓存。实现只读索引，**绝不 resolve/物化**。
+    ///
+    /// 与 AWQ 源同律：单卡或 TP2-rank0 调用一次全量（两 rank 切片并集 =
+    /// 全量）；rank1 不重复读。DFlash2 草稿此前没有本口，每次都被逐键
+    /// `DONTNEED` 打回冷盘（0.92GB / ~4.7s）。
+    fn prefetch_ranges(&self, keys: &[&str]) {
+        self.prefetch_join();
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::new(); // (map, start, end)
+        let push = |ranges: &mut Vec<(usize, usize, usize)>, e: &RawEntry| {
+            if e.nbytes > 0 {
+                ranges.push((e.map_ix, e.start, e.start + e.nbytes));
+            }
+        };
+        for key in keys {
+            if key.ends_with(".marlin_ws") || key.ends_with(".marlin_ctmp") {
+                continue;
+            }
+            if let Some(e) = self.index.get(*key) {
+                push(&mut ranges, e);
+            }
+        }
+        // 量化线性的两件源（qweight/scales/packed_raw/weight 都从它们派生）；
+        // fc_i 的列块也从 fc.weight_packed/weight_scale 派生。
+        for (k, e) in &self.index {
+            if k.ends_with(".weight_packed") || k.ends_with(".weight_scale") {
+                push(&mut ranges, e);
+            }
+        }
+        if ranges.is_empty() {
+            return;
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize, usize)> = Vec::with_capacity(ranges.len());
+        for (map, start, end) in ranges {
+            match merged.last_mut() {
+                Some((m, _, last_end)) if *m == map && start <= *last_end => {
+                    *last_end = (*last_end).max(end);
+                }
+                _ => merged.push((map, start, end)),
+            }
+        }
+        let total: usize = merged.iter().map(|(_, s, e)| e - s).sum();
+        let segs = merged.len();
+        let maps = self.maps.clone();
+        let t0 = std::time::Instant::now();
+        let flows = segs.min(2).max(1);
+        let mut buckets: Vec<Vec<(usize, usize, usize)>> =
+            (0..flows).map(|_| Vec::new()).collect();
+        for (i, r) in merged.into_iter().enumerate() {
+            buckets[i % flows].push(r);
+        }
+        let mut handles = Vec::with_capacity(flows);
+        for bucket in buckets {
+            let maps = maps.clone();
+            handles.push(std::thread::spawn(move || {
+                for (map, start, end) in bucket {
+                    if let Err(e) = maps[map].readahead(start, end - start) {
+                        owl_shared::log_warn!(
+                            "load",
+                            "预取读失败(map {} @{} {}B): {e}(回退按需缺页)",
+                            map, start, end - start
+                        );
+                    }
+                }
+            }));
+        }
+        *self.prefetch_thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(handles);
+        owl_shared::log_info!(
+            "load",
+            "预取源区间(w4a16):{} 段 / {:.2}GB · {} 读流 · 后台启动 {:.1}ms",
+            segs,
+            total as f64 / 1e9,
+            flows,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    fn prefetch_join(&self) {
+        if let Some(handles) = self
+            .prefetch_thread
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            for h in handles {
+                if h.join().is_err() {
+                    owl_shared::log_warn!("load", "预取线程 panic(已忽略;按需缺页仍可装载)");
+                }
+            }
+        }
     }
 
     /// 反量化口(测试/对拍用):量化基线性 → f32(dequant_u4 精确展宽)
@@ -201,9 +297,20 @@ impl W4A16Source {
         // 变换,与 AWQ kU4 同核同 B 字节布局,故 W4A16 直接复用)。
         // 零拷贝 View 优先;fc 列块五拆 / qkvz 合并走 linear_bytes_for。
         if let Some(base) = key.strip_suffix(".packed_raw") {
-            // 原始 ct packed i32 → **U32 字节**(零重排)。注意:不可用
-            // `Resolved::View` —— 它走 passthrough 归一 F16(I32 条目落
-            // `_ => None` → 缺键);此处一律 Bytes/U32。
+            // 原始 ct packed i32 → **U32 字节**(零重排)。
+            //
+            // 2026-10-24:普通 ct 键返回 `View`（零拷贝）—— `convert_chunk_into_bytes`
+            // 的 `I32 + U32` 分支直接 `copy_par` 本 rank 的行段；不再先
+            // `linear_bytes_for` 把**整键** `to_vec` 一遍（双 rank 半量数据
+            // 反而多一次全键拷贝，draft 单键 ~80ms 的主因）。fc 列块五拆 /
+            // 合并虚拟键仍走构建路径。
+            if fc_block_index(base).is_none()
+                && crate::formats::split_merged(base).is_none()
+            {
+                if let Some(pe) = self.index.get(&format!("{base}.weight_packed")) {
+                    return Ok(Some(Resolved::View(pe.clone())));
+                }
+            }
             let Some(__b) = self.linear_bytes_for(base, key)? else { return Ok(None) };
             return Ok(Some(Resolved::Bytes(__b, Dtype::U32)));
         }
@@ -398,8 +505,11 @@ impl W4A16Source {
         let scale_bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
         let scales_f32 = scales_par(se.dtype, scale_bytes);
         // 源页消费完毕即还(DONTNEED;file-backed clean page 再访重新缺页)
-        self.maps[pe.map_ix].dontneed(pe.start, pe.nbytes);
-        self.maps[se.map_ix].dontneed(se.start, se.nbytes);
+        // **不 DONTNEED**（2026-10-24）：W4A16 草稿/视觉源在 TP2 两 rank 间
+        // 共享页缓存；逐键丢弃会把 rank1（或同 rank 后续重读）打回冷盘。
+        // 0.9GB 级 clean page 由内核按压力回收，保留更划算。
+        // self.maps[pe.map_ix].dontneed(pe.start, pe.nbytes);
+        // self.maps[se.map_ix].dontneed(se.start, se.nbytes);
 
         let mut inserts: Vec<(String, Arc<[u8]>, usize)> = Vec::new();
         let device = self.device_repack.get();
@@ -510,6 +620,14 @@ impl KeyData {
 }
 
 impl WeightSource for W4A16Source {
+    fn prefetch(&self, keys: &[&str]) {
+        self.prefetch_ranges(keys);
+    }
+
+    fn prefetch_finish(&self) {
+        self.prefetch_join();
+    }
+
     fn take(&self, key: &str) -> Taken<Vec<f32>> {
         let Some(n) = self.elem_len(key)? else { return Ok(None) };
         self.take_range(key, 0, n)
@@ -633,6 +751,15 @@ impl WeightSource for W4A16Source {
                 Ok(Some(()))
             }
             Resolved::View(e) => {
+                // **I32 packed → U32 want**(2026-10-24):W4A16 的
+                // `packed_raw` 原样字节上卡（GPU CtRepack 输入），必须
+                // 零拷贝直拷本 rank 行段；旧路先 `linear_bytes_for` 把整键
+                // `to_vec` 再切片，草稿双 rank 半量反而多一次全键拷贝。
+                if e.dtype == safetensors::Dtype::I32 && dtype == Dtype::U32 {
+                    let s = e.start + offset_elems * 4;
+                    copy_par(&self.maps[e.map_ix][s..s + need], &mut dst[..need]);
+                    return Ok(Some(()));
+                }
                 // F16 want(存量主路径)/ BF16 want(E5-DF3 同日十四;DFlash2
                 // 草稿 BF16 化 —— passthrough 权重原生 BF16,直拷零转换,
                 // sglang .to(bf16) 同位)
@@ -673,7 +800,8 @@ impl WeightSource for W4A16Source {
                     }
                     _ => return Ok(None),
                 }
-                self.maps[e.map_ix].dontneed(s, len * src_esz);
+                // 同上：保留页缓存供另一 rank / 后续读取。
+                // self.maps[e.map_ix].dontneed(s, len * src_esz);
                 Ok(Some(()))
             }
             Resolved::Bytes(b, reg) => {

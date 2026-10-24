@@ -20,7 +20,7 @@
 > `本地实测档` (local measurement archive) · `本地原始数据` (local raw data) ·
 > `/path/to/models/…` (weights you supply) · `<worktree>/…` (git worktree).
 
-Progress: **0 / 83** reviewed.
+Progress: **0 / 84** reviewed.
 
 Body documents are written in **Chinese**; this index and all meta documents
 (`README`, `CONTRIBUTING`, `SECURITY`, `THIRD_PARTY.md`, `NOTICE`) are in **English**.
@@ -77,6 +77,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/models/interpreter-tap.md`](devlog/models/interpreter-tap.md) — Interpreter node-level tap
 - ⬜ [`devlog/models/loader-interpreter.md`](devlog/models/loader-interpreter.md) — Loader as model interpreter
 - ⬜ [`devlog/models/load-speedup.md`](devlog/models/load-speedup.md) — Load-time speedup verdict round (27B AWQ)
+- ⬜ [`devlog/models/load-speedup-tp2-handoff-20261024.md`](devlog/models/load-speedup-tp2-handoff-20261024.md) — Load-speed handoff: TP2 parallel load + per-device vram account (P0 done)
 - ⬜ [`devlog/models/gguf-format.md`](devlog/models/gguf-format.md) — GGUF format support
 - ⬜ [`devlog/models/new-format-checklist.md`](devlog/models/new-format-checklist.md) — New-format onboarding checklist
 - ⬜ [`devlog/models/vision-tower.md`](devlog/models/vision-tower.md) — Vision tower integration + CPU parity harness

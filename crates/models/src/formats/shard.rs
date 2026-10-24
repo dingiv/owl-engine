@@ -359,10 +359,19 @@ impl<S: WeightSource + ?Sized> WeightSource for ShardedSource<'_, S> {
         let Some(seq) = self.map(key, offset_elems, len) else {
             return Ok(None);
         };
-        // **k 切键专治**(见 `full` 字段注):整键读一次 ⇒ 段数再多也只调内层源一次
+        // **只为"多段"键做全键缓存**(见 `full` 字段注)。
+        //
+        // 2026-10-24 修正:旧判据只看 `src_elems*esz <= 256MB` ⇒ 普通行切
+        // (`seq.len() == 1`) 也先 `vec![0; 整键]` 再拷一次,双 rank 每键
+        // 多出 20-30ms（单 rank 空 spans 走直通，没有这笔）。现按**段数**
+        // 分流:1~8 段直接逐段写 dst（与单 rank 同路）；只有 k 切/多段键
+        // 才整键缓存一次，避免 5120 次内层物化。
         let ent = &self.spans[key];
-        if ent.src_elems * esz <= FULL_CACHE_CAP {
-            self.full_bytes(key, dtype, ent.src_elems)?;
+        let needs_full_cache = ent.src_elems * esz <= FULL_CACHE_CAP && seq.len() > 8;
+        if needs_full_cache {
+            if self.full_bytes(key, dtype, ent.src_elems)?.is_none() {
+                return Ok(None);
+            }
             let g = self
                 .full
                 .lock()

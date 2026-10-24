@@ -543,8 +543,9 @@ fn engine_cfg(config: &ServerConfig, ordinal: usize) -> owl_engine::EngineConfig
 }
 
 /// 单 rank 分片装载(**单卡档 `world = 1` = 恒等分片**,与旧路径字节同源)。
-/// TP 档由 [`actor_main`] 逐 rank 调用(rank 序 = `devices` 序)—— 确定性分片
-/// 协议:两侧零协调,各自按同一张规则表切(切分见 `crates/engine/src/loader.rs`)。
+/// TP 档由 [`actor_main`] 在两条 OS 线程上**并行**调用(rank 序 = `devices`
+/// 序)—— 确定性分片协议:两侧零协调,各自按同一张规则表切(切分见
+/// `crates/engine/src/loader.rs`)。
 async fn load_shard(
     config: &ServerConfig,
     engine: &mut owl_engine::Engine<owl_cuda::GpuClient>,
@@ -621,9 +622,53 @@ async fn actor_main(
             // `RunningEngine<owl_engine::GpuFace>`。
             2 => {
                 let ord = config.devices.ordinals();
-                let model0 = load_shard(&config, &mut engine, 0, 2).await?;
+                // **双 rank 并行装载**(2026-10-24):两 rank 的切片源互不相交,
+                // 各自有独立 CUDA context/actor;串行装载曾让冷载 = rank0 + rank1
+                // (实测 19.6s + 9.2s)。先建好 rank1 引擎壳(账本在装载前合流),
+                // 再在两条 OS 线程上各自跑 load_shard —— 每个线程一个 current_thread
+                // runtime(GPU actor 在独立线程,不会被 actor_main 阻塞拖死)。
                 let mut engine1 = engine_of_tp(&config, ord[1], &engine, 1)?;
-                let model1 = load_shard(&config, &mut engine1, 1, 2).await?;
+                let (join0, join1) = std::thread::scope(|scope| {
+                    let h0 = scope.spawn(|| {
+                        let t = std::time::Instant::now();
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| owl_iface::contract::ModelError::Msg(format!(
+                                "TP rank0 loader runtime: {e}"
+                            )))?;
+                        let out = rt.block_on(load_shard(&config, &mut engine, 0, 2));
+                        owl_shared::log_info!(
+                            "boot",
+                            "TP2 rank0 装载 {:.2}s{}",
+                            t.elapsed().as_secs_f32(),
+                            if out.is_ok() { "" } else { "(失败)" }
+                        );
+                        out
+                    });
+                    let h1 = scope.spawn(|| {
+                        let t = std::time::Instant::now();
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| owl_iface::contract::ModelError::Msg(format!(
+                                "TP rank1 loader runtime: {e}"
+                            )))?;
+                        let out = rt.block_on(load_shard(&config, &mut engine1, 1, 2));
+                        owl_shared::log_info!(
+                            "boot",
+                            "TP2 rank1 装载 {:.2}s{}",
+                            t.elapsed().as_secs_f32(),
+                            if out.is_ok() { "" } else { "(失败)" }
+                        );
+                        out
+                    });
+                    (h0.join(), h1.join())
+                });
+                let model0 = join0
+                    .map_err(|_| owl_iface::contract::ModelError::Msg("TP rank0 装载线程 panic".into()))??;
+                let model1 = join1
+                    .map_err(|_| owl_iface::contract::ModelError::Msg("TP rank1 装载线程 panic".into()))??;
                 vram_phase("server:tp-weights", engine.mem_info().await, &mut phase_used);
                 owl_shared::log_info!(
                     "boot",

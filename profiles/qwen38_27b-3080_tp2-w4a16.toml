@@ -69,6 +69,8 @@ lookup = true
 tp_draft = true
 
 [pool]
+# 页对齐 pad 词（main 87eba470 起为必填；"。" 恰 1 token）
+image_evict_pad = "。"
 kv_fp8 = true
 gdn_slots = 1
 snap_max = 1

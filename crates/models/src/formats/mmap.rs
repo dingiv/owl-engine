@@ -14,6 +14,8 @@ use std::path::Path;
 pub(crate) struct Mmap {
     ptr: std::ptr::NonNull<u8>,
     len: usize,
+    /// 保留 fd 供**后台预取**用 `pread` 填充页缓存（mmap 本身不持 fd）。
+    file: std::fs::File,
 }
 
 impl Mmap {
@@ -51,11 +53,32 @@ impl Mmap {
         Ok(Self {
             ptr: unsafe { std::ptr::NonNull::new_unchecked(ptr.cast::<u8>()) },
             len,
+            file,
         })
     }
 }
 
 impl Mmap {
+    /// **后台预取一段区间**（`pread` 填充页缓存；与 `madvise(WILLNEED)`
+    /// 不同，`pread` 的可控队列深度更稳定，冷盘实测 ~2.1GB/s/流）。
+    /// 只读、可重入；错误由调用方记账，不改变映射内容。
+    pub fn readahead(&self, start: usize, len: usize) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        const CHUNK: usize = 4 << 20;
+        let mut buf = vec![0u8; CHUNK.min(len.max(1))];
+        let mut off = start;
+        let end = start.saturating_add(len).min(self.len);
+        while off < end {
+            let n = (end - off).min(buf.len());
+            let got = self.file.read_at(&mut buf[..n], off as u64)?;
+            if got == 0 {
+                break;
+            }
+            off += got;
+        }
+        Ok(())
+    }
+
     /// 归还已消费区间映射页(页对齐向下/向上取整;只读私有映射,
     /// DONTNEED 后再访问会从文件重新缺页,数据无恙)
     pub fn dontneed(&self, start: usize, len: usize) {

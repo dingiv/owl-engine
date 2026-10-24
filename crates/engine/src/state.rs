@@ -15,7 +15,7 @@
 //! dtype 定盘(F5 整模切换):KV cache 随 spec.dtype;GDN state 恒 f32
 //! (三方先例 + 旧世界律);slots/kv_lens/bt f32(契约 5)。
 
-use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError};
+use owl_iface::contract::{Bytes, DeviceClient, Dtype, ModelError, VramSnapshot};
 use owl_store::SnapKey;
 use owl_models::interpreters::eval_ops;
 use owl_models::module::kv_paged_policy;
@@ -170,14 +170,17 @@ pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     pub fi_quant: Option<owl_models::env::KvQuant>,
     /// 草稿池量化
     pub draft_kv: owl_models::env::KvQuant,
-    /// **本引擎的 rank 数**(1 = 单卡;2 = TP2)—— 治理器按卡摊 `live`
-    /// (`vram::LIVE` 是进程级全局计数器,TP2 下含两卡之和;2026-10-19 定谳)
+    /// **本引擎的 rank 数**(1 = 单卡;2 = TP2)—— 仅诊断/旧算式用;
+    /// 2026-10-24 起池容量读 `vram` 快照(本卡),不再摊全局 LIVE。
     pub tp_ranks: usize,
     /// **池分配前的每卡 live 基线**(TP2:两 rank 共用同一快照)。
-    /// `None` = 旧路/测试,回退 `vram::live_bytes()/tp_ranks`。
-    /// 为什么必须固定:池是逐 rank 顺序分配的;rank1 计算时 rank0 池已进
-    /// `live`,全局 `/ranks` 会把 rank0 池的一半算到 rank1 头上,cap 被压低。
+    /// `None` = 旧路/测试,回退本设备快照的 live。
+    /// 为什么必须固定:池是逐 rank 分配的;rank1 计算时 rank0 池已进
+    /// 本 rank 的账(per-device)不会串,但测试/旧路仍留 fallback。
     pub live_baseline_per_card: Option<u64>,
+    /// **本 rank 的显存快照**(total/free/live;2026-10-24 per-device 账)。
+    /// 池容量决策只读它,不再读 `owl_shared::vram` 全局三元组。
+    pub vram: VramSnapshot,
     /// **草稿池几何**(层数, hkv, hd;**分片后**;P2.1-b)。`None` = 非 DFlash2 档
     /// ⇒ 池不分配;`Some` ⇒ 用它替掉写死的 `DRAFT_POOL`(双 rank 下 hkv 减半)
     pub draft_geom: Option<(usize, usize, usize)>,
@@ -2029,21 +2032,17 @@ impl<'a> AllocCtx<'a> {
     fn pool_cap(plan: &PoolPlan, per_tok: &PerTokBytes, fixed_after: &FixedAfter) -> Option<usize> {
         let per_tok_bytes = per_tok.total();
         let vram_reserve = plan.vram_reserve_mb << 20;
-        let vram_total = owl_shared::vram::total_bytes();
+        let vram_total = plan.vram.total;
         // `vram_target = 0` = 治理禁用;**`1.0` 是合法档**(吃满总显存,`reserve`
         // 仍是唯一缓冲)—— 旧条件写 `target < 1.0` 把 1.0 当"禁用" ⇒ 硬预算
         // 静默失效(2026-10-21 实测:`target=1.0` 的档 boot 里根本没有 cap 行,
         // 池怎么设都不校验,直到驱动 OOM)。
         if plan.vram_target > 0.0 && vram_total > 0 {
-            // ★ **TP 档的账要按卡算**(2026-10-19 定谳):`owl_shared::vram::LIVE` 是
-            // **进程级全局计数器** —— TP2 下**两张卡的分配都加进同一个数**,
-            // 而 `total`/`per_tok` 是**单卡**口径 ⇒ 拿"两卡之和"比"单卡总量"
-            // 会把预算算成负数(实测 `budget = -6.58G` ⇒ `cap = 0` ⇒ 池被压到 0,
-            // KV 容量白白丢掉)。修:live 按 rank 数摊回单卡。
-            // (两 rank 的权重/草稿/池是对称的 ⇒ 摊分是正确口径)
+            // ★ **按卡账**(2026-10-24):本 rank 的 total/free/live 全部来自
+            // `PoolPlan.vram`(设备 account 快照),不再有进程级 LIVE 摊分。
             let live_per_card = plan
                 .live_baseline_per_card
-                .unwrap_or_else(|| owl_shared::vram::live_bytes() / plan.tp_ranks.max(1) as u64);
+                .unwrap_or(plan.vram.live);
             // **预算基 = 驱动 free**(2026-10-22):旧式
             // `total×target − live − fixed − reserve` 的 `live` 是**引擎账**,
             // 不含 CUDA ctx / FI workspace / allocator 惰性 reserved / 碎片
@@ -2051,7 +2050,7 @@ impl<'a> AllocCtx<'a> {
             // `free` 是驱动实测(每卡;boot 已落账),它自动把这些未入账项算进去。
             // target 仍作**上限**(防别的进程刚释放时把池吃满):
             //   target_cap = free − total×(1−target)
-            let free = owl_shared::vram::free_bytes();
+            let free = plan.vram.free;
             let target_cap = free as i64
                 - ((vram_total as f64 * (1.0 - plan.vram_target)) as i64);
             // 无 free 落账(测试/旧路)⇒ 回退旧口径
@@ -2071,7 +2070,7 @@ impl<'a> AllocCtx<'a> {
             eprintln!(
                 "[vram-gov] total={:.2}G free={:.2}G target={:.0}% reserve={}M fixed_after={:.2}G[{}] live={:.2}G(引擎账;仅参考;ranks={}) per_tok={}B[{}] ⇒ budget={:.2}G cap={} tok(manual={})",
                 vram_total as f64 / 1073741824.0,
-                owl_shared::vram::free_bytes() as f64 / 1073741824.0,
+                free as f64 / 1073741824.0,
                 plan.vram_target * 100.0,
                 vram_reserve >> 20,
                 fixed_after.total() as f64 / 1073741824.0,
