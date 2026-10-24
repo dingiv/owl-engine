@@ -59,6 +59,10 @@ const MARK_THINK_OPEN: &str = "<think>";
 const MARK_THINK_CLOSE: &str = "</think>";
 const MARK_TOOL_OPEN: &str = "<tool_call>";
 const MARK_TOOL_CLOSE: &str = "</tool_call>";
+/// 无外层 `<tool_call>` 的裸函数块（GGUF 上游模板实测会漏壳；函数名/参数
+/// 形态与 XML 工具块完全一致）。只在文本/思考态遇到 `<function=` 时启用。
+const MARK_FUNCTION_OPEN: &str = "<function=";
+const MARK_FUNCTION_CLOSE: &str = "</function>";
 const MARK_THINK_OPEN_LONG: &str = "<thinking>";
 const MARK_THINK_CLOSE_LONG: &str = "</thinking>";
 // 第二组别名:模型偶尔混用 `thought`(实测 2026-10-14 出现过一次)。
@@ -67,11 +71,13 @@ const MARK_THINK_OPEN_THOUGHT: &str = "<thought>";
 const MARK_THINK_CLOSE_THOUGHT: &str = "</thought>";
 
 /// Text/Think 态的全部识别标记(主 + 别名;游标标记也**吞掉不泄漏**,见 `next_state`)
-const MARKS: [&str; 8] = [
+const MARKS: [&str; 10] = [
     MARK_THINK_OPEN,
     MARK_THINK_CLOSE,
     MARK_TOOL_OPEN,
     MARK_TOOL_CLOSE,
+    MARK_FUNCTION_OPEN,
+    MARK_FUNCTION_CLOSE,
     MARK_THINK_OPEN_LONG,
     MARK_THINK_CLOSE_LONG,
     MARK_THINK_OPEN_THOUGHT,
@@ -90,6 +96,10 @@ fn canon(m: &str) -> &'static str {
         MARK_THINK_CLOSE
     } else if m == MARK_TOOL_OPEN {
         MARK_TOOL_OPEN
+    } else if m == MARK_FUNCTION_OPEN {
+        MARK_FUNCTION_OPEN
+    } else if m == MARK_FUNCTION_CLOSE {
+        MARK_FUNCTION_CLOSE
     } else {
         MARK_TOOL_CLOSE
     }
@@ -145,6 +155,7 @@ fn state_name(s: State) -> &'static str {
         State::Text => "text",
         State::Think => "think",
         State::InTool => "tool",
+        State::InBareTool => "bare_tool",
     }
 }
 
@@ -153,6 +164,8 @@ enum State {
     Text,
     Think,
     InTool,
+    /// 裸 `<function=...>...</function>`（无 `<tool_call>` 外壳）
+    InBareTool,
 }
 
 /// 请求侧工具 schema(仅取 `name → 属性名 → JSON 类型`,用于 xml 参数类型回填)
@@ -283,7 +296,13 @@ impl ChannelSplitter {
     fn marks(&self) -> Vec<&'static str> {
         MARKS
             .iter()
-            .filter(|m| self.tool_on || (**m != MARK_TOOL_OPEN && **m != MARK_TOOL_CLOSE))
+            .filter(|m| {
+                self.tool_on
+                    || (**m != MARK_TOOL_OPEN
+                        && **m != MARK_TOOL_CLOSE
+                        && **m != MARK_FUNCTION_OPEN
+                        && **m != MARK_FUNCTION_CLOSE)
+            })
             .copied()
             .collect()
     }
@@ -336,6 +355,8 @@ impl ChannelSplitter {
         let to = match (self.state, canon(m)) {
             (State::Text, MARK_THINK_OPEN) => State::Think,
             (State::Text, MARK_TOOL_OPEN) => State::InTool,
+            (State::Text, MARK_FUNCTION_OPEN) => State::InBareTool,
+            (State::Think, MARK_FUNCTION_OPEN) => State::InBareTool,
             (State::Think, MARK_THINK_CLOSE) => {
                 // 模板 `\n</think>\n\n{content}` 里的 `\n\n` 归模板(单源):
                 // 后续至多两个 `\n` 从流里吞掉(不足则按实际吞尽,见 `drain`)
@@ -374,14 +395,16 @@ impl ChannelSplitter {
     pub fn finish(&mut self) -> Vec<Item> {
         let mut out = Vec::new();
         match self.state {
-            State::InTool => {
+            State::InTool | State::InBareTool => {
                 let raw = std::mem::take(&mut self.buf);
-                self.trace_event(StructEvent::Malformed {
-                    kind: "tool_call_unclosed",
-                    bytes: raw.len(),
-                });
+                let kind = if self.state == State::InBareTool {
+                    "tool_call_bare_unclosed"
+                } else {
+                    "tool_call_unclosed"
+                };
+                self.trace_event(StructEvent::Malformed { kind, bytes: raw.len() });
                 self.malformed += 1;
-                out.push(Item::Malformed { kind: "tool_call_unclosed", raw });
+                out.push(Item::Malformed { kind, raw });
                 self.state = State::Text;
             }
             State::Text | State::Think => {
@@ -468,6 +491,27 @@ impl ChannelSplitter {
                     }
                     break; // 工具块内部内容不外发;等闭合标记
                 }
+                State::InBareTool => {
+                    if let Some(p) = self.buf.find(MARK_FUNCTION_CLOSE) {
+                        let body = self.buf[..p].to_string();
+                        self.buf.drain(..p + MARK_FUNCTION_CLOSE.len());
+                        out.push(self.build_tool_call(&body));
+                        self.state = State::Text;
+                        continue;
+                    }
+                    if self.buf.len() > MAX_TOOL_BYTES {
+                        let raw = std::mem::take(&mut self.buf);
+                        self.trace_event(StructEvent::Malformed {
+                            kind: "tool_call_bare_overflow",
+                            bytes: raw.len(),
+                        });
+                        self.malformed += 1;
+                        out.push(Item::Malformed { kind: "tool_call_bare_overflow", raw });
+                        self.state = State::Text;
+                        continue;
+                    }
+                    break; // 裸工具块内部内容不外发;等 </function>
+                }
                 State::Text | State::Think => {
                     // 找**最早**出现的标记(同位置取更长者,防前缀重叠)
                     let marks = self.marks();
@@ -491,7 +535,10 @@ impl ChannelSplitter {
                                     text: self.buf[..p].to_string(),
                                 });
                             }
-                            self.buf.drain(..p + m.len());
+                            // 裸 `<function=` 的标记本体必须留在 buf 里：
+                            // `parse_tool_body` 以它定位名字；普通标记照常剥掉。
+                            let keep_marker = canon(m) == MARK_FUNCTION_OPEN;
+                            self.buf.drain(..if keep_marker { p } else { p + m.len() });
                             self.state = self.next_state(m);
                             continue;
                         }
@@ -686,6 +733,33 @@ mod tests {
         assert!(items
             .iter()
             .any(|i| matches!(i, Item::ToolCall { name, .. } if name == "bash")));
+    }
+
+    /// GGUF 上游模板实测会漏 `<tool_call>` 外壳：裸 `<function=...>` 块
+    /// 也必须按工具调用解析（函数名/参数形态与 XML 外壳内完全一致）。
+    #[test]
+    fn bare_function_block_without_tool_call_wrapper() {
+        let src = "\n<function=bash>\n<parameter=command>\npwd\n</parameter>\n</function>\n";
+        let mut s = ChannelSplitter::new(false, tools());
+        let mut items = Vec::new();
+        for ch in src.chars() {
+            let mut b = [0u8; 4];
+            items.extend(s.push(ch.encode_utf8(&mut b)));
+        }
+        items.extend(s.finish());
+        let calls: Vec<(usize, &str, &str)> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::ToolCall { index, name, arguments } => {
+                    Some((*index, name.as_str(), arguments.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, vec![(0, "bash", r#"{"command":"pwd"}"#)]);
+        assert_eq!(s.tool_calls(), 1);
+        assert_eq!(s.malformed(), 0);
+        assert!(!items.iter().any(|i| matches!(i, Item::Malformed { .. })));
     }
 
     /// 多工具块 + I5 序号连续

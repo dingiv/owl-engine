@@ -263,6 +263,11 @@ ls -la
 或 json 格式(若我们传 `tool_call_format="json"`):
 `<tool_call>\n{"name":"bash","arguments":{"command":"ls -la"}}\n</tool_call>`
 
+> **GGUF 裸函数块(2026-10-24)**:GGUF 上游模板实测会漏 `<tool_call>`
+> 外壳，只吐 `<function=bash>…</function>`。解析器现把裸块也认作一次
+> 工具调用（结构轨迹 `text→bare_tool`）；`parse_tool_calls=false` 时
+> 仍按普通文本放行。
+
 **响应面 delta 时序**(`index` 必须每帧带,`id` 首帧带即可 —— pi 按 `index` 归并):
 
 ```text
