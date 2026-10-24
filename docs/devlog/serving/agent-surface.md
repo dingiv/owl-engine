@@ -236,6 +236,12 @@
 字典 `.items()`(✅)、`ns.attr = v`(✅)、`~` 拼接 / `is defined/is mapping/is iterable/is string`(✅)。
 `chat_tpl.rs` 只保留 owl 的模板来源/agent 缺省变量接口，不再自带 `py_json`/`py_float`。
 
+- **tokenizer 特殊 token(2026-10-24)**:`tokenizer_config.json` 的
+  `bos_token`/`eos_token`/`pad_token`/`unk_token` 由 `hf-chat-template`
+  的 `TokenizerConfig` 视图读取，按 `special tokens → agent defaults →
+  request kwargs` 顺序注入；GGUF 单文件路径没有该配置 ⇒ 空。
+  配置文件存在但解析失败 = 拒启（不静默丢配置事实）。
+
 ### 3.3 工具调用 wire 形状(响应面)
 
 生成文本形态(模板指令产出,**xml 为默认格式**):
