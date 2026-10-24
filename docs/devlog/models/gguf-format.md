@@ -826,7 +826,7 @@ llama.cpp 实测 argmax,top-1 领先次高 ≥ 2.5 nat ⇒ 不是 near-tie):
 | `ffn_down` | Q4_K(256) | 行并行 ⇒ 内维切 | 内维 = **17408**(inter)/256 = 68 块 ⇒ /2 = **34 ✓**(W-1 实测;此处原写 5120 是笔误) |
 | `attn_output` | Q6_K(256) | 同上 | 6144/256 = 24 ⇒ /2 = **12 ✓** |
 | `ffn_gate/up` | Q4_K | 列并行 ⇒ 外维切 | 行是整块链 ✓ |
-| `attn_q/k/v`、`attn_qkv`、`attn_gate` | Q8_0(32) | 外维切(`attn_q` = q ⊕ gate 两段;`attn_qkv` = q ⊕ k ⊕ v 三段) | ✓ |
+| `attn_q/k/v`、`attn_qkv`、`attn_gate` | Q8_0(32) | 外维切(`attn_q` = per-head `[q_h, gate_h]` 整行;`attn_qkv` = q ⊕ k ⊕ v 三段) | ✓ |
 | `ssm_alpha/beta` | Q8_0 | 按头切(外维 = nv=48 ⇒ /2 = 24) | ✓ |
 | `ssm_out` | **Q8_0** | 行并行 ⇒ 内维切,且必须**按 v-head 整块聚合** | `hv=128 % 32 = 0` ⇒ 每头 4 块 ⇒ /2 = 24 头 = 96 块 ✓ |
 | F32 小件(norm/dt/A_log/conv) | F32 | Replicate / PerHead | ✓ |
@@ -863,8 +863,9 @@ grouped 激活,**不需要 A2 表**(零运行期成本);
 ### 15.2 一条贯穿全部角色的**不变式**(测试与实现的锚)
 
 > **每一 rank 装载后的张量 == 全量逆变换(grouped 序)张量的连续块**:
-> 行 = grouped 行窗口,列 = grouped 原子窗口;分段件(`attn_qkv`/`attn_q`/
-> `ssm_conv1d`)是"每段各取一窗再拼接"。
+> 行 = grouped 行窗口,列 = grouped 原子窗口;分段件(`attn_qkv`/
+> `ssm_conv1d`)是"每段各取一窗再拼接";`attn_q` 是 per-head `[q_h, gate_h]`
+> 交错，按整行窗口切（2026-10-24 定谳）。
 
 推论(★ 用户裁决的落地):**TP 档不需要 A2 表** —— 每 rank 的激活本来就是
 grouped 序的连续段 ⇒ `SourceFacts::GGUF_TP.vhead_tiled_columns = false`,
@@ -876,8 +877,8 @@ grouped 序的连续段 ⇒ `SourceFacts::GGUF_TP.vhead_tiled_columns = false`,
 
 | 角色 | 键 | 切法 |
 |---|---|---|
-| `Out` | `ffn_gate`/`ffn_up`/`attn_k`/`attn_v` | 行窗口(外维) |
-| `Segs` | `attn_q`(q⊕gate)、`attn_qkv`(q⊕k⊕v)、`ssm_conv1d` | 每段各取行窗口(V 段 grouped) |
+| `Out` | `ffn_gate`/`ffn_up`/`attn_k`/`attn_v`/`attn_q` | 行窗口(外维；`attn_q` 每 rank 完整 q/gate 头对) |
+| `Segs` | `attn_qkv`(q⊕k⊕v)、`ssm_conv1d` | 每段各取行窗口(V 段 grouped) |
 | `OutHead` | `attn_gate`/`ssm_alpha`/`ssm_beta`/`ssm_a`/`ssm_dt.bias` | v-head grouped 行窗口 |
 | `In` | `ffn_down`/`attn_output` | 块对齐列窗口 |
 | `InHead` | `ssm_out` | 逐头列段(v-head grouped) |
@@ -888,7 +889,7 @@ grouped 序的连续段 ⇒ `SourceFacts::GGUF_TP.vhead_tiled_columns = false`,
 K-quant 256 > `hv=128`,正是这条 —— 实测 4B 档被**如实拒**,不静默)。
 
 `GgufPlan` 也随档分叉:分片档的层声明是**分片维**,形状门按角色把声明维
-**放大 world 倍**再与文件比(`attn_q` 的段长从张量本身反推)。
+**放大 world 倍**再与文件比(`attn_q` 按整行；`attn_qkv` 的段长从张量本身反推)。
 
 ### 15.4 门(全部真机/真文件,零 GPU 的两条先跑)
 
@@ -920,10 +921,11 @@ decode    30.9 tok/s · 首步 logits 预热+捕获共 ~19s
 
 ### 15.6 ★ 一条**既有行为**的定谳:TP2 与单卡的首步 logits 不等价
 
-| 档 | TP2 vs 单卡 max\|Δ\| | cos | top-1 |
-|---|---|---|---|
-| AWQ-27B(`tp_logits_27b`,既有诊断件) | **10.83** | — | 同 |
-| **GGUF 27B Q4_K_M(本刀)** | **6.36**(max\|L\| 17.5) | 0.939 | **同** |
+| 档 | TP2 vs 单卡 max\|Δ\| | mean / p99 | cos | top-1 | 生成段 |
+|---|---|---|---|---|---|
+| AWQ-27B(`tp_logits_27b`,既有诊断件) | **10.83** | — | — | 同 | — |
+| **GGUF 27B Q4_K_M(首步)** | **6.36**(max\|L\| 17.5) | — | 0.939 | **同** | — |
+| **GGUF 27B Q4_K_M(900 词长 ctx)** | **5.76** | **0.53 / 2.36** | **0.978** | **同** | **16/16 同** |
 
 **判读**:"TP2 与单卡 logits 不等价"**不是 GGUF 分片的错**(GGUF 的偏差比 AWQ 还小),
 而是引擎既有的 numerics:row-parallel 拆半 ⇒ 归约序变化 + 激活量化在两侧各做一次
@@ -933,6 +935,13 @@ decode    30.9 tok/s · 首步 logits 预热+捕获共 ~19s
 ⇒ 因此 W-1 的判据写成:**argmax 相同 + 两 rank 逐位相同 + `max|Δ|` 与 AWQ 对照同量级**
 (而不是"与单卡逐位/逐 token 相同"——那在 TP2 形态下不成立,量化档尤甚)。
 **这条口径已写进测试注释**,避免后来者把它当回归。
+
+**2026-10-24 长 ctx 复测 + 一处探针修正**:`tp_logits_gguf_long` 旧实现
+在轮末读 peer logits，而 rank0 存的是首步 logits ⇒ 两个不同 decode step
+相比，必然报“248k 项不同”。现改为在同一个 `Token` 事件里读两侧：
+peer 逐位相同（max|Δ|=0 / cos=1）。TP1↔TP2 长 ctx 实测 max 5.76、
+mean 0.53、p99 2.36、cos 0.978、top-1 与 16/16 生成 token 全同 ⇒ 仍在
+AWQ 既有噪声量级内，诊断门放宽为 `max|Δ| < 12`、`cos > 0.95`。
 
 ### 15.7 与既有设计文档的差异(回写)
 
