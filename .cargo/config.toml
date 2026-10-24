@@ -1,0 +1,6 @@
+# 项目内快捷入口：从 packages/owl 根目录直接起 server。
+#   cargo serve -p profiles/<档>.toml --set server.bind=0.0.0.0:8134
+# 等价于：
+#   cargo run --release -p server -- -p profiles/<档>.toml --set ...
+[alias]
+serve = "run --release -p server --"
