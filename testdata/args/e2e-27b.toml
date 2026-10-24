@@ -9,6 +9,11 @@
 #
 # ⚠️ 路径为本机资产(workspace models/ 下),换机需改。
 
+[server]
+# 必须与 apps/server/tests/e2e.rs 的 PORT 同源：否则继承 full.toml 的 8137，
+# 会被生产/调试 server 占用而误报 AddrInUse。
+bind = "127.0.0.1:8135"
+
 [model]
 path = "../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
 name = "qwen3.8-27b"
