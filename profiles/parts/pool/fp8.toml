@@ -1,0 +1,6 @@
+# 池组件：fp8 KV + 单会话 GDN。
+[pool]
+kv_fp8 = true
+gdn_slots = 1
+vram_target = 0.99
+vram_reserve_mb = 256

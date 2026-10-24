@@ -1,0 +1,7 @@
+# 内核组件：FI 单图快档（plan 按 max_seq 烘死）。
+[kernel]
+decode_arm = "fi"
+verify_arm = "fi"
+fi_plan_bake = true
+fi_plan_restore = false
+fi_cuda_graph = true

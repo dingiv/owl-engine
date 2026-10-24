@@ -1,88 +1,25 @@
-# owl 预设档 `qwen38_27b-3080_tp2-w4a16` —— 2×3080 27B + 视觉 + DFlash2 d7 / **262k**
-#
-# 全量字段继承自 `full.toml`;本文件只写差异。卡位 = 名字子串(两张 3080);
-# 需要钉到具体卡时改成 BDF / UUID(禁 CUDA 序号)。
-#
-# **decode 快档(2026-10-22 真机 A/B 转正)**:FI 单图(decode/verify=fi + bake plan)
-# + `tp_draft=true` 放行双 rank 草稿。std 五点三轮(math,2×3080):
-#   v2 裸 decode 46.2 → FI+DFlash2 d7 **138.1 t/s**(262k std;p50 138.1;范围 82.7–202.8,
-#   AL 逐 prompt 波动);184k 同量级(139.8/1619.3)
-#   prefill 1646.9 → 1616.8(−1.8%,噪声带内);裸 FI(无 spec)46.2 → 56.6(+21.7%)
-# **262k 定档(2026-10-22,草稿池 ring)**:草稿 config 是 sliding_window=2048,
-#   草稿池只留 2080 slots(20 MiB,原 1800 MiB)⇒ per_tok 26624→16384,
-#   `[ctx-max]` 442k;262k 实测 512/2048 decode 165.7/100.7、prefill 1585;
-#   std 十五点 decode 138.1 / prefill 1616.8 / TTFT@8192 5068ms(与 184k 持平)。
-# **head 精度(2026-10-22 用户裁决)**:默认 = `rtn-int8-row`(int4 头太小,
-#   质量优先)。**W8A16 多 token 快路已转正**(2026-10-22 晚):spec 的
-#   m=7/8 行不再每 token 重读权重,权重只读一遍。
-#   **2026-10-22 深夜再上 f16 Tensor Core**(Marlin 同款: HBM 读 int8,
-#   shared 仍 int8,寄存器 `int8→half`,激活 f16):spec 同门 round
-#   **36.65→35.28ms**、propose **6.26→5.97ms**、verify **28.62→27.45ms**;
-#   f16 vs i8 质量门 **0.9896**。32K TC 未单独复测(旧 39.0 是 FMA 口径)。
-#   速度档仍可显式回退 `--set model.head_quant=rtn-int4-g32`。
-#   `tp_vocab_split` 仍不要开(半表草稿 host 合并的负收益)。
-extends = ["full.toml"]
+# 两张 3080 20G / 27B AWQ + 视觉 + DFlash2 d7 / 262k（主生产档）。
+extends = [
+  "full.toml",
+  "parts/model/27b-awq.toml",
+  "parts/feature/vision.toml",
+  "parts/feature/dflash2-27b.toml",
+  "parts/hardware/3080-tp2.toml",
+  "parts/kernel/fi-graph.toml",
+  "parts/pool/fp8.toml",
+]
 
-[model]
-name = "qwen3.8-27b"
-path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-format = "awq"
-quant = "w4a16"
-head_quant = "rtn-int8-row"
-vision = true
-
-[parallel]
-mode = "tensor"
-tp_ar_f8 = true
-# **AR 一核融合(2026-10-23 转正)**:decode 小载荷(<256KiB)走
-# `owl_comm_ar_fused_{f16,bf16}`;大载荷仍按 `tp_ar_f8` 走两核 f8 腿
-# (融合核只非 fp8)。K7 1k 受控 A/B:round −0.5~−0.6%、verify −0.7~−0.9%、
-# token 逐位相同;nsys 核时 AR 198.0→173.3ms(−12.5%)。
-# 回退 = 删本行或 `--set parallel.tp_ar_fused=false`。
-tp_ar_fused = true
-# **AR-2 barrier-only(2026-10-23 转正)**:verify/propose 的 80KB 小包走
-# 单 block、v1 produced/consumed 相对游标 + release/acquire;去掉尾部
-# rendezvous/wait_done/blocks_done 与全线程 system fence。
-# K7 1k(无 push): round 34.586→**33.316ms(−3.7%)**、verify 27.002→**25.975ms(−3.8%)**;
-# f8 档 34.392→**32.968ms(−4.1%)**、verify 26.978→**25.764ms(−4.5%)**;
-# **本档 push=true 同参**: round 33.907→**33.708ms(−0.6%)**、verify
-# 26.532→**26.250ms(−1.1%)**; push 与 AR2 收益部分重叠,token 仍逐位相同。
-# 大包/prefill 仍走 fused/v1(f8 腿不变)。
-# 回退 = 删本行或 `--set parallel.tp_ar2=false`。
-tp_ar2 = true
-tp_vocab_split = true
-device = ["3080", "3080"]
+[server]
+bind = "127.0.0.1:8137"
 
 [runtime]
 max_seq = 262144
 max_concurrency = 1
 
 [spec]
-depth = 7
-draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
-# **DFlash2 lookup(2026-10-22 实测转正)**:copy 任务 AL 5.91→6.64–7.00
-# (+12–18%;两次 boot 的最后一块边界差一轮),decode ~238→273–286 t/s;
-# 32k 固定尾部 prose AL 1.69→1.87(+10.6%),轮时 33.79→33.92ms(噪声);
-# greedy 恒等门(d7,lookup on)已过。回退 = `--set spec.lookup=false`。
-lookup = true
-# TP2 双 rank 草稿放行(缺它 = `tp.rs` 装配期响亮拒;2026-10-22 实测本档此前一直缺)
+# TP2 草稿族放行（缺它 = tp.rs 装配期响亮拒）
 tp_draft = true
 
 [pool]
-# 页对齐 pad 词（main 87eba470 起为必填；"。" 恰 1 token）
-image_evict_pad = "。"
-kv_fp8 = true
-gdn_slots = 1
 snap_max = 1
 prefix_cache = false
-vram_target = 0.99
-vram_reserve_mb = 256
-
-[kernel]
-# **FI 单图快档**(2026-10-22):plan 上界 = runtime.max_seq 烘死;表由 host 窗外刷。
-# 裸 decode +21.7%,+ DFlash2 d7 后 std decode 139.8(v2 46.2)。
-decode_arm = "fi"
-verify_arm = "fi"
-fi_plan_bake = true
-fi_plan_restore = false
-fi_cuda_graph = true

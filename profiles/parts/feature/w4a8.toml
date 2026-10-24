@@ -1,0 +1,3 @@
+# 特性组件：W4A8（激活 int8；长 prompt 档）。
+[model]
+quant = "w4a8"

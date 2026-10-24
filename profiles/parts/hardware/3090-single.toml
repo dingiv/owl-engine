@@ -1,0 +1,5 @@
+# 硬件组件：单张 3090 Ti（24G）。
+# 名字子串按列表序去重；禁 CUDA 序号。
+[parallel]
+mode = "single"
+device = ["3090"]

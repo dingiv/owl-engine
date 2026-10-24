@@ -8,7 +8,7 @@
 # **spec m=7/8 质量门: i8 vs a8 0.6962、逐字全等 4/6** ⇒ strict 未过。
 # W8A16 TC 同门 round **35.28ms**、质量 0.9896 ⇒ W8A8 被同速支配。
 # 详见 docs/devlog/perf/tp2-decode-fast.md §10.13/§10.14。
-extends = ["qwen38_27b-3080_tp2-w4a16.toml"]
+extends = ["../qwen38_27b-3080_tp2-w4a16.toml"]
 
 [model]
 head_quant = "rtn-int8-row-a8"

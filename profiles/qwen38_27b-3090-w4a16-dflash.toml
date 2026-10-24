@@ -1,45 +1,25 @@
-# owl 预设档 `qwen38_27b-3090-w4a16-dflash` —— 27B AWQ + DFlash2 d7 单卡(16k;测试/取证用)
-#
-# 全量字段继承自 `full.toml`;本文件只写差异。
-# 校验:`server -p profiles/qwen38_27b-3090-w4a16-dflash.toml --check`
-extends = ["full.toml"]
-
-[model]
-name = "qwen3.8-27b"
-path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-format = "awq"
-quant = "w4a16"
-head_quant = "rtn-int8-row"
+# 单张 3090 Ti / 27B AWQ + DFlash2 d7 / 16k（测试/取证档）。
+extends = [
+  "full.toml",
+  "parts/model/27b-awq.toml",
+  "parts/feature/dflash2-27b.toml",
+  "parts/hardware/3090-single.toml",
+  "parts/kernel/fi-graph.toml",
+  "parts/pool/fp8.toml",
+]
 
 [runtime]
 max_seq = 16384
 max_concurrency = 1
 
-[spec]
-depth = 7
-draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
-
 [pool]
-kv_fp8 = true
-gdn_slots = 1
 snap_max = 4
 prefix_cache = true
-vram_target = 0.99
 vram_reserve_mb = 512
 host_cache_mb = 4096
 snap_host_mb = 3072
-# 消息边界快照（agent 10K 固定 system/tool 前缀）：delim 空 = 模型
-# ChatFormat.im_open；第一条边界必拍，后续每 2048 tok 一条。
+# agent 10K 消息边界（delim 空 = 模型 ChatFormat.im_open）
 snap_msg_boundary = true
 snap_msg_delim = ""
 snap_msg_min_gap = 2048
 snap_msg_min_span = 0
-
-[kernel]
-decode_arm = "fi"
-verify_arm = "fi"
-fi_cuda_graph = true
-fi_plan_restore = false
-
-[parallel]
-device = ["3090"]

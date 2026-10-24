@@ -11,7 +11,7 @@
 #     --log-level info
 # 预检:
 #   ./target/release/server -p profiles/qwen38_27b-3090-w4a16-dflash-longctx.toml --check
-extends = ["qwen38_27b-3090-w4a16-dflash.toml"]
+extends = ["../qwen38_27b-3090-w4a16-dflash.toml"]
 
 [runtime]
 max_seq = 67584

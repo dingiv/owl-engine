@@ -17,7 +17,7 @@
 #
 # 预检：
 #   ./target/release/server -p profiles/qwen38_27b-3090-w4a16-dflash-kvmem.toml --check
-extends = ["qwen38_27b-3090-w4a16-dflash.toml"]
+extends = ["../qwen38_27b-3090-w4a16-dflash.toml"]
 
 [runtime]
 max_seq = 262144

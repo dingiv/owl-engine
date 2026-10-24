@@ -1,0 +1,3 @@
+# 特性组件：视觉塔（HF/AWQ 用检查点内置 model.visual.*）。
+[model]
+vision = true

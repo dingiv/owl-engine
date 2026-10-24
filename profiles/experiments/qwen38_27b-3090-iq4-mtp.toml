@@ -1,5 +1,5 @@
 # owl 档 `qwen38_27b-3090-iq4-mtp` —— 27B AWQ 主干 + 外部 GGUF MTP 头 / 16k。
-extends = ["full.toml"]
+extends = ["../full.toml"]
 
 [server]
 bind = "127.0.0.1:8141"

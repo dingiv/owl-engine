@@ -22,7 +22,7 @@ ss -ltnp 2>/dev/null | grep -q ":$PORT " && { echo "✗ 端口 $PORT 被占"; ex
 
 nsys profile --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none \
   --force-overwrite=true -o "$OUT/nsys" \
-  ./target/release/server -p "$ROOT/profiles/qwen38_27b-3090-w4a16-dflash-longctx.toml" --log-level warn \
+  ./target/release/server -p "$ROOT/profiles/experiments/qwen38_27b-3090-w4a16-dflash-longctx.toml" --log-level warn \
   > "$OUT/server.log" 2>&1 &
 NSYS=$!
 ok=0

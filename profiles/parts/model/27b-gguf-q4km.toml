@@ -1,0 +1,7 @@
+# 模型组件：Qwen3.8-27B GGUF Q4_K_M（文本主干）。
+[model]
+name = "qwen3.8-27b-gguf"
+path = "../models/ggml-org/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf"
+format = "gguf"
+quant = "q4k"
+head_quant = "off"

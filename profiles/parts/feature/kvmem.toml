@@ -1,0 +1,24 @@
+# 特性组件：KVMem 选择层 + 部分驻留 + host 下沉。
+# 具体 workspace / max_seq / 池大小由 leaf 用 --set 或少量键定。
+[pool]
+prefix_cache = true
+snap_max = 0
+host_cache_mb = 10240
+snap_host_mb = 1024
+vram_reserve_mb = 1024
+
+[kvmem]
+select_decode = true
+select_partial = true
+index = true
+pool_overcommit = true
+workspace_per_req = 8192
+verify_view_tokens = 0
+gqa_aggregation = "max"
+query_replay = false
+select_sink = 2
+select_recent = 4
+recall_every = 1
+coverage_probe = false
+analyze_at_ctx = 0
+evict_policy = "lru"

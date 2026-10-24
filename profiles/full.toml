@@ -189,6 +189,9 @@ image_evict = false
 # f16 每轮约 0.4~0.6 ulp,实测 N=4/16/32/64 ⇒ 2.5/7.7/13.7/25.2 ulp(最差元素;
 # 门 `kv_rope_k_shift_drift_under_repeats`)。缺省 32 ≈ 13.7 ulp;0 = 不限。
 image_evict_delta_limit = 32
+# 页对齐 pad 词（必须恰 1 token；空 = 自动 `。`→` `→`\n`）。
+# 27B 实测 `。` 在 8 图/8 次删除下稳定；"\n" 从第 3 张标记图起会吐 `< >`。
+image_evict_pad = "。"
 # 解释器块池预算(字节;0 = 关)
 block_pool_bytes = 0
 # 关活性中途回收(诊断;开会无界常驻)

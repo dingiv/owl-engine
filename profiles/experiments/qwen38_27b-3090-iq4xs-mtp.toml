@@ -19,7 +19,7 @@
 #
 # 降档(f16 池更快,代价 ctx 上限 96k):`--set pool.kv_fp8=false` +
 #   `--set runtime.max_seq=98304`;32k/64k 同理只改 max_seq(池自动)。
-extends = ["full.toml"]
+extends = ["../full.toml"]
 
 [server]
 bind = "127.0.0.1:8146"

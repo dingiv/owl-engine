@@ -1,0 +1,5 @@
+# 特性组件：MTP window（草稿读 sink=64 + 最近 4032 tok；target verify 全上下文）。
+[spec]
+mtp_window = 4032
+mtp_sink = 64
+mtp_window_min_ctx = 12288

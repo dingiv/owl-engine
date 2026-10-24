@@ -1,0 +1,7 @@
+# 内核组件：v2 decode/verify（KVMem / 小池 / 图像删除档）。
+[kernel]
+decode_arm = "v2"
+verify_arm = "v2"
+fi_plan_bake = false
+fi_plan_restore = true
+fi_cuda_graph = false

@@ -1,0 +1,13 @@
+# 特性组件：图像段前缀无感删除（需 f16 KV + prefix_cache）。
+[spec]
+depth = 0
+lookup = false
+
+[pool]
+kv_fp8 = false
+prefix_cache = true
+snap_max = 2
+image_evict = true
+image_evict_delta_limit = 32
+vram_target = 0.9
+vram_reserve_mb = 1024

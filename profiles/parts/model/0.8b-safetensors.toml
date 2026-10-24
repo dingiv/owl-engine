@@ -1,0 +1,7 @@
+# 模型组件：Qwen3.5-0.8B HF safetensors（F16 装载）。
+[model]
+name = "qwen3.5-0.8b"
+path = "../models/Qwen/Qwen3.5-0.8B"
+format = "safetensors"
+quant = "w4a16" # safetensors 档忽略；保留 schema 完整
+head_quant = "off"

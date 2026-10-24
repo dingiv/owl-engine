@@ -1,54 +1,5 @@
-# GGUF × agent 10K 多轮档（2026-10-24）
-#
-# 场景：pi/agent 单会话约 10K token（系统提示 + 工具 + 历史），每轮只追加
-# 一小段用户/工具增量。本档不启用 KVMem 选择层（10K 远小于 32K 池），
-# 只把**前缀复用闭环**配齐：
-#
-#   prefix_cache = true
-#   snap_max = 4          # durable 前缀边界 + 生成段 Transient 分槽
-#   snap_host_mb = 2048   # 槽满时 durable 快照可下沉，跨会话仍可复用
-#   host_cache_mb = 2048  # 跨会话缓存块受压时可下沉
-#   implicit_session = true  # pi 不发 session 键
-#   snap_msg_boundary = true  # 消息边界页点补拍（system/tool 前缀分叉）
-#
-# 判据（同轮入仓的探针）：
-#   python3 apps/server/tests/agent_prefix_10k_probe.py \
-#     --base-url http://127.0.0.1:8137 --model qwen3.8-27b-gguf
-#
-# 定谳：snap_max=0 时 cached_tokens 结构性恒 0；snap_max=1 + snap_host=0
-# 时同会话看似命中、跨会话固定前缀掉 0；本档 snap_max=4 实测同会话/
-# 跨会话 98–100%。详见 devlog/serving/agent-prefix-10k.md。
-extends = ["qwen38_27b-3090-gguf.toml"]
+# 单张 3090 Ti / 27B GGUF Q4_K_M / 32k / pi-agent 10K 前缀复用。
+extends = ["qwen38_27b-3090-gguf.toml", "parts/feature/agent-prefix.toml"]
 
 [server]
 bind = "127.0.0.1:8137"
-parse_tool_calls = true
-
-[runtime]
-max_seq = 32768
-max_concurrency = 1
-implicit_session = true
-
-[pool]
-prefix_cache = true
-snap_max = 4
-snap_host_mb = 2048
-host_cache_mb = 2048
-vram_reserve_mb = 512
-# 消息边界快照：delim 空 = 模型 ChatFormat.im_open（不写死字面量）；
-# 第一条边界无条件保留，后续每 2048 tok 一条；min_span=0 保证边界
-# 落在 chunk 起点附近时也会被切到（否则 system 前缀会被跳过）。
-snap_msg_boundary = true
-snap_msg_delim = ""
-snap_msg_min_gap = 2048
-snap_msg_min_span = 0
-
-[kvmem]
-select_decode = false
-select_partial = false
-index = false
-pool_overcommit = false
-query_replay = false
-
-[spec]
-depth = 0

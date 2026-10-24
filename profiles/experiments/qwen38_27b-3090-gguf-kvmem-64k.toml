@@ -4,7 +4,7 @@
 #   - FP8 KV（32 KiB/token）⇒ 设备池 ~96K；
 #   - workspace_per_req = 65536（2048 页），覆盖 60K 上下文 / 90K 的部分召回。
 #   - 24GB 卡上 f16 KV 的 48K 已贴顶；FP8 才能到论文量级。
-extends = ["qwen38_27b-3090-gguf-kvmem.toml"]
+extends = ["../qwen38_27b-3090-gguf-kvmem.toml"]
 
 [pool]
 kv_fp8 = true

@@ -1,0 +1,5 @@
+# 特性组件：27B DFlash2 d7 草稿（W4A16）。
+[spec]
+depth = 7
+draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+lookup = true

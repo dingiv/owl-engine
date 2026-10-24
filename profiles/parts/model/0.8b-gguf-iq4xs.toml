@@ -1,0 +1,7 @@
+# 模型组件：Qwen3.5-0.8B GGUF IQ4_XS（开发档）。
+[model]
+name = "qwen3.5-0.8b-gguf-iq4"
+path = "../models/unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_XS.gguf"
+format = "gguf"
+quant = "iq4"
+head_quant = "off"

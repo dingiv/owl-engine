@@ -1,0 +1,5 @@
+# 特性组件：27B 检查点自带 MTP 头（静态 d3）。
+[spec]
+depth = 3
+draft = "mtp"
+draft_kv_fp8 = false

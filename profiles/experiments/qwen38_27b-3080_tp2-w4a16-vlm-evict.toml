@@ -11,7 +11,7 @@
 #   - FI plan / cuda graph 关掉(v2 臂):FI 的 plan 按 ctx 烘表,f16 小池档没必要。
 #
 # 端口 8136(与 0.8B 联调档 8135、现役引擎 8080 错开)。
-extends = ["qwen38_27b-3080_tp2-w4a16.toml"]
+extends = ["../qwen38_27b-3080_tp2-w4a16.toml"]
 
 [server]
 bind = "0.0.0.0:8136"

@@ -1,39 +1,25 @@
-# owl 档 `qwen35_4b-3090-q4km-vlm` —— 4B Q4_K_M + mmproj 视觉塔 / 8k。
-extends = ["full.toml"]
+# 单张 3090 Ti / Qwen3.5-4B GGUF Q4_K_M + mmproj 视觉塔 / 8k。
+extends = [
+  "full.toml",
+  "parts/model/4b-gguf-q4km.toml",
+  "parts/feature/vision.toml",
+  "parts/hardware/3090-single.toml",
+  "parts/kernel/fi-graph.toml",
+  "parts/pool/fp8.toml",
+]
 
 [server]
 bind = "127.0.0.1:8143"
 
 [model]
-name = "qwen3.5-4b-gguf-vlm"
-path = "../models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf"
-format = "gguf"
-quant = "q4k"
-head_quant = "off"
-vision = true
 vision_path = "../models/bartowski/Qwen_Qwen3.5-4B-GGUF/mmproj-Qwen_Qwen3.5-4B-f16.gguf"
-
-[parallel]
-mode = "single"
-device = ["42:00.0"]
 
 [runtime]
 max_seq = 8192
 max_concurrency = 1
 
 [pool]
-kv_fp8 = true
-gdn_slots = 1
-vram_target = 0.99
 vram_reserve_mb = 512
 
 [spec]
 depth = 0
-
-[kernel]
-verify_arm = "fi"
-decode_arm = "fi"
-fi_plan_bake = true
-fi_plan_restore = false
-fi_cuda_graph = true
-tag_wildcard = false

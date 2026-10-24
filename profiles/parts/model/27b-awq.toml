@@ -1,0 +1,7 @@
+# 模型组件：Qwen3.8-27B AWQ-INT4（W4A16，int8 头）。
+[model]
+name = "qwen3.8-27b"
+path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+format = "awq"
+quant = "w4a16"
+head_quant = "rtn-int8-row"

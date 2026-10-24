@@ -1,31 +1,18 @@
-# owl 预设档 `qwen38_27b-3090-w4a16` —— 单张 3090 Ti 24G / 128k / fp8 KV(最大上下文档)
+# 单张 3090 Ti / 27B AWQ-INT4 / 128k / fp8 KV。
 #
-# 全量字段继承自 `full.toml`;本文件只写差异。
-# 校验:`server -p profiles/qwen38_27b-3090-w4a16.toml --check`
-extends = ["full.toml"]
+# 组件：model=27b-awq, hardware=3090-single, kernel=fi-graph, pool=fp8。
+# 校验：server -p profiles/qwen38_27b-3090-w4a16.toml --check
+extends = [
+  "full.toml",
+  "parts/model/27b-awq.toml",
+  "parts/hardware/3090-single.toml",
+  "parts/kernel/fi-graph.toml",
+  "parts/pool/fp8.toml",
+]
 
-[model]
-name = "qwen3.8-27b"
-path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-format = "awq"
-quant = "w4a16"
-head_quant = "rtn-int8-row"
+[server]
+bind = "127.0.0.1:8137"
 
 [runtime]
 max_seq = 131072
 max_concurrency = 1
-
-[pool]
-image_evict_pad = "。"
-kv_fp8 = true
-gdn_slots = 1
-vram_target = 0.99
-vram_reserve_mb = 256
-
-[kernel]
-decode_arm = "fi"
-fi_cuda_graph = true
-fi_plan_restore = false
-
-[parallel]
-device = ["3090"]

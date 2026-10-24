@@ -1,34 +1,15 @@
-# owl 档 `qwen38_27b-3090-iq4xs` —— 27B UD-IQ4_XS 单卡 / 12k(纯 GGUF 块型)。
-extends = ["full.toml"]
+# 单张 3090 Ti / 27B GGUF UD-IQ4_XS / 12k（纯块型）。
+extends = [
+  "full.toml",
+  "parts/model/27b-gguf-iq4xs.toml",
+  "parts/hardware/3090-single.toml",
+  "parts/pool/f16.toml",
+  "parts/kernel/v2.toml",
+]
 
 [server]
 bind = "127.0.0.1:8145"
 
-[model]
-name = "qwen3.8-27b-gguf-iq4"
-path = "../models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf"
-format = "gguf"
-quant = "iq4"
-head_quant = "off"
-
-[parallel]
-mode = "single"
-device = ["42:00.0"]
-
 [runtime]
 max_seq = 12288
 max_concurrency = 1
-
-[pool]
-kv_fp8 = false
-gdn_slots = 1
-vram_target = 0.97
-vram_reserve_mb = 1024
-
-[kernel]
-verify_arm = "v2"
-decode_arm = "v2"
-fi_plan_bake = false
-fi_plan_restore = true
-fi_cuda_graph = false
-tag_wildcard = false

@@ -1,0 +1,7 @@
+# 模型组件：Qwen3.5-4B GGUF Q4_K_M。
+[model]
+name = "qwen3.5-4b-gguf"
+path = "../models/bartowski/Qwen_Qwen3.5-4B-GGUF/Qwen_Qwen3.5-4B-Q4_K_M.gguf"
+format = "gguf"
+quant = "q4k"
+head_quant = "off"

@@ -1,0 +1,8 @@
+# 硬件组件：两张 3080 20G，TP2。
+[parallel]
+mode = "tensor"
+device = ["3080", "3080"]
+tp_ar_f8 = true
+tp_ar_fused = true
+tp_ar2 = true
+tp_vocab_split = true

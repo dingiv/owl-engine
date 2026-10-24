@@ -1,0 +1,6 @@
+# 池组件：f16 KV（image-evict / KVMem 长上下文对照）。
+[pool]
+kv_fp8 = false
+gdn_slots = 1
+vram_target = 0.97
+vram_reserve_mb = 1024
