@@ -122,7 +122,7 @@
 
 | 编号 | 需求 | 验收口径(判据) |
 |---|---|---|
-| **REQ-AGT-01** | **模板真渲染**:渲染器读模型快照的 `chat_template.jinja`(**Rust crate `minijinja`**,非 PyPI 同名包 — 见 §7.1 开头),按 §3.2 契约传参;`tools` 渲染进 `# Tools` 块 | **G0 token 等价门**:同输入下,owl 渲染 → tokenize 的 id 序列与参考实现逐 id 相等 |
+| **REQ-AGT-01** | **模板真渲染**:渲染器读模型快照的 `chat_template.jinja`,经 **`hf-chat-template`**(底层 `minijinja`,transformers 兼容层;2026-10-24 起)渲染,按 §3.2 契约传参;`tools` 渲染进 `# Tools` 块 | **G0 token 等价门**:同输入下,owl 渲染 → tokenize 的 id 序列与参考实现逐 id 相等 |
 | **REQ-AGT-02** | **工具调用解析**:从生成文本中抽出 `<tool_call>` 块(xml + json 两种格式),转 OpenAI `tool_calls` 流式 delta,`finish_reason="tool_calls"` | **G1 单测**:两种格式 × 多块 × 跨 chunk 边界 × 多行参数值 × Unicode;`arguments` 恒为合法 JSON 字符串 |
 | **REQ-AGT-03** | **历史回填**:解析请求里的 `tool_calls`(assistant,可 `content:null`)与 `role:"tool"`+`tool_call_id`,按模板语义渲染 | **G2 e2e L1**:三轮工具对话端到端语义正确(工具结果被模型引用) |
 | **REQ-AGT-04** | **thinking 分离**:`...response` 前的内容走 `reasoning_content` 通道,之后走 `content`;回填时按 `preserve_thinking` 语义还原 | **G0/G1**:回填渲染与生成 token 逐 id 相等(见 §4.3)|
@@ -230,11 +230,11 @@
 > —— HF 把 kwargs 直接当模板变量;不展平则 `enable_thinking=false` **静默失效**(走默认 `true`,
 > 实测差 434 B)。单测必锁此项。
 
-**外部依赖(minijinja 兼容层,§7.1 = 已实测定案)**:
-`namespace(...)`(builtins 自带,✅)、`{% macro %}`(✅)、`| tojson`(**必须覆盖为 HF 语义**)、
-`raise_exception(...)`(**自注入**)、`.split/.startswith/.lstrip/.rstrip/.endswith`
-(**`minijinja-contrib::pycompat` 全覆盖**)、字典 `.items()`(✅)、`ns.attr = v`(✅)、
-`~` 拼接 / `is defined/is mapping/is iterable/is string`(✅)。
+**外部依赖(2026-10-24 起由 `hf-chat-template` 承担)**:
+`namespace(...)`(builtins 自带,✅)、`{% macro %}`(✅)、`| tojson`(HF Python 语义)、
+`raise_exception(...)`、`.split/.startswith/.lstrip/.rstrip/.endswith`(`pycompat`)、
+字典 `.items()`(✅)、`ns.attr = v`(✅)、`~` 拼接 / `is defined/is mapping/is iterable/is string`(✅)。
+`chat_tpl.rs` 只保留 owl 的模板来源/agent 缺省变量接口，不再自带 `py_json`/`py_float`。
 
 ### 3.3 工具调用 wire 形状(响应面)
 
@@ -465,7 +465,7 @@ apps/server/src/
 ├─ http.rs        不变(M-B 才动 keep-alive/chunked)
 ├─ config.rs      新增 [agent] module 开关(模板路径缺省、tool 解析开关、隐式会话)
 ├─ openai.rs      §协议面重排:请求解析(全字段)→ 渲染调用 → 事件流消费(三通道)
-├─ chat_tpl.rs    ★新:jinja 渲染器(minijinja 环境 + HF 兼容 filter/global 注入)
+├─ chat_tpl.rs    ★新:模板入口(快照/GGUF/覆盖 + agent 缺省变量;渲染委托 hf-chat-template)
 └─ toolcall.rs    ★新:增量工具调用解析器(状态机,吃增量文本吐三通道事件)
 ```
 
@@ -483,7 +483,7 @@ pi ──POST /v1/chat/completions{tools,messages[…tool_calls,tool…]}
     apps/server/src/openai.rs::chat()
       openai::ChatRequest::from_json()            全字段解析(deny 未知关键字段)
       chat_tpl::render(model_dir, messages, tools, add_generation_prompt, enable_thinking)
-        └─ minijinja render → prompt 文本
+        └─ hf-chat-template render → prompt 文本
       actor::EngineReq::Chat{prompt, max_new, sampler:Option<SamplerCfg>, session:Option<u64>}
         openai.rs 事件循环:
           TurnEvent::Token{delta} ─▶ toolcall::Feed::push(delta)
@@ -612,6 +612,10 @@ token 序列"在**前缀上逐 id 相等**,否则守卫失配 ⇒ 全量重算�
 
 ### 7.1 minijinja 支持度(G0 spike 靶子,最高风险)
 
+> **2026-10-24 更新**:本节是当时的 spike 记录。渲染层现已收敛到
+> `hf-chat-template` 1.0（minijinja + transformers 兼容层）；owl 不再自维护
+> `py_json`/`py_float`。保留本节作为兼容性证据与踩坑来源。
+
 **先澄清名词**:`minijinja` **本体是 Rust crate**(crates.io,作者 = Jinja2 作者 Armin Ronacher;
 本机 cargo 缓存已有 2.14.0/2.24.0,线上 3.0.0),`cargo add minijinja` 即可,零 Python 依赖,
 与 serde/toml 同级(符合“纯 Rust 链”原则)。**PyPI 上另有一个同名包**(minijinja-py,
@@ -664,7 +668,7 @@ add_generation_prompt=True, chat_template_kwargs=…)` 对同一输入渲染,**�
 |---|---|---|
 | 5 | 模板里**两种 think 标记并存**:主形态 = `<think>`/`</think>`(产物与 `add_generation_prompt` 段实测);长形态 `<thinking>`/`</thinking>` 出现在**历史 assistant 内容剥除**分支(`content.startswith(...)`;模板计数:主 12/18,长 3/10) | 解析器必须**主 + 别名双认**;`toolcall::markers_match_snapshot` 把这对耦合钉在仓库内金标上 |
 | 6 | **证据读法纪律**:`<think>` 形态的字面量在**显示层会被当 HTML 标签吞掉**(显示成 `" think"`),抄"看到的"会写出错字符串 —— 本轮为此白烧 3 个测试周期 | **凡标记/特殊 token 一律看 hex 或码点**,不看渲染文本;写入文件的标记字面量随后务必 hex 复验 |
-| 7 | `tojson` 四差异(实测):不转义 HTML / 非 ASCII 原样 / **Python 默认分隔符 `", "`/`": "`**(serde_json 紧凑输出少一个空格)/ 数值表示(Python `repr` 阈值:`exp<-4 || exp>=16` 走科学计数,指数至少两位) | `chat_tpl::py_json/py_float` 逐条实现 + 18 例 Python 期望值单测 |
+| 7 | `tojson` 四差异(实测):不转义 HTML / 非 ASCII 原样 / **Python 默认分隔符 `", "`/`": "`**(serde_json 紧凑输出少一个空格)/ 数值表示(Python `repr` 阈值:`exp<-4 || exp>=16` 走科学计数,指数至少两位) | 旧实现 `chat_tpl::py_json/py_float` 已退役；现由 `hf-chat-template` 提供，接缝单测保留 |
 | 8 | `serde_json` 必须开 **`preserve_order`**:默认 BTreeMap 在**解析时就把键排序** | tools schema 的键序会进 prompt,与 vLLM/HF 的 Python dict 序不一致 ⇒ G0 判据结构性不可能通过(已开) |
 
 | 9 | **`arguments` 必须是对象**:OpenAI 协议传 JSON 字符串,而模板(`tc.arguments \| items`)要求 mapping;0.8B 原版模板在 **HF 里也失败** | vLLM 同款归一(`_postprocess_messages`)已落在 `openai::normalize_tool_calls`;金标生成脚本同步用对象形态 |
@@ -944,7 +948,7 @@ DAG(lm_head gemm → argmax)核对**命令序是否与求值序一致**(gemm 的
 ### 7.2 魔改模板的复刻度
 
 快照模板 461 行含:工具格式指令块、连续失败警告启发式(`_strong_error`/`_weak_error`)、
-`max_tool_*_chars` 截断、"exit code/error json" 判据。**渲染器全量执行它**(minijinja 直读),
+`max_tool_*_chars` 截断、"exit code/error json" 判据。**渲染器全量执行它**(hf-chat-template 直读模板),
 不做子集裁剪 —— 但需知:**这些启发式直接塑造模型行为**(如失败警告注入),行为真值门
 只能靠 G2/G3 真机验证。
 

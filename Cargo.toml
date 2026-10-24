@@ -32,14 +32,10 @@ regex = "1.12.2"
 # 逐字节一致(tools schema 的键序会进 prompt);默认 BTreeMap 在**解析时
 # 就把键排序** → G0 判据不可能通过(agent 服务面 §7.1)。
 serde_json = { version = "1.0.108", features = ["preserve_order"] }
-# chat template 渲染(agent 服务面 §3.2):Rust 版 Jinja2。**只加库,不引入
-# Python**(PyPI 同名包 minijinja-py 是 PyO3 绑定,明确不用)。
-# 默认 feature 已含 builtins(namespace())/macros/debug;
-# 额外:json(tojson 原料)/preserve_order(键序=插入序,HF tojson 语义)/loop_controls。
-minijinja = { version = "2.24", features = ["json", "preserve_order", "loop_controls"] }
-# Jinja2 模板调用 Python str 方法(.split/.startswith/…)的兼容回调
-# (实测模板用 5 个,pycompat 全覆盖;见 docs/arch/agent-服务面-设计与施工.md §7.1)
-minijinja-contrib = { version = "2.24", features = ["pycompat"] }
+# HF chat template 渲染（agent 服务面 §3.2）：底层 minijinja + transformers
+# 兼容层（pycompat / Python tojson / strftime_now / generation 段）。
+# 不再直接依赖 minijinja；模板语义收敛到这一层。
+hf-chat-template = "1.0"
 interprocess = "2.4.4"
 tokenizers = { version = "0.21.2", features = ["http"] }
 rayon = "1.12.0"

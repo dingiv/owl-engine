@@ -402,6 +402,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "hf-chat-template"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed4c5f2a8f34e7371a60a73bf129b13f698db5f9e0ba4cd583ff25bae285e166"
+dependencies = [
+ "minijinja",
+ "minijinja-contrib",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1071,10 +1083,9 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "hf-chat-template",
  "image",
  "libc",
- "minijinja",
- "minijinja-contrib",
  "owl-cuda",
  "owl-engine",
  "owl-iface",
