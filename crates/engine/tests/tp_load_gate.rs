@@ -141,7 +141,7 @@ async fn tp_load_body(dir: &Path) {
     let keys: &[&str] = &[
         "mlp.gate_proj.weight",            // UniformCol(行切)
         "mlp.down_proj.weight",            // UniformRow(列切;stride)
-        "self_attn.q_proj.weight",         // SegmentedCol(QGate 两段)
+        "self_attn.q_proj.weight",         // UniformCol(per-head 交错，整行等分)
         "self_attn.o_proj.weight",         // UniformRow
         "linear_attn.in_proj_qkvz.weight", // SegmentedCol(QKVZ 四段)
         "linear_attn.in_proj_a.weight",    // PerHead

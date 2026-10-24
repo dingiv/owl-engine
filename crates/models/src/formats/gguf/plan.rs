@@ -31,7 +31,7 @@ use crate::contract::ModelError;
 use crate::module::{PlanTable, QuantPlan};
 
 use super::reader::Gguf;
-use super::shard::{role_of, Role, ShardSel, TensorFacts};
+use super::shard::{role_of, Role, ShardSel};
 use super::transform::GgufDims;
 use owl_kernels::family::gguf::{entry_for, GgmlTy};
 
@@ -61,12 +61,11 @@ impl<'g> GgufPlan<'g> {
     }
 
     /// 声明维(分片)→ 文件维(全量):按角色把**被切的那一维**放大 `world` 倍
-    fn inflate(&self, key: &str, t: &super::reader::TensorInfo, out_dim: usize, in_dim: usize)
+    fn inflate(&self, key: &str, out_dim: usize, in_dim: usize)
         -> Result<(usize, usize), String>
     {
         let Some((dims, sel)) = self.tp else { return Ok((out_dim, in_dim)) };
-        let f = TensorFacts { ty: t.ty, rows: t.rows() as usize, inner: t.inner() as usize };
-        let role = role_of(key, &dims, &f).map_err(|e| e.to_string())?;
+        let role = role_of(key, &dims).map_err(|e| e.to_string())?;
         let w = sel.world;
         Ok(match role {
             Role::Replicate => (out_dim, in_dim),
@@ -96,7 +95,7 @@ impl PlanTable for GgufPlan<'_> {
         };
         // 形状门:索引是 GGML 序(`ne[0]` = 内维)⇒ 与声明的 [out, in] 直比
         // (TP 档先按角色把声明维放大到全量维)
-        let (want_out, want_in) = match self.inflate(full_key, t, out_dim, in_dim) {
+        let (want_out, want_in) = match self.inflate(full_key, out_dim, in_dim) {
             Ok(v) => v,
             Err(e) => {
                 self.note(full_key, &format!("分片角色推导失败:{e}"));

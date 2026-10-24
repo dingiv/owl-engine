@@ -1402,15 +1402,14 @@ impl Module for Attention {
 
 impl Loadable for Attention {
     fn layout(&self, ctx: &LoaderCtx) -> LoaderOps {
-        let q_gate = self.hq * self.hd; // q_proj = q ⊕ gate(各 hq 头 × hd)
         self.q_proj.layout(ctx)
             .chain(self.k_proj.layout(ctx))
             .chain(self.v_proj.layout(ctx))
             .chain(self.o_proj.layout(ctx))
             .chain(self.q_norm.layout(ctx))
             .chain(self.k_norm.layout(ctx))
-            // **融合权重的段长事实**(S4 ②;q_proj = value|gate per-head 拼接)
-            .with_segments_for("q_proj", vec![q_gate, q_gate])
+        // q_proj 是 per-head `[q_h, gate_h]` 交错，不是 q ⊕ gate 两段。
+        // 不声明段长：规则表按 UniformCol 切 out 行，每个 rank 拿完整的头对。
     }
 }
 

@@ -45,13 +45,17 @@ pub enum WeightRule {
 ///
 /// 段结构 = **层代码的 narrow 顺序**(单源:GDN/Attention 的 forward)——
 /// 键名与段数已按真实 want 键逐条核实(2026-10-17):
-/// - `q_proj` 是 `Linear::new("q_proj", hq*hd*2, …)`(value|gate 融合);
 /// - `in_proj_qkvz` 是 `[2K+2V, hidden]` 四段(源侧 `in_proj_qkv`+`in_proj_z`
 ///   由装载源**虚拟合成**为这一个 want);
 /// - `conv1d` 是 `[2K+V, 4]` 三段(`conv_dim = 2·key_dim + value_dim`)。
+///
+/// ⚠️ Qwen3.5 的 `q_proj` 虽然字节上是 2·hq·hd,但**不是**两个全局段,
+/// 而是 per-head `[q_h, gate_h]` 交错;它由 [`rule_of`] 直接映射为
+/// `UniformCol`(2026-10-24),不走 `SegKind::QGate`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegKind {
-    /// `q_proj = q ⊕ gate`(Qwen3Next 门控注意力:两段各 hq 头 × hd)
+    /// 显式声明为 `q ⊕ gate` 两段融合的源。当前主路径(AWQ 与 GGUF `attn_q`)
+    /// 都是 per-head 交错,不使用本段;保留给将来显式两段源/单元测试。
     QGate,
     /// `in_proj_qkvz = q ⊕ k ⊕ v ⊕ z`(GDN 四段:q/k 各 nk 头、v/z 各 nv 头)
     QKVZ,
@@ -194,8 +198,16 @@ pub fn rule_of(key: &str) -> WeightRule {
         return WeightRule::UniformRow;
     }
     // ── full attention(Qwen3Next 门控)──
+    // q_proj 的真实布局是 **per-head `[q_h, gate_h]` 交错**(见 attention.rs
+    // 文件头与 vLLM qwen3_next.py 的 `view(..., heads, -1).chunk(2, -1)`)。
+    // 因此只能按输出**行对**等分：每 rank 拿连续的 `2*hq/world*hd` 行。
+    // 不能走 SegmentedCol(QGate)：那会把 q/gate 当成两个全局段再各切一半，
+    // 得到 heads `0..5 + 12..17` / `6..11 + 18..23`，与 o_proj 的
+    // `0..11` / `12..23` K 分片错位。
+    // 行对完整性由 ModelSpec::sharded 的 `plan.shard_len(hq)?` 保证
+    // （hq 不被 world 整除时已响亮拒启）。
     if tail(k, "q_proj") {
-        return WeightRule::SegmentedCol(SegKind::QGate);
+        return WeightRule::UniformCol;
     }
     if tail(k, "k_proj") || tail(k, "v_proj") {
         return WeightRule::UniformCol;
@@ -229,11 +241,14 @@ pub fn rule_of(key: &str) -> WeightRule {
 /// **键 → 规则(带「段长事实」)** —— 装载面的**唯一入口**(P2.1-a,2026-10-19)。
 ///
 /// 为什么需要:`rule_of(key)` 只看键名,而**同名键在不同模型里语义不同** ——
-/// 典型 = `q_proj`:主模型(Qwen3.5 主干)是 **gated attention**(out = q ⊕ gate,
-/// 段长 [hq·hd, hq·hd]),草稿(DFlash2 的 `DfAttn`)是**无门控**(out = hq·hd)。
+/// 典型 = 融合的 `gate_up_proj` / `in_proj_qkvz`:有段长声明才按段切,
+/// 无门控草稿上的同名 `q_proj`(out = hq·hd)则只能按 out 维等分。
 /// 段长是**权重的事实**,由构造者声明在 `Want::segments` 上(Want 文档原文:
 /// `Some` = 本张量是拼接而来)⇒ **无段长声明 ⇒ 不是融合张量** ⇒ 分段切无据可依,
 /// 规则降级为 `UniformCol`(切 out 维)。
+///
+/// 注:Qwen3.5 的 gated `q_proj` 是 per-head `[q_h, gate_h]` 交错,不走
+/// `SegmentedCol`;它在 [`rule_of`] 里直接是 `UniformCol`(2026-10-24 定谳)。
 ///
 /// ⚠️ 这不是「静默兜底」:降级判据 = **层自己声明的段长事实缺席**,与
 /// `SegmentedCol` 的定义(按段长切)互为表里;真要分段的张量**必然**声明段长
@@ -271,7 +286,7 @@ mod tests {
             ("model.layers.0.mlp.gate_proj.weight", WeightRule::UniformCol),
             ("mlp.up_proj.weight", WeightRule::UniformCol),
             ("model.layers.3.mlp.down_proj.weight", WeightRule::UniformRow),
-            ("model.layers.3.self_attn.q_proj.weight", WeightRule::SegmentedCol(SegKind::QGate)),
+            ("model.layers.3.self_attn.q_proj.weight", WeightRule::UniformCol),
             ("self_attn.k_proj.weight", WeightRule::UniformCol),
             ("model.layers.3.self_attn.v_proj.weight", WeightRule::UniformCol),
             ("model.layers.3.self_attn.o_proj.weight", WeightRule::UniformRow),
@@ -321,10 +336,28 @@ mod tests {
         }
     }
 
+    /// q_proj 必须按**完整头对**等分：rank1 从 head 12 开始，而不是
+    /// SegmentedCol(QGate) 会得到的 head 6（2026-10-24 TP2 工具名回归）。
+    #[test]
+    fn q_proj_uniform_col_splits_complete_head_pairs() {
+        let spec = spec27b();
+        assert_eq!(
+            rule_of("model.layers.3.self_attn.q_proj.weight"),
+            WeightRule::UniformCol
+        );
+        let p = TpPlan::new(1, 2).unwrap();
+        let out_dim = 2 * spec.full_heads.0 * spec.full_heads.2;
+        assert_eq!(p.shard_range(out_dim).unwrap(), 6144..12288, "rank1 = heads 12..23");
+        let local = spec.sharded(p).unwrap();
+        assert_eq!(local.full_heads.0, 12, "每 rank 12 个完整 q/gate 头对");
+    }
+
     /// 段长展开(27B 全量维度)× 分段切 ⇒ 每 rank 的分片形状
     #[test]
     fn segment_lengths_match_27b_shapes() {
         let spec = spec27b();
+        // QGate 段长保留给显式 q ⊕ gate 两段源；当前 AWQ/GGUF 的
+        // gated q_proj 都是 per-head 交错，规则表/角色表都走整行等分。
         assert_eq!(SegKind::QGate.segments(&spec).unwrap(), vec![6144, 6144], "q ⊕ gate");
         assert_eq!(
             SegKind::QKVZ.segments(&spec).unwrap(),

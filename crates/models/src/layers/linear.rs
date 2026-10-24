@@ -930,7 +930,7 @@ mod tp_marking_tests {
             ("out_proj", WeightRule::UniformRow),
             ("gate_proj", WeightRule::UniformCol),
             ("up_proj", WeightRule::UniformCol),
-            ("q_proj", WeightRule::SegmentedCol(crate::plan::rules::SegKind::QGate)),
+            ("q_proj", WeightRule::UniformCol),
             ("in_proj_qkvz", WeightRule::SegmentedCol(crate::plan::rules::SegKind::QKVZ)),
             ("in_proj_a", WeightRule::PerHead),
         ];

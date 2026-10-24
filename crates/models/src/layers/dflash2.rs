@@ -239,10 +239,9 @@ impl DfAttn {
         // 计划 = 逐键来源(Uniform 臂忽略键);层内局部键是**声明面事实**
         let p = plan.into();
         Self {
-            // ⚠️ **草稿的 `q_proj` 无门控**(out = hq·hd),而规则表按键尾
-            // `q_proj` 给的是**主模型**的 `SegmentedCol(QGate)`(Qwen3.5 主干的
-            // gated attention)⇒ 双 rank 装载会在 `build_shard_pass` 的强校验处
-            // 拒。这里**显式覆盖**为 `UniformCol`(切 out 维 = 每 rank 分头);
+            // 草稿的 `q_proj` 无门控(out = hq·hd)；主模型 gated `q_proj`
+            // 是 per-head `[q_h, gate_h]` 交错，两者都按 `UniformCol` 切 out
+            // 行(每 rank 完整头/头对)。显式覆盖保留为声明，防键表未来漂移；
             // `shard = 1` 时规则不参与 ⇒ 零行为变化。
             // 输出 dtype 钉定 = 草稿激活域(BF16):GGUF 块型臂的 GEMM 核写
             // F16 ⇒ 不铸会让下游 norm/attention 按 BF16 读 F16 位型(静默错值)

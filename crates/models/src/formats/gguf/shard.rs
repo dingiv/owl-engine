@@ -21,10 +21,11 @@
 //! > **每一 rank 装载后的张量 == 全量装载(已逆变换 = grouped 序)张量的
 //! > 连续块**:行 = grouped 行窗口,列 = grouped 原子窗口。
 //!
-//! 分段件(`attn_qkv` / `attn_q` / `ssm_conv1d`)是"每段各取一个窗口再拼接"——
-//! 段内仍是 grouped 序的连续块。这条不变式让 A2 表在 TP 档**不需要**
-//! (`SourceFacts::vhead_tiled_columns = false`):每 rank 的激活本来就是
-//! grouped 序的连续段。
+//! 分段件(`attn_qkv` / `ssm_conv1d`)是"每段各取一个窗口再拼接"——段内仍是
+//! grouped 序的连续块。`attn_q` 不是分段件：它是 per-head `[q_h, gate_h]` 交错，
+//! 只能按整行窗口切（2026-10-24 定谳；源布局与 HF `q_proj` 同序）。这条不变式让
+//! A2 表在 TP 档**不需要** (`SourceFacts::vhead_tiled_columns = false`):每 rank
+//! 的激活本来就是 grouped 序的连续段。
 //!
 //! # 角色表(GGUF 名 → 切法;**唯一点**)
 //!
@@ -32,7 +33,7 @@
 //! |---|---|---|
 //! | `ffn_gate` / `ffn_up` | `Out` | 行窗口(外维 = inter) |
 //! | `attn_k` / `attn_v` | `Out` | 行窗口(外维 = kv 头) |
-//! | `attn_q`(= q ⊕ gate 融合) | `Segs[QGate]` | 两段各取行窗口 |
+//! | `attn_q`(= per-head `[q_h, gate_h]`) | `Out` | 行窗口(每 rank 完整头对) |
 //! | `attn_qkv`(= q ⊕ k ⊕ v) | `Segs[QKV]` | 三段各取行窗口(V 段 grouped) |
 //! | `ssm_conv1d`(通道 = q ⊕ k ⊕ v) | `Segs[QKV]` | 同上(原生 F32,行置换在源侧) |
 //! | `attn_gate`(= in_proj_z) | `OutHead` | v-head grouped 行窗口 |
@@ -109,11 +110,9 @@ pub enum Role {
     InHead,
 }
 
-/// 键 → 角色(**唯一映射点**;未知层内键 = `Replicate`,由首 token 门兜底)
-///
-/// `f` 只为 `attn_q` 的融合段长(`q ⊕ gate` 两段各半)与形态自洽检查服务;
-/// 其余角色的段长来自维度事实 `d`。
-pub fn role_of(key: &str, d: &GgufDims, f: &TensorFacts) -> Result<Role, ModelError> {
+/// 键 → 角色(**唯一映射点**;未知层内键 = `Replicate`,由首 token 门兜底)。
+/// 段长来自维度事实 `d`;`attn_q` 的 per-head 交错布局不需要张量几何输入。
+pub fn role_of(key: &str, d: &GgufDims) -> Result<Role, ModelError> {
     let (k, v) = (d.nk * d.hk, d.nv * d.hv);
     Ok(match classify(key) {
         KeyClass::Gdn(GdnPart::Qkv) => Role::Segs { lens: vec![k, k, v], tail_perm: true },
@@ -135,18 +134,9 @@ pub fn role_of(key: &str, d: &GgufDims, f: &TensorFacts) -> Result<Role, ModelEr
                 .map(|(l, _)| l)
                 .unwrap_or(key);
             match local {
-                // full attention:q 是 **q ⊕ gate 融合**(27B `attn_q` ne[1] = 2·hq·hd)
-                "attn_q" => {
-                    if f.rows % 2 != 0 || f.rows == 0 {
-                        return Err(ModelError::Msg(format!(
-                            "[{key}] `attn_q` 行数 {} 不是偶数(q ⊕ gate 融合的两段)",
-                            f.rows
-                        )));
-                    }
-                    let q = f.rows / 2;
-                    Role::Segs { lens: vec![q, q], tail_perm: false }
-                }
-                "attn_k" | "attn_v" | "ffn_gate" | "ffn_up" => Role::Out,
+                // full attention:q 是 per-head `[q_h, gate_h]` 交错，
+                // 不能按 q ⊕ gate 两个全局段切；整行窗口天然落在完整头对上。
+                "attn_q" | "attn_k" | "attn_v" | "ffn_gate" | "ffn_up" => Role::Out,
                 "attn_output" | "ffn_down" => Role::In,
                 // 其余 plain 键 = 各 norm(attn_norm / post_attention_norm / q_norm / k_norm)
                 _ => Role::Replicate,
@@ -226,7 +216,7 @@ pub fn geom_of(
     sel: Option<ShardSel>,
 ) -> Result<Option<KeyGeom>, ModelError> {
     let Some(sel) = sel else { return Ok(None) };
-    let role = role_of(key, d, f)?;
+    let role = role_of(key, d)?;
     if role == Role::Replicate {
         return Ok(None);
     }
@@ -480,11 +470,11 @@ mod tests {
                 quantized: true,
             },
         );
-        // ── attn_q(full 层:q ⊕ gate,各 6144 行 ⇒ 各半)─────────────
+        // ── attn_q(full 层:per-head [q_h, gate_h],整行窗口 6144 行)──
         case(
             "blk.3.attn_q.weight",
             KeyGeom {
-                shape: Shape::Mat { wins: vec![(0, 3072), (6144, 3072)], rows: 6144 },
+                shape: Shape::Mat { wins: vec![(0, 6144)], rows: 6144 },
                 cols: Cols::Full,
                 col_first: 0,
                 row_atoms: 160,
@@ -492,6 +482,14 @@ mod tests {
                 elem_per_atom: 32,
                 quantized: true,
             },
+        );
+        // rank1 必须从 head 12 开始（文件 row 6144），而不是 q/gate 两段各半
+        let t = g.get_tensor("blk.3.attn_q.weight").unwrap();
+        let q1 = geom_of("blk.3.attn_q.weight", &d, &tf(t), Some(sel1)).unwrap().unwrap();
+        assert_eq!(
+            q1.shape,
+            Shape::Mat { wins: vec![(6144, 6144)], rows: 6144 },
+            "attn_q rank1 行窗口"
         );
         // ── ffn_gate(外维 17408 ⇒ 各 8704 行)───────────────────────
         case(
