@@ -369,14 +369,48 @@ impl ChatRequest {
         (want.min(agent.max_new_cap), want > agent.max_new_cap)
     }
 
+    /// **模板 kwargs 的唯一组装点**(vLLM `build_chat_params` 同款)。
+    ///
+    /// OpenAI 面的 `reasoning_effort` 与 Qwen 模板面的 `enable_thinking`
+    /// 是同一个状态的两个入口。只把前者塞进模板而不管后者 ⇒ 模板可能
+    /// 关思考、`ChannelSplitter` 却按默认 true 启动，答案会被整段吞进
+    /// `reasoning_content`。这里在请求层归一化：显式 `enable_thinking`
+    /// 优先；否则 `reasoning_effort` 存在时同步派生。
+    pub fn effective_template_kwargs(&self) -> Map<String, Value> {
+        let mut kw = self.chat_template_kwargs.clone().unwrap_or_default();
+        if let Some(e) = &self.reasoning_effort {
+            kw.insert("reasoning_effort".into(), json!(e));
+            if !kw.contains_key("enable_thinking") {
+                kw.insert("enable_thinking".into(), json!(!reasoning_off(e)));
+            }
+        }
+        kw
+    }
+
     /// 开启思考?(模板契约:未给 = 模板缺省 true)
+    ///
+    /// 与 [`effective_template_kwargs`](Self::effective_template_kwargs)
+    /// 同口径：显式 `enable_thinking` > `reasoning_effort` none/off > true。
+    /// 不能让模板关思考而 splitter 仍按 think 态启动。
     pub fn enable_thinking(&self) -> bool {
-        self.chat_template_kwargs
+        if let Some(v) = self
+            .chat_template_kwargs
             .as_ref()
             .and_then(|k| k.get("enable_thinking"))
             .and_then(|v| v.as_bool())
-            .unwrap_or(true)
+        {
+            return v;
+        }
+        match self.reasoning_effort.as_deref() {
+            Some(e) if reasoning_off(e) => false,
+            _ => true,
+        }
     }
+}
+
+/// `reasoning_effort` 的关思考词（与快照模板同口径；大小写不敏感）。
+fn reasoning_off(e: &str) -> bool {
+    e.eq_ignore_ascii_case("none") || e.eq_ignore_ascii_case("off")
 }
 
 /// 隐式默认会话 id(AGT-09;`[agent] implicit_session` = true 时无 session 键的请求落此)
@@ -621,10 +655,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     }
     // 思考档位(AGT-07):OpenAI `reasoning_effort` **直通模板变量**
     // (模板自持值域: none|low|medium|high|xhigh|…)。请求 > 配置缺省
-    let mut kw = req.chat_template_kwargs.clone().unwrap_or_default();
-    if let Some(e) = &req.reasoning_effort {
-        kw.insert("reasoning_effort".into(), json!(e));
-    }
+    let kw = req.effective_template_kwargs();
     let kw_ref = if kw.is_empty() { None } else { Some(&kw) };
     // 渲染:唯一权威 = 快照模板(§4.3 R2);模板拒(如 system 含图像)= 400
     let mut prompt = match tpl.render(RenderArgs {
@@ -1452,6 +1483,48 @@ mod tests {
             "messages":[{"role":"user","content":"x"}],
             "chat_template_kwargs": {"enable_thinking": false}})).expect("parse");
         assert!(!r.enable_thinking());
+        // `reasoning_effort=none/off` 与模板同口径：splitter 也必须按关思考启动
+        for off in ["none", "off", "NONE", "Off"] {
+            let r: ChatRequest = serde_json::from_value(json!({
+                "messages":[{"role":"user","content":"x"}],
+                "reasoning_effort": off})).expect("parse");
+            assert!(!r.enable_thinking(), "reasoning_effort={off} 应关思考");
+        }
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"x"}],
+            "reasoning_effort": "high"})).expect("parse");
+        assert!(r.enable_thinking(), "reasoning_effort=high 应开思考");
+        // 显式 enable_thinking 覆盖 reasoning_effort
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"x"}],
+            "reasoning_effort": "none",
+            "chat_template_kwargs": {"enable_thinking": true}})).expect("parse");
+        assert!(r.enable_thinking(), "显式 enable_thinking=true 应优先");
+
+        // vLLM 同款归一化：reasoning_effort 必须同步派生 enable_thinking
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"x"}],
+            "reasoning_effort": "none"})).expect("parse");
+        let kw = r.effective_template_kwargs();
+        assert_eq!(kw.get("reasoning_effort"), Some(&json!("none")));
+        assert_eq!(kw.get("enable_thinking"), Some(&json!(false)));
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"x"}],
+            "reasoning_effort": "high"})).expect("parse");
+        assert_eq!(
+            r.effective_template_kwargs().get("enable_thinking"),
+            Some(&json!(true))
+        );
+        // 显式 enable_thinking 不被派生值覆盖(与 vLLM build_chat_params 一致)
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"x"}],
+            "reasoning_effort": "none",
+            "chat_template_kwargs": {"enable_thinking": true}})).expect("parse");
+        assert_eq!(
+            r.effective_template_kwargs().get("enable_thinking"),
+            Some(&json!(true))
+        );
+
         // [agent] 定制上限生效(配置面唯一旋钮)
         let agent = AgentCfg { max_new_cap: 32768, default_max_new: 2048, ..AgentCfg::default() };
         let r: ChatRequest = serde_json::from_value(json!({

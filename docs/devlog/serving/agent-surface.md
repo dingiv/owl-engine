@@ -286,6 +286,16 @@ data: [DONE]
 - 入:pi 回填 `assistant.reasoning_content`(因为我们的 thinkingSignature = `reasoning_content`)。
 - **回填对称性(§4.3)**:渲染历史 assistant 时必须还原 `<think>{reasoning}\n</think>\n\n{content}`,
   与模板 `_preserve_thinking=true` 分支逐字节一致。
+- **`reasoning_effort` / `enable_thinking` 归一化(2026-10-24)**:
+  OpenAI 面只发 `reasoning_effort:"none"` 时，Qwen 模板会据此关思考，
+  但 `ChannelSplitter` 旧实现只看 `chat_template_kwargs.enable_thinking`
+  （缺省 true）⇒ 正文被整段归到 `reasoning_content`。现按 vLLM
+  `build_chat_params` 同款在请求层归一化：`ChatRequest::effective_template_kwargs()`
+  同步派生 `enable_thinking = reasoning_effort != none/off`（显式
+  `enable_thinking` 优先）；`enable_thinking()` 与 splitter 同口径。
+  门 = `server::openai::tests::max_new_clamp_and_thinking_flag`。
+  pi 侧 Qwen 模型仍建议配 `compat.thinkingFormat="qwen-chat-template"`
+  （`3090_dual` / `3080_dual` 的 27B 条目已配）。
 
 ### 3.5 usage 与缓存计数
 
