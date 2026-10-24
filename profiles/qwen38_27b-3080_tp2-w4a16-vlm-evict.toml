@@ -33,6 +33,10 @@ snap_max = 2
 prefix_cache = true
 image_evict = true
 image_evict_delta_limit = 32
+# **页对齐 pad 词**(模型敏感项;必须恰 1 token)。27B 实测:`\n`(空行)从第 3 张标记图
+# 起让回答开头吐 `< >`;` ` 推到 ≥7 张;`。` 8 图 / 8 次删除都干净 ⇒ 缺省 `。`。
+# pad 对客户端不可见(unpad 按区间剥)。空串 = 自动 `。`→` `→`\n`。
+image_evict_pad = "。"
 # f16 KV(image_evict 的硬前提;main 起该键在 `[pool]`)
 kv_fp8 = false
 vram_target = 0.9

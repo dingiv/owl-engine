@@ -547,6 +547,33 @@ impl<D: DeviceClient> RunningEngine<D> {
         )
     }
 
+    /// **页对齐 pad 词**(单源;`unpad` 按区间剥 ⇒ 内容对客户端不可见)。
+    ///
+    /// 只要"恰 1 token",顺序 = **模型最不敏感者优先**:`。`(正常标点)→ ` ` → `\n`。
+    /// 依据(27B/TP2,keep=99 规整多图历史):`\n` 从第 3 张**标记**图起就让回答开头
+    /// 吐 `< >`;换成 ` ` 后阈值推到 ≥7 张(见设计卷 §5duodecies)。与旋转/删除无关。
+    pub(crate) fn image_pad_token(&self) -> Option<u32> {
+        // 显式配置优先(boot 门已验"恰 1 token");空串 = 自动挑。
+        let conf = self.boot.cfg.knobs.image_evict_pad.as_str();
+        if !conf.is_empty() {
+            return self
+                .boot
+                .tok
+                .try_encode(conf)
+                .ok()
+                .filter(|v| v.len() == 1)
+                .map(|v| v[0]);
+        }
+        for cand in ["。", " ", "\n"] {
+            if let Ok(v) = self.boot.tok.try_encode(cand) {
+                if v.len() == 1 {
+                    return Some(v[0]);
+                }
+            }
+        }
+        None
+    }
+
     /// **页对齐 pad 律 + 删除重建**(前缀无感删除;2026-10-23)。
     ///
     /// 三件事(纯 host、零设备 IO):
@@ -601,9 +628,10 @@ impl<D: DeviceClient> RunningEngine<D> {
         let (vs, ve, pad) = if page == 0 {
             (None, None, 0u32)
         } else {
-            let pad = one("\n").ok_or_else(|| {
+            // **pad 词** = [`Self::image_pad_token`] 单源(恰 1 token、模型最不敏感者)。
+            let pad = self.image_pad_token().ok_or_else(|| {
                 ModelError::Msg(
-                    "image_pad_law: `\n` 不是单 token —— 页对齐 pad 律要求恰 1 token 的 pad"
+                    "image_pad_law: 找不到\"恰 1 token\"的 pad 词(页对齐 pad 律要求)"
                         .into(),
                 )
             })?;

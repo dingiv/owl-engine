@@ -88,6 +88,9 @@ pub struct EngineKnobs {
     /// prefill + `reset_gdn`)—— 漂移与计数同时归零(不在漂移上继续加)。
     /// 32 的依据:叠转实测 13.7 ulp(最差元素,`drift_under_repeats` 门)。
     pub image_evict_delta_limit: u32,
+    /// **页对齐 pad 词**(`[pool].image_evict_pad`;缺省 `。`;空串 = 自动)。
+    /// 模型敏感项:27B 实测 `\n` 会让回答开头吐 `<`;`。` 干净。必须恰 1 token。
+    pub image_evict_pad: String,
     /// **宿主层预算 MiB**(状态存储三层的中层;缺省 **0 = 关层**,REQ C4)。
     /// 环境变量 `OWL_HOST_CACHE_MB`;S3-3b(回灌)接线前开了也没用
     pub host_cache_mb: usize,
@@ -325,6 +328,7 @@ impl Default for EngineKnobs {
             bulk_drop_when_tier_full: false,
             image_evict: false,
             image_evict_delta_limit: 32,
+            image_evict_pad: "。".to_string(),
             host_cache_mb: 0,
             snap_host_mb: 0,
             disk_cache_mb: 0,
@@ -660,6 +664,7 @@ impl EngineKnobs {
             bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
             image_evict: cfg.pool.image_evict,
             image_evict_delta_limit: cfg.pool.image_evict_delta_limit,
+            image_evict_pad: cfg.pool.image_evict_pad.clone(),
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
             host_cache_mb: cfg.pool.host_cache_mb,
             disk_cache_mb: cfg.pool.disk_cache_mb,
@@ -1436,9 +1441,29 @@ pub(crate) fn into_running<D: DeviceClient>(
                 dev.pool.geom.paged, dev.pool.geom.kv_fp8, dev.pool.geom.dims.dtype
             )));
         }
+        // **pad 词校验**(模型敏感项,必须恰 1 token):空串 = 运行时自动挑;
+        // 显式给值 ⇒ boot 期就验(不符 = 拒启,别拖到第一张图才炸)。
+        if !cfg.knobs.image_evict_pad.is_empty() {
+            let tok = cfg.knobs.image_evict_pad.as_str();
+            match tokenizer.try_encode(tok) {
+                Ok(v) if v.len() == 1 => {}
+                Ok(v) => {
+                    return Err(ModelError::Msg(format!(
+                        "[pool] image_evict_pad = {tok:?} 必须恰 1 token(实测 {} tok:{v:?})",
+                        v.len()
+                    )))
+                }
+                Err(e) => {
+                    return Err(ModelError::Msg(format!(
+                        "[pool] image_evict_pad = {tok:?} 编码失败:{e}"
+                    )))
+                }
+            }
+        }
         owl_shared::log_info!(
             "boot",
-            "前缀无感删除:开(可删图像段页对齐 pad + 删除后缀 K 重转;页 {} tok)",
+            "前缀无感删除:开(可删图像段页对齐 pad = {:?} + 删除后缀 K 重转;页 {} tok)",
+            if cfg.knobs.image_evict_pad.is_empty() { "(自动)" } else { cfg.knobs.image_evict_pad.as_str() },
             dev.pool.geom.page
         );
     }

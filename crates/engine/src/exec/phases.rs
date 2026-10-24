@@ -22,6 +22,7 @@ async fn prepare_vlm_rank<D: DeviceClient>(
     dev: &mut crate::engine::RankDev<D>,
     ids: &[u32],
     images: &[crate::turn::TurnImage],
+    dbg: bool,
 ) -> Result<crate::vlm::VlmPrepared> {
     let vlm = dev
         .boot
@@ -35,6 +36,54 @@ async fn prepare_vlm_rank<D: DeviceClient>(
         .flat_map(|i| i.image.pixel_values.iter().copied())
         .collect();
     let req = vlm.prepare(ids, &grids, &[], &px)?;
+    // **诊断(probes.debug)**:每 turn 的 VLM 位置面 —— 多图 × 前缀复用 × 删除的
+    // 定位点(2026-10-24 尾查:2 次删除后 27B 出 `< 0.000…`)。
+    // 打印 = 全 prompt 长度、视觉 token 数、delta、每段视觉占位游程与**前几个
+    // 位置号**(rope_index 的 m-RoPE 行号;图像位是 2D 网格 ⇒ 与标量 S 的关系要对).
+    if dbg {
+        let (n_vis, runs, pos_head, pos_img) = {
+            let tt = owl_models::layers::mrope::token_types(
+                ids,
+                vlm.cfg().image_token,
+                vlm.cfg().video_token,
+            );
+            let n_vis = tt.iter().filter(|t| **t != 0).count();
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let mut i = 0usize;
+            while i < tt.len() {
+                if tt[i] != 0 {
+                    let st = i;
+                    while i < tt.len() && tt[i] != 0 {
+                        i += 1;
+                    }
+                    runs.push((st, i));
+                } else {
+                    i += 1;
+                }
+            }
+            let idx = &req.ins;
+            let pos_all = idx.idx_host.len();
+            let head: Vec<f32> = idx.idx_host.iter().take(8).copied().collect();
+            let imgs: Vec<f32> = runs
+                .iter()
+                .take(4)
+                .map(|(st, _)| idx.idx_host.get(*st).copied().unwrap_or(-1.0))
+                .collect();
+            (n_vis, (runs, pos_all), head, imgs)
+        };
+        let (runs, pos_all) = runs;
+        owl_shared::log_info!(
+            "vlm-dbg",
+            "prompt={} 视觉 token={} 段={:?} delta={} ins.tokens={} idx_head={:?} 段首行号={:?}",
+            ids.len(),
+            n_vis,
+            runs,
+            req.ins.delta,
+            pos_all,
+            pos_head,
+            pos_img
+        );
+    }
     let merged = match req.merged {
         Some(m) => {
             let dtype = m.dtype();
@@ -94,6 +143,26 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if let Some(rr) = b.rerope.as_ref() {
             if !rr.snap_disk.is_empty() {
                 self.execute_snap_disk_ops(&rr.snap_disk).await?;
+            }
+        }
+        // **诊断(probes.debug)**:本轮恢复点(键/层/归属/深度)与是否重置 GDN ——
+        // 多图 × 删除 × 前缀复用尾查的位置帧证据(2026-10-24)。
+        if self.boot.probes.debug {
+            match b.restore_key {
+                Some(k) => owl_shared::log_info!(
+                    "vlm-dbg",
+                    "restore key={:?} tier={:?} owner={:?} reset_gdn={}",
+                    k,
+                    self.bank.rel.state.locate(k),
+                    self.bank.rel.state.snap_session(k),
+                    b.reset_gdn
+                ),
+                None => owl_shared::log_info!(
+                    "vlm-dbg",
+                    "restore 无键(reset_gdn={};prefix 命中 {} tok?)",
+                    b.reset_gdn,
+                    b.pending_loads.len()
+                ),
             }
         }
         // 快照就位(host 侧:store 层账 + 必要时一条 swap 回灌)——
@@ -250,9 +319,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 (act.prompt_ids.clone(), act.images.clone())
             };
             // **TP2:两 rank 各备一份**(host 表同源;merged 各 rank 设备块)。
-            let prep0 = prepare_vlm_rank(&mut self.dev, &ids, &images).await?;
+            let prep0 = prepare_vlm_rank(&mut self.dev, &ids, &images, self.boot.probes.debug).await?;
             let prep1 = match self.peer.as_mut() {
-                Some(p) => Some(prepare_vlm_rank(p, &ids, &images).await?),
+                Some(p) => Some(prepare_vlm_rank(p, &ids, &images, self.boot.probes.debug).await?),
                 None => None,
             };
             let act = self.turns.active_mut()?;

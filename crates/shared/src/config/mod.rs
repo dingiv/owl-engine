@@ -73,6 +73,7 @@
 //! | pool | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
 //! | pool | image_evict | bool / false(**前缀无感删除**:客户端给可删图像打标记 ⇒ 引擎页对齐 + 删除即位置帧平移) |
 //! | pool | image_evict_delta_limit | u32 / 32(一条链允许被重转的次数;到顶后下一轮删除触发整段重建;0 = 不限) |
+//! | pool | image_evict_pad | str / "。"(页对齐 pad 词;必须恰 1 token;空 = 自动 `。`→` `→`\\n`) |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
 //! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
 //! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
@@ -651,6 +652,15 @@ pub struct PoolCfg {
     /// 整段重建**(全量 prefill,`reset_gdn`;漂移归零、计数归零),而不是
     /// 在漂移上继续加。只在本键开(`image_evict`)时生效。
     pub image_evict_delta_limit: u32,
+    /// **页对齐 pad 的填充词**(`[pool].image_evict_pad`;缺省 **`。`**;空串 = 自动)。
+    ///
+    /// 为什么要可配:pad 词是**模型敏感项** —— 27B/TP2 实测,`\n`(一串空行)从第 3 张
+    /// 标记图起就让回答开头吐 `< >`;` `(空格)推到 ≥7 张;`。`(正常标点)8 图 / 8 次删除
+    /// 都干净。不同模型/不同 chat 模板对此的容忍度不同 ⇒ **不写死**。
+    ///
+    /// 约束:**必须恰 1 token**(boot 门校验,不符即拒启);pad 按区间记账、`unpad`
+    /// 整段剥 ⇒ 对客户端**完全不可见**。空串 = 按 `。`→` `→`\n` 顺序自动挑第一个。
+    pub image_evict_pad: String,
     /// **解释器块池预算**(字节;0 = 关 = 逐节点 alloc/free 存量路径)。
     /// 原 `OWL_BLOCK_POOL` env;P1″ 块竞技场(见 `interpreters::eval`)。
     pub block_pool_bytes: usize,
@@ -1648,6 +1658,7 @@ impl Default for PoolCfg {
             prefix_cache: true,
             image_evict: false,
             image_evict_delta_limit: 32,
+            image_evict_pad: "。".to_string(),
             block_pool_bytes: 0,
             no_reclaim: false,
             vram_budget_mb: None,

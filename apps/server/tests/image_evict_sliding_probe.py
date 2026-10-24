@@ -49,9 +49,11 @@ COLORS = [(200, 40, 40), (40, 80, 200), (40, 180, 80), (220, 180, 40),
           (160, 60, 200), (40, 190, 190), (240, 120, 40), (120, 120, 240)]
 
 
-def chat(base: str, session: str, messages, max_tokens: int, model=MODEL, think=True):
+def chat(base: str, session, messages, max_tokens: int, model=MODEL, think=True):
     body = json.dumps({
-        "model": model, "session": session, "messages": messages,
+        "model": model,
+        **({"session": session} if session else {}),
+        "messages": messages,
         "max_tokens": max_tokens, "temperature": 0,
         # 思考默认开（答案在 reasoning_content；**harness 回填必须回同一份**，
         # 否则下一轮前缀守卫失配 ⇒ cached=0，删除路径根本走不到）
@@ -91,12 +93,22 @@ def main():
     ap.add_argument("--base", default="http://127.0.0.1:8135")
     ap.add_argument("--model", default=MODEL, help="OpenAI model 名(缺省 0.8B)")
     ap.add_argument("--session", default="slide-demo")
+    ap.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="不给 session(每轮全量重算;判\"pad 本身\"与\"pad+前缀复用\")",
+    )
     ap.add_argument("--turns", type=int, default=6)
     ap.add_argument("--keep", type=int, default=3, help="会话里保留几张图（滑动窗口）")
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--size", type=int, default=256)
     ap.add_argument("--no-evict", action="store_true", help="对照臂：不打 owl_evict")
     ap.add_argument("--no-think", action="store_true", help="关思考（答案进 content；前缀守卫才稳）")
+    ap.add_argument(
+        "--mark-first",
+        action="store_true",
+        help="只给**第一张**图打 owl_evict（判 artifact 是否随\"被打 pad 的图片数\"增长）",
+    )
     a = ap.parse_args()
 
     imgs = [png(a.size, a.size, COLORS[k % len(COLORS)], stripe=64) for k in range(a.turns)]
@@ -108,14 +120,21 @@ def main():
         if len(images_in(msgs)) >= a.keep:
             drop_oldest_image(msgs)
         part = {"type": "image_url", "image_url": {"url": imgs[k]}}
-        if not a.no_evict:
+        if not a.no_evict and (not a.mark_first or len(images_in(msgs)) == 0):
             part["owl_evict"] = True
         msgs.append({"role": "user", "content": [
             {"type": "text", "text": f"第 {k + 1} 步：这是当前屏幕截图。"},
             part,
             {"type": "text", "text": "请用一句话描述你看到了什么。"},
         ]})
-        resp, ms = chat(a.base, a.session, msgs, a.max_tokens, a.model, think=not a.no_think)
+        resp, ms = chat(
+            a.base,
+            None if a.ephemeral else a.session,
+            msgs,
+            a.max_tokens,
+            a.model,
+            think=not a.no_think,
+        )
         u = resp.get("usage", {})
         cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
         prompt = u.get("prompt_tokens", 0)

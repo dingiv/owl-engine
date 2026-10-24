@@ -4901,7 +4901,8 @@ pub async fn gpu_image_evict_gate() {
         v[0]
     };
     let (vs, ve) = (one(&running, "<|vision_start|>"), one(&running, "<|vision_end|>"));
-    let pad_id = one(&running, "\n");
+    // pad 词与引擎**同一单源**(`RunningEngine::image_pad_token`)
+    let pad_id = running.image_pad_token().expect("引擎 pad 词");
 
     // ── 预热轮(纯文本;消掉 F1 的"首轮+图"变量) ──
     {
@@ -5372,7 +5373,8 @@ pub async fn gpu_image_evict_spec_identity_gate() {
             v[0]
         };
         let (vs, ve) = (one(&running, "<|vision_start|>"), one(&running, "<|vision_end|>"));
-        let pad_id = one(&running, "\n");
+        // pad 词与引擎**同一单源**(`RunningEngine::image_pad_token`)
+        let pad_id = running.image_pad_token().expect("引擎 pad 词");
         // 纯文本预热轮(0.8B「boot 后首轮带图」既有红 F1)
         {
             let (_s, t) = running
@@ -5496,13 +5498,6 @@ pub async fn gpu_image_evict_spec_identity_gate() {
             .map(|s| s.tokens[plen1.min(s.tokens.len())..].to_vec())
             .unwrap_or_default();
         eprintln!("[D] t1 生成(len={}) {gen1:?}", gen1.len());
-        let text1 = running
-            .bank
-            .sessions
-            .get(sid)
-            .map(|s| s.tokens[plen1.min(s.tokens.len())..].iter().map(|t| *t).collect::<Vec<_>>())
-            .map(|_| String::new())
-            .unwrap_or_default();
         // 文本由 token 账反解(仅供 prompt2 回填;与客户端回同一份文本同等语义)
         let text1 = {
             let ids: Vec<u32> = running

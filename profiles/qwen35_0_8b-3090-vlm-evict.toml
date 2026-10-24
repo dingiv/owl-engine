@@ -50,6 +50,10 @@ kv_fp8 = false
 image_evict = true
 # 叠转上限（到顶 ⇒ 下一轮删除改走整段重建；实测 32 轮 ≈ 13.7 ulp 最差元素）
 image_evict_delta_limit = 32
+# **页对齐 pad 词**(模型敏感项;必须恰 1 token)。27B 实测:`\n`(空行)从第 3 张标记图
+# 起让回答开头吐 `< >`;` ` 推到 ≥7 张;`。` 8 图 / 8 次删除都干净 ⇒ 缺省 `。`。
+# pad 对客户端不可见(unpad 按区间剥)。空串 = 自动 `。`→` `→`\n`。
+image_evict_pad = "。"
 vram_target = 0.8
 vram_reserve_mb = 1024
 
