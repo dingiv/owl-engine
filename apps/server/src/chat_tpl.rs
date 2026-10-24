@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use hf_chat_template::ChatTemplate;
+use hf_chat_template::{ChatTemplate, TokenField, TokenizerConfig};
 use serde_json::{Map, Value as Json};
 
 /// 快照模板文件名（HF 解析优先级与之同源：先独立文件，再 tokenizer_config）
@@ -52,6 +52,9 @@ pub struct ChatTpl {
     /// agent 面缺省模板变量（`[agent]` 配置→jinja 变量；请求 kwargs 覆盖之）。
     /// 只装**非缺省**项 ⇒ 与 HF oracle（无 kwargs）逐字节同源（G0 不变式）
     defaults: Map<String, Json>,
+    /// 快照 `tokenizer_config.json` 的 `bos_token`/`eos_token`/…（HF 同款注入；
+    /// 模板不引用时零影响）。GGUF 单文件路径没有该配置 ⇒ 空。
+    special_tokens: Map<String, Json>,
 }
 
 impl ChatTpl {
@@ -82,7 +85,8 @@ impl ChatTpl {
                 (s, format!("{} (agent.template_path)", path.display()))
             }
         };
-        Self::from_str(src, source, defaults)
+        let special_tokens = read_special_tokens(model_dir)?;
+        Self::from_str_with_specials(src, source, defaults, special_tokens)
     }
 
     /// **是否 GGUF 档 + 自动路由的唯一产地**（路径是文件 ⇒ GGUF 单文件形态）。
@@ -113,9 +117,18 @@ impl ChatTpl {
         source: String,
         defaults: Map<String, Json>,
     ) -> Result<Self, TplError> {
+        Self::from_str_with_specials(template, source, defaults, Map::new())
+    }
+
+    fn from_str_with_specials(
+        template: String,
+        source: String,
+        defaults: Map<String, Json>,
+        special_tokens: Map<String, Json>,
+    ) -> Result<Self, TplError> {
         let template = ChatTemplate::from_str(&template)
             .map_err(|e| TplError(format!("chat 模板编译失败({source}): {e}")))?;
-        Ok(Self { template, source, defaults })
+        Ok(Self { template, source, defaults, special_tokens })
     }
 
     /// **从 GGUF 文件装**（`tokenizer.chat_template` KV；缺 = 拒启）。
@@ -159,8 +172,12 @@ impl ChatTpl {
             ctx.insert("tools".into(), Json::Array(tools.to_vec()));
         }
         ctx.insert("add_generation_prompt".into(), Json::Bool(args.add_generation_prompt));
+        // HF 同款顺序：tokenizer special tokens → agent 缺省 → 请求 kwargs。
+        // 模板不引用这些变量时零影响；GGUF 单文件路径为空。
+        for (k, v) in &self.special_tokens {
+            ctx.insert(k.clone(), v.clone());
+        }
         // 契约：chat_template_kwargs 展平到顶层（不展平 = enable_thinking 静默失效）
-        // 序：agent 面缺省在前、请求 kwargs 在后（请求优先）
         for (k, v) in &self.defaults {
             ctx.insert(k.clone(), v.clone());
         }
@@ -173,6 +190,31 @@ impl ChatTpl {
             .render_context(&Json::Object(ctx))
             .map_err(|e| TplError(format!("chat 模板渲染失败: {e}")))
     }
+}
+
+/// 读 `tokenizer_config.json` 的特殊 token（标准 `hf-chat-template` 视图）。
+/// 缺文件 = 空；文件在但解析失败 = 响亮拒（配置面事实不能静默丢）。
+fn read_special_tokens(model_dir: &Path) -> Result<Map<String, Json>, TplError> {
+    let path = model_dir.join(TOKENIZER_CONFIG);
+    if !path.is_file() {
+        return Ok(Map::new());
+    }
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| TplError(format!("读 tokenizer 配置 {}：{e}", path.display())))?;
+    let cfg: TokenizerConfig = serde_json::from_str(&raw)
+        .map_err(|e| TplError(format!("解析 tokenizer 配置 {}：{e}", path.display())))?;
+    let mut out = Map::new();
+    for (name, field) in [
+        ("bos_token", &cfg.bos_token),
+        ("eos_token", &cfg.eos_token),
+        ("pad_token", &cfg.pad_token),
+        ("unk_token", &cfg.unk_token),
+    ] {
+        if let Some(v) = field.as_ref().and_then(TokenField::as_str) {
+            out.insert(name.to_string(), Json::String(v.to_string()));
+        }
+    }
+    Ok(out)
 }
 
 /// 读模板源：独立 `.jinja` 优先，回退 `tokenizer_config.json.chat_template`
@@ -282,6 +324,30 @@ mod tests {
         assert_eq!(t.render(args(&msgs, None, Some(&kw))).unwrap(), "think=False");
         // 不给 = 模板默认(true)
         assert_eq!(t.render(args(&msgs, None, None)).unwrap(), "think=True");
+    }
+
+    /// tokenizer special tokens 注入（HF 同款；请求 kwargs 可覆盖）
+    #[test]
+    fn tokenizer_special_tokens_are_injected() {
+        let mut special = Map::new();
+        special.insert("bos_token".into(), Json::String("<s>".into()));
+        let t = ChatTpl::from_str_with_specials(
+            "{{ bos_token }}|{{ x }}".into(),
+            "test".into(),
+            Map::new(),
+            special,
+        )
+        .unwrap();
+        let msgs: Vec<Json> = vec![];
+        let mut kw = Map::new();
+        kw.insert("x".into(), Json::String("ok".into()));
+        assert_eq!(t.render(args(&msgs, None, Some(&kw))).unwrap(), "<s>|ok");
+        let mut kw = Map::new();
+        kw.insert("bos_token".into(), Json::String("<override>".into()));
+        assert_eq!(
+            t.render(args(&msgs, None, Some(&kw))).unwrap(),
+            "<override>|"
+        );
     }
 
     /// **G0 金标门**:快照模板 × HF oracle 逐字节对拍。
