@@ -105,6 +105,8 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/memory/kvmem-selection.md`](devlog/memory/kvmem-selection.md) — KVMem selection layer (B axis)
 - ⬜ [`devlog/memory/longctx-attribution.md`](devlog/memory/longctx-attribution.md) — Long-context performance attribution, round one
 - ⬜ [`devlog/memory/prefix-deletion.md`](devlog/memory/prefix-deletion.md) — Prefix-transparent deletion
+- ⬜ [`devlog/memory/kv-quant-deep-dive.md`](devlog/memory/kv-quant-deep-dive.md) — KV quant deep dive: FP8 vs TQ k8v4 vs KVarN (quality/capacity/integration)
+- ⬜ [`devlog/memory/fp8-baseline-2026-10-25.md`](devlog/memory/fp8-baseline-2026-10-25.md) — FP8 KV baseline: GSM8K 200, MMLU-Pro smoke, needle 240k, std (spec-off)
 
 ## H. Serving, sessions and configuration
 
