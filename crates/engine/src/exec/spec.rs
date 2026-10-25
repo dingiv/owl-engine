@@ -22,8 +22,11 @@ struct VerifyViewTables {
 }
 
 const SPEC_ADAPTIVE_WARMUP_ROUNDS: u32 = 8;
-/// 本轮 target live 草稿数 P：预算 rem 个 token 时最多 P+1 个提交行。
+/// 本轮**提交面** live 草稿数 P：预算 rem 个 token 时最多 P+1 个提交行。
 /// rem=1 ⇒ P=0（裸 decode，调用方不应发 spec）；rem>=2 ⇒ P=min(K, rem-1)。
+///
+/// ⚠️ **只裁提交/接受，不裁 verify 图**：verify 图与 FI plan 恒为 `K+1` 行
+/// （2026-10-25 P0 判例；图形状改小会复用满宽 CUDA graph 并自旋）。
 fn live_depth_for_budget(depth: usize, remaining: usize) -> usize {
     if remaining <= 1 {
         0
@@ -97,8 +100,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             mcnt("spec.q.none", 1);
         }
-        // target live = P+1：proposal 仍满 W=K+1；预算不足时 target 的
-        // GDN/FI 只算前 P+1 行（verify_round 的 target_rows），也只提交这些行。
+        // **预算只裁提交面，不裁 verify 图的 target 形状**（2026-10-25 P0 修）：
+        // proposal 与 verify 图恒为 W=K+1 行；预算不足时只接受/提交前 P+1 行。
+        // 旧实现把 `live+1` 传给 `verify_round`，同时改掉 FI plan/GDN 行数，
+        // 但 CUDA graph 是按 K+1 行捕获的 ⇒ T<K+1 的尾批复用满宽图，
+        // FI 尾部 CTA 等待永不到来的信号（GPU 100% 自旋）。
+        // 这里只算 `live` 作为提交上限；verify 仍跑满 `block.len()`，
+        // 未接受的行由既有 fold/回滚路径丢弃。
         let live = {
             let act = self.turns.active()?;
             let rem = act.max_new.saturating_sub(act.out.len());
@@ -141,7 +149,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 &xqa_pt_v,
                 sid,
                 depth,
-                live + 1,
             )
             .await?;
         t_verify = t_v;
@@ -1021,7 +1028,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         xqa_pt_v: &[f32],
         sid: u64,
         depth: usize,
-        target_rows: usize,
     ) -> Result<(
         Vec<u32>,
         owl_iface::contract::Bytes,
@@ -1031,6 +1037,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         std::time::Duration,
     )> {
         let verify_elapsed;
+        // **verify 图/FI plan 恒为满宽 depth+1**(2026-10-25 P0 修)。
+        // 预算裁剪只作用于提交面(`execute_spec_round` 的 `live`)；
+        // 这里不再收 target_rows 参数 —— 否则调用点可再次把图形状改小，
+        // 复用满宽 CUDA graph 会触发 FI 尾部 CTA 自旋。
+        let target_rows = block.len();
+        // 图形状是 `depth+1` 行；块行数不符时**响亮拒**，不许带错形状复用图
+        // （否则又回到 2026-10-25 P0 的 FI 尾 CTA 自旋）。
+        if self.dev.graphs.verify_of(depth).is_some() && block.len() != depth + 1 {
+            return Err(ModelError::EngineInvariant {
+                what: format!(
+                    "verify 块行数 {} != 图 depth+1 {}（预算裁剪只许改提交面）",
+                    block.len(),
+                    depth + 1
+                ),
+            });
+        }
         // **视图化 verify(2026-10-23)**:先在 `vg` 借用之前取视图表 ——
         // `verify_view_tables` 只读 bank/sel;有洞 + 有视图 = 逐行表,
         // 无洞 = None(旧 dense 路径逐字不变)。
@@ -1046,7 +1068,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (ids, hidden, records, hidden_owned, row_logits) =
         if self.dev.graphs.verify_of(depth).is_some() {
             let vg = self.dev.graphs.verify_mut(depth)?;
-        let target_rows = target_rows.clamp(1, block.len());
         let ts = std::time::Instant::now();
         let bt_chain = {
             let s = self.bank.sessions.session(sid)?;
