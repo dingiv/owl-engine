@@ -2,46 +2,19 @@
 #
 # 形状:prefill = eager + Marlin W4A16;decode = FlashInfer + CUDA graph;
 #       投机 = DFlash2 d7(W4A16 草稿);KV = fp8 e4m3;**视觉塔开**;
-#       前缀缓存 + 三层账全开。
+#       前缀缓存 + 三层账全开 + image_evict(FP8, delta_limit=4)。
 #
-# **max_seq = 79872(2026-10-25 拉满档;页对齐 2496×32)**
-# 1 快照下 boot 的 `[ctx-max]` 给 cap=90025 tok / ctx_max≈89993;
-# **但可用上限由 runtime 压力地板决定**(target = max(reserve×2,1GiB) +
-# 单块工作集实测 ≈ 64.6MB):
+# **max_seq = 63456 / snap_max = 2 —— 2026-10-25 全特性稳定点**
 #
-#   max_seq   boot 后驱动余量   可用余量(减 1GiB)   实测
-#   75712     1234MiB           210MiB              65.1k prompt 200 OK
-#   79872     1106MiB            82MiB              **70.25k prompt 200 OK**
-#   80384     ~1090MiB           ~66MiB              边界(不取)
-#   80896     ~1074MiB           ~50MiB              `PoolExhausted`
+# 24G 卡上:27B + 视觉塔 + DFlash2 d7 + fp8 KV + 前缀缓存 + image_evict
+# 全部同时开。fresh boot 驱动余量 >1GiB;前缀缓存饱和后可能短暂出现 N6
+# 压力 WARN(功能/删除/缓存实测仍通过)。`image_delete_marked` / GUI 三图
+# 窗口均通过。79872 + snap1 是更大 ctx,但驱动余量贴 1GiB 压力地板,
+# image_evict 的前缀块会被下沉到 host(`前缀有宿主占位 ⇒ 不吸收`)⇒ 不在
+# 生产档保留“看起来更大、实际关键特性失效”的点。
 #
-# ⇒ 取 79872(page 对齐 2496 页)。**不写 pool 容量**:池 = max_seq 自动派生。
-#
-# 与旧 65536 档的关系(2026-10-24 无视觉时实测):
-#
-#   max_seq   snap   短答    12.6k prompt   近满 ctx              N6   硬预算拒发
-#   65536     4      0.38s   585 t/s        64.7k ⇒ **1002 t/s**   **0**  0
-#   81920     4      0.38s   582 t/s        80.8k ⇒ 938 t/s       54     0
-#   98304/1   1      0.51s   579 t/s        97.0k ⇒ 728 t/s       72     0
-#
-# ⚠️ 视觉塔每 rank 全量 ⇒ live 权重 +0.86G(16.76G→17.62G),cap 从 104.5k
-#    降到 **75.8k**。**boot cap ≠ 可用上限**:runtime 压力地板 = max(reserve×2,1GiB), 
-#    快照占 4 槽(594MiB)时,75712 档 boot 后驱动余量仅 786MiB < 1GiB ⇒
-#    第一个 turn 就 `PoolExhausted(vram-hard-budget)`。实测把快照压到 **1 槽**
-#    (省 445MiB)后:free≈1234MiB,65,152-token prompt 实测 200 OK(66.5s 冷),
-#    同 prompt 第二发 cached 65,120/65,152 = **99.95%**(1.63s)⇒ 复用没丢
-#    (Durable 快照可下沉宿主,snap_host=3072)。
-#    ⇒ 本档 = 视觉 + DFlash2 d7 + fp8 KV + **1 快照**下的实测最大。
-#    代价:驱动余量长期贴着 1GiB 压力地板,会出现 `N6 压力节点` WARN
-#    (功能/缓存实测未坏;要零腾槽把 max_seq 降回 65536,或关视觉)。
-#
-# 再往上只有三条路(都要付代价):#   ① 关视觉:live 回到 16.76G ⇒ ctx_max ≈ 104.4k;
-#   ② 快照已 1 槽(再砍就是关前缀复用),换更大 ctx 只剩"关视觉/降 per_tok";
-#   ③ 262k = KVMem 部分驻留(池小于 ctx + 宿主腿 + v2 臂 + 关图):
-#      2026-10-25 实测**当前自动池仍会拒**(`[pool] 自动池装不下本档`,
-#      auto 分支在 overcommit 前判 `max_seq ≤ ctx_max`)⇒ 需要先改引擎
-#      (让 pool_overcommit 档走"逻辑 ctx=model_max、物理池=cap"),
-#      不是配置能开出来的;旧档注释里的 262k --set 配方已失效。
+# 分工:本档 = agent 低时延短上下文;长上下文/大图窗口由 3080 TP2(262144,
+# snap2)承担。池不手写:自动派生自 max_seq。
 #
 # ⚠️ 已知引擎缺陷(2026-10-24 立案,非本档引入):DFlash2 **尾批裁剪**形状
 # (`max_new` 剩余 ≤ depth)会让 verify 以裁后的 T 跑图档 ⇒ **核在设备上自旋**
@@ -64,22 +37,27 @@ extends = [
 bind = "127.0.0.1:8134"
 
 [runtime]
-max_seq = 79872
+max_seq = 63456
 max_concurrency = 1
+# pi 不发 session 键:隐式会话 0 让工具轮/图片删除有稳定会话;
+# 跨会话前缀仍由内容寻址缓存兜底。
+implicit_session = true
 
 [pool]
-# 快照 1 槽 = 148.5MiB:75712 档必须给 runtime 压力地板(1GiB)留空间
-# (4 槽实测会让第一个 turn `PoolExhausted`);65k 跨会话命中 99.95% 已在宿主兜住
-snap_max = 1
+# 2 槽 = 297MiB:给压力地板(1GiB)留余量,同时覆盖三图窗口的删除快照。
+snap_max = 2
 prefix_cache = true
 vram_reserve_mb = 512
-# KV 宿主腿 10GiB:设备池只有 2496 槽(79k ctx),两发长 prompt 就占满;
+# KV 宿主腿 10GiB:设备池只有 1983 槽(63k ctx),两发长 prompt 就占满;
 # 宿主腿让整链下沉(内容不丢)而不是硬拒。4GiB 实测:70k+65k 链装不下
 # ⇒ N6 只能逐叶丢(一次一个叶),第三发 27k 前缀回灌时 `槽池耗尽`
 # (2026-10-25;旧版还会丢宿主内容 ⇒ 粘性「身份未登记」,已修)。
-# 10GiB ≈ 容纳 4 条 79k 链(每条 2496 块)的冷缓存。
+# 10GiB ≈ 容纳 4 条 63k 链(每条 1983 块)的冷缓存。
 host_cache_mb = 10240
 snap_host_mb = 3072
+# 图像前缀无感删除:FP8 重转硬上限 = 4;snap2 覆盖三图窗口。
+image_evict = true
+image_evict_delta_limit = 4
 # agent 消息边界快照:delim 空 = 用模型 ChatFormat.im_open(实测 = 1 token [248045])
 snap_msg_boundary = true
 snap_msg_delim = ""
