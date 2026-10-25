@@ -108,6 +108,8 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/memory/store-hook-contract.md`](devlog/memory/store-hook-contract.md) — Store hook contract: 19-point audit, 3-hook convergence (Acquire/Release/Maintain), migration gates
 - ⬜ [`devlog/memory/kvarn-k4v4-施工文档.md`](devlog/memory/kvarn-k4v4-施工文档.md) — KVarN k4v4/g128 handoff: layout, kernels, page128 integration, phase gates
 - ⬜ [`devlog/memory/kvarn-k4v4-落地可行性复核.md`](devlog/memory/kvarn-k4v4-落地可行性复核.md) — KVarN feasibility review: sink/tail lifecycle, store RTN/pack gap, page128 blast radius, 3090/3080 capacity math, k4v4 vs k4v2 verdict
+- ⬜ [`devlog/memory/kv-quant-deep-dive.md`](devlog/memory/kv-quant-deep-dive.md) — KV quant deep dive: FP8 vs TQ k8v4 vs KVarN (quality/capacity/integration)
+- ⬜ [`devlog/memory/fp8-baseline-2026-10-25.md`](devlog/memory/fp8-baseline-2026-10-25.md) — FP8 KV baseline: GSM8K 200, MMLU-Pro smoke, needle 240k, std (spec-off)
 
 ## H. Serving, sessions and configuration
 
