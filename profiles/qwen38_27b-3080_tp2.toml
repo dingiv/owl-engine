@@ -31,6 +31,12 @@ bind = "127.0.0.1:8135"
 [runtime]
 max_seq = 262144
 max_concurrency = 1
+# 3080 TP2 冷 prefill A/B（2026-10-25，15K/25K/37K）:
+#   512  = 1486 / 1446 / 1359 t/s
+#   1024 = 1576 / 1521 / 1454 t/s
+#   2048 = 1605 / 1543 / 1477 t/s  ← 当前档
+# 只改本 TP2 档;3090 仍走 full.toml 的 512。
+prefill_chunk = 2048
 # pi 不发 session 键:隐式会话 0 让工具轮/图片删除有稳定会话;
 # 跨会话前缀仍由内容寻址缓存兜底(实测 49k prompt 99.9% 命中)。
 implicit_session = true

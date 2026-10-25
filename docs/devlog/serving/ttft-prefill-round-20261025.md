@@ -144,15 +144,29 @@ snap_msg_min_gap = 2048 (baseline) vs 512 vs 256
 固定同一前端 transcript / 回放，记录 cached、miss、TTFT、prefill、snapshot 开销。
 不要在没有实际 transcript 的情况下只凭合成文本改生产值。
 
-### E3：prefill 吞吐 A/B
+### E3：prefill 吞吐 A/B（已完成第一组）
+
+用 `replay.py --mode tool --rounds 1`，三个**不同 seed / 不同前缀**的冷请求
+（15K / 25K / 37K prompt），避免跨 session 内容缓存污染：
+
+| chunk | 15K prompt | 25K prompt | 37K prompt |
+|---:|---:|---:|---:|
+| 512 (baseline) | 1,486 t/s | 1,446 t/s | 1,359 t/s |
+| 1024 | 1,576 t/s (+6.1%) | 1,521 t/s (+5.2%) | 1,454 t/s (+7.0%) |
+| 2048 | **1,605 t/s (+8.0%)** | **1,543 t/s (+6.7%)** | **1,477 t/s (+8.7%)** |
+
+同批 TTFT：
 
 ```text
-prefill_chunk = 512 (baseline) vs 256 vs 1024
-prefill_tail_merge = 512 vs 0
+512:  10.28 / 17.35 / 27.66 s
+1024:  9.70 / 16.58 / 25.87 s
+2048:  9.57 / 16.33 / 25.45 s
 ```
 
-用冷 15K prompt + 4.5K 尾巴量 prefill t/s，不用 decode 数据混判。
-门槛：TTFT 改善 ≥10%，decode/AL 不退化。
+⇒ 3080 TP2 采用 `prefill_chunk = 2048`（只改 3080 TP2 profile；3090 不动）。
+预期对前端 4.5K 尾巴的 TTFT 改善约 5–8%，但这不是 86% 缓存问题的替代品。
+
+`prefill_tail_merge=512` 保持；2048 chunk 已能覆盖尾块，暂不混调两个变量。
 
 ### E4：图像/工具 payload 瘦身
 
@@ -183,3 +197,82 @@ prefill_tail_merge = 512 vs 0
   仍是未提交现场，patch 见 `perf-runs/.../git-diff.patch`；
 - 任何 profile 实验只改一个变量，先保留 baseline 日志再重启；
 - 3090 生产档不在本轮改动范围。
+
+---
+
+## §7 E0/E1 首轮实测（2026-10-25 晚，41 轮）
+
+前端已经开始使用 `images=3 / evict=3`（三图窗口全部带 `owl_evict`），
+缓存与 TTFT 都明显改善。但 `image_evict_delta_limit=4` 的**整段重建**
+现在成了新的长尾。
+
+### 7.1 缓存
+
+| 口径 | n | token 加权命中率 | 单轮中位 | cold |
+|---|---:|---:|---:|---:|
+| 全部 | 41 | **81.82%** | 93.66% | 5 |
+| warm（去掉 cold） | 36 | **94.78%** | 94.47% | 0 |
+| 主 GUI 会话全部 | 26 | 81.35% | **97.37%** | 4 |
+| 主 GUI 会话 warm | 22 | **96.29%** | **97.42%** | 0 |
+| 旧的无标记会话 | 3 | 77.86% | 77.95% | 0 |
+
+结论：
+
+- 正常热轮已经到 **94–97%**，不再是上一批的 86%；
+- 全部口径被 **5 次 cold** 拉低：2 次新会话冷启 + 3 次图片叠转到顶；
+- `evict=3` 的会话稳定吸收；`evict=0` 的 3 轮明显更低。
+
+### 7.2 TTFT
+
+| 口径 | 平均 | 中位 | p90 |
+|---|---:|---:|---:|
+| 全部 41 | 4.78 s | **1.98 s** | 8.00 s |
+| warm 36 | **2.01 s** | **1.94 s** | 3.48 s |
+| 主 GUI warm | 2.02 s | 1.98 s | 2.95 s |
+
+正常轮已经从 4.55 s 降到 **约 2 s**；平均值被 cold 的 31–38 s 拉高。
+
+### 7.3 新的头号瓶颈：delta_limit 整段重建
+
+主 GUI 会话在 turn 30 / 35 / 40 各触发一次：
+
+```text
+叠转到顶: rot_rounds=4, delta_limit=4
+⇒ 本轮整段重建（全量 prefill）
+```
+
+三次 cold：
+
+```text
+prompt 43,180 → TTFT 31.2 s
+prompt 46,092 → TTFT 33.5 s
+prompt 51,564 → TTFT 38.2 s
+```
+
+图片删除本身只要约 1.5 ms K 重转；真正贵的是每 4 次叠转后的
+**整段 43–52K prefill**。
+
+`delta_limit` 是 FP8 精度硬上限（1..=4），不能靠调大绕过。下一轮优先级：
+
+1. **避免/隐藏 rebase**：能否在 idle 预热、异步重建、或把重建放到前端不可见时点；
+2. **降低单次重建成本**：chunk/prefill 已到 2048；继续压要换重建策略；
+3. **减少触发频率**：图片窗口更大/更少 prune，或只在必要时删图；
+4. 若业务不能接受 30s 尖峰，考虑 f16 KV 的 image_evict 档（delta_limit 32）
+   作为专用 GUI 档，不与 262k FP8 生产档混用。
+
+### 7.4 当前配置
+
+```text
+prefill_chunk = 2048（3080 TP2）
+snap_msg_min_gap = 2048
+image_evict_delta_limit = 4
+```
+
+现场文件：
+
+```text
+perf-runs/ttft-prefill-20261025/owl-8135-ttft-2048-41.log
+perf-runs/ttft-prefill-20261025/owl-agent-2048-41.json
+perf-runs/ttft-prefill-20261025/turns-2048-41.csv
+perf-runs/ttft-prefill-20261025/cache-summary-2048-41.txt
+```
