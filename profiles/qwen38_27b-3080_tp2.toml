@@ -31,14 +31,29 @@ bind = "127.0.0.1:8135"
 [runtime]
 max_seq = 262144
 max_concurrency = 1
+# pi 不发 session 键:隐式会话 0 让工具轮/图片删除有稳定会话;
+# 跨会话前缀仍由内容寻址缓存兜底(实测 49k prompt 99.9% 命中)。
+implicit_session = true
 
 [spec]
 # TP2 草稿族放行(缺它 = tp.rs 装配期响亮拒)
 tp_draft = true
 
 [pool]
-# TP2 双卡各 20G:快照开到 1、前缀缓存关(与历史生产档一致;
-# 本机实测更高配置会撞压力腾槽/硬预算拒发,要冲先 --set 单变量复测)
-snap_max = 1
-prefix_cache = false
+# 生产级默认:关键特性全开(非"看着省一点"的保守档)。
+# TP2 双卡各 20G:快照 2 槽 + 宿主 3G(pi agent 无 session,
+# 前缀缓存必须开;宿主预算避免 Transient 快照顶掉 durable 边界)。
+# 27B agent prompt 实测 49k token 二次命中 99.9%(TTFT 37.9s→0.21s)。
+snap_max = 2
+prefix_cache = true
+snap_host_mb = 3072
+host_cache_mb = 10240
 vram_reserve_mb = 512
+# 图像前缀无感删除:FP8 重转的硬上限 = 4(每次重转一次 e4m3 量化)。
+image_evict = true
+image_evict_delta_limit = 4
+# 消息边界快照:pi 每轮重发全历史;与 3090 生产档同形。
+snap_msg_boundary = true
+snap_msg_delim = ""
+snap_msg_min_gap = 2048
+snap_msg_min_span = 0
