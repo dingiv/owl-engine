@@ -1,2 +1,0 @@
-# 两张 3080 20G / 27B W4A8 + DFlash2 d7 / 262k（长 prompt 档）。
-extends = ["qwen38_27b-3080_tp2-w4a16.toml", "parts/feature/w4a8.toml"]

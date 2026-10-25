@@ -13,7 +13,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/perf-runs/metrics-optimize/max-$(date +%m%d-%H%M)}"
-PROFILE="$ROOT/profiles/experiments/qwen38_27b-3090-w4a16-dflash-longctx.toml"
+PROFILE="$ROOT/profiles/qwen38_27b-3090.toml"
+MAX_SEQ="${MAX_SEQ:-67584}"
 PORT=8140
 BDF="41:00.0"
 LENGTHS="${LENGTHS:-512,2048,8192,16384,32768,49152,65536}"

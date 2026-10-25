@@ -51,3 +51,5 @@ docs/bench/data/
 /models
 # 子 crate 里误生成的独立 lock(工作区统一用根 Cargo.lock)
 crates/*/Cargo.lock
+
+experiments

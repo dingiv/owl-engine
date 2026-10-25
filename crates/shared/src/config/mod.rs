@@ -3081,7 +3081,7 @@ mod extends_tests {
         write(&site, "[runtime]\nmax_seq = 12345\n[pool]\nsnap_max = 2\n");
         let child = d.join("child.toml");
         write(&child, "extends = \"site.toml\"\n\n[spec]\ndepth = 5\n");
-        let base = crate::profiles::profile_path("qwen38_27b-3090-w4a16-dflash").expect("预设档");
+        let base = crate::profiles::profile_path("qwen38_27b-3090").expect("预设档");
         let c = OwlConfig::load(Some(&base), Some(&child)).expect("load");
         assert_eq!(c.spec.depth, 5, "子档覆盖基准/父档");
         assert_eq!(c.runtime.max_seq, 12345, "父档提供、基准未写者生效");
@@ -3153,7 +3153,7 @@ mod extends_tests {
     #[test]
     fn extends_绝对路径基准() {
         let d = tmp_dir("extends_abs");
-        let base = crate::profiles::profile_path("qwen38_27b-3090-w4a16-dflash").expect("预设档");
+        let base = crate::profiles::profile_path("qwen38_27b-3090").expect("预设档");
         let conf = d.join("test-conf.toml");
         write(
             &conf,
@@ -3195,7 +3195,7 @@ mod config_overlay_tests {
         file_loader::create_dir_all(&dir).expect("mkdir");
         let over = dir.join("over.toml");
         file_loader::write(&over, "[spec]\ndepth = 5\n").expect("w");
-        let base = crate::profiles::profile_path("qwen38_27b-3090-w4a16-dflash").expect("预设档");
+        let base = crate::profiles::profile_path("qwen38_27b-3090").expect("预设档");
         let c = OwlConfig::load(Some(&base), Some(&over)).expect("load");
         assert_eq!(c.spec.depth, 5, "覆盖文件优先");
         assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");

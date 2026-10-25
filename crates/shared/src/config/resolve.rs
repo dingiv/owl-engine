@@ -648,7 +648,7 @@ mod tests {
         (v, origins)
     }
 
-    /// 27B/3090 意图档(旧 `profiles/qwen38_27b-3090-w4a16.toml` 的 `[intent]` 块;
+    /// 27B/3090 意图档(旧 `profiles/qwen38_27b-3090.toml` 的 `[intent]` 块;
     /// 2026-10-21 档已转全量显式,意图面留在本测试里做**派生器对照锚**)。
     const INTENT_AWQ_3090_MAX: &str = r#"
 [intent]
@@ -668,50 +668,56 @@ reuse       = "off"
 mode = "greedy"
 "#;
 
-    /// **P0 验收**:意图派生结果 = 仓库全量档 `profiles/qwen38_27b-3090-w4a16.toml`
-    /// 的逐键值(准入由 tag filter 派生)。
+    /// **P0 验收**:意图派生结果 = 该意图**应当**产出的逐键值(绝对锚)。
+    ///
+    /// 2026-10-24 改锚:本门原先拿仓库档 `profiles/qwen38_27b-3090.toml` 当对照物,
+    /// 而档面收敛后现役档 = `spec on / reuse on / max_seq 79872`,与本夹具
+    /// (`spec=off / reuse=off / context=max`)有意不同 ⇒ 对照锚会随档位漂移而假失败。
+    /// 派生器的正确性只能钉在它自己的输出上,不能挂在会动的靶子上。
     #[test]
     fn profile_matches_handwritten_flavor() {
         let (p, _po) = resolve_str(INTENT_AWQ_3090_MAX);
         let c: crate::config::OwlConfig = p.try_into().expect("intent 反序列化");
-        let f = crate::config::OwlConfig::load(
-            Some(&crate::profiles::profile_path("qwen38_27b-3090-w4a16").expect("profile")),
-            None,
-        )
-        .expect("全量档装载");
+
         // 模型面
-        assert_eq!(c.model.format, f.model.format);
-        assert_eq!(c.model.quant, f.model.quant);
-        assert_eq!(c.model.head_quant, f.model.head_quant);
-        // 上下文/池
-        assert_eq!(c.runtime.max_seq, f.runtime.max_seq, "128k");
-        assert_eq!(c.runtime.prefill_chunk, f.runtime.prefill_chunk);
-        assert_eq!(c.runtime.prefill_tail_merge, f.runtime.prefill_tail_merge);
-        assert_eq!(c.runtime.max_batch, f.runtime.max_batch);
-        assert_eq!(c.pool.gdn_slots, f.pool.gdn_slots);
-        assert_eq!(c.runtime.max_concurrency, f.runtime.max_concurrency);
-        assert_eq!(c.pool.vram_target, f.pool.vram_target);
-        assert_eq!(c.pool.vram_reserve_mb, f.pool.vram_reserve_mb);
-        // prefix_cache 由 intent.reuse 派生(本档 reuse=off);手写档继承
-        // full.toml 的 true —— 两者**有意不同**,不在此门对拍。
-        assert_eq!(c.pool.snap_max, f.pool.snap_max);
-        assert_eq!(c.pool.host_cache_mb, f.pool.host_cache_mb);
-        assert_eq!(c.pool.snap_host_mb, f.pool.snap_host_mb);
-        // 臂/KV/图/投机
-        assert_eq!(c.pool.kv_fp8, f.pool.kv_fp8);
-        assert_eq!(c.kernel.gdn_chunked, f.kernel.gdn_chunked);
-        assert_eq!(c.kernel.decode_arm, f.kernel.decode_arm);
-        assert_eq!(c.kernel.verify_arm, f.kernel.verify_arm);
-        assert_eq!(c.kernel.fi_cuda_graph, f.kernel.fi_cuda_graph);
-        assert_eq!(c.kernel.fi_plan_bake, f.kernel.fi_plan_bake);
-        assert_eq!(c.kernel.fi_plan_restore, f.kernel.fi_plan_restore);
-        assert_eq!(c.spec.depth, f.spec.depth);
-        assert_eq!(c.kvmem.select_decode, f.kvmem.select_decode);
-        assert_eq!(c.kvmem.select_partial, f.kvmem.select_partial);
-        assert_eq!(c.kvmem.index, f.kvmem.index);
-        assert_eq!(c.kvmem.pool_overcommit, f.kvmem.pool_overcommit);
-        assert_eq!(c.sampling.mode, f.sampling.mode);
+        assert_eq!(c.model.format, crate::config::ModelFormat::Awq);
+        assert_eq!(c.model.quant, crate::config::QuantScheme::W4a16);
+
+        // 上下文/并发/预填充
+        assert_eq!(c.runtime.max_seq, 131_072, "context=max ⇒ 模型 max_pos");
+        assert_eq!(c.runtime.max_concurrency, 1);
+        assert_eq!(c.runtime.max_batch, 1);
         assert_eq!(c.runtime.prefill_chunk, 512);
+        assert_eq!(c.runtime.prefill_tail_merge, 512);
+
+        // 复用关(reuse=off ⇒ 快照/宿主/前缀缓存全零)
+        assert_eq!(c.pool.snap_max, 0, "reuse=off ⇒ 快照池关");
+        assert_eq!(c.pool.host_cache_mb, 0, "reuse=off ⇒ KV 宿主层关");
+        assert_eq!(c.pool.snap_host_mb, 0, "reuse=off ⇒ 快照宿主层关");
+        assert!(!c.pool.prefix_cache, "reuse=off ⇒ 前缀缓存关");
+        assert_eq!(c.pool.gdn_slots, 1);
+        assert_eq!(c.pool.kv_fp8, true, "kv=fp8");
+        assert_eq!(c.pool.vram_target, 0.99);
+        assert_eq!(c.pool.vram_reserve_mb, 256);
+
+        // 投机关(spec=off)
+        assert_eq!(c.spec.depth, 0, "spec=off ⇒ 深度 0");
+        assert!(!c.spec.lookup, "无草稿 ⇒ lookup 不得单开(否则装配期响亮拒)");
+
+        // KVMem 关(kvmem=off)
+        assert!(!c.kvmem.select_decode && !c.kvmem.select_partial);
+        assert!(!c.kvmem.index && !c.kvmem.pool_overcommit);
+
+        // 臂:decode=FI + 图,verify=V2(派生器口径;与仓库档的 fi-graph 不同形)
+        assert_eq!(c.kernel.decode_arm, crate::config::DecodeArm::Fi);
+        assert_eq!(c.kernel.verify_arm, crate::config::VerifyArm::V2);
+        assert!(c.kernel.fi_cuda_graph, "graphs=auto ⇒ 开图");
+        assert!(c.kernel.fi_plan_bake);
+        assert!(!c.kernel.fi_plan_restore);
+        assert!(c.kernel.gdn_chunked);
+
+        // 采样档
+        assert_eq!(c.sampling.mode, crate::config::SamplerMode::Greedy);
     }
 
     /// `--check` 的估算必须与手写档 boot 现场对齐(128k / 池 4G / fixed 0.90G)

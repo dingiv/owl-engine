@@ -220,7 +220,7 @@ lookup_nmax = 12
 lookup_nstrong = 6
 lookup_agree = 0
 # MTP 窗口/sink 的全量 schema 缺省(0 = full)。**实际性能值写在具体 MTP 档**
-# (如 qwen38_27b-3090-w4a16-mtp.toml 的 4032/64)，不要在这里做调优。
+# (如 profiles/parts/feature/mtp-window.toml 的 4032/64)，不要在这里做调优。
 mtp_window = 0
 mtp_sink = 64
 # 窗口生效的最小绝对 ctx(0 = 不设额外门槛;短 ctx 保完整历史)

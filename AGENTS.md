@@ -90,18 +90,23 @@ cargo build --release -p server                  # 生产(release 零计时税)
 cargo build --release -p server --features perf  # 基准(计时器保留)
 
 # 预检 / 生效配置 / 单键解释(不加载权重,~10–20ms)
-./target/release/server -p profiles/<档>.toml --check
-./target/release/server -p profiles/<档>.toml --print-config
-./target/release/server -p profiles/<档>.toml --explain runtime.max_seq
+./target/release/server -p profiles/qwen38_27b-3090.toml --check
+./target/release/server -p profiles/qwen38_27b-3090.toml --print-config
+./target/release/server -p profiles/qwen38_27b-3090.toml --explain runtime.max_seq
 
-# 起服务 + 诊断(默认 127.0.0.1:8135)
-./target/release/server -p profiles/<档>.toml --log-level info
-curl 127.0.0.1:8135/debug/log            # 在线调级 / 换 tag 过滤
-curl 127.0.0.1:8135/debug/metrics/<族>   # 引擎内真值(优先用这个)
-curl 127.0.0.1:8135/debug/perf/epoch/json
+# 起服务 + 诊断(常驻档端口已写进档内:3090 = 127.0.0.1:8134,3080 TP2 = 127.0.0.1:8135)
+cargo serve -p profiles/qwen38_27b-3090.toml          # 单 3090 满血(= cargo run --release -p server --)
+./target/release/server -p profiles/qwen38_27b-3080_tp2.toml --log-level info
+# 实验变体一律 `--set`,不新建入口档(入口档面由测试钉死,见 profiles/README.md):
+#   --set runtime.max_seq=81920                     # 冲上下文,接受压力腾槽
+#   --set spec.depth=0 --set spec.lookup=false      # 关投机对照臂
+curl 127.0.0.1:8134/debug/log            # 在线调级 / 换 tag 过滤
+curl 127.0.0.1:8134/debug/metrics/<族>   # 引擎内真值(优先用这个)
+curl 127.0.0.1:8134/debug/perf/epoch/json
+curl 127.0.0.1:8134/debug/vram           # 三层账 + `kv.host_duplicate_landings`(账漂指纹)
 
 # 统一测速(与 Web 前端同内核)
-cd llm_speedtest(外部存档) && uv run cli --api-url http://127.0.0.1:8135/v1/chat/completions \
+cd llm_speedtest(外部存档) && uv run cli --api-url http://127.0.0.1:8134/v1/chat/completions \
   --model <名> --flavor std
 
 # 测试
@@ -127,7 +132,7 @@ cargo test -p owl-engine --lib -- --test-threads=1    # GPU 面(必须串行)
 | `models/` | 加模型 / 格式 / 装载 | loader-interpreter · gguf-format · new-format-checklist · vision-wiring |
 | `spec/` | 投机解码 | dflash2-design · mtp-design · mtp-longctx-* · spec-decode-survey |
 | `memory/` | KV / 存储 / 长 ctx | store · kvmem-selection · longctx-attribution · prefix-deletion |
-| `serving/` | 服务面 / 会话 / 配置 | agent-surface · multi-session · cross-session-batch · config-ux |
+| `serving/` | 服务面 / 会话 / 配置 | agent-surface · multi-session · cross-session-batch · config-ux · **spec-tailcap-gpu-spin(未修 P0)** |
 | `perf/` | **调性能 / 工程纪律 / 看实测数字**(先看这张表) | **optimization-candidates(工作清单)** · perf-framework · decode-cycle · device-command-ledger · stream-ordering · log-framework · pitfalls-general · pitfalls-cuda · qwen38-single-3090 · v1-fi-switch |
 | `dev/` | 上手干活 | config · testing · debug-tools · profiling · fixtures |
 

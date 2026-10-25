@@ -1,0 +1,44 @@
+# ── 唯二常驻档 ②:双 3080 20G / TP2 / 27B AWQ-INT4 满血档 ─────────────────
+#
+# 形状:TP2(张量并行)+ 词表切分 + fp8 全 reduce + 融合 AR;
+#       prefill = eager + Marlin W4A16;decode = FlashInfer + CUDA graph;
+#       投机 = DFlash2 d7(W4A16 草稿,TP2 需 `spec.tp_draft = true`);
+#       KV = fp8 e4m3;视觉塔开(与 3090 档同形)。
+#
+# 卡位:靠 `parts/hardware/3080-tp2.toml` 的名字子串("3080"×2)去重消费;
+#       **禁 CUDA 序号**(本机 nvidia-smi 序 ≠ CUDA 序,数字序会被重解释成混插对)。
+#       要钉死物理卡用 UUID:--set parallel.device='["GPU-…","GPU-…"]'
+#
+# 上下文:262144 = 模型 `max_position_embeddings`(再高要 YaRN,别在这档里改)。
+# 与 3090 档的分工:双 3080 吃"长上下文 + 视觉",单 3090 吃"agent 低时延";
+# 两档不能同机共驻(3090 对与 3080 对各占各的卡)。
+#
+# ⚠️ 与单 3090 档同源的已知缺陷:DFlash2 尾批裁剪可让设备核自旋
+# (`docs/devlog/serving/spec-tailcap-gpu-spin-立案.md`)。
+extends = [
+  "full.toml",
+  "parts/model/27b-awq.toml",
+  "parts/feature/vision.toml",
+  "parts/feature/dflash2-27b.toml",
+  "parts/hardware/3080-tp2.toml",
+  "parts/kernel/fi-graph.toml",
+  "parts/pool/fp8.toml",
+]
+
+[server]
+bind = "127.0.0.1:8135"
+
+[runtime]
+max_seq = 262144
+max_concurrency = 1
+
+[spec]
+# TP2 草稿族放行(缺它 = tp.rs 装配期响亮拒)
+tp_draft = true
+
+[pool]
+# TP2 双卡各 20G:快照开到 1、前缀缓存关(与历史生产档一致;
+# 本机实测更高配置会撞压力腾槽/硬预算拒发,要冲先 --set 单变量复测)
+snap_max = 1
+prefix_cache = false
+vram_reserve_mb = 512

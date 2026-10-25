@@ -14,7 +14,7 @@
 #   tools/tp-ab-std.sh tp2 --extra --ignore-eos   # `--extra` 之后原样转给 cli
 #
 # 口径纪律(**改任一条都会让两臂不可比**):
-#   · 档位几何/白名单在 flavor(`profiles/qwen38_27b-3090-w4a16.toml` vs `qwen38_27b-3090-w4a16.toml`);
+#   · 档位几何/白名单在 flavor(`profiles/qwen38_27b-3090.toml` vs `profiles/qwen38_27b-3080_tp2.toml`);
 #     运行档 `testdata/args/bench-27b-tp{1,2}.toml` 只管模型路径与卡位;
 #   · **TP1 与 TP2 必须逐项同参** —— 唯一允许的差别 = rank 数(单卡 vs 双卡);
 #   · `--ignore-eos` = greedy 档跑满 256 tok(否则 OOD 词池下提前停 ⇒ decode 成伪影);
@@ -115,11 +115,11 @@ TP1_CFG="${TP1_CFG:-testdata/args/bench-27b-tp1.toml}"
 TP2_CFG="${TP2_CFG:-testdata/args/bench-27b-tp2.toml}"
 
 case "$ARM" in
-  tp1) run_arm tp1 qwen38_27b-3090-w4a16 "$TP1_CFG" ;;
-  tp2) run_arm tp2 qwen38_27b-3080_tp2-w4a16  "$TP2_CFG" ;;
+  tp1) run_arm tp1 qwen38_27b-3090 "$TP1_CFG" ;;
+  tp2) run_arm tp2 qwen38_27b-3080_tp2 "$TP2_CFG" ;;
   ab)
-    run_arm tp1 qwen38_27b-3090-w4a16 "$TP1_CFG"
-    run_arm tp2 qwen38_27b-3080_tp2-w4a16  "$TP2_CFG"
+    run_arm tp1 qwen38_27b-3090 "$TP1_CFG"
+    run_arm tp2 qwen38_27b-3080_tp2 "$TP2_CFG"
     python3 - "$OUT_DIR/tp1-std.csv" "$OUT_DIR/tp2-std.csv" <<'PY'
 import csv, sys
 def load(p):

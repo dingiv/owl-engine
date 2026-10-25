@@ -1,0 +1,87 @@
+# ── 唯二常驻档 ①:单张 3090 Ti / 27B AWQ-INT4 满血档 ──────────────────────
+#
+# 形状:prefill = eager + Marlin W4A16;decode = FlashInfer + CUDA graph;
+#       投机 = DFlash2 d7(W4A16 草稿);KV = fp8 e4m3;**视觉塔开**;
+#       前缀缓存 + 三层账全开。
+#
+# **max_seq = 79872(2026-10-25 拉满档;页对齐 2496×32)**
+# 1 快照下 boot 的 `[ctx-max]` 给 cap=90025 tok / ctx_max≈89993;
+# **但可用上限由 runtime 压力地板决定**(target = max(reserve×2,1GiB) +
+# 单块工作集实测 ≈ 64.6MB):
+#
+#   max_seq   boot 后驱动余量   可用余量(减 1GiB)   实测
+#   75712     1234MiB           210MiB              65.1k prompt 200 OK
+#   79872     1106MiB            82MiB              **70.25k prompt 200 OK**
+#   80384     ~1090MiB           ~66MiB              边界(不取)
+#   80896     ~1074MiB           ~50MiB              `PoolExhausted`
+#
+# ⇒ 取 79872(page 对齐 2496 页)。**不写 pool 容量**:池 = max_seq 自动派生。
+#
+# 与旧 65536 档的关系(2026-10-24 无视觉时实测):
+#
+#   max_seq   snap   短答    12.6k prompt   近满 ctx              N6   硬预算拒发
+#   65536     4      0.38s   585 t/s        64.7k ⇒ **1002 t/s**   **0**  0
+#   81920     4      0.38s   582 t/s        80.8k ⇒ 938 t/s       54     0
+#   98304/1   1      0.51s   579 t/s        97.0k ⇒ 728 t/s       72     0
+#
+# ⚠️ 视觉塔每 rank 全量 ⇒ live 权重 +0.86G(16.76G→17.62G),cap 从 104.5k
+#    降到 **75.8k**。**boot cap ≠ 可用上限**:runtime 压力地板 = max(reserve×2,1GiB), 
+#    快照占 4 槽(594MiB)时,75712 档 boot 后驱动余量仅 786MiB < 1GiB ⇒
+#    第一个 turn 就 `PoolExhausted(vram-hard-budget)`。实测把快照压到 **1 槽**
+#    (省 445MiB)后:free≈1234MiB,65,152-token prompt 实测 200 OK(66.5s 冷),
+#    同 prompt 第二发 cached 65,120/65,152 = **99.95%**(1.63s)⇒ 复用没丢
+#    (Durable 快照可下沉宿主,snap_host=3072)。
+#    ⇒ 本档 = 视觉 + DFlash2 d7 + fp8 KV + **1 快照**下的实测最大。
+#    代价:驱动余量长期贴着 1GiB 压力地板,会出现 `N6 压力节点` WARN
+#    (功能/缓存实测未坏;要零腾槽把 max_seq 降回 65536,或关视觉)。
+#
+# 再往上只有三条路(都要付代价):#   ① 关视觉:live 回到 16.76G ⇒ ctx_max ≈ 104.4k;
+#   ② 快照已 1 槽(再砍就是关前缀复用),换更大 ctx 只剩"关视觉/降 per_tok";
+#   ③ 262k = KVMem 部分驻留(池小于 ctx + 宿主腿 + v2 臂 + 关图):
+#      2026-10-25 实测**当前自动池仍会拒**(`[pool] 自动池装不下本档`,
+#      auto 分支在 overcommit 前判 `max_seq ≤ ctx_max`)⇒ 需要先改引擎
+#      (让 pool_overcommit 档走"逻辑 ctx=model_max、物理池=cap"),
+#      不是配置能开出来的;旧档注释里的 262k --set 配方已失效。
+#
+# ⚠️ 已知引擎缺陷(2026-10-24 立案,非本档引入):DFlash2 **尾批裁剪**形状
+# (`max_new` 剩余 ≤ depth)会让 verify 以裁后的 T 跑图档 ⇒ **核在设备上自旋**
+# (GPU util 恒 100%、主机全 futex 等待),短 `max_new` 请求可整台卡死;
+# 2026-10-25 已确定性复现(T=8 正常、T=7 自旋)。
+# 现场与判据见 `docs/devlog/serving/spec-tailcap-gpu-spin-立案.md`。
+# 规避:功能/恒等门用 `--set spec.depth=0 --set spec.lookup=false`;
+# agent 客户端给足 `max_tokens`(pi 用 8192,早停回合不受影响)。
+extends = [
+  "full.toml",
+  "parts/model/27b-awq.toml",
+  "parts/feature/vision.toml",
+  "parts/feature/dflash2-27b.toml",
+  "parts/hardware/3090-single.toml",
+  "parts/kernel/fi-graph.toml",
+  "parts/pool/fp8.toml",
+]
+
+[server]
+bind = "127.0.0.1:8134"
+
+[runtime]
+max_seq = 79872
+max_concurrency = 1
+
+[pool]
+# 快照 1 槽 = 148.5MiB:75712 档必须给 runtime 压力地板(1GiB)留空间
+# (4 槽实测会让第一个 turn `PoolExhausted`);65k 跨会话命中 99.95% 已在宿主兜住
+snap_max = 1
+prefix_cache = true
+vram_reserve_mb = 512
+# KV 宿主腿 10GiB:设备池只有 2496 槽(79k ctx),两发长 prompt 就占满;
+# 宿主腿让整链下沉(内容不丢)而不是硬拒。4GiB 实测:70k+65k 链装不下
+# ⇒ N6 只能逐叶丢(一次一个叶),第三发 27k 前缀回灌时 `槽池耗尽`
+# (2026-10-25;旧版还会丢宿主内容 ⇒ 粘性「身份未登记」,已修)。
+# 10GiB ≈ 容纳 4 条 79k 链(每条 2496 块)的冷缓存。
+host_cache_mb = 10240
+snap_host_mb = 3072
+# agent 消息边界快照:delim 空 = 用模型 ChatFormat.im_open(实测 = 1 token [248045])
+snap_msg_boundary = true
+snap_msg_delim = ""
+snap_msg_min_gap = 2048
+snap_msg_min_span = 0

@@ -76,13 +76,34 @@ pub fn profile_path(name: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
+    /// **唯二常驻档门**(2026-10-24 用户裁决):`profiles/` 顶层入口档只允许
+    /// 两个硬件档 —— 单 3090 满血 / 双 3080 TP2 满血;其余形状一律用
+    /// `--set` 临时覆盖,不再落成新文件(历史 28 个入口档的收敛记录见
+    /// `roadmap.local/profiles-consolidation-2026-10-24.md`)。
+    /// `full.toml` = 全量模板(构成底座,不是档位)、`parts/**` = 组件,不计入。
+    #[test]
+    fn 入口档面只允许唯二常驻档() {
+        let names = profile_names();
+        let mut got: Vec<&str> = names
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|n| *n != "full")
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["qwen38_27b-3080_tp2", "qwen38_27b-3090"],
+            "档面膨胀了:要新形状请用 `--set` 覆盖,不要新增入口档"
+        );
+    }
+
     /// **全量档门**:`profiles/` 下每一档都必须能经 `Completeness::Enforce`
     /// 加载(缺字段 = 拒启)。这是"档可启动"的最低保证,替代旧的历史档清单。
     #[test]
     fn 全部档均可经完整度门加载() {
         let names = profile_names();
-        assert!(names.iter().any(|n| n == "qwen38_27b-3090-w4a16"), "应有 qwen38_27b-3090-w4a16:{names:?}");
-        assert!(names.iter().any(|n| n == "qwen38_27b-3090-w4a16-dflash"), "应有 qwen38_27b-3090-w4a16-dflash:{names:?}");
+        assert!(names.iter().any(|n| n == "qwen38_27b-3090"), "应有单 3090 常驻档:{names:?}");
+        assert!(names.iter().any(|n| n == "qwen38_27b-3080_tp2"), "应有双 3080 常驻档:{names:?}");
         for n in &names {
             let p = profile_path(n).expect("profile 路径");
             crate::config::OwlConfig::load_resolved(

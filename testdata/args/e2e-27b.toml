@@ -1,7 +1,7 @@
 # e2e 黑盒测试 server 配置(apps/server/tests/e2e.rs 用 include_str! 读)
 #
 # 由 e2e.rs 在运行时写到 $TMPDIR/owl-e2e-server.toml,再以
-#   server -p profiles/qwen38_27b-3090-w4a16-dflash.toml <该文件>
+#   server -p profiles/qwen38_27b-3090.toml <该文件>
 # 拉起(端口 8135,设备 CUDA ordinal 1 = 3090 Ti)。
 #
 # 口径来由(§三十三):8448/8704 + prefill_split = 数学 gate 判据干净的配置

@@ -1,5 +1,0 @@
-# 单张 3090 Ti / 27B GGUF Q4_K_M / 32k / pi-agent 10K 前缀复用。
-extends = ["qwen38_27b-3090-gguf.toml", "parts/feature/agent-prefix.toml"]
-
-[server]
-bind = "127.0.0.1:8137"
