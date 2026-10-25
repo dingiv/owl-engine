@@ -82,6 +82,14 @@ pub struct KvStats {
     pub misses: u64,
     /// 累计被逐块数(容量驱逐)。
     pub evicted: u64,
+    /// **宿主层同身份重复落地次数**(账漂指纹;真源在宿主层,报告时合并)。
+    ///
+    /// 判据:链哈希 = 内容身份 ⇒ 同身份重复落地本可幂等合并,但**非零就说明
+    /// 有登记入口漏清了旧宿主副本**(2026-10-24 粘性毒化案)。非零 = 当案查。
+    pub host_duplicate_landings: u64,
+    /// **宿主副本缺失的删除次数**(幂等删除;真源在宿主层,报告时合并)。
+    /// 非零 = 树账说宿主、内容已不在(上游曾丢内容/账漂;2026-10-25 案)。
+    pub host_drop_missing: u64,
 }
 
 /// attention 块腿(槽池 + 前缀树)。
@@ -519,6 +527,15 @@ impl KvStore {
         tokens: &[u32],
     ) -> StoreResult<(Vec<ChainHash>, Vec<(ChainHash, Option<u32>)>)> {
         let up = self.tree.insert_offloaded(tokens);
+        // **响亮拒绝而非无声吞**:本口是“无设备槽重建”⇒ `insert_one(slot=None)`
+        // 结构上不会重绑;`rebound` 非空 = 上游判据失守(静默丢它会漏掉
+        // 引用账与幽灵宿主副本,正是 2026-10-24 毒化案的同类)。
+        if !up.rebound.is_empty() {
+            return Err(StoreError::Invariant(format!(
+                "盘/宿主重建路径不得出现重绑(收到 {} 项)—— 上游判据失守",
+                up.rebound.len()
+            )));
+        }
         let inserted: Vec<ChainHash> = up.inserted.iter().map(|(c, _)| *c).collect();
         for (_chain, slot) in &up.evicted {
             if let Some(slot) = slot {
@@ -701,6 +718,9 @@ impl KvStore {
             hits: self.hits,
             misses: self.misses,
             evicted: self.evicted,
+            // 真源在宿主层(`KvStore` 看不到)⇒ 留 0,由 `Rel::report` 合并。
+            host_duplicate_landings: 0,
+            host_drop_missing: 0,
         }
     }
 

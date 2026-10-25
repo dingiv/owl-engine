@@ -1235,7 +1235,13 @@ impl LedgerBook {
 
     fn fail(&mut self, what: &str, detail: String) {
         self.hook_fail = self.hook_fail.saturating_add(1);
-        eprintln!("[store.ledger] {what} 未入账:{detail}");
+        // 限流:首条必打(带定位 detail),之后每 1024 条一条(带累计数)。
+        // 2026-10-25 真机:快照 staging 缓冲复用会反复触发「Out from=Host」
+        // ⇒ 单会话 3840 行刷屏,把真信号淹了。计数(hook_fail)不丢。
+        let n = self.hook_fail;
+        if n == 1 || n.is_multiple_of(1024) {
+            eprintln!("[store.ledger] {what} 未入账:{detail}(累计 {n})");
+        }
     }
 
     /// 出借(登记 + 入账)。失败**响亮计数**,不 panic、不静默。

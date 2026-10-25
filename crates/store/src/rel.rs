@@ -1169,7 +1169,13 @@ impl Rel {
             .sum();
         StoreReport {
             tiers,
-            kv: self.leg.kv_stats(),
+            kv: {
+                // 宿主账漂指纹合并(真源 = 宿主层;`KvStore` 看不到宿主 ⇒ 报告处补)
+                let mut k = self.leg.kv_stats();
+                k.host_duplicate_landings = self.leg.host_duplicate_landings();
+                k.host_drop_missing = self.leg.host_drop_missing();
+                k
+            },
             state: self.state.stats(),
             active_turns: self.admission.active_turns(),
             reserved_bytes: self.admission.reserved_bytes(),

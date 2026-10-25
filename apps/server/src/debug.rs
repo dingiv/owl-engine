@@ -353,6 +353,10 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
             "hits": r.kv.hits,
             "misses": r.kv.misses,
             "evicted": r.kv.evicted,
+            // 账漂指纹:非零 = 有登记入口漏清旧宿主副本(2026-10-24 案)
+            "host_duplicate_landings": r.kv.host_duplicate_landings,
+            // 账漂指纹:非零 = 树账说宿主、内容已不在(幂等删除已计数;2026-10-25 案)
+            "host_drop_missing": r.kv.host_drop_missing,
         },
         "state": {
             // **淘汰序预览**(会话感知:同会话 depth 降序 = 末端先走)

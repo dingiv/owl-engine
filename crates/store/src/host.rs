@@ -126,6 +126,12 @@ pub struct HostTier<K = ChainHash> {
     free: Vec<HostBlock>,
     /// 因容量驱逐而累计释放的字节(报告面)。
     evicted_bytes: u64,
+    /// **同身份重复落地**次数(账漂指纹;2026-10-24 粘性毒化案新增)。
+    ///
+    /// 判据：`K` 是内容寻址链哈希 ⇒ 同身份 = 同内容，落地幂等可合并；
+    /// 但这个计数非零意味着**上游两条腿账对不上**(典型成因：重绑设备时
+    /// 没丢旧宿主副本)，必须当告警看，不是当正常路径看。
+    duplicate_landings: u64,
     /// 大页提示未生效的块数(可观测面;0 = 全部生效)。
     /// 它不等于错误:提示只影响"冷写缺页速度"(159 MiB: 12ms vs 80ms),不影响内容。
     hint_failures: usize,
@@ -157,6 +163,7 @@ impl<K: HostKey> HostTier<K> {
             resident: BTreeMap::new(),
             free: Vec::new(),
             evicted_bytes: 0,
+            duplicate_landings: 0,
             hint_failures: 0,
         })
     }
@@ -222,14 +229,54 @@ impl<K: HostKey> HostTier<K> {
         Ok(out)
     }
 
-    /// **批量落账**(命令回执后:内容已写好,装回驻留表)。
-    /// 逐项校验(大小/重复/预算);任一失败即停并上抛(已落的项保留 ——
-    /// 内容不丢,调用方据错回滚剩余部分)。
+    /// **批量落账**(命令回执后:内容已写好,装回驻留表)。**两趟、零半途态**。
+    ///
+    /// 为什么要两趟(2026-10-24 粘性毒化案)：旧版逐项 `put` 边落边校验，
+    /// 中途一撞重复/预算 ⇒ 前几块已落宿主、后面的没落，而调用方
+    /// (`commit_offload`)的 `unbind` 整个不执行 ⇒ 形成“设备还绑着 + 宿主已有几块”
+    /// 的**半半账**，下一次下沉同一块必再撞 ⇒ 每个后续 turn 全灭(须重启才解)。
+    ///
+    /// 现口径：
+    /// ① 预检(**零副作用**)：尺寸不符 / 预算越界 ⇒ **一块都不落**直接 `Err`；
+    /// ② 落地：同身份重复 = **同一内容**(K 内容寻址)⇒ 幂等换新，留本次刚从
+    ///    设备搬来的那份(它对应设备现状)，旧缓冲回收，并计入
+    ///    [`HostTier::duplicate_landings`](响亮，不静默)。
     pub fn land(&mut self, items: Vec<(K, HostBlock)>) -> StoreResult<()> {
+        // ① 预检
+        let mut fresh = 0usize;
+        for (chain, buf) in &items {
+            if buf.len() != self.block_bytes {
+                return Err(StoreError::Invariant(format!(
+                    "宿主块大小不符:{} ≠ {}",
+                    buf.len(),
+                    self.block_bytes
+                )));
+            }
+            if !self.resident.contains_key(chain) {
+                fresh += 1;
+            }
+        }
+        let after = self.used_bytes() + fresh * self.block_bytes;
+        if self.budget_bytes != 0 && after > self.budget_bytes {
+            return Err(StoreError::Exhausted(format!(
+                "宿主层越界:{after} > {}(需先驱逐)",
+                self.budget_bytes
+            )));
+        }
+        // ② 落地
         for (chain, buf) in items {
-            self.put(chain, buf)?;
+            if let Some(stale) = self.resident.remove(&chain) {
+                self.recycle(stale);
+                self.duplicate_landings += 1;
+            }
+            self.resident.insert(chain, buf);
         }
         Ok(())
+    }
+
+    /// 同身份重复落地次数(账漂指纹;报告面用)。
+    pub fn duplicate_landings(&self) -> u64 {
+        self.duplicate_landings
     }
 
     /// **批量回收空转缓冲**(换入后内容已上行;超 `free_cap` 的真释放)。
@@ -432,6 +479,51 @@ impl Connector for SlotTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `land` 预检失败 ⇒ **零副作用**(旧版逐项 `put` 边落边校验,会在
+    /// 撞错前把前几块落进去 ⇒ “设备还绑 + 宿主已有几块”的半半账;
+    /// 2026-10-24 粘性毒化案的放大器)。
+    #[test]
+    fn land_rejects_without_half_landed_state() {
+        let mut t: HostTier = HostTier::new(1024, 2048).expect("构造");
+        let items = vec![
+            (ChainHash::new(1), HostBlock::from_bytes(vec![7u8; 1024])),
+            (ChainHash::new(2), HostBlock::from_bytes(vec![7u8; 512])), // 尺寸不符
+        ];
+        let err = t.land(items).expect_err("尺寸不符必须响亮拒");
+        assert!(matches!(err, StoreError::Invariant(_)), "得 {err:?}");
+        assert_eq!(t.used_bytes(), 0, "预检失败 ⇒ 一块都不落");
+        assert!(t.resident_blocks().is_empty(), "驻留表不得动");
+    }
+
+    /// 超预算同样零副作用(预算在预检统一校,不靠逐块撞墙)。
+    #[test]
+    fn land_over_budget_lands_nothing() {
+        let mut t: HostTier = HostTier::new(1024, 2048).expect("构造");
+        let items = vec![
+            (ChainHash::new(1), HostBlock::from_bytes(vec![1u8; 1024])),
+            (ChainHash::new(2), HostBlock::from_bytes(vec![2u8; 1024])),
+            (ChainHash::new(3), HostBlock::from_bytes(vec![3u8; 1024])),
+        ];
+        assert!(matches!(t.land(items).expect_err("3 块超 2 块预算"), StoreError::Exhausted(_)));
+        assert_eq!(t.used_bytes(), 0, "超预算 ⇒ 零副作用");
+    }
+
+    /// 同身份重复落地 = 同内容(K 是内容寻址链哈希)⇒ **幂等换新**,
+    /// 但必须**留下指纹**(`duplicate_landings`)供报面追问,不静默吞过。
+    #[test]
+    fn land_merges_duplicate_identity_loudly() {
+        let mut t: HostTier = HostTier::new(1024, 2048).expect("构造");
+        let k = ChainHash::new(1);
+        t.put(k, HostBlock::from_bytes(vec![1u8; 1024])).expect("先落");
+        t.land(vec![(k, HostBlock::from_bytes(vec![2u8; 1024]))])
+            .expect("同身份 ⇒ 不该炸 turn");
+        assert_eq!(t.used_bytes(), 1024, "不重复占预算(驻留只一份)");
+        assert_eq!(t.resident_blocks().len(), 1, "驻留表不涨");
+        assert_eq!(t.free_bytes(), 1024, "旧副本进空转缓冲(RAM 复用,不白还又要)");
+        assert_eq!(t.get(k).map(|b| b.as_slice()[0]), Some(2), "留本次从设备搬来的那份");
+        assert_eq!(t.duplicate_landings(), 1, "账漂指纹必须记账");
+    }
 
     #[test]
     fn disabled_tier_rejects_loudly() {

@@ -171,6 +171,9 @@ pub struct LegOps {
     /// **宿主层让位**真删的块数(执行面兜底;>0 = 计划面曾乐观/滞后,
     /// 是"宿主满没人逐"的指纹)。
     pub host_relief_blocks: u64,
+    /// **宿主副本缺失**的删除次数(幂等删除;>0 = 树账说宿主、宿主内容已不在)。
+    /// 2026-10-25:回灌计划失败回滚会丢内容(已修);本计数是**账漂指纹**。
+    pub host_drop_missing: u64,
 }
 
 /// 腿报告(设计卷 §10 报告口径)。
@@ -394,12 +397,35 @@ impl BlockLeg {
     }
 
     /// 压力驱逐产出宿主条目 = 内容整体淘汰:把宿主副本**真的丢掉**(S3-3b 宿主面在位)。
+    /// **树变更的统一收尾**(两笔宿主账一起清;四处登记入口共用)。
+    ///
+    /// 为什么必须收成一口:2026-10-24 的"粘性毒化"案就是**入口各写各的收尾**
+    /// 写漏了一笔 —— `register_chain_owned`(turn 收口的生产入口)只清了
+    /// `evicted`,漏了 `host_drop`,于是"块沉宿主 → 同前缀重算重绑"留下幽灵
+    /// 副本 ⇒ 之后每次下沉 `host.land` 撞「块 … 已在宿主层」⇒ 每个 turn 全灭。
+    /// 判据:
+    /// - `evicted` 里 `slot = None` 的条目 = 离树时载体在宿主 ⇒ 副本要丢;
+    /// - `host_drop` = 同身份**重绑到设备新槽**时的旧宿主副本(幽灵)⇒ 必须当场丢。
+    fn finish_tree_update(&mut self, up: &CacheUpdate) -> StoreResult<()> {
+        self.drop_host_evicted(&up.evicted)?;
+        self.drop_host_chains(&up.host_drop)?;
+        Ok(())
+    }
+
     fn drop_host_evicted(&mut self, evicted: &[(ChainHash, Option<u32>)]) -> StoreResult<()> {
+        let mut missing = 0usize;
         for (chain, slot) in evicted {
             if slot.is_none() {
-                let _ = self.host.evict(*chain)?;
+                match self.host.evict(*chain) {
+                    Ok(_) => {}
+                    // 删除语义是幂等:树说宿主但副本已不在 ⇒ 内容已丢,删条目仍是对的。
+                    // 不许静默:"宿主副本缺失"计数 + 一条 WARN(2026-10-25 粘性毒化案)。
+                    Err(StoreError::Unknown(_)) => missing += 1,
+                    Err(e) => return Err(e),
+                }
             }
         }
+        self.note_host_drop_missing(missing);
         Ok(())
     }
 
@@ -427,6 +453,14 @@ impl BlockLeg {
     /// 内容是否在宿主层(不判设备)。
     pub fn host_contains(&self, chain: ChainHash) -> bool {
         self.host.get(chain).is_some()
+    }
+
+    /// 宿主层**同身份重复落地**次数(账漂指纹;0 = 两腿账一直对齐)。
+    ///
+    /// 它不是错误(同身份 = 同内容 ⇒ 落地可幂等合并),而是**上游漏了
+    /// 旧副本清理**的现场证据 —— 非零就应当案。
+    pub fn host_duplicate_landings(&self) -> u64 {
+        self.host.duplicate_landings()
     }
 
     /// **放入宿主层并摘掉设备绑定**(S6:盘层搬运的两端都走这里)。
@@ -510,6 +544,11 @@ impl BlockLeg {
         self.ops.host_relief_blocks
     }
 
+    /// **宿主副本缺失**计数(幂等删除;>0 = 树账说宿主、内容已不在)。
+    pub fn host_drop_missing(&self) -> u64 {
+        self.ops.host_drop_missing
+    }
+
     /// 宿主层预算(字节;0 = 关层)。
     pub fn host_budget_bytes(&self) -> usize {
         self.host.budget_bytes()
@@ -546,6 +585,21 @@ impl BlockLeg {
     }
 
     /// **带归属的链登记**(turn 收口;会话感知淘汰的唯一写入口)。
+    ///
+    /// 与 [`BlockLeg::register_chain`] 同款收尾(**两条都不能省**):
+    /// - `drop_host_evicted`:被容量逐出的宿主条目 ⇒ 宿主副本一起丢;
+    /// - `drop_host_chains`:同身份**重绑到新设备槽** ⇒ 旧的宿主副本是幽灵,
+    ///   必须当场丢。
+    ///
+    /// ⚠️ 2026-10-24 定谳:本口原先**只做了第一条**(兄弟口 `register_chain` /
+    /// `register_chain_inc` 两条都做),而它正是 turn 收口的生产入口
+    /// (`engine/src/exec/turn_end.rs`)⇒ 块下沉到宿主后若被重算并重绑设备,
+    /// 宿主副本留尸 ⇒ 之后每次下沉 `host.land` 必撞「块 … 已在宿主层」,
+    /// 且 `land` 半途失败 ⇒ `unbind` 不执行 ⇒ 双驻留原地不动 ⇒
+    /// **此后每个 turn 全灭**(粘性毒化,须重启才解)。回归门(在库、可红可绿):
+    /// `crates/store/tests/store_e2e.rs::owned_recompute_leaves_no_host_ghost`;
+    /// 账漂指纹:`HostTier::duplicate_landings` → `/debug/vram` 的
+    /// `kv.host_duplicate_landings`(非零 = 某个登记入口又在留尸)。
     pub fn register_chain_owned(
         &mut self,
         tokens: &[u32],
@@ -553,7 +607,7 @@ impl BlockLeg {
         session: u64,
     ) -> StoreResult<CacheUpdate> {
         let up = self.kv.register_chain_owned(tokens, table, session)?;
-        self.drop_host_evicted(&up.evicted)?;
+        self.finish_tree_update(&up)?;
         Ok(up)
     }
 
@@ -757,9 +811,7 @@ impl BlockLeg {
     /// 一起丢掉(`ensure_for_len` 那条路有,这里原先漏了:副本留尸)。
     pub fn register_chain(&mut self, tokens: &[u32], table: &[u32]) -> StoreResult<CacheUpdate> {
         let up = self.kv.register_chain(tokens, table)?;
-        self.drop_host_evicted(&up.evicted)?;
-        // **重绑掉宿主的幽灵副本**(2026-10-20;见 `CacheUpdate::host_drop`)
-        self.drop_host_chains(&up.host_drop)?;
+        self.finish_tree_update(&up)?;
         Ok(up)
     }
 
@@ -770,6 +822,9 @@ impl BlockLeg {
         if !evicted.is_empty() {
             self.ops.ensure_evicted += evicted.len() as u64;
         }
+        // 同款收尾:被逐条目若载体在宿主(slot=None),宿主副本必须一起丢,
+        // 否则留尸 ⇒ 同身份日后 `host.land` 撞「已在宿主层」(2026-10-24 案)。
+        self.drop_host_evicted(&evicted)?;
         Ok(inserted)
     }
 
@@ -783,17 +838,41 @@ impl BlockLeg {
         blocks: &[(&[u32], u32)],
     ) -> StoreResult<crate::kv::CacheUpdate> {
         let up = self.kv.register_chain_inc(parent0, blocks)?;
-        self.drop_host_evicted(&up.evicted)?;
-        self.drop_host_chains(&up.host_drop)?;
+        self.finish_tree_update(&up)?;
         Ok(up)
     }
 
     /// 丢掉一批**宿主副本**(内容已重绑设备或已离树)。
+    ///
+    /// 删除是**幂等**的:副本本就不在 = 目标状态已达成(2026-10-25 粘性毒化
+    /// 案:回灌失败丢内容后,下一次树更新必在 `host_drop` 撞 Unknown,旧实现
+    /// 让每个后续 turn 全灭)。"不在"不静默:计入 `host_drop_missing` + WARN;
+    /// 真错误(尺寸/预算等)仍上抛。
     fn drop_host_chains(&mut self, chains: &[ChainHash]) -> StoreResult<()> {
+        let mut missing = 0usize;
         for chain in chains {
-            let _ = self.host.evict(*chain)?;
+            match self.host.evict(*chain) {
+                Ok(_) => {}
+                Err(StoreError::Unknown(_)) => missing += 1,
+                Err(e) => return Err(e),
+            }
         }
+        self.note_host_drop_missing(missing);
         Ok(())
+    }
+
+    /// "宿主副本缺失"合计(WARN + 计数一次;`drop_host_*` 共用)。
+    fn note_host_drop_missing(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.ops.host_drop_missing += n as u64;
+        owl_shared::log_warn!(
+            "store",
+            "宿主副本缺失 {n} 块(树账说宿主、内容已不在 ⇒ 按幂等删除继续;累计 {})—— \
+             上游曾有内容丢失/账漂,查回灌失败与 plan_onload 回滚",
+            self.ops.host_drop_missing
+        );
     }
 
     /// 释放整张表的引用(表回空;与逐块 `release` 同源)。
@@ -1095,7 +1174,14 @@ pub fn abort_offload(leg: &mut BlockLeg, blocks: &[(ChainHash, u32)]) {
 }
 
 /// **回灌计划**(纯 host):逐块取宿主内容 → 分配槽 → 组片。
-/// 任一环节失败即回滚已做的部分(内容放回 / 槽归还),不留半态。
+/// 任一环节失败即回滚已做的部分(**宿主内容放回** / 槽归还),不留半态。
+///
+/// ⚠️ 2026-10-25 定谳:旧版在失败回滚时把**已取出的宿主缓冲丢进小决池**
+/// (`recycle_many`)—— 内容没了但树条目仍是 `slot = None`(宿主驻留)⇒
+/// 之后任何 `drop_host_evicted` / `drop_cached` 都撞「块 … 不在宿主层」,
+/// **一个 turn 失败后整台粘性毒化**(只能重启)。根因就是这里:
+/// 回灌失败时(i)宿主内容必须原样放回,(ii)不能用 recycle(那是“丢弃”语义)。
+/// 回归门:`plan_onload_slot_exhaustion_keeps_host_content`。
 pub fn plan_onload(leg: &mut BlockLeg, chains: &[ChainHash]) -> StoreResult<InPlan> {
     if chains.is_empty() {
         return Ok(InPlan {
@@ -1108,11 +1194,12 @@ pub fn plan_onload(leg: &mut BlockLeg, chains: &[ChainHash]) -> StoreResult<InPl
     }
     leg.pieces()?; // 未注册布局 = 先拒(别先动宿主)
     let mut bufs: Vec<HostBlock> = Vec::with_capacity(chains.len());
-    for c in chains {
+    for (i, c) in chains.iter().enumerate() {
         match leg.host.take(*c) {
             Ok(b) => bufs.push(b),
             Err(e) => {
-                leg.host.recycle_many(bufs);
+                // 部分取走 ⇒ 已取出的必须放回(否则树说宿主、内容已丢)。
+                put_back_host(leg, &chains[..i], bufs)?;
                 return Err(e);
             }
         }
@@ -1125,16 +1212,43 @@ pub fn plan_onload(leg: &mut BlockLeg, chains: &[ChainHash]) -> StoreResult<InPl
                 for s in &slots {
                     let _ = leg.kv.decref(*s);
                 }
-                leg.host.recycle_many(bufs);
+                put_back_host(leg, chains, bufs)?;
                 return Err(e);
             }
         }
     }
     let planes: Vec<(ChainHash, u32)> = chains.iter().copied().zip(slots.iter().copied()).collect();
-    let pieces = (0..leg.planes)
+    let pieces = match (0..leg.planes)
         .map(|p| in_pieces(leg, &planes, 0, p))
-        .collect::<StoreResult<Vec<_>>>()?;
+        .collect::<StoreResult<Vec<_>>>()
+    {
+        Ok(p) => p,
+        Err(e) => {
+            for s in &slots {
+                let _ = leg.kv.decref(*s);
+            }
+            put_back_host(leg, chains, bufs)?;
+            return Err(e);
+        }
+    };
     Ok(InPlan { chains: chains.to_vec(), slots, pieces, table: SlotTable::new(bufs) })
+}
+
+/// 回灌计划失败时把**已取出的宿主内容原样放回**。
+/// 放不回 = 真不变量违反(响亮;不许吞):树条目将变成“宿主驻留但内容不在”的假账。
+fn put_back_host(
+    leg: &mut BlockLeg,
+    chains: &[ChainHash],
+    bufs: Vec<HostBlock>,
+) -> StoreResult<()> {
+    for (c, b) in chains.iter().zip(bufs) {
+        leg.host.put(*c, b).map_err(|e| {
+            StoreError::Invariant(format!(
+                "回灌计划回滚失败:宿主内容放不回 {c:?}(树将留假账):{e}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// **回灌记账**(搬运成功后调用;纯 host):缓冲回池 + 绑定回设备(引用 +1)+ 计数。
@@ -1573,7 +1687,113 @@ mod tests {
         assert_eq!(rep.ops.offloads, 0);
     }
 
-    /// 字节口径直读(测试可读性;`usize` 本身即字节)。
+    /// **同病第二扇门（2026-10-24）**：启动按盘上索引重建树走
+    /// `register_chain_offloaded`，超缓存上限会逐出旧条目；被逐条目若载体在
+    /// 宿主，宿主副本必须一起丢 —— 否则留尸（与 `register_chain_owned` 那次
+    /// 是同一种毒：树账与宿主账对不上 ⇒ 日后同身份 `host.land` 必撞）。
+    #[test]
+    fn offloaded_rebuild_drops_host_copies_of_evicted() {
+        let mut l = leg_with(2); // cache cap = 4 + 2 = 6 块
+        let block_bytes = PIECE_ELEMS * 4 * 2;
+
+        // ① 一块真内容沉到宿主（树 slot=None + 宿主有副本）
+        let a_tokens: Vec<u32> = (0..TOKENS_PER_BLOCK as u32).collect();
+        let mut table = Vec::new();
+        l.ensure_for_len(&mut table, a_tokens.len()).expect("块表");
+        l.register_chain(&a_tokens, &table).expect("登记");
+        let a = l.match_prefix(&a_tokens).expect("命中").hashes[0];
+        l.release_table(&mut table).expect("归还");
+        l.put_host(a, crate::host::HostBlock::from_bytes(vec![7u8; block_bytes]))
+            .expect("入宿主");
+        assert!(l.host_contains(a), "前置：宿主确有副本");
+
+        // ② 按盘重建式登记（无设备槽），超上限 ⇒ 最冷的 a 被逐出树
+        for i in 0..6u32 {
+            let t: Vec<u32> = (100 + i * 32..100 + i * 32 + TOKENS_PER_BLOCK as u32).collect();
+            l.register_chain_offloaded(&t).expect("盘索重建式登记");
+        }
+        assert!(!l.host_contains(a), "被逐条目的宿主副本不得留尸");
+        assert_eq!(l.host_duplicate_landings(), 0, "全程不该出现同身份重复落地");
+    }
+
+    /// **2026-10-25 粘性毒化回归**:回灌计划在**槽不足**时失败,已取出的宿主内容
+    /// 必须原样放回(旧版 `recycle_many` 丢掉内容 ⇒ 树说宿主、宿主无副本 ⇒
+    /// 后续任何 drop 都撞 `Unknown`,每个 turn 全灭)。
+    #[tokio::test]
+    async fn plan_onload_slot_exhaustion_keeps_host_content() {
+        let mut face = CpuFace::default();
+        let pieces = pieces_n(&mut face, 2).await;
+        let mut l = leg(); // 2 槽
+        l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces })
+            .expect("注册");
+
+        // A:一块;登记缓存后放会话引用 ⇒ 可下沉(腾出 1 槽)。
+        let toks_a: Vec<u32> = (0..32).collect();
+        let mut ta = Vec::new();
+        l.ensure_for_len(&mut ta, 32).expect("A 块表");
+        l.register_chain(&toks_a, &ta).expect("A 登记");
+        l.release_table(&mut ta).expect("A 会话归还");
+        let tail_a = l.match_prefix(&toks_a).expect("A 命中").hashes[0];
+        do_offload(&mut l, &mut face, tail_a).await.expect("A 整链下沉");
+        assert!(l.host_contains(tail_a), "前置:宿主有副本");
+        assert_eq!(l.report().slots_free, 2, "A 整链(1 块)下沉后两槽都空");
+
+        // B:两块占满补充后的两槽。
+        let toks_b: Vec<u32> = (100..164).collect();
+        let mut tb = Vec::new();
+        l.ensure_for_len(&mut tb, 64).expect("B 块表");
+        l.register_chain(&toks_b, &tb).expect("B 登记");
+        l.release_table(&mut tb).expect("B 会话归还");
+        assert_eq!(l.report().slots_free, 0, "槽已占满");
+
+        // 回灌失败(无槽)—— 宿主内容不许丢。
+        let err = match plan_onload(&mut l, &[tail_a]) {
+            Err(e) => e,
+            Ok(_) => panic!("无槽必须拒"),
+        };
+        assert!(matches!(err, StoreError::Exhausted(_)), "得 {err:?}");
+        assert!(l.host_contains(tail_a), "失败回滚后宿主内容必须还在");
+        let hit = l.match_prefix(&toks_a).expect("A 仍在树");
+        assert!(hit.slots[0].is_none(), "树仍是宿主驻留(slot=None)");
+        assert_eq!(l.host_drop_missing(), 0, "不应有账漂");
+
+        // 松开一槽后回灌必须成功(内容一直可用,不是“失败即丢”)。
+        let tail_b = l.match_prefix(&toks_b).expect("B 命中").hashes[0];
+        l.drop_cached(tail_b).expect("腾一槽");
+        let p = plan_onload(&mut l, &[tail_a]).expect("有槽后回灌计划成功");
+        assert!(!l.host_contains(tail_a), "计划成功 = 内容已交给槽台");
+        commit_onload(&mut l, &p.chains, &p.slots, p.table).expect("回灌记账");
+        let hit = l.match_prefix(&toks_a).expect("A 命中");
+        assert!(hit.slots[0].is_some(), "树已重绑设备槽");
+    }
+
+    /// **删除幂等**:树账说宿主、宿主副本已不在(历史内容丢失/账漂)时,
+    /// `drop_host_*` 不得上抛 `Unknown` 把后续 turn 全灭;必须计数 + WARN 并继续。
+    #[tokio::test]
+    async fn missing_host_copy_on_drop_is_idempotent_not_fatal() {
+        let mut face = CpuFace::default();
+        let pieces = pieces_n(&mut face, 2).await;
+        let mut l = leg();
+        l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces })
+            .expect("注册");
+        let toks: Vec<u32> = (0..64).collect();
+        let mut t = Vec::new();
+        l.ensure_for_len(&mut t, 64).expect("块表");
+        l.register_chain(&toks, &t).expect("登记");
+        l.release_table(&mut t).expect("会话归还");
+        let tail = l.match_prefix(&toks).expect("命中").hashes[1];
+        do_offload(&mut l, &mut face, tail).await.expect("下沉");
+        assert!(l.host_contains(tail));
+
+        // 模拟历史内容丢失(树未改):宿主副本先没。
+        l.host.evict(tail).expect("模拟内容丢失");
+        assert!(!l.host_contains(tail));
+        l.drop_host_evicted(&[(tail, None)]).expect("幂等删除不得上抛");
+        l.drop_host_chains(&[tail]).expect("重复幂等删除也不得上抛");
+        assert_eq!(l.host_drop_missing(), 2, "两处缺失都要入账(响亮)");
+    }
+
+    /// 字节口径直读（测试可读性；`usize` 本身即字节）。
     fn real(v: usize) -> usize {
         v
     }

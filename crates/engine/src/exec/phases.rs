@@ -185,6 +185,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 b.pending_loads.iter().map(|(_, c)| *c).collect();
             // **S6**:盘上的块先读回宿主(盘 → 设备要两跳;判据与账都在 store)
             let _ = self.ensure_host_resident(&chains).await?;
+            // **设备槽先腾够**:前缀命中面在宿主时要**一次性回灌 N 块**;池可能正被
+            // 缓存占满(2026-10-25 实测:两发长 prompt 后第三发 27k 前缀 844 块、
+            // free 459 ⇒ `plan_onload` 半途 `alloc_slot` 失败,旧版还会丢宿主内容
+            // ⇒ 粘性「身份未登记」)。需求驱动保洁按 store 政策逐冷腾槽;
+            // 搬不动就让它真拒(不静默降级)。
+            let need_slots = chains.len();
+            if self.bank.rel.leg.slots_free() < need_slots {
+                self.pool_housekeeping(owl_store::Need::kv(
+                    need_slots,
+                    owl_store::NeedWhy::Grow,
+                ))
+                .await?;
+            }
             let (cs, new_slots, pieces, table) = {
                 let p = owl_store::plan_onload(&mut self.bank.rel.leg, &chains)?;
                 (p.chains, p.slots, p.pieces, p.table)
@@ -897,28 +910,41 @@ if self.dev.graphs.session.has_input("sel_pt") {
                 let _page = self.dev.pool.geom.page;
                 let k_off =
                     |slot: usize, d: usize| -> usize { owl_models::env::knhd_offset(slot, 0, d, hkv, hd) };
-                let probe = |slot: usize| -> usize {
+                let probe = |slot: usize| -> Option<usize> {
+                    let win = if fp8 { 8usize } else { 16usize };
                     let base = k_off(slot, 0) * esz;
+                    // 守卫:回读面只覆盖 `whole.len()`;长 ctx 下槽号可以远超
+                    // 该面(2026-10-24 实测 pos=40352 > 面 25600 槽 ⇒ 越界 panic)。
+                    // 诊断面**只报告取不到**,绝不掀翻引擎。
+                    if base + win > whole.len() {
+                        return None;
+                    }
                     if fp8 {
-                        whole[base..base + 8].iter().filter(|&&b| b != 0).count()
+                        Some(whole[base..base + 8].iter().filter(|&&b| b != 0).count())
                     } else {
-                        whole[base..base + 16]
-                            .chunks_exact(2)
-                            .filter(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32() != 0.0)
-                            .count()
+                        Some(
+                            whole[base..base + 16]
+                                .chunks_exact(2)
+                                .filter(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32() != 0.0)
+                                .count(),
+                        )
                     }
                 };
                 let pos_now = pos;
                 owl_shared::log_debug!(
-                    "kv-dump", "fp8={fp8} pos={pos_now} 槽2非零={}/8 槽{pos_now}非零={}/8 槽{}非零={}/8",
+                    "kv-dump", "fp8={fp8} pos={pos_now} 槽2非零={:?} 槽{pos_now}非零={:?} 槽{}非零={:?}(回读面 {}B)",
                     probe(2),
                     probe(pos_now),
                     pos_now.saturating_sub(1),
-                    probe(pos_now.saturating_sub(1))
+                    probe(pos_now.saturating_sub(1)),
+                    whole.len()
                 );
                 // 取证:当前槽 k 值(f16 半值 / fp8 原始字节,头 0,维 0..8)
                 let base_now = k_off(pos_now, 0) * esz;
-                if fp8 {
+                let win_now = if fp8 { 8usize } else { 16usize };
+                if base_now + win_now > whole.len() {
+                    owl_shared::log_debug!("kv-hex", "槽{pos_now} 越出回读面(base={base_now} win={win_now} 面={}B)⇒ 跳过", whole.len());
+                } else if fp8 {
                     let hex: String = whole[base_now..base_now + 8]
                         .iter()
                         .map(|b| format!("{b:02x}"))

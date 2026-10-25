@@ -401,3 +401,60 @@ async fn pressure_offloads_without_deficit_and_prefers_host() {
     assert!(idle.out.iter().all(|o| o.sink() == Sink::Host), "空转整理同样先下沉");
     assert!(idle.deny.is_none(), "有可搬面 ⇒ 不拒");
 }
+// ───────────────── 生产路径回归:重算重绑不得留宿主幽灵 ─────────────────
+//
+// 2026-10-24 定谳案:`BlockLeg::register_chain_owned` 缺一步
+// `drop_host_chains` ⇒ "块先沉宿主 → 同前缀被重算并重绑设备"时旧宿主副本留尸
+// ⇒ 下一次 `commit_offload` 的 `host.land` 撞「块 … 已在宿主层」⇒ `unbind`
+// 不执行 ⇒ 双驻留原地不动 ⇒ 之后**每个 turn 全灭**(实测:队列卡死,须重启)。
+//
+// 本用例在无修复版本上必须是红的(第 ④ 步 Err Invariant)。
+#[tokio::test]
+async fn owned_recompute_leaves_no_host_ghost() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let mut l = leg(6);
+    l.attach_pool(PoolLayout {
+        class: BlockClass::KvPage,
+        epoch: 1,
+        pieces: ps.clone(),
+    })
+    .expect("注册布局");
+
+    let tokens: Vec<u32> = (0..96).collect(); // 3 块
+
+    // ① 生产入口:带归属登记(turn 收口),随后归还会话引用 ⇒ 缓存独占
+    let mut table = Vec::new();
+    l.ensure_for_len(&mut table, tokens.len()).expect("块表");
+    l.register_chain_owned(&tokens, &table, 7).expect("首登");
+    l.release_table(&mut table).expect("归还");
+
+    let hashes = l.match_prefix(&tokens).expect("命中").hashes;
+    assert_eq!(hashes.len(), 3);
+
+    // ② 整条沉到宿主
+    engine_offload(&mut l, &mut face, *hashes.last().expect("链尾"))
+        .await
+        .expect("换出");
+    for h in &hashes {
+        assert!(l.host_contains(*h), "沉完应在宿主:{h:?}");
+    }
+    assert_eq!(l.report().host_blocks, 3, "宿主账 = 3 块");
+
+    // ③ 同前缀被重算(新设备槽)+ 带归属登记 ⇒ 旧宿主副本是幽灵,必须当场丢
+    let mut t2 = Vec::new();
+    l.ensure_for_len(&mut t2, tokens.len()).expect("重算块表");
+    l.register_chain_owned(&tokens, &t2, 7).expect("重登(重绑)");
+    l.release_table(&mut t2).expect("归还");
+    for h in &hashes {
+        assert!(!l.host_contains(*h), "重绑设备后不得留宿主幽灵:{h:?}");
+    }
+    assert_eq!(l.report().host_blocks, 0, "树账应全回设备");
+
+    // ④ 再沉一次 —— 病灶版在这里抛「已在宿主层」,并因此毒化后续每个 turn
+    engine_offload(&mut l, &mut face, *hashes.last().expect("链尾"))
+        .await
+        .expect("再下沉(修复前必炸)");
+    assert_eq!(l.host_duplicate_landings(), 0, "源头修好后不该有重复落地");
+    assert_eq!(l.report().host_blocks, 3, "第二次下沉同样 3 块入宿主");
+}
