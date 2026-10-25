@@ -1,7 +1,8 @@
 # DFlash2 尾批裁剪 × verify 图档 —— 设备核自旋立案(2026-10-24)
 
-> 状态:**未修,已定性地**。严重度:**P0**(整台引擎被一个 turn 钉死,
-> 只能重启;`max_concurrency=1` 时后续请求全部排队饿死)。
+> 状态:**已修(2026-10-25,根因定谳 + 真机 2 boot / 双形状验证)**。
+> 严重度:**P0**(整台引擎被一个 turn 钉死,只能重启;
+> `max_concurrency=1` 时后续请求全部排队饿死)。修复见 §十。
 > 影响档:`profiles/qwen38_27b-3090.toml`、`profiles/qwen38_27b-3080_tp2.toml`
 > (凡 `spec.depth > 0` + 图档 decode 臂皆可能命中)。
 
@@ -90,14 +91,14 @@ curl -s http://127.0.0.1:8134/v1/chat/completions -H 'Content-Type: application/
 
 关掉投机(`--set spec.depth=0 --set spec.lookup=false`)同请求 0.4s 返回。
 
-## 五、规避(现在就能用)
+## 五、规避(修复前的临时手段;2026-10-25 修复后不再需要)
 
 1. **客户端给足 `max_tokens`**:`≥ 64` 基本不进裁剪,agent 场景(pi = 8192)不受影响;
    但**"跑到 `max_tokens` 上限"的回合仍会进尾批** ⇒ 这不是免疫,只是低概率。
 2. 短请求/评测臂用 `--set spec.depth=0 --set spec.lookup=false`(恒等门本来就要求 spec-off)。
 3. 一旦被钉死:只能 kill 重启(`SIGTERM` 收不掉在飞的 turn,见 §七)。
 
-## 六、下一步取证建议
+## 六、下一步取证建议(修复前记录;§十 已定谳)
 
 - 在 `verify_round` 入口断言:`graph 烤进的 rows` 与 `target_rows` 不等 ⇒ 响亮拒
   (而不是带着错形状发射),先把它从"自旋"变成"报错",顺便确认假设 1;
@@ -155,3 +156,59 @@ debug 档停在(删去无关行):
 3. 卡死判定双判据可复用:`GPU util 恒 100%` + `/health` 200 但 chat 不返回;
 4. 功能验收请在 spec-off 下跑(`--set spec.depth=0 --set spec.lookup=false`),
    本次 pi 全链(spec-off)35 轮零错误、`host_duplicate_landings=0`。
+
+
+## 十、修复(2026-10-25)
+
+### 根因(假设 1 成立,假设 2 不是根因)
+
+`execute_spec_round` 把 **`live + 1`** 当成 `verify_round` 的 `target_rows`
+传进去。`verify_round` 又把这个值用于:
+
+- `fi_plan_spec(target_rows, ctx_total)` —— FI plan 的 `total_rows`；
+- `gdn_cu = target_rows`；
+- `xqa_seq = pos + target_rows`。
+
+但 verify 的 **CUDA graph 是按 `depth+1` 行捕获的**。尾批 `live < depth` 时，
+目标行变成 `T=7/4/...`，却复用满宽 `T=8` 的图；FI 的尾部 CTA 被掩掉后仍在
+等一个由满宽同伴写来的信号 ⇒ 设备自旋、GPU 100%、主机全 futex。
+
+§三的假设 1（图档形状错配）成立；假设 2（`int_ws` 置位条件）不是根因。
+
+### 修复
+
+**预算截断只作用于提交面，绝不改 verify 图的 target 形状。**
+
+- `execute_spec_round` 的 `live` 仍按 `live_depth_for_budget` 计算，只用于
+  接受/提交上限；
+- `verify_round` **不再收 `target_rows` 参数**；内部固定
+  `target_rows = block.len() (= depth+1)`；
+- FI plan/GDN/XQA 全部按满宽 `depth+1` 发射，与捕获图一致；
+- 未接受的行由既有 fold/回滚路径丢弃（KV 覆写幂等）。
+
+结构性防回归：调用点无法再传一个更小的 target_rows（签名已删）。
+
+### 真机验证
+
+固定二进制 = 本修复后的 `server`，`qwen38_27b-3090.toml`（spec d7，
+`max_seq=49152`）与 `qwen38_27b-3080_tp2.toml` 各起一次：
+
+| 用例 | 修复前 | 修复后 |
+|---|---|---|
+| `max_tokens=16`, "What is 2+2?" | 可能卡死 | **0.17s 返回，16 tok** |
+| `max_tokens=64`, "用一句话说明什么是目录。不要思考。" | 2/2 boot 卡死 | **1.2s 返回，64 tok** |
+| `max_tokens ∈ {2,3,4,5,6,7,8,9,10,12,14,15,16,17,20,32,64}` | — | **17/17 返回，无自旋** |
+| 第二次独立 boot + 同请求 | — | **通过** |
+| 3080 TP2 + 同请求 | — | **通过** |
+| spec-on vs spec-off 同 prompt/temp=0/max_tokens=64 | — | **content/reasoning 逐字节一致** |
+
+关键日志判据（debug 档）：尾批轮仍打印
+`[owl-fi] [plan] ... total_rows=8 ...`，不再出现 `total_rows=7` 后无后续；
+请求完成后 `nvidia-smi` GPU util 回到 0。
+
+### 残留
+
+- 本修复不改变 `SIGTERM` 收不住在飞 turn 的 §七 问题；
+  卡死已不再发生，但关停语义仍应另案补。
+- 尾批仍会多算未提交的 draft 行（full width），这是换取图形状稳定的代价；
+  只发生在接近 `max_tokens` 的尾部，量级可忽略。
