@@ -12,6 +12,10 @@
 > **设计参考(必读)**:`KVMem: Virtualizing Million-Token Agent Workspaces on a Consumer
 > GPU`(Di Chai et al.,arXiv:2609.04852v1,2026-09;本机 `kvmem.pdf`)——
 > 同题(24GB 卡 + Qwen3.8-27B + MTP 跑 1M 工作区),其四机制 = 本卷骨架的对照系(§3.6)。
+>
+> **2026-10-25 更新**：engine 侧调用面已收口为 `StoreHook::{Acquire,Release,Maintain}`
+> （Phase 1，行为保持）；本卷中的 `Node` 描述保留为历史，新契约见
+> [`store-hook-contract.md`](store-hook-contract.md)。
 
 ## 0. 立项口径(边界,先说清楚)
 

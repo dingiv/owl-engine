@@ -194,7 +194,7 @@ async fn idle_node_offloads_device_snapshot_via_store_plan() {
     running.dev.pool.snap_place(0, key);
 
     running
-        .node(crate::running::Node::Idle(0))
+        .store_hook(crate::store_hook::StoreHook::idle(0))
         .await
         .expect("Idle 节点");
 
@@ -267,11 +267,9 @@ async fn disk_spill_and_fill_roundtrip() {
 
     // **拍 1**:目标 1 张 ⇒ 沉到宿主(宿主 1 位,刚好)
     running
-        .pool_housekeeping(owl_store::Need {
-            slots: 0,
-            snap_bytes: bytes,
-            why: owl_store::NeedWhy::Pressure,
-        })
+        .store_hook(crate::store_hook::StoreHook::Maintain(
+            crate::store_hook::Maintain::Pressure { slots: 0, snap_bytes: bytes },
+        ))
         .await
         .expect("拍 1");
     let st1 = running.bank.rel.state.stats();
@@ -284,11 +282,9 @@ async fn disk_spill_and_fill_roundtrip() {
 
     // **拍 2**:宿主满 ⇒ 逐层律第三步:把宿主里最冷的那张挪到磁盘(内容不丢)
     running
-        .pool_housekeeping(owl_store::Need {
-            slots: 0,
-            snap_bytes: bytes,
-            why: owl_store::NeedWhy::Pressure,
-        })
+        .store_hook(crate::store_hook::StoreHook::Maintain(
+            crate::store_hook::Maintain::Pressure { slots: 0, snap_bytes: bytes },
+        ))
         .await
         .expect("拍 2");
     let disk = running.bank.rel.snap_disk.as_ref().unwrap().resident_count();
@@ -439,11 +435,9 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
         // 压力保洁(N6):设备 → 宿主 → 磁盘(小宿主 ⇒ 必然溢写)
         for _ in 0..6 {
             running
-                .pool_housekeeping(owl_store::Need {
-                    slots: 8,
-                    snap_bytes: 0,
-                    why: owl_store::NeedWhy::Pressure,
-                })
+                .store_hook(crate::store_hook::StoreHook::Maintain(
+                    crate::store_hook::Maintain::Pressure { slots: 8, snap_bytes: 0 },
+                ))
                 .await
                 .expect("保洁");
         }
@@ -540,11 +534,9 @@ async fn disk_adopt_on_boot_restores_ledger() {
         running.dev.pool.snap_place(0, key);
         for _ in 0..2 {
             running
-                .pool_housekeeping(owl_store::Need {
-                    slots: 0,
-                    snap_bytes: bytes,
-                    why: owl_store::NeedWhy::Pressure,
-                })
+                .store_hook(crate::store_hook::StoreHook::Maintain(
+                    crate::store_hook::Maintain::Pressure { slots: 0, snap_bytes: bytes },
+                ))
                 .await
                 .expect("保洁");
         }
@@ -907,7 +899,7 @@ async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D
     //    唯一判据出 `Snap{Host}` 票 ⇒ engine 执行臂把设备层快照下沉。
     //    (接线前:状态腿只能等 capture 撞满时被 engine 池被动逐 —— 第二套判据)
     running
-        .node(crate::running::Node::Idle(0))
+        .store_hook(crate::store_hook::StoreHook::idle(0))
         .await
         .expect("Idle 节点");
     let rep3 = running.store_report();

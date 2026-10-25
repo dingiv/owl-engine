@@ -2035,6 +2035,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         "逐出生成段快照 {victim:?}(逐出即丢,不下沉)"
                     );
                 } else {
+                    // FIXME(store-hook): H7 状态腿旁路(snapshot victim → host);
+                    // 应归 StoreHook::Maintain(State) / Release,不直呼 snap_offload。
                     match self.snap_offload(victim, slot).await {
                         Ok(()) => {
                             self.dev.pool.snap_clear_slot(slot);
@@ -2177,6 +2179,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             Some(owl_store::Tier::Host) => {
                 let slot = self.snap_ensure_slot(key).await?;
+                // FIXME(store-hook): H7 状态腿旁路(host → device);
+                // 应归 StoreHook::Acquire(State)。
                 self.snap_onload(key, slot).await?;
                 Ok(slot)
             }
@@ -2184,6 +2188,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 // **S6**:盘 → 宿主 → 设备(两跳);读回后层账回 Host,再走 Host 分支
                 self.fill_snap_from_disk(key).await?;
                 let slot = self.snap_ensure_slot(key).await?;
+                // FIXME(store-hook): H7 状态腿旁路(disk → host → device);
+                // 应归 StoreHook::Acquire(State)。
                 self.snap_onload(key, slot).await?;
                 Ok(slot)
             }

@@ -369,6 +369,9 @@ async fn non_strict_dense_floor_is_allowed_when_virtualization_is_on() {
         prefill_chunk: 32,
         knobs: EngineKnobs {
             sampler_enabled: false,
+            // 本门测的是“虚拟化开 ⇒ 非 Strict 放行”，不是自动池推导：
+            // 显式给 16 页（与下方工作集注释 11 页/turn 的上界一致）。
+            pool_tokens: Some(16 * 32),
             dense_floor: owl_store::TurnFloor::Pages(0), // 允许全量下沉
             kvmem_virtualization: true,                  // 配置面两条门都开
             select_decode: true,

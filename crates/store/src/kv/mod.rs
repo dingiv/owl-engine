@@ -160,6 +160,8 @@ impl KvStore {
     ///
     /// 返回:被逐出的缓存条目(内容身份, 设备槽 `None` = host 承载)。
     /// 上层须为 host 条目丢掉 host 副本(`Rel` 职责 —— store 不做跨层副作用)。
+    // FIXME(store-hook): 同步驱逐是第二套决策路径;新版只保留纯分配,
+    // 需求侧先走 StoreHook::Acquire(Grow)。
     pub fn ensure_for_len(
         &mut self,
         table: &mut Vec<u32>,

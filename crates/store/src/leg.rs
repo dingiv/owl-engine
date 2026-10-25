@@ -385,6 +385,9 @@ impl BlockLeg {
     /// §12.4:需求驱动保洁到位时,这条路上的同步驱逐应**恒为空**
     /// (腾位发生在段边界);非空 = 保洁不足(计入 `ops.ensure_evicted`,
     /// 报告面可查 —— 不许静默)。
+    // FIXME(store-hook): 这是第二套决策路径(绕过 plan_capacity)。新版
+    // Acquire(Grow) 预留后,本函数应改为**纯分配**、不驱逐;
+    // 不够 = EngineInvariant,而不是静默 drop host 副本。
     pub fn ensure_for_len(&mut self, table: &mut Vec<u32>, target_len: usize) -> StoreResult<()> {
         let evicted = self.kv.ensure_for_len(table, target_len).map_err(|e| match e {
             StoreError::Exhausted(m) => StoreError::Exhausted(format!("{} 链:{m}", self.label)),

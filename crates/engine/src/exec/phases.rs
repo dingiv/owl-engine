@@ -130,7 +130,7 @@ impl DecodeStepInputs {
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
     /// 块表重写(write_bt;图烘焙 bt 指针,内容重写指针稳定图不重捕)
-    pub(crate) async fn execute_begin(&mut self, b: BeginPlan) -> Result<()> {
+    pub(crate) async fn execute_begin(&mut self, mut b: BeginPlan) -> Result<()> {
         // **上一 turn 的池缓存**(§23.9):turn 收尾之后才 free 的大额临时块
         // (`RELEASE_THRESHOLD=∞` 下不主动清就永远占着)在新 turn 起点一并回收。
         // 放在 begin 之前:此时设备已空闲,连同步一起做代价最小(ms 级)。
@@ -176,67 +176,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             None
         };
         // **S3-3b:待回灌块**(内容在宿主层)在段边界搬到设备,并把新槽写回块表 ——
-        // 必须在 `write_bt` 之前(否则写进设备的是占位坏槽)。搬运实现全在 store。
+        // 必须在 `write_bt` 之前(否则写进设备的是占位坏槽)。
+        // 搬运/腾槽/账目全在 `StoreHook::Acquire(Load)` 内；这里只交请求。
         if !b.pending_loads.is_empty() {
-            let t_stage = std::time::Instant::now();
-            // §21:搬运由 engine 编排(取计划 → face.swap → 回执 → 记账);
-            // **一条命令搬 N 块**(逐块 = 每块一次往返,回灌收益被吃光)。
-            let chains: Vec<owl_store::ChainHash> =
-                b.pending_loads.iter().map(|(_, c)| *c).collect();
-            // **S6**:盘上的块先读回宿主(盘 → 设备要两跳;判据与账都在 store)
-            let _ = self.ensure_host_resident(&chains).await?;
-            // **设备槽先腾够**:前缀命中面在宿主时要**一次性回灌 N 块**;池可能正被
-            // 缓存占满(2026-10-25 实测:两发长 prompt 后第三发 27k 前缀 844 块、
-            // free 459 ⇒ `plan_onload` 半途 `alloc_slot` 失败,旧版还会丢宿主内容
-            // ⇒ 粘性「身份未登记」)。需求驱动保洁按 store 政策逐冷腾槽;
-            // 搬不动就让它真拒(不静默降级)。
-            let need_slots = chains.len();
-            if self.bank.rel.leg.slots_free() < need_slots {
-                self.pool_housekeeping(owl_store::Need::kv(
-                    need_slots,
-                    owl_store::NeedWhy::Grow,
+            let pending_loads = std::mem::take(&mut b.pending_loads);
+            let outcome = self
+                .store_hook(crate::store_hook::StoreHook::load(
+                    b.session_id,
+                    pending_loads,
                 ))
                 .await?;
-            }
-            let (cs, new_slots, pieces, table) = {
-                let p = owl_store::plan_onload(&mut self.bank.rel.leg, &chains)?;
-                (p.chains, p.slots, p.pieces, p.table)
-            };
-            let table = match self
-                .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, table)
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    owl_store::abort_onload(&mut self.bank.rel.leg, &cs, &new_slots);
-                    return Err(e);
-                }
-            };
-            let slots = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &new_slots, table)?;
-            // **B-3e 实测账**:本条命令的块数/字节/墙钟(含发射 + 回执)
-            self.sel.note_stage_in(
-                cs.len(),
-                cs.len() * self.dev.pool.block_bytes(),
-                t_stage.elapsed().as_nanos() as u64,
-                crate::select::StageSrc::Prefill,
-            );
-            let s = self.bank.sessions.get_mut(b.session_id).ok_or_else(|| {
-                owl_iface::contract::ModelError::Msg(format!("回灌:会话 {} 不在账", b.session_id))
-            })?;
-            for ((idx, _), slot) in b.pending_loads.iter().zip(&slots) {
-                if *idx >= s.block_table.len() {
-                    return Err(owl_iface::contract::ModelError::Msg(format!(
-                        "回灌下标 {idx} 越界(表长 {})",
-                        s.block_table.len()
-                    )));
-                }
-                s.block_table[*idx] = *slot;
-            }
             owl_shared::log_debug!(
                 "store",
-                "段边界回灌 {} 块(session={};宿主→设备;一条命令)",
-                b.pending_loads.len(),
-                b.session_id
+                "段边界回灌 {} 块(session={};宿主→设备;一条命令;腾槽 {:?})",
+                outcome.loaded_blocks,
+                b.session_id,
+                outcome.applied
             );
         }
         let table = self
@@ -361,6 +316,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .sessions
                 .get_mut(sid)
                 .ok_or_else(|| ModelError::Msg("prefill 块表增长:会话账不在场".into()))?;
+            // FIXME(store-hook): H2 槽兜底旁路;应改为 Acquire(Grow) 预留后纯分配。
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, need)?;
         }
         // ── 主机侧事实(唯一取值点;两 rank 共用)────────────────────────

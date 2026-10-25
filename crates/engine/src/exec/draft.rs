@@ -35,6 +35,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             let s = self.bank.sessions.session_mut(act.session_id)?;
             let before = s.block_table.len();
+            // FIXME(store-hook): H2 槽兜底旁路(DFlash2 target 预增长);
+            // 应改为 Acquire(Grow) 预留后纯分配。
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, fp + block)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
@@ -293,6 +295,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             let s = self.bank.sessions.session_mut(act.session_id)?;
             let before = s.block_table.len();
+            // FIXME(store-hook): H2 槽兜底旁路(DFlash2 target 跨页);
+            // 应改为 Acquire(Grow) 预留后纯分配。
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, pos + block)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
@@ -984,6 +988,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let bt = {
             let sid = self.turns.active()?.session_id;
             let s = self.bank.sessions.get_mut(sid).expect("账在");
+            // FIXME(store-hook): H2 槽兜底旁路(MTP propose 链);
+            // 应改为 Acquire(Grow) 预留后纯分配。
             self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, pos + m + depth)?;
             s.mtp_block_table.clone()
         };
@@ -1202,6 +1208,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     pub(crate) fn mtp_chain_bt(&mut self, cover: usize) -> Result<Vec<u32>> {
         let sid = self.turns.active()?.session_id;
         let s = self.bank.sessions.get_mut(sid).expect("账在");
+        // FIXME(store-hook): H2 槽兜底旁路(MTP 链覆盖);
+        // 应改为 Acquire(Grow) 预留后纯分配。
         self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
         Ok(s.mtp_block_table.clone())
     }
@@ -1410,6 +1418,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let d = self.pool.geom.dims;
         let page = self.pool.geom.page;
         let bt = {
+            // FIXME(store-hook): H2 槽兜底旁路(MTP 批量行);
+            // 应改为 Acquire(Grow) 预留后纯分配。
             bank.leg_mtp
                 .ensure_for_len(&mut bank.sessions.session_mut(sid)?.mtp_block_table, base + t_rows)?;
             bank.sessions.session(sid)?.mtp_block_table.clone()

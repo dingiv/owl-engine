@@ -19,44 +19,14 @@ use crate::housekeeping::Housekeeping;
 use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::select::SelectRuntime;
 use crate::session::SessionBank;
+use crate::store_hook::{Acquire, LoadRequest, Maintain, Release, StoreHook, StoreOutcome};
 use crate::turn::{Turn, TurnEvent, TurnLedger, TurnSpec, TurnSpecState};
 
 type Result<T> = std::result::Result<T, ModelError>;
 
-/// **引擎节点**(store 立案 §三.A / §五.2 的"节点即调用点";步 4 收编 2026-10-19)。
-///
-/// 每个节点 = **一次 `store.plan` 决策 + 一次搬运执行 + 一次记账**(N4/N5 例外:
-/// 它们不按"槽需求"决策,而是"归还清单/归属复位")。所有保洁调用都从
-/// [`RunningEngine::node`] 走 —— 那正是"散落 ad-hoc 驱逐/下沉归零"的判据面。
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Node {
-    /// **N1/N2/N3**:准入 / prefill chunk 增长 / decode 步增长(需求算式在 `step_need`)
-    Need(owl_store::Need),
-    /// **N4 TurnEnd**:池清点(池内块改归 `Cache`)+ 未归还清单(按名 WARN)
-    TurnEnd(u64),
-    /// **N6 Pressure**:余量告急 ⇒ 零缺口也搬(先下沉、再驱逐)
-    Pressure(usize),
-    /// **H5 Idle**:空转整理(无活跃 turn;每 N 拍一次)
-    Idle(usize),
-}
-
-impl Node {
-    /// 打点名(`store.node.*`)。
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            Node::Need(need) => match need.why {
-                owl_store::NeedWhy::Admit => "admit",
-                owl_store::NeedWhy::Grow => "grow",
-                owl_store::NeedWhy::Idle => "idle",
-                owl_store::NeedWhy::Pressure => "pressure",
-            },
-            Node::TurnEnd(_) => "turn_end",
-            Node::Pressure(_) => "pressure",
-            Node::Idle(_) => "idle",
-        }
-    }
-}
-
+// Store 钩子的请求/回执类型在 `store_hook.rs`；唯一执行臂是
+// [`RunningEngine::store_hook`]。旧 `Node` 四变体已于 2026-10-25 Phase 1
+// 收编为 `StoreHook::{Acquire, Release, Maintain}`。
 
 /// 步级探针开关(诊断面;结构纯数据,Default = 全关)。
 /// **入口侧构造器** = [`StepProbes::from_config`](server config/测试用例
@@ -1157,86 +1127,176 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
     }
 
-    /// **H5 空转整理的触发节拍**(每 N 次空转 pump 整理一次)。
+    /// **store 唯一入口**（三语义钩子；2026-10-25 Phase 1）。
     ///
-    /// 常量而非 env:引擎零 env 读取纪律(env 是隐式依赖);判据已随字段
-    /// 迁入 [`crate::housekeeping::Housekeeping`](节拍与计数同屋),这里不再
-    /// 重复声明。
-    ///
-    /// **统一节点入口**(store 立案 §三.A / §五.2;步 4 收编)。
-    ///
-    /// 纪律:节点只做三件事 —— ①按节点算需求 ②`store.plan` 取计划 ③`apply_verdict`
-    /// 执行 + 记账。**决策唯一产地 = store**;本函数只负责"何时问、搬、记"。
-    /// **判据(grep 可证)**:engine 内 `store::plan(` / `apply_verdict(` 只应出现在
-    /// `pool_housekeeping`(本入口的唯一执行臂)里 —— 散落的 ad-hoc 驱逐/下沉归零。
-    pub(crate) async fn node(&mut self, n: Node) -> Result<()> {
-        let name = n.label();
+    /// 纪律：engine **生产位置**不直接调 `plan_need` / `plan_onload` / `snap_*`；
+    /// 先构造 [`StoreHook`]，由本函数统一走 `plan → apply` 与记账。
+    /// 旧 `Node` 四变体已删除，调用点收敛为：
+    /// - `Acquire::Capacity`（准入/增长）→ `pool_housekeeping`；
+    /// - `Acquire::Load`（前缀回灌）→ `store_load`；
+    /// - `Release::{TurnEnd,Abort}` → `store_release`（N4）；
+    /// - `Maintain::{Idle,Pressure}` → `store_maintain`。
+    pub(crate) async fn store_hook(&mut self, hook: StoreHook) -> Result<StoreOutcome> {
         owl_shared::metrics::with_metrics_store(|m| {
-            m.counter_add(&format!("store.node.{name}"), 1, file!(), line!());
+            m.counter_add(
+                &format!("store.hook.{}", hook.label()),
+                1,
+                file!(),
+                line!(),
+            );
         });
-        match n {
-            // N1/N2/N3:准入/增长(需求算式在 `step_need`,唯一边界由它给)
-            Node::Need(need) => self.pool_housekeeping(need).await,
-            // N6:余量告急 ⇒ 零缺口也搬
-            Node::Pressure(k) => {
-                self.pool_housekeeping(owl_store::Need::kv(k, owl_store::NeedWhy::Pressure))
-                    .await
+        match hook {
+            StoreHook::Acquire(a) => self.store_acquire(a).await,
+            StoreHook::Release(r) => self.store_release(r).await,
+            StoreHook::Maintain(m) => self.store_maintain(m).await,
+        }
+    }
+
+    async fn store_acquire(&mut self, acquire: Acquire) -> Result<StoreOutcome> {
+        match acquire {
+            Acquire::Capacity(need) => {
+                match need.why {
+                    owl_store::NeedWhy::Admit | owl_store::NeedWhy::Grow => {}
+                    other => {
+                        return Err(ModelError::EngineInvariant {
+                            what: format!(
+                                "store_hook: Acquire::Capacity 只接 Admit/Grow，收到 {other:?}"
+                            ),
+                        })
+                    }
+                }
+                let applied = self.pool_housekeeping(need).await?;
+                Ok(StoreOutcome { applied, ..StoreOutcome::default() })
             }
-            // H5:空转整理(无活跃 turn;冷面下沉/清池,不碰活跃面)
-            // 状态腿目标 = **一条快照的字节**(27B ≈162MB):空转期慢慢收,
-            // 每 N 拍整理一条;KV 侧照旧是 1/8 池(两条腿目标各自独立)。
-            Node::Idle(k) => {
-                // 状态腿目标 = **一条快照**(宿主**有位**才要:空转整理不是为了丢内容;
-                // 宿主分片小/关时给 0 ⇒ 不产生永远凑不够的 deny)
-                let snap = if self.bank.rel.snap_host_free_slots() > 0 {
+            Acquire::Load(req) => self.store_load(req).await,
+        }
+    }
+
+    /// **前缀命中回灌**（原 H4 双旁路）：槽不足先问 store，再一条命令搬 N 块，
+    /// 最后把新槽写回会话块表。
+    async fn store_load(&mut self, req: LoadRequest) -> Result<StoreOutcome> {
+        if req.blocks.is_empty() {
+            return Ok(StoreOutcome::default());
+        }
+        let t_stage = std::time::Instant::now();
+        let chains: Vec<owl_store::ChainHash> =
+            req.blocks.iter().map(|(_, chain)| *chain).collect();
+        // 盘上的块先读回宿主（盘 → 设备要两跳；判据与账都在 store）
+        self.ensure_host_resident(&chains).await?;
+        let need_slots = chains.len();
+        let mut applied = owl_store::Applied::default();
+        // 设备槽先腾够：`Need.slots` 是需求，`plan_capacity` 会按当前 free 折算缺口。
+        if self.bank.rel.leg.slots_free() < need_slots {
+            applied = self
+                .pool_housekeeping(owl_store::Need::kv(
+                    need_slots,
+                    owl_store::NeedWhy::Grow,
+                ))
+                .await?;
+        }
+        let (cs, new_slots, pieces, table) = {
+            let p = owl_store::plan_onload(&mut self.bank.rel.leg, &chains)?;
+            (p.chains, p.slots, p.pieces, p.table)
+        };
+        let table = match self
+            .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, table)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                owl_store::abort_onload(&mut self.bank.rel.leg, &cs, &new_slots);
+                return Err(e);
+            }
+        };
+        let slots = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &new_slots, table)?;
+        let loaded_blocks = cs.len();
+        let moved_bytes = loaded_blocks * self.dev.pool.block_bytes();
+        let s = self.bank.sessions.get_mut(req.session).ok_or_else(|| {
+            ModelError::Msg(format!("回灌:会话 {} 不在账", req.session))
+        })?;
+        for ((idx, _), slot) in req.blocks.iter().zip(&slots) {
+            if *idx >= s.block_table.len() {
+                return Err(ModelError::Msg(format!(
+                    "回灌下标 {idx} 越界(表长 {})",
+                    s.block_table.len()
+                )));
+            }
+            s.block_table[*idx] = *slot;
+        }
+        self.sel.note_stage_in(
+            loaded_blocks,
+            moved_bytes,
+            t_stage.elapsed().as_nanos() as u64,
+            crate::select::StageSrc::Prefill,
+        );
+        Ok(StoreOutcome { applied, loaded_blocks })
+    }
+
+    /// **生命周期收尾**（Phase 1 只承接原 N4）：池清点 + 未归还清单 +
+    /// 兜底释放 + 池缓存回收。H3/H6 尚未并入（Phase 3）。
+    async fn store_release(&mut self, release: Release) -> Result<StoreOutcome> {
+        let turn = match release {
+            Release::TurnEnd(turn) | Release::Abort(turn) => turn,
+        };
+        self.n4_pool_sweep(turn);
+        self.n4_report_unreturned(turn);
+        // **兜底释放**（2026-10-20；§78 P1）：清点只报告、不处置 ⇒ 有调用点
+        // 漏 free 时每 turn 掉一截显存（4k prefill ≈ 1.6 GiB），长 ctx 撞
+        // `vram-hard-budget`。这里把 `Turn(t)` 名下"仍开着、不在池里"的块
+        // **强制归还驱动**（决策在 store `stale_of`，执行在句柄）。
+        self.n4_force_release(turn).await?;
+        // **池缓存回收**（2026-10-20 §23.9）：`RELEASE_THRESHOLD=∞` ⇒ turn 内
+        // 的峰值缓存**永不**还 OS（peer 侧实测 3.3 GiB 长期挂着，长 prefill
+        // 因此提前撞 `vram-hard-budget`）。turn 收尾清一次：块账不变，
+        // 只把"已 free 的缓存页"还给驱动。
+        let freed = self.trim_pools().await;
+        // 让**紧随其后的 Idle 出口**再清一次：turn 收尾路径里还有一批
+        // 大额临时块是在 TurnEnd 之后才 free 的（实测 peer 3.0 GiB）。
+        self.hk.expire_trim();
+        for (rank, r) in freed {
+            match r {
+                Ok(0) => {}
+                Ok(n) => owl_shared::log_info!(
+                    "store",
+                    "池缓存回收:turn {turn} rank{rank} 释放 {:.1} MiB(已 free 的池页还给驱动)",
+                    n as f64 / 1048576.0
+                ),
+                // 收尾路径的可失败调用：如实 WARN（不静默；也不升级为 turn 失败 ——
+                // 显存多占一点不影响正确性，下一 turn 的压力旁路还会再试）
+                Err(e) => owl_shared::log_warn!(
+                    "store",
+                    "池缓存回收失败(turn {turn} rank{rank}): {e}"
+                ),
+            }
+        }
+        Ok(StoreOutcome::default())
+    }
+
+    /// **后场维护**：Idle 的状态腿目标由宿主余位补；Pressure 只带显式 snap_bytes。
+    async fn store_maintain(&mut self, maintain: Maintain) -> Result<StoreOutcome> {
+        let need = match maintain {
+            Maintain::Idle(slots) => {
+                // 状态腿目标 = 一条快照（宿主有位才要；宿主关/满时给 0，
+                // 不产生永远凑不够的 deny）
+                let snap_bytes = if self.bank.rel.snap_host_free_slots() > 0 {
                     self.bank.rel.snap_bytes()
                 } else {
                     0
                 };
-                self.pool_housekeeping(owl_store::Need {
-                    slots: k,
-                    snap_bytes: snap,
+                owl_store::Need {
+                    slots,
+                    snap_bytes,
                     why: owl_store::NeedWhy::Idle,
-                })
-                .await
-            }
-            // N4:turn 收尾 —— 池清点(改归属 Cache)+ 未归还清单(响亮)
-            Node::TurnEnd(turn) => {
-                self.n4_pool_sweep(turn);
-                self.n4_report_unreturned(turn);
-                // **兜底释放**(2026-10-20;§78 P1):清点只报告、不处置 ⇒ 有调用点
-                // 漏 free 时每 turn 掉一截显存(4k prefill ≈ 1.6 GiB),长 ctx 撞
-                // `vram-hard-budget`。这里把 `Turn(t)` 名下"仍开着、不在池里"的块
-                // **强制归还驱动**(决策在 store `stale_of`,执行在句柄)。
-                self.n4_force_release(turn).await?;
-                // **池缓存回收**(2026-10-20 §23.9):`RELEASE_THRESHOLD=∞` ⇒ turn 内
-                // 的峰值缓存**永不**还 OS(peer 侧实测 3.3 GiB 长期挂着,长 prefill
-                // 因此提前撞 `vram-hard-budget`)。turn 收尾清一次:块账不变,
-                // 只把"已 free 的缓存页"还给驱动。
-                let freed = self.trim_pools().await;
-                // 让**紧随其后的 Idle 出口**再清一次:turn 收尾路径里还有一批
-                // 大额临时块是在 TurnEnd 之后才 free 的(实测 peer 3.0 GiB)。
-                self.hk.expire_trim();
-                for (rank, r) in freed {
-                    match r {
-                        Ok(0) => {}
-                        Ok(n) => owl_shared::log_info!(
-                            "store",
-                            "池缓存回收:turn {turn} rank{rank} 释放 {:.1} MiB(已 free 的池页还给驱动)",
-                            n as f64 / 1048576.0
-                        ),
-                        // 收尾路径的可失败调用:如实 WARN(不静默;也不升级为 turn 失败 ——
-                        // 显存多占一点不影响正确性,下一 turn 的压力旁路还会再试)
-                        Err(e) => owl_shared::log_warn!(
-                            "store",
-                            "池缓存回收失败(turn {turn} rank{rank}): {e}"
-                        ),
-                    }
                 }
-                Ok(())
             }
-            // N5:会话关闭 —— 链已由会话表归还(store API),本节点只记账/归属复位
-        }
+            Maintain::Pressure { slots, snap_bytes } => owl_store::Need {
+                slots,
+                snap_bytes,
+                why: owl_store::NeedWhy::Pressure,
+            },
+        };
+        let applied = self.pool_housekeeping(need).await?;
+        Ok(StoreOutcome { applied, ..StoreOutcome::default() })
     }
 
     /// **压力缓解口**(缺口 3;actor 在 `PoolExhausted` 后调;2026-10-19)。
@@ -1259,7 +1319,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let k = self.pressure_probe().unwrap_or(0);
         if k > 0 {
-            self.node(Node::Pressure(k)).await?;
+            self.store_hook(StoreHook::pressure(k)).await?;
         }
         Ok((freed, k))
     }
@@ -1270,6 +1330,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **2×reserve**(留一次呼吸)所需的块数,按池块字节折算,夹在 `[1, 64]`
     /// (一次 N6 是"整理"不是"搬家";不够就下一拍再来)。无设备账(CPU mock)⇒ None。
     fn pressure_probe(&self) -> Option<usize> {
+        // FIXME(store-hook): N6 触发/需求错位。1 GiB 只是告警阈值,不是预留;
+        // 固定池下沉不增加驱动 free,且这里只给 KV 槽(snap_bytes=0)。
+        // 目标形态 = Maintain(Pressure) 用硬余量(free−reserve) + 两腿目标。
         let free = owl_shared::vram::free_bytes();
         if owl_shared::vram::total_bytes() == 0 {
             return None;
@@ -1284,7 +1347,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         Some(want.clamp(1, PRESSURE_MAX_SLOTS))
     }
 
-    /// **H5 空转制的节拍推进**(Idle pump 计数;每 N 拍调 `node(Node::Idle)` 一次)
+    /// **H5 空转制的节拍推进**(Idle pump 计数;每 N 拍调 `StoreHook::idle` 一次)
     fn idle_tick(&mut self) -> Option<usize> {
         if !self.hk.note_idle_pump() {
             return None;
@@ -1440,6 +1503,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 准入分支要查一次命中面(纯 host、与 `schedule` 同一条匹配路):
     /// Δ_j = `ceil(N_j/page) − 设备已驻留的命中块数`(§12.1)—— **host 命中的
     /// 块不算省槽**(回灌时照样占槽,少算就是回灌 Exhausted)。
+    // FIXME(store-hook): H1(Admit) 与 H2(Grow) 共用一个 Need;H1 还另有
+    // scheduler 的 admission.decide 与本节 admission_gate 的 Rel::check 两层判决。
+    // 目标: Acquire(Admit) / Acquire(Grow) 两个 kind,同一契约。
     fn step_need(&mut self) -> Result<owl_store::Need> {
         use owl_store::NeedWhy;
         let page = self.dev.pool.geom.page.max(1);
@@ -1786,6 +1852,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 为什么先于 `ensure_for_len`:那条路是"**占了槽**才发现不够"(Exhausted,
     /// 中后段才炸,且已写半截账);本判决是"**判在前**"——不够就先腾,
     /// 腾不够就带数字拒。
+    // FIXME(store-hook): H1 的第二层判决(store floor);与 scheduler 的
+    // turns.admission.decide 合并为 Acquire(Admit) 的一个出口。
     fn admission_gate(&mut self, need: &mut owl_store::Need) -> Result<()> {
         use owl_store::AdmissionVerdict;
         if need.why != owl_store::NeedWhy::Admit {
@@ -2410,7 +2478,13 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 与接线前行为一致)。
     /// 判定单里的 `deny` = **"即使搬空也不够"的真容量不足预警** ⇒ 响亮 WARN,
     /// 但 `out` 里能搬的照搬(下沉不丢内容);真拒绝由 `ensure_for_len` 兜底。
-    pub(crate) async fn pool_housekeeping(&mut self, need: owl_store::Need) -> Result<()> {
+    // 唯一调用者 = `store_hook`（Acquire::Capacity / Load / Maintain）。
+    // FIXME(store-hook): `ensure_for_len` / spec `snap_*` / H3/H6 仍各有旁路，
+    // Phase 2/3 收编；见 docs/devlog/memory/store-hook-contract.md §4。
+    async fn pool_housekeeping(
+        &mut self,
+        need: owl_store::Need,
+    ) -> Result<owl_store::Applied> {
         // 两条腿各自"宿主关 ⇒ 该腿目标清零"(旧行为:宿主关 = 不换出,**也不做无谓驱逐**;
         // 两腿独立,不能因为状态腿开就顺手把 KV 面 Drop 掉)
         let mut need = need;
@@ -2421,7 +2495,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             need.snap_bytes = 0;
         }
         if need.is_zero() {
-            return Ok(());
+            return Ok(owl_store::Applied::default());
         }
         let verdict = self.bank.rel.plan_need(need, &owl_store::Protected::default());
         if self.boot.probes.store_hook_dbg {
@@ -2442,7 +2516,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             );
         }
         if verdict.is_noop() {
-            return Ok(());
+            return Ok(owl_store::Applied::default());
         }
         let (n_out, n_in) = (verdict.out.len(), verdict.in_.len());
         if let Some(why) = &verdict.deny {
@@ -2487,7 +2561,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             m.counter_add("store.hook.snap.spill", applied.snap_spilled as u64, file!(), line!());
             m.counter_add("store.hook.busy", applied.skipped_busy as u64, file!(), line!());
         });
-        Ok(())
+        Ok(applied)
     }
 
     pub async fn pump(&mut self) -> Result<TurnEvent> {
@@ -2516,7 +2590,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let need = self.step_need()?;
         let mut need = need;
         self.admission_gate(&mut need)?;
-        self.node(Node::Need(need.clone())).await?;
+        self.store_hook(StoreHook::capacity(need)).await?;
         // **[N6 Pressure]**(缺口 3):余量告急 ⇒ **零缺口也搬**(先下沉、再驱逐);
         // 这是"压力路径第一步":先把自己能腾的腾出来,而不是等 `ensure_for_len` 撞墙。
         if let Some(k) = self.pressure_probe() {
@@ -2526,7 +2600,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 "N6 压力节点:驱动余量 {:.0}MiB < 目标 ⇒ 目标腾 {k} 槽(先下沉后驱逐)",
                 free as f64 / 1048576.0
             );
-            self.node(Node::Pressure(k)).await?;
+            self.store_hook(StoreHook::pressure(k)).await?;
         }
         let loophead_ms = t_loophead.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
         let t_lh1 = prof.then(std::time::Instant::now); // 循环头之后
@@ -2565,7 +2639,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // 决策仍全在 store(`NeedWhy::Idle` = 零缺口也搬);无活跃 turn ⇒
                 // 只动缓存面,绝不碰活跃面。
                 // **池缓存回收(空转出口;§23.9)**:server 的泵循环 `Idle` 即断,
-                // `Node::Idle`(每 16 拍)到不了 ⇒ 在这里按时间节流清一次。
+                // `Maintain::Idle`(每 16 拍)到不了 ⇒ 在这里按时间节流清一次。
                 // `RELEASE_THRESHOLD=∞` 下 turn 收尾后 free 的 GB 级临时块
                 // 不主动还驱动就永远占着(实测 peer 侧 3.0 GiB)。
                 let due = self.hk.trim_due();
@@ -2607,7 +2681,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     }
                 }
                 if let Some(k) = self.idle_tick() {
-                    self.node(Node::Idle(k)).await?;
+                    self.store_hook(StoreHook::idle(k)).await?;
                 }
                 // 准入拒(S3b §23.4)等 host 侧即时终态:先回吐再报 Idle ——
                 // 否则 Idle 会让服务面的泵循环在此断开,被拒 turn 的事件

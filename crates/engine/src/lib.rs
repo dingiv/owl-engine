@@ -60,6 +60,8 @@ pub(crate) mod scheduler;
 pub(crate) mod select;
 pub(crate) mod spec_runtime;
 pub(crate) mod state;
+/// Store 三钩子契约（Acquire / Release / Maintain；2026-10-25 Phase 1）
+pub(crate) mod store_hook;
 pub(crate) mod tp;
 pub(crate) mod vlm;
 // 测试分层(test-architecture.md):单元测试走 cfg(test);

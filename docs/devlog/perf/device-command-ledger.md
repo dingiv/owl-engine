@@ -714,6 +714,9 @@ device_ledger 2(断言"turn 后池非空 + hits+misses>0")· 真机三轮同上�
 
 ### 12.16 刀 N6-③/步 4:节点收编 + 池上限 + **拒绝不再直通致命** + 真机池贴顶实录(2026-10-19)
 
+> 2026-10-25 更新：本节记录的 `Node` 已收编为 `StoreHook::{Acquire,Release,Maintain}`，
+> metrics 名由 `store.node.*` 改为 `store.hook.*`；以下保留当时的施工事实。
+
 #### (1) 步 4:全部保洁收进**唯一节点入口** `RunningEngine::node(Node)`
 
 `Node = { Need(need) | TurnEnd(t) | SessionClose(s) | Pressure(k) | Idle(k) }`:

@@ -105,6 +105,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/memory/kvmem-selection.md`](devlog/memory/kvmem-selection.md) — KVMem selection layer (B axis)
 - ⬜ [`devlog/memory/longctx-attribution.md`](devlog/memory/longctx-attribution.md) — Long-context performance attribution, round one
 - ⬜ [`devlog/memory/prefix-deletion.md`](devlog/memory/prefix-deletion.md) — Prefix-transparent deletion
+- ⬜ [`devlog/memory/store-hook-contract.md`](devlog/memory/store-hook-contract.md) — Store hook contract: 19-point audit, 3-hook convergence (Acquire/Release/Maintain), migration gates
 
 ## H. Serving, sessions and configuration
 

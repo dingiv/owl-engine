@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 /// 空转整理节拍(pump 拍数;H5)。
 const IDLE_HK_EVERY: u64 = 16;
-/// 池缓存回收节拍(墙钟):server 泵循环 `Idle` 即断,`Node::Idle` 到不了,
+/// 池缓存回收节拍(墙钟):server 泵循环 `Idle` 即断,`StoreHook::idle` 到不了,
 /// 所以在空转出口按时间节流清一次(§23.9)。
 const IDLE_TRIM_EVERY: Duration = Duration::from_millis(500);
 
@@ -48,7 +48,7 @@ impl Housekeeping {
         Some((self.sched_cnt, avg_ms, elapsed.as_secs_f64() * 1e3))
     }
 
-    /// 空转一拍;返回 `true` = 本拍到点(调用方调 `Node::Idle` 整理)。
+    /// 空转一拍;返回 `true` = 本拍到点(调用方调 `StoreHook::idle` 整理)。
     pub(crate) fn note_idle_pump(&mut self) -> bool {
         self.idle_pumps = self.idle_pumps.wrapping_add(1);
         self.idle_pumps.is_multiple_of(IDLE_HK_EVERY)

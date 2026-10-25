@@ -6,6 +6,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// **turn 末释放设备表**(S2 引用拆分;§25.1①):表出账归还(引用减一),
     /// `cached_len` 归到**块边界**(缓存里确实还有的整块数 —— 尾块随表释放,
     /// 内容丢,下次重算 ≤ 1 页)。
+    // FIXME(store-hook): H6 引用归零是生命周期旁路(无 store event);
+    // 应并入 StoreHook::Release(TurnEnd/SessionClose)。
     pub(crate) fn release_turn_table(&mut self, session_id: u64) -> Result<()> {
         let page = self.dev.pool.geom.page.max(1);
         let mut table = Vec::new();
@@ -135,9 +137,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // **[N4 TurnEnd]**(弃置路径同款:归属下行;须在 act 还在手时取会话事实)
         self.set_ctx_after_turn(act.session_id, act.ephemeral);
-        // abandon 返回 TurnEvent(非 Result)⇒ 节点失败**响亮留痕**但不掩盖原错
-        if let Err(e) = self.node(crate::running::Node::TurnEnd(act.id)).await {
-            owl_shared::log_warn!("store", "N4 节点失败(继续收尾): {e}");
+        // abandon 返回 TurnEvent(非 Result)⇒ 钩子失败**响亮留痕**但不掩盖原错。
+        // Phase 1 的 Release 只承接 N4；H6 引用归零仍在 release_turn_table。
+        if let Err(e) = self
+            .store_hook(crate::store_hook::StoreHook::abort(act.id))
+            .await
+        {
+            owl_shared::log_warn!("store", "N4/Release(Abort) 失败(继续收尾): {e}");
         }
     }
 
@@ -178,6 +184,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // E2c:块链登记前缀缓存(缓存持引用;会话释放后块仍驻留)。
             // S3-2:登记走 store 的块腿(引用配对在腿内自洽)
             if self.dev.pool.geom.paged {
+                // FIXME(store-hook): H3 链登记在生产路径绕过 StoreHook;
+                // Phase 3 并入 StoreHook::Release(TurnEnd) 的链资产发布。
                 // **会话感知**(2026-10-19):链块记到会话名下(淘汰时按会话从末端削)
                 let up = self.bank.rel.leg.register_chain_owned(
                     &s.tokens,
@@ -238,8 +246,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // **[N4 TurnEnd]**:归属下行 —— 会话仍活 ⇒ `Session(s)`,焚毁 ⇒ `System`
         self.set_ctx_after_turn(act.session_id, act.ephemeral);
-        // **[N4 TurnEnd]**(节点入口):池清点(改归属 Cache)+ 未归还清单(响亮)
-        self.node(crate::running::Node::TurnEnd(act.id)).await?;
+        // FIXME(store-hook): H3+H6 → StoreHook::Release(TurnEnd)(Phase 3；
+        // 现拆成 register_chain_owned + Release(N4))。
+        // **[N4 TurnEnd]**(唯一钩子入口):池清点 + 未归还清单 + 兜底释放 + trim。
+        self.store_hook(crate::store_hook::StoreHook::turn_end(act.id))
+            .await?;
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(act.id);
         // **B-3d**:选择层视图态随 turn 收口(视图是 turn 域资源 —— 下一 turn
