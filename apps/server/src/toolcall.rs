@@ -70,14 +70,15 @@ const MARK_THINK_CLOSE_LONG: &str = "</thinking>";
 const MARK_THINK_OPEN_THOUGHT: &str = "<thought>";
 const MARK_THINK_CLOSE_THOUGHT: &str = "</thought>";
 
-/// Text/Think 态的全部识别标记(主 + 别名;游标标记也**吞掉不泄漏**,见 `next_state`)
-const MARKS: [&str; 10] = [
+/// Text/Think/InToolBetween 态的识别标记(主 + 别名;游标标记也**吞掉不泄漏**,
+/// 见 `next_state`)。`</function>` 不入表:它只由工具态显式 `find`,
+/// 在正文态出现一律当普通文本(旧行为,见 `char_by_char`)。
+const MARKS: [&str; 9] = [
     MARK_THINK_OPEN,
     MARK_THINK_CLOSE,
     MARK_TOOL_OPEN,
     MARK_TOOL_CLOSE,
     MARK_FUNCTION_OPEN,
-    MARK_FUNCTION_CLOSE,
     MARK_THINK_OPEN_LONG,
     MARK_THINK_CLOSE_LONG,
     MARK_THINK_OPEN_THOUGHT,
@@ -156,6 +157,7 @@ fn state_name(s: State) -> &'static str {
         State::Think => "think",
         State::InTool => "tool",
         State::InBareTool => "bare_tool",
+        State::InToolBetween => "between_tool",
     }
 }
 
@@ -166,12 +168,34 @@ enum State {
     InTool,
     /// 裸 `<function=...>...</function>`（无 `<tool_call>` 外壳）
     InBareTool,
+    /// `</function>` 已闭合，等待可选的 `</tool_call>` / 下一个工具
+    InToolBetween,
 }
 
 /// 请求侧工具 schema(仅取 `name → 属性名 → JSON 类型`,用于 xml 参数类型回填)
 #[derive(Debug, Default)]
 pub struct ToolSchemas {
     types: HashMap<String, HashMap<String, String>>,
+}
+
+/// 取属性的标量类型；Pydantic v2 的 Optional[T] 是 `anyOf/oneOf`，
+/// 取第一个非 null 分支（与 vLLM 的 qwen3 parser 类型回填同口径）。
+fn json_type_of(v: &Json) -> Option<&str> {
+    if let Some(t) = v.get("type").and_then(Json::as_str) {
+        return Some(t);
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(items) = v.get(key).and_then(Json::as_array) {
+            for item in items {
+                if let Some(t) = item.get("type").and_then(Json::as_str) {
+                    if t != "null" {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 impl ToolSchemas {
@@ -188,7 +212,7 @@ impl ToolSchemas {
                 .and_then(|p| p.as_object())
             {
                 for (k, v) in p {
-                    if let Some(ty) = v.get("type").and_then(|v| v.as_str()) {
+                    if let Some(ty) = json_type_of(v) {
                         props.insert(k.clone(), ty.to_string());
                     }
                 }
@@ -206,7 +230,7 @@ impl ToolSchemas {
             return Json::String(raw.to_string());
         };
         match ty.as_str() {
-            "number" | "integer" => match serde_json::from_str::<Json>(raw.trim()) {
+            "number" | "integer" | "float" => match serde_json::from_str::<Json>(raw.trim()) {
                 Ok(Json::Number(n)) => Json::Number(n),
                 _ => Json::String(raw.to_string()),
             },
@@ -300,11 +324,15 @@ impl ChannelSplitter {
                 self.tool_on
                     || (**m != MARK_TOOL_OPEN
                         && **m != MARK_TOOL_CLOSE
-                        && **m != MARK_FUNCTION_OPEN
-                        && **m != MARK_FUNCTION_CLOSE)
+                        && **m != MARK_FUNCTION_OPEN)
             })
             .copied()
             .collect()
+    }
+
+    /// 本 drain 在「工具之间」态认的结构标记(只这三个;工具解析关时不会进此态)
+    fn marks_structural(&self) -> Vec<&'static str> {
+        vec![MARK_TOOL_CLOSE, MARK_TOOL_OPEN, MARK_FUNCTION_OPEN]
     }
 
     /// 本 turn 已解析出的工具调用数(协议层据此定 `finish_reason`)
@@ -357,6 +385,9 @@ impl ChannelSplitter {
             (State::Text, MARK_TOOL_OPEN) => State::InTool,
             (State::Text, MARK_FUNCTION_OPEN) => State::InBareTool,
             (State::Think, MARK_FUNCTION_OPEN) => State::InBareTool,
+            (State::InToolBetween, MARK_TOOL_CLOSE) => State::Text,
+            (State::InToolBetween, MARK_TOOL_OPEN) => State::InTool,
+            (State::InToolBetween, MARK_FUNCTION_OPEN) => State::InBareTool,
             (State::Think, MARK_THINK_CLOSE) => {
                 // 模板 `\n</think>\n\n{content}` 里的 `\n\n` 归模板(单源):
                 // 后续至多两个 `\n` 从流里吞掉(不足则按实际吞尽,见 `drain`)
@@ -407,7 +438,7 @@ impl ChannelSplitter {
                 out.push(Item::Malformed { kind, raw });
                 self.state = State::Text;
             }
-            State::Text | State::Think => {
+            State::InToolBetween | State::Text | State::Think => {
                 // 收尾:未消化的结构空白按"归模板"处理(吐给 content 会让
                 // 回填渲染多出换行 —— 与 `drain` 同一律)
                 if self.swallow_lf > 0 {
@@ -471,11 +502,22 @@ impl ChannelSplitter {
             }
             match self.state {
                 State::InTool => {
-                    if let Some(p) = self.buf.find(MARK_TOOL_CLOSE) {
+                    // XML: `</function>` 就是工具体闭合（vLLM TOOL_BETWEEN 同款）；
+                    // JSON: 仍以 `</tool_call>` 闭合。
+                    let xml = self.buf.trim_start().starts_with(MARK_FUNCTION_OPEN);
+                    let func = if xml { self.buf.find(MARK_FUNCTION_CLOSE) } else { None };
+                    let tool = self.buf.find(MARK_TOOL_CLOSE);
+                    let close = match (func, tool) {
+                        (Some(f), Some(t)) if f < t => Some((f, MARK_FUNCTION_CLOSE, true)),
+                        (_, Some(t)) => Some((t, MARK_TOOL_CLOSE, false)),
+                        (Some(f), None) => Some((f, MARK_FUNCTION_CLOSE, true)),
+                        _ => None,
+                    };
+                    if let Some((p, marker, between)) = close {
                         let body = self.buf[..p].to_string();
-                        self.buf.drain(..p + MARK_TOOL_CLOSE.len());
+                        self.buf.drain(..p + marker.len());
                         out.push(self.build_tool_call(&body));
-                        self.state = State::Text;
+                        self.state = if between { State::InToolBetween } else { State::Text };
                         continue;
                     }
                     if self.buf.len() > MAX_TOOL_BYTES {
@@ -491,12 +533,59 @@ impl ChannelSplitter {
                     }
                     break; // 工具块内部内容不外发;等闭合标记
                 }
+                State::InToolBetween => {
+                    // vLLM TOOL_BETWEEN 同构:`</function>` 与下一个结构标记之间的
+                    // 空白 = **模板结构资产**,既不进正文也不进工具体。
+                    // 因此先找标记,再决定丢弃范围;看不到标记且尾巴可能是
+                    // 标记前缀 ⇒ **挂起等下一个 chunk**(不能提前转 Text,
+                    // 否则结构空白会泄进正文 —— 2026-10-24 char_by_char 翻车定案)
+                    let structural = self.marks_structural();
+                    let hit = structural
+                        .iter()
+                        .filter_map(|m| self.buf.find(m).map(|p| (p, *m)))
+                        .min_by_key(|(p, _)| *p);
+                    if let Some((p, m)) = hit {
+                        if !self.buf[..p].chars().all(|c| c.is_ascii_whitespace()) {
+                            // 标记前夹了真文本:交回 Text 照常发(不吞用户可见内容)
+                            self.state = State::Text;
+                            continue;
+                        }
+                        // 裸函数块的标记本体必须留在 buf 里(parse_tool_body 靠它定名)
+                        self.buf.drain(..if canon(m) == MARK_FUNCTION_OPEN { p } else { p + m.len() });
+                        self.state = match canon(m) {
+                            MARK_TOOL_CLOSE => State::Text,
+                            MARK_TOOL_OPEN => State::InTool,
+                            _ => State::InBareTool,
+                        };
+                        continue;
+                    }
+                    // 无完整标记:尾巴若是标记真前缀 → 整段挂起
+                    let hold = holdback_len(&self.buf, &structural);
+                    if hold == self.buf.len() {
+                        break; // 全挂起,等下一 chunk
+                    }
+                    // 开头若是空白,先丢掉(不可能属于任何标记);剩余非结构
+                    // 内容交回 Text 处理
+                    let ws = self
+                        .buf
+                        .bytes()
+                        .take_while(|b| b.is_ascii_whitespace())
+                        .count();
+                    if ws > 0 {
+                        self.buf.drain(..ws);
+                    }
+                    if self.buf.is_empty() {
+                        break;
+                    }
+                    self.state = State::Text;
+                    continue;
+                }
                 State::InBareTool => {
                     if let Some(p) = self.buf.find(MARK_FUNCTION_CLOSE) {
                         let body = self.buf[..p].to_string();
                         self.buf.drain(..p + MARK_FUNCTION_CLOSE.len());
                         out.push(self.build_tool_call(&body));
-                        self.state = State::Text;
+                        self.state = State::InToolBetween;
                         continue;
                     }
                     if self.buf.len() > MAX_TOOL_BYTES {
@@ -605,28 +694,112 @@ fn parse_tool_body(body: &str, schemas: &ToolSchemas) -> Result<(String, String)
     }
     let inner = &rest[gt + 1..];
     let mut obj = Map::new();
-    let mut cur = inner;
-    while let Some(p) = cur.find("<parameter=") {
-        let after = &cur[p + "<parameter=".len()..];
-        let Some(gt) = after.find('>') else { break };
-        let key = after[..gt].trim().to_string();
-        let tail = &after[gt + 1..];
-        let end = tail.find("</parameter>").ok_or("tool_call_param_unclosed")?;
-        let mut val = &tail[..end];
-        // 模板写入形态 = `<parameter=k>\nVALUE\n</parameter>`:各去一个包裹换行
+    let mut pos = 0usize;
+    // 参数扫描 = vLLM qwen3_coder `_PARAM_RE` 同款口径:开标签 `<` parameter `=` NAME `>`
+    // 与闭标签 `<` `/` parameter `>` 都容忍标签内空白;缺闭标签时,下一个开标签
+    // 就是当前值的边界(vLLM 的前瞻交替)。
+    while let Some(op) = find_param_open(inner, pos) {
+        let close = find_param_close(inner, op.value_start);
+        // 前瞻:下一个开标签的 **标签起点**(不是它的值起点)才是当前值的边界
+        let next = find_param_open(inner, op.value_start).map(|n| n.tag_start);
+        let (val_end, next_pos) = match (close, next) {
+            (Some((e, x)), None) => (e, x),
+            (Some((e, x)), Some(f)) => if e <= f { (e, x) } else { (f, f) },
+            (None, Some(f)) => (f, f),
+            // 既无闭标签也无后继开标签:与 vLLM 一样丢尾巴
+            (None, None) => break,
+        };
+        // 模板写入形态 = 开标签 /n VALUE /n 闭标签:各去一个包裹换行
+        let mut val = &inner[op.value_start..val_end];
         if let Some(v) = val.strip_prefix('\n') {
             val = v;
         }
         if let Some(v) = val.strip_suffix('\n') {
             val = v;
         }
-        if !key.is_empty() {
-            obj.insert(key.clone(), schemas.coerce(&name, &key, val));
+        if !op.name.is_empty() {
+            obj.insert(op.name.clone(), schemas.coerce(&name, &op.name, val));
         }
-        cur = &tail[end + "</parameter>".len()..];
+        pos = next_pos;
     }
     let s = serde_json::to_string(&Json::Object(obj)).map_err(|_| "tool_call_args_unserializable")?;
     Ok((name, s))
+}
+
+/// 标签骨架的一跳:先跳过 ASCII 空白,再要求恰好是 `lit`。
+/// 匹配 → 返回 `lit` 之后的位置;不匹配 → None(调用方自己推进游标,不会死循环)。
+fn tag_step(s: &str, from: usize, lit: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = from;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b[i..].starts_with(lit.as_bytes()) {
+        Some(i + lit.len())
+    } else {
+        None
+    }
+}
+
+/// 从 `from` 起跳过 ASCII 空白
+fn skip_ws(s: &str, from: usize) -> usize {
+    let b = s.as_bytes();
+    let mut i = from;
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// 一个参数**开标签**的定位结果。
+/// `tag_start` = 标签的 `<` 位置(前瞻边界要用它,不是值起点);
+/// `value_start` = `>` 之后的值起点;`name` = `=` 与 `>` 之间的名字(已 trim)。
+struct ParamOpen {
+    tag_start: usize,
+    value_start: usize,
+    name: String,
+}
+
+/// 找下一个参数**开标签** `<` parameter `=` NAME `>`(NAME 取到 `>` 为止,可为空)。
+fn find_param_open(s: &str, from: usize) -> Option<ParamOpen> {
+    let mut at = from;
+    while let Some(rel) = s[at..].find('<') {
+        let lt = at + rel;
+        if let Some(name_from) = tag_step(s, lt + 1, "parameter")
+            .and_then(|k| tag_step(s, k, "="))
+            .map(|k| skip_ws(s, k))
+        {
+            if let Some(rel_gt) = s[name_from..].find('>') {
+                let gt = name_from + rel_gt;
+                return Some(ParamOpen {
+                    tag_start: lt,
+                    value_start: gt + 1,
+                    name: s[name_from..gt].trim().to_string(),
+                });
+            }
+        }
+        at = lt + 1;
+    }
+    None
+}
+
+/// 找参数**闭标签** `< / parameter >`。
+/// 返回 (闭标签起点 = 值终点, 闭标签之后起点)。
+fn find_param_close(s: &str, from: usize) -> Option<(usize, usize)> {
+    let mut at = from;
+    while let Some(rel) = s[at..].find('<') {
+        let lt = at + rel;
+        if let Some(gt_at) = tag_step(s, lt + 1, "/")
+            .and_then(|k| tag_step(s, k, "parameter"))
+            .map(|k| skip_ws(s, k))
+        {
+            if s.as_bytes().get(gt_at) == Some(&b'>') {
+                return Some((lt, gt_at + 1));
+            }
+        }
+        at = lt + 1;
+    }
+    None
 }
 
 /// 尾巴挂起长度:`buf` 的最长后缀,且该后缀是某个标记的**真前缀**
@@ -760,6 +933,153 @@ mod tests {
         assert_eq!(s.tool_calls(), 1);
         assert_eq!(s.malformed(), 0);
         assert!(!items.iter().any(|i| matches!(i, Item::Malformed { .. })));
+    }
+
+    /// vLLM qwen3_coder 同款容错：第一个参数缺 `</parameter>` 时，
+    /// 下一个 `<parameter=` 是它的边界，仍应完整解析。
+    #[test]
+    fn missing_parameter_close_uses_next_parameter_boundary() {
+        let mut s = ChannelSplitter::new(false, tools());
+        let items = s.push(
+            "<tool_call>\n<function=bash>\n<parameter=command>\npwd\n<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>",
+        );
+        let calls: Vec<&Item> = items.iter().filter(|i| matches!(i, Item::ToolCall { .. })).collect();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(
+            calls[0],
+            Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == r#"{"command":"pwd","timeout":30}"#
+        ));
+        assert_eq!(s.malformed(), 0);
+    }
+
+    /// `</function>` 已闭合但漏了 `</tool_call>`（vLLM TOOL_BETWEEN 同款）：仍发工具。
+    #[test]
+    fn missing_tool_call_close_after_function_is_tolerated() {
+        let mut s = ChannelSplitter::new(false, tools());
+        let items = s.push(
+            "<tool_call>\n<function=bash>\n<parameter=command>\npwd\n</parameter>\n</function>",
+        );
+        assert!(items.iter().any(|i| matches!(
+            i,
+            Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == r#"{"command":"pwd"}"#
+        )));
+        assert_eq!(s.malformed(), 0);
+    }
+
+    /// 同一 `<tool_call>` 内连续两个 `<function>`（中间没有 tool 外壳）。
+    #[test]
+    fn multiple_functions_inside_one_tool_call() {
+        let mut s = ChannelSplitter::new(false, tools());
+        let items = s.push(
+            "<tool_call>\n<function=bash>\n<parameter=command>\npwd\n</parameter>\n</function>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>",
+        );
+        let calls: Vec<&Item> = items.iter().filter(|i| matches!(i, Item::ToolCall { .. })).collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls.iter().map(|i| match i { Item::ToolCall { arguments, .. } => arguments.as_str(), _ => "" }).collect::<Vec<_>>(),
+            vec![r#"{"command":"pwd"}"#, r#"{"command":"ls"}"#]
+        );
+        assert_eq!(s.malformed(), 0);
+    }
+
+    /// between 态跨 chunk 切断标记:结构空白与半截标记都不得泄进正文。
+    /// (旧实现逐字符推进时会提前转 Text,把 function-close 之后的换行当正文
+    /// 吐出 —— 这正是 char_by_char 翻车的机制,本用例钉死跨 chunk 形态)
+    #[test]
+    fn between_tools_state_survives_chunk_splits() {
+        let src = "<tool_call>\n<function=bash>\n<parameter=command>\npwd\n</parameter>\n</function>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
+        let mut s = ChannelSplitter::new(false, tools());
+        let mut items = Vec::new();
+        let bytes = src.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            // 本串全 ASCII,3 字节一步可把任意标记切成半截
+            let j = (i + 3).min(bytes.len());
+            items.extend(s.push(std::str::from_utf8(&bytes[i..j]).unwrap()));
+            i = j;
+        }
+        items.extend(s.finish());
+        let text: String = items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Delta { chan: Chan::Text, text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "", "between 态结构空白不进正文: {items:?}");
+        assert_eq!(s.tool_calls(), 2, "连续两个 function 块都要解析");
+        assert_eq!(s.malformed(), 0);
+    }
+
+    /// function-close 之后模型接着写正文(漏了 tool-call 壳):正文照常出,
+    /// 但夹在中间的结构换行归模板(与 vLLM TOOL_BETWEEN 丢空白同口径)。
+    #[test]
+    fn prose_after_function_block_still_streams() {
+        let mut s = ChannelSplitter::new(false, tools());
+        let mut items = s.push("<tool_call>\n<function=bash>\n<parameter=command>\npwd\n</parameter>\n</function>");
+        items.extend(s.push("done"));
+        items.extend(s.finish());
+        let text: String = items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Delta { chan: Chan::Text, text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "done", "正文接得上且不泄漏标记: {items:?}");
+        assert_eq!(s.tool_calls(), 1);
+        assert_eq!(s.malformed(), 0);
+    }
+
+    /// vLLM `_PARAM_RE` 容忍标签内空白(`< parameter = name >` 与 `闭标签`),
+    /// 且参数值里的换行必须原样保留(模板只吃首尾各一个换行)。
+    #[test]
+    fn tolerant_param_tags_and_multiline_values() {
+        let schema = ToolSchemas::from_tools(&[json!({"type":"function","function":{
+            "name":"bash",
+            "parameters":{"type":"object","properties":{
+                "command":{"type":"string"},
+                "count":{"type":"integer"}
+            }}}})]);
+        // 标签内故意加空白:开标签 " parameter = command "、闭标签 " / parameter "
+        let body = "<tool_call>\n<function=bash>\n< parameter = command >\n\
+                    echo a\nb\n< / parameter >\n<parameter=count>\n7\n</parameter>\n\
+                    </function>\n</tool_call>";
+        let mut s = ChannelSplitter::new(false, schema);
+        let items = s.push(body);
+        let call = items.iter().find_map(|it| match it {
+            Item::ToolCall { arguments, .. } => Some(arguments.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            call.as_deref(),
+            Some(r#"{"command":"echo a\nb","count":7}"#),
+            "空白标签 + 多行值 + 类型回填"
+        );
+        assert_eq!(s.malformed(), 0, "宽容扫描不得把合法块判成畸形");
+    }
+
+    /// Pydantic v2 的 Optional[T] 是 anyOf；类型回填取非 null 分支。
+    #[test]
+    fn anyof_schema_types_are_coerced() {
+        let schema = ToolSchemas::from_tools(&[json!({"type":"function","function":{
+            "name":"typed",
+            "parameters":{"type":"object","properties":{
+                "count":{"anyOf":[{"type":"integer"},{"type":"null"}]},
+                "flag":{"anyOf":[{"type":"boolean"},{"type":"null"}]},
+                "ratio":{"anyOf":[{"type":"float"},{"type":"null"}]}
+            }}}})]);
+        let mut s = ChannelSplitter::new(false, schema);
+        let items = s.push(
+            "<tool_call>\n<function=typed>\n<parameter=count>\n42\n</parameter>\n<parameter=flag>\ntrue\n</parameter>\n<parameter=ratio>\n3.14\n</parameter>\n</function>\n</tool_call>",
+        );
+        assert!(items.iter().any(|i| matches!(
+            i,
+            Item::ToolCall { name, arguments, .. }
+                if name == "typed" && arguments == r#"{"count":42,"flag":true,"ratio":3.14}"#
+        )));
     }
 
     /// 多工具块 + I5 序号连续
