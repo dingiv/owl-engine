@@ -1604,10 +1604,54 @@ cargo test -p cli --test workload_e2e -- --nocapture
 pi 形态无 session 时依赖 `runtime.implicit_session=true`。多段 text 的边界
 由服务端 `normalize_multipart_text` 统一补 `\n`，客户端不要手写分隔符。
 
+## §9.4 pi 前缀缓存：8135 生产档修复（2026-10-25）
+
+**症状**：pi 在 8135（TP2 / FP8 / spec d7）调用工具后等待约 20s；
+`/debug/agent` 显示每轮 `cached_tokens=0`，用户手动输入新消息也不命中。
+
+**根因**：`profiles/qwen38_27b-3080_tp2.toml` 的生产配置是
+`prefix_cache=false`（历史 TP2 档为了避免压力腾槽），不是引擎缓存失效。
+pi 不发 `session`，但跨会话内容寻址缓存仍应工作；关掉后每轮必然全量 prefill。
+
+**修复**：
+
+```toml
+[pool]
+snap_max = 1
+prefix_cache = true
+snap_host_mb = 1024
+snap_msg_boundary = true
+snap_msg_delim = ""
+snap_msg_min_gap = 2048
+snap_msg_min_span = 0
+```
+
+`snap_host_mb=1024` 避免唯一 durable 前缀边界被 Transient 快照顶掉；
+消息边界快照与 3090 档同形。这是首轮修复值；同日生产档拉满后为
+`snap_max=2` / `snap_host_mb=3072`（见 v0.18）。
+
+**真机读数**（restart 后，pi 实际请求 / 合成 49k prompt）：
+
+| 请求 | prompt | cached | TTFT |
+|---|---:|---:|---:|
+| 合成 49k 首轮 | 49,453 | 0 | 37.9s |
+| 合成 49k 次轮 | 49,474 | **49,440（99.9%）** | **0.21s** |
+| pi 工具跟进 | 1,640 | **1,568（95.6%）** | **149ms** |
+| pi 手动新消息 | 1,696 | **1,632（96.2%）** | **97ms** |
+| pi 新会话（同 system） | 1,563 | **1,536（98.3%）** | **116ms** |
+
+⇒ 工具调用后的等待与用户新消息的“重新 prefill”均消失；8135 保持
+FP8 + spec d7 生产形状。2026-10-25 生产档进一步拉满：
+`implicit_session=true`、`image_evict=true` + `delta_limit=4`、
+`snap_msg_boundary=true`；8135 `image-evict` 5/5、GUI 三图窗口 PASS，
+8134 pi 工具跟进 cached 1568/1647、TTFT 141ms。
+
 ## §十 变更记录
 
 | 日期 | 版本 | 变更 |
 |---|---|---|
+| 2026-10-25 | v0.18 | **生产 profiles 拉满**：3090 改 63456/snap2、3080 TP2 262144/snap2；两档统一 prefix_cache + implicit_session + image_evict(delta4) + 消息边界 + host 10G。8134 `image_delete_marked`/pi 工具跟进(cached 1568/1647, TTFT 141ms)通过；8135 `image-evict` 5/5、GUI PASS |
+| 2026-10-25 | v0.17 | **8135 pi 前缀缓存修复**：TP2 生产档 `prefix_cache=false` 是根因；改 true + snap_host 1G + 消息边界快照。pi 工具跟进 cached 95.6%/TTFT 149ms，新消息 96.2%/97ms，新会话 98.3%/116ms；合成 49k 首轮 37.9s → 次轮 0.21s |
 | 2026-10-25 | v0.16 | **agent workload e2e 回归面 + FP8 重转**：`core` / `gui` / `image-evict` / `image-evict-rebase`；真 HTTP/真图/真工具，覆盖 **GUI-agent 三图窗口（tool 结果附截图）**、首图/中间图/最后一张/工具轮后删图/滑动窗口 + 叠转重建；新增 `tools/run-agent-workload.sh` 隔离起停;同时修复中间图删除的前缀 pad 重复 —— 见 §9.3 |
 | 2026-10-19 | v0.15 | **pi 口径定档 64k**(测装 `pi-27b-64k.toml` + pi `contextWindow 65536/maxTokens 8192`;>16k 实测 16064 tok OK;pi 真机 7 轮:冷 12.25s → cached 100.0%/98.9%/92.4%/98.7%/99.7%,TTFT 0.42-1.33s;日志 117 行/零 conn 警告/零收缩)—— 见 §9.2(6) |
 | 2026-10-19 | v0.14 | **G5 真机收口**:pi(undici)真客户端验证——keep-alive/chunked 零 `[conn]` 警告,4 轮含工具调用;前缀复用 cached 98.9%→99.85%,TTFT 12.4s→1.0-1.3s;`/debug/agent` 四轮全在场。**日志面两修**:①`owl-gpu` free 刷屏(49920 行/会话)降 DEBUG,仅账目不平升 WARN;②生成段快照(Transient)不再试下沉(设计行为曾被报成故障 WARN)—— 见 §9.2(5) |

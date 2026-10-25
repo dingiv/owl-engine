@@ -29,31 +29,42 @@ extends = [
 
 | 文件 | 形状 |
 |---|---|
-| `qwen38_27b-3090.toml` | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / **max_seq 79872** |
-| `qwen38_27b-3080_tp2.toml` | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / fp8 KV / **max_seq 262144** |
+| `qwen38_27b-3090.toml` | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 63456（全特性稳定点）** |
+| `qwen38_27b-3080_tp2.toml` | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144** |
 
 这条裁决被**测试钉住**：`crates/shared/src/profiles.rs::入口档面只允许唯二常驻档`
 —— 往 `profiles/` 顶层再丢一个 `.toml` 就会红。
 
-`max_seq=79872` 是 **2026-10-25 全特性拉满档**（视觉塔 + DFlash2 d7 + fp8 KV +
-1 快照）的实测最大：1 快照下 boot cap=90025，但**可用上限由 runtime 压力地板
-决定**（1GiB + 单块工作集 ≈64.6MB）：79872 时驱动余量 1106MiB（82MiB 余量），
-70,250-token prompt 实测 200 OK（73.4s 冷），同 prompt 第二发
-cached 70,240/70,250 = **99.99%**（1.52s）；再高到 80,896 就会
-`PoolExhausted`。池不手写（自动派生）。4 快照时 75712 连第一个 turn 都过不了
-（余量 786MiB < 1GiB）——所以本档把快照压到 1 槽（实测复用没丢）。
-视觉塔让 live 权重 +0.86G，无视觉时上限 ≈104.4k；代价是驱动余量贴着压力
-地板，会出现 `N6 压力节点` WARN（功能/缓存实测未坏；要零腾槽改回 65536）。
-宿主 KV 腿 **10GiB**（≈4 条 79k 链）：4GiB 时两发长 prompt 后第三发的 27k 前缀
-回灌会撞「槽池耗尽」；10GiB 让整链下沉、设备槽立刻回来（2026-10-25 修复配套）。
-**旧注释里的 262k `--set` 配方已失效**：自动池在 overcommit 之前先判
-`max_seq ≤ ctx_max`，262k 会 boot 响亮拒；要 262k 需先改引擎（逻辑 ctx 与
-物理池解耦），不是配置能开出来的。历史实测表在该档文件头注释里。
+2026-10-25 生产档拉满（两档同形，硬件差异只留 max_seq/TP）：
+
+- `prefix_cache=true` + `snap_msg_boundary=true`；
+- `implicit_session=true`（pi 不发 session，工具轮/图片删除有稳定会话）；
+- `image_evict=true` + `image_evict_delta_limit=4`（FP8 硬上限）；
+- 3090：`max_seq=63456 / snap_max=2 / host_cache=10G / snap_host=3G`；
+- 3080 TP2：`max_seq=262144 / snap_max=2 / host_cache=10G / snap_host=3G`。
+
+pi 实测工具跟进 cached 95.6% / TTFT 149ms，手动新消息 96.2% / 97ms，
+新会话 98.3% / 116ms；8135 的 `image-evict` 5/5、GUI 窗口 PASS。
+详见 `docs/devlog/serving/agent-surface.md` §9.4。
+
+`max_seq=63456 / snap_max=2` 是 **2026-10-25 单 3090 全特性稳定点**：
+24G 上同时开视觉塔 + DFlash2 d7 + fp8 KV + 前缀缓存 + image_evict。
+fresh boot 驱动余量高于 1GiB；前缀缓存饱和后可能短暂出现 N6 压力 WARN，
+`image_delete_marked` 与 GUI 三图窗口实测仍通过。更大的 79872/snap1 虽然 ctx 更大，但驱动余量贴地板，
+image_evict 的前缀块会被下沉到 host（`前缀有宿主占位 ⇒ 不吸收`），
+不再作为生产默认；长上下文/大图窗口由 3080 TP2（262144/snap2）承担。
+
+宿主 KV 腿 **10GiB**（≈4 条 63k 链）：4GiB 时两发长 prompt 后第三发的
+27k 前缀回灌会撞「槽池耗尽」；10GiB 让整链下沉、设备槽立刻回来
+（2026-10-25 修复配套）。自动池在 overcommit 之前先判 `max_seq ≤ ctx_max`，
+262k 在单 3090 上会 boot 响亮拒；要 262k 需改引擎（逻辑 ctx 与物理池解耦），
+不是配置能开出来的。
 
 ```bash
 # 临时变体（不再建文件；超过 ctx_max 会被 boot 响亮拒，不会静默夹）
 --set spec.depth=0 --set spec.lookup=false     # 关投机对照臂
---set runtime.max_seq=65536                    # 回退到旧稳态点（压力更小）
+--set runtime.max_seq=63456                    # 全特性稳定点（默认）
+--set runtime.max_seq=79872 --set pool.snap_max=1  # 更大 ctx 但 image_evict 可能失效
 --set model.vision=false                       # 关视觉可换回更大 ctx（~104k）
 ```
 
@@ -70,9 +81,8 @@ cargo serve -p profiles/qwen38_27b-3090.toml
   --set parallel.device='["GPU-…","GPU-…"]' --log-level info
 
 # 临时变体（不再建文件）
---set runtime.max_seq=65536                    # 回退到无抖动稳态点
 --set spec.depth=0 --set spec.lookup=false     # 关投机对照臂
---set pool.snap_max=2                          # 用前缀复用换更大 ctx
+# 默认 63456 + snap2;要更大 ctx 见上面 79872 的取舍
 ```
 
 ## 目录
