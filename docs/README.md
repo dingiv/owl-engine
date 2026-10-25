@@ -105,6 +105,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/memory/kvmem-selection.md`](devlog/memory/kvmem-selection.md) — KVMem selection layer (B axis)
 - ⬜ [`devlog/memory/longctx-attribution.md`](devlog/memory/longctx-attribution.md) — Long-context performance attribution, round one
 - ⬜ [`devlog/memory/prefix-deletion.md`](devlog/memory/prefix-deletion.md) — Prefix-transparent deletion
+- ⬜ [`devlog/memory/image-evict-leave-gap-交接.md`](devlog/memory/image-evict-leave-gap-交接.md) — Image eviction without delta-limit rebuilds: leave-gap positions, position ledger, consolidation, phased handoff
 - ⬜ [`devlog/memory/store-hook-contract.md`](devlog/memory/store-hook-contract.md) — Store hook contract: 19-point audit, 3-hook convergence (Acquire/Release/Maintain), migration gates
 - ⬜ [`devlog/memory/kvarn-k4v4-施工文档.md`](devlog/memory/kvarn-k4v4-施工文档.md) — KVarN k4v4/g128 handoff: layout, kernels, page128 integration, phase gates
 - ⬜ [`devlog/memory/kvarn-k4v4-落地可行性复核.md`](devlog/memory/kvarn-k4v4-落地可行性复核.md) — KVarN feasibility review: sink/tail lifecycle, store RTN/pack gap, page128 blast radius, 3090/3080 capacity math, k4v4 vs k4v2 verdict
