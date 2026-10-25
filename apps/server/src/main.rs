@@ -316,6 +316,16 @@ async fn main() {
     );
 
     let (bind, model_name) = (config.bind.clone(), config.model_name.clone());
+    // 请求原文落盘目录（诊断开关；空 = 关）。写入失败 = 启动失败，
+    // 不允许“日志开了但其实没落盘”的静默失约。
+    let request_dump_dir = config.request_dump_dir.clone();
+    if let Some(dir) = &request_dump_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("[boot] request_dump_dir 创建失败 {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+        owl_shared::log_info!("boot", "请求原文落盘:{}", dir.display());
+    }
     // agent 服务面旋钮(模板已装载用于 log;此处交协议面消费)
     let agent = std::sync::Arc::new(config.agent.clone());
     // **诊断投影面共享单元**(见 `DbgFace` 注):actor 装、HTTP 读
@@ -462,6 +472,7 @@ async fn main() {
                 let ctx = ConnCtx {
                     tx: tx.clone(),
                     model_name: model_name.clone(),
+                    request_dump_dir: request_dump_dir.clone(),
                     tpl: tpl.clone(),
                     agent: agent.clone(),
                     dbg_face: dbg_face.clone(),
@@ -770,6 +781,8 @@ fn panic_payload_str(p: &(dyn std::any::Any + Send)) -> String {
 struct ConnCtx {
     tx: mpsc::Sender<EngineReq>,
     model_name: String,
+    /// 原始请求 JSON 落盘目录（None = 关）
+    request_dump_dir: Option<std::path::PathBuf>,
     tpl: std::sync::Arc<chat_tpl::ChatTpl>,
     agent: std::sync::Arc<crate::config::AgentCfg>,
     /// `/debug/blocks` 的 GPU 命令出口(engine `face_clone()`;None = 不支持)
@@ -872,6 +885,7 @@ async fn handle(
                 &ctx.trace,
                 &ctx.sessions,
                 &ctx.gate,
+                ctx.request_dump_dir.as_deref(),
             )
             .await?;
         }

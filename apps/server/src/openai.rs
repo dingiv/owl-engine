@@ -14,6 +14,7 @@
 //! 挂账(M-C):取消/abort 的上游用法(`EngineReq::Abort` 已就位,pi 侧
 //! 断流走路由 actor 自动弃置)。
 
+use std::io::Write;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -681,6 +682,41 @@ fn expand_image_pads(prompt: &str, images: &[owl_engine::TurnImage]) -> Result<S
     Ok(out)
 }
 
+/// **原始请求 JSON 落盘**(显式诊断开关；每请求一份，便于前端联调复现)。
+///
+/// 文件名用纳秒 + pid + attempt；`create_new` 防并发覆盖。落盘失败只 WARN，
+/// 不影响请求本身（诊断面不能把主路径打死）。
+fn dump_request(dir: &std::path::Path, body: &[u8]) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    for attempt in 0..100u32 {
+        let path = dir.join(format!("req-{nanos}-{pid}-{attempt}.json"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(body) {
+                    owl_shared::log_warn!("request-dump", "写入失败 {}: {e}", path.display());
+                } else {
+                    owl_shared::log_debug!("request-dump", "落盘 {} ({}B)", path.display(), body.len());
+                }
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                owl_shared::log_warn!("request-dump", "创建失败 {}: {e}", path.display());
+                return;
+            }
+        }
+    }
+    owl_shared::log_warn!("request-dump", "同一纳秒 100 次文件名冲突，放弃落盘");
+}
+
 /// chat completions:提交 actor → 首笔 Accepted/Rejected → 三通道折叠循环。
 pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
@@ -695,7 +731,12 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     gates: &Arc<crate::session_gate::SessionGates>,
     // **并发 permit**(P0):必须在会话闸**之后**取 —— 见 `serve()` 的注释
     gate: &Arc<tokio::sync::Semaphore>,
+    // 原始请求 JSON 落盘目录（None = 关）
+    request_dump_dir: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
+    if let Some(dir) = request_dump_dir {
+        dump_request(dir, body);
+    }
     let mut req: ChatRequest = match serde_json::from_slice::<ChatRequest>(body) {
         Ok(r) => r,
         Err(e) => {

@@ -1558,6 +1558,9 @@ pub enum ToolCallFormat {
 pub struct ServerCfg {
     /// HTTP 监听地址(原 `[runtime] bind`)
     pub bind: String,
+    /// **原始请求 JSON 落盘目录**(空 = 关;每请求一份 body,供前端联调
+    /// 精确复现。含业务数据/图片 data URL,开启前确认隐私与磁盘容量)。
+    pub request_dump_dir: String,
     /// 模板路径覆盖:None/空 = 模型快照 `<model.path>/chat_template.jinja`;
     /// 相对路径 = 相对模型目录。**不动快照**换模板的运维抓手。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1578,6 +1581,7 @@ impl Default for ServerCfg {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8135".into(),
+            request_dump_dir: String::new(),
             template_path: None,
             parse_tool_calls: true,
             tool_call_format: ToolCallFormat::Xml,
