@@ -15,7 +15,8 @@ OpenAI 兼容面正常行为；缓存机制与思考无关）。诊断想看 con
   - 去掉 `owl_evict` 再跑一遍（对照臂）= 删点不落页边界 ⇒ cached 只到删点
     之前（实测 0）。
 
-前置：档位必须开 `[pool] image_evict = true` + `prefix_cache = true` + f16 KV；
+前置：档位必须开 `[pool] image_evict = true` + `prefix_cache = true` +
+分页 KV（f16 或 fp8-e4m3；FP8 需 `image_evict_delta_limit` 1..=4）；
 图像建议 ≥256×256（网格过小会撞 FI ragged 的既有面）。
 """
 import argparse, base64, json, struct, urllib.request, zlib

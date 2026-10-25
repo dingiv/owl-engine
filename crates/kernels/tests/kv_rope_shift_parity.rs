@@ -389,3 +389,116 @@ fn kv_rope_k_shift_matches_host() {
         assert!(worst <= 1.0, "R(Δ)∘R(−Δ) 往返 {worst:.3}× 超 8 ulp(配对量级)");
     }
 }
+
+// ── FP8 e4m3 主池变体(2026-10-25)──────────────────────────────────────
+
+fn host_shift_fp8(k: &mut [u8], cos1: &[f32], sin1: &[f32], blocks: &[u32]) {
+    for &b in blocks {
+        let b = b as usize;
+        for h in 0..HKV {
+            for t in 0..PAGE {
+                for d in 0..HALF {
+                    let lo = k_off(b, h, d) + t * X;
+                    let hi = k_off(b, h, d + HALF) + t * X;
+                    let c = cos1[d];
+                    let s = sin1[d];
+                    let a = owl_kernels::ops::oracles::e4m3_decode(k[lo]);
+                    let bb = owl_kernels::ops::oracles::e4m3_decode(k[hi]);
+                    k[lo] = owl_kernels::ops::oracles::e4m3_encode(a * c - bb * s);
+                    k[hi] = owl_kernels::ops::oracles::e4m3_encode(bb * c + a * s);
+                }
+            }
+        }
+    }
+}
+
+/// 设备 ⇔ host:FP8 旋转。判据用 **e4m3 码差 ≤1**(量化格式粒度大;
+/// 与 f16 的 ulp 判据不同,见文档 §5sexies)。
+#[owl_test(gpu)]
+fn kv_rope_k_shift_fp8_matches_host() {
+    let ctx = CudaContext::new(1).expect("ctx");
+    ctx.bind_to_thread().expect("bind");
+    let stream = ctx.default_stream();
+    let f = compile(
+        &ctx,
+        owl_kernels::cu_sig::cu_text(owl_kernels::ops::source("owl_kv_rope_k_shift_fp8")).as_str(),
+        "owl_kv_rope_k_shift_fp8",
+    );
+    let pool_elems = NB * HKV * HD * PAGE;
+    let base: Vec<u8> = (0..pool_elems)
+        .map(|i| owl_kernels::ops::oracles::e4m3_encode(((i * 37 + 11) % 401) as f32 / 40.0 - 5.0))
+        .collect();
+    let blocks: [u32; 3] = [2, 0, 4];
+    let (c, s) = delta_row(977);
+    let cb: Vec<u16> = c.iter().map(|v| half_bits(*v)).collect();
+    let sb: Vec<u16> = s.iter().map(|v| half_bits(*v)).collect();
+    let mut d_k = unsafe { stream.alloc::<u8>(pool_elems) }.unwrap();
+    stream.memcpy_htod(&base, &mut d_k).unwrap();
+    let mut d_c = unsafe { stream.alloc::<u16>(HALF) }.unwrap();
+    let mut d_s = unsafe { stream.alloc::<u16>(HALF) }.unwrap();
+    stream.memcpy_htod(&cb, &mut d_c).unwrap();
+    stream.memcpy_htod(&sb, &mut d_s).unwrap();
+    let mut d_b = unsafe { stream.alloc::<f32>(blocks.len()) }.unwrap();
+    let bl: Vec<f32> = blocks.iter().map(|b| *b as f32).collect();
+    stream.memcpy_htod(&bl, &mut d_b).unwrap();
+    let (kp, cp, sp, bp) = (
+        d_k.device_ptr(&stream).0,
+        d_c.device_ptr(&stream).0,
+        d_s.device_ptr(&stream).0,
+        d_b.device_ptr(&stream).0,
+    );
+    let (hkv, hd, page, x, half) =
+        (HKV as u64, HD as u64, PAGE as u64, X as u64, HALF as u64);
+    let units = blocks.len() * HKV * (HALF / X);
+    let mut b = stream.launch_builder(&f);
+    b.arg(&cp)
+        .arg(&sp)
+        .arg(&bp)
+        .arg(&hkv)
+        .arg(&hd)
+        .arg(&page)
+        .arg(&x)
+        .arg(&half)
+        .arg(&kp);
+    unsafe {
+        b.launch(LaunchConfig {
+            grid_dim: (units as u32, 1, 1),
+            block_dim: ((PAGE * X) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+    let mut got = vec![0u8; pool_elems];
+    stream.memcpy_dtoh(&d_k, &mut got).unwrap();
+    let mut want = base.clone();
+    host_shift_fp8(&mut want, &c, &s, &blocks);
+    let mut worst = 0i32;
+    let mut bad = 0usize;
+    for &blk in &blocks {
+        let blk = blk as usize;
+        for h in 0..HKV {
+            for t in 0..PAGE {
+                for d in 0..HD {
+                    let off = k_off(blk, h, d) + t * X;
+                    let a = owl_kernels::ops::oracles::e4m3_decode(got[off]);
+                    let b = owl_kernels::ops::oracles::e4m3_decode(want[off]);
+                    if !a.is_finite() || !b.is_finite() {
+                        bad += 1;
+                        continue;
+                    }
+                    let step = (a.abs().max(b.abs()) * 2.0f32.powi(-3)).max(1e-6);
+                    let code_diff = ((a - b).abs() / step).round() as i32;
+                    worst = worst.max(code_diff);
+                    // 1 步差可分给“nvcc FMA vs host 两次舍入”；2 步是量化
+                    // 边界上的极端抵销（3 页 × 4 头 × 256 维里实测 2 个）。
+                    if (a - b).abs() > 2.0 * step {
+                        bad += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(bad, 0, "FP8 K 旋转有 {bad} 个元素超过 2 个 e4m3 步长(最差 {worst} 步)");
+    eprintln!("[fp8-shift] 最差 {worst} 个 e4m3 码步(判据 ≤2)");
+}

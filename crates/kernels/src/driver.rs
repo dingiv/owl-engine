@@ -2353,7 +2353,13 @@ pub mod elems {
     /// 参数量纲:标量槽序 = `hkv, hd, page, x, half`(与表同源),`dt` 恒 F16
     /// (fp8 主池不支持 —— 调用方先拒)。
     pub fn kv_rope_shift(dt: DType, nblocks: usize, scalars: &[i64]) -> KernelPick {
-        assert!(matches!(dt, DType::F16), "kv_rope_shift 只有 f16 档,得 {dt:?}");
+        // 池句柄口径:FP8 主池是 U32 扁平字节账,元素格式由 POOL=F8E4M3
+        // 承担;f16 主池是 F16。两种都走同一几何/同一核对拍门。
+        let fp8 = match dt {
+            DType::F16 => false,
+            DType::U32 | DType::F8E4M3 => true,
+            other => panic!("kv_rope_shift: 仅 f16 / fp8-e4m3,得 {other:?}"),
+        };
         let s = |i: usize| -> usize {
             *scalars.get(i).unwrap_or_else(|| {
                 panic!("kv_rope_shift: 标量槽 {i} 缺失(需 hkv/hd/page/x/half 五个)")
@@ -2369,11 +2375,12 @@ pub mod elems {
         );
         let units = nblocks * hkv * (half / x);
         assert!(units > 0, "kv_rope_shift: 零单元(空页列表?)");
-        KernelPick::of::<crate::ops::elems::KvRopeKShiftF16>(Shape {
-            grid: (units as u32, 1, 1),
-            block: (threads as u32, 1, 1),
-            smem: 0,
-        })
+        let shape = Shape { grid: (units as u32, 1, 1), block: (threads as u32, 1, 1), smem: 0 };
+        if fp8 {
+            KernelPick::of::<crate::ops::elems::KvRopeKShiftFp8>(shape)
+        } else {
+            KernelPick::of::<crate::ops::elems::KvRopeKShiftF16>(shape)
+        }
     }
 
     /// 激活 per-token int8 量化(W4A8 喂料手;S1c)。

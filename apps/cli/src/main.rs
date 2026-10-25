@@ -20,6 +20,12 @@
 //! cargo run -p cli -- --url http://127.0.0.1:8135 --max-tokens 96
 //! cargo run -p cli -- --workload core --url http://127.0.0.1:8135 \
 //!   --server-log /tmp/owl-8135-image-evict.log
+//! # 真实 GUI-agent 负载(工具结果附截图,窗口只留 3 张):
+//! cargo run -p cli -- --workload gui --url http://127.0.0.1:8135 \
+//!   --server-log /tmp/owl-8135-gui.log
+//! # 调试单场景:
+//! cargo run -p cli -- --workload image-evict --only image_delete_middle \
+//!   --url http://127.0.0.1:8135 --server-log /tmp/owl-8135-image-evict.log
 //! ```
 //!
 //! 架子边界(挂账):纯 std 阻塞实现(客户端零异步依赖;SSE close
@@ -44,6 +50,7 @@ struct Cfg {
     max_tokens: usize,
     session: String,
     workload: Option<String>,
+    only: Option<String>,
     server_log: Option<String>,
     json: bool,
     keep: bool,
@@ -60,6 +67,7 @@ fn parse_args() -> Cfg {
         model: None,
         max_tokens: DEFAULT_MAX_TOKENS,
         workload: None,
+        only: None,
         server_log: None,
         json: false,
         keep: false,
@@ -82,11 +90,12 @@ fn parse_args() -> Cfg {
             "--session" => cfg.session = val(),
             "--model" => cfg.model = Some(val()),
             "--workload" => cfg.workload = Some(val()),
+            "--only" => cfg.only = Some(val()),
             "--server-log" => cfg.server_log = Some(val()),
             "--json" => cfg.json = true,
             "--keep" => cfg.keep = true,
             other => die(&format!(
-                "未知参数 {other}(--url/--max-tokens/--session/--model/--workload/--server-log/--json/--keep)"
+                "未知参数 {other}(--url/--max-tokens/--session/--model/--workload/--only/--server-log/--json/--keep)"
             )),
         }
     }
@@ -106,6 +115,7 @@ fn main() {
             model: cfg.model.clone(),
             max_tokens: cfg.max_tokens,
             suite,
+            only: cfg.only.clone(),
             server_log: cfg.server_log.clone(),
             json: cfg.json,
             keep: cfg.keep,

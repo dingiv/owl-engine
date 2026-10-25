@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use crate::client::{ChatReply, Client};
 use crate::workload::png::{data_url_png, BLUE, CYAN, GREEN, PURPLE, RED, YELLOW};
 use crate::workload::report::{ScenarioReport, TurnRecord};
-use crate::workload::{report, Args, Ctx, Workspace};
+use crate::workload::{gui, image_count, remove_oldest_image, report, Args, Ctx, Workspace};
 
 const SYS_TEXT: &str =
     "You are a careful assistant. Answer concisely. Use the conversation history; never invent facts.";
@@ -70,33 +70,125 @@ fn remove_image(history: &mut [Value], url: &str) -> bool {
     false
 }
 
-fn image_count(history: &[Value]) -> usize {
-    history
-        .iter()
-        .filter_map(|m| m.get("content").and_then(Value::as_array))
-        .map(|a| {
-            a.iter()
-                .filter(|p| p.get("image_url").is_some())
-                .count()
-        })
-        .sum()
-}
-
-fn remove_oldest_image(history: &mut [Value]) -> Option<String> {
-    for msg in history.iter_mut() {
-        let Some(arr) = msg.get_mut("content").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        if let Some(pos) = arr.iter().position(|p| p.get("image_url").is_some()) {
-            let part = arr.remove(pos);
-            return part["image_url"]["url"].as_str().map(str::to_string);
-        }
-    }
-    None
-}
-
 fn tool_names(ctx: &Ctx<'_>) -> Vec<String> {
     ctx.turns.iter().flat_map(|t| t.tools.clone()).collect()
+}
+
+const SYS_GUI: &str = "You are a GUI agent controlling a desktop. You have exactly these tools: \
+screenshot, click, type, key. Every tool call returns the current screen as an image. \
+The harness executes every tool call, attaches the resulting screen, and keeps only the three \
+newest screenshots in the conversation; older images are removed automatically. \
+A single assistant response may contain several tool calls. The user does not act between them; \
+the agent loop executes all calls and sends the tool results back to you. \
+Follow the user's step list in order and use the attached images.";
+
+// ── 0. real GUI-agent load: tools return screenshots, keep newest three ───
+pub(crate) fn gui_agent_screenshots(
+    client: &Client,
+    args: &Args,
+    pid: u32,
+    max_tokens: usize,
+) -> Result<ScenarioReport, String> {
+    let ws = Workspace::new("gui_agent_screenshots", pid, args.keep)?;
+    let mut ctx = Ctx::new(
+        client,
+        "gui_agent_screenshots",
+        Some(session(pid, "gui")),
+        true,
+        max_tokens,
+        ws.path(),
+    );
+    ctx.log_path = args.server_log.as_ref().map(std::path::PathBuf::from);
+    // Unique run tag: the prefix tree is content-addressed, so two identical
+    // GUI transcripts would share image-bearing blocks and the first delete
+    // would be refused as "shared suffix" (refs > 1) instead of absorbed.
+    ctx.system(&format!("{SYS_GUI} Run tag: {}.", nonce(pid)));
+    ctx.gui = Some(gui::GuiAgent::new());
+    ctx.image_limit = Some(3);
+    let log_mark = ctx.log_mark();
+    let result = (|| -> Result<String, String> {
+        let reply = ctx.send(json!(
+            "Complete these six steps in order. The user does not act between steps; the \
+             agent loop executes every tool call and returns the screen after each action.\n\
+             1. screenshot\n\
+             2. In one assistant response, emit two separate function calls: \
+                click(64, 64) and click(192, 192). Do not split them across responses.\n\
+             3. type the text \"owl\" into the focused field\n\
+             4. press the ENTER key\n\
+             5. screenshot\n\
+             6. After the final screenshot, answer with the dominant colour of the latest \
+                screenshot as one lowercase English colour word. Do not answer earlier."
+        ))?;
+        let names = tool_names(&ctx);
+        ensure(
+            names.iter().filter(|n| *n == "screenshot").count() >= 2,
+            format!("截图次数不足: {names:?}"),
+        )?;
+        ensure(
+            names.iter().filter(|n| *n == "click").count() >= 2,
+            format!("点击次数不足: {names:?}"),
+        )?;
+        ensure(names.iter().any(|n| n == "type"), format!("没有 type: {names:?}"))?;
+        ensure(names.iter().any(|n| n == "key"), format!("没有 key: {names:?}"))?;
+        ensure(
+            names.len() >= 6,
+            format!("工具调用少于 6 次,不足以触发图片窗口: {names:?}"),
+        )?;
+        // A single assistant response may return several function calls; the
+        // agent loop executes all of them. Do not assert one tool per round.
+        let max_images = ctx.turns.iter().map(|t| t.images).max().unwrap_or(0);
+        ensure(
+            max_images <= 3,
+            format!("请求里图片数超过 3: {max_images}(turns={:?})",
+                ctx.turns.iter().map(|t| t.images).collect::<Vec<_>>()),
+        )?;
+        ensure(
+            ctx.image_prunes.len() >= 3,
+            format!("只删除了 {} 张旧图(期望 ≥3)", ctx.image_prunes.len()),
+        )?;
+        ensure(
+            image_count(&ctx.history) == 3,
+            format!("结束时历史图片数 = {}(期望 3)", image_count(&ctx.history)),
+        )?;
+        let log = ctx.log_since(log_mark);
+        if ctx.log_path.is_some() {
+            let absorbed = log.matches("前缀无感删除").count();
+            ensure(
+                absorbed >= 3,
+                format!(
+                    "服务端只吸收 {absorbed} 次旧图删除(期望 ≥3);img-evict={:?}",
+                    log.lines().filter(|l| l.contains("img-evict")).collect::<Vec<_>>()
+                ),
+            )?;
+        }
+        // 最后三轮都在首次 prune 之后;不能把 t4(刚好 3 图、尚未删图)
+        // 的 cached 当成删除吸收的证据。
+        let warm = ctx
+            .turns
+            .iter()
+            .rev()
+            .take(3)
+            .map(|t| t.cached_pct())
+            .fold(0.0f64, f64::max);
+        ensure(
+            warm >= 30.0,
+            format!("三图窗口下 cached 最高只有 {warm:.1}%(前缀/删图吸收失败)"),
+        )?;
+        ensure(has(&reply, "yellow"), format!("最终颜色不是 yellow: {:?}", reply.text()))?;
+        let screen = ctx.gui.as_ref().map(gui::GuiAgent::screen).unwrap_or((0, 0, 0));
+        ensure(
+            screen == crate::workload::png::YELLOW,
+            format!("GUI 终态颜色 {screen:?} != yellow"),
+        )?;
+        Ok(format!(
+            "tools={} prunes={} images={} max_images/round={} warm_cached={warm:.1}% final=yellow",
+            names.len(),
+            ctx.image_prunes.len(),
+            image_count(&ctx.history),
+            max_images,
+        ))
+    })();
+    Ok(report("gui_agent_screenshots", ctx, result))
 }
 
 // ── 1. text multi-turn ────────────────────────────────────────────────────
@@ -259,6 +351,36 @@ pub(crate) fn mixed_tool_image(
     Ok(report("mixed_tool_image", ctx, result))
 }
 
+fn assert_image_delete_absorbed(
+    label: &str,
+    last: &TurnRecord,
+    log: &str,
+    has_log: bool,
+    min_cached_pct: f64,
+) -> Result<(), String> {
+    if has_log {
+        ensure(
+            log.contains("前缀无感删除"),
+            format!(
+                "{label}: server log 未出现吸收;img-evict 行: {:?}",
+                log.lines().filter(|l| l.contains("img-evict")).collect::<Vec<_>>()
+            ),
+        )?;
+    }
+    ensure(
+        last.cached > 0,
+        format!("{label}: cached=0(删点之后重算;log 吸收证据={})", log.contains("前缀无感删除")),
+    )?;
+    ensure(
+        last.cached_pct() >= min_cached_pct,
+        format!(
+            "{label}: cached={:.1}%(期望 ≥{min_cached_pct:.0}%)",
+            last.cached_pct()
+        ),
+    )?;
+    Ok(())
+}
+
 // ── 5. image prefix-transparent deletion (marked + control + implicit) ───
 fn delete_arm(
     client: &Client,
@@ -328,8 +450,10 @@ fn delete_arm(
                     log.lines().filter(|l| l.contains("img-evict")).collect::<Vec<_>>()),
             )?;
         }
+        // 无日志时的弱判据:只靠前缀(删点之前)命中。不同 prompt 形状下
+        // 这份前缀可以到 30%+;有日志时上面的 `!log_absorbed` 才是硬判据。
         ensure(
-            last.cached_pct() < 20.0,
+            last.cached_pct() < 50.0,
             format!("control 臂 cached={:.1}%(删点之后不应命中)", last.cached_pct()),
         )?;
     }
@@ -385,7 +509,289 @@ pub(crate) fn image_delete_marked(
     })
 }
 
-// ── 6. sliding screenshot window (6 turns, keep 3, delete oldest) ────────
+// ── 6. delete a middle image from a three-image history ─────────────────
+pub(crate) fn image_delete_middle(
+    client: &Client,
+    args: &Args,
+    pid: u32,
+    max_tokens: usize,
+) -> Result<ScenarioReport, String> {
+    let ws = Workspace::new("image_delete_middle", pid, args.keep)?;
+    let mut ctx = Ctx::new(
+        client,
+        "image_delete_middle",
+        Some(session(pid, "img-middle")),
+        false,
+        max_tokens,
+        ws.path(),
+    );
+    ctx.log_path = args.server_log.as_ref().map(std::path::PathBuf::from);
+    ctx.system(SYS_VISION);
+    let red = data_url_png(IMG_W, IMG_H, RED);
+    let green = data_url_png(IMG_W, IMG_H, GREEN);
+    let blue = data_url_png(IMG_W, IMG_H, BLUE);
+    let nonce = nonce(pid);
+    let result = (|| -> Result<String, String> {
+        ctx.send(json!([
+            {"type": "text", "text": format!("History starts here [{nonce}-middle].")},
+            image_part(&red, true),
+            {"type": "text", "text": "First image."},
+            image_part(&green, true),
+            {"type": "text", "text": "Middle image."},
+            image_part(&blue, true),
+            {"type": "text", "text": format!("History ends here [{nonce}-middle]. Reply with OK.")},
+        ]))?;
+        ensure(
+            remove_image(&mut ctx.history, &green),
+            "第一轮的 middle 图没找到",
+        )?;
+        let log_mark = ctx.log_mark();
+        let reply = ctx.send(json!(
+            "The middle image was removed. Name the colours of the remaining images \
+             in order, separated by a comma. Use one lowercase English colour word per image."
+        ))?;
+        let log = ctx.log_since(log_mark);
+        ensure(has(&reply, "red"), format!("剩余图没答红: {:?}", reply.text()))?;
+        ensure(has(&reply, "blue"), format!("剩余图没答蓝: {:?}", reply.text()))?;
+        ensure(!has(&reply, "green"), format!("删掉的绿图又被提到: {:?}", reply.text()))?;
+        assert_image_delete_absorbed("middle", ctx.last(), &log, ctx.log_path.is_some(), 55.0)?;
+        Ok(format!(
+            "middle removed; remaining=red+blue; cached={:.1}%",
+            ctx.last().cached_pct()
+        ))
+    })();
+    Ok(report("image_delete_middle", ctx, result))
+}
+
+// ── 7. delete the only/last image => next prompt is pure text ───────────
+pub(crate) fn image_delete_last_image(
+    client: &Client,
+    args: &Args,
+    pid: u32,
+    max_tokens: usize,
+) -> Result<ScenarioReport, String> {
+    let ws = Workspace::new("image_delete_last_image", pid, args.keep)?;
+    let mut ctx = Ctx::new(
+        client,
+        "image_delete_last_image",
+        Some(session(pid, "img-last")),
+        false,
+        max_tokens,
+        ws.path(),
+    );
+    ctx.log_path = args.server_log.as_ref().map(std::path::PathBuf::from);
+    ctx.system(SYS_VISION);
+    // This arm only has one image and one suffix snapshot; a long free-form
+    // think can evict that snapshot and force a full recompute. Thinking is
+    // orthogonal to the deletion assertion, so pin it off for determinism.
+    ctx.thinking(false);
+    let red = data_url_png(IMG_W, IMG_H, RED);
+    let nonce = nonce(pid);
+    let result = (|| -> Result<String, String> {
+        ctx.send(json!([
+            {"type": "text", "text": format!("History starts here [{nonce}-last].")},
+            image_part(&red, true),
+            {"type": "text", "text": format!("History ends here [{nonce}-last]. Reply with OK.")},
+        ]))?;
+        ensure(
+            remove_image(&mut ctx.history, &red),
+            "第一轮的 last 图没找到",
+        )?;
+        ensure(
+            image_count(&ctx.history) == 0,
+            "删掉最后一张图后历史里仍有图",
+        )?;
+        let log_mark = ctx.log_mark();
+        let reply = ctx.send(json!(
+            "The only image was removed from the prompt. Recall its colour and \
+             answer with one lowercase English colour word."
+        ))?;
+        let log = ctx.log_since(log_mark);
+        ensure(has(&reply, "red"), format!("没回忆出红色: {:?}", reply.text()))?;
+        assert_image_delete_absorbed("last", ctx.last(), &log, ctx.log_path.is_some(), 55.0)?;
+        Ok(format!(
+            "only image removed; history has no images; recalled=red; cached={:.1}%",
+            ctx.last().cached_pct()
+        ))
+    })();
+    Ok(report("image_delete_last_image", ctx, result))
+}
+
+// ── 8. delete an old image after a real tool round ──────────────────────
+pub(crate) fn image_delete_with_tool_round(
+    client: &Client,
+    args: &Args,
+    pid: u32,
+    max_tokens: usize,
+) -> Result<ScenarioReport, String> {
+    let ws = Workspace::new("image_delete_with_tool_round", pid, args.keep)?;
+    let mut ctx = Ctx::new(
+        client,
+        "image_delete_with_tool_round",
+        Some(session(pid, "img-tools")),
+        true,
+        max_tokens,
+        ws.path(),
+    );
+    ctx.log_path = args.server_log.as_ref().map(std::path::PathBuf::from);
+    ctx.system(SYS_MIXED);
+    let red = data_url_png(IMG_W, IMG_H, RED);
+    let nonce = nonce(pid);
+    let result = (|| -> Result<String, String> {
+        ctx.send(json!([
+            {"type": "text", "text": format!("History starts here [{nonce}-tools].")},
+            image_part(&red, true),
+            {"type": "text", "text": format!(
+                "This is the current screenshot. Create a file named color.txt containing \
+                 the dominant colour of the image as one lowercase English word (no newline). \
+                 Then answer with the colour. [{nonce}-tools]"
+            )},
+        ]))?;
+        let first_tools = tool_names(&ctx);
+        ensure(
+            first_tools.iter().any(|n| n == "write"),
+            format!("工具轮没有 write: {first_tools:?}"),
+        )?;
+        let path = ws.path().join("color.txt");
+        let color = std::fs::read_to_string(&path)
+            .map_err(|e| format!("color.txt: {e}"))?
+            .trim()
+            .to_lowercase();
+        ensure(color == "red", format!("color.txt={color:?}"))?;
+
+        ensure(remove_image(&mut ctx.history, &red), "历史里的图没找到")?;
+        let log_mark = ctx.log_mark();
+        let post_start = ctx.turns.len();
+        let reply = ctx.send(json!(
+            "The screenshot was removed from the prompt. Use the read tool or bash to read \
+             color.txt and answer with the colour it contains. Do not guess."
+        ))?;
+        let log = ctx.log_since(log_mark);
+        let post_tools: Vec<String> = ctx.turns[post_start..]
+            .iter()
+            .flat_map(|t| t.tools.clone())
+            .collect();
+        ensure(
+            post_tools.iter().any(|n| n == "read" || n == "bash"),
+            format!("删图后的工具轮没有 read/bash: {post_tools:?}"),
+        )?;
+        ensure(has(&reply, "red"), format!("最终答复没红: {:?}", reply.text()))?;
+        ensure(
+            std::fs::read_to_string(&path).is_ok_and(|c| c.trim() == "red"),
+            "color.txt 在删图后被改坏",
+        )?;
+        // 吸收发生在删图后的**首个**模型请求(可能是 tool_calls);
+        // 后续 tool 结果会改写尾巴,最后一轮 cached 不能作为删除证据。
+        let absorbed_turn = ctx
+            .turns
+            .get(post_start)
+            .ok_or_else(|| "工具轮没有记录删图后的首个 turn".to_string())?;
+        assert_image_delete_absorbed(
+            "tool-round",
+            absorbed_turn,
+            &log,
+            ctx.log_path.is_some(),
+            50.0,
+        )?;
+        Ok(format!(
+            "write before delete; read/bash after; cached={:.1}%",
+            absorbed_turn.cached_pct()
+        ))
+    })();
+    Ok(report("image_delete_with_tool_round", ctx, result))
+}
+
+// ── 9. delta-limit rebase (requires image_evict_delta_limit=2) ───────────
+pub(crate) fn image_delete_rebase(
+    client: &Client,
+    args: &Args,
+    pid: u32,
+    max_tokens: usize,
+) -> Result<ScenarioReport, String> {
+    let ws = Workspace::new("image_delete_rebase", pid, args.keep)?;
+    let mut ctx = Ctx::new(
+        client,
+        "image_delete_rebase",
+        Some(session(pid, "img-rebase")),
+        false,
+        max_tokens,
+        ws.path(),
+    );
+    ctx.log_path = args.server_log.as_ref().map(std::path::PathBuf::from);
+    ctx.system(SYS_VISION);
+    let red = data_url_png(IMG_W, IMG_H, RED);
+    let green = data_url_png(IMG_W, IMG_H, GREEN);
+    let blue = data_url_png(IMG_W, IMG_H, BLUE);
+    let nonce = nonce(pid);
+    let result = (|| -> Result<String, String> {
+        ctx.send(json!([
+            {"type": "text", "text": format!("History starts here [{nonce}-rebase].")},
+            image_part(&red, true),
+            {"type": "text", "text": "Red image."},
+            image_part(&green, true),
+            {"type": "text", "text": "Green image."},
+            image_part(&blue, true),
+            {"type": "text", "text": format!("History ends here [{nonce}-rebase]. Reply with OK.")},
+        ]))?;
+
+        ensure(remove_image(&mut ctx.history, &red), "red 图没找到")?;
+        let mark1 = ctx.log_mark();
+        let r1 = ctx.send(json!(
+            "The red image was removed. Name the remaining colours in order, \
+             separated by a comma, using lowercase English colour words."
+        ))?;
+        let log1 = ctx.log_since(mark1);
+        ensure(has(&r1, "green") && has(&r1, "blue"), format!("第一删后颜色不符: {:?}", r1.text()))?;
+        assert_image_delete_absorbed("rebase/first", ctx.last(), &log1, ctx.log_path.is_some(), 50.0)?;
+
+        ensure(remove_image(&mut ctx.history, &green), "green 图没找到")?;
+        let mark2 = ctx.log_mark();
+        let r2 = ctx.send(json!(
+            "The green image was removed too. Name the only remaining colour with one \
+             lowercase English colour word."
+        ))?;
+        let log2 = ctx.log_since(mark2);
+        ensure(has(&r2, "blue"), format!("第二删后颜色不符: {:?}", r2.text()))?;
+        assert_image_delete_absorbed("rebase/second", ctx.last(), &log2, ctx.log_path.is_some(), 50.0)?;
+
+        ensure(remove_image(&mut ctx.history, &blue), "blue 图没找到")?;
+        ensure(image_count(&ctx.history) == 0, "第三删后历史里仍有图")?;
+        let mark3 = ctx.log_mark();
+        let r3 = ctx.send(json!("All images were removed. Reply with OK only."))?;
+        let log3 = ctx.log_since(mark3);
+        ensure(!r3.text().trim().is_empty(), "第三删后回答为空")?;
+        if ctx.log_path.is_some() {
+            ensure(
+                log3.contains("叠转到顶"),
+                format!(
+                    "第三次删除没有触发 rebase(需要 --set pool.image_evict_delta_limit=2);img-evict={:?}",
+                    log3.lines().filter(|l| l.contains("img-evict")).collect::<Vec<_>>()
+                ),
+            )?;
+            ensure(
+                !log3.contains("前缀无感删除"),
+                "第三次删除应整段重建，不应走吸收路径",
+            )?;
+        } else {
+            ensure(
+                ctx.last().cached_pct() < 10.0,
+                format!(
+                    "无日志时用 cached 判 rebase:第三删 cached={:.1}%（期望 ~0；需要 delta_limit=2）",
+                    ctx.last().cached_pct()
+                ),
+            )?;
+        }
+        Ok(format!(
+            "absorb x2 then rebase x1; cached={:.1}/{:.1}/{:.1}%",
+            ctx.turns[1].cached_pct(),
+            ctx.turns[2].cached_pct(),
+            ctx.last().cached_pct()
+        ))
+    })();
+    Ok(report("image_delete_rebase", ctx, result))
+}
+
+// ── 10. sliding screenshot window (6 turns, keep 3, delete oldest) ───────
 pub(crate) fn image_sliding_window(
     client: &Client,
     args: &Args,

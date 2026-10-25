@@ -1272,9 +1272,10 @@ impl StatePool {
             .collect()
     }
 
-    /// **前缀无感删除可用?**(f16 + kNHD 分页;fp8 需 dequant→requant,未做)
+    /// **前缀无感删除可用?**(kNHD 分页 + f16 或 fp8-e4m3 主池)
     pub(crate) fn k_shift_supported(&self) -> bool {
-        self.geom.paged && !self.geom.kv_fp8 && self.geom.dims.dtype == Dtype::F16
+        self.geom.paged
+            && (self.geom.kv_fp8 || self.geom.dims.dtype == Dtype::F16)
     }
 
     /// 池内 K 的 Δ-rope 几何(`[nb, hkv, hd/x, page, x]` 四维 + `half`)

@@ -96,6 +96,59 @@ pub fn k_shift(
         .arg_usize(geom.half)
 }
 
+/// **host 参考实现**(FP8 e4m3;对拍/单测用,生产零调用)。
+///
+/// 与 `cu/elems/kv_rope_shift.cu::owl_kv_rope_k_shift_fp8` 同式:
+/// `e4m3 → f32 → R(−S) → e4m3`。每轮一次量化舍入是 FP8 存储的固有代价;
+/// `image_evict_delta_limit` 超限时仍走整段重建。
+pub fn k_shift_host_fp8(
+    k: &mut [u8],
+    cos1: &[f32],
+    sin1: &[f32],
+    blocks: &[u32],
+    geom: KvShiftGeom,
+) -> Result<(), String> {
+    geom.check()?;
+    let KvShiftGeom { hkv, hd, page, x, half } = geom;
+    let dg_per_half = half / x;
+    let page_elems = hkv * hd * page;
+    if cos1.len() < half || sin1.len() < half {
+        return Err(format!(
+            "k_shift_host_fp8: 表宽 {}/{} 短于 half={half}",
+            cos1.len(),
+            sin1.len()
+        ));
+    }
+    for &b in blocks {
+        let base = (b as usize) * page_elems;
+        if base + page_elems > k.len() {
+            return Err(format!(
+                "k_shift_host_fp8: 页 {b} 越出池(需 {} elems,池 {} elems)",
+                base + page_elems,
+                k.len()
+            ));
+        }
+        for h in 0..hkv {
+            for dg in 0..dg_per_half {
+                for t in 0..page {
+                    for j in 0..x {
+                        let d = dg * x + j;
+                        let lo = base + h * (hd * page) + dg * (page * x) + t * x + j;
+                        let hi = lo + (half / x) * (page * x);
+                        let c = cos1[d];
+                        let s = sin1[d];
+                        let a = crate::kernel::e4m3_decode(k[lo]);
+                        let bb = crate::kernel::e4m3_decode(k[hi]);
+                        k[lo] = crate::kernel::e4m3_encode(a * c - bb * s);
+                        k[hi] = crate::kernel::e4m3_encode(bb * c + a * s);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// **host 参考实现**(f16;对拍/单测用,生产零调用)。
 ///
 /// 与 `cu/elems/kv_rope_shift.cu` 逐式同源:先 `__half2float`,f32 内乘加,

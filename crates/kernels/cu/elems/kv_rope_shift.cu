@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 // **图像窗口旋转**:池内 K 的 Δ-rope(原地方向,单行增量表)。
 //
@@ -55,4 +56,52 @@ extern "C" __global__ void owl_kv_rope_k_shift_f16(
     const float bb = __half2float(k[hi_off]);
     k[lo_off] = __float2half(a * c - bb * s);
     k[hi_off] = __float2half(bb * c + a * s);
+}
+
+
+// ---- FP8 e4m3 主池变体(生产 FP8 KV 档;同一几何/同一配对律)----
+//
+// 与 f16 版的唯一差别 = 读写时的 e4m3 量化:
+//   load:  e4m3 字节 → half → float
+//   store: float → e4m3(RNE, SATFINITE)字节
+// 这样 FP8 生产档也能走“删除 = 后缀 K 乘 R(−S)”,不需要临时 f16 副本。
+// 代价 = 每轮一次量化舍入(见文档 §FP8 漂移;超过 delta_limit 走整段重建)。
+extern "C" __global__ void owl_kv_rope_k_shift_fp8(
+    const __half* cos1,           // [half]
+    const __half* sin1,           // [half]
+    const float* blocks,          // [nblocks]
+    size_t hkv, size_t hd, size_t page, size_t x, size_t half,
+    unsigned char* k)             // e4m3 [nb_kv, hkv, hd/x, page, x]
+{
+    const size_t dg_per_half = half / x;
+    const size_t units_per_block = hkv * dg_per_half;
+    unsigned int u = blockIdx.x;
+    const size_t b = u / units_per_block;
+    const size_t rem = u % units_per_block;
+    const size_t h = rem / dg_per_half;
+    const size_t dg = rem % dg_per_half;
+
+    const size_t blk = (size_t)blocks[b];
+    const size_t tid = threadIdx.x;
+    const size_t t = tid / x;
+    const size_t j = tid % x;
+
+    const size_t lo_off = blk * (hkv * hd * page)
+                        + h * (hd * page)
+                        + dg * (page * x)
+                        + t * x + j;
+    const size_t hi_off = lo_off + (half / x) * (page * x);
+
+    __nv_fp8_e4m3 le;
+    le.__x = k[lo_off];
+    __nv_fp8_e4m3 he;
+    he.__x = k[hi_off];
+    const float a = __half2float(__half(le));
+    const float bb = __half2float(__half(he));
+    const float c = __half2float(cos1[dg * x + j]);
+    const float s = __half2float(sin1[dg * x + j]);
+    const __nv_fp8_e4m3 lo(a * c - bb * s);
+    const __nv_fp8_e4m3 hi(bb * c + a * s);
+    k[lo_off] = lo.__x;
+    k[hi_off] = hi.__x;
 }

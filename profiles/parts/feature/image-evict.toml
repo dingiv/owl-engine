@@ -1,13 +1,11 @@
-# 特性组件：图像段前缀无感删除（需 f16 KV + prefix_cache）。
-[spec]
-depth = 0
-lookup = false
-
+# 特性组件：图像段前缀无感删除（需分页 KV + prefix_cache；f16 或 fp8-e4m3）。
+# 池 dtype 继承调用方 profile；FP8 生产档沿用 fp8-e4m3。
+# 投机解码继承调用方 profile（生产默认深度 7）；本组件不覆盖。
 [pool]
-kv_fp8 = false
 prefix_cache = true
 snap_max = 2
 image_evict = true
-image_evict_delta_limit = 32
+# 安全缺省 4（f16 可显式调回 32；fp8 硬上限 4）。
+image_evict_delta_limit = 4
 vram_target = 0.9
 vram_reserve_mb = 1024

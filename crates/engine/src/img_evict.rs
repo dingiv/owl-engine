@@ -157,6 +157,9 @@ pub fn unpad(ids: &[u32], pads: &[(usize, usize)]) -> Result<Vec<u32>, String> {
 ///
 /// `inherited` = 输入序列里**已经存在**的 pad 区间(上一轮留下的;输入坐标)。
 /// 它们会被原样搬进输出并映射到输出坐标(会话账要能一路追下去)。
+/// **已补过的图不会二次补 pad**:before 块以图首为尾、after 块以图尾为首,
+/// 命中即只记 `pad_before/pad_after` 账,不发射 token(重建路径的前缀
+/// 逐字节不变靠这一条;见 `delete_middle_image_keeps_padded_prefix`)。
 ///
 /// 返回 [`PaddedSeq`]。`marks.len()` 必须 = 游程数(调用方按占位顺序对齐;
 /// 不符 = 响亮的 `Err`,不许静默错位)。未标记的段**一个 pad 都不加**。
@@ -221,8 +224,24 @@ pub fn pad_image_spans(
             _ => re,
         };
         copy_upto(&mut out, &mut pads, &mut inh, cursor, start)?;
+        // 重建路径会把**删点之前**的旧 padded 前缀原样带进来；那些已经
+        // 补过 pad 的图不能在新一轮 pad 律里再补一份（否则前缀被推歪，
+        // 调度面会因 `old[..a] != new[..a]` 拒吸收）。`inherited` 里的
+        // pad 块就是“已补过”的权威事实：before 块以图首为尾，after 块
+        // 以图尾为首。命中则只记账、不发射 token；旧 pad 随后由
+        // `copy_upto` 原样搬进输出。
+        let inherited_before = inherited
+            .iter()
+            .find(|(_, hi)| *hi == start)
+            .map(|(lo, hi)| hi - lo);
+        let inherited_after = inherited
+            .iter()
+            .find(|(lo, _)| *lo == end)
+            .map(|(lo, hi)| hi - lo);
         let before_pad_lo = out.len();
-        let pad_before = if marks[k] && page > 0 {
+        let pad_before = if let Some(n) = inherited_before {
+            n
+        } else if marks[k] && page > 0 {
             let p = (page - out.len() % page) % page;
             out.extend(std::iter::repeat_n(pad_id, p));
             p
@@ -233,19 +252,29 @@ pub fn pad_image_spans(
         let span_start = out.len();
         out.extend_from_slice(&ids[start..end]);
         let text_end = out.len();
-        let pad_after = if marks[k] && page > 0 {
+        let pad_after = if let Some(n) = inherited_after {
+            // 不发射 token；旧 pad 仍留在 `ids[end..]`，由后续 copy_upto 搬运。
+            n
+        } else if marks[k] && page > 0 {
             let p = (page - out.len() % page) % page;
             out.extend(std::iter::repeat_n(pad_id, p));
             p
         } else {
             0
         };
-        let span_end = out.len();
-        if pad_before > 0 {
-            pads.push((before_pad_lo, span_start));
-        }
-        if pad_after > 0 {
+        // 新补分支：out 已经含 pad；继承分支：旧 pad 还在 `ids[end..]`，
+        // 由后续 copy_upto 搬入，span_end 先按输出坐标记到它之后。
+        let span_end = if inherited_after.is_some() {
+            out.len() + pad_after
+        } else {
+            out.len()
+        };
+        // `pads` 由 copy_upto 在搬旧 pad 时登记；这里只为新补的 pad 登记。
+        if inherited_after.is_none() && pad_after > 0 {
             pads.push((text_end, span_end));
+        }
+        if inherited_before.is_none() && pad_before > 0 {
+            pads.push((before_pad_lo, span_start));
         }
         // 文本坐标(客户端可见序列)= 输入坐标剥掉 inherited pad 之后的下标
         let text_idx = |i: usize| -> usize {
@@ -519,6 +548,42 @@ mod tests {
         // ③ 下一轮的文本坐标账仍然自洽(unpad 回到"删掉一张图"的文本)
         let back = unpad(&next.ids, &next.pads).expect("unpad2");
         assert_eq!(back, raw, "重建后的文本坐标必须 = 客户端原文");
+    }
+
+    /// **中间图删除**:三图删第二张，删点之前必须仍逐字节不变。
+    ///
+    /// 这个形态会保留一张**在删点之前、且已经带 pad** 的图；重建后重跑
+    /// pad 律时不能给这张图再补一份 pad（否则前缀会被推歪，调度面拒吸收）。
+    #[test]
+    fn delete_middle_image_keeps_padded_prefix() {
+        let ids = build(&[1, 1, 1], 5);
+        let seq = pad(&ids, &[true, true, true], &[grid(), grid(), grid()]);
+        let text = unpad(&seq.ids, &seq.pads).expect("unpad");
+        let del = seq.spans[1];
+        let raw: Vec<u32> = text[..del.text_start]
+            .iter()
+            .chain(&text[del.text_end..])
+            .copied()
+            .collect();
+        let hit = detect_text_delete(&text, &raw, &seq.spans).expect("必须识别中间图");
+        assert_eq!((hit.text_a, hit.text_b), (del.text_start, del.text_end));
+        let rebuilt = rebuild_after_delete(&seq.ids, &raw, &hit).expect("重建");
+        let inherited: Vec<(usize, usize)> =
+            seq.pads.iter().copied().filter(|(_, hi)| *hi <= hit.a).collect();
+        let next = pad_image_spans(
+            &rebuilt,
+            &[true, true],
+            &[grid(), grid()],
+            IMG,
+            Some(VS),
+            Some(VE),
+            PAGE,
+            PAD,
+            &inherited,
+        )
+        .expect("pad2");
+        assert_eq!(&next.ids[..hit.a], &seq.ids[..hit.a], "删点之前必须逐字节不变");
+        assert_eq!(unpad(&next.ids, &next.pads).expect("unpad2"), raw);
     }
 
     #[test]

@@ -640,8 +640,8 @@ pub struct PoolCfg {
     ///    乘 `R(−S)`(位置帧平移),不重算前缀之后的任何 token。
     ///
     /// 关 = 逐字节旧行为(标记被忽略;带了标记也**响亮拒**,不静默降级)。
-    /// 依赖:`prefix_cache = true`(内容寻址取旧链)与 f16 KV(paged kNHD;
-    /// fp8 池需 dequant→requant,未做)。
+    /// 依赖:`prefix_cache = true`(内容寻址取旧链)与分页 kNHD KV
+    /// (f16 或 fp8-e4m3;FP8 的 `image_evict_delta_limit` 必须 1..=4)。
     pub image_evict: bool,
     /// **漂移上限 = 一条链允许被重转的次数**(`[pool].image_evict_delta_limit`;
     /// 缺省 **32**;`0` = 不限)。

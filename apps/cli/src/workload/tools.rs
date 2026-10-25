@@ -90,10 +90,6 @@ pub fn execute(root: &Path, call: &ToolCall) -> Result<Value, String> {
     }
 }
 
-pub fn result_string(v: &Value) -> String {
-    v.to_string()
-}
-
 fn path_arg(root: &Path, args: &Value) -> Result<PathBuf, Value> {
     let raw = args
         .get("path")

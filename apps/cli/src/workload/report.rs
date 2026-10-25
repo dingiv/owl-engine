@@ -1,4 +1,9 @@
 //! Workload result records and rendering.
+//!
+//! `TurnRecord` = one **model request** inside a user turn. A single user turn
+//! may contain many model requests, and each model request may contain several
+//! tool calls. The rendered label is `round` to avoid confusing it with the
+//! user-facing turn.
 
 use serde_json::{json, Value};
 
@@ -8,6 +13,8 @@ pub struct TurnRecord {
     pub turn: usize,
     pub finish: String,
     pub prompt: u64,
+    /// Images present in the request (GUI workload keeps this <= 3).
+    pub images: usize,
     pub cached: u64,
     pub completion: u64,
     pub reasoning: u64,
@@ -32,9 +39,10 @@ impl TurnRecord {
     pub fn to_json(&self) -> Value {
         json!({
             "scenario": self.scenario,
-            "turn": self.turn,
+            "round": self.turn,
             "finish": self.finish,
             "prompt_tokens": self.prompt,
+            "images": self.images,
             "cached_tokens": self.cached,
             "cached_pct": self.cached_pct(),
             "completion_tokens": self.completion,
@@ -75,10 +83,11 @@ pub fn print_report(r: &ScenarioReport) {
     println!("[{tag}] {}{}", r.name, if r.detail.is_empty() { String::new() } else { format!(" — {}", r.detail) });
     for t in &r.turns {
         println!(
-            "  turn {:<2} finish={:<10} prompt={:<6} cached={:<6} ({:5.1}%) completion={:<4} reasoning={:<4} absorbed=+{:<2} rotate=+{:<8} rebase=+{} tools=[{}] {}ms{}",
+            "  round {:<2} finish={:<10} prompt={:<6} images={} cached={:<6} ({:5.1}%) completion={:<4} reasoning={:<4} absorbed=+{:<2} rotate=+{:<8} rebase=+{} tools=[{}] {}ms{}",
             t.turn,
             t.finish,
             t.prompt,
+            t.images,
             t.cached,
             t.cached_pct(),
             t.completion,

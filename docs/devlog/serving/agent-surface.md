@@ -1540,10 +1540,75 @@ chunk 帧两项)。
 
 **待办**:若将来要更大,`flavors/awq27b-262k.toml` 是单卡 262144 超卖档
 (设备 3 GiB + 宿主 9 GiB、fp8 KV、需虚拟化两扇门),代价 = **无 DFlash2 投机**。
+## §9.3 agent workload e2e（2026-10-25）
+
+真实 HTTP/SSE + 真图 + 真工具的执行面回归，入口在 `apps/cli`：
+
+```bash
+cargo run -p cli -- --workload core --url http://127.0.0.1:8135 \
+  --server-log /tmp/owl-8135-image-evict.log
+# 调试单场景:
+cargo run -p cli -- --workload image-evict --only image_delete_middle \
+  --url http://127.0.0.1:8135 --server-log /tmp/owl-8135-image-evict.log
+```
+
+| suite | 内容 |
+|---|---|
+| `core` | 文本多轮 / 工具闭环 / 视觉 / 图文混合 + GUI-agent 窗口 + 五项图像删除 |
+| `gui` | **真实 GUI-agent 负载**：screenshot/click/type/key 工具，每个工具结果附当前截图；客户端永远只保留最新 3 张图 |
+| `image-evict` | 只跑图像删除：首图、中间图、最后一张（无图后续）、工具轮后删图、滑动窗口 |
+| `image-evict-rebase` | 叠转上限臂（需 `--set pool.image_evict_delta_limit=2`） |
+
+**GUI-agent 场景**：系统提示词声明 `screenshot/click/type/key`；用户只发一次
+6 步任务（截图 → 两次 click → type → ENTER → 截图）。**一个用户 turn 内**，
+agent loop 可多次调用模型，**一个模型响应可返回多个 function call**（实测
+`[click, click]`）；harness 执行全部调用并把每张结果截图回填，用户不再操作。
+每个工具结果 = `[text, 当前屏幕截图, text]`（截图带 `owl_evict`），客户端每次
+工具结果后只保留最新 3 张图。真机 27B：6 次工具 / 3 次 prune / 3 张图 /
+末三轮 cached 88-92% / 终态 yellow；TP2 131k spec-on 的完整 `core` 10/10
+通过（fresh server `workload_e2e` 35.00s；**FP8 e4m3 + spec-on**）。
+运行条件：测试 server `snap_max≥2`
+（3 次删除需要后缀快照），且每次 transcript 带唯一 run tag（避免相同前缀
+跨会话共享带图块）。
+
+判据不是模型文风，而是结构性事实：工具名与产物字节、`usage.cached_tokens`、
+服务端 info 日志 `[img-evict] 前缀无感删除` / `叠转到顶`。release 构建里
+`image_evict.*` counter 被编译期关闭，因此日志是吸收/重整的直接证据。
+
+服务端要求：**分页 KV（f16 或 fp8-e4m3）+ `pool.image_evict=true` +
+`pool.prefix_cache=true` + 视觉档**。FP8 生产档现已支持重转，但必须
+`pool.image_evict_delta_limit=4`（1..=4；f16 可用 32）。自包含入口：
+
+```bash
+tools/run-agent-workload.sh gui
+tools/run-agent-workload.sh image-evict
+OWL_WORKLOAD_DELTA_LIMIT=2 tools/run-agent-workload.sh image-evict-rebase
+```
+
+脚本会先查端口占用（不抢占现有 server），再起隔离测试 server、等 health、
+跑 workload，退出时只 kill 自己记录的 PID。
+
+测试门：
+
+```bash
+OWL_E2E=1 OWL_SERVER_URL=http://127.0.0.1:8135 \
+OWL_SERVER_LOG=/tmp/owl-8135-image-evict.log \
+cargo test -p cli --test workload_e2e -- --nocapture
+```
+
+`OWL_WORKLOAD_SUITE` 选择 suite（默认 `core`）。图片删除需要稳定 session；
+中间图删除曾因重建路径重复补 pad 被调度面拒收，已在
+`pad_image_spans` 修复（见 `docs/devlog/memory/prefix-deletion.md` §3.0 补记）。
+`gui` 档要求测试 server 至少 `snap_max=2`（3 次删图需要 3 个后缀快照）；
+每次运行会加唯一 run tag，避免相同 transcript 跨会话共享带图块。
+pi 形态无 session 时依赖 `runtime.implicit_session=true`。多段 text 的边界
+由服务端 `normalize_multipart_text` 统一补 `\n`，客户端不要手写分隔符。
+
 ## §十 变更记录
 
 | 日期 | 版本 | 变更 |
 |---|---|---|
+| 2026-10-25 | v0.16 | **agent workload e2e 回归面 + FP8 重转**：`core` / `gui` / `image-evict` / `image-evict-rebase`；真 HTTP/真图/真工具，覆盖 **GUI-agent 三图窗口（tool 结果附截图）**、首图/中间图/最后一张/工具轮后删图/滑动窗口 + 叠转重建；新增 `tools/run-agent-workload.sh` 隔离起停;同时修复中间图删除的前缀 pad 重复 —— 见 §9.3 |
 | 2026-10-19 | v0.15 | **pi 口径定档 64k**(测装 `pi-27b-64k.toml` + pi `contextWindow 65536/maxTokens 8192`;>16k 实测 16064 tok OK;pi 真机 7 轮:冷 12.25s → cached 100.0%/98.9%/92.4%/98.7%/99.7%,TTFT 0.42-1.33s;日志 117 行/零 conn 警告/零收缩)—— 见 §9.2(6) |
 | 2026-10-19 | v0.14 | **G5 真机收口**:pi(undici)真客户端验证——keep-alive/chunked 零 `[conn]` 警告,4 轮含工具调用;前缀复用 cached 98.9%→99.85%,TTFT 12.4s→1.0-1.3s;`/debug/agent` 四轮全在场。**日志面两修**:①`owl-gpu` free 刷屏(49920 行/会话)降 DEBUG,仅账目不平升 WARN;②生成段快照(Transient)不再试下沉(设计行为曾被报成故障 WARN)—— 见 §9.2(5) |
 | 2026-10-19 | v0.13 | **G5(4) keep-alive 落地**(请求循环 + 每请求 permit + 空闲 30s + 请求数上限;SSE 改 **chunked 定界**;JSON/文本自带定界;非 1.1 ⇒ 505);战役教训:**旧 `stream.shutdown()` 残留会每响应发 FIN 掐死复用连接**(插桩定位);门 = 裸 socket 探针 6 项 + wire smoke + e2e 27B(46.4s)+ 单测 46/46 —— 见 §3.8 / §9.2(4) |

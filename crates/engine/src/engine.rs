@@ -80,13 +80,14 @@ pub struct EngineKnobs {
     /// **前缀无感删除(图像段)**(`[pool].image_evict`;缺省关)。
     ///
     /// 开 = 客户端给图像打可删标记时:页对齐 pad + 删除后后缀 K 重转
-    /// (`R(−S)`),不重算删点之后的 token。依赖 `prefix_cache` + f16 分页池
-    /// + 视觉档(boot 门;任缺 = 拒启)。
+    /// (`R(−S)`),不重算删点之后的 token。依赖 `prefix_cache` + 分页池
+    /// (f16 或 fp8-e4m3) + 视觉档(boot 门;任缺 = 拒启)。
     pub image_evict: bool,
     /// **漂移上限 = 一条链允许被重转的次数**(`[pool].image_evict_delta_limit`;
     /// 缺省 32;`0` = 不限)。到顶后**下一轮删除触发一次整段重建**(全量
     /// prefill + `reset_gdn`)—— 漂移与计数同时归零(不在漂移上继续加)。
     /// 32 的依据:叠转实测 13.7 ulp(最差元素,`drift_under_repeats` 门)。
+    /// **FP8 档必须 1..=4**(每次重转都过 e4m3 量化;boot 门硬拒 0/大于 4)。
     pub image_evict_delta_limit: u32,
     /// **页对齐 pad 词**(`[pool].image_evict_pad`;缺省 `。`;空串 = 自动)。
     /// 模型敏感项:27B 实测 `\n` 会让回答开头吐 `<`;`。` 干净。必须恰 1 token。
@@ -1430,8 +1431,8 @@ pub(crate) fn into_running<D: DeviceClient>(
         };
 
     // **前缀无感删除的 boot 门**(2026-10-23):开了就必须具备执行面 ——
-    // ① 视觉塔(图像段识别 / m-RoPE 位置自证)② f16 分页池(池内 K 原地重转;
-    // fp8 需 dequant→rotate→requant,未做)③ 前缀缓存(按内容取回旧链)。
+    // ① 视觉塔(图像段识别 / m-RoPE 位置自证)② 分页池(f16 或 fp8-e4m3
+    // 的池内 K 原地重转)③ 前缀缓存(按内容取回旧链)。
     // 任缺 = **拒启**(静默降级 = 客户端以为删了不重算、实际每轮全量重灌)。
     if cfg.knobs.image_evict {
         if dev.boot.vlm.is_none() {
@@ -1442,10 +1443,21 @@ pub(crate) fn into_running<D: DeviceClient>(
         }
         if !dev.pool.geom.paged || !dev.pool.k_shift_supported() {
             return Err(ModelError::Msg(format!(
-                "[pool] image_evict = true 需要 f16 分页 KV 池(paged={} kv_fp8={} dtype={:?});\
-                 fp8 池的 dequant→requant 未做",
+                "[pool] image_evict = true 需要 f16 或 fp8-e4m3 分页 KV 池\
+                 (paged={} kv_fp8={} dtype={:?})",
                 dev.pool.geom.paged, dev.pool.geom.kv_fp8, dev.pool.geom.dims.dtype
             )));
+        }
+        // FP8 的每次重转都经过一次 e4m3 量化舍入(12.5% 网格);不设上限会
+        // 累积到不可用。f16 的缺省 32 轮不适用于 FP8 ⇒ 必须显式收紧。
+        if dev.pool.geom.kv_fp8 {
+            let limit = cfg.knobs.image_evict_delta_limit;
+            if limit == 0 || limit > 4 {
+                return Err(ModelError::Msg(format!(
+                    "[pool] image_evict = true + fp8 KV: image_evict_delta_limit \
+                     必须在 1..=4(得 {limit});FP8 每次重转都有 e4m3 量化舍入"
+                )));
+            }
         }
         // **pad 词校验**(模型敏感项,必须恰 1 token):空串 = 运行时自动挑;
         // 显式给值 ⇒ boot 期就验(不符 = 拒启,别拖到第一张图才炸)。
@@ -1468,7 +1480,9 @@ pub(crate) fn into_running<D: DeviceClient>(
         }
         owl_shared::log_info!(
             "boot",
-            "前缀无感删除:开(可删图像段页对齐 pad = {:?} + 删除后缀 K 重转;页 {} tok)",
+            "前缀无感删除:开({} 池;delta_limit={};可删图像段页对齐 pad = {:?} + 删除后缀 K 重转;页 {} tok)",
+            if dev.pool.geom.kv_fp8 { "fp8-e4m3" } else { "f16" },
+            cfg.knobs.image_evict_delta_limit,
             if cfg.knobs.image_evict_pad.is_empty() { "(自动)" } else { cfg.knobs.image_evict_pad.as_str() },
             dev.pool.geom.page
         );

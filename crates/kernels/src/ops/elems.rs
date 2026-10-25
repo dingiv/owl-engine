@@ -1068,6 +1068,47 @@ impl KernelSpec for KvRopeKShiftF16 {
     };
 }
 
+/// `owl_kv_rope_k_shift_fp8` —— 前缀无感删除的 **FP8 e4m3** 主池变体
+/// (2026-10-25;生产 FP8 KV 档默认可用)。
+///
+/// 与 f16 版逐式同源,只在 load/store 各做一次 e4m3 量化:
+/// `e4m3 → half → f32 → R(−S) → e4m3`。池句柄仍是引擎 U32 扁平字节账;
+/// `POOL` 的 `F8E4M3` 承担元素格式语义。
+pub struct KvRopeKShiftFp8;
+
+#[kernel_tags("dom.elem", "role.rope", "role.kv_write", "phase.decode", "kv.main.fp8")]
+impl KernelSpec for KvRopeKShiftFp8 {
+    const ENTRY: &'static str = "owl_kv_rope_k_shift_fp8";
+    const SRC: &'static str = "cu/elems/kv_rope_shift.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("cos1", Dtype::F16, 1),
+        Param::t_in("sin1", Dtype::F16, 1),
+        Param::t_in("blocks", Dtype::F32, 1),
+        Param::sz("hkv"),
+        Param::sz("hd"),
+        Param::sz("page"),
+        Param::sz("x"),
+        Param::sz("half"),
+        // fp8 池以 U32 承载(bytes/4);核内按 e4m3 字节序寻址
+        Param::t_out("k", Dtype::U32, 1),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::F8E4M3,
+    )];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
+    };
+}
+
 /// `probe_ts_f16` —— ts_probe.cu(R1 补表)
 pub struct ProbeTsF16;
 
@@ -1105,6 +1146,7 @@ pub static OWL_ROPE_HALF_PARTIAL_F32: KernelMeta = meta_of::<RopeHalfPartialF32>
 pub static PROBE_TS_F16: KernelMeta = meta_of::<ProbeTsF16>();
 /// 前缀无感删除的池内 Δ-rope(`driver::elems::kv_rope_shift`)
 pub static KV_ROPE_K_SHIFT_F16: KernelMeta = meta_of::<KvRopeKShiftF16>();
+pub static KV_ROPE_K_SHIFT_FP8: KernelMeta = meta_of::<KvRopeKShiftFp8>();
 
 pub static QUANT_INT8_ROW_F16: KernelMeta = meta_of::<QuantInt8RowF16>();
 pub static QUANT_INT8_ROW_BF16: KernelMeta = meta_of::<QuantInt8RowBf16>();
