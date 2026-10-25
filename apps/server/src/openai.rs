@@ -94,6 +94,16 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
+fn is_image_part(p: &Value) -> bool {
+    p.get("type").and_then(Value::as_str) == Some("image")
+        || p.get("type").and_then(Value::as_str) == Some("image_url")
+        || p.get("image_url").is_some()
+}
+
+fn is_text_part(p: &Value) -> bool {
+    !is_image_part(p) && p.get("text").is_some()
+}
+
 impl ChatRequest {
     /// 结构校验:非法 → 400(不静默、不猜)
     pub fn validate(&self) -> Result<(), String> {
@@ -214,6 +224,70 @@ impl ChatRequest {
             out.push(format!("未知字段 {:?}", self.extra.keys().collect::<Vec<_>>()));
         }
         out
+    }
+
+    /// **多段 content 的文本边界规范化**(2026-10-25;服务端请求预处理)。
+    ///
+    /// 客户端删掉 image part 后,前后两个 text part 直接相邻;BPE 会在拼接
+    /// 边界重新分词,导致引擎的 `detect_text_delete` 无法满足逐 token 前缀
+    /// 契约(删除不被吸收、前缀缓存失效)。这里在**渲染之前**保证多段
+    /// `content` 里的每个 text part 以 `\n` 结尾,给删除点留下稳定的文本边界。
+    ///
+    /// 影响面(**最小化**,专治“图片被删后的边界”):
+    /// - plain string content 不动(pi / 普通文本请求零变化);
+    /// - 只有 **user** 消息、**数组且 >=2 段** 才处理;
+    /// - 单 text part 数组不动(很多客户端用 `[{"type":"text"}]` 表示纯文本);
+    /// - 没有图片且 text part < 2 的数组不动;
+    /// - image part / `owl_evict` / 顺序原样保留;
+    /// - 幂等:已以 `\n` 结尾不重复加。
+    ///
+    /// 为什么不放模板/引擎层:模板是模型快照(模型无关的布局规则不应耦合进去),
+    /// 引擎层已没有 content 分段(只剩 token);见 workload 回归。
+    pub fn normalize_multipart_text(&mut self) -> usize {
+        let mut changed = 0usize;
+        for m in &mut self.messages {
+            if m.get("role").and_then(Value::as_str) != Some("user") {
+                continue;
+            }
+            let Some(arr) = m.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            if arr.len() < 2 {
+                continue;
+            }
+            let has_image = arr.iter().any(is_image_part);
+            let text_parts = arr.iter().filter(|p| is_text_part(p)).count();
+            // 无图且只有一段 text = 纯文本数组,不动;其余(带图 / 多 text)规范化。
+            if !has_image && text_parts < 2 {
+                continue;
+            }
+            for part in arr.iter_mut() {
+                if !is_text_part(part) {
+                    continue;
+                }
+                let Some(text) = part.get_mut("text") else {
+                    continue;
+                };
+                let Some(s) = text.as_str() else {
+                    continue;
+                };
+                if s.ends_with('\n') {
+                    continue;
+                }
+                let mut next = String::with_capacity(s.len() + 1);
+                next.push_str(s);
+                next.push('\n');
+                *text = Value::String(next);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            owl_shared::log_debug!(
+                "chat",
+                "多段 content 文本边界规范化:{changed} 处补 \n(删除吸收 / 前缀稳定)"
+            );
+        }
+        changed
     }
 
     /// 采样覆写(AGT-06;`None`/空 = 请求未表达采样意图)
@@ -635,6 +709,8 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     {
         return http::respond_json(w, 400, &error_json(e)).await;
     }
+    // 图片删除的文本边界规范化(渲染前;plain string / 单 text 数组零变化)。
+    let _ = req.normalize_multipart_text();
     for wmsg in req.warnings() {
         owl_shared::log_warn!("chat", "收下但暂未生效(AGT-06 后仅余未知字段):{wmsg}");
     }
@@ -1618,5 +1694,78 @@ mod admission_tests {
         assert_eq!(retry_after_secs("admission:no_memory retry_ms=200"), 1, "不足 1s 夹到 1");
         assert_eq!(retry_after_secs("admission:no_memory retry_ms=999999"), 30, "封顶 30");
         assert_eq!(retry_after_secs("admission:no_slot"), 5, "无建议值 = 5s 保守");
+    }
+}
+
+#[cfg(test)]
+mod multipart_text_tests {
+    use super::ChatRequest;
+    use serde_json::{json, Value};
+
+    fn req(messages: Value) -> ChatRequest {
+        serde_json::from_value(json!({"messages": messages})).expect("请求解析")
+    }
+
+    /// 最小影响面:plain string / 单 text 数组 / system / assistant 一律不动;
+    /// 带图多段只给 text 补 `\n`,image 顺序与 owl_evict 原样;幂等。
+    #[test]
+    fn multipart_text_normalization_is_minimal_and_idempotent() {
+        let mut r = req(json!([
+            {"role": "system", "content": [{"type": "text", "text": "sys"}]},
+            {"role": "user", "content": "plain string"},
+            {"role": "user", "content": [{"type": "text", "text": "single"}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "a"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}, "owl_evict": true},
+                {"type": "text", "text": "b\n"}
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "asst"}]}
+        ]));
+        let changed = r.normalize_multipart_text();
+        assert_eq!(changed, 1, "只有 a 需要补;b 已带换行");
+        assert_eq!(r.messages[0]["content"][0]["text"], "sys", "system 不动");
+        assert_eq!(r.messages[1]["content"], "plain string", "string 逐字节不动");
+        assert_eq!(r.messages[2]["content"][0]["text"], "single", "单 text 数组不动");
+        assert_eq!(r.messages[3]["content"][0]["text"], "a\n");
+        assert_eq!(r.messages[3]["content"][2]["text"], "b\n");
+        assert_eq!(r.messages[3]["content"][1]["owl_evict"], true, "标记保留");
+        assert_eq!(
+            r.messages[3]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AA",
+            "image 原样"
+        );
+        assert_eq!(r.messages[4]["content"][0]["text"], "asst", "assistant 不动");
+        let snapshot = r.messages.clone();
+        assert_eq!(r.normalize_multipart_text(), 0, "幂等");
+        assert_eq!(snapshot, r.messages, "第二次调用零变化");
+    }
+
+    /// 删图后的 user 消息形状:text1 + text2 相邻(无图)也必须补换行,
+    /// 否则引擎的删点前缀/后缀无法对齐。
+    #[test]
+    fn adjacent_user_texts_after_image_removal_get_newlines() {
+        let mut r = req(json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "before"},
+                {"type": "text", "text": "after"}
+            ]}
+        ]));
+        assert_eq!(r.normalize_multipart_text(), 2);
+        assert_eq!(r.messages[0]["content"][0]["text"], "before\n");
+        assert_eq!(r.messages[0]["content"][1]["text"], "after\n");
+    }
+
+    /// 纯文本多段 content 的规范化是确定性的:同输入两次渲染结果一致。
+    #[test]
+    fn normalization_is_deterministic_for_cache() {
+        let msg = json!([{"role": "user", "content": [
+            {"type": "text", "text": "x"},
+            {"type": "text", "text": "y"}
+        ]}]);
+        let mut a = req(msg.clone());
+        let mut b = req(msg);
+        a.normalize_multipart_text();
+        b.normalize_multipart_text();
+        assert_eq!(a.messages, b.messages);
     }
 }
