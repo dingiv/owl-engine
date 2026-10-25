@@ -119,7 +119,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/serving/cross-session-batch.md`](devlog/serving/cross-session-batch.md) — Cross-session batched decode (B5.1)
 - ⬜ [`devlog/serving/session-plan.md`](devlog/serving/session-plan.md) — Session orchestration surface
 - ⬜ [`devlog/serving/config-ux.md`](devlog/serving/config-ux.md) — Configuration UX (fully explicit fields)
-- 🔴 [`devlog/serving/spec-tailcap-gpu-spin-立案.md`](devlog/serving/spec-tailcap-gpu-spin-立案.md) — DFlash2 尾批裁剪 ⇒ verify 图档形状错配 ⇒ **设备核自旋整台钉死**(未修,含复现与取证下一步)
+- ⬜ [`devlog/serving/spec-tailcap-gpu-spin-立案.md`](devlog/serving/spec-tailcap-gpu-spin-立案.md) — DFlash2 尾批裁剪 ⇒ verify 图档形状错配 ⇒ **设备核自旋整台钉死**(已修;含根因、复现与回归门)
 
 ## I. Performance and engineering (framework · device · pitfalls · bench reports)
 
