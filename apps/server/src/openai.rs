@@ -756,6 +756,13 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         };
     }
     let (sink_tx, mut sink_rx) = mpsc::channel::<SinkEvent>(SINK_CAPACITY);
+    // 请求级图像事实（日志/诊断；图像 token = 视觉占位展开量的真源）。
+    let image_count = images.len();
+    let image_tokens = images
+        .iter()
+        .map(|i| (i.image.grid.1 * i.image.grid.2) / 4)
+        .sum::<usize>();
+    let evict_images = images.iter().filter(|i| i.evict).count();
     // 会话身份:显式 `session` 键优先;缺省按 [agent] implicit_session 落到
     // 隐式会话 0(AGT-09:pi 每轮全量重发历史 ⇒ 前缀增量命中;守卫失配
     // 自回退全量重算,正确性不依赖客户端)
@@ -787,6 +794,9 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             .collect::<Vec<_>>()
             .join(","),
         tools: req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+        images: image_count,
+        image_tokens,
+        evict_images,
         thinking: req.enable_thinking(),
         reasoning_effort: req.reasoning_effort.clone(),
         session,
@@ -836,7 +846,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             }
             owl_shared::log_info!(
                 "chat",
-                "受理 session {session:#x} turn {turn}(stream={};tools={};think={};prompt={prompt_tokens};cached={cached_tokens};max_new={max_new})",
+                "受理 session {session:#x} turn {turn}(stream={};tools={};images={image_count}/tokens={image_tokens}/evict={evict_images};think={};prompt={prompt_tokens};cached={cached_tokens};max_new={max_new})",
                 mode == ReplyMode::Stream,
                 req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
                 req.enable_thinking(),
@@ -976,7 +986,9 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                     usage.cached = cached_tokens;
                 }
             }
-            Some(SinkEvent::Turn(TurnEvent::Completed { text, finish, .. })) => {
+            Some(SinkEvent::Turn(TurnEvent::Completed {
+                text, finish, stats, ..
+            })) => {
                 let items = splitter.finish();
                 emit!(items);
                 // 思考相位真账(在 finish 之后取:本 turn 再无 push)
@@ -999,6 +1011,34 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                         owl_engine::turn::FinishReason::Length => "length",
                     }
                 };
+                // **单轮诊断主日志**(2026-10-25):TTFT / prefill / decode /
+                // cache / spec AL 同一条,服务面日志不再只有"完成"。
+                // TTFT 含排队与 HTTP;prefill/decode 来自引擎侧 TurnStats
+                // (起跑→首 token / 首 token→终态),两者口径分开。
+                let ttft_ms = led.ttft_ms().unwrap_or(0);
+                let cache_pct = if usage.prompt > 0 {
+                    usage.cached as f64 * 100.0 / usage.prompt as f64
+                } else {
+                    0.0
+                };
+                owl_shared::log_info!(
+                    "chat",
+                    "turn {:?} 指标: ttft={}ms; prefill={}ms/{}tok={:.1}t/s; decode={}ms/{}tok={:.1}t/s; cache={}/{} ({:.1}%); spec rounds={} accepted={} al={:.2}",
+                    turn.map(|(_, t)| t),
+                    ttft_ms,
+                    stats.prefill_ms,
+                    stats.prefill_tokens,
+                    stats.prefill_tps(),
+                    stats.decode_ms,
+                    stats.decode_tokens,
+                    stats.decode_tps(),
+                    usage.cached,
+                    usage.prompt,
+                    cache_pct,
+                    stats.spec_rounds,
+                    stats.spec_accepted,
+                    stats.spec_al(),
+                );
                 // G5②:结算诊断环(结构轨迹 + usage + 结局;与 wire 同一份账)
                 led.set_events(splitter.structural_trace());
                 led.commit(
@@ -1013,6 +1053,13 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                         tools_called: splitter.tool_calls(),
                         strays: splitter.strays(),
                         malformed: splitter.malformed(),
+                        prefill_ms: stats.prefill_ms,
+                        decode_ms: stats.decode_ms,
+                        prefill_tps: stats.prefill_tps(),
+                        decode_tps: stats.decode_tps(),
+                        spec_rounds: stats.spec_rounds,
+                        spec_accepted: stats.spec_accepted,
+                        spec_al: stats.spec_al(),
                         ..Default::default()
                     },
                 );
@@ -1039,8 +1086,11 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                         http::sse_end(w).await?;
                         owl_shared::log_info!(
                             "chat",
-                            "turn {:?} 完成({reason};tools={};think={}B/text={}B):{}",
+                            "turn {:?} 完成({reason};prompt={};cached={};completion={};tools={};think={}B/text={}B):{}",
                             turn.map(|(_, t)| t),
+                            usage.prompt,
+                            usage.cached,
+                            usage.completion,
                             splitter.tool_calls(),
                             acc.reason.len(),
                             acc.text.len(),
@@ -1050,6 +1100,17 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                     }
                     ReplyMode::Aggregate => {
                         let msg = agg_message(&acc, splitter.tool_calls());
+                        owl_shared::log_info!(
+                            "chat",
+                            "turn {:?} 完成({reason};prompt={};cached={};completion={};tools={};think={}B/text={}B)",
+                            turn.map(|(_, t)| t),
+                            usage.prompt,
+                            usage.cached,
+                            usage.completion,
+                            splitter.tool_calls(),
+                            acc.reason.len(),
+                            acc.text.len()
+                        );
                         let body = completion_json(
                             &id,
                             model_name,

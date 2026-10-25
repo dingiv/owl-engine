@@ -669,6 +669,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // E4:m 直方图进 metrics(tag 有界 0..=7;/debug/metrics 直读,
         // 免日志 grep;AL 均值 = spec.accepted/spec.rounds 同源可算)
         mcnt(&format!("spec.m{m}"), 1);
+        // **先落本 turn 诊断账,再发事件**:`sample_and_emit` 可能在预算尽/
+        // EOS 时把活跃 turn 收掉;若等发完再 `tspec()` 会命中"活跃 0 个"。
+        {
+            let ts = self.tspec()?;
+            ts.spec_rounds += 1;
+            ts.spec_accepted += m as u64;
+            ts.spec_emitted += (m + 1) as u64;
+        }
         let ts = std::time::Instant::now();
         let mut evq = std::collections::VecDeque::new();
         for &t in &toks {

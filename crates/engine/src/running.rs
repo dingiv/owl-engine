@@ -679,6 +679,21 @@ impl<D: DeviceClient> RunningEngine<D> {
                             }
                         }
                         if let Some(hit) = detect {
+                            let imgs = s.img_spans.len();
+                            let marked = s.img_spans.iter().filter(|x| x.evict).count();
+                            owl_shared::log_info!(
+                                "img-evict",
+                                "删除识别: session={sid:#x} old={} raw={} images={imgs}(marked={marked}) \
+                                 ⇒ 删 text=[{},{}), padded=[{},{}), {} tok/{} 页",
+                                old_text.len(),
+                                input.len(),
+                                hit.text_a,
+                                hit.text_b,
+                                hit.a,
+                                hit.b,
+                                hit.b - hit.a,
+                                (hit.b - hit.a) / page
+                            );
                             let rebuilt = crate::img_evict::rebuild_after_delete(
                                 &s.tokens, &input, &hit,
                             )
@@ -2590,7 +2605,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         let need = self.step_need()?;
         let mut need = need;
         self.admission_gate(&mut need)?;
-        self.store_hook(StoreHook::capacity(need)).await?;
+        // `step_need` 在"无活跃 + 队列空"时返回 NeedWhy::Idle（零需求）。
+        // 这不是 Acquire::Capacity 的合法 kind；旧 Node::Need 走
+        // pool_housekeeping 时 is_zero() 会自然 no-op。Idle 的整理由下方
+        // H5 `idle_tick` / Maintain::Idle 负责，不能在这里误报不变量。
+        if !matches!(need.why, owl_store::NeedWhy::Idle) {
+            self.store_hook(StoreHook::capacity(need)).await?;
+        }
         // **[N6 Pressure]**(缺口 3):余量告急 ⇒ **零缺口也搬**(先下沉、再驱逐);
         // 这是"压力路径第一步":先把自己能腾的腾出来,而不是等 `ensure_for_len` 撞墙。
         if let Some(k) = self.pressure_probe() {

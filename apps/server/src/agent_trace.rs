@@ -23,7 +23,7 @@
 //!
 //! ## 内存上界
 //! `TURNS` × (`PROMPT_HEAD` + `PROMPT_TAIL` + `TRACE_CAP` 行 + 常数)
-//! ≈ 8 × 32 KiB = **256 KiB** 量级(prompt 文本域);与 ctx 无关(截断)。
+//! ≈ 64 × 32 KiB = **2 MiB** 量级(prompt 文本域);与 ctx 无关(截断)。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +33,7 @@ use std::time::Instant;
 use serde_json::{json, Value as Json};
 
 /// 环形深度(轮)
-pub const TURNS: usize = 8;
+pub const TURNS: usize = 64;
 /// prompt 快照保留的**头部**字节数(系统段 + 模板起手)
 pub const PROMPT_HEAD: usize = 8 * 1024;
 /// prompt 快照保留的**尾部**字节数(最近对话 + assistant 起手;渲染对称律看这里)
@@ -51,6 +51,10 @@ pub struct ReqFacts {
     pub messages: usize,
     pub roles: String,
     pub tools: usize,
+    /// 图像输入张数 / 视觉占位 token 数 / 可删标记数（2026-10-25 联调数据面）。
+    pub images: usize,
+    pub image_tokens: usize,
+    pub evict_images: usize,
     pub thinking: bool,
     pub reasoning_effort: Option<String>,
     /// 会话 id(哈希后;原始键不留在诊断面 —— 含客户端本地路径信息)
@@ -68,6 +72,9 @@ impl ReqFacts {
             "messages": self.messages,
             "roles": self.roles,
             "tools": self.tools,
+            "images": self.images,
+            "image_tokens": self.image_tokens,
+            "evict_images": self.evict_images,
             "thinking": self.thinking,
             "reasoning_effort": self.reasoning_effort,
             "session": self.session.map(|s| format!("{s:#x}")),
@@ -156,6 +163,18 @@ pub struct OutcomeFacts {
     /// 首 token 延迟(ms;`None` = 没到首 token)
     pub ttft_ms: Option<u64>,
     pub elapsed_ms: u64,
+    /// 引擎侧 prefill 时长(起跑→首 token;不含排队/HTTP)。
+    pub prefill_ms: u64,
+    /// 首 token → 终态。
+    pub decode_ms: u64,
+    /// 未命中前缀的 prefill 吞吐(token/s)。
+    pub prefill_tps: f64,
+    /// 首 token 之后的 decode 吞吐(token/s)。
+    pub decode_tps: f64,
+    /// spec 轮数 / 接受草稿数 / 平均接受长度(含 bonus)。
+    pub spec_rounds: u64,
+    pub spec_accepted: u64,
+    pub spec_al: f64,
     pub error: Option<String>,
 }
 
@@ -168,6 +187,13 @@ impl OutcomeFacts {
             "malformed": self.malformed,
             "ttft_ms": self.ttft_ms,
             "elapsed_ms": self.elapsed_ms,
+            "prefill_ms": self.prefill_ms,
+            "decode_ms": self.decode_ms,
+            "prefill_tps": self.prefill_tps,
+            "decode_tps": self.decode_tps,
+            "spec_rounds": self.spec_rounds,
+            "spec_accepted": self.spec_accepted,
+            "spec_al": self.spec_al,
             "error": self.error,
         })
     }
@@ -324,6 +350,11 @@ impl TurnLedger {
     /// 记录渲染后的 prompt(截断在 `PromptFacts::clip` 内,显式记账)
     pub fn set_prompt(&mut self, prompt: &str) {
         self.prompt = Some(PromptFacts::clip(prompt));
+    }
+
+    /// 当前轮已记录的 TTFT(只读;日志/诊断用)。
+    pub fn ttft_ms(&self) -> Option<u64> {
+        self.ttft_ms
     }
 
     /// 首个生成 token(幂等:只记第一次 —— TTFT)

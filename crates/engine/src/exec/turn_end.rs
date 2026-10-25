@@ -165,6 +165,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
     pub(crate) async fn complete(&mut self, reason: crate::turn::FinishReason) -> Result<TurnEvent> {
         let act = self.turns.take_exec().ok_or_else(|| ModelError::EngineInvariant { what: "turn_end:无活跃 turn".into() })?;
+        // **单 turn 诊断账**:在 take_exec 之后、任何收口动作之前取快照。
+        // `started_ms` = start_one 起跑;首 token 时间由 `sample_and_emit` 写。
+        let now = crate::running::now_ms();
+        let first_token_ms = act.first_token_ms.unwrap_or(now);
+        let prompt_tokens = act.prompt_ids.len();
+        let cached_tokens = act.cached_start.min(prompt_tokens);
+        let stats = crate::turn::TurnStats {
+            prefill_ms: first_token_ms.saturating_sub(act.started_ms),
+            decode_ms: now.saturating_sub(first_token_ms),
+            prompt_tokens,
+            cached_tokens,
+            prefill_tokens: prompt_tokens.saturating_sub(cached_tokens),
+            decode_tokens: if act.first_token_ms.is_some() {
+                act.out.len().saturating_sub(1)
+            } else {
+                0
+            },
+            spec_rounds: act.spec.spec_rounds,
+            spec_accepted: act.spec.spec_accepted,
+            spec_emitted: act.spec.spec_emitted,
+        };
         // B4 分母保鲜回写(下一 turn 种入;见 RunningEngine::bare_cost_carry_ms)
         self.dev.spec_rt.carry_ms = act.spec.bare_cost_ewma_ms;
         self.dev.spec_rt.carry_ctx = act.spec.bare_cost_ctx;
@@ -263,7 +284,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let n = crate::exec::floor_boundary(&text, n);
             text.truncate(n);
         }
-        Ok(TurnEvent::Completed { turn: act.id, text, finish: reason })
+        Ok(TurnEvent::Completed { turn: act.id, text, finish: reason, stats })
     }
 }
 

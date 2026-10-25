@@ -120,9 +120,76 @@ pub enum TurnEvent {
     /// token 由全量重解差分兜住)
     Token { turn: u64, delta: String },
     /// turn 终了(text = 生成全文,eos 不入文;finish = 终了原因)
-    Completed { turn: u64, text: String, finish: FinishReason },
+    Completed {
+        turn: u64,
+        text: String,
+        finish: FinishReason,
+        /// **单 turn 诊断账**(2026-10-25):TTFT/prefill/decode/spec AL 的
+        /// 引擎侧真源。服务面只负责投影到 wire/日志,不自己重新推导。
+        stats: TurnStats,
+    },
     /// turn 失败(槽/执行错误;槽已释放,队列继续)
     Failed { turn: u64, err: String },
+}
+
+/// 单 turn 的诊断账(与 `TurnEvent::Completed` 同源)。
+///
+/// 时间口径:
+/// - `prefill_ms` = `started_ms`(真正起跑)→ 首 token;含首步采样,
+///   不含排队/HTTP/模板渲染;
+/// - `decode_ms` = 首 token → 终态;`decode_tokens` 不含首 token
+///   (首 token 已计入 prefill 的尾部/首步),避免 decode t/s 分母重复。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TurnStats {
+    pub prefill_ms: u64,
+    pub decode_ms: u64,
+    pub prompt_tokens: usize,
+    pub cached_tokens: usize,
+    pub prefill_tokens: usize,
+    pub decode_tokens: usize,
+    pub spec_rounds: u64,
+    pub spec_accepted: u64,
+    pub spec_emitted: u64,
+}
+
+impl TurnStats {
+    /// 未命中前缀的真实 prefill 吞吐(token/s)。
+    pub fn prefill_tps(&self) -> f64 {
+        if self.prefill_ms == 0 {
+            0.0
+        } else {
+            self.prefill_tokens as f64 * 1000.0 / self.prefill_ms as f64
+        }
+    }
+
+    /// 首 token 之后的 decode 吞吐(token/s)。
+    pub fn decode_tps(&self) -> f64 {
+        if self.decode_ms == 0 {
+            0.0
+        } else {
+            self.decode_tokens as f64 * 1000.0 / self.decode_ms as f64
+        }
+    }
+
+    /// 投机接受长度:每轮平均发射 token 数(含 bonus)。
+    pub fn spec_al(&self) -> f64 {
+        if self.spec_rounds == 0 {
+            0.0
+        } else {
+            self.spec_emitted as f64 / self.spec_rounds as f64
+        }
+    }
+
+    /// 投机接受率:accepted drafts / 每轮 depth 的总草稿位。
+    /// `depth` 由调用方给(引擎侧 spec 深度),没有轮次时返回 0。
+    pub fn spec_accept_rate(&self, depth: usize) -> f64 {
+        if self.spec_rounds == 0 || depth == 0 {
+            0.0
+        } else {
+            self.spec_accepted as f64
+                / (self.spec_rounds as f64 * depth as f64)
+        }
+    }
 }
 
 // ===========================================================================
@@ -188,6 +255,8 @@ pub(crate) struct ActiveTurn {
     /// 缓存命中;AGT-12 `cached_tokens` 真源 —— 后者在 submit 时尚未
     /// 决定,只有 begin 定相后才知)
     pub(crate) cached_start: usize,
+    /// 首 token 的墙钟毫秒(`now_ms()`;`None` = 还没产出 token)。
+    pub(crate) first_token_ms: Option<u64>,
     pub(crate) out: Vec<u32>,
     /// KV/prompt 推进指针(会话 turn 从 `cached_len` 起步 = 增量 prefill)
     pub(crate) fed: usize,
@@ -223,6 +292,10 @@ pub(crate) struct TurnSpecState {
     pub(crate) spec_zero_streak: usize,
     /// B4:降级态(true = 调度发裸 Decode;草稿池逐 token 同步)
     pub(crate) spec_degraded: bool,
+    /// 本 turn 的 spec 轮数 / 接受草稿数 / 发射 token 数(诊断账)。
+    pub(crate) spec_rounds: u64,
+    pub(crate) spec_accepted: u64,
+    pub(crate) spec_emitted: u64,
     /// B4:降级以来 decode 步数(探测周期判定)
     pub(crate) spec_steps_degraded: usize,
     /// B4:当前探测周期(失败 ×2 退避,上限 512)

@@ -1367,6 +1367,9 @@ if self.dev.graphs.session.has_input("sel_pt") {
         }
         let budget_done = {
             let act = self.turns.active_mut()?;
+            if act.first_token_ms.is_none() {
+                act.first_token_ms = Some(crate::running::now_ms());
+            }
             act.out.push(nt);
             // `decoded` 由全量重解差分维护(delta 本步统一从 `emitted` 切片取,
             // 以便 stop 尾缓冲能回吐);返回值丢弃是有意的

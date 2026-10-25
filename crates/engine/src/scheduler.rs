@@ -544,9 +544,14 @@ impl<D: DeviceClient> RunningEngine<D> {
                 if self.image_evict_rebase_due(&turn)? {
                     self.img_evict.rebased += 1;
                     owl_shared::counter_add!("image_evict.rebase", 1);
+                    let rot_rounds = self.bank.sessions.session(turn.session_id)?.rot_rounds;
                     owl_shared::log_info!(
                         "img-evict",
-                        "叠转到顶(delta_limit={})⇒ 本轮整段重建(全量 prefill)",
+                        "叠转到顶:session={:#x} turn={} rot_rounds={} delta_limit={} \
+                         ⇒ 本轮整段重建(全量 prefill)",
+                        turn.session_id,
+                        turn.id,
+                        rot_rounds,
                         self.boot.cfg.knobs.image_evict_delta_limit
                     );
                     let (c, r, pl) = self.plan_fresh(&turn)?;
@@ -649,6 +654,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 emitted: 0,
                 trim_text_to: None,
                 seed: opts.seed,
+                first_token_ms: None,
                 out: Vec::new(),
                 fed: cached_len,
                 cached_start: cached_len,
@@ -732,29 +738,82 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let Some(del) = turn.deletion else { return Ok(None) };
         if del.a >= del.b || del.a % page != 0 || (del.b - del.a) % page != 0 {
+            owl_shared::log_warn!(
+                "img-evict",
+                "删除计划非法:session={:#x} turn={} a={} b={} page={} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                del.a,
+                del.b,
+                page
+            );
             return Ok(None);
         }
-        let (old, old_spans) = {
+        let (old, old_spans, rot_rounds) = {
             let s = self.bank.sessions.session(turn.session_id)?;
-            (s.tokens.clone(), s.img_spans.clone())
+            (s.tokens.clone(), s.img_spans.clone(), s.rot_rounds)
         };
         if del.b > old.len() || del.a > turn.prompt_ids.len() {
+            owl_shared::log_warn!(
+                "img-evict",
+                "删除计划越界:session={:#x} turn={} del=[{},{}), old={}, raw={} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                del.a,
+                del.b,
+                old.len(),
+                turn.prompt_ids.len()
+            );
             return Ok(None);
         }
+        let marked = old_spans.iter().filter(|x| x.evict).count();
+        owl_shared::log_info!(
+            "img-evict",
+            "删除计划:session={:#x} turn={} 删 [{},{})({} tok/{} 页)· images={} marked={} · rot_rounds={}",
+            turn.session_id,
+            turn.id,
+            del.a,
+            del.b,
+            del.b - del.a,
+            (del.b - del.a) / page,
+            old_spans.len(),
+            marked,
+            rot_rounds
+        );
         // **提交→起跑之间会话账没被别人动过**:删点之前必须逐字节相同
         // (识别在 submit 做,取链在 schedule 做;两道之间隔着排队)
         if old[..del.a] != turn.prompt_ids[..del.a] {
-            owl_shared::log_debug!("img-evict", "删点之前不一致(排队期会话账变了)⇒ 不吸收");
+            owl_shared::log_warn!(
+                "img-evict",
+                "删点之前不一致(排队期会话账变了):session={:#x} turn={} a={} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                del.a
+            );
             return Ok(None);
         }
         // ② 取旧链(内容树;纯读)—— 前缀身份不变,后缀身份待重挂。
         let (hit, _recall) = self.bank.rel.match_prefix(&old)?;
         let a_blocks = del.a / page;
         if hit.matched_blocks < a_blocks {
+            owl_shared::log_info!(
+                "img-evict",
+                "旧前缀链不足:session={:#x} turn={} matched={} need={} 页 ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                hit.matched_blocks,
+                a_blocks
+            );
             return Ok(None);
         }
         if hit.slots[..a_blocks].iter().any(|s| s.is_none()) {
-            owl_shared::log_debug!("img-evict", "前缀有宿主占位 ⇒ 不吸收");
+            owl_shared::log_info!(
+                "img-evict",
+                "前缀有宿主占位:session={:#x} turn={} a_blocks={} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                a_blocks
+            );
             return Ok(None);
         }
         // 后缀 = 删点之后**逐 token 相同**的段(padded 坐标,整块截断)
@@ -772,7 +831,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         }
         if keep == 0 {
-            owl_shared::log_debug!("img-evict", "后缀无可复用整页(k_pad={k_pad})⇒ 不吸收");
+            owl_shared::log_info!(
+                "img-evict",
+                "后缀无可复用整页:session={:#x} turn={} k_pad={k_pad} page={page} ⇒ 不吸收",
+                turn.session_id,
+                turn.id
+            );
             return Ok(None);
         }
         // ① 位置同移自证:用**真正喂前向的同一份** m-RoPE 两侧各算一遍。
@@ -795,10 +859,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             ) {
                 Some(s) => s,
                 None => {
-                    owl_shared::log_debug!(
+                    owl_shared::log_info!(
                         "img-evict",
-                        "位置同移自证失败(session={},a={},D={},keep={} 页)⇒ 不吸收",
+                        "位置同移自证失败:session={:#x} turn={} a={} D={} keep={} 页 ⇒ 不吸收",
                         turn.session_id,
+                        turn.id,
                         del.a,
                         del.b - del.a,
                         keep
@@ -814,9 +879,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             })?;
             let refs = self.bank.rel.leg.slot_refs(slot);
             if refs != 1 {
-                owl_shared::log_debug!(
+                owl_shared::log_info!(
                     "img-evict",
-                    "后缀块共享(slot={slot} refs={refs})⇒ 整轮放弃(禁原地重转)"
+                    "后缀块共享:session={:#x} turn={} slot={slot} refs={refs} ⇒ 整轮放弃(禁原地重转)",
+                    turn.session_id,
+                    turn.id
                 );
                 return Ok(None);
             }
@@ -833,9 +900,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             keep -= 1;
         }
         let Some((bi, old_key)) = boundary else {
-            owl_shared::log_debug!(
+            owl_shared::log_info!(
                 "img-evict",
-                "后缀边界无快照(snap_used={})⇒ 不吸收",
+                "后缀边界无快照:session={:#x} turn={} keep={} snap_used={} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                keep,
                 self.dev.pool.snap_used()
             );
             return Ok(None);
@@ -936,7 +1006,10 @@ impl<D: DeviceClient> RunningEngine<D> {
         owl_shared::counter_add!("image_evict.tokens", (del.b - del.a) as u64);
         owl_shared::log_info!(
             "img-evict",
-            "前缀无感删除:删 [{}, {})={} tok(a={} 页对齐,整 {} 页)· 保留后缀 {} 页 / {} tok · 位置平移 S={} · 快照重挂 {} 条(盘层待搬 {}) · 旋转页旧身份废弃 {} · 主动删段 0(死枝交回收器)",
+            "前缀无感删除:session={:#x} turn={} rot_rounds={} 删 [{}, {})={} tok(a={} 页对齐,整 {} 页)· 保留后缀 {} 页 / {} tok · 位置平移 S={} · 快照重挂 {} 条(盘层待搬 {}) · 旋转页旧身份废弃 {} · 主动删段 0(死枝交回收器)",
+            turn.session_id,
+            turn.id,
+            rot_rounds,
             del.a,
             del.b,
             del.b - del.a,
