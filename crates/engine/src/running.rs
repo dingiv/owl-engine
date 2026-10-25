@@ -648,9 +648,67 @@ impl<D: DeviceClient> RunningEngine<D> {
                     if !s.tokens.is_empty() && !s.img_spans.is_empty() {
                         let old_text = crate::img_evict::unpad(&s.tokens, &s.pads)
                             .map_err(ModelError::Msg)?;
-                        if let Some(hit) =
-                            crate::img_evict::detect_text_delete(&old_text, &input, &s.img_spans)
-                        {
+                        let detect = crate::img_evict::detect_text_delete(
+                            &old_text,
+                            &input,
+                            &s.img_spans,
+                        );
+                        owl_shared::log_debug!(
+                            "img-evict",
+                            "detect: session={sid:#x} old={} raw={} spans={:?} ⇒ {}",
+                            old_text.len(),
+                            input.len(),
+                            s.img_spans
+                                .iter()
+                                .map(|x| (x.start, x.end, x.text_start, x.text_end, x.evict))
+                                .collect::<Vec<_>>(),
+                            detect
+                                .map(|h| format!("hit text=[{},{})=padded[{},{})", h.text_a, h.text_b, h.a, h.b))
+                                .unwrap_or_else(|| "none".to_string())
+                        );
+                        if detect.is_none() {
+                            let n = old_text.len().min(input.len());
+                            let first_diff = (0..n).find(|&i| old_text[i] != input[i]);
+                            if let Some(i) = first_diff {
+                                let lo = i.saturating_sub(24);
+                                let hi = (i + 40).min(n);
+                                owl_shared::log_debug!(
+                                    "img-evict",
+                                    "first_diff={i} old_win={:?} raw_win={:?}",
+                                    self.boot.tok.decode(&old_text[lo..hi]),
+                                    self.boot.tok.decode(&input[lo..hi])
+                                );
+                            }
+                            for sp in s.img_spans.iter().filter(|x| x.evict) {
+                                let ta = sp.text_start;
+                                let tb = sp.text_end;
+                                let pre = ta <= old_text.len()
+                                    && ta <= input.len()
+                                    && old_text[..ta] == input[..ta];
+                                let k = if tb <= old_text.len() && ta <= input.len() {
+                                    old_text[tb..]
+                                        .iter()
+                                        .zip(&input[ta..])
+                                        .take_while(|(x, y)| x == y)
+                                        .count()
+                                } else {
+                                    0
+                                };
+                                let old_after: Vec<u32> =
+                                    old_text.get(tb..tb.saturating_add(12)).unwrap_or(&[]).to_vec();
+                                let raw_after: Vec<u32> =
+                                    input.get(ta..ta.saturating_add(12)).unwrap_or(&[]).to_vec();
+                                owl_shared::log_debug!(
+                                    "img-evict",
+                                    "detect miss: span text=[{ta},{tb}) padded=[{},{}) pre={pre} k={k} old_after={:?} raw_after={:?}",
+                                    sp.start,
+                                    sp.end,
+                                    self.boot.tok.decode(&old_after),
+                                    self.boot.tok.decode(&raw_after)
+                                );
+                            }
+                        }
+                        if let Some(hit) = detect {
                             let rebuilt = crate::img_evict::rebuild_after_delete(
                                 &s.tokens, &input, &hit,
                             )
@@ -674,8 +732,19 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 deletion = Some(hit);
                             }
                         }
+                    } else {
+                        owl_shared::log_debug!(
+                            "img-evict",
+                            "detect skipped: session={sid:#x} tokens={} spans={}",
+                            s.tokens.len(),
+                            s.img_spans.len()
+                        );
                     }
+                } else {
+                    owl_shared::log_debug!("img-evict", "detect skipped: session={sid:#x} 不在表");
                 }
+            } else {
+                owl_shared::log_debug!("img-evict", "detect skipped: 无 session(ephemeral)");
             }
         }
 
