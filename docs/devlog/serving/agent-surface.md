@@ -1646,6 +1646,19 @@ FP8 + spec d7 生产形状。2026-10-25 生产档进一步拉满：
 `snap_msg_boundary=true`；8135 `image-evict` 5/5、GUI 三图窗口 PASS，
 8134 pi 工具跟进 cached 1568/1647、TTFT 141ms。
 
+客户端请求侧参考实现（TypeScript，三图窗口 + 只删 image part）见
+[`examples/chat-completions-image-evict/`](../../../examples/chat-completions-image-evict/)。
+
+## §9.5 后续：Responses API（仅架子，未实现）
+
+Chat Completions 是客户端全量重发；Responses API 的 `previous_response_id`
+则把历史放服务端，下一轮可以只发 `function_call_output`。两者的状态模型、
+工具 item、SSE 事件和图像删除语义都不同，不能只加一个路由别名。
+
+接口/存储/分支/图像删除的施工前架子见
+[`responses-api-scaffold.md`](responses-api-scaffold.md)。当前状态：
+**零代码、未排期**；服务端仍只支持 `/v1/chat/completions`。
+
 ## §十 变更记录
 
 | 日期 | 版本 | 变更 |

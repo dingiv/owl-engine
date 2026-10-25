@@ -5,6 +5,8 @@
 roadmap.local/
 target
 __pycache__
+# examples 的 TypeScript 依赖（示例本身不带 node_modules）
+node_modules/
 crates/*-bak
 dev_log
 # testdata:bins 大件忽略,但金标生成脚本 + manifest(可复现配方)必须进版本

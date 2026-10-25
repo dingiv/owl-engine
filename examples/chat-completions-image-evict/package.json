@@ -1,0 +1,14 @@
+{
+  "name": "owl-chat-completions-image-evict-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "demo": "node demo.ts",
+    "demo:send": "node demo.ts --send",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
