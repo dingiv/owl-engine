@@ -41,7 +41,10 @@ for d in /path/to/crates/models/assets/*; do
 done
 ```
 
-冷建一次 **~9 分钟**(44 源 cubin 全编;之后增量 10-20s)。工作树位置与清理纪律见包根 `AGENTS.md`。
+冷建一次 **~9 分钟**(44 源 cubin 全编;之后增量 10-20s)。`build.rs` 现在
+自带 CUDA 编译线程池：`OWL_BUILD_JOBS`（缺省 `min(nproc,8)`）可并行
+native/Marlin/FlashInfer/XQA 的独立 TU；48 核全量强制重编实测 ~12m → ~4m28s。
+工作树位置与清理纪律见包根 `AGENTS.md`。
 
 ```bash
 # ③ testdata/ 的**本地面**(资源清单 / args / 用例 overlay / 金标)。

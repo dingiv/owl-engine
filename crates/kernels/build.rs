@@ -5,6 +5,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 
 // ============================================================================
@@ -33,6 +34,7 @@ use std::process::Command;
 // - `OWL_CUBIN_ARCHS` = 逗号分隔目标架构(缺省 `sm_86`);多档 ⇒ 一个 fatbin 含多代际
 // - `OWL_NVCC`        = nvcc 路径(缺省 PATH)
 // - `OWL_CUBIN_SKIP`  = 跳过构建期编 cubin(排障:纯 NVRTC 基线对照)
+// - `OWL_BUILD_JOBS`  = build.rs 内部 CUDA 编译线程数(缺省 min(nproc,8);1=串行)
 // ============================================================================
 fn cubin_archs() -> Vec<String> {
     env::var("OWL_CUBIN_ARCHS")
@@ -41,6 +43,53 @@ fn cubin_archs() -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// 构建期 CUDA 编译并发度。`build.rs` 是**单进程**，cargo 的 `-j` 不会
+/// 拆开脚本内部的 `nvcc` 调用 ⇒ 这里自己起线程池。
+///
+/// 缺省 8（48 核机器上 ~1-2GB/TU 的 nvcc/cicc 内存 × 8 仍安全），
+/// `OWL_BUILD_JOBS=1` 回到原来的串行路径。
+fn build_jobs() -> usize {
+    if let Ok(raw) = env::var("OWL_BUILD_JOBS") {
+        let n: usize = raw
+            .parse()
+            .unwrap_or_else(|e| panic!("OWL_BUILD_JOBS={raw:?} 非法: {e}"));
+        assert!(n > 0, "OWL_BUILD_JOBS 必须 >= 1");
+        return n;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
+}
+
+/// 顺序无关的独立 TU 编译:固定 jobs 个 worker 从下标队列取活。
+/// 每个 task 必须写自己的 `.o/.fatbin/.stamp`；panic 会沿 scope 传回 build.rs。
+fn parallel_for<T, F>(items: &[T], f: F)
+where
+    T: Sync,
+    F: Fn(&T) + Sync,
+{
+    let jobs = build_jobs().min(items.len()).max(1);
+    if jobs <= 1 {
+        for item in items {
+            f(item);
+        }
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= items.len() {
+                    break;
+                }
+                f(&items[i]);
+            });
+        }
+    });
 }
 
 /// FNV-1a 64 —— **必须**与 `kernels::family::cubins::hash_source` 逐位一致
@@ -296,31 +345,42 @@ fn build_native_cubins(
     let bin_dir = out_dir.join("cubins");
     std::fs::create_dir_all(&bin_dir).expect("mkdir cubins");
 
-    // (module 名, 源哈希, 源长度, 源路径, fatbin 路径, 符号清单)
-    let mut rows: Vec<(String, u64, usize, PathBuf, PathBuf, Vec<String>)> = Vec::new();
-    let mut rebuilt = 0usize;
-    let mut src_ids: Vec<String> = Vec::new();
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
-        let rel = src.strip_prefix(&cu_root).unwrap_or(src);
-        let asset = rel
-            .with_extension("")
-            .to_string_lossy()
-            .replace(['/', '\\'], "__")
-            .trim_end_matches('.')
-            .to_string();
-        let dst = bin_dir.join(format!("{asset}.fatbin"));
+    }
+    // 每个源独立:源路径、fatbin 目标、资产 id 先算好，再并行编。
+    let jobs: Vec<(PathBuf, PathBuf, String, String)> = sources
+        .iter()
+        .map(|src| {
+            let rel = src.strip_prefix(&cu_root).unwrap_or(src);
+            let asset = rel
+                .with_extension("")
+                .to_string_lossy()
+                .replace(['/', '\\'], "__")
+                .trim_end_matches('.')
+                .to_string();
+            let dst = bin_dir.join(format!("{asset}.fatbin"));
+            let src_id = format!("cu/{}", rel.to_string_lossy().replace('\\', "/"));
+            (src.clone(), dst, asset, src_id)
+        })
+        .collect();
+    let rebuilt = AtomicUsize::new(0);
+    parallel_for(&jobs, |(src, dst, _, _)| {
         // ⚠️ nvcc 规则:`--cubin` 不允许"多个 GPU code instance"(实测
         // `Option '--cubin' is not allowed when compiling for multiple GPU code instances`)
         // ⇒ 多代际必须用 `-fatbin`(内含多份 cubin;driver 载入 API 完全相同,
         // 运行期由驱动按设备挑最匹配那份)。单代际两者等价 ⇒ 统一用 fatbin。
-        if compile_fatbin(&nvcc, src, &dst, &archs, &[]) {
-            rebuilt += 1;
+        if compile_fatbin(&nvcc, src, dst, &archs, &[]) {
+            rebuilt.fetch_add(1, Ordering::Relaxed);
         }
+    });
+    let rebuilt = rebuilt.load(Ordering::Relaxed);
+    let mut rows: Vec<(String, u64, usize, PathBuf, PathBuf, Vec<String>)> = Vec::new();
+    let mut src_ids: Vec<String> = Vec::new();
+    for (src, dst, asset, src_id) in &jobs {
         let text = std::fs::read_to_string(src).expect("read .cu");
-        rows.push((asset, hash_source(&text), text.len(), src.clone(), dst, symbols_of(&text)));
-        // 资产 id = cu/ 相对路径(与 KernelSpec::SRC 同形)
-        src_ids.push(format!("cu/{}", rel.to_string_lossy().replace('\\', "/")));
+        rows.push((asset.clone(), hash_source(&text), text.len(), src.clone(), dst.clone(), symbols_of(&text)));
+        src_ids.push(src_id.clone());
     }
 
     // ---- 生成资产登记表(源哈希 → 资产;运行期零路径知识)----
@@ -446,21 +506,26 @@ fn build_xqa_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
     ];
     let dir = out_dir.join("xqa");
     std::fs::create_dir_all(&dir).expect("mkdir xqa assets");
-    let mut rows = Vec::new();
-    for (name, extra) in specs {
-        let dst = dir.join(format!("xqa_{name}.fatbin"));
-        let mut flags: Vec<&str> = COMMON.to_vec();
-        flags.extend_from_slice(extra);
-        let built = compile_fatbin(&nvcc, std::path::Path::new("cu/xqa/mha.cu"), &dst, &archs, &flags);
+    let jobs: Vec<(&'static str, PathBuf, Vec<&'static str>)> = specs
+        .iter()
+        .map(|(name, extra)| {
+            let dst = dir.join(format!("xqa_{name}.fatbin"));
+            let mut flags: Vec<&str> = COMMON.to_vec();
+            flags.extend_from_slice(extra);
+            (*name, dst, flags)
+        })
+        .collect();
+    parallel_for(&jobs, |(name, dst, flags)| {
+        let built =
+            compile_fatbin(&nvcc, std::path::Path::new("cu/xqa/mha.cu"), dst, &archs, flags);
         println!(
             "cargo:warning=owl-kernels: xqa_{name}.fatbin [{}] {} B{}",
             archs.join(","),
-            std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0),
+            std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0),
             if built { "" } else { "(增量命中,未重编)" }
         );
-        rows.push((name, dst));
-    }
-    rows
+    });
+    jobs.into_iter().map(|(name, dst, _)| (name, dst)).collect()
 }
 
 // ============================================================================
@@ -833,6 +898,8 @@ fn build_ops_table(out_dir: &std::path::Path) {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=OWL_BUILD_JOBS");
+    println!("cargo:warning=owl-kernels: CUDA 编译并行度 = {}（OWL_BUILD_JOBS 可覆盖）", build_jobs());
     // native cubin 构建期产出(终态 = 零运行期编译)
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     build_ops_table(&out_dir);
@@ -997,40 +1064,45 @@ fn build_marlin() {
             if !force && stamp_hit(&lib_out, &deps, &flags) {
                 println!("cargo:warning=owl-kernels: libmarlin.a 增量命中(零 nvcc)");
             } else {
-            let mut objs = Vec::new();
-            for src in &sources {
-                let obj = obj_dir.join(src.file_name().unwrap()).with_extension("o");
-                let mut args = vec![
-                    "-c".to_string(),
-                    src.to_str().unwrap().to_string(),
-                    "-o".to_string(),
-                    obj.to_str().unwrap().to_string(),
-                ];
-                for inc in &includes {
-                    args.push("-I".into());
-                    args.push(inc.to_str().unwrap().to_string());
-                }
-                args.extend(log_flags.iter().cloned());
-                args.extend([
-                    format!("-arch=compute_{arch}"),
-                    format!("-code=sm_{arch}"),
-                    "-O3".into(),
-                    "-std=c++17".into(),
-                    "-Xcompiler".into(),
-                    "-fPIC".into(),
-                    // 禁 -fvisibility=hidden:__global__ 模板实例跨 TU 拒链(xinfer 坑)
-                    "--expt-relaxed-constexpr".into(),
-                    "-static-global-template-stub=false".into(),
-                    "-Xcudafe".into(),
-                    "--diag_suppress=20236".into(),
-                ]);
-                let status = Command::new(&nvcc_m)
-                    .args(&args)
-                    .status()
-                    .unwrap_or_else(|e| panic!("marlin: failed to spawn {nvcc_m}: {e}"));
-                assert!(status.success(), "marlin: nvcc failed for {}", src.display());
-                objs.push(obj);
-            }
+                let jobs: Vec<(PathBuf, PathBuf, Vec<String>)> = sources
+                    .iter()
+                    .map(|src| {
+                        let obj = obj_dir.join(src.file_name().unwrap()).with_extension("o");
+                        let mut args = vec![
+                            "-c".to_string(),
+                            src.to_str().unwrap().to_string(),
+                            "-o".to_string(),
+                            obj.to_str().unwrap().to_string(),
+                        ];
+                        for inc in &includes {
+                            args.push("-I".into());
+                            args.push(inc.to_str().unwrap().to_string());
+                        }
+                        args.extend(log_flags.iter().cloned());
+                        args.extend([
+                            format!("-arch=compute_{arch}"),
+                            format!("-code=sm_{arch}"),
+                            "-O3".into(),
+                            "-std=c++17".into(),
+                            "-Xcompiler".into(),
+                            "-fPIC".into(),
+                            // 禁 -fvisibility=hidden:__global__ 模板实例跨 TU 拒链(xinfer 坑)
+                            "--expt-relaxed-constexpr".into(),
+                            "-static-global-template-stub=false".into(),
+                            "-Xcudafe".into(),
+                            "--diag_suppress=20236".into(),
+                        ]);
+                        (src.clone(), obj, args)
+                    })
+                    .collect();
+                parallel_for(&jobs, |(src, _, args)| {
+                    let status = Command::new(&nvcc_m)
+                        .args(args)
+                        .status()
+                        .unwrap_or_else(|e| panic!("marlin: failed to spawn {nvcc_m}: {e}"));
+                    assert!(status.success(), "marlin: nvcc failed for {}", src.display());
+                });
+                let objs: Vec<PathBuf> = jobs.into_iter().map(|(_, obj, _)| obj).collect();
                 let _ = std::fs::remove_file(&lib_out); // ar rcs 是按名替换:旧成员会留存
                 let mut cmd = Command::new(&ar);
                 cmd.arg("rcs").arg(lib_out.to_str().unwrap());
@@ -1141,42 +1213,55 @@ fn build_flashinfer() {
             // 自带 fp8 反量化(`fast_dequant_f8f16x4`)。
             // (历史坑留档:旧预编 `.a` 带该宏、从源路径起初没带 ⇒ 链接期
             //  undefined symbol;换源后这类"配方不一致"面自然消失)
-            let mut objs: Vec<PathBuf> = Vec::new();
+            let mut jobs: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
             for src in [src_f16, src_fp8, src_ragged] {
                 let obj = fi_dir.join(format!(
                     "{}.o",
                     PathBuf::from(src).file_stem().unwrap().to_string_lossy()
                 ));
-                let status = std::process::Command::new(&nvcc_m)
-                    .args(["-O3", "-std=c++17", "-arch=sm_86"])
-                    .arg(format!("-I{fi_include}"))
+                let mut args = vec![
+                    "-O3".into(),
+                    "-std=c++17".into(),
+                    "-arch=sm_86".into(),
+                    format!("-I{fi_include}"),
                     // owl_log.h(算子侧唯一日志出口)+ 编译门
-                    .arg("-Icu")
-                    .args(&log_flags)
-                    .arg("-c").arg(src).arg("-o").arg(&obj)
-                    .status()
-                    .expect("flashinfer: failed to spawn nvcc");
-                assert!(status.success(), "flashinfer: nvcc failed on {src}");
-                objs.push(obj);
+                    "-Icu".into(),
+                    "-c".into(),
+                    src.to_string(),
+                    "-o".into(),
+                    obj.to_str().unwrap().to_string(),
+                ];
+                args.extend(log_flags.iter().cloned());
+                jobs.push((src.to_string(), obj, args));
             }
             // FA2 hdim96（72 维输入；vLLM 原版 run_mha_fwd_hdim96）
             let obj_fa2 = fi_dir.join("owl_fa2.o");
-            let status = std::process::Command::new(&nvcc_m)
-                .args(["-O3", "-std=c++17", "-arch=sm_86", "--expt-relaxed-constexpr"])
-                .args([
-                    "-DFLASHATTENTION_DISABLE_DROPOUT",
-                    "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                    "-DFLASHATTENTION_DISABLE_LOCAL",
-                    "-DFLASHATTENTION_DISABLE_ALIBI",
-                ])
-                .arg(format!("-I{fa2_compat}"))
-                .arg(format!("-I{fa2_src}"))
-                .arg(format!("-I{fa2_cutlass}"))
-                .arg("-c").arg(src_fa2).arg("-o").arg(&obj_fa2)
-                .status()
-                .expect("flash-attn: failed to spawn nvcc");
-            assert!(status.success(), "flash-attn: nvcc failed on {src_fa2}");
-            objs.push(obj_fa2);
+            let fa2_args = vec![
+                "-O3".into(),
+                "-std=c++17".into(),
+                "-arch=sm_86".into(),
+                "--expt-relaxed-constexpr".into(),
+                "-DFLASHATTENTION_DISABLE_DROPOUT".into(),
+                "-DFLASHATTENTION_DISABLE_SOFTCAP".into(),
+                "-DFLASHATTENTION_DISABLE_LOCAL".into(),
+                "-DFLASHATTENTION_DISABLE_ALIBI".into(),
+                format!("-I{fa2_compat}"),
+                format!("-I{fa2_src}"),
+                format!("-I{fa2_cutlass}"),
+                "-c".into(),
+                src_fa2.to_string(),
+                "-o".into(),
+                obj_fa2.to_str().unwrap().to_string(),
+            ];
+            jobs.push((src_fa2.to_string(), obj_fa2, fa2_args));
+            parallel_for(&jobs, |(src, _, args)| {
+                let status = std::process::Command::new(&nvcc_m)
+                    .args(args)
+                    .status()
+                    .unwrap_or_else(|e| panic!("flashinfer: failed to spawn nvcc({src}): {e}"));
+                assert!(status.success(), "flashinfer: nvcc failed on {src}");
+            });
+            let objs: Vec<PathBuf> = jobs.into_iter().map(|(_, obj, _)| obj).collect();
             let _ = std::fs::remove_file(&lib);
             let mut ar_cmd = std::process::Command::new(&ar);
             ar_cmd.args(["rcs"]).arg(&lib);

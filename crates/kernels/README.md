@@ -77,7 +77,25 @@ MMQ 可用(MMQ 移植领地 = decode 小批;大批 llama.cpp 自己都 dequant �
 | 5 | **Q4 GGUF**(Q4_K_M → IQ4_XS → IQ3) | GGUF 端到端 == llama.cpp 数值锚 | Q0 |
 | 6 | Q2 FP8/W4A8;Q3 NVFP4(50 系硬件位) | 同 Q1 形态 | Q0;硬件 |
 
-## 六、纪律
+## 六、构建并行度
+
+`build.rs` 是**单个 cargo 构建脚本**：cargo 的 `-j` 不会拆开脚本内部的
+`nvcc` 调用。因此 `build.rs` 自带一个固定 worker 池（`std::thread::scope`），
+并行编译互相独立的 TU：
+
+- native cubin（`build_native_cubins`）
+- Marlin 7 个 `.cu`
+- FlashInfer 3 TU + FA2
+- XQA verify/decode 两变体
+
+旋钮：`OWL_BUILD_JOBS`（缺省 `min(nproc, 8)`；`1` = 原串行路径）。
+每个 TU 仍写自己的 `.stamp`/`.o`/`.fatbin`，增量闸不变；失败按源名报错。
+GDN 的 Triton AOT 仍是一个 Python 脚本内部顺序编六核。
+
+2026-10-25 实测（48 核，全部强制重编）：串行 ~12m → `OWL_BUILD_JOBS=8`
+~4m28s。
+
+## 七、纪律
 
 - **对拍**:每核引入/移植即写数值对拍(建核与对拍同批,不欠账);
 - **C1**:维度推导只读声明 shape;块账长仅容量;
