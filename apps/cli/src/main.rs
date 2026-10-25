@@ -18,10 +18,15 @@
 //! ```text
 //! cargo run -p cli                        # 默认连 127.0.0.1:8135
 //! cargo run -p cli -- --url http://127.0.0.1:8135 --max-tokens 96
+//! cargo run -p cli -- --workload core --url http://127.0.0.1:8135 \
+//!   --server-log /tmp/owl-8135-image-evict.log
 //! ```
 //!
 //! 架子边界(挂账):纯 std 阻塞实现(客户端零异步依赖;SSE close
 //! 定界逐行读)、无超时/断线重连、Ctrl-C 即退(无优雅收尾)。
+
+mod client;
+mod workload;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -38,6 +43,10 @@ struct Cfg {
     model: Option<String>,
     max_tokens: usize,
     session: String,
+    workload: Option<String>,
+    server_log: Option<String>,
+    json: bool,
+    keep: bool,
 }
 
 fn parse_args() -> Cfg {
@@ -50,6 +59,10 @@ fn parse_args() -> Cfg {
             .to_string(),
         model: None,
         max_tokens: DEFAULT_MAX_TOKENS,
+        workload: None,
+        server_log: None,
+        json: false,
+        keep: false,
         session: format!("cli-{}", SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -68,7 +81,13 @@ fn parse_args() -> Cfg {
             "--max-tokens" => cfg.max_tokens = val().parse().unwrap_or_else(|_| die("--max-tokens 非数字")),
             "--session" => cfg.session = val(),
             "--model" => cfg.model = Some(val()),
-            other => die(&format!("未知参数 {other}(--url/--max-tokens/--session/--model)")),
+            "--workload" => cfg.workload = Some(val()),
+            "--server-log" => cfg.server_log = Some(val()),
+            "--json" => cfg.json = true,
+            "--keep" => cfg.keep = true,
+            other => die(&format!(
+                "未知参数 {other}(--url/--max-tokens/--session/--model/--workload/--server-log/--json/--keep)"
+            )),
         }
     }
     cfg
@@ -81,6 +100,18 @@ fn die(msg: &str) -> ! {
 
 fn main() {
     let cfg = parse_args();
+    if let Some(suite) = cfg.workload.clone() {
+        let code = workload::run(workload::Args {
+            url: format!("http://{}", cfg.host),
+            model: cfg.model.clone(),
+            max_tokens: cfg.max_tokens,
+            suite,
+            server_log: cfg.server_log.clone(),
+            json: cfg.json,
+            keep: cfg.keep,
+        });
+        std::process::exit(code);
+    }
     // 起手探活(失败不拦,允许 server 后起;首条消息时会再报错)
     match get_health(&cfg.host) {
         Ok(model) => eprintln!("[cli] 已连接 {0}(模型 {1});/help 看命令", cfg.host, model),
