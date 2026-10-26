@@ -38,7 +38,7 @@ impl Mlp {
         let p = plan.into();
         let merge = matches!(
             p.uniform_plan(),
-            Some(QuantPlan::W4A16 | QuantPlan::W4A16Awq)
+            Some(QuantPlan::W4A16 | QuantPlan::W4A16Awq | QuantPlan::W4A8Awq)
         );
         Self::new_with(hidden, intermediate, p, merge)
     }
