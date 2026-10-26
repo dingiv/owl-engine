@@ -1599,6 +1599,7 @@ pub mod attn {
         let hq = scalars.first().copied().unwrap_or(1) as u32;
         let hkv = scalars.get(1).copied().unwrap_or(1) as u32;
         let hd = scalars.get(2).copied().unwrap_or(128) as u32;
+        let page = scalars.get(3).copied().unwrap_or(32).max(1) as u32;
         // v2 臂(2026-10-13 ③):dpl = hd/32 ∈ {4,8} 时走重写核(1.86×);其余旧核。
         // fp8kv 面 v2 未做 ⇒ 一律旧核。
         // **几何门(2026-10-18)**:v2 核要求 CTA 内 warp 能覆盖一个 GQA 组
@@ -1614,7 +1615,30 @@ pub mod attn {
             && group > 0
             && nwarp >= group
             && nwarp % group == 0;
+        // **v3 臂(2026-10-26 propose 刀1)**:页粒度把 K/V 整页搬进 shared
+        // (池里一页的 K 块/V 块都是连续 8KB ⇒ 16B 整块搬),键内零同步;
+        // v2 的标量 V 散读(单 key 128 个 32B 扇区)与 nsub 段切分是主凶。
+        // 几何门:hd=128(草稿)、page ≤ 64、动态 smem ≤ 48KB(图捕获期免 opt-in)、
+        // group 能被 CTA 内 warp 覆盖。不满足 ⇒ 回落 v2 / 旧核(慢但正确)。
+        // ⚠️ 只接 **bf16**(= DFlash2 草稿的生产 dtype,探针已对拍):f16 臂
+        // (MTP 链)与 fp8kv 池臂暂不接 —— 探针尚未覆盖,保持旧核不冒险。
+        let v3_nwarp = ((hd / 32) * 4).max(1);
+        let v3_esz = if fp8kv { 1u64 } else { 2u64 };
+        let v3_smem = 2 * page as u64 * hd as u64 * v3_esz
+            + v3_nwarp as u64 * (hd as u64 + 2) * 4;
+        let v3 = !fp8kv
+            && matches!(dt, DType::BF16)
+            && hd == 128
+            && (16..=64).contains(&page)
+            && hkv > 0
+            && hq % hkv == 0
+            && group > 0
+            && v3_nwarp >= group
+            && v3_nwarp % group == 0
+            && v3_smem <= 48 * 1024;
         let name = match (dt, fp8kv) {
+            (DType::F16, false) if v3 => "owl_naive_attn_nc_tiled_f16",
+            (DType::BF16, false) if v3 => "owl_naive_attn_nc_tiled_bf16",
             (DType::F16, false) => "owl_naive_attn_nc_f16",
             (DType::BF16, false) if v2 => "owl_naive_attn_nc_bf16_v2",
             (DType::BF16, false) => "owl_naive_attn_nc_bf16",
@@ -1630,7 +1654,9 @@ pub mod attn {
         // (2026-10-18 实测:只改 grid 不补并行度 ⇒ 11.3 vs 9.3 ms,更慢)。
         // v2 的**动态 smem** = `nwarp*(d_dim+2)*4`(归并 acc + m + l;见 .cu 注释)
         let v2_nwarp = nwarp * 4; // block = 4·hd ⇒ warp = 4·(hd/32)
-        let smem = if v2 {
+        let smem = if v3 {
+            v3_smem as u32
+        } else if v2 {
             (v2_nwarp as u64 * (hd as u64 + 2) * 4) as u32
         } else {
             0
@@ -1638,8 +1664,8 @@ pub mod attn {
         KernelPick {
             name,
             shape: Shape {
-                grid: if v2 { (t, hkv.max(1), 1) } else { (t, hq, 1) },
-                block: if v2 { (hd.max(1) * 4, 1, 1) } else { (hd.max(1), 1, 1) },
+                grid: if v2 || v3 { (t, hkv.max(1), 1) } else { (t, hq, 1) },
+                block: if v2 || v3 { (hd.max(1) * 4, 1, 1) } else { (hd.max(1), 1, 1) },
                 smem,
             },
         }

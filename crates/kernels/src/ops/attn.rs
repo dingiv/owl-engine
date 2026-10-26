@@ -413,6 +413,10 @@ impl KernelSpec for NormRopeBf16 {
 // ============================================================================
 
 pub static NC_ATTN_BF16_V2: KernelMeta = meta_of::<NcAttnBf16V2>();
+pub static NC_ATTN_TILED_BF16: KernelMeta = meta_of::<NcAttnTiledBf16>();
+pub static NC_ATTN_TILED_F16: KernelMeta = meta_of::<NcAttnTiledF16>();
+pub static NC_ATTN_TILED_FP8KV_BF16: KernelMeta = meta_of::<NcAttnTiledFp8kvBf16>();
+pub static NC_ATTN_TILED_FP8KV_F16: KernelMeta = meta_of::<NcAttnTiledFp8kvF16>();
 pub static PAGED_V2_FP8_KNHD_HD256BS32: KernelMeta = meta_of::<PagedAttnV2Fp8KnhdHd256Bs32>();
 pub static PAGED_V2_REDUCE_F16_HD256: KernelMeta = meta_of::<PagedAttnV2ReduceF16Hd256>();
 pub static K0_WRITE_FP8_KNHD: KernelMeta = meta_of::<K0WriteFp8Knhd>();
@@ -700,6 +704,100 @@ impl KernelSpec for NaiveAttnNcFp8KvF16 {
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
+
+// ============================================================================
+// 草稿 NC 注意力 v3(页粒度共享 K/V;2026-10-26 propose 刀1)
+// ============================================================================
+
+/// 四个入口共用一份表(与 v1/v2 同签名:PARAMS 一字不动)。
+macro_rules! nc_tiled_spec {
+    ($ty:ident, $entry:literal, $dt:ident, $kv:ident, $kr:literal, $vr:literal, $kvpool:ident,
+     $tag:literal, $doc:literal) => {
+        #[doc = $doc]
+        pub struct $ty;
+
+        #[kernel_tags("dom.attn", "role.attn", "feat.dflash", "feat.spec", "phase.propose", $tag)]
+        impl KernelSpec for $ty {
+            const ENTRY: &'static str = $entry;
+            const SRC: &'static str = "cu/attn/naive_attn_nc.cu";
+            const PARAMS: &'static [Param] = &[
+                Param::t_in("q", Dtype::$dt, 2),
+                Param::t_in("k_self", Dtype::$dt, 3),
+                Param::t_in("v_self", Dtype::$dt, 3),
+                // 线格式事实:classic 池句柄 = 5 阶(K)/4 阶(V);fp8 档 = 扁平字节账
+                Param::t_in("kc", Dtype::$kv, $kr),
+                Param::t_in("vc", Dtype::$kv, $vr),
+                Param::t_in("kv_len_p", Dtype::F32, 0),
+                Param::i32("q_heads"),
+                Param::i32("kv_heads"),
+                Param::i32("d_dim"),
+                Param::i32("page"),
+                Param::i32("x"),
+                Param::i32("ring_cap"),
+                Param::t_out("out", Dtype::$dt, 2),
+            ];
+            const POOL: &'static [PoolAccess] =
+                &[PoolAccess::read(pools::KV_DRAFT, LayoutTag::Classic, Dtype::$kvpool)];
+            const LAWS: &'static [Law] = &[Law::OutputFinite];
+            const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+            const DETERMINISM: Determinism = Determinism::Deterministic;
+            const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+                kv_dtype: Some(Dtype::$kvpool),
+                // v3 的 shared 契约按 hd=128 定形(驱动件只在该几何下选它;
+                // hd=256 的 shared 预算要 opt-in,留 v2)
+                head_dim: &[128],
+                page: &[16, 32, 64, 128],
+                grp: None,
+                tile: None,
+            };
+        }
+    };
+}
+
+nc_tiled_spec!(
+    NcAttnTiledBf16,
+    "owl_naive_attn_nc_tiled_bf16",
+    BF16,
+    BF16,
+    5,
+    4,
+    BF16,
+    "kv.draft.bf16",
+    "`owl_naive_attn_nc_tiled_bf16` —— NC 注意力 v3(页粒度 shared;bf16 池)"
+);
+nc_tiled_spec!(
+    NcAttnTiledF16,
+    "owl_naive_attn_nc_tiled_f16",
+    F16,
+    F16,
+    5,
+    4,
+    F16,
+    "kv.draft.f16",
+    "`owl_naive_attn_nc_tiled_f16` —— NC 注意力 v3(f16 池;MTP 链同族)"
+);
+nc_tiled_spec!(
+    NcAttnTiledFp8kvBf16,
+    "owl_naive_attn_nc_tiled_fp8kv_bf16",
+    BF16,
+    U32,
+    1,
+    1,
+    F8E4M3,
+    "kv.draft.fp8",
+    "`owl_naive_attn_nc_tiled_fp8kv_bf16` —— NC 注意力 v3(fp8 前缀池;bf16 自块)"
+);
+nc_tiled_spec!(
+    NcAttnTiledFp8kvF16,
+    "owl_naive_attn_nc_tiled_fp8kv_f16",
+    F16,
+    U32,
+    1,
+    1,
+    F8E4M3,
+    "kv.draft.fp8",
+    "`owl_naive_attn_nc_tiled_fp8kv_f16` —— NC 注意力 v3(fp8 前缀池;f16 自块)"
+);
 
 /// `vllm_reshape_and_cache_f16` —— reshape_and_cache.cu(R1 补表;池声明见 POOL)
 pub struct VllmReshapeAndCacheF16;

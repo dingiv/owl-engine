@@ -1001,3 +1001,279 @@ extern "C" __global__ void owl_naive_attn_nc_bf16_v2(
                                        d_dim, page, x, ring_cap, out);
     }
 }
+
+// ============================================================================
+// v3(2026-10-26 propose 刀1):**页粒度共享 K/V** + 键内零同步
+// ---------------------------------------------------------------------------
+// v2(上)在 propose 形状下的两处浪费(probe 实测:prefix 2048 / T=8 / Hq=16 /
+// Hkv=4 / 单发 ≈ 0.5ms/层,5 层占 propose 图 ~55%):
+//   ① V 是**标量散读**:池 V 布局 [nb,hkv,D,page] 下,一个 key 的 128 维散落在
+//      128 个 32B 扇区(每扇区只用 2B)⇒ 单 key 单 warp 128 次事务;
+//   ② nsub 个 warp 各切**连续** key 段 ⇒ 同 CTA 内 warp 读不同页,shared 无从
+//      复用(只能吃 L1/L2 的整页时间局部性)。
+// v3 把 key 循环改成**页(池块)粒度**:
+//   - 一页的 K 块((D/x)×page×x)与 V 块(D×page)在池里都是**连续 8KB**,按 16B
+//     整块搬进 shared(全 CTA 共享)⇒ 事务数 = 元素数/8,且整页只读一遍;
+//   - key 分片改成**页内条带**(sub 取 j ∈ [sub·page/nsub, (sub+1)·page/nsub)),
+//     全 CTA 同页 ⇒ shared 复用成立;跨条带归并与 v2 同式(s_m/s_l/s_acc);
+//   - 键内**零 __syncthreads**(dot 的 5 步 butterfly 让每 lane 持完整点积 ⇒
+//     softmax 态逐 lane 一致,与 v2 同律)。
+// 语义/槽序/平局律与 v2 逐字同一套(只有 f32 累加顺序不同 ⇒ 门 = host 参考 1e-2)。
+// 几何门(驱动件 + 核内 __trap 双保险):32|d_dim、group ≤ nwarp 且整除、
+// page ≤ 64、ring_cap ≥ 窗口+自块。
+// smem = 2·page·d_dim·sizeof(KVT) + nwarp·(d_dim+2)·4(≤ 48KB 免 opt-in)。
+// ============================================================================
+#define OWL_NC_TILE_MAX_PAGE 64
+
+template <typename KVT>
+struct NcTileConv;
+template <>
+struct NcTileConv<__nv_bfloat16> {
+    static __device__ __forceinline__ float tof(__nv_bfloat16 v) { return __bfloat162float(v); }
+};
+template <>
+struct NcTileConv<__half> {
+    static __device__ __forceinline__ float tof(__half v) { return __half2float(v); }
+};
+template <>
+struct NcTileConv<unsigned char> {
+    static __device__ __forceinline__ float tof(unsigned char v) {
+        __nv_fp8_e4m3 e;
+        e.__x = v;
+        return __half2float(__half(e));
+    }
+};
+
+// 一页前缀 → shared([pos][dim] 行主序;pos-major 让 key 内 16B 读与转置写都无冲突)
+template <typename KVT>
+__device__ __forceinline__ void nc_tile_load(
+    const KVT* __restrict__ kc, const KVT* __restrict__ vc,
+    KVT* s_k, KVT* s_v,
+    int b, int kvh, int kv_heads, int d_dim, int page, int x, int ring_cap,
+    int tid, int nthreads) {
+    const int hd_x = d_dim / x;
+    const int esz = (int)sizeof(KVT);
+    // ring 页对齐(`ring_cap % page == 0`,生产档 2080/32 恒成立)⇒ 一个逻辑页
+    // 整页映到另一个**槽页**,页内 32 个逻辑位的槽号仍连续 ⇒ 快速路照走。
+    // 非页对齐 ring 走慢速路(正确但逐元素;不静默错槽)。
+    const bool ring_paged = (ring_cap == 0) || (ring_cap % page) == 0;
+    if (ring_paged && x * esz == 16 && (page % 8) == 0) {
+        // 快速路:池页块连续 ⇒ 16B 整块搬(每 thread 1~2 块)
+        const int bp = (ring_cap == 0)
+                           ? b
+                           : (int)((((long long)b * page) % ring_cap) / page);
+        const long long kb = ((long long)bp * kv_heads + kvh) * (long long)hd_x * page * x;
+        const int nck = hd_x * page;
+        for (int c = tid; c < nck; c += nthreads) {
+            const int g = c / page;
+            const int off = c - g * page;
+            const uint4 v = *reinterpret_cast<const uint4*>(kc + kb + (long long)c * x);
+            *reinterpret_cast<uint4*>(s_k + (long long)off * d_dim + g * x) = v;
+        }
+        const long long vb = ((long long)bp * kv_heads + kvh) * (long long)d_dim * page;
+        const int per = page / 8;
+        const int ncv = d_dim * per;
+        for (int c = tid; c < ncv; c += nthreads) {
+            const int d = c / per;
+            const int q8 = c - d * per;
+            const uint4 v = *reinterpret_cast<const uint4*>(vc + vb + (long long)d * page + q8 * 8);
+            const KVT* tmp = reinterpret_cast<const KVT*>(&v);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) s_v[(long long)(q8 * 8 + j) * d_dim + d] = tmp[j];
+        }
+    } else {
+        // 慢速路(ring 槽映射 / 非 16B 组):逐元素,槽按逻辑位现算
+        for (int j = 0; j < page; ++j) {
+            const int srow = b * page + j;
+            const int slot = nc_ring_slot(srow, ring_cap);
+            const int bb = slot / page;
+            const int off = slot - bb * page;
+            const long long kb = ((long long)bb * kv_heads + kvh) * (long long)hd_x * page * x;
+            const long long vb = ((long long)bb * kv_heads + kvh) * (long long)d_dim * page;
+            for (int d = tid; d < d_dim; d += nthreads) {
+                s_k[(long long)j * d_dim + d] =
+                    kc[kb + (long long)(d / x) * page * x + (long long)off * x + (d % x)];
+                s_v[(long long)j * d_dim + d] = vc[vb + (long long)d * page + off];
+            }
+        }
+    }
+}
+
+// 单 key 的 online-softmax 一步(dot → 5 步 butterfly → 更新 → PV)
+template <typename KVT, int DPL>
+__device__ __forceinline__ void nc_tile_key(
+    const KVT* __restrict__ s_k, const KVT* __restrict__ s_v, long long off, int d0,
+    const float* qd, float scale, float& m, float& l, float* acc) {
+    KVT raw[DPL];
+    const KVT* kp = s_k + off + d0;
+    if (DPL * (int)sizeof(KVT) == 8) {
+        *reinterpret_cast<uint2*>(raw) = *reinterpret_cast<const uint2*>(kp);
+    } else if (DPL * (int)sizeof(KVT) == 16) {
+        *reinterpret_cast<uint4*>(raw) = *reinterpret_cast<const uint4*>(kp);
+    } else {
+#pragma unroll
+        for (int i = 0; i < DPL; ++i) raw[i] = kp[i];
+    }
+    float dot = 0.0f;
+#pragma unroll
+    for (int i = 0; i < DPL; ++i) dot += qd[i] * NcTileConv<KVT>::tof(raw[i]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+    const float ds = dot * scale;
+    const float m_new = fmaxf(m, ds);
+    const float resc = __expf(m - m_new);
+    const float p = __expf(ds - m_new);
+    l = l * resc + p;
+    m = m_new;
+    KVT vraw[DPL];
+    const KVT* vp = s_v + off + d0;
+    if (DPL * (int)sizeof(KVT) == 8) {
+        *reinterpret_cast<uint2*>(vraw) = *reinterpret_cast<const uint2*>(vp);
+    } else if (DPL * (int)sizeof(KVT) == 16) {
+        *reinterpret_cast<uint4*>(vraw) = *reinterpret_cast<const uint4*>(vp);
+    } else {
+#pragma unroll
+        for (int i = 0; i < DPL; ++i) vraw[i] = vp[i];
+    }
+#pragma unroll
+    for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * resc + p * NcTileConv<KVT>::tof(vraw[i]);
+}
+
+template <typename T, typename KVT, int DPL>
+__device__ __forceinline__ void nc_attn_tiled(
+    const T* __restrict__ q, const T* __restrict__ k_self, const T* __restrict__ v_self,
+    const KVT* __restrict__ kc, const KVT* __restrict__ vc,
+    const float* __restrict__ kv_len_p,
+    int q_heads, int kv_heads, int d_dim, int page, int x, int ring_cap,
+    T* __restrict__ out) {
+    const int t = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int nthreads = (int)blockDim.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int nwarp = nthreads >> 5;
+    const int group = q_heads / kv_heads;
+    // 结构门(驱动件同判;越界 = 硬错,不静默、不半跑)
+    if (group <= 0 || nwarp < group || (nwarp % group) != 0) { __trap(); }
+    if (page <= 0 || page > OWL_NC_TILE_MAX_PAGE) { __trap(); }
+    if (ring_cap != 0 && ring_cap < OWL_NC_SLIDING_WINDOW + (int)gridDim.x) { __trap(); }
+    const int nsub = nwarp / group;
+    const int wq = warp % group;
+    const int sub = warp / group;
+    const int h = kvh * group + wq;
+    const int d0 = lane * DPL;
+    const int kv_len = (int)kv_len_p[0];
+    const int t_rows = (int)gridDim.x;   // 自块行数(= propose 的 8;gridDim.x)
+    const int prefix_len = kv_len - t_rows;
+    const float scale = rsqrtf((float)d_dim);
+
+    // ---- shared:[2][page][d_dim] tile ‖ 归并区(nwarp·d_dim + 2·nwarp)----
+    extern __shared__ __align__(16) char s_raw[];
+    KVT* s_k = reinterpret_cast<KVT*>(s_raw);
+    KVT* s_v = s_k + (long long)page * d_dim;
+    float* s_merge = reinterpret_cast<float*>(s_v + (long long)page * d_dim);
+    float* s_acc = s_merge;                       // nwarp × d_dim
+    float* s_m = s_merge + (long long)nwarp * d_dim;
+    float* s_l = s_m + nwarp;
+
+    const T* qs = q + ((long long)t * q_heads + h) * d_dim;
+    float qd[DPL];
+#pragma unroll
+    for (int i = 0; i < DPL; ++i) qd[i] = NcConv<T>::tof(qs[d0 + i]);
+
+    float m = -3.0e38f;
+    float l = 0.0f;
+    float acc[DPL];
+#pragma unroll
+    for (int i = 0; i < DPL; ++i) acc[i] = 0.0f;
+
+    // D2 滑窗:前缀只取最近 OWL_NC_SLIDING_WINDOW 行(自块恒全可见)
+    const int srow_begin =
+        (prefix_len > OWL_NC_SLIDING_WINDOW) ? (prefix_len - OWL_NC_SLIDING_WINDOW) : 0;
+    const int p0 = srow_begin / page;
+    const int p1 = (prefix_len + page - 1) / page;   // 末页可含越界行(池内安全)
+    const int jlo = sub * page / nsub;
+    const int jhi = (sub + 1) * page / nsub;
+    for (int b = p0; b < p1; ++b) {
+        __syncthreads();
+        nc_tile_load<KVT>(kc, vc, s_k, s_v, b, kvh, kv_heads, d_dim, page, x, ring_cap, tid,
+                          nthreads);
+        __syncthreads();
+        for (int j = jlo; j < jhi; ++j) {
+            const int srow = b * page + j;
+            if (srow < srow_begin || srow >= prefix_len) continue;
+            nc_tile_key<KVT, DPL>(s_k, s_v, (long long)j * d_dim, d0, qd, scale, m, l, acc);
+        }
+    }
+
+    // ---- 自块 T 行(直读 k_self/v_self;同一 tile 循环,位置 0..T-1)----
+    {
+        __syncthreads();
+        for (int e = tid; e < t_rows * d_dim; e += nthreads) {
+            const int st = e / d_dim;
+            const int d = e - st * d_dim;
+            s_k[e] = k_self[((long long)st * kv_heads + kvh) * d_dim + d];
+            s_v[e] = v_self[((long long)st * kv_heads + kvh) * d_dim + d];
+        }
+        __syncthreads();
+        const int slo = sub * t_rows / nsub;
+        const int shi = (sub + 1) * t_rows / nsub;
+        for (int j = slo; j < shi; ++j) {
+            nc_tile_key<KVT, DPL>(s_k, s_v, (long long)j * d_dim, d0, qd, scale, m, l, acc);
+        }
+    }
+
+    // ---- 收尾:跨条带归并(v2 同式;1 次 __syncthreads)----
+    __syncthreads();
+    if (lane == 0) {
+        s_m[warp] = m;
+        s_l[warp] = l;
+    }
+#pragma unroll
+    for (int i = 0; i < DPL; ++i) s_acc[(long long)warp * d_dim + d0 + i] = acc[i];
+    __syncthreads();
+    float mg = -3.0e38f;
+    for (int s2 = 0; s2 < nsub; ++s2) mg = fmaxf(mg, s_m[wq + s2 * group]);
+    float lg = 0.0f;
+    float ag[DPL];
+#pragma unroll
+    for (int i = 0; i < DPL; ++i) ag[i] = 0.0f;
+    for (int s2 = 0; s2 < nsub; ++s2) {
+        const int w = wq + s2 * group;
+        const float e = __expf(s_m[w] - mg);
+        lg += s_l[w] * e;
+#pragma unroll
+        for (int i = 0; i < DPL; ++i) ag[i] += s_acc[(long long)w * d_dim + d0 + i] * e;
+    }
+    // 落盘只由条带 0 做(同组各 warp 的归并结果逐位相同 ⇒ 冗余写无必要)
+    if (sub == 0) {
+        T* o = out + ((long long)t * q_heads + h) * d_dim;
+#pragma unroll
+        for (int i = 0; i < DPL; ++i) o[d0 + i] = NcConv<T>::fromf(ag[i] / lg);
+    }
+}
+
+// ---- 四个入口(与 v1/v2 同签名:PARAMS 一字不动)----
+#define OWL_NC_TILED_ENTRY(NAME, T, KVT)                                                       \
+    extern "C" __global__ void NAME(                                                           \
+        const T* __restrict__ q, const T* __restrict__ k_self, const T* __restrict__ v_self,    \
+        const KVT* __restrict__ kc, const KVT* __restrict__ vc,                                \
+        const float* __restrict__ kv_len_p, int q_heads, int kv_heads, int d_dim, int page,     \
+        int x, int ring_cap, T* __restrict__ out) {                                            \
+        const int dpl = d_dim >> 5;                                                            \
+        if (dpl == 4) {                                                                        \
+            nc_attn_tiled<T, KVT, 4>(q, k_self, v_self, kc, vc, kv_len_p, q_heads, kv_heads,    \
+                                     d_dim, page, x, ring_cap, out);                            \
+        } else if (dpl == 8) {                                                                 \
+            nc_attn_tiled<T, KVT, 8>(q, k_self, v_self, kc, vc, kv_len_p, q_heads, kv_heads,    \
+                                     d_dim, page, x, ring_cap, out);                            \
+        } else {                                                                               \
+            __trap();                                                                          \
+        }                                                                                      \
+    }
+
+OWL_NC_TILED_ENTRY(owl_naive_attn_nc_tiled_bf16, __nv_bfloat16, __nv_bfloat16)
+OWL_NC_TILED_ENTRY(owl_naive_attn_nc_tiled_f16, __half, __half)
+OWL_NC_TILED_ENTRY(owl_naive_attn_nc_tiled_fp8kv_bf16, __nv_bfloat16, unsigned char)
+OWL_NC_TILED_ENTRY(owl_naive_attn_nc_tiled_fp8kv_f16, __half, unsigned char)

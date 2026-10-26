@@ -30,6 +30,8 @@ const HKV: usize = 8;
 const HD: usize = 128;
 const PAGE: usize = 32;
 const X: usize = 8; // bf16: 16B/2B
+/// 生产 ring 槽数(页对齐:`ceil((2048+16)/32)*32`)
+const RING: usize = 2080;
 
 fn bf16_bits(v: f32) -> u16 {
     half::bf16::from_f32(v).to_bits()
@@ -59,6 +61,7 @@ fn v_idx(kvh: usize, d: usize, page_off: usize) -> usize {
 }
 
 /// host 参考:f32 全量 softmax,语义见模块头注。
+#[allow(clippy::too_many_arguments)]
 fn host_ref(
     q: &[u16],
     k_self: &[u16],
@@ -66,24 +69,30 @@ fn host_ref(
     kc: &[u16],
     vc: &[u16],
     kv_len: usize,
+    hq: usize,
+    hkv: usize,
+    ring_cap: usize,
 ) -> Vec<f32> {
     let prefix = kv_len - T;
+    // ring 槽映射(0 = 线性;>0 = 逻辑位 % ring_cap)
+    let slot_of = |srow: usize| if ring_cap == 0 { srow } else { srow % ring_cap };
     let srow_begin = prefix.saturating_sub(2048);
     let scale = 1.0 / (HD as f32).sqrt();
-    let mut out = vec![0f32; T * HQ * HD];
+    let mut out = vec![0f32; T * hq * HD];
     for t in 0..T {
-        for h in 0..HQ {
-            let kvh = h / (HQ / HKV);
+        for h in 0..hq {
+            let kvh = h / (hq / hkv);
             let mut qk = Vec::with_capacity(kv_len - srow_begin);
             for srow in srow_begin..kv_len {
                 let mut acc = 0f32;
                 for d in 0..HD {
-                    let qd = bf16_to_f32(q[(t * HQ + h) * HD + d]);
+                    let qd = bf16_to_f32(q[(t * hq + h) * HD + d]);
                     let kv = if srow < prefix {
                         // 池:页号 = srow/PAGE,页内偏移 = srow%PAGE
-                        kc[k_idx(kvh, d, srow % PAGE) + (srow / PAGE) * HKV * HD * PAGE]
+                        kc[k_idx(kvh, d, slot_of(srow) % PAGE)
+                            + (slot_of(srow) / PAGE) * hkv * HD * PAGE]
                     } else {
-                        k_self[((srow - prefix) * HKV + kvh) * HD + d]
+                        k_self[((srow - prefix) * hkv + kvh) * HD + d]
                     };
                     acc += qd * bf16_to_f32(kv);
                 }
@@ -95,33 +104,35 @@ fn host_ref(
                 let mut acc = 0f32;
                 for (i, srow) in (srow_begin..kv_len).enumerate() {
                     let v = if srow < prefix {
-                        vc[v_idx(kvh, d, srow % PAGE) + (srow / PAGE) * HKV * HD * PAGE]
+                        vc[v_idx(kvh, d, slot_of(srow) % PAGE)
+                            + (slot_of(srow) / PAGE) * hkv * HD * PAGE]
                     } else {
-                        v_self[((srow - prefix) * HKV + kvh) * HD + d]
+                        v_self[((srow - prefix) * hkv + kvh) * HD + d]
                     };
                     acc += (qk[i] - m).exp() * bf16_to_f32(v);
                 }
-                out[(t * HQ + h) * HD + d] = acc / l;
+                out[(t * hq + h) * HD + d] = acc / l;
             }
         }
     }
     out
 }
 
-fn run_case(prefix: usize, check: bool) {
+fn run_case(prefix: usize, hq: usize, hkv: usize, ring_cap: usize, check: bool) {
     let kv_len = prefix + T;
-    let nb = prefix.div_ceil(PAGE);
+    // 池页数:线性档 = ceil(prefix/page);ring 档 = ring_cap/page(槽空间)
+    let nb = if ring_cap == 0 { prefix.div_ceil(PAGE) } else { ring_cap / PAGE };
     let ctx = CudaContext::new(1).expect("ctx");
     ctx.bind_to_thread().expect("bind");
     let stream = ctx.default_stream();
 
     // ---- 数据 ----
-    let q = lcg_bf16(T * HQ * HD, 901);
-    let k_self = lcg_bf16(T * HKV * HD, 902);
-    let v_self = lcg_bf16(T * HKV * HD, 903);
+    let q = lcg_bf16(T * hq * HD, 901);
+    let k_self = lcg_bf16(T * hkv * HD, 902);
+    let v_self = lcg_bf16(T * hkv * HD, 903);
     // 池:整页分配(末页只用前 prefix%PAGE 行)
-    let kc_n = nb * HKV * (HD / X) * PAGE * X;
-    let vc_n = nb * HKV * HD * PAGE;
+    let kc_n = nb * hkv * (HD / X) * PAGE * X;
+    let vc_n = nb * hkv * HD * PAGE;
     let kc = lcg_bf16(kc_n, 904);
     let vc = lcg_bf16(vc_n, 905);
 
@@ -135,7 +146,7 @@ fn run_case(prefix: usize, check: bool) {
     let d_vs = dev(&v_self);
     let d_kc = dev(&kc);
     let d_vc = dev(&vc);
-    let d_out = dev(&vec![0u16; T * HQ * HD]);
+    let d_out = dev(&vec![0u16; T * hq * HD]);
     let d_len = {
         let mut d = unsafe { stream.alloc::<f32>(1) }.unwrap();
         stream.memcpy_htod(&[kv_len as f32], &mut d).unwrap();
@@ -157,6 +168,27 @@ fn run_case(prefix: usize, check: bool) {
         .unwrap_or_else(|| "owl_naive_attn_nc_bf16".to_string());
     let f = m.load_function(&name).unwrap_or_else(|e| panic!("load {name}: {e}"));
 
+    // ---- 发射形状(按核族)----
+    //   v1 旧核:grid (T, Hq), block hd, smem 0
+    //   v2 重写核:grid (T, Hkv), block 4·hd, smem = nwarp·(hd+2)·4
+    //   v3 分页核:grid (T, Hkv), block 4·hd, smem = 2·page·hd·2 + nwarp·(hd+2)·4
+    let nwarp = (HD / 32) * 4;
+    let (grid, block, smem) = if name.contains("_tiled_") {
+        (
+            (T as u32, hkv as u32, 1),
+            (HD as u32 * 4, 1, 1),
+            (2 * PAGE * HD * 2 + nwarp * (HD + 2) * 4) as u32,
+        )
+    } else if name.ends_with("_v2") {
+        (
+            (T as u32, hkv as u32, 1),
+            (HD as u32 * 4, 1, 1),
+            (nwarp * (HD + 2) * 4) as u32,
+        )
+    } else {
+        ((T as u32, hq as u32, 1), (HD as u32, 1, 1), 0)
+    };
+
     let (q_p, ks_p, vs_p, kc_p, vc_p, ln_p, o_p) = (
         d_q.device_ptr(&stream).0,
         d_ks.device_ptr(&stream).0,
@@ -166,13 +198,9 @@ fn run_case(prefix: usize, check: bool) {
         d_len.device_ptr(&stream).0,
         d_out.device_ptr(&stream).0,
     );
-    let (hq_i, hkv_i, hd_i, page_i, x_i) =
-        (HQ as i32, HKV as i32, HD as i32, PAGE as i32, X as i32);
-    let cfg = LaunchConfig {
-        grid_dim: (T as u32, HQ as u32, 1),
-        block_dim: (HD as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let (hq_i, hkv_i, hd_i, page_i, x_i, ring_i) =
+        (hq as i32, hkv as i32, HD as i32, PAGE as i32, X as i32, ring_cap as i32);
+    let cfg = LaunchConfig { grid_dim: grid, block_dim: block, shared_mem_bytes: smem };
     let call = || {
         let mut b = stream.launch_builder(&f);
         b.arg(&q_p)
@@ -186,6 +214,7 @@ fn run_case(prefix: usize, check: bool) {
             .arg(&hd_i)
             .arg(&page_i)
             .arg(&x_i)
+            .arg(&ring_i)
             .arg(&o_p);
         unsafe { b.launch(cfg) }.expect("nc launch");
     };
@@ -206,19 +235,19 @@ fn run_case(prefix: usize, check: bool) {
     let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
 
     // ---- 数值 ----
-    let mut o = vec![0u16; T * HQ * HD];
+    let mut o = vec![0u16; T * hq * HD];
     stream.memcpy_dtoh(&d_out, &mut o).unwrap();
     let got: Vec<f32> = o.iter().map(|&b| bf16_to_f32(b)).collect();
     let n_zero = got.iter().filter(|&&v| v == 0.0).count();
     let d_h = if check {
-        let h = host_ref(&q, &k_self, &v_self, &kc, &vc, kv_len);
+        let h = host_ref(&q, &k_self, &v_self, &kc, &vc, kv_len, hq, hkv, ring_cap);
         Some(got.iter().zip(h.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max))
     } else {
         None
     };
     let win = prefix.min(2048);
     println!(
-        "=== {name} prefix={prefix} (窗口={win}+自块{T}, grid=({T},{HQ})) ===\n  \
+        "=== {name} prefix={prefix} hq={hq} hkv={hkv} ring={ring_cap} (窗口={win}+自块{T}, grid={grid:?}) ===\n  \
          单发      : {ms:7.3} ms/call\n  \
          数值 max|gpu−host| = {:?}   (零值 {n_zero}/{})\n  \
          有效行数/block = {T} · 总行/block = {}",
@@ -233,11 +262,16 @@ fn run_case(prefix: usize, check: bool) {
 
 #[owl_test(gpu)]
 fn dflash2_nc_speed_and_parity() {
-    // 生产窗口点(滑窗生效:prefix > 2048)+ host 参考
-    run_case(2048, true);
+    // 生产窗口点(滑窗生效:prefix > 2048)+ host 参考。
+    // 两种 head 几何:单卡草稿 Hq=32/Hkv=8;TP2 分片后 Hq=16/Hkv=4。
+    run_case(2048, HQ, HKV, 0, true);
+    run_case(2048, HQ / 2, HKV / 2, 0, true);
+    // **生产档 = 页对齐 ring(2080/32)**:走整页映射快速路
+    run_case(2048, HQ / 2, HKV / 2, RING, true);
+    run_case(4096, HQ / 2, HKV / 2, RING, true);
     // 短 ctx(滑窗不生效)+ 长 ctx(滑窗钳死)只测速
-    run_case(512, false);
-    run_case(8192, false);
+    run_case(512, HQ, HKV, 0, false);
+    run_case(8192, HQ, HKV, 0, false);
 }
 
 // ============================================================================
