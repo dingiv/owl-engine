@@ -974,15 +974,38 @@ if self.dev.graphs.session.has_input("sel_pt") {
         // 旧行为不变(GDN 恒等门类测试不带请求参数)。
         let eff_sampler = self.turns.active()?.sampler;
         let sampler_on = self.turns.active()?.sampler_on;
-        let nt = if sampler_on {
+        // 采样 RNG 基元(两条采样路共用):turn/sec + 步数定序
+        let (turn_id, step) = {
+            let act = self.turns.active()?;
+            (act.id, act.out.len() as u64)
+        };
+        let seed_base = self
+            .turns
+            .active()?
+            .seed
+            .unwrap_or_else(|| turn_id.wrapping_mul(0x9E3779B97F4A7C15));
+        // **候选采样门**(2026-10-26):采样 + 词表切 + 图带 cand 槽 + topk 有界
+        // + 无重复惩罚 ⇒ 只读 64×2 float/rank,不回读整行 logits。
+        let use_cand = sampler_on
+            && self.head_split_active()
+            && self.boot.cfg.knobs.sampler_enabled
+            && eff_sampler.rep_penalty <= 1.0
+            && eff_sampler.topk > 0
+            && eff_sampler.topk <= 32;
+        let nt = if sampler_on && use_cand {
+            let cs = self
+                .read_session_cands()
+                .await?
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: "候选采样:图无 cand 槽(判据漂移)".into(),
+                })?;
+            let mut rng = seed_base ^ step.wrapping_mul(0xBF58476D1CE4E5B9);
+            crate::sampler::sample_from_candidates(&cs[0], &eff_sampler, &mut rng)
+        } else if sampler_on {
             // P1.1:词表切档 ⇒ 两 rank 半表 host 拼接后的**全表**(未切档逐字节等价)
             let mut logits = self.read_full_logits("logits").await?;
             // 诊断:分布形状(绝对尺度 / top1-top2 gap / 候选词面)——
             // 复读病理定位的仪表盘(OWL_DEBUG 门控,前 16 步)
-            let (turn_id, step) = {
-                let act = self.turns.active()?;
-                (act.id, act.out.len() as u64)
-            };
             // 诊断:KV 池回读(取证图内 K0 写是否落盘)—— 槽 2 = prompt
             // (eager prefill 写);槽 pos = 本步 K0(图内写)。
             // 回读偏移走**布局单源**(`env::knhd_offset`;P6-A 后单布局,
@@ -1071,11 +1094,6 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     .collect();
                 owl_shared::log_debug!("logits-dump", "t{turn_id} s{step}: {}", pretty.join(" | "));
             }
-            // RNG seed = turn id ⊕ 步数(同 turn 重放确定性,跨 turn 独立);
-            // 请求给了 `seed` ⇒ 以它为基(AGT-06)
-            let seed_base = self.turns.active()?
-                .seed
-                .unwrap_or_else(|| turn_id.wrapping_mul(0x9E3779B97F4A7C15));
             let mut rng = seed_base ^ step.wrapping_mul(0xBF58476D1CE4E5B9);
             // 惩罚集 = prompt 尾(64)+ 已生成(反循环;llama.cpp 同语义)
             let history: Vec<u32> = {
@@ -1895,19 +1913,49 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         fi: Option<owl_iface::contract::FiPlanSpec>,
         want_logits: bool,
         depth: usize,
-    ) -> Result<(Vec<f32>, Option<Vec<f32>>)> {
+        rank: u8,
+        want_tokv: bool,
+        want_cand: bool,
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>)> {
         let vg = self.graphs.verify_mut(depth)?;
+        // **图外分相**(2026-10-26;本轮 CUPTI 账钉出 5.1–5.7ms/轮不在图内):
+        // fi=FI 表刷新 / launch=装填+入队回执 / tok=等图完成+回读。
+        // 按 rank 分 tag(有界 r0/r1)——两 rank 的差 = 跨 rank 启动偏斜的直接证据。
+        let t_fi = std::time::Instant::now();
         if let Some(spec) = fi {
             vg.face_mut().fi_plan_sync(spec).await?;
         }
+        let t_launch = std::time::Instant::now();
         vg.step(ins).await?;
+        let t_tok = std::time::Instant::now();
         let tok = vg.read_output_f32("tok").await?;
+        let t_logits = std::time::Instant::now();
         let logits = if want_logits {
             Some(vg.read_output_f32("logits").await?)
         } else {
             None
         };
-        Ok((tok, logits))
+        let t_tokv = std::time::Instant::now();
+        // 分布式 argmax:每行 2 float(值,索引) ⇒ 64B/rank,替代 4MB 半表 logits。
+        let tokv = if want_tokv {
+            Some(vg.read_output_f32("tokv").await?)
+        } else {
+            None
+        };
+        // 分布式采样候选:每行 32×(val,idx) = 256B/rank(替代 2MB 半表 logits)。
+        let cand = if want_cand {
+            Some(vg.read_output_f32("cand").await?)
+        } else {
+            None
+        };
+        let t_end = std::time::Instant::now();
+        mrec(&format!("spec.verify.pre.fi.r{rank}"), t_launch - t_fi);
+        mrec(&format!("spec.verify.pre.launch.r{rank}"), t_tok - t_launch);
+        mrec(&format!("spec.verify.pre.tok.r{rank}"), t_logits - t_tok);
+        mrec(&format!("spec.verify.pre.tokv.r{rank}"), t_tokv - t_logits);
+        mrec(&format!("spec.verify.pre.cand.r{rank}"), t_end - t_tokv);
+        mrec(&format!("spec.verify.pre.all.r{rank}"), t_end - t_fi);
+        Ok((tok, tokv, cand, logits))
     }
 
     /// **decode 设备半**(S4 ⑤-K3):块表重写(跨页)+ FI plan 表同步 + 会话图入队

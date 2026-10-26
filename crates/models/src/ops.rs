@@ -206,6 +206,8 @@ pub enum SemanticKernel {
     CastBf16F16,
     /// 设备侧贪心 argmax(采样;输出 [1] f32 索引数值)
     Argmax,
+    /// 设备侧 argmax 的 (max 值, 索引) 双输出(分布式 argmax;2026-10-26)
+    ArgmaxVal,
     /// 逐行 top-16(值半区 + 索引半区双 f32;aux = [rows])
     Topk16,
     /// 逐行 top-16 split-K 段一(2026-10-14 D2;aux = [rows, nparts];
@@ -214,6 +216,10 @@ pub enum SemanticKernel {
     /// 逐行 top-16 split-K 段二(一行一 warp;aux = [rows];
     /// 输入 = 段一单缓冲,输出 = 与 Topk16 逐位同布局的 [2·rows·K])
     Topk16Merge,
+    /// 逐行 top-32 split-K 段一(分布式采样;2026-10-26)
+    Topk32Split,
+    /// 逐行 top-32 split-K 段二(输出 [2·rows·32])
+    Topk32Merge,
     /// DFlash2 格打分 + 贪心 walk 融合(单块;输出 [rows·(K·K+1)])
     DflashSelect,
     /// DFlash2 分组动态深度 2-tap 卷积
@@ -386,9 +392,12 @@ impl SemanticKernel {
             SemanticKernel::Scale => "elems.scale",
             SemanticKernel::CastBf16F16 => "elems.cast_bf16_f16",
             SemanticKernel::Argmax => "ops.argmax",
+            SemanticKernel::ArgmaxVal => "ops.argmax_val",
             SemanticKernel::Topk16 => "ops.topk16",
             SemanticKernel::Topk16Split => "ops.topk16_split",
             SemanticKernel::Topk16Merge => "ops.topk16_merge",
+            SemanticKernel::Topk32Split => "ops.topk32_split",
+            SemanticKernel::Topk32Merge => "ops.topk32_merge",
             SemanticKernel::DflashSelect => "dflash.select",
             SemanticKernel::DflashConv => "dflash.conv",
             SemanticKernel::NaiveAttnNc => "attn.naive_nc",
@@ -779,6 +788,49 @@ pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> c
     .arg_i32(n as i32)
     .arg_i32(offset as i32)
     .with_shape(Dtype::F32, vec![1])
+}
+
+/// **逐行 top-32 候选**(K=32;分布式采样用,2026-10-26):两段 split-K,
+/// 输出单缓冲 `[2·rows·32]`(值区行主 + 索引区,索引 f32 过线)。
+///
+/// `stride` = 本 rank 的 logits 行宽(词表切档 = 半表)⇒ 索引是**半表域**,
+/// 全局 id 由 host 合并面加偏移(与 DFlash2 候选同律)。
+pub fn topk32_of_logits(
+    logits: &crate::tensor::TensorOps,
+    rows: usize,
+    nparts: usize,
+) -> crate::tensor::TensorOps {
+    use crate::contract::Dtype;
+    const K: usize = 32;
+    let stride = logits.shape()[1];
+    let part = crate::tensor::TensorOps::call(SemanticKernel::Topk32Split)
+        .aux(&[rows, nparts])
+        .arg(logits)
+        .arg_i32(stride as i32)
+        .arg_i32(nparts as i32)
+        .arg_i32(rows as i32)
+        .with_shape(Dtype::F32, vec![2 * rows * nparts * K]);
+    crate::tensor::TensorOps::call(SemanticKernel::Topk32Merge)
+        .aux(&[rows])
+        .arg(&part)
+        .arg_i32(nparts as i32)
+        .arg_i32(rows as i32)
+        .arg_i32(stride as i32)
+        .with_shape(Dtype::F32, vec![2 * rows * K])
+}
+
+/// 设备侧 argmax 的 **(max 值, 索引)** 双输出([2] f32;值在前)。
+///
+/// 用于 TP 词表切的两半表合并:两 rank 各出本半的最大值+索引 ⇒ host 只比较
+/// 2 个数(每行 8B),不再回读 4MB 半表 logits。平局语义与
+/// [`argmax_f32idx`] 一致(最小索引)。
+pub fn argmax_validx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> crate::tensor::TensorOps {
+    use crate::contract::Dtype;
+    crate::tensor::TensorOps::call(SemanticKernel::ArgmaxVal)
+    .arg(x)
+    .arg_i32(n as i32)
+    .arg_i32(offset as i32)
+    .with_shape(Dtype::F32, vec![2])
 }
 
 /// **激活 per-token int8 量化声明**(W4A8 喂料手;S1c)。

@@ -366,9 +366,12 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.narrow" => elems::narrow(dt),
         "ops.ts_stamp" => ops::ts_stamp(),
         "ops.argmax" => ops::argmax(),
+        "ops.argmax_val" => ops::argmax_validx(),
         "ops.topk16" => ops::topk16(ax(0)),
         "ops.topk16_split" => ops::topk16_split(ax(0), ax(1)), // aux = [rows, nparts]
         "ops.topk16_merge" => ops::topk16_merge(ax(0)),        // aux = [rows]
+        "ops.topk32_split" => ops::topk32_split(ax(0), ax(1)),
+        "ops.topk32_merge" => ops::topk32_merge(ax(0)),
         "ops.sigmoid_gate_mul" => attn::gate_mul(dt),
         "elems.scale" => elems::scale(dt),
         "elems.cast_f16_bf16" => elems::cast_dir(false),
@@ -1021,6 +1024,11 @@ pub mod ops {
         KernelPick::of::<crate::ops::elems::ArgmaxF32IdxF16>(Shape { grid: (1, 1, 1), block: (256, 1, 1), smem: 0 })
     }
 
+    /// (max 值, 索引) 双输出(分布式 argmax;grid/block 与索引版同参)
+    pub fn argmax_validx() -> KernelPick {
+        KernelPick::of::<crate::ops::elems::ArgmaxValIdxF16>(Shape { grid: (1, 1, 1), block: (256, 1, 1), smem: 0 })
+    }
+
     /// 逐行 top-16(单缓冲 [rows, 32]:值半区降序 + 索引半区;aux = [rows])
     pub fn topk16(rows: usize) -> KernelPick {
         KernelPick::of::<crate::ops::elems::Topk16F16>(Shape { grid: (rows as u32, 1, 1), block: (256, 1, 1), smem: 0 })
@@ -1038,6 +1046,24 @@ pub mod ops {
     /// split-K 段二(一行一 warp;grid = rows,block = 32)
     pub fn topk16_merge(rows: usize) -> KernelPick {
         KernelPick::of::<crate::ops::elems::Topk16MergeF16>(Shape {
+            grid: (rows as u32, 1, 1),
+            block: (32, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// 逐行 top-32 split-K 段一(K=32 twin;grid = rows×nparts)
+    pub fn topk32_split(rows: usize, nparts: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::Topk32SplitF16>(Shape {
+            grid: ((rows * nparts) as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// 逐行 top-32 split-K 段二(一行一 warp)
+    pub fn topk32_merge(rows: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::Topk32MergeF16>(Shape {
             grid: (rows as u32, 1, 1),
             block: (32, 1, 1),
             smem: 0,

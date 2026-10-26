@@ -538,6 +538,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         // `vocab_size()` 仍是词表全量(embed/tokenizer 面用)。
         let vocab = boot.model.logits_vocab();
         let knobs = boot.knobs;
+        // **词表切面**(2026-10-26):decode 侧候选采样只对"两半表合并"有意义。
+        let head_split = vocab != boot.model.vocab_size();
+        let cand_on = head_split && knobs.sampler_enabled;
         // taps 层号表(闭包 'static ⇒ Arc 持有;单一事实源 = SpecRuntime)
         let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let kv_caches = pool.kv_caches();
@@ -681,7 +684,18 @@ impl<D: DeviceClient> GraphFleet<D> {
             // argmax —— 消费面走 host 拼接(见 `RunningEngine::read_full_logits`)。
             let tok = owl_models::ops::argmax_f32idx(&tree, vocab, 0);
             sc.output("token", &tok)?;
-            sc.output("logits", &tree)
+            sc.output("logits", &tree)?;
+            // **候选采样槽**(2026-10-26):裸 decode 采样不再回读整行 logits。
+            // 仅"词表切 + 采样档 flavor"捕获;greedy 档零节点零槽。
+            if cand_on {
+                let cand = owl_models::ops::topk32_of_logits(
+                    &tree,
+                    1,
+                    owl_models::layers::dflash2::TOPK_NPARTS,
+                );
+                sc.output("cand", &cand)?;
+            }
+            Ok(())
         };
 
         let desc = GraphPlanDesc {
@@ -736,6 +750,13 @@ impl<D: DeviceClient> GraphFleet<D> {
                         OutputSlot { name: "logits".into(), shape: vec![1, vocab], dtype: dims.dtype },
                         OutputSlot { name: "token".into(), shape: vec![1], dtype: Dtype::F32 },
                     ];
+                    if cand_on {
+                        o.push(OutputSlot {
+                            name: "cand".into(),
+                            shape: vec![64],
+                            dtype: Dtype::F32,
+                        });
+                    }
                     if decode_taps {
                         for i in 0..5 {
                             o.push(OutputSlot {
@@ -951,6 +972,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let fi_want = knobs.env.attn.verify_arm.uses_fi();
         let mut vouts = vec![
             OutputSlot { name: "tok".into(), shape: vec![depth1, 1], dtype: Dtype::F32 },
+
             OutputSlot { name: "hid".into(), shape: vec![depth1, dims.hidden], dtype: dims.dtype },
             // A11(2026-10-14):per-row logits 出槽 —— 投机轮的**采样接受**
             // 需要各行目标分布(原先只有 argmax ⇒ spec 臂不采样 =
@@ -958,6 +980,28 @@ impl<D: DeviceClient> GraphFleet<D> {
             // 贪心档不回读(零额外 D2H);仅采样档付 ~2.4MB/轮。
             OutputSlot { name: "logits".into(), shape: vec![depth1, model_v.logits_vocab()], dtype: Dtype::F16 },
         ];
+        // **词表切面**(2026-10-26):只有 `logits_vocab < vocab` 才需要
+        // "两半表合并"的分布式通路(tokv / cand)。未切档(单卡 / 关
+        // `tp_vocab_split`)**零额外节点零额外槽** —— 不许为不存在的合并付税。
+        let head_split = model_v.logits_vocab() != model_v.vocab_size();
+        if head_split {
+            vouts.push(OutputSlot {
+                name: "tokv".into(),
+                shape: vec![depth1, 2],
+                dtype: Dtype::F32,
+            });
+        }
+        // **分布式采样候选槽**:词表切 + "采样档 flavor"才捕获(topk32 每轮
+        // 有 ~50µs 成本;纯 greedy 档不该付)。请求级 temp>0 落在 greedy flavor
+        // 上时没有该槽 ⇒ spec.rs 自动回退 logits 老路(见 `use_cand` 门)。
+        let cand_on = head_split && knobs.sampler_enabled;
+        if cand_on {
+            vouts.push(OutputSlot {
+                name: "cand".into(),
+                shape: vec![2 * depth1 * 32],
+                dtype: Dtype::F32,
+            });
+        }
         // DFlash2 target taps(E5-DF2;层输出残差流,sglang capture 同语义)
         // notaps → 退回 last_hidden(排查开关:隔离 taps 图)
         let dflash_taps = boot.spec.dflash_tap_count > 0;
@@ -1169,6 +1213,32 @@ impl<D: DeviceClient> GraphFleet<D> {
                     .arg_usize(1)
                     .with_shape(Dtype::F32, vec![depth1, 1]);
                 sc.output("tok", &root)?;
+                // **分布式 argmax(2026-10-26)**:每行同时出 (max 值, 索引)
+                // ⇒ TP 词表切时两 rank 只需交换 8B/行(而非 4MB 半表 logits)。
+                // 只在贪心档消费(`spec.rs`);采样档仍读 `logits`。
+                if head_split {
+                    let tokv_rows: Vec<TensorOps> = (0..depth1)
+                        .map(|r| owl_models::ops::argmax_validx(&logits, vocab, r * vocab))
+                        .collect();
+                    let mut troot = TensorOps::call(owl_models::ops::SemanticKernel::Concat);
+                    for i in 0..owl_models::kernel::CONCAT_ROWS_SLOTS {
+                        troot = troot.arg(tokv_rows.get(i).unwrap_or(&tokv_rows[0]));
+                    }
+                    let troot = troot
+                        .arg_usize(depth1)
+                        .arg_usize(1)
+                        .arg_usize(2)
+                        .with_shape(Dtype::F32, vec![depth1, 2]);
+                    sc.output("tokv", &troot)?;
+                }
+                if cand_on {
+                    let cand = owl_models::ops::topk32_of_logits(
+                        &logits,
+                        depth1,
+                        owl_models::layers::dflash2::TOPK_NPARTS,
+                    );
+                    sc.output("cand", &cand)?;
+                }
                 sc.output("hid", &hidden)?;
                 for (i, t) in tap.borrow().iter().enumerate() {
                     sc.output(format!("r{i}"), t)?;

@@ -127,6 +127,16 @@ pub fn distribution(logits: &mut [f32], cfg: &SamplerCfg, history: &[u32]) -> Ve
         }
     }
 
+    // ── 规范化序(2026-10-26;分布式采样等价性的前提)──
+    // 选出的 k 个候选按 **(值降, 索引升)** 重排后再做 softmax:
+    // 拓扑选择只保证"集合"一致,而**槽位顺序**是扫描历史的产物(被替换的
+    // 低值填充位会改变顺序)⇒ 求和顺序随实现漂移。规范化后,全表路径与
+    // "两半 top-K 并集"路径的集合相同 ⇒ 采样**逐位相同**。
+    cand.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
     // ── softmax(temperature;减 max 稳定化)──
     let mx = cand.iter().map(|(v, _)| *v).fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0f32;
@@ -158,6 +168,32 @@ pub fn distribution(logits: &mut [f32], cfg: &SamplerCfg, history: &[u32]) -> Ve
     keep.iter().map(|(p, t)| (*t, *p)).collect()
 }
 
+/// **候选集采样**(分布式采样,2026-10-26):TP 词表切下两半表各出 top-K,
+/// host 合并后只在这 ≤2K 个候选上采样 —— 不再回读 4MB logits。
+///
+/// `union` = **(全局索引升序)** 的 `(logit, 全局 token id)`,由调用方排序。
+/// 语义与 [`sample`] **逐位等价**:
+/// - 全局 top-k ⊆ 两半 top-K 的并集 ⇒ 在并集上按同一"index 升序扫描 +
+///   严格 `>` 替换"的算法选 k,其结果**集合与内部顺序**与全域扫描一致;
+/// - 之后的 softmax/top-p/多项式抽样直接复用 [`distribution`]。
+///
+/// 前置门(调用方保证,不满足就走 logits 老路):`cfg.topk > 0`、
+/// `cfg.topk <= K`、`cfg.rep_penalty <= 1.0`、`union.len() >= cfg.topk`。
+pub fn sample_from_candidates(union: &[(f32, u32)], cfg: &SamplerCfg, rng: &mut u64) -> u32 {
+    debug_assert!(cfg.topk > 0 && union.len() >= cfg.topk);
+    let mut vals: Vec<f32> = union.iter().map(|(v, _)| *v).collect();
+    let keep = distribution(&mut vals, cfg, &[]);
+    let u = uniform(rng);
+    let mut acc = 0f32;
+    for (pos, p) in keep.iter() {
+        acc += *p;
+        if u < acc {
+            return union[*pos as usize].1;
+        }
+    }
+    keep.last().map(|(pos, _)| union[*pos as usize].1).unwrap_or(0)
+}
+
 /// logits → 采样 token（[`distribution`] + 多项式抽样）。
 /// repeat-penalty 会原地修改 `logits`（与旧行为一致）。
 pub fn sample(logits: &mut [f32], cfg: &SamplerCfg, rng: &mut u64, history: &[u32]) -> u32 {
@@ -171,6 +207,70 @@ pub fn sample(logits: &mut [f32], cfg: &SamplerCfg, rng: &mut u64, history: &[u3
         }
     }
     keep.last().map(|(idx, _)| *idx).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+
+    /// 候选式采样必须与全表采样**逐 token 等价**(同 rng、同 cfg)。
+    /// 覆盖:普通分布 / 大量平局 / topk=1 / topp=1.0。
+    fn check(logits: &[f32], cfg: &SamplerCfg, k: usize, seeds: u64) {
+        let n = logits.len();
+        // 全表 top-32(值降,索引升)= 两半并集的上界
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap()
+                .then(a.cmp(&b))
+        });
+        let mut union: Vec<(f32, u32)> = order[..k.min(n)]
+            .iter()
+            .map(|&i| (logits[i], i as u32))
+            .collect();
+        union.sort_unstable_by_key(|&(_, i)| i);
+        for sd in 0..seeds {
+            let mut state = sd.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+            let (mut r1, mut r2) = (state, state);
+            let mut full = logits.to_vec();
+            let a = sample(&mut full, cfg, &mut r1, &[]);
+            let b = sample_from_candidates(&union, cfg, &mut r2);
+            assert_eq!(a, b, "seed={sd} cfg={cfg:?}");
+            assert_eq!(r1, r2, "RNG 消耗必须一致");
+            state = state.wrapping_add(0x9E3779B97F4A7C15);
+        }
+    }
+
+    #[test]
+    fn candidates_equal_full_table_random() {
+        let n = 4096usize;
+        let mut x = vec![0f32; n];
+        let mut s = 123456789u64;
+        for v in x.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((s >> 40) as f32 / (1u64 << 24) as f32) * 8.0 - 4.0;
+        }
+        let cfg = SamplerCfg { temp: 0.9, topk: 20, topp: 0.92, rep_penalty: 1.0 };
+        check(&x, &cfg, 32, 500);
+    }
+
+    #[test]
+    fn candidates_equal_full_table_heavy_ties() {
+        // 大量同值:候选边界全是平局 —— 最考"取最小索引"语义
+        let n = 512usize;
+        let x: Vec<f32> = (0..n).map(|i| ((i % 7) as f32) * 0.5).collect();
+        let cfg = SamplerCfg { temp: 1.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        check(&x, &cfg, 32, 500);
+    }
+
+    #[test]
+    fn candidates_equal_full_table_k1_and_topp1() {
+        let n = 1024usize;
+        let x: Vec<f32> = (0..n).map(|i| ((i * 37 % 101) as f32) * 0.1).collect();
+        check(&x, &SamplerCfg { temp: 1.3, topk: 1, topp: 0.95, rep_penalty: 1.0 }, 32, 200);
+        check(&x, &SamplerCfg { temp: 0.7, topk: 20, topp: 1.0, rep_penalty: 1.0 }, 32, 200);
+    }
 }
 
 #[cfg(test)]

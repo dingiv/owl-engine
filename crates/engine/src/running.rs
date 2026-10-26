@@ -426,6 +426,27 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.dev.boot.model.logits_vocab() != self.dev.boot.model.vocab_size()
     }
 
+    /// **候选采样读面**(2026-10-26):裸 decode 的 `cand` 两半表 → 每行候选并集
+    /// (全局索引升序)。`None` = 图没有候选槽(未切档 / greedy 档 flavor)⇒
+    /// 调用方回退 `read_full_logits`。
+    pub(crate) async fn read_session_cands(
+        &mut self,
+    ) -> Result<Option<Vec<Vec<(f32, u32)>>>> {
+        if !self.dev.graphs.session.has_output("cand") {
+            return Ok(None);
+        }
+        let half = self.dev.boot.model.logits_vocab();
+        let a = self.dev.graphs.session.read_output_f32("cand").await?;
+        let p = self
+            .peer
+            .as_mut()
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: "候选采样:词表切档缺 peer（装配不一致）".into(),
+            })?;
+        let b = p.graphs.session.read_output_f32("cand").await?;
+        Ok(Some(crate::exec::merge_sample_cands(&a, &b, 1, half)?))
+    }
+
     pub(crate) async fn read_full_logits(&mut self, name: &str) -> Result<Vec<f32>> {
         let a = self.dev.graphs.session.read_output_f32(name).await?;
         if !self.head_split_active() {

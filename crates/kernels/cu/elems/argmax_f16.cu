@@ -34,11 +34,11 @@ typedef unsigned long long uint64_t;
 constexpr int ARGMAX_BLOCK = 256;
 constexpr int ARGMAX_OWN = 8;   // 每线程每 chunk 连续 half 数(uint4)
 
-extern "C" __global__ void owl_argmax_f32idx_f16(
-    const __half* __restrict__ x,   // [n](logits 末行窄视图或整行)
-    int n,
-    int offset,                     // 起始元素(末行 = (T-1)·V)
-    float* __restrict__ out) {      // [1] = argmax 索引(f32 数值)
+// ── 共用归约体(2026-10-26):索引版与 (值,索引) 版**同一份算术序**,
+//    避免两套实现漂移。平局取最小索引贯穿全程。
+__device__ __forceinline__ void owl_argmax_reduce(
+    const __half* __restrict__ x, int n, int offset,
+    float* __restrict__ best_out, int* __restrict__ idx_out) {
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
     const __half* row = x + offset;
@@ -103,6 +103,31 @@ extern "C" __global__ void owl_argmax_f32idx_f16(
     }
 
     if (tid == 0) {
-        out[0] = (float)s_idx[0];
+        *best_out = s_val[0];
+        *idx_out = s_idx[0];
     }
+}
+
+extern "C" __global__ void owl_argmax_f32idx_f16(
+    const __half* __restrict__ x,   // [n](logits 末行窄视图或整行)
+    int n,
+    int offset,                     // 起始元素(末行 = (T-1)·V)
+    float* __restrict__ out) {      // [1] = argmax 索引(f32 数值)
+    float v = 0.0f;
+    int i = -1;
+    owl_argmax_reduce(x, n, offset, &v, &i);
+    if (threadIdx.x == 0) out[0] = (float)i;
+}
+
+// (值,索引) 版(2026-10-26 分布式 argmax):out[0]=max 值,out[1]=索引。
+// 语义与索引版逐位同源(同一个归约体)⇒ 两半表合并时 `val` 比较可信。
+extern "C" __global__ void owl_argmax_validx_f16(
+    const __half* __restrict__ x,
+    int n,
+    int offset,
+    float* __restrict__ out) {      // [2] = [max 值, argmax 索引]
+    float v = 0.0f;
+    int i = -1;
+    owl_argmax_reduce(x, n, offset, &v, &i);
+    if (threadIdx.x == 0) { out[0] = v; out[1] = (float)i; }
 }
