@@ -635,8 +635,8 @@ pub(crate) fn order_snap_victims(
 
 // **自证(§30.4)**:判据唯一由本文件的 `plan_capacity` 承担 ——
 // `Rel::plan_need` 是唯一生产入口,`Rel::plan_evict`/旧 `hooks::plan` 已删除;
-// `KvStore::ensure_for_len` 保留为**兜底**(报告面 `ops.ensure_evicted > 0`
-// = 调度器失职的告警信号,不是另一套判据)。
+// `KvStore::ensure_for_len` 已改为**纯分配**(Phase 2,2026-10-25),
+// 不再逐缓存；`ops.ensure_evicted` 是回归门（应恒 0）。
 
 #[cfg(test)]
 mod tests {

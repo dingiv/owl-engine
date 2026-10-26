@@ -14,7 +14,9 @@
 > 同题(24GB 卡 + Qwen3.8-27B + MTP 跑 1M 工作区),其四机制 = 本卷骨架的对照系(§3.6)。
 >
 > **2026-10-25 更新**：engine 侧调用面已收口为 `StoreHook::{Acquire,Release,Maintain}`
-> （Phase 1，行为保持）；本卷中的 `Node` 描述保留为历史，新契约见
+> （Phase 1 行为保持；Phase 2 把 `ensure_for_len` 改为纯分配；Phase 3 收编
+> H3/H6 与状态腿；Phase 4 修 `FixedAfter`/N6 触发）；本卷中的 `Node` 描述
+> 保留为历史，新契约见
 > [`store-hook-contract.md`](store-hook-contract.md)。
 
 ## 0. 立项口径(边界,先说清楚)
@@ -1475,6 +1477,10 @@ store 的 `apply` 里逐刀切到 `swap`;CPU 面给 `swap` 的**循环等价实�
 `LegOps::ensure_evicted`:凡 `ensure_for_len` 内部触发了压力驱逐,就 +N(报告面可查)。
 语义 = **"需求驱动保洁不够用"的指纹**;需求驱动到位时它应恒为 0。
 
+> **2026-10-25 Phase 2 更新**：`ensure_for_len` 已改为纯分配，
+> `ensure_evicted` 成为**恒 0 回归 canary**；链登记容量驱逐改记
+> `tree_evicted`。`ensure_for_len` 不足时仍响亮 `Exhausted`。
+
 ### 17.5 演示台重做:冷热交替(真需求)
 
 旧演示台靠"H5 空转水位"造下沉(那正是 §12.4 批评的临时法);新场景**只靠真需求**:
@@ -2401,7 +2407,7 @@ pub fn plan_need(&self, need: Need, protect: &Protected) -> Verdict
 |---|---|
 | `hooks::plan`(只吃 KV 腿) | **删除**;能力并入 `plan_capacity` |
 | `Rel::plan_evict` + `EvictItem`/`EvictPlan` | **删除**(零调用点;其"两腿合并 + 策略出序"能力并入 `plan_need`) |
-| `KvStore::ensure_for_len` 同步驱逐 | **保留为兜底**,不是第二套判据:报告面 `ops.ensure_evicted > 0` = 调度器失职的**告警信号**(正常路径应恒 0) |
+| `KvStore::ensure_for_len` 同步驱逐 | **Phase 2 已删除**（2026-10-25）：改为纯分配，不足响亮 `Exhausted`；`ops.ensure_evicted` 是恒 0 canary，链登记容量驱逐改记 `tree_evicted` |
 
 ### 30.4 门(全绿)
 

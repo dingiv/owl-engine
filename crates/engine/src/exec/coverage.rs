@@ -717,8 +717,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         if n_sink > 0 {
             let hashes: Vec<ChainHash> = sink.iter().map(|(_, h, _)| *h).collect();
             let (blocks, pieces, tbl) = {
-                // FIXME(store-hook): 诊断/选择层直呼 plan_offload(非生产主路径);
-                // 契约上应走 StoreHook::Maintain/Acquire,或显式标为 diag-only。
+                // diag-only(store-hook): 选择层诊断直接取搬运计划，不走生产
+                // StoreHook；生产路径只经 pump/store_hook。
                 let p = owl_store::plan_offload_blocks(&mut self.bank.rel.leg, &hashes)?;
                 if p.skipped.len() > 0 {
                     owl_shared::log_warn!(
@@ -762,7 +762,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             // **S6**:盘上的块先读回宿主(与 phases.rs 同一口)
             let _ = self.ensure_host_resident(&hashes).await?;
             let (cs, slots, pieces, tbl) = {
-                // FIXME(store-hook): 诊断/选择层直呼 plan_onload(非生产主路径)。
+                // diag-only(store-hook): 同上；仅诊断/选择层探针。
                 let p = owl_store::plan_onload(&mut self.bank.rel.leg, &hashes)?;
                 (p.chains, p.slots, p.pieces, p.table)
             };

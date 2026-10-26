@@ -704,6 +704,10 @@ struct FixedAfter {
     gdn_grid: usize,
     /// GDN 快照池(同格 × snap_max)
     gdn_snap: usize,
+    /// **spec 快照缓冲**(独立于前缀快照池;`spec_mode != Off` 且 paged 时分配)
+    spec_snap: usize,
+    /// **query replay 回滚缓冲**(独立于 spec 快照;`query_replay` 且 paged 时分配)
+    replay_snap: usize,
     /// 图 slab 预算(见 [`GRAPH_SLAB_BUDGET`])
     graph_slab: usize,
     /// warmup 瞬态 + 杂项(见 [`WARMUP_MISC_BUDGET`])
@@ -719,11 +723,16 @@ impl FixedAfter {
         gdn_slot_elems: usize,
         snap_max: usize,
         draft_ring: usize,
+        spec_snap: bool,
+        replay_snap: bool,
     ) -> Self {
         let grid = n_gdn * gdn_slots * gdn_slot_elems * 4;
+        let snap_row = n_gdn * gdn_slot_elems * 4;
         FixedAfter {
             gdn_grid: grid,
-            gdn_snap: snap_max * n_gdn * gdn_slot_elems * 4,
+            gdn_snap: snap_max * snap_row,
+            spec_snap: if spec_snap { snap_row } else { 0 },
+            replay_snap: if replay_snap { snap_row } else { 0 },
             graph_slab: GRAPH_SLAB_BUDGET,
             warmup_misc: WARMUP_MISC_BUDGET,
             draft_ring,
@@ -731,15 +740,23 @@ impl FixedAfter {
     }
 
     fn total(self) -> usize {
-        self.gdn_grid + self.gdn_snap + self.graph_slab + self.warmup_misc + self.draft_ring
+        self.gdn_grid
+            + self.gdn_snap
+            + self.spec_snap
+            + self.replay_snap
+            + self.graph_slab
+            + self.warmup_misc
+            + self.draft_ring
     }
 
     fn explain(self) -> String {
         let mbf = |v: usize| v as f64 / 1048576.0;
         format!(
-            "gdn格 {:.0}MiB + gdn快照 {:.0}MiB + 图slab {:.0}MiB + warmup/杂项 {:.0}MiB + 草稿ring {:.0}MiB",
+            "gdn格 {:.0}MiB + gdn快照 {:.0}MiB + spec快照 {:.0}MiB + replay快照 {:.0}MiB + 图slab {:.0}MiB + warmup/杂项 {:.0}MiB + 草稿ring {:.0}MiB",
             mbf(self.gdn_grid),
             mbf(self.gdn_snap),
+            mbf(self.spec_snap),
+            mbf(self.replay_snap),
             mbf(self.graph_slab),
             mbf(self.warmup_misc),
             mbf(self.draft_ring)
@@ -838,7 +855,7 @@ impl StatePool {
         pool / self.geom.gdn_slots.max(1)
     }
 
-    /// **快照池字节**(E2c 静态预分配;固定面的一项,含 spec 快照缓冲)。
+    /// **快照池字节**(E2c 静态预分配;固定面的一项,含 spec / replay 快照缓冲)。
     // 调用约束:**池已装配之后**才可读(准入预算组装 `assemble_budget` / 预算探针);
     // 生产热路径不调。原 `#[cfg(any(test, feature = "e2e"))]` 门对前者过严(2026-10-19 合并)。
     pub(crate) fn snapshot_pool_bytes(&self) -> usize {
@@ -851,7 +868,11 @@ impl StatePool {
             .as_ref()
             .map(|s| s.bufs.iter().map(|b| b.1 * elem_bytes(b.0.dtype)).sum::<usize>())
             .unwrap_or(0);
-        pool + spec
+        let replay = self.draft.replay_snap
+            .as_ref()
+            .map(|s| s.bufs.iter().map(|b| b.1 * elem_bytes(b.0.dtype)).sum::<usize>())
+            .unwrap_or(0);
+        pool + spec + replay
     }
 
     /// **草稿池字节**(MTP 链 / DFlash2 ring;关 = 0)。DFlash2 自 2026-10-22
@@ -1817,6 +1838,9 @@ impl<'a> AllocCtx<'a> {
         let gdn_dbg = plan.gdn_dbg;
         let n_full = layer_types.iter().filter(|&&f| f).count();
         let n_gdn = layer_types.len() - n_full;
+        // 页宽策略只推导一次（FixedAfter 的 spec/replay 缓冲与后面的池几何共用）
+        let pol = kv_paged_policy(dims.dtype);
+        let paged = pol.is_some();
         owl_shared::log_info!("boot", "StatePool::alloc 进入(n_full={n_full} kv_fp8={kv_fp8})");
 
         // B6.5 显存硬预算治理(2026-10-10):池容量 =
@@ -1855,8 +1879,15 @@ impl<'a> AllocCtx<'a> {
         } else {
             0
         };
-        let fixed_after =
-            FixedAfter::of(n_gdn, gdn_slots, gdn_slot_elems, snap_max, draft_ring);
+        let fixed_after = FixedAfter::of(
+            n_gdn,
+            gdn_slots,
+            gdn_slot_elems,
+            snap_max,
+            draft_ring,
+            paged && plan.spec_mode != crate::spec_runtime::SpecMode::Off,
+            paged && plan.query_replay,
+        );
         let pool_cap = pool_cap(plan, &per_tok, &fixed_after);
         // ── 池容量:**手写值** 或 **自动 = 本档 ctx**(2026-10-21)──
         //
@@ -1925,12 +1956,11 @@ impl<'a> AllocCtx<'a> {
                 plan.seq_tokens
             ),
         }
-        let pol = kv_paged_policy(dims.dtype);
         // 单会话容量(页数)= 旧实现的池下限;`pool_overcommit` 关时仍按它钉住
         let seq_blocks = seq_tokens.div_ceil(pol.as_ref().map_or(1, |p| p.page).max(1));
-        let (page, x, nb, paged) = match &pol {
-            Some(p) => (p.page, p.x, seq_tokens.div_ceil(p.page), true),
-            None => (seq_tokens, 1usize, 1usize, false),
+        let (page, x, nb) = match &pol {
+            Some(p) => (p.page, p.x, seq_tokens.div_ceil(p.page)),
+            None => (seq_tokens, 1usize, 1usize),
         };
         // E2b 块池容量:pool_tokens 向上取整到页。
         //
@@ -2636,7 +2666,7 @@ mod vram_budget_tests {
             458 << 20,
             "桶退役后预算校准(2026-10-21:640→320)"
         );
-        let f = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1, 0);
+        let f = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1, 0, false, false);
         assert_eq!(f.gdn_grid, 155_713_536);
         assert_eq!(f.gdn_snap, 155_713_536);
         assert_eq!(f.graph_slab, 320 << 20, "图项 = 非桶图族 261 + 余量");
@@ -2644,9 +2674,14 @@ mod vram_budget_tests {
         assert_eq!(f.total(), 730_857_472 + (58 << 20), "fixed_after = 历史 400MiB + 图项 58MiB");
         // DFlash2 ring:固定项计入 total;2080 slots(65 页)×10240B/token
         let ring = 2080 * 10240;
-        let fr = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1, ring);
+        let fr = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1, ring, false, false);
         assert_eq!(fr.draft_ring, ring);
         assert_eq!(fr.total(), f.total() + ring);
+        // spec/replay 快照各是一整行 GDN 状态（此前漏账 ⇒ cap 虚高 4860 tok/份）
+        let fs = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1, 0, true, true);
+        assert_eq!(fs.spec_snap, fs.gdn_snap, "spec 快照 = 一行 GDN");
+        assert_eq!(fs.replay_snap, fs.gdn_snap, "replay 快照 = 一行 GDN");
+        assert_eq!(fs.total(), f.total() + 2 * fs.gdn_snap);
     }
 
     /// 草稿池几何单源:逐 token 项与分配项同一来源(原两处各写一遍)

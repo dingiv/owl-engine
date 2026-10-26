@@ -35,8 +35,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             let s = self.bank.sessions.session_mut(act.session_id)?;
             let before = s.block_table.len();
-            // FIXME(store-hook): H2 槽兜底旁路(DFlash2 target 预增长);
-            // 应改为 Acquire(Grow) 预留后纯分配。
+            // H2 已由 `step_need::generation_target`（DFlash2 = pos+2d+2）
+            // 预留；这里只纯分配。
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, fp + block)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
@@ -295,8 +295,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             let s = self.bank.sessions.session_mut(act.session_id)?;
             let before = s.block_table.len();
-            // FIXME(store-hook): H2 槽兜底旁路(DFlash2 target 跨页);
-            // 应改为 Acquire(Grow) 预留后纯分配。
+            // H2 已由 `step_need::generation_target` 覆盖；这里只纯分配。
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, pos + block)?;
             if s.block_table.len() != before {
                 let sid = act.session_id;
@@ -988,8 +987,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let bt = {
             let sid = self.turns.active()?.session_id;
             let s = self.bank.sessions.get_mut(sid).expect("账在");
-            // FIXME(store-hook): H2 槽兜底旁路(MTP propose 链);
-            // 应改为 Acquire(Grow) 预留后纯分配。
+            // MTP 腿 cache=Off、无宿主 ⇒ 本函数只做纯分配（无同步驱逐可收）；
+            // 长度由 target 的 `generation_target`（MTP = pos+2d）配对覆盖。
             self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, pos + m + depth)?;
             s.mtp_block_table.clone()
         };
@@ -1208,8 +1207,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     pub(crate) fn mtp_chain_bt(&mut self, cover: usize) -> Result<Vec<u32>> {
         let sid = self.turns.active()?.session_id;
         let s = self.bank.sessions.get_mut(sid).expect("账在");
-        // FIXME(store-hook): H2 槽兜底旁路(MTP 链覆盖);
-        // 应改为 Acquire(Grow) 预留后纯分配。
+        // MTP 腿 cache=Off ⇒ 纯分配；长度由 `generation_target`（MTP=pos+2d）
+        // 配对覆盖。
         self.bank.leg_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
         Ok(s.mtp_block_table.clone())
     }
@@ -1418,8 +1417,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let d = self.pool.geom.dims;
         let page = self.pool.geom.page;
         let bt = {
-            // FIXME(store-hook): H2 槽兜底旁路(MTP 批量行);
-            // 应改为 Acquire(Grow) 预留后纯分配。
+            // MTP 腿 cache=Off ⇒ 纯分配；prefill 的 target 长度由
+            // `step_need` 的 prefill 分支（fed+chunk）配对覆盖。
             bank.leg_mtp
                 .ensure_for_len(&mut bank.sessions.session_mut(sid)?.mtp_block_table, base + t_rows)?;
             bank.sessions.session(sid)?.mtp_block_table.clone()

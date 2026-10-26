@@ -1,16 +1,15 @@
 # Store 钩子契约（现状审计 + 三钩子收敛设计）
 
-> 2026-10-25。状态：**Phase 1 已落地**（行为保持；旧 `Node` 四变体已删除）。
+> 2026-10-25。状态：**Phase 1 + Phase 2 + Phase 3 + Phase 4 已落地**
+> （Phase 1 行为保持；Phase 2 纯分配；Phase 3 H3/H6 + 状态腿；
+> Phase 4 账目/压力触发）。
 > 目标：把 store 的“何时问、问什么、谁搬、搬完怎么记账”收成**一个契约**；
 > 把当前散在 engine 的 19 个 store 调用点收编为 **3 个语义钩子**。
 >
-> 代码标记：本文件配套的 `FIXME(store-hook)` 注释就是当前调用点清单；
-> 搜索该标记可得到全部待收编位置。Phase 1 后剩 **23 个标记** =
-> 12 个生产旁路（`ensure_for_len` 9 + spec `snap_*` 3）
-> + H3/H6 生命周期 + 结构性/诊断标记（N6、H1、coverage 等）。
+> 代码标记：**`FIXME(store-hook)` 已清零**。`coverage.rs` 的
+> `plan_offload/plan_onload` 是显式 `diag-only(store-hook)`，不进生产链路。
 >
-> **类型以 §7 的实施记录为准**；§3 的 `Acquire` 结构是草案，落地时已
-> 收敛为更小的 enum（`Acquire::Capacity(Need)` / `Acquire::Load(LoadRequest)`）。
+> **类型/实现以 §7–§10 为准**；§3 的 `Acquire` 结构是草案。
 
 ---
 
@@ -296,24 +295,43 @@ pub struct Maintain {
 
 实施细节与偏差见 §7。
 
-### Phase 2：消灭同步驱逐
+### Phase 2：消灭同步驱逐 —— ✅ 已完成（2026-10-25）
 
-- `ensure_for_len` 改为**纯分配**（不够 = `EngineInvariant`）；
-- `pump` 的 `Acquire(Grow)` 覆盖 prefill/decode/draft/MTP 的全部目标；
-- 门：`ops.ensure_evicted == 0`；任何非零 = Acquire 算少了。
+- `KvStore::ensure_for_len` / `BlockLeg::ensure_for_len` 改为**纯分配**；
+  不够 = 响亮 `Exhausted`（带「Acquire(Grow) 预留不足」文案）；
+- `step_need` 的生成相位改用 `generation_target`，覆盖 verify + 轮末
+  propose：DFlash2 `pos+2d+2` / MTP `pos+2d` / 裸 decode `pos+d+1`；
+- MTP 腿 `cache=Off`/无宿主，本来就不产生同步驱逐；其 3 个
+  `ensure_for_len` 已是纯分配，长度由 target 预留配对覆盖；
+- 门：`ops.ensure_evicted == 0`（现在是回归 canary；`register_chain_offloaded`
+  的树容量驱逐改记 `tree_evicted`）。
 
-### Phase 3：收编旁路
+实施细节与实测见 §8。
 
-- H4 `plan_onload` 进入 `Acquire(Load).load`；
-- spec `snap_onload/offload` 进入 `Acquire(State)` / `Maintain`；
-- H3/H6 进入 `Release`；
-- 删除 `Node` 的 4 个变体，只留 `StoreHook`。
+### Phase 3：收编生命周期与状态腿 —— ✅ 已完成（2026-10-25）
 
-### Phase 4：修触发与账目
+- H3 链登记/盘索引 + H6 表释放 + GDN 行归还 + 归属下行 + N4 全部进入
+  `StoreHook::Release(TurnEnd)`；弃置走 `Release(Abort)`（H6/N4 同款，
+  链不发布）；
+- 状态腿进入 `Acquire(State)`：
+  - `StateAcquire::Slot`：拍摄选槽（受害者沉宿主/丢弃）；
+  - `StateAcquire::Resident`：Gpu/Host/Disk 就位；
+- `spec.rs` 的 `snap_offload/onload` 只保留执行定义，生产直呼清零；
+- 收尾 grep 门（coverage 诊断例外）。
 
-- N6 去掉 `max(2*reserve, 1GiB)`，改 `reserve + headroom` 或只走 `Acquire`；
-- `FixedAfter` 补 `spec_snap` / `replay_snap`（账目先对，再谈容量）；
-- 统一 metrics：`store.hook.acquire.*` / `.release.*` / `.maintain.*`。
+实施细节与实测见 §9。
+
+### Phase 4：修触发与账目 —— ✅ 已完成（2026-10-25）
+
+- **删除 pump 的 N6**（驱动 free < 1GiB 触发）；`Maintain::Pressure` 只在
+  `PoolExhausted` 后的 `relieve_pressure` 使用，判据改成**池自由槽**，
+  并先 `trim_pools` 真还驱动；
+- `FixedAfter` 补 `spec_snap` / `replay_snap`（各 = 一行 GDN 状态）；
+  `snapshot_pool_bytes` 也补 replay；
+- Admission **保留两层**（批量策略 vs VRAM 地板），理由见 §5 Q1；
+- metrics label 用纯单测钉住；e2e 计数门未强制（全局 metrics 易串扰）。
+
+实施细节见 §10。
 
 ---
 
@@ -321,17 +339,23 @@ pub struct Maintain {
 
 1. **Admission 两套判决**：`turns.admission.decide`（策略）与 `Rel::check`
    （store 地板）是否合并为 `Acquire(Admit)` 一个出口？
-   **状态：未做（Phase 2）**；Phase 1 保持 `Need.why = Admit` + 原有两层判决。
+   **状态：已评审，保留两层**（Phase 4）：前者是批量状态机（会话守卫/槽位/
+   生成预算/退避），后者是单 turn VRAM 地板（dense floor/EvictThen）；
+   两者共享 store facts，但合并会把预算内部暴露给策略状态机。
 2. **Draft/MTP 增长**：并入 `step_need` 的上界，还是在 draft 前单独
    `Acquire(Grow)`？前者简单，后者精确。
-   **状态：未做（Phase 2）**；当前 5 个 `ensure_for_len` 仍是槽兜底。
+   **状态：已完成（Phase 2）**；采用前者：`step_need::generation_target`
+   用一个 pump 步的最远位预留，draft/MTP 的 `ensure_for_len` 只纯分配。
+   这样不在 draft 内新增钩子，避免同一轮两次问 store。
 3. **StateLeg 是否独立**：作为 `Acquire.snap_bytes` 的一维，还是单独
    `Acquire(State)` / `Maintain(State)`？建议先作为维度，不增加第 4 钩子。
-   **状态：未做（Phase 3）**；Phase 1 的 `Maintain::Pressure` 已带
-   `snap_bytes` 字段，但生产压力路径仍传 0。
+   **状态：已完成（Phase 3）**；采用 `Acquire::State(StateAcquire)`，
+   不增加第 4 个 top-level 钩子。`Maintain::Pressure` 的 `snap_bytes`
+   在 Phase 4 已接到 `relieve_pressure`（宿主有位时带一条快照目标）。
 4. **Pressure 是否保留**：固定池档如果“腾槽不增驱动 free”，是否只保留
    `Maintain(Idle)` + `Acquire` 的 Deny，删除 N6？
-   **状态：保留但未修（Phase 4）**；Phase 1 只改入口，1 GiB/`snap=0` 语义未动。
+   **状态：已关闭（Phase 4）**；删除 pump 的 N6 驱动-free 触发；
+   `Maintain::Pressure` 只在 `PoolExhausted` 后按池自由槽收缩。
 5. **TurnEnd 的 trim**：`trim_pools` 是 release 的一部分，还是单独的
    `Maintain(Trim)`？建议归 Release，避免第 4 钩子。
    **状态：已归 `Release`**（Phase 1 的 N4 实现内）。
@@ -342,15 +366,18 @@ pub struct Maintain {
 
 - **grep 门**：`plan_need` / `apply_verdict` / `plan_onload` / `snap_onload` /
   `snap_offload` 只出现在 `store_hook` 实现内；engine 其他位置零直呼。
-  **Phase 1 部分通过**：生产 `plan_need` / `apply_verdict` 已收进
-  `store_hook` 家族；`plan_onload` 仍有 `coverage.rs` 诊断直呼，
-  `snap_*` 仍在 spec 旁路（Phase 3 清零）。
+  **Phase 4 通过（生产面）**：`plan_need` / `apply_verdict` 只在
+  `store_hook` 家族；`plan_onload` 仅剩 `coverage.rs` 的 `diag-only`
+  诊断；`snap_onload/offload` 的调用只在 `running.rs` 的 store_hook 内
+  （`spec.rs` 仅保留执行定义）。`FIXME(store-hook)` = 0。
 - **无同步驱逐门**：生产 e2e 的 `ops.ensure_evicted == 0`；
-  非零即 Acquire 目标算少。**Phase 1 未动**（Phase 2）。
+  非零即有人把逐缓存重新塞回分配路径。**Phase 2 通过**：
+  纯分配实现 + store/engine 单测 + CPU mock + DFlash2/MTP 恒等门。
 - **钩子覆盖门**：每个 e2e 场景断言实际发生的
   `store.hook.{acquire,release,maintain}` 计数与预期一致。
   **Phase 1 已换 metrics 名**：`store.node.*` → `store.hook.*`；
-  计数门待 Phase 2 的 e2e 场景补。
+  Phase 4 用 `labels_are_stable` 钉住全部 label。e2e 计数断言未强制
+  （metrics 全局，多场景串扰；需要时单测里串行读）。
 - **状态机门**：`StoreHook` 只有 3 个变体；新增场景只能加 `kind`，
   不得新增第 4 个 top-level 钩子（除非另行评审）。**Phase 1 通过**。
 
@@ -408,15 +435,12 @@ pub(crate) struct StoreOutcome {
 `Node` enum 已删除，`store.node.*` metrics 已改名为
 `store.hook.{acquire,release,maintain}.*`。
 
-### 7.3 仍未收编（按 Phase）
+### 7.3 仍未收编（Phase 1 时点；后由 Phase 4 关闭）
 
-- **Phase 2**：`ensure_for_len` 9 个生产点（scheduler 3 / prefill 1 / draft 5）；
-  `pump` 的 `Acquire(Grow)` 要覆盖 draft/MTP 目标，之后 `ensure_for_len`
-  才能改成纯分配。
-- **Phase 3**：H3 `register_chain_owned`、H6 `release_turn_table`；
-  spec 的 3 个 `snap_*` 直呼。
-- **Phase 4**：N6 的 1 GiB 目标、`FixedAfter` 漏 `spec_snap/replay_snap`、
-  `store_hook` 覆盖门。
+- Phase 4 的 N6 / `FixedAfter` / admission 已在 §10 处理。
+
+> Phase 2 的 9 个 `ensure_for_len` 已收口；其中 3 个 MTP 点因腿
+> `cache=Off` 本来就不产生同步驱逐，未新增钩子。
 
 ### 7.4 验证
 
@@ -434,3 +458,267 @@ pub(crate) struct StoreOutcome {
 - 行为保持：H4 的回灌顺序、`note_stage_in` 计时起点、N4 的 trim/expire 时序、
   Idle 的 snap 目标计算均逐段保留。唯一可见变化是 metrics 名与
   `StoreHook` 单入口。
+
+---
+
+## 8. Phase 2 实施记录（2026-10-25）
+
+### 8.1 纯分配
+
+- `KvStore::ensure_for_len`：只做 `need = ceil(target/page)` 与 free 槽检查；
+  不再调用 `tree.evict_device`、不再 `drop_host_evicted`，返回 `StoreResult<()>`。
+- `BlockLeg::ensure_for_len`：只转发纯分配 + 链名错误映射；
+  `ops.ensure_evicted` 不再有任何自增点（回归 canary，恒 0）。
+- 错误文案：`KV 块池纯分配不足…Acquire(Grow) 预留不足（同步驱逐已删除…）`。
+- `register_chain_offloaded` 的 `cache_cap` 树驱逐改记 `LegOps::tree_evicted`，
+  不再污染 `ensure_evicted`。
+
+### 8.2 生成目标上界
+
+`RunningEngine::generation_target(pos)`（`running.rs`）：
+
+| 档位 | 公式 | 来源 |
+|---|---|---|
+| 裸 decode / Dumb | `pos + d + 1` | verify 行 |
+| MTP | `pos + 2d` | verify + 轮末 propose `pos+m+d`（m≤d） |
+| DFlash2 | `pos + 2d + 2` | propose `fp+block`，`fp=pos+m+1`、`block=d+1`、m≤d |
+
+`step_need` 的生成相位直接用该上界；`schedule`/`prefill`/draft/MTP 的
+`ensure_for_len` 都只消费已预留的 free 槽。
+
+MTP 腿是独立页池、`cache=Off`、`host_bytes=0`：其 `ensure_for_len` 从
+Phase 2 前就不会产生同步驱逐（树无可逐候选）。Phase 2 只验证其长度
+不超过 target 的配对上界，**不新增 draft 内钩子**（避免同一轮二次问 store）。
+
+### 8.3 9 个生产点归属
+
+| 点 | 归属 | 处理 |
+|---|---|---|
+| scheduler `decode_row_of` | target | 纯分配；`generation_target` 覆盖 |
+| scheduler `start_one` | target | 纯分配；H1/H2 预留覆盖 |
+| scheduler `decode` 相位 | target | 纯分配；`pos+spec+1` ≤ `generation_target` |
+| prefill `execute_prefill` | target | 纯分配；`fed+chunk` 预留覆盖 |
+| draft DFlash2 graph round | target | 纯分配；`pos+2d+2` 覆盖 |
+| draft DFlash2 eager propose | target | 纯分配；`pos+2d+2` 覆盖 |
+| draft MTP `mtp_chain_bt` | MTP | 本来就是纯分配（cache=Off）；长度配对覆盖 |
+| draft MTP `propose_graph_step` | MTP | 同上 |
+| draft MTP `prefill_extend` | MTP | 同上；`base+t_rows` 与 prefill 目标同源 |
+
+### 8.4 验证（本工作树）
+
+- `cargo test -p owl-store --lib -- --test-threads=1`：**136 passed / 0 failed**。
+- `cargo test -p owl-engine --lib -- --test-threads=1`：**158 passed / 0 failed**
+  （新增 `generation_target` 公式钉子）。
+- `cargo check -p server`：通过。
+- `OWL_CPU_MOCK=1 cargo test -p owl-engine --test store_admission_gate -- --test-threads=1`：
+  **6 passed / 0 failed**。
+- `OWL_CPU_MOCK=1 OWL_OFFLOAD_PROBE=1 OWL_E2E_ONLY=offload_probe \
+   cargo test -p owl-engine --features e2e --test engine_e2e -- --test-threads=1`：
+  **1 passed**；`回灌 2 块/1 命令 · 同步驱逐 canary 0`。
+- `OWL_TEST_DEVICE=42:00.0 OWL_E2E_ONLY=dflash2 \
+   cargo test -p owl-engine --features e2e --test engine_e2e -- --test-threads=1`：
+  **1 passed**；DFlash2 depth=7，15 轮，AL=1.40，greedy spec ≡ no-spec 逐位一致；
+  并断言 `ops.ensure_evicted == 0`。
+- `OWL_TEST_DEVICE=42:00.0 OWL_E2E_ONLY=spec_identity_gate_27b \
+   cargo test -p owl-engine --features e2e --test engine_e2e -- --test-threads=1`：
+  **1 passed**；MTP depth=3，13 轮 / sum_m=23，greedy spec ≡ no-spec 逐位一致；
+  并断言 `ops.ensure_evicted == 0`。
+- 测试改造：`kv/mod.rs` 的 4 个“靠 `ensure_for_len` 逐缓存”用例改为显式
+  `evict_cached` / `evict_device_cached`（测试专用），保留原判据；
+  `leg.rs` 的关宿主压力用例改为显式 `evict_cached(1)`。
+
+### 8.5 剩余（Phase 2 时点）
+
+- Phase 4 已在 §10 完成。
+
+---
+
+## 9. Phase 3 实施记录（2026-10-25）
+
+### 9.1 类型
+
+```rust
+// crates/engine/src/store_hook.rs
+pub(crate) enum Acquire {
+    Capacity(Need),
+    Load(LoadRequest),
+    State(StateAcquire),
+}
+
+pub(crate) enum StateAcquire {
+    Slot { key: SnapKey },      // 拍摄选槽（受害者沉宿主/丢弃）
+    Resident { key: SnapKey },  // Gpu/Host/Disk 就位
+}
+
+pub(crate) struct Release {
+    pub kind: ReleaseKind,      // TurnEnd | Abort
+    pub turn: u64,
+    pub session: u64,
+    pub gdn_slot: usize,
+    pub ephemeral: bool,
+}
+
+pub(crate) struct StoreOutcome {
+    pub applied: Applied,
+    pub loaded_blocks: usize,
+    pub state_slot: Option<u32>, // State 就位/选槽结果
+}
+```
+
+### 9.2 H3/H6 收编
+
+`StoreHook::Release` 现在按原 `complete`/`abandon_active` 的顺序执行：
+
+```text
+TurnEnd:
+  H3  register_chain_owned → write_chain_index → index_probe 排空
+  H6  burn_ephemeral / release_turn_table
+  GDN return_row
+  set_ctx_after_turn
+  N4  pool_sweep → report_unreturned → force_release → trim_pools
+Abort:
+  跳过 H3
+  H6  burn_ephemeral / release_turn_table（失败只 WARN，继续收尾）
+  GDN return_row（失败只 WARN）
+  set_ctx_after_turn
+  N4（失败只 WARN，跳过 trim）
+```
+
+`complete()` 只保留 `commit_turn` / `set_img_spans`，然后一次
+`Release(TurnEnd)`；`abandon_active()` 只保留墙钟 EWMA，然后一次
+`Release(Abort)`。H3/H6 的 FIXME 已清零。
+
+### 9.3 状态腿收编
+
+- `spec::snap_ensure_slot` / `snap_ensure_resident` 现在都是
+  `store_hook` 的**薄包装**：只负责取 `StoreOutcome.state_slot`；
+- `snap_offload` / `snap_onload` 仍是执行定义（在 `spec.rs`），但生产直呼
+  只在 `running.rs` 的 `store_state_slot` / `store_state_resident` 内；
+- `capture_gdn_snap` 的「选槽」也走 `StateAcquire::Slot`，因此实际收编
+  的是 **4 个**状态点（原审计的 3 个 `snap_*` + capture 的选槽）。
+
+### 9.4 验证
+
+- `cargo test -p owl-engine --lib -- --test-threads=1`：**159 passed / 0 failed**
+  （新增 `state_hook_slot_offload_and_resident_roundtrip`）。
+- `OWL_CPU_MOCK=1 cargo test -p owl-engine --test store_admission_gate`：
+  **6 passed / 0 failed**。
+- CPU offload probe：**1 passed**，H4 回灌 2 块/1 命令，canary 0。
+- DFlash2 / MTP 27B 恒等门：各 **1 passed**，canary 0。
+- `cargo check -p server`：通过。
+
+**已知预存失败（与本刀无关）**：`cpu_mock_state_leg_probe` 在
+`snap_max=1 + churn` 断言处失败（宿主 0 条）。在**主工作树基线**
+（Phase 3 前，`dc5194b3`）复跑同样失败，故判定为存量测试/配置漂移，
+不是状态钩子回归。本刀新增的 `state_hook_slot_offload_and_resident_roundtrip`
+直接覆盖了 `StateAcquire::Slot` + `Resident` 两条新路径。
+
+### 9.5 剩余（Phase 3 时点）
+
+- Phase 4 已在 §10 完成。
+
+---
+
+## 10. Phase 4 实施记录（2026-10-25）
+
+### 10.1 `FixedAfter` 补账
+
+`state.rs::FixedAfter` 新增两项：
+
+```text
+spec_snap   = spec_mode != Off && paged ? n_gdn × gdn_slot_elems × 4 : 0
+replay_snap = query_replay && paged     ? n_gdn × gdn_slot_elems × 4 : 0
+```
+
+两项各自等于**一行 GDN 状态**（27B ≈ 151.9 MiB）。此前：
+
+- `FixedAfter` 只算 `gdn_snap`（前缀快照池），漏掉 spec/replay；
+- `snapshot_pool_bytes` 只算 `spec_snap`，漏掉 replay。
+
+后果：`pool_cap` / `[ctx-max]` 虚高约 4,860 tok/份（27B），3090 档实际
+ctx 上限被高估。现在 `pool_cap` 与 `snapshot_pool_bytes` 都按真分配扣账。
+
+`fixed_after_matches_production_and_keeps_historical_total` 增加断言：
+`spec_snap == gdn_snap`、`replay_snap == gdn_snap`、total 增量 = 2×一行。
+
+### 10.2 N6 删除与 `Maintain::Pressure` 重定义
+
+- **删除 pump 的 N6**：不再按 `free < max(2×reserve, 1GiB)` 每拍触发；
+  固定池下沉不增加驱动 free，原逻辑只制造 churn。
+- `Maintain::Pressure` 只在 `PoolExhausted` 后的 `relieve_pressure` 使用：
+  1. 复用池排空（`drain_temp_pool`，真还驱动）；
+  2. `trim_pools` 把已 free 缓存页还驱动；
+  3. 按**池自由槽**算目标：`target = clamp(total/8, 1, 64)`，
+     `slots = target − free`；宿主有位且设备上有快照时带一条 `snap_bytes`；
+  4. 一次 `Maintain::Pressure { slots, snap_bytes }`（两腿）。
+- `StoreHook::pressure_with_snap` 是唯一构造；旧 `pressure(slots)` 删除
+  （pump 不再用，避免死代码）。
+- server actor 的注释已同步为“池排空 + trim + Maintain(Pressure)”。
+
+### 10.3 Admission 两层判决（评审结论：保留）
+
+- `scheduler::admission.decide` = **批量准入策略**：同会话守卫、槽位上限、
+  生成预算、newcomer reserve、退避；
+- `admission_gate` 的 `Rel::check` = **单 turn VRAM 地板**：dense floor /
+  `EvictThen` / `Queue` / `Reject`；
+- 两者共享 `StoreFacts`，但判据不同；合并会把 `Budget/Admission` 内部
+  暴露给策略状态机，收益低、回归面大 ⇒ **不合并**，只在注释中写明分工。
+- 原 H1 的两个 `FIXME(store-hook)` 已删除；`FIXME(store-hook)` 全局归零。
+
+### 10.4 metrics
+
+- `store_hook::label_tests::labels_are_stable` 钉住全部 9 个 label：
+  `acquire.admit/grow/load/state.slot/state.resident`、
+  `release.turn_end/abort`、`maintain.idle/pressure`。
+- e2e 的“每个场景断言计数”未强制：metrics 是进程全局，并行/多场景会串扰；
+  需要时在单测里串行读。当前以 label 稳定 + 单 hook 入口为门。
+
+### 10.5 验证
+
+- `cargo test -p owl-engine --lib -- --test-threads=1`：**160 passed / 0 failed**
+  （新增 `labels_are_stable`）。
+- `OWL_CPU_MOCK=1 cargo test -p owl-engine --test store_admission_gate`：
+  **6 passed / 0 failed**。
+- CPU offload probe：**1 passed**，H4 回灌 2 块/1 命令，canary 0。
+- DFlash2 / MTP 27B 恒等门：各 **1 passed**，canary 0。
+- `cargo check -p server`：通过。
+- 预存 `cpu_mock_state_leg_probe` 失败仍与本刀无关（主树基线同样失败，
+  见 §9.4）。
+
+### 10.6 剩余
+
+- 无阻塞项；`FIXME(store-hook)` = 0。
+- 可选后续：e2e `store.hook` 计数断言（串行 metrics 场景）、
+  `cpu_mock_state_leg_probe` 存量修复独立案。
+
+---
+
+## 11. 2026-10-26 接管收尾：rebase 到 main
+
+Phase 1–4 的 WIP 原先停在 `dc5194b3`（落后 main 12 个提交）。本轮已 rebase 到
+`a23eae04`，只解两处冲突：
+
+- `running.rs`：保留 main 的 `NeedWhy::Idle` 守卫，同时按 Phase 4 删除 pump N6；
+- `docs/README.md`：同时保留 leave-gap 交接条目与本文“Phase 1–4 complete”。
+
+rebase 后复验（2026-10-26）：
+
+```text
+cargo test -p owl-engine --lib -- --test-threads=1     168 passed / 0 failed
+cargo test -p owl-store  --lib -- --test-threads=1     136 passed / 0 failed
+OWL_CPU_MOCK=1 cargo test -p owl-engine --test store_admission_gate
+                                                        6 passed / 0 failed
+OWL_CPU_MOCK=1 OWL_OFFLOAD_PROBE=1 OWL_E2E_ONLY=cpu_mock_offload_probe
+                                                        1 passed（H4 回灌 2 块/1 命令）
+OWL_E2E_ONLY=gpu_image_evict_gate                       1 passed
+OWL_E2E_ONLY=gpu_image_evict_spec_identity_gate         1 passed
+OWL_E2E_ONLY=gpu_spec_identity_gate                     1 passed（DFlash2/0.8B）
+cargo check -p server                                   passed
+```
+
+**未复验**：27B DFlash2 / MTP 恒等门。当前 3090 卡被其他进程占用（约
+13.7 GiB/卡），无法给 27B 双卡/单卡测试留出足够余量；Phase 4 时点曾各
+1 passed。待卡空闲后补跑。
+
+`FIXME(store-hook)` 仍为 0；生产面直呼 `plan_need` / `plan_onload` / `snap_*`
+已收口到 `store_hook`，`coverage.rs` 的 `plan_*` 保持显式 diag-only。

@@ -153,62 +153,28 @@ impl KvStore {
         target_len.div_ceil(self.block_tokens)
     }
 
-    /// 块表增长至覆盖 `target_len` token(**只增不减、幂等、事务性**)。
+    /// 块表增长至覆盖 `target_len` token(**纯分配、只增不减、幂等**)。
     ///
-    /// 池不足时先逐前缀缓存叶(≤4 轮,与 engine 现版同),仍不足 = 结构性
-    /// 响亮拒,且**不留半截块表**(调用方可安全重试)。
+    /// 池不足 ⇒ 响亮 `Exhausted`，**不再在这里逐缓存**。腾位是 engine 的
+    /// `StoreHook::Acquire(Grow)` 职责；本函数只消费已预留的 free 槽。
+    /// 这样正常路径没有第二套决策，`ops.ensure_evicted` 应恒为 0。
     ///
-    /// 返回:被逐出的缓存条目(内容身份, 设备槽 `None` = host 承载)。
-    /// 上层须为 host 条目丢掉 host 副本(`Rel` 职责 —— store 不做跨层副作用)。
-    // FIXME(store-hook): 同步驱逐是第二套决策路径;新版只保留纯分配,
-    // 需求侧先走 StoreHook::Acquire(Grow)。
+    /// 容量检查失败**不留半截块表**（调用方可安全重试）。
     pub fn ensure_for_len(
         &mut self,
         table: &mut Vec<u32>,
         target_len: usize,
-    ) -> StoreResult<Vec<(ChainHash, Option<u32>)>> {
+    ) -> StoreResult<()> {
         let need = self.blocks_for(target_len);
         if need <= table.len() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let delta = need - table.len();
-        let mut evicted = Vec::new();
-        if self.pool.free() < delta {
-            // **缓存叶逐出:逐到够为止**(2026-10-19 修,`prefix_cache` 闭环必路)。
-            //
-            // 旧实现写死 `passes < 4`:当时只想到"池里散着几条叶"。**单链前缀
-            // 缓存里只有尾块是叶**(每个块都有子链),逐一条尾块后它的父才变叶
-            // ⇒ **每趟最多腾 1 槽**。于是长链一改(agent 编辑/压缩历史)就变成:
-            // 需 419 页、空闲 306 ⇒ 4 趟只腾 4 页 ⇒ 响亮拒"真实容量不足"——
-            // 而实际上缓存里就势着 222 页可逐(实测 13k tok prompt 改一句话必 500)。
-            //
-            // 终止条件 = 够用 ‖ **真的无可逐**(`evict_device` 返回空 = 池里
-            // 只剩会话/活跃面,那是真容量不足)。不再用趟数当终止(它是伪边界)。
-            loop {
-                if self.pool.free() >= delta {
-                    break;
-                }
-                let shortage = delta - self.pool.free();
-                // 腾**设备槽**只逐设备叶:host 叶被逐不腾槽却丢内容(§16 定谳)
-                let batch = self.tree.evict_device(shortage);
-                if batch.is_empty() {
-                    break;
-                }
-                for (chain, slot) in &batch {
-                    if let Some(slot) = slot {
-                        // 缓存那一份引用随绑定一起还(会话持有的引用不动)
-                        self.pool.decref(*slot)?;
-                    }
-                    let _ = chain;
-                }
-                self.evicted += batch.len() as u64;
-                evicted.extend(batch);
-            }
-        }
         if self.pool.free() < delta {
             return Err(StoreError::Exhausted(format!(
-                "KV 块池耗尽:需 {need} 块,空闲 {},table={} —— 缓存压力驱逐后仍不足 \
-                 = 真实容量不足(降并发/上下文,或调大池容量)",
+                "KV 块池纯分配不足:需 {need} 块,空闲 {},table={} —— \
+                 Acquire(Grow) 预留不足(同步驱逐已删除；先走 store_hook 腾位，\
+                 真容量不足则准入应拒)",
                 self.pool.free(),
                 table.len()
             )));
@@ -216,7 +182,7 @@ impl KvStore {
         for _ in 0..delta {
             table.push(self.pool.acquire()?);
         }
-        Ok(evicted)
+        Ok(())
     }
 
     /// 归还会话整条块表(逆序减引用;共享块自然只剩减引用)。
@@ -753,6 +719,19 @@ mod tests {
         KvStore::new(slots, crate::id::TOKENS_PER_BLOCK, 1 << 20, cap)
     }
 
+    /// 显式逐设备叶（测试专用）。Phase 2 后 `ensure_for_len` 不再逐缓存；
+    /// 需要造槽的用例显式走这条等价路径。
+    fn evict_device_cached(m: &mut KvStore, n: usize) -> Vec<(ChainHash, Option<u32>)> {
+        let batch = m.tree.evict_device(n);
+        for (_, slot) in &batch {
+            if let Some(slot) = slot {
+                m.pool.decref(*slot).expect("逐出设备叶");
+            }
+        }
+        m.evicted += batch.len() as u64;
+        batch
+    }
+
     /// **B-3e-2 第 2b 项**:增量登记(从已注册链尾续挂)≡ 全量登记 ——
     /// 命中面/块数/树引用账三件必须一致(否则"轮内登记"就是第二套身份语义)。
     #[test]
@@ -853,7 +832,7 @@ mod tests {
         let mut table = Vec::new();
         let err = m.ensure_for_len(&mut table, 100).expect_err("池不足必须拒");
         assert!(matches!(err, StoreError::Exhausted(_)), "得 {err:?}");
-        assert!(format!("{err}").contains("真实容量不足"), "{err}");
+        assert!(format!("{err}").contains("纯分配不足"), "{err}");
         assert!(table.is_empty(), "事务性:失败不留半截块表");
         assert_eq!(m.slots_free(), 2);
     }
@@ -882,12 +861,13 @@ mod tests {
         m.release_table(&mut ta).expect("归还 A(缓存持引 ⇒ 块不回池)");
         assert_eq!(m.slots_free(), 0, "缓存应持有全部 8 块");
 
-        let mut tb = Vec::new();
-        let evicted = m.ensure_for_len(&mut tb, 8 * 32).expect("压力驱逐后放行");
+        let evicted = m.evict_cached(8).expect("显式逐缓存");
         assert_eq!(evicted.len(), 8, "逐出的正是 A 的 8 块");
+        let mut tb = Vec::new();
+        m.ensure_for_len(&mut tb, 8 * 32).expect("纯分配放行");
         assert_eq!(tb.len(), 8);
         let err = m.ensure_for_len(&mut tb, 9 * 32).expect_err("真耗尽");
-        assert!(format!("{err}").contains("真实容量不足"), "{err}");
+        assert!(format!("{err}").contains("纯分配不足"), "{err}");
     }
 
     #[test]
@@ -972,8 +952,10 @@ mod tests {
 
         // B:更大的链压进来 ⇒ 缓存被逐、槽回池并被复用
         let toks_b: Vec<u32> = (500..516).collect(); // 4 块
+        let evicted = m.evict_cached(2).expect("显式逐缓存");
+        assert_eq!(evicted.len(), 2, "先腾出 A 的两块");
         let mut tb = Vec::new();
-        m.ensure_for_len(&mut tb, 16).expect("B 块表(压力驱逐放行)");
+        m.ensure_for_len(&mut tb, 16).expect("纯分配放行");
         assert!(tb.contains(&a_tail_slot), "前提:槽 {a_tail_slot} 确实被复用(tb={tb:?})");
         m.register_chain(&toks_b, &tb).expect("B 登记缓存");
 
@@ -1062,12 +1044,13 @@ mod tests {
         m.release_table(&mut tb).expect("B 归还");
         assert_eq!(m.slots_free(), 0, "A头 + B两块 = 3 槽满");
 
-        // 增长 1 块 ⇒ 驱逐:A 尾(host 叶,LRU 更老)必须被跳过,逐 B 尾
-        let mut tc = Vec::new();
-        let evicted = m.ensure_for_len(&mut tc, 32).expect("腾槽后放行");
+        // 增长 1 块 ⇒ 显式逐设备叶:A 尾(host 叶,LRU 更老)必须被跳过,逐 B 尾
+        let evicted = evict_device_cached(&mut m, 1);
         assert_eq!(evicted.len(), 1, "只需要一个槽:{evicted:?}");
         assert_eq!(evicted[0].0, tail_b, "逐的是设备叶(B 尾)");
-        assert_eq!(m.locate(tail_a), Some(Tier::Host), "host 叶不得被腾槽驱逐逐掉");
+        assert_eq!(m.locate(tail_a), Some(Tier::Host), "host 叶不得被逐设备路径逐掉");
+        let mut tc = Vec::new();
+        m.ensure_for_len(&mut tc, 32).expect("纯分配");
         assert_eq!(tc.len(), 1);
     }
 
@@ -1124,17 +1107,17 @@ mod tests {
         assert!(leaf_has(&m, d1), "摘掉孩子 ⇒ d1 自动变叶 ⇒ 可回收");
         assert!(!leaf_has(&m, fork_h), "F 仍有活孩子 s ⇒ 不该变叶");
 
-        // 逼一次容量驱逐:要的块数 = 当前空槽 + 1 ⇒ 必须逐 1 个叶
+        // 逼一次容量驱逐:要的块数 = 当前空槽 + 1 ⇒ 显式逐 1 个设备叶
         let free = m.slots_free();
-        let mut extra = Vec::new();
-        let evicted = m
-            .ensure_for_len(&mut extra, (free + 1) * crate::id::TOKENS_PER_BLOCK)
-            .expect("腾槽");
+        let evicted = evict_device_cached(&mut m, 1);
         assert!(!evicted.is_empty(), "必须发生驱逐(空槽 {free})");
         assert_eq!(evicted[0].0, d1, "收的必须是死枝 d1(叶 + 更冷),不是活链 s");
         assert_eq!(m.locate(d1), None, "死枝 d1 已被回收");
         assert!(m.locate(s).is_some(), "活链 s 一根不动");
         assert!(m.locate(fork_h).is_some(), "分叉点 F 不动");
+        let mut extra = Vec::new();
+        m.ensure_for_len(&mut extra, (free + 1) * crate::id::TOKENS_PER_BLOCK)
+            .expect("纯分配");
     }
 
     /// 叶级候选面(驱逐/退化下沉)**仍只出叶**且 protect 有效。

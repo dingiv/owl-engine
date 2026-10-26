@@ -8,8 +8,8 @@
 //!    `Reject` ⇒ `TurnEvent::Failed` 带数字,**且文案不带 "超预算"**
 //!    (那是 context-overflow 专用标记,服务面据此触发客户端 compact;
 //!    池墙拒是另一类,客户端该降并发/重试);
-//! ③ **不靠兜底**:全程 `ops.ensure_evicted == 0`(需求驱动/准入判决到位时,
-//!    同步兜底驱逐应为空 —— §17.4 的指纹)。
+//! ③ **分配路径无同步驱逐**:Phase 2 后 `ensure_for_len` 纯分配 ⇒
+//!    `ops.ensure_evicted` 是恒 0 canary；本门同时验证 H1 先腾后进。
 //!
 //! **档位包络(必须说清)**:本档跑在 CPU mock 上,只吃**单 prefill chunk**
 //! (prompt ≤ `prefill_chunk` = 32 tok)—— 多 chunk 的真前向是 §18.5.1 的
@@ -195,7 +195,7 @@ async fn cold_cache_is_offloaded_before_the_new_turn_is_admitted() {
     let (ev2, n2) = run_turn(&mut running, None, 100, WORDS, 32).await;
     let r2 = running.leg_stats();
     eprintln!(
-        "[gate] 轮 2: prompt={n2} tok · 换出 {}(+{}) 条 · 回灌 {} · 兜底驱逐 {} · 宿主 {}/{} 槽",
+        "[gate] 轮 2: prompt={n2} tok · 换出 {}(+{}) 条 · 回灌 {} · 同步驱逐 canary {} · 宿主 {}/{} 槽",
         r2.ops.offloads,
         r2.ops.offloads - off_before,
         r2.ops.onloads,
@@ -209,7 +209,7 @@ async fn cold_cache_is_offloaded_before_the_new_turn_is_admitted() {
         "轮 2 准入应触发**主动下沉**(EvictThen),实际未搬:{}",
         r2.ops.offloads
     );
-    assert_eq!(r2.ops.ensure_evicted, 0, "应走判决腾位,而不是同步兜底驱逐");
+    assert_eq!(r2.ops.ensure_evicted, 0, "应走判决腾位;同步驱逐 canary 必须为 0");
     assert_eq!(running.store_report().active_turns, 0, "turn 终了应还保留额");
 }
 
@@ -261,14 +261,14 @@ async fn idle_sessions_hold_nothing_so_the_wall_becomes_evictable() {
     let (ev, n) = run_turn(&mut running, Some(9), 1800, WORDS, 12).await;
     let leg2 = running.leg_stats();
     eprintln!(
-        "[gate] 第九会话: prompt={n} tok · 换出 {}(+{}) · 兜底驱逐 {} ⇒ {ev:?}",
+        "[gate] 第九会话: prompt={n} tok · 换出 {}(+{}) · 同步驱逐 canary {} ⇒ {ev:?}",
         leg2.ops.offloads,
         leg2.ops.offloads - off_before,
         leg2.ops.ensure_evicted
     );
     assert!(matches!(ev, TurnEvent::Completed { .. }), "应先腾后进(不再拒):{ev:?}");
     assert!(leg2.ops.offloads > off_before, "腾位应真下沉(宿主面开着)");
-    assert_eq!(leg2.ops.ensure_evicted, 0, "应走判决腾位,而不是同步兜底驱逐");
+    assert_eq!(leg2.ops.ensure_evicted, 0, "应走判决腾位;同步驱逐 canary 必须为 0");
     assert_eq!(running.store_report().active_turns, 0, "turn 终了应还保留额");
 }
 

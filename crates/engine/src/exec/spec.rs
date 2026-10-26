@@ -2156,77 +2156,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         Ok(())
     }
 
-    /// **快照落设备槽**(S2 §25.2;编排:store 出计划 → `face.swap` → 记账)。
-    ///
-    /// - 同 key 已在设备 ⇒ 原地槽(幂等重拍);
-    /// - 空槽 ⇒ 直接用;
-    /// - 池满 ⇒ 最冷的设备快照**先下沉**(内容留);宿主满/关 ⇒ 丢(丢 = 状态没了,
-    ///   下次该边界不可复用 —— 与旧行为同,但现在有账可查);
-    /// - 池关(`snap_max = 0`)⇒ 结构性拒(调用方已先行跳过)。
-    pub(crate) async fn snap_ensure_slot(&mut self, key: owl_store::SnapKey) -> Result<u32> {
-        use crate::state::SnapSlotPick;
-        // **判据 = store(唯一产地;§30.6-②)**:出序(事实档 + EvictPolicy)从
-        // `Rel::snap_victim_order` 拿;池只做 key→槽映射。旧实现在池内自带
-        // `rank + LRU` = 第二套规范(与容量调度可能各说各话)。
-        let order = self.bank.rel.snap_victim_order(&[]);
-        let pick = self.dev.pool.snap_pick_slot(key, &order).ok_or_else(|| {
-            owl_iface::contract::ModelError::Msg(
-                "GDN 快照池为空(snap_max = 0):调用方应跳过 capture".into(),
-            )
-        })?;
-        match pick {
-            SnapSlotPick::Hit(slot) | SnapSlotPick::Free(slot) => Ok(slot),
-            SnapSlotPick::Victim(slot, victim) => {
-                // **生成段(Transient)= 逐出即丢**:store 的不变量本就拒它下沉
-                // ⇒ 试了只会换来一条“失败”WARN(把设计行为报成故障)。
-                // 2026-10-19 pi 真机实测:一次会话 9 条。
-                let transient = matches!(
-                    self.bank.rel.state.snap_durability(victim),
-                    Some(owl_store::SnapDurability::Transient)
-                );
-                if transient {
-                    owl_shared::log_debug!(
-                        "store",
-                        "逐出生成段快照 {victim:?}(逐出即丢,不下沉)"
-                    );
-                } else {
-                    // FIXME(store-hook): H7 状态腿旁路(snapshot victim → host);
-                    // 应归 StoreHook::Maintain(State) / Release,不直呼 snap_offload。
-                    match self.snap_offload(victim, slot).await {
-                        Ok(()) => {
-                            self.dev.pool.snap_clear_slot(slot);
-                            if let Some(pr) = self.peer.as_mut() {
-                                pr.pool.snap_clear_slot(slot);
-                            }
-                            return Ok(slot);
-                        }
-                        Err(e) => {
-                            // 收编为结构化 WARN(2026-10-18 T1;原为 `DBG-SNAP` 直接打印)
-                            owl_shared::log_warn!("store", "快照下沉失败: {e}");
-                        }
-                    }
-                }
-                // 沉不下 ⇒ 丢(内容整体消失;宿主副本同步丢)
-                owl_shared::log_debug!(
-                    "store",
-                    "快照槽满且宿主不可用 ⇒ 丢弃最冷快照 {victim:?}(该边界将不可复用)"
-                );
-                self.bank.rel.drop_snap_host(victim)?;
-                if let Err(e) = self.bank.rel.state.drop_snap(victim) {
-                    owl_shared::log_debug!("store", "快照 {victim:?} 出账: {e}");
-                }
-                owl_shared::metrics::with_metrics_store(|m| {
-                    m.counter_add("store.snap.drop", 1, file!(), line!());
-                });
-                self.dev.pool.snap_clear_slot(slot);
-                if let Some(pr) = self.peer.as_mut() {
-                    pr.pool.snap_clear_slot(slot);
-                }
-                Ok(slot)
-            }
-        }
-    }
-
     /// **快照下沉**(设备槽 → 宿主;一条 swap 搬 N 片)。
     ///
     /// ⚠️ 宿主梯满时由 **store 政策**先逐最冷条目(见 `plan_snap_offload`)——
@@ -2315,43 +2244,38 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         Ok(())
     }
 
-    /// **快照就位到设备**(restore 前置;§25.2):设备层 ⇒ 原槽;宿主层 ⇒
-    /// 先找槽再回灌;不在账 ⇒ 结构性拒(该边界不可复用,调用方应已裁掉)。
+    /// **为一次快照拍摄选设备槽**（Phase 3）：池满时的受害者下沉/丢弃
+    /// 全部在 `StoreHook::Acquire(State::Slot)` 内完成。
+    pub(crate) async fn snap_ensure_slot(
+        &mut self,
+        key: owl_store::SnapKey,
+    ) -> Result<u32> {
+        let out = self
+            .store_hook(crate::store_hook::StoreHook::state_slot(key))
+            .await?;
+        out.state_slot.ok_or_else(|| {
+            ModelError::EngineInvariant {
+                what: format!("Acquire(State::Slot) 未返回快照槽: {key:?}"),
+            }
+        })
+    }
+
+    /// **快照就位到设备**（restore 前置；§25.2）。
+    ///
+    /// Phase 3 起只经 `StoreHook::Acquire(State)`：Gpu 命中 / Host 回灌 /
+    /// Disk→Host→Device 两跳、受害者下沉/丢弃全部在 store hook 内完成。
     pub(crate) async fn snap_ensure_resident(
         &mut self,
         key: owl_store::SnapKey,
     ) -> Result<u32> {
-        match self.bank.rel.state.locate(key) {
-            Some(owl_store::Tier::Gpu) => {
-                let slot = self.dev.pool.snap_slot_of(key).ok_or_else(|| {
-                    owl_iface::contract::ModelError::Msg(format!(
-                        "快照 {key:?} 账在设备层但池里找不到槽(账目不平)"
-                    ))
-                })?;
-                // 使用即触达(store 出序的真源)
-                self.bank.rel.state.touch(key);
-                Ok(slot)
+        let out = self
+            .store_hook(crate::store_hook::StoreHook::state(key))
+            .await?;
+        out.state_slot.ok_or_else(|| {
+            ModelError::EngineInvariant {
+                what: format!("Acquire(State) 未返回快照槽: {key:?}"),
             }
-            Some(owl_store::Tier::Host) => {
-                let slot = self.snap_ensure_slot(key).await?;
-                // FIXME(store-hook): H7 状态腿旁路(host → device);
-                // 应归 StoreHook::Acquire(State)。
-                self.snap_onload(key, slot).await?;
-                Ok(slot)
-            }
-            Some(owl_store::Tier::Disk) => {
-                // **S6**:盘 → 宿主 → 设备(两跳);读回后层账回 Host,再走 Host 分支
-                self.fill_snap_from_disk(key).await?;
-                let slot = self.snap_ensure_slot(key).await?;
-                // FIXME(store-hook): H7 状态腿旁路(disk → host → device);
-                // 应归 StoreHook::Acquire(State)。
-                self.snap_onload(key, slot).await?;
-                Ok(slot)
-            }
-            None => Err(owl_iface::contract::ModelError::Msg(format!(
-                "快照 {key:?} 不在账(已被逐出)"
-            ))),
-        }
+        })
     }
 
     /// 取本 turn 已喂入 KV 的 token 段 `[lo, hi)`(= `prompt_ids ++ out`)。

@@ -360,8 +360,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         let grew = {
             let s = self.bank.sessions.session_mut(sid)?;
             let before = s.block_table.len();
-            // FIXME(store-hook): H2 槽兜底旁路(decode_row_of);
-            // 应改为 pump 的 Acquire(Grow) 预留后纯分配。
+            // H2 已由 pump 的 Acquire(Grow) 预留；这里只纯分配
+            // (`generation_target` 覆盖 verify+propose)。
             self.bank
                 .rel
                 .leg
@@ -579,8 +579,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 } else {
                     turn.prompt_ids.len()
                 };
-                // FIXME(store-hook): H2 槽兜底旁路(start_one);
-                // 应改为 Acquire(Grow) 预留后纯分配。
+                // H1/H2 已由 pump 的 Acquire(Admit/Grow) 预留；这里只纯分配。
                 self.bank.rel.leg.ensure_for_len(&mut s.block_table, target)?;
             }
             let begin = BeginPlan {
@@ -1455,8 +1454,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let s = self.bank.sessions.session_mut(sid)?;
             let need = pos + spec + 1;
             let before = s.block_table.len();
-            // FIXME(store-hook): H2 槽兜底旁路(decode 相位);
-            // 应改为 Acquire(Grow) 预留后纯分配。
+            // H2 已由 pump 的 Acquire(Grow) 预留；这里只纯分配。
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, need)?;
             let grew = s.block_table.len() != before;
             let page = self.dev.pool.geom.page;

@@ -438,7 +438,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .sessions
                 .get_mut(sid)
                 .ok_or_else(|| ModelError::Msg("prefill 块表增长:会话账不在场".into()))?;
-            // FIXME(store-hook): H2 槽兜底旁路;应改为 Acquire(Grow) 预留后纯分配。
+            // H2 已由 pump 的 Acquire(Grow) 预留；这里只纯分配。
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, need)?;
         }
         // ── 主机侧事实(唯一取值点;两 rank 共用)────────────────────────
