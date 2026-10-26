@@ -68,6 +68,10 @@ pub(crate) struct GraphFleet<D: DeviceClient> {
     /// DFlash2 propose 单图(E5-DF4;encode 全 W 行 + 噪声块 + selector,
     /// W=K+1 运行时定形;None = eager 回退)
     pub dflash: Option<GraphPlan<D>>,
+    /// **切档 propose 收割图**(2026-10-26 propose 刀3;仅 rank0 建):
+    /// 两半候选合并核 + selector 全在设备侧,输出 = select 单缓冲(前 K = drafts)。
+    /// None = 回落 host 合并 + eager select(`dflash_select_merged`)。
+    pub dflash_select: Option<GraphPlan<D>>,
 }
 /// **臂事实**(2026-10-19 审查):boot 自证行原先只报"**面**登记"(`FI 节点登记=true`),
 /// 而**臂**由 models 侧顺序决定 —— 两者可以不一致(实测:flavor `verify_fi=true`
@@ -371,6 +375,18 @@ impl<D: DeviceClient> GraphFleet<D> {
         } else {
             None
         };
+        // ③c **切档 propose 收割图**(刀3;仅 rank0 且词表切档):
+        // 吃 dflash 图的 topk/sel_proj 输出块(刀2 已验证 of_block 这条路)
+        // + peer 候选输入槽 ⇒ 图内合并 + selector,输出 select 单缓冲。
+        let dflash_select = match (dflash.as_ref(), boot.spec.drafter.as_ref()) {
+            (Some(dg), Some(Drafter::DFlash2(_)))
+                if boot.model.logits_vocab() != boot.model.vocab_size()
+                    && boot.tp.as_ref().map(|t| t.plan.rank()).unwrap_or(0) == 0 =>
+            {
+                Self::plan_dflash_select(dg, &mut extra_faces, &boot, t0).await?
+            }
+            _ => None,
+        };
         // ③.5 **合批 decode 图**(B5.1 M1b):T = max_batch 定形,行 = 会话。
         // 捕获失败只降级本环(eager 臂仍在执行器里),不连锁。
         let batch = if boot.knobs.max_batch > 1 {
@@ -448,7 +464,8 @@ impl<D: DeviceClient> GraphFleet<D> {
             let n_fold: usize = depth_graphs.iter().map(|g| g.fold.len()).sum();
             let n_propose: usize = depth_graphs.iter().map(|g| g.propose.len()).sum();
             let df = dflash.as_ref().map(|g| g.slab_bytes()).unwrap_or(0);
-            let total = s + v + fo + pr + df;
+            let dfs = dflash_select.as_ref().map(|g| g.slab_bytes()).unwrap_or(0);
+            let total = s + v + fo + pr + df + dfs;
             owl_shared::log_info!(
                 "boot",
                 "slab 总账:session {}MiB + verify {}MiB + fold {}MiB({}) + propose {}MiB({}) + dflash {}MiB = {}MiB(Σ 已捕获图)‖ 引擎账 vram::live={}MiB(含池/权重/全部真分配)",
@@ -458,7 +475,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 n_fold,
                 mb(pr),
                 n_propose,
-                mb(df),
+                mb(df + dfs),
                 mb(total),
                 owl_shared::vram::live_bytes() >> 20,
             );
@@ -492,6 +509,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             depths: depth_graphs,
             batch,
             dflash,
+            dflash_select,
         })
     }
 
@@ -1584,6 +1602,131 @@ impl<D: DeviceClient> GraphFleet<D> {
             }
             other => {
                 owl_shared::log_info!("boot", "dflash propose 图降级({other:?})→ eager propose");
+                Ok(None)
+            }
+        }
+    }
+
+    /// ③c **切档 propose 收割图**(2026-10-26 propose 刀3)。
+    ///
+    /// 切档(`head_split`)时 propose 图只出「半表 top-16 候选 + sel_proj」,
+    /// 收割要两步:① 两半候选合并成全表 top-K;② rank0 跑 selector。
+    /// 原实现两步都在 host(eager):read0/read1 两次 dtoh + from_host 回写 +
+    /// `eval_ops_scoped_env` 一次发射 ⇒ 每轮 ~0.8ms 的主机往返与同步。
+    ///
+    /// 本图把两步**整体下沉**:输入 = peer 的 topk 单缓冲(唯一需要主机同步
+    /// 的一件,因为两 rank 的图是并发发射的,不能互相读对方本轮产物)+
+    /// anchor;输出 = select 单缓冲(前 `rows` 元 = drafts)。
+    /// 本 rank 的 `topk`/`sel_proj` 直接吃 dflash 图的**输出块**(刀2 已验证:
+    /// 图输出块指针在捕获态恒定,可作 `Op::Block` 叶子被下游图消费)。
+    ///
+    /// 只建在 rank0(selector 的全表域码本/合并结果只在 rank0 用),rank1 不建。
+    async fn plan_dflash_select(
+        dg: &GraphPlan<D>,
+        extra_faces: &mut Vec<D>,
+        boot: &FleetBoot<'_>,
+        t0: T,
+    ) -> Result<Option<GraphPlan<D>>> {
+        let Some(Drafter::DFlash2(d2)) = boot.spec.drafter.as_ref() else {
+            return Ok(None);
+        };
+        let rows = d2.depth();
+        let k = owl_models::layers::dflash2::TOP_K;
+        let rank = d2.selector_rank();
+        let half = boot.model.logits_vocab();
+        let env = boot.spec.draft_env;
+        let tp = boot.tp.clone();
+        let knobs = boot.knobs;
+        let topk_blk = dg.output_block("topk").ok_or_else(|| ModelError::EngineInvariant {
+            what: "select 图:propose 图输出槽 topk 缺席(切档声明不一致)".into(),
+        })?;
+        let proj_blk = dg.output_block("sel_proj").ok_or_else(|| ModelError::EngineInvariant {
+            what: "select 图:propose 图输出槽 sel_proj 缺席(切档声明不一致)".into(),
+        })?;
+        if topk_blk.len != 2 * rows * k {
+            return Err(ModelError::EngineInvariant {
+                what: format!(
+                    "select 图:topk 槽长 {} ≠ 2·{}·{}",
+                    topk_blk.len,
+                    rows,
+                    k
+                ),
+            });
+        }
+        let Some(sface) = extra_faces.pop() else {
+            owl_shared::log_warn!("boot", "select 图 face 耗尽 → 回落 host 合并 + eager select");
+            return Ok(None);
+        };
+        let d2s = Arc::clone(d2);
+        let (sg, sout) = GraphPlan::plan(
+            sface,
+            env,
+            tp,
+            GraphPlanDesc {
+                inputs: vec![
+                    // peer 的 topk 单缓冲(值区 ‖ 索引区;半表域 id)
+                    InputSlot::f32("peercand", 2 * rows * k),
+                    InputSlot::f32("anchor", 1),
+                ],
+                outputs: vec![OutputSlot {
+                    name: "sel".into(),
+                    shape: vec![rows * (k * k + 1)],
+                    dtype: Dtype::F32,
+                }],
+                capture: !knobs.no_graph,
+                slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
+                debug_probe: knobs.probes.debug,
+                reclaim_capture: true,
+                warmup: true,
+            },
+            move |sc: &PlanCtx| -> Result<()> {
+                // 本 rank 的候选/proj = propose 图的输出块(只读叶子)
+                let own = TensorOps::of_block(topk_blk.id, Dtype::F32, vec![2 * rows * k]);
+                let peer = sc.input("peercand")?.reshape(vec![2 * rows * k]);
+                let anchor = sc.input("anchor")?;
+                let own_v = own.slice_view(0, vec![rows, k]);
+                let own_i = own.slice_view(rows * k, vec![rows, k]);
+                let peer_v = peer.slice_view(0, vec![rows, k]);
+                let peer_i = peer.slice_view(rows * k, vec![rows, k]);
+                // 两半合并(全序律与 host `merge_topk_two_halves` 逐位同;
+                // 单测 = crates/kernels/tests/topk_merge_halves.rs)
+                let merged = TensorOps::call(owl_models::ops::SemanticKernel::TopkMergeHalves)
+                    .aux(&[rows])
+                    .arg(&own_v)
+                    .arg(&own_i)
+                    .arg(&peer_v)
+                    .arg(&peer_i)
+                    .arg_i32(half as i32)
+                    .arg_i32(rows as i32)
+                    .arg_i32(k as i32)
+                    .with_shape(Dtype::F32, vec![2 * rows * k]);
+                let cand = merged.slice_view(rows * k, vec![rows, k]);
+                let vals = merged.slice_view(0, vec![rows, k]);
+                let proj = TensorOps::of_block(proj_blk.id, proj_blk.dtype, vec![rows, rank]);
+                let (drafts, scores) =
+                    d2s.selector().select_from_candidates(&cand, &vals, &proj, &anchor, rows);
+                // drafts 是 select 单缓冲的前缀视图 ⇒ 输出整父块
+                // (host 从 sel[0..rows] 取 drafts,与未切档档同约定)
+                let _ = drafts;
+                sc.output("sel", &scores)?;
+                Ok(())
+            },
+        )
+        .await?;
+        match sout {
+            PlanOutcome::Captured => {
+                owl_shared::log_info!(
+                    "boot",
+                    "select 图捕获(两半候选合并 + selector 单图;rows={rows} k={k} rank={rank}) +{:.2}s",
+                    t0.elapsed().as_secs_f32()
+                );
+                Ok(Some(sg))
+            }
+            other => {
+                owl_shared::log_warn!(
+                    "boot",
+                    "select 图降级({other:?})→ 回落 host 合并 + eager select"
+                );
                 Ok(None)
             }
         }

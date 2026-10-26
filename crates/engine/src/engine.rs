@@ -1553,7 +1553,8 @@ pub(crate) fn into_running<D: DeviceClient>(
 /// 自适应档两档 = 各自的 fold/propose + 两张 verify。另加 DFlash2 单图 1 张。
 /// 第一张 verify 用 `vface`，其余从本预算里领 ⇒ 预算只算**额外** verify。
 fn fleet_faces(depths: &[usize]) -> usize {
-    let mut n = 1; // DFlash2 propose 单图（非 DFlash2 档留空）
+    // DFlash2 propose 单图 + 切档 propose 收割图(刀3;非 DFlash2/未切档留空)
+    let mut n = 2;
     for (i, &d) in depths.iter().enumerate() {
         n += d.max(1) + (d + 1);
         if i > 0 {

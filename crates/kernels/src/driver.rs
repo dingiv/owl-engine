@@ -370,6 +370,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.topk16" => ops::topk16(ax(0)),
         "ops.topk16_split" => ops::topk16_split(ax(0), ax(1)), // aux = [rows, nparts]
         "ops.topk16_merge" => ops::topk16_merge(ax(0)),        // aux = [rows]
+        "ops.topk_merge_halves" => ops::topk_merge_halves(ax(0)), // aux = [rows]
         "ops.topk32_split" => ops::topk32_split(ax(0), ax(1)),
         "ops.topk32_merge" => ops::topk32_merge(ax(0)),
         "ops.sigmoid_gate_mul" => attn::gate_mul(dt),
@@ -1040,6 +1041,15 @@ pub mod ops {
     /// split-K 段二(一行一 warp;grid = rows,block = 32)
     pub fn topk16_merge(rows: usize) -> KernelPick {
         KernelPick::of::<crate::ops::elems::Topk16MergeF16>(Shape {
+            grid: (rows as u32, 1, 1),
+            block: (32, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// 两半表候选合并(一行一线程;2K 候选插入选取 —— 不进关键路径)
+    pub fn topk_merge_halves(rows: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::elems::TopkMergeHalvesF32>(Shape {
             grid: (rows as u32, 1, 1),
             block: (32, 1, 1),
             smem: 0,

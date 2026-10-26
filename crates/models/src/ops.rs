@@ -217,6 +217,8 @@ pub enum SemanticKernel {
     Topk32Split,
     /// 逐行 top-32 split-K 段二(输出 [2·rows·32])
     Topk32Merge,
+    /// 两半表候选合并(DFlash2 切档 propose 收割;2026-10-26 刀3)
+    TopkMergeHalves,
     /// DFlash2 格打分 + 贪心 walk 融合(单块;输出 [rows·(K·K+1)])
     DflashSelect,
     /// DFlash2 分组动态深度 2-tap 卷积
@@ -394,6 +396,7 @@ impl SemanticKernel {
             SemanticKernel::Topk16Merge => "ops.topk16_merge",
             SemanticKernel::Topk32Split => "ops.topk32_split",
             SemanticKernel::Topk32Merge => "ops.topk32_merge",
+            SemanticKernel::TopkMergeHalves => "ops.topk_merge_halves",
             SemanticKernel::DflashSelect => "dflash.select",
             SemanticKernel::DflashConv => "dflash.conv",
             SemanticKernel::NaiveAttnNc => "attn.naive_nc",

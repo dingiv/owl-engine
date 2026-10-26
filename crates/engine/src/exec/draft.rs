@@ -134,6 +134,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if self.head_split_active() {
             let mut d = self.dflash_select_merged(bonus).await?;
             mrec("spec.propose.sel", t_sel.elapsed());
+            if self.boot.probes.dflash_probe {
+                owl_shared::log_debug!("dflash-probe", "pos={pos} anchor={bonus} drafts={d:?}");
+            }
             self.apply_dflash_lookup(&mut d, lookup);
             return Ok(d);
         }
@@ -1085,26 +1088,82 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     }
 
 
-    /// **切档 propose 的收割面**（P1.1 × P2.1,2026-10-19）
+    /// **切档 propose 的收割面**（P1.1 × P2.1,2026-10-19；刀3 2026-10-26 下沉）
     ///
-    /// 图（每 rank，半表）已出三槽：`topk_vals`/`topk_ids`（各 `[7,16]`）与
-    /// `sel_proj`（`[7,rank]`）。本函数:
-    /// ① 读两 rank 候选（rank1 的 id 是**半表域**）；
-    /// ② host 合并 → 全局 top-16（纯函数 `merge_topk_two_halves`）；
-    /// ③ **rank0** 跑 selector（全表域；码本全量）→ drafts。
+    /// 图（每 rank，半表）已出两槽：`topk`（`[7,16]` 值区 ‖ 索引区）与
+    /// `sel_proj`（`[7,rank]`）。收割 = ① 两半候选合并成全表 top-16；
+    /// ② **rank0** 跑 selector（全表域；码本全量）→ drafts。
     ///
     /// 为什么正确:全局 top-16 ⊆ 两半各自 top-16 的并集（截断性质）。
-    /// 为什么 rank0:读数面单点（与全合一档同构）；peer 的图输出照旧丢弃。
+    /// 为什么 rank0:读数面单点；peer 的图输出照旧丢弃。
+    ///
+    /// **刀3**:①②整体下沉到 `dflash_select` 图（两半合并核 + selector），
+    /// 本 rank 的 `topk`/`sel_proj` 直接吃 propose 图的输出块（零回读）。
+    /// 唯一必须主机参与的只剩 peer 候选:两 rank 的图**并发发射**，谁都不能
+    /// 读对方本轮产物 ⇒ 一次 dtoh 既取数据也当同步点。
+    /// 图缺席（未切档/捕获降级/单卡）⇒ 回落原 host 合并 + eager select。
     async fn dflash_select_merged(&mut self, bonus: u32) -> Result<Vec<u32>> {
         use owl_models::layers::dflash2::TOP_K;
         let rows = self.dev.spec_rt.depth;
         let k = TOP_K;
         let half = self.dev.boot.model.logits_vocab();
+        let t_r1 = std::time::Instant::now();
+        // ① peer 同槽（候选；半表域）。这一次 dtoh = **peer 图完成同步点**
+        //    （本 rank 的图不必单独等:收割图与它同流,回放天然有序）
+        let peer = {
+            let p = self
+                .peer
+                .as_mut()
+                .ok_or_else(|| ModelError::EngineInvariant { what: "切档 propose 缺 peer".into() })?;
+            let pg1 = p
+                .graphs
+                .dflash
+                .as_mut()
+                .ok_or_else(|| ModelError::EngineInvariant { what: "peer dflash_graph 缺席".into() })?;
+            let t = pg1.read_output_f32("topk").await?;
+            if t.len() != 2 * rows * k {
+                return Err(ModelError::EngineInvariant {
+                    what: format!("peer 切档 propose topk 槽尺寸不符:{} ≠ {}", t.len(), 2 * rows * k),
+                });
+            }
+            t
+        };
+        mrec("spec.propose.sel.read1", t_r1.elapsed());
+
+        // ② **图内收割**（刀3）:合并核 + selector 全在设备侧
+        if self.dev.graphs.dflash_select.is_some() {
+            let anchor = [bonus as f32];
+            let t_step = std::time::Instant::now();
+            {
+                let pg = self.dev.graphs.dflash_select.as_mut().ok_or_else(|| {
+                    ModelError::EngineInvariant { what: "select 图并发态自毁(不应发生)".into() }
+                })?;
+                pg.step(&[("peercand", &peer), ("anchor", &anchor)]).await?;
+            }
+            mrec("spec.propose.sel.step", t_step.elapsed());
+            let t_read = std::time::Instant::now();
+            let pg = self.dev.graphs.dflash_select.as_mut().ok_or_else(|| {
+                ModelError::EngineInvariant { what: "select 图并发态自毁(不应发生)".into() }
+            })?;
+            let sel = pg.read_output_f32("sel").await?;
+            mrec("spec.propose.sel.read", t_read.elapsed());
+            if sel.len() < rows {
+                return Err(ModelError::EngineInvariant {
+                    what: format!("select 图输出槽长 {} < rows {rows}", sel.len()),
+                });
+            }
+            owl_shared::log_debug!(
+                "dflash-probe",
+                "切档 propose 收割(图):两半 {} + {} → 全表 {rows} 行 top-{k}",
+                half,
+                half
+            );
+            return Ok(sel[..rows].iter().map(|&v| v as u32).collect());
+        }
+
+        // ---- 兜底:host 合并 + eager select（图缺席时的原路,语义逐字不变）----
         let t_r0 = std::time::Instant::now();
-        // ① rank0 三槽（图输出；`topk` dtoh、`sel_proj` 留设备块）。
-        // `topk` = 单缓冲:前段值区 ‖ 后段索引区。
-        // `sel_proj` 不再 D2H→H2D 往返（刀2）：它是 selector 的只读输入，
-        // 图输出块指针在捕获态恒定 ⇒ 直接作 `Op::Block` 叶子喂 select。
+        // rank0 两槽（`topk` dtoh、`sel_proj` 留设备块）
         let (v0, c0, proj_blk) = {
             let pg = self
                 .dev
@@ -1124,33 +1183,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             (t[..rows * k].to_vec(), t[rows * k..].to_vec(), p)
         };
         mrec("spec.propose.sel.read0", t_r0.elapsed());
-        let t_r1 = std::time::Instant::now();
-        // ② peer 同槽（候选）
-        let (v1, c1) = {
-            let p = self
-                .peer
-                .as_mut()
-                .ok_or_else(|| ModelError::EngineInvariant { what: "切档 propose 缺 peer".into() })?;
-            let pg1 = p
-                .graphs
-                .dflash
-                .as_mut()
-                .ok_or_else(|| ModelError::EngineInvariant { what: "peer dflash_graph 缺席".into() })?;
-            let t = pg1.read_output_f32("topk").await?;
-            if t.len() != 2 * rows * k {
-                return Err(ModelError::EngineInvariant {
-                    what: format!("peer 切档 propose topk 槽尺寸不符:{} ≠ {}", t.len(), 2 * rows * k),
-                });
-            }
-            (t[..rows * k].to_vec(), t[rows * k..].to_vec())
-        };
-        mrec("spec.propose.sel.read1", t_r1.elapsed());
         let t_merge = std::time::Instant::now();
-        // ③ host 合并（rank1 的 id + half）
+        let (v1, c1) = (peer[..rows * k].to_vec(), peer[rows * k..].to_vec());
         let (mv, mc) = crate::running::merge_topk_two_halves(&v0, &c0, &v1, &c1, rows, k, half)?;
         mrec("spec.propose.sel.merge", t_merge.elapsed());
         let t_eval = std::time::Instant::now();
-        // ④ rank0 select（eager;全表域 —— 候选已合并、码本全量）
+        // rank0 select（eager;全表域 —— 候选已合并、码本全量）
         let d2 = match self.dev.spec_rt.drafter.as_ref() {
             Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
             _ => {
@@ -1202,11 +1240,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("spec.propose.sel.launch", t_launch - t_prep);
         owl_shared::log_debug!(
             "dflash-probe",
-            "切档 propose 收割:候选合并 {}+{} → 全表 {} 行 top-{}",
+            "切档 propose 收割(eager 兜底):候选合并 {}+{} → 全表 {rows} 行 top-{k}",
             half,
-            half,
-            rows,
-            k
+            half
         );
         mrec("spec.propose.sel.eval", t_eval.elapsed());
         Ok(buf

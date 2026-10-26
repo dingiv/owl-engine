@@ -757,6 +757,33 @@ impl KernelSpec for Topk16MergeF16 {
 
 pub static TOPK16_MERGE_F16: KernelMeta = meta_of::<Topk16MergeF16>();
 
+/// `owl_topk_merge_halves_f32` —— **两半表候选合并**(DFlash2 切档 propose 收割;
+/// 2026-10-26 propose 刀3)。语义 = host `merge_topk_two_halves` 逐位同律:
+/// (值降, id 升) 全序取前 K,rank1 的 id += half,丢弃 id 非有限的哨兵槽。
+/// 输出单缓冲 [2·rows·K](值区 ‖ 索引区),可直接喂 `dflash.select`。
+pub struct TopkMergeHalvesF32;
+
+#[kernel_tags("dom.elem", "role.sample", "feat.dflash", "feat.spec", "phase.propose")]
+impl KernelSpec for TopkMergeHalvesF32 {
+    const ENTRY: &'static str = "owl_topk_merge_halves_f32";
+    const SRC: &'static str = "cu/elems/topk_merge_halves.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("vals_a", Dtype::F32, 2),
+        Param::t_in("ids_a", Dtype::F32, 2),
+        Param::t_in("vals_b", Dtype::F32, 2),
+        Param::t_in("ids_b", Dtype::F32, 2),
+        Param::i32("half"),
+        Param::i32("rows"),
+        Param::i32("k"),
+        Param::t_out("out", Dtype::F32, 1),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static TOPK_MERGE_HALVES_F32: KernelMeta = meta_of::<TopkMergeHalvesF32>();
+
 /// `owl_topk32_split_f16` —— **K=32 twin**(分布式采样;同 K=16 版算术序)
 pub struct Topk32SplitF16;
 
