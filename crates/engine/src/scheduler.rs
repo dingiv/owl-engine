@@ -969,6 +969,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         s.cached_len = d.cached_len;
         s.tokens.clear();
         s.tokens.extend_from_slice(&turn.prompt_ids[..d.cached_len]);
+        // **中途落账也必须自洽**：Abort 不会再 commit_turn；pad/spans 若仍
+        // 指向被截掉的后缀，下一轮 unpad 会 400。
+        let (spans, pads) = crate::img_evict::ledger_prefix(
+            &turn.img_spans,
+            &turn.img_pads,
+            d.cached_len,
+        );
+        s.set_img_spans(spans, pads);
         s.chain.seed(d.cached_len / page, d.tail_hash);
         s.set_positions(&turn.positions[..d.cached_len], true)?;
         s.position_epoch = s.position_epoch.wrapping_add(1);

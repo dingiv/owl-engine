@@ -124,6 +124,21 @@ fn image_runs(ids: &[u32], image_token: u32) -> Vec<(usize, usize)> {
     out
 }
 
+/// 把图像账截到 padded 前缀 `len`：只保留**完整落在前缀内**的 spans/pads。
+///
+/// leave-gap 删除会在 turn 中途把会话 `tokens` 截到 cached 前缀；若此时
+/// 客户端断流走 Abort，不会再 `commit_turn`。因此落账点必须同时截
+/// `img_spans`/`pads`，否则下一轮 `unpad` 会读到超出序列尾的 pad 区间。
+pub fn ledger_prefix(
+    spans: &[ImgSpan],
+    pads: &[(usize, usize)],
+    len: usize,
+) -> (Vec<ImgSpan>, Vec<(usize, usize)>) {
+    let spans = spans.iter().copied().filter(|sp| sp.end <= len).collect();
+    let pads = pads.iter().copied().filter(|(_, hi)| *hi <= len).collect();
+    (spans, pads)
+}
+
 /// 剥掉 pad 区间 → 客户端可见的 token 序列。
 ///
 /// `pads` 必须升序且互不重叠(由 [`pad_image_spans`] 保证);越界 = `Err`
@@ -720,6 +735,25 @@ mod tests {
         .expect("pad2");
         assert_eq!(&next.ids[..hit.a], &seq.ids[..hit.a], "删点之前必须逐字节不变");
         assert_eq!(unpad(&next.ids, &next.pads).expect("unpad2"), raw);
+    }
+
+    #[test]
+    fn ledger_prefix_drops_out_of_range_pads_and_spans() {
+        let sp = |start, end| ImgSpan {
+            start,
+            end,
+            text_start: 0,
+            text_end: 0,
+            pad_before: 0,
+            pad_after: 0,
+            grid: (1, 2, 2),
+            evict: true,
+        };
+        let spans = [sp(0, 4), sp(8, 16)];
+        let pads = [(0, 4), (12, 16)];
+        let (s, p) = ledger_prefix(&spans, &pads, 10);
+        assert_eq!(s.len(), 1, "只保留完整落在前缀内的 span");
+        assert_eq!(p, vec![(0, 4)], "超出前缀尾的 pad 必须丢掉");
     }
 
     #[test]

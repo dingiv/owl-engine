@@ -41,6 +41,15 @@ prefill_chunk = 2048
 # 跨会话前缀仍由内容寻址缓存兜底(实测 49k prompt 99.9% 命中)。
 implicit_session = true
 
+[sampling]
+# GUI agent 联调：打破 greedy 复读；客户端显式 temperature=0 仍可逐请求回落贪心。
+# 本次只改 3080 档；3090/full 仍以 greedy 为基线。
+mode = "sampling"
+temp = 0.7
+topk = 20
+topp = 0.95
+rep_penalty = 1.0
+
 [spec]
 # TP2 草稿族放行(缺它 = tp.rs 装配期响亮拒)
 tp_draft = true
