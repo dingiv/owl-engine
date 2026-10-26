@@ -282,6 +282,7 @@ pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "owl_add_bf16",
     "owl_add_f16",
     "owl_argmax_f32idx_f16",
+    "owl_argmax_validx_f16",
     "marlin_gemm_w4a8_awq",
     "owl_quant_int8_row_f16",
     "owl_ct_repack_a8_u32",
@@ -457,6 +458,7 @@ pub const PRODUCTION_UNION_2026_10_13: &[&str] = &[
     "owl_add_bf16",
     "owl_add_f16",
     "owl_argmax_f32idx_f16",
+    "owl_argmax_validx_f16",
     "owl_cast_bf16_f16",
     "owl_cast_f16_bf16",
     "owl_concat_rows_f16",
@@ -687,7 +689,7 @@ mod tests {
             "owl_xqa_verify", "owl_xqa_decode", "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
             "owl_argmax_f32idx_f16", "owl_silu_and_mul_bf16", "owl_naive_attn_nc_bf16_v2",
             "owl_embed_f16", "owl_embed_i8_f16", "owl_rmsnorm_bf16", "owl_concat_rows_f16", "owl_topk16_f16",
-            "owl_dflash_select_bf16", "owl_cast_bf16_f16", "owl_concat_rows_f32",
+            "owl_dflash_select_bf16", "owl_cast_bf16_f16", "owl_concat_rows_f32", "owl_argmax_validx_f16",
             "vllm_paged_attention_v2_fp8_knhd_hd256bs32", "vllm_paged_attention_v2_reduce_f16_hd256",
         ];
         audit_active(Some(PROD)).expect("生产集池审计必须通过");

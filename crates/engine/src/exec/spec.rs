@@ -39,6 +39,36 @@ fn adaptive_should_downshift(rounds: u32, tokens: u32, min_tpr: f32) -> bool {
     rounds >= SPEC_ADAPTIVE_WARMUP_ROUNDS && (tokens as f32 / rounds as f32) < min_tpr
 }
 
+/// **两半表 (max 值, 索引) 合并**(2026-10-26 分布式 argmax)。
+///
+/// `a` / `b` = 每行 2 个 f32(`[val, idx]`),`a` = rank0(低半词表),
+/// **平局归 rank0** —— 与旧 host fold 的「取最小索引」逐位一致。
+/// 返回每行**全局索引**(f32 过线,与 `tok` 槽同口径)。
+fn dist_argmax_merge(a: &[f32], b: &[f32], half_vocab: usize) -> Result<Vec<f32>> {
+    if a.len() != b.len() || a.len() % 2 != 0 {
+        return Err(ModelError::EngineInvariant {
+            what: format!(
+                "分布式 argmax 行尺寸不符:a={} b={}(应为 2×行数)",
+                a.len(),
+                b.len()
+            ),
+        });
+    }
+    let rows = a.len() / 2;
+    let mut out = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let (va, ia) = (a[2 * r], a[2 * r + 1]);
+        let (vb, ib) = (b[2 * r], b[2 * r + 1]);
+        let idx = if vb > va {
+            ib as usize + half_vocab
+        } else {
+            ia as usize
+        };
+        out.push(idx as f32);
+    }
+    Ok(out)
+}
+
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 投机轮执行(E5-M2b;施工方案 §9.2):快照 → 草稿到位 → verify
     /// (depth+1 行 prefill 通道,返回 ids + hidden 块)→ greedy 接受 →
@@ -134,6 +164,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             (act.sampler_on, act.sampler)
         };
+        // **分布式采样门**(2026-10-26):采样档 + 词表切 + 图带 cand 槽
+        // + topk 有界 + 无重复惩罚。任一不满足 ⇒ 走原 logits 路径(响亮可解释)。
+        let use_cand = sampler_on
+            && self.head_split_active()
+            && sampler_cfg.rep_penalty <= 1.0
+            && sampler_cfg.topk > 0
+            && sampler_cfg.topk <= 32
+            && proposal_q.is_none();
         let mut hist: Vec<u32> = {
             let act = self.turns.active()?;
             let tail = act.prompt_ids.len().saturating_sub(SPEC_HIST_KEEP);
@@ -146,7 +184,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // XQA 页表:在借 self.dev.graphs.verify 之前算好(自 sessions 取真块链)
         let xqa_pt_v = self.xqa_pt_of(sid);
 
-        let (ids, hidden, records, hidden_owned, row_logits, t_v) = self
+        let (ids, hidden, records, hidden_owned, row_logits, cand_rows, t_v) = self
             .verify_round(
                 &block,
                 pos,
@@ -156,6 +194,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 &xqa_pt_v,
                 sid,
                 depth,
+                use_cand,
             )
             .await?;
         t_verify = t_v;
@@ -167,6 +206,26 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 原实现只有贪心接受 ⇒ spec 臂完全不采样 ⇒ 请求温度/top_p/seed
         // 在 spec 开时失效 = 事实贪心(27B instruct 复读吸引子;A7/A8 根因)。
         let (m, emitted, bonus) = if sampler_on {
+            if let Some(cs) = cand_rows.as_ref() {
+                // **候选式采样**(2026-10-26):只在 ≤64 个候选上做 temperature →
+                // top-k → softmax → top-p → 抽样;RNG/历史语义与 logits 路逐字同。
+                if cs.len() < live + 1 {
+                    return Err(ModelError::EngineInvariant {
+                        what: format!("分布式采样行数不足:{} < {}", cs.len(), live + 1),
+                    });
+                }
+                let mut s: Vec<u32> = Vec::with_capacity(live + 1);
+                for i in 0..=live {
+                    let mut rng =
+                        seed_base ^ ((pos + i) as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+                    let tok =
+                        crate::sampler::sample_from_candidates(&cs[i], &sampler_cfg, &mut rng);
+                    s.push(tok);
+                    hist.push(tok);
+                }
+                let m = spec_sampled_accept_prefix(&drafts[..live], &s[..live]);
+                (m, s[..=m].to_vec(), s[m])
+            } else {
             let Some(lg) = row_logits.as_ref() else {
                 return Err(ModelError::Msg(
                     "spec 采样接受需要 per-row logits(verify 路未出 logits 槽)".into(),
@@ -217,6 +276,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let m = spec_sampled_accept_prefix(&drafts[..live], &s[..live]);
                 (m, s[..=m].to_vec(), s[m])
             }
+            } // 候选式采样 / logits 老路
         } else {
             // **argmax/greedy 路**:只比 target live 前 P 个 draft
             let m = (0..live).take_while(|&i| drafts[i] == ids[i]).count();
@@ -1030,7 +1090,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// `verify_forward`。TP 档两 rank 必须同跑(verify 图含 AR,T=depth+1 行
     /// RowParallel);词表切档 = 两 rank 各出半表、rank0 host 拼接。
     ///
-    /// 返回 `(ids, hidden, records, hidden_owned, row_logits, 耗时)`。
+/// 返回 `(ids, hidden, records, hidden_owned, row_logits, 耗时)`。
     /// `hidden_owned = true` ⇒ 调用方负责 free(eager 路的中间块)。
     #[allow(clippy::type_complexity)]
     async fn verify_round(
@@ -1043,12 +1103,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         xqa_pt_v: &[f32],
         sid: u64,
         depth: usize,
+        want_cand: bool,
     ) -> Result<(
         Vec<u32>,
         owl_iface::contract::Bytes,
         Vec<owl_iface::contract::Bytes>,
         bool,
         Option<Vec<f32>>,
+        Option<Vec<Vec<(f32, u32)>>>,
         std::time::Duration,
     )> {
         let verify_elapsed;
@@ -1080,7 +1142,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 m.counter_add("spec.verify.view", 1, file!(), line!());
             });
         }
-        let (ids, hidden, records, hidden_owned, row_logits) =
+        let (ids, hidden, records, hidden_owned, row_logits, cand_rows) =
         if self.dev.graphs.verify_of(depth).is_some() {
             let vg = self.dev.graphs.verify_mut(depth)?;
         let ts = std::time::Instant::now();
@@ -1213,22 +1275,75 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // （实效判据：本 rank logits 宽 < 全量；tied 档装载期已响亮拒）
         let head_split = self.head_split_active();
         let half_vocab = self.dev.boot.model.logits_vocab();
-        let (tok_f, row_logits) = {
+        // **分布式 argmax 档**(2026-10-26):词表切 + 贪心 ⇒ 两 rank 各出
+        // (max 值, 索引),host 只比较 2 个数/行;不再回读 4MB 半表 logits。
+        // 采样档保留 logits 路径(host 采样需要完整分布)。
+        let dist_argmax = head_split && !sampler_on;
+        // 分布式采样(候选式):graph 有 cand 槽时不再读 logits。
+        let dist_sample = want_cand;
+        let (tok_f, row_logits, cand_rows) = {
             let (dev, peer) = (&mut self.dev, self.peer.as_mut());
             match peer {
-                None => dev.verify_dev(&ins, fi_spec, sampler_on, depth).await?,
+                None => {
+                    let (tok, _tokv, _cand, lg) =
+                        dev.verify_dev(&ins, fi_spec, sampler_on, depth, 0, false, false).await?;
+                    (tok, lg, None)
+                }
                 Some(p) => {
                     // 两半都校验(纪律:`join2` 等另一半到底,吞错 = 挂住)
                     // 切档 ⇒ 两 rank 都要 logits 半表(rank0 拼接用);未切档
                     // = 原路(peer 不读 ⇒ 省那份 D2H 与 host 内存)。
                     let (r0, r1) = crate::exec::join2(
-                        dev.verify_dev(&ins, fi_spec, sampler_on || head_split, depth),
-                        p.verify_dev(&ins, fi_spec, head_split, depth),
+                        dev.verify_dev(
+                            &ins,
+                            fi_spec,
+                            (sampler_on || head_split) && !dist_argmax && !dist_sample,
+                            depth,
+                            0,
+                            dist_argmax,
+                            dist_sample,
+                        ),
+                        p.verify_dev(
+                            &ins,
+                            fi_spec,
+                            head_split && !dist_argmax && !dist_sample,
+                            depth,
+                            1,
+                            dist_argmax,
+                            dist_sample,
+                        ),
                     )
                     .await;
-                    let (_, lg1) = r1?;
-                    let (tok0, lg0) = r0?;
-                    if head_split {
+                    let (_, tv1, cd1, lg1) = r1?;
+                    let (tok0, tv0, cd0, lg0) = r0?;
+                    if dist_argmax {
+                        let (a, b) = match (tv0, tv1) {
+                            (Some(a), Some(b)) => (a, b),
+                            _ => {
+                                return Err(ModelError::EngineInvariant {
+                                    what: "词表切 verify:分布式 argmax 的 (值,索引) 行缺席"
+                                        .into(),
+                                })
+                            }
+                        };
+                        (dist_argmax_merge(&a, &b, half_vocab)?, None, None)
+                    } else if dist_sample {
+                        // **候选式采样**(2026-10-26):两 rank 各出 top-32,
+                        // host 合并成全局候选(≤64),不再读 2MB 半表 logits。
+                        let (cd0, cd1) = match (cd0, cd1) {
+                            (Some(a), Some(b)) => (a, b),
+                            _ => {
+                                return Err(ModelError::EngineInvariant {
+                                    what: "词表切 verify:分布式采样候选行缺席".into(),
+                                })
+                            }
+                        };
+                        (
+                            tok0,
+                            None,
+                            Some(merge_sample_cands(&cd0, &cd1, block.len(), half_vocab)?),
+                        )
+                    } else if head_split {
                         let (a, b) = match (lg0, lg1) {
                             (Some(a), Some(b)) => (a, b),
                             _ => {
@@ -1238,9 +1353,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                                 })
                             }
                         };
-                        (tok0, Some(crate::running::concat_head_rows(&a, &b, half_vocab)?))
+                        (
+                            tok0,
+                            Some(crate::running::concat_head_rows(&a, &b, half_vocab)?),
+                            None,
+                        )
                     } else {
-                        (tok0, lg0)
+                        (tok0, lg0, None)
                     }
                 }
             }
@@ -1271,7 +1390,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("spec.verify.read", t_read_v.elapsed());
         // P1.1:切档的设备 token 只是**半表局部** argmax ⇒ 从拼接后的全表行
         // 重算全局 argmax(贪心接受判据的唯一依据);未切档 = 原值。
-        let ids: Vec<u32> = if head_split {
+        let ids: Vec<u32> = if head_split && row_logits.is_some() {
             let lg = row_logits.as_ref().ok_or_else(|| ModelError::EngineInvariant {
                 what: "词表切 verify:全表行 logits 缺席(greedy 判据无据)".into(),
             })?;
@@ -1314,7 +1433,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             })
             .collect::<Result<Vec<_>>>()?;
         verify_elapsed = ts.elapsed();
-        (ids, hidden, records, false, row_logits) // 图输出槽:持久,不 free
+        (ids, hidden, records, false, row_logits, cand_rows) // 图输出槽:持久,不 free
     } else {
         if view_tables.is_some() {
             return Err(ModelError::Msg(
@@ -1327,9 +1446,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (ids, hidden, row_logits) =
             self.verify_forward(&block, pos, gdn_slot, sampler_on, vlm_delta).await?;
         verify_elapsed = ts.elapsed();
-        (ids, hidden, Vec::new(), true, row_logits)
+        (ids, hidden, Vec::new(), true, row_logits, None)
         };
-        Ok((ids, hidden, records, hidden_owned, row_logits, verify_elapsed))
+        Ok((ids, hidden, records, hidden_owned, row_logits, cand_rows, verify_elapsed))
     }
 
     /// **① 轮首快照**(S6d):GDN 态回滚缓冲;仅失效时拍。

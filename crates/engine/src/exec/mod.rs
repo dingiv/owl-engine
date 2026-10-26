@@ -98,6 +98,45 @@ where
     (ra.expect("join2 a"), rb.expect("join2 b"))
 }
 
+/// **候选合并**(分布式采样,2026-10-26):两 rank 各 32 个 `(val, idx)`
+/// (半表域)→ 每行全局索引升序的并集(≤64)。
+///
+/// 为什么按**索引升序**:[`crate::sampler::sample_from_candidates`] 复用
+/// `distribution` 的扫描序(index 升序 + 严格 `>`)才与全表路径逐位等价。
+pub(crate) fn merge_sample_cands(
+    a: &[f32],
+    b: &[f32],
+    rows: usize,
+    half_vocab: usize,
+) -> Result<Vec<Vec<(f32, u32)>>> {
+    const K: usize = 32;
+    let need = 2 * rows * K;
+    if a.len() < need || b.len() < need {
+        return Err(ModelError::EngineInvariant {
+            what: format!(
+                "分布式采样候选尺寸不符:a={} b={} 需 {}",
+                a.len(),
+                b.len(),
+                need
+            ),
+        });
+    }
+    let mut out = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut u: Vec<(f32, u32)> = Vec::with_capacity(2 * K);
+        for k in 0..K {
+            u.push((a[r * K + k], a[rows * K + r * K + k] as u32));
+            u.push((
+                b[r * K + k],
+                b[rows * K + r * K + k] as u32 + half_vocab as u32,
+            ));
+        }
+        u.sort_unstable_by_key(|&(_, i)| i);
+        out.push(u);
+    }
+    Ok(out)
+}
+
 pub mod phases;
 
 /// **E4 接入面(声明;未实现)**——见 `docs/arch/三流事件序-设计与迁移.md` §6

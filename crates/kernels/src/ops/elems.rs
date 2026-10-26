@@ -309,6 +309,26 @@ impl KernelSpec for ArgmaxF32IdxF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+/// `owl_argmax_validx_f16` —— 设备侧 argmax 的 (max 值, 索引) 双输出
+/// (2026-10-26 分布式 argmax:TP 词表切下合并两半表的贪心结果,
+/// 不再把 4MB 半表 logits 拉回主机)。归约体与索引版同一份算术序。
+pub struct ArgmaxValIdxF16;
+
+#[kernel_tags("dom.elem", "role.sample", "phase.decode")]
+impl KernelSpec for ArgmaxValIdxF16 {
+    const ENTRY: &'static str = "owl_argmax_validx_f16";
+    const SRC: &'static str = "cu/elems/argmax_f16.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 0),
+        Param::i32("n"),
+        Param::i32("offset"),
+        Param::t_out("out", Dtype::F32, 1),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 /// `owl_topk16_f16` —— 逐行 top-16(DFlash2 草稿;单缓冲 [rows,32])
 pub struct Topk16F16;
 
@@ -688,6 +708,7 @@ pub static CONCAT_ROWS_F32: KernelMeta = meta_of::<ConcatRowsF32>();
 pub static EMBED_F16: KernelMeta = meta_of::<EmbedF16>();
 pub static EMBED_I8_F16: KernelMeta = meta_of::<EmbedI8F16>();
 pub static ARGMAX_F32IDX_F16: KernelMeta = meta_of::<ArgmaxF32IdxF16>();
+pub static ARGMAX_VALIDX_F16: KernelMeta = meta_of::<ArgmaxValIdxF16>();
 pub static TOPK16_F16: KernelMeta = meta_of::<Topk16F16>();
 
 /// `owl_topk16_split_f16` —— split-K 段一(grid = rows×nparts):
@@ -735,6 +756,48 @@ impl KernelSpec for Topk16MergeF16 {
 }
 
 pub static TOPK16_MERGE_F16: KernelMeta = meta_of::<Topk16MergeF16>();
+
+/// `owl_topk32_split_f16` —— **K=32 twin**(分布式采样;同 K=16 版算术序)
+pub struct Topk32SplitF16;
+
+#[kernel_tags("dom.elem", "role.sample", "phase.decode")]
+impl KernelSpec for Topk32SplitF16 {
+    const ENTRY: &'static str = "owl_topk32_split_f16";
+    const SRC: &'static str = "cu/elems/topk32.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::i32("vocab"),
+        Param::i32("nparts"),
+        Param::i32("rows"),
+        Param::t_out("tmp", Dtype::F32, 1),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static TOPK32_SPLIT_F16: KernelMeta = meta_of::<Topk32SplitF16>();
+
+/// `owl_topk32_merge_f16` —— K=32 split-K 段二
+pub struct Topk32MergeF16;
+
+#[kernel_tags("dom.elem", "role.sample", "phase.decode")]
+impl KernelSpec for Topk32MergeF16 {
+    const ENTRY: &'static str = "owl_topk32_merge_f16";
+    const SRC: &'static str = "cu/elems/topk32.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("tmp", Dtype::F32, 1),
+        Param::i32("nparts"),
+        Param::i32("rows"),
+        Param::i32("vocab"),
+        Param::t_out("out", Dtype::F32, 1),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static TOPK32_MERGE_F16: KernelMeta = meta_of::<Topk32MergeF16>();
 
 // ============================================================================
 // `elems.rs` 域 R1 补表
