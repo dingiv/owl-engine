@@ -1,0 +1,40 @@
+# ── GGUF 测量档(2026-10-27;单卡 3090 / TP2 由 CLI 覆盖) ─────────────────
+#
+# 目的:量 GGUF(Q4_K_M)在 owl 上的裸性能(无投机),与 AWQ-INT4 档同口径比。
+# 组成 = 生产档同款外设(FP8 KV / FI 图 / 前缀缓存),只换模型与关投机。
+#
+# 用法:
+#   单卡: ./target/release/server -p profiles/qwen38_27b-gguf.toml
+#   TP2 : ./target/release/server -p profiles/qwen38_27b-gguf.toml \
+#           --set parallel.mode=tensor --set parallel.device='["3090","3090"]' \
+#           --set parallel.tp_ar_f8=true --set parallel.tp_ar_fused=true \
+#           --set parallel.tp_ar2=true
+extends = [
+  "full.toml",
+  "parts/model/27b-gguf-q4km.toml",
+  "parts/hardware/3090-single.toml",
+  "parts/kernel/fi-graph.toml",
+  "parts/pool/fp8.toml",
+]
+
+[server]
+bind = "127.0.0.1:8141"
+
+[runtime]
+max_seq = 32768
+max_concurrency = 1
+# **prefill_chunk = 2048**(2026-10-27 实测;GGUF 专属,勿照搬到 AWQ 档):
+# GGUF 的 prefill 走 MMQ2(j128 一块),AR 是每层每 chunk 一次 ⇒ chunk 越大
+# AR 次数越少。实测(3090 对 / 8k prompt / 64 tok 输出):
+#   chunk 512 → prefill 2069 / TTFT 3889ms
+#   chunk 1024 → 2259 / 3510ms
+#   chunk **2048 → 2372 / 3343ms(+14.6% / −14%)**
+#   单卡 3090 亦 +8%(1618 → 1751;无 AR,收益来自发射/占用)
+# ⚠️ **chunk 4096 在 8k prompt 上会"prefill 边界降级"**(返回 0 token)
+#    ⇒ 2048 是当前安全上限,别再加。
+prefill_chunk = 2048
+
+[spec]
+# 裸性能口径:关投机(投机档另测)
+depth = 0
+lookup = false
