@@ -1101,8 +1101,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let k = TOP_K;
         let half = self.dev.boot.model.logits_vocab();
         let t_r0 = std::time::Instant::now();
-        // ① rank0 三槽（图输出；dtoh）。`topk` = 单缓冲:前段值区 ‖ 后段索引区。
-        let (v0, c0, proj, dt) = {
+        // ① rank0 三槽（图输出；`topk` dtoh、`sel_proj` 留设备块）。
+        // `topk` = 单缓冲:前段值区 ‖ 后段索引区。
+        // `sel_proj` 不再 D2H→H2D 往返（刀2）：它是 selector 的只读输入，
+        // 图输出块指针在捕获态恒定 ⇒ 直接作 `Op::Block` 叶子喂 select。
+        let (v0, c0, proj_blk) = {
             let pg = self
                 .dev
                 .graphs
@@ -1110,13 +1113,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .as_mut()
                 .ok_or_else(|| ModelError::EngineInvariant { what: "dflash_graph 缺席(档位不一致)".into() })?;
             let t = pg.read_output_f32("topk").await?;
-            let p = pg.read_output_f32("sel_proj").await?;
+            let p = pg.output_block("sel_proj").ok_or_else(|| ModelError::EngineInvariant {
+                what: "切档 propose sel_proj 输出槽缺席(先 step)".into(),
+            })?;
             if t.len() != 2 * rows * k {
                 return Err(ModelError::EngineInvariant {
                     what: format!("切档 propose topk 槽尺寸不符:{} ≠ {}", t.len(), 2 * rows * k),
                 });
             }
-            (t[..rows * k].to_vec(), t[rows * k..].to_vec(), p, self.dev.spec_rt.draft_dt)
+            (t[..rows * k].to_vec(), t[rows * k..].to_vec(), p)
         };
         mrec("spec.propose.sel.read0", t_r0.elapsed());
         let t_r1 = std::time::Instant::now();
@@ -1155,13 +1160,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         };
         let rank = d2.selector_rank();
-        if mv.len() != rows * k || mc.len() != rows * k || proj.len() != rows * rank {
+        if mv.len() != rows * k || mc.len() != rows * k || proj_blk.len != rows * rank {
             return Err(ModelError::EngineInvariant {
                 what: format!(
                     "切档 propose 槽形状不符:vals {} / ids {} / proj {}(期望 {}×{}/{})",
                     mv.len(),
                     mc.len(),
-                    proj.len(),
+                    proj_blk.len,
                     rows,
                     k,
                     rows * rank
@@ -1172,23 +1177,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let cand_v: Vec<f32> = mc.iter().map(|&i| i as f32).collect();
         let cand_t = owl_models::TensorOps::from_host(Dtype::F32, vec![rows, k], &f32b(&cand_v));
         let vals_t = owl_models::TensorOps::from_host(Dtype::F32, vec![rows, k], &f32b(&mv));
-        // proj 回送按**草稿 dt**（图槽已是 dt，读回 f32 无损 ⇒ 再编码回 dt 无损）
-        let proj_bytes = match dt {
-            Dtype::F16 => proj
-                .iter()
-                .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
-                .collect::<Vec<u8>>(),
-            Dtype::BF16 => proj
-                .iter()
-                .flat_map(|f| half::bf16::from_f32(*f).to_le_bytes())
-                .collect::<Vec<u8>>(),
-            _ => f32b(&proj),
-        };
-        let proj_t = owl_models::TensorOps::from_host(dt, vec![rows, rank], &proj_bytes);
+        // proj = 图输出块的**只读**叶子（dtype/形状取自槽事实面，零往返）
+        let proj_t = owl_models::TensorOps::of_block(proj_blk.id, proj_blk.dtype, vec![rows, rank]);
         let anchor_t = owl_models::TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[bonus as f32]));
         let (drafts, _scores) =
             d2.selector()
                 .select_from_candidates(&cand_t, &vals_t, &proj_t, &anchor_t, rows);
+        let t_prep = t_eval.elapsed();
         let face = self.dev.graphs.session.face_mut();
         let (b, arena) = owl_models::interpreters::eval_ops_scoped_env(
             drafts.step(),
@@ -1197,11 +1192,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             self.dev.boot.tp.as_ref(),
         )
         .await?;
+        let t_launch = t_eval.elapsed();
         let mut buf = vec![0u8; 4 * rows];
         let face = self.dev.graphs.session.face_mut();
         face.dtoh(&b, &mut buf).await?;
         face.free(&[b.id]).await?;
         face.free(&arena).await?;
+        mrec("spec.propose.sel.prep", t_prep);
+        mrec("spec.propose.sel.launch", t_launch - t_prep);
         owl_shared::log_debug!(
             "dflash-probe",
             "切档 propose 收割:候选合并 {}+{} → 全表 {} 行 top-{}",
