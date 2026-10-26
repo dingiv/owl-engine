@@ -11,10 +11,36 @@ use crate::device::ScratchBuf;
 
 use crate::client::flashinfer::{parse_prefill, PREFILL_FI};
 use crate::family::flashinfer::{
-    owl_fi_prefill_plan, owl_fi_prefill_run, owl_fi_prefill_run_fp8kv,
-    FI_FLOAT_WS_BYTES, FI_HOST_STAGING_BYTES, FI_INT_WS_BYTES, FI_RAGGED_INT_WS_BYTES,
+    owl_fi_dequant_fp8_to_f16, owl_fi_prefill_plan, owl_fi_prefill_plan2, owl_fi_prefill_run,
+    owl_fi_prefill_run_fp8kv, FI_FLOAT_WS_BYTES, FI_HOST_STAGING_BYTES, FI_INT_WS_BYTES,
+    FI_RAGGED_INT_WS_BYTES,
 };
 use crate::registry::{FamilyGuard, KernelFamily};
+
+type FiRunFn = unsafe extern "C" fn(
+    *const std::ffi::c_void,
+    *const std::ffi::c_void,
+    *const std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *mut i32,
+    *mut i32,
+    *mut i32,
+    *mut i32,
+    *const i64,
+    *mut std::ffi::c_void,
+    usize,
+    *mut std::ffi::c_void,
+    usize,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    f32,
+    *const std::ffi::c_void,
+    *mut std::ffi::c_void,
+) -> i32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct PlanKey {
@@ -42,6 +68,8 @@ struct PlanKey {
     hkv: usize,
     hd: usize,
     page: usize,
+    /// **plan 的 KV 元素字节**(1=fp8 / 2=f16;分键,避免两臂互相复用)
+    kv_bytes: usize,
 }
 
 /// 图档 plan 开关(**与 C++ `owl_fi_cuda_graph` 同源**)。
@@ -61,6 +89,31 @@ fn fi_cuda_graph() -> bool {
     CUDA_GRAPH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// **prefill f16 shadow 开关**(boot 期唯一写点;C++ 侧不读 env)。
+static PREFILL_SHADOW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// **shadow 容量上限(token)**:boot 期由 `runtime.max_seq` 下发。
+/// 首层 FI 调用即按此 cap 一次性预留,避免 ctx 增长到池压力峰值时再扩容
+/// (2026-10-26 实测 100k 处 68MiB 扩容被硬预算拒发)。
+static PREFILL_SHADOW_CAP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_prefill_shadow(on: bool) {
+    PREFILL_SHADOW.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_prefill_shadow_cap(tokens: usize) {
+    PREFILL_SHADOW_CAP.store(tokens, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn prefill_shadow_on() -> bool {
+    PREFILL_SHADOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn prefill_shadow_cap() -> usize {
+    PREFILL_SHADOW_CAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// **plan 键归一化(纯函数;可单测)**:ctx 恒进键。
 ///
 /// 桶化(把 ctx 上取整到桶再进键)**不在这里做** —— 值由引擎侧写进
@@ -75,6 +128,7 @@ fn plan_key(
     hd: usize,
     page: usize,
     graph: bool,
+    kv_bytes: usize,
 ) -> PlanKey {
     PlanKey {
         total_rows,
@@ -85,6 +139,7 @@ fn plan_key(
         hd,
         page,
         graph,
+        kv_bytes,
     }
 }
 
@@ -183,6 +238,10 @@ pub struct FiRuntime {
     fa2_cu: Option<ScratchBuf>,
     /// FA2 cu 的上传缓存键(cu block id + 形状;同一 tower 请求逐层复用)
     fa2_key: Option<Fa2Key>,
+    /// f16 shadow(K/V 各一半;按当前 ctx 页数增长,覆盖写)
+    shadow: Option<ScratchBuf>,
+    /// shadow 的 identity 页表(`[0,1,..,pages-1]`;让 FI 读 dense shadow)
+    shadow_indices: Option<ScratchBuf>,
 }
 /// 视觉塔 ragged plan 键
 #[derive(Clone, Copy, PartialEq)]
@@ -322,6 +381,8 @@ impl Default for FiRuntime {
             fa2_lse: None,
             fa2_cu: None,
             fa2_key: None,
+            shadow: None,
+            shadow_indices: None,
         }
     }
 }
@@ -359,6 +420,8 @@ impl KernelFamily for FiRuntime {
             )?),
             fa2_cu: Some(res.alloc(VIS_CU_BYTES, "fa2.cu")?),
             fa2_key: None,
+            shadow: None,
+            shadow_indices: None,
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -428,8 +491,17 @@ impl KernelFamily for FiRuntime {
             (w.ptr, w.bytes)
         };
         let stream = res.stream()?;
+        // **prefill-only f16 shadow**:verify/decode(t=1/8)不启用(每步全 ctx
+        // 反量化净亏);t>=64 覆盖主 prefill chunk,尾块仍走 fp8。
+        // **仅 fp8 主池**:配置面 `validate` 已拒 `prefill_shadow && !kv_fp8`;
+        // 这里再以 `call.fp8kv` 双保险 —— f16 池的 `PREFILL_FI` 绝不应触发。
+        let shadow = prefill_shadow_on()
+            && call.fp8kv
+            && call.t >= 64
+            && !res.capturing().unwrap_or(false);
 
         // plan(host,每形状一次;键 = 形状七元组 + **桶化 ctx**)
+        let kv_bytes = if shadow || !call.fp8kv { 2 } else { 1 };
         let key = plan_key(
             call.total_rows,
             call.ctx_total,
@@ -439,6 +511,7 @@ impl KernelFamily for FiRuntime {
             call.hd,
             call.page,
             fi_cuda_graph(),
+            kv_bytes,
         );
         // ⚠️ **plan 必须在捕获窗之外算**(2026-10-14 实测 + 结构性守卫;自
         // `feat/prefill-graph` 合入)。
@@ -473,6 +546,7 @@ impl KernelFamily for FiRuntime {
             (int_ws_ptr, int_ws_bytes),
             &stream,
             &msg.kernel.name,
+            kv_bytes,
         )?;
         // ── int_ws 激活(多 plan 共存;M2b 2026-10-15)──
         //
@@ -496,22 +570,49 @@ impl KernelFamily for FiRuntime {
             (e.plan15, e.mask.as_ref().map(|m| m.ptr).unwrap_or(0))
         };
 
-        let run = if call.fp8kv {
-            owl_fi_prefill_run_fp8kv
+        // **f16 shadow**:先把当前 ctx 的物理页一次性反量化到 dense f16
+        // (identity 页表),再走 f16 臂。失败 = 结构化拒,不静默回落。
+        let (run, kc_run, vc_run, indices_run) = if shadow {
+            let pages = call.ctx_total.div_ceil(call.page.max(1)).max(1);
+            let (sk, sv, sidx) = self.ensure_shadow(res, pages, call.page, call.hkv, call.hd)?;
+            let rc = unsafe {
+                owl_fi_dequant_fp8_to_f16(
+                    kc as *const std::ffi::c_void,
+                    vc as *const std::ffi::c_void,
+                    sk as *mut std::ffi::c_void,
+                    sv as *mut std::ffi::c_void,
+                    indices as *const i32,
+                    pages as i32,
+                    call.hkv as i32,
+                    call.hd as i32,
+                    call.page as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                )
+            };
+            if rc != 0 {
+                return Err(OpError::Launch {
+                    op: msg.kernel.name.clone(),
+                    stage: crate::contract::Stage::Compute,
+                    detail: format!("fi shadow dequant err {rc}(pages={pages})"),
+                });
+            }
+            (owl_fi_prefill_run as FiRunFn, sk, sv, sidx)
+        } else if call.fp8kv {
+            (owl_fi_prefill_run_fp8kv as FiRunFn, kc, vc, indices)
         } else {
-            owl_fi_prefill_run
+            (owl_fi_prefill_run as FiRunFn, kc, vc, indices)
         };
         // 家族面入账(A13 补漏):FlashInfer = **直连 FFI 发射**(plan/run 均不经
         // `Exec::launch`),账上本无痕;ptrs = q/kc/vc/out 四块地址。
-        res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[q, kc, vc, out_ptr]);
+        res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[q, kc_run, vc_run, out_ptr]);
         let rc = unsafe {
             run(
                 q as *const std::ffi::c_void,
-                kc as *const std::ffi::c_void,
-                vc as *const std::ffi::c_void,
+                kc_run as *const std::ffi::c_void,
+                vc_run as *const std::ffi::c_void,
                 out_ptr as *mut std::ffi::c_void,
                 q_cu as *mut i32,
-                indices as *mut i32,
+                indices_run as *mut i32,
                 indptr as *mut i32,
                 last_len as *mut i32,
                 plan15.as_ptr(),
@@ -725,17 +826,23 @@ mod plan_key_tests {
     /// (实测 32k 单请求 186 次重算);桶化后只跨桶才新键。图档位单列。
     #[test]
     fn ctx_always_enters_key_before_bucketing() {
-        let k = |rows: usize, ctx: usize, graph: bool| plan_key(rows, ctx, rows, 24, 4, 256, 32, graph);
+        let k = |rows: usize, ctx: usize, graph: bool| plan_key(rows, ctx, rows, 24, 4, 256, 32, graph, 1);
         assert_ne!(k(512, 512, true), k(512, 2048, true), "ctx 必须分键(桶化由引擎侧做)");
         // 图档位:同形状不同档 ⇒ 不同键(数组与 padded_batch_size 都不同)
         assert_ne!(k(512, 0, false), k(512, 0, true));
         // 形状位:行数/页 仍分键
         assert_ne!(k(512, 0, true), k(511, 0, true));
         assert_ne!(
-            plan_key(512, 0, 512, 24, 4, 256, 32, true),
-            plan_key(512, 0, 512, 24, 4, 256, 64, true),
+            plan_key(512, 0, 512, 24, 4, 256, 32, true, 1),
+            plan_key(512, 0, 512, 24, 4, 256, 64, true, 1),
             "page 必须分键"
-        );    }
+        );
+        assert_ne!(
+            plan_key(512, 0, 512, 24, 4, 256, 32, true, 1),
+            plan_key(512, 0, 512, 24, 4, 256, 32, true, 2),
+            "KV 元素字节必须分键(fp8/f16 plan 不可互吃)"
+        );
+    }
 }
 
 // ============================================================================
@@ -769,6 +876,7 @@ impl FiRuntime {
         int_ws: (u64, usize),
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         op_name: &str,
+        kv_bytes: usize,
     ) -> Result<(), OpError> {
         let key = plan_key(
             geom.total_rows,
@@ -779,6 +887,7 @@ impl FiRuntime {
             geom.hd,
             geom.page,
             fi_cuda_graph(),
+            kv_bytes,
         );
         if self.plans.contains_key(&key) {
             return Ok(());
@@ -815,27 +924,52 @@ impl FiRuntime {
         let (mut plan15, mut cta_tile_q, mut split_kv) = ([0i64; 15], 0i32, 0i32);
         let mut int_bytes: usize = 0;
         let rc = unsafe {
-            owl_fi_prefill_plan(
-                float_ws.0 as *mut std::ffi::c_void,
-                float_ws.1,
-                int_ws.0 as *mut std::ffi::c_void,
-                int_ws.1,
-                self.host_staging.as_mut_ptr() as *mut std::ffi::c_void,
-                self.host_staging.len(),
-                plan15.as_mut_ptr(),
-                &mut cta_tile_q,
-                &mut split_kv,
-                &mut int_bytes,
-                qo_indptr.as_ptr(),
-                kv_indptr.as_ptr(),
-                geom.total_rows as i32,
-                1, // batch = 1(owl 单会话)
-                geom.hq as i32,
-                geom.hkv as i32,
-                geom.hd as i32,
-                geom.page as i32,
-                stream.cu_stream() as *mut std::ffi::c_void,
-            )
+            if kv_bytes == 2 {
+                owl_fi_prefill_plan2(
+                    float_ws.0 as *mut std::ffi::c_void,
+                    float_ws.1,
+                    int_ws.0 as *mut std::ffi::c_void,
+                    int_ws.1,
+                    self.host_staging.as_mut_ptr() as *mut std::ffi::c_void,
+                    self.host_staging.len(),
+                    plan15.as_mut_ptr(),
+                    &mut cta_tile_q,
+                    &mut split_kv,
+                    &mut int_bytes,
+                    qo_indptr.as_ptr(),
+                    kv_indptr.as_ptr(),
+                    geom.total_rows as i32,
+                    1,
+                    geom.hq as i32,
+                    geom.hkv as i32,
+                    geom.hd as i32,
+                    geom.page as i32,
+                    kv_bytes as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                )
+            } else {
+                owl_fi_prefill_plan(
+                    float_ws.0 as *mut std::ffi::c_void,
+                    float_ws.1,
+                    int_ws.0 as *mut std::ffi::c_void,
+                    int_ws.1,
+                    self.host_staging.as_mut_ptr() as *mut std::ffi::c_void,
+                    self.host_staging.len(),
+                    plan15.as_mut_ptr(),
+                    &mut cta_tile_q,
+                    &mut split_kv,
+                    &mut int_bytes,
+                    qo_indptr.as_ptr(),
+                    kv_indptr.as_ptr(),
+                    geom.total_rows as i32,
+                    1,
+                    geom.hq as i32,
+                    geom.hkv as i32,
+                    geom.hd as i32,
+                    geom.page as i32,
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                )
+            }
         };
         if rc != 0 {
             return Err(OpError::Launch {
@@ -922,6 +1056,97 @@ impl FiRuntime {
         Ok(())
     }
 
+    /// **prefill f16 shadow**:按当前 ctx 页数分配/复用 K+V f16 scratch
+    /// 与 identity 页表。返回 `(k_ptr, v_ptr, indices_ptr)`。
+    ///
+    /// shadow 是**覆盖写**的每层 staging,不跨层/跨轮保留;长度 O(ctx),
+    /// 但只有 1 层(16 层共用),262k/rank ≈ 512MiB。
+    fn ensure_shadow(
+        &mut self,
+        res: &mut dyn crate::device::DeviceRes,
+        pages: usize,
+        page: usize,
+        hkv: usize,
+        hd: usize,
+    ) -> Result<(u64, u64, u64), OpError> {
+        let per_page = page
+            .checked_mul(hkv)
+            .and_then(|v| v.checked_mul(hd))
+            .and_then(|v| v.checked_mul(2)) // f16
+            .ok_or_else(|| OpError::Contract {
+                op: PREFILL_FI.into(),
+                field: "shadow.geom",
+                expect: "page*hkv*hd*2 不溢出".into(),
+                got: format!("page={page} hkv={hkv} hd={hd}"),
+            })?;
+        // **固定 cap**:cap_tokens=0 时退回按当前 ctx 增长(探针/未配置);
+        // 生产 boot 期下发 max_seq ⇒ 首层就按最大 ctx 预留,池后期变满也不再扩容。
+        let cap_tokens = prefill_shadow_cap();
+        let cap_pages = if cap_tokens == 0 { 0 } else { cap_tokens.div_ceil(page.max(1)) };
+        if cap_pages != 0 && pages > cap_pages {
+            return Err(OpError::Contract {
+                op: PREFILL_FI.into(),
+                field: "shadow.ctx",
+                expect: format!("ctx 页数 {pages} ≤ cap {cap_pages}(tokens={cap_tokens})"),
+                got: format!("page={page} ctx_pages={pages}"),
+            });
+        }
+        let want_pages = pages.max(cap_pages);
+        let k_bytes = want_pages.checked_mul(per_page).ok_or_else(|| OpError::Contract {
+            op: PREFILL_FI.into(),
+            field: "shadow.bytes",
+            expect: "pages*per_page 不溢出".into(),
+            got: format!("pages={want_pages} per_page={per_page}"),
+        })?;
+        let total = k_bytes.checked_mul(2).ok_or_else(|| OpError::Contract {
+            op: PREFILL_FI.into(),
+            field: "shadow.bytes",
+            expect: "2*K 不溢出".into(),
+            got: format!("k_bytes={k_bytes}"),
+        })?;
+        if pages == 0 || k_bytes == 0 {
+            return Err(OpError::Contract {
+                op: PREFILL_FI.into(),
+                field: "shadow",
+                expect: "pages>0 且 K/V 字节>0".into(),
+                got: format!("pages={pages} k_bytes={k_bytes}"),
+            });
+        }
+        if self.shadow.as_ref().map(|b| b.bytes < total).unwrap_or(true) {
+            let sb = res.alloc(total, "fi.prefill_shadow")?;
+            crate::klog_info!(
+                "kernels",
+                "FI prefill shadow 预留: {} MiB/rank(cap={} tok, {} 页, page={}, hkv={}, hd={})",
+                total / (1024 * 1024),
+                cap_tokens,
+                want_pages,
+                page,
+                hkv,
+                hd
+            );
+            self.shadow = Some(sb);
+        }
+        let need_idx = want_pages * 4;
+        if self.shadow_indices.as_ref().map(|b| b.bytes < need_idx).unwrap_or(true) {
+            let sb = res.alloc(need_idx, "fi.prefill_shadow_idx")?;
+            let mut bytes = Vec::with_capacity(need_idx);
+            for i in 0..want_pages {
+                bytes.extend_from_slice(&(i as i32).to_le_bytes());
+            }
+            res.upload(sb.ptr, &bytes)?;
+            self.shadow_indices = Some(sb);
+        }
+        let base = self.shadow.as_ref().ok_or_else(|| OpError::Asset {
+            op: PREFILL_FI.into(),
+            detail: "shadow 未装配".into(),
+        })?.ptr;
+        let idx = self.shadow_indices.as_ref().ok_or_else(|| OpError::Asset {
+            op: PREFILL_FI.into(),
+            detail: "shadow identity 表未装配".into(),
+        })?.ptr;
+        Ok((base, base + k_bytes as u64, idx))
+    }
+
     /// **plan 表同步**(W3):保证 (geom, ctx) 的 plan 在场,并把它的表刷进
     /// `int_ws`(窗外路径 ⇒ `activate` 必刷)。**调用方 = 引擎**(每步图 launch
     /// 之前),用于"FI 核在图内 + 图不烘 restore"的档。
@@ -942,7 +1167,7 @@ impl FiRuntime {
         let (fp, fb) = (float_ws.ptr, float_ws.bytes);
         let (ip, ib) = (int_ws.ptr, int_ws.bytes);
         let stream = res.stream()?;
-        self.ensure_plan(geom, ctx_total, res, (fp, fb), (ip, ib), &stream, "plan-sync")?;
+        self.ensure_plan(geom, ctx_total, res, (fp, fb), (ip, ib), &stream, "plan-sync", 1)?;
         let key = plan_key(
             geom.total_rows,
             ctx_total,
@@ -952,6 +1177,7 @@ impl FiRuntime {
             geom.hd,
             geom.page,
             fi_cuda_graph(),
+            1,
         );
         self.activate(key, res)
     }

@@ -72,6 +72,13 @@ impl TestRes {
         host.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
     }
 
+    /// 设备地址(测试域直调 FFI 用;块在册即返回)。
+    pub fn ptr(&self, id: u64) -> u64 {
+        let s = self.blocks.get(&id).expect("块在册");
+        let (p, _guard) = cudarc::driver::DevicePtr::device_ptr(s, &self.stream);
+        p
+    }
+
     pub fn take_u16(&self, id: u64) -> Vec<u16> {
         let s = self.blocks.get(&id).expect("块在册");
         let host = self.stream.clone_dtoh(s).expect("dtoh");

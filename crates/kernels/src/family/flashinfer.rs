@@ -104,6 +104,39 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    /// **f16 shadow 专用 plan**(显式 `kv_bytes`;2 = f16,不读 env)
+    pub fn owl_fi_prefill_plan2(
+        float_ws: *mut c_void, float_ws_size: usize,
+        int_ws: *mut c_void, int_ws_size: usize,
+        page_locked: *mut c_void, page_locked_size: usize,
+        out_plan15: *mut i64,
+        out_cta_tile_q: *mut i32,
+        out_split_kv: *mut i32,
+        out_int_bytes: *mut usize,
+        qo_indptr_h: *const i32,
+        kv_indptr_h: *const i32,
+        total_num_rows: i32,
+        batch_size: i32,
+        num_qo_heads: i32, num_kv_heads: i32,
+        head_dim: i32, page_size: i32,
+        kv_bytes: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// **FP8→F16 shadow 反量化**(prefill-only;dense 逻辑页输出)
+    pub fn owl_fi_dequant_fp8_to_f16(
+        k_src: *const c_void,
+        v_src: *const c_void,
+        k_dst: *mut c_void,
+        v_dst: *mut c_void,
+        indices: *const i32,
+        nb_pages: i32,
+        hkv: i32,
+        hd: i32,
+        page: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
     /// fp8 KV paged prefill(e4m3 KV + half Q/Out;scale 隐式 1.0)
     pub fn owl_fi_prefill_run_fp8kv(
         q_ptr: *const c_void,

@@ -1242,6 +1242,16 @@ pub struct KernelCfg {
     /// `owl_kernels::family::flashinfer::configure_plan_env` **唯一**写入。
     #[serde(default)]
     pub fi_cuda_graph: bool,
+    /// **prefill-only FP8→F16 shadow**(2026-10-26;实验,**默认关**):
+    /// prefill 每层 attention 前把当前 ctx 的 K/V 一次反量化进 f16 scratch,
+    /// 再走 FI f16 臂 —— 省掉 FA2 fp8 核在每个 q tile 上的重复 dequant/repack。
+    /// **仅 `[pool] kv_fp8 = true` 可用**;f16 主池没有可反量化的源,
+    /// 显式开 + f16 池 = `validate` 拒启(不静默 no-op)。
+    /// **不改 KV 池/不改变语义**;decode/verify 仍走 fp8。
+    /// scratch 大小 = ctx × 2KiB/rank(100k≈200MiB,262k≈512MiB),首层按
+    /// `runtime.max_seq` 预留,单层复用。
+    #[serde(default)]
+    pub prefill_shadow: bool,
     /// prefill(chunked q=T)注意力改走 **XQA**(与 verify **同一份**
     /// `M_TILESIZE=32` 实例化**;feature `xqa`;自 `feat/prefill-graph` 合入)。
     ///
@@ -1778,6 +1788,7 @@ impl Default for KernelCfg {
             // FI plan 图档瓦(2026-10-18 图档单图立案):**缺省关** —— 图档单图的
             // 其余件(W2 关自携 / W3 单图)未落地前开它只是换瓦片口径,不产生图。
             fi_cuda_graph: false,
+            prefill_shadow: false,
             xqa_prefill: false,
             fi_min_tokens: 1,
             // 2026-10-20:**定谳后翻默认**(FLA 五核,生产 spec-dflash 长期在跑;
@@ -2374,6 +2385,17 @@ impl OwlConfig {
                 self.spec.depth, SPEC_DEPTH_MAX, SPEC_VERIFY_ROWS_MAX
             ));
         }
+        // **prefill shadow 仅限 fp8 主 KV 池**(2026-10-26 用户裁决):
+        // 这是 FP8→F16 的 prefill-only 影子;f16 主池没有可反量化的源,
+        // 开启即无意义。默认关;显式开 + f16 池 = 配置面直接拒启,
+        // 不留给运行期静默 no-op。
+        if self.kernel.prefill_shadow && !self.pool.kv_fp8 {
+            return Err(
+                "[kernel] prefill_shadow = true 只支持 fp8 主 KV 池;当前 [pool] kv_fp8 = false。\
+                 请改回 kv_fp8 = true,或保持 prefill_shadow = false"
+                    .to_string(),
+            );
+        }
         // **DFlash2 lookup 自洽**(2026-10-22):只服务 DFlash2;nmin/nmax/
         // nstrong/agree 的代数关系在配置面先拒，boot 再按实际裁决模式兜底。
         if self.spec.lookup {
@@ -2808,6 +2830,23 @@ mod tests {
                 .is_err(),
             "合批 + 选择层视图应拒"
         );
+    }
+
+    /// **prefill shadow 只在 fp8 主池启用**(2026-10-26 用户裁决):
+    /// 默认关;f16 池 + 显式开启必须配置面拒启,不能静默无效。
+    #[test]
+    fn prefill_shadow_requires_fp8_kv() {
+        let e = OwlConfig::from_toml_str(
+            "[kernel]\nprefill_shadow = true\n[pool]\nkv_fp8 = false\n",
+        )
+        .expect_err("f16 KV + prefill_shadow 必须拒");
+        assert!(e.contains("prefill_shadow") && e.contains("fp8"), "{e}");
+        OwlConfig::from_toml_str(
+            "[kernel]\nprefill_shadow = true\n[pool]\nkv_fp8 = true\n",
+        )
+        .expect("fp8 KV + prefill_shadow 合规");
+        OwlConfig::from_toml_str("[pool]\nkv_fp8 = false\n")
+            .expect("f16 KV 默认关 shadow 合规");
     }
 
     #[test]
