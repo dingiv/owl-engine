@@ -324,6 +324,10 @@ decode_arm = "fi"
 fi_plan_bake = true
 fi_plan_restore = false
 fi_cuda_graph = true
+# prefill-only FP8→F16 shadow(实验;默认关,仅 pool.kv_fp8=true 可用;
+# f16 主池 + 本键 = validate 拒启。首层按 runtime.max_seq 预留,
+# 100k≈200MiB/rank,262k≈512MiB/rank;decode/verify 仍走 fp8)
+prefill_shadow = false
 xqa_prefill = false
 fi_min_tokens = 1
 gdn_chunked = true

@@ -41,7 +41,7 @@
 // plan:host 侧调度规划(每形状一次;Rust 侧一项缓存)
 // 入参/出参 ABI 与旧版逐字一致;新增校验 = `PrefillPlanWorkspaceSize`。
 // ---------------------------------------------------------------------------
-extern "C" int owl_fi_prefill_plan(
+static int owl_fi_prefill_plan_impl(
     void* float_ws, size_t float_ws_size,
     void* int_ws, size_t int_ws_size,
     void* page_locked, size_t page_locked_size,
@@ -60,11 +60,12 @@ extern "C" int owl_fi_prefill_plan(
     int32_t batch_size,
     int32_t num_qo_heads, int32_t num_kv_heads,
     int32_t head_dim, int32_t page_size,
+    uint32_t kv_bytes,
     cudaStream_t stream) {
   try {
     auto* qo_h = const_cast<int32_t*>(qo_indptr_h);
     auto* kv_h = const_cast<int32_t*>(kv_indptr_h);
-    const uint32_t kv_bytes = owl_fi_kv_bytes();
+    if (kv_bytes != 1 && kv_bytes != 2) return -203;
     const bool disable_split_kv = !owl_fi_split_kv_enabled();
 
     // ① 先问所需 workspace(上游要求尺寸精确;不够就**报出来**,不静默)
@@ -115,6 +116,52 @@ extern "C" int owl_fi_prefill_plan(
     OWL_LOG_ERROR("owl-fi", "[plan] 异常: %s", e.what());
     return -101;
   }
+}
+
+extern "C" int owl_fi_prefill_plan(
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, size_t int_ws_size,
+    void* page_locked, size_t page_locked_size,
+    int64_t* out_plan15,
+    int32_t* out_cta_tile_q,
+    int32_t* out_split_kv,
+    size_t* out_int_bytes,
+    const int32_t* qo_indptr_h,
+    const int32_t* kv_indptr_h,
+    int32_t total_num_rows,
+    int32_t batch_size,
+    int32_t num_qo_heads, int32_t num_kv_heads,
+    int32_t head_dim, int32_t page_size,
+    cudaStream_t stream) {
+  return owl_fi_prefill_plan_impl(float_ws, float_ws_size, int_ws, int_ws_size, page_locked,
+                                  page_locked_size, out_plan15, out_cta_tile_q, out_split_kv,
+                                  out_int_bytes, qo_indptr_h, kv_indptr_h, total_num_rows,
+                                  batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
+                                  owl_fi_kv_bytes(), stream);
+}
+
+/// **f16 shadow 专用 plan**:显式 `kv_bytes`(2 = f16),不读 env。
+extern "C" int owl_fi_prefill_plan2(
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, size_t int_ws_size,
+    void* page_locked, size_t page_locked_size,
+    int64_t* out_plan15,
+    int32_t* out_cta_tile_q,
+    int32_t* out_split_kv,
+    size_t* out_int_bytes,
+    const int32_t* qo_indptr_h,
+    const int32_t* kv_indptr_h,
+    int32_t total_num_rows,
+    int32_t batch_size,
+    int32_t num_qo_heads, int32_t num_kv_heads,
+    int32_t head_dim, int32_t page_size,
+    int32_t kv_bytes,
+    cudaStream_t stream) {
+  return owl_fi_prefill_plan_impl(float_ws, float_ws_size, int_ws, int_ws_size, page_locked,
+                                  page_locked_size, out_plan15, out_cta_tile_q, out_split_kv,
+                                  out_int_bytes, qo_indptr_h, kv_indptr_h, total_num_rows,
+                                  batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
+                                  (uint32_t)kv_bytes, stream);
 }
 
 // ---------------------------------------------------------------------------
