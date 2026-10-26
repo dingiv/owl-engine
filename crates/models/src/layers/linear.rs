@@ -732,7 +732,12 @@ impl Linear {
         ) {
             let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
             let n_pack = marlin_n_pack(self.out_dim);
-            let a_scales = TensorOps::zeros(Dtype::F32, vec![m, 1]);
+            // **`uninit` 而非 `zeros`（2026-10-27 刀A-1）**:`a_scales` 由紧随的
+            // 量化核**逐行全量写**(`scales[row]` for all row < m)⇒ 预清零是纯浪费。
+            // 而 `Op::Zeros` 在图里 = 一个 **memset 节点**(每条 a8 Linear 一个,
+            // 实测 104 发/rank/轮)⇒ W4A8 的 verify 图节点数 1575→1991 里有一半
+            // 是它。图节点派发 ~4-8µs/个 ⇒ 这一行白吃 0.5~1ms/轮。
+            let a_scales = TensorOps::uninit(Dtype::F32, vec![m, 1]);
             let q = crate::ops::quant_int8_row(xs, &fac.decl(), &a_scales, m, self.in_dim);
             // 槽序(w4a8 表)= a, b, out, scales, zeros, a_scales, ws, c_tmp,
             // m, k, n, groupsize(out 由装配器按 O 槽插入 —— 声明驱动)
