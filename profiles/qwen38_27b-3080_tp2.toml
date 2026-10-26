@@ -48,7 +48,8 @@ mode = "sampling"
 temp = 0.7
 topk = 20
 topp = 0.95
-rep_penalty = 1.0
+# 轻度重复惩罚；若仍出现语义级循环，再按请求/档位加到 1.08~1.10。
+rep_penalty = 1.05
 
 [spec]
 # TP2 草稿族放行(缺它 = tp.rs 装配期响亮拒)
