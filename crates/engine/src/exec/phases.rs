@@ -988,7 +988,6 @@ if self.dev.graphs.session.has_input("sel_pt") {
         // + 无重复惩罚 ⇒ 只读 64×2 float/rank,不回读整行 logits。
         let use_cand = sampler_on
             && self.head_split_active()
-            && self.boot.cfg.knobs.sampler_enabled
             && eff_sampler.rep_penalty <= 1.0
             && eff_sampler.topk > 0
             && eff_sampler.topk <= 32;
@@ -1942,6 +1941,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         } else {
             None
         };
+        let t_tokv_after = std::time::Instant::now();
         // 分布式采样候选:每行 32×(val,idx) = 256B/rank(替代 2MB 半表 logits)。
         let cand = if want_cand {
             Some(vg.read_output_f32("cand").await?)
@@ -1952,8 +1952,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         mrec(&format!("spec.verify.pre.fi.r{rank}"), t_launch - t_fi);
         mrec(&format!("spec.verify.pre.launch.r{rank}"), t_tok - t_launch);
         mrec(&format!("spec.verify.pre.tok.r{rank}"), t_logits - t_tok);
-        mrec(&format!("spec.verify.pre.tokv.r{rank}"), t_tokv - t_logits);
-        mrec(&format!("spec.verify.pre.cand.r{rank}"), t_end - t_tokv);
+        // tokv 计时 = 读 64B 的往返;cand 计时 = 读 256B 的往返(logits 各自独立)
+        mrec(&format!("spec.verify.pre.tokv.r{rank}"), t_tokv_after - t_tokv);
+        mrec(&format!("spec.verify.pre.cand.r{rank}"), t_end - t_tokv_after);
         mrec(&format!("spec.verify.pre.all.r{rank}"), t_end - t_fi);
         Ok((tok, tokv, cand, logits))
     }

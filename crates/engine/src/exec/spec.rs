@@ -168,7 +168,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // + topk 有界 + 无重复惩罚。任一不满足 ⇒ 走原 logits 路径(响亮可解释)。
         let use_cand = sampler_on
             && self.head_split_active()
-            && self.boot.cfg.knobs.sampler_enabled
             && sampler_cfg.rep_penalty <= 1.0
             && sampler_cfg.topk > 0
             && sampler_cfg.topk <= 32

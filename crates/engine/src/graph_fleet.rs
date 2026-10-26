@@ -539,8 +539,11 @@ impl<D: DeviceClient> GraphFleet<D> {
         let vocab = boot.model.logits_vocab();
         let knobs = boot.knobs;
         // **词表切面**(2026-10-26):decode 侧候选采样只对"两半表合并"有意义。
+        // 候选槽**恒随词表切**捕获(不再看 flavor 的 sampling/greedy):topk32
+        // 每轮 ~60µs/rank(0.2–0.4%),换来"请求级 temp>0 在 greedy 档也不再
+        // 回退 4MB logits"——用固定小税消掉一个静默陷阱。
         let head_split = vocab != boot.model.vocab_size();
-        let cand_on = head_split && knobs.sampler_enabled;
+        let cand_on = head_split;
         // taps 层号表(闭包 'static ⇒ Arc 持有;单一事实源 = SpecRuntime)
         let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let kv_caches = pool.kv_caches();
@@ -994,7 +997,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         // **分布式采样候选槽**:词表切 + "采样档 flavor"才捕获(topk32 每轮
         // 有 ~50µs 成本;纯 greedy 档不该付)。请求级 temp>0 落在 greedy flavor
         // 上时没有该槽 ⇒ spec.rs 自动回退 logits 老路(见 `use_cand` 门)。
-        let cand_on = head_split && knobs.sampler_enabled;
+        let cand_on = head_split;
         if cand_on {
             vouts.push(OutputSlot {
                 name: "cand".into(),
