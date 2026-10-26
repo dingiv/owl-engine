@@ -16,6 +16,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         bonus: u32,
         lookup: Option<&LookupProposal>,
     ) -> Result<Vec<u32>> {
+        let t_build = std::time::Instant::now();
         let fp = pos + m + 1;
         let depth = self.dev.spec_rt.depth;
         let block = depth + 1;
@@ -97,6 +98,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             ("prop_kv_lens", prop_kv_lens.as_slice()),
             ("kv_len", kv_len.as_slice()),
         ];
+        mrec("spec.propose.build", t_build.elapsed());
+        let t_launch = std::time::Instant::now();
         {
             let (dev, peer) = (&mut self.dev, self.peer.as_mut());
             match peer {
@@ -123,11 +126,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 }
             }
         }
+        mrec("spec.propose.launch", t_launch.elapsed());
+        let t_sel = std::time::Instant::now();
         let t1 = prof.then(std::time::Instant::now);
         // ★ **切档收割面**（P1.1 × P2.1,2026-10-19）:图本档只出半表候选
         // （`drafts` 槽不写）⇒ 走"读两 rank 候选 → host 合并 → rank0 select"。
         if self.head_split_active() {
             let mut d = self.dflash_select_merged(bonus).await?;
+            mrec("spec.propose.sel", t_sel.elapsed());
             self.apply_dflash_lookup(&mut d, lookup);
             return Ok(d);
         }
@@ -1094,6 +1100,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let rows = self.dev.spec_rt.depth;
         let k = TOP_K;
         let half = self.dev.boot.model.logits_vocab();
+        let t_r0 = std::time::Instant::now();
         // ① rank0 三槽（图输出；dtoh）。`topk` = 单缓冲:前段值区 ‖ 后段索引区。
         let (v0, c0, proj, dt) = {
             let pg = self
@@ -1111,6 +1118,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             (t[..rows * k].to_vec(), t[rows * k..].to_vec(), p, self.dev.spec_rt.draft_dt)
         };
+        mrec("spec.propose.sel.read0", t_r0.elapsed());
+        let t_r1 = std::time::Instant::now();
         // ② peer 同槽（候选）
         let (v1, c1) = {
             let p = self
@@ -1130,8 +1139,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             (t[..rows * k].to_vec(), t[rows * k..].to_vec())
         };
+        mrec("spec.propose.sel.read1", t_r1.elapsed());
+        let t_merge = std::time::Instant::now();
         // ③ host 合并（rank1 的 id + half）
         let (mv, mc) = crate::running::merge_topk_two_halves(&v0, &c0, &v1, &c1, rows, k, half)?;
+        mrec("spec.propose.sel.merge", t_merge.elapsed());
+        let t_eval = std::time::Instant::now();
         // ④ rank0 select（eager;全表域 —— 候选已合并、码本全量）
         let d2 = match self.dev.spec_rt.drafter.as_ref() {
             Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
@@ -1197,6 +1210,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             rows,
             k
         );
+        mrec("spec.propose.sel.eval", t_eval.elapsed());
         Ok(buf
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
