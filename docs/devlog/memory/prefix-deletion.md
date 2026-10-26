@@ -9,8 +9,9 @@
 > 不需要重算。就按这个需求做，不需要图片旋转/滑窗那一套。」
 
 > **2026-10-25 后续方向**：当前 `delta_limit=4` 的周期性整段 prefill 由
-> FP8 K 叠转漂移触发；下一步改为 leave-gap（删块保留幸存 position、不旋转 K），
-> 设计/交接见 [`image-evict-leave-gap-交接.md`](image-evict-leave-gap-交接.md)。
+> FP8 K 叠转漂移触发；leave-gap（删块保留幸存 position、不旋转 K）已实现
+> P0-P3 核心（`[pool].image_evict_mode = "leave_gap"`），设计/交接/施工结果
+> 见 [`image-evict-leave-gap-交接.md`](image-evict-leave-gap-交接.md)。
 
 | 修订 | 内容 |
 |---|---|

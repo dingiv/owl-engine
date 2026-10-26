@@ -39,7 +39,9 @@ extends = [
 
 - `prefix_cache=true` + `snap_msg_boundary=true`；
 - `implicit_session=true`（pi 不发 session，工具轮/图片删除有稳定会话）；
-- `image_evict=true` + `image_evict_delta_limit=4`（FP8 硬上限）；
+- `image_evict=true` + `image_evict_delta_limit=4`（FP8 硬上限，仅 `rebase` 模式）；
+- 删除后处理默认 `rebase`；`leave_gap` 已实现但需真机门验收后再切生产档
+  （`--set pool.image_evict_mode=leave_gap` 可试）；
 - 3090：`max_seq=63456 / snap_max=2 / host_cache=10G / snap_host=3G`；
 - 3080 TP2：`max_seq=262144 / snap_max=2 / host_cache=10G / snap_host=3G`。
 

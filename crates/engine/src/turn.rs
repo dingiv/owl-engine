@@ -212,6 +212,11 @@ pub(crate) struct Turn {
     pub(crate) img_spans: Vec<crate::img_evict::ImgSpan>,
     /// 本轮 prompt 的 pad 区间(升序;与 `img_spans` 同一次写回)
     pub(crate) img_pads: Vec<(usize, usize)>,
+    /// **本轮 prompt 的逐 token 绝对 m-RoPE 位置**(与 `prompt_ids` 等长;
+    /// leave-gap 时含位置洞)。
+    pub(crate) positions: Vec<crate::img_evict::Pos3>,
+    /// 本轮位置是否已离开紧凑坐标(leave-gap 删除后 true;缓存/投机门用)。
+    pub(crate) positions_gap: bool,
     /// **前缀无感删除命中**(本轮识别到的删除;`None` = 普通 turn)
     pub(crate) deletion: Option<crate::img_evict::TextDelete>,
     /// per-turn 可选项(AGT-06)
@@ -235,6 +240,14 @@ pub(crate) struct ActiveTurn {
     /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
     pub(crate) msg_snaps: Vec<usize>,
     pub(crate) max_new: usize,
+    /// **本轮 prompt 的逐 token 绝对位置**(与 `prompt_ids` 等长;prefill
+    /// 的 `pos` 槽与 VLM cos/sin 都从这里切)。
+    pub(crate) positions: Vec<crate::img_evict::Pos3>,
+    /// **下一枚生成 token 的绝对 rope 位置**(leave-gap 的核心;
+    /// 非 leave-gap 时恒等于 token 下标 + VLM delta)。
+    pub(crate) next_rope_pos: i32,
+    /// 本轮位置账含洞(leave-gap 删除后);spec/跨会话缓存暂时关闭。
+    pub(crate) rope_gap: bool,
     /// 忽略 EOS 跑满预算(TurnSpec 透传;测速口径)
     pub(crate) ignore_eos: bool,
     /// **起跑时刻**（墙钟 EWMA 用；`start_one` 写）

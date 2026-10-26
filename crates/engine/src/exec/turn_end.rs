@@ -198,7 +198,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 会话账落地(S1 收口):KV 此刻 = prompt 全量 + 生成段;GDN 状态
         // 跨 turn 连续。临时会话终了即焚(表不随 turn 数无界增长)
         if let Some(s) = self.bank.sessions.get_mut(act.session_id) {
-            s.commit_turn(&act.prompt_ids, &act.out);
+            s.commit_turn(
+                &act.prompt_ids,
+                &act.out,
+                &act.positions,
+                act.rope_gap,
+            )?;
             // **图像段账写回**(前缀无感删除;2026-10-23):与 `tokens` 同一次
             // 收口 —— 两处各写一份 = 下一轮删除识别拿错坐标。
             s.set_img_spans(act.img_spans.clone(), act.img_pads.clone());

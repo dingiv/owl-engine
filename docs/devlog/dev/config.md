@@ -291,6 +291,7 @@ ls profiles/
 | 面 | 形态 | 说明 |
 |---|---|---|
 | 引擎配置 | `[pool] image_evict = false` | 缺省关 = 逐字节旧行为。开 ⇒ boot 门要求**视觉档 + 分页 KV（f16 或 fp8-e4m3） + 前缀缓存**,任缺**拒启**;FP8 还要求 `image_evict_delta_limit ∈ 1..=4` |
+| 删除后处理 | `[pool] image_evict_mode = "rebase"` | `rebase` = 旧行为（旋转后缀 K，受 `delta_limit` 约束）；`leave_gap` = 保留幸存 position、不转 K、新 token 从 `max_pos+1` 追加（2026-10-25 实现，推荐新 GUI 档） |
 | 客户端标记 | 图像 content part `"owl_evict": true` | 「这张图将来可能从历史里删」。未标记 = 零行为差异;带标记但档位没开 = 提交**响亮拒** |
 
 - **生效形态**:带标记的图像段被补 `\n` 到「段首页对齐 + 整段整页」;下一轮若
@@ -299,7 +300,13 @@ ls profiles/
 - **标记冻结律**:一张图打了标记后,留在历史期间标记必须保持不变(pad 数由标记
   决定,改标记 ⇒ 前缀身份断 ⇒ 退化为重算,不会错值)。
 - **FP8 档**:已支持重转（e4m3→f16→f32→R(−S)→e4m3），但每次都有量化舍入；
-  `image_evict_delta_limit` 必须 1..=4，超限/0 拒启。
+  `image_evict_delta_limit` 必须 1..=4，超限/0 拒启。`leave_gap` 不转 K ⇒
+  不受该漂移上限约束。
+- **leave-gap（2026-10-25）**:删除只摘页，幸存 token 的 position 原样保留；
+  prefill/decode/verify 均读逐 token 绝对位置账。跨会话 token-only 缓存
+  只能由**本会话**命中（`positioned=true`）；spec 的 target verify/replay
+  已用 `next_rope_pos - 1`，草稿仍走既有 token 位置（只影响 AL，不影响贪心恒等）。
+  设计与交接:`memory/image-evict-leave-gap-交接.md`。
 - 语义:删点**之前**逐位等价;删点**之后**是**搬运记忆**(后缀 KV/GDN 仍带着被删
   图的上下文)。设计与门:`memory/prefix-deletion.md`。
 

@@ -136,6 +136,7 @@ impl ChunkTables {
         fi_face: bool,
         xqa_face: bool,
         past: Option<(&[u32], usize)>,
+        positions: Option<&[[i32; 3]]>,
     ) -> Result<Self> {
         let seq = |start: usize, n: usize| -> Vec<f32> {
             (0..n).map(|i| (start + i) as f32).collect()
@@ -175,7 +176,20 @@ impl ChunkTables {
         let fi = if fi_face { Some(fi_tables_view(base_for_len, t, &tbl, page)?) } else { None };
         Ok(Self {
             ids: ids.iter().map(|v| *v as f32).collect(),
-            pos: seq(base, t),
+            pos: match positions {
+                Some(p) => {
+                    if p.len() < base + t {
+                        return Err(ModelError::Msg(format!(
+                            "ChunkTables: 位置表 {} 短于 [{}..{})",
+                            p.len(), base, base + t
+                        )));
+                    }
+                    // `ChunkTables.pos` 是**标量 rope 槽**(长度 t);m-RoPE
+                    // 的三轴表由 VLM 注入面覆盖(`ctx.pos = vlm_pos`)。
+                    p[base..base + t].iter().map(|v| v[0] as f32).collect()
+                }
+                None => seq(base, t),
+            },
             slots,
             lens,
             gdn_slot: gdn_slot_v as f32,
@@ -249,6 +263,8 @@ pub(crate) struct ChunkHost<'a> {
     pub(crate) sid: u64,
     /// 本会话块链(logical → 物理页)
     pub(crate) bt_chain: &'a [u32],
+    /// 本 turn 的逐 token 绝对位置(prompt 坐标;leave-gap 含洞)
+    pub(crate) positions: &'a [[i32; 3]],
     pub(crate) gdn_slot: usize,
     /// host 账房(草稿臂;peer 路 None)
     pub(crate) bank: Option<&'a mut SessionBank>,
@@ -354,6 +370,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             self.pool.geom.fi_face,
             self.env().attn.xqa_prefill,
             past_view.as_ref().map(|(pages, tokens)| (pages.as_slice(), *tokens)),
+            Some(host.positions),
         )?;
         // **B-3e-2 第 3 项**:子集档 ⇒ 把本 chunk 的"过去表"写进池里的视图块,
         // 并把它当作 `block_tables`(eager prefill 无图,块叶直接可用)。

@@ -83,6 +83,12 @@ pub struct EngineKnobs {
     /// (`R(−S)`),不重算删点之后的 token。依赖 `prefix_cache` + 分页池
     /// (f16 或 fp8-e4m3) + 视觉档(boot 门;任缺 = 拒启)。
     pub image_evict: bool,
+    /// **删除后处理模式**(`[pool].image_evict_mode`;缺省 `rebase`)。
+    ///
+    /// `leave_gap` = 删除后不旋转 K、不移动幸存 token 的 position;新 token
+    /// 从 `max_pos+1` 追加。它不需要 `image_evict_delta_limit`,也不会因
+    /// 叠转到顶触发整段重建。
+    pub image_evict_mode: owl_shared::config::ImageEvictMode,
     /// **漂移上限 = 一条链允许被重转的次数**(`[pool].image_evict_delta_limit`;
     /// 缺省 32;`0` = 不限)。到顶后**下一轮删除触发一次整段重建**(全量
     /// prefill + `reset_gdn`)—— 漂移与计数同时归零(不在漂移上继续加)。
@@ -328,6 +334,7 @@ impl Default for EngineKnobs {
             prefix_cache: true,
             bulk_drop_when_tier_full: false,
             image_evict: false,
+            image_evict_mode: owl_shared::config::ImageEvictMode::Rebase,
             image_evict_delta_limit: 32,
             image_evict_pad: "。".to_string(),
             host_cache_mb: 0,
@@ -664,6 +671,7 @@ impl EngineKnobs {
             prefix_cache: cfg.pool.prefix_cache,
             bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
             image_evict: cfg.pool.image_evict,
+            image_evict_mode: cfg.pool.image_evict_mode,
             image_evict_delta_limit: cfg.pool.image_evict_delta_limit,
             image_evict_pad: cfg.pool.image_evict_pad.clone(),
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
@@ -1441,16 +1449,18 @@ pub(crate) fn into_running<D: DeviceClient>(
                     .into(),
             ));
         }
-        if !dev.pool.geom.paged || !dev.pool.k_shift_supported() {
+        if !dev.pool.geom.paged || (!cfg.knobs.image_evict_mode.is_leave_gap() && !dev.pool.k_shift_supported()) {
             return Err(ModelError::Msg(format!(
                 "[pool] image_evict = true 需要 f16 或 fp8-e4m3 分页 KV 池\
-                 (paged={} kv_fp8={} dtype={:?})",
+                 (mode={:?} paged={} kv_fp8={} dtype={:?})",
+                cfg.knobs.image_evict_mode,
                 dev.pool.geom.paged, dev.pool.geom.kv_fp8, dev.pool.geom.dims.dtype
             )));
         }
         // FP8 的每次重转都经过一次 e4m3 量化舍入(12.5% 网格);不设上限会
         // 累积到不可用。f16 的缺省 32 轮不适用于 FP8 ⇒ 必须显式收紧。
-        if dev.pool.geom.kv_fp8 {
+        // leave-gap 不转 K ⇒ 不受这条漂移门约束。
+        if dev.pool.geom.kv_fp8 && !cfg.knobs.image_evict_mode.is_leave_gap() {
             let limit = cfg.knobs.image_evict_delta_limit;
             if limit == 0 || limit > 4 {
                 return Err(ModelError::Msg(format!(
@@ -1480,10 +1490,12 @@ pub(crate) fn into_running<D: DeviceClient>(
         }
         owl_shared::log_info!(
             "boot",
-            "前缀无感删除:开({} 池;delta_limit={};可删图像段页对齐 pad = {:?} + 删除后缀 K 重转;页 {} tok)",
+            "前缀无感删除:开({} 池;mode={:?};delta_limit={};可删图像段页对齐 pad = {:?};{};页 {} tok)",
             if dev.pool.geom.kv_fp8 { "fp8-e4m3" } else { "f16" },
+            cfg.knobs.image_evict_mode,
             cfg.knobs.image_evict_delta_limit,
             if cfg.knobs.image_evict_pad.is_empty() { "(自动)" } else { cfg.knobs.image_evict_pad.as_str() },
+            if cfg.knobs.image_evict_mode.is_leave_gap() { "删除后保留位置洞、不改 K" } else { "删除后缀 K 重转" },
             dev.pool.geom.page
         );
     }
@@ -1559,6 +1571,10 @@ pub(crate) fn into_running<D: DeviceClient>(
         hk: crate::housekeeping::Housekeeping::default(),
         dev,
         peer,
+        vlm_cache: [
+            crate::vlm::VlmMergedCache::default(),
+            crate::vlm::VlmMergedCache::default(),
+        ],
     })
 }
 

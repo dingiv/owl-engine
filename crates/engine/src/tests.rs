@@ -711,6 +711,8 @@ pub async fn gpu_schedule_decision_surface() {
         let act = &mut eng.turns.active[0];
         act.fed = act.prompt_ids.len();
         act.out.push(7);
+        act.positions.push([act.next_rope_pos; 3]);
+        act.next_rope_pos = act.next_rope_pos.saturating_add(1);
     }
 
     let page = eng.dev.pool.geom.page;
@@ -744,8 +746,16 @@ pub async fn gpu_schedule_decision_surface() {
     // "有没有得复用"由**内容身份**说了算,不由会话账说了算。
     {
         let act = eng.turns.active.pop().expect("模拟器活跃 turn");
+        eng.turns.select(None);
+        eng.close_admission(act.id);
         let s = eng.bank.sessions.get_mut(act.session_id).unwrap();
-        s.commit_turn(&act.prompt_ids, &[]);
+        s.commit_turn(
+            &act.prompt_ids,
+            &[],
+            &act.positions[..act.prompt_ids.len()],
+            act.rope_gap,
+        )
+        .expect("提交位置账");
         s.cached_len -= 2;
     }
     eng.submit_session(Some(sid), "一二三四五六七八九十", 2).unwrap();
@@ -4826,21 +4836,25 @@ pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
 }
 
 
-/// **前缀无感删除门**(2026-10-23;设计卷 `memory/prefix-deletion.md`)。
+/// **前缀无感删除门（leave-gap；2026-10-25 改造）**。
 ///
-/// 场景 = GUI agent 的一步:历史里有两张截图(turn 1),harness 把**旧的
-/// 第一张**抽掉(turn 2),其余全部前移。
+/// 场景 = GUI agent 的一步：历史里有两张截图（turn 1），harness 把**旧的
+/// 第一张**抽掉（turn 2），其余全部前移；随后再删剩余那张（G7）。
 ///
-/// # 判据(硬)
+/// # 判据（硬）
 ///
-/// 1. `image_evict.absorbed == 1` —— 删除**被吸收**,不是退回全量重算;
-/// 2. 删除区间 == 第一张图的**整段**(含页对齐 pad),起点/长度都是整页;
-/// 3. **G1 机械等价**:被复用后缀页的每层 K == `R(−S)·` 删除前(配对量级 ≤4 ulp)
-///    —— 退回重算会因 hidden 不同而**完全不等**,所以这条是**正判别**;
-/// 4. 吸收轮 prefill 事件数很小(只喂新尾部;后缀零重算);
-/// 5. 两轮文本都非空。
+/// 1. `image_evict.absorbed` 递增 —— 删除**被吸收**，不是退回全量重算；
+/// 2. 删除区间 == 被删图的**整段**（含页对齐 pad），起点/长度都是整页；
+/// 3. **K 一个字节都不改**：删除前后后缀物理页的每层 K 逐字节相同
+///    （leave-gap 的正判别；旧 rebase 路径这条必红）；
+/// 4. 吸收轮 prefill 事件数很小（只喂新尾部；后缀零重算）；
+/// 5. 幸存 token 的 position 逐 token 不变，`max_pos` 不回退；
+/// 6. 旧链从删点起的身份已释放：被删图槽的 `slot_refs` 在 `execute_begin`
+///    之后归零（删除前 >0）；K 内容本身未被改写（只比保留后缀页）；
+/// 7. 第二次删除仍吸收，`rot_rounds == 0` / `rebased == 0`（delta_limit
+///    在 leave-gap 下不生效）。
 ///
-/// ⚠️ 0.8B「boot 后第一轮就带图」有既有红(F1,另案)⇒ 门先跑**纯文本预热轮**。
+/// ⚠️ 0.8B「boot 后第一轮就带图」有既有红（F1，另案）⇒ 门先跑**纯文本预热轮**。
 pub async fn gpu_image_evict_gate() {
     let Some(ordinal) = gpu_ordinal() else {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
@@ -4859,11 +4873,12 @@ pub async fn gpu_image_evict_gate() {
             vision: true,
             prefix_cache: true,
             image_evict: true,
-            // **叠转上限降到 1**:让 G7 臂第一次删除吸收(rot=1)、第二次删除
-            // 必然到顶 ⇒ 整段重建(门要的是"到顶真的重建",不是数值)
+            image_evict_mode: owl_shared::config::ImageEvictMode::LeaveGap,
+            // 故意设 1：leave-gap 必须无视这个 rebase 漂移上限，第二次删除
+            // 仍要吸收而不是整段重建。
             image_evict_delta_limit: 1,
-            // 钉小池(门只跑 ~700 tok;auto 池算式在本机会被"预算可服务上限"
-            // 拒 —— 与本特性无关的既有面)
+            // 钉小池（门只跑 ~700 tok；auto 池算式在本机会被“预算可服务上限”
+            // 拒 —— 与本特性无关的既有面）
             pool_tokens: Some(2048),
             ..Default::default()
         },
@@ -4893,10 +4908,10 @@ pub async fn gpu_image_evict_gate() {
         v[0]
     };
     let (vs, ve) = (one(&running, "<|vision_start|>"), one(&running, "<|vision_end|>"));
-    // pad 词与引擎**同一单源**(`RunningEngine::image_pad_token`)
+    // pad 词与引擎**同一单源**（`RunningEngine::image_pad_token`）
     let pad_id = running.image_pad_token().expect("引擎 pad 词");
 
-    // ── 预热轮(纯文本;消掉 F1 的"首轮+图"变量) ──
+    // ── 预热轮（纯文本；消掉 F1 的“首轮+图”变量） ──
     {
         let (_s, t) = running
             .submit_session(Some(5), "请用一句话说明你在做什么。", 6)
@@ -4905,7 +4920,7 @@ pub async fn gpu_image_evict_gate() {
         assert!(!text.trim().is_empty(), "纯文本预热轮必须出文本");
     }
 
-    // 图:grid (1,16,16) ⇒ 占位 (16/2)·(16/2) = 64 tok(网格 ≥ 16×16 是 FI ragged 门)
+    // 图：grid (1,16,16) ⇒ 占位 (16/2)·(16/2) = 64 tok（网格 ≥ 16×16 是 FI ragged 门）
     let l_img = 64usize;
     let mk_img = |salt: f32| owl_models::vlm::VlmImage {
         pixel_values: (0..256 * 3 * 2 * 16 * 16)
@@ -4923,7 +4938,7 @@ pub async fn gpu_image_evict_gate() {
     };
     let q1 = "请用一句话说明你看到了什么。";
     let mid = "中间这段文字会留在历史里。\n";
-    // ── turn 1:两张截图(都打可删标记) ──
+    // ── turn 1：两张截图（都打可删标记） ──
     let prompt1 = running.boot.tok.chat_format().render_chat(
         &[
             ("system", "你是助手,按约定回答。"),
@@ -4949,7 +4964,7 @@ pub async fn gpu_image_evict_gate() {
     let text1 = drive_turn(&mut running, t1).await;
     assert!(!text1.trim().is_empty(), "t1 必须出文本(视觉基线)");
 
-    // ── 测试侧复算 pad 律(与引擎同一份纯函数;用来验"删的正是第一段") ──
+    // ── 测试侧复算 pad 律（与引擎同一份纯函数；用来验“删的正是第一段”） ──
     let grids = [(1usize, 16usize, 16usize), (1usize, 16usize, 16usize)];
     let ids1 = running.boot.tok.encode(&prompt1);
     let seq1 = crate::img_evict::pad_image_spans(
@@ -4969,7 +4984,7 @@ pub async fn gpu_image_evict_gate() {
     assert_eq!(spans1[0].start % page, 0, "段首必须页对齐");
     assert_eq!((spans1[0].end - spans1[0].start) % page, 0, "段长必须整页");
     let del = spans1[0];
-    {
+    let (old_tokens, old_positions, old_max) = {
         let s = running.bank.sessions.session(sid).expect("会话账");
         assert_eq!(
             &s.tokens[..padded1.len()],
@@ -4979,9 +4994,9 @@ pub async fn gpu_image_evict_gate() {
         assert_eq!(s.img_spans.len(), 2, "会话账必须记住两段");
         assert_eq!(s.img_spans[0].start, spans1[0].start);
         assert_eq!(s.img_spans[0].end, spans1[0].end);
-    }
-    // 旧链槽位(内容树;turn 收口后会话不持表)
-    let old_tokens = running.bank.sessions.session(sid).expect("会话账").tokens.clone();
+        (s.tokens.clone(), s.positions.clone(), s.max_pos)
+    };
+    // 旧链槽位（内容树；turn 收口后会话不持表）
     let (hit, _) = running.bank.rel.match_prefix(&old_tokens).expect("旧链命中");
     assert!(
         hit.matched_blocks >= (del.end / page) + 1,
@@ -4990,8 +5005,8 @@ pub async fn gpu_image_evict_gate() {
         del.end / page
     );
 
-    // ── 读 K(全层;删点之后的整段 —— 吸收后这些页要被原地重转) ──
-    // 一条 `dtoh_batch` 读完一个槽的全部层(逐层一次往返会把门拖成分钟级)。
+    // ── 读 K（全层；删点之后的整段 —— leave-gap 下这些页必须一字节不改） ──
+    // 一条 `dtoh_batch` 读完一个槽的全部层（逐层一次往返会把门拖成分钟级）。
     async fn read_slot(
         running: &mut RunningEngine<crate::GpuFace>,
         slot: u32,
@@ -5009,12 +5024,14 @@ pub async fn gpu_image_evict_gate() {
     }
     let mut k_before: std::collections::HashMap<u32, Vec<Vec<u8>>> =
         std::collections::HashMap::new();
-    for slot in hit.slots.iter().skip(del.start / page).flatten().copied() {
+    // 只读**保留后缀**页（删点之前的物理页会被释放、可能被新尾巴复用；
+    // 这里验的是“没被删的 K 一字节不改”）。
+    for slot in hit.slots.iter().skip(del.end / page).flatten().copied() {
         let per_layer = read_slot(&mut running, slot, per_page_bytes).await;
         k_before.insert(slot, per_layer);
     }
 
-    // ── turn 2:harness 抽掉**第一张**截图(其余全部前移) ──
+    // ── turn 2：harness 抽掉**第一张**截图（其余全部前移） ──
     let q2 = "现在屏幕上还有什么?";
     let prompt2 = running.boot.tok.chat_format().render_chat(
         &[
@@ -5028,8 +5045,8 @@ pub async fn gpu_image_evict_gate() {
         ],
         false,
     );
-    // 幸存图的**标记必须保持不变**:pad 律由 `evict` 决定,标记一变 ⇒ pad 数变
-    // ⇒ 前缀身份断(这是"标记一旦打上就冻结"的硬约束,见设计卷)
+    // 幸存图的**标记必须保持不变**：pad 律由 `evict` 决定，标记一变 ⇒ pad 数变
+    // ⇒ 前缀身份断（这是“标记一旦打上就冻结”的硬约束，见设计卷）
     let imgs2 = vec![crate::turn::TurnImage { image: mk_img(0.6), evict: true }];
     let (_, t2) = running
         .submit_session_opts(
@@ -5039,6 +5056,37 @@ pub async fn gpu_image_evict_gate() {
             crate::turn::TurnOpts { images: imgs2, ..Default::default() },
         )
         .expect("t2 提交");
+    // **引用释放的机械门**：先把决策+begin 跑完（不跑 prefill），在宿主
+    // 回灌和旧链 drop 之后检查被删图的物理槽引用必须归零。
+    //
+    // 为什么要手动拆 `pump`：`pump` = schedule + begin + prefill 一步；prefill
+    // 会马上复用空闲槽，之后再看 refs 就分不清“释放了”还是“又被用了”。
+    let deleted_slots: Vec<u32> = hit.slots[del.start / page..del.end / page]
+        .iter()
+        .filter_map(|s| *s)
+        .collect();
+    assert!(!deleted_slots.is_empty(), "被删图应有设备槽");
+    for slot in &deleted_slots {
+        assert!(
+            running.bank.rel.leg.slot_refs(*slot) > 0,
+            "删除前 {slot} 应仍有缓存引用（否则本门没有可验对象）"
+        );
+    }
+    let begin = match running.schedule().expect("t2 schedule") {
+        SchedulerOutput::Step { begin: Some(b), action } => {
+            assert!(matches!(action, StepAction::Prefill { .. }), "t2 应从 prefill 起步");
+            b
+        }
+        _ => panic!("t2 决策应带 begin + Prefill"),
+    };
+    running.execute_begin(begin).await.expect("t2 begin");
+    for slot in &deleted_slots {
+        assert_eq!(
+            running.bank.rel.leg.slot_refs(*slot),
+            0,
+            "被删图的槽 {slot} 仍有缓存引用：leave-gap 没有解除旧链尾引用"
+        );
+    }
     let mut prefill_events = 0usize;
     let text2 = loop {
         match running.pump().await.expect("pump") {
@@ -5051,100 +5099,91 @@ pub async fn gpu_image_evict_gate() {
     };
     assert!(!text2.trim().is_empty(), "t2 必须出文本");
 
-    // ① 吸收(不是退回重算)
+    // ① 吸收（不是退回重算）
     let trace = running.img_evict.last.clone().expect("必须吸收删除(退回重算 = 本门失败)");
-    assert_eq!(running.img_evict.absorbed, 1, "一次删除只许吸收一次(Δ 一次性)");
+    assert_eq!(running.img_evict.absorbed, 1, "一次删除只许吸收一次");
     // ② 删的正是第一张图的整段
     assert_eq!(trace.a, del.start, "删除起点必须是第一段的段首");
     assert_eq!(trace.b, del.end, "删除终点必须是第一段的段尾(含 pad)");
     assert_eq!(trace.a % page, 0, "删点必须页对齐");
     assert_eq!((trace.b - trace.a) % page, 0, "删除长度必须整页");
     assert!(trace.keep_blocks >= 1, "后缀至少要保留一页");
-    assert_eq!(trace.pages.len(), trace.keep_blocks);
+    // ④ 整链登记必须包含删除点之后的 suffix —— 否则下一轮内容树只能匹配
+    // 到删点之前，`reuse_face` 再退快照也救不回来（2026-10-26 前端
+    // turn36→37 案：删除轮 cache 41k，下一轮只到 36,960）。
+    {
+        let s = running.bank.sessions.session(sid).expect("会话账");
+        let (hit_new, _) = running.bank.rel.match_prefix(&s.tokens).expect("新链查询");
+        eprintln!(
+            "[test] leave-gap 新链登记:matched={} suffix_start_page={} keep={} tokens={}",
+            hit_new.matched_blocks,
+            trace.a / page,
+            trace.keep_blocks,
+            s.tokens.len() / page
+        );
+        assert!(
+            hit_new.matched_blocks > trace.a / page,
+            "删除后新链没有登记 suffix：matched={} / 删点页={} / keep={}",
+            hit_new.matched_blocks,
+            trace.a / page,
+            trace.keep_blocks
+        );
+    }
+    assert_eq!(trace.shift, 0, "leave-gap 不许 K 旋转");
+    assert!(trace.pages.is_empty(), "leave-gap 不许标旋转页");
+    assert_eq!(trace.rotate_us, 0, "leave-gap 不许发 K 重转核");
+    assert_eq!(trace.rot_rounds, 0, "leave-gap 不累计叠转");
+    assert_eq!(running.img_evict.rebased, 0, "leave-gap 不整段重建");
     // ③ 吸收轮只喂新尾部
     assert!(
         prefill_events <= 3,
         "吸收轮 prefill 事件 {prefill_events} 次 —— 后缀被重算了?(期间应只喂新尾部)"
     );
 
-    // ④ **G6b 改写即失效**:被重转后缀在内容树里的**旧身份必须已废弃** ——
-    // 否则别的会话按旧 token 命中同一批槽,会读到旋转过的 K(静默错值;实测 NaN)。
-    {
-        let (hit_old, _) = running.bank.rel.match_prefix(&old_tokens).expect("旧链查询");
-        // 删点之后**整条旧链**都不可达了:被删段的 KV 已显式释放(用户口径:
-        // 删了图显存要跟着降),后缀页被原地重转(旧身份失真),尾巴是孤儿。
-        // ⇒ 旧 tokens 现在只能命中**前缀**。
-        // **2026-10-24 收窄**:我们只摘「被旋转页」的旧身份(正确性);被删段与
-        // 未复用的老尾巴内容没变 ⇒ 留作死枝交回收器。所以旧历史现在能**穿过
-        // 被删段**,在**第一个被旋转的页**处断 ✓(那里 K 已失真)。
+    // ④ **K 一字节不改**：逐页逐层逐字节对比删除前后
+    for (&slot, before) in &k_before {
+        let after = read_slot(&mut running, slot, per_page_bytes).await;
         assert_eq!(
-            hit_old.matched_blocks,
-            trace.b / page,
-            "旧身份必须止于第一页被旋转的后缀(得 {} 块;b/page={})",
-            hit_old.matched_blocks,
-            trace.b / page
+            &after, before,
+            "页 {slot} 的 K 在 leave-gap 删除后被改写(必须一字节不动)"
         );
     }
 
-    // ⑤ **G1 机械等价**:复用后缀页每层 K == R(−S)·删除前(配对量级 ≤4 ulp)
-    let mrope_delta = {
-        let vlm = running.dev.boot.vlm.as_ref().expect("VLM");
-        owl_models::layers::kvshift::delta_table(&vlm.cfg().mrope, -trace.shift)
-    };
-    let half = mrope_delta.0.len();
-    let geom = running.dev.pool.k_shift_geom(half).expect("K 重转几何");
-    let mut worst = 0f32;
-    for &slot in &trace.pages {
-        let Some(before) = k_before.get(&slot) else {
-            panic!("后缀页 {slot} 不在删除前的读取集里(页序错?)");
-        };
-        let after_all = read_slot(&mut running, slot, per_page_bytes).await;
-        for (li, after) in after_all.iter().enumerate() {
-            // host 参考:同一页原地乘 R(−S)
-            let mut expect = before[li]
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                .collect::<Vec<u16>>();
-            owl_models::layers::kvshift::k_shift_host_f16(
-                &mut expect,
-                &mrope_delta.0,
-                &mrope_delta.1,
-                &[0u32],
-                geom,
-            )
-            .expect("host 参考");
-            // 判据 = **配对量级**的 4 ulp(rotate-half 的配对是
-            // `(d, d+half)`;抵销情形按**输入**量级取 ulp —— 按输出去取会爆)
-            let dg_units = geom.half / geom.x;
-            let n_el = after.len() / 2;
-            for i in 0..n_el {
-                let a = &after[i * 2..i * 2 + 2];
-                let av = f32::from(half::f16::from_bits(u16::from_le_bytes([a[0], a[1]])));
-                let ev = f32::from(half::f16::from_bits(expect[i]));
-                let dg = (i / (geom.page * geom.x)) % (geom.hd / geom.x);
-                let partner = if dg < dg_units {
-                    i + geom.half * geom.page
-                } else {
-                    i - geom.half * geom.page
-                };
-                let pv = before[li]
-                    .chunks_exact(2)
-                    .nth(partner)
-                    .map(|b| f32::from(half::f16::from_bits(u16::from_le_bytes([b[0], b[1]]))))
-                    .unwrap_or(0.0);
-                let scale = av.abs().max(ev.abs()).max(pv.abs()).max(1e-3);
-                let ulp = scale * 2f32.powi(-10);
-                worst = worst.max((av - ev).abs() / (4.0 * ulp));
-                assert!(
-                    (av - ev).abs() <= 4.0 * ulp,
-                    "层 {li} 页 {slot} 元素 {i}: K 重转与 host 参考不符({av} vs {ev};配对 {pv};第 {worst:.2} × 4ulp)"
-                );
-            }
-        }
+    // ⑤ 位置账：幸存后缀逐 token 不变，max_pos 不回退
+    {
+        let s = running.bank.sessions.session(sid).expect("会话账");
+        assert!(s.positioned, "删除后必须标记位置洞");
+        assert_eq!(s.positions.len(), s.tokens.len(), "位置账与 token 账等长");
+        assert!(s.max_pos >= old_max, "max_pos 不回退");
+        let k = old_tokens[del.end..]
+            .iter()
+            .zip(&s.tokens[del.start..])
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(k > 0, "至少应有一段幸存后缀可对位置账");
+        assert_eq!(
+            &s.positions[del.start..del.start + k],
+            &old_positions[del.end..del.end + k],
+            "幸存后缀 position 必须逐 token 不变"
+        );
     }
-    // ── G5 臂:**引擎不自作主张** —— 删一张**未标记**的图 ⇒ 必须退回旧路径 ──
+
+    // ⑥ **旧链尾引用已释放**：从删点起的旧身份已不在内容树 ⇒ 被删图的
+    // KV 槽不再被缓存引用站住；保留前缀仍可命中。
+    {
+        let (hit_old, _) = running.bank.rel.match_prefix(&old_tokens).expect("旧链查询");
+        assert_eq!(
+            hit_old.matched_blocks,
+            del.start / page,
+            "旧链必须止于删点：删除段及旧尾身份应已释放（得 {} 块；a/page={}）",
+            hit_old.matched_blocks,
+            del.start / page
+        );
+    }
+
+    // ── G5 臂：**引擎不自作主张** —— 删一张**未标记**的图 ⇒ 必须退回旧路径 ──
     let q3 = "还有别的吗?";
-    // 用**另一个会话**(8):同会话里换标记会改 pad 律(标记冻结律)。
+    // 用**另一个会话**（8）：同会话里换标记会改 pad 律（标记冻结律）。
     let g5_prompt1 = running.boot.tok.chat_format().render_chat(
         &[
             ("system", "你是助手,按约定回答。"),
@@ -5185,17 +5224,17 @@ pub async fn gpu_image_evict_gate() {
         "未标记的图被删时**不许**吸收(引擎不自作主张)"
     );
 
-    // ── G7 臂:**叠转上限**(delta_limit=1)── 第二次删除必须整段重建 ──
+    // ── G7 臂：**连续删除**（delta_limit=1 也无效）──
     //
-    // 会话 9:turn 1 两张可删图 ⇒ turn 2 删第一张(吸收,rot=1 ⇒ 到顶)⇒
-    // turn 3 删第二张时**不许**再叠转,改走全量 prefill(漂移与计数归零)。
+    // 会话 9：turn 1 两张可删图 ⇒ turn 2 删第一张 ⇒ turn 3 删第二张；
+    // leave-gap 下两次都要吸收，rot_rounds/rebased 恒 0。
     {
         let g7_p1 = running.boot.tok.chat_format().render_chat(
             &[
                 ("system", "你是助手,按约定回答。"),
                 (
                     "user",
-                    &format!("{}{}{}{}{}{q1}", p_text(1), item(0), mid, item(1), p_text(1)),
+                    &format!("{}{}{}{}{}{q1}", p_text(2), item(0), mid, item(1), p_text(5)),
                 ),
             ],
             false,
@@ -5218,11 +5257,14 @@ pub async fn gpu_image_evict_gate() {
         assert!(!g7_text1.trim().is_empty(), "G7 t1 必须出文本");
         let absorbed_after_t1 = running.img_evict.absorbed;
 
-        // turn 2:删第一张(吸收;rot_rounds = 1 = limit ⇒ 到顶)
+        // turn 2：删第一张
         let g7_p2 = running.boot.tok.chat_format().render_chat(
             &[
                 ("system", "你是助手,按约定回答。"),
-                ("user", &format!("{}{}{}{}{q1}", p_text(1), mid, item(1), p_text(1))),
+                (
+                    "user",
+                    &format!("{}{}{}{}{q1}", p_text(2), mid, item(1), p_text(5)),
+                ),
                 ("assistant", &g7_text1),
                 ("user", q2),
             ],
@@ -5244,20 +5286,20 @@ pub async fn gpu_image_evict_gate() {
         assert_eq!(
             running.img_evict.absorbed,
             absorbed_after_t1 + 1,
-            "第一次删除应当被吸收(没到顶)"
+            "第一次删除应当被吸收"
         );
         assert_eq!(
             running.bank.sessions.session(9).expect("会话 9").rot_rounds,
-            1,
-            "吸收一轮 ⇒ 叠转计数 1"
+            0,
+            "leave-gap 无叠转计数"
         );
 
-        // turn 3:删第二张 —— 到顶 ⇒ 整段重建(不吸收、cached_len = 0)
+        // turn 3：删第二张 —— 仍须吸收（delta_limit=1 不得触发重建）
         let q4 = "再确认一次。";
         let g7_p3 = running.boot.tok.chat_format().render_chat(
             &[
                 ("system", "你是助手,按约定回答。"),
-                ("user", &format!("{}{}{}", p_text(1), mid, p_text(1))),
+                ("user", &format!("{}{}{}", p_text(2), mid, p_text(5))),
                 ("assistant", &g7_text2),
                 ("user", q4),
             ],
@@ -5267,45 +5309,43 @@ pub async fn gpu_image_evict_gate() {
             .submit_session_opts(Some(9), g7_p3.as_str(), 6, crate::turn::TurnOpts::default())
             .expect("G7 t3 提交");
         let g7_text3 = drive_turn(&mut running, g7t3).await;
-        assert!(!g7_text3.trim().is_empty(), "G7 t3(重建)必须出文本");
-        // 判据要看**重建的痕迹**,不是 turn 收口后的 cached_len(turn 收口会把
-        // cached_len 写成新链长度 —— 任何路径都不是 0):
-        //   ① 叠转计数归零(只有 rebase 路径会清零;不吸收的旧路径会留着 1);
-        //   ② 计数器 `image_evict.rebase` 涨了 1(决策面的唯一事实)。
+        assert!(!g7_text3.trim().is_empty(), "G7 t3 必须出文本");
         let s9 = running.bank.sessions.session(9).expect("会话 9");
-        assert_eq!(s9.rot_rounds, 0, "重建 ⇒ 叠转计数归零");
+        assert_eq!(s9.rot_rounds, 0, "连续删除仍无叠转计数");
+        assert_eq!(s9.positioned, true, "第二次删除后位置洞标记仍在");
         assert_eq!(
-            running.img_evict.rebased, 1,
-            "到顶必须走一次整段重建(观测账 img_evict.rebased)"
+            running.img_evict.rebased, 0,
+            "leave-gap 连续删除不许整段重建"
         );
         assert_eq!(
             running.img_evict.absorbed,
-            absorbed_after_t1 + 1,
-            "到顶那一轮**不许**再吸收(叠转上限是硬门)"
+            absorbed_after_t1 + 2,
+            "第二次删除必须继续吸收(delta_limit=1 在 leave-gap 下无效)"
         );
+        let t3 = running.img_evict.last.clone().expect("G7 t3 trace");
+        assert_eq!(t3.shift, 0);
+        assert!(t3.pages.is_empty());
     }
 
-    eprintln!(
-        "[G3] 旋转段 {} µs({} 页 / {} 层;逐层发射的旧口径 ≈1.1 ms)",
-        trace.rotate_us,
-        trace.keep_blocks,
-        running.dev.pool.kv_caches().len()
-    );
+    // ── 视觉塔输出缓存:同一张图跨 turn 再出现时必须命中,不再重跑塔 ──
+    // G1 的两张图在 G2 仍有一张原样保留;命中数为 0 = 缓存键/接线失效
+    // (功能仍是正确路径,但 TTFT 优化没生效)。
     assert!(
-        trace.rotate_us < 5_000,
-        "旋转段 {} µs —— 发射没合批?(旧口径 ~1.1ms,批量应远低于此)",
-        trace.rotate_us
+        running.vlm_cache[0].hits >= 1,
+        "同图跨 turn 必须命中视觉塔输出缓存(得 hits={} misses={})",
+        running.vlm_cache[0].hits,
+        running.vlm_cache[0].misses
     );
     eprintln!(
-        "[test] 前缀无感删除:删 [{}, {})={} tok · 保留后缀 {} 页 · S={} · 重挂 {} · 轮时 prefill 事件 {} · K 最差 {:.2}×4ulp",
+        "[test] leave-gap 删除:删 [{}, {})={} tok · 保留后缀 {} 页 · 无 K 旋转 · 重挂 {} · 轮时 prefill 事件 {} · VLM 缓存 hit={} miss={}",
         trace.a,
         trace.b,
         trace.b - trace.a,
         trace.keep_blocks,
-        trace.shift,
         trace.rekeyed,
         prefill_events,
-        worst
+        running.vlm_cache[0].hits,
+        running.vlm_cache[0].misses,
     );
 }
 
@@ -5347,6 +5387,9 @@ pub async fn gpu_image_evict_spec_identity_gate() {
         if spec {
             knobs.draft.depth = 3;
             knobs.draft.dumb = true;
+        }
+        if owl_shared::env_reader::flag("OWL_GATE_LEAVE_GAP") {
+            knobs.image_evict_mode = owl_shared::config::ImageEvictMode::LeaveGap;
         }
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
@@ -5624,7 +5667,11 @@ pub async fn gpu_image_evict_spec_identity_gate() {
     let (a, abs_a, pa) = arm(true, ordinal, &dir, false).await;
     let (b, abs_b, pb) = arm(false, ordinal, &dir, false).await;
     assert!(abs_a && abs_b, "两臂都必须吸收删除(on={abs_a} off={abs_b})");
-    assert!(pa > 0 && pb > 0, "两臂都必须真的旋转过(on={pa} off={pb} 页)");
+    if owl_shared::env_reader::flag("OWL_GATE_LEAVE_GAP") {
+        assert_eq!(pa + pb, 0, "leave-gap 两臂都不许旋转 K(on={pa} off={pb} 页)");
+    } else {
+        assert!(pa > 0 && pb > 0, "两臂都必须真的旋转过(on={pa} off={pb} 页)");
+    }
     eprintln!("[D] 删除臂 on  len={} {a:?}\n[D] 删除臂 off len={} {b:?}", a.len(), b.len());
     assert_eq!(a.len(), b.len(), "两臂生成 token 数必须一致(max_new=8)");
     assert_eq!(

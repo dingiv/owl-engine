@@ -172,7 +172,7 @@ async fn e2e_body() {
     // ── VLM 图像输入基线(自装载:需要 `vision = true`)──
     run!(gpu_vlm_image_baseline);
 
-    // ── **前缀无感删除**(图像段;2026-10-23):两图 → 删旧图 → 后缀 K 原地重转 ──
+    // ── **前缀无感删除（leave-gap；2026-10-25）**：两图 → 连续删 → 不转 K / 不重建 ──
     run!(gpu_image_evict_gate);
 
     // ── **多图 × 投机 verify 行**(D 项):spec on/off 贪心 token 逐位相同 ──

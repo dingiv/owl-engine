@@ -72,6 +72,29 @@ pub(crate) struct ImageDelete {
     rerope: ReropePlan,
 }
 
+/// **leave-gap 删除计划的落账包**(不转 K;只摘页 + 位置账保留旧值)。
+pub(crate) struct ImageLeaveGap {
+    /// 拼接后的会话块表(前缀 ++ 后缀;会话引用已 `incref`)
+    table: Vec<u32>,
+    /// 删除区间(旧 token 坐标;观测账用)
+    a: usize,
+    b: usize,
+    /// 设备层快照重挂条数(观测账用)
+    rekeyed: usize,
+    /// 复用面 token 数(= 表长 × 页)
+    cached_len: usize,
+    /// 拼接边界的链尾身份(新链)
+    tail_hash: owl_store::ChainHash,
+    /// GDN 恢复键(删除后的边界;设备层已重挂则用新键,否则旧键)
+    restore_key: Option<owl_store::SnapKey>,
+    /// 盘层快照收尾(重挂;**不做 K 重转**)
+    snap_disk: Vec<SnapDiskOp>,
+    /// 宿主占位页的段边界回灌清单(逻辑块下标, 内容身份)
+    pending_loads: Vec<(usize, owl_store::ChainHash)>,
+    /// 旧链尾身份:等宿主回灌完成后再释放引用(不能先丢宿主内容)
+    release_chains: Vec<owl_store::ChainHash>,
+}
+
 /// 删除之后的**后缀 K 重转**指令(池内原地,`R(−shift)`)。
 #[derive(Clone, Debug)]
 pub(crate) struct ReropePlan {
@@ -84,6 +107,8 @@ pub(crate) struct ReropePlan {
     /// 盘内容要真 `rename`/`remove`,而决策面是纯 host —— 故计划只**记账**,
     /// 真 I/O 在 `execute_begin` **最前**(快照恢复之前)由阻塞池做。
     pub snap_disk: Vec<SnapDiskOp>,
+    /// leave-gap:待释放旧链尾身份;`execute_begin` 在宿主回灌之后 drop。
+    pub release_chains: Vec<owl_store::ChainHash>,
 }
 
 /// 盘层快照的删除收尾动作(决策面出票,执行面照办)。
@@ -541,7 +566,17 @@ impl<D: DeviceClient> RunningEngine<D> {
             // prefill,漂移与计数归零),不在漂移上继续加。只对本轮真要删图
             // 的 turn 生效 —— 否则白扔前缀命中。
             let (cached_len, restore_key, pending_loads, rerope) =
-                if self.image_evict_rebase_due(&turn)? {
+                if self.boot.cfg.knobs.image_evict_mode.is_leave_gap()
+                    && turn.deletion.is_some()
+                {
+                    match self.plan_image_leave_gap(&turn)? {
+                        Some(p) => self.apply_image_leave_gap(p, &turn)?,
+                        None => {
+                            let (c, r, pl) = self.plan_prefix_reuse(&turn)?;
+                            (c, r, pl, None)
+                        }
+                    }
+                } else if self.image_evict_rebase_due(&turn)? {
                     self.img_evict.rebased += 1;
                     owl_shared::counter_add!("image_evict.rebase", 1);
                     let rot_rounds = self.bank.sessions.session(turn.session_id)?.rot_rounds;
@@ -638,6 +673,14 @@ impl<D: DeviceClient> RunningEngine<D> {
             let started_ms = crate::running::now_ms();
             self.turns
                 .note_wait(started_ms.saturating_sub(turn.submitted_ms));
+            let next_rope_pos = turn
+                .positions
+                .iter()
+                .flat_map(|p| p.iter())
+                .copied()
+                .max()
+                .unwrap_or(-1)
+                .saturating_add(1);
             self.turns.active.push(crate::turn::ActiveTurn {
                 id: turn.id,
                 session_id: turn.session_id,
@@ -647,6 +690,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 prompt_ids: turn.prompt_ids,
                 msg_snaps: turn.msg_snaps,
                 max_new: turn.spec.max_new,
+                positions: turn.positions,
+                next_rope_pos,
+                rope_gap: turn.positions_gap,
                 ignore_eos,
                 sampler: eff_sampler,
                 sampler_on,
@@ -684,6 +730,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 只在"本轮确实又要删图"时生效 —— 其它 turn 照常前缀命中(不白扔复用面)。
     /// `limit = 0` = 不限(逐字节旧行为)。
     fn image_evict_rebase_due(&self, turn: &crate::turn::Turn) -> Result<bool> {
+        if self.boot.cfg.knobs.image_evict_mode.is_leave_gap() {
+            return Ok(false);
+        }
         if !self.boot.cfg.knobs.image_evict || turn.deletion.is_none() {
             return Ok(false);
         }
@@ -715,6 +764,309 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.bank.leg_mtp.release_table(&mut mold)?;
         s.rebase();
         Ok((0, None, Vec::new()))
+    }
+
+    /// **leave-gap 删除计划**(纯 host):摘掉被删图像页,保留前缀/后缀页,
+    /// **不转 K、不移动幸存 token 的 position**。快照只换边界身份(元数据),
+    /// 内容仍是同一份 GDN 状态/K。
+    fn plan_image_leave_gap(
+        &mut self,
+        turn: &crate::turn::Turn,
+    ) -> Result<Option<ImageLeaveGap>> {
+        if !self.boot.cfg.knobs.image_evict || !self.dev.pool.geom.paged {
+            return Ok(None);
+        }
+        let page = self.dev.pool.geom.page;
+        if page == 0 {
+            return Ok(None);
+        }
+        let Some(del) = turn.deletion else { return Ok(None) };
+        if del.a >= del.b || del.a % page != 0 || (del.b - del.a) % page != 0 {
+            owl_shared::log_warn!(
+                "img-evict",
+                "leave-gap 删除计划非法:session={:#x} turn={} a={} b={} page={} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                del.a,
+                del.b,
+                page
+            );
+            return Ok(None);
+        }
+        let (old, old_pos, old_spans) = {
+            let s = self.bank.sessions.session(turn.session_id)?;
+            (s.tokens.clone(), s.positions.clone(), s.img_spans.clone())
+        };
+        if old_pos.len() != old.len() {
+            owl_shared::log_info!(
+                "img-evict",
+                "leave-gap 跳过:session={:#x} 旧位置账 {} ≠ token {}（上一版无位置账）",
+                turn.session_id,
+                old_pos.len(),
+                old.len()
+            );
+            return Ok(None);
+        }
+        if del.b > old.len()
+            || del.a > turn.prompt_ids.len()
+            || turn.positions.len() != turn.prompt_ids.len()
+        {
+            owl_shared::log_warn!(
+                "img-evict",
+                "leave-gap 删除越界:session={:#x} turn={} del=[{},{}), old={}, raw={}, pos={} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                del.a,
+                del.b,
+                old.len(),
+                turn.prompt_ids.len(),
+                turn.positions.len()
+            );
+            return Ok(None);
+        }
+        if old[..del.a] != turn.prompt_ids[..del.a] {
+            owl_shared::log_warn!(
+                "img-evict",
+                "leave-gap 删点之前不一致:session={:#x} turn={} a={} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                del.a
+            );
+            return Ok(None);
+        }
+        let (hit, _recall) = self.bank.rel.match_prefix(&old)?;
+        // leave-gap 会话的链只允许**本会话**复用:token-only 链哈希无法区分
+        // 同 token 不同 position 的 K(跨会话命中 = 静默错值)。
+        if hit
+            .hashes
+            .last()
+            .is_some_and(|h| self.bank.rel.leg.session_of(*h) != turn.session_id)
+        {
+            owl_shared::log_info!(
+                "img-evict",
+                "leave-gap 链归属不符:session={:#x} turn={} tail_owner={:?} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                hit.hashes.last().map(|h| self.bank.rel.leg.session_of(*h))
+            );
+            return Ok(None);
+        }
+        let a_blocks = del.a / page;
+        let b_blocks = del.b / page;
+        if hit.matched_blocks < a_blocks {
+            owl_shared::log_info!(
+                "img-evict",
+                "leave-gap 旧前缀链不足:session={:#x} turn={} matched={} need={} 页 ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                hit.matched_blocks,
+                a_blocks
+            );
+            return Ok(None);
+        }
+        // 后缀 = 删点之后逐 token 相同、且页对齐的段。
+        let k_pad = old[del.b..]
+            .iter()
+            .zip(&turn.prompt_ids[del.a..])
+            .take_while(|(x, y)| x == y)
+            .count();
+        let mut keep = (k_pad / page).min(hit.matched_blocks.saturating_sub(b_blocks));
+        if keep == 0 {
+            owl_shared::log_info!(
+                "img-evict",
+                "leave-gap 后缀无可复用整页:session={:#x} turn={} k_pad={k_pad} page={page} matched={} a_blk={a_blocks} b_blk={b_blocks} first_slot={:?} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                hit.matched_blocks,
+                hit.slots.get(b_blocks).copied().flatten()
+            );
+            return Ok(None);
+        }
+        // 至少一个后缀边界有快照(GDN 态只能从边界续)。
+        let mut boundary = None;
+        while keep > 0 {
+            let bi = b_blocks + keep - 1;
+            let k = owl_store::SnapKey::at_boundary(hit.hashes[bi]);
+            if self.bank.rel.state.locate(k).is_some() {
+                boundary = Some((bi, k));
+                break;
+            }
+            keep -= 1;
+        }
+        let Some((bi, old_key)) = boundary else {
+            owl_shared::log_info!(
+                "img-evict",
+                "leave-gap 后缀边界无快照:session={:#x} turn={} keep={} ⇒ 不吸收",
+                turn.session_id,
+                turn.id,
+                keep
+            );
+            return Ok(None);
+        };
+        let mut cur = owl_store::ChainCursor::new();
+        if a_blocks > 0 {
+            cur.seed(a_blocks, hit.hashes[a_blocks - 1]);
+        }
+        let mut boundary_new: Option<owl_store::SnapKey> = None;
+        let mut rekeyed = 0usize;
+        let mut disk_ops: Vec<SnapDiskOp> = Vec::new();
+        for i in 0..keep {
+            let lo = (a_blocks + i) * page;
+            let h = cur
+                .advance(page, &turn.prompt_ids[lo..], a_blocks + i + 1)
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: format!("leave-gap:新链哈希推进失败(块 {})", a_blocks + i),
+                })?;
+            let k_old = owl_store::SnapKey::at_boundary(hit.hashes[b_blocks + i]);
+            let k_new = owl_store::SnapKey::at_boundary(h);
+            let tier = self.bank.rel.state.locate(k_old);
+            let target = snap_rekey_target(tier, self.dev.pool.snap_slot_of(k_old).is_some());
+            let ok = match target {
+                RekeyTarget::Device => {
+                    if self.bank.rel.rekey_snap(k_old, k_new) {
+                        let _ = self.dev.pool.snap_rekey(k_old, k_new);
+                        if let Some(p) = self.peer.as_mut() {
+                            let _ = p.pool.snap_rekey(k_old, k_new);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                RekeyTarget::Host => self.bank.rel.rekey_snap(k_old, k_new),
+                RekeyTarget::Disk => {
+                    disk_ops.push(SnapDiskOp::Rekey { old: k_old, new: k_new });
+                    true
+                }
+                RekeyTarget::Skip => false,
+            };
+            if ok {
+                rekeyed += 1;
+            }
+            if b_blocks + i == bi {
+                let pending_disk = disk_ops
+                    .iter()
+                    .any(|o| matches!(o, SnapDiskOp::Rekey { old, new } if *old == k_old && *new == k_new));
+                boundary_new = if self.bank.rel.state.locate(k_new).is_some() || pending_disk {
+                    Some(k_new)
+                } else {
+                    None
+                };
+            }
+        }
+        // 前缀/后缀槽位:设备页直接持引用;宿主占位页记回灌清单(段边界
+        // 由 `execute_begin` 搬到设备后再写块表)。**不能**在这里先 drop 旧链,
+        // 否则宿主内容先被 evict,回灌必失败。
+        let mut table = Vec::with_capacity(a_blocks + keep);
+        let mut pending_loads: Vec<(usize, owl_store::ChainHash)> = Vec::new();
+        for i in 0..a_blocks {
+            let idx = table.len();
+            match hit.slots[i] {
+                Some(slot) => {
+                    self.bank.rel.leg.incref(slot)?;
+                    table.push(slot);
+                }
+                None => {
+                    table.push(PENDING_LOAD_PLACEHOLDER);
+                    pending_loads.push((idx, hit.hashes[i]));
+                }
+            }
+        }
+        for i in 0..keep {
+            let bi = b_blocks + i;
+            let idx = table.len();
+            match hit.slots[bi] {
+                Some(slot) => {
+                    self.bank.rel.leg.incref(slot)?;
+                    table.push(slot);
+                }
+                None => {
+                    table.push(PENDING_LOAD_PLACEHOLDER);
+                    pending_loads.push((idx, hit.hashes[bi]));
+                }
+            }
+        }
+        let cached_len = (a_blocks + keep) * page;
+        let old_marked = old_spans.iter().filter(|s| s.evict).count();
+        // **待释放旧链尾**（不是 free）：新表已持前缀/后缀引用；旧链从
+        // 删点起的所有身份（被删图 + 未复用旧尾）在执行面回灌完成后摘掉
+        // ⇒ 缓存不再站住这些槽。槽何时真正回收由 store/调度器决定。
+        let release_chains: Vec<owl_store::ChainHash> =
+            hit.hashes[a_blocks..hit.matched_blocks].to_vec();
+        owl_shared::log_info!(
+            "img-evict",
+            "leave-gap:session={:#x} turn={} 删 [{}, {})={} tok/{} 页 · 保留前缀 {} + 后缀 {} 页 / {} tok · 不改 K · 待释放旧链 {} 块 · 宿主回灌 {} 页 · 快照重挂 {} 条(盘待搬 {}) · marked={}",
+            turn.session_id,
+            turn.id,
+            del.a,
+            del.b,
+            del.b - del.a,
+            (del.b - del.a) / page,
+            a_blocks,
+            keep,
+            cached_len,
+            release_chains.len(),
+            pending_loads.len(),
+            rekeyed,
+            disk_ops.len(),
+            old_marked
+        );
+        Ok(Some(ImageLeaveGap {
+            table,
+            a: del.a,
+            b: del.b,
+            rekeyed,
+            cached_len,
+            tail_hash: cur.tail(),
+            restore_key: boundary_new.or(Some(old_key)),
+            snap_disk: disk_ops,
+            pending_loads,
+            release_chains,
+        }))
+    }
+
+    /// leave-gap 删除计划的落账(表/游标/token/位置账);设备半只做盘快照收尾。
+    fn apply_image_leave_gap(
+        &mut self,
+        d: ImageLeaveGap,
+        turn: &crate::turn::Turn,
+    ) -> Result<(
+        usize,
+        Option<owl_store::SnapKey>,
+        Vec<(usize, owl_store::ChainHash)>,
+        Option<ReropePlan>,
+    )> {
+        let page = self.dev.pool.geom.page;
+        let s = self.bank.sessions.session_mut(turn.session_id)?;
+        let mut mold = std::mem::take(&mut s.mtp_block_table);
+        self.bank.leg_mtp.release_table(&mut mold)?;
+        s.block_table = d.table;
+        s.cached_len = d.cached_len;
+        s.tokens.clear();
+        s.tokens.extend_from_slice(&turn.prompt_ids[..d.cached_len]);
+        s.chain.seed(d.cached_len / page, d.tail_hash);
+        s.set_positions(&turn.positions[..d.cached_len], true)?;
+        s.position_epoch = s.position_epoch.wrapping_add(1);
+        s.rot_rounds = 0;
+        self.img_evict.absorbed += 1;
+        self.img_evict.last = Some(crate::running::ImgEvictTrace {
+            a: d.a,
+            b: d.b,
+            keep_blocks: d.cached_len / page - d.a / page,
+            shift: 0,
+            pages: Vec::new(),
+            rekeyed: d.rekeyed,
+            rot_rounds: 0,
+            rotate_us: 0,
+        });
+        owl_shared::counter_add!("image_evict.blocks_released", d.release_chains.len() as u64);
+        let snap = ReropePlan {
+            pages: Vec::new(),
+            shift: 0,
+            snap_disk: d.snap_disk,
+            release_chains: d.release_chains,
+        };
+        Ok((d.cached_len, d.restore_key, d.pending_loads, Some(snap)))
     }
 
     /// **前缀无感删除的决策**(纯 host;`Ok(None)` = 不吸收,零副作用)。
@@ -1030,7 +1382,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             cached_len,
             tail_hash: cur.tail(),
             restore_key,
-            rerope: ReropePlan { pages, shift, snap_disk: disk_ops },
+            rerope: ReropePlan {
+                pages,
+                shift,
+                snap_disk: disk_ops,
+                release_chains: Vec::new(),
+            },
         }))
     }
 
@@ -1053,6 +1410,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         s.cached_len = d.cached_len;
         s.tokens.clear();
         s.tokens.extend_from_slice(&turn.prompt_ids[..d.cached_len]);
+        s.set_positions(&turn.positions[..d.cached_len], false)?;
         s.chain.seed(d.cached_len / page, d.tail_hash);
         // 叠转计数(漂移上限的真源):只在本函数自增
         s.rot_rounds = s.rot_rounds.saturating_add(1);
@@ -1083,11 +1441,27 @@ impl<D: DeviceClient> RunningEngine<D> {
         let s = self.bank.sessions
             .get_mut(turn.session_id)
             .expect("submit 已建会话账");
+        let positioned = s.positioned;
         if self.dev.pool.geom.paged {
             // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)。
             // **S3b 收尾**:经 `Rel` 门面**一次问两腿**(块链 + 快照层)
             // —— 少一条"引擎自己分别查两处"的旁路(§10.4 律⑤)。
             let (hit, recall) = self.bank.rel.match_prefix(&turn.prompt_ids)?;
+            if positioned
+                && hit
+                    .hashes
+                    .last()
+                    .is_some_and(|h| self.bank.rel.leg.session_of(*h) != turn.session_id)
+            {
+                owl_shared::log_info!(
+                    "img-evict",
+                    "leave-gap 会话拒绝跨会话复用:session={:#x} turn={} tail_owner={:?} ⇒ Fresh",
+                    turn.session_id,
+                    turn.id,
+                    hit.hashes.last().map(|h| self.bank.rel.leg.session_of(*h))
+                );
+                return self.plan_fresh(turn);
+            }
             // S3-3b:宿主承载格(内容在 host)不再整条拒 —— 占位 + 记进
             // `pending_loads`,由 `execute_begin` 在段边界回灌(真槽写回,
             // 必须在 `write_bt` 之前换掉)。
@@ -1154,6 +1528,18 @@ impl<D: DeviceClient> RunningEngine<D> {
                     "dbg prefix",
                     "复用面 m={m}/{matched_raw} 块(= {} tok)/ 落在边界层={found}",
                     m * self.dev.pool.geom.page
+                );
+            }
+            if positioned {
+                owl_shared::log_info!(
+                    "img-evict",
+                    "leave-gap 复用:session={:#x} turn={} prompt={} matched={} m={} tail_snap={:?}",
+                    turn.session_id,
+                    turn.id,
+                    turn.prompt_ids.len(),
+                    matched_raw,
+                    m,
+                    recall.snap_tier
                 );
             }
             if m > 0 {
@@ -1459,6 +1845,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             let act = self.turns.active()?;
             act.max_new.saturating_sub(act.out.len())
         };
+        // leave-gap 的 target verify/replay 已用 `next_rope_pos` 的 rope_delta；
+        // 草稿仍走既有 token 位置（只影响 AL，不影响 greedy 恒等）。
         let spec = if self.dev.spec_rt.depth == 0 || remaining_out <= 1 {
             0
         } else if !self.turns.active()?.spec.spec_degraded {

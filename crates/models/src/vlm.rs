@@ -499,6 +499,30 @@ impl Vlm {
         px: &[f32],
     ) -> Result<VlmRequest, ModelError> {
         let ins = self.inputs(ids, grids, video_grids, Dtype::F16)?;
+        self.prepare_from_inputs(ins, grids, video_grids, px)
+    }
+
+    /// **显式位置的备料**(leave-gap;2026-10-25):塔表照旧,文本位置表由
+    /// `positions` 直接生成。
+    pub fn prepare_with_positions(
+        &self,
+        ids: &[u32],
+        grids: &[GridThw],
+        video_grids: &[GridThw],
+        px: &[f32],
+        positions: &[[i32; 3]],
+    ) -> Result<VlmRequest, ModelError> {
+        let ins = self.inputs_with_positions(ids, grids, video_grids, Dtype::F16, positions)?;
+        self.prepare_from_inputs(ins, grids, video_grids, px)
+    }
+
+    fn prepare_from_inputs(
+        &self,
+        ins: VlmInputs,
+        grids: &[GridThw],
+        video_grids: &[GridThw],
+        px: &[f32],
+    ) -> Result<VlmRequest, ModelError> {
         // 纯文本请求(无网格):不进塔(塔表构造器拒空网格),注入面自然为空
         let merged = if grids.is_empty() && video_grids.is_empty() {
             None
@@ -545,11 +569,58 @@ impl Vlm {
         video_grids: &[GridThw],
         dtype: Dtype,
     ) -> Result<VlmInputs, ModelError> {
-        let l = ids.len();
         let ttypes = token_types(ids, self.cfg.image_token, self.cfg.video_token);
         let frames = split_video_frames(video_grids);
         let index = self.cfg.mrope.rope_index(ids, &ttypes, grids, &frames)?;
+        self.inputs_from_positions(ids, grids, video_grids, dtype, index.pos, index.delta)
+    }
 
+    /// **显式位置输入**(leave-gap;2026-10-25):cos/sin 直接由调用方给的
+    /// 逐 token 绝对位置生成,不再从 0 重算。行号/塔输出校验与 [`Self::inputs`]
+    /// 同一条(单一产地)。
+    pub fn inputs_with_positions(
+        &self,
+        ids: &[u32],
+        grids: &[GridThw],
+        video_grids: &[GridThw],
+        dtype: Dtype,
+        positions: &[[i32; 3]],
+    ) -> Result<VlmInputs, ModelError> {
+        if positions.len() != ids.len() {
+            return Err(ModelError::Msg(format!(
+                "Vlm::inputs_with_positions: 位置 {} ≠ token {}",
+                positions.len(),
+                ids.len()
+            )));
+        }
+        let pos: Vec<[i64; 3]> = positions
+            .iter()
+            .map(|p| [p[0] as i64, p[1] as i64, p[2] as i64])
+            .collect();
+        let max_pos = pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0);
+        let delta = max_pos + 1 - ids.len() as i64;
+        self.inputs_from_positions(ids, grids, video_grids, dtype, pos, delta)
+    }
+
+    /// 位置表 → `VlmInputs`(两条入口的唯一实现)。
+    fn inputs_from_positions(
+        &self,
+        ids: &[u32],
+        grids: &[GridThw],
+        video_grids: &[GridThw],
+        dtype: Dtype,
+        positions: Vec<[i64; 3]>,
+        delta: i64,
+    ) -> Result<VlmInputs, ModelError> {
+        let l = ids.len();
+        let ttypes = token_types(ids, self.cfg.image_token, self.cfg.video_token);
+        let frames = split_video_frames(video_grids);
+        if positions.len() != l {
+            return Err(ModelError::Msg(format!(
+                "Vlm::inputs_from_positions: 位置 {} ≠ token {l}",
+                positions.len()
+            )));
+        }
         // 行号表:第 k 个视觉 token → 塔输出第 k 行(HF `masked_scatter` 同序)
         let mut idx = vec![-1.0f32; l];
         let mut n_vis = 0usize;
@@ -572,7 +643,7 @@ impl Vlm {
                 "Vlm::inputs: 视觉占位 token {n_vis} ≠ 塔输出行数 {n_merged}(网格/占位不符)"
             )));
         }
-        let (mcos, msin) = self.cfg.mrope.cos_sin(&index.pos);
+        let (mcos, msin) = self.cfg.mrope.cos_sin(&positions);
         let half = self.cfg.mrope.half();
         let pack = |v: &[f32]| -> Vec<u8> {
             match dtype {
@@ -593,7 +664,7 @@ impl Vlm {
             half,
             dtype,
             tokens: l,
-            delta: index.delta,
+            delta,
         })
     }
 }

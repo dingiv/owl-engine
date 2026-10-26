@@ -61,6 +61,18 @@ pub struct AgentSession {
     /// 不随 `reset()` 归零 —— 前缀命中路径也调 `reset()` 而是**续写**;
     /// 只有真正丢掉整条链(`plan_fresh`)才清零。
     pub rot_rounds: u32,
+    /// **逐 token 的 m-RoPE 绝对位置**(leave-gap;2026-10-25)。
+    /// 与 `tokens` 等长;文本 `[p,p,p]`,图像 `[t,h,w]`。
+    /// 删除图标段后幸存 token 的位置**不移动**,新尾巴从 `max_pos+1` 追加。
+    /// 未启用 leave-gap(`positioned = false`)时仍写紧凑位置,作为统一账。
+    pub positions: Vec<[i32; 3]>,
+    /// 当前最大绝对位置(三轴取 max;空账 = 0)。
+    pub max_pos: i32,
+    /// **位置账是否已离开紧凑坐标**(leave-gap 删除后为 true)。
+    /// 用于禁用跨会话内容缓存(同 token 不同 position 的 K 不同)。
+    pub positioned: bool,
+    /// 位置账代数(consolidation/rebase 时递增;缓存/诊断面用)。
+    pub position_epoch: u32,
     /// E5:LRU 逐出账(SessionTable.tick 触达时间;越小越老)
     /// MTP 草稿链块链(E5-M2b):独立页池的第二链;mtp 模式由
     /// propose 路径 ensure_for_len,与 target 链同步跨 turn 存续
@@ -91,6 +103,10 @@ impl AgentSession {
             img_spans: Vec::new(),
             pads: Vec::new(),
             rot_rounds: 0,
+            positions: Vec::new(),
+            max_pos: 0,
+            positioned: false,
+            position_epoch: 0,
         }
     }
 
@@ -120,6 +136,9 @@ impl AgentSession {
         self.chain.reset();
         self.img_spans.clear();
         self.pads.clear();
+        self.positions.clear();
+        self.max_pos = 0;
+        self.positioned = false;
     }
 
     /// **整段重建**(漂移到顶 / 前缀失配):`reset` + 叠转计数归零。
@@ -129,6 +148,34 @@ impl AgentSession {
     pub fn rebase(&mut self) {
         self.reset();
         self.rot_rounds = 0;
+        self.position_epoch = self.position_epoch.wrapping_add(1);
+    }
+
+    /// **写入当前前缀的位置账**(删除/前缀命中后、turn 收口前使用)。
+    ///
+    /// `positions` 必须与 `tokens` 同长;越界 = 结构错(显式拒,不静默截断)。
+    pub fn set_positions(&mut self, positions: &[[i32; 3]], positioned: bool) -> Result<()> {
+        if positions.len() != self.tokens.len() {
+            return Err(owl_iface::contract::ModelError::EngineInvariant {
+                what: format!(
+                    "位置账长度 {} ≠ token 账 {}（会话 {}）",
+                    positions.len(),
+                    self.tokens.len(),
+                    self.id
+                ),
+            });
+        }
+        self.positions.clear();
+        self.positions.extend_from_slice(positions);
+        self.max_pos = self
+            .positions
+            .iter()
+            .flat_map(|p| p.iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
+        self.positioned = positioned;
+        Ok(())
     }
 
     /// **图像段账写回**(turn 收口;坐标 = `tokens` 的 prompt 段坐标)。
@@ -163,11 +210,39 @@ impl AgentSession {
     /// 回填账(turn 收口):KV 此刻已含「prompt 全量 + 生成段」,GDN
     /// 状态跨 turn 连续。账本 = prompt ++ generated,`cached_len` 同步
     /// 推进到总长(下一个 turn 的增量起点)。
-    pub fn commit_turn(&mut self, prompt: &[u32], generated: &[u32]) {
+    pub fn commit_turn(
+        &mut self,
+        prompt: &[u32],
+        generated: &[u32],
+        positions: &[[i32; 3]],
+        positioned: bool,
+    ) -> Result<()> {
+        let total = prompt.len() + generated.len();
+        if positions.len() != total {
+            return Err(owl_iface::contract::ModelError::EngineInvariant {
+                what: format!(
+                    "turn 收口位置账 {} ≠ prompt+generated {}（会话 {}）",
+                    positions.len(),
+                    total,
+                    self.id
+                ),
+            });
+        }
         self.tokens.clear();
         self.tokens.extend_from_slice(prompt);
         self.tokens.extend_from_slice(generated);
         self.cached_len = self.tokens.len();
+        self.positions.clear();
+        self.positions.extend_from_slice(positions);
+        self.max_pos = self
+            .positions
+            .iter()
+            .flat_map(|p| p.iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
+        self.positioned = positioned;
+        Ok(())
     }
 }
 
@@ -425,7 +500,8 @@ mod tests {
         let p1: Vec<u32> = (0..10).collect();
         assert!(s.guard(&p1));
         assert_eq!(s.delta_range(10), Some((0, 10)));
-        s.commit_turn(&p1, &[90, 91]);
+        let pos1: Vec<[i32;3]> = (0..12).map(|i| [i,i,i]).collect();
+        s.commit_turn(&p1, &[90, 91], &pos1, false).expect("收口 turn1");
         assert_eq!(s.cached_len, 12);
         assert_eq!(s.tokens, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 90, 91]);
 
@@ -435,7 +511,8 @@ mod tests {
         p2.extend([90, 91, 7, 7]);
         assert!(s.guard(&p2), "历史逐 id 一致应命中");
         assert_eq!(s.delta_range(14), Some((12, 14)));
-        s.commit_turn(&p2, &[42]);
+        let pos2: Vec<[i32;3]> = (0..15).map(|i| [i,i,i]).collect();
+        s.commit_turn(&p2, &[42], &pos2, false).expect("收口 turn2");
         assert_eq!(s.cached_len, 15);
 
         // turn3:纯生成续段(无新增 prompt)→ None
@@ -453,7 +530,8 @@ mod tests {
         assert!(s.guard(&bad), "重置后零缓存守卫恒真(全量重算)");
 
         // 截短的历史(prompt 比账本还短)也拒
-        s.commit_turn(&p2, &[]);
+        let pos2: Vec<[i32;3]> = (0..p2.len()).map(|i| [i as i32,i as i32,i as i32]).collect();
+        s.commit_turn(&p2, &[], &pos2, false).expect("收口 turn3");
         assert!(!s.guard(&p2[..8]));
     }
 

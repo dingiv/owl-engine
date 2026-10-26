@@ -5,7 +5,9 @@
 prefix_cache = true
 snap_max = 2
 image_evict = true
-# 安全缺省 4（f16 可显式调回 32；fp8 硬上限 4）。
+# 删除后处理:rebase(旧)/ leave_gap(不转 K、保留位置洞)。
+image_evict_mode = "rebase"
+# 安全缺省 4(f16 可显式调回 32;fp8 硬上限 4;仅 rebase 使用)。
 image_evict_delta_limit = 4
 vram_target = 0.9
 vram_reserve_mb = 1024

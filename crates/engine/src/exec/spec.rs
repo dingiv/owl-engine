@@ -76,14 +76,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **VLM m-RoPE delta**(V5):图像提示经塔后,文本主干的 rope 位置
         // 相对真实 token 位置有常量偏移;verify 行必须与 decode 同式
         // (`pos_rope = pos + delta`),但 KV slots/lens 仍用真实位置。
-        let vlm_delta = self
-            .turns
-            .active()
-            .ok()
-            .and_then(|a| a.vlm.as_ref())
-            .map(|v| v.ins.delta)
-            .unwrap_or(0);
-        owl_shared::log_debug!("spec-round", "轮开始 token={token} pos={pos} depth={depth} vlm_delta={vlm_delta}");
+        let (vlm_delta, rope_delta) = {
+            let act = self.turns.active()?;
+            let vlm_delta = act.vlm.as_ref().map(|v| v.ins.delta).unwrap_or(0);
+            // **leave-gap**:verify/replay 的 rope 位置用绝对位置账;
+            // block[0] = 上一枚已发射 token ⇒ 其位置 = next_rope_pos − 1。
+            // draft 仍沿用草稿池的既有 delta（其正确性只影响 AL，不影响
+            // target greedy 恒等）。
+            let rope_delta =
+                i64::from(act.next_rope_pos.saturating_sub(1)) - pos as i64;
+            (vlm_delta, rope_delta)
+        };
+        owl_shared::log_debug!(
+            "spec-round",
+            "轮开始 token={token} pos={pos} depth={depth} vlm_delta={vlm_delta} rope_delta={rope_delta}"
+        );
 
         // ① 快照(轮首;恢复后仍有效 → 只在失效时拍)
         t_snap = self.ensure_spec_snap(gdn_slot).await?;
@@ -145,7 +152,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 pos,
                 gdn_slot,
                 sampler_on,
-                vlm_delta,
+                rope_delta,
                 &xqa_pt_v,
                 sid,
                 depth,
@@ -528,7 +535,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .collect();
                 owl_shared::log_debug!("spec-round", "回滚重放:eager verify_forward 起(peer 镜像)");
                 let (_, replay_hidden, _) =
-                    self.verify_forward(&replay, pos, gdn_slot, false, vlm_delta).await?;
+                    self.verify_forward(&replay, pos, gdn_slot, false, rope_delta).await?;
                 owl_shared::log_debug!("spec-round", "回滚重放:eager verify_forward 完");
                 let face = self.dev.graphs.session.face_mut();
                 face.free(&[replay_hidden.id]).await?;

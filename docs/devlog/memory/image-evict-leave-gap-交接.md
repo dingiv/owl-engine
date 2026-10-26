@@ -1,6 +1,6 @@
 # 图像无感删除：Leave-Gap 改造方案（设计与交接）
 
-> 状态：**设计定稿，未实现**（2026-10-25）
+> 状态：**P0-P2 核心 + 0.8B spec 门已实现；P3 27B/TP2 与 P4 consolidation 未做**（2026-10-25）
 > 目标：彻底移除 `image_evict_delta_limit=4` 导致的“每 5 次删除一次整段 prefill”
 > 尖峰，同时保持三图窗口、前缀缓存和 FP8 KV。
 >
@@ -9,6 +9,38 @@
 > 当前实现：`docs/devlog/memory/prefix-deletion.md`
 >
 > **本文是下一个会话的施工交接，不是完成记录。**
+
+---
+
+## §0bis 施工结果（2026-10-25）
+
+已落地（0.8B 门验收）：
+
+- 配置：`[pool].image_evict_mode = "rebase" | "leave_gap"`；leave-gap 不受
+  FP8 `delta_limit ∈ 1..=4` 约束，默认仍是 `rebase`；
+- `AgentSession.positions / max_pos / positioned / position_epoch`；
+- `img_evict::{compact_positions, positions_after_splice}`：删除后前缀/后缀
+  position 原样保留、新尾巴从 `max_pos+1` 追加；
+- `ChunkTables` 显式 positions；decode 用 `ActiveTurn.next_rope_pos`；
+  VLM cos/sin 由 `Vlm::prepare_with_positions` 生成；
+- `scheduler::plan_image_leave_gap`：摘页 + 快照元数据重挂，**不调用 K 重转**；
+  保留 rebase 旧路径；
+- positioned 会话的跨会话内容命中收窄为**本会话链**；
+- target spec verify/replay 用 `next_rope_pos - 1` 的 `rope_delta`（草稿仍走既有
+  token 位置，只影响 AL，不影响 greedy 恒等）；
+- 0.8B 真机门：原 `gpu_image_evict_gate` 已改造成 leave-gap 版（两次连续
+  删除、K 逐字节不变、零重建、幸存 position 逐 token 不变、删点起旧链身份
+  释放）；门内**手动拆 begin 与 prefill**，在 `execute_begin` 后断言被删图
+  槽 `slot_refs == 0`（删除前 >0），直接证明缓存引用已解除而非“等 prefill
+  复用后再看”。`gpu_image_evict_spec_identity_gate` 在
+  `OWL_GATE_LEAVE_GAP=1` 下 spec on/off 逐位相同。
+- **27B 真机 TTFT A/B（2026-10-25，单 3090，22k prompt / 三图窗口）**：
+  leave-gap 删首图轮 `ttft=1342ms` / cache 98.3% / prefill 368 tok；
+  同请求 `--no-evict` 控制臂 `ttft=18070ms` / cache 0%。删除轮还实测
+  宿主回灌 676 页后吸收（不再因 host 占位退回全量）。
+
+未做：P4 consolidation（position 上限）、草稿池/DFlash2 的绝对 rope 位置、
+27B TP2 长跑、生产 profile 默认切换。
 
 ---
 

@@ -21,6 +21,11 @@
 //! 唯一的机械约束:块表是**页粒度**(32 tok/页)。要让"删"变成**零数据搬运**,
 //! 被删区间必须是整页数、且起点落页边界 ⇒ 可删图像段强制**页对齐**(前后补 pad)。
 //!
+//! **2026-10-25 leave-gap**:`[pool].image_evict_mode = "leave_gap"` 时不再
+//! 旋转后缀 K;删除只摘页,幸存 token 的 position 原样保留,新 token 从
+//! `max_pos+1` 追加。位置账/拼接的唯一产地 = [`compact_positions`] /
+//! [`positions_after_splice`];启动/执行面见 `session.rs`、`scheduler.rs`。
+//!
 //! # 为什么需要"重建"(不是纯 diff)
 //!
 //! 页对齐 pad 是**引擎自己插进 prompt 的 token**;客户端从不发它们。删掉一张图
@@ -143,6 +148,48 @@ pub fn unpad(ids: &[u32], pads: &[(usize, usize)]) -> Result<Vec<u32>, String> {
     }
     out.extend_from_slice(&ids[cursor..]);
     Ok(out)
+}
+
+/// 把 **unpadded 坐标**下的前缀长度映射回 **padded 序列**的切点。
+///
+/// `raw_len` = 客户端可见 token 数;返回值 = 覆盖这 `raw_len` 个可见 token
+/// 的 padded 前缀长度,**并吞掉紧跟在切点后的 pad 块**(孤儿 pad 必须留下,
+/// 否则下一轮从裸文本重算 pad 时它会消失,缓存退到删点之前)。
+///
+/// `Err` = `raw_len` 超过可见 token 数 / pad 账非法(不静默截断)。
+pub fn padded_prefix_for_raw(
+    tokens: &[u32],
+    pads: &[(usize, usize)],
+    raw_len: usize,
+) -> Result<usize, String> {
+    let mut pad_i = 0usize;
+    let mut raw = 0usize;
+    let mut i = 0usize;
+    while i <= tokens.len() {
+        while pad_i < pads.len() && pads[pad_i].0 == i {
+            let (lo, hi) = pads[pad_i];
+            if lo != i || hi < lo || hi > tokens.len() {
+                return Err(format!(
+                    "padded_prefix_for_raw: pad 区间 [{lo},{hi}) 非法(tokens={})",
+                    tokens.len()
+                ));
+            }
+            i = hi;
+            pad_i += 1;
+        }
+        if raw == raw_len {
+            return Ok(i);
+        }
+        if i >= tokens.len() {
+            break;
+        }
+        i += 1;
+        raw += 1;
+    }
+    Err(format!(
+        "padded_prefix_for_raw: raw_len={raw_len} > 可见 token {raw}(padded={})",
+        tokens.len()
+    ))
 }
 
 /// **页对齐 pad 律**(只在 `[pool] image_evict` 且该图带标记时执行)。
@@ -376,6 +423,147 @@ pub fn rebuild_after_delete(
     Ok(out)
 }
 
+/// **位置三元组**(与 `MropeCfg` 的 `[T,H,W]` 同序;i32 足够覆盖 262k)。
+pub type Pos3 = [i32; 3];
+
+/// **紧凑位置账**:从 token 0 起按 m-RoPE 重新计算(普通 turn / rebase)。
+pub fn compact_positions(
+    ids: &[u32],
+    spans: &[ImgSpan],
+    image_token: u32,
+    mrope: &MropeCfg,
+) -> Result<(Vec<Pos3>, i32), String> {
+    if ids.is_empty() {
+        return Err("compact_positions: 空序列".to_string());
+    }
+    let tt = owl_models::layers::mrope::token_types(ids, image_token, None);
+    let grids: Vec<GridThw> = spans.iter().map(|s| s.grid).collect();
+    let index = mrope
+        .rope_index(ids, &tt, &grids, &[])
+        .map_err(|e| format!("compact_positions: {e}"))?;
+    let pos = index
+        .pos
+        .into_iter()
+        .map(|p| {
+            Ok([
+                i32::try_from(p[0]).map_err(|_| "position T 越 i32".to_string())?,
+                i32::try_from(p[1]).map_err(|_| "position H 越 i32".to_string())?,
+                i32::try_from(p[2]).map_err(|_| "position W 越 i32".to_string())?,
+            ])
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let max_pos = pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0);
+    Ok((pos, max_pos))
+}
+
+/// **删除/追加后的位置账**(leave-gap 的唯一产地)。
+///
+/// - `old_tokens` / `old_pos` = 会话上一版 padded 序列与逐 token 位置;
+/// - `new_ids` / `spans` = 本轮重建后的 padded 序列与图像段账;
+/// - `deletion = Some(hit)` 时按 `[a,b)` 删一段:前缀 `[..a)` 与后缀
+///   `[b..b+k)` 的 position **原样保留**,新尾巴从 `max_pos+1` 追加;
+/// - `deletion = None` 时按普通追加:公共前缀保留旧 position,尾巴从
+///   `max_pos+1` 追加(leave-gap 会话跨 turn 继续留洞)。
+///
+/// 返回 `(positions, max_pos, positioned)`;`positioned=true` 表示位置已
+/// 离开紧凑坐标,调用方须禁用跨会话内容缓存。
+pub fn positions_after_splice(
+    old_tokens: &[u32],
+    old_pos: &[Pos3],
+    new_ids: &[u32],
+    spans: &[ImgSpan],
+    deletion: Option<TextDelete>,
+    image_token: u32,
+    mrope: &MropeCfg,
+) -> Result<(Vec<Pos3>, i32, bool), String> {
+    if old_tokens.len() != old_pos.len() {
+        return Err(format!(
+            "positions_after_splice: 旧 token {} ≠ 旧位置 {}",
+            old_tokens.len(),
+            old_pos.len()
+        ));
+    }
+    if new_ids.is_empty() {
+        return Err("positions_after_splice: 新序列为空".to_string());
+    }
+    let mut pos: Vec<Pos3> = Vec::with_capacity(new_ids.len());
+    let tail_start;
+    if let Some(del) = deletion {
+        let (a, b) = (del.a, del.b);
+        if a > b || b > old_tokens.len() || a > new_ids.len() {
+            return Err(format!(
+                "positions_after_splice: 删除区间 [{a},{b}) 越界(旧 {} / 新 {})",
+                old_tokens.len(),
+                new_ids.len()
+            ));
+        }
+        if old_tokens[..a] != new_ids[..a] {
+            return Err("positions_after_splice: 删点之前 token 不一致".to_string());
+        }
+        pos.extend_from_slice(&old_pos[..a]);
+        let k = old_tokens[b..]
+            .iter()
+            .zip(&new_ids[a..])
+            .take_while(|(x, y)| x == y)
+            .count();
+        pos.extend_from_slice(&old_pos[b..b + k]);
+        tail_start = a + k;
+    } else {
+        let k = old_tokens
+            .iter()
+            .zip(new_ids)
+            .take_while(|(x, y)| x == y)
+            .count();
+        pos.extend_from_slice(&old_pos[..k]);
+        tail_start = k;
+    }
+    // 位置账只能从旧账**连续**拼;跨 tail_start 的图像段说明删除点落在图内,
+    // 这种形状不允许(页对齐 pad 律保证删点在图段边界)。
+    if spans.iter().any(|s| s.start < tail_start && s.end > tail_start) {
+        return Err(format!(
+            "positions_after_splice: 图像段跨越尾巴起点 {tail_start}(spans={:?})",
+            spans.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>()
+        ));
+    }
+    let tail = &new_ids[tail_start..];
+    if !tail.is_empty() {
+        let grids: Vec<GridThw> = spans
+            .iter()
+            .filter(|s| s.start >= tail_start)
+            .map(|s| s.grid)
+            .collect();
+        let tt = owl_models::layers::mrope::token_types(tail, image_token, None);
+        let index = mrope
+            .rope_index(tail, &tt, &grids, &[])
+            .map_err(|e| format!("positions_after_splice: 新尾巴 rope_index: {e}"))?;
+        let base = old_pos
+            .iter()
+            .flat_map(|p| p.iter())
+            .copied()
+            .max()
+            .unwrap_or(-1)
+            .saturating_add(1);
+        for p in index.pos {
+            let add = |v: i64| -> Result<i32, String> {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.checked_add(base))
+                    .ok_or_else(|| format!("positions_after_splice: 位置 {v}+{base} 越 i32"))
+            };
+            pos.push([add(p[0])?, add(p[1])?, add(p[2])?]);
+        }
+    }
+    if pos.len() != new_ids.len() {
+        return Err(format!(
+            "positions_after_splice: 位置 {} ≠ 新序列 {}",
+            pos.len(),
+            new_ids.len()
+        ));
+    }
+    let max_pos = pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0);
+    Ok((pos, max_pos, deletion.is_some() || tail_start < old_tokens.len()))
+}
+
 /// **位置同移自证**(G-自证):删掉 `[a,b)` 之后,后缀每个 token 的三网格位置
 /// 是否都只差**同一个标量** `S`。
 ///
@@ -587,6 +775,76 @@ mod tests {
     }
 
     #[test]
+    fn leave_gap_preserves_survivor_positions() {
+        let mrope = MropeCfg::new([11, 11, 10], 64, 1e7, 2).expect("mrope");
+        let ids = build(&[1, 1, 1], 5);
+        let seq = pad(&ids, &[true, true, true], &[grid(), grid(), grid()]);
+        let (old_pos, old_max) = compact_positions(&seq.ids, &seq.spans, IMG, &mrope)
+            .expect("旧位置账");
+        let text = unpad(&seq.ids, &seq.pads).expect("unpad");
+        let del = seq.spans[1];
+        let raw: Vec<u32> = text[..del.text_start]
+            .iter()
+            .chain(&text[del.text_end..])
+            .copied()
+            .collect();
+        let hit = detect_text_delete(&text, &raw, &seq.spans).expect("识别中间图");
+        let rebuilt = rebuild_after_delete(&seq.ids, &raw, &hit).expect("重建");
+        let inherited: Vec<(usize, usize)> =
+            seq.pads.iter().copied().filter(|(_, hi)| *hi <= hit.a).collect();
+        let next = pad_image_spans(
+            &rebuilt,
+            &[true, true],
+            &[grid(), grid()],
+            IMG,
+            Some(VS),
+            Some(VE),
+            PAGE,
+            PAD,
+            &inherited,
+        )
+        .expect("重新 pad");
+        let (pos, max_pos, gap) = positions_after_splice(
+            &seq.ids,
+            &old_pos,
+            &next.ids,
+            &next.spans,
+            Some(hit),
+            IMG,
+            &mrope,
+        )
+        .expect("leave-gap 位置");
+        assert!(gap, "删除后必须标记位置洞");
+        assert_eq!(&pos[..hit.a], &old_pos[..hit.a], "删点之前位置逐 token 不变");
+        let k = seq.ids[hit.b..]
+            .iter()
+            .zip(&next.ids[hit.a..])
+            .take_while(|(x, y)| x == y)
+            .count();
+        assert_eq!(&pos[hit.a..hit.a + k], &old_pos[hit.b..hit.b + k], "幸存后缀位置不移动");
+        assert_eq!(max_pos, old_max, "无新尾巴时 max_pos 不回退");
+        assert_eq!(pos.len(), next.ids.len());
+
+        // 普通追加:旧前缀位置不动,新尾巴从 max_pos+1 起。
+        let mut appended = seq.ids.clone();
+        appended.extend([777u32, 778, 779]);
+        let (pos2, max2, gap2) = positions_after_splice(
+            &seq.ids,
+            &old_pos,
+            &appended,
+            &seq.spans,
+            None,
+            IMG,
+            &mrope,
+        )
+        .expect("append 位置");
+        assert!(!gap2, "纯追加仍是紧凑连续位置");
+        assert_eq!(&pos2[..seq.ids.len()], &old_pos[..], "旧前缀位置不动");
+        assert_eq!(pos2[seq.ids.len()], [old_max + 1; 3], "新尾巴从 max+1 起");
+        assert_eq!(max2, old_max + 3);
+    }
+
+    #[test]
     fn detect_rejects_text_edits_and_unmarked() {
         let ids = build(&[1, 1], 5);
         let seq = pad(&ids, &[true, true], &[grid(), grid()]);
@@ -610,5 +868,22 @@ mod tests {
         let mut raw2: Vec<u32> = text[..del.text_start].iter().chain(&text[del.text_end..]).copied().collect();
         raw2.extend([777u32, 778]);
         assert!(detect_text_delete(&text, &raw2, &seq.spans).is_some(), "追加尾部必须仍识别");
+    }
+}
+
+#[cfg(test)]
+mod padded_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn raw_prefix_mapping_keeps_trailing_orphan_pad() {
+        // raw: [10,11, 12,13]; padded: [10,11, 99,98, 12,13]
+        let tokens = [10, 11, 99, 98, 12, 13];
+        let pads = [(2usize, 4usize)];
+        assert_eq!(padded_prefix_for_raw(&tokens, &pads, 0).unwrap(), 0);
+        assert_eq!(padded_prefix_for_raw(&tokens, &pads, 1).unwrap(), 1);
+        assert_eq!(padded_prefix_for_raw(&tokens, &pads, 2).unwrap(), 4, "切点后的 pad 必须留下");
+        assert_eq!(padded_prefix_for_raw(&tokens, &pads, 4).unwrap(), 6);
+        assert!(padded_prefix_for_raw(&tokens, &pads, 5).is_err());
     }
 }

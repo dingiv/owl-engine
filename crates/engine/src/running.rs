@@ -167,6 +167,9 @@ pub struct RunningEngine<D: DeviceClient> {
     /// **TP peer 束(rank1;`None` = 单卡)** —— 设备侧程序镜像的目标
     /// (S4 ⑤-K3:同一份设备侧代码,换装到 peer 束上再跑一遍)
     pub(crate) peer: Option<RankDev<D>>,
+    /// **视觉塔逐图 merged 缓存**(每 rank 一份;跨 turn,按像素内容指纹命中)。
+    /// 索引 0 = rank0,1 = peer;缓存块归 `Owner::Cache`,不随 turn 回收。
+    pub(crate) vlm_cache: [crate::vlm::VlmMergedCache; 2],
 }
 
 /// **前缀无感删除的观测账**(进程内;`Default` = 从未吸收过删除)。
@@ -517,6 +520,68 @@ impl<D: DeviceClient> RunningEngine<D> {
         )
     }
 
+    /// **本轮 prompt 的逐 token 绝对位置账**(单一产地)。
+    ///
+    /// - `leave_gap` 且会话已有位置账:删除段 `[a,b)` 的幸存后缀保留旧
+    ///   position,新尾巴从 `max_pos+1` 追加;普通追加同样保留旧前缀;
+    /// - 其余情况(首轮 / rebase):从 0 起紧凑重算。
+    ///
+    /// 返回 `(positions, positions_gap)`;`positions_gap=true` 表示位置已
+    /// 离开紧凑坐标,调用方须禁用跨会话内容缓存。
+    fn prompt_positions(
+        &self,
+        session: Option<u64>,
+        prompt_ids: &[u32],
+        spans: &[crate::img_evict::ImgSpan],
+        deletion: Option<crate::img_evict::TextDelete>,
+    ) -> Result<(Vec<crate::img_evict::Pos3>, bool)> {
+        let Some(vlm) = self.dev.boot.vlm.as_ref() else {
+            // 纯文本档:位置 = 标量下标(逐字节旧行为)。
+            return Ok(((0..prompt_ids.len()).map(|i| [i as i32; 3]).collect(), false));
+        };
+        let image_token = vlm.cfg().image_token;
+        let mrope = &vlm.cfg().mrope;
+        if self.boot.cfg.knobs.image_evict_mode.is_leave_gap() {
+            if let Some(sid) = session {
+                if let Some(s) = self.bank.sessions.get(sid) {
+                    if !s.positions.is_empty() && s.positions.len() == s.tokens.len() {
+                        let (pos, _max, mut gap) = crate::img_evict::positions_after_splice(
+                            &s.tokens,
+                            &s.positions,
+                            prompt_ids,
+                            spans,
+                            deletion,
+                            image_token,
+                            mrope,
+                        )
+                        .map_err(ModelError::Msg)?;
+                        // 已 positioned 的会话即使本轮纯追加也仍带位置洞；
+                        // 标记必须跨 turn 保持（缓存安全门）。
+                        gap |= s.positioned;
+                        owl_shared::log_debug!(
+                            "img-evict",
+                            "位置账:session={sid:#x} old={} new={} deletion={} gap={} max_pos={}",
+                            s.tokens.len(),
+                            prompt_ids.len(),
+                            deletion.is_some(),
+                            gap,
+                            s.max_pos
+                        );
+                        return Ok((pos, gap));
+                    }
+                }
+            }
+        }
+        let (pos, _) = crate::img_evict::compact_positions(
+            prompt_ids,
+            spans,
+            image_token,
+            mrope,
+        )
+        .map_err(ModelError::Msg)?;
+        Ok((pos, false))
+    }
+
     /// **页对齐 pad 词**(单源;`unpad` 按区间剥 ⇒ 内容对客户端不可见)。
     ///
     /// 只要"恰 1 token",顺序 = **模型最不敏感者优先**:`。`(正常标点)→ ` ` → `\n`。
@@ -678,6 +743,69 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 );
                             }
                         }
+                        if detect.is_none() {
+                            // **沿用上一轮 padded 前缀**(2026-10-26)。
+                            //
+                            // leave-gap 删除后,删除段前面的 `pad_before` 块
+                            // 仍在前缀里、并且已经进了 KV;但对应图像已经不在。
+                            // 下一轮若从裸文本重算 pad,这个"孤儿 pad 块"不会
+                            // 被重新插入 ⇒ 前缀在删点前的 pad 块处分叉,缓存
+                            // 退到删点之前(实测 turn36→37)。
+                            //
+                            // 客户端追加/只改尾部时,`old_text` 与 `input` 有
+                            // 长公共前缀。把这段公共前缀映射成 padded 切点
+                            // (吞掉切点后的 pad),再接客户端新尾部 ⇒ 历史 pad
+                            // 全部保留,新尾部照常走 pad 律。
+                            //
+                            // 切点落在图像内部 / 客户端缩短历史 = 不做(交回
+                            // 裸文本重算),避免把半个图像拼进来。
+                            let common = old_text
+                                .iter()
+                                .zip(&input)
+                                .take_while(|(a, b)| a == b)
+                                .count();
+                            let cuts_image = s.img_spans.iter().any(|sp| {
+                                sp.text_start < common && common < sp.text_end
+                            });
+                            if common > 0 && input.len() > common && !cuts_image {
+                                let p = crate::img_evict::padded_prefix_for_raw(
+                                    &s.tokens,
+                                    &s.pads,
+                                    common,
+                                )
+                                .map_err(ModelError::Msg)?;
+                                let mut merged = s.tokens[..p].to_vec();
+                                merged.extend_from_slice(&input[common..]);
+                                // 拼接后图像游程数必须与当前请求的 marks 对齐;
+                                // 不齐 = 切点切进了图像/账不平 ⇒ 放弃复用,走裸文本重算,
+                                // 不许把半个图拼进来后让下游 silent 错位。
+                                let mut runs = 0usize;
+                                let mut prev = false;
+                                for &t in &merged {
+                                    let cur = t == image_token;
+                                    if cur && !prev {
+                                        runs += 1;
+                                    }
+                                    prev = cur;
+                                }
+                                if runs == marks.len() {
+                                    input = merged;
+                                    inherited = s
+                                        .pads
+                                        .iter()
+                                        .copied()
+                                        .filter(|(_, hi)| *hi <= p)
+                                        .collect();
+                                    owl_shared::log_debug!(
+                                        "img-evict",
+                                        "沿用 padded 前缀:session={sid:#x} common={common} padded_cut={p} old={} new={} pads={}",
+                                        s.tokens.len(),
+                                        input.len(),
+                                        inherited.len()
+                                    );
+                                }
+                            }
+                        }
                         if let Some(hit) = detect {
                             let imgs = s.img_spans.len();
                             let marked = s.img_spans.iter().filter(|x| x.evict).count();
@@ -812,22 +940,24 @@ impl<D: DeviceClient> RunningEngine<D> {
             // **可删标记必须有人接**(前缀无感删除;2026-10-23):客户端打了
             // `owl_evict` 而引擎档没开 = 静默失约(用户以为删了不重算,
             // 实际每轮全量重灌)⇒ 提交边界**响亮拒**,不静默忽略。
-            if self.boot.cfg.knobs.image_evict {
-                if !self.dev.pool.k_shift_supported() {
-                    return Err(ModelError::Msg(format!(
-                        "submit: [pool] image_evict = true 但本池不支持 K 重转\
-                         (paged={} kv_fp8={} dtype={:?})",
-                        self.dev.pool.geom.paged,
-                        self.dev.pool.geom.kv_fp8,
-                        self.dev.pool.geom.dims.dtype
-                    )));
+            if !self.boot.cfg.knobs.image_evict {
+                if opts.images.iter().any(|i| i.evict) {
+                    return Err(ModelError::Msg(
+                        "submit: 图像带 evict(可删)标记,但本档 [pool] image_evict = false\
+                         —— 要么把档位打开,要么去掉标记(不许静默忽略)"
+                            .into(),
+                    ));
                 }
-            } else if opts.images.iter().any(|i| i.evict) {
-                return Err(ModelError::Msg(
-                    "submit: 图像带 evict(可删)标记,但本档 [pool] image_evict = false\
-                     —— 要么把档位打开,要么去掉标记(不许静默忽略)"
-                        .into(),
-                ));
+            } else if !self.boot.cfg.knobs.image_evict_mode.is_leave_gap()
+                && !self.dev.pool.k_shift_supported()
+            {
+                return Err(ModelError::Msg(format!(
+                    "submit: [pool] image_evict = true 但本池不支持 K 重转\
+                     (paged={} kv_fp8={} dtype={:?})",
+                    self.dev.pool.geom.paged,
+                    self.dev.pool.geom.kv_fp8,
+                    self.dev.pool.geom.dims.dtype
+                )));
             }
         }
         let raw_ids = {
@@ -864,6 +994,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         if prompt_ids.is_empty() {
             return Err(ModelError::Msg("submit: 空 prompt".into()));
         }
+        let (positions, positions_gap) =
+            self.prompt_positions(session, &prompt_ids, &img_spans, deletion)?;
         // **消息边界快照点**(2026-10-24):页对齐 token offset，供
         // `prefill_step_chunk_msg` 切块与 `capture_gdn_snap` 的 snap_keep
         // 共用。`open_ids` 来自配置/模型声明，不在扫描函数里写死。
@@ -1015,6 +1147,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             msg_snaps,
             img_spans,
             img_pads,
+            positions,
+            positions_gap,
             deletion,
             opts,
             cached: cached_hit,

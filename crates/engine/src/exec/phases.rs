@@ -14,14 +14,18 @@ use owl_iface::contract::ModelError;
 /// 而 append 场景所需的**末边界快照**永远在。
 const SNAP_EVERY: usize = 4;
 
-/// **单 rank VLM 备料**(V2/V3):塔图根 eval 成本 rank 的设备叶块。
+/// **单 rank VLM 备料**(V2/V3;2026-10-26 逐图塔输出缓存)。
 ///
-/// 两 rank 的 host 表(cos/sin/idx)由同一个 `Vlm::prepare` 得到(输入相同);
-/// `merged` 是**本 rank** 的塔输出块(塔无 AR,两 rank 数值应逐位一致)。
+/// 视觉塔输出只依赖「像素 + grid + 塔权重」,与文本 position 无关 ⇒
+/// 按图片内容指纹缓存 `merged [N,D]`,跨 turn 复用。命中时不再跑塔;
+/// 未命中只对本 turn **新增/变化**的图跑塔。最后把逐图块组合成本 turn
+/// 连续的 `[N,D]`(组合块归 turn,缓存块只作输入,故 LRU 可安全出清)。
 async fn prepare_vlm_rank<D: DeviceClient>(
     dev: &mut crate::engine::RankDev<D>,
+    cache: &mut crate::vlm::VlmMergedCache,
     ids: &[u32],
     images: &[crate::turn::TurnImage],
+    positions: &[[i32; 3]],
     dbg: bool,
 ) -> Result<crate::vlm::VlmPrepared> {
     let vlm = dev
@@ -31,11 +35,13 @@ async fn prepare_vlm_rank<D: DeviceClient>(
         .ok_or_else(|| ModelError::Msg("prefill: 图像输入但本 rank 无视觉塔".into()))?;
     let grids: Vec<owl_models::layers::vision::GridThw> =
         images.iter().map(|i| i.image.grid).collect();
-    let px: Vec<f32> = images
-        .iter()
-        .flat_map(|i| i.image.pixel_values.iter().copied())
-        .collect();
-    let req = vlm.prepare(ids, &grids, &[], &px)?;
+    let ins = vlm.inputs_with_positions(
+        ids,
+        &grids,
+        &[],
+        owl_models::contract::Dtype::F16,
+        positions,
+    )?;
     // **诊断(probes.debug)**:每 turn 的 VLM 位置面 —— 多图 × 前缀复用 × 删除的
     // 定位点(2026-10-24 尾查:2 次删除后 27B 出 `< 0.000…`)。
     // 打印 = 全 prompt 长度、视觉 token 数、delta、每段视觉占位游程与**前几个
@@ -61,13 +67,12 @@ async fn prepare_vlm_rank<D: DeviceClient>(
                     i += 1;
                 }
             }
-            let idx = &req.ins;
-            let pos_all = idx.idx_host.len();
-            let head: Vec<f32> = idx.idx_host.iter().take(8).copied().collect();
+            let pos_all = ins.idx_host.len();
+            let head: Vec<f32> = ins.idx_host.iter().take(8).copied().collect();
             let imgs: Vec<f32> = runs
                 .iter()
                 .take(4)
-                .map(|(st, _)| idx.idx_host.get(*st).copied().unwrap_or(-1.0))
+                .map(|(st, _)| ins.idx_host.get(*st).copied().unwrap_or(-1.0))
                 .collect();
             (n_vis, (runs, pos_all), head, imgs)
         };
@@ -78,20 +83,58 @@ async fn prepare_vlm_rank<D: DeviceClient>(
             ids.len(),
             n_vis,
             runs,
-            req.ins.delta,
+            ins.delta,
             pos_all,
             pos_head,
             pos_img
         );
     }
-    let merged = match req.merged {
-        Some(m) => {
+    // 逐图取缓存 / 只对未命中图跑塔。缓存键 = 像素内容 + grid;同图重复出现
+    // 在第二轮循环里会自然命中刚插入的条目。
+    let merge = vlm.cfg().vision.merge;
+    let hidden = vlm.hidden();
+    let mut leaves: Vec<(owl_models::TensorOps, usize)> = Vec::with_capacity(images.len());
+    for img in images {
+        let rows = crate::vlm::merged_rows(img.image.grid, merge)?;
+        let key = crate::vlm::VlmImageKey::of(&img.image);
+        let leaf = if let Some((leaf, cached_rows)) = cache.get(key) {
+            if cached_rows != rows {
+                return Err(ModelError::Msg(format!(
+                    "VLM 缓存行数失配:key={key:?} cached={cached_rows} now={rows}"
+                )));
+            }
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("vlm.cache.hit", 1, file!(), line!());
+            });
+            leaf
+        } else {
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("vlm.cache.miss", 1, file!(), line!());
+            });
+            let tb = vlm.tower_inputs(
+                &[img.image.grid],
+                &img.image.pixel_values,
+                owl_models::contract::Dtype::F16,
+            )?;
+            let m = vlm.tower_forward(&tb);
+            let want = [rows, hidden];
+            if m.shape() != want {
+                return Err(ModelError::Msg(format!(
+                    "VLM 塔输出形状 {:?} ≠ {want:?}(单图 grid={:?})",
+                    m.shape(),
+                    img.image.grid
+                )));
+            }
             let dtype = m.dtype();
             let shape = m.shape().to_vec();
             let (b, arena) = {
-                // env 值语义:先取(方法借 `&dev`)再借 face
+                // 缓存块归 `Owner::Cache`,不随 turn 回收;塔中间块立即归还。
                 let env = dev.env();
                 let face = dev.graphs.session.face_mut();
+                let _scope = face.scoped_ctx(
+                    owl_iface::handle::Owner::Cache,
+                    owl_iface::handle::AssetClass::Unclassified,
+                );
                 owl_models::interpreters::eval_ops_scoped_env(
                     m.step(),
                     face,
@@ -100,12 +143,58 @@ async fn prepare_vlm_rank<D: DeviceClient>(
                 )
                 .await?
             };
+            // 中间块只服务本次塔求值;根块进缓存。free 在作用域外也正确:
+            // owner 只影响分配记账,归还按块 id 结算。
+            dev.graphs.session.face_mut().free(&arena).await?;
             let leaf = owl_models::TensorOps::of_block(b.id, dtype, shape);
-            Some((b, arena, leaf))
-        }
-        None => None,
+            if let Some(old) = cache.insert(key, rows, b, leaf.clone()) {
+                // 同键旧条目是异常调用;不静默泄漏。
+                dev.graphs.session.face_mut().free(&[old]).await?;
+            }
+            leaf
+        };
+        leaves.push((leaf, rows));
+    }
+    let combined = crate::vlm::combine_merged(&leaves, hidden)?;
+    let dtype = combined.dtype();
+    let shape = combined.shape().to_vec();
+    let (b, arena) = {
+        // 组合块归当前 turn(执行上下文由 scheduler 设成 `Turn(id)`)。
+        let env = dev.env();
+        let face = dev.graphs.session.face_mut();
+        owl_models::interpreters::eval_ops_scoped_env(
+            combined.step(),
+            face,
+            env,
+            dev.boot.tp.as_ref(),
+        )
+        .await?
     };
-    Ok(crate::vlm::VlmPrepared { ins: req.ins, merged })
+    let leaf = owl_models::TensorOps::of_block(b.id, dtype, shape);
+    // 组合求值已完成 ⇒ 缓存块不再被本 turn 引用,可以安全 LRU 出清。
+    let evicted = cache.evict_to_cap();
+    if !evicted.is_empty() {
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.counter_add("vlm.cache.evict", evicted.len() as u64, file!(), line!());
+        });
+        dev.graphs.session.face_mut().free(&evicted).await?;
+    }
+    if dbg {
+        owl_shared::log_info!(
+            "vlm-cache",
+            "images={} hit={} miss={} entries={} used={}KiB evicted={}",
+            images.len(),
+            cache.hits,
+            cache.misses,
+            cache.len(),
+            cache.used_bytes() / 1024,
+            cache.evictions
+        );
+    }
+    Ok(crate::vlm::VlmPrepared {
+        ins,
+        merged: Some((b, arena, leaf)),
+    })
 }
 
 
@@ -193,6 +282,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 b.session_id,
                 outcome.applied
             );
+        }
+        // **leave-gap 旧链尾引用释放**：必须在宿主回灌完成之后 —— 先 drop
+        // 会把待回灌的宿主内容一并 evict。这里只 decref 缓存身份，槽真正
+        // free 仍由 store/调度器决定。
+        if let Some(rr) = b.rerope.as_ref() {
+            let mut released = 0usize;
+            for h in &rr.release_chains {
+                if self.bank.rel.drop_chain(*h)? {
+                    released += 1;
+                }
+            }
+            if released > 0 {
+                owl_shared::log_debug!(
+                    "img-evict",
+                    "旧链尾引用释放 {released} 块(session={};宿主回灌已先完成)",
+                    b.session_id
+                );
+            }
         }
         let table = self
             .bank
@@ -282,14 +389,34 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             act.vlm.is_none() && !act.images.is_empty()
         };
         if need_vlm {
-            let (ids, images) = {
+            let (ids, images, positions) = {
                 let act = self.turns.active()?;
-                (act.prompt_ids.clone(), act.images.clone())
+                (act.prompt_ids.clone(), act.images.clone(), act.positions.clone())
             };
             // **TP2:两 rank 各备一份**(host 表同源;merged 各 rank 设备块)。
-            let prep0 = prepare_vlm_rank(&mut self.dev, &ids, &images, self.boot.probes.debug).await?;
+            // 缓存同样每 rank 一份:塔无 AR,但块 id/设备面各归各的。
+            let dbg = self.boot.probes.debug;
+            let prep0 = prepare_vlm_rank(
+                &mut self.dev,
+                &mut self.vlm_cache[0],
+                &ids,
+                &images,
+                &positions,
+                dbg,
+            )
+            .await?;
             let prep1 = match self.peer.as_mut() {
-                Some(p) => Some(prepare_vlm_rank(p, &ids, &images, self.boot.probes.debug).await?),
+                Some(p) => Some(
+                    prepare_vlm_rank(
+                        p,
+                        &mut self.vlm_cache[1],
+                        &ids,
+                        &images,
+                        &positions,
+                        dbg,
+                    )
+                    .await?,
+                ),
                 None => None,
             };
             let act = self.turns.active_mut()?;
@@ -339,6 +466,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             (act.vlm.as_ref(), act.vlm_peer.as_ref())
         };
+        let positions = self.turns.active()?.positions.clone();
         // **廉价边界省 Q**：只有完整召回/诊断边界才需要 query 面。
         // 与 `coverage_analyze` 同一份调度算式（末边界预测 + recall_every）——
         // 不能在两处各写一个数。
@@ -387,6 +515,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             knobs: &self.boot.cfg.knobs,
             sid,
             bt_chain: &bt_chain,
+            positions: &positions,
             gdn_slot,
             bank: Some(&mut self.bank),
             sel: Some(&mut self.sel),
@@ -400,6 +529,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             knobs: &self.boot.cfg.knobs,
             sid,
             bt_chain: &bt_chain,
+            positions: &positions,
             gdn_slot,
             bank: None, // peer:镜像路不给账房(草稿臂在本路响亮拒)
             sel: None,  // peer:诊断账只在主 rank
@@ -537,6 +667,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             replay_knobs.select_decode = false;
             replay_knobs.coverage_probe = false;
             let vlm_replay = self.turns.active()?.vlm.as_ref();
+            let positions_replay = self.turns.active()?.positions.clone();
             let tail = {
                 let mut host = ChunkHost {
                     boot_seq: self.boot.seq,
@@ -544,6 +675,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     knobs: &replay_knobs,
                     sid,
                     bt_chain: &replay_bt,
+                    positions: &positions_replay,
                     gdn_slot,
                     bank: None,
                     sel: None,
@@ -732,18 +864,20 @@ if self.dev.graphs.session.has_input("sel_pt") {
         grew: bool,
     ) -> Result<TurnEvent> {
         let sid = self.turns.active()?.session_id;
-        // **VLM 位置增量**:m-RoPE 的 `delta` 只加到 **rope 位置**(pos 槽);
-        // `kv_len/kv_slot` 仍是真实 token 计数(加进 kv_len = 注意力长度错)。
-        let vlm_delta = self
-            .turns
-            .active()
-            .ok()
-            .and_then(|a| a.vlm.as_ref())
-            .map(|v| v.ins.delta)
-            .unwrap_or(0);
-        let pos_rope = usize::try_from(pos as i64 + vlm_delta).map_err(|_| {
+        // **leave-gap 位置**:rope 位置 = 本 turn 的位置账(绝对),不再由
+        // `token 下标 + VLM delta` 推导;KV 长度/槽仍按 token 数。
+        // `next_rope_pos` 是**下一枚**生成 token 的位置;本步喂的
+        // `token` 是上一枚已发射 token ⇒ 其位置 = next − 1。
+        let pos_rope = usize::try_from(
+            self.turns
+                .active()?
+                .next_rope_pos
+                .saturating_sub(1),
+        )
+        .map_err(|_| {
             ModelError::Msg(format!(
-                "decode: VLM 位置为负(pos={pos}, delta={vlm_delta})"
+                "decode: 绝对 rope 位置为负(token pos={pos}, next_rope_pos={})",
+                self.turns.active().map(|a| a.next_rope_pos).unwrap_or(-1)
             ))
         })?;
         // 调试门:decode 步粒度
@@ -1371,6 +1505,10 @@ if self.dev.graphs.session.has_input("sel_pt") {
                 act.first_token_ms = Some(crate::running::now_ms());
             }
             act.out.push(nt);
+            // 生成 token 的位置 = `next_rope_pos`(连续,不产生新洞);leave-gap
+            // 下它与 token 下标不同。
+            act.positions.push([act.next_rope_pos; 3]);
+            act.next_rope_pos = act.next_rope_pos.saturating_add(1);
             // `decoded` 由全量重解差分维护(delta 本步统一从 `emitted` 切片取,
             // 以便 stop 尾缓冲能回吐);返回值丢弃是有意的
             let _appended = decode_delta(&self.boot.tok, &act.out, &mut act.decoded);
