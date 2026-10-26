@@ -6,9 +6,7 @@
 //!   cargo test -p cli --test workload_e2e -- --nocapture
 //!
 //! `OWL_WORKLOAD_SUITE` selects the suite (default `core`; `gui` is the
-//! GUI-agent screenshot-window scenario and needs `snap_max>=2`). For the
-//! rebase arm start the server with `--set pool.image_evict_delta_limit=2` and
-//! set `OWL_WORKLOAD_SUITE=image-evict-rebase`.
+//! GUI-agent screenshot-window scenario and needs `snap_max>=2`).
 
 use std::process::Command;
 

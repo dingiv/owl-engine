@@ -56,11 +56,6 @@ pub struct AgentSession {
     /// **pad 区间账**(padded 坐标,升序):`unpad(tokens, pads)` = 客户端可见
     /// 序列。与 `img_spans` 同一次写回(两处各写一份 = 下一轮 diff 拿错坐标)。
     pub pads: Vec<(usize, usize)>,
-    /// **叠转轮数**(漂移上限;2026-10-23):本会话链自上次**整段重建**以来
-    /// 被 Δ-rope 重转的次数(f16 每轮约 1 ulp;超限 ⇒ 下一轮删除触发重建)。
-    /// 不随 `reset()` 归零 —— 前缀命中路径也调 `reset()` 而是**续写**;
-    /// 只有真正丢掉整条链(`plan_fresh`)才清零。
-    pub rot_rounds: u32,
     /// **逐 token 的 m-RoPE 绝对位置**(leave-gap;2026-10-25)。
     /// 与 `tokens` 等长;文本 `[p,p,p]`,图像 `[t,h,w]`。
     /// 删除图标段后幸存 token 的位置**不移动**,新尾巴从 `max_pos+1` 追加。
@@ -102,7 +97,6 @@ impl AgentSession {
             chain: ChainCursor::new(),
             img_spans: Vec::new(),
             pads: Vec::new(),
-            rot_rounds: 0,
             positions: Vec::new(),
             max_pos: 0,
             positioned: false,
@@ -141,13 +135,11 @@ impl AgentSession {
         self.positioned = false;
     }
 
-    /// **整段重建**(漂移到顶 / 前缀失配):`reset` + 叠转计数归零。
+    /// **整段重建**(前缀失配):`reset` + 位置账代数递增。
     ///
-    /// 单产地律:`rot_rounds` 只在这里与 `apply_image_delete`(自增)被写 ——
     /// 前缀命中的续写路径不得清零(它也会调 `reset()`,但那不是重建)。
     pub fn rebase(&mut self) {
         self.reset();
-        self.rot_rounds = 0;
         self.position_epoch = self.position_epoch.wrapping_add(1);
     }
 

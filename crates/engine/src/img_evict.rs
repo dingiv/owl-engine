@@ -8,23 +8,18 @@
 //! 引擎**不自作主张**:客户端在图像上打「将来可能被删」标记(`TurnImage::evict`),
 //! 且 `[pool] image_evict = true` 才启用。没有标记的图 → 逐字节旧路径。
 //!
-//! # 为什么"删一段"能退化成**一个标量旋转**
+//! # 为什么是 leave-gap(而不是旋转 K)
 //!
-//! RoPE 只吃**相对位置**。删掉区间 `[a, b)` 后,其后所有 token 的位置整体
-//! 前移**同一个量 `S`**(位置推进,不是 token 位移)⇒ 只要把**后缀的 K** 乘
-//! `R(−S)`:
+//! 删掉区间 `[a, b)` 后,若把后缀 K 乘 `R(−S)` 压紧位置,语义上精确,但
+//! **每轮都在已经量化/旋转过的 K 上再转一次** ⇒ FP8 网格反复舍入,无法
+//! 无限次丢弃旧图片。最终方案改为 **leave-gap**:
 //!
-//! - 后缀内部:两端同时旋转 ⇒ 相对位置不变 ⇒ 注意力**精确不变**;
-//! - 后缀 ↔ 前缀:相对位置恰好等于"真的删了"之后的值 ⇒ **精确**;
-//! - **V 不用动**(V 无位置),**前缀一个字节都不用碰**(连 K 都不转)。
+//! - 删除只摘页,**不转 K、不移动幸存 token 的 position**;
+//! - 新 token 从 `max_pos+1` 追加;位置账保留洞(不可复原);
+//! - 因此可以**无限次**丢弃旧图片缓存,没有叠转漂移,也没有周期整段重建。
 //!
-//! 唯一的机械约束:块表是**页粒度**(32 tok/页)。要让"删"变成**零数据搬运**,
-//! 被删区间必须是整页数、且起点落页边界 ⇒ 可删图像段强制**页对齐**(前后补 pad)。
-//!
-//! **2026-10-25 leave-gap**:`[pool].image_evict_mode = "leave_gap"` 时不再
-//! 旋转后缀 K;删除只摘页,幸存 token 的 position 原样保留,新 token 从
-//! `max_pos+1` 追加。位置账/拼接的唯一产地 = [`compact_positions`] /
-//! [`positions_after_splice`];启动/执行面见 `session.rs`、`scheduler.rs`。
+//! 位置账/拼接的唯一产地 = [`compact_positions`] / [`positions_after_splice`];
+//! 启动/执行面见 `session.rs`、`scheduler.rs`。
 //!
 //! # 为什么需要"重建"(不是纯 diff)
 //!
@@ -48,7 +43,7 @@
 //! # 本模块的边界
 //!
 //! 只做 **host 纯函数**(零设备 IO、零 store 访问):段 discovery、pad 律、
-//! 删除识别、位置同移自证。动手(取链 / 拼接 / 旋转 / 记账)在
+//! 删除识别、位置同移自证。动手(取链 / 拼接 / 位置账 / 盘层收尾)在
 //! [`crate::scheduler`] 与 `exec::img_evict`。
 
 use owl_models::layers::mrope::MropeCfg;
@@ -426,7 +421,7 @@ pub fn rebuild_after_delete(
 /// **位置三元组**(与 `MropeCfg` 的 `[T,H,W]` 同序;i32 足够覆盖 262k)。
 pub type Pos3 = [i32; 3];
 
-/// **紧凑位置账**:从 token 0 起按 m-RoPE 重新计算(普通 turn / rebase)。
+/// **紧凑位置账**:从 token 0 起按 m-RoPE 重新计算(普通 turn / 整段重建)。
 pub fn compact_positions(
     ids: &[u32],
     spans: &[ImgSpan],
@@ -564,53 +559,6 @@ pub fn positions_after_splice(
     Ok((pos, max_pos, deletion.is_some() || tail_start < old_tokens.len()))
 }
 
-/// **位置同移自证**(G-自证):删掉 `[a,b)` 之后,后缀每个 token 的三网格位置
-/// 是否都只差**同一个标量** `S`。
-///
-/// 用**真正喂给前向的同一份** `MropeCfg::rope_index` 两侧各算一遍(不抄公式 ——
-/// 抄公式是"静默位移半格"的头号来源),再逐 token 逐分量比对:
-/// `pos_old[b+j] − pos_new[a+j] == S`。
-///
-/// 返回 `Some(S)`(S = 后缀位置前移量;K 乘 `R(−S)`);不成立 = `None`。
-pub fn positions_shift(
-    old: &[u32],
-    new: &[u32],
-    old_spans: &[ImgSpan],
-    new_spans: &[ImgSpan],
-    image_token: u32,
-    mrope: &MropeCfg,
-    a: usize,
-    b: usize,
-    keep_tokens: usize,
-) -> Option<i64> {
-    if b + keep_tokens > old.len() || a + keep_tokens > new.len() {
-        return None;
-    }
-    // 网格按**出现序**喂给 rope_index;段数与占位数不符 = 结构错(响亮 None)
-    let runs_old = image_runs(old, image_token);
-    let runs_new = image_runs(new, image_token);
-    if runs_old.len() != old_spans.len() || runs_new.len() != new_spans.len() {
-        return None;
-    }
-    let grids_old: Vec<GridThw> = old_spans.iter().map(|s| s.grid).collect();
-    let grids_new: Vec<GridThw> = new_spans.iter().map(|s| s.grid).collect();
-    let tt_old = owl_models::layers::mrope::token_types(old, image_token, None);
-    let tt_new = owl_models::layers::mrope::token_types(new, image_token, None);
-    let pi_old = mrope.rope_index(old, &tt_old, &grids_old, &[]).ok()?;
-    let pi_new = mrope.rope_index(new, &tt_new, &grids_new, &[]).ok()?;
-    let s0 = pi_old.pos.get(b)?[0] - pi_new.pos.get(a)?[0];
-    for j in 0..keep_tokens {
-        let po = pi_old.pos.get(b + j)?;
-        let pn = pi_new.pos.get(a + j)?;
-        for c in 0..3 {
-            if po[c] - pn[c] != s0 {
-                return None;
-            }
-        }
-    }
-    Some(s0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,7 +633,7 @@ mod tests {
     }
 
     /// **全链闭环**:pad → 删一张 → 文本识别 → 重建 → 重新 pad
-    /// 判据:删点之前逐字节不变;后缀逐 token 相同(⇒ 可复用 + 单标量旋转)。
+    /// 判据:删点之前逐字节不变;后缀逐 token 相同(⇒ 可复用)。
     #[test]
     fn delete_pipeline_keeps_prefix_and_suffix() {
         let ids = build(&[1, 1], 5);

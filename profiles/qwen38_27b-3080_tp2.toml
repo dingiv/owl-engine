@@ -55,9 +55,8 @@ prefix_cache = true
 snap_host_mb = 3072
 host_cache_mb = 10240
 vram_reserve_mb = 512
-# 图像前缀无感删除:FP8 重转的硬上限 = 4(每次重转一次 e4m3 量化)。
+# 图像前缀无感删除(leave-gap:删后不转 K、保留位置洞)。
 image_evict = true
-image_evict_delta_limit = 4
 # 消息边界快照:pi 每轮重发全历史;与 3090 生产档同形。
 snap_msg_boundary = true
 snap_msg_delim = ""

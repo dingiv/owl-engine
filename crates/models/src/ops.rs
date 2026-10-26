@@ -73,9 +73,6 @@ pub enum SemanticKernel {
     SiluAndMulMerged,
     /// partial rope
     Rope,
-    /// **前缀无感删除**:池内 K 的 Δ-rope(原地;单行吃 cos/sin 表,
-    /// `blocks` = 物理页号列表;标量槽 = hkv/hd/page/x/half)
-    KvRopeShift,
     /// 激活 per-token int8 量化(W4A8 喂料手;S1c:行 absmax → scale → 饱和
     /// round-nearest-even;`mul` = 权重侧全局因子只进 scales 出口)
     /// —— 两个 op_id 各一档(输出恒 U8,`dt` 载不了输入档;与 cast 对同律)
@@ -325,7 +322,6 @@ impl SemanticKernel {
             SemanticKernel::Narrow => "ops.narrow",
             SemanticKernel::Concat => "ops.concat",
             SemanticKernel::Rope => "ops.rope",
-            SemanticKernel::KvRopeShift => "elems.kv_rope_shift",
             SemanticKernel::QuantInt8RowF16 => "elems.quant_int8_row_f16",
             SemanticKernel::QuantInt8RowBf16 => "elems.quant_int8_row_bf16",
             SemanticKernel::Embed => "ops.embed",

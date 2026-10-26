@@ -181,25 +181,13 @@ vram_reserve_mb = 256
 vram_budget_mb = 0
 # 前缀缓存开/关
 prefix_cache = true
-# **前缀无感删除**(图像段;2026-10-23):客户端给图像打 `owl_evict` 标记时,
-# 引擎把图像段补 pad 到页对齐并记为删除候选;下一轮若该段真的被删 ⇒ 保留后缀
-# 页 + 后缀 K 乘 R(−S)(位置帧平移),不重算删点之后的 token。
+# **前缀无感删除**(图像段;最终方案 = leave-gap):客户端给图像打 `owl_evict`
+# 标记时,引擎把图像段补 pad 到页对齐并记为删除候选;下一轮若该段真的被删
+# ⇒ 保留后缀页、**不转 K、不移动幸存 token 的 position**,新 token 从
+# max_pos+1 追加;不重算删点之后的 token,可无限次丢弃旧图片缓存。
 # **引擎不自作主张**:没有标记的图一律走旧路径。需 prefix_cache = true 且
-# 分页 KV(f16 或 fp8-e4m3;FP8 的 delta_limit 必须 1..=4)。
-# 缺省关 = 逐字节旧行为。
+# 分页 KV(f16 或 fp8-e4m3)。缺省关 = 逐字节旧行为。
 image_evict = false
-# **删除后处理模式**(2026-10-25):`rebase` = 删后旋转后缀 K(旧行为,
-# FP8 需 delta_limit);`leave_gap` = 删后不转 K、不移动幸存 token position,
-# 新 token 从 max_pos+1 追加(无叠转漂移、无周期整段重建)。
-# 产线先用 rebase;leave-gap 在 0.8B/27B 验收后单独开。
-image_evict_mode = "rebase"
-# **叠转上限**(2026-10-23):一条链允许被 K 重转的次数;到顶后**下一轮删除
-# 触发一次整段重建**(全量 prefill + GDN 重置,漂移与计数归零)。
-# f16 每轮约 0.4~0.6 ulp,实测 N=4/16/32/64 ⇒ 2.5/7.7/13.7/25.2 ulp(最差元素;
-# 门 `kv_rope_k_shift_drift_under_repeats`)。缺省 32 ≈ 13.7 ulp;0 = 不限。
-# **FP8 档**:每轮重落 e4m3 网格,必须设 1..=4(boot 门硬拒 0/大于 4);
-# 三图 GUI 窗口用 4。
-image_evict_delta_limit = 32
 # 页对齐 pad 词（必须恰 1 token；空 = 自动 `。`→` `→`\n`）。
 # 27B 实测 `。` 在 8 图/8 次删除下稳定；"\n" 从第 3 张标记图起会吐 `< >`。
 image_evict_pad = "。"

@@ -3,16 +3,14 @@
 #
 # 用法:
 #   tools/run-agent-workload.sh [suite] [cli 额外参数...]
-#   suite = core | gui | image-evict | image-evict-rebase | all
+#   suite = core | gui | image-evict | all
 #
 # 前置:
 #   - 端口 $OWL_WORKLOAD_PORT(缺省 8135)空闲;脚本绝不抢占现有 server。
 #   - 2×3080 空闲(TP2 测试档;3090 生产档可继续跑在 8134)。
-#   - rebase suite 需要 OWL_WORKLOAD_DELTA_LIMIT=2。
 #
 # 环境:
 #   OWL_WORKLOAD_PORT / OWL_WORKLOAD_LOG / OWL_WORKLOAD_MAX_SEQ
-#   OWL_WORKLOAD_DELTA_LIMIT(缺省 4;rebase 用例设 2)
 #   OWL_WORKLOAD_PROFILE(缺省 profiles/qwen38_27b-3080_tp2.toml)
 #   OWL_WORKLOAD_SERVER_BIN / OWL_WORKLOAD_CLI_BIN
 #
@@ -28,7 +26,6 @@ if (($# > 0)); then shift; fi
 LOG="${OWL_WORKLOAD_LOG:-/tmp/owl-agent-workload-${PORT}.log}"
 PROFILE="${OWL_WORKLOAD_PROFILE:-profiles/qwen38_27b-3080_tp2.toml}"
 MAX_SEQ="${OWL_WORKLOAD_MAX_SEQ:-131072}"
-DELTA_LIMIT="${OWL_WORKLOAD_DELTA_LIMIT:-4}"
 SERVER_BIN="${OWL_WORKLOAD_SERVER_BIN:-$ROOT/target/release/server}"
 CLI_BIN="${OWL_WORKLOAD_CLI_BIN:-$ROOT/target/release/cli}"
 
@@ -44,7 +41,7 @@ if ss -tln | awk '{print $4}' | grep -Eq "[:.]${PORT}$"; then
     exit 2
 fi
 
-echo "[workload] 启动测试 server: $PROFILE -> 127.0.0.1:${PORT} (delta_limit=${DELTA_LIMIT})" >&2
+echo "[workload] 启动测试 server: $PROFILE -> 127.0.0.1:${PORT} (leave-gap)" >&2
 echo "[workload] 日志: $LOG" >&2
 # 子 shell 内 exec ⇒ `$!` 就是 server 本体(不是 nohup/wrapper)，
 # 清理时只 kill 这个 PID。
@@ -59,7 +56,6 @@ echo "[workload] 日志: $LOG" >&2
         --set "pool.snap_host_mb=1024" \
         --set "runtime.max_seq=${MAX_SEQ}" \
         --set "runtime.implicit_session=true" \
-        --set "pool.image_evict_delta_limit=${DELTA_LIMIT}" \
         --log-level info >"${LOG}" 2>&1
 ) &
 SERVER_PID=$!

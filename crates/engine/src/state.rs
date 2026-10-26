@@ -762,21 +762,6 @@ impl StatePool {
         total / self.geom.nb_kv.max(1)
     }
 
-    /// **单逻辑块的 K 字节**(旋转面的长度真源;`block_bytes()` 是 **K+V**)。
-    ///
-    /// 为什么要单独一个:`elems.kv_rope_shift` **只碰 K**(V 无位置)——
-    /// 拿 `block_bytes()` 当"旋转字节数"会把账记成 2× 并压低带宽口径
-    /// (27B/TP2 实测:16 页 = 8 MiB/rank,不是 16 MiB)。
-    pub(crate) fn k_block_bytes(&self) -> usize {
-        let total: usize = self
-            .kv
-            .kvs
-            .iter()
-            .map(|kv| kv.k_cache.1 * elem_bytes(kv.k_cache.0.dtype))
-            .sum();
-        total / self.geom.nb_kv.max(1)
-    }
-
     /// **主池布局**(engine 注册给 store 的 id 级描述;设计卷 §10.3 推论 A)。
     /// 每层 k/v 各一项;`stride_bytes` = 每页字节(槽步长)。
     pub(crate) fn pool_layout(&self, epoch: u64) -> owl_store::PoolLayout {
@@ -1270,34 +1255,6 @@ impl StatePool {
                 rec: block_leaf(&g.rec.0, vec![self.geom.gdn_slots, d.nv, d.hk, d.hv]),
             })
             .collect()
-    }
-
-    /// **前缀无感删除可用?**(kNHD 分页 + f16 或 fp8-e4m3 主池)
-    pub(crate) fn k_shift_supported(&self) -> bool {
-        self.geom.paged
-            && (self.geom.kv_fp8 || self.geom.dims.dtype == Dtype::F16)
-    }
-
-    /// 池内 K 的 Δ-rope 几何(`[nb, hkv, hd/x, page, x]` 四维 + `half`)
-    pub(crate) fn k_shift_geom(
-        &self,
-        half: usize,
-    ) -> crate::Result<owl_models::layers::kvshift::KvShiftGeom> {
-        if !self.k_shift_supported() {
-            return Err(ModelError::Msg(format!(
-                "k_shift_geom: 本池不支持 K 重转(paged={} kv_fp8={} dtype={:?})",
-                self.geom.paged, self.geom.kv_fp8, self.geom.dims.dtype
-            )));
-        }
-        let g = owl_models::layers::kvshift::KvShiftGeom {
-            hkv: self.geom.dims.hkv,
-            hd: self.geom.dims.hd,
-            page: self.geom.page,
-            x: self.geom.x,
-            half,
-        };
-        g.check().map_err(ModelError::Msg)?;
-        Ok(g)
     }
 
     /// 逐层 KV cache K 的**块句柄**(门/诊断:按槽偏移 D2H 读 K 字节)。

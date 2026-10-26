@@ -229,9 +229,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         owl_shared::metrics::mark_epoch();
         // **删后旧身份的盘层快照收尾**(重挂 / 丢弃):必须在**任何快照恢复之前**
         // —— 新链的恢复键可能落在盘层,回灌按新键查文件。
-        if let Some(rr) = b.rerope.as_ref() {
-            if !rr.snap_disk.is_empty() {
-                self.execute_snap_disk_ops(&rr.snap_disk).await?;
+        if let Some(ex) = b.image_exec.as_ref() {
+            if !ex.snap_disk.is_empty() {
+                self.execute_snap_disk_ops(&ex.snap_disk).await?;
             }
         }
         // **诊断(probes.debug)**:本轮恢复点(键/层/归属/深度)与是否重置 GDN ——
@@ -286,9 +286,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **leave-gap 旧链尾引用释放**：必须在宿主回灌完成之后 —— 先 drop
         // 会把待回灌的宿主内容一并 evict。这里只 decref 缓存身份，槽真正
         // free 仍由 store/调度器决定。
-        if let Some(rr) = b.rerope.as_ref() {
+        if let Some(ex) = b.image_exec.as_ref() {
             let mut released = 0usize;
-            for h in &rr.release_chains {
+            for h in &ex.release_chains {
                 if self.bank.rel.drop_chain(*h)? {
                     released += 1;
                 }
@@ -315,11 +315,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             crate::exec::mirror2!(dev, peer,
                 d => d.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table),
                 p => p.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table))?;
-        }
-        // **前缀无感删除的设备半**(2026-10-23):拼接后的后缀 K 原地重转。
-        // 顺序 = `write_bt` 之后、任何 prefill/decode 读 KV 之前。
-        if let Some(rr) = b.rerope.as_ref() {
-            self.execute_k_shift(rr).await?;
         }
         Ok(())
     }

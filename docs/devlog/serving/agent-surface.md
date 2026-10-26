@@ -1557,7 +1557,6 @@ cargo run -p cli -- --workload image-evict --only image_delete_middle \
 | `core` | 文本多轮 / 工具闭环 / 视觉 / 图文混合 + GUI-agent 窗口 + 五项图像删除 |
 | `gui` | **真实 GUI-agent 负载**：screenshot/click/type/key 工具，每个工具结果附当前截图；客户端永远只保留最新 3 张图 |
 | `image-evict` | 只跑图像删除：首图、中间图、最后一张（无图后续）、工具轮后删图、滑动窗口 |
-| `image-evict-rebase` | 叠转上限臂（需 `--set pool.image_evict_delta_limit=2`） |
 
 **GUI-agent 场景**：系统提示词声明 `screenshot/click/type/key`；用户只发一次
 6 步任务（截图 → 两次 click → type → ENTER → 截图）。**一个用户 turn 内**，
@@ -1572,17 +1571,16 @@ agent loop 可多次调用模型，**一个模型响应可返回多个 function 
 跨会话共享带图块）。
 
 判据不是模型文风，而是结构性事实：工具名与产物字节、`usage.cached_tokens`、
-服务端 info 日志 `[img-evict] 前缀无感删除` / `叠转到顶`。release 构建里
+服务端 info 日志 `[img-evict] 前缀无感删除`。release 构建里
 `image_evict.*` counter 被编译期关闭，因此日志是吸收/重整的直接证据。
 
 服务端要求：**分页 KV（f16 或 fp8-e4m3）+ `pool.image_evict=true` +
-`pool.prefix_cache=true` + 视觉档**。FP8 生产档现已支持重转，但必须
-`pool.image_evict_delta_limit=4`（1..=4；f16 可用 32）。自包含入口：
+`pool.prefix_cache=true` + 视觉档**。删除后处理固定 leave-gap（不转 K、
+保留位置洞）。自包含入口：
 
 ```bash
 tools/run-agent-workload.sh gui
 tools/run-agent-workload.sh image-evict
-OWL_WORKLOAD_DELTA_LIMIT=2 tools/run-agent-workload.sh image-evict-rebase
 ```
 
 脚本会先查端口占用（不抢占现有 server），再起隔离测试 server、等 health、
@@ -1665,7 +1663,7 @@ Chat Completions 是客户端全量重发；Responses API 的 `previous_response
 |---|---|---|
 | 2026-10-25 | v0.18 | **生产 profiles 拉满**：3090 改 63456/snap2、3080 TP2 262144/snap2；两档统一 prefix_cache + implicit_session + image_evict(delta4) + 消息边界 + host 10G。8134 `image_delete_marked`/pi 工具跟进(cached 1568/1647, TTFT 141ms)通过；8135 `image-evict` 5/5、GUI PASS |
 | 2026-10-25 | v0.17 | **8135 pi 前缀缓存修复**：TP2 生产档 `prefix_cache=false` 是根因；改 true + snap_host 1G + 消息边界快照。pi 工具跟进 cached 95.6%/TTFT 149ms，新消息 96.2%/97ms，新会话 98.3%/116ms；合成 49k 首轮 37.9s → 次轮 0.21s |
-| 2026-10-25 | v0.16 | **agent workload e2e 回归面 + FP8 重转**：`core` / `gui` / `image-evict` / `image-evict-rebase`；真 HTTP/真图/真工具，覆盖 **GUI-agent 三图窗口（tool 结果附截图）**、首图/中间图/最后一张/工具轮后删图/滑动窗口 + 叠转重建；新增 `tools/run-agent-workload.sh` 隔离起停;同时修复中间图删除的前缀 pad 重复 —— 见 §9.3 |
+| 2026-10-25 | v0.16 | **agent workload e2e 回归面 + FP8 重转（2026-10-26：rebase/K 旋转已删除，只保留 leave-gap）**：`core` / `gui` / `image-evict`；真 HTTP/真图/真工具，覆盖 **GUI-agent 三图窗口（tool 结果附截图）**、首图/中间图/最后一张/工具轮后删图/滑动窗口 + 叠转重建；新增 `tools/run-agent-workload.sh` 隔离起停;同时修复中间图删除的前缀 pad 重复 —— 见 §9.3 |
 | 2026-10-19 | v0.15 | **pi 口径定档 64k**(测装 `pi-27b-64k.toml` + pi `contextWindow 65536/maxTokens 8192`;>16k 实测 16064 tok OK;pi 真机 7 轮:冷 12.25s → cached 100.0%/98.9%/92.4%/98.7%/99.7%,TTFT 0.42-1.33s;日志 117 行/零 conn 警告/零收缩)—— 见 §9.2(6) |
 | 2026-10-19 | v0.14 | **G5 真机收口**:pi(undici)真客户端验证——keep-alive/chunked 零 `[conn]` 警告,4 轮含工具调用;前缀复用 cached 98.9%→99.85%,TTFT 12.4s→1.0-1.3s;`/debug/agent` 四轮全在场。**日志面两修**:①`owl-gpu` free 刷屏(49920 行/会话)降 DEBUG,仅账目不平升 WARN;②生成段快照(Transient)不再试下沉(设计行为曾被报成故障 WARN)—— 见 §9.2(5) |
 | 2026-10-19 | v0.13 | **G5(4) keep-alive 落地**(请求循环 + 每请求 permit + 空闲 30s + 请求数上限;SSE 改 **chunked 定界**;JSON/文本自带定界;非 1.1 ⇒ 505);战役教训:**旧 `stream.shutdown()` 残留会每响应发 FIN 掐死复用连接**(插桩定位);门 = 裸 socket 探针 6 项 + wire smoke + e2e 27B(46.4s)+ 单测 46/46 —— 见 §3.8 / §9.2(4) |

@@ -1,5 +1,10 @@
 # 图像无感删除：Leave-Gap 改造方案（设计与交接）
 
+> **2026-10-26 结案**：最终只保留 **leave-gap**。旧的 `rebase` / K 旋转路径
+> （配置 `image_evict_mode` / `image_evict_delta_limit`、`kv_rope_shift` 核、
+> rerope 计划与相关测试）已从主干删除；本文中相关章节仅作历史记录。
+
+
 > 状态：**P0-P2 核心 + 0.8B spec 门已实现；P3 27B/TP2 与 P4 consolidation 未做**（2026-10-25）
 > 目标：彻底移除 `image_evict_delta_limit=4` 导致的“每 5 次删除一次整段 prefill”
 > 尖峰，同时保持三图窗口、前缀缓存和 FP8 KV。

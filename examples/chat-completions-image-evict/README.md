@@ -264,7 +264,7 @@ implicit_session = true
 [pool]
 image_evict = true
 prefix_cache = true
-image_evict_delta_limit = 4   # FP8；f16 可用 32
+# 删除后处理固定 leave-gap（不转 K、保留位置洞）
 ```
 
 以及：

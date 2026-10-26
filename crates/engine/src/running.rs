@@ -150,9 +150,9 @@ pub struct TokenizeReply {
 pub struct RunningEngine<D: DeviceClient> {
     /// boot 期事实(只读;写入只在构造期)
     pub(crate) boot: BootCtx,
-    /// **前缀无感删除的观测账**(2026-10-23):决策事实(删除区间/保留块/
-    /// 平移量/被重转的物理页)。落账在 `scheduler::apply_image_delete`;
-    /// 门与运维共用这一份(**不许再从日志里反推**)。
+    /// **前缀无感删除的观测账**(leave-gap):决策事实(删除区间/保留块/
+    /// 快照重挂数)。落账在 `scheduler::apply_image_leave_gap`;门与运维
+    /// 共用这一份(**不许再从日志里反推**)。
     pub(crate) img_evict: ImgEvictLedger,
     /// turn 运行账(turn.rs)
     pub(crate) turns: TurnLedger,
@@ -177,8 +177,6 @@ pub struct RunningEngine<D: DeviceClient> {
 pub struct ImgEvictLedger {
     /// 累计吸收次数(一次 turn 最多一次)
     pub absorbed: u64,
-    /// 累计**整段重建**次数(叠转到顶 `image_evict_delta_limit`;漂移归零)
-    pub rebased: u64,
     /// 最近一次的决策事实(`None` = 还没吸收过)
     pub last: Option<ImgEvictTrace>,
 }
@@ -196,18 +194,8 @@ pub struct ImgEvictTrace {
     pub b: usize,
     /// 复用后缀的整块数
     pub keep_blocks: usize,
-    /// 位置平移量 `S`(正 = 后缀前移;K 乘 `R(−S)`)
-    pub shift: i64,
-    /// 被原地重转的**物理页**(= 复用后缀页,逻辑序)
-    pub pages: Vec<u32>,
     /// 快照重挂条数(设备 + 宿主;盘层异步另计)
     pub rekeyed: usize,
-    /// **本会话链累计被重转的次数**(漂移账;到 `image_evict_delta_limit`
-    /// 后下一轮删除触发整段重建)
-    pub rot_rounds: u32,
-    /// **旋转段墙钟(µs,两 rank 合计)** —— 执行面在 `execute_k_shift` 回填。
-    /// 口径:G3 的门与运维面板直接读它(别再从日志里抠)。
-    pub rotate_us: u64,
 }
 
 /// **boot 期定型、运行期只读**的事实。
@@ -543,9 +531,9 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// **本轮 prompt 的逐 token 绝对位置账**(单一产地)。
     ///
-    /// - `leave_gap` 且会话已有位置账:删除段 `[a,b)` 的幸存后缀保留旧
-    ///   position,新尾巴从 `max_pos+1` 追加;普通追加同样保留旧前缀;
-    /// - 其余情况(首轮 / rebase):从 0 起紧凑重算。
+    /// - 会话已有位置账:删除段 `[a,b)` 的幸存后缀保留旧 position,新尾巴
+    ///   从 `max_pos+1` 追加;普通追加同样保留旧前缀;
+    /// - 首轮 / 无位置账:从 0 起紧凑重算。
     ///
     /// 返回 `(positions, positions_gap)`;`positions_gap=true` 表示位置已
     /// 离开紧凑坐标,调用方须禁用跨会话内容缓存。
@@ -562,34 +550,32 @@ impl<D: DeviceClient> RunningEngine<D> {
         };
         let image_token = vlm.cfg().image_token;
         let mrope = &vlm.cfg().mrope;
-        if self.boot.cfg.knobs.image_evict_mode.is_leave_gap() {
-            if let Some(sid) = session {
-                if let Some(s) = self.bank.sessions.get(sid) {
-                    if !s.positions.is_empty() && s.positions.len() == s.tokens.len() {
-                        let (pos, _max, mut gap) = crate::img_evict::positions_after_splice(
-                            &s.tokens,
-                            &s.positions,
-                            prompt_ids,
-                            spans,
-                            deletion,
-                            image_token,
-                            mrope,
-                        )
-                        .map_err(ModelError::Msg)?;
-                        // 已 positioned 的会话即使本轮纯追加也仍带位置洞；
-                        // 标记必须跨 turn 保持（缓存安全门）。
-                        gap |= s.positioned;
-                        owl_shared::log_debug!(
-                            "img-evict",
-                            "位置账:session={sid:#x} old={} new={} deletion={} gap={} max_pos={}",
-                            s.tokens.len(),
-                            prompt_ids.len(),
-                            deletion.is_some(),
-                            gap,
-                            s.max_pos
-                        );
-                        return Ok((pos, gap));
-                    }
+        if let Some(sid) = session {
+            if let Some(s) = self.bank.sessions.get(sid) {
+                if !s.positions.is_empty() && s.positions.len() == s.tokens.len() {
+                    let (pos, _max, mut gap) = crate::img_evict::positions_after_splice(
+                        &s.tokens,
+                        &s.positions,
+                        prompt_ids,
+                        spans,
+                        deletion,
+                        image_token,
+                        mrope,
+                    )
+                    .map_err(ModelError::Msg)?;
+                    // 已 positioned 的会话即使本轮纯追加也仍带位置洞；
+                    // 标记必须跨 turn 保持（缓存安全门）。
+                    gap |= s.positioned;
+                    owl_shared::log_debug!(
+                        "img-evict",
+                        "位置账:session={sid:#x} old={} new={} deletion={} gap={} max_pos={}",
+                        s.tokens.len(),
+                        prompt_ids.len(),
+                        deletion.is_some(),
+                        gap,
+                        s.max_pos
+                    );
+                    return Ok((pos, gap));
                 }
             }
         }
@@ -969,16 +955,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                             .into(),
                     ));
                 }
-            } else if !self.boot.cfg.knobs.image_evict_mode.is_leave_gap()
-                && !self.dev.pool.k_shift_supported()
-            {
-                return Err(ModelError::Msg(format!(
-                    "submit: [pool] image_evict = true 但本池不支持 K 重转\
-                     (paged={} kv_fp8={} dtype={:?})",
-                    self.dev.pool.geom.paged,
-                    self.dev.pool.geom.kv_fp8,
-                    self.dev.pool.geom.dims.dtype
-                )));
             }
         }
         let raw_ids = {

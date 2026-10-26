@@ -72,8 +72,6 @@
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
 //! | pool | image_evict | bool / false(**前缀无感删除**:客户端给可删图像打标记 ⇒ 引擎页对齐 + 删除即位置帧平移) |
-//! | pool | image_evict_mode | ImageEvictMode / rebase(删除后处理:`rebase` = 旋转后缀 K;`leave_gap` = 保留位置洞、不改 K) |
-//! | pool | image_evict_delta_limit | u32 / 32(一条链允许被重转的次数;到顶后下一轮删除触发整段重建;0 = 不限;仅 rebase) |
 //! | pool | image_evict_pad | str / "。"(页对齐 pad 词;必须恰 1 token;空 = 自动 `。`→` `→`\\n`) |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
 //! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
@@ -558,30 +556,6 @@ pub struct ModelCfg {
     pub quant: QuantScheme,
 }
 
-/// **前缀无感删除的删除后处理模式**(`[pool].image_evict_mode`)。
-///
-/// - [`Rebase`](Self::Rebase):旧实现 —— 删除后把后缀 K 原地乘 `R(−S)`,
-///   位置压紧;FP8 有叠转漂移,靠 `image_evict_delta_limit` 周期整段重建。
-/// - [`LeaveGap`](Self::LeaveGap):删除后**不改 K、不移动幸存 token 的
-///   position**,新 token 从 `max_pos+1` 追加;位置空间留洞,彻底消除
-///   叠转漂移与周期重建。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImageEvictMode {
-    /// 旋转后缀 K、压紧位置(旧行为,保留回退)。
-    #[default]
-    Rebase,
-    /// 保留位置洞、不改 K(leave-gap)。
-    LeaveGap,
-}
-
-impl ImageEvictMode {
-    /// 是否为 leave-gap 模式。
-    pub fn is_leave_gap(self) -> bool {
-        matches!(self, Self::LeaveGap)
-    }
-}
-
 /// 池几何与显存预算(engine StatePool)
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -661,28 +635,14 @@ pub struct PoolCfg {
     ///
     /// 开 = 对**带标记**的图像段做两件事:
     /// ① 页对齐 pad(段首落页边界、整段整页 —— 删除后块表拼接零搬运);
-    /// ② 下一轮若识别到「历史里正好少了这一段」,保留后缀页 + 只把后缀 K
-    ///    乘 `R(−S)`(位置帧平移),不重算前缀之后的任何 token。
+    /// ② 下一轮若识别到「历史里正好少了这一段」,保留后缀页、**不转 K、
+    ///    不移动幸存 token 的 position**,新 token 从 `max_pos+1` 追加;
+    ///    不重算前缀之后的任何 token,可无限次丢弃旧图片缓存。
     ///
     /// 关 = 逐字节旧行为(标记被忽略;带了标记也**响亮拒**,不静默降级)。
     /// 依赖:`prefix_cache = true`(内容寻址取旧链)与分页 kNHD KV
-    /// (f16 或 fp8-e4m3;FP8 的 `image_evict_delta_limit` 必须 1..=4)。
+    /// (f16 或 fp8-e4m3)。
     pub image_evict: bool,
-    /// **删除后处理模式**(`[pool].image_evict_mode`;缺省 `rebase`)。
-    ///
-    /// `leave_gap` = 删除后不旋转 K、不移动幸存 token 的 position;新 token
-    /// 从 `max_pos+1` 追加。它不需要 `image_evict_delta_limit`,也不会因
-    /// 叠转到顶触发整段重建。
-    pub image_evict_mode: ImageEvictMode,
-    /// **漂移上限 = 一条链允许被重转的次数**(`[pool].image_evict_delta_limit`;
-    /// 缺省 **32**;`0` = 不限)。
-    ///
-    /// 每次删除都是"在已经重转过的 K 上再乘 R(−S)" —— f16 每轮约 0.4~0.6 ulp
-    /// 舍入,多次叠转按随机游走累积(实测 N=4/16/32/64 ⇒ 2.5/7.7/13.7/25.2 ulp,
-    /// 门 `kv_rope_k_shift_drift_under_repeats`)。到顶后**下一轮删除触发一次
-    /// 整段重建**(全量 prefill,`reset_gdn`;漂移归零、计数归零),而不是
-    /// 在漂移上继续加。只在本键开(`image_evict`)时生效。
-    pub image_evict_delta_limit: u32,
     /// **页对齐 pad 的填充词**(`[pool].image_evict_pad`;缺省 **`。`**;空串 = 自动)。
     ///
     /// 为什么要可配:pad 词是**模型敏感项** —— 27B/TP2 实测,`\n`(一串空行)从第 3 张
@@ -1702,8 +1662,6 @@ impl Default for PoolCfg {
             vram_reserve_mb: 1024,
             prefix_cache: true,
             image_evict: false,
-            image_evict_mode: ImageEvictMode::Rebase,
-            image_evict_delta_limit: 32,
             image_evict_pad: "。".to_string(),
             block_pool_bytes: 0,
             no_reclaim: false,

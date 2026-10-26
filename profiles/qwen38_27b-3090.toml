@@ -55,9 +55,8 @@ vram_reserve_mb = 512
 # 10GiB ≈ 容纳 4 条 63k 链(每条 1983 块)的冷缓存。
 host_cache_mb = 10240
 snap_host_mb = 3072
-# 图像前缀无感删除:FP8 重转硬上限 = 4;snap2 覆盖三图窗口。
+# 图像前缀无感删除(leave-gap;snap2 覆盖三图窗口)。
 image_evict = true
-image_evict_delta_limit = 4
 # agent 消息边界快照:delim 空 = 用模型 ChatFormat.im_open(实测 = 1 token [248045])
 snap_msg_boundary = true
 snap_msg_delim = ""

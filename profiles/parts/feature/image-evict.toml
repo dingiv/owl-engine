@@ -1,13 +1,10 @@
 # 特性组件：图像段前缀无感删除（需分页 KV + prefix_cache；f16 或 fp8-e4m3）。
+# 最终方案 = leave-gap：删后不转 K、保留位置洞，可无限次丢弃旧图片缓存。
 # 池 dtype 继承调用方 profile；FP8 生产档沿用 fp8-e4m3。
 # 投机解码继承调用方 profile（生产默认深度 7）；本组件不覆盖。
 [pool]
 prefix_cache = true
 snap_max = 2
 image_evict = true
-# 删除后处理:rebase(旧)/ leave_gap(不转 K、保留位置洞)。
-image_evict_mode = "rebase"
-# 安全缺省 4(f16 可显式调回 32;fp8 硬上限 4;仅 rebase 使用)。
-image_evict_delta_limit = 4
 vram_target = 0.9
 vram_reserve_mb = 1024

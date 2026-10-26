@@ -1,18 +1,11 @@
-//! **前缀无感删除的设备半**:后缀 K 的池内原地重转(两 rank 对称)。
+//! **前缀无感删除的盘层收尾**:快照重挂 / 旧身份丢弃。
 //!
-//! 决策在 `scheduler::plan_image_delete`(纯 host);本模块只做设备动作:
-//! 把拼接后的**后缀物理页**里每层 K 乘上 `R(−S)`(位置帧平移),V 不动。
-//!
-//! 为什么不能复用 prefill 的 rope 核:池 K 是 kNHD 分页
-//! `[nb,hkv,hd/x,page,x]` —— token 在**倒数第二维**,拿不到 token-major 视图;
-//! 硬搬只会把一次原地乘变成四趟搬运(见 `cu/elems/kv_rope_shift.cu` 头注)。
+//! leave-gap 只摘页、保留幸存 position,不转 K;本模块只做 `SnapDiskOp` 的
+//! 真实 I/O(决策在 `scheduler` 纯 host 面出票)。
 
-use owl_iface::contract::{DeviceClient, Dtype, ModelError};
-use owl_models::layers::kvshift::{delta_table, k_shift};
-use owl_models::interpreters::eval_ops_side_effect_env_pool;
-use owl_models::TensorOps;
+use owl_iface::contract::{DeviceClient, ModelError};
 
-use crate::scheduler::{ReropePlan, SnapDiskOp};
+use crate::scheduler::SnapDiskOp;
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// **盘层快照的删除收尾**(重挂 / 丢弃旧身份;2026-10-23)。
@@ -36,8 +29,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             });
         }
         let mut rekeyed = 0usize;
-        let mut dropped = 0usize;
-        let mut freed = 0usize;
         for op in ops {
             match op {
                 SnapDiskOp::Rekey { old, new } => {
@@ -53,124 +44,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         }
                     }
                 }
-                SnapDiskOp::Drop { key } => {
-                    let path = self.bank.rel.plan_drop_snap_disk(*key);
-                    if let Some(p) = path {
-                        freed += crate::disk_io::remove_files(vec![p]).await;
-                    }
-                    match self.bank.rel.commit_drop_snap_disk(*key) {
-                        Ok(()) => dropped += 1,
-                        Err(e) => {
-                            owl_shared::log_warn!("img-evict", "盘层快照丢弃落账失败:{e}");
-                        }
-                    }
-                }
             }
         }
         owl_shared::log_info!(
             "img-evict",
-            "盘层快照收尾:重挂 {} 条 · 丢弃 {} 条(文件 {} 个)",
-            rekeyed,
-            dropped,
-            freed
-        );
-        Ok(())
-    }
-
-    /// **删除之后的后缀 K 重转**(`R(−shift)`;每层一发,两 rank 对称)。
-    ///
-    /// 顺序纪律:必须在任何读这些页的 chunk **之前**(调用点 = `execute_begin`,
-    /// 紧接 `write_bt`;此时本 turn 还没有 prefill/decode 读过 KV)。
-    pub(crate) async fn execute_k_shift(&mut self, plan: &ReropePlan) -> Result<(), ModelError> {
-        if plan.pages.is_empty() || plan.shift == 0 {
-            return Ok(());
-        }
-        let half = self.dev.boot.rope.rotary_dim() / 2;
-        let geom = self.dev.pool.k_shift_geom(half)?;
-        // Δ 表 = m-RoPE 表在 `[Δ,Δ,Δ]` 处的一行(**与上轮 prefill 同源**);
-        // 位置前移 `shift` ⇒ 乘 `R(−shift)`。
-        let (cos, sin) = {
-            let vlm = self.dev.boot.vlm.as_ref().ok_or_else(|| {
-                ModelError::EngineInvariant {
-                    what: "K 重转:本 rank 无视觉档(image_evict 的 boot 门应已拒)".into(),
-                }
-            })?;
-            delta_table(&vlm.cfg().mrope, -plan.shift)
-        };
-        let pack = |v: &[f32]| -> Vec<u8> {
-            v.iter().flat_map(|x| half::f16::from_f32(*x).to_le_bytes()).collect()
-        };
-        let cos_t = TensorOps::from_host(Dtype::F16, vec![geom.half], &pack(&cos));
-        let sin_t = TensorOps::from_host(Dtype::F16, vec![geom.half], &pack(&sin));
-        let blocks: Vec<f32> = plan.pages.iter().map(|p| *p as f32).collect();
-        let blocks_bytes: Vec<u8> = blocks.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let blocks_t = TensorOps::from_host(Dtype::F32, vec![blocks.len()], &blocks_bytes);
-        let t0 = std::time::Instant::now();
-        let n_layers = self.dev.pool.kv_caches().len();
-        // **K only**(本核不碰 V;口径见 `StatePool::k_block_bytes`)
-        let bytes = plan.pages.len() * self.dev.pool.k_block_bytes();
-        // **每 rank 一条批量发射**(2026-10-24):16 层攒进**一条**信箱消息。
-        // 旧口径 = 逐层 `eval_ops_scoped_env` ⇒ 每层一次往返(27B/TP2 实测
-        // 6.3 ms 里 ~95% 是发射,GPU 只占零点几毫秒)。多根 side-effect 口径
-        // 一次求值全部层;预算只用来**打开累积批**(本算子无临时块)。
-        const BATCH_POOL: usize = 1 << 20;
-        let roots: Vec<TensorOps> = self
-            .dev
-            .pool
-            .kv_caches()
-            .iter()
-            .map(|(k, _v)| k_shift(&k, &cos_t, &sin_t, &blocks_t, geom))
-            .collect();
-        {
-            let refs: Vec<&TensorOps> = roots.iter().collect();
-            let env = self.dev.env();
-            let face = self.dev.graphs.session.face_mut();
-            let _ = eval_ops_side_effect_env_pool(
-                &refs,
-                face,
-                env,
-                self.dev.boot.tp.as_ref(),
-                BATCH_POOL,
-            )
-            .await?;
-        }
-        drop(roots);
-        // TP2:**同一份 Δ 表 / 同一份页列表**(物理槽两 rank 同号;旋转对称)
-        if let Some(peer) = self.peer.as_mut() {
-            let geom_p = peer.pool.k_shift_geom(half)?;
-            let roots_p: Vec<TensorOps> = peer
-                .pool
-                .kv_caches()
-                .iter()
-                .map(|(k, _v)| k_shift(&k, &cos_t, &sin_t, &blocks_t, geom_p))
-                .collect();
-            {
-                let refs: Vec<&TensorOps> = roots_p.iter().collect();
-                let env = peer.env();
-                let face = peer.graphs.session.face_mut();
-                let _ = eval_ops_side_effect_env_pool(
-                    &refs,
-                    face,
-                    env,
-                    peer.boot.tp.as_ref(),
-                    BATCH_POOL,
-                )
-                .await?;
-            }
-        }
-        let elapsed_us = t0.elapsed().as_micros() as u64;
-        if let Some(t) = self.img_evict.last.as_mut() {
-            t.rotate_us = elapsed_us;
-        }
-        owl_shared::counter_add!("image_evict.rotate.bytes", bytes as u64);
-        owl_shared::log_info!(
-            "img-evict",
-            "后缀 K 重转 R(−{}) · 层 {} · 页 {} / {:.1} MiB(K) / {:.2} ms",
-            plan.shift,
-            n_layers,
-            plan.pages.len(),
-            bytes as f64 / 1048576.0,
-            t0.elapsed().as_secs_f64() * 1e3
+            "盘层快照收尾:重挂 {} 条",
+            rekeyed
         );
         Ok(())
     }

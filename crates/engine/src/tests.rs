@@ -4846,13 +4846,12 @@ pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
 /// 1. `image_evict.absorbed` 递增 —— 删除**被吸收**，不是退回全量重算；
 /// 2. 删除区间 == 被删图的**整段**（含页对齐 pad），起点/长度都是整页；
 /// 3. **K 一个字节都不改**：删除前后后缀物理页的每层 K 逐字节相同
-///    （leave-gap 的正判别；旧 rebase 路径这条必红）；
+///    （leave-gap 的正判别；旧旋转路径这条必红，已删除）；
 /// 4. 吸收轮 prefill 事件数很小（只喂新尾部；后缀零重算）；
 /// 5. 幸存 token 的 position 逐 token 不变，`max_pos` 不回退；
 /// 6. 旧链从删点起的身份已释放：被删图槽的 `slot_refs` 在 `execute_begin`
 ///    之后归零（删除前 >0）；K 内容本身未被改写（只比保留后缀页）；
-/// 7. 第二次删除仍吸收，`rot_rounds == 0` / `rebased == 0`（delta_limit
-///    在 leave-gap 下不生效）。
+/// 7. 第二次删除仍吸收（可无限次丢弃旧图片）。
 ///
 /// ⚠️ 0.8B「boot 后第一轮就带图」有既有红（F1，另案）⇒ 门先跑**纯文本预热轮**。
 pub async fn gpu_image_evict_gate() {
@@ -4873,10 +4872,6 @@ pub async fn gpu_image_evict_gate() {
             vision: true,
             prefix_cache: true,
             image_evict: true,
-            image_evict_mode: owl_shared::config::ImageEvictMode::LeaveGap,
-            // 故意设 1：leave-gap 必须无视这个 rebase 漂移上限，第二次删除
-            // 仍要吸收而不是整段重建。
-            image_evict_delta_limit: 1,
             // 钉小池（门只跑 ~700 tok；auto 池算式在本机会被“预算可服务上限”
             // 拒 —— 与本特性无关的既有面）
             pool_tokens: Some(2048),
@@ -5129,11 +5124,6 @@ pub async fn gpu_image_evict_gate() {
             trace.keep_blocks
         );
     }
-    assert_eq!(trace.shift, 0, "leave-gap 不许 K 旋转");
-    assert!(trace.pages.is_empty(), "leave-gap 不许标旋转页");
-    assert_eq!(trace.rotate_us, 0, "leave-gap 不许发 K 重转核");
-    assert_eq!(trace.rot_rounds, 0, "leave-gap 不累计叠转");
-    assert_eq!(running.img_evict.rebased, 0, "leave-gap 不整段重建");
     // ③ 吸收轮只喂新尾部
     assert!(
         prefill_events <= 3,
@@ -5224,10 +5214,10 @@ pub async fn gpu_image_evict_gate() {
         "未标记的图被删时**不许**吸收(引擎不自作主张)"
     );
 
-    // ── G7 臂：**连续删除**（delta_limit=1 也无效）──
+    // ── G7 臂：**连续删除**（两次都必须吸收）──
     //
     // 会话 9：turn 1 两张可删图 ⇒ turn 2 删第一张 ⇒ turn 3 删第二张；
-    // leave-gap 下两次都要吸收，rot_rounds/rebased 恒 0。
+    // leave-gap 下两次都要吸收。
     {
         let g7_p1 = running.boot.tok.chat_format().render_chat(
             &[
@@ -5288,13 +5278,8 @@ pub async fn gpu_image_evict_gate() {
             absorbed_after_t1 + 1,
             "第一次删除应当被吸收"
         );
-        assert_eq!(
-            running.bank.sessions.session(9).expect("会话 9").rot_rounds,
-            0,
-            "leave-gap 无叠转计数"
-        );
 
-        // turn 3：删第二张 —— 仍须吸收（delta_limit=1 不得触发重建）
+        // turn 3：删第二张 —— 仍须吸收（leave-gap 可无限次删除）
         let q4 = "再确认一次。";
         let g7_p3 = running.boot.tok.chat_format().render_chat(
             &[
@@ -5311,20 +5296,12 @@ pub async fn gpu_image_evict_gate() {
         let g7_text3 = drive_turn(&mut running, g7t3).await;
         assert!(!g7_text3.trim().is_empty(), "G7 t3 必须出文本");
         let s9 = running.bank.sessions.session(9).expect("会话 9");
-        assert_eq!(s9.rot_rounds, 0, "连续删除仍无叠转计数");
         assert_eq!(s9.positioned, true, "第二次删除后位置洞标记仍在");
-        assert_eq!(
-            running.img_evict.rebased, 0,
-            "leave-gap 连续删除不许整段重建"
-        );
         assert_eq!(
             running.img_evict.absorbed,
             absorbed_after_t1 + 2,
-            "第二次删除必须继续吸收(delta_limit=1 在 leave-gap 下无效)"
+            "第二次删除必须继续吸收(leave-gap 可无限次删除)"
         );
-        let t3 = running.img_evict.last.clone().expect("G7 t3 trace");
-        assert_eq!(t3.shift, 0);
-        assert!(t3.pages.is_empty());
     }
 
     // ── 视觉塔输出缓存:同一张图跨 turn 再出现时必须命中,不再重跑塔 ──
@@ -5368,7 +5345,7 @@ pub async fn gpu_image_evict_spec_identity_gate() {
         owl_shared::testkit::report::skip(format_args!("0.8B 资产不在 {}", dir.display()));
         return;
     }
-    /// 跑一遍"两图 → 删第一张"的灰心流,返回 (turn2 生成 token, 是否吸收, 旋转页数)
+    /// 跑一遍"两图 → 删第一张"的灰心流,返回 (turn2 生成 token, 是否吸收, 旋转页数=0)
     async fn arm(
         spec: bool,
         ordinal: usize,
@@ -5387,9 +5364,6 @@ pub async fn gpu_image_evict_spec_identity_gate() {
         if spec {
             knobs.draft.depth = 3;
             knobs.draft.dumb = true;
-        }
-        if owl_shared::env_reader::flag("OWL_GATE_LEAVE_GAP") {
-            knobs.image_evict_mode = owl_shared::config::ImageEvictMode::LeaveGap;
         }
         let mut engine = Engine::new(EngineConfig {
             device_ordinal: ordinal,
@@ -5622,7 +5596,7 @@ pub async fn gpu_image_evict_spec_identity_gate() {
             }
         }
         let absorbed = running.img_evict.absorbed == 1;
-        let pages = running.img_evict.last.as_ref().map(|t| t.pages.len()).unwrap_or(0);
+        let pages = 0usize; // leave-gap 不转 K
         let toks = running
             .bank
             .sessions
@@ -5659,7 +5633,7 @@ pub async fn gpu_image_evict_spec_identity_gate() {
     if c_on != c_off {
         owl_shared::testkit::report::skip(
             "既有红:VLM 跨 boot 不可复现(无删除对照臂已分叉;OWL_GATE_SAME=1 同构两臂也分叉、\
-             OWL_GATE_TEXT=1 纯文本则逐位相同)⇒ spec 差异无法归因于 verify 行/旋转,删除臂判据暂不可用",
+             OWL_GATE_TEXT=1 纯文本则逐位相同)⇒ spec 差异无法归因于 verify 行/leave-gap,删除臂判据暂不可用",
         );
         return;
     }
@@ -5667,16 +5641,12 @@ pub async fn gpu_image_evict_spec_identity_gate() {
     let (a, abs_a, pa) = arm(true, ordinal, &dir, false).await;
     let (b, abs_b, pb) = arm(false, ordinal, &dir, false).await;
     assert!(abs_a && abs_b, "两臂都必须吸收删除(on={abs_a} off={abs_b})");
-    if owl_shared::env_reader::flag("OWL_GATE_LEAVE_GAP") {
-        assert_eq!(pa + pb, 0, "leave-gap 两臂都不许旋转 K(on={pa} off={pb} 页)");
-    } else {
-        assert!(pa > 0 && pb > 0, "两臂都必须真的旋转过(on={pa} off={pb} 页)");
-    }
+    assert_eq!(pa + pb, 0, "leave-gap 两臂都不许旋转 K(on={pa} off={pb} 页)");
     eprintln!("[D] 删除臂 on  len={} {a:?}\n[D] 删除臂 off len={} {b:?}", a.len(), b.len());
     assert_eq!(a.len(), b.len(), "两臂生成 token 数必须一致(max_new=8)");
     assert_eq!(
         a, b,
-        "spec on/off 的贪心 token 必须逐位相同(verify 行 × 旋转后的位置帧)"
+        "spec on/off 的贪心 token 必须逐位相同(verify 行 × leave-gap 位置帧)"
     );
 }
 

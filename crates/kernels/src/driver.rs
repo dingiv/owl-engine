@@ -397,12 +397,6 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "elems.cast_f16_f32" => elems::cast_f16_f32(dt),
         "ops.concat" => elems::concat(dt),
         "ops.rope" => elems::rope(dt, ax(0)),
-        // 前缀无感删除:池内 K 的 Δ-rope(物理页列表原地重转)
-        "elems.kv_rope_shift" => elems::kv_rope_shift(
-            dt,
-            req.shapes.get(2).and_then(|s| s.first().copied()).unwrap_or(0),
-            req.scalars,
-        ),
         "ops.embed" => elems::embed(dt, ax(0)),
         "elems.embed_i8" => elems::embed_i8(ax(0)),
         "attn.norm_rope" => attn::norm_rope(dt, ax(0), ax(1), ax(2)), // aux = [tokens, heads, hd]
@@ -2367,45 +2361,6 @@ pub mod elems {
         KernelPick {
             name: dt_name("rope", dt),
             shape: Shape { grid: (tokens as u32, 1, 1), block: (128, 1, 1), smem: 0 },
-        }
-    }
-
-    /// **前缀无感删除的池内 Δ-rope**(2026-10-23,自 image-rotation 收编)。
-    ///
-    /// 几何:一 block 一**单元** = (物理页 × kv 头 × 半维组 `dg`);
-    /// `page·x` 个线程 = 单元内 `(tok, j)` 逐点对。单元数 = `nblocks·hkv·half/x`
-    /// (nblocks 自 `blocks` 张量首维取 —— 与标量槽不重复声明)。
-    ///
-    /// 参数量纲:标量槽序 = `hkv, hd, page, x, half`(与表同源),`dt` 恒 F16
-    /// (fp8 主池不支持 —— 调用方先拒)。
-    pub fn kv_rope_shift(dt: DType, nblocks: usize, scalars: &[i64]) -> KernelPick {
-        // 池句柄口径:FP8 主池是 U32 扁平字节账,元素格式由 POOL=F8E4M3
-        // 承担;f16 主池是 F16。两种都走同一几何/同一核对拍门。
-        let fp8 = match dt {
-            DType::F16 => false,
-            DType::U32 | DType::F8E4M3 => true,
-            other => panic!("kv_rope_shift: 仅 f16 / fp8-e4m3,得 {other:?}"),
-        };
-        let s = |i: usize| -> usize {
-            *scalars.get(i).unwrap_or_else(|| {
-                panic!("kv_rope_shift: 标量槽 {i} 缺失(需 hkv/hd/page/x/half 五个)")
-            }) as usize
-        };
-        let (hkv, hd, page, x, half) = (s(0), s(1), s(2), s(3), s(4));
-        assert!(x > 0 && half % x == 0, "kv_rope_shift: 要求 half % x == 0(half={half} x={x})");
-        assert!(2 * half <= hd, "kv_rope_shift: 2·half={} 超 head_dim {hd}", 2 * half);
-        let threads = page * x;
-        assert!(
-            threads > 0 && threads <= 1024,
-            "kv_rope_shift: block 尺寸 page·x = {threads} 非法(需 ∈ (0, 1024])"
-        );
-        let units = nblocks * hkv * (half / x);
-        assert!(units > 0, "kv_rope_shift: 零单元(空页列表?)");
-        let shape = Shape { grid: (units as u32, 1, 1), block: (threads as u32, 1, 1), smem: 0 };
-        if fp8 {
-            KernelPick::of::<crate::ops::elems::KvRopeKShiftFp8>(shape)
-        } else {
-            KernelPick::of::<crate::ops::elems::KvRopeKShiftF16>(shape)
         }
     }
 

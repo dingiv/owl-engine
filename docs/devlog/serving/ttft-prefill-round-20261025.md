@@ -1,5 +1,10 @@
 # TTFT / prefill 优化轮（2026-10-25）
 
+> **2026-10-26 结案**：最终只保留 **leave-gap**。旧的 `rebase` / K 旋转路径
+> （配置 `image_evict_mode` / `image_evict_delta_limit`、`kv_rope_shift` 核、
+> rerope 计划与相关测试）已从主干删除；本文中相关章节仅作历史记录。
+
+
 > 状态：**基线已冻结，第一轮归因完成；优化实验未开始。**
 > 原始现场：`perf-runs/ttft-prefill-20261025/`（gitignored，含日志/CSV/回放脚本/配置指纹）。
 > 服务：`qwen38_27b-3080_tp2.toml`，`0.0.0.0:8135`，3080×2 TP2，

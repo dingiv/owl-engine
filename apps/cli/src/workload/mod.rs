@@ -5,9 +5,7 @@
 //! functional (one scenario per feature family), not a stress test.
 //!
 //! Suites: `core` (all resident cases), `gui` (the real GUI-agent screenshot
-//! window), `image-evict` (five image-deletion shapes), `image-evict-rebase`
-//! (delta-limit arm; requires `--set pool.image_evict_delta_limit=2`), and
-//! `all` (alias of core for now).
+//! window), `image-evict` (image-deletion shapes), and `all` (alias of core).
 
 pub mod gui;
 pub mod png;
@@ -67,7 +65,6 @@ pub fn run(args: Args) -> i32 {
                 "[workload] 8135 图像无感删除测试档示例:\n\
                  ./target/release/server -p profiles/qwen38_27b-3080_tp2.toml \\\n\
                    --set pool.image_evict=true \\\n\
-                   --set pool.image_evict_delta_limit=4 \\\n\
                    --set pool.prefix_cache=true --set pool.snap_max=2 \\\n\
                    --set pool.snap_host_mb=1024 --set runtime.max_seq=131072 \\\n\
                    --set runtime.implicit_session=true --log-level info\n\
@@ -80,10 +77,10 @@ pub fn run(args: Args) -> i32 {
     let suite = args.suite.to_ascii_lowercase();
     if !matches!(
         suite.as_str(),
-        "core" | "image-evict" | "image-evict-rebase" | "gui" | "all"
+        "core" | "image-evict" | "gui" | "all"
     ) {
         eprintln!(
-            "[workload] 未知 suite {suite:?}(core | image-evict | image-evict-rebase | gui | all)"
+            "[workload] 未知 suite {suite:?}(core | image-evict | gui | all)"
         );
         return 2;
     }
@@ -103,19 +100,12 @@ pub fn run(args: Args) -> i32 {
         ("image_delete_middle", scenarios::image_delete_middle),
         ("image_delete_last_image", scenarios::image_delete_last_image),
         ("image_delete_with_tool_round", scenarios::image_delete_with_tool_round),
-        ("image_delete_rebase", scenarios::image_delete_rebase),
         ("image_sliding_window", scenarios::image_sliding_window),
     ];
     if suite == "gui" {
         cases.retain(|(n, _)| *n == "gui_agent_screenshots");
     } else if suite == "image-evict" {
-        // The rebase arm needs a non-default server knob; keep it out of the
-        // resident image-evict suite unless explicitly requested.
-        cases.retain(|(n, _)| n.starts_with("image_") && *n != "image_delete_rebase");
-    } else if suite == "image-evict-rebase" {
-        cases.retain(|(n, _)| *n == "image_delete_rebase");
-    } else if suite == "core" || suite == "all" {
-        cases.retain(|(n, _)| *n != "image_delete_rebase");
+        cases.retain(|(n, _)| n.starts_with("image_"));
     }
     if let Some(only) = args.only.as_deref() {
         cases.retain(|(n, _)| *n == only);

@@ -11,13 +11,13 @@
 
 ### 已完成
 
-- `image_evict_mode = "leave_gap"`：
+- 唯一删除后处理 = **leave-gap**（旧 `rebase`/K 旋转路径已删除）：
   - 删除图片只摘页，不旋转 K；
   - 幸存 token 保留绝对 position，新 token 从 `max_pos + 1` 追加；
   - 删除段/旧链尾的缓存引用在宿主回灌完成后解除，槽何时 free 由 store 决定；
   - 支持宿主后缀回灌后再吸收；
   - target spec verify/replay 使用绝对 `next_rope_pos - 1`；
-  - 保留 `rebase` 回退路径，默认仍是 `rebase`。
+  - **旧 `rebase`/K 旋转路径已删除**，leave-gap 是唯一路径。
 - 原 `gpu_image_evict_gate` 已直接改造成 leave-gap 版，并新增机械断言：
   - 删除前后保留后缀 K 逐字节不变；
   - `execute_begin` 后，被删图槽 `slot_refs == 0`；
@@ -50,7 +50,7 @@
 server PID: 800821
 port: 0.0.0.0:8135
 profile: profiles/qwen38_27b-3080_tp2.toml
-override: pool.image_evict_mode=leave_gap
+override: (无；leave-gap 已是唯一路径)
 request dump: /tmp/owl-requests-frontend
 health: {"ok":true,"model":"qwen3.8-27b"}
 ```
@@ -64,7 +64,6 @@ cd /home/div/Documents/codes/packages/owl
 ./target/release/server \
   -p profiles/qwen38_27b-3080_tp2.toml \
   --set server.bind=0.0.0.0:8135 \
-  --set pool.image_evict_mode=leave_gap \
   --set server.request_dump_dir=/tmp/owl-requests-frontend \
   --log-level info
 ```
@@ -141,12 +140,10 @@ profiles/parts/feature/image-evict.toml
 ```toml
 [pool]
 image_evict = true
-image_evict_mode = "rebase"   # "rebase" | "leave_gap"
 ```
 
-- `EngineKnobs.image_evict_mode`。
-- `leave_gap` 不要求 FP8 `image_evict_delta_limit ∈ 1..=4`。
-- 默认仍是 `rebase`；3080/3090 profile 文件没有切成 leave_gap，当前 8135 是 CLI override。
+- `EngineKnobs` 不再有 `image_evict_mode` / `image_evict_delta_limit`。
+- 删除后处理固定 leave-gap；profile 不再需要 CLI override。
 
 ### 2.2 Session 位置账
 
@@ -232,7 +229,7 @@ cargo test -p owl-engine --features e2e --test engine_e2e -- --test-threads=1
 - 删除前被删槽 `refs > 0`，`execute_begin` 后 `refs == 0`；
 - 旧链止于删点；
 - 连续第二次删除仍吸收；
-- `delta_limit=1` 不触发 rebase。
+- 可无限次连续删除；无 delta_limit/rebase。
 
 ### 3.2 spec identity
 
@@ -534,10 +531,9 @@ image content hash
 1. **删除段 GDN 快照**：`release_chains` 只解除 KV 链身份，删除段旧 snapshot 是否已从
    `StateStore`/host/disk 释放，尚未核查；可能仍占 snapshot 池。
 2. **P4 consolidation**：position 洞持续增长；当前没有 `max_position` 阈值/压缩。
-3. **旧 rebase e2e**：原 `gpu_image_evict_gate` 已改成 leave-gap 版；rebase K 旋转的完整
-   机械门不再由这条 e2e 覆盖，后续需要单独补一条 rebase 回归门。
-4. **生产 profile**：`profiles/qwen38_27b-3080_tp2.toml` 仍是 `rebase`。当前 8135 只是 CLI
-   `--set`；重启若不带 override 会回到 rebase。
+3. **旧 rebase 路径**：已随 2026-10-26 清理删除（K 旋转核 / 配置 / 计划 / 测试）；
+   不再有 rebase 回归门。
+4. **生产 profile**：已统一 leave-gap；不再需要 CLI override。
 5. **当前 8135 是 fresh replay 后状态**，不是 turn35 原始 session；不要拿当前缓存判断 turn35。
 6. **不要主动 commit/push**：用户未指示；所有改动保持工作树。
 
@@ -690,7 +686,7 @@ gpu_image_evict_spec_identity_gate    OK（leave-gap spec on/off 逐位相同）
 PID: 747883
 log: /tmp/owl-8135-vlm-cache.log
 profile: profiles/qwen38_27b-3080_tp2.toml
-override: pool.image_evict_mode=leave_gap
+override: (无；leave-gap 已是唯一路径)
 request dump: /tmp/owl-requests-frontend
 health: ok
 ```
