@@ -132,6 +132,12 @@ pub struct EngineKnobs {
     /// 这正是**低显存档位**(池 < ctx)成立的那一件 —— 不开它,
     /// 链无法超出池容量。
     pub select_partial: bool,
+    /// **prefill 过去视图口径**(`[kvmem].prefill_view`;缺省 `OnHole` = 旧行为)。
+    ///
+    /// `Always` = prefill 与 decode 同源稀疏视图 ⇒ attention ∝ 工作集
+    /// (单 3090 / 27B / w4a8 / 64k 实测 prefill 1791→1994 t/s,+10.5%)。
+    /// **语义变更**(过去只读选中块),默认不开 —— 质量门未立。
+    pub prefill_view: owl_shared::config::PrefillViewMode,
     /// **驱逐策略**(B-4;缺省 `lru`)。`OWL_EVICT_POLICY=lrfu[:λ]`。
     ///
     /// - `lru` = 现役基线(`last_use` 升序);
@@ -331,6 +337,7 @@ impl Default for EngineKnobs {
             coverage_analyze_every: None,
             select_decode: false,
             select_partial: false,
+            prefill_view: owl_shared::config::PrefillViewMode::default(),
             evict_policy: owl_store::EvictPolicyKind::Lru,
             workspace_per_req: 2240,
             verify_view_tokens: 0,
@@ -668,6 +675,7 @@ impl EngineKnobs {
             coverage_analyze_every: owl_shared::env_reader::parse::<usize>("OWL_COV_ANALYZE_EVERY"),
             select_decode: cfg.kvmem.select_decode,
             select_partial: cfg.kvmem.select_partial,
+            prefill_view: cfg.kvmem.prefill_view,
             evict_policy: Self::evict_policy_of(&cfg.kvmem),
             workspace_per_req: cfg.kvmem.workspace_per_req,
             verify_view_tokens: cfg.kvmem.verify_view_tokens,
@@ -1140,7 +1148,12 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let weights_bytes = live_before_pool.saturating_sub(boot.live_at_new);
         // 设备侧装配(单卡:tp = None;双 rank 走 `TpEngine` 的同一 `boot_rank`)
         let dev = boot_rank(face, &mut cfg, rm, None, live_before_pool, t_run).await?;
-        Ok(into_running(cfg, tokenizer, boot, dev, None, ledger, weights_bytes)?)
+        let mut engine = into_running(cfg, tokenizer, boot, dev, None, ledger, weights_bytes)?;
+        // **staging 预热放在就绪之前**(2026-10-27):把首次大下沉的
+        // `cudaHostAlloc(≈600 ms)` 从 TTFT 关键路径搬到 boot。只在部分驻留档
+        // 生效(其它档 = 后端 no-op)。
+        engine.prewarm_pinned_staging().await?;
+        Ok(engine)
     }
 
     /// 本引擎账本单元(TP2 rank1 **装载前**接管用;与 `TpEngine` 的合流同源)
@@ -1518,6 +1531,7 @@ pub(crate) fn into_running<D: DeviceClient>(
         hk: crate::housekeeping::Housekeeping::default(),
         dev,
         peer,
+        pending_out: None,
         vlm_cache: [
             crate::vlm::VlmMergedCache::default(),
             crate::vlm::VlmMergedCache::default(),

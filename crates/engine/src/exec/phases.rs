@@ -433,6 +433,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 只在本档执行)。
         if self.boot.cfg.knobs.kvmem_virtualization {
             let need = base + chunk_ids.len();
+            // **槽预留前按需收口**(2026-10-27):在飞的下沉块票还占着设备槽,
+            // `ensure_for_len` 拿不到足够的槽就会响亮失败。只要池里的自由槽
+            // 够本 chunk 用,就把收口留到 **enqueue 之后**(GPU 已开算 —— 真正的
+            // 重叠);不够才在这里等。不用一刀切同步:实测 64k 只触发 1~2 次。
+            if self.pending_out.is_some() {
+                let page = self.dev.pool.geom.page.max(1);
+                let grow = chunk_ids.len().div_ceil(page).max(1);
+                if self.bank.rel.leg.report().slots_free < grow {
+                    owl_shared::counter_inc!("select.rec.drain_for_slots");
+                    self.drain_pending_out().await?;
+                }
+            }
             let s = self
                 .bank
                 .sessions
@@ -556,6 +568,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 }
             }
         };
+        // **在飞下沉收口**(2026-10-27):本 chunk 已入队 ⇒ GPU 已在算。
+        // 这里 await 的回执包含 D2H + 宿主拷贝 + 首次 pinned 分配(64k 实测
+        // **1.1 s/次**),它与本 chunk 的计算**无数据依赖** —— 让 host 等待和
+        // GPU 计算并行,而不是把等待串到下一个边界前。
+        //
+        // 放 harvest **之前**是关键:harvest 会等 GPU 跑完,那就没有窗口了。
+        self.drain_pending_out().await?;
         // 主 rank 收割(**两 rank 都已入队之后**才读;borrow 已释放)
         let mut last_row = self.harvest_prefill(tail0, boot_seq).await?;
         let t_bnd = std::time::Instant::now();
@@ -710,6 +729,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // (prefill_chunk.rs 内部记),这里补“边界那一半”(快照 + 召回/打分/调和)
         // ⇒ “每 chunk 随 ctx 变慢”在 `/debug/perf` 里直接分两半,不再靠打印。
         mrec("prefill.bnd", t_bnd.elapsed());
+        // **边界后的兜底收口**:上面的重叠点是"下个 chunk 入队后",但**末个 chunk**
+        // 没有下一个 chunk —— 留在飞的下沉就是槽泄漏(池会在 decode 阶段凭空少一半)。
+        // 重复调是幂等 no-op(已收口就立即返回)。
+        self.drain_pending_out().await?;
         // **逐 chunk 显存轨迹**(`OWL_VRAM_DBG=1`;262k 冲刺的取证面):
         // live/free 测在**边界之后** —— 判“中间件是否归还”。计时已改走 metrics。
         self.turns.active_mut()?.fed += chunk_ids.len();

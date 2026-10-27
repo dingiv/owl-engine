@@ -137,6 +137,31 @@ pub struct RunningEngine<D: DeviceClient> {
     /// **视觉塔逐图 merged 缓存**(每 rank 一份;跨 turn,按像素内容指纹命中)。
     /// 索引 0 = rank0,1 = peer;缓存块归 `Owner::Cache`,不随 turn 回收。
     pub(crate) vlm_cache: [crate::vlm::VlmMergedCache; 2],
+    /// **在飞的 stage-out**(2026-10-27):下沉命令已提交、回执未收。
+    /// 安全点(下一个 chunk 已入队、GPU 正在算)由 [`Self::drain_pending_out`] 收口。
+    pub(crate) pending_out: Option<PendingOut>,
+}
+
+/// **在飞的下沉命令**(分离式换出)。
+///
+/// 为什么可以"发出去先不管":
+/// - `plan_offload_blocks` 已把块票占住 ⇒ 在 commit 之前**没有任何路径能为
+///   这些槽签发新 lease**(在飞槽不可复用的结构保证);
+/// - 被沉的块**不在**选择集里 ⇒ 本 chunk 的视图与下一个 chunk 的 `past_view`
+///   都不读它们(表已写占位符);
+/// - `SlotTable` 单主零锁 ⇒ 同一时刻只允许一条 out 在飞(`drain` 后清)。
+///
+/// 本结构尚在 = 账尚未结 — 不许推迟到 turn 收口后(那吋池可能已在别处填满)。
+/// `since` 给诊断面(在飞时长)。
+pub(crate) struct PendingOut {
+    /// 会话(表写回/恢复用)
+    pub(crate) sid: u64,
+    /// (表内下标, 身份, 原设备槽):drain **失败**时按它把表恢复成原槽
+    pub(crate) blocks: Vec<(usize, owl_store::ChainHash, u32)>,
+    /// 每个 rank 一个回执句柄(单卡 ⇒ 1 个;分离式目前只开在单卡)
+    pub(crate) waiters: Vec<owl_iface::contract::SwapWaiter>,
+    /// 提交时刻(诊断:在飞时长)
+    pub(crate) since: std::time::Instant,
 }
 
 /// **前缀无感删除的观测账**(进程内;`Default` = 从未吸收过删除)。
@@ -2676,6 +2701,111 @@ impl<D: DeviceClient> RunningEngine<D> {
             table = owl_store::reclaim_slot_table(conn)?;
         }
         Ok(table)
+    }
+
+    /// **本档能否走分离式下沉**(单卡 + 后端自述支持)。
+    ///
+    /// 先探能力再动 `SlotTable`:表格是单主零锁的,一旦交给 `swap_begin`
+    /// 就只能等回执拿回 —— 没有"试一下不行就换回去"这条路。
+    pub(crate) fn can_defer_out(&self, rank_groups: usize) -> bool {
+        self.bank.rel.world().max(1) == 1
+            && rank_groups == 1
+            && self.dev.graphs.session.face_ref().supports_swap_begin()
+    }
+
+    /// **发一条分离式 stage-out**(2026-10-27;调用前必须 `can_defer_out`)。
+    pub(crate) fn swap_out_begin(
+        &mut self,
+        pieces: &[Vec<owl_iface::contract::SwapPiece>],
+        table: owl_store::SlotTable,
+    ) -> Result<owl_iface::contract::SwapWaiter> {
+        let w = self.dev.graphs.session.face_mut().swap_begin(
+            owl_iface::contract::SwapDir::Out,
+            &pieces[0],
+            Box::new(table),
+        )?;
+        Ok(w)
+    }
+
+    /// **boot 后预热 pinned staging 池**(2026-10-27)。
+    ///
+    /// 预算 = 池总量(`slots_total × block_bytes`):选择层一次下沉最多搬
+    /// "池内全部页"(64k 档实测 1881 MiB),而不预热的代价是
+    /// `cudaHostAlloc(1.8 GiB) ≈ 600 ms` **占着 server 命令线程** —— 当时排队的
+    /// 视图页表写/下一个 chunk 入队全部干等(实测 `select.view` 965 ms)。
+    /// 稳态发生第一次越池时再付这笔 = 单次 TTFT 多 0.6 s。
+    ///
+    /// 只在"部分驻留档"开(其它档没有下沉腿);默认无操作面也会返回 (0,0)
+    /// —— 日志把数报出来,不静默。
+    pub(crate) async fn prewarm_pinned_staging(&mut self) -> Result<()> {
+        if !self.boot.cfg.knobs.select_partial {
+            return Ok(());
+        }
+        let st = self.bank.rel.leg.report();
+        let bytes = st.slots_total.saturating_mul(st.block_bytes).min(4usize << 30);
+        if bytes == 0 {
+            return Ok(());
+        }
+        let (made, have) = self.dev.graphs.session.face_mut().prewarm_pinned(bytes).await?;
+        owl_shared::log_warn!(
+            "store",
+            "pinned staging 预热:目标 {} MiB → 新建 {made} 桶 / 已有 {have} 桶",
+            bytes >> 20
+        );
+        Ok(())
+    }
+
+    /// **收口在飞的下沉**(2026-10-27)。
+    ///
+    /// 调用点必须落在"下一个 chunk 已入队、GPU 正在算"的窗口:这里 await 的
+    /// 是 D2H + 宿主拷贝 + 首次 pinned 分配,实测 1.1 s/次 —— 让它与计算**并行**
+    /// 才是收益来源(而不是把等待搬到别处)。
+    ///
+    /// 失败 = 整条失败(与同步路径同语义):`abort_offload` 回滚块票 + 会话表
+    /// 恢复成原槽 —— **不许留下"表说在宿主、实际在设备"的半态**。
+    pub(crate) async fn drain_pending_out(&mut self) -> Result<()> {
+        let Some(p) = self.pending_out.take() else { return Ok(()) };
+        // 在飞时长(诊断面):它应该 ≈ 一个 chunk 的计算时间(完全被盖住),
+        // 而不是被白白串行掉。
+        let inflight_ms = p.since.elapsed().as_secs_f64() * 1000.0;
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.timer_record_tag(
+                "select.rec.out_inflight",
+                std::time::Duration::from_secs_f64(inflight_ms / 1000.0),
+                file!(),
+                line!(),
+            );
+        });
+        let mut table: Option<owl_store::SlotTable> = None;
+        for w in p.waiters {
+            match w.await {
+                Ok(conn) => table = Some(owl_store::reclaim_slot_table(conn)?),
+                Err(e) => {
+                    let pairs: Vec<(owl_store::ChainHash, u32)> =
+                        p.blocks.iter().map(|(_, h, s)| (*h, *s)).collect();
+                    owl_store::abort_offload(&mut self.bank.rel.leg, &pairs);
+                    if let Some(s) = self.bank.sessions.get_mut(p.sid) {
+                        for (i, _, slot) in &p.blocks {
+                            if let Some(cell) = s.block_table.get_mut(*i) {
+                                *cell = *slot;
+                            }
+                        }
+                    }
+                    return Err(owl_iface::contract::ModelError::Msg(format!(
+                        "在飞下沉失败(已回滚 {} 块): {e}",
+                        p.blocks.len()
+                    )));
+                }
+            }
+        }
+        let Some(t) = table else { return Ok(()) };
+        let pairs: Vec<(owl_store::ChainHash, u32)> =
+            p.blocks.iter().map(|(_, h, s)| (*h, *s)).collect();
+        let n = owl_store::commit_offload(&mut self.bank.rel.leg, &pairs, t)?;
+        owl_shared::metrics::with_metrics_store(|m| {
+            m.counter_add("select.rec.out_committed", n as u64, file!(), line!());
+        });
+        Ok(())
     }
 
     /// **视图页表写两 rank**(TP;槽号两侧一致 ⇒ 同一份页表)。

@@ -37,6 +37,7 @@
 //!   `MeanKCollector::push_post_rope_halves` 同源)。
 
 use super::*;
+use owl_shared::config::PrefillViewMode;
 use crate::running::RunningEngine;
 use owl_models::ops::PlanNode;
 use std::cell::RefCell;
@@ -591,6 +592,26 @@ pub(crate) fn cap_view_pages(pages: &mut Vec<u32>, page: usize, cap_tokens: usiz
     pages.len()
 }
 
+/// 调和(effort)细分相位计时出口(唯一;`reconcile_residency` 内共用)。
+///
+/// 语义:一次调和的**一条腿**花了多少 —— 用来把 1.4s 的尖峰拆成
+/// plan / swap(D2H·H2D + host 拷贝) / commit / ensure_host 四类,
+/// 否则只能凭猜。tag 前缀 `select.rec.` 与 `select.reconcile`(整段)可对账。
+fn rec_phase(tag: &'static str, t0: std::time::Instant) {
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if !(ms.is_finite() && ms >= 0.0) {
+        return; // 计时脏值不污染分布
+    }
+    owl_shared::metrics::with_metrics_store(|s| {
+        s.timer_record_tag(tag, std::time::Duration::from_secs_f64(ms / 1000.0), file!(), line!());
+    });
+}
+
+/// 调和(volume)计数出口:块数/字节数(搬了多少,与耗时分家)。
+fn rec_count(tag: &'static str, n: u64) {
+    owl_shared::metrics::with_metrics_store(|s| s.counter_add(tag, n, file!(), line!()));
+}
+
 /// 选择预算(环境旋钮;缺省 64 块 + sink 2 / recent 4)。
 impl<D: DeviceClient> RunningEngine<D> {
     /// 召回预算(`OWL_SELECT_BLOCKS` / `OWL_SELECT_SINK` / `OWL_SELECT_RECENT`;
@@ -694,6 +715,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ③ 下沉(批:一次 swap 搬 N 块)
         if n_sink > 0 {
             let hashes: Vec<ChainHash> = sink.iter().map(|(_, h, _)| *h).collect();
+            let t_plan = std::time::Instant::now();
             let (blocks, pieces, tbl) = {
                 // diag-only(store-hook): 选择层诊断直接取搬运计划，不走生产
                 // StoreHook；生产路径只经 pump/store_hook。
@@ -707,43 +729,108 @@ impl<D: DeviceClient> RunningEngine<D> {
                 }
                 (p.blocks, p.pieces, p.table)
             };
+            rec_phase("select.rec.out_plan", t_plan);
             if !blocks.is_empty() {
-                let tbl = match self
-                    .swap_all_ranks(owl_iface::contract::SwapDir::Out, &pieces, tbl)
-                    .await
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        owl_store::abort_offload(&mut self.bank.rel.leg, &blocks);
-                        return Err(e);
+                rec_count("select.rec.out_blocks", blocks.len() as u64);
+                // **分离式下沉**(2026-10-27):命令发出去就返回,回执留在
+                // `pending_out` —— 由下一个 chunk 入队后的 `drain_pending_out`
+                // 在 GPU 计算期间收口。表**立即**写占位符:视图不读这些块,
+                // 而 `past_view_of` 靠它认洞(晚写 = 下一 chunk 退回 dense 注意力,
+                // 64k 上每 chunk 多 ~1s,得不偿失)。
+                let t_swap = std::time::Instant::now();
+                if self.can_defer_out(pieces.len()) {
+                    let waiter = match self.swap_out_begin(&pieces, tbl) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            owl_store::abort_offload(&mut self.bank.rel.leg, &blocks);
+                            return Err(owl_iface::contract::ModelError::Msg(format!(
+                                "分离式下沉提交失败: {e}"
+                            )));
+                        }
+                    };
+                    // 表写占位(只对真入了计划的块;被 plan 跳过的保留原槽)。
+                    // ⚠️ `PendingOut.blocks` 也只能收**真沉了的**那些:commit 会把
+                    // 块票结清并释放设备槽 —— 把 plan 跳过的块一并 commit = 误
+                    // 释放仍在用的槽(实测:1492 槽档跑到"槽池耗尽")。
+                    let slot_of: std::collections::HashMap<ChainHash, u32> =
+                        blocks.iter().copied().collect();
+                    let mut sunk: Vec<(usize, ChainHash, u32)> = Vec::with_capacity(sink.len());
+                    for (i, h, old) in &sink {
+                        match slot_of.get(h) {
+                            Some(slot) => {
+                                table[*i] = crate::scheduler::PENDING_LOAD_PLACEHOLDER;
+                                sunk.push((*i, *h, *slot));
+                            }
+                            None => {
+                                let _ = old;
+                            }
+                        }
                     }
-                };
-                let n = owl_store::commit_offload(&mut self.bank.rel.leg, &blocks, tbl)?;
-                // 表写占位(**只对真沉下去的那些**;被跳过的块保留原槽)
-                let sunk_set: std::collections::HashSet<ChainHash> =
-                    blocks.iter().map(|(h, _)| *h).collect();
-                for (i, h, _) in &sink {
-                    if sunk_set.contains(h) {
-                        table[*i] = crate::scheduler::PENDING_LOAD_PLACEHOLDER;
+                    if let Some(s) = self.bank.sessions.get_mut(sid) {
+                        s.block_table[..n_blocks].copy_from_slice(&table[..n_blocks]);
                     }
+                    self.pending_out = Some(crate::running::PendingOut {
+                        sid,
+                        blocks: sunk,
+                        waiters: vec![waiter],
+                        since: std::time::Instant::now(),
+                    });
+                    rec_phase("select.rec.out_begin", t_swap);
+                } else {
+                    // 后端/world 不支持 ⇒ 同步路径(语义不变)
+                    let t = match self
+                        .swap_all_ranks(owl_iface::contract::SwapDir::Out, &pieces, tbl)
+                        .await
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            owl_store::abort_offload(&mut self.bank.rel.leg, &blocks);
+                            return Err(e);
+                        }
+                    };
+                    rec_phase("select.rec.out_swap", t_swap);
+                    let t_commit = std::time::Instant::now();
+                    let n = owl_store::commit_offload(&mut self.bank.rel.leg, &blocks, t)?;
+                    rec_phase("select.rec.out_commit", t_commit);
+                    let sunk_set: std::collections::HashSet<ChainHash> =
+                        blocks.iter().map(|(h, _)| *h).collect();
+                    for (i, h, _) in &sink {
+                        if sunk_set.contains(h) {
+                            table[*i] = crate::scheduler::PENDING_LOAD_PLACEHOLDER;
+                        }
+                    }
+                    if let Some(s) = self.bank.sessions.get_mut(sid) {
+                        s.block_table[..n_blocks].copy_from_slice(&table[..n_blocks]);
+                    }
+                    let _ = n;
                 }
-                if let Some(s) = self.bank.sessions.get_mut(sid) {
-                    s.block_table[..n_blocks].copy_from_slice(&table[..n_blocks]);
-                }
-                let _ = n;
             }
         }
         // ④ 回灌选中的宿主块(批)
         let mut staged = 0usize;
         if n_need > 0 {
+            // **槽依赖**:回灌要用的槽可能正好是本轮刚提交、还没落地的下沉槽
+            // (`plan_onload` 拿不到在飞槽 ⇒ Exhausted)。这里**先收口**在飞下沉:
+            // 正确性优先 —— 否则整个 turn 会在 `ensure_for_len` 上响亮失败。
+            // 分开发生(只有 in 没有 out 的边界)仍走重叠路。
+            if self.pending_out.is_some() {
+                rec_count("select.rec.drain_for_in", 1);
+                self.drain_pending_out().await?;
+            }
             let hashes: Vec<ChainHash> = need.iter().map(|(_, h)| *h).collect();
             // **S6**:盘上的块先读回宿主(与 phases.rs 同一口)
+            let t_host = std::time::Instant::now();
             let _ = self.ensure_host_resident(&hashes).await?;
+            rec_phase("select.rec.in_host", t_host);
+            let t_plan = std::time::Instant::now();
             let (cs, slots, pieces, tbl) = {
                 // diag-only(store-hook): 同上；仅诊断/选择层探针。
                 let p = owl_store::plan_onload(&mut self.bank.rel.leg, &hashes)?;
                 (p.chains, p.slots, p.pieces, p.table)
             };
+            rec_phase("select.rec.in_plan", t_plan);
+            rec_count("select.rec.in_blocks", need.len() as u64);
+            let t_swap = std::time::Instant::now();
             let tbl = match self
                 .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, tbl)
                 .await
@@ -754,7 +841,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                     return Err(e);
                 }
             };
+            rec_phase("select.rec.in_swap", t_swap);
+            let t_commit = std::time::Instant::now();
             let got = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &slots, tbl)?;
+            rec_phase("select.rec.in_commit", t_commit);
             staged = got.len();
             // 槽写回表(同序:need 与 cs 同序)
             for ((i, _), slot) in need.iter().zip(&got) {
@@ -797,14 +887,26 @@ impl<D: DeviceClient> RunningEngine<D> {
             .and_then(|a| self.bank.sessions.get(a.session_id))
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
-        // **只有在链上真出现洞(已下沉)时才换表** —— 没洞就用全量链(更保真;
-        // 换表 = 稀疏化过去,是有代价的语义选择,不该无谓付)。
+        // **视图门槛**:旧行为 = 只在链上真出现洞(已下沉)时才换表 ⇒ 池内
+        // (≤47.7k)prefill 跟着**全量链**走,注意力 O(ctx);而 decode 读的是
+        // **选中集**。两套口径同时存在。
+        //
+        // 2026-10-27:改成 prefill 与 decode 同源 —— 只要选择层有视图就换表。
+        // 代价 = 过去只读选中块(§2.5 的质量门另验);收益 = attention 从
+        // ∝ctx 变成 ∝工作集(64k 实测 16.3k→11.4k 页可见)。
         let last_lb = (base + t.saturating_sub(1)) / page;
-        if !chain[..=last_lb.min(chain.len().saturating_sub(1))]
+        let has_hole = chain[..=last_lb.min(chain.len().saturating_sub(1))]
             .iter()
-            .any(|s| *s == crate::scheduler::PENDING_LOAD_PLACEHOLDER)
-        {
-            return None;
+            .any(|s| *s == crate::scheduler::PENDING_LOAD_PLACEHOLDER);
+        // **口径档**(`kvmem.prefill_view`;2026-10-27):
+        //   on-hole(缺省)= 旧行为,无洞走全量链(更保真,attention ∝ ctx);
+        //   always      = prefill 与 decode 同源视图(attention ∝ 工作集)。
+        // 是语义变更 ⇒ 必须显式在配置里选,缺省不偷改。
+        if !has_hole {
+            if self.boot.cfg.knobs.prefill_view != PrefillViewMode::Always {
+                return None;
+            }
+            owl_shared::counter_inc!("select.prefill_view.no_hole");
         }
         self.sel.note_prefill_subset();
         let mut pages = view_pages;
