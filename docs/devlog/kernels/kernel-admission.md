@@ -926,7 +926,31 @@ impl KernelPick {
 把 `no kernel image is available for execution on the device` 从**发射时**提前到**装配期**
 (资产 manifest 已记 `archs` 集,设备 sm 由 `cuDeviceGetAttribute(COMPUTE_CAPABILITY_*)` 查)。
 
-**构建期旋钮**:`OWL_CUBIN_ARCHS`(CSV,缺省 `sm_86`)/ `OWL_NVCC` / `OWL_CUBIN_ONLY`(排障)。
+**构建期代际 = Cargo feature**(2026-10-27 用户裁决:`arch-sm75` / `arch-sm80` / `arch-sm86` /
+`arch-sm89` / `arch-sm90` / `arch-sm100` / `arch-sm120`,可叠加 ⇒ 多代际 fatbin)。
+工具链旋钮仍走 env:`OWL_NVCC` / `OWL_BUILD_JOBS` / `OWL_CUBIN_SKIP`。
+
+> **为什么不用环境变量**:env 不进 cargo 的缓存键 ⇒ "同一份源码 + 另一个 env"
+> 在 `target/` 里不是一个东西,旧产物会被静默留用(本仓真踩过:换卡后 fatbin 还是
+> 上一代的)。feature 由 cargo 解析,天然进指纹、可复现、可叠加;
+> 实测 sm_86 / sm_120 两套产物各占一个 build 目录、互不覆盖。
+> 多选语义:native cubin 出多代际 fatbin;单份 `.a` 家族(Marlin / FlashInfer+FA2 /
+> GDN AOT)取**最高**代;零 feature ⇒ `Arch::DEFAULT` + 响亮告警。
+
+> **单一真源裁决(2026-10-27,sm_120 移植)**:设备码一共四张面 —— native cubin /
+> vLLM-Marlin / FlashInfer+FA2 / GDN chunked(Triton AOT)。在此之前 FI 的
+> `-arch=sm_86`、Marlin 的缺省 `86`、Triton AOT 的 `GPUTarget("cuda", 86, 32)` 是
+> **三处各自写死**的 ⇒ 换卡代际必须同时改三处,漏一处就是"编过了但设备码
+> 是上一代"。现统一从 **Cargo feature `arch-smXX`** 派生(单一入口,进缓存键);
+> 历史 env 旋钮 `OWL_TARGET_ARCH` / `OWL_CUBIN_ARCHS` / `MARLIN_CUDA_ARCH` /
+> `FLASHINFER_ARCH` / `GDN_TRITON_ARCH` **已删除**。
+> 换卡 = `cargo build --release -p server --no-default-features --features arch-sm120`。
+>
+> **代际表** = `crates/kernels/src/arch.rs`(`Arch` / `Family` / `Caps` / `parse`),
+> **`build.rs` 用 `#[path]` 引入同一份文件** ⇒ 构建期与运行期不可能漂。
+> 运行期真值另有一条腿:`DeviceClient::device_arch()`(`COMPUTE_CAPABILITY_*` → `Arch::from_cc`)
+> 在 boot 期问一次写进 `EnvProvider::hw`;两腿由**装配期架构门**对齐(设备 sm ∉ 编译集 ⇒ 拒启)。
+> 新增代际 = 加枚举变体 / 写 `caps` / 让 `marlin` 与 `dispatch` 的**无通配 match** 表态。
 
 ---
 
