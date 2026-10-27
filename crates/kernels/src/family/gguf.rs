@@ -449,16 +449,33 @@ pub const fn mmq2_entry_for(ty: GgmlTy, m: usize) -> Option<&'static str> {
         GgmlTy::Iq3Xxs => (MMQ2_IQ3XXS_J16, MMQ2_IQ3XXS_J64, MMQ2_IQ3XXS_J128),
         // 2026-10-21 第二刀:**只挂 J=16**(小 m)。m > 16 仍回 tile ——
         // MMQ 的 ntx = ceil(m/J) 按 token 窗重读权重,prefill 侧本刀不动。
-        GgmlTy::Q3K => (MMQ2_Q3K_J16, MMQ2_Q3K_J16, MMQ2_Q3K_J16),
-        GgmlTy::Iq2S => (MMQ2_IQ2S_J16, MMQ2_IQ2S_J16, MMQ2_IQ2S_J16),
-        GgmlTy::Iq2Xs => (MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J16),
+        // 2026-10-21 第二刀只挂 J=16;2026-10-27(worktree iq3-perf)补齐 J=64/128:
+        // UD-IQ3_S 里这六型占 18.5% 字节,prefill(m=2048)落 tile 臂吃掉 16% 核时。
+        GgmlTy::Q3K => (MMQ2_Q3K_J16, MMQ2_Q3K_J64, MMQ2_Q3K_J128),
+        GgmlTy::Iq2S => (MMQ2_IQ2S_J16, MMQ2_IQ2S_J64, MMQ2_IQ2S_J128),
+        GgmlTy::Iq2Xs => (MMQ2_IQ2XS_J16, MMQ2_IQ2XS_J64, MMQ2_IQ2XS_J128),
+        GgmlTy::Iq2Xxs => (MMQ2_IQ2XXS_J16, MMQ2_IQ2XXS_J64, MMQ2_IQ2XXS_J128),
+        // IQ1_S **暂不挂**(2026-10-27):它的激活布局必须是 DS4
+        // (`mmq.cuh::mmq_get_q8_1_ds_layout`,与 Q4_K/Q5_K 同族;按 D4 喂会出 inf)。
+        // 改成 DS4 后**引擎输出连贯**,但本仓现有的对拍门拿不到可信参考:
+        // `gpu_gguf_mmq2_small_m` 的参考臂(MMVQ / dp4a MMQ)在该形状给出
+        // inf/全零 ⇒ 无法建立数值等价。**无法验证 = 无法宣称**,留 tile 臂
+        // (该型在 UD-IQ3_S 里 2 张 / 0.3% 字节,代价 <0.5% prefill)。
+        // 下一步:用 dequant+cuBLAS(`RANGE_IQ1S`)当参考,或逐元素对拍 tile 臂。
+        GgmlTy::Iq1S => {
+            let _ = (MMQ2_IQ1S_J16, MMQ2_IQ1S_J64, MMQ2_IQ1S_J128);
+            return None;
+        }
+        // Q2_K **不挂**(2026-10-27 定位):它的激活布局是 **D2S6**
+        // (`mmq.cuh::mmq_get_q8_1_ds_layout`),而本适配层的量化手只有 D4/DS4
+        // 两族 ⇒ 硬接出 inf(实测 blk.3.attn_q m=8/64 两种激活都炸)。要开它得先
+        // 加一支 D2S6 激活量化核;该型在 UD-IQ3_S 里占 1.0% 字节,暂留 tile 臂。
+        GgmlTy::Q2K => {
+            let _ = (MMQ2_Q2K_J16, MMQ2_Q2K_J64, MMQ2_Q2K_J128);
+            return None;
+        }
         _ => return None,
     };
-    // 新族(J16 专用)只服务小 m:m > 16 交回 tile/MMVQ(见上注)
-    if matches!(ty, GgmlTy::Q3K | GgmlTy::Iq2S | GgmlTy::Iq2Xs) && m > MMQ2_SMALL_J
-    {
-        return None;
-    }
     Some(if m <= MMQ2_SMALL_J {
         e16
     } else if m >= MMQ2_I {
@@ -485,6 +502,10 @@ pub const fn mmq2_quant_entry_for_act(ty: GgmlTy, bf16: bool) -> Option<&'static
         GgmlTy::Q8_0 | GgmlTy::Q6K => false,
         // IQ 族:vendor2 的 MMQ 配置声明 `SRAM_LAYOUT_Q8_0` ⇒ 与 Q8_0 同(D4)
         GgmlTy::Iq4Xs | GgmlTy::Iq3S | GgmlTy::Iq3Xxs => false,
+        // ⚠️ IQ1_S 是**例外**:`mmq.cuh::mmq_get_q8_1_ds_layout` 给它 DS4
+        // (它的 vec_dot 不带 ds_layout 实参 ⇒ 走默认 DS4,与 Q4_K/Q5_K 同族)。
+        // 2026-10-27 实测:按 D4 喂 ⇒ blk.0.ffn_up 出 inf。
+        GgmlTy::Iq1S => true,
         // 2026-10-21:`SRAM_LAYOUT_Q3_K` / `Q2_K`(布局 = Q8_0 的 D4 变体)
         GgmlTy::Q3K | GgmlTy::Iq2S | GgmlTy::Iq2Xs | GgmlTy::Q2K => false,
         _ => return None,
@@ -604,6 +625,28 @@ pub const MMQ2_Q3K_J16: &str = "owl_mmq2_q3k_j16";
 pub const MMQ2_IQ2S_J16: &str = "owl_mmq2_iq2s_j16";
 /// `owl_mmq2_iq2xs_j16`(小 m;J=16;SRAM 布局 = Q3_K)
 pub const MMQ2_IQ2XS_J16: &str = "owl_mmq2_iq2xs_j16";
+
+/// Q3_K / J=64,128(2026-10-27 补;此前 m>16 落 tile 臂)
+pub const MMQ2_Q3K_J64: &str = "owl_mmq2_q3k_j64";
+pub const MMQ2_Q3K_J128: &str = "owl_mmq2_q3k_j128";
+/// IQ2_S / J=64,128
+pub const MMQ2_IQ2S_J64: &str = "owl_mmq2_iq2s_j64";
+pub const MMQ2_IQ2S_J128: &str = "owl_mmq2_iq2s_j128";
+/// IQ2_XS / J=64,128
+pub const MMQ2_IQ2XS_J64: &str = "owl_mmq2_iq2xs_j64";
+pub const MMQ2_IQ2XS_J128: &str = "owl_mmq2_iq2xs_j128";
+/// IQ2_XXS / J=16,64,128(2026-10-27 新挂;此前无 MMQ2 入口)
+pub const MMQ2_IQ2XXS_J16: &str = "owl_mmq2_iq2xxs_j16";
+pub const MMQ2_IQ2XXS_J64: &str = "owl_mmq2_iq2xxs_j64";
+pub const MMQ2_IQ2XXS_J128: &str = "owl_mmq2_iq2xxs_j128";
+/// IQ1_S / J=16,64,128(同上;SRAM 布局 = Q8_0)
+pub const MMQ2_IQ1S_J16: &str = "owl_mmq2_iq1s_j16";
+pub const MMQ2_IQ1S_J64: &str = "owl_mmq2_iq1s_j64";
+pub const MMQ2_IQ1S_J128: &str = "owl_mmq2_iq1s_j128";
+/// Q2_K / J=16,64,128(同上;SRAM 布局 Q2_K = stride 100)
+pub const MMQ2_Q2K_J16: &str = "owl_mmq2_q2k_j16";
+pub const MMQ2_Q2K_J64: &str = "owl_mmq2_q2k_j64";
+pub const MMQ2_Q2K_J128: &str = "owl_mmq2_q2k_j128";
 
 /// **X 面 SRAM stride**(每 I 行占多少个 32bit 槽;逐型不同)。
 ///

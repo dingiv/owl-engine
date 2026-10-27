@@ -227,6 +227,28 @@ OWL_MMQ2_WRAP(owl_mmq2_iq3s_j128, GGML_TYPE_IQ3_S, 128)
 OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j64, GGML_TYPE_IQ3_XXS, 64)
 OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j128, GGML_TYPE_IQ3_XXS, 128)
 
+// ---- prefill 档补齐(2026-10-27,worktree iq3-perf)--------------------------
+// 动机(IQ3_S 档 nsys):这六型在 **m > 16** 时 `mmq2_entry_for` 返回 None
+// ⇒ 全落复用臂(tile,每 16 token 重读一遍权重)。UD-IQ3_S 里它们占 18.5% 字节,
+// 却吃掉 prefill 核时的 16%(iq2s 212ms / iq2xxs 202ms / iq2xs 120ms /
+// q3k 76ms / iq1s 36ms / q2k 33ms @4096 token)。vendor2 的 ampere 配置**本来
+// 就有** J=64/128 的 CASE 行 ⇒ 只缺适配层入口。
+//
+// ⚠️ SRAM 布局按型取(`family::gguf::mmq2_sram_stride_for`):Q2_K=100、
+// Q3_K/IQ2_S/IQ2_XS=84、IQ1_S/IQ2_XXS=76;smem 由 `mmq2_smem_for(ty,j)` 算。
+OWL_MMQ2_WRAP(owl_mmq2_q3k_j64, GGML_TYPE_Q3_K, 64)
+OWL_MMQ2_WRAP(owl_mmq2_q3k_j128, GGML_TYPE_Q3_K, 128)
+OWL_MMQ2_WRAP(owl_mmq2_iq2s_j64, GGML_TYPE_IQ2_S, 64)
+OWL_MMQ2_WRAP(owl_mmq2_iq2s_j128, GGML_TYPE_IQ2_S, 128)
+OWL_MMQ2_WRAP(owl_mmq2_iq2xs_j64, GGML_TYPE_IQ2_XS, 64)
+OWL_MMQ2_WRAP(owl_mmq2_iq2xs_j128, GGML_TYPE_IQ2_XS, 128)
+OWL_MMQ2_WRAP(owl_mmq2_iq2xxs_j64, GGML_TYPE_IQ2_XXS, 64)
+OWL_MMQ2_WRAP(owl_mmq2_iq2xxs_j128, GGML_TYPE_IQ2_XXS, 128)
+OWL_MMQ2_WRAP(owl_mmq2_iq1s_j64, GGML_TYPE_IQ1_S, 64)
+OWL_MMQ2_WRAP(owl_mmq2_iq1s_j128, GGML_TYPE_IQ1_S, 128)
+OWL_MMQ2_WRAP(owl_mmq2_q2k_j64, GGML_TYPE_Q2_K, 64)
+OWL_MMQ2_WRAP(owl_mmq2_q2k_j128, GGML_TYPE_Q2_K, 128)
+
 // ---- J=16(2026-10-21):小 m(verify depth+1 = 2..8、propose 8 行)专用档 ----
 // 复用同一 `mul_mat_q<ty, J, false>`(上游 J 表本就含 16)。J=64 在 m=8 时
 // 有 8/64 的有用行 ⇒ 4× 的 MMA 浪费;J=16 同样一次读权重(ntx=ceil(8/16)=1),
@@ -262,6 +284,9 @@ OWL_MMQ2_WRAP(owl_mmq2_iq3xxs_j16, GGML_TYPE_IQ3_XXS, 16)
 OWL_MMQ2_WRAP(owl_mmq2_q3k_j16, GGML_TYPE_Q3_K, 16)
 OWL_MMQ2_WRAP(owl_mmq2_iq2s_j16, GGML_TYPE_IQ2_S, 16)
 OWL_MMQ2_WRAP(owl_mmq2_iq2xs_j16, GGML_TYPE_IQ2_XS, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq2xxs_j16, GGML_TYPE_IQ2_XXS, 16)
+OWL_MMQ2_WRAP(owl_mmq2_iq1s_j16, GGML_TYPE_IQ1_S, 16)
+OWL_MMQ2_WRAP(owl_mmq2_q2k_j16, GGML_TYPE_Q2_K, 16)
 // ⚠️ Q2_K **不在本刀**:它的激活布局是 `MMQ_Q8_1_DS_LAYOUT_D2S6`
 // (`mmq.cuh::mmq_get_q8_1_ds_layout`),而本适配层的量化手只有 D4 / DS4 两族 ⇒
 // 硬接会出 inf(实测)。本档 Q2_K 只有 1 张(19 MB),留在 tile 臂。

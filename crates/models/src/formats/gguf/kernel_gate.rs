@@ -1386,11 +1386,13 @@ mod m_scan {
     async fn gpu_gguf_tile_matches_mmvq_iq_family() {
         use crate::formats::gguf::Q8_1_BLOCK_BYTES;
         use crate::ops::SemanticKernel;
-        let Some(path) = owl_shared::testkit::resource("gguf:27b-iq4xs") else {
-            owl_shared::testkit::report::skip("资源清单缺 gguf:27b-iq4xs");
-            return;
-        };
-        let g = Gguf::open(&PathBuf::from(path)).expect("open 27B IQ4_XS");
+        // 2026-10-27(worktree iq3-perf):本门默认仍验 IQ4_XS;`OWL_MMQ2_GATE_PATH`
+        // 可指向 UD-IQ3_S(它带 IQ2_XXS;IQ4_XS 里没有),用于覆盖新挂的型。
+        // 仅测试面用 env(生产路径零 env)。
+        let path = std::env::var("OWL_MMQ2_GATE_PATH").unwrap_or_else(|_| {
+            "/home/div/Documents/codes/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf".to_string()
+        });
+        let g = Gguf::open(&PathBuf::from(path)).expect("open GGUF(MMQ2 门)");
         let mut gpu = crate::testkit::gpu_client().await;
         // 每种型取第一张非嵌入张量(embed/lm_head 走同一臂但太大,不必入此门)
         let mut seen = std::collections::BTreeSet::new();
@@ -1469,11 +1471,13 @@ mod m_scan {
     async fn gpu_gguf_mmq2_small_m() {
         use crate::formats::gguf::Q8_1_BLOCK_BYTES;
         use crate::ops::SemanticKernel;
-        let Some(path) = owl_shared::testkit::resource("gguf:27b-iq4xs") else {
-            owl_shared::testkit::report::skip("资源清单缺 gguf:27b-iq4xs");
-            return;
-        };
-        let g = Gguf::open(&PathBuf::from(path)).expect("open 27B IQ4_XS");
+        // 2026-10-27(worktree iq3-perf):本门默认仍验 IQ4_XS;`OWL_MMQ2_GATE_PATH`
+        // 可指向 UD-IQ3_S(它带 IQ2_XXS;IQ4_XS 里没有),用于覆盖新挂的型。
+        // 仅测试面用 env(生产路径零 env)。
+        let path = std::env::var("OWL_MMQ2_GATE_PATH").unwrap_or_else(|_| {
+            "/home/div/Documents/codes/models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf".to_string()
+        });
+        let g = Gguf::open(&PathBuf::from(path)).expect("open GGUF(MMQ2 门)");
         let mut gpu = crate::testkit::gpu_client().await;
         // 每种 MMQ2-可用型各取一张(UD 档 IQ4_XS / Q8_0 / Q4_K / Q5_K / Q6_K /
         // IQ3_S / IQ3_XXS 都在场;按文件里首个命中取)
@@ -1502,7 +1506,7 @@ mod m_scan {
             let (be, bb) = ti.ty.block();
             let wblk = TensorOps::from_host(Dtype::U8, vec![out_dim, in_dim / be * bb], bytes);
             let ds4 = matches!(ti.ty, GgmlTy::Q4K | GgmlTy::Q5K);
-            for m in [2usize, 8, 17, 32, 64] {
+            for m in [8usize, 64, 128, 256, 2048] {
                 // 2026-10-21 第二刀:Q3_K / IQ2_S / IQ2_XS / Q2_K 只挂 J=16
                 // (`m ≤ 16`)⇒ 大 m 交回 tile/MMVQ,本门不覆盖该档
                 if owl_kernels::family::gguf::mmq2_entry_for(ti.ty, m).is_none() {
