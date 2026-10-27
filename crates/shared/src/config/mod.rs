@@ -55,17 +55,16 @@
 //! | runtime | max_seq | usize / 4096 |
 //! | runtime | prefill_chunk / prefill_tail_merge | usize / 512、0 |
 //! | runtime | max_batch | usize / 1(合批上限;>1 需 gdn_slots≥它、单卡、无选择层) |
-//! | runtime | test_device / server_url | 测试域 / CLI(不入 toml) |
-//! | parallel | mode | ParallelMode 枚举 single\|tensor\|layer / single(layer 暂未支持=拒) |
+//! | runtime | test_device | 测试域(不入 toml) |
+//! | parallel | mode | ParallelMode 枚举 single\|tensor / single |
 //! | parallel | device | [String] 卡位(BDF / UUID / find-name;**禁 CUDA 序号**);空 = 自动挑空闲卡 |
-//! | parallel | tp_push / tp_ar_f8 / tp_vocab_split / tp_ar_fused / tp_ar2 / tp_one_stage | TP 档(见字段注) |
+//! | parallel | tp_ar / tp_ar_f8 / tp_vocab_split | TP 档(见字段注;tp_ar = v1\|fused\|ar2) |
 //! | model | format | ModelFormat 枚举 safetensors\|awq\|gguf / safetensors |
 //! | model | path / name | Option<PathBuf> / None(模型目录或 .gguf 单文件) |
-//! | model | awq27b_dir | Option<String> / None(27B AWQ 检查点门控) |
 //! | model | quant | QuantScheme(safetensors/awq: w4a16\|w4a8;gguf: q4k\|iq4\|iq3) |
 //! | model | vision / vision_path | bool / false + Option(视觉塔;GGUF 档 = `mmproj-*.gguf` 单文件) |
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
-//! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row"\|"rtn-int8-row-a8")/ off |
+//! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
 //! | pool | kv_fp8 | bool / false(主 KV 池 e4m3;32 KiB/token) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
@@ -82,7 +81,6 @@
 //! | spec | mtp_window / mtp_sink | usize / 0、64(MTP 草稿读视图;0 = full) |
 //! | spec | mtp_window_min_ctx | usize / 0(短 ctx 不压缩的门槛) |
 //! | spec | adaptive_depth / depth_min / depth_switch_ctx / adaptive_min_tpr | flag / false、3、49152、3.0(MTP 两档图族 + T1b 门) |
-//! | spec | notaps / tapdecl | flag / false(verify 图诊断) |
 //! | spec | degrade_after / probe_every | usize / 6、8(降级首探窗口;旧 64 = 长尾税) |
 //! | sampling | mode | SamplerMode 枚举("greedy"\\|"sampling")/ sampling |
 //! | sampling | temp / topk / topp / rep_penalty | 1.0 / 20 / 0.95 / 1.0 |
@@ -97,7 +95,7 @@
 //! | kernel | gguf_mmvq_l2_mib | usize / **4**(0 = 关;GGUF 小 n 装得进 L2 ⇒ 让 MMVQ 赢) |
 //! | kernel | gguf_tile / gguf_cublas / gguf_mmq2 / gguf_mmq / gguf_smem | bool / 全 true |
 //! | kernel | fi_cuda_graph | bool / false(图档瓦;FI 臂的配套件) |
-//! | kernel | fi_plan_bake / fi_plan_restore | bool / false、true(烘 plan 进图;上界恒 = max_seq) |
+//! | kernel | fi_plan | FiPlanMode 枚举 baked\|host-sync / host-sync(plan 表权威;baked 上界恒 = max_seq) |
 //! | spec | depth | usize / 0;上限 = `SPEC_DEPTH_MAX` = 15(超限拒启) |
 //! | dispatch | allowed_ops | **已退役**(旧键 `deny_unknown_fields` 拒启;准入走 tag filter) |
 //! | dispatch | tag_wildcard | bool / false(诊断 `*`:跳过 tag 过滤) |
@@ -105,21 +103,18 @@
 //! | kvmem | workspace_per_req / select_sink / select_recent / recall_every | usize / 2240、2、4、1 |
 //! | kvmem | coverage_probe / analyze_at_ctx / evict_policy / dense_floor_mib | 见字段注(lru\|lrfu[:λ]) |
 //! | kvmem | bulk_drop_when_tier_full | bool / false(整枝塌缩:宿主/磁盘装不下时允许一次丢整段) |
-//! | probes | step_profile / perf_level / gdn_dump / debug / prefill_cksum / fact_probe | flag / false |
+//! | probes | step_profile / perf_level / gdn_dump / debug | flag / false |
 //! | probes | step_gate / step_gate_ms / step_gate_us / step_gate_every | StepMode("off"\|"sticky"\|"single") / 50 / 0(覆盖 ms) / 1 |
 //! | log | level / tags_allow / tags_deny / file / max_mb / keep / timestamp | 见模块 |
-//! | probes | trace_gate / dflash_probe / propose_eager | flag / false |
-//! | probes | dflash_eager / dflash_noencode / dflash_dumb | flag / false |
-//! | probes | gdn_dump_all / pf_bisect / pf_fin_check / raw_completion / prompt_dump / gdn_dbg / pf_fence | flag / false |
-//! | probes | pf_stages | Option<usize> / None |
+//! | probes | trace_gate / dflash_probe / raw_completion / prompt_dump / live_diag | flag / false |
+//! | probes | kv_dump_at | Option<usize> / None(KV 页差分落点) |
 //! | cuda | srv_timing / cap_prof / launch_sync / launch_time | flag / false |
 //! | cuda | trace_ring | usize / 0(关;>0 = 发射账容量) |
 //! | cuda | d2h_prof / gpu_prof / free_legacy | flag / false |
-//! | cuda | graph_flags | { upload, device_launch } / 全 false |
+//! | cuda | graph_flags | { upload } / false |
 //! | cuda | capture_slab_mb | Option<usize> / None(hint 定量) |
 //! | cuda | *(nvrtc_include/native_aot 2026-10-13 退役 —— NVRTC 已删)* | — |
 //! | dispatch | fi_min_tokens | usize / 1(FI 接管的 T 下限;128 = 复现旧行为) |
-//! | dispatch | xqa_prefill | flag / false(prefill 尾块走 XQA;主路径禁止开) |
 //! | graph | no_graph | flag / false(总闸:eager 直发,跳过**全部**图捕获) |
 //! | agent | template_path | Option<String> / None(相对路径 = 相对 model.dir) |
 //! | agent | implicit_session | flag / false(AGT-09:不带 session 键 ⇒ 会话 0) |
@@ -181,8 +176,43 @@ pub enum ParallelMode {
     Single,
     /// 张量并行(TP2;`device` 0 项 = 自动挑两张,2 项 = 钉卡)
     Tensor,
-    /// 流水/层并行(**暂未支持**;写它 = 拒启,避免"配了但静默单卡")
-    Layer,
+}
+
+/// **TP all-reduce 拓扑档**(`parallel.tp_ar`;2026-10-27 单键化)。
+///
+/// 三档是能力阶梯:每级在自己形状门不满足时**显式**落回下一级
+/// (形状门在 `models::interpreters::eval` 的 AR 发射处)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TpArMode {
+    /// 两核:v1 `stage`(写本端槽)+ `reduce`(读对端槽)
+    #[default]
+    V1,
+    /// 非 fp8 载荷走单核融合(`owl_comm_ar_fused_*`);fp8 载荷仍 v1 两核
+    Fused,
+    /// 非 fp8 小包(≤256KiB)走 barrier-only AR-2;其余落 `Fused` / v1
+    Ar2,
+}
+
+impl TpArMode {
+    /// 拓扑字符串(日志/`--print-config` 自证)
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::Fused => "fused",
+            Self::Ar2 => "ar2",
+        }
+    }
+
+    /// 融合核是否在场(`Fused`/`Ar2` 都自带 fused 回落)
+    pub const fn uses_fused(self) -> bool {
+        matches!(self, Self::Fused | Self::Ar2)
+    }
+
+    /// barrier-only AR-2 是否在场
+    pub const fn uses_ar2(self) -> bool {
+        matches!(self, Self::Ar2)
+    }
 }
 
 /// 采样模式(sampling.mode;原 `!= "greedy"` 字符串和稀泥废除)
@@ -215,10 +245,6 @@ pub enum HeadQuant {
     /// (2026-10-22,权重只读一遍;8 token 2.07 ms / 7 token 1.45 ms)。
     /// 质量门 = top-1 ≥99.9% + 贪心 256 逐字。
     RtnInt8Row,
-    /// **W8A8 头**(2026-10-22 实验档):权重同 `RtnInt8Row`,前向把 hidden
-    /// 按 token 量化成 int8 + f32 scale,内积走 `__dp4a`。目标 = 把 spec
-    /// 头从 ~1.5–2.1 ms 压到 ~1 ms;激活量化有一层额外误差,质量门同 int8。
-    RtnInt8RowA8,
     // 预留:GptqInt4G128(需自采 hidden states 产量化,另案)、
     // RtnInt8G128(中间档)——加值时同步 loader 映射与质量门台账
 }
@@ -261,15 +287,6 @@ pub enum QuantScheme {
     Iq4,
     #[serde(rename = "iq3")]
     Iq3,
-    /// **W8A8 · int8 权重 × int8 激活**(未实现;`validate` 拒启)
-    #[serde(rename = "w8a8i")]
-    W8a8i,
-    /// **W8A8 · fp8 权重 × fp8 激活**(未实现;`validate` 拒启)
-    #[serde(rename = "w8a8f")]
-    W8a8f,
-    /// **W8A8 · 未定精度**(未实现;`validate` 拒启)
-    #[serde(rename = "w8a8")]
-    W8a8,
     /// W4A8 × AWQ 同源权重(权重 = a8 布局三件套;激活 per-token int8 +
     /// `marlin_gemm_w4a8_awq`(kS8×kU4,int8 张量核))。
     /// 实测(单卡 3090 Ti @32k):prefill +48~50% / TTFT −33% / decode 不变;
@@ -278,8 +295,9 @@ pub enum QuantScheme {
     /// `docs/arch/W4A8-算子家族-设计与施工.md`。
     #[serde(rename = "w4a8")]
     W4a8,
-    // 预留:W8A8 / W8A16 / W4A4 —— 加值时同步 loader 映射
-    // (engine::quant_plan_of)与质量门台账。
+    // 加新方案 = 枚举值 + loader 映射(engine::quant_plan_of)+ 质量门台账;
+    // **不要先加"未实现"的占位值**(2026-10-27 剪:w8a8i/w8a8f/w8a8 三个
+    // 占位值只换来一条恒拒的 validate 分支)。
 }
 
 /// 图实例化旗标(cuda.graph_flags;原裸 u64 魔数 2/4 收口为结构化位面)
@@ -288,14 +306,15 @@ pub enum QuantScheme {
 pub struct GraphInstantiateFlags {
     /// UPLOAD=0b10(实例化后预热上传)
     pub upload: bool,
-    /// DEVICE_LAUNCH=0b100(设备侧派发;派发税排查面)
-    pub device_launch: bool,
+    // DEVICE_LAUNCH=0b100 已删(2026-10-27):驱动直接拒
+    // (`CUDA_ERROR_INVALID_VALUE`,见 docs/devlog/memory/longctx-attribution.md §175),
+    // 全仓零消费者 —— 留着只是一个能把 boot 打死的开关。
 }
 
 impl GraphInstantiateFlags {
     /// cuda GraphInstantiateWithFlags 位面(唯一出口;与位定义同尺)
     pub fn to_bits(self) -> u64 {
-        ((self.upload as u64) << 1) | ((self.device_launch as u64) << 2)
+        (self.upload as u64) << 1
     }
 }
 
@@ -388,9 +407,6 @@ pub struct RuntimeCfg {
     /// (如 `41:00.0`)。`Some` = GPU 门已过。**CUDA 序号禁用**(序会漂)。
     #[serde(skip)]
     pub test_device: Option<String>,
-    /// cli 上行端点(不入 toml;cli 入口自填)
-    #[serde(skip)]
-    pub server_url: Option<String>,
 }
 
 /// **并行面**(`[parallel]`;2026-10-21 从 runtime 拆出，卡位与 TP 旋钮归此)。
@@ -408,15 +424,6 @@ pub struct ParallelCfg {
     pub mode: ParallelMode,
     /// 卡位(BDF / UUID / find-name；**禁 CUDA 序号**；空 = 自动挑)
     pub device: Vec<String>,
-    /// **TP 通信数据腿：push(写对端)档**(2026-10-18;`TP2-施工设计.md` §36.6/§36.7)。
-    ///
-    /// `false`(缺省)= v1:两核"stage 写本端槽 → reduce 读对端槽",跨 PCIe 是**读**。
-    /// `true` = **指针对调**:"stage 写**对端**槽 → reduce 读**本端**槽",跨 PCIe 只剩
-    /// **写**(posted)。同会话实测(3080 对 2/3,f16):双向读 9.52GB/s vs 双向写
-    /// **12.52GB/s**(+31%)—— 因为 non-posted 读在双向档争完成通道。
-    /// 副作用:staging 别名改授 `PROT_READWRITE`。
-    #[serde(default)]
-    pub tp_push: bool,
     /// **TP 通信数据腿：fp8 载荷**(§47 第二步 2026-10-19)⇒ 交 `TpOpts.ar_f8`。
     /// **两侧同装配 ⇒ 同档**(不同档 = 收端按错 dtype 解读)。
     #[serde(default)]
@@ -429,21 +436,20 @@ pub struct ParallelCfg {
     /// 拼接。**缺省 `false` = 逐字节旧行为**；需 world = 2(词表必须被 2 整除)。
     #[serde(default)]
     pub tp_vocab_split: bool,
-    /// **v1 两核融合档**(§11.2 2026-10-19)：AR 走一核(stage+reduce 同核两阶段)，
-    /// 少发一个核 ≈ decode +4%。**只非 fp8 载荷**；两 rank 同装配。
+    /// **AR 拓扑档位**(2026-10-27 单键化;原 `tp_ar_fused`/`tp_ar2`/
+    /// `tp_one_stage`/`tp_push` 四布尔)。
+    ///
+    /// 三档是一条**能力阶梯**(每级在形状门不满足时落回下一级):
+    /// - `v1`(缺省)= 两核:stage 写本端槽 → reduce 读对端槽;
+    /// - `fused` = 非 fp8 载荷走单核(stage+reduce 同核两阶段,少一个发射);
+    ///   fp8 载荷仍走 v1 两核(融合核只有 f32/f16/bf16 实例);
+    /// - `ar2` = 非 fp8 **小包**(≤256KiB)走 barrier-only AR-2(单 block,
+    ///   produced/consumed 相对游标 + release/acquire);其余落 `fused` / v1。
+    ///
+    /// 两 rank 必须同档。旧四布尔的"中性/互斥"实验档已在同一轮剪掉:
+    /// `tp_push`(3090 对读写对称)、`tp_one_stage`(对称 arena,实测中性)。
     #[serde(default)]
-    pub tp_ar_fused: bool,
-    /// **barrier-only AR-2**(2026-10-23)：小包(≤256KiB)/非 fp8 的 graph AR
-    /// 走单 block、v1 produced/consumed 相对游标 + release/acquire；去掉尾部
-    /// rendezvous、`wait_done/blocks_done` 与全线程 system fence。
-    /// 需 `mode = "tensor"`；与 `tp_one_stage` 互斥。缺省 false；两 rank 同装配。
-    #[serde(default)]
-    pub tp_ar2: bool,
-    /// **1-stage 对称 arena 档**(§35 2026-10-18)：staging 换对称 arena，结构更对
-    /// 但实测**中性** ⇒ 缺省关。互斥与前提(validate 拒启，不静默失效)：
-    /// 与 `tp_push` 互斥；需 `mode = "tensor"`。
-    #[serde(default)]
-    pub tp_one_stage: bool,
+    pub tp_ar: TpArMode,
 }
 
 impl Default for ParallelCfg {
@@ -451,12 +457,9 @@ impl Default for ParallelCfg {
         Self {
             mode: ParallelMode::Single,
             device: Vec::new(),
-            tp_push: false,
             tp_ar_f8: false,
             tp_vocab_split: false,
-            tp_ar_fused: false,
-            tp_ar2: false,
-            tp_one_stage: false,
+            tp_ar: TpArMode::V1,
         }
     }
 }
@@ -536,9 +539,6 @@ pub struct ModelCfg {
     pub path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// 27B AWQ 检查点目录(测试/E2E 门控)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub awq27b_dir: Option<String>,
     /// **MTP 头覆盖路径**(2026-10-21;`None` = 用 `model.path` 自带 mtp.* /
     /// 同 GGUF 文件)。用于"主模型 + 外部 GGUF MTP 头"的验证档;
     /// 支持目录(HF/AWQ)或 `.gguf` 单文件。
@@ -970,10 +970,6 @@ pub struct SpecCfg {
     /// T1b 滚动降档门：窗口 `tokens/round = m+1` 低于它即回 `depth_min`。
     /// 默认 3.0（MATH 32k d7 实测 4.98；DOCS 29.7k d7 实测 2.80）。
     pub adaptive_min_tpr: f32,
-    /// verify 图 taps 退回 last_hidden(排查开关)
-    pub notaps: bool,
-    /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
-    pub tapdecl: bool,
     /// **TP 档放行投机解码**(P2.1-c;缺省 false = 响亮拒)。
     /// 打开 = "草稿族双 rank 化"这条路的显式闸门:草稿 spec/权重按本 rank 计划
     /// 分片、草稿池几何按分片 hkv、草稿 AR 与主干共用同一条 AR 序列。
@@ -1133,6 +1129,37 @@ pub const SPEC_FOLD_RECORDS_PER_LAYER: usize = 8;
 /// **MTP/投机深度的上限**(= 行容量 - 1)
 pub const SPEC_DEPTH_MAX: usize = SPEC_VERIFY_ROWS_MAX - 1;
 
+/// **FI plan 表权威档**(`kernel.fi_plan`;2026-10-27 单键化)。
+///
+/// 原为 `fi_plan_bake` + `fi_plan_restore` 两个布尔,`validate` 强制互反
+/// —— 两个键编码同一个二值档位(而且反向可表示成"两个都开"的非法态)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FiPlanMode {
+    /// 图自携 plan:捕获窗内把本 plan 的表烘进图的 memcpy 节点,
+    /// `ctx_total` 用 `runtime.max_seq` 作上界烘死(单序列 ctx 的天然上界)。
+    /// 需 `fi_cuda_graph = true`。
+    Baked,
+    /// **host 为表的唯一权威**(缺省):图不烘表,引擎每次图 launch 前用
+    /// `fi_plan_sync` 刷当步精确表。v2 臂 / eager 档 / 降级档走这里。
+    #[default]
+    HostSync,
+}
+
+impl FiPlanMode {
+    /// 是否”图自带表”(= 旧 `fi_plan_bake = true` / `fi_plan_restore = false`)
+    pub const fn bakes(self) -> bool {
+        matches!(self, Self::Baked)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Baked => "baked",
+            Self::HostSync => "host-sync",
+        }
+    }
+}
+
 /// 解释器分派面(models EnvProvider 组装源;**正语义** —— true = 开,
 /// env 面的 NO_FUSE 反开关是兼容遗留,不入 toml)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1140,12 +1167,6 @@ pub const SPEC_DEPTH_MAX: usize = SPEC_VERIFY_ROWS_MAX - 1;
 pub struct KernelCfg {
     /// W2 qkv 融合(缺省真;2026-10-04 k-probe 硬门定谳)
     pub qkv_fuse: bool,
-    /// **W4A8 Marlin int8 m8 8-row 解码**(2026-10-22;实验,缺省 false)。
-    ///
-    /// 来自 famp-marlin 的 kS8 `m_block_size_8` 路径;3080 实测与 16-row
-    /// 持平/略慢(权重都只读一遍)⇒ 默认关。仅作为 3090/形状复验的显式配置。
-    #[serde(default)]
-    pub marlin_w4a8_m8: bool,
     /// **GGUF 小 n 的 MMVQ 判据**(MiB;`0` = 关 = 一律走复用臂)。
     ///
     /// 语义:「整张量 ≤ 本值(装得进 L2)且 `m ≤ TILE_MT` ⇒ 让 MMVQ 赢」
@@ -1182,17 +1203,10 @@ pub struct KernelCfg {
     /// (单序列 ctx 的天然上界,随档位走 —— 换 max_seq 不必两处手改)。
     /// `false`(缺省)= 现状(piecewise 断点 + 每步重算精确表)。
     ///
-    /// ⚠️ 配套:`fi_plan_restore` 必须 false(表由 host 每步刷)且
-    /// `fi_cuda_graph` 必须 true;`decode_fi`/`verify_fi` 需要本键为 true。
+    /// ⚠️ 配套:本键 = `baked` 时 `fi_cuda_graph` 必须 true;
+    /// `decode_arm`/`verify_arm` = fi 只在本键 = `baked` 时才能装配。
     #[serde(default)]
-    pub fi_plan_bake: bool,
-    /// **图自携 plan restore**(缺省 `true` = 捕获窗内把本 plan 的表烘进图的
-    /// memcpy 节点;prefill 桶图靠它)。
-    /// `false` = 图不烘表 ⇒ **host 为表的唯一权威**:引擎每次图 launch 前
-    /// 用 `fi_plan_sync` 刷当步**精确**表(单图档 `fi_plan_bake` 的标配)。
-    /// ⚠️ 与 `fi_plan_bake` 必须配套(false),冲突配置由 `validate` 拒启。
-    #[serde(default = "default_true")]
-    pub fi_plan_restore: bool,
+    pub fi_plan: FiPlanMode,
     /// **FI plan 走图档瓦**(上游 `enable_cuda_graph=true`):`cta_tile_q` 取最坏情形、
     /// `padded_batch_size = max(2·SM/hkv, tiles)` ⇒ **plan 形状对 ctx 全域恒定**
     /// (2026-10-18 实测:ctx 32→262144 一条直线 `padded=42/cta=16|64/split=1/int_bytes=618|650`)
@@ -1212,16 +1226,6 @@ pub struct KernelCfg {
     /// `runtime.max_seq` 预留,单层复用。
     #[serde(default)]
     pub prefill_shadow: bool,
-    /// prefill(chunked q=T)注意力改走 **XQA**(与 verify **同一份**
-    /// `M_TILESIZE=32` 实例化**;feature `xqa`;自 `feat/prefill-graph` 合入)。
-    ///
-    /// ⚠️ **只作 FI 缺口交接臂,不许放到 FI 之前**(CUPTI 逐核同请求 A/B:
-    /// XQA `kernel_mha` 258.5ms vs FI `BatchPrefill` 63.0ms = **慢 4.1×**;
-    /// XQA 是 decode 形状核,q=512 只有 ~9 TFLOPS)。价值面 = `t < fi_min_tokens`
-    /// 的尾块(现役回落核 24 CTA)⇒ 探针 T=128 同形状 **3.9×**
-    /// (`crates/kernels/tests/xqa_prefill_probe.rs`),长 prompt 净省 ~75ms
-    /// (期望值 ≈ 0.25×75ms)。缺省 **false** = 生产零行为变化。
-    pub xqa_prefill: bool,
     /// **FI 接管的 T 下限**(行)。**缺省 1 = FI 通吃**(2026-10-14 定谳,自
     /// `feat/prefill-graph` 合入)。
     ///
@@ -1260,10 +1264,6 @@ pub struct KernelCfg {
     pub gguf_mmq: bool,
     /// smem 复用臂(`m ≥ 64`)
     pub gguf_smem: bool,
-    /// cuBLAS 臂**行窗行数**(`None` = 96 MiB 预算档)。原
-    /// `OWL_GGUF_CUBLAS_TILE`;诊断/调参用,`0` 或 `None` = 预算档。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gguf_cublas_tile: Option<usize>,
     pub resolve_trace: bool,
     pub host_argmax: bool,
     pub ts_probe: bool,
@@ -1360,71 +1360,24 @@ pub struct ProbesCfg {
     pub perf_level: PerfLevel,
     pub gdn_dump: bool,
     pub debug: bool,
-    pub prefill_cksum: bool,
-    pub fact_probe: bool,
     pub trace_gate: bool,
     pub dflash_probe: bool,
-    /// 末边界额外哈希一个**逻辑块**的 K/V 页(诊断面;定位 stage-in 内容是否
-    /// 与首次写入一致)。`None` = 不哈希。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view_hash_block: Option<usize>,
-    pub propose_eager: bool,
-    pub dflash_eager: bool,
-    pub dflash_noencode: bool,
-    pub dflash_dumb: bool,
-    pub gdn_dump_all: bool,
-    pub pf_bisect: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pf_stages: Option<usize>,
-    pub pf_fin_check: bool,
     pub raw_completion: bool,
     /// 渲染后 prompt 落盘(/tmp/owl-prompt-*.txt;诊断面 —— 原
     /// OWL_PROMPT_DUMP env,2026-10-15 随 env 退出配置链收编)
     #[serde(default)]
     pub prompt_dump: bool,
-    /// reset_gdn 后 GDN rec 格画像(§三十二 会话污染定位诊断面;
-    /// 原 OWL_GDN_DBG)
-    #[serde(default)]
-    pub gdn_dbg: bool,
-    /// prefill H2D 叶子后插流栅栏(A13 竞态排障;
-    /// 原 OWL_PF_FENCE)
-    #[serde(default)]
-    pub pf_fence: bool,
-    // ---- 2026-10-21 env 收编:下列键原为入口 `env_reader` 直读 ----
+    // ---- 2026-10-21 env 收编 ----
     /// 解释器活性收尾归因打印(原 `OWL_LIVE_DIAG`;`models::eval` 消费)
     #[serde(default)]
     pub live_diag: bool,
-    /// B 轴调和 / 显存 / 索引 / 覆盖 / 落盘 / 桶 tap 的排障打印
-    /// (原 `OWL_RECON_DBG` / `OWL_VRAM_DBG` / `OWL_IDX_DBG` / `OWL_COV_DUMP` /
-    /// `OWL_STORE_HOOK_DEBUG` / `OWL_PF_TAPS`;引擎 `StepProbes` 消费)
-    #[serde(default)]
-    pub recon_dbg: bool,
-    #[serde(default)]
-    pub vram_dbg: bool,
-    #[serde(default)]
-    pub idx_dbg: bool,
-    #[serde(default)]
-    pub cov_dump: bool,
-    #[serde(default)]
-    pub store_hook_dbg: bool,
-    #[serde(default)]
-    pub pf_taps: bool,
-    /// **L3 事实面审计**(原 `OWL_L3_AUDIT`;声明 rank=0 的槽实际阶数登记)
-    #[serde(default)]
-    pub l3_audit: bool,
-    /// **GDN chunked 诊断**(原 `OWL_GDN_DIAG`;逐 call 打印前 48 次)
-    #[serde(default)]
-    pub gdn_diag: bool,
-    /// GDN 内容不变 dtoh+htod 往返区名单(原 `OWL_GDN_TOUCH`;
-    /// `None`/空 = 关,`"all"` = 全区,否则逗号名单)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gdn_touch: Option<String>,
-    /// GDN 每 call 前清零私有 scratch 区名单(原 `OWL_GDN_ZERO_SCRATCH`)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gdn_zero_scratch: Option<String>,
-    /// GDN 每 call 新分配 scratch(原 `OWL_GDN_FRESH_SCRATCH`)
-    #[serde(default)]
-    pub gdn_fresh_scratch: bool,
+    // 2026-10-27 配置面剪枝:原 24 个"纯打印/一次性排障"旗标已退役
+    // (prefill_cksum / fact_probe / view_hash_block / propose_eager /
+    //  dflash_eager / dflash_noencode / dflash_dumb / gdn_dump_all /
+    //  pf_bisect / pf_stages / pf_fin_check / pf_taps / gdn_dbg / pf_fence /
+    //  recon_dbg / vram_dbg / idx_dbg / cov_dump / store_hook_dbg / l3_audit /
+    //  gdn_diag / gdn_touch / gdn_zero_scratch / gdn_fresh_scratch)。
+    // 对应调查均已结案;排障改走 `[log] level` + tag 面,不再逐项留开关。
     /// **单步/粘滞调试门**(2026-10-14;见 `crate::stepgate` 模块头):
     /// 解释器检查点的运行期档位。⚠️ 需以 `--features stepgate` 构建才生效;
     /// 未编入时入口会**可见地告警**(不静默失效)。
@@ -1635,7 +1588,6 @@ impl Default for RuntimeCfg {
             reserve_pages: 0,
             max_queue: 0,
             test_device: None,
-            server_url: None,
         }
     }
 }
@@ -1720,8 +1672,6 @@ impl Default for SpecCfg {
             depth_min: 3,
             depth_switch_ctx: 49152,
             adaptive_min_tpr: 3.0,
-            notaps: false,
-            tapdecl: false,
             degrade_after: 6,
             probe_every: 8,
         }
@@ -1733,7 +1683,6 @@ impl Default for KernelCfg {
     fn default() -> Self {
         Self {
             qkv_fuse: true,
-            marlin_w4a8_m8: false,
             gguf_mmvq_l2_mib: default_gguf_mmvq_l2_mib(),
             prefill_split: false,
             force_naive_prefill: false,
@@ -1741,13 +1690,11 @@ impl Default for KernelCfg {
             decode_arm: DecodeArm::V2,
             // piecewise 段驱动件:**缺省关**(2026-10-15 立项;A/B 先证机制
             // 零回归,定谱后再翻默认 —— 同 verify_xqa 的翻法)
-            fi_plan_bake: false,
-            fi_plan_restore: true,
+            fi_plan: FiPlanMode::HostSync,
             // FI plan 图档瓦(2026-10-18 图档单图立案):**缺省关** —— 图档单图的
             // 其余件(W2 关自携 / W3 单图)未落地前开它只是换瓦片口径,不产生图。
             fi_cuda_graph: false,
             prefill_shadow: false,
-            xqa_prefill: false,
             fi_min_tokens: 1,
             // 2026-10-20:**定谳后翻默认**(FLA 五核,生产 spec-dflash 长期在跑;
             // 形状/T 门不满足时层内自动回落 varlen,无行为风险)
@@ -1761,7 +1708,6 @@ impl Default for KernelCfg {
             gguf_mmq2: true,
             gguf_mmq: true,
             gguf_smem: true,
-            gguf_cublas_tile: None,
             tag_wildcard: false,
             resolve_trace: false,
             host_argmax: false,
@@ -1913,10 +1859,124 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
             "pw_dump_tok",
             "piecewise 断点面已退役(W5):该 dump 无数据源 —— 删掉该键",
         ),
+        // ---- 2026-10-27 配置面剪枝(死开关 / 死枚举值 / 一次性探针)----
+        (
+            "model",
+            "awq27b_dir",
+            "已退役(2026-10-27):零读取的早期 E2E 门控 —— 删掉该键",
+        ),
+        (
+            "runtime",
+            "server_url",
+            "已退役(2026-10-27):零读取 —— 删掉该键",
+        ),
+        (
+            "spec",
+            "notaps",
+            "已退役(2026-10-27):DFlash2 施工期二分臂(taps 已是主路径)—— 删掉该键",
+        ),
+        (
+            "spec",
+            "tapdecl",
+            "已退役(2026-10-27):TAPDECL 声明期二分臂 —— 删掉该键",
+        ),
+        (
+            "kernel",
+            "marlin_w4a8_m8",
+            "已退役(2026-10-27):3080 A/B 持平/略慢(权重都只读一遍)—— 删掉该键",
+        ),
+        (
+            "kernel",
+            "xqa_prefill",
+            "已退役(2026-10-27):自陈慢 4.1×;`fi_min_tokens = 1` 已让 FI 通吃,缺口可选 —— 删掉该键",
+        ),
+        (
+            "kernel",
+            "gguf_cublas_tile",
+            "已退役(2026-10-27):无档使用的诊断行窗 —— 删掉该键",
+        ),
+        (
+            "kernel",
+            "fi_plan_bake",
+            "2026-10-27 单键化:改用 `[kernel] fi_plan = \"baked\" | \"host-sync\"`(原 bake/restore 两布尔必须互反)",
+        ),
+        (
+            "kernel",
+            "fi_plan_restore",
+            "2026-10-27 单键化:改用 `[kernel] fi_plan = \"baked\" | \"host-sync\"`(host-sync = 原 restore=true)",
+        ),
+        (
+            "parallel",
+            "tp_push",
+            "已退役(2026-10-27):3090 对实测读写对称、无档开启 —— 删掉该键",
+        ),
+        (
+            "parallel",
+            "tp_one_stage",
+            "已退役(2026-10-27):对称 arena 实测中性、无档开启 —— 删掉该键",
+        ),
+        (
+            "parallel",
+            "tp_ar_fused",
+            "2026-10-27 单键化:改用 `[parallel] tp_ar = \"v1\" | \"fused\" | \"ar2\"`",
+        ),
+        (
+            "parallel",
+            "tp_ar2",
+            "2026-10-27 单键化:改用 `[parallel] tp_ar = \"v1\" | \"fused\" | \"ar2\"`",
+        ),
     ];
     for (module, key, hint) in RETIRED {
         if v.get(*module).and_then(|m| m.get(*key)).is_some() {
             return Err(format!("[{module}] {key} 退役键:{hint}"));
+        }
+    }
+    // 嵌套表的两层键(退役键表只支持一层,故单独列)
+    if v.get("cuda")
+        .and_then(|m| m.get("graph_flags"))
+        .and_then(|m| m.get("device_launch"))
+        .is_some()
+    {
+        return Err(
+            "[cuda.graph_flags] device_launch 退役键:驱动直接拒(CUDA_ERROR_INVALID_VALUE),全仓零消费者 —— 删掉该键"
+                .to_string(),
+        );
+    }
+    // **2026-10-27 剪枝:一次性探针**(纯打印/dump;对应调查均已结案)。
+    // 排障改走 `[log] level` + tag 面,不再逐项留开关。
+    const RETIRED_PROBES: &[&str] = &[
+        "prefill_cksum",
+        "fact_probe",
+        "view_hash_block",
+        "propose_eager",
+        "dflash_eager",
+        "dflash_noencode",
+        "dflash_dumb",
+        "gdn_dump_all",
+        "pf_bisect",
+        "pf_stages",
+        "pf_fin_check",
+        "pf_taps",
+        "gdn_dbg",
+        "pf_fence",
+        "recon_dbg",
+        "vram_dbg",
+        "idx_dbg",
+        "cov_dump",
+        "store_hook_dbg",
+        "l3_audit",
+        "gdn_diag",
+        "gdn_touch",
+        "gdn_zero_scratch",
+        "gdn_fresh_scratch",
+    ];
+    if let Some(p) = v.get("probes") {
+        for key in RETIRED_PROBES {
+            if p.get(*key).is_some() {
+                return Err(format!(
+                    "[probes] {key} 退役键(2026-10-27):一次性排障探针已剪掉 —— 删掉该键"
+                ));
+            }
         }
     }
     // **2026-10-21 schema v2 的搬迁提示**(结构重组,不是同一键改名能表达的):
@@ -1936,11 +1996,6 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
         ("runtime", "device", "卡位已统一到 `[parallel] device = [\"<BDF|UUID|名字>\"]`(空 = 自动挑;禁 CUDA 序号)"),
         ("runtime", "device_ordinal", "显式 ordinal 退役:卡位用 `[parallel] device`(BDF / UUID / 名字子串)"),
         ("runtime", "tp_ordinals", "TP 卡位改用 `[parallel] mode = \"tensor\"` + `device = [\"41:00.0\", \"42:00.0\"]`"),
-        ("runtime", "tp_push", "已搬到 `[parallel] tp_push`"),
-        ("runtime", "tp_ar_f8", "已搬到 `[parallel] tp_ar_f8`"),
-        ("runtime", "tp_vocab_split", "已搬到 `[parallel] tp_vocab_split`"),
-        ("runtime", "tp_ar_fused", "已搬到 `[parallel] tp_ar_fused`"),
-        ("runtime", "tp_one_stage", "已搬到 `[parallel] tp_one_stage`"),
         ("server", "max_concurrency", "已搬到 `[runtime] max_concurrency`(与 gdn_slots 的校验同一处)"),
         ("model", "kind", "已由 `[model] format`(safetensors|awq|gguf)+ `quant` 取代"),
         ("model", "dir", "已更名为 `[model] path`(目录或 .gguf 单文件)"),
@@ -2452,18 +2507,11 @@ impl OwlConfig {
             }
         }
         // **并行面自洽**(2026-10-21;卡位唯一真源 = `[parallel] device`)。
-        //   · `layer` 暂未支持 ⇒ 拒(不许"配了但静默单卡");
         //   · device 条数必须与 mode 匹配(0 = 自动挑,单卡 1,tensor 2);
         //   · 每项必须是 BDF / UUID / 名字子串 —— **CUDA 序号拒**(序会漂);
-        //   · one_stage 需 tensor 且与 push 互斥(代码侧 push 下会静默不装)。
+        //   · AR 拓扑档需 tensor(单卡无 AR 可切)。
         let par = &self.parallel;
         match par.mode {
-            ParallelMode::Layer => {
-                return Err(
-                    "[parallel] mode = \"layer\" 暂未支持(流水/层并行未实现;用 single 或 tensor)"
-                        .to_string(),
-                );
-            }
             ParallelMode::Single if par.device.len() > 1 => {
                 return Err(format!(
                     "[parallel] mode = single 只能给 0 或 1 个 device,实得 {} 个: {:?}",
@@ -2483,39 +2531,14 @@ impl OwlConfig {
         for d in &par.device {
             crate::device::DeviceSpec::parse(d).map_err(|e| format!("[parallel] device = {d:?}: {e}"))?;
         }
-        if par.tp_ar2 {
-            if par.mode != ParallelMode::Tensor {
-                return Err(
-                    "[parallel] tp_ar2 = true 需 mode = \"tensor\"(单卡档无 TP 通信,开关无效)"
-                        .to_string(),
-                );
-            }
-            if par.tp_one_stage {
-                return Err(
-                    "[parallel] tp_ar2 与 tp_one_stage 互斥(AR-2 走 staging 两段 barrier,不是对称 arena)"
-                        .to_string(),
-                );
-            }
-        }
-        if par.tp_one_stage {
-            if par.mode != ParallelMode::Tensor {
-                return Err(
-                    "[parallel] tp_one_stage = true 需 mode = \"tensor\"(单卡档无 TP 通信,开关无效)"
-                        .to_string(),
-                );
-            }
-            if par.tp_push {
-                return Err(
-                    "[parallel] tp_one_stage 与 tp_push 互斥(push 档的指针对调依赖 v1 staging 布局)"
-                        .to_string(),
-                );
-            }
-        }
-        if par.tp_push && par.mode != ParallelMode::Tensor {
-            return Err("[parallel] tp_push = true 需 mode = \"tensor\"".to_string());
+        if par.tp_ar != TpArMode::V1 && par.mode != ParallelMode::Tensor {
+            return Err(format!(
+                "[parallel] tp_ar = \"{}\" 需 mode = \"tensor\"(单卡档无 TP 通信,档位无效)",
+                par.tp_ar.as_str()
+            ));
         }
         // **format × quant 的组合门**(2026-10-21):量化词表按格式分域,
-        // 错配 = 拒启(装载器不会替你猜);未实现方案同样在 boot 前拦下。
+        // 错配 = 拒启(装载器不会替你猜)。
         match (self.model.format, self.model.quant) {
             (ModelFormat::Gguf, QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3) => {}
             (ModelFormat::Gguf, q) => {
@@ -2528,12 +2551,6 @@ impl OwlConfig {
                     "[model] quant = q4k/iq4/iq3 只配 format = \"gguf\"(safetensors/awq 无块型)"
                         .to_string(),
                 );
-            }
-            (_, QuantScheme::W8a8i | QuantScheme::W8a8f | QuantScheme::W8a8) => {
-                return Err(format!(
-                    "[model] quant = {:?} 暂未支持(当前:w4a16 / w4a8 / gguf q4k·iq4·iq3)",
-                    self.model.quant
-                ));
             }
             _ => {}
         }
@@ -2615,15 +2632,8 @@ impl OwlConfig {
         // 会超过表里的工作项数 ⇒ partial 行 stride 错(设计卷 §2.2 的 V1 形态,
         // 实测 T=8 max|Δ|=1.39)。**只许上界 ≥ 任何可能 ctx**,这里 fail-fast。
         // 单图烘 plan 档必须"图不烘表"(否则回放那次 memcpy 把同步进去的表盖掉
-        // ⇒ 又回 inert 表)。**拒启**而不是自动纠正:静默改语义比拒启危险。
-        //
-        if self.kernel.fi_plan_bake && self.kernel.fi_plan_restore {
-            return Err(
-                "[kernel] fi_plan_bake 需要 fi_plan_restore = false \
-                 (单图档的 plan 表由 host 每步 `fi_plan_sync` 刷新,图内不得再烘自携 restore)"
-                    .to_string(),
-            );
-        }
+        // ⇒ 又回 inert 表)。2026-10-27:`fi_plan_bake`/`fi_plan_restore` 两布尔
+        // 已收成一个 `fi_plan` 枚举(原 validate 在此强制二者互反)。
         // **W5 意图配套门**（2026-10-18）：FI 臂只有"图内臂"一种承载（核留图内 +
         // `ctx_total` 烘上界 + 表由 `fi_plan_sync` 窗外刷）。缺上界 ⇒ 捕获期会拿
         // **占位 ctx** 烘表（文本连贯但错，历史踩过）⇒ 响亮拒绝，不给静默错值。
@@ -2651,22 +2661,22 @@ impl OwlConfig {
         }
 
         // **臂 × FI 前置件的一致性门**(2026-10-21 单键化):FI 臂(verify/decode
-        // 任一)只有在 `fi_plan_bake` 在场时才能捕获(图内臂 + 窗外刷表)。
+        // 任一)只有在 `fi_plan = "baked"` 在场时才能捕获(图内臂 + 窗外刷表)。
         // 拒启而不是自动补 —— 静默补一个上界会让 `ctx_total` 烘错。
         for (key, uses_fi) in [
             ("verify_arm", self.kernel.verify_arm.uses_fi()),
             ("decode_arm", self.kernel.decode_arm.uses_fi()),
         ] {
-            if uses_fi && !self.kernel.fi_plan_bake {
+            if uses_fi && !self.kernel.fi_plan.bakes() {
                 return Err(format!(
-                    "[kernel] {key} = \"fi\" 需要 `fi_plan_bake = true`\
+                    "[kernel] {key} = \"fi\" 需要 `fi_plan = \"baked\"`\
                      (FI 核只能走图内臂 + 窗外刷表:上界恒 = max_seq)"
                 ));
             }
         }
-        if self.kernel.fi_plan_bake && !self.kernel.fi_cuda_graph {
+        if self.kernel.fi_plan.bakes() && !self.kernel.fi_cuda_graph {
             return Err(
-                "[kernel] fi_plan_bake 需要 fi_cuda_graph = true（图档瓦让 plan 形状对 ctx 恒定，                 单图才可能服务任意 ctx）"
+                "[kernel] fi_plan = \"baked\" 需要 fi_cuda_graph = true（图档瓦让 plan 形状对 ctx 恒定，                 单图才可能服务任意 ctx）"
                     .to_string(),
             );
         }
@@ -2855,16 +2865,16 @@ mod tests {
         );
         // `fi` 臂 = 图内臂 + 窗外刷表 ⇒ 缺上界拒启(不静默补)
         let e = OwlConfig::from_toml_str("[kernel]\nverify_arm = \"fi\"\n")
-            .expect_err("fi 臂缺 fi_plan_bake 必须拒");
-        assert!(e.contains("fi_plan_bake"), "拒语应指向缺件: {e}");
+            .expect_err("fi 臂缺 fi_plan=baked 必须拒");
+        assert!(e.contains("fi_plan"), "拒语应指向缺件: {e}");
         let e = OwlConfig::from_toml_str("[kernel]\ndecode_arm = \"fi\"\n")
-            .expect_err("decode fi 臂缺 fi_plan_bake 必须拒");
-        assert!(e.contains("fi_plan_bake"), "拒语应指向缺件: {e}");
+            .expect_err("decode fi 臂缺 fi_plan=baked 必须拒");
+        assert!(e.contains("fi_plan"), "拒语应指向缺件: {e}");
         // 配上就过(与生产 spec-dflash 档同形)
         OwlConfig::from_toml_str(
-            "[kernel]\nverify_arm = \"fi\"\ndecode_arm = \"fi\"\n             fi_cuda_graph = true\nfi_plan_bake = true\nfi_plan_restore = false\n",
+            "[kernel]\nverify_arm = \"fi\"\ndecode_arm = \"fi\"\n             fi_cuda_graph = true\nfi_plan = \"baked\"\n",
         )
-        .expect("fi 臂 + 三件套 = 合规");
+        .expect("fi 臂 + 两件套 = 合规");
     }
 
     /// **部分驻留 × 投机 = v2-only**(2026-10-23):视图化 verify 已落地,
@@ -2880,13 +2890,13 @@ mod tests {
         // FI 臂 = 单表,不支持逐行视图
         let e = OwlConfig::from_toml_str(&format!(
             "{base}[kernel]\nverify_arm = \"fi\"\ndecode_arm = \"v2\"\n\
-             fi_plan_bake = true\nfi_cuda_graph = true\nfi_plan_restore = false\n"
+             fi_plan = \"baked\"\nfi_cuda_graph = true\n"
         ))
         .expect_err("partial + spec + fi verify 必须拒启");
         assert!(e.contains("v2") && e.contains("select_partial"), "拒语要可行动: {e}");
         let e = OwlConfig::from_toml_str(&format!(
             "{base}[kernel]\nverify_arm = \"v2\"\ndecode_arm = \"fi\"\n\
-             fi_plan_bake = true\nfi_cuda_graph = true\nfi_plan_restore = false\n"
+             fi_plan = \"baked\"\nfi_cuda_graph = true\n"
         ))
         .expect_err("partial + spec + fi decode 必须拒启");
         assert!(e.contains("v2") && e.contains("select_partial"), "拒语要可行动: {e}");
@@ -2968,66 +2978,38 @@ mod prefill_tail_merge_tests {
 }
 
 #[cfg(test)]
-mod tp_ar2_tests {
+mod tp_ar_tests {
     use super::*;
 
+    /// `tp_ar` 三档:缺省 v1;非 v1 需 TP;字面量严格(打错 = 拒启)。
     #[test]
-    fn tp_ar2_defaults_off_and_requires_tensor() {
+    fn tp_ar_defaults_to_v1_and_requires_tensor() {
         let c = OwlConfig::from_toml_str("[runtime]\nmax_seq = 128\n").expect("解析");
-        assert!(!c.parallel.tp_ar2, "AR-2 缺省必须关");
-        let e = OwlConfig::from_toml_str("[parallel]\ntp_ar2 = true\n").expect_err("单卡必须拒");
+        assert_eq!(c.parallel.tp_ar, TpArMode::V1, "缺省必须 v1(逐字节旧行为)");
+        let e = OwlConfig::from_toml_str("[parallel]\ntp_ar = \"ar2\"\n").expect_err("单卡必须拒");
         assert!(e.contains("tensor"), "拒语应点名 tensor: {e}");
         let c = OwlConfig::from_toml_str(
-            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\ntp_ar2 = true\n",
+            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\ntp_ar = \"ar2\"\n",
         )
-        .expect("TP2 + AR-2 合法");
-        assert!(c.parallel.tp_ar2);
+        .expect("TP2 + ar2 合法");
+        assert_eq!(c.parallel.tp_ar, TpArMode::Ar2);
+        assert!(c.parallel.tp_ar.uses_fused() && c.parallel.tp_ar.uses_ar2());
+        assert!(!TpArMode::V1.uses_fused() && !TpArMode::Fused.uses_ar2());
     }
 
+    /// 旧四布尔(含已退役的 push / one_stage)必须**响亮拒**,不留第二套接口。
     #[test]
-    fn tp_ar2_rejects_one_stage() {
-        let e = OwlConfig::from_toml_str(
-            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\n\
-             tp_ar2 = true\ntp_one_stage = true\n",
-        )
-        .expect_err("必须拒");
-        assert!(e.contains("互斥"), "拒语应点名互斥: {e}");
-    }
-}
-
-#[cfg(test)]
-mod tp_one_stage_tests {
-    use super::*;
-
-    /// 缺省 false(§35 实验档;生产走 v1 两段)。
-    #[test]
-    fn tp_one_stage_defaults_off() {
-        let c = OwlConfig::from_toml_str("[runtime]\nmax_seq = 128\n").expect("解析");
-        assert!(!c.parallel.tp_one_stage, "1-stage 缺省必须关");
-    }
-
-    /// 前提与互斥**响亮拒**(代码侧 `one_stage && !push` 是静默不装 ——
-    /// 配置错必须在 boot 前被拒,而不是"配了但没生效")。
-    #[test]
-    fn tp_one_stage_requires_tp_and_rejects_push() {
-        // 单卡档给 one_stage = 无效开关 ⇒ 拒
-        let e = OwlConfig::from_toml_str("[parallel]\ntp_one_stage = true\n").expect_err("必须拒");
-        assert!(e.contains("tensor"), "拒语应点名前提: {e}");
-
-        // 与 push 互斥 ⇒ 拒
-        let e = OwlConfig::from_toml_str(
-            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\n\
-             tp_push = true\ntp_one_stage = true\n",
-        )
-        .expect_err("必须拒");
-        assert!(e.contains("互斥"), "拒语应点名互斥: {e}");
-
-        // 合法组合:TP + one_stage(无 push)
-        let c = OwlConfig::from_toml_str(
-            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\ntp_one_stage = true\n",
-        )
-        .expect("合法组合应通过");
-        assert!(c.parallel.tp_one_stage && !c.parallel.tp_push);
+    fn retired_tp_switches_are_rejected() {
+        for (key, val) in [
+            ("tp_push", "true"),
+            ("tp_one_stage", "true"),
+            ("tp_ar_fused", "true"),
+            ("tp_ar2", "true"),
+        ] {
+            let e = OwlConfig::from_toml_str(&format!("[parallel]\n{key} = {val}\n"))
+                .expect_err("退役键必须拒");
+            assert!(e.contains("退役"), "{key} 拒语应点名退役: {e}");
+        }
     }
 }
 

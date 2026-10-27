@@ -225,7 +225,6 @@ impl GpuServer {
         sink: owl_shared::log::LogSink,
         vram: Arc<VramAccount>,
     ) -> Self {
-        let marlin_w4a8_m8 = diag.marlin_w4a8_m8;
         Self {
             actor_tag: ACTOR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             rx,
@@ -237,7 +236,7 @@ impl GpuServer {
 // (diag 自身随 Self 移动,克隆 include 后置)
             registry: None,
             tag_filter: diag.tag_filter,
-            exec: owl_kernels::device::Exec::new().with_marlin_w4a8_m8(marlin_w4a8_m8),
+            exec: owl_kernels::device::Exec::new(),
             scratch_ledger: Vec::new(),
             peak_watermark_bytes: 0,
             peak_snapshots: 0,
@@ -569,23 +568,13 @@ impl GpuServer {
                     owl_kernels::server::flashinfer::set_prefill_shadow_cap(
                         self.diag.fi_prefill_shadow_cap,
                     );
-                    // **服务端面诊断旋钮**(2026-10-21;原 OWL_GDN_* / FI_DEBUG /
-                    // OWL_L3_AUDIT env 已退场):同一 boot 点从 DiagOpts 显式下发。
-                    // **输出口 + 采集旋钮一次下发**(boot 唯一写点)。
+                    // **服务端面输出口**(2026-10-21 收编 env;2026-10-27 采集旗标
+                    // 全退役,只剩 sink)。**boot 唯一写点**。
                     // `sink` 接上后:算子面 `klog_*!`(Rust)与 `OWL_LOG_*`
                     // (C/C++)同时可用,可见性由 logger 的 level/tag 管;
                     // 失败 = 拒启(重入不同值 ⇒ 不静默覆盖)。
                     if let Err(e) = owl_kernels::server::configure_diag(
-                        &owl_kernels::server::DiagTune {
-                            sink: self.sink,
-                            l3_audit: self.diag.l3_audit,
-                            gdn: owl_kernels::server::gdn_chunked::GdnDiag {
-                                on: self.diag.gdn_diag,
-                                touch: self.diag.gdn_touch.clone(),
-                                zero_scratch: self.diag.gdn_zero_scratch.clone(),
-                                fresh_scratch: self.diag.gdn_fresh_scratch,
-                            },
-                        },
+                        &owl_kernels::server::DiagTune { sink: self.sink },
                     ) {
                         let msg = format!("诊断面下发失败(拒启): {e}");
                         self.sink.logf(

@@ -88,8 +88,6 @@ pub(crate) struct ChunkTables {
     /// `[0, t]`(attn/gdn 的 cu_seqlens)
     pub seq_cu: Vec<f32>,
     pub fi: Option<FiTables>,
-    /// XQA prefill 表件(`dispatch.xqa_prefill` 开才有;见 [`XqaTables`])
-    pub xqa: Option<XqaTables>,
 }
 
 /// FlashInfer 表四件套(U32 位型;`nb_used` = 本 chunk 实际覆盖页数)
@@ -99,21 +97,6 @@ pub(crate) struct FiTables {
     pub indptr: Vec<u32>,
     pub last_len: Vec<u32>,
     pub nb_used: usize,
-}
-
-/// XQA prefill 表件(U32 位型;`q_seq_len` 由调用方按本 chunk 真行数传)
-///
-/// - `page_table` = 本会话**物理页链**(= FI 的 `indices` 同值 —— 两者是
-///   "页链"的两种编码;kNHD 池下同一份);
-/// - `seq_len` = 整请求 KV 长(`ctx_total`)—— XQA 的 `seqLens` 语义就是它,
-///   块内因果**只由 mask 表达**(见 `cu/xqa/README.md` 调用契约);
-/// - `mask` = spec-dec 位掩码 `[t, ceil(t/32)]` u32,行 i 的 bit 0..i 置 1。
-///   行跨 `ceil(t/32)` ⇒ 表件随行数定制,`qSeqLen` 槽就传本 chunk 真行数
-///   (尾块不越写)。
-pub(crate) struct XqaTables {
-    pub page_table: Vec<u32>,
-    pub seq_len: u32,
-    pub mask: Vec<u32>,
 }
 
 impl ChunkTables {
@@ -134,7 +117,6 @@ impl ChunkTables {
         bt_chain: &[u32],
         gdn_slot_v: usize,
         fi_face: bool,
-        xqa_face: bool,
         past: Option<(&[u32], usize)>,
         positions: Option<&[[i32; 3]]>,
     ) -> Result<Self> {
@@ -195,11 +177,6 @@ impl ChunkTables {
             gdn_slot: gdn_slot_v as f32,
             seq_cu: vec![0.0, t as f32],
             fi,
-            xqa: xqa_face.then(|| XqaTables {
-                page_table: tbl,
-                seq_len: (base + t) as u32,
-                mask: causal_mask_words(t),
-            }),
         })
     }
 }
@@ -228,28 +205,6 @@ fn fi_tables_view(base: usize, t: usize, tbl: &[u32], page: usize) -> Result<FiT
         last_len: vec![(ctx_total - (nb_used - 1) * page) as u32],
         nb_used,
     })
-}
-
-/// XQA SPEC_DEC 因果位掩码:`[t, ceil(t/32)]` u32,行 i 的 bit 0..i 置 1。
-/// 语义定谳与多方佐证见 `crates/kernels/cu/xqa/README.md`(掩码位序/极性/
-/// 行序三组 A/B:唯"行 i 看块内 0..i、含自身"贴 host)。
-pub(crate) fn causal_mask_words(t: usize) -> Vec<u32> {
-    let wpr = t.div_ceil(32);
-    let mut v = vec![0u32; t * wpr];
-    for i in 0..t {
-        for w in 0..wpr {
-            let lo = w * 32;
-            let hi = (i + 1).min(lo + 32);
-            v[i * wpr + w] = if hi <= lo {
-                0
-            } else if hi - lo == 32 {
-                u32::MAX
-            } else {
-                (1u32 << (hi - lo)) - 1
-            };
-        }
-    }
-    v
 }
 
 /// **prefill 设备半的主机侧事实**(S4 ⑤-K3):两 rank 共用一份**只读**事实
@@ -308,14 +263,6 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
     // prefill 桶图路(M2b;设计 §4–§6)
     // ========================================================================
 
-    /// 取证面 rank 标识(TP2 双 rank 同进程 ⇒ 同一 `boot_seq`、同一 tag;
-    /// `mfact` 是 `counter_set` 语义 ⇒ 后写覆盖、前值丢失。pf 系列打点必须带
-    /// rank,否则"单卡 vs 双卡"对拍拿到的是混合值(2026-10-17 实测踩到)。
-    /// 单卡档恒 0(与历史 tag 语义等价)。
-    fn tp_rank(&self) -> usize {
-        self.boot.tp.as_ref().map(|t| t.plan.rank()).unwrap_or(0)
-    }
-
     /// 块式 prefill(W1;批P5 契约):ids [T] 从 KV 行 base 起步,
     /// 单序列语义(gdn_slot 恒 0;KV 行随 token 走)。末块走 logits 根
     /// 返回末行;中间块走 last_hidden 根(免 lm_head [T,V] 计算与大
@@ -368,7 +315,6 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             &bt_chain,
             gdn_slot_v,
             self.pool.geom.fi_face,
-            self.env().attn.xqa_prefill,
             past_view.as_ref().map(|(pages, tokens)| (pages.as_slice(), *tokens)),
             Some(host.positions),
         )?;
@@ -434,32 +380,6 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             && self.pool.geom.paged
             && (base + t).is_multiple_of(self.pool.geom.page))
         .then(|| crate::exec::coverage::QSink::new(Vec::new()));
-        // ── XQA prefill 表件(`dispatch.xqa_prefill`;缺省关)──
-        // 三张 U32 位型表(页链/整请求长/因果位掩码)与 FI 四件套同路:
-        // **预物化**(eval_ops 往返同步)而非 from_host 叶子 —— Htod 在 H2D
-        // 流、核在 COMPUTE 流,无跨流序 ⇒ 异步竞态会让核偶发读到半写入表
-        // (2026-10-03 渐进腐败案同病史,见上方 FI 表注)。
-        // semaphores/scratch 两件取池里的真块:单块几何(`XqaPrefillRuntime`
-        // 强制 `nbSubSeq=1`)下核**结构上不解引用**它们,传真块只为"不隐瞒"。
-        // XQA prefill 表三件:表件逐 chunk 物化、semaphores/scratch 取自池 ——
-        // 两件都归 `KvBank` 所有 ⇒ 组装由它封装(`prefill_xqa`)。
-        let xqa_pf = if self.env().attn.xqa_prefill {
-            match tb.xqa.as_ref() {
-                Some(xt) => {
-                    let face = self.graphs.session.face_mut();
-                    self.pool.prefill_xqa(face, xt, t).await?
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        // 诊断(2026-10-14 A13):`[probes] pf_fence = true` ⇒ from_host 叶子(pos/slots/
-        // lens/id/gdn_slot)建完后插一道流栅栏 —— 判「H2D 叶子与 COMPUTE 核
-        // 无跨流序」竞态(仓内 2026-10-03 FI 表同病史:预物化修法)
-        if host.probes.pf_fence {
-            self.graphs.session.face_mut().sync().await?;
-        }
         let mut ctx = ForwardCtx::model_prefill(
             t, &ci.pos_t, &ci.kvs_step, &self.boot.rope, &ci.gdns_step, &ci.slots_leaf, &ci.lens_leaf, &ci.gdn_slot,
             // A13(2026-10-14):chunked/scalar 臂的 rec 态寻址吃这个 host 标量
@@ -487,7 +407,6 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             nt: g.nt,
         });
         ctx.gdn_tables = gdn_tables;
-        ctx.xqa = xqa_pf;
         // ── **VLM:本 chunk 的 m-RoPE / 图像注入**(2026-10-20)──
         // 行号表/余弦表按 chunk 行号切;`has_image=false` 的块只装 rope
         // (image_scatter 不必跑全 -1 表)。塔输出 `merged` 是 turn 域设备叶。
@@ -514,184 +433,6 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         ctx.env = self.env();
         ctx.trace_gate = host.knobs.probes.trace_gate;
         let _vocab = self.boot.model.vocab_size();
-        // E5-DF4 逐层 bisect(OWL_PF_BISECT;非 dflash 路径):单遍 multi
-        // eval 产出 48 层 taps + fin —— **fin 块直接作为主路输出**(bisect
-        // 前向有 GDN 状态副作用,双执行会双推进;单执行 + 逐层 checksum
-        // → metrics `pf.c{base}.l{i}`,双 boot/双跑 diff = 首个发散层)。
-        // fin block-leaf 下游 eval = 零操作透传。
-        let pf_bisect = host.knobs.pf_bisect && self.spec_rt.dflash_tap_count == 0;
-        // GDN 状态 checksum(pre/post;崩坏排查:状态脏 = reset 病,状态净
-        // 而输出异 = 核病)。rec [slots,nv,kd,vd] f32 全量 dtoh ≈ 3.1MB/层。
-        let pf_state_check = pf_bisect;
-        // 指定层五站 stage tap(OWL_PF_STAGES=层号;配合 BISECT 定位层内核)
-        let pf_stage_layer: Option<usize> = host.knobs.pf_stages;
-        let mut bisect_fin_block: Option<(TensorOps, owl_iface::contract::Bytes)> = None;
-        let mut _bisect_fin_blk: Option<owl_iface::contract::Bytes> = None;
-        if pf_bisect {
-            let gdn_leaves = self.pool.gdn_caches();
-            if pf_state_check {
-                for (j, g) in gdn_leaves.iter().enumerate() {
-                    for (sn, buf, nb) in [
-                        ("convq", &g.conv_q, self.pool.geom.gdn_slots * d.nk * d.hk * 3),
-                        ("convk", &g.conv_k, self.pool.geom.gdn_slots * d.nv * d.hv * 3),
-                        ("convv", &g.conv_v, self.pool.geom.gdn_slots * d.nv * d.hv * 3),
-                        ("rec", &g.rec, self.pool.geom.gdn_slots * d.nv * d.hk * d.hv),
-                    ] {
-                        let mut sb = vec![0u8; nb * 4];
-                        {
-                            let face = self.graphs.session.face_mut();
-                            let blk = owl_models::interpreters::eval_ops(buf.step(), face).await?;
-                            face.dtoh(&blk, &mut sb).await?;
-                        }
-                        mfact(
-                            host.boot_seq,
-                            &format!("pf.r{}.c{}.pre.g{j}.{sn}", self.tp_rank(), base),
-                            fnv_bytes(&sb) & 0x7fff_ffff_ffff_ffff,
-                        );
-                    }
-                }
-            }
-            let _ids_all: Vec<usize> = (0..self.boot.model.layers.len()).collect();
-            // GDN 层内打点(M4 gdn_tap 现成):每 GDN 层 8 件
-            // (q/k/v raw + q_n/k_n/v_c/g/beta)→ 定位 qkv-proj/l2norm/conv/gating
-            // GDN 层内 8 件打点(gdn_tap)已启用:层六站展开 + 8 件随层带出
-            // (旧案:gtap 节点直挂 multi 曾现节点/块尺寸错配,改由
-            // forward_bisect_stages 随 mixer 调用自然求值,不直挂 multi)
-            ctx.gdn_tap = Some(std::rc::Rc::new(std::cell::RefCell::new(Vec::new())));
-            let (fin, nodes) =
-                self.boot.model
-                    .prefill_bisect(&ci.ids_t, &ctx, pf_stage_layer);
-            let mut roots: Vec<TensorOps> = Vec::new();
-            let mut names: Vec<String> = Vec::new();
-            for (name, n) in &nodes {
-                roots.push(n.clone());
-                names.push(name.clone());
-            }
-            roots.push(fin);
-            names.push("fin".into());
-            let refs: Vec<&TensorOps> = roots.iter().collect();
-            let outs = {
-                let env = self.env();
-                let face = self.graphs.session.face_mut();
-                owl_models::interpreters::eval_ops_multi_env(&refs, face, env, self.boot.tp.as_ref()).await?
-            };
-            for (i, r) in roots.iter().enumerate() {
-                let n: usize = r.shape().iter().product();
-                // 形状/元素数上屏(2026-10-17 三版;env 门控 —— 判读量级前
-                // **必须先看形状**(形状不同时量级不可比,踩过)
-                if i < 24 && host.probes.pf_taps {
-                    owl_shared::log_debug!(
-                        "pf-tap",
-                        "rank{} {} shape={:?} dtype={:?} n={n}",
-                                self.tp_rank(), names[i], r.shape(), r.dtype()
-                    );
-                }
-                // ⚠️ **按 dtype 定宽**(2026-10-17 三版):原硬编码 `n*2` ⇒
-                // **f32 拍只 dtoh 一半字节**,再按 f32 解 = 垃圾(量级探针
-                // 的 2308/64928 就是这类伪影,不是模型值)。
-                let mut b = vec![0u8; n * r.dtype().size_bytes()];
-                {
-                    let face = self.graphs.session.face_mut();
-                    let res = face.dtoh(&outs[i], &mut b).await;
-                    if let Err(e) = res {
-                        owl_shared::log_debug!("pf-bisect", "dtoh 失败 i={i} name={} shape={:?} blk_bytes={} err={e}", names[i], r.shape(), b.len());
-                        return Err(e);
-                    }
-                }
-                mfact(
-                    host.boot_seq,
-                    &format!("pf.r{}.c{base}.{}", self.tp_rank(), names[i]),
-                    fnv_bytes(&b) & 0x7fff_ffff_ffff_ffff,
-                );
-                // **量级探针**(2026-10-17 S6 诊断):逐层 |x| 和(f16 位型解回)。
-                // 为什么另立一条:哈希面对"多根 eval 的块覆盖"敏感(实测单卡/双卡
-                // 全异,零信息量),而**量级**即便被覆盖也只在同阶内跳 —— 逐层
-                // 爆炸/塌陷仍一眼可见(定位 TP 前向在哪层溢出)。
-                {
-                    // 读法 = **均值 |x|**(形状无关:分片与全量的元素数不同,
-                    // 和不可比 —— 2026-10-17 首版踩到)+ 非有限计数 + 元素数。
-                    // 打包:高 20 位 = 非有限数,低 40 位 = mean|x| × 1e4,
-                    // 再各留一格:元素数以 2^20 为单位塞进次高位。
-                    // **dtype 感知**(2026-10-17 二版:首版硬按 f16 解,f32 拍
-                    // 出来的均值是垃圾 ⇒ 单卡/双卡的"同一拍"可能 dtype 不同,
-                    // 比值全乱)。
-                    let dt = r.dtype();
-                    let (w, mut sum, mut bad, mut cnt, mut mx) =
-                        (dt.size_bytes(), 0f64, 0usize, 0usize, 0f32);
-                    for c in b.chunks_exact(w) {
-                        let v = match dt {
-                            owl_iface::contract::Dtype::F16 => {
-                                half::f16::from_le_bytes([c[0], c[1]]).to_f32()
-                            }
-                            owl_iface::contract::Dtype::F32 => {
-                                f32::from_le_bytes([c[0], c[1], c[2], c[3]])
-                            }
-                            _ => f32::NAN,
-                        };
-                        cnt += 1;
-                        if v.is_finite() {
-                            sum += (v as f64).abs();
-                            if v.abs() > mx {
-                                mx = v.abs();
-                            }
-                        } else {
-                            bad += 1;
-                        }
-                    }
-                    let mean = if cnt > 0 { sum / cnt as f64 } else { 0.0 };
-                    let mean_q = ((mean * 1e4) as u64).min(0xff_ffff_ffff);
-                    mfact(
-                        host.boot_seq,
-                        &format!("pf.m.r{}.c{base}.{}", self.tp_rank(), names[i]),
-                        ((bad.min(0xffff) as u64) << 40) | mean_q,
-                    );
-                    // **max|x|**(2026-10-17 二版):均值会掩盖离群 —— 判"输入是否
-                    // 有界"(RMSNorm 输出应 ~γ 量级)必须看 max。
-                    let maxq = ((mx * 1e3) as u64).min(0xff_ffff_ffff);
-                    let dt_code = match dt {
-                        owl_iface::contract::Dtype::F16 => 1u64,
-                        owl_iface::contract::Dtype::F32 => 2,
-                        owl_iface::contract::Dtype::BF16 => 3,
-                        _ => 9,
-                    };
-                    mfact(
-                        host.boot_seq,
-                        &format!("pf.x.r{}.c{base}.{}", self.tp_rank(), names[i]),
-                        (dt_code << 56) | maxq,
-                    );
-                }
-                if i == roots.len() - 1 {
-                    let d_model = d.hidden;
-                    bisect_fin_block = Some((
-                        TensorOps::of_block(outs[i].id, d.dtype, vec![t, d_model]),
-                        outs[i].clone(),
-                    ));
-                }
-            }
-            if pf_state_check {
-                for (j, g) in gdn_leaves.iter().enumerate() {
-                    for (sn, buf, nb) in [
-                        ("convq", &g.conv_q, self.pool.geom.gdn_slots * d.nk * d.hk * 3),
-                        ("convk", &g.conv_k, self.pool.geom.gdn_slots * d.nv * d.hv * 3),
-                        ("convv", &g.conv_v, self.pool.geom.gdn_slots * d.nv * d.hv * 3),
-                        ("rec", &g.rec, self.pool.geom.gdn_slots * d.nv * d.hk * d.hv),
-                    ] {
-                        let mut sb = vec![0u8; nb * 4];
-                        {
-                            let face = self.graphs.session.face_mut();
-                            let blk = owl_models::interpreters::eval_ops(buf.step(), face).await?;
-                            face.dtoh(&blk, &mut sb).await?;
-                        }
-                        mfact(
-                            host.boot_seq,
-                            &format!("pf.r{}.c{}.post.g{j}.{sn}", self.tp_rank(), base),
-                            fnv_bytes(&sb) & 0x7fff_ffff_ffff_ffff,
-                        );
-                    }
-                }
-            }
-            owl_shared::log_debug!("pf-bisect", "chunk base={base} t={t} 层 checksum 已记");
-        }
         let _face = self.graphs.session.face_mut();
         // P1.1:同桶图路(stride = 本 rank logits 宽;token 在收割半重算)
         let vocab = self.boot.model.logits_vocab();
@@ -703,12 +444,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             // DFlash2:同树多根(hidden + 5 taps;CSE 共享前向零额外计算)。
             // 树根 = concat(hidden, taps)(单根 scoped eval 竞技场回收照旧;
             // 块内切片消费 —— SliceView 作根丢偏移,故不走多根 plain eval)
-        let (hidden_full, prefill_taps) = if pf_bisect {
-                // bisect fin 块直通(block-leaf 下游 eval 零操作)
-                let (decl, blk) = bisect_fin_block.take().ok_or_else(|| ModelError::EngineInvariant { what: "bisect fin 块缺席(诊断档口径)".into() })?;
-                _bisect_fin_blk = Some(blk);
-                (decl, None)
-            } else if self.spec_rt.dflash_tap_count > 0 {
+        let (hidden_full, prefill_taps) = if self.spec_rt.dflash_tap_count > 0 {
                 let (h, tp) = self.boot.model.tapped_hidden(&ci.ids_t, &ctx, &self.spec_rt.dflash_tap_ids);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for t in &tp {
@@ -736,7 +472,6 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             live_diag_end(ld, base, t);
             let (hfb, arena1, cov_q) = r_eval?;
             // Q 回读(探针档;设备块当场 free;分析在块边界事件后做)
-            self.dump_hidden_row(&hfb, base, t, d_model, host.probes.cov_dump).await?;
             if let Some(qs) = cov_q {
                 if let Some(sel) = host.sel.as_deref_mut() {
                     let (pl, pc) = sel.analysis_pair();
@@ -750,22 +485,6 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     let (_pl, pc) = sel.analysis_pair();
                     self.coverage_mark_cheap(base, t, pc)?;
                 }
-            }
-            // E5 崩坏排查·轻探针(OWL_PF_FIN_CHECK;bisect 900 dtoh 强掩蔽
-            // 0/10,本探针仅 1 dtoh —— 近零扰判决:fin 翻 = 前向内部腐坏;
-            // fin 绿而 pf.last 翻 = lm_head/argmax 面腐坏)
-            if host.knobs.pf_fin_check && !pf_bisect {
-                let n_fin = t * d_model;
-                let mut fb = vec![0u8; n_fin * 2];
-                {
-                    let face = self.graphs.session.face_mut();
-                    face.dtoh(&hfb, &mut fb).await?;
-                }
-                mfact(
-                    host.boot_seq,
-                    "pf.fin",
-                    fnv_bytes(&fb) & 0x7fff_ffff_ffff_ffff,
-                );
             }
             // DFlash2:草稿 KV 物化(root 块行 [T, 6T) 切片出 taps → encode)
             if let Some(tp) = &prefill_taps {
@@ -909,11 +628,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         } else {
             // 中间块:last_hidden 根(状态推进完整;lm_head 免算)。
             // DFlash2:同构 concat 单根(taps 随块回收前切片 encode)
-            let (tree, prefill_taps) = if pf_bisect {
-                let (decl, blk) = bisect_fin_block.take().ok_or_else(|| ModelError::EngineInvariant { what: "bisect fin(非末)块缺席(诊断档口径)".into() })?;
-                _bisect_fin_blk = Some(blk);
-                (decl, None)
-            } else if self.spec_rt.dflash_tap_count > 0 {
+            let (tree, prefill_taps) = if self.spec_rt.dflash_tap_count > 0 {
                 let (h, tp) = self.boot.model.tapped_hidden(&ci.ids_t, &ctx, &self.spec_rt.dflash_tap_ids);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for tt in &tp {
@@ -939,7 +654,6 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let r_eval = self.eval_root_and_q(&tree, cov_sink.as_ref()).await;
             live_diag_end(ld, base, t);
             let (b, arena, cov_q) = r_eval?;
-            self.dump_hidden_row(&b, base, t, d.hidden, host.probes.cov_dump).await?;
             if let Some(qs) = cov_q {
                 if let Some(sel) = host.sel.as_deref_mut() {
                     let (pl, pc) = sel.analysis_pair();
@@ -962,18 +676,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 // (曾用 t·hidden → 多 chunk DFlash2 首跑即炸;MTP 无 taps
                 // 时 n_tp=0 同式兼容)
                 let rows_b = if let Some(tp) = &prefill_taps { tp.0.len() + 1 } else { 1 } * t;
-                // ⚠️ 2026-10-17(K3 分相):原为**无条件** dtoh(整块隐层回读),
-                // 但 `buf` 只被 `prefill_cksum` 探针消费 ⇒ 纯浪费 + 每 chunk 一次
-                // 同步(TP 入队半的硬违例)。收进探针门内(单卡路语义不变)。
-                if host.probes.prefill_cksum {
-                    let mut buf = vec![0u8; rows_b * d.hidden * esz];
-                    face.dtoh(&b, &mut buf).await?;
-                    // 临时取证:每 chunk 隐层校验和(FI 开/关对比找第一分歧)
-                    let cks: f32 = buf.chunks_exact(2)
-                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32().abs())
-                        .sum();
-                    owl_shared::log_debug!("cksum", "chunk base={base} t={t} sum|x|={cks:.4}");
-                }
+                // 勘误(2026-10-27):原 `prefill_cksum` 探针已退役 —— 那段
+                // 无条件 dtoh 在 2026-10-17 已收进门内,现在整段去掉(零回读)。
+                let _ = (&face, rows_b, esz);
                 // prefill extend(E5-M5):行 0..T-1 的 mtp KV(行 T-1 配对需
                 // 下一 chunk 首 token,由其 extend 补)。DFlash2:草稿 KV
                 // 物化(整 chunk 全行 taps → encode)

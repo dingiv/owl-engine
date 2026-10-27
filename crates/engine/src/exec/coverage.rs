@@ -679,28 +679,6 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ⇒ 下一 chunk 的 `ensure_for_len` 必 `Exhausted`。这里把三条数打出来:
         // 可沉 / 待回灌 / 不可沉,以及**候选块的 refs 分布**(1=仅会话持,
         // 2=树+会话双持=可沉)。
-        if self.boot.probes.recon_dbg {
-            let mut hist = [0usize; 4];
-            for (i, _h) in cands.iter().enumerate().take(n_blocks) {
-                if let Some(slot) = table.get(i).copied() {
-                    if slot != crate::scheduler::PENDING_LOAD_PLACEHOLDER {
-                        let r = self.bank.rel.leg.slot_refs(slot).min(3) as usize;
-                        hist[r] += 1;
-                    }
-                }
-            }
-            owl_shared::log_debug!(
-                "recon",
-                "候选 {n_blocks} · 表 {} · 可沉 {} · 待回灌 {} · **不可沉 {}** · refs(1/2/3+)={}/{}/{}",
-                table.len(),
-                sink.len(),
-                need.len(),
-                not_in_tree,
-                hist[1],
-                hist[2],
-                hist[3]
-            );
-        }
         let sink = sinkable;
         let n_sink = sink.len();
         let n_need = need.len();
@@ -1180,49 +1158,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 let m = true_block_mass(&q_post, &k_post, (layers, hq, hkv, hd), page, pos + 1);
                 // ⚠️ **临时取证**(`OWL_COV_DUMP=1`;A2 定谳用,事后删):逐 query 行的
                 // 真实质量峰位 —— 报告里的 `mass` 是 W 行均值,掩盖“哪一行退化”。
-                if self.boot.probes.cov_dump {
-                    let mut ord: Vec<usize> = (0..m.len()).collect();
-                    ord.sort_by(|a: &usize, b: &usize| {
-                        m[*b].partial_cmp(&m[*a]).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    let top: Vec<String> =
-                        ord.iter().take(5).map(|i| format!("{i}:{:.4}", m[*i])).collect();
-                    owl_shared::log_debug!(
-                        "cov",
-                        "rowmass qi={qi} pos={pos} visible={} sum={:.4} top5={}",
-                                pos + 1,
-                                m.iter().sum::<f32>(),
-                                top.join(" ")
-                    );
-                    // 最后一行的**逐层**质量 + 峰/均比(平不平一眼看出)
-                    if qi == pid.t - 1 {
-                        for l in 0..layers {
-                            let ml = true_block_mass(
-                                &q_post[l..l + 1],
-                                &k_post[l..l + 1],
-                                (1, hq, hkv, hd),
-                                page,
-                                pos + 1,
-                            );
-                            let mut ol: Vec<usize> = (0..ml.len()).collect();
-                            ol.sort_by(|a: &usize, b: &usize| {
-                                ml[*b].partial_cmp(&ml[*a]).unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            let tl: Vec<String> = ol
-                                .iter()
-                                .take(3)
-                                .map(|i| format!("{i}:{:.4}", ml[*i]))
-                                .collect();
-                            let mean = ml.iter().sum::<f32>() / ml.len().max(1) as f32;
-                            owl_shared::log_debug!(
-                                "cov",
-                                "rowlast 层={l} 峰/均={:.1} top3={}",
-                                                ml[ol[0]] / mean.max(1e-12),
-                                                tl.join(" ")
-                            );
-                        }
-                    }
-                }
                 for (a, b) in mass.iter_mut().zip(m) {
                     *a += b;
                 }
@@ -1256,104 +1191,6 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ⚠️ **临时取证**(`OWL_COV_DUMP=1`;A2 定谳用,事后删):三面指纹 ——
         // ① Q 面(本边界末 W 行,post-RoPE 原样)**② 池内 K 回读**(定块)
         // **③ 索引账 Mean-K**(同块)—— 三者谁随 chunk 漂,谁就是 A2 的源。
-        if self.boot.probes.cov_dump {
-            let hf = |v: &[f32]| -> u64 {
-                let mut h = 0xcbf2_9ce4_8422_2325u64;
-                for x in v {
-                    for b in x.to_le_bytes() {
-                        h ^= b as u64;
-                        h = h.wrapping_mul(0x100_0000_01b3);
-                    }
-                }
-                h
-            };
-            let hu = |v: &[u16]| -> u64 {
-                let mut h = 0xcbf2_9ce4_8422_2325u64;
-                for x in v {
-                    for b in x.to_le_bytes() {
-                        h ^= b as u64;
-                        h = h.wrapping_mul(0x100_0000_01b3);
-                    }
-                }
-                h
-            };
-            let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
-            owl_shared::log_debug!(
-                "cov",
-                "geom base={} t={} w={} ctx={ctx_tokens} page={page} blocks={n_blocks} layers={layers} hq={hq} hkv={hkv} hd={hd} analyze={analyze_now} last={last_boundary}",
-                pid.base, pid.t, pid.w
-            );
-            for qi in 0..pid.w {
-                let q_off = qi * hq * hd;
-                let allq: Vec<f32> = pid
-                    .q
-                    .iter()
-                    .flat_map(|l| l[q_off..q_off + hq * hd].to_vec())
-                    .collect();
-                let r0 = &pid.q[0][q_off..q_off + hd];
-                let per_l: Vec<String> = pid
-                    .q
-                    .iter()
-                    .map(|l| format!("{:.1}", l2(&l[q_off..q_off + hq * hd])))
-                    .collect();
-                let per_l_fnv: Vec<String> = pid
-                    .q
-                    .iter()
-                    .map(|l| format!("{:08x}", (hf(&l[q_off..q_off + hq * hd]) & 0xffff_ffff) as u32))
-                    .collect();
-                owl_shared::log_debug!(
-                    "cov",
-                    "Q qi={qi} pos={} fnv={:016x} l2={:.4} per层l2=[{}] per层fnv=[{}] l0h0=[{:.5} {:.5} {:.5} {:.5}]",
-                        pid.base + (pid.t - pid.w) + qi,
-                        hf(&allq),
-                        l2(&allq),
-                        per_l.join(" "),
-                        per_l_fnv.join(" "),
-                        r0[0],
-                        r0[1],
-                        r0[2],
-                        r0[3]
-                );
-            }
-            if analyze_now {
-                for lb in [0usize, 1, 2, 17, 36, 56, 95] {
-                    if lb >= n_blocks {
-                        continue;
-                    }
-                    let lo = lb * page * hkv * hd;
-                    let hi = lo + page * hkv * hd;
-                    let allk: Vec<f32> =
-                        k_post.iter().take(layers).flat_map(|l| l[lo..hi].to_vec()).collect();
-                    let k0 = &k_post[0][lo..lo + hd];
-                    let (idxn, idxv) = match index.block_k_bar(cands[lb]) {
-                        Some(seg) => {
-                            let row: Vec<f32> = seg[..hd]
-                                .iter()
-                                .map(|b| owl_store::f16_to_f32_pub(*b))
-                                .collect();
-                            (
-                                format!("fnv={:016x} l2={:.4}", hu(seg), l2(&row)),
-                                format!(
-                                    "[{:.4} {:.4} {:.4} {:.4}]",
-                                    row[0], row[1], row[2], row[3]
-                                ),
-                            )
-                        }
-                        None => ("无条目".to_string(), String::new()),
-                    };
-                    owl_shared::log_debug!(
-                        "cov",
-                        "blk={lb} K fnv={:016x} l2={:.4} t0h0=[{:.5} {:.5} {:.5} {:.5}] ‖ IDX {idxn} {idxv}",
-                                hf(&allk),
-                                l2(&allk),
-                                k0[0],
-                                k0[1],
-                                k0[2],
-                                k0[3]
-                    );
-                }
-            }
-        }
         let gqa = gqa_map(hq, hkv);
         // ── **召回节奏**(`OWL_RECALL_EVERY`;缺省 1 = 每边界都完整召回)──
         //
@@ -1620,21 +1457,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                         bids.len(),
                         bids
                     );
-                    if let Some(tb) = self.boot.probes.view_hash_block {
-                        if let Some(&pg) = bt_after.get(tb) {
-                            match self.probe_view_page_hash(pg as usize, "target").await {
-                                Ok(h) => owl_shared::log_info!(
-                                    "view-diag",
-                                    "target-hash block={} page={} hash={:016x}",
-                                    tb, pg, h
-                                ),
-                                Err(e) => owl_shared::log_error!(
-                                    "view-diag",
-                                    "target-hash block={tb} page={pg} 失败: {e}"
-                                ),
-                            }
-                        }
-                    }
                     if let Some(&pg) = view_pages.get(2) {
                         match self.probe_view_page_hash(pg as usize, "idx2").await {
                             Ok(h) => owl_shared::log_info!(
@@ -1898,79 +1720,6 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let hfb = outs[0].clone();
         // ⚠️ 根块**不被** multi_scoped 回收 ⇒ 调用方负责 hfb / Q 块的生命周期
         Ok((hfb, Vec::new(), Some(outs[1..].to_vec())))
-    }
-
-    /// ⚠️ **临时取证**(A2;`OWL_COV_DUMP=1`,事后删):**末行 hidden 指纹**。
-    ///
-    /// 判别“前向真的随 chunk 漂”(同一绝对行的 hidden 不同 ⇒ 算出来的东西不同)
-    /// 还是“Q 槽读回面坏了”(hidden 相同而 Q 面不同 ⇒ 读的是别的内存)。
-    pub(crate) async fn dump_hidden_row(
-        &mut self,
-        block: &owl_iface::contract::Bytes,
-        base: usize,
-        t: usize,
-        d_model: usize,
-        cov_dump: bool,
-    ) -> Result<()> {
-        if !cov_dump || t == 0 {
-            return Ok(());
-        }
-        let esz = self.pool.geom.dims.dtype.size_bytes();
-        let row = d_model * esz;
-        // **整块回读**(逐行 L2)—— 异常是"尾行"还是"整块",只有整块 profile 能判
-        let buf = {
-            let face = self.graphs.session.face_mut();
-            face.dtoh_batch(&[(block, 0, t * row)]).await?
-        };
-        let dec = |c: &[u8]| -> f32 {
-            match esz {
-                2 => half::f16::from_le_bytes([c[0], c[1]]).to_f32(),
-                _ => f32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-            }
-        };
-        let mut rows: Vec<f32> = Vec::with_capacity(t);
-        for r in 0..t {
-            let seg = &buf[r * row..(r + 1) * row];
-            rows.push(seg.chunks_exact(esz).map(dec).map(|x| x * x).sum::<f32>().sqrt());
-        }
-        let tail: Vec<String> = rows[t.saturating_sub(16)..].iter().map(|v| format!("{v:.1}")).collect();
-        let stride = (t / 8).max(1);
-        let prof: Vec<String> = (0..t)
-            .step_by(stride)
-            .map(|r| format!("{}:{:.1}", base + r, rows[r]))
-            .collect();
-        owl_shared::log_debug!(
-            "cov",
-            "HID base={base} t={t} 首行={:.1} 末行={:.1} ‖ 尾16=[{}]",
-        rows[0],
-        rows[t - 1],
-        tail.join(" ")
-        );
-        owl_shared::log_debug!(
-            "cov",
-            "PROF base={base} {}", prof.join(" "));
-        let l2 = rows[t - 1];
-        let last_seg = &buf[(t - 1) * row..t * row];
-        let h = {
-            let mut h = 0xcbf2_9ce4_8422_2325u64;
-            for x in last_seg.chunks_exact(esz).map(dec) {
-                for b in x.to_le_bytes() {
-                    h ^= b as u64;
-                    h = h.wrapping_mul(0x100_0000_01b3);
-                }
-            }
-            h
-        };
-        let v0 = dec(&last_seg[..esz]);
-        let v1 = dec(&last_seg[esz..2 * esz]);
-        let v2 = dec(&last_seg[2 * esz..3 * esz]);
-        let v3 = dec(&last_seg[3 * esz..4 * esz]);
-        owl_shared::log_debug!(
-            "cov",
-            "HID2 base={base} t={t} row={} fnv={h:016x} l2={l2:.4} first4=[{v0:.5} {v1:.5} {v2:.5} {v3:.5}]",
-        base + t - 1
-        );
-        Ok(())
     }
 
     /// **廉价边界**的待分析面:不采 Q、不做 query 面,只让 `coverage_analyze`

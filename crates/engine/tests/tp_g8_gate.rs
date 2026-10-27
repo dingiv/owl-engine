@@ -24,7 +24,7 @@
 //! OWL_TP_TEST_DEV_A=2 OWL_TP_TEST_DEV_B=3 OWL_0_8B_DIR=<…/Qwen3.5-0.8B> \
 //!   cargo test -p owl-engine --test tp_g8_gate -- --nocapture
 //! ```
-//! `OWL_G8B_TOPN`(默认 5)= 判据的 N;`OWL_G8_BISECT=1` = 附带逐层 checksum 对拍诊断。
+//! `OWL_G8B_TOPN`(默认 5)= 判据的 N。
 
 use std::path::PathBuf;
 
@@ -57,7 +57,6 @@ fn knobs() -> EngineKnobs {
     let mut k = EngineKnobs::default();
     k.sampler_enabled = false; // 设备 argmax(逐 token 确定性)
     k.prefix_cache = false;
-    k.pf_bisect = std::env::var("OWL_G8_BISECT").is_ok();
     k
 }
 
@@ -207,7 +206,7 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
         }
     }
     // ── ① TP1 参考臂:单卡全量(先跑先卸,腾出显存给双 rank)──────────
-    let (tp1, pf1) = {
+    let (tp1, _pf1) = {
         let mut e = Engine::new(cfg_of(ref_dev)).expect("engine(TP1)");
         let loaded = e.loader().load_qwen35_0_8b(&dir).await.expect("TP1 装载");
         let mut r = e.run(loaded).await.expect("TP1 装配");
@@ -229,24 +228,18 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(&dir).await.expect("rank0 分片装载");
     let mut e1 = Engine::new_with_ledger(cfg_of(ob), e0.ledger_cell(), 1).expect("engine(TP2 rank1)");
     let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(&dir).await.expect("rank1 分片装载");
-    // ★ **push 档开关**(2026-10-18;§36.6/§36.7)—— 测试用例可放 env
-    // (owl 纪律:行为开关走配置,测试可例外)。
-    let push = matches!(std::env::var("OWL_TP_PUSH").as_deref(), Ok("1") | Ok("true"));
-    // ★ **fp8 载荷档**(§47 第二步;测试用例可放 env —— owl 纪律:行为开关走配置,测试例外)
+    // ★ 测试例外:AR 档位从 env 显式取(owl 纪律:行为开关走配置,测试例外)。
+    // 2026-10-27:push / 1-stage 两档已退役,只剩 fp8 载荷 + 融合 + AR-2。
     let ar_f8 = matches!(std::env::var("OWL_TP_AR_F8").as_deref(), Ok("1") | Ok("true"));
-    // ★ **v1 两核融合档**(§11.2;测试例外同上)
     let ar_fused = matches!(std::env::var("OWL_TP_AR_FUSED").as_deref(), Ok("1") | Ok("true"));
-    // ★ **1-stage 档**(§35;2026-10-21 收编:TpOpts 不再读 env,测试侧显式给)
-    let one_stage = matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"));
+    let ar2 = matches!(std::env::var("OWL_TP_AR2").as_deref(), Ok("1") | Ok("true"));
     let tp = TpEngine::assemble_with(
         vec![e0, e1],
         vec![l0, l1],
         owl_engine::TpOpts {
-            push,
             ar_f8,
             ar_fused,
-            ar2: matches!(std::env::var("OWL_TP_AR2").as_deref(), Ok("1") | Ok("true")),
-            one_stage,
+            ar2,
         },
     )
         .await
@@ -267,7 +260,7 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     // 另一个测试(`body_probe`,走 `assemble` 默认档 = 两核)⇒ 若它先跑,计数已经
     // 不是 0 ⇒ "融合档下 v1 必须为 0"的绝对判据会**假红**(实测 v1=2016 全是它留的)。
     // 判据改成**本臂增量**(turn 前后的差),与测试顺序解耦。
-    let base = ["tp.ar.push", "tp.ar.v1", "tp.ar.fused", "tp.ar.1stage"].map(|t| cnt0(t));
+    let base = ["tp.ar.v1", "tp.ar.fused", "tp.ar.ar2"].map(|t| cnt0(t));
     let Steps { gen: tp2_gen, logits: tp2_logits } =
         run_turn_steps(&mut r, 1, PROMPT, MAX_NEW).await.expect("TP2 turn");
     let cnt = |t: &str| -> u64 {
@@ -278,31 +271,22 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
         .map(|x| x.counter)
         .sum();
         let i = match t {
-            "tp.ar.push" => 0,
-            "tp.ar.v1" => 1,
-            "tp.ar.fused" => 2,
-            _ => 3,
+            "tp.ar.v1" => 0,
+            "tp.ar.fused" => 1,
+            _ => 2,
         };
         now.saturating_sub(base[i])
     };
-    let (n_push, n_v1) = (cnt("tp.ar.push"), cnt("tp.ar.v1"));
+    let n_v1 = cnt("tp.ar.v1");
     let n_fused = cnt("tp.ar.fused");
-    // ⚠️ 1-stage 档的路径判据在 `tp_perf_split_probe`(那里断言 `tp.ar.1stage > 0 ∧ v1 = 0`);
-    // 本条只管 push/v1 两档 —— **1-stage 开时 v1 本就该是 0**,别在这里拦(2026-10-19)
-    eprintln!("[g8b] 路径判据:push={n_push} · v1={n_v1} · fused={n_fused}(OWL_TP_PUSH={push} · 融合={ar_fused} · 1-stage={one_stage})");
-    if one_stage {
-        /* 走 tp_perf_split_probe 的判据 */
-    } else if ar_fused {
-        // **融合档的路径判据**(§11.2;2026-10-19):必须走到 fused,且 v1/push 都为 0
+    let n_ar2 = cnt("tp.ar.ar2");
+    eprintln!("[g8b] 路径判据:v1={n_v1} · fused={n_fused} · ar2={n_ar2}(融合={ar_fused} · ar2={ar2})");
+    if ar_fused {
+        // **融合档的路径判据**(§11.2;2026-10-19):必须走到 fused,且 v1 为 0
         // (否则"开了融合档但没走"= 静默不生效,与 1-stage §60.2 同族坑)
         assert!(n_fused > 0, "开了融合档但一次都没走到(tp.ar.fused = 0)");
         assert_eq!(n_v1, 0, "融合档下不应走 v1 两核(tp.ar.v1 = {n_v1})");
-        assert_eq!(n_push, 0, "融合档下不应走 push 两核(tp.ar.push = {n_push})");
-    } else if push {
-        assert!(n_push > 0, "开了 push 但一次都没走到(tp.ar.push = 0)");
-        assert_eq!(n_v1, 0, "开了 push 却仍在走 v1 绑定(tp.ar.v1 = {n_v1})");
     } else {
-        assert_eq!(n_push, 0, "没开 push 却走了 push 绑定");
         assert!(n_v1 > 0, "v1 档应有 tp.ar.v1 > 0");
     }
     eprintln!("[g8b] TP2(双 rank {oa}/{ob}):{} tok;逐步 logits {} 条", tp2_gen.len(), tp2_logits.len());
@@ -399,25 +383,6 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
         steps,
         all_diff
     );
-
-    // ── 附:逐层 checksum 诊断(旧二分法;默认关)──────────────────
-    if std::env::var("OWL_G8_BISECT").is_ok() {
-        let pf2 = pf_map("b2.pf.");
-        let mut diffs = 0;
-        let mut first: Option<String> = None;
-        for (k, v1) in &pf1 {
-            match pf2.get(k) {
-                Some(v2) if v2 == v1 => {}
-                other => {
-                    diffs += 1;
-                    if first.is_none() {
-                        first = Some(format!("{k}: TP1={v1} TP2={other:?}"));
-                    }
-                }
-            }
-        }
-        eprintln!("[bisect] 层 checksum 差异 = {diffs}/{};首个 = {first:?}", pf1.len());
-    }
 
     // 附:全量 spec 自证(world = 2 整除前提;CPU 侧读 config,零 GPU)
     let (full, _) = ModelSpec::from_ckpt(&dir, SpecSource::family(&qwen3_5_0_8b())).expect("全量 spec");
@@ -519,16 +484,13 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
     let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(&dir).await.expect("rank0 装载");
     let mut e1 = Engine::new_with_ledger(cfg_eager(ob), e0.ledger_cell(), 1).expect("engine rank1");
     let l1 = e1.loader().slice(1, 2).load_qwen35_0_8b(&dir).await.expect("rank1 装载");
-    // 2026-10-21:`TpOpts` 已无 env 读取(引擎零 env);本探针**显式**从 env 取
-    // 档位(测试例外),再交 `assemble_with` —— 否则 `OWL_TP_1STAGE=1` 只改
-    // 断言分支、不改装配,判据永远看到"没走新路径"却测的不是它。
+    // 2026-10-27:`TpOpts` 已无 env 读取(引擎零 env);本探针**显式**从 env
+    // 取档位(测试例外),再交 `assemble_with`(push / 1-stage 两档已退役)。
     let flag = |k: &str| matches!(std::env::var(k).as_deref(), Ok("1") | Ok("true"));
     let opts = owl_engine::TpOpts {
-        push: flag("OWL_TP_PUSH"),
         ar_f8: flag("OWL_TP_AR_F8"),
         ar_fused: flag("OWL_TP_AR_FUSED"),
         ar2: flag("OWL_TP_AR2"),
-        one_stage: flag("OWL_TP_1STAGE"),
     };
     let tp = TpEngine::assemble_with(vec![e0, e1], vec![l0, l1], opts)
         .await
@@ -569,14 +531,14 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
     let total = t0.elapsed();
     eprintln!("[perf-split:{tag}] mode={mode}");
     eprintln!(
-        "[perf-split:{tag}] prompt {} 字 / gen {} tok ⇒ **总墙钟 {:.3}s** | 1-stage={} · gpu_prof={} · eager=on",
+        "[perf-split:{tag}] prompt {} 字 / gen {} tok ⇒ **总墙钟 {:.3}s** | fused={} · gpu_prof={} · eager=on",
         prompt.chars().count(),
         ngen,
         total.as_secs_f64(),
-        std::env::var("OWL_TP_1STAGE").unwrap_or_else(|_| "(缺省 v1)".to_string()),
+        std::env::var("OWL_TP_AR_FUSED").unwrap_or_else(|_| "(缺省 v1)".to_string()),
         std::env::var("OWL_GPU_PROF").is_ok(),
     );
-    // ★ **路径存在性判据**(2026-10-18):1-stage 开时,融合核必须真被走到
+    // ★ **路径存在性判据**(2026-10-18):开档后核必须真被走到
     // —— 门全绿 ≠ 新路径被执行(本轮实测:融合核 0 次而门全绿)。
     let cnt = |t: &str| -> u64 {
         owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new().tag(t))
@@ -584,16 +546,13 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
             .map(|r| r.counter)
             .sum()
     };
-    let one_stage = matches!(std::env::var("OWL_TP_1STAGE").as_deref(), Ok("1") | Ok("true"));
-    let (n_new, n_old) = (cnt("tp.ar.1stage"), cnt("tp.ar.v1"));
-    eprintln!("[perf-split:{tag}] 路径判据:fusion={n_new} · v1={n_old}(开 1-stage={one_stage})");
-    if one_stage {
-        assert!(n_new > 0, "开了 1-stage 但融合核一次都没被走到(tp.ar.1stage = 0)");
-        assert_eq!(n_old, 0, "开了 1-stage 却仍在走 v1 两段(tp.ar.v1 = {n_old})");
-    } else {
-        assert_eq!(n_new, 0, "没开 1-stage 却走了融合核");
-        assert!(n_old > 0, "v1 档应有 tp.ar.v1 > 0");
+    let fused = matches!(std::env::var("OWL_TP_AR_FUSED").as_deref(), Ok("1") | Ok("true"));
+    let (n_fused, n_v1) = (cnt("tp.ar.fused"), cnt("tp.ar.v1"));
+    eprintln!("[perf-split:{tag}] 路径判据:fusion={n_fused} · v1={n_v1}(开融合={fused})");
+    if fused {
+        assert!(n_fused > 0, "开了融合档但融合核一次都没被走到(tp.ar.fused = 0)");
     }
+    assert!(n_v1 > 0 || n_fused > 0, "AR 两档都没被走到(判据失效)");
     let path = format!("/tmp/tp-perf-{tag}.txt");
     match owl_shared::metrics::dump(&owl_shared::metrics::MetricsFilter::new(), &path) {
         Ok(()) => eprintln!("[perf-split:{tag}] metrics → {path}"),

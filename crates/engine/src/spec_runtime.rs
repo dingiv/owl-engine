@@ -64,7 +64,7 @@ pub(crate) struct SpecRuntime {
     /// **DFlash2 taps 的 target 层号(0-based,升序)** —— 单一事实源:
     /// HF 草稿 = 家族常量 `[5,19,33,47,61]`;GGUF 草稿 = `dflash.target_layers - 1`
     /// (GGUF 侧是 1-based)。**禁止在调用点写死**:错一层 = AL 静默塌陷。
-    /// 无 spec / notaps ⇒ 空。
+    /// 无 spec / 非 DFlash2 ⇒ 空。
     pub dflash_tap_ids: std::sync::Arc<Vec<usize>>,
     /// 噪声块 mask token(GGUF 草稿可能未导出 → 家族兜底,见 DraftSpec)
     pub dflash_mask_token: u32,
@@ -211,7 +211,6 @@ pub(crate) struct SpecBootInput<'a> {
     /// 的声明校验与码本行数用)
     pub(crate) target: owl_models::formats::gguf::TargetFacts,
     /// DFlash2 taps 退回 last_hidden(排查开关)
-    pub(crate) notaps: bool,
     /// **本 rank 的 TP 计划**(P2.1-a;`None`/`is_single()` = 单卡 ⇒ 逐字节旧行为)。
     /// 草稿族双 rank 化的**唯一形状/装载单源**:草稿 spec 按它切、草稿权重按它装、
     /// 草稿 rope 按它分片 —— 与主干同 TpPlan(vLLM/SGLang 形态:同 TP group)。
@@ -576,13 +575,13 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         }
         _ => None,
     };
-    // DFlash2 target taps 数(dflash 模式 = 5 层;notaps 退 last_hidden = 0)
-    let dflash_tap_count = if mode == SpecMode::DFlash2 && !inp.notaps {
+    // DFlash2 target taps 数(dflash 模式 = 5 层;taps 是唯一路径)
+    let dflash_tap_count = if mode == SpecMode::DFlash2 {
         dflash_tap_ids.len()
     } else {
         0
     };
-    if mode == SpecMode::DFlash2 && !inp.notaps {
+    if mode == SpecMode::DFlash2 {
         // 层号合法性(启动期判死:`tapped_hidden` 的结构保证是"层号必在域内")
         if let Some(&last) = dflash_tap_ids.last() {
             if last >= inp.target.layers {

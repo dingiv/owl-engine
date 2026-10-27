@@ -288,14 +288,6 @@ pub struct EngineKnobs {
     pub sampler_enabled: bool,
     /// 采样参数(temp/topk/topp/rep;缺省 = 反循环服务档)
     pub sampler: crate::sampler::SamplerCfg,
-    /// GDN 画像 dump 全槽(原 OWL_GDN_DUMP_ALL)
-    pub gdn_dump_all: bool,
-    /// prefill 逐层 checksum 二分(原 OWL_PF_BISECT)
-    pub pf_bisect: bool,
-    /// prefill 指定层五站 stage tap(原 OWL_PF_STAGES)
-    pub pf_stages: Option<usize>,
-    /// prefill 尾块校验(原 OWL_PF_FIN_CHECK)
-    pub pf_fin_check: bool,
     /// 设备诊断/调优选项(srv_timing/cap_prof/launch_sync/free_legacy/
     /// graph_flags/capture_slab_mb;原散点 OWL_* 直读 →
     /// owl_cuda::DiagOpts 一体携带,入口经 DiagOpts::from_config 填充)
@@ -378,10 +370,6 @@ impl Default for EngineKnobs {
             raw_completion: false,
             sampler_enabled: true,
             sampler: crate::sampler::SamplerCfg::default(),
-            gdn_dump_all: false,
-            pf_bisect: false,
-            pf_stages: None,
-            pf_fin_check: false,
             cuda: owl_cuda::DiagOpts::default(),
             env: owl_models::env::EnvProvider::default(),
         }
@@ -651,8 +639,6 @@ impl EngineKnobs {
                 lookup_nmax: cfg.spec.lookup_nmax,
                 lookup_nstrong: cfg.spec.lookup_nstrong,
                 lookup_agree: cfg.spec.lookup_agree,
-                notaps: cfg.spec.notaps,
-                tapdecl: cfg.spec.tapdecl,
                 tp_draft: cfg.spec.tp_draft,
             },
             prefix_cache: cfg.pool.prefix_cache,
@@ -718,8 +704,8 @@ impl EngineKnobs {
             fi_cuda_graph: cfg.kernel.fi_cuda_graph,
             // 哨兵:0 = 取 max_seq(FI 调度表的图档上界 = 单序列 ctx 的天然上界;
             // 这样档位改 max_seq 时上界跟着走,不必两处手改)
-            fi_plan_bake: cfg.kernel.fi_plan_bake.then_some(cfg.runtime.max_seq),
-            fi_plan_restore: cfg.kernel.fi_plan_restore,
+            fi_plan_bake: cfg.kernel.fi_plan.bakes().then_some(cfg.runtime.max_seq),
+            fi_plan_restore: !cfg.kernel.fi_plan.bakes(),
             ts_probe: cfg.kernel.ts_probe,
             // S2b 正名:env 新名优先,旧名 `OWL_GDN_SLOTS` 兼容(旧档脚本不炸)
             gdn_slots: owl_shared::env_reader::parse("OWL_MAX_ACTIVE_TURNS")
@@ -748,10 +734,6 @@ impl EngineKnobs {
             raw_completion: cfg.probes.raw_completion,
             sampler_enabled: cfg.sampling.mode == owl_shared::config::SamplerMode::Sampling,
             sampler: crate::sampler::SamplerCfg::from_sampling(&cfg.sampling),
-            gdn_dump_all: cfg.probes.gdn_dump_all,
-            pf_bisect: cfg.probes.pf_bisect,
-            pf_stages: cfg.probes.pf_stages,
-            pf_fin_check: cfg.probes.pf_fin_check,
             cuda: owl_cuda::DiagOpts::from_config(cfg),
             env: owl_models::env::EnvProvider::from_config(cfg),
         }
@@ -797,9 +779,7 @@ pub struct DraftCfg {
     pub lookup_nstrong: usize,
     pub lookup_agree: usize,
     /// verify taps 退回 last_hidden(排查开关)
-    pub notaps: bool,
     /// TAPDECL 二分臂(声明期 tapped 不挂输出槽)
-    pub tapdecl: bool,
     /// **TP 档放行投机**(`[spec] tp_draft`;缺省 false ⇒ `tp.rs` 的 v1 护栏仍拒)
     pub tp_draft: bool,
 }
@@ -827,8 +807,6 @@ impl Default for DraftCfg {
             lookup_nmax: 12,
             lookup_nstrong: 6,
             lookup_agree: 0,
-            notaps: false,
-            tapdecl: false,
         }
     }
 }
@@ -1865,8 +1843,7 @@ fn boot_post_check<D: DeviceClient>(
     // (实测:第二个请求收到「引擎退役」)。即"捕获失败 → eager 逃生"
     // 这条路径对 DFlash2 既不可用、也**死得太晚**(跑到一半才炸)。
     // ⇒ 收口为**装配期拒启**:要跑该档就显式 `[spec] depth = 0`
-    // 或 `[spec] notaps = true`(退 last_hidden,不需要图)。
-    // 注:`dflash_tap_count > 0` ⟺ (DFlash2 模式 && !notaps)。
+    // 注:`dflash_tap_count > 0` ⟺ DFlash2 模式(taps 是主路径;二分开关已退役)。
     if spec.mode == SpecMode::DFlash2
         && spec.dflash_tap_count > 0
         && graphs.verify_of(spec.depth).is_none()
@@ -1874,7 +1851,7 @@ fn boot_post_check<D: DeviceClient>(
         return Err(owl_iface::contract::ModelError::Msg(
             "DFlash2 spec 需要 verify 图(taps 输出),但本档未建图\
              ([graph] no_graph = true 或捕获失败)。请二选一:去掉 no_graph,\
-             或显式关闭该档([spec] depth = 0;或 [spec] notaps = true 退 last_hidden)"
+             或显式关闭该档([spec] depth = 0)"
                 .to_string(),
         ));
     }
@@ -1996,7 +1973,6 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
                 layers: rm.spec.layer_types.len(),
                 hidden: rm.spec.hidden,
             },
-            notaps: cfg.knobs.draft.notaps,
             // P2.1-a:本 rank 的 TP 计划(单卡 = None ⇒ 旧行为)
             tp: tp.as_ref().map(|c| c.plan),
             load: cfg.knobs.load.clone(),
@@ -2016,7 +1992,6 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         head_int8: matches!(
             cfg.knobs.head_quant,
             owl_shared::config::HeadQuant::RtnInt8Row
-                | owl_shared::config::HeadQuant::RtnInt8RowA8
         ),
         head_int4: cfg.knobs.head_quant == owl_shared::config::HeadQuant::RtnInt4G32,
         main_kv: Some(owl_models::kernel_env::KvCaps::from_env(&env)),
@@ -2109,14 +2084,11 @@ fn boot_pool_plan(
         // B-3e-2:部分驻留档**不带 XQA**(页表语义不共戴;见上方醒目告知)
         xqa_decode: matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
             && !cfg.knobs.select_partial,
-        xqa_prefill: cfg.knobs.env.attn.xqa_prefill,
         gdn_slots: cfg.knobs.gdn_slots,
         max_batch: cfg.knobs.max_batch,
         snap_max: cfg.knobs.snap_max,
         vram_target: cfg.knobs.vram_target,
         vram_reserve_mb: cfg.knobs.vram_reserve_mb,
-        dump_all: cfg.knobs.gdn_dump_all,
-        gdn_dbg: cfg.knobs.probes.gdn_dbg,
         // B-2:选择层视图面(**生产档也要** —— 视图是 decode 的消费方;
         // 与诊断面 `coverage_probe` 解耦)
         select_view: cfg.knobs.coverage_probe || cfg.knobs.select_decode,

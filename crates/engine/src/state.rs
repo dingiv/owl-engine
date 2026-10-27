@@ -196,7 +196,6 @@ pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     /// XQA 裸 decode 臂(SPEC_DEC=1 `M_TILESIZE=16`)
     pub xqa_decode: bool,
     /// **XQA prefill 臂**(chunked q=T;同一份 `M_TILESIZE=32` 实例化)
-    pub xqa_prefill: bool,
     /// GDN 行容量
     pub gdn_slots: usize,
     /// **合批上限**(B5.1;1 = 串行)。>1 ⇒ 分配批页表块 + seqs=N 注意力 scratch
@@ -207,10 +206,6 @@ pub(crate) struct PoolPlan {    /// 单会话容量(= max_seq_tokens)
     pub vram_target: f64,
     /// VRAM 预留 MiB
     pub vram_reserve_mb: u64,
-    /// GDN 画像 dump 全槽
-    pub dump_all: bool,
-    /// reset_gdn 后 GDN rec 格画像(诊断面;原 OWL_GDN_DBG)
-    pub gdn_dbg: bool,
     /// **选择层视图块表槽**(B-2;`OWL_COVERAGE_PROBE=1` = 召回点探针档)。
     /// true ⇒ 主池多分配一个 `[1, nb]` 的视图页表块(内容 = **选中块**的物理页
     /// 按时间序;每召回点重写),与全量块表 `bt` **并存**(两者都要在场:
@@ -285,15 +280,6 @@ impl StatePool {
         self.kv.write_gdn_tables(face, t_real, nt).await
     }
 
-    /// XQA prefill 表三件(见 [`KvBank::prefill_xqa`])。
-    pub(crate) async fn prefill_xqa<D: DeviceClient>(
-        &self,
-        face: &mut D,
-        xt: &crate::exec::prefill_chunk::XqaTables,
-        t: usize,
-    ) -> Result<Option<owl_models::module::XqaVerifyCtx>> {
-        self.kv.prefill_xqa(face, xt, t).await
-    }
 }
 
 /// **池几何 / 档位**(boot 期定型,运行期只读)。
@@ -317,11 +303,6 @@ pub(crate) struct PoolGeom {
     pub(crate) kv_fp8: bool,
     /// 每页 token 折叠因子(页内行布局;legacy = 1)
     x: usize,
-    /// GDN 画像 dump 全槽(knobs.gdn_dump_all)
-    #[allow(dead_code)] // 诊断面字段(写入后当前无读者)
-    dump_all: bool,
-    /// reset_gdn 后 rec 格画像([probes] gdn_dbg;诊断面)
-    gdn_dbg: bool,
 }
 
 /// **主 KV 池 + 页表 + attention scratch + 表槽**(运行期重写内容,地址恒定)。
@@ -472,50 +453,6 @@ impl KvBank {
         }))
     }
 
-    /// **XQA prefill 表三件**(页链 / 整请求长 / 因果位掩码)。
-    ///
-    /// 表件是**逐 chunk 物化**的临时块(`eval_ops` 往返同步;Htod 在 H2D 流、
-    /// 核在 COMPUTE 流,无跨流序 ⇒ 异步竞态会让核读到半写入表 —— 2026-10-03
-    /// 渐进腐败案同病史);semaphores/scratch 取池里的真块(单块几何下核
-    /// **结构上不解引用**它们,传真块只为"不隐瞒")。
-    ///
-    /// 无 XQA 资源面 = `None`(调用方按 `env.attn.xqa_prefill` 先行判门)。
-    pub(crate) async fn prefill_xqa<D: DeviceClient>(
-        &self,
-        face: &mut D,
-        xt: &crate::exec::prefill_chunk::XqaTables,
-        t: usize,
-    ) -> Result<Option<owl_models::module::XqaVerifyCtx>> {
-        let Some(px) = self.xqa.clone() else {
-            return Ok(None);
-        };
-        let pt_b = eval_ops(
-            TensorOps::from_host(Dtype::U32, vec![xt.page_table.len()], &crate::exec::u32s_le_bytes(&xt.page_table))
-                .step(),
-            face,
-        )
-        .await?;
-        let sl_b = eval_ops(
-            TensorOps::from_host(Dtype::U32, vec![1], &crate::exec::u32s_le_bytes(&[xt.seq_len])).step(),
-            face,
-        )
-        .await?;
-        let mk_b = eval_ops(
-            TensorOps::from_host(Dtype::U32, vec![xt.mask.len()], &crate::exec::u32s_le_bytes(&xt.mask)).step(),
-            face,
-        )
-        .await?;
-        Ok(Some(owl_models::module::XqaVerifyCtx {
-            page_table: TensorOps::of_block(pt_b.id, Dtype::U32, vec![xt.page_table.len()]),
-            seq_lens: TensorOps::of_block(sl_b.id, Dtype::U32, vec![1]),
-            mask: TensorOps::of_block(mk_b.id, Dtype::U32, vec![xt.mask.len()]),
-            semaphores: px.semaphores.clone(),
-            scratch: px.scratch.clone(),
-            q_seq_len: t,
-            max_seq_len: px.max_seq_len,
-            sm_count: px.sm_count,
-        }))
-    }
 }
 
 /// FI 表四件叶子(形状随本 chunk 用量;`kcs/vcs` 由池的层视图另取)。
@@ -1212,19 +1149,13 @@ impl StatePool {
         face: &mut D,
         gdn_slot: usize,
         step: u64,
-        all: bool,
     ) -> Result<Vec<String>> {
         let nl = self.gdn.gdns.len();
         let mut out = Vec::new();
         for (li, g) in self.gdn.gdns.iter().enumerate() {
             let last = li + 1 == nl;
-            // 全层扫 = 仅 cv;默认 = 首末层 cv+rec
-            if all && !last {
-                let line = self.profile_block(face, li, "cv", &g.conv_v, gdn_slot, step, false).await?;
-                out.push(line);
-                continue;
-            }
-            if !all && li != 0 && !last {
+            // 首末层 cv+rec(全层扫档 gdn_dump_all 已退役,2026-10-27)
+            if li != 0 && !last {
                 continue;
             }
             for (name, bn) in [("cv", &g.conv_v), ("rec", &g.rec)] {
@@ -1445,16 +1376,6 @@ impl StatePool {
             }
         }
         face.sync().await?;
-        // 临时诊断(§三十二 会话污染定位;[probes] gdn_dbg 启用,收口后删)
-        if self.geom.gdn_dbg {
-            let g = &self.gdn.gdns[0];
-            let row_elems = g.rec.1 / self.geom.gdn_slots;
-            let mut buf = vec![0u8; g.rec.1 * 4];
-            face.dtoh(&g.rec.0, &mut buf).await?;
-            let seg = &buf[gdn_slot * row_elems * 4..(gdn_slot + 1) * row_elems * 4];
-            let nz = seg.iter().filter(|&&b| b != 0).count();
-            owl_shared::log_debug!("gdn-dbg", "reset_gdn slot={gdn_slot} rec非零字节={nz}/{}", seg.len());
-        }
         Ok(())
     }
 
@@ -1834,8 +1755,6 @@ impl<'a> AllocCtx<'a> {
         let dflash = plan.spec_mode == crate::spec_runtime::SpecMode::DFlash2;
         let gdn_slots = plan.gdn_slots;
         let snap_max = plan.snap_max;
-        let dump_all = plan.dump_all;
-        let gdn_dbg = plan.gdn_dbg;
         let n_full = layer_types.iter().filter(|&&f| f).count();
         let n_gdn = layer_types.len() - n_full;
         // 页宽策略只推导一次（FixedAfter 的 spec/replay 缓冲与后面的池几何共用）
@@ -1999,7 +1918,7 @@ impl<'a> AllocCtx<'a> {
             plan,
             geom: PoolGeom {
                 dims, page, nb, nb_kv, paged, gdn_slots, fi_face, kv_fp8,
-                x, dump_all, gdn_dbg,
+                x,
             },
             kv_dt,
             kv_bytes_elem,
@@ -2263,7 +2182,7 @@ impl KvBank {
         };
         // **XQA 能力契约**(S6h):几何前提集中成表,不满足则**响亮告知**
         // (原实现静默 `None` —— 换模型后 XQA 消失且无一行日志)。
-        let xqa_want = plan.xqa_verify || plan.xqa_decode || plan.xqa_prefill;
+        let xqa_want = plan.xqa_verify || plan.xqa_decode;
         if xqa_want {
             if let Err(why) = xqa_caps(&dims, page, plan.kv) {
                 owl_shared::log_warn!(

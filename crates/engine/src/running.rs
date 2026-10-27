@@ -43,12 +43,6 @@ pub struct StepProbes {
     pub gdn_dump: bool,
     /// OWL_DEBUG(通用诊断:kv-dump/logits-dump/sample-dump)
     pub debug: bool,
-    /// OWL_PREFILL_CKSUM(prefill 校验和)
-    pub prefill_cksum: bool,
-    /// OWL_FACT_PROBE(逐轮事实值 mfact;UAF 案取证遗留 —— 无门控时
-    /// 每轮 ×9 个动态 tag 无限增殖(metrics tag 爆炸 + 每轮 host 开销),
-    /// 案结后默认关,2026-10-10 A1 复测踩中)
-    pub fact_probe: bool,
     /// B4:OWL_SPEC_DEGRADE_AFTER(m=0 连击降级阈值;0 = 禁用)
     pub degrade_after: usize,
     /// B4:OWL_SPEC_PROBE_EVERY(降级期探测周期 token 数,失败 ×2 退避)
@@ -57,33 +51,14 @@ pub struct StepProbes {
     pub trace_gate: bool,
     /// E3 收编(原热路径散落 var_os;boot 解析一次):DFlash2 诊断/回退族
     pub dflash_probe: bool,
-    /// 末边界额外哈希一个逻辑块的 K/V 页(诊断面;stage-in 内容校验)
-    pub view_hash_block: Option<usize>,
-    pub propose_eager: bool,
-    pub dflash_eager: bool,
-    pub dflash_noencode: bool,
-    pub dflash_dumb: bool,
     /// 渲染后 prompt 落盘诊断(原 OWL_PROMPT_DUMP;2026-10-15 收编)
     pub prompt_dump: bool,
-    /// reset_gdn 后 GDN rec 格画像(原 OWL_GDN_DBG;§三十二)
-    pub gdn_dbg: bool,
-    /// prefill H2D 叶子后流栅栏(A13 竞态排障;原 OWL_PF_FENCE)
-    pub pf_fence: bool,
     /// KV 页差分落点(原 OWL_KV_DUMP,同上收编)
     pub kv_dump_at: Option<usize>,
-    /// **B 轴调和/显存/索引/落盘的排障打印**(原散落的 `OWL_RECON_DBG` /
-    /// `OWL_VRAM_DBG` / `OWL_IDX_DBG` / `OWL_LIVE_DIAG` / `OWL_COV_DUMP` /
-    /// `OWL_STORE_HOOK_DEBUG` / `OWL_PF_TAPS`)。
-    ///
-    /// 收编理由:引擎内部**零 env 读取**(显式依赖律)—— 这些开关只影响
-    /// 打印量,统一在入口一次性解析,散点不再各读各的。
-    pub recon_dbg: bool,
-    pub vram_dbg: bool,
-    pub idx_dbg: bool,
+    /// 解释器活性收尾归因打印(原 `OWL_LIVE_DIAG`)
     pub live_diag: bool,
-    pub cov_dump: bool,
-    pub store_hook_dbg: bool,
-    pub pf_taps: bool,
+    // 2026-10-27 配置面剪枝:一次性排障旗标(ck/mfact/view-hash/propose-eager/
+    // dflash-*/gdn_dbg/pf_fence/B 轴六件)已随 `[probes]` 一起退役。
 }
 
 impl StepProbes {
@@ -95,30 +70,19 @@ impl StepProbes {
             gdn_dump: p.gdn_dump,
             // 既有命名:OWL_DEBUG(通用诊断;preset 的 [probes] debug 可覆盖)
             debug: p.debug || owl_shared::env_reader::flag("OWL_DEBUG"),
-            prefill_cksum: p.prefill_cksum,
-            fact_probe: p.fact_probe,
             degrade_after: cfg.spec.degrade_after,
             probe_every: cfg.spec.probe_every,
             trace_gate: p.trace_gate,
             dflash_probe: p.dflash_probe,
-            view_hash_block: p.view_hash_block,
-            propose_eager: p.propose_eager,
-            dflash_eager: p.dflash_eager,
-            dflash_noencode: p.dflash_noencode,
-            dflash_dumb: p.dflash_dumb,
             prompt_dump: p.prompt_dump,
-            gdn_dbg: p.gdn_dbg,
-            pf_fence: p.pf_fence,
+            // ⚠️ `0` = 关(与 full.toml 的文档口径一致):`Option` 会把 toml 的
+            // `kv_dump_at = 0` 解析成 **Some(0)** —— 那意味着"每个请求 pos 0
+            // 各 d2h 一页",是纯税(2026-10-27 配置面 review 抓到的现役 bug)。
             kv_dump_at: p
                 .kv_dump_at
-                .or_else(|| owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP")),
-            recon_dbg: p.recon_dbg,
-            vram_dbg: p.vram_dbg,
-            idx_dbg: p.idx_dbg,
+                .filter(|v| *v > 0)
+                .or_else(|| owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP").filter(|v| *v > 0)),
             live_diag: p.live_diag,
-            cov_dump: p.cov_dump,
-            store_hook_dbg: p.store_hook_dbg,
-            pf_taps: p.pf_taps,
         }
     }
 }
@@ -2924,23 +2888,6 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(owl_store::Applied::default());
         }
         let verdict = self.bank.rel.plan_need(need, &owl_store::Protected::default());
-        if self.boot.probes.store_hook_dbg {
-            owl_shared::log_debug!(
-                "hook",
-                "{:?} need={}槽/{}B free={}/{} host_free={} disk_free={} 整链候选={} 判 out={} in={} deny={:?}",
-                need.why,
-                need.slots,
-                need.snap_bytes,
-                self.bank.rel.leg.slots_free(),
-                self.bank.rel.leg.slots_total(),
-                self.bank.rel.leg.host_free_slots(),
-                self.bank.rel.disk.as_ref().map(|d| d.free_slots()).unwrap_or(0),
-                self.bank.rel.leg.host_chain_candidates(&[]).len(),
-                verdict.out.len(),
-                verdict.in_.len(),
-                verdict.deny
-            );
-        }
         if verdict.is_noop() {
             return Ok(owl_store::Applied::default());
         }

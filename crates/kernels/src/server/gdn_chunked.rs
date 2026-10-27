@@ -53,9 +53,6 @@ struct Scratch {
     // 序列表(cu|coff|idx)**不再驻留 runtime**:改由引擎按 t_real 写入持久槽
     // (P-6b,2026-10-15;见 run 内"序列表"段)。
     grave: Vec<ScratchBuf>,          // A1.7 坟场
-    /// 诊断仪(OWL_GDN_DIAG):**逐 call 打印**前 N 次(跨臂对齐比较用;
-    /// 按形状去重会看不到同臂逐 chunk 的演化)
-    diag_calls: usize,
 }
 
 /// cast 发射(block 256;handler 同款;自由函数免长借用)
@@ -73,125 +70,9 @@ fn cast_exec(
     )
 }
 
-/// **服务端面诊断旋钮**(进程级;后端 boot 期一次下发 —— 零 env 读取)。
-///
-/// ⚠️ **回读纪律(历史上两次踩中)**:本仪表用 `DeviceRes::download`
-/// (= `cuMemcpyDtoH`,**NULL 流**语义)—— 与 compute 流**无跨流序**,
-/// 不加 `res.stream()?.synchronize()` 会读到**旧值/全零**;即便加了
-/// sync,个别 run 仍观察到 stale(疑 host 跑在 GPU 前面)⇒ 判读时
-/// **同一量读两次比对**,不一致即弃用该次读数。
-///
-/// 背景:chunked 臂(六核)曾在**同臂同 T、数据不同**时呈「末行 logits 塔平」
-/// 式的塔陷(same prompt:T=512 塔陷 / T=64 正确),而 varlen 臂恒健康。
-/// 下列仪表只回答三个是非题(不猜;2026-10-14 A13 立案,已结):
-///   1. `g_cum` 是**chunk 局部**(每 chunk 从头累计,锯齿)还是**全局**累计?
-///   2. `g_cum` 的**域**是 nats 还是 log2(host 双口径重算对拍)?
-///   3. 跨 chunk 状态(h0→ht)有没有被 `exp(g_cum_last)` **清零**?
-///
-/// 全部缺省 = 全关(生产语义);名单串语义与原 env 一致:
-/// `touch` / `zero_scratch` 为空串 = 关,`"1"` / `"all"` = 全部区,
-/// 否则逗号分隔区名。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct GdnDiag {
-    /// 逐 call 打印前 N 次(原 `OWL_GDN_DIAG`)
-    pub on: bool,
-    /// 内容不变 dtoh+htod 往返(原 `OWL_GDN_TOUCH=<区名>`)
-    pub touch: String,
-    /// 每 call 前清零私有 scratch(原 `OWL_GDN_ZERO_SCRATCH`)
-    pub zero_scratch: String,
-    /// 每 call 新分配 scratch(原 `OWL_GDN_FRESH_SCRATCH`)
-    pub fresh_scratch: bool,
-}
-
-/// 诊断档快照(进程内单槽;boot 后冻结 —— 重入不覆盖)
-static DIAG: std::sync::OnceLock<GdnDiag> = std::sync::OnceLock::new();
-
-/// 诊断档下发失败(重入且值不同)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiagError {
-    /// boot 后冻结:首批值已生效,本次(不同的)下发被拒
-    AlreadyConfigured,
-}
-
-impl std::fmt::Display for DiagError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AlreadyConfigured => {
-                write!(f, "gdn: 诊断旋钮已冻结(boot 后一次),二次下发不同值被拒")
-            }
-        }
-    }
-}
-impl std::error::Error for DiagError {}
-
-/// 唯一的诊断旋钮写入点(重入同值 = 幂等;异值 = 响亮 [`DiagError`])
-pub fn configure_diag(d: GdnDiag) -> Result<(), DiagError> {
-    match DIAG.set(d.clone()) {
-        Ok(()) => Ok(()),
-        Err(_) if DIAG.get() == Some(&d) => Ok(()),
-        Err(_) => Err(DiagError::AlreadyConfigured),
-    }
-}
-
-fn diag() -> &'static GdnDiag {
-    DIAG.get_or_init(GdnDiag::default)
-}
-
-fn diag_on() -> bool {
-    diag().on
-}
-
-/// bf16 字节 → f32(零依赖律:本 crate 不带 half;bf16 = f32 高 16 位)
-#[inline]
-fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
-    f32::from_bits((u16::from_le_bytes([lo, hi]) as u32) << 16)
-}
-
-/// 诊断:全 scratch 清零开关(`gdn_zero_scratch`;空串 = 关)。
-/// 动机:boot warmup 用**未初始化输入**跑过本 handler(实测 raw g=-200/T=512)
-/// ⇒ 未写区可能残留 inf/NaN;真实调用若读到该区即被毒(且任何布局扰动都会
-/// 改掉重叠关系 = "布局运气"）。
-fn zero_scratch_on() -> bool {
-    !diag().zero_scratch.is_empty()
-}
-
-/// 诊断:`gdn_touch` 区名单(见调用点注)。名单串只在门内读。
-fn touch_on() -> bool {
-    !diag().touch.is_empty()
-}
-
-fn touch_spec() -> &'static str {
-    &diag().touch
-}
-
-fn zero_scratch_spec() -> &'static str {
-    &diag().zero_scratch
-}
-
-fn f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
-}
-
-/// (min, max, 非零个数, sum)
-fn stat(v: &[f32]) -> (f32, f32, usize, f64) {
-    let mut mn = f32::INFINITY;
-    let mut mx = f32::NEG_INFINITY;
-    let mut nz = 0usize;
-    let mut s = 0f64;
-    for &x in v {
-        if x < mn {
-            mn = x;
-        }
-        if x > mx {
-            mx = x;
-        }
-        if x != 0.0 {
-            nz += 1;
-        }
-        s += x as f64;
-    }
-    (mn, mx, nz, s)
-}
+// 2026-10-27 配置面剪枝:A13 那套 GDN 仪表(on/touch/zero_scratch/fresh_scratch)
+// 已整体退役 —— 调查早已结案,而它每次 call 带 sync + dtoh 回读(捕获窗内还不合法)。
+// 需要重开时按 `roadmap.local/26-10-15-A13-结案-NULL流上传.md` 的现场重建。
 
 /// 单 scratch 槽取/扩容(扩容 = 旧代入坟场;容量语义 = 字节)
 fn ensure_one(
@@ -201,16 +82,6 @@ fn ensure_one(
     bytes: usize,
     tag: &'static str,
 ) -> Result<u64, OpError> {
-    // 诊断(2026-10-14 A13;`[probes] gdn_fresh_scratch`):⇒ 每 call 新分配
-    // (alloc_zeros ⇒ 必零),用来判「复用 scratch 里有没有被读到 stale 区」
-    let fresh = diag().fresh_scratch;
-    if fresh {
-        if let Some(old) = cur.take() {
-            grave.push(old);
-        }
-        *cur = Some(res.alloc(bytes, tag)?);
-        return Ok(cur.as_ref().expect("刚就位").ptr);
-    }
     if cur.as_ref().is_none_or(|b| b.bytes < bytes) {
         if let Some(old) = cur.take() {
             grave.push(old);
@@ -382,85 +253,6 @@ impl KernelFamily for GdnChunkedRuntime {
         let o_b16 =
             ensure_one(&mut st.o_b16, &mut st.grave, res, t * hv * vd * 2, "gdn.o_b16")?;
 
-        // ── 诊断:`gdn_touch=<区名>` = **内容不变**的 dtoh+htod 往返搬运
-        // (只为把 host 挡住 ⇒ 分离「stale 内容」与「host-ahead 时序」两假设:
-        //  搬运后仍病 = 内容;搬运后变健康 = 时序窗口)──
-        if touch_on() {
-            // 名单在门内读(诊断档才付费)
-            let spec = touch_spec();
-            let all = spec == "1" || spec == "all";
-            let want = |n: &str| all || spec.split(',').any(|x| x.trim() == n);
-            let bufs: [(u64, usize); 15] = [
-                (g_cum, t * hv * 4),
-                (a_buf, t * hv * 64 * 4),
-                (ai_buf, t * hv * 64 * 2),
-                (w, t * hv * kd * 2),
-                (u, t * hv * vd * 2),
-                (h_buf, nt * hv * vd * kd * 2),
-                (v_new, t * hv * vd * 2),
-                (state_t, hv * kd * vd * 4),
-                (state_out, hv * kd * vd * 4),
-                (in_q, t * nk * kd * 2),
-                (in_k, t * nk * kd * 2),
-                (in_v, t * hv * vd * 2),
-                (in_beta, t * hv * 2),
-                (in_g, t * hv * 4),
-                (o_b16, t * hv * vd * 2),
-            ];
-            let names = [
-                "g_cum", "a", "ai", "w", "u", "h_buf", "v_new", "state", "state", "in", "in",
-                "in", "in", "g_cum", "o",
-            ];
-            for (i, (ptr, bytes)) in bufs.into_iter().enumerate() {
-                if !want(names[i]) {
-                    continue;
-                }
-                let mut buf = vec![0u8; bytes];
-                res.download(ptr, &mut buf)?;
-                res.upload(ptr, &buf)?;
-            }
-        }
-
-        // ── 诊断:全 scratch 清零(见 zero_scratch_on 注)──
-        if zero_scratch_on() {
-            // 区域过滤:`gdn_zero_scratch=1|all` = 全清;或逗号名单
-            // (h_buf/a/ai/w/u/v_new/o/g_cum/state/in*)= 只清该区(分区定位用)
-            let spec = zero_scratch_spec();
-            let all = spec == "1" || spec == "all" || spec.is_empty();
-            let want = |n: &str| all || spec.split(',').any(|x| x.trim() == n);
-            let bufs: [(u64, usize); 15] = [
-                (g_cum, t * hv * 4),
-                (a_buf, t * hv * 64 * 4),
-                (ai_buf, t * hv * 64 * 2),
-                (w, t * hv * kd * 2),
-                (u, t * hv * vd * 2),
-                (h_buf, nt * hv * vd * kd * 2),
-                (v_new, t * hv * vd * 2),
-                (state_t, hv * kd * vd * 4),
-                (state_out, hv * kd * vd * 4),
-                (in_q, t * nk * kd * 2),
-                (in_k, t * nk * kd * 2),
-                (in_v, t * hv * vd * 2),
-                (in_beta, t * hv * 2),
-                (in_g, t * hv * 4),
-                (o_b16, t * hv * vd * 2),
-            ];
-            let names = [
-                "g_cum", "a", "ai", "w", "u", "h_buf", "v_new", "state", "state", "in", "in",
-                "in", "in", "g_cum", "o",
-            ];
-            let mut zbuf: Vec<u8> = Vec::new();
-            for (i, (ptr, bytes)) in bufs.into_iter().enumerate() {
-                if !want(names[i]) {
-                    continue;
-                }
-                if zbuf.len() < bytes {
-                    zbuf.resize(bytes, 0);
-                }
-                res.upload(ptr, &zbuf[..bytes])?;
-            }
-        }
-
         // ── 输入解析(块句柄 → 设备指针)──
         let q_p = res.resolve(call.q().id)?;
         let k_p = res.resolve(call.k().id)?;
@@ -484,20 +276,6 @@ impl KernelFamily for GdnChunkedRuntime {
         cast_exec(res, exec, &f16bf16, v_p, t * hv * vd, in_v)?;
         cast_exec(res, exec, &f16bf16, beta_p, t * hv, in_beta)?;
         cast_exec(res, exec, &f16f32, g_p, t * hv, in_g)?;
-        // 捕获期禁入(2026-10-15 审查补):diag 走 sync + download,
-        // 两者在 CUDA stream capture 窗内均非法(见 DeviceRes::download 守卫)
-        let diag = diag_on() && st.diag_calls < 48 && !res.capturing().unwrap_or(false);
-        let diag_tag = if diag {
-            st.diag_calls += 1;
-            format!(
-                "#c{} cap={}",
-                st.diag_calls,
-                res.capturing().unwrap_or(false)
-            )
-        } else {
-            String::new()
-        };
-
 
         // ── 状态转置入:池 [HV,K,V] → fork [V,K](handler 同款)──
         let kv_vk = f("owl_state_kv_to_vk")?;
@@ -520,88 +298,6 @@ impl KernelFamily for GdnChunkedRuntime {
               LaunchVal::Ptr(idx_p), LaunchVal::I32(ti),
               LaunchVal::Ptr(scratch), LaunchVal::Ptr(scratch)],
         )?;
-
-        // ── 诊断仪(1):g 域/作用域 + 跨 chunk 态是否被清零 ──
-        if diag {
-            // ⚠️ 回读前必须显式 sync:memcpy_dtoh_sync 在 NULL 流,与 compute
-            // 流不同流 ⇒ 不 sync 会读到半写入/全零(本仓 2026-10-13 同病史)
-            res.stream()?.synchronize().map_err(|e| OpError::Launch {
-                op: OP.0.to_string(), stage: crate::contract::Stage::Load,
-                detail: format!("diag sync: {e:?}"),
-            })?;
-            let mut gb = vec![0u8; t * hv * 4];
-            res.download(in_g, &mut gb)?;
-            // 判别:in_k(本 call 刚 cast,必非零)与 g_cum 二次回读(睡 50ms)
-            let mut kb = vec![0u8; t * nk * kd * 2];
-            res.download(in_k, &mut kb)?;
-            let knz = kb.iter().filter(|&&b| b != 0).count();
-            let mut cb = vec![0u8; t * hv * 4];
-            res.download(g_cum, &mut cb)?;
-            let cnz1 = cb.iter().filter(|&&b| b != 0).count();
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            res.download(g_cum, &mut cb)?;
-            let cnz2 = cb.iter().filter(|&&b| b != 0).count();
-            crate::klog_debug!(
-                "gdn-diag",
-                "回读判别: in_k 非零字节={knz}/{} | g_cum 非零字节 立即={cnz1} 睡50ms后={cnz2}",
-                kb.len()
-            );
-            let (gv, cv) = (f32s(&gb), f32s(&cb));
-            let (gmn, gmx, gnz, _) = stat(&gv);
-            let (cmn, cmx, cnz, _) = stat(&cv);
-            crate::klog_debug!(
-                "gdn-diag",
-                "{diag_tag} T={t} NT={nt} raw g: min={gmn:.4} max={gmx:.4} nz={gnz}/{} | g_cum: min={cmn:.4} max={cmx:.4} nz={cnz}/{}",
-                gv.len(), cv.len()
-            );
-            // 逐 chunk(头 0):首/末值 —— 局部累计 = 每 chunk 首值≈0(锯齿);
-            // 全局累计 = 首值单调递减。同时给 host 双口径(local-nats /
-            // local-log2)重算,g_cum 与哪个逐元素对得上 = 域定谳
-            let h0i = |t_i: usize| t_i * hv; // 头 0 在 [T,HV] 里的下标
-            let mut dev_first = Vec::new();
-            let mut dev_last = Vec::new();
-            for i_t in 0..nt {
-                let (s, e) = (i_t * 64, (((i_t + 1) * 64).min(t)).saturating_sub(1));
-                dev_first.push(cv[h0i(s)]);
-                dev_last.push(cv[h0i(e)]);
-            }
-            let tail: Vec<String> = dev_first
-                .iter()
-                .zip(&dev_last)
-                .map(|(a, b)| format!("{a:.2}/{b:.2}"))
-                .collect();
-            crate::klog_debug!("gdn-diag", "头0 各 chunk g_cum 首/末: {}", tail.join(" "));
-            // host 重算(头 0):local cumsum(nats)与 local cumsum(log2)
-            let mut loc_nats = vec![0f32; t];
-            let mut loc_log2 = vec![0f32; t];
-            for i_t in 0..nt {
-                let mut a = 0f32;
-                let mut b = 0f32;
-                for k in (i_t * 64)..(((i_t + 1) * 64).min(t)) {
-                    a += gv[h0i(k)];
-                    b += gv[h0i(k)] * std::f32::consts::LOG2_E;
-                    loc_nats[k] = a;
-                    loc_log2[k] = b;
-                }
-            }
-            let md = |w: &[f32]| -> f32 {
-                (0..t).map(|k| (cv[h0i(k)] - w[k]).abs()).fold(0f32, f32::max)
-            };
-            crate::klog_debug!(
-                "gdn-diag",
-                "与 host 重算 max|Δ|: local-nats={:.3e} local-log2={:.3e}(×ln2 口径差)",
-                md(&loc_nats),
-                md(&loc_log2)
-            );
-            let mut h0b = vec![0u8; hv * kd * vd * 4];
-            res.download(state_t, &mut h0b)?;
-            let (amn, amx, anz, _) = stat(&f32s(&h0b));
-            crate::klog_debug!(
-                "gdn-diag",
-                "入态 h0([V,K] 转置后): min={amn:.4} max={amx:.4} nz={anz}/{}",
-                hv * kd * vd
-            );
-        }
 
         // ── 2. kkt:k/beta/g_cum → A(f32)【g 语义律:吃 cumsum 产物】──
         let f_kkt = f("kkt")?;
@@ -666,49 +362,6 @@ impl KernelFamily for GdnChunkedRuntime {
               LaunchVal::Ptr(cu_p), LaunchVal::Ptr(idx_p), LaunchVal::F32(scale),
               LaunchVal::I32(ti), LaunchVal::Ptr(scratch), LaunchVal::Ptr(scratch)],
         )?;
-
-        // ── 诊断仪(2):终态 ht 与出块 —— 态被清零/爆掉 = 一眼可见 ──
-        if diag {
-            res.stream()?.synchronize().map_err(|e| OpError::Launch {
-                op: OP.0.to_string(), stage: crate::contract::Stage::Load,
-                detail: format!("diag sync: {e:?}"),
-            })?;
-            // h_buf 逐 chunk block(inter-chunk 态):未写 = 全零(alloc_zeros)
-            // ⇒ o 核会读到 0(态贡献消失)= 塔平签名
-            let blk = hv * vd * kd * 2;
-            let mut hblk = vec![0u8; blk];
-            let mut hline: Vec<String> = Vec::with_capacity(nt);
-            for i_t in 0..nt.min(12) {
-                res.download(h_buf + (i_t * blk) as u64, &mut hblk)?;
-                let vs: Vec<f32> = hblk
-                    .chunks_exact(2)
-                    .map(|c| bf16_to_f32(c[0], c[1]))
-                    .collect();
-                let (_mn, mx, nz, _) = stat(&vs);
-                hline.push(format!("#{i_t}:{mx:.2}/{nz}"));
-            }
-            crate::klog_debug!(
-                "gdn-diag",
-                "{diag_tag} h_buf 逐 chunk(max|·|/非零数, blk={blk}B): {}",
-                hline.join(" ")
-            );
-            let mut hb = vec![0u8; hv * kd * vd * 4];
-            res.download(state_out, &mut hb)?;
-            let (hmn, hmx, hnz, _) = stat(&f32s(&hb));
-            let mut ob = vec![0u8; t * hv * vd * 2];
-            res.download(o_b16, &mut ob)?;
-            let ov: Vec<f32> = ob
-                .chunks_exact(2)
-                .map(|c| bf16_to_f32(c[0], c[1]))
-                .collect();
-            let (omn, omx, onz, _) = stat(&ov);
-            crate::klog_debug!(
-                "gdn-diag",
-                "终态 ht(fork [V,K]): min={hmn:.4} max={hmx:.4} nz={hnz}/{} | o(bf16→f32): min={omn:.4} max={omx:.4} nz={onz}/{}",
-                hv * kd * vd,
-                ov.len()
-            );
-        }
 
         // ── 8. cast-out:o(bf16)→ out(f16;层侧纯 f16 契约)──
         cast_exec(res, exec, &bf16f16, o_b16, t * hv * vd, out_p)?;

@@ -638,16 +638,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         if let Some(d2) = d2_arc7 {
             let ts = std::time::Instant::now();
-            // E5-DF4:图态优先(单图一轮 encode+propose;eager 回退 =
-            // OWL_DFLASH_EAGER=1 或图降级)
-            if self.dev.graphs.dflash.is_some() && !self.boot.probes.dflash_eager {
+            // E5-DF4:图态(单图一轮 encode+propose);图降级才走 eager 路
+            if self.dev.graphs.dflash.is_some() {
                 let d = self
                     .dflash_graph_round(m, pos, toks[m], lookup.as_ref())
                     .await?;
                 t_propose += ts.elapsed();
                 self.tspec()?.spec_drafts_host = Some(d);
             } else {
-            let noencode = self.boot.probes.dflash_noencode;
             let taps: Vec<owl_iface::contract::Bytes> = (0..self.dev.spec_rt.dflash_tap_count)
                 .map(|i| {
                     self.dev.graphs
@@ -661,9 +659,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if !noencode {
-                self.dflash_encode(&d2, &taps, m, pos).await?;
-            }
+            self.dflash_encode(&d2, &taps, m, pos).await?;
             let fp = pos + m + 1;
             let bonus = toks[m];
             let d = self.dflash_propose(bonus, fp, lookup.as_ref()).await?;
@@ -674,7 +670,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             t_propose += ts.elapsed();
             self.tspec()?.spec_drafts_host = Some(d);
             }
-        } else if self.dev.graphs.has_propose(depth) && !self.boot.probes.propose_eager {
+        } else if self.dev.graphs.has_propose(depth) {
             let ts = std::time::Instant::now();
             let d = self.propose_graph_step(m, &toks, pos, depth).await?;
             t_propose += ts.elapsed();
@@ -708,22 +704,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
 
         // ⑧ 逐 token 发射(eos/预算;事件入队,pump 逐个出)
-        {
-            // 崩坏排查打点(E5-DF4):per-boot per-round 事实值
-            // (OWL_FACT_PROBE 门控;案结后默认关 —— 动态 tag 每轮 ×9
-            // 无限增殖,metrics tag 爆炸 + 512 上限挤掉真账,2026-10-10)
-            if self.boot.probes.fact_probe {
-                let bs = self.boot.seq;
-                let rn = self.dev.spec_rt.stats.rounds;
-                mfact(bs, &format!("r{rn}.pos"), pos as u64);
-                mfact(bs, &format!("r{rn}.m"), m as u64);
-                mfact(bs, &format!("r{rn}.bonus"), bonus as u64);
-                for (i, (&dv, &iv)) in drafts.iter().zip(ids.iter()).take(depth).enumerate() {
-                    mfact(bs, &format!("r{rn}.d{i}"), dv as u64);
-                    mfact(bs, &format!("r{rn}.i{i}"), iv as u64);
-                }
-            }
-        }
         self.dev.spec_rt.stats.rounds += 1;
         self.dev.spec_rt.stats.sum_m += m;
         if m == depth {
@@ -1659,7 +1639,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if start >= full_blocks {
             return Ok(()); // 幂等:同一 fed 不重复拍(状态由同一 token 链唯一确定)
         }
-        let t_diag = std::time::Instant::now();
         // 2) 取新增整块的 token 段(活跃 turn 的链面;轮内调用带 `tail`)
         let seg = self.tokens_upto_with(start * page, full_blocks * page, tail)?;
         // 3) 推进身份链(段长不符 = 结构性拒,不静默;逐块哈希在同一处重放
@@ -1730,7 +1709,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 full_blocks,
             );
         }
-        let snap_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
         // **B 轴 B-0:同一处顺手采索引**(同一"块边界 + 链尾身份"事件 ⇒
         // 一次算身份、一次推进游标;索引与 GDN 快照共享边界身份)。
         // 逐块登记:物理页由**会话块表**定(池可被多会话共享;旧实现拿
@@ -1762,23 +1740,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 self.bank.rel.leg.set_owner(sid, &up.inserted);
                 mcnt("store.chain.inc.blocks", up.inserted.len() as u64);
                 mcnt("store.chain.inc.evicted", up.evicted.len() as u64);
-                // **A1 取证**(`OWL_RECON_DBG=1`):注册口三数 —— 送入 / 入树 / 被逐。
-                // 入树为 0 就是"块永远 refs==1 ⇒ 不可沉"的直接原因。
-                if self.boot.probes.recon_dbg {
-                    owl_shared::log_debug!(
-                        "chain-inc",
-                        "送 {} 片 · **入树 {}** · 被逐 {} · parent0={:?}",
-                        blk_slices.len(),
-                        up.inserted.len(),
-                        up.evicted.len(),
-                        parent0
-                    );
-                }
-            } else if self.boot.probes.recon_dbg {
-                owl_shared::log_debug!("chain-inc", "空:per_block={} 全被跳过", per_block.len());
             }
         }
-        let reg_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
         // **B 轴 B-0:索引采集**(同一"块边界"事件;物理页由会话块表定)
         if self.boot.cfg.knobs.index_probe {
             let mut todo: Vec<(owl_store::ChainHash, usize, usize)> =
@@ -1808,15 +1771,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 // 廉价边界：只记身份/页号，不触发 D2H（块在调和时受保护）。
                 self.sel.push_index_pending(todo);
             }
-        }
-        if self.boot.probes.vram_dbg {
-            let idx_ms = t_diag.elapsed().as_secs_f64() * 1000.0;
-            owl_shared::log_debug!(
-                "snap",
-                "fed={fed} 快照段 {snap_ms:.0}ms(含链/槽/拷贝/登记)· 增量登记 {:.0}ms · 索引 {:.0}ms",
-                reg_ms - snap_ms,
-                idx_ms - reg_ms
-            );
         }
         Ok(())
     }
@@ -1905,7 +1859,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         aux.extend_from_slice(&sin);
-        let t_upload = std::time::Instant::now();
         let face = self.dev.graphs.session.face_mut();
         let aux_b = face
             .htod(Dtype::U8, &vec![aux_len], &aux, "kvmem.index.aux")
@@ -1921,7 +1874,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 return Err(e);
             }
         };
-        let t_launch = std::time::Instant::now();
         let src = owl_models::kernel::source(entry).to_string();
         let launch_res: Result<()> = async {
             for (layer, (id, dt)) in k_layers.iter().enumerate() {
@@ -1965,7 +1917,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             Ok(())
         }
         .await;
-        let t_dtoh = std::time::Instant::now();
         let dtoh_res = match launch_res {
             Ok(()) => {
                 let mut bytes = vec![0u8; out_elems * 2];
@@ -1990,7 +1941,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 bytes.len()
             )));
         }
-        let t_reg = std::time::Instant::now();
         let mut off = 0usize;
         for (hash, _, _) in todo {
             let end = off + per_block_elems * 2;
@@ -2003,17 +1953,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let el = t_index.elapsed().as_secs_f64() * 1000.0;
         self.sel.note_index(el);
-        if self.boot.probes.idx_dbg {
-            let upload_ms = t_launch.duration_since(t_upload).as_secs_f64() * 1000.0;
-            let launch_ms = t_dtoh.duration_since(t_launch).as_secs_f64() * 1000.0;
-            let dtoh_ms = t_reg.duration_since(t_dtoh).as_secs_f64() * 1000.0;
-            let reg_ms = t_reg.elapsed().as_secs_f64() * 1000.0;
-            owl_shared::log_debug!(
-                "idx",
-                "GPU 批 {} 块 / {layers} 层：总 {el:.1}ms = 上传 {upload_ms:.1} + 发射 {launch_ms:.1} + D2H {dtoh_ms:.1} + 登记 {reg_ms:.1}",
-                n
-            );
-        }
         Ok(())
     }
 
@@ -2076,8 +2015,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.dev.graphs.session.face_mut();
             face.dtoh_batch(&pieces).await?
         };
-        let t_host = std::time::Instant::now();
-        let dtoh_ms = t_host.duration_since(t_index).as_secs_f64() * 1000.0;
         // **cos/sin 表在主机线程取好**(位置 = 逻辑块;`Rope` 句柄不跨线程共享)
         let ropes: Vec<Vec<(Vec<f32>, Vec<f32>)>> = todo
             .iter()
@@ -2169,14 +2106,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let el = t_index.elapsed().as_secs_f64() * 1000.0;
         self.sel.note_index(el);
-        if self.boot.probes.idx_dbg {
-            let host_ms = t_host.elapsed().as_secs_f64() * 1000.0;
-            owl_shared::log_debug!(
-                "idx",
-                "批 {} 块 / {layers} 层:总 {el:.1}ms = D2H {dtoh_ms:.1} + host {host_ms:.1} ({n_threads} 线程)",
-                todo.len()
-            );
-        }
         Ok(())
     }
 

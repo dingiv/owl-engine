@@ -60,10 +60,6 @@ pub(crate) fn u32s_as_f32(v: &[u32]) -> Vec<f32> {
     v.iter().map(|x| f32::from_bits(*x)).collect()
 }
 
-/// u32 → LE 字节(`TensorOps::from_host` 的 U32 表用)。
-pub(crate) fn u32s_le_bytes(v: &[u32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
 
 /// **手工 join 两 future**(S4 ⑤-K3):引擎 lib **不依赖 async 运行时/组合器**
 /// (只有 owl-* + half)—— 两 rank 的设备半必须**并发推进**(见
@@ -278,20 +274,6 @@ fn mfact(boot: u64, fact: &str, v: u64) {
         s.counter_set(&format!("b{boot}.{fact}"), v, file!(), line!());
     });
 }
-/// FNV-1a 64(逐层 checksum;与装载校验同款字批量混入)
-fn fnv_bytes(data: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    let mut chunks = data.chunks_exact(8);
-    for c in &mut chunks {
-        let w = u64::from_le_bytes(c.try_into().unwrap());
-        h = (h ^ w).wrapping_mul(0x100000001b3);
-    }
-    for b in chunks.remainder() {
-        h = (h ^ (*b as u64)).wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
 type Result<T> = std::result::Result<T, ModelError>;
 
 /// 增量解码(全量重解后取后缀差分;多字节字符跨 token 边界时以

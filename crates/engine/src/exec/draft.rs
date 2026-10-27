@@ -378,13 +378,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 }
             }
         }
-        // 诊断开关:OWL_DFLASH_DUMB=1 → 哑草稿(anchor 重复,跳过 draft
-        // 前向)—— 隔离「草稿值泄漏」vs「轮管线污染」(2026-10-07 恒等门
-        // AL=0 分歧排查;正式开关挂 C7)
-        // OWL_DFLASH_DUMB=1:零副作用哑草稿(不进 GPU;② 直接 host 表)
-        if self.boot.probes.dflash_dumb {
-            return Ok(vec![anchor; depth]);
-        }
         let mut probe_roots: Vec<TensorOps> = Vec::new();
         let probe_on = self.boot.probes.dflash_probe;
         let kv_len_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(pos + block) as f32]));

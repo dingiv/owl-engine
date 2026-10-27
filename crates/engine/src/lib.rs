@@ -90,7 +90,6 @@ pub fn head_plan_of(hq: owl_shared::config::HeadQuant) -> owl_models::module::Qu
         owl_shared::config::HeadQuant::Off => QuantPlan::F16,
         owl_shared::config::HeadQuant::RtnInt4G32 => QuantPlan::W4A16Awq,
         owl_shared::config::HeadQuant::RtnInt8Row => QuantPlan::I8W,
-        owl_shared::config::HeadQuant::RtnInt8RowA8 => QuantPlan::I8W8,
     }
 }
 /// embedding 表量化映射(P8;`None` = 检查点原表计划,`Some(I8W)` = int8)。
@@ -133,7 +132,7 @@ pub fn quant_plan_of(
         // 普通 safetensors 的 W4A8 尚无独立 plan(AWQ 布局是其唯一实现)
         (F::Safetensors, Q::W4a8) => owl_models::module::QuantPlan::W4A8Awq,
         // 未实现/错配(validate 已拒):保持 f16 直读,不 panic
-        (_, Q::W8a8i | Q::W8a8f | Q::W8a8 | Q::Q4k | Q::Iq4 | Q::Iq3) => {
+        (_, Q::Q4k | Q::Iq4 | Q::Iq3) => {
             owl_models::module::QuantPlan::F16
         }
     }
