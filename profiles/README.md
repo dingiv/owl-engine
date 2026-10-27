@@ -32,7 +32,7 @@ extends = [
 |---|---|---|
 | `qwen38_27b-3090.toml` | 8134 | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 63456（全特性稳定点）** / chunk 2048 |
 | `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144** / chunk 2048 |
-| `qwen38_27b-gguf_3090.toml` | 8136 | 单 3090 Ti / 27B **GGUF UD-IQ4_XS**（14.3GB，无视觉）/ DFlash2 d7 / fp8 KV / 前缀缓存 / **max_seq 196608（192k，本机单卡最长）** / chunk 2048。prefill 1633–1681 t/s、decode 127–135、128k prompt 零拒发；代价 = prefill 比 8134 的 a8 慢 ~24% |
+| `qwen38_27b-gguf_3090.toml` | 8136 | 单 3090 Ti / 27B **GGUF UD-IQ4_XS**（14.3GB）+ **mmproj-F16 视觉塔** / DFlash2 d7 / fp8 KV / 前缀缓存 / **max_seq 172032（168k，本机单卡最长）** / chunk 2048。prefill 1633–1681 t/s、decode 127–135、128k prompt 零拒发；代价 = prefill 比 8134 的 a8 慢 ~24% |
 
 这条裁决被**测试钉住**：`crates/shared/src/profiles.rs::入口档面只允许三个常驻档`
 —— 往 `profiles/` 顶层再丢一个 `.toml` 就会红。置顶三档各占一张卡
