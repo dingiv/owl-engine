@@ -9,7 +9,9 @@
 //!    (gname/leak_name 由此绝迹);
 //! ② **拾取**:按 (硬件档, dtype, 形状) 产出 [`KernelPick`]——名 +
 //!    grid/block/smem;上层描述语义,参数推导住这里;
-//! ③ **参数推导**:契约公式进代码(paged v1 的 smem 契约、delta_dec 的
+//! ③ **代际准入**:按 (ISA 族 × 代际 × spec 形状) 判"这核该不该在本卡跑"
+//!    —— 规则表 `crate::admit`,出口 [`KernelPick::admit`](判据不散在调用点);
+//! ④ **参数推导**:契约公式进代码(paged v1 的 smem 契约、delta_dec 的
 //!    kd 项……)——硬编码参数事故面(smem 手抄越界、页配对错配,三次
 //!    立案)在此结构性封死:调用点传形状,pick 出参数,错配 = 单测红,
 //!    不再有「难以察觉」。
@@ -523,11 +525,14 @@ impl KernelPick {
         if n.starts_with("owl_xqa_") || n.contains("_xqa_") {
             return Some(F::Xqa);
         }
-        // GDN:Triton chunked 六核 vs 原生标量/融合臂
-        if matches!(n, "cumsum" | "kkt" | "merge" | "wu" | "h" | "o") {
+        // GDN:**臂**只有两个入口 —— chunked(`gdn_chunked_delta_rule_fwd`,内部再发
+        // Triton 六核 `cumsum/kkt/merge/wu/h/o`)与标量(`gdn_scalar_delta_rule_fwd`)。
+        // `owl_gdn_*`(conv/gating/norm/decode_step 等)是**两臂共用的子核**,
+        // 按臂判族会误判 ⇒ 不设门(臂级门在 boot pre-check 那边覆盖)。
+        if n.starts_with("gdn_chunked_") || matches!(n, "cumsum" | "kkt" | "merge" | "wu" | "h" | "o") {
             return Some(F::GdnChunked);
         }
-        if n.starts_with("owl_gdn_") || n.starts_with("gdn_scalar_") {
+        if n.starts_with("gdn_scalar_") {
             return Some(F::GdnScalar);
         }
         if n.contains("cublas") {

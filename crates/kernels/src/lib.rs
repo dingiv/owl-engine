@@ -118,7 +118,4 @@ pub fn dispatch(arch: Arch) -> &'static str {
 
 pub mod driver;
 
-// **代际准入表由 driver(选核唯一出口)拥有** —— 外部一律走 `driver::OpFamily`
-// 这条路径,不要从 crate 根另开一条(2026-10-27 用户裁决:别在选核外面另起一套)。
-pub use driver::{Admit as DriverAdmit, OpFamily as DriverOpFamily};
 

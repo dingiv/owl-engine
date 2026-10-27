@@ -1,7 +1,8 @@
 //! **代际准入门(引擎侧投影)** —— 把「当前配置」投影成 [`OpFamily`] 并逐项裁决。
 //!
 //! 分工:
-//! - 判据表住 `owl_kernels::admit`(零依赖单源);
+//! - 判据表由 **`owl_kernels::driver::{OpFamily, Admit, AdmitCtx}`** 拥有
+//!   (选核唯一出口 = `KernelPick`;规则本体在 `crates/kernels/src/admit.rs`);
 //! - **映射**住这里(`QuantPlan` / `EnvProvider` 都属 models ⇒ 不把引擎概念塞进 kernels);
 //! - 调用点 = 引擎 boot(拒启)+ 预检(可选)。
 //!
