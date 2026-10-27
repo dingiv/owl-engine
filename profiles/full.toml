@@ -61,10 +61,18 @@ queue_wait_ms = 0
 # 上下文上限(token)
 max_seq = 131072
 # 预填块长 / 尾块合并阈值(剩余 ≤ chunk + tail_merge ⇒ 一口气吃完)
-# ⚠️ 不要直接把 chunk 拉到 2048/4096：Marlin 在 m>1024 会按 max_par 拆 M，
-#    每段各重读一遍完整权重；当前 512 不触发。改前先看 marlin-v2 的 split=。
+# 实测(2026-10-27,单 3090 / 27B AWQ / DFlash2 d7 / ctx 63456,**冷 boot 逐档**):
+#   chunk 512 / tail 512 : 4k 1320 · 8k 1308 t/s ; 32k 1173 t/s(TTFT 27.9s)
+#   chunk 1024 / tail 0  : 4k 1328 · 8k 1350 t/s
+#   chunk 2048 / tail 0  : 4k 1360 · 8k 1358 t/s ; 32k 1231 t/s(TTFT 26.6s)
+# ⇒ **2048 是最优档**(+3~5%);旧注"m>1024 会拆 M 更慢"已被本轮实测推翻。
+# ⚠️ **4096 不可用**:单 3090 在 prefix_cache 吃满池后,4096 块的 marlin 工作区
+#    (272MiB)会撞 vram 硬预算 ⇒ 请求直接 PoolExhausted。2048 的工作区 ≈136MiB,
+#    32k 连跑三次仍有余量(free ≈1.1G)。要再上去得先给预填留专用预算。
+# 尾块合并取 0:合并会把块撑到 chunk+tail(2048+512=2560)⇒ 工作区跟着变大,
+#    而收益只是"少一发尾块";稳态档不值得这个 OOM 边。
 prefill_chunk = 512
-prefill_tail_merge = 512
+prefill_tail_merge = 0
 # 跨会话合批上限(1 = 串行;>1 需 gdn_slots ≥ 它、单卡、无选择层)
 max_batch = 1
 # 相位时间片:每 slice_every 拍 decode 插一片 prefill(0 = 关)
@@ -86,18 +94,14 @@ mode = "single"
 # **禁 CUDA 序号**(序会漂)。空 = 自动挑空闲卡(single 1 张 / tensor 2 张);
 # 按列表序去重消费:["3090","3090"] = 两张不同的 3090。
 device = []
-# TP 通信数据腿:push(写对端)档(需 mode = tensor)
-tp_push = false
+# AR 拓扑档:v1(两核)| fused(非 fp8 单核)| ar2(非 fp8 小包 barrier-only;
+# 其余落 fused/v1)。原 tp_ar_fused / tp_ar2 / tp_push / tp_one_stage 四布尔
+# 已于 2026-10-27 单键化(前两个中性/无档使用的实验档直接剪掉)。
+tp_ar = "v1"
 # TP AR 载荷 fp8(两侧同档)
 tp_ar_f8 = false
 # lm_head 词表切(每 rank 只持半表;需 mode = tensor)
 tp_vocab_split = false
-# v1 两核融合档(AR 一核做完两段;需 mode = tensor)
-tp_ar_fused = false
-# barrier-only AR-2(小包 graph;≤64KiB/非 fp8;需 mode = tensor,与 tp_one_stage 互斥)
-tp_ar2 = false
-# 1-stage 对称 arena(结构更对但实测中性;需 mode = tensor,与 tp_push 互斥)
-tp_one_stage = false
 
 # ---------------------------------------------------------------------------
 # [model] —— 模型资产
@@ -113,12 +117,10 @@ format = "awq"
 #   safetensors/awq → w4a16 | w4a8 | w8a8i(暂未支持) | w8a8f(暂未支持)
 #   gguf            → q4k | iq4 | iq3
 quant = "w4a16"
-# lm_head 量化:off | rtn-int4-g32 | rtn-int8-row | rtn-int8-row-a8
+# lm_head 量化:off | rtn-int4-g32 | rtn-int8-row
 # 2026-10-22 用户裁决:int4 头太小,int8 为默认(质量优先;int4 仅显式覆盖)
 # int8 = W8A16:多 token 自动走 f16 Tensor Core(2026-10-22;HBM 读 int8、
 #   寄存器反量化、激活 f16),质量门 0.9896。
-# a8 = W8A8 诊断档:8-bit 走 SM86 int8 TC(无 fp8 TC);spec m=7/8
-#   质量门 0.6962(<0.95),且被 W8A16 TC 同速支配 ⇒ **不推荐**。
 head_quant = "rtn-int8-row"
 # embedding 表量化:f16(默认/对照) | i8(per-row;省 ~1.2G,仅 untied)
 embed_quant = "f16"
@@ -231,10 +233,6 @@ depth_min = 3
 depth_switch_ctx = 49152
 # T1b 滚动降档门(tokens/round = m+1;仅 adaptive 生效)
 adaptive_min_tpr = 3.0
-# verify 图 taps 退回 last_hidden(排查开关)
-notaps = false
-# TAPDECL 二分臂(声明期 tapped 不挂输出槽)
-tapdecl = false
 # TP 档放行投机(未验完的档不许静默放行)
 tp_draft = false
 # m=0 连击降级阈值(0 = 禁用)/ 降级后的探测窗口(tokens)
@@ -309,21 +307,20 @@ force_naive_prefill = false
 verify_arm = "v2"
 decode_arm = "fi"
 # 单图烘 plan(上界恒 = runtime.max_seq;true 需 fi_plan_restore = false + fi_cuda_graph = true)
-fi_plan_bake = true
-fi_plan_restore = false
+# plan 表权威:baked(图自携,上界恒 = max_seq;需 fi_cuda_graph)| host-sync
+# (缺省;图不烘表,引擎每步 fi_plan_sync 刷精确表)。原 fi_plan_bake +
+# fi_plan_restore 两布尔(validate 强制互反)已于 2026-10-27 收成单键。
+fi_plan = "baked"
 fi_cuda_graph = true
 # prefill-only FP8→F16 shadow(实验;默认关,仅 pool.kv_fp8=true 可用;
 # f16 主池 + 本键 = validate 拒启。首层按 runtime.max_seq 预留,
 # 100k≈200MiB/rank,262k≈512MiB/rank;decode/verify 仍走 fp8)
 prefill_shadow = false
-xqa_prefill = false
 fi_min_tokens = 1
 gdn_chunked = true
 gdn_scalar = false
 gdn_fused_decode = true
 gdn_fused_decode_v2 = true
-# W4A8 Marlin int8 m8 8-row 解码(实验;3080 A/B 无收益,默认关)
-marlin_w4a8_m8 = false
 # GGUF 小 n(装得进 L2)且 m ≤ TILE_MT ⇒ 让 MMVQ 赢(0 = 关)
 gguf_mmvq_l2_mib = 4
 # GGUF 预填臂(缺省全开;关 = 回退下一臂)
@@ -346,40 +343,16 @@ step_profile = false
 perf_level = "host"
 gdn_dump = false
 debug = false
-prefill_cksum = false
-fact_probe = false
 trace_gate = false
 dflash_probe = false
-propose_eager = false
-dflash_eager = false
-dflash_noencode = false
-dflash_dumb = false
-gdn_dump_all = false
-pf_bisect = false
-pf_stages = 0
-pf_fin_check = false
 raw_completion = false
 prompt_dump = false
-gdn_dbg = false
-pf_fence = false
 live_diag = false
-recon_dbg = false
-vram_dbg = false
-idx_dbg = false
-cov_dump = false
-store_hook_dbg = false
-pf_taps = false
-l3_audit = false
-gdn_diag = false
-gdn_touch = ""
-gdn_zero_scratch = ""
-gdn_fresh_scratch = false
 # 单步/粘滞调试门(需 --features stepgate 构建)
 step_gate = "off"
 step_gate_ms = 50
 step_gate_us = 0
 step_gate_every = 1
-kv_dump_at = 0
 
 # ---------------------------------------------------------------------------
 # [cuda] —— 设备面(图 / 同步 / 实例化旗标 / 发射账)
@@ -404,8 +377,6 @@ trace_ring = 0
 [cuda.graph_flags]
 # UPLOAD = 0b10(实例化后预热上传)
 upload = false
-# DEVICE_LAUNCH = 0b100(设备侧派发;派发税排查面)
-device_launch = false
 
 # ---------------------------------------------------------------------------
 # [log]

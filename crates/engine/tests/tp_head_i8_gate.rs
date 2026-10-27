@@ -89,7 +89,6 @@ fn head_quant_of(plan: QuantPlan) -> HeadQuant {
     match plan {
         QuantPlan::F16 => HeadQuant::Off,
         QuantPlan::I8W => HeadQuant::RtnInt8Row,
-        QuantPlan::I8W8 => HeadQuant::RtnInt8RowA8,
         other => panic!("tp_head_i8_gate 不支持 head plan {other:?}"),
     }
 }
@@ -108,11 +107,9 @@ fn flag(k: &str) -> bool {
 /// `OWL_TP_AR2=1` 显式开融合/小包 AR-2,供 nsys/round A/B 使用。
 fn tp_opts() -> TpOpts {
     TpOpts {
-        push: flag("OWL_TP_PUSH"),
         ar_f8: flag("OWL_TP_AR_F8"),
         ar_fused: flag("OWL_TP_AR_FUSED"),
         ar2: flag("OWL_TP_AR2"),
-        one_stage: flag("OWL_TP_1STAGE"),
     }
 }
 
@@ -236,8 +233,8 @@ async fn run_arm(
     assert!(r.has_peer(), "TP2 执行态必须带 peer 束");
     let opts = tp_opts();
     eprintln!(
-        "[tp-head] TpOpts: push={} ar_f8={} ar_fused={} ar2={} one_stage={}",
-        opts.push, opts.ar_f8, opts.ar_fused, opts.ar2, opts.one_stage
+        "[tp-head] TpOpts: ar_f8={} ar_fused={} ar2={}",
+        opts.ar_f8, opts.ar_fused, opts.ar2
     );
 
     // metrics 是进程级 OnceLock:必须在 turn 之前 init,否则 spec.* 全 0。
@@ -348,7 +345,6 @@ async fn run_arm(
             .collect();
         let n_v1 = cnt("tp.ar.v1");
         let n_fused = cnt("tp.ar.fused");
-        let n_push = cnt("tp.ar.push");
         let n_ar2 = cnt("tp.ar.ar2");
         eprintln!(
             "[tp-head] spec 账:rounds={rounds} m 直方图 [m0..m{}]={hist:?} q={} none={} reject={}",
@@ -358,7 +354,7 @@ async fn run_arm(
             cnt("spec.reject")
         );
         eprintln!(
-            "[tp-head] AR 路径账:v1={n_v1} fused={n_fused} ar2={n_ar2} push={n_push}"
+            "[tp-head] AR 路径账:v1={n_v1} fused={n_fused} ar2={n_ar2}"
         );
         if opts.ar2 {
             assert!(n_ar2 > 0, "开了 ar2 但一次都没走到");

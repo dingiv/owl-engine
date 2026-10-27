@@ -44,9 +44,8 @@ pub struct DiagOpts {
     /// 图实例化旗标(原 OWL_GRAPH_FLAGS;UPLOAD=2 / DEVICE_LAUNCH=4;
     /// 类型化位面经 OwlConfig.cuda.graph_flags → to_bits())
     pub graph_flags: u64,
-    /// **图自携 plan restore**(`[dispatch] fi_plan_restore`;缺省 true = 历史行为)。
-    /// `false` ⇒ 图不烘表,host 每步用 `fi_plan_sync` 刷当步精确表
-    /// (单图档 `[dispatch] fi_plan_bake` 的配套;配置层已校验二者不冲突)。
+    /// **图自携 plan restore**(=`[kernel] fi_plan = "host-sync"`;缺省 true = 历史行为)。
+    /// `false`(baked 档)⇒ 图不烘表,host 每步用 `fi_plan_sync` 刷当步精确表。
     pub fi_plan_restore: bool,
     /// **prefill-only FP8→F16 shadow**(`[kernel].prefill_shadow`)
     pub fi_prefill_shadow: bool,
@@ -71,15 +70,6 @@ pub struct DiagOpts {
     /// 由 `model.kind/quant/head_quant`、`pool.kv_fp8`、`spec`、`vision`、
     /// `runtime.tp_ordinals` 自动推导;`*`/Default = 全放行(诊断/测试)。
     pub tag_filter: owl_kernels::tag_filter::TagFilter,
-    /// **L3 事实面审计**(`[probes] l3_audit`;原 `OWL_L3_AUDIT` env)
-    pub l3_audit: bool,
-    /// **W4A8 Marlin int8 m8**(`[kernel] marlin_w4a8_m8`;默认 false)
-    pub marlin_w4a8_m8: bool,
-    /// **GDN chunked 诊断旋钮**(`[probes] gdn_*`;原 `OWL_GDN_*` env)
-    pub gdn_diag: bool,
-    pub gdn_touch: String,
-    pub gdn_zero_scratch: String,
-    pub gdn_fresh_scratch: bool,
 }
 
 /// **诊断档的缺省 = 全放行**(2026-10-20 修一个静默坑):
@@ -106,12 +96,6 @@ impl Default for DiagOpts {
             vram_budget_mb: None,
             trace_ring: 0,
             tag_filter: owl_kernels::tag_filter::TagFilter::wildcard(),
-            marlin_w4a8_m8: false,
-            l3_audit: false,
-            gdn_diag: false,
-            gdn_touch: String::new(),
-            gdn_zero_scratch: String::new(),
-            gdn_fresh_scratch: false,
         }
     }
 }
@@ -146,16 +130,10 @@ impl DiagOpts {
             graph_flags: c.graph_flags.to_bits(),
             capture_slab_mb: c.capture_slab_mb,
             trace_ring: c.trace_ring,
-            fi_plan_restore: cfg.kernel.fi_plan_restore,
+            fi_plan_restore: !cfg.kernel.fi_plan.bakes(),
             fi_prefill_shadow: cfg.kernel.prefill_shadow,
             fi_prefill_shadow_cap: cfg.runtime.max_seq,
             tag_filter: tag_filter_from_config(cfg),
-            marlin_w4a8_m8: cfg.kernel.marlin_w4a8_m8,
-            l3_audit: cfg.probes.l3_audit,
-            gdn_diag: cfg.probes.gdn_diag,
-            gdn_touch: cfg.probes.gdn_touch.clone().unwrap_or_default(),
-            gdn_zero_scratch: cfg.probes.gdn_zero_scratch.clone().unwrap_or_default(),
-            gdn_fresh_scratch: cfg.probes.gdn_fresh_scratch,
         }
     }
 }
@@ -187,15 +165,11 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
                     tags.push(T::QUANT_AWQ);
                 }
             }
-            // validate 已拒;这里保守只放通用量化核
-            QuantScheme::W8a8i | QuantScheme::W8a8f | QuantScheme::W8a8
-            | QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3 => {}
+            // GGUF 块型在这里不给 tag(上面的 format=Gguf 分支已放行)
+            QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3 => {}
         },
     }
-    if matches!(
-        cfg.model.head_quant,
-        HeadQuant::RtnInt8Row | HeadQuant::RtnInt8RowA8
-    ) {
+    if cfg.model.head_quant == HeadQuant::RtnInt8Row {
         tags.push(T::QUANT_INT8);
         tags.push(T::FEAT_HEAD);
     }

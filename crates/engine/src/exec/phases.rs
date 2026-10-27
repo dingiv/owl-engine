@@ -614,31 +614,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // GDN 快照拍摄(**唯一入口** `capture_gdn_snap`:链推进 + 增量登记 +
             // 索引采集 + 快照;内部已 TP 感知 —— peer 在场时两 rank 各拍各自的池,
             // store 的 state 账仍单份)。
-            let t_snap = std::time::Instant::now();
             self.capture_gdn_snap(sid, new_fed, snap_keep, index_now).await?;
-            let snap_ms = t_snap.elapsed().as_secs_f64() * 1000.0;
-            // **边界相位拆分**(`OWL_VRAM_DBG=1`;2026-10-19 A3):
-            // 边界 = 快照拍摄(链哈希 + GDN 拷贝 + 登记)‖ 索引采集 ‖ B 轴(打分/选择/视图/调和)。
-            let dbg = self.boot.probes.vram_dbg;
             // ── B 轴选择层(生产面 + 可选诊断面)──
             // 必须**晚于**边界事件:索引/快照刚登记完,候选块才齐(§8.4)。
             // 两扇门:`select_decode`(生产)= 打分/选择/视图/调和;
             // `coverage_probe`(诊断)= 额外算真实质量与覆盖率读数。
             if self.boot.cfg.knobs.coverage_probe || self.boot.cfg.knobs.select_decode {
                 // 末边界/下一边界预测已在**拍快照之前**算好(`last_boundary`)
-                let t_cov = std::time::Instant::now();
                 self.coverage_analyze(sid, new_fed, last_boundary).await?;
-                if dbg {
-                    let cov_ms = t_cov.elapsed().as_secs_f64() * 1000.0;
-                    owl_shared::log_debug!(
-                        "vram",
-                        "边界@{new_fed}: 快照 {snap_ms:.0}ms + B 轴 {cov_ms:.0}ms"
-                    );
-                }
-            } else if dbg {
-                owl_shared::log_debug!(
-                    "vram",
-                    "边界@{new_fed}: 选择层关,无索引/B 轴");
             }
         }
         // ── **KVMem 最终 query replay**(P0;2026-10-23)──────────────
@@ -729,16 +712,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("prefill.bnd", t_bnd.elapsed());
         // **逐 chunk 显存轨迹**(`OWL_VRAM_DBG=1`;262k 冲刺的取证面):
         // live/free 测在**边界之后** —— 判“中间件是否归还”。计时已改走 metrics。
-        if self.boot.probes.vram_dbg {
-            owl_shared::log_debug!(
-                "vram",
-                "chunk@{} t={} ⇒ live={} MiB · 驱动 free={} MiB",
-                base,
-                chunk_ids.len(),
-                owl_shared::vram::live_bytes() >> 20,
-                owl_shared::vram::free_bytes() >> 20,
-            );
-        }
         self.turns.active_mut()?.fed += chunk_ids.len();
         if !is_last {
             // 块落定,无文本产出 —— 不谎报 Idle
@@ -1500,7 +1473,7 @@ if self.dev.graphs.session.has_input("sel_pt") {
         }
         let lines = {
             let face = self.dev.graphs.session.face_mut();
-            self.dev.pool.gdn_slot_profile(face, gdn_slot, step, self.boot.cfg.knobs.gdn_dump_all).await?
+            self.dev.pool.gdn_slot_profile(face, gdn_slot, step).await?
         };
         for l in lines {
             // GDN 画像行(probes.gdn_dump 门内;行体自含格式,只挂 tag)

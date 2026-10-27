@@ -692,14 +692,9 @@ async fn actor_main(
                     vec![engine, engine1],
                     vec![model0, model1],
                     owl_engine::TpOpts {
-                        push: config.tp_push,
                         ar_f8: config.tp_ar_f8,
-                        ar_fused: config.tp_ar_fused,
-                        ar2: config.tp_ar2,
-                        // 1-stage 对称 arena(§35):结构更对但实测中性 ⇒ 缺省关;
-                        // 2026-10-21 起走配置键(原 env `OWL_TP_1STAGE` 已退场)。
-                        // 与 push 互斥、需 tp_ordinals —— `validate` 已拒非法组合。
-                        one_stage: config.tp_one_stage,
+                        ar_fused: config.tp_ar.uses_fused(),
+                        ar2: config.tp_ar.uses_ar2(),
                     },
                 )
                 .await?;
@@ -709,22 +704,11 @@ async fn actor_main(
                         "TP2 **AR fp8 载荷档**已开(runtime.tp_ar_f8):载荷 e4m3(1.031×)"
                     );
                 }
-                if config.tp_push {
+                if config.tp_ar != owl_shared::config::TpArMode::V1 {
                     owl_shared::log_info!(
                         "boot",
-                        "TP2 **push 档**已开(runtime.tp_push):数据腿 = 写对端槽(RW 别名)"
-                    );
-                }
-                if config.tp_ar2 {
-                    owl_shared::log_info!(
-                        "boot",
-                        "TP2 **barrier-only AR-2**已开(tp_ar2;小包 graph ≤64KiB/非 fp8)"
-                    );
-                }
-                if config.tp_one_stage {
-                    owl_shared::log_info!(
-                        "boot",
-                        "TP2 **1-stage 对称 arena**已开(runtime.tp_one_stage;§35 实验档)"
+                        "TP2 **AR 拓扑档** = {} (非 fp8 梯级:fused→ar2;fp8 恒 v1 两核)",
+                        config.tp_ar.as_str()
                     );
                 }
                 owl_shared::log_info!(

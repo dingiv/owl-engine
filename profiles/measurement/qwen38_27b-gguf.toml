@@ -4,17 +4,16 @@
 # 组成 = 生产档同款外设(FP8 KV / FI 图 / 前缀缓存),只换模型与关投机。
 #
 # 用法:
-#   单卡: ./target/release/server -p profiles/qwen38_27b-gguf.toml
-#   TP2 : ./target/release/server -p profiles/qwen38_27b-gguf.toml \
+#   单卡: ./target/release/server -p profiles/measurement/qwen38_27b-gguf.toml
+#   TP2 : ./target/release/server -p profiles/measurement/qwen38_27b-gguf.toml \
 #           --set parallel.mode=tensor --set parallel.device='["3090","3090"]' \
-#           --set parallel.tp_ar_f8=true --set parallel.tp_ar_fused=true \
-#           --set parallel.tp_ar2=true
+#           --set parallel.tp_ar_f8=true --set parallel.tp_ar='"ar2"' 
 extends = [
-  "full.toml",
-  "parts/model/27b-gguf-q4km.toml",
-  "parts/hardware/3090-single.toml",
-  "parts/kernel/fi-graph.toml",
-  "parts/pool/fp8.toml",
+  "../full.toml",
+  "../parts/model/27b-gguf-q4km.toml",
+  "../parts/hardware/3090-single.toml",
+  "../parts/kernel/fi-graph.toml",
+  "../parts/pool/fp8.toml",
 ]
 
 [server]

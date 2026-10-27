@@ -250,7 +250,7 @@ pub(crate) struct FleetBoot<'a> {
     pub(crate) rope: owl_models::layers::rope::Rope,
     /// 引擎级 spec 运行态(模式/深度/草稿器/草稿 rope/tap 开关)
     pub(crate) spec: &'a SpecRuntime,
-    /// boot 旋钮(no_graph/ts_probe/capture_slab/debug/draft.notaps/tapdecl)
+    /// boot 旋钮(no_graph/ts_probe/capture_slab/debug)
     pub(crate) knobs: &'a EngineKnobs,
 }
 
@@ -584,7 +584,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let xqa_decode_ctx = if xqa_decode_on { pool.xqa_ctx() } else { None };
         let xqa_dec_sem_n = if xqa_decode_on { pool.xqa_sem_n() } else { 0 };
         // B4:decode 图 taps(DFlash2 降级期逐 token 草稿同步的取数面;
-        // notaps 同款逃生开关)。tapped_hidden 零额外计算,
+        // tapped_hidden 零额外计算,
         // 仅多 5 个 [1,hidden] 输出槽写;非 dflash 走原 forward(拓扑不变)
         let decode_taps = boot.spec.dflash_tap_count > 0;
         let fi_kcv: (Vec<TensorOps>, Vec<TensorOps>) = kv_caches.iter().cloned().unzip();
@@ -977,7 +977,6 @@ impl<D: DeviceClient> GraphFleet<D> {
         let env = boot.env;
         let tp = boot.tp.clone();
         let knobs = boot.knobs;
-        let spec_mode = boot.spec.mode;
         let depth1 = depth + 1;
         let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let model_v = Arc::clone(&boot.model);
@@ -1052,12 +1051,9 @@ impl<D: DeviceClient> GraphFleet<D> {
             });
         }
         // DFlash2 target taps(E5-DF2;层输出残差流,sglang capture 同语义)
-        // notaps → 退回 last_hidden(排查开关:隔离 taps 图)
+        // —— DFlash2 模式的主路径(子路径二分开关已于 2026-10-27 退役)
         let dflash_taps = boot.spec.dflash_tap_count > 0;
-        // TAPDECL:声明期 tapped(收集)但不挂输出槽 —— 二分「tap 节点
-        // 本身」vs「输出槽机制」(2026-10-07 恒等门排查)
-        let dflash_tap_decl =
-            dflash_taps || (spec_mode == crate::spec_runtime::SpecMode::DFlash2 && knobs.draft.tapdecl);
+        let dflash_tap_decl = dflash_taps;
         if dflash_taps {
             for i in 0..5 {
                 vouts.push(OutputSlot { name: format!("tap{i}"), shape: vec![depth1, dims.hidden], dtype: dims.dtype });

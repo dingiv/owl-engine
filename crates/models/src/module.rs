@@ -102,42 +102,6 @@ pub struct AttnFiBreak {
 
 /// **张量并行的运行期上下文**(S4 ③;引擎在装配期构造并注入 `ForwardCtx.tp`)。
 ///
-/// ★ **1-stage allreduce 的对称槽束**(2026-10-18;`TP2-施工设计.md` §35)。
-///
-/// 与 v1 的 staging(header + slot×2 **同一块**)的关键区别:**槽是独立块** ——
-/// 这样上游算子(GEMM)可以**直接写槽**(块是分配接口的最小单位),不需要
-/// "块内偏移"这层新接口。代价:每 rank 多 2 次 `peer_alloc`/`import`。
-///
-/// 分配与握手在**引擎装配期**(捕获窗外)⇒ 图只引用、不分配。
-#[derive(Debug)]
-pub struct TpArenaSlots {
-    /// 本端 payload 槽(**乒乓**;槽选择 = 调用序号 % 2 —— 建图期定死、烘进图)
-    pub own_slots: [crate::contract::Bytes; 2],
-    /// 对端 payload 槽的跨卡别名
-    pub peer_slots: [crate::contract::Bytes; 2],
-    /// 本端 header(64B;produced/consumed/err/wait_done/blocks_done)
-    pub own_hdr: crate::contract::Bytes,
-    /// 对端 header 的别名
-    pub peer_hdr: crate::contract::Bytes,
-    /// 单槽容量(字节)
-    pub slot_bytes: u64,
-    /// AR 调用序号(host 侧)。
-    ///
-    /// ⚠️ **它只在建图期推进**:图回放不重跑 host 代码 ⇒ 图内每个节点烘死的
-    /// 槽选择是**自洽**的(同一张图重复回放 ≡ 同一串节点),而设备侧的 credit
-    /// 游标是**相对量** ⇒ 二者互不依赖。**因此不需要任何 reset 钩子。**
-    pub call: std::sync::atomic::AtomicU64,
-}
-
-impl TpArenaSlots {
-    /// 取本次 AR 用的 `(own_slot, peer_slot)` —— 乒乓 + 递增序号
-    pub fn next_pair(&self) -> (crate::contract::Bytes, crate::contract::Bytes) {
-        use std::sync::atomic::Ordering;
-        let i = (self.call.fetch_add(1, Ordering::Relaxed) % 2) as usize;
-        (self.own_slots[i].clone(), self.peer_slots[i].clone())
-    }
-}
-
 /// 层结构体**零感知**(用户裁决:切分不进结构体):唯一读它的地方是
 /// 解释器求值尾部的 allreduce 注入(节点标记 = [`TensorOps::tp_role`]);
 /// 装载期的 `needs_ar` 查询 = 规则表单源。
@@ -153,14 +117,6 @@ pub struct TpCtx {
     pub peer: crate::contract::Bytes,
     /// staging 的 slot 字节数(`comm::ar::StagingLayout::slot_bytes`)
     pub slot_bytes: u64,
-    /// ★ **1-stage 对称槽束**(`None` = 走 v1 的 stage+reduce 两段;
-    /// `Some` = 融合核直接原地加对端槽 —— 见 `TpArenaSlots` 与 §35)
-    pub arena: Option<std::sync::Arc<TpArenaSlots>>,
-    /// ★ **push 档**(2026-10-18;§36.6/§36.7):`true` ⇒ allreduce 注入点把
-    /// `ArStageCall` / `ArReduceCall` 的 `own`/`peer` **实参对调** ——
-    /// stage 写**对端**槽、reduce 读**本端**槽 ⇒ 跨 PCIe 只剩**写**(posted)。
-    /// 要求别名块是 RW 导入的(`TpOpts::push` 会在握手期用 `peer_import_rw`)。
-    pub push: bool,
     /// ★ **fp8 载荷档**(§47 第二步;2026-10-19):`true` ⇒ AR 两条腿的载荷走
     /// e4m3(1B/元素 + 64 元素/尺度 f16 ⇒ 1.031× 原字节)。两侧必须同档
     /// (rank 同装配 ⇒ 同值)。缺省 false ⇒ 与历史逐字一致。

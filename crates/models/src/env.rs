@@ -269,9 +269,6 @@ pub struct AttnEnv {
     pub decode_arm: owl_shared::config::DecodeArm,
     /// FI 接管的 T 下限(`dispatch.fi_min_tokens`;t ≥ 此值走 FI 主臂)
     pub fi_min_tokens: usize,
-    /// prefill(chunked q=T)走 XQA(同一份 `M_TILESIZE=32` 实例化;缺省 false =
-    /// 只作 FI 缺口交接臂 —— 主路径换它净亏 4.1×,见 `DispatchCfg::xqa_prefill`)
-    pub xqa_prefill: bool,
     /// FlashInfer prefill 面 —— **生产恒真**(2026-10-13:配置面开关已移除,
     /// 没有不启用的情况)。本字段保留仅供**门/诊断**做读核 A/B
     /// (engine::tests::gpu_longctx_fi_direct_gate 用它切 FI/自研读核)
@@ -367,8 +364,6 @@ pub struct GgufEnv {
     pub mmq2: bool,
     pub mmq: bool,
     pub smem: bool,
-    /// cuBLAS 臂行窗行数(None = 96 MiB 预算档)
-    pub cublas_tile: Option<usize>,
 }
 
 impl Default for GgufEnv {
@@ -380,7 +375,6 @@ impl Default for GgufEnv {
             mmq2: true,
             mmq: true,
             smem: true,
-            cublas_tile: None,
         }
     }
 }
@@ -439,7 +433,6 @@ impl EnvProvider {
                 verify_arm: d.verify_arm,
                 decode_arm: d.decode_arm,
                 fi_min_tokens: d.fi_min_tokens,
-                xqa_prefill: d.xqa_prefill,
                 // FI **恒启用**(2026-10-13 用户令:移除开关,没有不启用的情况;
                 // 原 dispatch.flashinfer 已删)。
                 // ⚠️ 诊断 A/B(2026-10-14 A13 立案):`OWL_DIAG_NO_FI=1` 只服务
@@ -454,7 +447,6 @@ impl EnvProvider {
                 mmq2: d.gguf_mmq2,
                 mmq: d.gguf_mmq,
                 smem: d.gguf_smem,
-                cublas_tile: d.gguf_cublas_tile,
             },
             gdn: GdnEnv {
                 chunked: d.gdn_chunked,

@@ -1,0 +1,71 @@
+# ── 常驻档 ③:单张 3090 Ti / 27B **GGUF Q4_K_M** + DFlash2 d7(文本档)──────
+#
+# 为什么值得单独一档(2026-10-27 实测,GPU2 独占,冷 boot 逐档;同 prompt 域):
+#   指标(4k/8k/16k,256 tok 输出)   AWQ-INT4(档①)   GGUF Q4_K_M(本档)
+#   prefill                     1334 / 1311 / —    1688 / 1530 / 1655 t/s  (**+26%**)
+#   decode                        ~110–135          **174 / 164 / 135 t/s**
+#   TTFT                        3.13 / 6.14 / —    2.43 / 5.36 / 9.90 s     (**−22%**)
+# 解码快的原因不是权重小(19GB > AWQ 15GB),而是 **AL 高**:GGUF 主干 + 同一份
+# DFlash2 W4A16 草稿,实测 m7(满接受)占 71%、AL 5.58(档① AWQ 约 3.0),
+# 单轮 verify p50 35ms 但仍 5.58 tok/轮。
+#
+# 代价:
+#   · **上下文 72k**(AWQ 档 63.4k;但 GGUF 权重更大 ⇒ KV 预算更小,见下);
+#   · **本档不开视觉**(GGUF 的视觉塔是独立 mmproj:`../models/ggml-org/
+#     Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf`,约 1.1 GiB,开了要从
+#     KV 预算里扣 ≈35k ctx)。要图像请用档①/档②,或临时:
+#     --set model.vision=true --set model.vision_path=../models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf
+#   · 权重 19.0GB(Q4_K_M 有 38% 字节是 Q8_0)—— 没意义再换 IQ4_XS:
+#     实测 IQ4_XS 字节少 25% 但 MMVQ 内核效率低 23%,净 +4%(见 measurement 档)。
+extends = [
+  "full.toml",
+  "parts/model/27b-gguf-q4km.toml",
+  "parts/hardware/3090-single.toml",
+  "parts/kernel/fi-graph.toml",
+  "parts/pool/fp8.toml",
+]
+
+[server]
+# 与档①(8134 AWQ 单 3090)/档②(8135 双 3080 TP2)并存:
+# 本机有两张 3090 Ti ⇒ 8134 与 8136 各占一张(device 按"名字子串 + 空闲占比"
+# 自动挑;先起谁谁先占).要钉死物理卡用 UUID:
+#   --set parallel.device='["GPU-…"]'
+bind = "127.0.0.1:8136"
+
+[runtime]
+# 57344 = 1792 页。⚠️ 本档的显存账与档①**不同**:GGUF 权重 19.0GB 比 AWQ 的
+# 15.2GB 多吃 3.8GB ⇒ 留给 KV + 预填工作区的空间本来就小。实测教训:
+#   · 65536 + snap2 + reserve512:单发 32k 就连撞 24-48MiB 的硬预算拒发
+#     (owl_gdn_conv_fwd/owl_add 都是 2048 块的瞬态激活);
+#   · 本档 = 57344 + snap1 + reserve256 ⇒ boot 后驱动余量 ≈1.9GB,32k 连发三次无拒。
+max_seq = 57344
+max_concurrency = 1
+# 与档①同款:GGUF 的 prefill 走 MMQ2,块越大发射越少(实测 512→2048 +8~15%,
+# 4096 在 8k prompt 上会 prefill 边界降级 ⇒ 2048 是安全上限)。
+prefill_chunk = 2048
+prefill_tail_merge = 0
+# pi 不发 session 键:隐式会话 0 让工具轮有稳定会话;跨轮前缀由内容寻址缓存兜底。
+implicit_session = true
+
+[spec]
+# DFlash2 d7:草稿仍是 W4A16 pack-quantized 检查点(与主干格式无关;
+# tag filter 在 depth>0 + draft_path 时会同时放行 QUANT_GGUF 与 W4A16/AWQ)。
+depth = 7
+draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+lookup = true
+
+[pool]
+# snap1 + reserve256:给 2048 块的瞬态激活留余量(见 max_seq 注)
+snap_max = 1
+prefix_cache = true
+vram_reserve_mb = 256
+host_cache_mb = 10240
+# 快照腿宿主面关:本档 snap_max=1,槽一换就要「下沉→再 land」⇒ 会撞
+# store 的「块已在宿主层」不变量(实测一次,同 2026-10-24 粘性毒化案族)。
+# 只留设备侧 1 槽:边界快照被换掉就是丢了(单会话 + 活链前缀缓存够用)。
+snap_host_mb = 0
+# agent 消息边界快照(delim 空 = 模型 ChatFormat.im_open)
+snap_msg_boundary = true
+snap_msg_delim = ""
+snap_msg_min_gap = 2048
+snap_msg_min_span = 0

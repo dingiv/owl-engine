@@ -42,7 +42,6 @@ fn gguf_arms_from_env() -> owl_models::env::GgufEnv {
         mmq2: flag("OWL_GGUF_MMQ2"),
         mmq: flag("OWL_GGUF_MMQ"),
         smem: flag("OWL_GGUF_SMEM"),
-        cublas_tile: std::env::var("OWL_GGUF_CUBLAS_TILE").ok().and_then(|s| s.parse().ok()),
         ..Default::default()
     }
 }

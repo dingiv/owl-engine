@@ -262,7 +262,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             b.set("cuda.graph", false.into(), "intent.graphs = off(eager 直发)");
             b.set("cuda.graph", false.into(), "intent.graphs = off(eager 直发)");
             b.set("kernel.fi_cuda_graph", false.into(), "intent.graphs = off");
-            b.set("kernel.fi_plan_restore", true.into(), "intent.graphs = off");
+            b.set("kernel.fi_plan", "host-sync".into(), "intent.graphs = off");
             b.set("kernel.decode_arm", "v2".into(), "intent.graphs = off");
             b.set("kernel.verify_arm", "v2".into(), "intent.graphs = off");
             false
@@ -285,7 +285,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                     b.set("cuda.graph", true.into(), "graphs=auto(降级:保留普通 decode 图)");
                     b.set("cuda.graph", true.into(), "graphs=auto(降级:保留普通 decode 图)");
                     b.set("kernel.fi_cuda_graph", false.into(), "graphs=auto 降级");
-                    b.set("kernel.fi_plan_restore", true.into(), "graphs=auto 降级");
+                    b.set("kernel.fi_plan", "host-sync".into(), "graphs=auto 降级");
                     b.set("kernel.decode_arm", "v2".into(), "graphs=auto 降级");
                     b.set("kernel.verify_arm", "v2".into(), "graphs=auto 降级:verify 回 v2");
                     false
@@ -301,8 +301,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                         b.set("kernel.verify_arm", "v2".into(), "graphs=auto:无投机 ⇒ verify 臂不影响,留 v2");
                     }
                     b.set("kernel.fi_cuda_graph", true.into(), "graphs=auto:图档瓦(plan 形状恒定)");
-                    b.set("kernel.fi_plan_bake", true.into(), "graphs=auto:烘 plan 进图(上界 = max_seq)");
-                    b.set("kernel.fi_plan_restore", false.into(), "graphs=auto:表由窗外 fi_plan_sync 刷");
+                    b.set("kernel.fi_plan", "baked".into(), "graphs=auto:烘 plan 进图(上界 = max_seq) + 表由窗外 fi_plan_sync 刷");
                     true
                 }
             }
@@ -570,9 +569,6 @@ fn quant_name(q: super::QuantScheme) -> &'static str {
     match q {
         super::QuantScheme::W4a16 => "w4a16",
         super::QuantScheme::W4a8 => "w4a8",
-        super::QuantScheme::W8a8i => "w8a8i",
-        super::QuantScheme::W8a8f => "w8a8f",
-        super::QuantScheme::W8a8 => "w8a8",
         super::QuantScheme::Q4k => "q4k",
         super::QuantScheme::Iq4 => "iq4",
         super::QuantScheme::Iq3 => "iq3",
@@ -584,7 +580,6 @@ fn head_name(h: super::HeadQuant) -> &'static str {
         super::HeadQuant::Off => "off",
         super::HeadQuant::RtnInt4G32 => "rtn-int4-g32",
         super::HeadQuant::RtnInt8Row => "rtn-int8-row",
-        super::HeadQuant::RtnInt8RowA8 => "rtn-int8-row-a8",
     }
 }
 
@@ -712,8 +707,7 @@ mode = "greedy"
         assert_eq!(c.kernel.decode_arm, crate::config::DecodeArm::Fi);
         assert_eq!(c.kernel.verify_arm, crate::config::VerifyArm::V2);
         assert!(c.kernel.fi_cuda_graph, "graphs=auto ⇒ 开图");
-        assert!(c.kernel.fi_plan_bake);
-        assert!(!c.kernel.fi_plan_restore);
+        assert!(c.kernel.fi_plan.bakes());
         assert!(c.kernel.gdn_chunked);
 
         // 采样档

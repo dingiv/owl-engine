@@ -289,23 +289,11 @@ pub struct Exec {
     fns: HashMap<(BlobKey, &'static str), Arc<CudaFunction>>,
     /// 模块表:块身份 → 已载模块(同一 `.cu`/同一 cubin 的多核共享)
     modules: HashMap<BlobKey, Arc<cudarc::driver::CudaModule>>,
-    /// W4A8 Marlin int8 m8(配置显式下发;默认 false)
-    marlin_w4a8_m8: bool,
 }
 
 impl Exec {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// 配置面 `[kernel] marlin_w4a8_m8` 的显式注入点。
-    pub fn with_marlin_w4a8_m8(mut self, on: bool) -> Self {
-        self.marlin_w4a8_m8 = on;
-        self
-    }
-
-    pub fn marlin_w4a8_m8(&self) -> bool {
-        self.marlin_w4a8_m8
     }
 
     /// **构建期资产装载**(native 核唯一路径;资产 id 查表 → fatbin → 符号)。

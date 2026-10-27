@@ -142,7 +142,7 @@ impl MarlinRuntime {
     /// 强制 `use_fp32_reduce`,c_tmp 由 host 发射器流序自管(槽位仍须在
     /// 线格式里、仍有实体 —— F2 账长门照旧,见 [`check_pack_sizes`])
     /// —— 暗雷面在 C 侧已焊缝(见 `marlin_gemm_v2_awq_w4a8_ffi` 注)。
-    fn run_w4a8_awq(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+    fn run_w4a8_awq(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
         let call = crate::client::marlin::parse_gemm_w4a8_awq(msg)?;
         let r = |b: &crate::client::marlin::BlockRef| {
             res.resolve(b.id).map(|p| p + b.byte_offset)
@@ -178,7 +178,7 @@ impl MarlinRuntime {
                 m, n, k,
                 ws as *mut i32, call.groupsize, dev,
                 stream.cu_stream() as usize,
-                exec.marlin_w4a8_m8(),
+                false, // w4a8_m8:配置档已退役(2026-10-27;16-row 恒为生产档)
             )
         };
         // c_tmp 槽仍被 F2 门核账长(线格式契约),但**不进 FFI**(上面传 null)

@@ -267,14 +267,13 @@ mod candidate_tests {
             .collect();
         union.sort_unstable_by_key(|&(_, i)| i);
         for sd in 0..seeds {
-            let mut state = sd.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+            let state = sd.wrapping_mul(0x9E3779B97F4A7C15) | 1;
             let (mut r1, mut r2) = (state, state);
             let mut full = logits.to_vec();
             let a = sample(&mut full, cfg, &mut r1, &[]);
             let b = sample_from_candidates(&union, cfg, &mut r2);
             assert_eq!(a, b, "seed={sd} cfg={cfg:?}");
             assert_eq!(r1, r2, "RNG 消耗必须一致");
-            state = state.wrapping_add(0x9E3779B97F4A7C15);
         }
     }
 

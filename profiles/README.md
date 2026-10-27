@@ -22,18 +22,25 @@ extends = [
 - 卡位只走 `[parallel]`；`device` 用 BDF / UUID / 名字子串，**禁 CUDA 序号**。
 - **实验变体一律用 `--set`，不新建入口档**（见下"唯二常驻档门"）。
 
-## 唯二常驻档
+## 常驻档（三个）
 
-2026-10-24 用户裁决：入口档只留两个硬件形状，其余 27 个历史档删除
+2026-10-24 用户裁决：入口档只留硬件形状，其余 27 个历史档删除
 （收敛记录与找回方式：`roadmap.local/profiles-consolidation-2026-10-24.md`）。
+2026-10-27 增补第三档（GGUF 文本档，实测全面快于 AWQ 档）。
 
-| 文件 | 形状 |
-|---|---|
-| `qwen38_27b-3090.toml` | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 63456（全特性稳定点）** |
-| `qwen38_27b-3080_tp2.toml` | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144** |
+| 文件 | 端口 | 形状 |
+|---|---|---|
+| `qwen38_27b-3090.toml` | 8134 | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 63456（全特性稳定点）** / chunk 2048 |
+| `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144** / chunk 2048 |
+| `qwen38_27b-gguf_3090.toml` | 8136 | 单 3090 Ti / 27B **GGUF Q4_K_M**（无视觉）/ DFlash2 d7 / fp8 KV / 前缀缓存 / **max_seq 57344** / chunk 2048。prefill +26%、decode 135–174 t/s、TTFT −22%（比 8134）；代价 = 上下文更小 + 无视觉 |
 
-这条裁决被**测试钉住**：`crates/shared/src/profiles.rs::入口档面只允许唯二常驻档`
-—— 往 `profiles/` 顶层再丢一个 `.toml` 就会红。
+这条裁决被**测试钉住**：`crates/shared/src/profiles.rs::入口档面只允许三个常驻档`
+—— 往 `profiles/` 顶层再丢一个 `.toml` 就会红。置顶三档各占一张卡
+（3090×2 在 8134/8136，3080 对在 8135），互不干扰。
+
+`profiles/measurement/` = **测量档**（不计入入口档面；子目录不参与档名发现）：
+`qwen38_27b-gguf.toml` / `qwen38_27b-gguf-iq4.toml` 是 GGUF 裸性能口径，
+不是常驻形状。
 
 2026-10-25 生产档拉满（两档同形，硬件差异只留 max_seq/TP）：
 
@@ -91,8 +98,12 @@ cargo serve -p profiles/qwen38_27b-3090.toml
 ```text
 profiles/
   full.toml                    # 全量 schema + 注释（底座，不是档位）
-  qwen38_27b-3090.toml         # 常驻档①：单 3090 满血
+  qwen38_27b-3090.toml         # 常驻档①：单 3090 满血（AWQ + 视觉）
   qwen38_27b-3080_tp2.toml     # 常驻档②：双 3080 TP2 满血
+  qwen38_27b-gguf_3090.toml    # 常驻档③：单 3090 / GGUF Q4_K_M（文本，更快）
+  measurement/                 # 测量档（不算入口档面；GGUF 裸性能口径）
+    qwen38_27b-gguf.toml
+    qwen38_27b-gguf-iq4.toml
   parts/
     model/                     # 模型资产（path/format/quant/head；含 0.8B/4B/27B GGUF 与 AWQ）
     hardware/                  # 卡位 + TP 开关（3090-single / 3080-tp2）

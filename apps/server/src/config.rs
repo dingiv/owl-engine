@@ -368,20 +368,13 @@ pub struct ServerConfig {
     /// **合批上限**([runtime] max_batch;1 = 串行现状)。服务面用它做两件事:
     /// 会话闸的配套告警(隐式会话 + 合批 ⇒ 串行)与 `/debug/vram` 的如实报数。
     pub max_batch: usize,
-    /// **TP 通信数据腿:push 档**(runtime.tp_push;2026-10-18 §36.6)⇒ 交 `TpOpts`
-    pub tp_push: bool,
-    /// **TP AR 载荷 fp8 档**（runtime.tp_ar_f8；§47 第二步）⇒ 交 `TpOpts.ar_f8`
+    /// **TP AR 载荷 fp8 档**（parallel.tp_ar_f8；§47 第二步）⇒ 交 `TpOpts.ar_f8`
     pub tp_ar_f8: bool,
     /// **lm_head 词表切**（runtime.tp_vocab_split；P1.1）⇒ 装载面
     /// `ModelSpec::head_split`（每 rank 只持半表头；logits 由引擎 host 拼接）
     pub tp_vocab_split: bool,
-    /// **v1 两核融合档**（runtime.tp_ar_fused；§11.2）⇒ 交 `TpOpts.ar_fused`
-    pub tp_ar_fused: bool,
-    /// **barrier-only AR-2**（runtime.tp_ar2；2026-10-23）⇒ 交 `TpOpts.ar2`
-    pub tp_ar2: bool,
-    /// **1-stage 对称 arena 档**（runtime.tp_one_stage；§35）⇒ 交 `TpOpts.one_stage`。
-    /// 缺省 false（实测中性）；与 `tp_push` 互斥、需 `tp_ordinals`（`validate` 拒启）。
-    pub tp_one_stage: bool,
+    /// **AR 拓扑档**（parallel.tp_ar;v1|fused|ar2,2026-10-27 单键化）⇒ 交 `TpOpts`
+    pub tp_ar: owl_shared::config::TpArMode,
     /// 性能账落盘基名(--perf-dump;None = 不落盘)
     pub perf_dump: Option<PathBuf>,
     /// 性能分级(probes.perf_level,可被 --perf-level 覆盖)
@@ -503,12 +496,9 @@ impl ServerConfig {
             head_quant: cfg.model.head_quant,
             embed_quant: cfg.model.embed_quant,
             quant: cfg.model.quant,
-            tp_push: cfg.parallel.tp_push,
             tp_ar_f8: cfg.parallel.tp_ar_f8,
             tp_vocab_split: cfg.parallel.tp_vocab_split,
-            tp_ar_fused: cfg.parallel.tp_ar_fused,
-            tp_ar2: cfg.parallel.tp_ar2,
-            tp_one_stage: cfg.parallel.tp_one_stage,
+            tp_ar: cfg.parallel.tp_ar,
             max_concurrency: cfg.runtime.max_concurrency,
             max_batch: cfg.runtime.max_batch,
             perf_dump: None,
@@ -592,10 +582,6 @@ fn resolve_devices(par: &owl_shared::config::ParallelCfg, min_free_ratio: f64) -
                 picked.iter().map(|r| r.uuid.clone()).collect(),
             )
         }
-        // validate 已拒;到这里 = 内部不变量破了 ⇒ 响亮拒(不静默降级成单卡)
-        ParallelMode::Layer => Err(
-            "[parallel] mode = \"layer\" 暂未支持(config 层守门漏了)".to_string(),
-        ),
     }
 }
 

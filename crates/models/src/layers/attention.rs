@@ -1302,33 +1302,6 @@ impl Attention {
                                 );
                             }
                         }
-                        // XQA prefill 臂(**只接 FI 不覆盖的尾块**;自
-                        // `feat/prefill-graph` 合入,2026-10-15)。
-                        //
-                        // ⚠️ **位置就是判据**:本臂不许放在 FI 之前 —— CUPTI
-                        // 逐核实测(3038 tok / 6 chunk,同请求 A/B):XQA
-                        // `kernel_mha` **258.5ms** vs FI `BatchPrefill`
-                        // **63.0ms = 慢 4.1×**(每 chunk 43.0 vs 10.5ms)。
-                        // XQA 是 **decode 形状**的核(SPEC_DEC 的 q 维近乎免费
-                        // = 小 q 专属),q=T 时只有 ~9 TFLOPS(FI 40+);单算子
-                        // 探针里它 2–3× 于 `chunked knhd` 是真的 —— 但那个核
-                        // **只在 FI 缺席时**上阵,拿它当基线做选型方向就反了。
-                        //
-                        // 所以本臂的价值面 = **FI 的缺口**(t < fi_min_tokens
-                        // 尾块,或 `ctx.fi` 缺席;现役回落 `chunked knhd` 只有
-                        // 24 CTA):探针同形状对拍(T=128)XQA 0.355 vs chunked
-                        // 1.381ms = **3.9×**(`crates/kernels/tests/xqa_prefill_probe.rs`)。
-                        // 表件缺位(非 fp8 池/页≠32/特征关)⇒ 原路回落。
-                        if ctx.env.attn.xqa_prefill {
-                            if let Some(x) = ctx.xqa.as_ref() {
-                                if x.q_seq_len == tokens {
-                                    return self.xqa_specdec_arm(
-                                        SemanticKernel::XqaPrefill,
-                                        &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, x,
-                                    );
-                                }
-                            }
-                        }
                         // 长 ctx split(flash-decoding;2026-10-02):nparts ≥ 4
                         // (max_ctx > 2048)走分块路径;仅 hd256 核(hd128 变体
                         // 挂账)。2026-10-12:核按池档位直读主池(f16/fp8kv

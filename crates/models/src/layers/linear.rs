@@ -197,15 +197,9 @@ pub(crate) fn gguf_quant_gemm(
         // ⇒ 实测 26 TFLOPS(cuBLAS 同形状可达 55-65;见设计 §19.5 定位 ③)。
         // 现档 96 MiB ⇒ 大张量 1-2 块(每发几百 CTA);峰值 = 单块 scratch
         // (2·rows·k 字节,不进双缓冲 —— 发射序串行),27B 最大 96 MiB。
-        // `[dispatch] gguf_cublas_tile` 可强制行窗(诊断/调参用;None/0 = 预算档)
+        // 行窗 = 96 MiB 预算档(原 `gguf_cublas_tile` 诊断覆盖已退役,2026-10-27)
         let budget_rows = (96usize << 20) / (k.max(1) * 2);
-        let mut tile = budget_rows.clamp(128, 8 * 1024) / 64 * 64;
-        tile = tile.min(out_dim).max(64);
-        if let Some(v) = arms.cublas_tile {
-            if v > 0 {
-                tile = v;
-            }
-        }
+        let tile = (budget_rows.clamp(128, 8 * 1024) / 64 * 64).min(out_dim).max(64);
         // 首 tile 用**普通 Call**(由 eval 分配并 `track_new` 整块 y —— 账本上
         // "这个块是新分配的"必须只说一次);后续 tile 用 `CallDst` 写同一块
         // (同块别名,链式)。若首 tile 也用 CallDst,块从未被 `track_new`,
@@ -1116,9 +1110,11 @@ mod tests {
         assert_eq!(q.dtype, Dtype::I8, "量化出 int8(有符号)");
         // 量化 3 父:x(f16 激活) / mul(设备标量因子) / scales(每轮瞬态)
         assert_eq!(q.parents.len(), 3, "量化槽 3 父:x / mul / scales");
+        // 2026-10-26 A-1:`a_scales` 改 `Op::Uninit`(量化核逐 token 全写 ⇒ 不需要
+        // memset 零化;省图里一个 memset 节点)。**这条门随实现更新**,别再钉 Zeros。
         assert!(
-            matches!(q.parents[2].op, crate::ops::Op::Zeros),
-            "a_scales = 引擎按形状分配的瞬态(Op::Zeros);实得 {:?}",
+            matches!(q.parents[2].op, crate::ops::Op::Uninit),
+            "a_scales = 引擎按形状分配的瞬态(Op::Uninit,无 memset 节点);实得 {:?}",
             q.parents[2].op
         );
     }
