@@ -1072,13 +1072,61 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
             // 裁剪(末块对齐 + 快照在场)= **单源** `reuse_face`
             // (需求驱动保洁 §12.4 用同一份算式,不许各算一份)
-            let (m, _dev) = Self::reuse_face(
+            let (m_raw, _dev) = Self::reuse_face(
                 &self.bank.rel,
                 &hit,
                 &recall,
                 turn.prompt_ids.len(),
                 self.dev.pool.geom.page,
             );
+            // ── **超卖档的命中面上限**(2026-10-27 立案并修) ──
+            //
+            // 命中的**宿主块**要在 `execute_begin` 里**全量回灌**进设备(占位符
+            // 换成真槽,`write_bt` 之前必须换掉)⇒ 命中面一旦超过设备池容量,
+            // 回灌阶段必 `Exhausted`。
+            //
+            // 实测:池 1492 槽 / 48k prompt(=1500 块) 的**第二次**请求
+            // (前缀缓存全命中)必 `500 / 槽池耗尽(共 1492 槽,无自由槽)`;
+            // 第一次能跑是因为新算的块可以边算边沉,而回灌的块**全在视图
+            // 工作集里**、不可再沉。⇒ 命中面必须预留出"本 turn 还要新算的
+            // chunk + 工作集"的槽,尾部重算。
+            //
+            // 非超卖档(`pool ≥ ctx`)cap 恒大于链长 ⇒ 本段自动不生效。
+            let page = self.dev.pool.geom.page.max(1);
+            let cap = self.dev.pool.geom.nb.max(1);
+            let reserve = self.boot.cfg.prefill_chunk.div_ceil(page)
+                + self.boot.cfg.knobs.workspace_per_req.div_ceil(page)
+                + 2;
+            let max_hit = cap.saturating_sub(reserve).max(1);
+            let m = if self.boot.cfg.knobs.kvmem_virtualization && m_raw > max_hit {
+                // 裁完还要**向下对齐到有快照的边界** —— `cached_len` 与 GDN 态
+                // 必须成对:`restore_snap` 拿不到快照会响亮失败,而不是静默错值。
+                // (锚点节奏 = 每 `SNAP_EVERY` 个 chunk + 末边界 + msg 边界。)
+                let mut m = max_hit;
+                while m > 0
+                    && self
+                        .bank
+                        .rel
+                        .state
+                        .locate(owl_store::SnapKey::at_boundary(hashes[m - 1]))
+                        .is_none()
+                {
+                    m -= 1;
+                }
+                owl_shared::log_warn!(
+                    "kvmem",
+                    "前缀命中面 {m_raw} 块 > 池可容 {max_hit}(池 {cap} 槽 − 新写/工作集 {reserve}) \
+                     ⇒ 裁到 {m} 块(对齐全场快照),尾部重算(否则回灌阶段必槽池耗尽)"
+                );
+                owl_shared::counter_inc!("kvmem.prefix.hit_capped");
+                m
+            } else {
+                m_raw
+            };
+            if m == 0 {
+                // 裁到零 = 没有可用复用面 ⇒ 走全新链(语义与零命中一致)
+                return self.plan_fresh(turn);
+            }
             if self.boot.cfg.knobs.probes.debug {
                 // 裁剪结果 = 复用面真值(块);页对齐后 = 可复用 token 数
                 let found = if m > 0 {
