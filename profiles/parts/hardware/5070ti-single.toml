@@ -1,0 +1,8 @@
+# 硬件组件：单张 RTX 5070 Ti（Blackwell sm_120，16G）。
+#
+# 名字子串按列表序去重；**禁 CUDA 序号**（BDF / UUID / 名字子串三选一）。
+# 设备码代际不在这里配：cubin 是构建期产物，用 Cargo feature `arch-sm120`
+# （见 crates/kernels/build.rs 头注）—— 配置面与构建面不混。
+[parallel]
+mode = "single"
+device = ["5070"]
