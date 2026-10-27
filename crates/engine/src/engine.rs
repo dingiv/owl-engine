@@ -2189,11 +2189,11 @@ fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
             ));
         }
         if cfg.knobs.draft.depth > 0
-            && !matches!(cfg.knobs.env.attn.verify_arm, owl_shared::config::VerifyArm::V2)
+            && matches!(cfg.knobs.env.attn.verify_arm, owl_shared::config::VerifyArm::Xqa)
         {
             return Err(owl_iface::contract::ModelError::Msg(
-                "boot: `[kvmem] select_partial = true` + 投机只支持 verify_arm = v2 \
-                 (FI/XQA 的逐行视图页表未实现)"
+                "boot: `[kvmem] select_partial = true` + 投机不支持 verify_arm = xqa \
+                 (视图页表未实现);用 v2 或 fi"
                     .into(),
             ));
         }

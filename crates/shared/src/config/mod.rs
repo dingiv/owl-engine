@@ -2682,11 +2682,11 @@ impl OwlConfig {
                         .to_string(),
                 );
             }
-            if self.spec.depth > 0 && !matches!(self.kernel.verify_arm, VerifyArm::V2) {
+            if self.spec.depth > 0 && matches!(self.kernel.verify_arm, VerifyArm::Xqa) {
                 return Err(
-                    "[kvmem] select_partial = true 与 [spec] depth > 0 目前只支持\
-                     verify_arm = \"v2\":FI/XQA 的逐行视图页表未实现。\
-                     请改 v2(或关 select_partial / 关投机)。"
+                    "[kvmem] select_partial = true 与 [spec] depth > 0 不支持 \
+                     verify_arm = \"xqa\"(视图页表未实现)。\
+                     请改 v2 或 fi(或关 select_partial / 关投机)。"
                         .to_string(),
                 );
             }
@@ -2909,23 +2909,23 @@ mod tests {
         .expect("fi 臂 + 两件套 = 合规");
     }
 
-    /// **部分驻留 × 投机 = v2-only**(2026-10-23):视图化 verify 已落地,
-    /// v2/v2 放行;FI/XQA 的逐行页表未实现 ⇒ 拒启。
+    /// **部分驻留 × 投机 = v2/fi 双臂**(2026-10-27 放开 fi):视图化 verify
+    /// 原本只接了 v2(逐行 `bt8`);FI 的页表通道是 `fi_indices` 单链 +
+    /// `ctx_total`,换成视图链即可 ⇒ 实测 verify 每轮 51 → 24 ms。
+    /// XQA 的视图页表仍未实现 ⇒ 只拒它。
     #[test]
-    fn select_partial_spec_requires_v2() {
+    fn select_partial_spec_rejects_only_xqa_verify() {
         let base = "[kvmem]\nselect_partial = true\nselect_decode = true\n\
                     [spec]\ndepth = 7\n";
         OwlConfig::from_toml_str(&format!(
             "{base}[kernel]\nverify_arm = \"v2\"\ndecode_arm = \"v2\"\n"
         ))
         .expect("partial + spec + v2/v2 = 合规(视图化 verify)");
-        // FI 臂 = 单表,不支持逐行视图
-        let e = OwlConfig::from_toml_str(&format!(
+        OwlConfig::from_toml_str(&format!(
             "{base}[kernel]\nverify_arm = \"fi\"\ndecode_arm = \"v2\"\n\
              fi_plan = \"baked\"\nfi_cuda_graph = true\n"
         ))
-        .expect_err("partial + spec + fi verify 必须拒启");
-        assert!(e.contains("v2") && e.contains("select_partial"), "拒语要可行动: {e}");
+        .expect("partial + spec + fi verify = 合规(2026-10-27 接通视图链)");
         let e = OwlConfig::from_toml_str(&format!(
             "{base}[kernel]\nverify_arm = \"v2\"\ndecode_arm = \"fi\"\n\
              fi_plan = \"baked\"\nfi_cuda_graph = true\n"

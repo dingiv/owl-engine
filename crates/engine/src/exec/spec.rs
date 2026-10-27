@@ -19,6 +19,10 @@ struct VerifyViewTables {
     bt8: Vec<f32>,
     lens: Vec<f32>,
     slots: Vec<f32>,
+    /// **单链页表**(共用的那一条,= 最后一行最长的视图):FI 臂的
+    /// `fi_indices` 直接吃它 —— FI 的页表通道不是 `bt8` 矩阵,
+    /// 而是"一条页链 + `ctx_total`"。2026-10-27 加。
+    pages: Vec<u32>,
 }
 
 const SPEC_ADAPTIVE_WARMUP_ROUNDS: u32 = 8;
@@ -1061,7 +1065,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 &pages[pages.len().saturating_sub(6)..]
             );
         }
-        Ok(Some(VerifyViewTables { bt8, lens, slots }))
+        Ok(Some(VerifyViewTables { bt8, lens, slots, pages }))
     }
 
     /// **③ verify 轮**(S6d):`[anchor, d1..dk]` 一次前向。
@@ -1177,38 +1181,51 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ② 表四件套(q_cu/indices/indptr/last_len;u32 位型过线)
         let page_fi = self.dev.pool.geom.page;
         let ctx_total_fi = pos + target_rows;
+        // **视图档的 FI ctx 总长**(= 视图内可见 token 数;`None` = dense 旧路)。
+        // 取最后一行(视图内最长那行)的可见数 —— 与 `view_pages_at` 的链一致。
+        let view_tokens_fi: Option<usize> = view_tables.as_ref().map(|v| {
+            let page = page.max(1);
+            let _ = page;
+            // 行 r 的可见数 = view.tokens + (pos+r+1 - recall_pos);取末行
+            let last = pos + target_rows - 1;
+            v.lens.last().map(|f| *f as usize).unwrap_or(last + 1)
+        });
         // 门 = **槽在场**(槽属于**图**;判"某核在场"必须看节点/槽,不看旋钮)
         // 槽恒在 verify 图里声明(拓扑恒常);真正的“FI 臂是否消费”看单值臂。
         // **必须把槽在场与臂在场分开**:v2 档槽也在,但表不能按会话链铺
         // (overcommit 时链长 > 池页数,旧代码会写越 idx ⇒ panic)。
         let fi_slots_on = vg.has_input("fi_q_cu")
             && self.boot.cfg.knobs.env.attn.verify_arm.uses_fi();
-        if fi_slots_on && view_tables.is_some() {
-            return Err(ModelError::Msg(
-                "spec verify:FI 臂不支持逐行视图页表(select_partial);\
-                 请设 [kernel] verify_arm = \"v2\""
-                    .into(),
-            ));
-        }
+        // **FI 臂 × 视图(2026-10-27 接通)**:FI 的页表通道是
+        // `fi_indices`(一条页链)+ `ctx_total`(plan 的 key),**不是** `bt8`
+        // 矩阵 ⇒ 只要把"链"和"ctx 总长"换成视图那份,v2 的逐行视图就
+        // 等价成立(slots/lens 两条本来就已是视图)。此前这里直接拒,
+        // 于是 select_partial 只能吃 v2 分页核:实测 verify 每轮
+        // 51 ms(v2) vs 25 ms(FI) ⇒ decode 45 vs 92 t/s。
         let (fi_q_cu_v, fi_idx_v, fi_indptr_v, fi_ll_v): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
             if fi_slots_on {
                 // ⚠️ **必须写本轮真值**(verify 不吃桶化):T=8 的 plan split
                 // chunk 数必须与核运行期 `ceil_div(kv_len, chunk)` 一致,否则
                 // partial 行 stride 与 `merge_indptr` 打架(同参 A/B:桶 2048
                 // ⇒ 空文本/`!!!`、42.9 t/s;真值 ⇒ 连贯 71 t/s)。
-                let nb_used = ctx_total_fi
+                // 视图档:链 = 视图页链(单链),ctx 总长 = 视图长度。
+                let (fi_chain, ctx_total_use) = match (&view_tables, view_tokens_fi) {
+                    (Some(v), Some(vt)) => (v.pages.as_slice(), vt),
+                    _ => (bt_chain.as_slice(), ctx_total_fi),
+                };
+                let nb_used = ctx_total_use
                     .div_ceil(page_fi)
-                    .min(bt_chain.len())
+                    .min(fi_chain.len())
                     .max(1);
                 let mut idx = vec![0f32; self.dev.pool.geom.nb];
-                for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
+                for (i, b) in fi_chain.iter().take(nb_used).enumerate() {
                     idx[i] = f32::from_bits(*b);
                 }
                 (
                     vec![0.0, f32::from_bits(target_rows as u32)],
                     idx,
                     vec![0.0, f32::from_bits(nb_used as u32)],
-                    vec![f32::from_bits((ctx_total_fi - (nb_used - 1) * page_fi) as u32)],
+                    vec![f32::from_bits((ctx_total_use - (nb_used - 1) * page_fi) as u32)],
                 )
             } else {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())
@@ -1269,7 +1286,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 与草稿无关,卡点就在这一句)。单卡档 = 原路(零分支)。
         // FI 表两 rank 各自的图都要刷 ⇒ 规格传进 `verify_dev`。
         let fi_spec = if self.boot.cfg.knobs.fi_plan_bake.is_some() && fi_slots_on {
-            Some(self.dev.pool.fi_plan_spec(target_rows, ctx_total_fi))
+            Some(self.dev.pool.fi_plan_spec(
+                target_rows,
+                view_tokens_fi.unwrap_or(ctx_total_fi),
+            ))
         } else {
             None
         };
