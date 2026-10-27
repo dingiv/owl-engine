@@ -32,11 +32,11 @@
 | `crates/kernels/cu/gguf/vendor2/**` (head MMQ, tensor-core arm) | same | `dfcf18193` (2026-09-13) | **MIT** (`LICENSE`) | **OWNED** | 4 registered changes P1/P2/P2b/P3 — see [README](crates/kernels/cu/gguf/vendor2/README.md) |
 | `crates/kernels/triton/fla/**` (GDN chunked, 6 Triton kernels + import closure) | [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) | pinned via `triton/gdn_chunked_aot.json` | **MIT** | **FROZEN** | `triton_shim.py` is ours; AOT-compiled at build time by `triton/gdn_aot_compile.py` (no runtime compile) |
 | `crates/kernels/cu/flash_attn/vendor/flash_attn/src/**` (15 FA2 forward headers + c10 shim in `compat/`) | [vLLM vendored FlashAttention](https://github.com/vllm-project/vllm) (`.deps/vllm-flash-attn-src/csrc/flash_attn/src`) | vLLM `e20bccc642` (workspace checkout) | **BSD-3-Clause** | **FROZEN** | Only the forward header closure; adapter `owl_fa2.cu` is ours (host glue). Only `run_mha_fwd_hdim96<half,false>` is instantiated; see [`README`](crates/kernels/cu/flash_attn/README.md) |
-| `crates/kernels/cu/cutlass/include/**` (146 headers) | [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass) | workspace `repos/cutlass` `78e46228` (v4.8.0) | **BSD-3-Clause** | **FROZEN** | Separate shared header family; only the exact FA2 compile closure (6.2 MiB), not full CUTLASS; see [`README`](crates/kernels/cu/cutlass/README.md) + `closure.txt` |
+| `crates/kernels/cu/cutlass/include/**` (514 headers) | [NVIDIA CUTLASS](https://github.com/NVIDIA/cutlass) | workspace `repos/cutlass` `91843b71` (v4.8.1) | **BSD-3-Clause** | **FROZEN** | Separate shared header family. 闭包 = **FA2(hdim96) 146 + NVFP4(sm_120) 368 = 514 头 / 17 MiB（先跑通态，瘦身待办）**（全量是 838 头 / 28 MiB）。**不走 `CollectiveBuilder` 雨伞入口**（那条路 513 头，其中 225 个是其它架构/2.x 旧层）；EPILOGUE 与 tile 调度按上游源**抄进 `cu/nvfp4/` 再简化**。清单与理由见 [`README`](crates/kernels/cu/cutlass/README.md) + `closure.txt` |
 
 **Common admission checks** (verified per tree):
 
-- no cutlass **except the registered shared CUTLASS family** (`cu/cutlass`; 146-header closure), no PyTorch runtime, no TVM dependency;
+- no cutlass **except the registered shared CUTLASS family** (`cu/cutlass`; 162-header minimal-TU closure), no PyTorch runtime, no TVM dependency;
 - **no untracked `cudaMalloc`** (everything goes through our pool/arena — the first
   iron rule in `crates/backends/README.md`);
 - sources are committed; prebuilt `.a` files are not (nvcc generates them at build
