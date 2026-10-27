@@ -1,25 +1,30 @@
-# ── 常驻档 ③:单张 3090 Ti / 27B **GGUF Q4_K_M** + DFlash2 d7(文本档)──────
+# ── 常驻档 ③:单张 3090 Ti / 27B **GGUF UD-IQ4_XS** + DFlash2 d7(文本档)─────
 #
-# 为什么值得单独一档(2026-10-27 实测,GPU2 独占,冷 boot 逐档;同 prompt 域):
-#   指标(4k/8k/16k,256 tok 输出)   AWQ-INT4(档①)   GGUF Q4_K_M(本档)
-#   prefill                     1334 / 1311 / —    1688 / 1530 / 1655 t/s  (**+26%**)
-#   decode                        ~110–135          **174 / 164 / 135 t/s**
-#   TTFT                        3.13 / 6.14 / —    2.43 / 5.36 / 9.90 s     (**−22%**)
-# 解码快的原因不是权重小(19GB > AWQ 15GB),而是 **AL 高**:GGUF 主干 + 同一份
-# DFlash2 W4A16 草稿,实测 m7(满接受)占 71%、AL 5.58(档① AWQ 约 3.0),
-# 单轮 verify p50 35ms 但仍 5.58 tok/轮。
+# 为什么是 IQ4_XS 而不是 Q4_K_M(2026-10-27 实测,GPU2 独占,冷 boot):
+#   · **Q4_K_M 19.0GB 里 38% 字节是 Q8_0**,比 AWQ-INT4(15.2GB)还重 3.8GB ⇒
+#     什么也没省下,而速度已经被同卡的 a8 AWQ 全面超过(prefill 1679 vs 2174)
+#     ⇒ **不作为常驻档**(留 measurement 档对照)。
+#   · **UD-IQ4_XS 14.3GB**,比 Q4_K_M 轻 4.7GB ⇒ 同一张 24G 卡上
+#     **上下文 57k → 192k(3.4×)**,而 prefill 几乎不变。
 #
-# 代价:
-#   · **上下文 72k**(AWQ 档 63.4k;但 GGUF 权重更大 ⇒ KV 预算更小,见下);
-#   · **本档不开视觉**(GGUF 的视觉塔是独立 mmproj:`../models/ggml-org/
-#     Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf`,约 1.1 GiB,开了要从
-#     KV 预算里扣 ≈35k ctx)。要图像请用档①/档②,或临时:
-#     --set model.vision=true --set model.vision_path=../models/ggml-org/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-Q8_0.gguf
-#   · 权重 19.0GB(Q4_K_M 有 38% 字节是 Q8_0)—— 没意义再换 IQ4_XS:
-#     实测 IQ4_XS 字节少 25% 但 MMVQ 内核效率低 23%,净 +4%(见 measurement 档)。
+# 本档实测(单 3090 / greedy / chunk 2048 / DFlash2 d7):
+#   ctx        prefill      decode     TTFT
+#   4k         1646 t/s     135 t/s     2.49 s
+#   8k         1681 t/s     127 t/s     4.88 s
+#   64k        1296 t/s      77 t/s     50.6 s
+#   128k        969 t/s      41 t/s    135.3 s
+#   (128k 请求零拒发,boot 余量 2.2GB;cap = 246105,本档取 80%)
+#
+# 定位:
+#   · **本机唯一能开到 192k 的档**(AWQ 档 a8 后只有 57k,TP2 档 262k 但要两张卡);
+#   · 文本档:GGUF 主文件不带视觉塔;要图像用档①/档②,或临时开 mmproj:
+#     --set model.vision=true --set model.vision_path=../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf
+#     (约 0.9GB,从 KV 预算里扣 ≈27k ctx)
+#   · prefill 比 a8 AWQ 慢 24%,换的是 3.4× 上下文 —— 长文/大 prompt 用本档,
+#     短 prompt 低时延用档①(8134)。
 extends = [
   "full.toml",
-  "parts/model/27b-gguf-q4km.toml",
+  "parts/model/27b-gguf-iq4xs.toml",
   "parts/hardware/3090-single.toml",
   "parts/kernel/fi-graph.toml",
   "parts/pool/fp8.toml",
@@ -33,12 +38,10 @@ extends = [
 bind = "127.0.0.1:8136"
 
 [runtime]
-# 57344 = 1792 页。⚠️ 本档的显存账与档①**不同**:GGUF 权重 19.0GB 比 AWQ 的
-# 15.2GB 多吃 3.8GB ⇒ 留给 KV + 预填工作区的空间本来就小。实测教训:
-#   · 65536 + snap2 + reserve512:单发 32k 就连撞 24-48MiB 的硬预算拒发
-#     (owl_gdn_conv_fwd/owl_add 都是 2048 块的瞬态激活);
-#   · 本档 = 57344 + snap1 + reserve256 ⇒ boot 后驱动余量 ≈1.9GB,32k 连发三次无拒。
-max_seq = 57344
+# 196608 = 6144 页(boot 报的 cap = 246105 的 80%)。UD-IQ4_XS 只有 14.3GB,
+# 比 Q4_K_M 轻 4.7GB ⇒ 余量够开 3.4× 上下文:实测 128k prompt 零拒发、余量 2.2GB。
+# 再往上(229376+)就没有预填工作区的余量了。
+max_seq = 196608
 max_concurrency = 1
 # 与档①同款:GGUF 的 prefill 走 MMQ2,块越大发射越少(实测 512→2048 +8~15%,
 # 4096 在 8k prompt 上会 prefill 边界降级 ⇒ 2048 是安全上限)。
