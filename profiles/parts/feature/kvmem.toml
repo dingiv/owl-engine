@@ -19,6 +19,9 @@ query_replay = false
 select_sink = 2
 select_recent = 4
 recall_every = 1
+# prefill 过去视图口径（on-hole = 旧行为；always = 与 decode 同源稀疏视图，
+# 单 3090 / 27B / w4a8 / 64k 实测 prefill +10.5%，属语义变更 ⇒ 需质量门）
+prefill_view = "on-hole"
 coverage_probe = false
 analyze_at_ctx = 0
 evict_policy = "lru"

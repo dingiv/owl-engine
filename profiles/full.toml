@@ -281,6 +281,10 @@ query_replay = false
 select_sink = 2
 select_recent = 4
 recall_every = 1
+# prefill 过去视图口径：on-hole（缺省，= 旧行为，池内走全量链）| always
+# always = prefill 与 decode 同源稀疏视图 ⇒ attention ∝ 工作集（64k +10.5%），
+# 但过去只读选中块 = **语义变更**，质量门未立 ⇒ 缺省 on-hole。
+prefill_view = "on-hole"
 coverage_probe = false
 analyze_at_ctx = 0
 # lru | lrfu | lrfu:0.8

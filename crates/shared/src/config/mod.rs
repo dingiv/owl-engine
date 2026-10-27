@@ -763,6 +763,27 @@ impl<'de> Deserialize<'de> for EvictPolicyCfg {
 /// ⚠️ 与 `probes.coverage_probe` 的分工:那个是**诊断面**(真实质量全量扫描,
 /// 单次成本含 `ctx` 因子 ⇒ 全军 O(ctx²))。**生产档只需 `select_decode`**,
 /// 不要为了开功能而把探针一起打开。
+/// **prefill 过去视图口径**(2026-10-27;见 [`KvmemCfg::prefill_view`])。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefillViewMode {
+    /// 只在链上出现洞(已下沉)时换表 —— 旧行为,池内走全量链。
+    #[default]
+    OnHole,
+    /// 总是用选择层视图(prefill 与 decode 同源)⇒ attention ∝ 工作集。
+    /// **语义变更**(过去只读选中块),默认不开。
+    Always,
+}
+
+impl PrefillViewMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OnHole => "on-hole",
+            Self::Always => "always",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KvmemCfg {
@@ -819,6 +840,16 @@ pub struct KvmemCfg {
     /// 其余边界**只采索引、不干预驻留**(驻留交给 A 轴,下一次完整召回时对齐)。
     /// **末个边界永远是完整召回**(decode 消费的视图取自它)。
     pub recall_every: usize,
+    /// **prefill 的过去视图口径**(2026-10-27)。
+    ///
+    /// - `on-hole`(缺省,= 旧行为):只在链上出现占位符(已下沉)时才换视图表。
+    ///   池内(≤`max_seq` 以内的池容量)时 prefill 走**全量链** ⇒ attention O(ctx),
+    ///   而 decode 走**选中集** ⇒ 同一请求里两套口径。
+    /// - `always`:prefill 与 decode 同源 —— 只看选中集 + 尾部窗口。
+    ///   attention 从 ∝ctx 变成 ∝工作集(单卡 3090 / 27B / w4a8 / 64k:
+    ///   prefill **1791 → 1994 t/s**,+10.5%);代价 = 过去只读选中块,
+    ///   **是语义变更**。默认不开:质量门(长文 QA/检索命中率)尚未立。
+    pub prefill_view: PrefillViewMode,
     /// **覆盖率探针(诊断面;缺省关)**。开则在末个边界额外做**真重诊断**:
     /// K/V 全量回读 + host 逐元素解码 + `true_block_mass`(逐 query 行 ×(层,头)
     /// 扫**全 ctx**)+ 论文口径对照 + 方案 A/B 对照 + 覆盖率/上界报告。
@@ -1629,6 +1660,7 @@ impl Default for KvmemCfg {
         Self {
             select_decode: false,
             select_partial: false,
+            prefill_view: PrefillViewMode::default(),
             index: false,
             index_gpu: true,
             // 2240 tok = 70 页 × 32 tok = 保底 6 + 召回 64 块(与旧 `select_blocks=64` 等值)
