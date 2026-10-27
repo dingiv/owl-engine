@@ -1818,20 +1818,42 @@ impl<'a> AllocCtx<'a> {
         let pool_tokens = if plan.pool_auto {
             match ctx_max {
                 Some(m) if plan.seq_tokens > m => {
-                    return Err(ModelError::Msg(format!(
-                        "[pool] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
-                         本档 per_tok={}B ⇒ cap={:?} tok。修法:降 [runtime].max_seq 到 ≤ {}、\
-                         或降 per_tok(池 fp8 / 减草稿池)、或加 [pool].pool_tokens 显式钉(不推荐)。",
+                    // **超卖档(锁①,2026-10-27 修)**:`[kvmem].pool_overcommit` 开的语义就是
+                    // "池 < 上下文" —— 多出的链块靠选择层下沉 host/disk。旧实现无条件拒启
+                    // (2026-10-21 自动池重构漏了这条门),把超卖档挡在门外。
+                    if !plan.pool_overcommit {
+                        return Err(ModelError::Msg(format!(
+                            "[pool] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
+                             本档 per_tok={}B ⇒ cap={:?} tok。修法:降 [runtime].max_seq 到 ≤ {}、\
+                             或降 per_tok(池 fp8 / 减草稿池)、或开 [kvmem] 超卖(select_decode+select_partial+pool_overcommit)。",
+                            plan.seq_tokens,
+                            m,
+                            per_tok.total(),
+                            pool_cap,
+                            m
+                        )));
+                    }
+                    // 预填**瞬态**余量:超卖档池一旦吃满 cap,chunk 的激活/工作区
+                    // (a8 实测 24-68 MiB,2048 块)+ 选择层视图 + 图 warmup 就得从
+                    // 池外的空里挤 ⇒ 留 1 GiB(实测定值:512 MiB 在 27B/a8/视觉档
+                    // 会撞 `vram-hard-budget` 拒发)。
+                    let transient_tok = ((1024usize << 20) / per_tok.total().max(1)).max(1);
+                    let pool = m.saturating_sub(transient_tok).max(1);
+                    owl_shared::log_info!(
+                        "pool",
+                        "**超卖档**:max_seq={} > ctx_max={} ⇒ 设备池 = cap − 瞬态余量(512 MiB = {} tok) = {} tok(超卖 {:.2}×);\
+                         其余链块靠选择层下沉 host/disk",
                         plan.seq_tokens,
                         m,
-                        per_tok.total(),
-                        pool_cap,
-                        m
-                    )));
+                        transient_tok,
+                        pool,
+                        plan.seq_tokens as f64 / pool as f64
+                    );
+                    pool
                 }
-                _ => {}
+                Some(m) => plan.seq_tokens.min(m),
+                None => plan.seq_tokens,
             }
-            plan.seq_tokens
         } else {
             match pool_cap {
                 Some(cap) => plan.pool_tokens.min(cap),
