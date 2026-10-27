@@ -1838,7 +1838,35 @@ fn boot_pool_floor(
             page_bytes / 1024,
             floor_desc,
             cfg.knobs.host_cache_mb + cfg.knobs.snap_host_mb,
-        );
+                );
+        // 🔴 **可用上下文上限 = 池容量,不是 `max_seq`**(2026-10-27 实测定谳)。
+        //
+        // 超卖档的链一旦越过池,链上就出现占位符 ⇒ `past_view_of` 必须换稀疏视图
+        // (on-hole 也逃不掉),prefill 每个 chunk 只能看到
+        // `工作集 + 本 chunk` 那么长的"过去"。实测(真实中文文档 / greedy):
+        //
+        // | prompt | 输出 |
+        // |---|---|
+        // | 48k(≤池 47744) | 正常(176 tok) |
+        // | 64k / 72k / 80k / 96k / 124k(>池) | **out=1,finish=stop**(退化) |
+        //
+        // 同一批 prompt 在非超卖档(8135 TP2 262k)全部正常。⇒ **262144 是
+        // "装得下",不是"读得懂"**。客户端必须按池容量限流,否则模型会静默地
+        // 只吐一两个字 —— 这条 WARN 就是那件事的现场提示。
+        let usable = pool.geom.nb * pool.geom.page;
+        if cfg.knobs.select_partial && s > usable {
+            owl_shared::log_warn!(
+                "boot",
+                "🔴 KVMem 超卖档的**可用上下文上限 = 池容量 {} tok**(= {} 页 × {});\
+                 `max_seq = {}` 只保证 KV 装得下 —— 超池后 prefill 退化为稀疏视图,\
+                 实测 64k 起输出退到 1 token(对比非超卖档同 prompt 正常)。\
+                 长上下文请用非超卖档(TP2),或把 max_seq 降到池以内。",
+                usable,
+                pool.geom.nb,
+                pool.geom.page,
+                s
+            );
+        }
     }
     Ok(())
 }
