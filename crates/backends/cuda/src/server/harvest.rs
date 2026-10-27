@@ -4,6 +4,21 @@
 
 use super::*;
 
+/// swap 腿的分相计时出口(唯一;`harvest.rs` 内共用)。
+///
+/// 为什么要有它:`select.rec.out_swap` 把「D2H 入队 → 流完成 → host `conn.put` →
+/// ack」全包在一段里,引擎侧只看到 634ms/次的尖峰,分不清是 PCIe 慢还是宿主拷贝慢。
+/// 两个 tag 相加 ≈ 引擎段,可用于判断杠杆该落在哪一侧。
+fn swap_phase(tag: &'static str, t0: std::time::Instant) {
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if !(ms.is_finite() && ms >= 0.0) {
+        return;
+    }
+    owl_shared::metrics::with_metrics_store(|s| {
+        s.timer_record_tag(tag, std::time::Duration::from_secs_f64(ms / 1000.0), file!(), line!());
+    });
+}
+
 impl GpuServer {
     /// **notify 失败留痕**(2026-10-15 审查补):`launch_host_function` 失败 =
     /// 回执断链 —— 旧实现三处 `ack.take().unwrap()` 必 panic(server 线程猝死
@@ -163,6 +178,35 @@ impl GpuServer {
             Ok(s) => ack.send(Ok(Box::new(s))),
             Err(e) => ack.send(Err(e)),
         }
+    }
+
+    /// **staging 池预热**(2026-10-27):按 `seg` 切桶,补到 `bytes` 总量。
+    ///
+    /// 已够就跳过 —— 幂等(重复调用零成本)。返回 (新建桶数, 现有桶数)。
+    pub(super) fn handle_pinned_prewarm(
+        &mut self,
+        bytes: usize,
+        seg: usize,
+        ack: Ack<Result<(usize, usize), ModelError>>,
+    ) {
+        let seg = if seg == 0 { super::STAGE_SEG } else { seg };
+        let want = bytes.div_ceil(seg).max(0);
+        let t0 = std::time::Instant::now();
+        let have = self.pool.count_ge(seg);
+        let mut made = 0usize;
+        for _ in have..want {
+            match Staging::alloc(seg, "prewarm") {
+                Ok(s) => {
+                    self.pool.put(Box::new(s));
+                    made += 1;
+                }
+                Err(e) => return ack.send(Err(e)),
+            }
+        }
+        owl_shared::counter_add!("srv.pinned_prewarm_buckets", made as u64);
+        owl_shared::counter_add!("srv.pinned_prewarm_bytes", (made * seg) as u64);
+        let _ = t0;
+        ack.send(Ok((made, have)))
     }
 
     /// 上传租约(命令壳):`enqueue_upload_pinned` + 回执
@@ -582,13 +626,22 @@ impl GpuServer {
         self.sink.timer("srv.seg.swap", t0.elapsed());
     }
 
+    /// pinned staging 段大小(2026-10-27 定谳):一次 stage-out 可能搬 1.8 GiB
+    /// (64k 上下文首次越池 = 1881 片 × 1 MiB),而 `PinnedPool` 里不可能预先有
+    /// 这个尺寸的桶 ⇒ `Staging::alloc(total)` 落在 **cudaHostAlloc(1.8 GiB)** 上:
+    /// 实测 `srv.seg.swap` p99 = **792 ms**,占该次 `swap_out` 的一半以上,且此后
+    /// 回池才变快 —— 也就是每个"池尺寸档"的第一次都白付一次。
+    ///
+    /// 段化成 256 MiB:首段分配后,后续段在池里命中同尺寸桶;D2H 仍**按片序全量
+    /// 入队**(同一 d2h 流 FIFO ⇒ 流水线带宽不降),ack 仍只发一次(语义不变)。
+
+
     fn swap_out(
         &mut self,
         pieces: Vec<owl_iface::contract::SwapPiece>,
         conn: Box<dyn owl_iface::contract::Connector + Send>,
         ack: Ack<Result<Box<dyn owl_iface::contract::Connector + Send>, ModelError>>,
     ) {
-        let total: usize = pieces.iter().map(|p| p.len).sum();
         let stream = match self.d2h_ordered_stream() {
             Ok(s) => s,
             Err(e) => return ack.send(Err(e)),
@@ -597,63 +650,117 @@ impl GpuServer {
             owl_shared::vram::free_set(free as u64);
             self.vram.free_set(free as u64);
         }
-        let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
-            match self.pool.take(total) {
+        // ① 段规划(按片序累加;单片 > 段大小时独占一段 —— 不切分单片,
+        //    dev 指针与 conn 偏移的成对关系一旦拆开就没人守住)
+        let mut segs: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut lo = 0usize;
+            let mut acc = 0usize;
+            for (i, p) in pieces.iter().enumerate() {
+                if acc > 0 && acc + p.len > super::STAGE_SEG {
+                    segs.push((lo, i));
+                    lo = i;
+                    acc = 0;
+                }
+                acc += p.len;
+            }
+            if lo < pieces.len() {
+                segs.push((lo, pieces.len()));
+            }
+        }
+        // ② 取段缓冲(任一失败 = 整条失败,已取的段全部回池)
+        let mut stags: Vec<Box<dyn owl_iface::contract::PinnedRegion + Send>> =
+            Vec::with_capacity(segs.len());
+        for (lo, hi) in &segs {
+            let n: usize = pieces[*lo..*hi].iter().map(|p| p.len).sum();
+            let b = match self.pool.take(n) {
                 Some(b) => b,
-                None => match Staging::alloc(total, "swap_out") {
+                None => match Staging::alloc(n, "swap_out") {
                     Ok(s) => Box::new(s),
-                    Err(e) => return ack.send(Err(e)),
+                    Err(e) => {
+                        for s in stags {
+                            self.pool.put(s);
+                        }
+                        return ack.send(Err(e));
+                    }
                 },
             };
-        // 逐片入队(先校验后入队;任一失败 = 整条失败,已入队的 DMA 无回执意义)
-        let mut cursor = 0usize;
-        for (i, p) in pieces.iter().enumerate() {
-            if let Err(e) = self.ctx().check_range(p.block, p.dev_off, p.len, "swap-out") {
-                self.pool.put(staging);
-                return ack.send(Err(e));
-            }
-            let (dptr, _) = match self.ctx().block_ptr(p.block, &stream) {
-                Ok(x) => x,
-                Err(e) => {
-                    self.pool.put(staging);
+            stags.push(b);
+        }
+        // ③ 逐段逐片入队(先校验后入队;任一失败 = 整条失败,已入队的 DMA 无回执意义)
+        for (si, (lo, hi)) in segs.iter().enumerate() {
+            let st = &mut stags[si];
+            let mut cursor = 0usize;
+            for (i, p) in pieces[*lo..*hi].iter().enumerate() {
+                if let Err(e) = self.ctx().check_range(p.block, p.dev_off, p.len, "swap-out") {
+                    for s in stags {
+                        self.pool.put(s);
+                    }
                     return ack.send(Err(e));
                 }
-            };
-            let r = unsafe {
-                memcpy_dtoh_async(
-                    &mut staging.slice_bytes_mut()[cursor..cursor + p.len],
-                    dptr + p.dev_off as u64,
-                    stream.cu_stream(),
-                )
-            };
-            if let Err(e) = r {
-                self.pool.put(staging);
-                return ack.send(Err(ModelError::Msg(format!(
-                    "swap_out async(第 {i} 片): {e:?}"
-                ))));
+                let (dptr, _) = match self.ctx().block_ptr(p.block, &stream) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        for s in stags {
+                            self.pool.put(s);
+                        }
+                        return ack.send(Err(e));
+                    }
+                };
+                let r = unsafe {
+                    memcpy_dtoh_async(
+                        &mut st.slice_bytes_mut()[cursor..cursor + p.len],
+                        dptr + p.dev_off as u64,
+                        stream.cu_stream(),
+                    )
+                };
+                if let Err(e) = r {
+                    for s in stags {
+                        self.pool.put(s);
+                    }
+                    return ack.send(Err(ModelError::Msg(format!(
+                        "swap_out async(第 {} 片): {e:?}",
+                        lo + i
+                    ))));
+                }
+                cursor += p.len;
             }
-            cursor += p.len;
         }
-        // 完成回调:逐片 conn.put(DMA 已完成)+ 回池 + 回执
+        // ④ 完成回调:逐段逐片 conn.put(DMA 已完成)+ 回池 + 回执
         let cell = std::sync::Arc::new(std::sync::Mutex::new(Some((conn, ack))));
         let cell2 = cell.clone();
         let pool = self.pool.clone();
+        // 分相:t_dma 从入队时刻起算(含等待流),t_put 只跑宿主拷贝
+        let t_dma = std::sync::Arc::new(std::time::Instant::now());
+        let t_dma2 = t_dma.clone();
+        let segs2 = segs.clone();
         let finish: Finish = Box::new(move || {
+            swap_phase("srv.swap.out.dma", *t_dma2);
+            let t_put = std::time::Instant::now();
             let (mut conn, ack) = match cell2.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 Some(x) => x,
                 None => return,
             };
-            let bytes = staging.as_bytes();
-            let mut cursor = 0usize;
-            for p in &pieces {
-                if let Err(e) = conn.put(p.slot, p.conn_off, &bytes[cursor..cursor + p.len]) {
-                    pool.put(staging);
-                    ack.send(Err(e));
-                    return;
+            for (si, (lo, hi)) in segs2.iter().enumerate() {
+                let st = &stags[si];
+                let bytes = st.as_bytes();
+                let mut cursor = 0usize;
+                for p in &pieces[*lo..*hi] {
+                    if let Err(e) = conn.put(p.slot, p.conn_off, &bytes[cursor..cursor + p.len]) {
+                        for s in stags {
+                            pool.put(s);
+                        }
+                        swap_phase("srv.swap.out.put", t_put);
+                        ack.send(Err(e));
+                        return;
+                    }
+                    cursor += p.len;
                 }
-                cursor += p.len;
             }
-            pool.put(staging);
+            for s in stags {
+                pool.put(s);
+            }
+            swap_phase("srv.swap.out.put", t_put);
             ack.send(Ok(conn));
         });
         if let Err(e) = self.notify(&stream, finish) {
@@ -689,6 +796,7 @@ impl GpuServer {
                 },
             };
         // ① 连接器 → staging(host 侧同步拷贝)
+        let t_get = std::time::Instant::now();
         let mut cursor = 0usize;
         for p in pieces.iter() {
             if let Err(e) = conn.get(p.slot, p.conn_off, &mut staging.slice_bytes_mut()[cursor..cursor + p.len]) {
@@ -697,6 +805,7 @@ impl GpuServer {
             }
             cursor += p.len;
         }
+        swap_phase("srv.swap.in.get", t_get);
         // ② staging → 设备(COMPUTE 流序逐片;末尾单 notify ⇒ ack = 全部落地)
         let mut cursor = 0usize;
         for (i, p) in pieces.iter().enumerate() {

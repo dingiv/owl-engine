@@ -45,6 +45,12 @@ use std::sync::mpsc;
 
 type Finish = Box<dyn FnOnce() + Send>;
 
+/// **pinned staging 段大小**(2026-10-27):一次 stage-out 可能搬 1.8 GiB,
+/// 而 `PinnedPool` 不可能预先有那个尺寸的桶 ⇒ `cudaHostAlloc(1.8 GiB)` 实测
+/// ≈600 ms,还占着 server 命令线程。按 256 MiB 切段后,段与段共用同尺寸桶,
+/// 预热(`PinnedPrewarm`)也按这个粒度补桶。
+pub(crate) const STAGE_SEG: usize = 256 << 20;
+
 /// pinned 租约池(server 私有;Arc 随 dispatch 线程共持 ——
 /// 生命周期严格罩在 CUDA ctx 之内,server 关闭即整池释放,
 /// 杜绝跨 server 的悬垂页锁指针段错误)
@@ -70,6 +76,16 @@ impl PinnedPool {
     }
     fn put(&self, b: Box<dyn owl_iface::contract::PinnedRegion + Send>) {
         self.free.lock().unwrap().push(b);
+    }
+
+    /// 池里容量 ≥ `min_bytes` 的桶数(预热面用;只数不取)。
+    fn count_ge(&self, min_bytes: usize) -> usize {
+        self.free
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.as_bytes().len() >= min_bytes)
+            .count()
     }
 }
 
@@ -964,6 +980,9 @@ impl GpuServer {
                 self.handle_htod_chunk(block, offset_bytes, data, stream, ack)
             }
             Command::AllocPinned { bytes, name, ack } => self.handle_alloc_pinned(bytes, name, ack),
+            Command::PinnedPrewarm { bytes, seg, ack } => {
+                self.handle_pinned_prewarm(bytes, seg, ack)
+            }
             Command::LedgerReport { top, ack } => ack.send(Ok(self.ledger_report(top))),
             Command::LedgerJson { ack } => ack.send(Ok(self.ledger_dump_json())),
             Command::UploadPinned { buf, dst, offset_bytes, len_bytes, stream, ack } => {

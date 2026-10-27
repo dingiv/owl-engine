@@ -172,6 +172,20 @@ pub enum Command {
         name: String,
         ack: Ack<Result<Box<dyn owl_iface::contract::PinnedRegion + Send>, ModelError>>,
     },
+    /// **staging 池预热**(2026-10-27):把"首次大搬运时的 cudaHostAlloc"搬到 boot。
+    ///
+    /// 为什么要有:一次 stage-out 可能搬 1.8 GiB,而热路径上 `cudaHostAlloc(1.8 GiB)`
+    /// 实测 **≈600 ms/次** —— 这期间**同一个 server 命令线程**被占住,后面排队的
+    /// 视图页表写/下一个 chunk 的入队全部干等 ⇒ 分离式下沉的"重叠"被这 600 ms
+    /// 吃掉一半(`/debug/metrics/select`:reconcile 降到 167 ms,但 view 涨到 965 ms)。
+    /// 预热后 Swap 只剩 D2H 入队(毫秒级),命令线程不再被绑架。
+    PinnedPrewarm {
+        /// 目标总量(字节;按 `STAGE_SEG` 切桶,已够则跳过)
+        bytes: usize,
+        /// 段大小(字节;0 = 用 server 默认)
+        seg: usize,
+        ack: Ack<Result<(usize, usize), ModelError>>,
+    },
     /// **块账按名清单**(诊断查询面;2026-10-16 全量记名)。
     ///
     /// 纯读:不改块账/不碰设备。OOM dump 与排障共用同一渲染
@@ -365,6 +379,7 @@ impl Command {
             Self::HtodChunk { .. } => "htod_chunk",
             Self::HtodChunks { .. } => "htod_chunks",
             Self::AllocPinned { .. } => "alloc_pinned",
+            Self::PinnedPrewarm { .. } => "pinned_prewarm",
             Self::LedgerReport { .. } => "ledger_report",
             Self::LedgerJson { .. } => "ledger_json",
             Self::UploadPinned { .. } => "upload_pinned",
@@ -412,6 +427,7 @@ impl Command {
             Self::HtodChunk { ack, .. } => ack.created_at(),
             Self::HtodChunks { ack, .. } => ack.created_at(),
             Self::AllocPinned { ack, .. } => ack.created_at(),
+            Self::PinnedPrewarm { ack, .. } => ack.created_at(),
             Self::LedgerReport { ack, .. } => ack.created_at(),
             Self::LedgerJson { ack, .. } => ack.created_at(),
             Self::UploadPinned { ack, .. } => ack.created_at(),
