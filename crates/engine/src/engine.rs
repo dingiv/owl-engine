@@ -1938,10 +1938,31 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     };
 
     // 解释器执行环境(EnvProvider;E1.5 抽象):旋钮携带(入口经
-    // from_config 填充)+ 硬件档自 iface op_env 合入(被动律:引擎 = 环境事实来源)
+    // from_config 填充)+ 硬件档自 iface 合入(被动律:引擎 = 环境事实来源)
+    //
+    // **代际真值 = `device_arch()`**(2026-10-27 代际单源):`op_env()` 是同步面,
+    // 它只能复读“句柄上次问到的值” —— 首次必须在这里问一次,顺带把 server boot
+    // 变成显式先行(`sm_count` 同律)。未提供该口的面(CPU/无卡测试)直接报错
+    // —— 不退到“默认 sm86”(那正是之前 `[kernel-env] arch=Sm86` 写死的来源)。
     let mut env = cfg.knobs.env;
-    if let Some(oe) = face.op_env() {
-        env.hw = owl_models::env::HwEnv::Cuda(oe.hw.arch);
+    match face.device_arch().await {
+        Ok(arch) => {
+            env.hw = owl_models::env::HwEnv::Cuda(arch);
+            owl_shared::log_info!(
+                "boot",
+                "设备代际 = {arch}({} · {})",
+                arch.family(),
+                arch.caps().summary()
+            );
+        }
+        // 纯 host 面(CPU/mock/无卡测试):本来就没硬件档 ⇒ 保持 `HwEnv::Cpu`
+        Err(_) if face.op_env().is_none() => {}
+        // 有 GPU 面却答不出代际 = 拒启(不静默落回默认代际)
+        Err(e) => {
+            return Err(ModelError::Msg(format!(
+                "boot 代际感知失败(GPU 面已就绪但 device_arch 不可用): {e}"
+            )))
+        }
     }
     // 模型几何事实合入(2026-10-13 P4:算子准入的几何门对账面)——
     // 与 hw 同律:引擎 = 环境事实来源,算子层零探测

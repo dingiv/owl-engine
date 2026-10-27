@@ -238,7 +238,7 @@ impl KernelSelectionEnv {
     /// boot 日志一行(可审计:这个进程到底把什么投射给了 picker)
     pub fn describe(&self) -> String {
         format!(
-            "arch={:?} quant={:?} act={:?} kv={:?}/{:?} page={} hd={} grp={} vision={} spec_depth={} tp={} tags=[{}]",
+            "arch={} quant={:?} act={:?} kv={:?}/{:?} page={} hd={} grp={} vision={} spec_depth={} tp={} tags=[{}]",
             self.hw.arch,
             self.quant.plan,
             self.quant.act,

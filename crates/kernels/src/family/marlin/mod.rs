@@ -473,27 +473,36 @@ mod size_checks {
 
 /// **marlin 后端**(`QuantGemm` 契约的首个实现体)。
 ///
-/// 能力真值 = 架构真值:int8 张量核(IMMA `mma.s8s8s32`)自 **sm80** 起可用 ⇒
-/// 本仓 [`crate::Arch`] 现有两档(Sm86/Sm89)对 W4A16 / W4A8 / MoE-WNA16 全支持。
-/// ⚠️ 三处 `match` **故意不写通配臂**:未来新增 `Arch` 变体(尤其 < sm80)时,
-/// 编译器会在**这里**逼着作者明确表态,而不是静默继承旧答案(信条:响亮拒绝)。
+/// 能力真值 = 架构真值:Marlin 的设备码用 Ampere 原语(`cp.async` + `ldmatrix`
+/// + `mma.sync`),**消费级四代**里 sm86 / sm89 / sm120 答"支持",sm75(RTX 20 系)
+/// 答"不支持";表外代际(数据中心卡等)按 `caps()` 的硬件事实回答。
+/// **支持 ≠ 该卡已验证**:验证状态归试验台账,装错代际由装配期架构门拦截。
+/// ⚠️ 三处 `match` **故意不写通配臂**:未来新增 `Arch` 变体时,
+/// 编译器会在**这里**逼着作者明确表态(信条:响亮拒绝)。
 pub struct MarlinBackend;
 
 impl crate::QuantGemm for MarlinBackend {
     fn w4a16(&self, arch: crate::Arch) -> bool {
         match arch {
-            crate::Arch::Sm86 | crate::Arch::Sm89 => true,
+            crate::Arch::Sm75 => false,
+            crate::Arch::Sm86 | crate::Arch::Sm89 | crate::Arch::Sm120 => true,
+            // 表外代际:按硬件事实回答(能力 ≠ 已验证;装配期架构门兜底)
+            crate::Arch::Other { .. } => arch.caps().cp_async,
         }
     }
     /// W4A8 = int8 激活 × int4 权重(需 int8 张量核,sm80+)
     fn w4a8(&self, arch: crate::Arch) -> bool {
         match arch {
-            crate::Arch::Sm86 | crate::Arch::Sm89 => true,
+            crate::Arch::Sm75 => false,
+            crate::Arch::Sm86 | crate::Arch::Sm89 | crate::Arch::Sm120 => true,
+            crate::Arch::Other { .. } => arch.caps().cp_async && arch.caps().int8_mma,
         }
     }
     fn moe_wna16(&self, arch: crate::Arch) -> bool {
         match arch {
-            crate::Arch::Sm86 | crate::Arch::Sm89 => true,
+            crate::Arch::Sm75 => false,
+            crate::Arch::Sm86 | crate::Arch::Sm89 | crate::Arch::Sm120 => true,
+            crate::Arch::Other { .. } => arch.caps().cp_async,
         }
     }
 }

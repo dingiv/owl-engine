@@ -13,6 +13,13 @@ description = "CUDA backend: cudarc wrapped with memory-safety governance (chart
 #   运行时:/debug/perf/level/gpu 武装(level=gpu 才调 owl_cupti_start)
 cupti = []
 
+# 代际转发(单源在 owl-kernels;入口 `-p server --features arch-sm120` 一路透传)
+# 消费级四代:20/30/40/50 系。多选 = 多代际 fatbin;单份 `.a` 家族取最高代。
+arch-sm75 = ["owl-kernels/arch-sm75"]
+arch-sm86 = ["owl-kernels/arch-sm86"]
+arch-sm89 = ["owl-kernels/arch-sm89"]
+arch-sm120 = ["owl-kernels/arch-sm120"]
+
 [dependencies]
 # 官方 crates.io 版(非 guoqingbao fork):图相关语义由本封装层自持,
 # 不依赖 fork 的 graph feature(A4:语义分歧不进第三方库)

@@ -118,6 +118,9 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="cubin 输出目录")
     ap.add_argument("--device", default="none",
                     help="`none`(缺省)= 零 GPU(target 桩);`cuda:N` = 真实设备取 target")
+    ap.add_argument("--target-arch", default=os.environ.get("GDN_TRITON_ARCH", "86"),
+                    help=("`--device none` 下 target 桩的 SM 数字形(如 86 / 120);"
+                          "缺省读 `GDN_TRITON_ARCH`,再缺省 86。build.rs 按选中的 `arch-smXX` feature 显式传"))
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -143,7 +146,18 @@ def main() -> int:
         # do_bench 按默认设备分配缓冲,跨设备报 "Pointer argument cannot be
         # accessed from Triton";本脚本走 warmup 不经 bench,保持纪律免将来踩)
         torch.cuda.set_device(dev)
+        # 真机路径以**设备**为准(与 target 桩同口径:_sm = SM 数字形)
+        _cc = torch.cuda.get_device_capability(dev)
+        _sm = _cc[0] * 10 + _cc[1]
     else:
+        # target 桩的 SM 数字形来自 `--target-arch`(**不是**写死 86):
+        # cubin 是 SASS ⇒ 代际错了就直接在目标卡上跑不起来。
+        try:
+            _sm = int(str(args.target_arch).strip())
+        except ValueError:
+            raise SystemExit(
+                f"--target-arch 必须是 SM 数字形(如 86 / 120),得到 {args.target_arch!r}"
+            )
         # **零 GPU**:注入 target 桩 —— AOT 只编译不发射,`CompiledKernel` 的设备
         # 句柄是惰性的(`.run` 才 `_init_handles`)⇒ 全程不碰设备。
         from triton.backends.compiler import GPUTarget
@@ -154,7 +168,7 @@ def main() -> int:
             其余驱动方法一旦被调用就报错(说明真的触到了设备)。"""
 
             def get_current_target(self):
-                return GPUTarget("cuda", 86, 32)
+                return GPUTarget("cuda", _sm, 32)
 
             @staticmethod
             def get_current_device():
@@ -275,11 +289,21 @@ def main() -> int:
         proxy = _WarmupProxy(pristine, w, st, kw)
         call(proxy, original)
         shared = getattr(proxy.compiled.metadata, "shared", None)
-        if shared != cfg["shared"]:
-            print(f"[aot] ❌ {asset}: 编译产物 shared={shared} ≠ 表值 {cfg['shared']}"
-                  f"(配置 {kw} w{w} s{st})—— 源/配置漂移,拒用", file=sys.stderr)
-            return 1
-        print(f"[aot] ✓ {asset}: w{w} s{st} {kw} shared={shared}(= 表值)")
+        # `shared` 期望值分代际:表里的 `shared` = **采集代际(sm_86)** 的值;
+        # 其它代际可写 `shared_by_arch`(键 = SM 数字形)。两者都没收录的代际
+        # **只警告不拒**:表不是在该代际采集的,拿 86 的数去否 120 的产物是
+        # 假判据(源/配置漂移才是本检查要抓的东西)。
+        want = cfg.get("shared_by_arch", {}).get(str(_sm), cfg["shared"])
+        if shared != want:
+            if str(_sm) in cfg.get("shared_by_arch", {}):
+                print(f"[aot] ❌ {asset}: 编译产物 shared={shared} ≠ sm_{_sm} 表值 {want}"
+                      f"(配置 {kw} w{w} s{st})—— 源/配置漂移,拒用", file=sys.stderr)
+                return 1
+            print(f"[aot] ⚠ {asset}: shared={shared}(sm_{_sm})≠ sm_86 表值 {want}"
+                  f"—— 该代际未收录(不是漂移);如要钉住请写入 shared_by_arch.\"{_sm}\"",
+                  file=sys.stderr)
+        else:
+            print(f"[aot] ✓ {asset}: w{w} s{st} {kw} shared={shared}(= 表值)")
         cubin = proxy.compiled.asm["cubin"]
         dst = os.path.join(args.out, f"{asset}.cubin")
         with open(dst, "wb") as f:

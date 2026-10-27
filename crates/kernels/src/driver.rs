@@ -19,8 +19,8 @@
 //! - 登记表(models `kernel::REGISTRY`,名字→源+签名,执行面验证)暂留
 //!   models;models 侧耦合测试保证本模块产出的每个名字 ∈ 登记表 ——
 //!   漂移在 CI 红灯,不在 GPU 上胡言;
-//! - 硬件感知分阶段:arch 现由引擎 boot 装配占位 Sm86,CC 查询接通后
-//!   升级;Sm89(40 系预留)只加枚举臂,调用点零改动;
+//! - 硬件感知:arch 由引擎 boot 经 iface `device_arch()`(CC 属性查询)取得,
+//!   经 [`OpEnv`] 必传参进入;代际表 = `crate::arch`(与 `build.rs` 同一份源),
 //! - 迁移按族推进(gdn → attention → rope/embedding),每族对拍锚 +
 //!   `OWL_GPU_PROF` 分账验收(算子集合不变,只换拾取方式)。
 //!

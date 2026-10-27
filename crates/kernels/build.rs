@@ -7,6 +7,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// **代际表 = 与 lib 同一份源**(`crates/kernels/src/arch.rs`)。
+// build.rs 是独立 crate ⇒ 用 `#[path]` 直接引入;**该文件不得引用 crate 内任何
+// 其它模块**(它同时被 lib 与 build.rs 编译),否则这一侧编不过。
+#[allow(dead_code)]
+#[path = "src/arch.rs"]
+mod arch;
+use arch::Arch;
+
 
 // ============================================================================
 // native 核**构建期**编 cubin(2026-10-13 用户裁决"零运行期编译,设备码一律 cubin")
@@ -31,18 +39,60 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 //
 // # 旋钮
 //
-// - `OWL_CUBIN_ARCHS` = 逗号分隔目标架构(缺省 `sm_86`);多档 ⇒ 一个 fatbin 含多代际
 // - `OWL_NVCC`        = nvcc 路径(缺省 PATH)
 // - `OWL_CUBIN_SKIP`  = 跳过构建期编 cubin(排障:纯 NVRTC 基线对照)
 // - `OWL_BUILD_JOBS`  = build.rs 内部 CUDA 编译线程数(缺省 min(nproc,8);1=串行)
+//
+// # 代际不是旋钮,是 **Cargo feature**(2026-10-27 用户裁决)
+//
+// `arch-sm75` / `arch-sm80` / `arch-sm86` / `arch-sm89` / `arch-sm90` /
+// `arch-sm100` / `arch-sm120`,可叠加(多代际 fatbin)。
+//
+// - **为什么不用环境变量**:env 不进 cargo 的缓存键 ⇒ “同一份源码 + 另一个 env”
+//   在 `target/` 里不是一个东西,旧产物会被静默留用(本仓真踩过:换卡后
+//   fatbin 是上一代的)。feature 由 cargo 解析,天然进指纹、可复现、可叠加。
+// - **多选语义**:native cubin 出多代际 fatbin(驱动运行期挑);单份 `.a` 家族
+//   (Marlin / FlashInfer+FA2 / GDN AOT)取**最高**代 —— 一份 `.a` 只能是某一代的 SASS。
+// - **零 feature**(只跑 CPU 单测 / 依赖方没转发) ⇒ 落 `Arch::DEFAULT` 并**响亮告警**;
+//   产物绝不假装支持别的代际(装配期架构门会拒)。
 // ============================================================================
-fn cubin_archs() -> Vec<String> {
-    env::var("OWL_CUBIN_ARCHS")
-        .unwrap_or_else(|_| "sm_86".into())
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+
+/// 构建期代际集(feature 全选;升序去重 ⇒ 指纹稳定)
+fn selected_archs() -> &'static [Arch] {
+    static ARCHS: std::sync::OnceLock<Vec<Arch>> = std::sync::OnceLock::new();
+    ARCHS.get_or_init(|| {
+        let mut out: Vec<Arch> = Arch::ALL
+            .iter()
+            .copied()
+            .filter(|a| arch_feature_on(*a))
+            .collect();
+        out.sort();
+        out.dedup();
+        if out.is_empty() {
+            println!(
+                "cargo:warning=owl-kernels: **未选代际 feature**(arch-sm75 … arch-sm120)⇒ 落缺省 {}。\
+                 生产构建请显式选:`cargo build --release -p server --no-default-features --features arch-sm120`",
+                Arch::DEFAULT
+            );
+            out.push(Arch::DEFAULT);
+        }
+        out
+    })
+}
+
+/// `arch-sm120` → `CARGO_FEATURE_ARCH_SM120`
+fn arch_feature_on(a: Arch) -> bool {
+    env::var_os(format!("CARGO_FEATURE_ARCH_SM{}", a.nvcc_num())).is_some()
+}
+
+/// 单代际家族(Marlin / FlashInfer+FA2 / GDN `.a`)的编译代际 = 选中集合里的最高代。
+fn single_arch() -> Arch {
+    *selected_archs().last().expect("selected_archs 至少一项")
+}
+
+/// 代际集的 `sm_XX` 形(日志/错误/资产申报用)
+fn archs_sm(archs: &[Arch]) -> String {
+    archs.iter().map(|a| a.as_sm()).collect::<Vec<_>>().join(",")
 }
 
 /// 构建期 CUDA 编译并发度。`build.rs` 是**单进程**，cargo 的 `-j` 不会
@@ -258,7 +308,7 @@ fn vendor_stamp(src: &std::path::Path) -> String {
     out
 }
 
-fn fingerprint(src: &std::path::Path, archs: &[String], extra: &[&str]) -> String {
+fn fingerprint(src: &std::path::Path, archs: &[Arch], extra: &[&str]) -> String {
     let md = std::fs::metadata(src).expect("stat .cu");
     let mtime = md
         .modified()
@@ -271,7 +321,7 @@ fn fingerprint(src: &std::path::Path, archs: &[String], extra: &[&str]) -> Strin
         src.display(),
         md.len(),
         mtime,
-        archs.join(","),
+        archs_sm(archs),
         extra.join(" "),
         vendor_stamp(src)
     )
@@ -282,7 +332,7 @@ fn compile_fatbin(
     nvcc: &str,
     src: &std::path::Path,
     dst: &std::path::Path,
-    archs: &[String],
+    archs: &[Arch],
     extra: &[&str],
 ) -> bool {
     let fp = fingerprint(src, archs, extra);
@@ -293,8 +343,8 @@ fn compile_fatbin(
     let mut cmd = Command::new(nvcc);
     cmd.args(["-fatbin", "-O3", "-std=c++17", "--expt-relaxed-constexpr"]);
     for a in archs {
-        let cc = a.replace("sm_", "compute_");
-        cmd.arg("-gencode").arg(format!("arch={cc},code={a}"));
+        cmd.arg("-gencode")
+            .arg(format!("arch=compute_{},code={}", a.nvcc_num(), a.as_sm()));
     }
     cmd.args(extra).arg(src).arg("-o").arg(dst);
     let status = cmd
@@ -332,8 +382,8 @@ fn build_native_cubins(
         return;
     }
     let nvcc = env::var("OWL_NVCC").unwrap_or_else(|_| "nvcc".into());
-    let archs = cubin_archs();
-    assert!(!archs.is_empty(), "OWL_CUBIN_ARCHS 为空");
+    let archs = selected_archs();
+    assert!(!archs.is_empty(), "selected_archs 为空(不应发生:零 feature 会落缺省)");
     let cuda_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let sources = scan_cu_sources(&cuda_root);
     assert!(
@@ -393,7 +443,7 @@ fn build_native_cubins(
     );
     out.push_str("/// 构建期编出的代际集(设备 sm ∉ 本集 ⇒ 装配期拒启;见 §15.4 架构门)\n");
     out.push_str("pub const CUBIN_ARCHS: &[&str] = &[");
-    out.push_str(&archs.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(", "));
+    out.push_str(&archs.iter().map(|a| format!("\"{}\"", a.as_sm())).collect::<Vec<_>>().join(", "));
     out.push_str("];\n\n");
     out.push_str("/// 一个 `.cu` 文件产出的 fatbin 资产(E 轮:不再携带源文本 —— 运行期只要身份 + 字节)\npub struct CubinAsset {\n    /// **资产 id** = `cu/` 相对路径(与 `KernelSpec::SRC` 同形;查表键)\n    pub id: &'static str,\n    /// 模块缓存键/诊断名(`cu/` 相对路径,`/` → `__`)\n    pub module: &'static str,\n    /// 源内容 FNV-1a 64(**构建期指纹**;自洽门回算比对用)\n    pub src_hash: u64,\n    /// fatbin 字节(`include_bytes!`;多代际容器)\n    pub bytes: &'static [u8],\n}\n\n");
     out.push_str("pub const CUBIN_ASSETS: &[CubinAsset] = &[\n");
@@ -441,11 +491,11 @@ fn build_native_cubins(
     println!(
         "cargo:warning=owl-kernels: 构建期 cubin {} 个源文件 ({}) —— {} 个源可零 NVRTC 发射{}",
         rows.len(),
-        archs.join(","),
+        archs_sm(&archs),
         rows.len(),
         if rebuilt == 0 { "(全增量命中,零 nvcc)".to_string() } else { format!("(本次重编 {rebuilt} 个)") }
     );
-    println!("cargo:rerun-if-env-changed=OWL_CUBIN_ARCHS");
+    println!("cargo:rerun-if-env-changed=OWL_CUBIN_SKIP");
 }
 
 // ============================================================================
@@ -467,7 +517,7 @@ fn build_xqa_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
         return Vec::new();
     }
     let nvcc = env::var("OWL_NVCC").unwrap_or_else(|_| "nvcc".into());
-    let archs = cubin_archs();
+    let archs = selected_archs();
     // 头文件全量追踪(任一改动 ⇒ 重编)
     for h in [
         "cu/xqa/mha.cu", "cu/xqa/mha.h", "cu/xqa/defines.h", "cu/xqa/utils.h",
@@ -520,7 +570,7 @@ fn build_xqa_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
             compile_fatbin(&nvcc, std::path::Path::new("cu/xqa/mha.cu"), dst, &archs, flags);
         println!(
             "cargo:warning=owl-kernels: xqa_{name}.fatbin [{}] {} B{}",
-            archs.join(","),
+            archs_sm(&archs),
             std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0),
             if built { "" } else { "(增量命中,未重编)" }
         );
@@ -548,6 +598,7 @@ fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
     println!("cargo:rerun-if-env-changed=GDN_TRITON_BUILD");
     println!("cargo:rerun-if-env-changed=GDN_TRITON_PY");
     println!("cargo:rerun-if-env-changed=GDN_TRITON_DEVICE");
+    println!("cargo:warning=owl-kernels: 构建代际集 = [{}]（Cargo feature arch-smXX）", archs_sm(selected_archs()));
     // **默认自编**(2026-10-13 用户裁决:既然构建期已引入 Python+triton,
     // 就不留入库采集件)。`GDN_TRITON_BUILD=0` = 显式关(无 triton 环境仍能
     // **编过**这个 crate;代价 = 该族的资产表为空 ⇒ 装配期拒启,见 family 侧)。
@@ -564,8 +615,11 @@ fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
 
     let dir = out_dir.join("gdn");
     std::fs::create_dir_all(&dir).expect("mkdir gdn assets");
+    // 代际 = **Cargo feature**(`arch-smXX`;单份 `.a` 取最高代)
+    // AOT 只编译不发射 ⇒ `--device none` 下靠这个数字定 SASS 代际。
+    let gdn_arch = single_arch();
     let flags = format!(
-        "gdn-aot py={:?} dev={:?}",
+        "gdn-aot py={:?} dev={:?} arch={gdn_arch}",
         env::var("GDN_TRITON_PY").ok(),
         env::var("GDN_TRITON_DEVICE").ok()
     );
@@ -593,6 +647,8 @@ fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
             .arg(&dir)
             .arg("--device")
             .arg(&dev)
+            .arg("--target-arch")
+            .arg(gdn_arch.nvcc_num())
             .status()
             .unwrap_or_else(|e| panic!("gdn-aot: failed to spawn {py}: {e}"));
         assert!(status.success(), "gdn-aot: 自编失败({script})");
@@ -900,6 +956,17 @@ fn build_ops_table(out_dir: &std::path::Path) {
 fn main() {
     println!("cargo:rerun-if-env-changed=OWL_BUILD_JOBS");
     println!("cargo:warning=owl-kernels: CUDA 编译并行度 = {}（OWL_BUILD_JOBS 可覆盖）", build_jobs());
+    {
+        let archs = selected_archs();
+        let single = single_arch();
+        println!(
+            "cargo:warning=owl-kernels: 构建代际集 = [{}]（Cargo feature arch-smXX）· native 出 fatbin 多代 · 单份 .a 取最高代 {}(世代 {} · {})",
+            archs_sm(archs),
+            single,
+            single.family(),
+            single.caps().summary()
+        );
+    }
     // native cubin 构建期产出(终态 = 零运行期编译)
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     build_ops_table(&out_dir);
@@ -1017,14 +1084,14 @@ fn build_marlin() {
             println!("cargo:rerun-if-changed={}", h);
         }
         println!("cargo:rerun-if-env-changed=MARLIN_FORCE_BUILD");
-        println!("cargo:rerun-if-env-changed=MARLIN_CUDA_ARCH");
         println!("cargo:rerun-if-env-changed=MARLIN_NVCC");
         let force = env::var("MARLIN_FORCE_BUILD").ok().as_deref() == Some("1");
         let obj_dir = out_dir.join("marlin");
         std::fs::create_dir_all(&obj_dir).unwrap();
         let lib_out = out_dir.join("libmarlin.a");
         {
-            let arch = env::var("MARLIN_CUDA_ARCH").unwrap_or_else(|_| "86".into());
+            // 代际 = Cargo feature(`arch-smXX`;单份 `.a` 取最高代)
+            let arch = single_arch();
             let nvcc_m = env::var("MARLIN_NVCC").unwrap_or_else(|_| "nvcc".into());
             let base = PathBuf::from("cu/marlin");
             let sources = [
@@ -1055,7 +1122,7 @@ fn build_marlin() {
             // "用 FORCE_BUILD 跑过一次之后,普通构建反而重编")
             check_marlin_selector(&sources);
             let flags = format!(
-                "marlin arch=sm_{arch} nvcc={nvcc_m} ar={ar} log={} dev={}",
+                "marlin arch={arch} nvcc={nvcc_m} ar={ar} log={} dev={}",
                 log_enabled(),
                 std::env::var_os("OWL_LOG_DEVICE").is_some()
             );
@@ -1080,8 +1147,8 @@ fn build_marlin() {
                         }
                         args.extend(log_flags.iter().cloned());
                         args.extend([
-                            format!("-arch=compute_{arch}"),
-                            format!("-code=sm_{arch}"),
+                            format!("-arch=compute_{}", arch.nvcc_num()),
+                            format!("-code={}", arch.as_sm()),
                             "-O3".into(),
                             "-std=c++17".into(),
                             "-Xcompiler".into(),
@@ -1112,7 +1179,7 @@ fn build_marlin() {
                 let status = cmd.status().expect("marlin: failed to spawn ar");
                 assert!(status.success(), "marlin: ar failed");
                 stamp_write(&lib_out, &deps, &flags);
-                println!("cargo:warning=owl-kernels: built libmarlin.a (sm_{arch}) from source");
+                println!("cargo:warning=owl-kernels: built libmarlin.a ({arch}) from source");
             }
         }
         let cuda_lib = env::var("CUDA_HOME")
@@ -1181,6 +1248,9 @@ fn build_flashinfer() {
         println!("cargo:rerun-if-env-changed=FLASHINFER_FORCE_BUILD");
         println!("cargo:rerun-if-env-changed=FLASHINFER_INCLUDE");
         println!("cargo:rerun-if-env-changed=FLASHINFER_NVCC");
+        println!("cargo:rerun-if-env-changed=FLASHINFER_FORCE_BUILD");
+        // 设备码代际 = Cargo feature(`arch-smXX`;单份 `.a` 取最高代)
+        let fi_arch = single_arch();
         let force = env::var("FLASHINFER_FORCE_BUILD").ok().as_deref() == Some("1");
         let nvcc_m = env::var("FLASHINFER_NVCC").unwrap_or_else(|_| "nvcc".into());
         let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
@@ -1189,7 +1259,8 @@ fn build_flashinfer() {
         let lib = fi_dir.join("libowl_flashinfer.a");
         let log_flags = log_defines();
         let flags = format!(
-            "fi arch=sm_86 nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.6.18 split=2tu log={} dev={}",
+            "fi arch={} nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.6.18 split=2tu log={} dev={}",
+            fi_arch.as_sm(),
             log_enabled(),
             std::env::var_os("OWL_LOG_DEVICE").is_some()
         );
@@ -1222,7 +1293,7 @@ fn build_flashinfer() {
                 let mut args = vec![
                     "-O3".into(),
                     "-std=c++17".into(),
-                    "-arch=sm_86".into(),
+                    format!("-arch={}", fi_arch.as_sm()),
                     format!("-I{fi_include}"),
                     // owl_log.h(算子侧唯一日志出口)+ 编译门
                     "-Icu".into(),
@@ -1239,7 +1310,7 @@ fn build_flashinfer() {
             let fa2_args = vec![
                 "-O3".into(),
                 "-std=c++17".into(),
-                "-arch=sm_86".into(),
+                format!("-arch={}", fi_arch.as_sm()),
                 "--expt-relaxed-constexpr".into(),
                 "-DFLASHATTENTION_DISABLE_DROPOUT".into(),
                 "-DFLASHATTENTION_DISABLE_SOFTCAP".into(),

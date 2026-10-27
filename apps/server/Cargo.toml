@@ -30,6 +30,16 @@ hf-chat-template = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 
 [features]
+# **出代际（目标 GPU）** —— 只收消费级四代；缺省 = sm_86（RTX 30 系，可复现的基线档）。
+# 换卡/换机只需换 feature（不是刷环境变量）：
+#   cargo build --release -p server --no-default-features --features arch-sm120   # RTX 50 系
+#   cargo build --release -p server --no-default-features --features arch-sm86,arch-sm120  # 双代际 fatbin
+# 可选值：arch-sm75（RTX 20 系）/ arch-sm86（RTX 30 系）/ arch-sm89（RTX 40 系）/ arch-sm120（RTX 50 系）
+"default" = ["arch-sm86"]
+arch-sm75 = ["owl-cuda/arch-sm75"]
+arch-sm86 = ["owl-cuda/arch-sm86"]
+arch-sm89 = ["owl-cuda/arch-sm89"]
+arch-sm120 = ["owl-cuda/arch-sm120"]
 stepgate = ["owl-shared/stepgate"]
 
 # 性能框架(docs/arch/perf-framework.md):带本 feature 的 release 构建里

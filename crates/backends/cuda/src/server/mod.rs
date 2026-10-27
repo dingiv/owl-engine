@@ -808,6 +808,12 @@ impl GpuServer {
             .map_err(|e| ModelError::Msg(format!("device_sm_count: {e}")))
     }
 
+    /// 设备代际(运行期真值;纯属性读)
+    fn handle_device_arch(&self) -> Result<owl_kernels::Arch, ModelError> {
+        crate::ffi::device_arch(self.ctx().device_ordinal())
+            .map_err(|e| ModelError::Msg(format!("device_arch: {e}")))
+    }
+
     fn dispatch(&mut self, cmd: Command) {
         // 逐命令计时(OWL_SRV_TIMING 门控;卸载时汇总 —— server 侧分相,
         // 与客户端 [load] 探针互补:handler 真实执行时间,含阻塞段)
@@ -996,6 +1002,7 @@ impl GpuServer {
             // **E2b 接线**:复合 = 设备端事件序(record_tail + waitEvent),零 host 阻塞
             // 设备 SM 数:宿主面只读属性(无 GPU 活);失败 = 结构化拒(不猜)
             Command::DeviceSmCount { ack } => ack.send(self.handle_device_sm_count()),
+            Command::DeviceArch { ack } => ack.send(self.handle_device_arch()),
             Command::BlockLedgerDump { ack } => {
                 ack.send(self.ctx().block_ledger())
             }

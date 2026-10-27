@@ -1671,6 +1671,10 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         self.inner.sm_count()
     }
 
+    fn device_arch(&mut self) -> impl Future<Output = Result<owl_kernels::Arch, ModelError>> + Send {
+        self.inner.device_arch()
+    }
+
     fn copy_batch(
         &mut self,
         copies: &[(Bytes, usize, Bytes, usize, usize)],

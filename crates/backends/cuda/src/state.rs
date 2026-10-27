@@ -1260,9 +1260,12 @@ impl GpuCtx {
                     .map_err(|e| format!("查 COMPUTE_CAPABILITY_MINOR: {e:?}"))?;
                 let dev = format!("sm_{major}{minor}");
                 if !archs.contains(&dev.as_str()) {
+                    // 拒启消息必须**可操作**:直接给出要加的 feature(旧版指向的环境变量已废)
+                    let feat = dev.replacen("sm_", "arch-sm", 1);
                     return Err(format!(
-                        "装配期架构门:设备 {dev}(ordinal {ordinal} )不在构建期 cubin 代际集 {archs:?} 内 ——\
-                         重建时请加 `OWL_CUBIN_ARCHS=...,{dev}`(设计 §15.4)"
+                        "装配期架构门:设备 {dev}(ordinal {ordinal}) 不在构建期 cubin 代际集 {archs:?} 内 ——\
+                         重建时选代际 feature:` cargo build --release -p server --no-default-features --features {feat} `\
+                         (多代际:`--features arch-sm86,{feat}`;设计 §15.4)"
                     ));
                 }
             }

@@ -1142,6 +1142,23 @@ pub trait DeviceClient: Send {
         async { Err(ModelError::Msg("sm_count: 该后端未提供设备属性查询".into())) }
     }
 
+    /// **设备代际** —— 运行期代际真值(`是 sm_86 还是 sm_120`)。
+    ///
+    /// 用途:引擎 boot 把设备自述的代际写进 `EnvProvider::hw`,选核/能力面
+    /// (`dispatch` / `QuantGemm` / 日志)全部由此派生;
+    /// 与**构建期**真值(Cargo feature `arch-smXX` 写进 cubin 的 `CUBIN_ARCHS`)由
+    /// 装配期架构门在 boot 时对齐(不在编译集内 = 拒启)。
+    ///
+    /// 语义 = 同步小查询(纯属性读,不含 GPU 活;后端可缓存);
+    /// **默认 = 不支持** ⇒ 结构化拒(不猜代际 —— 猜错就是选错 kernel 臂),
+    /// 纯 host face 与无卡测试场自然落到这个默认。
+    fn device_arch(&mut self) -> impl Future<Output = Result<owl_kernels::Arch, ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        async { Err(ModelError::Msg("device_arch: 该后端未提供设备代际查询".into())) }
+    }
+
     /// 设备内批量块→块拷贝(E5-M4:spec 快照 capture/restore 的 192 次
     /// 逐块往返收敛为一次命令;单 ack = 全部已入流)。默认 = 逐条
     /// copy_block_at(CPU face / 未覆写后端语义等价)。
