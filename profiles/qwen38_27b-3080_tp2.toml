@@ -28,6 +28,11 @@ extends = [
 [server]
 bind = "127.0.0.1:8135"
 
+[model]
+# **W4A8 主干**(2026-10-27 用户裁决默认;理由与档①同:SM86 INT8 张量核 2×f16)。
+# TP2 每 rank 池 4096MiB / 预算 6.37G ⇒ a8 的工作区(≈170MiB/rank)有余量。
+quant = "w4a8"
+
 [runtime]
 max_seq = 262144
 max_concurrency = 1
@@ -35,8 +40,10 @@ max_concurrency = 1
 #   512  = 1486 / 1446 / 1359 t/s
 #   1024 = 1576 / 1521 / 1454 t/s
 #   2048 = 1605 / 1543 / 1477 t/s  ← 当前档
-# 只改本 TP2 档;3090 仍走 full.toml 的 512。
+# 只改本 TP2 档;3090 档 2026-10-27 亦提到 2048(单卡实测 +3~5%)。
+# 尾块合并取 0:同 full.toml 注 —— 合并会把块撑到 2560,工作区跟着变大。
 prefill_chunk = 2048
+prefill_tail_merge = 0
 # pi 不发 session 键:隐式会话 0 让工具轮/图片删除有稳定会话;
 # 跨会话前缀仍由内容寻址缓存兜底(实测 49k prompt 99.9% 命中)。
 implicit_session = true

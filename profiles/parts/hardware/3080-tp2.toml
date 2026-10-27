@@ -2,7 +2,7 @@
 [parallel]
 mode = "tensor"
 device = ["3080", "3080"]
+# AR 拓扑 = ar2(小包 barrier-only;其余非 fp8 落 fused;fp8 恒 v1 两核)
+tp_ar = "ar2"
 tp_ar_f8 = true
-tp_ar_fused = true
-tp_ar2 = true
 tp_vocab_split = true

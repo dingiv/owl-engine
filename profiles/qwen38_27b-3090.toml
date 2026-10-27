@@ -4,7 +4,8 @@
 #       投机 = DFlash2 d7(W4A16 草稿);KV = fp8 e4m3;**视觉塔开**;
 #       前缀缓存 + 三层账全开 + image_evict(FP8, delta_limit=4)。
 #
-# **max_seq = 63456 / snap_max = 2 —— 2026-10-25 全特性稳定点**
+# **max_seq = 57344 / snap_max = 2 —— 2026-10-27 a8 版全特性稳定点**
+# (原 a16 版 63456;换 a8 后显存账变小,见 [runtime] 注)
 #
 # 24G 卡上:27B + 视觉塔 + DFlash2 d7 + fp8 KV + 前缀缓存 + image_evict
 # 全部同时开。fresh boot 驱动余量 >1GiB;前缀缓存饱和后可能短暂出现 N6
@@ -36,9 +37,26 @@ extends = [
 [server]
 bind = "127.0.0.1:8134"
 
+[model]
+# **W4A8 主干**(2026-10-27 用户裁决默认):激活 per-token int8 × 权重 int4,
+# 走 SM86 **INT8 张量核**(W4A16 只能走 f16 核 ⇒ 半率)。实测同卡同二进制:
+#   prefill 4k 1334→**2126** / 8k 1311→**2230** t/s(**+59%**),decode 持平
+#   (+0.95ms/轮的 a8 verify 税已由 A-1/刀B 压掉大半),TTFT@4k 3.13→1.93 s。
+# 质量:非逐字同(int8 激活在近平分处翻 greedy 轨迹),S3 battery −0.95pt、
+#   McNemar p≈0.69 不显著 ⇒ 按"统计等价"取舍,见 roadmap 26-10-27 两份台账。
+quant = "w4a8"
+
 [runtime]
-max_seq = 63456
+# ⚠️ a8 的显存体积比 a16 大(marlin 工作区 84MiB×2 + 激活量化缓冲):
+# 63.4k 档实测 8k 请求就撞硬预算(拒发 19-34MiB)⇒ 全特性档收到 **57.3k**
+# (32k/24k 连发零拒发,余量 1.3GB)。要 63k 就不开 a8(回到 w4a16)。
+max_seq = 57344
 max_concurrency = 1
+# **prefill 块长 2048 / 尾块 0**(2026-10-27 逐档实测,详见 full.toml 注):
+# 4k 1320→1360、8k 1308→1358 t/s(+3.3%),32k TTFT 27.9→26.6s;
+# 4096 会撞显存硬预算(272MiB 工作区)⇒ 2048 是单卡天花板。
+prefill_chunk = 2048
+prefill_tail_merge = 0
 # pi 不发 session 键:隐式会话 0 让工具轮/图片删除有稳定会话;
 # 跨会话前缀仍由内容寻址缓存兜底。
 implicit_session = true

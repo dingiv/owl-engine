@@ -76,13 +76,17 @@ pub fn profile_path(name: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
-    /// **唯二常驻档门**(2026-10-24 用户裁决):`profiles/` 顶层入口档只允许
-    /// 两个硬件档 —— 单 3090 满血 / 双 3080 TP2 满血;其余形状一律用
-    /// `--set` 临时覆盖,不再落成新文件(历史 28 个入口档的收敛记录见
-    /// `roadmap.local/profiles-consolidation-2026-10-24.md`)。
+    /// **常驻档门**(2026-10-24 用户裁决"只留唯二硬件档";2026-10-27 增补第三档):
+    /// `profiles/` 顶层入口档只允许三个 ——
+    ///   ① 单 3090 / 27B **AWQ-INT4**(视觉 + image_evict 全特性);
+    ///   ② 双 3080 TP2 / 27B AWQ-INT4(长上下文 + 大图窗口);
+    ///   ③ 单 3090 / 27B **GGUF Q4_K_M**(文本档:prefill/decode 都比①快 25%+,
+    ///      代价 = 上下文 56k + 无视觉;2026-10-27 实测见该档头注)。
+    /// 其余形状一律用 `--set` 临时覆盖,不再落成新文件(历史 28 个入口档的
+    /// 收敛记录见 `roadmap.local/profiles-consolidation-2026-10-24.md`)。
     /// `full.toml` = 全量模板(构成底座,不是档位)、`parts/**` = 组件,不计入。
     #[test]
-    fn 入口档面只允许唯二常驻档() {
+    fn 入口档面只允许三个常驻档() {
         let names = profile_names();
         let mut got: Vec<&str> = names
             .iter()
@@ -92,7 +96,7 @@ mod tests {
         got.sort_unstable();
         assert_eq!(
             got,
-            vec!["qwen38_27b-3080_tp2", "qwen38_27b-3090"],
+            vec!["qwen38_27b-3080_tp2", "qwen38_27b-3090", "qwen38_27b-gguf_3090"],
             "档面膨胀了:要新形状请用 `--set` 覆盖,不要新增入口档"
         );
     }
