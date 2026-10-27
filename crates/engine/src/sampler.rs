@@ -19,6 +19,39 @@
 //! **RNG 契约**:xorshift64*,seed 由调用方从 (turn id, step) 派生 ——
 //! 同 turn 重放确定性(测试可复现),跨 turn 不同。
 
+/// **设备端重复惩罚窗口**(2026-10-26):固定 256 = 图输入槽 `rep_hist` 的长度。
+///
+/// 为什么要固定:图槽形状是捕获期契约,长度不能随请求/上下文变 —— 变长就
+/// 要新建图桶(本刀明确禁止)。语义 = 最近 256 个**已提交** token(去重排序)。
+pub const REP_HISTORY_WINDOW: usize = 256;
+
+/// 空槽/尾部填充值。真实词表 id < 2²⁴(见 argmax 契约),不会碰撞。
+pub const REP_HISTORY_SENTINEL: u32 = u32::MAX;
+
+/// 构建设备端惩罚集:最近 [`REP_HISTORY_WINDOW`] 个已提交 token,
+/// **去重后升序**,尾部用 [`REP_HISTORY_SENTINEL`] 填满。
+///
+/// 输入拆成 prompt/generated 两段只是为了避免调用点各拼一份 Vec;语义上就是
+/// `prompt_ids ++ generated` 的尾部窗口。草稿 token 不进入 v1 的历史(它们是
+/// speculative,尚未提交;见交接文档 §3.1)。
+#[must_use]
+pub fn penalty_history(prompt_ids: &[u32], generated: &[u32]) -> Vec<u32> {
+    let total = prompt_ids.len().saturating_add(generated.len());
+    let start = total.saturating_sub(REP_HISTORY_WINDOW);
+    let mut hist: Vec<u32> = Vec::with_capacity(REP_HISTORY_WINDOW);
+    if start < prompt_ids.len() {
+        hist.extend_from_slice(&prompt_ids[start..]);
+        hist.extend_from_slice(generated);
+    } else {
+        hist.extend_from_slice(&generated[start - prompt_ids.len()..]);
+    }
+    hist.sort_unstable();
+    hist.dedup();
+    debug_assert!(hist.len() <= REP_HISTORY_WINDOW);
+    hist.resize(REP_HISTORY_WINDOW, REP_HISTORY_SENTINEL);
+    hist
+}
+
 /// 采样配置(generation_config 同款三维 + 反循环惩罚)
 #[derive(Clone, Copy, Debug)]
 pub struct SamplerCfg {
@@ -178,7 +211,10 @@ pub fn distribution(logits: &mut [f32], cfg: &SamplerCfg, history: &[u32]) -> Ve
 /// - 之后的 softmax/top-p/多项式抽样直接复用 [`distribution`]。
 ///
 /// 前置门(调用方保证,不满足就走 logits 老路):`cfg.topk > 0`、
-/// `cfg.topk <= K`、`cfg.rep_penalty <= 1.0`、`union.len() >= cfg.topk`。
+/// `cfg.topk <= K`、`union.len() >= cfg.topk`。
+///
+/// **重复惩罚已由设备端 top-32 核在选候选之前完成**(2026-10-26):这里
+/// 传空 history 给 [`distribution`],不会二次惩罚;候选值就是最终比较值。
 pub fn sample_from_candidates(union: &[(f32, u32)], cfg: &SamplerCfg, rng: &mut u64) -> u32 {
     debug_assert!(cfg.topk > 0 && union.len() >= cfg.topk);
     let mut vals: Vec<f32> = union.iter().map(|(v, _)| *v).collect();
@@ -276,6 +312,89 @@ mod candidate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 与 production `distribution` 同式的 host 惩罚(仅测试参考用)。
+    fn apply_rep(logits: &mut [f32], rep: f32, history: &[u32]) {
+        if rep <= 1.0 || history.is_empty() {
+            return;
+        }
+        let mut uniq = history.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        for &t in &uniq {
+            let t = t as usize;
+            if t < logits.len() {
+                let v = logits[t];
+                logits[t] = if v > 0.0 { v / rep } else { v * rep };
+            }
+        }
+    }
+
+    #[test]
+    fn penalty_history_is_recent_dedup_sorted_with_sentinel() {
+        assert_eq!(penalty_history(&[], &[]), vec![REP_HISTORY_SENTINEL; REP_HISTORY_WINDOW]);
+
+        let h = penalty_history(&[9, 3, 9, 7], &[3, 5]);
+        // 最近窗口 = prompt ++ generated,去重升序,尾部哨兵
+        assert_eq!(&h[..4], &[3, 5, 7, 9]);
+        assert!(h[4..].iter().all(|&x| x == REP_HISTORY_SENTINEL));
+
+        // 超过窗口:只保留最近 256 个,再做去重排序
+        let prompt: Vec<u32> = (0..300).collect();
+        let gen: Vec<u32> = (300..400).collect();
+        let h = penalty_history(&prompt, &gen);
+        assert_eq!(h.len(), REP_HISTORY_WINDOW);
+        assert_eq!(h[0], 144, "窗口应从 400-256=144 开始");
+        assert_eq!(h[REP_HISTORY_WINDOW - 1], 399);
+        assert!(h.windows(2).all(|w| w[0] < w[1]), "必须严格升序");
+
+        // 窗口内重复 token 只留一份;空位仍是哨兵
+        let h = penalty_history(&[5, 5, 5], &[5, 6, 6]);
+        assert_eq!(h[0], 5);
+        assert_eq!(h[1], 6);
+        assert!(h[2..].iter().all(|&x| x == REP_HISTORY_SENTINEL));
+    }
+
+    /// 候选路径的重复惩罚语义:设备端先惩罚再 top-32,host 只在候选上
+    /// 做 temperature/top-k/top-p ⇒ 必须与全表 `sample` 逐 token 等价。
+    #[test]
+    fn candidates_equal_full_table_with_device_prepenalty() {
+        let n = 4096usize;
+        let mut x = vec![0f32; n];
+        let mut s = 0x1234_5678u64;
+        for v in x.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *v = ((s >> 40) as f32 / (1u64 << 24) as f32) * 8.0 - 4.0;
+        }
+        // 让历史命中若干真实高概率 token,并带重复项
+        let history: Vec<u32> = (20..70).chain(20..40).collect();
+        let cfg = SamplerCfg { temp: 0.8, topk: 20, topp: 0.92, rep_penalty: 1.3 };
+
+        let mut penalized = x.clone();
+        apply_rep(&mut penalized, cfg.rep_penalty, &history);
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            penalized[b]
+                .partial_cmp(&penalized[a])
+                .unwrap()
+                .then(a.cmp(&b))
+        });
+        let mut union: Vec<(f32, u32)> = order[..32]
+            .iter()
+            .map(|&i| (penalized[i], i as u32))
+            .collect();
+        union.sort_unstable_by_key(|&(_, i)| i);
+
+        for seed in 0..300u64 {
+            let state = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+            let (mut r1, mut r2) = (state, state);
+            let mut full = x.clone();
+            let a = sample(&mut full, &cfg, &mut r1, &history);
+            let b = sample_from_candidates(&union, &cfg, &mut r2);
+            assert_eq!(a, b, "候选路径与全表路径不等价 seed={seed}");
+            assert_eq!(r1, r2, "RNG 消耗必须一致 seed={seed}");
+        }
+    }
 
     #[test]
     fn greedy_arm_and_temp_zero() {

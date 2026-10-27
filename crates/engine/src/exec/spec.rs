@@ -165,10 +165,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             (act.sampler_on, act.sampler)
         };
         // **分布式采样门**(2026-10-26):采样档 + 词表切 + 图带 cand 槽
-        // + topk 有界 + 无重复惩罚。任一不满足 ⇒ 走原 logits 路径(响亮可解释)。
+        // + topk 有界。重复惩罚由设备端 top-32 核先行施加(2026-10-26),
+        // 不再回退整行 logits。
         let use_cand = sampler_on
             && self.head_split_active()
-            && sampler_cfg.rep_penalty <= 1.0
             && sampler_cfg.topk > 0
             && sampler_cfg.topk <= 32
             && proposal_q.is_none();
@@ -1233,6 +1233,25 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             } else {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             };
+        // **设备端重复惩罚历史**(2026-10-26):v1 = committed history
+        // (prompt 尾部 + 已生成),不含本轮草稿。采样关/rep<=1 时写全哨兵
+        // +1.0,核内跳过。两 rank 写同一份全局 id 历史(各自按 vocab_offset
+        // 查本半表),图槽内容不触发重捕获。
+        let (rep_hist_v, rep_penalty_v) = if vg.has_input("rep_hist") {
+            let act = self.turns.active()?;
+            let rep = if sampler_on { act.sampler.rep_penalty } else { 1.0 };
+            let hist = if rep > 1.0 {
+                crate::sampler::penalty_history(&act.prompt_ids, &act.out)
+            } else {
+                vec![crate::sampler::REP_HISTORY_SENTINEL; crate::sampler::REP_HISTORY_WINDOW]
+            };
+            (
+                hist.into_iter().map(f32::from_bits).collect::<Vec<_>>(),
+                vec![rep],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let gdn_slot_v1 = [gdn_slot as f32];
         let gdn_cu_v = [0.0f32, target_rows as f32];
         let mut ins: Vec<(&str, &[f32])> = vec![
@@ -1249,6 +1268,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 不写 = 留着恒等链 = 读到别家 KV —— §7.6)
             ("xqa_pt", xqa_pt_v),
         ];
+        // 设备端重复惩罚槽只随词表切存在;未切档不写(无消费者)。
+        if vg.has_input("rep_hist") {
+            ins.push(("rep_hist", rep_hist_v.as_slice()));
+            ins.push(("rep_penalty", rep_penalty_v.as_slice()));
+        }
         if !fi_q_cu_v.is_empty() {
             ins.push(("fi_q_cu", fi_q_cu_v.as_slice()));
             ins.push(("fi_indices", fi_idx_v.as_slice()));

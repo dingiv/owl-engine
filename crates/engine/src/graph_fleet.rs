@@ -22,6 +22,7 @@ use owl_models::tensor::TensorOps;
 
 use crate::engine::EngineKnobs;
 use crate::graph_plan::{GraphPlan, GraphPlanDesc, InputSlot, OutputSlot, PlanCtx, PlanOutcome};
+use crate::sampler::{REP_HISTORY_SENTINEL, REP_HISTORY_WINDOW};
 use crate::spec_runtime::{Drafter, SpecRuntime};
 use crate::state::{ModelDims, StatePool};
 use crate::Result;
@@ -562,6 +563,13 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 回退 4MB logits"——用固定小税消掉一个静默陷阱。
         let head_split = vocab != boot.model.vocab_size();
         let cand_on = head_split;
+        // 本 rank 半表在全局词表里的起点(rank0=0 / rank1=half)。候选索引
+        // 保持 local(host 合并照旧加偏移),只有设备端惩罚查历史时用全局 id。
+        let vocab_offset = if head_split {
+            vocab * boot.tp.as_ref().map(|t| t.plan.rank()).unwrap_or(0)
+        } else {
+            0
+        };
         // taps 层号表(闭包 'static ⇒ Arc 持有;单一事实源 = SpecRuntime)
         let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let kv_caches = pool.kv_caches();
@@ -707,12 +715,18 @@ impl<D: DeviceClient> GraphFleet<D> {
             sc.output("token", &tok)?;
             sc.output("logits", &tree)?;
             // **候选采样槽**(2026-10-26):裸 decode 采样不再回读整行 logits。
-            // 仅"词表切 + 采样档 flavor"捕获;greedy 档零节点零槽。
+            // 槽恒随词表切捕获(请求级 temp 可在 greedy flavor 上打开采样);
+            // 设备端 rep_penalty 也吃同一切档门,固定 hist/penalty 槽。
             if cand_on {
+                let hist = sc.input("rep_hist")?;
+                let rep = sc.input("rep_penalty")?;
                 let cand = owl_models::ops::topk32_of_logits(
                     &tree,
+                    &hist,
+                    &rep,
                     1,
                     owl_models::layers::dflash2::TOPK_NPARTS,
+                    vocab_offset,
                 );
                 sc.output("cand", &cand)?;
             }
@@ -763,6 +777,14 @@ impl<D: DeviceClient> GraphFleet<D> {
                             .init((0..pool.geom.nb).map(|i| f32::from_bits(i as u32)).collect()));
                         v.push(InputSlot::f32("fi_indptr", 2).init(vec![0.0, f32::from_bits(1)]));
                         v.push(InputSlot::f32("fi_last_len", 1).init(vec![f32::from_bits(1)]));
+                    }
+                    if cand_on {
+                        // 设备端重复惩罚的固定输入槽(形状不随内容变 => 不建桶)。
+                        // init = 全哨兵 + 1.0,与"惩罚关"的旧路径逐位一致。
+                        v.push(InputSlot::u32("rep_hist", REP_HISTORY_WINDOW).init(
+                            vec![f32::from_bits(REP_HISTORY_SENTINEL); REP_HISTORY_WINDOW],
+                        ));
+                        v.push(InputSlot::f32("rep_penalty", 1).rank1().init(vec![1.0]));
                     }
                     v
                 },
@@ -1005,6 +1027,12 @@ impl<D: DeviceClient> GraphFleet<D> {
         // "两半表合并"的分布式通路(tokv / cand)。未切档(单卡 / 关
         // `tp_vocab_split`)**零额外节点零额外槽** —— 不许为不存在的合并付税。
         let head_split = model_v.logits_vocab() != model_v.vocab_size();
+        let vocab_offset = if head_split {
+            model_v.logits_vocab()
+                * boot.tp.as_ref().map(|t| t.plan.rank()).unwrap_or(0)
+        } else {
+            0
+        };
         if head_split {
             vouts.push(OutputSlot {
                 name: "tokv".into(),
@@ -1047,7 +1075,8 @@ impl<D: DeviceClient> GraphFleet<D> {
             vouts.push(OutputSlot { name: format!("r{i}") , shape, dtype: dims.dtype });
         }
         let desc = GraphPlanDesc {
-                inputs: vec![
+                inputs: {
+                    let mut v = vec![
                     InputSlot::f32("ids", depth1),
                     InputSlot::f32("pos", depth1),
                     InputSlot::f32("kv_slots", depth1),
@@ -1077,7 +1106,16 @@ impl<D: DeviceClient> GraphFleet<D> {
                         .init((0..pool.geom.nb).map(|i| f32::from_bits(i as u32)).collect()),
                     InputSlot::f32("fi_indptr", 2).init(vec![0.0, f32::from_bits(1)]),
                     InputSlot::f32("fi_last_len", 1).init(vec![f32::from_bits(depth1 as u32)]),
-                ],
+                    ];
+                    // 设备端重复惩罚槽只随词表切存在(未切档零额外槽)。
+                    if head_split {
+                        v.push(InputSlot::u32("rep_hist", REP_HISTORY_WINDOW).init(
+                            vec![f32::from_bits(REP_HISTORY_SENTINEL); REP_HISTORY_WINDOW],
+                        ));
+                        v.push(InputSlot::f32("rep_penalty", 1).rank1().init(vec![1.0]));
+                    }
+                    v
+                },
                 outputs: vouts,
                 capture: !knobs.no_graph,
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
@@ -1253,10 +1291,15 @@ impl<D: DeviceClient> GraphFleet<D> {
                     sc.output("tokv", &troot)?;
                 }
                 if cand_on {
+                    let hist = sc.input("rep_hist")?;
+                    let rep = sc.input("rep_penalty")?;
                     let cand = owl_models::ops::topk32_of_logits(
                         &logits,
+                        &hist,
+                        &rep,
                         depth1,
                         owl_models::layers::dflash2::TOPK_NPARTS,
+                        vocab_offset,
                     );
                     sc.output("cand", &cand)?;
                 }

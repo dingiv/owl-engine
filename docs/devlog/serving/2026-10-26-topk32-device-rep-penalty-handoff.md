@@ -1,9 +1,10 @@
 # top-32 候选路径支持 rep_penalty —— 设计与交接
 
-> 2026-10-26。状态：**设计完成，未实现**。
-> 目标分支：从当前 main（或合入 store-hook 后的 main）新建
-> `feat/topk32-rep-penalty`。
-> 现场服务：`feat/store-hook-p2`，3080 TP2，`/tmp/owl-8135-store.log`。
+> 2026-10-26。状态：**已实现并真机验收**（P0–P4）。
+> 分支：`feat/topk32-rep-penalty`（从 `feat/store-hook-p2` tip `898bf77e`
+> 起，含 sampling/abort 修复；main 合入顺序见文末）。
+> 现场服务：3080 TP2，profile `qwen38_27b-3080_tp2.toml`，
+> `sampling.rep_penalty = 1.05`，日志 `/tmp/owl-8135-topk32-final2.log`。
 
 ---
 
@@ -12,6 +13,67 @@
 把 repetition penalty 放到**设备端 top-32 选候选之前**，用固定 256 token
 的 committed history 作为输入槽；这样 `rep_penalty > 1` 仍然走候选快路，
 不再回退整行 logits，也**不增加任何桶图**。
+
+---
+
+## 实现结果（2026-10-26）
+
+### 与设计的一处必要偏差
+
+`rep_penalty` 在核里是 **`const float*` 设备指针**，不是 `float` 标量：
+
+- 图输入槽的内容必须逐轮可换；标量会在 CUDA graph 捕获时烘死；
+- 因此 kernel 参数声明为 `Param::t_in("rep_penalty", Dtype::F32, 1)`，
+  核内 `const float rp = rep_penalty[0]`；
+- `hist` / `rep_penalty` 都是固定槽，内容变化不触发重捕获；
+- 其余（H=256、hist 升序去重、尾部哨兵、`vocab_offset`、先惩罚后 top-32）
+  与设计一致。
+
+### 代码落点
+
+```text
+crates/engine/src/sampler.rs       REP_HISTORY_WINDOW/HISTORY_SENTINEL + penalty_history
+crates/kernels/cu/elems/topk32.cu  hist 载入 shared + 二分命中 + 惩罚 + top-32
+crates/kernels/src/ops/elems.rs    Topk32Split 参数表（hist/rep_penalty/hist_cap/offset）
+crates/models/src/ops.rs           topk32_of_logits 接 hist/rep/offset
+crates/engine/src/graph_fleet.rs   session/verify 图固定槽 rep_hist + rep_penalty
+crates/engine/src/exec/phases.rs   decode 每步写 committed history
+crates/engine/src/exec/spec.rs     verify 每轮写 committed history + 打开 use_cand
+crates/kernels/tests/topk32_penalty.rs  5 类 kernel 对拍
+profiles/qwen38_27b-3080_tp2.toml  rep_penalty = 1.05
+```
+
+### 验收数字（3080 TP2，同 prompt/seed，256 tok）
+
+| 配置 | decode | spec AL |
+|---|---:|---:|
+| `rep=1.0` | 56.0–57.3 t/s | 1.57 |
+| `rep=1.05` | 57.6–58.6 t/s | 1.71 |
+
+另一条 thinking 长 prompt 上 `rep=1.05` 实测 85–94 t/s（旧回退路径
+同档约 52 t/s），证明没有关闭候选快路。`spec.verify.pre.lgread` 在
+真机 metrics 中 **0 行**（未读整行 logits），`spec.verify.pre.cand.r0`
+≈0.33 ms/轮。
+
+图：boot 前后均为 session×2 / verify×2 / fold×2 / propose×2；运行期
+（多轮、不同 history 内容）**无重捕获**。
+
+测试：
+
+```text
+topk32_penalty（GPU）        1 passed（5 cases，值与 id 逐位对 host）
+sampler unit                 12 passed
+op_tables                    10 passed
+owl-engine --lib             171 passed
+gpu_spec_identity_gate       0.8B + 27B 均 PASS
+gpu_image_evict_spec_identity_gate  PASS
+```
+
+### 合并注意
+
+本分支基于 `feat/store-hook-p2`（尚未合入 main）。合并顺序建议：
+先合 store-hook-p2，再合本分支；`profiles/qwen38_27b-3080_tp2.toml`
+的 sampling 段和 `docs/README.md` 索引按冲突双方保留。
 
 ---
 

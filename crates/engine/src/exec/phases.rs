@@ -772,6 +772,23 @@ let mut step_slots: Vec<(&str, Vec<f32>)> = vec![
     ("kv_slot", vec![kv_slot as f32]),
     ("gdn_slot", vec![gdn_slot as f32]),
 ];
+// **设备端重复惩罚(2026-10-26)**:固定 256 的 committed history +
+// rep_penalty 都走图输入槽。`rep_penalty<=1` 时写全哨兵 + 1.0,核内
+// 整段跳过 ⇒ 旧路径零行为/零成本变化;槽只在候选词表切档时存在。
+if self.dev.graphs.session.has_input("rep_hist") {
+    let (hist_bits, rep) = {
+        let act = self.turns.active()?;
+        let rep = if act.sampler_on { act.sampler.rep_penalty } else { 1.0 };
+        let hist = if rep > 1.0 {
+            crate::sampler::penalty_history(&act.prompt_ids, &act.out)
+        } else {
+            vec![crate::sampler::REP_HISTORY_SENTINEL; crate::sampler::REP_HISTORY_WINDOW]
+        };
+        (hist.into_iter().map(f32::from_bits).collect::<Vec<_>>(), rep)
+    };
+    step_slots.push(("rep_hist", hist_bits));
+    step_slots.push(("rep_penalty", vec![rep]));
+}
 if self.dev.graphs.session.has_input("xqa_seq") {
     step_slots.push(("xqa_seq", vec![f32::from_bits((pos + 1) as u32)]));
     let n = self.dev.graphs.session.input_len("xqa_sem").unwrap_or(0);
@@ -980,10 +997,12 @@ if self.dev.graphs.session.has_input("sel_pt") {
             .seed
             .unwrap_or_else(|| turn_id.wrapping_mul(0x9E3779B97F4A7C15));
         // **候选采样门**(2026-10-26):采样 + 词表切 + 图带 cand 槽 + topk 有界
-        // + 无重复惩罚 ⇒ 只读 64×2 float/rank,不回读整行 logits。
+        // ⇒ 只读 64×2 float/rank,不回读整行 logits。重复惩罚已在设备端
+        // top-32 核内先做,不再作为回退条件。
+        // rep_penalty 不再是门:设备端 top-32 核已在选候选前施加惩罚
+        // (2026-10-26)。history 已随 `rep_hist` 槽传入。
         let use_cand = sampler_on
             && self.head_split_active()
-            && eff_sampler.rep_penalty <= 1.0
             && eff_sampler.topk > 0
             && eff_sampler.topk <= 32;
         let nt = if sampler_on && use_cand {

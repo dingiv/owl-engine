@@ -794,10 +794,18 @@ pub fn argmax_f32idx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> c
 ///
 /// `stride` = 本 rank 的 logits 行宽(词表切档 = 半表)⇒ 索引是**半表域**,
 /// 全局 id 由 host 合并面加偏移(与 DFlash2 候选同律)。
+///
+/// **设备端重复惩罚**:`hist` = 全局 id 升序去重 + 尾部 u32::MAX 的固定窗口;
+/// `rep_penalty` = `[1]` f32 设备张量,核先按 `vocab_offset + local` 命中历史、
+/// 再做 top-32。两者都走图输入槽(不随内容重捕获)。`rep_penalty <= 1.0`
+/// 核内整段跳过,与旧 top-32 逐位一致。
 pub fn topk32_of_logits(
     logits: &crate::tensor::TensorOps,
+    hist: &crate::tensor::TensorOps,
+    rep_penalty: &crate::tensor::TensorOps,
     rows: usize,
     nparts: usize,
+    vocab_offset: usize,
 ) -> crate::tensor::TensorOps {
     use crate::contract::Dtype;
     const K: usize = 32;
@@ -805,9 +813,13 @@ pub fn topk32_of_logits(
     let part = crate::tensor::TensorOps::call(SemanticKernel::Topk32Split)
         .aux(&[rows, nparts])
         .arg(logits)
+        .arg(hist)
+        .arg(rep_penalty)
         .arg_i32(stride as i32)
         .arg_i32(nparts as i32)
         .arg_i32(rows as i32)
+        .arg_i32(hist.shape()[0] as i32)
+        .arg_i32(vocab_offset as i32)
         .with_shape(Dtype::F32, vec![2 * rows * nparts * K]);
     crate::tensor::TensorOps::call(SemanticKernel::Topk32Merge)
         .aux(&[rows])

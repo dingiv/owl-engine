@@ -48,8 +48,10 @@ mode = "sampling"
 temp = 0.7
 topk = 20
 topp = 0.95
-# 保持 1.0：>1.0 会关闭候选 top-32 采样快路（use_cand 门），decode 掉 30%。
-rep_penalty = 1.0
+# 2026-10-26：设备端 top-32 先惩罚再选候选，1.05 不再回退整行 logits
+# （实测同 prompt/seed：1.0 56.0–57.3 t/s vs 1.05 57.6–58.6 t/s；AL 1.57→1.71）。
+# 这是 opt-in 反循环档：若长跑出现词沙拉/工具遵循下降，回 1.0 即可（核内跳过）。
+rep_penalty = 1.05
 
 [spec]
 # TP2 草稿族放行(缺它 = tp.rs 装配期响亮拒)

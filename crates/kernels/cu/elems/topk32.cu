@@ -6,16 +6,23 @@
 // 换名字。为什么需要 32:host 采样器的 `topk` 缺省 20 > 16;候选集必须
 // **包含全局 top-k**,否则采样分布不等价。
 //
-// 入口契约与 K=16 版逐字同形:
-//   owl_topk32_split_f16(x[vocab] f16, vocab, nparts, rows, tmp[2*rows*nparts*K])
+// 入口契约:
+//   owl_topk32_split_f16(x[vocab] f16, hist[H] u32, rep_penalty[1] f32,
+//                        vocab, nparts, rows, hist_cap, vocab_offset,
+//                        tmp[2*rows*nparts*K])
 //   owl_topk32_merge_f16(tmp, nparts, rows, vocab, out[2*rows*K])
 // 输出:值区 [rows*K) + 索引区 [rows*K, 2*rows*K)(f32 过线)。
+//
+// **设备端重复惩罚(2026-10-26)**:必须在 top-K 选择**之前**施加 —— 被惩罚
+// 的重复 token 可能从第 1 名掉到第 33 名,原第 33 名必须补进候选。hist 是
+// **全局 token id**(升序去重,尾部 u32::MAX);本 rank 的 local index 经
+// `vocab_offset` 映射成全局 id。rep_penalty <= 1.0 时整段跳过(旧路径逐位
+// 不变)。rep_penalty 是**设备指针**(图输入槽内容可逐轮变,不重捕获)。
 // ============================================================================
 #include <cuda_fp16.h>
 
 #ifdef __CUDACC_RTC__
 typedef int int32_t;
-typedef unsigned int uint32_t;
 typedef unsigned short uint16_t;
 typedef long long int64_t;
 typedef unsigned long long uint64_t;
@@ -24,6 +31,7 @@ typedef unsigned long long uint64_t;
 #define TOPK32_BLOCK 256
 #define TOPK32_K 32
 #define TOPK32_NWARP (TOPK32_BLOCK / 32)
+#define TOPK32_HIST 256
 
 // ---------------------------------------------------------------------------
 // 2b) split-K 逐行 top-K(K=16 烘焙)—— **段一**(2026-10-14 D2 性能战线)
@@ -51,6 +59,25 @@ typedef unsigned long long uint64_t;
 /// (值降, 索引升)严格全序比较:真 = (v,iv) 优于 (w,iw)
 __device__ __forceinline__ bool topk32_gt(float v, int iv, float w, int iw) {
     return (v > w) || (v == w && iv < iw);
+}
+
+/// hist 已升序去重;哨兵 u32::MAX 在尾部,不会与真实 id 相等。
+__device__ __forceinline__ bool topk32_hist_has(
+    const unsigned int* __restrict__ hist, int n, unsigned int gid) {
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (hist[mid] < gid) lo = mid + 1; else hi = mid;
+    }
+    return lo < n && hist[lo] == gid;
+}
+
+/// llama.cpp 同语义:正 logit 除,负 logit 乘;每个不同 token 只罚一次
+/// (host 的 `penalty_history` 已去重)。
+__device__ __forceinline__ float topk32_rep_penalty(
+    float v, unsigned int gid, const unsigned int* __restrict__ hist, int n, float rep) {
+    if (!topk32_hist_has(hist, n, gid)) return v;
+    return v > 0.0f ? v / rep : v * rep;
 }
 
 /// 寄存器 top-16 插入(全展开常量索引;tk_tour 的"winner 在 slot 0"前提靠它)
@@ -91,11 +118,15 @@ __device__ __forceinline__ void topk32_tour(float* tv, int* ti, int lane, int si
 }
 
 extern "C" __global__ void owl_topk32_split_f16(
-    const __half* __restrict__ x,   // [rows, vocab]
+    const __half* __restrict__ x,            // [rows, vocab](本 rank 半表)
+    const unsigned int* __restrict__ hist,       // [hist_cap] 全局 id,升序去重
+    const float* __restrict__ rep_penalty,   // [1](设备指针;内容逐轮可换)
     int vocab,
     int nparts,
     int rows,
-    float* __restrict__ tmp) {      // [2*rows*nparts*K]:值区 + 索引区(见头注)
+    int hist_cap,
+    int vocab_offset,
+    float* __restrict__ tmp) {               // [2*rows*nparts*K]:值区 + 索引区
     const int row  = blockIdx.x / nparts;
     const int part = blockIdx.x % nparts;
     const int tid  = threadIdx.x;
@@ -105,6 +136,16 @@ extern "C" __global__ void owl_topk32_split_f16(
     const int hi = min(vocab, lo + chunk);
     const int n = hi > lo ? (hi - lo) : 0;   // nparts > vocab 时尾部空段(测试小词表)
     const __half* base = x + (unsigned long long)row * vocab + (lo < vocab ? lo : vocab);
+
+    // 惩罚集:每 block 一次载入 shared(1 KiB);rep<=1 时连载入/同步都跳过。
+    const float rp = rep_penalty[0];
+    const bool penalize = rp > 1.0f;
+    const int hn = hist_cap < 0 ? 0 : (hist_cap > TOPK32_HIST ? TOPK32_HIST : hist_cap);
+    __shared__ unsigned int hist_s[TOPK32_HIST];
+    if (penalize) {
+        for (int i = tid; i < hn; i += TOPK32_BLOCK) hist_s[i] = hist[i];
+        __syncthreads();
+    }
 
     float tv[TOPK32_K];
     int   ti[TOPK32_K];
@@ -128,11 +169,21 @@ extern "C" __global__ void owl_topk32_split_f16(
         f[6] = __half2float(__ushort_as_half((unsigned short)(u.w & 0xffffu)));
         f[7] = __half2float(__ushort_as_half((unsigned short)(u.w >> 16)));
         #pragma unroll
-        for (int j = 0; j < 8; ++j) topk32_push(f[j], i0 + j, tv, ti);
+        for (int j = 0; j < 8; ++j) {
+            const int ii = i0 + j;
+            float v = f[j];
+            if (penalize)
+                v = topk32_rep_penalty(v, (unsigned int)(vocab_offset + ii), hist_s, hn, rp);
+            topk32_push(v, ii, tv, ti);
+        }
     }
     // 标量尾(含未对齐兜底)
-    for (int i = lo + nvec * 8 + tid; i < hi; i += TOPK32_BLOCK)
-        topk32_push(__half2float(base[i - lo]), i, tv, ti);
+    for (int i = lo + nvec * 8 + tid; i < hi; i += TOPK32_BLOCK) {
+        float v = __half2float(base[i - lo]);
+        if (penalize)
+            v = topk32_rep_penalty(v, (unsigned int)(vocab_offset + i), hist_s, hn, rp);
+        topk32_push(v, i, tv, ti);
+    }
 
     // 块内归并:各 warp 锦标赛 → smem 候选 → warp0 再锦标赛 → 直写 tmp
     // (块内跨 warp 只 1 次同步;旧 16 轮 smem argmax 是 144 次)

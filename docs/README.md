@@ -123,6 +123,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/serving/spec-tailcap-gpu-spin-立案.md`](devlog/serving/spec-tailcap-gpu-spin-立案.md) — DFlash2 尾批裁剪 ⇒ verify 图档形状错配 ⇒ **设备核自旋整台钉死**(已修;含根因、复现与回归门)
 - ⬜ [`devlog/serving/2026-10-26-leave-gap-frontend-handoff.md`](devlog/serving/2026-10-26-leave-gap-frontend-handoff.md) — leave-gap 前端联调交接:KV 引用解除、turn35 重复输出、turn38 压缩全量 prefill、视觉塔缓存复用
 - ⬜ [`devlog/serving/2026-10-26-prefill-f16-shadow-3080实测.md`](devlog/serving/2026-10-26-prefill-f16-shadow-3080实测.md) — prefill FP8→F16 shadow:3080 TP2 +3~9%、1.265× attention、cap 预留修 OOM、相对数值门
+- ✅ [`devlog/serving/2026-10-26-topk32-device-rep-penalty-handoff.md`](devlog/serving/2026-10-26-topk32-device-rep-penalty-handoff.md) — top-32 设备端 rep_penalty:H=256 committed history、固定图槽、先惩罚后 top-32、3080 A/B 与 kernel 对拍
 
 ## I. Performance and engineering (framework · device · pitfalls · bench reports)
 

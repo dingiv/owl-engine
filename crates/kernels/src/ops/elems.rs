@@ -793,9 +793,15 @@ impl KernelSpec for Topk32SplitF16 {
     const SRC: &'static str = "cu/elems/topk32.cu";
     const PARAMS: &'static [Param] = &[
         Param::t_in("x", Dtype::F16, 2),
+        // 设备端重复惩罚(2026-10-26):hist=全局 id 升序去重 + 尾部哨兵;
+        // rep_penalty 必须是**设备张量**(图输入槽内容可变,标量会被图烘死)。
+        Param::t_in("hist", Dtype::U32, 1),
+        Param::t_in("rep_penalty", Dtype::F32, 1),
         Param::i32("vocab"),
         Param::i32("nparts"),
         Param::i32("rows"),
+        Param::i32("hist_cap"),
+        Param::i32("vocab_offset"),
         Param::t_out("tmp", Dtype::F32, 1),
     ];
     const LAWS: &'static [Law] = &[Law::OutputFinite];
