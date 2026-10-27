@@ -34,29 +34,38 @@ use crate::tier::Tier;
 ///
 /// 两个字段是**两腿的独立目标**(§30.2):
 /// - `slots` = KV 设备槽(32 token 页)要腾出的量;
-/// - `snap_bytes` = 状态腿(GDN 快照)要腾出的设备字节(0 = 不动快照)。
+/// - `snap_bytes` = 状态腿(GDN 快照)要腾出的设备字节(0 = 不动快照);
+/// - `host_slots` = **宿主腾位量**(HostPressure;只出 `Sink::Disk` 票,
+///   跳过 GPU→Host)。
 ///
 /// 压力/空转节点里它们是"**目标腾出量**"(零缺口也搬);准入/增长节点里
-/// `slots` 读作"缺口"(已扣自由槽),`snap_bytes` 恒 0。
+/// `slots` 读作"缺口"(已扣自由槽),`snap_bytes`/`host_slots` 恒 0。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Need {
     /// 需要的**设备槽数**(KV 腿;周转量,不是总量)。
     pub slots: usize,
     /// 需要的**状态腿设备字节**(快照;0 = 不动状态腿)。
     pub snap_bytes: usize,
+    /// 需要的**宿主槽数**(HostPressure;0 = 不专门腾宿主)。
+    pub host_slots: usize,
     /// 需求来源(打点/排障口径;H1 准入 / H2 增长 / H5 空转整理 / N6 压力)。
     pub why: NeedWhy,
 }
 
 impl Need {
-    /// 构造(状态腿目标缺省 0 —— 绝大多数节点只动 KV)。
+    /// 构造(状态腿/宿主目标缺省 0 —— 绝大多数节点只动 KV 设备槽)。
     pub fn kv(slots: usize, why: NeedWhy) -> Self {
-        Self { slots, snap_bytes: 0, why }
+        Self { slots, snap_bytes: 0, host_slots: 0, why }
     }
 
-    /// 是否零需求(KV 与状态腿都不动)。
+    /// **宿主压力票**：只把宿主冷面挪去磁盘，不从设备再往下沉。
+    pub fn host(slots: usize) -> Self {
+        Self { slots: 0, snap_bytes: 0, host_slots: slots, why: NeedWhy::HostPressure }
+    }
+
+    /// 是否零需求(KV / 状态腿 / 宿主都不动)。
     pub fn is_zero(&self) -> bool {
-        self.slots == 0 && self.snap_bytes == 0
+        self.slots == 0 && self.snap_bytes == 0 && self.host_slots == 0
     }
 }
 
@@ -74,6 +83,9 @@ pub enum NeedWhy {
     /// `slots`/`snap_bytes` 读作"**目标腾出量**"(不是缺口)。与其它节点的区别
     /// 只有一条:不吃 `free >= 目标` 早退(压力下"手上有货"也要整理)。
     Pressure,
+    /// **宿主压力**(P1-3 后续):宿主满/低 ⇒ 只把宿主冷面挪到磁盘,
+    /// **跳过 GPU→Host**,不把设备面再压进已经紧的宿主。
+    HostPressure,
 }
 
 /// 一块该去哪儿(次序:Host → Disk → Drop;§12.3 的三步唯一正确顺序)。
@@ -107,7 +119,8 @@ pub enum EvictOut {
         /// 从链尾向链头搬完,`chain` 是链尾)。
         ///
         /// - `Sink::Host` / `Sink::Drop`:值 = **设备槽数**;
-        /// - `Sink::Disk`(S6.1):值 = 链上**在宿主**的块数(整链搬盘 ⇒ 盘上可重建前缀)。
+        /// - `Sink::Disk`(S6.1):值 = 从**根**起要搬盘的块数;整链压力票 = 链长,
+        ///   HostPressure 可只取前缀(盘上仍是 root 连续的可用前缀)。
         span: usize,
     },
     /// 状态腿:快照(粒度 = 单张快照;`SnapKey` 是内容身份)。
@@ -230,10 +243,18 @@ pub fn plan_capacity(
     if need.is_zero() {
         return v;
     }
-    let force = matches!(need.why, NeedWhy::Pressure | NeedWhy::Idle);
-    // 非压力/空转:零缺口 ⇒ 不动任何人。状态腿目标只有压力/空转节点才给
-    // (`snap_bytes > 0` 且非 force 属调用方错配 —— 仍按"要腾"处理,不静默忽略)。
-    if !force && need.slots <= kv.slots_free() && need.snap_bytes == 0 {
+    let force = matches!(
+        need.why,
+        NeedWhy::Pressure | NeedWhy::Idle | NeedWhy::HostPressure
+    );
+    // 非压力/空转:零缺口 ⇒ 不动任何人。状态腿/宿主目标只有压力/空转节点才给
+    // (`snap_bytes/host_slots > 0` 且非 force 属调用方错配 —— 仍按"要腾"处理,
+    // 不静默忽略)。
+    if !force
+        && need.slots <= kv.slots_free()
+        && need.snap_bytes == 0
+        && need.host_slots == 0
+    {
         return v;
     }
 
@@ -246,12 +267,20 @@ pub fn plan_capacity(
         need.slots.saturating_sub(kv.slots_free())
     };
     let snap_goal = need.snap_bytes;
+    // HostPressure 只腾宿主:设备 leg 的两个目标归零,轮一不产生 GPU→Host 票。
+    let host_disk_only = need.host_slots > 0;
+    let host_goal = need.host_slots;
 
     let mut got_slots = 0usize;
     let mut got_snap = 0usize;
+    let mut got_host = 0usize;
     let mut picked: Vec<ChainHash> = protect_chains.to_vec();
-    let mut kv_host_room = room.host_kv_slots;
-    let mut snap_host_room = room.host_snap_slots;
+    let mut kv_host_room = if host_disk_only { 0 } else { room.host_kv_slots };
+    let mut snap_host_room = if host_disk_only {
+        0
+    } else {
+        room.host_snap_slots
+    };
 
     // ── 轮零：宿主满 ⇒ 先腾宿主位（否则轮一无位可出票） ─────────────────────
     //
@@ -419,9 +448,18 @@ pub fn plan_capacity(
                     if disk_kv == 0 || span > disk_kv {
                         continue;
                     }
-                    v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Disk, span });
+                    let take = if host_disk_only {
+                        span.min(host_goal.saturating_sub(got_host))
+                    } else {
+                        span
+                    };
+                    if take == 0 {
+                        continue;
+                    }
+                    v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Disk, span: take });
                     picked.push(tail);
-                    disk_kv -= span;
+                    disk_kv -= take;
+                    got_host += take;
                     host_relief_host = true;
                 }
                 Leg::State => {
@@ -429,8 +467,12 @@ pub fn plan_capacity(
                     if disk_snap == 0 {
                         continue;
                     }
+                    if host_disk_only && got_host >= host_goal {
+                        continue;
+                    }
                     v.out.push(EvictOut::Snap { key, sink: Sink::Disk });
                     disk_snap -= 1;
+                    got_host += 1;
                     host_relief_host = true;
                 }
             }
@@ -442,7 +484,11 @@ pub fn plan_capacity(
     // **`host_relief` 优先**(内容不丢):本轮已把宿主里最冷的挪去磁盘 ⇒
     // 宿主位下一拍就回来。此时**不做 Drop、不 deny** —— 设备缺口留一拍
     // (节点每拍都跑);代价是那一拍 `ensure_for_len` 可能响亮拒,而丢掉的是内容。
-    if !host_relief && !host_relief_host && (got_slots < kv_goal || got_snap < snap_goal) {
+    if !host_disk_only
+        && !host_relief
+        && !host_relief_host
+        && (got_slots < kv_goal || got_snap < snap_goal)
+    {
         let mut cands2: Vec<EvictCandidate> = Vec::new();
         if got_slots < kv_goal {
             // 叶级:丢尾部不动链头(前缀仍可复用)。已出票的链尾已在 `picked` 里。
@@ -511,18 +557,23 @@ pub fn plan_capacity(
     }
 
     // ── ③ 仍不足 ⇒ 拒(不许动活跃面;腾过宿主的一拍不算"凑不够") ──────────
-    if !host_relief && !host_relief_host && (got_slots < kv_goal || got_snap < snap_goal) {
+    let host_short = got_host < host_goal;
+    if host_short || (!host_relief && !host_relief_host && (got_slots < kv_goal || got_snap < snap_goal)) {
         let mut why = format!(
-            "{} 判据:KV 需求 {} 槽(自由 {}),状态腿需求 {} B;可搬面凑出 {} 槽/{} B(短 {} 槽/{} B);\
+            "{} 判据:KV 需求 {} 槽(自由 {}),状态腿需求 {} B,宿主需求 {} 槽;\
+             可搬面凑出 {} 槽/{} B/{} 宿主槽(短 {} 槽/{} B/{} 宿主槽);\
              宿主预算 KV {} B/{} 槽、状态腿 {} 张",
             kv.label(),
             kv_goal,
             kv.slots_free(),
             snap_goal,
+            host_goal,
             got_slots,
             got_snap,
+            got_host,
             kv_goal.saturating_sub(got_slots),
             snap_goal.saturating_sub(got_snap),
+            host_goal.saturating_sub(got_host),
             kv.host_budget_bytes(),
             room.host_kv_slots,
             room.host_snap_slots,

@@ -111,6 +111,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/memory/kvarn-k4v4-落地可行性复核.md`](devlog/memory/kvarn-k4v4-落地可行性复核.md) — KVarN feasibility review: sink/tail lifecycle, store RTN/pack gap, page128 blast radius, 3090/3080 capacity math, k4v4 vs k4v2 verdict
 - ⬜ [`devlog/memory/kv-quant-deep-dive.md`](devlog/memory/kv-quant-deep-dive.md) — KV quant deep dive: FP8 vs TQ k8v4 vs KVarN (quality/capacity/integration)
 - ⬜ [`devlog/memory/fp8-baseline-2026-10-25.md`](devlog/memory/fp8-baseline-2026-10-25.md) — FP8 KV baseline: GSM8K 200, MMLU-Pro smoke, needle 240k, std (spec-off)
+- ⬜ [`devlog/memory/2026-10-27-memory-plan-v0-v1.md`](devlog/memory/2026-10-27-memory-plan-v0-v1.md) — MemoryPlan V0/V1 + first schedulers refactor: single budget source, shared-prefix dedup, state-slot disk spill, Grant/Reservation ledger, active-snapshot guard, PressureSignals + idle-off-by-default, HostPressure disk-only tickets with low/high host watermarks
 
 ## H. Serving, sessions and configuration
 

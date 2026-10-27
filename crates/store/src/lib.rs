@@ -39,54 +39,63 @@ pub mod budget;
 pub mod disk;
 pub mod disk_index;
 pub mod error;
-pub mod host;
-pub mod moves;
-pub mod id;
 pub mod hooks;
+pub mod host;
+pub mod id;
 pub mod kv;
 pub mod leg;
+pub mod moves;
+pub mod plan;
 pub mod policy;
 pub mod rel;
+pub mod reservations;
 pub mod select;
 pub mod state;
 pub mod tier;
 
+pub use budget::{
+    check_admission, Admission, AdmissionVerdict, BudgetInputs, TurnFloor, VramBudget,
+};
 pub use disk::{
     AdoptReport, DiskEntry, DiskEvictPlanOf, DiskKey, DiskStats, DiskTier, FillPlanOf, SpillPlanOf,
 };
 pub use disk_index::ChainIndex;
 pub use error::{StoreError, StoreResult};
+pub use hooks::{plan_capacity, Applied, EvictOut, Need, NeedWhy, Room, Sink, Verdict};
 pub use host::{HostBlock, HostTier, SlotTable};
-pub use moves::{bytes_of, download_span, offload_to_host, onload_from_host, upload_span};
-pub use budget::{check_admission, Admission, AdmissionVerdict, BudgetInputs, TurnFloor, VramBudget};
 pub use id::{ChainHash, PrefixId, SnapKey, TOKENS_PER_BLOCK};
-pub use kv::{hash_block, tail_hash, CacheUpdate, ChainCursor, KvStats, KvStore, MatchedBlock, PrefixMatch};
+pub use kv::{
+    hash_block, tail_hash, CacheUpdate, ChainCursor, KvStats, KvStore, MatchedBlock, PrefixMatch,
+};
+pub use leg::CachePolicy;
 pub use leg::{
     abort_offload, abort_onload, commit_offload, commit_onload, is_host_placeholder, plan_offload,
-    plan_offload_blocks, plan_onload, BlockOutPlan, SkipWhy, HOST_PLACEHOLDER,
-    reclaim_slot_table, BlockClass, BlockLeg, Carrier, ChainCand, ChainHit, InPlan, LegConfig,
-    LegOps, LegStats, OutPlan, PieceSpec, PoolLayout,
+    plan_offload_blocks, plan_onload, reclaim_slot_table, BlockClass, BlockLeg, BlockOutPlan,
+    Carrier, ChainCand, ChainHit, InPlan, LegConfig, LegOps, LegStats, OutPlan, PieceSpec,
+    PoolLayout, SkipWhy, HOST_PLACEHOLDER,
 };
-pub use hooks::{plan_capacity, Applied, EvictOut, Need, NeedWhy, Room, Sink, Verdict};
+pub use moves::{bytes_of, download_span, offload_to_host, onload_from_host, upload_span};
+pub use plan::{
+    CardPlan, ComponentId, MemComponent, MemoryPlan, PlanCheck, PlanPolicy, PlanSource, PoolPlan,
+    TierPlan,
+};
 pub use policy::{
     AdmissionPolicy, EvictCandidate, EvictPolicy, EvictPolicyKind, Leg, LrfuPolicy, LruPolicy,
     QueuePolicy,
 };
-pub use leg::CachePolicy;
 pub use rel::{
     AdoptChainsReport, DiskAttach, EventBook, KvConfig, OpenLoan, PoolReport, Protected, RecallHit,
-    SnapEvictPreview,
-    RecallMode, Rel, StoreReport,
+    RecallMode, Rel, SnapEvictPreview, StoreReport,
 };
+pub use reservations::{Grant, ReservationId, ReservationKind, ReservationLedger};
 pub use select::{
-    assemble_view, f32_to_f16, score_blocks, select, select_recency, BlockSet, IndexStats,
-    MeanKEntry, MeanKIndex, block_mass, coverage_curve, derope_halves_inplace, derope_pair,
-    f16_to_f32_pub, MeanKCollector, PosAction, PosFrame, QueryFace, ScoreMode, ScoreTuning,
-    SelectBudget, ViewPlan,
+    assemble_view, block_mass, coverage_curve, derope_halves_inplace, derope_pair, f16_to_f32_pub,
+    f32_to_f16, score_blocks, select, select_recency, BlockSet, IndexStats, MeanKCollector,
+    MeanKEntry, MeanKIndex, PosAction, PosFrame, QueryFace, ScoreMode, ScoreTuning, SelectBudget,
+    ViewPlan,
 };
 pub use state::{SnapDurability, StateStore};
 pub use tier::{
-    AssetKind, EventRow, LedgerBook, LedgerEntry, Loan, Owner, OwnerRow, SharedLedger, Tier,
-    TierBudget,
-    TierLedger, TierReport, book_lock, ledger_entry, shared_ledger, tier_budget_of,
+    book_lock, ledger_entry, shared_ledger, tier_budget_of, AssetKind, EventRow, LedgerBook,
+    LedgerEntry, Loan, Owner, OwnerRow, SharedLedger, Tier, TierBudget, TierLedger, TierReport,
 };

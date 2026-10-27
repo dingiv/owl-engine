@@ -29,6 +29,8 @@ pub(crate) struct Housekeeping {
     /// N6/保洁 deny 的**累计**次数(限流日志用:首条 + 每 64 条打一次;
     /// 计数本身**不丢** —— 机读面 = `store.degrade` metrics)
     degrade_seen: u64,
+    /// 上次 HostPressure 时刻(空转 compact 的最小间隔;应急收缩不节流)
+    last_host_pressure: Option<Instant>,
     /// **合批 decode 已执行步数**(B5.1 事实位;门用它证明批路径真被走到)
     batch_steps: u64,
 }
@@ -52,6 +54,17 @@ impl Housekeeping {
     pub(crate) fn note_idle_pump(&mut self) -> bool {
         self.idle_pumps = self.idle_pumps.wrapping_add(1);
         self.idle_pumps.is_multiple_of(IDLE_HK_EVERY)
+    }
+
+    /// HostPressure 到点?(首拍 / 距上次 ≥ interval)
+    pub(crate) fn host_pressure_due(&self, interval: Duration) -> bool {
+        self.last_host_pressure
+            .is_none_or(|t| t.elapsed() >= interval)
+    }
+
+    /// 记一次 HostPressure(空转节流用)。
+    pub(crate) fn mark_host_pressure(&mut self) {
+        self.last_host_pressure = Some(Instant::now());
     }
 
     /// 池缓存回收到点?(首拍 / 距上次 ≥ `IDLE_TRIM_EVERY`)
@@ -115,6 +128,18 @@ mod tests {
             assert!(!hk.note_idle_pump(), "第 {i} 拍不该整理");
         }
         assert!(hk.note_idle_pump(), "第 {IDLE_HK_EVERY} 拍该整理");
+    }
+
+    #[test]
+    fn host_pressure_interval_gates_idle_compaction() {
+        let mut hk = Housekeeping::default();
+        assert!(hk.host_pressure_due(Duration::from_millis(1000)), "首拍应到点");
+        hk.mark_host_pressure();
+        assert!(
+            !hk.host_pressure_due(Duration::from_secs(1)),
+            "刚搬过 ⇒ 最小间隔内不再搬"
+        );
+        assert!(hk.host_pressure_due(Duration::ZERO), "零间隔 = 不节流");
     }
 
     #[test]

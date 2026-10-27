@@ -94,7 +94,10 @@ pub struct TurnImage {
 
 impl From<owl_models::vlm::VlmImage> for TurnImage {
     fn from(image: owl_models::vlm::VlmImage) -> Self {
-        Self { image, evict: false }
+        Self {
+            image,
+            evict: false,
+        }
     }
 }
 
@@ -186,8 +189,7 @@ impl TurnStats {
         if self.spec_rounds == 0 || depth == 0 {
             0.0
         } else {
-            self.spec_accepted as f64
-                / (self.spec_rounds as f64 * depth as f64)
+            self.spec_accepted as f64 / (self.spec_rounds as f64 * depth as f64)
         }
     }
 }
@@ -235,6 +237,13 @@ pub(crate) struct ActiveTurn {
     /// 借,终了归还(`return_row`);跨 turn 的状态连续性由**边界快照**承担
     /// (§25.2),不再靠"会话钉一行"。idle 会话因此对设备**零占用**。
     pub(crate) gdn_slot: usize,
+    /// **容量票**(P0-4):准入后由 store `ReservationLedger` 发放;
+    /// 本 turn 的每次 `ensure_for_len` 都消费这张票,终了随 Release 归还。
+    pub(crate) grant: owl_store::ReservationId,
+    /// **本 turn 最新边界快照**(P1-2):前缀命中时初值 = `restore_key`,
+    /// 每次 capture 成功后更新。store 保洁/驱逐把它当显式保护面 ——
+    /// 快照面没有引用计数,不能像 KV 那样靠 `refs > 1` 兜底。
+    pub(crate) last_snap: Option<owl_store::SnapKey>,
     pub(crate) ephemeral: bool,
     pub(crate) prompt_ids: Vec<u32>,
     /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
@@ -426,7 +435,9 @@ impl TurnLedger {
     pub(crate) fn active_mut(
         &mut self,
     ) -> std::result::Result<&mut ActiveTurn, owl_iface::contract::ModelError> {
-        let id = self.executing.or_else(|| (self.active.len() == 1).then(|| self.active[0].id));
+        let id = self
+            .executing
+            .or_else(|| (self.active.len() == 1).then(|| self.active[0].id));
         match id {
             Some(id) => self.active.iter_mut().find(|a| a.id == id).ok_or_else(|| {
                 owl_iface::contract::ModelError::EngineInvariant {
@@ -540,8 +551,14 @@ impl TurnLedger {
     /// 波数 = `ceil((队列 + 1) / max_batch)`（含自己）；EWMA 未测 = 用 2s 保守值。
     /// 上限 30s（客户端退避不该被估成分钟级）。
     pub fn eta_ms(&self, max_batch: usize, queue_len: usize) -> u64 {
-        let per = if self.turn_ms_ewma > 0.0 { self.turn_ms_ewma } else { 2000.0 };
-        let waves = ((queue_len + 1) as f64 / max_batch.max(1) as f64).ceil().max(1.0);
+        let per = if self.turn_ms_ewma > 0.0 {
+            self.turn_ms_ewma
+        } else {
+            2000.0
+        };
+        let waves = ((queue_len + 1) as f64 / max_batch.max(1) as f64)
+            .ceil()
+            .max(1.0);
         ((per * waves) as u64).clamp(500, 30_000)
     }
 

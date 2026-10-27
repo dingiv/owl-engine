@@ -83,6 +83,15 @@ newcomer_min_tokens = 4096
 min_gen_tokens = 256
 reserve_pages = 0
 max_queue = 0
+# 空转整理:false = 只回收池缓存、不预搬(缺省);true = 低水位时后台 compact
+idle_compact = false
+# 压力水位(占主池页百分比):自由页 < low 触发,补到 high 目标
+pressure_low_pct = 12
+pressure_high_pct = 25
+# 宿主压力低/高水位(占该腿总槽百分比)与空转 HostPressure 节流(ms)
+host_pressure_low_pct = 12
+host_pressure_high_pct = 25
+host_pressure_interval_ms = 1000
 
 # ---------------------------------------------------------------------------
 # [parallel] —— 并行与卡位(唯一真源)

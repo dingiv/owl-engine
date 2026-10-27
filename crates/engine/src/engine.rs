@@ -33,10 +33,10 @@
 use std::sync::Arc;
 
 use owl_cuda::{DeviceSelector, GpuClient};
-use owl_models::layers::rope::Rope;
-use owl_models::model::{Model, ModelSpec};
 use owl_iface::contract::{DeviceClient, ModelError, VramSnapshot};
 use owl_iface::handle::{AssetClass, DeviceHandle, Owner};
+use owl_models::layers::rope::Rope;
+use owl_models::model::{Model, ModelSpec};
 
 use crate::graph_fleet::{FleetBoot, GraphFleet};
 use crate::loader::{LoadedModel, ModelLoader, RankModel};
@@ -246,6 +246,19 @@ pub struct EngineKnobs {
     pub reserve_pages: usize,
     /// 等待队列上限(0 = 无界;超出 ⇒ 429 `no_slot`)
     pub max_queue: usize,
+    /// **空转整理策略**(`[runtime] idle_compact`;缺省 false = 不预搬)。
+    /// true = 池自由低于低水位时按高水位目标 compact。
+    pub idle_compact: bool,
+    /// 压力低水位(主池页百分比;缺省 12)
+    pub pressure_low_pct: usize,
+    /// 压力高水位/目标(主池页百分比;缺省 25)
+    pub pressure_high_pct: usize,
+    /// 宿主压力低水位(宿主该腿总槽百分比;缺省 12)
+    pub host_pressure_low_pct: usize,
+    /// 宿主压力高水位/目标(宿主该腿总槽百分比;缺省 25)
+    pub host_pressure_high_pct: usize,
+    /// HostPressure 空转节流(毫秒;缺省 1000)
+    pub host_pressure_interval_ms: usize,
     /// **末段页对齐**(前缀复用闭环,2026-10-19;`[pool] prefill_align_tail`,
     /// 缺省 **true**)。块边界快照只在**页对齐**处拍 ⇒ 单块档(整个 prompt 落进
     /// 一个 chunk)L4 会把尾端不对齐地一口吃完 ⇒ 一个快照都没有 ⇒ 下一轮全量
@@ -359,6 +372,12 @@ impl Default for EngineKnobs {
             min_gen_tokens: 256,
             reserve_pages: 0,
             max_queue: 0,
+            idle_compact: false,
+            pressure_low_pct: 12,
+            pressure_high_pct: 25,
+            host_pressure_low_pct: 12,
+            host_pressure_high_pct: 25,
+            host_pressure_interval_ms: 1000,
             prefill_align_tail: true,
             snap_decode_stride: 1,
             fi_cuda_graph: false,
@@ -395,7 +414,9 @@ fn parse_admission_on_full() -> std::result::Result<owl_store::QueuePolicy, Stri
     let s = s.trim().to_ascii_lowercase();
     match s.split_once(':') {
         None if s == "reject" => Ok(QueuePolicy::Reject),
-        None if s == "queue" => Ok(QueuePolicy::Queue { max_wait_ms: 30_000 }),
+        None if s == "queue" => Ok(QueuePolicy::Queue {
+            max_wait_ms: 30_000,
+        }),
         Some(("queue", ms)) => match ms.parse::<u64>() {
             Ok(max_wait_ms) => Ok(QueuePolicy::Queue { max_wait_ms }),
             Err(_) => Err(format!("OWL_ADMIT_ON_FULL 坏值:{s}(期望 queue:<毫秒>)")),
@@ -436,10 +457,7 @@ impl EngineKnobs {
     ///
     /// `floor_mib = Some(n)` 时仍需页宽才能定页数 ⇒ 本函数给的是
     /// `Pages(0)` 占位,**真值在装配期**(见 [`Self::dense_floor_with_mib`])。
-    pub fn dense_floor_for(
-        virtualization: bool,
-        floor_mib: Option<u64>,
-    ) -> owl_store::TurnFloor {
+    pub fn dense_floor_for(virtualization: bool, floor_mib: Option<u64>) -> owl_store::TurnFloor {
         if !virtualization {
             // 虚拟化不在场 ⇒ 唯一诚实值(非 Strict 会被 boot 拦)
             return owl_store::TurnFloor::Strict;
@@ -459,7 +477,6 @@ impl EngineKnobs {
         owl_store::TurnFloor::Pages(bytes.div_ceil(page_bytes))
     }
 
-
     /// **索引采集节奏（chunk 数）**：索引 D2H 批不能跟 `recall_every` 一样大 ——
     /// 暂存块在调和时受保护，r16 会把 256 块钉在池里（90K 实测池耗尽）。
     /// 上限 4 个 chunk（27B：64 页 = 2 MiB 索引输出），既散开同步点，
@@ -468,7 +485,6 @@ impl EngineKnobs {
         const INDEX_BATCH_CHUNKS_MAX: usize = 4;
         self.recall_every.max(1).min(INDEX_BATCH_CHUNKS_MAX)
     }
-
 
     /// **每 turn 工作集的派生(唯一产地)** —— 对外一个 token 数,内部三件:
     /// 工作集页数 / 召回预算(块)/ 准入地板(**页数**,A7 起)。
@@ -728,6 +744,12 @@ impl EngineKnobs {
             min_gen_tokens: cfg.runtime.min_gen_tokens,
             reserve_pages: cfg.runtime.reserve_pages,
             max_queue: cfg.runtime.max_queue,
+            idle_compact: cfg.runtime.idle_compact,
+            pressure_low_pct: cfg.runtime.pressure_low_pct,
+            pressure_high_pct: cfg.runtime.pressure_high_pct,
+            host_pressure_low_pct: cfg.runtime.host_pressure_low_pct,
+            host_pressure_high_pct: cfg.runtime.host_pressure_high_pct,
+            host_pressure_interval_ms: cfg.runtime.host_pressure_interval_ms,
             prefill_align_tail: cfg.pool.prefill_align_tail,
             snap_decode_stride: cfg.pool.snap_decode_stride,
             // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)
@@ -865,19 +887,94 @@ impl BootVram {
     }
 }
 
-/// **准入预算装配**(实测真源;设计卷 §23.3 表)。
+/// **boot 显存计划编译**(V0:结构 + 对账,不改分配行为)。
+///
+/// 所有固定项来自分配后的真实账(权重/GDN/快照/草稿)或显式保守预算
+/// (图 slab / warmup);主 KV 池单列。`MemoryPlan` 是后续 `BudgetInputs`
+/// 的唯一来源,不再用两次 `live_bytes()` 的残差反推运行底价。
+fn build_memory_plan(
+    boot: &BootVram,
+    cfg: &EngineConfig,
+    pool: &StatePool,
+    weights_bytes: u64,
+) -> Result<owl_store::MemoryPlan> {
+    let tier_budget = owl_store::tier_budget_of(
+        cfg.knobs.host_cache_mb,
+        cfg.knobs.snap_host_mb,
+        cfg.knobs.disk_cache_mb,
+        cfg.knobs.snap_disk_mb,
+    );
+    let block_bytes = pool.block_bytes();
+    let page = pool.geom.page.max(1);
+    let mut fixed = pool.memory_components();
+    fixed.insert(
+        0,
+        owl_store::MemComponent::new(
+            owl_store::ComponentId::Weights,
+            weights_bytes as usize,
+            owl_store::PlanSource::Measured,
+            owl_store::Tier::Gpu,
+            owl_store::Owner::System,
+        ),
+    );
+    let plan = owl_store::MemoryPlan::new(
+        0,
+        owl_store::CardPlan {
+            total_bytes: boot.total_bytes as usize,
+            free_at_boot_bytes: boot.v_card_bytes as usize,
+            reserve_bytes: (cfg.knobs.vram_reserve_mb << 20) as usize,
+        },
+        fixed,
+        owl_store::PoolPlan {
+            pages: pool.geom.nb,
+            page_tokens: page,
+            tokens: pool.geom.nb.saturating_mul(page),
+            per_token_bytes: (block_bytes / page).max(1),
+            block_bytes,
+            bytes: pool.kv_pool_bytes(),
+            gdn_slots: pool.geom.gdn_slots,
+            gdn_row_bytes: pool.gdn_row_bytes(),
+        },
+        owl_store::TierPlan {
+            host_bytes: tier_budget.host_bytes,
+            disk_bytes: tier_budget.disk_bytes,
+        },
+        owl_store::PlanPolicy {
+            fixed_pool: pool.kv_pool_bytes() > 0,
+        },
+    )?;
+    let check = plan.check_card();
+    if !plan.duplicate_components().is_empty() {
+        owl_shared::log_warn!(
+            "boot",
+            "MemoryPlan 固定项重复: {:?}(报告面会重复计数)",
+            plan.duplicate_components()
+        );
+    }
+    if !check.fits() {
+        owl_shared::log_warn!(
+            "boot",
+            "MemoryPlan 超卡面: fixed+pool+reserve={:.1}MiB / free {:.1}MiB / total {:.1}MiB \
+             (超 free {:.1}MiB, 超 total {:.1}MiB)",
+            check.total_bytes as f64 / 1048576.0,
+            check.card_free_bytes as f64 / 1048576.0,
+            check.card_total_bytes as f64 / 1048576.0,
+            check.over_free_bytes as f64 / 1048576.0,
+            check.over_total_bytes as f64 / 1048576.0,
+        );
+    }
+    owl_shared::log_info!("boot", "MemoryPlan: {}", plan.summary());
+    Ok(plan)
+}
+
+/// **准入预算装配**(plan 的投影;设计卷 §23.3 表)。
 ///
 /// 纪律:能测的必须测;无设备账档(CPU mock)由**固定池档**放宽规则接管
 /// (`kv_face_bytes > 0` ⇒ 准入走池墙,卡级三项可为 0 —— 但由
 /// `VramBudget::card_measured()` 标出,不装成"测过了")。
 fn assemble_budget(
-    boot: &BootVram,
     cfg: &EngineConfig,
-    pool: &StatePool,
-    weights_bytes: u64,
-    world: usize,
-    live_loaded: u64,
-    live_now: u64,
+    plan: &owl_store::MemoryPlan,
 ) -> Result<owl_store::BudgetInputs> {
     // 准入地板语义(S3b §23.5):**2026-10-19 拆护栏**。
     //
@@ -895,64 +992,39 @@ fn assemble_budget(
                 .into(),
         ));
     }
-    let block_bytes = pool.block_bytes();
-    let page = pool.geom.page.max(1);
-    let kv_pool = (pool.geom.nb as u64).saturating_mul(block_bytes as u64);
-    let gdn_pool = (pool.geom.gdn_slots as u64).saturating_mul(pool.gdn_row_bytes() as u64);
-    let snap_pool = pool.snapshot_pool_bytes() as u64;
-    let draft_pool = pool.draft_pool_bytes() as u64;
-    let weights = weights_bytes;
-    // 运行底价 = run 末 live − 装载后 live − **两 rank** 已归类池面
-    // (live 是进程级合计;单卡 world=1 退化为原式)
-    let pools_total = (kv_pool + gdn_pool + snap_pool + draft_pool)
-        .saturating_mul(world.max(1) as u64);
-    let runtime_floor = live_now
-        .saturating_sub(live_loaded)
-        .saturating_sub(pools_total);
-    // 中层预算(host/盘):**唯一算式在 store**(`tier_budget_of`)—— boot 造账与
-    // 本处预算入参必须同源(两处各算一遍 = 迟早漂;`Rel::open` 还会交叉校验兜底)。
-    let tier_budget = owl_store::tier_budget_of(
-        cfg.knobs.host_cache_mb,
-        cfg.knobs.snap_host_mb,
-        cfg.knobs.disk_cache_mb,
-        cfg.knobs.snap_disk_mb,
-    );
-    let inputs = owl_store::BudgetInputs {
-        v_card_bytes: boot.v_card_bytes as usize,
-        weights_bytes: weights as usize,
-        runtime_floor_bytes: runtime_floor as usize,
-        draft_pool_bytes: draft_pool as usize,
-        gdn_row_bytes: pool.gdn_row_bytes(),
-        kv_bytes_per_token: (block_bytes / page).max(1),
-        page_tokens: page,
-        // 中层总账 = KV 块腿分片 + 状态腿(快照)分片(S2 §25.2)
-        host_bytes: tier_budget.host_bytes,
-        disk_bytes: tier_budget.disk_bytes,
-        kv_face_bytes: kv_pool as usize,
-    };
-    let mb = |b: u64| b as f64 / 1048576.0;
-    if boot.total_bytes > 0 && weights == 0 {
+    let inputs = plan.to_budget_inputs()?;
+    let mb = |b: usize| b as f64 / 1048576.0;
+    if plan.card.total_bytes > 0 && inputs.weights_bytes == 0 {
         // 有设备账却算出权重 0 = 测量病(不是"没权重");不许静默
         owl_shared::log_warn!(
             "boot",
             "准入预算:权重字节实测为 0(引擎 live 账未动?装载路径绕过账本?)—— 请核对"
         );
     }
+    let snap_pool = plan
+        .component(owl_store::ComponentId::GdnSnapshots)
+        .map_or(0, |c| c.bytes)
+        + plan
+            .component(owl_store::ComponentId::SpecSnapshots)
+            .map_or(0, |c| c.bytes)
+        + plan
+            .component(owl_store::ComponentId::ReplaySnapshots)
+            .map_or(0, |c| c.bytes);
     owl_shared::log_info!(
         "boot",
         "准入预算:卡可用 {:.1}MiB · 权重 {:.1}MiB · 运行底价 {:.1}MiB · KV 池面 {:.1}MiB({} 槽 × {}B) · GDN 行 {:.2}MiB × {} · 快照池 {:.1}MiB · 草稿池 {:.1}MiB · host {:.1}MiB · 卡级实测={}",
-        mb(boot.v_card_bytes),
-        mb(weights),
-        mb(runtime_floor),
-        mb(kv_pool),
-        pool.geom.nb,
-        block_bytes,
-        pool.gdn_row_bytes() as f64 / 1048576.0,
-        pool.geom.gdn_slots,
+        mb(inputs.v_card_bytes),
+        mb(inputs.weights_bytes),
+        mb(inputs.runtime_floor_bytes),
+        mb(plan.pool.bytes),
+        plan.pool.pages,
+        plan.pool.block_bytes,
+        plan.pool.gdn_row_bytes as f64 / 1048576.0,
+        plan.pool.gdn_slots,
         mb(snap_pool),
-        mb(draft_pool),
-        mb(cfg.knobs.host_cache_mb as u64 * 1048576),
-        weights > 0 && runtime_floor > 0,
+        mb(inputs.draft_pool_bytes),
+        mb(inputs.host_bytes),
+        inputs.weights_bytes > 0 && inputs.runtime_floor_bytes > 0,
     );
     Ok(inputs)
 }
@@ -992,10 +1064,7 @@ impl VramPhase {
         match info {
             Ok((free, total)) => {
                 let used = total.saturating_sub(free);
-                let delta = self
-                    .last_used
-                    .map(|p| used as i64 - p as i64)
-                    .unwrap_or(0);
+                let delta = self.last_used.map(|p| used as i64 - p as i64).unwrap_or(0);
                 eprintln!(
                     "[vram-phase] {tag}: used={:.1}MiB free={:.1}MiB delta={:+.1}MiB live={:.1}MiB",
                     used as f64 / 1048576.0,
@@ -1092,9 +1161,15 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let ledger_cell = owl_store::ledger_entry(&ledger);
         // 输出口注入(2026-10-21):`[device-handle]` 的告警/自愈面走统一日志门
         // (level + tag 白黑名单);iface 不依赖 owl-shared ⇒ 在这里显式给。
-        let face = DeviceHandle::new(face, Some(ledger_cell.clone()))
-            .with_sink(owl_shared::log::sink());
-        Ok(Self { face, ledger, ledger_cell, cfg, boot })
+        let face =
+            DeviceHandle::new(face, Some(ledger_cell.clone())).with_sink(owl_shared::log::sink());
+        Ok(Self {
+            face,
+            ledger,
+            ledger_cell,
+            cfg,
+            boot,
+        })
     }
 
     /// **接管已包好的句柄**(TP:两 rank 共用一本账;句柄由 `into_parts` 交出)。
@@ -1107,7 +1182,13 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let ledger_cell = face
             .ledger_cell()
             .unwrap_or_else(|| owl_store::ledger_entry(&ledger));
-        Ok(Self { face, ledger, ledger_cell, cfg, boot })
+        Ok(Self {
+            face,
+            ledger,
+            ledger_cell,
+            cfg,
+            boot,
+        })
     }
 
     /// 本引擎的**账本单元**(TP 接管/诊断面)。
@@ -1138,7 +1219,13 @@ impl<D: DeviceClient + 'static> Engine<D> {
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn run(self, loaded: LoadedModel) -> Result<RunningEngine<DeviceHandle<D>>> {
         let t_run = std::time::Instant::now();
-        let Engine { face, ledger, ledger_cell: _, mut cfg, boot } = self;
+        let Engine {
+            face,
+            ledger,
+            ledger_cell: _,
+            mut cfg,
+            boot,
+        } = self;
         let (rm, tokenizer) = loaded.into_parts();
         // 池分配前的 live 快照 = 权重/杂项(不含池)。单卡直接当 per-card 基线;
         // weights = 装载增量。TP2 由 `TpEngine` 取两 rank 合计后摊分。
@@ -1164,17 +1251,19 @@ impl<D: DeviceClient + 'static> Engine<D> {
     /// rank1 的模型/视觉塔装载事件必须直接进 rank0 的账本 —— 否则
     /// `TpEngine::assemble` 的 boot-only `adopt_ledger` 会拒(已发事件进孤儿账)。
     /// 幂等:同一本账重复接管 = Ok(`TpEngine` 后续再调一次)。
-    pub fn adopt_ledger(
-        &mut self,
-        cell: owl_iface::handle::LedgerCell,
-    ) -> Result<()> {
+    pub fn adopt_ledger(&mut self, cell: owl_iface::handle::LedgerCell) -> Result<()> {
         self.face.adopt_ledger(cell)
     }
 
     /// **拆件**(TP 双 rank 装配面:face/cfg/账本同源单持有;S4 ⑤-K2)
     pub(crate) fn into_parts(
         self,
-    ) -> (DeviceHandle<D>, EngineConfig, owl_store::SharedLedger, BootVram) {
+    ) -> (
+        DeviceHandle<D>,
+        EngineConfig,
+        owl_store::SharedLedger,
+        BootVram,
+    ) {
         (self.face, self.cfg, self.ledger, self.boot)
     }
 
@@ -1202,120 +1291,117 @@ pub(crate) fn into_running<D: DeviceClient>(
 ) -> Result<RunningEngine<D>> {
     // **store 装配(host 半;S3b §23.3)** —— 预算/策略/层布局/快照腿:
     // 单卡与 TP 都**只做一份**(host 账单一)。
-    let live_loaded = owl_shared::vram::live_bytes();
-    let world = if peer.is_some() { 2 } else { 1 };
-    let budget_inputs = assemble_budget(
-        &boot,
-        &cfg,
-        &dev.pool,
-        weights_bytes,
-        world,
-        live_loaded,
-        owl_shared::vram::live_bytes(),
-    )?;
-        let admission_policy = owl_store::AdmissionPolicy::new(
-            cfg.knobs.gdn_slots.max(1),
-            cfg.knobs.admission_on_full,
+    let memory_plan = build_memory_plan(&boot, &cfg, &dev.pool, weights_bytes)?;
+    let budget_inputs = assemble_budget(&cfg, &memory_plan)?;
+    let admission_policy =
+        owl_store::AdmissionPolicy::new(cfg.knobs.gdn_slots.max(1), cfg.knobs.admission_on_full);
+    let host_bytes = cfg.knobs.host_cache_mb << 20;
+    // **S2:状态腿三层化**(§25.2)—— 注册快照池布局(快照 = 「槽 × 片」),
+    // 并把 store 的状态腿宿主层挂上(KV 腿宿主分片之外的部分)。
+    // 放在 `SessionBank::new` 之前:布局进 store 后 `Rel` 才知道快照的
+    // 单条字节(宿主层的块粒度)。
+    let mut bank = {
+        let mut b = crate::session::SessionBank::new(
+            crate::session::BankPlan {
+                nb: dev.pool.geom.nb,
+                page: dev.pool.geom.page,
+                block_bytes: dev.pool.block_bytes(),
+                mtp_block_bytes: dev.pool.mtp_block_bytes(),
+                paged: dev.pool.geom.paged,
+                prefix_cache: cfg.knobs.prefix_cache,
+                mtp: dev.spec_rt.mode == SpecMode::Mtp,
+                // 宿主层预算(REQ C4:默认关;0 = 关层)—— 与预算入参**同源**
+                // (腿不得超总账;`Rel::open` 交叉校验)
+                host_bytes,
+                // **TP 宿主腿平面数 = world**(单卡 1;双 rank 2 —— 两个 rank
+                // 的半页 KV 各占一平面,预算仍是两 rank 合计)
+                world: if peer.is_some() { 2 } else { 1 },
+            },
+            budget_inputs,
+            admission_policy,
+            dev.pool.pool_layout(0),
+            dev.pool.mtp_pool_layout(0),
+            ledger,
+        )?;
+        // **TP:peer 平面布局**(2026-10-20 双卡 KVMem)。两 rank 的池句柄 id
+        // 是两套 ⇒ 每个平面必须用**自己那套** `PieceSpec` 组片(靠偏移平移不行)。
+        if let Some(pr) = peer.as_ref() {
+            b.rel.leg.attach_pool_peer(pr.pool.pool_layout(0))?;
+        }
+        // **复用池上限**(缺口 4 收尾 P1-1):配置面显式(=0 ⇒ 不限,仅诊断用)
+        let cap = cfg.knobs.pool_cap_mb << 20;
+        b.rel.set_pool_cap(cap.max(0) as usize);
+        owl_shared::log_info!(
+            "store",
+            "复用池上限 = {}(缺省 256MiB;超限逐块顶出回驱动)",
+            if cap == 0 {
+                "不限".to_string()
+            } else {
+                format!("{}MiB", cfg.knobs.pool_cap_mb)
+            }
         );
-        let host_bytes = cfg.knobs.host_cache_mb << 20;
-        // **S2:状态腿三层化**(§25.2)—— 注册快照池布局(快照 = 「槽 × 片」),
-        // 并把 store 的状态腿宿主层挂上(KV 腿宿主分片之外的部分)。
-        // 放在 `SessionBank::new` 之前:布局进 store 后 `Rel` 才知道快照的
-        // 单条字节(宿主层的块粒度)。
-        let bank = {
-            let mut b = crate::session::SessionBank::new(
-                crate::session::BankPlan {
-                    nb: dev.pool.geom.nb,
-                    page: dev.pool.geom.page,
-                    block_bytes: dev.pool.block_bytes(),
-                    mtp_block_bytes: dev.pool.mtp_block_bytes(),
-                    paged: dev.pool.geom.paged,
-                    prefix_cache: cfg.knobs.prefix_cache,
-                    mtp: dev.spec_rt.mode == SpecMode::Mtp,
-                                // 宿主层预算(REQ C4:默认关;0 = 关层)—— 与预算入参**同源**
-                    // (腿不得超总账;`Rel::open` 交叉校验)
-                    host_bytes,
-                    // **TP 宿主腿平面数 = world**(单卡 1;双 rank 2 —— 两个 rank
-                    // 的半页 KV 各占一平面,预算仍是两 rank 合计)
-                    world: if peer.is_some() { 2 } else { 1 },
-                },
-                budget_inputs,
-                admission_policy,
-                dev.pool.pool_layout(0),
-                dev.pool.mtp_pool_layout(0),
-                ledger,
+        // **B-4 驱逐策略装配**(boot 一次;缺省 LRU ⇒ 与历史逐字一致)
+        b.rel.set_evict_policy(cfg.knobs.evict_policy.build());
+        // 整枝塌缩(2026-10-23):宿主/磁盘**装不下整链**时允许一张票丢整段
+        b.rel
+            .set_bulk_drop_when_tier_full(cfg.knobs.bulk_drop_when_tier_full);
+        owl_shared::log_info!("store", "驱逐策略 = {}", b.rel.evict_policy_name());
+        if cfg.knobs.index_probe {
+            // B 轴索引几何:层 = 全注意力层数,头 = KV 头数,dim = head_dim
+            b.rel.attach_index(
+                dev.pool.geom.dims.hd,
+                dev.pool.kvs().len(),
+                dev.pool.geom.dims.hkv,
             )?;
-            // **TP:peer 平面布局**(2026-10-20 双卡 KVMem)。两 rank 的池句柄 id
-            // 是两套 ⇒ 每个平面必须用**自己那套** `PieceSpec` 组片(靠偏移平移不行)。
-            if let Some(pr) = peer.as_ref() {
-                b.rel.leg.attach_pool_peer(pr.pool.pool_layout(0))?;
-            }
-            // **复用池上限**(缺口 4 收尾 P1-1):配置面显式(=0 ⇒ 不限,仅诊断用)
-            let cap = cfg.knobs.pool_cap_mb << 20;
-            b.rel.set_pool_cap(cap.max(0) as usize);
             owl_shared::log_info!(
-                "store",
-                "复用池上限 = {}(缺省 256MiB;超限逐块顶出回驱动)",
-                if cap == 0 { "不限".to_string() } else { format!("{}MiB", cfg.knobs.pool_cap_mb) }
+                "boot",
+                "选择层索引:采集开(dim={} 层={} KV 头={};每块 {}B)",
+                dev.pool.geom.dims.hd,
+                dev.pool.kvs().len(),
+                dev.pool.geom.dims.hkv,
+                b.rel.index.as_ref().map(|i| i.block_bytes()).unwrap_or(0)
             );
-            // **B-4 驱逐策略装配**(boot 一次;缺省 LRU ⇒ 与历史逐字一致)
-            b.rel.set_evict_policy(cfg.knobs.evict_policy.build());
-            // 整枝塌缩(2026-10-23):宿主/磁盘**装不下整链**时允许一张票丢整段
-            b.rel.set_bulk_drop_when_tier_full(cfg.knobs.bulk_drop_when_tier_full);
-            owl_shared::log_info!("store", "驱逐策略 = {}", b.rel.evict_policy_name());
-            if cfg.knobs.index_probe {
-                // B 轴索引几何:层 = 全注意力层数,头 = KV 头数,dim = head_dim
-                b.rel.attach_index(dev.pool.geom.dims.hd, dev.pool.kvs().len(), dev.pool.geom.dims.hkv)?;
-                owl_shared::log_info!(
-                    "boot",
-                    "选择层索引:采集开(dim={} 层={} KV 头={};每块 {}B)",
-                    dev.pool.geom.dims.hd,
-                    dev.pool.kvs().len(),
-                    dev.pool.geom.dims.hkv,
-                    b.rel.index.as_ref().map(|i| i.block_bytes()).unwrap_or(0)
-                );
+        }
+        if dev.pool.geom.paged && dev.pool.snap_capacity() > 0 {
+            let epoch = b.rel.attach_snap_layout(dev.pool.snap_pool_layout(0))?;
+            if let Some(pr) = peer.as_ref() {
+                b.rel.attach_snap_layout_peer(pr.pool.snap_pool_layout(0))?;
             }
-            if dev.pool.geom.paged && dev.pool.snap_capacity() > 0 {
-                let epoch = b.rel.attach_snap_layout(dev.pool.snap_pool_layout(0))?;
-                if let Some(pr) = peer.as_ref() {
-                    b.rel.attach_snap_layout_peer(pr.pool.snap_pool_layout(0))?;
-                }
-                owl_shared::log_info!(
-                    "boot",
-                    "状态腿三层化:快照 {} 槽 × {}B/条(布局 epoch {epoch})· 宿主预算 {:.1}MiB",
-                    dev.pool.snap_capacity(),
-                    dev.pool.snap_bytes(),
-                    b.rel.snap_host_budget() as f64 / 1048576.0
-                );
-            }
-            // **磁盘层接线 + 启动回加载**(S6;用户 2026-10-19):配置给配额与目录 ⇒
-            // 接盘(两腿分片)+ **扫目录回填账**(内容惰性读:27B 一条快照 159 MiB,
-            // 全量预读会把启动拖垮)。大小不符/超预算/重复 = 隔离并逐条 WARN。
-            if (cfg.knobs.disk_cache_mb + cfg.knobs.snap_disk_mb) > 0 && !cfg.knobs.disk_dir.is_empty()
-            {
-                let snap_disk_bytes = if dev.pool.geom.paged && dev.pool.snap_capacity() > 0 {
-                    cfg.knobs.snap_disk_mb << 20
-                } else {
-                    0 // 没快照池 ⇒ 状态腿盘分片无意义(不许静默吃掉配额)
-                };
-                let attach = b.rel.attach_disk(
-                    cfg.knobs.disk_dir.clone(),
-                    cfg.knobs.disk_cache_mb << 20,
-                    snap_disk_bytes,
-                )?;
-                // **S6.1:按盘上链索引重建树**(跨重启复用的真身)。
-                //
-                // 顺序:①内容入账(`adopt_disk`)②索引解码(每条链 ≈32 KB,同步读一次)
-                // ③`adopt_disk_chains` 逐链重算块身份 + 按"内容文件在场"截断到连续前缀
-                // ④重建条目为**非设备层**(`slot = None`)⑤盘上没被任何重建链引用的
-                // 内容 = 孤儿(占配额且永远用不上)⇒ 清掉(索引文件保留:只增不删)。
-                let snap_entries =
-                    crate::disk_io::scan_dir_sync::<owl_store::SnapKey>(&attach.snap_root);
-                let kv_entries =
-                    crate::disk_io::scan_dir_sync::<owl_store::ChainHash>(&attach.kv_root);
-                let (n_kv, n_snap) = (kv_entries.len(), snap_entries.len());
-                let (ra, rb) = b.rel.adopt_disk(kv_entries, snap_entries);
-                owl_shared::log_info!(
+            owl_shared::log_info!(
+                "boot",
+                "状态腿三层化:快照 {} 槽 × {}B/条(布局 epoch {epoch})· 宿主预算 {:.1}MiB",
+                dev.pool.snap_capacity(),
+                dev.pool.snap_bytes(),
+                b.rel.snap_host_budget() as f64 / 1048576.0
+            );
+        }
+        // **磁盘层接线 + 启动回加载**(S6;用户 2026-10-19):配置给配额与目录 ⇒
+        // 接盘(两腿分片)+ **扫目录回填账**(内容惰性读:27B 一条快照 159 MiB,
+        // 全量预读会把启动拖垮)。大小不符/超预算/重复 = 隔离并逐条 WARN。
+        if (cfg.knobs.disk_cache_mb + cfg.knobs.snap_disk_mb) > 0 && !cfg.knobs.disk_dir.is_empty()
+        {
+            let snap_disk_bytes = if dev.pool.geom.paged && dev.pool.snap_capacity() > 0 {
+                cfg.knobs.snap_disk_mb << 20
+            } else {
+                0 // 没快照池 ⇒ 状态腿盘分片无意义(不许静默吃掉配额)
+            };
+            let attach = b.rel.attach_disk(
+                cfg.knobs.disk_dir.clone(),
+                cfg.knobs.disk_cache_mb << 20,
+                snap_disk_bytes,
+            )?;
+            // **S6.1:按盘上链索引重建树**(跨重启复用的真身)。
+            //
+            // 顺序:①内容入账(`adopt_disk`)②索引解码(每条链 ≈32 KB,同步读一次)
+            // ③`adopt_disk_chains` 逐链重算块身份 + 按"内容文件在场"截断到连续前缀
+            // ④重建条目为**非设备层**(`slot = None`)⑤盘上没被任何重建链引用的
+            // 内容 = 孤儿(占配额且永远用不上)⇒ 清掉(索引文件保留:只增不删)。
+            let snap_entries =
+                crate::disk_io::scan_dir_sync::<owl_store::SnapKey>(&attach.snap_root);
+            let kv_entries = crate::disk_io::scan_dir_sync::<owl_store::ChainHash>(&attach.kv_root);
+            let (n_kv, n_snap) = (kv_entries.len(), snap_entries.len());
+            let (ra, rb) = b.rel.adopt_disk(kv_entries, snap_entries);
+            owl_shared::log_info!(
                     "store",
                     "磁盘层:配额 {}MiB(KV {} / 快照 {})· 目录 {} · 回填内容 KV {}/{} 快照 {}/{} 条 · 隔离 {}+{} 条(内容惰性读回)",
                     cfg.knobs.disk_cache_mb + cfg.knobs.snap_disk_mb,
@@ -1329,89 +1415,91 @@ pub(crate) fn into_running<D: DeviceClient>(
                     ra.skipped.len(),
                     rb.skipped.len(),
                 );
-                for (p, why) in ra.skipped.iter().chain(rb.skipped.iter()) {
-                    owl_shared::log_warn!("store", "磁盘回填隔离 {}:{why}", p.display());
-                }
+            for (p, why) in ra.skipped.iter().chain(rb.skipped.iter()) {
+                owl_shared::log_warn!("store", "磁盘回填隔离 {}:{why}", p.display());
+            }
 
-                let idx_files =
-                    crate::disk_io::scan_index_sync::<owl_store::ChainHash>(&attach.kv_root);
-                let mut idxs = Vec::with_capacity(idx_files.len());
-                for (_, p) in &idx_files {
-                    let decoded = std::fs::read(p)
-                        .map_err(|e| format!("{e}"))
-                        .and_then(|bytes| {
-                            owl_store::ChainIndex::decode(&bytes).map_err(|e| format!("{e}"))
-                        });
-                    match decoded {
-                        Ok(i) => idxs.push(i),
-                        Err(e) => {
-                            owl_shared::log_warn!("store", "链索引不可用 {}:{e}", p.display());
-                        }
+            let idx_files =
+                crate::disk_io::scan_index_sync::<owl_store::ChainHash>(&attach.kv_root);
+            let mut idxs = Vec::with_capacity(idx_files.len());
+            for (_, p) in &idx_files {
+                let decoded = std::fs::read(p)
+                    .map_err(|e| format!("{e}"))
+                    .and_then(|bytes| {
+                        owl_store::ChainIndex::decode(&bytes).map_err(|e| format!("{e}"))
+                    });
+                match decoded {
+                    Ok(i) => idxs.push(i),
+                    Err(e) => {
+                        owl_shared::log_warn!("store", "链索引不可用 {}:{e}", p.display());
                     }
                 }
-                let rep = b.rel.adopt_disk_chains(&idxs)?;
-                {
-                    let kept: std::collections::HashSet<_> = rep.kept.iter().copied().collect();
-                    let orphans: Vec<owl_store::ChainHash> = b
+            }
+            let rep = b.rel.adopt_disk_chains(&idxs)?;
+            {
+                let kept: std::collections::HashSet<_> = rep.kept.iter().copied().collect();
+                let orphans: Vec<owl_store::ChainHash> = b
+                    .rel
+                    .disk
+                    .as_ref()
+                    .map(|d| {
+                        d.resident_keys()
+                            .into_iter()
+                            .filter(|k| !kept.contains(k))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !orphans.is_empty() {
+                    let paths: Vec<std::path::PathBuf> = b
                         .rel
                         .disk
                         .as_ref()
                         .map(|d| {
-                            d.resident_keys()
-                                .into_iter()
-                                .filter(|k| !kept.contains(k))
+                            orphans
+                                .iter()
+                                .filter_map(|k| d.path_of(*k).map(|p| p.to_path_buf()))
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if !orphans.is_empty() {
-                        let paths: Vec<std::path::PathBuf> = b
-                            .rel
-                            .disk
-                            .as_ref()
-                            .map(|d| {
-                                orphans
-                                    .iter()
-                                    .filter_map(|k| d.path_of(*k).map(|p| p.to_path_buf()))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        for p in &paths {
-                            let _ = std::fs::remove_file(p);
-                        }
-                        let freed = b
-                            .rel
-                            .disk
-                            .as_mut()
-                            .map(|d| d.commit_evict(&orphans))
-                            .unwrap_or(0);
-                        owl_shared::log_warn!(
-                            "store",
-                            "盘上孤儿内容:清掉 {} 块 / {freed}B(无索引或索引截断;索引文件保留)",
-                            orphans.len()
-                        );
+                    for p in &paths {
+                        let _ = std::fs::remove_file(p);
                     }
-                }
-                owl_shared::log_info!(
-                    "store",
-                    "跨重启复用:索引 {} 条 ⇒ 重建 {} 链 / {} 块 · 跳过 {} · 截断 {}",
-                    idxs.len(),
-                    rep.chains,
-                    rep.blocks,
-                    rep.skipped.len(),
-                    rep.truncated.len()
-                );
-                for (what, why) in &rep.skipped {
-                    owl_shared::log_warn!("store", "链重建跳过({what}):{why}");
-                }
-                for (what, n) in &rep.truncated {
-                    owl_shared::log_info!(
+                    let freed = b
+                        .rel
+                        .disk
+                        .as_mut()
+                        .map(|d| d.commit_evict(&orphans))
+                        .unwrap_or(0);
+                    owl_shared::log_warn!(
                         "store",
-                        "链截断({what}):盘上只覆盖前缀 {n} 块(其余内容不在盘上)"
+                        "盘上孤儿内容:清掉 {} 块 / {freed}B(无索引或索引截断;索引文件保留)",
+                        orphans.len()
                     );
                 }
             }
-            b
-        };
+            owl_shared::log_info!(
+                "store",
+                "跨重启复用:索引 {} 条 ⇒ 重建 {} 链 / {} 块 · 跳过 {} · 截断 {}",
+                idxs.len(),
+                rep.chains,
+                rep.blocks,
+                rep.skipped.len(),
+                rep.truncated.len()
+            );
+            for (what, why) in &rep.skipped {
+                owl_shared::log_warn!("store", "链重建跳过({what}):{why}");
+            }
+            for (what, n) in &rep.truncated {
+                owl_shared::log_info!(
+                    "store",
+                    "链截断({what}):盘上只覆盖前缀 {n} 块(其余内容不在盘上)"
+                );
+            }
+        }
+        b
+    };
+    // **V0/V1:计划与准入账交叉校验**（plan 投影必须与 Rel::open 的入参逐字一致）。
+    bank.rel.attach_memory_plan(memory_plan.clone())?;
 
     // **前缀无感删除的 boot 门**(2026-10-23;2026-10-26 只保留 leave-gap):
     // 开了就必须具备执行面 —— ① 视觉塔(图像段识别 / m-RoPE 位置自证)
@@ -1420,8 +1508,7 @@ pub(crate) fn into_running<D: DeviceClient>(
     if cfg.knobs.image_evict {
         if dev.boot.vlm.is_none() {
             return Err(ModelError::Msg(
-                "[pool] image_evict = true 需要 [model].vision = true(图像段识别依赖视觉档)"
-                    .into(),
+                "[pool] image_evict = true 需要 [model].vision = true(图像段识别依赖视觉档)".into(),
             ));
         }
         if !dev.pool.geom.paged {
@@ -1463,9 +1550,8 @@ pub(crate) fn into_running<D: DeviceClient>(
     // 代码里不写死 `<|im_start|>`;优先用显式 `[pool].snap_msg_delim`,
     // 空串则回退模型声明 `ChatFormat.im_open`。这里 boot 期只 tokenize 一次,
     // 运行期扫 prompt_ids 时只传 `&[u32]`。
-    let msg_snap_on = cfg.knobs.snap_msg_boundary
-        && cfg.knobs.prefix_cache
-        && cfg.knobs.snap_max > 0;
+    let msg_snap_on =
+        cfg.knobs.snap_msg_boundary && cfg.knobs.prefix_cache && cfg.knobs.snap_max > 0;
     if cfg.knobs.snap_msg_boundary && !msg_snap_on {
         owl_shared::log_warn!(
             "boot",
@@ -1917,8 +2003,7 @@ fn boot_post_check<D: DeviceClient>(
     if matches!(spec.mode, SpecMode::DFlash2 | SpecMode::Mtp)
         && model.logits_vocab() != model.vocab_size()
     {
-        let dflash_graph_ok =
-            spec.mode == SpecMode::DFlash2 && graphs.dflash.is_some();
+        let dflash_graph_ok = spec.mode == SpecMode::DFlash2 && graphs.dflash.is_some();
         if !dflash_graph_ok {
             return Err(owl_iface::contract::ModelError::Msg(
                 "词表切(runtime.tp_vocab_split)与**本草稿档**不兼容：".to_string()
@@ -1950,7 +2035,13 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     let (hq, hkv, hd) = rm.spec.full_heads;
     let (nk, hk, nv, hv) = rm.spec.gdn_heads;
     let dims = ModelDims {
-        hq, hkv, hd, nk, hk, nv, hv,
+        hq,
+        hkv,
+        hd,
+        nk,
+        hk,
+        nv,
+        hv,
         hidden: rm.spec.hidden,
         dtype: rm.spec.dtype,
     };
@@ -1973,9 +2064,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     // FI 面启用(量化恒 = 主池;影子池已删,本值只作"启用 + 池量化"携带)
     // FI 面启用条件 = **能力条件**(f16 池 + paged 页表),不是开关:
     // 2026-10-13 起配置面无 flashinfer 选项,FI 恒启用(env.attn.fi 仅门/诊断用)
-    let fi_quant = if env.attn.fi
-        && env.kv.paged
-        && rm.spec.dtype == owl_models::tensor::Dtype::F16
+    let fi_quant = if env.attn.fi && env.kv.paged && rm.spec.dtype == owl_models::tensor::Dtype::F16
     {
         Some(env.kv.quant)
     } else {
@@ -2050,8 +2139,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     // 而不是 target 的 fp8 池。DFlash2 仍按草稿池 tag 走。
     let mut draft_features = features;
     if spec.mode == SpecMode::Mtp {
-        draft_features.main_kv =
-            Some(owl_models::kernel_env::KvCaps::from_env(&spec.draft_env));
+        draft_features.main_kv = Some(owl_models::kernel_env::KvCaps::from_env(&spec.draft_env));
     }
     if let Some(k) =
         owl_models::kernel_env::KernelSelectionEnv::from_env(&spec.draft_env, draft_features)
@@ -2121,10 +2209,15 @@ fn boot_pool_plan(
         draft_dt: spec.draft_dt,
         spec_mode: spec.mode,
         spec_depth: spec.depth,
-        xqa_verify: matches!(cfg.knobs.env.attn.verify_arm, owl_shared::config::VerifyArm::Xqa),
+        xqa_verify: matches!(
+            cfg.knobs.env.attn.verify_arm,
+            owl_shared::config::VerifyArm::Xqa
+        ),
         // B-3e-2:部分驻留档**不带 XQA**(页表语义不共戴;见上方醒目告知)
-        xqa_decode: matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
-            && !cfg.knobs.select_partial,
+        xqa_decode: matches!(
+            cfg.knobs.env.attn.decode_arm,
+            owl_shared::config::DecodeArm::Xqa
+        ) && !cfg.knobs.select_partial,
         gdn_slots: cfg.knobs.gdn_slots,
         max_batch: cfg.knobs.max_batch,
         snap_max: cfg.knobs.snap_max,
@@ -2153,10 +2246,7 @@ fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
              ⇒ reuse_face 会被裁到 0 ⇒ cached_tokens 结构性恒 0。\
              要前缀复用请设 snap_max>=1(agent 10K 建议 4 + snap_host_mb>0)"
         );
-    } else if cfg.knobs.prefix_cache
-        && cfg.knobs.snap_max == 1
-        && cfg.knobs.snap_host_mb == 0
-    {
+    } else if cfg.knobs.prefix_cache && cfg.knobs.snap_max == 1 && cfg.knobs.snap_host_mb == 0 {
         owl_shared::log_warn!(
             "boot",
             "snap_max=1 且 snap_host_mb=0:生成段 Transient 快照会顶掉唯一的 \
@@ -2208,7 +2298,10 @@ fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
     // **视图化 verify 的臂门**(2026-10-23):`select_partial` 的链上有宿主占位符,
     // FI/XQA 的页表仍直接读会话链。配置层已拒;这里兜测试/手工构造的 EngineKnobs。
     if cfg.knobs.select_partial {
-        if !matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::V2) {
+        if !matches!(
+            cfg.knobs.env.attn.decode_arm,
+            owl_shared::config::DecodeArm::V2
+        ) {
             return Err(owl_iface::contract::ModelError::Msg(
                 "boot: `[kvmem] select_partial = true` 只支持 decode_arm = v2 \
                  (FI/XQA 页表读会话链,遇宿主占位符 = CUDA 700)"
@@ -2226,7 +2319,10 @@ fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
         }
     }
     if cfg.knobs.select_partial
-        && matches!(cfg.knobs.env.attn.decode_arm, owl_shared::config::DecodeArm::Xqa)
+        && matches!(
+            cfg.knobs.env.attn.decode_arm,
+            owl_shared::config::DecodeArm::Xqa
+        )
     {
         owl_shared::log_warn!(
             "boot",
@@ -2245,84 +2341,81 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     live_baseline_per_card: u64,
     t_run: std::time::Instant,
 ) -> Result<RankDev<DeviceHandle<D>>> {
-        boot_knobs_check(&mut face, cfg, tp.as_ref())?;
-        let mut phase = VramPhase::new();
-        phase.mark(&mut face, "boot-rank:权重已装载").await;
-        let s = cfg.max_seq_tokens;
-        // ⚠️ **已知缺口(§18.5 挂账①)**:CPU/mock 档若要跑引擎真前向,
-        // `dtype` 不能简单归一为 F32 —— `kv_paged_policy(dtype)` 与
-        // attn v2 scratch 注入都以**模型 dtype** 为前提(F32 ⇒ 无分页策略
-        // ⇒ 走 legacy v1 臂 ⇒ attention.rs 的退役 panic)。所需修法:
-        // 让分页策略/scratch 与执行域 dtype 解耦(单独一刀),不在 mock 刀里扫。
-        let (dims, env, fi_quant, spec) =
-            boot_env_and_spec(&mut face, cfg, &rm, tp.as_ref()).await?;
-        phase.mark(&mut face, "env+spec(草稿/环境)").await;
-        // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
-        // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 =
-        // min(剩余显存 cap, max_seq×并发 + 1 页)(knobs.pool_tokens 仅测试覆写)。
-        boot_kvmem_check(cfg)?;
-        // **池前 settle(2026-10-22)**:装载期临时块(store 复用池)与
-        // cudaMallocAsync 缓存会残留到 `free@池` 的读数里;不排空则同一档
-        // 不同 boot 的 cap 抖动(79k–116k)。先把它们还驱动/还 OS,再让
-        // `pool_cap` 读 free —— 这是“池前 materialize/结算”的收口。
-        let drained = face.drain_temp_pool().await;
-        let trimmed = face.mem_pool_trim().await.unwrap_or(0);
-        // **fresh free 回写**:`pool_cap` 读本 rank 的 `VramSnapshot`(由
-        // `mem_info` 写入设备 account;全局 free 仅诊断镜像)。装载期分配
-        // 模式不同会让缓存停在不同时刻 ⇒ 同一档 cap 抖 79k–116k。这里先
-        // drain/trim,再 sync,最后用 `cuMemGetInfo` 刷新设备账,让池看到
-        // **结算后的真值**。
-        if let Err(e) = face.sync().await {
-            eprintln!("[vram-pre-pool] sync 失败(继续):{e}");
-        }
-        if let Ok((free, _total)) = face.mem_info().await {
-            owl_shared::vram::free_set(free);
-        }
-        // **本 rank 的池前快照**(2026-10-24):`mem_info` 已把 free/total 写进
-        // 设备 account;池容量只读这份,不再读进程级全局 FREE。
-        let vram = face.vram_snapshot();
-        eprintln!(
-            "[vram-pre-pool] temp_drained={drained} 块 · driver_trimmed={} MiB ⇒ free={} MiB",
-            trimmed >> 20,
-            vram.free >> 20
-        );
-        let plan = boot_pool_plan(
-            cfg,
-            s,
-            &env,
-            &spec,
-            fi_quant,
-            tp.as_ref(),
-            live_baseline_per_card,
-            vram,
-        );
-        phase.mark(&mut face, "pre-pool settle").await;
-        // **池骨架 = `Pool` 类**(boot 相位;不加这个上下文就会落“未分类”桶 ——
-        // 可见但无用)。作用域 RAII:块分配途中任何早退都会还原上下文。
-        let pool = {
-            let _scope = face.scoped_ctx(Owner::System, AssetClass::Pool);
-            StatePool::alloc(&mut face, dims, &rm.spec.layer_types, &plan).await?
-        };
-        phase.mark(&mut face, "pool(KV/GDN 状态)").await;
+    boot_knobs_check(&mut face, cfg, tp.as_ref())?;
+    let mut phase = VramPhase::new();
+    phase.mark(&mut face, "boot-rank:权重已装载").await;
+    let s = cfg.max_seq_tokens;
+    // ⚠️ **已知缺口(§18.5 挂账①)**:CPU/mock 档若要跑引擎真前向,
+    // `dtype` 不能简单归一为 F32 —— `kv_paged_policy(dtype)` 与
+    // attn v2 scratch 注入都以**模型 dtype** 为前提(F32 ⇒ 无分页策略
+    // ⇒ 走 legacy v1 臂 ⇒ attention.rs 的退役 panic)。所需修法:
+    // 让分页策略/scratch 与执行域 dtype 解耦(单独一刀),不在 mock 刀里扫。
+    let (dims, env, fi_quant, spec) = boot_env_and_spec(&mut face, cfg, &rm, tp.as_ref()).await?;
+    phase.mark(&mut face, "env+spec(草稿/环境)").await;
+    // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
+    // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 =
+    // min(剩余显存 cap, max_seq×并发 + 1 页)(knobs.pool_tokens 仅测试覆写)。
+    boot_kvmem_check(cfg)?;
+    // **池前 settle(2026-10-22)**:装载期临时块(store 复用池)与
+    // cudaMallocAsync 缓存会残留到 `free@池` 的读数里;不排空则同一档
+    // 不同 boot 的 cap 抖动(79k–116k)。先把它们还驱动/还 OS,再让
+    // `pool_cap` 读 free —— 这是“池前 materialize/结算”的收口。
+    let drained = face.drain_temp_pool().await;
+    let trimmed = face.mem_pool_trim().await.unwrap_or(0);
+    // **fresh free 回写**:`pool_cap` 读本 rank 的 `VramSnapshot`(由
+    // `mem_info` 写入设备 account;全局 free 仅诊断镜像)。装载期分配
+    // 模式不同会让缓存停在不同时刻 ⇒ 同一档 cap 抖 79k–116k。这里先
+    // drain/trim,再 sync,最后用 `cuMemGetInfo` 刷新设备账,让池看到
+    // **结算后的真值**。
+    if let Err(e) = face.sync().await {
+        eprintln!("[vram-pre-pool] sync 失败(继续):{e}");
+    }
+    if let Ok((free, _total)) = face.mem_info().await {
+        owl_shared::vram::free_set(free);
+    }
+    // **本 rank 的池前快照**(2026-10-24):`mem_info` 已把 free/total 写进
+    // 设备 account;池容量只读这份,不再读进程级全局 FREE。
+    let vram = face.vram_snapshot();
+    eprintln!(
+        "[vram-pre-pool] temp_drained={drained} 块 · driver_trimmed={} MiB ⇒ free={} MiB",
+        trimmed >> 20,
+        vram.free >> 20
+    );
+    let plan = boot_pool_plan(
+        cfg,
+        s,
+        &env,
+        &spec,
+        fi_quant,
+        tp.as_ref(),
+        live_baseline_per_card,
+        vram,
+    );
+    phase.mark(&mut face, "pre-pool settle").await;
+    // **池骨架 = `Pool` 类**(boot 相位;不加这个上下文就会落“未分类”桶 ——
+    // 可见但无用)。作用域 RAII:块分配途中任何早退都会还原上下文。
+    let pool = {
+        let _scope = face.scoped_ctx(Owner::System, AssetClass::Pool);
+        StatePool::alloc(&mut face, dims, &rm.spec.layer_types, &plan).await?
+    };
+    phase.mark(&mut face, "pool(KV/GDN 状态)").await;
 
-        // **MTP window 的 v2 依赖门**(2026-10-21):window 只改 draft 读，
-        // 但必须走 v2 伪序列（decode T=1 / extend 多行 / chain）；缺
-        // `attn_v2_scratch` 或 `verify_attn_v2_scratch` 就会落 full lens
-        // 的 chunked 语义，window 表会静默错位 ⇒ boot 拒，不自动回退。
-        if spec.mtp_window.active() {
-            if pool.attn_v2_scratch().is_none()
-                || pool.verify_attn_v2_scratch().is_none()
-            {
-                return Err(owl_iface::contract::ModelError::Msg(
-                    "[spec] mtp_window > 0 需要 v2 注意力 scratch（attn_v2 + verify_attn_v2）；\
+    // **MTP window 的 v2 依赖门**(2026-10-21):window 只改 draft 读，
+    // 但必须走 v2 伪序列（decode T=1 / extend 多行 / chain）；缺
+    // `attn_v2_scratch` 或 `verify_attn_v2_scratch` 就会落 full lens
+    // 的 chunked 语义，window 表会静默错位 ⇒ boot 拒，不自动回退。
+    if spec.mtp_window.active() {
+        if pool.attn_v2_scratch().is_none() || pool.verify_attn_v2_scratch().is_none() {
+            return Err(owl_iface::contract::ModelError::Msg(
+                "[spec] mtp_window > 0 需要 v2 注意力 scratch（attn_v2 + verify_attn_v2）；\
                      当前池缺其一，window 读会落 chunked/full lens 语义 ⇒ 拒启"
-                        .into(),
-                ));
-            }
-            let page = pool.geom.page.max(1);
-            let sink_eff = spec.mtp_window.sink.div_ceil(page) * page;
-            let window_eff = spec.mtp_window.window.div_ceil(page) * page;
-            owl_shared::log_info!(
+                    .into(),
+            ));
+        }
+        let page = pool.geom.page.max(1);
+        let sink_eff = spec.mtp_window.sink.div_ceil(page) * page;
+        let window_eff = spec.mtp_window.window.div_ceil(page) * page;
+        owl_shared::log_info!(
                 "boot",
                 "MTP window: window={} sink={} min_ctx={} page={} => sink_pages={} window_pages={} (effective sink={} window={})",
                 spec.mtp_window.window,
@@ -2334,28 +2427,28 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
                 sink_eff,
                 window_eff
             );
-        }
+    }
 
-        // **锁①:虚拟化档的池容量硬校验**(2026-10-19;响亮拒,不静默落空槽)。
-        //
-        // 几何一律从**池实况**取(`pool.geom.page`/`pool.geom.nb`),不另算一份。
-        //
-        // # 下限的算式(为什么乘 N_active)
-        //
-        // ```text
-        // 池页数 ≥ N_active × (select_blocks + sink + recent + chunk/page)
-        //          └─ 每个活跃 turn 都要**自己一套**工作集与 chunk 工作区
-        // ```
-        //
-        // `N_active` = `gdn_slots`(并发上限)。**这一项不能省** ——
-        // 并发档下每个 turn 各有自己的工作集,池要能同时装下它们。
-        // 27B f16 算例(页 = 32 tok = 2 MiB):
-        //   select_blocks 32 + sink 2 + recent 4 + chunk 256 ⇒ 每 turn 46 页 = 92 MiB
-        //   8 并发 ⇒ 368 页 = 736 MiB ‖ 对照 dense 8 并发 = 8×256 页 = 4 GiB ⇒ 省 5.6×
-        // **每 turn 工作集派生**(唯一产地;对外一个 token 数 ⇒ 内部三件)。
-        // 位置 = 装配期(页几何已知)、**与虚拟化档无关** —— 诊断档(只跑选择器
-        // 读数)也要同一口径,否则配置写了 token 却被静默忽略。
-        boot_pool_floor(cfg, &pool, s, plan.pool_tokens)?;
+    // **锁①:虚拟化档的池容量硬校验**(2026-10-19;响亮拒,不静默落空槽)。
+    //
+    // 几何一律从**池实况**取(`pool.geom.page`/`pool.geom.nb`),不另算一份。
+    //
+    // # 下限的算式(为什么乘 N_active)
+    //
+    // ```text
+    // 池页数 ≥ N_active × (select_blocks + sink + recent + chunk/page)
+    //          └─ 每个活跃 turn 都要**自己一套**工作集与 chunk 工作区
+    // ```
+    //
+    // `N_active` = `gdn_slots`(并发上限)。**这一项不能省** ——
+    // 并发档下每个 turn 各有自己的工作集,池要能同时装下它们。
+    // 27B f16 算例(页 = 32 tok = 2 MiB):
+    //   select_blocks 32 + sink 2 + recent 4 + chunk 256 ⇒ 每 turn 46 页 = 92 MiB
+    //   8 并发 ⇒ 368 页 = 736 MiB ‖ 对照 dense 8 并发 = 8×256 页 = 4 GiB ⇒ 省 5.6×
+    // **每 turn 工作集派生**(唯一产地;对外一个 token 数 ⇒ 内部三件)。
+    // 位置 = 装配期(页几何已知)、**与虚拟化档无关** —— 诊断档(只跑选择器
+    // 读数)也要同一口径,否则配置写了 token 却被静默忽略。
+    boot_pool_floor(cfg, &pool, s, plan.pool_tokens)?;
     {
         // **池的落账行**(2026-10-21):算式上限(`[ctx-max] cap`)与真实可服务
         // 上限之间还差一块**未入账固定开销**(CUDA ctx + FI ws + 图 slab + 碎片,
@@ -2372,47 +2465,50 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
             draft_mib
         );
     }
-        if let Some(q) = fi_quant {
-            owl_shared::log_info!("boot", "FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
-                q
-            );
-        }
-
-        // 图族总装配(graph_fleet.rs:① 主会话图(warmup+捕获)→
-        // ② verify 桶形图 → ③ fold/DFlash2/MTP 族;face 句柄派生
-        // vface + extra_faces(pop 消费桶))
-        let vface = face.face_clone();
-        // E5-M5:fold/propose 桶形图族的 face 句柄(depth × 2)
-        let depth_candidates = spec.depth_candidates();
-        let extra_faces: Vec<DeviceHandle<D>> =
-            (0..fleet_faces(&depth_candidates)).filter_map(|_| face.face_clone()).collect();
-        let mut graphs = GraphFleet::assemble(
-            face,
-            vface,
-            extra_faces,
-            FleetBoot {
-                env,
-                tp: tp.clone(),
-                dims,
-                pool: &pool,
-                model: std::sync::Arc::clone(&rm.model),
-                rope: rm.rope.clone(),
-                spec: &spec,
-                knobs: &cfg.knobs,
-            },
-            t_run,
-        )
-        .await?;
-        phase.mark_info(
-            "graphs(全部捕获图)",
-            graphs.session.face_mut().mem_info().await,
+    if let Some(q) = fi_quant {
+        owl_shared::log_info!(
+            "boot",
+            "FlashInfer prefill 面启用(FI 直读主池 kNHD 单池;quant={:?})",
+            q
         );
+    }
 
-        // ── 准入预算组装 + 会话/块账房(S3b;§23.3)──
-        // 此刻固定面全部落位(权重 + 池 + 图 slab + 表件)⇒ 实测数字齐;
-        // 装配失败 = 拒绝启动(A5.1:没有数字的项不许进预算式)。
+    // 图族总装配(graph_fleet.rs:① 主会话图(warmup+捕获)→
+    // ② verify 桶形图 → ③ fold/DFlash2/MTP 族;face 句柄派生
+    // vface + extra_faces(pop 消费桶))
+    let vface = face.face_clone();
+    // E5-M5:fold/propose 桶形图族的 face 句柄(depth × 2)
+    let depth_candidates = spec.depth_candidates();
+    let extra_faces: Vec<DeviceHandle<D>> = (0..fleet_faces(&depth_candidates))
+        .filter_map(|_| face.face_clone())
+        .collect();
+    let mut graphs = GraphFleet::assemble(
+        face,
+        vface,
+        extra_faces,
+        FleetBoot {
+            env,
+            tp: tp.clone(),
+            dims,
+            pool: &pool,
+            model: std::sync::Arc::clone(&rm.model),
+            rope: rm.rope.clone(),
+            spec: &spec,
+            knobs: &cfg.knobs,
+        },
+        t_run,
+    )
+    .await?;
+    phase.mark_info(
+        "graphs(全部捕获图)",
+        graphs.session.face_mut().mem_info().await,
+    );
 
-        boot_post_check(&spec, &graphs, &rm.model)?;
+    // ── 准入预算组装 + 会话/块账房(S3b;§23.3)──
+    // 此刻固定面全部落位(权重 + 池 + 图 slab + 表件)⇒ 实测数字齐;
+    // 装配失败 = 拒绝启动(A5.1:没有数字的项不许进预算式)。
+
+    boot_post_check(&spec, &graphs, &rm.model)?;
     let boot_env = env;
     Ok(RankDev {
         boot: RankBoot {
@@ -2427,4 +2523,5 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         spec_rt: spec,
         pool,
         graphs,
-    })}
+    })
+}

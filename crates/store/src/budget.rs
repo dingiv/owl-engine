@@ -17,13 +17,15 @@ use crate::error::{StoreError, StoreResult};
 use crate::tier::TierBudget;
 
 /// 预算输入(**全部为实测字节数**;设计卷 §2.2)。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BudgetInputs {
     /// 卡可用字节(实测 `cudaMemGetInfo` free,不是标称容量)。
     pub v_card_bytes: usize,
     /// 权重常驻(27B AWQ 实测 ≈17.5GB —— 账面 13.7GB,**2G 待审计**)。
     pub weights_bytes: usize,
-    /// 运行底价:图 slab + 激活峰值 + 上下文 + warmup 瞬态(实测)。
+    /// 运行底价:图 slab + warmup 瞬态 + **快照池** + 其它非池固定项。
+    /// boot 由 [`crate::plan::MemoryPlan::to_budget_inputs`] 从固定项投影,
+    /// 不再用两次 `live_bytes()` 的残差反推。
     pub runtime_floor_bytes: usize,
     /// 草稿池(MTP/DFlash2;关 = 0。按 `pool_tokens` 全额预留,是第二主池)。
     pub draft_pool_bytes: usize,
@@ -87,7 +89,9 @@ impl TurnFloor {
         kv_bytes_per_token: usize,
     ) -> usize {
         let page = page_tokens.max(1);
-        self.floor_pages(ctx_tokens, page).saturating_mul(page).saturating_mul(kv_bytes_per_token)
+        self.floor_pages(ctx_tokens, page)
+            .saturating_mul(page)
+            .saturating_mul(kv_bytes_per_token)
     }
 
     /// 是否零耐受(禁选择层)。
@@ -116,17 +120,25 @@ impl VramBudget {
             return Err(StoreError::Budget("每 token KV 字节为 0".into()));
         }
         if inputs.page_tokens == 0 {
-            return Err(StoreError::Budget("页宽(page_tokens)为 0(地板/池下限无从按页对齐)".into()));
+            return Err(StoreError::Budget(
+                "页宽(page_tokens)为 0(地板/池下限无从按页对齐)".into(),
+            ));
         }
         if gdn_slots == 0 {
-            return Err(StoreError::Budget("gdn_slots = 0(没有任何 turn 能跑)".into()));
+            return Err(StoreError::Budget(
+                "gdn_slots = 0(没有任何 turn 能跑)".into(),
+            ));
         }
         // 固定池档(池已预分配)⇒ 准入判据不看卡级三项 ⇒ 允许未实测(记 0 + 标记);
         // 动态池档 ⇒ 卡级三项是判据本身,缺项 = 分解失败(A5.1)。
         let fixed_pool = inputs.kv_face_bytes > 0;
         let card_measured = inputs.weights_bytes > 0 && inputs.runtime_floor_bytes > 0;
         if !card_measured && !fixed_pool {
-            let miss = if inputs.weights_bytes == 0 { "权重字节" } else { "运行底价" };
+            let miss = if inputs.weights_bytes == 0 {
+                "权重字节"
+            } else {
+                "运行底价"
+            };
             return Err(StoreError::Budget(format!(
                 "{miss}为 0(缺实测数字,禁进预算式;动态池档无池面兜底)"
             )));
@@ -149,7 +161,11 @@ impl VramBudget {
                 inputs.gdn_row_bytes / (1 << 20)
             )));
         }
-        Ok(Self { inputs, gdn_slots, card_measured })
+        Ok(Self {
+            inputs,
+            gdn_slots,
+            card_measured,
+        })
     }
 
     /// 卡级三项(`v_card`/权重/底价)是否实测。固定池档允许缺项 —— 缺了不是
@@ -194,7 +210,10 @@ impl VramBudget {
 
     /// 三层预算(交给 `TierLedger`)。
     pub fn tier_budget(&self) -> TierBudget {
-        TierBudget { host_bytes: self.inputs.host_bytes, disk_bytes: self.inputs.disk_bytes }
+        TierBudget {
+            host_bytes: self.inputs.host_bytes,
+            disk_bytes: self.inputs.disk_bytes,
+        }
     }
 }
 
@@ -217,12 +236,17 @@ pub struct Admission {
     cache_bytes: usize,
     /// 非 turn 归属的**不可动面**(idle 会话持着的历史;引擎段边界同步)。
     session_held_bytes: usize,
+    /// 活跃块槽宽(字节;`0` = 未接块身份,退回按 turn floor 求和)。
+    slot_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Default)]
 struct ActiveTurn {
     floor_bytes: usize,
     elastic_bytes: usize,
+    /// 本 turn 持有的设备块槽(共享前缀会出现在多个 turn 的集合里,
+    /// `Admission::reserved_bytes` 取并集,不按会话表长度重复计数)。
+    slots: std::collections::BTreeSet<u32>,
 }
 
 impl Admission {
@@ -232,11 +256,23 @@ impl Admission {
     }
 
     /// 登记一个活跃 turn(准入前置:调用方必须先用 [`check_admission`] 判过)。
-    pub fn admit(&mut self, turn: u64, floor_bytes: usize, elastic_bytes: usize) -> StoreResult<()> {
+    pub fn admit(
+        &mut self,
+        turn: u64,
+        floor_bytes: usize,
+        elastic_bytes: usize,
+    ) -> StoreResult<()> {
         if self.active.contains_key(&turn) {
             return Err(StoreError::Invariant(format!("turn {turn} 已在活跃集")));
         }
-        self.active.insert(turn, ActiveTurn { floor_bytes, elastic_bytes });
+        self.active.insert(
+            turn,
+            ActiveTurn {
+                floor_bytes,
+                elastic_bytes,
+                ..ActiveTurn::default()
+            },
+        );
         Ok(())
     }
 
@@ -273,6 +309,40 @@ impl Admission {
         Ok(())
     }
 
+    /// **活跃块集合更新**(段边界;P0-3)。
+    ///
+    /// `slots` = 本 turn 当前持有的设备块槽号;多 turn 共享前缀时同一槽号
+    /// 出现在多个集合里,保留面按**并集**计,不再把共享块算两次。
+    /// `slot_bytes` 在首次调用时定档;后续不一致 = 装配错(响亮拒)。
+    pub fn set_active_slots(
+        &mut self,
+        turn: u64,
+        slots: impl IntoIterator<Item = u32>,
+        slot_bytes: usize,
+    ) -> StoreResult<()> {
+        if slot_bytes == 0 {
+            return Err(StoreError::Invariant(
+                "set_active_slots: slot_bytes = 0".into(),
+            ));
+        }
+        if self.slot_bytes == 0 {
+            self.slot_bytes = slot_bytes;
+        } else if self.slot_bytes != slot_bytes {
+            return Err(StoreError::Invariant(format!(
+                "set_active_slots: 槽宽漂移 {} ≠ {slot_bytes}",
+                self.slot_bytes
+            )));
+        }
+        let blocks: std::collections::BTreeSet<u32> = slots.into_iter().collect();
+        let t = self
+            .active
+            .get_mut(&turn)
+            .ok_or_else(|| StoreError::Unknown(format!("turn {turn}")))?;
+        t.floor_bytes = blocks.len().saturating_mul(slot_bytes);
+        t.slots = blocks;
+        Ok(())
+    }
+
     /// 缓存面驻留登记(入账/出账由调用方配对)。
     pub fn set_cache_bytes(&mut self, bytes: usize) {
         self.cache_bytes = bytes;
@@ -291,9 +361,19 @@ impl Admission {
         self.active.len()
     }
 
-    /// 保留面合计(活跃 turn 的地板之和 —— **不可驱逐**面)。
+    /// 保留面合计(**唯一**活跃块字节 —— 共享前缀只计一次)。
+    ///
+    /// 未接块身份(`slot_bytes = 0`,旧测试/非块资产)= 退回各 turn floor 之和。
     pub fn reserved_bytes(&self) -> usize {
-        self.active.values().map(|t| t.floor_bytes).sum()
+        if self.slot_bytes == 0 {
+            return self.active.values().map(|t| t.floor_bytes).sum();
+        }
+        let union: std::collections::BTreeSet<u32> = self
+            .active
+            .values()
+            .flat_map(|t| t.slots.iter().copied())
+            .collect();
+        union.len().saturating_mul(self.slot_bytes)
     }
 
     /// 弹性面合计(可驱逐)。
@@ -377,7 +457,10 @@ pub fn check_admission(
     }
     let short = (committed + floor_bytes).saturating_sub(face);
     if evictable_bytes >= short {
-        return AdmissionVerdict::EvictThen { floor_bytes, need_bytes: short };
+        return AdmissionVerdict::EvictThen {
+            floor_bytes,
+            need_bytes: short,
+        };
     }
     let pages = floor.floor_pages(ctx_tokens, inp.page_tokens);
     let reason = if floor.is_strict() {
@@ -398,7 +481,9 @@ pub fn check_admission(
         if grantable == 0 {
             return verdict_for_full(on_full, reason);
         }
-        AdmissionVerdict::Admit { floor_bytes: grantable }
+        AdmissionVerdict::Admit {
+            floor_bytes: grantable,
+        }
     }
 }
 
@@ -465,7 +550,10 @@ mod tests {
             disk_bytes: 0,
             kv_face_bytes: 0, // 也没有池面兑底 ⇒ 必须拒
         };
-        assert!(matches!(VramBudget::decompose(inp, 1), Err(StoreError::Budget(_))));
+        assert!(matches!(
+            VramBudget::decompose(inp, 1),
+            Err(StoreError::Budget(_))
+        ));
     }
 
     #[test]
@@ -493,7 +581,14 @@ mod tests {
         // 可动面够 ⇒ 先腾后进
         let mut a2 = Admission::new();
         a2.set_cache_bytes(4 << 20); // 池满（全在缓存面）
-        let v = check_admission(&b, &a2, TurnFloor::Strict, 128, 4 << 20, QueuePolicy::Reject);
+        let v = check_admission(
+            &b,
+            &a2,
+            TurnFloor::Strict,
+            128,
+            4 << 20,
+            QueuePolicy::Reject,
+        );
         match v {
             AdmissionVerdict::EvictThen { need_bytes, .. } => assert_eq!(need_bytes, 4 << 20),
             other => panic!("应先腾后进，得 {other:?}"),
@@ -525,7 +620,10 @@ mod tests {
     fn v_avail_and_capacity_match_hand_math() {
         let b = budget(2);
         // 25.0 − 17.5 − 2.0 − 2×0.162 = 5.176GB
-        assert_eq!(b.v_avail_bytes(), 25_000_000_000 - 17_500_000_000 - 2_000_000_000 - 324_000_000);
+        assert_eq!(
+            b.v_avail_bytes(),
+            25_000_000_000 - 17_500_000_000 - 2_000_000_000 - 324_000_000
+        );
         // N* = 5.176GB / 32KiB ≈ 157k tok
         let n_star = b.kv_tokens_capacity();
         assert!((150_000..165_000).contains(&n_star), "N* = {n_star}");
@@ -535,7 +633,11 @@ mod tests {
     #[test]
     fn floor_is_page_granular_and_capped() {
         // 页 = 32 tok × 32KiB = 1 MiB
-        assert_eq!(TurnFloor::Strict.floor_pages(100, 32), 4, "100 tok 占 4 页(ceil)");
+        assert_eq!(
+            TurnFloor::Strict.floor_pages(100, 32),
+            4,
+            "100 tok 占 4 页(ceil)"
+        );
         assert_eq!(
             TurnFloor::Strict.floor_bytes(100, 32, 32 * 1024),
             4 << 20,
@@ -543,20 +645,31 @@ mod tests {
         );
         assert_eq!(TurnFloor::Strict.floor_pages(96, 32), 3, "对齐不浪费页");
         assert_eq!(TurnFloor::Pages(2).floor_pages(100, 32), 2);
-        assert_eq!(TurnFloor::Pages(9).floor_pages(100, 32), 4, "高于 ctx 页数 ⇒ 封顶到 ctx");
+        assert_eq!(
+            TurnFloor::Pages(9).floor_pages(100, 32),
+            4,
+            "高于 ctx 页数 ⇒ 封顶到 ctx"
+        );
         assert_eq!(
             TurnFloor::Pages(0).floor_bytes(100, 32, 32 * 1024),
             0,
             "0 页 = 允许全量下沉(不是“未设”)"
         );
-        assert_eq!(TurnFloor::Pages(1).floor_bytes(0, 32, 32 * 1024), 0, "零长 ctx = 零地板");
+        assert_eq!(
+            TurnFloor::Pages(1).floor_bytes(0, 32, 32 * 1024),
+            0,
+            "零长 ctx = 零地板"
+        );
     }
 
     #[test]
     fn decompose_rejects_zero_page_width() {
         let mut inp = pool_budget(1, 1 << 20).inputs();
         inp.page_tokens = 0;
-        assert!(matches!(VramBudget::decompose(inp, 1), Err(StoreError::Budget(_))));
+        assert!(matches!(
+            VramBudget::decompose(inp, 1),
+            Err(StoreError::Budget(_))
+        ));
     }
 
     #[test]
@@ -599,8 +712,37 @@ mod tests {
         let mut a = Admission::new();
         let v_avail = b.v_avail_bytes();
         a.set_cache_bytes(v_avail - (1 << 20)); // 缓存几乎占满
-        let v = check_admission(&b, &a, TurnFloor::Pages(4), 8192, 8 << 20, QueuePolicy::Reject);
+        let v = check_admission(
+            &b,
+            &a,
+            TurnFloor::Pages(4),
+            8192,
+            8 << 20,
+            QueuePolicy::Reject,
+        );
         assert!(matches!(v, AdmissionVerdict::EvictThen { .. }), "得 {v:?}");
+    }
+
+    /// **P0-3**:两个活跃 turn 共享前缀时,保留面按槽号并集计,
+    /// 第三个同尺寸 turn 不应因重复计数被误拒。
+    #[test]
+    fn shared_prefix_is_counted_once() {
+        let b = pool_budget(3, 4 << 20); // 4MiB 池;1MiB/块
+        let mut a = Admission::new();
+        a.admit(1, 0, 0).expect("t1");
+        a.admit(2, 0, 0).expect("t2");
+        a.set_active_slots(1, [1u32, 2], 1 << 20).expect("t1 slots");
+        a.set_active_slots(2, [1u32, 2, 3], 1 << 20)
+            .expect("t2 slots");
+        assert_eq!(a.reserved_bytes(), 3 << 20, "共享块只计一次");
+        // 第三 turn 1 块:3MiB + 1MiB = 4MiB,刚好准入(双计则会 5MiB 被拒)
+        assert!(matches!(
+            check_admission(&b, &a, TurnFloor::Strict, 32, 0, QueuePolicy::Reject),
+            AdmissionVerdict::Admit { .. }
+        ));
+        // 释放共享方之一,并集仍覆盖另一 turn 的全部块
+        a.release(1).expect("release");
+        assert_eq!(a.reserved_bytes(), 3 << 20);
     }
 
     #[test]
@@ -608,12 +750,26 @@ mod tests {
         let b = budget(1);
         let mut a = Admission::new();
         a.admit(1, 1 << 20, 0).expect("第一个");
-        let v = check_admission(&b, &a, TurnFloor::Pages(1), 32, 1 << 30, QueuePolicy::Reject);
+        let v = check_admission(
+            &b,
+            &a,
+            TurnFloor::Pages(1),
+            32,
+            1 << 30,
+            QueuePolicy::Reject,
+        );
         match v {
             AdmissionVerdict::Reject { reason } => assert!(reason.contains("天花板"), "{reason}"),
             other => panic!("应拒,得 {other:?}"),
         }
-        let q = check_admission(&b, &a, TurnFloor::Pages(1), 32, 1 << 30, QueuePolicy::Queue { max_wait_ms: 50 });
+        let q = check_admission(
+            &b,
+            &a,
+            TurnFloor::Pages(1),
+            32,
+            1 << 30,
+            QueuePolicy::Queue { max_wait_ms: 50 },
+        );
         assert!(matches!(q, AdmissionVerdict::Queue { .. }), "得 {q:?}");
     }
 }

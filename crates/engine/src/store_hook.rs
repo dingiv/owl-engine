@@ -13,7 +13,7 @@
 //!   `snap_ensure_resident` 直呼）；
 //! - `Release::{TurnEnd,Abort}`：H3 链登记/盘索引 + H6 表释放 +
 //!   GDN 行归还 + 归属下行 + N4 清点/force release/trim；
-//! - `Maintain::{Idle,Pressure}`：空转与压力整理（原 `Node::Idle/Pressure`）；
+//! - `Maintain::{Idle,Pressure,HostPressure}`：空转、池压力与宿主压力整理；
 //! - **Phase 2**：`ensure_for_len` 改为纯分配；生成相位的 `Acquire(Grow)`
 //!   按 `step_need::generation_target` 覆盖 verify + 轮末 propose
 //!   （DFlash2 `pos+2d+2` / MTP `pos+2d`）。MTP 腿 cache=Off/无宿主，
@@ -29,8 +29,12 @@
 //! engine 生产位置不得直接调 `plan_need` / `plan_onload` / `snap_*`；
 //! 只能经 `store_hook`。`Acquire::Capacity` 的 kind 由 `Need.why` 表达
 //! （`Admit` / `Grow`），不另设一个可能和 `Need` 漂移的冗余枚举。
+//!
+//! **P0-4**：`Capacity { reserve: Some(..) }` 在准入 Admit 后发 Grant；
+//! 回执走 `StoreOutcome.grant`，后续 `Rel::ensure_for_len(grant, ..)` 消费，
+//! `Release` 归还。`Grow` 不开新票（复用在册 turn 的容量票）。
 
-use owl_store::{Applied, ChainHash, Need, SnapKey};
+use owl_store::{Applied, ChainHash, Grant, Need, ReservationKind, SnapKey};
 
 /// 顶层三钩子。
 #[derive(Clone, Debug)]
@@ -47,11 +51,32 @@ pub(crate) enum StoreHook {
 #[derive(Clone, Debug)]
 pub(crate) enum Acquire {
     /// 准入 / 增长：`need.why` 必须是 `Admit` / `Grow`。
-    Capacity(Need),
+    ///
+    /// `reserve` = 本次是否新开一张 Grant（准入时给整条上下文；增长时复用
+    /// 已有 turn grant，不再开新票）。`None` 只做容量保洁。
+    Capacity {
+        /// 本次腾位/增长需求。
+        need: Need,
+        /// 新开票请求（准入）。
+        reserve: Option<ReserveRequest>,
+    },
     /// 前缀命中回灌：先确保设备槽，再统一执行 host→device onload。
     Load(LoadRequest),
     /// 状态腿：选槽或就位。
     State(StateAcquire),
+}
+
+/// 一张新 Grant 的请求（准入后由 store 账发放）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReserveRequest {
+    /// turn 归属。
+    pub(crate) turn: u64,
+    /// 准入面批准槽数（超卖档 = 工作集）。
+    pub(crate) slots: usize,
+    /// 分配面可消费槽数（超卖档 = 整条 ctx 的块表上限）。
+    pub(crate) alloc_slots: usize,
+    /// 用途。
+    pub(crate) kind: ReservationKind,
 }
 
 /// 状态腿前场请求。
@@ -112,6 +137,11 @@ pub(crate) enum Maintain {
         /// 目标腾出的状态腿设备字节。
         snap_bytes: usize,
     },
+    /// **宿主压力**：只把宿主冷面挪到磁盘；不产生 GPU→Host 票。
+    HostPressure {
+        /// 目标腾出的宿主槽数。
+        slots: usize,
+    },
 }
 
 /// 钩子回执：调用方只消费“实际发生了什么”，不反推计划。
@@ -123,11 +153,34 @@ pub(crate) struct StoreOutcome {
     pub(crate) loaded_blocks: usize,
     /// 本次 `State` 就位后的设备槽（其它钩子为 None）。
     pub(crate) state_slot: Option<u32>,
+    /// 本次 `Capacity { reserve: Some(..) }` 新开的票。
+    pub(crate) grant: Option<Grant>,
 }
 
 impl StoreHook {
     pub(crate) fn capacity(need: Need) -> Self {
-        Self::Acquire(Acquire::Capacity(need))
+        Self::Acquire(Acquire::Capacity {
+            need,
+            reserve: None,
+        })
+    }
+
+    /// 准入后新开一张票（turn 归属 + 准入面/分配面槽数）。
+    pub(crate) fn capacity_reserve(
+        need: Need,
+        turn: u64,
+        slots: usize,
+        alloc_slots: usize,
+    ) -> Self {
+        Self::Acquire(Acquire::Capacity {
+            need,
+            reserve: Some(ReserveRequest {
+                turn,
+                slots,
+                alloc_slots,
+                kind: ReservationKind::ActiveFloor,
+            }),
+        })
     }
 
     pub(crate) fn load(session: u64, blocks: Vec<(usize, ChainHash)>) -> Self {
@@ -142,12 +195,7 @@ impl StoreHook {
         Self::Acquire(Acquire::State(StateAcquire::Slot { key }))
     }
 
-    pub(crate) fn turn_end(
-        turn: u64,
-        session: u64,
-        gdn_slot: usize,
-        ephemeral: bool,
-    ) -> Self {
+    pub(crate) fn turn_end(turn: u64, session: u64, gdn_slot: usize, ephemeral: bool) -> Self {
         Self::Release(Release {
             kind: ReleaseKind::TurnEnd,
             turn,
@@ -157,12 +205,7 @@ impl StoreHook {
         })
     }
 
-    pub(crate) fn abort(
-        turn: u64,
-        session: u64,
-        gdn_slot: usize,
-        ephemeral: bool,
-    ) -> Self {
+    pub(crate) fn abort(turn: u64, session: u64, gdn_slot: usize, ephemeral: bool) -> Self {
         Self::Release(Release {
             kind: ReleaseKind::Abort,
             turn,
@@ -180,24 +223,37 @@ impl StoreHook {
         Self::Maintain(Maintain::Pressure { slots, snap_bytes })
     }
 
+    pub(crate) fn host_pressure(slots: usize) -> Self {
+        Self::Maintain(Maintain::HostPressure { slots })
+    }
+
     /// 指标标签（`store.hook.<label>`）。
     ///
     /// `Capacity` 的非法 `why` 由执行臂响亮拒；这里给 `invalid` 只是让
     /// 计数先落账，不把错误吞成正常标签。
     pub(crate) fn label(&self) -> &'static str {
         match self {
-            Self::Acquire(Acquire::Capacity(need)) => match need.why {
+            Self::Acquire(Acquire::Capacity { need, .. }) => match need.why {
                 owl_store::NeedWhy::Admit => "acquire.admit",
                 owl_store::NeedWhy::Grow => "acquire.grow",
                 _ => "acquire.invalid",
             },
             Self::Acquire(Acquire::Load(_)) => "acquire.load",
             Self::Acquire(Acquire::State(StateAcquire::Slot { .. })) => "acquire.state.slot",
-            Self::Acquire(Acquire::State(StateAcquire::Resident { .. })) => "acquire.state.resident",
-            Self::Release(Release { kind: ReleaseKind::TurnEnd, .. }) => "release.turn_end",
-            Self::Release(Release { kind: ReleaseKind::Abort, .. }) => "release.abort",
+            Self::Acquire(Acquire::State(StateAcquire::Resident { .. })) => {
+                "acquire.state.resident"
+            }
+            Self::Release(Release {
+                kind: ReleaseKind::TurnEnd,
+                ..
+            }) => "release.turn_end",
+            Self::Release(Release {
+                kind: ReleaseKind::Abort,
+                ..
+            }) => "release.abort",
             Self::Maintain(Maintain::Idle(_)) => "maintain.idle",
             Self::Maintain(Maintain::Pressure { .. }) => "maintain.pressure",
+            Self::Maintain(Maintain::HostPressure { .. }) => "maintain.host_pressure",
         }
     }
 }
@@ -221,16 +277,20 @@ mod label_tests {
         assert_eq!(StoreHook::load(1, vec![]).label(), "acquire.load");
         let key = SnapKey::at_boundary(ChainHash::new(0xA1));
         assert_eq!(StoreHook::state(key).label(), "acquire.state.resident");
+        assert_eq!(StoreHook::state_slot(key).label(), "acquire.state.slot");
         assert_eq!(
-            StoreHook::state_slot(key).label(),
-            "acquire.state.slot"
+            StoreHook::turn_end(1, 2, 0, false).label(),
+            "release.turn_end"
         );
-        assert_eq!(StoreHook::turn_end(1, 2, 0, false).label(), "release.turn_end");
         assert_eq!(StoreHook::abort(1, 2, 0, true).label(), "release.abort");
         assert_eq!(StoreHook::idle(1).label(), "maintain.idle");
         assert_eq!(
             StoreHook::pressure_with_snap(1, 2).label(),
             "maintain.pressure"
+        );
+        assert_eq!(
+            StoreHook::host_pressure(1).label(),
+            "maintain.host_pressure"
         );
     }
 }

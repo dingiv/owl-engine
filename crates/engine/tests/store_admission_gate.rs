@@ -43,7 +43,10 @@ fn skip() -> bool {
 /// CPU 面"值块恒 f32"的口径差上 —— 那是 §18.5.1 的**已挂账缺口**
 /// (裁决:不追),不在本刀范围。本门要验的是准入判决,故把负载压在单 chunk 内。
 fn num_prompt(base: u32, n: u32) -> String {
-    (0..n).map(|i| ((base + i) * 7 % 997).to_string()).collect::<Vec<_>>().join(" ")
+    (0..n)
+        .map(|i| ((base + i) * 7 % 997).to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 池 = 8 槽(下限 = 单会话容量 max_seq/32);prompt 全部 ≤ 32 tok(单 chunk)
@@ -76,10 +79,17 @@ async fn boot_rows(
             ..Default::default()
         },
     };
-    let face =
-        CpuFace::mock(MockLimits { null_kernels: true, graph_capture: true, ..Default::default() });
+    let face = CpuFace::mock(MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
     let mut engine = Engine::on(cfg, face).expect("构造(CPU face)");
-    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
     engine.run(loaded).await.expect("装配")
 }
 
@@ -112,7 +122,9 @@ async fn run_turn(
 ///
 /// 与 `boot_rows` 的区别:开虚拟化两扇门 + 地板走 per-turn 覆写面,
 /// 工作集由调用方给(池下限 `nb ≥ 1 × (ws_pages + 1)` 必须装得进 8 槽池)。
-async fn boot_virt(ws_tokens: usize) -> owl_engine::RunningEngine<owl_engine::DeviceHandle<CpuFace>> {
+async fn boot_virt(
+    ws_tokens: usize,
+) -> owl_engine::RunningEngine<owl_engine::DeviceHandle<CpuFace>> {
     let cfg = EngineConfig {
         device_ordinal: 0,
         max_seq_tokens: MAX_SEQ,
@@ -132,10 +144,17 @@ async fn boot_virt(ws_tokens: usize) -> owl_engine::RunningEngine<owl_engine::De
             ..Default::default()
         },
     };
-    let face =
-        CpuFace::mock(MockLimits { null_kernels: true, graph_capture: true, ..Default::default() });
+    let face = CpuFace::mock(MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
     let mut engine = Engine::on(cfg, face).expect("构造(CPU face)");
-    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
     engine.run(loaded).await.expect("装配")
 }
 
@@ -188,7 +207,10 @@ async fn cold_cache_is_offloaded_before_the_new_turn_is_admitted() {
         r1.slots_total,
         r1.movable_bytes
     );
-    assert!(matches!(ev1, TurnEvent::Completed { .. }), "轮 1 应完成:{ev1:?}");
+    assert!(
+        matches!(ev1, TurnEvent::Completed { .. }),
+        "轮 1 应完成:{ev1:?}"
+    );
     let off_before = r1.ops.offloads;
 
     // 轮 2(不同前缀 ⇒ 不复用)⇒ 池不够但**可动面够** ⇒ 应先腾后进
@@ -203,14 +225,60 @@ async fn cold_cache_is_offloaded_before_the_new_turn_is_admitted() {
         r2.host_blocks,
         r2.host_budget_bytes / r2.block_bytes.max(1)
     );
-    assert!(matches!(ev2, TurnEvent::Completed { .. }), "轮 2 应完成:{ev2:?}");
+    assert!(
+        matches!(ev2, TurnEvent::Completed { .. }),
+        "轮 2 应完成:{ev2:?}"
+    );
     assert!(
         r2.ops.offloads > off_before,
         "轮 2 准入应触发**主动下沉**(EvictThen),实际未搬:{}",
         r2.ops.offloads
     );
-    assert_eq!(r2.ops.ensure_evicted, 0, "应走判决腾位;同步驱逐 canary 必须为 0");
-    assert_eq!(running.store_report().active_turns, 0, "turn 终了应还保留额");
+    assert_eq!(
+        r2.ops.ensure_evicted, 0,
+        "应走判决腾位;同步驱逐 canary 必须为 0"
+    );
+    assert_eq!(
+        running.store_report().active_turns,
+        0,
+        "turn 终了应还保留额"
+    );
+}
+
+/// **P0-4 门**：准入后 store 账里必须有一张 Grant；turn 终了必须归还。
+#[tokio::test(flavor = "current_thread")]
+async fn admission_issues_and_releases_grant() {
+    if skip() {
+        return;
+    }
+    let mut running = boot().await;
+    assert_eq!(running.store_report().in_flight_turns, 0);
+    assert_eq!(running.store_report().reserved_slots, 0);
+
+    let (_sid, tid) = running
+        .submit_session_opts(None, num_prompt(0, WORDS), 32, Default::default())
+        .expect("submit");
+    // 一次 pump = schedule（含准入 Grant）+ 首个执行段；turn 尚未终了。
+    let _ = running.pump().await.expect("pump");
+    let rep = running.store_report();
+    eprintln!(
+        "[gate] 准入后: in_flight={} reserved_slots={} reserved_bytes={}",
+        rep.in_flight_turns, rep.reserved_slots, rep.reserved_bytes
+    );
+    assert_eq!(rep.in_flight_turns, 1, "准入 Grant 必须在 store 账里");
+    assert!(rep.reserved_slots > 0, "Grant 槽数必须 > 0");
+
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. } if turn == tid => {
+                break
+            }
+            _ => {}
+        }
+    }
+    let rep2 = running.store_report();
+    assert_eq!(rep2.in_flight_turns, 0, "turn 终了 Grant 必须归还");
+    assert_eq!(rep2.reserved_slots, 0, "turn 终了预留槽必须归零");
 }
 
 /// **门②idle 会话占满池 ⇒ 先腾后进(不再拒)** —— S2 引用拆分(§25.1①)的正面证据。
@@ -238,19 +306,33 @@ async fn idle_sessions_hold_nothing_so_the_wall_becomes_evictable() {
     for (k, sid) in (1u64..=8).enumerate() {
         let base = (k as u32) * 200;
         let (ev, _n) = run_turn(&mut running, Some(sid), base, WORDS, 12).await;
-        assert!(matches!(ev, TurnEvent::Completed { .. }), "会话 {sid} 应完成:{ev:?}");
+        assert!(
+            matches!(ev, TurnEvent::Completed { .. }),
+            "会话 {sid} 应完成:{ev:?}"
+        );
     }
     let leg = running.leg_stats();
     let rep = running.store_report();
     eprintln!(
         "[gate] 八会话后: 设备 {}B / 可动 {}B · 保留 {}B · 会话持有 {}B · 缓存 {}B",
-        leg.gpu_bytes, leg.movable_bytes, rep.reserved_bytes, rep.session_held_bytes, rep.cache_bytes
+        leg.gpu_bytes,
+        leg.movable_bytes,
+        rep.reserved_bytes,
+        rep.session_held_bytes,
+        rep.cache_bytes
     );
     // 池要**接近满**(八段历史 ⇒ 六~八槽;首块含同一份 chat 模板 ⇒ 内容寻址下
     // 部分会话共享首块,槽数略少于会话数是**正确行为**)
     let used = leg.slots_total - leg.slots_free;
-    assert!(used + 1 >= leg.slots_total, "八段历史应把池占到近满(实际 {used}/{})", leg.slots_total);
-    assert_eq!(rep.session_held_bytes, 0, "S2:idle 会话不再钉住设备面(会话持有面 = 0)");
+    assert!(
+        used + 1 >= leg.slots_total,
+        "八段历史应把池占到近满(实际 {used}/{})",
+        leg.slots_total
+    );
+    assert_eq!(
+        rep.session_held_bytes, 0,
+        "S2:idle 会话不再钉住设备面(会话持有面 = 0)"
+    );
     assert_eq!(
         leg.movable_bytes, leg.gpu_bytes,
         "S2:池里的历史全进**可动面**(refs = 1 的纯缓存)"
@@ -266,10 +348,20 @@ async fn idle_sessions_hold_nothing_so_the_wall_becomes_evictable() {
         leg2.ops.offloads - off_before,
         leg2.ops.ensure_evicted
     );
-    assert!(matches!(ev, TurnEvent::Completed { .. }), "应先腾后进(不再拒):{ev:?}");
+    assert!(
+        matches!(ev, TurnEvent::Completed { .. }),
+        "应先腾后进(不再拒):{ev:?}"
+    );
     assert!(leg2.ops.offloads > off_before, "腾位应真下沉(宿主面开着)");
-    assert_eq!(leg2.ops.ensure_evicted, 0, "应走判决腾位;同步驱逐 canary 必须为 0");
-    assert_eq!(running.store_report().active_turns, 0, "turn 终了应还保留额");
+    assert_eq!(
+        leg2.ops.ensure_evicted, 0,
+        "应走判决腾位;同步驱逐 canary 必须为 0"
+    );
+    assert_eq!(
+        running.store_report().active_turns,
+        0,
+        "turn 终了应还保留额"
+    );
 }
 
 /// **门④地板语义**:本刀只实做 `Strict` —— 非 `Strict` 在两处**响亮拒**
@@ -290,9 +382,17 @@ async fn non_strict_dense_floor_is_refused_loudly() {
             ..Default::default()
         },
     };
-    let face = CpuFace::mock(MockLimits { null_kernels: true, graph_capture: true, ..Default::default() });
+    let face = CpuFace::mock(MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
     let mut engine = Engine::on(cfg, face).expect("构造");
-    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
     let err = match engine.run(loaded).await {
         Ok(_) => panic!("非 Strict 地板必须拒启"),
         Err(e) => e,
@@ -304,15 +404,23 @@ async fn non_strict_dense_floor_is_refused_loudly() {
         msg.contains("dense_floor") || msg.contains("虚拟化"),
         "拒启理由应指明地板/虚拟化: {msg}"
     );
-    assert!(msg.contains("select_decode") || msg.contains("虚拟化"), "{msg}");
+    assert!(
+        msg.contains("select_decode") || msg.contains("虚拟化"),
+        "{msg}"
+    );
 
     // ② 请求面(per-turn)
     let mut running = boot().await;
     let err = running
-        .submit_session_opts(None, num_prompt(0, WORDS), 5, owl_engine::TurnOpts {
-            dense_floor: Some(owl_store::TurnFloor::Pages(1)),
-            ..Default::default()
-        })
+        .submit_session_opts(
+            None,
+            num_prompt(0, WORDS),
+            5,
+            owl_engine::TurnOpts {
+                dense_floor: Some(owl_store::TurnFloor::Pages(1)),
+                ..Default::default()
+            },
+        )
         .expect_err("请求面非 Strict 必须拒");
     let msg = format!("{err}");
     eprintln!("[gate] 非 Strict 请求拒原文: {msg}");
@@ -335,7 +443,10 @@ async fn idle_sessions_do_not_hold_gdn_rows() {
     for (k, sid) in (1u64..=6).enumerate() {
         let base = (k as u32) * 200;
         let (ev, _n) = run_turn(&mut running, Some(sid), base, WORDS, 12).await;
-        assert!(matches!(ev, TurnEvent::Completed { .. }), "会话 {sid} 应完成:{ev:?}");
+        assert!(
+            matches!(ev, TurnEvent::Completed { .. }),
+            "会话 {sid} 应完成:{ev:?}"
+        );
         let st = running.store_report().state;
         assert_eq!(st.rows_free, rows_total, "turn 止应把行还回(会话 {sid} 后)");
         eprintln!(
@@ -383,7 +494,7 @@ async fn non_strict_dense_floor_is_allowed_when_virtualization_is_on() {
             // 工作集 = 10 页(= 320 tok)⇒ 保底 sink1+recent1 + 召回 top-k 8 块
             // (⚠️ 配置面只给 `workspace_per_req`;`select_blocks` 是装配期派生量,
             //  这里不再手写,免得两个数对不上)
-            workspace_per_req: 320,   // 10 页 = 保底 2 + 召回 8(旧 `select_blocks: 8`)
+            workspace_per_req: 320, // 10 页 = 保底 2 + 召回 8(旧 `select_blocks: 8`)
             select_sink: 1,
             select_recent: 1,
             ..Default::default()
@@ -395,7 +506,11 @@ async fn non_strict_dense_floor_is_allowed_when_virtualization_is_on() {
         ..Default::default()
     });
     let mut engine = Engine::on(cfg, face).expect("构造");
-    let loaded = engine.loader().load_qwen35_0_8b(&asset_dir()).await.expect("装载");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
     let mut running = match engine.run(loaded).await {
         Ok(r) => r,
         Err(e) => panic!("虚拟化开时非 Strict 地板必须放行,得: {e}"),
@@ -435,7 +550,7 @@ async fn per_turn_floor_above_workspace_is_refused_loudly() {
         return;
     }
     let mut running = boot_virt(96).await; // 3 页工作集(保底 sink1+recent1)
-    // ① 请求 2 页 ≤ 3 页 ⇒ 收(并跑完)
+                                           // ① 请求 2 页 ≤ 3 页 ⇒ 收(并跑完)
     let (ev, _n) = run_turn_opts(
         &mut running,
         None,
@@ -448,7 +563,10 @@ async fn per_turn_floor_above_workspace_is_refused_loudly() {
         },
     )
     .await;
-    assert!(matches!(ev, TurnEvent::Completed { .. }), "2 页 ≤ 工作集 3 页应放行,得 {ev:?}");
+    assert!(
+        matches!(ev, TurnEvent::Completed { .. }),
+        "2 页 ≤ 工作集 3 页应放行,得 {ev:?}"
+    );
     // ② 请求 4 页 > 3 页(ctx 上界 251 tok = 8 页 ⇒ 不被 ctx 夹)⇒ 响亮拒
     let (ev2, _n2) = run_turn_opts(
         &mut running,

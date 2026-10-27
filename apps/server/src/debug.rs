@@ -49,7 +49,11 @@ pub fn metrics_json(prefix: &str) -> Value {
             })
         })
         .collect();
-    rows.sort_by(|a, b| total_ms(b).partial_cmp(&total_ms(a)).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        total_ms(b)
+            .partial_cmp(&total_ms(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     json!({ "rows": rows, "slab_live": slab_live_json() })
 }
 
@@ -206,7 +210,11 @@ pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
     }
     let mut ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
     ids.sort_unstable();
-    let dup_ids: Vec<u64> = ids.windows(2).filter(|w| w[0] == w[1]).map(|w| w[0]).collect();
+    let dup_ids: Vec<u64> = ids
+        .windows(2)
+        .filter(|w| w[0] == w[1])
+        .map(|w| w[0])
+        .collect();
     let blocks: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -301,10 +309,16 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
                 }
             }
         }
-        let mut v: Vec<(&str, usize, usize)> = by.into_iter().map(|(n, (c, b))| (n, c, b)).collect();
+        let mut v: Vec<(&str, usize, usize)> =
+            by.into_iter().map(|(n, (c, b))| (n, c, b)).collect();
         v.sort_by(|a, b| b.2.cmp(&a.2));
-        v.iter().take(40).map(|(n, c, b)| json!({"name": n, "count": c, "bytes": b,
-            "mib": (*b as f64) / 1048576.0})).collect()
+        v.iter()
+            .take(40)
+            .map(|(n, c, b)| {
+                json!({"name": n, "count": c, "bytes": b,
+            "mib": (*b as f64) / 1048576.0})
+            })
+            .collect()
     };
     // **驱动残差**(P5):物理 − free − store live − 池缓存。这一项就是
     // CUDA ctx / 模块 / cuBLAS / 图 exec / 分配器元数据 —— 块账拦不住的部分。
@@ -313,7 +327,11 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
             let pool_cached: u64 = snap
                 .pools
                 .iter()
-                .filter_map(|(_, row)| row.as_ref().ok().map(|(u, _, res, _)| res.saturating_sub(*u)))
+                .filter_map(|(_, row)| {
+                    row.as_ref()
+                        .ok()
+                        .map(|(u, _, res, _)| res.saturating_sub(*u))
+                })
                 .sum();
             let residual = total
                 .saturating_sub(*free)
@@ -389,8 +407,48 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
                 "evicted_bytes": d.evicted_bytes,
             })),
         },
+        // **MemoryPlan**(V0/V1):固定项逐项来源 + 主池 + 预留 + 卡面闭合。
+        "plan": r.plan.as_ref().map(|p| {
+            let c = p.check_card();
+            json!({
+                "epoch": p.epoch,
+                "summary": p.summary(),
+                "card": {
+                    "total": p.card.total_bytes,
+                    "free_at_boot": p.card.free_at_boot_bytes,
+                    "reserve": p.card.reserve_bytes,
+                },
+                "fixed": p.fixed.iter().map(|x| json!({
+                    "id": x.id.label(),
+                    "bytes": x.bytes,
+                    "mib": (x.bytes as f64) / 1048576.0,
+                    "source": x.source.label(),
+                    "tier": format!("{:?}", x.tier),
+                    "owner": x.owner.label(),
+                })).collect::<Vec<_>>(),
+                "pool": {
+                    "bytes": p.pool.bytes,
+                    "pages": p.pool.pages,
+                    "page_tokens": p.pool.page_tokens,
+                    "tokens": p.pool.tokens,
+                    "per_token_bytes": p.pool.per_token_bytes,
+                    "block_bytes": p.pool.block_bytes,
+                    "gdn_slots": p.pool.gdn_slots,
+                    "gdn_row_bytes": p.pool.gdn_row_bytes,
+                },
+                "check": {
+                    "fits": c.fits(),
+                    "total_bytes": c.total_bytes,
+                    "over_free_bytes": c.over_free_bytes,
+                    "over_total_bytes": c.over_total_bytes,
+                },
+            })
+        }),
         "faces": {
             "active_turns": r.active_turns,
+            // **P0-4 Grant 面**：批准槽总量 / 在册 turn 数
+            "reserved_slots": r.reserved_slots,
+            "in_flight_turns": r.in_flight_turns,
             "reserved_bytes": r.reserved_bytes,
             "session_held_bytes": r.session_held_bytes,
             "elastic_bytes": r.elastic_bytes,

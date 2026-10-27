@@ -15,7 +15,7 @@
 //! ```text
 //! ┌─────────────── Admission（准入）───────────────┐   ┌────────── PhaseSched（相位）──────────┐
 //! │ 输入: StoreFacts + 队首/活跃 TurnFacts           │   │ 输入: &[TurnFacts]（相位/欠账）        │
-//! │ 状态: 预留账 reserved / 本批 admitted / 退避表   │   │ 状态: rr 游标 / 距上一片 prefill 的拍数 │
+//! │ 状态: 会话守卫 / 退避表(页账在 store Grant)     │   │ 状态: rr 游标 / 距上一片 prefill 的拍数 │
 //! │ 输出: Admit | Hold | Reject{reason,retry_after}  │   │ 输出: Plan{kind, turn, slice_tokens}   │
 //! │ 律: A1..A4（见下）                               │   │ 律: P1..P4（见下）                     │
 //! └──────────────────────────────────────────────────┘   └────────────────────────────────────────┘
@@ -28,11 +28,11 @@
 //! ## 准入（Admission）
 //! - **A1 单一放行口**：引擎只在本模块返回 `Admit` 时才借 GDN 行 / 长块链；
 //!   其它路径不得自行判定"容量够"。
-//! - **A2 预留口径**：
+//! - **A2 预留口径**（页账由 store `ReservationLedger` 持有；本模块只读）：
 //!   - 不超卖（`oversub = false`）：`pages = ceil((prompt + max_new) / page)`
 //!     —— prefill 要读前缀链、decode 每步读整条链，**整条链必须驻留**；
 //!   - 超卖（`oversub = true`）：`pages = workspace_pages + chunk_pages`
-//!     —— 只有工作集驻留，其余沉宿主/磁盘。
+//!     —— 只有工作集进准入面；分配面仍由 Grant 覆盖整条块表。
 //! - **A3 在跑者不受新人影响**：预留账满 ⇒ 新人 `Hold`/`Reject`，**绝不**驱逐/收缩
 //!   已在跑的 turn（"实质性进展"底线）。
 //! - **A4 拒绝可行动**：必带 `Reason`（内存/槽位/会话/排队超时）+ `retry_after_ms`。
@@ -126,8 +126,10 @@ pub struct StoreFacts {
     pub free_pages: usize,
     /// 设备池里"可回收的缓存页"（非活跃、非预留；可被驱逐/下沉）
     pub cache_pages: usize,
-    /// 准入账已预留页（store 侧 `admission` 账）
+    /// 准入账已预留页（store 侧 `ReservationLedger` 的**准入面批准总量**）
     pub reserved_pages: usize,
+    /// 在册 turn 数（store 侧 grant 的 turn 去重；槽位策略用）
+    pub in_flight_turns: usize,
     /// 宿主层空闲页（超卖档的下沉腿；不超卖档 = 0 也无妨）
     pub host_free_pages: usize,
     /// 磁盘层空闲页（0 = 无磁盘腿）
@@ -178,7 +180,10 @@ impl TurnFacts {
             return 0;
         }
         let total = self.prompt_tokens.saturating_add(self.max_new);
-        let resident = l.workspace_pages.saturating_add(l.chunk_pages).saturating_mul(l.page.max(1));
+        let resident = l
+            .workspace_pages
+            .saturating_add(l.chunk_pages)
+            .saturating_mul(l.page.max(1));
         total.saturating_sub(resident).div_ceil(l.page.max(1))
     }
 
@@ -230,7 +235,10 @@ pub enum Reason {
     /// 槽位满（批位/GDN 格/请求上限）
     NoSlot,
     /// 设备内存不足（不超卖：Σctx；超卖：工作集 × N）
-    NoMemory { need_pages: usize, free_pages: usize },
+    NoMemory {
+        need_pages: usize,
+        free_pages: usize,
+    },
     /// 同会话已有活跃/排队 turn（引擎不变量；服务面应已串行）
     SessionBusy,
     /// 排队超时（服务面按 `retry_after_ms` 退避）
@@ -261,10 +269,11 @@ pub enum Verdict {
 }
 
 /// 准入状态机
+///
+/// **页账不在这里**：`reserved_pages`/`in_flight_turns` 由 store 的
+/// `ReservationLedger` 注入 `StoreFacts`；本状态机只保留会话守卫与退避。
 #[derive(Debug, Default)]
 pub struct Admission {
-    /// 已放行、尚未终了的 turn（预留账；终了归还）
-    admitted: BTreeMap<u64, usize>, // turn → 预留页
     /// 会话 → 在场 turn（同会话并发守卫；值 = turn id）
     sess_turn: BTreeMap<u64, u64>,
     /// 退避表：会话 → 最近一次拒绝时刻（毫秒；防打摆子）
@@ -280,7 +289,10 @@ impl Admission {
 
     /// 目标并发（份额分母）：`min(max_batch, gdn_slots, max_concurrency)`
     pub fn n_target(&self, l: &Limits) -> usize {
-        l.max_batch.min(l.gdn_slots).min(l.max_concurrency.max(1)).max(1)
+        l.max_batch
+            .min(l.gdn_slots)
+            .min(l.max_concurrency.max(1))
+            .max(1)
     }
 
     /// **在位者优先 + 给新人留头寸** 的生成封顶（token）。
@@ -292,12 +304,7 @@ impl Admission {
     /// 若该值 < min_gen（把在位者压得不能生成）⇒ **放弃新人预留**，封顶 = 可用 − 其它 − prompt
     /// ```
     /// 超卖档：生成不额外占设备 ⇒ 返回 `max_new`（不封顶）。
-    pub fn cap_for(
-        &self,
-        l: &Limits,
-        s: &StoreFacts,
-        head: &TurnFacts,
-    ) -> usize {
+    pub fn cap_for(&self, l: &Limits, s: &StoreFacts, head: &TurnFacts) -> usize {
         if l.oversub {
             return head.max_new;
         }
@@ -318,7 +325,13 @@ impl Admission {
     /// **容量快照**（纯函数；门/诊断/单测直接用）。
     ///
     /// `running` = 活跃 turn（它们已占预留）；`incoming` = 待判 turn。
-    pub fn capacity(&self, l: &Limits, s: &StoreFacts, running: &[TurnFacts], incoming: &TurnFacts) -> Capacity {
+    pub fn capacity(
+        &self,
+        l: &Limits,
+        s: &StoreFacts,
+        running: &[TurnFacts],
+        incoming: &TurnFacts,
+    ) -> Capacity {
         // **页账单源 = store**（`reserved_pages` 就是在跑 turn 的预留;不许再
         // 叠加 `running` 的 need —— 那会双算（本骨架第一版就踩了,测试抓到））。
         let used_pages = s.reserved_pages;
@@ -341,8 +354,18 @@ impl Admission {
             (usable / per_turn).min(n_host)
         };
         // `running` 的用途 = 诊断（最大在跑 turn 的尺寸;门/日志读）
-        let largest_running = running.iter().map(|t| t.need_pages(l, usize::MAX)).max().unwrap_or(0);
-        glue(capacity_result(n_slots, n_mem, used_pages, usable, largest_running))
+        let largest_running = running
+            .iter()
+            .map(|t| t.need_pages(l, usize::MAX))
+            .max()
+            .unwrap_or(0);
+        glue(capacity_result(
+            n_slots,
+            n_mem,
+            used_pages,
+            usable,
+            largest_running,
+        ))
     }
 
     /// **放行判定**（唯一放行口）。`now_ms` = 单调时钟毫秒（由引擎注入）。
@@ -357,7 +380,10 @@ impl Admission {
         // ① 同会话守卫（引擎不变量：同会话两 turn 会共享 KV/GDN = 互踩）
         if let Some(t) = self.sess_turn.get(&head.session) {
             if *t != head.turn {
-                return Verdict::Reject { reason: Reason::SessionBusy, retry_after_ms: 1000 };
+                return Verdict::Reject {
+                    reason: Reason::SessionBusy,
+                    retry_after_ms: 1000,
+                };
             }
         }
         // ② 槽位
@@ -368,8 +394,7 @@ impl Admission {
         // · 有**同住者**且本 turn 的生成余量 < `min_gen` ⇒ 拒（别让新人当陪跑）；
         // · **独自一人**时即便余量 < min_gen 也放行（大 prompt 独占是合法形态，
         //   生成到 `cap` 就 `length` 收尾）—— 判据是"有没有别人"，不是绝对值。
-        if !l.oversub && (gen_cap == 0 || (gen_cap < l.min_gen_tokens && !self.admitted.is_empty()))
-        {
+        if !l.oversub && (gen_cap == 0 || (gen_cap < l.min_gen_tokens && s.in_flight_turns > 0)) {
             return Verdict::Reject {
                 reason: Reason::NoMemory {
                     need_pages: head.need_pages(l, 0),
@@ -402,7 +427,7 @@ impl Admission {
                 };
             }
         }
-        if self.admitted.len() >= cap.n_slots {
+        if s.in_flight_turns >= cap.n_slots {
             return Verdict::Hold; // 槽满但内存够 ⇒ 排队（不是失败）
         }
         // ③ 退避（同会话刚被拒过 ⇒ 本拍不重判，避免同一拍反复出队/入队）
@@ -414,20 +439,16 @@ impl Admission {
         Verdict::Admit
     }
 
-    /// 引擎在**真正起 turn 后**回报（预留入账；幂等）。
-    pub fn note_started(&mut self, l: &Limits, s: &StoreFacts, t: &TurnFacts) {
+    /// 引擎在**真正起 turn 后**回报（会话守卫/幂等；页账由 store grant 记）。
+    pub fn note_started(&mut self, t: &TurnFacts) {
         if self.once.insert(t.turn) {
-            self.admitted.insert(t.turn, t.need_pages(l, self.cap_for(l, s, t)));
             self.sess_turn.insert(t.session, t.turn);
         }
     }
 
-    /// 引擎在 turn 终了（complete/abandon/拒）后回报（预留归还）。
+    /// 引擎在 turn 终了（complete/abandon/拒）后回报（会话守卫归还）。
     pub fn note_finished(&mut self, turn: u64) {
-        if let Some(pages) = self.admitted.remove(&turn) {
-            let _ = pages;
-            self.once.remove(&turn);
-        }
+        self.once.remove(&turn);
         self.sess_turn.retain(|_, t| *t != turn);
     }
 
@@ -437,13 +458,8 @@ impl Admission {
         self.backoff.insert(session, now_ms);
     }
 
-    /// 诊断：在册预留页 / 在登 turn（`/debug/vram` 用）。
-    pub fn reserved_pages(&self) -> usize {
-        self.admitted.values().sum()
-    }
-
     pub fn in_flight(&self) -> usize {
-        self.admitted.len()
+        self.once.len()
     }
 }
 
@@ -518,20 +534,34 @@ impl PhaseSched {
             return None;
         }
         // 相位分类
-        let gen: Vec<&TurnFacts> = actives.iter().filter(|t| t.phase != PhaseSz::Prefill).collect();
-        let pending: Vec<&TurnFacts> = actives.iter().filter(|t| t.phase == PhaseSz::Prefill).collect();
+        let gen: Vec<&TurnFacts> = actives
+            .iter()
+            .filter(|t| t.phase != PhaseSz::Prefill)
+            .collect();
+        let pending: Vec<&TurnFacts> = actives
+            .iter()
+            .filter(|t| t.phase == PhaseSz::Prefill)
+            .collect();
 
         // P3:全 gen + 批位 ⇒ 批（不管时间片；批本身就是"人人前进"）
         if pending.is_empty() {
             if gen.len() >= 2 && batch_ok && l.max_batch >= gen.len() {
                 self.decodes_since_slice = self.decodes_since_slice.saturating_add(1);
                 self.last = 0;
-                return Some(Plan { kind: Kind::BatchDecode, turn: 0, slice_tokens: 0 });
+                return Some(Plan {
+                    kind: Kind::BatchDecode,
+                    turn: 0,
+                    slice_tokens: 0,
+                });
             }
             let tid = self.pick_gen(&gen);
             self.decodes_since_slice = self.decodes_since_slice.saturating_add(1);
             self.last = tid;
-            return Some(Plan { kind: Kind::Decode, turn: tid, slice_tokens: 0 });
+            return Some(Plan {
+                kind: Kind::Decode,
+                turn: tid,
+                slice_tokens: 0,
+            });
         }
 
         // 有 prefill 欠账：没有 gen 可跑 ⇒ prefill **独占**（不切片）。
@@ -564,7 +594,11 @@ impl PhaseSched {
         let tid = self.pick_gen(&gen);
         self.decodes_since_slice = self.decodes_since_slice.saturating_add(1);
         self.last = tid;
-        Some(Plan { kind: Kind::Decode, turn: tid, slice_tokens: 0 })
+        Some(Plan {
+            kind: Kind::Decode,
+            turn: tid,
+            slice_tokens: 0,
+        })
     }
 
     /// P4:round-robin（跳过上一拍挑中的；单元素时直接返回其 turn id）。
@@ -616,7 +650,14 @@ mod tests {
     use super::*;
 
     fn limits_non_oversub() -> Limits {
-        Limits { page: 32, max_batch: 2, gdn_slots: 2, max_concurrency: 8, reserve_pages: 8, ..Default::default() }
+        Limits {
+            page: 32,
+            max_batch: 2,
+            gdn_slots: 2,
+            max_concurrency: 8,
+            reserve_pages: 8,
+            ..Default::default()
+        }
     }
 
     fn limits_oversub() -> Limits {
@@ -651,7 +692,12 @@ mod tests {
     }
 
     fn store(free: usize, cache: usize) -> StoreFacts {
-        StoreFacts { free_pages: free, cache_pages: cache, host_free_pages: 1 << 20, ..Default::default() }
+        StoreFacts {
+            free_pages: free,
+            cache_pages: cache,
+            host_free_pages: 1 << 20,
+            ..Default::default()
+        }
     }
 
     /// 不超卖：两路各 4k prompt + 4k gen（256 页）在 528 页池里 ⇒ 2 个；
@@ -671,7 +717,11 @@ mod tests {
         assert_eq!(cap.n_mem, 1);
         // 两路 half ctx 已在跑（store 已记 512 页预留）⇒ 新人放不下
         let running = [turn(1, 10, 4096, 4096), turn(2, 11, 4096, 4096)];
-        let busy = StoreFacts { free_pages: 8, reserved_pages: 512, ..Default::default() };
+        let busy = StoreFacts {
+            free_pages: 8,
+            reserved_pages: 512,
+            ..Default::default()
+        };
         let cap = a.capacity(&l, &busy, &running, &turn(3, 12, 4096, 4096));
         assert_eq!(cap.n_mem, 0, "两份已占满 512 页，第三个不许进");
         assert_eq!(cap.largest_running_pages, 256, "诊断面:最大在跑预留");
@@ -699,28 +749,39 @@ mod tests {
         let mut a = Admission::new();
         let t1 = turn(1, 10, 4096, 4096); // 256 页
         assert_eq!(a.decide(&l, &s, &[], &t1, 0), Verdict::Admit);
-        a.note_started(&l, &s, &t1);
+        a.note_started(&t1);
         // 同会话第二 turn ⇒ SessionBusy
         let dup = turn(2, 10, 1024, 1024);
         assert!(matches!(
             a.decide(&l, &s, &[t1], &dup, 0),
-            Verdict::Reject { reason: Reason::SessionBusy, .. }
+            Verdict::Reject {
+                reason: Reason::SessionBusy,
+                ..
+            }
         ));
         // 新会话 + 槽位还有 1 个 ⇒ Admit（页账由 store 注入:第一人已占 256）
-        let s1 = StoreFacts { free_pages: 264, reserved_pages: 256, ..Default::default() };
+        let s1 = StoreFacts {
+            free_pages: 264,
+            reserved_pages: 256,
+            in_flight_turns: 1,
+            ..Default::default()
+        };
         let t2 = turn(3, 11, 1024, 1024); // 64 页
         assert_eq!(a.decide(&l, &s1, &[t1], &t2, 0), Verdict::Admit);
-        a.note_started(&l, &s1, &t2);
+        a.note_started(&t2);
         // 槽位满（2）⇒ 第三人 Hold（内存仍够:320/512）
-        let s2 = StoreFacts { free_pages: 200, reserved_pages: 320, ..Default::default() };
+        let s2 = StoreFacts {
+            free_pages: 200,
+            reserved_pages: 320,
+            in_flight_turns: 2,
+            ..Default::default()
+        };
         let t3 = turn(4, 12, 1024, 1024);
         assert_eq!(a.decide(&l, &s2, &[t1, t2], &t3, 0), Verdict::Hold);
         // 在跑者终了 ⇒ 名额与预留一起回来（剩第二人的 64 页）
         a.note_finished(1);
         assert_eq!(a.in_flight(), 1);
-        assert_eq!(a.reserved_pages(), 64);
     }
-
 
     /// **用户场景门（2026-10-20 裁决）**：200K 池、A 已 150K、B 全新进来。
     ///
@@ -741,19 +802,31 @@ mod tests {
         };
         let mut a = Admission::new();
         // 200K 池 = 6250 页;可用 = 6242 页 = 199,744 tok
-        let s0 = StoreFacts { free_pages: 6250, ..Default::default() };
+        let s0 = StoreFacts {
+            free_pages: 6250,
+            ..Default::default()
+        };
         // A:prompt 142K,请求 50K 生成（约占满 192K）
         let ta = turn(1, 10, 142_000, 50_000);
         assert_eq!(a.cap_for(&l, &s0, &ta), 53_648, "A 的封顶（留 4K 给新人）");
         assert_eq!(ta.need_pages(&l, a.cap_for(&l, &s0, &ta)), 6000);
-        a.note_started(&l, &s0, &ta);
+        a.note_started(&ta);
         // B:全新,prompt 300,请求 8K ⇒ 被夹到 3,348（**必须如实告知客户端**）
         let tb = turn(2, 11, 300, 8192);
-        let s1 = StoreFacts { free_pages: 250, reserved_pages: 6000, ..Default::default() };
+        let s1 = StoreFacts {
+            free_pages: 250,
+            reserved_pages: 6000,
+            in_flight_turns: 1,
+            ..Default::default()
+        };
         let cap_b = a.cap_for(&l, &s1, &tb);
         assert_eq!(cap_b, 3_348, "B 的生成封顶（A 已占 192K）");
         assert_eq!(tb.need_pages(&l, cap_b), 114);
-        assert_eq!(a.decide(&l, &s1, &[ta], &tb, 0), Verdict::Admit, "B 应能进来");
+        assert_eq!(
+            a.decide(&l, &s1, &[ta], &tb, 0),
+            Verdict::Admit,
+            "B 应能进来"
+        );
     }
 
     /// 在位者把池吃满（prompt 196K + 生成）⇒ 新人**响亮拒**（不是进来撞墙）。
@@ -770,19 +843,41 @@ mod tests {
             ..Default::default()
         };
         let mut a = Admission::new();
-        let s0 = StoreFacts { free_pages: 6250, ..Default::default() };
+        let s0 = StoreFacts {
+            free_pages: 6250,
+            ..Default::default()
+        };
         let ta = turn(1, 10, 196_000, 8192);
         // 新人预留会把 A 压到不能生成 ⇒ 放弃预留,A 吃掉剩余（3,744 tok）
         assert_eq!(a.cap_for(&l, &s0, &ta), 3_744);
         assert_eq!(ta.need_pages(&l, 3_744), 6242);
-        a.note_started(&l, &s0, &ta);
+        a.note_started(&ta);
         let tb = turn(2, 11, 300, 8192);
-        let s1 = StoreFacts { free_pages: 8, reserved_pages: 6242, ..Default::default() };
+        let s1 = StoreFacts {
+            free_pages: 8,
+            reserved_pages: 6242,
+            in_flight_turns: 1,
+            ..Default::default()
+        };
         match a.decide(&l, &s1, &[ta], &tb, 0) {
-            Verdict::Reject { reason: Reason::NoMemory { need_pages, free_pages }, .. } => {
+            Verdict::Reject {
+                reason:
+                    Reason::NoMemory {
+                        need_pages,
+                        free_pages,
+                    },
+                ..
+            } => {
                 assert_eq!(need_pages, 10);
                 assert_eq!(free_pages, 0);
-                assert_eq!(Reason::NoMemory { need_pages, free_pages }.code(), "no_memory");
+                assert_eq!(
+                    Reason::NoMemory {
+                        need_pages,
+                        free_pages
+                    }
+                    .code(),
+                    "no_memory"
+                );
             }
             other => panic!("应拒（newcomer_rejected）,得到 {other:?}"),
         }
@@ -801,13 +896,21 @@ mod tests {
         // 前 4 拍：decode（每拍一次）
         for k in 0..4 {
             match p.next(&l, &two, true).expect("plan") {
-                Plan { kind: Kind::Decode, turn: 1, .. } => assert_eq!(k, k),
+                Plan {
+                    kind: Kind::Decode,
+                    turn: 1,
+                    ..
+                } => assert_eq!(k, k),
                 other => panic!("第 {k} 拍应为 Decode,得到 {other:?}"),
             }
         }
         // 第 5 拍：prefill 片
         match p.next(&l, &two, true).expect("plan") {
-            Plan { kind: Kind::Prefill, turn: 2, slice_tokens: 64 } => {}
+            Plan {
+                kind: Kind::Prefill,
+                turn: 2,
+                slice_tokens: 64,
+            } => {}
             other => panic!("应为 Prefill 64,得到 {other:?}"),
         }
         // 全 gen ⇒ 批
@@ -816,10 +919,21 @@ mod tests {
         let two = [gen, pre];
         assert_eq!(
             p.next(&l, &two, true),
-            Some(Plan { kind: Kind::BatchDecode, turn: 0, slice_tokens: 0 })
+            Some(Plan {
+                kind: Kind::BatchDecode,
+                turn: 0,
+                slice_tokens: 0
+            })
         );
         // 只剩 gen 一人 ⇒ 单行
-        assert_eq!(p.next(&l, &[gen], true), Some(Plan { kind: Kind::Decode, turn: 1, slice_tokens: 0 }));
+        assert_eq!(
+            p.next(&l, &[gen], true),
+            Some(Plan {
+                kind: Kind::Decode,
+                turn: 1,
+                slice_tokens: 0
+            })
+        );
         // 空集 ⇒ None
         assert_eq!(p.next(&l, &[], true), None);
     }
@@ -874,12 +988,17 @@ mod scenario_tests {
             }
         }
 
-        /// store 事实（页账单源：已预留 = 准入账）
+        /// store 事实（页账单源 = 活跃 turn 的 grant 总量；模拟 store 账）
         fn store(&self) -> StoreFacts {
-            let used = self.adm.reserved_pages();
+            let used: usize = self
+                .actives
+                .iter()
+                .map(|t| t.need_pages(&self.l, usize::MAX))
+                .sum();
             StoreFacts {
                 free_pages: self.total_pages.saturating_sub(used),
                 reserved_pages: used,
+                in_flight_turns: self.actives.len(),
                 host_free_pages: self.host_pages,
                 ..Default::default()
             }
@@ -894,7 +1013,9 @@ mod scenario_tests {
             self.now += 1;
             // ① 准入
             loop {
-                let Some(head) = self.queued.first().copied() else { break };
+                let Some(head) = self.queued.first().copied() else {
+                    break;
+                };
                 let s = self.store();
                 match self.adm.decide(&self.l, &s, &self.actives, &head, self.now) {
                     Verdict::Admit => {
@@ -904,7 +1025,7 @@ mod scenario_tests {
                             self.clamped.push((t.turn, cap));
                             t.max_new = cap.max(1);
                         }
-                        self.adm.note_started(&self.l, &s, &t);
+                        self.adm.note_started(&t);
                         self.actives.push(t);
                     }
                     Verdict::Hold => break,
@@ -919,7 +1040,9 @@ mod scenario_tests {
                 return false;
             }
             // ② 相位
-            let Some(plan) = self.ph.next(&self.l, &self.actives, true) else { return false };
+            let Some(plan) = self.ph.next(&self.l, &self.actives, true) else {
+                return false;
+            };
             self.kinds.push(plan.kind);
             // ③ 推进
             let mut advanced: Vec<u64> = Vec::new();
@@ -957,7 +1080,11 @@ mod scenario_tests {
                     *g = 0;
                     let m = self.max_gap.entry(id).or_insert(0);
                     *m = (*m).max(v);
-                } else if self.actives.iter().any(|t| t.turn == id && t.phase != PhaseSz::Prefill) {
+                } else if self
+                    .actives
+                    .iter()
+                    .any(|t| t.turn == id && t.phase != PhaseSz::Prefill)
+                {
                     *g += 1;
                 }
             }
@@ -1037,7 +1164,11 @@ mod scenario_tests {
         let steps = sim.run_until_idle(4000);
         assert_eq!(sim.finished.len(), 2, "两人都应跑完（{steps} 拍）");
         assert!(sim.rejected.is_empty(), "B 不该被拒：{:?}", sim.rejected);
-        assert!(sim.clamped.is_empty(), "本例 cap 充足，不该夹：{:?}", sim.clamped);
+        assert!(
+            sim.clamped.is_empty(),
+            "本例 cap 充足，不该夹：{:?}",
+            sim.clamped
+        );
         let gap = *sim.max_gap.get(&1).unwrap_or(&0);
         assert!(gap <= 5, "A 的最大停顿 {gap} 拍应 ≤ slice_every+1");
     }
@@ -1074,7 +1205,10 @@ mod scenario_tests {
         assert!(
             sim.kinds.iter().any(|k| *k == Kind::BatchDecode),
             "同时到达应出现批 decode（kinds={:?}）",
-            sim.kinds.iter().filter(|k| **k == Kind::BatchDecode).count()
+            sim.kinds
+                .iter()
+                .filter(|k| **k == Kind::BatchDecode)
+                .count()
         );
     }
 
@@ -1089,7 +1223,11 @@ mod scenario_tests {
         assert!(sim.step());
         sim.submit(fresh(2, 11, 300, 32));
         let _ = sim.run_until_idle(4000);
-        assert!(sim.rejected.is_empty(), "槽满应 Hold 而不是拒：{:?}", sim.rejected);
+        assert!(
+            sim.rejected.is_empty(),
+            "槽满应 Hold 而不是拒：{:?}",
+            sim.rejected
+        );
         assert_eq!(sim.finished.len(), 2, "前者终了后第二个应被放行");
     }
 
@@ -1143,15 +1281,39 @@ mod edge_tests {
     }
 
     fn gen(id: u64, sess: u64, prompt: usize, max_new: usize) -> TurnFacts {
-        TurnFacts { turn: id, session: sess, prompt_tokens: prompt, max_new, fed: prompt, out_len: 0, phase: PhaseSz::Gen, spec: false }
+        TurnFacts {
+            turn: id,
+            session: sess,
+            prompt_tokens: prompt,
+            max_new,
+            fed: prompt,
+            out_len: 0,
+            phase: PhaseSz::Gen,
+            spec: false,
+        }
     }
 
     fn pre(id: u64, sess: u64, prompt: usize, fed: usize, max_new: usize) -> TurnFacts {
-        TurnFacts { turn: id, session: sess, prompt_tokens: prompt, max_new, fed, out_len: 0, phase: PhaseSz::Prefill, spec: false }
+        TurnFacts {
+            turn: id,
+            session: sess,
+            prompt_tokens: prompt,
+            max_new,
+            fed,
+            out_len: 0,
+            phase: PhaseSz::Prefill,
+            spec: false,
+        }
     }
 
     fn store(free: usize, cache: usize, reserved: usize) -> StoreFacts {
-        StoreFacts { free_pages: free, cache_pages: cache, reserved_pages: reserved, host_free_pages: 1 << 20, ..Default::default() }
+        StoreFacts {
+            free_pages: free,
+            cache_pages: cache,
+            reserved_pages: reserved,
+            host_free_pages: 1 << 20,
+            ..Default::default()
+        }
     }
 
     // ── 准入：退避 / 会话互斥 / 幂等 ──────────────────────────────
@@ -1166,9 +1328,24 @@ mod edge_tests {
         let s = store(6250, 0, 0);
         let mut a = Admission::new();
         let t = gen(1, 20, 100, 32);
-        a.note_rejected(20, 5000, Reason::NoMemory { need_pages: 1, free_pages: 0 });
-        assert_eq!(a.decide(&l, &s, &[], &t, 5100), Verdict::Hold, "退避窗内应 Hold");
-        assert_eq!(a.decide(&l, &s, &[], &t, 5300), Verdict::Admit, "越过窗口应放行");
+        a.note_rejected(
+            20,
+            5000,
+            Reason::NoMemory {
+                need_pages: 1,
+                free_pages: 0,
+            },
+        );
+        assert_eq!(
+            a.decide(&l, &s, &[], &t, 5100),
+            Verdict::Hold,
+            "退避窗内应 Hold"
+        );
+        assert_eq!(
+            a.decide(&l, &s, &[], &t, 5300),
+            Verdict::Admit,
+            "越过窗口应放行"
+        );
     }
 
     /// 同会话 exclusivity：A 在跑 ⇒ 同会话新 turn = SessionBusy；A 终了后放行。
@@ -1179,31 +1356,34 @@ mod edge_tests {
         let mut a = Admission::new();
         let a1 = gen(1, 77, 1000, 64);
         assert_eq!(a.decide(&l, &s, &[], &a1, 0), Verdict::Admit);
-        a.note_started(&l, &s, &a1);
+        a.note_started(&a1);
         let a2 = gen(2, 77, 500, 64);
         match a.decide(&l, &s, &[a1], &a2, 0) {
-            Verdict::Reject { reason: Reason::SessionBusy, retry_after_ms } => assert!(retry_after_ms > 0),
+            Verdict::Reject {
+                reason: Reason::SessionBusy,
+                retry_after_ms,
+            } => assert!(retry_after_ms > 0),
             other => panic!("同会话应 SessionBusy，得到 {other:?}"),
         }
         a.note_finished(1);
-        assert_eq!(a.decide(&l, &s, &[], &a2, 10_000), Verdict::Admit, "前者终了后应放行");
+        assert_eq!(
+            a.decide(&l, &s, &[], &a2, 10_000),
+            Verdict::Admit,
+            "前者终了后应放行"
+        );
     }
 
     /// note_started / note_finished 幂等（重复调用不许重复记账/下溢）。
     #[test]
     fn ledger_notes_are_idempotent() {
-        let l = l();
-        let s = store(6250, 0, 0);
         let mut a = Admission::new();
         let t = gen(1, 10, 1000, 64);
-        a.note_started(&l, &s, &t);
-        a.note_started(&l, &s, &t);
+        a.note_started(&t);
+        a.note_started(&t);
         assert_eq!(a.in_flight(), 1);
-        assert_eq!(a.reserved_pages(), t.need_pages(&l, usize::MAX));
         a.note_finished(1);
         a.note_finished(1);
         assert_eq!(a.in_flight(), 0);
-        assert_eq!(a.reserved_pages(), 0);
     }
 
     // ── 准入：容量算式边界 ───────────────────────────────────────
@@ -1215,9 +1395,24 @@ mod edge_tests {
         let s = store(6250, 0, 0); // usable = 6242 页 = 199,744 tok
         let mut a = Admission::new();
         // prompt = 199,744（= 恰好用满）⇒ cap 0
-        let t = TurnFacts { turn: 1, session: 1, prompt_tokens: 199_744, max_new: 64, fed: 0, out_len: 0, phase: PhaseSz::Prefill, spec: false };
+        let t = TurnFacts {
+            turn: 1,
+            session: 1,
+            prompt_tokens: 199_744,
+            max_new: 64,
+            fed: 0,
+            out_len: 0,
+            phase: PhaseSz::Prefill,
+            spec: false,
+        };
         assert_eq!(a.cap_for(&l, &s, &t), 0);
-        assert!(matches!(a.decide(&l, &s, &[], &t, 0), Verdict::Reject { reason: Reason::NoMemory { .. }, .. }));
+        assert!(matches!(
+            a.decide(&l, &s, &[], &t, 0),
+            Verdict::Reject {
+                reason: Reason::NoMemory { .. },
+                ..
+            }
+        ));
     }
 
     /// 超卖档：生成预算**不占设备** ⇒ 永不夹（哪怕 200 万 token 的 max_new）。
@@ -1231,7 +1426,11 @@ mod edge_tests {
         let t = gen(1, 10, 200_000, 2_000_000);
         let a = Admission::new();
         assert_eq!(a.cap_for(&l, &s, &t), 2_000_000, "超卖不夹生成");
-        assert_eq!(a.capacity(&l, &s, &[], &t).n_mem, 0, "但设备侧仍按工作集算不进来");
+        assert_eq!(
+            a.capacity(&l, &s, &[], &t).n_mem,
+            0,
+            "但设备侧仍按工作集算不进来"
+        );
     }
 
     /// `n_target` 取三者最小：`max_batch=8, gdn_slots=2` ⇒ 新人预留只按 2 人算。
@@ -1273,8 +1472,16 @@ mod edge_tests {
         let l = l();
         let a = Admission::new();
         let t = gen(1, 10, 1024, 1024); // 64 页/人
-        assert_eq!(a.capacity(&l, &store(100, 0, 0), &[], &t).n_mem, 1, "(100−8)/64 = 1");
-        assert_eq!(a.capacity(&l, &store(100, 100, 0), &[], &t).n_mem, 3, "(200−8)/64 = 3");
+        assert_eq!(
+            a.capacity(&l, &store(100, 0, 0), &[], &t).n_mem,
+            1,
+            "(100−8)/64 = 1"
+        );
+        assert_eq!(
+            a.capacity(&l, &store(100, 100, 0), &[], &t).n_mem,
+            3,
+            "(200−8)/64 = 3"
+        );
         assert_eq!(store(100, 0, 0).usable_pages(8), 92);
         assert_eq!(store(100, 0, 0).usable_pages(50), 50);
     }
@@ -1326,7 +1533,11 @@ mod edge_tests {
         let b = pre(2, 11, 1000, 0, 64);
         for _ in 0..3 {
             match p.next(&l, &[a, b], true).expect("plan") {
-                Plan { kind: Kind::Prefill, turn: 2, .. } => {}
+                Plan {
+                    kind: Kind::Prefill,
+                    turn: 2,
+                    ..
+                } => {}
                 other => panic!("K=0 应一直 prefill，得到 {other:?}"),
             }
         }
@@ -1346,7 +1557,14 @@ mod edge_tests {
         }
         assert_eq!(
             kinds,
-            vec![Kind::Decode, Kind::Prefill, Kind::Decode, Kind::Prefill, Kind::Decode, Kind::Prefill]
+            vec![
+                Kind::Decode,
+                Kind::Prefill,
+                Kind::Decode,
+                Kind::Prefill,
+                Kind::Decode,
+                Kind::Prefill
+            ]
         );
     }
 
@@ -1370,7 +1588,11 @@ mod edge_tests {
         l.gdn_slots = 3;
         l.max_concurrency = 3;
         let mut p = PhaseSched::new();
-        let acts = [gen(1, 10, 100, 64), gen(2, 11, 100, 64), gen(3, 12, 100, 64)];
+        let acts = [
+            gen(1, 10, 100, 64),
+            gen(2, 11, 100, 64),
+            gen(3, 12, 100, 64),
+        ];
         let mut seq = Vec::new();
         for _ in 0..6 {
             seq.push(p.next(&l, &acts, false).expect("plan").turn);
@@ -1388,7 +1610,11 @@ mod edge_tests {
         spec.phase = PhaseSz::Spec;
         let b = pre(2, 11, 1000, 0, 64);
         let first = p.next(&l, &[spec, b], true).expect("plan");
-        assert_eq!((first.kind, first.turn), (Kind::Decode, 1), "Spec 应能先跑 decode");
+        assert_eq!(
+            (first.kind, first.turn),
+            (Kind::Decode, 1),
+            "Spec 应能先跑 decode"
+        );
     }
 
     /// prefill 挑选：欠账最多优先；同欠账按 turn id 定序（确定性）。
@@ -1423,7 +1649,10 @@ mod edge_tests {
         }
         let _ = sim.run_until_idle(5000);
         assert_eq!(sim.finished.len(), 3, "三人都应完成");
-        assert!(sim.kinds.iter().any(|k| *k == Kind::BatchDecode), "应出现批 decode");
+        assert!(
+            sim.kinds.iter().any(|k| *k == Kind::BatchDecode),
+            "应出现批 decode"
+        );
         assert!(sim.rejected.is_empty());
     }
 }
@@ -1451,11 +1680,26 @@ mod more_tests {
     }
 
     fn gen(id: u64, sess: u64, prompt: usize, max_new: usize) -> TurnFacts {
-        TurnFacts { turn: id, session: sess, prompt_tokens: prompt, max_new, fed: prompt, out_len: 0, phase: PhaseSz::Gen, spec: false }
+        TurnFacts {
+            turn: id,
+            session: sess,
+            prompt_tokens: prompt,
+            max_new,
+            fed: prompt,
+            out_len: 0,
+            phase: PhaseSz::Gen,
+            spec: false,
+        }
     }
 
     fn store(free: usize, cache: usize, reserved: usize) -> StoreFacts {
-        StoreFacts { free_pages: free, cache_pages: cache, reserved_pages: reserved, host_free_pages: 1 << 20, ..Default::default() }
+        StoreFacts {
+            free_pages: free,
+            cache_pages: cache,
+            reserved_pages: reserved,
+            host_free_pages: 1 << 20,
+            ..Default::default()
+        }
     }
 
     /// **A3**：判决（拒绝新人）不许改在跑者的账 —— `admitted`/预留页一字不动。
@@ -1465,14 +1709,29 @@ mod more_tests {
         let s = store(6250, 0, 0);
         let mut a = Admission::new();
         let running = gen(1, 10, 199_000, 64);
-        a.note_started(&l, &s, &running);
-        let before = (a.in_flight(), a.reserved_pages());
-        let used = a.reserved_pages();
-        let s2 = store(6250 - used, 0, used);
+        a.note_started(&running);
+        let before = a.in_flight();
+        let used = running.need_pages(&l, usize::MAX);
+        let s2 = StoreFacts {
+            free_pages: 6250 - used,
+            reserved_pages: used,
+            in_flight_turns: 1,
+            host_free_pages: 1 << 20,
+            ..Default::default()
+        };
         let newcomer = gen(2, 11, 1000, 64);
         let v = a.decide(&l, &s2, &[running], &newcomer, 0);
-        assert!(matches!(v, Verdict::Reject { reason: Reason::NoMemory { .. }, .. }), "{v:?}");
-        assert_eq!((a.in_flight(), a.reserved_pages()), before, "在跑者的账不许被拒新扰动");
+        assert!(
+            matches!(
+                v,
+                Verdict::Reject {
+                    reason: Reason::NoMemory { .. },
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        assert_eq!(a.in_flight(), before, "在跑者名额不许被拒新扰动");
     }
 
     /// **预算夹紧真的进预留**：夹紧后的 `need_pages` 必须小于未夹紧（否则会撞墙）。
@@ -1486,8 +1745,15 @@ mod more_tests {
         assert!(cap < 300_000, "应被夹（cap={cap}）");
         let clamped = t.need_pages(&l, cap);
         let uncapped = t.need_pages(&l, usize::MAX);
-        assert!(clamped < uncapped, "夹紧后预留必须变小（{clamped} vs {uncapped}）");
-        assert_eq!(clamped, (1000 + cap).div_ceil(32), "预留 = prompt + min(max_new, cap)");
+        assert!(
+            clamped < uncapped,
+            "夹紧后预留必须变小（{clamped} vs {uncapped}）"
+        );
+        assert_eq!(
+            clamped,
+            (1000 + cap).div_ceil(32),
+            "预留 = prompt + min(max_new, cap)"
+        );
     }
 
     /// **缓存页可回收**：`free=0` 但 `cache>0` 时仍能进人（先逐缓存，不逐活跃）。
@@ -1545,7 +1811,12 @@ mod more_tests {
         // 同一拍内反复判：只应拒一次（出队后不再重判）
         let _ = sim.step();
         let _ = sim.step();
-        assert_eq!(sim.rejected.len(), 1, "同一 turn 只许被拒一次：{:?}", sim.rejected);
+        assert_eq!(
+            sim.rejected.len(),
+            1,
+            "同一 turn 只许被拒一次：{:?}",
+            sim.rejected
+        );
         assert_eq!(sim.rejected[0].0, 2);
     }
 }
@@ -1574,11 +1845,23 @@ mod p0_tests {
     }
 
     fn gen(id: u64, sess: u64, prompt: usize, max_new: usize) -> TurnFacts {
-        TurnFacts { turn: id, session: sess, prompt_tokens: prompt, max_new, fed: prompt, out_len: 0, phase: PhaseSz::Gen, spec: false }
+        TurnFacts {
+            turn: id,
+            session: sess,
+            prompt_tokens: prompt,
+            max_new,
+            fed: prompt,
+            out_len: 0,
+            phase: PhaseSz::Gen,
+            spec: false,
+        }
     }
 
     fn store(free: usize) -> StoreFacts {
-        StoreFacts { free_pages: free, ..Default::default() }
+        StoreFacts {
+            free_pages: free,
+            ..Default::default()
+        }
     }
 
     /// **P0-3 超卖宿主腿**：设备装得下、宿主装不下 ⇒ 拒（不许"进来再丢块"）。
@@ -1596,12 +1879,27 @@ mod p0_tests {
         let off = t.offload_pages(&l);
         assert!(off > 6000, "20 万 ctx 应要沉 {off} 页");
         // 宿主够 ⇒ 放行
-        let ok = StoreFacts { free_pages: 1024, host_free_pages: off + 10, ..Default::default() };
+        let ok = StoreFacts {
+            free_pages: 1024,
+            host_free_pages: off + 10,
+            ..Default::default()
+        };
         assert_eq!(a.decide(&l, &ok, &[], &t, 0), Verdict::Admit);
         // 宿主不够 ⇒ 拒（NoMemory 报的是**宿主页**收支）
-        let tight = StoreFacts { free_pages: 1024, host_free_pages: off / 2, ..Default::default() };
+        let tight = StoreFacts {
+            free_pages: 1024,
+            host_free_pages: off / 2,
+            ..Default::default()
+        };
         match a.decide(&l, &tight, &[], &t, 0) {
-            Verdict::Reject { reason: Reason::NoMemory { need_pages, free_pages }, .. } => {
+            Verdict::Reject {
+                reason:
+                    Reason::NoMemory {
+                        need_pages,
+                        free_pages,
+                    },
+                ..
+            } => {
                 assert_eq!(need_pages, off);
                 assert_eq!(free_pages, off / 2);
             }
@@ -1633,15 +1931,29 @@ mod p0_tests {
             disk_free_pages: off + 10,
             ..Default::default()
         };
-        assert_eq!(a.decide(&l, &s, &[], &t, 0), Verdict::Admit, "宿主满但盘够 ⇒ 放行");
-        assert!(a.capacity(&l, &s, &[], &t).n_mem >= 1, "容量侧同样把盘算进去");
+        assert_eq!(
+            a.decide(&l, &s, &[], &t, 0),
+            Verdict::Admit,
+            "宿主满但盘够 ⇒ 放行"
+        );
+        assert!(
+            a.capacity(&l, &s, &[], &t).n_mem >= 1,
+            "容量侧同样把盘算进去"
+        );
     }
 
     /// 非超卖档不看宿主（全量驻留设备）—— 回归：别把 host 门误开。    #[test]
     fn non_oversub_ignores_host_tier() {
         let l = l();
-        let s = StoreFacts { free_pages: 6250, host_free_pages: 0, ..Default::default() };
+        let s = StoreFacts {
+            free_pages: 6250,
+            host_free_pages: 0,
+            ..Default::default()
+        };
         let mut a = Admission::new();
-        assert_eq!(a.decide(&l, &s, &[], &gen(1, 10, 1000, 64), 0), Verdict::Admit);
+        assert_eq!(
+            a.decide(&l, &s, &[], &gen(1, 10, 1000, 64), 0),
+            Verdict::Admit
+        );
     }
 }

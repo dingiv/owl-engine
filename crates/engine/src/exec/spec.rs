@@ -1734,6 +1734,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 sid,
                 full_blocks,
             );
+            // **P1-2**:本 turn 的最新边界进入显式保护面。快照面没有引用计数,
+            // 若不记在这里,下一次 Idle/Pressure 可能把它当成最冷条目搬走。
+            self.turns.active_mut()?.last_snap = Some(key);
         }
         // **B 轴 B-0:同一处顺手采索引**(同一"块边界 + 链尾身份"事件 ⇒
         // 一次算身份、一次推进游标;索引与 GDN 快照共享边界身份)。

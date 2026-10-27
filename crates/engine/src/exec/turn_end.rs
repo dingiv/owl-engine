@@ -145,6 +145,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 准入状态机归还预留(幂等;complete/abandon/腿终局全走这里)
         self.turns.admission.note_finished(turn_id);
+        // **P0-4**：Grant 是 store 的账，准入收口也必须归还（store_hook::Release
+        // 正常路径已还；这里兜底排队取消 / 拒绝 / 早退路径，幂等）。
+        let released = self.bank.rel.release_turn_grants(turn_id);
+        if !released.is_empty() {
+            owl_shared::log_debug!(
+                "store",
+                "准入收口归还 Grant：turn {turn_id} {} 张",
+                released.len()
+            );
+        }
         if let Err(e) = self.bank.rel.admission.release(turn_id) {
             owl_shared::log_debug!("store", "准入账收口：turn {turn_id} 不在账上（{e}）");
         }
@@ -153,8 +163,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
     }
 
-    pub(crate) async fn complete(&mut self, reason: crate::turn::FinishReason) -> Result<TurnEvent> {
-        let act = self.turns.take_exec().ok_or_else(|| ModelError::EngineInvariant { what: "turn_end:无活跃 turn".into() })?;
+    pub(crate) async fn complete(
+        &mut self,
+        reason: crate::turn::FinishReason,
+    ) -> Result<TurnEvent> {
+        let act = self
+            .turns
+            .take_exec()
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: "turn_end:无活跃 turn".into(),
+            })?;
         // **单 turn 诊断账**:在 take_exec 之后、任何收口动作之前取快照。
         // `started_ms` = start_one 起跑;首 token 时间由 `sample_and_emit` 写。
         let now = crate::running::now_ms();
@@ -181,19 +199,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         self.dev.spec_rt.carry_ctx = act.spec.bare_cost_ctx;
         // 取证(B6.3 后泄漏案):每 turn 设备余量打点(free 账由 cuda 侧 dtoh
         // 收割刷新;泄漏 = 线性下降)
-        owl_shared::log_debug!("vram-trace", "turn end: free={:.0}MiB out={}",
-                  owl_shared::vram::free_bytes() as f64 / 1024.0 / 1024.0, act.out.len());
+        owl_shared::log_debug!(
+            "vram-trace",
+            "turn end: free={:.0}MiB out={}",
+            owl_shared::vram::free_bytes() as f64 / 1024.0 / 1024.0,
+            act.out.len()
+        );
         // spec 轮机器状态随 act(TurnSpecState)销毁 —— 跨 turn 残留
         // 结构性消失(2026-10-10 生命周期收口;原手动 spec_drafts_host 清)
         // 会话账落地(S1 收口):KV 此刻 = prompt 全量 + 生成段;GDN 状态
         // 跨 turn 连续。临时会话终了即焚(表不随 turn 数无界增长)
         if let Some(s) = self.bank.sessions.get_mut(act.session_id) {
-            s.commit_turn(
-                &act.prompt_ids,
-                &act.out,
-                &act.positions,
-                act.rope_gap,
-            )?;
+            s.commit_turn(&act.prompt_ids, &act.out, &act.positions, act.rope_gap)?;
             // **图像段账写回**(前缀无感删除;2026-10-23):与 `tokens` 同一次
             // 收口 —— 两处各写一份 = 下一轮删除识别拿错坐标。
             s.set_img_spans(act.img_spans.clone(), act.img_pads.clone());
@@ -219,7 +236,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let n = crate::exec::floor_boundary(&text, n);
             text.truncate(n);
         }
-        Ok(TurnEvent::Completed { turn: act.id, text, finish: reason, stats })
+        Ok(TurnEvent::Completed {
+            turn: act.id,
+            text,
+            finish: reason,
+            stats,
+        })
     }
 }
-

@@ -405,6 +405,7 @@ pub(crate) enum Release { TurnEnd(u64), Abort(u64) }
 pub(crate) enum Maintain {
     Idle(usize),
     Pressure { slots: usize, snap_bytes: usize },
+    HostPressure { slots: usize },
 }
 
 pub(crate) struct StoreOutcome {
@@ -419,8 +420,11 @@ pub(crate) struct StoreOutcome {
   `Acquire::Capacity` 收到 `Idle/Pressure` 时**响亮拒**（`EngineInvariant`）。
 - `Acquire::Load` 用 `LoadRequest` 而不是把 `slots/load/protect` 混在一个结构里：
   当前只有一种回灌载荷，字段更少、非法状态更少。
-- `Maintain::Pressure` 保留 `snap_bytes` 字段（测试与未来 N6 两腿目标用）；
-  当前生产压力路径仍传 0。
+- `Maintain::Pressure` 保留 `snap_bytes` 字段（测试与 N6 两腿目标用）。
+- `Maintain::HostPressure` 只出 `Sink::Disk`（宿主冷面 → 盘），
+  不产生 GPU→Host；`Need.host_slots` 是其唯一目标字段。
+  Disk 票的 `span` = **从 root 起的前缀块数**；长链超过单次配额时
+  只搬前缀，盘上仍是连续可重建前缀。
 
 ### 7.2 已迁移调用点
 
@@ -648,12 +652,17 @@ ctx 上限被高估。现在 `pool_cap` 与 `snapshot_pool_bytes` 都按真分�
 - `Maintain::Pressure` 只在 `PoolExhausted` 后的 `relieve_pressure` 使用：
   1. 复用池排空（`drain_temp_pool`，真还驱动）；
   2. `trim_pools` 把已 free 缓存页还驱动；
-  3. 按**池自由槽**算目标：`target = clamp(total/8, 1, 64)`，
-     `slots = target − free`；宿主有位且设备上有快照时带一条 `snap_bytes`；
-  4. 一次 `Maintain::Pressure { slots, snap_bytes }`（两腿）。
-- `StoreHook::pressure_with_snap` 是唯一构造；旧 `pressure(slots)` 删除
-  （pump 不再用，避免死代码）。
-- server actor 的注释已同步为“池排空 + trim + Maintain(Pressure)”。
+  3. 按**PressureSignals + 低/高水位**算目标：`free < low ⇒ high − free`
+     （`runtime.pressure_low_pct` / `pressure_high_pct`，cap 64）；宿主有位
+     且设备上有快照时带一条 `snap_bytes`；
+  4. 宿主腿低于独立低水位且盘有位时，先发 `Maintain::HostPressure { slots }`
+     （只出 `Sink::Disk`，**跳过 GPU→Host**；目标补到独立高水位），再发
+     `Maintain::Pressure` 做池内收缩。
+- `StoreHook::pressure_with_snap` / `host_pressure` 是两个显式构造；
+  `pressure(slots)` 仍不保留（pump 不再用，避免死代码）。
+- `idle_compact=false`（缺省）时空转不预搬；显式 true 才按同一套水位触发
+  `Maintain::Idle` / `HostPressure`。
+- server actor 的注释已同步为“池排空 + trim + 压力/宿主收缩”。
 
 ### 10.3 Admission 两层判决（评审结论：保留）
 

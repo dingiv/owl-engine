@@ -90,7 +90,10 @@ pub(crate) struct ImageExec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SnapDiskOp {
     /// 同一条快照换边界身份(`rename` 旧文件 → 新路径 + 两本账换键)
-    Rekey { old: owl_store::SnapKey, new: owl_store::SnapKey },
+    Rekey {
+        old: owl_store::SnapKey,
+        new: owl_store::SnapKey,
+    },
 }
 
 /// 快照重挂的**层分派**(纯;门与文档的唯一真源)。
@@ -208,7 +211,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 设备层与宿主层都算"在场"(宿主层在段边界回灌;`RecallMode::Exact`
             // 的判据就是这一条)。旧实现只看引擎的设备池 ⇒ 下沉后的快照被当成
             // "不在场"、白裁掉复用面。
-            if rel.state.locate(owl_store::SnapKey::at_boundary(hit.hashes[m - 1])).is_some() {
+            if rel
+                .state
+                .locate(owl_store::SnapKey::at_boundary(hit.hashes[m - 1]))
+                .is_some()
+            {
                 break;
             }
             m -= 1; // 无快照的边界不可复用(GDN 态对不上)
@@ -254,8 +261,16 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 分块决策(scheduler) / kvmem 准入估算(scheduler) / 池需求估算(running) /
     /// 边界预测(phases) —— 曾经各传各的(一处门了、三处没门 ⇒ 估算与真调度
     /// 打架),现收成这一处。
-    pub(crate) fn prefill_align_page(align_tail: bool, prefix_cache: bool, pool_page: usize) -> usize {
-        if align_tail && prefix_cache { pool_page } else { 0 }
+    pub(crate) fn prefill_align_page(
+        align_tail: bool,
+        prefix_cache: bool,
+        pool_page: usize,
+    ) -> usize {
+        if align_tail && prefix_cache {
+            pool_page
+        } else {
+            0
+        }
     }
 
     /// 旧行为入口（测试用；生产统一走 [`Self::prefill_step_chunk_msg`]）。
@@ -348,14 +363,12 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **合批行派生**(B5.1;host 侧,零 await):刷新块链(可能跨页增长)并
     /// 算出本步物理槽。与单行 `Decode` 分支的派生逐式同源(pos+1 行)。
     fn decode_row_of(&mut self, idx: usize) -> Result<RowSpec> {
-        let (turn, sid, gdn_slot, pos, token) = {
+        let (turn, sid, gdn_slot, pos, token, grant) = {
             let a = &self.turns.active[idx];
-            let token = *a.out.last().ok_or_else(|| {
-                ModelError::EngineInvariant {
-                    what: "合批 decode:行 out 为空(相位判定漂移)".into(),
-                }
+            let token = *a.out.last().ok_or_else(|| ModelError::EngineInvariant {
+                what: "合批 decode:行 out 为空(相位判定漂移)".into(),
             })?;
-            (a.id, a.session_id, a.gdn_slot, a.fed, token)
+            (a.id, a.session_id, a.gdn_slot, a.fed, token, a.grant)
         };
         let grew = {
             let s = self.bank.sessions.session_mut(sid)?;
@@ -364,8 +377,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             // (`generation_target` 覆盖 verify+propose)。
             self.bank
                 .rel
-                .leg
-                .ensure_for_len(&mut s.block_table, pos + 1)?;
+                .ensure_for_len(grant, &mut s.block_table, pos + 1)?;
             s.block_table.len() != before
         };
         let page = self.dev.pool.geom.page;
@@ -393,13 +405,17 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// - `cache_pages` = **可回收缓存页**（设备面引用=1 的块；
     ///   `LegStats.movable_bytes` 是 store 的 §23.2「准入可动面真源」）−
     ///   已被上面 `free` 吃掉的部分（不许和 `free` 重叠，否则双算）；
-    /// - `reserved_pages` = 本模块准入账（在跑 turn 的预留）。
+    /// - `reserved_pages` = store 的 `ReservationLedger` 准入面（Grant 总量）；
+    /// - `in_flight_turns` = store 的 Grant 在册 turn 数（槽位策略）。
     ///
     /// ⇒ `usable = free + cache − reserve ≤ total − reserved − reserve`：
     /// 物理可用、缓存可回收、未来承诺三者同时成立才放人。
     pub(crate) fn store_facts(&self) -> crate::sched_policy::StoreFacts {
         let leg = self.bank.rel.leg.report();
-        let reserved = self.turns.admission.reserved_pages();
+        // **P0-4**：页账唯一真源 = store 的 ReservationLedger（不再读 sched_policy
+        // 的影子 admitted 账）。
+        let reserved = self.bank.rel.reserved_slots();
+        let in_flight_turns = self.bank.rel.in_flight_turns();
         let claimed_free = leg.slots_total.saturating_sub(reserved);
         let free_pages = leg.slots_free.min(claimed_free);
         let movable_pages = if leg.block_bytes > 0 {
@@ -420,6 +436,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             free_pages,
             cache_pages,
             reserved_pages: reserved,
+            in_flight_turns,
             // **宿主腿**（超卖档溢出面）：预算 − 已驻留，按块字节折页。
             host_free_pages: if leg.block_bytes > 0 {
                 leg.host_budget_bytes.saturating_sub(leg.host_bytes) / leg.block_bytes
@@ -431,7 +448,12 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     /// 准入容量快照（诊断：`/debug/vram → batch.capacity`）
-    pub fn capacity_probe(&self) -> (crate::sched_policy::StoreFacts, crate::sched_policy::Capacity) {
+    pub fn capacity_probe(
+        &self,
+    ) -> (
+        crate::sched_policy::StoreFacts,
+        crate::sched_policy::Capacity,
+    ) {
         let l = self.admission_limits();
         let s = self.store_facts();
         // 用一个"零成本"的代表 turn 报容量：取当前账上最大在跑尺寸，
@@ -516,168 +538,186 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 从 `schedule()` 抽出（2026-10-20）：准入判决必须**在启动之外**做
     /// `Hold/Reject` —— 判决嵌在启动体里时，Hold 早退会停摆已有活跃、
     /// 不早退则队首照常被弹起（准入形同虚设）。**行为逐字节不变**。
-    fn start_one(&mut self, turn: crate::turn::Turn) -> Result<BeginPlan> {
-            // **准入登记**(S3b §23.2):turn 从此占用一块保留额(实占随
-            // `sync_pool_account` 在段边界更新;天花板门 count 靠它)。
-            self.bank.rel.admission.admit(turn.id, 0, 0)?;
-            self.turns.admit_wait = None;
-            // **S2b(§28):turn 起借 GDN 行**(账在 store:行 = 活跃 turn 的资源;
-            // 物理行号就是账里的行号 —— 一本账,不两份)。行耗尽 = 响亮拒
-            // (`Exhausted`;正常路径由准入面 `gdn_slots` 天花板先挡)。
-            let gdn_row = self.bank.rel.state.borrow_row()?;
-            // E2c 复用形态:**PrefixHit(内容寻址,块链复用 + 快照恢复)/ Fresh(全量)**
-            //
-            // **S2(§25.1①)删掉 GuardHit 快路**:idle 会话不再持设备表 ⇒
-            // "同会话原样复用块链"这条快路不再成立(表已释放),"同会话增量"
-            // 由**内容寻址**接管:tokens 前缀一致 ⇒ 命中;客户端改写历史 ⇒
-            // 命中自然变短(自回退全量)—— 守卫(isolation)的活由内容身份干,
-            // 少一条与内容寻址并行的"账本信任"路径。
-            // **前缀无感删除**(2026-10-23):先试"历史里正好少了一段**已标记**
-            // 图像"。命中 ⇒ 后缀页保留 + 位置洞 + 零重算;不命中 ⇒ 逐字节旧路径
-            // (G5 兜底,`plan_image_delete` 全程纯读,失败零副作用)。
-            // **前缀无感删除 = leave-gap 唯一路径**(2026-10-26):删图后保留
-            // 幸存 position、不转 K;不命中则逐字节旧前缀复用路径。
-            let (cached_len, restore_key, pending_loads, image_exec) =
-                if turn.deletion.is_some() {
-                    match self.plan_image_leave_gap(&turn)? {
-                        Some(p) => self.apply_image_leave_gap(p, &turn)?,
-                        None => {
-                            let (c, r, pl) = self.plan_prefix_reuse(&turn)?;
-                            (c, r, pl, None)
-                        }
-                    }
-                } else {
+    fn start_one(&mut self, turn: crate::turn::Turn, grant: owl_store::Grant) -> Result<BeginPlan> {
+        let grant_id = grant.id;
+        // **准入登记**(S3b §23.2):turn 从此占用一块保留额(实占随
+        // `sync_pool_account` 在段边界更新;天花板门 count 靠它)。
+        self.bank.rel.admission.admit(turn.id, 0, 0)?;
+        self.turns.admit_wait = None;
+        // **S2b(§28):turn 起借 GDN 行**(账在 store:行 = 活跃 turn 的资源;
+        // 物理行号就是账里的行号 —— 一本账,不两份)。行耗尽 = 响亮拒
+        // (`Exhausted`;正常路径由准入面 `gdn_slots` 天花板先挡)。
+        let gdn_row = self.bank.rel.state.borrow_row()?;
+        // E2c 复用形态:**PrefixHit(内容寻址,块链复用 + 快照恢复)/ Fresh(全量)**
+        //
+        // **S2(§25.1①)删掉 GuardHit 快路**:idle 会话不再持设备表 ⇒
+        // "同会话原样复用块链"这条快路不再成立(表已释放),"同会话增量"
+        // 由**内容寻址**接管:tokens 前缀一致 ⇒ 命中;客户端改写历史 ⇒
+        // 命中自然变短(自回退全量)—— 守卫(isolation)的活由内容身份干,
+        // 少一条与内容寻址并行的"账本信任"路径。
+        // **前缀无感删除**(2026-10-23):先试"历史里正好少了一段**已标记**
+        // 图像"。命中 ⇒ 后缀页保留 + 位置洞 + 零重算;不命中 ⇒ 逐字节旧路径
+        // (G5 兜底,`plan_image_delete` 全程纯读,失败零副作用)。
+        // **前缀无感删除 = leave-gap 唯一路径**(2026-10-26):删图后保留
+        // 幸存 position、不转 K;不命中则逐字节旧前缀复用路径。
+        let (cached_len, restore_key, pending_loads, image_exec) = if turn.deletion.is_some() {
+            match self.plan_image_leave_gap(&turn)? {
+                Some(p) => self.apply_image_leave_gap(p, &turn)?,
+                None => {
                     let (c, r, pl) = self.plan_prefix_reuse(&turn)?;
                     (c, r, pl, None)
-                };
-            // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
-            //
-            // **锁①后半(2026-10-19)**:原实现一次长到**整个 prompt** ——
-            // 池 ≥ ctx 时从不暴露;池 < ctx(虚拟化档)时那一步就要几千页槽
-            // ⇒ 必 `Exhausted`。虚拟化档只长到**首个 chunk** 的那几页,
-            // 后面由 `execute_prefill` 逐 chunk 增量长(用到哪长到哪);
-            // 腾位归召回点的驻留调和。
-            {
-                let s = self.bank.sessions
-                    .get_mut(turn.session_id)
-                    .expect("submit 已建会话账");
-                let target = if self.boot.cfg.knobs.kvmem_virtualization {
-                    Self::prefill_step_chunk_msg(
-                        0,
-                        turn.prompt_ids.len(),
-                        self.boot.cfg.prefill_chunk,
-                        self.boot.cfg.knobs.prefill_tail_merge,
-                        Self::prefill_align_page(
-                            self.boot.cfg.knobs.prefill_align_tail,
-                            self.boot.cfg.knobs.prefix_cache,
-                            self.dev.pool.geom.page,
-                        ),
-                        &turn.msg_snaps,
-                        self.boot.cfg.knobs.snap_msg_min_span,
-                    )
-                    .unwrap_or(1)
-                } else {
-                    turn.prompt_ids.len()
-                };
-                // H1/H2 已由 pump 的 Acquire(Admit/Grow) 预留；这里只纯分配。
-                self.bank.rel.leg.ensure_for_len(&mut s.block_table, target)?;
-            }
-            let begin = BeginPlan {
-                session_id: turn.session_id,
-                gdn_slot: gdn_row,
-                restore_key,
-                reset_gdn: cached_len == 0 && image_exec.is_none(),
-                pending_loads,
-                image_exec,
-            };
-            let ignore_eos = turn.spec.ignore_eos;
-            let opts = turn.opts.clone();
-            // 采样面合并(AGT-06):请求覆写按字段并入引擎 knobs;
-            // 请求未表达采样意图 ⇒ 完全走 knobs(flavor 语义不变)
-            let (eff_sampler, sampler_on) = match opts.sampler {
-                Some(o) if !o.is_empty() => {
-                    let mut s = self.boot.cfg.knobs.sampler;
-                    if let Some(t) = o.temp {
-                        s.temp = t;
-                    }
-                    if let Some(k) = o.topk {
-                        s.topk = k;
-                    }
-                    if let Some(p) = o.topp {
-                        s.topp = p;
-                    }
-                    let on = s.temp > 0.0;
-                    (s, on)
                 }
-                _ => (self.boot.cfg.knobs.sampler, self.boot.cfg.knobs.sampler_enabled),
+            }
+        } else {
+            let (c, r, pl) = self.plan_prefix_reuse(&turn)?;
+            (c, r, pl, None)
+        };
+        // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
+        //
+        // **锁①后半(2026-10-19)**:原实现一次长到**整个 prompt** ——
+        // 池 ≥ ctx 时从不暴露;池 < ctx(虚拟化档)时那一步就要几千页槽
+        // ⇒ 必 `Exhausted`。虚拟化档只长到**首个 chunk** 的那几页,
+        // 后面由 `execute_prefill` 逐 chunk 增量长(用到哪长到哪);
+        // 腾位归召回点的驻留调和。
+        {
+            let s = self
+                .bank
+                .sessions
+                .get_mut(turn.session_id)
+                .expect("submit 已建会话账");
+            let target = if self.boot.cfg.knobs.kvmem_virtualization {
+                Self::prefill_step_chunk_msg(
+                    0,
+                    turn.prompt_ids.len(),
+                    self.boot.cfg.prefill_chunk,
+                    self.boot.cfg.knobs.prefill_tail_merge,
+                    Self::prefill_align_page(
+                        self.boot.cfg.knobs.prefill_align_tail,
+                        self.boot.cfg.knobs.prefix_cache,
+                        self.dev.pool.geom.page,
+                    ),
+                    &turn.msg_snaps,
+                    self.boot.cfg.knobs.snap_msg_min_span,
+                )
+                .unwrap_or(1)
+            } else {
+                turn.prompt_ids.len()
             };
-            // **[N1 TurnBegin]**:turn 上设备 —— 归属 `Turn(id)`;类别 `Temp`
-            //    (turn 域的一切分配都是临时面:激活/工作区/回退;常驻面在 boot 已归 System)
-            let admit_id = turn.id;
-            self.set_dev_ctx(
-                owl_iface::handle::Owner::Turn(admit_id),
-                owl_iface::handle::AssetClass::Temp,
-            );
-            // 排队时长（提交 → 起跑）：直方图 + 起跑时刻（墙钟 EWMA 用）
-            let started_ms = crate::running::now_ms();
-            self.turns
-                .note_wait(started_ms.saturating_sub(turn.submitted_ms));
-            let next_rope_pos = turn
-                .positions
-                .iter()
-                .flat_map(|p| p.iter())
-                .copied()
-                .max()
-                .unwrap_or(-1)
-                .saturating_add(1);
-            self.turns.active.push(crate::turn::ActiveTurn {
-                id: turn.id,
-                session_id: turn.session_id,
-                gdn_slot: gdn_row,
-                started_ms,
-                ephemeral: turn.ephemeral,
-                prompt_ids: turn.prompt_ids,
-                msg_snaps: turn.msg_snaps,
-                max_new: turn.spec.max_new,
-                positions: turn.positions,
-                next_rope_pos,
-                rope_gap: turn.positions_gap,
-                ignore_eos,
-                sampler: eff_sampler,
-                sampler_on,
-                stop: opts.stop,
-                emitted: 0,
-                trim_text_to: None,
-                seed: opts.seed,
-                first_token_ms: None,
-                out: Vec::new(),
-                fed: cached_len,
-                cached_start: cached_len,
-                decoded: String::new(),
-                // 视觉输入（主分支 V1–V5）：图像随 turn 携带，prefill 首块注入
-                images: opts.images.clone(),
-                img_spans: turn.img_spans,
-                img_pads: turn.img_pads,
-                vlm: None,
-                vlm_peer: None,
-                spec: crate::turn::TurnSpecState {
-                    // B4 分母**跨 turn 保鲜**(见 RunningEngine::bare_cost_carry_ms);
-                    // 其余 spec 态仍全零 = 生命周期收口纪律不动
-                    bare_cost_ewma_ms: self.dev.spec_rt.carry_ms,
-                    bare_cost_ctx: self.dev.spec_rt.carry_ctx,
-                    // 分母未测 ⇒ 本 turn 发播种裸步(见 TurnSpecState::bare_seed_left)
-                    bare_seed_left: if self.dev.spec_rt.carry_ms > 0.0 { 0 } else { crate::turn::SPEC_SEED_SAMPLES },
-                    ..Default::default()
+            // **P0-4**：只消费准入 Grant（分配失败会把额度回滚）。
+            self.bank
+                .rel
+                .ensure_for_len(grant_id, &mut s.block_table, target)?;
+        }
+        let begin = BeginPlan {
+            session_id: turn.session_id,
+            gdn_slot: gdn_row,
+            restore_key,
+            reset_gdn: cached_len == 0 && image_exec.is_none(),
+            pending_loads,
+            image_exec,
+        };
+        let ignore_eos = turn.spec.ignore_eos;
+        let opts = turn.opts.clone();
+        // 采样面合并(AGT-06):请求覆写按字段并入引擎 knobs;
+        // 请求未表达采样意图 ⇒ 完全走 knobs(flavor 语义不变)
+        let (eff_sampler, sampler_on) = match opts.sampler {
+            Some(o) if !o.is_empty() => {
+                let mut s = self.boot.cfg.knobs.sampler;
+                if let Some(t) = o.temp {
+                    s.temp = t;
+                }
+                if let Some(k) = o.topk {
+                    s.topk = k;
+                }
+                if let Some(p) = o.topp {
+                    s.topp = p;
+                }
+                let on = s.temp > 0.0;
+                (s, on)
+            }
+            _ => (
+                self.boot.cfg.knobs.sampler,
+                self.boot.cfg.knobs.sampler_enabled,
+            ),
+        };
+        // **[N1 TurnBegin]**:turn 上设备 —— 归属 `Turn(id)`;类别 `Temp`
+        //    (turn 域的一切分配都是临时面:激活/工作区/回退;常驻面在 boot 已归 System)
+        let admit_id = turn.id;
+        self.set_dev_ctx(
+            owl_iface::handle::Owner::Turn(admit_id),
+            owl_iface::handle::AssetClass::Temp,
+        );
+        // 排队时长（提交 → 起跑）：直方图 + 起跑时刻（墙钟 EWMA 用）
+        let started_ms = crate::running::now_ms();
+        self.turns
+            .note_wait(started_ms.saturating_sub(turn.submitted_ms));
+        let next_rope_pos = turn
+            .positions
+            .iter()
+            .flat_map(|p| p.iter())
+            .copied()
+            .max()
+            .unwrap_or(-1)
+            .saturating_add(1);
+        self.turns.active.push(crate::turn::ActiveTurn {
+            id: turn.id,
+            session_id: turn.session_id,
+            gdn_slot: gdn_row,
+            grant: grant_id,
+            // 回滚键 = 当前 turn 的第一个已知边界;capture 后会被更新。
+            last_snap: restore_key,
+            started_ms,
+            ephemeral: turn.ephemeral,
+            prompt_ids: turn.prompt_ids,
+            msg_snaps: turn.msg_snaps,
+            max_new: turn.spec.max_new,
+            positions: turn.positions,
+            next_rope_pos,
+            rope_gap: turn.positions_gap,
+            ignore_eos,
+            sampler: eff_sampler,
+            sampler_on,
+            stop: opts.stop,
+            emitted: 0,
+            trim_text_to: None,
+            seed: opts.seed,
+            first_token_ms: None,
+            out: Vec::new(),
+            fed: cached_len,
+            cached_start: cached_len,
+            decoded: String::new(),
+            // 视觉输入（主分支 V1–V5）：图像随 turn 携带，prefill 首块注入
+            images: opts.images.clone(),
+            img_spans: turn.img_spans,
+            img_pads: turn.img_pads,
+            vlm: None,
+            vlm_peer: None,
+            spec: crate::turn::TurnSpecState {
+                // B4 分母**跨 turn 保鲜**(见 RunningEngine::bare_cost_carry_ms);
+                // 其余 spec 态仍全零 = 生命周期收口纪律不动
+                bare_cost_ewma_ms: self.dev.spec_rt.carry_ms,
+                bare_cost_ctx: self.dev.spec_rt.carry_ctx,
+                // 分母未测 ⇒ 本 turn 发播种裸步(见 TurnSpecState::bare_seed_left)
+                bare_seed_left: if self.dev.spec_rt.carry_ms > 0.0 {
+                    0
+                } else {
+                    crate::turn::SPEC_SEED_SAMPLES
                 },
-            });
-            Ok(begin)
+                ..Default::default()
+            },
+        });
+        Ok(begin)
     }
 
     /// **Fresh 起跑**(零复用):释放旧块表/旧 MTP 链 + 会话账归零。
     fn plan_fresh(
         &mut self,
         turn: &crate::turn::Turn,
-    ) -> Result<(usize, Option<owl_store::SnapKey>, Vec<(usize, owl_store::ChainHash)>)> {
+    ) -> Result<(
+        usize,
+        Option<owl_store::SnapKey>,
+        Vec<(usize, owl_store::ChainHash)>,
+    )> {
         let s = self
             .bank
             .sessions
@@ -694,10 +734,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **leave-gap 删除计划**(纯 host):摘掉被删图像页,保留前缀/后缀页,
     /// **不转 K、不移动幸存 token 的 position**。快照只换边界身份(元数据),
     /// 内容仍是同一份 GDN 状态/K。
-    fn plan_image_leave_gap(
-        &mut self,
-        turn: &crate::turn::Turn,
-    ) -> Result<Option<ImageLeaveGap>> {
+    fn plan_image_leave_gap(&mut self, turn: &crate::turn::Turn) -> Result<Option<ImageLeaveGap>> {
         if !self.boot.cfg.knobs.image_evict || !self.dev.pool.geom.paged {
             return Ok(None);
         }
@@ -705,7 +742,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         if page == 0 {
             return Ok(None);
         }
-        let Some(del) = turn.deletion else { return Ok(None) };
+        let Some(del) = turn.deletion else {
+            return Ok(None);
+        };
         if del.a >= del.b || del.a % page != 0 || (del.b - del.a) % page != 0 {
             owl_shared::log_warn!(
                 "img-evict",
@@ -860,7 +899,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                 }
                 RekeyTarget::Host => self.bank.rel.rekey_snap(k_old, k_new),
                 RekeyTarget::Disk => {
-                    disk_ops.push(SnapDiskOp::Rekey { old: k_old, new: k_new });
+                    disk_ops.push(SnapDiskOp::Rekey {
+                        old: k_old,
+                        new: k_new,
+                    });
                     true
                 }
                 RekeyTarget::Skip => false,
@@ -971,11 +1013,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         s.tokens.extend_from_slice(&turn.prompt_ids[..d.cached_len]);
         // **中途落账也必须自洽**：Abort 不会再 commit_turn；pad/spans 若仍
         // 指向被截掉的后缀，下一轮 unpad 会 400。
-        let (spans, pads) = crate::img_evict::ledger_prefix(
-            &turn.img_spans,
-            &turn.img_pads,
-            d.cached_len,
-        );
+        let (spans, pads) =
+            crate::img_evict::ledger_prefix(&turn.img_spans, &turn.img_pads, d.cached_len);
         s.set_img_spans(spans, pads);
         s.chain.seed(d.cached_len / page, d.tail_hash);
         s.set_positions(&turn.positions[..d.cached_len], true)?;
@@ -992,7 +1031,10 @@ impl<D: DeviceClient> RunningEngine<D> {
             d.cached_len,
             d.restore_key,
             d.pending_loads,
-            Some(ImageExec { snap_disk: d.snap_disk, release_chains: d.release_chains }),
+            Some(ImageExec {
+                snap_disk: d.snap_disk,
+                release_chains: d.release_chains,
+            }),
         ))
     }
 
@@ -1003,8 +1045,14 @@ impl<D: DeviceClient> RunningEngine<D> {
     fn plan_prefix_reuse(
         &mut self,
         turn: &crate::turn::Turn,
-    ) -> Result<(usize, Option<owl_store::SnapKey>, Vec<(usize, owl_store::ChainHash)>)> {
-        let s = self.bank.sessions
+    ) -> Result<(
+        usize,
+        Option<owl_store::SnapKey>,
+        Vec<(usize, owl_store::ChainHash)>,
+    )> {
+        let s = self
+            .bank
+            .sessions
             .get_mut(turn.session_id)
             .expect("submit 已建会话账");
         let positioned = s.positioned;
@@ -1047,22 +1095,19 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // 在场性 = **store 的层账**(设备/宿主都算);层号一并打出。
                 // 头尾都要看(2026-10-19):复用面只认**最靠近链头**的在场面 ⇒
                 // "前 4 全 '-'"曾把"链头那张缺位"误读成"全丢";故头 4 + 尾 6。
-                let tier_of = |h: &owl_store::ChainHash| {
-                    match self.bank.rel.state.locate(owl_store::SnapKey::at_boundary(*h)) {
-                        Some(owl_store::Tier::Gpu) => "dev",
-                        Some(owl_store::Tier::Host) => "host",
-                        Some(owl_store::Tier::Disk) => "disk",
-                        None => "-",
-                    }
+                let tier_of = |h: &owl_store::ChainHash| match self
+                    .bank
+                    .rel
+                    .state
+                    .locate(owl_store::SnapKey::at_boundary(*h))
+                {
+                    Some(owl_store::Tier::Gpu) => "dev",
+                    Some(owl_store::Tier::Host) => "host",
+                    Some(owl_store::Tier::Disk) => "disk",
+                    None => "-",
                 };
                 let head: Vec<&str> = hashes.iter().take(4).map(tier_of).collect();
-                let tail: Vec<&str> = hashes
-                    .iter()
-                    .rev()
-                    .take(6)
-                    .rev()
-                    .map(tier_of)
-                    .collect();
+                let tail: Vec<&str> = hashes.iter().rev().take(6).rev().map(tier_of).collect();
                 owl_shared::log_debug!(
                     "dbg prefix",
                     "match = {matched_raw} blocks / chain = {chain:?} · snap_used={}/{} 边界在场 头4={head:?} 尾6={tail:?}",
@@ -1130,7 +1175,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             if self.boot.cfg.knobs.probes.debug {
                 // 裁剪结果 = 复用面真值(块);页对齐后 = 可复用 token 数
                 let found = if m > 0 {
-                    match self.bank.rel.state.locate(owl_store::SnapKey::at_boundary(hashes[m - 1])) {
+                    match self
+                        .bank
+                        .rel
+                        .state
+                        .locate(owl_store::SnapKey::at_boundary(hashes[m - 1]))
+                    {
                         Some(owl_store::Tier::Gpu) => "dev",
                         Some(owl_store::Tier::Host) => "host",
                         _ => "?",
@@ -1164,8 +1214,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         self.bank.rel.leg.incref(b)?;
                     }
                 }
-                pending_loads
-                    .truncate(pending_loads.iter().take_while(|(i, _)| *i < m).count());
+                pending_loads.truncate(pending_loads.iter().take_while(|(i, _)| *i < m).count());
                 let mut old = std::mem::take(&mut s.block_table);
                 self.bank.rel.leg.release_table(&mut old)?;
                 s.block_table = chain[..m].to_vec();
@@ -1193,10 +1242,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
     }
 
-    /// 调度决策(纯主机侧)：turn 启动判定(会话守卫/前缀匹配/快照
+    /// 调度决策(主机侧)：turn 启动判定(会话守卫/前缀匹配/快照
     /// 边界)+ 相位决策(prefill chunk / decode 步,host 派生量备齐)。
-    /// 只动账(队列/会话账/块账房/活跃 turn),**零 await**。
-    pub(crate) fn schedule(&mut self) -> Result<SchedulerOutput> {
+    /// 只动账(队列/会话账/块账房/活跃 turn)。
+    ///
+    /// **P0-4**：准入 Admit 后、启动之前经 `Acquire::Capacity { reserve }`
+    /// 向 store 领一张 Grant；`start_one`/后续 `ensure_for_len` 只消费这张票。
+    /// 因此本函数是 `async`（只多一次“零 I/O”的 grant 发放；搬位仍在 pump）。
+    pub(crate) async fn schedule(&mut self) -> Result<SchedulerOutput> {
         let mut begin = None;
         // B5.1:多活跃 —— 有空位才允许起新 turn(其余逻辑不变)。
         // **准入排队中**(S3b §23.4 `Queue` 姿态):留队首不弹 —— 起 turn
@@ -1210,14 +1263,14 @@ impl<D: DeviceClient> RunningEngine<D> {
             .unwrap_or(false);
         if self.turns.active.len() < self.boot.cfg.knobs.max_batch.max(1) && !admit_blocked {
             // **准入（唯一放行口）**：纯状态机 + store 事实注入。
-            // · Admit  → 启动（`start_one`）并入账；
+            // · Admit  → 领 grant → 启动（`start_one`）并入账；
             // · Hold   → 队首**留原位**，本拍只推已有活跃（不许停摆）；
             // · Reject → 出队 + `Failed{admission:<code>}`（服务面翻 429）。
             let mut start_ok = true;
-            if let Some(head) = self.turns.queue.front() {
+            let mut admission_grant: Option<owl_store::Grant> = None;
+            if let Some(head_facts) = self.turns.queue.front().map(Self::facts_of_queued) {
                 let l = self.admission_limits();
                 let s = self.store_facts();
-                let head_facts = Self::facts_of_queued(head);
                 let running: Vec<crate::sched_policy::TurnFacts> =
                     self.turns.actives().map(Self::facts_of_active).collect();
                 let now_ms = std::time::SystemTime::now()
@@ -1226,7 +1279,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .unwrap_or(0);
                 owl_shared::log_debug!(
                     "admit-dbg",
-                    "head turn {} prompt={} max_new={} | free={} reserved={} usable={} cap={} run={} admitted={}",
+                    "head turn {} prompt={} max_new={} | free={} reserved={} usable={} cap={} run={} in_flight={}",
                     head_facts.turn,
                     head_facts.prompt_tokens,
                     head_facts.max_new,
@@ -1235,13 +1288,42 @@ impl<D: DeviceClient> RunningEngine<D> {
                     s.usable_pages(l.reserve_pages),
                     self.turns.admission.cap_for(&l, &s, &head_facts),
                     running.len(),
-                    self.turns.admission.reserved_pages()
+                    s.in_flight_turns
                 );
-                match self.turns.admission.decide(&l, &s, &running, &head_facts, now_ms) {
+                match self
+                    .turns
+                    .admission
+                    .decide(&l, &s, &running, &head_facts, now_ms)
+                {
                     crate::sched_policy::Verdict::Admit => {
                         owl_shared::metrics::with_metrics_store(|m| {
                             m.counter_add("admit.decision.admit", 1, file!(), line!())
                         });
+                        // **Grant 必须在判决之后发**：否则它会进入本次判决的
+                        // `StoreFacts.reserved_pages`，变成“自己占自己的位”。
+                        let cap = self.turns.admission.cap_for(&l, &s, &head_facts);
+                        let reserved_slots = head_facts.need_pages(&l, cap).max(1);
+                        // **分配面**必须覆盖整条块表（超卖档的准入面只是工作集，
+                        // 后续 prefill 仍会按 chunk 长表）；非超卖档两者相等。
+                        let alloc_slots = head_facts
+                            .prompt_tokens
+                            .saturating_add(head_facts.max_new)
+                            .div_ceil(l.page.max(1))
+                            .max(reserved_slots);
+                        let out = self
+                            .store_hook(crate::store_hook::StoreHook::capacity_reserve(
+                                owl_store::Need::kv(0, owl_store::NeedWhy::Admit),
+                                head_facts.turn,
+                                reserved_slots,
+                                alloc_slots,
+                            ))
+                            .await?;
+                        admission_grant = out.grant;
+                        if admission_grant.is_none() {
+                            return Err(ModelError::EngineInvariant {
+                                what: "准入 Admit 后 Capacity 未返回 Grant".into(),
+                            });
+                        }
                     }
                     crate::sched_policy::Verdict::Hold => {
                         start_ok = false;
@@ -1289,11 +1371,25 @@ impl<D: DeviceClient> RunningEngine<D> {
             if start_ok {
                 if let Some(turn) = self.turns.queue.pop_front() {
                     let facts = Self::facts_of_queued(&turn);
-                    begin = Some(self.start_one(turn)?);
-                    // 入账（预留页；终局 `close_admission` 归还）
-                    let l = self.admission_limits();
-                    let s = self.store_facts();
-                    self.turns.admission.note_started(&l, &s, &facts);
+                    let grant =
+                        admission_grant
+                            .take()
+                            .ok_or_else(|| ModelError::EngineInvariant {
+                                what: "准入放行但无 Grant（store 账未发）".into(),
+                            })?;
+                    let turn_id = turn.id;
+                    begin = Some(match self.start_one(turn, grant) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            // 启动失败 ⇒ 票必须归还，不能让一次失败吞掉容量。
+                            self.bank.rel.release_turn_grants(turn_id);
+                            return Err(e);
+                        }
+                    });
+                    self.turns.admission.note_started(&facts);
+                } else if let Some(g) = admission_grant.take() {
+                    // 队首在判决后消失（理论竞态）⇒ 票必须归还。
+                    self.bank.rel.release_turn_grants(g.turn);
                 }
             }
         }
@@ -1309,7 +1405,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ③ 单 rank(TP 的 AR 批语义未审,R8);④ 选择层视图关闭(页表需 per-row)。
         if self.boot.cfg.knobs.max_batch > 1
             && self.turns.active.len() >= 2
-            && self.turns.active.iter().all(|a| a.fed >= a.prompt_ids.len())
+            && self
+                .turns
+                .active
+                .iter()
+                .all(|a| a.fed >= a.prompt_ids.len())
             && self.dev.spec_rt.depth == 0
             && self.peer.is_none()
             && !self.sel.has_view()
@@ -1438,19 +1538,24 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 生成相位:decode 单步 / 投机轮(host 派生量备齐 —— 物理槽/跨页增长)
         let (sid, token, pos) = {
             let act = self.turns.active()?;
-            (act.session_id, *act.out.last().ok_or_else(|| ModelError::EngineInvariant { what: "生成相位但 out 为空(相位判定漂移)".into() })?, act.fed)
+            (
+                act.session_id,
+                *act.out.last().ok_or_else(|| ModelError::EngineInvariant {
+                    what: "生成相位但 out 为空(相位判定漂移)".into(),
+                })?,
+                act.fed,
+            )
         };
         // B4 自适应降级(§6.24):降级态发裸 Decode(草稿池逐 token 同步);
         // 每 probe_every 步发一轮真 SpecRound 探测(m≥1 → 解除降级,
         // 见 execute_spec_round 尾态机)。非降级 = 原调度,零变化。
         // B4 三态在 ActiveTurn.spec(turn 生命周期;2026-10-10 收口)
-        let active_depth = if self.dev.spec_rt.adaptive_depth
-            && self.turns.active()?.spec.adaptive_downshift
-        {
-            self.dev.spec_rt.depth_min
-        } else {
-            self.dev.spec_rt.depth_for_pos(pos)
-        };
+        let active_depth =
+            if self.dev.spec_rt.adaptive_depth && self.turns.active()?.spec.adaptive_downshift {
+                self.dev.spec_rt.depth_min
+            } else {
+                self.dev.spec_rt.depth_for_pos(pos)
+            };
         // **target live 宽度 = P+1**（NInfer 同律）：proposal 仍算满 W=K+1，
         // target 图也仍是 T=K+1（owl 图定形），但 P< K 时只提交前 P+1 行。
         // rem=1 时直接裸 decode；P 的截断在 `execute_spec_round` 内做
@@ -1490,7 +1595,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 let a = &mut self.turns.active_mut()?.spec;
                 a.bare_seed_left -= 1;
                 a.bare_seed_step = true;
-                owl_shared::log_info!("spec-seed", "分母未测 ⇒ 本步发播种裸 decode(还欠 {} 步)", a.bare_seed_left);
+                owl_shared::log_info!(
+                    "spec-seed",
+                    "分母未测 ⇒ 本步发播种裸 decode(还欠 {} 步)",
+                    a.bare_seed_left
+                );
                 0
             } else {
                 active_depth
@@ -1503,15 +1612,23 @@ impl<D: DeviceClient> RunningEngine<D> {
         } else {
             0
         };
-        let gdn_row = self.turns.active.first().map(|a| a.gdn_slot).ok_or_else(|| {
-            owl_iface::contract::ModelError::Msg("decode 相位:无活跃 turn(行号真源缺失)".into())
-        })?;
+        let gdn_row = self
+            .turns
+            .active
+            .first()
+            .map(|a| a.gdn_slot)
+            .ok_or_else(|| {
+                owl_iface::contract::ModelError::Msg("decode 相位:无活跃 turn(行号真源缺失)".into())
+            })?;
+        let grant = self.turns.active()?.grant;
         let (kv_slot, kv_slots, gdn_slot, grew) = {
             let s = self.bank.sessions.session_mut(sid)?;
             let need = pos + spec + 1;
             let before = s.block_table.len();
-            // H2 已由 pump 的 Acquire(Grow) 预留；这里只纯分配。
-            self.bank.rel.leg.ensure_for_len(&mut s.block_table, need)?;
+            // **P0-4**：消费本 turn 的准入 Grant。
+            self.bank
+                .rel
+                .ensure_for_len(grant, &mut s.block_table, need)?;
             let grew = s.block_table.len() != before;
             let page = self.dev.pool.geom.page;
             let slot_at = |p: usize| {
@@ -1535,18 +1652,28 @@ impl<D: DeviceClient> RunningEngine<D> {
         match kv_slots {
             Some(kv_slots) => Ok(SchedulerOutput::Step {
                 begin,
-                action: StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew, depth: spec },
+                action: StepAction::SpecRound {
+                    token,
+                    pos,
+                    kv_slots,
+                    gdn_slot,
+                    grew,
+                    depth: spec,
+                },
             }),
             None => Ok(SchedulerOutput::Step {
                 begin,
-                action: StepAction::Decode { token, pos, kv_slot, gdn_slot, grew },
+                action: StepAction::Decode {
+                    token,
+                    pos,
+                    kv_slot,
+                    gdn_slot,
+                    grew,
+                },
             }),
         }
     }
 }
-
-
-
 
 #[cfg(test)]
 mod prefill_tail_merge_tests {
@@ -1673,7 +1800,7 @@ mod prefill_tail_merge_tests {
         assert_eq!(R::decode_boundary_in(250, 257, page, 8), Some(256)); // 页 8 ✓(stride 8)
         assert_eq!(R::decode_boundary_in(186, 193, page, 8), None); // 页 6
         assert_eq!(R::decode_boundary_in(186, 193, page, 2), Some(192)); // 页 6 ✓(stride 2)
-        // 关(stride=0)/无页(page=0)
+                                                                         // 关(stride=0)/无页(page=0)
         assert_eq!(R::decode_boundary_in(158, 163, page, 0), None);
         assert_eq!(R::decode_boundary_in(158, 163, 0, 1), None);
         // 尾首:pos=0 且 fed_new 已过第一页 ⇒ 拍

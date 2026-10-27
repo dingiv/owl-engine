@@ -319,9 +319,9 @@ pub async fn run_actor<D: DeviceClient>(
                         match running.relieve_pressure().await {
                             // **如实报数**:还缓存 0 块也照说(mid-turn 池空是常态 ——
                             // 失败那一刻的块都在使用中,不在池里)
-                            Ok((freed, k)) => owl_shared::log_warn!(
+                            Ok((freed, k, h)) => owl_shared::log_warn!(
                                 "actor",
-                                "显存压力:已收缩(还缓存 {freed} 块 + 目标腾 {k} 槽)⇒ 引擎继续(丢本 turn)"
+                                "显存压力:已收缩(还缓存 {freed} 块 + 目标腾 {k} KV 槽 + {h} 宿主槽)⇒ 引擎继续(丢本 turn)"
                             ),
                             Err(pe) => owl_shared::log_warn!(
                                 "actor",

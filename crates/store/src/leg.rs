@@ -554,6 +554,14 @@ impl BlockLeg {
         self.host.budget_bytes()
     }
 
+    /// 宿主层总槽数(= 预算 / 单宿主块字节;0 = 关层)。
+    pub fn host_total_slots(&self) -> usize {
+        self.host
+            .budget_bytes()
+            .checked_div(self.host.block_bytes().max(1))
+            .unwrap_or(0)
+    }
+
     /// 宿主层**空转缓冲**字节(真实 RAM;报告必须算上 —— 已 acquire 未 put 的池租约)。
     pub fn host_free_bytes(&self) -> usize {
         self.host.free_bytes()

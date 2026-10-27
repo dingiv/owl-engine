@@ -55,6 +55,8 @@
 //! | runtime | max_seq | usize / 4096 |
 //! | runtime | prefill_chunk / prefill_tail_merge | usize / 512、0 |
 //! | runtime | max_batch | usize / 1(合批上限;>1 需 gdn_slots≥它、单卡、无选择层) |
+//! | runtime | idle_compact / pressure_low_pct / pressure_high_pct | bool、usize、usize / false、12、25(空转默认不预搬;低触发/高目标) |
+//! | runtime | host_pressure_low_pct / host_pressure_high_pct / host_pressure_interval_ms | usize、usize、usize / 12、25、1000(宿主低触发/高目标/空转节流) |
 //! | runtime | test_device | 测试域(不入 toml) |
 //! | parallel | mode | ParallelMode 枚举 single\|tensor / single |
 //! | parallel | device | [String] 卡位(BDF / UUID / find-name;**禁 CUDA 序号**);空 = 自动挑空闲卡 |
@@ -342,6 +344,26 @@ fn default_max_batch() -> usize {
     1
 }
 
+fn default_pressure_low_pct() -> usize {
+    12
+}
+
+fn default_pressure_high_pct() -> usize {
+    25
+}
+
+fn default_host_pressure_low_pct() -> usize {
+    12
+}
+
+fn default_host_pressure_interval_ms() -> usize {
+    1000
+}
+
+fn default_host_pressure_high_pct() -> usize {
+    25
+}
+
 /// 进程装配面
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -402,6 +424,35 @@ pub struct RuntimeCfg {
     /// **准入:等待队列上限**(0 = 无界;超出 ⇒ 新来者 429 `no_slot`)
     #[serde(default)]
     pub max_queue: usize,
+    /// **空转整理策略**(缺省 `false` = 不预搬)。
+    ///
+    /// `false` = 空转只做池缓存回收，不主动把设备块搬到宿主/磁盘；
+    /// `true` = 池自由页低于 [`Self::pressure_low_pct`] 时按
+    /// [`Self::pressure_high_pct`] 做一次后台 compact。
+    #[serde(default)]
+    pub idle_compact: bool,
+    /// **压力低水位**(占主池页数百分比；缺省 12)。
+    /// 自由页低于它才算“池在压力下”；仅在 `idle_compact` 或
+    /// `PoolExhausted` 后的收缩路径消费。
+    #[serde(default = "default_pressure_low_pct")]
+    pub pressure_low_pct: usize,
+    /// **压力高水位/目标水位**(占主池页数百分比；缺省 25)。
+    /// 触发后把自由页补到该水位，形成“低触发 / 高目标”的滞回，
+    /// 避免每拍在阈值附近抖动。
+    #[serde(default = "default_pressure_high_pct")]
+    pub pressure_high_pct: usize,
+    /// **宿主压力低水位**(占宿主该腿总槽数百分比；缺省 12)。
+    /// 低于它才发 `HostPressure`；KV 宿主与快照宿主各自独立套用。
+    #[serde(default = "default_host_pressure_low_pct")]
+    pub host_pressure_low_pct: usize,
+    /// **宿主压力高水位/目标**(占该腿总槽百分比；缺省 25)。
+    /// 低水位触发后补到该值；策略层保证 high ≥ low。
+    #[serde(default = "default_host_pressure_high_pct")]
+    pub host_pressure_high_pct: usize,
+    /// **HostPressure 最小间隔**(毫秒；缺省 1000)。
+    /// 只节流空转 compact；`PoolExhausted` 的应急收缩不走这个间隔。
+    #[serde(default = "default_host_pressure_interval_ms")]
+    pub host_pressure_interval_ms: usize,
     /// **测试设备门控值**(不入 toml;测试入口自填):`OWL_TEST_DEVICE` 的 **BDF**
     /// (如 `41:00.0`)。`Some` = GPU 门已过。**CUDA 序号禁用**(序会漂)。
     #[serde(skip)]
@@ -1593,6 +1644,12 @@ impl Default for RuntimeCfg {
             min_gen_tokens: 256,
             reserve_pages: 0,
             max_queue: 0,
+            idle_compact: false,
+            pressure_low_pct: 12,
+            pressure_high_pct: 25,
+            host_pressure_low_pct: 12,
+            host_pressure_high_pct: 25,
+            host_pressure_interval_ms: 1000,
             test_device: None,
         }
     }
@@ -3362,6 +3419,33 @@ mod auto_pool_tests {
         assert_eq!((c.runtime.newcomer_min_tokens, c.runtime.min_gen_tokens), (2048, 128));
         assert_eq!(c.runtime.reserve_pages, 4);
         assert_eq!(c.runtime.queue_wait_ms, 15000);
+    }
+
+    /// 空转/压力水位：缺省不预搬，显式才开；百分比原样保留（策略层再钳位）
+    #[test]
+    fn idle_and_pressure_defaults_are_conservative() {
+        let c = OwlConfig::from_toml_str("").expect("空档");
+        assert!(!c.runtime.idle_compact, "缺省不做空转预搬");
+        assert_eq!(c.runtime.pressure_low_pct, 12);
+        assert_eq!(c.runtime.pressure_high_pct, 25);
+        assert_eq!(c.runtime.host_pressure_low_pct, 12);
+        assert_eq!(c.runtime.host_pressure_high_pct, 25);
+        assert_eq!(c.runtime.host_pressure_interval_ms, 1000);
+        let c = OwlConfig::from_toml_str(
+            "[runtime]\nidle_compact = true\npressure_low_pct = 20\npressure_high_pct = 40\n\
+             host_pressure_low_pct = 15\nhost_pressure_high_pct = 35\nhost_pressure_interval_ms = 500\n",
+        )
+        .expect("显式档");
+        assert!(c.runtime.idle_compact);
+        assert_eq!((c.runtime.pressure_low_pct, c.runtime.pressure_high_pct), (20, 40));
+        assert_eq!(
+            (
+                c.runtime.host_pressure_low_pct,
+                c.runtime.host_pressure_high_pct,
+                c.runtime.host_pressure_interval_ms
+            ),
+            (15, 35, 500)
+        );
     }
 
     /// 自动 gdn_slots 与 max_batch 的自洽门：并发 2 + 批 3 ⇒ 拒（批位吃不到）

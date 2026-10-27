@@ -10,7 +10,6 @@
 //! KV 由「kv_len 窗口 + 先写后打分」语义天然隔离);真并发随调度层铺开
 //! S3 拼批换入,submit/pump 形状不变。
 
-
 use owl_iface::contract::{DeviceClient, ModelError};
 use owl_models::tokenizer::Tokenizer;
 
@@ -20,8 +19,7 @@ use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::select::SelectRuntime;
 use crate::session::SessionBank;
 use crate::store_hook::{
-    Acquire, LoadRequest, Maintain, Release, ReleaseKind, StateAcquire, StoreHook,
-    StoreOutcome,
+    Acquire, LoadRequest, Maintain, Release, ReleaseKind, StateAcquire, StoreHook, StoreOutcome,
 };
 use crate::turn::{Turn, TurnEvent, TurnLedger, TurnSpec, TurnSpecState};
 
@@ -78,10 +76,9 @@ impl StepProbes {
             // ⚠️ `0` = 关(与 full.toml 的文档口径一致):`Option` 会把 toml 的
             // `kv_dump_at = 0` 解析成 **Some(0)** —— 那意味着"每个请求 pos 0
             // 各 d2h 一页",是纯税(2026-10-27 配置面 review 抓到的现役 bug)。
-            kv_dump_at: p
-                .kv_dump_at
-                .filter(|v| *v > 0)
-                .or_else(|| owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP").filter(|v| *v > 0)),
+            kv_dump_at: p.kv_dump_at.filter(|v| *v > 0).or_else(|| {
+                owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP").filter(|v| *v > 0)
+            }),
             live_diag: p.live_diag,
         }
     }
@@ -211,6 +208,127 @@ pub(crate) struct BootCtx {
 /// 一次最多腾这么多槽，避免"一口气搬空"把正在跑的 turn 的工作集也冲掉。
 const PRESSURE_MAX_SLOTS: usize = 64;
 
+/// 空转 compact 单次腾槽上限（显式 `idle_compact=true` 才走）。
+const IDLE_COMPACT_MAX_SLOTS: usize = 16;
+
+/// 单次 HostPressure 最多补多少宿主槽（防止低水位目标过大时一次搬空）。
+const HOST_PRESSURE_MAX_SLOTS: usize = 64;
+
+/// **压力信号快照**（P1-3）：把"池/宿主/磁盘/驱动"的余量一次读齐。
+///
+/// 读的时候全部是纯 host 账；不触发 I/O，也不改任何状态。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PressureSignals {
+    pub(crate) pool_free_pages: usize,
+    pub(crate) pool_total_pages: usize,
+    /// KV 宿主腿 + 状态腿的剩余槽（合计；用于判断是否还能下沉）。
+    pub(crate) host_free_slots: usize,
+    /// 分腿余量/开关：启用的腿低于低水位 ⇒ 需要 HostPressure。
+    pub(crate) host_kv_enabled: bool,
+    pub(crate) host_snap_enabled: bool,
+    pub(crate) host_kv_total_slots: usize,
+    pub(crate) host_snap_total_slots: usize,
+    pub(crate) host_kv_free_slots: usize,
+    pub(crate) host_snap_free_slots: usize,
+    /// KV 盘腿 + 状态盘腿的剩余槽。
+    pub(crate) disk_free_slots: usize,
+    pub(crate) disk_kv_free_slots: usize,
+    pub(crate) disk_snap_free_slots: usize,
+    /// 最紧一张卡的驱动 free（TP2 取两 rank 的 min）。
+    pub(crate) driver_free_bytes: u64,
+    pub(crate) reserve_bytes: u64,
+}
+
+impl PressureSignals {
+    /// 驱动余量已低于 boot 预留。
+    pub(crate) fn driver_below_reserve(&self) -> bool {
+        self.driver_free_bytes < self.reserve_bytes
+    }
+
+    /// 一行诊断（日志/报告；不参与判据）。
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "pool {}/{} 页 · host {} 槽 · disk {} 槽 · driver {:.0}MiB/reserve {:.0}MiB{}",
+            self.pool_free_pages,
+            self.pool_total_pages,
+            self.host_free_slots,
+            self.disk_free_slots,
+            self.driver_free_bytes as f64 / 1048576.0,
+            self.reserve_bytes as f64 / 1048576.0,
+            if self.driver_below_reserve() { " · 驱动低于预留" } else { "" }
+        )
+    }
+}
+
+/// **压力水位策略**：低水位触发、高水位目标（滞回）。
+///
+/// 百分比是主池页数的占比，不是驱动字节；固定池档的池墙才是主判据。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PressurePolicy {
+    low_pct: usize,
+    high_pct: usize,
+    host_low_pct: usize,
+    host_high_pct: usize,
+}
+
+impl Default for PressurePolicy {
+    fn default() -> Self {
+        Self {
+            low_pct: 12,
+            high_pct: 25,
+            host_low_pct: 12,
+            host_high_pct: 25,
+        }
+    }
+}
+
+impl PressurePolicy {
+    pub(crate) fn new(
+        low_pct: usize,
+        high_pct: usize,
+        host_low_pct: usize,
+        host_high_pct: usize,
+    ) -> Self {
+        let low = low_pct.clamp(1, 100);
+        let high = high_pct.clamp(low, 100);
+        let host_low = host_low_pct.clamp(1, 100);
+        let host_high = host_high_pct.clamp(host_low, 100);
+        Self {
+            low_pct: low,
+            high_pct: high,
+            host_low_pct: host_low,
+            host_high_pct: host_high,
+        }
+    }
+
+    /// 宿主腿低水位（按该腿总槽数）。
+    pub(crate) fn host_low_slots(&self, total: usize) -> usize {
+        Self::slots_at(total, self.host_low_pct)
+    }
+
+    /// 宿主腿目标水位（触发后补到该值；≥ 低水位）。
+    pub(crate) fn host_high_slots(&self, total: usize) -> usize {
+        Self::slots_at(total, self.host_high_pct).max(self.host_low_slots(total))
+    }
+
+    fn slots_at(total: usize, pct: usize) -> usize {
+        if total == 0 {
+            return 0;
+        }
+        (total.saturating_mul(pct) / 100).clamp(1, total)
+    }
+
+    /// 触发当前压力所需的目标。`free >= low` 返回 0（不搬）。
+    pub(crate) fn target_slots(&self, total: usize, free: usize, cap: usize) -> usize {
+        let low = Self::slots_at(total, self.low_pct);
+        if free >= low {
+            return 0;
+        }
+        let high = Self::slots_at(total, self.high_pct).max(low);
+        high.saturating_sub(free).min(cap)
+    }
+}
+
 /// 生成相位 spec 档位（只用于 `generation_target_for` 的纯算式）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerationKind {
@@ -289,11 +407,7 @@ pub fn budget_clamp(
 ///
 /// 响亮拒：两半长度不等 / 不是半表宽的整倍（形状不符就拼接了
 /// = 静默错词，比拒启难查一百倍）。
-pub(crate) fn concat_head_rows(
-    a: &[f32],
-    b: &[f32],
-    half: usize,
-) -> crate::Result<Vec<f32>> {
+pub(crate) fn concat_head_rows(a: &[f32], b: &[f32], half: usize) -> crate::Result<Vec<f32>> {
     if half == 0 || a.len() != b.len() || !a.len().is_multiple_of(half) {
         return Err(owl_iface::contract::ModelError::EngineInvariant {
             what: format!(
@@ -330,7 +444,12 @@ pub(crate) fn merge_topk_two_halves(
     half: usize,
 ) -> crate::Result<(Vec<f32>, Vec<u32>)> {
     let want = rows * k;
-    if k == 0 || vals_a.len() != want || vals_b.len() != want || ids_a.len() != want || ids_b.len() != want {
+    if k == 0
+        || vals_a.len() != want
+        || vals_b.len() != want
+        || ids_a.len() != want
+        || ids_b.len() != want
+    {
         return Err(owl_iface::contract::ModelError::EngineInvariant {
             what: format!(
                 "候选合并：形状不符（rows {rows} k {k} / a {}/{} b {}/{}）",
@@ -436,9 +555,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **候选采样读面**(2026-10-26):裸 decode 的 `cand` 两半表 → 每行候选并集
     /// (全局索引升序)。`None` = 图没有候选槽(未切档 / greedy 档 flavor)⇒
     /// 调用方回退 `read_full_logits`。
-    pub(crate) async fn read_session_cands(
-        &mut self,
-    ) -> Result<Option<Vec<Vec<(f32, u32)>>>> {
+    pub(crate) async fn read_session_cands(&mut self) -> Result<Option<Vec<Vec<(f32, u32)>>>> {
         if !self.dev.graphs.session.has_output("cand") {
             return Ok(None);
         }
@@ -473,7 +590,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **诊断出口**：读 peer（rank1）会话图输出（TP 对拍；**单卡 = None**）。
     /// 用途:G8 的"两 rank 同值"实证(AR 后两 rank 应**逐位相同**)。
     pub async fn read_peer_output_f32(&mut self, name: &str) -> Result<Option<Vec<f32>>> {
-        let Some(p) = self.peer.as_mut() else { return Ok(None) };
+        let Some(p) = self.peer.as_mut() else {
+            return Ok(None);
+        };
         if !p.graphs.session.has_output(name) {
             return Ok(None);
         }
@@ -490,13 +609,20 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 不碰池/图。`chat_wrap = true` = 先套家族单轮包装(与裸文本提交同一律,
     /// 见 [`owl_models::tokenizer::Tokenizer::chat_wrap`]);否则纯文本编码。
     /// 编码失败**显式上抛**(不用会吞错误的 `encode` —— 空序列 ≡ “文本是空的”)。
-    pub fn tokenize(&self, text: &str, chat_wrap: bool) -> std::result::Result<TokenizeReply, String> {
+    pub fn tokenize(
+        &self,
+        text: &str,
+        chat_wrap: bool,
+    ) -> std::result::Result<TokenizeReply, String> {
         let tokens = if chat_wrap {
             self.boot.tok.try_encode(&self.boot.tok.chat_wrap(text))?
         } else {
             self.boot.tok.try_encode(text)?
         };
-        Ok(TokenizeReply { tokens, max_seq_tokens: self.boot.cfg.max_seq_tokens })
+        Ok(TokenizeReply {
+            tokens,
+            max_seq_tokens: self.boot.cfg.max_seq_tokens,
+        })
     }
 
     /// 提交 turn(临时会话:每 turn 独立,终了即焚;行为同 M0.5)。
@@ -544,7 +670,10 @@ impl<D: DeviceClient> RunningEngine<D> {
             session,
             prompt,
             max_new,
-            crate::turn::TurnOpts { ignore_eos, ..Default::default() },
+            crate::turn::TurnOpts {
+                ignore_eos,
+                ..Default::default()
+            },
         )
     }
 
@@ -565,7 +694,10 @@ impl<D: DeviceClient> RunningEngine<D> {
     ) -> Result<(Vec<crate::img_evict::Pos3>, bool)> {
         let Some(vlm) = self.dev.boot.vlm.as_ref() else {
             // 纯文本档:位置 = 标量下标(逐字节旧行为)。
-            return Ok(((0..prompt_ids.len()).map(|i| [i as i32; 3]).collect(), false));
+            return Ok((
+                (0..prompt_ids.len()).map(|i| [i as i32; 3]).collect(),
+                false,
+            ));
         };
         let image_token = vlm.cfg().image_token;
         let mrope = &vlm.cfg().mrope;
@@ -598,13 +730,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                 }
             }
         }
-        let (pos, _) = crate::img_evict::compact_positions(
-            prompt_ids,
-            spans,
-            image_token,
-            mrope,
-        )
-        .map_err(ModelError::Msg)?;
+        let (pos, _) = crate::img_evict::compact_positions(prompt_ids, spans, image_token, mrope)
+            .map_err(ModelError::Msg)?;
         Ok((pos, false))
     }
 
@@ -692,8 +819,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             // **pad 词** = [`Self::image_pad_token`] 单源(恰 1 token、模型最不敏感者)。
             let pad = self.image_pad_token().ok_or_else(|| {
                 ModelError::Msg(
-                    "image_pad_law: 找不到\"恰 1 token\"的 pad 词(页对齐 pad 律要求)"
-                        .into(),
+                    "image_pad_law: 找不到\"恰 1 token\"的 pad 词(页对齐 pad 律要求)".into(),
                 )
             })?;
             (one("<|vision_start|>"), one("<|vision_end|>"), pad)
@@ -707,13 +833,10 @@ impl<D: DeviceClient> RunningEngine<D> {
             if let Some(sid) = session {
                 if let Some(s) = self.bank.sessions.get(sid) {
                     if !s.tokens.is_empty() && !s.img_spans.is_empty() {
-                        let old_text = crate::img_evict::unpad(&s.tokens, &s.pads)
-                            .map_err(ModelError::Msg)?;
-                        let detect = crate::img_evict::detect_text_delete(
-                            &old_text,
-                            &input,
-                            &s.img_spans,
-                        );
+                        let old_text =
+                            crate::img_evict::unpad(&s.tokens, &s.pads).map_err(ModelError::Msg)?;
+                        let detect =
+                            crate::img_evict::detect_text_delete(&old_text, &input, &s.img_spans);
                         owl_shared::log_debug!(
                             "img-evict",
                             "detect: session={sid:#x} old={} raw={} spans={:?} ⇒ {}",
@@ -724,7 +847,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 .map(|x| (x.start, x.end, x.text_start, x.text_end, x.evict))
                                 .collect::<Vec<_>>(),
                             detect
-                                .map(|h| format!("hit text=[{},{})=padded[{},{})", h.text_a, h.text_b, h.a, h.b))
+                                .map(|h| format!(
+                                    "hit text=[{},{})=padded[{},{})",
+                                    h.text_a, h.text_b, h.a, h.b
+                                ))
                                 .unwrap_or_else(|| "none".to_string())
                         );
                         if detect.is_none() {
@@ -755,8 +881,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 } else {
                                     0
                                 };
-                                let old_after: Vec<u32> =
-                                    old_text.get(tb..tb.saturating_add(12)).unwrap_or(&[]).to_vec();
+                                let old_after: Vec<u32> = old_text
+                                    .get(tb..tb.saturating_add(12))
+                                    .unwrap_or(&[])
+                                    .to_vec();
                                 let raw_after: Vec<u32> =
                                     input.get(ta..ta.saturating_add(12)).unwrap_or(&[]).to_vec();
                                 owl_shared::log_debug!(
@@ -790,14 +918,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 .zip(&input)
                                 .take_while(|(a, b)| a == b)
                                 .count();
-                            let cuts_image = s.img_spans.iter().any(|sp| {
-                                sp.text_start < common && common < sp.text_end
-                            });
+                            let cuts_image = s
+                                .img_spans
+                                .iter()
+                                .any(|sp| sp.text_start < common && common < sp.text_end);
                             if common > 0 && input.len() > common && !cuts_image {
                                 let p = crate::img_evict::padded_prefix_for_raw(
-                                    &s.tokens,
-                                    &s.pads,
-                                    common,
+                                    &s.tokens, &s.pads, common,
                                 )
                                 .map_err(ModelError::Msg)?;
                                 let mut merged = s.tokens[..p].to_vec();
@@ -816,12 +943,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 }
                                 if runs == marks.len() {
                                     input = merged;
-                                    inherited = s
-                                        .pads
-                                        .iter()
-                                        .copied()
-                                        .filter(|(_, hi)| *hi <= p)
-                                        .collect();
+                                    inherited =
+                                        s.pads.iter().copied().filter(|(_, hi)| *hi <= p).collect();
                                     owl_shared::log_debug!(
                                         "img-evict",
                                         "沿用 padded 前缀:session={sid:#x} common={common} padded_cut={p} old={} new={} pads={}",
@@ -848,10 +971,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 hit.b - hit.a,
                                 (hit.b - hit.a) / page
                             );
-                            let rebuilt = crate::img_evict::rebuild_after_delete(
-                                &s.tokens, &input, &hit,
-                            )
-                            .map_err(ModelError::Msg)?;
+                            let rebuilt =
+                                crate::img_evict::rebuild_after_delete(&s.tokens, &input, &hit)
+                                    .map_err(ModelError::Msg)?;
                             // 只继承**删点之前**的 pad 块(删点之后由本轮的 pad 律重算)
                             inherited = s
                                 .pads
@@ -920,7 +1042,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         let max_queue = self.boot.cfg.knobs.max_queue;
         if max_queue > 0 {
             let in_flight = self.turns.active.len() + self.turns.queue.len();
-            let cap = self.boot.cfg.knobs.max_batch.max(1).saturating_add(max_queue);
+            let cap = self
+                .boot
+                .cfg
+                .knobs
+                .max_batch
+                .max(1)
+                .saturating_add(max_queue);
             if in_flight >= cap {
                 // 退避建议（P3-c）：EWMA × 需要的波数（含自己）
                 let eta = self
@@ -1051,8 +1179,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         // (增量段写 `[cached, prompt)` 行,生成续写其后;失配回退全量时
         // prompt 为准,同一上界)
         let cached_hit = {
-            let probe = session
-                .and_then(|id| self.bank.sessions.get(id).map(|s| (id, s.cached_len, s.guard(&prompt_ids))));
+            let probe = session.and_then(|id| {
+                self.bank
+                    .sessions
+                    .get(id)
+                    .map(|s| (id, s.cached_len, s.guard(&prompt_ids)))
+            });
             match probe {
                 Some((_, cached, true)) => cached,
                 // **守卫失配取证**(`[probes] debug`;§4.3):报首个分叉的**位置 +
@@ -1158,7 +1290,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             id,
             session_id,
             ephemeral,
-            spec: TurnSpec { prompt, max_new, ignore_eos: opts.ignore_eos },
+            spec: TurnSpec {
+                prompt,
+                max_new,
+                ignore_eos: opts.ignore_eos,
+            },
             prompt_ids,
             msg_snaps,
             img_spans,
@@ -1206,7 +1342,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             .iter()
             .find(|t| t.id == turn)
             .map(|t| t.spec.max_new)
-            .or_else(|| self.turns.active.iter().find(|a| a.id == turn).map(|a| a.max_new))
+            .or_else(|| {
+                self.turns
+                    .active
+                    .iter()
+                    .find(|a| a.id == turn)
+                    .map(|a| a.max_new)
+            })
     }
 
     /// 拒绝分桶快照（会话, 码, 次数；按次数降序，最多 `limit` 条）
@@ -1284,7 +1426,11 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///
     /// 两 rank 一起设(上下文各引擎一份、账本共用):只设 rank0 会让 rank1 的
     /// 分配归错 owner —— 而这正是"谁占着多少"要回答的问题。
-    pub(crate) fn set_dev_ctx(&mut self, owner: owl_iface::handle::Owner, class: owl_iface::handle::AssetClass) {
+    pub(crate) fn set_dev_ctx(
+        &mut self,
+        owner: owl_iface::handle::Owner,
+        class: owl_iface::handle::AssetClass,
+    ) {
         for dev in std::iter::once(&mut self.dev).chain(self.peer.as_mut()) {
             let f = dev.graphs.dev_ctx_face_mut();
             f.set_owner(owner);
@@ -1301,15 +1447,10 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// - `Acquire::Load`（前缀回灌）→ `store_load`；
     /// - `Acquire::State`（选槽/就位）→ `store_state_slot` / `store_state_resident`；
     /// - `Release::{TurnEnd,Abort}` → `store_release`（H3/H6/N4）；
-    /// - `Maintain::{Idle,Pressure}` → `store_maintain`。
+    /// - `Maintain::{Idle,Pressure,HostPressure}` → `store_maintain`。
     pub(crate) async fn store_hook(&mut self, hook: StoreHook) -> Result<StoreOutcome> {
         owl_shared::metrics::with_metrics_store(|m| {
-            m.counter_add(
-                &format!("store.hook.{}", hook.label()),
-                1,
-                file!(),
-                line!(),
-            );
+            m.counter_add(&format!("store.hook.{}", hook.label()), 1, file!(), line!());
         });
         match hook {
             StoreHook::Acquire(a) => self.store_acquire(a).await,
@@ -1320,7 +1461,7 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     async fn store_acquire(&mut self, acquire: Acquire) -> Result<StoreOutcome> {
         match acquire {
-            Acquire::Capacity(need) => {
+            Acquire::Capacity { need, reserve } => {
                 match need.why {
                     owl_store::NeedWhy::Admit | owl_store::NeedWhy::Grow => {}
                     other => {
@@ -1328,18 +1469,37 @@ impl<D: DeviceClient> RunningEngine<D> {
                             what: format!(
                                 "store_hook: Acquire::Capacity 只接 Admit/Grow，收到 {other:?}"
                             ),
-                        })
+                        });
                     }
                 }
-                let applied = self.pool_housekeeping(need).await?;
-                Ok(StoreOutcome { applied, ..StoreOutcome::default() })
+                if reserve.is_some() && need.why != owl_store::NeedWhy::Admit {
+                    return Err(ModelError::EngineInvariant {
+                        what: "store_hook: 只有 Admit 能新开 Grant".into(),
+                    });
+                }
+                let applied = self.pool_housekeeping(need, &[], None).await?;
+                let grant = match reserve {
+                    Some(r) => Some(self.bank.rel.reserve_capacity(
+                        r.turn,
+                        r.slots,
+                        r.alloc_slots,
+                        r.kind,
+                    )?),
+                    None => None,
+                };
+                Ok(StoreOutcome {
+                    applied,
+                    grant,
+                    ..StoreOutcome::default()
+                })
             }
             Acquire::Load(req) => self.store_load(req).await,
-            Acquire::State(StateAcquire::Resident { key }) => {
-                self.store_state_resident(key).await
-            }
+            Acquire::State(StateAcquire::Resident { key }) => self.store_state_resident(key).await,
             Acquire::State(StateAcquire::Slot { key }) => {
-                let slot = self.store_state_slot(key).await?;
+                // capture 路径：本 turn 的旧边界会被新边界替代，允许它成为 victim；
+                // 其它活跃 turn 的最新边界仍受保护。
+                let skip_turn = self.turns.active().ok().map(|a| a.id);
+                let slot = self.store_state_slot(key, &[], skip_turn).await?;
                 Ok(StoreOutcome {
                     state_slot: Some(slot),
                     ..StoreOutcome::default()
@@ -1350,38 +1510,29 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// **状态腿就位**（原 H7 三段直呼）：Gpu 直接命中；Host/Disk 先找槽再回灌。
     /// 返回的槽号经 `StoreOutcome.state_slot` 交给调用方。
-    async fn store_state_resident(
-        &mut self,
-        key: owl_store::SnapKey,
-    ) -> Result<StoreOutcome> {
+    async fn store_state_resident(&mut self, key: owl_store::SnapKey) -> Result<StoreOutcome> {
         let slot = match self.bank.rel.state.locate(key) {
             Some(owl_store::Tier::Gpu) => {
                 let slot = self.dev.pool.snap_slot_of(key).ok_or_else(|| {
-                    ModelError::Msg(format!(
-                        "快照 {key:?} 账在设备层但池里找不到槽(账目不平)"
-                    ))
+                    ModelError::Msg(format!("快照 {key:?} 账在设备层但池里找不到槽(账目不平)"))
                 })?;
                 // 使用即触达(store 出序的真源)
                 self.bank.rel.state.touch(key);
                 slot
             }
             Some(owl_store::Tier::Host) => {
-                let slot = self.store_state_slot(key).await?;
+                let slot = self.store_state_slot(key, &[key], None).await?;
                 self.snap_onload(key, slot).await?;
                 slot
             }
             Some(owl_store::Tier::Disk) => {
                 // **S6**:盘 → 宿主 → 设备(两跳);读回后层账回 Host,再走 Host 分支
                 self.fill_snap_from_disk(key).await?;
-                let slot = self.store_state_slot(key).await?;
+                let slot = self.store_state_slot(key, &[key], None).await?;
                 self.snap_onload(key, slot).await?;
                 slot
             }
-            None => {
-                return Err(ModelError::Msg(format!(
-                    "快照 {key:?} 不在账(已被逐出)"
-                )))
-            }
+            None => return Err(ModelError::Msg(format!("快照 {key:?} 不在账(已被逐出)"))),
         };
         Ok(StoreOutcome {
             state_slot: Some(slot),
@@ -1389,66 +1540,86 @@ impl<D: DeviceClient> RunningEngine<D> {
         })
     }
 
-    /// **快照槽选择**（原 `spec::snap_ensure_slot`）：池满时按 store 顺序选最冷
-    /// 受害者；能沉宿主就先沉，沉不下再丢。
-    async fn store_state_slot(&mut self, key: owl_store::SnapKey) -> Result<u32> {
+    /// **快照槽选择**（原 `spec::snap_ensure_slot`）：池满时先问 store 的
+    /// 同一张容量票（`plan_capacity`），把“谁走、去宿主还是磁盘”的判据
+    /// 收回收敛点；池只做 key→槽物理映射。
+    ///
+    /// 为什么要循环：设备快照不能直连磁盘（层级律要求 GPU → Host → Disk）。
+    /// 宿主满时第一张票可能只把**宿主里的冷快照**挪到盘（腾宿主位），
+    /// 设备槽要下一拍才空出来；因此最多重试 3 次（搬盘 → 设备下沉 → 取槽）。
+    async fn store_state_slot(
+        &mut self,
+        key: owl_store::SnapKey,
+        extra_snaps: &[owl_store::SnapKey],
+        skip_turn: Option<u64>,
+    ) -> Result<u32> {
         use crate::state::SnapSlotPick;
-        // **判据 = store(唯一产地;§30.6-②)**:出序(事实档 + EvictPolicy)从
-        // `Rel::snap_victim_order` 拿;池只做 key→槽映射。
-        let order = self.bank.rel.snap_victim_order(&[]);
-        let pick = self.dev.pool.snap_pick_slot(key, &order).ok_or_else(|| {
-            ModelError::Msg(
-                "GDN 快照池为空(snap_max = 0):调用方应跳过 capture".into(),
-            )
-        })?;
-        match pick {
-            SnapSlotPick::Hit(slot) | SnapSlotPick::Free(slot) => Ok(slot),
-            SnapSlotPick::Victim(slot, victim) => {
-                // **生成段(Transient)= 逐出即丢**:store 的不变量本就拒它下沉
-                // ⇒ 试了只会换来一条“失败”WARN(把设计行为报成故障)。
-                let transient = matches!(
-                    self.bank.rel.state.snap_durability(victim),
-                    Some(owl_store::SnapDurability::Transient)
-                );
-                if transient {
-                    owl_shared::log_debug!(
-                        "store",
-                        "逐出生成段快照 {victim:?}(逐出即丢,不下沉)"
-                    );
-                } else {
-                    match self.snap_offload(victim, slot).await {
-                        Ok(()) => {
-                            self.dev.pool.snap_clear_slot(slot);
-                            if let Some(pr) = self.peer.as_mut() {
-                                pr.pool.snap_clear_slot(slot);
-                            }
-                            return Ok(slot);
-                        }
-                        Err(e) => {
-                            // 收编为结构化 WARN(2026-10-18 T1;原为 `DBG-SNAP` 直接打印)
-                            owl_shared::log_warn!("store", "快照下沉失败: {e}");
+        // **P1-2**：出序与容量票必须看到同一份保护面。
+        let protect = self.snap_guard(extra_snaps, skip_turn);
+        for _ in 0..3 {
+            // **判据 = store(唯一产地;§30.6-②)**:出序(事实档 + EvictPolicy)从
+            // `Rel::snap_victim_order` 拿;池只做 key→槽映射。
+            let order = self.bank.rel.snap_victim_order(&protect);
+            let pick = self.dev.pool.snap_pick_slot(key, &order).ok_or_else(|| {
+                ModelError::Msg("GDN 快照池为空(snap_max = 0):调用方应跳过 capture".into())
+            })?;
+            match pick {
+                SnapSlotPick::Hit(slot) | SnapSlotPick::Free(slot) => return Ok(slot),
+                SnapSlotPick::Victim(slot, victim) => {
+                    // 池内 LRU 兜底可能越过 store 序；保护面是最后一道闸。
+                    if protect.contains(&victim) {
+                        return Err(ModelError::Msg(format!(
+                            "快照槽选择把受保护的 {victim:?} 当 victim（池序回退越过保护面）"
+                        )));
+                    }
+                    // **P0-2**:不再走“只搬 host、失败就 drop”的旁路；
+                    // 用状态腿的同一张票（snap_bytes = 一条快照），
+                    // host 满时会出 Disk 票，盘层因此可达。
+                    let snap_bytes = self.bank.rel.snap_bytes();
+                    if snap_bytes > 0 {
+                        let applied = self
+                            .pool_housekeeping(
+                                owl_store::Need {
+                                    slots: 0,
+                                    snap_bytes,
+                                    host_slots: 0,
+                                    why: owl_store::NeedWhy::Grow,
+                                },
+                                extra_snaps,
+                                skip_turn,
+                            )
+                            .await?;
+                        let progress =
+                            applied.snap_offloaded + applied.snap_spilled + applied.snap_dropped;
+                        if progress > 0 {
+                            continue;
                         }
                     }
+
+                    // 最后兜底（store 判据无票可出 / 宿主+盘都关）：
+                    // 丢最冷一条，保证本次 capture 能拿到槽；不静默。
+                    owl_shared::log_debug!(
+                        "store",
+                        "快照槽满且 store 无票可出 ⇒ 丢弃最冷快照 {victim:?}(该边界将不可复用)"
+                    );
+                    self.bank.rel.drop_snap_host(victim)?;
+                    if let Err(e) = self.bank.rel.state.drop_snap(victim) {
+                        owl_shared::log_debug!("store", "快照 {victim:?} 出账: {e}");
+                    }
+                    owl_shared::metrics::with_metrics_store(|m| {
+                        m.counter_add("store.snap.drop", 1, file!(), line!());
+                    });
+                    self.dev.pool.snap_clear_slot(slot);
+                    if let Some(pr) = self.peer.as_mut() {
+                        pr.pool.snap_clear_slot(slot);
+                    }
+                    return Ok(slot);
                 }
-                // 沉不下 ⇒ 丢(内容整体消失;宿主副本同步丢)
-                owl_shared::log_debug!(
-                    "store",
-                    "快照槽满且宿主不可用 ⇒ 丢弃最冷快照 {victim:?}(该边界将不可复用)"
-                );
-                self.bank.rel.drop_snap_host(victim)?;
-                if let Err(e) = self.bank.rel.state.drop_snap(victim) {
-                    owl_shared::log_debug!("store", "快照 {victim:?} 出账: {e}");
-                }
-                owl_shared::metrics::with_metrics_store(|m| {
-                    m.counter_add("store.snap.drop", 1, file!(), line!());
-                });
-                self.dev.pool.snap_clear_slot(slot);
-                if let Some(pr) = self.peer.as_mut() {
-                    pr.pool.snap_clear_slot(slot);
-                }
-                Ok(slot)
             }
         }
+        Err(ModelError::Msg(
+            "快照槽选择重试 3 次仍无空位（store 票未兑现；检查 host/disk 预算与快照账）".into(),
+        ))
     }
 
     /// **前缀命中回灌**（原 H4 双旁路）：槽不足先问 store，再一条命令搬 N 块，
@@ -1467,10 +1638,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 设备槽先腾够：`Need.slots` 是需求，`plan_capacity` 会按当前 free 折算缺口。
         if self.bank.rel.leg.slots_free() < need_slots {
             applied = self
-                .pool_housekeeping(owl_store::Need::kv(
-                    need_slots,
-                    owl_store::NeedWhy::Grow,
-                ))
+                .pool_housekeeping(
+                    owl_store::Need::kv(need_slots, owl_store::NeedWhy::Grow),
+                    &[],
+                    None,
+                )
                 .await?;
         }
         let (cs, new_slots, pieces, table) = {
@@ -1490,9 +1662,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         let slots = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &new_slots, table)?;
         let loaded_blocks = cs.len();
         let moved_bytes = loaded_blocks * self.dev.pool.block_bytes();
-        let s = self.bank.sessions.get_mut(req.session).ok_or_else(|| {
-            ModelError::Msg(format!("回灌:会话 {} 不在账", req.session))
-        })?;
+        let s = self
+            .bank
+            .sessions
+            .get_mut(req.session)
+            .ok_or_else(|| ModelError::Msg(format!("回灌:会话 {} 不在账", req.session)))?;
         for ((idx, _), slot) in req.blocks.iter().zip(&slots) {
             if *idx >= s.block_table.len() {
                 return Err(ModelError::Msg(format!(
@@ -1519,6 +1693,16 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// GDN 行归还 + 归属下行 + N4 清点/force release/trim。
     async fn store_release(&mut self, release: Release) -> Result<StoreOutcome> {
         let turn = release.turn;
+        // **P0-4：Release 归还本 turn 的全部 Grant**（幂等；准入收口也会再调一次）。
+        let released = self.bank.rel.release_turn_grants(turn);
+        if !released.is_empty() {
+            owl_shared::log_debug!(
+                "store",
+                "Release 归还 Grant：turn {turn} {} 张 / {} 槽",
+                released.len(),
+                released.iter().map(|g| g.slots).sum::<usize>()
+            );
+        }
         // ── H3：正常 turn 收尾才发布链；abort 的半途链不进缓存 ----------
         if release.kind == ReleaseKind::TurnEnd {
             if self.dev.pool.geom.paged {
@@ -1558,10 +1742,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 let n_pending = self.sel.pending_index_len();
                 let pending = self.sel.take_index_pending();
                 if !pending.is_empty() {
-                    owl_shared::log_debug!(
-                        "idx",
-                        "turn 收口排空索引暂存:{n_pending} 块"
-                    );
+                    owl_shared::log_debug!("idx", "turn 收口排空索引暂存:{n_pending} 块");
                     self.collect_index_for_blocks(&pending).await?;
                 }
             }
@@ -1585,11 +1766,7 @@ impl<D: DeviceClient> RunningEngine<D> {
 
         // ── GDN 行归还（行 = turn 域资源；失败只 WARN） --------------------
         if let Err(e) = self.bank.rel.state.return_row(release.gdn_slot, None) {
-            owl_shared::log_warn!(
-                "session",
-                "turn {} 还 GDN 行失败: {e}",
-                release.turn
-            );
+            owl_shared::log_warn!("session", "turn {} 还 GDN 行失败: {e}", release.turn);
         }
 
         // ── 归属下行（会话仍活 ⇒ Session(s)，焚毁 ⇒ System） ---------------
@@ -1625,10 +1802,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 ),
                 // 收尾路径的可失败调用：如实 WARN（不静默；也不升级为 turn 失败 ——
                 // 显存多占一点不影响正确性，下一 turn 的压力旁路还会再试）
-                Err(e) => owl_shared::log_warn!(
-                    "store",
-                    "池缓存回收失败(turn {turn} rank{rank}): {e}"
-                ),
+                Err(e) => {
+                    owl_shared::log_warn!("store", "池缓存回收失败(turn {turn} rank{rank}): {e}")
+                }
             }
         }
         Ok(StoreOutcome::default())
@@ -1648,28 +1824,36 @@ impl<D: DeviceClient> RunningEngine<D> {
                 owl_store::Need {
                     slots,
                     snap_bytes,
+                    host_slots: 0,
                     why: owl_store::NeedWhy::Idle,
                 }
             }
             Maintain::Pressure { slots, snap_bytes } => owl_store::Need {
                 slots,
                 snap_bytes,
+                host_slots: 0,
                 why: owl_store::NeedWhy::Pressure,
             },
+            Maintain::HostPressure { slots } => owl_store::Need::host(slots),
         };
-        let applied = self.pool_housekeeping(need).await?;
-        Ok(StoreOutcome { applied, ..StoreOutcome::default() })
+        let applied = self.pool_housekeeping(need, &[], None).await?;
+        Ok(StoreOutcome {
+            applied,
+            ..StoreOutcome::default()
+        })
     }
 
     /// **压力缓解口**（actor 在 `PoolExhausted` 后调）。
     ///
     /// 次序：**先还缓存**（复用池排空 + 池缓存 trim —— 真还驱动），
+    /// **先腾宿主**（`Maintain::HostPressure`：只出 Disk 票），
     /// **再做池内收缩**（`Maintain::Pressure`：KV 槽 + 状态腿目标）。
-    /// 返回 `(池排空块数, 目标腾出槽数)`；失败响亮上抛（调用方只记日志继续）。
+    /// 返回 `(池排空块数, 目标腾出 KV 槽数, 目标腾出宿主槽数)`；失败响亮上抛
+    /// （调用方只记日志继续）。
     ///
     /// 为什么不再用“驱动 free < 1GiB”触发：固定池把块沉宿主**不增加驱动 free**，
     /// 却会制造每拍 churn。`pump` 不再跑 N6；只有真正 `PoolExhausted` 才收缩。
-    pub async fn relieve_pressure(&mut self) -> Result<(usize, usize)> {
+    pub async fn relieve_pressure(&mut self) -> Result<(usize, usize, usize)> {
         let freed = {
             let f = self.dev.graphs.dev_ctx_face_mut();
             f.drain_temp_pool().await
@@ -1687,10 +1871,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         for (rank, r) in trimmed {
             match r {
                 Ok(n) => trim_bytes += n as u64,
-                Err(e) => owl_shared::log_warn!(
-                    "store",
-                    "压力缓解:池缓存回收失败(rank{rank}): {e}"
-                ),
+                Err(e) => {
+                    owl_shared::log_warn!("store", "压力缓解:池缓存回收失败(rank{rank}): {e}")
+                }
             }
         }
         if trim_bytes > 0 {
@@ -1700,51 +1883,150 @@ impl<D: DeviceClient> RunningEngine<D> {
                 trim_bytes as f64 / 1048576.0
             );
         }
-        let (slots, snap_bytes) = self.pressure_need();
+        let signals = self.pressure_signals();
+        if signals.driver_below_reserve() {
+            owl_shared::log_warn!(
+                "store",
+                "压力信号:驱动 free 已低于预留（{}）；先排空/回收，池收缩仍按池水位",
+                signals.summary()
+            );
+        }
+        let (slots, snap_bytes, host_slots) = self.pressure_need(&signals);
+        if host_slots > 0 {
+            // **先腾宿主**：宿主腿满时若先压池，轮一会把设备块继续往宿主塞。
+            owl_shared::log_warn!(
+                "store",
+                "压力缓解目标:宿主 {host_slots} 槽 → 磁盘（跳过 GPU→Host）; {}",
+                signals.summary()
+            );
+            self.store_hook(StoreHook::host_pressure(host_slots)).await?;
+            self.hk.mark_host_pressure();
+        }
         if slots > 0 || snap_bytes > 0 {
             owl_shared::log_warn!(
                 "store",
-                "压力缓解目标:KV {slots} 槽 / 状态腿 {:.1} MiB（按池自由槽，不再看驱动 free）",
-                snap_bytes as f64 / 1048576.0
+                "压力缓解目标:KV {slots} 槽 / 状态腿 {:.1} MiB（低水位触发 → 高水位目标）; {}",
+                snap_bytes as f64 / 1048576.0,
+                signals.summary()
             );
             self.store_hook(StoreHook::pressure_with_snap(slots, snap_bytes))
                 .await?;
         }
-        Ok((freed, slots))
+        Ok((freed, slots, host_slots))
+    }
+
+    /// **压力信号快照**（P1-3；纯 host 账，零 I/O）。
+    fn pressure_signals(&self) -> PressureSignals {
+        let leg = &self.bank.rel.leg;
+        let mut driver_free = self.dev.graphs.dev_ctx_face().vram_snapshot().free;
+        if let Some(p) = self.peer.as_ref() {
+            driver_free = driver_free.min(p.graphs.dev_ctx_face().vram_snapshot().free);
+        }
+        PressureSignals {
+            pool_free_pages: leg.slots_free(),
+            pool_total_pages: leg.slots_total(),
+            host_free_slots: leg.host_free_slots() + self.bank.rel.snap_host_free_slots(),
+            host_kv_enabled: leg.host_enabled(),
+            host_snap_enabled: self.bank.rel.snap_host_budget() > 0,
+            host_kv_total_slots: leg.host_total_slots(),
+            host_snap_total_slots: self.bank.rel.snap_host_total_slots(),
+            host_kv_free_slots: leg.host_free_slots(),
+            host_snap_free_slots: self.bank.rel.snap_host_free_slots(),
+            disk_free_slots: self
+                .bank
+                .rel
+                .disk
+                .as_ref()
+                .map(|d| d.free_slots())
+                .unwrap_or(0)
+                + self
+                    .bank
+                    .rel
+                    .snap_disk
+                    .as_ref()
+                    .map(|d| d.free_slots())
+                    .unwrap_or(0),
+            disk_kv_free_slots: self
+                .bank
+                .rel
+                .disk
+                .as_ref()
+                .map(|d| d.free_slots())
+                .unwrap_or(0),
+            disk_snap_free_slots: self
+                .bank
+                .rel
+                .snap_disk
+                .as_ref()
+                .map(|d| d.free_slots())
+                .unwrap_or(0),
+            driver_free_bytes: driver_free,
+            reserve_bytes: self.boot.cfg.knobs.vram_reserve_mb << 20,
+        }
+    }
+
+    fn pressure_policy(&self) -> PressurePolicy {
+        PressurePolicy::new(
+            self.boot.cfg.knobs.pressure_low_pct,
+            self.boot.cfg.knobs.pressure_high_pct,
+            self.boot.cfg.knobs.host_pressure_low_pct,
+            self.boot.cfg.knobs.host_pressure_high_pct,
+        )
     }
 
     /// **紧急池压力目标**（`PoolExhausted` 后；不是每拍 N6）。
     ///
-    /// 判据 = **池自由槽**低于总量的 1/8（夹在 `[1, 64]`），不再看驱动 free：
-    /// 固定池下沉不增驱动 free，但会真腾池槽；状态腿在宿主有位时带一条快照。
-    fn pressure_need(&self) -> (usize, usize) {
-        let total = self.bank.rel.leg.slots_total();
-        if total == 0 {
-            return (0, 0);
-        }
-        let target = (total / 8).clamp(1, PRESSURE_MAX_SLOTS);
-        let slots = target.saturating_sub(self.bank.rel.leg.slots_free());
-        let snap_bytes = if self.bank.rel.snap_host_free_slots() > 0
+    /// 判据 = **压力信号 + 低/高双水位**：自由页低于 low 才触发，目标补到 high
+    /// （滞回，避免阈值附近 churn）。状态腿在宿主有位时带一条快照。
+    fn pressure_need(&self, signals: &PressureSignals) -> (usize, usize, usize) {
+        let slots = self.pressure_policy().target_slots(
+            signals.pool_total_pages,
+            signals.pool_free_pages,
+            PRESSURE_MAX_SLOTS,
+        );
+        let snap_bytes = if slots > 0
+            && signals.host_free_slots > 0
             && self.bank.rel.state.stats().snap_gpu.0 > 0
         {
             self.bank.rel.snap_bytes()
         } else {
             0
         };
-        (slots, snap_bytes)
+        let host_slots = host_pressure_slots(signals, &self.pressure_policy());
+        (slots, snap_bytes, host_slots)
     }
 
-    /// **H5 空转制的节拍推进**(Idle pump 计数;每 N 拍调 `StoreHook::idle` 一次)
-    fn idle_tick(&mut self) -> Option<usize> {
+    /// **H5 空转整理节拍**（Idle pump 计数；每 N 拍问一次）。
+    ///
+    /// **默认不预搬**：`runtime.idle_compact=false` 时只让 `pump` 走池缓存
+    /// 回收（`trim_pools`），不触发 `Maintain::Idle`。显式开启后也只按
+    /// 压力信号的低水位触发、补到高水位，不再用固定 `pool/8` 目标。
+    fn idle_tick(&mut self) -> Option<(usize, usize)> {
         if !self.hk.note_idle_pump() {
             return None;
         }
-        let total = self.bank.rel.leg.slots_total();
-        if total == 0 {
+        if !self.boot.cfg.knobs.idle_compact {
             return None;
         }
-        // 目标 = 总量的 1/8(至少 1 槽、至多 16):空转整理是"慢慢收",不是搬家
-        Some((total / 8).clamp(1, 16))
+        let signals = self.pressure_signals();
+        let slots = self.pressure_policy().target_slots(
+            signals.pool_total_pages,
+            signals.pool_free_pages,
+            IDLE_COMPACT_MAX_SLOTS,
+        );
+        let policy = self.pressure_policy();
+        let mut host_slots = host_pressure_slots(&signals, &policy);
+        if host_slots > 0 {
+            let interval = std::time::Duration::from_millis(
+                self.boot.cfg.knobs.host_pressure_interval_ms as u64,
+            );
+            if self.hk.host_pressure_due(interval) {
+                self.hk.mark_host_pressure();
+            } else {
+                host_slots = 0;
+            }
+        }
+        (slots > 0 || host_slots > 0).then_some((slots, host_slots))
     }
 
     /// **句柄计数三元组**(诊断面;`/debug/vram`):`(hook_fail, window_unclosed, 窗内块数)`
@@ -1801,9 +2083,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 语义:`cuMemPoolTrimTo(0)` 把池内**已 free 的缓存页**还给 OS(不改块账)。
     /// 返回逐 rank 的 `(rank, Ok(释放字节)/Err(原因))` —— 失败**如实带出**
     /// (调用方决定是否响亮;本函数不吞)。
-    pub async fn trim_pools(
-        &mut self,
-    ) -> Vec<(u8, std::result::Result<u64, String>)> {
+    pub async fn trim_pools(&mut self) -> Vec<(u8, std::result::Result<u64, String>)> {
         let mut out: Vec<(u8, std::result::Result<u64, String>)> = Vec::new();
         let r = self
             .dev
@@ -1833,10 +2113,15 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 由报告面分别标——**不静默降级成 None**。
     pub async fn block_ledger_probe(
         &mut self,
-    ) -> Vec<(u8, std::result::Result<Vec<owl_iface::contract::BlockLedgerRow>, String>)> {
+    ) -> Vec<(
+        u8,
+        std::result::Result<Vec<owl_iface::contract::BlockLedgerRow>, String>,
+    )> {
         #[allow(clippy::type_complexity)]
-        let mut out: Vec<(u8, std::result::Result<Vec<owl_iface::contract::BlockLedgerRow>, String>)> =
-            Vec::new();
+        let mut out: Vec<(
+            u8,
+            std::result::Result<Vec<owl_iface::contract::BlockLedgerRow>, String>,
+        )> = Vec::new();
         let ranks: Vec<(u8, &mut RankDev<D>)> = {
             let mut v: Vec<(u8, &mut RankDev<D>)> = vec![(0, &mut self.dev)];
             if let Some(p) = self.peer.as_mut() {
@@ -1866,6 +2151,18 @@ impl<D: DeviceClient> RunningEngine<D> {
             owl_iface::handle::Owner::Session(session_id)
         };
         self.set_dev_ctx(owner, owl_iface::handle::AssetClass::Unclassified);
+    }
+
+    /// 当前活跃 turn 的容量票（P0-4；exec 子模块的块表增长入口用）。
+    pub(crate) fn grant_of_session(&self, session: u64) -> Result<owl_store::ReservationId> {
+        self.turns
+            .active
+            .iter()
+            .find(|a| a.session_id == session)
+            .map(|a| a.grant)
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: format!("会话 {session:#x} 无活跃 turn 的 Grant"),
+            })
     }
 
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
@@ -1913,7 +2210,12 @@ impl<D: DeviceClient> RunningEngine<D> {
                     let (hit, recall) = self.bank.rel.match_prefix(&t.prompt_ids)?;
                     Self::reuse_face(&self.bank.rel, &hit, &recall, plen, page).1
                 };
-                let have = self.bank.sessions.get(sid).map(|s| s.block_table.len()).unwrap_or(0);
+                let have = self
+                    .bank
+                    .sessions
+                    .get(sid)
+                    .map(|s| s.block_table.len())
+                    .unwrap_or(0);
                 return Ok(owl_store::Need::kv(
                     slots_for(plen).saturating_sub(dev).saturating_sub(have),
                     NeedWhy::Admit,
@@ -2024,8 +2326,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 定位就得开 `trace_ring` 拼发射账。
     pub(crate) fn n4_report_unreturned(&self, turn: u64) {
         let cell = self.bank.rel.ledger_cell();
-        let loans = owl_store::book_lock(&cell)
-            .open_loans(|o| o == owl_iface::handle::Owner::Turn(turn));
+        let loans =
+            owl_store::book_lock(&cell).open_loans(|o| o == owl_iface::handle::Owner::Turn(turn));
         if loans.is_empty() {
             return;
         }
@@ -2189,8 +2491,18 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok((0, 0));
         }
         owl_shared::metrics::with_metrics_store(|m| {
-            m.counter_add(&format!("store.{tag}.stale_blocks"), total.0 as u64, file!(), line!());
-            m.counter_add(&format!("store.{tag}.stale_bytes"), total.1 as u64, file!(), line!());
+            m.counter_add(
+                &format!("store.{tag}.stale_blocks"),
+                total.0 as u64,
+                file!(),
+                line!(),
+            );
+            m.counter_add(
+                &format!("store.{tag}.stale_bytes"),
+                total.1 as u64,
+                file!(),
+                line!(),
+            );
         });
         Ok(total)
     }
@@ -2212,11 +2524,11 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     /// **池账同步**(S3b §23.2):把池实占按"活跃面 / 可动面"拆给准入账 ——
-    /// 真源 = 块腿报告的设备驻留字节 + 活跃 turn 的块表长(引擎知道)。
+    /// 真源 = 块腿报告的设备驻留字节 + 活跃 turn 的块表(**按槽号去重**)。
     ///
     /// 恒等式(必须成立,否则判据就偏):
-    /// `reserved(活跃实占) + cache(其余池实占) = 池实占`。
-    /// 单一活跃 turn ⇒ O(1);将来多活跃 = 求和(算式不变)。
+    /// `reserved(唯一活跃实占) + session_held + cache = 池实占`。
+    /// 共享前缀出现在多个 turn 的块表里时,保留面只计一次。
     pub(crate) fn sync_pool_account(&mut self) -> Result<()> {
         let block_bytes = self.dev.pool.block_bytes();
         // 池实占 = **槽账**真源(已用槽 × 块字节)—— 不看树绑定面:
@@ -2227,31 +2539,34 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 不用"池实占 − 活跃实占"那种字节相减:那会把 idle 会话持着的
         // 历史算成可动,准入就说满了话而搬不动(Busy ⇒ 退回 Exhausted)。
         let movable = self.bank.rel.leg.movable_bytes();
-        // B5.1:多活跃 ⇒ 逐 turn 记保留额(各自会话块链实占)
-        let active_holds: Vec<(u64, usize)> = self
+        // B5.1:多活跃 ⇒ 逐 turn 记块表快照;共享块的槽号相同,
+        // `Admission::reserved_bytes` 取并集(共享前缀只算一次)。
+        let active_slots: Vec<(u64, Vec<u32>)> = self
             .turns
             .actives()
             .map(|a| {
-                let held = self
+                let slots: Vec<u32> = self
                     .bank
                     .sessions
                     .get(a.session_id)
-                    .map_or(0, |s| s.block_table.len())
-                    * block_bytes;
-                (a.id, held)
+                    .map(|s| {
+                        s.block_table
+                            .iter()
+                            .copied()
+                            .filter(|b| !owl_store::is_host_placeholder(*b))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (a.id, slots)
             })
             .collect();
-        let held = active_holds
-            .iter()
-            .map(|(_, h)| *h)
-            .sum::<usize>()
-            .min(occupied.saturating_sub(movable));
         let ad = &mut self.bank.rel.admission;
         ad.set_cache_bytes(movable); // 可动面(可下沉/可驱逐)
-        ad.set_session_held(occupied.saturating_sub(movable).saturating_sub(held)); // 会话持有面
-        for (id, h) in &active_holds {
-            ad.set_floor(*id, *h)?; // 活跃 turn 保留额(G2b)
+        for (id, slots) in &active_slots {
+            ad.set_active_slots(*id, slots.iter().copied(), block_bytes)?;
         }
+        let held = ad.reserved_bytes();
+        ad.set_session_held(occupied.saturating_sub(movable).saturating_sub(held)); // 会话持有面
         Ok(())
     }
 
@@ -2275,7 +2590,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             "准入：turn {turn_id} 地板请求 {req_pages} 页 / **实得 {got_pages} 页**\
              (={} KiB)‖ ctx {ctx_tokens} tok = {ctx_pages} 页 ‖ 档 {}",
             granted_bytes >> 10,
-            if floor.is_strict() { "Strict" } else { "耐受" }
+            if floor.is_strict() {
+                "Strict"
+            } else {
+                "耐受"
+            }
         );
     }
 
@@ -2304,7 +2623,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 t.id,
                 // 上界 = prompt + 生成长度 + spec 深度(安全方向:多算只是多腾几个槽)
                 t.prompt_ids.len() + t.spec.max_new + self.dev.spec_rt.depth,
-                t.opts.dense_floor.unwrap_or(self.boot.cfg.knobs.dense_floor),
+                t.opts
+                    .dense_floor
+                    .unwrap_or(self.boot.cfg.knobs.dense_floor),
             )
         }) else {
             return Ok(());
@@ -2330,13 +2651,14 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // **实得地板回吐**(设计卷 §2.4 报告面):请求页 / 实得页 / 上下文页。
                 self.log_floor_grant(turn_id, floor, ctx_tokens, page, page_bytes, floor_bytes);
             }
-            AdmissionVerdict::EvictThen { need_bytes, floor_bytes } => {
+            AdmissionVerdict::EvictThen {
+                need_bytes,
+                floor_bytes,
+            } => {
                 // 抬需求到"腾够就能进":同一次段边界搬完(下沉不丢内容)
                 let want = need_bytes.div_ceil(self.dev.pool.block_bytes().max(1));
                 need.slots = need.slots.max(want);
-                self.log_floor_grant(
-                    turn_id, floor, ctx_tokens, page, page_bytes, floor_bytes,
-                );
+                self.log_floor_grant(turn_id, floor, ctx_tokens, page, page_bytes, floor_bytes);
             }
             AdmissionVerdict::Queue { reason } => {
                 let started = match self.turns.admit_wait {
@@ -2384,13 +2706,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         owl_shared::metrics::with_metrics_store(|m| {
             m.counter_add("store.admit.reject", 1, file!(), line!());
         });
-        self.turns.pending_events.push_back(TurnEvent::Failed { turn: turn_id, err: why });
+        self.turns.pending_events.push_back(TurnEvent::Failed {
+            turn: turn_id,
+            err: why,
+        });
         self.sync_pool_account()?;
         Ok(())
     }
-
-
-
 
     // ─────────────────────── 磁盘层执行面(S6;store 出计划 / 这里做 I/O) ───────────────────────
 
@@ -2403,7 +2725,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         if self.bank.rel.disk.is_none() {
             return Ok(false);
         }
-        if self.bank.rel.disk.as_ref().is_some_and(|d| d.contains(chain)) {
+        if self
+            .bank
+            .rel
+            .disk
+            .as_ref()
+            .is_some_and(|d| d.contains(chain))
+        {
             return Ok(false);
         }
         let buf = match self.bank.rel.leg.host_take(chain) {
@@ -2419,10 +2747,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                 return Ok(false);
             }
         };
-        match crate::disk_io::write_block(plan.path.clone(), plan.tmp.clone(), buf.into_bytes()).await
+        match crate::disk_io::write_block(plan.path.clone(), plan.tmp.clone(), buf.into_bytes())
+            .await
         {
             Ok(_) => {
-                self.bank.rel.disk.as_mut().expect("上面判过").commit_spill(&plan)?;
+                self.bank
+                    .rel
+                    .disk
+                    .as_mut()
+                    .expect("上面判过")
+                    .commit_spill(&plan)?;
                 owl_shared::metrics::with_metrics_store(|m| {
                     m.counter_add("store.disk.spill", 1, file!(), line!());
                 });
@@ -2430,7 +2764,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
             Err(f) => {
                 // 内容所有权被带回 ⇒ 放回宿主(溢写失败 ≠ 丢内容)
-                self.bank.rel
+                self.bank
+                    .rel
                     .leg
                     .host_put(chain, owl_store::HostBlock::from_bytes(f.bytes))?;
                 owl_shared::log_warn!("store", "KV 溢写失败(内容已回宿主):{}", f.err);
@@ -2448,12 +2783,24 @@ impl<D: DeviceClient> RunningEngine<D> {
         chain: owl_store::ChainHash,
     ) -> Result<Option<owl_store::SpillPlanOf<owl_store::ChainHash>>> {
         for attempt in 0..2 {
-            let r = self.bank.rel.disk.as_ref().expect("调用方判过").plan_spill(chain);
+            let r = self
+                .bank
+                .rel
+                .disk
+                .as_ref()
+                .expect("调用方判过")
+                .plan_spill(chain);
             match r {
                 Ok(p) => return Ok(Some(p)),
                 Err(owl_store::StoreError::Exhausted(_)) if attempt == 0 => {
                     let need = self.bank.rel.disk.as_ref().expect("判过").block_bytes();
-                    let evp = self.bank.rel.disk.as_ref().expect("判过").plan_evict(need, &[]);
+                    let evp = self
+                        .bank
+                        .rel
+                        .disk
+                        .as_ref()
+                        .expect("判过")
+                        .plan_evict(need, &[]);
                     if evp.victims.is_empty() {
                         return Ok(None);
                     }
@@ -2462,7 +2809,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                     let keys: Vec<owl_store::ChainHash> =
                         evp.victims.iter().map(|(k, _)| *k).collect();
                     let n = crate::disk_io::remove_files(paths).await;
-                    let freed = self.bank.rel.disk.as_mut().expect("判过").commit_evict(&keys);
+                    let freed = self
+                        .bank
+                        .rel
+                        .disk
+                        .as_mut()
+                        .expect("判过")
+                        .commit_evict(&keys);
                     owl_shared::log_info!(
                         "store",
                         "磁盘腾位:删 {n} 文件 / 出账 {freed}B(盘按 LRU 逐最老)"
@@ -2520,7 +2873,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 });
             }
             Err(f) => {
-                owl_shared::log_warn!("store", "链索引写盘失败:{}(索引缺失 = 该链跨重启不可复用)", f.err);
+                owl_shared::log_warn!(
+                    "store",
+                    "链索引写盘失败:{}(索引缺失 = 该链跨重启不可复用)",
+                    f.err
+                );
             }
         }
         Ok(())
@@ -2546,7 +2903,9 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// **KV 回填**(磁盘 → 宿主;S6)。返回 `true` = 真读了盘。
     async fn fill_kv_from_disk(&mut self, chain: owl_store::ChainHash) -> Result<bool> {
-        let Some(d) = self.bank.rel.disk.as_ref() else { return Ok(false) };
+        let Some(d) = self.bank.rel.disk.as_ref() else {
+            return Ok(false);
+        };
         if !d.contains(chain) {
             return Ok(false);
         }
@@ -2554,7 +2913,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             let _ = self.bank.rel.disk.as_mut().expect("判过").touch(chain);
             return Ok(false); // 已在宿主(盘副本仍在)
         }
-        let plan = self.bank.rel.disk.as_ref().expect("判过").plan_fill(chain)?;
+        let plan = self
+            .bank
+            .rel
+            .disk
+            .as_ref()
+            .expect("判过")
+            .plan_fill(chain)?;
         let bytes = crate::disk_io::read_block(plan.path.clone(), plan.bytes)
             .await
             .map_err(|e| owl_iface::contract::ModelError::Msg(e))?;
@@ -2574,7 +2939,12 @@ impl<D: DeviceClient> RunningEngine<D> {
                 "宿主让位:磁盘回填前先逐最冷 {relief} 块(链 {chain:?})"
             );
         }
-        self.bank.rel.disk.as_mut().expect("判过").commit_fill(chain)?;
+        self.bank
+            .rel
+            .disk
+            .as_mut()
+            .expect("判过")
+            .commit_fill(chain)?;
         owl_shared::metrics::with_metrics_store(|m| {
             m.counter_add("store.disk.fill", 1, file!(), line!());
         });
@@ -2586,7 +2956,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         if self.bank.rel.snap_disk.is_none() {
             return Ok(false);
         }
-        if self.bank.rel.snap_disk.as_ref().is_some_and(|d| d.contains(key)) {
+        if self
+            .bank
+            .rel
+            .snap_disk
+            .as_ref()
+            .is_some_and(|d| d.contains(key))
+        {
             return Ok(false);
         }
         let buf = match self.bank.rel.snap_host.take(key) {
@@ -2596,23 +2972,47 @@ impl<D: DeviceClient> RunningEngine<D> {
         };
         let mut plan = None;
         for attempt in 0..2 {
-            let r = self.bank.rel.snap_disk.as_ref().expect("判过").plan_spill(key);
+            let r = self
+                .bank
+                .rel
+                .snap_disk
+                .as_ref()
+                .expect("判过")
+                .plan_spill(key);
             match r {
                 Ok(p) => {
                     plan = Some(p);
                     break;
                 }
                 Err(owl_store::StoreError::Exhausted(_)) if attempt == 0 => {
-                    let need = self.bank.rel.snap_disk.as_ref().expect("判过").block_bytes();
-                    let evp = self.bank.rel.snap_disk.as_ref().expect("判过").plan_evict(need, &[]);
+                    let need = self
+                        .bank
+                        .rel
+                        .snap_disk
+                        .as_ref()
+                        .expect("判过")
+                        .block_bytes();
+                    let evp = self
+                        .bank
+                        .rel
+                        .snap_disk
+                        .as_ref()
+                        .expect("判过")
+                        .plan_evict(need, &[]);
                     if evp.victims.is_empty() {
                         break;
                     }
                     let paths: Vec<std::path::PathBuf> =
                         evp.victims.iter().map(|(_, p)| p.clone()).collect();
-                    let keys: Vec<owl_store::SnapKey> = evp.victims.iter().map(|(k, _)| *k).collect();
+                    let keys: Vec<owl_store::SnapKey> =
+                        evp.victims.iter().map(|(k, _)| *k).collect();
                     crate::disk_io::remove_files(paths).await;
-                    self.bank.rel.snap_disk.as_mut().expect("判过").commit_evict(&keys);
+                    self.bank
+                        .rel
+                        .snap_disk
+                        .as_mut()
+                        .expect("判过")
+                        .commit_evict(&keys);
                 }
                 Err(_) => break,
             }
@@ -2621,10 +3021,16 @@ impl<D: DeviceClient> RunningEngine<D> {
             self.bank.rel.snap_host.put(key, buf)?;
             return Ok(false);
         };
-        match crate::disk_io::write_block(plan.path.clone(), plan.tmp.clone(), buf.into_bytes()).await
+        match crate::disk_io::write_block(plan.path.clone(), plan.tmp.clone(), buf.into_bytes())
+            .await
         {
             Ok(_) => {
-                self.bank.rel.snap_disk.as_mut().expect("判过").commit_spill(&plan)?;
+                self.bank
+                    .rel
+                    .snap_disk
+                    .as_mut()
+                    .expect("判过")
+                    .commit_spill(&plan)?;
                 self.bank.rel.state.set_tier(key, owl_store::Tier::Disk)?;
                 owl_shared::metrics::with_metrics_store(|m| {
                     m.counter_add("store.disk.snap.spill", 1, file!(), line!());
@@ -2632,7 +3038,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                 Ok(true)
             }
             Err(f) => {
-                self.bank.rel
+                self.bank
+                    .rel
                     .snap_host
                     .put(key, owl_store::HostBlock::from_bytes(f.bytes))?;
                 owl_shared::log_warn!("store", "快照溢写失败(内容已回宿主):{}", f.err);
@@ -2643,7 +3050,9 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// **快照回填**(磁盘 → 宿主;S6)。
     pub(crate) async fn fill_snap_from_disk(&mut self, key: owl_store::SnapKey) -> Result<bool> {
-        let Some(d) = self.bank.rel.snap_disk.as_ref() else { return Ok(false) };
+        let Some(d) = self.bank.rel.snap_disk.as_ref() else {
+            return Ok(false);
+        };
         if !d.contains(key) {
             return Ok(false);
         }
@@ -2651,14 +3060,26 @@ impl<D: DeviceClient> RunningEngine<D> {
             let _ = self.bank.rel.snap_disk.as_mut().expect("判过").touch(key);
             return Ok(false);
         }
-        let plan = self.bank.rel.snap_disk.as_ref().expect("判过").plan_fill(key)?;
+        let plan = self
+            .bank
+            .rel
+            .snap_disk
+            .as_ref()
+            .expect("判过")
+            .plan_fill(key)?;
         let bytes = crate::disk_io::read_block(plan.path.clone(), plan.bytes)
             .await
             .map_err(|e| owl_iface::contract::ModelError::Msg(e))?;
-        self.bank.rel
+        self.bank
+            .rel
             .snap_host
             .put(key, owl_store::HostBlock::from_bytes(bytes))?;
-        self.bank.rel.snap_disk.as_mut().expect("判过").commit_fill(key)?;
+        self.bank
+            .rel
+            .snap_disk
+            .as_mut()
+            .expect("判过")
+            .commit_fill(key)?;
         self.bank.rel.state.set_tier(key, owl_store::Tier::Host)?;
         owl_shared::metrics::with_metrics_store(|m| {
             m.counter_add("store.disk.snap.fill", 1, file!(), line!());
@@ -2701,13 +3122,19 @@ impl<D: DeviceClient> RunningEngine<D> {
                         .await
                 }
                 _ => match self.peer.as_mut() {
-                    Some(pr) => pr.graphs.session.face_mut().swap(dir, pcs, Box::new(table)).await,
+                    Some(pr) => {
+                        pr.graphs
+                            .session
+                            .face_mut()
+                            .swap(dir, pcs, Box::new(table))
+                            .await
+                    }
                     None => {
                         return Err(owl_iface::contract::ModelError::EngineInvariant {
                             what: format!(
                                 "宿主腿 swap({dir:?}): world = {world} 但 peer 束缺席(装配不一致)"
                             ),
-                        })
+                        });
                     }
                 },
             };
@@ -2847,10 +3274,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// - `Busy`(判与搬之间状态变了)= **跳过该条**(不是错误);
     /// - 搬运失败 ⇒ `abort_*`(内容已随命令消失 ⇒ 条目删,不留假账)后上抛;
     /// - `Drop` 是纯 host(store 直接删条目),无需 face。
-    async fn apply_verdict(
-        &mut self,
-        verdict: &owl_store::Verdict,
-    ) -> Result<owl_store::Applied> {
+    async fn apply_verdict(&mut self, verdict: &owl_store::Verdict) -> Result<owl_store::Applied> {
         use owl_store::Sink;
         let mut a = owl_store::Applied::default();
         // ① 换出/驱逐(**两腿同单**:KV 链/叶 + GDN 快照;§30)
@@ -2880,12 +3304,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                             .saturating_sub(relief0);
                         if relief > 0 {
                             owl_shared::metrics::with_metrics_store(|m| {
-                                m.counter_add(
-                                    "store.host.relief_blocks",
-                                    relief,
-                                    file!(),
-                                    line!(),
-                                );
+                                m.counter_add("store.host.relief_blocks", relief, file!(), line!());
                             });
                             owl_shared::log_warn!(
                                 "store",
@@ -2916,9 +3335,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                     // 票是**链级**的(`chain` = 链尾,S6.1):整链里所有**在宿主**的块
                     // 逐块写盘 —— 只挪尾部会拆散链,重启重建不出从根连续的前缀。
                     Sink::Disk => {
+                        // `span` = 从根起的前缀块数(HostPressure 可只搬一段;
+                        // 普通整链票的 span = 链长)。盘上仍是 root 连续前缀。
                         let blocks = self.bank.rel.leg.chain_blocks(*chain);
                         let mut n = 0usize;
-                        for b in blocks {
+                        for b in blocks.into_iter().take((*span).max(1)) {
                             if self.spill_kv_to_disk(b).await? {
                                 n += 1;
                             }
@@ -3019,9 +3440,30 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// `ensure_for_len` 处响亮拒（Phase 2 后不再有同步驱逐）。
     // 唯一调用者 = `store_hook`（Acquire::Capacity / Load / Maintain）。
     // Phase 3 后 spec `snap_*` / H3/H6 均已收口；仅剩 coverage 诊断直呼。
+    /// **活跃 turn 的显式快照保护面**(P1-2)。
+    ///
+    /// 快照面没有引用计数(不像 KV 由 `SlotPool.refs` 兜底),因此必须由
+    /// engine 把「本 turn 最新边界」与「正在回滚/就位的 key」显式交给 store。
+    ///
+    /// `skip_turn` 只给 capture 路径:新边界会替代本 turn 的旧边界,旧边界
+    /// 可以成为 victim;其它活跃 turn 的最新边界仍然受保护。
+    fn snap_guard(
+        &self,
+        extra: &[owl_store::SnapKey],
+        skip_turn: Option<u64>,
+    ) -> Vec<owl_store::SnapKey> {
+        snap_guard_keys(
+            self.turns.active.iter().map(|a| (a.id, a.last_snap)),
+            extra,
+            skip_turn,
+        )
+    }
+
     async fn pool_housekeeping(
         &mut self,
         need: owl_store::Need,
+        extra_snaps: &[owl_store::SnapKey],
+        skip_turn: Option<u64>,
     ) -> Result<owl_store::Applied> {
         // 两条腿各自"宿主关 ⇒ 该腿目标清零"(旧行为:宿主关 = 不换出,**也不做无谓驱逐**;
         // 两腿独立,不能因为状态腿开就顺手把 KV 面 Drop 掉)
@@ -3035,7 +3477,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         if need.is_zero() {
             return Ok(owl_store::Applied::default());
         }
-        let verdict = self.bank.rel.plan_need(need, &owl_store::Protected::default());
+        let protect = owl_store::Protected {
+            snaps: self.snap_guard(extra_snaps, skip_turn),
+            ..owl_store::Protected::default()
+        };
+        let verdict = self.bank.rel.plan_need(need, &protect);
         if verdict.is_noop() {
             return Ok(owl_store::Applied::default());
         }
@@ -3049,10 +3495,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 首条 + 每 64 条打一次,带累计数;计数本身逐次入 metrics,不丢。
             let n = self.hk.note_degrade();
             if n == 1 || n.is_multiple_of(64) {
-                owl_shared::log_warn!(
-                    "store",
-                    "钩子:需求凑不够(真容量不足预警,累计 {n} 次):{why}"
-                );
+                owl_shared::log_warn!("store", "钩子:需求凑不够(真容量不足预警,累计 {n} 次):{why}");
             }
             owl_shared::metrics::with_metrics_store(|m| {
                 m.counter_add("store.degrade", 1, file!(), line!());
@@ -3076,11 +3519,31 @@ impl<D: DeviceClient> RunningEngine<D> {
             m.counter_add("store.hook.out", applied.offloaded as u64, file!(), line!());
             m.counter_add("store.hook.drop", applied.dropped as u64, file!(), line!());
             m.counter_add("store.hook.in", applied.onloaded as u64, file!(), line!());
-            m.counter_add("store.hook.snap.out", applied.snap_offloaded as u64, file!(), line!());
-            m.counter_add("store.hook.snap.drop", applied.snap_dropped as u64, file!(), line!());
+            m.counter_add(
+                "store.hook.snap.out",
+                applied.snap_offloaded as u64,
+                file!(),
+                line!(),
+            );
+            m.counter_add(
+                "store.hook.snap.drop",
+                applied.snap_dropped as u64,
+                file!(),
+                line!(),
+            );
             m.counter_add("store.hook.spill", applied.spilled as u64, file!(), line!());
-            m.counter_add("store.hook.snap.spill", applied.snap_spilled as u64, file!(), line!());
-            m.counter_add("store.hook.busy", applied.skipped_busy as u64, file!(), line!());
+            m.counter_add(
+                "store.hook.snap.spill",
+                applied.snap_spilled as u64,
+                file!(),
+                line!(),
+            );
+            m.counter_add(
+                "store.hook.busy",
+                applied.skipped_busy as u64,
+                file!(),
+                line!(),
+            );
         });
         Ok(applied)
     }
@@ -3113,23 +3576,30 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.admission_gate(&mut need)?;
         // `step_need` 在"无活跃 + 队列空"时返回 NeedWhy::Idle（零需求）。
         // 这不是 Acquire::Capacity 的合法 kind；Idle 的整理由下方
-        // H5 `idle_tick` / Maintain::Idle 负责，不能在这里误报不变量。
+        // H5 `idle_tick` / Maintain::{Idle,HostPressure} 负责，不能在这里误报不变量。
         // Phase 4 已删除 pump 的 N6（驱动 free 触发只制造 churn）；
         // 压力整理只在 PoolExhausted 后走 `relieve_pressure`。
         if !matches!(need.why, owl_store::NeedWhy::Idle) {
             self.store_hook(StoreHook::capacity(need)).await?;
         }
-        let loophead_ms = t_loophead.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
+        let loophead_ms = t_loophead
+            .map(|t| t.elapsed().as_secs_f64() * 1e3)
+            .unwrap_or(0.0);
         let t_lh1 = prof.then(std::time::Instant::now); // 循环头之后
         owl_shared::timer_start!("engine.pump.schedule");
         let t_sched = (prof || true).then(std::time::Instant::now);
-        let out = self.schedule()?;
+        let out = self.schedule().await?;
         let t_sc1 = prof.then(std::time::Instant::now); // schedule 之后
         if let Some(ts) = t_sched {
             let d = ts.elapsed();
             if let Some((n, avg_ms, last_ms)) = self.hk.note_sched(d) {
-                owl_shared::log_info!("sched", "n={} avg={:.2}ms last={:.2}ms loophead={:.3}ms",
-                    n, avg_ms, last_ms, loophead_ms
+                owl_shared::log_info!(
+                    "sched",
+                    "n={} avg={:.2}ms last={:.2}ms loophead={:.3}ms",
+                    n,
+                    avg_ms,
+                    last_ms,
+                    loophead_ms
                 );
             }
         }
@@ -3146,17 +3616,18 @@ impl<D: DeviceClient> RunningEngine<D> {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 .is_multiple_of(64)
             {
-                owl_shared::metrics::query_metrics(&owl_shared::metrics::MetricsFilter::new()
-                    .tag_prefix("engine.pump."));
+                owl_shared::metrics::query_metrics(
+                    &owl_shared::metrics::MetricsFilter::new().tag_prefix("engine.pump."),
+                );
             }
         }
         match out {
             SchedulerOutput::Idle => {
-                // **[H5 Idle]**(步 4 入档):空转期每 N 拍做一次整理(冷面下沉/清池),
-                // 决策仍全在 store(`NeedWhy::Idle` = 零缺口也搬);无活跃 turn ⇒
-                // 只动缓存面,绝不碰活跃面。
+                // **空转整理**(H5;`runtime.idle_compact` 缺省 **false**)。
+                // false = 只做下方池缓存回收，**不预搬**；true = 每 N 拍按低水位
+                // 触发、补到高水位（决策仍全在 store；无活跃 turn ⇒ 只动缓存面）。
                 // **池缓存回收(空转出口;§23.9)**:server 的泵循环 `Idle` 即断,
-                // `Maintain::Idle`(每 16 拍)到不了 ⇒ 在这里按时间节流清一次。
+                // `Maintain::Idle`(显式 compact 时才每 16 拍)到不了 ⇒ 在这里按时间节流清一次。
                 // `RELEASE_THRESHOLD=∞` 下 turn 收尾后 free 的 GB 级临时块
                 // 不主动还驱动就永远占着(实测 peer 侧 3.0 GiB)。
                 let due = self.hk.trim_due();
@@ -3175,8 +3646,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         }
                     }
                     let freed = self.trim_pools().await;
-                    let total: u64 =
-                        freed.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
+                    let total: u64 = freed.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
                     if total > 0 {
                         owl_shared::log_info!(
                             "store",
@@ -3190,15 +3660,17 @@ impl<D: DeviceClient> RunningEngine<D> {
                     }
                     for (rank, r) in freed {
                         if let Err(e) = r {
-                            owl_shared::log_warn!(
-                                "store",
-                                "空转池缓存回收失败(rank{rank}): {e}"
-                            );
+                            owl_shared::log_warn!("store", "空转池缓存回收失败(rank{rank}): {e}");
                         }
                     }
                 }
-                if let Some(k) = self.idle_tick() {
-                    self.store_hook(StoreHook::idle(k)).await?;
+                if let Some((slots, host_slots)) = self.idle_tick() {
+                    if host_slots > 0 {
+                        self.store_hook(StoreHook::host_pressure(host_slots)).await?;
+                    }
+                    if slots > 0 {
+                        self.store_hook(StoreHook::idle(slots)).await?;
+                    }
                 }
                 // 准入拒(S3b §23.4)等 host 侧即时终态:先回吐再报 Idle ——
                 // 否则 Idle 会让服务面的泵循环在此断开,被拒 turn 的事件
@@ -3214,7 +3686,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                     self.execute_begin(b).await?;
                 }
                 match action {
-                    StepAction::Prefill { chunk_ids, base, is_last } => {
+                    StepAction::Prefill {
+                        chunk_ids,
+                        base,
+                        is_last,
+                    } => {
                         // 性能面:相位定相 + 包络 span(perf-framework.md §四)。
                         // 引擎 actor = current_thread 运行时 ⇒ 单线程栈配对安全;
                         // 解释器节点钩子按 env.phase 打 tag,两者同源。
@@ -3226,18 +3702,29 @@ impl<D: DeviceClient> RunningEngine<D> {
                         self.set_phase(saved);
                         r
                     }
-                    StepAction::Decode { token, pos, kv_slot, gdn_slot, grew } => {
+                    StepAction::Decode {
+                        token,
+                        pos,
+                        kv_slot,
+                        gdn_slot,
+                        grew,
+                    } => {
                         let saved = self.dev.phase();
                         self.set_phase(owl_models::env::EvalPhase::Decode);
                         owl_shared::timer_start!("engine.phase.decode");
                         let t_ex0 = t_ph0.map(|_| std::time::Instant::now());
-                        let r = self.execute_decode(token, pos, kv_slot, gdn_slot, grew).await;
+                        let r = self
+                            .execute_decode(token, pos, kv_slot, gdn_slot, grew)
+                            .await;
                         if let (Some(p0), Some(ex0)) = (t_ph0, t_ex0) {
                             let head = ex0.duration_since(p0);
                             let exec = ex0.elapsed();
                             let lh = t_lh1.map(|t| t.duration_since(p0)).unwrap_or_default();
-                            let sc = t_sc1.map(|t| t.duration_since(t_lh1.unwrap_or(t))).unwrap_or_default();
-                            let tail_head = t_sc1.map(|t| ex0.duration_since(t)).unwrap_or_default();
+                            let sc = t_sc1
+                                .map(|t| t.duration_since(t_lh1.unwrap_or(t)))
+                                .unwrap_or_default();
+                            let tail_head =
+                                t_sc1.map(|t| ex0.duration_since(t)).unwrap_or_default();
                             owl_shared::log_info!(
                                 "pump-phases",
                                 "head={head:?} [entry→lh={lh:?} lh→sched={sc:?} sched→exec={tail_head:?}] exec={exec:?}"
@@ -3260,12 +3747,20 @@ impl<D: DeviceClient> RunningEngine<D> {
                         }
                         r
                     }
-                    StepAction::SpecRound { token, pos, kv_slots, gdn_slot, grew, depth } => {
+                    StepAction::SpecRound {
+                        token,
+                        pos,
+                        kv_slots,
+                        gdn_slot,
+                        grew,
+                        depth,
+                    } => {
                         let saved = self.dev.phase();
                         self.set_phase(owl_models::env::EvalPhase::Spec);
                         owl_shared::timer_start!("engine.phase.spec");
-                        let r =
-                            self.execute_spec_round(token, pos, kv_slots, gdn_slot, grew, depth).await;
+                        let r = self
+                            .execute_spec_round(token, pos, kv_slots, gdn_slot, grew, depth)
+                            .await;
                         owl_shared::timer_end!("engine.phase.spec");
                         self.set_phase(saved);
                         r
@@ -3283,7 +3778,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             match self.pump().await? {
                 TurnEvent::Completed { turn, text, .. } if turn == id => return Ok(text),
                 TurnEvent::Idle => {
-                    return Err(ModelError::Msg(format!("generate: turn {id} 队列丢失")))
+                    return Err(ModelError::Msg(format!("generate: turn {id} 队列丢失")));
                 }
                 _ => {}
             }
@@ -3353,7 +3848,10 @@ mod head_concat_tests {
     fn single_row_low_then_high() {
         let a = [1.0, 2.0, 3.0];
         let b = [4.0, 5.0, 6.0];
-        assert_eq!(concat_head_rows(&a, &b, 3).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            concat_head_rows(&a, &b, 3).unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
     }
 
     /// 多行（verify 形状）：每行各自拼接，不串行
@@ -3362,7 +3860,10 @@ mod head_concat_tests {
         // rows = 2, half = 2
         let a = [1.0, 2.0, 3.0, 4.0]; // 行0=[1,2] 行1=[3,4]
         let b = [10.0, 20.0, 30.0, 40.0];
-        assert_eq!(concat_head_rows(&a, &b, 2).unwrap(), vec![1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0]);
+        assert_eq!(
+            concat_head_rows(&a, &b, 2).unwrap(),
+            vec![1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0]
+        );
     }
 
     /// 响亮拒：长度不等 / 非整倍 / 半表宽 0
@@ -3388,7 +3889,10 @@ mod budget_tests {
         // 边界:刚好 = max_seq ⇒ 可用 0 …… 但 0 < 下限 ⇒ 拒
         assert_eq!(budget_clamp(32768, 8192, 32768), Err((32768, 8192)));
         // 剩余恰好 = 下限 ⇒ 放行(边界语义:≥ 下限即可)
-        assert_eq!(budget_clamp(32768 - _MIN_GEN_TOKENS, 8192, 32768), Ok(_MIN_GEN_TOKENS));
+        assert_eq!(
+            budget_clamp(32768 - _MIN_GEN_TOKENS, 8192, 32768),
+            Ok(_MIN_GEN_TOKENS)
+        );
         // 剩余 = 下限 − 1 ⇒ 拒(真溢出,客户端该压缩)
         assert_eq!(
             budget_clamp(32768 - _MIN_GEN_TOKENS + 1, 8192, 32768),
@@ -3437,5 +3941,161 @@ mod generation_target_tests {
             pos + 2 * d + 2,
             "DFlash2 = fp+block，m≤d"
         );
+    }
+}
+
+/// **P1-2 快照保护面合并**（纯函数；测试与 `snap_guard` 共用）。
+///
+/// `active` = 活跃 turn 的 `(turn, last_snap)`；`extra` = 本次操作点名的
+/// key；`skip_turn` = capture 时允许被新边界替代的本 turn。
+fn snap_guard_keys<I>(
+    active: I,
+    extra: &[owl_store::SnapKey],
+    skip_turn: Option<u64>,
+) -> Vec<owl_store::SnapKey>
+where
+    I: IntoIterator<Item = (u64, Option<owl_store::SnapKey>)>,
+{
+    let mut out: Vec<owl_store::SnapKey> = Vec::new();
+    for (turn, key) in active {
+        if Some(turn) == skip_turn {
+            continue;
+        }
+        if let Some(key) = key {
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+    }
+    for key in extra {
+        if !out.contains(key) {
+            out.push(*key);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod snap_guard_tests {
+    use super::snap_guard_keys;
+    use owl_store::{ChainHash, SnapKey};
+
+    fn key(n: u8) -> SnapKey {
+        SnapKey::at_boundary(ChainHash::new(n as u64))
+    }
+
+    #[test]
+    fn keeps_active_latest_and_restore_key_without_duplicates() {
+        let (a, b, restore) = (key(1), key(2), key(3));
+        assert_eq!(
+            snap_guard_keys([(10, Some(a)), (20, Some(b))], &[restore], None),
+            vec![a, b, restore]
+        );
+        assert_eq!(
+            snap_guard_keys([(10, Some(a)), (20, Some(a))], &[], None),
+            vec![a],
+            "同一 key 在多个 turn 上只保留一次"
+        );
+        assert_eq!(
+            snap_guard_keys([(10, Some(a)), (20, Some(a))], &[a], None),
+            vec![a],
+            "extra 与活跃面重复时不得双计"
+        );
+    }
+
+    #[test]
+    fn capture_skips_only_its_own_previous_boundary() {
+        let (own, other, new_key) = (key(1), key(2), key(3));
+        assert_eq!(
+            snap_guard_keys([(10, Some(own)), (20, Some(other))], &[new_key], Some(10)),
+            vec![other, new_key],
+            "本 turn 旧边界可被新 capture 替代；其它 turn 与本次目标仍受保护"
+        );
+    }
+}
+
+/// 宿主腿低于低水位且盘有位 ⇒ 把该腿补回**高水位**；总目标 cap 防止一次搬空。
+fn host_pressure_slots(signals: &PressureSignals, policy: &PressurePolicy) -> usize {
+    let kv = if signals.host_kv_enabled
+        && signals.host_kv_free_slots < policy.host_low_slots(signals.host_kv_total_slots)
+        && signals.disk_kv_free_slots > 0
+    {
+        policy
+            .host_high_slots(signals.host_kv_total_slots)
+            .saturating_sub(signals.host_kv_free_slots)
+    } else {
+        0
+    };
+    let snap = if signals.host_snap_enabled
+        && signals.host_snap_free_slots < policy.host_low_slots(signals.host_snap_total_slots)
+        && signals.disk_snap_free_slots > 0
+    {
+        policy
+            .host_high_slots(signals.host_snap_total_slots)
+            .saturating_sub(signals.host_snap_free_slots)
+    } else {
+        0
+    };
+    (kv + snap).min(HOST_PRESSURE_MAX_SLOTS)
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::{host_pressure_slots, PressurePolicy, PressureSignals};
+
+    #[test]
+    fn low_watermark_triggers_and_high_is_the_target() {
+        let p = PressurePolicy::new(12, 25, 12, 25);
+        assert_eq!(p.target_slots(100, 11, 64), 14, "低水位下补到高水位");
+        assert_eq!(p.target_slots(100, 12, 64), 0, "等于低水位不触发");
+        assert_eq!(p.target_slots(100, 0, 64), 25, "空池补到高水位");
+        assert_eq!(p.target_slots(100, 0, 8), 8, "单次上限生效");
+        assert_eq!(p.target_slots(0, 0, 64), 0, "无池不触发");
+    }
+
+    #[test]
+    fn small_pool_and_bad_percentages_are_clamped() {
+        let p = PressurePolicy::new(0, 0, 0, 0);
+        assert_eq!(p.target_slots(4, 0, 64), 1, "1% 至少取 1 页");
+        let p = PressurePolicy::new(80, 10, 12, 25);
+        assert_eq!(p.target_slots(100, 79, 64), 1, "high < low 时按 low 封底");
+    }
+
+    #[test]
+    fn host_pressure_uses_independent_low_watermark_and_disk_room() {
+        let p = PressurePolicy::new(12, 25, 20, 40);
+        let mut s = PressureSignals::default();
+        s.host_kv_enabled = true;
+        s.host_snap_enabled = true;
+        s.host_kv_total_slots = 100; // low = 20, high = 40
+        s.host_kv_free_slots = 19;
+        s.disk_kv_free_slots = 100;
+        assert_eq!(host_pressure_slots(&s, &p), 21, "低于低水位补到高水位");
+        s.host_kv_free_slots = 0;
+        assert_eq!(host_pressure_slots(&s, &p), 40, "空宿主补到高水位");
+        s.host_kv_free_slots = 20;
+        assert_eq!(host_pressure_slots(&s, &p), 0, "等于低水位不触发");
+
+        s.host_snap_total_slots = 10; // low = 2, high = 4
+        s.host_snap_free_slots = 0;
+        s.disk_snap_free_slots = 10;
+        assert_eq!(host_pressure_slots(&s, &p), 4, "状态腿独立高水位");
+        s.disk_kv_free_slots = 0;
+        assert_eq!(host_pressure_slots(&s, &p), 4, "KV 无盘位不影响快照");
+        s.host_kv_free_slots = 0; // KV 仍低但无盘位
+        assert_eq!(host_pressure_slots(&s, &p), 4);
+        s.host_snap_free_slots = 4;
+        assert_eq!(host_pressure_slots(&s, &p), 0);
+    }
+
+    #[test]
+    fn driver_headroom_is_part_of_the_signal() {
+        let mut s = PressureSignals::default();
+        s.driver_free_bytes = 100;
+        s.reserve_bytes = 200;
+        assert!(s.driver_below_reserve());
+        assert!(s.summary().contains("驱动低于预留"));
+        s.driver_free_bytes = 300;
+        assert!(!s.driver_below_reserve());
     }
 }

@@ -1,9 +1,9 @@
 //! 调度三相位执行(begin/prefill/decode)+ 采样收口 + GDN 画像
 use super::prefill_chunk::ChunkHost;
 use super::*;
+use owl_iface::contract::ModelError;
 use owl_models::module::Module; // 合批 eager:整模 `forward`
 use owl_models::ops::PlanNode; // ⚙ diag:池叶 → 块 id(写者足迹取证)
-use owl_iface::contract::ModelError;
 
 /// **GDN 快照节奏**(2026-10-20):prefill 每 N 个 chunk 留一个**锚点**快照
 /// (末边界另保)。链推进 / 增量登记 / 索引采集**每边界照走**;只有
@@ -197,7 +197,6 @@ async fn prepare_vlm_rank<D: DeviceClient>(
     })
 }
 
-
 /// **decode 单步的设备输入束**（S6j）：图上各输入槽的当步值。
 ///
 /// 为什么成对象：槽值是**逐槽条件装填**的（xqa / fi / sel 三族各看
@@ -214,7 +213,6 @@ impl DecodeStepInputs {
         self.slots.iter().map(|(n, v)| (*n, v.as_slice())).collect()
     }
 }
-
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// turn 启动执行(设备侧照办):GDN 格重置 / 边界快照恢复 + 持久
@@ -336,7 +334,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .iter()
                 .enumerate()
                 .fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
-                    if v > a.1 { (i, v) } else { a }
+                    if v > a.1 {
+                        (i, v)
+                    } else {
+                        a
+                    }
                 })
                 .0 as u32
         } else {
@@ -386,7 +388,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if need_vlm {
             let (ids, images, positions) = {
                 let act = self.turns.active()?;
-                (act.prompt_ids.clone(), act.images.clone(), act.positions.clone())
+                (
+                    act.prompt_ids.clone(),
+                    act.images.clone(),
+                    act.positions.clone(),
+                )
             };
             // **TP2:两 rank 各备一份**(host 表同源;merged 各 rank 设备块)。
             // 缓存同样每 rank 一份:塔无 AR,但块 id/设备面各归各的。
@@ -402,15 +408,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .await?;
             let prep1 = match self.peer.as_mut() {
                 Some(p) => Some(
-                    prepare_vlm_rank(
-                        p,
-                        &mut self.vlm_cache[1],
-                        &ids,
-                        &images,
-                        &positions,
-                        dbg,
-                    )
-                    .await?,
+                    prepare_vlm_rank(p, &mut self.vlm_cache[1], &ids, &images, &positions, dbg)
+                        .await?,
                 ),
                 None => None,
             };
@@ -445,13 +444,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     self.drain_pending_out().await?;
                 }
             }
+            let grant = self.grant_of_session(sid)?;
             let s = self
                 .bank
                 .sessions
                 .get_mut(sid)
                 .ok_or_else(|| ModelError::Msg("prefill 块表增长:会话账不在场".into()))?;
-            // H2 已由 pump 的 Acquire(Grow) 预留；这里只纯分配。
-            self.bank.rel.leg.ensure_for_len(&mut s.block_table, need)?;
+            // **P0-4**：消费本 turn 的准入 Grant。
+            self.bank
+                .rel
+                .ensure_for_len(grant, &mut s.block_table, need)?;
         }
         // ── 主机侧事实(唯一取值点;两 rank 共用)────────────────────────
         let (bt_chain, gdn_slot) = {
@@ -465,7 +467,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let replay_armed = is_last && base > 0 && self.boot.cfg.knobs.query_replay;
         if replay_armed {
             let (pool, graphs) = (&mut self.dev.pool, &mut self.dev.graphs);
-            pool.capture_replay_snap(graphs.session.face_mut(), gdn_slot).await?;
+            pool.capture_replay_snap(graphs.session.face_mut(), gdn_slot)
+                .await?;
         }
         // 部分驻留档的"过去"子集页链(host 面算好;两 rank 同值)
         let past_view = self.past_view_of(base, chunk_ids.len())?;
@@ -551,7 +554,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let tail0 = {
             let (dev, peer) = (&mut self.dev, self.peer.as_mut());
             match peer {
-                None => dev.prefill_chunk_enqueue(&mut host0, &chunk_ids, base, is_last).await?,
+                None => {
+                    dev.prefill_chunk_enqueue(&mut host0, &chunk_ids, base, is_last)
+                        .await?
+                }
                 Some(p) => {
                     let (r0, r1) = join2(
                         dev.prefill_chunk_enqueue(&mut host0, &chunk_ids, base, is_last),
@@ -641,7 +647,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // GDN 快照拍摄(**唯一入口** `capture_gdn_snap`:链推进 + 增量登记 +
             // 索引采集 + 快照;内部已 TP 感知 —— peer 在场时两 rank 各拍各自的池,
             // store 的 state 账仍单份)。
-            self.capture_gdn_snap(sid, new_fed, snap_keep, index_now).await?;
+            self.capture_gdn_snap(sid, new_fed, snap_keep, index_now)
+                .await?;
             // ── B 轴选择层(生产面 + 可选诊断面)──
             // 必须**晚于**边界事件:索引/快照刚登记完,候选块才齐(§8.4)。
             // 两扇门:`select_decode`(生产)= 打分/选择/视图/调和;
@@ -664,7 +671,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             {
                 let (pool, graphs) = (&mut self.dev.pool, &mut self.dev.graphs);
-                pool.restore_replay_snap(graphs.session.face_mut(), gdn_slot).await?;
+                pool.restore_replay_snap(graphs.session.face_mut(), gdn_slot)
+                    .await?;
             }
             let replay_bt = self.bank.sessions.session(sid)?.block_table.clone();
             let replay_past = self.past_view_of(base, chunk_ids.len())?;
@@ -754,9 +762,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             });
         }
         // 末块:末行采样(eos / 预算 / Token)
-        self.sample_and_emit(last_row.ok_or_else(|| ModelError::EngineInvariant { what: "末块缺 logits(采样面与声明不一致)".into() })?).await
+        self.sample_and_emit(last_row.ok_or_else(|| ModelError::EngineInvariant {
+            what: "末块缺 logits(采样面与声明不一致)".into(),
+        })?)
+        .await
     }
-
 
     /// decode 单步执行(设备侧;host 派生量由决策面备齐)
     /// 装填本步的输入束（判据 = **槽在场**，不看宿主旋钮：槽属于图）。
@@ -769,105 +779,112 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         kv_slot: u32,
         gdn_slot: usize,
     ) -> Result<DecodeStepInputs> {
-let mut step_slots: Vec<(&str, Vec<f32>)> = vec![
-    ("frontier", vec![token as f32]),
-    ("pos", vec![pos_rope as f32]),
-    ("kv_len", vec![(pos + 1) as f32]),
-    ("kv_slot", vec![kv_slot as f32]),
-    ("gdn_slot", vec![gdn_slot as f32]),
-];
-// **设备端重复惩罚(2026-10-26)**:固定 256 的 committed history +
-// rep_penalty 都走图输入槽。`rep_penalty<=1` 时写全哨兵 + 1.0,核内
-// 整段跳过 ⇒ 旧路径零行为/零成本变化;槽只在候选词表切档时存在。
-if self.dev.graphs.session.has_input("rep_hist") {
-    let (hist_bits, rep) = {
-        let act = self.turns.active()?;
-        let rep = if act.sampler_on { act.sampler.rep_penalty } else { 1.0 };
-        let hist = if rep > 1.0 {
-            crate::sampler::penalty_history(&act.prompt_ids, &act.out)
-        } else {
-            vec![crate::sampler::REP_HISTORY_SENTINEL; crate::sampler::REP_HISTORY_WINDOW]
-        };
-        (hist.into_iter().map(f32::from_bits).collect::<Vec<_>>(), rep)
-    };
-    step_slots.push(("rep_hist", hist_bits));
-    step_slots.push(("rep_penalty", vec![rep]));
-}
-if self.dev.graphs.session.has_input("xqa_seq") {
-    step_slots.push(("xqa_seq", vec![f32::from_bits((pos + 1) as u32)]));
-    let n = self.dev.graphs.session.input_len("xqa_sem").unwrap_or(0);
-    step_slots.push(("xqa_sem", vec![0.0; n]));
-    // XQA 页表 = 本会话真页链(不喂 = 图里恒等链 = 读到别家 KV;§7.6)
-    if self.dev.graphs.session.has_input("xqa_pt") {
-        step_slots.push(("xqa_pt", self.xqa_pt_of(sid)));
-    }
-}
-// **FI 图内臂每步 ingress**:**表四件套**(位型过线)。图里 `ctx_total`
-// 是**烘死的上界**(调度表形状),当步真值靠**表**(下面 `fi_plan_sync` 刷)。
-// ⚠️ 判据 = **槽在场**(与 xqa_seq 同款纪律):槽属于**图**;曾按"宿主标量
-// cell 在不在"判 ⇒ 单图档四件套一条不写 ⇒ 核读陈旧页表 ⇒ 输出 64 个空
-// token(2026-10-18 实测踩过)。
-if self.dev.graphs.session.has_input("fi_q_cu") {
-    let ctx_total = pos + 1;
-    // 四件套:真值(与承载无关 —— 图内/窗外都读同一批槽)
-    let page = self.dev.pool.geom.page;
-    let bt_chain = {
-        let s = self.bank.sessions.session(sid)?;
-        s.block_table.clone()
-    };
-    // ⚠️ **响亮拒(2026-10-19 审查)**:`.min(bt_chain.len())` 只防"链过长",
-    // 链过短时 `nb_used < ceil(ctx/page)` ⇒ `fi_last_len > page`(结构非法)
-    // ⇒ 核越界读页链。与 prefill 侧 `fi_tables` 同型,一并改成结构化 Err。
-    let need = ctx_total.div_ceil(page.max(1)).max(1);
-    if bt_chain.len() < need {
-        return Err(ModelError::Msg(format!(
+        let mut step_slots: Vec<(&str, Vec<f32>)> = vec![
+            ("frontier", vec![token as f32]),
+            ("pos", vec![pos_rope as f32]),
+            ("kv_len", vec![(pos + 1) as f32]),
+            ("kv_slot", vec![kv_slot as f32]),
+            ("gdn_slot", vec![gdn_slot as f32]),
+        ];
+        // **设备端重复惩罚(2026-10-26)**:固定 256 的 committed history +
+        // rep_penalty 都走图输入槽。`rep_penalty<=1` 时写全哨兵 + 1.0,核内
+        // 整段跳过 ⇒ 旧路径零行为/零成本变化;槽只在候选词表切档时存在。
+        if self.dev.graphs.session.has_input("rep_hist") {
+            let (hist_bits, rep) = {
+                let act = self.turns.active()?;
+                let rep = if act.sampler_on {
+                    act.sampler.rep_penalty
+                } else {
+                    1.0
+                };
+                let hist = if rep > 1.0 {
+                    crate::sampler::penalty_history(&act.prompt_ids, &act.out)
+                } else {
+                    vec![crate::sampler::REP_HISTORY_SENTINEL; crate::sampler::REP_HISTORY_WINDOW]
+                };
+                (
+                    hist.into_iter().map(f32::from_bits).collect::<Vec<_>>(),
+                    rep,
+                )
+            };
+            step_slots.push(("rep_hist", hist_bits));
+            step_slots.push(("rep_penalty", vec![rep]));
+        }
+        if self.dev.graphs.session.has_input("xqa_seq") {
+            step_slots.push(("xqa_seq", vec![f32::from_bits((pos + 1) as u32)]));
+            let n = self.dev.graphs.session.input_len("xqa_sem").unwrap_or(0);
+            step_slots.push(("xqa_sem", vec![0.0; n]));
+            // XQA 页表 = 本会话真页链(不喂 = 图里恒等链 = 读到别家 KV;§7.6)
+            if self.dev.graphs.session.has_input("xqa_pt") {
+                step_slots.push(("xqa_pt", self.xqa_pt_of(sid)));
+            }
+        }
+        // **FI 图内臂每步 ingress**:**表四件套**(位型过线)。图里 `ctx_total`
+        // 是**烘死的上界**(调度表形状),当步真值靠**表**(下面 `fi_plan_sync` 刷)。
+        // ⚠️ 判据 = **槽在场**(与 xqa_seq 同款纪律):槽属于**图**;曾按"宿主标量
+        // cell 在不在"判 ⇒ 单图档四件套一条不写 ⇒ 核读陈旧页表 ⇒ 输出 64 个空
+        // token(2026-10-18 实测踩过)。
+        if self.dev.graphs.session.has_input("fi_q_cu") {
+            let ctx_total = pos + 1;
+            // 四件套:真值(与承载无关 —— 图内/窗外都读同一批槽)
+            let page = self.dev.pool.geom.page;
+            let bt_chain = {
+                let s = self.bank.sessions.session(sid)?;
+                s.block_table.clone()
+            };
+            // ⚠️ **响亮拒(2026-10-19 审查)**:`.min(bt_chain.len())` 只防"链过长",
+            // 链过短时 `nb_used < ceil(ctx/page)` ⇒ `fi_last_len > page`(结构非法)
+            // ⇒ 核越界读页链。与 prefill 侧 `fi_tables` 同型,一并改成结构化 Err。
+            let need = ctx_total.div_ceil(page.max(1)).max(1);
+            if bt_chain.len() < need {
+                return Err(ModelError::Msg(format!(
             "decode FI 表失守:块链 {} 页 < 本步需要 {need} 页(pos={pos} page={page} ctx={ctx_total})",
             bt_chain.len()
         )));
-    }
-    let nb_used = need;
-    let mut idx = vec![0f32; self.dev.pool.geom.nb];
-    for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
-        idx[i] = f32::from_bits(*b);
-    }
-    step_slots.push(("fi_q_cu", vec![0.0, f32::from_bits(1)]));
-    step_slots.push(("fi_indices", idx));
-    step_slots.push(("fi_indptr", vec![0.0, f32::from_bits(nb_used as u32)]));
-    step_slots.push((
-        "fi_last_len",
-        vec![f32::from_bits((ctx_total - (nb_used - 1) * page) as u32)],
-    ));
-}
-// **B-3d 选择层视图**:`select_decode` 档 ⇒ 页表与上下文长走视图输入槽
-// (视图 = 选中页 ++ 新生成尾部;无视图态 ⇒ 写全量链,与不开时等价)
-if self.dev.graphs.session.has_input("sel_pt") {
-    let (pt, len) = self.select_view_step(sid, pos);
-    // **页表不变量守卫**(2026-10-21,合并自 feat/gguf 08790fa):视图页表只要有一项是
-    // ① 宿主占位符(`u32::MAX` 位型)② ≥ 池页数 —— 核就会把编号当字节偏移去读,
-    // 轻则错页、重则 CUDA 700(而且**污染整个上下文**,之后每个 turn 都炸)。
-    // 这一条把"静默越界"改成**结构化拒发**:弃置本 turn、点名页号与 pos,不发核。
-    {
-        let page = self.dev.pool.geom.page.max(1);
-        let nb = self.dev.pool.geom.nb;
-        let need = len.div_ceil(page).max(1);
-        // 表项是**页号的 f32 值**(`page as f32`);唯一例外 = 占位符走
-        // `f32::from_bits(u32::MAX)`(= NaN)。判据按**值**比,别按位型比
-        // (按 `to_bits()` 比会把页号 1 的位型 0x3F800000 当越界,误伤正常步)。
-        let bad = pt
-            .iter()
-            .take(need)
-            .copied()
-            .position(|v| v.is_nan() || v < 0.0 || v.fract() != 0.0 || v >= nb as f32);
-        if let Some(i) = bad {
-            let raw = pt[i].to_bits();
-            return Err(ModelError::Msg(format!(
+            }
+            let nb_used = need;
+            let mut idx = vec![0f32; self.dev.pool.geom.nb];
+            for (i, b) in bt_chain.iter().take(nb_used).enumerate() {
+                idx[i] = f32::from_bits(*b);
+            }
+            step_slots.push(("fi_q_cu", vec![0.0, f32::from_bits(1)]));
+            step_slots.push(("fi_indices", idx));
+            step_slots.push(("fi_indptr", vec![0.0, f32::from_bits(nb_used as u32)]));
+            step_slots.push((
+                "fi_last_len",
+                vec![f32::from_bits((ctx_total - (nb_used - 1) * page) as u32)],
+            ));
+        }
+        // **B-3d 选择层视图**:`select_decode` 档 ⇒ 页表与上下文长走视图输入槽
+        // (视图 = 选中页 ++ 新生成尾部;无视图态 ⇒ 写全量链,与不开时等价)
+        if self.dev.graphs.session.has_input("sel_pt") {
+            let (pt, len) = self.select_view_step(sid, pos);
+            // **页表不变量守卫**(2026-10-21,合并自 feat/gguf 08790fa):视图页表只要有一项是
+            // ① 宿主占位符(`u32::MAX` 位型)② ≥ 池页数 —— 核就会把编号当字节偏移去读,
+            // 轻则错页、重则 CUDA 700(而且**污染整个上下文**,之后每个 turn 都炸)。
+            // 这一条把"静默越界"改成**结构化拒发**:弃置本 turn、点名页号与 pos,不发核。
+            {
+                let page = self.dev.pool.geom.page.max(1);
+                let nb = self.dev.pool.geom.nb;
+                let need = len.div_ceil(page).max(1);
+                // 表项是**页号的 f32 值**(`page as f32`);唯一例外 = 占位符走
+                // `f32::from_bits(u32::MAX)`(= NaN)。判据按**值**比,别按位型比
+                // (按 `to_bits()` 比会把页号 1 的位型 0x3F800000 当越界,误伤正常步)。
+                let bad = pt
+                    .iter()
+                    .take(need)
+                    .copied()
+                    .position(|v| v.is_nan() || v < 0.0 || v.fract() != 0.0 || v >= nb as f32);
+                if let Some(i) = bad {
+                    let raw = pt[i].to_bits();
+                    return Err(ModelError::Msg(format!(
                 "decode 视图页表失守:第 {i}/{need} 项 = {raw}(pos={pos} len={len} page={page} nb={nb})                     ⇒ 拒发(占位符/越界页号会被核当字节偏移读 = CUDA 700 上下文毒化)"
             )));
+                }
+            }
+            step_slots.push(("sel_pt", pt));
+            step_slots.push(("sel_len", vec![len as f32]));
         }
-    }
-    step_slots.push(("sel_pt", pt));
-    step_slots.push(("sel_len", vec![len as f32]));
-}
         Ok(DecodeStepInputs { slots: step_slots })
     }
 
@@ -884,18 +901,13 @@ if self.dev.graphs.session.has_input("sel_pt") {
         // `token 下标 + VLM delta` 推导;KV 长度/槽仍按 token 数。
         // `next_rope_pos` 是**下一枚**生成 token 的位置;本步喂的
         // `token` 是上一枚已发射 token ⇒ 其位置 = next − 1。
-        let pos_rope = usize::try_from(
-            self.turns
-                .active()?
-                .next_rope_pos
-                .saturating_sub(1),
-        )
-        .map_err(|_| {
-            ModelError::Msg(format!(
-                "decode: 绝对 rope 位置为负(token pos={pos}, next_rope_pos={})",
-                self.turns.active().map(|a| a.next_rope_pos).unwrap_or(-1)
-            ))
-        })?;
+        let pos_rope = usize::try_from(self.turns.active()?.next_rope_pos.saturating_sub(1))
+            .map_err(|_| {
+                ModelError::Msg(format!(
+                    "decode: 绝对 rope 位置为负(token pos={pos}, next_rope_pos={})",
+                    self.turns.active().map(|a| a.next_rope_pos).unwrap_or(-1)
+                ))
+            })?;
         // 调试门:decode 步粒度
         owl_shared::step_gate!("engine.decode").await;
         let prof = self.boot.probes.step_profile;
@@ -944,11 +956,28 @@ if self.dev.graphs.session.has_input("sel_pt") {
             self.dump_kv_page(sid, kv_slot, "after").await?;
         }
         if prof {
-            owl_shared::log_info!("step-prof", "pos={pos} fill+launch={:?} wall={}", t0.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
+            owl_shared::log_info!(
+                "step-prof",
+                "pos={pos} fill+launch={:?} wall={}",
+                t0.unwrap().elapsed(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    % 100000
+            );
         }
         if prof {
             let total = t0.unwrap().elapsed();
-            owl_shared::log_info!("step-prof", "pos={pos} step-total={total:?} wall2={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
+            owl_shared::log_info!(
+                "step-prof",
+                "pos={pos} step-total={total:?} wall2={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    % 100000
+            );
         }
         self.turns.active_mut()?.fed += 1;
         // E2c:decode 跨页边界 → 快照拍摄(同流保序,先拍再采样)
@@ -1010,12 +1039,12 @@ if self.dev.graphs.session.has_input("sel_pt") {
             && eff_sampler.topk > 0
             && eff_sampler.topk <= 32;
         let nt = if sampler_on && use_cand {
-            let cs = self
-                .read_session_cands()
-                .await?
-                .ok_or_else(|| ModelError::EngineInvariant {
-                    what: "候选采样:图无 cand 槽(判据漂移)".into(),
-                })?;
+            let cs =
+                self.read_session_cands()
+                    .await?
+                    .ok_or_else(|| ModelError::EngineInvariant {
+                        what: "候选采样:图无 cand 槽(判据漂移)".into(),
+                    })?;
             let mut rng = seed_base ^ step.wrapping_mul(0xBF58476D1CE4E5B9);
             crate::sampler::sample_from_candidates(&cs[0], &eff_sampler, &mut rng)
         } else if sampler_on {
@@ -1038,8 +1067,9 @@ if self.dev.graphs.session.has_input("sel_pt") {
                 face.dtoh(&kv0.0, &mut whole).await?;
                 let (hkv, hd) = (self.dev.pool.geom.dims.hkv, self.dev.pool.geom.dims.hd);
                 let _page = self.dev.pool.geom.page;
-                let k_off =
-                    |slot: usize, d: usize| -> usize { owl_models::env::knhd_offset(slot, 0, d, hkv, hd) };
+                let k_off = |slot: usize, d: usize| -> usize {
+                    owl_models::env::knhd_offset(slot, 0, d, hkv, hd)
+                };
                 let probe = |slot: usize| -> Option<usize> {
                     let win = if fp8 { 8usize } else { 16usize };
                     let base = k_off(slot, 0) * esz;
@@ -1073,7 +1103,11 @@ if self.dev.graphs.session.has_input("sel_pt") {
                 let base_now = k_off(pos_now, 0) * esz;
                 let win_now = if fp8 { 8usize } else { 16usize };
                 if base_now + win_now > whole.len() {
-                    owl_shared::log_debug!("kv-hex", "槽{pos_now} 越出回读面(base={base_now} win={win_now} 面={}B)⇒ 跳过", whole.len());
+                    owl_shared::log_debug!(
+                        "kv-hex",
+                        "槽{pos_now} 越出回读面(base={base_now} win={win_now} 面={}B)⇒ 跳过",
+                        whole.len()
+                    );
                 } else if fp8 {
                     let hex: String = whole[base_now..base_now + 8]
                         .iter()
@@ -1106,7 +1140,11 @@ if self.dev.graphs.session.has_input("sel_pt") {
                 let pretty: Vec<String> = top
                     .iter()
                     .map(|(v, i)| {
-                        format!("{:.2}:'{}'", v, self.boot.tok.decode(&[*i]).replace('\n', "\\n"))
+                        format!(
+                            "{:.2}:'{}'",
+                            v,
+                            self.boot.tok.decode(&[*i]).replace('\n', "\\n")
+                        )
                     })
                     .collect();
                 owl_shared::log_debug!("logits-dump", "t{turn_id} s{step}: {}", pretty.join(" | "));
@@ -1125,19 +1163,40 @@ if self.dev.graphs.session.has_input("sel_pt") {
             let t_sample = prof.then(std::time::Instant::now);
             let nt = crate::sampler::sample(&mut logits, &eff_sampler, &mut rng, &history);
             if prof {
-                owl_shared::log_info!("step-prof", "pos={pos} host-sample={:?} wall3={}", t_sample.unwrap().elapsed(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
+                owl_shared::log_info!(
+                    "step-prof",
+                    "pos={pos} host-sample={:?} wall3={}",
+                    t_sample.unwrap().elapsed(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                        % 100000
+                );
             }
             if self.boot.probes.debug {
-                owl_shared::log_debug!("sample-dump", "t{turn_id} s{step}: sampled={nt} hist={} pen={}", history.len(), eff_sampler.rep_penalty);
+                owl_shared::log_debug!(
+                    "sample-dump",
+                    "t{turn_id} s{step}: sampled={nt} hist={} pen={}",
+                    history.len(),
+                    eff_sampler.rep_penalty
+                );
             }
             nt
         } else if self.dev.env().diag.host_argmax {
             // P1.1:全表出口(半表档 = 拼接后)
             let logits = self.read_full_logits("logits").await?;
-            logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
-                if v > a.1 { (i, v) } else { a }
-            })
-            .0 as u32
+            logits
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
+                    if v > a.1 {
+                        (i, v)
+                    } else {
+                        a
+                    }
+                })
+                .0 as u32
         } else {
             // D1 取证:greedy 路径 logits 形状仪表(OWL_DEBUG;前 16 步,与
             // 采样分支同格式 —— 基线/融合 A/B 对比用)
@@ -1159,17 +1218,25 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     // `select_nth_unstable_by(7)` 会越界崩引擎 —— 先按实际长度夹紧。
                     if !top.is_empty() {
                         let k = top.len().saturating_sub(1).min(7);
-                    top.select_nth_unstable_by(k, |a, b| b.0.total_cmp(&a.0));
+                        top.select_nth_unstable_by(k, |a, b| b.0.total_cmp(&a.0));
                     }
                     top.truncate(8);
                     top.sort_by(|a, b| b.0.total_cmp(&a.0));
                     let pretty: Vec<String> = top
                         .iter()
                         .map(|(v, i)| {
-                            format!("{:.2}:'{}'", v, self.boot.tok.decode(&[*i]).replace('\n', "\\n"))
+                            format!(
+                                "{:.2}:'{}'",
+                                v,
+                                self.boot.tok.decode(&[*i]).replace('\n', "\\n")
+                            )
                         })
                         .collect();
-                    owl_shared::log_debug!("logits-dump", "t{turn_id} s{step}: {}", pretty.join(" | "));
+                    owl_shared::log_debug!(
+                        "logits-dump",
+                        "t{turn_id} s{step}: {}",
+                        pretty.join(" | ")
+                    );
                 }
             }
             // P1.1:词表切档的**设备 token 是半表局部 argmax**(图内 stride = 本 rank
@@ -1182,7 +1249,11 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     .iter()
                     .enumerate()
                     .fold((0usize, f32::NEG_INFINITY), |a, (i, &v)| {
-                        if v > a.1 { (i, v) } else { a }
+                        if v > a.1 {
+                            (i, v)
+                        } else {
+                            a
+                        }
                     })
                     .0 as u32
             } else {
@@ -1191,7 +1262,11 @@ if self.dev.graphs.session.has_input("sel_pt") {
             }
         };
         if prof {
-            owl_shared::log_info!("step-prof", "pos={pos} token-dtoh={:?}", t_dtoh.unwrap().elapsed());
+            owl_shared::log_info!(
+                "step-prof",
+                "pos={pos} token-dtoh={:?}",
+                t_dtoh.unwrap().elapsed()
+            );
         }
         mrec("decode.step", t_step.elapsed());
         // P2.2 侦察(2026-10-19):execute_decode 主体(321→此) vs 步间隔 ⇒ 定位
@@ -1215,7 +1290,9 @@ if self.dev.graphs.session.has_input("sel_pt") {
                 .map(|b| TensorOps::of_block(b.id, dtype, vec![1, hidden]))
                 .collect();
             if taps.len() == self.dev.spec_rt.dflash_tap_count {
-                self.dev.prefill_dflash_encode(self.boot.probes, &taps, pos).await?;
+                self.dev
+                    .prefill_dflash_encode(self.boot.probes, &taps, pos)
+                    .await?;
             }
             mrec("decode.sync", t_syn.elapsed());
             if degraded {
@@ -1238,7 +1315,14 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     );
                 }
             }
-            mrec(if degraded { "decode.step.deg" } else { "decode.step.seed" }, t_step.elapsed());
+            mrec(
+                if degraded {
+                    "decode.step.deg"
+                } else {
+                    "decode.step.seed"
+                },
+                t_step.elapsed(),
+            );
             self.tspec()?.bare_seed_step = false;
         }
         // P2.2 侦察(2026-10-19):`sample_and_emit` = tokenizer 解码差分 + stop 检查
@@ -1272,7 +1356,13 @@ if self.dev.graphs.session.has_input("sel_pt") {
         // ── ① 页表:每行 = 会话真链(整表重写;T×nb×4B 极小)──
         let mut tables: Vec<Vec<u32>> = Vec::with_capacity(t_rows);
         for r in &rows {
-            tables.push(self.bank.sessions.session(r.session_id)?.block_table.clone());
+            tables.push(
+                self.bank
+                    .sessions
+                    .session(r.session_id)?
+                    .block_table
+                    .clone(),
+            );
         }
         {
             let face = self.dev.graphs.session.face_mut();
@@ -1300,9 +1390,12 @@ if self.dev.graphs.session.has_input("sel_pt") {
             lens_v[i] = r.kv_len as f32;
             gslot_v[i] = r.gdn_slot as f32;
         }
-        let need_logits = rows
-            .iter()
-            .any(|r| self.turns.active_by_id(r.turn).map(|a| a.sampler_on).unwrap_or(false));
+        let need_logits = rows.iter().any(|r| {
+            self.turns
+                .active_by_id(r.turn)
+                .map(|a| a.sampler_on)
+                .unwrap_or(false)
+        });
 
         // ── ③ 图臂优先(捕获成功时);否则 eager 整模单树 ──
         let (logits_all, tok_dev): (Option<Vec<f32>>, Option<Vec<f32>>) =
@@ -1314,9 +1407,14 @@ if self.dev.graphs.session.has_input("sel_pt") {
                     ("kv_slot", &slots_v),
                     ("gdn_slot", &gslot_v),
                 ];
-                let g = self.dev.graphs.batch.as_mut().ok_or_else(|| {
-                    ModelError::EngineInvariant { what: "合批图缺席(判据漂移)".into() }
-                })?;
+                let g =
+                    self.dev
+                        .graphs
+                        .batch
+                        .as_mut()
+                        .ok_or_else(|| ModelError::EngineInvariant {
+                            what: "合批图缺席(判据漂移)".into(),
+                        })?;
                 g.step(&refs).await?;
                 let tok = g.read_output_f32("token").await?;
                 let logits = if need_logits {
@@ -1328,15 +1426,21 @@ if self.dev.graphs.session.has_input("sel_pt") {
             } else {
                 // eager 臂(只喂真行;不 pad)
                 let ids = TensorOps::from_host(Dtype::F32, vec![t_rows], &f32b(&ids_v[..t_rows]));
-                let pos_t = TensorOps::from_host(Dtype::F32, vec![1, t_rows], &f32b(&pos[..t_rows]));
-                let slots_t = TensorOps::from_host(Dtype::F32, vec![1, t_rows], &f32b(&slots_v[..t_rows]));
-                let lens_t = TensorOps::from_host(Dtype::F32, vec![1, t_rows], &f32b(&lens_v[..t_rows]));
-                let gslot_t = TensorOps::from_host(Dtype::F32, vec![t_rows], &f32b(&gslot_v[..t_rows]));
-                let bt8 = self.dev.pool.bt_batch_leaf().ok_or_else(|| {
-                    ModelError::EngineInvariant {
-                        what: "合批页表块未分配(max_batch 档位不一致)".into(),
-                    }
-                })?;
+                let pos_t =
+                    TensorOps::from_host(Dtype::F32, vec![1, t_rows], &f32b(&pos[..t_rows]));
+                let slots_t =
+                    TensorOps::from_host(Dtype::F32, vec![1, t_rows], &f32b(&slots_v[..t_rows]));
+                let lens_t =
+                    TensorOps::from_host(Dtype::F32, vec![1, t_rows], &f32b(&lens_v[..t_rows]));
+                let gslot_t =
+                    TensorOps::from_host(Dtype::F32, vec![t_rows], &f32b(&gslot_v[..t_rows]));
+                let bt8 =
+                    self.dev
+                        .pool
+                        .bt_batch_leaf()
+                        .ok_or_else(|| ModelError::EngineInvariant {
+                            what: "合批页表块未分配(max_batch 档位不一致)".into(),
+                        })?;
                 let scratch = self.dev.pool.batch_attn_v2_scratch().ok_or_else(|| {
                     ModelError::EngineInvariant {
                         what: "合批注意力 scratch 未分配(max_batch 档位不一致)".into(),
@@ -1368,8 +1472,13 @@ if self.dev.graphs.session.has_input("sel_pt") {
                         slots: gslot_t.clone(),
                     })
                     .collect();
-                let mut ctx =
-                    ForwardCtx::model_decode(t_rows, &pos_t, &kvs_step, &self.dev.boot.rope, &gdns_step);
+                let mut ctx = ForwardCtx::model_decode(
+                    t_rows,
+                    &pos_t,
+                    &kvs_step,
+                    &self.dev.boot.rope,
+                    &gdns_step,
+                );
                 ctx.env = self.dev.env();
                 ctx.attn_v2 = Some(scratch);
                 ctx.v2_bt8 = Some(&bt8);
@@ -1442,9 +1551,11 @@ if self.dev.graphs.session.has_input("sel_pt") {
                 (act.sampler_on, act.sampler, seed, turn_id, step, history)
             };
             let nt = if sampler_on {
-                let all = logits_all.as_ref().ok_or_else(|| ModelError::EngineInvariant {
-                    what: "合批采样档缺 logits 回读(判据漂移)".into(),
-                })?;
+                let all = logits_all
+                    .as_ref()
+                    .ok_or_else(|| ModelError::EngineInvariant {
+                        what: "合批采样档缺 logits 回读(判据漂移)".into(),
+                    })?;
                 let mut row_logits = all[i * vocab..(i + 1) * vocab].to_vec();
                 let mut rng = seed ^ step.wrapping_mul(0xBF58476D1CE4E5B9);
                 crate::sampler::sample(&mut row_logits, &eff_sampler, &mut rng, &history)
@@ -1452,9 +1563,11 @@ if self.dev.graphs.session.has_input("sel_pt") {
                 // 图臂:设备逐行 argmax(零额外 D2H 面)
                 tok[i] as u32
             } else {
-                let all = logits_all.as_ref().ok_or_else(|| ModelError::EngineInvariant {
-                    what: "合批贪心档缺 logits(判据漂移)".into(),
-                })?;
+                let all = logits_all
+                    .as_ref()
+                    .ok_or_else(|| ModelError::EngineInvariant {
+                        what: "合批贪心档缺 logits(判据漂移)".into(),
+                    })?;
                 all[i * vocab..(i + 1) * vocab]
                     .iter()
                     .enumerate()
@@ -1492,13 +1605,8 @@ if self.dev.graphs.session.has_input("sel_pt") {
     // 保持,pending 延续);全接受 → 状态直落 state@F+k = 下轮不变量。
     // ====================================================================
 
-
     /// GDN 状态格画像(首末层 conv_v/rec;owl_gdn_slot_profile 委托)
-    pub(crate) async fn probe_gdn_dump(
-        &mut self,
-        gdn_slot: usize,
-        step: u64,
-    ) -> Result<()> {
+    pub(crate) async fn probe_gdn_dump(&mut self, gdn_slot: usize, step: u64) -> Result<()> {
         if step >= 6 {
             return Ok(());
         }
@@ -1513,7 +1621,6 @@ if self.dev.graphs.session.has_input("sel_pt") {
         Ok(())
     }
 
-
     /// 采样 + 事件产出(Greedy;E3 设备 argmax,token id 直入)。
     /// eos 命中或预算尽 → Completed;否则 Token(delta = 解码文本增量)。
     pub(crate) async fn sample_and_emit(&mut self, nt: u32) -> Result<TurnEvent> {
@@ -1521,7 +1628,11 @@ if self.dev.graphs.session.has_input("sel_pt") {
         {
             // 崩坏排查打点:首 token / EOS 事实(decode 与 spec 两路汇合)
             let bs = self.boot.seq;
-            let first = self.turns.active().map(|a| a.out.is_empty()).unwrap_or(false);
+            let first = self
+                .turns
+                .active()
+                .map(|a| a.out.is_empty())
+                .unwrap_or(false);
             if first {
                 mfact(bs, "emit.first", nt as u64);
             }
@@ -1586,7 +1697,10 @@ if self.dev.graphs.session.has_input("sel_pt") {
                 return Ok(done_ev);
             }
             self.turns.pending_events.push_back(done_ev);
-            return Ok(TurnEvent::Token { turn: turn_id, delta });
+            return Ok(TurnEvent::Token {
+                turn: turn_id,
+                delta,
+            });
         }
         if budget_done {
             // 末 token 也要作为 Token 事件发出 —— 否则 (a) usage.completion
@@ -1595,12 +1709,16 @@ if self.dev.graphs.session.has_input("sel_pt") {
             // Completed(pending 队列先出,见 running::pump)
             let done_ev = self.complete(crate::turn::FinishReason::Length).await?;
             self.turns.pending_events.push_back(done_ev);
-            return Ok(TurnEvent::Token { turn: turn_id, delta });
+            return Ok(TurnEvent::Token {
+                turn: turn_id,
+                delta,
+            });
         }
-        Ok(TurnEvent::Token { turn: turn_id, delta })
+        Ok(TurnEvent::Token {
+            turn: turn_id,
+            delta,
+        })
     }
-
-
 
     /// ⚙ diag:把"当前槽所在页"的 KV 字节 d2h 落盘(层 0 的 k 池;写者足迹取证)。
     /// 落 `/tmp/kv-{tag}.bin` + `/tmp/kv-meta.txt`(blk/off/hkv/hd/page/字节数)。
@@ -1609,7 +1727,11 @@ if self.dev.graphs.session.has_input("sel_pt") {
         let page = self.dev.pool.geom.page;
         let (hkv, hd) = (d.hkv, d.hd);
         // fp8 池 = 1B/元素(扁平 u8 账);f16 池 = 2B ✓
-        let esize = if self.dev.pool.geom.kv_fp8 { 1 } else { d.dtype.size_bytes() };
+        let esize = if self.dev.pool.geom.kv_fp8 {
+            1
+        } else {
+            d.dtype.size_bytes()
+        };
         let row_bytes = hkv * hd * esize;
         let blk = {
             let s = self.bank.sessions.session(sid)?;
@@ -1625,27 +1747,24 @@ if self.dev.graphs.session.has_input("sel_pt") {
         let face = self.dev.graphs.session.face_mut();
         // 记名(全量):KV 页 dump 探针的临时块(按 tag 区分调用点)
         let scratch = face
-            .alloc(owl_iface::contract::Dtype::U32, n / 4, &format!("probe.kv_page.{tag}"))
+            .alloc(
+                owl_iface::contract::Dtype::U32,
+                n / 4,
+                &format!("probe.kv_page.{tag}"),
+            )
             .await?;
-        let src = owl_iface::contract::Bytes::new(
-            pool_id,
-            n / 4,
-            owl_iface::contract::Dtype::U32,
-            0,
-        );
-        face.copy_block_at(
-            &src,
-            blk as usize * n,
-            &scratch,
-            0,
-            n,
-        )
-        .await?;
+        let src =
+            owl_iface::contract::Bytes::new(pool_id, n / 4, owl_iface::contract::Dtype::U32, 0);
+        face.copy_block_at(&src, blk as usize * n, &scratch, 0, n)
+            .await?;
         let mut buf = vec![0u8; n];
         face.dtoh(&scratch, &mut buf).await?;
         let _ = face.free(&[scratch.id]).await;
-        std::fs::write(crate::probe_dump::probe_path(&format!("kv-{tag}.bin")), &buf)
-            .map_err(|e| owl_iface::contract::ModelError::Msg(format!("kv dump 落盘: {e}")))?;
+        std::fs::write(
+            crate::probe_dump::probe_path(&format!("kv-{tag}.bin")),
+            &buf,
+        )
+        .map_err(|e| owl_iface::contract::ModelError::Msg(format!("kv dump 落盘: {e}")))?;
         let meta = format!(
             "tag={tag} slot={kv_slot} blk={blk} off={} hkv={hkv} hd={hd} page={page} row_bytes={row_bytes} page_bytes={n}\n",
             kv_slot as usize % page
@@ -1662,7 +1781,6 @@ if self.dev.graphs.session.has_input("sel_pt") {
         }
         Ok(())
     }
-
 }
 
 impl<D: DeviceClient> crate::engine::RankDev<D> {
@@ -1746,7 +1864,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let ids_t = TensorOps::from_host(
             Dtype::F32,
             vec![t],
-            &block.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect::<Vec<u8>>(),
+            &block
+                .iter()
+                .flat_map(|v| (*v as f32).to_le_bytes())
+                .collect::<Vec<u8>>(),
         );
         // **VLM m-RoPE delta**(V5):只加到 rope 位置;KV slot/lens/FI ctx
         // 仍是真实 token 位置(与 decode 的 `pos_rope` 同律)。
@@ -1758,7 +1879,11 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let pos_t = TensorOps::from_host(
             Dtype::F32,
             vec![t],
-            &f32b(&(rope_base..rope_base + t).map(|v| v as f32).collect::<Vec<_>>()),
+            &f32b(
+                &(rope_base..rope_base + t)
+                    .map(|v| v as f32)
+                    .collect::<Vec<_>>(),
+            ),
         );
         let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let slots_t = TensorOps::from_host(
@@ -1791,25 +1916,43 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let k_fi_leaf = self.pool.kv_fi_leaves();
             let face = self.graphs.session.face_mut();
             let q_cu_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, t as i32])).step(), face)
-                .await?;
+                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, t as i32])).step(),
+                face,
+            )
+            .await?;
             let idx_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![nb],
-                    &i32le(&bt_chain.iter().map(|&b| b as i32).collect::<Vec<_>>())).step(), face)
-                .await?;
+                TensorOps::from_host(
+                    Dtype::U32,
+                    vec![nb],
+                    &i32le(&bt_chain.iter().map(|&b| b as i32).collect::<Vec<_>>()),
+                )
+                .step(),
+                face,
+            )
+            .await?;
             let ind_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, nb as i32])).step(), face)
-                .await?;
+                TensorOps::from_host(Dtype::U32, vec![2], &i32le(&[0, nb as i32])).step(),
+                face,
+            )
+            .await?;
             let ll_b = owl_models::interpreters::eval_ops(
-                TensorOps::from_host(Dtype::U32, vec![1],
-                    &i32le(&[(ctx_total - nb * page + page) as i32])).step(), face)
-                .await?;
+                TensorOps::from_host(
+                    Dtype::U32,
+                    vec![1],
+                    &i32le(&[(ctx_total - nb * page + page) as i32]),
+                )
+                .step(),
+                face,
+            )
+            .await?;
             let q_cu = TensorOps::of_block(q_cu_b.id, Dtype::U32, vec![2]);
             let indices = TensorOps::of_block(idx_b.id, Dtype::U32, vec![nb]);
             let indptr = TensorOps::of_block(ind_b.id, Dtype::U32, vec![2]);
             let last_len = TensorOps::of_block(ll_b.id, Dtype::U32, vec![1]);
-            let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) =
-                k_fi_leaf.iter().map(|(k, v)| (k.clone(), v.clone())).unzip();
+            let (kcs, vcs): (Vec<TensorOps>, Vec<TensorOps>) = k_fi_leaf
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .unzip();
             fi_tensors = (kcs, vcs, q_cu, indices, indptr, last_len);
             Some(FiPrefillCtx {
                 kcs: &fi_tensors.0,
@@ -1827,9 +1970,17 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // 逐层 from_host 兜底;48 次 8B H2D × ~3.5ms 往返)
         let seq_cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
         let mut ctx = owl_models::module::ForwardCtx::model_prefill(
-            t, &pos_t, &kvs_step, &self.boot.rope, &gdns_step, &slots_t, &lens_t, &gdn_slot_t,
+            t,
+            &pos_t,
+            &kvs_step,
+            &self.boot.rope,
+            &gdns_step,
+            &slots_t,
+            &lens_t,
+            &gdn_slot_t,
             Some(gdn_slot), // A13:host 槽真值(verify T≤16 不走 chunked 臂;注入即真值)
-            base, fi,
+            base,
+            fi,
         );
         ctx.seq_cu = Some(&seq_cu);
         ctx.env = self.env();
@@ -1845,13 +1996,19 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // free(每轮泄漏 verify 全部中间块 —— M2a 存量雷,本轮修复)。
         let hidden = self.boot.model.last_hidden(&ids_t, &ctx);
         let hd = hidden.shape()[1];
-        let (hb, arena1) =
-            owl_models::interpreters::eval_ops_scoped_env(hidden.step(), face, env, self.boot.tp.as_ref()).await?;
+        let (hb, arena1) = owl_models::interpreters::eval_ops_scoped_env(
+            hidden.step(),
+            face,
+            env,
+            self.boot.tp.as_ref(),
+        )
+        .await?;
         // 树二:lm_head + 逐行 argmax(引用树一根块,不重建整模前向)
         let hview = TensorOps::of_block(hb.id, self.pool.geom.dims.dtype, vec![t, hd]);
         let logits = self.boot.model.embed.lm_head_matmul(&hview, &gguf);
-        let rows: Vec<TensorOps> =
-            (0..t).map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab)).collect();
+        let rows: Vec<TensorOps> = (0..t)
+            .map(|r| owl_models::ops::argmax_f32idx(&logits, vocab, r * vocab))
+            .collect();
         let refs: Vec<&TensorOps> = rows.iter().collect();
         let mut root = TensorOps::call(owl_models::ops::SemanticKernel::Concat);
         // FIXME(2026-10-13,律 #1):`refs.get(i).unwrap_or(refs[0])` 在
@@ -1861,16 +2018,30 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         for i in 0..owl_models::kernel::CONCAT_ROWS_SLOTS {
             root = root.arg(refs.get(i).copied().unwrap_or(refs[0]));
         }
-        let root = root.arg_usize(t).arg_usize(1).arg_usize(1).with_shape(Dtype::F32, vec![t, 1]);
-        let (b, arena2) =
-            owl_models::interpreters::eval_ops_scoped_env(root.step(), face, env, self.boot.tp.as_ref()).await?;
+        let root = root
+            .arg_usize(t)
+            .arg_usize(1)
+            .arg_usize(1)
+            .with_shape(Dtype::F32, vec![t, 1]);
+        let (b, arena2) = owl_models::interpreters::eval_ops_scoped_env(
+            root.step(),
+            face,
+            env,
+            self.boot.tp.as_ref(),
+        )
+        .await?;
         let mut buf = vec![0u8; 4 * t];
         face.dtoh(&b, &mut buf).await?;
         // A11:采样接受需要各行**目标分布**(不只 argmax)⇒ 按需物化
         // [t, vocab] 行 logits(f16 → host f32;仅采样档付这份 D2H)
         let row_logits: Option<Vec<f32>> = if want_logits {
-            let (lb, arena3) =
-                owl_models::interpreters::eval_ops_scoped_env(logits.step(), face, env, self.boot.tp.as_ref()).await?;
+            let (lb, arena3) = owl_models::interpreters::eval_ops_scoped_env(
+                logits.step(),
+                face,
+                env,
+                self.boot.tp.as_ref(),
+            )
+            .await?;
             let mut lbuf = vec![0u8; 2 * t * vocab];
             face.dtoh(&lb, &mut lbuf).await?;
             face.free(&[lb.id]).await?;
@@ -1933,7 +2104,12 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         rank: u8,
         want_tokv: bool,
         want_cand: bool,
-    ) -> Result<(Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>)> {
+    ) -> Result<(
+        Vec<f32>,
+        Option<Vec<f32>>,
+        Option<Vec<f32>>,
+        Option<Vec<f32>>,
+    )> {
         let vg = self.graphs.verify_mut(depth)?;
         // **图外分相**(2026-10-26;本轮 CUPTI 账钉出 5.1–5.7ms/轮不在图内):
         // fi=FI 表刷新 / launch=装填+入队回执 / tok=等图完成+回读。
@@ -1971,8 +2147,14 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         mrec(&format!("spec.verify.pre.launch.r{rank}"), t_tok - t_launch);
         mrec(&format!("spec.verify.pre.tok.r{rank}"), t_logits - t_tok);
         // tokv 计时 = 读 64B 的往返;cand 计时 = 读 256B 的往返(logits 各自独立)
-        mrec(&format!("spec.verify.pre.tokv.r{rank}"), t_tokv_after - t_tokv);
-        mrec(&format!("spec.verify.pre.cand.r{rank}"), t_end - t_tokv_after);
+        mrec(
+            &format!("spec.verify.pre.tokv.r{rank}"),
+            t_tokv_after - t_tokv,
+        );
+        mrec(
+            &format!("spec.verify.pre.cand.r{rank}"),
+            t_end - t_tokv_after,
+        );
         mrec(&format!("spec.verify.pre.all.r{rank}"), t_end - t_fi);
         Ok((tok, tokv, cand, logits))
     }
