@@ -1976,9 +1976,16 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     // ------------------------------------------------------------------
     // **代际准入门**(2026-10-27 用户裁决:权重格式定算子族,代际只做门)
     //
-    // 判据表 = `owl_kernels::admit`(零依赖单源);投影/裁决 = `owl_models::admit`。
-    // 放在 boot 而不是发射时:发射时报 `no kernel image available` 是运维事故;
-    // 且实测已定的「不该跑」组合(GDN chunked × sm_120 × spec)必须当场拦。
+    // 判据表 = `owl_kernels::driver::{OpFamily, Admit}`(选核唯一出口拥有);
+    // 投影/裁决 = `owl_models::admit`。
+    //
+    // **为什么还要一处 boot 级 pre-check**(2026-10-27 实测):逐算子那道门在
+    // `KernelEnvironment::resolve()`(= 走 `driver::resolve` 的族),但 **GDN chunked
+    // 六核(`cumsum/kkt/merge/wu/h/o`)是按资产名直发的,不经过 resolve** —— 只留
+    // 算子级门时 `gdn_chunked + spec` 仍能起机(实测)。所以:
+    //   · 算子级门 = 权威(每个走 picker 的族逐条拦,报的是真核名);
+    //   · 本 pre-check = 覆盖"不走 picker"的族 + **在装权重之前**快速拒启。
+    // 两处调的是**同一张表**,不存在第二套规则。
     // ------------------------------------------------------------------
     match owl_models::admit::check_env(&env, rm.quant_plan, cfg.knobs.draft.depth) {
         Ok(summary) => owl_shared::log_info!("admit", "{}", summary),

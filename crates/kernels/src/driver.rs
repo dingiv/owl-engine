@@ -489,11 +489,68 @@ pub struct KernelPick {
     pub shape: Shape,
 }
 
+/// **代际准入表**(由选核唯一出口拥有;规则见 `crate::admit`)。
+pub use crate::admit::{Admit, AdmitCtx, OpFamily};
+
 impl KernelPick {
     /// **按 `KernelSpec` 拾取**(生产臂用):名字 = 算子关联常量,
     /// 元数据/槽序/检查函数随之而来(编译期耦合,名字不可能写错)。
     pub const fn of<T: crate::spec::KernelSpec>(shape: Shape) -> Self {
         Self { name: T::ENTRY, shape }
+    }
+
+    /// **本 pick 的 ISA 族**(权重格式侧身份;认不出 = `None` = 不设门)。
+    ///
+    /// 为什么按**名字**判而不是按执行家族:执行家族是**路由**概念
+    /// (`marlin` / `finfer` / `gdn`),而 ISA 族要细到"同一族里哪条臂"
+    /// —— GDN chunked(Triton 六核 `cumsum/kkt/merge/wu/h/o`)与标量臂
+    /// (`owl_gdn_*`)在**同一执行家族**里,但代际门不同。名字是这里唯一
+    /// 能分开它们的稳定标识(族清单见 `crate::family::*`)。
+    pub fn isa_family(&self) -> Option<crate::OpFamily> {
+        use crate::OpFamily as F;
+        let n = self.name;
+        // GGUF 块型(MMQ/MMVQ/TILE/SMEM + 激活量化 + 行解量化)
+        if n.starts_with("owl_gguf_") || n.starts_with("owl_mmq2_") {
+            return Some(F::GgufMmq);
+        }
+        // Marlin(W4A8 的名字里带 `w4a8`;其余 W4A16)
+        if n.contains("marlin") {
+            return Some(if n.contains("w4a8") { F::MarlinW4A8 } else { F::MarlinW4A16 });
+        }
+        if n.starts_with("flashinfer") || n.contains("FlashPrefillWithPagedKVCache") {
+            return Some(F::FiPrefill);
+        }
+        if n.starts_with("owl_xqa_") || n.contains("_xqa_") {
+            return Some(F::Xqa);
+        }
+        // GDN:Triton chunked 六核 vs 原生标量/融合臂
+        if matches!(n, "cumsum" | "kkt" | "merge" | "wu" | "h" | "o") {
+            return Some(F::GdnChunked);
+        }
+        if n.starts_with("owl_gdn_") || n.starts_with("gdn_scalar_") {
+            return Some(F::GdnScalar);
+        }
+        if n.contains("cublas") {
+            return Some(F::CublasF16);
+        }
+        None
+    }
+
+    /// **代际准入裁决**(`None` = 认不出族 ⇒ 不设门;与 tag filter 同律)。
+    ///
+    /// 这是「显卡做门」在**选核面**的落点:调用方(解释器的唯一执行入口)拿到
+    /// `Some(Deny)` 必须**拒发**,而不是发出去等驱动报 no kernel image。
+    pub fn admit(
+        &self,
+        env: &OpEnv,
+        spec_depth: usize,
+    ) -> Option<crate::Admit> {
+        self.isa_family().map(|f| {
+            f.admit(crate::AdmitCtx {
+                arch: env.hw.arch,
+                spec_depth,
+            })
+        })
     }
 
     /// 本算子的准入声明(未建表 = `None`,即"仅引入")
