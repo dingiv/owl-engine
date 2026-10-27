@@ -661,10 +661,15 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 两次 PCIe),而 prefill 的 attention 读放大远小于 17.7 GB 权重读。
         // 判据 = 空闲槽够"下一 chunk + 工作集"的余量;池将满(长 ctx)时自动回
         // 到逐块下沉。语义不变:视图仍只读选中块(懒沉只是**少腾**设备槽)。
+        //
+        // ⚠️ **2026-10-27 修正**:原式把 `workspace_per_req` 也扣进余量 ——
+        // 但工作集块**本来就是要常驻的**(它们是视图读的那批),不该再从"新
+        // 写入的余量"里扣第二遍。多扣 256 页(= 8k tok)直接把**密集区间**
+        // 从 47.7k 压到 37.4k:实测同一任务 40.4k 正常 / 36.7k 崩(而 36.7k <
+        // 37.4k,说明边界附近由选中覆盖率随机性主导),44k 更是必然掉进稀疏。
+        // 现在余量 = 本 chunk 写入 + 小量安全边。
         let page = self.dev.pool.geom.page.max(1);
-        let margin = self.boot.cfg.prefill_chunk.div_ceil(page).max(1)
-            + self.boot.cfg.knobs.workspace_per_req.div_ceil(page).max(1)
-            + 2;
+        let margin = self.boot.cfg.prefill_chunk.div_ceil(page).max(1) + 8;
         if !sink.is_empty() && self.bank.rel.leg.slots_free() >= margin + need.len() {
             self.sel.note_lazy_keep(sink.len());
             owl_shared::log_debug!(
@@ -918,10 +923,22 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.sel.note_prefill_subset();
         let mut pages = view_pages;
         let last = base + t.saturating_sub(1);
+        // **尾部拼接的洞计数**(2026-10-27 立案):这段 = [上次召回点, 本 chunk 末),
+        // 而 reconcile 的 keep 只有 sink(2 块)+recent(4 块)+top-k —— 一个 chunk
+        // 有 `chunk/page` 页(2048 tok ⇒ 64 页)⇒ **只有 4 页受保护**。
+        // 若其余被沉,这里 push 到的就是占位符(不是物理页号)⇒ 喂给 FI/v2 =
+        // 静默错页。**先只计数不改变行为**,用实测决定是"过滤"还是"recent 扩容"。
+        let mut tail_holes = 0usize;
         for lb in (view_recall / page)..=(last / page) {
             if let Some(p) = chain.get(lb) {
+                if *p == crate::scheduler::PENDING_LOAD_PLACEHOLDER {
+                    tail_holes += 1;
+                }
                 pages.push(*p);
             }
+        }
+        if tail_holes > 0 {
+            owl_shared::counter_inc!("select.prefill_view.tail_holes");
         }
         // **视图等效偏移**(= 本 chunk **起点**处的可见 token 数)。
         //
