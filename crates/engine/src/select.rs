@@ -400,47 +400,61 @@ impl SelectRuntime {
 
     pub(crate) fn note_index(&mut self, ms: f64) {
         self.prof.index_ms += ms;
+        // **相位计时进 metrics**(2026-10-27):`/debug/metrics/select` 直接给出
+        // 每相位的 count/total/p50/p99 —— 选择层是"每召回点一次"的活,不能只看
+        // 端到端 prefill 猜它的占比(此前只有 coverage_probe 报告才看得到)。
+        record_phase("select.index", ms);
     }
 
     pub(crate) fn note_q_face(&mut self, ms: f64) {
         self.prof.q_face_ms += ms;
+        record_phase("select.qface", ms);
     }
 
     pub(crate) fn note_q_derope(&mut self, ms: f64) {
         self.prof.q_derope_ms += ms;
+        record_phase("select.qderope", ms);
     }
 
     pub(crate) fn note_q_mass(&mut self, ms: f64) {
         self.prof.q_mass_ms += ms;
+        record_phase("select.qmass", ms);
     }
 
     pub(crate) fn note_mass(&mut self, ms: f64) {
         self.prof.mass_ms += ms;
+        record_phase("select.mass", ms);
     }
 
     pub(crate) fn note_score(&mut self, ms: f64) {
         self.prof.score_ms += ms;
+        record_phase("select.score", ms);
     }
 
     pub(crate) fn note_paper(&mut self, ms: f64) {
         self.prof.paper_ms += ms;
+        record_phase("select.paper", ms);
     }
 
     pub(crate) fn note_select(&mut self, ms: f64) {
         self.prof.select_ms += ms;
+        record_phase("select.pick", ms);
     }
 
     pub(crate) fn note_view(&mut self, ms: f64) {
         self.prof.view_ms += ms;
+        record_phase("select.view", ms);
     }
 
     pub(crate) fn note_reconcile(&mut self, ms: f64) {
         self.prof.reconcile_ms += ms;
+        record_phase("select.reconcile", ms);
     }
 
     /// 一个召回点的总相位(收口;与 `note_boundary` 成对)。
     pub(crate) fn note_total(&mut self, ms: f64) {
         self.prof.total_ms += ms;
+        record_phase("select.total", ms);
     }
 
     /// B 轴相位账只读面(生产诊断也读；纯计时，零语义)。
@@ -448,4 +462,17 @@ impl SelectRuntime {
         &self.prof
     }
 
+}
+
+/// 相位计时出口(唯一;`select.rs` 内 note_* 共用)。
+///
+/// 语义 = "这一次相位花了多少"(每次召回点各记一条)⇒ metrics 的 count = 召回点数、
+/// total = 累计、p50/p99 = 单点分布;与 `sel.prof` 的累加口径同源(不改量值)。
+fn record_phase(tag: &'static str, ms: f64) {
+    if !(ms.is_finite() && ms >= 0.0) {
+        return; // 计时脏值不污染分布(不静默:调用点仍是累加器)
+    }
+    owl_shared::metrics::with_metrics_store(|s| {
+        s.timer_record_tag(tag, std::time::Duration::from_secs_f64(ms / 1000.0), file!(), line!());
+    });
 }
