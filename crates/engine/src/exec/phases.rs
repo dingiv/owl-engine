@@ -621,8 +621,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // GDN 快照**节奏化**(2026-10-20):末边界 + 每 `SNAP_EVERY` 个 chunk 一个锚点。
             // 冷 prefill 每边界都拍 = 槽满后每拍一次 DtoH(159 MB ≈ 31 ms);
             // 复用只需要**末边界**(append 场景)与稀疏锚点(分叉场景)。
-            let every = self.boot.cfg.prefill_chunk.max(1) * SNAP_EVERY;
-            let snap_keep = last_boundary || new_fed.is_multiple_of(every) || msg_snap;
+            // **按边界序号**数锚点,不按 token 位置整除(2026-10-27 定谳):
+            // 首块常被页对齐/消息边界切成 32 之类 ⇒ 步长虽然是 chunk,但**起点
+            // 不是 chunk 的整数倍** ⇒ `new_fed % (chunk × N)` 永不为 0,
+            // 整条锚点节奏失效。实测 48k(边界 = 32, 2080, 4128, …)只拍了
+            // 「首块 + 末边界」两张 ⇒ `reuse_face` 只能退到 1 块,
+            // **前缀缓存复用率 ≈ 0(等价全量重算)**。
+            // 修法与 `index_every` 同源(那里早就用边界序号了,教训同源)。
+            let every = SNAP_EVERY.max(1);
+            let snap_keep =
+                last_boundary || (self.sel.boundaries() + 1) % every == 0 || msg_snap;
             // **索引采集节奏**：与 `coverage_analyze` 的完整召回同拍 ——
             // 廉价边界只攒身份/页号，不触发 D2H；下次完整召回前一次补齐。
             // `coverage_probe` 诊断档要求每边界都有索引 ⇒ 全采。
