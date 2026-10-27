@@ -19,7 +19,10 @@ use crate::housekeeping::Housekeeping;
 use crate::scheduler::{SchedulerOutput, StepAction};
 use crate::select::SelectRuntime;
 use crate::session::SessionBank;
-use crate::store_hook::{Acquire, LoadRequest, Maintain, Release, StoreHook, StoreOutcome};
+use crate::store_hook::{
+    Acquire, LoadRequest, Maintain, Release, ReleaseKind, StateAcquire, StoreHook,
+    StoreOutcome,
+};
 use crate::turn::{Turn, TurnEvent, TurnLedger, TurnSpec, TurnSpecState};
 
 type Result<T> = std::result::Result<T, ModelError>;
@@ -215,9 +218,36 @@ pub(crate) struct BootCtx {
     pub(crate) seq: u64,
 }
 
-/// **压力节点单次腾槽上限**(N6):一次最多腾这么多槽,避免"一口气搬空"
-/// 把正在跑的 turn 的工作集也冲掉。
+/// **紧急压力单次腾槽上限**（`PoolExhausted` 后的收缩；原 N6 改名）：
+/// 一次最多腾这么多槽，避免"一口气搬空"把正在跑的 turn 的工作集也冲掉。
 const PRESSURE_MAX_SLOTS: usize = 64;
+
+/// 生成相位 spec 档位（只用于 `generation_target_for` 的纯算式）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationKind {
+    None,
+    Mtp,
+    DFlash2,
+}
+
+/// **一个 pump 步内生成相位可能长到的最远 token 位**（纯函数；Phase 2）。
+///
+/// - 裸 decode / Dumb：`pos + d + 1`（verify 行）；
+/// - MTP：`pos + 2d`（verify + 轮末 propose `pos+m+d`，`m ≤ d`）；
+/// - DFlash2：`pos + 2d + 2`（propose `fp+block`，`fp=pos+m+1`、
+///   `block=d+1`、`m ≤ d`）。
+fn generation_target_for(pos: usize, depth: usize, kind: GenerationKind) -> usize {
+    if depth == 0 {
+        return pos.saturating_add(1);
+    }
+    match kind {
+        GenerationKind::DFlash2 => pos
+            .saturating_add(depth.saturating_mul(2))
+            .saturating_add(2),
+        GenerationKind::Mtp => pos.saturating_add(depth.saturating_mul(2)),
+        GenerationKind::None => pos.saturating_add(depth).saturating_add(1),
+    }
+}
 
 /// **生成预算的最小保留量**(tok):剩余额度低于它 = 真溢出(连一个像样的
 /// 工具调用/短答都放不下)⇒ 拒绝,让客户端压缩上下文。
@@ -1280,7 +1310,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 旧 `Node` 四变体已删除，调用点收敛为：
     /// - `Acquire::Capacity`（准入/增长）→ `pool_housekeeping`；
     /// - `Acquire::Load`（前缀回灌）→ `store_load`；
-    /// - `Release::{TurnEnd,Abort}` → `store_release`（N4）；
+    /// - `Acquire::State`（选槽/就位）→ `store_state_slot` / `store_state_resident`；
+    /// - `Release::{TurnEnd,Abort}` → `store_release`（H3/H6/N4）；
     /// - `Maintain::{Idle,Pressure}` → `store_maintain`。
     pub(crate) async fn store_hook(&mut self, hook: StoreHook) -> Result<StoreOutcome> {
         owl_shared::metrics::with_metrics_store(|m| {
@@ -1315,6 +1346,119 @@ impl<D: DeviceClient> RunningEngine<D> {
                 Ok(StoreOutcome { applied, ..StoreOutcome::default() })
             }
             Acquire::Load(req) => self.store_load(req).await,
+            Acquire::State(StateAcquire::Resident { key }) => {
+                self.store_state_resident(key).await
+            }
+            Acquire::State(StateAcquire::Slot { key }) => {
+                let slot = self.store_state_slot(key).await?;
+                Ok(StoreOutcome {
+                    state_slot: Some(slot),
+                    ..StoreOutcome::default()
+                })
+            }
+        }
+    }
+
+    /// **状态腿就位**（原 H7 三段直呼）：Gpu 直接命中；Host/Disk 先找槽再回灌。
+    /// 返回的槽号经 `StoreOutcome.state_slot` 交给调用方。
+    async fn store_state_resident(
+        &mut self,
+        key: owl_store::SnapKey,
+    ) -> Result<StoreOutcome> {
+        let slot = match self.bank.rel.state.locate(key) {
+            Some(owl_store::Tier::Gpu) => {
+                let slot = self.dev.pool.snap_slot_of(key).ok_or_else(|| {
+                    ModelError::Msg(format!(
+                        "快照 {key:?} 账在设备层但池里找不到槽(账目不平)"
+                    ))
+                })?;
+                // 使用即触达(store 出序的真源)
+                self.bank.rel.state.touch(key);
+                slot
+            }
+            Some(owl_store::Tier::Host) => {
+                let slot = self.store_state_slot(key).await?;
+                self.snap_onload(key, slot).await?;
+                slot
+            }
+            Some(owl_store::Tier::Disk) => {
+                // **S6**:盘 → 宿主 → 设备(两跳);读回后层账回 Host,再走 Host 分支
+                self.fill_snap_from_disk(key).await?;
+                let slot = self.store_state_slot(key).await?;
+                self.snap_onload(key, slot).await?;
+                slot
+            }
+            None => {
+                return Err(ModelError::Msg(format!(
+                    "快照 {key:?} 不在账(已被逐出)"
+                )))
+            }
+        };
+        Ok(StoreOutcome {
+            state_slot: Some(slot),
+            ..StoreOutcome::default()
+        })
+    }
+
+    /// **快照槽选择**（原 `spec::snap_ensure_slot`）：池满时按 store 顺序选最冷
+    /// 受害者；能沉宿主就先沉，沉不下再丢。
+    async fn store_state_slot(&mut self, key: owl_store::SnapKey) -> Result<u32> {
+        use crate::state::SnapSlotPick;
+        // **判据 = store(唯一产地;§30.6-②)**:出序(事实档 + EvictPolicy)从
+        // `Rel::snap_victim_order` 拿;池只做 key→槽映射。
+        let order = self.bank.rel.snap_victim_order(&[]);
+        let pick = self.dev.pool.snap_pick_slot(key, &order).ok_or_else(|| {
+            ModelError::Msg(
+                "GDN 快照池为空(snap_max = 0):调用方应跳过 capture".into(),
+            )
+        })?;
+        match pick {
+            SnapSlotPick::Hit(slot) | SnapSlotPick::Free(slot) => Ok(slot),
+            SnapSlotPick::Victim(slot, victim) => {
+                // **生成段(Transient)= 逐出即丢**:store 的不变量本就拒它下沉
+                // ⇒ 试了只会换来一条“失败”WARN(把设计行为报成故障)。
+                let transient = matches!(
+                    self.bank.rel.state.snap_durability(victim),
+                    Some(owl_store::SnapDurability::Transient)
+                );
+                if transient {
+                    owl_shared::log_debug!(
+                        "store",
+                        "逐出生成段快照 {victim:?}(逐出即丢,不下沉)"
+                    );
+                } else {
+                    match self.snap_offload(victim, slot).await {
+                        Ok(()) => {
+                            self.dev.pool.snap_clear_slot(slot);
+                            if let Some(pr) = self.peer.as_mut() {
+                                pr.pool.snap_clear_slot(slot);
+                            }
+                            return Ok(slot);
+                        }
+                        Err(e) => {
+                            // 收编为结构化 WARN(2026-10-18 T1;原为 `DBG-SNAP` 直接打印)
+                            owl_shared::log_warn!("store", "快照下沉失败: {e}");
+                        }
+                    }
+                }
+                // 沉不下 ⇒ 丢(内容整体消失;宿主副本同步丢)
+                owl_shared::log_debug!(
+                    "store",
+                    "快照槽满且宿主不可用 ⇒ 丢弃最冷快照 {victim:?}(该边界将不可复用)"
+                );
+                self.bank.rel.drop_snap_host(victim)?;
+                if let Err(e) = self.bank.rel.state.drop_snap(victim) {
+                    owl_shared::log_debug!("store", "快照 {victim:?} 出账: {e}");
+                }
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("store.snap.drop", 1, file!(), line!());
+                });
+                self.dev.pool.snap_clear_slot(slot);
+                if let Some(pr) = self.peer.as_mut() {
+                    pr.pool.snap_clear_slot(slot);
+                }
+                Ok(slot)
+            }
         }
     }
 
@@ -1375,22 +1519,105 @@ impl<D: DeviceClient> RunningEngine<D> {
             t_stage.elapsed().as_nanos() as u64,
             crate::select::StageSrc::Prefill,
         );
-        Ok(StoreOutcome { applied, loaded_blocks })
+        Ok(StoreOutcome {
+            applied,
+            loaded_blocks,
+            ..StoreOutcome::default()
+        })
     }
 
-    /// **生命周期收尾**（Phase 1 只承接原 N4）：池清点 + 未归还清单 +
-    /// 兜底释放 + 池缓存回收。H3/H6 尚未并入（Phase 3）。
+    /// **生命周期收尾**（Phase 3）：H3 链登记/盘索引 + H6 表/引用归零 +
+    /// GDN 行归还 + 归属下行 + N4 清点/force release/trim。
     async fn store_release(&mut self, release: Release) -> Result<StoreOutcome> {
-        let turn = match release {
-            Release::TurnEnd(turn) | Release::Abort(turn) => turn,
-        };
+        let turn = release.turn;
+        // ── H3：正常 turn 收尾才发布链；abort 的半途链不进缓存 ----------
+        if release.kind == ReleaseKind::TurnEnd {
+            if self.dev.pool.geom.paged {
+                if let Some(s) = self.bank.sessions.get(release.session) {
+                    let up = self.bank.rel.leg.register_chain_owned(
+                        &s.tokens,
+                        &s.block_table,
+                        release.session,
+                    )?;
+                    if self.boot.cfg.knobs.probes.debug {
+                        owl_shared::log_debug!(
+                            "dbg prefix",
+                            "register_chain: 块表={} 新入={} 逐出={}",
+                            s.block_table.len(),
+                            up.inserted.len(),
+                            up.evicted.len()
+                        );
+                    }
+                }
+            }
+            // **S6.1：盘上链索引**（内容可能还没溢写 ⇒ boot 按内容截断）。
+            // 放在 ephemeral 焚毁之前 —— 会话 tokens 此刻还在。
+            if self.dev.pool.geom.paged && self.bank.rel.disk_enabled() {
+                let toks = self
+                    .bank
+                    .sessions
+                    .get(release.session)
+                    .map(|s| s.tokens.clone())
+                    .unwrap_or_default();
+                if !toks.is_empty() {
+                    self.write_chain_index(&toks).await?;
+                }
+            }
+            // **索引暂存排空**：正常 prefill 的末边界已清空；这里兜底
+            // abort/短轮 —— 必须在 `release_turn_table` 之前采，物理页还在。
+            if self.boot.cfg.knobs.index_probe {
+                let n_pending = self.sel.pending_index_len();
+                let pending = self.sel.take_index_pending();
+                if !pending.is_empty() {
+                    owl_shared::log_debug!(
+                        "idx",
+                        "turn 收口排空索引暂存:{n_pending} 块"
+                    );
+                    self.collect_index_for_blocks(&pending).await?;
+                }
+            }
+        }
+
+        // ── H6：表/引用归零（ephemeral = 焚毁；否则只释放设备表） ----------
+        if release.ephemeral {
+            self.burn_ephemeral(release.session);
+        } else {
+            let r = self.release_turn_table(release.session);
+            match (release.kind, r) {
+                (_, Ok(())) => {}
+                // 正常收尾：表释放失败 = turn 失败（当前 complete 语义）
+                (ReleaseKind::TurnEnd, Err(e)) => return Err(e),
+                // 弃置：只 WARN，不能让一次表释放失败挡住后面的 GDN/N4 收尾
+                (ReleaseKind::Abort, Err(e)) => {
+                    owl_shared::log_warn!("session", "弃置 turn 释放设备表失败: {e}");
+                }
+            }
+        }
+
+        // ── GDN 行归还（行 = turn 域资源；失败只 WARN） --------------------
+        if let Err(e) = self.bank.rel.state.return_row(release.gdn_slot, None) {
+            owl_shared::log_warn!(
+                "session",
+                "turn {} 还 GDN 行失败: {e}",
+                release.turn
+            );
+        }
+
+        // ── 归属下行（会话仍活 ⇒ Session(s)，焚毁 ⇒ System） ---------------
+        self.set_ctx_after_turn(release.session, release.ephemeral);
+
+        // ── N4：池清点 + 未归还清单 + 兜底释放 + trim ---------------------
         self.n4_pool_sweep(turn);
         self.n4_report_unreturned(turn);
-        // **兜底释放**（2026-10-20；§78 P1）：清点只报告、不处置 ⇒ 有调用点
-        // 漏 free 时每 turn 掉一截显存（4k prefill ≈ 1.6 GiB），长 ctx 撞
-        // `vram-hard-budget`。这里把 `Turn(t)` 名下"仍开着、不在池里"的块
-        // **强制归还驱动**（决策在 store `stale_of`，执行在句柄）。
-        self.n4_force_release(turn).await?;
+        let force = self.n4_force_release(turn).await;
+        match (release.kind, force) {
+            (_, Ok(())) => {}
+            (ReleaseKind::TurnEnd, Err(e)) => return Err(e),
+            (ReleaseKind::Abort, Err(e)) => {
+                owl_shared::log_warn!("store", "N4/Release(Abort) 失败(继续收尾): {e}");
+                return Ok(StoreOutcome::default());
+            }
+        }
         // **池缓存回收**（2026-10-20 §23.9）：`RELEASE_THRESHOLD=∞` ⇒ turn 内
         // 的峰值缓存**永不**还 OS（peer 侧实测 3.3 GiB 长期挂着，长 prefill
         // 因此提前撞 `vram-hard-budget`）。turn 收尾清一次：块账不变，
@@ -1445,12 +1672,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(StoreOutcome { applied, ..StoreOutcome::default() })
     }
 
-    /// **压力缓解口**(缺口 3;actor 在 `PoolExhausted` 后调;2026-10-19)。
+    /// **压力缓解口**（actor 在 `PoolExhausted` 后调）。
     ///
-    /// 次序:**先还缓存**(池排空 —— 真还驱动),**再腾结构**(N6 节点:先下沉后驱逐)。
-    /// 返回 `(池排空块数, 目标腾出槽数)` —— **如实报数**(0 就是 0:
-    /// 实测"mid-turn 池为空"是常态:失败那一刻的块都还在**使用中**,不在池里);
-    /// 失败响亮上抛(调用方只记日志继续)。
+    /// 次序：**先还缓存**（复用池排空 + 池缓存 trim —— 真还驱动），
+    /// **再做池内收缩**（`Maintain::Pressure`：KV 槽 + 状态腿目标）。
+    /// 返回 `(池排空块数, 目标腾出槽数)`；失败响亮上抛（调用方只记日志继续）。
+    ///
+    /// 为什么不再用“驱动 free < 1GiB”触发：固定池把块沉宿主**不增加驱动 free**，
+    /// 却会制造每拍 churn。`pump` 不再跑 N6；只有真正 `PoolExhausted` 才收缩。
     pub async fn relieve_pressure(&mut self) -> Result<(usize, usize)> {
         let freed = {
             let f = self.dev.graphs.dev_ctx_face_mut();
@@ -1463,34 +1692,57 @@ impl<D: DeviceClient> RunningEngine<D> {
                 owl_shared::vram::free_bytes() as f64 / 1048576.0
             );
         }
-        let k = self.pressure_probe().unwrap_or(0);
-        if k > 0 {
-            self.store_hook(StoreHook::pressure(k)).await?;
+        // 池缓存 pages 真还驱动（不增池槽，但能缓解驱动硬墙）
+        let trimmed = self.trim_pools().await;
+        let mut trim_bytes = 0u64;
+        for (rank, r) in trimmed {
+            match r {
+                Ok(n) => trim_bytes += n as u64,
+                Err(e) => owl_shared::log_warn!(
+                    "store",
+                    "压力缓解:池缓存回收失败(rank{rank}): {e}"
+                ),
+            }
         }
-        Ok((freed, k))
+        if trim_bytes > 0 {
+            owl_shared::log_warn!(
+                "store",
+                "压力缓解:池缓存回收 {:.1} MiB",
+                trim_bytes as f64 / 1048576.0
+            );
+        }
+        let (slots, snap_bytes) = self.pressure_need();
+        if slots > 0 || snap_bytes > 0 {
+            owl_shared::log_warn!(
+                "store",
+                "压力缓解目标:KV {slots} 槽 / 状态腿 {:.1} MiB（按池自由槽，不再看驱动 free）",
+                snap_bytes as f64 / 1048576.0
+            );
+            self.store_hook(StoreHook::pressure_with_snap(slots, snap_bytes))
+                .await?;
+        }
+        Ok((freed, slots))
     }
 
-    /// **N6 压力探测**(缺口 3;2026-10-19):驱动余量逼近 reserve ⇒ 返回"目标腾出槽数"。
+    /// **紧急池压力目标**（`PoolExhausted` 后；不是每拍 N6）。
     ///
-    /// 判据(全部实测量,零猜测):`free < reserve` 才报压力;目标 = 把 free 拉回
-    /// **2×reserve**(留一次呼吸)所需的块数,按池块字节折算,夹在 `[1, 64]`
-    /// (一次 N6 是"整理"不是"搬家";不够就下一拍再来)。无设备账(CPU mock)⇒ None。
-    fn pressure_probe(&self) -> Option<usize> {
-        // FIXME(store-hook): N6 触发/需求错位。1 GiB 只是告警阈值,不是预留;
-        // 固定池下沉不增加驱动 free,且这里只给 KV 槽(snap_bytes=0)。
-        // 目标形态 = Maintain(Pressure) 用硬余量(free−reserve) + 两腿目标。
-        let free = owl_shared::vram::free_bytes();
-        if owl_shared::vram::total_bytes() == 0 {
-            return None;
+    /// 判据 = **池自由槽**低于总量的 1/8（夹在 `[1, 64]`），不再看驱动 free：
+    /// 固定池下沉不增驱动 free，但会真腾池槽；状态腿在宿主有位时带一条快照。
+    fn pressure_need(&self) -> (usize, usize) {
+        let total = self.bank.rel.leg.slots_total();
+        if total == 0 {
+            return (0, 0);
         }
-        let reserve = (self.boot.cfg.knobs.vram_reserve_mb as u64) << 20;
-        let target = reserve.saturating_mul(2).max(1 << 30);
-        if free >= target {
-            return None;
-        }
-        let per = self.dev.pool.block_bytes().max(1) as u64;
-        let want = ((target - free) / per) as usize;
-        Some(want.clamp(1, PRESSURE_MAX_SLOTS))
+        let target = (total / 8).clamp(1, PRESSURE_MAX_SLOTS);
+        let slots = target.saturating_sub(self.bank.rel.leg.slots_free());
+        let snap_bytes = if self.bank.rel.snap_host_free_slots() > 0
+            && self.bank.rel.state.stats().snap_gpu.0 > 0
+        {
+            self.bank.rel.snap_bytes()
+        } else {
+            0
+        };
+        (slots, snap_bytes)
     }
 
     /// **H5 空转制的节拍推进**(Idle pump 计数;每 N 拍调 `StoreHook::idle` 一次)
@@ -1638,9 +1890,10 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// (块长走 [`crate::scheduler::RunningEngine::prefill_step_chunk`] 单源):
     /// - 队列里有待准入 turn ⇒ 目标 = 该 prompt 全长(准入那一刻就要覆盖);
     /// - 活跃 turn 在 prefill ⇒ 目标 = `fed + chunk`;
-    /// - 活跃 turn 在 decode ⇒ 目标 = `pos + spec 深度上界 + 1`
-    ///   (**上界是安全方向**:多算只是多腾几个槽(内容不丢),
-    ///   少算才会退回 `ensure_for_len` 的同步驱逐 —— 那正是要消灭的);
+    /// - 活跃 turn 在 decode ⇒ 目标 = `pos + 本档 spec 轮总增长上界`
+    ///   (裸 decode / MTP / DFlash2 的差别见 [`Self::generation_target`];
+    ///   **上界是安全方向**:多算只是多腾几个槽(内容不丢),少算会在
+    ///   纯分配 `ensure_for_len` 处响亮拒);
     /// - 无活跃且队列空 ⇒ **零需求**(§12.4:不用固定水位预搬;
     ///   预搬是显式策略,留给将来 预热/B 轴)。
     ///
@@ -1649,9 +1902,14 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 准入分支要查一次命中面(纯 host、与 `schedule` 同一条匹配路):
     /// Δ_j = `ceil(N_j/page) − 设备已驻留的命中块数`(§12.1)—— **host 命中的
     /// 块不算省槽**(回灌时照样占槽,少算就是回灌 Exhausted)。
-    // FIXME(store-hook): H1(Admit) 与 H2(Grow) 共用一个 Need;H1 还另有
-    // scheduler 的 admission.decide 与本节 admission_gate 的 Rel::check 两层判决。
-    // 目标: Acquire(Admit) / Acquire(Grow) 两个 kind,同一契约。
+    // H1(Admit) 与 H2(Grow) 共用一个 Need；两层判决是**有意保留**的：
+    // - `scheduler::admission.decide` = 批量准入策略（会话守卫/槽位/生成预算/退避）；
+    // - `admission_gate` 的 `Rel::check` = 单 turn VRAM 地板（dense floor/EvictThen）。
+    // 两者共享 store facts，但判据不同；合并会把预算内部暴露给策略状态机。
+    //
+    // **Phase 2**:生成相位的目标必须覆盖**本 pump 内 spec 轮的 propose**,
+    // 不能只算 verify 的 `pos+depth+1`;否则 ⑦ 轮末 propose 的 `ensure_for_len`
+    // 会在纯分配处撞墙。
     fn step_need(&mut self) -> Result<owl_store::Need> {
         use owl_store::NeedWhy;
         let page = self.dev.pool.geom.page.max(1);
@@ -1692,7 +1950,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 self.boot.cfg.knobs.snap_msg_min_span,
             ) {
                 Some(chunk) => act.fed + chunk,
-                None => act.fed + self.dev.spec_rt.depth + 1, // 生成相位(act.fed = pos)
+                None => self.generation_target(act.fed), // 生成相位(act.fed = pos)
             };
             let have = self
                 .bank
@@ -1703,6 +1961,28 @@ impl<D: DeviceClient> RunningEngine<D> {
             need += slots_for(target).saturating_sub(have);
         }
         Ok(owl_store::Need::kv(need, NeedWhy::Grow))
+    }
+
+    /// **生成相位一个 pump 步内可能长到的最远 token 位**（Phase 2 预留上界）。
+    ///
+    /// 一个 spec 轮会连续做两段增长：
+    /// 1. verify 行 `pos..pos+depth`（scheduler 已按 `pos+spec+1` 增长）；
+    /// 2. 轮末 propose 的草稿链（⑦，发生在 `act.fed = pos+m+1` 之后）。
+    ///
+    /// 因此 `step_need` 必须按**本轮最终位**预留，而不是只按 verify 行：
+    /// - 裸 decode / Dumb：`pos + depth + 1`；
+    /// - MTP：`pos + m + depth`（propose 链），`m ≤ depth` ⇒ `pos + 2·depth`；
+    /// - DFlash2：`pos + m + 1 + (depth+1)`（`fp + block`），`m ≤ depth`
+    ///   ⇒ `pos + 2·depth + 2`。
+    ///
+    /// 这里用配置的最大 `depth`（自适应降档只会更小），宁多勿少。
+    fn generation_target(&self, pos: usize) -> usize {
+        let kind = match self.dev.spec_rt.drafter.as_ref() {
+            Some(crate::spec_runtime::Drafter::DFlash2(_)) => GenerationKind::DFlash2,
+            Some(crate::spec_runtime::Drafter::Mtp(_)) => GenerationKind::Mtp,
+            None => GenerationKind::None,
+        };
+        generation_target_for(pos, self.dev.spec_rt.depth, kind)
     }
 
     /// **N4 池清点**(缺口 4 的节点面):把**已在 store 池里**的 `Turn(t)` 名下块
@@ -1998,8 +2278,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 为什么先于 `ensure_for_len`:那条路是"**占了槽**才发现不够"(Exhausted,
     /// 中后段才炸,且已写半截账);本判决是"**判在前**"——不够就先腾,
     /// 腾不够就带数字拒。
-    // FIXME(store-hook): H1 的第二层判决(store floor);与 scheduler 的
-    // turns.admission.decide 合并为 Acquire(Admit) 的一个出口。
+    // H1 的地板层（有意保留）：scheduler 的 `turns.admission.decide` 管批量策略，
+    // 本函数只管单 turn VRAM 地板；两层共享 store facts，不合并。
     fn admission_gate(&mut self, need: &mut owl_store::Need) -> Result<()> {
         use owl_store::AdmissionVerdict;
         if need.why != owl_store::NeedWhy::Admit {
@@ -2623,10 +2903,10 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 的同一份算式给出;零需求不搬。宿主两腿都关 = 直接返回(无下沉面;
     /// 与接线前行为一致)。
     /// 判定单里的 `deny` = **"即使搬空也不够"的真容量不足预警** ⇒ 响亮 WARN,
-    /// 但 `out` 里能搬的照搬(下沉不丢内容);真拒绝由 `ensure_for_len` 兜底。
+    /// 但 `out` 里能搬的照搬(下沉不丢内容);纯分配不足会在
+    /// `ensure_for_len` 处响亮拒（Phase 2 后不再有同步驱逐）。
     // 唯一调用者 = `store_hook`（Acquire::Capacity / Load / Maintain）。
-    // FIXME(store-hook): `ensure_for_len` / spec `snap_*` / H3/H6 仍各有旁路，
-    // Phase 2/3 收编；见 docs/devlog/memory/store-hook-contract.md §4。
+    // Phase 3 后 spec `snap_*` / H3/H6 均已收口；仅剩 coverage 诊断直呼。
     async fn pool_housekeeping(
         &mut self,
         need: owl_store::Need,
@@ -2728,8 +3008,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         //  · 有活跃/待准入 ⇒ H1(H1 准入)/ H2(增长),need = 真 delta;
         //  · 空转 ⇒ **零需求,不搬**(§12.4 废弃了"总槽/2"这类固定水位:
         //    预搬是显式策略,不是默认行为)。
-        // 保洁**先于** `schedule` 里的 `ensure_for_len` ⇒ 正常路径下同步驱逐恒为空
-        // (报告面 `ops.ensure_evicted` 可查)。
+        // 保洁**先于** `schedule` 里的 `ensure_for_len`；Phase 2 起后者只纯分配，
+        // 不再有同步驱逐。`ops.ensure_evicted` 是回归 canary（应恒 0）。
         // P0.3 定谳(2026-10-19):**循环头**耗时(需求驱动保洁:need/gate/housekeeping)
         // —— 它是"步墙钟 − 设备 − fill/launch − 采样"的缺口候选(此前未打点)。
         let t_loophead = (prof || true).then(std::time::Instant::now);
@@ -2737,22 +3017,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut need = need;
         self.admission_gate(&mut need)?;
         // `step_need` 在"无活跃 + 队列空"时返回 NeedWhy::Idle（零需求）。
-        // 这不是 Acquire::Capacity 的合法 kind；旧 Node::Need 走
-        // pool_housekeeping 时 is_zero() 会自然 no-op。Idle 的整理由下方
+        // 这不是 Acquire::Capacity 的合法 kind；Idle 的整理由下方
         // H5 `idle_tick` / Maintain::Idle 负责，不能在这里误报不变量。
+        // Phase 4 已删除 pump 的 N6（驱动 free 触发只制造 churn）；
+        // 压力整理只在 PoolExhausted 后走 `relieve_pressure`。
         if !matches!(need.why, owl_store::NeedWhy::Idle) {
             self.store_hook(StoreHook::capacity(need)).await?;
-        }
-        // **[N6 Pressure]**(缺口 3):余量告急 ⇒ **零缺口也搬**(先下沉、再驱逐);
-        // 这是"压力路径第一步":先把自己能腾的腾出来,而不是等 `ensure_for_len` 撞墙。
-        if let Some(k) = self.pressure_probe() {
-            let free = owl_shared::vram::free_bytes();
-            owl_shared::log_warn!(
-                "store",
-                "N6 压力节点:驱动余量 {:.0}MiB < 目标 ⇒ 目标腾 {k} 槽(先下沉后驱逐)",
-                free as f64 / 1048576.0
-            );
-            self.store_hook(StoreHook::pressure(k)).await?;
         }
         let loophead_ms = t_loophead.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
         let t_lh1 = prof.then(std::time::Instant::now); // 循环头之后
@@ -3039,5 +3309,38 @@ mod budget_tests {
         assert_eq!(budget_clamp(0, 48, 64), Ok(48));
         // 装不下且 room < 下限 ⇒ 仍拒(round4 真溢出语义不变)
         assert_eq!(budget_clamp(18, 4096, 128), Err((18, 4096)));
+    }
+}
+
+#[cfg(test)]
+mod generation_target_tests {
+    use super::{generation_target_for, GenerationKind};
+
+    /// Phase 2 的预留上界必须覆盖“verify + 轮末 propose”两段增长；
+    /// 这些数字与 `draft.rs` 的 `fp/block`、`pos+m+depth` 同源。
+    #[test]
+    fn pins_spec_round_growth_upper_bounds() {
+        let pos = 100usize;
+        let d = 7usize;
+        assert_eq!(
+            generation_target_for(pos, 0, GenerationKind::DFlash2),
+            pos + 1,
+            "depth=0 ⇒ 只有当前 token"
+        );
+        assert_eq!(
+            generation_target_for(pos, d, GenerationKind::None),
+            pos + d + 1,
+            "裸 decode / Dumb = verify 行"
+        );
+        assert_eq!(
+            generation_target_for(pos, d, GenerationKind::Mtp),
+            pos + 2 * d,
+            "MTP = verify + propose pos+m+d"
+        );
+        assert_eq!(
+            generation_target_for(pos, d, GenerationKind::DFlash2),
+            pos + 2 * d + 2,
+            "DFlash2 = fp+block，m≤d"
+        );
     }
 }

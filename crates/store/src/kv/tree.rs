@@ -313,12 +313,16 @@ impl PrefixTree {
     /// 会话仍持有时槽不回自由队列)。
     ///
     /// ⚠️ 容量语义:先设备叶,不足再 host 叶(`host` 叶本就在宿主层,
-    /// 逐它只丢内容)。要**腾设备槽**请用 [`Self::evict_device`]。
+    /// 逐它只丢内容)。要**腾设备槽**请用 `evict_device`（测试/维护面）。
     pub(crate) fn evict(&mut self, n: usize) -> Vec<(ChainHash, Option<u32>)> {
         self.evict_impl(n, false)
     }
 
     /// **只逐设备叶**(腾设备槽语义;§16 定谳:host 叶被逐腾不出槽,白丢内容)。
+    ///
+    /// 生产分配路径已改为纯分配（Phase 2）；此口只留给测试与将来的显式
+    /// 设备维护面。
+    #[cfg(test)]
     pub(crate) fn evict_device(&mut self, n: usize) -> Vec<(ChainHash, Option<u32>)> {
         self.evict_impl(n, true)
     }

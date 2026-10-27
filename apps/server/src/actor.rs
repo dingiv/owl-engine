@@ -311,7 +311,8 @@ pub async fn run_actor<D: DeviceClient>(
                     owl_shared::log_warn!("actor", "pump 错误: {e}");
                     abandon_turn(running, &mut sinks, &format!("engine: {e}")).await;
                     // **缺口 3(2026-10-19)**:硬预算/池耗尽 ⇒ **不再直通致命**:
-                    // 丢本 turn(客户端拿到 500/503,如实) + **立即收缩**(池排空 + N6)
+                    // 丢本 turn(客户端拿到 500/503,如实) + **立即收缩**
+                    // (池排空 + 池缓存 trim + Maintain(Pressure))
                     // + **继续跑**。判据:引擎不退出,后续请求仍可服务;只有真正的
                     // 设备级错误(ServerClosed / 状态机失守)才走优雅关停。
                     if matches!(e, owl_iface::contract::ModelError::PoolExhausted { .. }) {

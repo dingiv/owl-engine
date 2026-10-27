@@ -6,8 +6,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// **turn 末释放设备表**(S2 引用拆分;§25.1①):表出账归还(引用减一),
     /// `cached_len` 归到**块边界**(缓存里确实还有的整块数 —— 尾块随表释放,
     /// 内容丢,下次重算 ≤ 1 页)。
-    // FIXME(store-hook): H6 引用归零是生命周期旁路(无 store event);
-    // 应并入 StoreHook::Release(TurnEnd/SessionClose)。
+    // Phase 3：H6 执行臂。唯一调用者是 `StoreHook::Release`；
+    // engine 其它位置不得直呼。
     pub(crate) fn release_turn_table(&mut self, session_id: u64) -> Result<()> {
         let page = self.dev.pool.geom.page.max(1);
         let mut table = Vec::new();
@@ -121,29 +121,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 墙钟 EWMA（`Retry-After` 估算用；所有终局路径同源）
         self.turns
             .note_turn_ms(crate::running::now_ms().saturating_sub(act.started_ms));
-        // 草稿账随 act(TurnSpecState)销毁(生命周期收口)
-        if act.ephemeral {
-            self.burn_ephemeral(act.session_id);
-        } else {
-            // S2 引用拆分:弃置的 turn 也不留设备表(半途的链**不进缓存**
-            // —— 没有 `register_chain` ⇒ 下次内容寻址自然不命中,安全)
-            if let Err(e) = self.release_turn_table(act.session_id) {
-                owl_shared::log_warn!("session", "弃置 turn 释放设备表失败: {e}");
-            }
-        }
-        // S2b:还 GDN 行(半途状态**不落快照** —— 弃置的 turn 账面不可信)
-        if let Err(e) = self.bank.rel.state.return_row(act.gdn_slot, None) {
-            owl_shared::log_warn!("session", "弃置 turn {} 还 GDN 行失败: {e}", act.id);
-        }
-        // **[N4 TurnEnd]**(弃置路径同款:归属下行;须在 act 还在手时取会话事实)
-        self.set_ctx_after_turn(act.session_id, act.ephemeral);
-        // abandon 返回 TurnEvent(非 Result)⇒ 钩子失败**响亮留痕**但不掩盖原错。
-        // Phase 1 的 Release 只承接 N4；H6 引用归零仍在 release_turn_table。
+        // 草稿账随 act(TurnSpecState)销毁(生命周期收口)。
+        // H6 / GDN 行 / 归属下行 / N4 全部由 `Release(Abort)` 统一执行；
+        // 弃置路径失败只 WARN，不掩盖原始错误。
         if let Err(e) = self
-            .store_hook(crate::store_hook::StoreHook::abort(act.id))
+            .store_hook(crate::store_hook::StoreHook::abort(
+                act.id,
+                act.session_id,
+                act.gdn_slot,
+                act.ephemeral,
+            ))
             .await
         {
-            owl_shared::log_warn!("store", "N4/Release(Abort) 失败(继续收尾): {e}");
+            owl_shared::log_warn!("store", "Release(Abort) 失败(继续收尾): {e}");
         }
     }
 
@@ -207,76 +197,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // **图像段账写回**(前缀无感删除;2026-10-23):与 `tokens` 同一次
             // 收口 —— 两处各写一份 = 下一轮删除识别拿错坐标。
             s.set_img_spans(act.img_spans.clone(), act.img_pads.clone());
-            // E2c:块链登记前缀缓存(缓存持引用;会话释放后块仍驻留)。
-            // S3-2:登记走 store 的块腿(引用配对在腿内自洽)
-            if self.dev.pool.geom.paged {
-                // FIXME(store-hook): H3 链登记在生产路径绕过 StoreHook;
-                // Phase 3 并入 StoreHook::Release(TurnEnd) 的链资产发布。
-                // **会话感知**(2026-10-19):链块记到会话名下(淘汰时按会话从末端削)
-                let up = self.bank.rel.leg.register_chain_owned(
-                    &s.tokens,
-                    &s.block_table,
-                    act.session_id,
-                )?;
-                if self.boot.cfg.knobs.probes.debug {
-                    owl_shared::log_debug!(
-                        "dbg prefix",
-                        "register_chain: 块表={} 新入={} 逐出={}",
-                        s.block_table.len(),
-                        up.inserted.len(),
-                        up.evicted.len()
-                    );
-                }
-            }
+            // 链登记 / 盘索引 / 表释放 / GDN 行 / 归属下行 / N4 全部由
+            // `StoreHook::Release(TurnEnd)` 统一执行（Phase 3）。
         }
-        // **S6.1:盘上链索引**(turn 收口一次;内容可能还没溢写 ⇒ boot 按内容截断)。
-        // 放在 `ephemeral` 焚毁之前 —— 会话 tokens 此刻还在。
-        if self.dev.pool.geom.paged && self.bank.rel.disk_enabled() {
-            let toks = self
-                .bank
-                .sessions
-                .get(act.session_id)
-                .map(|s| s.tokens.clone())
-                .unwrap_or_default();
-            if !toks.is_empty() {
-                self.write_chain_index(&toks).await?;
-            }
-        }
-        // **索引暂存排空**：正常 prefill 的末边界已清空；这里兜底
-        // abort/短轮 —— 必须在 `release_turn_table` 之前采，物理页还在。
-        if self.boot.cfg.knobs.index_probe {
-            let n_pending = self.sel.pending_index_len();
-            let pending = self.sel.take_index_pending();
-            if !pending.is_empty() {
-                owl_shared::log_debug!(
-                    "idx",
-                    "turn 收口排空索引暂存:{n_pending} 块"
-                );
-                self.collect_index_for_blocks(&pending).await?;
-            }
-        }
-        if act.ephemeral {
-            // 终了即焚:块链归还账房 + 会话表移除(GDN 格随之释放)
-            self.burn_ephemeral(act.session_id);
-        } else {
-            // **S2 引用拆分(§25.1①)**:idle 会话**不持设备表** ——
-            // 历史此刻已进前缀缓存(上面的 `register_chain`),设备表的引用随 turn 死;
-            // 下一个 turn 由**内容寻址重建**(`schedule` 的前缀匹配路径)。
-            // 于是:①idle 会话对设备零持有(历史 = 纯缓存 ⇒ 可动/可逐/可下沉)
-            //       ②`Admission.reserved` = 真·在飞工作集(§24.5② 收口)
-            self.release_turn_table(act.session_id)?;
-        }
-        // **S2b(§28):还 GDN 行**(行 = turn 域资源;状态已由边界快照承担)
-        if let Err(e) = self.bank.rel.state.return_row(act.gdn_slot, None) {
-            owl_shared::log_warn!("session", "turn {} 还 GDN 行失败: {e}", act.id);
-        }
-        // **[N4 TurnEnd]**:归属下行 —— 会话仍活 ⇒ `Session(s)`,焚毁 ⇒ `System`
-        self.set_ctx_after_turn(act.session_id, act.ephemeral);
-        // FIXME(store-hook): H3+H6 → StoreHook::Release(TurnEnd)(Phase 3；
-        // 现拆成 register_chain_owned + Release(N4))。
-        // **[N4 TurnEnd]**(唯一钩子入口):池清点 + 未归还清单 + 兜底释放 + trim。
-        self.store_hook(crate::store_hook::StoreHook::turn_end(act.id))
-            .await?;
+        self.store_hook(crate::store_hook::StoreHook::turn_end(
+            act.id,
+            act.session_id,
+            act.gdn_slot,
+            act.ephemeral,
+        ))
+        .await?;
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(act.id);
         // **B-3d**:选择层视图态随 turn 收口(视图是 turn 域资源 —— 下一 turn

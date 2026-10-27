@@ -777,7 +777,9 @@ impl Rel {
         self.leg.register_chain(tokens, table)
     }
 
-    /// 块表增长(engine 每步/每 turn 调;压力驱逐与宿主副本回收均在腿内)。
+    /// 块表增长（engine 每步/每 turn 调；**纯分配**，不做压力驱逐）。
+    ///
+    /// 需求侧必须先由 `StoreHook::Acquire(Grow)` 预留；不足 = 响亮 `Exhausted`。
     pub fn ensure_for_len(&mut self, table: &mut Vec<u32>, target_len: usize) -> StoreResult<()> {
         self.leg.ensure_for_len(table, target_len)
     }

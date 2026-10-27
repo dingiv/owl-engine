@@ -789,3 +789,47 @@ log: /tmp/owl-8135-fix-final.log
 ```
 
 尚未 commit / push。
+
+---
+
+## 14. 2026-10-26 GUI agent 联调补丁
+
+### 14.1 复读：3080 档默认改 sampling
+
+前端 GUI agent 请求不带 `temperature`，此前继承 `[sampling] mode = "greedy"`，
+同一上下文反复吐相同片段。3080 档已改：
+
+```toml
+[sampling]
+mode = "sampling"
+temp = 0.7
+topk = 20
+topp = 0.95
+rep_penalty = 1.0
+```
+
+客户端显式 `temperature` 仍逐请求覆盖（`TurnSampler`）：`temperature=0`
+回落贪心；`>0` 走采样。已验证同 prompt 下 `temp=0` 与 `temp=0.9` 输出不同。
+
+### 14.2 中断后 400：pad 账与 token 账截齐
+
+leave-gap 删除在 turn 中途把会话 `tokens` 截到 cached 前缀；若客户端断流走
+`Release(Abort)`，不会 `commit_turn`，旧 `pads` 仍指向被截掉的后缀 ⇒ 下一轮
+`unpad` 报：
+
+```text
+unpad: pad 区间 [38546,38560) 非法(序列长 37728, 上一 cursor 37664)
+```
+
+修复：`apply_image_leave_gap` 落账时用 `img_evict::ledger_prefix` 同步截
+`img_spans` / `pads`，只保留完整落在 cached 前缀内的区间。新增单测
+`ledger_prefix_drops_out_of_range_pads_and_spans`。
+
+### 14.3 回归
+
+```text
+cargo test -p owl-engine --lib                     ✅ 169/169
+OWL_E2E_ONLY=gpu_image_evict_gate                  ✅
+```
+
+8135 已用新 release 重启（`/tmp/owl-8135-store.log`）。

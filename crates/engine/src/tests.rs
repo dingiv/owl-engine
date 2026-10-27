@@ -206,6 +206,51 @@ async fn idle_node_offloads_device_snapshot_via_store_plan() {
     assert_eq!(running.dev.pool.snap_used(), 0, "设备槽应释放");
 }
 
+/// **Phase 3 状态钩子门**：`Acquire(State::Slot)` 选槽时把受害者沉宿主，
+/// `Acquire(State::Resident)` 再把它回灌到设备；两条都只经 `store_hook`。
+#[cfg(test)]
+#[tokio::test]
+async fn state_hook_slot_offload_and_resident_roundtrip() {
+    let mut running = mock_snap_engine(2).await;
+    let bytes = running.bank.rel.snap_bytes();
+    assert!(bytes > 0, "状态腿布局应已注册");
+    let k_a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xA31));
+    let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB32));
+    let k_new = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xC33));
+    for k in [k_a, k_b] {
+        running.bank.rel.state.register_snap(
+            k,
+            bytes,
+            owl_store::Tier::Gpu,
+            owl_store::SnapDurability::Durable,
+        );
+    }
+    running.dev.pool.snap_place(0, k_a);
+    running.dev.pool.snap_place(1, k_b);
+    assert_eq!(running.dev.pool.snap_used(), 2, "两槽已满");
+
+    // Slot hook：为 k_new 选槽 ⇒ 按 store 序逐一条到宿主（内容留）
+    let slot = running.snap_ensure_slot(k_new).await.expect("State::Slot");
+    let victim = [k_a, k_b]
+        .into_iter()
+        .find(|k| running.bank.rel.state.locate(*k) == Some(owl_store::Tier::Host))
+        .expect("应有一条被沉到宿主");
+    assert!(running.bank.rel.snap_host.get(victim).is_some(), "宿主应有内容");
+    assert_eq!(running.dev.pool.snap_used(), 1, "受害者设备槽已释放");
+    eprintln!("[state-hook] slot={slot} victim={victim:?}");
+
+    // Resident hook：Host → Device，槽号经 StoreOutcome.state_slot 返回
+    let resident = running.snap_ensure_resident(victim).await.expect("State::Resident");
+    assert_eq!(
+        running.bank.rel.state.locate(victim),
+        Some(owl_store::Tier::Gpu),
+        "回灌后层账应回设备"
+    );
+    assert_eq!(running.dev.pool.snap_slot_of(victim), Some(resident), "槽索引应记上");
+    assert!(running.bank.rel.snap_host.get(victim).is_none(), "宿主副本已取走");
+    assert_eq!(running.dev.pool.snap_used(), 2, "两槽重新占满");
+}
+
 /// **磁盘层门(S6)**:宿主装不下 ⇒ 溢写到磁盘(内容不丢),再能读回宿主。
 ///
 /// 验的是三件:①`plan_capacity` 的第三层出票 ②engine 的执行臂真写文件
@@ -2022,7 +2067,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
 
     let rep = running.bank.rel.leg.report();
     eprintln!(
-        "[s3-3b] 轮 3 后:自由槽 {}/{} · 缓存 {} 块 · 宿主 {} 块 / {:.2}MiB · 换出 {} 次 {}KiB(drop {} / 兜底驱逐 {})",
+        "[s3-3b] 轮 3 后:自由槽 {}/{} · 缓存 {} 块 · 宿主 {} 块 / {:.2}MiB · 换出 {} 次 {}KiB(drop {} / 同步驱逐 canary {})",
         rep.slots_free,
         rep.slots_total,
         rep.cached_blocks,
@@ -2056,7 +2101,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     }
     assert!(rep.ops.offloads > 0, "门①:需求驱动保洁应真下沉(宿主面已开)");
     assert!(rep.host_bytes > 0, "门①:宿主层应真有驻留");
-    assert_eq!(rep.ops.ensure_evicted, 0, "需求驱动到位 ⇒ `ensure_for_len` 同步驱逐应为 0");
+    assert_eq!(rep.ops.ensure_evicted, 0, "Phase 2：`ensure_for_len` 纯分配，同步驱逐 canary 必须为 0");
 
     // 诊断:命中面到底长什么样(scheduler 看到的同一面)。
     // ⚠️ 口径必须与 submit 一致:`submit_session` 内部先 `chat_wrap` 再 encode
@@ -2117,7 +2162,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
 
     let rep2 = running.bank.rel.leg.report();
     eprintln!(
-        "[s3-3b] 轮 4 后:宿主 {} 块 / {:.2}MiB · 换出 {} 块/{} 命令 · 回灌 {} 块/{} 命令 · 兜底驱逐 {}",
+        "[s3-3b] 轮 4 后:宿主 {} 块 / {:.2}MiB · 换出 {} 块/{} 命令 · 回灌 {} 块/{} 命令 · 同步驱逐 canary {}",
         rep2.host_blocks,
         rep2.host_bytes as f64 / 1048576.0,
         rep2.ops.offloads,
@@ -2132,7 +2177,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
         rep2.ops.onload_batches, 1,
         "§15 批面:多块回灌必须**一条命令**(逐块 = 每块一次往返)"
     );
-    assert_eq!(rep2.ops.ensure_evicted, 0, "全程不得依赖 `ensure_for_len` 的同步驱逐");
+    assert_eq!(rep2.ops.ensure_evicted, 0, "Phase 2：全程不得再有 `ensure_for_len` 同步驱逐");
     // 轮 4 的换出 = **为回灌腾位**(冷链让路)⇒ 宿主净增减不作文判据;
     // 真正要看的:回灌发生了、且没有同步驱逐(上两条)。
 }
@@ -3722,6 +3767,11 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
         );
         assert_eq!(ta, tb, "恒等门 27B(d{gate_depth}):greedy 真草稿 spec 文本 ≡ 无 spec");
         assert_eq!(ta_tokens, tb_tokens, "恒等门 27B(d{gate_depth}):token 账逐位一致");
+        let leg = running.leg_stats();
+        assert_eq!(
+            leg.ops.ensure_evicted, 0,
+            "Phase 2:MTP spec 轮不得回退到 ensure_for_len 同步驱逐"
+        );
         // 旋钮已全量显式化,无 env 清场需要
 
         drop(running);
@@ -3941,6 +3991,11 @@ pub async fn boot_27b_default() -> RunningEngine<crate::GpuFace> {
         );
         assert_eq!(ta, tb, "恒等门 DFlash2:greedy 真草稿 spec 文本 ≡ 无 spec");
         assert_eq!(ta_tokens, tb_tokens, "恒等门 DFlash2:token 账逐位一致");
+        let leg = running.leg_stats();
+        assert_eq!(
+            leg.ops.ensure_evicted, 0,
+            "Phase 2:DFlash2 spec 轮不得回退到 ensure_for_len 同步驱逐"
+        );
         // 旋钮已全量显式化,无 env 清场需要
     
         // 实例收尾屏障:drop 后等 server 线程退出 + CUDA ctx 析构(异步;

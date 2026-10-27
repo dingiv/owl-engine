@@ -161,9 +161,14 @@ pub struct LegOps {
     pub offload_bytes: u64,
     /// 换回字节。
     pub onload_bytes: u64,
-    /// **`ensure_for_len` 兜底驱逐的块数**(需求驱动保洁不足的指纹,§12.4):
-    /// 需求驱动做实后,该值只在真容量不足(或保洁误算)时非零。
+    /// **同步分配驱逐的块数**（Phase 2 后恒 0 的回归门）。
+    ///
+    /// 2026-10-25 起 `ensure_for_len` 只做纯分配；任何非零 = 有人把逐缓存
+    /// 重新塞回了分配路径。链登记容量驱逐另记 [`Self::tree_evicted`]。
     pub ensure_evicted: u64,
+    /// **链登记容量驱逐的块数**（`register_chain_offloaded` 启动按盘索引
+    /// 重建树时的 `cache_cap` 驱逐；不是分配路径的同步驱逐）。
+    pub tree_evicted: u64,
     /// 换出**命令**次数(块数见 `offloads`;§15 批面:一条 swap 搬 N 块)。
     pub offload_batches: u64,
     /// 换回**命令**次数(块数见 `onloads`)。
@@ -380,23 +385,15 @@ impl BlockLeg {
         Ok(ChainHit { matched_blocks: pm.matched_blocks, slots, hashes })
     }
 
-    /// 块表增长(压力驱逐在腿内;逐出的宿主条目 = 未接线,响亮拒)。
+    /// 块表增长（**纯分配**；腾位已归 engine 的 `StoreHook::Acquire(Grow)`）。
     ///
-    /// §12.4:需求驱动保洁到位时,这条路上的同步驱逐应**恒为空**
-    /// (腾位发生在段边界);非空 = 保洁不足(计入 `ops.ensure_evicted`,
-    /// 报告面可查 —— 不许静默)。
-    // FIXME(store-hook): 这是第二套决策路径(绕过 plan_capacity)。新版
-    // Acquire(Grow) 预留后,本函数应改为**纯分配**、不驱逐;
-    // 不够 = EngineInvariant,而不是静默 drop host 副本。
+    /// 池不足 ⇒ 响亮 `Exhausted`（带链名）；不再逐缓存、不再丢宿主副本。
+    /// `ops.ensure_evicted` 因此应恒为 0；非零 = 同步驱逐回归。
     pub fn ensure_for_len(&mut self, table: &mut Vec<u32>, target_len: usize) -> StoreResult<()> {
-        let evicted = self.kv.ensure_for_len(table, target_len).map_err(|e| match e {
+        self.kv.ensure_for_len(table, target_len).map_err(|e| match e {
             StoreError::Exhausted(m) => StoreError::Exhausted(format!("{} 链:{m}", self.label)),
             other => other,
-        })?;
-        if !evicted.is_empty() {
-            self.ops.ensure_evicted += evicted.len() as u64;
-        }
-        self.drop_host_evicted(&evicted)
+        })
     }
 
     /// 压力驱逐产出宿主条目 = 内容整体淘汰:把宿主副本**真的丢掉**(S3-3b 宿主面在位)。
@@ -823,7 +820,7 @@ impl BlockLeg {
     pub fn register_chain_offloaded(&mut self, tokens: &[u32]) -> StoreResult<Vec<crate::id::ChainHash>> {
         let (inserted, evicted) = self.kv.register_chain_offloaded(tokens)?;
         if !evicted.is_empty() {
-            self.ops.ensure_evicted += evicted.len() as u64;
+            self.ops.tree_evicted += evicted.len() as u64;
         }
         // 同款收尾:被逐条目若载体在宿主(slot=None),宿主副本必须一起丢,
         // 否则留尸 ⇒ 同身份日后 `host.land` 撞「已在宿主层」(2026-10-24 案)。
@@ -1666,7 +1663,7 @@ mod tests {
         l.release_table(&mut table).expect("收拾");
     }
 
-    /// 关宿主层时:压力驱逐仍走纯设备路径(行为与接线前一致)。
+    /// 关宿主层时:显式逐缓存仍走纯设备路径（Phase 2 后 `ensure_for_len` 只纯分配）。
     #[test]
     fn pressure_without_host_never_touches_host_tier() {
         let mut l = BlockLeg::open(LegConfig {
@@ -1683,8 +1680,9 @@ mod tests {
         l.ensure_for_len(&mut t, 32).expect("块表");
         l.register_chain(&(0..32u32).collect::<Vec<_>>(), &t).expect("登记");
         l.release_table(&mut t).expect("归还");
+        l.kv.evict_cached(1).expect("显式逐一槽");
         let mut t2 = Vec::new();
-        l.ensure_for_len(&mut t2, 64).expect("压力驱逐放行");
+        l.ensure_for_len(&mut t2, 64).expect("纯分配放行");
         let rep = l.report();
         assert_eq!(rep.host_bytes, 0, "关宿主层:压力驱逐不得碰宿主");
         assert_eq!(rep.ops.offloads, 0);

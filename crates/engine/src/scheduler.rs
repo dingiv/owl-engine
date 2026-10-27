@@ -360,8 +360,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         let grew = {
             let s = self.bank.sessions.session_mut(sid)?;
             let before = s.block_table.len();
-            // FIXME(store-hook): H2 槽兜底旁路(decode_row_of);
-            // 应改为 pump 的 Acquire(Grow) 预留后纯分配。
+            // H2 已由 pump 的 Acquire(Grow) 预留；这里只纯分配
+            // (`generation_target` 覆盖 verify+propose)。
             self.bank
                 .rel
                 .leg
@@ -579,8 +579,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 } else {
                     turn.prompt_ids.len()
                 };
-                // FIXME(store-hook): H2 槽兜底旁路(start_one);
-                // 应改为 Acquire(Grow) 预留后纯分配。
+                // H1/H2 已由 pump 的 Acquire(Admit/Grow) 预留；这里只纯分配。
                 self.bank.rel.leg.ensure_for_len(&mut s.block_table, target)?;
             }
             let begin = BeginPlan {
@@ -970,6 +969,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         s.cached_len = d.cached_len;
         s.tokens.clear();
         s.tokens.extend_from_slice(&turn.prompt_ids[..d.cached_len]);
+        // **中途落账也必须自洽**：Abort 不会再 commit_turn；pad/spans 若仍
+        // 指向被截掉的后缀，下一轮 unpad 会 400。
+        let (spans, pads) = crate::img_evict::ledger_prefix(
+            &turn.img_spans,
+            &turn.img_pads,
+            d.cached_len,
+        );
+        s.set_img_spans(spans, pads);
         s.chain.seed(d.cached_len / page, d.tail_hash);
         s.set_positions(&turn.positions[..d.cached_len], true)?;
         s.position_epoch = s.position_epoch.wrapping_add(1);
@@ -1455,8 +1462,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let s = self.bank.sessions.session_mut(sid)?;
             let need = pos + spec + 1;
             let before = s.block_table.len();
-            // FIXME(store-hook): H2 槽兜底旁路(decode 相位);
-            // 应改为 Acquire(Grow) 预留后纯分配。
+            // H2 已由 pump 的 Acquire(Grow) 预留；这里只纯分配。
             self.bank.rel.leg.ensure_for_len(&mut s.block_table, need)?;
             let grew = s.block_table.len() != before;
             let page = self.dev.pool.geom.page;
