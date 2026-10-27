@@ -1117,6 +1117,50 @@ impl KernelSpec for RopeHalfPartialF32 {
 }
 
 
+/// `owl_derope_half_partial_f16` —— rope_f32.cu(逆 rope;KVMem raw K 落盘)
+pub struct DeropeHalfPartialF16;
+
+#[kernel_tags("dom.elem", "role.rope")]
+impl KernelSpec for DeropeHalfPartialF16 {
+    const ENTRY: &'static str = "owl_derope_half_partial_f16";
+    const SRC: &'static str = "cu/elems/rope_f32.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::t_in("cos_t", Dtype::F16, 2),
+        Param::t_in("sin_t", Dtype::F16, 2),
+        Param::t_in("pos", Dtype::F32, 2),
+        Param::sz("heads"),
+        Param::sz("head_dim"),
+        Param::sz("half"),
+        Param::t_out("out", Dtype::F16, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+/// `owl_derope_half_partial_f32` —— rope_f32.cu(逆 rope;KVMem raw K 落盘)
+pub struct DeropeHalfPartialF32;
+
+#[kernel_tags("dom.elem", "role.rope")]
+impl KernelSpec for DeropeHalfPartialF32 {
+    const ENTRY: &'static str = "owl_derope_half_partial_f32";
+    const SRC: &'static str = "cu/elems/rope_f32.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F32, 2),
+        Param::t_in("cos_t", Dtype::F32, 2),
+        Param::t_in("sin_t", Dtype::F32, 2),
+        Param::t_in("pos", Dtype::F32, 2),
+        Param::sz("heads"),
+        Param::sz("head_dim"),
+        Param::sz("half"),
+        Param::t_out("out", Dtype::F32, 2),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
 /// `probe_ts_f16` —— ts_probe.cu(R1 补表)
 pub struct ProbeTsF16;
 
@@ -1151,6 +1195,8 @@ pub static OWL_EMBED_F32: KernelMeta = meta_of::<EmbedF32>();
 pub static OWL_NARROW_STRIDED_F32: KernelMeta = meta_of::<NarrowStridedF32>();
 pub static OWL_ROPE_HALF_PARTIAL_F16: KernelMeta = meta_of::<RopeHalfPartialF16>();
 pub static OWL_ROPE_HALF_PARTIAL_F32: KernelMeta = meta_of::<RopeHalfPartialF32>();
+pub static OWL_DEROPE_HALF_PARTIAL_F16: KernelMeta = meta_of::<DeropeHalfPartialF16>();
+pub static OWL_DEROPE_HALF_PARTIAL_F32: KernelMeta = meta_of::<DeropeHalfPartialF32>();
 pub static PROBE_TS_F16: KernelMeta = meta_of::<ProbeTsF16>();
 
 pub static QUANT_INT8_ROW_F16: KernelMeta = meta_of::<QuantInt8RowF16>();
