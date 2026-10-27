@@ -212,6 +212,24 @@ pub struct GgufMmq2Q3KJ16;
 pub struct GgufMmq2IQ2SJ16;
 pub struct GgufMmq2IQ2XSJ16;
 
+/// **prefill 档补齐(2026-10-27)**:Q3_K / IQ2_S / IQ2_XS 的 J=64,128,
+/// 以及新挂的 IQ2_XXS / IQ1_S / Q2_K 三型(J=16/64/128)。
+pub struct GgufMmq2Q3KJ64;
+pub struct GgufMmq2Q3KJ128;
+pub struct GgufMmq2IQ2SJ64;
+pub struct GgufMmq2IQ2SJ128;
+pub struct GgufMmq2IQ2XSJ64;
+pub struct GgufMmq2IQ2XSJ128;
+pub struct GgufMmq2IQ2XXSJ16;
+pub struct GgufMmq2IQ2XXSJ64;
+pub struct GgufMmq2IQ2XXSJ128;
+pub struct GgufMmq2IQ1SJ16;
+pub struct GgufMmq2IQ1SJ64;
+pub struct GgufMmq2IQ1SJ128;
+pub struct GgufMmq2Q2KJ16;
+pub struct GgufMmq2Q2KJ64;
+pub struct GgufMmq2Q2KJ128;
+
 const MMQ2_PARAMS: &[Param] = &[
     // 名字逐字对 `.cu` 实例(`vx`/`vy`;2026-10-20 互证门修正)
     Param::t_in("vx", Dtype::U8, 2),
@@ -260,6 +278,21 @@ gguf_mmq2_spec!(GgufMmq2IQ3XXSJ16, crate::family::gguf::MMQ2_IQ3XXS_J16);
 gguf_mmq2_spec!(GgufMmq2Q3KJ16, crate::family::gguf::MMQ2_Q3K_J16);
 gguf_mmq2_spec!(GgufMmq2IQ2SJ16, crate::family::gguf::MMQ2_IQ2S_J16);
 gguf_mmq2_spec!(GgufMmq2IQ2XSJ16, crate::family::gguf::MMQ2_IQ2XS_J16);
+gguf_mmq2_spec!(GgufMmq2Q3KJ64, crate::family::gguf::MMQ2_Q3K_J64);
+gguf_mmq2_spec!(GgufMmq2Q3KJ128, crate::family::gguf::MMQ2_Q3K_J128);
+gguf_mmq2_spec!(GgufMmq2IQ2SJ64, crate::family::gguf::MMQ2_IQ2S_J64);
+gguf_mmq2_spec!(GgufMmq2IQ2SJ128, crate::family::gguf::MMQ2_IQ2S_J128);
+gguf_mmq2_spec!(GgufMmq2IQ2XSJ64, crate::family::gguf::MMQ2_IQ2XS_J64);
+gguf_mmq2_spec!(GgufMmq2IQ2XSJ128, crate::family::gguf::MMQ2_IQ2XS_J128);
+gguf_mmq2_spec!(GgufMmq2IQ2XXSJ16, crate::family::gguf::MMQ2_IQ2XXS_J16);
+gguf_mmq2_spec!(GgufMmq2IQ2XXSJ64, crate::family::gguf::MMQ2_IQ2XXS_J64);
+gguf_mmq2_spec!(GgufMmq2IQ2XXSJ128, crate::family::gguf::MMQ2_IQ2XXS_J128);
+gguf_mmq2_spec!(GgufMmq2IQ1SJ16, crate::family::gguf::MMQ2_IQ1S_J16);
+gguf_mmq2_spec!(GgufMmq2IQ1SJ64, crate::family::gguf::MMQ2_IQ1S_J64);
+gguf_mmq2_spec!(GgufMmq2IQ1SJ128, crate::family::gguf::MMQ2_IQ1S_J128);
+gguf_mmq2_spec!(GgufMmq2Q2KJ16, crate::family::gguf::MMQ2_Q2K_J16);
+gguf_mmq2_spec!(GgufMmq2Q2KJ64, crate::family::gguf::MMQ2_Q2K_J64);
+gguf_mmq2_spec!(GgufMmq2Q2KJ128, crate::family::gguf::MMQ2_Q2K_J128);
 
 // ---- **行窗解量化**(W-2d;dequant+cuBLAS 的喂料手)———————————————
 //
@@ -777,6 +810,21 @@ pub static MMQ2_IQ3XXS_J16: KernelMeta = meta_of::<GgufMmq2IQ3XXSJ16>();
 pub static MMQ2_Q3K_J16: KernelMeta = meta_of::<GgufMmq2Q3KJ16>();
 pub static MMQ2_IQ2S_J16: KernelMeta = meta_of::<GgufMmq2IQ2SJ16>();
 pub static MMQ2_IQ2XS_J16: KernelMeta = meta_of::<GgufMmq2IQ2XSJ16>();
+pub static MMQ2_Q3K_J64: KernelMeta = meta_of::<GgufMmq2Q3KJ64>();
+pub static MMQ2_Q3K_J128: KernelMeta = meta_of::<GgufMmq2Q3KJ128>();
+pub static MMQ2_IQ2S_J64: KernelMeta = meta_of::<GgufMmq2IQ2SJ64>();
+pub static MMQ2_IQ2S_J128: KernelMeta = meta_of::<GgufMmq2IQ2SJ128>();
+pub static MMQ2_IQ2XS_J64: KernelMeta = meta_of::<GgufMmq2IQ2XSJ64>();
+pub static MMQ2_IQ2XS_J128: KernelMeta = meta_of::<GgufMmq2IQ2XSJ128>();
+pub static MMQ2_IQ2XXS_J16: KernelMeta = meta_of::<GgufMmq2IQ2XXSJ16>();
+pub static MMQ2_IQ2XXS_J64: KernelMeta = meta_of::<GgufMmq2IQ2XXSJ64>();
+pub static MMQ2_IQ2XXS_J128: KernelMeta = meta_of::<GgufMmq2IQ2XXSJ128>();
+pub static MMQ2_IQ1S_J16: KernelMeta = meta_of::<GgufMmq2IQ1SJ16>();
+pub static MMQ2_IQ1S_J64: KernelMeta = meta_of::<GgufMmq2IQ1SJ64>();
+pub static MMQ2_IQ1S_J128: KernelMeta = meta_of::<GgufMmq2IQ1SJ128>();
+pub static MMQ2_Q2K_J16: KernelMeta = meta_of::<GgufMmq2Q2KJ16>();
+pub static MMQ2_Q2K_J64: KernelMeta = meta_of::<GgufMmq2Q2KJ64>();
+pub static MMQ2_Q2K_J128: KernelMeta = meta_of::<GgufMmq2Q2KJ128>();
 
 // ---- MMQ 的元数据表项 ----
 pub static MMQ_Q8_0: KernelMeta = meta_of::<GgufMmqQ8_0>();
