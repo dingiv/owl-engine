@@ -1,0 +1,7 @@
+# 模型组件：Qwen3.8-27B GGUF UD-IQ3_S(3.44 bit,12.0GB;极限上下文档)。
+[model]
+name = "qwen3.8-27b-gguf-iq3"
+path = "../models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_S.gguf"
+format = "gguf"
+quant = "iq3"
+head_quant = "off"

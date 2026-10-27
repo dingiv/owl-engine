@@ -81,7 +81,10 @@ mod tests {
     ///   ① 单 3090 / 27B **AWQ-INT4**(视觉 + image_evict 全特性);
     ///   ② 双 3080 TP2 / 27B AWQ-INT4(长上下文 + 大图窗口);
     ///   ③ 单 3090 / 27B **GGUF UD-IQ4_XS + mmproj-F16**(14.3GB 权重 ⇒ **168k 上下文**,
-    ///      本机唯一能开这么长的单卡档;prefill 比①a8 慢 ~24%,换 3× ctx)。
+    ///      本机唯一能开这么长的单卡档;prefill 比①a8 慢 ~24%,换 3× ctx);
+    ///   ④ 单 3090 / 27B **GGUF UD-IQ3_S + mmproj-F16**(12.0GB ⇒ **224k 上下文**,
+    ///      逼近 native 262144;与③**互斥**——同一张 3090 二选一,速度慢 ~13%、
+    ///      3bit 质量低一档)。
     ///      2026-10-27 实测与选型理由见该档头注。
     /// 其余形状一律用 `--set` 临时覆盖,不再落成新文件(历史 28 个入口档的
     /// 收敛记录见 `roadmap.local/profiles-consolidation-2026-10-24.md`)。
@@ -97,7 +100,12 @@ mod tests {
         got.sort_unstable();
         assert_eq!(
             got,
-            vec!["qwen38_27b-3080_tp2", "qwen38_27b-3090", "qwen38_27b-gguf_3090"],
+            vec![
+                "qwen38_27b-3080_tp2",
+                "qwen38_27b-3090",
+                "qwen38_27b-gguf-iq3_3090",
+                "qwen38_27b-gguf_3090",
+            ],
             "档面膨胀了:要新形状请用 `--set` 覆盖,不要新增入口档"
         );
     }
