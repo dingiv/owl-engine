@@ -1,0 +1,68 @@
+# ── 常驻档 ④:单张 3090 Ti / 27B **GGUF UD-IQ3_S** + DFlash2 d7(极限上下文档)──
+#
+# **与档③(IQ4_XS)二选一**:两者都要一张 3090,而本机两张 3090 已被档①/档③占住
+# ⇒ 想用本档先停档③(`kill 8136 的 PID`,按端口取 PID,不要 pkill -f),
+# 再 `-p profiles/qwen38_27b-gguf-iq3_3090.toml` 起 8137。
+#
+# 为什么值得单独一档(IQ3_S = 12.0GB,比 IQ4_XS 再轻 2.3GB):
+#   同一张 24G 卡上 **上下文 168k → 224k**(逼近模型 native 262144,不用 YaRN),
+#   代价 = 内核更慢(IQ3 的 3.44bit 打包反量化比 IQ4 贵)且 3bit 质量更低。
+#
+# 实测(单 3090 / greedy / chunk 2048 / DFlash2 d7 / 视觉塔 F16 在座):
+#   ctx        prefill      decode     TTFT
+#   4k         1409 t/s      97 t/s     2.91 s
+#   8k         1509 t/s     121 t/s     5.43 s
+#   64k        1218 t/s      61 t/s     53.8 s
+#   128k        948 t/s      56 t/s    138.2 s
+#   (cap = 286041;本档 229376 = 80%;64k/128k 请求零拒发,余量 2.1GB)
+#   ← 对比档③(IQ4_XS):prefill 1646/1681 → **IQ3 慢 ~13%**,换 +33% ctx。
+#
+# 视觉:同源 unsloth `mmproj-F16.gguf`(0.9GB,已计入上面的 max_seq);
+#   烟雾门:三色横带图 ⇒ 正确答"红、绿、蓝"。
+# 质量:3bit 明显比 IQ4/AWQ 差一档 —— 长文检索/摘要这类"读得多"的任务优先本档,
+#   需要精度(数学/代码/严格格式)请用档①(8134 a8)或档③(IQ4)。
+extends = [
+  "full.toml",
+  "parts/model/27b-gguf-iq3s.toml",
+  "parts/hardware/3090-single.toml",
+  "parts/kernel/fi-graph.toml",
+  "parts/pool/fp8.toml",
+]
+
+[server]
+# 8137:与档③(8136)互斥(同一张 3090);同时起会先撞 bind,再撞选卡拒。
+bind = "127.0.0.1:8137"
+
+[model]
+# 视觉塔(GGUF 主干不含 model.visual.*)
+vision = true
+vision_path = "../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
+
+[runtime]
+# 229376 = 7168 页(boot 报的 cap 286041 的 80%,已含 0.9GB 视觉塔);
+# 实测 64k/128k 零拒发、余量 2.1GB。
+max_seq = 229376
+max_concurrency = 1
+# GGUF prefill 走 MMQ2;512→2048 实测 +8~15%,4096 在 8k prompt 上会边界降级。
+prefill_chunk = 2048
+prefill_tail_merge = 0
+implicit_session = true
+
+[spec]
+# 同档③:外部 DFlash2 W4A16 草稿(depth>0 + draft_path ⇒ tag filter 同时放行
+# QUANT_GGUF 与 W4A16/AWQ)。
+depth = 7
+draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
+lookup = true
+
+[pool]
+snap_max = 1
+prefix_cache = true
+vram_reserve_mb = 256
+host_cache_mb = 10240
+# 快照腿宿主面关(同档③:单槽快照换槽会撞 store「块已在宿主层」不变量)
+snap_host_mb = 0
+snap_msg_boundary = true
+snap_msg_delim = ""
+snap_msg_min_gap = 2048
+snap_msg_min_span = 0
