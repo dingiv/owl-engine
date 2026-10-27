@@ -15,7 +15,15 @@ use crate::graph_plan::f32b;
 use crate::scheduler::BeginPlan;
 
 /// **B4 降级探测周期上限**(tok):退避 ×2 后封顶,避免探针稀疏到失效。
-const DEGRADE_PROBE_MAX: usize = 512;
+/// **降级态探测间隔上限**(2026-10-27 由 512 下修到 64)。
+///
+/// 原值 512 是"指数退避,别在真亏本时白试"的思路;但实测(48k 真实文档):
+/// 一次 `m=0×7` 连击降级后,`probe_every` 从 8 逐轮翻倍到 512 —— **而请求
+/// 总共才 400 token**,于是**一次探测都不会发生** ⇒ 整段永久裸 decode
+/// (346/400 token,28 ms/token vs 投机 12 ms/token)。
+/// 封顶 64 后最坏情况 = 每 64 token 试一轮投机:多付 ≈ (34−28×AL)/64
+/// ≈ 0.1 ms/token,却保证"内容一旦回到可投机域就自动恢复"。
+const DEGRADE_PROBE_MAX: usize = 64;
 
 /// **双 rank 镜像执行**(S6f):`dev` 必跑;`peer` 在场则**并发**跑同一动作。
 ///

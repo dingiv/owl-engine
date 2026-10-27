@@ -432,6 +432,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             } else if !degraded && spec.spec_degraded {
                 owl_shared::log_warn!("spec-degrade", "探测命中 m={m} → 恢复 spec");
                 mcnt("spec.undegrad", 1);
+                // **恢复即清窗口**(2026-10-27):窗口里还留着降级前那段低 AL,
+                // 不清就会在下一轮"凑满窗口"时**立刻再判一次亏本** ⇒
+                // 降级↔恢复 振荡(实测日志成对出现)。恢复后应从干净窗口重新观察。
+                spec.recent_rounds = 0;
+                spec.recent_tokens = 0;
+                spec.recent_ms = 0.0;
             }
             spec.spec_zero_streak = streak;
             spec.spec_degraded = degraded;

@@ -4325,11 +4325,14 @@ fn spec_degrade_transition_branches() {
     let (s, d, p) = spec_degrade_transition(5, false, 64, 0, 6, 64);
     assert_eq!((s, d, p), (6, true, 64));
     // 降级态探测失败 → 退避 ×2
-    let (s, d, p) = spec_degrade_transition(7, true, 64, 0, 6, 64);
-    assert_eq!((s, d, p), (8, true, 128));
-    // 退避封顶 512
-    let (s, d, p) = spec_degrade_transition(9, true, 400, 0, 6, 64);
-    assert_eq!((s, d, p), (10, true, 512));
+    let (s, d, p) = spec_degrade_transition(7, true, 16, 0, 6, 8);
+    assert_eq!((s, d, p), (8, true, 32));
+    // 退避封顶 64(2026-10-27 由 512 下修:实测 48k 请求只有 400 token,
+    // 512 的间隔 = 一次探测都不会发生 ⇒ 整段永久裸 decode)
+    let (s, d, p) = spec_degrade_transition(9, true, 40, 0, 6, 8);
+    assert_eq!((s, d, p), (10, true, 64));
+    let (s, d, p) = spec_degrade_transition(9, true, 64, 0, 6, 8);
+    assert_eq!((s, d, p), (10, true, 64)); // 已在封顶 ⇒ 不再涨
     // **小首探窗**(2026-10-18 缺省 8):入降级即用 8,探测失败退避到 16
     let (s, d, p) = spec_degrade_transition(5, false, 8, 0, 6, 8);
     assert_eq!((s, d, p), (6, true, 8));

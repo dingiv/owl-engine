@@ -2059,6 +2059,24 @@ impl<D: DeviceClient> RunningEngine<D> {
             .map(|(n, (c, b))| format!("{n} ×{c} / {}B", b))
             .collect();
         let pool_kib: usize = pooled.iter().map(|(_, l)| l.bytes).sum::<usize>() / 1024;
+        // **噪声闸门**(2026-10-27):小量残块(≤4 块且 ≤64 KiB)降为 debug。
+        //
+        // 依据不是"看着烦",而是**它们不会累积**:`n4_force_release` 紧随其后
+        // 用同一份账兜底结清(`drain_owner` 与 `open_loans` 同源),且实测
+        // 13 个 turn 的池水位稳定(used 21.1~22.8 GiB 波动 = 正常周转)。
+        // 典型样本 = 每个 turn 1 块 `owl_narrow_strided_f16` / 10240 B
+        // (GDN `project` 的 z 窄切中间量)。真正的泄漏形态是"每轮 +N 且 N 大"
+        // —— 那条仍然响亮 WARN(阈值之上的老口径一字未改)。
+        let small = open.len() <= 4 && total_kib <= 64;
+        if small {
+            owl_shared::log_debug!(
+                "store",
+                "N4 残块(兜底将清):turn {turn} {} 块 / {total_kib} KiB —— {}",
+                open.len(),
+                detail.join(" ｜ ")
+            );
+            return;
+        }
         owl_shared::log_warn!(
             "store",
             "N4 未归还清单:turn {turn} 名下仍有 {} 块 / {total_kib} KiB 开着(另有池内复用 {} 块 / {pool_kib} KiB)—— {}",
