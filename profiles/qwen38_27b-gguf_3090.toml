@@ -16,10 +16,10 @@
 #   (128k 请求零拒发,boot 余量 2.2GB;cap = 246105,本档取 80%)
 #
 # 定位:
-#   · **本机唯一能开到 192k 的档**(AWQ 档 a8 后只有 57k,TP2 档 262k 但要两张卡);
-#   · 文本档:GGUF 主文件不带视觉塔;要图像用档①/档②,或临时开 mmproj:
-#     --set model.vision=true --set model.vision_path=../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf
-#     (约 0.9GB,从 KV 预算里扣 ≈27k ctx)
+#   · **本机唯一能开到 168k 的档**(AWQ 档 a8 后只有 57k;TP2 档 262k 但要两张卡);
+#   · **视觉已接**:GGUF 主文件不含视觉塔,用同源 `mmproj-F16.gguf`(0.9GB)。
+#     开视觉前 192k / 开视觉后 **168k**(cap 218457 的 79%,128k prompt 零拒发);
+#     烟雾实测:三色横带图 ⇒ 回答"红、绿、蓝"正确。
 #   · prefill 比 a8 AWQ 慢 24%,换的是 3.4× 上下文 —— 长文/大 prompt 用本档,
 #     短 prompt 低时延用档①(8134)。
 extends = [
@@ -37,11 +37,17 @@ extends = [
 #   --set parallel.device='["GPU-…"]'
 bind = "127.0.0.1:8136"
 
+[model]
+# **视觉塔**:GGUF 主干不含 `model.visual.*`,必须指 mmproj。
+# F16 版(0.9GB)与 IQ4_XS 同为 unsloth 系(视觉塔精度不随主干量化)。
+# ⚠️ 它吃 0.9GB ⇒ ctx 从 192k 收到 168k(见 [runtime] 注)。
+vision = true
+vision_path = "../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
+
 [runtime]
-# 196608 = 6144 页(boot 报的 cap = 246105 的 80%)。UD-IQ4_XS 只有 14.3GB,
-# 比 Q4_K_M 轻 4.7GB ⇒ 余量够开 3.4× 上下文:实测 128k prompt 零拒发、余量 2.2GB。
-# 再往上(229376+)就没有预填工作区的余量了。
-max_seq = 196608
+# 172032 = 5376 页(boot 报的 cap = 218457 的 79%,已含 0.9GB 视觉塔)。
+# 实测 64k / 128k prompt 零拒发,余量 1.79GB;196608 时 64k 就撞 68MiB 硬预算。
+max_seq = 172032
 max_concurrency = 1
 # 与档①同款:GGUF 的 prefill 走 MMQ2,块越大发射越少(实测 512→2048 +8~15%,
 # 4096 在 8k prompt 上会 prefill 边界降级 ⇒ 2048 是安全上限)。
