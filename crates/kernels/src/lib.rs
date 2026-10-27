@@ -65,8 +65,11 @@ pub mod registry;
 
 /// **代际(`Arch`)表** —— 构建期(`build.rs` 同源引入)与运行期共用。
 pub mod arch;
+/// **算子族 × 代际的准入表**(「这族不该在这张卡上跑」的唯一出口)。
+pub mod admit;
 
 pub use arch::{Arch, Caps, Family};
+pub use admit::{Admit, AdmitCtx, OpFamily};
 
 /// 可捕获 kernel 契约(A1.5)—— 实现者签字画押处。
 ///

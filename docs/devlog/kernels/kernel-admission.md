@@ -952,6 +952,22 @@ impl KernelPick {
 > 在 boot 期问一次写进 `EnvProvider::hw`;两腿由**装配期架构门**对齐(设备 sm ∉ 编译集 ⇒ 拒启)。
 > 新增代际 = 加枚举变体 / 写 `caps` / 让 `marlin` 与 `dispatch` 的**无通配 match** 表态。
 
+> **准入表(2026-10-27 用户裁决)**:分工 = **权重格式定算子族，代际只做门**。
+> 表住 `crates/kernels/src/admit.rs`(`OpFamily` × `AdmitCtx` → `Admit::{Ok, NeedsArchSpecific, Deny(why)}`)；
+> 投影与裁决住 `crates/models/src/admit.rs`(`family_of_plan` / `check_env`)；
+> 生效点 = **引擎 boot**(`boot_env_and_spec`，拒启时带“为什么 + 怎么办”)。
+>
+> 为什么不能散着写:`if arch == …` 会漏一处，而选核是**三键**(arch × 权重格式 × spec 形状)。
+> `AdmitCtx` 就是为第三键存在的 —— 例:GDN chunked 在 sm_120 上
+> **只在 spec verify(T>1)形状出错**(T=1/prefill 与标量臂逐字相同)，所以
+> `spec_depth = 0` 放行、`> 0` 拒启；同一张卡、同一档，结论不同。
+> 其他已钉死的判据:NVFP4 需 `caps.fp4_blockscale`(sm_120/121，且要 `a` 目标)；
+> Marlin W4A16/W4A8 需 `cp.async`(Turing 不行)；GGUF MMQ 需 `int8_mma`。
+>
+> 验证方式(真机):① 生产档(scalar+spec7) → `[admit] sm_120 · spec=7 ⇒ …=ok` 并起机；
+> ② `--set kernel.gdn_chunked=true` 且 spec>0 → **启动硬失败**并给出两个替代；
+> ③ 同 ② 但 `spec.depth=0` → 放行(证明是**条件门**不是一刀切)。
+
 ---
 
 ### 15.5 C2 施工实录(2026-10-13;**native 全量迁 cubin,运行期零编译**,已验收)

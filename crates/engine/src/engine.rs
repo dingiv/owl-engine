@@ -1973,6 +1973,17 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     if let Some(q) = rm.quant_plan {
         env.quant = q;
     }
+    // ------------------------------------------------------------------
+    // **代际准入门**(2026-10-27 用户裁决:权重格式定算子族,代际只做门)
+    //
+    // 判据表 = `owl_kernels::admit`(零依赖单源);投影/裁决 = `owl_models::admit`。
+    // 放在 boot 而不是发射时:发射时报 `no kernel image available` 是运维事故;
+    // 且实测已定的「不该跑」组合(GDN chunked × sm_120 × spec)必须当场拦。
+    // ------------------------------------------------------------------
+    match owl_models::admit::check_env(&env, rm.quant_plan, cfg.knobs.draft.depth) {
+        Ok(summary) => owl_shared::log_info!("admit", "{}", summary),
+        Err(why) => return Err(ModelError::Msg(why)),
+    }
     // FI 面启用(量化恒 = 主池;影子池已删,本值只作"启用 + 池量化"携带)
     // FI 面启用条件 = **能力条件**(f16 池 + paged 页表),不是开关:
     // 2026-10-13 起配置面无 flashinfer 选项,FI 恒启用(env.attn.fi 仅门/诊断用)
