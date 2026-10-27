@@ -908,6 +908,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
             owl_shared::counter_inc!("select.prefill_view.no_hole");
         }
+        // 响亮提示(2026-10-27 实测):`always` 让 prefill 只读 top-k 选中块 ——
+        // **长 system / tools schema 里未被选中的部分模型看不见** ⇒ 输出退化到
+        // 1~2 token 就 EOS(复现:60k system 时 output=1;同上下文 on-hole 正常 176)。
+        // 不阻断(纯长文档场景仍可用),但每次装配/每 turn 首次走这条就点名。
+        if self.boot.cfg.knobs.prefill_view == PrefillViewMode::Always {
+            owl_shared::counter_inc!("select.prefill_view.always_used");
+        }
         self.sel.note_prefill_subset();
         let mut pages = view_pages;
         let last = base + t.saturating_sub(1);
