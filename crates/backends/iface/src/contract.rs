@@ -17,6 +17,7 @@
 //!   server 回执族 = 本模块 [`ModelError`]。
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 // ============================================================================
@@ -416,6 +417,13 @@ pub struct FiPlanSpec {
     pub hd: usize,
     pub page: usize,
 }
+
+/// **分离式 swap 的回执句柄**(2026-10-27)。
+///
+/// `await` 即得"原箱奉还"的 connector;`Err` = 整条 swap 失败 —— 与
+/// [`DeviceClient::swap`] 的成败语义**逐字相同**,唯一差别是提交与等待解耦。
+pub type SwapWaiter =
+    Pin<Box<dyn Future<Output = Result<Box<dyn Connector + Send>, ModelError>> + Send>>;
 
 pub trait DeviceClient: Send {
     /// **本设备显存快照**(boot/预算决策的唯一读数;2026-10-24)。
@@ -845,6 +853,40 @@ pub trait DeviceClient: Send {
         }
     }
 
+    /// **分离式 swap**(2026-10-27):提交命令后**不当场等**,返回可稍后 await 的回执。
+    ///
+    /// 为什么需要:把 KV 块沉到宿主的一次搬运在 27B/64k 档实测 **1.1 s**
+    /// (1.8 GiB 的 D2H + 宿主拷贝 + 首次 pinned 分配),而这段时间 GPU 空转 ——
+    /// 它与被沉的块**没有数据依赖**(视图不读它们),可以藏进"下一个 chunk
+    /// 已入队、GPU 正在算"的窗口。调用方:提交 → 记在飞 → 安全点再 await。
+    ///
+    /// 纪律:
+    /// - **默认 = 不支持**(响亮拒)—— 调用方必须回退到同步 [`Self::swap`];
+    ///   不许给"假异步"的默认体(那会把失败藏起来);
+    /// - 在飞期间 **conn 不回还** ⇒ 调用方不得重入第二条 swap(单主零锁);
+    /// - 槽的安全由**派单方**守(plan 已把块标成在飞,commit 前不许复用)。
+    fn swap_begin(
+        &mut self,
+        dir: SwapDir,
+        pieces: &[SwapPiece],
+        conn: Box<dyn Connector + Send>,
+    ) -> Result<SwapWaiter, ModelError> {
+        let _ = (dir, pieces, conn);
+        Err(ModelError::Msg(
+            "swap_begin: 本后端不提供分离式 swap(调用方应回退到 swap)".into(),
+        ))
+    }
+
+    /// **能力自述**:本后端是否真能分离式 swap。
+    ///
+    /// 为什么要单独一条而不是"try 一下":
+    /// - 拿 `swap_begin` 的 Err 当"不支持"会与**真失败**(队列关/参数错)
+    ///   混为一谈 ⇒ 要么重复提交命令,要么把错误吞掉;
+    /// - 引擎在**决策前**就要知道走哪条路径(同步/异步的表写法不同)。
+    fn supports_swap_begin(&self) -> bool {
+        false
+    }
+
     /// 算子发射(COMPUTE 流,火后不理):Ok = 提交成功;同流保序,
     /// 与数据搬运的跨流先后靠回执时序/sync 建立(顺序语义,见 trait 级文档)
     fn launch(&mut self, msg: LaunchMsg)
@@ -908,6 +950,17 @@ pub trait DeviceClient: Send {
         Self: Sized,
     {
         async move { Ok(Box::new(HeapRegion(vec![0u8; bytes])) as _) }
+    }
+
+    /// **staging 池预热**(2026-10-27;设备侧语义见 `Command::PinnedPrewarm`)。
+    ///
+    /// 默认 = 无操作(无 pinned 码头的后端不需要):"没有这回事"与"预热了 0 个桶"
+    /// 在返回的计数上区分得开。
+    fn prewarm_pinned(&mut self, _bytes: usize) -> impl Future<Output = Result<(usize, usize), ModelError>> + Send
+    where
+        Self: Sized,
+    {
+        async move { Ok((0, 0)) }
     }
 
     /// pinned 租约上载(**异步语义**,F5 尾批):提交即回执,DMA 完成由

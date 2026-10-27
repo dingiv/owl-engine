@@ -461,6 +461,16 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::AllocPinned { bytes, name: nm, ack })?.await
     }
 
+    /// **staging 池预热**(2026-10-27):段大小与 `swap_out` 的 `STAGE_SEG` 同源。
+    async fn prewarm_pinned(&mut self, bytes: usize) -> Result<(usize, usize), ModelError> {
+        self.submit(move |ack| Command::PinnedPrewarm {
+            bytes,
+            seg: crate::server::STAGE_SEG,
+            ack,
+        })?
+        .await
+    }
+
     async fn upload_pinned_on(
         &mut self,
         stream: owl_iface::contract::UpStream,
@@ -622,6 +632,29 @@ impl DeviceClient for GpuClient {
     ) -> Result<Box<dyn Connector + Send>, ModelError> {
         let pieces = pieces.to_vec();
         self.submit(move |ack| Command::Swap { dir, pieces, conn, ack })?.await
+    }
+
+    /// **分离式 swap**(2026-10-27):把命令投进信箱,回执句柄原样返回。
+    ///
+    /// 与 [`Self::swap`] **同一条命令、同一份语义**;唯一差别是不在这里
+    /// await —— 回执 `Waiter` 是 `Send + 'static`,调用方可以搁到"GPU 正在
+    /// 算下一个 chunk"的窗口里再 await(此处的搬运算例 1.1 s/次)。
+    fn supports_swap_begin(&self) -> bool {
+        true
+    }
+
+    fn swap_begin(
+        &mut self,
+        dir: SwapDir,
+        pieces: &[SwapPiece],
+        conn: Box<dyn Connector + Send>,
+    ) -> Result<owl_iface::contract::SwapWaiter, ModelError> {
+        let pieces = pieces.to_vec();
+        let (ack, waiter): (Ack<_>, Waiter<_>) = Ack::pair();
+        self.tx
+            .send(Command::Swap { dir, pieces, conn, ack })
+            .map_err(|_| ModelError::ServerClosed)?;
+        Ok(Box::pin(waiter))
     }
 
     async fn sm_count(&mut self) -> Result<usize, ModelError> {

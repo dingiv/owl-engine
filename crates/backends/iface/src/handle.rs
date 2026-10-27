@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::contract::{
     BlockLedgerRow, Bytes, Connector, DeviceClient, Dtype, FiPlanSpec, GraphId, LaunchMsg,
-    ModelError, PinnedRegion, Shape, SwapDir, SwapPiece, UpChunk, UpStream,
+    ModelError, PinnedRegion, Shape, SwapDir, SwapPiece, SwapWaiter, UpChunk, UpStream,
 };
 // 输出口(值语义 fn 指针包;未注入 = 全部静默)。本 crate 不能依赖 owl-shared
 // (`owl-shared → owl-iface`),故类型住叶子 crate `owl-sink`,由 engine 注入。
@@ -541,6 +541,42 @@ fn swap_moves(dir: SwapDir, pieces: &[SwapPiece]) -> Vec<MoveEvent> {
         SwapDir::In => MoveDir::In,
     };
     by_block.into_iter().map(|(id, bytes)| MoveEvent { id, bytes, dir: d }).collect()
+}
+
+/// **换层事件的无句柄落账口**(2026-10-27;分离式 swap 专用)。
+///
+/// `swap_begin` 的回执要跨 await 才能拿到,而 `send_events` 借 `&self` ⇒
+/// 句柄不能跟着 future 走。账本与上下文本来都是共享句柄 ⇒ 把三件(账本/
+/// 上下文/输出口) 按值带过去,语义与 [`DeviceHandle::send_events`] 的
+/// "迁移部分"逐字一致(出生/死亡段留空 —— 本口只用于 swap)。
+fn emit_moves(
+    ledger: Option<LedgerCell>,
+    ctx: Arc<Mutex<Ctx>>,
+    sink: LogSink,
+    moves: &[MoveEvent],
+) {
+    if moves.is_empty() {
+        return;
+    }
+    let Some(cell) = ledger else { return }; // 纯转发态
+    let poisoned = cell.is_poisoned();
+    {
+        let mut guard = match cell.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        for ev in moves {
+            guard.on_move(ev);
+        }
+    }
+    let mut c = match ctx.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    c.events_sent = c.events_sent.saturating_add(moves.len() as u64);
+    if poisoned {
+        c.bump(sink, "ledger-lock", "事件入口锁中毒(已续用内部数据)".into());
+    }
 }
 
 // ============================================================================
@@ -1469,6 +1505,33 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         }
     }
 
+    /// **分离式 swap 的转发**(2026-10-27):换层事件必须在**回执之后**才发
+    /// —— 否则"还没搬完就报迁移"会向观察者撒谎。账本/上下文都是共享句柄
+    /// (Arc/Mutex),所以可以随 future 一起移动,不借 `self`。
+    fn supports_swap_begin(&self) -> bool {
+        self.inner.supports_swap_begin()
+    }
+
+    fn swap_begin(
+        &mut self,
+        dir: SwapDir,
+        pieces: &[SwapPiece],
+        conn: Box<dyn Connector + Send>,
+    ) -> Result<SwapWaiter, ModelError> {
+        let moves = swap_moves(dir, pieces);
+        let waiter = self.inner.swap_begin(dir, pieces, conn)?;
+        let ledger = self.ledger.clone();
+        let ctx = self.ctx.clone();
+        let sink = self.sink;
+        Ok(Box::pin(async move {
+            let r = waiter.await;
+            if r.is_ok() {
+                emit_moves(ledger, ctx, sink, &moves);
+            }
+            r
+        }))
+    }
+
     fn launch(&mut self, msg: LaunchMsg) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
         self.note_node();
         self.inner.launch(msg)
@@ -1538,6 +1601,14 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
     ) -> impl Future<Output = Result<Box<dyn PinnedRegion + Send>, ModelError>> + Send {
         // pinned 是**宿主**面(服务端 pinned 池自成一本账,不在设备块账房)⇒ 不进设备账
         self.inner.alloc_pinned(bytes, name)
+    }
+
+    /// staging 池预热转发(2026-10-27;语义见 `DeviceClient::prewarm_pinned`)。
+    fn prewarm_pinned(
+        &mut self,
+        bytes: usize,
+    ) -> impl Future<Output = Result<(usize, usize), ModelError>> + Send {
+        self.inner.prewarm_pinned(bytes)
     }
 
     fn upload_pinned_on(
