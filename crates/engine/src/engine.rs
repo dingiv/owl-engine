@@ -551,7 +551,7 @@ impl EngineKnobs {
             }
         };
         format!(
-            "pool={:?} turns={} snap_max={} host={}M snap_host={}M disk={}M snap_disk={}M dir={:?} prefix_cache={} align_tail={} bnd_stride={} | kvmem={}[idx={} gpu={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} split={} gdn_chunked={} kv={} graph_off={}",
+            "pool={:?} turns={} snap_max={} host={}M snap_host={}M disk={}M snap_disk={}M dir={:?} prefix_cache={} align_tail={} bnd_stride={} | kvmem={}[idx={} gpu={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
             self.gdn_slots,
             self.snap_max,
@@ -577,7 +577,6 @@ impl EngineKnobs {
             ev,
             fl,
             self.env.attn.fi as u8,
-            self.env.attn.prefill_split as u8,
             self.env.gdn.chunked as u8,
             q,
             self.no_graph as u8,

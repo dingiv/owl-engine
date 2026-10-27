@@ -1278,11 +1278,11 @@ impl Attention {
                         // 18→36ms/tok;split 同形状平坦 ~14-17)—— 大 chunk
                         // 走 FI 吃 tensor-core 收益(prefill −25%),小 T 回落
                         // chunked_opt(读 classic 主池,零影子依赖)。
-                        // 门槛 = `dispatch.fi_min_tokens`(缺省 1;2026-10-14
-                        // 单测 `fi_prefill_probe` 显示可降到 1 —— FI 在 T=54/ctx3072
-                        // 是 0.437 ms/层,而 t<128 回落核同形状 6.7 ms/层;
-                        // 历史硬编码 128 的依据被该单测推翻 ⇒ 收成配置旋钮)
-                        let fi_min_tokens = ctx.env.attn.fi_min_tokens;
+                        // **FI 通吃**(原 `dispatch.fi_min_tokens` 已于 2026-10-27
+                        // 退役:缺省恒 1、所有档都是 1,已退化为常量)。
+                        // 依据:2026-10-14 单测 `fi_prefill_probe` —— FI 在
+                        // T=1/8/54/128 × ctx=3072 = 0.287/0.435/0.437/0.438 ms/层,
+                        // 而旧门槛(128)以下的回落核同形状 6.7 ms/层(FI 快 15×)。
                         // **verify 面的 FI 由臂单值定**(2026-10-21):`verify_bt8`
                         // 在场 = 这是 verify 图,此时只有 `verify_arm = "fi"` 才许
                         // 走 FI;`v2`/`xqa`/`prefill` 三臂都**跳过**它(从前 FI 在
@@ -1290,29 +1290,19 @@ impl Attention {
                         // prefill 面(v2_bt8 缺席)行为不变:FI 仍是主臂。
                         let fi_allowed = ctx.v2_bt8.is_none() || varm.uses_fi();
                         if let Some(fi) = ctx.fi.as_ref().filter(|_| fi_allowed) {
-                            if tokens >= fi_min_tokens {
-                                // 同一条臂服务 prefill 与 verify;`v2_bt8` 只在 verify 图声明
-                                note_arm(if ctx.v2_bt8.is_some() {
-                                    "attn.arm.verify.fi"
-                                } else {
-                                    "attn.arm.prefill.fi"
-                                });
-                                return self.paged_prefill_fi_output(
-                                    &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, fi,
-                                );
-                            }
-                        }
-                        // 长 ctx split(flash-decoding;2026-10-02):nparts ≥ 4
-                        // (max_ctx > 2048)走分块路径;仅 hd256 核(hd128 变体
-                        // 挂账)。2026-10-12:核按池档位直读主池(f16/fp8kv
-                        // 变体,env 单源)—— 零影子依赖,FI 模式小 T 同样可走
-                        // (fp8 影子与主池双写并存,读主池免型转换税)
-                        let nparts = (ctx.ctx_base + tokens).div_ceil(512);
-                        if nparts >= 4 && self.hd == 256 && ctx.env.attn.prefill_split {
-                            return self.paged_prefill_split_output(
-                                &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, nparts,
+                            // 同一条臂服务 prefill 与 verify;`v2_bt8` 只在 verify 图声明
+                            note_arm(if ctx.v2_bt8.is_some() {
+                                "attn.arm.verify.fi"
+                            } else {
+                                "attn.arm.prefill.fi"
+                            });
+                            return self.paged_prefill_fi_output(
+                                &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, fi,
                             );
                         }
+                        // (原 `prefill_split` 分块路径已退役:2026-10-19 审计定谳
+                        //  "主路走 FI,split 只在 FI 缺席时上阵",而 FI 面自
+                        //  2026-10-13 起恒在 ⇒ 分支不可达;且该核有契约 rank bug。)
                         return self.paged_prefill_output(
                             &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, kv_lens,
                         );

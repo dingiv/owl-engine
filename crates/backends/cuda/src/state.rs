@@ -47,10 +47,6 @@ pub struct DiagOpts {
     /// **图自携 plan restore**(=`[kernel] fi_plan = "host-sync"`;缺省 true = 历史行为)。
     /// `false`(baked 档)⇒ 图不烘表,host 每步用 `fi_plan_sync` 刷当步精确表。
     pub fi_plan_restore: bool,
-    /// **prefill-only FP8→F16 shadow**(`[kernel].prefill_shadow`)
-    pub fi_prefill_shadow: bool,
-    /// shadow 预留上限 token(`runtime.max_seq`;0 = 按当前 ctx 增长)
-    pub fi_prefill_shadow_cap: usize,
     /// 捕获 slab 固定档 MiB(None = warmup 计量定量;原 OWL_CAPTURE_SLAB_MB
     /// —— 24G 贴顶的 27B + spec 双图场景,verify 图按需调小)
     pub capture_slab_mb: Option<usize>,
@@ -89,8 +85,6 @@ impl Default for DiagOpts {
             gpu_prof: false,
             graph_flags: 0,
             fi_plan_restore: false,
-            fi_prefill_shadow: false,
-            fi_prefill_shadow_cap: 0,
             capture_slab_mb: None,
             vram_reserve_mb: 0,
             vram_budget_mb: None,
@@ -131,8 +125,6 @@ impl DiagOpts {
             capture_slab_mb: c.capture_slab_mb,
             trace_ring: c.trace_ring,
             fi_plan_restore: !cfg.kernel.fi_plan.bakes(),
-            fi_prefill_shadow: cfg.kernel.prefill_shadow,
-            fi_prefill_shadow_cap: cfg.runtime.max_seq,
             tag_filter: tag_filter_from_config(cfg),
         }
     }

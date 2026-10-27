@@ -308,7 +308,6 @@ dense_floor_mib = 0
 # ---------------------------------------------------------------------------
 [kernel]
 qkv_fuse = true
-prefill_split = false
 force_naive_prefill = false
 # 单键臂(2026-10-21;旧 verify_v2/verify_fi/verify_xqa + decode_fi/decode_xqa 已退役)
 verify_arm = "v2"
@@ -322,8 +321,6 @@ fi_cuda_graph = true
 # prefill-only FP8→F16 shadow(实验;默认关,仅 pool.kv_fp8=true 可用;
 # f16 主池 + 本键 = validate 拒启。首层按 runtime.max_seq 预留,
 # 100k≈200MiB/rank,262k≈512MiB/rank;decode/verify 仍走 fp8)
-prefill_shadow = false
-fi_min_tokens = 1
 gdn_chunked = true
 gdn_scalar = false
 gdn_fused_decode = true

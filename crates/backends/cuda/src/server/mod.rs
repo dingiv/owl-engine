@@ -579,11 +579,6 @@ impl GpuServer {
                     // 零 env):写完 registry 之前设,保证任何 plan/activate
                     // 都读到本 boot 的档位。
                     owl_kernels::server::flashinfer::set_plan_restore(self.diag.fi_plan_restore);
-                    // **prefill f16 shadow**(配置驱动;boot 唯一写点)
-                    owl_kernels::server::flashinfer::set_prefill_shadow(self.diag.fi_prefill_shadow);
-                    owl_kernels::server::flashinfer::set_prefill_shadow_cap(
-                        self.diag.fi_prefill_shadow_cap,
-                    );
                     // **服务端面输出口**(2026-10-21 收编 env;2026-10-27 采集旗标
                     // 全退役,只剩 sink)。**boot 唯一写点**。
                     // `sink` 接上后:算子面 `klog_*!`(Rust)与 `OWL_LOG_*`

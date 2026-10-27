@@ -256,8 +256,6 @@ impl KvEnv {
 pub struct AttnEnv {
     /// C1-W2 qknorm_rope_kv_insert 单发(已结案;opt-in)
     pub qkv_fuse: bool,
-    /// 自研 flash-decoding split(对照臂;FI 在场时优先 FI)
-    pub prefill_split: bool,
     /// 诊断二分:强制 naive 回退(paged 数值质量 A/B)
     pub force_naive_prefill: bool,
     /// **verify 臂(单值;2026-10-21 取代 verify_v2/verify_xqa/verify_fi 三布尔)**
@@ -267,8 +265,6 @@ pub struct AttnEnv {
     pub verify_arm: owl_shared::config::VerifyArm,
     /// **decode 臂(单值;取代 decode_fi/decode_xqa)**
     pub decode_arm: owl_shared::config::DecodeArm,
-    /// FI 接管的 T 下限(`dispatch.fi_min_tokens`;t ≥ 此值走 FI 主臂)
-    pub fi_min_tokens: usize,
     /// FlashInfer prefill 面 —— **生产恒真**(2026-10-13:配置面开关已移除,
     /// 没有不启用的情况)。本字段保留仅供**门/诊断**做读核 A/B
     /// (engine::tests::gpu_longctx_fi_direct_gate 用它切 FI/自研读核)
@@ -428,11 +424,9 @@ impl EnvProvider {
         Self {
             attn: AttnEnv {
                 qkv_fuse: d.qkv_fuse,
-                prefill_split: d.prefill_split,
                 force_naive_prefill: d.force_naive_prefill,
                 verify_arm: d.verify_arm,
                 decode_arm: d.decode_arm,
-                fi_min_tokens: d.fi_min_tokens,
                 // FI **恒启用**(2026-10-13 用户令:移除开关,没有不启用的情况;
                 // 原 dispatch.flashinfer 已删)。
                 // ⚠️ 诊断 A/B(2026-10-14 A13 立案):`OWL_DIAG_NO_FI=1` 只服务

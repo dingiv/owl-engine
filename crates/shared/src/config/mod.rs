@@ -86,7 +86,7 @@
 //! | sampling | temp / topk / topp / rep_penalty | 1.0 / 20 / 0.95 / 1.0 |
 //! | load | verify / debug_tap | flag / false |
 //! | dispatch | qkv_fuse / gdn_fused_decode / gdn_fused_decode_v2 | bool / 全真(**正语义**) |
-//! | dispatch | prefill_split / force_naive | flag / false |
+//! | dispatch | force_naive_prefill | flag / false(原 `prefill_split` 已退役:FI 恒在用,分支不可达) |
 //! | dispatch | ~~flashinfer~~ | **已移除(2026-10-13):FI 恒启用,无开关** |
 //! | dispatch | gdn_chunked | bool / **true**(定谳;形状门自动回落) |
 //! | dispatch | gdn_scalar | flag / false |
@@ -114,7 +114,6 @@
 //! | cuda | graph_flags | { upload } / false |
 //! | cuda | capture_slab_mb | Option<usize> / None(hint 定量) |
 //! | cuda | *(nvrtc_include/native_aot 2026-10-13 退役 —— NVRTC 已删)* | — |
-//! | dispatch | fi_min_tokens | usize / 1(FI 接管的 T 下限;128 = 复现旧行为) |
 //! | graph | no_graph | flag / false(总闸:eager 直发,跳过**全部**图捕获) |
 //! | agent | template_path | Option<String> / None(相对路径 = 相对 model.dir) |
 //! | agent | implicit_session | flag / false(AGT-09:不带 session 键 ⇒ 会话 0) |
@@ -1205,7 +1204,9 @@ pub struct KernelCfg {
     /// —— `ssm_alpha/beta`(n=48)每发 34.2 µs → 5.1 µs,verify −2.8 ms/轮。
     #[serde(default = "default_gguf_mmvq_l2_mib")]
     pub gguf_mmvq_l2_mib: usize,
-    pub prefill_split: bool,
+    /// 诊断二分:强制 naive 回退(paged 数值质量 A/B)。
+    /// (原 `prefill_split` 已退役:2026-10-19 审计定谳"主路走 FI,
+    ///  split 只在 FI 缺席时上阵";FI 面自 2026-10-13 起恒在 ⇒ 分支不可达。)
     pub force_naive_prefill: bool,
     /// verify(T=depth+1)走的注意力臂 —— **单键、有序、互斥**(2026-10-21)。
     ///
@@ -1247,32 +1248,6 @@ pub struct KernelCfg {
     /// `owl_kernels::family::flashinfer::configure_plan_env` **唯一**写入。
     #[serde(default)]
     pub fi_cuda_graph: bool,
-    /// **prefill-only FP8→F16 shadow**(2026-10-26;实验,**默认关**):
-    /// prefill 每层 attention 前把当前 ctx 的 K/V 一次反量化进 f16 scratch,
-    /// 再走 FI f16 臂 —— 省掉 FA2 fp8 核在每个 q tile 上的重复 dequant/repack。
-    /// **仅 `[pool] kv_fp8 = true` 可用**;f16 主池没有可反量化的源,
-    /// 显式开 + f16 池 = `validate` 拒启(不静默 no-op)。
-    /// **不改 KV 池/不改变语义**;decode/verify 仍走 fp8。
-    /// scratch 大小 = ctx × 2KiB/rank(100k≈200MiB,262k≈512MiB),首层按
-    /// `runtime.max_seq` 预留,单层复用。
-    #[serde(default)]
-    pub prefill_shadow: bool,
-    /// **FI 接管的 T 下限**(行)。**缺省 1 = FI 通吃**(2026-10-14 定谳,自
-    /// `feat/prefill-graph` 合入)。
-    ///
-    /// 历史缺省 128(2026-10-12 立),依据是"FI 对小 qo 低效(18→36ms/tok)"。
-    /// ⚠️ 2026-10-14 单测推翻该依据(`crates/kernels/tests/fi_prefill_probe.rs`,
-    /// 生产核的第一个单测):FI 在 T=1/8/54/128 × ctx=3072 实测
-    /// **0.287/0.435/0.437/0.438 ms/层**(数值 max|FI−host| 3.2e-4,超门行数 0),
-    /// 而旧门槛以下的回落核(`chunked knhd`,24 CTA 低并行)同形状 **6.7 ms/层**
-    /// (in-engine CUPTI)⇒ **FI 快 15×**,且差距随 ctx 线性放大(T=128:ctx512
-    /// 1.38 → ctx8192 20.05 ms/层)。
-    ///
-    /// 引擎 A/B(3 轮交替 boot,中位,同 prompt 只差本键;尾块 47/36 行):
-    /// **−73.8ms @3.1k ctx(−3.0%)· −272.2ms @8.2k ctx(−4.1%)**;
-    /// 短 prompt(58 tok)与满 chunk(567 tok)各 −2.8/−1.9ms(无回归)。
-    /// 本键留作诊断旋钮(128 = 复现旧行为)。
-    pub fi_min_tokens: usize,
     /// FlashInfer prefill 面
     pub gdn_chunked: bool,
     pub gdn_scalar: bool,
@@ -1716,7 +1691,6 @@ impl Default for KernelCfg {
         Self {
             qkv_fuse: true,
             gguf_mmvq_l2_mib: default_gguf_mmvq_l2_mib(),
-            prefill_split: false,
             force_naive_prefill: false,
             verify_arm: VerifyArm::V2,
             decode_arm: DecodeArm::V2,
@@ -1726,8 +1700,6 @@ impl Default for KernelCfg {
             // FI plan 图档瓦(2026-10-18 图档单图立案):**缺省关** —— 图档单图的
             // 其余件(W2 关自携 / W3 单图)未落地前开它只是换瓦片口径,不产生图。
             fi_cuda_graph: false,
-            prefill_shadow: false,
-            fi_min_tokens: 1,
             // 2026-10-20:**定谳后翻默认**(FLA 五核,生产 spec-dflash 长期在跑;
             // 形状/T 门不满足时层内自动回落 varlen,无行为风险)
             gdn_chunked: true,
@@ -1926,6 +1898,23 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
             "kernel",
             "gguf_cublas_tile",
             "已退役(2026-10-27):无档使用的诊断行窗 —— 删掉该键",
+        ),
+        (
+            "kernel",
+            "prefill_split",
+            "已退役(2026-10-27):prefill 走 FI 主臂,该分块路径在 FI 缺席时才可达\
+             (FI 面自 2026-10-13 恒在)⇒ 死分支 —— 删掉该键",
+        ),
+        (
+            "kernel",
+            "fi_min_tokens",
+            "已退役(2026-10-27):缺省恒 1、所有档都是 1 ⇒ 等价常量(FI 通吃)—— 删掉该键",
+        ),
+        (
+            "kernel",
+            "prefill_shadow",
+            "已退役(2026-10-27):prefill-only FP8→F16 实验开关,默认关且无实测结论\
+             (未进过任何生产档)—— 删掉该键",
         ),
         (
             "kernel",
@@ -2434,13 +2423,6 @@ impl OwlConfig {
         // 这是 FP8→F16 的 prefill-only 影子;f16 主池没有可反量化的源,
         // 开启即无意义。默认关;显式开 + f16 池 = 配置面直接拒启,
         // 不留给运行期静默 no-op。
-        if self.kernel.prefill_shadow && !self.pool.kv_fp8 {
-            return Err(
-                "[kernel] prefill_shadow = true 只支持 fp8 主 KV 池;当前 [pool] kv_fp8 = false。\
-                 请改回 kv_fp8 = true,或保持 prefill_shadow = false"
-                    .to_string(),
-            );
-        }
         // **DFlash2 lookup 自洽**(2026-10-22):只服务 DFlash2;nmin/nmax/
         // nstrong/agree 的代数关系在配置面先拒，boot 再按实际裁决模式兜底。
         if self.spec.lookup {
@@ -2830,23 +2812,6 @@ mod tests {
                 .is_err(),
             "合批 + 选择层视图应拒"
         );
-    }
-
-    /// **prefill shadow 只在 fp8 主池启用**(2026-10-26 用户裁决):
-    /// 默认关;f16 池 + 显式开启必须配置面拒启,不能静默无效。
-    #[test]
-    fn prefill_shadow_requires_fp8_kv() {
-        let e = OwlConfig::from_toml_str(
-            "[kernel]\nprefill_shadow = true\n[pool]\nkv_fp8 = false\n",
-        )
-        .expect_err("f16 KV + prefill_shadow 必须拒");
-        assert!(e.contains("prefill_shadow") && e.contains("fp8"), "{e}");
-        OwlConfig::from_toml_str(
-            "[kernel]\nprefill_shadow = true\n[pool]\nkv_fp8 = true\n",
-        )
-        .expect("fp8 KV + prefill_shadow 合规");
-        OwlConfig::from_toml_str("[pool]\nkv_fp8 = false\n")
-            .expect("f16 KV 默认关 shadow 合规");
     }
 
     #[test]
