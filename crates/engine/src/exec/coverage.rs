@@ -872,18 +872,17 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///
     /// 为什么要它:被踢出工作集的块已下沉(会话链上是占位符)⇒ prefill 若不换表,
     /// 读到的是占位符当页号 = 静默错页。
-    pub(crate) fn past_view_of(&mut self, base: usize, t: usize) -> Option<(Vec<u32>, usize)> {
+    pub(crate) fn past_view_of(
+        &mut self,
+        base: usize,
+        t: usize,
+    ) -> Result<Option<(Vec<u32>, usize)>> {
         if !self.boot.cfg.knobs.select_partial {
-            return None;
+            return Ok(None);
         }
         // 先取视图快照(视图住在 `self.sel` 里,后续记账要可变借同一户)
-        let (view_pages, view_recall, view_tokens) = {
-            let v = self.sel.view()?;
-            (v.pages.clone(), v.recall_pos, v.tokens)
-        };
-        if base < view_recall {
-            return None; // 召回点之前:链还是完整的,不必换表
-        }
+        let Some(v) = self.sel.view() else { return Ok(None) };
+        let (view_pages, view_recall, view_tokens) = (v.pages.clone(), v.recall_pos, v.tokens);
         let page = self.dev.pool.geom.page.max(1);
         let chain: Vec<u32> = self
             .turns
@@ -892,6 +891,37 @@ impl<D: DeviceClient> RunningEngine<D> {
             .and_then(|a| self.bank.sessions.get(a.session_id))
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
+        // **P0-2 守卫(2026-10-27)**:`base < recall_pos` 时视图不覆盖本 chunk,
+        // 旧实现无条件 `return None`(退回全量链)。这**只在链上无洞时才安全** ——
+        // 有洞还走 dense = 拿占位符当页号 = 静默错值(不是"信息少",是"读错页")。
+        //
+        // 现役流程里这条路径本不该被触发:跨 turn 命中的宿主块由
+        // `plan_prefix_reuse` 的 `pending_loads` + `execute_begin` **全量回灌**
+        // (且 t.view 在 turn 收口 `clear_view` 清掉),同 turn 内 `base` 单调不减。
+        // 但它没有守卫 ⇒ 将来任何一处改动(裁剪点、视图生命周期)都可能静静打开
+        // 它。这里改成**响亮拒**(内部不变量失守不许 panic,走 Result 上抛)。
+        if base < view_recall {
+            let last_lb = (base + t.saturating_sub(1)) / page;
+            let has_hole = chain[..=last_lb.min(chain.len().saturating_sub(1))]
+                .iter()
+                .any(|s| *s == crate::scheduler::PENDING_LOAD_PLACEHOLDER);
+            if has_hole {
+                owl_shared::counter_inc!("select.prefill_view.dense_with_hole");
+                return Err(ModelError::EngineInvariant {
+                    what: format!(
+                        "prefill 过去视图:base={base} < 视图召回点 {view_recall},但链上已有洞 \
+                         (已下沉块)—— 退回全量链会读到占位符当页号。\
+                         这通常意味着视图生命周期或命中面裁剪与 cached_len 错位。"
+                    ),
+                });
+            }
+            owl_shared::counter_inc!("select.prefill_view.dense_ok");
+            return Ok(None); // 召回点之前且链无洞:全量链安全
+        }
+        // 视图覆盖点必须页对齐(`past_view` 的等效偏移算式按页推)
+        if !(base - view_recall).is_multiple_of(page) {
+            owl_shared::counter_inc!("select.prefill_view.unaligned_base");
+        }
         // **视图门槛**:旧行为 = 只在链上真出现洞(已下沉)时才换表 ⇒ 池内
         // (≤47.7k)prefill 跟着**全量链**走,注意力 O(ctx);而 decode 读的是
         // **选中集**。两套口径同时存在。
@@ -909,7 +939,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 是语义变更 ⇒ 必须显式在配置里选,缺省不偷改。
         if !has_hole {
             if self.boot.cfg.knobs.prefill_view != PrefillViewMode::Always {
-                return None;
+                return Ok(None);
             }
             owl_shared::counter_inc!("select.prefill_view.no_hole");
         }
@@ -949,7 +979,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         //   "等效偏移"契约(见下 `fi_tables_view` 调用)⇒ 注意力窗口 = 全 ctx
         //   ⇒ **每 chunk O(ctx)**(2026-10-19 262k 冲刺实测:前向 517→1718ms/chunk)。
         let tokens = view_tokens + base.saturating_sub(view_recall);
-        Some((pages, tokens))
+        Ok(Some((pages, tokens)))
     }
 
     /// **调试探针**:读一页 K(第一层)的字节哈希(视图页内容校验)。

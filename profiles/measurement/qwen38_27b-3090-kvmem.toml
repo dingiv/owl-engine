@@ -105,8 +105,12 @@ prefix_cache = true
 snap_max = 2
 # KV 块宿主腿:超卖档的下沉去处。10 GiB ≈ 10240 块。
 host_cache_mb = 10240
-# GDN 快照宿主预算:3 GiB ≈ 20 份边界快照。**262k 档若真要跑满需 ~4.7 GiB**
-# (128 边界 / SNAP_EVERY=4),不够时丢最冷的锚点(行为 = 复用点变近,不是错)。
+# GDN 快照宿主预算。算锚点数 **按真实可用区间算,不按 max_seq**:
+#   锚点 = ceil(可用 ctx / chunk / SNAP_EVERY=4),每份 = snap_row ≈ 148 MiB
+#   · 本档可用 ~44k ⇒ 44k/2048/4 ≈ 5.4 份 ≈ **800 MiB** ⇒ 3072 有余量 ✓
+#   · 若真把 max_seq 跑到 262k ⇒ 128 边界/4 = 32 份 ≈ **4.7 GiB**,3072 会丢
+#     最冷的锚点(行为 = 复用点变近,不是错值)
+# ⇒ 换档/加大 max_seq 时按上式重算,别照抄。
 snap_host_mb = 3072
 # **必须 512**(不是 kvmem 组件档里的 1024)。这不是"保守一点"的旋钮:
 # reserve 每多 1 MiB,池就少 1 页(32 tok),**可用上下文跟着降**。
@@ -127,9 +131,19 @@ select_decode = true
 select_partial = true
 index = true
 index_gpu = true
-# 召回预算 = 视图大小 = decode 的 attention 面。8192 是本档实测点;
-# 16384 对长 prompt 无改善(实测 124k 仍退化)但会挤掉池槽 ⇒ 别乱加。
-workspace_per_req = 8192
+# 召回预算 = 视图大小 = decode 的 attention 面。**4096 是本档实测最优点**
+# (2026-10-27 扫描 4096 / 8192 / 12288):
+#
+#   | workspace | decode(8k/512tok) | AL | 70k 三问 | 95k 三问 | 110k 三问 |
+#   |---|---|---|---|---|---|
+#   | **4096** | **105.7 t/s** | **3.66** | 全 48 | 1/ERR/2 | 1/1/**29** |
+#   | 8192 | 82.3 | 2.83 | 全 48 | 1/1/1 | ERR/ERR/ERR |
+#   | 12288 | 83.8 | 2.83 | — | — | — |
+#
+# ⇒ 视图减半**没有牺牲召回**(sink/recent 不变,top-k 从 244 块降到 116 块仍够),
+# 但 verify 扫的 KV 少一半 ⇒ decode +28%。**别凭直觉往大调**:16384 只挤池槽、
+# 不改善长 prompt(实测 124k 仍退化)。
+workspace_per_req = 4096
 verify_view_tokens = 0
 gqa_aggregation = "max"
 query_replay = false

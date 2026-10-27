@@ -468,7 +468,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             pool.capture_replay_snap(graphs.session.face_mut(), gdn_slot).await?;
         }
         // 部分驻留档的"过去"子集页链(host 面算好;两 rank 同值)
-        let past_view = self.past_view_of(base, chunk_ids.len());
+        let past_view = self.past_view_of(base, chunk_ids.len())?;
         let (vlm0, vlm1) = {
             let act = self.turns.active()?;
             (act.vlm.as_ref(), act.vlm_peer.as_ref())
@@ -667,7 +667,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 pool.restore_replay_snap(graphs.session.face_mut(), gdn_slot).await?;
             }
             let replay_bt = self.bank.sessions.session(sid)?.block_table.clone();
-            let replay_past = self.past_view_of(base, chunk_ids.len());
+            let replay_past = self.past_view_of(base, chunk_ids.len())?;
             let mut replay_knobs = self.boot.cfg.knobs.clone();
             replay_knobs.select_decode = false;
             replay_knobs.coverage_probe = false;
