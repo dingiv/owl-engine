@@ -39,9 +39,20 @@ extends = [
 —— 往 `profiles/` 顶层再丢一个 `.toml` 就会红。置顶三档各占一张卡
 （3090×2 在 8134/8136，3080 对在 8135），互不干扰。
 
-`profiles/measurement/` = **测量档**（不计入入口档面；子目录不参与档名发现）：
-`qwen38_27b-gguf.toml` / `qwen38_27b-gguf-iq4.toml` 是 GGUF 裸性能口径，
-不是常驻形状。
+`profiles/measurement/` = **测量/实验档**（不计入入口档面；子目录不参与档名发现）：
+
+- `qwen38_27b-gguf.toml` / `qwen38_27b-gguf-iq4.toml` —— GGUF 裸性能口径；
+- `qwen38_27b-3090-kvmem.toml` —— **KVMem 单卡档（8140）**：池超卖 5.49× +
+  选择层 + 块下沉。起机 `-p profiles/measurement/qwen38_27b-3090-kvmem.toml`
+  （不需要 `--set`）。
+  🔴 **真实可用上下文 = 池容量 47744 tok，不是 `max_seq`**：链越过池就有
+  占位符 ⇒ prefill 被迫只读稀疏视图 ⇒ 实测 64k 起输出退到 1 token。
+  长上下文请用 `qwen38_27b-3080_tp2.toml`。
+  实测：prefill 4k/8k/16k/32k/64k = 2168/2116/2018/1795/1755 t/s；
+  decode（真实文本 8k/512 tok）**83 t/s**、AL 2.83、verify 24.4 ms/轮；
+  48k 文档增量对话 ≈ 9 s（修 GDN 快照锚点前是 28.7 s）。
+  档内焊死三个"看着能开、实际会坏"的开关（`prefill_view=always` /
+  `decode_arm=fi` / `spec.degrade_after>0`），档头有逐条实测依据。
 
 2026-10-25 生产档拉满（两档同形，硬件差异只留 max_seq/TP）：
 

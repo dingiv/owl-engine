@@ -1,0 +1,142 @@
+# ── KVMem 档:单张 3090 Ti / 27B AWQ-INT4 / 池超卖 + 选择层 ────────────────
+#
+# 形状:prefill = eager + Marlin W4A8;decode = **v2 分页核**(不是 FI);
+#       投机 = DFlash2 d7(**verify 走 FI 图 + 视图页表**);KV = fp8 e4m3;
+#       KVMem 选择层全开(视图 + 部分驻留 + 块下沉宿主);视觉塔开。
+#
+# 起机:`server -p profiles/measurement/qwen38_27b-3090-kvmem.toml`(不再需要 --set)。
+#
+# ══════════════════════════════════════════════════════════════════════════
+# 🔴 **本档的真实可用上下文 = 池容量 47744 tok,不是 max_seq**
+#
+# `max_seq = 262144` 只保证 **KV 装得下**(超卖 5.49×,多出来的沉到宿主)。
+# 但链一旦越过池,链上就有宿主占位符 ⇒ `past_view_of` **必须**换稀疏视图
+# (on-hole 也躲不掉)⇒ prefill 每个 chunk 只能看到「工作集 + 本 chunk」
+# ≈ 10k 的"过去",与 ctx 无关。实测(真实中文文档 / greedy):
+#
+#   | prompt | 输出 |
+#   |---|---|
+#   | 48k(≤池) | 正常 176 tok |
+#   | 64k / 72k / 80k / 96k / 124k(>池) | **out=1, finish=stop**(退化) |
+#
+# 同一批 prompt 在非超卖档(3080 TP2 262k)全部正常。
+# ⇒ **长上下文用 `qwen38_27b-3080_tp2.toml`,不要用本档。**
+# 本档定位:≤47.7k 的 agent/多轮会话 —— 它的价值是**前缀复用**(48k 文档
+# 增量追问 28.7 s → 9 s)与 decode 视图,不是"更大 ctx"。
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 2026-10-27 实测(本档):
+#   prefill 4k/8k/16k/32k/64k = 2168 / 2116 / 2018 / 1795 / 1755 t/s;
+#   decode(真实文本 8k/512 tok)= **83.0 t/s**,AL 2.83,verify 24.4 ms/轮;
+#   48k 文档增量对话 ≈ 9 s(修 GDN 快照锚点前是 28.7 s,= 全量重算)。
+#
+# ⚠️ 三个"看起来能开、实际上会坏"的开关,本档已按实测焊死,改前三思:
+#
+# 1. `[kvmem].prefill_view = "always"` —— **禁止**用于 agent。
+#    它让 prefill 也只读 top-k 选中块 ⇒ 长 system / tools schema 里未被
+#    选中的部分模型看不见 ⇒ 输出退化到 1~2 token 就 EOS
+#    (实测 60k system:always out=1 / on-hole out=176)。
+#    纯长文档 RAG(无 system 契约)理论上可用,但需先立"选中覆盖率门"。
+#    运行时用 `/debug/metrics` 的 `select.prefill_view.always_used` 自查。
+#
+# 2. `[kernel].decode_arm` 不能是 `fi` —— 本档 `select_partial = true`,
+#    会话链上有宿主占位符,FI/XQA 的页表**直读会话链** ⇒ CUDA 700 + 上下文
+#    毒化(配置层已拒启)。decode 必须 v2。
+#    但 `verify_arm` **必须**是 `fi`:v2 分页核在 8 行 verify 形状下 51.5 ms/轮,
+#    FI 只要 24.9 ms ⇒ decode 45 → 83 t/s(2026-10-27 `a9da5d20` 接通视图链)。
+#
+# 3. `[spec].degrade_after` 缺省 6 在本档**禁用**(= 0)。
+#    原因:降级期走裸 decode ⇒ **不写草稿模型的 KV** ⇒ 草稿流断掉 ⇒ 之后
+#    任何探测都是"无上下文草稿" ⇒ 永远 m=0 ⇒ **降级是单向门**。
+#    实测同一请求:开门 43.9 t/s(346/400 token 走裸 decode)/ 关门 83.0 t/s。
+#    代价:随机词/乱码域(AL 天然低)会亏 ~0.1 ms/token —— agent 真实文本不吃这个。
+# extends 路径**相对本文件**(在 `measurement/` 子目录 ⇒ 全部 `../`)。
+# 为什么放在 `measurement/` 而不是顶层:`profiles/` 顶层的"入口档面"被
+# `profiles.rs::入口档面只允许三个常驻档` 钉死(2026-10-24 用户裁决:
+# 入口档只留硬件形状)。本档 = **同一硬件形状(单 3090)的另一配置**,
+# 且真实可用上下文只有池容量 47.7k ⇒ 不是常驻生产档。
+# 固化目的(防 `--set` 误配)不受影响:`-p profiles/measurement/这档` 即可。
+extends = [
+  "../full.toml",
+  "../parts/model/27b-awq.toml",
+  "../parts/feature/vision.toml",
+  "../parts/feature/dflash2-27b.toml",
+  "../parts/feature/kvmem.toml",
+  "../parts/hardware/3090-single.toml",
+  "../parts/kernel/fi-graph.toml",
+  "../parts/pool/fp8.toml",
+]
+
+[server]
+bind = "127.0.0.1:8140"
+
+[model]
+quant = "w4a8"
+
+[runtime]
+# 池自动派生自 max_seq 与显存余量;超卖靠 [kvmem].pool_overcommit。
+# 见档头红线:**这个数不是可用上下文上限**。
+max_seq = 262144
+max_concurrency = 1
+# 2048 = 单卡 a8 天花板(4096 的工作区 136 MiB 会撞 vram-hard-budget)。
+prefill_chunk = 2048
+prefill_tail_merge = 0
+implicit_session = true
+
+[pool]
+prefix_cache = true
+# 2 槽 = 297 MiB(GDN 快照)。**不要设 0**:0 = 快照面整体关闭 ⇒ 前缀复用
+# 只能退到 turn 起点(= 全量重算);也不要盲目加大(每份 148 MiB 挤设备池)。
+snap_max = 2
+# KV 块宿主腿:超卖档的下沉去处。10 GiB ≈ 10240 块。
+host_cache_mb = 10240
+# GDN 快照宿主预算:3 GiB ≈ 20 份边界快照。**262k 档若真要跑满需 ~4.7 GiB**
+# (128 边界 / SNAP_EVERY=4),不够时丢最冷的锚点(行为 = 复用点变近,不是错)。
+snap_host_mb = 3072
+# **必须 512**(不是 kvmem 组件档里的 1024)。这不是"保守一点"的旋钮:
+# reserve 每多 1 MiB,池就少 1 页(32 tok),**可用上下文跟着降**。
+# 实测点:reserve=512 ⇒ 池 1492 页 = 47744 tok(= 本档真实可用上限);
+# reserve=1024 ⇒ 池 980 页 = 31360 tok —— 小心别在"固化"时把档改小了
+# (2026-10-27 本 profile 首版就踩了这一个)。
+vram_reserve_mb = 512
+image_evict = true
+snap_msg_boundary = true
+snap_msg_delim = ""
+snap_msg_min_gap = 2048
+snap_msg_min_span = 0
+
+[kvmem]
+select_decode = true
+# 块可下沉宿主 = 超卖的前提。**结构上要求** prefix_cache + decode_arm=v2
+# + (投机档)verify_arm=v2|fi。
+select_partial = true
+index = true
+index_gpu = true
+# 召回预算 = 视图大小 = decode 的 attention 面。8192 是本档实测点;
+# 16384 对长 prompt 无改善(实测 124k 仍退化)但会挤掉池槽 ⇒ 别乱加。
+workspace_per_req = 8192
+verify_view_tokens = 0
+gqa_aggregation = "max"
+query_replay = false
+select_sink = 2
+select_recent = 4
+recall_every = 1
+# 🔴 agent 场景必须 on-hole(见档头第 1 条)。
+prefill_view = "on-hole"
+coverage_probe = false
+analyze_at_ctx = 0
+evict_policy = "lru"
+bulk_drop_when_tier_full = false
+pool_overcommit = true
+
+[kernel]
+# decode 必须 v2(占位符);verify 必须 fi(v2 在 8 行形状下慢 2×)。
+decode_arm = "v2"
+verify_arm = "fi"
+fi_plan = "baked"
+fi_cuda_graph = true
+
+[spec]
+depth = 7
+# 🔴 见档头第 3 条:降级是单向门。
+degrade_after = 0
