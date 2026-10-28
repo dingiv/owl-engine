@@ -224,6 +224,13 @@ pub fn resolve(req: OpReq) -> KernelPick {
         ),
         "gdn.chunked_delta" => gdn::chunked_delta(),
         "gdn.scalar_delta" => gdn::scalar_delta(),
+        // NVFP4 块缩放 GEMM(foreign:家族 runtime 直发 FFI;FOREIGN 哨兵)
+        // — 选不选它 = **调用方(层)** 按 `caps.fp4_blockscale && m ≥ 128` 决定,
+        //   本处只做"语义名 → 核名"的解析(与 comm/gdn 同形)。
+        "nvfp4.gemm" => KernelPick {
+            name: crate::family::nvfp4::GEMM,
+            shape: FOREIGN,
+        },
         // 通信族(TP2 S4;dtype ⇒ 三实例之一;族 runtime 自持单 block 几何 —— FOREIGN 哨兵)
         "comm.ar_stage" => KernelPick { name: crate::family::comm::stage_entry(dt), shape: FOREIGN },
         "comm.ar_reduce" => KernelPick { name: crate::family::comm::reduce_entry(dt), shape: FOREIGN },
@@ -537,6 +544,10 @@ impl KernelPick {
         }
         if n.contains("cublas") {
             return Some(F::CublasF16);
+        }
+        // NVFP4 块缩放 GEMM(arch-specific 指令;准入表按 `Caps::fp4_blockscale` 裁决)
+        if n == crate::family::nvfp4::GEMM {
+            return Some(F::NvFp4Cutlass);
         }
         None
     }

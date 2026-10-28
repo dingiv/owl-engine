@@ -111,23 +111,32 @@ Turing(sm_75) 上跑不了,请换 f16 基线或换卡",
                     )
                 }
             }
-            // **实测硬门**:sm_120 上 chunked 臂在 verify(T>1) 形状数值不对
-            // (2026-10-27 立案:T=1 与标量臂逐字相同、T=4 时 MTP 接受率从 2.88 塌到 1.39)。
-            // 修好之前不许被选中 —— 这正是"显卡做门"该拦的东西。
+            // **实测硬门(2026-10-28 证伪并调转)**:sm_120 上跑坏的是**标量臂**,不是 chunked。
+            // 证据(同 prompt 贪婪,`B/tok` = 字节/生成 token,>3 = 正常文本):
+            //   spec off + scalar  → 正常(2.96~4.58 B/tok)
+            //   spec d1/2/3/7 + scalar → **退化**("Thinking Process:\n" 后一路 "!",1.05~1.3 B/tok)
+            //   spec d3 + chunked  → 正常(3.6~3.9 B/tok;d3 = 173 tok/s,接受 3.16/轮)
+            // 前一轮把"字符少"当成"被截断"读反了 —— 415 字符/400 tok 才是退化那格。
+            // 标量臂只在 verify(T>1) 形状坏:T=1 decode 与 prefill 都正常。
             Self::GdnChunked => {
                 if !caps.cp_async {
                     return Admit::Deny(
                         "GDN chunked 依赖 cp.async(sm_80+)",
                     );
                 }
-                if arch.cc() == (12, 0) && ctx.spec_depth > 0 {
+                Admit::Ok
+            }
+            Self::GdnScalar => {
+                // 标量臂(lmdeploy pre_sm90 chunked GDR 移植)在 Blackwell 上
+                // 跑 spec verify 的 T=depth+1 形状时数值错 ⇒ 只允许 spec 关的档。
+                if arch.cc().0 == 12 && ctx.spec_depth > 0 {
                     return Admit::Deny(
-                        "GDN chunked 在 sm_120 上跑 spec verify(T>1)数值不对(2026-10-27 立案: 接受率 2.88→1.39、文本漂移;T=1/prefill 与标量臂逐字相同)。 二选一:关投机(spec.depth=0),或 `kernel.gdn_scalar = true`",
+                        "GDN 标量臂在 sm_12x 上跑 spec verify(T>1)数值不对(2026-10-28 实测:spec 开即退化,1.05~1.3 B/tok;spec 关正常)。 二选一:关投机(spec.depth=0),或 `kernel.gdn_chunked = true, kernel.gdn_scalar = false`",
                     );
                 }
                 Admit::Ok
             }
-            Self::GdnScalar | Self::CublasF16 => Admit::Ok,
+            Self::CublasF16 => Admit::Ok,
         }
     }
 }

@@ -851,7 +851,7 @@ fn build_ops_table(out_dir: &std::path::Path) {
     const DOMAIN_ORDER: &[&str] = &[
         "attn", "gdn", "gguf", "gdn_chunked", "gdn_scalar", "comm", "elems",
         "fused", "ln", "dflash", "load", "marlin", "cublas", "flashinfer",
-        "xqa", "vis",
+        "xqa", "vis", "nvfp4",
     ];
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let ops_dir = root.join("src").join("ops");
@@ -981,6 +981,111 @@ fn main() {
     // 各自门控(marlin 段本体原有自门控,原 early-return 是冗余且有害)。
     build_marlin();
     build_flashinfer();
+    build_nvfp4();
+}
+
+/// **NVFP4 块缩放 GEMM**(feature `nvfp4`,随 `arch-sm120` 自动开)。
+///
+/// 与 marlin/FI 的两点不同:
+/// 1. **arch-specific**:源里是 `mxf4nvf4.block_scale` 指令,目标必须是
+///    `-gencode arch=compute_<n>a,code=sm_<n>a` —— **两个都要带 `a`**。
+///    只写 `-arch=sm_120a` 时 nvcc 会把 PTX 目标退成 `compute_120`,ptxas
+///    直接报 `Feature '.kind::mxf4nvf4' not supported on .target 'sm_120'`。
+/// 2. **代际不满足就整段跳过**(而不是降级):FP4 张量核只在 sm_12x 有,
+///    选 sm_86 的构建不该为一张 50 系卡付 25 s 冷编。
+fn build_nvfp4() {
+    if env::var_os("CARGO_FEATURE_NVFP4").is_none() {
+        return;
+    }
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let arch = single_arch();
+    if !arch.caps().fp4_blockscale {
+        println!(
+            "cargo:warning=owl-kernels: nvfp4 跳过 —— {arch} 没有 FP4 块缩放张量核(只在 sm_12x)"
+        );
+        return;
+    }
+    let Some(sm_a) = arch.as_sm_a() else {
+        println!("cargo:warning=owl-kernels: nvfp4 跳过 —— {arch} 没有 'a' 编译目标");
+        return;
+    };
+    let compute_a = sm_a.replace("sm_", "compute_");
+    // 两个 TU:GEMM 适配器 + 设备侧激活量化器(同一个 `.a`)
+    let sources = ["cu/nvfp4/nvfp4_gemm.cu", "cu/nvfp4/nvfp4_quant_act.cu"];
+    let inc_cutlass = "cu/cutlass/include";
+    for s in sources {
+        println!("cargo:rerun-if-changed={s}");
+    }
+    println!("cargo:rerun-if-changed={inc_cutlass}");
+    println!("cargo:rerun-if-changed=cu/nvfp4");
+    println!("cargo:rerun-if-env-changed=NVFP4_FORCE_BUILD");
+    println!("cargo:rerun-if-env-changed=NVFP4_NVCC");
+    let force = env::var("NVFP4_FORCE_BUILD").ok().as_deref() == Some("1");
+    let nvcc = env::var("NVFP4_NVCC").unwrap_or_else(|_| "nvcc".into());
+    let ar = env::var("AR").unwrap_or_else(|_| "ar".into());
+    let dir = out_dir.join("nvfp4");
+    std::fs::create_dir_all(&dir).expect("mkdir nvfp4 out");
+    let lib = dir.join("libnvfp4.a");
+    let flags = format!("nvfp4 target={compute_a}/{sm_a} nvcc={nvcc} ar={ar}");
+    let mut deps: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+    all_files(inc_cutlass, &mut deps);
+    deps.sort();
+    if !force && stamp_hit(&lib, &deps, &flags) {
+        println!("cargo:warning=owl-kernels: libnvfp4.a 增量命中(零 nvcc)");
+    } else {
+        let mut jobs: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
+        for src in sources {
+            let obj = dir.join(format!(
+                "{}.o",
+                PathBuf::from(src).file_stem().unwrap().to_string_lossy()
+            ));
+            let args = vec![
+                "-O3".into(),
+                "-std=c++17".into(),
+                "--expt-relaxed-constexpr".into(),
+                // FP4 是 'a' 档指令:compute 与 code 两半都要带 `a`
+                "-gencode".into(),
+                format!("arch={compute_a},code={sm_a}"),
+                format!("-I{inc_cutlass}"),
+                // owl_log.h(算子侧唯一日志出口)+ 编译门
+                "-Icu".into(),
+                "-c".into(),
+                src.into(),
+                "-o".into(),
+                obj.to_str().unwrap().to_string(),
+                "-Xcompiler".into(),
+                "-fPIC".into(),
+            ];
+            jobs.push((src.to_string(), obj, args));
+        }
+        parallel_for(&jobs, |(src, _, args)| {
+            let status = std::process::Command::new(&nvcc)
+                .args(args)
+                .status()
+                .unwrap_or_else(|e| panic!("nvfp4: failed to spawn {nvcc} ({src}): {e}"));
+            assert!(status.success(), "nvfp4: nvcc failed on {src}");
+        });
+        let objs: Vec<PathBuf> = jobs.into_iter().map(|(_, obj, _)| obj).collect();
+        let _ = std::fs::remove_file(&lib);
+        let mut cmd = std::process::Command::new(&ar);
+        cmd.arg("rcs").arg(&lib);
+        for o in &objs {
+            cmd.arg(o);
+        }
+        let status = cmd.status().expect("nvfp4: failed to spawn ar");
+        assert!(status.success(), "nvfp4: ar failed");
+        stamp_write(&lib, &deps, &flags);
+        println!("cargo:warning=owl-kernels: built libnvfp4.a ({sm_a} · CUTLASS 闭包 + 设备量化器)");
+    }
+    let cuda_lib = env::var("CUDA_HOME")
+        .map(|h| PathBuf::from(h).join("lib64"))
+        .unwrap_or_else(|_| PathBuf::from("/usr/local/cuda/lib64"));
+    println!("cargo:rustc-link-search=native={}", dir.display());
+    println!("cargo:rustc-link-search=native={}", cuda_lib.display());
+    println!("cargo:rustc-link-lib=static=nvfp4");
+    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());
 }
 
 /// marlin 编译期依赖的头(E5-DF3 同日十二:selector 改动不触发重编 →

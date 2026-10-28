@@ -175,6 +175,9 @@ pub mod cublas;
 /// Marlin face(feature=marlin,随底座)
 #[cfg(feature = "marlin")]
 pub mod marlin;
+/// NVFP4 GEMM face(feature=nvfp4,随 `arch-sm120`)
+#[cfg(feature = "nvfp4")]
+pub mod nvfp4;
 /// FlashInfer 槽序签名 + scale 编码(ungated:models 零 feature 消费方
 /// 也引用;解析面仍在 feature = "flashinfer" 的 flashinfer.rs)
 pub mod fi_sig {

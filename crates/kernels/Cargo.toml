@@ -32,7 +32,12 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 "arch-sm75" = []
 "arch-sm86" = []
 "arch-sm89" = []
-"arch-sm120" = []
+# sm_120(50 系)顺带开 NVFP4 静态库:FP4 是 'a' 档指令,只有这一代有(见 `Caps::fp4_blockscale`)。
+"arch-sm120" = ["nvfp4"]
+# NVFP4 块缩放 GEMM(CUTLASS sm120 blockscaled mainloop → `libnvfp4.a`)。
+# 源是 **arch-specific**:`-gencode arch=compute_120a,code=sm_120a`(两个都要带 `a`);
+# 选中代没有 FP4 张量核时 build.rs 整段跳过。冷编 ≈ 25 s(CUTLASS 闭包单 TU)。
+"nvfp4" = []
 # cuBLAS 封装(f16 基线 F1;独立 feature —— 引源码之家不拖链接)
 # half:W-2d 的 `gemm_f16_dst` 用 f16 标量(alpha/beta;CUBLAS_COMPUTE_16F 口径)
 "cublas" = ["dep:cudarc", "dep:half"]

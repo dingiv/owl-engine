@@ -24,6 +24,10 @@ pub mod gdn_scalar;
 pub mod comm;
 /// Marlin:族身份 + FFI 声明(零门);**repack** 随 feature=marlin(half/rayon)
 pub mod marlin;
+/// **NVFP4 块缩放 GEMM**(2026-10-28):名/槽序契约/foreign 谓词。
+/// **族身份零门**(与 `family::cublas` 同律 —— `driver::resolve` 的表要它);
+/// 执行面 `server::nvfp4` 与源 `cu/nvfp4/` 才是 feature 门槛的。
+pub mod nvfp4;
 /// **GGUF 族**(2026-10-19):格式词汇 `GgmlTy` + 块几何 + 内核码唯一映射。
 /// 零门零依赖(声明面;`cu/gguf/` 执行面随 `device` 门)。
 pub mod gguf;

@@ -20,6 +20,9 @@ pub mod comm;
 /// Marlin runtime(feature=marlin,随底座)
 #[cfg(feature = "marlin")]
 pub mod marlin;
+/// NVFP4 块缩放 GEMM runtime(feature=nvfp4,随 `arch-sm120`)
+#[cfg(feature = "nvfp4")]
+pub mod nvfp4;
 
 pub mod selfcheck;
 
@@ -39,6 +42,8 @@ pub fn family_factories() -> Vec<FamilyFactory> {
         cublas::CublasRuntime::assemble,
         #[cfg(feature = "marlin")]
         marlin::MarlinRuntime::assemble,
+        #[cfg(feature = "nvfp4")]
+        nvfp4::Nvfp4Runtime::assemble,
         #[cfg(feature = "flashinfer")]
         flashinfer::FiRuntime::assemble,
         #[cfg(feature = "xqa")]

@@ -51,6 +51,10 @@ pub mod ln;
 pub mod load;
 pub mod marlin;
 pub mod oracles;
+/// **NVFP4 块缩放 GEMM 声明**(零门:算子总表由构建期扫描 `pub static`,
+/// 被 cfg 掉的域会让生成的总表指向不存在的模块 —— 声明面恒在场,
+/// 执行面(`server::nvfp4` + `cu/nvfp4/`)才是 feature 门槛的)
+pub mod nvfp4;
 pub mod vis;
 pub mod xqa;
 

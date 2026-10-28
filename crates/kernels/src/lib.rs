@@ -67,6 +67,35 @@ pub mod registry;
 pub mod arch;
 /// **算子族 × 代际的准入表**(「这族不该在这张卡上跑」的唯一出口)。
 pub mod admit;
+/// **NVFP4 块缩放 GEMM 的 Rust 面**(`libnvfp4.a` 的薄 FFI;feature `nvfp4`,
+/// 随 `arch-sm120` 自动开)。选不选这条臂归 [`driver::KernelPick`] + [`admit`] 管。
+///
+/// **模块恒存在**:feature 关时换 [`nvfp4_stub`](一个同面替身,`pack_weight_b`
+/// 一律响亮拒) —— 上层不用各写一遍 `cfg(feature)`(同一个开关在多处重复 =
+/// 静默漂移的温床)。
+#[cfg(feature = "nvfp4")]
+pub mod nvfp4;
+/// 未编入替身(见上)。
+#[cfg(not(feature = "nvfp4"))]
+#[path = "nvfp4_stub.rs"]
+pub mod nvfp4;
+
+/// FP4 库自述(未编入时 `None`)。
+///
+/// 为什么留这个恒存在的入口:`cfg(feature)` 是**本 crate** 的 feature,上层
+/// (`models`/`engine`/`server`)没法自己 cfg 它 —— 否则就变成“同一个开关在
+/// 每个上游各写一遍”。这里把门控收在一处,上层只管读 `Option`。
+#[must_use]
+pub fn fp4_banner() -> Option<&'static str> {
+    #[cfg(feature = "nvfp4")]
+    {
+        Some(nvfp4::banner())
+    }
+    #[cfg(not(feature = "nvfp4"))]
+    {
+        None
+    }
+}
 
 pub use arch::{Arch, Caps, Family};
 pub use admit::{Admit, AdmitCtx, OpFamily};
