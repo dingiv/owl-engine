@@ -88,6 +88,13 @@ pub(crate) struct ChunkTables {
     /// `[0, t]`(attn/gdn 的 cu_seqlens)
     pub seq_cu: Vec<f32>,
     pub fi: Option<FiTables>,
+    /// **建 FI 表时用的 `ctx_total`**(= `base_for_len + t`;单源)。
+    ///
+    /// 为什么必须带出来:模型层喂核的 `ctx_total` 默认是 `ctx_base + tokens`
+    /// (**绝对**口径)。子集档下两者差 `base − view_tokens` ⇒ 核会越过
+    /// `indptr` 读越界页号、静默喂垃圾(2026-10-28 定谳的长上下文塌陷)。
+    /// `prefill_chunk_enqueue` 用它做**硬断**,把这条口径错配焊死。
+    pub fi_ctx: Option<usize>,
 }
 
 /// FlashInfer 表四件套(U32 位型;`nb_used` = 本 chunk 实际覆盖页数)
@@ -156,7 +163,29 @@ impl ChunkTables {
         // `base − recall_pos`(随 ctx 增长);传错的后果 = 注意力窗口 = 全 ctx
         // (O(ctx)/chunk ⇒ 总 O(ctx²))+ 末页读越界(2026-10-19 定谳)。
         let fi = if fi_face { Some(fi_tables_view(base_for_len, t, &tbl, page)?) } else { None };
+        // **视图账逐 chunk 取证**(2026-10-28;`--log-level debug` 可见):
+        // 稀疏 prefill 的硬塌(collapse)要逐 chunk diff 才能定位 —— 一行里把
+        // "链长 vs 记账长度 vs FI 四件套 vs 本 chunk 写入槽"全摆出来。
+        owl_shared::log_debug!(
+            "view-acc",
+            "base={base} t={t} paged={paged} page={page} view={:?} view_tokens={} ctx_total={} \
+             need={} last_len={:?} idx_first={:?} idx_last={:?} lens_first={:?} lens_last={:?} \
+             slot_first={:?} slot_last={:?} bt_len={}",
+            past.map(|(p, n)| (p.len(), n)),
+            base_for_len,
+            base_for_len + t,
+            (base_for_len + t).div_ceil(page.max(1)).max(1),
+            fi.as_ref().map(|f| f.last_len.clone()),
+            fi.as_ref().map(|f| f.indices.first().copied()),
+            fi.as_ref().map(|f| f.indices.last().copied()),
+            lens.first().copied(),
+            lens.last().copied(),
+            slots.first().copied(),
+            slots.last().copied(),
+            bt_chain.len()
+        );
         Ok(Self {
+            fi_ctx: fi.as_ref().map(|_| base_for_len + t),
             ids: ids.iter().map(|v| *v as f32).collect(),
             pos: match positions {
                 Some(p) => {
@@ -387,6 +416,36 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             Some(gdn_slot_v),
             base, fi,
         );
+        // 🔴 **FI 的 plan ctx 必须是“视图口径”,不是绝对位置**(2026-10-28 定谳)。
+        //
+        // 子集档(`prefill_view = always` / 超池后被迫稀疏)下,给 FI 的页链只有
+        // `view_tokens 页 + 本 chunk 页`,而 `build_view` 建的 `indptr/last_len` 也按
+        // `ctx_total = view_tokens + t` 算。但注意力层默认喂 `ctx_base + tokens`
+        // = **绝对** base + t —— 两者差 `base − view_tokens`(= 被丢块数×页),
+        // 核据此认为链更长 ⇒ 越过 `indptr` 读**越界页号** ⇒ 注意力喂垃圾。
+        //
+        // 实测征状(每一条都对得上):同样的 ws 下 prefill 走全链(`on-hole`)完全正常;
+        // 一旦视图是真子集(哪怕只丢 6 块)⇒ 任何文档问题都退到 `:` 后 EOS;
+        // 而宿主侧对照(`scheme_compare`)**拧不到这里**(它不过核)。
+        if let Some((_, view_tokens)) = past_view.as_ref() {
+            ctx.fi_plan_ctx = Some(view_tokens + t);
+        }
+        // **硬断(单源)**:喂 FI 的 plan ctx 必须等于建表用的 `ctx_total`。
+        // 缺了它,`ctx_base` 的绝对口径会静静顶上去 —— 2026-10-28 的长上下文
+        // 塌陷(64k 起 out=1、108k 修复后正常)就是这个错配,而且**宿主侧对照
+        // 照不到**(`scheme_compare` 不过核)。这里改成响亮拒,不再靠人眼核表。
+        if let Some(want) = tb.fi_ctx {
+            let got = ctx.fi_plan_ctx.unwrap_or(ctx.ctx_base + t);
+            if got != want {
+                return Err(owl_iface::contract::ModelError::EngineInvariant {
+                    what: format!(
+                        "prefill FI 的 ctx_total 口径错配:喂核 {got} ≠ 建表 {want} \
+                         (base={base} t={t} view={:?})—— 核会越 indptr 读越界页号",
+                        past_view.as_ref().map(|(p, n)| (p.len(), *n))
+                    ),
+                });
+            }
+        }
         ctx.seq_cu = Some(&seq_cu);
         // ── GDN 序列表(cu|coff|idx;P-6b 2026-10-15)──
         //

@@ -227,6 +227,12 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], t: usize, ctx: usize) -> Vec<f
 // 一次全量测量
 // ============================================================================
 fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
+    run_case_dtype(t, ctx, host_check, iters, false);
+}
+
+/// `f16_kv=true`: 同一台架换 f16 主池 + `PREFILL_FI`(f16 臂)，
+/// 用来量"FP8 KV 的反量化税"到底值多少。
+fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: bool) {
     let nb = ctx.div_ceil(PAGE);
     // 过供给探针(缺省 = 与真值同 ⇒ 历史口径零变化)
     let plan_ctx = owl_shared::env_reader::parse::<usize>("FI_PF_PLAN_CTX").unwrap_or(ctx);
@@ -236,10 +242,17 @@ fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
     // 孤儿 —— 见 registry::init_all_inner 的射程注)
     // 读+写都要在场:池审计 E10(读该池实例的算子必须有 ≥1 个写者)——
     // 本探针的池由 host 直灌,写者算子只为审计在场(白名单 = 生产档同款口径)
-    let active: &[&str] = &[
-        owl_kernels::family::flashinfer::PREFILL_FI_FP8KV,
-        "owl_reshape_and_cache_fp8kv_knhd",
-    ];
+    let active: &[&str] = if f16_kv {
+        &[
+            owl_kernels::family::flashinfer::PREFILL_FI,
+            "vllm_reshape_and_cache_f16_knhd",
+        ]
+    } else {
+        &[
+            owl_kernels::family::flashinfer::PREFILL_FI_FP8KV,
+            "owl_reshape_and_cache_fp8kv_knhd",
+        ]
+    };
     let mut reg = owl_kernels::registry::OpRegistry::init_all_with(
         owl_kernels::server::family_factories(),
         &mut res,
@@ -251,11 +264,21 @@ fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
     let pool = nb * HKV * HD * PAGE;
     let k_fp8 = lcg_u8(pool, 701);
     let v_fp8 = lcg_u8(pool, 702);
+    let k_f16 = if f16_kv { Some(lcg_f16(pool, 701)) } else { None };
+    let v_f16 = if f16_kv { Some(lcg_f16(pool, 702)) } else { None };
     let q_f16 = lcg_f16(t * H * HD, 703);
 
     let q_b = res.upload(&q_f16.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
-    let k_b = res.upload(&k_fp8);
-    let v_b = res.upload(&v_fp8);
+    let k_b = if let Some(v) = k_f16.as_ref() {
+        res.upload(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())
+    } else {
+        res.upload(&k_fp8)
+    };
+    let v_b = if let Some(v) = v_f16.as_ref() {
+        res.upload(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())
+    } else {
+        res.upload(&v_fp8)
+    };
     let q_cu = res.upload(&[0u32, t as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
     let indices: Vec<u32> = (0..nb as u32).collect();
     let idx_b = res.upload(&indices.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
@@ -265,15 +288,20 @@ fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
     let wr_b = res.zeros(8);
     let out_b = res.zeros(t * H * HD * 2);
 
+    let (kernel_name, kv_dtype) = if f16_kv {
+        (owl_kernels::client::flashinfer::PREFILL_FI, Dtype::F16)
+    } else {
+        (owl_kernels::client::flashinfer::PREFILL_FI_FP8KV, Dtype::U32)
+    };
     let msg = LaunchMsg {
         kernel: KernelSource {
-            name: owl_kernels::client::flashinfer::PREFILL_FI_FP8KV.to_string(),
+            name: kernel_name.to_string(),
             source: String::new(),
         },
         args: vec![
             Arg::Block { id: q_b.id, dtype: Dtype::F16, rank: 2 },
-            Arg::Block { id: k_b.id, dtype: Dtype::U32, rank: 1 },
-            Arg::Block { id: v_b.id, dtype: Dtype::U32, rank: 1 },
+            Arg::Block { id: k_b.id, dtype: kv_dtype, rank: 1 },
+            Arg::Block { id: v_b.id, dtype: kv_dtype, rank: 1 },
             Arg::Block { id: q_cu.id, dtype: Dtype::U32, rank: 1 },
             Arg::Block { id: idx_b.id, dtype: Dtype::U32, rank: 1 },
             Arg::Block { id: indptr.id, dtype: Dtype::U32, rank: 1 },
@@ -320,7 +348,7 @@ fn run_case(t: usize, ctx: usize, host_check: bool, iters: usize) {
     let o = res.take_u16(out_b.id);
     let fx: Vec<f32> = o.iter().map(|&h| f16_to_f32(h)).collect();
     let mut line = format!("=== FI T={t} ctx={ctx} (nb={nb}) ===\n  FI: {ms:7.3} ms/call");
-    if host_check {
+    if host_check && !f16_kv {
         let host = host_ref_knhd(&q_f16, &k_fp8, &v_fp8, t, ctx);
         let d = fx
             .iter()
@@ -448,4 +476,36 @@ fn fi_prefill_speed_and_parity() {
         let hc = hc || (host_all && t.saturating_mul(ctx) * H * HD <= 8_000_000_000);
         run_case(t, ctx, hc, it);
     }
+}
+
+/// **长上下文专属探针**(2026-10-26):100k/200k 的 attention 曲线定位。
+///
+/// 复用上面的生产形状台架,但把 T/ctx/iter 从 env 读入,
+/// 避免动 `fi_prefill_speed_and_parity` 的历史档:
+/// ```text
+/// OWL_TEST_DEVICE=42:00.0 FI_LONG_T=807 FI_LONG_CTX=100000 FI_LONG_ITERS=5 \
+///   cargo test --release -p owl-kernels --features device,flashinfer \
+///   --test fi_prefill_probe fi_prefill_longctx_probe -- --test-threads=1 --nocapture
+/// ```
+#[owl_test(gpu)]
+fn fi_prefill_longctx_probe() {
+    let t = owl_shared::env_reader::parse::<usize>("FI_LONG_T").unwrap_or(807);
+    let ctx = owl_shared::env_reader::parse::<usize>("FI_LONG_CTX").unwrap_or(100_000);
+    let iters = owl_shared::env_reader::parse::<usize>("FI_LONG_ITERS").unwrap_or(5);
+    run_case(t, ctx, false, iters.max(1));
+}
+
+/// **f16 vs fp8 KV 的 attention 核对比**(2026-10-26):同一 100k 形状,
+/// 量 FP8 反量化+repack 的净税。
+/// ```text
+/// OWL_TEST_DEVICE=42:00.0 FI_LONG_T=807 FI_LONG_CTX=100000 FI_LONG_F16=1 \
+///   cargo test --release -p owl-kernels --features device,flashinfer \
+///   --test fi_prefill_probe fi_prefill_longctx_f16_probe -- --test-threads=1 --nocapture
+/// ```
+#[owl_test(gpu)]
+fn fi_prefill_longctx_f16_probe() {
+    let t = owl_shared::env_reader::parse::<usize>("FI_LONG_T").unwrap_or(807);
+    let ctx = owl_shared::env_reader::parse::<usize>("FI_LONG_CTX").unwrap_or(100_000);
+    let iters = owl_shared::env_reader::parse::<usize>("FI_LONG_ITERS").unwrap_or(5);
+    run_case_dtype(t, ctx, false, iters.max(1), true);
 }
