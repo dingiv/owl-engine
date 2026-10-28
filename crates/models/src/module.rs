@@ -1081,11 +1081,80 @@ pub enum Layout {
         /// 原始 packed u32 列数(= in/8)
         cols: usize,
     },
+    /// **NVFP4 权重打包**(2026-10-28 装载管线 P2):源 = f16/bf16 全精度权重
+    /// (`[rows, cols]` 行主序),装载期在 **host** 量化为
+    /// `q`(`[rows, cols/2]` 的 e2m1 对)+ `sf`(`rows*cols/16` 字节的
+    /// CUTLASS 交错块缩放)+ 回填 host 标量 `gb`。
+    ///
+    /// 与其余三臂的区别:那三条是**搬运/换序**(字节进、字节出),这条是
+    /// **真格式变换**(精度从 16 位降到 4 位 + 块缩放)—— 实现在
+    /// [`crate::formats::transform::NvFp4Pack`],本变体只携带**事实**
+    /// (源的行/列数;目标形状由变换自己算)。
+    ///
+    /// **一源二槽**:主槽 = `q`(`Want.sink`),`sf` 走 `Want.extra`。
+    NvFp4Weight {
+        /// 源行数(= out_dim;= 目标 N)
+        rows: usize,
+        /// 源列数(= in_dim;= 目标 K)
+        cols: usize,
+    },
 }
 
 /// 空包回填口(执行器写入;使用者零感知)
 #[derive(Clone)]
 pub struct Sink(SlotCell);
+
+/// **host 标量回填口**(一源**一个**标量;2026-10-28 NVFP4 的权重全局缩放 `gb`)。
+///
+/// 为什么另开一个口而不复用 [`Sink`]:Sink 交付的是**设备块**(`Bytes` 句柄),
+/// 装载面按它记 manifest / 做回读校验;而 `gb` 是 4 字节**主机常量**,
+/// 发射时直接作为 kernel 标量参数(`arg_f32`),不上卡、不进 manifest。
+/// 两个东西的生命周期与校验面都不同,合成一个类型只会让两者互相污染。
+#[derive(Clone)]
+pub struct ScalarSink(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl Default for ScalarSink {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
+impl ScalarSink {
+    /// 建口(初值 = f32 位型;缺省 1.0 = “尚无缩放”,乘法中性元)
+    #[must_use]
+    pub fn new(v: f32) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+            v.to_bits(),
+        )))
+    }
+
+    /// 装载期回填(f32 位型走 `AtomicU32`:`Model` 要 `Sync`,写入晚于构造)
+    pub fn store(&self, v: f32) {
+        self.0.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 取值(发射面读)
+    #[must_use]
+    pub fn load(&self) -> f32 {
+        f32::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// **附加槽**(一源多槽里的第 2..N 件;2026-10-28 装载管线 P1)。
+///
+/// 主槽仍是 [`Want`] 的 `dtype`/`shape`/`sink`(**旧三臂与 manifest 零变化**),
+/// `extra` 只装同一源键的其余产物(NVFP4 的 `sf`)。
+/// 为什么不一步改成 `slots: Vec<..>`:那要同时改分片 pass(按 `shape` 改写
+/// 分片形状)、manifest 与所有声明点 —— 在只有一种 1:N 变换时不值得;
+/// 设计 §8 的 P3 再把主槽并进 `slots`(那时分片规则也一并由变换声张)。
+#[derive(Clone)]
+pub struct SlotWant {
+    /// 诊断名(`q`/`sf`/…)—— 日志与 manifest 用;判决不按名字,按 `dtype × shape`
+    pub name: &'static str,
+    pub dtype: Dtype,
+    pub shape: Shape,
+    pub sink: Sink,
+}
 
 impl Sink {
     pub(crate) fn deliver(&self, b: Bytes) {
@@ -1126,6 +1195,11 @@ pub struct Want {
     /// `build_shard_pass` 优先读本字段,缺省回落键表 ⇒ 只有**真覆盖**的键
     /// (现仅词表切档的 lm_head)行为改变。
     pub rule: Option<crate::plan::rules::WeightRule>,
+    /// **附加槽**(1:N 面):同一源键的其余产物(2026-10-28 NVFP4 的 `sf`)。
+    /// 空 = 单槽(旧路径全部如此,零行为变化)。
+    pub extra: Vec<SlotWant>,
+    /// **host 标量回填口**(与槽无关的旁路产物;NVFP4 的 `gb`)。
+    pub scalar: Option<ScalarSink>,
     pub(crate) sink: Sink,
 }
 
@@ -1280,6 +1354,13 @@ pub enum QuantPlan {
     /// 与 `W4A16Awq` 的差别**全在布局与激活面**:权重同源、模型同构 ⇒
     /// 换 plan 即 A/B(端口/配置不动)。
     W4A8Awq,
+    /// **NVFP4 块缩放**(2026-10-28):权重装载期 RTN 量化成
+    /// `q`(`u8 [out, in/2]`,每字节两个 `e2m1`)+ `sf`(`u8`,`out*in/16` 字节,
+    /// CUTLASS 交错布局),另带 per-tensor 全局缩放 `gb`(host 标量)。
+    ///
+    /// 前向 = **一次 `nvfp4_gemm`**(家族内自己做设备侧激活量化 + CUTLASS
+    /// `m16n8k64` 块缩放 MMA)。**统一臂**:不按 m 分流(decode m=1 也走这条)。
+    NvFp4,
     /// **GGUF 块型**(2026-10-19 gguf 轮):权重以 **GGUF 块字节原样驻留**
     /// (槽 dtype = `U8`、形状 `[out, row_bytes]`),forward = **两发**:
     /// `GgufQuantAct{_F16,_Bf16}`(激活 → q8_1) + `GgufGemm`(dequant-in-kernel)。
@@ -1759,6 +1840,8 @@ impl Weight {
             layout: if self.transposed { Layout::Transposed } else { Layout::Direct },
             segments: None,
             rule: None,
+            extra: Vec::new(),
+            scalar: None,
             sink: Sink(self.cell.clone()),
         })
     }
@@ -1784,6 +1867,59 @@ impl Weight {
             layout: Layout::DeviceRearrange { op, rows, cols },
             segments: None,
             rule: None,
+            extra: Vec::new(),
+            scalar: None,
+            sink: Sink(self.cell.clone()),
+        })
+    }
+
+    /// **NVFP4 打包布局**(2026-10-28 装载管线 P2):源 = 全精度权重
+    /// (`[rows, cols]` 行主序),装载期 host 量化成
+    /// `q`(本槽) + `sf`(附加槽) + `gb`(host 标量)。
+    ///
+    /// 调用方须已 [`Weight::new_typed`] 把本槽定成 `U8`、形状 `[rows, cols/2]`
+    /// (见 `Linear::quantize_nvfp4`);`sf` 槽同理(`U8`、`[rows*cols/16]`)。
+    /// **两槽形状不在此计算**:声明面只搬事实,目标形状归变换
+    /// (`formats::transform::NvFp4Pack::slots`),两边不一致就在这里响。
+    pub(crate) fn layout_as_nvfp4(
+        &self,
+        key: impl Into<String>,
+        rows: usize,
+        cols: usize,
+        sf: &Weight,
+        gb: &ScalarSink,
+    ) -> LoaderOps {
+        assert_eq!(
+            self.shape,
+            vec![rows, cols / 2],
+            "NVFP4 q 槽形状 {:?} 与源 {rows}x{cols} 的口径不符(需 [rows, cols/2])",
+            self.shape
+        );
+        assert_eq!(
+            sf.shape,
+            vec![rows * cols / 16],
+            "NVFP4 sf 槽形状 {:?} 与源 {rows}x{cols} 的口径不符(需 {} 字节)",
+            sf.shape,
+            rows * cols / 16
+        );
+        self.dtype
+            .store(dtype_code(Dtype::U8), std::sync::atomic::Ordering::Relaxed);
+        sf.dtype
+            .store(dtype_code(Dtype::U8), std::sync::atomic::Ordering::Relaxed);
+        LoaderOps::want(Want {
+            key: key.into(),
+            dtype: Dtype::U8,
+            shape: self.shape.clone(),
+            layout: Layout::NvFp4Weight { rows, cols },
+            segments: None,
+            rule: None,
+            extra: vec![SlotWant {
+                name: "sf",
+                dtype: Dtype::U8,
+                shape: sf.shape.clone(),
+                sink: Sink(sf.cell.clone()),
+            }],
+            scalar: Some(gb.clone()),
             sink: Sink(self.cell.clone()),
         })
     }

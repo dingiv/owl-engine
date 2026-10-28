@@ -19,6 +19,7 @@ pub fn family_of_plan(p: QuantPlan) -> OpFamily {
         QuantPlan::W4A16 | QuantPlan::W4A16Awq => OpFamily::MarlinW4A16,
         QuantPlan::W4A8Awq => OpFamily::MarlinW4A8,
         QuantPlan::Gguf(_) => OpFamily::GgufMmq,
+        QuantPlan::NvFp4 => OpFamily::NvFp4Cutlass,
         QuantPlan::F16 | QuantPlan::I8W | QuantPlan::I8W8 => OpFamily::CublasF16,
     }
 }
@@ -88,6 +89,12 @@ pub fn check_env(
             }
             a => brief.push(format!("xqa={}", a.describe())),
         }
+    }
+    // FP4 库是否编进了本次构建(feature `nvfp4`,随 `arch-sm120` 开)。
+    // 这一行同时是**链接验证**:banner 是个 `extern "C"` 符号,能打出来
+    // 就说明 `libnvfp4.a` 真的进了产物(不是“源在树但没链”)。
+    if let Some(banner) = owl_kernels::fp4_banner() {
+        brief.push(format!("nvfp4={banner}"));
     }
     Ok(format!("{arch} · spec={spec_depth} ⇒ {}", brief.join(" · ")))
 }

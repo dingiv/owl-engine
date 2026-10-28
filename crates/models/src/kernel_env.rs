@@ -125,6 +125,8 @@ impl KernelSelectionEnv {
                 tags.push(KernelTag::QUANT_AWQ);
             }
             QuantPlan::Gguf(_) => tags.push(KernelTag::QUANT_GGUF),
+            // NVFP4 是权重+激活的块缩放:放行 `quant.nvfp4` 档核
+            QuantPlan::NvFp4 => tags.push(KernelTag::QUANT_NVFP4),
             QuantPlan::F16 | QuantPlan::I8W | QuantPlan::I8W8 => {}
         }
         // 头是独立 plan:主干 W4A8/GGUF 时,int4 头仍要放行 W4A16 核

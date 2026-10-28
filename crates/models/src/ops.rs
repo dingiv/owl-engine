@@ -48,6 +48,10 @@ pub enum SemanticKernel {
     /// foreign 家族臂:scalar 单核(lmdeploy pre_sm90 port)
     GdnScalarDelta,
 
+    // ---- nvfp4.*(NVFP4 块缩放 GEMM;sm_12x 的 prefill 臂)----
+    /// NVFP4 GEMM(`out = (ga·gb)·A×Bᵀ`;权重装载期打包一次,激活每次量化)
+    NvFp4Gemm,
+
     // ---- comm.*(TP2 S4:allreduce 的语义面;家族臂)----
     /// AR stage:本端 payload → 本端 staging slot(发布 produced)
     CommArStage,
@@ -314,6 +318,7 @@ impl SemanticKernel {
             SemanticKernel::GdnNormAct => "gdn.norm_act",
             SemanticKernel::GdnChunkedDelta => "gdn.chunked_delta",
             SemanticKernel::GdnScalarDelta => "gdn.scalar_delta",
+            SemanticKernel::NvFp4Gemm => "nvfp4.gemm",
             SemanticKernel::CommArStage => "comm.ar_stage",
             SemanticKernel::CommArReduce => "comm.ar_reduce",
             SemanticKernel::Sigmoid => "ops.sigmoid",

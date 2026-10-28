@@ -122,6 +122,16 @@ pub fn build_shard_pass(
     }
     let plan = TpPlan::new(ctx.slice_id, ctx.shard).map_err(ModelError::Msg)?;
     for w in ops.wants_mut() {
+        // **NVFP4 × TP 先写明拒**(设计 §6):`sf` 的分块布局是**按目标 N
+        // 重算**的,不是全量 SFB 的子矩形 ⇒ 先切再打是错的,先打再切也无定义。
+        // 单卡档不进本 pass(shard=1 早已返回);真上 TP 时实现 `SliceThenRepack`。
+        if matches!(w.layout, Layout::NvFp4Weight { .. }) {
+            return Err(ModelError::Msg(format!(
+                "build_shard_pass: {} 是 NVFP4 打包权重(N%128/K%16 块缩放布局)——\
+                 TP 分片尚未实现(需先切源、再按新 N 重算 sf;设计 §6 SliceThenRepack)",
+                w.key
+            )));
+        }
         // **带段长事实**的规则推导(P2.1-a):同名键在「融合/不融合」两个模型里
         // 语义不同 —— 段长由层声明,缺声明 ⇒ 不按段切(见 `rule_of_want`)。
         // **层声明的规则覆盖优先**(P1.1,2026-10-19):"这个张量切不切"是装配期
@@ -463,6 +473,8 @@ use crate::plan::rules::WeightRule;
             layout: Layout::Direct,
             segments: None,
             rule: None,
+            extra: Vec::new(),
+            scalar: None,
             sink: crate::module::Sink::for_test(),
         }
     }
