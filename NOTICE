@@ -50,7 +50,7 @@ LICENSE files for the full texts.
    Copyright:  Copyright (c) 2023-2026 The ggml authors.
 
 5. NVIDIA CUTLASS — shared header family
-   Files:      crates/kernels/cu/cutlass/include/**  (146-header compile closure)
+   Files:      crates/kernels/cu/cutlass/include/**  (95-header sm86 compile closure)
    Source:     https://github.com/NVIDIA/cutlass
                (workspace repos/cutlass, commit 78e46228, v4.8.0)
    License:    BSD 3-Clause (see crates/kernels/cu/cutlass/LICENSE.txt)
