@@ -4,3 +4,6 @@ kv_fp8 = false
 gdn_slots = 1
 vram_target = 0.97
 vram_reserve_mb = 1024
+
+# 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
+transient_reserve_mb = 1024

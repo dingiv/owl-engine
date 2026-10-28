@@ -74,6 +74,8 @@ prefix_cache = true
 snap_host_mb = 3072
 host_cache_mb = 10240
 vram_reserve_mb = 512
+# 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
+transient_reserve_mb = 1024
 # 图像前缀无感删除(leave-gap:删后不转 K、保留位置洞)。
 image_evict = true
 # 消息边界快照:pi 每轮重发全历史;与 3090 生产档同形。

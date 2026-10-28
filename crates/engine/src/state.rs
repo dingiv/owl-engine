@@ -205,6 +205,12 @@ pub(crate) struct PoolPlan {
     pub vram_target: f64,
     /// VRAM 预留 MiB
     pub vram_reserve_mb: u64,
+    /// **超卖档「池外瞬态余量」MiB**(= `[pool].transient_reserve_mb`)。
+    ///
+    /// 原先这里是硬编码 1 GiB(并且日志文案漂移成"512 MiB"),现在**可配置 +
+    /// 日志打真值**。语义:超卖档池 = `cap − ceil(本值 / per_tok)`,给池外
+    /// 瞬态(chunk 激活/视图/图 warmup/kernel 惰性保留)留的空。
+    pub transient_reserve_mb: u64,
     /// **选择层视图块表槽**(B-2;`OWL_COVERAGE_PROBE=1` = 召回点探针档)。
     /// true ⇒ 主池多分配一个 `[1, nb]` 的视图页表块(内容 = **选中块**的物理页
     /// 按时间序;每召回点重写),与全量块表 `bt` **并存**(两者都要在场:
@@ -2079,17 +2085,23 @@ impl<'a> AllocCtx<'a> {
                         )));
                     }
                     // 预填**瞬态**余量:超卖档池一旦吃满 cap,chunk 的激活/工作区
-                    // (a8 实测 24-68 MiB,2048 块)+ 选择层视图 + 图 warmup 就得从
-                    // 池外的空里挤 ⇒ 留 1 GiB(实测定值:512 MiB 在 27B/a8/视觉档
-                    // 会撞 `vram-hard-budget` 拒发)。
-                    let transient_tok = ((1024usize << 20) / per_tok.total().max(1)).max(1);
+                    // + 选择层视图 + 图 warmup + kernel 惰性保留都得从**池外**挤。
+                    //
+                    // ⚠️ 2026-10-28:此值原为**硬编码 1 GiB**,而日志文案一直写
+                    // "512 MiB"(漂移)。现改为 `[pool].transient_reserve_mb`
+                    // (缺省 1024 = 旧行为),日志打**真值** —— 这笔"给不确定性的
+                    // 保险费"是池预算里最大的一块可调项(1 GiB = 32,768 tok)。
+                    let transient_mb = plan.transient_reserve_mb.max(1);
+                    let transient_tok =
+                        (((transient_mb as usize) << 20) / per_tok.total().max(1)).max(1);
                     let pool = m.saturating_sub(transient_tok).max(1);
                     owl_shared::log_info!(
                         "pool",
-                        "**超卖档**:max_seq={} > ctx_max={} ⇒ 设备池 = cap − 瞬态余量(512 MiB = {} tok) = {} tok(超卖 {:.2}×);\
+                        "**超卖档**:max_seq={} > ctx_max={} ⇒ 设备池 = cap − 瞬态余量({} MiB = {} tok) = {} tok(超卖 {:.2}×);\
                          其余链块靠选择层下沉 host/disk",
                         plan.seq_tokens,
                         m,
+                        transient_mb,
                         transient_tok,
                         pool,
                         plan.seq_tokens as f64 / pool as f64

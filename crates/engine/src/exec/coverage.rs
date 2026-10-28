@@ -669,7 +669,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 37.4k,说明边界附近由选中覆盖率随机性主导),44k 更是必然掉进稀疏。
         // 现在余量 = 本 chunk 写入 + 小量安全边。
         let page = self.dev.pool.geom.page.max(1);
-        let margin = self.boot.cfg.prefill_chunk.div_ceil(page).max(1) + 8;
+        // **余量单源**（`sched_policy::reclaim_margin`）：与命中面裁剪同一份算式
+        // —— 两处各算一套就是 2026-10-27 立案的 P1-2（同一个"池还剩多少能用"
+        // 得到两个答案）。
+        let margin = crate::sched_policy::reclaim_margin(
+            self.boot.cfg.prefill_chunk.div_ceil(page),
+        );
         if !sink.is_empty() && self.bank.rel.leg.slots_free() >= margin + need.len() {
             self.sel.note_lazy_keep(sink.len());
             owl_shared::log_debug!(

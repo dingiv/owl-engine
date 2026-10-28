@@ -116,6 +116,46 @@ impl Default for Limits {
 }
 
 // ===========================================================================
+// §1.5 **可回收余量（单源算式）**
+// ===========================================================================
+
+/// 余量里的**安全边**（页）。很小 —— 它只是给"计划与执行之间的漂移"留的。
+///
+/// 为什么不能大：每多 1 页 = 少 32 tok 的**可用上下文**（超卖档的密集区间
+/// 直接跟着缩）；旧式在这里多扣一个 `workspace`（1024 页）直接把密集区间
+/// 从 47.7k 压到 37.4k（2026-10-27 实测定谳）。
+pub const RECLAIM_SAFETY_PAGES: usize = 8;
+
+/// **池回收余量（页）—— 单源算式**。
+///
+/// # 谁用（必须只有这两处）
+///
+/// 1. `exec/coverage.rs::reconcile_residency` 的**懒沉**门槛
+///    （池空闲 ≥ 余量 ⇒ 本轮不沉，整链常驻）；
+/// 2. `scheduler.rs::plan_prefix_reuse` 的**命中面裁剪**
+///    （`命中块 ≤ 池 − 余量`）。
+///
+/// 两处各算一套 = 2026-10-27 立案的缺陷 P1-2：懒沉按 `chunk + 8` 算，命中面
+/// 却按 `chunk + workspace + 2` 算 ⇒ 同一个"池还剩多少能用"得到两个答案。
+/// 后果（2026-10-28 实测，`ws=32768` 档的 22.9k prompt）：
+/// `命中面 716 块 > 池可容 402（池 1492 − 新写/工作集 1090）⇒ 裁到 256 块`
+/// ⇒ 6.5k token 白重算。
+///
+/// # 判据（为什么只有 `chunk + 安全边`）
+///
+/// turn 起始 `execute_begin` **一次性**回灌命中面 ⇒ 峰值驻留 =
+/// **命中面 + 本 chunk 新写**。工作集（`sink`/`recent`/`top-k`）是命中面的
+/// **子集** —— 它们本来就要常驻，不是额外开销，扣第二遍就是白丢容量。
+/// 工作集 + 驻留尾装不装得下，由 boot 侧独立校验（见 `boot_pool_floor`），
+/// 不靠这里重复扣。
+///
+/// `chunk_pages` = `ceil(prefill_chunk / page)`（调用方算好传入，避免两处
+/// 对 `div_ceil` 的口径再分家）。
+pub fn reclaim_margin(chunk_pages: usize) -> usize {
+    chunk_pages.max(1) + RECLAIM_SAFETY_PAGES
+}
+
+// ===========================================================================
 // §2 外部注入的事实（只读快照）
 // ===========================================================================
 
@@ -132,6 +172,13 @@ pub struct StoreFacts {
     pub in_flight_turns: usize,
     /// 宿主层空闲页（超卖档的下沉腿；不超卖档 = 0 也无妨）
     pub host_free_pages: usize,
+    /// 宿主层**已驻留**页（超卖档；只作**同前缀复用**的可用性判据）。
+    ///
+    /// 为什么需要:超卖档的"要下沉多少页"(`TurnFacts::offload_pages`)按
+    /// **整条链 − 设备工作集**算；但前缀命中时这些块**已经在宿主持有同一份内容**
+    /// (同前缀 ⇒ 同块身份)。只看 `host_free` 会把它们**双算** ⇒ 第二个 255k
+    /// 追问被 `no_memory` 拒（2026-10-28 实测:首个 255k 请求成功、同文档追问 429）。
+    pub host_used_pages: usize,
     /// 磁盘层空闲页（0 = 无磁盘腿）
     pub disk_free_pages: usize,
 }
@@ -416,7 +463,13 @@ impl Admission {
         // **超卖档：宿主/磁盘腿**（被挤出去的上下文必须有地方落）
         if l.oversub {
             let off = head.offload_pages(l);
-            let host = s.host_free_pages.saturating_add(s.disk_free_pages);
+            // **宿主腿**:空闲 + **已驻留** 都算可用 —— 前缀命中的块在宿主里
+            // 已经是同一份内容(`offload_pages` 按整链算 ⇒ 不加上就双算)。
+            // 真放不下时 store 的下沉会响亮 `Exhausted`(不静默),所以这里不必保守到拒。
+            let host = s
+                .host_free_pages
+                .saturating_add(s.host_used_pages)
+                .saturating_add(s.disk_free_pages);
             if off > host {
                 return Verdict::Reject {
                     reason: Reason::NoMemory {
@@ -648,6 +701,19 @@ fn pick_prefill<'a>(pending: &[&'a TurnFacts]) -> &'a TurnFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 余量**单源**(P1-2):懒沉与命中面裁剪必须用同一份算式 —— 两处各算
+    /// 一套就是"同一个池给出两个可用答案"(实测把 22.9k prompt 的复用面从
+    /// 1420 块砍到 402 块)。这里钉住算式本身,防止再被某个调用点"顺手加一项"。
+    #[test]
+    fn reclaim_margin_is_single_source() {
+        // chunk 64 页(2048 tok / 32)= 常态;余量 = chunk + 安全边(8)
+        assert_eq!(reclaim_margin(64), 72);
+        // 退化输入不许产生 0(0 余量 = 命中面可以吃光池)
+        assert_eq!(reclaim_margin(0), 1 + RECLAIM_SAFETY_PAGES);
+        // 安全边必须远小于工作集档 —— 否则又回到"白砍密集区间"的老路
+        assert!(RECLAIM_SAFETY_PAGES <= 16);
+    }
 
     fn limits_non_oversub() -> Limits {
         Limits {
@@ -1706,7 +1772,6 @@ mod more_tests {
     #[test]
     fn admission_does_not_disturb_the_running() {
         let l = l();
-        let s = store(6250, 0, 0);
         let mut a = Admission::new();
         let running = gen(1, 10, 199_000, 64);
         a.note_started(&running);

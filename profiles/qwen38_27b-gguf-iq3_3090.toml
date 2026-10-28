@@ -59,6 +59,8 @@ lookup = true
 snap_max = 1
 prefix_cache = true
 vram_reserve_mb = 256
+# 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
+transient_reserve_mb = 1024
 host_cache_mb = 10240
 # 快照腿宿主面关(同档③:单槽快照换槽会撞 store「块已在宿主层」不变量)
 snap_host_mb = 0

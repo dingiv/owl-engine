@@ -443,6 +443,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             } else {
                 0
             },
+            host_used_pages: if leg.block_bytes > 0 {
+                leg.host_bytes / leg.block_bytes
+            } else {
+                0
+            },
             disk_free_pages,
         }
     }
@@ -1146,11 +1151,27 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 非超卖档(`pool ≥ ctx`)cap 恒大于链长 ⇒ 本段自动不生效。
             let page = self.dev.pool.geom.page.max(1);
             let cap = self.dev.pool.geom.nb.max(1);
-            let reserve = self.boot.cfg.prefill_chunk.div_ceil(page)
-                + self.boot.cfg.knobs.workspace_per_req.div_ceil(page)
-                + 2;
+            // **余量单源**（`sched_policy::reclaim_margin`）—— 与懒沉同一份算式。
+            // 旧式额外把 `workspace_per_req` 也扣进来，是 P1-2 的一半：命中面
+            // 被白砍（实测 `ws=32768` 档 22.9k prompt：716 → 256 块，6.5k token
+            // 白重算）。工作集是命中面的子集，不该再扣第二遍。
+            let reserve = crate::sched_policy::reclaim_margin(
+                self.boot.cfg.prefill_chunk.div_ceil(page),
+            );
             let max_hit = cap.saturating_sub(reserve).max(1);
-            let m = if self.boot.cfg.knobs.kvmem_virtualization && m_raw > max_hit {
+            // **懒回灌（W3, 2026-10-28）**：虚拟化档（`select_decode && select_partial`）
+            // 下命中面**不再按池容量裁剪**。
+            //
+            // 旧口径（保留给非虚拟化档）：命中块必须在 `execute_begin` **全量**回灌，
+            // 回灌块全在视图工作集里、不可再沉 ⇒ 命中面一旦超池必 `Exhausted`
+            // ⇒ 只能裁到 `池 − 余量`，尾部整段重算（111k 会话每轮重算 38.6k tok，
+            // TTFT 44 s；参照实现在同形状下 1.2 s —— 差距全在这里）。
+            //
+            // 新口径：回灌只给 **sink + recent 窗**（保底续写连续性），其余命中块
+            // 在会话链上留 `PENDING_LOAD_PLACEHOLDER`，由**视图**选择 + `reconcile`
+            // 按需 stage-in（稳态 `select_partial` 本来就有洞，沿同一条路）。
+            let lazy_stage = self.boot.cfg.knobs.kvmem_virtualization && self.boot.cfg.knobs.select_partial;
+            let m = if !lazy_stage && m_raw > max_hit {
                 // 裁完还要**向下对齐到有快照的边界** —— `cached_len` 与 GDN 态
                 // 必须成对:`restore_snap` 拿不到快照会响亮失败,而不是静默错值。
                 // (锚点节奏 = 每 `SNAP_EVERY` 个 chunk + 末边界 + msg 边界。)

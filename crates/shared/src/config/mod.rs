@@ -650,6 +650,21 @@ pub struct PoolCfg {
     /// 只在 `边界页号 % stride == 0` 的边界拍(快照 27B ≈ 152 MiB/条 ⇒ 拍得越密,
     /// 宿主下沉流量越大;1 = 每个页边界都拍)。
     pub snap_decode_stride: usize,
+    /// **超卖档的「池外瞬态余量」MiB**(缺省 1024 = 历史硬编码值)。
+    ///
+    /// 语义:超卖档池吃满显存治理 `cap` 之后,**不在池里**的那部分分配
+    /// (prefill chunk 的激活/工作区、选择层视图、图 warmup、kernel 惰性保留)
+    /// 只能从池外挤 ⇒ 必须留一块空。
+    ///
+    /// **为什么要有这个旋钮**:该值原先**硬编码 1 GiB**
+    /// (`state.rs::pool` 2026-10-27),而代码注释自己写着"实测瞬态只要 24–68 MiB"。
+    /// 在 27B/a8/视觉档上 1 GiB = 池预算的 41%(32,768 tok / 32 KiB 每 token)——
+    /// 等于用**池容量**给不确定的瞬态买单。现在改成可观测、可扫的值。
+    ///
+    /// 取值口径:池 = `cap − ceil(本值 / per_tok)`;越小池越大,但**小于真实瞬态
+    /// 需求会撞 `vram-hard-budget` 拒发**(响亮,不静默)。扫档记录见
+    /// `roadmap.local/26-10-28-KVMem-位置定谳与三修.md` §13。
+    pub transient_reserve_mb: u64,
     /// **主 KV 池 fp8**(→ `KvQuant::Fp8E4M3`;32 KiB/token,容量翻倍)。
     /// 2026-10-22 从 `[kernel]` 移入:它决定池的**存储 dtype/几何**,
     /// 与 `gdn_slots`/`snap_max` 同属池面,而不是算子臂。
@@ -1792,6 +1807,7 @@ impl Default for PoolCfg {
             pool_cap_mb: 256,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
+            transient_reserve_mb: 1024,
             prefix_cache: true,
             image_evict: false,
             image_evict_pad: "。".to_string(),

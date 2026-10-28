@@ -66,6 +66,8 @@ implicit_session = true
 snap_max = 2
 prefix_cache = true
 vram_reserve_mb = 512
+# 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
+transient_reserve_mb = 1024
 # KV 宿主腿 10GiB:设备池只有 1983 槽(63k ctx),两发长 prompt 就占满;
 # 宿主腿让整链下沉(内容不丢)而不是硬拒。4GiB 实测:70k+65k 链装不下
 # ⇒ N6 只能逐叶丢(一次一个叶),第三发 27k 前缀回灌时 `槽池耗尽`

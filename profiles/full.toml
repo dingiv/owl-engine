@@ -191,6 +191,8 @@ pool_cap_mb = 256
 # 显存目标占比 / 预留 MiB
 vram_target = 0.99
 vram_reserve_mb = 256
+# 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
+transient_reserve_mb = 1024
 # 显存硬上限 MiB(留空 = 只按驱动账判)
 vram_budget_mb = 0
 # 前缀缓存开/关
