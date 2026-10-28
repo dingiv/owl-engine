@@ -421,8 +421,9 @@ pub(crate) struct StoreOutcome {
 - `Acquire::Load` 用 `LoadRequest` 而不是把 `slots/load/protect` 混在一个结构里：
   当前只有一种回灌载荷，字段更少、非法状态更少。
 - `Maintain::Pressure` 保留 `snap_bytes` 字段（测试与 N6 两腿目标用）。
-- `Maintain::HostPressure` 只出 `Sink::Disk`（宿主冷面 → 盘），
-  不产生 GPU→Host；`Need.host_slots` 是其唯一目标字段。
+- `Maintain::HostPressure { kv_slots, snap_slots }` 只出 `Sink::Disk`
+  （宿主冷面 → 盘），不产生 GPU→Host；`Need.host_kv_slots` /
+  `Need.host_snap_slots` 是分腿目标（快照单位与 KV 块不同，不能合并）。
   Disk 票的 `span` = **从 root 起的前缀块数**；长链超过单次配额时
   只搬前缀，盘上仍是连续可重建前缀。
 
@@ -662,6 +663,8 @@ ctx 上限被高估。现在 `pool_cap` 与 `snapshot_pool_bytes` 都按真分�
   `pressure(slots)` 仍不保留（pump 不再用，避免死代码）。
 - `idle_compact=false`（缺省）时空转不预搬；显式 true 才按同一套水位触发
   `Maintain::Idle` / `HostPressure`。
+- 每请求分腿配额：`host_pressure_request_slots`（KV）/
+  `host_pressure_request_snaps`（快照）；8 并发最坏总量 = 8× 各自配额。
 - server actor 的注释已同步为“池排空 + trim + 压力/宿主收缩”。
 
 ### 10.3 Admission 两层判决（评审结论：保留）

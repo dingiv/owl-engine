@@ -42,8 +42,8 @@ P0-4 的 Grant 是 store 的单页账：准入批准、`ensure_for_len` 消费�
 | GdnGrid | `gdn_row_bytes × gdn_slots`（实测） |
 | GdnSnapshots / SpecSnapshots / ReplaySnapshots | 真实缓冲账（实测） |
 | DraftPool | `draft_pool_bytes()`（MTP / DFlash2 ring，实测） |
-| GraphSlab | `GRAPH_SLAB_BUDGET`（保守上界，尚未逐项实测） |
-| WarmupMisc | `WARMUP_MISC_BUDGET`（保守上界） |
+| GraphSlab | 捕获后 `GraphFleet::slab_bytes()` 实测；boot 预算上界仍打印 `GRAPH_SLAB_BUDGET` |
+| WarmupMisc | `WARMUP_MISC_BUDGET`（瞬态保守上界；不拿运行期残差冒充实测） |
 
 主 KV 池单列在 `PoolPlan`，不混进 `fixed`。
 
@@ -238,16 +238,19 @@ free <  low  ⇒ 目标 = high − free（cap 见调用点）
   固定预搬；显式 true 才按同一套低/高水位 compact（上限 16 槽）。
 - **HostPressure**：宿主 KV/快照腿低于**独立低水位**（
   `host_pressure_low_pct=12`，按该腿总槽）且对应盘腿有位时，先发
-  `Maintain::HostPressure { slots }`；目标补到**独立高水位**
+  `Maintain::HostPressure { kv_slots, snap_slots }`；目标补到**独立高水位**
   `host_pressure_high_pct=25`（不是只补回 low），形成滞回。
-  单次目标 = `high − free`，总 cap 64；`plan_capacity` 只出 `Sink::Disk`，
-  跳过 GPU→Host，避免把设备面继续压进已经紧的宿主。
+  单次目标 = `high − free`；`plan_capacity` 只出 `Sink::Disk`，跳过 GPU→Host。
+- **每请求分腿配额**（2026-10-27 裁决）：
+  `host_pressure_request_slots=16`（KV 宿主块/请求）+
+  `host_pressure_request_snaps=1`（快照/请求）。
+  8 并发最坏 = `8×16` KV 槽 + `8×1` 快照；不做 turn 累计账/全局窗口。
 - **长链不超调**：HostPressure 的 Disk 票 `span` = 从 root 起的前缀块数；
   长链超过目标时只搬前缀（盘上仍是连续可重建前缀），不再整链越过 high。
 - 空转 compact 的 HostPressure 有 `host_pressure_interval_ms=1000` 最小间隔；
   `PoolExhausted` 的应急收缩不节流（并会把节流时间戳刷新）。
-- `Need` 增加 `host_slots` 字段（HostPressure 专用），`Need::host(n)` 是唯一
-  构造；普通 `Need::kv` 保持 `host_slots = 0`。
+- `Need` 增加 `host_kv_slots` / `host_snap_slots`（HostPressure 分腿），
+  `Need::host(kv, snap)` 是唯一构造；普通 `Need::kv` 两字段为 0。
 - `/debug/vram` 的压力日志带 `pool/host/disk/driver` 一行诊断。
 
 门：
@@ -257,10 +260,96 @@ free <  low  ⇒ 目标 = high − free（cap 见调用点）
 - `running::pressure_tests::driver_headroom_is_part_of_the_signal`
 - `running::pressure_tests::host_pressure_uses_independent_low_watermark_and_disk_room`
   （low 触发 / high 目标 / 每腿独立）
+- `running::pressure_tests::request_quota_clamps_kv_and_snapshot_independently`
 - `housekeeping::tests::host_pressure_interval_gates_idle_compaction`
 - `store::rel::tests::host_pressure_skips_gpu_to_host_and_emits_disk_only`
 - `store::rel::tests::host_pressure_spills_only_the_prefix_needed_to_meet_quota`
+- `store::rel::tests::host_pressure_limits_snapshot_tickets_independently`
+- `store::rel::tests::host_pressure_keeps_kv_and_snapshot_goals_independent`
 - `config::auto_pool_tests::idle_and_pressure_defaults_are_conservative`
+
+## 4.4 P2-2：GraphSlab 捕获后实测回填
+
+`GraphFleet` 新增：
+
+```rust
+pub(crate) fn slab_bytes(&self) -> usize
+```
+
+口径与 boot 的“slab 总账”一致：
+
+```text
+session + verify + fold + propose + dflash + dflash_select
+```
+
+`build_memory_plan(..., graph_slab_bytes)` 在 `into_running` 里读：
+
+```text
+graph_slab_bytes = max(rank0.graphs.slab_bytes(), rank1.graphs.slab_bytes())
+```
+
+然后：
+
+- `MemoryPlan.fixed[GraphSlab].bytes = 实测 Σ`；
+- `source = Measured`；
+- boot 日志同时打印 **实测 / `GRAPH_SLAB_BUDGET` 保守上界**；
+- `WarmupMisc` **仍保持 `Conservative`**：它是 warmup 瞬态上界，不是捕获后
+  的常驻实测，不能拿 `live` 残差冒充。
+
+门：
+
+- `engine::tests::memory_plan_uses_measured_graph_slab_after_capture`
+  （CPU mock 捕获后：GraphSlab = `Measured`，WarmupMisc = `Conservative`）
+
+## 4.5 P1-5：GDN 行 owner
+
+`StateStore` 增加 `row_owners: BTreeMap<row, Owner>`：
+
+- `borrow_row(Owner::Turn(turn.id))`：借行时登记归属；
+- `return_row(...)`：还行时清归属（重复归还仍拒）；
+- `row_owner` / `row_owners()`：报告面读取。
+
+`Rel::leg_accounting()` 不再把行统一记 `System`，而是按 `row_owners` 分组：
+
+```text
+Turn(t) + AssetKind::Row + n × row_bytes
+```
+
+只有异常的无主在借行才兜底 `System`。engine 的 `start_one` 已传
+`Owner::Turn(turn.id)`。
+
+门：
+
+- `engine::tests::gdn_row_is_owned_by_the_active_turn`
+- `store::rel::tests::report_surfaces_both_legs_and_faces`（行 owner 断言）
+
+## 4.6 Load / Row / Snap / Temp Grant
+
+五类票现在都在同一本 `ReservationLedger`：
+
+| kind | 来源 | 计量 |
+|---|---|---|
+| `ActiveFloor` | 准入 | KV 槽（唯一进准入面） |
+| `Load` | `store_load` 回灌块 | 块数 × `slot_bytes` |
+| `Row` | `start_one` 借 GDN 行 | 1 × `row_bytes` |
+| `Snap` | `store_state_slot` 取快照槽 | 1 × `snap_bytes` |
+| `Temp` | `store_load` 周转/临时工作区 | 调用方给 slots/bytes |
+
+关键纪律：
+
+```text
+Rel::reserved_slots() = reserved_slots_of(ActiveFloor)
+```
+
+Row/Snap/Load/Temp **不污染** `sched_policy::StoreFacts.reserved_pages`。
+`StoreReport.grants` 新增按 kind 汇总的 `GrantReport`，`/debug/vram →
+faces.grants` 输出。
+
+门：
+
+- `store::reservations::tests::kinds_are_accounted_separately`
+- `store::rel::tests::grant_ledger_keeps_kinds_separate`
+- `engine::tests::gdn_row_is_owned_by_the_active_turn`（Row Grant 同报）
 
 ## 5. 观测面
 
@@ -275,7 +364,11 @@ free <  low  ⇒ 目标 = high − free（cap 见调用点）
     "pool": { "pages": ..., "tokens": ..., "per_token_bytes": ... },
     "check": { "fits": true, "over_free_bytes": 0, "over_total_bytes": 0 }
   },
-  "faces": { "reserved_slots": 0, "in_flight_turns": 0 }
+  "faces": {
+    "reserved_slots": 0,
+    "in_flight_turns": 0,
+    "grants": [{ "kind": "active_floor", "grants": 0, "slots": 0, "bytes": 0, "turns": 0 }]
+  }
 }
 ```
 
@@ -284,36 +377,31 @@ free <  low  ⇒ 目标 = high − free（cap 见调用点）
 已跑：
 
 ```text
-cargo test -p owl-store --lib                 153 passed
+cargo test -p owl-store --lib                 157 passed
+cargo test -p owl-engine --lib                182 passed
 cargo test -p owl-engine --lib snap_guard_tests       2 passed
-cargo test -p owl-engine --lib pressure_tests         4 passed
+cargo test -p owl-engine --lib pressure_tests         5 passed
 cargo test -p owl-engine --lib host_pressure_interval_gates_idle_compaction 1 passed
-cargo test -p owl-shared --lib                126 passed
-本轮相关状态腿门(state_hook / state_slot / snapshot_victim)  3 passed
+OWL_CPU_MOCK=1 cargo test -p owl-engine --test store_admission_gate 7 passed
+cargo test -p owl-shared --lib                125 passed
 cargo check -p server                          PASS
 ```
 
-全量 `owl-engine --lib` 在当前工作树的构建面被一个存量问题挡住：
-`vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256` 缺少算子准入声明
-（与本次 P1-2/P1-3 改动无关；同一构建下既有 prefill 门也会失败）。
+`server --test config_check` 仍有 3 项既有 `runtime.max_seq` 期望值失败
+（57344 vs 79872），与本次改动无关。
 
 真机：
 
-- 3080 TP2 `262k` boot 成功；
-- `MemoryPlan` 闭合、`运行底价 685.8MiB`、`卡级实测=true`；
-- 一次 `/v1/chat/completions` 冒烟返回正常。
+- P2-2 前：3080 TP2 `262k` boot 成功、`MemoryPlan` 闭合、`卡级实测=true`；
+- P2-2 后尚未重启 8135；GraphSlab 实测值需在下一次 boot 日志复核。
 
 ## 7. 未完成 / 下一刀
 
-1. **HostPressure 跨多次调用的 turn 累计配额**：当前已按“每次调用”
-   `high − free` 限额并用前缀切链，不会单链超调；后续若要限制同一 turn
-   多次 PoolExhausted 的累计搬迁，再加 turn 账。
-2. **P2-2 GraphSlab/Warmup 实测**：当前仍是 `Conservative` 上界；
-   捕获后把 GraphFleet 实测 Σ 回填 plan。
-3. **P1-5 GDN row owner**：仍归 `System`，未按 turn 归因。
-4. **Load/Row/Snap/Temp Grant**：`ReservationKind` 已有词，当前只发
-   `ActiveFloor`；后续把 Load/Row/Snap 的临时额度也纳入同一本账。
-5. `MemoryPlan.epoch` 目前恒 0；运行期重编译（若做）再递增。
+1. `MemoryPlan.epoch` 目前恒 0；运行期重编译（若做）再递增。
+2. **WarmupMisc**：保留保守上界；若要实测，需要单独的热身瞬态账，
+   不能用捕获后的 live 残差替代。
+3. **Grant 粒度**：Load/Snap/Temp 当前是 turn 生命周期票；若要按单次操作
+   即时归还，需要再区分“操作票”和“turn 票”的生命周期。
 
 ## 8. 文件落点
 

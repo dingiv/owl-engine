@@ -2767,3 +2767,601 @@ engine **59**(+ `disk_chain_index_enables_cross_restart_reuse`:turn 写索引 �
 语义正确但"公平性"可按需再加(按会话配额);②`evict_order` 只是**候选序**,
 一次淘汰多条时仍会连续取同一会话的多层(浅层排在后面,实际很少轮到);
 ③会话归属在**跨重启**后不恢复(NV 盘上索引不含 sid;需要则加进 `.idx` 头)。
+
+---
+
+## 33. HostPressure 每请求配额（并发 1..8 的设计 · 2026-10-27）
+
+> **状态**：已实施（2026-10-27）。
+> 前序：§14 钩子框架 / §30 两腿统一调度 / §33 之前的 `HostPressure`（host 满 →
+> 只出 `Sink::Disk`、长链只搬 root 前缀、单次 cap 64）。
+> 本节解决“**一个请求一次能搬多少宿主**”，不是“一个 turn 累计搬多少”。
+
+### 33.1 问题与结论
+
+HostPressure 的目标是：
+
+```text
+宿主冷 KV / 快照 → 磁盘
+```
+
+它有两个成本：
+
+1. **磁盘写放大**：一条快照约 152 MiB；KV 链可能几十 MiB；
+2. **宿主缓存保护**：被搬走的宿主块可能属于其它并发会话，下一次命中要回灌。
+
+当前单次 HostPressure 的 hard cap = 64 槽，长链已按 root 前缀切分；但仍然是
+**一个请求最多可以触发 64 槽**。并发 8 时，最坏总搬迁量没有按请求数收紧。
+
+**结论（用户 2026-10-27 裁决）**：
+
+```text
+不做 per-turn 累计账（当前一个 turn 只会触发一次 relieve_pressure）；
+做“每请求配额”：
+  KV 宿主每请求最多 Q_kv 槽
+  快照宿主每请求最多 Q_snap 条
+```
+
+最多 8 并发 ⇒ 总上限天然是：
+
+```text
+8 × Q_kv KV 槽
+8 × Q_snap 快照
+```
+
+---
+
+### 33.2 为什么不是“turn 累计”
+
+当前调用链：
+
+```text
+pump 报 PoolExhausted
+  → actor abandon_turn(...)
+  → running.relieve_pressure()
+       → HostPressure
+```
+
+`abandon_turn` 发生在 `relieve_pressure` **之前** ⇒ 触发压力的 turn 已经被弃置；
+同一个 turn 不会再次进入 `relieve_pressure`。因此：
+
+- 一个 turn 最多一次 HostPressure；
+- “同一 turn 多次调用累计”当前不会发生；
+- `idle_tick` 的 HostPressure 根本没有 turn 归属。
+
+所以 turn 累计账在当前架构里接近 no-op；真正要限制的是**每个请求这一次**的
+最大搬迁量。
+
+> 将来若允许同一个 turn 失败后重试/继续跑（多次 `relieve_pressure`），再引入
+> `HostPressureSpent { turn, spent }`；本设计不预置这个复杂度。
+
+### 33.3 请求数推演
+
+设 KV 配额 `Q_kv`、快照配额 `Q_snap`：
+
+| 并发请求数 N | 最坏 KV 搬迁 | 最坏快照搬迁 |
+|---:|---:|---:|
+| 1 | `Q_kv` | `Q_snap` |
+| 2 | `2 × Q_kv` | `2 × Q_snap` |
+| 3 | `3 × Q_kv` | `3 × Q_snap` |
+| 8 | `8 × Q_kv` | `8 × Q_snap` |
+
+**1 个请求**：没有其它请求需要保护；它最多搬自己的配额。配额不够 ⇒ 本请求失败，
+下一个请求重新拿一份配额。
+
+**2 个并发**：A 触发时最多搬 `Q_kv/Q_snap`，不会把 B 的宿主缓存一次刷光；
+B 后触发时拿自己的一份。总上限 `2 × Q`。
+
+**3..8 个并发**：同理，单请求上限不随并发数放大；总上限随 N 线性增长，N ≤ 8
+是硬边界。
+
+**顺序轮换**：每个新请求都是一份新配额，所以连续很多请求理论上仍可累计搬很多。
+本设计先接受这个残余；如果真实负载出现“连续请求刷宿主”，再加全局窗口预算
+（例如 128 槽/秒）。当前不做，是为了不把“每请求公平”与“全局速率”混在一起。
+
+### 33.4 为什么 KV / 快照要分开配额
+
+两者单位不可折算：
+
+```text
+KV 宿主槽 ≈ 单块字节（27B 约 2 MiB）
+快照宿主槽 ≈ 单条快照（27B 约 152 MiB）
+```
+
+若只有一个 `host_slots` 配额，`Q = 16` 对不同腿意味着：
+
+```text
+KV：约 32 MiB
+快照：约 2.4 GiB
+```
+
+所以配额必须分腿：
+
+```toml
+[runtime]
+host_pressure_request_slots = 16   # KV 宿主槽/请求
+host_pressure_request_snaps = 1    # 快照条数/请求
+```
+
+> 16 / 1 是首版缺省；按真机宿主体量和盘带宽可调。0 = 该腿不限额（仅诊断/实验，
+> 不推荐生产）。
+
+### 33.5 数据模型
+
+#### 33.5.1 `Need` 分腿
+
+当前：
+
+```rust
+pub struct Need {
+    pub slots: usize,
+    pub snap_bytes: usize,
+    pub host_slots: usize,
+    pub why: NeedWhy,
+}
+```
+
+改为：
+
+```rust
+pub struct Need {
+    /// KV 设备槽目标（原有）
+    pub slots: usize,
+    /// 状态腿设备字节目标（原有）
+    pub snap_bytes: usize,
+    /// HostPressure：KV 宿主前缀块数目标
+    pub host_kv_slots: usize,
+    /// HostPressure：快照宿主条数目标
+    pub host_snap_slots: usize,
+    pub why: NeedWhy,
+}
+
+impl Need {
+    pub fn host(kv_slots: usize, snap_slots: usize) -> Self {
+        Self {
+            slots: 0,
+            snap_bytes: 0,
+            host_kv_slots: kv_slots,
+            host_snap_slots: snap_slots,
+            why: NeedWhy::HostPressure,
+        }
+    }
+}
+```
+
+`Need::is_zero()` 同时检查四个目标。
+
+#### 33.5.2 `Maintain` / `StoreHook`
+
+```rust
+Maintain::HostPressure {
+    kv_slots: usize,
+    snap_slots: usize,
+}
+
+StoreHook::host_pressure(kv_slots, snap_slots)
+```
+
+指标标签仍为 `maintain.host_pressure`。
+
+### 33.6 plan_capacity 语义
+
+`host_disk_only = need.host_kv_slots > 0 || need.host_snap_slots > 0`。
+
+#### KV 腿
+
+- 只从宿主 KV 链候选出票；
+- 每张票的 `span` = **从 root 起的前缀块数**；
+- 单票写入：
+
+```text
+take = min(chain_span, host_kv_goal - got_host_kv)
+```
+
+- `take == 0` ⇒ 跳过；
+- 不产生 `Sink::Host`（跳过 GPU→Host）；
+- 不进入轮二 Drop。
+
+#### 状态腿
+
+- 只从宿主快照候选出票；
+- 每张 `Snap { sink: Disk }` 消耗 1 条快照配额；
+- 不超过 `host_snap_goal`；
+- `Transient` 快照仍不写盘（现有事实档）。
+
+#### 失败
+
+```text
+got_host_kv < host_kv_goal
+或 got_host_snap < host_snap_goal
+⇒ deny（响亮，带两腿缺口）
+```
+
+盘满/没候选 = deny；不许静默 Drop 或转回 GPU→Host。
+
+### 33.7 engine 目标计算
+
+`PressureSignals` 已有分腿字段（§33 前置实现）：
+
+```text
+host_kv_enabled / host_snap_enabled
+host_kv_total_slots / host_snap_total_slots
+host_kv_free_slots / host_snap_free_slots
+disk_kv_free_slots / disk_snap_free_slots
+```
+
+计算：
+
+```text
+planned_kv = if host_kv_enabled
+               && free_kv < low_kv
+               && disk_kv > 0
+             { high_kv - free_kv } else { 0 }
+
+planned_snap = if host_snap_enabled
+                 && free_snap < low_snap
+                 && disk_snap > 0
+               { high_snap - free_snap } else { 0 }
+
+actual_kv   = min(planned_kv,   host_pressure_request_slots)
+actual_snap = min(planned_snap, host_pressure_request_snaps)
+```
+
+`low/high` 仍按各腿总槽百分比（`host_pressure_low_pct` / `host_pressure_high_pct`）。
+
+**单请求上限是硬上限**：即使 `planned_kv = 200`，`Q_kv = 16` 也只搬 16。
+这是有意的：一次少搬一点，保护其它并发请求；后续请求/轮次再逐步补。
+
+### 33.8 调用路径
+
+#### `relieve_pressure`（PoolExhausted 后）
+
+```text
+drain_temp_pool + trim_pools
+  → 计算 signals
+  → HostPressure { kv, snap }（先腾宿主）
+  → Pressure { slots, snap_bytes }（再收缩池）
+```
+
+`relieve_pressure` 返回：
+
+```text
+(freed, kv_slots, host_kv_slots, host_snap_slots)
+```
+
+actor 日志同步报三项目标。
+
+#### `idle_tick`（显式 `idle_compact=true`）
+
+- 同一套 `HostPressure { kv, snap }` 目标；
+- 仍受 `host_pressure_interval_ms` 节流；
+- 先 HostPressure，再 Idle。
+
+#### 无请求 / 空转
+
+- 没有请求可归属，仍使用同一份 `Q_kv/Q_snap`；
+- 空转有 `host_pressure_interval_ms`，不会每拍搬。
+
+### 33.9 配置
+
+新增：
+
+```toml
+[runtime]
+host_pressure_request_slots = 16
+host_pressure_request_snaps = 1
+```
+
+已有：
+
+```toml
+host_pressure_low_pct = 12
+host_pressure_high_pct = 25
+host_pressure_interval_ms = 1000
+```
+
+语义层级：
+
+```text
+low/high      = 何时触发、想补到多少（压力水位）
+request_*     = 本次最多搬多少（公平/成本上限）
+interval_ms   = 空转两次之间至少隔多久（节流）
+```
+
+### 33.10 验收门
+
+1. **纯函数**
+   - `planned_kv=40, Q_kv=16 ⇒ 16`
+   - `planned_snap=3, Q_snap=1 ⇒ 1`
+   - `0 = 不限`（仅测试/诊断）
+
+2. **plan_capacity**
+   - 宿主 2 块链 + `host_kv_slots=1` ⇒ 只出 `span=1` Disk 票；
+   - 宿主 3 条快照 + `host_snap_slots=1` ⇒ 只出 1 张 `Snap{Disk}`；
+   - 两腿同时低 ⇒ 两张票互不折算；
+   - 无盘位 ⇒ deny，不出 Drop。
+
+3. **engine**
+   - `relieve_pressure` 目标被 `Q` 裁剪；
+   - `idle_tick` 同样裁剪；
+   - actor 日志/返回值带 `host_kv_slots` 与 `host_snap_slots`。
+
+4. **配置**
+   - 缺省 16 / 1；
+   - 显式覆盖生效；
+   - `full.toml` 完整度门通过。
+
+### 33.11 非目标
+
+- 不做 per-turn 累计账（当前一 turn 一次调用）；
+- 不做全局时间窗口预算（max_concurrency=8 已给总量上界；
+  顺序轮换的残余风险先记录，实测出现再加）；
+- 不做按会话/按租户的 HostPressure 配额；
+- 不改 `Transient` 快照不写盘的既有事实档。
+
+### 33.12 文件落点
+
+```text
+crates/shared/src/config/mod.rs     runtime.host_pressure_request_slots/snaps
+crates/engine/src/engine.rs         EngineKnobs 两字段 + from_config
+crates/engine/src/store_hook.rs     Maintain::HostPressure { kv, snap }
+crates/store/src/hooks.rs           Need.host_kv_slots / host_snap_slots
+crates/store/src/hooks.rs           plan_capacity 分腿 host goal
+crates/engine/src/running.rs        pressure_need / idle_tick / relieve_pressure
+crates/engine/src/housekeeping.rs   （可选）每次请求上限的指标/日志
+profiles/full.toml                  两个新键
+crates/engine/src/tests.rs          目标裁剪 + 长链前缀 + 快照条数门
+crates/store/src/rel.rs             两腿 HostPressure plan 门
+```
+
+### 33.13 一句话
+
+> 一个请求最多搬 `Q_kv` 个 KV 宿主块 + `Q_snap` 条宿主快照；
+> 8 个并发最多 `8 × Q`；不引入 turn 累计账，也不做全局窗口。
+
+### 33.14 实施回填（2026-10-27）
+
+**已落地**：
+
+- `Need` 分腿：
+  - `host_kv_slots`（KV root 前缀块数）
+  - `host_snap_slots`（快照条数）
+  - `Need::host(kv, snap)`
+- `Maintain::HostPressure { kv_slots, snap_slots }` /
+  `StoreHook::host_pressure(kv, snap)`。
+- `plan_capacity`：
+  - `host_kv_goal` / `host_snap_goal` 分开；
+  - KV 票按 `min(chain_span, remaining_kv)` 取 root 前缀；
+  - 快照票按 `remaining_snap` 计数；
+  - 两腿都不产生 GPU→Host/Drop。
+- engine：
+  - `PressureSignals` 分腿总/余量；
+  - `host_pressure_targets` 产 `(planned_kv, planned_snap)`；
+  - `clamp_host_pressure` 按每请求配额分腿裁剪；
+  - `pressure_need` / `idle_tick` 返回 `(slots, host_kv, host_snap)`；
+  - `relieve_pressure` 返回 `(freed, kv_slots, host_kv, host_snap)`。
+- 配置：
+  ```toml
+  [runtime]
+  host_pressure_request_slots = 16   # KV/请求
+  host_pressure_request_snaps = 1    # 快照/请求
+  ```
+  0 = 该腿不设每请求上限（KV 仍受绝对 cap 64）。
+
+**门（全绿）**：
+
+```text
+cargo check -p server                          PASS
+cargo test -p owl-store --lib                 155 passed
+cargo test -p owl-engine --lib                180 passed
+cargo test -p owl-engine --lib pressure_tests     5 passed
+OWL_CPU_MOCK=1 cargo test -p owl-engine \
+  --test store_admission_gate                  7 passed
+```
+
+新增/更新门：
+
+- `store::rel::tests::host_pressure_skips_gpu_to_host_and_emits_disk_only`
+- `store::rel::tests::host_pressure_spills_only_the_prefix_needed_to_meet_quota`
+- `store::rel::tests::host_pressure_limits_snapshot_tickets_independently`
+- `store::rel::tests::host_pressure_keeps_kv_and_snapshot_goals_independent`
+- `running::pressure_tests::host_pressure_uses_independent_low_watermark_and_disk_room`
+- `running::pressure_tests::request_quota_clamps_kv_and_snapshot_independently`
+- `config::auto_pool_tests::idle_and_pressure_defaults_are_conservative`
+
+**残余**：
+
+- 顺序轮换仍可能逐请求累计搬多；本设计接受，若真机出现 churn 再加全局窗口；
+- `server --test config_check` 的 3 项既有 `runtime.max_seq` 期望值失败与本节无关。
+
+---
+
+## 34. GDN 行 owner（P1-5 · 2026-10-27）
+
+### 34.1 问题
+
+`Rel::leg_accounting()` 此前把 GDN 行统一记为：
+
+```text
+AssetKind::Row · Owner::System
+```
+
+而 `StateStore` 只知道“哪一行空闲”，不知道“这一行是谁借的”。后果：
+
+- `/debug/vram` 无法回答“哪个活跃 turn 占了几行/多少字节”；
+- N4 只看 `DeviceHandle` 的 `Turn(t)`，看不到 GDN 行；
+- 行账与 active reservation 是两套口径。
+
+### 34.2 实现
+
+`StateStore`：
+
+```rust
+rows_free: BTreeSet<usize>
+row_owners: BTreeMap<usize, Owner>
+
+pub fn borrow_row(&mut self, owner: Owner) -> StoreResult<usize>
+pub fn return_row(&mut self, row: usize, snap: Option<SnapKey>) -> StoreResult<()>
+pub fn row_owner(&self, row: usize) -> Option<Owner>
+pub fn row_owners(&self) -> impl Iterator<Item = (usize, Owner)>
+```
+
+语义：
+
+- 借行时写 `row_owners[row] = owner`；
+- 还行时清 `row_owners`；重复归还仍响亮拒；
+- 快照登记不受影响（`return_row(row, Some(snap))` 仍先落快照）。
+
+engine：
+
+```rust
+state.borrow_row(Owner::Turn(turn.id))
+```
+
+`Rel::leg_accounting()`：
+
+```text
+按 row_owners 分组 → OwnerRow { owner: Turn(t), kind: Row, bytes: n×row_bytes }
+```
+
+只有**没有 owner 的在借行**才兜底 `System`（正常路径不应出现）。
+
+### 34.3 门
+
+```text
+cargo test -p owl-engine --lib gdn_row_is_owned_by_the_active_turn
+cargo test -p owl-store --lib report_surfaces_both_legs_and_faces
+```
+
+- engine：活跃 turn 借行后，`store_report().tiers.owners` 必须有
+  `Owner::Turn(tid) + AssetKind::Row`，`entries == 1`；
+- store：`Rel::report()` 按 `Turn(7)` 归因，字节 = `row_bytes`，归还后清账。
+
+**结果**：
+
+```text
+owl-engine --lib 182 passed
+owl-store  --lib 155 passed
+cargo check -p server PASS
+```
+
+---
+
+## 35. Load / Row / Snap / Temp Grant（同一本 ReservationLedger）
+
+### 35.1 分维度票
+
+`ReservationKind` 的五个变体现在都进同一本 `ReservationLedger`：
+
+| kind | 语义 | 生命周期 |
+|---|---|---|
+| `ActiveFloor` | KV 地板（准入面） | turn |
+| `Load` | 前缀回灌块占用的设备槽 | turn |
+| `Row` | GDN 行（1 行 = `row_bytes`） | turn |
+| `Snap` | 快照设备槽（1 条 = `snap_bytes`） | turn |
+| `Temp` | 回灌周转/临时工作区 | turn |
+
+**准入只读 `ActiveFloor`**：
+
+```rust
+Rel::reserved_slots() = reservations.reserved_slots_of(ActiveFloor)
+```
+
+Row/Snap/Load/Temp 不会污染 `sched_policy::StoreFacts.reserved_pages`。
+
+### 35.2 接线
+
+- `Rel::reserve_row(turn)`：`start_one` 借 GDN 行后发 1 行票；
+- `Rel::reserve_load(turn, blocks)`：`store_load` 按回灌块数发票并 `consume`；
+- `Rel::reserve_temp(turn, slots, bytes)`：同一次回灌的周转票；
+- `Rel::reserve_snap(turn)`：`store_state_slot` 每次取槽发 1 条票并 `consume`；
+- `Release` / `release_turn_grants` 统一归还五类票。
+
+`LoadRequest` 增加 `turn` 字段（原来只有 session），回灌票需要 turn 归属。
+
+### 35.3 报告
+
+`StoreReport` 增加：
+
+```rust
+pub grants: Vec<GrantReport>
+```
+
+每行：
+
+```text
+kind / grants / slots / bytes / turns
+```
+
+`/debug/vram → faces.grants` 原样输出；`reserved_slots` 仍是 ActiveFloor，
+不把 Row/Snap/Load/Temp 算进 KV 准入。
+
+### 35.4 门
+
+```text
+cargo test -p owl-store --lib kinds_are_accounted_separately
+cargo test -p owl-store --lib grant_ledger_keeps_kinds_separate
+cargo test -p owl-engine --lib gdn_row_is_owned_by_the_active_turn
+```
+
+- ledger：五种 kind 各自汇总，`reserved_slots()` 全量、`reserved_slots_of`
+  分用途；KV 准入只读 ActiveFloor；
+- store：五类票同时存在时 `Rel::reserved_slots()==2`（只有 ActiveFloor）；
+- engine：活跃 turn 的 Row Grant 与 Row owner 同时在报告里。
+
+**结果**：
+
+```text
+owl-store  --lib 157 passed
+owl-engine --lib 182 passed
+cargo check -p server PASS
+```
+
+---
+
+## 36. 单会话 / 两会话迁移回填基线（2026-10-27）
+
+无卡 store e2e（`crates/store/tests/store_e2e.rs`，CPU mock）：
+
+### 36.1 单会话
+
+池 6 槽、宿主 8 MiB、单链 6 块：
+
+```text
+占满池 → 整链沉宿主 → 命中 → 整链回灌
+[单] offload: host_blocks=6 slots_free=6
+[单] reload : host_blocks=0 slots_free=0
+```
+
+每块回灌后逐字节与下沉前一致。
+
+### 36.2 两会话并发/轮换
+
+A/B 各 3 块、池 6 槽：
+
+```text
+A、B 都活跃（表引用未释放）
+  → plan 不出 Host 票（整链下沉被引用挡住）
+A 先轮换出去
+  → A 整链沉宿主（host=3 / free=3）
+  → A 回灌；B 仍活跃，B pending=0
+B 再轮换出去
+  → B 整链沉宿主 / 回灌
+  → host=0 / free=0；A/B 内容均逐字节正确
+```
+
+**已修正（同日）**：两会话都活跃时，`plan_capacity` 的 Drop 候选现在
+先过 `BlockLeg::device_leaf_is_cache(chain)`（设备叶 `refs == 1`）；
+活跃链 `refs > 1` 不再进 Drop 票。容量不足时 plan 直接 `deny`，不再出
+无效 Drop 票。门内断言：
+
+```text
+[active] both active tickets=[] · deny.is_some()
+```
+
+### 36.3 门
+
+```text
+cargo test -p owl-store --test store_e2e
+  8 passed（含 3 个新并发/轮换门）
+```
