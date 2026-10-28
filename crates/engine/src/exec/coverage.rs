@@ -1374,9 +1374,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         // `OWL_SCHEME_MIN_CTX`(缺省 0 = 每个边界都算):只在这个 ctx 以上才算
         // ⇒ 规模档只跑最后一次(host 数学与 dense 成正比,小边界算了也白算)
         let scheme_min = self.boot.cfg.knobs.coverage_scheme_min_ctx;
-        let want_scheme = diag
-            && self.boot.cfg.knobs.coverage_scheme_probe
-            && ctx_tokens >= scheme_min;
+        // ⚠️ 方案对照**依附于诊断面**:`k_post`/`v_post` 只在 `analyze_now` 时回读
+        // (见下方 read_pool_kv 的 `if analyze_now`)。若这里只看 ctx 不看
+        // `analyze_now`,非诊断边界会拿**空 Vec** 去调 `scheme_compare` ⇒
+        // `k_post[l]` 越界 panic(2026-10-28 实测:`analyze_at_ctx` 钉住 ctx 时,
+        // 前面每个边界都炸)。绑定关系在下面 `analyze_now` 算出后收紧。
         // **重诊断采样**(`OWL_COV_ANALYZE_EVERY`;三档):
         //
         // | 值 | 语义 |
@@ -1413,6 +1415,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                     None => last_boundary,
                 }
             };
+        // 方案对照 = 诊断面的子集(**必须**与 `analyze_now` 同寿命;见上注)。
+        let want_scheme = diag
+            && self.boot.cfg.knobs.coverage_scheme_probe
+            && ctx_tokens >= scheme_min
+            && analyze_now;
         if ctx_tokens != pid.base + pid.t {
             owl_shared::log_debug!(
                 "cov-probe",
