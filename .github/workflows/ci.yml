@@ -1,9 +1,12 @@
 name: ci
 
+# Runs on **tags only** (plus manual dispatch): pushes to `main` are frequent
+# and the hosted runners cannot build the device paths anyway (no CUDA), so a
+# per-push run costs minutes to re-prove the same thing. Cut a tag when a
+# checkpoint is worth gating.
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ["v*"]
   workflow_dispatch:
 
 env:
