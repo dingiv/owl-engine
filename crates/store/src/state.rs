@@ -5,7 +5,7 @@
 //!
 //! 本刀(S1)落**账与生命周期语义**:
 //! - **行(row)= 活跃 turn 借还**(S2b 的目标语义,先在账上成立):
-//!   `borrow_row()` 拿行 → 用毕 `return_row(row, Some(snap))` **落快照后还格**;
+//!   `borrow_row(owner)` 拿行 → 用毕 `return_row(row, Some(snap))` **落快照后还格**;
 //! - 快照 = 可驱逐资产(所在层由 `Tier` 记账;下沉 host/盘是 S2 的搬运活);
 //! - 行数上限 = `gdn_slots`(**并发 turn 天花板**,不是"能挂多少会话")。
 
@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::error::{StoreError, StoreResult};
 use crate::id::SnapKey;
 use crate::policy::{EvictCandidate, Leg};
-use crate::tier::Tier;
+use crate::tier::{Owner, Tier};
 
 /// 快照账。
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +57,8 @@ pub enum SnapDurability {
 pub struct StateStore {
     rows_total: usize,
     rows_free: BTreeSet<usize>,
+    /// 行 → 归属(turn/session/system;报告面 P1-5)
+    row_owners: BTreeMap<usize, Owner>,
     row_bytes: usize,
     snaps: BTreeMap<SnapKey, SnapEntry>,
     tick: u64,
@@ -71,6 +73,7 @@ impl StateStore {
         Self {
             rows_total,
             rows_free: (0..rows_total).collect(),
+            row_owners: BTreeMap::new(),
             row_bytes,
             snaps: BTreeMap::new(),
             tick: 0,
@@ -90,13 +93,16 @@ impl StateStore {
     }
 
     /// 借行(**活跃 turn 起**)——耗尽 = 响亮拒;调用方应先查 `rows_free()`。
-    pub fn borrow_row(&mut self) -> StoreResult<usize> {
+    ///
+    /// `owner` = 行归属（正常 = `Owner::Turn(turn)`）；报告面据此按 turn 归因。
+    pub fn borrow_row(&mut self, owner: Owner) -> StoreResult<usize> {
         let row = *self
             .rows_free
             .iter()
             .next()
             .ok_or_else(|| StoreError::Exhausted(format!("GDN 行耗尽({} 行)", self.rows_total)))?;
         self.rows_free.remove(&row);
+        self.row_owners.insert(row, owner);
         Ok(row)
     }
 
@@ -111,6 +117,7 @@ impl StateStore {
         if !self.rows_free.insert(row) {
             return Err(StoreError::Invariant(format!("行 {row} 重复归还")));
         }
+        self.row_owners.remove(&row);
         if let Some(k) = snap {
             self.tick += 1;
             let tick = self.tick;
@@ -134,6 +141,16 @@ impl StateStore {
     /// 空闲行数。
     pub fn rows_free(&self) -> usize {
         self.rows_free.len()
+    }
+
+    /// 行归属(报告面;P1-5)。
+    pub fn row_owner(&self, row: usize) -> Option<Owner> {
+        self.row_owners.get(&row).copied()
+    }
+
+    /// 当前所有在借行的 `(row, owner)`（报告/对账口）。
+    pub fn row_owners(&self) -> impl Iterator<Item = (usize, Owner)> + '_ {
+        self.row_owners.iter().map(|(row, owner)| (*row, *owner))
     }
 
     /// **登记快照**(S2:引擎每次 `capture_snap` 后调用;幂等 —— 已存在则只触达)。
@@ -344,14 +361,16 @@ mod tests {
     #[test]
     fn rows_are_borrowed_per_turn_and_returned_with_snapshot() {
         let mut s = StateStore::new(2, 162 << 20);
-        let r0 = s.borrow_row().expect("借行");
-        let r1 = s.borrow_row().expect("借行");
-        assert!(s.borrow_row().is_err(), "第三行必须响亮拒(天花板)");
+        let r0 = s.borrow_row(Owner::Turn(1)).expect("借行");
+        let r1 = s.borrow_row(Owner::Turn(2)).expect("借行");
+        assert_eq!(s.row_owner(r0), Some(Owner::Turn(1)), "行归属 = turn");
+        assert!(s.borrow_row(Owner::Turn(3)).is_err(), "第三行必须响亮拒(天花板)");
         // turn 止:落快照 + 还行 ⇒ idle 会话不再占行
         s.return_row(r0, Some(SnapKey::at_boundary(ChainHash::new(7)))).expect("还行");
         assert_eq!(s.rows_free(), 1);
         assert_eq!(s.locate(SnapKey::at_boundary(ChainHash::new(7))), Some(Tier::Gpu));
-        assert_eq!(s.borrow_row().expect("再借"), 0, "还回的行号应可复用");
+        assert_eq!(s.row_owner(r0), None, "还行后归属清空");
+        assert_eq!(s.borrow_row(Owner::Turn(4)).expect("再借"), 0, "还回的行号应可复用");
         s.return_row(r1, None).expect("无快照也行");
         assert_eq!(s.rows_free(), 1);
     }
@@ -388,7 +407,7 @@ mod tests {
     #[test]
     fn double_return_is_loud() {
         let mut s = StateStore::new(1, 1);
-        let r = s.borrow_row().expect("借行");
+        let r = s.borrow_row(Owner::System).expect("借行");
         s.return_row(r, None).expect("还行");
         assert!(matches!(s.return_row(r, None), Err(StoreError::Invariant(_))));
     }
@@ -397,7 +416,7 @@ mod tests {
     fn snaps_are_evictable_but_protect_wins() {
         let mut s = StateStore::new(1, 1024);
         let k = SnapKey::at_boundary(ChainHash::new(3));
-        let r = s.borrow_row().expect("借行");
+        let r = s.borrow_row(Owner::System).expect("借行");
         s.return_row(r, Some(k)).expect("落快照");
         assert!(s.evict_candidates(&[k]).is_empty(), "点名保住");
         assert_eq!(s.evict_candidates(&[]).len(), 1);

@@ -520,6 +520,39 @@ impl<D: DeviceClient> GraphFleet<D> {
     /// KV 槽 = 本 token 自己的格子(窗 = [slot-kv_len+1, slot],随步进;
     /// 2026-09-26 窗口语义探针定谳:slots 恒 0 读块外垃圾行);
     /// GDN 槽 = 序列状态格,turn 内恒 0(递推状态按序列累积)。
+    /// **已捕获图族的 slab 总字节**(实测;session/verify/fold/propose/dflash)。
+    ///
+    /// 与 boot 日志“slab 总账”同口径 —— `MemoryPlan` 的 GraphSlab 项
+    /// 在捕获后用它回填，不再只报 `GRAPH_SLAB_BUDGET` 保守上界。
+    pub(crate) fn slab_bytes(&self) -> usize {
+        let session = self.session.slab_bytes();
+        let verify: usize = self
+            .depths
+            .iter()
+            .filter_map(|g| g.verify.as_ref())
+            .map(|g| g.slab_bytes())
+            .sum();
+        let fold: usize = self
+            .depths
+            .iter()
+            .flat_map(|g| g.fold.iter())
+            .map(|g| g.slab_bytes())
+            .sum();
+        let propose: usize = self
+            .depths
+            .iter()
+            .flat_map(|g| g.propose.iter())
+            .map(|g| g.slab_bytes())
+            .sum();
+        let dflash = self.dflash.as_ref().map(|g| g.slab_bytes()).unwrap_or(0);
+        let dflash_select = self
+            .dflash_select
+            .as_ref()
+            .map(|g| g.slab_bytes())
+            .unwrap_or(0);
+        session + verify + fold + propose + dflash + dflash_select
+    }
+
     /// **face 句柄克隆**(诊断/投影面出口:`GET /debug/blocks` 的 GPU 命令通道;
     /// 取主会话图的 face —— 克隆 = 同一个 actor 的另一个发送端)
     pub fn face_clone(&self) -> Option<D> {

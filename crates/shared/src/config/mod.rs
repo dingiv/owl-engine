@@ -57,6 +57,7 @@
 //! | runtime | max_batch | usize / 1(合批上限;>1 需 gdn_slots≥它、单卡、无选择层) |
 //! | runtime | idle_compact / pressure_low_pct / pressure_high_pct | bool、usize、usize / false、12、25(空转默认不预搬;低触发/高目标) |
 //! | runtime | host_pressure_low_pct / host_pressure_high_pct / host_pressure_interval_ms | usize、usize、usize / 12、25、1000(宿主低触发/高目标/空转节流) |
+//! | runtime | host_pressure_request_slots / host_pressure_request_snaps | usize、usize / 16、1(每请求 KV/快照搬迁上限) |
 //! | runtime | test_device | 测试域(不入 toml) |
 //! | parallel | mode | ParallelMode 枚举 single\|tensor / single |
 //! | parallel | device | [String] 卡位(BDF / UUID / find-name;**禁 CUDA 序号**);空 = 自动挑空闲卡 |
@@ -364,6 +365,14 @@ fn default_host_pressure_high_pct() -> usize {
     25
 }
 
+fn default_host_pressure_request_slots() -> usize {
+    16
+}
+
+fn default_host_pressure_request_snaps() -> usize {
+    1
+}
+
 /// 进程装配面
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -449,6 +458,14 @@ pub struct RuntimeCfg {
     /// 低水位触发后补到该值；策略层保证 high ≥ low。
     #[serde(default = "default_host_pressure_high_pct")]
     pub host_pressure_high_pct: usize,
+    /// **每请求 KV 宿主搬迁上限**(HostPressure;缺省 16 槽)。
+    /// 0 = 不设每请求上限（仍受单次绝对 cap 64）。
+    #[serde(default = "default_host_pressure_request_slots")]
+    pub host_pressure_request_slots: usize,
+    /// **每请求快照宿主搬迁上限**(HostPressure;缺省 1 条)。
+    /// 快照单条约 152MiB，不能和 KV 槽共用配额。
+    #[serde(default = "default_host_pressure_request_snaps")]
+    pub host_pressure_request_snaps: usize,
     /// **HostPressure 最小间隔**(毫秒；缺省 1000)。
     /// 只节流空转 compact；`PoolExhausted` 的应急收缩不走这个间隔。
     #[serde(default = "default_host_pressure_interval_ms")]
@@ -1649,6 +1666,8 @@ impl Default for RuntimeCfg {
             pressure_high_pct: 25,
             host_pressure_low_pct: 12,
             host_pressure_high_pct: 25,
+            host_pressure_request_slots: 16,
+            host_pressure_request_snaps: 1,
             host_pressure_interval_ms: 1000,
             test_device: None,
         }
@@ -3430,10 +3449,12 @@ mod auto_pool_tests {
         assert_eq!(c.runtime.pressure_high_pct, 25);
         assert_eq!(c.runtime.host_pressure_low_pct, 12);
         assert_eq!(c.runtime.host_pressure_high_pct, 25);
+        assert_eq!(c.runtime.host_pressure_request_slots, 16);
+        assert_eq!(c.runtime.host_pressure_request_snaps, 1);
         assert_eq!(c.runtime.host_pressure_interval_ms, 1000);
         let c = OwlConfig::from_toml_str(
             "[runtime]\nidle_compact = true\npressure_low_pct = 20\npressure_high_pct = 40\n\
-             host_pressure_low_pct = 15\nhost_pressure_high_pct = 35\nhost_pressure_interval_ms = 500\n",
+             host_pressure_low_pct = 15\nhost_pressure_high_pct = 35\nhost_pressure_request_slots = 8\nhost_pressure_request_snaps = 2\nhost_pressure_interval_ms = 500\n",
         )
         .expect("显式档");
         assert!(c.runtime.idle_compact);
@@ -3442,9 +3463,11 @@ mod auto_pool_tests {
             (
                 c.runtime.host_pressure_low_pct,
                 c.runtime.host_pressure_high_pct,
+                c.runtime.host_pressure_request_slots,
+                c.runtime.host_pressure_request_snaps,
                 c.runtime.host_pressure_interval_ms
             ),
-            (15, 35, 500)
+            (15, 35, 8, 2, 500)
         );
     }
 

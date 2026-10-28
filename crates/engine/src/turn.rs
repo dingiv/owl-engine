@@ -234,7 +234,7 @@ pub(crate) struct ActiveTurn {
     pub(crate) id: u64,
     pub(crate) session_id: u64,
     /// **GDN 行号(S2b:turn 域资源)** —— turn 起从 `StateStore::borrow_row()`
-    /// 借,终了归还(`return_row`);跨 turn 的状态连续性由**边界快照**承担
+    /// 借(`Owner::Turn(id)`),终了归还(`return_row`);跨 turn 的状态连续性由**边界快照**承担
     /// (§25.2),不再靠"会话钉一行"。idle 会话因此对设备**零占用**。
     pub(crate) gdn_slot: usize,
     /// **容量票**(P0-4):准入后由 store `ReservationLedger` 发放;

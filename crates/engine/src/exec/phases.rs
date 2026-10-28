@@ -267,9 +267,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 搬运/腾槽/账目全在 `StoreHook::Acquire(Load)` 内；这里只交请求。
         if !b.pending_loads.is_empty() {
             let pending_loads = std::mem::take(&mut b.pending_loads);
+            let turn = self.turns.active()?.id;
             let outcome = self
                 .store_hook(crate::store_hook::StoreHook::load(
                     b.session_id,
+                    turn,
                     pending_loads,
                 ))
                 .await?;

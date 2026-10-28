@@ -1554,6 +1554,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         skip_turn: Option<u64>,
     ) -> Result<u32> {
         use crate::state::SnapSlotPick;
+        // **Snap 票**：快照设备槽也进同一本 ReservationLedger（turn 生命周期）。
+        // 无活跃 turn（测试/纯 store 路径）⇒ 不发；正常 capture/restore 都有 turn。
+        if let Ok(act) = self.turns.active() {
+            let grant = self.bank.rel.reserve_snap(act.id)?;
+            self.bank
+                .rel
+                .consume_capacity(grant.id, 1, self.bank.rel.snap_bytes())?;
+        }
         // **P1-2**：出序与容量票必须看到同一份保护面。
         let protect = self.snap_guard(extra_snaps, skip_turn);
         for _ in 0..3 {
@@ -1582,7 +1590,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 owl_store::Need {
                                     slots: 0,
                                     snap_bytes,
-                                    host_slots: 0,
+                                    host_kv_slots: 0,
+                                    host_snap_slots: 0,
                                     why: owl_store::NeedWhy::Grow,
                                 },
                                 extra_snaps,
@@ -1634,6 +1643,25 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 盘上的块先读回宿主（盘 → 设备要两跳；判据与账都在 store）
         self.ensure_host_resident(&chains).await?;
         let need_slots = chains.len();
+        let block_bytes = self.dev.pool.block_bytes();
+        let load_bytes = need_slots
+            .checked_mul(block_bytes)
+            .ok_or_else(|| ModelError::Msg("Load Grant: 字节溢出".into()))?;
+        // **Load / Temp 票**（同一本 ReservationLedger）：
+        // - Load = 回灌块占用的设备槽；consume 标记已兑现；
+        // - Temp = 本次回灌的周转额度；turn 收尾统一归还。
+        // 两者都不进 ActiveFloor 的 KV 准入面（`Rel::reserved_slots` 按 kind 过滤）。
+        let load_grant = self.bank.rel.reserve_load(req.turn, need_slots)?;
+        self.bank
+            .rel
+            .consume_capacity(load_grant.id, need_slots, load_bytes)?;
+        let temp_grant = self
+            .bank
+            .rel
+            .reserve_temp(req.turn, need_slots, load_bytes)?;
+        self.bank
+            .rel
+            .consume_capacity(temp_grant.id, need_slots, load_bytes)?;
         let mut applied = owl_store::Applied::default();
         // 设备槽先腾够：`Need.slots` 是需求，`plan_capacity` 会按当前 free 折算缺口。
         if self.bank.rel.leg.slots_free() < need_slots {
@@ -1824,17 +1852,21 @@ impl<D: DeviceClient> RunningEngine<D> {
                 owl_store::Need {
                     slots,
                     snap_bytes,
-                    host_slots: 0,
+                    host_kv_slots: 0,
+                    host_snap_slots: 0,
                     why: owl_store::NeedWhy::Idle,
                 }
             }
             Maintain::Pressure { slots, snap_bytes } => owl_store::Need {
                 slots,
                 snap_bytes,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: owl_store::NeedWhy::Pressure,
             },
-            Maintain::HostPressure { slots } => owl_store::Need::host(slots),
+            Maintain::HostPressure { kv_slots, snap_slots } => {
+                owl_store::Need::host(kv_slots, snap_slots)
+            }
         };
         let applied = self.pool_housekeeping(need, &[], None).await?;
         Ok(StoreOutcome {
@@ -1848,12 +1880,12 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 次序：**先还缓存**（复用池排空 + 池缓存 trim —— 真还驱动），
     /// **先腾宿主**（`Maintain::HostPressure`：只出 Disk 票），
     /// **再做池内收缩**（`Maintain::Pressure`：KV 槽 + 状态腿目标）。
-    /// 返回 `(池排空块数, 目标腾出 KV 槽数, 目标腾出宿主槽数)`；失败响亮上抛
+    /// 返回 `(池排空块数, 目标腾出 KV 槽数, 目标腾出 KV 宿主块数, 目标腾出快照数)`；失败响亮上抛
     /// （调用方只记日志继续）。
     ///
     /// 为什么不再用“驱动 free < 1GiB”触发：固定池把块沉宿主**不增加驱动 free**，
     /// 却会制造每拍 churn。`pump` 不再跑 N6；只有真正 `PoolExhausted` 才收缩。
-    pub async fn relieve_pressure(&mut self) -> Result<(usize, usize, usize)> {
+    pub async fn relieve_pressure(&mut self) -> Result<(usize, usize, usize, usize)> {
         let freed = {
             let f = self.dev.graphs.dev_ctx_face_mut();
             f.drain_temp_pool().await
@@ -1891,15 +1923,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                 signals.summary()
             );
         }
-        let (slots, snap_bytes, host_slots) = self.pressure_need(&signals);
-        if host_slots > 0 {
+        let (slots, snap_bytes, host_kv, host_snap) = self.pressure_need(&signals);
+        if host_kv > 0 || host_snap > 0 {
             // **先腾宿主**：宿主腿满时若先压池，轮一会把设备块继续往宿主塞。
             owl_shared::log_warn!(
                 "store",
-                "压力缓解目标:宿主 {host_slots} 槽 → 磁盘（跳过 GPU→Host）; {}",
+                "压力缓解目标:宿主 {host_kv} KV 块 + {host_snap} 快照 → 磁盘（跳过 GPU→Host）; {}",
                 signals.summary()
             );
-            self.store_hook(StoreHook::host_pressure(host_slots)).await?;
+            self.store_hook(StoreHook::host_pressure(host_kv, host_snap))
+                .await?;
             self.hk.mark_host_pressure();
         }
         if slots > 0 || snap_bytes > 0 {
@@ -1912,7 +1945,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             self.store_hook(StoreHook::pressure_with_snap(slots, snap_bytes))
                 .await?;
         }
-        Ok((freed, slots, host_slots))
+        Ok((freed, slots, host_kv, host_snap))
     }
 
     /// **压力信号快照**（P1-3；纯 host 账，零 I/O）。
@@ -1974,11 +2007,22 @@ impl<D: DeviceClient> RunningEngine<D> {
         )
     }
 
+    /// HostPressure 每请求目标（KV 前缀块 / 快照条数；分腿裁剪）。
+    fn request_host_pressure(&self, signals: &PressureSignals) -> (usize, usize) {
+        let (planned_kv, planned_snap) = host_pressure_targets(signals, &self.pressure_policy());
+        clamp_host_pressure(
+            planned_kv,
+            planned_snap,
+            self.boot.cfg.knobs.host_pressure_request_slots,
+            self.boot.cfg.knobs.host_pressure_request_snaps,
+        )
+    }
+
     /// **紧急池压力目标**（`PoolExhausted` 后；不是每拍 N6）。
     ///
     /// 判据 = **压力信号 + 低/高双水位**：自由页低于 low 才触发，目标补到 high
     /// （滞回，避免阈值附近 churn）。状态腿在宿主有位时带一条快照。
-    fn pressure_need(&self, signals: &PressureSignals) -> (usize, usize, usize) {
+    fn pressure_need(&self, signals: &PressureSignals) -> (usize, usize, usize, usize) {
         let slots = self.pressure_policy().target_slots(
             signals.pool_total_pages,
             signals.pool_free_pages,
@@ -1992,8 +2036,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         } else {
             0
         };
-        let host_slots = host_pressure_slots(signals, &self.pressure_policy());
-        (slots, snap_bytes, host_slots)
+        let (host_kv, host_snap) = self.request_host_pressure(signals);
+        (slots, snap_bytes, host_kv, host_snap)
     }
 
     /// **H5 空转整理节拍**（Idle pump 计数；每 N 拍问一次）。
@@ -2001,7 +2045,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **默认不预搬**：`runtime.idle_compact=false` 时只让 `pump` 走池缓存
     /// 回收（`trim_pools`），不触发 `Maintain::Idle`。显式开启后也只按
     /// 压力信号的低水位触发、补到高水位，不再用固定 `pool/8` 目标。
-    fn idle_tick(&mut self) -> Option<(usize, usize)> {
+    fn idle_tick(&mut self) -> Option<(usize, usize, usize)> {
         if !self.hk.note_idle_pump() {
             return None;
         }
@@ -2014,19 +2058,19 @@ impl<D: DeviceClient> RunningEngine<D> {
             signals.pool_free_pages,
             IDLE_COMPACT_MAX_SLOTS,
         );
-        let policy = self.pressure_policy();
-        let mut host_slots = host_pressure_slots(&signals, &policy);
-        if host_slots > 0 {
+        let (mut host_kv, mut host_snap) = self.request_host_pressure(&signals);
+        if host_kv > 0 || host_snap > 0 {
             let interval = std::time::Duration::from_millis(
                 self.boot.cfg.knobs.host_pressure_interval_ms as u64,
             );
             if self.hk.host_pressure_due(interval) {
                 self.hk.mark_host_pressure();
             } else {
-                host_slots = 0;
+                host_kv = 0;
+                host_snap = 0;
             }
         }
-        (slots > 0 || host_slots > 0).then_some((slots, host_slots))
+        (slots > 0 || host_kv > 0 || host_snap > 0).then_some((slots, host_kv, host_snap))
     }
 
     /// **句柄计数三元组**(诊断面;`/debug/vram`):`(hook_fail, window_unclosed, 窗内块数)`
@@ -3664,9 +3708,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                         }
                     }
                 }
-                if let Some((slots, host_slots)) = self.idle_tick() {
-                    if host_slots > 0 {
-                        self.store_hook(StoreHook::host_pressure(host_slots)).await?;
+                if let Some((slots, host_kv, host_snap)) = self.idle_tick() {
+                    if host_kv > 0 || host_snap > 0 {
+                        self.store_hook(StoreHook::host_pressure(host_kv, host_snap))
+                            .await?;
                     }
                     if slots > 0 {
                         self.store_hook(StoreHook::idle(slots)).await?;
@@ -4014,8 +4059,11 @@ mod snap_guard_tests {
     }
 }
 
-/// 宿主腿低于低水位且盘有位 ⇒ 把该腿补回**高水位**；总目标 cap 防止一次搬空。
-fn host_pressure_slots(signals: &PressureSignals, policy: &PressurePolicy) -> usize {
+/// 宿主腿低于低水位且盘有位 ⇒ 把该腿补回**高水位**（未裁剪的期望值）。
+fn host_pressure_targets(
+    signals: &PressureSignals,
+    policy: &PressurePolicy,
+) -> (usize, usize) {
     let kv = if signals.host_kv_enabled
         && signals.host_kv_free_slots < policy.host_low_slots(signals.host_kv_total_slots)
         && signals.disk_kv_free_slots > 0
@@ -4036,12 +4084,34 @@ fn host_pressure_slots(signals: &PressureSignals, policy: &PressurePolicy) -> us
     } else {
         0
     };
-    (kv + snap).min(HOST_PRESSURE_MAX_SLOTS)
+    (kv, snap)
+}
+
+/// 每请求分腿配额：KV 槽 / 快照条数分别裁剪（0 = 该腿不设每请求上限）。
+fn clamp_host_pressure(
+    planned_kv: usize,
+    planned_snap: usize,
+    request_slots: usize,
+    request_snaps: usize,
+) -> (usize, usize) {
+    let kv = if request_slots == 0 {
+        planned_kv.min(HOST_PRESSURE_MAX_SLOTS)
+    } else {
+        planned_kv.min(request_slots).min(HOST_PRESSURE_MAX_SLOTS)
+    };
+    let snap = if request_snaps == 0 {
+        planned_snap
+    } else {
+        planned_snap.min(request_snaps)
+    };
+    (kv, snap)
 }
 
 #[cfg(test)]
 mod pressure_tests {
-    use super::{host_pressure_slots, PressurePolicy, PressureSignals};
+    use super::{
+        clamp_host_pressure, host_pressure_targets, PressurePolicy, PressureSignals,
+    };
 
     #[test]
     fn low_watermark_triggers_and_high_is_the_target() {
@@ -4070,22 +4140,42 @@ mod pressure_tests {
         s.host_kv_total_slots = 100; // low = 20, high = 40
         s.host_kv_free_slots = 19;
         s.disk_kv_free_slots = 100;
-        assert_eq!(host_pressure_slots(&s, &p), 21, "低于低水位补到高水位");
+        assert_eq!(
+            host_pressure_targets(&s, &p),
+            (21, 0),
+            "低于低水位补到高水位"
+        );
         s.host_kv_free_slots = 0;
-        assert_eq!(host_pressure_slots(&s, &p), 40, "空宿主补到高水位");
+        assert_eq!(host_pressure_targets(&s, &p), (40, 0), "空宿主补到高水位");
         s.host_kv_free_slots = 20;
-        assert_eq!(host_pressure_slots(&s, &p), 0, "等于低水位不触发");
+        assert_eq!(host_pressure_targets(&s, &p), (0, 0), "等于低水位不触发");
 
         s.host_snap_total_slots = 10; // low = 2, high = 4
         s.host_snap_free_slots = 0;
         s.disk_snap_free_slots = 10;
-        assert_eq!(host_pressure_slots(&s, &p), 4, "状态腿独立高水位");
+        assert_eq!(host_pressure_targets(&s, &p), (0, 4), "状态腿独立高水位");
         s.disk_kv_free_slots = 0;
-        assert_eq!(host_pressure_slots(&s, &p), 4, "KV 无盘位不影响快照");
+        assert_eq!(host_pressure_targets(&s, &p), (0, 4), "KV 无盘位不影响快照");
         s.host_kv_free_slots = 0; // KV 仍低但无盘位
-        assert_eq!(host_pressure_slots(&s, &p), 4);
+        assert_eq!(host_pressure_targets(&s, &p), (0, 4));
         s.host_snap_free_slots = 4;
-        assert_eq!(host_pressure_slots(&s, &p), 0);
+        assert_eq!(host_pressure_targets(&s, &p), (0, 0));
+    }
+
+    #[test]
+    fn request_quota_clamps_kv_and_snapshot_independently() {
+        assert_eq!(
+            clamp_host_pressure(40, 3, 16, 1),
+            (16, 1),
+            "KV/快照各自裁剪"
+        );
+        assert_eq!(clamp_host_pressure(40, 3, 0, 0), (40, 3), "0 = 不设每请求上限");
+        assert_eq!(
+            clamp_host_pressure(100, 2, 0, 0),
+            (64, 2),
+            "KV 仍受绝对 cap 64"
+        );
+        assert_eq!(clamp_host_pressure(0, 5, 16, 1), (0, 1));
     }
 
     #[test]

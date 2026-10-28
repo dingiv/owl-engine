@@ -91,6 +91,9 @@ pressure_high_pct = 25
 # 宿主压力低/高水位(占该腿总槽百分比)与空转 HostPressure 节流(ms)
 host_pressure_low_pct = 12
 host_pressure_high_pct = 25
+# 每请求搬迁上限(KV 槽 / 快照条数);8 并发最坏 = 8×16 KV + 8×1 快照
+host_pressure_request_slots = 16
+host_pressure_request_snaps = 1
 host_pressure_interval_ms = 1000
 
 # ---------------------------------------------------------------------------

@@ -42,8 +42,8 @@ impl ReservationId {
     }
 }
 
-/// 票的用途。第一刀只发 `ActiveFloor`;其余变体留给后续的 load/snap/temp 接线。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 票的用途。KV 准入只读 `ActiveFloor`；Load/Row/Snap/Temp 分维度记账。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReservationKind {
     /// 活跃 turn 的设备槽地板(准入时一次批准,`ensure_for_len` 逐页消费)。
     ActiveFloor,
@@ -68,6 +68,21 @@ impl ReservationKind {
             Self::Temp => "temp",
         }
     }
+}
+
+/// 按用途汇总的票账（报告/`/debug/vram` 用；不参与准入判决）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrantReport {
+    /// 用途标签。
+    pub kind: &'static str,
+    /// 在册票数。
+    pub grants: usize,
+    /// 准入面总槽。
+    pub slots: usize,
+    /// 准入面总字节。
+    pub bytes: usize,
+    /// 去重 turn 数。
+    pub turns: usize,
 }
 
 /// 一张已批准的票。
@@ -246,6 +261,53 @@ impl ReservationLedger {
         self.entries.values().map(|e| e.grant.bytes).sum()
     }
 
+    /// 某一用途的批准总槽（KV 准入只读 `ActiveFloor`）。
+    pub fn reserved_slots_of(&self, kind: ReservationKind) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.grant.kind == kind)
+            .map(|e| e.grant.slots)
+            .sum()
+    }
+
+    /// 某一用途的批准总字节。
+    pub fn reserved_bytes_of(&self, kind: ReservationKind) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.grant.kind == kind)
+            .map(|e| e.grant.bytes)
+            .sum()
+    }
+
+    /// 按用途汇总（报告面；不改变任何账）。
+    pub fn report(&self) -> Vec<GrantReport> {
+        #[derive(Default)]
+        struct Acc {
+            grants: usize,
+            slots: usize,
+            bytes: usize,
+            turns: BTreeSet<u64>,
+        }
+        let mut by_kind: BTreeMap<ReservationKind, Acc> = BTreeMap::new();
+        for e in self.entries.values() {
+            let a = by_kind.entry(e.grant.kind).or_default();
+            a.grants += 1;
+            a.slots += e.grant.slots;
+            a.bytes += e.grant.bytes;
+            a.turns.insert(e.grant.turn);
+        }
+        by_kind
+            .into_iter()
+            .map(|(kind, a)| GrantReport {
+                kind: kind.label(),
+                grants: a.grants,
+                slots: a.slots,
+                bytes: a.bytes,
+                turns: a.turns.len(),
+            })
+            .collect()
+    }
+
     /// 在册 turn 数(去重;槽位策略用)。
     pub fn in_flight_turns(&self) -> usize {
         self.entries
@@ -353,6 +415,34 @@ mod tests {
         l.consume(g.id, 8, 8 << 20).expect("消费 8 页");
         assert_eq!(l.reserved_slots(), 2, "消费不改变准入面");
         assert_eq!(l.remaining_slots(g.id), Some(2));
+    }
+
+    #[test]
+    fn kinds_are_accounted_separately() {
+        let mut l = ReservationLedger::new();
+        l.grant(1, Owner::Turn(1), ReservationKind::ActiveFloor, 2, 2, 2, 2)
+            .expect("floor");
+        l.grant(1, Owner::Turn(1), ReservationKind::Row, 1, 1, 1, 1)
+            .expect("row");
+        l.grant(1, Owner::Turn(1), ReservationKind::Load, 3, 3, 3, 3)
+            .expect("load");
+        l.grant(1, Owner::Turn(1), ReservationKind::Snap, 1, 1, 1, 1)
+            .expect("snap");
+        l.grant(1, Owner::Turn(1), ReservationKind::Temp, 4, 4, 4, 4)
+            .expect("temp");
+        assert_eq!(l.reserved_slots(), 11, "全用途合计");
+        assert_eq!(
+            l.reserved_slots_of(ReservationKind::ActiveFloor),
+            2,
+            "KV 准入只看 ActiveFloor"
+        );
+        assert_eq!(l.reserved_slots_of(ReservationKind::Load), 3);
+        assert_eq!(l.reserved_slots_of(ReservationKind::Row), 1);
+        assert_eq!(l.reserved_slots_of(ReservationKind::Snap), 1);
+        assert_eq!(l.reserved_slots_of(ReservationKind::Temp), 4);
+        let report = l.report();
+        assert_eq!(report.len(), 5, "每种用途一行:{report:?}");
+        assert!(report.iter().any(|r| r.kind == "row" && r.slots == 1));
     }
 
     #[test]

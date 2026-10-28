@@ -87,7 +87,7 @@ pub use rel::{
     AdoptChainsReport, DiskAttach, EventBook, KvConfig, OpenLoan, PoolReport, Protected, RecallHit,
     RecallMode, Rel, SnapEvictPreview, StoreReport,
 };
-pub use reservations::{Grant, ReservationId, ReservationKind, ReservationLedger};
+pub use reservations::{Grant, GrantReport, ReservationId, ReservationKind, ReservationLedger};
 pub use select::{
     assemble_view, block_mass, coverage_curve, derope_halves_inplace, derope_pair, f16_to_f32_pub,
     f32_to_f16, score_blocks, select, select_recency, BlockSet, IndexStats, MeanKCollector,

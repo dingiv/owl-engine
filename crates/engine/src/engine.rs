@@ -257,6 +257,10 @@ pub struct EngineKnobs {
     pub host_pressure_low_pct: usize,
     /// 宿主压力高水位/目标(宿主该腿总槽百分比;缺省 25)
     pub host_pressure_high_pct: usize,
+    /// 每请求 KV 宿主搬迁上限(缺省 16;0 = 不设每请求上限)
+    pub host_pressure_request_slots: usize,
+    /// 每请求快照宿主搬迁上限(缺省 1;0 = 不设每请求上限)
+    pub host_pressure_request_snaps: usize,
     /// HostPressure 空转节流(毫秒;缺省 1000)
     pub host_pressure_interval_ms: usize,
     /// **末段页对齐**(前缀复用闭环,2026-10-19;`[pool] prefill_align_tail`,
@@ -377,6 +381,8 @@ impl Default for EngineKnobs {
             pressure_high_pct: 25,
             host_pressure_low_pct: 12,
             host_pressure_high_pct: 25,
+            host_pressure_request_slots: 16,
+            host_pressure_request_snaps: 1,
             host_pressure_interval_ms: 1000,
             prefill_align_tail: true,
             snap_decode_stride: 1,
@@ -749,6 +755,8 @@ impl EngineKnobs {
             pressure_high_pct: cfg.runtime.pressure_high_pct,
             host_pressure_low_pct: cfg.runtime.host_pressure_low_pct,
             host_pressure_high_pct: cfg.runtime.host_pressure_high_pct,
+            host_pressure_request_slots: cfg.runtime.host_pressure_request_slots,
+            host_pressure_request_snaps: cfg.runtime.host_pressure_request_snaps,
             host_pressure_interval_ms: cfg.runtime.host_pressure_interval_ms,
             prefill_align_tail: cfg.pool.prefill_align_tail,
             snap_decode_stride: cfg.pool.snap_decode_stride,
@@ -897,6 +905,7 @@ fn build_memory_plan(
     cfg: &EngineConfig,
     pool: &StatePool,
     weights_bytes: u64,
+    graph_slab_bytes: usize,
 ) -> Result<owl_store::MemoryPlan> {
     let tier_budget = owl_store::tier_budget_of(
         cfg.knobs.host_cache_mb,
@@ -907,6 +916,24 @@ fn build_memory_plan(
     let block_bytes = pool.block_bytes();
     let page = pool.geom.page.max(1);
     let mut fixed = pool.memory_components();
+    // **P2-2**：图族已捕获，GraphSlab 用实测值回填；`GRAPH_SLAB_BUDGET`
+    // 只保留为 boot 预算上界（日志同时报两者）。
+    let Some(graph_slab) = fixed
+        .iter_mut()
+        .find(|c| c.id == owl_store::ComponentId::GraphSlab)
+    else {
+        return Err(owl_iface::contract::ModelError::Msg(
+            "MemoryPlan: memory_components 缺 GraphSlab 项".into(),
+        ));
+    };
+    graph_slab.bytes = graph_slab_bytes;
+    graph_slab.source = owl_store::PlanSource::Measured;
+    owl_shared::log_info!(
+        "boot",
+        "MemoryPlan 图 slab: 实测 {:.1}MiB / 保守上界 {}MiB",
+        graph_slab_bytes as f64 / 1048576.0,
+        crate::state::GRAPH_SLAB_BUDGET >> 20,
+    );
     fixed.insert(
         0,
         owl_store::MemComponent::new(
@@ -1291,7 +1318,17 @@ pub(crate) fn into_running<D: DeviceClient>(
 ) -> Result<RunningEngine<D>> {
     // **store 装配(host 半;S3b §23.3)** —— 预算/策略/层布局/快照腿:
     // 单卡与 TP 都**只做一份**(host 账单一)。
-    let memory_plan = build_memory_plan(&boot, &cfg, &dev.pool, weights_bytes)?;
+    let graph_slab_bytes = dev
+        .graphs
+        .slab_bytes()
+        .max(peer.as_ref().map_or(0, |p| p.graphs.slab_bytes()));
+    let memory_plan = build_memory_plan(
+        &boot,
+        &cfg,
+        &dev.pool,
+        weights_bytes,
+        graph_slab_bytes,
+    )?;
     let budget_inputs = assemble_budget(&cfg, &memory_plan)?;
     let admission_policy =
         owl_store::AdmissionPolicy::new(cfg.knobs.gdn_slots.max(1), cfg.knobs.admission_on_full);

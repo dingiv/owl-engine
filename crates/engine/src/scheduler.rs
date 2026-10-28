@@ -547,7 +547,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         // **S2b(§28):turn 起借 GDN 行**(账在 store:行 = 活跃 turn 的资源;
         // 物理行号就是账里的行号 —— 一本账,不两份)。行耗尽 = 响亮拒
         // (`Exhausted`;正常路径由准入面 `gdn_slots` 天花板先挡)。
-        let gdn_row = self.bank.rel.state.borrow_row()?;
+        let gdn_row = self
+            .bank
+            .rel
+            .state
+            .borrow_row(owl_store::tier::Owner::Turn(turn.id))?;
+        // **P0-4 x P1-5**：行也进同一本 ReservationLedger（turn 生命周期）。
+        let row_grant = self.bank.rel.reserve_row(turn.id)?;
+        debug_assert_eq!(row_grant.kind, owl_store::ReservationKind::Row);
         // E2c 复用形态:**PrefixHit(内容寻址,块链复用 + 快照恢复)/ Fresh(全量)**
         //
         // **S2(§25.1①)删掉 GuardHit 快路**:idle 会话不再持设备表 ⇒

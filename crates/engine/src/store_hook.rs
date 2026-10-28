@@ -99,6 +99,8 @@ pub(crate) enum StateAcquire {
 pub(crate) struct LoadRequest {
     /// 会话 id：回灌后把新槽写回它的 `block_table`。
     pub(crate) session: u64,
+    /// 发起回灌的活跃 turn（Load/Temp 票归属）。
+    pub(crate) turn: u64,
     /// `(块表下标, 内容身份)`；顺序与 `BeginPlan.pending_loads` 一致。
     pub(crate) blocks: Vec<(usize, ChainHash)>,
 }
@@ -139,8 +141,10 @@ pub(crate) enum Maintain {
     },
     /// **宿主压力**：只把宿主冷面挪到磁盘；不产生 GPU→Host 票。
     HostPressure {
-        /// 目标腾出的宿主槽数。
-        slots: usize,
+        /// KV 宿主前缀块数目标。
+        kv_slots: usize,
+        /// 快照宿主条数目标。
+        snap_slots: usize,
     },
 }
 
@@ -183,8 +187,16 @@ impl StoreHook {
         })
     }
 
-    pub(crate) fn load(session: u64, blocks: Vec<(usize, ChainHash)>) -> Self {
-        Self::Acquire(Acquire::Load(LoadRequest { session, blocks }))
+    pub(crate) fn load(
+        session: u64,
+        turn: u64,
+        blocks: Vec<(usize, ChainHash)>,
+    ) -> Self {
+        Self::Acquire(Acquire::Load(LoadRequest {
+            session,
+            turn,
+            blocks,
+        }))
     }
 
     pub(crate) fn state(key: SnapKey) -> Self {
@@ -223,8 +235,8 @@ impl StoreHook {
         Self::Maintain(Maintain::Pressure { slots, snap_bytes })
     }
 
-    pub(crate) fn host_pressure(slots: usize) -> Self {
-        Self::Maintain(Maintain::HostPressure { slots })
+    pub(crate) fn host_pressure(kv_slots: usize, snap_slots: usize) -> Self {
+        Self::Maintain(Maintain::HostPressure { kv_slots, snap_slots })
     }
 
     /// 指标标签（`store.hook.<label>`）。
@@ -274,7 +286,7 @@ mod label_tests {
             StoreHook::capacity(Need::kv(1, NeedWhy::Grow)).label(),
             "acquire.grow"
         );
-        assert_eq!(StoreHook::load(1, vec![]).label(), "acquire.load");
+        assert_eq!(StoreHook::load(1, 2, vec![]).label(), "acquire.load");
         let key = SnapKey::at_boundary(ChainHash::new(0xA1));
         assert_eq!(StoreHook::state(key).label(), "acquire.state.resident");
         assert_eq!(StoreHook::state_slot(key).label(), "acquire.state.slot");
@@ -289,7 +301,7 @@ mod label_tests {
             "maintain.pressure"
         );
         assert_eq!(
-            StoreHook::host_pressure(1).label(),
+            StoreHook::host_pressure(1, 1).label(),
             "maintain.host_pressure"
         );
     }

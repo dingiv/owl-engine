@@ -450,6 +450,15 @@ pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
             "reserved_slots": r.reserved_slots,
             "in_flight_turns": r.in_flight_turns,
             "reserved_bytes": r.reserved_bytes,
+            // **Grant 分用途账**：Load/Row/Snap/Temp 与 ActiveFloor 分开，
+            // 不污染调度器的 KV `reserved_slots`。
+            "grants": r.grants.iter().map(|g| json!({
+                "kind": g.kind,
+                "grants": g.grants,
+                "slots": g.slots,
+                "bytes": g.bytes,
+                "turns": g.turns,
+            })).collect::<Vec<_>>(),
             "session_held_bytes": r.session_held_bytes,
             "elastic_bytes": r.elastic_bytes,
             "cache_bytes": r.cache_bytes,

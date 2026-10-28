@@ -110,6 +110,8 @@ pub struct StoreReport {
     pub reserved_slots: usize,
     /// **Grant 在册 turn 数**(P0-4;槽位策略真源)。
     pub in_flight_turns: usize,
+    /// 按用途汇总的票账（Load/Row/Snap/Temp 等；不参与准入）。
+    pub grants: Vec<crate::reservations::GrantReport>,
     /// 非 turn 归属的不可动面字节(idle 会话持着的历史;§23.2)。
     pub session_held_bytes: usize,
     /// 弹性面字节(可驱逐)。
@@ -833,11 +835,6 @@ impl Rel {
         alloc_slots: usize,
         kind: ReservationKind,
     ) -> StoreResult<Grant> {
-        if turn == 0 {
-            return Err(StoreError::Invariant(
-                "reserve_capacity: turn = 0(准入票必须有 turn 归属)".into(),
-            ));
-        }
         let slot_bytes = self.leg.slot_bytes();
         let bytes = slots
             .checked_mul(slot_bytes)
@@ -845,6 +842,27 @@ impl Rel {
         let alloc_bytes = alloc_slots
             .checked_mul(slot_bytes)
             .ok_or_else(|| StoreError::Budget("reserve_capacity: 分配面字节溢出".into()))?;
+        self.reserve_direct(turn, kind, slots, bytes, alloc_slots, alloc_bytes)
+    }
+
+    /// **通用票**（Row/Snap/Load/Temp 等非 KV 槽单位资源）。
+    ///
+    /// `slots`/`bytes` 由调用方按资源语义给；KV 准入只读
+    /// [`ReservationKind::ActiveFloor`]，不会被这些票污染。
+    pub fn reserve_direct(
+        &mut self,
+        turn: u64,
+        kind: ReservationKind,
+        slots: usize,
+        bytes: usize,
+        alloc_slots: usize,
+        alloc_bytes: usize,
+    ) -> StoreResult<Grant> {
+        if turn == 0 {
+            return Err(StoreError::Invariant(
+                "reserve_direct: turn = 0(票必须有 turn 归属)".into(),
+            ));
+        }
         self.reservations.grant(
             turn,
             crate::tier::Owner::Turn(turn),
@@ -854,6 +872,36 @@ impl Rel {
             alloc_slots,
             alloc_bytes,
         )
+    }
+
+    /// GDN 行票（1 行 = `row_bytes`；turn 生命周期）。
+    pub fn reserve_row(&mut self, turn: u64) -> StoreResult<Grant> {
+        let bytes = self.state.row_bytes();
+        self.reserve_direct(turn, ReservationKind::Row, 1, bytes, 1, bytes)
+    }
+
+    /// 前缀回灌票（`blocks` 个 KV 槽；turn 生命周期）。
+    pub fn reserve_load(&mut self, turn: u64, blocks: usize) -> StoreResult<Grant> {
+        let bytes = blocks
+            .checked_mul(self.leg.slot_bytes())
+            .ok_or_else(|| StoreError::Budget("reserve_load: 字节溢出".into()))?;
+        self.reserve_direct(turn, ReservationKind::Load, blocks, bytes, blocks, bytes)
+    }
+
+    /// 快照设备槽票（1 条 = `snap_bytes`；turn 生命周期）。
+    pub fn reserve_snap(&mut self, turn: u64) -> StoreResult<Grant> {
+        let bytes = self.snap_bytes;
+        self.reserve_direct(turn, ReservationKind::Snap, 1, bytes, 1, bytes)
+    }
+
+    /// 临时工作区票（调用方给槽/字节；turn 生命周期或调用方显式归还）。
+    pub fn reserve_temp(
+        &mut self,
+        turn: u64,
+        slots: usize,
+        bytes: usize,
+    ) -> StoreResult<Grant> {
+        self.reserve_direct(turn, ReservationKind::Temp, slots, bytes, slots, bytes)
     }
 
     /// 消费一张票的额度(只减 remaining;总额保留给准入面)。
@@ -878,12 +926,16 @@ impl Rel {
 
     /// 准入面:已批准总量(槽;含已兑现的活跃块,不能减)。
     pub fn reserved_slots(&self) -> usize {
-        self.reservations.reserved_slots()
+        // 准入/槽位策略只读 KV 地板；Row/Snap/Load/Temp 是分维度票，
+        // 不能污染 `reserved_pages`。
+        self.reservations
+            .reserved_slots_of(ReservationKind::ActiveFloor)
     }
 
     /// 准入面:已批准总字节。
     pub fn reserved_bytes(&self) -> usize {
-        self.reservations.reserved_bytes()
+        self.reservations
+            .reserved_bytes_of(ReservationKind::ActiveFloor)
     }
 
     /// 在册 turn 数(槽位策略用)。
@@ -1332,8 +1384,11 @@ impl Rel {
             state: self.state.stats(),
             active_turns: self.admission.active_turns(),
             reserved_bytes: self.admission.reserved_bytes(),
-            reserved_slots: self.reservations.reserved_slots(),
+            reserved_slots: self
+                .reservations
+                .reserved_slots_of(ReservationKind::ActiveFloor),
             in_flight_turns: self.reservations.in_flight_turns(),
+            grants: self.reservations.report(),
             session_held_bytes: self.admission.session_held_bytes(),
             elastic_bytes: self.admission.elastic_bytes(),
             cache_bytes: self.admission.cache_bytes(),
@@ -1389,7 +1444,7 @@ impl Rel {
     /// 归属规则(有意保守,不猜):
     /// - KV 块(设备/宿主)= `Cache`(跨会话共享,无单会话归属);
     /// - 快照(设备/宿主)= `Cache`(Durable 可下沉 / Transient 逐出即丢,都是缓存面);
-    /// - GDN 行 = `System`(逐会话归属需引擎的会话表;接线后再细化,不猜)。
+    /// - GDN 行 = 借行时登记的 `Turn(t)`（P1-5；无归属兜底 `System`）。
     fn leg_accounting(&self) -> crate::tier::TierReport {
         let mut owners: Vec<crate::tier::OwnerRow> = Vec::new();
         let mut rows: Vec<crate::tier::TierRow> = Vec::new();
@@ -1474,16 +1529,38 @@ impl Rel {
             st.snap_host.1,
             st.snap_host.0,
         );
+        // P1-5：GDN 行按借行 owner 分组；正常 = `Turn(t)`。
         let rows_in_use = st.rows_total.saturating_sub(st.rows_free);
-        push(
-            &mut owners,
-            &mut rows,
-            crate::tier::Owner::System,
-            Tier::Gpu,
-            AssetKind::Row,
-            rows_in_use * self.state.row_bytes(),
-            rows_in_use,
-        );
+        let mut row_groups: std::collections::BTreeMap<crate::tier::Owner, usize> =
+            std::collections::BTreeMap::new();
+        for (_row, owner) in self.state.row_owners() {
+            *row_groups.entry(owner).or_insert(0) += 1;
+        }
+        let mut owned_rows = 0usize;
+        for (owner, n) in row_groups {
+            owned_rows += n;
+            push(
+                &mut owners,
+                &mut rows,
+                owner,
+                Tier::Gpu,
+                AssetKind::Row,
+                n * self.state.row_bytes(),
+                n,
+            );
+        }
+        let unowned = rows_in_use.saturating_sub(owned_rows);
+        if unowned > 0 {
+            push(
+                &mut owners,
+                &mut rows,
+                crate::tier::Owner::System,
+                Tier::Gpu,
+                AssetKind::Row,
+                unowned * self.state.row_bytes(),
+                unowned,
+            );
+        }
         crate::tier::TierReport {
             rows,
             owners,
@@ -1769,7 +1846,7 @@ mod tests {
         );
 
         // 状态腿到位 ⇒ Exact
-        let row = r.state.borrow_row().expect("借行");
+        let row = r.state.borrow_row(crate::tier::Owner::Turn(1)).expect("借行");
         r.state
             .return_row(row, Some(id.snap_key()))
             .expect("落快照");
@@ -1785,10 +1862,11 @@ mod tests {
             let mut table = Vec::new();
             r.ensure_for_len_unreserved(&mut table, 32).expect("块表");
             r.register_chain(t, &table).expect("登记");
+            r.release_table(&mut table).expect("会话表归还");
         }
         let a = r.leg.tail_hash(&ta, 1).expect("A 身份");
         let b = r.leg.tail_hash(&tb, 1).expect("B 身份");
-        let row = r.state.borrow_row().expect("借行");
+        let row = r.state.borrow_row(crate::tier::Owner::Turn(1)).expect("借行");
         r.state
             .return_row(row, Some(SnapKey::at_boundary(ChainHash::new(9))))
             .expect("快照");
@@ -1798,7 +1876,8 @@ mod tests {
             Need {
                 slots: 1,
                 snap_bytes: 162_000_000,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: NeedWhy::Pressure,
             },
             &Protected {
@@ -1839,7 +1918,8 @@ mod tests {
             Need {
                 slots: 1,
                 snap_bytes: 0,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: NeedWhy::Pressure,
             },
             &Protected {
@@ -1887,7 +1967,8 @@ mod tests {
             Need {
                 slots: 0,
                 snap_bytes: 3 * BLOCK_BYTES,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: NeedWhy::Pressure,
             },
             &Protected::default(),
@@ -1947,7 +2028,8 @@ mod tests {
             Need {
                 slots: 1,
                 snap_bytes: 0,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: NeedWhy::Pressure,
             },
             &Protected::default(),
@@ -2009,7 +2091,7 @@ mod tests {
             .expect("A 入宿主");
         assert_eq!(r.leg.host_free_slots(), 0);
 
-        let v = r.plan_need(Need::host(1), &Protected::default());
+        let v = r.plan_need(Need::host(1, 0), &Protected::default());
         assert!(v.deny.is_none(), "宿主有盘位 ⇒ 不拒:{:?}", v.deny);
         assert!(
             v.out.iter().all(|o| o.sink() != Sink::Host),
@@ -2062,7 +2144,7 @@ mod tests {
         }
         assert_eq!(r.leg.host_free_slots(), 0);
 
-        let v = r.plan_need(Need::host(1), &Protected::default());
+        let v = r.plan_need(Need::host(1, 0), &Protected::default());
         assert!(v.deny.is_none(), "前缀够配额 ⇒ 不拒:{:?}", v.deny);
         assert_eq!(
             v.out,
@@ -2203,7 +2285,8 @@ mod tests {
             Need {
                 slots: 1,
                 snap_bytes: 0,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: NeedWhy::Pressure,
             },
             &Protected::default(),
@@ -2308,7 +2391,8 @@ mod tests {
             Need {
                 slots: 0,
                 snap_bytes: 2 * BLOCK_BYTES,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: NeedWhy::Pressure,
             },
             &Protected::default(),
@@ -2325,6 +2409,122 @@ mod tests {
                 .iter()
                 .all(|o| !matches!(o, EvictOut::Snap { sink: Sink::Disk, key } if *key == k_tr)),
             "Transient 不写盘:{v:?}"
+        );
+    }
+
+    /// **HostPressure 快照配额**：宿主快照腿只出 `host_snap_slots` 张 Disk 票，
+    /// 不与 KV 配额合并；Transient 仍不写盘。
+    #[test]
+    fn host_pressure_limits_snapshot_tickets_independently() {
+        let mut i = inputs();
+        i.disk_bytes = 8 << 20;
+        let mut cfg = kv_cfg(8, 8);
+        cfg.host_bytes = i.host_bytes;
+        let mut r = Rel::open(
+            i.clone(),
+            AdmissionPolicy::new(2, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+        )
+        .expect("装配");
+        r.attach_snap_layout(crate::leg::PoolLayout {
+            class: crate::leg::BlockClass::GdnRow,
+            epoch: 1,
+            pieces: vec![crate::leg::PieceSpec {
+                buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                stride_bytes: BLOCK_BYTES,
+            }],
+        })
+        .expect("状态腿布局");
+        r.attach_disk("/tmp/owl-disk-test-host-snap-quota", 0, 4 << 20)
+            .expect("接盘");
+        for n in 0..3 {
+            let k = SnapKey::at_boundary(ChainHash::new(0xE0 + n));
+            r.state
+                .register_snap(k, BLOCK_BYTES, Tier::Host, SnapDurability::Durable);
+        }
+        let k_tr = SnapKey::at_boundary(ChainHash::new(0xEF));
+        r.state
+            .register_snap(k_tr, BLOCK_BYTES, Tier::Host, SnapDurability::Transient);
+
+        let v = r.plan_need(Need::host(0, 1), &Protected::default());
+        assert!(v.deny.is_none(), "一张快照配额够 ⇒ 不拒:{:?}", v.deny);
+        let disk_snaps = v
+            .out
+            .iter()
+            .filter(|o| matches!(o, EvictOut::Snap { sink: Sink::Disk, .. }))
+            .count();
+        assert_eq!(disk_snaps, 1, "只出一张快照 Disk 票:{v:?}");
+        assert!(
+            v.out
+                .iter()
+                .all(|o| !matches!(o, EvictOut::Kv { .. } | EvictOut::Snap { sink: Sink::Host, .. } | EvictOut::Snap { sink: Sink::Drop, .. })),
+            "HostPressure 不应出 KV/Host/Drop 票:{v:?}"
+        );
+    }
+
+    /// **HostPressure 两腿同时低**：KV 票与快照票各自独立，互不折算。
+    #[test]
+    fn host_pressure_keeps_kv_and_snapshot_goals_independent() {
+        let mut i = inputs();
+        i.disk_bytes = 8 << 20;
+        let mut cfg = kv_cfg(64, 32);
+        cfg.host_bytes = BLOCK_BYTES; // KV 宿主 1 块
+        let mut r = Rel::open(
+            i.clone(),
+            AdmissionPolicy::new(2, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+        )
+        .expect("装配");
+        r.attach_snap_layout(crate::leg::PoolLayout {
+            class: crate::leg::BlockClass::GdnRow,
+            epoch: 1,
+            pieces: vec![crate::leg::PieceSpec {
+                buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                stride_bytes: BLOCK_BYTES,
+            }],
+        })
+        .expect("状态腿布局");
+        r.attach_disk("/tmp/owl-disk-test-host-both", 4 << 20, 4 << 20)
+            .expect("接盘");
+        let kv_tokens = toks(32);
+        let mut table = Vec::new();
+        r.ensure_for_len_unreserved(&mut table, 32).expect("块表");
+        r.register_chain(&kv_tokens, &table).expect("登记");
+        r.release_table(&mut table).expect("归还");
+        let kv_tail = r.leg.tail_hash(&kv_tokens, 1).expect("KV 尾");
+        r.leg
+            .put_host(
+                kv_tail,
+                crate::host::HostBlock::from_bytes(vec![3u8; BLOCK_BYTES]),
+            )
+            .expect("KV 入宿主");
+        let snap = SnapKey::at_boundary(ChainHash::new(0xF1));
+        r.state
+            .register_snap(snap, BLOCK_BYTES, Tier::Host, SnapDurability::Durable);
+
+        let v = r.plan_need(Need::host(1, 1), &Protected::default());
+        assert!(v.deny.is_none(), "两腿都有盘位 ⇒ 不拒:{:?}", v.deny);
+        assert_eq!(
+            v.out
+                .iter()
+                .filter(|o| matches!(o, EvictOut::Kv { sink: Sink::Disk, span: 1, .. }))
+                .count(),
+            1,
+            "KV 应出 1 张前缀票:{v:?}"
+        );
+        assert_eq!(
+            v.out
+                .iter()
+                .filter(|o| matches!(o, EvictOut::Snap { sink: Sink::Disk, .. }))
+                .count(),
+            1,
+            "快照应出 1 张票:{v:?}"
+        );
+        assert!(
+            v.out.iter().all(|o| o.sink() != Sink::Host && o.sink() != Sink::Drop),
+            "HostPressure 不得 Host/Drop:{v:?}"
         );
     }
 
@@ -2461,7 +2661,8 @@ mod tests {
         let need = |slots: usize| crate::hooks::Need {
             slots,
             snap_bytes: 0,
-            host_slots: 0,
+            host_kv_slots: 0,
+            host_snap_slots: 0,
             why: crate::hooks::NeedWhy::Pressure,
         };
         let v = r.plan_need(need(8), &Protected::default());
@@ -2512,7 +2713,8 @@ mod tests {
             crate::hooks::Need {
                 slots: 30,
                 snap_bytes: 0,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: crate::hooks::NeedWhy::Pressure,
             },
             &Protected::default(),
@@ -2552,7 +2754,8 @@ mod tests {
             crate::hooks::Need {
                 slots: 30,
                 snap_bytes: 0,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: crate::hooks::NeedWhy::Pressure,
             },
             &Protected::default(),
@@ -2796,7 +2999,8 @@ mod tests {
             Need {
                 slots: 0,
                 snap_bytes: BLOCK_BYTES,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: NeedWhy::Pressure,
             },
             &Protected::default(),
@@ -2838,7 +3042,8 @@ mod tests {
             Need {
                 slots: 0,
                 snap_bytes: BLOCK_BYTES,
-                host_slots: 0,
+                host_kv_slots: 0,
+                host_snap_slots: 0,
                 why: NeedWhy::Pressure,
             },
             &Protected::default(),
@@ -2875,7 +3080,20 @@ mod tests {
         r.admission.admit(1, 0, 0).expect("活跃 turn");
         r.admission.set_floor(1, 4 << 20).expect("实占");
         r.admission.set_elastic(1, 1 << 20).expect("弹性");
+        let row = r
+            .state
+            .borrow_row(crate::tier::Owner::Turn(7))
+            .expect("借行");
         let rep = r.report();
+        let row_owner = rep
+            .tiers
+            .owners
+            .iter()
+            .find(|o| o.owner == crate::tier::Owner::Turn(7) && o.kind == AssetKind::Row)
+            .expect("行归属应报 Turn(7)");
+        assert_eq!(row_owner.entries, 1);
+        assert_eq!(row_owner.bytes, r.state.row_bytes());
+        r.state.return_row(row, None).expect("还行");
         assert_eq!(rep.active_turns, 1);
         assert_eq!(rep.reserved_bytes, 4 << 20);
         assert_eq!(rep.elastic_bytes, 1 << 20);
@@ -2890,6 +3108,31 @@ mod tests {
     ///
     /// 原 `report()` 只取 ledger 的 `host_used`(Index 行),腿的 Host KvBlock
     /// 只进 rows/owners ⇒ 260k kvmem 档报 204MiB,实际约 5GiB。
+    /// **Grant 分用途账**：Row/Load/Snap/Temp 不污染 KV `reserved_slots`。
+    #[test]
+    fn grant_ledger_keeps_kinds_separate() {
+        let mut r = rel(2);
+        let floor = r
+            .reserve_capacity(1, 2, 2, crate::reservations::ReservationKind::ActiveFloor)
+            .expect("floor");
+        assert_eq!(floor.kind, crate::reservations::ReservationKind::ActiveFloor);
+        r.reserve_row(1).expect("row");
+        r.reserve_load(1, 3).expect("load");
+        r.reserve_snap(1).expect("snap");
+        r.reserve_temp(1, 2, 2 << 20).expect("temp");
+
+        assert_eq!(r.reserved_slots(), 2, "KV 准入只读 ActiveFloor");
+        let report = r.report();
+        let kinds: Vec<_> = report.grants.iter().map(|g| g.kind).collect();
+        assert!(kinds.contains(&"active_floor"), "{report:?}");
+        assert!(kinds.contains(&"row"), "{report:?}");
+        assert!(kinds.contains(&"load"), "{report:?}");
+        assert!(kinds.contains(&"snap"), "{report:?}");
+        assert!(kinds.contains(&"temp"), "{report:?}");
+        r.release_turn_grants(1);
+        assert_eq!(r.reserved_slots(), 0);
+    }
+
     #[test]
     fn report_host_used_includes_leg_host_blocks() {
         let mut r = rel(2);

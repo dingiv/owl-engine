@@ -909,6 +909,18 @@ impl BlockLeg {
         self.kv.evict_candidates(protect)
     }
 
+    /// 设备叶是否**缓存独占**(`refs == 1`)⇒ 可作为 Drop 候选。
+    ///
+    /// `evict_candidates` 只保证"叶 + 未保护";活跃 turn/会话持着的块
+    /// `refs > 1`，plan 若把它们列入 Drop 票，执行侧只会 `Busy` 跳过 ——
+    /// 这是 plan 级过度承诺。本方法把该前置条件显式化。
+    pub fn device_leaf_is_cache(&self, chain: ChainHash) -> bool {
+        self.kv
+            .bound_slot(chain)
+            .map(|slot| self.kv.slot_refs(slot) == 1)
+            .unwrap_or(false)
+    }
+
     /// 一块现在在哪(不在账里 = 响亮拒)。
     pub fn carrier_of(&self, chain: ChainHash) -> StoreResult<Carrier> {
         match self.kv.locate(chain) {
