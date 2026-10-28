@@ -56,6 +56,7 @@ async fn load_once<F: DeviceClient>(
         dtype: spec.dtype,
         shard: n,
         slice_id: id,
+        head_split: false,
         device_repack: Some(false), // CPU 面不设备重排
         verify: false,
         debug_tap: false,

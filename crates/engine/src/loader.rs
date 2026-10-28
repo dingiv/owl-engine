@@ -180,6 +180,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         LoadOpts {
             shard: n,
             slice_id: id,
+            head_split: self.vocab_split,
             verify: self.load.verify,
             debug_tap: self.load.debug_tap,
             staging_mb: self.load.staging_mb,
@@ -282,8 +283,11 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         // TP 分片(W-1,2026-10-19):**源自担** —— 块对齐列切 + v-head grouped
         // 聚合都在 `GgufSource` 里(`owns_shard`);开箱即逐键验可分片性
         // (不整除/块不对齐/按头不可分 ⇒ 响亮拒)。见设计 §14.6/§15。
-        let sel = (self.slice.1 > 1)
-            .then_some(owl_models::formats::gguf::ShardSel { id: self.slice.0, world: self.slice.1 });
+        let sel = (self.slice.1 > 1).then_some(owl_models::formats::gguf::ShardSel {
+            id: self.slice.0,
+            world: self.slice.1,
+            head_split: self.vocab_split,
+        });
         // metrics 早 init(与 27B 装载同律):`/debug/metrics` 的 `decode.step`
         // 等直用 API 记账需要 store 在场;server 入口已 init(幂等,`let _ =`)。
         let _ = owl_shared::metrics::init_metrics(owl_shared::metrics::MetricsStore::new());

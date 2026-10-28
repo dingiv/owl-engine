@@ -7,7 +7,9 @@
 #   单卡: ./target/release/server -p profiles/measurement/qwen38_27b-gguf.toml
 #   TP2 : ./target/release/server -p profiles/measurement/qwen38_27b-gguf.toml \
 #           --set parallel.mode=tensor --set parallel.device='["3090","3090"]' \
-#           --set parallel.tp_ar_f8=true --set parallel.tp_ar='"ar2"' 
+#           --set parallel.tp_ar_f8=true --set parallel.tp_ar='"ar2"'
+#   词表切: 追加 `--set parallel.tp_vocab_split=true`
+#   (2026-10-28 起 GGUF 的 `output.weight` 按行窗口分片;untied head 才能开)
 extends = [
   "../full.toml",
   "../parts/model/27b-gguf-q4km.toml",

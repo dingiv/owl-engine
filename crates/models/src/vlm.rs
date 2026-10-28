@@ -455,6 +455,7 @@ impl Vlm {
             dtype: ctx.dtype,
             shard: ctx.shard,
             slice_id: ctx.slice_id,
+            head_split: false,
             device_repack: Some(ctx.device_repack),
             verify: ctx.verify,
             debug_tap: ctx.debug_tap,

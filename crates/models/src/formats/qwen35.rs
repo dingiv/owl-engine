@@ -606,6 +606,7 @@ mod tests {
             dtype: draft_exec_dt(),
             shard: 1,
             slice_id: 0,
+            head_split: false,
             device_repack: Some(
                 crate::module::RepackPath::resolve(device_repack, face.device_kernels())
                     .is_device(),

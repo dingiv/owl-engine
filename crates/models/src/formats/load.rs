@@ -40,6 +40,8 @@ pub struct LoadOpts {
     pub shard: usize,
     /// **本切片 id**(S4 ②;`0..shard`)
     pub slice_id: usize,
+    /// **GGUF lm_head 词表切**(TP;`true` ⇒ `output.weight` 按行窗口分片)
+    pub head_split: bool,
     /// 设备重排(量化族;**已裁决结果**;`None` = 能力自述裁决)
     pub device_repack: Option<bool>,
     /// 装载校验(整块回读对账)
@@ -63,6 +65,7 @@ impl LoadOpts {
             dtype,
             shard: 1,
             slice_id: 0,
+            head_split: false,
             device_repack: Some(
                 crate::module::RepackPath::resolve(None, face.device_kernels()).is_device(),
             ),
@@ -77,7 +80,7 @@ impl LoadOpts {
     /// 非量化/固定档(无设备重排 + 零探针):裸 safetensors f16 直拷、
     /// W4A16-CPU 重排等"不需要能力裁决"的装载点。
     pub fn plain(dtype: crate::contract::Dtype) -> Self {
-        Self { dtype, shard: 1, slice_id: 0, device_repack: Some(false), verify: false, debug_tap: false, staging_mb: 128, dump: false, gguf_dequant: false }
+        Self { dtype, shard: 1, slice_id: 0, head_split: false, device_repack: Some(false), verify: false, debug_tap: false, staging_mb: 128, dump: false, gguf_dequant: false }
     }
 
     /// 装载 ctx(旋钮 → LoaderCtx;唯一产地)
@@ -218,6 +221,7 @@ where
                 let sel = (opts.shard > 1).then_some(crate::formats::gguf::ShardSel {
                     id: opts.slice_id,
                     world: opts.shard,
+                    head_split: opts.head_split,
                 });
                 let src = crate::formats::gguf::GgufSource::open_shard(path, sel)?;
                 load_component(face, comp, &src, opts).await
@@ -1601,6 +1605,7 @@ mod generic_entry_tests {
             dtype: spec.dtype,
             shard: 1,
             slice_id: 0,
+            head_split: false,
             device_repack: Some(false),
             verify: false,
             debug_tap: false,
@@ -1745,6 +1750,7 @@ mod generic_entry_tests {
             dtype: crate::contract::Dtype::F16,
             shard: 1,
             slice_id: 0,
+            head_split: false,
             device_repack: Some(true), // 生产档(设备 marlin 重排)
             verify: false,
             debug_tap: false,

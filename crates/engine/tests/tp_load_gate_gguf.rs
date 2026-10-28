@@ -122,7 +122,7 @@ fn gguf_shard_reads_equal_grouped_windows_all_keys() {
             grouped_full(&full, key)
         };
         for rank in 0..2usize {
-            let sel = ShardSel { id: rank, world: 2 };
+            let sel = ShardSel { id: rank, world: 2, head_split: false };
             let Some(g) = geom_of(key, &d, &f, Some(sel)).expect("geom") else {
                 n_skip += 1;
                 continue;
@@ -192,7 +192,7 @@ fn sharded_plan_shapes_match_source_elem_len() {
     let full = GgufSource::open(&path).expect("全量源");
     let (spec0, _rep) = spec_from_gguf(full.gguf()).expect("spec");
     for rank in 0..2 {
-        let sel = ShardSel { id: rank, world: 2 };
+        let sel = ShardSel { id: rank, world: 2, head_split: false };
         let spec = spec0.sharded(TpPlan::new(rank, 2).expect("plan")).expect("shard spec");
         let src = GgufSource::open_shard(&path, Some(sel)).expect("分片源");
         let plan = GgufPlan::for_shard(src.gguf(), *src.dims(), sel);
@@ -237,5 +237,60 @@ fn sharded_plan_shapes_match_source_elem_len() {
             "[rank{rank}] 量化字节 {bytes} 超出 文件/2 + 20%({})",
             file / 2 + file / 5
         );
+    }
+}
+
+/// **GGUF 词表切装载账**(2026-10-28):`output.weight` 开 `head_split` 后
+/// 计划表/源/层声明三方对齐,且每 rank 只交付半表。
+#[test]
+fn gguf_head_split_plan_and_source_match() {
+    if !resource_ok("gguf:27b") {
+        owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
+        return;
+    }
+    let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));
+    let full = GgufSource::open(&path).expect("全量源");
+    let full_head = full
+        .elem_len("output.weight")
+        .expect("elem_len(full)")
+        .expect("output.weight 在");
+    let (mut spec0, _rep) = spec_from_gguf(full.gguf()).expect("spec");
+    spec0.head_split = true;
+    for rank in 0..2 {
+        let sel = ShardSel { id: rank, world: 2, head_split: true };
+        let spec = spec0
+            .sharded(TpPlan::new(rank, 2).expect("plan"))
+            .expect("shard spec");
+        assert_eq!(spec.head_vocab * 2, spec.vocab, "rank{rank} 半表");
+        let src = GgufSource::open_shard(&path, Some(sel)).expect("分片源");
+        let plan = GgufPlan::for_shard(src.gguf(), *src.dims(), sel);
+        let keys = GgufConvention::new();
+        let ps = PlanSource::keyed(&plan, &keys, SourceFacts::GGUF_TP);
+        let model = Model::new(&spec, keys, ps, ps).expect("Model::new(head split)");
+        let ctx = LoaderCtx {
+            dtype: Dtype::F16,
+            shard: 2,
+            slice_id: rank,
+            ..Default::default()
+        };
+        let ops = model.layout(&ctx);
+        for w in ops.wants() {
+            let n: usize = w.shape.iter().product();
+            let got = src.elem_len(&w.key).expect("elem_len").unwrap_or_else(|| {
+                panic!("[rank{rank}] 键 {} 在源里不存在", w.key)
+            });
+            assert_eq!(
+                got, n,
+                "[rank{rank}] 键 {} 的源交付量 {got} ≠ 声明形状 {:?} = {n}",
+                w.key, w.shape
+            );
+        }
+        let head = src
+            .elem_len("output.weight")
+            .expect("elem_len(head)")
+            .expect("output.weight 在");
+        assert_eq!(head * 2, full_head, "[rank{rank}] output.weight 应为半表");
+        let unresolved = plan.take_unresolved();
+        assert!(unresolved.is_empty(), "[rank{rank}] 计划表未解析:{unresolved:?}");
     }
 }

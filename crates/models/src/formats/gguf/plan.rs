@@ -65,7 +65,7 @@ impl<'g> GgufPlan<'g> {
         -> Result<(usize, usize), String>
     {
         let Some((dims, sel)) = self.tp else { return Ok((out_dim, in_dim)) };
-        let role = role_of(key, &dims).map_err(|e| e.to_string())?;
+        let role = role_of(key, &dims, sel.head_split).map_err(|e| e.to_string())?;
         let w = sel.world;
         Ok(match role {
             Role::Replicate => (out_dim, in_dim),

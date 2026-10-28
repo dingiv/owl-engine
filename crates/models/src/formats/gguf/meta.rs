@@ -209,8 +209,9 @@ pub fn spec_from_gguf(g: &Gguf) -> Result<(ModelSpec, GgufSpecReport), ModelErro
             chat: family_chat_format(),
         },
         tied,
-        // 词表切(P1.1,main 并入):单 rank 恒不切;GGUF 的 `output.weight` 是
-        // Q6_K 整表(W-1 的 TP 只切内维)⇒ 此处恒 false/全量
+        // 词表切(P1.1,main 并入):缺省不切/全量;TP 装载器按
+        // `runtime.tp_vocab_split` 覆盖 `head_split`,并由 `ShardSel.head_split`
+        // 让 `output.weight` 走行窗口(untied head 的 Q6_K 半表)。
         head_split: false,
         head_vocab: vocab,
     };

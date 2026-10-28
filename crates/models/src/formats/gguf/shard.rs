@@ -40,7 +40,8 @@
 //! | `ssm_alpha` / `ssm_beta` / `ssm_a` / `ssm_dt` | `OutHead` | 同上(head_dim = 1) |
 //! | `ffn_down` / `attn_output` | `In` | 每行的块对齐列窗口 |
 //! | `ssm_out` | `InHead` | 每行的 **v-head grouped** 列窗口(逐头一段) |
-//! | 其余(norm / embed / output / q_norm / k_norm / ssm_norm) | `Replicate` | 全量 |
+//! | `output`(仅 `ShardSel.head_split`) | `Out` | 行窗口(lm_head 半表) |
+//! | 其余(norm / embed / q_norm / k_norm / ssm_norm) | `Replicate` | 全量 |
 //!
 //! # 三条响亮拒(不静默出错值)
 //!
@@ -58,6 +59,8 @@ use super::transform::{classify, GdnPart, GgufDims, KeyClass};
 pub struct ShardSel {
     pub id: usize,
     pub world: usize,
+    /// 是否切 lm_head 词表(GGUF `output.weight` 按行窗口;`false` = 整表复制)
+    pub head_split: bool,
 }
 
 impl ShardSel {
@@ -112,7 +115,7 @@ pub enum Role {
 
 /// 键 → 角色(**唯一映射点**;未知层内键 = `Replicate`,由首 token 门兜底)。
 /// 段长来自维度事实 `d`;`attn_q` 的 per-head 交错布局不需要张量几何输入。
-pub fn role_of(key: &str, d: &GgufDims) -> Result<Role, ModelError> {
+pub fn role_of(key: &str, d: &GgufDims, head_split: bool) -> Result<Role, ModelError> {
     let (k, v) = (d.nk * d.hk, d.nv * d.hv);
     Ok(match classify(key) {
         KeyClass::Gdn(GdnPart::Qkv) => Role::Segs { lens: vec![k, k, v], tail_perm: true },
@@ -123,6 +126,9 @@ pub fn role_of(key: &str, d: &GgufDims) -> Result<Role, ModelError> {
         KeyClass::Gdn(GdnPart::Conv) => Role::Segs { lens: vec![k, k, v], tail_perm: true },
         KeyClass::Gdn(GdnPart::Out) => Role::InHead,
         KeyClass::Gdn(GdnPart::Norm) => Role::Replicate,
+        // 词表切档:GGUF 的 `output.weight` 是普通 2-D 行表(untied head),
+        // 与 v-head 无关 ⇒ 走 `Out` 的行窗口;未开切时仍整表复制。
+        KeyClass::Head if head_split => Role::Out,
         KeyClass::Embed | KeyClass::Head | KeyClass::Norm | KeyClass::Unknown => Role::Replicate,
         KeyClass::Plain => {
             // 层内局部名(`blk.N.` 之后、`.weight`/`.bias` 之前)
@@ -216,7 +222,7 @@ pub fn geom_of(
     sel: Option<ShardSel>,
 ) -> Result<Option<KeyGeom>, ModelError> {
     let Some(sel) = sel else { return Ok(None) };
-    let role = role_of(key, d)?;
+    let role = role_of(key, d, sel.head_split)?;
     if role == Role::Replicate {
         return Ok(None);
     }
@@ -392,8 +398,8 @@ mod tests {
         };
         let d = facts(&g);
         assert_eq!((d.nk, d.hk, d.nv, d.hv), (16, 128, 48, 128), "27B v-head 事实");
-        let sel = ShardSel { id: 0, world: 2 };
-        let sel1 = ShardSel { id: 1, world: 2 };
+        let sel = ShardSel { id: 0, world: 2, head_split: false };
+        let sel1 = ShardSel { id: 1, world: 2, head_split: false };
         let case = |k: &str, want: KeyGeom| {
             let t = g.get_tensor(k).unwrap_or_else(|| panic!("缺键 {k}"));
             let got = geom_of(k, &d, &tf(t), Some(sel)).unwrap().unwrap_or_else(|| panic!("{k} 未切"));
@@ -545,7 +551,7 @@ mod tests {
                 quantized: false,
             }
         );
-        // ── Replicate:norm / embed / output ────────────────────────
+        // ── Replicate:norm / embed / output(未开词表切)────────────
         for k in ["blk.0.attn_norm.weight", "blk.0.ssm_norm.weight", "token_embd.weight", "output.weight"] {
             let t = g.get_tensor(k).unwrap();
             assert!(
@@ -553,6 +559,52 @@ mod tests {
                 "[{k}] 应不切(Replicate)"
             );
         }
+    }
+
+    /// **GGUF 词表切几何**(2026-10-28):`output.weight` 是普通 2-D 行表,
+    /// 开 `head_split` 后每 rank 取连续半行;未开切仍是整表复制。
+    #[test]
+    fn head_split_geometry_27b_is_half_rows() {
+        let Some(g) = open("gguf:27b") else {
+            owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
+            return;
+        };
+        let d = facts(&g);
+        let t = g.get_tensor("output.weight").expect("output.weight");
+        let f = tf(t);
+        let g0 = geom_of(
+            "output.weight",
+            &d,
+            &f,
+            Some(ShardSel { id: 0, world: 2, head_split: true }),
+        )
+        .expect("geom")
+        .expect("head_split 应切");
+        let g1 = geom_of(
+            "output.weight",
+            &d,
+            &f,
+            Some(ShardSel { id: 1, world: 2, head_split: true }),
+        )
+        .expect("geom")
+        .expect("head_split 应切");
+        assert_eq!(g0.shape, Shape::Mat { wins: vec![(0, 124160)], rows: 124160 });
+        assert_eq!(g1.shape, Shape::Mat { wins: vec![(124160, 124160)], rows: 124160 });
+        assert_eq!(g0.cols, Cols::Full);
+        assert_eq!(g0.row_atoms, 20, "Q6_K 内维 5120 / 256");
+        assert_eq!(g0.atom_bytes, 210, "Q6_K 块字节");
+        assert_eq!(g0.len() + g1.len(), f.rows * (f.inner / 256) * 210);
+        assert!(
+            geom_of(
+                "output.weight",
+                &d,
+                &f,
+                Some(ShardSel { id: 0, world: 2, head_split: false }),
+            )
+            .expect("geom")
+            .is_none(),
+            "未开词表切时 output.weight 应整表复制"
+        );
     }
 
     /// **几何自洽门**:对 27B 每个键,
@@ -573,7 +625,7 @@ mod tests {
             let (be, _bb) = t.ty.block();
             let native = t.ty.native_dtype().is_some();
             let geom = |id: usize| {
-                geom_of(key, &d, &f, Some(ShardSel { id, world: 2 }))
+                geom_of(key, &d, &f, Some(ShardSel { id, world: 2, head_split: false }))
                     .unwrap_or_else(|e| panic!("[{key}] rank{id}: {e}"))
             };
             let (Some(g0), Some(g1)) = (geom(0), geom(1)) else {
@@ -624,19 +676,19 @@ mod tests {
     fn misalignment_is_loud() {
         let d = GgufDims { nk: 16, nv: 48, hk: 128, hv: 128, nq: 24, nkv: 4 };
         let f = TensorFacts { ty: GgmlTy::Q4K, rows: 100, inner: 5120 };
-        let e = geom_of("blk.0.ffn_gate.weight", &d, &f, Some(ShardSel { id: 0, world: 8 }))
+        let e = geom_of("blk.0.ffn_gate.weight", &d, &f, Some(ShardSel { id: 0, world: 8, head_split: false }))
             .unwrap_err()
             .to_string();
         assert!(e.contains("不被 world"), "{e}");
         // 列切不落块边界:inner 5120 / world 3(量化块 256)⇒ 响亮拒
-        let e = geom_of("blk.0.ffn_down.weight", &d, &f, Some(ShardSel { id: 0, world: 3 }))
+        let e = geom_of("blk.0.ffn_down.weight", &d, &f, Some(ShardSel { id: 0, world: 3, head_split: false }))
             .unwrap_err()
             .to_string();
         assert!(e.contains("不落块边界") || e.contains("不被 world"), "{e}");
         // ssm_out 的 hv 不被原子整除 ⇒ 按头不可分 ⇒ TP 拒
         let d2 = GgufDims { nk: 16, nv: 48, hk: 128, hv: 100, nq: 24, nkv: 4 };
         let f2 = TensorFacts { ty: GgmlTy::Q8_0, rows: 5120, inner: 4800 };
-        let e = geom_of("blk.0.ssm_out.weight", &d2, &f2, Some(ShardSel { id: 0, world: 2 }))
+        let e = geom_of("blk.0.ssm_out.weight", &d2, &f2, Some(ShardSel { id: 0, world: 2, head_split: false }))
             .unwrap_err()
             .to_string();
         assert!(e.contains("不是原子"), "{e}");
