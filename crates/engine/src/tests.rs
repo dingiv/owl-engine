@@ -174,6 +174,31 @@ async fn mock_snap_engine(
     engine.run(loaded).await.expect("装配")
 }
 
+/// **P2-2 图 slab 实测回填门**：GraphFleet 捕获后，MemoryPlan 的 GraphSlab
+/// 必须标为 `Measured`；WarmupMisc 仍保留 `Conservative`（瞬态上界语义不变）。
+#[cfg(test)]
+#[tokio::test]
+async fn memory_plan_uses_measured_graph_slab_after_capture() {
+    let running = mock_snap_engine(1).await;
+    let plan = running.bank.rel.memory_plan().expect("MemoryPlan 应已注入");
+    let slab = plan
+        .component(owl_store::ComponentId::GraphSlab)
+        .expect("GraphSlab 项");
+    assert_eq!(
+        slab.source,
+        owl_store::PlanSource::Measured,
+        "捕获后 GraphSlab 应回填实测"
+    );
+    let warm = plan
+        .component(owl_store::ComponentId::WarmupMisc)
+        .expect("WarmupMisc 项");
+    assert_eq!(
+        warm.source,
+        owl_store::PlanSource::Conservative,
+        "Warmup 瞬态仍是保守上界"
+    );
+}
+
 /// **两腿统一调度器门(engine 侧;§30)**:store 的 `plan_need` 出 `Snap{Host}` 票
 /// 之后,engine 的执行臂(`apply_verdict`)真的把设备层快照沉到宿主 ——
 /// 验的是"判据唯一 + 执行闭环",不依赖 capture 的 churn 路径。
@@ -610,6 +635,49 @@ async fn turn_records_session_ownership_for_kv_and_snaps() {
         }
     }
     assert!(seen_depth, "快照应带边界深度(末端优先的依据)");
+}
+
+/// **P1-5 GDN 行归属门**：活跃 turn 借行时，store 报告必须把行记到
+/// `Owner::Turn(tid)`，而不是 `System`。
+#[cfg(test)]
+#[tokio::test]
+async fn gdn_row_is_owned_by_the_active_turn() {
+    let mut running = mock_snap_engine(1).await;
+    let prompt: String = (0..80)
+        .map(|i| ["alpha", "bravo", "cedar", "delta", "ember", "falcon"][i % 6])
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (_sid, tid) = running
+        .submit_session(None, &prompt, 16)
+        .expect("submit");
+    for _ in 0..4 {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败:{err}"),
+            _ => {}
+        }
+        if running.active_turn_id() == Some(tid) {
+            break;
+        }
+    }
+    assert_eq!(running.active_turn_id(), Some(tid), "turn 应仍在跑");
+    let rep = running.store_report();
+    let row = rep
+        .tiers
+        .owners
+        .iter()
+        .find(|o| {
+            o.owner == owl_store::tier::Owner::Turn(tid)
+                && o.kind == owl_store::tier::AssetKind::Row
+        })
+        .expect("行应归 Turn(tid)");
+    assert_eq!(row.entries, 1, "本 turn 应恰好借一行:{row:?}");
+    assert_eq!(row.bytes, running.bank.rel.state.row_bytes());
+    let row_grant = rep
+        .grants
+        .iter()
+        .find(|g| g.kind == "row")
+        .expect("Row Grant 应在同一本账");
+    assert_eq!(row_grant.slots, 1, "Row 票 = 1 行");
 }
 
 /// **S6.1 端到端门**:turn 收口写链索引 → 小宿主把链溢写到盘 →

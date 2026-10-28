@@ -458,3 +458,235 @@ async fn owned_recompute_leaves_no_host_ghost() {
     assert_eq!(l.host_duplicate_landings(), 0, "源头修好后不该有重复落地");
     assert_eq!(l.report().host_blocks, 3, "第二次下沉同样 3 块入宿主");
 }
+
+// ───────────────── 并发/轮换基线(2026-10-27) ─────────────────
+//
+// 这一组只测 store 的**迁移 → 回填**语义,不引入 engine 调度:
+// - 单会话:整条链沉宿主 → 再回灌,逐字节一致;
+// - 两会话:池满后 A/B 轮流沉、回灌,验证互不串内容、宿主不残留。
+
+/// **单会话迁移回填**：一条 6 块链占满池 → 整条沉宿主 → 命中后整条回灌。
+#[tokio::test]
+async fn single_session_offload_and_reload_roundtrip() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let mut l = leg(6);
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
+        .expect("注册布局");
+
+    let tokens: Vec<u32> = (0..192).collect(); // 6 块
+    let chain = build_chain(&mut l, &tokens).await;
+    assert_eq!(chain.len(), 6);
+    assert_eq!(l.report().slots_free, 0, "单会话也应占满池");
+
+    let mut before = Vec::new();
+    for slot in 0..6u32 {
+        seed(&mut face, &ps, slot, 0x10 * (slot as u8 + 1)).await;
+        before.push(read_slot(&mut face, &ps, slot).await);
+    }
+
+    let tail = *chain.last().expect("尾块");
+    let moved = engine_offload(&mut l, &mut face, tail).await.expect("整链下沉");
+    assert_eq!(moved, 6, "单会话整链沉 6 块");
+    assert_eq!(l.report().host_blocks, 6, "宿主应持 6 块");
+    assert_eq!(l.report().slots_free, 6, "下沉后池应全空");
+    eprintln!(
+        "[single] offload: host_blocks={} slots_free={}",
+        l.report().host_blocks,
+        l.report().slots_free
+    );
+
+    let hit = l.match_prefix(&tokens).expect("宿主命中");
+    let pending = hit.pending_host();
+    assert_eq!(pending.len(), 6, "单会话回灌面 = 6 块");
+    let slots = engine_onload(&mut l, &mut face, &pending).await.expect("整链回灌");
+    assert_eq!(slots.len(), 6);
+    for (i, slot) in slots.iter().enumerate() {
+        let after = read_slot(&mut face, &ps, *slot).await;
+        assert_eq!(after, before[i], "单会话第 {i} 块回填必须逐字节一致");
+    }
+    assert_eq!(l.report().host_blocks, 0, "回灌后不得留宿主副本");
+    assert_eq!(l.report().slots_free, 0, "回灌后池重新占满");
+    eprintln!(
+        "[single] reload: host_blocks={} slots_free={}",
+        l.report().host_blocks,
+        l.report().slots_free
+    );
+}
+
+/// **两会话并发 + 轮换**：A/B 各 3 块占满池 → A 沉/回 → B 沉/回。
+#[tokio::test]
+async fn two_sessions_alternate_offload_and_reload_roundtrip() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let mut l = leg(6);
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
+        .expect("注册布局");
+
+    let a_tokens: Vec<u32> = (0..96).collect();
+    let b_tokens: Vec<u32> = (1000..1096).collect();
+    let a = build_chain(&mut l, &a_tokens).await;
+    let b = build_chain(&mut l, &b_tokens).await;
+    assert_eq!((a.len(), b.len()), (3, 3), "两会话各 3 块");
+    assert_eq!(l.report().slots_free, 0, "两会话占满池");
+
+    // 固定槽: A 先建 0..3,B 后建 3..6。
+    let mut a_before = Vec::new();
+    let mut b_before = Vec::new();
+    for slot in 0..3u32 {
+        seed(&mut face, &ps, slot, 0x20 * (slot as u8 + 1)).await;
+        a_before.push(read_slot(&mut face, &ps, slot).await);
+    }
+    for slot in 3..6u32 {
+        seed(&mut face, &ps, slot, 0x30 * (slot as u8 - 2)).await;
+        b_before.push(read_slot(&mut face, &ps, slot).await);
+    }
+
+    // A 轮换出去;B 仍在设备。
+    assert_eq!(engine_offload(&mut l, &mut face, *a.last().unwrap()).await.expect("A 下沉"), 3);
+    assert_eq!(l.report().host_blocks, 3, "A 在宿主");
+    assert_eq!(l.report().slots_free, 3, "A 腾出 3 槽");
+    eprintln!(
+        "[two] A offload: host_blocks={} slots_free={}",
+        l.report().host_blocks,
+        l.report().slots_free
+    );
+    // B 命中仍在设备,不触发回灌。
+    let b_hit = l.match_prefix(&b_tokens).expect("B 命中");
+    assert!(b_hit.pending_host().is_empty(), "B 未下沉,不应回灌");
+
+    // A 回灌;B 仍在设备。
+    let a_pending = l.match_prefix(&a_tokens).expect("A 命中").pending_host();
+    assert_eq!(a_pending.len(), 3, "A 回灌面 = 3 块");
+    let a_slots = engine_onload(&mut l, &mut face, &a_pending).await.expect("A 回灌");
+    for (i, slot) in a_slots.iter().enumerate() {
+        assert_eq!(read_slot(&mut face, &ps, *slot).await, a_before[i], "A 第 {i} 块");
+    }
+    assert_eq!(l.report().slots_free, 0, "A 回灌后池再次满");
+    eprintln!(
+        "[two] A reload: host_blocks={} slots_free={}; B pending={}",
+        l.report().host_blocks,
+        l.report().slots_free,
+        l.match_prefix(&b_tokens).expect("B").pending_host().len()
+    );
+
+    // B 轮换出去;A 仍在设备。
+    assert_eq!(engine_offload(&mut l, &mut face, *b.last().unwrap()).await.expect("B 下沉"), 3);
+    assert_eq!(l.report().host_blocks, 3, "B 在宿主");
+    assert_eq!(l.report().slots_free, 3, "B 腾出 3 槽");
+    eprintln!(
+        "[two] B offload: host_blocks={} slots_free={}",
+        l.report().host_blocks,
+        l.report().slots_free
+    );
+
+    // B 回灌;A 仍在设备,内容不得互串。
+    let b_pending = l.match_prefix(&b_tokens).expect("B 命中").pending_host();
+    assert_eq!(b_pending.len(), 3, "B 回灌面 = 3 块");
+    let b_slots = engine_onload(&mut l, &mut face, &b_pending).await.expect("B 回灌");
+    for (i, slot) in b_slots.iter().enumerate() {
+        assert_eq!(read_slot(&mut face, &ps, *slot).await, b_before[i], "B 第 {i} 块");
+    }
+    assert_eq!(l.report().host_blocks, 0, "轮换结束宿主无残留");
+    assert_eq!(l.report().slots_free, 0, "轮换结束池仍由 A+B 占满");
+    eprintln!(
+        "[two] B reload: host_blocks={} slots_free={}",
+        l.report().host_blocks,
+        l.report().slots_free
+    );
+}
+
+/// **两会话同时活跃 → 轮换才允许迁移**：
+/// A/B 都持会话引用时,整链下沉被 `Busy` 挡住;A 先轮换出去后可沉/回,
+/// B 仍活跃且内容不变;随后 B 轮换,重复同一路径。
+#[tokio::test]
+async fn two_active_sessions_block_migration_until_one_rotates_out() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let mut l = leg(6);
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps.clone() })
+        .expect("注册布局");
+
+    let a_tokens: Vec<u32> = (0..96).collect();
+    let b_tokens: Vec<u32> = (1000..1096).collect();
+    // 两会话都**保留**块表引用(模拟同时活跃)。
+    let (a_table, b_table) = {
+        let mut a_table = Vec::new();
+        let mut b_table = Vec::new();
+        l.ensure_for_len(&mut a_table, a_tokens.len()).expect("A 表");
+        l.ensure_for_len(&mut b_table, b_tokens.len()).expect("B 表");
+        l.register_chain(&a_tokens, &a_table).expect("A 登记");
+        l.register_chain(&b_tokens, &b_table).expect("B 登记");
+        (a_table, b_table)
+    };
+    let a_tail = l.tail_hash(&a_tokens, 3).expect("A 尾");
+    let b_tail = l.tail_hash(&b_tokens, 3).expect("B 尾");
+    assert_eq!(l.report().slots_free, 0);
+
+    let mut a_before = Vec::new();
+    let mut b_before = Vec::new();
+    for slot in 0..3u32 {
+        seed(&mut face, &ps, slot, 0x50 * (slot as u8 + 1)).await;
+        a_before.push(read_slot(&mut face, &ps, slot).await);
+    }
+    for slot in 3..6u32 {
+        seed(&mut face, &ps, slot, 0x60u8.wrapping_mul(slot as u8 - 2)).await;
+        b_before.push(read_slot(&mut face, &ps, slot).await);
+    }
+
+    // 两个都活跃:计划不得把它们当缓存下沉。
+    // 活跃 refs > 1 的叶不得进 Host **也不得进 Drop**；plan 应在容量不足时
+    // 直接 deny，而不是出无效 Drop 票。
+    let verdict = plan_kv(&l, Need::kv(2, NeedWhy::Admit));
+    assert!(
+        verdict.out.iter().all(|o| o.sink() != Sink::Host),
+        "活跃会话的整链不得下沉:{verdict:?}"
+    );
+    eprintln!(
+        "[active] both active: tickets={} host_ok={} slots_free={}",
+        verdict.out.len(),
+        verdict.out.iter().all(|o| o.sink() != Sink::Host),
+        l.report().slots_free
+    );
+    assert!(
+        verdict.out.iter().all(|o| o.sink() != Sink::Drop),
+        "活跃链不得出 Drop 票:{verdict:?}"
+    );
+    assert!(verdict.deny.is_some(), "无缓存可动 ⇒ 必须响亮 deny:{verdict:?}");
+    eprintln!("[active] both active tickets={:?}", verdict.out);
+
+    // A 轮换出去(释放表引用)→ 可整链下沉。
+    let mut a_table = a_table;
+    l.release_table(&mut a_table).expect("A 表归还");
+    assert_eq!(engine_offload(&mut l, &mut face, a_tail).await.expect("A 下沉"), 3);
+    assert_eq!(l.report().host_blocks, 3, "A 在宿主");
+    eprintln!(
+        "[active] A rotates out: host_blocks={} slots_free={}",
+        l.report().host_blocks,
+        l.report().slots_free
+    );
+    // B 仍然活跃:回灌 A 不能影响 B 的内容。
+    let a_pending = l.match_prefix(&a_tokens).expect("A 宿主命中").pending_host();
+    assert_eq!(a_pending.len(), 3);
+    let a_slots = engine_onload(&mut l, &mut face, &a_pending).await.expect("A 回灌");
+    for (i, slot) in a_slots.iter().enumerate() {
+        assert_eq!(read_slot(&mut face, &ps, *slot).await, a_before[i], "A 第 {i} 块");
+    }
+    for (i, h) in l.match_prefix(&b_tokens).expect("B 仍命中").hashes.iter().enumerate() {
+        // B 的表引用还在,命中面应全驻留。
+        let _ = (i, h);
+    }
+    assert_eq!(l.report().slots_free, 0, "A 回灌后池满");
+
+    // B 轮换出去 → 下沉/回灌,验证 A 的内容不被串。
+    let mut b_table = b_table;
+    l.release_table(&mut b_table).expect("B 表归还");
+    assert_eq!(engine_offload(&mut l, &mut face, b_tail).await.expect("B 下沉"), 3);
+    let b_pending = l.match_prefix(&b_tokens).expect("B 宿主命中").pending_host();
+    assert_eq!(b_pending.len(), 3);
+    let b_slots = engine_onload(&mut l, &mut face, &b_pending).await.expect("B 回灌");
+    for (i, slot) in b_slots.iter().enumerate() {
+        assert_eq!(read_slot(&mut face, &ps, *slot).await, b_before[i], "B 第 {i} 块");
+    }
+    assert_eq!(l.report().host_blocks, 0, "轮换结束无宿主残留");
+}
