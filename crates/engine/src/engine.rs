@@ -2272,6 +2272,10 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     t_run: std::time::Instant,
 ) -> Result<RankDev<DeviceHandle<D>>> {
         boot_knobs_check(&mut face, cfg, tp.as_ref())?;
+        // **NVFP4 已可进图**(2026-10-28 进图刀):原来这里有一条“NVFP4 ⇒ 自动
+        // 关图捕获”的降级(因为本族发射前要回读 4B `ga`),alpha 设备化后不再需要。
+        // 保留一句痕迹只为了将来排查“为何 NVFP4 档没图”——先看算子声明
+        // (`ops/nvfp4.rs::CAPTURE`)再看这里;两者都必须是 `NoHostWork`。
         let mut phase = VramPhase::new();
         phase.mark(&mut face, "boot-rank:权重已装载").await;
         let s = cfg.max_seq_tokens;

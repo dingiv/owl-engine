@@ -253,6 +253,15 @@ pub enum QuantScheme {
     #[serde(rename = "w4a16")]
     #[default]
     W4a16,
+    /// **NVFP4 块缩放**(权重与激活都是 `e2m1` 数据 + 每 16 个 k 一个 `e4m3` 缩放;
+    /// 2026-10-28)。只配 `format = "safetensors"`:装载期把 f16 权重 RTN 量化成
+    /// `q`(`u8`)+ `sf`(`u8`,CUTLASS 交错布局),前向 = 设备侧激活量化 + CUTLASS
+    /// `m16n8k64` 块缩放 MMA(sm_12x 的 `a` 档指令)。
+    ///
+    /// **统一臂**(用户裁决 2026-10-28):不按 m 分流 —— decode(m=1)与 prefill
+    /// 都走同一条;代价是 decode 会按 128 行 tile 空转,收益在 prefill。
+    #[serde(rename = "nvfp4")]
+    Nvfp4,
     /// **GGUF 块型**(`format=gguf` 专用;声明口径 —— 实际逐张量型从文件读,
     /// 本键用于 tag filter/预检与"档-文件不一致"的响亮拒)。
     #[serde(rename = "q4k")]
@@ -2528,6 +2537,14 @@ impl OwlConfig {
                     "[model] quant = q4k/iq4/iq3 只配 format = \"gguf\"(safetensors/awq 无块型)"
                         .to_string(),
                 );
+            }
+            // NVFP4 是权重+激活的块缩放格式:装载期现量化(safetensors 的 f16)
+            (ModelFormat::Safetensors, QuantScheme::Nvfp4) => {}
+            (_, QuantScheme::Nvfp4) => {
+                return Err(format!(
+                    "[model] quant = \"nvfp4\" 只配 format = \"safetensors\"(装载期从 f16 现量化),实得 format = {:?}",
+                    self.model.format
+                ));
             }
             (_, QuantScheme::W8a8i | QuantScheme::W8a8f | QuantScheme::W8a8) => {
                 return Err(format!(

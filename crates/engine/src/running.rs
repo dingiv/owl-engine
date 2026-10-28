@@ -1608,6 +1608,14 @@ impl<D: DeviceClient> RunningEngine<D> {
 
         // ── N4：池清点 + 未归还清单 + 兜底释放 + trim ---------------------
         self.n4_pool_sweep(turn);
+        // **先交还 eager 档的瞬态输出**(2026-10-28):那批块是 plan 自己持有的
+        // 句柄(要到下一步开头才回收);若让 N4 兼底释放先跑(它会把借出登记
+        // 删掉并真 free),下一 turn 头部就会对同一批 id 双 free —— 实测
+        // `幽灵归还 —— 账上无 id 的在借登记`,第二次请求必失败(与量化方案
+        // 无关;F16 档同形)。捕获档里这个调用是 no-op(输出槽由图持有)。
+        if let Err(e) = self.dev.graphs.session.release_eager_outputs().await {
+            owl_shared::log_warn!("store", "turn {turn} 交还 eager 输出失败(继续收尾): {e}");
+        }
         self.n4_report_unreturned(turn);
         let force = self.n4_force_release(turn).await;
         match (release.kind, force) {

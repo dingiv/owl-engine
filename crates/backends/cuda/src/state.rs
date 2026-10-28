@@ -187,6 +187,8 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
                     tags.push(T::QUANT_AWQ);
                 }
             }
+            // NVFP4:权重+激活块缩放(统一臂;decode 也走同一条)
+            QuantScheme::Nvfp4 => tags.push(T::QUANT_NVFP4),
             // validate 已拒;这里保守只放通用量化核
             QuantScheme::W8a8i | QuantScheme::W8a8f | QuantScheme::W8a8
             | QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3 => {}

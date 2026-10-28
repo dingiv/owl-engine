@@ -581,8 +581,16 @@ async fn load_shard(
                 )
                 .await
         }
-        // 普通 HF safetensors(0.8B 开发档 / 转换后的 27B)
-        ModelFormat::Safetensors => loader.load_qwen35_0_8b(&config.model_dir).await,
+        // 普通 HF safetensors(全精度检查点):计划 = **装载期现量化**唯一表
+        // (`w4a16/w4a8` 在这类目录上是历史空档 ⇒ F16;`nvfp4` 才是真档)
+        ModelFormat::Safetensors => {
+            let head_plan = owl_engine::head_plan_of(config.head_quant);
+            let quant = owl_engine::safetensors_load_plan(config.quant);
+            let embed_plan = owl_engine::embed_plan_of(config.embed_quant);
+            loader
+                .load_qwen35_safetensors(&config.model_dir, quant, head_plan, embed_plan)
+                .await
+        }
         // GGUF 单文件:超参/词表/模板/rope/权重全从 `model.path` 那个文件取
         ModelFormat::Gguf => loader.load_gguf(&config.model_dir).await,
     }
@@ -613,7 +621,13 @@ async fn actor_main(
                     // 量化方案映射在 `load_shard` 内部(唯一映射点)
                     ModelFormat::Awq => load_shard(&config, &mut engine, 0, 1).await?,
                     ModelFormat::Safetensors => {
-                        engine.loader().load_qwen35_0_8b(&config.model_dir).await?
+                        let head_plan = owl_engine::head_plan_of(config.head_quant);
+                        let quant = owl_engine::safetensors_load_plan(config.quant);
+                        let embed_plan = owl_engine::embed_plan_of(config.embed_quant);
+                        engine
+                            .loader()
+                            .load_qwen35_safetensors(&config.model_dir, quant, head_plan, embed_plan)
+                            .await?
                     }
                     ModelFormat::Gguf => {
                         engine.loader().load_gguf(&config.model_dir).await?
