@@ -12,7 +12,7 @@ CUTLASS is **not** taken from vLLM; it is the separate shared family
 **Trimmed closure:** the vendor is **not** the full CUTLASS tree. It contains only
 the 16-file FlashAttention/c10 closure of this directory (`closure.txt`).
 CUTLASS is a **separate shared family** at `crates/kernels/cu/cutlass/`
-(146-header closure, 6.2 MiB). Regenerate both closure lists with `nvcc -M`
+(95-header sm86 closure, 1.9 MiB). Regenerate both closure lists with `nvcc -M`
 (same include paths/flags) after changing the adapter or upstream source.
 
 **Class:** FROZEN. The kernel/body is **verbatim upstream**; only the host C ABI
