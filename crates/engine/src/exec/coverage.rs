@@ -987,6 +987,115 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(Some((pages, tokens)))
     }
 
+    /// **turn 起点的合成视图（懒回灌, W3）** —— 在第一个 prefill chunk **之前**
+    /// 立一个「sink 块 ++ 稠密尾窗」视图。
+    ///
+    /// 为什么必须在 chunk 之前：命中面现在是**稀疏**的（只有 sink + recent 窗
+    /// 回灌进设备，其余是 `PENDING_LOAD_PLACEHOLDER`）。`past_view_of` 在
+    /// “无视图”时退回**全量链**（dense）；有洞时那条路会把占位符当页号读。
+    /// 它自己有一道响亮拒的门（`dense_with_hole`），但拒 = 本 turn 500 ——
+    /// 所以正确体位是在 begin 就立视图，让 prefill / decode 都走视图页表。
+    ///
+    /// 视图语义与 `view_pages_at` **逐字同源**：
+    /// `pages = sink 块` ++ `链[recall_pos..=pos]`，`len = sink_tokens + (pos+1 − recall_pos)`。
+    /// 这里只把 `sink` 段与 `recall_pos` 定下来；尾部由 `past_view_of` 每次拼
+    /// （它天然是本轮刚写的、必驻留的）。
+    ///
+    /// 返回 `Ok(true)` = 已立视图；`Ok(false)` = 本 turn 不需要（无洞 / 未开部分驻留）。
+    /// **任何“该在场却不在场”的情形一律 `Err`**（不静默降级成全量回灌）。
+    pub(crate) fn seed_turn_start_view(
+        &mut self,
+        sid: u64,
+        seed: crate::scheduler::LazySeed,
+    ) -> Result<bool> {
+        if !self.boot.cfg.knobs.select_partial {
+            return Ok(false);
+        }
+        let page = self.dev.pool.geom.page.max(1);
+        let s = self
+            .bank
+            .sessions
+            .get(sid)
+            .ok_or_else(|| ModelError::Msg(format!("懒回灌视图:会话 {sid:#x} 不在账")))?;
+        let chain = &s.block_table;
+        let n_blocks = (seed.cached_len / page).min(chain.len());
+        if n_blocks == 0
+            || !chain[..n_blocks]
+                .iter()
+                .any(|b| *b == crate::scheduler::PENDING_LOAD_PLACEHOLDER)
+        {
+            return Ok(false); // 链上无洞 ⇒ dense 安全,不需要合成视图
+        }
+        // 召回点 = cached_len − recent_tokens（页对齐;`seed` 构造时已保证）
+        let recent_len = seed.recent_tokens.min(seed.cached_len);
+        let recall_pos = seed.cached_len - recent_len;
+        if !recent_len.is_multiple_of(page) || !recall_pos.is_multiple_of(page) {
+            return Err(ModelError::EngineInvariant {
+                what: format!(
+                    "懒回灌视图:recent {recent_len} / recall {recall_pos} 不是页 {page} 的整数倍"
+                ),
+            });
+        }
+        // **驻留校验（守卫）**:sink 段与 recent 窗必须已在设备 ——
+        // 它们是 `plan_prefix_reuse` 的 `pending_loads` 清单，同一份算式。
+        // 不在这里“顺手回灌”:那会把决策面（调度）与执行面（搬运）混到
+        // 一个函数里，也会在回灌失败时留下半态。
+        let sink_n = seed.sink_blocks.min(n_blocks);
+        let recent_lo_block = recall_pos / page;
+        let mut pages: Vec<u32> = Vec::with_capacity(sink_n + n_blocks - recent_lo_block);
+        let mut missing: Vec<usize> = Vec::new();
+        for (i, b) in chain[..sink_n].iter().enumerate() {
+            if *b == crate::scheduler::PENDING_LOAD_PLACEHOLDER {
+                missing.push(i);
+            } else {
+                pages.push(*b);
+            }
+        }
+        for (i, b) in chain[recent_lo_block..n_blocks].iter().enumerate() {
+            if *b == crate::scheduler::PENDING_LOAD_PLACEHOLDER {
+                missing.push(recent_lo_block + i);
+            } else {
+                pages.push(*b);
+            }
+        }
+        if !missing.is_empty() {
+            return Err(ModelError::EngineInvariant {
+                what: format!(
+                    "懒回灌视图:sink/recent 窗里有 {} 块不在设备(sink {sink_n} 块 · recent 窗 \
+                     块 [{recent_lo_block},{n_blocks}) ⇒ 首个缺位下标 {})",
+                    missing.len(),
+                    missing[0]
+                ),
+            });
+        }
+        if seed.blocks.len() != pages.len() {
+            return Err(ModelError::EngineInvariant {
+                what: format!(
+                    "懒回灌视图:种子身份 {} 项 ≠ 驻留页 {} 项(调度面与视图口径分叉)",
+                    seed.blocks.len(),
+                    pages.len()
+                ),
+            });
+        }
+        self.sel.set_view(crate::select::SelectView {
+            pages,
+            blocks: seed.blocks.clone(),
+            // 选段只算 sink（recent 窗由 tail 拼入，不能再计一遍）
+            tokens: sink_n * page,
+            recall_pos,
+        });
+        owl_shared::log_info!(
+            "kvmem",
+            "懒回灌起点视图:session={sid:#x} cached={} tok · sink {} 块 · recent {} tok \
+             (recall_pos={recall_pos}) ⇒ prefill/decode 都走视图页表",
+            seed.cached_len,
+            sink_n,
+            recent_len
+        );
+        owl_shared::counter_inc!("kvmem.lazy_prefix.view_seeded");
+        Ok(true)
+    }
+
     /// **GPU page-softmax 召回打分**(参照实现 `page_softmax_scores` 的设备版;
     /// 2026-10-28)。
     ///

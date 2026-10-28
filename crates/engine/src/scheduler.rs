@@ -51,6 +51,25 @@ pub(crate) struct BeginPlan {
     /// **前缀无感删除的收尾动作**(leave-gap;`None` = 本 turn 没删)。
     /// 只携带盘层快照重挂票与旧链尾释放清单;不转 K、不移动 position。
     pub image_exec: Option<ImageExec>,
+    /// **懒回灌的 turn 起点视图种子**(W3;`None` = 本 turn 不需要合成视图)。
+    ///
+    /// 语义:`plan_prefix_reuse` 只把 **sink + recent 窗** 回灌进设备,其余命中块
+    /// 留在会话链上作占位符 ⇒ 执行器必须在**第一个 chunk 之前**立一个视图
+    /// (否则 `past_view_of`/`select_view_step` 会退回 dense 链读占位符 = 静默错页)。
+    pub lazy_view: Option<LazySeed>,
+}
+
+/// **懒回灌起点视图种子**(调度面算好,m 与 `pending_loads` **同一份算式**)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LazySeed {
+    /// 保底 sink 块数(链头,永不进视图洞)。
+    pub sink_blocks: usize,
+    /// 尾部连续留驻的 token 数(= 视图召回点到 `cached_len` 的距离;页对齐)。
+    pub recent_tokens: usize,
+    /// 复用面 token 数(= 视图召回点之后的"当前位置"起点)。
+    pub cached_len: usize,
+    /// 视图中**驻留段**的块身份(`sink 块 ++ recent 窗` 同序;驻留校验/探针用)。
+    pub blocks: Vec<owl_store::ChainHash>,
 }
 
 /// **leave-gap 删除计划的落账包**(不转 K;只摘页 + 位置账保留旧值)。
@@ -572,17 +591,20 @@ impl<D: DeviceClient> RunningEngine<D> {
         // (G5 兜底,`plan_image_delete` 全程纯读,失败零副作用)。
         // **前缀无感删除 = leave-gap 唯一路径**(2026-10-26):删图后保留
         // 幸存 position、不转 K;不命中则逐字节旧前缀复用路径。
-        let (cached_len, restore_key, pending_loads, image_exec) = if turn.deletion.is_some() {
+        let (cached_len, restore_key, pending_loads, image_exec, lazy_view) = if turn.deletion.is_some() {
             match self.plan_image_leave_gap(&turn)? {
-                Some(p) => self.apply_image_leave_gap(p, &turn)?,
+                Some(p) => {
+                    let (c, r, pl, im) = self.apply_image_leave_gap(p, &turn)?;
+                    (c, r, pl, im, None)
+                }
                 None => {
-                    let (c, r, pl) = self.plan_prefix_reuse(&turn)?;
-                    (c, r, pl, None)
+                    let (c, r, pl, lz) = self.plan_prefix_reuse(&turn)?;
+                    (c, r, pl, None, lz)
                 }
             }
         } else {
-            let (c, r, pl) = self.plan_prefix_reuse(&turn)?;
-            (c, r, pl, None)
+            let (c, r, pl, lz) = self.plan_prefix_reuse(&turn)?;
+            (c, r, pl, None, lz)
         };
         // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
         //
@@ -627,6 +649,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             reset_gdn: cached_len == 0 && image_exec.is_none(),
             pending_loads,
             image_exec,
+            lazy_view,
         };
         let ignore_eos = turn.spec.ignore_eos;
         let opts = turn.opts.clone();
@@ -729,6 +752,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         usize,
         Option<owl_store::SnapKey>,
         Vec<(usize, owl_store::ChainHash)>,
+        Option<LazySeed>,
     )> {
         let s = self
             .bank
@@ -740,7 +764,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut mold = std::mem::take(&mut s.mtp_block_table);
         self.bank.leg_mtp.release_table(&mut mold)?;
         s.rebase();
-        Ok((0, None, Vec::new()))
+        Ok((0, None, Vec::new(), None))
     }
 
     /// **leave-gap 删除计划**(纯 host):摘掉被删图像页,保留前缀/后缀页,
@@ -1061,6 +1085,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         usize,
         Option<owl_store::SnapKey>,
         Vec<(usize, owl_store::ChainHash)>,
+        Option<LazySeed>,
     )> {
         let s = self
             .bank
@@ -1242,7 +1267,76 @@ impl<D: DeviceClient> RunningEngine<D> {
                         self.bank.rel.leg.incref(b)?;
                     }
                 }
-                pending_loads.truncate(pending_loads.iter().take_while(|(i, _)| *i < m).count());
+                // ── **待回灌清单 = 起点视图要读的那一小批**（W3）──
+                //
+                // 视图口径（与 `past_view_of`/`view_pages_at` 逐字同源）：
+                //   页链 = sink 块 ++ 链[recall_pos..=pos]（tail）
+                //   len  = sink_tokens + (pos+1 − recall_pos)
+                // ⇒ 设备必须驻留的只有：**sink 块** + **recent 窗**（tail 的前半）。
+                // 命中面里其余块全留占位符，由首次边界召回后的 `reconcile` 按选择面
+                // stage-in（既有路径，不需要新机制）。
+                let lazy = if lazy_stage && m * page > 3 * page {
+                    let sink_blocks = self.boot.cfg.knobs.select_sink.min(m);
+                    // recent 窗：sink/recent 旋钮的块口径，再抬到**参照实现同量级**
+                    // （1024 tok）—— 太小会让"续写连续性"的尾部过低。
+                    let recent_tokens = (self.boot.cfg.knobs.select_recent * page)
+                        .max(1024)
+                        .min(m * page);
+                    let recent_lo = (m * page).saturating_sub(recent_tokens) / page;
+                    let mut view_blocks: Vec<owl_store::ChainHash> =
+                        Vec::with_capacity(sink_blocks + m - recent_lo);
+                    view_blocks.extend_from_slice(&hashes[..sink_blocks]);
+                    view_blocks.extend_from_slice(&hashes[recent_lo..m]);
+                    Some(LazySeed {
+                        sink_blocks,
+                        recent_tokens,
+                        cached_len: m * page,
+                        blocks: view_blocks,
+                    })
+                } else {
+                    None
+                };
+                match lazy.clone() {
+                    Some(seed) => {
+                        // 只保留 sink + recent 窗的待回灌项；其余本轮不进设备。
+                        let recent_lo = seed
+                            .cached_len
+                            .saturating_sub(seed.recent_tokens)
+                            / page;
+                        let keep_idx = |i: usize| i < seed.sink_blocks || i >= recent_lo;
+                        let before = pending_loads.len();
+                        pending_loads.retain(|(i, _)| keep_idx(*i));
+                        let holes = m - pending_loads.len()
+                            - chain[..m]
+                                .iter()
+                                .filter(|s| **s != PENDING_LOAD_PLACEHOLDER)
+                                .count();
+                        owl_shared::log_info!(
+                            "kvmem",
+                            "懒回灌:复用面 {m} 块({} tok)= sink {} + recent {} tok \
+                             ⇒ 回灌 {} 块(旧口径 {before})· 留洞 {holes} 块 \
+                             (由视图选择 + reconcile 按需 stage-in)",
+                            seed.cached_len,
+                            seed.sink_blocks,
+                            seed.recent_tokens,
+                            pending_loads.len()
+                        );
+                        owl_shared::counter_inc!("kvmem.lazy_prefix.used");
+                        owl_shared::metrics::with_metrics_store(|m| {
+                            m.counter_add(
+                                "kvmem.lazy_prefix.holes",
+                                holes as u64,
+                                file!(),
+                                line!(),
+                            )
+                        });
+                    }
+                    None => {
+                        pending_loads.truncate(
+                            pending_loads.iter().take_while(|(i, _)| *i < m).count(),
+                        );
+                    }
+                }
                 let mut old = std::mem::take(&mut s.block_table);
                 self.bank.rel.leg.release_table(&mut old)?;
                 s.block_table = chain[..m].to_vec();
@@ -1261,6 +1355,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     m * self.dev.pool.geom.page,
                     Some(owl_store::SnapKey::at_boundary(hashes[m - 1])),
                     pending_loads,
+                    lazy,
                 ))
             } else {
                 self.plan_fresh(turn)

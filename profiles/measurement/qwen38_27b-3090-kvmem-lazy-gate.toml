@@ -1,0 +1,32 @@
+# **验收档（KVMem 懒回灌 TTFT 门）** —— 2026-10-28 W1/W2/W3 联测用。
+# 形状 = `qwen38_27b-3090-kvmem.toml` + 长文档三件套(chunk 1024 / transient 384 /
+# reserve 256 ⇒ 池 76.4k tok) + 大工作集(ws 16384) + 钉空闲那张 3090 Ti。
+#
+# 起机:`./target/release/server -p profiles/measurement/qwen38_27b-3090-kvmem-lazy-gate.toml --log-level info`
+# 收门:`python3 tools/kvmem_ttft_gate.py --port 8140 --ctx 111k --turns 3`
+#
+# 实测(2026-10-28,台账 `26-10-28-KVMem-懒回灌-施工结案.md` §2):
+#   111k 会话:轮1 TTFT 94.8 s · 轮2 **1.06 s** · 轮3 0.76 s(中段针答对)
+#   255k 会话:轮1 248.3 s · 轮2 **2.07 s**(旧口径宿主越界 500,已修)
+# ⚠️ 这张卡同时被别的进程占用时:改 `[parallel].device` 的 UUID(序号已禁用)。
+extends = ["qwen38_27b-3090-kvmem.toml"]
+
+[server]
+bind = "127.0.0.1:8140"
+
+[parallel]
+mode = "single"
+# 钉卡:GPU2 上跑着参照实现(18200),这里用空闲的那张 3090 Ti
+device = ["GPU-e565c505-4921-9979-2e0f-2b83490b7aed"]
+
+[runtime]
+# 长文档档(W1 的失败现场就是这个组合)
+prefill_chunk = 1024
+max_seq = 262144
+
+[pool]
+transient_reserve_mb = 384
+vram_reserve_mb = 256
+
+[kvmem]
+workspace_per_req = 16384

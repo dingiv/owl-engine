@@ -301,6 +301,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 );
             }
         }
+        // **懒回灌（W3）**：起点视图必须在**第一个 chunk 之前**立 ——
+        // 命中面只回灌了 sink + recent 窗,其余是占位符;`past_view_of` 在无视图时
+        // 会退 dense 链（有洞则读错页）。这里放在回灌**之后**（sink/recent 已在设备）、
+        // `begin_dev` 之前（后者只写设备块表,与视图无关）。
+        if let Some(seed) = b.lazy_view.clone() {
+            let _seeded = self.seed_turn_start_view(b.session_id, seed)?;
+        }
         let table = self
             .bank
             .sessions
@@ -310,11 +317,46 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 设备半(两 rank **并发**推进):GDN 重置/快照恢复 + 持久块表重写
         // (并发理由同 prefill:单边先行 ⇒ 对端 AR 撞 5s 自旋)
         let (reset_gdn, restore_key, gdn_slot) = (b.reset_gdn, b.restore_key, b.gdn_slot);
+        // **懒回灌( W3)**：带洞的块表不能写进设备持久块表。能跳过的前提是
+        // 本档没有任何"直读持久块表"的臂(`select_partial` ⇒ 配置层已强制
+        // `decode_arm = v2`;verify 走 FI/ v2 视图表)。否则响亮拒 —— 绝不
+        // 写出"看似稠密"的错页。
+        let write_bt = match table
+            .iter()
+            .position(|x| owl_store::is_host_placeholder(*x))
+        {
+            None => true,
+            Some(i) => {
+                let k = &self.boot.cfg.knobs;
+                let view_only = matches!(k.env.attn.decode_arm, owl_shared::config::DecodeArm::V2)
+                    && matches!(
+                        k.env.attn.verify_arm,
+                        owl_shared::config::VerifyArm::V2 | owl_shared::config::VerifyArm::Fi
+                    );
+                if !view_only {
+                    return Err(ModelError::EngineInvariant {
+                        what: format!(
+                            "begin:块表第 {i} 项是宿主占位符,但本档存在直读持久块表的臂 \
+                             (decode={:?} / verify={:?}) ⇒ 拒绝写出错页",
+                            k.env.attn.decode_arm, k.env.attn.verify_arm
+                        ),
+                    });
+                }
+                owl_shared::counter_inc!("kvmem.lazy_prefix.bt_skipped");
+                owl_shared::log_info!(
+                    "kvmem",
+                    "begin:块表含洞(首洞下标 {i} / 共 {} 项) ⇒ 跳过持久块表重写 \
+                     (decode=v2 + verify 视图表;洞只由视图页表表达)",
+                    table.len()
+                );
+                false
+            }
+        };
         {
             let (dev, peer) = (&mut self.dev, self.peer.as_mut());
             crate::exec::mirror2!(dev, peer,
-                d => d.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table),
-                p => p.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table))?;
+                d => d.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table, write_bt),
+                p => p.begin_dev(reset_gdn, restore_key, restore_slot, gdn_slot, &table, write_bt))?;
         }
         Ok(())
     }
@@ -1798,6 +1840,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         restore_slot: Option<u32>,
         gdn_slot: usize,
         table: &[u32],
+        write_bt: bool,
     ) -> Result<()> {
         if reset_gdn {
             let face = self.graphs.session.face_mut();
@@ -1808,6 +1851,13 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             self.pool.restore_snap(face, gdn_slot, key, slot).await?;
         }
         let face = self.graphs.session.face_mut();
+        // **懒回灌( W3)**：命中面可以带洞(只回灌 sink + recent 窗)。
+        // 设备持久块表**不允许**写占位符(u32::MAX 当页号 = ILLEGAL_ADDRESS)；
+        // 洞只能由**视图页表**表达 ⇒ 调用方(有配置面)判定本档没有"直读持久
+        // 块表"的臂之后，用 `write_bt = false` 跳过重写。
+        if !write_bt {
+            return Ok(());
+        }
         self.pool.write_bt(face, table).await
     }
 

@@ -21,23 +21,51 @@
 # (实测 36.7k 崩 / 40.3k 正常)—— 稀疏化后的可用性取决于"关键块是否被
 # top-k 选中",不是 ctx 本身。真正需要全文通读的任务(拼接文档全文总结)
 # 仍建议走非超卖档。
+#
+# ✅ **懒回灌(2026-10-28 W3)**:命中面**不再按池容量裁剪** —— turn 起只回灌
+# `sink + recent 窗`(实测 34 块),其余命中块留占位符,由末边界召回后的
+# `reconcile` 按选择面批量 stage-in(实测 502 块)。长会话追加轮因此从
+# "尾部重算 38.6k tok" 降到秒级:
+#
+#   | 会话 | 首轮 TTFT | 追加轮(修前 → 修后) |
+#   |---|---|---|
+#   | 111k | 94.8 s | **44.0 s → 1.06 s** |
+#   | 255k | 248.3 s | **500(宿主越界) → 2.07 s** |
+#
+# 机制/实测/残余见 `roadmap.local/26-10-28-KVMem-懒回灌-施工结案.md`。
 # ══════════════════════════════════════════════════════════════════════════
-# 🔴 **本档的真实可用上下文 = 池容量 47744 tok,不是 max_seq**
+# ✅ **超池长上下文已可用(2026-10-28 修根因后;旧的"可用上下文 = 池容量"作废)**
 #
-# `max_seq = 262144` 只保证 **KV 装得下**(超卖 5.49×,多出来的沉到宿主)。
-# 但链一旦越过池,链上就有宿主占位符 ⇒ `past_view_of` **必须**换稀疏视图
-# (on-hole 也躲不掉)⇒ prefill 每个 chunk 只能看到「工作集 + 本 chunk」
-# ≈ 10k 的"过去",与 ctx 无关。实测(真实中文文档 / greedy):
+# 旧结论(64k 起 `out=1`)的根因 = **FI 的 ctx_total 口径错配**:模型层喂核
+# `ctx_base + tokens`(**绝对** base),而视图页链只有 `view_tokens + 本 chunk` 页
+# ⇒ 核越 `indptr` 读越界页号 ⇒ 注意力喂垃圾。**只要视图是真子集(丢一块也算)就必塌**,
+# 与 ctx 无关 —— 所以表现为"越池就崩"。已修(`exec/prefill_chunk.rs` 显式喂
+# `fi_plan_ctx = view_tokens + t` + 硬断守卫),台账见
+# `roadmap.local/26-10-28-KVMem-位置定谳与三修.md` §6。
 #
-#   | prompt | 输出 |
-#   |---|---|
-#   | 48k(≤池) | 正常 176 tok |
-#   | 64k / 72k / 80k / 96k / 124k(>池) | **out=1, finish=stop**(退化) |
+# 修后实测(真实中文台账 / greedy / 事实针在中段 / 选择题):
 #
-# 同一批 prompt 在非超卖档(3080 TP2 262k)全部正常。
-# ⇒ **长上下文用 `qwen38_27b-3080_tp2.toml`,不要用本档。**
-# 本档定位:≤47.7k 的 agent/多轮会话 —— 它的价值是**前缀复用**(48k 文档
-# 增量追问 28.7 s → 9 s)与 decode 视图,不是"更大 ctx"。
+#   | prompt | ws=4096 | ws=8192 | ws=16384 |
+#   |---|---|---|---|
+#   | 108k | ✅ 命中 | — | — |
+#   | 160k | ❌ 未命中(猜) | ✅ 命中 | ✅ 命中 |
+#   | 211k(→160k 素材上限) | ❌ | — | ✅ |
+#
+# ⇒ 现在 **不再有"塌陷"**,只剩**覆盖率**:看得到的过去 = `workspace_per_req`。
+# **覆盖率门**(`tools/kvmem_visibility_gate.py --task sections`,72k 文档实测):
+#
+#   | workspace | 物化比 | 小节标题召回 |
+#   |---|---|---|
+#   | 4096 | 5.6% | 3/7 (43%) |
+#   | 8192 | 11% | 5/7 (71%) |
+#   | 12288 | 17% | 6/7 (86%) |
+#   | 16384 | 22.5% | 6/7 |
+#
+# ⇒ **按上下文挑工作集**:≤48k 用 4096(decode 105 t/s);48k~80k 用 8192~12288;
+# 80k 以上用 16384(decode ~82 t/s)。`select_stratified` 在这些比值下**无量测收益**
+# (48/2240=2% 的采样间隔远大于一个语义块)⇒ 缺省 0。
+# "全文通读"类任务仍建议走非超卖 TP2 档。
+# 本档的核心价值不变:**前缀复用**(48k 文档增量追问 28.7 s → 9 s)+ decode 视图。
 # ══════════════════════════════════════════════════════════════════════════
 #
 # 2026-10-27 实测(本档):
@@ -47,11 +75,12 @@
 #
 # ⚠️ 三个"看起来能开、实际上会坏"的开关,本档已按实测焊死,改前三思:
 #
-# 1. `[kvmem].prefill_view = "always"` —— **禁止**用于 agent。
-#    它让 prefill 也只读 top-k 选中块 ⇒ 长 system / tools schema 里未被
-#    选中的部分模型看不见 ⇒ 输出退化到 1~2 token 就 EOS
-#    (实测 60k system:always out=1 / on-hole out=176)。
-#    纯长文档 RAG(无 system 契约)理论上可用,但需先立"选中覆盖率门"。
+# 1. `[kvmem].prefill_view = "always"` —— **机制上已不再致命**(2026-10-28 修
+#    ctx_total 口径错配后,实测 160k 文档 always/on-hole 都能答,只有命中率差异),
+#    但它让 prefill 也只读选中块:长 system / tools schema 里**未被覆盖**的部分
+#    模型看不见(旧实测 60k system 退化到 1 token,当时叠加了上面的 bug)。
+#    ⇒ agent 场景仍建议 **on-hole**。覆盖率门已立(见上 §覆盖率门):
+#    72k 下 ws=4096 只有 43% 标题召回 —— 长 system/tools 想用 always 先把 ws 调够。
 #    运行时用 `/debug/metrics` 的 `select.prefill_view.always_used` 自查。
 #
 # 2. `[kernel].decode_arm` 不能是 `fi` —— 本档 `select_partial = true`,
@@ -69,7 +98,8 @@
 # 为什么放在 `measurement/` 而不是顶层:`profiles/` 顶层的"入口档面"被
 # `profiles.rs::入口档面只允许三个常驻档` 钉死(2026-10-24 用户裁决:
 # 入口档只留硬件形状)。本档 = **同一硬件形状(单 3090)的另一配置**,
-# 且真实可用上下文只有池容量 47.7k ⇒ 不是常驻生产档。
+# 且 `workspace_per_req` 的取值(4096 = decode 最快 / 16384 = 长文命中率最高)
+# 取决于任务形状 ⇒ 不是常驻生产档(见档头"超池长上下文已可用")。
 # 固化目的(防 `--set` 误配)不受影响:`-p profiles/measurement/这档` 即可。
 extends = [
   "../full.toml",
@@ -118,6 +148,20 @@ snap_host_mb = 3072
 # reserve=1024 ⇒ 池 980 页 = 31360 tok —— 小心别在"固化"时把档改小了
 # (2026-10-27 本 profile 首版就踩了这一个)。
 vram_reserve_mb = 512
+# 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
+# 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
+#
+# 它兜的是 **prefill 的 chunk 工作区**(eager ⇒ 无捕获图 slab):
+#   峰值 ∝ chunk 宽度,chunk=2048 实测单笔 120~136 MiB,叠加 vram_reserve 守卫地板
+#   ⇒ 1024 MiB 是 chunk=2048 下的最小稳定档(768 MiB 实测差 34 MiB 翻车)。
+#
+#  **长文档档(≥80k)**:把下面三行改成
+#     runtime.prefill_chunk = 1024
+#     transient_reserve_mb  = 384
+#     pool.vram_reserve_mb  = 256
+#   ⇒ 池 47.7k → **76.4k(+60%)**,代价 prefill −17%(255k 首答 192→228 s)。
+#   实测表见 roadmap.local/26-10-28-KVMem-位置定谳与三修.md §13.6。
+transient_reserve_mb = 1024
 image_evict = true
 snap_msg_boundary = true
 snap_msg_delim = ""
@@ -149,9 +193,34 @@ gqa_aggregation = "max"
 query_replay = false
 select_sink = 2
 select_recent = 4
+# 时间序分层抽样块数(P1-3 覆盖率门;0 = 关 = 旧行为)。
+# >0 ⇒ 中间区间等距取块,保证全文每段都有一双眼(top-k 只填剩余位)。
+select_stratified = 0
+# 保底 sink/recent 的 **token 口径**(0 = 用上面的块数;参照实现配方 sink/recent=12288/1024 tok)
+select_sink_tokens = 0
+select_recent_tokens = 0
+# query 窗(打分用最近多少行)。参照实现默认 512,但它的 Q 跨度是**最后一条 user
+# 消息**,我们的 Q 是"最后 N 个 token" —— 实测 512 反而把信号稀释
+# (72k/ws4096:softmax 5/7 → **2/7**)⇒ 本档保持 64。
+select_query_tokens = 64
+# 召回打分 scorer:`softmax-mean`(**参照实现默认**;设备三段核
+# `owl_kvscore_{logits,maxsum,acc}`,72k/2240 块 ≈ 11 ms/边界)|
+# `cosine-max`(折叠热路,host)| `cosine-mean` | `logit-mean`
+#
+# 实测(72k 文档 / ws=4096 / 可见性门 7 小节,各 2 次可复现):
+#   cosine-max **3/7** → softmax-mean **5/7** → softmax + α0.2 **6/7**
+# ⇒ 本档采纳 softmax-mean。
+score_mode = "softmax-mean"
+# 一跳邻接传播 α(参照实现 propagate_query_scores;0 = 关)。
+# 与 softmax 打分**配套**:72k/ws4096 标题召回 5/7 → **6/7**(2/2 可复现);
+# 配 cosine 打分时量不出收益(§8.3)⇒ 两者要一起用。
+select_graph_alpha = 0.2
 recall_every = 1
 # 🔴 agent 场景必须 on-hole(见档头第 1 条)。
 prefill_view = "on-hole"
+# 召回点选块口径:`topk`(缺省,按 cosine 补足 = scattered)|
+# `recency`(参照实现 prefill 口径 = 头 + 连续近期窗;2026-10-28 受控对照)
+prefill_select = "topk"
 coverage_probe = false
 analyze_at_ctx = 0
 evict_policy = "lru"
