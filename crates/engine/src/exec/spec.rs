@@ -1724,16 +1724,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 );
             }
             // 登记/触达(层 = 设备;档 = 调用方给的事实)
-            // **会话感知**(2026-10-19):记归属与边界深度 —— 淘汰时同会话
-            // **末端(深边界)先走**,保留链头前缀(否则头部被逐 ⇒ 后面全垃圾)。
-            self.bank.rel.state.register_snap_owned(
+            //
+            // ⚠️ 2026-10-28 定谳:必须走 `register_snap_captured`(单源),
+            // 不能直接 `state.register_snap_owned` —— 同名边界快照重拍
+            // (truncate 尾部重算 / 同 prompt 再次到达同一边界)会产生同键,
+            // 若旧键已在宿主/盘就**留尸** ⇒ 下次下沉 `snap_host.put` 撞
+            // 「已在宿主层」⇒ 整个 turn 500(实测第 3 次请求必现)。
+            let ghosts = self.bank.rel.register_snap_captured(
                 key,
                 self.dev.pool.snap_bytes(),
-                owl_store::Tier::Gpu,
                 durability,
                 sid,
                 full_blocks,
-            );
+            )?;
+            if ghosts > 0 {
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("store.snap.rebind_ghost_dropped", ghosts as u64, file!(), line!());
+                });
+            }
             // **P1-2**:本 turn 的最新边界进入显式保护面。快照面没有引用计数,
             // 若不记在这里,下一次 Idle/Pressure 可能把它当成最冷条目搬走。
             self.turns.active_mut()?.last_snap = Some(key);

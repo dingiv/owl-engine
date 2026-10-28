@@ -703,6 +703,50 @@ impl Rel {
         self.snap_bytes
     }
 
+    /// **快照新拍进入设备层的落账口**(单源;引擎在 `capture` 后只调这一个)。
+    ///
+    /// 为何不能直接 `state.register_snap_owned(.., Tier::Gpu)`:
+    /// `SnapKey` 是**块边界内容身份** ⇒ 同一条 token 链重算会得到**同一个键**。
+    /// 若该键此前已被下沉到宿主/盘(宿主还留着副本),直接改层账 Gpu 就会
+    /// **宿主副本留尸** —— 之后任何 Host 下沉走到 `snap_host.put` 都撞
+    /// 「块 … 已在宿主层」⇒ 整个 turn 500(2026-10-28 实测:同 prompt 第 3 次
+    /// 必现,truncate 尾部重算时重拍同名边界快照)。
+    ///
+    /// 判据与 KV 腿的 `drop_host_chains` 同律:**同身份重绑到设备新槽 ⇒
+    /// 旧的宿主/盘副本是幽灵,必须当场丢**。
+    ///
+    /// 返回被丢掉的幽灵数(宿主 + 盘各至多 1;非零 = 上游重算了同一身份,
+    /// 属正常事件但要看得见)。
+    pub fn register_snap_captured(
+        &mut self,
+        key: SnapKey,
+        bytes: usize,
+        durability: crate::state::SnapDurability,
+        session: u64,
+        depth: usize,
+    ) -> StoreResult<usize> {
+        let mut ghosts = 0usize;
+        if self.snap_host.get(key).is_some() {
+            self.snap_host.evict(key)?;
+            ghosts += 1;
+        }
+        if let Some(d) = self.snap_disk.as_mut() {
+            if d.contains(key) {
+                d.commit_evict(&[key]);
+                ghosts += 1;
+            }
+        }
+        self.state
+            .register_snap_owned(key, bytes, Tier::Gpu, durability, session, depth);
+        if ghosts > 0 {
+            owl_shared::log_debug!(
+                "snap-trace",
+                "重拍同名边界快照 {key:?} ⇒ 丢掉旧副本 {ghosts} 份(宿主/盘)"
+            );
+        }
+        Ok(ghosts)
+    }
+
     /// 状态腿宿主层预算(字节;0 = 关层)。
     pub fn snap_host_budget(&self) -> usize {
         self.snap_host.budget_bytes()
@@ -1200,8 +1244,19 @@ impl Rel {
             .into_iter()
             .next()
             .ok_or_else(|| StoreError::Invariant("快照槽台为空".into()))?;
+        // **诊断面**(2026-10-28):同键重复落宿主 = 宿主副本留尸(幽灵),
+        // 会把 put 变成不变量违反 ⇒ 直接 500。这里先响亮报出世面,再照常拒。
+        if self.snap_host.get(key).is_some() {
+            owl_shared::log_warn!(
+                "snap-trace",
+                "下沉落宿主撞幽灵 {key:?}:宿主已有该键(状态账={:?},重复落地累计={}) ⇒ 拒落",
+                self.state.locate(key),
+                self.snap_host.duplicate_landings()
+            );
+        }
         self.snap_host.put(key, buf)?;
         self.state.set_tier(key, Tier::Host)?;
+        owl_shared::log_debug!("snap-trace", "offload→Host {key:?}");
         Ok(())
     }
 
@@ -1220,7 +1275,7 @@ impl Rel {
         if self.state.locate(new).is_some() {
             return false;
         }
-        match self.state.locate(old) {
+        let r = match self.state.locate(old) {
             Some(Tier::Gpu) => self.state.rekey_snap(old, new),
             Some(Tier::Host) => {
                 if self.snap_host.rekey(old, new).is_err() {
@@ -1230,7 +1285,13 @@ impl Rel {
                 self.state.rekey_snap(old, new)
             }
             Some(Tier::Disk) | None => false,
-        }
+        };
+        owl_shared::log_debug!(
+            "snap-trace",
+            "rekey {old:?} → {new:?} tier={:?} ok={r}",
+            self.state.locate(new).or_else(|| self.state.locate(old))
+        );
+        r
     }
 
     /// **盘层快照重挂:计划**(`(旧路径, 新路径)`;真 I/O 归 engine 阻塞池)。
@@ -1290,6 +1351,11 @@ impl Rel {
         key: SnapKey,
         slot: u32,
     ) -> StoreResult<(Vec<Vec<SwapPiece>>, SlotTable)> {
+        owl_shared::log_debug!(
+            "snap-trace",
+            "onload←Host {key:?} slot={slot} 宿主在场={}",
+            self.snap_host.get(key).is_some()
+        );
         let buf = self.snap_host.take(key)?;
         let all = (0..self.world.max(1))
             .map(|plane| {
@@ -1320,11 +1386,14 @@ impl Rel {
 
     /// 丢弃一条快照的宿主副本(内容整体淘汰时;不在宿主 = 幂等)。
     pub fn drop_snap_host(&mut self, key: SnapKey) -> StoreResult<usize> {
-        match self.snap_host.evict(key) {
+        let had = self.snap_host.get(key).is_some();
+        let r = match self.snap_host.evict(key) {
             Ok(n) => Ok(n),
             Err(StoreError::Unknown(_)) => Ok(0),
             Err(e) => Err(e),
-        }
+        };
+        owl_shared::log_debug!("snap-trace", "drop-host {key:?} 在场={had}");
+        r
     }
 
     /// 报告(两腿 + 保留/弹性面)。

@@ -183,3 +183,45 @@ async fn transient_snapshot_is_not_offloadable() {
         .register_snap(kd, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
     r.plan_snap_offload(kd, 1).expect("Durable 可沉");
 }
+/// ⑥ **同名边界快照重拍不留幽灵**(2026-10-28 定谳)。
+///
+/// 病灶:同一条 token 链重算(turn 裁尾重算 / 同 prompt 再次到达同一边界)
+/// 会得到**同一个 `SnapKey`**。若该键此前已下沉到宿主(内容还在),而拍摄侧
+/// 直接 `state.register_snap_owned(.., Tier::Gpu)`,层账变 Gpu 但宿主副本留着
+/// ⇒ 之后任何 Host 下沉走到 `snap_host.put` 都撞「块 … 已在宿主层」⇒ 整个
+/// turn 500(实测:同 prompt 第 3 次请求必现)。
+///
+/// 门:重拍后宿主账必须清零,且**能再沉一次**(端到端的"毒化解除"判据)。
+#[tokio::test]
+async fn recapture_drops_stale_host_copy() {
+    let mut face = CpuFace::new();
+    let ps = snap_pieces(&mut face, 4).await;
+    let mut r = rel(1 << 20);
+    r.attach_snap_layout(PoolLayout { class: BlockClass::GdnRow, epoch: 0, pieces: ps.clone() })
+        .expect("布局");
+    let k = key(21);
+    seed(&mut face, &ps, 0, 0x33).await;
+    r.register_snap_captured(k, SNAP_BYTES, SnapDurability::Durable, 7, 4)
+        .expect("首拍");
+    // 沉到宿主(此刻宿主真有内容)
+    let (pieces, table) = r.plan_snap_offload(k, 0).expect("下沉计划");
+    let conn = face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await.expect("swap");
+    r.commit_snap_offload(k, owl_store::reclaim_slot_table(conn).expect("台")).expect("落账");
+    assert_eq!(r.state.locate(k), Some(Tier::Host));
+    assert_eq!(r.snap_host_used(), SNAP_BYTES);
+
+    // 重拍同一边界(同键):幽灵必须当场丢
+    let ghosts = r
+        .register_snap_captured(k, SNAP_BYTES, SnapDurability::Durable, 7, 4)
+        .expect("重拍");
+    assert_eq!(ghosts, 1, "应丢掉一份旧副本");
+    assert_eq!(r.snap_host_used(), 0, "宿主账必须清零(否则是幽灵)");
+    assert_eq!(r.state.locate(k), Some(Tier::Gpu), "层账回到设备");
+
+    // 再沉一次:病灶版在这里抛「已在宿主层」
+    let (pieces, table) = r.plan_snap_offload(k, 1).expect("重拍后可再沉(零幽灵)");
+    let conn = face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await.expect("swap");
+    r.commit_snap_offload(k, owl_store::reclaim_slot_table(conn).expect("台"))
+        .expect("再沉落账(不得撞不变量)");
+    assert_eq!(r.state.locate(k), Some(Tier::Host));
+}
