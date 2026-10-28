@@ -1347,7 +1347,18 @@ async fn load_nvfp4<D: DeviceClient, S: WeightSource + ?Sized>(
     // 产物槽必须与层声明的槽位一一对上(主槽 = q,附加槽 = sf)
     verify_slot_agreement(w, &slots)?;
     let mut outs: Vec<Vec<u8>> = slots.iter().map(|s| vec![0u8; s.bytes()]).collect();
-    let mut scalars = [0f32; 1];
+    // **标量口契约**(2026-10-28 review):`gb` 是**数值的一部分** —— 掉了它,
+    // 层上会继续用 `ScalarSink` 的缺省 1.0,输出就静默被 `1/gb` 缩放。
+    // 所以:初值取 NaN(不可当真值),跑完仍是 NaN = 变换没写;而层没留口
+    // (`want.scalar = None`)= 装了也用不上 —— 两个方向都响亮拒。
+    if w.scalar.is_none() {
+        return Err(ModelError::Msg(
+            "NVFP4 声明缺 `scalar` 口:变换会产出 per-tensor 全局缩放 `gb`,\
+             没有回填口就只能用缺省 1.0(读数静默偏移)—— 请用 `Weight::layout_as_nvfp4` 声明"
+                .into(),
+        ));
+    }
+    let mut scalars = [f32::NAN];
     {
         let _s = probe.span("pack");
         xf.run(&mut TransformCtx {
@@ -1359,12 +1370,17 @@ async fn load_nvfp4<D: DeviceClient, S: WeightSource + ?Sized>(
             scalars: &mut scalars,
         })?;
     }
+    if !scalars[0].is_finite() {
+        return Err(ModelError::Msg(format!(
+            "NVFP4 打包未产出 `gb`(scalar 仍是 {})—— 变换实现与声明不一致",
+            scalars[0]
+        )));
+    }
     // 源字节用完即弃(下个键前释放;大键 f16 副本不攒留)
     drop(src_bytes);
 
     // 3) 逐槽上卡 + 交付(主槽 = `w.sink`;其余按声明序走 `w.extra`)
     let mut entries = Vec::with_capacity(slots.len());
-    let mut scalars_iter = scalars.iter().copied();
     for (i, (slot, bytes)) in slots.iter().zip(outs.iter()).enumerate() {
         let _s = probe.span("htod");
         let nm = if i == 0 {
@@ -1403,10 +1419,13 @@ async fn load_nvfp4<D: DeviceClient, S: WeightSource + ?Sized>(
         });
     }
 
-    // 4) host 标量回填(层发射时作 `gb` —— 与本处字节**同源**,不同源 = 静默错值)
-    if let (Some(cell), Some(gb)) = (&w.scalar, scalars_iter.next()) {
-        cell.store(gb);
-    }
+    // 4) host 标量回填(层发射时作 `gb` —— 与本处字节**同源**,不同源 = 静默错值)。
+    // 口与值两边都已在上面硬校过(缺口/未写均拒),这里的 `expect` 是**结构保证**:
+    // `w.scalar = Some(..)` 恒成立,`scalars[0]` 恒为有限值。
+    w.scalar
+        .as_ref()
+        .expect("上面已校: NVFP4 声明必有 scalar 口")
+        .store(scalars[0]);
     probe.done();
     Ok(entries)
 }
@@ -1471,7 +1490,9 @@ fn fetch_source_bytes<S: WeightSource + ?Sized>(
     }
     // 元素通道(分带;带宽已知 = `elems`)
     let mut buf = vec![0u8; elems * 4];
-    let band = (32usize << 20).max(1); // 32MB 元素 = 8M 个 f32
+    // 带宽 = **32MB 的 f32**(不是 32M 个元素 —— 后者是 128MB,
+    // 大键上会让“整键 f32 + 整键字节”同时在场的目标白白多占一倍)
+    let band = 8usize << 20;
     let mut off = 0usize;
     while off < elems {
         let len = (elems - off).min(band);

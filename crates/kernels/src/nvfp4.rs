@@ -3,10 +3,11 @@
 //! 库本体 = `cu/nvfp4/nvfp4_gemm.cu`(nvcc → `libnvfp4.a`,目标是
 //! `compute_120a/sm_120a`)。本模块只是**薄 FFI 包装**,不含任何调度决策:
 //! 选不选这条臂由 [`crate::driver::KernelPick`] 的准入表说话(`Caps::fp4_blockscale`
-//! × `m >= 128`),不在这里另起一套 if。
+//! 这一条;M **不设门** —— 统一臂,decode 的 m=1 也走这条),不在这里另起一套 if。
 //!
 //! ## 生命周期(调用方职责)
-//! 1. [`Nvfp4Plan::new`] —— 形状 `(M,N,K)` 定死;`M ≡ 0 (mod 128)`、`K ≡ 0 (mod 16)`。
+//! 1. [`Nvfp4Plan::new`] —— 形状 `(M,N,K)` 定死;**M 任意**(tile 谓词自己处理),`N ≡ 0 (mod 8)`,
+//!    `K ≡ 0 (mod 16)`。
 //! 2. **权重**(B):`pack_b` 一次,产出 `q`(`N*K/2` 字节)+ `sf`(`sfb_bytes`),跨 M 复用
 //!    (SFB 布局只依赖 `N,K`)。
 //! 3. **激活**(A):每个 chunk `pack_a`(`M*K/2` + `sfa_bytes`);设备侧量化器见后续刀。
@@ -169,7 +170,13 @@ pub struct Nvfp4Plan {
 unsafe impl Send for Nvfp4Plan {}
 
 impl Nvfp4Plan {
-    /// 建计划。`M % 128 == 0`、`N % 128 == 0`、`K % 16 == 0` 为前提(库侧拒绝时返回 `None`)。
+    /// 建计划。前提:`M > 0`(**不要求 128 对齐**;tile 谓词自己处理不足一 tile 的行)、
+    /// `N % 8 == 0`(epilogue 向量化)、`K % 16 == 0`(块缩放粒度)。
+    /// 库侧拒绝(含 SFA 仿射模型自校验不通过)时返回 `None`。
+    ///
+    /// ⚠️ **装载期 SF 尺寸别用 `N*K/16` 硬算**:那是 `cosize` 在 `N` 128 对齐时的值;
+    /// `N` 只 8 对齐时 SFB 仍按 128 行窗口排布 ⇒ `cosize > N*K/16`。
+    /// 权威值 = [`Self::sfb_bytes`]/[`Self::sfa_bytes`](plan 里 cute 实测)。
     #[must_use]
     pub fn new(m: usize, n: usize, k: usize) -> Option<Self> {
         let (mi, ni, ki) = (i32::try_from(m).ok()?, i32::try_from(n).ok()?, i32::try_from(k).ok()?);

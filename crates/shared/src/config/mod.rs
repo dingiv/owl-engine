@@ -2548,11 +2548,35 @@ impl OwlConfig {
             }
             (_, QuantScheme::W8a8i | QuantScheme::W8a8f | QuantScheme::W8a8) => {
                 return Err(format!(
-                    "[model] quant = {:?} 暂未支持(当前:w4a16 / w4a8 / gguf q4k·iq4·iq3)",
+                    "[model] quant = {:?} 暂未支持(当前:w4a16 / w4a8 / nvfp4 / gguf q4k·iq4·iq3)",
                     self.model.quant
                 ));
             }
             _ => {}
+        }
+        // **头/表量化 × 骨架源的约束**(2026-10-28 review):
+        //
+        // `lm_head.i8q/i8s`(以及表的 q/s)是 **AWQ 源装载期现算的派生键**
+        // (`awq_build` 读 bf16 源、写 int8 派生键);纯 safetensors 源不会造它们。
+        // 旧行为:整条量化链在 safetensors 档被**静默忽略**(loader 里写死 F16),
+        // 配了跟没配一样;现在配置面真生效 ⇒ 必须在 boot 前把配不出来的组合拒掉,
+        // 不能让它跑到装载期才报“缺键”。
+        if matches!(self.model.format, ModelFormat::Safetensors) {
+            if !matches!(self.model.head_quant, HeadQuant::Off) {
+                return Err(format!(
+                    "[model] head_quant = {:?} 需要 AWQ 源(AWQ 源装载期从 bf16 现算 `lm_head.i8q/i8s`),\
+                     format = \"safetensors\" 没有这两个派生键 —— 请设 head_quant = \"off\"\
+                     或改用 format = \"awq\"",
+                    self.model.head_quant
+                ));
+            }
+            if !matches!(self.model.embed_quant, EmbedQuant::F16) {
+                return Err(format!(
+                    "[model] embed_quant = {:?} 同样需要 AWQ 源(表的 int8 也是装载期派生键),\
+                     format = \"safetensors\" 请保持 embed_quant = \"f16\"",
+                    self.model.embed_quant
+                ));
+            }
         }
         if !(0.0..=1.0).contains(&self.runtime.gpu_min_free_ratio) {
             return Err(format!(

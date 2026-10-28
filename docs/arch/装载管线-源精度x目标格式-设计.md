@@ -331,3 +331,29 @@ pub fn decode_to_f32(src: &[u8], dt: SrcDtype, out: &mut [f32]) -> Result<(), Lo
 `propose 桶形图捕获(m=0..3)` 四张 + `verify(T=4)` + `fold` 全捕；
 **AL 3.06~3.24 · decode 188~190 tok/s**（无投机 98~101 ⇒ ≈1.9×）；
 `17*23 → 391`、中文散文正常；9B GGUF 生产档回归逐字节一致。
+
+---
+
+## 13. Review 修正（2026-10-28 收尾）
+
+自审整条链路（装载 → 发射 → 进图 → 投机）后的修正，按严重度排：
+
+| # | 面 | 问题 | 修法 |
+|---|---|---|---|
+| 1 | `transform.rs::NvFp4Pack::slots` | **SF 尺寸口径错**：门按库的 `N%8` 收，却用 `N*K/16` 报字节数；SFB 的 cute 布局按 **128 行窗口**排布 ⇒ `N` 只 8 对齐时 `cosize > N*K/16`，槽会**小一号**（上卡时静默踩邻块） | 门提到 `N%128`（与层侧 `quantize_nvfp4` 同门），且尺寸直接取库的 `sf_bytes` **同一个 const fn** |
+| 2 | `load.rs::load_nvfp4` | **`gb` 静默丢失**：`if let (Some(cell), Some(gb))` 任一侧缺就跳过 ⇒ 层继续用 1.0，输出被 `1/gb` 静默缩放 | 声明缺 `scalar` 口 = 拒；`scalars` 初值 **NaN**，跑完仍非有限 = 拒（两侧都响亮） |
+| 3 | `spec_runtime.rs::SpecMode::Mtp` | **MTP × TP 二次分片**：`inp.spec` 已是本 rank 分片，`shard_draft_plan` 再切一刀（`ModelSpec::sharded` 不幂等）⇒ 双 rank 草稿头错值。旧 GGUF 分支同形，只是从没走到 | `tp>1` **结构化拒**并注明接线点（需要未分片事实） |
+| 4 | `config/mod.rs` | safetensors × `head_quant`/`embed_quant`：`i8q/i8s` 是 **AWQ 源**装载期现算的派生键；配置面真生效后会拖到装载期才报“缺键”（旧行为是整链**静默忽略**） | 配置面加门：纯 safetensors 档非 `off`/`f16` ⇒ boot 前拒，错文给两条出路 |
+| 5 | `kernels/src/nvfp4.rs`、`server/nvfp4.rs` | 文档/错文漂移：还写着 `M%128`、`m>=128` 分流（已裁决统一臂） | 改成「M 无门、N%8（库）/ N%128（装载 SF 口径）、K%16」并说明两处 N 门为何不同 |
+| 6 | `load.rs::fetch_source_bytes` | 注释说 32MB、实际 `32<<20` **元素** = 128MB f32 | 改 `8<<20`（=32MB f32），与注释一致 |
+| 7 | `safetensors.rs::fc_half_range` | 读完不 `madvise(DONTNEED)`（`convert_range` 有）⇒ 13MB 级 fc 常驻 RSS | 补上 |
+| 8 | `linear.rs::quantize_nvfp4` | 形状门不过时**静默回落 f16**（"哪层没走 fp4" 只能靠反推） | 首次 info + 逐层 debug（实测 4B 只有 `in_proj_a/b` 32×2560 回落） |
+| 9 | 死接口 | `SrcDtype::from_safetensors`、`Linear::is_nvfp4` 无消费者 | 删；前者随 fp8 源（P4）与首个消费者一起加回 |
+
+**回归证据**：4B NVFP4+MTP 三图全捕、AL 3.24、decode 190.7 tok/s、`17*23→391`；
+9B GGUF 生产档输出逐字节同（137/94/757 B）；`head_quant` 门实测 boot 拒且错文可操作。
+
+**挂账未做**：
+- `Nvfp4Runtime.plans` 无淘汰（eager prefill 的 chunk 尺寸若频繁变化会累积；每个 plan 只持 host 布局 POD，量小）。
+- `pack_weight_b` 每次调用在 C++ 侧新建线程（738 个张量 = 线程 churn）；总装载 18.4s 已达标，未优化。
+- MTP 头仍 F16（既定"二期"）⇒ propose 图内没有 FP4 算子。

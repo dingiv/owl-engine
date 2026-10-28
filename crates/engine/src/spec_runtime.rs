@@ -422,7 +422,21 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             // 去重读草稿目录的 `config.json`。旧实现除了重读,还把
             // **`qwen3_8_27b()` 预设硬编码**写在这里 —— 对 4B/0.8B 蒸馏档
             // 而言,一旦 config 缺字段就会落到 27B 默认值上。
-            // 分片同一套规则(P2.1-a):草稿与主干同 TpPlan。
+            //
+            // ⚠️ **TP 暂拒**(2026-10-28 review):`inp.spec` 是 **已按本 rank
+            // 分片**的 target spec(装载器 `shard_spec` 先跑过),而
+            // `shard_draft_plan` 会**再切一次**(`ModelSpec::sharded` 不是幂等)
+            // ⇒ 双 rank 下草稿头会被切成两半。旧代码在 GGUF 分支也是同形,
+            // 只是从不报 —— 与其静默错值,不如拒后接线(草案:传入未分片事实
+            // 或让 `sharded` 带幂等标记)。
+            if inp.tp.is_some_and(|p| !p.is_single()) {
+                return Err(ModelError::Msg(
+                    "MTP 草稿 × TP 分片尚未接线:草稿几何必须来自**未分片**事实,\
+                     而此处只有本 rank 的分片 spec(再切一次 = 静默错值;\
+                     见 spec_runtime::SpecMode::Mtp 注释)"
+                        .into(),
+                ));
+            }
             let spec = shard_draft_plan(inp.spec.clone(), inp.tp)?;
             // GGUF 档:MTP 头走**原生块**(逐键计划表)而不是 host 解到 F16 —
             // 27B 头 = Q6_K 12 张 + Q8_0 3 张 ⇒ 0.35 GB(对 0.86 GB),

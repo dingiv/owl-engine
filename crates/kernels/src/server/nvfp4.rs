@@ -45,7 +45,7 @@ impl Nvfp4Runtime {
             let plan = Nvfp4Plan::new(m, n, k).ok_or_else(|| OpError::Asset {
                 op: GEMM.into(),
                 detail: format!(
-                    "建 plan 失败 m={m} n={n} k={k}(要求 m%128==0、n%128==0、k%16==0,\
+                    "建 plan 失败 m={m} n={n} k={k}(要求 m>0(无 128 门)、n%8==0、k%16==0,\
                      且 SF 交错布局的仿射模型须与 cute 逐点一致)"
                 ),
             })?;

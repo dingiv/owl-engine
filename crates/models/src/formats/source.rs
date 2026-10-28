@@ -8,6 +8,11 @@
 //! 纪律(与 `admit.rs` 的"不许静默降级"同律):
 //! - `SrcDtype` **禁止由 plan 反推**(plan 是目标侧愿望,不是源的事实);
 //! - 表外/未实现组合 = **响亮拒**,决不许"按 f16 猜着读"。
+//!
+//! 今天的事实源 = [`crate::module::WeightSource::native_dtype`](它报的是文件
+//! 头里那个 dtype,经 [`SrcDtype::from_dtype`] 归类)。fp8 源(P4)接入时要一个
+//! **头字符串 → `SrcDtype`** 的口(`F8_E4M3` 与 `F8_E4M3FNUZ` 是两个码表,
+//! 不能混);那个函数跟它的**第一个消费者**一起加,不先摆一个没人调的空壳。
 
 use crate::contract::{Dtype, ModelError};
 
@@ -43,23 +48,6 @@ impl SrcDtype {
             Dtype::F32 => Some(SrcDtype::F32),
             Dtype::F8E4M3 => Some(SrcDtype::F8E4M3),
             Dtype::F8E5M2 => Some(SrcDtype::F8E5M2),
-            _ => None,
-        }
-    }
-
-    /// safetensors 头字符串 → 源精度。
-    ///
-    /// `F8_E4M3FN` / `F8_E5M2` 是 HF 的写法;`F8_E4M3`(无 fn)与
-    /// `F8_E4M3FNUZ` 语义不同(**不是**同一码表)⇒ 后者返回 `None`,
-    /// 由调用方响亮拒(别把 fnuz 当 fn 解)。
-    #[must_use]
-    pub fn from_safetensors(s: &str) -> Option<SrcDtype> {
-        match s {
-            "F16" => Some(SrcDtype::F16),
-            "BF16" => Some(SrcDtype::BF16),
-            "F32" => Some(SrcDtype::F32),
-            "F8_E4M3" | "F8_E4M3FN" => Some(SrcDtype::F8E4M3),
-            "F8_E5M2" => Some(SrcDtype::F8E5M2),
             _ => None,
         }
     }

@@ -114,17 +114,34 @@ impl Transform for NvFp4Pack {
     fn slots(&self) -> Result<Vec<SlotDecl>, ModelError> {
         let (n, k) = (self.rows, self.cols);
         // 形态门(与 `Linear::quantize_nvfp4` 同一谓词;此处再拒一次是**廉价自证**:
-        // 谁把不合规形状喂进来,要在装载期就响,而不是等 SF 布局写错位)
-        if k % 16 != 0 || n % 8 != 0 {
+        // 谁把不合规形状喂进来,要在装载期就响,而不是等 SF 布局写错位。
+        //
+        // **N 要 128 对齐、不是库的 8 对齐**:库对 N 只要求 `%8`(epilogue 向量化),
+        // 但 SFB 的 cute 布局按 **128 行窗口** 排布 ⇒ 未对齐时
+        // `cosize(SFB) > N*K/16`。本函数用 `N*K/16` 报字节数(装载面按它分配槽!),
+        // 一旦 N 只是 `%8`,槽就**小一号** ⇒ 上卡时静默踩邻块。
+        // 取严:装载面只接受 128 对齐的 N(层侧 `quantize_nvfp4` 的本征门也是它)。
+        if k % 16 != 0 || n % 128 != 0 {
             return Err(ModelError::Msg(format!(
-                "NVFP4: 形状 {n}x{k} 不合规(K 需 16 对齐 = 块缩放粒度,N 需 8 对齐 = epilogue 向量化)"
+                "NVFP4: 形状 {n}x{k} 不合规(K 需 16 对齐 = 块缩放粒度,\
+                 N 需 128 对齐 = SFB 的 128 行窗口;否则 SF 尺寸不是 N*K/16)"
             )));
         }
         Ok(vec![
             // 数据槽:每字节两个 e2m1(k 偶数在低 nibble)
-            SlotDecl { name: "q", dtype: Dtype::U8, shape: vec![n, k / 2] },
-            // 缩放槽:CUTLASS SFB 交错布局,字节数 = `N*K/16`(cosize 口径)
-            SlotDecl { name: "sf", dtype: Dtype::U8, shape: vec![n * k / 16] },
+            SlotDecl {
+                name: "q",
+                dtype: Dtype::U8,
+                shape: vec![n, k / 2],
+            },
+            // 缩放槽:CUTLASS SFB 交错布局,字节数 = `N*K/16`(cosize 口径)。
+            // 尺寸取**库的同一个 const fn**(`pack_weight_b` 也用它验缓冲)——
+            // 装载面与库各算一套就是上次“SF 小一号”那类静默踩坑的温床。
+            SlotDecl {
+                name: "sf",
+                dtype: Dtype::U8,
+                shape: vec![owl_kernels::nvfp4::sf_bytes(n, k)],
+            },
         ])
     }
 

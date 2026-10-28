@@ -573,6 +573,30 @@ impl Linear {
     /// - `out % 128 == 0`(SF 行按 128 pad;`out % 8 == 0` 是 epilogue 向量化前提)
     fn quantize_nvfp4(&mut self) {
         if self.in_dim % 16 != 0 || self.out_dim % 128 != 0 {
+            // **不静默**:回落到 f16 是这个档位允许的(小头/异形层),但“哪些层没走`
+            // fp4”必须可查 —— 否则“算得慢/显存没降”只能靠反推。首次一条 info
+            // (说明总体事实),逐层 debug(排查时开 level=debug 看全量)。
+            static FALLBACK_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !FALLBACK_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                owl_shared::log_info!(
+                    "boot",
+                    "NVFP4: 形状不达标的 Linear 回落 f16(in%16 / out%128;例 {} {}x{};\
+                     逐层名单开 --log-level debug)",
+                    self.w.key(),
+                    self.out_dim,
+                    self.in_dim
+                );
+            }
+            owl_shared::log_debug!(
+                "boot",
+                "NVFP4 回落 f16:{} {}x{}(in%16={} out%128={})",
+                self.w.key(),
+                self.out_dim,
+                self.in_dim,
+                self.in_dim % 16,
+                self.out_dim % 128
+            );
             return;
         }
         let key: &'static str = self.w.key();
@@ -588,11 +612,6 @@ impl Linear {
             vec![self.out_dim * self.in_dim / 16],
             Dtype::U8,
         ));
-    }
-
-    /// 本层是否走 NVFP4 臂(诊断/装载面用)
-    pub fn is_nvfp4(&self) -> bool {
-        self.nv_q.is_some()
     }
 
     /// 本层当前的权重全局缩放(发射面读)

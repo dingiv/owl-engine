@@ -271,6 +271,9 @@ impl SafeTensorsSource {
             }
             i += n;
         }
+        // 读一点装一点(与 `convert_range` 同律):MTP 头 fc 是 2×hidden 宽的
+        // 大件,不去页就会把整段留在 RSS 里(小量,但律不破)。
+        self.maps[e.map_ix].dontneed(e.start, e.nbytes);
         Some(v)
     }
 }
