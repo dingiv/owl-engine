@@ -356,6 +356,28 @@ fn generation_target_for(pos: usize, depth: usize, kind: GenerationKind) -> usiz
     }
 }
 
+/// **准入 alloc 面的 token 上界**(纯函数;与 `step_need`/`generation_target` **同一口径**)。
+///
+/// 为什么不能只算 `prompt + max_new`(2026-10-28 实测 `grant 额度不足` 的根因):
+/// 产出预算约束的是**发射**位置(`pos ≤ prompt + max_new − 1`),但块表在
+/// **最后一个 spec 轮**还要覆盖 verify 行与轮末 propose 链 —— 它们的位号
+/// 翻过产出预算继续长(`pos + 2·depth + 2`,DFlash2)。旧 alloc 面按
+/// `prompt + max_new` 折算页宽,恰好在"块边界对齐"的 prompt 上少算 1 页:
+/// 111340 + 16 tok ⇒ 旧 3480 槽,实需 3481 槽 ⇒ 生成到第 12 个 token 时
+/// 撞 `grant 额度不足` 而**整发 500**(台账 `26-10-28-位置定谳与三修` 同卷日志)。
+///
+/// 因此 alloc 面 = `generation_target_for(最后一个产出位)`，让"预留面"与
+/// "增长面"共用同一个上界函数 —— 两处各算一次就是下一次同类事故。
+fn chain_alloc_tokens(
+    prompt_tokens: usize,
+    max_new: usize,
+    depth: usize,
+    kind: GenerationKind,
+) -> usize {
+    let last_pos = prompt_tokens.saturating_add(max_new).saturating_sub(1);
+    generation_target_for(last_pos, depth, kind)
+}
+
 /// **生成预算的最小保留量**(tok):剩余额度低于它 = 真溢出(连一个像样的
 /// 工具调用/短答都放不下)⇒ 拒绝,让客户端压缩上下文。
 ///
@@ -2312,12 +2334,30 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///
     /// 这里用配置的最大 `depth`（自适应降档只会更小），宁多勿少。
     fn generation_target(&self, pos: usize) -> usize {
-        let kind = match self.dev.spec_rt.drafter.as_ref() {
+        generation_target_for(pos, self.dev.spec_rt.depth, self.generation_kind())
+    }
+
+    /// 本进程的草稿档位（`generation_target_for` 的档位入参真源）。
+    fn generation_kind(&self) -> GenerationKind {
+        match self.dev.spec_rt.drafter.as_ref() {
             Some(crate::spec_runtime::Drafter::DFlash2(_)) => GenerationKind::DFlash2,
             Some(crate::spec_runtime::Drafter::Mtp(_)) => GenerationKind::Mtp,
             None => GenerationKind::None,
-        };
-        generation_target_for(pos, self.dev.spec_rt.depth, kind)
+        }
+    }
+
+    /// **准入 alloc 面（块表可消费总槽）** —— 单源：
+    /// [`chain_alloc_tokens`] 的 token 上界按页宽折算。
+    /// 超卖档的准入面只是工作集，但块表仍会长到整条链 ⇒ alloc 必须覆盖全程。
+    pub(crate) fn chain_alloc_slots(&self, prompt_tokens: usize, max_new: usize) -> usize {
+        let page = self.dev.pool.geom.page.max(1);
+        let tokens = chain_alloc_tokens(
+            prompt_tokens,
+            max_new,
+            self.dev.spec_rt.depth,
+            self.generation_kind(),
+        );
+        tokens.div_ceil(page).max(1)
     }
 
     /// **N4 池清点**(缺口 4 的节点面):把**已在 store 池里**的 `Turn(t)` 名下块
@@ -3958,7 +3998,7 @@ mod budget_tests {
 
 #[cfg(test)]
 mod generation_target_tests {
-    use super::{generation_target_for, GenerationKind};
+    use super::{chain_alloc_tokens, generation_target_for, GenerationKind};
 
     /// Phase 2 的预留上界必须覆盖“verify + 轮末 propose”两段增长；
     /// 这些数字与 `draft.rs` 的 `fp/block`、`pos+m+depth` 同源。
@@ -3986,6 +4026,32 @@ mod generation_target_tests {
             pos + 2 * d + 2,
             "DFlash2 = fp+block，m≤d"
         );
+    }
+
+    /// **alloc 面必须覆盖 spec 滑越**（2026-10-28 `grant 额度不足` 回归门）。
+    ///
+    /// 实测失败现场：`prompt=111340 / max_new=16 / depth=7 / DFlash2 /
+    /// page=32`。最后一个产出位 = 111355，最后一个 spec 轮还要滑到
+    /// `111355 + 16 = 111371` ⇒ 实需 `ceil(111371/32) = 3481` 槽；
+    /// 旧式 `ceil((prompt+max_new)/32)` 只给 3480 ⇒ 生成到第 12 个 token 撞墙。
+    #[test]
+    fn alloc_face_covers_spec_round_overflow() {
+        let (prompt, max_new, d, page) = (111_340usize, 16usize, 7usize, 32usize);
+        let naive = prompt
+            .saturating_add(max_new)
+            .div_ceil(page);
+        let alloc = chain_alloc_tokens(prompt, max_new, d, GenerationKind::DFlash2).div_ceil(page);
+        assert_eq!(naive, 3480, "旧式（少一页）");
+        assert_eq!(alloc, 3481, "上界必须含 verify+propose 滑越");
+        // 裸 decode（depth = 0）不滑越：与旧式**逐位相等**（不得白涨池占用）。
+        for (p, m) in [(0usize, 1usize), (32, 32), (4096, 512), (111_340, 16)] {
+            let alloc0 = chain_alloc_tokens(p, m, 0, GenerationKind::None).div_ceil(page);
+            assert_eq!(
+                alloc0,
+                p.saturating_add(m).div_ceil(page).max(1),
+                "depth=0 时 alloc 面 = 旧式（{p}+{m}）"
+            );
+        }
     }
 }
 

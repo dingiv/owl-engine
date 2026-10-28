@@ -1333,10 +1333,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                         let reserved_slots = head_facts.need_pages(&l, cap).max(1);
                         // **分配面**必须覆盖整条块表（超卖档的准入面只是工作集，
                         // 后续 prefill 仍会按 chunk 长表）；非超卖档两者相等。
-                        let alloc_slots = head_facts
-                            .prompt_tokens
-                            .saturating_add(head_facts.max_new)
-                            .div_ceil(l.page.max(1))
+                        // 上界单源 = `RunningEngine::chain_alloc_slots`（
+                        // 含 spec 轮 verify/propose 的滑越，见其判据）。
+                        let alloc_slots = self
+                            .chain_alloc_slots(head_facts.prompt_tokens, head_facts.max_new)
                             .max(reserved_slots);
                         let out = self
                             .store_hook(crate::store_hook::StoreHook::capacity_reserve(
