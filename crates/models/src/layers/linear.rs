@@ -782,8 +782,11 @@ impl Linear {
         // **可捕获**(2026-10-28):整条链零 host 工作 —— `gb` 作为 kernel 标量参数
         // 烘进图(装载期常量),激活全局缩放与 alpha 全在设备算。
         //
-        // `asf` 的形状是**pad 后**口径(家族按 plan 的 `sfa_bytes` 验账长;
-        // M<128 时 CUTLASS 仍按 128 行布 SF)⇒ 这里必须同口径,否则被账长门拒。
+        // **`asf` 按 128 行 pad 口径**（实测:`sfa_bytes = ceil(M/128)·128 · K/16`）——
+        // 激活侧的 SF 布局是**按 128 行块**排的(M=1 也要一整个块 128·K/16),
+        // 与权重侧不同(`sfb_bytes = N·K/16`,不含 M)。旧注释本来就对;
+        // 2026-10-28 review 一度把它改成 `m·in/16`,起机当场被家族账长门抓住
+        // （`asf ≥ 20480 实得 160`）—— 反证正确的口径就是这个 pad。
         if let (Some(qw), Some(sf)) = (&self.nv_q, &self.nv_sf) {
             if xs.shape().is_empty() {
                 return TensorOps::poisoned(

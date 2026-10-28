@@ -1092,6 +1092,12 @@ pub enum Layout {
     /// (源的行/列数;目标形状由变换自己算)。
     ///
     /// **一源二槽**:主槽 = `q`(`Want.sink`),`sf` 走 `Want.extra`。
+    ///
+    /// ⚠️ **manifest 读法**:一源二槽意味着两件产物的 `LoadEntry` 都带着本变体
+    /// (它描述的是**源**是什么、经过了哪种变换),而**该槽自己的事实**是
+    /// `LoadEntry.{dtype, shape}`(`q` = `U8 [rows, cols/2]`,
+    /// `sf` = `U8 [rows*cols/16]`)。别人的 manifest 统计若按 `layout` 分桶,
+    /// 别把 `rows/cols` 当成该槽的矩阵形状。
     NvFp4Weight {
         /// 源行数(= out_dim;= 目标 N)
         rows: usize,
