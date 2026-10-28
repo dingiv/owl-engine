@@ -524,6 +524,26 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_5_0_8b()))?;
         log_spec_report("safetensors", &rep);
         let spec = self.shard_spec(spec)?;
+        // **同一目录自带 MTP 头 ⇒ 当草稿源**(2026-10-28 propose 进图刀)。
+        //
+        // 为何要探:HF 厂的蒸馏档把 `mtp.*`(NextN 头)直接放在主检查点里,
+        // 但 `config.json` 通常**不声明** `num_nextn_predict_layers` ⇒ spec 不
+        // 会为它建层,“有没有头”只能从**权重键**看出来(与 GGUF 档探
+        // `blk.N.nextn.*` 同律)。探到就把本目录交给 spec 运行时(那里的
+        // `SpecMode::Mtp` 分支用 `MtpPredictor` 的 `mtp.*` 键面自己装)。
+        let mtp_dir = match owl_models::formats::SafeTensorsSource::open_dir(dir) {
+            Ok(src) => match src.has_mtp_head() {
+                Ok(true) => {
+                    owl_shared::log_info!(
+                        "boot",
+                        "检查点自带 MTP/NextN 头(mtp.*):spec.draft=mtp 时由同一目录装载"
+                    );
+                    Some(dir.to_path_buf())
+                }
+                _ => None,
+            },
+            Err(_) => None,
+        };
         let model = Model::new_with_embed(
             &spec,
             Qwen35Convention::new(convention_base(&rep)),
@@ -539,7 +559,15 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         let vlm = self.load_vision_into(dir, &model, spec.dtype).await?;
-        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None, vlm })
+        Ok(LoadedModel {
+            model,
+            tokenizer,
+            rope,
+            spec,
+            quant_plan,
+            mtp_dir: self.mtp_override.clone().or(mtp_dir),
+            vlm,
+        })
     }
 
     /// W4A16 装载(E3;llm-compressor 产物目录):装载期重排到 marlin

@@ -31,13 +31,17 @@ pub struct SafeTensorsSource {
     index: Mutex<HashMap<String, Entry>>,
 }
 
-/// 张量条目(映射区内字节区间 + dtype)
-#[derive(Clone, Copy)]
+/// 张量条目(映射区内字节区间 + dtype + **形状**)
+///
+/// 形状为何要留:`mtp.fc_{e,h}` 两个**虚拟键**是 `mtp.fc.weight` 的
+/// in 维前后半(列半拆),拆法必须知道行宽 —— 只靠 `nbytes` 拆不出来。
+#[derive(Clone)]
 struct Entry {
     map_ix: usize,
     start: usize,
     nbytes: usize,
     dtype: safetensors::Dtype,
+    shape: Vec<usize>,
 }
 
 impl Entry {
@@ -101,7 +105,13 @@ impl SafeTensorsSource {
             }
             index.insert(
                 name,
-                Entry { map_ix: e.map_ix, start: e.start, nbytes: e.nbytes, dtype: e.dtype },
+                Entry {
+                    map_ix: e.map_ix,
+                    start: e.start,
+                    nbytes: e.nbytes,
+                    dtype: e.dtype,
+                    shape: e.shape.clone(),
+                },
             );
         }
         Ok(Self { maps, index: Mutex::new(index) })
@@ -188,12 +198,87 @@ impl SafeTensorsSource {
     pub fn has_key(&self, key: &str) -> Result<bool, ModelError> {
         Ok(self.idx()?.contains_key(key))
     }
+
+    /// **MTP 头是否自带**(2026-10-28 propose 进图刀):两种落盘形态都认 ——
+    /// 融合 `mtp.fc.weight`(HF 原样)或已拆好的 `mtp.fc_e/h.weight`。
+    /// 调用方据此决定 `mtp_dir`(同一目录当草稿源)。
+    pub fn has_mtp_head(&self) -> Result<bool, ModelError> {
+        let idx = self.idx()?;
+        Ok(idx.contains_key("mtp.fc.weight") || idx.contains_key("mtp.fc_e.weight"))
+    }
+
+    /// **fc 列半拆虚拟键**:`mtp.fc_{e,h}.weight` → (`mtp.fc.weight`, `high`)
+    ///
+    /// 语义:`mtp.fc.weight` = `[out, 2·hidden]` 行主序,`fc_e` 吃 embedding
+    /// 侧、`fc_h` 吃 hidden 侧 ⇒ 按 **in 维前后半**拆(`W [out, 2h]` → 两块
+    /// `[out, h]`)。与 AWQ 源的同名派生键**同语义**(那里是打包字节形态)。
+    ///
+    /// 为何不允许"用整张 `mtp.fc` 跑一条 GEMM":两半的**输入不同**(embedding /
+    /// residual),融合需要每轮 concat;拆开装载 = 零运行时开销,且与 27B/GGUF
+    /// 两条已定谳路径同形。
+    fn fc_half(&self, key: &str) -> Taken<(Entry, bool)> {
+        let high = match key {
+            "mtp.fc_e.weight" => false,
+            "mtp.fc_h.weight" => true,
+            _ => return Ok(None),
+        };
+        let Some(e) = self.idx()?.get("mtp.fc.weight").cloned() else {
+            return Ok(None);
+        };
+        if e.shape.len() != 2 || e.shape[1] % 2 != 0 {
+            return Ok(None); // 形态不对 ⇒ 按"缺键"报(不猜)
+        }
+        Ok(Some((e, high)))
+    }
+
+    /// fc 半张量的 `[offset, offset+len)` 元素区间 → f32(行内不去交织)
+    fn fc_half_range(
+        &self,
+        e: &Entry,
+        high: bool,
+        offset_elems: usize,
+        len: usize,
+    ) -> Option<Vec<f32>> {
+        let (out, din) = (e.shape.first().copied()?, e.shape.get(1).copied()?);
+        let half = din / 2;
+        let total = out * half;
+        if half == 0 || offset_elems + len > total {
+            return None;
+        }
+        let esz = e.esz();
+        let src = &self.maps[e.map_ix][e.start..e.start + e.nbytes];
+        let skip = if high { half } else { 0 };
+        let mut v = vec![0f32; len];
+        let mut i = 0usize;
+        while i < len {
+            let flat = offset_elems + i;
+            let (r, c) = (flat / half, flat % half);
+            let n = (half - c).min(len - i);
+            let base = (r * din + skip + c) * esz;
+            let chunk = &src[base..base + n * esz];
+            match e.dtype {
+                safetensors::Dtype::F32 => {
+                    for (k, c4) in chunk.chunks_exact(4).enumerate() {
+                        v[i + k] = f32::from_le_bytes([c4[0], c4[1], c4[2], c4[3]]);
+                    }
+                }
+                safetensors::Dtype::BF16 => {
+                    for (k, c2) in chunk.chunks_exact(2).enumerate() {
+                        v[i + k] = f32::from_bits((u16::from_le_bytes([c2[0], c2[1]]) as u32) << 16);
+                    }
+                }
+                _ => return None,
+            }
+            i += n;
+        }
+        Some(v)
+    }
 }
 
 impl WeightSource for SafeTensorsSource {
     /// 天然 dtype(F32/BF16;合并虚拟键 = None —— 原始通道不做行拼接)
     fn native_dtype(&self, key: &str) -> Taken<crate::contract::Dtype> {
-        if self.merged_parts(key)?.is_some() {
+        if self.merged_parts(key)?.is_some() || self.fc_half(key)?.is_some() {
             return Ok(None);
         }
         let Some(e) = self.idx()?.get(key).cloned() else {
@@ -215,7 +300,7 @@ impl WeightSource for SafeTensorsSource {
         len: usize,
         dst: &mut [u8],
     ) -> Taken<()> {
-        if self.merged_parts(key)?.is_some() {
+        if self.merged_parts(key)?.is_some() || self.fc_half(key)?.is_some() {
             return Ok(None);
         }
         let Some(e) = self.idx()?.get(key).cloned() else {
@@ -248,6 +333,9 @@ impl WeightSource for SafeTensorsSource {
         if let Some((_, n1, _, n2)) = self.merged_parts(key)? {
             return Ok(Some(n1 + n2));
         }
+        if let Some((e, _)) = self.fc_half(key)? {
+            return Ok(Some(e.shape[0] * (e.shape[1] / 2)));
+        }
         let Some(e) = self.idx()?.get(key).cloned() else {
             return Ok(None);
         };
@@ -257,6 +345,11 @@ impl WeightSource for SafeTensorsSource {
     /// 整取(F32 直读 / BF16 升位),条目即从索引移除。
     /// 流式装载主路径走 `take_range`(分块,条目保留)。
     fn take(&self, key: &str) -> Taken<Vec<f32>> {
+        if let Some((e, high)) = self.fc_half(key)? {
+            // **不摘物理键**(同源另一半还要用)
+            let n = e.shape[0] * (e.shape[1] / 2);
+            return Ok(self.fc_half_range(&e, high, 0, n));
+        }
         if let Some((k1, _, k2, _)) = self.merged_parts(key)? {
             let Some(mut v) = self.take(&k1)? else {
                 return Ok(None);
@@ -280,6 +373,9 @@ impl WeightSource for SafeTensorsSource {
 
     /// 区间转换(mmap 直读,**不移除条目** —— 分块上传同键多块重复取)
     fn take_range(&self, key: &str, offset_elems: usize, len: usize) -> Taken<Vec<f32>> {
+        if let Some((e, high)) = self.fc_half(key)? {
+            return Ok(self.fc_half_range(&e, high, offset_elems, len));
+        }
         if let Some((k1, n1, k2, _)) = self.merged_parts(key)? {
             // 行堆叠拼接:子1 元素区 [0,n1),子2 [n1,n1+n2)
             if offset_elems + len <= n1 {
@@ -318,6 +414,39 @@ impl WeightSource for SafeTensorsSource {
         dst: &mut [u8],
         dtype: crate::contract::Dtype,
     ) -> Taken<()> {
+        // **fc 列半拆虚拟键**(2026-10-28):行内去交织 + 目标 dtype 转换
+        if let Some((e, high)) = self.fc_half(key)? {
+            let Some(v) = self.fc_half_range(&e, high, offset_elems, len) else {
+                return Ok(None);
+            };
+            match dtype {
+                crate::contract::Dtype::F32 => {
+                    if dst.len() < len * 4 {
+                        return Ok(None);
+                    }
+                    for (i, x) in v.iter().enumerate() {
+                        dst[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+                    }
+                }
+                crate::contract::Dtype::F16 => {
+                    if dst.len() < len * 2 {
+                        return Ok(None);
+                    }
+                    crate::f16c::f32_slice_to_f16_bytes(&v, &mut dst[..len * 2]);
+                }
+                crate::contract::Dtype::BF16 => {
+                    if dst.len() < len * 2 {
+                        return Ok(None);
+                    }
+                    for (i, x) in v.iter().enumerate() {
+                        dst[i * 2..i * 2 + 2]
+                            .copy_from_slice(&half::bf16::from_f32(*x).to_le_bytes());
+                    }
+                }
+                _ => return Ok(None),
+            }
+            return Ok(Some(()));
+        }
         // 刀2 合并键面:跨界块拆两子键分别直写(行堆叠拼接)
         if let Some((k1, n1, k2, _)) = self.merged_parts(key)? {
             let out_esz = match dtype {

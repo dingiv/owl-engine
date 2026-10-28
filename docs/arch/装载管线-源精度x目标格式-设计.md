@@ -315,11 +315,19 @@ pub fn decode_to_f32(src: &[u8], dt: SrcDtype, out: &mut [f32]) -> Result<(), Lo
 | decode | **98~101 tok/s**（eager 时 82；F16 eager 77） ⇒ 进图 +20%、对 F16 +28% |
 | 多轮 | 连续多次请求正常（进图后不再受 eager 缺陷影响） |
 
-### 12.4 仍未覆盖
+### 12.4 propose 图（同日闭环）
 
-- **propose 图**：需要 MTP 头。4B 检查点里**有** `mtp.layers.0.*`，但其 `config.json` 没有
-  `num_nextn_predict_layers` ⇒ `ModelSpec` 不认；`load_qwen35_safetensors` 仍给 `mtp_dir: None`。
-  接线点明确：`spec_runtime.rs` 的 `SpecMode::Mtp` 分支（非 GGUF）+ `loader.rs` 里
-  「检查点有 mtp 块 ⇒ 同一目录当 mtp_dir」（GGUF 路径已有同款探测，见 `blk.N.nextn.*`）。
-  图机件相同（同一个 `NvFp4Gemm`，已可捕获），接上即验证。
-- verify 目前只验了 **dumb 草稿**（AL=1.00，无加速）—— 它证明的是「T=depth+1 图内 NVFP4 数值正确」。
+原先只有 verify（dumb 草稿证明「T=depth+1 图内 NVFP4 数值正确」）。propose 需要 MTP 头，
+而 4B 检查点**有** `mtp.layers.0.*` + `mtp.fc.weight`，只是 `config.json` 没声明
+`num_nextn_predict_layers` ⇒ spec 不为它建层。三处接线：
+
+| 面 | 改动 |
+|---|---|
+| `formats/safetensors.rs` | `Entry` 保留 `shape`；新增**虚拟键** `mtp.fc_{e,h}.weight` = `mtp.fc.weight`(`[out, 2h]`)的 in 维前/后半（行内去交织；`take` / `take_range` / `convert_chunk_into_bytes` / `elem_len` 四口同源），与 AWQ 源的同名派生键**同语义**；`has_mtp_head()` 供探测 |
+| `engine/loader.rs` | 装载完探 `mtp.fc.weight` ⇒ `mtp_dir = Some(目录)`（与 GGUF 探 `blk.N.nextn.*` 同律：**有没有头只能从权重键看出来**） |
+| `engine/spec_runtime.rs` | `SpecMode::Mtp` 非 GGUF 分支的几何改为 **target spec**（`shard_draft_plan(inp.spec, tp)`）：MTP 头与 target 同维是它的定义性质 —— 旧实现重读草稿目录 `config.json` 还把 `qwen3_8_27b()` 预设写死，4B/0.8B 档一旦 config 缺字段就落到 27B 默认值 |
+
+实测（4B NVFP4，`[spec] depth = 3, draft = "mtp"`）：
+`propose 桶形图捕获(m=0..3)` 四张 + `verify(T=4)` + `fold` 全捕；
+**AL 3.06~3.24 · decode 188~190 tok/s**（无投机 98~101 ⇒ ≈1.9×）；
+`17*23 → 391`、中文散文正常；9B GGUF 生产档回归逐字节一致。
