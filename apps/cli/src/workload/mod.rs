@@ -5,7 +5,8 @@
 //! functional (one scenario per feature family), not a stress test.
 //!
 //! Suites: `core` (all resident cases), `gui` (the real GUI-agent screenshot
-//! window), `image-evict` (image-deletion shapes), and `all` (alias of core).
+//! window), `gui-capability` (ambiguous capability prompt must still call
+//! screenshot), `image-evict` (image-deletion shapes), and `all` (alias of core).
 
 pub mod gui;
 pub mod png;
@@ -77,10 +78,10 @@ pub fn run(args: Args) -> i32 {
     let suite = args.suite.to_ascii_lowercase();
     if !matches!(
         suite.as_str(),
-        "core" | "image-evict" | "gui" | "all"
+        "core" | "image-evict" | "gui" | "gui-capability" | "all"
     ) {
         eprintln!(
-            "[workload] 未知 suite {suite:?}(core | image-evict | gui | all)"
+            "[workload] 未知 suite {suite:?}(core | image-evict | gui | gui-capability | all)"
         );
         return 2;
     }
@@ -92,6 +93,7 @@ pub fn run(args: Args) -> i32 {
     let mut reports = Vec::new();
     let mut cases: Vec<(&str, fn(&Client, &Args, u32, usize) -> Result<ScenarioReport, String>)> = vec![
         ("gui_agent_screenshots", scenarios::gui_agent_screenshots),
+        ("gui_capability_prompt", scenarios::gui_capability_prompt),
         ("text_multiturn", scenarios::text_multiturn),
         ("tool_roundtrip", scenarios::tool_roundtrip),
         ("vision_chat", scenarios::vision_chat),
@@ -104,6 +106,8 @@ pub fn run(args: Args) -> i32 {
     ];
     if suite == "gui" {
         cases.retain(|(n, _)| *n == "gui_agent_screenshots");
+    } else if suite == "gui-capability" {
+        cases.retain(|(n, _)| *n == "gui_capability_prompt");
     } else if suite == "image-evict" {
         cases.retain(|(n, _)| n.starts_with("image_"));
     }

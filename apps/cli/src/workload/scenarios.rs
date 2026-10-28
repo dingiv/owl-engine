@@ -46,6 +46,19 @@ fn nonce(pid: u32) -> String {
     format!("{pid}-{ms}")
 }
 
+/// 服务端吸收删图的日志指纹。2026-10-28 起 info 行从「前缀无感删除」
+/// 改为「[img-evict] leave-gap:」;两种都认,避免测试门跟日志文案漂移。
+fn log_has_absorbed(log: &str) -> bool {
+    log.lines()
+        .any(|l| l.contains("前缀无感删除") || l.contains("leave-gap:"))
+}
+
+fn log_absorbed_count(log: &str) -> usize {
+    log.lines()
+        .filter(|l| l.contains("前缀无感删除") || l.contains("leave-gap:"))
+        .count()
+}
+
 fn image_part(url: &str, evict: bool) -> Value {
     let mut part = json!({"type": "image_url", "image_url": {"url": url}});
     if evict {
@@ -152,7 +165,7 @@ pub(crate) fn gui_agent_screenshots(
         )?;
         let log = ctx.log_since(log_mark);
         if ctx.log_path.is_some() {
-            let absorbed = log.matches("前缀无感删除").count();
+            let absorbed = log_absorbed_count(&log);
             ensure(
                 absorbed >= 3,
                 format!(
@@ -189,6 +202,70 @@ pub(crate) fn gui_agent_screenshots(
         ))
     })();
     Ok(report("gui_agent_screenshots", ctx, result))
+}
+
+/// **质量门：能力问句也必须先调工具**。
+///
+/// 这是前端/GUI agent 的业务层护栏（不是推理引擎配置）：用户问
+/// 「你能使用 GUI 工具来浏览一下界面吗？」时，模型必须调用 `screenshot`，
+/// 不允许只输出一段“我已经看到了…”的文本。旧 GUI workload 只测脚本化的
+/// 六步任务，覆盖不到这种能力问句，所以模型幻觉没有被门抓住。
+const SYS_GUI_TOOL_GUARD: &str = "Hard rule: when the user asks you to look at, inspect, \
+browse, or operate the screen, you MUST call the `screenshot` tool first. Do NOT claim to \
+have seen the screen, and do NOT describe screen contents, unless a screenshot tool result \
+is present in the conversation. If no screenshot result is present, call the tool instead \
+of answering.";
+
+// ── 0b. quality gate: ambiguous capability prompt still must call screenshot ─
+pub(crate) fn gui_capability_prompt(
+    client: &Client,
+    args: &Args,
+    pid: u32,
+    max_tokens: usize,
+) -> Result<ScenarioReport, String> {
+    let ws = Workspace::new("gui_capability_prompt", pid, args.keep)?;
+    let mut ctx = Ctx::new(
+        client,
+        "gui_capability_prompt",
+        Some(session(pid, "gui-cap")),
+        true,
+        max_tokens,
+        ws.path(),
+    );
+    ctx.log_path = args.server_log.as_ref().map(std::path::PathBuf::from);
+    ctx.system(&format!("{SYS_GUI} {SYS_GUI_TOOL_GUARD} Run tag: {}.", nonce(pid)));
+    ctx.gui = Some(gui::GuiAgent::new());
+    ctx.image_limit = Some(3);
+    let result = (|| -> Result<String, String> {
+        let reply = ctx.send(json!("你能使用 GUI 工具来浏览一下界面吗？"))?;
+        let names = tool_names(&ctx);
+        ensure(
+            names.iter().any(|n| n == "screenshot"),
+            format!(
+                "能力问句没有触发 screenshot（模型直接文本作答）: tools={names:?} content={:?}",
+                reply.text()
+            ),
+        )?;
+        ensure(
+            ctx.turns.first().is_some_and(|t| t.finish == "tool_calls"),
+            format!("首个模型响应不是 tool_calls: {:?}", ctx.turns.first()),
+        )?;
+        ensure(
+            image_count(&ctx.history) >= 1,
+            "screenshot 结果没有作为图片回填到历史",
+        )?;
+        ensure(
+            !reply.text().trim().is_empty(),
+            "screenshot 之后没有最终正文",
+        )?;
+        Ok(format!(
+            "tools={names:?} turns={} images={} final={:?}",
+            ctx.turns.len(),
+            image_count(&ctx.history),
+            reply.text()
+        ))
+    })();
+    Ok(report("gui_capability_prompt", ctx, result))
 }
 
 // ── 1. text multi-turn ────────────────────────────────────────────────────
@@ -360,7 +437,7 @@ fn assert_image_delete_absorbed(
 ) -> Result<(), String> {
     if has_log {
         ensure(
-            log.contains("前缀无感删除"),
+            log_has_absorbed(log),
             format!(
                 "{label}: server log 未出现吸收;img-evict 行: {:?}",
                 log.lines().filter(|l| l.contains("img-evict")).collect::<Vec<_>>()
@@ -369,7 +446,7 @@ fn assert_image_delete_absorbed(
     }
     ensure(
         last.cached > 0,
-        format!("{label}: cached=0(删点之后重算;log 吸收证据={})", log.contains("前缀无感删除")),
+        format!("{label}: cached=0(删点之后重算;log 吸收证据={})", log_has_absorbed(log)),
     )?;
     ensure(
         last.cached_pct() >= min_cached_pct,
@@ -421,7 +498,7 @@ fn delete_arm(
          Answer with one lowercase English colour word."
     ))?;
     let log = ctx.log_since(log_mark);
-    let log_absorbed = log.contains("前缀无感删除");
+    let log_absorbed = log_has_absorbed(&log);
     ensure(has(&reply, "blue"), format!("保留图没答蓝: {:?}", reply.text()))?;
     let last = ctx.last();
     if marked {

@@ -23,6 +23,9 @@
 //! # 真实 GUI-agent 负载(工具结果附截图,窗口只留 3 张):
 //! cargo run -p cli -- --workload gui --url http://127.0.0.1:8135 \
 //!   --server-log /tmp/owl-8135-gui.log
+//! # 质量门:能力问句也必须先调 screenshot(不允许纯文本幻觉):
+//! cargo run -p cli -- --workload gui-capability --url http://127.0.0.1:8135 \
+//!   --server-log /tmp/owl-8135-gui.log
 //! # 调试单场景:
 //! cargo run -p cli -- --workload image-evict --only image_delete_middle \
 //!   --url http://127.0.0.1:8135 --server-log /tmp/owl-8135-image-evict.log

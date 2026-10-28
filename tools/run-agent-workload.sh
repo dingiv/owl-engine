@@ -3,7 +3,7 @@
 #
 # 用法:
 #   tools/run-agent-workload.sh [suite] [cli 额外参数...]
-#   suite = core | gui | image-evict | all
+#   suite = core | gui | gui-capability | image-evict | all
 #
 # 前置:
 #   - 端口 $OWL_WORKLOAD_PORT(缺省 8135)空闲;脚本绝不抢占现有 server。

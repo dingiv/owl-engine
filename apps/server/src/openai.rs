@@ -936,14 +936,26 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     // role 首帧延到首个内容帧(2026-10-02:提前发会让测速端把 HTTP 往返
     // 当 TTFT,长 prompt 的 prefill 全被藏进首帧延迟)
     let mut role_sent = false;
+    // 工具协议错误(畸形/缺 required/未知工具):一旦置位,后续通道全部静音,
+    // 终态按错误收口 —— 绝不再把半截工具块或空 stop 当正常结果返回。
+    let mut protocol_error: Option<&'static str> = None;
     // 写失败 ⇒ 显式弃置引擎 turn(AGT-10):actor 侧虽会在下次投递失败时
     // 发现,但显式 abort 立刻停(长思考/长输出下差几十秒 GPU)。
     // 注:宏必须在 `acc`/`role_sent` 作用域内定义 —— macro_rules 卫生:
     // 宏体内标识符按**定义点**解析,定义在前就看不到(实测踩过)
     macro_rules! emit {
         ($items:expr) => {
-            if let Err(e) = emit_items(w, mode, &id, model_name, &mut acc, &mut role_sent, $items)
-                .await
+            if let Err(e) = emit_items(
+                w,
+                mode,
+                &id,
+                model_name,
+                &mut acc,
+                &mut role_sent,
+                &mut protocol_error,
+                $items,
+            )
+            .await
             {
                 // **先关 sink 再等回执**(2026-10-20 真机定谳):本任务若还持有
                 // `sink_rx` 等 abort 回执,actor 的投递就一直成功 ⇒ 它**察觉不到**
@@ -1032,6 +1044,44 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             })) => {
                 let items = splitter.finish();
                 emit!(items);
+                if let Some(kind) = protocol_error {
+                    let msg = format!(
+                        "模型工具调用不符合 OpenAI 协议({kind});服务端已拒绝返回无效结果"
+                    );
+                    led.fail(msg.clone());
+                    owl_shared::log_warn!(
+                        "chat",
+                        "turn {:?} 工具协议错误({kind}) ⇒ 拒绝正常完成",
+                        turn.map(|(_, t)| t)
+                    );
+                    return match mode {
+                        ReplyMode::Stream => {
+                            let mut chunk =
+                                chunk_json(&id, model_name, json!({}), Some("error"));
+                            chunk["error"] = json!({
+                                "message": msg,
+                                "type": "tool_call_error",
+                                "code": kind,
+                            });
+                            http::sse_data(w, &chunk.to_string()).await?;
+                            http::sse_data(w, "[DONE]").await?;
+                            http::sse_end(w).await?;
+                            Ok(())
+                        }
+                        ReplyMode::Aggregate => {
+                            http::respond_json(
+                                w,
+                                502,
+                                &json!({"error": {
+                                    "message": msg,
+                                    "type": "tool_call_error",
+                                    "code": kind,
+                                }}),
+                            )
+                            .await
+                        }
+                    };
+                }
                 // 思考相位真账(在 finish 之后取:本 turn 再无 push)
                 usage.reasoning = splitter.reasoning_steps();
                 // 有工具调用 ⇒ finish_reason = tool_calls(pi 的 mapStopReason 只认
@@ -1362,9 +1412,16 @@ async fn emit_items<W: tokio::io::AsyncWrite + Unpin>(
     model: &str,
     acc: &mut Agg,
     role_sent: &mut bool,
+    protocol_error: &mut Option<&'static str>,
     items: Vec<Item>,
 ) -> std::io::Result<()> {
+    if protocol_error.is_some() {
+        return Ok(());
+    }
     for it in items {
+        if protocol_error.is_some() {
+            break;
+        }
         match it {
             Item::Delta { chan, text } => {
                 if mode == ReplyMode::Stream {
@@ -1412,9 +1469,12 @@ async fn emit_items<W: tokio::io::AsyncWrite + Unpin>(
             }
             // 畸形工具块:不发射工具调用(§3.3 约束 4),但**不静默**
             Item::Malformed { kind, raw } => {
+                if protocol_error.is_none() {
+                    *protocol_error = Some(kind);
+                }
                 owl_shared::log_warn!(
                     "chat",
-                    "工具块畸形({kind};{}B)已丢弃:{}",
+                    "工具块畸形({kind};{}B) ⇒ 拒绝正常返回:{}",
                     raw.len(),
                     preview(&raw)
                 );

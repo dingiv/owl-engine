@@ -63,6 +63,11 @@ const MARK_TOOL_CLOSE: &str = "</tool_call>";
 /// 形态与 XML 工具块完全一致）。只在文本/思考态遇到 `<function=` 时启用。
 const MARK_FUNCTION_OPEN: &str = "<function=";
 const MARK_FUNCTION_CLOSE: &str = "</function>";
+/// Anthropic/Claude 风格工具块（Qwen 在长 system prompt 下实测会照抄）：
+/// `<function_calls><invoke name="…"><parameter name="…">…</parameter></invoke>…</function_calls>`。
+/// 外层整体缓冲到闭合后一次解析；一个 wrapper 可含多个 invoke。
+const MARK_FUNCTION_CALLS_OPEN: &str = "<function_calls>";
+const MARK_FUNCTION_CALLS_CLOSE: &str = "</function_calls>";
 const MARK_THINK_OPEN_LONG: &str = "<thinking>";
 const MARK_THINK_CLOSE_LONG: &str = "</thinking>";
 // 第二组别名:模型偶尔混用 `thought`(实测 2026-10-14 出现过一次)。
@@ -73,12 +78,14 @@ const MARK_THINK_CLOSE_THOUGHT: &str = "</thought>";
 /// Text/Think/InToolBetween 态的识别标记(主 + 别名;游标标记也**吞掉不泄漏**,
 /// 见 `next_state`)。`</function>` 不入表:它只由工具态显式 `find`,
 /// 在正文态出现一律当普通文本(旧行为,见 `char_by_char`)。
-const MARKS: [&str; 9] = [
+const MARKS: [&str; 11] = [
     MARK_THINK_OPEN,
     MARK_THINK_CLOSE,
     MARK_TOOL_OPEN,
     MARK_TOOL_CLOSE,
     MARK_FUNCTION_OPEN,
+    MARK_FUNCTION_CALLS_OPEN,
+    MARK_FUNCTION_CALLS_CLOSE,
     MARK_THINK_OPEN_LONG,
     MARK_THINK_CLOSE_LONG,
     MARK_THINK_OPEN_THOUGHT,
@@ -101,6 +108,10 @@ fn canon(m: &str) -> &'static str {
         MARK_FUNCTION_OPEN
     } else if m == MARK_FUNCTION_CLOSE {
         MARK_FUNCTION_CLOSE
+    } else if m == MARK_FUNCTION_CALLS_OPEN {
+        MARK_FUNCTION_CALLS_OPEN
+    } else if m == MARK_FUNCTION_CALLS_CLOSE {
+        MARK_FUNCTION_CALLS_CLOSE
     } else {
         MARK_TOOL_CLOSE
     }
@@ -157,6 +168,7 @@ fn state_name(s: State) -> &'static str {
         State::Think => "think",
         State::InTool => "tool",
         State::InBareTool => "bare_tool",
+        State::InAnthropic => "anthropic_tool",
         State::InToolBetween => "between_tool",
     }
 }
@@ -168,14 +180,32 @@ enum State {
     InTool,
     /// 裸 `<function=...>...</function>`（无 `<tool_call>` 外壳）
     InBareTool,
+    /// Anthropic/Claude 风格 `<function_calls>…</function_calls>`（可含多个 invoke）
+    InAnthropic,
     /// `</function>` 已闭合，等待可选的 `</tool_call>` / 下一个工具
     InToolBetween,
 }
 
-/// 请求侧工具 schema(仅取 `name → 属性名 → JSON 类型`,用于 xml 参数类型回填)
+/// 请求侧工具 schema(取 `name → 属性名 → JSON 类型` + required;用于 xml
+/// 参数类型回填与**服务层工具调用校验**)
 #[derive(Debug, Default)]
 pub struct ToolSchemas {
     types: HashMap<String, HashMap<String, String>>,
+    required: HashMap<String, Vec<String>>,
+}
+
+/// JSON 值是否匹配 schema 标量类型。
+fn type_matches(ty: &str, v: &Json) -> bool {
+    match ty {
+        "number" | "float" => v.is_number(),
+        "integer" => v.as_i64().is_some() || v.as_u64().is_some(),
+        "boolean" => v.is_boolean(),
+        "string" => v.is_string(),
+        "array" => v.is_array(),
+        "object" => v.is_object(),
+        "null" => v.is_null(),
+        _ => true,
+    }
 }
 
 /// 取属性的标量类型；Pydantic v2 的 Optional[T] 是 `anyOf/oneOf`，
@@ -202,6 +232,7 @@ impl ToolSchemas {
     /// 从 OpenAI `tools` 数组提取(兼容嵌套 `{type,function:{…}}` 与扁平形)
     pub fn from_tools(tools: &[Json]) -> Self {
         let mut types = HashMap::new();
+        let mut required = HashMap::new();
         for t in tools {
             let f = t.get("function").unwrap_or(t);
             let Some(name) = f.get("name").and_then(|v| v.as_str()) else { continue };
@@ -217,9 +248,53 @@ impl ToolSchemas {
                     }
                 }
             }
+            let req: Vec<String> = f
+                .get("parameters")
+                .and_then(|p| p.get("required"))
+                .and_then(|r| r.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
             types.insert(name.to_string(), props);
+            required.insert(name.to_string(), req);
         }
-        Self { types }
+        Self { types, required }
+    }
+
+    /// **服务层工具调用校验**(OpenAI 语义):工具名必须在请求 tools 中;
+    /// arguments 必须是 JSON 对象;required 属性必须非 null;已知属性类型必须
+    /// 匹配。无 schema(空 tools)时不做推断 —— 返回 Ok,由上游决定。
+    fn validate(&self, name: &str, args: &str) -> Result<(), &'static str> {
+        if self.types.is_empty() {
+            return Ok(());
+        }
+        if !self.types.contains_key(name) {
+            return Err("tool_call_unknown_tool");
+        }
+        let v: Json = serde_json::from_str(args).map_err(|_| "tool_call_args_invalid_json")?;
+        let Some(obj) = v.as_object() else {
+            return Err("tool_call_args_not_object");
+        };
+        if let Some(req) = self.required.get(name) {
+            for p in req {
+                if obj.get(p).is_none_or(Json::is_null) {
+                    return Err("tool_call_missing_required");
+                }
+            }
+        }
+        if let Some(props) = self.types.get(name) {
+            for (k, ty) in props {
+                if let Some(val) = obj.get(k) {
+                    if !val.is_null() && !type_matches(ty, val) {
+                        return Err("tool_call_arg_type");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// xml 参数值 → JSON 值。**按 schema 类型回填**(xml 分支把一切写成了
@@ -324,7 +399,9 @@ impl ChannelSplitter {
                 self.tool_on
                     || (**m != MARK_TOOL_OPEN
                         && **m != MARK_TOOL_CLOSE
-                        && **m != MARK_FUNCTION_OPEN)
+                        && **m != MARK_FUNCTION_OPEN
+                        && **m != MARK_FUNCTION_CALLS_OPEN
+                        && **m != MARK_FUNCTION_CALLS_CLOSE)
             })
             .copied()
             .collect()
@@ -332,7 +409,13 @@ impl ChannelSplitter {
 
     /// 本 drain 在「工具之间」态认的结构标记(只这三个;工具解析关时不会进此态)
     fn marks_structural(&self) -> Vec<&'static str> {
-        vec![MARK_TOOL_CLOSE, MARK_TOOL_OPEN, MARK_FUNCTION_OPEN]
+        vec![
+            MARK_TOOL_CLOSE,
+            MARK_TOOL_OPEN,
+            MARK_FUNCTION_OPEN,
+            MARK_FUNCTION_CALLS_OPEN,
+            MARK_FUNCTION_CALLS_CLOSE,
+        ]
     }
 
     /// 本 turn 已解析出的工具调用数(协议层据此定 `finish_reason`)
@@ -384,10 +467,14 @@ impl ChannelSplitter {
             (State::Text, MARK_THINK_OPEN) => State::Think,
             (State::Text, MARK_TOOL_OPEN) => State::InTool,
             (State::Text, MARK_FUNCTION_OPEN) => State::InBareTool,
+            (State::Text, MARK_FUNCTION_CALLS_OPEN) => State::InAnthropic,
             (State::Think, MARK_FUNCTION_OPEN) => State::InBareTool,
+            (State::Think, MARK_FUNCTION_CALLS_OPEN) => State::InAnthropic,
             (State::InToolBetween, MARK_TOOL_CLOSE) => State::Text,
             (State::InToolBetween, MARK_TOOL_OPEN) => State::InTool,
             (State::InToolBetween, MARK_FUNCTION_OPEN) => State::InBareTool,
+            (State::InToolBetween, MARK_FUNCTION_CALLS_OPEN) => State::InAnthropic,
+            (State::InToolBetween, MARK_FUNCTION_CALLS_CLOSE) => State::Text,
             (State::Think, MARK_THINK_CLOSE) => {
                 // 模板 `\n</think>\n\n{content}` 里的 `\n\n` 归模板(单源):
                 // 后续至多两个 `\n` 从流里吞掉(不足则按实际吞尽,见 `drain`)
@@ -426,12 +513,12 @@ impl ChannelSplitter {
     pub fn finish(&mut self) -> Vec<Item> {
         let mut out = Vec::new();
         match self.state {
-            State::InTool | State::InBareTool => {
+            State::InTool | State::InBareTool | State::InAnthropic => {
                 let raw = std::mem::take(&mut self.buf);
-                let kind = if self.state == State::InBareTool {
-                    "tool_call_bare_unclosed"
-                } else {
-                    "tool_call_unclosed"
+                let kind = match self.state {
+                    State::InBareTool => "tool_call_bare_unclosed",
+                    State::InAnthropic => "tool_call_anthropic_unclosed",
+                    _ => "tool_call_unclosed",
                 };
                 self.trace_event(StructEvent::Malformed { kind, bytes: raw.len() });
                 self.malformed += 1;
@@ -501,6 +588,27 @@ impl ChannelSplitter {
                 }
             }
             match self.state {
+                State::InAnthropic => {
+                    if let Some(p) = self.buf.find(MARK_FUNCTION_CALLS_CLOSE) {
+                        let body = self.buf[..p].to_string();
+                        self.buf.drain(..p + MARK_FUNCTION_CALLS_CLOSE.len());
+                        out.extend(self.build_anthropic_calls(&body));
+                        self.state = State::Text;
+                        continue;
+                    }
+                    if self.buf.len() > MAX_TOOL_BYTES {
+                        let raw = std::mem::take(&mut self.buf);
+                        self.trace_event(StructEvent::Malformed {
+                            kind: "tool_call_anthropic_overflow",
+                            bytes: raw.len(),
+                        });
+                        self.malformed += 1;
+                        out.push(Item::Malformed { kind: "tool_call_anthropic_overflow", raw });
+                        self.state = State::Text;
+                        continue;
+                    }
+                    break; // 整体缓冲到 </function_calls>
+                }
                 State::InTool => {
                     // XML: `</function>` 就是工具体闭合（vLLM TOOL_BETWEEN 同款）；
                     // JSON: 仍以 `</tool_call>` 闭合。
@@ -555,6 +663,8 @@ impl ChannelSplitter {
                         self.state = match canon(m) {
                             MARK_TOOL_CLOSE => State::Text,
                             MARK_TOOL_OPEN => State::InTool,
+                            MARK_FUNCTION_CALLS_OPEN => State::InAnthropic,
+                            MARK_FUNCTION_CALLS_CLOSE => State::Text,
                             _ => State::InBareTool,
                         };
                         continue;
@@ -651,12 +761,67 @@ impl ChannelSplitter {
         out
     }
 
+    /// Anthropic/Claude 风格 wrapper → 一个或多个完整调用。
+    ///
+    /// 外层 `<function_calls>` 已由状态机剥掉；body 里是
+    /// `<invoke name="…">` + 可选 `<parameter name="…">…</parameter>`。
+    fn build_anthropic_calls(&mut self, body: &str) -> Vec<Item> {
+        let body = body.trim();
+        match parse_anthropic_calls(body, &self.schemas) {
+            Ok(calls) if !calls.is_empty() => {
+                // 先整组校验，任一条非法 ⇒ 整组 Malformed（不发射半组假调用）。
+                if let Some(kind) = calls
+                    .iter()
+                    .find_map(|(name, args)| self.schemas.validate(name, args).err())
+                {
+                    self.trace_event(StructEvent::Malformed { kind, bytes: body.len() });
+                    self.malformed += 1;
+                    return vec![Item::Malformed { kind, raw: body.to_string() }];
+                }
+                calls
+                    .into_iter()
+                    .map(|(name, arguments)| {
+                        let index = self.tool_index;
+                        self.tool_index += 1;
+                        self.trace_event(StructEvent::Tool {
+                            index,
+                            name: name.clone(),
+                            arg_bytes: arguments.len(),
+                        });
+                        Item::ToolCall { index, name, arguments }
+                    })
+                    .collect()
+            }
+            Ok(_) => {
+                self.trace_event(StructEvent::Malformed {
+                    kind: "tool_call_anthropic_empty",
+                    bytes: body.len(),
+                });
+                self.malformed += 1;
+                vec![Item::Malformed {
+                    kind: "tool_call_anthropic_empty",
+                    raw: body.to_string(),
+                }]
+            }
+            Err(kind) => {
+                self.trace_event(StructEvent::Malformed { kind, bytes: body.len() });
+                self.malformed += 1;
+                vec![Item::Malformed { kind, raw: body.to_string() }]
+            }
+        }
+    }
+
     /// 工具块体 → 完整调用(两格式;I4 保证 arguments 是合法 JSON 字符串)
     fn build_tool_call(&mut self, body: &str) -> Item {
         let body = body.trim();
         let index = self.tool_index;
         match parse_tool_body(body, &self.schemas) {
             Ok((name, args)) => {
+                if let Err(kind) = self.schemas.validate(&name, &args) {
+                    self.trace_event(StructEvent::Malformed { kind, bytes: body.len() });
+                    self.malformed += 1;
+                    return Item::Malformed { kind, raw: body.to_string() };
+                }
                 self.tool_index += 1;
                 self.trace_event(StructEvent::Tool {
                     index,
@@ -672,6 +837,118 @@ impl ChannelSplitter {
             }
         }
     }
+}
+
+/// 解析 Anthropic/Claude wrapper 内的一个或多个 `<invoke>`。
+fn parse_anthropic_calls(
+    body: &str,
+    schemas: &ToolSchemas,
+) -> Result<Vec<(String, String)>, &'static str> {
+    let mut calls = Vec::new();
+    let mut at = 0usize;
+    while let Some(rel) = body[at..].find("<invoke") {
+        let lt = at + rel;
+        if !body[at..lt].chars().all(|c| c.is_ascii_whitespace()) {
+            return Err("tool_call_anthropic_unexpected_text");
+        }
+        let gt = body[lt..]
+            .find('>')
+            .ok_or("tool_call_anthropic_bad_invoke")?
+            + lt;
+        let tag = &body[lt..=gt];
+        let name = xml_attr(tag, "name").ok_or("tool_call_anthropic_no_name")?;
+        if name.is_empty() {
+            return Err("tool_call_anthropic_empty_name");
+        }
+        let inner_start = gt + 1;
+        let close_rel = body[inner_start..]
+            .find("</invoke>")
+            .ok_or("tool_call_anthropic_unclosed_invoke")?;
+        let inner = &body[inner_start..inner_start + close_rel];
+        let args = parse_anthropic_params(&name, inner, schemas)?;
+        calls.push((name, args));
+        at = inner_start + close_rel + "</invoke>".len();
+    }
+    if !body[at..].chars().all(|c| c.is_ascii_whitespace()) {
+        return Err("tool_call_anthropic_unexpected_text");
+    }
+    if calls.is_empty() {
+        return Err("tool_call_anthropic_no_invoke");
+    }
+    Ok(calls)
+}
+
+/// `<invoke>` 内的 `<parameter name="…">值</parameter>` 列表 → JSON 字符串。
+fn parse_anthropic_params(
+    tool: &str,
+    inner: &str,
+    schemas: &ToolSchemas,
+) -> Result<String, &'static str> {
+    let mut obj = Map::new();
+    let mut at = 0usize;
+    while let Some(rel) = inner[at..].find("<parameter") {
+        let lt = at + rel;
+        if !inner[at..lt].chars().all(|c| c.is_ascii_whitespace()) {
+            return Err("tool_call_anthropic_unexpected_text");
+        }
+        let gt = inner[lt..]
+            .find('>')
+            .ok_or("tool_call_anthropic_bad_param")?
+            + lt;
+        let tag = &inner[lt..=gt];
+        let name = xml_attr(tag, "name").ok_or("tool_call_anthropic_param_no_name")?;
+        let value_start = gt + 1;
+        let close_rel = inner[value_start..]
+            .find("</parameter>")
+            .ok_or("tool_call_anthropic_param_unclosed")?;
+        let mut val = &inner[value_start..value_start + close_rel];
+        if let Some(v) = val.strip_prefix('\n') {
+            val = v;
+        }
+        if let Some(v) = val.strip_suffix('\n') {
+            val = v;
+        }
+        if !name.is_empty() {
+            obj.insert(name.clone(), schemas.coerce(tool, &name, val));
+        }
+        at = value_start + close_rel + "</parameter>".len();
+    }
+    if !inner[at..].chars().all(|c| c.is_ascii_whitespace()) {
+        return Err("tool_call_anthropic_unexpected_text");
+    }
+    serde_json::to_string(&Json::Object(obj))
+        .map_err(|_| "tool_call_anthropic_args_unserializable")
+}
+
+/// 从 `<invoke ...>` / `<parameter ...>` 标签里取一个带引号的属性。
+fn xml_attr(tag: &str, attr: &str) -> Option<String> {
+    let b = tag.as_bytes();
+    let mut at = 0usize;
+    while let Some(rel) = tag[at..].find(attr) {
+        let i = at + rel;
+        let before_ok = i == 0 || b[i - 1].is_ascii_whitespace();
+        let after = i + attr.len();
+        let after_ok = after >= b.len()
+            || b[after].is_ascii_whitespace()
+            || b[after] == b'=';
+        if before_ok && after_ok {
+            let mut j = skip_ws(tag, after);
+            if b.get(j) != Some(&b'=') {
+                at = after;
+                continue;
+            }
+            j = skip_ws(tag, j + 1);
+            let quote = *b.get(j)?;
+            if quote != b'"' && quote != b'\'' {
+                return None;
+            }
+            let start = j + 1;
+            let end = tag[start..].find(quote as char)?;
+            return Some(tag[start..start + end].to_string());
+        }
+        at = after;
+    }
+    None
 }
 
 /// 工具块体解析:json 格式 `{"name":…,"arguments":{…}}` 优先,其次 xml 格式
@@ -845,12 +1122,18 @@ mod tests {
     }
 
     fn tools() -> ToolSchemas {
-        ToolSchemas::from_tools(&[json!({"type":"function","function":{
-            "name":"bash",
-            "parameters":{"type":"object","properties":{
-                "command":{"type":"string"},
-                "timeout":{"type":"number"},
-                "background":{"type":"boolean"}}}}})])
+        ToolSchemas::from_tools(&[
+            json!({"type":"function","function":{
+                "name":"bash",
+                "parameters":{"type":"object","properties":{
+                    "command":{"type":"string"},
+                    "timeout":{"type":"number"},
+                    "background":{"type":"boolean"}}}}}),
+            json!({"type":"function","function":{
+                "name":"read",
+                "parameters":{"type":"object","properties":{
+                    "path":{"type":"string"}}}}}),
+        ])
     }
 
     /// 单块:思考 → 正文 → 工具调用(模板默认 xml 格式)
@@ -1367,4 +1650,193 @@ mod tests {
         assert_eq!(joined.join("|"), "R:想|T:答案", "切半不得漏出结构空白");
     }
 
+    fn anthropic_tools() -> ToolSchemas {
+        ToolSchemas::from_tools(&[
+            json!({"type":"function","function":{
+                "name":"screenshot",
+                "parameters":{"type":"object","properties":{}}}}),
+            json!({"type":"function","function":{
+                "name":"click",
+                "parameters":{"type":"object","properties":{
+                    "x":{"type":"integer"},
+                    "y":{"type":"integer"}}}}}),
+        ])
+    }
+
+    /// Anthropic/Claude 风格：`<function_calls><invoke name="…">`。
+    /// 27B 在长 system prompt 下实测会吐这个壳，而不是 Qwen 的 `<tool_call>`。
+    #[test]
+    fn anthropic_function_calls_single() {
+        let mut s = ChannelSplitter::new(true, anthropic_tools());
+        let items = s.push(
+            "我先看屏幕。\n</think>\n\n<function_calls>\n<invoke name=\"screenshot\">\n</invoke>\n</function_calls>",
+        );
+        assert_eq!(split(&items), "R:我先看屏幕。\n|", "正文不得泄漏 wrapper");
+        assert_eq!(
+            items.last(),
+            Some(&Item::ToolCall {
+                index: 0,
+                name: "screenshot".into(),
+                arguments: "{}".into(),
+            })
+        );
+        assert_eq!(s.tool_calls(), 1);
+        assert_eq!(s.malformed(), 0);
+        assert_eq!(s.strays(), 0);
+    }
+
+    /// 一个 wrapper 内多个 invoke；参数按 schema 回填类型；wrapper 后正文继续。
+    #[test]
+    fn anthropic_function_calls_multiple() {
+        let mut s = ChannelSplitter::new(false, anthropic_tools());
+        let items = s.push(
+            "<function_calls>\n\
+             <invoke name=\"click\">\n\
+             <parameter name=\"x\">64</parameter>\n\
+             <parameter name=\"y\">64</parameter>\n\
+             </invoke>\n\
+             <invoke name=\"click\">\n\
+             <parameter name=\"x\">192</parameter>\n\
+             <parameter name=\"y\">192</parameter>\n\
+             </invoke>\n\
+             </function_calls>done",
+        );
+        let calls: Vec<(usize, &str, &str)> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::ToolCall { index, name, arguments } => {
+                    Some((*index, name.as_str(), arguments.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                (0, "click", r#"{"x":64,"y":64}"#),
+                (1, "click", r#"{"x":192,"y":192}"#),
+            ]
+        );
+        assert_eq!(split(&items), "T:done|", "wrapper 后正文继续");
+        assert_eq!(s.tool_calls(), 2);
+        assert_eq!(s.malformed(), 0);
+    }
+
+    /// 逐字符切分：wrapper/invoke/parameter 跨 chunk 时不得漏进正文。
+    #[test]
+    fn anthropic_function_calls_survive_chunk_split() {
+        let src = "好，你会运维这个推特吗？\n<function_calls>\n\
+                   <invoke name=\"screenshot\">\n\
+                   </invoke>\n\
+                   </function_calls>";
+        let mut s = ChannelSplitter::new(false, anthropic_tools());
+        let mut items = Vec::new();
+        for ch in src.chars() {
+            let mut b = [0u8; 4];
+            items.extend(s.push(ch.encode_utf8(&mut b)));
+        }
+        items.extend(s.finish());
+        let text: String = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Delta { chan: Chan::Text, text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "好，你会运维这个推特吗？\n");
+        assert!(items.iter().any(|i| matches!(
+            i,
+            Item::ToolCall { name, arguments, .. } if name == "screenshot" && arguments == "{}"
+        )));
+        assert_eq!(s.tool_calls(), 1);
+        assert_eq!(s.malformed(), 0);
+    }
+
+    /// 未闭合 wrapper ⇒ Malformed，不发射假工具调用。
+    #[test]
+    fn anthropic_function_calls_unclosed_is_malformed() {
+        let mut s = ChannelSplitter::new(false, anthropic_tools());
+        assert!(s.push("<function_calls><invoke name=\"screenshot\">").is_empty());
+        let f = s.finish();
+        assert!(matches!(
+            f[0],
+            Item::Malformed { kind: "tool_call_anthropic_unclosed", .. }
+        ));
+        assert_eq!(s.tool_calls(), 0);
+    }
+
+}
+
+#[cfg(test)]
+mod tool_validation_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn schemas() -> ToolSchemas {
+        ToolSchemas::from_tools(&[
+            json!({"type":"function","function":{
+                "name":"bash",
+                "parameters":{"type":"object",
+                    "properties":{"command":{"type":"string"},"timeout":{"type":"number"}},
+                    "required":["command"]}}}),
+            json!({"type":"function","function":{
+                "name":"screenshot",
+                "parameters":{"type":"object","properties":{}}}}),
+        ])
+    }
+
+    #[test]
+    fn missing_required_and_unknown_tool_are_malformed() {
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items = s.push("<tool_call><function=bash></function></tool_call>");
+        assert!(matches!(
+            items[0],
+            Item::Malformed { kind: "tool_call_missing_required", .. }
+        ));
+        assert_eq!(s.tool_calls(), 0);
+
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items = s.push("<tool_call><function=nope></function></tool_call>");
+        assert!(matches!(
+            items[0],
+            Item::Malformed { kind: "tool_call_unknown_tool", .. }
+        ));
+        assert_eq!(s.tool_calls(), 0);
+    }
+
+    #[test]
+    fn valid_required_and_anthropic_calls_pass() {
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items = s.push(
+            "<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>",
+        );
+        assert!(matches!(
+            &items[0],
+            Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == r#"{"command":"ls"}"#
+        ));
+
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items = s.push(
+            "<function_calls><invoke name=\"bash\"><parameter name=\"command\">pwd</parameter></invoke></function_calls>",
+        );
+        assert!(matches!(
+            &items[0],
+            Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == r#"{"command":"pwd"}"#
+        ));
+    }
+
+    #[test]
+    fn anthropic_missing_required_is_whole_block_malformed() {
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items = s.push(
+            "<function_calls><invoke name=\"bash\"></invoke><invoke name=\"screenshot\"></invoke></function_calls>",
+        );
+        assert!(matches!(
+            items[0],
+            Item::Malformed { kind: "tool_call_missing_required", .. }
+        ));
+        assert_eq!(s.tool_calls(), 0, "非法组不得发射半组调用");
+    }
 }

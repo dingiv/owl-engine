@@ -968,6 +968,31 @@ DAG(lm_head gemm → argmax)核对**命令序是否与求值序一致**(gemm 的
 默认 **xml**。若真机发现 27B 在 xml 格式上产废(或 pi 侧解析问题),可切 `json`
 (`chat_template_kwargs` 之外我们自控)——**必须与解析器同批切换**,并留 A/B 记录。
 
+**2026-10-28 补记(Anthropic 风格输出)**:Pi 的 22k system prompt + 32 tools 下,
+27B 实测会吐 Claude/Anthropic 风格:
+
+```text
+<function_calls>
+<invoke name="screenshot">
+</invoke>
+</function_calls>
+```
+
+这不是模板要求的 `<tool_call>`,旧解析器会把它当正文 ⇒ Pi 侧 `tool_calls=0`。
+`toolcall.rs` 已加该别名:外层整体缓冲到 `</function_calls>`,一个 wrapper 可含多个
+`<invoke>`/`<parameter name="…">`;单测 `anthropic_function_calls_*` 4 项覆盖单发、多发、
+跨 chunk、未闭合。**与 A7/A13 不是同一问题**:A7/A13 是 prefill 末行 logits 错读;
+本项是输出格式覆盖缺口。解析器只保证"模型发出什么格式就能收",**不保证模型选对工具** ——
+后者仍是 G3 真机门。
+
+**服务层硬约束(同轮)**:`ToolSchemas` 现在同时保存 `required`，`build_tool_call` /
+`build_anthropic_calls` 在发射前校验 **工具名 ∈ 请求 tools、arguments 是对象、
+required 非 null、已知属性类型匹配**。任一失败 ⇒ `Item::Malformed`；`openai.rs`
+不再"记日志后按 stop 返回"，而是**静音后续通道并按协议错误收口**：
+非流式 502 `{error:{type:"tool_call_error",code:...}}`，流式发
+`finish_reason:"error"` 的终止帧（Pi 的 `mapStopReason` 会按 error 处理）。
+这保证前端永远看不到半截 `<function_calls>`、`bash {}` 或空 stop 假成功。
+
 ### 7.4 模型侧未知数(非本专项能解)
 
 - 27B AWQ INT4 + DFlash2 草稿在 **agent 域(代码/工具 JSON)** 的接受率**未知**
@@ -1556,6 +1581,7 @@ cargo run -p cli -- --workload image-evict --only image_delete_middle \
 |---|---|
 | `core` | 文本多轮 / 工具闭环 / 视觉 / 图文混合 + GUI-agent 窗口 + 五项图像删除 |
 | `gui` | **真实 GUI-agent 负载**：screenshot/click/type/key 工具，每个工具结果附当前截图；客户端永远只保留最新 3 张图 |
+| `gui-capability` | **质量门：能力问句也必须先调 screenshot**（`你能使用 GUI 工具来浏览一下界面吗？`）；只允许 tool_calls，不允许纯文本“我已经看到了…” |
 | `image-evict` | 只跑图像删除：首图、中间图、最后一张（无图后续）、工具轮后删图、滑动窗口 |
 
 **GUI-agent 场景**：系统提示词声明 `screenshot/click/type/key`；用户只发一次
@@ -1569,6 +1595,14 @@ agent loop 可多次调用模型，**一个模型响应可返回多个 function 
 运行条件：测试 server `snap_max≥2`
 （3 次删除需要后缀快照），且每次 transcript 带唯一 run tag（避免相同前缀
 跨会话共享带图块）。
+
+**2026-10-28 增补（`gui-capability`）**：旧的 `gui` 场景只测脚本化六步任务，
+覆盖不到“能力问句”。真机 Pi 在 `你能使用 GUI 工具来浏览一下界面吗？` 下
+没有调 `screenshot`，却输出了 VS Code 界面描述（`tools=0 / finish=stop`）。
+新场景在 **业务层 system prompt** 里加硬规则：没有 screenshot 结果时禁止声称
+看到/描述屏幕；门断言首轮 `finish=tool_calls` + `tools` 含 screenshot + 图片回填。
+这是**前端/GUI agent 的业务护栏**，不是 `[server]` 引擎配置；引擎只保留通用
+工具格式解析（见 §7.3）。
 
 判据不是模型文风，而是结构性事实：工具名与产物字节、`usage.cached_tokens`、
 服务端 info 日志 `[img-evict] 前缀无感删除`。release 构建里
