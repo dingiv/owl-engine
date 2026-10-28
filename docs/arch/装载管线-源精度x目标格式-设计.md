@@ -120,12 +120,31 @@ pub fn decode_to_f32(src: &[u8], dt: SrcDtype, out: &mut [f32]) -> Result<(), Lo
 
 | 位置 | 适用 | 判据 |
 |---|---|---|
-| **Host** | 变换是闭合表达式且源字节已在 host（流式读文件时天然如此）：**NVFP4 打包**、转置、fp8→f16 | 不需要 stream，最简单，装载期一次性 |
-| **Device** | 变换已有设备核（marlin U4B8 重排：实测把 141.7 s 降到 37.0 s） | 有现成核 + 数据量大到 host 往返不划算 |
+| **Host** | 变换是闭合表达式且源字节已在 host（流式读文件时天然如此）：转置、fp8→f16 | 不需要 stream，最简单，装载期一次性 |
+| **Device** | 变换已有设备核（marlin U4B8 重排：实测把 141.7 s 降到 37.0 s；**NVFP4 打包**：18.4 s → 5.3 s） | 有现成核 + 数据量大到 host 往返不划算 |
 
-**NVFP4 走 Host** 的理由：`pack_b` 是纯 host 函数，且源 f16 字节本来就在 host
-⇒ 装载多几秒，换来**不新增算子**（否则 quantizer 要再走一遍 client/server/ops 三件）。
-若将来要提速，把同一个 `Transform` 换成 Device 实现即可，**接口不变**。
+**已落地：同一个 `Transform` 的两个位置共存，接口不变**（2026-10-28 收尾）。
+NVFP4 原先只有 Host（理由：“`pack_b` 是纯 host 函数，不新增算子”），但那与既有
+量化族（AWQ 的 `ct_repack` = DMA 上卡 + GPU 就地重排）**两个落点**，属架构不一致
+（用户裁决）⇒ 现在：
+
+```
+设备臂（首选）: fetch → htod(源 f16/bf16 直上卡) → nvfp4_pack_weight → dtoh(g,4B) → free(源)
+host 臂（回落）: fetch → pack_weight_b（CPU）→ htod(q/sf)
+选臂判据     : face.device_kernels() && 源精度 ∈ {f16,bf16}（f32/fp8 源走 host）
+```
+
+- 设备臂是**正式算子**（`nvfp4_pack_weight`，与 GEMM 同族同 plan：SFB 布局只依赖 `N,K`，
+  plan 键取 `m=1` ⇒ 装载期建的那份被首轮 decode 直接命中），选核走 `driver::resolve`
+  （装载域的重排也归 `KernelPick`，装载器不自建执行面 —— 与 `ct_repack` 同律）。
+- 槽声明 `U8`（不透明源字节）+ `src_bf16` 旗标：同一个核吃两种源精度，声明成 F16
+  会在 bf16 源上说谎（事实面会当场按声明比对线格式）。
+- **逐字节等价是硬门**：校验档（`OWL_LOAD_VERIFY=1`）把设备产物 dtoh 回来与 host
+  同源打包 **memcmp**；要对齐三处（bf16 先落 f16 网格、`want = mx*(1/(6g))`、
+  退化回退同式），否则真实权重上会差 1 ULP（实测某层 sf 1.34% 组 / q 0.39% 字节）。
+- 顺带补源层缺口：**合并虚拟键**（`in_proj_qkvz` = `in_proj_qkv ⊕ in_proj_z`）原先无字节
+  通道（"原始通道不做行拼接"）⇒ 24 个键掉回 f32 元素通道；现按"两段同 dtype ⇒
+  行拼接 = 两次 memcpy"补齐，这些键也走设备臂，F16 档同受益（6.76 s → 3.01 s）。
 
 ---
 
@@ -340,7 +359,7 @@ pub fn decode_to_f32(src: &[u8], dt: SrcDtype, out: &mut [f32]) -> Result<(), Lo
 
 | # | 面 | 问题 | 修法 |
 |---|---|---|---|
-| 1 | `transform.rs::NvFp4Pack::slots` | **SF 尺寸口径错**：门按库的 `N%8` 收，却用 `N*K/16` 报字节数；SFB 的 cute 布局按 **128 行窗口**排布 ⇒ `N` 只 8 对齐时 `cosize > N*K/16`，槽会**小一号**（上卡时静默踩邻块） | 门提到 `N%128`（与层侧 `quantize_nvfp4` 同门），且尺寸直接取库的 `sf_bytes` **同一个 const fn** |
+| 1 | `transform.rs::NvFp4Pack::slots` | **SF 尺寸口径错**：门按库的 `N%8` 收，却用 `N*K/16` 报字节数；SFB 的布局按 128 对齐排布 ⇒ `N` 只 8 对齐时 `cosize > N*K/16`（**实测** `N=1000,K=256` ⇒ 16384 vs 16000），槽会**小一号**（上卡时静默踩邻块） | 门提到 `N%128`（与层侧 `quantize_nvfp4` 同门），且尺寸直接取库的 `sf_bytes` **同一个 const fn** |
 | 2 | `load.rs::load_nvfp4` | **`gb` 静默丢失**：`if let (Some(cell), Some(gb))` 任一侧缺就跳过 ⇒ 层继续用 1.0，输出被 `1/gb` 静默缩放 | 声明缺 `scalar` 口 = 拒；`scalars` 初值 **NaN**，跑完仍非有限 = 拒（两侧都响亮） |
 | 3 | `spec_runtime.rs::SpecMode::Mtp` | **MTP × TP 二次分片**：`inp.spec` 已是本 rank 分片，`shard_draft_plan` 再切一刀（`ModelSpec::sharded` 不幂等）⇒ 双 rank 草稿头错值。旧 GGUF 分支同形，只是从没走到 | `tp>1` **结构化拒**并注明接线点（需要未分片事实） |
 | 4 | `config/mod.rs` | safetensors × `head_quant`/`embed_quant`：`i8q/i8s` 是 **AWQ 源**装载期现算的派生键；配置面真生效后会拖到装载期才报“缺键”（旧行为是整链**静默忽略**） | 配置面加门：纯 safetensors 档非 `off`/`f16` ⇒ boot 前拒，错文给两条出路 |
@@ -357,3 +376,16 @@ pub fn decode_to_f32(src: &[u8], dt: SrcDtype, out: &mut [f32]) -> Result<(), Lo
 - `Nvfp4Runtime.plans` 无淘汰（eager prefill 的 chunk 尺寸若频繁变化会累积；每个 plan 只持 host 布局 POD，量小）。
 - `pack_weight_b` 每次调用在 C++ 侧新建线程（738 个张量 = 线程 churn）；总装载 18.4s 已达标，未优化。
 - MTP 头仍 F16（既定"二期"）⇒ propose 图内没有 FP4 算子。
+
+### 13.1 两个 SF 口径（逐档实测，2026-10-28）
+
+`check_nvfp4_shapes` 加跑 `M=1/7`、`N=1000`、`K=8` 后钉死的事实 —— **A/B 两侧不同**：
+
+| 侧 | 字节数 | 说明 |
+|---|---|---|
+| 激活 A | `ceil(M/128)·128 · K/16` | M 按 **128 行块**排。M=1 也要一整块（K=2560 ⇒ 20480B）。权威值 = `plan.sfa_bytes()` |
+| 权重 B | `N·K/16`（N 128 对齐时） | 与 M 无关；`N` 只 8 对齐时会偏大（`N=1000,K=256` ⇒ 16384 > 16000）⇒ 装载期只收 128 对齐 |
+
+> 教训（自审现场）：review 时**把 A 侧也按 `M·K/16` 缩了**，起机当场被家族的
+> 账长门抓住（`asf ≥ 20480 实得 160`）—— 长度门这层"廉价自证"直接兑现了。
+> 同时 `K=8` ⇒ `plan=NULL`（K%16），与文档一致。
