@@ -180,9 +180,15 @@ impl ReservationLedger {
             .get_mut(&id)
             .ok_or_else(|| StoreError::Unknown(format!("grant {id:?} 不在账")))?;
         if e.remaining_slots < slots || e.remaining_bytes < bytes {
+            // 诊断面必须**可行动**:光有 id 无法判断是“分配面算小了”还是
+            // “同一张票被重复消费”(2026-10-28 排障时这两者代价差一个数量级)。
+            let used_slots = e.grant.alloc_slots.saturating_sub(e.remaining_slots);
+            let used_bytes = e.grant.alloc_bytes.saturating_sub(e.remaining_bytes);
             return Err(StoreError::Budget(format!(
-                "grant {id:?} 额度不足:要 {slots} 槽/{bytes}B,剩 {} 槽/{}B",
-                e.remaining_slots, e.remaining_bytes
+                "grant {id:?} 额度不足:要 {slots} 槽/{bytes}B,剩 {} 槽/{}B\
+                 (票:turn {} {:?};分配面 {} 槽/{}B,已消费 {used_slots} 槽/{used_bytes}B)",
+                e.remaining_slots, e.remaining_bytes, e.grant.turn, e.grant.kind,
+                e.grant.alloc_slots, e.grant.alloc_bytes
             )));
         }
         e.remaining_slots -= slots;

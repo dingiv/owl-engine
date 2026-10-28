@@ -1174,6 +1174,31 @@ pub fn commit_offload(
     let n = blocks.len();
     let items: Vec<(ChainHash, HostBlock)> =
         blocks.iter().map(|(c, _)| *c).zip(table.into_slots()).collect();
+    // **活性兜底（W2, 2026-10-28）**：宿主预算被**别的会话 / 在飞批次**占满时，
+    // `land` 会以「宿主层越界 …（需先驱逐）」响亮拒 ⇒ 整发 500（实测现场 = 255k
+    // 会话第 2 轮追加，过账 16 MiB）。
+    //
+    // 为什么在这里而不是在计划面：计划面（`plan_capacity`）只能算**当时**的余量；
+    // 下沉是**分离式**的（`swap_out_begin` 发出命令就返回，`commit` 晚一拍收口），
+    // 在飞批次的宿主缓冲已经借出、既不在 `resident` 也不在 `free` ⇒ 账面上看不见。
+    // ⇒ 落地前**再问一次**，越界就按与 `plan_capacity` **同一条政策**先逐最冷
+    // （保护本批链：它们的内容马上要落宿主，让位不能反手删掉已在宿主的那几块），
+    // 然后照常落。没有可削的面时仍由 `land` 响亮拒（不静默）。
+    let fresh = items
+        .iter()
+        .filter(|(c, _)| !leg.host_contains(*c))
+        .count();
+    let deficit = leg.host.land_deficit(fresh, items.len());
+    if deficit > 0 {
+        let protect: Vec<ChainHash> = blocks.iter().map(|(c, _)| *c).collect();
+        let dropped = leg.host_relieve(deficit, &protect)?;
+        if dropped > 0 {
+            owl_shared::log_warn!(
+                "store",
+                "宿主让位:下沉落地前先逐最冷 {dropped} 块(缺口 {deficit};\n                 计划面未预见 —— 在飞下沉批次占着借台)"
+            );
+        }
+    }
     leg.host.land(items)?;
     for (chain, _) in blocks {
         leg.kv.unbind(*chain)?; // 摘绑定 + 还槽(缓存那份引用随绑定一起还)
@@ -1516,6 +1541,84 @@ mod tests {
         assert_eq!(real(l.report().host_bytes), 0, "宿主缓冲已回收");
         let after = read_slot(&mut face, &pieces, slot2).await;
         assert_eq!(after, before, "换出→换回必须逐字节一致");
+    }
+
+    /// **W2 回归门**：分离式下沉的**在飞借台**也要算进宿主预算。
+    ///
+    /// 现场(2026-10-28, 255k 会话第 2 轮追加)：宿主 10 GiB 被别的会话 + 在飞
+    /// 批次占满 ⇒ `land` 报「宿主层越界 …（需先驱逐）」而整发 500。
+    /// 判据：`plan` 借台时 `acquire` 看不见在飞块（既不在 resident 也不在 free），
+    /// 于是「4 槽预算、3 块常驻、再沉 2 块」能一路放行到落地——落地必须**先驱逐**
+    /// 再落，而不是拒。
+    #[tokio::test]
+    async fn commit_offload_evicts_when_inflight_borrow_covers_the_gap() {
+        let mut face = CpuFace::default();
+        let pieces = pieces_n(&mut face, 8).await;
+        let block_bytes = PIECE_ELEMS * 4 * 2;
+        // 宿主只容 4 块:先塞满 3 块,再沉一条 2 块的链(旧账必越界)
+        let mut l = BlockLeg::open(LegConfig {
+            slots: 8,
+            block_tokens: TOKENS_PER_BLOCK,
+            block_bytes,
+            cache: CachePolicy::Cap(16),
+            host_bytes: 4 * block_bytes,
+            class: BlockClass::KvPage,
+            label: "host-4",
+        })
+        .expect("开腿");
+        l.attach_pool(PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 1,
+            pieces: pieces.clone(),
+        })
+        .expect("注册布局");
+
+        // 三条单块链 → 各沉一块(占 3 个宿主槽)
+        for i in 0..3u32 {
+            let tokens: Vec<u32> = (i * 64..i * 64 + TOKENS_PER_BLOCK as u32).collect();
+            let mut table = Vec::new();
+            l.ensure_for_len(&mut table, TOKENS_PER_BLOCK).expect("块表");
+            l.register_chain(&tokens, &table).expect("登记");
+            let hit = l.match_prefix(&tokens).expect("命中");
+            let tail = *hit.hashes.last().expect("尾块");
+            l.release_table(&mut table).expect("会话归还");
+            do_offload(&mut l, &mut face, tail).await.expect("单块下沉");
+        }
+        assert_eq!(l.host_free_slots(), 1, "宿主: 4 槽 − 3 块驻留");
+
+        // 第四条链 = 2 块:借台时账上看不出在飞 ⇒ 两槽都能借到
+        let tokens: Vec<u32> = (1000..1000 + 2 * TOKENS_PER_BLOCK as u32).collect();
+        let mut table = Vec::new();
+        l.ensure_for_len(&mut table, 2 * TOKENS_PER_BLOCK).expect("块表");
+        l.register_chain(&tokens, &table).expect("登记");
+        let hit = l.match_prefix(&tokens).expect("命中");
+        let tail = *hit.hashes.last().expect("尾块");
+        l.release_table(&mut table).expect("会话归还");
+
+        // ① **计划面就该拒**:借到第 2 块时"在飞借台 1 块"必须计入预算
+        //    (旧账看不见它 ⇒ 一路放行,直到 land 才以「需先驱逐」整发 500)
+        let err = match plan_offload(&mut l, tail) {
+            Ok(_) => panic!("在飞借台必须计入预算(旧账放行 = land 才炸)"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, StoreError::Exhausted(_)),
+            "必须是预算不足(不是别的错): {err:?}"
+        );
+        // ② 按既有政策让位(与 `plan_kv_offload` 同一口)后重试 ⇒ 落地
+        let before = l.host_relief_blocks();
+        assert_eq!(l.host_relieve(1, &[]).expect("让位"), 1, "逐掉 1 块最冷");
+        let n = do_offload(&mut l, &mut face, tail)
+            .await
+            .expect("让位后必须能落,不许拒");
+        assert_eq!(n, 2, "两块的链整条落宿主");
+        assert!(l.host_relief_blocks() > before, "让位可观测");
+        assert!(
+            real(l.report().host_bytes) <= 4 * block_bytes,
+            "宿主物理占用 {} ≤ 预算 {}",
+            real(l.report().host_bytes),
+            4 * block_bytes
+        );
     }
 
     #[tokio::test]

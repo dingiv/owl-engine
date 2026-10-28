@@ -135,6 +135,14 @@ pub struct HostTier<K = ChainHash> {
     /// 大页提示未生效的块数(可观测面;0 = 全部生效)。
     /// 它不等于错误:提示只影响"冷写缺页速度"(159 MiB: 12ms vs 80ms),不影响内容。
     hint_failures: usize,
+    /// **已借出、尚未落账**的块数(swap 在飞批次)。
+    ///
+    /// 为什么必须记（2026-10-28 W2 定谳）：下沉是**分离式**的（`plan` 借台 →
+    /// 命令在飞 → `commit` 晚一拍落账）。借出的缓冲既不在 `resident` 也不在
+    /// `free` ⇒ 旧账**看不见它们**，于是 `acquire` 放行、`land` 才发现已越界
+    /// （实测 255k 会话第 2 轮追加：「宿主层越界 …（需先驱逐）」= 整发 500，
+    /// 过账 16 MiB = 在飞批次的块数）。本字段让预算看到**物理占用**。
+    outstanding: usize,
 }
 
 /// 宿主层键(可寻址 + 可打印)。
@@ -165,6 +173,7 @@ impl<K: HostKey> HostTier<K> {
             evicted_bytes: 0,
             duplicate_landings: 0,
             hint_failures: 0,
+            outstanding: 0,
         })
     }
 
@@ -186,22 +195,29 @@ impl<K: HostKey> HostTier<K> {
     /// 取一块空缓冲(优先复用;新建时**先判预算** —— 超界响亮拒)。
     pub fn acquire(&mut self) -> StoreResult<HostBlock> {
         if let Some(b) = self.free.pop() {
+            // 空转缓冲 → 借出台(free → outstanding;总量不变,不必再判预算)
+            self.outstanding += 1;
             return Ok(b);
         }
         if self.is_disabled() {
             return Err(StoreError::Exhausted("宿主层已关闭(host_bytes = 0)".into()));
         }
-        let after = self.used_bytes() + self.free_bytes() + self.block_bytes;
+        // **物理占用** = 驻留 + 空转 + 在飞借台 + 本次;在飞那块旧账看不见。
+        let after = self.used_bytes()
+            + self.free_bytes()
+            + self.outstanding * self.block_bytes
+            + self.block_bytes;
         if after > self.budget_bytes {
             return Err(StoreError::Exhausted(format!(
-                "宿主层越界:{after} > {}(关层请置 0,放量请调大 host_bytes)",
-                self.budget_bytes
+                "宿主层越界:{after} > {}(关层请置 0,放量请调大 host_bytes;在飞借台 {} 块)",
+                self.budget_bytes, self.outstanding
             )));
         }
         let b = HostBlock::zeroed(self.block_bytes);
         if !b.hugepage() {
             self.hint_failures += 1;
         }
+        self.outstanding += 1;
         Ok(b)
     }
 
@@ -256,13 +272,17 @@ impl<K: HostKey> HostTier<K> {
                 fresh += 1;
             }
         }
-        let after = self.used_bytes() + fresh * self.block_bytes;
+        // 落地后物理占用 = 驻留(+新落) + 仍在飞的借台(其余批次)
+        let landing = items.len().min(self.outstanding);
+        let remain = self.outstanding - landing;
+        let after = self.used_bytes() + fresh * self.block_bytes + remain * self.block_bytes;
         if self.budget_bytes != 0 && after > self.budget_bytes {
             return Err(StoreError::Exhausted(format!(
-                "宿主层越界:{after} > {}(需先驱逐)",
-                self.budget_bytes
+                "宿主层越界:{after} > {}(需先驱逐;在飞借台 {} 块)",
+                self.budget_bytes, remain
             )));
         }
+        self.outstanding = remain;
         // ② 落地
         for (chain, buf) in items {
             if let Some(stale) = self.resident.remove(&chain) {
@@ -281,9 +301,28 @@ impl<K: HostKey> HostTier<K> {
 
     /// **批量回收空转缓冲**(换入后内容已上行;超 `free_cap` 的真释放)。
     pub fn recycle_many(&mut self, bufs: Vec<HostBlock>) {
+        // 这些都是**借出台还回来**的缓冲(超界回滚 / 回灌失败回滚)
+        self.outstanding = self.outstanding.saturating_sub(bufs.len());
         for b in bufs {
             self.recycle(b);
         }
+    }
+
+    /// **落地缺口**（零副作用预判;块数 = 必须先腾出的宿主槽）。
+    ///
+    /// 用途:执行面在 `land` 之前问一次 ⇒ 缺口 > 0 就先按政策**驱逐**再落
+    /// （`commit_offload` 的活性兜底;2026-10-28 255k 会话第 2 轮实测
+    /// 「宿主层越界 …（需先驱逐）」= 整发 500）。
+    ///
+    /// 算式与 [`Self::land`] **逐字同源**（含在飞借台）—— 两处各算一份就是
+    /// 下一次"预判说没事、落地却拒"的同类事故。
+    pub fn land_deficit(&self, fresh: usize, landing: usize) -> usize {
+        if self.budget_bytes == 0 {
+            return 0;
+        }
+        let remain = self.outstanding.saturating_sub(landing);
+        let after = self.used_bytes() + (fresh + remain) * self.block_bytes;
+        after.saturating_sub(self.budget_bytes).div_ceil(self.block_bytes.max(1))
     }
 
     /// 登记驻留(内容落到宿主层)。
@@ -298,11 +337,13 @@ impl<K: HostKey> HostTier<K> {
         if self.resident.contains_key(&block) {
             return Err(StoreError::Invariant(format!("块 {block:?} 已在宿主层")));
         }
-        let after = self.used_bytes() + self.block_bytes;
+        // 本块来自借台 ⇒ 结算在飞计数(仍要按**物理占用**判预算)
+        self.outstanding = self.outstanding.saturating_sub(1);
+        let after = self.used_bytes() + self.outstanding * self.block_bytes + self.block_bytes;
         if self.budget_bytes != 0 && after > self.budget_bytes {
             return Err(StoreError::Exhausted(format!(
-                "宿主层越界:{after} > {}(需先驱逐)",
-                self.budget_bytes
+                "宿主层越界:{after} > {}(需先驱逐;在飞借台 {} 块)",
+                self.budget_bytes, self.outstanding
             )));
         }
         self.resident.insert(block, buf);

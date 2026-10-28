@@ -1120,6 +1120,37 @@ impl Rel {
         }
     }
 
+    /// **逐块下沉计划**（选择层生产路径;宿主满时**先逐最冷再重试**）。
+    ///
+    /// 与 [`Self::plan_kv_offload`]（链级）**同一条政策**：计划面负责经济性
+    /// （`plan_capacity` 按宿主容量出票），执行面负责**活性**（计划乐观/滞后时
+    /// 不许让 turn 硬崩）。
+    ///
+    /// 为什么必须有这一口（2026-10-28 W2）：KVMem 选择层的下沉是**逐块**的
+    /// （`exec/coverage.rs` 每个边界踢出若干块），旧实现直呼
+    /// `plan_offload_blocks` ⇒ 宿主被**别的会话的旧链**填满时 `lend_slots` 直接
+    /// `Exhausted` ⇒ 整发 500。链级票当时已有 `plan_kv_offload` 兜底，逐块票
+    /// 漏了 —— 两条路必须对称。
+    ///
+    /// `protect` = 本批要沉的链自己（它们的内容即将落宿主，让位时不能反手删掉
+    /// 其中已在宿主的那几块，否则链上缺一段、前缀永远拼不回来）。
+    pub fn plan_kv_offload_blocks(
+        &mut self,
+        chains: &[ChainHash],
+    ) -> StoreResult<crate::leg::BlockOutPlan> {
+        match crate::leg::plan_offload_blocks(&mut self.leg, chains) {
+            Ok(p) => Ok(p),
+            Err(StoreError::Exhausted(why)) => {
+                // 需求 = 本批块数（上界；让位是多删无害的冷块，少删才会再撞）
+                if self.leg.host_relieve(chains.len(), chains)? == 0 {
+                    return Err(StoreError::Exhausted(why));
+                }
+                crate::leg::plan_offload_blocks(&mut self.leg, chains)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     // ───────────────── 状态腿搬运口(§25.2;与 KV 腿同形:store 出计划与账) ─────────────────
 
     /// 状态腿的片(逐 (层,quad);`dev_off = 槽 × 行宽`)。
@@ -2418,6 +2449,59 @@ mod tests {
 
         let p = r.plan_kv_offload(b).expect("先逐最冷再借台");
         assert_eq!(p.blocks.len(), 1, "B 的一整块拿到票");
+        assert_eq!(r.leg.host_relief_blocks(), 1, "让位块数入账（可观测）");
+        assert!(!r.leg.host_contains(a), "最冷宿主链已被丢");
+        assert_eq!(p.table.len(), 1, "借到 1 个宿主槽台（未提交前 B 仍在设备）");
+    }
+
+    /// **逐块票的同一道活性兜底**（W2;2026-10-28）：选择层的下沉是**逐块**的
+    /// （`exec/coverage.rs`），旧实现直呼 `plan_offload_blocks` ⇒ 宿主被别的
+    /// 会话填满时 `Exhausted` 直接 500。这里钉住"逐块票也能先逐最冷再出票"。
+    #[test]
+    fn plan_kv_offload_blocks_relieves_host_before_lending_slots() {
+        let i = inputs();
+        let mut cfg = kv_cfg(64, 32);
+        // 宿主只容一块 ⇒ B 下沉前必须让位
+        cfg.host_bytes = BLOCK_BYTES;
+        let mut r = Rel::open(
+            i.clone(),
+            AdmissionPolicy::new(2, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+        )
+        .expect("装配");
+        let ta = toks(32);
+        let tb: Vec<u32> = (100..132).collect();
+        for t in [&ta, &tb] {
+            let mut table = Vec::new();
+            r.ensure_for_len_unreserved(&mut table, 32).expect("块表");
+            r.register_chain(t, &table).expect("登记");
+            r.release_table(&mut table).expect("归还");
+        }
+        let a = r.leg.tail_hash(&ta, 1).expect("A 身份");
+        let b = r.leg.tail_hash(&tb, 1).expect("B 身份");
+        r.leg
+            .attach_pool(crate::leg::PoolLayout {
+                class: crate::leg::BlockClass::KvPage,
+                epoch: 0,
+                pieces: vec![crate::leg::PieceSpec {
+                    buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                    stride_bytes: BLOCK_BYTES,
+                }],
+            })
+            .expect("布局");
+        r.leg
+            .put_host(
+                a,
+                crate::host::HostBlock::from_bytes(vec![7u8; BLOCK_BYTES]),
+            )
+            .expect("A 入宿主");
+        assert_eq!(r.leg.host_free_slots(), 0, "宿主已满");
+
+        let p = r
+            .plan_kv_offload_blocks(&[b])
+            .expect("逐块票:先逐最冷再借台");
+        assert_eq!(p.blocks.len(), 1, "B 拿到一块票");
         assert_eq!(r.leg.host_relief_blocks(), 1, "让位块数入账（可观测）");
         assert!(!r.leg.host_contains(a), "最冷宿主链已被丢");
         assert_eq!(p.table.len(), 1, "借到 1 个宿主槽台（未提交前 B 仍在设备）");

@@ -729,7 +729,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let (blocks, pieces, tbl) = {
                 // diag-only(store-hook): 选择层诊断直接取搬运计划，不走生产
                 // StoreHook；生产路径只经 pump/store_hook。
-                let p = owl_store::plan_offload_blocks(&mut self.bank.rel.leg, &hashes)?;
+                let p = self.bank.rel.plan_kv_offload_blocks(&hashes)?;
                 if p.skipped.len() > 0 {
                     owl_shared::log_warn!(
                         "cov-probe",
