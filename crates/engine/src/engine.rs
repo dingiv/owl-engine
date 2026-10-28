@@ -138,6 +138,12 @@ pub struct EngineKnobs {
     /// (单 3090 / 27B / w4a8 / 64k 实测 prefill 1791→1994 t/s,+10.5%)。
     /// **语义变更**(过去只读选中块),默认不开 —— 质量门未立。
     pub prefill_view: owl_shared::config::PrefillViewMode,
+    /// **prefill 召回点的选块口径**(`[kvmem].prefill_select`;缺省 `Topk` = 旧行为)。
+    ///
+    /// `Recency` = 参照实现 `repos/ninfer-kvmem-actkv` 的 prefill 口径
+    /// (`pick_prefill_ungrouped`:sink + 从最新往前填满 ⇒ 可见面 = 头 + **连续**
+    /// 近期窗)。受控对照用:scattered top-k 窗口是否让模型 OOD。
+    pub prefill_select: owl_shared::config::PrefillSelectMode,
     /// **驱逐策略**(B-4;缺省 `lru`)。`OWL_EVICT_POLICY=lrfu[:λ]`。
     ///
     /// - `lru` = 现役基线(`last_use` 升序);
@@ -174,6 +180,19 @@ pub struct EngineKnobs {
     /// 保底 sink / recent(块;缺省 2 / 4)
     pub select_sink: usize,
     pub select_recent: usize,
+    /// **保底 sink / recent 的 token 口径**(`[kvmem].select_*_tokens`;0 = 用块数)。
+    /// boot 期按页宽换成块数写入 `select_sink`/`select_recent`(单源 = 块口径)。
+    pub select_sink_tokens: usize,
+    pub select_recent_tokens: usize,
+    /// **召回打分 scorer**(`[kvmem].score_mode`;缺省 cosine-max = 历史行为)。
+    pub score_mode: owl_shared::config::ScoreModeCfg,
+    /// **query 窗 token 数**(`[kvmem].select_query_tokens`;缺省 64)。
+    pub select_query_tokens: usize,
+    /// **一跳邻接传播强度 α**(`[kvmem].select_graph_alpha`;缺省 0 = 关)。
+    pub select_graph_alpha: f32,
+    /// **时间序分层抽样块数**(`[kvmem].select_stratified`;缺省 0 = 关)。
+    /// 与 sink/recent 同级**先占预算**,余下才给 top-k —— 保证"全文每段都有眼睛"。
+    pub select_stratified: usize,
     /// **召回节奏**(块边界):每 k 个边界做一次**完整召回**(打分+按分选择),
     /// 其余边界**只采索引、不干预驻留**。缺省 **1 = 每个边界都完整召回**
     /// (旧行为,逐位不变)。`OWL_RECALL_EVERY` / `[kvmem].recall_every`。
@@ -305,6 +324,9 @@ pub struct EngineKnobs {
     pub vram_target: f64,
     /// VRAM 预留 MiB(缺省 1024;原 OWL_VRAM_RESERVE_MB)
     pub vram_reserve_mb: u64,
+    /// **超卖档池外瞬态余量 MiB**(`[pool].transient_reserve_mb`;缺省 1024)。
+    /// 池 = `cap − ceil(mb / per_tok)`。原来是 `state.rs` 里写死的 1 GiB。
+    pub transient_reserve_mb: u64,
     /// 裸续写输出,绕过 chat 模板(原 OWL_RAW_COMPLETION)
     pub raw_completion: bool,
     /// 采样开关(缺省开;OWL_SAMPLER=greedy → false)
@@ -355,6 +377,7 @@ impl Default for EngineKnobs {
             select_decode: false,
             select_partial: false,
             prefill_view: owl_shared::config::PrefillViewMode::default(),
+            prefill_select: owl_shared::config::PrefillSelectMode::default(),
             evict_policy: owl_store::EvictPolicyKind::Lru,
             workspace_per_req: 2240,
             verify_view_tokens: 0,
@@ -363,6 +386,12 @@ impl Default for EngineKnobs {
             select_blocks: 64,
             select_sink: 2,
             select_recent: 4,
+            select_stratified: 0,
+            select_query_tokens: 64,
+            select_graph_alpha: 0.0,
+            score_mode: owl_shared::config::ScoreModeCfg::default(),
+            select_sink_tokens: 0,
+            select_recent_tokens: 0,
             recall_every: 1,
             kvmem_virtualization: false,
             dense_floor_mib: None,
@@ -399,6 +428,7 @@ impl Default for EngineKnobs {
             snap_msg_min_span: 0,
             vram_target: 0.97,
             vram_reserve_mb: 1024,
+            transient_reserve_mb: 1024,
             raw_completion: false,
             sampler_enabled: true,
             sampler: crate::sampler::SamplerCfg::default(),
@@ -512,7 +542,6 @@ impl EngineKnobs {
         knobs: &mut EngineKnobs,
     ) -> Result<(usize, usize)> {
         let page = page_tokens.max(1);
-        let keep = knobs.select_sink + knobs.select_recent;
         let ws_pages = workspace_tokens.div_ceil(page).max(1);
         if knobs.verify_view_tokens > workspace_tokens {
             return Err(owl_iface::contract::ModelError::Msg(format!(
@@ -520,10 +549,23 @@ impl EngineKnobs {
                 knobs.verify_view_tokens, workspace_tokens
             )));
         }
+        // **token 口径的保底**(参照实现 `resolve_kvmem_keep_allocation`):boot 期
+        // 按页宽换成块数 —— 之后全仓只认块口径(单源)。`<= 0` 的 token 数 = 用块数。
+        if knobs.select_sink_tokens > 0 {
+            knobs.select_sink = knobs.select_sink_tokens.div_ceil(page);
+        }
+        if knobs.select_recent_tokens > 0 {
+            knobs.select_recent = knobs.select_recent_tokens.div_ceil(page);
+        }
+        // 保底 = sink + recent + **分层抽样**(三者同级先占预算;分层为 0 时逐位回退)
+        let keep = knobs.select_sink
+            + knobs.select_recent
+            + knobs.select_stratified;
         if ws_pages < keep {
             return Err(owl_iface::contract::ModelError::Msg(format!(
-                "boot: 每 turn 工作集不自洽 —— workspace_per_req={} tok = {} 页 < 保底                  (sink {} + recent {} = {} 页);要么调大工作集,要么调小保底",
-                workspace_tokens, ws_pages, knobs.select_sink, knobs.select_recent, keep
+                "boot: 每 turn 工作集不自洽 —— workspace_per_req={} tok = {} 页 < 保底                  (sink {} + recent {} + 分层 {} = {} 页);要么调大工作集,要么调小保底",
+                workspace_tokens, ws_pages, knobs.select_sink, knobs.select_recent,
+                knobs.select_stratified, keep
             )));
         }
         // `select_blocks` = **总选中数(含保底)** —— 工作集页数就是它;保底是
@@ -697,6 +739,7 @@ impl EngineKnobs {
             select_decode: cfg.kvmem.select_decode,
             select_partial: cfg.kvmem.select_partial,
             prefill_view: cfg.kvmem.prefill_view,
+            prefill_select: cfg.kvmem.prefill_select,
             evict_policy: Self::evict_policy_of(&cfg.kvmem),
             workspace_per_req: cfg.kvmem.workspace_per_req,
             verify_view_tokens: cfg.kvmem.verify_view_tokens,
@@ -710,6 +753,12 @@ impl EngineKnobs {
             select_blocks: 64,
             select_sink: cfg.kvmem.select_sink,
             select_recent: cfg.kvmem.select_recent,
+            select_stratified: cfg.kvmem.select_stratified,
+            select_query_tokens: cfg.kvmem.select_query_tokens.max(1),
+            score_mode: cfg.kvmem.score_mode,
+            select_graph_alpha: cfg.kvmem.select_graph_alpha as f32,
+            select_sink_tokens: cfg.kvmem.select_sink_tokens,
+            select_recent_tokens: cfg.kvmem.select_recent_tokens,
             recall_every: cfg.kvmem.recall_every,
             kvmem_virtualization: cfg.kvmem.virtualization_enabled(),
             // 地板 = **事实**(MiB 配置项);页数在装配期按池页宽落(`derive_turn_ws`)。
@@ -768,6 +817,7 @@ impl EngineKnobs {
             snap_msg_min_span: cfg.pool.snap_msg_min_span,
             vram_target: cfg.pool.vram_target,
             vram_reserve_mb: cfg.pool.vram_reserve_mb,
+            transient_reserve_mb: cfg.pool.transient_reserve_mb,
             raw_completion: cfg.probes.raw_completion,
             sampler_enabled: cfg.sampling.mode == owl_shared::config::SamplerMode::Sampling,
             sampler: crate::sampler::SamplerCfg::from_sampling(&cfg.sampling),
@@ -1868,7 +1918,7 @@ fn boot_pool_floor(
     owl_shared::log_info!(
         "turn-ws",
         "每 turn 工作集 = {} tok = {} 页 = {} KiB(页 {} tok / {} KiB)⇒ \
-         常驻 {} 块 = 保底 sink {} + recent {} + 召回 top-k {};准入地板 = {};\
+         常驻 {} 块 = 保底 sink {} + recent {} + 分层 {} + 召回 top-k {};准入地板 = {};\
          池下限 = {} 并发 × (工作集 {} + 驻留尾 {} 页[视图 {} / 索引 {}] = {} 页) = {} 页(池 {} 页){}\
          (改工作集只动 `[kvmem].workspace_per_req`;`select_blocks` 是派生量)",
         cfg.knobs.workspace_per_req,
@@ -1879,7 +1929,8 @@ fn boot_pool_floor(
         ws_pages,
         cfg.knobs.select_sink,
         cfg.knobs.select_recent,
-        ws_pages - keep_pages,
+        cfg.knobs.select_stratified.min(ws_pages - keep_pages),
+        ws_pages - keep_pages - cfg.knobs.select_stratified.min(ws_pages - keep_pages),
         floor_desc,
         n_active,
         ws_pages,
@@ -1961,31 +2012,27 @@ fn boot_pool_floor(
             floor_desc,
             cfg.knobs.host_cache_mb + cfg.knobs.snap_host_mb,
                 );
-        // 🔴 **可用上下文上限 = 池容量,不是 `max_seq`**(2026-10-27 实测定谳)。
+        // ℹ️ **超池上下文 = 稀疏读；机制已修，只剩覆盖率**(2026-10-28 定谳)。
         //
-        // 超卖档的链一旦越过池,链上就出现占位符 ⇒ `past_view_of` 必须换稀疏视图
-        // (on-hole 也逃不掉),prefill 每个 chunk 只能看到
-        // `工作集 + 本 chunk` 那么长的"过去"。实测(真实中文文档 / greedy):
+        // 旧结论（"可用上下文 = 池容量、64k 起 out=1"）的根因是 **FI 的
+        // `ctx_total` 口径错配**（喂核 `ctx_base+t` 绝对口径 vs 建表
+        // `view_tokens+t`）⇒ 越 `indptr` 读越界页号。已修 + 硬断守卫
+        // （`exec/prefill_chunk.rs`；台账 `26-10-28-KVMem-位置定谳与三修.md` §6）。
         //
-        // | prompt | 输出 |
-        // |---|---|
-        // | 48k(≤池 47744) | 正常(176 tok) |
-        // | 64k / 72k / 80k / 96k / 124k(>池) | **out=1,finish=stop**(退化) |
-        //
-        // 同一批 prompt 在非超卖档(8135 TP2 262k)全部正常。⇒ **262144 是
-        // "装得下",不是"读得懂"**。客户端必须按池容量限流,否则模型会静默地
-        // 只吐一两个字 —— 这条 WARN 就是那件事的现场提示。
+        // 修后实测：108k prompt 在单卡 3090（池 47.7k）上正确答题；160k 需要
+        // `workspace_per_req ≥ 8192`（可见性门 7 小节：ws4096 3/7 → ws8192 5/7
+        // → ws16384 6/7）。⇒ **本条不再是"限流"提示，而是"调工作集"提示**。
         let usable = pool.geom.nb * pool.geom.page;
         if cfg.knobs.select_partial && s > usable {
-            owl_shared::log_warn!(
+            owl_shared::log_info!(
                 "boot",
-                "🔴 KVMem 超卖档的**可用上下文上限 = 池容量 {} tok**(= {} 页 × {});\
-                 `max_seq = {}` 只保证 KV 装得下 —— 超池后 prefill 退化为稀疏视图,\
-                 实测 64k 起输出退到 1 token(对比非超卖档同 prompt 正常)。\
-                 长上下文请用非超卖档(TP2),或把 max_seq 降到池以内。",
+                "ℹ️ KVMem 超卖档：池 {} tok × 超卖 {:.2}×（max_seq={}）—— 超池后走**稀疏读**\
+                 （2026-10-28 修 `ctx_total` 口径错配后**不再退化成 out=1**）。\
+                 长上下文的杠杆 = `[kvmem].workspace_per_req`：可见内容 ≈ 它的大小\
+                 （72k 文档实测 ws=4096 43% / 8192 71% / 12288+ 86% 小节召回）。\
+                 全文通读类任务仍建议非超卖 TP2 档。",
                 usable,
-                pool.geom.nb,
-                pool.geom.page,
+                s as f64 / usable as f64,
                 s
             );
         }
@@ -2260,6 +2307,7 @@ fn boot_pool_plan(
         snap_max: cfg.knobs.snap_max,
         vram_target: cfg.knobs.vram_target,
         vram_reserve_mb: cfg.knobs.vram_reserve_mb,
+        transient_reserve_mb: cfg.knobs.transient_reserve_mb,
         // B-2:选择层视图面(**生产档也要** —— 视图是 decode 的消费方;
         // 与诊断面 `coverage_probe` 解耦)
         select_view: cfg.knobs.coverage_probe || cfg.knobs.select_decode,

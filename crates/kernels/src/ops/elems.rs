@@ -1339,6 +1339,93 @@ impl KernelSpec for MeanKBlockFp8 {
 pub static OWL_MEAN_K_BLOCK_F16: KernelMeta = meta_of::<MeanKBlockF16>();
 pub static OWL_MEAN_K_BLOCK_FP8: KernelMeta = meta_of::<MeanKBlockFp8>();
 
+// ============================================================================
+// **page-softmax 召回打分**(2026-10-28;参照实现 `page_softmax_scores` 设备版)
+// ============================================================================
+//
+// 三段一组(逐层发射;scratch `[W,hq,nb]` f16 逐层复用):
+// ① logits → ② 逐 (t,h) 的 max/Σexp → ③ 逐块累加（无原子）。
+// 语义 = `owl_store::score_blocks(ScoreMode::SoftmaxMean)`：
+// `out[b] = (1/(L·hq)) · Σ_t Σ_h softmax_b(q[t,h]·mk[b,g(h)]·scale)`。
+//
+// **为什么上设备**：softmax 非线性 ⇒ token/GQA 头**不可折叠** ⇒ host 代价
+// `W×L×hq×nb×hd`（72k/2240 块 ≈ 28 GFLOP，实测 4.4 s/边界）。
+
+/// ① `owl_kvscore_logits_f16` —— 块瓦片 × 单 token 出 logits。
+pub struct KvScoreLogitsF16;
+
+#[kernel_tags("dom.elem", "role.kv_read", "phase.prefill")]
+impl KernelSpec for KvScoreLogitsF16 {
+    const ENTRY: &'static str = "owl_kvscore_logits_f16";
+    const SRC: &'static str = "cu/elems/page_softmax.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 2),    // [W, hq, hd]（去位置后的 q̃）
+        Param::t_in("mk", Dtype::F16, 2),   // [nb, hkv, hd]（本层 mean-K）
+        Param::t_in("gqa", Dtype::U32, 1),  // [hq] ⇒ kv 头(u32 承载;核内按 int 读)
+        Param::i32("W"),
+        Param::i32("hq"),
+        Param::i32("hkv"),
+        Param::i32("hd"),
+        Param::i32("nb"),
+        Param::f32("scale"),
+        Param::t_out("z", Dtype::F16, 2),   // [W, hq, nb]
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::F16),
+        head_dim: &[128, 256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// ② `owl_kvscore_maxsum` —— 逐 (t,h) 的行 max 与 Σexp。
+pub struct KvScoreMaxSum;
+
+#[kernel_tags("dom.elem", "role.kv_read", "phase.prefill")]
+impl KernelSpec for KvScoreMaxSum {
+    const ENTRY: &'static str = "owl_kvscore_maxsum";
+    const SRC: &'static str = "cu/elems/page_softmax.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("z", Dtype::F16, 2),
+        Param::i32("W"),
+        Param::i32("hq"),
+        Param::i32("nb"),
+        Param::t_out("ms_out", Dtype::F32, 2), // [W, hq, 2]
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+/// ③ `owl_kvscore_acc` —— 逐块累加（每块只属一个 CTA ⇒ 无原子）。
+pub struct KvScoreAcc;
+
+#[kernel_tags("dom.elem", "role.kv_read", "phase.prefill")]
+impl KernelSpec for KvScoreAcc {
+    const ENTRY: &'static str = "owl_kvscore_acc";
+    const SRC: &'static str = "cu/elems/page_softmax.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("z", Dtype::F16, 2),
+        Param::t_in("ms", Dtype::F32, 2),
+        Param::i32("W"),
+        Param::i32("hq"),
+        Param::i32("nb"),
+        Param::i32("layers"),
+        Param::t_out("out", Dtype::F32, 2), // [nb]（跨层累加）
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static OWL_KVSCORE_LOGITS_F16: KernelMeta = meta_of::<KvScoreLogitsF16>();
+pub static OWL_KVSCORE_MAXSUM: KernelMeta = meta_of::<KvScoreMaxSum>();
+pub static OWL_KVSCORE_ACC: KernelMeta = meta_of::<KvScoreAcc>();
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1366,3 +1453,4 @@ mod tests {
         }
     }
 }
+

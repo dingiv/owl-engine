@@ -88,6 +88,11 @@ impl MeanKIndex {
         (self.dim, self.layers, self.kv_heads)
     }
 
+    /// **KV 头数**(设备打分内核按 `[nb, hkv, hd]` 打包 mean-K 需要它)。
+    pub fn kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+
     /// 每块条目数。
     pub fn entries_per_block(&self) -> usize {
         self.layers * self.kv_heads
@@ -530,6 +535,14 @@ impl QueryFace {
     /// 几何(层, 查询头, dim)。
     pub fn geometry(&self) -> (usize, usize, usize) {
         (self.layers, self.q_heads, self.dim)
+    }
+
+    /// **逐 token 的扁平行**(`[layer][q_head][dim]`;去 RoPE)。
+    ///
+    /// 单源读取口 —— 设备软最大打分(`owl_kvscore_*`)要把 q̃ 打包上卡,
+    /// 不允许旁路直接摸 `tokens` 字段(几何/长度契约住本类型)。
+    pub fn token_rows(&self) -> &[Vec<f32>] {
+        &self.tokens
     }
 
     /// **窗合并**(B-1 快路;`ScoreMode::LogitMean` 专用):
@@ -1128,12 +1141,55 @@ pub struct SelectBudget {
     pub sink: usize,
     /// **保底 recent**(时间序最后的若干块)。
     pub recent: usize,
+    /// **时间序分层抽样块数**(2026-10-28;P1-3 覆盖率门)。
+    ///
+    /// 语义 = 在「sink 之后、recent 之前」的**中间区间**里按**等距分桶**各取一块
+    /// (每桶取中点),保证"全文每一段都至少有一双眼"。它和 sink/recent 一样
+    /// **优先占预算**,top-k 只能填剩下的位置。
+    ///
+    /// 为什么需要它:纯 top-k 召回下,注意力分散的文档(全文通读/对比类)
+    /// 会整段整段地看不见,而这对 decoder 是分布外输入 —— 实测"丢 11% 就塌"
+    /// 那类现象(2026-10-28)在机制修好后仍会以"答不出/瞎猜"的形态剩余。
+    /// 参考实现里对应的是 `pick_prefill_ungrouped` 的"头 + 连续近期窗"+
+    /// `resolve_kvmem_keep_allocation` 的 token 级保底。
+    ///
+    /// `0` = 关(旧行为,逐位可回退)。
+    pub stratified: usize,
+    /// **一跳邻接传播强度 α**(参照实现 `propagate_query_scores`;`0` = 关)。
+    ///
+    /// 语义(与 `repos/kvmem/kvmem/src/host/graph_recall.cpp` 逐式同源):
+    /// 只在**正证据**上传播,负残差留在原地 ——
+    ///
+    /// ```text
+    /// total  = Σ max(s_i, 0)                     (仅候选域)
+    /// seed_i = max(s_i, 0) / total
+    /// δ      = total · seed_i · α · 0.25         (对每个相邻块 ±1 各转一次)
+    /// out_i  = max( min(s_i,0), s_i − Σδ_out + Σδ_in )
+    /// ```
+    ///
+    /// 参照实现另有"注意力边"通道(α·0.5·edge.mass/Σmass,跨消息 ×0.25)与
+    /// message span 系数;我们**暂无**注意力图采集 ⇒ 只做**邻接**通道。
+    /// 作用:被高分砸中的块**带上左右邻** ⇒ 选中集变成"成段"而不是"散点",
+    /// 这对 decoder 的局部连贯性(以及"整段不可见"的病)是关键。
+    pub graph_alpha: f32,
 }
 
 impl SelectBudget {
     /// 构造(预算为 0 = 选择层关;调用方据此走 dense 路径)。
     pub fn new(blocks: usize, sink: usize, recent: usize) -> Self {
-        Self { blocks, sink, recent }
+        Self { blocks, sink, recent, stratified: 0, graph_alpha: 0.0 }
+    }
+
+    /// 追加一跳邻接传播(构建器写法;`0` = 关)。
+    pub fn with_graph_alpha(mut self, alpha: f32) -> Self {
+        self.graph_alpha = alpha;
+        self
+    }
+
+    /// 追加时间序分层抽样(构建器写法;`0` = 不动)。
+    pub fn with_stratified(mut self, stratified: usize) -> Self {
+        self.stratified = stratified;
+        self
     }
 }
 
@@ -1146,6 +1202,60 @@ pub struct BlockSet {
     pub dropped: usize,
     /// 保底 sink/recent 占的位数(报告面)。
     pub reserved: usize,
+}
+
+/// **一跳邻接传播**(参照实现 `propagate_query_scores` 的邻接通道)。
+///
+/// 输入 `scores` 与 `order`(时间序候选域)同序;输出同长。
+///
+/// 与参照实现**逐式同源**(`repos/kvmem/kvmem/src/host/graph_recall.cpp`):
+///
+/// ```text
+/// total  = Σ max(s_i, 0)                        // 正证据总量(候选域内)
+/// seed_i = max(s_i, 0) / total
+/// δ      = total · seed_i · α · 0.25            // 每个 ±1 邻块各转一次
+/// out_i  = max( min(s_i,0), s_i − Σδ_out + Σδ_in )
+/// ```
+///
+/// 三条语义必须保留(踩过就懂):
+/// - **只传正证据**:负残差 `min(s,0)` 留在原地且作为下界(不许被邻居抬到负数以上
+///   再抹掉排序信息);
+/// - **`α = 0` 精确旁路**(旧行为逐位可回退);全非正 ⇒ 原样返回;
+/// - 候选域 = `order`(不在域内的邻块**不接收**,质量留在源头)。
+///
+/// 我们暂无"注意力边"通道(α·0.5·edge/Σedge,跨消息 ×0.25),只做邻接。
+pub fn propagate_adjacent(scores: &[f32], alpha: f32) -> Vec<f32> {
+    let n = scores.len();
+    if alpha <= 0.0 || n <= 1 || !alpha.is_finite() {
+        return scores.to_vec();
+    }
+    let total: f32 = scores.iter().map(|s| s.max(0.0)).sum();
+    if !(total > 0.0) {
+        return scores.to_vec();
+    }
+    let mut out = scores.to_vec();
+    for i in 0..n {
+        let positive = scores[i].max(0.0);
+        if positive <= 0.0 {
+            continue;
+        }
+        let seed = positive / total;
+        let delta = total * seed * alpha * 0.25;
+        // 左邻 / 右邻(域内才转;质量守恒:源减、目标加)
+        if i > 0 {
+            out[i] -= delta;
+            out[i - 1] += delta;
+        }
+        if i + 1 < n {
+            out[i] -= delta;
+            out[i + 1] += delta;
+        }
+    }
+    // 负残差是下界(负证据不外传,也不被抹平)
+    for i in 0..n {
+        out[i] = out[i].max(scores[i].min(0.0));
+    }
+    out
 }
 
 /// **纯近期选择**(无打分、无排序):sink 保底 + recent 保底 + **从尾往前填满**。
@@ -1213,8 +1323,24 @@ pub fn select(
     for (b, s) in scored {
         table.insert(*b, *s);
     }
-    let score_of =
-        |b: &ChainHash| -> f32 { table.get(b).copied().unwrap_or(f32::NEG_INFINITY) };
+    // **一跳邻接传播**(参照实现 `propagate_query_scores` 的邻接通道;α = 0 精确旁路)。
+    // 在**时间序候选域**(`order`)上做:域外的邻块不接收(质量留在源头)。
+    // 结果按 `order` 下标索引 ⇒ 下面的 `score_of` 仍是 O(1)(不许退化成线性查找)。
+    let propagated: Vec<f32> = {
+        let raw: Vec<f32> = order
+            .iter()
+            .map(|b| table.get(b).copied().unwrap_or(f32::NEG_INFINITY))
+            .collect();
+        propagate_adjacent(&raw, budget.graph_alpha)
+    };
+    let idx_of: std::collections::HashMap<ChainHash, usize> =
+        order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+    let score_of = |b: &ChainHash| -> f32 {
+        match idx_of.get(b) {
+            Some(i) => propagated[*i],
+            None => f32::NEG_INFINITY,
+        }
+    };
     // ① 保底:sink(时间序最前) + recent(时间序最后)
     let n = order.len();
     let sink_n = budget.sink.min(n);
@@ -1226,7 +1352,27 @@ pub fn select(
     for p in picked.iter_mut().skip(n.saturating_sub(recent_n)) {
         *p = true;
     }
-    let reserved = picked.iter().filter(|x| **x).count();
+    let mut reserved = picked.iter().filter(|x| **x).count();
+    // ①′ **时间序分层抽样**(P1-3):中间区间等距分桶,每桶取中点。
+    //
+    // 判据:纯 top-k 下"没被高分砸中"的段落**整段不可见** —— 对全文通读/对比
+    // 类任务是分布外输入(实测丢了 11% 就答不出)。分层位与 sink/recent 同级,
+    // **先占预算**,top-k 只填剩下的。
+    if budget.stratified > 0 && n > sink_n + recent_n {
+        let lo = sink_n;
+        let hi = n - recent_n;
+        let mid = hi - lo;
+        let want = budget.stratified.min(mid);
+        // 等距分桶取中点:第 j 桶 = [lo + j*mid/want, lo + (j+1)*mid/want)
+        for j in 0..want {
+            let idx = lo + ((2 * j + 1) * mid) / (2 * want);
+            let idx = idx.min(hi - 1);
+            if !picked[idx] {
+                picked[idx] = true;
+                reserved += 1;
+            }
+        }
+    }
     // ② 按分补足(分高者优先;同分 = 时间序靠后优先 —— 论文的"越近越可能有用")
     let mut rest: Vec<(usize, f32)> = (0..n)
         .filter(|i| !picked[*i])
@@ -1736,6 +1882,74 @@ mod tests {
         // 全 -inf / 空 = 零(不 panic)
         assert_eq!(block_mass(&[f32::NEG_INFINITY; 3], &[0, 1, 2], 3).iter().sum::<f32>(), 0.0);
         assert!(coverage_curve(&[], &[], &[1]).iter().all(|(_, c)| *c == 0.0));
+    }
+
+    /// **一跳邻接传播**(参照实现 `propagate_query_scores` 邻接通道)。
+    /// 数值级钉死:δ = total·seed·α·0.25 两边各一份 ⇒ α=0.2 时邻块得 0.5。
+    #[test]
+    fn adjacent_propagation_matches_reference_formula() {
+        // α = 0 = 精确旁路
+        let s = [0.0f32, 0.0, 10.0, 0.0, 0.0];
+        assert_eq!(propagate_adjacent(&s, 0.0), s.to_vec());
+        // α = 0.2:total = 10, seed[2] = 1 ⇒ δ = 10·1·0.2·0.25 = 0.5
+        let g = propagate_adjacent(&s, 0.2);
+        assert!((g[1] - 0.5).abs() < 1e-6, "左邻应得 δ=0.5,实得 {}", g[1]);
+        assert!((g[3] - 0.5).abs() < 1e-6, "右邻应得 δ=0.5,实得 {}", g[3]);
+        assert!((g[2] - 9.0).abs() < 1e-6, "源应失 2δ=1.0,实得 {}", g[2]);
+        // 质量守恒(总和不增不减;负下界不影响正证据)
+        let sum: f32 = g.iter().sum();
+        assert!((sum - 10.0).abs() < 1e-5, "传播必须守恒,实得 {sum}");
+        // **负证据的语义**(与参照实现一致):负分**不外传**(不作为种子),但它
+        // **可以接收**邻居的正证据,且下界 = 自身负值 ⇒ 永远抬不到 0 以上。
+        let s2 = [-5.0f32, 10.0, 0.0];
+        let g2 = propagate_adjacent(&s2, 0.2);
+        assert!((g2[0] + 4.5).abs() < 1e-6, "负块应只被抬 δ=0.5(下界 −5),实得 {}", g2[0]);
+        assert!(g2[0] <= 0.0, "负证据不得越过 0(否则排序信息被抹平)");
+        // 全非正 ⇒ 原样
+        let s3 = [-1.0f32, -2.0, -3.0];
+        assert_eq!(propagate_adjacent(&s3, 0.2), s3.to_vec());
+        // 边界:单元素 / 全零
+        assert_eq!(propagate_adjacent(&[7.0], 0.2), vec![7.0]);
+        assert_eq!(propagate_adjacent(&[0.0, 0.0], 0.2), vec![0.0, 0.0]);
+    }
+
+    /// **P1-3 覆盖率门:时间序分层抽样**(2026-10-28)。
+    ///
+    /// 判据三条:① 中间区间**每段都有人**(不是靠分数运气);
+    /// ② 输出仍**时间序**(页表契约);③ `stratified = 0` 逐位回退旧行为。
+    #[test]
+    fn stratified_selection_covers_whole_middle_range() {
+        let n = 100usize;
+        let order: Vec<ChainHash> = (0..n as u64).map(ChainHash::new).collect();
+        // 分数故意做成"只有尾段高"(模拟 top-k 只爱近处)⇒ 纯 top-k 会整段跳过开头
+        let scored: Vec<(ChainHash, f32)> =
+            order.iter().enumerate().map(|(i, b)| (*b, i as f32)).collect();
+        let b = SelectBudget::new(12, 1, 1);
+        let plain = select(&scored, &order, b);
+        assert_eq!(plain.blocks.len(), 12);
+        // 纯 top-k:除 sink(块 0)与 recent(块 99)外,其余全在尾段
+        assert!(plain.blocks.iter().skip(1).take(10).all(|h| h.raw() >= 88));
+
+        let strat = select(&scored, &order, b.with_stratified(8));
+        assert_eq!(strat.blocks.len(), 12, "分层位挤占 top-k,总量不变");
+        // ② 时间序
+        let raw: Vec<u64> = strat.blocks.iter().map(|h| h.raw()).collect();
+        let mut sorted = raw.clone();
+        sorted.sort_unstable();
+        assert_eq!(raw, sorted, "选中集必须按时间序输出(页表契约)");
+        // ① 中间区间 [1, 99) 四等分,每段至少落一个分层块
+        for q in 0..4u64 {
+            let lo = 1 + q * 24;
+            let hi = lo + 24;
+            assert!(
+                raw.iter().any(|v| *v >= lo && *v < hi),
+                "第 {q} 段 [{lo},{hi}) 没有选中块:分层失效 ⇒ 该段对模型完全不可见(raw={raw:?})"
+            );
+        }
+        // 确定性(同输入同输出;界面上不许抖)
+        assert_eq!(strat, select(&scored, &order, b.with_stratified(8)));
+        // ③ 0 = 旧行为
+        assert_eq!(select(&scored, &order, b.with_stratified(0)), plain);
     }
 
     #[test]

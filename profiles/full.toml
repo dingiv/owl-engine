@@ -292,6 +292,19 @@ gqa_aggregation = "max"
 query_replay = false
 select_sink = 2
 select_recent = 4
+# 时间序分层抽样块数(P1-3 覆盖率门;0 = 关 = 旧行为)。
+# >0 ⇒ 中间区间等距取块,保证全文每段都有一双眼(top-k 只填剩余位)。
+select_stratified = 0
+# 保底 sink/recent 的 **token 口径**(0 = 用上面的块数;参照实现配方 sink/recent=12288/1024 tok)
+select_sink_tokens = 0
+select_recent_tokens = 0
+# query 窗(打分用最近多少行;参照实现默认 512,我们历史值 64)
+select_query_tokens = 64
+# 召回打分 scorer:`cosine-max`(折叠热路) | `cosine-mean` | `softmax-mean`(参照实现默认,
+# 逐 token softmax;不可折叠 ⇒ host 侧 72k 不可用,需 GPU 化) | `logit-mean`
+score_mode = "cosine-max"
+# 一跳邻接传播 α(参照实现 propagate_query_scores;0 = 关,cosine 打分缺省也是 0)
+select_graph_alpha = 0.0
 recall_every = 1
 # prefill 过去视图口径：on-hole（缺省，= 旧行为，池内走全量链）| always
 # always = prefill 与 decode 同源稀疏视图 ⇒ attention ∝ 工作集（64k +10.5%）。
@@ -300,6 +313,9 @@ recall_every = 1
 # 复现：60k system（超池）时 C1 只 output 1 token；同一上下文 on-hole 正常 176。
 # ⇒ agent/工具调用场景**必须** on-hole；always 只留给"纯长文档、无 system 契约"的实验。
 prefill_view = "on-hole"
+# 召回点选块口径:`topk`(缺省,按 cosine 补足 = scattered)|
+# `recency`(参照实现 prefill 口径 = 头 + 连续近期窗;2026-10-28 受控对照)
+prefill_select = "topk"
 coverage_probe = false
 analyze_at_ctx = 0
 # lru | lrfu | lrfu:0.8

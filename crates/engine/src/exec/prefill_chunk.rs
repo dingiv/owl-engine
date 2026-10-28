@@ -534,7 +534,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             if let Some(qs) = cov_q {
                 if let Some(sel) = host.sel.as_deref_mut() {
                     let (pl, pc) = sel.analysis_pair();
-                    self.coverage_take_q(qs, base, t, pl, pc).await?;
+                    let w_tok = host.knobs.select_query_tokens.max(1);
+                    self.coverage_take_q(qs, base, t, w_tok, pl, pc).await?;
                 }
             } else if !host.q_needed
                 && self.pool.geom.paged
@@ -716,7 +717,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             if let Some(qs) = cov_q {
                 if let Some(sel) = host.sel.as_deref_mut() {
                     let (pl, pc) = sel.analysis_pair();
-                    self.coverage_take_q(qs, base, t, pl, pc).await?;
+                    let w_tok = host.knobs.select_query_tokens.max(1);
+                    self.coverage_take_q(qs, base, t, w_tok, pl, pc).await?;
                 }
             } else if !host.q_needed
                 && self.pool.geom.paged

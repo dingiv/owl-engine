@@ -851,6 +851,65 @@ impl PrefillViewMode {
     }
 }
 
+/// **prefill 召回点的选块口径**(2026-10-28;参照实现 `repos/ninfer-kvmem-actkv`)。
+///
+/// 两边都是**原位置稀疏**(方案 A,不变 K、不 re-RoPE),差别只在"挑哪批块":
+///
+/// - `topk`(缺省 = 我们现有行为):sink + recent + **按 cosine 分数补足**。
+///   选中块**散布在全文档**,相邻可见块之间常有空洞。
+/// - `recency`(参考实现的 prefill 路径 `pick_prefill_ungrouped`):
+///   sink + **从最新块往前填满** ⇒ 可见面是"头部 + 一段**连续**的近期窗口",
+///   与普通滑动窗口推理同分布。
+///
+/// 为何要有这个开关:参考实现的**产品路径在 prefill 用 recency、decode 用 top-k**,
+/// 而我们 prefill 一直用 top-k。实测(2026-10-28,23k 文档 / ws 17408):
+/// top-k 窗口下模型对"末尾事实"都答不出(out=1),而同一可见量的 dense 运行正常
+/// ⇒ 怀疑 scattered 窗口是 OOD。本开关用来做受控对照。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefillSelectMode {
+    /// 按 cosine 分数补足(缺省 = 旧行为,逐位可回退)。
+    #[default]
+    Topk,
+    /// 从最新块往前填满(参考实现的 prefill 口径;`store::select_recency`)。
+    Recency,
+}
+
+/// 召回打分口径(见 [`KvmemCfg::score_mode`])。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScoreModeCfg {
+    /// 余弦 + GQA 组内 max(缺省 = 历史行为,折叠热路)
+    #[default]
+    CosineMax,
+    /// 余弦 + 组内均值
+    CosineMean,
+    /// **参照实现默认**:逐 token × (层,查询头) 对候选块 softmax
+    SoftmaxMean,
+    /// 原始 logit 均值(对照)
+    LogitMean,
+}
+
+impl ScoreModeCfg {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CosineMax => "cosine-max",
+            Self::CosineMean => "cosine-mean",
+            Self::SoftmaxMean => "softmax-mean",
+            Self::LogitMean => "logit-mean",
+        }
+    }
+}
+
+impl PrefillSelectMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Topk => "topk",
+            Self::Recency => "recency",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KvmemCfg {
@@ -903,6 +962,42 @@ pub struct KvmemCfg {
     pub select_sink: usize,
     /// 保底 recent(时间序最后的若干块)。
     pub select_recent: usize,
+    /// **保底 sink / recent 的 token 口径**(参照实现 `resolve_kvmem_keep_allocation`;
+    /// 缺省 0 = 用块数 `select_sink`/`select_recent`)。
+    ///
+    /// 为什么要 token 口径:参照实现的配方是 `sink/recent = 12288/1024` **token**
+    /// (B=36864)⇒ sink 占预算 1/3。我们缺省只有 2 块(64 tok),长 system /
+    /// tools schema 几乎全在保底面外。boot 期按页宽换成块数(**单源**:之后
+    /// 全仓只认 `select_sink`/`select_recent` 的块口径)。
+    pub select_sink_tokens: usize,
+    /// 见 [`Self::select_sink_tokens`](recent 侧;缺省 0 = 用块数)。
+    pub select_recent_tokens: usize,
+    /// **召回打分的 scorer**(参照实现默认 = `page-softmax`;我们的历史值 = cosine-max)。
+    ///
+    /// - `cosine-max`(缺省):逐 (层, KV 头) 余弦、GQA 组内取 max —— **折叠热路**
+    ///   (窗 Σ + 头 Σ)⇒ 50×~24× 便宜,但**不能配大 query 窗**(实测 512 窗反而变差);
+    /// - `cosine-mean`:同上,组内取均值;
+    /// - `softmax-mean`(参照实现默认):**逐 token × (层,查询头) 对候选块做 softmax**
+    ///   —— 语义上更对(注意力是分布),但**不可折叠** ⇒ host 侧代价
+    ///   `W × 层 × 查询头 × 块 × dim`(72k/2240 块 ≈ 14 GFLOP/边界)⇒
+    ///   **必须上 GPU 才可用**(参照实现就是这么做的:page LSE 内核)。
+    /// - `logit-mean`:原始 logit 均值(对照用)。
+    pub score_mode: ScoreModeCfg,
+    /// **query 窗 token 数**(打分用最近多少行;缺省 64 = 旧行为)。
+    /// 参照实现默认 **512**(`--kvmem-query-max-tokens`)。窗越大越不容易
+    /// "只盯最后几个字",代价 = 打分线性放慢。
+    pub select_query_tokens: usize,
+    /// **一跳邻接传播强度 α**(参照实现 `propagate_query_scores`;缺省 0 = 关)。
+    /// >0 ⇒ 高分块带上左右邻(选中集成"段"而不是"散点")。
+    /// 参照缺省 = 0.2(page-softmax 打分)/ 0(cosine 打分)。
+    pub select_graph_alpha: f64,
+    /// **时间序分层抽样块数**(P1-3 覆盖率门;缺省 0 = 关)。
+    ///
+    /// 在「sink 之后、recent 之前」的中间区间**等距分桶各取一块**,与
+    /// sink/recent 同级**先占预算**(top-k 只填剩下的)。用途:纯 top-k 下
+    /// 注意力分散的文档会整段不可见 ⇒ 全文通读/对比类任务退化成瞎猜。
+    /// 判据/门见 `roadmap.local/26-10-28-KVMem-位置定谳与三修.md` §7。
+    pub select_stratified: usize,
     /// **召回节奏**:每 k 个块边界做一次**完整召回**(打分+按分选择),
     /// 其余边界**只采索引、不干预驻留**(驻留交给 A 轴,下一次完整召回时对齐)。
     /// **末个边界永远是完整召回**(decode 消费的视图取自它)。
@@ -917,7 +1012,10 @@ pub struct KvmemCfg {
     ///   prefill **1791 → 1994 t/s**,+10.5%);代价 = 过去只读选中块,
     ///   **是语义变更**。默认不开:质量门(长文 QA/检索命中率)尚未立。
     pub prefill_view: PrefillViewMode,
-    /// **覆盖率探针(诊断面;缺省关)**。开则在末个边界额外做**真重诊断**:
+    /// **prefill 召回点的选块口径**(缺省 `topk` = 旧行为;`recency` = 参考实现口径)。
+    /// 只在 `recall_every` 的**完整召回**边界生效;decode 的视图取自末个边界。
+    /// 受控对照用:[`PrefillSelectMode`]。
+    pub prefill_select: PrefillSelectMode,
     /// K/V 全量回读 + host 逐元素解码 + `true_block_mass`(逐 query 行 ×(层,头)
     /// 扫**全 ctx**)+ 论文口径对照 + 方案 A/B 对照 + 覆盖率/上界报告。
     /// 单边界成本**含 ctx 因子** ⇒ 全军 O(ctx²)(27B/8k 实测单次 6.3s = 墙钟 32%)。
@@ -1712,6 +1810,7 @@ impl Default for KvmemCfg {
             select_decode: false,
             select_partial: false,
             prefill_view: PrefillViewMode::default(),
+            prefill_select: PrefillSelectMode::default(),
             index: false,
             index_gpu: true,
             // 2240 tok = 70 页 × 32 tok = 保底 6 + 召回 64 块(与旧 `select_blocks=64` 等值)
@@ -1722,6 +1821,12 @@ impl Default for KvmemCfg {
             query_replay: false,
             select_sink: 2,
             select_recent: 4,
+            select_stratified: 0,
+            select_sink_tokens: 0,
+            select_recent_tokens: 0,
+            select_query_tokens: 64,
+            score_mode: ScoreModeCfg::default(),
+            select_graph_alpha: 0.0,
             recall_every: 1,
             coverage_probe: false,
             analyze_at_ctx: 0,

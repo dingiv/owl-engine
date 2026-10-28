@@ -982,6 +982,204 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(Some((pages, tokens)))
     }
 
+    /// **GPU page-softmax 召回打分**(参照实现 `page_softmax_scores` 的设备版;
+    /// 2026-10-28)。
+    ///
+    /// 语义 = `owl_store::score_blocks(ScoreMode::SoftmaxMean)`：
+    ///
+    /// ```text
+    /// out[b] = (1/(L·hq)) · Σ_t Σ_h softmax_b( q̃[t,h]·mk[b,g(h)]·scale )
+    /// ```
+    ///
+    /// 为什么必须上设备：softmax 非线性 ⇒ token/GQA 头**不可折叠** ⇒ host 侧
+    /// 代价 `W×L×hq×nb×hd`（72k/2240 块 ≈ 4.4 s/边界，实测）。设备三段
+    /// （`owl_kvscore_{logits,maxsum,acc}`）在同几何下 **≈11 ms/边界**
+    /// （含对拍门 `page_softmax_parity`，逐块相对误差 3.6e-6）。
+    ///
+    /// 口径：q̃ 与 mean-K 都按**显式 FP16 操作数边界**上卡（参照实现同款），
+    /// 点积在核内 f32 累加。
+    pub(crate) async fn kvscore_softmax_gpu(
+        dev: &mut crate::engine::RankDev<D>,
+        index: &owl_store::MeanKIndex,
+        face: &owl_store::QueryFace,
+        cands: &[owl_store::ChainHash],
+        gqa: &[u16],
+    ) -> Result<Vec<f32>> {
+        use owl_iface::contract::{Arg, Dtype, KernelSource, LaunchMsg};
+        let (layers, hq, dim) = face.geometry();
+        let kv_heads = index.kv_heads();
+        let w = face.len();
+        let nb = cands.len();
+        if w == 0 || nb == 0 || dim == 0 || hq == 0 || layers == 0 || kv_heads == 0 {
+            return Ok(vec![0.0f32; nb]);
+        }
+        if gqa.len() != hq {
+            return Err(ModelError::Msg(format!(
+                "GPU 打分:GQA 映射长 {} ≠ 查询头 {hq}",
+                gqa.len()
+            )));
+        }
+        let scale = 1.0f32 / (dim as f32).sqrt();
+        let face_dev = dev.graphs.session.face_mut();
+
+        // ① 设备缓冲（q/mk 逐层复用 ⇒ 一次分配、16 次 in-place 上传）
+        let q_bytes: Vec<u8> = vec![0u8; w * hq * dim * 2];
+        let q_b = face_dev
+            .htod(Dtype::F16, &vec![w * hq * dim], &q_bytes, "kvscore.q")
+            .await?;
+        let mk_bytes: Vec<u8> = vec![0u8; nb * kv_heads * dim * 2];
+        let mk_b = face_dev
+            .htod(Dtype::F16, &vec![nb * kv_heads * dim], &mk_bytes, "kvscore.mk")
+            .await?;
+        let gqa_u32: Vec<u32> = gqa.iter().map(|g| *g as u32).collect();
+        let mut gqa_bytes = Vec::with_capacity(gqa_u32.len() * 4);
+        for v in &gqa_u32 {
+            gqa_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let gqa_b = face_dev
+            .htod(Dtype::U32, &vec![gqa_u32.len()], &gqa_bytes, "kvscore.gqa")
+            .await?;
+        let z_b = face_dev
+            .alloc_uninit(Dtype::F16, w * hq * nb, "kvscore.z")
+            .await?;
+        let ms_b = face_dev
+            .alloc_uninit(Dtype::F32, w * hq * 2, "kvscore.ms")
+            .await?;
+        let out_bytes = vec![0u8; nb * 4];
+        let out_b = face_dev
+            .htod(Dtype::F32, &vec![nb], &out_bytes, "kvscore.out")
+            .await?;
+
+        let run: Result<()> = async {
+            for l in 0..layers {
+                // q̃ 第 l 层打包 `[w, hq, dim]`（f16）
+                let mut qb = Vec::with_capacity(w * hq * dim * 2);
+                for row in face.token_rows() {
+                    for h in 0..hq {
+                        let off = (l * hq + h) * dim;
+                        for d in 0..dim {
+                            qb.extend_from_slice(&half::f16::from_f32(row[off + d]).to_bits().to_le_bytes());
+                        }
+                    }
+                }
+                // mean-K 第 l 层打包 `[nb, hkv, dim]`（f16；未登记块补零）
+                let mut mb = Vec::with_capacity(nb * kv_heads * dim * 2);
+                for b in cands {
+                    for g in 0..kv_heads {
+                        match index.entry_at(*b, l, g) {
+                            Some(row) => {
+                                for v in row {
+                                    mb.extend_from_slice(&v.to_le_bytes());
+                                }
+                            }
+                            None => mb.extend_from_slice(&vec![0u8; dim * 2]),
+                        }
+                    }
+                }
+                // 逐层 **就地** 改写 q/mk（`htod_batch` = pinned + upload，同流保序）
+                dev.graphs
+                    .session
+                    .face_mut()
+                    .htod_batch(&[(&q_b, 0, &qb), (&mk_b, 0, &mb)])
+                    .await?;
+                let (w_i, hq_i, hkv_i, hd_i, nb_i) =
+                    (w as i32, hq as i32, kv_heads as i32, dim as i32, nb as i32);
+                let layers_i = layers as i32;
+                // ① logits（块瓦片 × kv 头）
+                let mut msg = LaunchMsg {
+                    kernel: KernelSource {
+                        name: "owl_kvscore_logits_f16".to_string(),
+                        source: owl_models::kernel::source("owl_kvscore_logits_f16").to_string(),
+                    },
+                    args: vec![
+                        Arg::block(q_b.id, Dtype::F16, 2),
+                        Arg::block(mk_b.id, Dtype::F16, 2),
+                        Arg::block(gqa_b.id, Dtype::U32, 1),
+                        Arg::I32(w_i),
+                        Arg::I32(hq_i),
+                        Arg::I32(hkv_i),
+                        Arg::I32(hd_i),
+                        Arg::I32(nb_i),
+                        Arg::F32(scale),
+                        Arg::block(z_b.id, Dtype::F16, 2),
+                    ],
+                    grid: (nb.div_ceil(32) as u32, kv_heads as u32, 1),
+                    block: (256, 1, 1),
+                    shared_mem: (32 * dim * 2) as u32,
+                    out_elems: w * hq * nb,
+                };
+                let got = dev.graphs.session.face_mut().launch(msg).await?;
+                if got.id != z_b.id {
+                    return Err(ModelError::Msg("kvscore:logits 回执块不符".into()));
+                }
+                // ② 逐 (t,h) max/Σexp
+                msg = LaunchMsg {
+                    kernel: KernelSource {
+                        name: "owl_kvscore_maxsum".to_string(),
+                        source: owl_models::kernel::source("owl_kvscore_maxsum").to_string(),
+                    },
+                    args: vec![
+                        Arg::block(z_b.id, Dtype::F16, 2),
+                        Arg::I32(w_i),
+                        Arg::I32(hq_i),
+                        Arg::I32(nb_i),
+                        Arg::block(ms_b.id, Dtype::F32, 2),
+                    ],
+                    grid: (w as u32, hq as u32, 1),
+                    block: (256, 1, 1),
+                    shared_mem: 0,
+                    out_elems: w * hq * 2,
+                };
+                let got = dev.graphs.session.face_mut().launch(msg).await?;
+                if got.id != ms_b.id {
+                    return Err(ModelError::Msg("kvscore:maxsum 回执块不符".into()));
+                }
+                // ③ 逐块累加（t 分片 ⇒ 原子合并）
+                msg = LaunchMsg {
+                    kernel: KernelSource {
+                        name: "owl_kvscore_acc".to_string(),
+                        source: owl_models::kernel::source("owl_kvscore_acc").to_string(),
+                    },
+                    args: vec![
+                        Arg::block(z_b.id, Dtype::F16, 2),
+                        Arg::block(ms_b.id, Dtype::F32, 2),
+                        Arg::I32(w_i),
+                        Arg::I32(hq_i),
+                        Arg::I32(nb_i),
+                        Arg::I32(layers_i),
+                        Arg::block(out_b.id, Dtype::F32, 2),
+                    ],
+                    grid: (nb.div_ceil(32) as u32, 8, 1),
+                    block: (128, 1, 1),
+                    shared_mem: 0,
+                    out_elems: nb,
+                };
+                let got = dev.graphs.session.face_mut().launch(msg).await?;
+                if got.id != out_b.id {
+                    return Err(ModelError::Msg("kvscore:acc 回执块不符".into()));
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        let mut bytes = vec![0u8; nb * 4];
+        let dtoh = dev.graphs.session.face_mut().dtoh(&out_b, &mut bytes).await;
+        let free = dev
+            .graphs
+            .session
+            .face_mut()
+            .free(&[q_b.id, mk_b.id, gqa_b.id, z_b.id, ms_b.id, out_b.id])
+            .await;
+        run?;
+        dtoh?;
+        free?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
     /// **调试探针**:读一页 K(第一层)的字节哈希(视图页内容校验)。
     ///
     /// 只在 `probes.dflash_probe` 的末边界调用;不参与生产路径。
@@ -1259,7 +1457,10 @@ impl<D: DeviceClient> RunningEngine<D> {
         // **query 窗**(论文 §4.3:当前 step 的 query;**单 token 的注意力太局
         // 部**,末 token 常只盯前几个字)。取本 chunk **末 W 行**,逐行去 RoPE +
         // 逐行真实质量,再对窗取均值 —— 与论文 Eq.10 的 `Σ_m` 同构。
-        let w = if cheap { 0 } else { W_QUERY_TOKENS.min(pid.t) };
+        // **query 窗**从旋钮取(参照实现默认 512;我们是 64)—— 窗越大越不容易
+        // "只盯最后几个字",代价 = 打分线性放慢。
+        let w_knob = self.boot.cfg.knobs.select_query_tokens.max(1);
+        let w = if cheap { 0 } else { w_knob.min(pid.t) };
         let first = pid.t - w;
         // **口径单源硬断**:待分析面只留了末 `w` 行(`coverage_take_q` 按同一
         // `W_QUERY_TOKENS` 切片)⇒ 两侧不得各写一个数,否则行列错位 = 静默错值。
@@ -1378,18 +1579,29 @@ impl<D: DeviceClient> RunningEngine<D> {
         // (窗 Σ_m + GQA 头 Σ_h)后逐 (层, KV 头) 算余弦,便宜 50×~24×。
         let t_sc = std::time::Instant::now();
         let scores = if recall_now {
-            let mode = if self.boot.cfg.knobs.gqa_max {
-                owl_store::ScoreMode::CosineMax
-            } else {
-                owl_store::ScoreMode::CosineMean
+            // **scorer 单源**(`[kvmem].score_mode`)—— 参照实现默认 `page-softmax`
+            // (= 我们的 `SoftmaxMean`;不可折叠 ⇒ host 侧 72k 下不可用,需 GPU 化)。
+            let mode = match self.boot.cfg.knobs.score_mode {
+                owl_shared::config::ScoreModeCfg::CosineMax => owl_store::ScoreMode::CosineMax,
+                owl_shared::config::ScoreModeCfg::CosineMean => owl_store::ScoreMode::CosineMean,
+                owl_shared::config::ScoreModeCfg::SoftmaxMean => owl_store::ScoreMode::SoftmaxMean,
+                owl_shared::config::ScoreModeCfg::LogitMean => owl_store::ScoreMode::LogitMean,
             };
-            owl_store::score_blocks(
-                index,
-                &face,
-                &cands,
-                &gqa,
-                owl_store::ScoreTuning { scale: 0.0, mode },
-            )?
+            // **softmax 口径走设备三段核**（2026-10-28）:host 逐 token 软最大
+            // 在 72k/2240 块 ≈ 4.4 s/边界；设备同口径 ≈ 11 ms（同逐位门:
+            // `page_softmax_parity` 误差 3.6e-6）。其它口径仍走 host 折叠热路。
+            if matches!(mode, owl_store::ScoreMode::SoftmaxMean) {
+                // 索引借 `self.bank`、设备面借 `self.dev` —— **不同字段** ⇒ 直接分借。
+                Self::kvscore_softmax_gpu(&mut self.dev, index, &face, &cands, &gqa).await?
+            } else {
+                owl_store::score_blocks(
+                    index,
+                    &face,
+                    &cands,
+                    &gqa,
+                    owl_store::ScoreTuning { scale: 0.0, mode },
+                )?
+            }
         } else {
             Vec::new()
         };
@@ -1421,9 +1633,30 @@ impl<D: DeviceClient> RunningEngine<D> {
                 "top8 ctx={} qfnv={:016x} {}", ctx_tokens, qh, s.join(" ")
             );
         }
-        let budget = owl_store::SelectBudget::new(budget_blocks.min(n_blocks), sink, recent);
+        // **P1-3**:分层抽样与 sink/recent 同级先占预算(0 = 关,逐位回退)。
+        let budget = owl_store::SelectBudget::new(budget_blocks.min(n_blocks), sink, recent)
+            .with_stratified(self.boot.cfg.knobs.select_stratified)
+            .with_graph_alpha(self.boot.cfg.knobs.select_graph_alpha);
         let set = if recall_now {
-            let s = owl_store::select(&scored, &cands, budget);
+            // **选块口径**(`[kvmem].prefill_select`;2026-10-28):
+            //
+            // - `Topk`(缺省):sink + recent + 按 cosine 补足 ⇒ 选中块**散布全文档**;
+            // - `Recency`:sink + **从最新往前填满** ⇒ 可见面 = 头 + 一段**连续**
+            //   近期窗(与普通滑动窗口推理同分布)。
+            //
+            // 为何有这俩:参照实现 `repos/ninfer-kvmem-actkv` 的 **prefill** 走的就是
+            // recency(`pick_prefill_ungrouped`),top-k 只用于 decode 重选。
+            // 两边都是方案 A(原位置、不改 K),所以这是**纯窗口形状**的对照。
+            let s = match self.boot.cfg.knobs.prefill_select {
+                owl_shared::config::PrefillSelectMode::Recency => {
+                    owl_shared::counter_inc!("select.prefill_select.recency");
+                    owl_store::select_recency(&cands, budget)
+                }
+                owl_shared::config::PrefillSelectMode::Topk => {
+                    owl_shared::counter_inc!("select.prefill_select.topk");
+                    owl_store::select(&scored, &cands, budget)
+                }
+            };
             // 冻结名单(供廉价边界复用)+ 记账
             self.sel.set_keep(s.blocks.clone());
             s
@@ -1910,6 +2143,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         q_blocks: Vec<Bytes>,
         base: usize,
         t: usize,
+        // `w_tokens` = query 窗 token 数(调用方从 `knobs.select_query_tokens`
+        // 传给;与 `coverage_analyze` 的 `w` **同一真源**,口径不一致会硬断)。
+        w_tokens: usize,
         prof: &mut crate::select::BAxisProfile,
         cov: &mut Option<crate::exec::coverage::CoveragePending>,
     ) -> Result<()> {
@@ -1917,7 +2153,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let (hq, hkv, hd) = (d.hq, d.hkv, d.hd);
         // **只留 query 窗**(末 W 行;从尾部按行偏移切)—— W 口径与
         // `coverage_analyze` 同源(`W_QUERY_TOKENS`),此处不得再写第二个数。
-        let w = W_QUERY_TOKENS.min(t);
+        // 窗宽由调用方注入(`knobs.select_query_tokens`)—— `RankDev` 拿不到 knobs,
+        // 所以旋钮值**必须**从 `coverage_analyze` 那条链传进来(单源;`pid.w` 硬断兜底)。
+        let w = w_tokens.max(1).min(t);
         let elem = d.dtype.size_bytes();
         let row_bytes = hq * hd * elem;
         let off = (t - w) * row_bytes;
