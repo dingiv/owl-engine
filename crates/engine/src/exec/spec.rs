@@ -490,10 +490,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             t
         };
         if hidden_owned {
-            // eager 路的 hidden = 竞技场根块,收割后归池;图态 = 图输出槽
-            // (持久复用,free = 炸图,M4 立案注记)
-            let face = self.dev.graphs.session.face_mut();
-            face.free(&[hidden.id]).await?;
+            // **此处不还**（2026-10-28 M6）:`hidden` 在本轮 ⑦ 还要喂
+            // `propose_round`（MTP）—— 旧实现在这里先 free 一次、⑦ 之后再
+            // free 一次 ⇒ eager 档（`hidden_owned = true`）**双 free**
+            // （现场：`free: 双 free —— id=… 已在复用池(pooled)里`，
+            // 四个请求全挂；图态 `hidden_owned = false` 所以从没暴露）。
+            // 归还点统一在后一个（⑦ 之后，那也是本轮最后一次用 `hidden`）。
         }
         owl_shared::log_debug!("spec-round", "⑤ 草稿入参准备完成(propose 统一在⑦)");
         // ⑥ fold(尾部:图发射异步,restore 单命令;下一轮 verify 流序
