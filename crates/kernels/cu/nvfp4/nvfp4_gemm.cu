@@ -175,6 +175,10 @@ struct OwlNvfp4Plan {
   /// SFA 交错布局的**仿射步长**(m%32 / (m/32)%4 / m/128 / (g%4) / g/4);
   /// 设备侧激活量化器用它写 SF —— 防错位靠 `plan_new` 里对 cute 布局的逐点校验。
   int sf_s[5] = {0, 0, 0, 0, 0};
+  /// **SFB**(权重侧)的同一套仿射步长(n%32 / (n/32)%4 / n/128 / (g%4) / g/4)。
+  /// 2026-10-28:装载改成**设备侧打包**后,权重量化器需要它
+  /// (host 打包时由 cute 的 `make_tensor` 直接算,设备侧只能拿仿射模型)。
+  int sfb_s[5] = {0, 0, 0, 0, 0};
 };
 
 extern "C" {
@@ -290,6 +294,35 @@ void* owl_nvfp4_plan_new(int M, int N, int K) {
     delete p;
     return nullptr;  // 布局结构变了(新的 K 分块):设备侧量化器需同步改
   }
+  // ---- SFB 仿射模型(设备侧**权重**量化器用;同律:实测步长 + 逐点校验)----
+  {
+    auto sfb_at = [&](int n_idx, int gg) -> long { return (long)p->l_sfb(n_idx, 16 * gg, 0); };
+    const long base_b = sfb_at(0, 0);
+    p->sfb_s[0] = (int)(sfb_at(1, 0) - base_b);
+    p->sfb_s[1] = (int)(sfb_at(32, 0) - base_b);
+    p->sfb_s[2] = (int)(sfb_at(128, 0) - base_b);
+    p->sfb_s[3] = (int)(sfb_at(0, 1) - base_b);
+    p->sfb_s[4] = (int)(sfb_at(0, 4) - base_b);
+    auto affine_b = [&](int n_idx, int gg) -> long {
+      const int n0 = n_idx % 32, n1 = (n_idx / 32) % 4, n2 = n_idx / 128;
+      const int g0 = gg % 4, g1 = gg / 4;
+      return base_b + (long)n0 * p->sfb_s[0] + (long)n1 * p->sfb_s[1] +
+             (long)n2 * p->sfb_s[2] + (long)g0 * p->sfb_s[3] + (long)g1 * p->sfb_s[4];
+    };
+    long max_off = 0;  // 同时求上界:设备侧写 SF 前先能自证“不越 sfb_bytes”
+    bool okb = true;
+    for (int i = 0; i < 4096 && okb; ++i) {
+      const int n_idx = (i < 256) ? (i % N) : (int)((unsigned)(i * 2654435761u) % (unsigned)N);
+      const int gg = (int)((unsigned)(i * 40503u + 7u) % (unsigned)groups);
+      const long a = sfb_at(n_idx, gg);
+      okb = (a == affine_b(n_idx, gg));
+      if (a > max_off) max_off = a;
+    }
+    if (!okb || (size_t)max_off >= p->sfb_bytes) {
+      delete p;
+      return nullptr;  // SFB 布局结构变了 ⇒ 设备侧权重量化器拒绝旧仿射模型
+    }
+  }
   // workspace 与 args 无关的部分(当前实测 0,但不依赖这个巧合:预分配按需真算)
   StrideA stride_A{(int64_t)K, cute::C<1>{}, (int64_t)M * K};
   StrideB stride_B{(int64_t)K, cute::C<1>{}, (int64_t)N * K};
@@ -311,6 +344,15 @@ void* owl_nvfp4_plan_new(int M, int N, int K) {
 void owl_nvfp4_plan_free(void* plan) { delete static_cast<OwlNvfp4Plan*>(plan); }
 size_t owl_nvfp4_plan_sfa_bytes(void* plan) { return static_cast<OwlNvfp4Plan*>(plan)->sfa_bytes; }
 size_t owl_nvfp4_plan_sfb_bytes(void* plan) { return static_cast<OwlNvfp4Plan*>(plan)->sfb_bytes; }
+
+/// **SFB 仿射步长**(设备侧权重量化器用;`out` 至少 5 个 int)。
+/// 返回 0 = 已写入,非 0 = plan 无效。
+int owl_nvfp4_sfb_strides(void* plan, int* out) {
+  auto* p = static_cast<OwlNvfp4Plan*>(plan);
+  if (!p || !out) return -1;
+  for (int i = 0; i < 5; ++i) out[i] = p->sfb_s[i];
+  return 0;
+}
 size_t owl_nvfp4_plan_ws_bytes(void* plan) { return static_cast<OwlNvfp4Plan*>(plan)->ws_bytes; }
 
 /// 发射一次 `D[M,N] = alpha · A(M,K) × B(N,K)ᵀ`。`ws` 长度须 ≥ `plan_ws_bytes`
@@ -409,6 +451,25 @@ const char* owl_nvfp4_banner() {
 int owl_nvfp4_quant_act_launch(const __half* x, int M, int K, unsigned char* q,
                                unsigned char* sf, float* d_g, float gb,
                                int s_m0, int s_m1, int s_m2, int s_g0, int s_g1, void* stream);
+
+/// 设备侧**权重**量化器(实现在 `nvfp4_quant_act.cu`):源 f16/bf16 `[N,K]`
+/// → `q`(e2m1)+ `sf`(SFB 交错)+ `d_g[0] = gb`。`src_bf16 != 0` 时源是 bf16。
+int owl_nvfp4_pack_b_dev_launch(const void* src, int N, int K, unsigned char* q,
+                                unsigned char* sf, float* d_g, int src_bf16,
+                                int s_n0, int s_n1, int s_n2, int s_g0, int s_g1,
+                                void* stream);
+
+/// **设备侧权重打包**(装载期;2026-10-28 改成与 `ct_repack` 同律):
+/// 源 f16/bf16 直上卡 → 核内 amax → g → 量化 + 写 SFB;`g` 写回 `d_g`,
+/// 由装载面回读 4 字节(装载期一次,不在热路径)
+int owl_nvfp4_pack_b_dev(void* plan, void* stream, const void* src, unsigned char* q,
+                         unsigned char* sf, float* d_g, int src_bf16) {
+  auto* p = static_cast<OwlNvfp4Plan*>(plan);
+  if (!p || !stream) return -1;
+  return owl_nvfp4_pack_b_dev_launch(src, p->N, p->K, q, sf, d_g, src_bf16,
+                                     p->sfb_s[0], p->sfb_s[1], p->sfb_s[2], p->sfb_s[3],
+                                     p->sfb_s[4], stream);
+}
 
 /// 把 f16 激活 `[M,K]` 在设备上量化成 fp4 + SF,并在 `d_g`(**f32[2]**)写出
 /// `g` 与 `alpha = g·gb`。`d_g` **由 launch 自己清零**(调用方不必预清)

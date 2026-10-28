@@ -231,6 +231,12 @@ pub fn resolve(req: OpReq) -> KernelPick {
             name: crate::family::nvfp4::GEMM,
             shape: FOREIGN,
         },
+        // NVFP4 **装载期权重打包**(2026-10-28 M7;与 `ct_repack` 同律:
+        // 装载域的重排/量化也要按名选核;FOREIGN 哨兵 ⇒ 族 runtime 自持几何)
+        "nvfp4.pack_weight" => KernelPick {
+            name: crate::family::nvfp4::PACK_WEIGHT,
+            shape: FOREIGN,
+        },
         // 通信族(TP2 S4;dtype ⇒ 三实例之一;族 runtime 自持单 block 几何 —— FOREIGN 哨兵)
         "comm.ar_stage" => KernelPick { name: crate::family::comm::stage_entry(dt), shape: FOREIGN },
         "comm.ar_reduce" => KernelPick { name: crate::family::comm::reduce_entry(dt), shape: FOREIGN },
@@ -546,7 +552,8 @@ impl KernelPick {
             return Some(F::CublasF16);
         }
         // NVFP4 块缩放 GEMM(arch-specific 指令;准入表按 `Caps::fp4_blockscale` 裁决)
-        if n == crate::family::nvfp4::GEMM {
+        // —— 打包那把也归同一族:同为 `compute_120a` 指令面 + 同一份 plan
+        if n == crate::family::nvfp4::GEMM || n == crate::family::nvfp4::PACK_WEIGHT {
             return Some(F::NvFp4Cutlass);
         }
         None

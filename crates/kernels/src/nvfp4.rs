@@ -51,6 +51,18 @@ extern "C" {
         ws: *mut c_void,
     ) -> i32;
     fn owl_nvfp4_banner() -> *const c_char;
+    /// SFB 仿射步长（设备侧权重量化器用；`out` ≥ 5 个 `i32`）
+    fn owl_nvfp4_sfb_strides(plan: *mut c_void, out: *mut i32) -> i32;
+    /// **设备侧权重打包**（源 f16/bf16 直上卡 → q + SFB + `d_g[0]=gb`）
+    fn owl_nvfp4_pack_b_dev(
+        plan: *mut c_void,
+        stream: *mut c_void,
+        src: *const c_void,
+        q: *mut u8,
+        sf: *mut u8,
+        d_g: *mut f32,
+        src_bf16: i32,
+    ) -> i32;
     /// **`alpha` 来自设备指针**的发射版(进图路径;`alpha_dev` = f32[1])
     fn owl_nvfp4_run_dev(
         plan: *mut c_void,
@@ -80,11 +92,16 @@ pub const fn q_bytes(rows: usize, k: usize) -> usize {
     rows * k / 2
 }
 
-/// 缩放字节数(`N*K/16`,cosize 口径)—— **只依赖 `(N,K)`,与 `M` 无关**。
+/// 缩放字节数(**权重侧** B: `N*K/16`,cosize 口径)—— 只依赖 `(N,K)`,与 `M` 无关。
 ///
-/// 依据:SFB 布局由 `tile_atom_to_shape_SFB(make_shape(1,N,K,1))` 定,`cosize`
-/// 实测恒等于 `N*K/16`(M=1/7/128/512/2048 同 N,K 逐个核过)。装载期按它
-/// 分配权重 `sf` 槽,运行期按同式验账长 ⇒ 两侧不许各算一套。
+/// 依据:SFB 布局由 `tile_atom_to_shape_SFB(make_shape(1,N,K,1))` 定。
+/// **注意两个口径不同**(2026-10-28 逐档实测):
+/// - **权重**(B):`N*K/16` —— 只要 `N` 128 对齐;`N` 只是 8 对齐时会**偏大**
+///   (实测 `N=1000,K=256` ⇒ 16384 > 16000)⇒ 装载期必须 `N%128` 或直接问 plan;
+/// - **激活**(A):`ceil(M/128)·128 · K/16`(M 按 **128 行块** 排;M=1 也要一整块)
+///   ⇒ 权威值 = [`Nvfp4Plan::sfa_bytes`]。
+///
+/// 装载期按本函数分配 **权重** `sf` 槽,运行期按 `plan.sfb_bytes()` 验账长 ⇒ 两侧同源。
 #[must_use]
 pub const fn sf_bytes(n: usize, k: usize) -> usize {
     n * k / 16
@@ -306,6 +323,46 @@ impl Nvfp4Plan {
         ws: *mut c_void,
     ) -> i32 {
         owl_nvfp4_run(self.ptr, stream, aq, asf, ga, bq, bsf, gb, d, ws)
+    }
+
+    /// **设备侧权重打包**(装载期;与 `ct_repack` 同律)。
+    ///
+    /// 源 = 设备端 f16/bf16 `[N,K]`(装载面 DMA 上来),产出 `q` + `sf`(SFB)
+    /// + `d_g[0] = gb`(per-tensor 全局缩放,**装载期回读 4 字节**;不在热路径)。
+    /// 与 host `pack_weight_b` 数学逐条相同(同一套 amax → g → e4m3/e2m1)。
+    ///
+    /// 返回 0 = 已发射(未同步);负 = 主机侧失败。
+    ///
+    /// # Safety
+    /// `src` = 设备端 `n*k` 个 f16/bf16;`q` ≥ [`Self::b_q_bytes`];
+    /// `sf` ≥ [`Self::sfb_bytes`];`d_g` = 设备端 4 字节;`stream` 有效。
+    pub unsafe fn pack_b_dev(
+        &self,
+        stream: *mut c_void,
+        src: *const c_void,
+        q: *mut u8,
+        sf: *mut u8,
+        d_g: *mut f32,
+        src_bf16: bool,
+    ) -> i32 {
+        owl_nvfp4_pack_b_dev(
+            self.ptr,
+            stream,
+            src,
+            q,
+            sf,
+            d_g,
+            i32::from(src_bf16),
+        )
+    }
+
+    /// SFB 仿射步长(诊断/自证面;设备侧权重量化器内部已用)
+    #[must_use]
+    pub fn sfb_strides(&self) -> Option<[i32; 5]> {
+        let mut out = [0i32; 5];
+        // SAFETY: `out` 是本地 5 元数组;C 侧只写这 5 个 i32。
+        let rc = unsafe { owl_nvfp4_sfb_strides(self.ptr, out.as_mut_ptr()) };
+        (rc == 0).then_some(out)
     }
 
     /// 发射 `D = alpha·A×Bᵀ`,**`alpha` 从设备读**(`alpha_dev` = f32[1])。

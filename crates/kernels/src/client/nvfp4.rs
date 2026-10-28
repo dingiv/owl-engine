@@ -10,11 +10,14 @@ use crate::contract::{LaunchMsg, OpError};
 
 pub use super::BlockRef;
 
-pub use crate::family::nvfp4::GEMM;
+pub use crate::family::nvfp4::{GEMM, PACK_WEIGHT};
 
 /// `parse_gemm` 取用的槽名(声明序)
 pub const PARSE_SLOTS: &[&str] =
     &["a", "bq", "bsf", "out", "aq", "asf", "dg", "m", "k", "n", "gb"];
+
+/// `parse_pack` 取用的槽名(声明序;见表 `ops::nvfp4::PACK_WEIGHT`)
+pub const PARSE_SLOTS_PACK: &[&str] = &["src", "q", "sf", "g", "n", "k", "src_bf16"];
 
 /// 一次 NVFP4 GEMM 调用(解析结果)
 #[derive(Clone, Copy, Debug)]
@@ -54,5 +57,35 @@ pub fn parse_gemm(msg: &LaunchMsg) -> Result<GemmCall, OpError> {
         k: s.u64("k")? as usize,
         n: s.u64("n")? as usize,
         gb: s.f32("gb")?,
+    })
+}
+
+/// 一次**装载期权重打包**调用(解析结果)
+#[derive(Clone, Copy, Debug)]
+pub struct PackCall {
+    /// 源权重字节(**不透明**:f16 或 bf16,由 `src_bf16` 解释;`[n, k]` 行主序)
+    pub src: BlockRef,
+    /// 产物 fp4 `[n, k/2]`
+    pub q: BlockRef,
+    /// 产物块缩放(SFB 交错)
+    pub sf: BlockRef,
+    /// 产物 per-tensor 全局缩放 `f32[1]`(装载面回读)
+    pub g: BlockRef,
+    pub n: usize,
+    pub k: usize,
+    /// 源精度开关(0 = f16,非 0 = bf16)
+    pub src_bf16: bool,
+}
+
+pub fn parse_pack(msg: &LaunchMsg) -> Result<PackCall, OpError> {
+    let s = crate::client::NamedSlots::new(msg)?;
+    Ok(PackCall {
+        src: s.block("src")?,
+        q: s.block("q")?,
+        sf: s.block("sf")?,
+        g: s.block("g")?,
+        n: s.u64("n")? as usize,
+        k: s.u64("k")? as usize,
+        src_bf16: s.u64("src_bf16")? != 0,
     })
 }

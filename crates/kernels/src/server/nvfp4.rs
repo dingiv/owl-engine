@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 
-use crate::client::nvfp4::{parse_gemm, GEMM};
+use crate::client::nvfp4::{parse_gemm, parse_pack, GEMM, PACK_WEIGHT};
 use crate::nvfp4::Nvfp4Plan;
 use crate::registry::{FamilyGuard, KernelFamily};
 
@@ -39,18 +39,51 @@ pub struct Nvfp4Runtime {
 impl Nvfp4Runtime {
     pub const ID: OpId = OpId(GEMM);
 
-    /// 保证计划存在(只增;取用走 `plans.get`,避免 `&mut self` 借住整段 run)
+    /// **计划缓存上限**(S4,2026-10-28)。
+    ///
+    /// 缓存键 = `(m,k,n)` —— `m` 是**运行期 token 数**(capture 档很小:
+    /// `1 / depth+1 / fold 行`;eager prefill 档跟 chunk 尺寸走,长期会话里
+    /// 可能见到几十种)。每个 plan 只持 host 布局 POD(几百字节),但它们
+    /// **无界增长**;超限时的取舍:
+    /// - 不做 LRU:plan 建造很便宜(纯 cute 布局 + 一次 4096 点仿射自校验),
+    ///   而 LRU 需要额外簿记与访问序;真正的病是"无界"而不是"不最优"。
+    /// - 所以**满即清空重建**(下一发重新建,只付一次建造成本) + WARN 点名
+    ///   当前的 `m` 集合 —— 看到这条日志就说明这个档的 m 分布过散。
+    const PLAN_CAP: usize = 64;
+
+    /// 保证计划存在(取用走 `plans.get`,避免 `&mut self` 借住整段 run)
     fn ensure_plan(&mut self, m: usize, n: usize, k: usize) -> Result<(), OpError> {
-        if !self.plans.contains_key(&(m, k, n)) {
-            let plan = Nvfp4Plan::new(m, n, k).ok_or_else(|| OpError::Asset {
-                op: GEMM.into(),
-                detail: format!(
-                    "建 plan 失败 m={m} n={n} k={k}(要求 m>0(无 128 门)、n%8==0、k%16==0,\
-                     且 SF 交错布局的仿射模型须与 cute 逐点一致)"
-                ),
-            })?;
-            self.plans.insert((m, k, n), plan);
+        if self.plans.contains_key(&(m, k, n)) {
+            return Ok(());
         }
+        if self.plans.len() >= Self::PLAN_CAP {
+            let mut ms: Vec<usize> = self.plans.keys().map(|(m, _, _)| *m).collect();
+            ms.sort_unstable();
+            ms.dedup();
+            crate::klog_warn!(
+                "nvfp4",
+                "plan 缓存满({} 个)⇒ 整批清空重建(建造成本小;m 集合 {:?} ⇒ 本档形状过散)",
+                self.plans.len(),
+                ms
+            );
+            self.plans.clear();
+        }
+        let plan = Nvfp4Plan::new(m, n, k).ok_or_else(|| OpError::Asset {
+            op: GEMM.into(),
+            detail: format!(
+                "建 plan 失败 m={m} n={n} k={k}(要求 m>0(无 128 门)、n%8==0、k%16==0,\
+                 且 SF 交错布局的仿射模型须与 cute 逐点一致)"
+            ),
+        })?;
+        crate::klog_debug!(
+            "nvfp4",
+            "建 plan m={m} n={n} k={k}(sfa={} sfb={} ws={};缓存 {} 个)",
+            plan.sfa_bytes(),
+            plan.sfb_bytes(),
+            plan.ws_bytes(),
+            self.plans.len() + 1
+        );
+        self.plans.insert((m, k, n), plan);
         Ok(())
     }
 }
@@ -69,6 +102,87 @@ impl KernelFamily for Nvfp4Runtime {
     }
 
     fn run(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+    ) -> Result<Bytes, OpError> {
+        // 按核名分派(同族两条算子:运行期 GEMM / 装载期权重打包)
+        if msg.kernel.name == PACK_WEIGHT {
+            return self.run_pack_weight(msg, res);
+        }
+        self.run_gemm(msg, res, exec)
+    }
+}
+
+impl Nvfp4Runtime {
+    /// **装载期权重打包**(2026-10-28 M7):源 `f16/bf16` 已在设备上(装载面 DMA
+    /// 上来)→ 三发量化核 → `q` + `sf`(SFB)+ `g`。与 AWQ 的 `ct_repack` 同律。
+    ///
+    /// 计划形状取 **`m = 1`**:打包与 `M` 无关(SFB 布局只依赖 `N,K`),而
+    /// `m = 1` 恰好就是 decode 的 GEMM 计划 ⇒ **同一个缓存项被复用**,不新增
+    /// 一类计划(装载期建的那份在首轮 decode 直接命中)。
+    fn run_pack_weight(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+    ) -> Result<Bytes, OpError> {
+        let call = parse_pack(msg)?;
+        self.ensure_plan(1, call.n, call.k)?;
+        let plan = self.plans.get(&(1, call.k, call.n)).expect("ensure_plan 刚插入");
+        // **入参/产物尺寸自证**(FFI 越界不报错,只会踩邻块)
+        let need = [
+            // 源是不透明字节(f16/bf16)
+            ("src", call.src.id, call.n * call.k * 2),
+            ("q", call.q.id, plan.b_q_bytes()),
+            ("sf", call.sf.id, plan.sfb_bytes()),
+            ("g", call.g.id, std::mem::size_of::<f32>()),
+        ];
+        for (name, id, want) in need {
+            let got = res.resolve_len(id)?;
+            if got < want {
+                return Err(OpError::Contract {
+                    op: PACK_WEIGHT.into(),
+                    field: "block",
+                    expect: format!("{name} ≥ {want} 字节"),
+                    got: format!("{got} 字节"),
+                });
+            }
+        }
+        let src = res.resolve(call.src.id)? + call.src.byte_offset;
+        let q = res.resolve(call.q.id)? + call.q.byte_offset;
+        let sf = res.resolve(call.sf.id)? + call.sf.byte_offset;
+        let g = res.resolve(call.g.id)? + call.g.byte_offset;
+        let stream = res.stream()?;
+        let raw = stream.cu_stream() as *mut std::ffi::c_void;
+
+        res.note_device("fam_ffi_pack", &msg.kernel.name, 0, &[src, q, sf]);
+        // SAFETY: 四个指针来自账本块的 `resolve`(上面已按 plan 逐个验账长);
+        // 形状 = plan 的 (N,K) = 本次调用的 (n,k)。
+        let rc = unsafe {
+            plan.pack_b_dev(
+                raw,
+                src as *const std::ffi::c_void,
+                q as *mut u8,
+                sf as *mut u8,
+                g as *mut f32,
+                call.src_bf16,
+            )
+        };
+        if rc != 0 {
+            return Err(OpError::Launch {
+                op: msg.kernel.name.clone(),
+                stage: crate::contract::Stage::Compute,
+                detail: format!(
+                    "pack_b_dev rc={rc} n={} k={} src_bf16={}",
+                    call.n, call.k, call.src_bf16
+                ),
+            });
+        }
+        Ok(Bytes::new(call.q.id, msg.out_elems, Dtype::U8, 2))
+    }
+
+    fn run_gemm(
         &mut self,
         msg: &LaunchMsg,
         res: &mut dyn crate::device::DeviceRes,
