@@ -993,6 +993,50 @@ required 非 null、已知属性类型匹配**。任一失败 ⇒ `Item::Malform
 `finish_reason:"error"` 的终止帧（Pi 的 `mapStopReason` 会按 error 处理）。
 这保证前端永远看不到半截 `<function_calls>`、`bash {}` 或空 stop 假成功。
 
+**2026-10-28 续记(近失格式修复)**:同一 Pi 请求回放抓到模型实际吐的是
+半截 Qwen XML，而非 Anthropic wrapper：
+
+```text
+<tool_call>
+<function=bash>
+<command>
+ls ...
+</parameter>
+</function>
+```
+
+`<command>` 少了 `parameter=`，旧解析器得到 `{}` ⇒ required 校验失败 ⇒ 502。
+新增保守修复：Qwen 工具体里接受 `<parameter name="…">`、裸 `<prop>`、
+`prop="…"`，Anthropic wrapper 里也接受 `<parameter=…>`；**只有修复后能通过
+同一份 schema 校验才收**，修不好仍 `Malformed`。`/debug/agent` 轨迹记
+`repair <tool> qwen_loose`，服务日志同时 WARN。真机同请求 8 发：7 发成功
+（其中 3 发经修复），1 发因模型自造 `computer_use`（不在请求 tools）仍 502。
+
+**2026-10-28 二修（arg_type 软通过）**:自定义远端工具（如 `video_collect`）
+的 schema 由前端提供，模型偶尔把 `integer` 写成 `"512"`/`20.0`、把 `array`
+写成 `"[...]"`、把 `bool` 写成 `"true"`，或写成 `512MB` 这类不可归一值。
+服务层现在：
+
+- XML 回填先做保守归一：`"512"`→512、`20.0`→20（integer 的整值浮点）、
+  `"[...]"`→数组、`"{...}"`→对象、`"true"`/`"false"`→bool；
+- `tool_call_arg_type` 不再整轮 `Malformed`/502：字段级 WARN **软通过**，
+  原值保留在 `arguments` 里，由远端工具/前端决定接受或报错；
+- 未知工具、缺 required、arguments 非对象/坏 JSON 仍然硬拒；
+- 日志打**字段级** `tool/prop/expect/got` + 完整 raw（超 8KB 截断并记账）；
+  `/debug/agent` 轨迹记 `soft_type <tool>.<prop> ...`。
+
+这样单字段类型错只损失该字段的信息量，不再让整轮上下文重来。注意：软通过
+不等于远端一定接受；schema 仍应尽量用明确的 `integer`/`string`/`array`，
+时间/容量单位不要混在数字字段里。
+
+**与 vLLM 的关系**:`packages/vllm-test/.../argv_builders.py` 的
+`--enable-auto-tool-choice --tool-call-parser qwen3_coder` 是**响应解析器**，
+不是解码约束；`vllm/parser/qwen3.py::_PARAM_RE` 同样只认 `<parameter=...>`，
+且不认 Anthropic wrapper。照搬它不能修复模型格式漂移，也不能把 `<command>`
+变成合法参数。格式遵循度的硬保证只能来自 prompt/模板约束或 grammar/constrained
+decoding。该子项目的原型设计、阶段与工时见
+[`constrained-tool-grammar/`](constrained-tool-grammar/README.md)（当前只冻结设计，未实现）。
+
 ### 7.4 模型侧未知数(非本专项能解)
 
 - 27B AWQ INT4 + DFlash2 草稿在 **agent 域(代码/工具 JSON)** 的接受率**未知**
