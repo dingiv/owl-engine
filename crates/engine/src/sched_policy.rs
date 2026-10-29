@@ -155,6 +155,24 @@ pub fn reclaim_margin(chunk_pages: usize) -> usize {
     chunk_pages.max(1) + RECLAIM_SAFETY_PAGES
 }
 
+/// **懒回灌待回灌项的下标判据**（纯函数;单源）。
+///
+/// 命中面里只回灌「起点视图要读的那一批」：`sink 块` ++ `recent 窗`。
+///
+/// ⚠️ **上界 `i < m` 不是可选项**（2026-10-28 实测 500）：
+/// `reuse_face` 会把复用面 `m` 裁到「**有 GDN 快照的边界**」（尾块重算 / 无快照
+/// 边界），而 `m < matched_blocks` —— 命中块清单来自整条匹配面，尾部那些块
+/// **不在本 turn 的会话块表里**（`block_table = chain[..m]`）。若它们恰好已下沉
+/// 到宿主（超池后的必然态），就会混进回灌清单 ⇒ 段边界回灌写表时
+/// `回灌下标 m 越界(表长 m)` 整发 500。
+///
+/// 现场：代码 review 任务、上下文 29.2%/262k(≈76.5k tok，刚好跨过池 76.4k)、
+/// 第 5 轮 read 后报错。
+#[inline]
+pub fn lazy_pending_keep(i: usize, m: usize, sink_blocks: usize, recent_lo: usize) -> bool {
+    i < m && (i < sink_blocks || i >= recent_lo)
+}
+
 // ===========================================================================
 // §2 外部注入的事实（只读快照）
 // ===========================================================================
@@ -713,6 +731,26 @@ mod tests {
         assert_eq!(reclaim_margin(0), 1 + RECLAIM_SAFETY_PAGES);
         // 安全边必须远小于工作集档 —— 否则又回到"白砍密集区间"的老路
         assert!(RECLAIM_SAFETY_PAGES <= 16);
+    }
+
+    /// 懒回灌的待回灌下标判据:必须**两侧都夹**——
+    /// 上界 `i < m`(复用面)与下界结构(sink ∨ recent 窗)。
+    ///
+    /// 实测现场(2026-10-28):`m = 2094 < matched = 2095`(尾块无快照被裁)且
+    /// 尾块已沉宿主 ⇒ 旧式只判「sink ∨ recent」就把 `i = 2094` 留在清单里 ⇒
+    /// 回灌写表越界(表长 2094)= 整发 500。
+    #[test]
+    fn lazy_pending_keep_clamps_both_sides() {
+        let (m, sink, recent_lo) = (2094usize, 2usize, 2062usize);
+        assert!(!lazy_pending_keep(m, m, sink, recent_lo), "上界:超出复用面一律不收");
+        assert!(!lazy_pending_keep(m + 1, m, sink, recent_lo));
+        assert!(lazy_pending_keep(m - 1, m, sink, recent_lo), "recent 窗内收");
+        assert!(lazy_pending_keep(0, m, sink, recent_lo), "sink 收");
+        assert!(!lazy_pending_keep(sink, m, sink, recent_lo), "sink 与 recent 之间是洞");
+        assert!(!lazy_pending_keep(recent_lo - 1, m, sink, recent_lo));
+        assert!(lazy_pending_keep(recent_lo, m, sink, recent_lo));
+        // 短链退化:m = 4 页时 recent 窗覆盖全链 ⇒ 全部收(退化为旧全量回灌)
+        assert!((0..4).all(|i| lazy_pending_keep(i, 4, 2, 0)));
     }
 
     fn limits_non_oversub() -> Limits {

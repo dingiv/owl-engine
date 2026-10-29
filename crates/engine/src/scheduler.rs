@@ -1303,9 +1303,28 @@ impl<D: DeviceClient> RunningEngine<D> {
                             .cached_len
                             .saturating_sub(seed.recent_tokens)
                             / page;
-                        let keep_idx = |i: usize| i < seed.sink_blocks || i >= recent_lo;
+                        // 判据单源 = `sched_policy::lazy_pending_keep`（**含上界
+                        // `i < m`**：`m` 可能被裁到有快照的边界 ⇒ 命中清单尾部那些
+                        // 不在本 turn 块表里的块绝不能被回灌）。
                         let before = pending_loads.len();
-                        pending_loads.retain(|(i, _)| keep_idx(*i));
+                        pending_loads.retain(|(i, _)| {
+                            crate::sched_policy::lazy_pending_keep(
+                                *i,
+                                m,
+                                seed.sink_blocks,
+                                recent_lo,
+                            )
+                        });
+                        // 硬断:回灌清单必须落在本 turn 的块表内（`s.block_table` 待会儿
+                        // 会被赋成 `chain[..m]`）—— 越界就是调度面口径分叉,不许带病往下。
+                        if let Some((i, _)) = pending_loads.iter().find(|(i, _)| *i >= m) {
+                            return Err(ModelError::EngineInvariant {
+                                what: format!(
+                                    "懒回灌:待回灌下标 {i} ≥ 复用面 {m}(表长) —— \
+                                     命中面清单与复用面口径分叉"
+                                ),
+                            });
+                        }
                         let holes = m - pending_loads.len()
                             - chain[..m]
                                 .iter()
