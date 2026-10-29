@@ -144,7 +144,8 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
     // GGUF 档:块型核(逐张量型去量化);其余按量化方案放行
     match cfg.model.format {
         ModelFormat::Gguf => tags.push(T::QUANT_GGUF),
-        ModelFormat::Safetensors | ModelFormat::Awq => match cfg.model.quant {
+        ModelFormat::Safetensors | ModelFormat::Awq | ModelFormat::PackQuantized => {
+            match cfg.model.quant {
             QuantScheme::W4a16 => {
                 tags.push(T::QUANT_W4A16);
                 if cfg.model.format == ModelFormat::Awq {
@@ -161,7 +162,8 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
             QuantScheme::Nvfp4 => tags.push(T::QUANT_NVFP4),
             // GGUF 块型在这里不给 tag(上面的 format=Gguf 分支已放行)
             QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3 => {}
-        },
+            }
+        }
     }
     if cfg.model.head_quant == HeadQuant::RtnInt8Row {
         tags.push(T::QUANT_INT8);

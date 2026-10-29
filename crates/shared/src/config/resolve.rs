@@ -561,6 +561,7 @@ fn format_name(f: super::ModelFormat) -> &'static str {
     match f {
         super::ModelFormat::Safetensors => "safetensors",
         super::ModelFormat::Awq => "awq",
+        super::ModelFormat::PackQuantized => "pack-quantized",
         super::ModelFormat::Gguf => "gguf",
     }
 }

@@ -128,6 +128,10 @@ pub fn quant_plan_of(
         (F::Gguf, _) => owl_models::module::QuantPlan::F16,
         (F::Awq, Q::W4a16) => owl_models::module::QuantPlan::W4A16Awq,
         (F::Awq, Q::W4a8) => owl_models::module::QuantPlan::W4A8Awq,
+        // compressed-tensors pack-quantized(g128-sym):源侧已打包,装载只重排
+        (F::PackQuantized, Q::W4a16) => owl_models::module::QuantPlan::W4A16,
+        // validate 已拦;防御:配置门漏了也不炸引擎
+        (F::PackQuantized, _) => owl_models::module::QuantPlan::F16,
         (F::Safetensors, Q::W4a16) => owl_models::module::QuantPlan::W4A16,
         // NVFP4:装载期从 f16 现量化(权重+激活块缩放)
         (F::Safetensors, Q::Nvfp4) => owl_models::module::QuantPlan::NvFp4,
