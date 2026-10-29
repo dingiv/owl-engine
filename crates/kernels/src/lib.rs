@@ -11,7 +11,9 @@
 /// 契约面(类型权威:Dtype/线格式/Bytes/LaunchMsg/OpError/OpId;
 /// 2026-10-12 M2 自 owl-iface::contract 迁入 —— iface 依赖 kernels,
 /// kernels 不依赖 iface,契约老家即此;iface 经 re-export 续用旧路径)
-pub mod contract;
+/// **契约面**:2026-10-29 起定义住 `owl-iface::contract`(接口层),
+/// 本 crate 只 re-export —— `owl_kernels::contract::X` 旧路径不变。
+pub use owl_iface::contract;
 
 /// 诊断输出口(唯一):Rust 侧 `klog_*!` 宏 + C/C++ 侧 `cu/owl_log.h`
 /// 共用同一条 `LogSink`(boot 期由后端经 [`server::DiagTune::sink`] 注入)。
@@ -64,7 +66,9 @@ pub mod device;
 pub mod registry;
 
 /// **代际(`Arch`)表** —— 构建期(`build.rs` 同源引入)与运行期共用。
-pub mod arch;
+/// **代际表**:2026-10-29 起定义住 `owl-iface::arch`(自包含;
+/// `build.rs` 仍以 `#[path]` 直接引同一份文件)。本 crate re-export 保旧路径。
+pub use owl_iface::arch;
 /// **算子族 × 代际的准入表**(「这族不该在这张卡上跑」的唯一出口)。
 pub mod admit;
 /// **NVFP4 块缩放 GEMM 的 Rust 面**(`libnvfp4.a` 的薄 FFI;feature `nvfp4`,
@@ -97,7 +101,7 @@ pub fn fp4_banner() -> Option<&'static str> {
     }
 }
 
-pub use arch::{Arch, Caps, Family};
+pub use owl_iface::arch::{Arch, Caps, Family};
 pub use admit::{Admit, AdmitCtx, OpFamily};
 
 /// 可捕获 kernel 契约(A1.5)—— 实现者签字画押处。

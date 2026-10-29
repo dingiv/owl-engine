@@ -66,6 +66,9 @@ owl-cuda = { path = "../backends/cuda" }
 owl-macros = { path = "../macros" }
 
 [dependencies]
+# **接口层**(2026-10-29 反置):契约词汇(Dtype/Bytes/Arg/LaunchMsg/Arch/Hw/OpEnv)
+# 与 LogSink 值类型住在 owl-iface —— 接口不依赖实现,实现依赖接口。
+owl-iface = { path = "../backends/iface" }
 # 算子 tag 注入属性宏(`#[kernel_tags]`;仅编译期,零运行期依赖)
 owl-macros = { path = "../macros" }
 # 官方 cudarc:仅 device/cublas feature 使用(Exec/家族发射;feature 化,

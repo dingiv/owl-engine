@@ -1,7 +1,16 @@
 # 算子契约权威 —— kernels 双面基础设施与名字无关 server(Result 全链)
 
 > 版本:v0.5(2026-10-12 深夜;**状态:全部里程碑完工**——M1 金标归位 / M2 骨架 / M3 全家族面+models 切换(gdn_chunked 全链样板)/ M4 一键切换(registry 现役,foreign.rs 退役,净删 ~1320 行)/ M5 manifest 审计面+双侧名字面量门)。
-> **v0.4→v0.5 变更(依赖现实修订,M2 实测)**:
+> **⚠️ 2026-10-29 反转(用户裁决)**:v0.5 的"契约老家 = kernels"已**作废** ——
+> 用户判定"kernels 本身是实现类,哪有接口依赖实现的",于是依赖方向反转为
+> **`kernels → iface`**:契约词汇(`Dtype/Bytes/Arg/LaunchMsg/KernelSource/OpError/
+> OpId`)、代际表(`Arch`/`Caps`/`Family`)、执行环境词汇(`Hw`/`OpEnv`)、
+> `LogSink` 值类型全部搬回 `owl-iface`;`owl_kernels::{contract,arch,driver::Hw/OpEnv,
+> sink::LogSink}` 保留为 re-export 兼容层(旧路径逐字不变),`kernels/build.rs` 以
+> `#[path]` 直接引 `iface/src/arch.rs`(同一份表,不复制)。测试:iface 20 ·
+> kernels 116 · shared 125 · engine 186 · store 161 全绿;`cargo tree` 无环。
+>
+> **v0.4→v0.5 变更(依赖现实修订,M2 实测)***(已被上条反转,保留作历史)*:
 > ① **契约老家 = owl-kernels::contract**(用户裁决:iface 依赖 kernels、
 >    kernels 不依赖 iface,则 iface 的线格式 Bytes/LaunchMsg/Arg/Dtype
 >    **搬进 kernels**,iface 经 re-export 零破坏续用)——依赖方向

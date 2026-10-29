@@ -142,11 +142,11 @@ macro_rules! alloc_pinned {
 
 // ============================================================================
 // 标注词汇:Dtype + Shape(线格式的元数据维)
-// —— 2026-10-12 M2 迁往 owl-kernels::contract(契约老家;iface 依赖
-//    kernels 方向不变)。下方 re-export 保旧路径全量可用,零破坏。
+// —— 2026-10-29 反置:定义回到本 crate 的 `contract_vocab`(接口不依赖
+//    实现);下面整体 re-export,`owl_iface::contract::X` 旧路径逐字不变。
 // ============================================================================
 
-pub use owl_kernels::contract::{numel, Arg, Bytes, Dtype, GraphId, KernelSource, LaunchMsg, Shape};
+pub use crate::contract_vocab::*;
 // **设备命令面**(2026-10-21):SDK ↔ server 的唯一单位。见 [`crate::command`]。
 pub use crate::command::{BatchOutcome, Command, Outcome};
 
@@ -514,7 +514,7 @@ pub trait DeviceClient: Send {
     /// 执行环境提供(硬件感知;None = 无 GPU 环境,语义调用结构化拒绝)。
     /// 感知发生在引擎/boot 侧(实现者可缓存);kernels/解释器零探测
     /// (被动律)。page 项由解释器从页策略单源补齐,实现者可置 0。
-    fn op_env(&self) -> Option<owl_kernels::driver::OpEnv> {
+    fn op_env(&self) -> Option<OpEnv> {
         None
     }
 
@@ -1205,7 +1205,7 @@ pub trait DeviceClient: Send {
     /// 语义 = 同步小查询(纯属性读,不含 GPU 活;后端可缓存);
     /// **默认 = 不支持** ⇒ 结构化拒(不猜代际 —— 猜错就是选错 kernel 臂),
     /// 纯 host face 与无卡测试场自然落到这个默认。
-    fn device_arch(&mut self) -> impl Future<Output = Result<owl_kernels::Arch, ModelError>> + Send
+    fn device_arch(&mut self) -> impl Future<Output = Result<crate::Arch, ModelError>> + Send
     where
         Self: Sized,
     {

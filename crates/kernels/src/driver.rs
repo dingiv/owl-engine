@@ -48,13 +48,6 @@
 /// 硬件画像(拾取的全部依据;随感知手段升级扩充字段)。
 /// `Arch` 复用 crate 根枚举(REQ-HW-01 单一分发表键)。
 /// 构造权在引擎侧(boot 感知;kernels 零探测 —— 被动律)。
-#[derive(Clone, Copy, Debug)]
-pub struct Hw {
-    pub arch: crate::Arch,
-}
-
-
-
 // ============================================================================
 // §2 值类型
 // ============================================================================
@@ -92,19 +85,8 @@ pub struct Shape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct OpId(pub &'static str);
 
-/// 执行环境(引擎/解释器装配,**必传参**;被动律:kernels 零探测)
-#[derive(Clone, Copy, Debug)]
-pub struct OpEnv {
-    pub hw: Hw,
-    /// KV 页大小(tokens/block;0 = 非 paged/legacy)。页配对律的 env 侧
-    /// 单源 —— wrapper 变体选择在此吃页,调用点无页可错配
-    pub page: usize,
-    /// 注意力头维(0 = 未知 ⇒ 几何门跳过该项)。模型级几何事实,
-    /// 由引擎 boot 从 `ModelDims` 合入(与 hw 同律:被动律)
-    pub head_dim: usize,
-    /// GQA 分组比 hq/hkv(0 = 未知/不适用)
-    pub grp: usize,
-}
+/// **执行环境词汇**(2026-10-29 反置:定义已搬 `owl_iface::contract_vocab`)。
+pub use owl_iface::contract_vocab::{Hw, OpEnv};
 
 /// 一次拾取请求(解释器 → driver;全部只读引用,零 I/O)
 pub struct OpReq<'a> {

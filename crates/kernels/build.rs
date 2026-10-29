@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // build.rs 是独立 crate ⇒ 用 `#[path]` 直接引入;**该文件不得引用 crate 内任何
 // 其它模块**(它同时被 lib 与 build.rs 编译),否则这一侧编不过。
 #[allow(dead_code)]
-#[path = "src/arch.rs"]
+#[path = "../backends/iface/src/arch.rs"]
 mod arch;
 use arch::Arch;
 

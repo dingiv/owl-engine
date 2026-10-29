@@ -46,9 +46,19 @@
 //!   后端特有的能力(如 cuda 的 stream 句柄)走下沉扩展 trait,
 //!   不污染通用契约。
 
-/// 后端 Arch 标识(与 kernels 的 arch 分发表共用一套词汇)
-pub use owl_kernels::Arch;
+/// **契约词汇:代际标识**(`Arch`/`Caps`/`Family`)。
+///
+/// 2026-10-29 反置:定义从 `owl-kernels` 搬回接口层;`kernels::arch` 变成
+/// re-export 兼容层。`kernels/build.rs` 仍以 `#[path]` 直接引同一份文件。
+pub mod arch;
+pub use arch::{Arch, Caps, Family};
 
+/// **契约词汇面**(Dtype/Bytes/Arg/LaunchMsg/KernelSource/OpError/OpId/Hw/OpEnv…)。
+///
+/// 2026-10-29 反置:定义从 `owl-kernels::contract`/`driver` 搬回接口层;
+/// `contract` 模块整体 re-export(旧路径 `owl_iface::contract::X` 不变),
+/// `owl_kernels::contract` / `owl_kernels::driver::{Hw,OpEnv}` 继续可用。
+pub mod contract_vocab;
 pub mod command;
 pub mod contract;
 /// **DeviceHandle:分配账 + 命令面**(2026-10-19;设计卷 device-命令面与分配账)
@@ -58,7 +68,8 @@ pub mod handle;
 /// `owl-shared`）。上层（含 `owl-shared` 自己）经本模块取类型，**不新增**对
 /// `owl-kernels` 的直接依赖 —— 保持 `shared → iface → kernels` 单向边，
 /// 避免 dev-dep 环导致的双份编译。
-pub use owl_kernels::sink;
+pub mod sink;
+pub use sink::LogSink;
 pub mod signal;
 
 // 契约面顶层再导出(前后端共同依赖;见 contract 模块文档)

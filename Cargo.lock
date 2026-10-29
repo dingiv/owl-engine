@@ -706,7 +706,6 @@ dependencies = [
 name = "owl-iface"
 version = "0.1.0"
 dependencies = [
- "owl-kernels",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -718,6 +717,7 @@ dependencies = [
  "cudarc",
  "half",
  "owl-cuda",
+ "owl-iface",
  "owl-macros",
  "owl-shared",
  "rayon",

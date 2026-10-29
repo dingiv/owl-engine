@@ -153,10 +153,10 @@ fn 指针值,经 `server::DiagTune{sink}` 在 boot 期注入)。kernels 自己�
 不持全局 logger,只持这个可 Copy 的包。
 
 ```
-owl-shared ──► owl-iface ──► owl-kernels                     (单向边,无新环)
+owl-shared ──► owl-iface ◄── owl-kernels                     (2026-10-29 反转)
      │                            │
-     └── re-export ◄──────────────┘    LogSink 唯一定义处 = kernels::sink
-         (owl_iface::sink)
+     └── 用同一类型 ───────────────┘   LogSink 值类型定义处 = iface::sink
+                                       (全局槽/C ABI/klog 宏住 kernels::sink)
 ```
 
 > **2026-10-29 合并(用户裁决)**:原先为了避开这个依赖环,`LogSink` 被单独

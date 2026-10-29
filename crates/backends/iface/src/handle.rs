@@ -45,7 +45,7 @@ use crate::contract::{
 // 输出口(值语义 fn 指针包;未注入 = 全部静默)。本 crate 不能依赖 owl-shared
 // (`owl-shared → owl-iface`),故类型住 `owl-kernels::sink`(依赖倒置口),
 // 由 engine 用 `owl-shared` 的 logger 包好后注入。
-use owl_kernels::sink::{LogSink, LVL_INFO, LVL_WARN};
+use crate::sink::{LogSink, LVL_INFO, LVL_WARN};
 
 // ============================================================================
 // §1 归属与资产类别(与 store 的 TierLedger 同构;store 侧 impl 时做映射)
@@ -340,7 +340,7 @@ impl Command {
     }
 
     /// 链式:设置核参数表。
-    pub fn args(mut self, args: Vec<owl_kernels::contract::Arg>) -> Self {
+    pub fn args(mut self, args: Vec<crate::contract::Arg>) -> Self {
         if let Command::Launch { msg, .. } = &mut self {
             msg.args = args;
         }
@@ -1223,7 +1223,7 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         async move { DeviceHandle::drain_pool_to_driver(self).await }
     }
 
-    fn op_env(&self) -> Option<owl_kernels::driver::OpEnv> {
+    fn op_env(&self) -> Option<crate::contract_vocab::OpEnv> {
         self.inner.op_env()
     }
 
@@ -1743,7 +1743,7 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         self.inner.sm_count()
     }
 
-    fn device_arch(&mut self) -> impl Future<Output = Result<owl_kernels::Arch, ModelError>> + Send {
+    fn device_arch(&mut self) -> impl Future<Output = Result<crate::Arch, ModelError>> + Send {
         self.inner.device_arch()
     }
 
@@ -1814,7 +1814,7 @@ mod tests {
     #[test]
     fn command_builder_is_chainable() {
         let msg = LaunchMsg {
-            kernel: owl_kernels::contract::KernelSource { name: "k".into(), source: String::new() },
+            kernel: crate::contract::KernelSource { name: "k".into(), source: String::new() },
             args: vec![],
             grid: (1, 1, 1),
             block: (1, 1, 1),

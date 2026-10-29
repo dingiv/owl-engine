@@ -428,3 +428,32 @@ mod tests {
         assert!(format!("{z}").contains("numel=0"), "{z}");
     }
 }
+
+// ============================================================================
+// §E 执行环境词汇(Hw / OpEnv)—— 2026-10-29 自 `owl-kernels::driver` 搬入
+// ============================================================================
+//
+// 为什么属于契约面:它们是**引擎装配时传给算子层的被动事实**(硬件代际 /
+// KV 页宽 / 头维 / GQA 比),kernels 零探测;接口层定义词汇,实现层消费。
+// `owl_kernels::driver::{Hw, OpEnv}` 保留为 re-export(旧路径不变)。
+
+/// 硬件事实的**最小面**(只收会被选核消费的;SM 数/频率/显存一律不在此)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hw {
+    /// 计算能力代际(选核键)
+    pub arch: crate::arch::Arch,
+}
+
+/// 执行环境(引擎/解释器装配,**必传参**;被动律:kernels 零探测)
+#[derive(Clone, Copy, Debug)]
+pub struct OpEnv {
+    pub hw: Hw,
+    /// KV 页大小(tokens/block;0 = 非 paged/legacy)。页配对律的 env 侧
+    /// 单源 —— wrapper 变体选择在此吃页,调用点无页可错配
+    pub page: usize,
+    /// 注意力头维(0 = 未知 ⇒ 几何门跳过该项)。模型级几何事实,
+    /// 由引擎 boot 从 `ModelDims` 合入(与 hw 同律:被动律)
+    pub head_dim: usize,
+    /// GQA 分组比 hq/hkv(0 = 未知/不适用)
+    pub grp: usize,
+}
