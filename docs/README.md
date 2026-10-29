@@ -117,6 +117,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 ## H. Serving, sessions and configuration
 
 - ⬜ [`devlog/serving/agent-surface.md`](devlog/serving/agent-surface.md) — Agent serving surface (pi integration)
+- ⬜ [`devlog/serving/constrained-tool-grammar/README.md`](devlog/serving/constrained-tool-grammar/README.md) — Constrained tool grammar project: prototype design, phases, decode-cost budget (design only; not implemented)
 - ⬜ [`devlog/serving/agent-prefix-10k.md`](devlog/serving/agent-prefix-10k.md) — Agent 10K multi-turn prefix hit rate: snapshot verdict, message-boundary anchors, probe
 - ⬜ [`devlog/serving/multi-session.md`](devlog/serving/multi-session.md) — Multi-session and concurrency
 - ⬜ [`devlog/serving/cross-session-batch.md`](devlog/serving/cross-session-batch.md) — Cross-session batched decode (B5.1)
