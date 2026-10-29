@@ -28,68 +28,25 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
+// ============================================================================
+// **owl 裁剪版(2026-10-28)** —— 不是 NVIDIA 原文件的全集。
+//
+// 原版把 sm70/sm80/sm90(GMMA,含 sparse/fp8/blockwise)/sm100(UMMA 全家:
+// array/rcggemm/emulated/interleaved/planar/mixed-input/sparse/blockwise)/
+// sm103/sm107/sm120 的 **40 多个 mainloop** 全部 include 进来,用来支撑
+// `CollectiveBuilder` 的任意组合。本仓只用 **sm120 blockscaled**(NVFP4 唯一的
+// 那条路;30/40 系走 Marlin/GGUF 的自写核),所以这里只留它。
+//
+// 升级 CUTLASS:全量覆盖后按本文件的 include 清单重裁;漏了会在编译期
+// 直接点名(sm120 builder 找不到 `CollectiveMma` 特化),不会静默走错。
+// ============================================================================
 #pragma once
 
 #include "cutlass/gemm/collective/collective_mma_decl.hpp"
 
-
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "cutlass/gemm/collective/sm70_mma_twostage.hpp"
-#include "cutlass/gemm/collective/sm80_mma_multistage.hpp"
-#include "cutlass/gemm/collective/sm80_mma_array_multistage.hpp"
-#include "cutlass/gemm/collective/sm90_mma_multistage_gmma_ss_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_mma_multistage_gmma_rs_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_ss.hpp"
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_rs_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_rs_warpspecialized_mixed_input.hpp"
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_sparse_mma_tma_gmma_ss_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_sparse_mma_tma_gmma_ss_warpspecialized_fp8.hpp"
-#include "cutlass/gemm/collective/sm90_mma_array_tma_gmma_ss_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input.hpp"
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized_fp8.hpp"
-#include "cutlass/gemm/collective/sm90_mma_array_tma_gmma_ss_warpspecialized_fp8.hpp"
-#include "cutlass/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized_fp8_blockwise_scaling.hpp"
-#include "cutlass/gemm/collective/sm90_mma_array_tma_gmma_ss_warpspecialized_fp8_blockwise_scaling.hpp"
-#if !defined(__CUDACC_RTC__)
-#include "cutlass/gemm/collective/sm100_mma_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm107_mma_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm107_blockscaled_mma_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm100_mma_array_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm100_mma_array_warpspecialized_rcggemm.hpp"
-#include "cutlass/gemm/collective/sm100_blockscaled_mma_array_warpspecialized_rcggemm.hpp"
-#include "cutlass/gemm/collective/sm100_mma_warpspecialized_emulated.hpp"
-#include "cutlass/gemm/collective/sm100_mma_array_warpspecialized_emulated.hpp"
-#include "cutlass/gemm/collective/sm100_sparse_mma_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm100_blockscaled_sparse_mma_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm100_blockscaled_mma_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm100_blockscaled_mma_array_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm100_mma_warpspecialized_blockwise_scaling.hpp"
-#include "cutlass/gemm/collective/sm100_mma_array_warpspecialized_blockwise_scaling.hpp"
-#include "cutlass/gemm/collective/sm100_mma_warpspecialized_mixed_input.hpp"
-#include "cutlass/gemm/collective/sm100_mma_cpasync_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm100_mma_mixed_tma_cpasync_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm100_blockscaled_mma_mixed_tma_cpasync_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm103_blockscaled_mma_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm103_blockscaled_mma_array_warpspecialized.hpp"
-#include "cutlass/gemm/collective/sm120_mma_tma.hpp"
 #include "cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp"
-#include "cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp"
-#include "cutlass/gemm/collective/sm120_mma_tma_blockwise_scaling.hpp"
-#include "cutlass/gemm/collective/sm120_mma_array_tma_blockwise_scaling.hpp"
-#include "cutlass/gemm/collective/sm120_mma_array_tma.hpp"
-#include "cutlass/gemm/collective/sm100_mma_warpspecialized_interleaved_complex_emulated.hpp"
-#include "cutlass/gemm/collective/sm100_mma_array_warpspecialized_interleaved_complex_emulated.hpp"
-#include "cutlass/gemm/collective/sm100_mma_warpspecialized_interleaved_complex_tf32.hpp"
-#include "cutlass/gemm/collective/sm100_mma_array_warpspecialized_interleaved_complex_tf32.hpp"
-#include "cutlass/gemm/collective/sm100_mma_warpspecialized_planar_complex.hpp"
-#include "cutlass/gemm/collective/sm100_mma_array_warpspecialized_planar_complex.hpp"
-#include "cutlass/gemm/collective/sm120_sparse_mma_tma.hpp"
-#include "cutlass/gemm/collective/sm120_blockscaled_sparse_mma_tma.hpp"
-#endif // !defined(__CUDACC_RTC__)
-
-
-
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

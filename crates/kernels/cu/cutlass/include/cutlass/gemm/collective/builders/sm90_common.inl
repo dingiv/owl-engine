@@ -37,8 +37,10 @@
 #include "cutlass/detail/collective.hpp"
 #include "cutlass/detail/dependent_false.hpp"
 
+// **owl 裁剪点(2026-10-28)**:稀疏 GMMA 那一支(约 1.3MB 头:
+// `mma_traits_sm90_gmma_sparse` + `mma_sm90_gmma_sparse`)本仓不用 —— 全部
+// 原生核都是稠密。保留 sm90_common 只为了 `ss_smem_selector` 这个 smem 布局选路。
 #include "cute/atom/mma_traits_sm90_gmma.hpp"
-#include "cute/atom/mma_traits_sm90_gmma_sparse.hpp"
 #include "cute/atom/copy_traits_sm90_tma.hpp"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

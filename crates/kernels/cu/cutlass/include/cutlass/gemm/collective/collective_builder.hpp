@@ -36,33 +36,20 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// ============================================================================
+// **owl 裁剪点(2026-10-28)**:原版这里按序 include 了 sm90/sm100/sm103/
+// sm107/sm120 的全部 builder(30 个 `.inl`,连带整棵 UMMA/GMMA 内核树)。
+// 本仓只用 **sm120 blockscaled**(NVFP4 的唯一条路),其余代际走 Marlin/GGUF
+// 的自写核 —— 所以只留它,加它真正需要的公共面:
+// - `collective_builder_decl.hpp`:主模板声明(不是代际-specific)
+// - `sm100_blockscaled_umma_builder.inl`:它定义了
+//   `sm100_compute_stage_count_or_override_blockscaled`(blockscaled 流水级数
+//   启发式,sm120 builder 直接用)—— 只为一个函数引整个文件,但被引的那份
+//   builder 本身已在闭包里(cute/cutlass 的 pipeline/UMMA trait 复用)
+// 升级 CUTLASS 时照旧全量覆盖,再按同口径重裁一次。
+// ============================================================================
 #include "cutlass/gemm/collective/collective_builder_decl.hpp"
-#include "cutlass/gemm/collective/builders/sm90_gmma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm90_sparse_gmma_builder.inl"
-#if !defined(__CUDACC_RTC__)
-#include "cutlass/gemm/collective/builders/sm100_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_9xBF16_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_sparse_umma_builder.inl"
 #include "cutlass/gemm/collective/builders/sm100_blockscaled_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_blockwise_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_blockscaled_sparse_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_simt_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_mixed_input_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_cpasync_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_mixed_tma_cpasync_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_blockscaled_mixed_tma_cpasync_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm103_blockscaled_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm107_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm107_blockscaled_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm120_mma_builder.inl"
 #include "cutlass/gemm/collective/builders/sm120_blockscaled_mma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm120_sparse_mma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm120_blockscaled_sparse_mma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm120_blockwise_mma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm120_array_mma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_interleaved_complex_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_9xBF16_interleaved_complex_umma_builder.inl"
-#include "cutlass/gemm/collective/builders/sm100_planar_complex_umma_builder.inl"
-#endif
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

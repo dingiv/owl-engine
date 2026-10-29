@@ -1336,7 +1336,8 @@ fn build_flashinfer() {
         let src_hdr = "cu/flashinfer/owl_fi_attention_common.h";
         // vLLM vendored FA2 forward（2026-10-23）：**原版核体** + 本仓 host 胶水。
         // FA2 源在 `cu/flash_attn/vendor/`；CUTLASS 是**独立的共享家族**
-        // `cu/cutlass/`（workspace CUTLASS 4.8.0；仅 sm86 编译闭包）。
+        // `cu/cutlass/`（workspace CUTLASS 4.8.0 **裁剪快照**:只留 sm120 块缩放
+        // 那一条计算路 + FA2 的类型面;口径与重裁法见 `cu/cutlass/TRIMMED.md`）。
         let src_fa2 = "cu/flash_attn/owl_fa2.cu";
         let fa2_src = "cu/flash_attn/vendor/flash_attn/src";
         let fa2_cutlass = "cu/cutlass/include";

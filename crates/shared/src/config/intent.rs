@@ -370,6 +370,43 @@ pub const QWEN38_27B_AWQ: ModelProfile = ModelProfile {
     calibrated: true,
 };
 
+/// Qwen3.8-4B 蒸馏档(safetensors;NVFP4 / F16 对照都用它)
+///
+/// 几何来自 `models/empero-ai/Qwen3.8-4B-Distill/config.json`:32 层 hybrid
+/// (full_attention_interval=4 ⇒ full 8 / GDN 24)。`gdn_slot_elems` 按
+/// `engine::FixedAfter` 同式:`nk*hk*3 + nv*hv*3 + nv*hk*hv`
+/// `= 16*128*3 + 32*128*3 + 32*128*128 = 542,720`。
+///
+/// ⚠️ `calibrated = false`:无 `[vram-gov]` 现场;`weights_base_bytes` 取
+/// F16 参数量上界(8.41 GB 源 + 运行底价)。要 intent 派生显存账时先跑一发
+/// 拿 live 再改本行(NVFP4 档实测 live=3166 MiB)。
+pub const QWEN38_4B: ModelProfile = ModelProfile {
+    key: "qwen3.8-4b",
+    aliases: &["4b", "qwen3.8-4b-distill", "qwen35-4b"],
+    format: ModelFormat::Safetensors,
+    quant: QuantScheme::W4a16,
+    head_quant: HeadQuant::Off,
+    geom: ModelGeom {
+        hidden: 2560,
+        n_layers: 32,
+        n_full: 8,
+        n_kv_heads: 4,
+        head_dim: 256,
+        vocab: 248320,
+        max_pos: 262144,
+        // 16*128*3 + 32*128*3 + 32*128*128 = 542,720
+        gdn_slot_elems: 542_720,
+    },
+    // 9.0 GiB = F16 权重上界(8.41 GB 源 + 运行底价)
+    weights_base_bytes: 9_200 << 20,
+    weights_base_tp2_bytes: 0,
+    draft_weights_bytes: 260 << 20,
+    draft_weights_tp2_bytes: 0,
+    vision_weights_bytes: 0,
+    draft: None,
+    calibrated: false,
+};
+
 /// 0.8B 开发档(Qwen3.5)
 ///
 /// ⚠️ `calibrated = false`:权重字节为 f16 参数量的保守上界(1.6 GiB),
@@ -400,7 +437,7 @@ pub const QWEN35_08B: ModelProfile = ModelProfile {
     calibrated: false,
 };
 
-pub const MODELS: &[ModelProfile] = &[QWEN38_27B_AWQ, QWEN35_08B];
+pub const MODELS: &[ModelProfile] = &[QWEN38_27B_AWQ, QWEN38_4B, QWEN35_08B];
 
 /// 模型键 → 档(主键或别名;未命中 = Err 带清单)
 pub fn model_profile(key: &str) -> Result<&'static ModelProfile, String> {

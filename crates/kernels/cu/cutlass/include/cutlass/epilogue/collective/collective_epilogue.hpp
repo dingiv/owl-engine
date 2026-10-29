@@ -28,6 +28,20 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
+// ============================================================================
+// **owl 裁剪版(2026-10-28)** —— 不是 NVIDIA 原文件的全集。
+//
+// 原版把 sm70(vectorized)、sm90(TMA warp-specialized / bias / array)、
+// sm100(nosmem / tma / array)的 epilogue collective 全部 include 进来。
+// 本仓只用 **sm90 TMA warp-specialized** 那一条:sm120 的 builder 把
+// `Sm120TmaWarpSpecialized` 经 `GetBaseDispatchPolicy` 映射到 `Sm90TmaWarpSpecialized`
+// (见 `builders/sm120_builder.inl` 尾部),实际例化的就是它。
+// `default_epilogue_array` 与 `..._bias_elementwise` 只被 sm90 builder 的
+// 分支**按名引用**(非依赖名查找 ⇒ 必须在场),不例化。
+//
+// 升级 CUTLASS:全量覆盖后按本清单重裁;漏了会在编译期点名。
+// ============================================================================
 #pragma once
 
 #include <cutlass/detail/dependent_false.hpp>
@@ -59,17 +73,5 @@ class CollectiveEpilogue {
 //
 #include "default_epilogue.hpp"
 #include "default_epilogue_array.hpp"
-#include "epilogue_tensor_broadcast.hpp"
-#include "sm70_epilogue_vectorized.hpp"
-#include "sm70_epilogue_vectorized_array.hpp"
-#include "sm90_epilogue_tma_warpspecialized.hpp"
 #include "sm90_epilogue_tma_warpspecialized_bias_elementwise.hpp"
-#include "sm90_epilogue_array_tma_warpspecialized.hpp"
-#include "sm100_epilogue_nosmem.hpp"
-#include "sm100_epilogue_array_nosmem.hpp"
-#include "sm100_epilogue_tma_warpspecialized.hpp"
-#include "sm100_epilogue_array_tma_warpspecialized.hpp"
-//
-// Conv
-//
-/////////////////////////////////////////////////////////////////////////////////////////////////
+#include "sm90_epilogue_tma_warpspecialized.hpp"

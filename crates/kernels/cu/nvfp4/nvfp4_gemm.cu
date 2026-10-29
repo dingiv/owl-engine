@@ -52,7 +52,10 @@
 #include "cutlass/numeric_types.h"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
+// 启动器**自写**(2026-10-28 CUTLASS 裁剪):不再引 `gemm_universal_adapter.h`
+// —— 那是 CUTLASS 2.x 的 device 层,它把整棵 2.x 内核树(`gemm/threadblock` /
+// `gemm/warp` / `epilogue/threadblock` / sm70·sm100·sm107 的 kernel 头)全拉进来。
+// 我们要的只是 3.x 内核的四个静态入口 + 一次普通 `<<<>>>` 发射。
 
 using namespace cute;
 using ElemA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
@@ -87,7 +90,6 @@ using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
 
 using Kernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int, int, int, int>, Mainloop, Epilogue, cutlass::gemm::PersistentScheduler>;
-using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 using Sm1xxBlkScaledConfig = typename Mainloop::Sm1xxBlkScaledConfig;
 using StrideA = typename Mainloop::StrideA;
 using StrideB = typename Mainloop::StrideB;
@@ -100,6 +102,55 @@ using SFLayoutA = decltype(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
     make_shape(int(0), int(0), int(0), int(0))));
 using SFLayoutB = decltype(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
     make_shape(int(0), int(0), int(0), int(0))));
+
+// ---------------------------------------------------------------------------
+// 启动器(自写;替掉 CUTLASS 2.x 的 `GemmUniversalAdapter`)
+// ---------------------------------------------------------------------------
+//
+// 适配器做的事就三步：`initialize_workspace` → `to_underlying_arguments` →
+// `device_kernel<Kernel><<<grid, block, smem>>>`。前两步是 3.x 内核的静态入口，
+// 第三步一个 `__global__` 包装就够了 —— 引整个 2.x device 层只为了这三行不划算。
+
+/// 3.x 内核的 `__global__` 包装。逐字对齐 CUTLASS 自己那份(`cutlass/device_kernel.h`
+/// 的 `device_kernel<Operator>`,可它连带拉了 2.x 头):默认构造一个无状态算子,
+/// 直接用动态 smem + params 调它的 `operator()`。
+///
+/// `__launch_bounds__` 必须带上——它参与寄存器分配(与 CUTLASS 版逐字对齐
+/// 才能真正做到“只换启动器、不换代码生成”)。
+template <class K>
+__global__
+__launch_bounds__(K::MaxThreadsPerBlock, K::MinBlocksPerMultiprocessor)
+void OwlGemmKernel(__grid_constant__ typename K::Params const params) {
+  extern __shared__ char smem[];
+  K op;
+  op(params, smem);
+}
+namespace owl_nvfp4_detail {
+/// 一次发射(host 侧)：返回 0 = 已提交(未同步)；负值 = 主机侧失败
+/// (`-2` = `can_implement` 拒 / `-3` = workspace 初始化失败 / `-4` = 启动失败)。
+inline int launch(typename Kernel::Arguments const& args, void* ws, void* stream) {
+  if (!Kernel::can_implement(args)) return -2;
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  if (Kernel::initialize_workspace(args, ws, s) != cutlass::Status::kSuccess) return -3;
+  auto params = Kernel::to_underlying_arguments(args, ws);
+  const int smem = static_cast<int>(Kernel::SharedStorageSize);
+  // >48KB 的动态 smem 必须逐函数开阀(适配器在 `initialize` 里做的事)；
+  // 每调用一次也只是一次 cheap 的 driver 调用，但它是**不幂等报错**的，
+  // 所以只在超过阀值时做。
+  if (smem >= (48 << 10)) {
+    auto rc = cudaFuncSetAttribute(OwlGemmKernel<Kernel>,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (rc != cudaSuccess) {
+      (void)cudaGetLastError();  // 清错位，免得污染下一次读数
+      return -4;
+    }
+  }
+  dim3 grid = Kernel::get_grid_shape(params);
+  dim3 block = Kernel::get_block_shape();
+  OwlGemmKernel<Kernel><<<grid, block, smem, s>>>(params);
+  return cudaGetLastError() == cudaSuccess ? 0 : -4;
+}
+}  // namespace owl_nvfp4_detail
 
 // ---------------------------------------------------------------------------
 // e2m1 / e4m3 编码(host;与探针逐字相同)
@@ -337,7 +388,7 @@ void* owl_nvfp4_plan_new(int M, int N, int K) {
       {M, N, K, 1},
       {nullptr, stride_A, nullptr, stride_B, nullptr, p->l_sfa, nullptr, p->l_sfb},
       epi};
-  p->ws_bytes = Gemm::get_workspace_size(args);
+  p->ws_bytes = Kernel::get_workspace_size(args);
   return p;
 }
 
@@ -389,12 +440,7 @@ int owl_nvfp4_run(void* plan, void* stream,
        reinterpret_cast<ElementSF const*>(asf), p->l_sfa,
        reinterpret_cast<ElementSF const*>(bsf), p->l_sfb},
       epi};
-  Gemm gemm_op;
-  if (gemm_op.can_implement(args) != cutlass::Status::kSuccess) return -2;
-  cudaStream_t s = static_cast<cudaStream_t>(stream);
-  if (gemm_op.initialize(args, ws, s) != cutlass::Status::kSuccess) return -3;
-  if (gemm_op.run(s) != cutlass::Status::kSuccess) return -4;
-  return 0;
+  return owl_nvfp4_detail::launch(args, ws, stream);
 }
 
 /// **alpha 来自设备指针**版(2026-10-28 进图刀;生产路径)。
@@ -432,12 +478,7 @@ int owl_nvfp4_run_dev(void* plan, void* stream,
        reinterpret_cast<ElementSF const*>(asf), p->l_sfa,
        reinterpret_cast<ElementSF const*>(bsf), p->l_sfb},
       epi};
-  Gemm gemm_op;
-  if (gemm_op.can_implement(args) != cutlass::Status::kSuccess) return -2;
-  cudaStream_t s = static_cast<cudaStream_t>(stream);
-  if (gemm_op.initialize(args, ws, s) != cutlass::Status::kSuccess) return -3;
-  if (gemm_op.run(s) != cutlass::Status::kSuccess) return -4;
-  return 0;
+  return owl_nvfp4_detail::launch(args, ws, stream);
 }
 
 /// 版本/自述(诊断面:确认编进去的是哪个算术形态)

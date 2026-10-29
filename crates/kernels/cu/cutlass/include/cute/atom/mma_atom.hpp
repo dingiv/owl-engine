@@ -691,16 +691,17 @@ print(ThrMMA<TiledMMA, ThrVMNK> const& thr_mma)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include <cute/atom/mma_traits_sm61.hpp>
-#include <cute/atom/mma_traits_sm70.hpp>
+// **owl 裁剪点(2026-10-28)**:原版这里把 sm61/70/75/80/89/90/gmma/sm100/sm107/
+// sm120/sm120_sparse 的 MMA traits 全部拉进来 —— 单 sm100 traits 就会把
+// `copy_traits_sm100` → `copy_sm100`(356KB)、GMMA 稀疏 traits(→ 1MB 的
+// `mma_sm90_gmma_sparse.hpp`)、`tmem_allocator_sm100` 全带进来。
+// 本仓只用 **sm120 稠密** 的块缩放 atom。
+// `sm75` 是 **FA2(vLLM fork)在 sm86 代际**要的(`SM75_16x8x8_F32F16F16F32_TN`
+// 当 `MMA_Atom_Arch`)—— 那份 vendor 源不在我们的裁切范围里,必须留着。
 #include <cute/atom/mma_traits_sm75.hpp>
 #include <cute/atom/mma_traits_sm80.hpp>
-#include <cute/atom/mma_traits_sm89.hpp>
 #include <cute/atom/mma_traits_sm90.hpp>
 #include <cute/atom/mma_traits_sm90_gmma.hpp>
-#include <cute/atom/mma_traits_sm100.hpp>
-#include <cute/atom/mma_traits_sm107.hpp>
 #include <cute/atom/mma_traits_sm120.hpp>
-#include <cute/atom/mma_traits_sm120_sparse.hpp>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
