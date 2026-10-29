@@ -20,7 +20,7 @@
 > `本地实测档` (local measurement archive) · `本地原始数据` (local raw data) ·
 > `/path/to/models/…` (weights you supply) · `<worktree>/…` (git worktree).
 
-Progress: **0 / 84** reviewed.
+Progress: **0 / 100** reviewed.
 
 Body documents are written in **Chinese**; this index and all meta documents
 (`README`, `CONTRIBUTING`, `SECURITY`, `THIRD_PARTY.md`, `NOTICE`) are in **English**.
@@ -80,6 +80,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/models/load-speedup-tp2-handoff-20261024.md`](devlog/models/load-speedup-tp2-handoff-20261024.md) — Load-speed handoff: TP2 parallel load + per-device vram account (P0 done)
 - ⬜ [`devlog/models/gguf-format.md`](devlog/models/gguf-format.md) — GGUF format support
 - ⬜ [`devlog/models/new-format-checklist.md`](devlog/models/new-format-checklist.md) — New-format onboarding checklist
+- ⬜ [`devlog/models/fp8-to-w4a16-converter.md`](devlog/models/fp8-to-w4a16-converter.md) — FP8 → 4bit offline converter: two-step dequant + AWQ/GPTQ, owl-accepted schemes, quality gates (design frozen)
 - ⬜ [`devlog/models/vision-tower.md`](devlog/models/vision-tower.md) — Vision tower integration + CPU parity harness
 - ⬜ [`devlog/models/vision-wiring.md`](devlog/models/vision-wiring.md) — Vision tower × engine/serving wiring
 - ⬜ [`devlog/models/vision-multi-image-handoff-20261024.md`](devlog/models/vision-multi-image-handoff-20261024.md) — Vision multi-image handoff: FA2 convergence, 4B MTP restore_spec_snap blocker
