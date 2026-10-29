@@ -59,3 +59,4 @@ experiments
 # 本机站点事实 / 本地档(不入库):构建环境变量、本地 profile、boot 日志。
 # 新硬件形状在被裁决成常驻档之前,档位只住在这里(入口档面受 profiles.rs 钉住)。
 .local-state/
+*.local.toml

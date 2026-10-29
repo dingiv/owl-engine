@@ -55,11 +55,11 @@ max_concurrency = 1
 implicit_session = false
 # 未带 max_tokens 时的生成步数 / 夹紧上限
 default_max_new = 4096
-max_new_cap = 8192
+max_new_cap = 32768
 # 排队超时(毫秒;0 = 关)
 queue_wait_ms = 0
 # 上下文上限(token)
-max_seq = 131072
+max_seq = 32768
 # 预填块长 / 尾块合并阈值(剩余 ≤ chunk + tail_merge ⇒ 一口气吃完)
 # 实测(2026-10-27,单 3090 / 27B AWQ / DFlash2 d7 / ctx 63456,**冷 boot 逐档**):
 #   chunk 512 / tail 512 : 4k 1320 · 8k 1308 t/s ; 32k 1173 t/s(TTFT 27.9s)
