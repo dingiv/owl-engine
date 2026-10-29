@@ -447,13 +447,80 @@ impl W4A16Source {
         Ok(Some(buf))
     }
 
+    /// 原始尺度([out, groups] f32)+ 形状(合并键重排用)。
+    fn scales_f32_words(&self, base: &str) -> Taken<(Vec<f32>, usize, usize)> {
+        let Some((out, k, _pe, se)) = self.linear_dims(base)? else { return Ok(None) };
+        let bytes = &self.maps[se.map_ix][se.start..se.start + se.nbytes];
+        Ok(Some((scales_par(se.dtype, bytes), out, k)))
+    }
+
+    /// 原始 packed 字([out, k/8] I32)+ 形状(合并键重排用)。
+    fn packed_words(&self, base: &str) -> Taken<(Vec<i32>, usize, usize)> {
+        let Some((out, k, pe, _se)) = self.linear_dims(base)? else { return Ok(None) };
+        let bytes = &self.maps[pe.map_ix][pe.start..pe.start + pe.nbytes];
+        Ok(Some((i32s_par(bytes), out, k)))
+    }
+
     /// 量化线性物化(键首触才建;qweight/scales 成对,weight 独立)。
     /// 双检缓存(快路径锁内查;构建在 build_lock 串行内,防并发双建)。
     fn linear_bytes_for(&self, base: &str, key: &str) -> Taken<Arc<[u8]>> {
-        // 刀2 虚拟合并:in_proj_qkvz = row-stack(in_proj_qkv, in_proj_z)
-        // (同 k 行堆叠 = 字节拼接;两子基各自走完整建管)
+        // 刀2 虚拟合并:in_proj_qkvz / gate_up_proj = row-stack(两子基)
+        //
+        // ⚠️ **只有原始字节/未重排产物可以跨 N 拼接**:
+        // - `packed_raw` / `.weight`(行主序)→ 拼接后整体重排,等价;
+        // - `.scales` 同样不行:perm 的 64 元素块按**整行 out** 排布,out 变了
+        //   边界就变 ⇒ 也要先拼原始尺度再整体 `pack_marlin_s`;
+        // - **`.qweight` 不行** —— marlin B 的 N 轴有 tile 交错,半矩阵 B 拼接
+        //   ≠ 整体 B(同门实测);必须先解包两半 nibble、拼成 `[2I,k]`,再整体
+        //   `pack_marlin_b_gather_into` 一次。
         if let Some((b1, b2)) = crate::formats::split_merged(base) {
             let suffix = &key[base.len()..];
+            if suffix == ".scales" {
+                let Some((s1, o1, k1)) = self.scales_f32_words(&b1)? else { return Ok(None) };
+                let Some((s2, o2, k2)) = self.scales_f32_words(&b2)? else { return Ok(None) };
+                if k1 != k2 {
+                    return Err(ModelError::Msg(format!(
+                        "合并键 {base}: 两子 k 不一致（{k1} vs {k2}）"
+                    )));
+                }
+                let out = o1 + o2;
+                let groups = k1 / 128;
+                let mut merged = s1;
+                merged.extend(s2);
+                let s = pack_marlin_s(&merged, out, groups);
+                let buf: Arc<[u8]> = Arc::from(u16s_le_bytes(&s).into_boxed_slice());
+                let mut cache = self.cache_guard();
+                cache.1 += buf.len();
+                cache.0.insert(key.to_string(), buf.clone());
+                return Ok(Some(buf));
+            }
+            if suffix == ".qweight" {
+                let Some((p1, o1, k1)) = self.packed_words(&b1)? else { return Ok(None) };
+                let Some((p2, o2, k2)) = self.packed_words(&b2)? else { return Ok(None) };
+                if k1 != k2 {
+                    return Err(ModelError::Msg(format!(
+                        "合并键 {base}: 两子 k 不一致（{k1} vs {k2}）"
+                    )));
+                }
+                let out = o1 + o2;
+                let mut q = Vec::with_capacity(out * k1);
+                unpack_nibbles_into(&p1, o1, k1, &mut q);
+                let mut q2 = Vec::new();
+                unpack_nibbles_into(&p2, o2, k2, &mut q2);
+                q.extend_from_slice(&q2);
+                let idx = self
+                    .idx_guard()
+                    .entry((k1, out))
+                    .or_insert_with(|| Arc::new(marlin_gather_indices(k1, out)))
+                    .clone();
+                let mut b = Vec::new();
+                pack_marlin_b_gather_into(&q, &idx, out * k1 / 8, &mut b);
+                let buf: Arc<[u8]> = Arc::from(i32s_le_bytes(&b).into_boxed_slice());
+                let mut cache = self.cache_guard();
+                cache.1 += buf.len();
+                cache.0.insert(key.to_string(), buf.clone());
+                return Ok(Some(buf));
+            }
             let Some(s1) = self.linear_bytes_for(&b1, &format!("{b1}{suffix}"))? else { return Ok(None) };
             let Some(s2) = self.linear_bytes_for(&b2, &format!("{b2}{suffix}"))? else { return Ok(None) };
             let mut buf = Vec::with_capacity(s1.len() + s2.len());
@@ -976,5 +1043,96 @@ mod tests {
             "[fc-derive] 5 块 × (尺度内容口径 BF16 对账 + marlin B 逐字)全绿(目录 {})",
             dir.display()
         );
+    }
+}
+
+#[cfg(test)]
+mod merge_regression {
+    //! 合并键（gate_up / qkvz）回归：qweight/scales 必须先拼原始再整体重排。
+    use super::*;
+    use safetensors::tensor::{serialize, TensorView};
+    use std::collections::HashMap;
+    use std::fs;
+
+    fn pack_words(q: &[u8], out: usize, k: usize) -> Vec<u8> {
+        let mut words = vec![0i32; out * k / 8];
+        for o in 0..out {
+            for i in 0..k {
+                words[o * k / 8 + i / 8] |= (q[o * k + i] as i32) << (4 * (i % 8));
+            }
+        }
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    fn bf16_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| half::bf16::from_f32(*x).to_le_bytes()).collect()
+    }
+
+    /// 源 scales 落盘是 BF16 ⇒ 权威面也必须先过 BF16 网格。
+    fn bf16_round(v: &[f32]) -> Vec<f32> {
+        v.iter().map(|x| half::bf16::from_f32(*x).to_f32()).collect()
+    }
+
+    #[test]
+    fn merged_qweight_and_scales_are_repacked_not_concatenated() {
+        const OUT: usize = 256;
+        const K: usize = 256;
+        let groups = K / 128;
+        let qg: Vec<u8> = (0..OUT * K).map(|i| (i * 7 + 3) as u8 % 16).collect();
+        let qu: Vec<u8> = (0..OUT * K).map(|i| (i * 11 + 5) as u8 % 16).collect();
+        let sg: Vec<f32> = (0..OUT * groups).map(|i| (i as f32 + 1.0) * 1e-3).collect();
+        let su: Vec<f32> = (0..OUT * groups).map(|i| (i as f32 + 2.0) * 1e-3).collect();
+
+        let dir = std::env::temp_dir().join(format!("owl-w4a16-merge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let qg_bytes = pack_words(&qg, OUT, K);
+        let qu_bytes = pack_words(&qu, OUT, K);
+        let sg_bytes = bf16_bytes(&sg);
+        let su_bytes = bf16_bytes(&su);
+        let prefix = "model.layers.0.mlp.";
+        let mut data: HashMap<String, TensorView> = HashMap::new();
+        for (base, qb, sb) in [
+            (format!("{prefix}gate_proj"), &qg_bytes, &sg_bytes),
+            (format!("{prefix}up_proj"), &qu_bytes, &su_bytes),
+        ] {
+            data.insert(
+                format!("{base}.weight_packed"),
+                TensorView::new(safetensors::Dtype::I32, vec![OUT, K / 8], qb).unwrap(),
+            );
+            data.insert(
+                format!("{base}.weight_scale"),
+                TensorView::new(safetensors::Dtype::BF16, vec![OUT, groups], sb).unwrap(),
+            );
+        }
+        let blob = serialize(data, None).unwrap();
+        fs::write(dir.join("model.safetensors"), blob).unwrap();
+
+        let src = W4A16Source::open_dir(&dir).unwrap();
+        src.set_device_repack(false);
+        let base = format!("{prefix}gate_up_proj");
+
+        let (qb, qdt) = src.key_bytes(&format!("{base}.qweight")).unwrap().unwrap();
+        assert_eq!(qdt, Dtype::U32);
+        let mut merged_q = qg.clone();
+        merged_q.extend_from_slice(&qu);
+        let idx = marlin_gather_indices(K, OUT * 2);
+        let mut want_b = Vec::new();
+        pack_marlin_b_gather_into(&merged_q, &idx, OUT * 2 * K / 8, &mut want_b);
+        assert_eq!(i32s_par(qb.as_slice()), want_b, "merged qweight 必须整体重排");
+
+        let (sb, sdt) = src.key_bytes(&format!("{base}.scales")).unwrap().unwrap();
+        assert_eq!(sdt, Dtype::F16);
+        let mut merged_s = bf16_round(&sg);
+        merged_s.extend_from_slice(&bf16_round(&su));
+        let want_s = pack_marlin_s(&merged_s, OUT * 2, groups);
+        let got_s: Vec<u16> = sb
+            .as_slice()
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(got_s, want_s, "merged scales 必须整体 perm");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
