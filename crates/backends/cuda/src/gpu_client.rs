@@ -23,6 +23,10 @@ pub struct GpuClient {
     vram: std::sync::Arc<VramAccount>,
     /// 诊断下沉口(与 GPU server 同一只;`sink()` 组装时同传双方)
     sink: owl_shared::log::LogSink,
+    /// **设备代际缓存**(2026-10-27 代际单源):`device_arch()` 问到的值,
+    /// 供同步面 `op_env()` 复读 —— 契约里的 `op_env` 是同步的,不能现场问 server。
+    /// 未问过 = 未探测面(测试句柄);引擎 boot 必先问一次。
+    arch: std::sync::OnceLock<owl_kernels::Arch>,
     /// **累积批的待提交队列**(`queue` 追加 / `flush` 一次提交;2026-10-21)。
     ///
     /// 语义:队列**属于句柄**,不跨克隆(`face_clone`/`loader_faces` 出来的
@@ -37,6 +41,8 @@ impl Clone for GpuClient {
             tx: self.tx.clone(),
             vram: self.vram.clone(),
             sink: self.sink,
+            // 克隆 = 同一份设备事实(已探测过的代际跟着走)
+            arch: self.arch.clone(),
             pending: Vec::new(),
         }
     }
@@ -86,6 +92,7 @@ impl GpuClient {
             tx,
             vram: std::sync::Arc::new(VramAccount::new()),
             sink: owl_shared::log::LogSink::none(),
+            arch: std::sync::OnceLock::new(),
             pending: Vec::new(),
         }
     }
@@ -101,7 +108,7 @@ impl GpuClient {
         sink: owl_shared::log::LogSink,
         vram: std::sync::Arc<VramAccount>,
     ) -> Self {
-        Self { tx, vram, sink, pending: Vec::new() }
+        Self { tx, vram, sink, arch: std::sync::OnceLock::new(), pending: Vec::new() }
     }
 
     /// **块账按名清单**(诊断查询面;2026-10-16 全量记名)。
@@ -356,14 +363,28 @@ impl DeviceClient for GpuClient {
     fn vram_snapshot(&self) -> VramSnapshot {
         self.vram.snapshot()
     }
-    /// 执行环境提供(被动律:感知在本侧/boot,kernels 零探测)。
-    /// arch 占位 Sm86 —— boot 时从 driver API/CC 查询接真感知,接口零改动。
+    /// **设备代际**(代际真值;与 `sm_count` 同族:纯属性查询、无 GPU 活)。
+    ///
+    /// 查询结果**缓存**在该句柄:契约的同步面 `op_env()` 从这里复读
+    /// (否则每个句柄都要现场问一次,且捕获期/装载前没法 ask)。
+    async fn device_arch(&mut self) -> Result<owl_kernels::Arch, ModelError> {
+        let arch = self.submit(move |ack| Command::DeviceArch { ack })?.await?;
+        // 竞态无意义:一次 boot 只问一次;已缓存时以先到者为准(设备不会换)
+        let _ = self.arch.set(arch);
+        Ok(arch)
+    }
+
+    /// **执行环境提供**(被动律:感知在本侧/boot,kernels 零探测)。
+    ///
+    /// 代际 = [`Self::device_arch`] 问到的真值(未问过 = 测试句柄,落
+    /// [`owl_kernels::Arch::DEFAULT`] —— 生产路径引擎 boot **必先**问一次,
+    /// 所以这里的兜底不会落到真机上)。
     fn op_env(&self) -> Option<owl_kernels::driver::OpEnv> {
+        let arch = *self.arch.get().unwrap_or(&owl_kernels::Arch::DEFAULT);
         Some(owl_kernels::driver::OpEnv {
-            hw: owl_kernels::driver::Hw { arch: owl_kernels::Arch::Sm86 },
+            hw: owl_kernels::driver::Hw { arch },
             page: 0, // 页项由解释器从页策略单源补齐(kv_paged_policy)
-            // 几何事实由引擎 boot 从 ModelDims 合入(EnvProvider::op_env);
-            // 后端自述面拿不到模型几何 ⇒ 0 = 未知(几何门跳过)
+            // 几何事实由引擎 boot 从 ModelDims 合入(EnvProvider::op_env)
             head_dim: 0,
             grp: 0,
         })

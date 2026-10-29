@@ -1,12 +1,13 @@
 {
-  "_note": "gdn_chunked 六核 **AOT 编译配置表**(2026-10-13)。为什么需要它:Triton 核的编译选项空间是 **autotune 选出来的**(不是从源码唯一确定的),所以必须把 2026-10-11 采集时**选中的那组**记下来;`shared` = 该组编译产物的 smem 字节数,由 tools/gdn_aot_compile.py 编译后回读比对(= 自校验)。native 核没有这张表(它们的编译输入 = .cu + arch)。",
+  "_note": "gdn_chunked 六核 **AOT 编译配置表**(2026-10-13)。为什么需要它:Triton 核的编译选项空间是 **autotune 选出来的**(不是从源码唯一确定的),所以必须把 2026-10-11 采集时**选中的那组**记下来;`shared` = 该组编译产物的 smem 字节数(采集代际 = sm_86),由 tools/gdn_aot_compile.py 编译后回读比对(= 自校验)。其它代际的 smem 可写在 `shared_by_arch`(键 = SM 数字形;2026-10-27 补 sm_120:wu 在 Blackwell 上 codegen 少一个 stage 的 smem,28672)。native 核没有这张表(它们的编译输入 = .cu + arch)。",
   "_shape": "采集时的生产形状;配置按此调优 ⇒ 编译必须同形(T=1024 NK=16 NV=48 KD=128 VD=128 BT=64)",
   "shape": { "T": 1024, "NK": 16, "NV": 48, "KD": 128, "VD": 128, "BT": 64 },
   "kernels": {
     "cumsum": { "num_warps": 4, "num_stages": 3, "kwargs": {}, "shared": 8 },
     "kkt": { "num_warps": 8, "num_stages": 4, "kwargs": { "BK": 64 }, "shared": 24576 },
     "merge": { "num_warps": 2, "num_stages": 2, "kwargs": {}, "shared": 10240 },
-    "wu": { "num_warps": 4, "num_stages": 3, "kwargs": {}, "shared": 32768 },
+    "wu": { "num_warps": 4, "num_stages": 3, "kwargs": {}, "shared": 32768,
+            "shared_by_arch": { "120": 28672 } },
     "h": { "num_warps": 4, "num_stages": 2, "kwargs": { "BV": 64 }, "shared": 49412 },
     "o": { "num_warps": 4, "num_stages": 3, "kwargs": { "BK": 32, "BV": 64 }, "shared": 24576 }
   }

@@ -509,6 +509,41 @@ impl<D: DeviceClient> GraphPlan<D> {
         self.last.get(name).map(|o| o.block.clone())
     }
 
+    /// **交还 eager 档的瞬态输出**(2026-10-28)。
+    ///
+    /// 背景:`eval_current` 在**下一步开头**才释放上一步的 `last` 块。捕获档无妨
+    /// (输出槽由图持有、跨步恒定);但 **eager 档**跨 turn 时tab是灾难:
+    /// turn 末的 `last`(logits 496640B + token 4B)一直挂着 → N4 报"未归还"
+    /// → **兼底释放**(store 侧删借出登记并真 free) → 下一 turn 头部
+    /// `eval_current` 又去 free 那批 id → `幽灵归还 —— 账上无 id 的在借登记`
+    /// **(实测:第二次请求必失败,与量化方案无关 —— F16 档同形)。
+    ///
+    /// 修法:turn 收尾(兼底释放**之前**)在 eager 档主动把输出交还,让
+    /// 账本与句柄一致。捕获档直接 no-op(那里的 `last` 是图输出槽,不许动)。
+    pub async fn release_eager_outputs(&mut self) -> Result<()> {
+        if self.is_captured() || self.last.is_empty() {
+            return Ok(());
+        }
+        let old: Vec<u64> = self.last.values().map(|o| o.block.id).collect();
+        self.last.clear();
+        self.face.free(&old).await?;
+        Ok(())
+    }
+
+    /// **本 plan 是否处于捕获态**(输出槽指针跨步恒定)。
+    ///
+    /// 为什么必须问这个:eager 档的 `last` 是**上一步的瞬态块** —— 步末已被
+    /// 作用域回收(或 turn 末被 N4 兜底释放)⇒ 它的 id **不能跨步/跨 turn 用**。
+    /// 旧实现不区分两态:prefill 末块把 logits "发布进会话图输出槽"
+    /// (`copy_block_at` 到 `output_block("logits")`),而在 `[cuda] graph = false`
+    /// 的档里那个句柄已死 ⇒ **第二次请求**当场
+    /// `[copy-dst-arg] … DeadBlock`(2026-10-28 实测:与量化方案无关,
+    /// F16 档同形;eager 档此前几乎无人跑,故长期潜伏)。
+    #[must_use]
+    pub fn is_captured(&self) -> bool {
+        matches!(self.mode, Mode::Captured { .. })
+    }
+
     /// 输出收割(读语义;块 = 最近一次 step/捕获的归约产物)
     pub async fn read_output_f32(&mut self, name: &str) -> Result<Vec<f32>> {
         let out = self

@@ -1,0 +1,12 @@
+# 模型组件：Qwen3.8-9B GGUF Q4_K_M（文本主干；33 层 hybrid = GDN + 每 4 层 full attn）。
+# 形状来源：GGUF 元数据（general.architecture=qwen35 / block_count=33 /
+# embedding_length=4096 / head_count=16 / head_count_kv=4 / key=value_length=256 /
+# full_attention_interval=4 / nextn_predict_layers=1 ⇒ 自带 MTP 头）。
+[model]
+name = "qwen3.8-9b-gguf"
+path = "/home/ubuntu/gui_agent/models/empero-ai/Qwen3.8-9B-Distill-GGUF/Qwen3.8-9B-Q4_K_M.gguf"
+format = "gguf"
+quant = "q4k"
+head_quant = "off"
+# 该 GGUF 不带视觉塔（纯文本蒸馏档）
+vision = false

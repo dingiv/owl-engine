@@ -12,6 +12,9 @@
 //! - [`nc_bf16_v2`]:草稿非因果块注意力(滑窗 + 单头 softmax)—— ③ 重写核。
 
 pub mod cublas_gemm;
+/// NVFP4 块缩放 GEMM(feature `nvfp4`;host 同规则反量化参考)
+#[cfg(feature = "nvfp4")]
+pub mod nvfp4;
 pub mod k0_fp8_knhd;
 /// marlin oracle(需自家 packer ⇒ 随 feature 门;`SELFCHECK` 用互斥 cfg 常量挂)
 #[cfg(feature = "marlin")]

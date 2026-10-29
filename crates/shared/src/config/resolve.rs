@@ -568,6 +568,7 @@ fn format_name(f: super::ModelFormat) -> &'static str {
 fn quant_name(q: super::QuantScheme) -> &'static str {
     match q {
         super::QuantScheme::W4a16 => "w4a16",
+        super::QuantScheme::Nvfp4 => "nvfp4",
         super::QuantScheme::W4a8 => "w4a8",
         super::QuantScheme::Q4k => "q4k",
         super::QuantScheme::Iq4 => "iq4",

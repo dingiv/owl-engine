@@ -302,6 +302,12 @@ pub enum Command {
     DeviceSmCount {
         ack: Ack<Result<usize, ModelError>>,
     },
+    /// **设备代际查询**(宿主面只读;`COMPUTE_CAPABILITY_MAJOR/MINOR` → `Arch`)。
+    /// 与 `DeviceSmCount` 同族。语义 = **运行期代际真值**(构建期真值 = Cargo feature `arch-smXX`,
+    /// 两者由装机期架构门对齐;见 `owl_kernels::arch`)。
+    DeviceArch {
+        ack: Ack<Result<owl_kernels::Arch, ModelError>>,
+    },
     /// **块账本投影**(调试面;`GET /debug/blocks`):全活块 (id, 字节, dtype, 地址, 账本)
     /// —— 判「同 id 两地址」与「两活块区间相交」的唯一权威快照。
     BlockLedgerDump {
@@ -370,6 +376,7 @@ impl Command {
             Self::Htod { .. } => "htod",
             Self::MemsetZero { .. } => "memset_zero",
             Self::DeviceSmCount { .. } => "device_sm_count",
+            Self::DeviceArch { .. } => "device_arch",
             Self::BlockLedgerDump { .. } => "block_ledger_dump",
             Self::MemPoolTrim { .. } => "mem_pool_trim",
             Self::MemPoolStats { .. } => "mem_pool_stats",
@@ -417,6 +424,7 @@ impl Command {
             Self::Alloc { ack, .. } => ack.created_at(),
             Self::Htod { ack, .. } => ack.created_at(),
             Self::DeviceSmCount { ack } => ack.created_at(),
+            Self::DeviceArch { ack } => ack.created_at(),
             Self::BlockLedgerDump { ack } => ack.created_at(),
             Self::MemPoolStats { ack } => ack.created_at(),
             Self::MemInfo { ack } => ack.created_at(),

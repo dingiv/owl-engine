@@ -129,6 +129,15 @@ impl GpuServer {
         let dst = unsafe { stream.alloc::<u8>(n) }
             .map_err(|e| ModelError::Msg(format!("htod alloc: {e:?}")))?;
         let id = self.ctx_mut().new_block(dst, name);
+        // **live 音账**(2026-10-28 review M1):`htod` 也是一次块出生 —— 与
+        // `handle_alloc` 同律记账。原先只 `new_block` 不记账，而 `free_blocks`
+        // 对 Owned 块**无条件**减 ⇒ 这些块被释放时 live 被多减（可致负数），
+        // 进而把 `Engine::run` 的“权重字节”算低：NVFP4 档实测少 ~2 GB
+        // （源 8.41 GB → 应付 3.3 GB，账上只有 1.25 GB），**而那个数决定 KV
+        // 池余量** —— 即显存超分风险。同时它也把 `vram_guard` 的真实占用
+        // 报低了一个 htod 量级。
+        owl_shared::vram::live_add(n as i64);
+        self.vram.live_add(n as i64);
         // 2. pinned 码头 + 异步 memcpy(流序;host 侧必须 pinned 才真异步)。
         //    码头池化(2026-09-26 尾批:原每次 malloc_host 新分配,大权重
         //    锁页分配是装载耗时大头;finish 回调归还池)

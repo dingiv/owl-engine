@@ -650,10 +650,15 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             // D2D ≤ 500KB)。
             {
                 let lb = &blks[0];
-                if let Some(slot) = self.graphs.session.output_block("logits") {
-                    let n = lb.len.min(slot.len) * lb.dtype.size_bytes();
-                    let face = self.graphs.session.face_mut();
-                    face.copy_block_at(lb, 0, &slot, 0, n).await?;
+                // **只在捕获态发布**(2026-10-28):eager 档的 `last` 是瞬态块
+                // (步末已回收)⇒ 拷进去 = 写死块(第二次请求必 DeadBlock)。
+                // eager 本就不靠「图 step 槽」读 logits(它每步现算),故跳过无损。
+                if self.graphs.session.is_captured() {
+                    if let Some(slot) = self.graphs.session.output_block("logits") {
+                        let n = lb.len.min(slot.len) * lb.dtype.size_bytes();
+                        let face = self.graphs.session.face_mut();
+                        face.copy_block_at(lb, 0, &slot, 0, n).await?;
+                    }
                 }
             }
             if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {

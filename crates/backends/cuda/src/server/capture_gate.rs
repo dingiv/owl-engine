@@ -30,6 +30,7 @@ pub(super) fn reject_closed(cmd: Command) {
             Command::LedgerJson { ack, .. } => closed!(ack),
             Command::UploadPinned { ack, .. } => closed!(ack),
             Command::DeviceSmCount { ack } => closed!(ack),
+            Command::DeviceArch { ack } => closed!(ack),
             Command::BlockLedgerDump { ack } => closed!(ack),
             Command::MemPoolTrim { ack } => closed!(ack),
             Command::MemPoolStats { ack } => closed!(ack),
@@ -66,6 +67,7 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
         let name = |c: &Command| match c {
             // E2 复合(分相计时标签;与 Command::kind() 同名单一真源)
             Command::DeviceSmCount { .. } => "device_sm_count",
+            Command::DeviceArch { .. } => "device_arch",
             Command::BlockLedgerDump { .. } => "block_ledger_dump",
             Command::MemPoolTrim { .. } => "mem_pool_trim",
             Command::MemPoolStats { .. } => "mem_pool_stats",
@@ -129,6 +131,8 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             // 设备 SM 数 = 恒定属性查询(**不碰设备状态、不发射**)⇒ 捕获期**放行**
             // (与 LedgerDump/Trim 不同:那两个要排空/改池;本命令纯读属性)
             Command::DeviceSmCount { .. } => {}
+            // 设备代际 = 恒定的属性查询(不碰设备状态、不发射)⇒ 捕获期放行
+            Command::DeviceArch { .. } => {}
             Command::BlockLedgerDump { ack } => reject!(ack),
             // 池回收 = host 侧池操作(与图捕获无关的全局动作)⇒ 捕获期拒
             Command::MemPoolTrim { ack } => reject!(ack),

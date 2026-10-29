@@ -14,6 +14,30 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 # 运行期可见性另由 logger 的 level + tag 白黑名单控制(同一道 `LogSink::enabled`)。
 "default" = ["log"]
 "log" = []
+
+# ── 构建期代际(目标 GPU 那一代:消费级 20/30/40/50 系)──────────────────
+#
+# 为什么是 feature 而不是环境变量:构建目标必须**进构建指纹**。env 不进 cargo
+# 的缓存键 ⇒ “同一份源码 + 另一个 env”在 target/ 里不是一个东西,旧产物会
+# 静默留用。feature 由 cargo 解析,天然进指纹、可复现、可被 `--features` 叠加。
+#
+# 选法:
+#   cargo build --release -p server --no-default-features --features arch-sm120   # RTX 50 系
+#   cargo build --release -p server --no-default-features --features arch-sm86,arch-sm120  # 双代际 fatbin
+# 缺省(sm_86 = RTX 30 系)= `apps/server` 的 default;零 feature 的库构建落 `Arch::DEFAULT` + 告警。
+# 多选语义:native cubin 出多代际 fatbin;单份 `.a` 家族(Marlin/FI/GDN)取**最高**代。
+#
+# 只收录用户裁决的四代(2026-10-27);数据中心卡/A100·H100·B200 不进具名表,
+# 驱动报上来的表外代际落 `Arch::Other`(能力按 CC 推导,不冒充邻近代际)。
+"arch-sm75" = []
+"arch-sm86" = []
+"arch-sm89" = []
+# sm_120(50 系)顺带开 NVFP4 静态库:FP4 是 'a' 档指令,只有这一代有(见 `Caps::fp4_blockscale`)。
+"arch-sm120" = ["nvfp4"]
+# NVFP4 块缩放 GEMM(CUTLASS sm120 blockscaled mainloop → `libnvfp4.a`)。
+# 源是 **arch-specific**:`-gencode arch=compute_120a,code=sm_120a`(两个都要带 `a`);
+# 选中代没有 FP4 张量核时 build.rs 整段跳过。冷编 ≈ 25 s(CUTLASS 闭包单 TU)。
+"nvfp4" = []
 # cuBLAS 封装(f16 基线 F1;独立 feature —— 引源码之家不拖链接)
 # half:W-2d 的 `gemm_f16_dst` 用 f16 标量(alpha/beta;CUBLAS_COMPUTE_16F 口径)
 "cublas" = ["dep:cudarc", "dep:half"]

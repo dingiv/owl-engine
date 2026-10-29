@@ -129,12 +129,38 @@ pub fn quant_plan_of(
         (F::Awq, Q::W4a16) => owl_models::module::QuantPlan::W4A16Awq,
         (F::Awq, Q::W4a8) => owl_models::module::QuantPlan::W4A8Awq,
         (F::Safetensors, Q::W4a16) => owl_models::module::QuantPlan::W4A16,
+        // NVFP4:装载期从 f16 现量化(权重+激活块缩放)
+        (F::Safetensors, Q::Nvfp4) => owl_models::module::QuantPlan::NvFp4,
         // 普通 safetensors 的 W4A8 尚无独立 plan(AWQ 布局是其唯一实现)
         (F::Safetensors, Q::W4a8) => owl_models::module::QuantPlan::W4A8Awq,
         // 未实现/错配(validate 已拒):保持 f16 直读,不 panic
+        (_, Q::Nvfp4) => owl_models::module::QuantPlan::NvFp4,
         (_, Q::Q4k | Q::Iq4 | Q::Iq3) => {
             owl_models::module::QuantPlan::F16
         }
+    }
+}
+
+/// **safetensors 目录的“装载期现量化”计划**(与 [`quant_plan_of`] 并列的
+/// 第二入口:同样是唯一映射点,只服务普通 HF 目录)。
+///
+/// 为何不直接用 [`quant_plan_of`]:那份表对 `(Safetensors, W4a16)` 答
+/// `W4A16` —— 那是**pack-quantized 源**(ct 已打包的 qweight/scales)
+/// 的语义,而普通 HF 目录里的 `[model] quant = "w4a16"` 历史上是
+/// **空档**(旧 loader 恒 F16;档案注释也写着“safetensors 档忽略”)。
+/// 把两者混为一种计划,第一次就会把纯 bf16 检查点按 marlin 键去要
+/// `…qweight` 而当场拒启(实测现场)。
+///
+/// 所以本表只回答一件事:**普通 HF 目录能“在装载期从全精度现算出”哪些
+/// 量化格式**。今天只有 `nvfp4`(host 打包,见 `formats::transform::NvFp4Pack`);
+/// 其余一律 F16 直读(与历史逐字节一致)。
+pub fn safetensors_load_plan(
+    q: owl_shared::config::QuantScheme,
+) -> owl_models::module::QuantPlan {
+    use owl_shared::config::QuantScheme as Q;
+    match q {
+        Q::Nvfp4 => owl_models::module::QuantPlan::NvFp4,
+        _ => owl_models::module::QuantPlan::F16,
     }
 }
 

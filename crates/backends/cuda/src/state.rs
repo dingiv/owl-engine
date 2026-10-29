@@ -157,6 +157,8 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
                     tags.push(T::QUANT_AWQ);
                 }
             }
+            // NVFP4:权重+激活块缩放(统一臂;decode 也走同一条)
+            QuantScheme::Nvfp4 => tags.push(T::QUANT_NVFP4),
             // GGUF 块型在这里不给 tag(上面的 format=Gguf 分支已放行)
             QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3 => {}
         },
@@ -1226,9 +1228,12 @@ impl GpuCtx {
                     .map_err(|e| format!("查 COMPUTE_CAPABILITY_MINOR: {e:?}"))?;
                 let dev = format!("sm_{major}{minor}");
                 if !archs.contains(&dev.as_str()) {
+                    // 拒启消息必须**可操作**:直接给出要加的 feature(旧版指向的环境变量已废)
+                    let feat = dev.replacen("sm_", "arch-sm", 1);
                     return Err(format!(
-                        "装配期架构门:设备 {dev}(ordinal {ordinal} )不在构建期 cubin 代际集 {archs:?} 内 ——\
-                         重建时请加 `OWL_CUBIN_ARCHS=...,{dev}`(设计 §15.4)"
+                        "装配期架构门:设备 {dev}(ordinal {ordinal}) 不在构建期 cubin 代际集 {archs:?} 内 ——\
+                         重建时选代际 feature:` cargo build --release -p server --no-default-features --features {feat} `\
+                         (多代际:`--features arch-sm86,{feat}`;设计 §15.4)"
                     ));
                 }
             }

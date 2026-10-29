@@ -926,7 +926,47 @@ impl KernelPick {
 把 `no kernel image is available for execution on the device` 从**发射时**提前到**装配期**
 (资产 manifest 已记 `archs` 集,设备 sm 由 `cuDeviceGetAttribute(COMPUTE_CAPABILITY_*)` 查)。
 
-**构建期旋钮**:`OWL_CUBIN_ARCHS`(CSV,缺省 `sm_86`)/ `OWL_NVCC` / `OWL_CUBIN_ONLY`(排障)。
+**构建期代际 = Cargo feature**(2026-10-27 用户裁决:`arch-sm75` / `arch-sm80` / `arch-sm86` /
+`arch-sm89` / `arch-sm90` / `arch-sm100` / `arch-sm120`,可叠加 ⇒ 多代际 fatbin)。
+工具链旋钮仍走 env:`OWL_NVCC` / `OWL_BUILD_JOBS` / `OWL_CUBIN_SKIP`。
+
+> **为什么不用环境变量**:env 不进 cargo 的缓存键 ⇒ "同一份源码 + 另一个 env"
+> 在 `target/` 里不是一个东西,旧产物会被静默留用(本仓真踩过:换卡后 fatbin 还是
+> 上一代的)。feature 由 cargo 解析,天然进指纹、可复现、可叠加;
+> 实测 sm_86 / sm_120 两套产物各占一个 build 目录、互不覆盖。
+> 多选语义:native cubin 出多代际 fatbin;单份 `.a` 家族(Marlin / FlashInfer+FA2 /
+> GDN AOT)取**最高**代;零 feature ⇒ `Arch::DEFAULT` + 响亮告警。
+
+> **单一真源裁决(2026-10-27,sm_120 移植)**:设备码一共四张面 —— native cubin /
+> vLLM-Marlin / FlashInfer+FA2 / GDN chunked(Triton AOT)。在此之前 FI 的
+> `-arch=sm_86`、Marlin 的缺省 `86`、Triton AOT 的 `GPUTarget("cuda", 86, 32)` 是
+> **三处各自写死**的 ⇒ 换卡代际必须同时改三处,漏一处就是"编过了但设备码
+> 是上一代"。现统一从 **Cargo feature `arch-smXX`** 派生(单一入口,进缓存键);
+> 历史 env 旋钮 `OWL_TARGET_ARCH` / `OWL_CUBIN_ARCHS` / `MARLIN_CUDA_ARCH` /
+> `FLASHINFER_ARCH` / `GDN_TRITON_ARCH` **已删除**。
+> 换卡 = `cargo build --release -p server --no-default-features --features arch-sm120`。
+>
+> **代际表** = `crates/kernels/src/arch.rs`(`Arch` / `Family` / `Caps` / `parse`),
+> **`build.rs` 用 `#[path]` 引入同一份文件** ⇒ 构建期与运行期不可能漂。
+> 运行期真值另有一条腿:`DeviceClient::device_arch()`(`COMPUTE_CAPABILITY_*` → `Arch::from_cc`)
+> 在 boot 期问一次写进 `EnvProvider::hw`;两腿由**装配期架构门**对齐(设备 sm ∉ 编译集 ⇒ 拒启)。
+> 新增代际 = 加枚举变体 / 写 `caps` / 让 `marlin` 与 `dispatch` 的**无通配 match** 表态。
+
+> **准入表(2026-10-27 用户裁决)**:分工 = **权重格式定算子族，代际只做门**。
+> 表住 `crates/kernels/src/admit.rs`(`OpFamily` × `AdmitCtx` → `Admit::{Ok, NeedsArchSpecific, Deny(why)}`)；
+> 投影与裁决住 `crates/models/src/admit.rs`(`family_of_plan` / `check_env`)；
+> 生效点 = **引擎 boot**(`boot_env_and_spec`，拒启时带“为什么 + 怎么办”)。
+>
+> 为什么不能散着写:`if arch == …` 会漏一处，而选核是**三键**(arch × 权重格式 × spec 形状)。
+> `AdmitCtx` 就是为第三键存在的 —— 例:GDN chunked 在 sm_120 上
+> **只在 spec verify(T>1)形状出错**(T=1/prefill 与标量臂逐字相同)，所以
+> `spec_depth = 0` 放行、`> 0` 拒启；同一张卡、同一档，结论不同。
+> 其他已钉死的判据:NVFP4 需 `caps.fp4_blockscale`(sm_120/121，且要 `a` 目标)；
+> Marlin W4A16/W4A8 需 `cp.async`(Turing 不行)；GGUF MMQ 需 `int8_mma`。
+>
+> 验证方式(真机):① 生产档(scalar+spec7) → `[admit] sm_120 · spec=7 ⇒ …=ok` 并起机；
+> ② `--set kernel.gdn_chunked=true` 且 spec>0 → **启动硬失败**并给出两个替代；
+> ③ 同 ② 但 `spec.depth=0` → 放行(证明是**条件门**不是一刀切)。
 
 ---
 

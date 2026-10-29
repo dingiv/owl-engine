@@ -12,7 +12,7 @@
 //! (ops 工作流兼容面),组件内部禁止直读环境变量。
 //!
 //! **单一来源**:
-//! - 硬件档 ← iface `op_env()`(引擎 boot 合入;GpuClient = Sm86)
+//! - 硬件档 ← iface `device_arch()`(引擎 boot 的**代际真值**;后端答不出 = 拒启)
 //! - KV 几何 ← [`KvEnv::policy`](原 `kv_paged_policy` 的 dtype 键表收编,
 //!   新 KV dtype = 加 KvEnv 构造行,调用点零改动)
 //! - 量化方案 ← [`QuantPlan`](构造期注入的同一枚举;装载面显式入口照旧,

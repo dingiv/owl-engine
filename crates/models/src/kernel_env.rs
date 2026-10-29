@@ -125,6 +125,8 @@ impl KernelSelectionEnv {
                 tags.push(KernelTag::QUANT_AWQ);
             }
             QuantPlan::Gguf(_) => tags.push(KernelTag::QUANT_GGUF),
+            // NVFP4 是权重+激活的块缩放:放行 `quant.nvfp4` 档核
+            QuantPlan::NvFp4 => tags.push(KernelTag::QUANT_NVFP4),
             QuantPlan::F16 | QuantPlan::I8W | QuantPlan::I8W8 => {}
         }
         // 头是独立 plan:主干 W4A8/GGUF 时,int4 头仍要放行 W4A16 核
@@ -221,6 +223,23 @@ impl KernelSelectionEnv {
                 meta.tag_ids()
             )));
         }
+        // **代际准入(显卡做门)** —— 与 tag filter 同一处、同一条出口:
+        // 权重格式决定算子族,代际只回答"这族在不在本卡上跑得"。判据表 =
+        // `owl_kernels::driver::{OpFamily, Admit}`(选核唯一出口拥有),
+        // 规则的"为什么"写在 `crates/kernels/src/admit.rs`。
+        // 认不出族 = 不设门(与 tag filter 同律:没声明就不拦)。
+        if let Some(admit) = pick.admit(&env, self.features.spec_depth) {
+            if let owl_kernels::driver::Admit::Deny(why) = admit {
+                let fam = pick
+                    .isa_family()
+                    .map(|f| f.name())
+                    .unwrap_or("<unknown>");
+                return Err(crate::contract::ModelError::Msg(format!(
+                    "代际准入门:算子 `{}`({fam})不允许在 {} 上跑 —— {why}",
+                    pick.name, env.hw.arch
+                )));
+            }
+        }
         Ok(pick)
     }
 
@@ -238,7 +257,7 @@ impl KernelSelectionEnv {
     /// boot 日志一行(可审计:这个进程到底把什么投射给了 picker)
     pub fn describe(&self) -> String {
         format!(
-            "arch={:?} quant={:?} act={:?} kv={:?}/{:?} page={} hd={} grp={} vision={} spec_depth={} tp={} tags=[{}]",
+            "arch={} quant={:?} act={:?} kv={:?}/{:?} page={} hd={} grp={} vision={} spec_depth={} tp={} tags=[{}]",
             self.hw.arch,
             self.quant.plan,
             self.quant.act,

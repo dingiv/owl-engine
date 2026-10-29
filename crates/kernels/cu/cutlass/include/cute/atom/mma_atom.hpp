@@ -691,13 +691,16 @@ print(ThrMMA<TiledMMA, ThrVMNK> const& thr_mma)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// owl: this family is vendored for the sm86 FA2 forward only.
-// FA2 instantiates the SM80 half atom; the host-side #else path still names
-// the SM75 atom. SM61/SM70/SM89 traits and SM90+ traits are dead here and
-// account for most of the header weight. When a future kernel needs them,
-// restore the includes from the pinned CUTLASS revision and re-vendor the
-// corresponding headers + closure.txt.
+#include <cute/atom/mma_traits_sm61.hpp>
+#include <cute/atom/mma_traits_sm70.hpp>
 #include <cute/atom/mma_traits_sm75.hpp>
 #include <cute/atom/mma_traits_sm80.hpp>
+#include <cute/atom/mma_traits_sm89.hpp>
+#include <cute/atom/mma_traits_sm90.hpp>
+#include <cute/atom/mma_traits_sm90_gmma.hpp>
+#include <cute/atom/mma_traits_sm100.hpp>
+#include <cute/atom/mma_traits_sm107.hpp>
+#include <cute/atom/mma_traits_sm120.hpp>
+#include <cute/atom/mma_traits_sm120_sparse.hpp>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

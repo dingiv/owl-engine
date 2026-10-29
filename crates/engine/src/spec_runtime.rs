@@ -414,21 +414,29 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             // 草稿池也按目标模型 dtype(F16)分配。**不是** BF16 草稿池。
             draft_dt = owl_models::contract::Dtype::F16;
             let is_gguf = dir.extension().and_then(|s| s.to_str()) == Some("gguf");
-            let spec = if is_gguf {
-                // GGUF 单文件:MTP 与 target 同维(同一 spec);块号 = 解码层数
-                shard_draft_plan(inp.spec.clone(), inp.tp)?
-            } else {
-                // 声明构造走起点事实(同一份 27B 检查点的 spec;报告已由主模型
-                // 装载路径上屏,此处不重报);装载走通用入口
-                let (spec, _rep) = owl_models::model::ModelSpec::from_ckpt(
-                    dir,
-                    owl_models::formats::spec::SpecSource::family(
-                        &owl_models::formats::qwen35::qwen3_8_27b(),
-                    ),
-                )?;
-                // P2.1-a:草稿与主干同 TpPlan(单卡 ⇒ `sharded` 恒等)
-                shard_draft_plan(spec, inp.tp)?
-            };
+            // **几何单源 = target spec**(2026-10-28 propose 进图刀):
+            //
+            // MTP/NextN 头与目标模型**同维**(hidden / inter / heads / eps)是
+            // 它的定义性质(fc 吃 [embed; hidden]、共享词表)⇒ 不需要也不该
+            // 去重读草稿目录的 `config.json`。旧实现除了重读,还把
+            // **`qwen3_8_27b()` 预设硬编码**写在这里 —— 对 4B/0.8B 蒸馏档
+            // 而言,一旦 config 缺字段就会落到 27B 默认值上。
+            //
+            // ⚠️ **TP 暂拒**(2026-10-28 review):`inp.spec` 是 **已按本 rank
+            // 分片**的 target spec(装载器 `shard_spec` 先跑过),而
+            // `shard_draft_plan` 会**再切一次**(`ModelSpec::sharded` 不是幂等)
+            // ⇒ 双 rank 下草稿头会被切成两半。旧代码在 GGUF 分支也是同形,
+            // 只是从不报 —— 与其静默错值,不如拒后接线(草案:传入未分片事实
+            // 或让 `sharded` 带幂等标记)。
+            if inp.tp.is_some_and(|p| !p.is_single()) {
+                return Err(ModelError::Msg(
+                    "MTP 草稿 × TP 分片尚未接线:草稿几何必须来自**未分片**事实,\
+                     而此处只有本 rank 的分片 spec(再切一次 = 静默错值;\
+                     见 spec_runtime::SpecMode::Mtp 注释)"
+                        .into(),
+                ));
+            }
+            let spec = shard_draft_plan(inp.spec.clone(), inp.tp)?;
             // GGUF 档:MTP 头走**原生块**(逐键计划表)而不是 host 解到 F16 —
             // 27B 头 = Q6_K 12 张 + Q8_0 3 张 ⇒ 0.35 GB(对 0.86 GB),
             // 省下的 0.5 GB 直接还给 KV 池(fp8 池下 ≈ +16k 上下文),

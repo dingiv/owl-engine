@@ -496,6 +496,29 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     // A3 同步隔离:引擎单线程模型;Arc 仅作共享句柄,不跨线程发送。
     #[allow(clippy::arc_with_non_send_sync)]
     pub async fn load_qwen35_0_8b(&mut self, dir: &Path) -> Result<LoadedModel> {
+        use owl_models::module::QuantPlan;
+        self.load_qwen35_safetensors(dir, QuantPlan::F16, QuantPlan::F16, None)
+            .await
+    }
+
+    /// **通用 HF safetensors 档(带量化计划)**(2026-10-28 装载管线 P2)。
+    ///
+    /// 与 [`Self::load_qwen35_0_8b`](Self::load_qwen35_0_8b) **同体**;差别只有
+    /// 三个计划参数(主干 / 头 / 表)。为什么要这个入口:原函数把
+    /// `QuantPlan::F16` **硬编码**在体内 ⇒ `[model] quant = "nvfp4"` 即使被
+    /// 配置面接受也永远装不到(nvfp4 臂的声明根本不会产生 —— 实测 `quant=F16`
+    /// 的 boot 日志就是那次静默失配的现场)。
+    ///
+    /// `quant_plan` 同时作为 `LoadedModel.quant_plan` 交给装配面:它决定
+    /// `kernel-env` 的 tag 派生(没它就没有 `quant.nvfp4` ⇒ 算子被白名单拒)。
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub async fn load_qwen35_safetensors(
+        &mut self,
+        dir: &Path,
+        quant_plan: owl_models::module::QuantPlan,
+        head_plan: owl_models::module::QuantPlan,
+        embed_plan: Option<owl_models::module::QuantPlan>,
+    ) -> Result<LoadedModel> {
         // **[相位上下文]装载 = `Weight` 类 + `System` 归属**(RAII:任何早退都还原)
         let _scope = self.face.scoped_ctx(
             owl_iface::handle::Owner::System,
@@ -503,24 +526,52 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         );
 
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_5_0_8b()))?;
-        log_spec_report("0.8B", &rep);
+        log_spec_report("safetensors", &rep);
         let spec = self.shard_spec(spec)?;
-        let model = Model::new(
+        // **同一目录自带 MTP 头 ⇒ 当草稿源**(2026-10-28 propose 进图刀)。
+        //
+        // 为何要探:HF 厂的蒸馏档把 `mtp.*`(NextN 头)直接放在主检查点里,
+        // 但 `config.json` 通常**不声明** `num_nextn_predict_layers` ⇒ spec 不
+        // 会为它建层,“有没有头”只能从**权重键**看出来(与 GGUF 档探
+        // `blk.N.nextn.*` 同律)。探到就把本目录交给 spec 运行时(那里的
+        // `SpecMode::Mtp` 分支用 `MtpPredictor` 的 `mtp.*` 键面自己装)。
+        let mtp_dir = match owl_models::formats::SafeTensorsSource::open_dir(dir) {
+            Ok(src) => match src.has_mtp_head() {
+                Ok(true) => {
+                    owl_shared::log_info!(
+                        "boot",
+                        "检查点自带 MTP/NextN 头(mtp.*):spec.draft=mtp 时由同一目录装载"
+                    );
+                    Some(dir.to_path_buf())
+                }
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        let model = Model::new_with_embed(
             &spec,
             Qwen35Convention::new(convention_base(&rep)),
-            owl_models::module::QuantPlan::F16,
-            owl_models::module::QuantPlan::F16,
+            quant_plan,
+            head_plan,
+            embed_plan,
         )?;
         load_from_dir(dir, self.face, &model, self.shard_opts(spec.dtype)).await?;
         let model = Arc::new(model);
         let tokenizer = load_tokenizer(dir, &spec.tokenizer)?;
         let rope = Rope::new(262_144, 256, 64, 10_000_000.0)?;
-        let quant_plan = Some(owl_models::module::QuantPlan::F16);
+        let quant_plan = Some(quant_plan);
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;
         let vlm = self.load_vision_into(dir, &model, spec.dtype).await?;
-        Ok(LoadedModel { model, tokenizer, rope, spec, quant_plan, mtp_dir: None, vlm })
-
+        Ok(LoadedModel {
+            model,
+            tokenizer,
+            rope,
+            spec,
+            quant_plan,
+            mtp_dir: self.mtp_override.clone().or(mtp_dir),
+            vlm,
+        })
     }
 
     /// W4A16 装载(E3;llm-compressor 产物目录):装载期重排到 marlin

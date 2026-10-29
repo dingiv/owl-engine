@@ -209,6 +209,34 @@ pub fn device_sm_count(ordinal: usize) -> Result<usize, String> {
     Ok(v.max(1) as usize)
 }
 
+/// 取指定 ordinal 的设备代际(`COMPUTE_CAPABILITY_*` → [`owl_kernels::Arch`])。
+///
+/// 与 [`device_sm_count`] 同族:纯属性读,不开上下文、不发射、可捕获期调用。
+/// **这是运行期代际的唯一真值入口**(构建期真值 = Cargo feature `arch-smXX`,两者由
+/// 装配期架构门在 boot 时对齐)。
+pub fn device_arch(ordinal: usize) -> Result<owl_kernels::Arch, String> {
+    use cudarc::driver::sys::{cuDeviceGetAttribute, CUdevice_attribute, CUresult};
+    driver_init().map_err(|e| format!("driver_init: {e:?}"))?;
+    let dev = device_get(ordinal as i32).map_err(|e| format!("device_get({ordinal}): {e:?}"))?;
+    let attr = |a: CUdevice_attribute, what: &str| -> Result<i32, String> {
+        let mut v: i32 = 0;
+        let rc = unsafe { cuDeviceGetAttribute(&mut v, a, dev) };
+        if rc != CUresult::CUDA_SUCCESS {
+            return Err(format!("cuDeviceGetAttribute({what}): {rc:?}"));
+        }
+        Ok(v)
+    };
+    let major = attr(
+        CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        "COMPUTE_CAPABILITY_MAJOR",
+    )?;
+    let minor = attr(
+        CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        "COMPUTE_CAPABILITY_MINOR",
+    )?;
+    Ok(owl_kernels::Arch::from_cc(major as u8, minor as u8))
+}
+
 /// 取指定 ordinal 的设备 UUID(内部自管 cuInit;UUID 钉卡的配套查询)
 pub fn device_uuid(ordinal: usize) -> Result<[u8; 16], DriverError> {
     driver_init()?;

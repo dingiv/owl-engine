@@ -45,6 +45,10 @@ id = "dom.cublas"
 desc = "cuBLAS 封装域"
 
 [[tag]]
+id = "dom.nvfp4"
+desc = "NVFP4 块缩放 GEMM 域（CUTLASS SM120 blockscaled）"
+
+[[tag]]
 id = "dom.flashinfer"
 desc = "FlashInfer 注意力域"
 
@@ -83,6 +87,11 @@ desc = "GGUF 块量化（Q4_K/Q5_K/Q6_K/Q8_0 等）"
 id = "quant.int8"
 facet = "quant.head"
 desc = "INT8 权重量化（per-row / lm_head）"
+
+[[tag]]
+id = "quant.nvfp4"
+facet = "quant.weight"
+desc = "NVFP4 块缩放量化（e2m1 数据 + e4m3/16 缩放）"
 
 [[tag]]
 id = "quant.awq"

@@ -175,6 +175,9 @@ pub mod cublas;
 /// Marlin face(feature=marlin,随底座)
 #[cfg(feature = "marlin")]
 pub mod marlin;
+/// NVFP4 GEMM face(feature=nvfp4,随 `arch-sm120`)
+#[cfg(feature = "nvfp4")]
+pub mod nvfp4;
 /// FlashInfer 槽序签名 + scale 编码(ungated:models 零 feature 消费方
 /// 也引用;解析面仍在 feature = "flashinfer" 的 flashinfer.rs)
 pub mod fi_sig {
@@ -298,6 +301,16 @@ mod tests {
             // prefill 臂复用同一张槽序表 ⇒ 同一份 PARSE_SLOTS(覆盖门会强制列出)
             (crate::family::xqa::PREFILL_XQA, crate::client::xqa::PARSE_SLOTS),
         ]);
+        #[cfg(feature = "nvfp4")]
+        cases.extend([
+            // NVFP4(2026-10-28 远程线;合并日补登):运行期 GEMM + 装载期权重打包
+            // 是**两条**族算子、两张槽名表 —— 前一版只落了 client face,漏了本锁
+            (crate::family::nvfp4::GEMM, crate::client::nvfp4::PARSE_SLOTS),
+            (
+                crate::family::nvfp4::PACK_WEIGHT,
+                crate::client::nvfp4::PARSE_SLOTS_PACK,
+            ),
+        ]);
 
         cases.push((crate::family::flashinfer::FA2_VARLEN_F16, FA2_SLOTS));
         for (entry, want) in cases.iter() {
@@ -376,6 +389,11 @@ mod tests {
             crate::family::xqa::DECODE_XQA,
             crate::family::xqa::PREFILL_XQA,
         ]);
+        #[cfg(feature = "nvfp4")]
+        want.extend([
+            crate::family::nvfp4::GEMM,
+            crate::family::nvfp4::PACK_WEIGHT,
+        ]);
         let listed: std::collections::BTreeSet<&str> = cases.iter().map(|(n, _)| *n).collect();
         let want_set: std::collections::BTreeSet<&str> = want.iter().copied().collect();
         assert_eq!(
@@ -383,7 +401,7 @@ mod tests {
             "parse 槽名锁的 case 列表与【有 parse 面的族算子】清单不一致\
              (新增族算子必须在此显式声明它用哪张槽名表 —— 与 ops 的 A17 锁同律)"
         );
-        #[cfg(all(feature = "cublas", feature = "marlin", feature = "flashinfer", feature = "xqa"))]
+        #[cfg(all(feature = "cublas", feature = "marlin", feature = "flashinfer", feature = "xqa", feature = "nvfp4"))]
         {
             // 全 feature(= 标准门跑法)⇒ 面清单必须覆盖**所有**族算子
             let fam: std::collections::BTreeSet<&str> = crate::ops::all()

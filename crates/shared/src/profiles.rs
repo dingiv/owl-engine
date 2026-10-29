@@ -35,6 +35,10 @@ fn find_dir(name: &str) -> Option<PathBuf> {
 }
 
 /// 目录下全部 `.toml` 名(去扩展;排序;子目录忽略)
+///
+/// **本地档不入档面**(2026-10-28 用户裁决):`*.local.toml` 是站点私有覆写
+/// (`.gitignore` 同口径),不参与入口档门/全量档门 —— 它们仍可直接用
+/// `-p profiles/xxx.local.toml` 启动，但不显示为可发现的常驻档。
 fn names_in(dir: &PathBuf) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else { return v };
@@ -43,6 +47,9 @@ fn names_in(dir: &PathBuf) -> Vec<String> {
             continue;
         }
         if let Some(stem) = e.file_name().to_str().and_then(|f| f.strip_suffix(".toml")) {
+            if stem.ends_with(".local") {
+                continue;
+            }
             v.push(stem.to_string());
         }
     }

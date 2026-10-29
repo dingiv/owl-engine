@@ -9,7 +9,9 @@
 //!    (gname/leak_name 由此绝迹);
 //! ② **拾取**:按 (硬件档, dtype, 形状) 产出 [`KernelPick`]——名 +
 //!    grid/block/smem;上层描述语义,参数推导住这里;
-//! ③ **参数推导**:契约公式进代码(paged v1 的 smem 契约、delta_dec 的
+//! ③ **代际准入**:按 (ISA 族 × 代际 × spec 形状) 判"这核该不该在本卡跑"
+//!    —— 规则表 `crate::admit`,出口 [`KernelPick::admit`](判据不散在调用点);
+//! ④ **参数推导**:契约公式进代码(paged v1 的 smem 契约、delta_dec 的
 //!    kd 项……)——硬编码参数事故面(smem 手抄越界、页配对错配,三次
 //!    立案)在此结构性封死:调用点传形状,pick 出参数,错配 = 单测红,
 //!    不再有「难以察觉」。
@@ -19,8 +21,8 @@
 //! - 登记表(models `kernel::REGISTRY`,名字→源+签名,执行面验证)暂留
 //!   models;models 侧耦合测试保证本模块产出的每个名字 ∈ 登记表 ——
 //!   漂移在 CI 红灯,不在 GPU 上胡言;
-//! - 硬件感知分阶段:arch 现由引擎 boot 装配占位 Sm86,CC 查询接通后
-//!   升级;Sm89(40 系预留)只加枚举臂,调用点零改动;
+//! - 硬件感知:arch 由引擎 boot 经 iface `device_arch()`(CC 属性查询)取得,
+//!   经 [`OpEnv`] 必传参进入;代际表 = `crate::arch`(与 `build.rs` 同一份源),
 //! - 迁移按族推进(gdn → attention → rope/embedding),每族对拍锚 +
 //!   `OWL_GPU_PROF` 分账验收(算子集合不变,只换拾取方式)。
 //!
@@ -222,6 +224,19 @@ pub fn resolve(req: OpReq) -> KernelPick {
         ),
         "gdn.chunked_delta" => gdn::chunked_delta(),
         "gdn.scalar_delta" => gdn::scalar_delta(),
+        // NVFP4 块缩放 GEMM(foreign:家族 runtime 直发 FFI;FOREIGN 哨兵)
+        // — 选不选它 = **调用方(层)** 按 `caps.fp4_blockscale && m ≥ 128` 决定,
+        //   本处只做"语义名 → 核名"的解析(与 comm/gdn 同形)。
+        "nvfp4.gemm" => KernelPick {
+            name: crate::family::nvfp4::GEMM,
+            shape: FOREIGN,
+        },
+        // NVFP4 **装载期权重打包**(2026-10-28 M7;与 `ct_repack` 同律:
+        // 装载域的重排/量化也要按名选核;FOREIGN 哨兵 ⇒ 族 runtime 自持几何)
+        "nvfp4.pack_weight" => KernelPick {
+            name: crate::family::nvfp4::PACK_WEIGHT,
+            shape: FOREIGN,
+        },
         // 通信族(TP2 S4;dtype ⇒ 三实例之一;族 runtime 自持单 block 几何 —— FOREIGN 哨兵)
         "comm.ar_stage" => KernelPick { name: crate::family::comm::stage_entry(dt), shape: FOREIGN },
         "comm.ar_reduce" => KernelPick { name: crate::family::comm::reduce_entry(dt), shape: FOREIGN },
@@ -489,11 +504,76 @@ pub struct KernelPick {
     pub shape: Shape,
 }
 
+/// **代际准入表**(由选核唯一出口拥有;规则见 `crate::admit`)。
+pub use crate::admit::{Admit, AdmitCtx, OpFamily};
+
 impl KernelPick {
     /// **按 `KernelSpec` 拾取**(生产臂用):名字 = 算子关联常量,
     /// 元数据/槽序/检查函数随之而来(编译期耦合,名字不可能写错)。
     pub const fn of<T: crate::spec::KernelSpec>(shape: Shape) -> Self {
         Self { name: T::ENTRY, shape }
+    }
+
+    /// **本 pick 的 ISA 族**(权重格式侧身份;认不出 = `None` = 不设门)。
+    ///
+    /// 为什么按**名字**判而不是按执行家族:执行家族是**路由**概念
+    /// (`marlin` / `finfer` / `gdn`),而 ISA 族要细到"同一族里哪条臂"
+    /// —— GDN chunked(Triton 六核 `cumsum/kkt/merge/wu/h/o`)与标量臂
+    /// (`owl_gdn_*`)在**同一执行家族**里,但代际门不同。名字是这里唯一
+    /// 能分开它们的稳定标识(族清单见 `crate::family::*`)。
+    pub fn isa_family(&self) -> Option<crate::OpFamily> {
+        use crate::OpFamily as F;
+        let n = self.name;
+        // GGUF 块型(MMQ/MMVQ/TILE/SMEM + 激活量化 + 行解量化)
+        if n.starts_with("owl_gguf_") || n.starts_with("owl_mmq2_") {
+            return Some(F::GgufMmq);
+        }
+        // Marlin(W4A8 的名字里带 `w4a8`;其余 W4A16)
+        if n.contains("marlin") {
+            return Some(if n.contains("w4a8") { F::MarlinW4A8 } else { F::MarlinW4A16 });
+        }
+        if n.starts_with("flashinfer") || n.contains("FlashPrefillWithPagedKVCache") {
+            return Some(F::FiPrefill);
+        }
+        if n.starts_with("owl_xqa_") || n.contains("_xqa_") {
+            return Some(F::Xqa);
+        }
+        // GDN:**臂**只有两个入口 —— chunked(`gdn_chunked_delta_rule_fwd`,内部再发
+        // Triton 六核 `cumsum/kkt/merge/wu/h/o`)与标量(`gdn_scalar_delta_rule_fwd`)。
+        // `owl_gdn_*`(conv/gating/norm/decode_step 等)是**两臂共用的子核**,
+        // 按臂判族会误判 ⇒ 不设门(臂级门在 boot pre-check 那边覆盖)。
+        if n.starts_with("gdn_chunked_") || matches!(n, "cumsum" | "kkt" | "merge" | "wu" | "h" | "o") {
+            return Some(F::GdnChunked);
+        }
+        if n.starts_with("gdn_scalar_") {
+            return Some(F::GdnScalar);
+        }
+        if n.contains("cublas") {
+            return Some(F::CublasF16);
+        }
+        // NVFP4 块缩放 GEMM(arch-specific 指令;准入表按 `Caps::fp4_blockscale` 裁决)
+        // —— 打包那把也归同一族:同为 `compute_120a` 指令面 + 同一份 plan
+        if n == crate::family::nvfp4::GEMM || n == crate::family::nvfp4::PACK_WEIGHT {
+            return Some(F::NvFp4Cutlass);
+        }
+        None
+    }
+
+    /// **代际准入裁决**(`None` = 认不出族 ⇒ 不设门;与 tag filter 同律)。
+    ///
+    /// 这是「显卡做门」在**选核面**的落点:调用方(解释器的唯一执行入口)拿到
+    /// `Some(Deny)` 必须**拒发**,而不是发出去等驱动报 no kernel image。
+    pub fn admit(
+        &self,
+        env: &OpEnv,
+        spec_depth: usize,
+    ) -> Option<crate::Admit> {
+        self.isa_family().map(|f| {
+            f.admit(crate::AdmitCtx {
+                arch: env.hw.arch,
+                spec_depth,
+            })
+        })
     }
 
     /// 本算子的准入声明(未建表 = `None`,即"仅引入")

@@ -2131,10 +2131,31 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     };
 
     // 解释器执行环境(EnvProvider;E1.5 抽象):旋钮携带(入口经
-    // from_config 填充)+ 硬件档自 iface op_env 合入(被动律:引擎 = 环境事实来源)
+    // from_config 填充)+ 硬件档自 iface 合入(被动律:引擎 = 环境事实来源)
+    //
+    // **代际真值 = `device_arch()`**(2026-10-27 代际单源):`op_env()` 是同步面,
+    // 它只能复读“句柄上次问到的值” —— 首次必须在这里问一次,顺带把 server boot
+    // 变成显式先行(`sm_count` 同律)。未提供该口的面(CPU/无卡测试)直接报错
+    // —— 不退到“默认 sm86”(那正是之前 `[kernel-env] arch=Sm86` 写死的来源)。
     let mut env = cfg.knobs.env;
-    if let Some(oe) = face.op_env() {
-        env.hw = owl_models::env::HwEnv::Cuda(oe.hw.arch);
+    match face.device_arch().await {
+        Ok(arch) => {
+            env.hw = owl_models::env::HwEnv::Cuda(arch);
+            owl_shared::log_info!(
+                "boot",
+                "设备代际 = {arch}({} · {})",
+                arch.family(),
+                arch.caps().summary()
+            );
+        }
+        // 纯 host 面(CPU/mock/无卡测试):本来就没硬件档 ⇒ 保持 `HwEnv::Cpu`
+        Err(_) if face.op_env().is_none() => {}
+        // 有 GPU 面却答不出代际 = 拒启(不静默落回默认代际)
+        Err(e) => {
+            return Err(ModelError::Msg(format!(
+                "boot 代际感知失败(GPU 面已就绪但 device_arch 不可用): {e}"
+            )))
+        }
     }
     // 模型几何事实合入(2026-10-13 P4:算子准入的几何门对账面)——
     // 与 hw 同律:引擎 = 环境事实来源,算子层零探测
@@ -2144,6 +2165,24 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     // (`PlanSource::Keyed`);此字段只服务"单一方案"档位的一致性/准入面。
     if let Some(q) = rm.quant_plan {
         env.quant = q;
+    }
+    // ------------------------------------------------------------------
+    // **代际准入门**(2026-10-27 用户裁决:权重格式定算子族,代际只做门)
+    //
+    // 判据表 = `owl_kernels::driver::{OpFamily, Admit}`(选核唯一出口拥有);
+    // 投影/裁决 = `owl_models::admit`。
+    //
+    // **为什么还要一处 boot 级 pre-check**(2026-10-27 实测):逐算子那道门在
+    // `KernelEnvironment::resolve()`(= 走 `driver::resolve` 的族),但 **GDN chunked
+    // 六核(`cumsum/kkt/merge/wu/h/o`)是按资产名直发的,不经过 resolve** —— 只留
+    // 算子级门时 `gdn_chunked + spec` 仍能起机(实测)。所以:
+    //   · 算子级门 = 权威(每个走 picker 的族逐条拦,报的是真核名);
+    //   · 本 pre-check = 覆盖"不走 picker"的族 + **在装权重之前**快速拒启。
+    // 两处调的是**同一张表**,不存在第二套规则。
+    // ------------------------------------------------------------------
+    match owl_models::admit::check_env(&env, rm.quant_plan, cfg.knobs.draft.depth) {
+        Ok(summary) => owl_shared::log_info!("admit", "{}", summary),
+        Err(why) => return Err(ModelError::Msg(why)),
     }
     // FI 面启用(量化恒 = 主池;影子池已删,本值只作"启用 + 池量化"携带)
     // FI 面启用条件 = **能力条件**(f16 池 + paged 页表),不是开关:
@@ -2426,64 +2465,69 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     live_baseline_per_card: u64,
     t_run: std::time::Instant,
 ) -> Result<RankDev<DeviceHandle<D>>> {
-    boot_knobs_check(&mut face, cfg, tp.as_ref())?;
-    let mut phase = VramPhase::new();
-    phase.mark(&mut face, "boot-rank:权重已装载").await;
-    let s = cfg.max_seq_tokens;
-    // ⚠️ **已知缺口(§18.5 挂账①)**:CPU/mock 档若要跑引擎真前向,
-    // `dtype` 不能简单归一为 F32 —— `kv_paged_policy(dtype)` 与
-    // attn v2 scratch 注入都以**模型 dtype** 为前提(F32 ⇒ 无分页策略
-    // ⇒ 走 legacy v1 臂 ⇒ attention.rs 的退役 panic)。所需修法:
-    // 让分页策略/scratch 与执行域 dtype 解耦(单独一刀),不在 mock 刀里扫。
-    let (dims, env, fi_quant, spec) = boot_env_and_spec(&mut face, cfg, &rm, tp.as_ref()).await?;
-    phase.mark(&mut face, "env+spec(草稿/环境)").await;
-    // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
-    // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 =
-    // min(剩余显存 cap, max_seq×并发 + 1 页)(knobs.pool_tokens 仅测试覆写)。
-    boot_kvmem_check(cfg)?;
-    // **池前 settle(2026-10-22)**:装载期临时块(store 复用池)与
-    // cudaMallocAsync 缓存会残留到 `free@池` 的读数里;不排空则同一档
-    // 不同 boot 的 cap 抖动(79k–116k)。先把它们还驱动/还 OS,再让
-    // `pool_cap` 读 free —— 这是“池前 materialize/结算”的收口。
-    let drained = face.drain_temp_pool().await;
-    let trimmed = face.mem_pool_trim().await.unwrap_or(0);
-    // **fresh free 回写**:`pool_cap` 读本 rank 的 `VramSnapshot`(由
-    // `mem_info` 写入设备 account;全局 free 仅诊断镜像)。装载期分配
-    // 模式不同会让缓存停在不同时刻 ⇒ 同一档 cap 抖 79k–116k。这里先
-    // drain/trim,再 sync,最后用 `cuMemGetInfo` 刷新设备账,让池看到
-    // **结算后的真值**。
-    if let Err(e) = face.sync().await {
-        eprintln!("[vram-pre-pool] sync 失败(继续):{e}");
-    }
-    if let Ok((free, _total)) = face.mem_info().await {
-        owl_shared::vram::free_set(free);
-    }
-    // **本 rank 的池前快照**(2026-10-24):`mem_info` 已把 free/total 写进
-    // 设备 account;池容量只读这份,不再读进程级全局 FREE。
-    let vram = face.vram_snapshot();
-    eprintln!(
-        "[vram-pre-pool] temp_drained={drained} 块 · driver_trimmed={} MiB ⇒ free={} MiB",
-        trimmed >> 20,
-        vram.free >> 20
-    );
-    let plan = boot_pool_plan(
-        cfg,
-        s,
-        &env,
-        &spec,
-        fi_quant,
-        tp.as_ref(),
-        live_baseline_per_card,
-        vram,
-    );
-    phase.mark(&mut face, "pre-pool settle").await;
-    // **池骨架 = `Pool` 类**(boot 相位;不加这个上下文就会落“未分类”桶 ——
-    // 可见但无用)。作用域 RAII:块分配途中任何早退都会还原上下文。
-    let pool = {
-        let _scope = face.scoped_ctx(Owner::System, AssetClass::Pool);
-        StatePool::alloc(&mut face, dims, &rm.spec.layer_types, &plan).await?
-    };
-    phase.mark(&mut face, "pool(KV/GDN 状态)").await;
+        boot_knobs_check(&mut face, cfg, tp.as_ref())?;
+        // **NVFP4 已可进图**(2026-10-28 进图刀):原来这里有一条“NVFP4 ⇒ 自动
+        // 关图捕获”的降级(因为本族发射前要回读 4B `ga`),alpha 设备化后不再需要。
+        // 保留一句痕迹只为了将来排查“为何 NVFP4 档没图”——先看算子声明
+        // (`ops/nvfp4.rs::CAPTURE`)再看这里;两者都必须是 `NoHostWork`。
+        let mut phase = VramPhase::new();
+        phase.mark(&mut face, "boot-rank:权重已装载").await;
+        let s = cfg.max_seq_tokens;
+        // ⚠️ **已知缺口(§18.5 挂账①)**:CPU/mock 档若要跑引擎真前向,
+        // `dtype` 不能简单归一为 F32 —— `kv_paged_policy(dtype)` 与
+        // attn v2 scratch 注入都以**模型 dtype** 为前提(F32 ⇒ 无分页策略
+        // ⇒ 走 legacy v1 臂 ⇒ attention.rs 的退役 panic)。所需修法:
+        // 让分页策略/scratch 与执行域 dtype 解耦(单独一刀),不在 mock 刀里扫。
+        let (dims, env, fi_quant, spec) =
+            boot_env_and_spec(&mut face, cfg, &rm, tp.as_ref()).await?;
+        phase.mark(&mut face, "env+spec(草稿/环境)").await;
+        // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
+        // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 =
+        // min(剩余显存 cap, max_seq×并发 + 1 页)(knobs.pool_tokens 仅测试覆写)。
+        boot_kvmem_check(cfg)?;
+        // **池前 settle(2026-10-22)**:装载期临时块(store 复用池)与
+        // cudaMallocAsync 缓存会残留到 `free@池` 的读数里;不排空则同一档
+        // 不同 boot 的 cap 抖动(79k–116k)。先把它们还驱动/还 OS,再让
+        // `pool_cap` 读 free —— 这是“池前 materialize/结算”的收口。
+        let drained = face.drain_temp_pool().await;
+        let trimmed = face.mem_pool_trim().await.unwrap_or(0);
+        // **fresh free 回写**:`pool_cap` 读本 rank 的 `VramSnapshot`(由
+        // `mem_info` 写入设备 account;全局 free 仅诊断镜像)。装载期分配
+        // 模式不同会让缓存停在不同时刻 ⇒ 同一档 cap 抖 79k–116k。这里先
+        // drain/trim,再 sync,最后用 `cuMemGetInfo` 刷新设备账,让池看到
+        // **结算后的真值**。
+        if let Err(e) = face.sync().await {
+            eprintln!("[vram-pre-pool] sync 失败(继续):{e}");
+        }
+        if let Ok((free, _total)) = face.mem_info().await {
+            owl_shared::vram::free_set(free);
+        }
+        // **本 rank 的池前快照**(2026-10-24):`mem_info` 已把 free/total 写进
+        // 设备 account;池容量只读这份,不再读进程级全局 FREE。
+        let vram = face.vram_snapshot();
+        eprintln!(
+            "[vram-pre-pool] temp_drained={drained} 块 · driver_trimmed={} MiB ⇒ free={} MiB",
+            trimmed >> 20,
+            vram.free >> 20
+        );
+        let plan = boot_pool_plan(
+            cfg,
+            s,
+            &env,
+            &spec,
+            fi_quant,
+            tp.as_ref(),
+            live_baseline_per_card,
+            vram,
+        );
+        phase.mark(&mut face, "pre-pool settle").await;
+        // **池骨架 = `Pool` 类**(boot 相位;不加这个上下文就会落“未分类”桶 ——
+        // 可见但无用)。作用域 RAII:块分配途中任何早退都会还原上下文。
+        let pool = {
+            let _scope = face.scoped_ctx(Owner::System, AssetClass::Pool);
+            StatePool::alloc(&mut face, dims, &rm.spec.layer_types, &plan).await?
+        };
+        phase.mark(&mut face, "pool(KV/GDN 状态)").await;
 
     // **MTP window 的 v2 依赖门**(2026-10-21):window 只改 draft 读，
     // 但必须走 v2 伪序列（decode T=1 / extend 多行 / chain）；缺

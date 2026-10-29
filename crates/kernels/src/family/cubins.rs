@@ -19,7 +19,7 @@
 //!
 //! # 代际维度
 //!
-//! `CUBIN_ARCHS` = 构建期 `OWL_CUBIN_ARCHS` 解析结果;每个资产是**一个 fatbin**
+//! `CUBIN_ARCHS` = 构建期 Cargo feature(`arch-smXX`)的选择结果;每个资产是**一个 fatbin**
 //! (内含每代际一份 cubin,运行期由驱动按设备挑最匹配)。设备 sm ∉ 本集 ⇒
 //! 装配期拒启(把 "no kernel image is available for execution on the device"
 //! 从发射时提前到装配时)。

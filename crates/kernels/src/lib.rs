@@ -63,15 +63,42 @@ pub mod device;
 #[cfg(feature = "device")]
 pub mod registry;
 
-/// Arch 分发表键(REQ-HW-01):业务代码禁止写死 arch,一律经此查询。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Arch {
-    /// RTX 30 系一等公民
-    Sm86,
-    /// RTX 40 系顺带兼容
-    Sm89,
-    // 新架构 = 新枚举 + 注册新实现,不改调用方
+/// **代际(`Arch`)表** —— 构建期(`build.rs` 同源引入)与运行期共用。
+pub mod arch;
+/// **算子族 × 代际的准入表**(「这族不该在这张卡上跑」的唯一出口)。
+pub mod admit;
+/// **NVFP4 块缩放 GEMM 的 Rust 面**(`libnvfp4.a` 的薄 FFI;feature `nvfp4`,
+/// 随 `arch-sm120` 自动开)。选不选这条臂归 [`driver::KernelPick`] + [`admit`] 管。
+///
+/// **模块恒存在**:feature 关时换 [`nvfp4_stub`](一个同面替身,`pack_weight_b`
+/// 一律响亮拒) —— 上层不用各写一遍 `cfg(feature)`(同一个开关在多处重复 =
+/// 静默漂移的温床)。
+#[cfg(feature = "nvfp4")]
+pub mod nvfp4;
+/// 未编入替身(见上)。
+#[cfg(not(feature = "nvfp4"))]
+#[path = "nvfp4_stub.rs"]
+pub mod nvfp4;
+
+/// FP4 库自述(未编入时 `None`)。
+///
+/// 为什么留这个恒存在的入口:`cfg(feature)` 是**本 crate** 的 feature,上层
+/// (`models`/`engine`/`server`)没法自己 cfg 它 —— 否则就变成“同一个开关在
+/// 每个上游各写一遍”。这里把门控收在一处,上层只管读 `Option`。
+#[must_use]
+pub fn fp4_banner() -> Option<&'static str> {
+    #[cfg(feature = "nvfp4")]
+    {
+        Some(nvfp4::banner())
+    }
+    #[cfg(not(feature = "nvfp4"))]
+    {
+        None
+    }
 }
+
+pub use arch::{Arch, Caps, Family};
+pub use admit::{Admit, AdmitCtx, OpFamily};
 
 /// 可捕获 kernel 契约(A1.5)—— 实现者签字画押处。
 ///
@@ -96,12 +123,28 @@ pub trait QuantGemm {
     fn moe_wna16(&self, arch: Arch) -> bool;
 }
 
-/// arch 分发表:目前 sm86 全绿(借力件全部以 sm86 为目标构建)。
+/// arch 分发表(消费级四代 + 表外兜底):
+///
+/// - `sm_86 / sm_89 / sm_120`:Marlin-ffi(W4A16/W4A8/MoE)+ attention-rs 快照;
+/// - `sm_75`(RTX 20 系):没有 `cp.async`/marlin 所需的 Ampere 原语 ⇒ 只承诺最基础的臂;
+/// - `Other`(表外代际,如数据中心卡):按 `caps()` 的硬件事实回答。
+///
+/// **无通配臂**:新增 `Arch` 变体时编译器会在**这里**逼作者表态
+/// (信条:响亮拒绝,不静默继承旧答案)。
 pub fn dispatch(arch: Arch) -> &'static str {
     match arch {
-        Arch::Sm86 | Arch::Sm89 => "marlin-ffi+attention-rs(快照)",
+        Arch::Sm75 => "attention-rs(快照;无 marlin)",
+        Arch::Sm86 | Arch::Sm89 | Arch::Sm120 => "marlin-ffi+attention-rs(快照)",
+        Arch::Other { .. } => {
+            if arch.caps().cp_async {
+                "marlin-ffi+attention-rs(快照)"
+            } else {
+                "attention-rs(快照;无 marlin)"
+            }
+        }
     }
 }
 
 pub mod driver;
+
 

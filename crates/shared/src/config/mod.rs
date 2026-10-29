@@ -281,6 +281,15 @@ pub enum QuantScheme {
     #[serde(rename = "w4a16")]
     #[default]
     W4a16,
+    /// **NVFP4 块缩放**(权重与激活都是 `e2m1` 数据 + 每 16 个 k 一个 `e4m3` 缩放;
+    /// 2026-10-28)。只配 `format = "safetensors"`:装载期把 f16 权重 RTN 量化成
+    /// `q`(`u8`)+ `sf`(`u8`,CUTLASS 交错布局),前向 = 设备侧激活量化 + CUTLASS
+    /// `m16n8k64` 块缩放 MMA(sm_12x 的 `a` 档指令)。
+    ///
+    /// **统一臂**(用户裁决 2026-10-28):不按 m 分流 —— decode(m=1)与 prefill
+    /// 都走同一条;代价是 decode 会按 128 行 tile 空转,收益在 prefill。
+    #[serde(rename = "nvfp4")]
+    Nvfp4,
     /// **GGUF 块型**(`format=gguf` 专用;声明口径 —— 实际逐张量型从文件读,
     /// 本键用于 tag filter/预检与"档-文件不一致"的响亮拒)。
     #[serde(rename = "q4k")]
@@ -2763,7 +2772,39 @@ impl OwlConfig {
                         .to_string(),
                 );
             }
+            // NVFP4 是权重+激活的块缩放格式:装载期现量化(safetensors 的 f16)
+            (ModelFormat::Safetensors, QuantScheme::Nvfp4) => {}
+            (_, QuantScheme::Nvfp4) => {
+                return Err(format!(
+                    "[model] quant = \"nvfp4\" 只配 format = \"safetensors\"(装载期从 f16 现量化),实得 format = {:?}",
+                    self.model.format
+                ));
+            }
             _ => {}
+        }
+        // **头/表量化 × 骨架源的约束**(2026-10-28 review):
+        //
+        // `lm_head.i8q/i8s`(以及表的 q/s)是 **AWQ 源装载期现算的派生键**
+        // (`awq_build` 读 bf16 源、写 int8 派生键);纯 safetensors 源不会造它们。
+        // 旧行为:整条量化链在 safetensors 档被**静默忽略**(loader 里写死 F16),
+        // 配了跟没配一样;现在配置面真生效 ⇒ 必须在 boot 前把配不出来的组合拒掉,
+        // 不能让它跑到装载期才报“缺键”。
+        if matches!(self.model.format, ModelFormat::Safetensors) {
+            if !matches!(self.model.head_quant, HeadQuant::Off) {
+                return Err(format!(
+                    "[model] head_quant = {:?} 需要 AWQ 源(AWQ 源装载期从 bf16 现算 `lm_head.i8q/i8s`),\
+                     format = \"safetensors\" 没有这两个派生键 —— 请设 head_quant = \"off\"\
+                     或改用 format = \"awq\"",
+                    self.model.head_quant
+                ));
+            }
+            if !matches!(self.model.embed_quant, EmbedQuant::F16) {
+                return Err(format!(
+                    "[model] embed_quant = {:?} 同样需要 AWQ 源(表的 int8 也是装载期派生键),\
+                     format = \"safetensors\" 请保持 embed_quant = \"f16\"",
+                    self.model.embed_quant
+                ));
+            }
         }
         if !(0.0..=1.0).contains(&self.runtime.gpu_min_free_ratio) {
             return Err(format!(

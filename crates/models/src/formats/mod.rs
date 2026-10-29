@@ -33,7 +33,11 @@ pub mod qwen35;
 pub mod safetensors;
 /// **装载面分片化**(S4 ②;确定性分片协议:pass + 源包装)
 pub mod shard;
+/// **源精度轴**(2026-10-28 装载管线 P1):`SrcDtype` + `decode_to_f32`
+pub mod source;
 pub mod spec;
+/// **目标格式变换面**(P1):`Transform` / `SlotDecl` / `Place` / `NvFp4Pack`
+pub mod transform;
 pub mod util;
 pub mod w4a16;
 

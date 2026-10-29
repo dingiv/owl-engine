@@ -390,6 +390,19 @@ pub struct Linear {
     /// **GGUF 块型**(2026-10-19):`Some` = 本层权重以 GGUF 块字节驻留
     /// (槽 dtype=U8、形状 [out, row_bytes]);forward 走 quant_act + gemm 两发
     gguf_ty: Option<crate::formats::gguf::GgmlTy>,
+    /// **NVFP4 五条臂之一**(2026-10-28):`Some` = 本层权重以 **e2m1 + e4m3/16
+    /// 块缩放**驻留(`q` = `[out, in/2]` 字节、`sf` = CUTLASS 交错布局)。
+    /// 与 GGUF 同族(**统一臂**:decode 的 m=1 也走这条,不按 m 分流)。
+    nv_q: Option<Weight>,
+    nv_sf: Option<Weight>,
+    /// 权重 per-tensor 全局缩放(`gb`;装载期由 `pack` 算出后经
+    /// [`crate::module::ScalarSink`] 回填)。
+    ///
+    /// 为什么是**共享单元**而不是普通字段:装载器只见 `Weight`/`Want`(不认
+    /// `Linear`),它拿到的是从层上抛出去的句柄 ⇒ 夹具必须是可共享的内部可变
+    /// 单元(`Arc<AtomicU32>`;顺带满足 `Model: Sync`)。语义上它仍是**装载期
+    /// 常量**:写入晚于构造,之后只读。
+    nv_gb: crate::module::ScalarSink,
     /// **GGUF 内维列序表**(设计 §11.4 落点 A2):`Some` = 本层权重的**内维**
     /// 处于 ggml **tiled** 序(`ssm_out` 的 v-head 反重排)⇒ 喂它的激活须按
     /// 32 元素块置换 —— 折进激活量化核(零额外发射)。表 = `U32[in_dim/32]`,
@@ -436,6 +449,9 @@ impl Linear {
             ws: None,
             ctmp: None,
             a8_factor: None,
+            nv_q: None,
+            nv_sf: None,
+            nv_gb: crate::module::ScalarSink::new(1.0),
             gguf_ty: None,
             gguf_col_index: None,
             tp_role: crate::plan::rules::rule_of(key),
@@ -447,6 +463,7 @@ impl Linear {
             QuantPlan::W4A16 if eligible => lin.quantize_g128(),
             QuantPlan::W4A16Awq if eligible => lin.quantize_awq32(),
             QuantPlan::W4A8Awq if eligible => lin.quantize_awq_a8(),
+            QuantPlan::NvFp4 => lin.quantize_nvfp4(),
             _ => {}
         }
         lin
@@ -542,6 +559,60 @@ impl Linear {
     /// W4A16 定形(E3;REQ-PRE-01,构造期私有):forward 换 marlin GEMM
     /// (foreign 通道),装载换三件套(qweight marlin-packed i32 / scales
     /// f16 / workspace 零初始化)。
+    /// **NVFP4 块缩放臂**(2026-10-28):声明两个 u8 槽 —— `q`(e2m1 数据)
+    /// 与 `sf`(e4m3/16 块缩放,CUTLASS 交错布局);`gb` 由装载期打包时回填。
+    ///
+    /// 形态学门(不满足就不建臂 ⇒ 该层回落 f16 直读,响亮而非静默):
+    /// - `in % 16 == 0`(每 16 个 k 一个缩放)
+    /// - `out % 128 == 0`(SF 行按 128 pad;`out % 8 == 0` 是 epilogue 向量化前提)
+    fn quantize_nvfp4(&mut self) {
+        if self.in_dim % 16 != 0 || self.out_dim % 128 != 0 {
+            // **不静默**:回落到 f16 是这个档位允许的(小头/异形层),但“哪些层没走`
+            // fp4”必须可查 —— 否则“算得慢/显存没降”只能靠反推。首次一条 info
+            // (说明总体事实),逐层 debug(排查时开 level=debug 看全量)。
+            static FALLBACK_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !FALLBACK_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                owl_shared::log_info!(
+                    "boot",
+                    "NVFP4: 形状不达标的 Linear 回落 f16(in%16 / out%128;例 {} {}x{};\
+                     逐层名单开 --log-level debug)",
+                    self.w.key(),
+                    self.out_dim,
+                    self.in_dim
+                );
+            }
+            owl_shared::log_debug!(
+                "boot",
+                "NVFP4 回落 f16:{} {}x{}(in%16={} out%128={})",
+                self.w.key(),
+                self.out_dim,
+                self.in_dim,
+                self.in_dim % 16,
+                self.out_dim % 128
+            );
+            return;
+        }
+        let key: &'static str = self.w.key();
+        // 数据槽:每字节两个 e2m1(k 偶数在低 nibble)
+        self.nv_q = Some(Weight::new_typed(
+            key,
+            vec![self.out_dim, self.in_dim / 2],
+            Dtype::U8,
+        ));
+        // 缩放槽:`out*in/16` 字节(out 已 128 对齐 ⇒ 与 cosize 同口径)
+        self.nv_sf = Some(Weight::new_typed(
+            key,
+            vec![self.out_dim * self.in_dim / 16],
+            Dtype::U8,
+        ));
+    }
+
+    /// 本层当前的权重全局缩放(发射面读)
+    fn nvfp4_gb(&self) -> f32 {
+        self.nv_gb.load()
+    }
+
     fn quantize_g128(&mut self) {
         // 构造期前置(**响亮**,release 也拦 —— 2026-10-17 审查 §五轮-C2):
         // 唯一调用点(`new` 的 match)已用同一谓词门控,这里是私有函数自己的
@@ -696,6 +767,47 @@ impl Module for Linear {
 impl Linear {
     /// ctx 无关前向(Embedding::lm_head_matmul 复用;臂集由调用方显式传入)。
     pub(crate) fn forward_inner(&self, xs: &TensorOps, arms: &crate::env::GgufEnv) -> TensorOps {
+        // ---- **NVFP4 臂**(2026-10-28):设备侧激活量化 + CUTLASS 块缩放 GEMM ----
+        //
+        // 一次 `NvFp4Gemm` 里做完:激活 e2m1+e4m3/16 量化 → 设备侧算
+        // `alpha = g·gb` → 块缩放 MMA。`aq/asf/dg` 是**本轮瞬态**(`uninit` ⇒
+        // 零 memset 节点;`dg` 由家族内核自己清,之后又当 `alpha_ptr` 用)。
+        //
+        // **可捕获**(2026-10-28):整条链零 host 工作 —— `gb` 作为 kernel 标量参数
+        // 烘进图(装载期常量),激活全局缩放与 alpha 全在设备算。
+        //
+        // **`asf` 按 128 行 pad 口径**（实测:`sfa_bytes = ceil(M/128)·128 · K/16`）——
+        // 激活侧的 SF 布局是**按 128 行块**排的(M=1 也要一整个块 128·K/16),
+        // 与权重侧不同(`sfb_bytes = N·K/16`,不含 M)。旧注释本来就对;
+        // 2026-10-28 review 一度把它改成 `m·in/16`,起机当场被家族账长门抓住
+        // （`asf ≥ 20480 实得 160`）—— 反证正确的口径就是这个 pad。
+        if let (Some(qw), Some(sf)) = (&self.nv_q, &self.nv_sf) {
+            if xs.shape().is_empty() {
+                return TensorOps::poisoned(
+                    Dtype::F16,
+                    vec![self.out_dim],
+                    "NVFP4 GEMM: xs 形状为空(需 [.., in])",
+                );
+            }
+            let m: usize = xs.shape()[..xs.shape().len() - 1].iter().product();
+            let padded_m = m.div_ceil(128).max(1) * 128;
+            let aq = TensorOps::uninit(Dtype::U8, vec![m, self.in_dim / 2]);
+            let asf = TensorOps::uninit(Dtype::U8, vec![padded_m * self.in_dim / 16]);
+            let dg = TensorOps::uninit(Dtype::F32, vec![2]);
+            // 槽序见 `ops::nvfp4::PARAMS`(O 槽由装配器按声明位插入)
+            return TensorOps::call(SemanticKernel::NvFp4Gemm)
+                .arg(xs)
+                .arg(&qw.decl())
+                .arg(&sf.decl())
+                .arg(&aq)
+                .arg(&asf)
+                .arg(&dg)
+                .arg_usize(m)
+                .arg_usize(self.in_dim)
+                .arg_usize(self.out_dim)
+                .arg_f32(self.nvfp4_gb())
+                .with_shape(Dtype::F16, vec![m, self.out_dim]);
+        }
         // ---- **GGUF 块型臂**(2026-10-19):激活 → q8_1 → dequant-in-kernel GEMM ----
         if let Some(ty) = self.gguf_ty {
             return gguf_quant_gemm(
@@ -831,6 +943,21 @@ impl Loadable for Linear {
 impl Linear {
     /// **装载分支臂**(f16 / W4A16 / W4A8 三族;`layout` 的唯一产出点)
     fn layout_arm(&self, ctx: &LoaderCtx) -> LoaderOps {
+        // ---- NVFP4 打包臂(2026-10-28):一源二槽 + host 标量 ----
+        //
+        // 与下面三族的**根本不同**:那几族的源**已经是打包字节**(ct packed /
+        // GGUF 块 / AWQ aut)⇒ 装载只搬不转;本臂的源是**全精度权重**,
+        // 装载期现算 fp4 + 块缩放 ⇒ 走 `Layout::NvFp4Weight`(host 变换)。
+        // `gb`(per-tensor 全局缩放)也是装载期产物 ⇒ 经 `ScalarSink` 回填。
+        if let (Some(qw), Some(sf)) = (&self.nv_q, &self.nv_sf) {
+            return qw.layout_as_nvfp4(
+                self.w.key(),
+                self.out_dim,
+                self.in_dim,
+                sf,
+                &self.nv_gb,
+            );
+        }
         // ---- W4A8 键族(S2):与 a16 键族**并列**,同源不同布局 ----
         if let (Some(_g), Some(qw), Some(sc), Some(zs), Some(ws), Some(ctmp), Some(fac)) = (
             self.quant_group,

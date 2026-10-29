@@ -51,6 +51,10 @@ pub mod ln;
 pub mod load;
 pub mod marlin;
 pub mod oracles;
+/// **NVFP4 块缩放 GEMM 声明**(零门:算子总表由构建期扫描 `pub static`,
+/// 被 cfg 掉的域会让生成的总表指向不存在的模块 —— 声明面恒在场,
+/// 执行面(`server::nvfp4` + `cu/nvfp4/`)才是 feature 门槛的)
+pub mod nvfp4;
 pub mod vis;
 pub mod xqa;
 
@@ -868,6 +872,10 @@ mod tests {
             (crate::family::comm::asset::BARRIER_F16, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
             (crate::family::comm::asset::BARRIER_BF16, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
             (crate::family::comm::asset::BARRIER_F32, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["F32x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            // NVFP4(2026-10-28 远程线;合并日补登):GEMM + 装载期权重打包。
+            // 声明面恒在(feature 只门执行面) ⇒ 本锁无条件列两项。
+            (crate::family::nvfp4::GEMM, &["a", "bq", "bsf", "out", "aq", "asf", "dg", "m", "k", "n", "gb"], &["F16x2", "U8x2", "U8x1", "F16x2", "U8x2", "U8x1", "F32x1", "U64", "U64", "U64", "F32"]),
+            (crate::family::nvfp4::PACK_WEIGHT, &["src", "q", "sf", "g", "n", "k", "src_bf16"], &["U8x2", "U8x2", "U8x1", "F32x1", "U64", "U64", "U64"]),
         ];
         for (entry, want, want_ty) in EXPECT {
             let m = meta(entry).unwrap_or_else(|| panic!("锁表项 {entry} 不在声明表里"));

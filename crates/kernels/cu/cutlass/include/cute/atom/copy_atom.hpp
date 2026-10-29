@@ -655,11 +655,37 @@ print(ThrCopy<TiledCopy, ThrIdx> const& thr_copy)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// owl: sm86-only FA2 closure. SM90/SM100 copy traits (including TMA)
-// are intentionally not vendored; see mma_atom.hpp for the re-vendor note.
 #include <cute/atom/copy_traits_sm50.hpp>
 #include <cute/atom/copy_traits_sm75.hpp>
 #include <cute/atom/copy_traits_sm80.hpp>
+#include <cute/atom/copy_traits_sm90.hpp>
+#include <cute/atom/copy_traits_sm100.hpp>
+
+
+// Config
+#if (__CUDACC_VER_MAJOR__ >= 12)
+#  define CUTE_COPY_ATOM_TMA_SM90_ENABLED
+#  define CUTE_COPY_ATOM_TMA_SM100_ENABLED
+#endif
+
+
+#if (!defined(CUTE_COPY_ATOM_TMA_SM90_ENABLED))
+#  define CUTE_COPY_ATOM_TMA_SM90_ENABLED
+#endif
+
+#if (!defined(CUTE_COPY_ATOM_TMA_SM100_ENABLED))
+#  define CUTE_COPY_ATOM_TMA_SM100_ENABLED
+#endif
+
+
+#if defined(CUTE_COPY_ATOM_TMA_SM90_ENABLED)
+#include <cute/atom/copy_traits_sm90_tma.hpp>
+#endif
+
+
+#if defined(CUTE_COPY_ATOM_TMA_SM100_ENABLED)
+#include <cute/atom/copy_traits_sm100_tma.hpp>
+#endif
 
 
 

@@ -736,12 +736,24 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
     let mut manifest = Vec::new();
     for w in group {
         let n: usize = w.shape.iter().product();
+        // **NVFP4 打包臂**(2026-10-28,P2):一源二槽 + host 标量 —— 产出与
+        // 交付都在臂内(它一次产两个 `LoadEntry`,套不进下面"单 entry"的形状)
+        if let Layout::NvFp4Weight { rows, cols } = w.layout {
+            manifest.extend(
+                load_nvfp4(face, w, src, rows, cols, tap, verify)
+                    .await
+                    .map_err(|e| key_context(&w.key, e))?,
+            );
+            continue;
+        }
         let entry = match w.layout {
             Layout::Transposed => load_transposed(face, w, src, n, tap, verify).await?,
             Layout::Direct => load_direct(face, w, src, n, tap, staging, verify).await?,
             Layout::DeviceRearrange { op, rows, cols } => {
                 load_device_rearrange(face, w, src, n, op, rows, cols, tap, staging, verify).await?
             }
+            // 上一块已消费;此处只围护穷尽匹配(真走到 = 逻辑漏)
+            Layout::NvFp4Weight { .. } => unreachable!("NVFP4 臂已在上面分流"),
         };
         w.sink.deliver(crate::contract::Bytes::new(
             entry.block.id,
@@ -1290,6 +1302,490 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
         block: crate::contract::Bytes::new(out_block.id, n, Dtype::U32, 2),
         csum: 0, // staged = raw 而块 = 重排后:回读不可比,深校验挂账
     })
+}
+
+/// **NVFP4 权重打包臂**(2026-10-28 装载管线 P2;设计 §4/§7)。
+///
+/// 一源二槽:源 = 全精度权重(`[rows, cols]` 行主序)→ `q`(e2m1 对)
+/// + `sf`(e4m3/16 块缩放,CUTLASS 交错)+ `gb`(host 标量)。
+///
+/// **两个落点,一个接口**(2026-10-28 M7):
+/// - **设备臂**(首选,与 AWQ 的 `ct_repack` 同律):源字节直上卡 →
+///   `nvfp4_pack_weight` 在 GPU 上打包(host 只剩 memcpy);
+/// - **host 臂**(回落:`f32`/`fp8` 源、CPU face、无 GPU 环境):`pack_weight_b`
+///   在主机上打包。历史事实:第一版只有 host,4B 档多付 +11.6 s CPU
+///   (`pack` 段 300 ms/47MB)—— 那不是优化空间,而是**架构不一致**(同一件
+///   "装载期把权重变成目标格式"的事,两族两个落点)。
+///
+/// 取数只做一次(两臂共用),选臂判据放在取数之后 —— 因为"源精度是不是
+/// 2 字节"这个事实**只有当源的字节已经在手上时才确定**(虚拟键/解量化源
+/// 会退回 f32 通道)。
+///
+/// **不暂存设备环**(与其余三臂的关键区别):设备臂的源块是一次性的 `htod`
+/// (键内生命周期,回读 `g` 之后立刻 `free`),不进 `StagingPlan` 的账。
+///
+/// **落账**:两个槽各一条 `LoadEntry`(`sf` 用派生键 `{key}.sf`)。
+async fn load_nvfp4<D: DeviceClient, S: WeightSource + ?Sized>(
+    face: &mut D,
+    w: &crate::module::Want,
+    src: &S,
+    rows: usize,
+    cols: usize,
+    tap: Option<&Mutex<Box<dyn LoadTap>>>,
+    verify: bool,
+) -> Result<Vec<LoadEntry>, ModelError> {
+    use crate::formats::transform::{NvFp4Pack, Transform};
+
+    let elems = rows * cols;
+    let mut probe = KeyProbe::start(tap, &w.key, elems * 2);
+
+    // **标量口契约**(2026-10-28 review):`gb` 是**数值的一部分** —— 掉了它,
+    // 层上会继续用 `ScalarSink` 的缺省 1.0,输出就静默被 `1/gb` 缩放。
+    // 两个方向都响亮拒:层没留口 / 变换没写值(初值 NaN = 不可当真值)。
+    if w.scalar.is_none() {
+        return Err(ModelError::Msg(
+            "NVFP4 声明缺 `scalar` 口:变换会产出 per-tensor 全局缩放 `gb`,\
+             没有回填口就只能用缺省 1.0(读数静默偏移)—— 请用 `Weight::layout_as_nvfp4` 声明"
+                .into(),
+        ));
+    }
+
+    // 1) 取源字节 + 源精度事实(`SrcDtype` 只从源的元数据来)
+    let (src_bytes, src_dt) = {
+        let _s = probe.span("fetch");
+        fetch_source_bytes(src, &w.key, elems)?
+    };
+
+    // 2) 槽声明 → 与层声明对账(两臂共用;尺寸真源在 `nvfp4::sf_bytes`)
+    let xf = NvFp4Pack { rows, cols };
+    let slots = xf.slots()?;
+    verify_slot_agreement(w, &slots)?;
+
+    // 3) 选臂
+    let entries = if face.device_kernels()
+        && face.op_env().is_some()
+        && matches!(src_dt, crate::formats::source::SrcDtype::F16 | crate::formats::source::SrcDtype::BF16)
+    {
+        load_nvfp4_device(face, w, rows, cols, &src_bytes, src_dt, &slots, &mut probe, verify).await?
+    } else {
+        load_nvfp4_host(face, w, rows, cols, src_bytes, src_dt, &slots, &mut probe, verify).await?
+    };
+    probe.done();
+    Ok(entries)
+}
+
+/// **host 打包臂**(回落;CPU 上一次性产出 `q`/`sf`)。
+async fn load_nvfp4_host<D: DeviceClient>(
+    face: &mut D,
+    w: &crate::module::Want,
+    rows: usize,
+    cols: usize,
+    src_bytes: Vec<u8>,
+    src_dt: crate::formats::source::SrcDtype,
+    slots: &[crate::formats::transform::SlotDecl],
+    probe: &mut KeyProbe<'_>,
+    verify: bool,
+) -> Result<Vec<LoadEntry>, ModelError> {
+    use crate::formats::transform::{NvFp4Pack, Transform, TransformCtx};
+
+    let xf = NvFp4Pack { rows, cols };
+    let mut outs: Vec<Vec<u8>> = slots.iter().map(|s| vec![0u8; s.bytes()]).collect();
+    let mut scalars = [f32::NAN];
+    {
+        let _s = probe.span("pack");
+        xf.run(&mut TransformCtx {
+            src_bytes: &src_bytes,
+            src_dt,
+            rows,
+            cols,
+            outs: &mut outs,
+            scalars: &mut scalars,
+        })?;
+    }
+    if !scalars[0].is_finite() {
+        return Err(ModelError::Msg(format!(
+            "NVFP4 打包未产出 `gb`(scalar 仍是 {})—— 变换实现与声明不一致",
+            scalars[0]
+        )));
+    }
+    // 源字节用完即弃(下个键前释放;大键副本不攒留)
+    drop(src_bytes);
+
+    // 逐槽上卡 + 交付(主槽 = `w.sink`;其余按声明序走 `w.extra`)
+    let mut entries = Vec::with_capacity(slots.len());
+    for (i, (slot, bytes)) in slots.iter().zip(outs.iter()).enumerate() {
+        let _s = probe.span("htod");
+        let nm = if i == 0 {
+            format!("wt.{}", w.key)
+        } else {
+            format!("wt.{}.{}", w.key, slot.name)
+        };
+        let b = face
+            .htod(slot.dtype, &slot.shape, bytes, &nm)
+            .await
+            .map_err(|e| key_context(&w.key, e))?;
+        let numel: usize = slot.shape.iter().product();
+        let block = crate::contract::Bytes::new(b.id, numel, slot.dtype, slot.shape.len() as u8);
+        // 交付(主槽与附加槽同一种口;`Sink` 自己管单元格)
+        let sink = if i == 0 {
+            &w.sink
+        } else {
+            &w.extra[i - 1].sink
+        };
+        sink.deliver(block.clone());
+        entries.push(LoadEntry {
+            key: if i == 0 {
+                w.key.clone()
+            } else {
+                format!("{}.{}", w.key, slot.name)
+            },
+            dtype: slot.dtype,
+            shape: slot.shape.clone(),
+            layout: w.layout,
+            block,
+            csum: if verify {
+                fnv1a(bytes, 0xcbf29ce484222325)
+            } else {
+                0
+            },
+        });
+    }
+
+    // host 标量回填(层发射时作 `gb` —— 与本处字节**同源**,不同源 = 静默错值)。
+    w.scalar
+        .as_ref()
+        .expect("调用点已校: NVFP4 声明必有 scalar 口")
+        .store(scalars[0]);
+    Ok(entries)
+}
+
+/// **设备打包臂**(2026-10-28 M7;与 AWQ `ct_repack` 同律)。
+///
+/// 源 `f16/bf16` 直上卡 → `nvfp4_pack_weight`(三发量化核)→ `q` + `sf`(SFB)
+/// + `g`。**host 一遍只做 memcpy**(不再解码/量化 —— 4B 档省下 +11.6 s 的 CPU
+/// 量化,只剩 F16 基线的 DMA 底)。
+///
+/// 顺序契约:
+/// 1. `htod` 回执 = 源已落地(跨流读安全);
+/// 2. `launch` 只提交(未同步);
+/// 3. `dtoh(g)` 自带"先排空 COMPUTE"语义 ⇒ 回执后核已跑完、**源块可释放**;
+/// 4. 释放源块(键内生命周期;不进常驻账)。
+async fn load_nvfp4_device<D: DeviceClient>(
+    face: &mut D,
+    w: &crate::module::Want,
+    rows: usize,
+    cols: usize,
+    src_bytes: &[u8],
+    src_dt: crate::formats::source::SrcDtype,
+    slots: &[crate::formats::transform::SlotDecl],
+    probe: &mut KeyProbe<'_>,
+    verify: bool,
+) -> Result<Vec<LoadEntry>, ModelError> {
+    use crate::contract::{Arg, Dtype as Cdt, KernelSource, LaunchMsg};
+    use crate::formats::source::SrcDtype;
+
+    let (src_ct, src_bf16) = match src_dt {
+        SrcDtype::F16 => (Cdt::F16, false),
+        SrcDtype::BF16 => (Cdt::BF16, true),
+        other => {
+            return Err(ModelError::Msg(format!(
+                "NVFP4 设备打包只吃 f16/bf16 源,实得 {} —— 选臂判据漏了这一档",
+                other.name()
+            )))
+        }
+    };
+    // 产物恒两件(q + sf);三件是别的变换,不是本臂
+    if slots.len() != 2 || w.extra.len() != 1 {
+        return Err(ModelError::Msg(format!(
+            "NVFP4 设备打包臂产两槽(q/sf),实得 {} 槽 / {} 附加槽",
+            slots.len(),
+            w.extra.len()
+        )));
+    }
+
+    // 1) 源字节直上卡(**零转换**)
+    let src_blk = {
+        let _s = probe.span("htod");
+        face.htod(src_ct, &w.shape, src_bytes, &format!("wt.{}.src", w.key))
+            .await
+            .map_err(|e| key_context(&w.key, e))?
+    };
+    // 2) 两产物 + 标量槽(`uninit`:三个块都由核全量覆写 —— 零 memset 节点)
+    let (q_blk, sf_blk, g_blk) = {
+        let _s = probe.span("out_alloc");
+        let q = face
+            .alloc_uninit(Cdt::U8, slots[0].bytes(), &format!("wt.{}", w.key))
+            .await
+            .map_err(|e| ModelError::Msg(format!("Weight '{}': q alloc {e}", w.key)))?;
+        let sf = face
+            .alloc_uninit(Cdt::U8, slots[1].bytes(), &format!("wt.{}.sf", w.key))
+            .await
+            .map_err(|e| ModelError::Msg(format!("Weight '{}': sf alloc {e}", w.key)))?;
+        let g = face
+            .alloc_uninit(Cdt::F32, 1, &format!("wt.{}.gb", w.key))
+            .await
+            .map_err(|e| ModelError::Msg(format!("Weight '{}': gb alloc {e}", w.key)))?;
+        (q, sf, g)
+    };
+    // 3) 按名选核(装载域的重排/量化也走 `KernelPick`,不在装载器里自拼执行面)
+    let env = face.op_env().ok_or_else(|| {
+        ModelError::Msg(format!("Weight '{}': 设备打包需 GPU 环境", w.key))
+    })?;
+    let pick = owl_kernels::driver::resolve(owl_kernels::driver::OpReq {
+        op: crate::ops::SemanticKernel::NvFp4PackWeight.op_id(),
+        env: &env,
+        dt: owl_kernels::driver::DType::U8,
+        shapes: &[vec![rows, cols]],
+        aux: &[],
+        scalars: &[],
+    });
+    owl_shared::log_debug!(
+        "load-nvfp4-dev",
+        "{}: 核={} rows={} cols={} src={} ",
+        w.key,
+        pick.name,
+        rows,
+        cols,
+        src_dt.name()
+    );
+    // 槽序 = `ops::nvfp4::PACK_WEIGHT`(src/q/sf/g/n/k/src_bf16)
+    let msg = LaunchMsg {
+        kernel: KernelSource {
+            name: pick.name.to_string(),
+            source: crate::kernel::source(pick.name).to_string(),
+        },
+        args: vec![
+            // `src` 槽**声明为 U8(不透明字节)** —— 源精度由 `src_bf16` 决定 ⇒
+            // 线格式也按声明发 U8(声明 `U8` 而发 `BF16` = 事实面当场拒)。
+            // 块本身是按 `src_ct` 分配的:存储 dtype 与`槽声明`是两件事,
+            // 前者 = 物理存放格式,后者 = 核如何看待它。
+            Arg::block(src_blk.id, Cdt::U8, 2),
+            Arg::block(q_blk.id, Cdt::U8, 2),
+            Arg::block(sf_blk.id, Cdt::U8, 1),
+            Arg::block(g_blk.id, Cdt::F32, 1),
+            Arg::U64(rows as u64),
+            Arg::U64(cols as u64),
+            Arg::U64(u64::from(src_bf16)),
+        ],
+        grid: pick.shape.grid,
+        block: pick.shape.block,
+        shared_mem: pick.shape.smem,
+        out_elems: slots[0].bytes(),
+    };
+    {
+        let _s = probe.span("launch");
+        face.launch(msg)
+            .await
+            .map_err(|e| ModelError::Msg(format!("Weight '{}': 打包发射 {e}", w.key)))?;
+    }
+    // 4) 回读 4B `gb`(`dtoh` = "先排空 COMPUTE 再读" ⇒ 回执后核已落定)
+    let gb = {
+        let _s = probe.span("harvest");
+        let mut b = [0u8; 4];
+        face.dtoh(&g_blk, &mut b)
+            .await
+            .map_err(|e| ModelError::Msg(format!("Weight '{}': gb 回读 {e}", w.key)))?;
+        f32::from_le_bytes(b)
+    };
+    if !gb.is_finite() {
+        return Err(ModelError::Msg(format!(
+            "NVFP4 设备打包未产出 `gb`(回读 {gb})—— 核/槽位不一致"
+        )));
+    }
+    // 5) 源块归还(键内生命周期;核已跑完)
+    face.free(&[src_blk.id])
+        .await
+        .map_err(|e| ModelError::Msg(format!("Weight '{}': 源块释放 {e}", w.key)))?;
+
+    // 6) 校验档:与 host 打包**逐字节对拍**(装载期唯一的数值真值面)。
+    //    生产档只做一次 dtoh(4B),校验档额外回读两产物(慢,但 OWL_LOAD_VERIFY
+    //    本就是排障旋钮)。`csum` 取**回读字节** → `verify_loaded` 再读一次同一个
+    //    块 == 抓"装载后被写坏"(host 臂的 csum 是 host 真值,语义略强:那条路
+    //    的字节本来就是 host 产的)。
+    let (csum_q, csum_sf) = if verify {
+        use crate::formats::transform::{NvFp4Pack, Transform, TransformCtx};
+        let _s = probe.span("verify");
+        let mut dev_q = vec![0u8; slots[0].bytes()];
+        let mut dev_sf = vec![0u8; slots[1].bytes()];
+        face.dtoh(&q_blk, &mut dev_q)
+            .await
+            .map_err(|e| ModelError::Msg(format!("Weight '{}': q 回读 {e}", w.key)))?;
+        face.dtoh(&sf_blk, &mut dev_sf)
+            .await
+            .map_err(|e| ModelError::Msg(format!("Weight '{}': sf 回读 {e}", w.key)))?;
+        let xf = NvFp4Pack { rows, cols };
+        let mut outs: Vec<Vec<u8>> = slots.iter().map(|s| vec![0u8; s.bytes()]).collect();
+        let mut scalars = [f32::NAN];
+        xf.run(&mut TransformCtx {
+            src_bytes,
+            src_dt,
+            rows,
+            cols,
+            outs: &mut outs,
+            scalars: &mut scalars,
+        })?;
+        let bad = |what: &str, host: &[u8], dev: &[u8]| -> String {
+            let n = host.iter().zip(dev.iter()).filter(|(a, b)| a != b).count();
+            format!("{what} 差 {n}/{} 字节", host.len())
+        };
+        let mut diffs: Vec<String> = Vec::new();
+        if outs[0] != dev_q {
+            diffs.push(bad("q", &outs[0], &dev_q));
+        }
+        if outs[1] != dev_sf {
+            diffs.push(bad("sf", &outs[1], &dev_sf));
+        }
+        if scalars[0].to_bits() != gb.to_bits() {
+            diffs.push(format!("gb host={} dev={gb}", scalars[0]));
+        }
+        if !diffs.is_empty() {
+            return Err(ModelError::Msg(format!(
+                "NVFP4 设备打包与 host 打包不一致({}):{}",
+                w.key,
+                diffs.join(" / ")
+            )));
+        }
+        (
+            fnv1a(&dev_q, 0xcbf29ce484222325),
+            fnv1a(&dev_sf, 0xcbf29ce484222325),
+        )
+    } else {
+        (0, 0)
+    };
+
+    // 7) 交付两槽 + 落账(主槽 = `w.sink`;`sf` 走 `w.extra[0]`)
+    let mut entries = Vec::with_capacity(2);
+    for (i, (blk, csum)) in [(&q_blk, csum_q), (&sf_blk, csum_sf)].into_iter().enumerate() {
+        let slot = &slots[i];
+        let block = crate::contract::Bytes::new(
+            blk.id,
+            slot.bytes(),
+            slot.dtype,
+            slot.shape.len() as u8,
+        );
+        if i == 0 {
+            w.sink.deliver(block.clone());
+        } else {
+            w.extra[0].sink.deliver(block.clone());
+        }
+        entries.push(LoadEntry {
+            key: if i == 0 {
+                w.key.clone()
+            } else {
+                format!("{}.{}", w.key, slot.name)
+            },
+            dtype: slot.dtype,
+            shape: slot.shape.clone(),
+            layout: w.layout,
+            block,
+            csum,
+        });
+    }
+    // host 标量回填(与本处字节同源:设备核 amax 就是产 `q`/`sf` 的那个 amax)
+    w.scalar
+        .as_ref()
+        .expect("调用点已校: NVFP4 声明必有 scalar 口")
+        .store(gb);
+    Ok(entries)
+}
+
+/// **槽位一致性门**(声明面 ⇔ 变换面):数目、dtype、形状逐项对齐。
+///
+/// 为什么在装载期硬校:目标形状在两边各算一次(`Linear::quantize_nvfp4` 建槽 /
+/// `Transform::slots` 报产物)。两处口径一旦漂移,上卡后的块会**静静地**小一号
+/// (设备端按声明读越界),必须在写入显存前就阻住。
+fn verify_slot_agreement(
+    w: &crate::module::Want,
+    slots: &[crate::formats::transform::SlotDecl],
+) -> Result<(), ModelError> {
+    let mut declared: Vec<(&'static str, Dtype, &[usize])> = vec![("q", w.dtype, &w.shape)];
+    for s in &w.extra {
+        declared.push((s.name, s.dtype, &s.shape));
+    }
+    if declared.len() != slots.len() {
+        return Err(ModelError::Msg(format!(
+            "NVFP4 槽数不符:声明 {} 件,变换产 {} 件",
+            declared.len(),
+            slots.len()
+        )));
+    }
+    for ((name, dt, shape), s) in declared.iter().zip(slots.iter()) {
+        if *name != s.name || *dt != s.dtype || *shape != s.shape.as_slice() {
+            return Err(ModelError::Msg(format!(
+                "NVFP4 槽位漂移:声明 ({name}, {dt:?}, {shape:?}) vs 变换 ({}, {:?}, {:?})",
+                s.name, s.dtype, s.shape
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// **取源字节 + 源精度事实**(设计 §3.1/§3.3 的唯一入口)。
+///
+/// 两条路:
+/// 1. **原始字节通道**(mmap 源常态):`copy_native_into` 直拷(2B/元素),
+///    精度取文件头 `native_dtype` —— 零解码,不吃 f32 中间量;
+/// 2. **元素通道**(无可直拷字节的源:虚拟合并键 / 解量化源):逐**行带**
+///    `take_range` 取 f32 → 写 LE 字节。分带是为了不让"整键 f32 + 整键字节"
+///    同时在场(4B 的 `gate_up` 级键 = 4× 上百 MB)。
+///
+/// 两条路的产物形式统一 = `(字节, SrcDtype)`,下游只走 `decode_to_f32`。
+fn fetch_source_bytes<S: WeightSource + ?Sized>(
+    src: &S,
+    key: &str,
+    elems: usize,
+) -> Result<(Vec<u8>, crate::formats::source::SrcDtype), ModelError> {
+    use crate::formats::source::SrcDtype;
+
+    if let Some(dt) = src
+        .native_dtype(key)?
+        .and_then(SrcDtype::from_dtype)
+    {
+        let esz = dt.size_bytes();
+        let mut buf = vec![0u8; elems * esz];
+        if src.copy_native_into(key, 0, elems, &mut buf)?.is_some() {
+            // 通道选型可查(排查“装载为何慢”时的第一手事实:原生直拷本就有,
+            // 还是退化到了 f32 元素通道)
+            owl_shared::log_debug!(
+                "load",
+                "NVFP4 源取数:{} {} × {}B(原生字节通道)",
+                key,
+                elems,
+                esz
+            );
+            return Ok((buf, dt));
+        }
+        owl_shared::log_debug!(
+            "load",
+            "NVFP4 源取数:{} 无原始字节通道({}),退回 f32 元素通道",
+            key,
+            dt.name()
+        );
+    }
+    // 元素通道(分带;带宽已知 = `elems`)
+    let mut buf = vec![0u8; elems * 4];
+    // 带宽 = **32MB 的 f32**(不是 32M 个元素 —— 后者是 128MB,
+    // 大键上会让“整键 f32 + 整键字节”同时在场的目标白白多占一倍)
+    let band = 8usize << 20;
+    let mut off = 0usize;
+    while off < elems {
+        let len = (elems - off).min(band);
+        let v = src
+            .take_range(key, off, len)?
+            .ok_or_else(|| attribution(src, key, elems))?;
+        if v.len() != len {
+            return Err(ModelError::Msg(format!(
+                "Weight '{key}': 区间 [{off},{}）取回 {} 个元素",
+                off + len,
+                v.len()
+            )));
+        }
+        for (i, x) in v.iter().enumerate() {
+            buf[(off + i) * 4..(off + i) * 4 + 4].copy_from_slice(&x.to_le_bytes());
+        }
+        off += len;
+    }
+    Ok((buf, SrcDtype::F32))
 }
 
 /// 转置臂(tied 头等转置槽):整取 f32 → TILE² 转置 → 按 Want dtype 写

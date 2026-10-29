@@ -45,12 +45,20 @@
 // Tensor Algorithms
 //
 
-// owl: sm86-only FA2 closure. Keep only the algorithms FA2 actually calls.
-// `swizzle_layout.hpp` is required for `composition(Swizzle, Layout)`.
-// Removed: fill/prefetch/axpby, cooperative copy/gemm, print_tensor/print_latex.
-// See mma_atom.hpp for the re-vendor note.
 #include <cute/algorithm/tensor_algorithms.hpp>
+#include <cute/algorithm/fill.hpp>
 #include <cute/algorithm/clear.hpp>
 #include <cute/algorithm/copy.hpp>
+#include <cute/algorithm/prefetch.hpp>
+#include <cute/algorithm/axpby.hpp>
 #include <cute/algorithm/gemm.hpp>
-#include <cute/swizzle_layout.hpp>
+
+#include <cute/algorithm/cooperative_copy.hpp>
+#include <cute/algorithm/cooperative_gemm.hpp>
+
+//
+// Utilities
+//
+
+#include <cute/util/print_tensor.hpp>
+#include <cute/util/print_latex.hpp>
