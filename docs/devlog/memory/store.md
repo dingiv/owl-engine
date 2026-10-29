@@ -2568,19 +2568,30 @@ adopt(entries)         启动扫描后**回填账**(大小不符/超预算/重�
 
 ### 31.3 层级律:**逐层,不跨层**(设备 → 宿主 → 磁盘)
 
-`plan_capacity` 现在是三段(§30.2 的两轮 → 三轮):
+`plan_capacity` 现在是**四段**(§30.2 的两轮 → 三轮 → 2026-10-19 加了轮零):
 
 ```text
-轮一  设备 ⇒ 宿主(Host 票;宿主有位且装得下)
-轮1.5 宿主 ⇒ 磁盘(Disk 票;宿主满时,把**宿主里最冷**的挪到盘 —— 腾宿主位,内容不丢)
+轮零  宿主已满 ⇒ 先腾宿主位:short = want − host_kv_room
+      short > 0 && disk_kv > 0 ⇒ 对最冷**整链**出 Sink::Disk(盘不够/无盘层 ⇒ Sink::Drop)
+轮一  设备 ⇒ 宿主(Host 票;宿主有位且装得下 → 半链不出票,见 §31.8「整链律」)
+轮1.5 宿主 ⇒ 磁盘(Disk 票;宿主里**整链都在宿主**的最冷链 → 盘,腾宿主位,内容不丢)
 轮二  仍不足 ⇒ Drop(KV 叶级 / 快照;内容真丢)
 ```
+
+> **⚠️ 2026-10-29 更正(文档偏差)**:本节 2026-10-19 版**漏写了「轮零」** ——
+> 它同样会出 `Sink::Disk` 票(宿主一开始就满时**唯一**能让轮一继续接块的入口;
+> 否则轮二只能丢新算好的设备块)。另外「必须**整链**都在宿主才出票」的判据当时
+> 只写在 §31.8,本节的三行表看不出来 —— 现已在此处点明。
 
 **为什么设备不直连磁盘**:层级是"贵→廉"的缓存栈,跨层搬要临时缓冲且打乱"内容最近在哪"
 的一致语义;逐层的代价只是**一拍延迟**(需求/压力节点每拍都跑),换来内容永不先丢。
 
 **`host_relief`**:本轮若出过「宿主 → 磁盘」票 ⇒ **不出 Drop、不 deny** ——
 设备缺口留一拍(下一拍宿主有位,轮一继续接)。真丢弃只在"宿主+磁盘都动不了"时发生。
+
+> **2026-10-29 补注**:代码里是**两个**标记 —— `host_relief`(KV 腿,轮零/轮1.5 整链搬盘)
+> 与 `host_relief_host`(快照腿,轮1.5 的 Durable 快照搬盘);Drop 与 deny 两道门都要求
+> **两者皆假**(`hooks.rs` 508-513 / 594)。原文只写了前者。
 
 **`Transient` 快照**(生成段,逐出即丢)**两级都不下沉**(写 159 MiB 换不回共享价值)。
 
@@ -2673,6 +2684,11 @@ KV 树(见下)⇒ **本版的快照回填"账上可见、实际选不中"**(内�
 (`ceil(ctx/32) × 块字节`),否则整链下沉/整链搬盘永不发生(0.8B 真机两次踩中:
 宿主 1 MiB / 盘 1 MiB 都装不下 5–6 块链)。配得太小 = 退回逐叶 Drop(内容丢)。
 
+> **2026-10-29 补注**:本节只解决"**索引**能重建";**内容**是否在盘上仍取决于压力票
+> (§31.3) —— 宿主够大时永不溢写 ⇒ 索引在、内容不在 ⇒ 截断到 0。补这一半的是
+> **§31.10 S6.2 主动 checkpoint**(`[pool].checkpoint_max_mb`)。
+> ⇒ 跨重启复用的**必要条件 = 索引 + 内容 + 锚点快照**三者同时在盘上。
+
 **真机结果(0.8B / 单卡 3080 / 池 16 页 / host 16 MiB / disk 16 MiB)**:
 
 ```
@@ -2688,6 +2704,103 @@ boot 以"内容在场"为准跳过并**清掉未被引用的内容**,索引文�
 **门**:store **106**(+ 索引往返/拒坏魔数/截断 · 叶锚整链候选 · 重建树/截断)·
 engine **59**(+ `disk_chain_index_enables_cross_restart_reuse`:turn 写索引 → 溢写 →
 重启重建 → **同 prompt 命中**)· workspace check 干净。
+
+### 31.10 S6.2:主动 checkpoint(跨重启复用的**内容面**)· 2026-10-29
+
+> **问题**(真机现场):S6.1 之后**索引**每 turn 都写,但**内容**只在宿主压力票下被动
+> 溢写 ⇒ 宿主够大时盘上只有 `.idx`、没有 `.bin` ⇒ boot 按"内容在场"截断到 0
+> ⇒ 跨重启复用**恒为 0**(用户实测:重启后 `cache=0/4753`,全量重算 2.4 s)。
+> 用户口径:"每隔一段时间检查所有 session,把活跃 session 已算出的 KV 块保存到磁盘,
+> 这样引擎启停之间仍能召回。"
+
+#### 31.10.1 三条落盘路径(与 §31.3 的四段票并列,容易混,故列表)
+
+| # | 触发 | 谁出判据 | 方向 | 语义 | 代码 |
+|---|---|---|---|---|---|
+| ① | **压力票** | `hooks::plan_capacity` 轮零 / 轮1.5 的 `Sink::Disk` | 宿主 → 盘 | **搬家**(`host_take`) | `running::spill_kv_to_disk` / `spill_snap_to_disk` |
+| ② | **主动 checkpoint** | `[pool].checkpoint_*` + turn 收口 | 设备/宿主 → 盘 | **复制**(设备块只读 D2H 后归还缓冲;宿主块 clone) | `running::checkpoint_session_kv` |
+| ③ | **锚点快照**(checkpoint 的第二半) | 同上 | 设备/宿主 → 盘 | **搬家**(`snap_offload` → `spill_snap_to_disk`) | `running::checkpoint_tail_snap` |
+
+**层级律不变**(§31.3):①③ 走"设备 → 宿主 → 盘"两跳;②的设备块**借宿主缓冲但不登记**
+(不占宿主预算、不解绑设备槽) —— 这是"复制"与"搬家"的机制差异,不是新的跨层直连。
+
+#### 31.10.2 配置面
+
+```toml
+[pool]
+disk_dir            = "/var/lib/owl/kv"   # 盘层目录(空 = 关层)
+disk_cache_mb       = 2048                 # KV 盘分片(S6;0 = 关层)
+snap_disk_mb        = 1024                 # 状态腿盘分片(锚点快照要它)
+checkpoint_max_mb   = 0                    # S6.2:单次配额 MiB(0 = 关 = 旧行为)
+checkpoint_min_gap_ms = 5000               # 两次之间的最小间隔(0 = 每 turn)
+```
+
+> **⚠️ 三键必须同时给**:只开 `checkpoint_max_mb` 而没有 `snap_max` / `snap_disk_mb`
+> ⇒ 块能落盘、**锚点落不了** ⇒ `reuse_face` 找不到 Durable 快照,复用面被裁到 0
+> (实测 `cache=0/4753`)。boot 期已加 WARN 点名这个组合。
+
+#### 31.10.3 checkpoint 的执行序(`checkpoint_session_kv`)
+
+```text
+turn 收口(release_turn_table 之前;会话 tokens 还在)
+ └ maybe_checkpoint_kv(sid)
+    门: checkpoint_max_mb>0 && disk_dir && disk_cache_mb>0 && hk.kv_checkpoint_due(gap)
+    └ checkpoint_session_kv(sid, quota):
+       ① 从根起跳过**盘上已存在**的块(增量;整链已在盘则只补快照)
+       ② 配额 → 块数(quota/块字节,至少 1 块:小配额档也要能推进)
+       ③ **连续前缀**扫描:遇洞(既不在设备也不在宿主)即停 —— boot 以"内容在场"
+          截断到连续前缀,跳块写 = 白写
+       ④ 设备块: plan_read_blocks(只读出票,**不看 refs**) → swap(Out) D2H
+                  → 逐槽写盘 → recycle_read_plan 归还缓冲(不解绑、账不动)
+       ⑤ 宿主块: host_block clone → 写盘(宿主副本保留)
+       ⑥ 锚点快照: 从链尾**往回**找第一个 Durable
+                  → snap_offload(设备→宿主) → spill_snap_to_disk(宿主→盘)
+```
+
+**为什么 ④ 需要新出口**:旧的 `plan_offload_blocks` 只对 `refs == 1`(缓存独占)出票;
+活跃 session 的块 `refs == 2` 会被记 `LiveRefs` 跳过 —— 而 checkpoint 的对象**正是**
+活跃块。⇒ `leg::plan_read_blocks` 去掉这条策略,并新增 `SkipWhy::NotOnDevice`。
+
+**为什么 ⑥ 只搬 Durable**:链尾那张是生成段的 `Transient`(`plan_snap_offload` 会
+响亮拒:"链一推进就被取代"),能当锚点的是 prefill 段每 `SNAP_EVERY` 个 chunk 一张的
+`Durable` ⇒ 从链尾往回扫。
+
+#### 31.10.4 真机实测(3090 Ti / 27B AWQ / 4.75k prompt / 149 块)
+
+| 阶段 | 结果 |
+|---|---|
+| turn 收口 checkpoint | 149 块 / 149 MiB + 锚点快照 1 份 —— **268.8 ms** |
+| 关停后盘上 | `kv/*.bin` 149 · `kv/*.idx` 1 · `snap/` 1(150 MiB + 148 MiB) |
+| 重启 boot | `回填内容 KV 149/149 快照 1/1` + `跨重启复用:索引 1 条 ⇒ 重建 1 链 / 149 块 · 截断 0` |
+| **重启后首个请求** | **`cache=4736/4753 (99.6%)`,TTFT 278 ms**(对照:全量 prefill **2470 ms**) |
+| 对照(只落 KV、不落快照) | `cache=0/4753`,TTFT 2.44 s ⇒ 证实 ⑥ 是必需品 |
+
+#### 31.10.5 门
+
+- store:`plan_read_blocks_reads_live_blocks_without_touching_ledger`
+  (活跃块 `refs==2`:下沉票 `LiveRefs` 拒 / 只读票出;账不变;缓冲可归还)
+- engine:`disk_checkpoint_survives_restart_without_host_pressure`
+  (两分支对照:`checkpoint_max_mb=0` ⇒ 盘上 0 文件 + 重启不命中;`=8` ⇒ 落盘 + 重启命中)
+- 现状:store **162** · engine **185** · store e2e 4/8(全绿)
+
+#### 31.10.6 与 §31.6 挂账的对账(2026-10-29)
+
+| §31.6 条目 | 现状 |
+|---|---|
+| 1 设备直连磁盘 | **仍未做**,且 S6.2 不新增直连路径(②借宿主缓冲但**不登记**,不是跨层搬运) |
+| 2 盘层驱逐序接 `EvictPolicy` | 仍未做(盘内纯 LRU) |
+| 3 盘层启动审计(哈希/校验和) | 仍未做 |
+| 4 跨进程复用(锁文件/租约) | 仍未做 |
+| 5 **KV 腿 `locate` 二值** | **确认仍成立**:`KvStore::locate` = `slot.is_some()?Gpu:Host` ⇒ `Carrier::Disk` 分支**不可达**,盘上块被报 `Host`。checkpoint 因此**显式问 `disk.contains()`** 再判前缀(见 §31.10.3 ③)。升三值仍是挂账(改动面:树条目 + 四处调用点)。 |
+
+#### 31.10.7 遗留
+
+1. **同步开销**:268 ms 在 turn 收口同步做 → 可挪到 pump 空闲 tick(`StoreHook::idle`);
+2. **多会话**:只 checkpoint 当前 turn 的会话,并发多会话按 turn 轮转逐一轮到
+   (每会话至少跑过一轮,盘上才可能有它的内容);
+3. **快照搬家占用 `snap_max` 一格**(实测 `snap_max=2` 搬走 1 张);
+4. **换档必须换 `disk_dir`**:块字节/页宽变了 `adopt` 会隔离(已有),但隔离是"内容在、
+   用不上",看起来像 bug。
 
 ### 31.9 验证方法论(用户 2026-10-19):单卡小模型 + 硬预算,快速触发回收
 

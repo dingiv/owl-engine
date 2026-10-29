@@ -236,6 +236,10 @@ pub struct EngineKnobs {
     pub snap_disk_mb: usize,
     /// **磁盘内容目录**(空 = 关层)。
     pub disk_dir: String,
+    /// **KV 主动 checkpoint 单次配额 MiB**(S6.2;0 = 关)。
+    pub checkpoint_max_mb: usize,
+    /// **两次 checkpoint 的最小间隔 ms**(0 = 每 turn)。
+    pub checkpoint_min_gap_ms: u64,
     /// **准入满员姿态**(S3b;缺省响亮拒)。`OWL_ADMIT_ON_FULL=reject|queue[:ms]`。
     ///
     /// `Reject` = 准入拒(客户端该降并发/重试,不是压缩上下文);
@@ -365,6 +369,8 @@ impl Default for EngineKnobs {
             snap_host_mb: 0,
             disk_cache_mb: 0,
             snap_disk_mb: 0,
+            checkpoint_max_mb: 0,
+            checkpoint_min_gap_ms: 5000,
             disk_dir: String::new(),
             pool_cap_mb: 256,
             index_probe: false,
@@ -719,6 +725,8 @@ impl EngineKnobs {
             host_cache_mb: cfg.pool.host_cache_mb,
             disk_cache_mb: cfg.pool.disk_cache_mb,
             snap_disk_mb: cfg.pool.snap_disk_mb,
+            checkpoint_max_mb: cfg.pool.checkpoint_max_mb,
+            checkpoint_min_gap_ms: cfg.pool.checkpoint_min_gap_ms,
             disk_dir: cfg.pool.disk_dir.clone(),
             // 状态腿宿主预算(S2;`[pool].snap_host_mb`;两条腿各有热区,别互相饿死)
             snap_host_mb: cfg.pool.snap_host_mb,
@@ -1465,6 +1473,19 @@ pub(crate) fn into_running<D: DeviceClient>(
         // **磁盘层接线 + 启动回加载**(S6;用户 2026-10-19):配置给配额与目录 ⇒
         // 接盘(两腿分片)+ **扫目录回填账**(内容惰性读:27B 一条快照 159 MiB,
         // 全量预读会把启动拖垮)。大小不符/超预算/重复 = 隔离并逐条 WARN。
+        // **S6.2 防坑告警**：只 checkpoint KV 而快照没有盘腿 ⇒ 混合模型的复用面
+        // 会被 `reuse_face` 裁到 0（实测 `cache=0/4753`，全量重算）——
+        // 因为锚点（Durable GDN 快照）不在盘上，重启后 `state.locate == None`。
+        if cfg.knobs.checkpoint_max_mb > 0
+            && cfg.knobs.snap_max == 0
+            && cfg.knobs.disk_cache_mb > 0
+        {
+            owl_shared::log_warn!(
+                "store",
+                "[pool].checkpoint_max_mb={} 但 snap_max=0 ⇒ 只落 KV 不落 GDN 快照:                 重启后 `reuse_face` 找不到锚点,复用面会被裁到 0(等于没有跨重启召回)。                 混档请同时给 snap_max / snap_host_mb / snap_disk_mb。",
+                cfg.knobs.checkpoint_max_mb
+            );
+        }
         if (cfg.knobs.disk_cache_mb + cfg.knobs.snap_disk_mb) > 0 && !cfg.knobs.disk_dir.is_empty()
         {
             let snap_disk_bytes = if dev.pool.geom.paged && dev.pool.snap_capacity() > 0 {

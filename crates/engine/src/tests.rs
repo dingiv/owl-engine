@@ -680,6 +680,132 @@ async fn gdn_row_is_owned_by_the_active_turn() {
     assert_eq!(row_grant.slots, 1, "Row 票 = 1 行");
 }
 
+/// **S6.2 验收门：无宿主压力下，主动 checkpoint 让重启后仍能召回**。
+///
+/// 与 [`disk_chain_index_enables_cross_restart_reuse`] 的差别就是**去掉压力**：
+/// 旧门靠手工打 6 次 `Maintain::Pressure` 把内容逼上盘 —— 那正是本特性要取代的
+/// 路径（宿主够大时它永不发生 ⇒ 重启后索引在、内容不在 ⇒ 召回 = 0）。
+///
+/// 两个分支对照（同一套参数，只差 `checkpoint_max_mb`）：
+/// | 分支 | 盘上应有 `.bin` | 重启后应命中 |
+/// |---|---|---|
+/// | 关（0，旧行为） | **0** | **否**（内容只在设备/宿主） |
+/// | 开（8 MiB） | **>0** | **是** |
+#[tokio::test]
+async fn disk_checkpoint_survives_restart_without_host_pressure() {
+    let prompt: String = (0..120)
+        .map(|i| {
+            [
+                "alpha", "bravo", "cedar", "delta", "ember", "falcon", "garnet", "harbor",
+            ][i % 8]
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    for (ckpt_mb, expect_hit) in [(0usize, false), (8usize, true)] {
+        let dir = std::env::temp_dir().join(format!(
+            "owl-ckpt-e2e-{}-{ckpt_mb}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mk = |dir: &std::path::Path| {
+            let mut knobs = EngineKnobs {
+                sampler_enabled: false,
+                ..Default::default()
+            };
+            knobs.pool_tokens = Some(64); // 2 页：prompt 4 块 ⇒ 必须下沉到宿主
+            knobs.host_cache_mb = 8; // 宿主够装整链 ⇒ **永不产生磁盘压力**
+            knobs.snap_max = 0;
+            knobs.disk_cache_mb = 8;
+            knobs.snap_disk_mb = 0;
+            knobs.disk_dir = dir.display().to_string();
+            // 本门的主角：主动 checkpoint（对照组 = 0 = 旧行为）
+            knobs.checkpoint_max_mb = ckpt_mb;
+            knobs.checkpoint_min_gap_ms = 0; // 每 turn 都试
+            EngineConfig {
+                device_ordinal: 0,
+                max_seq_tokens: 256,
+                prefill_chunk: 32,
+                knobs,
+            }
+        };
+        let boot = |cfg: EngineConfig| async move {
+            let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+                null_kernels: true,
+                graph_capture: true,
+                ..Default::default()
+            });
+            let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+            let loaded = engine
+                .loader()
+                .load_qwen35_0_8b(&asset_dir())
+                .await
+                .expect("装载");
+            engine.run(loaded).await.expect("装配")
+        };
+
+        // ── 第一次进程：跑一个 turn（**不打任何 Pressure**），收口时 checkpoint
+        let (t0, matched0) = {
+            let mut running = boot(mk(&dir)).await;
+            let (_, tid) = running.submit_session(None, &prompt, 32).expect("submit");
+            loop {
+                match running.pump().await.expect("pump") {
+                    TurnEvent::Completed { turn, .. } if turn == tid => break,
+                    TurnEvent::Failed { turn, err } => panic!("t{turn} 失败:{err}"),
+                    TurnEvent::Idle => panic!("turn {tid} 队列丢失"),
+                    _ => {}
+                }
+            }
+            let bins = std::fs::read_dir(dir.join("kv"))
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".bin"))
+                        .count()
+                })
+                .unwrap_or(0);
+            eprintln!("[ckpt] checkpoint_max_mb={ckpt_mb} ⇒ 盘上 .bin = {bins}");
+            if ckpt_mb > 0 {
+                assert!(bins > 0, "开 checkpoint 时**无压力**也必须主动写盘");
+            } else {
+                assert_eq!(bins, 0, "关 checkpoint 且宿主够大 ⇒ 不该有盘上内容(旧行为)");
+            }
+            let t0 = running.tokenize(&prompt, true).expect("tokenize").tokens;
+            let (h, _) = running.bank.rel.match_prefix(&t0).expect("命中查询");
+            (t0, h.matched_blocks)
+        };
+        assert!(matched0 > 0, "重启前同进程应命中(对照组另说:内容在宿主)");
+
+        // ── 第二次进程：同目录 ⇒ boot 按索引 adopt ⇒ 命中面来自盘层
+        let mut running2 = boot(mk(&dir)).await;
+        let (h2, _) = running2.bank.rel.match_prefix(&t0).expect("重启后命中查询");
+        eprintln!(
+            "[ckpt] 重启后: ckpt={ckpt_mb} 盘 entries={} matched={}",
+            running2
+                .bank
+                .rel
+                .disk
+                .as_ref()
+                .map(|d| d.resident_count())
+                .unwrap_or(0),
+            h2.matched_blocks
+        );
+        assert_eq!(
+            h2.matched_blocks > 0,
+            expect_hit,
+            "checkpoint_max_mb={ckpt_mb}:重启后命中={} (期望 {expect_hit})",
+            h2.matched_blocks
+        );
+        // 开了 checkpoint 的分支：命中块必须真的覆盖 prompt 前缀（≥ 1 整块）
+        if expect_hit {
+            assert!(
+                h2.matched_blocks >= 1,
+                "盘层召回至少一块,实际 {}",
+                h2.matched_blocks
+            );
+        }
+    }
+}
+
 /// **S6.1 端到端门**:turn 收口写链索引 → 小宿主把链溢写到盘 →
 /// **重启后按索引重建树**(非设备层)→ **同 prompt 命中前缀**(跨重启复用成立)。
 #[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例

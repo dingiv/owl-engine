@@ -186,6 +186,12 @@ disk_cache_mb = 0
 snap_disk_mb = 0
 # 盘层目录(给了配额就必须给;必须独占)
 disk_dir = ""
+# **磁盘 KV 主动 checkpoint 单次配额 MiB**(S6.2;0 = 关)。
+# 开 = turn 收口把活跃会话的 KV 块**复制**一份到盘(不动运行期驻留)⇒ 引擎重启后
+# 仍能按盘上索引召回前缀;关 = 旧行为(只有宿主压力才被动溢写)。
+checkpoint_max_mb = 0
+# 两次 checkpoint 的最小间隔 ms(0 = 每 turn 都试)
+checkpoint_min_gap_ms = 5000
 # 临时块复用池上限(MiB;0 = 不限)
 pool_cap_mb = 256
 # 显存目标占比 / 预留 MiB

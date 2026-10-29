@@ -455,6 +455,13 @@ impl BlockLeg {
         self.host.get(chain).is_some()
     }
 
+    /// **只读宿主副本**(S6.2 checkpoint 的复制语义;不搬内容 —— 与
+    /// `host_take` 相对:"备份"不该把运行期驻留抽走，否则下一个 turn 命中
+    /// 就要多付一次 H2D)。
+    pub fn host_block(&self, chain: ChainHash) -> Option<&crate::host::HostBlock> {
+        self.host.get(chain)
+    }
+
     /// 宿主层**同身份重复落地**次数(账漂指纹;0 = 两腿账一直对齐)。
     ///
     /// 它不是错误(同身份 = 同内容 ⇒ 落地可幂等合并),而是**上游漏了
@@ -1108,6 +1115,84 @@ impl BlockOutPlan {
     }
 }
 
+/// **逐块只读出片计划**（S6.2：主动 checkpoint 的取料面）。
+///
+/// 与 [`plan_offload_blocks`] 的三处差别（**故意的**）：
+/// 1. **不做 `refs` 策略**：checkpoint 的对象是**活跃 session 的块**
+///    （`refs == 2`，旧票会记成 `LiveRefs` 跳过）；
+/// 2. **只读**：engine 拿到槽台 → 写盘 → [`recycle_read_plan`] 归还缓冲；
+///    块仍绑原设备槽、宿主副本不动（**复制语义**，不是搬家）；
+/// 3. 非设备驻留（宿主/盘/洞）一律 `NotOnDevice` —— 宿主副本由调用方直接
+///    clone，盘上的直接跳过，链上有洞的由调用方**停止前缀推进**。
+pub struct ReadPlan {
+    /// 有票块（与 `blocks` 同序）。
+    pub chains: Vec<ChainHash>,
+    /// （块身份, 原设备槽）—— 只读，不交给 `commit_offload`。
+    pub blocks: Vec<(ChainHash, u32)>,
+    /// 设备 → 连接器的片，**每平面一组**。
+    pub pieces: Vec<Vec<SwapPiece>>,
+    /// 宿主侧槽台（engine 交给 `face.swap` 后逐槽读字节）。
+    pub table: SlotTable,
+    /// 跳过的块 + 原因（报告面）。
+    pub skipped: Vec<(ChainHash, SkipWhy)>,
+}
+
+impl ReadPlan {
+    /// 有计划块数。
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+    /// 一块都没票（调用方可零副作用早退）。
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+/// **逐块只读出片**（见 [`ReadPlan`]）。纯 host、零 I/O、**不改任何账**。
+pub fn plan_read_blocks(leg: &mut BlockLeg, chains: &[ChainHash]) -> StoreResult<ReadPlan> {
+    leg.pieces()?; // 未注册布局 = 先拒
+    let mut blocks: Vec<(ChainHash, u32)> = Vec::new();
+    let mut skipped: Vec<(ChainHash, SkipWhy)> = Vec::new();
+    for c in chains {
+        match leg.kv.locate(*c) {
+            None => skipped.push((*c, SkipWhy::Unknown)),
+            Some(crate::tier::Tier::Gpu) => match leg.kv.bound_slot(*c) {
+                Ok(slot) => blocks.push((*c, slot)),
+                Err(_) => skipped.push((*c, SkipWhy::Unknown)),
+            },
+            // 宿主/盘都不是"错"，只是不在这条只读路径上
+            Some(_) => skipped.push((*c, SkipWhy::NotOnDevice)),
+        }
+    }
+    if blocks.is_empty() {
+        return Ok(ReadPlan {
+            chains: Vec::new(),
+            blocks,
+            pieces: (0..leg.planes).map(|_| Vec::new()).collect(),
+            table: SlotTable::new(Vec::new()),
+            skipped,
+        });
+    }
+    // 与下沉共用同一口借台（预算在借台处查，超界零副作用）
+    let bufs = leg.host.lend_slots(blocks.len())?;
+    let pieces = (0..leg.planes)
+        .map(|p| out_pieces(leg, &blocks, p))
+        .collect::<StoreResult<Vec<_>>>()?;
+    Ok(ReadPlan {
+        chains: blocks.iter().map(|(c, _)| *c).collect(),
+        blocks,
+        pieces,
+        table: SlotTable::new(bufs),
+        skipped,
+    })
+}
+
+/// 归还只读计划的宿主缓冲（内容已消费完；**调用方传入 swap 回执的槽台**）。
+/// **不**解绑、不改层账。
+pub fn recycle_read_plan(leg: &mut BlockLeg, table: SlotTable) {
+    leg.host.recycle_many(table.into_slots());
+}
+
 /// 逐块下沉里**跳过**一块的原因(报告面;由账直接判,不靠调用方猜)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkipWhy {
@@ -1117,6 +1202,9 @@ pub enum SkipWhy {
     AlreadyHost,
     /// 设备块引用 > 1(仍有会话表持有)⇒ 调用方忘了先 `decref`。
     LiveRefs,
+    /// **不在设备层**(宿主/盘/洞)—— 只读路径的正常跳过;
+    /// 与 `Unknown` 分开是为了报告面能区分"链上有洞"与"身份不存在"。
+    NotOnDevice,
 }
 
 /// **回灌计划**(纯 host):宿主内容取出 + 设备槽分配 + 组片。
@@ -1619,6 +1707,62 @@ mod tests {
             real(l.report().host_bytes),
             4 * block_bytes
         );
+    }
+
+    /// **只读出片 ≠ 下沉票**（S6.2 checkpoint 的核心语义差异）。
+    ///
+    /// 下沉票对 `refs == 2`（会话持有 = **活跃块**）记 `LiveRefs` 跳过 ——
+    /// 而 checkpoint 的对象**正是**活跃块。本门钉住：
+    /// ① `plan_read_blocks` 对活跃块**出票**；② 不碰账（块仍绑设备槽、
+    /// refs 不变）；③ 缓冲可归还（复制语义不留故障）。
+    #[tokio::test]
+    async fn plan_read_blocks_reads_live_blocks_without_touching_ledger() {
+        let mut face = CpuFace::default();
+        let pieces = pieces_n(&mut face, 2).await;
+        let mut l = leg();
+        l.attach_pool(PoolLayout {
+            class: BlockClass::KvPage,
+            epoch: 1,
+            pieces: pieces.clone(),
+        })
+        .expect("注册布局");
+
+        let tokens: Vec<u32> = (0..64).collect();
+        let mut table = Vec::new();
+        l.ensure_for_len(&mut table, 64).expect("块表");
+        l.register_chain(&tokens, &table).expect("登记");
+        // ⚠️ **不** release_table ⇒ 会话仍持有 ⇒ refs == 2（活跃块）
+        let hit = l.match_prefix(&tokens).expect("命中");
+        let (h0, s0) = (hit.hashes[0], hit.slots[0].expect("设备块"));
+        assert_eq!(l.slot_refs(s0), 2, "活跃块 refs 必须 == 2");
+
+        // ① 下沉票在这一刻会拒（LiveRefs），只读票必须出
+        let off = plan_offload_blocks(&mut l, &[h0]).expect("下沉计划");
+        assert!(off.is_empty(), "下沉票必须跳过活跃块: {:?}", off.skipped);
+        assert_eq!(off.skipped[0].1, SkipWhy::LiveRefs);
+        let p = plan_read_blocks(&mut l, &[h0]).expect("只读出片");
+        assert_eq!(p.len(), 1, "只读票必须**不**看 refs");
+        assert_eq!(p.chains, vec![h0]);
+
+        // ② 账不变：仍绑原设备槽、refs 不变、宿主无新驻留
+        assert_eq!(l.carrier_of(h0).expect("在账"), Carrier::Device(s0));
+        assert_eq!(l.slot_refs(s0), 2, "只读不得改引用账");
+        let host_before = l.report().host_bytes;
+
+        // ③ 内容真的搬到了槽台（swap 后逐槽可读），结束后归还缓冲
+        let conn = face
+            .swap(SwapDir::Out, &p.pieces[0], Box::new(p.table))
+            .await
+            .expect("swap(Out)");
+        let tbl = reclaim_slot_table(conn).expect("取台");
+        let slot_bytes = l.host_slot_bytes();
+        let mut buf = vec![0u8; slot_bytes];
+        tbl.get(ConnSlot(0), 0, &mut buf).expect("读槽 0");
+        assert_eq!(buf.len(), slot_bytes);
+        recycle_read_plan(&mut l, tbl);
+
+        assert_eq!(real(l.report().host_bytes), host_before, "归还后宿主字节回到基线");
+        assert_eq!(l.carrier_of(h0).expect("在账"), Carrier::Device(s0), "块仍在设备");
     }
 
     #[tokio::test]

@@ -29,6 +29,29 @@ type Result<T> = std::result::Result<T, ModelError>;
 // [`RunningEngine::store_hook`]。旧 `Node` 四变体已于 2026-10-25 Phase 1
 // 收编为 `StoreHook::{Acquire, Release, Maintain}`。
 
+/// **KV 磁盘 checkpoint 的一次结果**（S6.2；诊断/日志面）。
+///
+/// 三数分开记是必要的：`dev_blocks` 走 D2H（贵，受 PCIe 限），`host_blocks`
+/// 只是内存拷贝（便宜）——"为什么这次慢"只能从这两个数的比例看出来。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CheckpointStats {
+    /// 从设备只读 D2H 后写盘的块数
+    pub dev_blocks: usize,
+    /// 从宿主副本直接写盘的块数
+    pub host_blocks: usize,
+    /// 实际写入字节（KV 块；快照另记）
+    pub bytes: usize,
+    /// 尾部边界快照是否落盘（0/1）
+    pub snap_disk: bool,
+}
+
+impl CheckpointStats {
+    /// 本次写入的块数。
+    pub fn blocks(&self) -> usize {
+        self.dev_blocks + self.host_blocks
+    }
+}
+
 /// 步级探针开关(诊断面;结构纯数据,Default = 全关)。
 /// **入口侧构造器** = [`StepProbes::from_config`](server config/测试用例
 /// 专用);引擎内部零 env 读取,经 EngineKnobs.probes 显式传入。
@@ -1785,6 +1808,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 if !toks.is_empty() {
                     self.write_chain_index(&toks).await?;
                 }
+                // **S6.2 主动落盘**：索引之后 checkpoint 内容（配额小步、复制语义）。
+                // 位置在"会话尚在账"处 —— 出表之后拿不到整链 tokens。
+                self.maybe_checkpoint_kv(release.session).await?;
             }
             // **索引暂存排空**：正常 prefill 的末边界已清空；这里兜底
             // abort/短轮 —— 必须在 `release_turn_table` 之前采，物理页还在。
@@ -2924,6 +2950,290 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         }
         Ok(None)
+    }
+
+    /// **KV 主动 checkpoint（S6.2）**：把活跃会话已算出的 KV 块**复制**一份到盘层。
+    ///
+    /// 与旧路径（`spill_kv_to_disk`）的区别只有**驱动条件**：
+    /// - 旧 = 宿主压力票 ⇒ 宿主够大时永不落盘 ⇒ 重启后索引在、内容不在（召回=0）；
+    /// - 本 = **定期主动**（`[pool].checkpoint_max_mb` / `checkpoint_min_gap_ms`）。
+    ///
+    /// 三条纪律：
+    /// 1. **复制语义**：设备块走只读 D2H（`plan_read_blocks`）后归还缓冲、不解绑；
+    ///    宿主块只 clone 字节 —— 运行期驻留与账**一律不动**；
+    /// 2. **只写连续前缀**：boot 的 `adopt_disk_chains` 以"内容在场"截断到连续前缀，
+    ///    所以遇到"既不在设备也不在宿主"的洞（未算/已丢）立即停，**绝不跳块**；
+    /// 3. **配额小步**：一次最多写 `quota_bytes`（按块向下取整），中断即停 ——
+    ///    已写部分仍是合法前缀，多轮小步自然铺满整链。
+    async fn checkpoint_session_kv(
+        &mut self,
+        sid: u64,
+        quota_bytes: usize,
+    ) -> Result<CheckpointStats> {
+        use owl_iface::contract::Connector as _; // `SlotTable::get` 是 trait 方法
+        use owl_store::Carrier;
+        let mut out = CheckpointStats::default();
+        if quota_bytes == 0 || !self.bank.rel.disk_enabled() {
+            return Ok(out);
+        }
+        let page = self.dev.pool.geom.page.max(1);
+        let tokens = match self.bank.sessions.get(sid) {
+            Some(s) => s.tokens.clone(),
+            None => return Ok(out),
+        };
+        let full = tokens.len() / page; // 指整块前缀（尾残块不参与身份）
+        if full == 0 {
+            return Ok(out);
+        }
+        let Some(tail) = self.bank.rel.leg.tail_hash(&tokens, full) else {
+            return Ok(out);
+        };
+        let chain = self.bank.rel.leg.chain_blocks(tail); // root → tail
+        let Some(blk) = self.bank.rel.disk.as_ref().map(|d| d.block_bytes()) else {
+            return Ok(out);
+        };
+        if blk == 0 || chain.is_empty() {
+            return Ok(out);
+        }
+        // ① 已有前缀：从根起跳过**盘上已存在**的块
+        let mut start = 0usize;
+        while start < chain.len()
+            && self
+                .bank
+                .rel
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.contains(chain[start]))
+        {
+            start += 1;
+        }
+        if start >= chain.len() {
+            return Ok(out); // 整链已在盘上（幂等）
+        }
+        // ② 配额 → 块数（至少 1 块：否则小配额档永远推进不了）
+        let max_blocks = (quota_bytes / blk).max(1);
+        // ③ 连续前缀扫描：遇洞即停（不能跳块，否则 boot 截断到洞之前）
+        let mut dev: Vec<owl_store::ChainHash> = Vec::new();
+        let mut host: Vec<owl_store::ChainHash> = Vec::new();
+        for h in chain.iter().skip(start) {
+            if dev.len() + host.len() >= max_blocks {
+                break;
+            }
+            // ⚠️ **盘层要显式判**：KV 腿的 `KvStore::locate` 是**二值**
+            // (`slot.is_some() ? Gpu : Host`)⇒ `Carrier::Disk` 分支实际不可达,
+            // 盘上块会被报成 `Host`，再靠 `host_block()` 拿不到内容兜底 ——
+            // 那只是"碰巧对"，不是判据。这里先问盘层（挂账见 store.md §31.6-5）。
+            if self
+                .bank
+                .rel
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.contains(*h))
+            {
+                break;
+            }
+            match self.bank.rel.leg.carrier_of(*h) {
+                Ok(Carrier::Device(_)) => dev.push(*h),
+                Ok(Carrier::Host) => {
+                    if self.bank.rel.leg.host_block(*h).is_none() {
+                        break; // 账说宿主、内容不在 ⇒ 前缀断
+                    }
+                    host.push(*h)
+                }
+                // 保留：将来 `locate` 升三值后这里才是真路径
+                Ok(Carrier::Disk) | Err(_) => break,
+            }
+        }
+        // ④ 宿主副本：clone 字节写盘（缓冲不动 = 复制语义）
+        for h in &host {
+            let Some(bytes) = self.bank.rel.leg.host_block(*h).map(|b| b.as_slice().to_vec())
+            else {
+                break;
+            };
+            if self.spill_bytes_to_disk(*h, bytes).await? {
+                out.host_blocks += 1;
+            } else {
+                break;
+            }
+        }
+        // ⑤ 设备块：批量只读 D2H → 逐槽写盘 → 归还缓冲（不解绑、不改层账）
+        if !dev.is_empty() {
+            let owl_store::ReadPlan {
+                chains,
+                pieces,
+                table,
+                ..
+            } = owl_store::plan_read_blocks(&mut self.bank.rel.leg, &dev)?;
+            if !chains.is_empty() {
+                let t = self
+                    .swap_all_ranks(owl_iface::contract::SwapDir::Out, &pieces, table)
+                    .await?;
+                for (i, h) in chains.iter().enumerate() {
+                    let mut buf = vec![0u8; blk];
+                    if let Err(e) = t.get(owl_iface::contract::ConnSlot(i as u64), 0, &mut buf) {
+                        owl_shared::log_warn!("store", "KV checkpoint 读槽 {i} 失败:{e}");
+                        break;
+                    }
+                    if !self.spill_bytes_to_disk(*h, buf).await? {
+                        break;
+                    }
+                    out.dev_blocks += 1;
+                }
+                owl_store::recycle_read_plan(&mut self.bank.rel.leg, t);
+            }
+        }
+        out.bytes = (out.dev_blocks + out.host_blocks) * blk;
+        // ⑥ **尾部边界快照必须一起落盘**（否则召回等于 0）。
+        //
+        // 为什么：`reuse_face` 要求复用面的**尾边界有 GDN 快照**（混合模型的
+        // 状态不能只靠 KV 块重建）；快照不在盘上 ⇒ `state.locate == None` ⇒
+        // m 一路裁到 0 ⇒ `plan_fresh`（**实测：只 checkpoint KV 时，重启后
+        // `cache=0/4753`，全量重算 2.4 s**）。
+        //
+        // 语义上快照用**搬家**（设备/宿主 → 盘），不是复制：一份 148 MiB，
+        // 复制会白吃宿主；丢掉的快照是可重建的锚点（复用点变近，不是错值），
+        // 下次命中由 `fill_snap_from_disk` 回填。
+        out.snap_disk = self.checkpoint_tail_snap(tail).await?;
+        Ok(out)
+    }
+
+    /// **按字节写盘**（S6.2 的落点；与 `spill_kv_to_disk` 共用盘满腾位政策）。
+    ///
+    /// 与旧口的差别：旧口从宿主 `take`（内容搬家）；本口收**调用方持有的副本**，
+    /// 写失败时副本直接丢（宿主/设备原驻留仍在 ⇒ 不丢内容）。
+    async fn spill_bytes_to_disk(
+        &mut self,
+        chain: owl_store::ChainHash,
+        bytes: Vec<u8>,
+    ) -> Result<bool> {
+        if self.bank.rel.disk.is_none() {
+            return Ok(false);
+        }
+        if self
+            .bank
+            .rel
+            .disk
+            .as_ref()
+            .is_some_and(|d| d.contains(chain))
+        {
+            return Ok(false); // 幂等：已在盘
+        }
+        let plan = match self.disk_spill_plan_kv(chain).await? {
+            Some(p) => p,
+            None => return Ok(false), // 盘装不下（腾完也不够）⇒ 本单停
+        };
+        match crate::disk_io::write_block(plan.path.clone(), plan.tmp.clone(), bytes).await {
+            Ok(_) => {
+                self.bank
+                    .rel
+                    .disk
+                    .as_mut()
+                    .expect("上面判过")
+                    .commit_spill(&plan)?;
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("store.disk.checkpoint.block", 1, file!(), line!());
+                });
+                Ok(true)
+            }
+            Err(f) => {
+                // 我们持有的是**副本**（设备/宿主原驻留还在）⇒ 内容不丢，如实告警
+                owl_shared::log_warn!(
+                    "store",
+                    "KV checkpoint 写盘失败(副本可弃;链 {chain:?}):{}",
+                    f.err
+                );
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("store.disk.checkpoint.fail", 1, file!(), line!());
+                });
+                Ok(false)
+            }
+        }
+    }
+
+    /// **turn 收口的 checkpoint 调度**（门 + 节拍 + 日志/指标）。
+    async fn maybe_checkpoint_kv(&mut self, sid: u64) -> Result<()> {
+        let quota_mb = self.boot.cfg.knobs.checkpoint_max_mb;
+        if quota_mb == 0 || !self.bank.rel.disk_enabled() {
+            return Ok(());
+        }
+        let gap_ms = self.boot.cfg.knobs.checkpoint_min_gap_ms;
+        if gap_ms > 0
+            && !self
+                .hk
+                .kv_checkpoint_due(std::time::Duration::from_millis(gap_ms))
+        {
+            return Ok(());
+        }
+        self.hk.mark_kv_checkpoint();
+        let t0 = std::time::Instant::now();
+        let st = self.checkpoint_session_kv(sid, quota_mb << 20).await?;
+        if st.blocks() > 0 || st.snap_disk {
+            owl_shared::log_info!(
+                "store",
+                "KV checkpoint:session={sid:#x} 写 {} 块 / {} MiB(设备 {} · 宿主 {})· 锚点快照 {} in {:?}",
+                st.blocks(),
+                st.bytes >> 20,
+                st.dev_blocks,
+                st.host_blocks,
+                if st.snap_disk { "已落盘" } else { "无(该链尚无 Durable 锚点)" },
+                t0.elapsed()
+            );
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("store.disk.checkpoint.blocks", st.blocks() as u64, file!(), line!());
+                m.counter_add("store.disk.checkpoint.bytes", st.bytes as u64, file!(), line!());
+                if st.snap_disk {
+                    m.counter_add("store.disk.checkpoint.snap", 1, file!(), line!());
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// **锚点快照 → 盘**（S6.2 第二半；KV 块之外的必需品）。
+    ///
+    /// 为什么不能只写"链尾"那一个边界：链尾那张是**生成段**随手拍的
+    /// `Transient` 快照（`plan_snap_offload` 会响亮拒：链一推进就被取代），
+    /// 而能当复用锚点的是 **prefill 段的 `Durable`** 快照（每 `SNAP_EVERY`
+    /// 个 chunk 一张）。⇒ 从链尾**往回**找第一个 `Durable` 且在设备/宿主的。
+    ///
+    /// 语义：快照用**搬家**（设备/宿主 → 盘），不是复制 —— 一份 148 MiB，
+    /// 复制会白吃宿主；丢掉的锚点可重建（复用点变近），命中时由
+    /// `fill_snap_from_disk` 回填。
+    async fn checkpoint_tail_snap(&mut self, tail: owl_store::ChainHash) -> Result<bool> {
+        use owl_store::state::SnapDurability;
+        use owl_store::Tier;
+        if self.bank.rel.snap_disk.is_none() {
+            return Ok(false); // 状态腿盘分片没给配额 ⇒ 关层(不静默)
+        }
+        let chain = self.bank.rel.leg.chain_blocks(tail);
+        for h in chain.iter().rev() {
+            let key = owl_store::SnapKey::at_boundary(*h);
+            // 只要 Durable：Transient(生成段) 不可下沉,也不该当锚点
+            if self.bank.rel.state.snap_durability(key) != Some(SnapDurability::Durable) {
+                continue;
+            }
+            match self.bank.rel.state.locate(key) {
+                Some(Tier::Disk) => {
+                    owl_shared::counter_inc!("store.disk.checkpoint.snap_already");
+                    return Ok(false);
+                }
+                Some(Tier::Host) => return self.spill_snap_to_disk(key).await,
+                Some(Tier::Gpu) => {
+                    let Some(slot) = self.dev.pool.snap_slot_of(key) else {
+                        return Ok(false);
+                    };
+                    // 设备 → 宿主(搬移；随后空槽) → 盘
+                    self.snap_offload(key, slot).await?;
+                    self.dev.pool.snap_clear_slot(slot);
+                    if let Some(pr) = self.peer.as_mut() {
+                        pr.pool.snap_clear_slot(slot);
+                    }
+                    return self.spill_snap_to_disk(key).await;
+                }
+                None => continue, // 这张已被取代/逐出 ⇒ 再往回找
+            }
+        }
+        Ok(false)
     }
 
     /// **写盘上链索引**(S6.1;turn 收口一次,同 tail 幂等)。

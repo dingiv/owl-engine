@@ -711,6 +711,21 @@ pub struct PoolCfg {
     ///
     /// 目录由 `disk_dir` 指定;进程重启后**扫目录回填账**(内容惰性读回)。
     pub disk_cache_mb: usize,
+    /// **磁盘 KV 主动 checkpoint 的单次配额 MiB**（S6.2;缺省 0 = 关）。
+    ///
+    /// 语义：turn 收口时把**活跃会话已算出的 KV 块**从 设备/宿主**复制**一份
+    /// 到盘层（复制语义 —— 不动运行期驻留），于是引擎**重启后**仍能按盘上
+    /// 索引（`.idx`）召回前缀，不必全量重算。
+    ///
+    /// 旧行为（本键 = 0）：只有**宿主压力票**才被动溢写 ⇒ 宿主够大时重启后
+    /// 索引在、内容不在 ⇒ boot 截断到 0（等于没有跨重启召回）。
+    ///
+    /// 取值 = 一次 turn 收口最多写这么多（按「从根起的连续前缀」推进，中断即停，
+    /// 不留跳块）。64 MiB ≈ 64 块 ≈ 0.1 s（NVMe）—— 多轮小步即可把长链铺满，
+    /// 且不拖慢单轮响应。需要 `disk_dir` 非空 + `disk_cache_mb > 0`。
+    pub checkpoint_max_mb: usize,
+    /// **两次 KV checkpoint 的最小间隔 ms**（缺省 5000；0 = 每个 turn 都做）。
+    pub checkpoint_min_gap_ms: u64,
     /// **磁盘状态腿**(MiB;0 = 关层;与 [`Self::disk_cache_mb`] 同属盘层总账的两个分片)。
     pub snap_disk_mb: usize,
     /// **磁盘内容目录**(空 = 关层;两腿子目录 `kv/` 与 `snap/` 自动分)。
@@ -1812,6 +1827,8 @@ impl Default for PoolCfg {
             snap_host_mb: 0,
             disk_cache_mb: 0,
             snap_disk_mb: 0,
+            checkpoint_max_mb: 0,
+            checkpoint_min_gap_ms: 5000,
             disk_dir: String::new(),
             pool_cap_mb: 256,
             vram_target: 0.97,

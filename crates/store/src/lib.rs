@@ -70,7 +70,8 @@ pub use kv::{
 pub use leg::CachePolicy;
 pub use leg::{
     abort_offload, abort_onload, commit_offload, commit_onload, is_host_placeholder, plan_offload,
-    plan_offload_blocks, plan_onload, reclaim_slot_table, BlockClass, BlockLeg, BlockOutPlan,
+    plan_offload_blocks, plan_onload, plan_read_blocks, reclaim_slot_table, recycle_read_plan,
+    BlockClass, BlockLeg, BlockOutPlan, ReadPlan,
     Carrier, ChainCand, ChainHit, InPlan, LegConfig, LegOps, LegStats, OutPlan, PieceSpec,
     PoolLayout, SkipWhy, HOST_PLACEHOLDER,
 };
