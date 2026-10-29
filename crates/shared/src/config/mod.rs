@@ -62,7 +62,7 @@
 //! | parallel | mode | ParallelMode 枚举 single\|tensor / single |
 //! | parallel | device | [String] 卡位(BDF / UUID / find-name;**禁 CUDA 序号**);空 = 自动挑空闲卡 |
 //! | parallel | tp_ar / tp_ar_f8 / tp_vocab_split | TP 档(见字段注;tp_ar = v1\|fused\|ar2) |
-//! | model | format | ModelFormat 枚举 safetensors\|awq\|pack-quantized\|gguf / safetensors |
+//! | model | format | ModelFormat 枚举 safetensors\|awq\|gguf / safetensors |
 //! | model | path / name | Option<PathBuf> / None(模型目录或 .gguf 单文件) |
 //! | model | quant | QuantScheme(safetensors/awq: w4a16\|w4a8;gguf: q4k\|iq4\|iq3) |
 //! | model | vision / vision_path | bool / false + Option(视觉塔;GGUF 档 = `mmproj-*.gguf` 单文件) |
@@ -155,9 +155,7 @@ pub use resolve::{Origin, Origins, ResolveMeta};
 ///
 /// 语义 = **权重怎么摆**,与"量化到几比特"正交(后者是 `model.quant`)：
 /// - `safetensors` = 普通 HF 检查点目录(`config.json` + `*.safetensors`);
-/// - `awq` = AWQ pack-quantized 家族(cyankiwi 系;int4 权重已烘焙,g32-asym);
-/// - `pack-quantized` = compressed-tensors pack-quantized(g128-sym W4A16;
-///   转换器/llm-compressor 产物,非 AWQ 的 zp 布局);
+/// - `awq` = AWQ pack-quantized 家族(cyankiwi 系;int4 权重已烘焙);
 /// - `gguf` = `.gguf` 单文件(超参/词表/模板/rope/权重全从文件取)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -165,11 +163,8 @@ pub enum ModelFormat {
     /// 普通 HF safetensors 目录
     #[default]
     Safetensors,
-    /// AWQ pack-quantized 检查点(g32-asym)
+    /// AWQ pack-quantized 检查点
     Awq,
-    /// compressed-tensors pack-quantized(g128-sym W4A16)
-    #[serde(rename = "pack-quantized")]
-    PackQuantized,
     /// GGUF 单文件
     Gguf,
 }
@@ -2773,16 +2768,9 @@ impl OwlConfig {
             }
             (_, QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3) => {
                 return Err(
-                    "[model] quant = q4k/iq4/iq3 只配 format = \"gguf\"(safetensors/awq/pack-quantized 无块型)"
+                    "[model] quant = q4k/iq4/iq3 只配 format = \"gguf\"(safetensors/awq 无块型)"
                         .to_string(),
                 );
-            }
-            // compressed-tensors pack-quantized:g128-sym W4A16(转换器产物)
-            (ModelFormat::PackQuantized, QuantScheme::W4a16) => {}
-            (ModelFormat::PackQuantized, q) => {
-                return Err(format!(
-                    "[model] format = \"pack-quantized\" 只配 quant = \"w4a16\"(g128-sym),实得 {q:?}"
-                ));
             }
             // NVFP4 是权重+激活的块缩放格式:装载期现量化(safetensors 的 f16)
             (ModelFormat::Safetensors, QuantScheme::Nvfp4) => {}
@@ -2801,14 +2789,11 @@ impl OwlConfig {
         // 旧行为:整条量化链在 safetensors 档被**静默忽略**(loader 里写死 F16),
         // 配了跟没配一样;现在配置面真生效 ⇒ 必须在 boot 前把配不出来的组合拒掉,
         // 不能让它跑到装载期才报“缺键”。
-        if matches!(
-            self.model.format,
-            ModelFormat::Safetensors | ModelFormat::PackQuantized
-        ) {
+        if matches!(self.model.format, ModelFormat::Safetensors) {
             if !matches!(self.model.head_quant, HeadQuant::Off) {
                 return Err(format!(
                     "[model] head_quant = {:?} 需要 AWQ 源(AWQ 源装载期从 bf16 现算 `lm_head.i8q/i8s`),\
-                     format = \"safetensors\"/\"pack-quantized\" 没有这两个派生键 —— 请设 head_quant = \"off\"\
+                     format = \"safetensors\" 没有这两个派生键 —— 请设 head_quant = \"off\"\
                      或改用 format = \"awq\"",
                     self.model.head_quant
                 ));
@@ -2816,7 +2801,7 @@ impl OwlConfig {
             if !matches!(self.model.embed_quant, EmbedQuant::F16) {
                 return Err(format!(
                     "[model] embed_quant = {:?} 同样需要 AWQ 源(表的 int8 也是装载期派生键),\
-                     format = \"safetensors\"/\"pack-quantized\" 请保持 embed_quant = \"f16\"",
+                     format = \"safetensors\" 请保持 embed_quant = \"f16\"",
                     self.model.embed_quant
                 ));
             }
