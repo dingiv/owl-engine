@@ -51,11 +51,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // §1 级别
 // ============================================================================
 //
-// 常量本体住叶子 crate `owl-sink`(下层 kernels 也要用,而它不能依赖本 crate
+// 常量本体住 `owl-iface::sink`(类型定义实际住 `owl-kernels`)(下层 kernels 也要用,而它不能依赖本 crate
 // —— `owl-shared → owl-iface → owl-kernels` 的既成边)。此处 **re-export 不
-// 重定义**:数值只有一份事实(`owl_sink::LVL_*`),`Level::to_u8` 也引用它们。
+// 重定义**:数值只有一份事实(`owl_iface::sink::LVL_*`),`Level::to_u8` 也引用它们。
 
-pub use owl_sink::{LVL_DEBUG, LVL_ERROR, LVL_INFO, LVL_OFF, LVL_TRACE, LVL_WARN};
+pub use owl_iface::sink::{LVL_DEBUG, LVL_ERROR, LVL_INFO, LVL_OFF, LVL_TRACE, LVL_WARN};
 
 /// 日志级别
 ///
@@ -105,9 +105,9 @@ impl Level {
         })
     }
 
-    /// 名称 ↔ u8(含 off);数值→名字的唯一实现住 `owl_sink`(与 C 侧同源)
+    /// 名称 ↔ u8(含 off);数值→名字的唯一实现住 `owl_iface::sink`(与 C 侧同源)
     pub fn name_of(l: u8) -> &'static str {
-        owl_sink::level_name_of(l)
+        owl_iface::sink::level_name_of(l)
     }
 
     /// 阈值解析(含 `off`)
@@ -491,10 +491,10 @@ pub fn set_tags(allow: Vec<String>, deny: Vec<String>) -> bool {
 //
 // ```text
 // owl-shared ──► owl-iface ──► owl-kernels      (既成债:kernels 是最底层)
-//      └──────► owl-sink ◄──────┘              (本口:两边都向下引叶子)
+//      └──► owl-kernels::sink ◄───┘            (类型住下层;实现住本层)
 // ```
 //
-// ⇒ 结构本体住叶子 crate `owl-sink`(与 kernels 同一份定义,不搞镜像;
+// ⇒ 结构本体住 `owl-kernels::sink`(2026-10-29 起 kernels 自己就是"叶子";
 // AGENTS.md 禁「接口不唯一」)。本模块只负责 **实现接线**(logger + metrics)。
 //
 // 一个对象管三件事(都是「把事实抽出去」,不是新概念):
@@ -504,7 +504,7 @@ pub fn set_tags(allow: Vec<String>, deny: Vec<String>) -> bool {
 //
 // 未注入(= [`LogSink::none`])时全部静默且**零分支以外的开销**。
 
-pub use owl_sink::LogSink;
+pub use owl_iface::sink::LogSink;
 
 fn sink_log(level: u8, tag: &str, msg: &str) {
     if let Some(g) = LOGGER.get() {

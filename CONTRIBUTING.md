@@ -27,7 +27,7 @@ No GPU / no CUDA toolkit? Two build-script switches make the whole workspace com
 ```bash
 OWL_CUBIN_SKIP=1 GDN_TRITON_BUILD=0 cargo check --workspace --tests --locked
 # asset-free unit tests (the four crates that need no cubins):
-OWL_CUBIN_SKIP=1 GDN_TRITON_BUILD=0 cargo test -p owl-sink -p owl-iface -p owl-shared -p owl-store --lib
+OWL_CUBIN_SKIP=1 GDN_TRITON_BUILD=0 cargo test -p owl-kernels -p owl-iface -p owl-shared -p owl-store --lib
 ```
 
 This is exactly what CI does (`.github/workflows/ci.yml`).

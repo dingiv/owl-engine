@@ -147,17 +147,28 @@ curl "127.0.0.1:8136/debug/log/tags/boot,gl-prof/-" # allow=boot,gl-prof;deny �
 `owl-shared → owl-iface → owl-kernels` 是既成边 ⇒ `kernels → shared` =
 **cyclic package dependency**(cargo 实测报错)。而 kernels 又必须出声。
 
-解法 = **把 `LogSink` 这个纯函数指针包搬到依赖图叶子**:
+解法 = **依赖倒置**:`LogSink` 是「**下层要求的输出口**」,所以**类型定义住
+`owl-kernels::sink`**,**实现由上层给**(`owl-shared` 把它自己的 logger 包成
+fn 指针值,经 `server::DiagTune{sink}` 在 boot 期注入)。kernels 自己不打日志、
+不持全局 logger,只持这个可 Copy 的包。
 
 ```
-owl-shared ──► owl-iface ──► owl-kernels
+owl-shared ──► owl-iface ──► owl-kernels                     (单向边,无新环)
      │                            │
-     └──────► owl-sink ◄──────────┘        (零依赖 ABI crate,唯一 LogSink 定义)
+     └── re-export ◄──────────────┘    LogSink 唯一定义处 = kernels::sink
+         (owl_iface::sink)
 ```
 
-`crates/sink`(package `owl-sink`)只装:级别常量 `LVL_*` / `level_name_of` /
-`LogSink`。`owl_shared::log` 与 `owl_kernels::sink` 都是它的**使用者**
-(不各持一份镜像结构 —— AGENTS.md 禁"接口不唯一")。
+> **2026-10-29 合并(用户裁决)**:原先为了避开这个依赖环,`LogSink` 被单独
+> 放在零依赖叶子 crate `owl-sink`(`crates/sink`)。用户判断"**这个 crate 太
+> 啰嗦 —— 它其实就是 kernels 要求的一种接口**",于是:定义搬进
+> `crates/kernels/src/sink.rs`,`crates/sink` 删除;`owl-iface` re-export
+> (`pub use owl_kernels::sink;`)供 `owl-shared` 取,`owl-shared` **不新增**
+> 对 kernels 的直接依赖(dev-dep 环风险保持为零)。
+>
+> 现在的形态:级别常量 `LVL_*` / `level_name_of` / `LogSink` 全部住
+> `kernels::sink`(全仓唯一一份);`owl_shared::log` 从 `owl_iface::sink`
+> re-export 同一批符号 —— 仍然"接口唯一",只是少了那个 crate。
 
 ### 8.2 三道门(与 Rust 侧逐条同构)
 
@@ -235,7 +246,8 @@ tag 约定与 Rust 面同名同义:`owl-fi` / `marlin-cfg` / `marlin-v2` /
 ### 8.6b HAL 契约面(`owl-iface`)的注入(2026-10-21 补齐)
 
 `owl-iface` 也不能依赖 `owl-shared`(`owl-shared → owl-iface` 成环),但**可以**
-依赖叶子 `owl-sink` —— 于是 `DeviceHandle` 直接持一个 `LogSink`:
+依赖 `owl-kernels`(既有边)—— 于是 `DeviceHandle` 直接持一个
+`owl_kernels::sink::LogSink`(2026-10-29 起;此前经 `owl-sink`):
 
 ```rust
 pub struct DeviceHandle<D: DeviceClient> { inner, ledger, ctx, sink }

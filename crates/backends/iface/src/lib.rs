@@ -53,6 +53,12 @@ pub mod command;
 pub mod contract;
 /// **DeviceHandle:分配账 + 命令面**(2026-10-19;设计卷 device-命令面与分配账)
 pub mod handle;
+
+/// **日志/计量下沉口 re-export**（依赖倒置：类型定义住 `owl-kernels`，实现在
+/// `owl-shared`）。上层（含 `owl-shared` 自己）经本模块取类型，**不新增**对
+/// `owl-kernels` 的直接依赖 —— 保持 `shared → iface → kernels` 单向边，
+/// 避免 dev-dep 环导致的双份编译。
+pub use owl_kernels::sink;
 pub mod signal;
 
 // 契约面顶层再导出(前后端共同依赖;见 contract 模块文档)

@@ -66,10 +66,6 @@ owl-cuda = { path = "../backends/cuda" }
 owl-macros = { path = "../macros" }
 
 [dependencies]
-# 输出口 ABI(叶子 crate,零依赖):kernels 不能依赖 owl-shared
-# (`owl-shared → owl-iface → owl-kernels` 成环),故 LogSink 住 owl-sink,
-# 两侧引同一个类型(不搞镜像结构)。
-owl-sink = { path = "../sink" }
 # 算子 tag 注入属性宏(`#[kernel_tags]`;仅编译期,零运行期依赖)
 owl-macros = { path = "../macros" }
 # 官方 cudarc:仅 device/cublas feature 使用(Exec/家族发射;feature 化,

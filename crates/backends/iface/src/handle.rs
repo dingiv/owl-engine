@@ -43,8 +43,9 @@ use crate::contract::{
     ModelError, PinnedRegion, Shape, SwapDir, SwapPiece, SwapWaiter, UpChunk, UpStream,
 };
 // 输出口(值语义 fn 指针包;未注入 = 全部静默)。本 crate 不能依赖 owl-shared
-// (`owl-shared → owl-iface`),故类型住叶子 crate `owl-sink`,由 engine 注入。
-use owl_sink::{LogSink, LVL_INFO, LVL_WARN};
+// (`owl-shared → owl-iface`),故类型住 `owl-kernels::sink`(依赖倒置口),
+// 由 engine 用 `owl-shared` 的 logger 包好后注入。
+use owl_kernels::sink::{LogSink, LVL_INFO, LVL_WARN};
 
 // ============================================================================
 // §1 归属与资产类别(与 store 的 TierLedger 同构;store 侧 impl 时做映射)

@@ -707,7 +707,6 @@ name = "owl-iface"
 version = "0.1.0"
 dependencies = [
  "owl-kernels",
- "owl-sink",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -721,7 +720,6 @@ dependencies = [
  "owl-cuda",
  "owl-macros",
  "owl-shared",
- "owl-sink",
  "rayon",
  "serde",
  "toml",
@@ -762,15 +760,10 @@ name = "owl-shared"
 version = "0.1.0"
 dependencies = [
  "owl-iface",
- "owl-sink",
  "serde",
  "tokio",
  "toml",
 ]
-
-[[package]]
-name = "owl-sink"
-version = "0.1.0"
 
 [[package]]
 name = "owl-store"

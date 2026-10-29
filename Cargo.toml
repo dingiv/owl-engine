@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/sink",
     "crates/store",
     "crates/macros",
     "crates/kernels",
