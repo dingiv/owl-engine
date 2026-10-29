@@ -579,33 +579,25 @@ impl GpuServer {
                     // 零 env):写完 registry 之前设,保证任何 plan/activate
                     // 都读到本 boot 的档位。
                     owl_kernels::server::flashinfer::set_plan_restore(self.diag.fi_plan_restore);
-                    // **服务端面输出口**(2026-10-21 收编 env;2026-10-27 采集旗标
-                    // 全退役,只剩 sink)。**boot 唯一写点**。
-                    // `sink` 接上后:算子面 `klog_*!`(Rust)与 `OWL_LOG_*`
-                    // (C/C++)同时可用,可见性由 logger 的 level/tag 管;
-                    // 失败 = 拒启(重入不同值 ⇒ 不静默覆盖)。
-                    if let Err(e) = owl_kernels::server::configure_diag(
-                        &owl_kernels::server::DiagTune { sink: self.sink },
-                    ) {
-                        let msg = format!("诊断面下发失败(拒启): {e}");
-                        self.sink.logf(
-                            owl_shared::log::LVL_ERROR,
-                            "kernels",
-                            format_args!("❌ {msg}"),
-                        );
-                        if let Some(boot) = self.boot.take() {
-                            let _ = boot.send(Err(msg.clone()));
-                        }
-                        return Err(msg);
-                    }
-                    let r = owl_kernels::registry::OpRegistry::boot_with(
+                    // 2026-10-29:输出口不再下发 —— kernels 直接用 `owl_shared`
+                    // 的全局 logger(Rust 宏)与 shared 的 C ABI(C++ 侧 `OWL_LOG_*`)。
+                    // 2026-10-29:装配报告由**本层**打印(kernels 只产出结构化事实)
+                    let mut rep = owl_kernels::registry::AssembleReport::default();
+                    let r = owl_kernels::registry::OpRegistry::boot_with_reporting(
                         &mut res,
                         &mut exec,
                         allowed.as_deref(),
+                        &mut rep,
                     );
                     self.exec = exec;
                     match r {
-                        Ok(reg) => self.registry = Some(reg),
+                        Ok(reg) => {
+                            self.registry = Some(reg);
+                            owl_shared::log_info!("kernels", "{}", rep.summary());
+                            for w in rep.warnings() {
+                                owl_shared::log_warn!("kernels", "{w}");
+                            }
+                        }
                         Err(e) => {
                             // 拒启必须可见:LVL_ERROR(任何档位都在门内)+ **上握手**
                             // (否则 spawn_with 拿不到失败原因,只剩"通道关闭")

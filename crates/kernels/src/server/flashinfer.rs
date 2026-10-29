@@ -354,7 +354,7 @@ impl FiRuntime {
         }
         res.upload_invariant(int_ws.ptr, &entry.staged)?;
         self.active = Some(key);
-        crate::klog_debug!(
+        owl_shared::log_debug!(
             "owl-fi",
             "[plan] int_ws 激活(t={} padded={} tiles={} cap={})",
             key.t,
@@ -913,7 +913,7 @@ impl FiRuntime {
         // ⚙ 诊断(level=debug 或 tag `owl-fi`):plan 重算时的**本轮** ctx_total
         // (宿主标量槽是否真按步送到 —— piecewise 断点面取证)。
         // 2026-10-21:原 `[probes] fi_debug` 纯打印开关退役 → 可见性交给日志门。
-        crate::klog_debug!(
+        owl_shared::log_debug!(
             "owl-fi",
             "[fi-plan] ctx_total={} nb_pages={nb_pages} T={} page={}",
             ctx_total,
@@ -1020,7 +1020,7 @@ impl FiRuntime {
             None
         };
         if padded > tiles {
-            crate::klog_debug!(
+            owl_shared::log_debug!(
                 "owl-fi",
                 "[mask] 图档 plan:T={} ctx={} padded={} tiles={} ⇒ 掩 {} 个尾部 CTA",
                 geom.t,
@@ -1114,7 +1114,7 @@ impl FiRuntime {
         }
         if self.shadow.as_ref().map(|b| b.bytes < total).unwrap_or(true) {
             let sb = res.alloc(total, "fi.prefill_shadow")?;
-            crate::klog_info!(
+            owl_shared::log_info!(
                 "kernels",
                 "FI prefill shadow 预留: {} MiB/rank(cap={} tok, {} 页, page={}, hkv={}, hd={})",
                 total / (1024 * 1024),

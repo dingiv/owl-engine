@@ -98,7 +98,7 @@ pub fn run_selfchecks(
         // 生产 boot 里自检失败时,日志只有"族被 drop"的兜底告警)。
         // 2026-10-21:走统一输出口(INFO 级;默认级别 warn 不出,排障用
         // `--log-level info` 或 tag 白名单 `kernels`)。
-        crate::klog_info!("selfcheck", "{} …({})", m.entry, c.name());
+        owl_shared::log_info!("selfcheck", "{} …({})", m.entry, c.name());
         let mut r = Runner { res, exec, registry: Some(&mut *registry) };
         let rep: CheckReport = c.run(&mut r as &mut dyn CheckRunner).map_err(|e| {
             OpError::Asset {
@@ -110,7 +110,7 @@ pub fn run_selfchecks(
             Some(k) => format!("毒值律 ✓(未写字节 {k})"),
             None => "毒值律 —(非池算子)".to_string(),
         };
-        crate::klog_info!(
+        owl_shared::log_debug!(
             "selfcheck",
             "{} ✓ {} max|err|={:.3e} ≤ {:.1e} {poison}",
             m.entry, c.name(), rep.worst_abs_err, rep.tolerance

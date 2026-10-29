@@ -60,7 +60,7 @@ impl Nvfp4Runtime {
             let mut ms: Vec<usize> = self.plans.keys().map(|(m, _, _)| *m).collect();
             ms.sort_unstable();
             ms.dedup();
-            crate::klog_warn!(
+            owl_shared::log_warn!(
                 "nvfp4",
                 "plan 缓存满({} 个)⇒ 整批清空重建(建造成本小;m 集合 {:?} ⇒ 本档形状过散)",
                 self.plans.len(),
@@ -75,7 +75,7 @@ impl Nvfp4Runtime {
                  且 SF 交错布局的仿射模型须与 cute 逐点一致)"
             ),
         })?;
-        crate::klog_debug!(
+        owl_shared::log_debug!(
             "nvfp4",
             "建 plan m={m} n={n} k={k}(sfa={} sfb={} ws={};缓存 {} 个)",
             plan.sfa_bytes(),

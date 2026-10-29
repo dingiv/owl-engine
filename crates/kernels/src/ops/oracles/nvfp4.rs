@@ -284,7 +284,7 @@ impl BootCheck for NvFp4GemmOracle {
         let mut rep = CheckReport::numeric(crate::family::nvfp4::GEMM, worst, TOL);
         rep.first_bad = None;
         // 逐档账长/误差上屏(诊断面:哪一档的 pad 口径变了,一行看出来)
-        crate::klog_info!("nvfp4-oracle", "{}", detail.join(" ｜ "));
+        owl_shared::log_info!("nvfp4-oracle", "{}", detail.join(" ｜ "));
         Ok(rep)
     }
 }

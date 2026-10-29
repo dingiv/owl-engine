@@ -15,10 +15,9 @@
 /// 本 crate 只 re-export —— `owl_kernels::contract::X` 旧路径不变。
 pub use owl_iface::contract;
 
-/// 诊断输出口(唯一):Rust 侧 `klog_*!` 宏 + C/C++ 侧 `cu/owl_log.h`
-/// 共用同一条 `LogSink`(boot 期由后端经 [`server::DiagTune::sink`] 注入)。
-/// 编译门 = cargo feature `log`(缺省开;不开 = 两侧逐字节零成本)。
-pub mod sink;
+// 2026-10-29:本 crate 不再自带日志下沉口 —— 直接用 `owl_shared::log_*!`
+// 与 `owl_shared::metrics`(用户裁决:对 kernels 开 shared 的口子);
+// C++ 侧 `OWL_LOG_*` 走 shared 提供的同一组 C ABI 符号(同一个全局 logger)。
 
 /// 登记表(list:native kernel 名字 → 源 + 槽序契约 + dtype 标注;
 /// 2026-10-12 自 models::kernel 迁入,同日由 native.rs 更名 list.rs ——

@@ -58,14 +58,16 @@ cudarc = { version = "0.19", default-features = false, features = [
     "std", "driver", "nvrtc", "cuda-version-from-build-system", "dynamic-loading",
 ] }
 half = { version = "2.7.1" }
-# 测试探针旋钮统一读取面(env reader;lib 零依赖律不破 —— 仅 dev 侧)
-owl-shared = { path = "../shared" }
 # 测试域设备解析(BDF→ordinal;唯一实现 = owl-cuda。dev 循环依赖允许)
 owl-cuda = { path = "../backends/cuda" }
 # 测试样板收编(#[owl_test(gpu)];同步体模式 —— 不建 runtime)
 owl-macros = { path = "../macros" }
 
 [dependencies]
+# **全局日志/计量单一产地**(2026-10-29 用户裁决:对 kernels 开这个口子):
+# kernels 直接用 `owl_shared::log_*!` / `metrics` —— 不再自带 sink 全局槽,
+# C++ 侧 `OWL_LOG_*` 走 shared 提供的同一组 C ABI 符号(同一个全局 logger)。
+owl-shared = { path = "../shared" }
 # **接口层**(2026-10-29 反置):契约词汇(Dtype/Bytes/Arg/LaunchMsg/Arch/Hw/OpEnv)
 # 与 LogSink 值类型住在 owl-iface —— 接口不依赖实现,实现依赖接口。
 owl-iface = { path = "../backends/iface" }

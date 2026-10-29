@@ -811,3 +811,78 @@ mod tests {
         assert!(logger_ready());
     }
 }
+
+// ============================================================================
+// §C ABI（C/C++ 侧唯一入口）—— 2026-10-29 自 `owl-kernels::sink` 迁入
+// ============================================================================
+//
+// 为什么必须住**日志全局的同一个文件**：`cu/**` 里的 `OWL_LOG_*(...)` 由 C++
+// 代码调用，**没有 Rust 栈上下文** ⇒ 只能从这个进程级 logger 取值。搬迁后全仓
+// 只有这一个全局日志槽(`LOGGER`)，Rust 宏与 C ABI 共用同一个判据。
+//
+// 符号名不变(`owl_log_on`/`owl_log_emit`)，`cu/owl_log.h` 无需改动；
+// 由 kernels 正常依赖本 crate ⇒ 任何链接 kernels 的产物都带上这两个符号。
+
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int};
+
+/// C 侧传进来的级别归一（越界 = 按 TRACE 截断；日志面不许 panic）
+fn clamp_c_level(level: u32) -> u8 {
+    if level >= u32::from(LVL_TRACE) {
+        LVL_TRACE
+    } else {
+        level as u8
+    }
+}
+
+/// C 侧准入判定：`1` = 放行（调用方随后才格式化）
+///
+/// # Safety
+/// `tag` 必须是 NUL 结尾的合法 C 字符串（C 侧传字面量）。
+#[no_mangle]
+pub unsafe extern "C" fn owl_log_on(level: u32, tag: *const c_char) -> c_int {
+    if tag.is_null() {
+        return 0;
+    }
+    // SAFETY: 调用契约要求 NUL 结尾；非法 UTF-8 走 lossy（日志面不许 panic）
+    let tag = match CStr::from_ptr(tag).to_str() {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    let on = LOGGER
+        .get()
+        .is_some_and(|g| g.enabled(clamp_c_level(level), tag));
+    i32::from(on)
+}
+
+/// C 侧发射：`msg` 是 `len` 字节的 UTF-8 文本（C 侧已截断到缓冲区内）
+///
+/// # Safety
+/// `tag` 同 [`owl_log_on`]；`msg` 必须指向 `len` 字节可读区间（可为空串）。
+#[no_mangle]
+pub unsafe extern "C" fn owl_log_emit(
+    level: u32,
+    tag: *const c_char,
+    msg: *const c_char,
+    len: usize,
+) {
+    if tag.is_null() || (msg.is_null() && len != 0) {
+        return;
+    }
+    // SAFETY: 调用契约要求 tag 为 NUL 结尾 C 字符串
+    let tag = match CStr::from_ptr(tag).to_str() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let body: &str = if len == 0 {
+        ""
+    } else {
+        // SAFETY: 调用方保证 msg 指向 len 字节可读区间
+        let bytes = std::slice::from_raw_parts(msg as *const u8, len);
+        // 非法 UTF-8 不许丢行（丢行 = 静默失败）：占位替代
+        std::str::from_utf8(bytes).unwrap_or("<非 UTF-8 日志体,已丢弃内容>")
+    };
+    if let Some(g) = LOGGER.get() {
+        g.emit(clamp_c_level(level), tag, body);
+    }
+}

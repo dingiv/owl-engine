@@ -55,50 +55,7 @@ pub fn family_factories() -> Vec<FamilyFactory> {
     ]
 }
 
-/// **服务端面诊断旋钮**(进程级快照;后端 boot 期一次下发 —— 本 crate 零 env)。
-///
-/// 2026-10-21 收编:原 `OWL_GDN_DIAG/TOUCH/ZERO_SCRATCH/FRESH_SCRATCH`、
-/// `FI_DEBUG`、`OWL_L3_AUDIT` 六类 env 全部退场 —— 唯一写点 = 后端
-/// (`owl_cuda::GpuServer::with_diag_sink`)经本结构显式下发。
-/// 2026-10-27:这六类**采集旗标本身**也已退役(对应调查全部结案)——
-/// 本结构只剩 `sink`(输出口)。
-///
-/// `sink` = **输出口**(`klog_*!` 与 C++ `OWL_LOG_*` 共用):它承载运行期
-/// 可见性(level + tag 白黑名单),故 `fi_debug` 这类"纯打印开关"不再需要
-/// 配置面旗标(2026-10-21 裁决:**bool 管采集,日志管可见性**)。
-#[derive(Clone, Default)]
-pub struct DiagTune {
-    /// 下层输出口(未接线 = 全部静默;接线后受 logger 分级/tag 过滤)
-    pub sink: crate::sink::Sink,
-}
+// 2026-10-29:`DiagTune` / `DiagError` / `configure_diag` 整体退役 ——
+// kernels 直接用 `owl_shared` 的全局日志(用户裁决:对 kernels 开 shared 的口子),
+// 不再需要 boot 期下发 LogSink;C++ 侧 `OWL_LOG_*` 走 shared 提供的同一组 C ABI。
 
-impl std::fmt::Debug for DiagTune {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // LogSink = fn 指针包,Debug 无信息量;只标接线与否
-        f.debug_struct("DiagTune")
-            .field("sink", &if self.sink.is_none() { "none" } else { "wired" })
-            .finish()
-    }
-}
-
-/// 诊断下发失败(boot 后冻结:二次不同值 = 拒,不静默覆盖)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiagError {
-    /// 输出口已配置(sink 值不同)
-    Sink(crate::sink::SinkError),
-}
-
-impl std::fmt::Display for DiagError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Sink(e) => write!(f, "{e}"),
-        }
-    }
-}
-impl std::error::Error for DiagError {}
-
-/// 唯一诊断写入点(boot 期一次;重入不同值 = [`DiagError`],不再静默覆盖)
-pub fn configure_diag(t: &DiagTune) -> Result<(), DiagError> {
-    // 输出口先接:后面两句自己的告警才能落地
-    crate::sink::configure(t.sink).map_err(DiagError::Sink)
-}

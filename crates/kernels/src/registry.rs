@@ -109,7 +109,7 @@ static UNCLOSED_DROPS: AtomicU64 = AtomicU64::new(0);
 /// best-effort 兜底:记一次"未经 close 即 drop"并打 warning(不静默)。
 pub fn note_unclosed_drop(id: &str) {
     let n = UNCLOSED_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
-    crate::klog_warn!("kernels", "族 {id} 未经 close() 即被 drop(累计未收尾 {n})");
+    owl_shared::log_warn!("kernels", "族 {id} 未经 close() 即被 drop(累计未收尾 {n})");
 }
 
 /// 未收尾 drop 计数快照(测试/运维用)。
@@ -236,6 +236,71 @@ pub struct OpRegistry {
     tag_index: crate::tag_index::KernelTagIndex,
 }
 
+/// **装配报告**（2026-10-29：职责收口 —— kernels 不再"顺手打印"装配结论）。
+///
+/// 为什么搬成返回值：装配结论（声明张数 / 编出符号 / 未声明清单 / tag 统计 /
+/// 激活集 / 自检通过数）是**上层的展示决策**，不是 kernels 的业务日志。
+/// kernels 只负责**产出结构化事实**；谁打、打几行、什么级别，由调用方
+/// （`owl-cuda` 的 server boot）决定 —— 它才有 `--log-level` 的上下文。
+#[derive(Debug, Default, Clone)]
+pub struct AssembleReport {
+    /// 没有已建表算子的族 id（只能靠主名路由）
+    pub families_without_ops: Vec<&'static str>,
+    /// 声明面张数（原生表 + 家族臂）
+    pub declared_ops: usize,
+    /// 家族路由名数
+    pub family_routed: usize,
+    /// 构建期编出的核符号数
+    pub asset_symbols: usize,
+    /// R1 判据：编出但未声明的片符号（`(名字, 源)`）
+    pub undeclared: Vec<(&'static str, &'static str)>,
+    /// 白名单激活集大小（`None` = 未给白名单）
+    pub active_ops: Option<usize>,
+    /// tag 词表项数
+    pub tag_entries: usize,
+    /// 已打 tag 的算子数
+    pub tagged_ops: usize,
+    /// 装配期自检通过数
+    pub selfchecks: usize,
+}
+
+impl AssembleReport {
+    /// 一行汇总（**纯函数，不打印** —— 由调用方决定级别/tag）。
+    pub fn summary(&self) -> String {
+        let active = match self.active_ops {
+            Some(n) => n.to_string(),
+            None => "—".to_string(),
+        };
+        format!(
+            "装配:声明 {} 张(家族臂 {})/ 编出符号 {}(未声明 {})· tag {} 项(打标 {})· 激活集 {} · 自检通过 {}",
+            self.declared_ops,
+            self.family_routed,
+            self.asset_symbols,
+            self.undeclared.len(),
+            self.tag_entries,
+            self.tagged_ops,
+            active,
+            self.selfchecks,
+        )
+    }
+
+    /// 需要**可见告警**的异常项（由调用方决定打 warn 还是收进报告）。
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for id in &self.families_without_ops {
+            out.push(format!("族 {id} 无已建表算子(只能靠主名路由;声明面零约束)"));
+        }
+        if !self.undeclared.is_empty() {
+            out.push(format!(
+                "R1 编出但未声明的核符号 {} 条:{:?}",
+                self.undeclared.len(),
+                self.undeclared
+            ));
+        }
+        out
+    }
+}
+
 impl OpRegistry {
     /// boot 一步:全家族装配(构造函数即装配门;失败 = Err 拒启)。
     pub fn boot(
@@ -255,8 +320,34 @@ impl OpRegistry {
         // 装配(族构造即门 + 白名单 + 池审计)→ **然后**跑自检:
         // foreign 算子的 oracle 要经注册表发射(dispatch),所以自检必须在
         // 注册表建成之后(2026-10-13 P5c 的调用点搬迁)。
-        let mut reg = Self::init_all_with(crate::server::family_factories(), res, exec, allowed)?;
-        reg.run_selfchecks(res, exec, allowed)?;
+        let mut rep = AssembleReport::default();
+        let mut reg = Self::init_all_inner(
+            crate::server::family_factories(),
+            res,
+            exec,
+            allowed,
+            &mut rep,
+        )?;
+        reg.run_selfchecks(res, exec, allowed, &mut rep)?;
+        Ok(reg)
+    }
+
+    /// **生产档 boot + 装配报告**(2026-10-29):kernels 只**产出**报告,
+    /// 打印由调用方(backend server)决定 —— 它才有 level/tag 的上下文。
+    pub fn boot_with_reporting(
+        res: &mut dyn crate::device::DeviceRes,
+        exec: &mut crate::device::Exec,
+        allowed: Option<&[&str]>,
+        report: &mut AssembleReport,
+    ) -> Result<Self, OpError> {
+        let mut reg = Self::init_all_inner(
+            crate::server::family_factories(),
+            res,
+            exec,
+            allowed,
+            report,
+        )?;
+        reg.run_selfchecks(res, exec, allowed, report)?;
         Ok(reg)
     }
 
@@ -271,6 +362,7 @@ impl OpRegistry {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
         allowed: Option<&[&str]>,
+        report: &mut AssembleReport,
     ) -> Result<(), OpError> {
         let Some(a) = allowed else { return Ok(()) };
         let active: Vec<&'static crate::spec::KernelMeta> = self
@@ -280,8 +372,9 @@ impl OpRegistry {
             .filter(|m| a.contains(&m.entry))
             .collect();
         let n = crate::server::selfcheck::run_selfchecks(active.into_iter(), res, exec, self)?;
+        report.selfchecks = n;
         if n > 0 {
-            crate::klog_info!("kernels", "装配期自检:{n} 个算子通过(oracle 独立参考)");
+            owl_shared::log_info!("kernels", "装配期自检:{n} 个算子通过(oracle 独立参考)");
         }
         Ok(())
     }
@@ -293,7 +386,7 @@ impl OpRegistry {
         exec: &mut crate::device::Exec,
         allowed: Option<&[&str]>,
     ) -> Result<Self, OpError> {
-        Self::init_all_inner(factories, res, exec, allowed)
+        Self::init_all_inner(factories, res, exec, allowed, &mut AssembleReport::default())
     }
 
     pub fn init_all(
@@ -301,7 +394,7 @@ impl OpRegistry {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
     ) -> Result<Self, OpError> {
-        Self::init_all_inner(factories, res, exec, None)
+        Self::init_all_inner(factories, res, exec, None, &mut AssembleReport::default())
     }
 
     fn init_all_inner(
@@ -309,6 +402,7 @@ impl OpRegistry {
         res: &mut dyn crate::device::DeviceRes,
         exec: &mut crate::device::Exec,
         allowed: Option<&[&str]>,
+        report: &mut AssembleReport,
     ) -> Result<Self, OpError> {
         let mut names = HashSet::new();
         let mut route: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
@@ -420,11 +514,7 @@ impl OpRegistry {
             }
             // C) 空 ops() = 只能靠主名路由(未建表);不报错但必须可见
             if f.ops().is_empty() {
-                crate::klog_info!(
-                    "kernels",
-                    "族 {} 无已建表算子(只能靠主名路由;声明面零约束)",
-                    id.0
-                );
+                report.families_without_ops.push(id.0);
             }
         }
         // F 轮(2026-10-13):登记表退役 ⇒ 唯一真源 = 声明面。boot 报告改为
@@ -433,22 +523,10 @@ impl OpRegistry {
         let n_declared = crate::ops::declared_count();
         let n_family = names.len();
         let undeclared = crate::ops::undeclared_symbols();
-        crate::klog_info!(
-            "kernels",
-            "算子准入:已声明 {} 张(原生表 + 家族臂 {})/ 编出符号 {} 条(未声明 {})",
-            n_declared,
-            n_family,
-            crate::cu_sig::ASSET_SYMBOLS.iter().map(|(_, s)| s.len()).sum::<usize>(),
-            undeclared.len()
-        );
-        if !undeclared.is_empty() {
-            // R1(F 轮换源:编出的符号 ⊆ 声明集)—— 未声明清单要可数、可见
-            crate::klog_warn!(
-                "kernels",
-                "R1 编出但未声明的核符号 {} 条:{undeclared:?}",
-                undeclared.len()
-            );
-        }
+        report.declared_ops = n_declared;
+        report.family_routed = n_family;
+        report.asset_symbols = crate::cu_sig::ASSET_SYMBOLS.iter().map(|(_, s)| s.len()).sum::<usize>();
+        report.undeclared = undeclared;
         // 装配期自检(设计 §5.5:独立 oracle,失败 = 拒启)。
         // 白名单在场 ⇒ 只跑生效算子(装配期成本按档位裁);否则跑全部已建表。
         // ── 白名单硬门(装配期三件事)──────────────────────────────
@@ -464,7 +542,7 @@ impl OpRegistry {
                 }
             }
             crate::ops::audit_active(Some(a))?;
-            crate::klog_info!("kernels", "tag 派生激活集:{} 项(池写集审计通过)", a.len());
+            report.active_ops = Some(a.len());
         }
 
         // **tag 索引**(同一份声明面;未打 tag/未知 tag ⇒ 拒启,不静默)。
@@ -482,13 +560,8 @@ impl OpRegistry {
             }
         };
         let tagged = tag_index.all().iter().filter(|m| !m.tags.is_empty()).count();
-        crate::klog_info!(
-            "kernels",
-            "tag 索引:{} 项词表 / {} 算子(已打 {})",
-            crate::spec::KERNEL_TAG_COUNT,
-            tag_index.all().len(),
-            tagged
-        );
+        report.tag_entries = crate::spec::KERNEL_TAG_COUNT;
+        report.tagged_ops = tagged;
         Ok(Self { families, names, route, metas, tag_index })
     }
 
@@ -519,7 +592,7 @@ impl OpRegistry {
         let mut first: Option<OpError> = None;
         for f in families {
             if let Err(e) = f.close() {
-                crate::klog_warn!("kernels", "族 close() 失败: {e}");
+                owl_shared::log_warn!("kernels", "族 close() 失败: {e}");
                 if first.is_none() {
                     first = Some(e);
                 }
