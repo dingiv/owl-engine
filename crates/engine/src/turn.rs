@@ -153,6 +153,8 @@ pub struct TurnStats {
     pub spec_rounds: u64,
     pub spec_accepted: u64,
     pub spec_emitted: u64,
+    /// 本 turn 走**降级裸 decode** 的步数(诊断;>0 = 前端速度会掉档)
+    pub spec_degraded_steps: u64,
 }
 
 impl TurnStats {
@@ -318,8 +320,11 @@ pub(crate) struct TurnSpecState {
     pub(crate) spec_rounds: u64,
     pub(crate) spec_accepted: u64,
     pub(crate) spec_emitted: u64,
-    /// B4:降级以来 decode 步数(探测周期判定)
+    /// B4:降级以来 decode 步数(探测周期判定;**探测时清零**)
     pub(crate) spec_steps_degraded: usize,
+    /// B4:本 turn **累计**降级步数(turn 诊断账;不清零 —— 用来回答
+    /// "这一轮到底有几成 token 走了裸 decode")。
+    pub(crate) spec_degraded_steps: u64,
     /// B4:当前探测周期(失败 ×2 退避,上限 512)
     pub(crate) spec_probe_every: usize,
     /// B4 滚动 AL 窗口(2026-10-12):轮数 / 产出 token 数 —— 连击 streak

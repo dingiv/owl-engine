@@ -89,11 +89,20 @@
 #    但 `verify_arm` **必须**是 `fi`:v2 分页核在 8 行 verify 形状下 51.5 ms/轮,
 #    FI 只要 24.9 ms ⇒ decode 45 → 83 t/s(2026-10-27 `a9da5d20` 接通视图链)。
 #
-# 3. `[spec].degrade_after` 缺省 6 在本档**禁用**(= 0)。
-#    原因:降级期走裸 decode ⇒ **不写草稿模型的 KV** ⇒ 草稿流断掉 ⇒ 之后
-#    任何探测都是"无上下文草稿" ⇒ 永远 m=0 ⇒ **降级是单向门**。
-#    实测同一请求:开门 43.9 t/s(346/400 token 走裸 decode)/ 关门 83.0 t/s。
-#    代价:随机词/乱码域(AL 天然低)会亏 ~0.1 ms/token —— agent 真实文本不吃这个。
+# 3. `[spec].degrade_after` **必须开**(= 6)。⚠️ 2026-10-28 更正旧结论:
+#    旧注释说"降级期不写草稿 KV ⇒ 单向门"曾把这里设 0 —— **该前提已过期**:
+#    降级臂现在逐 token 走 `prefill_dflash_encode(taps, pos)` 同步草稿 KV
+#    (decode 图带 `tap0..4`,≈0.5 ms/tok = 2%),草稿上下文不断 ⇒ 探测真有机会命中。
+#    同期 `DEGRADE_PROBE_MAX` 已由 512 下修到 **64**(512 时 400-token 请求一次
+#    探测都撞不到 = 真单向门)。
+#
+#    为什么**关掉比开着更糟**(现场:前端 decode 速度突然掉一半、直到下一轮才恢复):
+#    AL 掉到 ~1 时,m=0 的投机轮 ≈ 37 ms/token(verify 8 行 + propose 全付),
+#    **比裸 decode(25-28 ms/token)还慢**;而 `degrade_after = 0` ⇒ 不降级、
+#    也不探测 ⇒ 一路 27-40 t/s 直到 turn 结束(TurnSpecState 是 turn 域状态,
+#    下一轮重建才"恢复")。开门后:窗口 AL < 盈亏线才降级 → 裸 decode →
+#    最坏每 64 token 试一轮投机 → 命中即回 spec。
+#    代价(该域真差时)= 每 64 token 多付一轮投机 ≈ **0.1 ms/token**。
 # extends 路径**相对本文件**(在 `measurement/` 子目录 ⇒ 全部 `../`)。
 # 为什么放在 `measurement/` 而不是顶层:`profiles/` 顶层的"入口档面"被
 # `profiles.rs::入口档面只允许三个常驻档` 钉死(2026-10-24 用户裁决:
@@ -236,5 +245,5 @@ fi_cuda_graph = true
 
 [spec]
 depth = 7
-# 🔴 见档头第 3 条:降级是单向门。
-degrade_after = 0
+# 见档头第 3 条:开启降级 + 64-token 愈合探测(m=0 时裸 decode 更快;探测命中即回 spec)
+degrade_after = 6

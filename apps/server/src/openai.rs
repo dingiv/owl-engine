@@ -28,7 +28,7 @@ use crate::actor::{EngineReq, SinkEvent};
 use crate::agent_trace::{AgentTrace, OutcomeFacts, ReqFacts, TurnLedger, UsageFacts};
 use crate::chat_tpl::{ChatTpl, RenderArgs};
 use crate::http;
-use crate::toolcall::{Chan, ChannelSplitter, Item, ToolSchemas};
+use crate::toolcall::{raw_for_log, Chan, ChannelSplitter, Item, ToolSchemas};
 
 // ============================================================================
 // §1 协议数据与校验
@@ -1114,7 +1114,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                 };
                 owl_shared::log_info!(
                     "chat",
-                    "turn {:?} 指标: ttft={}ms; prefill={}ms/{}tok={:.1}t/s; decode={}ms/{}tok={:.1}t/s; cache={}/{} ({:.1}%); spec rounds={} accepted={} al={:.2}",
+                    "turn {:?} 指标: ttft={}ms; prefill={}ms/{}tok={:.1}t/s; decode={}ms/{}tok={:.1}t/s; cache={}/{} ({:.1}%); spec rounds={} accepted={} al={:.2} deg={}/{}",
                     turn.map(|(_, t)| t),
                     ttft_ms,
                     stats.prefill_ms,
@@ -1129,6 +1129,8 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                     stats.spec_rounds,
                     stats.spec_accepted,
                     stats.spec_al(),
+                    stats.spec_degraded_steps,
+                    stats.decode_tokens,
                 );
                 // G5②:结算诊断环(结构轨迹 + usage + 结局;与 wire 同一份账)
                 led.set_events(splitter.structural_trace());
@@ -1476,7 +1478,7 @@ async fn emit_items<W: tokio::io::AsyncWrite + Unpin>(
                     "chat",
                     "工具块畸形({kind};{}B) ⇒ 拒绝正常返回:{}",
                     raw.len(),
-                    preview(&raw)
+                    raw_for_log(&raw)
                 );
             }
         }

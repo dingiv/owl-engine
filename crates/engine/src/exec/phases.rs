@@ -1340,7 +1340,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             mrec("decode.sync", t_syn.elapsed());
             if degraded {
-                self.tspec()?.spec_steps_degraded += 1;
+                let t = self.tspec()?;
+                t.spec_steps_degraded += 1;
+                t.spec_degraded_steps += 1;
             }
             // 滚动裸步成本 ewma(动态盈亏线分母;α=0.15)
             {

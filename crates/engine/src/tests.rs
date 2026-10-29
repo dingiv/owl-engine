@@ -5145,6 +5145,65 @@ fn spec_degrade_transition_branches() {
     assert_eq!((s, d, p), (10, false, 64));
 }
 
+/// **降级不是单向门：turn 内必须能自愈**（2026-10-28 现场：前端 decode 速度
+/// 突然掉一半、直到下一轮才恢复）。
+///
+/// 为什么需要这条门：`degrade_after = 0`（旧档面）把降级与探测一起关掉时，
+/// m=0 的投机轮（37 ms/token）**比裸 decode（25-28 ms/token）还慢**，而
+/// `TurnSpecState` 是 turn 域状态 ⇒ 一路掉档到 turn 结束。修复 = 打开降级 +
+/// 封顶 64 的探测（`DEGRADE_PROBE_MAX`）。这里用纯转移函数模拟一整轮：
+/// 断言 (a) 降级后**一次 turn 内**确实探测到并恢复；(b) 退避封顶 64；(c) 域
+/// 一直差时探测仍周期性发生（不是"退避到永不探测"）。
+#[test]
+fn degraded_turn_heals_within_the_same_turn() {
+    use crate::exec::spec_degrade_transition;
+    const FLOOR: usize = 8; // [spec].probe_every 缺省
+
+    // ① 域会回到可投机：探测轮 m=1 ⇒ 必须在本 turn 内恢复
+    let (mut streak, mut degraded, mut probe, mut steps) = (0usize, false, FLOOR, 0usize);
+    let mut healed_at = None;
+    let mut max_probe = 0usize;
+    for step in 0..400usize {
+        let is_probe = degraded && steps >= probe;
+        if is_probe {
+            steps = 0;
+        }
+        let m = usize::from(is_probe); // 探测轮命中
+        let (s, d, p) = spec_degrade_transition(streak, degraded, probe, m, 6, FLOOR);
+        (streak, degraded, probe) = (s, d, p);
+        max_probe = max_probe.max(probe);
+        if degraded {
+            steps += 1;
+        } else if step > 0 {
+            healed_at = Some(step);
+            break;
+        }
+    }
+    assert!(!degraded, "turn 内必须自愈（旧行为是单向门）");
+    assert!(max_probe <= 64, "退避必须封顶 64，实际 {max_probe}");
+    assert!(healed_at.expect("必须愈合") < 200, "愈合太慢：{healed_at:?} 步");
+
+    // ② 域一直差（探测轮也 m=0）：退避停在 64，但探测必须**周期性**发生
+    let (mut streak, mut degraded, mut probe, mut steps) = (0usize, false, FLOOR, 0usize);
+    let (mut probes, mut max_probe) = (0usize, 0usize);
+    for _ in 0..400usize {
+        let is_probe = degraded && steps >= probe;
+        if is_probe {
+            steps = 0;
+            probes += 1;
+        }
+        let (s, d, p) = spec_degrade_transition(streak, degraded, probe, 0, 6, FLOOR);
+        (streak, degraded, probe) = (s, d, p);
+        max_probe = max_probe.max(probe);
+        if degraded {
+            steps += 1;
+        }
+    }
+    assert!(degraded, "真差域必须留在裸 decode（不许振荡回亏本 spec）");
+    assert_eq!(max_probe, 64, "封顶 64");
+    assert!(probes >= 3, "400 步内至少探测 3 次（每 ≤64 步一次），实际 {probes}");
+}
+
 // ============================================================================
 // A7 收口(2026-10-19):准入地板 = 页口径
 // ============================================================================

@@ -193,6 +193,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             spec_rounds: act.spec.spec_rounds,
             spec_accepted: act.spec.spec_accepted,
             spec_emitted: act.spec.spec_emitted,
+            spec_degraded_steps: act.spec.spec_degraded_steps,
         };
         // B4 分母保鲜回写(下一 turn 种入;见 RunningEngine::bare_cost_carry_ms)
         self.dev.spec_rt.carry_ms = act.spec.bare_cost_ewma_ms;
