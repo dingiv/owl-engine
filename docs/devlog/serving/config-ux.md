@@ -398,7 +398,7 @@ server --migrate-config old.toml --to profile > new.toml
 | `apps/server/src/main.rs` | 启动摘要（一行版） |
 | `profiles/awq27b-3090-max.toml` | 新增（≤25 行） |
 | `testdata/args/base.toml` | 改为 `[site]` 模板（仍本地） |
-| `tools/serve-w4a16-3090.sh` | 删掉临时 `extends`，改用 `--profile --site --set` |
+| `tools/fixture/serve-w4a16-3090.sh` | 删掉临时 `extends`，改用 `--profile --site --set` |
 | `config.md` | 重写为"意图 → 派生 → 预检" |
 
 ---
@@ -454,7 +454,7 @@ server --migrate-config old.toml --to profile > new.toml
 | `apps/server/src/config.rs` | CLI 新增 `--profile/--site/--check/--print-config/--format/--explain/--set/--list-profiles/--help`;`--check` 走 `load_resolved`(不选卡);CLI 日志/性能/调试门改为同一配置层 |
 | `apps/server/src/main.rs` | 预检分支在选卡/装权重之前;旧 flavor 路径不变 |
 | `profiles/awq27b-3090-max.toml` | 新增;25 行(含注释),无 `allowed_ops` |
-| `tools/serve-w4a16-3090.sh` | 删临时 TOML/`extends`;改 `--profile --site --set`;加 `CHECK=1` |
+| `tools/fixture/serve-w4a16-3090.sh` | 删临时 TOML/`extends`;改 `--profile --site --set`;加 `CHECK=1` |
 | `apps/server/tests/config_check.rs` | 新增 6 项黑盒门(check/print/explain/set/legacy/缺站点档拒) |
 
 ### 14.2 与设计稿的偏差(实测校准)

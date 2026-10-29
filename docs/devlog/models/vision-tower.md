@@ -35,7 +35,7 @@
    **纯 `MatmulNt` + bias**(权重 `[1152,3,2,16,16]` 直接按 `[1152, 1536]` 行主序直读,零重排)。
 4. **对拍口径三层(已实测,§8)**:① 表(interp 索引逐元素相等 / 权重 1e-7 / rope cos·sin 1e-6)
    ② 逐层 27 block(**尺度感知 allclose**:`|Δ| ≤ 2e-3·max(1,rms) + 1e-4·|want|`;实测最坏归一化误差 0.40)
-   ③ merged `[n/4, 4096]`(实测归一化误差 1.1e-2)。金标由 `tools/vision_golden.py` 生成
+   ③ merged `[n/4, 4096]`(实测归一化误差 1.1e-2)。金标由 `tools/fixture/vision_golden.py` 生成
    (真权重 + 固定种子合成 `pixel_values`,两档网格),Rust 侧同权重同输入复算。
 5. **风险不在塔内,在文本侧**(M4):image token 替换 + **mrope(3D,section [11,11,10],interleaved)**;
    以及 3080 单卡装 Holo-9B **BF16 18.8G ⇒ KV 池只剩 ~1G**(约 39k token)的容量问题(§6 R4)。
@@ -162,9 +162,9 @@ owl_models::layers::vision::VisionTower::forward(pixel_values, grid_thw)      //
 
 ## 4. CPU 对拍方案(首刀主交付)
 
-### 4.1 金标生成器 `tools/vision_golden.py`(入库;recipe 必须可复现)
+### 4.1 金标生成器 `tools/fixture/vision_golden.py`(入库;recipe 必须可复现)
 
-照 `tools/dflash2_golden.py` 先例(权重直读检查点,金标落 safetensors):
+照 `tools/fixture/dflash2_golden.py` 先例(权重直读检查点,金标落 safetensors):
 
 ```
 输入:CKPT=/…/Holo-3.1-9B(只读 model.visual.*)
@@ -282,7 +282,7 @@ OWL_TEST_DEVICE=2 cargo test -p owl-models --lib    # GPU 门测试要指定空�
 
 | 面 | 文件 |
 |---|---|
-| 金标生成器(入库) | `tools/vision_golden.py`(+ `testdata/vision_golden{,2}.safetensors`,gitignored) |
+| 金标生成器(入库) | `tools/fixture/vision_golden.py`(+ `testdata/vision_golden{,2}.safetensors`,gitignored) |
 | CUDA 核 | `cu/vis/layernorm.cu`(3 dtype)· `cu/vis/vision_ops.cu`(Gelu×6 / BiasAdd×3 / PosEmbed×2 / AttnFull×2) |
 | 声明 | `crates/kernels/src/ops/vis.rs`(16 张表)+ `ops/mod.rs` |
 | 拾取 | `crates/kernels/src/driver.rs`(`pub mod vis` 6 个 picker + 6 条分派臂) |
@@ -413,7 +413,7 @@ OWL_TEST_DEVICE=2 cargo test -p owl-models --lib    # GPU 门测试要指定空�
 | ① 表(真网格) | `assets/*.png` 经 **HF `Qwen3VLProcessor`** 真预处理(缩放/patchify/**2×2 块序**)⇒ 网格 (1,16,16)/(1,34,22)/(1,34,24)/(1,42,28) | interp 索引**逐元素相等**、权重 max\|Δ\|=**0**、rope cos/sin 6e-8 ⇒ **R2(patch 序)结案** |
 | ② 早期层(真图) | HF 钩子捕 `patch_embed/pos_embed/h0/norm1/qkv/attn(proj 后)` | h0 1.0e-5 · norm1 2.0e-5 · qkv 7.2e-6 · **attn(proj 后) 4.1e-6**(f32) |
 | ③ 逐层(真图,24 层) | f32 档逐 block 对 HF-f32 | max\|Δ\| ≤ 3.7e-3(rms 40 ⇒ **1e-4 相对**),**24/24 层 0 元素超阈** |
-| ④ **端到端识别** | 把**我们塔**的 `merged` 注入 HF 文本模型(`visual.forward` monkey-patch)生成答案(`tools/vision_inject_check.py`) | **4/4 与 HF 答案一致**(见 11.2) |
+| ④ **端到端识别** | 把**我们塔**的 `merged` 注入 HF 文本模型(`visual.forward` monkey-patch)生成答案(`tools/fixture/vision_inject_check.py`) | **4/4 与 HF 答案一致**(见 11.2) |
 
 ### 11.2 识别结果(文件名是障眼法,答案是对的)
 
@@ -527,7 +527,7 @@ CPU 面 + `reference.rs` 独立副本)。判据:`op_tables` **10/10**(含新核�
    `model.visual.*`)整装 —— 需要 GPU 与显存账(塔 0.8G + 文本 8.5G f16 ≈ 9.3G,
    单 3080 20G 可装);
 2. **e2e 贪心对拍**:真图 → 塔 → 文本 → 自己出答案,与 HF 逐 token 一致
-   (预处理沿用 `tools/vision_image_check.py` 的 `Qwen3VLProcessor`)。
+   (预处理沿用 `tools/fixture/vision_image_check.py` 的 `Qwen3VLProcessor`)。
 
 **已知拦路(pre-existing,与本分支无关)**:本 worktree 的 26 条 GPU/rank 红
 (`owl_narrow_strided_f32` / `owl_rope_half_partial_f32` 的 **rank 声明拒**:
@@ -549,7 +549,7 @@ F16 生产臂。**未动**(属主树 A20 战役)。
 ⚠️ **踩坑(写死)**:文本侧键约定**必须** `Qwen35Convention`,用 `LlamaFamily` 会在
 `layers.N.mlp.gate_proj.weight` 上"数据源缺键"炸(mlp/linear_attn/self_attn 三处子前缀)。
 
-### 13.2 端到端识图(金标 `tools/vlm_e2e_golden.py`;assets 四图)
+### 13.2 端到端识图(金标 `tools/fixture/vlm_e2e_golden.py`;assets 四图)
 
 金标 = 真 processor(`Qwen3VLProcessor`,`enable_thinking=False`)+ HF 4B(bf16 CPU)
 贪心 16 token + **真模型** `get_rope_index` 位置号 + 末位 logits top-10。

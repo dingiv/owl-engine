@@ -17,7 +17,7 @@
 # 纪律:起服前查端口,退出时只 kill 自己记录的 PID;不用 pkill -f。
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 PORT="${OWL_WORKLOAD_PORT:-8135}"

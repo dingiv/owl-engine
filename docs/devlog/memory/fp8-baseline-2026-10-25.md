@@ -161,8 +161,8 @@
    当前 768 截断率 40%，结果不可用。
 3. **spec-on 速度**：等 DFlash2 tail-cap P0 修复后再跑 std；当前生产
    spec-on 已恢复，但不在本基线内。
-4. **后续 KVarN/T8V4**：用同一套 `tools/quality_eval.py` +
-   `tools/needle_eval.py` + std 口径；质量门先看 GSM8K 不劣化 >1–2 点、
+4. **后续 KVarN/T8V4**：用同一套 `tools/fixture/quality_eval.py` +
+   `tools/fixture/needle_eval.py` + std 口径；质量门先看 GSM8K 不劣化 >1–2 点、
    needle 命中不降、PPL/KLD 不超预算，再谈容量收益。
 
 ## 8. 复现命令
@@ -173,13 +173,13 @@
   --set spec.depth=0 --set spec.lookup=false --log-level info
 
 # GSM8K 200
-python3 tools/quality_eval.py --task gsm8k --n 200 \
+python3 tools/fixture/quality_eval.py --task gsm8k --n 200 \
   --data /home/div/Documents/codes/repos/vllm-ampere-optimized/benchmarks/gsm8k.jsonl \
   --base http://127.0.0.1:8134 --tag 3090-fp8-specoff-gsm8k-off \
   --out perf-runs/quality-fp8/3090-fp8-specoff-gsm8k-off-n200.json
 
 # needle 64k
-python3 tools/needle_eval.py --base http://127.0.0.1:8134 \
+python3 tools/fixture/needle_eval.py --base http://127.0.0.1:8134 \
   --tokens 64000 --depth 0.5 --tag 3090-fp8-needle-64000 \
   --out perf-runs/quality-fp8/3090-fp8-needle-64000.json
 

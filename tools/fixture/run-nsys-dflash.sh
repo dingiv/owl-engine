@@ -7,7 +7,7 @@
 #
 # 用法: tools/run-nsys-dflash.sh <out_dir> [lengths] [outlen]
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${1:?out_dir}"
 LENGTHS="${2:-512,2048,16384,65536}"
 OUTLEN="${3:-64}"

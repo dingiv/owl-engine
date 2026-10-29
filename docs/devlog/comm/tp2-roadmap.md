@@ -22,10 +22,10 @@ decode 已落刀:③④ 小核治理(−1.41ms/步,已验)
 
 | 面 | 命令 | 口径 |
 |---|---|---|
-| **排名词**(端到端) | `PORT=8141 TP1_CFG=/tmp/diag/tp1-8141.toml TP2_CFG=/tmp/diag/tp2-8141.toml OUT_DIR=/tmp/owl-ab-<tag> tools/tp-ab-std.sh ab` | std 五点三轮;两臂**同二进制/同卡对(ord 2/3)/同会话**;唯一差别 = rank 数 |
-| **单步核账**(图内真设备时) | `tools/nsys-decode-account.sh <tag> <flavor> <cfg>` → `python3 tools/nsys_decode_account.py <tag> [<tag2>]` | nsys `--cuda-graph-trace=node`;>200µs 切段 ⇒ 段 = 一步;取段内中位 |
+| **排名词**(端到端) | `PORT=8141 TP1_CFG=/tmp/diag/tp1-8141.toml TP2_CFG=/tmp/diag/tp2-8141.toml OUT_DIR=/tmp/owl-ab-<tag> tools/fixture/tp-ab-std.sh ab` | std 五点三轮;两臂**同二进制/同卡对(ord 2/3)/同会话**;唯一差别 = rank 数 |
+| **单步核账**(图内真设备时) | `tools/fixture/nsys-decode-account.sh <tag> <flavor> <cfg>` → `python3 tools/fixture/nsys_decode_account.py <tag> [<tag2>]` | nsys `--cuda-graph-trace=node`;>200µs 切段 ⇒ 段 = 一步;取段内中位 |
 | **单核微基准** | `OWL_TEST_DEVICE=2 cargo test -p owl-kernels --features device --test ln_elems_bench -- --nocapture --test-threads=1` | 数值对拍 + µs(M=1/M=32 双档分辨 host/设备受限) |
-| (映射路径) | `nvcc -O3 -arch=sm_86 -o /tmp/vmm-tax tools/vmm-mapping-tax-probe.cu -lcuda && /tmp/vmm-tax 2 3` | API 一次性 + 访问税阶梯(读/写 × RT/VMM × READ/RW) |
+| (映射路径) | `nvcc -O3 -arch=sm_86 -o /tmp/vmm-tax tools/fixture/vmm-mapping-tax-probe.cu -lcuda && /tmp/vmm-tax 2 3` | API 一次性 + 访问税阶梯(读/写 × RT/VMM × READ/RW) |
 
 ### 1.1 开工检查单(每条都有血的代价)
 
@@ -70,7 +70,7 @@ decode 已落刀:③④ 小核治理(−1.41ms/步,已验)
 | 刀 | 做什么 | 判据/量法 | 预期 |
 |---|---|---|---|
 | **P0.0** | **RankDev × 主线骶架对账(TP 上主干的前置)**—— 见下方专节 | 28 文件 / 94 冲突块的干跑已做;验收 = 构建 + 五道门 + 排名词复现 | TP 上主干 |
-| **P0.1** | **prefill 逐核账** ✅ **已完成(2026-10-19)**:新工具 `tools/prefill-account.sh` + `tools/prefill_account.py`(8k prompt + 出 1 token ⇒ eager 段逐核) | 见下表 | ✅ **结论见 P1.4** |
+| **P0.1** | **prefill 逐核账** ✅ **已完成(2026-10-19)**:新工具 `tools/fixture/prefill-account.sh` + `tools/fixture/prefill_account.py`(8k prompt + 出 1 token ⇒ eager 段逐核) | 见下表 | ✅ **结论见 P1.4** |
 | **P0.2** | **W4A8 A/B** ✅ **已完成(2026-10-19 两次独立运行,合并前后各一次,逐点吻合)**:TP2 下 **prefill +45.7%**(1430–1511 → 2017–2203 t/s)、**TTFT@8k −31%**(5502 → 3765 ms)、**decode −12.4%**(44.0–44.9 → 38.3–39.6)| 配置级(`[model] quant = "w4a8"`);数据本地原始数据(未入库)(base/a8 + merge-rerun)| ✅ **比 AR 大得多的 prefill 杠杆**(M2 ≥1620 直接跨过,M3 1750 也已过);⚠️ **decode 退化 12.4% 是 TP2 特有**(单卡实测"decode 不变")⇒ **待排查**(候选:量化核的发起开销/小 m 效率/图外每步量化,见 P0.1 的逐核账) |
 | **P0.3** | **host 尾巴 2.1ms 定谳**:`[probes] step_profile = true` + 在 `phases.rs` 的采样收口段加临时计时(记了要拆)| 每步 `fill+launch` vs 尾巴的分布 | 上限 **decode +10%** |
 
@@ -212,7 +212,7 @@ BAR1 详查 + `test_device_bdf`;注意 git 会把我方函数的闭合括号当*
 **形状校准(硬纪律)**:TP 把 linear-attention 的 **value 头也切半** ⇒ 生产 grid `(16, 24, 1)`
 = 每 rank **nv=24 / nk=8**;按 config.json 的 `nv=48` 建台会对不上 2×。
 
-**归因(核台 `tools/gdn-rec-probe.cu`,1.74 µs/token 的构成)**:两次 32-lane 归约 0.42 ·
+**归因(核台 `tools/fixture/gdn-rec-probe.cu`,1.74 µs/token 的构成)**:两次 32-lane 归约 0.42 ·
 q/k 标量装载 0.45(块内 8× 冗余)· 单 lane 2B 写 out 0.18 · `__syncthreads` 0.24 ·
 纯算术 **0.33(19%)**。
 
@@ -559,7 +559,7 @@ Classic 岛写读者),并**剔掉**本档用不到的 Classic 主池/fp8-Knhd �
 ① 判据先行:这条改动"怎么证明对"(数值判据/门/计数器的**路径存在性**)—— 律㉗/⑱
 ② 单核台子:ln_elems_bench / ar_channel_bench 的 µs(隔离读数)
 ③ 图内读数:nsys 逐核(这一步的核时延真降了吗)
-④ 端到端:tools/tp-ab-std.sh ab(TP1/TP2 两臂,C SV 存档)
+④ 端到端:tools/fixture/tp-ab-std.sh ab(TP1/TP2 两臂,C SV 存档)
 ⑤ 门:tp_g8_gate(L1=0)· tp_determinism_gate · tp_transport_bits_gate · tp_assemble_gate
     · cargo test -p owl-kernels --lib(**全特性**跑法!)· 涉及核:marlin/ln 家族门
 ⑥ 入档:实录卷新 §N(逐轮账 + 教训)· 施工设计 §10 表更新(当前形态)
@@ -634,15 +634,15 @@ Classic 岛写读者),并**剔掉**本档用不到的 Classic 主池/fp8-Knhd �
 
 | # | 当时怎么封的(判据 + **范围**)| 草率点(为什么会借尸还魂)| 翻案条件 | 便宜重测 |
 |---|---|---|---|---|
-| 1 | **CE 换通道**(§32):"三段串行,净负";范围 = **CE + 两个分离核 + 跨流事件**那个形状 | 它否的是"CE 单独当搬运腿";vLLM 的形态是 **CE 搬载荷 + 紧邻一个融合核**(票写对端)—— **那是另一个形状**;§56.2 测到 D 臂 +1.2%(结构面),真值被同步面盖着(§56.5) | ① 上 D 结构(CE + 融合核)② 或 AR 与别的核**并发**(CE 不吃 SM 槽,§56.3) | `tools/ar-struct-probe.cu` 的 D 臂 + 生产图内 `ar_channel_bench` |
-| 2 | **图内跨流藏写腿**(§41):"PCIe 写与本地访存完全串行";范围 = **重本地负载 + PCIe Gen3**(★ **§44 已自行翻过一次**:轻负载**全免费**) | 结论本是**负载相关**的,却被当成了通性;§42.3 自认 **NVLink 下这条未验**(机制是"PCIe 写独占 L2 未完成缓冲"⇒ NVLink 是另一条通路) | ① NVLink 装车 ② 轻本地负载形状 ③ 多会话并发(AR 与别的核交错) | `tools/p2p-overlap-probe.cu` 的 X/Y/V 臂(带负载扫描) |
+| 1 | **CE 换通道**(§32):"三段串行,净负";范围 = **CE + 两个分离核 + 跨流事件**那个形状 | 它否的是"CE 单独当搬运腿";vLLM 的形态是 **CE 搬载荷 + 紧邻一个融合核**(票写对端)—— **那是另一个形状**;§56.2 测到 D 臂 +1.2%(结构面),真值被同步面盖着(§56.5) | ① 上 D 结构(CE + 融合核)② 或 AR 与别的核**并发**(CE 不吃 SM 槽,§56.3) | `tools/fixture/ar-struct-probe.cu` 的 D 臂 + 生产图内 `ar_channel_bench` |
+| 2 | **图内跨流藏写腿**(§41):"PCIe 写与本地访存完全串行";范围 = **重本地负载 + PCIe Gen3**(★ **§44 已自行翻过一次**:轻负载**全免费**) | 结论本是**负载相关**的,却被当成了通性;§42.3 自认 **NVLink 下这条未验**(机制是"PCIe 写独占 L2 未完成缓冲"⇒ NVLink 是另一条通路) | ① NVLink 装车 ② 轻本地负载形状 ③ 多会话并发(AR 与别的核交错) | `tools/fixture/p2p-overlap-probe.cu` 的 X/Y/V 臂(带负载扫描) |
 | 3 | **读腿 97% 重叠不可移植**(§48/§49):"形状特有(长同质链)";范围 = **现役 27B decode 形状** | 形状一变(batch>1 / 投机 verify 轮 k token / 不同层混合)比率就变 —— 而 **P2.1 投机正要改形状** | 投机接线后重量;或按层/按 batch 扫形状 | 同探针换形状参数 |
 | 4 | **TBO/微批**(§49.3/§68.0):"与 N 无关,零重叠 ⇒ 无地基";范围 = **当前引擎串行调度** + **核级链式形状**(2026-10-19 复核:`G→AR→G` 链 N=2/3/4 吞吐比 1.21–1.28×,**串行度 ≈ 1.000**)| 它封的是"**当前引擎**没有交错",不是"TBO 无效";引擎侧交错是**未建的能力**(探针 `OWL_PERF_MODE=concurrent` 就是为它留的) | ① 调度层支持前向交错 ② **投机轮天然多 token = 交错**(P2.1) | `tp_perf_split_probe` 的 concurrent 档 |
 | 5 | **vLLM 的 D 结构照搬**(§57.3):封的是"**载荷由上游 SM 核多线程写** ⇒ 单线程 fence 背不住可见性" | **前提可消除**:载荷改由 **CE** 搬 ⇒ 流序背书可见性 ⇒ vLLM 的做法就成立(**与 #1 合流**) | 同 #1 | 同 #1 |
 | 6 | **1-stage 融合核**(§57.4/§60.2):L1 间歇失败 **+ 从来未触发** | ①竞态**已修**(§60.1,门 5/5 绿);②**但 27B 生产档从未走到该路径**(§60.2 判据错位:标记在窄视图、判据在 Call 臂)⇒ §51 的 −4.7% **既不可靠也不存在** | ①**两核融合**(§10,不需要对称槽)②或修判据错位 | `tp_g8_gate`(L1)+ 生产 nsys 看核名 |
 | 7 | **"decode 换结构 5.8%" → 修正 1.2%**(§56.4/56.5) | 修正的是"**结构面**的净差",不等于"把生产 20.58µs 瘦到 9µs"的收益 —— 后者上限 **11%**(§56.5),必须在**生产上**量 | 融合/瘦核落生产 | 生产图内 nsys(§1 第二把尺) |
 | 8 | **"AR 全串行上限 1.64×"**(§39.4) | 它是**算术模型**:假设 AR 是**整段屏障**;**S5 "pipelined ring" 只设计了没施工**(施工设计 §1 S5 / §8 刀 C6)⇒ 若 AR 按 slab 渐进,上限抬到 ~**1.87×** | 施工 S5(**已列入 §3 P2.4**) | 先在 `ar_channel_bench` 上验"分块 AR 能否与算重叠" |
-| 9 | **"VMM 读腿税 3.8–5.9%"**(§50.8) | **已被 §60 翻案一次**(同口径 13.9–20.7%,差 3 倍);两版量法口径未定谳;且 **READ vs RW 差 3–6 点** ⇒ 授予位的旋钮**没扫完**(alloc props / handle 类型 / 压缩位) | 若要保留跨卡读:扫授予位 | `tools/vmm-mapping-tax-probe.cu` |
+| 9 | **"VMM 读腿税 3.8–5.9%"**(§50.8) | **已被 §60 翻案一次**(同口径 13.9–20.7%,差 3 倍);两版量法口径未定谳;且 **READ vs RW 差 3–6 点** ⇒ 授予位的旋钮**没扫完**(alloc props / handle 类型 / 压缩位) | 若要保留跨卡读:扫授予位 | `tools/fixture/vmm-mapping-tax-probe.cu` |
 | 10 | **"绕开 VMM 不值得"**(§60;**我自己的结论**) | 范围 = **现役写腿 + 10KB/5MB 两档**。一旦引入**跨卡读**形态(allgather / 1-stage 的 `peer_data` 读),那 14–24% 立刻相关 ⇒ 别读成"VMM 永远没问题" | 任何新的跨卡读路径 | 同探针(读腿档) |
 | 11 | **"MPS 128→256 ⇒ +1.6%"** | **从未实测** —— 是从 128B TLP 天花板模型**估**的(与 Gen4 的 1.71× 同属推算) | 拿到 root | `sudo lspci -vv` 看 MPS + 复跑排名词(一行命令就能把"估"变成"测") |
 | 12 | **"权重地板 79 t/s"**(§0) | 它假设"每 token 必须把每卡权重**读满一遍**" ⇒ **减字节**(lm_head 量化)**或**改结构(投机:一次权重读算 k 个 token)都会把地板本身移动 | 任何减字节 / 多 token 方案 | 由 P1.1 / P2.1 直接反映 |
@@ -748,11 +748,11 @@ OWL_TP_TEST_DEV_A=2 OWL_TP_TEST_DEV_B=3 \
   OWL_TP_1STAGE=1 cargo test -p owl-engine --test tp_g8_gate -- --nocapture
 # ③ 生产 A/B(std 五点三轮;端口须避开别的会话 —— 纪律㉜)
 PORT=8143 TP2_CFG=/tmp/bench8141/tp2-w4a8-arf8.toml OUT_DIR=/tmp/owl-bench-x \
-  tools/tp-ab-std.sh tp2
+  tools/fixture/tp-ab-std.sh tp2
 # ④ 逐核账(两把尺;报告在 /tmp/diag/<tag>/)
-PORT=8143 tools/nsys-decode-account.sh  <tag> tp27b <cfg>     # decode(图模式)
-PORT=8143 tools/prefill-account.sh      <tag> tp27b <cfg>     # prefill(eager)
-python3 tools/nsys_decode_account.py <tag> [...]
+PORT=8143 tools/fixture/nsys-decode-account.sh  <tag> tp27b <cfg>     # decode(图模式)
+PORT=8143 tools/fixture/prefill-account.sh      <tag> tp27b <cfg>     # prefill(eager)
+python3 tools/fixture/nsys_decode_account.py <tag> [...]
 ```
 **基准读数(28B TP2,双 3080,std 五点三轮;供回归对照)**:
 | 档 | prefill | decode | TTFT@8k |
@@ -812,8 +812,8 @@ MTP(`mtp.rs` 同构)的**选择面按全量 vocab 索引**,切档后候选塔到
 
 ```bash
 # 性能 A/B(非投机;五点三轮)
-PORT=8143 TP2_CFG=/tmp/bench8143/tp2-nospec.toml        OUT_DIR=/tmp/ab/base   tools/tp-ab-std.sh tp2
-PORT=8143 TP2_CFG=/tmp/bench8143/tp2-nospec-vsplit.toml OUT_DIR=/tmp/ab/vsplit tools/tp-ab-std.sh tp2
+PORT=8143 TP2_CFG=/tmp/bench8143/tp2-nospec.toml        OUT_DIR=/tmp/ab/base   tools/fixture/tp-ab-std.sh tp2
+PORT=8143 TP2_CFG=/tmp/bench8143/tp2-nospec-vsplit.toml OUT_DIR=/tmp/ab/vsplit tools/fixture/tp-ab-std.sh tp2
 # 切档正判据(27B;两臂对拍)
 OWL_TP_TEST_DEV_A=2 OWL_TP_TEST_DEV_B=3 \
   OWL_27B_DIR=/path/to/models/cyankiwi/Qwen3.8-27B-AWQ-INT4 \

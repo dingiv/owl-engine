@@ -22,7 +22,7 @@
 #   nvidia-smi --query-compute-apps=pid,process_name,gpu_uuid --format=csv
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${BIN:-$ROOT/target/release/server}"
 PROFILE="${PROFILE:-qwen38_27b-3090}"
 BDF="${BDF:-42:00.0}"

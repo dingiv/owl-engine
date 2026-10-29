@@ -6,7 +6,7 @@
 |---|---|---|
 | 🧮 | **VRAM-efficient local deployment** — a budget declared at boot that the process never exceeds; every allocation is ledgered by name and reconciled against the driver | ✅ |
 | 🚀 | **High performance** — CUDA-graph capture, block-level prefix cache, fused kernels (measured numbers to be published) | ✅ |
-| 📦 | **GGUF + SafeTensors** — AWQ-INT4, W4A16, Q4_K, IQ family are all supported | ✅ |
+| 📦 | **Five entry formats, loaded as-is** — AWQ-INT4 (W4A16 / W4A8), G128, NVFP4, GGUF Q4_K, GGUF IQ4 / IQ3. Pre-quantized checkpoints only: **owl does not convert** | ✅ |
 | 🔗 | **Tensor parallelism (TP=2)** — one-shot allreduce over IPC / P2P | ✅ |
 | 🗄 | **Three-tier KV offload** — GPU pool → pinned host RAM → disk; blocks demote and come back on demand instead of being dropped | ✅ |
 | 🧠 | **KV-cache virtualization** — each turn materializes only its working set on the device; the full KV stays virtual and is recalled by attention-aware scoring | ✅ |
@@ -28,10 +28,10 @@ becomes the product**: long agent sessions, 100k+ windows, no OOM.
 > **Scope, honestly** — this is alpha, and narrow on purpose.
 >
 > - **Models: today one family — Qwen3.8 / Qwen3.5.** Production is the 27B hybrid
->   (GDN linear + full attention), with AWQ-INT4 / W4A16 / GGUF checkpoints, a vision
->   tower, and DFlash2 / MTP draft heads. A new architecture lands as a spec + layer
->   set rather than a fork — but **if your checkpoint is not this family, owl cannot
->   serve it yet.**
+>   (GDN linear + full attention), with AWQ-INT4 (W4A16 · W4A8) / G128 / NVFP4 /
+>   GGUF (Q4_K · IQ4 · IQ3) checkpoints, a vision tower, and DFlash2 / MTP draft heads.
+>   A new architecture lands as a spec + layer set rather than a fork — but **if your
+>   checkpoint is not this family, owl cannot serve it yet.**
 > - **Status: single machine, alpha.** Tuned on RTX 30-series (sm_86); production
 >   inference still runs on vLLM. This project is grown milestone by milestone.
 >
@@ -49,8 +49,11 @@ becomes the product**: long agent sessions, 100k+ windows, no OOM.
 
 - **Model family**: Qwen3.8 / Qwen3.5 — dense hybrid (GDN linear + full attention),
   27B production / 0.8B dev, plus the VL vision tower — [`crates/models/src/formats/qwen35.rs`](crates/models/src/formats/qwen35.rs)
-- **Model formats**: AWQ-INT4 (pack-quantized, gs32 asymmetric), W4A16 safetensors,
-  F16/BF16, GGUF (Q4_K / Q5_K / Q6_K / IQ family) — [`crates/models`](crates/models)
+- **Model formats**: a short whitelist of **pre-quantized** checkpoints —
+  AWQ-INT4 (W4A16 · W4A8), G128 (🎯 planned), NVFP4, GGUF Q4_K, GGUF IQ4 / IQ3
+  (plus the f16/bf16 dev baseline);
+  see [Checkpoint formats](#checkpoint-formats--a-whitelist-not-a-converter) —
+  [`crates/models`](crates/models)
 - **Graph capture & replay**: decode / verify / fold / propose captured per family;
   prefill runs eager with chunk buckets; `[cuda] graph = false` flips everything to
   eager for A/B — [`docs/devlog/graph/graph-model-seam.md`](docs/devlog/graph/graph-model-seam.md)
@@ -72,6 +75,40 @@ becomes the product**: long agent sessions, 100k+ windows, no OOM.
   *collection*, logging gates *visibility*) —
   [`docs/devlog/perf/log-framework.md`](docs/devlog/perf/log-framework.md)
 
+### Supported Checkpoint Formats
+
+owl **loads pre-quantized checkpoints including**:
+
+| Family | `[model]` | What must already be on disk |
+|---|---|---|
+| **AWQ-INT4** | `format = "awq"`, `quant = "w4a16"`, `quant = "w4a8"` | pack-quantized HF dir: `.weight_packed` / `.weight_scale` / `.weight_shape` (+ zero-points), group 32, group 128, asymmetric. repack as marlin layout in w4a16 or w4a8. |
+| **NVFP4** | `format = "safetensors"`, `quant = "nvfp4"` | e2m1 weights + one `e4m3` scale per 16 k. Packed once into the CUTLASS layout at load; no precision is chosen for you |
+| **GGUF Q4_K** | `format = "gguf"`, `quant = "q4k"`, `path = *.gguf` | single-file GGUF (Q4_K_M / Q4_K_S) |
+| **GGUF IQ4 / IQ3** | `quant = "iq4"` / `"iq3"` | single-file GGUF (IQ4_XS, IQ3_XXS, IQ3_S — UD mixes included) |
+
+A non-quantized checkpoint still loads (`format = "safetensors"` with
+`quant = "w4a16"` and **no** pack-quantized keys): that is the f16/bf16 baseline used
+by the 0.8B dev checkpoint — a development surface, not a production one.
+
+**Companion tensors are not a fifth format.** A `Q4_K_M` file is not uniformly Q4_K:
+norms stay F32/F16, `token_embd` is usually Q6_K, `output.weight` is Q6_K, and a
+`UD-IQ3_XXS` mixes IQ2 / IQ3 / Q4_K / Q6_K in one file. The GGUF reader runs the
+block types it has kernels for (Q4_K / Q5_K / Q6_K / Q8_0, IQ4_NL / IQ4_XS, IQ3_XXS /
+IQ3_S, plus Q2_K / Q3_K / IQ2_* / IQ1_S on the tile arm) and **refuses the rest
+loudly** — an unported type is never silently dequantized to f16.
+
+**Attachments have their own format facts** (their own sources, not the backbone
+loader):
+
+| Piece | GGUF deployment | SafeTensors deployment |
+|---|---|---|
+| Vision tower | a separate `mmproj-*.gguf` next to the backbone (`general.architecture = "clip"`); F16 / F32 / Q8_0 mixed, dequantized to f32 at load (prefill-only, ~0.7–0.9 GB) | `model.visual.*` inside the checkpoint (bf16), `[model] vision = true` |
+| DFlash2 draft | its own GGUF draft file (`Q4_K_M` or `Q8_0` tier); quantized bytes stay packed — the only host dequant is the two selector codebooks (Q4_K → BF16, ~250 MB) | a bf16 draft checkpoint dir (`[spec] draft = ...`) |
+| MTP head | `blk.<n>.nextn.*` inside the backbone GGUF (Q8_0 / Q6_K / Q4_K mixed; resident as-is, GEMM through the GGUF arm) | `mtp.*` in the checkpoint |
+
+Adding a fifth entry format is a deliberate decision (enum arm + one whitelist row +
+a quality-gate ledger), not a config flag.
+
 ### How VRAM and context are handled
 
 | Mechanism | What it buys you |
@@ -79,7 +116,7 @@ becomes the product**: long agent sessions, 100k+ windows, no OOM.
 | **Declared VRAM budget (hard contract)** | Budget declared at boot, held for the whole process life. The decomposition is closed — weights / KV pool / graph allowance / activation peak / workspace / comm buffers / runtime floor / margin — and **a missing measured number means refuse-to-start**. Every allocation is ledgered *by name* and periodically reconciled against the driver; overspend is fail-fast with a ledger snapshot. **The process never OOMs itself.** |
 | **Three-tier KV offload** | The KV pool is not a hard ceiling: blocks demote GPU → pinned host RAM → disk and return on demand, tracked by a content-addressed ledger (`crates/store` tiers). Running out of VRAM costs latency, not a failed request. |
 | **KV-cache virtualization (selection layer)** | A turn only materializes its working set on the device (bounded by `workspace_per_req`); everything else stays virtual and is recalled by attention-aware scoring — this is the path to 262k on a single consumer card. |
-| **Quantization as the first lever** | W4A16 / W4A8 / AWQ-INT4 / GGUF (Q4_K · IQ family) — every GB saved on weights is a GB handed back to context. |
+| **Quantization as the first lever** | AWQ-INT4 (W4A16 · W4A8) / G128 / NVFP4 / GGUF (Q4_K · IQ4 · IQ3) — every GB saved on weights is a GB handed back to context. |
 | **KV dtype knob** | fp16 (default) / fp8 / int8 — fp8 doubles the pool, at a measured accuracy cost. |
 | **Graph budget up front** | Capture memory is registered *before* any pool arithmetic (axiom A1.1), so capture OOM is a boot-time decision, not a runtime surprise. |
 | **Prefix cache** | 88% hit on same-session multi-turn, 89% on cross-session shared prefixes (1536/1732 blocks) — long agent sessions stop recomputing. |
@@ -98,7 +135,7 @@ becomes the product**: long agent sessions, 100k+ windows, no OOM.
 | CUDA | Local CUDA Toolkit with `nvcc` (sm_86 support); driver matched to toolkit |
 | Rust | Stable, edition 2021 |
 | Memory | Plan ~20 GB host RAM per GPU for weights + caches |
-| Models | Bring your own (AWQ-INT4 / safetensors / GGUF; **not** distributed here) |
+| Models | Bring your own, **already quantized** (AWQ-INT4 W4A16/W4A8 / G128 (planned) / NVFP4 / GGUF Q4_K · IQ4 · IQ3; f16/bf16 baseline for the dev checkpoint). **Not** distributed here and **not** converted here |
 
 > ⚠️ **No authentication.** The server binds `127.0.0.1` by default. If you expose it to
 > a LAN, put your own reverse proxy and auth in front — see [`SECURITY.md`](SECURITY.md).
@@ -112,7 +149,7 @@ cargo build --release -p server
 #    cargo build --release -p server --features perf
 
 # 2) Pick a profile and point it at your checkpoint
-cp profiles/qwen38_27b-3090-w4a16.toml my.toml
+cp profiles/full.toml my.toml
 $EDITOR my.toml          # [model] path = "/path/to/Qwen3.8-27B-AWQ-INT4"
 
 # 3) Preflight (no weights, no GPU; prints resolved config + memory estimate)
@@ -176,14 +213,13 @@ cargo test -p owl-kernels --lib       # operator face (oracle parity included)
 
 ```
 crates/
-  sink       Log/metric sink (leaf crate, zero dependencies)
   store      KV/state three-tier virtualization + block ledger (pure state machine)
   iface      HAL contract (DeviceClient) + DeviceHandle (alloc ledger + command face)
-  kernels    Operator dispatch + device-code assets (AOT cubins; Marlin/FlashInfer/XQA/GDN/GGUF)
+  kernels    Operator dispatch + device-code assets (AOT cubins; Marlin/FlashInfer/XQA/GDN/GGUF); depends on `iface`, not the other way around
   backends/  cuda (GpuServer actor / GpuClient), cpu (CpuFace reference impl)
   models     Loaders / interpreters / layers (including the VLM vision tower)
-  engine     Scheduling / graph families / speculative decoding / sessions
-  shared     Config surface / logging / metrics / testkit
+  engine     Scheduling / graph families / speculative decoding / sessions; owns the load whitelist (`load_arm_of`)
+  shared     Config surface / logging (the single `LOGGER`) / metrics / testkit
   macros     #[owl_test] and friends
 apps/
   server     OpenAI-compatible SSE server (engine actor owns the device)

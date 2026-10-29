@@ -1,0 +1,28 @@
+# 0.8B P0a smoke job (skeleton; run/verify wiring lands after the spike).
+[source]
+path = "/home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B"
+
+[output]
+path = "/home/div/Documents/codes/models/empero-ai/Qwen3.5-0.8B-AWQ32-smoke"
+
+[scheme]
+method = "awq"
+bits = 4
+group_size = 32
+symmetric = false
+format = "compressed-tensors-pack-quantized"
+n_grid = 10
+
+[calibration]
+dataset = "HuggingFaceH4/ultrachat_200k"
+split = "train_sft"
+samples = 128
+sequence_length = 2048
+
+[runtime]
+backend = "llm-compressor"
+device = "cuda:0"
+dtype = "bfloat16"
+pipeline = "sequential"
+sequential_offload_device = "cuda"
+batch_size = 8

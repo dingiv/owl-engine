@@ -1,0 +1,45 @@
+[project]
+name = "awq-forge"
+version = "0.1.0"
+description = "FP8/BF16 -> AWQ INT4 (compressed-tensors pack-quantized) forge"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+quant = [
+    "torch>=2.14.1,<2.15",
+    "transformers>=5.20,<=5.21.0",
+    "llmcompressor>=0.15,<0.16",
+    "compressed-tensors>=0.20,<0.21",
+    "datasets>=5.0",
+    "accelerate>=1.10",
+    "pillow>=11",
+    "torchvision>=0.24",
+]
+# 27B FP8 module-local decode candidate only; NOT the Qwen3.5 AWQ backend.
+gptq = [
+    "torch>=2.14.1,<2.15",
+    "transformers>=5.20,<=5.21.1",
+    "gptqmodel>=7.7,<8",
+    "compressed-tensors>=0.20,<0.21",
+    "datasets>=5.0",
+]
+[project.scripts]
+awq-forge = "awq_forge.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "src"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "ruff>=0.14",
+]
+
+[tool.uv]
+torch-backend = "auto"

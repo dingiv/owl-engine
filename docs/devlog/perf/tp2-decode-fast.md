@@ -537,7 +537,7 @@ prompt 只是不同长度的前缀。§10.1/§10.3/§10.7 里那组
 **3.33 / 1.79 / 2.33 / 1.60** 和 **1.60–1.87** 因此**不能**作为
 “固定尾部 / remote-semantic”证据。修正 harness = 把源重复 4 次，再取
 `[60000:68000]` 作为真 8K 字符 tail，前缀长度按目标 token 数变化。
-已入档 `tools/fixedtail_prompt.py`：tail 为空/越界会**响亮拒**，
+已入档 `tools/fixture/fixedtail_prompt.py`：tail 为空/越界会**响亮拒**，
 不再像旧脚本那样静默退化成“无 tail”。
 
 **同 target/draft/ prompt 的 vLLM 对照**（2×3080）：

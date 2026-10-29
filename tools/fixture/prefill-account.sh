@@ -10,7 +10,7 @@
 set -u
 TAG="$1"; FLAVOR="$2"; CFG="$3"
 PORT="${PORT:-8141}"
-ROOT="${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+ROOT="${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
 OUT="/tmp/diag/$TAG"
 mkdir -p "$OUT"; rm -f "$OUT"/nsys.nsys-rep "$OUT"/nsys.sqlite "$OUT"/srv.log 2>/dev/null
 cd "$ROOT" || exit 1

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.work/
+out/
+docs/bench/data/
+*.local.toml
+logs/
+.offload/

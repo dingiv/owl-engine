@@ -2774,8 +2774,12 @@ impl OwlConfig {
                 par.tp_ar.as_str()
             ));
         }
-        // **format × quant 的组合门**(2026-10-21):量化词表按格式分域,
-        // 错配 = 拒启(装载器不会替你猜)。
+        // **format × quant 的组合门**(2026-10-21;2026-10-30 收紧为白名单口径)。
+        //
+        // 语义权威 = `owl_engine::load_arm_of`(装载臂白名单:awq+w4a16 /
+        // safetensors+nvfp4 / gguf+q4k·iq4·iq3 / safetensors+w4a16 基线;
+        // awq+w4a8 为 legacy 档)。本处只求**离线**(`--check`,零 GPU)就能抓到
+        // 词表域错配 —— 不重写那张表,只挡"连词表都进不去的"组合。
         match (self.model.format, self.model.quant) {
             (ModelFormat::Gguf, QuantScheme::Q4k | QuantScheme::Iq4 | QuantScheme::Iq3) => {}
             (ModelFormat::Gguf, q) => {
@@ -2789,13 +2793,20 @@ impl OwlConfig {
                         .to_string(),
                 );
             }
-            // NVFP4 是权重+激活的块缩放格式:装载期现量化(safetensors 的 f16)
+            // NVFP4 是权重+激活的块缩放格式(白名单族之一;safetensors 目录)
             (ModelFormat::Safetensors, QuantScheme::Nvfp4) => {}
             (_, QuantScheme::Nvfp4) => {
                 return Err(format!(
-                    "[model] quant = \"nvfp4\" 只配 format = \"safetensors\"(装载期从 f16 现量化),实得 format = {:?}",
+                    "[model] quant = \"nvfp4\" 只配 format = \"safetensors\"(NVFP4 块缩放权重),实得 format = {:?}",
                     self.model.format
                 ));
+            }
+            // 纯 HF 目录上没有"w4a8 布局"的含义:a8 布局三件套只由 AWQ 源产出
+            (ModelFormat::Safetensors, QuantScheme::W4a8) => {
+                return Err(
+                    "[model] quant = \"w4a8\" 只配 format = \"awq\"(a8 布局由 AWQ 源产出)"
+                        .to_string(),
+                );
             }
             _ => {}
         }
@@ -3018,9 +3029,13 @@ mod tests {
     #[test]
     fn quant_scheme_枚举与退役键门() {
         assert_eq!(OwlConfig::default().model.quant, QuantScheme::W4a16);
-        let c = OwlConfig::from_toml_str("[model]\nquant = \"w4a8\"").expect("a8 档");
+        let c = OwlConfig::from_toml_str("[model]\nformat = \"awq\"\nquant = \"w4a8\"").expect("a8 档");
         assert_eq!(c.model.quant, QuantScheme::W4a8);
         let c = OwlConfig::from_toml_str("[model]\nquant = \"w4a16\"").expect("a16 档");
+        // a8 布局只对 AWQ 源成立:纯 HF 目录 × w4a8 = 组合门拒(2026-10-30)
+        let e = OwlConfig::from_toml_str("[model]\nformat = \"safetensors\"\nquant = \"w4a8\"")
+            .expect_err("裸目录 × w4a8 必须拒");
+        assert!(e.contains("awq"), "拒语应点名正确格式: {e}");
         assert_eq!(c.model.quant, QuantScheme::W4a16);
         let e = OwlConfig::from_toml_str("[model]\nquant = \"w4a9\"").expect_err("非法档拒");
         assert!(e.contains("w4a9"), "拒语应带现场: {e}");

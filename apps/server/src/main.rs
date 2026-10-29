@@ -60,7 +60,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::actor::EngineReq;
-use crate::config::{ModelFormat, ServerConfig};
+use crate::config::ServerConfig;
 
 /// 引擎请求通道深度(pump 期间的提交在缓冲;收件与泵不相交纪律)
 const CHANNEL_CAPACITY: usize = 64;
@@ -560,16 +560,17 @@ fn engine_cfg(config: &ServerConfig, ordinal: usize) -> owl_engine::EngineConfig
 async fn load_shard(
     config: &ServerConfig,
     engine: &mut owl_engine::Engine<owl_cuda::GpuClient>,
+    arm: owl_engine::LoadArm,
     rank: usize,
     world: usize,
 ) -> owl_engine::Result<owl_engine::LoadedModel> {
     let mut loader = engine.loader().slice(rank, world).vocab_split(config.tp_vocab_split);
-    match config.model_format {
+    match arm {
         // AWQ pack-quantized 家族(cyankiwi 系;int4 权重已烘焙)
-        ModelFormat::Awq => {
-            // 量化方案映射(唯一点 owl_engine::{head_plan_of, quant_plan_of})
+        owl_engine::LoadArm::AwqInt4 | owl_engine::LoadArm::AwqA8 => {
+            // head/embed 计划 = 唯一映射点;主干计划由白名单臂给出
             let head_plan = owl_engine::head_plan_of(config.head_quant);
-            let quant = owl_engine::quant_plan_of(config.model_format, config.quant);
+            let quant = arm.quant_plan();
             let embed_plan = owl_engine::embed_plan_of(config.embed_quant);
             loader
                 .load_qwen38_27b_awq_with_embed(
@@ -581,18 +582,18 @@ async fn load_shard(
                 )
                 .await
         }
-        // 普通 HF safetensors(全精度检查点):计划 = **装载期现量化**唯一表
-        // (`w4a16/w4a8` 在这类目录上是历史空档 ⇒ F16;`nvfp4` 才是真档)
-        ModelFormat::Safetensors => {
+        // 普通 HF safetensors 目录:白名单下只有 `nvfp4`(预量化块缩放)与
+        // `w4a16`(裸 f16/bf16 基线,开发档)两臂,别无其它
+        owl_engine::LoadArm::NvFp4 | owl_engine::LoadArm::F16Base => {
             let head_plan = owl_engine::head_plan_of(config.head_quant);
-            let quant = owl_engine::safetensors_load_plan(config.quant);
+            let quant = arm.quant_plan();
             let embed_plan = owl_engine::embed_plan_of(config.embed_quant);
             loader
                 .load_qwen35_safetensors(&config.model_dir, quant, head_plan, embed_plan)
                 .await
         }
         // GGUF 单文件:超参/词表/模板/rope/权重全从 `model.path` 那个文件取
-        ModelFormat::Gguf => loader.load_gguf(&config.model_dir).await,
+        owl_engine::LoadArm::Gguf(_) => loader.load_gguf(&config.model_dir).await,
     }
 }
 
@@ -613,23 +614,40 @@ async fn actor_main(
         let mut phase_used: Option<u64> = None;
         vram_phase("server:context", engine.mem_info().await, &mut phase_used);
         owl_shared::log_info!("boot", "设备绑定 {:.2}s", t0.elapsed().as_secs_f32());
+        // **装载白名单在此判死**(2026-10-30):非白名单组合 = boot 期拒,
+        // 不等到装载到一半才报缺键。
+        let arm = owl_engine::load_arm_of(config.model_format, config.quant)?;
+        owl_shared::log_info!("boot", "装载臂 = {}(format={:?} quant={:?})", arm.name(), config.model_format, config.quant);
+        // G128(g128-sym pack-quantized)在路线图内但未接线:同键对今天落到 f16 基线,
+        // 装载到一半会因为要不到 `.weight_packed` 而拒。点名告知,不静默。
+        if arm == owl_engine::LoadArm::F16Base {
+            owl_shared::log_info!(
+                "boot",
+                "[model] safetensors × w4a16 按 f16/bf16 基线装载(G128 pack-quantized 档待接线,届时按键面探测分流)"
+            );
+        }
         match world {
             // ── 单卡档(原路径;分片 = 恒等)─────────────────────────────
             1 => {
-                // 装载 = 模型档分发(唯一点 owl_engine::{head_plan_of, quant_plan_of})
-                let model = match config.model_format {
-                    // 量化方案映射在 `load_shard` 内部(唯一映射点)
-                    ModelFormat::Awq => load_shard(&config, &mut engine, 0, 1).await?,
-                    ModelFormat::Safetensors => {
+                // 装载 = 白名单臂分发(唯一接线点 owl_engine::load_arm_of)
+                let model = match arm {
+                    owl_engine::LoadArm::AwqInt4 | owl_engine::LoadArm::AwqA8 => {
+                        load_shard(&config, &mut engine, arm, 0, 1).await?
+                    }
+                    owl_engine::LoadArm::NvFp4 | owl_engine::LoadArm::F16Base => {
                         let head_plan = owl_engine::head_plan_of(config.head_quant);
-                        let quant = owl_engine::safetensors_load_plan(config.quant);
                         let embed_plan = owl_engine::embed_plan_of(config.embed_quant);
                         engine
                             .loader()
-                            .load_qwen35_safetensors(&config.model_dir, quant, head_plan, embed_plan)
+                            .load_qwen35_safetensors(
+                                &config.model_dir,
+                                arm.quant_plan(),
+                                head_plan,
+                                embed_plan,
+                            )
                             .await?
                     }
-                    ModelFormat::Gguf => {
+                    owl_engine::LoadArm::Gguf(_) => {
                         engine.loader().load_gguf(&config.model_dir).await?
                     }
                 };
@@ -662,7 +680,7 @@ async fn actor_main(
                             .map_err(|e| owl_iface::contract::ModelError::Msg(format!(
                                 "TP rank0 loader runtime: {e}"
                             )))?;
-                        let out = rt.block_on(load_shard(&config, &mut engine, 0, 2));
+                        let out = rt.block_on(load_shard(&config, &mut engine, arm, 0, 2));
                         owl_shared::log_info!(
                             "boot",
                             "TP2 rank0 装载 {:.2}s{}",
@@ -679,7 +697,7 @@ async fn actor_main(
                             .map_err(|e| owl_iface::contract::ModelError::Msg(format!(
                                 "TP rank1 loader runtime: {e}"
                             )))?;
-                        let out = rt.block_on(load_shard(&config, &mut engine1, 1, 2));
+                        let out = rt.block_on(load_shard(&config, &mut engine1, arm, 1, 2));
                         owl_shared::log_info!(
                             "boot",
                             "TP2 rank1 装载 {:.2}s{}",

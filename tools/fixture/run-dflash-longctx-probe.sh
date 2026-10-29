@@ -11,7 +11,7 @@
 # 用法: tools/run-dflash-longctx-probe.sh [out_dir]
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${1:-$ROOT/perf-runs/metrics-optimize/max-$(date +%m%d-%H%M)}"
 PROFILE="$ROOT/profiles/qwen38_27b-3090.toml"
 MAX_SEQ="${MAX_SEQ:-67584}"

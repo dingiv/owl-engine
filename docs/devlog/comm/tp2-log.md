@@ -1116,7 +1116,7 @@ AR/staging 交互(或 §22.2 的错误权重把某处索引带飞)。**未定位
   同串 ⇒ **前向数值爆炸**,不是采样/模板问题;
 - TP2 **0.8B**:正常 ⇒ 与"双 rank 机制"无关。
 
-**最小复现(单层)**:`tools/trunc_ckpt_layers.py <N>` 造截断检查点(改
+**最小复现(单层)**:`tools/fixture/trunc_ckpt_layers.py <N>` 造截断检查点(改
 safetensors 头 + 重排 data_offsets;**索引 JSON 无用** —— `open_raw_index` 是
 扫文件头),`OWL_27B_DIR=<截断目录>` 指向它即可。**N=1 单层 GDN 已复现 NaN**
 ⇒ 病灶在**一层之内**,不需要跨层二分。
@@ -1211,7 +1211,7 @@ _ => (plan.shard_len(rows)?, cols),
 2. **装载器自带 `OWL_LOAD_VERIFY=1` 现场账**一锤定音:
    `rows=4096 cols=640 k=5120 n=5242880 p32=2621440 idx=20971520 b_ref=2621440`
    —— `n` 对(5,242,880 = 8192×640)、`p32` 只有一半、`idx` 表 8× 过长;
-3. **单层复现**(`tools/trunc_ckpt_layers.py 1`)把病灶锁进一层之内;
+3. **单层复现**(`tools/fixture/trunc_ckpt_layers.py 1`)把病灶锁进一层之内;
 4. 此前已逐项洗清:装载源读取(142 键源级对拍)、AR(载荷尺寸 3 档 + 游标)、
    marlin GEMM(6 个分片形状)、GDN recurrence(真维)、conv(真维)、
    norm_act(真维)、silu_mul(逐元素)、GPU 重排核(9 个分片形状)——
@@ -1457,7 +1457,7 @@ AR 核 = 单 block 256 线程;载荷 5.24MB 时有效带宽仅 ~400MB/s,对 P2P 
 §25 加了 `RR`(两 rank **同时**互读),想用它当"AR 数据面上限"。**它不成立** ——
 `RR` 用的是 **owl 自己的核**(单 block × 256 线程 + 8 路展开)⇒ 它只证明
 "**我们这套读协议**能跑到多少",不能证明"链路能跑到多少"。
-⇒ 新工具 `tools/nccl-ar-probe.cu`:同一对卡、同载荷、同 dtype(f16)、
+⇒ 新工具 `tools/fixture/nccl-ar-probe.cu`:同一对卡、同载荷、同 dtype(f16)、
 **NCCL 2-rank all-reduce** 的 `cudaEvent` 计时(fork + 管道传 uniqueId,无 MPI)。
 **这是分母。**(方法论:**"上限"必须用与被测对象无关的实现量,否则量的是自己。**)
 
@@ -1813,7 +1813,7 @@ A 期只换**搬运执行体**(SM 核 → CE),协议语义不变 ⇒ 这正是 A
 - `R` 从"本地+PCIe 混合"变成**纯 PCIe 读受限**(5.24MB/489.5µs = 10.7GB/s);
 - 门 `ar_transport_gate` G1/G2/G3 **全绿**(逐位 / 两跑同 / 回放 ≡ eager)。
 
-**生产 A/B(std 五点三轮;同二进制;3080 单卡 vs 双卡;`tools/tp-ab-std.sh ab`)**:
+**生产 A/B(std 五点三轮;同二进制;3080 单卡 vs 双卡;`tools/fixture/tp-ab-std.sh ab`)**:
 
 | 指标 | TP1 | TP2(§25.6)| **TP2(本轮)** | TP2/TP1 |
 |---|---:|---:|---:|---:|
@@ -2107,7 +2107,7 @@ v1 的 reduce 核里,对端读与本地加是**同一个核内的重叠**;CE 版
 
 **⑮ 回退也要复测**(本轮现埸):只看"新代码 vs 旧文档里的基线"会把**运行间波动**
 算成新代码的功劳(本次若不复测,prefill 的 +1.1% 会被写进结论;复测后是 0.35%)。
-⇒ **A/B 两臂必须同一会话、同一机器状态下体重跑** —— 这是 `tools/tp-ab-std.sh ab`
+⇒ **A/B 两臂必须同一会话、同一机器状态下体重跑** —— 这是 `tools/fixture/tp-ab-std.sh ab`
 存在的理由,别用"上次的基线"代替。
 
 #### 32.6 处置:回退 CE 接线,**保留全部基础设施与证据**
@@ -2355,8 +2355,8 @@ vs v1 的 21.93 —— 归约路径不同,属预期)。
 
 | 工具 | 量什么 | 口径 |
 |---|---|---|
-| `tools/p2p-wr-probe.cu` | **写腿 vs 读腿**;SM/CE × 单/双向;runtime 映射 | `cudaEvent` 纯设备时;8 路 16B 展开;**写臂有落地校验**(posted ≠ 落地) |
-| `tools/vmm-peer-probe.cu` | **映射路径 A/B**:`cudaMalloc+EnablePeerAccess` vs `cuMemCreate+fd 导入+SetAccess(PROT_READ)`(复刻 `vmm.rs` 同参) | 同程序、同核、同载荷、同偏移(HDR=64) |
+| `tools/fixture/p2p-wr-probe.cu` | **写腿 vs 读腿**;SM/CE × 单/双向;runtime 映射 | `cudaEvent` 纯设备时;8 路 16B 展开;**写臂有落地校验**(posted ≠ 落地) |
+| `tools/fixture/vmm-peer-probe.cu` | **映射路径 A/B**:`cudaMalloc+EnablePeerAccess` vs `cuMemCreate+fd 导入+SetAccess(PROT_READ)`(复刻 `vmm.rs` 同参) | 同程序、同核、同载荷、同偏移(HDR=64) |
 
 #### 36.3 读数(3080 对 2/3;f16;**K=200**;纯设备时)
 
@@ -2407,7 +2407,7 @@ vs v1 的 21.93 —— 归约路径不同,属预期)。
 #### 36.5 待办(一条,带风险)
 
 **push 协议的前置 = "可写对端映射"**:`peer_import` 现在授 `PROT_READ`,要写必须授
-`PROT_READWRITE`。`tools/vmm-peer-probe.cu` 已写好该臂(`VMMPROBE_RW=1`),**默认不开** ——
+`PROT_READWRITE`。`tools/fixture/vmm-peer-probe.cu` 已写好该臂(`VMMPROBE_RW=1`),**默认不开** ——
 它是 3080 `cuMemSetAccess` 老雷区的邻居(外部存档:llama.cpp《3080-p2p驱动攻坚-setAccess205-定位实录》),
 **跑之前必须确认没有别的 agent 占卡**(硬重置会殃及)。
 判据:①RW 授予成功与否(响亮读错误码);②VMM 写向双向带宽是否仍达 12GB/s 量级。
@@ -2520,7 +2520,7 @@ vs v1 的 21.93 —— 归约路径不同,属预期)。
 ⇒ 对 NCCL(463.2/907.1):**0.94× / 0.96×**(从 §36 的 0.77× 提上来)。
 剩余 73µs = 本地 RMW(~42µs)+ 协议往返 —— **下一刀在那两笔上**(流水掉 RMW / 压掉一轮跨卡往返)。
 
-**生产 std(同会话;27B AWQ-INT4;3080 对 2/3;`tools/tp-ab-std.sh`;`--ignore-eos`)**
+**生产 std(同会话;27B AWQ-INT4;3080 对 2/3;`tools/fixture/tp-ab-std.sh`;`--ignore-eos`)**
 
 | 臂 | prefill avg | prefill **median** | decode avg |
 |---|---:|---:|---:|
@@ -2567,7 +2567,7 @@ vs v1 的 21.93 —— 归约路径不同,属预期)。
 | **两核串联 + 握手** | **5.3 µs** | ⇒ **协议税≈0,融合两核没意义** |
 | = push AR | **494 µs** | |
 
-#### 38.2 两条候选的判据(裸 CUDA 探针 `tools/p2p-rmw-probe.cu`)
+#### 38.2 两条候选的判据(裸 CUDA 探针 `tools/fixture/p2p-rmw-probe.cu`)
 
 | 臂 | µs | 判 |
 |---|---:|---|
@@ -2592,7 +2592,7 @@ vs v1 的 21.93 —— 归约路径不同,属预期)。
 
 **再排除"owl 的捕获有问题"**(裸 CUDA,不经 owl):
 
-| 判据(`tools/p2p-rmw-probe.cu` ⑦)| 比 | 判 |
+| 判据(`tools/fixture/p2p-rmw-probe.cu` ⑦)| 比 | 判 |
 |---|---:|---|
 | 裸 CUDA 图:双分支(写链 ‖ RMW 链)vs 单流 | **1.000** | 不并行 |
 | 裸 CUDA 图:**同质**对照(两条**不饱和**的本地 RMW 链)vs 单链 | **1.999** | **确证串行**(同质 ⇒ 与资源争用无关) |
@@ -2784,7 +2784,7 @@ capture_route_to(AUX) → AUX 链 → capture_route_to(origin)(纯切换) → CO
 1. **"图回放不能并行"是错的** —— 裸 CUDA 同质对照 **1.001** 铁证;
 2. **owl 侧仍是 1.000** ⇒ **owl 与裸 CUDA 之间还有一处未找出的差别**(候选:图实例化 flags /
    事件池复用 / 流优先级 / slab 分配节点的额外依赖边)。**未解,立案。**
-3. **§38.3 的定谳作废**;`tools/p2p-rmw-probe.cu` 的 ⑦/⑧ 两格(裸 CUDA 图)现在**有 join**、可复现。
+3. **§38.3 的定谳作废**;`tools/fixture/p2p-rmw-probe.cu` 的 ⑦/⑧ 两格(裸 CUDA 图)现在**有 join**、可复现。
 
 #### 39.4 与"1.7× 目标"的关系(纯算术)
 
@@ -2898,7 +2898,7 @@ cudarc feature 集下**被门控掉**(实测 `found an item that was configured 
 
 #### 41.4 判据四:**裸 CUDA 同形图也一样串行**(排除 owl 实现)
 
-`tools/p2p-rmw-probe.cu` 的同形图 + 同判据扫描(`RMW_MULT`):
+`tools/fixture/p2p-rmw-probe.cu` 的同形图 + 同判据扫描(`RMW_MULT`):
 
 | mult | RMW 链单跑 | 单流(串行)| 双分支 | 读法 |
 |---:|---:|---:|---:|---|
@@ -3121,7 +3121,7 @@ TP=1 复现受挫(三次 OOM):`qwen38_3090` 档(DFlash2 draft + 视觉塔 + 262k
 而这个判决**又被 §38 用来否掉 TBO/微批**("微批也没有地基")⇒ **整条路线图押在它上面**,
 必须重测。
 
-#### 44.1 新工具:`tools/p2p-overlap-probe.cu`
+#### 44.1 新工具:`tools/fixture/p2p-overlap-probe.cu`
 
 十条臂(同载荷 5.24MB、同几何、**同计时口径**),并**内置两条存在性判据**(§39 的教训):
 
@@ -3277,7 +3277,7 @@ AR(生产 push)= 411.3(纯写地板,实测)           ← 12.75 GB/s = Gen3 x16 
 
 **用户口径**:"从两个角度再来尝试优化:一个是小包优化,另一个是搜搜论文/项目看别人怎么写的。"
 
-#### 46.1 写腿调优台(`tools/p2p-wr-tune.cu`;CUDA ord 0/3(见 §44.2 的卡序订正);5.24MB;机器全空)
+#### 46.1 写腿调优台(`tools/fixture/p2p-wr-tune.cu`;CUDA ord 0/3(见 §44.2 的卡序订正);5.24MB;机器全空)
 
 | 臂 | µs | GB/s | 判 |
 |---|---:|---:|---|
@@ -3497,7 +3497,7 @@ AR/token 122.9 → 69.4     ⇒ TP2 651.1 → 597.6µs ⇒ 1673 t/s ⇒ **1.73×
 
 #### 48.2 缺的那一格:测 [PCIe **读** ‖ 真 GEMM]
 
-`tools/p2p-overlap-probe.cu` 新增 `k_rp`(读对端 slot + 本地累加 = **v1 的 reduce 数据面**)与 R/M/N 三臂。
+`tools/fixture/p2p-overlap-probe.cu` 新增 `k_rp`(读对端 slot + 本地累加 = **v1 的 reduce 数据面**)与 R/M/N 三臂。
 
 **读数(同一支二进制、同一几何;`RMW_K=64`;5.24MB;GEMM = m512 n5120 k5120 fp16)**
 
@@ -3571,13 +3571,13 @@ AR/token 122.9 → 69.4     ⇒ TP2 651.1 → 597.6µs ⇒ 1673 t/s ⇒ **1.73×
 | **写腿** | 423.3 µs / 11.81 GB/s | 416.9 / 12.58 | **仅 1.5%** |
 | **读腿** | 496.5 µs / **10.6 GB/s** | 413.5 / **12.68** | **17~20%** |
 
-⇒ **VMM 别名上的 SM `ld.global` 有 17-20% 的税**(`tools/vmm-peer-probe.cu` 头部已记了这条:
+⇒ **VMM 别名上的 SM `ld.global` 有 17-20% 的税**(`tools/fixture/vmm-peer-probe.cu` 头部已记了这条:
 同核同卡换映射路径,9.93 → 12.93 GB/s),而**写腿不受影响**。
 ⚠️ **但 §32 已经试过"换通道"(CE 拉取)并回退** —— 结构性原因(§32.5):
 CE 版把"核内重叠的对端读 + 本地加"变成 `stage → rendezvous → CE 拷 → add` 四段串行;
 ⇒ **读腿的税要修,就得在 SM 读这一条路上修(VMM 映射参数/页粒度),不能绕道 CE。**
 
-#### 49.2 TBO 首测(`tools/p2p-overlap-probe.cu` 新增 S/T/U 臂;链 = 8 层 × [GEMM m256 + AR 2.62MB])
+#### 49.2 TBO 首测(`tools/fixture/p2p-overlap-probe.cu` 新增 S/T/U 臂;链 = 8 层 × [GEMM m256 + AR 2.62MB])
 
 | 臂 | 读数 | 判 |
 |---|---:|---|
@@ -3612,7 +3612,7 @@ CE 版把"核内重叠的对端读 + 本地加"变成 `stage → rendezvous → 
 **立案(v1 的假设)**:§49.2 两条流各一条链只藏 36% ⇒ 猜"两条链的满占用 GEMM 互抢 SM,
 一条链的 AR 在飞时另一条没有 GEMM 可跑"。**判据:N 变大时吞吐比是否往 N 走。**
 
-(`tools/p2p-overlap-probe.cu` 的 `V` 臂 = 微批扫描;链 = `NL=6` 层 × [GEMM m=512/N + AR 5.24MB/N];
+(`tools/fixture/p2p-overlap-probe.cu` 的 `V` 臂 = 微批扫描;链 = `NL=6` 层 × [GEMM m=512/N + AR 5.24MB/N];
 读源在对端 20MB 里轮流 ⇒ 断 L2;`cublasSetStream` 建 handle 后立刻设)
 
 | N | m | 单链 | N 链并行 | **吞吐比** | 理想 |
@@ -3651,7 +3651,7 @@ CE 版把"核内重叠的对端读 + 本地加"变成 `stage → rendezvous → 
 
 #### 49.5 ★★★★ 机制判据(核级 / 发序 / 错相):**全部否掉 ⇒ 更正 §48 的适用范围**
 
-`tools/p2p-overlap-probe.cu` 新增 `X`(核级)与 `Y`(错相)臂。链条形状:全批 512 token、GEMM m=512/n5120/k5120、
+`tools/fixture/p2p-overlap-probe.cu` 新增 `X`(核级)与 `Y`(错相)臂。链条形状:全批 512 token、GEMM m=512/n5120/k5120、
 AR 读 5.24MB(源在对端 20MB 里轮流 ⇒ 断 L2)。
 
 | 臂 | µs | 判 |
@@ -3716,7 +3716,7 @@ AR 读 5.24MB(源在对端 20MB 里轮流 ⇒ 断 L2)。
 | AR 次数 / token | 128(2/层 × 64 层)|
 | 若每次 α ≈ 20µs | **2.56 ms / 23.4 ms = 11%** |
 
-#### 50.2 ★ 栅栏成本按载荷的缩放(新读数;`tools/p2p-wr-tune.cu`,ord 0/3)
+#### 50.2 ★ 栅栏成本按载荷的缩放(新读数;`tools/fixture/p2p-wr-tune.cu`,ord 0/3)
 
 | 载荷 | +fence | −fence | **栅栏差** | 占写腿 |
 |---|---:|---:|---:|---:|
@@ -3764,7 +3764,7 @@ AR 读 5.24MB(源在对端 20MB 里轮流 ⇒ 断 L2)。
 
 #### 50.6 ★ 第一刀实测(栅栏档扫描):**省在"单线程 release 发布",不在"放宽 fence"**
 
-`tools/p2p-wr-tune.cu` 新增 `k_wr_fence<FM>` 四档(10 KB 档,K=300,ord 0/3):
+`tools/fixture/p2p-wr-tune.cu` 新增 `k_wr_fence<FM>` 四档(10 KB 档,K=300,ord 0/3):
 
 | 档 | µs | 判 |
 |---|---:|---|
@@ -3836,7 +3836,7 @@ AR 读 5.24MB(源在对端 20MB 里轮流 ⇒ 断 L2)。
 #### 50.8 ★★★★ 更正:"VMM 读腿税 17~20%" 是**跨程序相减**的伪差;真值是 **4~6%**
 
 **动机**:§50.7 结尾把 prefill 的 α(109µs)大部分归给"VMM 读腿税",并据此建议"换回 runtime 映射"。
-**判据**:`tools/vmm-peer-probe.cu` —— **同进程、同对卡、同核、同载荷,只换"对端块是怎么来的"**(K=200,5.24MB,f16)。
+**判据**:`tools/fixture/vmm-peer-probe.cu` —— **同进程、同对卡、同核、同载荷,只换"对端块是怎么来的"**(K=200,5.24MB,f16)。
 
 | 臂 | **3090 Ti 对**(ord 0/1;`Static`)| **3080 对**(ord 2/3;`Window`)|
 |---|---:|---:|
@@ -3869,7 +3869,7 @@ AR 读 5.24MB(源在对端 20MB 里轮流 ⇒ 断 L2)。
 - ⇒ **"砍协议往返"(§50.5 的刀 #2/#3:用 2 槽余量取消尾部 rendezvous、credit 改非阻塞)
   是 prefill 与 decode 共同的第一刀;而"换映射"排到第二(值 ~0.5% of TP2,且 Window 档可能落不了地)。**
 
-**⇒ 处置**:`tools/vmm-peer-probe.cu` 的读数存档;§49.1/§50.7 的"VMM 17–20%"表述**作废**,
+**⇒ 处置**:`tools/fixture/vmm-peer-probe.cu` 的读数存档;§49.1/§50.7 的"VMM 17–20%"表述**作废**,
 以本节 3.8–5.9%(1-way)为准。
 
 ---
@@ -3917,7 +3917,7 @@ AR 读 5.24MB(源在对端 20MB 里轮流 ⇒ 断 L2)。
 ### 52. ★★★★★ 1-stage 在 **27B(量化档)从未生效** —— 定位到设计前提,不是标签问题(2026-10-19)
 
 **动机**:§51 在 0.8B 上量出 1-stage(融合核)**−4.7%**,据此推测 27B decode 值 ~5%
-⇒ 直接上生产 A/B(`tools/tp-ab-std.sh tp2`,ord 2/3,27B AWQ-INT4):
+⇒ 直接上生产 A/B(`tools/fixture/tp-ab-std.sh tp2`,ord 2/3,27B AWQ-INT4):
 
 | 指标 | **v1** | **OWL_TP_1STAGE=1** | 差 |
 |---|---:|---:|---:|
@@ -4150,7 +4150,7 @@ owl  : [ar_stage 核:拷进我的槽 + **系统级栅栏** + 发布 produced + c
 
 **动机**:§54 从 vLLM 源码看出结构差别([CE 拷贝 + 1 融合核] vs [stage 核 + reduce 核]),
 §55.4 据此提改造 —— **但没有分母**。用户口径:"多测几个变化。"
-**工具**:`tools/ar-struct-probe.cu`(新;同载荷、同两卡、**图内回放**、host 只出一次 launch、**带落地校验**)。
+**工具**:`tools/fixture/ar-struct-probe.cu`(新;同载荷、同两卡、**图内回放**、host 只出一次 launch、**带落地校验**)。
 
 #### 56.1 四种协议(10 KB;N=32/图;REPS=5;ord 2/3)
 
@@ -4291,7 +4291,7 @@ prefill: −16.0 µs/AR × 128/512 = −4.0 µs/token ⇒ TP2 651.1 → 647.1 = 
 **⇒ 真实的 decode 比值 ≈ 1.315×(不是 1.00×),但"账不对"这件事成立**(见 §58.6):
 TP2 每卡流量只有 TP1 的 **0.576×**(见 §58.3 的 lm_head),decode 却只快 1.315×。
 
-#### 58.2 本轮 A/B 口径(`tools/tp-ab-std.sh ab`;同二进制、同卡对 2/3、同会话)
+#### 58.2 本轮 A/B 口径(`tools/fixture/tp-ab-std.sh ab`;同二进制、同卡对 2/3、同会话)
 
 | 臂 | prefill avg | decode avg | TTFT@512 |
 |---|---:|---:|---:|
@@ -4319,8 +4319,8 @@ TP2 每 token 每卡 = (9.215+3.970)/2 + 2.368 = 8.96 GiB   ⇒ 比值 0.576(不
 #### 58.4 ★★★★ 仪器:`nsys --cuda-graph-trace=node`(图模式逐核 + 分卡;已入树)
 
 ```bash
-tools/nsys-decode-account.sh tp2 tp27b testdata/args/bench-27b-tp2.toml   # 起服+打点+出报告
-python3 tools/nsys_decode_account.py tp1 tp2                              # 两臂并排单步表
+tools/fixture/nsys-decode-account.sh tp2 tp27b testdata/args/bench-27b-tp2.toml   # 起服+打点+出报告
+python3 tools/fixture/nsys_decode_account.py tp1 tp2                              # 两臂并排单步表
 ```
 
 **量法**(判据口径):按内核开始时间排序,间隙 >200µs 切段 ⇒ 一段 = 一次图回放 = 一 token 步;
@@ -4476,7 +4476,7 @@ TP2 步 = **11.47**(减半的 marlin) + **8.8ms 完全不缩的固定项**(31%) 
 客户端 `ConnectError: All connection attempts failed` + 服务端日志**零错误** + 进程已消失
 + 设备日志无 OOM/Xid/core。**根因**:两边都按"占用该端口者"清场(一边 `kill $(lsof -ti:8137)`,
 另一边 `ss -ltnp` 按端口收)——而**双方默认都绑 8137**(flavor 里写死)。
-⇒ 处置:`tools/tp-ab-std.sh` 加**端口 preflight**(只收自己 worktree 的实例;**别人的响亮拒**,
+⇒ 处置:`tools/fixture/tp-ab-std.sh` 加**端口 preflight**(只收自己 worktree 的实例;**别人的响亮拒**,
 不代为清理)+ 文件头写明"并行跑必须换专属 PORT **且运行档里声明同一 bind**"。
 **㉝ 判据自己的 dtype/期望值也要过一遍**:本轮两次假红——① argmax 的"期望索引"不能用
 手填的(`lcg_f16` 会产出**多个恰好相等**的最大值,而核的平局律 = 取**最小索引**;
@@ -4546,13 +4546,13 @@ TP2 步 = **11.47**(减半的 marlin) + **8.8ms 完全不缩的固定项**(31%) 
 ⇒ **"绕开 VMM"若为省 API 成本 = 走错门**(那 1.8ms 在启动时,与 decode 无关);
 它唯一可能值的地方是**访问路税**。
 
-#### 60.2 仪器:`tools/vmm-mapping-tax-probe.cu`(新;与 `vmm-peer-probe.cu` 分工)
+#### 60.2 仪器:`tools/fixture/vmm-mapping-tax-probe.cu`(新;与 `vmm-peer-probe.cu` 分工)
 
 `vmm-peer-probe.cu`(2026-10-18)= 单点定性;本探针 = **记账面**:① API 逐步成本;
 ② **尺寸阶梯**(10KB/128KB/1.25MiB/5MiB/32MiB)判"税是固定还是比例";③ **写腿**
 (push 档前置 —— 现役生产就是写腿);④ **导入访问位 A/B**(READ vs RW —— v1 档 vs push 档);
 ⑤ **生产 AR 形状**两条协议各跑一遍。
-跑法:`nvcc -O3 -arch=sm_86 -o /tmp/vmm-tax tools/vmm-mapping-tax-probe.cu -lcuda && /tmp/vmm-tax 2 3`
+跑法:`nvcc -O3 -arch=sm_86 -o /tmp/vmm-tax tools/fixture/vmm-mapping-tax-probe.cu -lcuda && /tmp/vmm-tax 2 3`
 (⚠️ 跑前查卡;它的 peer 导入**占 BAR1 窗口**,探针自己负责 unmap —— 见 60.5 的坑)
 
 #### 60.3 ★★ 表 A:API 一次性成本(64MiB/两卡两块;3 次中位)
@@ -5264,7 +5264,7 @@ P0.1 账里 `owl_gdn_recurrence_varlen_gqa_f16` = 664 ms/卡(19%)、768 发。
 **纪律(新增 @39)**:任何"从端到端反推的单核读数",上核台前**先用 nsys 的 grid/block 核对形状**;
 TP 档的"每 rank 头数"是**配置声明`/world`**,不是 config.json 的字面值。
 
-### 68.2 归因阶梯(`tools/gdn-rec-probe.cu`;3080 ord2,nv=24,nk=8,T=1024,8k 预热后 1.9 GHz)
+### 68.2 归因阶梯(`tools/fixture/gdn-rec-probe.cu`;3080 ord2,nv=24,nk=8,T=1024,8k 预热后 1.9 GHz)
 
 | 臂 | µs/token | Δ | 病根 |
 |---|---:|---:|---|
@@ -5338,7 +5338,7 @@ C 的扫描:C=1 1.41 / **C=2 1.087** / C=4 1.20(C=4 让并行 warp 数掉到 1/4
 
 ### 69.1 现状(TP2 / 双 3080 / `tp2-nospec-vsplit-fused`;prompt 63 tok、64 token 解码)
 
-`tools/nsys-decode-account.sh p14-dec`(node 模式)单步:核 964 个、设备 Σ **17.22 ms**。
+`tools/fixture/nsys-decode-account.sh p14-dec`(node 模式)单步:核 964 个、设备 Σ **17.22 ms**。
 
 | 项 | µs/步 | 占比 | 判语 |
 |---|---:|---:|---|
@@ -5392,7 +5392,7 @@ lm_head 量化(+6.4%,一刀)与节点税(~1.8 ms,9%)都在同一量级,而 marli
 
 ## 70. AR 小包延迟分相(2026-10-19)—— 协议本体很便宜,**fence 几乎免费**,节点税 1.34 µs/节点
 
-### 70.1 工具:`tools/ar-latency-probe.cu`(单进程双卡、两线程各驱动一 rank)
+### 70.1 工具:`tools/fixture/ar-latency-probe.cu`(单进程双卡、两线程各驱动一 rank)
 
 把生产融合核的协议逐相复制(单槽 ⇒ 省掉环,但 credit/发布/rendezvous/读加/收尾全在),
 每相打 `clock64()`(单 block ⇒ 同一 SM,亚 ns;⚠️ `%globaltimer` 在 sm_86 上**量化 ~1 µs**,
@@ -5850,8 +5850,8 @@ TTFT/prefill 不变**符合结构**:prefill 也在**末行窄切后**调头(`for
 
 ### 76.1 仪器(先修尺,再量)
 
-- `tools/nsys-decode-account.sh l2-fused tp27b <fused 站点档>`(**node 模式**)→
-  `tools/nsys_decode_account.py`:单步 **964 核**,设备 Σ **17.26 ms**,span **17.25 ms**;
+- `tools/fixture/nsys-decode-account.sh l2-fused tp27b <fused 站点档>`(**node 模式**)→
+  `tools/fixture/nsys_decode_account.py`:单步 **964 核**,设备 Σ **17.26 ms**,span **17.25 ms**;
 - **Σ ≈ span ⇒ 核是背靠背的:图内没有空隙**。脚本算出的"段间空隙(host) 2.21 ms"
   是 **CUPTI 逐节点插桩**的代价(node 模式的 ITL 19.47 vs 同档干净 ITL ≈18.6),
   与 §69.2 的律 @40 同一条:**空隙读数不可用,核内时长可信**;

@@ -543,7 +543,7 @@ metrics（低基数）：
 | DOCS 56.8k AL | **1.574** | 1.304 | 1.324 |
 
 MATH 三点基本持平；DOCS 4032 明显最优 ⇒ **保持 4032/64**，窗口不是越大越好。
-测量脚本已收编 `tools/mtp_curve.py`。当前数据 = Phase 0 + T0 收尾；生产 MTP 档
+测量脚本已收编 `tools/fixture/mtp_curve.py`。当前数据 = Phase 0 + T0 收尾；生产 MTP 档
 已写 `mtp_window=4032` / `mtp_window_min_ctx=12288`，A/B 回退用
 `--set spec.mtp_window=0`。
 

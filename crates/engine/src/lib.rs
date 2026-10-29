@@ -107,9 +107,102 @@ pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use session::{AgentSession, SessionTable};
 pub use turn::{TurnEvent, TurnImage, TurnOpts, TurnSampler, TurnSpec};
 
-/// 主干量化方案映射(**唯一点**:`(format, quant)` → owl_models `QuantPlan`;
+/// **装载臂白名单**(2026-10-30 用户裁决:只吃预量化产物)。
+///
+/// 引擎**不做任何格式转换**:离线转换器已从树中移除,装载期"从全精度现量化"
+/// 也不再是对外能力(转换研究在另一条线,产出物再交回 owl 直接装载)。
+/// 四族之外 = boot 期**响亮拒**([`load_arm_of`] 点名白名单),不再是旧
+/// [`quant_plan_of`] 那种"兜底回 f16 静默跑"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadArm {
+    /// **AWQ-INT4**:pack-quantized / g32 非对称(cyankiwi 系;int4 已由产出方烘焙)
+    AwqInt4,
+    /// **AWQ-INT4 · W4A8**:与上一臂**同源预量化权重**,装载期把三件套重排成 a8
+    /// 布局(纯 repack,不产生新精度),激活走 per-token int8。**生产档**
+    /// (prefill +48~50% / TTFT −33% @32k;3090 与 3080 档均跑这一臂)
+    AwqA8,
+    /// **NVFP4** 块缩放(e2m1 数据 + 每 16 个 k 一个 e4m3 缩放)
+    NvFp4,
+    /// **GGUF 块型**(Q4_K / IQ4 / IQ3;逐张量型仍以文件为准)
+    Gguf(owl_models::formats::gguf::GgmlTy),
+    /// **f16/bf16 基线**(无量化;0.8B 开发档与附属件,非生产档)
+    F16Base,
+}
+
+impl LoadArm {
+    /// 臂 → owl_models `QuantPlan`(白名单臂的**唯一**换算处)
+    pub fn quant_plan(self) -> owl_models::module::QuantPlan {
+        use owl_models::module::QuantPlan as P;
+        match self {
+            LoadArm::AwqInt4 => P::W4A16Awq,
+            LoadArm::AwqA8 => P::W4A8Awq,
+            LoadArm::NvFp4 => P::NvFp4,
+            LoadArm::Gguf(ty) => P::Gguf(ty),
+            LoadArm::F16Base => P::F16,
+        }
+    }
+
+    /// 诊断名(日志/错误信息用)
+    pub fn name(self) -> &'static str {
+        match self {
+            LoadArm::AwqInt4 => "awq-int4",
+            LoadArm::AwqA8 => "awq-w4a8",
+            LoadArm::NvFp4 => "nvfp4",
+            LoadArm::Gguf(_) => "gguf",
+            LoadArm::F16Base => "f16/bf16",
+        }
+    }
+}
+
+/// **server 的唯一装载接线点**(2026-10-30):`(format, quant)` → [`LoadArm`]。
+///
+/// 白名单(直接加载,不做转换):
+///
+/// | format | quant | 臂 |
+/// |---|---|---|
+/// | `awq` | `w4a16` | [`LoadArm::AwqInt4`] —— AWQ-INT4 预量化 |
+/// | `awq` | `w4a8` | [`LoadArm::AwqA8`] —— 同源权重 + int8 激活(生产档) |
+/// | `safetensors` | `nvfp4` | [`LoadArm::NvFp4`] —— NVFP4 块缩放 |
+/// | `gguf` | `q4k` / `iq4` / `iq3` | [`LoadArm::Gguf`] —— GGUF 块型 |
+/// | `safetensors` | `w4a16` | [`LoadArm::F16Base`] —— 裸 f16/bf16 基线(开发档) |
+///
+/// **路线图内、尚未接线**:**G128**(W4A16 g128-sym,llm-compressor / ct
+/// pack-quantized:`format=safetensors` + `quant=w4a16` + `.weight_packed` 三件套)。
+/// 装载路径已存在(`QuantPlan::W4A16`),挡在 marlin g128 形状雷上(n 必须
+/// `512·2^k`);放行前需按**键面探测**(`CheckpointKind::PackQuantized`)与裸 f16
+/// 目录分流 —— 今天两者都答 [`LoadArm::F16Base`],g128 产物会按 f16 读而报缺键。
+///
+/// 其余组合 = `Err`(错误信息点名白名单;不猜、不兜底)。加第五族是**决策**,
+/// 不是配置开关:枚举加臂 + 此表加行 + 质量门台账。
+pub fn load_arm_of(
+    f: owl_shared::config::ModelFormat,
+    q: owl_shared::config::QuantScheme,
+) -> Result<LoadArm> {
+    use owl_shared::config::{ModelFormat as F, QuantScheme as Q};
+    match (f, q) {
+        (F::Awq, Q::W4a16) => Ok(LoadArm::AwqInt4),
+        (F::Awq, Q::W4a8) => Ok(LoadArm::AwqA8),
+        (F::Safetensors, Q::Nvfp4) => Ok(LoadArm::NvFp4),
+        (F::Safetensors, Q::W4a16) => Ok(LoadArm::F16Base),
+        (F::Gguf, Q::Q4k) => Ok(LoadArm::Gguf(owl_models::formats::gguf::GgmlTy::Q4K)),
+        (F::Gguf, Q::Iq4) => Ok(LoadArm::Gguf(owl_models::formats::gguf::GgmlTy::Iq4Nl)),
+        (F::Gguf, Q::Iq3) => Ok(LoadArm::Gguf(owl_models::formats::gguf::GgmlTy::Iq3Xxs)),
+        (f, q) => Err(owl_iface::contract::ModelError::Msg(format!(
+            "[model] format = {f:?} × quant = {q:?} 不在装载白名单内。\
+             owl 只直接加载**预量化产物**(不做格式转换,离线转换器不在本仓):\
+             awq+w4a16(AWQ-INT4)/ awq+w4a8(W4A8)/ safetensors+nvfp4(NVFP4)\
+             / gguf+q4k|iq4|iq3(GGUF)/ safetensors+w4a16(f16 基线,开发档;\
+             G128 待接线,键面带 .weight_packed 时才是 g128)。\
+             换格式请先在外部产出相应 4bit 检查点"
+        ))),
+    }
+}
+
+/// 主干量化方案映射(**测试/内部用**;server 接线已改为 [`load_arm_of`] ——
+/// 本表的两条兜底臂(`(_, Nvfp4)`、`(Safetensors, W4a8)`)不再可从配置面到达)。
+///
 /// 同 [`head_plan_of`] 的范式 —— app 层不碰 owl_models,新方案 =
-/// 加枚举值 + 此处加臂 + 质量门台账)。
+/// 加枚举值 + 此处加臂 + 质量门台账。
 ///
 /// 为什么同时要 `format`:同一个 `w4a16` 在 AWQ 档是 **pack-quantized 布局**
 /// (`W4A16Awq`),在普通 safetensors 档是**装载期重排**(`W4A16`)——
@@ -141,8 +234,9 @@ pub fn quant_plan_of(
     }
 }
 
-/// **safetensors 目录的“装载期现量化”计划**(与 [`quant_plan_of`] 并列的
-/// 第二入口:同样是唯一映射点,只服务普通 HF 目录)。
+/// **safetensors 目录的“装载期现量化”计划**(**测试/内部用**;server 接线已改为
+/// [`load_arm_of`] —— 白名单下唯一允许的 safetensors 量化臂是 `nvfp4`,其余一律
+/// 响亮拒,不再有"回 f16 静默跑"的兜底)。
 ///
 /// 为何不直接用 [`quant_plan_of`]:那份表对 `(Safetensors, W4a16)` 答
 /// `W4A16` —— 那是**pack-quantized 源**(ct 已打包的 qweight/scales)
@@ -166,3 +260,41 @@ pub fn safetensors_load_plan(
 
 /// 本 crate 的结果别名:错误权威 = iface `ModelError`(线上一族,不另立)
 pub type Result<T> = std::result::Result<T, owl_iface::contract::ModelError>;
+
+#[cfg(test)]
+mod load_arm_tests {
+    use super::{load_arm_of, LoadArm};
+    use owl_models::formats::gguf::GgmlTy;
+    use owl_shared::config::{ModelFormat as F, QuantScheme as Q};
+
+    /// 白名单臂(AWQ-INT4 / W4A8 / NVFP4 / GGUF / f16 基线)= 放行;其余 =
+    /// 响亮点名拒(2026-10-30 裁决:只吃预量化产物;W4A8 是生产档)
+    #[test]
+    fn whitelist_arms_and_loud_refusal() {
+        let ok = [
+            (F::Awq, Q::W4a16, LoadArm::AwqInt4),
+            (F::Awq, Q::W4a8, LoadArm::AwqA8),
+            (F::Safetensors, Q::Nvfp4, LoadArm::NvFp4),
+            (F::Safetensors, Q::W4a16, LoadArm::F16Base),
+            (F::Gguf, Q::Q4k, LoadArm::Gguf(GgmlTy::Q4K)),
+            (F::Gguf, Q::Iq4, LoadArm::Gguf(GgmlTy::Iq4Nl)),
+            (F::Gguf, Q::Iq3, LoadArm::Gguf(GgmlTy::Iq3Xxs)),
+        ];
+        for (f, q, want) in ok {
+            assert_eq!(load_arm_of(f, q).expect("白名单臂应放行"), want, "{f:?}×{q:?}");
+        }
+        // 旧 `quant_plan_of` 的兜底臂:纯 HF 目录 × 块型 / awq × nvfp4 / 裸目录 × w4a8
+        for (f, q) in [
+            (F::Safetensors, Q::Q4k),
+            (F::Safetensors, Q::W4a8),
+            (F::Awq, Q::Nvfp4),
+            (F::Awq, Q::Q4k),
+            (F::Gguf, Q::W4a16),
+            (F::Gguf, Q::Nvfp4),
+        ] {
+            let e = load_arm_of(f, q).expect_err("非白名单组合必须响亮拒");
+            let msg = e.to_string();
+            assert!(msg.contains("白名单"), "错误信息须点名白名单,实得: {msg}");
+        }
+    }
+}

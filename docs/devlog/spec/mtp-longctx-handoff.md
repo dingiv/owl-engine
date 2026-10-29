@@ -46,7 +46,7 @@ T0 已收尾（W=4032 最优；W=8192 已补）
 新增文件：
 
 ```text
-tools/mtp_curve.py
+tools/fixture/mtp_curve.py
 crates/engine/src/exec/mtp_window.rs
 mtp-longctx-windowed.md
 mtp-longctx-handoff.md   # 本文
@@ -59,7 +59,7 @@ crates/shared/src/config/mod.rs          SpecCfg.mtp_window/mtp_sink + 校验
 crates/engine/src/engine.rs              DraftCfg / SpecBootInput / boot v2 门
 crates/engine/src/spec_runtime.rs        SpecRuntime.mtp_window + 模式/深度校验
 crates/engine/src/exec/mod.rs            mod mtp_window
-tools/mtp_curve.py
+tools/fixture/mtp_curve.py
 crates/engine/src/exec/mtp_window.rs     MtpWindowPlan（纯函数 + 9 单测）
 crates/engine/src/exec/draft.rs          propose_first/round/graph_step 接线
 crates/engine/src/graph_fleet.rs         chain c{j}_bt 输入槽
@@ -244,12 +244,12 @@ GDN_TRITON_PY=/path/to/owl/crates/kernels/.venv/bin/python \
 - 生产值：`4032/64`；W=6144/8192 均已补（`REPORT.md` §6.1）。
 - MATH 64k：4032 `93.60` / 6144 `92.79` / 8192 `93.77`（基本持平）。
 - DOCS 56.8k：4032 `69.39` / 6144 `62.53` / 8192 `63.82`（**4032 最优**）。
-- 测量脚本已收编：`tools/mtp_curve.py`（不再依赖 `/tmp`）。
+- 测量脚本已收编：`tools/fixture/mtp_curve.py`（不再依赖 `/tmp`）。
 
 ### 命令
 
 ```bash
-# 复现（脚本 = tools/mtp_curve.py；GPU2/8141 避开外部 8140）
+# 复现（脚本 = tools/fixture/mtp_curve.py；GPU2/8141 避开外部 8140）
 ./target/release/server \
   -p profiles/qwen38_27b-3090-w4a16-mtp.toml \
   --set server.bind=127.0.0.1:8141 \
@@ -257,12 +257,12 @@ GDN_TRITON_PY=/path/to/owl/crates/kernels/.venv/bin/python \
   --set spec.mtp_window=6144 --set spec.mtp_sink=64
 
 # 64k MATH（2 轮；W=4032 已有基线）
-python3 tools/mtp_curve.py --url http://127.0.0.1:8141 \
+python3 tools/fixture/mtp_curve.py --url http://127.0.0.1:8141 \
   --out <out-dir>/w6144 \
   --length 65536 --rounds 2
 
 # 64k DOCS（1–2 轮；prompt-file 同 REPORT）
-python3 tools/mtp_curve.py --url http://127.0.0.1:8141 \
+python3 tools/fixture/mtp_curve.py --url http://127.0.0.1:8141 \
   --out <out-dir>/w6144-docs \
   --length 65536 --rounds 1 --domain prose \
   --prompt-file 本地实测档(未入库)/corpus-docs.txt
@@ -646,7 +646,7 @@ mtp-longctx-handoff.md
 本地实测档(未入库)/{spec,spec-d7,nospec,spec-docs,nospec-docs,window-test,window-test2,window-docs}/
 
 # 代码
-tools/mtp_curve.py
+tools/fixture/mtp_curve.py
 crates/engine/src/exec/mtp_window.rs
 crates/engine/src/exec/draft.rs
 crates/engine/src/exec/spec.rs

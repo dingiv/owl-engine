@@ -384,17 +384,17 @@ AR 全串行的算术上限 = 1.64×(⇒ prefill 已吃到上限的 ~93%)
 | 工具 | 用途 |
 |---|---|
 | `crates/backends/cuda/tests/ar_channel_bench.rs` | AR 微基准 + **图内 AR 回放**(`OWL_ARB_GRAPH=1`,量真设备时延)+ 旁路协议/单核臂 |
-| `tools/ar-struct-probe.cu` | **四协议结构对比台**(现役 v1 形状 / CE+融合核 / release-acquire / 末次 relaxed;三尺寸 × 四几何;自带数值校验)|
-| `tools/p2p-wr-tune.cu` | 写腿:存储策略 / 栅栏档 / 几何 / 尺寸扫描 |
-| `tools/p2p-overlap-probe.cu` | 重叠归属:X(核级)/Y(错相)/V(微批扫描)/R(读腿) |
-| `tools/vmm-peer-probe.cu` | 映射路径 A/B(runtime vs VMM) |
-| `tools/tp-ab-std.sh` | 生产 std A/B 跑手(起服 → `llm_speedtest --flavor std` → 停服)|
-| **`tools/nsys-decode-account.sh` + `nsys_decode_account.py`** | **图模式逐核分账**(nsys `--cuda-graph-trace=node`;不改代码/不改档位/可分卡 ⇒ decode 步的核表 + 两 rank 时间线)|
+| `tools/fixture/ar-struct-probe.cu` | **四协议结构对比台**(现役 v1 形状 / CE+融合核 / release-acquire / 末次 relaxed;三尺寸 × 四几何;自带数值校验)|
+| `tools/fixture/p2p-wr-tune.cu` | 写腿:存储策略 / 栅栏档 / 几何 / 尺寸扫描 |
+| `tools/fixture/p2p-overlap-probe.cu` | 重叠归属:X(核级)/Y(错相)/V(微批扫描)/R(读腿) |
+| `tools/fixture/vmm-peer-probe.cu` | 映射路径 A/B(runtime vs VMM) |
+| `tools/fixture/tp-ab-std.sh` | 生产 std A/B 跑手(起服 → `llm_speedtest --flavor std` → 停服)|
+| **`tools/fixture/nsys-decode-account.sh` + `nsys_decode_account.py`** | **图模式逐核分账**(nsys `--cuda-graph-trace=node`;不改代码/不改档位/可分卡 ⇒ decode 步的核表 + 两 rank 时间线)|
 | `[probes] step_profile = true` | host 面的分相(每步 `fill+launch` / `token-dtoh` / 尾巴)|
-| **`tools/vmm-mapping-tax-probe.cu`** | **映射路径成本账**(2026-10-19 §60):① API 逐步成本(VMM vs runtime);② **访问税尺寸阶梯**(10KB→32MiB)× 读/写 × 单边/双边;③ **导入访问位 A/B**(READ vs RW);④ 两条 AR 协议形状 |
+| **`tools/fixture/vmm-mapping-tax-probe.cu`** | **映射路径成本账**(2026-10-19 §60):① API 逐步成本(VMM vs runtime);② **访问税尺寸阶梯**(10KB→32MiB)× 读/写 × 单边/双边;③ **导入访问位 A/B**(READ vs RW);④ 两条 AR 协议形状 |
 | **`crates/kernels/tests/ln_elems_bench.rs`** | **小核延迟台**(norm/fused_add/embed/argmax:**数值对拍 + µs;M=1/M=32 双档**分辨 host/设备受限;几何扫描;`*` = 生产几何)|
 
-⚠️ **同机多会话的端口纪律**(§58.10.7 ㉜):`tools/tp-ab-std.sh` 默认 8137,**与本机别的
+⚠️ **同机多会话的端口纪律**(§58.10.7 ㉜):`tools/fixture/tp-ab-std.sh` 默认 8137,**与本机别的
 agent 会话会互相击杀**(症状 = 客户端 `ConnectError` + 服务端零错 + 进程消失)。
 并行跑时:`PORT=8141` **且**运行档里 `[runtime] bind = "127.0.0.1:8141"`;
 脚本已加 preflight(端口被**别的 worktree**占用 ⇒ 响亮拒,不代为清理)。

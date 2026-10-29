@@ -17,7 +17,7 @@
 set -u
 TAG="$1"; FLAVOR="$2"; CFG="$3"
 PORT="${PORT:-8139}"
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="/tmp/diag/$TAG"
 API="http://127.0.0.1:$PORT/v1/chat/completions"
 mkdir -p "$OUT"; rm -f "$OUT"/nsys.nsys-rep "$OUT"/nsys.sqlite "$OUT"/srv.log 2>/dev/null

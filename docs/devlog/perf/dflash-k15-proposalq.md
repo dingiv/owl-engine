@@ -120,7 +120,7 @@ N=8 时 scheduler 把 live 压到 7（保留 bonus），verify 仍 T=16；
 
 ### 2.4 32K fixed-tail W8A16 TC 质量门
 
-prompt = `tools/fixedtail_prompt.py --length 32768`（34,240 tok），
+prompt = `tools/fixture/fixedtail_prompt.py --length 32768`（34,240 tok），
 N=64，TP2 3080，DFlash2 d7，head split。
 
 | 臂 | rounds | AL | round | verify | propose | decode |
@@ -176,7 +176,7 @@ OWL_TP_HEAD_CTX=1024 cargo test --release -p owl-engine \
   --test tp_head_i8_gate -- --nocapture
 
 # 32K fixed-tail（两臂 + compare）
-python3 tools/fixedtail_prompt.py --length 32768 --out /tmp/fixedtail32k.txt
+python3 tools/fixture/fixedtail_prompt.py --length 32768 --out /tmp/fixedtail32k.txt
 OWL_TP_HEAD_PROMPT_FILE=/tmp/fixedtail32k.txt OWL_TP_HEAD_CTX=35000 \
 OWL_TP_HEAD_N=64 ... OWL_TP_HEAD_ARM=f16 ...
 # i8 同参；然后 cp 到 /tmp/owl-tp-head-{f16,i8}.txt 跑 compare

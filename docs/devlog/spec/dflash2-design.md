@@ -325,7 +325,7 @@ probe 修正(单遍 multi)后根序解码:root1 = conv_in = **5019 有限**(conv
 
 ### 6.13 golden 对拍定位:首个发散 = L1 fused_add(同日八)
 
-- **golden 基建落成**(用户三指示兑现):tools/dflash2_golden.py(torch
+- **golden 基建落成**(用户三指示兑现):tools/fixture/dflash2_golden.py(torch
   f32,真实 W4A16 反量化,sglang 逐式;随机公式输入隔离 target)→
   testdata/dflash2_golden.safetensors 逐层激活;owl 侧
   gpu_dflash2_golden_matches(marlin 同权重同输入)逐层对拍

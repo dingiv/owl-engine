@@ -122,12 +122,17 @@ tp_vocab_split = false
 # 对外模型名(空 = GGUF 用文件名 / 其它用服务端缺省)
 name = "qwen3.8-27b"
 # 模型路径:目录(safetensors / awq)或 .gguf 单文件
-path = "../codes/models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+path = "../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
 # 权重摆放格式:safetensors | awq | gguf
 format = "awq"
-# 主干量化方案:
-#   safetensors/awq → w4a16 | w4a8 | w8a8i(暂未支持) | w8a8f(暂未支持)
-#   gguf            → q4k | iq4 | iq3
+# 主干量化方案(2026-10-30 白名单口径;权威表 = owl_engine::load_arm_of):
+#   awq         + w4a16 → AWQ-INT4 预量化(pack-quantized g32 非对称)
+#   awq         + w4a8  → 同源权重 + int8 激活(生产档;prefill +48~50%)
+#   safetensors + nvfp4 → NVFP4 块缩放(e2m1 + e4m3/16)
+#   gguf        + q4k | iq4 | iq3 → GGUF 块型
+#   safetensors + w4a16 → f16/bf16 基线(无量化;开发档)
+#     (G128 = g128-sym pack-quantized 档在路线图内,未接线:届时按键面探测分流)
+#   其余组合 = boot 期拒。owl 不做格式转换,只吃**已量化好的产物**。
 quant = "w4a16"
 # lm_head 量化:off | rtn-int4-g32 | rtn-int8-row
 # 2026-10-22 用户裁决:int4 头太小,int8 为默认(质量优先;int4 仅显式覆盖)

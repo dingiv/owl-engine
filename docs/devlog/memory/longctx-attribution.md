@@ -125,7 +125,7 @@ CUDA_VISIBLE_DEVICES=GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
   --perf-level host --log-level info
 
 # 梯子(逐点跑 llm_speedtest + 抓 epoch perf/发射账)
-python3 tools/ctxladder.py --out <out-dir> \
+python3 tools/fixture/ctxladder.py --out <out-dir> \
   --lengths 512,2048,8192,16384,32768 --rounds 1 --notes "<档位说明>"
 
 # 逐核档:CUPTI 必须在 boot 武装 ⇒ 重启实例并加 --perf-level gpu
@@ -200,7 +200,7 @@ decode t/s 直接 **47.9 / 57.0 / 48.9 / 63.2**(±20%)。
 
 ⇒ 判读纪律(入册):**decode 比较必须以「轮时(ms/轮)」为主键,`t/s` 只在轮数同档时才可比**;
 llm_speedtest 的 t/s 是 AL 的函数,而 AL 随 prompt 域/温度/随机性漂。
-本 worktree 的 `tools/ctxladder.py` 已把 `rounds`/`AL` 一并落进 `summary.tsv`。
+本 worktree 的 `tools/fixture/ctxladder.py` 已把 `rounds`/`AL` 一并落进 `summary.tsv`。
 
 ---
 

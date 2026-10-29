@@ -29,7 +29,7 @@
 | **代价/未决** | 17+17 条 slab:实测 **485MiB 图族总账**(session 47 / verify 313,见 **§12 显存账**);**段 slab 合并只值 −71MiB**(单 slab 口径 26/263MiB);⚠️ 合入 main 后**桶族(geobuckets)在 eval 档 5/5 全灭** = 起跑线太高(本设计边际 +580MiB),生产档不受影响(flavor 缺省 `prefill_bucket=off`)|
 | **不变量** | **I-1..I-6**(§5)+ **I-7 段边界值必须 keep**、**I-8 捕获窗内零回收**、**I-9 空段/空尾不建图**、**I-10 断点采集面与 plan 的断点表同源**(§11.3) |
 | **机制一句话** | 树被**断点**(核节点)切成段,各段单独捕获;断点由驱动件在**段间窗外 eager 重放**并写进**钉块**(plan 持有、两期同址);核里"每轮变的宿主标量"走**宿主标量槽**(`BreakDecl::host_scalar`,下标 = kernel 契约槽序),每轮变的设备值走**图输入槽** |
-| **取证仪器**(env diag,§11.4/§11.12) | **boot 期 `现役臂: prefill=… \| verify=… \| decode=… \| spec=… \| kv_fp8=…` 一行**(臂身份自证);`session/verify 分段捕获(段=N 断点=M)`;`OWL_PW_SELFCHECK`(回放≡eager,NaN 记 ∞);`OWL_PW_BREAKS=k`;`OWL_PW_PIN_ZERO` + `[pw-pin-now]`;`OWL_KV_DUMP` + `tools/kv_footprint.py`;`[fi-plan]`(OWL_FI_DEBUG);`tools/pw-ab-greedy.sh`、`tools/pw-probe.sh` |
+| **取证仪器**(env diag,§11.4/§11.12) | **boot 期 `现役臂: prefill=… \| verify=… \| decode=… \| spec=… \| kv_fp8=…` 一行**(臂身份自证);`session/verify 分段捕获(段=N 断点=M)`;`OWL_PW_SELFCHECK`(回放≡eager,NaN 记 ∞);`OWL_PW_BREAKS=k`;`OWL_PW_PIN_ZERO` + `[pw-pin-now]`;`OWL_KV_DUMP` + `tools/fixture/kv_footprint.py`;`[fi-plan]`(OWL_FI_DEBUG);`tools/pw-ab-greedy.sh`、`tools/pw-probe.sh` |
 | **门** | engine lib 33/33、models lib 129/129、`gpu_piecewise_segments`;`OWL_GATE_PIECEWISE=1` ⇒ 27B 恒等门整臂(断点臂不破文本红线) |
 
 **三条最贵的教训**(全文最有复用价值的部分):
@@ -617,7 +617,7 @@ FI 读 decode 行错(本次症状 ✓:FI 只与 K0 写的行对过账,verify 臂
 **仪器**(用户点醒的做法:**不看日志看设备字节**,且不需要参考值):
 `OWL_KV_DUMP=<decode_pos>` ⇒ 在 `exec/phases.rs` 的 decode 步**写前/写后各 d2h 一页**
 (`copy_block_at` 抠出该页 → `dtoh` → `/tmp/kv-{before,after}.bin` + `kv-meta.txt`);
-分析器 `tools/kv_footprint.py`:**差分足迹**即结构性事实 ——
+分析器 `tools/fixture/kv_footprint.py`:**差分足迹**即结构性事实 ——
 - page-major ⇒ 该行 `hkv·hd` 字节是**一整段连续**(页内 `off·hkv·hd` 起);
 - x-packed  ⇒ 是 128 个 **8B 块 strided 256B**。
 

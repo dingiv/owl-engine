@@ -40,7 +40,7 @@
 #            PORT=8141 TP1_CFG=/tmp/xxx/tp1-8141.toml TP2_CFG=… tools/tp-ab-std.sh ab
 set -u
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT" || exit 1
 
 OUT_DIR="${OUT_DIR:-/tmp/owl-bench}"

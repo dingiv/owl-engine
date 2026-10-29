@@ -140,7 +140,7 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
   - 模板:图像占位 token(`<|image_pad|>`)由 `chat_template.jinja` 产生;
     校验占位 token 数 = `grid` 展开的 merged 行数;
   - 引擎调用:`submit_session_opts` 带 `images`。
-- **预处理门**:与 `tools/vision_image_check.py` 的
+- **预处理门**:与 `tools/fixture/vision_image_check.py` 的
   `Qwen3VLProcessor` 输出逐元素对拍(索引/权重/pixel_values),四张真图
   端到端答案与 HF 一致。
 - 图像缓存/并发:单请求可多图(按内容序);图像请求仍串行,`max_batch > 1`

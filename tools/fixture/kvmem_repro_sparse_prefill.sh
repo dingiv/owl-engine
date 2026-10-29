@@ -7,7 +7,7 @@
 # 用法: tools/kvmem_repro_sparse_prefill.sh [ws...]   缺省 7680(活) 7168(死)
 # 前置: 仓库根构建好 target/release/server(单张空闲 3090 Ti,端口 8140)
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 WSS=${*:-"7680 7168"}
 python3 - <<'PY' $WSS
 import json, re, sys, time, subprocess, urllib.request
