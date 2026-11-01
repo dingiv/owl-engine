@@ -1689,8 +1689,26 @@ impl<D: DeviceClient> RunningEngine<D> {
         let t_stage = std::time::Instant::now();
         let chains: Vec<owl_store::ChainHash> =
             req.blocks.iter().map(|(_, chain)| *chain).collect();
-        // 盘上的块先读回宿主（盘 → 设备要两跳；判据与账都在 store）
-        self.ensure_host_resident(&chains).await?;
+        // 盘上的块先读回宿主(盘 → 设备要两跳;判据与账都在 store)
+        //
+        // **分相计时**(2026-11-01 P1 回灌提速):整链回灌的天花板在哪一段 ——
+        // 盘→宿主(读+拷贝) / plan / swap(主机→设备) / commit。每次 ≥64 块打一行,
+        // 千块级回灌的调优全靠这三个数。
+        // **窗口式回灌**(2026-11-01 P1 提速):整链一次性回灌时,
+        // ① 盘→宿主是每块一次线程跳(0.96 GB/s)、② pinned staging 一次
+        // `cudaHostAlloc` 要 2 GiB 级(~1.3 s/rank)、③ peak 宿主/显存都顶满。
+        // 切成窗口后:staging 只有 `W × block_bytes`,第一次分配后**池内复用**,
+        // 读盘走批量口,三笔一起降。W 取 1024 块(≈512 MiB/rank 档)。
+        const LOAD_WINDOW_BLOCKS: usize = 1024;
+        let t_fill = std::time::Instant::now();
+        // 批量读(整窗一次线程跳 + 4 路并行;逐块口每块一次 spawn_blocking,
+        // 热页缓存也只有 0.96 GB/s)
+        let filled = self.fill_kv_window(&chains).await?;
+        if filled == 0 {
+            // 全在宿主/设备 ⇒ 走老口(它还会 touch 盘副本,保持 LRU 语义)
+            self.ensure_host_resident(&chains).await?;
+        }
+        let d_fill = t_fill.elapsed();
         let need_slots = chains.len();
         let block_bytes = self.dev.pool.block_bytes();
         let load_bytes = need_slots
@@ -1722,10 +1740,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                 )
                 .await?;
         }
+        let t_plan = std::time::Instant::now();
         let (cs, new_slots, pieces, table) = {
             let p = owl_store::plan_onload(&mut self.bank.rel.leg, &chains)?;
             (p.chains, p.slots, p.pieces, p.table)
         };
+        let d_plan = t_plan.elapsed();
+        let t_swap = std::time::Instant::now();
         let table = match self
             .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, table)
             .await
@@ -1737,8 +1758,30 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         };
         let slots = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &new_slots, table)?;
+        let d_swap = t_swap.elapsed();
         let loaded_blocks = cs.len();
         let moved_bytes = loaded_blocks * self.dev.pool.block_bytes();
+        if loaded_blocks >= 64 {
+            let gbs = |b: usize, d: std::time::Duration| {
+                if d.as_secs_f64() > 0.0 {
+                    b as f64 / d.as_secs_f64() / 1e9
+                } else {
+                    0.0
+                }
+            };
+            owl_shared::log_info!(
+                "store",
+                "回灌 {loaded_blocks} 块 / {:.0} MiB:盘→宿主 {:.0} ms({:.2} GB/s) · \
+                 plan {:.0} ms · 宿主→设备 {:.0} ms({:.2} GB/s) · 合计 {:.0} ms",
+                moved_bytes as f64 / 1048576.0,
+                d_fill.as_secs_f64() * 1e3,
+                gbs(moved_bytes, d_fill),
+                d_plan.as_secs_f64() * 1e3,
+                d_swap.as_secs_f64() * 1e3,
+                gbs(moved_bytes, d_swap),
+                (d_fill + d_plan + d_swap).as_secs_f64() * 1e3
+            );
+        }
         let s = self
             .bank
             .sessions
@@ -3010,7 +3053,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             parent = owl_store::hash_block(parent, block);
             chain.push(parent);
         }
-        let Some(&tail) = chain.last() else {
+        let Some(&_tail) = chain.last() else {
             return Ok(out);
         };
         let Some(blk) = self.bank.rel.disk.as_ref().map(|d| d.block_bytes()) else {
@@ -3381,6 +3424,65 @@ impl<D: DeviceClient> RunningEngine<D> {
         for c in chains {
             if self.fill_kv_from_disk(*c).await? {
                 n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// **一批 KV 回填**(磁盘 → 宿主;2026-11-01 P1 提速)。
+    ///
+    /// 与逐块 [`Self::fill_kv_from_disk`] 的差别只在**读**:整窗一次线程跳、
+    /// 窗口内 4 路并行(逐块版 = 每块一次 spawn_blocking,热页缓存下也只有 0.96 GB/s)。
+    /// 记账/让位/commit 与逐块版同一条路(先凑齐再落账,免得半窗状态)。
+    async fn fill_kv_window(&mut self, chains: &[owl_store::ChainHash]) -> Result<usize> {
+        if self.bank.rel.disk.is_none() || chains.is_empty() {
+            return Ok(0);
+        }
+        // 判:盘上有 + 宿主没有 ⇒ 要读
+        let mut todo: Vec<(owl_store::ChainHash, std::path::PathBuf, usize)> = Vec::new();
+        for c in chains {
+            let Some(d) = self.bank.rel.disk.as_ref() else {
+                break;
+            };
+            if !d.contains(*c) {
+                continue;
+            }
+            if self.bank.rel.leg.host_contains(*c) {
+                continue;
+            }
+            let plan = d.plan_fill(*c)?;
+            todo.push((*c, plan.path, plan.bytes));
+        }
+        if todo.is_empty() {
+            return Ok(0);
+        }
+        let items: Vec<(std::path::PathBuf, usize)> =
+            todo.iter().map(|(_, p, b)| (p.clone(), *b)).collect();
+        let bufs = crate::disk_io::read_blocks(items).await;
+        let mut n = 0usize;
+        for ((c, _, _), r) in todo.iter().zip(bufs) {
+            match r {
+                Ok(bytes) => {
+                    // 宿主满 ⇒ 先逐最冷再落(与逐块版同政策)
+                    let r0 = self.bank.rel.leg.host_relief_blocks();
+                    self.bank
+                        .rel
+                        .host_fill(*c, owl_store::HostBlock::from_bytes(bytes))?;
+                    let relief = self.bank.rel.leg.host_relief_blocks().saturating_sub(r0);
+                    if relief > 0 {
+                        owl_shared::metrics::with_metrics_store(|m| {
+                            m.counter_add("store.host.relief_blocks", relief, file!(), line!());
+                        });
+                    }
+                    if let Some(d) = self.bank.rel.disk.as_mut() {
+                        d.commit_fill(*c)?;
+                    }
+                    n += 1;
+                }
+                Err(e) => {
+                    owl_shared::log_warn!("store", "回灌读盘失败(链 {c:?}):{e}");
+                    return Err(owl_iface::contract::ModelError::Msg(e));
+                }
             }
         }
         Ok(n)

@@ -718,6 +718,7 @@ impl BlockLeg {
     pub fn tree_len(&self) -> usize {
         self.kv.tree_len()
     }
+    /// 树容量上限(诊断;与 [`Self::tree_len`] 配一对)。
     pub fn tree_cap(&self) -> usize {
         self.kv.tree_cap()
     }

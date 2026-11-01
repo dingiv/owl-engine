@@ -796,63 +796,120 @@ impl GpuServer {
             Ok(s) => s.clone(),
             Err(e) => return ack.send(Err(e)),
         };
-        let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
-            match self.pool.take(total) {
-                Some(b) => b,
-                None => match Staging::alloc(total, "swap_in") {
-                    Ok(s) => Box::new(s),
-                    Err(e) => return ack.send(Err(e)),
-                },
-            };
-        // ① 连接器 → staging(host 侧同步拷贝)
-        let t_get = std::time::Instant::now();
-        let mut cursor = 0usize;
-        for p in pieces.iter() {
-            if let Err(e) = conn.get(p.slot, p.conn_off, &mut staging.slice_bytes_mut()[cursor..cursor + p.len]) {
-                self.pool.put(staging);
-                return ack.send(Err(e));
-            }
-            cursor += p.len;
-        }
-        swap_phase("srv.swap.in.get", t_get);
-        // ② staging → 设备(COMPUTE 流序逐片;末尾单 notify ⇒ ack = 全部落地)
-        let mut cursor = 0usize;
-        for (i, p) in pieces.iter().enumerate() {
-            if let Err(e) = self.ctx().check_range(p.block, p.dev_off, p.len, "swap-in") {
-                self.pool.put(staging);
-                return ack.send(Err(e));
-            }
-            if let Err(e) = self.ctx_mut().wait_zeroing(p.block, STREAM_COMPUTE) {
-                self.pool.put(staging);
-                return ack.send(Err(e));
-            }
-            let (dptr, _) = match self.ctx().block_ptr(p.block, &stream) {
-                Ok(x) => x,
-                Err(e) => {
-                    self.pool.put(staging);
-                    return ack.send(Err(e));
+        // **分段 staging**(2026-11-01 P1 回灌提速;与 `swap_out` 对称)。
+        //
+        // 旧实现一次 `Staging::alloc(total)`:整链回灌 2.1 GiB ⇒ 一次
+        // `cudaHostAlloc`(~1.3 s/rank,首段必冷),swap 被抬到 4.5 s
+        // (实测 0.51 GB/s),而真实 H2D 只 ~6 GB/s。现在按 `STAGE_SEG` 切段:
+        // 每段取池(首次才 alloc),本段 DMA 落地后立刻回池 ⇒ 分配只付一次
+        // 256 MiB,峰值 pinned 内存也从 GiB 级降下来。
+        let t_all = std::time::Instant::now();
+        let mut d_dma = std::time::Duration::ZERO;
+        {
+            let mut lo = 0usize;
+            let mut segs: Vec<(usize, usize)> = Vec::new();
+            let mut acc = 0usize;
+            for (i, p) in pieces.iter().enumerate() {
+                if acc > 0 && acc + p.len > super::STAGE_SEG {
+                    segs.push((lo, i));
+                    lo = i;
+                    acc = 0;
                 }
-            };
-            let r = unsafe {
-                memcpy_htod_async(
-                    dptr + p.dev_off as u64,
-                    &staging.as_bytes()[cursor..cursor + p.len],
-                    stream.cu_stream(),
-                )
-            };
-            if let Err(e) = r {
-                self.pool.put(staging);
-                return ack.send(Err(ModelError::Msg(format!(
-                    "swap_in async(第 {i} 片): {e:?}"
-                ))));
+                acc += p.len;
             }
-            cursor += p.len;
+            if lo < pieces.len() {
+                segs.push((lo, pieces.len()));
+            }
+            for (lo, hi) in segs {
+                let need: usize = pieces[lo..hi].iter().map(|p| p.len).sum();
+                let mut staging: Box<dyn owl_iface::contract::PinnedRegion + Send> =
+                    match self.pool.take(need) {
+                        Some(b) => b,
+                        None => match Staging::alloc(need, "swap_in") {
+                            Ok(s) => Box::new(s),
+                            Err(e) => return ack.send(Err(e)),
+                        },
+                    };
+                // ① 连接器 → staging(本段;host 侧同步拷贝)
+                let mut cursor = 0usize;
+                for p in &pieces[lo..hi] {
+                    if let Err(e) = conn.get(
+                        p.slot,
+                        p.conn_off,
+                        &mut staging.slice_bytes_mut()[cursor..cursor + p.len],
+                    ) {
+                        self.pool.put(staging);
+                        return ack.send(Err(e));
+                    }
+                    cursor += p.len;
+                }
+                // ② staging → 设备(本段;COMPUTE 流序逐片)
+                let t_dma = std::time::Instant::now();
+                let mut cursor = 0usize;
+                for (k, p) in pieces[lo..hi].iter().enumerate() {
+                    if let Err(e) = self.ctx().check_range(p.block, p.dev_off, p.len, "swap-in") {
+                        self.pool.put(staging);
+                        return ack.send(Err(e));
+                    }
+                    if let Err(e) = self.ctx_mut().wait_zeroing(p.block, STREAM_COMPUTE) {
+                        self.pool.put(staging);
+                        return ack.send(Err(e));
+                    }
+                    let (dptr, _) = match self.ctx().block_ptr(p.block, &stream) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            self.pool.put(staging);
+                            return ack.send(Err(e));
+                        }
+                    };
+                    let r = unsafe {
+                        memcpy_htod_async(
+                            dptr + p.dev_off as u64,
+                            &staging.as_bytes()[cursor..cursor + p.len],
+                            stream.cu_stream(),
+                        )
+                    };
+                    if let Err(e) = r {
+                        self.pool.put(staging);
+                        return ack.send(Err(owl_iface::contract::ModelError::Msg(format!(
+                            "swap_in async(段内第 {k} 片): {e:?}"
+                        ))));
+                    }
+                    cursor += p.len;
+                }
+                // ③ 本段 DMA 落地后才能把缓冲回池(否则被下一段覆写)。
+                if let Err(e) = stream.synchronize() {
+                    self.pool.put(staging);
+                    return ack.send(Err(owl_iface::contract::ModelError::Msg(format!(
+                        "swap_in 段落地同步失败: {e:?}"
+                    ))));
+                }
+                d_dma += t_dma.elapsed();
+                self.pool.put(staging);
+            }
+        }
+        let d_all = t_all.elapsed();
+        if total >= (64 << 20) {
+            self.sink.logf(
+                owl_shared::log::LVL_INFO,
+                "swap-in",
+                format_args!(
+                    "{} 片 / {:.0} MiB(分段 {:.0} MiB):copy+DMA 合计 {:.0} ms({:.2} GB/s,其中 DMA {:.0} ms)",
+                    pieces.len(),
+                    total as f64 / 1048576.0,
+                    super::STAGE_SEG as f64 / 1048576.0,
+                    d_all.as_secs_f64() * 1e3,
+                    total as f64 / d_all.as_secs_f64().max(1e-9) / 1e9,
+                    d_dma.as_secs_f64() * 1e3,
+                ),
+            );
         }
         let cell = std::sync::Arc::new(std::sync::Mutex::new(Some((conn, ack))));
         let cell2 = cell.clone();
         let pool = self.pool.clone();
         let finish: Finish = Box::new(move || {
-            pool.put(staging);
+            // 分段版:staging 已在每段结束时回池(本段 DMA 已落地)⇒ 这里只回执。
+            let _ = &pool;
             if let Some((conn, ack)) = cell2.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 ack.send(Ok(conn));
             }

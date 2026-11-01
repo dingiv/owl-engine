@@ -78,6 +78,69 @@ pub(crate) async fn read_block(path: PathBuf, bytes: usize) -> Result<Vec<u8>, S
     }
 }
 
+/// **批量读回一批块**(2026-11-01 P1 回灌提速)。
+///
+/// 逐块 `read_block` = 每块一次 `spawn_blocking` 线程跳 + 一次 open/read/close;
+/// 实测 4364 块(4.3 GiB,page cache 全热)只有 **0.96 GB/s**。这里把整窗塞进
+/// **一次** 线程跳、窗口内再按 4 路并行读 —— 台账里每次 ≥8 块走这条路。
+///
+/// 返回顺序与入参**逐项对齐**(`Err` 项带路径与原因,由调用方降级/报错);
+/// 大小不符仍按"账上长度"判(与 [`read_block`] 同律)。
+pub(crate) async fn read_blocks(
+    items: Vec<(std::path::PathBuf, usize)>,
+) -> Vec<Result<Vec<u8>, String>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    tokio::task::spawn_blocking(move || {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        let n = items.len();
+        let lanes = n.clamp(1, 4);
+        let next = AtomicUsize::new(0);
+        let out: Mutex<Vec<Option<Result<Vec<u8>, String>>>> =
+            Mutex::new((0..n).map(|_| None).collect());
+        std::thread::scope(|sc| {
+            for _ in 0..lanes {
+                let items = &items;
+                let next = &next;
+                let out = &out;
+                sc.spawn(move || loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= items.len() {
+                        break;
+                    }
+                    let (path, want) = &items[i];
+                    let label = path.display().to_string();
+                    let r = std::fs::read(path)
+                        .map_err(|e| format!("磁盘读失败({label}):{e}"))
+                        .and_then(|v| {
+                            if v.len() == *want {
+                                Ok(v)
+                            } else {
+                                Err(format!(
+                                    "磁盘块大小不符:{label} 实得 {} ≠ 账上 {}",
+                                    v.len(),
+                                    want
+                                ))
+                            }
+                        });
+                    if let Ok(mut g) = out.lock() {
+                        g[i] = Some(r);
+                    }
+                });
+            }
+        });
+        out.into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .into_iter()
+            .map(|x| x.unwrap_or_else(|| Err("磁盘读未完成(内部错)".to_string())))
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|e| vec![Err(format!("磁盘读任务 join 失败:{e}"))])
+}
+
 /// 把一块内容改名(盘层快照重挂;语义同 [`write_block`] 的原子性)。
 ///
 /// 失败**不改账** —— 调用方保留旧键(旧文件、旧路径仍在),按响亮日志走。

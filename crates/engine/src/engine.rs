@@ -1642,7 +1642,6 @@ pub(crate) fn into_running<D: DeviceClient>(
                         })
                         .unwrap_or_default();
                     let _ = &paths; // 只报不删(见上)
-                    let resident: u64 = orphans.len() as u64;
                     owl_shared::log_warn!(
                         "store",
                         "盘上孤儿内容:{} 块未被任何链索引引用(**保留**,配额由 LRU 回收;\
