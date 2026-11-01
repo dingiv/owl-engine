@@ -702,7 +702,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             }
             // **FI 图内臂**(session/T=1;W3 转正 + W5 收口):表四件套槽 → U32
             // 视图 + FiPrefillCtx + `ctx_total` 烘上界;当步**精确**表由引擎在
-            // 窗外 `fi_plan_sync` 刷(图不烘表)。
+            // 窗外族虚拟算子 `flashinfer_fi_plan_sync` 刷(图不烘表)。
             // ⚠️ 门 = **两件套都在场**(`dfi_on` + `plan_bake`):缺上界 ⇒ 本树
             // **不**换 FI 臂(回落 v2/XQA),而不是拿占位 ctx 烘表 —— 后者是
             // "文本连贯但错"的历史来源;校验层另有"FI 臂 ⇒ bake 在场"拒启门。
@@ -1042,7 +1042,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         // `docs/piecewise-断点图-设计与实现.md`。
         //
         // **verify 单图**(W4 转正 + W5 收口):FI 核留图内 + `ctx_total` 烘上界,
-        // **表由引擎每轮 `fi_plan_sync` 刷当轮精确值**(图不烘自携 restore;
+        // **表由引擎每轮发 `flashinfer_fi_plan_sync` 刷当轮精确值**(图不烘自携 restore;
         // 配置层已校验二者配套)。verify 恒随 `[dispatch] fi_plan_bake`
         // (`fi_plan_bake_verify` 旋钮已随断点面一并退役)。
         let vfi_bake: Option<usize> = knobs.fi_plan_bake;

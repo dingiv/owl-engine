@@ -72,46 +72,22 @@ struct PlanKey {
     kv_bytes: usize,
 }
 
-/// 图档 plan 开关(**与 C++ `owl_fi_cuda_graph` 同源**)。
-///
-/// 2026-10-21 收编:C++ 适配器只认 `getenv("FI_CUDA_GRAPH")`(上游 ABI 不动),
-/// 而本侧**不再自己读 env** —— 唯一写点 = 后端 [`set_plan_mode`]
-/// (C++ env 与本地原子同一次写入,两份口径不可能漂移)。
-/// plan 期读一次(非热路径)。
-static CUDA_GRAPH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// 写图档 plan 开关(与 C++ env 同值一次落;boot 期调用)
-pub fn set_plan_mode(cuda_graph: bool) {
-    CUDA_GRAPH.store(cuda_graph, std::sync::atomic::Ordering::Relaxed);
-}
+/// **本文件不持有任何开关状态**(2026-11-01 分层修正):族装配参数住在零门的
+/// `family::flashinfer`([`FlashinferCfg`] + `configure`),**写者唯一 = 引擎装配期**。
+/// 这里只是 feature 门内的读点(热路径仍是一次 relaxed load)。
+/// 下面三个 `use` 别名把读面包成族内旧名,调用点零改动。
+use crate::family::flashinfer as fam;
 
 fn fi_cuda_graph() -> bool {
-    CUDA_GRAPH.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// **prefill f16 shadow 开关**(boot 期唯一写点;C++ 侧不读 env)。
-static PREFILL_SHADOW: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-/// **shadow 容量上限(token)**:boot 期由 `runtime.max_seq` 下发。
-/// 首层 FI 调用即按此 cap 一次性预留,避免 ctx 增长到池压力峰值时再扩容
-/// (2026-10-26 实测 100k 处 68MiB 扩容被硬预算拒发)。
-static PREFILL_SHADOW_CAP: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_prefill_shadow(on: bool) {
-    PREFILL_SHADOW.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn set_prefill_shadow_cap(tokens: usize) {
-    PREFILL_SHADOW_CAP.store(tokens, std::sync::atomic::Ordering::Relaxed);
+    fam::cuda_graph()
 }
 
 fn prefill_shadow_on() -> bool {
-    PREFILL_SHADOW.load(std::sync::atomic::Ordering::Relaxed)
+    fam::prefill_shadow_on()
 }
 
 fn prefill_shadow_cap() -> usize {
-    PREFILL_SHADOW_CAP.load(std::sync::atomic::Ordering::Relaxed)
+    fam::prefill_shadow_cap()
 }
 
 /// **plan 键归一化(纯函数;可单测)**:ctx 恒进键。
@@ -143,7 +119,7 @@ fn plan_key(
     }
 }
 
-/// **图自携 plan restore** 的进程级开关(缺省 `true` = 历史行为)。
+/// **图自携 plan restore** 的语义文档(实现住 `family::flashinfer`,见上)。
 ///
 /// 语义(2026-10-18 W2 定稿;**只此一处**,不再是 env):
 ///   - `true`  ⇒ 捕获窗内把"本 plan 的表 → int_ws"烘成一条 memcpy 节点
@@ -156,18 +132,9 @@ fn plan_key(
 /// 把**窗外重刷**也一起掐了 ⇒ 单图档下表永不上传(实测:输出 64 个空 token)。
 /// 现口径:**只影响窗内那一烘**,窗外路径不受它管。
 ///
-/// 写者唯一 = 后端 boot(配置 `[dispatch] fi_plan_restore` → `DiagOpts` →
-/// `set_plan_restore`);本 crate 的 lib 零依赖律 ⇒ 不经 env。
-static PLAN_RESTORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// 设置"图自携 plan restore"开关(仅 boot 期调用一次;见 [`PLAN_RESTORE`])。
-pub fn set_plan_restore(on: bool) {
-    PLAN_RESTORE.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// 读当前开关(热路径:一次 relaxed load)
+/// 读当前开关(热路径:一次 relaxed load;写者 = 引擎装配期 `configure`)
 fn plan_restore() -> bool {
-    PLAN_RESTORE.load(std::sync::atomic::Ordering::Relaxed)
+    fam::plan_restore()
 }
 
 impl FiRuntime {
@@ -453,6 +420,11 @@ impl KernelFamily for FiRuntime {
     }
 
     fn run(&mut self, msg: &LaunchMsg, res: &mut dyn crate::device::DeviceRes, _exec: &mut crate::device::Exec) -> Result<Bytes, OpError> {
+        // **plan 表同步虚拟算子**(2026-11-01):族内 host 调用 + int_ws 搬运,
+        // 无核 —— 走同一张转发面(声明/准入/路由/记账),不再单独一条命令。
+        if msg.kernel.name == crate::family::flashinfer::PLAN_SYNC_FI {
+            return self.run_plan_sync(msg, res);
+        }
         // 视觉塔注意力(ragged 非因果;2026-10-15)—— 独立契约,先分流
         if msg.kernel.name == crate::family::flashinfer::ATTN_RAGGED_F16 {
             return self.run_attn_ragged(msg, res);
@@ -1180,6 +1152,33 @@ impl FiRuntime {
             1,
         );
         self.activate(key, res)
+    }
+
+    /// **虚拟算子 `flashinfer_fi_plan_sync` 的 run**:解析槽序 → 调
+    /// [`Self::plan_sync`] → 回执哑输出块句柄。
+    ///
+    /// 槽序 = `[O out, sz t, sz ctx_total, sz hq, sz hkv, sz hd, sz page]`
+    /// (权威 = `ops::flashinfer::FiPlanSync` 的 `PARAMS`;客户端构造器 =
+    /// `family::flashinfer::plan_sync_msg`)。
+    fn run_plan_sync(
+        &mut self,
+        msg: &LaunchMsg,
+        res: &mut dyn crate::device::DeviceRes,
+    ) -> Result<Bytes, OpError> {
+        let s = crate::client::NamedSlots::new(msg)?;
+        let out = s.out_block("out", msg.out_elems)?;
+        let t = s.u64("t")? as usize;
+        let ctx_total = s.u64("ctx_total")? as usize;
+        let geom = FiPlanGeom {
+            total_rows: t,
+            t,
+            hq: s.u64("hq")? as usize,
+            hkv: s.u64("hkv")? as usize,
+            hd: s.u64("hd")? as usize,
+            page: s.u64("page")? as usize,
+        };
+        self.plan_sync(&geom, ctx_total, res)?;
+        Ok(out)
     }
 }
 

@@ -17,6 +17,12 @@ owl-models = { path = "../models" }
 owl-store = { path = "../store" }
 # 绑定设备是引擎职责(models 主依赖零后端;engine 相反,见模块头)
 owl-cuda = { path = "../backends/cuda" }
+# **算子族装配参数直调**(2026-11-01 分层修正):"prefill 走哪条臂 / plan 表是否
+# 图自携"是**族**的装配参数,不是设备能力——因此不进 `DeviceClient`(那里只能
+# 给缺省空实现 = 静默托管),而由引擎(配置持有者)直写族配置面
+# (`family::flashinfer::{FlashinferCfg, configure}`;状态在进程内原子)。
+# 不新增传递边:owl-models 已经正常依赖本 crate(主依赖,非 dev)。
+owl-kernels = { path = "../kernels" }
 # CPU 后端(§18 mock 档:无卡跑 store 演示台 / 压力与错误路径测试)。
 # 方向与 owl-cuda 同:engine → backends/*(无环)。
 owl-cpu = { path = "../backends/cpu" }
@@ -26,8 +32,6 @@ half = "2"
 tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
-# 重排面门(TP 装载:设备块 vs CPU marlin 参考)
-owl-kernels = { path = "../kernels" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 owl-macros = { path = "../macros" }
 

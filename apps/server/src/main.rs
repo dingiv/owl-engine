@@ -145,20 +145,13 @@ async fn main() {
         }
     };
 
-    // **FI plan 档位投递**(配置 → 核):C++ 适配器只认
-    // `getenv("FI_CUDA_GRAPH")`(上游 ABI 不动),而档位必须来自配置面
-    // ⇒ 入口 boot 期**唯一 env 写者**。Rust 读面自 2026-10-21 起**不读 env**
-    // —— 由后端 `GpuClient::configure_fi_plan`(引擎装配期)同一点落
-    // `set_plan_mode`,两份口径不可能漂移。
-    // 必须在任何图捕获/plan 之前(boot 期一次)。
-    std::env::set_var(
-        "FI_CUDA_GRAPH",
-        if config.knobs.fi_cuda_graph { "1" } else { "0" },
-    );
-
-    // 注:**图自携 plan restore** 不再是 env(2026-10-18 用户裁决)。它现在走
-    // 配置 `[dispatch] fi_plan_restore` → `DiagOpts` → 后端 boot 期
-    // `set_plan_restore`(见 cuda `state.rs`/`server/mod.rs`);单图档必须配
+    // **FI 族装配参数不在入口写**(2026-11-01 分层修正):`FI_CUDA_GRAPH` env
+    // 与 Rust 侧原子由**同一处**一次落 —— `owl_kernels::family::flashinfer::
+    // configure`(写者唯一 = 引擎装配期 `owl_engine::kernel_cfg::apply`)。
+    // 入口不再设 env:两份写者 = 迟早漂移(此前的两处同值写入已合并)。
+    //
+    // 注:`[dispatch] fi_plan_restore` / `fi_cuda_graph` / `[kernel] prefill_shadow`
+    // 都是配置键 → `EngineKnobs` → 族 `configure`;单图档必须配
     // `fi_plan_restore = false`,由 `OwlConfig::validate` 拒启兜底。
 
     // 调试门三件套先取局部:下面 `config` 会被 move 进 actor 线程,

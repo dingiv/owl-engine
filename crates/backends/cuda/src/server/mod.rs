@@ -575,10 +575,12 @@ impl GpuServer {
                                 .collect(),
                         )
                     };
-                    // **图自携 plan restore 开关下发**(2026-10-18;配置驱动,
-                    // 零 env):写完 registry 之前设,保证任何 plan/activate
-                    // 都读到本 boot 的档位。
-                    owl_kernels::server::flashinfer::set_plan_restore(self.diag.fi_plan_restore);
+                    // **族装配参数不在这里下发**(2026-11-01 分层修正):
+                    // 写者唯一 = 引擎装配期(`owl_engine::kernel_cfg::apply` →
+                    // `owl_kernels::family::flashinfer::configure`)。原处曾写过
+                    // 一次 `set_plan_restore(diag.…)`,与引擎侧构成双写点 ——
+                    // registry boot 不读它(读点在 `activate` 的热路),所以删这里
+                    // 不改变顺序语义,只把“谁是权威”焊死。
                     // 2026-10-29:输出口不再下发 —— kernels 直接用 `owl_shared`
                     // 的全局 logger(Rust 宏)与 shared 的 C ABI(C++ 侧 `OWL_LOG_*`)。
                     // 2026-10-29:装配报告由**本层**打印(kernels 只产出结构化事实)
@@ -1012,31 +1014,6 @@ impl GpuServer {
             }
             Command::LaunchAndHarvest { msg, id, want_bytes, ack } => {
                 self.handle_launch_and_harvest(msg, id, want_bytes, ack)
-            }
-            // **FI plan 表同步**(W3):路由到 FI 族(名字 = 族主名;注册表内
-            // 路由与 execute 同表同行纪律)。字段级解构理由同家族发射路。
-            Command::FiPlanSync { spec, ack } => {
-                let Self { ctx, registry, scratch_ledger, actor_tag, .. } = self;
-                let out = (|| -> Result<(), String> {
-                    let ctx = ctx.as_mut().ok_or("server 未上线")?;
-                    let mut res = GpuRes { ctx, scratch: scratch_ledger, actor_tag: *actor_tag };
-                    registry
-                        .as_mut()
-                        .ok_or("注册表未装配")?
-                        .plan_sync(
-                            owl_kernels::family::flashinfer::PREFILL_FI,
-                            spec.t,
-                            spec.ctx_total,
-                            spec.hq,
-                            spec.hkv,
-                            spec.hd,
-                            spec.page,
-                            &mut res,
-                        )
-                        .map_err(|e| e.to_string())
-                })()
-                .map_err(ModelError::Msg);
-                ack.send(out)
             }
             Command::Sync { ack } => self.handle_sync(ack),
             Command::GraphBegin { ack } => ack.send(self.ctx_mut().graph_begin()),
@@ -1503,6 +1480,21 @@ impl GpuServer {
             smem: msg.shared_mem,
             out_elems: msg.out_elems,
         };
+        // ③ **捕获窗禁令(声明驱动;2026-11-01)**:`CAPTURE = NeedsHostPrep` 的
+        // 算子要算 host 侧东西(如 FI plan 表)→ 进图必错(图回放不经宿主处理器)。
+        // 原先这条只对一条命令硬编码(`Command::FiPlanSync` 的捕获负门);
+        // 算子化之后改在这里——**每条算子自带声明**,新增同类算子不需要再改
+        // 任何命令表。(`feat.graph` tag 与它同源:`NoHostWork` 才有)
+        if matches!(meta.capture, owl_kernels::spec::CaptureEvidence::NeedsHostPrep)
+            && self.ctx.as_ref().is_some_and(|c| c.capture_stream())
+        {
+            return Err(owl_kernels::contract::OpError::Contract {
+                op: msg.kernel.name.clone(),
+                field: "CAPTURE".into(),
+                expect: "捕获窗内只允许 NoHostWork 算子".into(),
+                got: "NeedsHostPrep(需 host 侧准备,不可进图)".into(),
+            });
+        }
         let ctx_ref = self.ctx.as_ref();
         // 账长探测:不在本账本/不在册 ⇒ None(哨兵跳过该槽)
         let len = |id: u64| ctx_ref.and_then(|c| c.block_len(id).ok());

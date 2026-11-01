@@ -441,31 +441,6 @@ impl DeviceClient for GpuClient {
         self.submit(move |ack| Command::Batch { cmds, ack })?.await
     }
 
-    /// **FI plan 自携开关**(引擎 boot 期下发;配置单源 `[dispatch] fi_plan_restore`)。
-    ///
-    /// 家族全局住本进程(kernels crate 的原子;server 线程与客户端同进程)⇒
-    /// 客户端直接落值即可,不必再走一条命令往返。**写点在引擎装配期**,
-    /// 后于后端 boot 的那次同值写入 ⇒ 引擎是最终权威(与"引擎 = 配置持有者"同律)。
-    fn configure_fi_plan(&mut self, self_carry: bool, cuda_graph: bool) -> Result<(), ModelError> {
-        owl_kernels::server::flashinfer::set_plan_restore(self_carry);
-        // C++ 适配器的图档瓦只认 `getenv("FI_CUDA_GRAPH")`(上游 ABI 不动)
-        // ⇒ 与 `apps/server/main.rs` 同一写点、同一口径;此处是**通用入口**
-        // (测试/直连后端也走它,不再各设 env)。本侧 Rust 读面同步落值
-        // (2026-10-21:两份口径同一写点,不可能漂移)。
-        std::env::set_var("FI_CUDA_GRAPH", if cuda_graph { "1" } else { "0" });
-        owl_kernels::server::flashinfer::set_plan_mode(cuda_graph);
-        Ok(())
-    }
-
-    /// **FI plan 表同步**(W3;见 `DeviceClient::fi_plan_sync` 与
-    /// `Command::FiPlanSync`)。提交即返回,设备侧同 COMPUTE 流 FIFO。
-    async fn fi_plan_sync(
-        &mut self,
-        spec: owl_iface::contract::FiPlanSpec,
-    ) -> Result<(), ModelError> {
-        self.submit(move |ack| Command::FiPlanSync { spec, ack })?.await
-    }
-
     /// **窗内自产块由后端回收**(契约三条见 trait 文档):捕获期 `alloc` 走
     /// `carve_block`(slab 切片),`graph_destroy`/`graph_abort`/空窗失败三处
     /// 都把窗内自产块整批移出块账房。

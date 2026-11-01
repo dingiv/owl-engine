@@ -183,7 +183,48 @@ impl KernelSpec for Fa2VarlenF16 {
 }
 pub static FA2_VARLEN_F16: KernelMeta = meta_of::<Fa2VarlenF16>();
 
+/// **`flashinfer_fi_plan_sync`** —— FI plan 表同步(虚拟算子;2026-11-01)。
+///
+/// 语义:算 `(t, ctx_total, …)` 对应的调度表并刷进族内 `int_ws`。**不发射核**
+/// (纯 host planner + 本族 workspace 的 H2D),与 `dom.cublas` 封装同形 ⇒
+/// 走转发面(声明 → 准入 → 路由 → 族 `run`),而不是设备契约上的一条专属命令。
+///
+/// 为什么必须当算子看(用户裁决):它是**族内部的一次函数调用**,
+/// 与 `PREFILL_FI` 同一份族状态;给它一条独立命令 = 设备层要为某个族背
+/// 一张专表(capture_gate / trace_map / command.rs 各一处),而转发面本来
+/// 就有这些表(而且按 `CAPTURE = NeedsHostPrep` **声明式**拒进图)。
+///
+/// 哑输出(`out`,1 元素 F16):转发面要求发射有块参与且 `out_elems ≥ 1`
+/// (契约 4 + 几何通用律)。调用方备一次、**跨调用复用**(不逐次分配);
+/// 本算子不写它。
+pub struct FiPlanSync;
 
+#[kernel_tags("dom.flashinfer", "role.attn", "phase.decode", "phase.verify")]
+impl KernelSpec for FiPlanSync {
+    const FAMILY: crate::contract::OpId =
+        crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
+    const ENTRY: &'static str = crate::family::flashinfer::PLAN_SYNC_FI;
+    /// foreign:无 `.cu` 源(host 调用 + 族 workspace 搬运)
+    const SRC: &'static str = "";
+    const PARAMS: &'static [Param] = &[
+        // O 槽(1 元素哑输出;契约 4:发射必产出块)
+        Param::t_out("out", Dtype::F16, 1),
+        Param::sz("t"),
+        Param::sz("ctx_total"),
+        Param::sz("hq"),
+        Param::sz("hkv"),
+        Param::sz("hd"),
+        Param::sz("page"),
+    ];
+    // 无核、无论值产物 ⇒ 有限性律不适用(输出块不写)
+    const LAWS: &'static [Law] = &[];
+    /// **需 host 侧算 plan ⇒ 不可进图**(准入面据此在捕获窗内响亮拒;
+    /// 原来这条约束是 `Command::FiPlanSync` 的捕获负门硬编码)
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NeedsHostPrep;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+}
+
+pub static FI_PLAN_SYNC: KernelMeta = meta_of::<FiPlanSync>();
 
 #[cfg(test)]
 mod tests {

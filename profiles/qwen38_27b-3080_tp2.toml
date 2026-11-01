@@ -90,6 +90,18 @@ topp = 0.95
 # ⚠️ greedy 档下 rep_penalty **本就不生效**（`act.sampler_on=false` ⇒ 历史槽填哨兵）。
 rep_penalty = 1.05
 
+[kernel]
+# **prefill f16 影子:开**(2026-10-31 算子级实测 + e2e 复验)。
+# 单 3080 单算子尺(hd256/hkv4/page32/ctx139264):fp8 KV 的 prefill 注意力
+# **比 f16 慢 21~26%**(sm86 无 fp8 MMA,kernel 每瓦片 e4m3→half 反量化),
+# 而 decode(T=1)上 fp8 快 2× ⇒ 影子只服务 prefill,主池保持 fp8(容量不变)。
+# e2e(真实 dump 回放):冷 139k prefill **103.8 s → 92.5 s(−10.9%)**;
+# 热追加 −5~35%(Δnew 1132→−20%, 931→−10%, 396→−6%)。
+# 代价:单层 staging,fp8 主池 + 本键 ⇒ 262k ≈ **512 MiB/rank**。
+# 质量抽检:8/8 数值题答案逐字相同;两句自由文本措辞不同(不同 plan/累加序 ⇒
+# 平局翻转),语义等价。
+prefill_shadow = true
+
 [spec]
 # TP2 草稿族放行(缺它 = tp.rs 装配期响亮拒)
 tp_draft = true

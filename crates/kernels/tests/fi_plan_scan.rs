@@ -94,10 +94,13 @@ fn scan_plan_shape() {
     let mut res = TestRes::new(dev);
     println!("mode,t,ctx,nb_pages,padded,cta_tile_q,split,int_bytes");
     for graph in [0u32, 1u32] {
-        // 两侧同一次写点:C++ 读 env、Rust 读显式模式(2026-10-21 起不读 env)
+        // 族装配参数唯一写点:C++ 侧 env 与 Rust 侧原子一次落
         let mode = graph == 1;
-        std::env::set_var("FI_CUDA_GRAPH", if mode { "1" } else { "0" });
-        owl_kernels::server::flashinfer::set_plan_mode(mode);
+        owl_kernels::family::flashinfer::configure(owl_kernels::family::flashinfer::FlashinferCfg {
+            cuda_graph: mode,
+            ..Default::default()
+        })
+        .expect("族装配参数");
         for t in [1usize, 4, 8, 64] {
             for ctx in ladder() {
                 let (padded, cta, split, ib) = plan_one(&mut res, t, ctx);

@@ -398,7 +398,8 @@ pub enum UpStream {
     Compute,
 }
 
-/// **FI plan 表同步请求**(W3;见 [`DeviceClient::fi_plan_sync`])。
+/// **FI plan 表同步的几何规格**(W3;纯数据 —— 表同步本身是族虚拟算子
+/// `flashinfer_fi_plan_sync`,不走设备能力契约)。
 ///
 /// 为什么要它:FI 核进捕获图后,**回放期不再经过 FI 的宿主处理器** ⇒ 那张
 /// 调度表(`int_ws`)没人刷。而 split 档的表必须与**当步真实 ctx** 对应
@@ -548,44 +549,6 @@ pub trait DeviceClient: Send {
             self.exec(Command::GraphLaunch { graph }).await?.into_done("graph_launch")
         }
     }
-    /// **FI plan 开关下发**(2026-10-19;单源 = 引擎 `knobs`)
-    ///
-    /// - `self_carry`(`knobs.fi_plan_restore`):捕获窗内是否把本 plan 的调度表
-    ///   烘成图内 restore 节点。`true` = 图自携表;`false` = host 每步 `fi_plan_sync`。
-    /// - `cuda_graph`(`knobs.fi_cuda_graph`):plan 用**图档瓦**(形状对 ctx 恒定)。
-    ///   ⚠️ 桶图 + 窗外刷表**要求**它为真 —— 否则 plan 形状随 ctx 跳变,而图内
-    ///   烘的是捕获期那一份 ⇒ 尾块(ctx ≠ t_pad)对不上。
-    ///
-    /// ⚠️ 为什么由**引擎**下发:这是配置面事实(`[dispatch] fi_plan_restore`),
-    /// 而"图是否自携"与"引擎是否在回放前刷表"必须**同一判据** —— 两条源各读
-    /// 各的会出现"图不烘表 + 引擎也不刷"的空档(实测 0.8B 桶门:回放读到上一个
-    /// plan 的调度表 ⇒ `q_indptr[5]` 越界 / 静默错值)。
-    ///
-    /// 缺省 = 无操作(**无 FI 面的后端没有这个概念**;不是静默失败 —— 没有
-    /// 这个开关可失)。
-    fn configure_fi_plan(&mut self, self_carry: bool, cuda_graph: bool) -> Result<(), ModelError> {
-        let _ = (self_carry, cuda_graph);
-        Ok(())
-    }
-
-    /// **FI plan 表同步**(W3;仅 CUDA/FI 后端有意义):确保 `spec.ctx_total`
-    /// 对应的调度表在场,并把它的表内容刷进 FI 的 `int_ws`。
-    ///
-    /// 用途 = "FI 核在捕获图内 + 图不烘 plan restore"的档
-    /// (`[dispatch] fi_plan_bake`):表刷新必须由图**外面**的一步完成
-    /// (图回放不会经过宿主处理器)。缺省实现 = **结构化拒**(不静默)。
-    fn fi_plan_sync(
-        &mut self,
-        spec: FiPlanSpec,
-    ) -> impl Future<Output = Result<(), ModelError>> + Send {
-        let _ = spec;
-        async {
-            Err(ModelError::Msg(
-                "fi_plan_sync: 本后端无 FI plan 面(仅 CUDA + flashinfer 族)".into(),
-            ))
-        }
-    }
-
     /// **捕获窗作废**(窗内出错/空窗的收尾):退出捕获态 + 销毁半成品图 +
     /// **窗内自产块整批作废**(slab 随之释放)。
     ///

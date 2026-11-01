@@ -4392,7 +4392,7 @@ pub async fn gpu_spec_identity_gate() {
         // **FI 图内臂恒等门**(W5:piecewise/断点面已退役 ⇒ 臂 = 单图 + 窗外刷表)。
         // spec(verify FI 图内臂)与 baseline(spec_depth=0)贪心 token 流必须逐位
         // 一致:覆盖"FI 四件套走输入槽 + `ctx_total` 烘上界 + 每步/每轮
-        // `fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
+        // `flashinfer_fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
         if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
             knobs.fi_cuda_graph = true;
             knobs.fi_plan_bake = Some(128); // ≥ max_seq(本门 max_seq_tokens=128)
@@ -4525,7 +4525,7 @@ pub async fn gpu_spec_identity_gate_27b() {
         // **FI 图内臂恒等门**(W5:piecewise/断点面已退役 ⇒ 臂 = 单图 + 窗外刷表)。
         // spec(verify FI 图内臂)与 baseline(spec_depth=0)贪心 token 流必须逐位
         // 一致:覆盖"FI 四件套走输入槽 + `ctx_total` 烘上界 + 每步/每轮
-        // `fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
+        // `flashinfer_fi_plan_sync` 刷精确表"全链。(env 名保留历史拼写:`OWL_GATE_PIECEWISE`)
         if owl_shared::env_reader::flag("OWL_GATE_PIECEWISE") {
             knobs.fi_cuda_graph = true;
             knobs.fi_plan_bake = Some(max_seq_tokens); // ≥ max_seq(本门 max_seq_tokens)

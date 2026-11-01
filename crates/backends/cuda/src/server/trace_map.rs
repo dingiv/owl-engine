@@ -35,7 +35,6 @@ pub(super) fn entry_of(ctx: &GpuCtx, cmd: &Command) -> TraceEntry {
             Command::DeviceArch { .. } => E::new("device_arch", ""),
             Command::BlockLedgerDump { .. } => E::new("block_ledger_dump", ""),
             // FI plan 表同步(W3):控制面命令(无 payload/无块)⇒ kind=ctl
-            Command::FiPlanSync { .. } => E::new("fi_plan_sync", "ctl"),
             Command::MemPoolTrim { .. } => E::new("mem_pool_trim", ""),
             Command::MemPoolStats { .. } => E::new("mem_pool_stats", ""),
             Command::MemInfo { .. } => E::new("mem_info", ""),

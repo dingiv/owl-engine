@@ -41,6 +41,8 @@ pub(crate) mod engine;
 pub(crate) mod disk_io;
 pub(crate) mod exec;
 pub(crate) mod graph_fleet;
+/// **算子族装配参数的下发面**(设备能力 ≠ 族装配;2026-11-01)
+pub(crate) mod kernel_cfg;
 // **状态域户**(2026-10-21 收户):选择层运行态 / 保洁账 —— 字段私有,
 // 只经语义方法读写(见各模块头)。
 pub(crate) mod housekeeping;

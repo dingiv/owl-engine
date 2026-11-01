@@ -35,7 +35,6 @@ pub(super) fn reject_closed(cmd: Command) {
             Command::MemPoolTrim { ack } => closed!(ack),
             Command::MemPoolStats { ack } => closed!(ack),
             Command::MemInfo { ack } => closed!(ack),
-            Command::FiPlanSync { ack, .. } => closed!(ack),
             Command::UploadAndLaunch { ack, .. } => closed!(ack),
             Command::LaunchAndHarvest { ack, .. } => closed!(ack),
             Command::Dtoh { ack, .. } => closed!(ack),
@@ -72,7 +71,6 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::MemPoolTrim { .. } => "mem_pool_trim",
             Command::MemPoolStats { .. } => "mem_pool_stats",
             Command::MemInfo { .. } => "mem_info",
-            Command::FiPlanSync { .. } => "FiPlanSync",
             Command::UploadAndLaunch { .. } => "upload_and_launch",
             Command::LaunchAndHarvest { .. } => "launch_and_harvest",
             Command::GraphBegin { .. } => "GraphBegin",
@@ -114,9 +112,9 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::GraphLaunch { ack, .. } => reject!(ack),
             Command::GraphAbort { ack, .. } => reject!(ack),
             Command::GraphDestroy { ack, .. } => reject!(ack),
-            // **FI plan 表同步(W3)**:含 H2D(表刷进 int_ws)⇒ 与 Htod 同类,
-            // 捕获期**结构化拒**(图回放期不会经过宿主处理器,刷表必须由图外做)
-            Command::FiPlanSync { ack, .. } => reject!(ack),
+            // 注:**FI plan 表同步**已收编成虚拟算子 `flashinfer_fi_plan_sync`
+            // (2026-11-01),不再是命令变体 ⇒ 捕获期禁令改由准入面按算子的
+            // `CAPTURE = NeedsHostPrep` 声明统一拒(`admission_check`)。
             Command::Alloc { ack, .. } => reject!(ack),
             Command::MemsetZero { ack, .. } => reject!(ack),
             Command::Htod { ack, .. } => reject!(ack),

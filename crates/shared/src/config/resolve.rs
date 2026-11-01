@@ -301,7 +301,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                         b.set("kernel.verify_arm", "v2".into(), "graphs=auto:无投机 ⇒ verify 臂不影响,留 v2");
                     }
                     b.set("kernel.fi_cuda_graph", true.into(), "graphs=auto:图档瓦(plan 形状恒定)");
-                    b.set("kernel.fi_plan", "baked".into(), "graphs=auto:烘 plan 进图(上界 = max_seq) + 表由窗外 fi_plan_sync 刷");
+                    b.set("kernel.fi_plan", "baked".into(), "graphs=auto:烘 plan 进图(上界 = max_seq) + 表由窗外 flashinfer_fi_plan_sync 刷");
                     true
                 }
             }

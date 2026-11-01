@@ -82,6 +82,162 @@ pub fn is_foreign(name: &str) -> bool {
         || name == PREFILL_FI_FP8KV
         || name == ATTN_RAGGED_F16
         || name == FA2_VARLEN_F16
+        || name == PLAN_SYNC_FI
+}
+
+// ============================================================================
+// plan 表同步(`flashinfer_fi_plan_sync`)—— 族的一个**虚拟算子**
+// ============================================================================
+//
+// 为什么是算子而不是一条专属命令(2026-11-01 用户裁决):它本质上是
+// **族内部的一次 host 调用 + 一次 H2D**(算调度表 + 刷进 int_ws),与 cuBLAS
+// 封装同形 —— 那就该走**转发面**(算子声明 → 准入 → 路由 → 族 run),
+// 不该在设备契约上开一条 flashinfer 专属命令。
+//
+// 形状约束:转发面要求发射**有一个块参与**(`GpuClient::exec` 的"至少一个
+// Block"门)且 `out_elems ≥ 1`(几何通用律)⇒ 本算子带一个 **1 元素的哑输出**
+// (契约 4 规定的 O 槽;调用方备块后复用,不逐次分配)。
+//
+// 捕获期禁令:本算子要算 host plan(**不可进图**)⇒ `CAPTURE = NeedsHostPrep`,
+// 由准入面统一拒(原来靠 `Command::FiPlanSync` 的守卫表硬编码一条)。
+
+/// 虚拟算子名(FI plan 表同步;槽序 = `[O out, sz t, sz ctx_total,
+/// sz hq, sz hkv, sz hd, sz page]`)
+pub const PLAN_SYNC_FI: &str = "flashinfer_fi_plan_sync";
+
+/// **构造 plan 表同步的发射消息**(转发面唯一入口;引擎侧不手摩槽序)。
+///
+/// `t` = 本轮 q 行数(decode = 1;prefill 桶 = 桶 t);`ctx_total` = 本轮 KV
+/// 总长(**必须给真值** —— plan 键的 ctx 维)。`out` = 调用方备的 1 元素哑输出块。
+pub fn plan_sync_msg(
+    out: crate::contract::Bytes,
+    t: usize,
+    ctx_total: usize,
+    hq: usize,
+    hkv: usize,
+    hd: usize,
+    page: usize,
+) -> crate::contract::LaunchMsg {
+    use crate::contract::{Arg, Dtype, KernelSource, LaunchMsg};
+    LaunchMsg {
+        kernel: KernelSource { name: PLAN_SYNC_FI.to_string(), source: String::new() },
+        args: vec![
+            Arg::block(out.id, Dtype::F16, 1),
+            Arg::U64(t as u64),
+            Arg::U64(ctx_total as u64),
+            Arg::U64(hq as u64),
+            Arg::U64(hkv as u64),
+            Arg::U64(hd as u64),
+            Arg::U64(page as u64),
+        ],
+        // 无核入队(纯 host 调用);几何给"非零最小"避免自持哨兵语义
+        grid: (1, 1, 1),
+        block: (1, 1, 1),
+        shared_mem: 0,
+        out_elems: 1,
+    }
+}
+
+// ============================================================================
+// 族装配参数(进程级单源;2026-11-01 分层修正)
+// ============================================================================
+//
+// **为什么住这里**:这些是**算子族的装配参数**(plan 表是否图自携 / plan 用不用
+// 图档瓦 / prefill 是否走 f16 影子),**不是设备能力**。此前它们挂在
+// `DeviceClient` 上(缺省空实现),两宗罪:
+//   (a) 每个后端都得背 flashinfer 的语义;
+//   (b) **缺省空实现 = 静默托管** —— 后端没接就悄悄不生效,正是本仓禁的失败形态。
+//
+// 现在的形状:**写者唯一** = [`configure`](引擎装配期;引擎 = 配置持有者);
+// **读侧** = `server::flashinfer`(feature 门内)+ C++ 适配器(它只认
+// `FI_CUDA_GRAPH` env ⇒ 本函数**同一次**落 env,两条口径不可能漂移)。
+//
+// 放**零门**模块的理由:执行面受 `feature = "flashinfer"` 门控,而配置面必须对
+// 引擎/后端**恒可见**(boot 期就要下发,不能因为 feature 关掉就编译不过)。
+//
+// 注:这里写 env 不是"用 env 当配置源"(禁),而是给**上游固定 ABI** 的适配器
+// 递话(它只读 `getenv`);配置源恒为 `[dispatch]`/`[kernel]` 键。
+
+/// FlashInfer 族装配参数(**整快照**:一次落全部字段,无局部更新语义)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashinferCfg {
+    /// 捕获窗内是否把本 plan 的调度表烘成图内 restore 节点
+    /// (`[dispatch] fi_plan_restore`)。`false` ⇒ host 是表唯一权威(每步刷)。
+    pub plan_restore: bool,
+    /// plan 用**图档瓦**(形状对 ctx 恒定;`[dispatch] fi_cuda_graph`)。
+    pub cuda_graph: bool,
+    /// prefill-only fp8→f16 影子(`[kernel] prefill_shadow`;仅 fp8 主池)。
+    pub prefill_shadow: bool,
+    /// 影子容量上界(token;`runtime.max_seq`):首层按它一次预留。
+    pub prefill_shadow_cap: usize,
+}
+
+impl Default for FlashinferCfg {
+    /// **生产缺省** = 各配置键的缺省值(探针/单测可
+    /// `FlashinferCfg { cuda_graph: true, ..Default::default() }` 只改一项)。
+    fn default() -> Self {
+        Self {
+            plan_restore: true,
+            cuda_graph: false,
+            prefill_shadow: false,
+            prefill_shadow_cap: 0,
+        }
+    }
+}
+
+/// 图自携 plan restore(缺省 true = 图自带表)
+static PLAN_RESTORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// 图档 plan 瓦(缺省 false = eager 定瓦)
+static CUDA_GRAPH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// prefill f16 影子(缺省 false)
+static PREFILL_SHADOW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// 影子容量上限(token;0 = 未下发)
+static PREFILL_SHADOW_CAP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// **族装配参数唯一写点**(引擎装配期一次;boot 期,任何 plan/捕获之前)。
+///
+/// 全部字段一次落:四个原子 + C++ 侧的 `FI_CUDA_GRAPH` env。
+/// 自洽门:**影子开启必须有容量**(cap = 0 时首层按 0 预留 ⇒ 开关静默不生效,
+/// 那正是要禁的静默失败);不满足则**结构化拒**,不做"看起来开了其实没开"。
+pub fn configure(cfg: FlashinferCfg) -> Result<(), crate::contract::OpError> {
+    if cfg.prefill_shadow && cfg.prefill_shadow_cap == 0 {
+        return Err(crate::contract::OpError::Contract {
+            op: PREFILL_FI.into(),
+            field: "prefill_shadow_cap".into(),
+            expect: "影子开启 ⇒ cap > 0(容量上界,取 runtime.max_seq)".into(),
+            got: "cap = 0(首层将按 0 预留,影子静默不生效)".into(),
+        });
+    }
+    // C++ 适配器(上游 ABI 不动)只认 env ⇒ 与本侧原子同一次写入
+    std::env::set_var("FI_CUDA_GRAPH", if cfg.cuda_graph { "1" } else { "0" });
+    PLAN_RESTORE.store(cfg.plan_restore, std::sync::atomic::Ordering::Relaxed);
+    CUDA_GRAPH.store(cfg.cuda_graph, std::sync::atomic::Ordering::Relaxed);
+    PREFILL_SHADOW.store(cfg.prefill_shadow, std::sync::atomic::Ordering::Relaxed);
+    PREFILL_SHADOW_CAP.store(cfg.prefill_shadow_cap, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// 读:图自携 plan restore(热路径一次 relaxed load)
+pub(crate) fn plan_restore() -> bool {
+    PLAN_RESTORE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 读:图档 plan 瓦(plan 期一次)
+pub(crate) fn cuda_graph() -> bool {
+    CUDA_GRAPH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 读:prefill f16 影子开关
+pub(crate) fn prefill_shadow_on() -> bool {
+    PREFILL_SHADOW.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 读:影子容量上界(token)
+pub(crate) fn prefill_shadow_cap() -> usize {
+    PREFILL_SHADOW_CAP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 extern "C" {
@@ -240,4 +396,53 @@ extern "C" {
         stream: *mut std::ffi::c_void,
     ) -> i32;
 
+}
+
+#[cfg(test)]
+mod cfg_tests {
+    use super::*;
+
+    /// 缺省档 = 生产基线(plan 自携 true / eager 瓦 / 影子关)。
+    #[test]
+    fn 缺省等于生产档() {
+        let d = FlashinferCfg::default();
+        assert!(d.plan_restore, "图自携缺省 true(历史行为)");
+        assert!(!d.cuda_graph, "图档瓦缺省关(eager 定瓦)");
+        assert!(!d.prefill_shadow, "影子缺省关");
+        assert_eq!(d.prefill_shadow_cap, 0);
+    }
+
+    /// **自洽门**:影子开启必须给容量 —— 否则首层按 0 预留、开关静默不生效。
+    /// 红档不写任何状态(先判后写),故本测试不污染进程。
+    #[test]
+    fn 影子无容量响亮拒() {
+        let e = configure(FlashinferCfg { prefill_shadow: true, ..Default::default() })
+            .expect_err("cap = 0 时必须拒");
+        assert!(format!("{e}").contains("prefill_shadow_cap"), "错误要点名字段: {e}");
+    }
+
+    /// **一次落全字段**(写者唯一的可观测后果);跑完还原缺省,不留给兄弟测试。
+    #[test]
+    fn 一次落全字段且可还原() {
+        let restore = FlashinferCfg {
+            plan_restore: plan_restore(),
+            cuda_graph: cuda_graph(),
+            prefill_shadow: prefill_shadow_on(),
+            prefill_shadow_cap: prefill_shadow_cap(),
+        };
+        configure(FlashinferCfg {
+            plan_restore: false,
+            cuda_graph: true,
+            prefill_shadow: true,
+            prefill_shadow_cap: 4096,
+        })
+        .expect("合法组合");
+        assert!(!plan_restore());
+        assert!(cuda_graph());
+        assert!(prefill_shadow_on());
+        assert_eq!(prefill_shadow_cap(), 4096);
+        // C++ 适配器的唯一通道(env)必须与 Rust 原子同一次落
+        assert_eq!(std::env::var("FI_CUDA_GRAPH").as_deref(), Ok("1"));
+        configure(restore).expect("还原");
+    }
 }

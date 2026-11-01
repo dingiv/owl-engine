@@ -447,7 +447,7 @@ impl<D: DeviceClient> GraphPlan<D> {
     // ── piecewise(分段捕获 + 断点)面已于 2026-10-18 W5 **整体退役** ──
     // 原址:`plan_piecewise` / `replay_piecewise` / `Mode::CapturedPiecewise` /
     // `BreakPoint`·`PiecewiseRt` / `pw_carry`(接力棒)/ `pw_*_stats` 诊断面。
-    // 退役理由:W3/W4 之后 FI 核留捕获图内、调度表由窗外 `fi_plan_sync` 刷 ⇒
+    // 退役理由:W3/W4 之后 FI 核留捕获图内、调度表由窗外虚拟算子 `flashinfer_fi_plan_sync` 刷 ⇒
     // 断点面零消费者;而接力棒"每步造新节点 id ⇒ 只增"正是端到端 O(步数²)
     // 那条慢化病的宿主(设计卷 §3.3)。需要时从 git 历史取回。
 

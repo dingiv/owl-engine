@@ -39,7 +39,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::contract::{
-    BlockLedgerRow, Bytes, Connector, DeviceClient, Dtype, FiPlanSpec, GraphId, LaunchMsg,
+    BlockLedgerRow, Bytes, Connector, DeviceClient, Dtype, GraphId, LaunchMsg,
     ModelError, PinnedRegion, Shape, SwapDir, SwapPiece, SwapWaiter, UpChunk, UpStream,
 };
 // 输出口(值语义 fn 指针包;未注入 = 全部静默)。本 crate 不能依赖 owl-shared
@@ -1285,14 +1285,6 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
     fn graph_launch(&mut self, graph: GraphId) -> impl Future<Output = Result<(), ModelError>> + Send {
         self.note_node();
         self.inner.graph_launch(graph)
-    }
-
-    fn configure_fi_plan(&mut self, self_carry: bool, cuda_graph: bool) -> Result<(), ModelError> {
-        self.inner.configure_fi_plan(self_carry, cuda_graph)
-    }
-
-    fn fi_plan_sync(&mut self, spec: FiPlanSpec) -> impl Future<Output = Result<(), ModelError>> + Send {
-        self.inner.fi_plan_sync(spec)
     }
 
     fn graph_abort(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {

@@ -116,8 +116,12 @@ fn batch_plan_shape_probe() {
     println!("mode,B,total_nb,nb_combo,padded,plan3,cta,split,int_bytes,shape_ok");
     for graph in [0u32, 1u32] {
         let mode = graph == 1;
-        std::env::set_var("FI_CUDA_GRAPH", if mode { "1" } else { "0" });
-        owl_kernels::server::flashinfer::set_plan_mode(mode);
+        // 族装配参数唯一写点(env 与原子一次落;探针也走同一接口)
+        owl_kernels::family::flashinfer::configure(owl_kernels::family::flashinfer::FlashinferCfg {
+            cuda_graph: mode,
+            ..Default::default()
+        })
+        .expect("族装配参数");
         for (b, combos) in [(2usize, &combos_2), (4, &combos_4), (8, &combos_8)] {
             let mut baseline: Option<Sig> = None;
             for nb in combos {

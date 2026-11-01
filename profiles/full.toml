@@ -364,9 +364,12 @@ decode_arm = "fi"
 # fi_plan_restore 两布尔(validate 强制互反)已于 2026-10-27 收成单键。
 fi_plan = "baked"
 fi_cuda_graph = true
-# prefill-only FP8→F16 shadow(实验;默认关,仅 pool.kv_fp8=true 可用;
-# f16 主池 + 本键 = validate 拒启。首层按 runtime.max_seq 预留,
-# 100k≈200MiB/rank,262k≈512MiB/rank;decode/verify 仍走 fp8)
+# prefill-only FP8→F16 shadow(2026-10-31 复辟;仅 pool.kv_fp8=true 有效)。
+# 算子级实测(单 3080/hd256/hkv4/page32/ctx=139264):fp8 KV 的 **prefill 注意力
+# 比 f16 慢 21~26%**(sm86 无 fp8 MMA,每瓦片要反量化),而 **decode(T=1)快 2×**。
+# 影子 = 保留 fp8 主池(容量),prefill 先反量化本层 KV 进 dense f16 staging。
+# 首层按 runtime.max_seq 一次预留:100k≈200MiB/rank,262k≈512MiB/rank。
+prefill_shadow = false
 gdn_chunked = true
 gdn_scalar = false
 gdn_fused_decode = true

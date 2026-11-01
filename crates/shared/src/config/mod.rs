@@ -1376,7 +1376,7 @@ pub enum FiPlanMode {
     /// 需 `fi_cuda_graph = true`。
     Baked,
     /// **host 为表的唯一权威**(缺省):图不烘表,引擎每次图 launch 前用
-    /// `fi_plan_sync` 刷当步精确表。v2 臂 / eager 档 / 降级档走这里。
+    /// `flashinfer_fi_plan_sync` 刷当步精确表。v2 臂 / eager 档 / 降级档走这里。
     #[default]
     HostSync,
 }
@@ -1449,10 +1449,20 @@ pub struct KernelCfg {
     /// (2026-10-18 实测:ctx 32→262144 一条直线 `padded=42/cta=16|64/split=1/int_bytes=618|650`)
     /// ⇒ 这是"FI 进捕获图"的结构前提(形状恒定 ⇒ 一张图 + 换表内容即可)。
     /// 关 = eager 瓦(历史行为;形状随 ctx 跳变 16 段)。
-    /// 投递:C++ 侧读 `getenv("FI_CUDA_GRAPH")`,故由引擎 boot 期经
-    /// `owl_kernels::family::flashinfer::configure_plan_env` **唯一**写入。
+    /// 投递:C++ 侧读 `getenv("FI_CUDA_GRAPH")`,故由引擎装配期经
+    /// `owl_kernels::family::flashinfer::configure` **唯一**写入(env 与 Rust 原子一次落)。
     #[serde(default)]
     pub fi_cuda_graph: bool,
+    /// **prefill-only FP8→F16 影子**(复辟键,原 2026-10-27 退役)。
+    ///
+    /// 算子级实测(单 3080 / hd=256 / hkv=4 / page32 / ctx=139264):
+    /// fp8 KV 的 prefill 注意力 **比 f16 慢 21~26%**(sm86 无 fp8 MMA,kernel 每
+    /// 瓦片要把 e4m3 反量化成 half 再算),而 decode(T=1)上 fp8 快 2×。
+    /// 影子 = 保留 fp8 主池(容量),prefill 先反量化本层 KV 进 dense f16 staging,
+    /// 再走 FI f16 臂。代价:单层 staging,262k ≈ 512 MiB/rank。
+    /// **仅 `[pool] kv_fp8 = true` 有效**(f16 主池没有可反量化的源)。
+    #[serde(default)]
+    pub prefill_shadow: bool,
     /// FlashInfer prefill 面
     pub gdn_chunked: bool,
     pub gdn_scalar: bool,
@@ -1930,6 +1940,7 @@ impl Default for KernelCfg {
             // FI plan 图档瓦(2026-10-18 图档单图立案):**缺省关** —— 图档单图的
             // 其余件(W2 关自携 / W3 单图)未落地前开它只是换瓦片口径,不产生图。
             fi_cuda_graph: false,
+            prefill_shadow: false,
             // 2026-10-20:**定谳后翻默认**(FLA 五核,生产 spec-dflash 长期在跑;
             // 形状/T 门不满足时层内自动回落 varlen,无行为风险)
             gdn_chunked: true,
@@ -2139,12 +2150,6 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
             "kernel",
             "fi_min_tokens",
             "已退役(2026-10-27):缺省恒 1、所有档都是 1 ⇒ 等价常量(FI 通吃)—— 删掉该键",
-        ),
-        (
-            "kernel",
-            "prefill_shadow",
-            "已退役(2026-10-27):prefill-only FP8→F16 实验开关,默认关且无实测结论\
-             (未进过任何生产档)—— 删掉该键",
         ),
         (
             "kernel",

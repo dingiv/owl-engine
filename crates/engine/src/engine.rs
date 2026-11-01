@@ -296,15 +296,19 @@ pub struct EngineKnobs {
     /// spec 轮提交跨过页边界 ⇒ 用 fold 把 GDN 态回卷到边界拍一张再卷回;
     /// 本键节流(`边界页号 % stride == 0` 才拍)。0 = 关(旧行为:生成相位不拍)。
     pub snap_decode_stride: usize,
+    /// **prefill-only FP8→F16 影子**(`[kernel] prefill_shadow`;2026-10-31 复辟)。
+    /// 装配期由 `kernel_cfg::apply` → 族 `configure` 投递给核侧。
+    pub prefill_shadow: bool,
     /// **FI plan 图档瓦**(`[dispatch] fi_cuda_graph`;2026-10-18 图档单图立案):
-    /// 开 ⇒ 形状对 ctx 全域恒定(可烘图的先决条件)。装配期经
-    /// `owl_kernels::family::flashinfer::configure_plan_env` 投递给核。
+    /// 开 ⇒ 形状对 ctx 全域恒定(可烘图的先决条件)。装配期由
+    /// `kernel_cfg::apply` → 族 `configure` 投递(env 与原子一次落)。
     pub fi_cuda_graph: bool,
     /// **decode 单图烘 plan 上界**(`[dispatch] fi_plan_bake`;None = 现状 piecewise)
     pub fi_plan_bake: Option<usize>,
     /// **图自携 FI plan restore**(`[dispatch] fi_plan_restore`;缺省 true):
     /// true = 捕获窗内把本 plan 表烘成图内 memcpy(桶图旧行为);
-    /// false = 图不烘表 ⇒ **host 是唯一权威**,每个图回放前窗外 `fi_plan_sync`
+    /// false = 图不烘表 ⇒ **host 是唯一权威**,每个图回放前窗外发虚拟算子
+    /// `flashinfer_fi_plan_sync`
     /// (decode/verify 既有;prefill 桶已退役,2026-10-21)。
     pub fi_plan_restore: bool,
     /// TS 探针槽(原 OWL_TS_PROBE)
@@ -421,6 +425,7 @@ impl Default for EngineKnobs {
             host_pressure_interval_ms: 1000,
             prefill_align_tail: true,
             snap_decode_stride: 1,
+            prefill_shadow: false,
             fi_cuda_graph: false,
             fi_plan_bake: None,
             fi_plan_restore: true,
@@ -787,6 +792,7 @@ impl EngineKnobs {
             // 只放 `dense_floor_of` 的三态占位。
             dense_floor: Self::dense_floor_of(&cfg.kvmem),
             no_graph: !cfg.cuda.graph,
+            prefill_shadow: cfg.kernel.prefill_shadow,
             fi_cuda_graph: cfg.kernel.fi_cuda_graph,
             // 哨兵:0 = 取 max_seq(FI 调度表的图档上界 = 单序列 ctx 的天然上界;
             // 这样档位改 max_seq 时上界跟着走,不必两处手改)
@@ -1778,6 +1784,13 @@ pub(crate) struct RankDev<D: DeviceClient> {
     pub(crate) graphs: GraphFleet<D>,
     /// 引擎级 spec 运行态(模式/深度/草稿器)
     pub(crate) spec_rt: SpecRuntime,
+    /// **FI plan 表同步算子的哑输出块**(1 元素 F16;2026-11-01)。
+    ///
+    /// 为什么需要:表同步已收编成族虚拟算子(`flashinfer_fi_plan_sync`),而
+    /// 转发面契约 4 要求**发射必产出块**(`out_elems ≥ 1` + 实参至少一个 Block)。
+    /// 该算子不写它 ⇒ 一次分配、跨调用复用(逐次 alloc/free 会在解码每步多
+    /// 两条命令;块 id 在同 server 内全局,故 session/verify 面共用同一块)。
+    pub(crate) fi_plan_out: Option<owl_iface::contract::Bytes>,
 }
 
 /// **装载期定型、运行期只读**的 rank 事实(权重是分片的,每 rank 一份)。
@@ -1820,6 +1833,55 @@ impl<D: DeviceClient> RankDev<D> {
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
         self.phase = p;
     }
+
+    /// **FI plan 表同步算子的哑输出块**(惰性分配、跨调用复用)。
+    ///
+    /// 用 session 面分配即可:块 id 在同一 server(同一个 rank)内全局,
+    /// verify/batch 的 face 都指同一个 server。
+    pub(crate) async fn fi_plan_out_block(&mut self) -> Result<owl_iface::contract::Bytes> {
+        if let Some(b) = &self.fi_plan_out {
+            return Ok(b.clone());
+        }
+        let b = self
+            .graphs
+            .session
+            .face_mut()
+            .alloc(owl_iface::contract::Dtype::F16, 1, "fi.plan.sync.out")
+            .await?;
+        self.fi_plan_out = Some(b.clone());
+        Ok(b)
+    }
+}
+
+/// **发出 `flashinfer_fi_plan_sync`**(族虚拟算子;唯一发射点)。
+///
+/// 语义 = “让 FI 族把 `spec` 对应的调度表刷进它的 int_ws”(图不烘表档每步必做)。
+/// 为什么是算子而不是专属命令(2026-11-01 用户裁决):它是**族内的一次函数调用**
+/// (host planner + 一次 H2D),与 cuBLAS 封装同形 ⇒ 走转发面;设备契约不再为
+/// 某个族背一条专表。回执块必须是传进去的哑输出(不写,仅保契约)。
+pub(crate) async fn launch_fi_plan_sync<D: DeviceClient>(
+    face: &mut D,
+    out: owl_iface::contract::Bytes,
+    spec: owl_iface::contract::FiPlanSpec,
+) -> Result<()> {
+    let want_id = out.id;
+    let msg = owl_kernels::family::flashinfer::plan_sync_msg(
+        out,
+        spec.t,
+        spec.ctx_total,
+        spec.hq,
+        spec.hkv,
+        spec.hd,
+        spec.page,
+    );
+    let got = face.launch(msg).await?;
+    if got.id != want_id {
+        return Err(ModelError::Msg(format!(
+            "FI plan 表同步:回执输出块 {} ≠ 哑输出 {}",
+            got.id, want_id
+        )));
+    }
+    Ok(())
 }
 
 /// **rank 设备侧装配(唯实现)**:几何 → 环境 → spec 域 → KV 写者门 →
@@ -1832,12 +1894,8 @@ impl<D: DeviceClient> RankDev<D> {
 ///
 /// 这些组合一旦放进运行期才爆,现场都很难查(0.8B 桶门 IMA / 首个 verify
 /// 步越界 / 图档瓦与表内容不同构)。集中在这里 = 坏配置毫秒级拒。
-fn boot_knobs_check<D: DeviceClient>(
-    face: &mut DeviceHandle<D>,
-    cfg: &EngineConfig,
-    tp: Option<&owl_models::module::TpCtx>,
-) -> Result<()> {
-    // **FI plan 自携开关:引擎 = 配置持有者 ⇒ 装配期下发**(2026-10-19 桶门立案)。
+fn boot_knobs_check(cfg: &EngineConfig, tp: Option<&owl_models::module::TpCtx>) -> Result<()> {
+    // **算子族装配参数:装配期下发**(2026-10-19 桶门立案;2026-11-01 分层修正)。
     //
     // 双源曾分叉:引擎旋钮 `knobs.fi_plan_restore`(桶图用它决定"图自携 vs
     // host 步前刷表")与后端 `DiagOpts.fi_plan_restore`(家族用它决定"窗内
@@ -1846,7 +1904,11 @@ fn boot_knobs_check<D: DeviceClient>(
     // 调度表 ⇒ 0.8B 桶门 IMA(`q_indptr[5]` 越界)/错值。
     // 单源 = 引擎旋钮(生产两处同源于 `[dispatch]`,行为不变;测试/直连档
     // 以后者为准)。写点必须在**图族装配之前**(boot_rank 内)。
-    face.configure_fi_plan(cfg.knobs.fi_plan_restore, cfg.knobs.fi_cuda_graph)?;
+    //
+    // ⚠️ 这两项**不走 `DeviceClient`**(2026-11-01 用户裁决):那是设备能力契约,
+    // 装不下"某个族的 prefill 走哪条臂"这类算子级事实 —— 摆在 trait 上只能给
+    // 缺省空实现 = 静默托管。现形状 = 族自己拥有配置面,引擎装配期唯一写者。
+    crate::kernel_cfg::apply(&cfg.knobs, cfg.max_seq_tokens)?;
     // **合批档自洽门**(B5.1;2026-10-20):每会话一格 GDN + 单卡 AR 语义未审
     if cfg.knobs.max_batch > 1 {
         if tp.is_some() {
@@ -2486,7 +2548,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     live_baseline_per_card: u64,
     t_run: std::time::Instant,
 ) -> Result<RankDev<DeviceHandle<D>>> {
-        boot_knobs_check(&mut face, cfg, tp.as_ref())?;
+        boot_knobs_check(cfg, tp.as_ref())?;
         // **NVFP4 已可进图**(2026-10-28 进图刀):原来这里有一条“NVFP4 ⇒ 自动
         // 关图捕获”的降级(因为本族发射前要回读 4B `ga`),alpha 设备化后不再需要。
         // 保留一句痕迹只为了将来排查“为何 NVFP4 档没图”——先看算子声明
@@ -2671,6 +2733,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         },
         phase: boot_env.phase,
         spec_rt: spec,
+        fi_plan_out: None,
         pool,
         graphs,
     })
