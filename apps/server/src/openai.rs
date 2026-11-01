@@ -314,7 +314,7 @@ impl ChatRequest {
     /// 的 `owl_evict: true` = 「这张图将来可能从历史里被删」。引擎**不自作
     /// 主张**:只有打了标 + `[pool] image_evict = true` 才补页对齐 pad 并
     /// 进删除候选;没打标 = 零行为差异。
-    pub fn images(&self) -> Result<Vec<owl_engine::TurnImage>, String> {
+    pub fn images(&self, max_pixels: usize) -> Result<Vec<owl_engine::TurnImage>, String> {
         let mut out = Vec::new();
         for (i, m) in self.messages.iter().enumerate() {
             let Some(arr) = m.get("content").and_then(|c| c.as_array()) else {
@@ -334,7 +334,7 @@ impl ChatRequest {
                     .ok_or_else(|| {
                         format!("messages[{i}].content[{j}].image_url.url 缺失或非字符串")
                     })?;
-                let image = crate::vision_processor::from_data_url(url)
+                let image = crate::vision_processor::from_data_url(url, max_pixels)
                     .map_err(|e| format!("messages[{i}].content[{j}] 图像预处理失败: {e}"))?;
                 let evict = match part.get("owl_evict") {
                     None | Some(Value::Null) => false,
@@ -733,6 +733,8 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     gate: &Arc<tokio::sync::Semaphore>,
     // 原始请求 JSON 落盘目录（None = 关）
     request_dump_dir: Option<&std::path::Path>,
+    // 单图像素上限（视觉预处理封顶；0 = 内置 4096² = 不缩）
+    vision_max_pixels: usize,
 ) -> std::io::Result<()> {
     if let Some(dir) = request_dump_dir {
         dump_request(dir, body);
@@ -786,7 +788,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     };
     // 图像:预处理(与模板顺序一致)+ **占位 token 展开**:
     // 模板对每张图只发一个 `<|image_pad|>`;视觉塔要求 `grid_h*grid_w/4` 个。
-    let images = match req.images() {
+    let images = match req.images(vision_max_pixels) {
         Ok(v) => v,
         Err(e) => return http::respond_json(w, 400, &error_json(e)).await,
     };
@@ -824,6 +826,19 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     let _permit = gate.acquire().await;
     // G5②:诊断环开账(此后的每一条返回路径都可见 —— 显式 fail 或 Drop 兜底)
     let mut led = TurnLedger::new(trace);
+    // **跳轮重复探测**(2026-10-31;只可见):模型反复发同一个 tool_call 时
+    // 上下文尾部同形 ⇒ 输出逐字复现的固定点(生产实录 17 轮)。这里只记账 +
+    // WARN,不改生成 —— 升级成提示注入/截断是另一道裁决。
+    let mut repeat = crate::repeat_guard::scan(&req.messages);
+    if let Some(f) = repeat.as_ref() {
+        if f.triggered() {
+            owl_shared::log_warn!(
+                "chat",
+                "跳轮重复(可见态):{} —— 客户端连续重发同一调用;本轮未做干预",
+                f.summary()
+            );
+        }
+    }
     led.set_req(ReqFacts {
         model: model_name.to_string(),
         stream: mode == ReplyMode::Stream,
@@ -844,6 +859,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
         max_new,
         ignore_eos: req.ignore_eos,
         stop: stop.len(),
+        repeat: repeat.take(),
     });
     led.set_prompt(&prompt);
     let engine_req = EngineReq::Chat {
@@ -1044,7 +1060,33 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             })) => {
                 let items = splitter.finish();
                 emit!(items);
+                // **部分可救**(2026-10-31):协议错误只在"一个调用都没拿到"时才
+                // 让整轮失败。已有合法调用 ⇒ 照常返回,畸形块只留 WARN ——
+                // 把整轮换成错误会让客户端拿同一上下文重放(模型原地复读)。
                 if let Some(kind) = protocol_error {
+                    if !acc.tools.is_empty() {
+                        owl_shared::log_warn!(
+                            "chat",
+                            "turn {:?} 含畸形工具块({kind}),但已取得 {} 个合法调用 ⇒ 照常返回",
+                            turn.map(|(_, t)| t),
+                            acc.tools.len()
+                        );
+                    }
+                }
+                // **长度截断 ≠ 协议错误**(2026-10-31 实测):`max_tokens` 用完导致
+                // 工具块半截(`<function=bash><parameter=command>curl -s "http://`)
+                // 时,旧行为 = 502 ⇒ 客户端拿同一请求重放 ⇒ 同样截断 ⇒ 复读。
+                // 长度截断是**客户端的预算问题**,如实回 `finish_reason="length"`
+                // (上层雷同 OpenAI/vLLM),由客户端决定加预算或换姿势。
+                let len_cut = matches!(finish, owl_engine::turn::FinishReason::Length);
+                if protocol_error.is_some() && len_cut {
+                    owl_shared::log_warn!(
+                        "chat",
+                        "turn {:?} 因 **length 截断**导致工具块不完整 ⇒ 按 length 返回(不判协议错误)",
+                        turn.map(|(_, t)| t)
+                    );
+                }
+                if let Some(kind) = protocol_error.filter(|_| acc.tools.is_empty() && !len_cut) {
                     let msg = format!(
                         "模型工具调用不符合 OpenAI 协议({kind});服务端已拒绝返回无效结果"
                     );

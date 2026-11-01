@@ -357,3 +357,180 @@ mod tests {
         assert_eq!(q.q_of(1, 0), 0.0);
     }
 }
+
+/// **拒绝采样接受(稀疏目标分布版;2026-10-31)**。
+///
+/// 与 [`accept_rejection`] **同语义**,区别只在 p 的来源:
+///
+/// - [`accept_rejection`] 吃 `depth+1 × vocab` 的整行 logits;
+/// - 本函数吃**每行已算好的稀疏目标分布**(`distribution` 的产物)。
+///
+/// 为什么要这一版:**单卡采样档**的 verify 只能从设备端拿 top-32 候选
+/// (`cand` 槽),而全文 logits 的回读 + host 全表 top-k 实测要 **+10ms/轮**
+/// (89 → 67 t/s)。但 `proposal_q` 路径此前被排除在候选臂之外
+/// (`use_cand` 里的 `proposal_q.is_none()`),因为本函数原来只会从整行 logits
+/// 现算 p。稀疏 p 的支撑 ⊆ top-20 ⊆ 设备 top-32 ⇒ 候选行足以给出**逐项相同**的
+/// p(温度是单调变换,不改序),于是两条路可合流。
+///
+/// 不变量(与 [`accept_rejection`] 逐字相同):
+/// - `p_rows.len() == depth+1`(行 0..depth = verify 行;行 depth = bonus);
+/// - `hist` 由调用方维护(接受一个就 push 一个);
+/// - RNG 派生顺序不变(accept / correction / bonus 三支各自独立)。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accept_rejection_sparse(
+    p_rows: &[Vec<(u32, f32)>],
+    drafts: &[u32],
+    depth: usize,
+    q: &DraftQ,
+    hist: &mut Vec<u32>,
+    seed_base: u64,
+    pos: usize,
+) -> Result<(usize, Vec<u32>, u32), ModelError> {
+    if p_rows.len() != depth + 1 || drafts.len() < depth {
+        return Err(ModelError::Msg(format!(
+            "spec rejection(稀疏):行数={} depth={depth} drafts={} 不闭合",
+            p_rows.len(),
+            drafts.len()
+        )));
+    }
+    let mut emitted: Vec<u32> = Vec::with_capacity(depth + 1);
+    for (i, p) in p_rows.iter().enumerate().take(depth) {
+        let d = drafts[i];
+        let pd = p.iter().find(|(t, _)| *t == d).map(|(_, p)| *p).unwrap_or(0.0);
+        let qd = q.q_of(i, d);
+        if !(qd.is_finite() && qd > 0.0) {
+            return Err(ModelError::Msg(format!(
+                "spec rejection(稀疏):第 {i} 步 draft={d} 的 q={qd} 非正/非有限（proposal_q 与 drafts 不同源）"
+            )));
+        }
+        let accept = (pd / qd).min(1.0).max(0.0);
+        if accept_uniform(seed_base, pos + i) < accept {
+            emitted.push(d);
+            hist.push(d);
+            continue;
+        }
+        let corr = residual_sample(p, q, i, seed_base, pos)?;
+        emitted.push(corr);
+        hist.push(corr);
+        return Ok((i, emitted, corr));
+    }
+    // 全接受:bonus 从第 depth 行目标分布抽(RNG 派生与整行版逐字同)
+    let mut rng = seed_base ^ ((pos + depth) as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let bonus = crate::sampler::sample_sparse(&p_rows[depth], &mut rng);
+    emitted.push(bonus);
+    Ok((depth, emitted, bonus))
+}
+
+#[cfg(test)]
+mod sparse_equivalence {
+    //! **稀疏 p 版 ≡ 整行 logits 版**(2026-10-31 候选臂合流的正确性门)。
+    //!
+    //! 判据必须落在"数值逐项相同"上 —— 否则单卡采样走候选臂时,投机接受
+    //! 会静默偏离参考实现(采样偏置没人看得见)。
+
+    use super::*;
+    use crate::sampler::{distribution, distribution_of_cands, SamplerCfg};
+
+    const VOCAB: usize = 256;
+
+    fn cfg() -> SamplerCfg {
+        SamplerCfg { temp: 0.7, topk: 20, topp: 0.95, rep_penalty: 1.0 }
+    }
+
+    /// 造一行"有尖峰"的 logits(确定性伪随机,不引 random crate)
+    fn row(seed: u32) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(2654435761);
+        (0..VOCAB)
+            .map(|i| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                let base = ((x >> 16) as f32 / 65536.0 - 0.5) * 2.0;
+                // 每 16 个位置放一个尖峰,保证 top-k 集非平凡
+                base + if i % 16 == 0 { 6.0 } else { 0.0 }
+            })
+            .collect()
+    }
+
+    /// 设备端 top-32 的等效物(host 侧模拟:按值降序取 32,索引升序平局)
+    fn top32(logits: &[f32]) -> Vec<(f32, u32)> {
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.sort_by(|&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        idx.truncate(32);
+        let mut v: Vec<(f32, u32)> =
+            idx.into_iter().map(|i| (logits[i], i as u32)).collect();
+        v.sort_unstable_by_key(|&(_, id)| id);
+        v
+    }
+
+    /// 稀疏分布 = 整行分布(逐项、含概率)
+    #[test]
+    fn sparse_distribution_matches_full_row() {
+        for seed in 1..8u32 {
+            let lg = row(seed);
+            let full = distribution(&mut lg.clone(), &cfg(), &[]);
+            let sparse = distribution_of_cands(&top32(&lg), &cfg());
+            assert_eq!(full.len(), sparse.len(), "seed={seed} 支撑大小不同");
+            for ((tf, pf), (ts, ps)) in full.iter().zip(sparse.iter()) {
+                assert_eq!(tf, ts, "seed={seed} 支撑集不同");
+                assert!((pf - ps).abs() < 1e-7, "seed={seed} p 不同:{pf} vs {ps}");
+            }
+        }
+    }
+
+    /// 接受/拒绝/bonus 三支逐字相同(含 RNG 派生顺序)
+    #[test]
+    fn sparse_accept_matches_full_logits_accept() {
+        let depth = 2usize;
+        // q:每步 16 候选,全零边分 ⇒ 均匀分布(与 prev 无关)
+        let scores = vec![0.0f32; depth * CAND * CAND];
+        let cand: Vec<u32> = (0..depth * CAND).map(|i| 10 + i as u32).collect();
+        for seed in 1..6u32 {
+            for pos in [0usize, 7, 33] {
+                let q = DraftQ::from_scores(&scores, &cand, depth, 1.0, seed as u64, pos)
+                    .expect("from_scores");
+                // depth+1 行:每行不同尖峰
+                let rows: Vec<Vec<f32>> = (0..=depth).map(|r| row(seed + r as u32)).collect();
+                let cfg = cfg();
+                // 整行版
+                let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+                let mut h_full = Vec::new();
+                let a = accept_rejection(
+                    &flat, VOCAB, depth + 1, q.drafts(), depth, &q, &cfg, &mut h_full, seed as u64, pos,
+                );
+                // 稀疏版
+                let p_rows: Vec<Vec<(u32, f32)>> =
+                    rows.iter().map(|r| distribution_of_cands(&top32(r), &cfg)).collect();
+                let mut h_sp = Vec::new();
+                let b = accept_rejection_sparse(
+                    &p_rows, q.drafts(), depth, &q, &mut h_sp, seed as u64, pos,
+                );
+                let a = a.expect("整行版");
+                let b = b.expect("稀疏版");
+                assert_eq!(a, b, "seed={seed} pos={pos} 接受结果不同");
+                assert_eq!(h_full, h_sp, "seed={seed} pos={pos} 历史推进不同");
+            }
+        }
+    }
+
+    /// 抽样器:候选式与整行式同 RNG ⇒ 同 token
+    #[test]
+    fn sparse_sample_matches_candidate_sample() {
+        for seed in 1..6u32 {
+            let lg = row(seed);
+            let t32 = top32(&lg);
+            let cfg = cfg();
+            for rng_seed in 0..4u64 {
+                let mut r1 = rng_seed ^ 0x9E37_79B9_7F4A_7C15;
+                let a = crate::sampler::sample_from_candidates(&t32, &cfg, &mut r1);
+                let p = distribution_of_cands(&t32, &cfg);
+                let mut r2 = rng_seed ^ 0x9E37_79B9_7F4A_7C15;
+                let b = crate::sampler::sample_sparse(&p, &mut r2);
+                assert_eq!(a, b, "seed={seed} rng={rng_seed}");
+            }
+        }
+    }
+}

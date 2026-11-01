@@ -46,6 +46,8 @@ mod load;
 // 每拍遥测单元(忙时也能读队列/容量;避免 actor 被诊断查询阻塞)
 mod telemetry;
 mod openai;
+// 跳轮重复探测(只可见不改生成;2026-10-31 立案)
+mod repeat_guard;
 // 会话闸(per-session serialization;合批档 `max_batch>1` 的前置契约)
 mod session_gate;
 // 视觉输入(主分支 V1–V5)
@@ -319,6 +321,7 @@ async fn main() {
     // 请求原文落盘目录（诊断开关；空 = 关）。写入失败 = 启动失败，
     // 不允许“日志开了但其实没落盘”的静默失约。
     let request_dump_dir = config.request_dump_dir.clone();
+    let vision_max_pixels = config.vision_max_pixels;
     if let Some(dir) = &request_dump_dir {
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!("[boot] request_dump_dir 创建失败 {}: {e}", dir.display());
@@ -473,6 +476,7 @@ async fn main() {
                     tx: tx.clone(),
                     model_name: model_name.clone(),
                     request_dump_dir: request_dump_dir.clone(),
+                    vision_max_pixels,
                     tpl: tpl.clone(),
                     agent: agent.clone(),
                     dbg_face: dbg_face.clone(),
@@ -799,6 +803,8 @@ struct ConnCtx {
     model_name: String,
     /// 原始请求 JSON 落盘目录（None = 关）
     request_dump_dir: Option<std::path::PathBuf>,
+    /// 单图像素上限(视觉预处理封顶;0 = 内置 4096² = 不缩)
+    vision_max_pixels: usize,
     tpl: std::sync::Arc<chat_tpl::ChatTpl>,
     agent: std::sync::Arc<crate::config::AgentCfg>,
     /// `/debug/blocks` 的 GPU 命令出口(engine `face_clone()`;None = 不支持)
@@ -902,6 +908,7 @@ async fn handle(
                 &ctx.sessions,
                 &ctx.gate,
                 ctx.request_dump_dir.as_deref(),
+                ctx.vision_max_pixels,
             )
             .await?;
         }

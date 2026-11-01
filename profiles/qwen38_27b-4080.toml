@@ -1,0 +1,129 @@
+# ── 常驻档 ⑤:单张 RTX 4080 SUPER(Ada sm_89 / 32G)/ 27B AWQ-INT4 满血档 ────
+#
+# 形状(与 ①单 3090 同形,只换硬件):prefill = eager + Marlin W4A8;
+#       decode = FlashInfer + CUDA graph;投机 = DFlash2 d7(W4A16 草稿);
+#       KV = fp8 e4m3;视觉塔开;前缀缓存 + 三层账全开 + image_evict。
+#
+# 硬件事实(2026-10-30 实测,驱动 615.71.09):
+#   `42:00.0` / RTX 4080 SUPER / **32760 MiB** / CC 8.9 / 原厂 16G 的 32G 改装卡。
+#   ⇒ 显存账按运行期 `memory.total` 探测,档里不写死容量。
+#
+# ⚠️ **本档必须用 sm_89 二进制**:
+#   cargo build --release -p server --no-default-features --features arch-sm89
+# 单份 `.a` 家族(Marlin / FlashInfer+FA2 / GDN AOT)取构建期**最高代**,
+# 所以 30 系(arch-sm86)与 40 系(arch-sm89)**不能混在同一份构建**里 ——
+# 混了会让 30 系档拿到 sm89 的 SASS。留两份二进制,各自指定。
+# (Marlin 能力面早已收录 sm89:`crates/kernels/src/family/marlin/mod.rs`;
+#  W4A8 走 INT8 张量核在 Ada 上同样成立 —— 本档与 ① 的 a8 口径一致。)
+#
+# 与 ① 的差异只有硬件带来的两项:
+#   1. 显存 32G ⇒ max_seq 拉高(3090 的 a8 稳定点是 57344);
+#   2. Ada 有 fp8 张量核(Caps::fp8_mma = true)⇒ fp8 KV 走真 fp8 核,不是
+#      Ampere 上的 f16 仿真路径。
+#
+# ⚠️ 沿用 ① 的引擎侧已知缺陷立案(DFlash2 尾批裁剪形状会让 verify 核自旋,
+#    短 max_new 可整卡死,2026-10-24 立案未修):功能/恒等门一律
+#      `--set spec.depth=0 --set spec.lookup=false`
+#    agent 客户端给足 max_tokens(pi 用 8192,早停回合不受影响)。
+#    判据与现场:`docs/devlog/serving/spec-tailcap-gpu-spin-立案.md`。
+#
+# ⚠️ 本档已起机验证(2026-10-30:boot 12.4s,权重 18041.5MiB,图捕获全过)。
+#
+# 首次性能实测(2026-10-30,`llm_speedtest --flavor std` = 512/1024/2048/4096/8192
+# × 3 轮、out 256、单并发、随机词池 seed=20261019;数据
+# `perf-runs/std-4080-20261030/`):
+#
+#   臂              prefill t/s(512→8192)          decode t/s      TTFT ms
+#   4080S spec-off  2392/2709/2980/2972/3084     35.9/35.9/35.9/35.6/35.3   216/380/689/1380/2659
+#   4080S spec-d7   2364/2443/3077/2948/3040     69.7/56.5/58.7/68.4/60.1   219/421/668/1391/2697
+#   3090Ti spec-off 1970/2084/2334/2221/2249     44.4/44.6/44.4/43.9/43.5   262/493/880/1846/3645
+#   (3090Ti = **同源二进制的对照臂**:`target/release/server` sm86 + ①号档
+#    + 同两个 --set,同一天同一协议)
+#
+# 结论与机理:
+#   - **prefill ×1.21–1.37**(+21~37%):算力面,Ada 时钟 + int8 张量核 + 64MB L2;
+#   - **decode ×0.81**(−19%):带宽面 —— 736GB/s(4080S) vs 1008GB/s(3090Ti)
+#     比值 0.73,实测 0.81(大 L2 回带一点);**decode 长 ctx 平坦不衰减**
+#     (35.9→35.3,−1.7%),与 3090 同形状;
+#   - **TTFT ×0.73–0.83**(8k 点 2659 vs 3645ms):prefill 快的直接结果;
+#   - **DFlash2 d7 在本卡上值 ×1.70–1.92 decode**(35.3→60.1 @8k,AL≈2.9–3.1),
+#     prefill 不变(±3%)——投机在本卡上比在 3090 上更值钱,因为 decode 更慢。
+#   - 一句话:这张卡适合 **prefill/agent 低首字延迟** 负载;单 token 成本比
+#     3090 Ti 贵 20%。要 decode 吞吐就靠投机拉回来。
+#
+# ⚠️ 两个测量坑(本轮踩过,写在这里免得重踩):
+#   1. std 原协议传 `temperature=1.0/top_p=0.1`,随机词池 prompt 上有 **3~5/15 点
+#      被模型自己 EOS 提前结束**(out=1)。已验 spec-on / spec-off **两臂都发生**
+#      ⇒ 不是引擎缺陷,是采样行为;decode 均值必须取**满 256 tok 那几点的中位数**,
+#      或者加 `--ignore-eos` 补全曲线(本轮两样都跑了)。
+#   2. **前缀缓存会把 prefill 读数打成假**（`--ignore-eos` 补跑那轮）：同 seed 同
+#      prompt 第二次命中 4064/4096、8160/8192 ⇒ ttft 110ms / “prefill 39k t/s”。
+#      跨跑对比必须用 `--prompt-nonce` 换 prompt,或只取 cache<5% 的点。
+#   3. 稳定性:本档 spec-on / spec-off 共 46 个 turn 无自旋、无挂死(尾批 P0 未触发)。
+#
+# 起机命令(本机实测):
+#   ./target-sm89/release/server -p profiles/qwen38_27b-4080.toml --log-level info
+extends = [
+  "full.toml",
+  "parts/model/27b-awq.toml",
+  "parts/feature/vision.toml",
+  "parts/feature/dflash2-27b.toml",
+  "parts/hardware/4080-single.toml",
+  "parts/kernel/fi-graph.toml",
+  "parts/pool/fp8.toml",
+]
+
+[server]
+bind = "127.0.0.1:8138"
+
+[model]
+# W4A8 主干(与 ① 同口径:激活 per-token int8 × 权重 int4)。
+# 质量账见 ① 头注(S3 battery −0.95pt / McNemar p≈0.69,按"统计等价"取舍)。
+# **Ada 未做过质量回归**:int8 激活在 sm89 上走同一族 IMMA,预期一致,
+# 但这是推论不是实测 —— 要质量门请照 ① 的 battery 口径另跑一轮。
+quant = "w4a8"
+
+[runtime]
+# **max_seq = 262144 = 模型 native 上限**(max_pos=262144),2026-10-30 实测采纳。
+# 首次起机装配报告(131072 档):卡可用 31500.1MiB · 权重 18041.5MiB(a8 marlin
+# + 视觉塔 + int8 头)· 运行底价 593.6MiB · 池 4096MiB · 快照 455.6MiB ⇒
+# 231 435.6/31500,余 8GB ⇒ 池直接拉到 native 上限:
+#   pool = 8192MiB(8192 页 × 32 tok × 32768B/token=469) = 27531.6MiB / free 31500.1MiB
+#   余量 ≈ 3.97GiB(boot 通过,图捕获完毕)。fp8 KV 口径下 **32 KiB/token**,
+#   比 3090 档的 57344 大 4.5 倍——这是这张卡的唯一卖点。
+# 再往上不是配置问题:262144 就是 max_pos(要更长得 YaRN/改引擎)。
+max_seq = 262144
+max_concurrency = 1
+# prefill 块长 2048 / 尾块 0(① 的逐档实测最优点;4096 撞 marlin 工作区显存)。
+# sm89 上未复测块长,先沿用同一口径。
+prefill_chunk = 2048
+prefill_tail_merge = 0
+implicit_session = true
+
+[sampling]
+# GUI agent 联调：打破 greedy 复读；客户端显式 temperature=0 仍可逐请求回落贪心。
+# 本次只改 3080 档；3090/full 仍以 greedy 为基线。
+mode = "sampling"
+temp = 0.3
+topk = 20
+topp = 0.95
+# 2026-10-26：设备端 top-32 先惩罚再选候选，1.05 不再回退整行 logits
+# （实测同 prompt/seed：1.0 56.0–57.3 t/s vs 1.05 57.6–58.6 t/s；AL 1.57→1.71）。
+# 这是 opt-in 反循环档：若长跑出现词沙拉/工具遵循下降，回 1.0 即可（核内跳过）。
+rep_penalty = 1.00
+
+[pool]
+# 2 槽 = 297MiB:覆盖三图窗口的删除快照(与 ① 同口径)。
+snap_max = 2
+prefix_cache = true
+vram_reserve_mb = 512
+transient_reserve_mb = 1024
+# 宿主 KV 腿 10GiB(设备池之外的冷缓存;整链下沉而不是硬拒)。
+host_cache_mb = 10240
+snap_host_mb = 3072
+# 图像前缀无感删除(leave-gap;snap2 覆盖三图窗口)。
+image_evict = true
+snap_msg_boundary = true
+snap_msg_delim = ""
+snap_msg_min_gap = 2048
+snap_msg_min_span = 0

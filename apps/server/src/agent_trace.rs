@@ -62,6 +62,9 @@ pub struct ReqFacts {
     pub max_new: usize,
     pub ignore_eos: bool,
     pub stop: usize,
+    /// **跳轮重复探测**(`repeat_guard::scan`;`None` = 无 assistant 轮可判)。
+    /// 只记事实,引擎不因此改变任何生成行为(2026-10-31 用户裁决:先只可见)。
+    pub repeat: Option<crate::repeat_guard::RepeatFacts>,
 }
 
 impl ReqFacts {
@@ -81,6 +84,13 @@ impl ReqFacts {
             "max_new": self.max_new,
             "ignore_eos": self.ignore_eos,
             "stop": self.stop,
+            "repeat": self.repeat.as_ref().map(|r| json!({
+                "same_call": r.same_call,
+                "trailing_same": r.trailing_same,
+                "sig": r.sig,
+                "tool": r.tool,
+                "triggered": r.triggered(),
+            })),
         })
     }
 }

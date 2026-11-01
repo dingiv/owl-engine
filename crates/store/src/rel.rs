@@ -480,7 +480,16 @@ impl Rel {
         let kv_root = root.join("kv");
         let snap_root = root.join("snap");
         let kv = DiskTier::<ChainHash>::new(kv_root.clone(), self.leg.host_slot_bytes(), kv_bytes)?;
-        let snap = DiskTier::<SnapKey>::new(snap_root.clone(), snap_blk.max(1), snap_bytes)?;
+        // **盘上一个快照文件 = 全部 rank 平面**(2026-10-31 修):宿主层早就按
+        // `slot_bytes × world` 建块(`attach_snap_layout`),盘层却只按**单 rank**
+        // (`snap_bytes`)建 ⇒ TP2 写出的文件是单块的 2 倍 ⇒ 启动回填逐条
+        // 「大小不符 ⇒ 隔离」⇒ 锚点快照全废、跨重启召回被 `reuse_face` 裁到 0。
+        // 实测:2400 块 KV 全部回填,但 6 张快照全部隔离(159252480 ≠ 79626240)。
+        let snap = DiskTier::<SnapKey>::new(
+            snap_root.clone(),
+            snap_blk.max(1).saturating_mul(self.world),
+            snap_bytes,
+        )?;
         let attach = DiskAttach {
             kv_root,
             snap_root,

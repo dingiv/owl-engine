@@ -31,6 +31,11 @@ bind = "127.0.0.1:8137"
 # 原始请求 JSON 落盘目录（空 = 关；每请求一份 body，供前端联调复现；
 # 含业务数据/图片 data URL，开启前确认隐私与磁盘容量）。
 request_dump_dir = ""
+# 单图像素上限(视觉预处理 `smart_resize` 封顶;**0 = 内置 4096² = 实际不缩**)。
+# 图像 token 数 ∝ 像素:1920×1088 ⇒ 646 tok / 2560×1440 ⇒ 1160 tok / 1280×704 ⇒ 281 tok。
+# 真实 GUI agent 每轮 +1 张截图 ⇒ 每 100 tok ≈ 135 ms prefill(135k 上下文实测)。
+# 设 1000000(≈1MP)⇒ 每张 ~646 tok;500000 ⇒ ~281 tok。代价 = 小字号 UI 可读性。
+vision_max_pixels = 0
 # 模板路径覆盖:空 = 用模型快照 `<model.path>/chat_template.jinja`;
 # 相对路径 = 相对模型目录。
 template_path = ""

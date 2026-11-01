@@ -60,3 +60,5 @@ experiments
 # 新硬件形状在被裁决成常驻档之前,档位只住在这里(入口档面受 profiles.rs 钉住)。
 .local-state/
 *.local.toml
+# 按代际分离的构建目录(单份 `.a` 家族取最高代 ⇒ sm86/sm89 各自一份二进制)
+/target-sm89

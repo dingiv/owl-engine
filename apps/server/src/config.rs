@@ -341,6 +341,8 @@ pub struct ServerConfig {
     pub bind: String,
     /// 原始请求 JSON 落盘目录（空 = 关；前端联调复现用）
     pub request_dump_dir: Option<PathBuf>,
+    /// 单图像素上限（视觉预处理封顶；0 = 内置 4096²=不缩）
+    pub vision_max_pixels: usize,
     /// 模型路径(`[model] path`;目录或 .gguf 单文件;构造期回退 workspace 缺省)
     pub model_dir: PathBuf,
     /// 模型格式(`[model] format`;装载器分档的唯一判据)
@@ -473,6 +475,7 @@ impl ServerConfig {
                 let p = cfg.server.request_dump_dir.trim();
                 (!p.is_empty()).then(|| PathBuf::from(p))
             },
+            vision_max_pixels: cfg.server.vision_max_pixels,
             model_dir: cfg
                 .model
                 .path

@@ -15,6 +15,16 @@
 #
 # ⚠️ 与单 3090 档同源的已知缺陷:DFlash2 尾批裁剪可让设备核自旋
 # (`docs/devlog/serving/spec-tailcap-gpu-spin-立案.md`)。
+#
+# 2026-10-29:默认主模型切到 `bytkim/Qwen3.8-27B-pi-AWQ-INT4`
+# (awq-forge 本地转换,19G,g32-asym,无 MTP;质量门 GSM8K 96.5% vs FP8 97.0%)。
+# DFlash 草稿用 **syvai W4A16 int4**(1.19G)——它就是 pi 源 BF16 草稿
+# (`bytkim/Qwen3.8-27B-pi-FP8/dflash2`,与 z-lab 件 sha256 逐字节一致)
+# 的 GPTQ 量化件(base_model=incoai),不是另一个模型。
+# ⚠️ 这个草稿的 conv 并行结构(qkv/gate_up 与 kernel_projection 共享
+# 同一份 normed 输入,且 coefficients 同时用于 prepare/finish)使 AWQ
+# 的平滑缩放无法折叠——硬做只能退化成 RTN。int4 的正确校准路径就是
+# GPTQ(syvai 同源),故不另造 AWQ 草稿。
 extends = [
   "full.toml",
   "parts/model/27b-awq.toml",
@@ -29,8 +39,11 @@ extends = [
 bind = "127.0.0.1:8135"
 
 [model]
+path = "../models/bytkim/Qwen3.8-27B-pi-AWQ-INT4"
 # **W4A8 主干**(2026-10-27 用户裁决默认;理由与档①同:SM86 INT8 张量核 2×f16)。
 # TP2 每 rank 池 4096MiB / 预算 6.37G ⇒ a8 的工作区(≈170MiB/rank)有余量。
+# 2026-10-31:a8 M-split 激活尺度修复后,长上下文门 20k × 10/10 通过
+# (`docs/devlog/kernels/w4a8-msplit-scales-立案与修复-2026-10-31.md`)。
 quant = "w4a8"
 
 [runtime]
@@ -50,19 +63,39 @@ implicit_session = true
 
 [sampling]
 # GUI agent 联调：打破 greedy 复读；客户端显式 temperature=0 仍可逐请求回落贪心。
-# 本次只改 3080 档；3090/full 仍以 greedy 为基线。
+# 2026-10-30 定调（复读立案）：**greedy = 27B instruct 的复读吸引子**，本档走采样。
+# temp 0.3 → **0.7**：0.3 在末层 logit gap ≥2 处 p(top1) ≈ 0.999，实际等同贪心
+# （真机复读探测：同一 prompt 的 6-gram 重复峰值 temp 0=13 / 0.3=5 / 1.0=3）；
+# 0.7 位于「0.3（近贪心）」与「checkpoint 自带 1.0」之间，留 agent 稳定性。
 mode = "sampling"
 temp = 0.7
 topk = 20
 topp = 0.95
-# 2026-10-26：设备端 top-32 先惩罚再选候选，1.05 不再回退整行 logits
-# （实测同 prompt/seed：1.0 56.0–57.3 t/s vs 1.05 57.6–58.6 t/s；AL 1.57→1.71）。
-# 这是 opt-in 反循环档：若长跑出现词沙拉/工具遵循下降，回 1.0 即可（核内跳过）。
+# **开启 1.05**（2026-10-31 用户裁决，基于下面的 A/B 事实）。
+#
+# 为何以前不敢开（已作废）：2026-10-26 **之前** rep>1 会把候选快路关掉 ⇒ 回读整行
+# logits（52.2 vs 82.4 t/s）。**2026-10-26 之后**惩罚已下沉到设备端 top-32
+# **选候选之前**，`use_cand` 不再以 rep_penalty 为门（exec/spec.rs:174 /
+# exec/phases.rs:1081）⇒ 热路径零回退。
+#
+# **2026-10-31 真机 A/B（单卡 3090 / w4a8 / spec d7 / 256 tok，两次独立 boot）**：
+#   rep=1.00 → 采样档 66.8 / 66.9 / 75.0 t/s；greedy 89.5 / 89.1
+#   rep=1.05 → 采样档 68.0 / 64.3 / 68.1 t/s；greedy 89.6 / 89.7
+#   ⇒ **解码无回归**(差异在方差内)；AL 2.82 → 2.67（符合预期，草稿也被惩罚）。
+#
+# ⚠️ **但它不是跳轮复读的解**：生产 17 轮逐字重复（/debug/agent seq29–45）**就发生在
+# temp=0.3 采样档上** ⇒ 固定点靠采样/惩罚治不了，需服务层“重复 tool_call”守卫
+# （已落 `apps/server/src/repeat_guard.rs`，当前形态 = 只可见 + WARN）。
+#
+# ⚠️ greedy 档下 rep_penalty **本就不生效**（`act.sampler_on=false` ⇒ 历史槽填哨兵）。
 rep_penalty = 1.05
 
 [spec]
 # TP2 草稿族放行(缺它 = tp.rs 装配期响亮拒)
 tp_draft = true
+# 2026-10-29 用户指定草稿口径 = INT4(syvai W4A16,GPTQ):
+# 与 pi 源 BF16 草稿同源(incoai),1.19G/TP2 = 0.6G/卡。
+draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 
 [pool]
 # 生产级默认:关键特性全开(非"看着省一点"的保守档)。

@@ -536,6 +536,12 @@ int marlin_mm(const void* A, const void* B, void* C, void* c_tmp, void* b_s,
 
     A_ptr += prob_m_split * (lda / (is_a_8bit ? 16 : 8));
     C_ptr += prob_m_split * (prob_n / 8);
+    // **W4A8 M-split 的 per-token 尺度必须随切片推进**(2026-10-31 定谳):
+    // a_scales 是 [M,1] 行主序,每个 M-slice 都要用自己那段行尺度;
+    // 之前只推进 A/C、不推进 a_s ⇒ 第 2 段起沿用第 1 段尺度,长 prefill
+    // (m=2048 被拆成 2×1024)后半段激活按错误尺度反量化 → 后段上下文
+    // 乱码/丢针。chunk<=1024(单切片)时恰好无感,故短 prompt 正常。
+    if (is_a_8bit) a_s_ptr += prob_m_split;
     rest_m -= prob_m_split;
   }
   return 0;

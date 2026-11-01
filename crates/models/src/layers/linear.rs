@@ -1115,7 +1115,10 @@ mod tests {
         // 局部键 = "gate_proj"(层内惯例);全键由 `map_keys` 在**声明期**改写
         // (与整模路同一条 `KeyConvention` 语义 —— 这里手写前缀即可)。
         let (local, prefix) = ("gate_proj", "model.language_model.layers.0.mlp.");
-        let (out_dim, in_dim, m) = (17408usize, 5120usize, 8usize);
+        let (out_dim, in_dim) = (17408usize, 5120usize);
+        // m=8: 单切片(旧门);m=2048: 触发 M-split(2×1024)—— 回归 2026-10-31
+        // `a_s_ptr` 未随切片推进的 bug(第 2 段用错 per-token 尺度)。
+        let ms = [8usize, 2048usize];
         struct Prefixed<'a>(&'a Linear, &'a str);
         impl crate::module::Loadable for Prefixed<'_> {
             fn layout(&self, ctx: &LoaderCtx) -> crate::module::LoaderOps {
@@ -1125,11 +1128,12 @@ mod tests {
         }
         // 确定性输入(r16 对齐:进 f16 域前先舍入,免"装载域 vs 输入域"两套口径)
         let r16 = |x: f32| half::f16::from_f32(x).to_f32();
-        let xs: Vec<f32> = (0..m * in_dim).map(|i| r16(((i as f32) * 0.013).sin() * 0.8)).collect();
-        let xb: Vec<u8> = xs.iter().flat_map(|f| half::f16::from_f32(*f).to_le_bytes()).collect();
 
-        let mut got: Vec<Vec<f32>> = Vec::new();
-        for plan in [QuantPlan::W4A16Awq, QuantPlan::W4A8Awq] {
+        let mut got: Vec<Vec<Vec<f32>>> = vec![Vec::new(), Vec::new()]; // [plan][m]
+        for (pi, plan) in [QuantPlan::W4A16Awq, QuantPlan::W4A8Awq]
+            .into_iter()
+            .enumerate()
+        {
             let lin = Linear::new(local, out_dim, in_dim, plan);
             let comp = Prefixed(&lin, prefix);
             let mut gpu = gpu_client().await;
@@ -1152,14 +1156,24 @@ mod tests {
                     );
                 }
             }
-            let x = TensorOps::from_host(Dtype::F16, vec![m, in_dim], &xb);
-            let decl = lin.forward(&x, &crate::module::ForwardCtx::minimal(m));
-            let out = crate::testkit::harvest_f16(&mut gpu, &decl).await;
+            for &m in &ms {
+                let xs: Vec<f32> = (0..m * in_dim)
+                    .map(|i| r16(((i as f32) * 0.013).sin() * 0.8))
+                    .collect();
+                let xb: Vec<u8> = xs
+                    .iter()
+                    .flat_map(|f| half::f16::from_f32(*f).to_le_bytes())
+                    .collect();
+                let x = TensorOps::from_host(Dtype::F16, vec![m, in_dim], &xb);
+                let decl = lin.forward(&x, &crate::module::ForwardCtx::minimal(m));
+                let out = crate::testkit::harvest_f16(&mut gpu, &decl).await;
+                got[pi].push(out);
+            }
             gpu.close().await.expect("关机");
-            got.push(out);
         }
-        // ---- 判据:噪声/信号 RMS(a8 vs a16)----
-        let (a16, a8) = (&got[0], &got[1]);
+        // ---- 判据:噪声/信号 RMS(a8 vs a16),每个 m 单独判 ----
+        for (mi, &m) in ms.iter().enumerate() {
+        let (a16, a8) = (&got[0][mi], &got[1][mi]);
         assert_eq!(a16.len(), a8.len());
         let n = a16.len();
         let rms = (a16.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / n as f64).sqrt();
@@ -1177,8 +1191,9 @@ mod tests {
         assert_eq!(nan, 0, "a8 输出含非有限值");
         assert!(
             noise < 1e-2,
-            "a8 与 a16 偏差过大({noise:.5})—— 布局/接线级错误距此量级 ≫ 10⁻¹"
+            "a8 与 a16 偏差过大(m={m}, {noise:.5})—— 布局/接线级错误距此量级 ≫ 10⁻¹"
         );
+        }
     }
 
     /// **W4A8 接线门(零 GPU)**:plan → 声明面(a8 键族 want)→ 前向面

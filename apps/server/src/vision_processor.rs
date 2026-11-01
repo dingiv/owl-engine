@@ -27,7 +27,7 @@ pub const MIN_PIXELS: usize = 65_536;
 pub const MAX_PIXELS: usize = 16_777_216;
 
 /// **data URL → VlmImage**(`data:image/png;base64,...`;http URL 暂不支持)
-pub fn from_data_url(url: &str) -> Result<VlmImage, String> {
+pub fn from_data_url(url: &str, max_pixels: usize) -> Result<VlmImage, String> {
     let rest = url
         .strip_prefix("data:")
         .ok_or_else(|| "图像 URL 只支持 data:image/...;base64,...(http 暂未接)".to_string())?;
@@ -40,31 +40,41 @@ pub fn from_data_url(url: &str) -> Result<VlmImage, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
         .map_err(|e| format!("data URL base64 解码失败: {e}"))?;
-    from_bytes(&bytes)
+    from_bytes(&bytes, max_pixels)
 }
 
 /// **字节流 → VlmImage**(PNG/JPEG;其他格式由 image crate 报错)
-pub fn from_bytes(bytes: &[u8]) -> Result<VlmImage, String> {
+pub fn from_bytes(bytes: &[u8], max_pixels: usize) -> Result<VlmImage, String> {
     let img = image::load_from_memory(bytes)
         .map_err(|e| format!("图像解码失败(PNG/JPEG): {e}"))?;
-    from_image(img)
+    from_image(img, max_pixels)
 }
 
 /// **已解码图 → VlmImage**
-pub fn from_image(img: DynamicImage) -> Result<VlmImage, String> {
+pub fn from_image(img: DynamicImage, max_pixels: usize) -> Result<VlmImage, String> {
     let rgb = img.to_rgb8();
     let (w, h) = rgb.dimensions();
     if h == 0 || w == 0 {
         return Err("图像尺寸为 0".into());
     }
-    let (h_bar, w_bar) = smart_resize(h as usize, w as usize)?;
+    let (h_bar, w_bar) = smart_resize(h as usize, w as usize, max_pixels)?;
     let resized = resize_pil(&rgb, w_bar, h_bar);
     let (pixel_values, grid_h, grid_w) = patchify(&resized);
     Ok(VlmImage { pixel_values, grid: (1, grid_h, grid_w) })
 }
 
 /// `smart_resize`(Qwen2VL 逐式;factor = PATCH*MERGE = 32)
-pub fn smart_resize(height: usize, width: usize) -> Result<(usize, usize), String> {
+/// `max_pixels` = 单图像素上限(**0 = 内置 `MAX_PIXELS`**,即 4096²,实际不缩)。
+///
+/// 为什么要可配(2026-10-31 P3):**图像 token 数 ∝ 像素**,而真实 GUI agent 每轮
+/// 新增 1 张截图 ≈ 880 tok ⇒ 在 135k 上下文里每轮多付 ~1.2 s prefill。
+/// 封顶到 1 MP ⇒ 646 tok、0.5 MP ⇒ 281 tok(线性);代价是小字号 UI 可读性。
+pub fn smart_resize(
+    height: usize,
+    width: usize,
+    max_pixels: usize,
+) -> Result<(usize, usize), String> {
+    let max_pixels = if max_pixels == 0 { MAX_PIXELS } else { max_pixels };
     let factor = PATCH * MERGE;
     let (h, w) = (height as f64, width as f64);
     if h.max(w) / h.min(w) > 200.0 {
@@ -72,8 +82,8 @@ pub fn smart_resize(height: usize, width: usize) -> Result<(usize, usize), Strin
     }
     let mut h_bar = ((h / factor as f64).round_ties_even() as usize) * factor;
     let mut w_bar = ((w / factor as f64).round_ties_even() as usize) * factor;
-    if h_bar * w_bar > MAX_PIXELS {
-        let beta = ((h * w) / MAX_PIXELS as f64).sqrt();
+    if h_bar * w_bar > max_pixels {
+        let beta = ((h * w) / max_pixels as f64).sqrt();
         h_bar = factor.max(((h / beta / factor as f64).floor() as usize) * factor);
         w_bar = factor.max(((w / beta / factor as f64).floor() as usize) * factor);
     } else if h_bar * w_bar < MIN_PIXELS {
@@ -237,7 +247,7 @@ mod tests {
         let img = RgbImage::from_fn(64, 48, |x, y| {
             image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
         });
-        let v = from_image(DynamicImage::ImageRgb8(img)).expect("preprocess");
+        let v = from_image(DynamicImage::ImageRgb8(img), 0).expect("preprocess");
         let (t, gh, gw) = v.grid;
         assert_eq!(t, 1);
         assert!(gh > 0 && gw > 0, "grid 必须非零");
@@ -250,15 +260,15 @@ mod tests {
     #[test]
     fn tiny_image_upscales() {
         let img = RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 0]));
-        let v = from_image(DynamicImage::ImageRgb8(img)).expect("upscale");
+        let v = from_image(DynamicImage::ImageRgb8(img), 0).expect("upscale");
         assert!(v.grid.1 >= PATCH && v.grid.2 >= PATCH);
     }
 
     /// data URL 头/编码的拒法
     #[test]
     fn data_url_rejects_http_and_non_base64() {
-        assert!(from_data_url("https://example.com/a.png").is_err());
-        assert!(from_data_url("data:image/png,abc").is_err());
+        assert!(from_data_url("https://example.com/a.png", 0).is_err());
+        assert!(from_data_url("data:image/png,abc", 0).is_err());
     }
 }
 
@@ -272,7 +282,7 @@ mod parity_probe {
         let Ok(bytes) = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../assets/bird.png")) else {
             return;
         };
-        let v = from_bytes(&bytes).expect("bird");
+        let v = from_bytes(&bytes, 0).expect("bird");
         eprintln!(
             "RUST bird grid={:?} len={} first8={:?}",
             v.grid,
@@ -293,7 +303,7 @@ mod parity_exact {
             return;
         };
         let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../assets/bird.png")).expect("bird");
-        let v = from_bytes(&bytes).expect("preprocess");
+        let v = from_bytes(&bytes, 0).expect("preprocess");
         assert_eq!(v.pixel_values.len() * 4, golden.len(), "长度");
         let want: Vec<f32> = golden
             .chunks_exact(4)

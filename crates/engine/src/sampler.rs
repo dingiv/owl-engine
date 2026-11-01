@@ -230,6 +230,38 @@ pub fn sample_from_candidates(union: &[(f32, u32)], cfg: &SamplerCfg, rng: &mut 
     keep.last().map(|(pos, _)| union[*pos as usize].1).unwrap_or(0)
 }
 
+/// **已算好的稀疏分布 → 多项式抽样**(2026-10-31;与 [`sample`] 的 RNG 用法**逐字一致**
+/// —— `distribution` 不消费 RNG,所以这里只做那一步采样)。
+///
+/// 用途:投机拒绝采样走**候选臂**时,bonus 需要从稀疏目标分布抽,而不能再
+/// 回读整行 logits。
+pub fn sample_sparse(p: &[(u32, f32)], rng: &mut u64) -> u32 {
+    let u = uniform(rng);
+    let mut acc = 0f32;
+    for (tok, prob) in p {
+        acc += *prob;
+        if u < acc {
+            return *tok;
+        }
+    }
+    p.last().map(|(t, _)| *t).unwrap_or(0)
+}
+
+/// **候选行 → 稀疏目标分布**(2026-10-31):`(值, 全局 id)` 列表走与整行
+/// [`distribution`] **同一套变换**(temperature → top-k → softmax → top-p),
+/// 但**不施加重复惩罚**(设备端 top-K 核已在选候选前施加过)。
+///
+/// 等价性根据:温度是单调变换 ⇒ 候选集上的 top-k 与全表 top-k 同集;
+/// 只要 `cfg.topk <= 候选数`(调用方的 `use_cand` 门已保证 ≤32),归一化后的
+/// 概率与整行路径**逐项相同**。
+pub fn distribution_of_cands(cands: &[(f32, u32)], cfg: &SamplerCfg) -> Vec<(u32, f32)> {
+    let mut vals: Vec<f32> = cands.iter().map(|(v, _)| *v).collect();
+    distribution(&mut vals, cfg, &[])
+        .into_iter()
+        .map(|(pos, p)| (cands[pos as usize].1, p))
+        .collect()
+}
+
 /// logits → 采样 token（[`distribution`] + 多项式抽样）。
 /// repeat-penalty 会原地修改 `logits`（与旧行为一致）。
 pub fn sample(logits: &mut [f32], cfg: &SamplerCfg, rng: &mut u64, history: &[u32]) -> u32 {

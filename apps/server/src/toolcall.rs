@@ -139,8 +139,6 @@ pub enum StructEvent {
     Tool { index: usize, name: String, arg_bytes: usize },
     /// 模型近失格式被保守修复(只在校验通过后记;不掩盖真错误)
     Repair { tool: String, kind: &'static str },
-    /// 参数类型不匹配但已软通过（保留原值，交远端工具/前端处置）
-    SoftType { tool: String, prop: String, expected: String, got: String },
     /// 畸形工具块(未闭合/超限/参数不可解析;上层记日志)
     Malformed { kind: &'static str, bytes: usize },
     /// 生成流结束时的状态与尾巴余量
@@ -158,9 +156,6 @@ impl StructEvent {
                 format!("tool #{index} {name} args={arg_bytes}B")
             }
             StructEvent::Repair { tool, kind } => format!("repair {tool} {kind}"),
-            StructEvent::SoftType { tool, prop, expected, got } => {
-                format!("soft_type {tool}.{prop} expect={expected} got={got}")
-            }
             StructEvent::Malformed { kind, bytes } => format!("malformed {kind} {bytes}B"),
             StructEvent::Finish { state, held_bytes } => {
                 format!("finish {state} held={held_bytes}B")
@@ -194,83 +189,18 @@ enum State {
     InToolBetween,
 }
 
-/// 请求侧工具 schema(取 `name → 属性名 → JSON 类型` + required;用于 xml
-/// 参数类型回填与**服务层工具调用校验**)
+/// 请求侧工具 schema(`name → 属性名 → JSON 类型`)。
+///
+/// **只用于 xml 参数值的类型回填**(`<parameter=timeout>30</parameter>` 要变成
+/// 数字而不是 `"30"`),**不做任何校验** —— 2026-10-31 用户裁决:服务层不替
+/// agent 客户端判工具对错,校验就是错误源(误拒 ⇒ 整轮 502 ⇒ 客户端重放 ⇒ 复读)。
 #[derive(Debug, Default)]
 pub struct ToolSchemas {
     types: HashMap<String, HashMap<String, String>>,
-    required: HashMap<String, Vec<String>>,
 }
 
-/// 参数校验错误（字段级；`tool_call_arg_type` 允许软通过）。
-#[derive(Debug, Clone)]
-struct ArgError {
-    kind: &'static str,
-    tool: String,
-    prop: Option<String>,
-    expected: Option<String>,
-    got: Option<String>,
-}
-
-impl ArgError {
-    fn tool(kind: &'static str, tool: &str) -> Self {
-        Self { kind, tool: tool.to_string(), prop: None, expected: None, got: None }
-    }
-
-    fn missing(tool: &str, prop: &str) -> Self {
-        Self {
-            kind: "tool_call_missing_required",
-            tool: tool.to_string(),
-            prop: Some(prop.to_string()),
-            expected: Some("required".into()),
-            got: Some("missing".into()),
-        }
-    }
-
-    fn type_mismatch(tool: &str, prop: &str, expected: &str, got: &Json) -> Self {
-        Self {
-            kind: "tool_call_arg_type",
-            tool: tool.to_string(),
-            prop: Some(prop.to_string()),
-            expected: Some(expected.to_string()),
-            got: Some(short_json(got)),
-        }
-    }
-
-    fn is_soft(&self) -> bool {
-        self.kind == "tool_call_arg_type"
-    }
-
-    fn log_line(&self) -> String {
-        match (&self.prop, &self.expected, &self.got) {
-            (Some(p), Some(e), Some(g)) => {
-                format!("tool={} prop={p} expect={e} got={g}", self.tool)
-            }
-            _ => format!("tool={} kind={}", self.tool, self.kind),
-        }
-    }
-}
-
-/// JSON 值是否匹配 schema 标量类型。
-fn type_matches(ty: &str, v: &Json) -> bool {
-    match ty {
-        "number" | "float" => v.is_number(),
-        "integer" => {
-            v.as_i64().is_some()
-                || v.as_u64().is_some()
-                || v.as_f64().is_some_and(|f| f.is_finite() && f.fract() == 0.0)
-        }
-        "boolean" => v.is_boolean(),
-        "string" => v.is_string(),
-        "array" => v.is_array(),
-        "object" => v.is_object(),
-        "null" => v.is_null(),
-        _ => true,
-    }
-}
-
-/// 取属性的标量类型；Pydantic v2 的 Optional[T] 是 `anyOf/oneOf`，
-/// 取第一个非 null 分支（与 vLLM 的 qwen3 parser 类型回填同口径）。
+/// schema 属性的类型名(`type`,或 `anyOf/oneOf` 里第一个非 null 的类型)。
+/// **只服务于 xml 参数回填**(值该是数字还是字符串),不参与任何校验。
 fn json_type_of(v: &Json) -> Option<&str> {
     if let Some(t) = v.get("type").and_then(Json::as_str) {
         return Some(t);
@@ -290,10 +220,14 @@ fn json_type_of(v: &Json) -> Option<&str> {
 }
 
 impl ToolSchemas {
+    /// 该名字是否在请求 tools 里(兜底抢救只在"名字已知"时才敢认形状)
+    pub fn knows(&self, name: &str) -> bool {
+        self.types.contains_key(name)
+    }
+
     /// 从 OpenAI `tools` 数组提取(兼容嵌套 `{type,function:{…}}` 与扁平形)
     pub fn from_tools(tools: &[Json]) -> Self {
         let mut types = HashMap::new();
-        let mut required = HashMap::new();
         for t in tools {
             let f = t.get("function").unwrap_or(t);
             let Some(name) = f.get("name").and_then(|v| v.as_str()) else { continue };
@@ -309,56 +243,9 @@ impl ToolSchemas {
                     }
                 }
             }
-            let req: Vec<String> = f
-                .get("parameters")
-                .and_then(|p| p.get("required"))
-                .and_then(|r| r.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
             types.insert(name.to_string(), props);
-            required.insert(name.to_string(), req);
         }
-        Self { types, required }
-    }
-
-    /// **服务层工具调用校验**(OpenAI 语义):工具名必须在请求 tools 中;
-    /// arguments 必须是 JSON 对象;required 属性必须非 null;已知属性类型必须
-    /// 匹配。无 schema(空 tools)时不做推断 —— 返回 Ok,由上游决定。
-    ///
-    /// `tool_call_arg_type` 由调用方按**软错误**处理（保留原值，不整轮 502）。
-    fn validate(&self, name: &str, args: &str) -> Result<(), ArgError> {
-        if self.types.is_empty() {
-            return Ok(());
-        }
-        if !self.types.contains_key(name) {
-            return Err(ArgError::tool("tool_call_unknown_tool", name));
-        }
-        let v: Json = serde_json::from_str(args)
-            .map_err(|_| ArgError::tool("tool_call_args_invalid_json", name))?;
-        let Some(obj) = v.as_object() else {
-            return Err(ArgError::tool("tool_call_args_not_object", name));
-        };
-        if let Some(req) = self.required.get(name) {
-            for p in req {
-                if obj.get(p).is_none_or(Json::is_null) {
-                    return Err(ArgError::missing(name, p));
-                }
-            }
-        }
-        if let Some(props) = self.types.get(name) {
-            for (k, ty) in props {
-                if let Some(val) = obj.get(k) {
-                    if !val.is_null() && !type_matches(ty, val) {
-                        return Err(ArgError::type_mismatch(name, k, ty, val));
-                    }
-                }
-            }
-        }
-        Ok(())
+        Self { types }
     }
 
     /// xml 参数值 → JSON 值。**按 schema 类型回填**(xml 分支把一切写成了
@@ -425,17 +312,6 @@ fn normalize_integer(n: serde_json::Number) -> Json {
         }
     }
     Json::Number(n)
-}
-
-fn short_json(v: &Json) -> String {
-    const N: usize = 160;
-    let s = v.to_string();
-    if s.len() <= N {
-        s
-    } else {
-        let cut = s.char_indices().take_while(|(i, _)| *i < N).last().map_or(0, |(i, _)| i);
-        format!("{}…({}B)", &s[..cut], s.len())
-    }
 }
 
 /// 日志用的 raw 截断（保留完整 450B 级工具块；超长块只打头尾账）。
@@ -645,9 +521,45 @@ impl ChannelSplitter {
                     State::InAnthropic => "tool_call_anthropic_unclosed",
                     _ => "tool_call_unclosed",
                 };
-                self.trace_event(StructEvent::Malformed { kind, bytes: raw.len() });
-                self.malformed += 1;
-                out.push(Item::Malformed { kind, raw });
+                // **缺壳抢救**(2026-10-31):模型常在 EOS 前被截断(预算/停机/模板),
+                // 壳没闭合但**工具体是完整的**。旧行为 = 整轮 502 + 客户端重放
+                // ⇒ 同上下文同输出 ⇒ 复读死循环。这里先按体解析一次:能过校验的
+                // 调用照样发射(记 `repair <tool> <kind>:missing_close`),救不回来
+                // 才落 Malformed(契约 I4 不破:arguments 仍是合法 JSON)。
+                let mut salvaged = if body_is_complete(&raw) {
+                    match self.state {
+                        State::InAnthropic => self.build_anthropic_calls(&raw),
+                        _ => vec![self.build_tool_call(&raw)],
+                    }
+                } else {
+                    Vec::new()
+                };
+                let kept = salvaged
+                    .iter()
+                    .filter(|i| matches!(i, Item::ToolCall { .. }))
+                    .count();
+                if kept > 0 {
+                    let tool = salvaged
+                        .iter()
+                        .find_map(|i| match i {
+                            Item::ToolCall { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    self.trace_event(StructEvent::Repair { tool, kind });
+                    owl_shared::log_warn!(
+                        "chat",
+                        "工具块缺闭合壳已抢救({kind};救回 {kept} 个调用;{}B;raw={})",
+                        raw.len(),
+                        raw_for_log(&raw)
+                    );
+                    salvaged.retain(|i| !matches!(i, Item::Malformed { .. }));
+                    out.extend(salvaged);
+                } else {
+                    self.trace_event(StructEvent::Malformed { kind, bytes: raw.len() });
+                    self.malformed += 1;
+                    out.push(Item::Malformed { kind, raw });
+                }
                 self.state = State::Text;
             }
             State::InToolBetween | State::Text | State::Think => {
@@ -891,52 +803,39 @@ impl ChannelSplitter {
     /// 外层 `<function_calls>` 已由状态机剥掉；body 里是
     /// `<invoke name="…">` + 可选 `<parameter name="…">…</parameter>`。
     fn build_anthropic_calls(&mut self, body: &str) -> Vec<Item> {
-        let body = body.trim();
-        // 模型偶尔会在 `<function_calls>` 壳里写 Qwen 的 `<function=...>`；
-        // Anthropic 解析失败时再按 Qwen 块扫一遍（只接受能过 schema 的块）。
+        let body_raw = body.trim();
+        // **命名空间归一**(2026-10-31):Claude 系文档/工具壳里常见
+        // `<antml:invoke>` / `<antml:parameter>` 前缀(Qwen 照抄会连前缀一起吐)。
+        // 只在解析副本上剥前缀 —— 日志仍打原文。
+        let owned;
+        let body: &str = if body_raw.contains("<antml:") || body_raw.contains("</antml:") {
+            owned = body_raw.replace("<antml:", "<").replace("</antml:", "</");
+            owned.as_str()
+        } else {
+            body_raw
+        };
+        let body = trim_foreign_close(body, &["</tool_call>"]);
+        // 混合体回退链(**壳与体可以各自出自不同协议**):
+        //   ① Anthropic 体: `<invoke name=…><parameter name=…>`
+        //   ② Qwen 体:      `<function=name><parameter=…>`
+        //   ③ **OpenAI 体**: 裸 JSON(`{"name":…,"arguments":…}`)套 Anthropic 壳
+        //      —— 2026-10-31 现场形态,旧版到此必 `no_invoke` ⇒ 整轮 502。
         match parse_anthropic_calls(body, &self.schemas)
             .or_else(|_| parse_qwen_blocks(body, &self.schemas))
+            .or_else(|_| parse_json_calls(body, &self.schemas))
         {
             Ok(calls) if !calls.is_empty() => {
-                // 硬错误（未知工具/缺 required/坏 JSON）整组拒；
-                // arg_type 只记字段级 WARN，保留原值继续发射。
-                let mut soft = Vec::new();
-                for (name, args) in &calls {
-                    if let Err(e) = self.schemas.validate(name, args) {
-                        if e.is_soft() {
-                            soft.push(e);
-                        } else {
-                            self.trace_event(StructEvent::Malformed {
-                                kind: e.kind,
-                                bytes: body.len(),
-                            });
-                            owl_shared::log_warn!(
-                                "chat",
-                                "工具调用硬拒绝({}; raw={})",
-                                e.log_line(),
-                                raw_for_log(body)
-                            );
-                            self.malformed += 1;
-                            return vec![Item::Malformed { kind: e.kind, raw: body.to_string() }];
-                        }
+                // **零校验**(2026-10-31 用户裁决:服务层不替 agent 客户端判工具
+                // 对错;校验本身就是错误源 —— 误拒一次 = 整轮 502 + 客户端重放
+                // + 模型复读)。这里只解析形状,工具名/参数原样交给前端。
+                // **混用留痕**:壳/体协议不一致时点名(下一轮现场数据靠它定位)
+                if body.trim_start().starts_with('{') || body.trim_start().starts_with('[') {
+                    if let Some((name, _)) = calls.first() {
+                        self.trace_event(StructEvent::Repair {
+                            tool: name.clone(),
+                            kind: "json_inside_function_calls",
+                        });
                     }
-                }
-                for e in soft {
-                    let prop = e.prop.clone().unwrap_or_default();
-                    let expected = e.expected.clone().unwrap_or_default();
-                    let got = e.got.clone().unwrap_or_default();
-                    self.trace_event(StructEvent::SoftType {
-                        tool: e.tool.clone(),
-                        prop,
-                        expected,
-                        got,
-                    });
-                    owl_shared::log_warn!(
-                        "chat",
-                        "工具参数类型不匹配(软通过;{}; raw={})",
-                        e.log_line(),
-                        raw_for_log(body)
-                    );
                 }
                 calls
                     .into_iter()
@@ -984,38 +883,6 @@ impl ChannelSplitter {
                         "工具调用近失格式已修复({kind};tool={name};args={}B)",
                         args.len()
                     );
-                }
-                if let Err(e) = self.schemas.validate(&name, &args) {
-                    if e.is_soft() {
-                        let prop = e.prop.clone().unwrap_or_default();
-                        let expected = e.expected.clone().unwrap_or_default();
-                        let got = e.got.clone().unwrap_or_default();
-                        self.trace_event(StructEvent::SoftType {
-                            tool: e.tool.clone(),
-                            prop,
-                            expected,
-                            got,
-                        });
-                        owl_shared::log_warn!(
-                            "chat",
-                            "工具参数类型不匹配(软通过;{}; raw={})",
-                            e.log_line(),
-                            raw_for_log(body)
-                        );
-                    } else {
-                        self.trace_event(StructEvent::Malformed {
-                            kind: e.kind,
-                            bytes: body.len(),
-                        });
-                        owl_shared::log_warn!(
-                            "chat",
-                            "工具调用硬拒绝({}; raw={})",
-                            e.log_line(),
-                            raw_for_log(body)
-                        );
-                        self.malformed += 1;
-                        return Item::Malformed { kind: e.kind, raw: body.to_string() };
-                    }
                 }
                 self.tool_index += 1;
                 self.trace_event(StructEvent::Tool {
@@ -1150,6 +1017,360 @@ fn xml_attr(tag: &str, attr: &str) -> Option<String> {
     None
 }
 
+// ============================================================================
+// § 宽松 JSON(2026-10-31 现场:`tool_call_json_invalid` 直接掐掉整轮)
+// ============================================================================
+//
+// 现场(pi GUI agent):模型发 `<tool_call>{"name":"screenshot","arguments":…}`
+// 但体里的 JSON 有**一处小毛病**(单引号 / 未加引号的键 / 尾逗号 / 少一个闭括号 /
+// 后面跟了多余文字),服务层判 `tool_call_json_invalid` ⇒ 整轮 502 ⇒ 客户端把
+// 错误回喂 ⇒ 模型改用 bash echo ⇒ 复读。
+//
+// 用户裁决:**错误也要给前端**,服务层不替它判工具对错。故这里做一个**宽容
+// 对象解析器**:只求"能看出是哪个工具、参数尽量拿到",坏的部分不猜(缺的参数
+// 留空,由前端报错并让模型自纠)。
+//
+// 容忍面(逐条,均有测试):
+// - 单/双引号;未加引号的键;尾逗号;`//` 与 `/* */` 注释;
+// - 缺闭合 `}`/`]`(EOF 处自动补齐);尾部多余文字(第一次闭合后即停);
+// - Python 字面量 `True/False/None`、`null/nil`、`NaN/Infinity`;
+// - 数字任意(含 `.5`/`1.`/指数)。
+//
+// **不**容忍(也不猜):键与值都读不出来的垃圾 —— 那种情况才返回 None。
+
+struct Lenient<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Lenient<'a> {
+    fn new(s: &'a str) -> Self {
+        Self { b: s.as_bytes(), i: 0 }
+    }
+
+    fn ws(&mut self) {
+        loop {
+            while self.i < self.b.len() && self.b[self.i].is_ascii_whitespace() {
+                self.i += 1;
+            }
+            // 注释
+            if self.i + 1 < self.b.len() && self.b[self.i] == b'/' {
+                match self.b[self.i + 1] {
+                    b'/' => {
+                        while self.i < self.b.len() && self.b[self.i] != b'\n' {
+                            self.i += 1;
+                        }
+                        continue;
+                    }
+                    b'*' => {
+                        self.i += 2;
+                        while self.i + 1 < self.b.len()
+                            && !(self.b[self.i] == b'*' && self.b[self.i + 1] == b'/')
+                        {
+                            self.i += 1;
+                        }
+                        self.i = (self.i + 2).min(self.b.len());
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+
+    /// 字符串(单/双引号;不闭合 = 吃到 EOF,按已读内容成串)
+    fn string(&mut self) -> String {
+        let q = match self.peek() {
+            Some(c @ (b'"' | b'\'')) => {
+                self.i += 1;
+                c
+            }
+            _ => return String::new(),
+        };
+        let mut out = String::new();
+        while let Some(c) = self.peek() {
+            self.i += 1;
+            if c == q {
+                break;
+            }
+            if c == b'\\' {
+                match self.peek() {
+                    Some(e) => {
+                        self.i += 1;
+                        match e {
+                            b'n' => out.push('\n'),
+                            b't' => out.push('\t'),
+                            b'r' => out.push('\r'),
+                            b'b' => out.push('\u{8}'),
+                            b'f' => out.push('\u{c}'),
+                            b'u' => {
+                                let mut v = 0u32;
+                                let mut n = 0;
+                                while n < 4 {
+                                    match self.peek().and_then(|d| (d as char).to_digit(16)) {
+                                        Some(d) => {
+                                            v = v * 16 + d;
+                                            self.i += 1;
+                                            n += 1;
+                                        }
+                                        None => break,
+                                    }
+                                }
+                                if let Some(ch) = char::from_u32(v) {
+                                    out.push(ch);
+                                }
+                            }
+                            other => out.push(other as char),
+                        }
+                    }
+                    None => break,
+                }
+                continue;
+            }
+            // UTF-8 逐字节收集后统一成串
+            out.push(c as char);
+        }
+        fix_utf8(out)
+    }
+
+    fn value(&mut self) -> Option<Json> {
+        self.ws();
+        match self.peek()? {
+            b'{' => self.object(),
+            b'[' => self.array(),
+            b'"' | b'\'' => Some(Json::String(self.string())),
+            _ => self.atom(),
+        }
+    }
+
+    fn object(&mut self) -> Option<Json> {
+        self.i += 1; // '{'
+        let mut m = Map::new();
+        loop {
+            self.ws();
+            match self.peek() {
+                None => return Some(Json::Object(m)), // EOF:自动补闭
+                Some(b'}') => {
+                    self.i += 1;
+                    return Some(Json::Object(m));
+                }
+                Some(b',') => {
+                    self.i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            // 键:引号串或裸标识符
+            let key = match self.peek() {
+                Some(b'"' | b'\'') => self.string(),
+                _ => {
+                    let start = self.i;
+                    while let Some(c) = self.peek() {
+                        if c == b':' {
+                            break;
+                        }
+                        if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'$') {
+                            break;
+                        }
+                        self.i += 1;
+                    }
+                    String::from_utf8_lossy(&self.b[start..self.i]).to_string()
+                }
+            };
+            self.ws();
+            if self.peek() == Some(b':') {
+                self.i += 1;
+            } else if key.is_empty() {
+                // 既无键也无冒号:吞一个字符推进,避免死循环
+                if self.peek().is_some() {
+                    self.i += 1;
+                    continue;
+                }
+                return Some(Json::Object(m));
+            }
+            let v = match self.value() {
+                Some(v) => v,
+                None => return Some(Json::Object(m)),
+            };
+            if !key.is_empty() {
+                m.insert(key, v);
+            }
+            self.ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.i += 1;
+                }
+                Some(b'}') => {
+                    self.i += 1;
+                    return Some(Json::Object(m));
+                }
+                None => return Some(Json::Object(m)),
+                // 后面是别的(尾随垃圾/下一个键):继续,下一轮会处理
+                _ => {}
+            }
+        }
+    }
+
+    fn array(&mut self) -> Option<Json> {
+        self.i += 1; // '['
+        let mut a = Vec::new();
+        loop {
+            self.ws();
+            match self.peek() {
+                None => return Some(Json::Array(a)),
+                Some(b']') => {
+                    self.i += 1;
+                    return Some(Json::Array(a));
+                }
+                Some(b',') => {
+                    self.i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            match self.value() {
+                Some(v) => a.push(v),
+                None => return Some(Json::Array(a)),
+            }
+            self.ws();
+            match self.peek() {
+                Some(b',') => self.i += 1,
+                Some(b']') => {
+                    self.i += 1;
+                    return Some(Json::Array(a));
+                }
+                None => return Some(Json::Array(a)),
+                _ => {}
+            }
+        }
+    }
+
+    /// 裸值:数字 / 真值 / 裸词(裸词当字符串,不猜)
+    fn atom(&mut self) -> Option<Json> {
+        let start = self.i;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || matches!(c, b'.' | b'+' | b'-' | b'_') {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        if self.i == start {
+            return None;
+        }
+        let raw = std::str::from_utf8(&self.b[start..self.i]).ok()?;
+        match raw {
+            "true" | "True" | "TRUE" => Some(Json::Bool(true)),
+            "false" | "False" | "FALSE" => Some(Json::Bool(false)),
+            "null" | "None" | "nil" | "NULL" => Some(Json::Null),
+            _ => {
+                // 整数按 i64 出(否则 `240` 会变成 `240.0`,前端 schema 会挑刺)
+                if !raw.contains(['.', 'e', 'E']) {
+                    if let Ok(i) = raw.parse::<i64>() {
+                        return Some(Json::Number(i.into()));
+                    }
+                }
+                if let Ok(n) = raw.parse::<f64>() {
+                    if let Some(n) = serde_json::Number::from_f64(n) {
+                        return Some(Json::Number(n));
+                    }
+                }
+                Some(Json::String(raw.to_string()))
+            }
+        }
+    }
+}
+
+/// 把 `char` 逐字节拼出来的串修回真 UTF-8(宽容解析里按字节推进,非 ASCII 会散)
+fn fix_utf8(s: String) -> String {
+    let bytes: Vec<u8> = s.chars().map(|c| c as u32 as u8).collect();
+    match String::from_utf8(bytes) {
+        Ok(v) => v,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).to_string(),
+    }
+}
+
+/// 宽容解析:文本里第一个 `{`/`[` 之后的对象/数组;失败 = None
+fn parse_lenient(body: &str) -> Option<Json> {
+    let start = body.find(['{', '['])?;
+    let mut p = Lenient::new(&body[start..]);
+    p.value()
+}
+
+/// 从**任意文本**里捞工具名:找不到 = None(仅用于"体解析失败"的兜底)
+fn sniff_name(body: &str) -> Option<String> {
+    for key in ["\"name\"", "'name'", "name"] {
+        if let Some(p) = body.find(key) {
+            let rest = &body[p + key.len()..];
+            let rest = rest.trim_start().trim_start_matches(':').trim_start();
+            if let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                let tail = &rest[1..];
+                if let Some(end) = tail.find(q) {
+                    let n = &tail[..end];
+                    if !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.') {
+                        return Some(n.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// **兜底抢救**:从"名字 + JSON 对象"这种裸体里取出一次调用。
+///
+/// 只认**请求 tools 里存在的名字**(`schemas.knows`),否则 = 不猜、返回 None。
+fn salvage_named_json(
+    body: &str,
+    schemas: &ToolSchemas,
+) -> Option<(String, String, &'static str)> {
+    let v = parse_lenient(body)?;
+    let obj = v.as_object()?;
+    // 形态 A:对象自带 name / arguments
+    if let Some(name) = obj
+        .get("name")
+        .or_else(|| obj.get("tool"))
+        .or_else(|| obj.get("tool_name"))
+        .and_then(|n| n.as_str())
+    {
+        if schemas.knows(name) {
+            let args = obj
+                .get("arguments")
+                .or_else(|| obj.get("input"))
+                .or_else(|| obj.get("parameters"))
+                .or_else(|| obj.get("args"))
+                .cloned()
+                .unwrap_or_else(|| Json::Object(Map::new()));
+            let s = serde_json::to_string(&args).ok()?;
+            return Some((name.to_string(), s, "json_repaired"));
+        }
+    }
+    // 形态 B:`工具名 {…}`(名字在 JSON 之前)
+    let head = body.split(['{', '[']).next().unwrap_or("").trim();
+    let word = head
+        .rsplit([' ', '\n', '\t', ':', '"', '\'', '<', '>', '('])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if !word.is_empty() && schemas.knows(word) {
+        let s = serde_json::to_string(&Json::Object(obj.clone())).ok()?;
+        return Some((word.to_string(), s, "tool_name_plus_json"));
+    }
+    // 形态 C:名字在 JSON 之后
+    if let Some(name) = sniff_name(body) {
+        if schemas.knows(&name) {
+            let s = serde_json::to_string(&Json::Object(obj.clone())).ok()?;
+            return Some((name, s, "json_repaired"));
+        }
+    }
+    None
+}
+
 /// 工具块体解析:json 格式 `{"name":…,"arguments":{…}}` 优先,其次 xml 格式
 ///
 /// 返回值第三项 = 近失修复标记（仅当修复后的参数能通过 schema 校验才非 None）。
@@ -1157,13 +1378,47 @@ fn parse_tool_body(
     body: &str,
     schemas: &ToolSchemas,
 ) -> Result<(String, String, Option<&'static str>), &'static str> {
+    let body = trim_foreign_close(body, &["</function_calls>", "</antml:function_calls>"]);
     // ① json 格式(template `tool_call_format="json"`)
+    //
+    // 2026-10-31 混用修复:字段名两套协议并存 —— OpenAI `arguments`,
+    // Anthropic `input`(以及 `parameters`/`args` 的野生态)。另:模型常把
+    // arguments 写成**字符串化的 JSON**(双编码),旧路径会原样转成 JSON 字符串
+    // ⇒ 客户端拿到 `"{\"command\":…}"` 再解析失败。两处都在这里一次性收口。
     if body.starts_with('{') {
-        let v: Json = serde_json::from_str(body).map_err(|_| "tool_call_json_invalid")?;
-        let name = v.get("name").and_then(|n| n.as_str()).ok_or("tool_call_no_name")?;
-        let args = v.get("arguments").cloned().unwrap_or_else(|| Json::Object(Map::new()));
+        // 严格优先;失败走**宽容解析**(2026-10-31:小毛病不该掐整轮)
+        let (v, lenient) = match serde_json::from_str::<Json>(body) {
+            Ok(v) => (v, false),
+            Err(_) => match parse_lenient(body) {
+                Some(v) if v.is_object() => (v, true),
+                _ => return Err("tool_call_json_invalid"),
+            },
+        };
+        let name = v
+            .get("name")
+            .or_else(|| v.get("tool"))
+            .or_else(|| v.get("tool_name"))
+            .and_then(|n| n.as_str())
+            .ok_or("tool_call_no_name")?;
+        let mut args = v
+            .get("arguments")
+            .or_else(|| v.get("input"))
+            .or_else(|| v.get("parameters"))
+            .or_else(|| v.get("args"))
+            .cloned()
+            .unwrap_or_else(|| Json::Object(Map::new()));
+        let mut repair = if lenient { Some("json_repaired") } else { None };
+        if let Some(inner) = args.as_str() {
+            // 双编码:字符串里再套一层 JSON 对象
+            if let Ok(parsed) = serde_json::from_str::<Json>(inner) {
+                if parsed.is_object() {
+                    args = parsed;
+                    repair = Some("args_double_encoded");
+                }
+            }
+        }
         let s = serde_json::to_string(&args).map_err(|_| "tool_call_args_unserializable")?;
-        return Ok((name.to_string(), s, None));
+        return Ok((name.to_string(), s, repair));
     }
     // ② `<tool_call>` 里混入 Anthropic 的 `<invoke>`（模型偶尔整块搬家）。
     if body.contains("<invoke") && !body.contains("<function=") {
@@ -1174,7 +1429,13 @@ fn parse_tool_body(
         }
         return Err("tool_call_anthropic_multiple_in_tool");
     }
-    // ③ xml 格式(template 默认):`<function=NAME> <parameter=K>V</parameter>… </function>`
+    // ③-**兜底**:体不是规范 JSON 开头,但里面有 JSON 对象 / 直接是 `工具名 {参数}`
+    // (2026-10-31:模型常把工具调用写成"名字 + 参数对象"的裸形)。
+    // 只在名字**能在请求 tools 里找到**时才认 —— 不猜一个不存在的工具。
+    if let Some((name, args, kind)) = salvage_named_json(body, schemas) {
+        return Ok((name, args, Some(kind)));
+    }
+    // ④ xml 格式(template 默认):`<function=NAME> <parameter=K>V</parameter>… </function>`
     let open = body.find("<function=").ok_or("tool_call_no_function")?;
     let rest = &body[open + "<function=".len()..];
     let gt = rest.find('>').ok_or("tool_call_no_function")?;
@@ -1214,24 +1475,138 @@ fn parse_tool_body(
     }
     let s = serde_json::to_string(&Json::Object(obj.clone()))
         .map_err(|_| "tool_call_args_unserializable")?;
-    if schemas.validate(&name, &s).is_ok() {
+    if !obj.is_empty() {
         return Ok((name, s, None));
     }
     // ④ 保守修复：模型把 `<parameter=command>` 写成 `<command>`、
-    // `command="…"` 或 `<parameter name="command">`。只补 schema 里缺的属性，
-    // 且修复后必须通过同一份 required/type 校验；否则原样交给上层报错。
+    // `command="…"` 或 `<parameter name="command">`。只补 schema 里的属性名
+    // (**不判定对不对**);补到任何东西就采纳,补不到就原样交前端。
     let mut loose = obj;
     if fill_qwen_loose(inner, &name, schemas, &mut loose) {
         let repaired = serde_json::to_string(&Json::Object(loose))
             .map_err(|_| "tool_call_args_unserializable")?;
-        if schemas.validate(&name, &repaired).is_ok() {
-            return Ok((name, repaired, Some("qwen_loose")));
-        }
+        return Ok((name, repaired, Some("qwen_loose")));
     }
     Ok((name, s, None))
 }
 
 /// `<function_calls>` 壳里写 Qwen `<function=…>` 块时的兜底解析（可多块）。
+/// **裸 JSON 体 → 调用列表**(2026-10-31;壳/体混用的第三种体形态)。
+///
+/// 认三种写法(模型在 Anthropic 壳里套 OpenAI 体时实际出现过的全部):
+/// - 单个对象:`{"name":"bash","arguments":{…}}`
+/// - 数组:`[{…},{…}]`
+/// - JSONL:一行一个对象
+///
+/// 字段别名与 [`parse_tool_body`] 同源(`input`/`parameters`/`args`、
+/// `tool`/`tool_name`)—— 混用之所以频繁,本质是**两套协议字段名不同**。
+/// **剥尾巴上的外来闭合标签**(2026-10-31)。
+///
+/// 交叉壳现场:`<tool_call>` 开、`</function_calls>` 收(或反之)。状态机按
+/// **开府标记**选闭合标记 ⇒ 收不上,工具体里就残留一条**不属于自己**的闭合标签。
+///
+/// 只剥调用点**点名**的那几个(不是"见到就剥"):`</invoke>`/`</parameter>` 在
+/// 合法体里本来就是收尾,无条件剥会把好块打坏(第一版实测 20 项全红)。
+fn trim_foreign_close<'a>(body: &'a str, foreign: &[&str]) -> &'a str {
+    let mut t = body.trim_end();
+    'outer: loop {
+        for c in foreign {
+            if let Some(v) = t.strip_suffix(c) {
+                t = v.trim_end();
+                continue 'outer;
+            }
+        }
+        return t;
+    }
+}
+
+/// **缺壳抢救的安全判据**(2026-10-31)。
+///
+/// 只救"**壳**没闭合、**体**是完整的":
+/// - JSON 体:能整体解析 ⇒ 体完整(JSON 自带闭合);
+/// - XML 体:每个 `<parameter…>` 都有 `</parameter>`,且 `<invoke>`/`<function=…>`
+///   开闭配平 ⇒ 截断只可能发生在最外层壳上。
+///
+/// 截断落在参数值中间 = **不救** —— 半截命令(`rm -rf /home/us` 之类)比一轮
+/// 502 危险得多;那种情况仍走 Malformed + 上层拒绝返回。
+fn body_is_complete(body: &str) -> bool {
+    let t = body.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with('{') || t.starts_with('[') {
+        // 严格解析失败时看**宽容解析**能不能出对象(2026-10-31:小毛病不该
+        // 让整块在 finish 时被判"未闭合" ⇒ 502)
+        return serde_json::from_str::<Json>(t).is_ok()
+            || parse_lenient(t).is_some_and(|v| v.is_object() || v.is_array());
+    }
+    let inv_o = t.matches("<invoke").count();
+    let inv_c = t.matches("</invoke>").count();
+    let par_o = t.matches("<parameter").count();
+    let par_c = t.matches("</parameter>").count();
+    if inv_o > 0 && inv_o != inv_c {
+        return false;
+    }
+    par_o == par_c && (inv_o > 0 || par_o > 0)
+}
+
+fn parse_json_calls(
+    body: &str,
+    schemas: &ToolSchemas,
+) -> Result<Vec<(String, String)>, &'static str> {
+    let body = body.trim();
+    if body.is_empty() {
+        return Err("tool_call_anthropic_no_invoke");
+    }
+    if body.starts_with('[') {
+        let v: Json = serde_json::from_str(body).map_err(|_| "tool_call_json_invalid")?;
+        let arr = v.as_array().ok_or("tool_call_json_invalid")?;
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr {
+            out.push(json_one_call(item, schemas)?);
+        }
+        return if out.is_empty() { Err("tool_call_anthropic_no_invoke") } else { Ok(out) };
+    }
+    if body.starts_with('{') {
+        // 单对象;解析失败再按 JSONL 逐行
+        if let Ok((n, a)) = parse_tool_body(body, schemas).map(|(n, a, _)| (n, a)) {
+            return Ok(vec![(n, a)]);
+        }
+        let mut out = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let v: Json = serde_json::from_str(line).map_err(|_| "tool_call_json_invalid")?;
+            out.push(json_one_call(&v, schemas)?);
+        }
+        return if out.is_empty() { Err("tool_call_anthropic_no_invoke") } else { Ok(out) };
+    }
+    Err("tool_call_anthropic_unexpected_text")
+}
+
+/// 一个 JSON 对象 → `(name, arguments-json)`(字段别名集中在这一处)
+fn json_one_call(v: &Json, schemas: &ToolSchemas) -> Result<(String, String), &'static str> {
+    let name = v
+        .get("name")
+        .or_else(|| v.get("tool"))
+        .or_else(|| v.get("tool_name"))
+        .and_then(|n| n.as_str())
+        .ok_or("tool_call_no_name")?;
+    let args = v
+        .get("arguments")
+        .or_else(|| v.get("input"))
+        .or_else(|| v.get("parameters"))
+        .or_else(|| v.get("args"))
+        .cloned()
+        .unwrap_or_else(|| Json::Object(Map::new()));
+    let s = serde_json::to_string(&args).map_err(|_| "tool_call_args_unserializable")?;
+    // 未知工具**不在这里拒**(由上层 validate 统一记 kind;这里只管形状)
+    let _ = schemas;
+    Ok((name.to_string(), s))
+}
+
 fn parse_qwen_blocks(
     body: &str,
     schemas: &ToolSchemas,
@@ -1248,11 +1623,7 @@ fn parse_qwen_blocks(
             .ok_or("tool_call_anthropic_unclosed_invoke")?;
         let end = start + close_rel + MARK_FUNCTION_CLOSE.len();
         let (name, args, _) = parse_tool_body(&body[start..end], schemas)?;
-        if let Err(e) = schemas.validate(&name, &args) {
-            if !e.is_soft() {
-                return Err(e.kind);
-            }
-        }
+        // schema 校验交给上层统一记 `lenient`(不在这里把整块判死)
         calls.push((name, args));
         at = end;
     }
@@ -2156,22 +2527,28 @@ mod tool_validation_tests {
     }
 
     #[test]
-    fn missing_required_and_unknown_tool_are_malformed() {
+    fn schema_violations_are_passed_through_not_rejected() {
+        // 2026-10-31 用户裁决:服务层**不替前端判定工具对错** —— 缺 required /
+        // 未知工具一律照发(`lenient` 记账),由前端报错并回喂模型自纠。
+        // 旧行为(整轮 502) = 前端拿同一上下文重放 ⇒ 模型原地复读。
         let mut s = ChannelSplitter::new(false, schemas());
         let items = s.push("<tool_call><function=bash></function></tool_call>");
-        assert!(matches!(
-            items[0],
-            Item::Malformed { kind: "tool_call_missing_required", .. }
-        ));
-        assert_eq!(s.tool_calls(), 0);
+        assert!(
+            matches!(&items[0], Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == "{}"),
+            "缺 required 也要照发: {items:?}"
+        );
+        assert_eq!(s.tool_calls(), 1);
+        assert_eq!(s.malformed(), 0);
 
         let mut s = ChannelSplitter::new(false, schemas());
-        let items = s.push("<tool_call><function=nope></function></tool_call>");
-        assert!(matches!(
-            items[0],
-            Item::Malformed { kind: "tool_call_unknown_tool", .. }
-        ));
-        assert_eq!(s.tool_calls(), 0);
+        let items = s.push("<tool_call><function=nope><parameter=x>1</parameter></function></tool_call>");
+        assert!(
+            matches!(&items[0], Item::ToolCall { name, .. } if name == "nope"),
+            "未知工具也要照发: {items:?}"
+        );
+        assert_eq!(s.tool_calls(), 1);
+        assert_eq!(s.malformed(), 0);
     }
 
     #[test]
@@ -2195,6 +2572,263 @@ mod tool_validation_tests {
             Item::ToolCall { name, arguments, .. }
                 if name == "bash" && arguments == r#"{"command":"pwd"}"#
         ));
+    }
+
+    // ======================================================================
+    // **壳/体跨协议混用**(2026-10-31 现场:模型同时见过 OpenAI 与 Anthropic
+    // 两套工具协议 ⇒ 壳与体各自出自不同协议)。四种组合必须全部落成 ToolCall,
+    // 且 `arguments` 恒为合法 JSON(I4 不破)。
+    // ======================================================================
+
+    /// Anthropic 壳 + **OpenAI 体**(裸 JSON)——旧版到此 `no_invoke` ⇒ 整轮 502
+    #[test]
+    fn anthropic_shell_with_openai_json_body() {
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items = s.push(
+            "<function_calls>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}\n</function_calls>",
+        );
+        assert!(matches!(
+            &items[0],
+            Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == r#"{"command":"ls -la"}"#
+        ));
+        assert_eq!(s.malformed(), 0);
+        // 混用留痕(下一轮现场数据靠它定位)
+        assert!(s.structural_trace().iter().any(|l| l.contains("json_inside_function_calls")));
+    }
+
+    /// Anthropic 壳 + **JSON 数组**(批量调用)
+    #[test]
+    fn anthropic_shell_with_json_array_body() {
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items = s.push(
+            "<function_calls>[{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}},\
+             {\"name\":\"screenshot\",\"arguments\":{}}]</function_calls>",
+        );
+        let calls: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::ToolCall { index, name, arguments } => {
+                    Some((*index, name.as_str(), arguments.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], (0, "bash", r#"{"command":"pwd"}"#));
+        assert_eq!(calls[1], (1, "screenshot", "{}"));
+    }
+
+    /// **antml: 命名空间**(Claude 文档原样)⇒ 前缀必须被归一
+    #[test]
+    fn antml_namespaced_anthropic_tags() {
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items = s.push(
+            "<function_calls><antml:invoke name=\"bash\">\
+             <antml:parameter name=\"command\">whoami</antml:parameter>\
+             </antml:invoke></function_calls>",
+        );
+        assert!(matches!(
+            &items[0],
+            Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == r#"{"command":"whoami"}"#
+        ));
+        assert_eq!(s.malformed(), 0);
+    }
+
+    /// Anthropic 字段名(`input`)当 OpenAI 体用 ⇒ 认
+    #[test]
+    fn openai_body_with_anthropic_input_field() {
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items =
+            s.push("<tool_call>{\"name\":\"bash\",\"input\":{\"command\":\"df -h\"}}</tool_call>");
+        assert!(matches!(
+            &items[0],
+            Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == r#"{"command":"df -h"}"#
+        ));
+    }
+
+    /// arguments **双编码**(字符串里再套 JSON)⇒ 解一层
+    #[test]
+    fn double_encoded_arguments_are_unwrapped() {
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items = s.push(
+            "<tool_call>{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"uptime\\\"}\"}</tool_call>",
+        );
+        assert!(
+            matches!(
+                &items[0],
+                Item::ToolCall { name, arguments, .. }
+                    if name == "bash" && arguments == r#"{"command":"uptime"}"#
+            ),
+            "实得 {items:?}"
+        );
+        assert!(s.structural_trace().iter().any(|l| l.contains("args_double_encoded")));
+    }
+
+    /// **缺壳抢救**:EOS 截断只丢了最外层壳 ⇒ 体完整就救回来(不 502)
+    #[test]
+    fn missing_outer_close_is_salvaged() {
+        // Anthropic 壳:invoke/parameter 都闭合,只缺 </function_calls>
+        let mut s = ChannelSplitter::new(false, schemas());
+        let _ = s.push(
+            "<function_calls><invoke name=\"bash\"><parameter name=\"command\">ls</parameter></invoke>",
+        );
+        let f = s.finish();
+        assert!(matches!(
+            &f[0],
+            Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == r#"{"command":"ls"}"#
+        ));
+        assert_eq!(s.malformed(), 0);
+
+        // tool_call 壳:参数闭合,`</function>` 已到 ⇒ 调用在 push 期就已发射,
+        // finish 只是把 `InToolBetween` 的壳空白收干净(不出假 Malformed)
+        let mut s = ChannelSplitter::new(false, schemas());
+        let got = s.push("<tool_call><function=bash><parameter=command>id</parameter></function>");
+        assert!(matches!(
+            &got[0],
+            Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == r#"{"command":"id"}"#
+        ));
+
+        assert!(s.finish().is_empty(), "InToolBetween 收尾不应再出事件");
+        assert_eq!(s.malformed(), 0);
+
+        // **交叉壳**:开府标记与收尾标记来自不同协议 ⇒ 体里余一条外来闭合标签,
+        // 也要落成 ToolCall(只剥尾巴那条外来标签,不动体内合法标签)
+        let mut s = ChannelSplitter::new(false, schemas());
+        let _ = s.push(
+            "<tool_call><invoke name=\"bash\"><parameter name=\"command\">uname -a</parameter></invoke></function_calls>",
+        );
+        let f = s.finish();
+        assert!(
+            matches!(
+                &f[0],
+                Item::ToolCall { name, arguments, .. }
+                    if name == "bash" && arguments == r#"{"command":"uname -a"}"#
+            ),
+            "实得 {f:?}"
+        );
+
+        let mut s = ChannelSplitter::new(false, schemas());
+        let items = s.push(
+            "<function_calls><function=bash><parameter=command>date</parameter></function></tool_call>",
+        );
+        let fin = s.finish();
+        let call = items
+            .iter()
+            .chain(fin.iter())
+            .find(|i| matches!(i, Item::ToolCall { .. }));
+        assert!(
+            matches!(
+                call,
+                Some(Item::ToolCall { name, arguments, .. })
+                    if name == "bash" && arguments == r#"{"command":"date"}"#
+            ),
+            "实得 {items:?}"
+        );
+
+        // 截断落在**参数值中间** ⇒ 不救(半截命令不可发射)
+        let mut s = ChannelSplitter::new(false, schemas());
+        let _ = s.push("<tool_call><function=bash><parameter=command>rm -rf /home/us");
+        let f = s.finish();
+        assert!(matches!(f[0], Item::Malformed { kind: "tool_call_unclosed", .. }));
+        assert_eq!(s.tool_calls(), 0);
+    }
+
+    // ======================================================================
+    // **坏 JSON 不再掐整轮**(2026-10-31 现场:`tool_call_json_invalid` ⇒ 502
+    // ⇒ 客户端回喂错误 ⇒ 模型改用 bash echo ⇒ 复读)。下面每一种都要落成
+    // ToolCall(name + 尽力恢复的 args),而不是 Malformed。
+    // ======================================================================
+
+    fn gui_schemas() -> ToolSchemas {
+        ToolSchemas::from_tools(&[
+            json!({"type":"function","function":{"name":"screenshot","parameters":{
+                "type":"object","properties":{}}}}),
+            json!({"type":"function","function":{"name":"mouse","parameters":{
+                "type":"object","properties":{
+                    "action":{"type":"string"},
+                    "x":{"type":"number"},
+                    "y":{"type":"number"}}}}}),
+        ])
+    }
+
+    fn one_call(items: &[Item]) -> (&str, &str) {
+        items
+            .iter()
+            .find_map(|i| match i {
+                Item::ToolCall { name, arguments, .. } => Some((name.as_str(), arguments.as_str())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("应有 ToolCall,实得 {items:?}"))
+    }
+
+    /// 尾随文字 / 缺闭括号 / 单引号 / 裸键 —— 四种坏法都照发
+    #[test]
+    fn broken_json_bodies_still_emit_calls() {
+        // ① 尾随文字
+        let mut s = ChannelSplitter::new(false, gui_schemas());
+        let items =
+            s.push("<tool_call>{\"name\":\"screenshot\",\"arguments\":{}} trailing prose</tool_call>");
+        assert_eq!(one_call(&items), ("screenshot", "{}"));
+
+        // ② 缺右闭括号(整体截断在参数中间)
+        let mut s = ChannelSplitter::new(false, gui_schemas());
+        let items = s.push(
+            "<tool_call>{\"name\":\"mouse\",\"arguments\":{\"action\":\"click\",\"x\":120.5,\"y\":240</tool_call>",
+        );
+        let (name, args) = one_call(&items);
+        assert_eq!(name, "mouse");
+        let v: Json = serde_json::from_str(args).expect("args 仍是合法 JSON");
+        assert_eq!(v["action"], json!("click"));
+        assert_eq!(v["y"], json!(240));
+
+        // ③ 单引号
+        let mut s = ChannelSplitter::new(false, gui_schemas());
+        let items = s.push(
+            "<tool_call>{'name':'mouse','arguments':{'action':'click','x':1,'y':2}}</tool_call>",
+        );
+        assert_eq!(one_call(&items), ("mouse", r#"{"action":"click","x":1,"y":2}"#));
+
+        // ④ 键没加引号
+        let mut s = ChannelSplitter::new(false, gui_schemas());
+        let items =
+            s.push("<tool_call>{name: \"screenshot\", arguments: {}}</tool_call>");
+        assert_eq!(one_call(&items), ("screenshot", "{}"));
+    }
+
+    /// 名字 + 裸 JSON 参数(没有 name/arguments 包装)—— 名字在请求 tools 里才认
+    #[test]
+    fn tool_name_plus_bare_json_object_is_salvaged() {
+        let mut s = ChannelSplitter::new(false, gui_schemas());
+        let items =
+            s.push("<tool_call>mouse {\"action\":\"click\",\"x\":120.5,\"y\":240}</tool_call>");
+        assert_eq!(
+            one_call(&items),
+            ("mouse", r#"{"action":"click","x":120.5,"y":240}"#)
+        );
+        assert_eq!(s.malformed(), 0);
+
+        // 名字**不认识** ⇒ 不猜(仍然落 Malformed,不发明工具)
+        let mut s = ChannelSplitter::new(false, gui_schemas());
+        let items = s.push("<tool_call>nonsense {\"a\":1}</tool_call>");
+        assert!(matches!(items[0], Item::Malformed { .. }));
+    }
+
+    /// 未闭壳 + 坏 JSON:宽容解析能出对象 ⇒ finish 时也要救回来
+    #[test]
+    fn unclosed_wrapper_with_lenient_json_is_salvaged() {
+        let mut s = ChannelSplitter::new(false, gui_schemas());
+        let _ = s.push("<tool_call>{'name':'mouse','arguments':{'action':'click'");
+        let f = s.finish();
+        assert!(
+            f.iter().any(|i| matches!(i, Item::ToolCall { .. })),
+            "应救回调用,实得 {f:?}"
+        );
+        assert_eq!(s.malformed(), 0);
     }
 
     fn video_schemas() -> ToolSchemas {
@@ -2277,33 +2911,31 @@ mod tool_validation_tests {
         ));
         assert_eq!(s.tool_calls(), 1);
         assert_eq!(s.malformed(), 0);
-        assert!(
-            s.structural_trace().iter().any(|l| l.contains("soft_type video_collect.max_download_mb")),
-            "软错误必须留结构轨迹: {:?}",
-            s.structural_trace()
-        );
+        // 2026-10-31:服务层**零校验** —— 值原样照发,不再有 soft_type 记账
     }
 
     /// 软通过只限 arg_type；缺 required / 未知工具仍然硬拒。
     #[test]
-    fn hard_errors_remain_hard() {
+    fn schema_violations_pass_through_as_calls() {
+        // 2026-10-31 裁决:缺 required / 未知工具**不再整轮拒**,照发调用 +
+        // `lenient` 记账(前端报错并回喂模型自纠;服务层不替前端判工具对错)。
         let mut s = ChannelSplitter::new(false, video_schemas());
         let items = s.push(
             "<tool_call><function=video_collect><parameter=action>process</parameter></function></tool_call>",
         );
-        assert!(matches!(
-            items[0],
-            Item::Malformed { kind: "tool_call_missing_required", .. }
-        ));
+        assert!(
+            matches!(&items[0], Item::ToolCall { name, arguments, .. }
+                if name == "video_collect" && arguments == r#"{"action":"process"}"#),
+            "缺 required 也要照发: {items:?}"
+        );
+        assert_eq!(s.malformed(), 0);
 
         let mut s = ChannelSplitter::new(false, video_schemas());
         let items = s.push(
             "<tool_call><function=nope><parameter=action>process</parameter></function></tool_call>",
         );
-        assert!(matches!(
-            items[0],
-            Item::Malformed { kind: "tool_call_unknown_tool", .. }
-        ));
+        assert!(matches!(&items[0], Item::ToolCall { name, .. } if name == "nope"));
+        assert_eq!(s.malformed(), 0);
     }
 
     /// 实测近失 ①：模型把 `<parameter=command>` 写成裸 `<command>`。
@@ -2385,27 +3017,35 @@ mod tool_validation_tests {
     /// 修复不能把未知标签硬塞成参数：没有可匹配的 schema 属性时仍报缺参。
     #[test]
     fn unknown_bare_tag_is_not_repaired() {
+        // 不认识的裸标签**不得**被当成参数回填(否则等于凭猜执行);调用照发,
+        // 缺的参数由前端/模型自纠(`lenient` 记账)。
         let mut s = ChannelSplitter::new(false, schemas());
         let items = s.push(
             "<tool_call><function=bash><nope>x</nope></function></tool_call>",
         );
-        assert!(matches!(
-            items[0],
-            Item::Malformed { kind: "tool_call_missing_required", .. }
-        ));
-        assert_eq!(s.tool_calls(), 0);
+        assert!(
+            matches!(&items[0], Item::ToolCall { name, arguments, .. }
+                if name == "bash" && arguments == "{}"),
+            "裸标签不应变成参数: {items:?}"
+        );
+        assert_eq!(s.tool_calls(), 1);
     }
 
     #[test]
-    fn anthropic_missing_required_is_whole_block_malformed() {
+    fn anthropic_missing_required_still_emits_every_call() {
+        // 多调用壳里某一条不合规 ⇒ **不连坐**:组内每条都照发(2026-10-31)
         let mut s = ChannelSplitter::new(false, schemas());
         let items = s.push(
             "<function_calls><invoke name=\"bash\"></invoke><invoke name=\"screenshot\"></invoke></function_calls>",
         );
-        assert!(matches!(
-            items[0],
-            Item::Malformed { kind: "tool_call_missing_required", .. }
-        ));
-        assert_eq!(s.tool_calls(), 0, "非法组不得发射半组调用");
+        let names: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::ToolCall { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["bash", "screenshot"], "实得 {items:?}");
+        assert_eq!(s.malformed(), 0);
     }
 }

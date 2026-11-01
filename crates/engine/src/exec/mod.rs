@@ -107,6 +107,26 @@ where
 ///
 /// 为什么按**索引升序**:[`crate::sampler::sample_from_candidates`] 复用
 /// `distribution` 的扫描序(index 升序 + 严格 `>`)才与全表路径逐位等价。
+/// **单卡候选表解析**(2026-10-31):`[2·rows·K]` 扁平 → 每行 `(值, 全局索引)`
+/// 按索引升序(与 [`merge_sample_cands`] 的产物**同一形态**,下游无需分支)。
+///
+/// 布局由 `topk32_of_logits` 定义:前 `rows·K` 是值、后 `rows·K` 是索引(as f32);
+/// 单卡时 `vocab_offset = 0` ⇒ 索引已全局,不需再加偏移。
+pub(crate) fn parse_local_cands(a: &[f32]) -> Vec<Vec<(f32, u32)>> {
+    const K: usize = 32;
+    let rows = a.len() / (2 * K);
+    let mut out = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut u: Vec<(f32, u32)> = Vec::with_capacity(K);
+        for k in 0..K {
+            u.push((a[r * K + k], a[rows * K + r * K + k] as u32));
+        }
+        u.sort_unstable_by_key(|&(_, i)| i);
+        out.push(u);
+    }
+    out
+}
+
 pub(crate) fn merge_sample_cands(
     a: &[f32],
     b: &[f32],

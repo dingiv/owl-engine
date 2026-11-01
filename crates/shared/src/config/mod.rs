@@ -1726,6 +1726,12 @@ pub struct ServerCfg {
     /// **原始请求 JSON 落盘目录**(空 = 关;每请求一份 body,供前端联调
     /// 精确复现。含业务数据/图片 data URL,开启前确认隐私与磁盘容量)。
     pub request_dump_dir: String,
+    /// **单图像素上限**(视觉预处理 `smart_resize` 的封顶;0 = 内置 4096²=不缩）。
+    ///
+    /// 图像 token 数 ∝ 像素；真实 GUI agent 每轮 +1 张截图 ≈880 tok ⇒ 在 135k
+    /// 上下文里每轮多付 ~1.2 s prefill。封顶到 1 MP ⇒ 646 tok、0.5 MP ⇒ 281 tok。
+    /// 代价 = 小字号 UI 的可读性（产品权衡，默认 0 = 老行为）。
+    pub vision_max_pixels: usize,
     /// 模板路径覆盖:None/空 = 模型快照 `<model.path>/chat_template.jinja`;
     /// 相对路径 = 相对模型目录。**不动快照**换模板的运维抓手。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1747,6 +1753,7 @@ impl Default for ServerCfg {
         Self {
             bind: "127.0.0.1:8135".into(),
             request_dump_dir: String::new(),
+            vision_max_pixels: 0,
             template_path: None,
             parse_tool_calls: true,
             tool_call_format: ToolCallFormat::Xml,

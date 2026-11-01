@@ -168,14 +168,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             (act.sampler_on, act.sampler)
         };
-        // **分布式采样门**(2026-10-26):采样档 + 词表切 + 图带 cand 槽
-        // + topk 有界。重复惩罚由设备端 top-32 核先行施加(2026-10-26),
-        // 不再回退整行 logits。
+        // **候选采样门**(2026-10-26;2026-10-31 扩到单卡):采样档 + **槽在场**
+        // + topk 有界。判据 = 图事实（verify 图是否声明 `cand`）—— greedy flavor
+        // 下请求级 temp>0 也会 `sampler_on`，但那时图里没 cand 槽、也没有
+        // `rep_hist`，用"采样开关"推就会在步进期抛
+        // `图无 cand 槽/未声明输入槽 rep_hist`（2026-10-31 实测踩过）。
+        // 槽不在 ⇒ 回退整行 logits（旧行为，正确性不变）。
         let use_cand = sampler_on
-            && self.head_split_active()
             && sampler_cfg.topk > 0
             && sampler_cfg.topk <= 32
-            && proposal_q.is_none();
+            && self
+                .dev
+                .graphs
+                .verify_of(depth)
+                .is_some_and(|g| g.has_output("cand"));
         let mut hist: Vec<u32> = {
             let act = self.turns.active()?;
             let tail = act.prompt_ids.len().saturating_sub(SPEC_HIST_KEEP);
@@ -218,17 +224,46 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         what: format!("分布式采样行数不足:{} < {}", cs.len(), live + 1),
                     });
                 }
-                let mut s: Vec<u32> = Vec::with_capacity(live + 1);
-                for i in 0..=live {
-                    let mut rng =
-                        seed_base ^ ((pos + i) as u64).wrapping_mul(0xBF58476D1CE4E5B9);
-                    let tok =
-                        crate::sampler::sample_from_candidates(&cs[i], &sampler_cfg, &mut rng);
-                    s.push(tok);
-                    hist.push(tok);
+                // 每行目标分布(稀疏):候选值走**与整行同一套**变换,
+                // 只是不施加重复惩罚(设备端 top-K 核已在选候选前施加过)。
+                let p_rows: Vec<Vec<(u32, f32)>> = cs[..=live]
+                    .iter()
+                    .map(|row| crate::sampler::distribution_of_cands(row, &sampler_cfg))
+                    .collect();
+                match proposal_q.as_ref() {
+                    // **DFlash2 拒绝采样**(2026-10-31 合流):q 路径需要的是
+                    // "目标分布"本身,而稀疏 p 的支撑 ⊆ top-20 ⊆ 设备 top-32
+                    // ⇒ 候选行足以给出逐项相同的 p,不再强制回读整行 logits
+                    // (单卡采样此前因此实实在在地多付 ~10ms/轮)。
+                    Some(q) => {
+                        let (m, emitted, bonus) = super::proposal_q::accept_rejection_sparse(
+                            &p_rows,
+                            &drafts[..live],
+                            live,
+                            q,
+                            &mut hist,
+                            seed_base,
+                            pos,
+                        )?;
+                        if m < live {
+                            mcnt("spec.reject", 1);
+                        }
+                        (m, emitted, bonus)
+                    }
+                    // 非 DFlash2(MTP/Dumb):旧「目标抽样 == draft」等价式。
+                    None => {
+                        let mut s: Vec<u32> = Vec::with_capacity(live + 1);
+                        for i in 0..=live {
+                            let mut rng =
+                                seed_base ^ ((pos + i) as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+                            let tok = crate::sampler::sample_sparse(&p_rows[i], &mut rng);
+                            s.push(tok);
+                            hist.push(tok);
+                        }
+                        let m = spec_sampled_accept_prefix(&drafts[..live], &s[..live]);
+                        (m, s[..=m].to_vec(), s[m])
+                    }
                 }
-                let m = spec_sampled_accept_prefix(&drafts[..live], &s[..live]);
-                (m, s[..=m].to_vec(), s[m])
             } else {
             let Some(lg) = row_logits.as_ref() else {
                 return Err(ModelError::Msg(
@@ -1317,9 +1352,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let (dev, peer) = (&mut self.dev, self.peer.as_mut());
             match peer {
                 None => {
-                    let (tok, _tokv, _cand, lg) =
-                        dev.verify_dev(&ins, fi_spec, sampler_on, depth, 0, false, false).await?;
-                    (tok, lg, None)
+                    // **单卡采样**(2026-10-31):有 cand 槽就只回读候选(不再读
+                    // `depth1 × vocab` 行 logits)。无槽(贪心 flavor)= 原路。
+                    let want_lg = sampler_on && !dist_sample;
+                    let (tok, _tokv, cd, lg) =
+                        dev.verify_dev(&ins, fi_spec, want_lg, depth, 0, false, dist_sample)
+                            .await?;
+                    let cands = if dist_sample {
+                        Some(crate::exec::parse_local_cands(
+                            cd.as_deref().ok_or_else(|| ModelError::EngineInvariant {
+                                what: "单卡 verify:cand 槽声明了但本轮未回读".into(),
+                            })?,
+                        ))
+                    } else {
+                        None
+                    };
+                    (tok, lg, cands)
                 }
                 Some(p) => {
                     // 两半都校验(纪律:`join2` 等另一半到底,吞错 = 挂住)

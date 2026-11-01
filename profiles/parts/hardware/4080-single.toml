@@ -1,0 +1,14 @@
+# 硬件组件：单张 RTX 4080 SUPER（Ada sm_89，**32G** 版）。
+#
+# 名字子串按列表序去重；**禁 CUDA 序号**（BDF / UUID / 名字子串三选一）。
+# 本机实测（2026-10-30，驱动 615.71.09）：`42:00.0` / 32760 MiB / CC 8.9
+# —— 该卡为 32G 改装版（原厂 16G），显存账按 `memory.total` 运行期探测，
+# 不在这里写死。
+#
+# 设备码代际不在这里配：cubin 是构建期产物，用 Cargo feature `arch-sm89`
+# （`cargo build --release -p server --no-default-features --features arch-sm89`）。
+# ⚠️ 单份 `.a` 家族（Marlin/FI/GDN）取构建期**最高**代 ⇒ sm86 与 sm89 **不要**
+# 混在同一份构建里，否则 30 系档会拿到 sm89 的 SASS；本档二进制单独出。
+[parallel]
+mode = "single"
+device = ["4080"]

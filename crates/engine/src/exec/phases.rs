@@ -35,6 +35,7 @@ async fn prepare_vlm_rank<D: DeviceClient>(
         .ok_or_else(|| ModelError::Msg("prefill: 图像输入但本 rank 无视觉塔".into()))?;
     let grids: Vec<owl_models::layers::vision::GridThw> =
         images.iter().map(|i| i.image.grid).collect();
+    let t_host = std::time::Instant::now();
     let ins = vlm.inputs_with_positions(
         ids,
         &grids,
@@ -42,6 +43,7 @@ async fn prepare_vlm_rank<D: DeviceClient>(
         owl_models::contract::Dtype::F16,
         positions,
     )?;
+    let vlm_host_ms = t_host.elapsed().as_secs_f32() * 1e3;
     // **诊断(probes.debug)**:每 turn 的 VLM 位置面 —— 多图 × 前缀复用 × 删除的
     // 定位点(2026-10-24 尾查:2 次删除后 27B 出 `< 0.000…`)。
     // 打印 = 全 prompt 长度、视觉 token 数、delta、每段视觉占位游程与**前几个
@@ -94,6 +96,8 @@ async fn prepare_vlm_rank<D: DeviceClient>(
     let merge = vlm.cfg().vision.merge;
     let hidden = vlm.hidden();
     let mut leaves: Vec<(owl_models::TensorOps, usize)> = Vec::with_capacity(images.len());
+    let mut tower_ms = 0f32;
+    let (hit0, miss0) = (cache.hits, cache.misses);
     for img in images {
         let rows = crate::vlm::merged_rows(img.image.grid, merge)?;
         let key = crate::vlm::VlmImageKey::of(&img.image);
@@ -111,6 +115,7 @@ async fn prepare_vlm_rank<D: DeviceClient>(
             owl_shared::metrics::with_metrics_store(|m| {
                 m.counter_add("vlm.cache.miss", 1, file!(), line!());
             });
+            let t_tower = std::time::Instant::now();
             let tb = vlm.tower_inputs(
                 &[img.image.grid],
                 &img.image.pixel_values,
@@ -146,6 +151,7 @@ async fn prepare_vlm_rank<D: DeviceClient>(
             // 中间块只服务本次塔求值;根块进缓存。free 在作用域外也正确:
             // owner 只影响分配记账,归还按块 id 结算。
             dev.graphs.session.face_mut().free(&arena).await?;
+            tower_ms += t_tower.elapsed().as_secs_f32() * 1e3;
             let leaf = owl_models::TensorOps::of_block(b.id, dtype, shape);
             if let Some(old) = cache.insert(key, rows, b, leaf.clone()) {
                 // 同键旧条目是异常调用;不静默泄漏。
@@ -155,6 +161,7 @@ async fn prepare_vlm_rank<D: DeviceClient>(
         };
         leaves.push((leaf, rows));
     }
+    let t_cat = std::time::Instant::now();
     let combined = crate::vlm::combine_merged(&leaves, hidden)?;
     let dtype = combined.dtype();
     let shape = combined.shape().to_vec();
@@ -179,6 +186,19 @@ async fn prepare_vlm_rank<D: DeviceClient>(
         });
         dev.graphs.session.face_mut().free(&evicted).await?;
     }
+    // **每轮 VLM 成本分相**(2026-10-31 P3 立案):host 表 O(prompt) / 塔前向(仅新图) /
+    // merged 拼接。一行一个 turn,直接看主项(真实 agent 每轮 +1 张截图)。
+    owl_shared::log_info!(
+        "vlm-cost",
+        "images={} 新图={} | host={:.1}ms tower={:.1}ms combine={:.1}ms | prompt={} tok",
+        images.len(),
+        cache.misses - miss0,
+        vlm_host_ms,
+        tower_ms,
+        t_cat.elapsed().as_secs_f32() * 1e3,
+        ids.len()
+    );
+    let _ = (hit0, miss0);
     if dbg {
         owl_shared::log_info!(
             "vlm-cache",
@@ -429,6 +449,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             act.vlm.is_none() && !act.images.is_empty()
         };
+        let t_vlm = std::time::Instant::now();
         if need_vlm {
             let (ids, images, positions) = {
                 let act = self.turns.active()?;
@@ -460,6 +481,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active_mut()?;
             act.vlm = Some(prep0);
             act.vlm_peer = prep1;
+        }
+        // **VLM 备料分相**(2026-10-31 长上下文立案):塔有内容缓存,但
+        // `inputs_with_positions` / merged 拼接是 **O(prompt)** 的 host 工作
+        // ⇒ 每轮都可能白付一次。单独记账(只在首块;`base==0`)。
+        if base == 0 {
+            mrec("pf.vlm", t_vlm.elapsed());
         }
         // 调试门:prefill 块粒度(见 owl_shared::stepgate;`--step-gate` 控制)
         owl_shared::step_gate!("engine.prefill").await;
@@ -1073,15 +1100,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .active()?
             .seed
             .unwrap_or_else(|| turn_id.wrapping_mul(0x9E3779B97F4A7C15));
-        // **候选采样门**(2026-10-26):采样 + 词表切 + 图带 cand 槽 + topk 有界
-        // ⇒ 只读 64×2 float/rank,不回读整行 logits。重复惩罚已在设备端
-        // top-32 核内先做,不再作为回退条件。
-        // rep_penalty 不再是门:设备端 top-32 核已在选候选前施加惩罚
-        // (2026-10-26)。history 已随 `rep_hist` 槽传入。
+        // **候选采样门**(2026-10-26;2026-10-31 扩到单卡):采样 + **槽在场**
+        // + topk 有界 ⇒ 只读 64×2 float,不回读整行 logits。
+        // 判据必须是**槽在场**(图捕获时点的事实),不能靠"采样开关"推 ——
+        // greedy flavor 下请求级 temp>0 也会 `sampler_on`,但那时图里没 cand 槽
+        // (2026-10-31 实测:去掉 `head_split` 门后这里曾直接抛
+        // `图无 cand 槽(判据漂移)` 把引擎打死)。槽不在 = 回退整行 logits。
         let use_cand = sampler_on
-            && self.head_split_active()
             && eff_sampler.topk > 0
-            && eff_sampler.topk <= 32;
+            && eff_sampler.topk <= 32
+            && self.dev.graphs.session.has_output("cand");
         let nt = if sampler_on && use_cand {
             let cs =
                 self.read_session_cands()

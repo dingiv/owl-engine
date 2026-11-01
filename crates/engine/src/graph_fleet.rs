@@ -590,12 +590,16 @@ impl<D: DeviceClient> GraphFleet<D> {
         // `vocab_size()` 仍是词表全量(embed/tokenizer 面用)。
         let vocab = boot.model.logits_vocab();
         let knobs = boot.knobs;
-        // **词表切面**(2026-10-26):decode 侧候选采样只对"两半表合并"有意义。
-        // 候选槽**恒随词表切**捕获(不再看 flavor 的 sampling/greedy):topk32
-        // 每轮 ~60µs/rank(0.2–0.4%),换来"请求级 temp>0 在 greedy 档也不再
-        // 回退 4MB logits"——用固定小税消掉一个静默陷阱。
+        // **候选槽**(2026-10-26;2026-10-31 扩到单卡):
+        // - 词表切档:恒捕获 —— topk32 每轮 ~60µs/rank(0.2–0.4%),换来
+        //   "请求级 temp>0 在 greedy flavor 上也不再回退 4MB logits";
+        // - **单卡 + 采样档**(2026-10-31):同样捕获。原先这里 god 给了
+        //   `head_split` ⇒ 单卡采样只能每步回读**整行 logits**(verify 是
+        //   `depth1` 行)⇒ 实测 **89.6 → 67 t/s(-25%)**。候选槽一开,
+        //   回读量从 `depth1 × vocab × 4B` 降到 `2 × depth1 × 32 × 4B`。
+        // - 单卡 + greedy:不捕获(纯贪心不采样,不该付那 50µs)。
         let head_split = vocab != boot.model.vocab_size();
-        let cand_on = head_split;
+        let cand_on = head_split || knobs.sampler_enabled;
         // 本 rank 半表在全局词表里的起点(rank0=0 / rank1=half)。候选索引
         // 保持 local(host 合并照旧加偏移),只有设备端惩罚查历史时用全局 id。
         let vocab_offset = if head_split {
@@ -1072,10 +1076,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                 dtype: Dtype::F32,
             });
         }
-        // **分布式采样候选槽**:词表切 + "采样档 flavor"才捕获(topk32 每轮
-        // 有 ~50µs 成本;纯 greedy 档不该付)。请求级 temp>0 落在 greedy flavor
-        // 上时没有该槽 ⇒ spec.rs 自动回退 logits 老路(见 `use_cand` 门)。
-        let cand_on = head_split;
+        // **候选槽**(2026-10-26;2026-10-31 扩到单卡见 session 图注释):
+        // 词表切档恒捕获;单卡只在采样档捕获(单卡 greedy 付那 50µs 没意义)。
+        let cand_on = head_split || knobs.sampler_enabled;
         if cand_on {
             vouts.push(OutputSlot {
                 name: "cand".into(),
@@ -1136,8 +1139,10 @@ impl<D: DeviceClient> GraphFleet<D> {
                     InputSlot::f32("fi_indptr", 2).init(vec![0.0, f32::from_bits(1)]),
                     InputSlot::f32("fi_last_len", 1).init(vec![f32::from_bits(depth1 as u32)]),
                     ];
-                    // 设备端重复惩罚槽只随词表切存在(未切档零额外槽)。
-                    if head_split {
+                    // 设备端重复惩罚槽**与候选槽同门**(`cand_on`):单卡采样档
+                    // 也要这两槽(2026-10-31)。原先 god 在 `head_split` 上
+                    // ⇒ 单卡采样捕获时闭包要槽、声明面没有 ⇒ 装配期响亮拒。
+                    if cand_on {
                         v.push(InputSlot::u32("rep_hist", REP_HISTORY_WINDOW).init(
                             vec![f32::from_bits(REP_HISTORY_SENTINEL); REP_HISTORY_WINDOW],
                         ));

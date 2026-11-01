@@ -22,7 +22,7 @@ extends = [
 - 卡位只走 `[parallel]`；`device` 用 BDF / UUID / 名字子串，**禁 CUDA 序号**。
 - **实验变体一律用 `--set`，不新建入口档**（见下"唯二常驻档门"）。
 
-## 常驻档（三个）
+## 常驻档（入口面）
 
 2026-10-24 用户裁决：入口档只留硬件形状，其余 27 个历史档删除
 （收敛记录与找回方式：`roadmap.local/profiles-consolidation-2026-10-24.md`）。
@@ -34,6 +34,7 @@ extends = [
 | `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144** / chunk 2048 |
 | `qwen38_27b-gguf_3090.toml` | 8136 | 单 3090 Ti / 27B **GGUF UD-IQ4_XS**（14.3GB）+ **mmproj-F16 视觉塔** / DFlash2 d7 / fp8 KV / 前缀缓存 / **max_seq 172032（168k）** / chunk 2048。prefill 1633–1681 t/s、decode 127–135、128k prompt 零拒发；代价 = prefill 比 8134 的 a8 慢 ~24% |
 | `qwen38_27b-gguf-iq3_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ3_S**（12.0GB）+ mmproj-F16 / DFlash2 d7 / fp8 KV / **max_seq 229376（224k，逼近 native 262144）** / chunk 2048。prefill 1409–1509 t/s、decode 97–121；**与 8136 互斥**（同一张卡二选一），速度慢 ~13%、3bit 质量低一档 |
+| `qwen38_27b-4080.toml` | 8138 | 单 **4080 SUPER（Ada sm_89 / 32G）** / 27B AWQ-INT4 **a8** + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144（= 模型 native 上限，32 KiB/token ⇒ 池 8192MiB）** / chunk 2048。std 五点三轮（`perf-runs/std-4080-20261030/`）：**spec-off prefill 2392→3084 t/s、decode 35.9 t/s 长 ctx 平坦**；spec-d7 decode ×1.70（60.1@8k）；**同二进制 3090 Ti 对照：prefill ×1.21–1.37、decode ×0.81、TTFT ×0.73–0.83**。**需 sm_89 二进制**（`cargo build --release -p server --no-default-features --features arch-sm89`，落到独立 target 目录）——单份 `.a` 家族取最高代，30 系与 40 系不混在一份构建里 |
 
 这条裁决被**测试钉住**：`crates/shared/src/profiles.rs::入口档面只允许三个常驻档`
 —— 往 `profiles/` 顶层再丢一个 `.toml` 就会红。置顶三档各占一张卡
@@ -118,7 +119,7 @@ profiles/
     qwen38_27b-gguf-iq4.toml
   parts/
     model/                     # 模型资产（path/format/quant/head；含 0.8B/4B/27B GGUF 与 AWQ）
-    hardware/                  # 卡位 + TP 开关（3090-single / 3080-tp2）
+    hardware/                  # 卡位 + TP 开关（3090-single / 3080-tp2 / 4080-single / 5070ti-single）
     kernel/                    # fi-graph / v2 臂
     pool/                      # fp8 / f16 池
     feature/                   # vision / dflash2 / mtp / kvmem / agent / w4a8 / image-evict

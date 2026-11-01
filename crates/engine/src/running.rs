@@ -597,21 +597,25 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.dev.boot.model.logits_vocab() != self.dev.boot.model.vocab_size()
     }
 
-    /// **候选采样读面**(2026-10-26):裸 decode 的 `cand` 两半表 → 每行候选并集
-    /// (全局索引升序)。`None` = 图没有候选槽(未切档 / greedy 档 flavor)⇒
-    /// 调用方回退 `read_full_logits`。
+    /// **候选采样读面**(2026-10-26;**2026-10-31 扩到单卡**):裸 decode 的
+    /// `cand` 表 → 每行候选并集(全局索引升序)。`None` = 图没有候选槽
+    /// (greedy 档 flavor / 未开采样)⇒ 调用方回退 `read_full_logits`。
+    ///
+    /// 两种拓扑:
+    /// - **词表切**:本 rank 半表 + peer 半表,索引加 `/half_vocab` 偏移后 host 合并;
+    /// - **单卡**(2026-10-31):本设备已经是**全词表行** ⇒ 直接解析 `[2·rows·K]`
+    ///   (与 merge 同一布局,索引已全局)。此前单卡没有这条路 ⇒ 采样档每步回读
+    ///   整行(verify 是 `depth1` 行)logits,实测 **-25%** 解码。
     pub(crate) async fn read_session_cands(&mut self) -> Result<Option<Vec<Vec<(f32, u32)>>>> {
         if !self.dev.graphs.session.has_output("cand") {
             return Ok(None);
         }
-        let half = self.dev.boot.model.logits_vocab();
         let a = self.dev.graphs.session.read_output_f32("cand").await?;
-        let p = self
-            .peer
-            .as_mut()
-            .ok_or_else(|| ModelError::EngineInvariant {
-                what: "候选采样:词表切档缺 peer（装配不一致）".into(),
-            })?;
+        let Some(p) = self.peer.as_mut() else {
+            // 单卡:全词表行的 top-K,索引已全局
+            return Ok(Some(crate::exec::parse_local_cands(&a)));
+        };
+        let half = self.dev.boot.model.logits_vocab();
         let b = p.graphs.session.read_output_f32("cand").await?;
         Ok(Some(crate::exec::merge_sample_cands(&a, &b, 1, half)?))
     }
