@@ -1,7 +1,8 @@
 // ============================================================================
-// owl FlashInfer prefill adapter —— **上游 FlashInfer 0.6.18 版 · plan + f16 臂**
+// owl FlashInfer prefill adapter —— **上游 FlashInfer v0.7.2.post1 版 · plan + f16 臂**
 // (2026-10-14 换源:guoqingbao fork @0f06c230(2026-08-07)→ 上游
-//  nightly-v0.6.18-20260819-317-gfdc56343(2026-09-17),`repos/flashinfer`;
+//  2026-10-14 首次换源 fdc56343(0.7.0-nightly);2026-11-01 升 v0.7.2.post1
+//  (beabf5004,闭包集合不变,仅 scheduler/pos_enc/utils 三头更新);`repos/flashinfer`;
 //  2026-10-15 **拆 TU**:fp8 臂搬 `owl_fi_attention_fp8.cu`,共享模板住
 //  `owl_fi_attention_common.h` —— 单 TU 双实例化会让 ptxas 病态卡住)
 //

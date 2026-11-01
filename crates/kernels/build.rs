@@ -1319,7 +1319,7 @@ fn build_flashinfer() {
     // FlashInfer prefill(foreign-kernel 通道;E1.5 工作包)
     //
     // **2026-10-13 C3-α**:由"预编 `.a` 入库(8.2 MB)"改为**构建期从源编**;
-    // 头闭包已 **vendor 进树**(`cu/flashinfer/include/`,**上游 0.6.18 闭包**
+    // 头闭包已 **vendor 进树**(`cu/flashinfer/include/`,**上游 v0.7.2.post1 闭包**
     // 22 文件 ~700 KB;闭包复现法见其 README)—— 原先缺省读 `~/.cudaforge/...` 的**树外**检出,
     // 违 §15.1.1 律 1"所有族的源必须在树"。冷编 ≈ 1.5 min,增量闸吸收。
     // ------------------------------------------------------------------
@@ -1365,7 +1365,7 @@ fn build_flashinfer() {
         let lib = fi_dir.join("libowl_flashinfer.a");
         let log_flags = log_defines();
         let flags = format!(
-            "fi arch={} nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.6.18 split=2tu log={} dev={}",
+            "fi arch={} nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.7.2.post1 split=2tu log={} dev={}",
             fi_arch.as_sm(),
             log_enabled(),
             std::env::var_os("OWL_LOG_DEVICE").is_some()

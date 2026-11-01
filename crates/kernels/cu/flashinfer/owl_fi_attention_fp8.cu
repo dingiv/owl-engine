@@ -1,5 +1,5 @@
 // ============================================================================
-// owl FlashInfer prefill adapter —— **上游 FlashInfer 0.6.18 版 · e4m3(KV)臂**
+// owl FlashInfer prefill adapter —— **上游 FlashInfer v0.7.2.post1 版 · e4m3(KV)臂**
 //
 // 2026-10-15 从 `owl_fi_attention.cu` 拆出(拆 TU = 按 KV dtype 臂切):
 // 该 TU 只实例化 `BatchPrefillPagedParams<half, __nv_fp8_e4m3, half, int32_t>` 一套

@@ -42,7 +42,7 @@ using OwlFiAttention = DefaultAttention<false, false, false, false>;
 constexpr PosEncodingMode OWL_POS_MODE = PosEncodingMode::kNone;
 /// fp16 累加(QK^T / PV 累加器走 half;FlashInfer `use_fp16_qk_reduction`)。
 /// **当前 false**:消费级 GA10x 的 fp32 累加只有半速 ⇒ 这一档理论上有 1.4~2× 油水,
-/// 但 0.6.18 的 fp16 路径在本仓**从未编译过**(需 fp16.h + C++20 + 一批 __half
+/// 但当前快照(0.7.x)的 fp16 路径在本仓**从未编译过**(需 fp16.h + C++20 + 一批 __half
 /// 二义修),不是翻开关的事 —— 见 roadmap.local/26-11-01-marlin-w4a8-扫档定谳.md §6。
 constexpr bool OWL_FP16_QK_REDUCTION = false;
 constexpr MaskMode OWL_MASK_MODE = MaskMode::kCausal;

@@ -148,6 +148,22 @@ nightly-0.6.18**(`flashinfer`(外部存档) @`fdc56343`),**ABI 逐字未变**
 | `crates/kernels/build.rs` | 去掉 `-DFLASHINFER_ENABLE_FP8_E4M3`(上游不需要);增量 stamp 旗标改 `src=upstream-0.6.18` |
 | 生产面 | **一行未动**(算子名/层分派/server 计划缓存/白名单全不变) |
 
+### 6.2 2026-11-01 升级 v0.7.2.post1(补丁级)
+
+**发现**:§6 写的“上游 nightly-0.6.18 @fdc56343”其 `version.txt` 实际是 **0.7.0**
+(2026-09-17,0.7.0 发布前 4 天)。因此本次升级 = **0.7.0-nightly → v0.7.2.post1**,
+不是 0.6→0.7。
+
+| 项 | 结果 |
+|---|---|
+| 闭包 | 25 头集合不变;仅 `scheduler.cuh`(+20/−5,graph mask 修复)、`pos_enc.cuh`(+413/−120,RoPE,不走)、`utils.cuh`(+3) |
+| adapter | **零改动**(0.7.2 的 plan/发射签名与快照逐字相同;`fixed_uniform_q_len` / `USE_TOKEN_HEAD_SF` 是 0.7.3 才加) |
+| 速度(3090/w4a8/DFlash/std 5×3) | prefill 2122.4→2128.6(+0.29%),TTFT −0.15%,decode +1.28%(方差内) |
+| 正确性 | 15/15 greedy 输出逐字节一致 |
+| 附带修复 | `flashinfer_fi_plan_sync` 哑输出块按 face 记账(HEAD 缺陷:turn2 起被准入拒) |
+
+全案(口径/逐点表/数据路径):`docs/bench/flashinfer-0.7-upgrade-2026-11-01.md`。
+
 ### 6.1 验收证据(四层)
 
 | 层 | 判据 | 结果 |
