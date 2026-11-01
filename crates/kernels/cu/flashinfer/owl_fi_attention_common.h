@@ -197,28 +197,34 @@ static int owl_fi_run_impl(
   // `FI_NO_MASK=1` = 取证档(量白跑成本;真行仍不应被写坏 —— 见探针)。
   params.block_valid_mask = owl_fi_no_mask() ? nullptr : (bool*)block_valid_mask;
   params.max_total_num_rows = (uint32_t)plan_info.total_num_rows;
-  params.total_num_rows = nullptr;  // 非 cuda-graph 档
+  // merge 核的 `seq_len_ptr` 允许为空:空则回退到 `max_seq_len`。
+  // eager 档 `max_total_num_rows` 就是真实 T(graph 档才需要 plan 的设备槽,
+  // 因为上界是 padded max)。旧实现无条件置空也能走通 merge;真正的坑在 mask。
+  if (plan_info.split_kv && plan_info.enable_cuda_graph) {
+    params.total_num_rows =
+        GetPtrFromBaseOffset<uint32_t>(int_ws, plan_info.total_num_rows_offset);
+  } else {
+    params.total_num_rows = nullptr;
+  }
   params.padded_batch_size = (uint32_t)plan_info.padded_batch_size;
   // ⚠️ **partition_kv 必须 = plan 的 split_kv**(2026-10-15 V1 定谳):
   // 上游 `include/` 从不设本字段(调用方责任),而核内三处都拿它分叉:
   //   max_chunk_size / chunk_start / chunk_end(是否按 kv_tile_idx 切 KV)
   //   与 `o_ptr_base`(partial 写 tmp_v 还是写 o)。
-  // 本行曾是 `false` 硬编码 + "plan 已把 split 编进调度表" 的注释 —— **错的**:
   // 调度表只决定"发射多少个 kv_tile 项",核要不要真分块由本字段定。
-  // 实测(FI_SPLIT_KV=1 探针):T=8/ctx=3072 数值 max|FI−host| = 1.39(门 1e-2)
-  // ⇒ split 路**从未真正可用**;改回 = plan 值后转绿(见探针复跑)。
   params.partition_kv = plan_info.split_kv;
   if (plan_info.split_kv) {
     params.merge_indptr = GetPtrFromBaseOffset<OwlId>(int_ws, plan_info.merge_indptr_offset);
-    // ⚠️ **尾部 CTA 掩码必须接上**(2026-10-15 V1 定谳,与 partition_kv 同一批):
-    // split 档 `padded_batch_size = max(2·SM/hkv, new_batch_size)` 会**大于**真实
-    // 工作项数 ⇒ 尾部 CTA 会读 `page_locked` 里的**陈旧** request/qo_tile/kv_tile
-    // ⇒ 算出垃圾 partial 并被 merge 累加(实测 T=8/ctx=3072 max|FI−host| = 1.39)。
-    // 上游只在 split 档分配这张表(`scheduler.cuh` 内 `block_valid_mask_offset` +
-    // `mask[i] = i < new_batch_size`),核侧守卫 `if (block_valid_mask && !mask[bx]) return;`
-    // 一直都在 —— 缺的只是**把指针传进去**。非 split 档该区不存在 ⇒ 保持 nullptr。
-    params.block_valid_mask =
-        GetPtrFromBaseOffset<bool>(int_ws, plan_info.block_valid_mask_offset);
+    // ⚠️ 0.7.2 起 mask 只在 **graph 档**分配;eager split 的
+    // `padded_batch_size == new_batch_size`(无尾部 CTA),不需要 mask。
+    // 旧代码无条件读 offset=0 ⇒ 把 request_indices 当 bool mask,首字节 0
+    // ⇒ 所有 CTA 被 guard 掉 ⇒ 输出全零(2026-11-01 实测)。
+    if (plan_info.enable_cuda_graph) {
+      params.block_valid_mask =
+          GetPtrFromBaseOffset<bool>(int_ws, plan_info.block_valid_mask_offset);
+    } else {
+      params.block_valid_mask = nullptr;
+    }
   }
 
   OwlOut* tmp_v = nullptr;

@@ -494,12 +494,17 @@ fn fi_prefill_speed_and_parity() {
 ///   cargo test --release -p owl-kernels --features device,flashinfer \
 ///   --test fi_prefill_probe fi_prefill_longctx_probe -- --test-threads=1 --nocapture
 /// ```
+///
+/// `FI_LONG_HOST=1` 开 host oracle(慢)。**T=1/8 × ctx=65k 是 2026-11-01
+/// eager split-KV mask 回归门**:0.7.2 只在 graph 档分配 `block_valid_mask`,
+/// 旧 adapter 在 eager split 把 offset=0 当 mask ⇒ 所有 CTA 被 guard 掉 ⇒ 全零。
 #[owl_test(gpu)]
 fn fi_prefill_longctx_probe() {
     let t = owl_shared::env_reader::parse::<usize>("FI_LONG_T").unwrap_or(807);
     let ctx = owl_shared::env_reader::parse::<usize>("FI_LONG_CTX").unwrap_or(100_000);
     let iters = owl_shared::env_reader::parse::<usize>("FI_LONG_ITERS").unwrap_or(5);
-    run_case(t, ctx, false, iters.max(1));
+    let hc = owl_shared::env_reader::flag("FI_LONG_HOST");
+    run_case(t, ctx, hc, iters.max(1));
 }
 
 /// **f16 vs fp8 KV 的 attention 核对比**(2026-10-26):同一 100k 形状,
