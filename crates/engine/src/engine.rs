@@ -1939,9 +1939,9 @@ pub(crate) struct RankDev<D: DeviceClient> {
     ///
     /// 为什么需要:表同步已收编成族虚拟算子(`flashinfer_fi_plan_sync`),而
     /// 转发面契约 4 要求**发射必产出块**(`out_elems ≥ 1` + 实参至少一个 Block)。
-    /// 该算子不写它 ⇒ 一次分配、跨调用复用(逐次 alloc/free 会在解码每步多
-    /// 两条命令;块 id 在同 server 内全局,故 session/verify 面共用同一块)。
-    pub(crate) fi_plan_out: Option<owl_iface::contract::Bytes>,
+    /// 该算子不写它 ⇒ 按 **face 指针**缓存复用:session/verify 是两本独立
+    /// 账本,且图重捕会给新 face;只缓存一个块会在下一 turn 撞"块不在本账本"。
+    pub(crate) fi_plan_out: std::collections::HashMap<usize, owl_iface::contract::Bytes>,
 }
 
 /// **装载期定型、运行期只读**的 rank 事实(权重是分片的,每 rank 一份)。
@@ -1984,24 +1984,25 @@ impl<D: DeviceClient> RankDev<D> {
     pub(crate) fn set_phase(&mut self, p: owl_models::env::EvalPhase) {
         self.phase = p;
     }
+}
 
-    /// **FI plan 表同步算子的哑输出块**(惰性分配、跨调用复用)。
-    ///
-    /// 用 session 面分配即可:块 id 在同一 server(同一个 rank)内全局,
-    /// verify/batch 的 face 都指同一个 server。
-    pub(crate) async fn fi_plan_out_block(&mut self) -> Result<owl_iface::contract::Bytes> {
-        if let Some(b) = &self.fi_plan_out {
-            return Ok(b.clone());
-        }
-        let b = self
-            .graphs
-            .session
-            .face_mut()
-            .alloc(owl_iface::contract::Dtype::F16, 1, "fi.plan.sync.out")
-            .await?;
-        self.fi_plan_out = Some(b.clone());
-        Ok(b)
+/// **取/建当前 face 的哑输出块**(2 字节 F16;按 face 指针缓存)。
+///
+/// 为什么不能只缓存一个:session/verify 各自一本账本,图重捕后 face 也会换
+/// —— 旧块在新账本里查不到(实测:turn1 正常、turn2 起每轮 `plan_sync` 被拒)。
+pub(crate) async fn fi_plan_out_on<D: DeviceClient>(
+    cache: &mut std::collections::HashMap<usize, owl_iface::contract::Bytes>,
+    face: &mut D,
+) -> Result<owl_iface::contract::Bytes> {
+    let key = face as *mut D as usize;
+    if let Some(b) = cache.get(&key) {
+        return Ok(b.clone());
     }
+    let b = face
+        .alloc(owl_iface::contract::Dtype::F16, 1, "fi.plan.sync.out")
+        .await?;
+    cache.insert(key, b.clone());
+    Ok(b)
 }
 
 /// **发出 `flashinfer_fi_plan_sync`**(族虚拟算子;唯一发射点)。
@@ -2884,7 +2885,7 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         },
         phase: boot_env.phase,
         spec_rt: spec,
-        fi_plan_out: None,
+        fi_plan_out: std::collections::HashMap::new(),
         pool,
         graphs,
     })

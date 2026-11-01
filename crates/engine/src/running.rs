@@ -1484,6 +1484,9 @@ impl<D: DeviceClient> RunningEngine<D> {
             let f = dev.graphs.dev_ctx_face_mut();
             f.set_owner(owner);
             f.set_class(class);
+            // 生命周期节点 = 图面可能已换/已回收:哑输出块按 face 缓存,
+            // 跨 turn 复用会撞"块不在本账本"(实测 turn2 起每轮被拒)。
+            dev.fi_plan_out.clear();
         }
     }
 

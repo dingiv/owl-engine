@@ -2193,20 +2193,17 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         Option<Vec<f32>>,
     )> {
         // 表同步走**族虚拟算子** `flashinfer_fi_plan_sync`(2026-11-01):
-        // 哑输出块要先备(它归 self,不能与下面 `vg` 的可变借同时存在)。
-        let plan_out = match fi {
-            Some(_) => Some(self.fi_plan_out_block().await?),
-            None => None,
-        };
+        // 哑输出块必须落在**当前 face 的账本**里(verify 与 session 各一本;
+        // 图重捕还会换 face ⇒ 按 face 指针缓存,见 `fi_plan_out_on`)。
         let vg = self.graphs.verify_mut(depth)?;
         // **图外分相**(2026-10-26;本轮 CUPTI 账钉出 5.1–5.7ms/轮不在图内):
         // fi=FI 表刷新 / launch=装填+入队回执 / tok=等图完成+回读。
         // 按 rank 分 tag(有界 r0/r1)——两 rank 的差 = 跨 rank 启动偏斜的直接证据。
         let t_fi = std::time::Instant::now();
         if let Some(spec) = fi {
-            let out = plan_out
-                .ok_or_else(|| ModelError::Msg("FI plan 表同步:哑输出块缺失".into()))?;
-            crate::engine::launch_fi_plan_sync(vg.face_mut(), out, spec).await?;
+            let face = vg.face_mut();
+            let out = crate::engine::fi_plan_out_on(&mut self.fi_plan_out, face).await?;
+            crate::engine::launch_fi_plan_sync(face, out, spec).await?;
         }
         let t_launch = std::time::Instant::now();
         vg.step(ins).await?;
@@ -2270,8 +2267,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // 发射口 = 族虚拟算子 `flashinfer_fi_plan_sync`(2026-11-01 收编)。
         if fi_bake.is_some() && self.graphs.session.has_input("fi_q_cu") {
             let spec = self.pool.fi_plan_spec(1, ctx_pos + 1);
-            let out = self.fi_plan_out_block().await?;
-            crate::engine::launch_fi_plan_sync(self.graphs.session.face_mut(), out, spec).await?;
+            let face = self.graphs.session.face_mut();
+            let out = crate::engine::fi_plan_out_on(&mut self.fi_plan_out, face).await?;
+            crate::engine::launch_fi_plan_sync(face, out, spec).await?;
         }
         self.graphs.session.step(refs).await
     }
