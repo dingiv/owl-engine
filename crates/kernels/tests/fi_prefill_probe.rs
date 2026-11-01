@@ -414,6 +414,13 @@ fn fi_prefill_chunk_ladder() {
         (2048, 16384, false, 20),
         (512, 32768, false, 10),
         (1024, 32768, false, 10),
+        // **长上下文档**(2026-10-31 立案):对齐真实 agent 稳态
+        // (ctx 65k / 139k × chunk 512/2048)。这才是生产 prefill 注意力
+        // 真正跑的区间 —— 短 ctx 阶梯看不到 O(ctx) 项的绝对量级。
+        (512, 65536, false, 6),
+        (2048, 65536, false, 6),
+        (512, 139264, false, 4),
+        (2048, 139264, false, 4),
     ];
     for &(t, ctx, hc, it) in cases {
         run_case(t, ctx, hc, it);

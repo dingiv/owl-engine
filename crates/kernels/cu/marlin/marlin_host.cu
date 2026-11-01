@@ -697,9 +697,37 @@ int marlin_gemm_v2_awq_cfg_ffi(const void* A, const void* B, void* C,
                    /*is_bf16=*/false, /*allow_w4a8_m8=*/false);
 }
 
+// W4A8 × AWQ **tile 可注**变体(2026-11-01;只为**台子** —— 生产走 auto 的那两个口)。
+// 与 w4a8_ffi 逐字同路,只把 thread_k/thread_n 透传下去(-1 = auto)。
+int marlin_gemm_v2_awq_w4a8_cfg_ffi(const void* A, const void* B, void* C,
+                                    const void* b_scales, const void* b_zeros,
+                                    const void* a_scales, int prob_m, int prob_n,
+                                    int prob_k, void* workspace, int group_size,
+                                    int dev, uintptr_t stream, int thread_k,
+                                    int thread_n) {
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+  int num_groups = (group_size == -1) ? 1 : prob_k / group_size;
+  int max_m_block = (prob_m + 15) / 16 * 16;
+  if (max_m_block > 64) max_m_block = 64;
+  void* c_tmp_own = nullptr;
+  if (cudaMallocAsync(&c_tmp_own,
+                      (size_t)sms * max_m_block * 256 * sizeof(float),
+                      (cudaStream_t)stream) != cudaSuccess)
+    return 7;
+  int err = marlin_mm(A, B, C, c_tmp_own, const_cast<void*>(b_scales),
+                      const_cast<void*>(a_scales), /*a_is_s8=*/true,
+                      const_cast<void*>(b_zeros), /*use_zp=*/true,
+                      prob_m, prob_n, prob_k, prob_k, workspace, num_groups,
+                      group_size, dev, (cudaStream_t)stream, thread_k, thread_n,
+                      sms, /*is_bf16=*/false, /*allow_w4a8_m8=*/false);
+  cudaFreeAsync(c_tmp_own, (cudaStream_t)stream);
+  return err;
+}
+
 // W4A8 × AWQ **非对称**变体:A = int8(已量化)+ a_scales fp32[M,1];B = kU4 + b_zeros。
-// c_tmp 与 marlin_gemm_v2_w4a8_ffi 同款自管 —— a_is_s8 强制 use_fp32_reduce ⇒
-// slice_count>1 形状走 global_reduce_fp32,缓冲由本发射器流序 malloc/free(暗雷面消除)。
+// c_tmp 由本发射器自管 —— a_is_s8 强制 use_fp32_reduce ⇒ slice_count>1 形状走
+// global_reduce_fp32,缓冲流序 malloc/free(2026-11-01 扫档:调用方复用缓冲 ≈0 收益)。
 int marlin_gemm_v2_awq_w4a8_ffi(const void* A, const void* B, void* C,
                                 void* c_tmp, const void* b_scales,
                                 const void* b_zeros, const void* a_scales,
@@ -709,9 +737,9 @@ int marlin_gemm_v2_awq_w4a8_ffi(const void* A, const void* B, void* C,
   int sms = 0;
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   int num_groups = (group_size == -1) ? 1 : prob_k / group_size;
-  (void)c_tmp;  // 调用方占位废弃
   int max_m_block = (prob_m + 15) / 16 * 16;
   if (max_m_block > 64) max_m_block = 64;
+  (void)c_tmp;  // 调用方占位废弃(实测复用缓冲 ≈0 收益,见 2026-11-01 扫档)
   void* c_tmp_own = nullptr;
   if (cudaMallocAsync(&c_tmp_own,
                       (size_t)sms * max_m_block * 256 * sizeof(float),

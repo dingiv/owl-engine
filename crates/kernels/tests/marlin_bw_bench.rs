@@ -56,13 +56,13 @@ fn bench_shape(
     stream.memcpy_htod(&z_h, &mut z).unwrap();
     stream.memcpy_htod(&ws_h, &mut ws).unwrap();
 
-    let (a_p, _) = a.device_ptr(stream);
-    let (b_p, _) = b.device_ptr(stream);
-    let (c_p, _) = c.device_ptr(stream);
-    let (s_p, _) = s.device_ptr(stream);
-    let (z_p, _) = z.device_ptr(stream);
-    let (ws_p, _) = ws.device_ptr(stream);
-    let (tmp_p, _) = tmp.device_ptr(stream);
+    let (a_p, _) = a.device_ptr(&stream);
+    let (b_p, _) = b.device_ptr(&stream);
+    let (c_p, _) = c.device_ptr(&stream);
+    let (s_p, _) = s.device_ptr(&stream);
+    let (z_p, _) = z.device_ptr(&stream);
+    let (ws_p, _) = ws.device_ptr(&stream);
+    let (tmp_p, _) = tmp.device_ptr(&stream);
     let cu_stream = stream.cu_stream() as usize;
 
     let launch = |a_p, b_p, c_p, s_p, z_p, ws_p, tmp_p| unsafe {
@@ -148,13 +148,13 @@ fn bench_shape_a8(
     stream.memcpy_htod(&z_h, &mut z).unwrap();
     stream.memcpy_htod(&ws_h, &mut ws).unwrap();
 
-    let (a_p, _) = a.device_ptr(stream);
-    let (as_p, _) = asd.device_ptr(stream);
-    let (b_p, _) = b.device_ptr(stream);
-    let (c_p, _) = c.device_ptr(stream);
-    let (s_p, _) = s.device_ptr(stream);
-    let (z_p, _) = z.device_ptr(stream);
-    let (ws_p, _) = ws.device_ptr(stream);
+    let (a_p, _) = a.device_ptr(&stream);
+    let (as_p, _) = asd.device_ptr(&stream);
+    let (b_p, _) = b.device_ptr(&stream);
+    let (c_p, _) = c.device_ptr(&stream);
+    let (s_p, _) = s.device_ptr(&stream);
+    let (z_p, _) = z.device_ptr(&stream);
+    let (ws_p, _) = ws.device_ptr(&stream);
     let cu_stream = stream.cu_stream() as usize;
 
     let launch = |a_p, as_p, b_p, c_p, s_p, z_p, ws_p| unsafe {
@@ -517,5 +517,203 @@ fn marlin_tile_sweep() {
         println!(
             "[tile-sweep] n={n} m={m} auto={auto:.1} k128n128t256={c1:.1} k64n128t128={c2:.1} k128n64t128={c3:.1}"
         );
+    }
+}
+
+// ============================================================================
+// **W4A8 tile 扫档台**(2026-11-01;"marlin 还有没有油水"的判决器)
+// ============================================================================
+//
+// 判据不是"比上一版快",而是**离 int8 张量核墙有多远**:
+//   - 3080(GA102 全卡 68 SM)int8 dense ≈ 237 TOPS(4-bit 无硬件 ⇒ 吃 int8 MMA);
+//   - 3090 Ti(84 SM)≈ 320 TOPS。
+// 同时算 **B 流量下界** `round_up(m/64) × n×k/2` —— marlin 的 CTA 是
+// 64 行 × tile_n 列,同一份 B 切片会被 m/64 个 m-block 各读一遍 ⇒ m 越大越
+// 易从"带宽墙"转"算力墙",这是 thread_m_blocks 之外唯一的物理约束。
+//
+// 扫的是**已实例化**的档(selector 只有 stages=4):(thread_k, thread_n) ∈
+// {(64,256),(64,128),(128,64),(128,128)};auto 档同时打印作对照。
+
+/// 单档计时(µs/发)+ TFLOPS + B 有效带宽
+fn bench_w4a8_cfg(
+    ctx: &std::sync::Arc<CudaContext>,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    n: usize,
+    k: usize,
+    m: usize,
+    thread_k: i32,
+    thread_n: i32,
+    threads: i32,
+) -> Result<(f64, f64, f64), i32> {
+    // 显式档要同时给 threads:`MARLIN_THREADS` 只在 thread_k/n 都给出时被读
+    // (C 侧诊断口;selector 的实例化表里 tmb=4 的 tn=128/tk=128 档恒配 128 线程)。
+    if threads > 0 {
+        std::env::set_var("MARLIN_THREADS", threads.to_string());
+    } else {
+        std::env::remove_var("MARLIN_THREADS");
+    }
+    let a_h: Vec<i8> = vec![1i8; m * k];
+    let as_h: Vec<f32> = vec![1.0f32; m];
+    let b_h: Vec<i32> = vec![0x2222_2222_i32; (k / 8) * n];
+    let c_h: Vec<u16> = vec![0u16; m * n];
+    let s_h: Vec<u16> = vec![0x0100u16; (k / G as usize) * n];
+    let z_h: Vec<i32> = vec![0_i32; (k / G as usize) * (n / 8) + 16];
+    let ws_h: Vec<i32> = vec![0_i32; owl_kernels::family::marlin::v2_workspace_len(n)];
+
+    let (mut a, mut asd, mut b, mut c, mut s, mut z, mut ws);
+    unsafe {
+        a = stream.alloc::<i8>(a_h.len()).unwrap();
+        asd = stream.alloc::<f32>(as_h.len()).unwrap();
+        b = stream.alloc::<i32>(b_h.len()).unwrap();
+        c = stream.alloc::<u16>(c_h.len()).unwrap();
+        s = stream.alloc::<u16>(s_h.len()).unwrap();
+        z = stream.alloc::<i32>(z_h.len()).unwrap();
+        ws = stream.alloc::<i32>(ws_h.len()).unwrap();
+    }
+    stream.memcpy_htod(&a_h, &mut a).unwrap();
+    stream.memcpy_htod(&as_h, &mut asd).unwrap();
+    stream.memcpy_htod(&b_h, &mut b).unwrap();
+    stream.memcpy_htod(&s_h, &mut s).unwrap();
+    stream.memcpy_htod(&z_h, &mut z).unwrap();
+    stream.memcpy_htod(&ws_h, &mut ws).unwrap();
+
+    let (a_p, _) = a.device_ptr(&stream);
+    let (as_p, _) = asd.device_ptr(&stream);
+    let (b_p, _) = b.device_ptr(&stream);
+    let (c_p, _) = c.device_ptr(&stream);
+    let (s_p, _) = s.device_ptr(&stream);
+    let (z_p, _) = z.device_ptr(&stream);
+    let (ws_p, _) = ws.device_ptr(&stream);
+    let cu_stream = stream.cu_stream() as usize;
+    let dev = ctx.ordinal() as i32;
+
+    let launch = || unsafe {
+        owl_kernels::family::marlin::gemm_v2_awq_w4a8_cfg_raw(
+            a_p as *const i8,
+            b_p as *const i32,
+            c_p as *mut u16,
+            s_p as *const u16,
+            z_p as *const i32,
+            as_p as *const f32,
+            m as i32,
+            n as i32,
+            k as i32,
+            ws_p as *mut i32,
+            G,
+            dev,
+            cu_stream,
+            thread_k,
+            thread_n,
+        )
+    };
+    // 该档未实例化 ⇒ selector 返回 3;先探一发,失败直接报 n/a(不污染计时)
+    if let Err(e) = launch() {
+        return Err(e);
+    }
+    for _ in 0..4 {
+        let _ = launch();
+    }
+    stream.synchronize().unwrap();
+    const ITERS: usize = 30;
+    let t0 = std::time::Instant::now();
+    for _ in 0..ITERS {
+        let _ = launch();
+    }
+    stream.synchronize().unwrap();
+    let us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+    let tf = 2.0 * m as f64 * n as f64 * k as f64 / (us * 1e-6) / 1e12;
+    // B 流量下界:每个 64 行 m-block 各读一遍完整权重
+    let b_bytes = (m.div_ceil(64) * n * k / 2) as f64;
+    let b_gbs = b_bytes / (us * 1e-6) / 1e9;
+    Ok((us, tf, b_gbs))
+}
+
+/// **W4A8 tile 扫档**(真实 27B 形状 × prefill m;auto vs 四个实例化档)。
+///
+/// 只回答一个问题:auto 挑的档离"物理墙"多远,换档有没有 ≥3% 的油水。
+#[ignore = "bench: marlin W4A8 tile 扫档(还有没有油水的判决器)"]
+#[test]
+fn marlin_w4a8_tile_sweep() {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let ctx = CudaContext::new(dev).expect("ctx");
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+    println!(
+        "[device] ordinal={dev} name={:?} sms=?",
+        ctx.name().unwrap_or_default()
+    );
+
+    // TP2 每 rank 的 n(行并行切 n;k 不切)
+    let shapes: &[(usize, usize, &str)] = &[
+        (17408, 5120, "gate+up /2"),
+        (2560, 17408, "down /2"),
+        (4096, 5120, "attn qkv /2"),
+        (8192, 5120, "gdn qkvz /2"),
+        (2560, 6144, "gdn o /2"),
+    ];
+    // (thread_k, thread_n, threads);-1 = auto。已实例化表(kS8×kU4,tmb=4)只有三档:
+    // {64,256,256} / {64,128,128} / {128,64,128}。
+    let cfgs: &[(i32, i32, i32)] = &[(-1, -1, -1), (64, 256, 256), (64, 128, 128), (128, 64, 128)];
+    println!(
+        "{:>14} {:>6} {:>10} {:>9} {:>9} {:>10}",
+        "shape", "m", "cfg(k,n)", "µs", "TFLOPS", "B GB/s"
+    );
+    for &(n, k, _t) in shapes {
+        for m in [512usize, 2048] {
+            for &(tk, tn, th) in cfgs {
+                let label = if tk < 0 {
+                    "auto".to_string()
+                } else {
+                    format!("{tk},{tn}/{th}")
+                };
+                match bench_w4a8_cfg(&ctx, &stream, n, k, m, tk, tn, th) {
+                    Ok((us, tf, gbs)) => println!(
+                        "{:>14} {:>6} {:>10} {:>9.1} {:>9.1} {:>10.1}",
+                        format!("{n}x{k}"), m, label, us, tf, gbs
+                    ),
+                    Err(e) => println!(
+                        "{:>14} {:>6} {:>10}   n/a(err {e})",
+                        format!("{n}x{k}"), m, label
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// **窄 n 档细扫**(down_proj / gdn-o 的 n≤2560 形状;2026-11-01)。
+///
+/// 目的:auto 的兜底 override(`n/tn × ceil(m/tmb) × 4 ≤ sms` → {128,64,128})
+/// 只覆盖"极小 m";这里找 **n 窄 × m 中等** 时 {64,128,128} 的赢面边界,
+/// 判"生产要不要加一条形状条件"。
+#[ignore = "bench: marlin W4A8 窄 n 细扫(形状条件判决)"]
+#[test]
+fn marlin_w4a8_narrow_n_sweep() {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let ctx = CudaContext::new(dev).expect("ctx");
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+    let shapes: &[(usize, usize)] = &[(2560, 17408), (2560, 6144), (4096, 5120)];
+    let cfgs: &[(i32, i32, i32)] = &[(-1, -1, -1), (64, 128, 128), (128, 64, 128)];
+    println!("{:>14} {:>6} {:>13} {:>9} {:>9}", "shape", "m", "cfg", "µs", "TFLOPS");
+    for &(n, k) in shapes {
+        for m in [128usize, 256, 384, 512, 768, 1024] {
+            for &(tk, tn, th) in cfgs {
+                let label = if tk < 0 { "auto=64,256".to_string() } else { format!("{tk},{tn}/{th}") };
+                match bench_w4a8_cfg(&ctx, &stream, n, k, m, tk, tn, th) {
+                    Ok((us, tf, _)) => println!(
+                        "{:>14} {:>6} {:>13} {:>9.1} {:>9.1}",
+                        format!("{n}x{k}"), m, label, us, tf
+                    ),
+                    Err(e) => println!("{:>14} {:>6} {:>13}  n/a({e})", format!("{n}x{k}"), m, label),
+                }
+            }
+        }
     }
 }

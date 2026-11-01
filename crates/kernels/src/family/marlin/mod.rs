@@ -280,6 +280,25 @@ extern "C" {
         stream: usize,
     ) -> i32;
 
+    // W4A8 × AWQ **tile 可注**(只为台子:auto 之外扫实例化档;生产不用)
+    fn marlin_gemm_v2_awq_w4a8_cfg_ffi(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        b_scales: *const c_void,
+        b_zeros: *const c_void,
+        a_scales: *const c_void,
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        workspace: *mut c_void,
+        group_size: i32,
+        dev: i32,
+        stream: usize,
+        thread_k: i32,
+        thread_n: i32,
+    ) -> i32;
+
     // W4A8 × AWQ(int8 激活 × kU4 零偏):A 已量化 + a_scales fp32[M,1];
     // c_tmp 由 host 自管(传空指针即可)
     fn marlin_gemm_v2_awq_w4a8_ffi(
@@ -379,6 +398,51 @@ pub unsafe fn gemm_v2_awq_raw_cfg(
         c as *mut c_void,
         scales as *const c_void,
         zeros as *const c_void,
+        m,
+        n,
+        k,
+        workspace as *mut c_void,
+        groupsize,
+        dev,
+        stream,
+        thread_k,
+        thread_n,
+    );
+    if err == 0 { Ok(()) } else { Err(err) }
+}
+
+/// **配置可注**的 W4A8×AWQ GEMM(2026-11-01;只为**台子**)—— 与
+/// [`gemm_v2_awq_w4a8_raw`] 同路同契约,多两个 tile 旋钮(`thread_k`/`thread_n`;
+/// `-1` 等价 auto)。生产**不用**这个口(与 [`gemm_v2_awq_raw_cfg`] 同纪律:
+/// auto 之外只允许实测台子扫档,避免两套规范)。
+///
+/// # Safety
+/// 同 [`gemm_v2_awq_w4a8_raw`]。
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_v2_awq_w4a8_cfg_raw(
+    a: *const i8,
+    b: *const i32,
+    c: *mut u16,
+    scales: *const u16,
+    zeros: *const i32,
+    a_scales: *const f32,
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut i32,
+    groupsize: i32,
+    dev: i32,
+    stream: usize,
+    thread_k: i32,
+    thread_n: i32,
+) -> Result<(), i32> {
+    let err = marlin_gemm_v2_awq_w4a8_cfg_ffi(
+        a as *const c_void,
+        b as *const c_void,
+        c as *mut c_void,
+        scales as *const c_void,
+        zeros as *const c_void,
+        a_scales as *const c_void,
         m,
         n,
         k,
