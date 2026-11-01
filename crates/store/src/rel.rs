@@ -515,9 +515,14 @@ impl Rel {
             Some(d) => d.adopt(snap),
             None => AdoptReport::default(),
         };
-        // **状态腿:盘上的快照要重建 `StateStore` 账**(否则重启后 `probe` 看不见它们
-        // ⇒ 文件在却复用不了)。`SnapKey` 是块边界内容身份 ⇒ 键可独立恢复;
-        // `durability` 盘上没存 ⇒ 按 `Durable` 保守记(Transient 本来就不写盘)。
+        self.adopt_disk_restore_snaps();
+        (a, b)
+    }
+
+    /// 状态腿:盘上的快照要重建 `StateStore` 账(否则重启后 `probe` 看不见它们
+    /// ⇒ 文件在却复用不了)。`SnapKey` 是块边界内容身份 ⇒ 键可独立恢复;
+    /// `durability` 盘上没存 ⇒ 按 `Durable` 保守记(Transient 本来就不写盘)。
+    fn adopt_disk_restore_snaps(&mut self) {
         let snap_keys: Vec<(SnapKey, usize)> = match self.snap_disk.as_ref() {
             Some(d) => {
                 let bytes = d.block_bytes();
@@ -529,7 +534,6 @@ impl Rel {
             self.state
                 .register_snap(k, bytes, Tier::Disk, SnapDurability::Durable);
         }
-        (a, b)
     }
 
     /// **状态腿淘汰序预览**(诊断面;`/debug/vram` 用)。
@@ -561,6 +565,54 @@ impl Rel {
     /// `fill_kv_from_disk` 读回宿主 —— 该链路在 S6 已打通。
     ///
     /// 页宽不符 / 一块内容都没有的链 = **跳过并列出**(不静默)。
+    /// **boot 回填(不按预算裁)** —— 见 [`crate::disk::DiskTier::adopt_with`]:
+    /// 配额交给索引重建之后的 `reconcile`(带保护集,删尾部保前缀)。
+    pub fn adopt_disk_boot(
+        &mut self,
+        kv: Vec<(ChainHash, std::path::PathBuf, usize)>,
+        snap: Vec<(SnapKey, std::path::PathBuf, usize)>,
+    ) -> (AdoptReport, AdoptReport) {
+        let a = match self.disk.as_mut() {
+            Some(d) => d.adopt_with(kv, false),
+            None => AdoptReport::default(),
+        };
+        let b = match self.snap_disk.as_mut() {
+            Some(d) => d.adopt_with(snap, false),
+            None => AdoptReport::default(),
+        };
+        self.adopt_disk_restore_snaps();
+        (a, b)
+    }
+
+    /// **对账删除后回账 + 摘树**(KV 腿;2026-11-01)。
+    ///
+    /// 配额对账删掉的是**尾块**;树里那些条目(第一次重建时按"内容在场"建好)
+    /// 现在内容没了 —— 必须一起摘掉,否则 `match_prefix` 会匹配到不存在的块,
+    /// 回灌读盘时炸在 turn 里。返回 (出账字节, 摘掉的树条目数)。
+    pub fn disk_forget_paths(&mut self, paths: &[std::path::PathBuf]) -> (usize, usize) {
+        let mut keys = Vec::new();
+        for p in paths {
+            let stem = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if let Some(k) = <ChainHash as crate::disk::DiskKey>::parse_stem(&stem) {
+                keys.push(k);
+            }
+        }
+        let bytes = match self.disk.as_mut() {
+            Some(d) => d.commit_evict(&keys),
+            None => 0,
+        };
+        let mut dropped = 0usize;
+        for k in &keys {
+            if self.leg.drop_chain(*k).unwrap_or(false) {
+                dropped += 1;
+            }
+        }
+        (bytes, dropped)
+    }
+
     pub fn adopt_disk_chains(
         &mut self,
         chains: &[crate::disk_index::ChainIndex],
@@ -815,6 +867,27 @@ impl Rel {
             .budget_bytes()
             .checked_div(self.snap_file_bytes().max(1))
             .unwrap_or(0)
+    }
+
+    /// **快照盘层的保护集**(boot 配额对账用):账上仍在(Disk/Host/Gpu 任一)
+    /// 的快照文件路径 —— 它们还能当复用锚点,对账时排最后删。
+    pub fn snap_disk_protected_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        let mut out = std::collections::HashSet::new();
+        let Some(d) = self.snap_disk.as_ref() else {
+            return out;
+        };
+        for k in d.resident_keys() {
+            // **必须在**"KV 前缀里还有这块"的前提下才算活锚点(2026-11-01):
+            // 配额对账把 KV 截到前 N 块后,落在 N 之后的锚点**没有 KV 内容可配**
+            // ⇒ 留着也没用(实测:留下的是尾端锚点 ⇒ `reuse_face` 一路回退到 0)。
+            let boundary_alive = self.leg.carrier_of(k.boundary()).is_ok();
+            if boundary_alive && self.state.locate(k).is_some() {
+                if let Some(p) = d.path_of(k) {
+                    out.insert(p.to_path_buf());
+                }
+            }
+        }
+        out
     }
 
     /// **一条快照的总字节 = `snap_bytes × world`**(2026-11-01 P1 收尾)。

@@ -261,6 +261,16 @@ impl<K: DiskKey> DiskTier<K> {
     /// - 超预算(按扫描序装,装不下 = 隔离:配额是硬约束);
     /// - 重复键(后到者隔离)。
     pub fn adopt(&mut self, entries: Vec<(K, PathBuf, usize)>) -> AdoptReport {
+        self.adopt_with(entries, true)
+    }
+
+    /// **boot 档:不按预算裁**(2026-11-01)。
+    ///
+    /// 预算在 adopt 期按**扫描序**裁会留下任意子集 —— 而链只能从**根**连续匹配
+    /// ⇒ 一旦根块被裁掉,整条链就重建不出来(实测:配置调小后 `重建 0 链`)。
+    /// 所以 boot 期先全量入账(允许 `used > budget`),等索引重建完再做
+    /// **带保护集的配额对账**(删尾部、保前缀),然后 `commit_evict` 回账。
+    pub fn adopt_with(&mut self, entries: Vec<(K, PathBuf, usize)>, enforce_budget: bool) -> AdoptReport {
         let mut rep = AdoptReport::default();
         for (key, path, bytes) in entries {
             if bytes != self.block_bytes {
@@ -274,7 +284,7 @@ impl<K: DiskKey> DiskTier<K> {
                 rep.skipped.push((path, "重复键(同内容身份出现两次)".into()));
                 continue;
             }
-            if !self.is_disabled() && self.used + bytes > self.budget_bytes {
+            if enforce_budget && !self.is_disabled() && self.used + bytes > self.budget_bytes {
                 rep.skipped.push((
                     path,
                     format!("超预算:{}+{} > {}", self.used, bytes, self.budget_bytes),

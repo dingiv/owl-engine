@@ -1562,7 +1562,9 @@ pub(crate) fn into_running<D: DeviceClient>(
                 crate::disk_io::scan_dir_sync::<owl_store::SnapKey>(&attach.snap_root);
             let kv_entries = crate::disk_io::scan_dir_sync::<owl_store::ChainHash>(&attach.kv_root);
             let (n_kv, n_snap) = (kv_entries.len(), snap_entries.len());
-            let (ra, rb) = b.rel.adopt_disk(kv_entries, snap_entries);
+            // boot 档:**不按预算裁**(预算交给索引重建之后的带保护集对账,
+            // 否则按扫描序裁会砍掉链根 ⇒ 整链重建不出来)
+            let (ra, rb) = b.rel.adopt_disk_boot(kv_entries, snap_entries);
             owl_shared::log_info!(
                     "store",
                     "磁盘层:配额 {}MiB(KV {} / 快照 {})· 目录 {} · 回填内容 KV {}/{} 快照 {}/{} 条 · 隔离 {}+{} 条(内容惰性读回)",
@@ -1581,6 +1583,27 @@ pub(crate) fn into_running<D: DeviceClient>(
                 owl_shared::log_warn!("store", "磁盘回填隔离 {}:{why}", p.display());
             }
 
+            // **配额对账(KV 腿)**（2026-11-01;见 `disk_io::reconcile_dir`）:
+            // `adopt` 只"隔离"超预算/坏尺寸/重复 —— 文件留在盘上且不在账里,
+            // LRU 永远挑不到 ⇒ 磁盘会永久大于配额(配置调小 48G→32G 就是这种)。
+            // 这里以文件系统真值为准:超配额才删,先删不可用的、再按 mtime 最老。
+            {
+                // **只清残件**(quota=0 档):此时还没有索引/保护集,按 mtime 删 .bin
+                // 会把**链头**删掉 ⇒ 整链再也重建不出来(实测:重建 0 链)。
+                // 真正的配额对账放到索引重建之后(带保护集)那一遍。
+                let rec = crate::disk_io::reconcile_dir(
+                    &attach.kv_root,
+                    0,
+                    &std::collections::HashSet::new(),
+                );
+                if rec.tmp_removed > 0 {
+                    owl_shared::log_warn!(
+                        "store",
+                        "KV 盘残件清理:删 {} 个 .tmp(写盘半成品)",
+                        rec.tmp_removed
+                    );
+                }
+            }
             let idx_files =
                 crate::disk_io::scan_index_sync::<owl_store::ChainHash>(&attach.kv_root);
             let mut idxs = Vec::with_capacity(idx_files.len());
@@ -1667,6 +1690,75 @@ pub(crate) fn into_running<D: DeviceClient>(
                     "store",
                     "链截断({what}):盘上只覆盖前缀 {n} 块(其余内容不在盘上)"
                 );
+            }
+            // **配额对账(第二遍,带保护集)**:此时才知道哪些内容真被链引用 ——
+            // 有保护集才能"先删死的、再删最老",不会误伤召回面。
+            // 两腿都做(KV 块 + 状态快照):配置调小(48G→32G)后这一遍把多余内容
+            // 清到配额内,而不是让它们永久占位(旧行为)。
+            {
+                let kv_quota = cfg.knobs.disk_cache_mb << 20;
+                let mut protect: std::collections::HashSet<std::path::PathBuf> =
+                    std::collections::HashSet::new();
+                for k in &rep.kept {
+                    if let Some(p) = b.rel.disk.as_ref().and_then(|d| d.path_of(*k)) {
+                        protect.insert(p.to_path_buf());
+                    }
+                }
+                let live_blocks = protect.len();
+                let rec = crate::disk_io::reconcile_dir(&attach.kv_root, kv_quota, &protect);
+                // 删掉的块要从盘层账里出掉(否则 `used` 虚高 ⇒ 后续溢写误判满)
+                if !rec.removed_paths.is_empty() {
+                    let (bytes, dropped) = b.rel.disk_forget_paths(&rec.removed_paths);
+                    if bytes as u64 != rec.bytes_freed {
+                        owl_shared::log_warn!(
+                            "store",
+                            "配额对账回账不符:删 {} MiB,出账 {} MiB(文件名不可解析?)",
+                            rec.bytes_freed >> 20,
+                            bytes >> 20
+                        );
+                    }
+                    owl_shared::log_info!(
+                        "store",
+                        "配额对账:摘掉 {} 条树条目(已删尾块;剩下的前缀仍可召回)",
+                        dropped
+                    );
+                }
+                if rec.removed > 0 || rec.tmp_removed > 0 || rec.removed_protected > 0 {
+                    owl_shared::log_warn!(
+                        "store",
+                        "KV 盘配额对账(带保护集):保留活链 {live_blocks} 块 · 删 {} 文件 / {} MiB \
+                         (其中**受保护被牺牲 {} 个** · 残件 {}) · 实占余 {:.0} MiB / 配额 {}MiB",
+                        rec.removed,
+                        rec.bytes_freed >> 20,
+                        rec.removed_protected,
+                        rec.tmp_removed,
+                        rec.kept_bytes as f64 / 1048576.0,
+                        kv_quota >> 20
+                    );
+                }
+                // 状态腿:保护集 = 已采纳到 state 账里的快照
+                if cfg.knobs.snap_disk_mb > 0 {
+                    let snap_quota = cfg.knobs.snap_disk_mb << 20;
+                    let snap_protect = b.rel.snap_disk_protected_paths();
+                    let rec = crate::disk_io::reconcile_dir(
+                        &attach.snap_root,
+                        snap_quota,
+                        &snap_protect,
+                    );
+                    if rec.removed > 0 || rec.tmp_removed > 0 || rec.removed_protected > 0 {
+                        owl_shared::log_warn!(
+                            "store",
+                            "快照盘配额对账:删 {} 文件 / {} MiB(受保护被牺牲 {} 个 · 残件 {})· \
+                             实占余 {:.0} MiB / 配额 {}MiB",
+                            rec.removed,
+                            rec.bytes_freed >> 20,
+                            rec.removed_protected,
+                            rec.tmp_removed,
+                            rec.kept_bytes as f64 / 1048576.0,
+                            snap_quota >> 20
+                        );
+                    }
+                }
             }
         }
         b
