@@ -228,3 +228,15 @@ cd ../llm_speedtest && uv run cli ... --lengths 60000 --rounds 1 \
 
 > 工作树同时带着 P0 的 eager split-KV mask 修复（`owl_fi_attention_common.h`
 > + probe 的 `FI_LONG_HOST`）。提交时建议拆成两笔：P0 修复 / FP16-PV。
+
+## 交叉引用:`fi-fp16acc`(QK half 累加)已落地,两者可叠加
+
+同一轮 2026-11-02 的姊妹档 `docs/devlog/kernels/fi-fp16-accum.md` 把 **QK^T + online softmax**
+也换成 half 累加(Cargo feature `fi-fp16acc`)。注意它**推翻**了此前
+"FP16 QK 累加 −18% ⇒ 否决"的结论 —— 那个负结果来自**上游 `logits_transform` 把 `half`
+当整数截断**的 bug(负值饱和 0 ⇒ S 全 0),修好后是 **+23~27%**。
+
+两者正交,叠加实测(3090 Ti / hd256 / ctx=139264 / f16 池):
+T=512 **31.4 → 21.7 ms(1.45×)**、T=2048 **104.8 → 73.4 ms(1.43×)**;
+数值 `max|Δ|` ≤1.24e-2、`cos` ≥0.9999966、`mean|Δ|` ≤1.02e-3。
+构建:`--features fi-fp16pv,fi-fp16acc`。
