@@ -23,3 +23,4 @@ $(FLASHINFER_INCLUDE)/flashinfer/attention/../vec_dtypes.cuh
 $(FLASHINFER_INCLUDE)/flashinfer/page.cuh
 $(FLASHINFER_INCLUDE)/flashinfer/pos_enc.cuh
 $(FLASHINFER_INCLUDE)/flashinfer/utils.cuh
+$(FLASHINFER_INCLUDE)/flashinfer/fp16.h

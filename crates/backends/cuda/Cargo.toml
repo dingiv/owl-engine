@@ -22,6 +22,9 @@ arch-sm120 = ["owl-kernels/arch-sm120"]
 # FP16-PV 实验档(只对 sm_86 构建开;见 owl-kernels 同名 feature)
 fi-fp16pv = ["owl-kernels/fi-fp16pv"]
 
+# FI prefill 半精度累加档(单源在 owl-kernels;语义/数字见该处注释)
+fi-fp16acc = ["owl-kernels/fi-fp16acc"]
+
 [dependencies]
 # 官方 crates.io 版(非 guoqingbao fork):图相关语义由本封装层自持,
 # 不依赖 fork 的 graph feature(A4:语义分歧不进第三方库)

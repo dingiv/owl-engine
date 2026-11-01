@@ -41,10 +41,20 @@ using OwlFiAttention = DefaultAttention<false, false, false, false>;
 
 constexpr PosEncodingMode OWL_POS_MODE = PosEncodingMode::kNone;
 /// fp16 累加(QK^T / PV 累加器走 half;FlashInfer `use_fp16_qk_reduction`)。
-/// **当前 false**:消费级 GA10x 的 fp32 累加只有半速 ⇒ 这一档理论上有 1.4~2× 油水,
-/// 但当前快照(0.7.x)的 fp16 路径在本仓**从未编译过**(需 fp16.h + C++20 + 一批 __half
-/// 二义修),不是翻开关的事 —— 见 roadmap.local/26-11-01-marlin-w4a8-扫档定谳.md §6。
+/// **单一真源 = 构建期宏** `FP16_QK_REDUCTION_SUPPORTED`(Cargo feature
+/// `fi-fp16acc` 在时 `build.rs` 给 FI 三个 TU 加该宏 + `-std=c++20`):宏在 ⇒ 模板参 true,
+/// 宏不在 ⇒ false 且**不实例化**半精度分支(静态断言会拒)。两边永不错配。
+///
+/// 为什么这个档值得开(2026-11-02):消费级 GA10x 的 fp32 累加只有半速
+/// ⇒ QK 换 half 累加 = 2× MMA 率;软max 也整条走 half2(`hexp2`/`hmax2`)。
+/// 历史负结果(2026-11-01,0.6.18.post1)是**软件位运算转换**吃掉的(见
+/// roadmap.local/26-11-01-marlin-w4a8-扫档定谳.md §7),本仓把
+/// `flashinfer/fp16.h` 换成硬件 `cvt` shim 后重测。
+#ifdef FP16_QK_REDUCTION_SUPPORTED
+constexpr bool OWL_FP16_QK_REDUCTION = true;
+#else
 constexpr bool OWL_FP16_QK_REDUCTION = false;
+#endif
 constexpr MaskMode OWL_MASK_MODE = MaskMode::kCausal;
 
 // ---------------------------------------------------------------------------

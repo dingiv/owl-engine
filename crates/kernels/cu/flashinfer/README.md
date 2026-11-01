@@ -29,8 +29,36 @@ prefill 核体逐字未变 ⇒ adapter **零改动**、速度中性(15/15 输出
    单测复现 `max|FI−host|=1.39`),且它是一条**个人分支**;上游 plan 用
    **q 瓦片伪批**(本形状 `padded_batch_size=48` ⇒ 192 CTA)把单请求铺满 SM。
 
-**闭包**(25 头 / ~0.85 MB;**无 cutlass**、无额外编译宏;`nvcc -M` 扫一个含
+**闭包**(25 头 / ~0.85 MB;**无 cutlass**;`nvcc -M` 扫一个含
 `BatchPrefillWithPagedKVCacheDispatched` 的 TU 即复现,清单见 `closure.txt`)。
+
+## 半精度累加档(2026-11-02;feature `fi-fp16acc`)
+
+消费级 GA10x 的 **fp32 累加只有半速** ⇒ 默认的 `mma...f32.f16.f16.f32` 是半速档。
+开 `fi-fp16acc` 后 QK^T 走 `mma...f16.f16.f16.f16`,整条 online softmax 也走 half2
+(`ex2.approx.f16x2` / `hmax2`)。
+
+| 形状(3090 Ti / hd256 / hkv4 / ctx=139264) | fp32-acc | **fp16-acc** |
+|---|---:|---:|
+| T=512,f16 池(**生产路径**) | 32.46 ms | **25.56 ms(1.270×)** |
+| T=807 / T=2048,f16 池 | 42.15 / 104.24 ms | **33.59 / 84.46 ms(1.255× / 1.234×)** |
+| T=512 / 807 / 2048,fp8 池 | 39.90 / 51.83 / 128.71 ms | **33.76 / 44.59 / 110.33 ms(1.18×)** |
+
+数值:host oracle `max|FI−host|` 5e-4 → **1.2e-2 最坏 / 2~5e-3 典型**(cos=1.00000;
+远小于 fp8 KV 自身量化噪声)。全案见 `roadmap.local/26-11-02-fi-fp16累加-30系attention.md`。
+
+**⚠️ 这个上游档在本仓以前从未被编译过,而且带着一个数值 bug**(`half` 被当整数
+截断 ⇒ S 全毁 ⇒ 注意力退化成均匀平均)。本目录的四处 in-tree 改动就是为了让它能编 + 算对,
+**升级闭包时必须重新对照**(详见下表)。
+
+### in-tree changes(FROZEN 档的登记项,同步 `THIRD_PARTY.md` §2)
+
+| 文件 | 改动 |
+|---|---|
+| `include/flashinfer/fp16.h` | **新增文件**(OWL 自有,非上游拷贝):`fp16_ieee_{to,from}_fp32_value` 的**硬件 `cvt` 版**(上游是软件位运算 + boost;device 侧十几条位运算 vs 一条 `cvt`) |
+| `attention/prefill.cuh` | ① `logits_transform` 的两处 half↔float 往返**显式给位型**(`__half_as_ushort`/`__ushort_as_half`)—— 原写法 `half` → `uint16_t` 形参走的是**数值**转换(负值饱和 0、正值取整)⇒ S 全毁;② `getNegInf<half>()` 用常量位型 `0xFC00`(原运行期转换函数不是 constexpr);③ hd≥512 vo-split 路 3 处 `half` 二义显式转 float(只影响编译面) |
+| `attention/variant_helper.cuh` | `OutputTransform` 的 `m != -inf` 在 `T_M=half` 时二义 ⇒ `float(m)` |
+| `build.rs`(非闭包) | feature 在 ⇒ 三个 TU 加 `-DFP16_QK_REDUCTION_SUPPORTED -std=c++20 --expt-relaxed-constexpr` |
 
 **ABI 逐字未变**(`owl_fi_prefill_plan` / `owl_fi_prefill_run` /
 `owl_fi_prefill_run_fp8kv`;15×int64 plan blob、槽序、`FI_SPLIT_KV`/`FI_DEBUG`
@@ -39,7 +67,7 @@ prefill 核体逐字未变 ⇒ adapter **零改动**、速度中性(15/15 输出
 **本目录文件**
 | 文件 | 说明 |
 |---|---|
-| `include/` | 上游闭包 + owl FP16-PV 补丁(默认宏 0;升级 = 重扫闭包 + 重放 `patches/fp16-pv-0.7.2.patch`) |
+| `include/` | 上游闭包 + owl 两个实验档的 in-tree changes(**两个宏都缺省 0 ⇒ 默认档逐字等价**;升级 = 重扫闭包 + 重放 `patches/fp16-pv-0.7.2.patch` + 对照下表) |
 | `patches/fp16-pv-0.7.2.patch` | owl 本地 FP16-PV 改动(相对上游 0.7.2.post1) |
 | `owl_fi_attention.cu` | owl adapter(换源记录见文件头注:plan 前置 `PrefillPlanWorkspaceSize` 尺寸校验 / `kv_dtype_bytes` / params 改逐字段赋值 / 模板加 `SAME_KV_STRIDES` / fp8 免宏) |
 | `bench/` | 候选核单测台架(不参与构建):`FI_SRC=$(cd .. && pwd) ./run.sh`(f16)/ `FP8=1 ...`(fp8 池) |

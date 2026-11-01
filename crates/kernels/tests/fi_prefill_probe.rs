@@ -223,6 +223,47 @@ fn host_ref_knhd(q: &[u16], kc: &[u8], vc: &[u8], t: usize, ctx: usize) -> Vec<f
     out
 }
 
+/// **f16 池版 host 参考**(2026-11-02):与 `host_ref_knhd` 同序同式,只是 K/V 是
+/// f16 位型(走 f16 臂时用来把"fp8 反量化税"与"f16 臂本身"分开判)。
+fn host_ref_knhd16(q: &[u16], kc: &[u16], vc: &[u16], t: usize, ctx: usize) -> Vec<f32> {
+    let kf: Vec<f32> = kc.iter().map(|&b| f16_to_f32(b)).collect();
+    let vf: Vec<f32> = vc.iter().map(|&b| f16_to_f32(b)).collect();
+    let qf: Vec<f32> = q.iter().map(|&b| f16_to_f32(b)).collect();
+    let mut out = vec![0f32; t * H * HD];
+    let kbs = HKV * HD * PAGE;
+    let scale = 1.0 / (HD as f32).sqrt();
+    for s in 0..t {
+        let len = ctx - t + s + 1;
+        for h in 0..H {
+            let kvh = h / (H / HKV);
+            let mut qk = vec![0f32; len];
+            #[allow(clippy::needless_range_loop)]
+            for b in 0..len {
+                let (pb, bb) = (b / PAGE, b % PAGE);
+                let mut acc = 0f32;
+                for d in 0..HD {
+                    let kidx = pb * kbs + bb * (HKV * HD) + kvh * HD + d;
+                    acc += qf[(s * H + h) * HD + d] * kf[kidx];
+                }
+                qk[b] = acc * scale;
+            }
+            let m = qk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let l: f32 = qk.iter().map(|&x| (x - m).exp()).sum();
+            for d in 0..HD {
+                let mut acc = 0f32;
+                #[allow(clippy::needless_range_loop)]
+                for b in 0..len {
+                    let (pb, bb) = (b / PAGE, b % PAGE);
+                    let vidx = pb * kbs + bb * (HKV * HD) + kvh * HD + d;
+                    acc += (qk[b] - m).exp() * vf[vidx];
+                }
+                out[(s * H + h) * HD + d] = acc / l;
+            }
+        }
+    }
+    out
+}
+
 // ============================================================================
 // 一次全量测量
 // ============================================================================
@@ -348,18 +389,38 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
     let o = res.take_u16(out_b.id);
     let fx: Vec<f32> = o.iter().map(|&h| f16_to_f32(h)).collect();
     let mut line = format!("=== FI T={t} ctx={ctx} (nb={nb}) ===\n  FI: {ms:7.3} ms/call");
-    if host_check && !f16_kv {
-        let host = host_ref_knhd(&q_f16, &k_fp8, &v_fp8, t, ctx);
+    let host_opt = if host_check {
+        Some(if f16_kv {
+            host_ref_knhd16(&q_f16, k_f16.as_ref().unwrap(), v_f16.as_ref().unwrap(), t, ctx)
+        } else {
+            host_ref_knhd(&q_f16, &k_fp8, &v_fp8, t, ctx)
+        })
+    } else {
+        None
+    };
+    // **数值门**(2026-11-02):两个 half 累加档都把绝对误差抬了一个量级
+    // ⇒ 缺省门按**编译进来的 feature** 自动放宽,env 可显式覆写:
+    //   `FI_PF_GATE`(max|Δ|)/ `FI_PF_COS`(整段余弦)/ `FI_PF_MEAN`(mean|Δ|)
+    // - 缺省档(fp32 累加)= 1e-2 / cos 不设门 / mean 不设门(历史口径);
+    // - `fi-fp16acc`(QK half)= 2e-2(实测 f16 池大 logits 到 4e-2,见 devlog);
+    // - `fi-fp16pv`(PV half)= 2e-2 + cos ≥ 0.99995 + mean|Δ| ≤ 5e-3(该档的口径)。
+    let half_acc = cfg!(feature = "fi-fp16acc") || cfg!(feature = "fi-fp16pv");
+    let gate = owl_shared::env_reader::parse::<f32>("FI_PF_GATE")
+        .unwrap_or(if half_acc { 2e-2 } else { 1e-2 });
+    let pv = cfg!(feature = "fi-fp16pv");
+    let cos_gate = owl_shared::env_reader::parse::<f64>("FI_PF_COS")
+        .unwrap_or(if pv { 0.99995 } else { 0.0 });
+    let mean_gate = owl_shared::env_reader::parse::<f64>("FI_PF_MEAN")
+        .unwrap_or(if pv { 5e-3 } else { f64::INFINITY });
+    if let Some(host) = host_opt {
+        let host = &host;
         let d = fx
             .iter()
             .zip(host.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        // 逐行体检(独立抓 "row>0 产出空" 那条历史指控)。
-        // FP16-PV 档是 half 累加,绝对误差天然比 fp32 大一个量级;该档的
-        // 回归门改用整段 cos/mean|Δ|(见下),行级阈值只作报告。
-        let pv = cfg!(feature = "fi-fp16pv");
-        let row_gate = if pv { 2e-2 } else { 1e-2 };
+        // 逐行体检(独立抓 "row>0 产出空" 那条历史指控)。行级阈值 = 整段门
+        // (half 累加档另加 cos/mean|Δ| 判据,见下)。
         let mut bad_rows = 0usize;
         for s in 0..t {
             let rd = fx[s * H * HD..(s + 1) * H * HD]
@@ -367,7 +428,7 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
                 .zip(&host[s * H * HD..(s + 1) * H * HD])
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
-            if rd > row_gate {
+            if rd > gate {
                 bad_rows += 1;
             }
         }
@@ -388,14 +449,49 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
         );
         // 先打印再断言(2026-10-15:split 排查要看到"哪一行/哪一头错")
         println!("{line}");
-        let acc_ok = if pv {
-            // half PV 累加:绝对误差不设 1e-2 门(曾测 T=512/3k max 1.55e-2,
-            // cos 0.999984;T=8/65k max 9.9e-3, cos 0.999994)。
-            cos >= 0.99995 && mean_abs <= 5e-3
-        } else {
-            d < 1e-2
-        };
+        let acc_ok = d < gate && cos >= cos_gate && mean_abs <= mean_gate;
         if !acc_ok {
+            // **形态诊断**(2026-11-02):超门时打印"FI 与 host 的范数比/前 6 值",
+            // 以及"FI 的 row0/h0 与哪些 V 最相关"—— 用来分辨失败形态
+            // (全零 / 均匀平均 / 缩放错 / 读错 KV 区间)。2026-11-02 就是靠它
+            // 抓出上游 half 转换 bug(logits 被截断 ⇒ 注意力退化成均匀平均)。
+            {
+                let n = fx.len() as f64;
+                println!(
+                    "\n  [形态] ||FI||={:.4} ||host||={:.4} cos={cos:.9} 均比={:.4}",
+                    (na / n).sqrt(),
+                    (nb / n).sqrt(),
+                    (na.sqrt() / (nb.sqrt() + 1e-30))
+                );
+                let f0: Vec<String> =
+                    fx[..6.min(fx.len())].iter().map(|v| format!("{v:.4}")).collect();
+                let h0: Vec<String> =
+                    host[..6.min(host.len())].iter().map(|v| format!("{v:.4}")).collect();
+                println!("  [FI  row0/h0 前6] {f0:?}");
+                println!("  [host row0/h0 前6] {h0:?}");
+                if !f16_kv {
+                    let vf: Vec<f32> = v_fp8.iter().map(|&c| e4m3_decode(c)).collect();
+                    let kbs = HKV * HD * PAGE;
+                    let nf: f64 = fx[..HD].iter().map(|&x| (x as f64) * (x as f64)).sum();
+                    let mut cors: Vec<(f32, usize)> = (0..ctx)
+                        .map(|b| {
+                            let (pb, bb) = (b / PAGE, b % PAGE);
+                            let mut dot = 0f64;
+                            let mut nv = 0f64;
+                            for d in 0..HD {
+                                let v = vf[pb * kbs + bb * (HKV * HD) + d] as f64;
+                                dot += fx[d] as f64 * v;
+                                nv += v * v;
+                            }
+                            ((dot / (nf.sqrt() * nv.sqrt() + 1e-30)) as f32, b)
+                        })
+                        .collect();
+                    cors.sort_by(|a, b| b.0.abs().partial_cmp(&a.0.abs()).unwrap());
+                    let top: Vec<String> =
+                        cors.iter().take(6).map(|(c, b)| format!("tok{b}:{c:.3}")).collect();
+                    println!("  [FI vs V 余弦 top6] {top:?}  (ctx={ctx})");
+                }
+            }
             for s in 0..t.min(8) {
                 let rd = fx[s * H * HD..(s + 1) * H * HD]
                     .iter()
@@ -413,9 +509,11 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
                 println!("    row {s}: max|Δ|={rd:.6}  per-head(前6)={per_head:?}");
             }
             panic!(
-                "FI vs host 超门:max|Δ|={d:.6} cos={cos:.9} mean|Δ|={mean_abs:.3e} \
-                 (FI_SPLIT_KV={:?}, fi-fp16pv={pv})",
-                std::env::var("FI_SPLIT_KV")
+                "FI vs host 超门:max|Δ|={d:.6}(门 {gate:e}) cos={cos:.9}(门 {cos_gate}) \
+                 mean|Δ|={mean_abs:.3e}(门 {mean_gate:.1e}) \
+                 (FI_SPLIT_KV={:?}, fi-fp16acc={}, fi-fp16pv={pv})",
+                std::env::var("FI_SPLIT_KV"),
+                cfg!(feature = "fi-fp16acc")
             );
         }
     }
@@ -544,5 +642,6 @@ fn fi_prefill_longctx_f16_probe() {
     let t = owl_shared::env_reader::parse::<usize>("FI_LONG_T").unwrap_or(807);
     let ctx = owl_shared::env_reader::parse::<usize>("FI_LONG_CTX").unwrap_or(100_000);
     let iters = owl_shared::env_reader::parse::<usize>("FI_LONG_ITERS").unwrap_or(5);
-    run_case_dtype(t, ctx, false, iters.max(1), true);
+    let hc = owl_shared::env_reader::flag("FI_LONG_HOST");
+    run_case_dtype(t, ctx, hc, iters.max(1), true);
 }

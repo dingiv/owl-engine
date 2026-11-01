@@ -1353,6 +1353,15 @@ fn build_flashinfer() {
         println!("cargo:rerun-if-changed={fa2_compat}");
         println!("cargo:rerun-if-env-changed=FLASHINFER_FORCE_BUILD");
         println!("cargo:rerun-if-env-changed=FLASHINFER_INCLUDE");
+        // **FP16 累加档**(2026-11-02,Cargo feature `fi-fp16acc`):FI 三个 TU 加
+        // `-DFP16_QK_REDUCTION_SUPPORTED` + `-std=c++20`(prefill.cuh 的
+        // `std::bit_cast` 需要),走**半精度 QK 累加 + 半精度 softmax**路径。
+        // 该宏同时决定 `owl_fi_attention_common.h` 的 `OWL_FP16_QK_REDUCTION`
+        // ⇒ C++ 侧单一真源,不会出现"编了 fp16 路径但模板参是 false"的错配。
+        // 注:上游该档 `#include "../fp16.h"`,本仓那份是**硬件 cvt 版 shim**
+        // (`include/flashinfer/fp16.h`,见文件头注)。
+        // 为什么是 feature 而不是 env:构建档必须进 cargo 缓存键(同 arch-smXX)。
+        let fi_fp16acc = std::env::var_os("CARGO_FEATURE_FI_FP16ACC").is_some();
         println!("cargo:rerun-if-env-changed=FLASHINFER_NVCC");
         println!("cargo:rerun-if-env-changed=FLASHINFER_FORCE_BUILD");
         // **FP16-PV 实验档**(2026-11-02):Cargo feature `fi-fp16pv` ⇒ 主 FI
@@ -1370,11 +1379,12 @@ fn build_flashinfer() {
         let lib = fi_dir.join("libowl_flashinfer.a");
         let log_flags = log_defines();
         let flags = format!(
-            "fi arch={} nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.7.2.post1 split=2tu log={} dev={} fp16pv={}",
+            "fi arch={} nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.7.2.post1 split=2tu log={} dev={} fp16pv={} fp16acc={}",
             fi_arch.as_sm(),
             log_enabled(),
             std::env::var_os("OWL_LOG_DEVICE").is_some(),
-            fi_fp16pv
+            fi_fp16pv,
+            fi_fp16acc
         );
         let mut deps: Vec<String> = vec![
             src_f16.to_string(),
@@ -1402,9 +1412,11 @@ fn build_flashinfer() {
                     "{}.o",
                     PathBuf::from(src).file_stem().unwrap().to_string_lossy()
                 ));
+                // FP16 累加档:prefill.cuh 的 fp16 分支用 `std::bit_cast`(C++20)
+                let std_flag = if fi_fp16acc { "-std=c++20" } else { "-std=c++17" };
                 let mut args = vec![
                     "-O3".into(),
-                    "-std=c++17".into(),
+                    std_flag.into(),
                     format!("-arch={}", fi_arch.as_sm()),
                     format!("-I{fi_include}"),
                     // owl_log.h(算子侧唯一日志出口)+ 编译门
@@ -1416,6 +1428,12 @@ fn build_flashinfer() {
                 ];
                 if fi_fp16pv && src != src_ragged {
                     args.push("-DOWL_FP16_PV=1".into());
+                }
+                if fi_fp16acc {
+                    // prefill.cuh 的 fp16 分支在 `__device__` 里用 `std::bit_cast`
+                    // (constexpr host 函数)⇒ 必须放开 relaxed-constexpr。
+                    args.push("-DFP16_QK_REDUCTION_SUPPORTED".into());
+                    args.push("--expt-relaxed-constexpr".into());
                 }
                 args.extend(log_flags.iter().cloned());
                 jobs.push((src.to_string(), obj, args));

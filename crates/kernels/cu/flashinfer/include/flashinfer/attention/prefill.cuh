@@ -412,7 +412,9 @@ struct KernelTraits {
   template <typename DT>
   static constexpr DT getNegInf() {
     if constexpr (std::is_same<DT, __half>::value) {
-      return std::bit_cast<half>(fp16_ieee_from_fp32_value(-math::inf));
+      // owl(2026-11-02):-inf 的 fp16 位型是常量 0xFC00 ⇒ 直接 bit_cast,
+      // 不走运行期转换函数(那是 `__device__` 非 constexpr,constexpr 上下文非法)。
+      return std::bit_cast<half>(uint16_t(0xFC00));
     } else {
       return static_cast<DTypeQKAccum>(-math::inf);
     }
@@ -1682,7 +1684,12 @@ __device__ __forceinline__ void logits_transform(
 
 #ifdef FP16_QK_REDUCTION_SUPPORTED
         if constexpr (std::is_same<DTypeQKAccum, __half>::value) {
-          logits = std::bit_cast<float>(fp16_ieee_to_fp32_value(s_frag[mma_q][mma_kv][reg_id]));
+          // owl(2026-11-02):**必须显式给位型**。原写法把 `half` 直接喂给
+          // `fp16_ieee_to_fp32_value(uint16_t)` —— 重载决议走 `__half::operator
+          // unsigned short()`(**数值**截断转换:负值饱和到 0、正值取整),
+          // 于是 logits 被毁 ⇒ S 全 0 ⇒ 注意力退化成均匀平均(实测 T=1/ctx=64
+          // 输出与正确值 cos=0.04)。上游该档从未被编译/测试过,故未暴露。
+          logits = fp16_ieee_to_fp32_value(__half_as_ushort(s_frag[mma_q][mma_kv][reg_id]));
         } else if constexpr (!std::is_same<DTypeQKAccum, __half>::value) {
           logits = s_frag[mma_q][mma_kv][reg_id];
         }
@@ -1696,8 +1703,9 @@ __device__ __forceinline__ void logits_transform(
                                                     qo_head_idx, kv_head_idx);
 #ifdef FP16_QK_REDUCTION_SUPPORTED
         if constexpr (std::is_same<DTypeQKAccum, __half>::value) {
+          // owl(2026-11-02):同上 —— 回写也必须走位型(`__ushort_as_half`)。
           s_frag[mma_q][mma_kv][reg_id] =
-              std::bit_cast<half>(fp16_ieee_from_fp32_value(logitsTransformed));
+              __ushort_as_half(fp16_ieee_from_fp32_value(logitsTransformed));
         } else if constexpr (!std::is_same<DTypeQKAccum, __half>::value) {
           s_frag[mma_q][mma_kv][reg_id] = logitsTransformed;
         }
@@ -1921,6 +1929,12 @@ __device__ __forceinline__ void update_mdo_states(
               o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
             }
           }
+          // 注(2026-11-02 实测,**不要**再试下面两条"降噪"改法):
+          //   (a) 先减后乘 `(S−m)*scale`(Sterbenz 论据);
+          //   (b) exp 参数走 float(`ex2.approx.f32`)。
+          // 两者对 `max|FI−host|` **零改善**(4.0e-2 → 4.0e-2)且慢 ~1%。
+          // 该档的噪声**全部来自 QK^T 的 half 累加**(f16 池 4.0e-2 / fp8 池 1.2e-2;
+          // fp32 累加档对应 9.3e-4 / 5.0e-4)⇒ 想再降噪只能回 fp32 累加。
           half2 m2s = make_half2(m_scaled_h, m_scaled_h);
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
@@ -3555,8 +3569,12 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
       float mt = -math::inf;
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
-        mt = max(mt, max(max(s_frag[mma_q][mma_kv][j * 2 + 0], s_frag[mma_q][mma_kv][j * 2 + 1]),
-                         max(s_frag[mma_q][mma_kv][j * 2 + 4], s_frag[mma_q][mma_kv][j * 2 + 5])));
+        // owl(2026-11-02):fp16 累加档下 s_frag 是 half ⇒ `max(half,half)` 二义;
+        // 本路只服务 hd>=512(vo-split),显式转 float(语义不变)。
+        mt = max(mt, max(max(float(s_frag[mma_q][mma_kv][j * 2 + 0]),
+                             float(s_frag[mma_q][mma_kv][j * 2 + 1])),
+                         max(float(s_frag[mma_q][mma_kv][j * 2 + 4]),
+                             float(s_frag[mma_q][mma_kv][j * 2 + 5]))));
       }
       mt = max(mt, math::shfl_xor_sync(mt, 0x2));
       mt = max(mt, math::shfl_xor_sync(mt, 0x1));
@@ -3600,8 +3618,10 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
       for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
 #pragma unroll
         for (uint32_t k = 0; k < 2; ++k) {  // reg positions j*2+{0,1} and j*2+{4,5}
-          float p0 = math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + k] * sm_scale - m_new);
-          float p1 = math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 4 + k] * sm_scale - m_new);
+          // owl(2026-11-02):half * float 二义 ⇒ 显式转 float。
+          float p0 = math::ptx_exp2(float(s_frag[mma_q][mma_kv][j * 2 + k]) * sm_scale - m_new);
+          float p1 =
+              math::ptx_exp2(float(s_frag[mma_q][mma_kv][j * 2 + 4 + k]) * sm_scale - m_new);
           dsum += p0 + p1;
           const uint32_t row = q_row_base + mma_q * 16 + lane_idx / 4 + 8 * j;
           const uint32_t col0 = mma_kv * 16 + 2 * (lane_idx % 4) + k;

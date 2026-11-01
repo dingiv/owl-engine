@@ -83,7 +83,8 @@ struct AttentionVariantBase {
   REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, { return; })
 
   REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
-    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
+    // owl(2026-11-02):fp16 累加档 T_M=half ⇒ 与 float 的 `!=` 二义,显式转 float。
+    float d_rcp = (float(m) != -math::inf) ? math::ptx_rcp(d) : 0.f;
     float v_scale_val = get_v_scale(params);
     return output * d_rcp * v_scale_val;
   })

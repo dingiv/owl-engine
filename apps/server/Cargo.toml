@@ -50,6 +50,8 @@ stepgate = ["owl-shared/stepgate"]
 perf = ["owl-shared/perf", "owl-engine/perf"]
 cupti = ["owl-cuda/cupti"]
 log = ["owl-shared/log", "owl-engine/log"]
+# FI prefill 半精度累加档(见 crates/kernels/Cargo.toml 的同名 feature 注释)
+fi-fp16acc = ["owl-cuda/fi-fp16acc"]
 
 [dev-dependencies]
 # e2e 骨架用 prctl(PR_SET_PDEATHSIG):父进程被 SIGKILL 时子 server 必须随之
