@@ -63,6 +63,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/kernels/attention-port.md`](devlog/kernels/attention-port.md) — attention-rs kernel port initiative
 - ⬜ [`devlog/kernels/long-ctx-attention.md`](devlog/kernels/long-ctx-attention.md) — Long-context attention: paged-family port route
 - ⬜ [`devlog/kernels/prefill-attention-swap.md`](devlog/kernels/prefill-attention-swap.md) — prefill attention kernel swap: candidates and unit tests
+- ✅ [`devlog/kernels/fp16-pv-prefill-2026-11-02.md`](devlog/kernels/fp16-pv-prefill-2026-11-02.md) — FlashInfer FP16-PV prefill: sm86 GeForce, +20~26% f16 / +12~20% fp8 kernel, +6.5~7.5% 60k e2e
 - ⬜ [`devlog/kernels/w4a8-family.md`](devlog/kernels/w4a8-family.md) — W4A8 operator family
 - ⬜ [`devlog/kernels/kernel-tag-catalog.md`](devlog/kernels/kernel-tag-catalog.md) — Operator tag catalog + build-time master table
 - ⬜ [`devlog/kernels/kernel-admission.md`](devlog/kernels/kernel-admission.md) — Operator admission gates and block governance

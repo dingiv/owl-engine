@@ -145,6 +145,8 @@ a quality-gate ledger), not a config flag.
 ```bash
 # 1) Build (release without `perf` = byte-for-byte zero cost for timers)
 cargo build --release -p server
+#    3090/3080 (sm86 GeForce) 长上下文预填推荐叠加 FP16-PV（+6~7% e2e）：
+#    cargo build --release -p server --features fi-fp16pv
 #    Benchmark binary (timers stay enabled in release):
 #    cargo build --release -p server --features perf
 

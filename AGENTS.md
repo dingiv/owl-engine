@@ -88,6 +88,7 @@ owl = **在消费级硬件上跑本地模型的推理引擎**(立项 2026-09-22)
 # 构建
 cargo build --release -p server                  # 生产(release 零计时税)
 cargo build --release -p server --features perf  # 基准(计时器保留)
+cargo build --release -p server --features fi-fp16pv  # 3090/3080 sm86:FI FP16-PV 预填(+6~7% 60k e2e;不要与多代际/sm89 同开)
 
 # 预检 / 生效配置 / 单键解释(不加载权重,~10–20ms)
 ./target/release/server -p profiles/qwen38_27b-3090.toml --check

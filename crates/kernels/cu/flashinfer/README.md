@@ -12,6 +12,14 @@
 prefill 核体逐字未变 ⇒ adapter **零改动**、速度中性(15/15 输出逐字节一致)。
 实测与决策见 `docs/bench/flashinfer-0.7-upgrade-2026-11-01.md`。
 
+**2026-11-02 owl 本地补丁**:`include/flashinfer/attention/prefill.cuh` 带
+**FP16-PV** 实验补丁(`patches/fp16-pv-0.7.2.patch`)。PV 累加器可从 fp32
+切到 half(`f16f16f16` HMMA + half2 rescale),由 Cargo feature
+`fi-fp16pv` → `-DOWL_FP16_PV=1` 打开;**默认宏 0,核体走原 fp32 路径**。
+只对 sm86 GeForce 的 f16/fp8 非 VO-split 预填生效,bf16 硬拒。详见
+`docs/devlog/kernels/fp16-pv-prefill-2026-11-02.md`。升级 FI 时必须重放
+该 patch(或按同文件重锚)。
+
 **为什么换**(用户令"换其他引擎的同类核 → 先单测 → 再替换"):
 1. **实测 1.4×**:同形状(T=512 × ctx,hd256,GQA 24/4,page32,kNHD,**fp8 池**)
    上游 0.112/0.568/1.176/2.432/4.829 ms @ctx 512/2048/4096/8192/16384,
@@ -31,7 +39,8 @@ prefill 核体逐字未变 ⇒ adapter **零改动**、速度中性(15/15 输出
 **本目录文件**
 | 文件 | 说明 |
 |---|---|
-| `include/` | 上游闭包黑箱(不手改;升级 = 重扫闭包) |
+| `include/` | 上游闭包 + owl FP16-PV 补丁(默认宏 0;升级 = 重扫闭包 + 重放 `patches/fp16-pv-0.7.2.patch`) |
+| `patches/fp16-pv-0.7.2.patch` | owl 本地 FP16-PV 改动(相对上游 0.7.2.post1) |
 | `owl_fi_attention.cu` | owl adapter(换源记录见文件头注:plan 前置 `PrefillPlanWorkspaceSize` 尺寸校验 / `kv_dtype_bytes` / params 改逐字段赋值 / 模板加 `SAME_KV_STRIDES` / fp8 免宏) |
 | `bench/` | 候选核单测台架(不参与构建):`FI_SRC=$(cd .. && pwd) ./run.sh`(f16)/ `FP8=1 ...`(fp8 池) |
 

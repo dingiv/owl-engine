@@ -355,7 +355,11 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
             .zip(host.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        // 逐行体检(独立抓 "row>0 产出空" 那条历史指控)
+        // 逐行体检(独立抓 "row>0 产出空" 那条历史指控)。
+        // FP16-PV 档是 half 累加,绝对误差天然比 fp32 大一个量级;该档的
+        // 回归门改用整段 cos/mean|Δ|(见下),行级阈值只作报告。
+        let pv = cfg!(feature = "fi-fp16pv");
+        let row_gate = if pv { 2e-2 } else { 1e-2 };
         let mut bad_rows = 0usize;
         for s in 0..t {
             let rd = fx[s * H * HD..(s + 1) * H * HD]
@@ -363,18 +367,35 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
                 .zip(&host[s * H * HD..(s + 1) * H * HD])
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
-            if rd > 1e-2 {
+            if rd > row_gate {
                 bad_rows += 1;
             }
         }
         let nz = fx.iter().filter(|&&x| x == 0.0).count();
+        let (mut dot, mut na, mut nb, mut sa) = (0f64, 0f64, 0f64, 0f64);
+        for (a, b) in fx.iter().zip(host.iter()) {
+            let (a, b) = (*a as f64, *b as f64);
+            dot += a * b;
+            na += a * a;
+            nb += b * b;
+            sa += (a - b).abs();
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-30);
+        let mean_abs = sa / fx.len() as f64;
         line += &format!(
-            "\n  max|FI−host| = {d:.6}   超门行数 = {bad_rows}/{t}   零值 = {nz}/{}",
+            "\n  max|FI−host| = {d:.6}   超门行数 = {bad_rows}/{t}   零值 = {nz}/{}   cos = {cos:.9}   mean|Δ| = {mean_abs:.3e}",
             fx.len()
         );
         // 先打印再断言(2026-10-15:split 排查要看到"哪一行/哪一头错")
         println!("{line}");
-        if d >= 1e-2 {
+        let acc_ok = if pv {
+            // half PV 累加:绝对误差不设 1e-2 门(曾测 T=512/3k max 1.55e-2,
+            // cos 0.999984;T=8/65k max 9.9e-3, cos 0.999994)。
+            cos >= 0.99995 && mean_abs <= 5e-3
+        } else {
+            d < 1e-2
+        };
+        if !acc_ok {
             for s in 0..t.min(8) {
                 let rd = fx[s * H * HD..(s + 1) * H * HD]
                     .iter()
@@ -391,7 +412,11 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
                     .collect();
                 println!("    row {s}: max|Δ|={rd:.6}  per-head(前6)={per_head:?}");
             }
-            panic!("FI vs host 超门:{d:.6}(FI_SPLIT_KV={:?})", std::env::var("FI_SPLIT_KV"));
+            panic!(
+                "FI vs host 超门:max|Δ|={d:.6} cos={cos:.9} mean|Δ|={mean_abs:.3e} \
+                 (FI_SPLIT_KV={:?}, fi-fp16pv={pv})",
+                std::env::var("FI_SPLIT_KV")
+            );
         }
     }
     if !host_check {

@@ -40,6 +40,8 @@ arch-sm75 = ["owl-cuda/arch-sm75"]
 arch-sm86 = ["owl-cuda/arch-sm86"]
 arch-sm89 = ["owl-cuda/arch-sm89"]
 arch-sm120 = ["owl-cuda/arch-sm120"]
+# FP16-PV 实验档(只对 sm_86 构建开;构建命令 `--features fi-fp16pv`)
+fi-fp16pv = ["owl-cuda/fi-fp16pv"]
 stepgate = ["owl-shared/stepgate"]
 
 # 性能框架(docs/arch/perf-framework.md):带本 feature 的 release 构建里

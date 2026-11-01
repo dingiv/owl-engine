@@ -45,6 +45,10 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 "marlin" = ["dep:rayon", "dep:half"]
 # FlashInfer prefill(预编 .a + foreign-kernel;E1.5 工作包)
 "flashinfer" = []
+# **FP16-PV 实验档**(2026-11-02):PV 累加器走 half(`f16f16f16` HMMA),仅
+# GeForce GA10x **sm_86** 的 f16/fp8 KV 预填路径;见 `prefill.cuh` 与
+# `docs/devlog/kernels/fp16-pv-...`。缺省关;需要 `flashinfer`。
+"fi-fp16pv" = ["flashinfer"]
 # XQA(kNHD fp8 KV 的 decode/verify 注意力;移植自 vllm-ampere-optimized/flashampere;
 # 预编 .a + foreign-kernel;2026-10-13 长 ctx verify 立案)
 "xqa" = []

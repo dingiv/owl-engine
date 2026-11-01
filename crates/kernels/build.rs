@@ -1355,6 +1355,11 @@ fn build_flashinfer() {
         println!("cargo:rerun-if-env-changed=FLASHINFER_INCLUDE");
         println!("cargo:rerun-if-env-changed=FLASHINFER_NVCC");
         println!("cargo:rerun-if-env-changed=FLASHINFER_FORCE_BUILD");
+        // **FP16-PV 实验档**(2026-11-02):Cargo feature `fi-fp16pv` ⇒ 主 FI
+        // 两个 TU(f16 臂 + fp8 臂)加 `-DOWL_FP16_PV=1`,PV 累加器走 half。
+        // ragged 视觉臂不加(尚未验证,保持原样)。feature 进 Cargo 指纹,
+        // 不用环境变量(构建纪律:目标/配方可复现)。
+        let fi_fp16pv = std::env::var_os("CARGO_FEATURE_FI_FP16PV").is_some();
         // 设备码代际 = Cargo feature(`arch-smXX`;单份 `.a` 取最高代)
         let fi_arch = single_arch();
         let force = env::var("FLASHINFER_FORCE_BUILD").ok().as_deref() == Some("1");
@@ -1365,10 +1370,11 @@ fn build_flashinfer() {
         let lib = fi_dir.join("libowl_flashinfer.a");
         let log_flags = log_defines();
         let flags = format!(
-            "fi arch={} nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.7.2.post1 split=2tu log={} dev={}",
+            "fi arch={} nvcc={nvcc_m} ar={ar} inc={fi_include} src=upstream-0.7.2.post1 split=2tu log={} dev={} fp16pv={}",
             fi_arch.as_sm(),
             log_enabled(),
-            std::env::var_os("OWL_LOG_DEVICE").is_some()
+            std::env::var_os("OWL_LOG_DEVICE").is_some(),
+            fi_fp16pv
         );
         let mut deps: Vec<String> = vec![
             src_f16.to_string(),
@@ -1408,6 +1414,9 @@ fn build_flashinfer() {
                     "-o".into(),
                     obj.to_str().unwrap().to_string(),
                 ];
+                if fi_fp16pv && src != src_ragged {
+                    args.push("-DOWL_FP16_PV=1".into());
+                }
                 args.extend(log_flags.iter().cloned());
                 jobs.push((src.to_string(), obj, args));
             }

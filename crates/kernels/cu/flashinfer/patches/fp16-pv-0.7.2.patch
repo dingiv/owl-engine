@@ -1,0 +1,408 @@
+diff --git a/crates/kernels/cu/flashinfer/include/flashinfer/attention/prefill.cuh b/crates/kernels/cu/flashinfer/include/flashinfer/attention/prefill.cuh
+index 55e74d91..ed6dd245 100644
+--- a/crates/kernels/cu/flashinfer/include/flashinfer/attention/prefill.cuh
++++ b/crates/kernels/cu/flashinfer/include/flashinfer/attention/prefill.cuh
+@@ -1003,17 +1003,88 @@ __device__ __forceinline__ void init_shared_rope_freq(
+   }
+ }
+ 
++// ---------------------------------------------------------------------------
++// owl FP16-PV experiment (2026-11-02)
++//
++// FlashAmpere's `flashinfer_fp16pv` recipe: accumulate the PV fragment in pure
++// half (`f16f16f16` HMMA, 4 regs/fragment) instead of float (8 regs), then
++// materialize back to the kept float `o_frag[8]` after the KV loop.  On GA10x
++// consumer Ampere the fp16-accum HMMA runs at 2x the fp32-accum rate, and at
++// hd256 the fp32 accumulator is what pushes the kernel into the 255-reg cap
++// with stack spill.  The spill relief is the dominant effect.
++//
++// Gate: compile-time `OWL_FP16_PV` (build.rs, experiment only) AND DTypeQ=half.
++// bf16 MUST NOT take this path: f16f16f16 would read bf16 bits as fp16.
++// VO-split (fp4 hd>=512) keeps the original fp32 path; owl's production hd256
++// f16/fp8 prefill is the non-VO-split path.
++// ---------------------------------------------------------------------------
++#ifndef OWL_FP16_PV
++#define OWL_FP16_PV 0
++#endif
++
++#if defined(__CUDA_ARCH__) && (OWL_FP16_PV != 0)
++// 只验证过 GeForce GA10x(sm_86)。A100/A40/A6000 的 fp32 累加全速,
++// 且 fp16 累加精度更低;sm_89 也未验证。别用 `>=860` 当判据。
++static_assert(__CUDA_ARCH__ == 860, "OWL_FP16_PV is only validated for sm_86");
++#endif
++
++template <typename KTraits>
++inline constexpr bool owl_pv16_v =
++    (OWL_FP16_PV != 0) && std::is_same_v<typename KTraits::DTypeQ, half> &&
++    (std::is_same_v<typename KTraits::DTypeKV, half> ||
++     sizeof(typename KTraits::DTypeKV) == 1) &&
++    !KTraits::USE_VO_SPLIT;
++template <typename KTraits>
++using OwlOFragT =
++    std::conditional_t<owl_pv16_v<KTraits>, uint32_t, float>;
++template <typename KTraits>
++inline constexpr uint32_t OWL_O_NREG = owl_pv16_v<KTraits> ? 4u : 8u;
++
++/// Convert the accumulator (half-packed or float) into the float fragment the
++/// downstream sync/transform/write helpers expect.  The half path's register
++/// order is C[0..3] = (row r, cols 0/1), (row r+8, cols 0/1), (row r, cols 8/9),
++/// (row r+8, cols 8/9); materializing half2[i] into floats [2i,2i+1] preserves
++/// that order, matching the original float C[8] layout.
++template <typename KTraits, uint32_t NQ, uint32_t ND>
++__device__ __forceinline__ void owl_materialize_o_frag(
++    const OwlOFragT<KTraits> (&o_acc)[NQ][ND][OWL_O_NREG<KTraits>],
++    float (&o_frag)[NQ][ND][8]) {
++#pragma unroll
++  for (uint32_t mma_q = 0; mma_q < NQ; ++mma_q) {
++#pragma unroll
++    for (uint32_t mma_d = 0; mma_d < ND; ++mma_d) {
++      if constexpr (owl_pv16_v<KTraits>) {
++#pragma unroll
++        for (uint32_t h = 0; h < 4; ++h) {
++          const float2 f = __half22float2(((const half2*)o_acc[mma_q][mma_d])[h]);
++          o_frag[mma_q][mma_d][h * 2 + 0] = f.x;
++          o_frag[mma_q][mma_d][h * 2 + 1] = f.y;
++        }
++      } else {
++#pragma unroll
++        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
++          o_frag[mma_q][mma_d][reg_id] = o_acc[mma_q][mma_d][reg_id];
++        }
++      }
++    }
++  }
++}
++
+ template <typename KTraits>
+ __device__ __forceinline__ void init_states(typename KTraits::AttentionVariant variant,
+-                                            float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8],
++                                            OwlOFragT<KTraits> (*o_frag)[KTraits::NUM_MMA_D_VO_TILE]
++                                                                  [OWL_O_NREG<KTraits>],
+                                             typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2]) {
+ #pragma unroll
+   for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+ #pragma unroll
+     for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
++      if constexpr (owl_pv16_v<KTraits>) {
+ #pragma unroll
+-      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+-        o_frag[mma_q][mma_d][reg_id] = 0.f;
++        for (uint32_t reg_id = 0; reg_id < 4; ++reg_id) o_frag[mma_q][mma_d][reg_id] = 0u;
++      } else {
++#pragma unroll
++        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) o_frag[mma_q][mma_d][reg_id] = 0.f;
+       }
+     }
+   }
+@@ -1753,8 +1824,8 @@ template <typename KTraits>
+ __device__ __forceinline__ void update_mdo_states(
+     typename KTraits::AttentionVariant variant,
+     typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+-    float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], typename KTraits::DTypeQKAccum (*m)[2],
+-    float (*d)[2]) {
++    OwlOFragT<KTraits> (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][OWL_O_NREG<KTraits>],
++    typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2]) {
+   using DTypeQKAccum = typename KTraits::DTypeQKAccum;
+   using AttentionVariant = typename KTraits::AttentionVariant;
+   constexpr bool use_softmax = AttentionVariant::use_softmax;
+@@ -1784,10 +1855,18 @@ __device__ __forceinline__ void update_mdo_states(
+           d[mma_q][j] *= o_scale;
+ #pragma unroll
+           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
+-            o_frag[mma_q][mma_d][j * 2 + 0] *= o_scale;
+-            o_frag[mma_q][mma_d][j * 2 + 1] *= o_scale;
+-            o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale;
+-            o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
++            if constexpr (owl_pv16_v<KTraits>) {
++              const half2 os2 = __half2half2(__float2half(o_scale));
++              ((half2*)o_frag[mma_q][mma_d])[j] =
++                  __hmul2(((half2*)o_frag[mma_q][mma_d])[j], os2);
++              ((half2*)o_frag[mma_q][mma_d])[j + 2] =
++                  __hmul2(((half2*)o_frag[mma_q][mma_d])[j + 2], os2);
++            } else {
++              o_frag[mma_q][mma_d][j * 2 + 0] *= o_scale;
++              o_frag[mma_q][mma_d][j * 2 + 1] *= o_scale;
++              o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale;
++              o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
++            }
+           }
+ #pragma unroll
+           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+@@ -1829,10 +1908,18 @@ __device__ __forceinline__ void update_mdo_states(
+           d[mma_q][j] *= o_scale;
+ #pragma unroll
+           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
+-            o_frag[mma_q][mma_d][j * 2 + 0] *= o_scale;
+-            o_frag[mma_q][mma_d][j * 2 + 1] *= o_scale;
+-            o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale;
+-            o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
++            if constexpr (owl_pv16_v<KTraits>) {
++              const half2 os2 = __half2half2(__float2half(o_scale));
++              ((half2*)o_frag[mma_q][mma_d])[j] =
++                  __hmul2(((half2*)o_frag[mma_q][mma_d])[j], os2);
++              ((half2*)o_frag[mma_q][mma_d])[j + 2] =
++                  __hmul2(((half2*)o_frag[mma_q][mma_d])[j + 2], os2);
++            } else {
++              o_frag[mma_q][mma_d][j * 2 + 0] *= o_scale;
++              o_frag[mma_q][mma_d][j * 2 + 1] *= o_scale;
++              o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale;
++              o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
++            }
+           }
+           half2 m2s = make_half2(m_scaled_h, m_scaled_h);
+ #pragma unroll
+@@ -1852,7 +1939,8 @@ template <typename KTraits, bool REPACK_BF16 = false>
+ __device__ __forceinline__ void compute_sfm_v(
+     smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t* v_smem_offset_r, uint8_t* v_sf_smem,
+     uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+-    float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], float (*d)[2], const uint32_t d_base = 0) {
++    OwlOFragT<KTraits> (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][OWL_O_NREG<KTraits>],
++    float (*d)[2], const uint32_t d_base = 0) {
+   constexpr uint32_t UPCAST_STRIDE_V = KTraits::UPCAST_STRIDE_V;
+   // When reading from the BF16 repack buffer, V is native 16-bit.
+   constexpr uint32_t VV_STRIDE = REPACK_BF16 ? KTraits::REPACK_STRIDE_VO : UPCAST_STRIDE_V;
+@@ -1937,7 +2025,15 @@ __device__ __forceinline__ void compute_sfm_v(
+         const uint32_t mma_d_local = mma_d - d_base;
+ #pragma unroll
+         for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+-          if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
++          if constexpr (owl_pv16_v<KTraits>) {
++            if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
++              mma::mma_sync_m16n16k16_row_col_f16f16f16(
++                  o_frag[mma_q][mma_d_local], (uint32_t*)s_frag_f16[mma_q][mma_kv], b_frag);
++            } else {
++              mma::mma_sync_m16n16k16_row_col_f16f16f16(
++                  o_frag[mma_q][mma_d_local], (uint32_t*)s_frag[mma_q][mma_kv], b_frag);
++            }
++          } else if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
+             mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
+                 o_frag[mma_q][mma_d_local], (uint32_t*)s_frag_f16[mma_q][mma_kv], b_frag);
+           } else {
+@@ -2365,7 +2461,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
+     constexpr uint32_t O_FRAG_D = KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT
+                                       ? KTraits::NUM_MMA_D_VO_PER_WARP
+                                       : KTraits::NUM_MMA_D_VO_TILE;
+-    alignas(16) float o_frag[NUM_MMA_Q][O_FRAG_D][8];
++    alignas(16) OwlOFragT<KTraits> o_acc[NUM_MMA_Q][O_FRAG_D][OWL_O_NREG<KTraits>];
+     [[maybe_unused]] float o_scale[NUM_MMA_Q][2];
+     DTypeQKAccum m[NUM_MMA_Q][2];
+     float d[NUM_MMA_Q][2];
+@@ -2409,7 +2505,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
+ #pragma unroll
+           for (uint32_t local_d = 0; local_d < KTraits::NUM_MMA_D_VO_PER_WARP; ++local_d) {
+ #pragma unroll
+-            for (uint32_t reg = 0; reg < 8; ++reg) o_frag[mma_q][local_d][reg] = 0.f;
++            for (uint32_t reg = 0; reg < 8; ++reg) o_acc[mma_q][local_d][reg] = 0.f;
+           }
+ #pragma unroll
+           for (uint32_t j = 0; j < 2; ++j) {
+@@ -2418,7 +2514,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
+           }
+         }
+       } else {
+-        init_states<KTraits>(variant, o_frag, m, d);
++        init_states<KTraits>(variant, o_acc, m, d);
+       }
+       uint32_t q_smem_offset_r = qo_smem.template get_permuted_offset<UPCAST_STRIDE_Q>(
+           get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
+@@ -2585,7 +2681,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
+                                            get_warp_idx_kv<KTraits>(tid.z),
+                                            get_warp_idx_q<KTraits>(tid.y), lane_idx);
+         } else {
+-          update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
++          update_mdo_states<KTraits>(variant, s_frag, o_acc, m, d);
+         }
+ 
+         block.sync();
+@@ -2611,7 +2707,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
+         if constexpr (KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT) {
+           const uint32_t warp_vo_base =
+               get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP;
+-          vosplit_compute_pv<KTraits>(&smem_storage, o_frag, o_scale, warp_vo_base,
++          vosplit_compute_pv<KTraits>(&smem_storage, o_acc, o_scale, warp_vo_base,
+                                       get_warp_idx_q<KTraits>(tid.y), lane_idx);
+         } else if constexpr (kRepackActive) {
+           // Dequantize one-byte V -> 16-bit staging smem (shuffle-free), then read native 16-bit.
+@@ -2623,13 +2719,13 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
+               &v_smem_bf16, &v_smem_offset_r_bf16,
+               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                          16 * KTraits::NUM_MMA_D_VO),
+-              lane_idx, s_frag, o_frag, d, d_base);
++              lane_idx, s_frag, o_acc, d, d_base);
+         } else {
+           compute_sfm_v<KTraits>(
+               &v_smem, &v_smem_offset_r,
+               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                          16 * KTraits::NUM_MMA_D_VO),
+-              lane_idx, s_frag, o_frag, d, d_base);
++              lane_idx, s_frag, o_acc, d, d_base);
+         }
+ 
+         block.sync();
+@@ -2655,11 +2751,13 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
+       finalize_m<KTraits>(variant, m);
+ 
+       if constexpr (KTraits::USE_SINGLE_PREFILL_SOFTMAX_VO_SPLIT) {
+-        vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
++        vosplit_write_o<KTraits>(o_acc, d, o_ptr_base, qo_packed_idx_base, qo_len,
+                                  partition_kv ? num_chunks * o_stride_n : o_stride_n, o_stride_h,
+                                  get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
+                                  group_size, lane_idx);
+       } else {
++        alignas(16) float o_frag[NUM_MMA_Q][O_FRAG_D][8];
++        owl_materialize_o_frag<KTraits>(o_acc, o_frag);
+         // threadblock synchronization
+         threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
+ 
+@@ -3049,7 +3147,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
+     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
+     constexpr uint32_t O_FRAG_D =
+         KTraits::USE_SOFTMAX_VO_SPLIT ? KTraits::NUM_MMA_D_VO_PER_WARP : KTraits::NUM_MMA_D_VO_TILE;
+-    alignas(16) float o_frag[NUM_MMA_Q][O_FRAG_D][8];
++    alignas(16) OwlOFragT<KTraits> o_acc[NUM_MMA_Q][O_FRAG_D][OWL_O_NREG<KTraits>];
+     [[maybe_unused]] float o_scale[NUM_MMA_Q][2];
+     DTypeQKAccum m[NUM_MMA_Q][2];
+     float d[NUM_MMA_Q][2];
+@@ -3100,7 +3198,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
+ #pragma unroll
+           for (uint32_t local_d = 0; local_d < KTraits::NUM_MMA_D_VO_PER_WARP; ++local_d) {
+ #pragma unroll
+-            for (uint32_t reg = 0; reg < 8; ++reg) o_frag[mma_q][local_d][reg] = 0.f;
++            for (uint32_t reg = 0; reg < 8; ++reg) o_acc[mma_q][local_d][reg] = 0.f;
+           }
+ #pragma unroll
+           for (uint32_t j = 0; j < 2; ++j) {
+@@ -3109,7 +3207,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
+           }
+         }
+       } else {
+-        init_states<KTraits>(variant, o_frag, m, d);
++        init_states<KTraits>(variant, o_acc, m, d);
+       }
+       uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
+           get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
+@@ -3296,7 +3394,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
+                                            get_warp_idx_kv<KTraits>(tid.z),
+                                            get_warp_idx_q<KTraits>(tid.y), lane_idx);
+         } else {
+-          update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
++          update_mdo_states<KTraits>(variant, s_frag, o_acc, m, d);
+         }
+ 
+         block.sync();
+@@ -3322,7 +3420,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
+         if constexpr (KTraits::USE_SOFTMAX_VO_SPLIT) {
+           const uint32_t warp_vo_base =
+               get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP;
+-          vosplit_compute_pv<KTraits>(&smem_storage, o_frag, o_scale, warp_vo_base,
++          vosplit_compute_pv<KTraits>(&smem_storage, o_acc, o_scale, warp_vo_base,
+                                       get_warp_idx_q<KTraits>(tid.y), lane_idx);
+         } else if constexpr (kRepackActive) {
+           // Dequantize one-byte V -> 16-bit staging smem (shuffle-free), then read native 16-bit.
+@@ -3334,13 +3432,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
+               &v_smem_bf16, &v_smem_offset_r_bf16,
+               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                          16 * KTraits::NUM_MMA_D_VO),
+-              lane_idx, s_frag, o_frag, d, d_base);
++              lane_idx, s_frag, o_acc, d, d_base);
+         } else {
+           compute_sfm_v<KTraits>(
+               &v_smem, &v_smem_offset_r,
+               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                          16 * KTraits::NUM_MMA_D_VO),
+-              lane_idx, s_frag, o_frag, d, d_base);
++              lane_idx, s_frag, o_acc, d, d_base);
+         }
+ 
+         block.sync();
+@@ -3368,11 +3466,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
+       const uint32_t num_kv_chunks =
+           ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+       if constexpr (KTraits::USE_SOFTMAX_VO_SPLIT) {
+-        vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
++        vosplit_write_o<KTraits>(o_acc, d, o_ptr_base, qo_packed_idx_base, qo_len,
+                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
+                                  get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
+                                  group_size, lane_idx);
+       } else {
++        alignas(16) float o_frag[NUM_MMA_Q][O_FRAG_D][8];
++        owl_materialize_o_frag<KTraits>(o_acc, o_frag);
+         // threadblock synchronization
+         threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
+ 
+@@ -3837,7 +3937,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+     // regs (no 256-reg wall).
+     constexpr uint32_t O_FRAG_D =
+         KTraits::USE_VO_SPLIT ? KTraits::NUM_MMA_D_VO_PER_WARP : KTraits::NUM_MMA_D_VO_TILE;
+-    alignas(16) float o_frag[NUM_MMA_Q][O_FRAG_D][8];
++    alignas(16) OwlOFragT<KTraits> o_acc[NUM_MMA_Q][O_FRAG_D][OWL_O_NREG<KTraits>];
+     [[maybe_unused]] float o_scale[NUM_MMA_Q][2];  // VO-split online rescale (per KV tile)
+     DTypeQKAccum m[NUM_MMA_Q][2];
+     float d[NUM_MMA_Q][2];
+@@ -3891,7 +3991,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+ #pragma unroll
+           for (uint32_t local_d = 0; local_d < KTraits::NUM_MMA_D_VO_PER_WARP; ++local_d) {
+ #pragma unroll
+-            for (uint32_t reg = 0; reg < 8; ++reg) o_frag[mma_q][local_d][reg] = 0.f;
++            for (uint32_t reg = 0; reg < 8; ++reg) o_acc[mma_q][local_d][reg] = 0.f;
+           }
+ #pragma unroll
+           for (uint32_t j = 0; j < 2; ++j) {
+@@ -3900,7 +4000,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+           }
+         }
+       } else {
+-        init_states<KTraits>(variant, o_frag, m, d);
++        init_states<KTraits>(variant, o_acc, m, d);
+       }
+       uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
+           get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
+@@ -4210,7 +4310,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+                                            get_warp_idx_kv<KTraits>(tid.z),
+                                            get_warp_idx_q<KTraits>(tid.y), lane_idx);
+         } else {
+-          update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
++          update_mdo_states<KTraits>(variant, s_frag, o_acc, m, d);
+         }
+ 
+         block.sync();
+@@ -4238,7 +4338,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+         if constexpr (KTraits::USE_VO_SPLIT) {
+           const uint32_t warp_vo_base =
+               get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP;
+-          vosplit_compute_pv<KTraits>(&smem_storage, o_frag, o_scale, warp_vo_base,
++          vosplit_compute_pv<KTraits>(&smem_storage, o_acc, o_scale, warp_vo_base,
+                                       get_warp_idx_q<KTraits>(tid.y), lane_idx);
+         } else if constexpr (kRepackActive) {
+           // Dequantize one-byte V -> 16-bit staging smem (shuffle-free), then read native 16-bit.
+@@ -4250,13 +4350,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+               &v_smem_bf16, &v_smem_offset_r_bf16,
+               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                          16 * KTraits::NUM_MMA_D_VO),
+-              lane_idx, s_frag, o_frag, d, d_base);
++              lane_idx, s_frag, o_acc, d, d_base);
+         } else {
+           compute_sfm_v<KTraits>(
+               &v_smem, &v_smem_offset_r,
+               smem_storage.v_sf_smem_ptr(get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV *
+                                          16 * KTraits::NUM_MMA_D_VO),
+-              lane_idx, s_frag, o_frag, d, d_base);
++              lane_idx, s_frag, o_acc, d, d_base);
+         }
+ 
+         block.sync();
+@@ -4294,11 +4394,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+           ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+ 
+       if constexpr (KTraits::USE_VO_SPLIT) {
+-        vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
++        vosplit_write_o<KTraits>(o_acc, d, o_ptr_base, qo_packed_idx_base, qo_len,
+                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
+                                  get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP,
+                                  group_size, lane_idx);
+       } else {
++        alignas(16) float o_frag[NUM_MMA_Q][O_FRAG_D][8];
++        owl_materialize_o_frag<KTraits>(o_acc, o_frag);
+         // threadblock synchronization
+         threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
+ 
