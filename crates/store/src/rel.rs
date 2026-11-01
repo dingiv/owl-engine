@@ -869,6 +869,43 @@ impl Rel {
             .unwrap_or(0)
     }
 
+    /// **账上活内容的盘上路径**(磁盘清理白名单;绝不禁删)。
+    /// = 盘层 resident 的全部路径(账内内容),外加快照腿。
+    pub fn disk_live_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        let mut out = std::collections::HashSet::new();
+        if let Some(d) = self.disk.as_ref() {
+            for k in d.resident_keys() {
+                if let Some(p) = d.path_of(k) {
+                    out.insert(p.to_path_buf());
+                }
+            }
+        }
+        out
+    }
+
+    /// **快照盘层账上路径**(清理白名单)。
+    pub fn snap_disk_live_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        let mut out = std::collections::HashSet::new();
+        if let Some(d) = self.snap_disk.as_ref() {
+            for k in d.resident_keys() {
+                if let Some(p) = d.path_of(k) {
+                    out.insert(p.to_path_buf());
+                }
+            }
+        }
+        out
+    }
+
+    /// **盘层账上实占字节**(诊断;与物理实占对账用)。
+    pub fn disk_used_bytes(&self) -> usize {
+        self.disk.as_ref().map(|d| d.used_bytes()).unwrap_or(0)
+    }
+
+    /// **快照盘层账上实占字节**(诊断)。
+    pub fn snap_disk_used_bytes(&self) -> usize {
+        self.snap_disk.as_ref().map(|d| d.used_bytes()).unwrap_or(0)
+    }
+
     /// **快照盘层的保护集**(boot 配额对账用):账上仍在(Disk/Host/Gpu 任一)
     /// 的快照文件路径 —— 它们还能当复用锚点,对账时排最后删。
     pub fn snap_disk_protected_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {

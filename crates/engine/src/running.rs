@@ -2952,7 +2952,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         &mut self,
         chain: owl_store::ChainHash,
     ) -> Result<Option<owl_store::SpillPlanOf<owl_store::ChainHash>>> {
-        for attempt in 0..2 {
+        // 三轮:① 直接 plan ② 账内 LRU 腾位后重试 ③ 清未入账后重试
+        for attempt in 0..3 {
             let r = self
                 .bank
                 .rel
@@ -2962,8 +2963,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                 .plan_spill(chain);
             match r {
                 Ok(p) => return Ok(Some(p)),
-                Err(owl_store::StoreError::Exhausted(_)) if attempt == 0 => {
-                    let need = self.bank.rel.disk.as_ref().expect("判过").block_bytes();
+                Err(owl_store::StoreError::Exhausted(_)) if attempt < 2 => {
+                    // 腾够**能写进这一块**的量:超配额部分(used − budget,启动期
+                    // 全量回填会把 used 顶到配额之上)+ 本次一块。
+                    let block = self.bank.rel.disk.as_ref().expect("判过").block_bytes();
+                    let over = self
+                        .bank
+                        .rel
+                        .disk_used_bytes()
+                        .saturating_sub(self.boot.cfg.knobs.disk_cache_mb << 20);
+                    let need = over.saturating_add(block);
                     let evp = self
                         .bank
                         .rel
@@ -2972,7 +2981,40 @@ impl<D: DeviceClient> RunningEngine<D> {
                         .expect("判过")
                         .plan_evict(need, &[]);
                     if evp.victims.is_empty() {
-                        return Ok(None);
+                        // **账内 LRU 腾不动 ⇒ 清"未入账"的盘上文件**
+                        // (2026-11-01 用户裁决:删除时机 = 这里,不是 boot)。
+                        // 未入账 = 本进程永远用不到的(坏尺寸/重复/外来/孤儿),
+                        // 它们不在账 ⇒ LRU 挑不到 ⇒ 配额被永久占死(vLLM 同类病)。
+                        let keep = self.bank.rel.disk_live_paths();
+                        let root = self
+                            .bank
+                            .rel
+                            .disk
+                            .as_ref()
+                            .expect("判过")
+                            .root()
+                            .to_path_buf();
+                        let sw = crate::disk_io::sweep_unaccounted(&root, &keep);
+                        if sw.removed > 0 {
+                            owl_shared::log_warn!(
+                                "store",
+                                "盘腾位:清掉未入账文件 {} 个 / {} MiB(簿记外的坏尺寸/重复/孤儿)",
+                                sw.removed,
+                                sw.bytes_freed >> 20
+                            );
+                            owl_shared::metrics::with_metrics_store(|m| {
+                                m.counter_add(
+                                    "store.disk.sweep_unaccounted",
+                                    sw.removed as u64,
+                                    file!(),
+                                    line!(),
+                                );
+                            });
+                        }
+                        if sw.remaining_bytes > 0 || sw.removed == 0 {
+                            return Ok(None); // 真没地方了 ⇒ 响亮放弃本次溢写(内容留在宿主)
+                        }
+                        continue; // 腾出来了一点,回到 for 里重试 plan_spill
                     }
                     let paths: Vec<std::path::PathBuf> =
                         evp.victims.iter().map(|(_, p)| p.clone()).collect();
@@ -3561,7 +3603,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             Err(e) => return Err(e.into()),
         };
         let mut plan = None;
-        for attempt in 0..2 {
+        // 三轮:① 直接 plan ② 账内 LRU 腾位(腾够"超配额 + 本块")③ 清未入账后重试
+        for attempt in 0..3 {
             let r = self
                 .bank
                 .rel
@@ -3574,14 +3617,20 @@ impl<D: DeviceClient> RunningEngine<D> {
                     plan = Some(p);
                     break;
                 }
-                Err(owl_store::StoreError::Exhausted(_)) if attempt == 0 => {
-                    let need = self
+                Err(owl_store::StoreError::Exhausted(_)) if attempt < 2 => {
+                    let block = self
                         .bank
                         .rel
                         .snap_disk
                         .as_ref()
                         .expect("判过")
                         .block_bytes();
+                    let over = self
+                        .bank
+                        .rel
+                        .snap_disk_used_bytes()
+                        .saturating_sub(self.boot.cfg.knobs.snap_disk_mb << 20);
+                    let need = over.saturating_add(block);
                     let evp = self
                         .bank
                         .rel
@@ -3590,6 +3639,26 @@ impl<D: DeviceClient> RunningEngine<D> {
                         .expect("判过")
                         .plan_evict(need, &[]);
                     if evp.victims.is_empty() {
+                        // 账内腾不动 ⇒ 清未入账(坏尺寸/重复/孤儿;删除时机 = 写盘时)
+                        let keep = self.bank.rel.snap_disk_live_paths();
+                        let root = self
+                            .bank
+                            .rel
+                            .snap_disk
+                            .as_ref()
+                            .expect("判过")
+                            .root()
+                            .to_path_buf();
+                        let sw = crate::disk_io::sweep_unaccounted(&root, &keep);
+                        if sw.removed > 0 {
+                            owl_shared::log_warn!(
+                                "store",
+                                "快照盘腾位:清掉未入账文件 {} 个 / {} MiB",
+                                sw.removed,
+                                sw.bytes_freed >> 20
+                            );
+                            continue; // 腾出来了一点 ⇒ 回 for 重试 plan_spill
+                        }
                         break;
                     }
                     let paths: Vec<std::path::PathBuf> =

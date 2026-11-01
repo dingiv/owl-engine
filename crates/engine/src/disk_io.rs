@@ -236,121 +236,67 @@ pub(crate) fn exists(p: &Path) -> bool {
     std::fs::metadata(p).is_ok()
 }
 
-/// **启动期磁盘配额对账**(2026-11-01;答"配置改小 / 没改也超限")。
+/// **清掉"未入账"的盘上文件**(2026-11-01 用户裁决:删除时机 = 写盘腾位时)。
 ///
-/// 现状(`DiskTier::adopt`)只做**隔离**:超预算 / 大小不符 / 重复键的文件
-/// **不删也不进账** ⇒ 物理占用可以永久大于配额,而且那些文件因为不在账里,
-/// `plan_evict` 的 LRU **永远挑不到**它们。换模型(块尺寸变)、崩在写盘半路
-/// (`.tmp` 残件)、索引丢失(孤儿)都会往这里堆 —— 这正是 vLLM 那类实现
-/// "缓存盘越跑越满、命中反而越来越差"的成因。
+/// 为什么要清:`DiskTier::adopt` 对「大小不符 / 重复键 / 外来物」只跳过不入账,
+/// 这些文件永远不在账里 ⇒ `plan_evict` 的 LRU 挑不到它们 ⇒ 配额被永久占死
+/// (vLLM 同类病)。但它们对**本进程毫无用处**,所以只要"这次写盘真的缺地方"了,
+/// 就可以按 mtime 最老先清。
 ///
-/// 本函数以**文件系统真值**为准做一次对账(与 store 的账无关):
-/// 1. **残件**:`*.tmp` 一律删(写盘是 tmp+rename,留下的必然是半成品);
-/// 2. **只在超配额时才删**:实占 ≤ 配额 ⇒ 一个不动(不打扰热内容);
-/// 3. 删除顺序 = **先不可用、再最老**:未被任何已采纳链引用的(`protected=false`)
-///    先删,同类内按 mtime 旧→新;
-/// 4. **绝不为凑配额删"已采纳链"的活内容** —— 全是被保护的还超 ⇒ 只报 ERROR
-///    (那是配额配置错,该由人改配置,不是引擎偷偷毁数据)。
+/// **调用时机**:只允许在 `plan_spill` / `plan_snap_*` 报 `Exhausted` 之后
+/// (即"要写盘、且账内 LRU 已经腾不动了"),**不许在 boot 期**主动调 —— 启动时
+/// 还不知道这一轮会用哪条链,删就是赌(实测:按扫描序删会把链根砍掉)。
 ///
-/// 幂等:可重复调用;多进程同目录并发时最坏重复删同一个文件(`NotFound` 忽略)。
-pub(crate) struct ReconcileReport {
-    pub tmp_removed: usize,
+/// `keep` = 账上仍有效的路径(含设备/宿主/盘任一层的活内容),**绝不删**;
+/// `.tmp` 一律算残件。返回 (删除文件数, 释放字节, 是否还有剩余未入账),
+/// `remaining_bytes > 0` 且没有可删的 ⇒ 调用方该响亮拒写盘。
+pub(crate) struct SweepReport {
     pub removed: usize,
     pub bytes_freed: u64,
-    pub kept_bytes: u64,
-    /// 删掉的**受保护**文件数(>0 = 配额不足已开始牺牲召回面,必须让人看见)
-    pub removed_protected: usize,
-    /// 被删文件的路径(调用方拿去出账/审计)
-    pub removed_paths: Vec<std::path::PathBuf>,
+    pub remaining_bytes: u64,
 }
 
-pub(crate) fn reconcile_dir(
+pub(crate) fn sweep_unaccounted(
     root: &std::path::Path,
-    quota_bytes: usize,
-    protected: &std::collections::HashSet<std::path::PathBuf>,
-) -> ReconcileReport {
-    use std::collections::HashSet;
-    let mut rep = ReconcileReport {
-        tmp_removed: 0,
+    keep: &std::collections::HashSet<std::path::PathBuf>,
+) -> SweepReport {
+    let mut rep = SweepReport {
         removed: 0,
         bytes_freed: 0,
-        kept_bytes: 0,
-        removed_protected: 0,
-        removed_paths: Vec::new(),
+        remaining_bytes: 0,
     };
-    // 注:`quota_bytes == 0` **仍清 tmp**(残件永远是垃圾),但不动 .bin。
-    let mut bins: Vec<(std::path::PathBuf, u64, std::time::SystemTime, bool)> = Vec::new();
     let Ok(rd) = std::fs::read_dir(root) else {
         return rep;
     };
+    let mut cands: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
     for e in rd.flatten() {
         let path = e.path();
         let name = e.file_name().to_string_lossy().to_string();
         if name.ends_with(".tmp") {
             if std::fs::remove_file(&path).is_ok() {
-                rep.tmp_removed += 1;
+                rep.removed += 1;
             }
             continue;
         }
-        if !name.ends_with(".bin") {
-            continue; // 索引/外来文件不动
+        if !name.ends_with(".bin") || keep.contains(&path) {
+            continue;
         }
         let Ok(md) = e.metadata() else { continue };
-        let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
-        let prot = protected.contains(&path);
-        bins.push((path, md.len(), mtime, prot));
+        let t = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+        cands.push((path, md.len(), t));
     }
-    if quota_bytes == 0 {
-        rep.kept_bytes = bins.iter().map(|b| b.1).sum();
-        return rep;
-    }
-    let total: u64 = bins.iter().map(|b| b.1).sum();
-    if total <= quota_bytes as u64 {
-        rep.kept_bytes = total;
-        return rep;
-    }
-    // 排序 = **先删不可用的,再删"尾巴"**:
-    // - 未保护(孤儿/外来):mtime 旧→新(越老越没价值);
-    // - 受保护(活链):mtime **新→旧** —— 删尾部才能保住"从头连续的可用前缀";
-    //   删链头 = 整条链再也对不上(实测过:无保护集按 mtime 删 ⇒ 重建 0 链)。
-    // 用 (组号, 时间戳) 排序:未保护组按时间**升序**,受保护组按时间**降序** ——
-    // 升/降用戳的取反表达(同一把 SystemTime 比较,避免两套键类型)。
-    bins.sort_by(|a, b| {
-        let (ga, gb) = (a.3 as u8, b.3 as u8);
-        ga.cmp(&gb).then_with(|| {
-            if a.3 {
-                b.2.cmp(&a.2) // 受保护:新的先删(保前缀)
-            } else {
-                a.2.cmp(&b.2) // 未保护:旧的后删(先删更老)
-            }
-        })
-    });
-    let mut live = total;
-    for (path, len, _, prot) in bins {
-        if live <= quota_bytes as u64 {
-            break;
-        }
-        if prot && rep.removed_protected > 0 {
-            // 已经开始牺牲活内容:同一批里只删到刚好够,但继续删也行 —— 这里保守:
-            // 只删到配额即停(上面的 live 判断),因此不会无差别清空
-        }
+    // 最老的先删:未入账内容对本进程没有价值,越老越可能早被取代
+    cands.sort_by_key(|(_, _, t)| *t);
+    for (path, len, _) in cands {
         match std::fs::remove_file(&path) {
             Ok(()) => {
-                live -= len;
                 rep.removed += 1;
                 rep.bytes_freed += len;
-                rep.removed_paths.push(path);
-                if prot {
-                    rep.removed_protected += 1;
-                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                live -= len; // 并发/重入:已经没了,账照减
-            }
-            Err(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => rep.remaining_bytes += len,
         }
     }
-    rep.kept_bytes = live;
     rep
 }
 
