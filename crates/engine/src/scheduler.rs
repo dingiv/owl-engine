@@ -1196,6 +1196,14 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 在会话链上留 `PENDING_LOAD_PLACEHOLDER`，由**视图**选择 + `reconcile`
             // 按需 stage-in（稳态 `select_partial` 本来就有洞，沿同一条路）。
             let lazy_stage = self.boot.cfg.knobs.kvmem_virtualization && self.boot.cfg.knobs.select_partial;
+            // **复用面口径留痕**(2026-11-01 P1 收尾):裁到了多少 / 为什么裁,
+            // 是"重启后召回面腰斩"这类问题唯一的第一手事实(原来只有 cap 时打一行)。
+            owl_shared::log_info!(
+                "kvmem",
+                "复用面:matched={matched_raw} m_raw={m_raw} 池cap={cap} 余量={reserve} \
+                 max_hit={max_hit} lazy_stage={lazy_stage} 尾快照层={:?}",
+                recall.snap_tier
+            );
             let m = if !lazy_stage && m_raw > max_hit {
                 // 裁完还要**向下对齐到有快照的边界** —— `cached_len` 与 GDN 态
                 // 必须成对:`restore_snap` 拿不到快照会响亮失败,而不是静默错值。
@@ -1214,7 +1222,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                 owl_shared::log_warn!(
                     "kvmem",
                     "前缀命中面 {m_raw} 块 > 池可容 {max_hit}(池 {cap} 槽 − 新写/工作集 {reserve}) \
-                     ⇒ 裁到 {m} 块(对齐全场快照),尾部重算(否则回灌阶段必槽池耗尽)"
+                     ⇒ 裁到 {m} 块(对齐全场快照;自 {max_hit} 回退 {}),尾部重算",
+                    max_hit.saturating_sub(m)
                 );
                 owl_shared::counter_inc!("kvmem.prefix.hit_capped");
                 m

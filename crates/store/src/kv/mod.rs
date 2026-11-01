@@ -138,6 +138,17 @@ impl KvStore {
         self.pool.capacity()
     }
 
+    /// 树条目数(诊断:adopt 后对账 —— 树只能**从根连续**匹配,
+    /// 容量把根裁掉 = 复用面归零)。
+    pub fn tree_len(&self) -> usize {
+        self.tree.len()
+    }
+
+    /// 树容量上限(诊断)。
+    pub fn tree_cap(&self) -> usize {
+        self.tree.cap()
+    }
+
     /// 自由槽数。
     pub fn slots_free(&self) -> usize {
         self.pool.free()

@@ -756,6 +756,16 @@ async fn disk_checkpoint_survives_restart_without_host_pressure() {
                     _ => {}
                 }
             }
+            // **落盘在空转拍**(2026-11-01 收尾:turn 收口只登记)⇒ 推到 Idle 再查盘。
+            // 契约:服务面恒在泵,空转拍必然到来;测试必须照生产节奏把泵走完。
+            let mut idled = false;
+            for _ in 0..8 {
+                if let TurnEvent::Idle = running.pump().await.expect("pump→idle") {
+                    idled = true;
+                    break;
+                }
+            }
+            assert!(idled, "空转拍未到(checkpoint 无机会执行)");
             let bins = std::fs::read_dir(dir.join("kv"))
                 .map(|rd| {
                     rd.flatten()

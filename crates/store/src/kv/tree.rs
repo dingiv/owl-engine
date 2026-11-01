@@ -96,6 +96,11 @@ impl PrefixTree {
     }
 
     /// 条目数(驻留缓存块数)。
+    /// 容量上限(诊断;只读)。
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }

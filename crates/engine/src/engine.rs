@@ -1499,6 +1499,54 @@ pub(crate) fn into_running<D: DeviceClient>(
             } else {
                 0 // 没快照池 ⇒ 状态腿盘分片无意义(不许静默吃掉配额)
             };
+            // **状态腿盘预算按 world 记**(2026-11-01 收尾;盘上一条快照 =
+            // `snap_bytes × world`,TP2 就是两倍)。`[pool] snap_disk_mb` 给的是
+            // **字节预算**,而盘层按"一条快照 = 一个文件"落 ⇒ 能装几条 =
+            // `预算 / (snap_bytes × world)`。旧口径按单 rank 估 ⇒ 512 MiB 只装 3 条、
+            // 第 4 条起「超预算」逐条隔离(实测:锚点每轮在丢,跨重启召回被裁)。
+            // 这里**响亮点名**该给多少,不静默按更小的容量跑。
+            if snap_disk_bytes > 0 {
+                let per_file = dev.pool.snap_bytes().saturating_mul(b.rel.world());
+                let cap = dev.pool.snap_capacity();
+                let fit = per_file.max(1);
+                let n_fit = snap_disk_bytes / fit;
+                let need_mb = (per_file.saturating_mul(cap)).div_ceil(1 << 20);
+                if per_file > 0 && n_fit == 0 {
+                    return Err(owl_iface::contract::ModelError::Msg(format!(
+                        "[pool] snap_disk_mb={} 装不下**一条**快照:一条 = {}B(单 rank {} × world {})⇒ 至少要 {} MiB",
+                        cfg.knobs.snap_disk_mb,
+                        per_file,
+                        dev.pool.snap_bytes(),
+                        b.rel.world(),
+                        need_mb.max(1)
+                    )));
+                }
+                if n_fit < cap {
+                    owl_shared::log_warn!(
+                        "store",
+                        "快照盘预算偏小:{} MiB 只能装 {} 条(池容量 {} 条;一条 {} MiB = 单 rank {}B × world {})—— \
+                         到顶后新锚点逐条被隔离 ⇒ 跨重启召回面被裁。建议 snap_disk_mb ≥ {}",
+                        cfg.knobs.snap_disk_mb,
+                        n_fit,
+                        cap,
+                        per_file >> 20,
+                        dev.pool.snap_bytes(),
+                        b.rel.world(),
+                        need_mb.max(1)
+                    );
+                } else {
+                    owl_shared::log_info!(
+                        "store",
+                        "快照盘预算:{} MiB ⇒ 可容纳 {}/{} 条(一条 {} MiB = 单 rank {}B × world {})",
+                        cfg.knobs.snap_disk_mb,
+                        n_fit,
+                        cap,
+                        per_file >> 20,
+                        dev.pool.snap_bytes(),
+                        b.rel.world()
+                    );
+                }
+            }
             let attach = b.rel.attach_disk(
                 cfg.knobs.disk_dir.clone(),
                 cfg.knobs.disk_cache_mb << 20,
@@ -1550,6 +1598,16 @@ pub(crate) fn into_running<D: DeviceClient>(
                 }
             }
             let rep = b.rel.adopt_disk_chains(&idxs)?;
+            // **树容量对账**(2026-11-01 P1 收尾):adopt 之后树里到底留了几条、上限多少。
+            // 少了 = `cache_cap` 把链根裁掉(树只能从根连续匹配 ⇒ 复用面归零),
+            // 这是"盘上 3072 块却只匹到 184"这类问题的第一现场。
+            owl_shared::log_info!(
+                "store",
+                "树对账:adopt 后 entries={} cap={}(设备池 {} 槽 × 份额 + 宿主槽)",
+                b.rel.leg.tree_len(),
+                b.rel.leg.tree_cap(),
+                b.rel.leg.slots_total(),
+            );
             {
                 let kept: std::collections::HashSet<_> = rep.kept.iter().copied().collect();
                 let orphans: Vec<owl_store::ChainHash> = b
@@ -1564,6 +1622,14 @@ pub(crate) fn into_running<D: DeviceClient>(
                     })
                     .unwrap_or_default();
                 if !orphans.is_empty() {
+                    // **不再开箱即删**(2026-11-01 P1 收尾,踩过两次):
+                    // 链索引由 turn 收口**另写**,而内容由空转 checkpoint 写 —— 两者
+                    // 时序不同(索引可能落后/缺失/被截断),boot 期按"没被索引引用"
+                    // 就删 = **把 3 GiB 刚写好的内容连同复用面一起抹掉**
+                    // (实测:ckpt3 boot 清掉 3072 块 / 3.0 GiB ⇒ 重启召回彻底归零)。
+                    // 现口径:**只报不删** —— 盘配额由 `DiskTier` 的 LRU 负责回收
+                    // (真写不下时按最老逐),孤儿内容留在盘上顶多占配额,不会毁数据。
+                    // 想主动清就删目录(运维动作),引擎不代劳。
                     let paths: Vec<std::path::PathBuf> = b
                         .rel
                         .disk
@@ -1575,18 +1641,12 @@ pub(crate) fn into_running<D: DeviceClient>(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    for p in &paths {
-                        let _ = std::fs::remove_file(p);
-                    }
-                    let freed = b
-                        .rel
-                        .disk
-                        .as_mut()
-                        .map(|d| d.commit_evict(&orphans))
-                        .unwrap_or(0);
+                    let _ = &paths; // 只报不删(见上)
+                    let resident: u64 = orphans.len() as u64;
                     owl_shared::log_warn!(
                         "store",
-                        "盘上孤儿内容:清掉 {} 块 / {freed}B(无索引或索引截断;索引文件保留)",
+                        "盘上孤儿内容:{} 块未被任何链索引引用(**保留**,配额由 LRU 回收;\
+                         索引缺失/截断时删它 = 连复用面一起毁)",
                         orphans.len()
                     );
                 }

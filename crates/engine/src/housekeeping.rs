@@ -35,6 +35,10 @@ pub(crate) struct Housekeeping {
     batch_steps: u64,
     /// 上次 **KV 磁盘 checkpoint** 时刻(S6.2 墙钟节拍;`None` = 从未)
     last_kv_checkpoint: Option<Instant>,
+    /// **待执行的 checkpoint**(T9 收尾:turn 收口只**登记**,真正落盘挪到空转拍
+    /// —— 写 2400 MiB 要 5 s 量级,挂在收口上就是 agent 的尾延迟)。
+    /// 存 **tokens 快照**:空转拍会话可能已出表,而链取址只要 tokens。
+    pending_kv_checkpoint: Option<(u64, Vec<u32>)>,
 }
 
 impl Housekeeping {
@@ -69,6 +73,16 @@ impl Housekeeping {
     /// 记一次 KV checkpoint(按"尝试"计,空链也有节拍,避免每 turn 空转)。
     pub(crate) fn mark_kv_checkpoint(&mut self) {
         self.last_kv_checkpoint = Some(Instant::now());
+    }
+
+    /// **登记一次待落盘**(turn 收口调;不占收口时间)。
+    pub(crate) fn arm_kv_checkpoint(&mut self, sid: u64, tokens: Vec<u32>) {
+        self.pending_kv_checkpoint = Some((sid, tokens));
+    }
+
+    /// 取走待落盘(空转拍调;一次一拍,不排队 —— 同会话只留最新)。
+    pub(crate) fn take_kv_checkpoint(&mut self) -> Option<(u64, Vec<u32>)> {
+        self.pending_kv_checkpoint.take()
     }
 
     /// HostPressure 到点?(首拍 / 距上次 ≥ interval)

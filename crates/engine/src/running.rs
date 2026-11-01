@@ -1812,9 +1812,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 if !toks.is_empty() {
                     self.write_chain_index(&toks).await?;
                 }
-                // **S6.2 主动落盘**：索引之后 checkpoint 内容（配额小步、复制语义）。
-                // 位置在"会话尚在账"处 —— 出表之后拿不到整链 tokens。
-                self.maybe_checkpoint_kv(release.session).await?;
+                // **S6.2 主动落盘**:turn 收口只**登记**(2026-11-01 收尾)——
+                // 真正落盘挪到空转拍。理由:一次配额写 2400 MiB 是 5 s 量级,
+                // 挂在收口上直接变成 agent 的尾延迟;而空转拍没有人在等回包。
+                // 会话 tokens 在空转拍仍可取(会话未出表),不影响链取址。
+                self.hk.arm_kv_checkpoint(release.session, toks);
             }
             // **索引暂存排空**：正常 prefill 的末边界已清空；这里兜底
             // abort/短轮 —— 必须在 `release_turn_table` 之前采，物理页还在。
@@ -2971,7 +2973,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///    已写部分仍是合法前缀，多轮小步自然铺满整链。
     async fn checkpoint_session_kv(
         &mut self,
-        sid: u64,
+        tokens: &[u32],
         quota_bytes: usize,
     ) -> Result<CheckpointStats> {
         use owl_iface::contract::Connector as _; // `SlotTable::get` 是 trait 方法
@@ -2981,13 +2983,17 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(out);
         }
         let page = self.dev.pool.geom.page.max(1);
-        let tokens = match self.bank.sessions.get(sid) {
-            Some(s) => s.tokens.clone(),
-            None => return Ok(out),
-        };
+        // 空转拍执行 ⇒ 会话可能已出表:tokens 由收口**随登记带过来**(链取址只要它)
+        let tokens = tokens.to_vec();
         let full = tokens.len() / page; // 指整块前缀（尾残块不参与身份）
         if full == 0 {
             return Ok(out);
+        }
+        // **索引与内容成对**(2026-11-01):索引平时由 turn 收口写,而内容由本函数
+        // 在空转拍写 —— 两条时序不同 ⇒ 出现过"内容在、索引缺"⇒ 下次 boot 按孤儿
+        // 清掉(已改成只报不删)。这里顺手补写一次索引:幂等(同名覆盖),32 KB 级。
+        if let Err(e) = self.write_chain_index(&tokens).await {
+            owl_shared::log_warn!("store", "checkpoint 侧索引补写失败(内容仍写):{e}");
         }
         let Some(tail) = self.bank.rel.leg.tail_hash(&tokens, full) else {
             return Ok(out);
@@ -3155,7 +3161,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     /// **turn 收口的 checkpoint 调度**（门 + 节拍 + 日志/指标）。
-    async fn maybe_checkpoint_kv(&mut self, sid: u64) -> Result<()> {
+    async fn maybe_checkpoint_kv(&mut self, sid: u64, tokens: &[u32]) -> Result<()> {
         let quota_mb = self.boot.cfg.knobs.checkpoint_max_mb;
         if quota_mb == 0 || !self.bank.rel.disk_enabled() {
             return Ok(());
@@ -3170,7 +3176,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         self.hk.mark_kv_checkpoint();
         let t0 = std::time::Instant::now();
-        let st = self.checkpoint_session_kv(sid, quota_mb << 20).await?;
+        let st = self.checkpoint_session_kv(tokens, quota_mb << 20).await?;
         if st.blocks() > 0 || st.snap_disk {
             owl_shared::log_info!(
                 "store",
@@ -4077,6 +4083,14 @@ impl<D: DeviceClient> RunningEngine<D> {
                     }
                     if slots > 0 {
                         self.store_hook(StoreHook::idle(slots)).await?;
+                    }
+                }
+                // **待落盘的 KV checkpoint**(2026-11-01 收尾):空转拍执行,
+                // 一拍一个(不排队)。失败只 WARN —— 落盘是尽力而为,
+                // 不许把空转打断(下一拍还有机会,`checkpoint_min_gap_ms` 另管节拍)。
+                if let Some((sid, toks)) = self.hk.take_kv_checkpoint() {
+                    if let Err(e) = self.maybe_checkpoint_kv(sid, &toks).await {
+                        owl_shared::log_warn!("store", "空转 checkpoint 失败(session={sid:#x}): {e}");
                     }
                 }
                 // 准入拒(S3b §23.4)等 host 侧即时终态:先回吐再报 Idle ——

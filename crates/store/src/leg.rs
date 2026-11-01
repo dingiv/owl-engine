@@ -713,6 +713,15 @@ impl BlockLeg {
     }
 
     /// 自由槽数(engine 保洁水位用)。
+    /// 树条目数 / 容量上限 / 设备槽总量(诊断三连;**P1 收尾**留的口:
+    /// 树只能从根连续匹配,容量把根裁掉 = 跨重启复用面归零)。
+    pub fn tree_len(&self) -> usize {
+        self.kv.tree_len()
+    }
+    pub fn tree_cap(&self) -> usize {
+        self.kv.tree_cap()
+    }
+
     pub fn slots_free(&self) -> usize {
         self.kv.slots_free()
     }
