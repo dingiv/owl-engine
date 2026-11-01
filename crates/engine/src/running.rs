@@ -1609,7 +1609,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let grant = self.bank.rel.reserve_snap(act.id)?;
             self.bank
                 .rel
-                .consume_capacity(grant.id, 1, self.bank.rel.snap_bytes())?;
+                .consume_capacity(grant.id, 1, self.bank.rel.snap_file_bytes())?;
         }
         // **P1-2**：出序与容量票必须看到同一份保护面。
         let protect = self.snap_guard(extra_snaps, skip_turn);
@@ -1632,7 +1632,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     // **P0-2**:不再走“只搬 host、失败就 drop”的旁路；
                     // 用状态腿的同一张票（snap_bytes = 一条快照），
                     // host 满时会出 Disk 票，盘层因此可达。
-                    let snap_bytes = self.bank.rel.snap_bytes();
+                    let snap_bytes = self.bank.rel.snap_file_bytes();
                     if snap_bytes > 0 {
                         let applied = self
                             .pool_housekeeping(
@@ -1907,7 +1907,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // 状态腿目标 = 一条快照（宿主有位才要；宿主关/满时给 0，
                 // 不产生永远凑不够的 deny）
                 let snap_bytes = if self.bank.rel.snap_host_free_slots() > 0 {
-                    self.bank.rel.snap_bytes()
+                    self.bank.rel.snap_file_bytes()
                 } else {
                     0
                 };
@@ -2995,10 +2995,24 @@ impl<D: DeviceClient> RunningEngine<D> {
         if let Err(e) = self.write_chain_index(&tokens).await {
             owl_shared::log_warn!("store", "checkpoint 侧索引补写失败(内容仍写):{e}");
         }
-        let Some(tail) = self.bank.rel.leg.tail_hash(&tokens, full) else {
+        // **身份来源 = tokens**(2026-11-01 P1 定谳):盘上内容的键必须与
+        // `ChainIndex`(同样由 tokens 算)同源 —— 否则 boot 的
+        // `adopt_disk_chains` 逐块 `hash_block(idx.tokens)` 全不命中,内容被判
+        // 孤儿(实测 3072 块 / 3 GiB 白写,召回归零)。
+        //
+        // 旧实现取 `leg.chain_blocks(tail_hash(tokens))` = 走**树里的祖先链**:
+        // 树是"登记时的父链",与会话 tokens 在全量重算/前缀复用混档时可以分叉
+        // (实测:索引首块 h=10108759405911707094,盘上 3072 键里一个都没有)。
+        // ⇒ 现在两边统一由 tokens 逐块 `hash_block` 得到,树只当缓存索引。
+        let mut parent = owl_store::ChainHash::new(0);
+        let mut chain = Vec::with_capacity(full);
+        for block in tokens.chunks(page).take(full) {
+            parent = owl_store::hash_block(parent, block);
+            chain.push(parent);
+        }
+        let Some(&tail) = chain.last() else {
             return Ok(out);
         };
-        let chain = self.bank.rel.leg.chain_blocks(tail); // root → tail
         let Some(blk) = self.bank.rel.disk.as_ref().map(|d| d.block_bytes()) else {
             return Ok(out);
         };
@@ -3092,7 +3106,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                 owl_store::recycle_read_plan(&mut self.bank.rel.leg, t);
             }
         }
-        out.bytes = (out.dev_blocks + out.host_blocks) * blk;
+        let wrote = out.dev_blocks + out.host_blocks;
+        out.bytes = wrote * blk;
         // ⑥ **尾部边界快照必须一起落盘**（否则召回等于 0）。
         //
         // 为什么：`reuse_face` 要求复用面的**尾边界有 GDN 快照**（混合模型的
@@ -3103,7 +3118,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 语义上快照用**搬家**（设备/宿主 → 盘），不是复制：一份 148 MiB，
         // 复制会白吃宿主；丢掉的快照是可重建的锚点（复用点变近，不是错值），
         // 下次命中由 `fill_snap_from_disk` 回填。
-        out.snap_disk = self.checkpoint_tail_snap(tail).await?;
+        // **窗口内所有 Durable 锚点都落盘**(2026-11-01 P1 收尾)。
+        //
+        // 旧实现只落**链尾那一张** ⇒ `reuse_face` 从命中面尾部往回找快照时,
+        // 只有尾边界可用/或者干脆没有(实测 `m_raw=1398/3072`,尾快照层=None);
+        // 复用面被削到 1/3。这里按"已写进盘的块前缀"逐个边界落盘,
+        // 盘不够就停(配额由 snap_disk 管,谁先到顶谁截断)。
+        out.snap_disk = self.checkpoint_prefix_snaps(&chain[..wrote]).await?;
         Ok(out)
     }
 
@@ -3244,6 +3265,58 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         }
         Ok(false)
+    }
+
+    /// **把已 checkpoint 前缀里的所有 Durable 锚点落盘**(2026-11-01)。
+    ///
+    /// 为什么不能只落尾:`reuse_face` 要求复用面的**尾边界有快照**,
+    /// 而它从命中面尾部往回走到最近一个在场锚点 —— 只有尾锚点时复用面
+    /// 会被削到口径之外(实测 3072 → 1398 块)。逐边界落盘 ⇒ 每个
+    /// 页对齐的锚点都能当复用点。
+    ///
+    /// 顺序:自尾向头(近端优先,盘配额先给最近用得上的);
+    /// 配额到顶即停(`spill_snap_to_disk` 返回 false),不静默扩容。
+    async fn checkpoint_prefix_snaps(&mut self, prefix: &[owl_store::ChainHash]) -> Result<bool> {
+        use owl_store::state::SnapDurability;
+        use owl_store::Tier;
+        if self.bank.rel.snap_disk.is_none() {
+            return Ok(false);
+        }
+        let mut any = false;
+        for h in prefix.iter().rev() {
+            let key = owl_store::SnapKey::at_boundary(*h);
+            if self.bank.rel.state.snap_durability(key) != Some(SnapDurability::Durable) {
+                continue;
+            }
+            let moved = match self.bank.rel.state.locate(key) {
+                Some(Tier::Disk) => true, // 已在盘(=可当复用点)
+                Some(Tier::Host) => self.spill_snap_to_disk(key).await?,
+                Some(Tier::Gpu) => {
+                    let Some(slot) = self.dev.pool.snap_slot_of(key) else {
+                        continue;
+                    };
+                    self.snap_offload(key, slot).await?;
+                    self.dev.pool.snap_clear_slot(slot);
+                    if let Some(pr) = self.peer.as_mut() {
+                        pr.pool.snap_clear_slot(slot);
+                    }
+                    self.spill_snap_to_disk(key).await?
+                }
+                None => continue, // 已被取代/逐出
+            };
+            if moved {
+                any = true;
+            } else {
+                // 配额到顶(或该张已不 Durable)⇒ 近端已尽力,停
+                owl_shared::log_info!(
+                    "store",
+                    "锚点落盘在边界 {:?} 停(盘配额到顶,前缀里其余锚点下次再落)",
+                    h
+                );
+                break;
+            }
+        }
+        Ok(any)
     }
 
     /// **写盘上链索引**(S6.1;turn 收口一次,同 tail 幂等)。

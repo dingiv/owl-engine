@@ -589,6 +589,27 @@ impl Rel {
                 ok += 1;
             }
             if ok == 0 {
+                // **身份对拍诊断**(2026-11-01 P1):索引算出的前几个块身份 vs 盘上
+                // 真实键 —— "盘上有内容却一块都不认"时,这一行直接给谁对不上。
+                if let (Some(first), Some(disk_keys)) = (
+                    idx.tokens.chunks(page).next(),
+                    Some(disk.resident_keys()),
+                ) {
+                    let h0 = crate::kv::hash_block(ChainHash::new(0), first);
+                    let sample: Vec<String> = disk_keys
+                        .iter()
+                        .take(3)
+                        .map(|k| format!("{k:?}"))
+                        .collect();
+                    owl_shared::log_warn!(
+                        "store",
+                        "身份对拍:索引首块 h={h0:?}(tokens[0..{page}]) 盘上含={} · \
+                         盘前 3 键={sample:?} · 盘上块数={} · 索引块数={}",
+                        disk.contains(h0),
+                        disk_keys.len(),
+                        idx.blocks(),
+                    );
+                }
                 rep.skipped.push((
                     format!("{} 块", idx.blocks()),
                     "盘上一块内容都没有(索引孤儿)".to_string(),
@@ -782,15 +803,29 @@ impl Rel {
     /// 状态腿宿主层**还能装几条快照**。
     pub fn snap_host_free_slots(&self) -> usize {
         let used = self.snap_host.used_bytes() + self.snap_host.free_bytes();
-        self.snap_host.budget_bytes().saturating_sub(used) / self.snap_bytes.max(1)
+        self.snap_host
+            .budget_bytes()
+            .saturating_sub(used)
+            / self.snap_file_bytes().max(1)
     }
 
     /// 状态腿宿主层总槽数(= 预算 / 单条快照字节;0 = 关层)。
     pub fn snap_host_total_slots(&self) -> usize {
         self.snap_host
             .budget_bytes()
-            .checked_div(self.snap_bytes.max(1))
+            .checked_div(self.snap_file_bytes().max(1))
             .unwrap_or(0)
+    }
+
+    /// **一条快照的总字节 = `snap_bytes × world`**(2026-11-01 P1 收尾)。
+    ///
+    /// 三处口径必须一致,TP 下差一个 `world` 就会"账 159 MB ≠ 布局 79 MB":
+    /// - 盘上一个文件(内容腿)= 全平面;
+    /// - 宿主层一块(`attach_snap_layout` 按 `bytes × world` 建);
+    /// - `StateStore` 记的 `snap_bytes(key)` = 全平面。
+    /// 单 rank 的 `snap_bytes` 只用于**平面内**偏移(swap piece 的 stride)。
+    pub fn snap_file_bytes(&self) -> usize {
+        self.snap_bytes.saturating_mul(self.world)
     }
 
     /// 卡级预算(只读)。
@@ -941,9 +976,11 @@ impl Rel {
         self.reserve_direct(turn, ReservationKind::Load, blocks, bytes, blocks, bytes)
     }
 
-    /// 快照设备槽票（1 条 = `snap_bytes`；turn 生命周期）。
+    /// 快照设备槽票(1 条 = **一条快照的总字节** `snap_bytes × world`;
+    /// 与下沉检查/宿主块/盘文件同一口径 —— TP 下按单 rank 记会少一半,
+    /// 消费时立刻撞「额度不足 159MB vs 79MB」)。
     pub fn reserve_snap(&mut self, turn: u64) -> StoreResult<Grant> {
-        let bytes = self.snap_bytes;
+        let bytes = self.snap_file_bytes();
         self.reserve_direct(turn, ReservationKind::Snap, 1, bytes, 1, bytes)
     }
 
@@ -1208,10 +1245,12 @@ impl Rel {
                 "快照 {key:?} 不可下沉(生成段边界:链一推进就被取代 ⇒ 逐出即丢)"
             )));
         }
-        if bytes != self.snap_bytes {
+        if bytes != self.snap_file_bytes() {
             return Err(StoreError::Invariant(format!(
-                "快照字节不符:账 {bytes} ≠ 布局 {}",
-                self.snap_bytes
+                "快照字节不符:账 {bytes} ≠ 布局 {}(单 rank {} × world {})",
+                self.snap_file_bytes(),
+                self.snap_bytes,
+                self.world
             )));
         }
         // **宿主满 ⇒ 先逐最冷**(2026-10-19 政策补口;G3 定档轮实测立案)。

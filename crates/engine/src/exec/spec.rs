@@ -1780,9 +1780,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // (truncate 尾部重算 / 同 prompt 再次到达同一边界)会产生同键,
             // 若旧键已在宿主/盘就**留尸** ⇒ 下次下沉 `snap_host.put` 撞
             // 「已在宿主层」⇒ 整个 turn 500(实测第 3 次请求必现)。
+            // **记账单元 = 一条快照的总字节**(单 rank 平面 × world;2026-11-01):
+            // 与盘上文件/宿主块/下沉检查同一口径 —— 按单 rank 记会让 TP2 的
+            // `plan_snap_offload` 报「账 79MB ≠ 布局 159MB」而弃置整个 turn。
             let ghosts = self.bank.rel.register_snap_captured(
                 key,
-                self.dev.pool.snap_bytes(),
+                self.bank.rel.snap_file_bytes(),
                 durability,
                 sid,
                 full_blocks,
