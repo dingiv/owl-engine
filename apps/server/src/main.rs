@@ -139,6 +139,8 @@ async fn main() {
     // 构建期实验档必须让运维看得见(profile 本身不携带 feature)。
     #[cfg(feature = "fi-fp16pv")]
     eprintln!("[boot] kernel: FlashInfer FP16-PV = on (sm_86 GeForce build; f16/fp8 KV prefill)");
+    #[cfg(feature = "fi-fp16acc")]
+    eprintln!("[boot] kernel: FlashInfer FP16-QK-acc = on (QK half accumulate + half2 softmax)");
     // 完整解析 → server 形态(选卡在这里;预检已提前返回)
     let config = match ServerConfig::from_resolved(resolved, &args) {
         Ok(c) => c,
