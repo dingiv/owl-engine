@@ -126,7 +126,21 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
             const int key = tile_k0 + tid;
             kscale_s[tid] = (key < L) ? kscale[(size_t)key * Hkv + kv_head] : 0.0f;
         }
-        cp_commit(); cp_wait<0>(); __syncthreads();
+        cp_commit();  // group 0: K
+        // group 1: V 预取,与 QK 重叠;K/V 共享区互不重叠(K 前半,V 后半)。
+        const int v_page = static_cast<int>(block_table[tile_k0 / page]);
+        for (int chunk = tid; chunk < D * (Bc / 2 / 8); chunk += Threads) {
+            const int d = chunk / (Bc / 2 / 8);
+            const int pair0 = (chunk % (Bc / 2 / 8)) * 8;
+            const uint16_t* src = &vp[((size_t)v_page * Hkv + kv_head) * D *
+                                          (page / 2) +
+                                      (size_t)d * (page / 2) + pair0];
+            uint16_t* dst = &v_b16[d * (Bc / 2) + swz_v(d, pair0)];
+            cp_async<16, Cache::cg>(dst, src);
+        }
+        cp_commit();  // group 1: V
+        cp_wait<1>(); // 只等 K;V 仍在飞
+        __syncthreads();
 
         float score[4][4];
 #pragma unroll
@@ -242,18 +256,8 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
 
         __syncthreads();  // all QK done; K is free, V can overwrite
 
-        const int v_page = static_cast<int>(block_table[tile_k0 / page]);
-        // V int8 prepacked [Hkv][D][L/2] b16; Bc/2 = 16 b16 per dim.
-        for (int chunk = tid; chunk < D * (Bc / 2 / 8); chunk += Threads) {
-            const int d = chunk / (Bc / 2 / 8);
-            const int pair0 = (chunk % (Bc / 2 / 8)) * 8;
-            const uint16_t* src = &vp[((size_t)v_page * Hkv + kv_head) * D *
-                                          (page / 2) +
-                                      (size_t)d * (page / 2) + pair0];
-            uint16_t* dst = &v_b16[d * (Bc / 2) + swz_v(d, pair0)];
-            cp_async<16, Cache::cg>(dst, src);
-        }
-        cp_commit(); cp_wait<0>(); __syncthreads();
+        cp_wait<0>(); // V 预取完成
+        __syncthreads();
 
         uint32_t a[4];
         ldmatrix_x4(a[0], a[1], a[2], a[3],
@@ -270,10 +274,10 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
             const float vv = vscale[(size_t)v_page * Hkv * 4 + kv_head * 4 + (n * 8) / 64];
             const float s0 = ps0 * vv;
             const float s1 = ps1 * vv;
-            acc[n][0] += static_cast<float>(c0) * s0;
-            acc[n][1] += static_cast<float>(c1) * s0;
-            acc[n][2] += static_cast<float>(c2) * s1;
-            acc[n][3] += static_cast<float>(c3) * s1;
+            acc[n][0] = __fmaf_rn(static_cast<float>(c0), s0, acc[n][0]);
+            acc[n][1] = __fmaf_rn(static_cast<float>(c1), s0, acc[n][1]);
+            acc[n][2] = __fmaf_rn(static_cast<float>(c2), s1, acc[n][2]);
+            acc[n][3] = __fmaf_rn(static_cast<float>(c3), s1, acc[n][3]);
         }
         __syncthreads();
     }
