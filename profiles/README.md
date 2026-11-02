@@ -21,6 +21,16 @@ extends = [
 - 合并后仍缺键 ⇒ 拒启；`--print-config` 是唯一放行半份档的迁移工具。
 - 卡位只走 `[parallel]`；`device` 用 BDF / UUID / 名字子串，**禁 CUDA 序号**。
 - **实验变体一律用 `--set`，不新建入口档**（见下"唯二常驻档门"）。
+- **并发三键必须成组改**（boot 门会拒启，别指望缺省兜）：
+  - `[runtime] max_concurrency = N`（在跑 + 排队的请求上限）；
+  - `[pool] gdn_slots ≥ N`（每活跃 turn 一格 GDN 状态；`parts/pool/fp8.toml` 给的是 1，
+    多并发档要在 leaf 里显式覆盖）—— 不足会拒启：
+    `[pool] gdn_slots(1) < [runtime] max_concurrency(2)`；
+  - `[pool] snap_max ≥ N + 1`（每个活跃 turn 的 `last_snap` 各占一格且**受保护**，
+    再留一格给"刚收口那条链的尾边界"）。
+  **并发 ≠ 设备并行**：本仓 `max_batch` 只能为 1（合批要求单卡 / spec off / 无选择层），
+  所以 N>1 的效果是"第二路**进引擎队列**（`/debug/queue` 可见、有 turn id），
+  而不是在 HTTP permit 上干等"；设备拍仍串行。
 
 ## 常驻档（入口面）
 
@@ -31,7 +41,7 @@ extends = [
 | 文件 | 端口 | 形状 |
 |---|---|---|
 | `qwen38_27b-3090.toml` | 8137 | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 57344（a8 版全特性稳定点）** / chunk 2048 |
-| `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144** / chunk 2048 |
+| `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144** / chunk 2048 / **并发 2（`gdn_slots=2` · `snap_max=3`；2026-11-03 用户裁决）** |
 | `qwen38_27b-gguf_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ4_XS**（14.3GB）+ **mmproj-F16 视觉塔** / DFlash2 d7 / fp8 KV / 前缀缓存 / **max_seq 172032（168k）** / chunk 2048。prefill 1633–1681 t/s、decode 127–135、128k prompt 零拒发；代价 = prefill 比 a8 档(同端口)慢 ~24% |
 | `qwen38_27b-gguf-iq3_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ3_S**（12.0GB）+ mmproj-F16 / DFlash2 d7 / fp8 KV / **max_seq 229376（224k，逼近 native 262144）** / chunk 2048。prefill 1409–1509 t/s、decode 97–121；**与 8137 上的其它单卡 3090 档互斥**（同一张卡二选一），速度慢 ~13%、3bit 质量低一档 |
 | `qwen38_27b-4080.toml` | 8138 | 单 **4080 SUPER（Ada sm_89 / 32G）** / 27B AWQ-INT4 **a8** + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144（= 模型 native 上限，32 KiB/token ⇒ 池 8192MiB）** / chunk 2048。std 五点三轮（`perf-runs/std-4080-20261030/`）：**spec-off prefill 2392→3084 t/s、decode 35.9 t/s 长 ctx 平坦**；spec-d7 decode ×1.70（60.1@8k）；**同二进制 3090 Ti 对照：prefill ×1.21–1.37、decode ×0.81、TTFT ×0.73–0.83**。**需 sm_89 二进制**（`cargo build --release -p server --no-default-features --features arch-sm89`，落到独立 target 目录）——单份 `.a` 家族取最高代，30 系与 40 系不混在一份构建里 |
