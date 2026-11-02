@@ -819,6 +819,89 @@ impl KernelSpec for NormRopeBf16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+/// `owl_norm_rope_q_int8_f16` —— norm+rope 后直接 Q int8 量化。
+pub struct NormRopeQInt8F16;
+
+#[kernel_tags("dom.attn", "role.attn", "role.norm", "role.rope", "kv.main.int8")]
+impl KernelSpec for NormRopeQInt8F16 {
+    const ENTRY: &'static str = "owl_norm_rope_q_int8_f16";
+    const SRC: &'static str = "cu/attn/norm_rope.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::t_in("w", Dtype::F16, 1),
+        Param::t_in("cos_t", Dtype::F16, 2),
+        Param::t_in("sin_t", Dtype::F16, 2),
+        Param::t_in("pos", Dtype::F32, 0),
+        Param::f32("eps"),
+        Param::sz("row_stride"),
+        Param::sz("head_stride"),
+        Param::sz("half"),
+        Param::i32("w_off"),
+        Param::t_in("qscale", Dtype::F32, 1),
+        Param::t_out("q", Dtype::I8, 2),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_norm_rope_k_int8_write_f16` —— norm+rope 后直接写 K int8 池 + scale。
+pub struct NormRopeKInt8WriteF16;
+
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.norm",
+    "role.rope",
+    "role.kv_write",
+    "kv.main.int8"
+)]
+impl KernelSpec for NormRopeKInt8WriteF16 {
+    const ENTRY: &'static str = "owl_norm_rope_k_int8_write_f16";
+    const SRC: &'static str = "cu/attn/norm_rope.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 3),
+        Param::t_in("w", Dtype::F16, 1),
+        Param::t_in("cos_t", Dtype::F16, 2),
+        Param::t_in("sin_t", Dtype::F16, 2),
+        Param::t_in("pos", Dtype::F32, 0),
+        Param::f32("eps"),
+        Param::sz("row_stride"),
+        Param::sz("head_stride"),
+        Param::sz("half"),
+        Param::i32("w_off"),
+        Param::t_in("slots", Dtype::F32, 0),
+        Param::t_in("k_cache", Dtype::I8, 1),
+        Param::t_in("k_scale", Dtype::F32, 1),
+        Param::i32("num_heads"),
+        Param::i32("head_size"),
+        Param::i32("block_size"),
+        Param::t_out("out", Dtype::F16, 1),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::I8,
+    )];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
 // ============================================================================
 // 命名 static(**单一提升点**;域表与族表共用同一份 KernelMeta)
 // ============================================================================
@@ -846,6 +929,8 @@ pub static K0_WRITE_FP8_CLASSIC: KernelMeta = meta_of::<K0WriteFp8Classic>();
 pub static K0_WRITE_BF16: KernelMeta = meta_of::<K0WriteBf16>();
 pub static NC_ATTN_FP8KV_BF16: KernelMeta = meta_of::<NcAttnFp8kvBf16>();
 pub static NORM_ROPE_F16: KernelMeta = meta_of::<NormRopeF16>();
+pub static NORM_ROPE_Q_INT8_F16: KernelMeta = meta_of::<NormRopeQInt8F16>();
+pub static NORM_ROPE_K_INT8_WRITE_F16: KernelMeta = meta_of::<NormRopeKInt8WriteF16>();
 pub static NORM_ROPE_BF16: KernelMeta = meta_of::<NormRopeBf16>();
 
 // ============================================================================

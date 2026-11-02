@@ -983,12 +983,13 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
-    /// **INT8 prefill**(生产首版):Q per-head int8、K-only writer、整页 V
-    /// scale+pack、`owl_int8_prefill_paged`。输出 f16 → GateMul。
+    /// **INT8 prefill(融合版)**:NormRope 后直接 Q int8 / K int8 写池,
+    /// 去掉 Q/K 的 F16 中间写读与独立 QuantInt8/K-only writer。
+    /// V 仍走 per-page pack;attention 输出 F16 → GateMul。
     #[allow(clippy::too_many_arguments)]
     fn paged_prefill_int8_output(
         &self,
-        q: &TensorOps,
+        q_raw: &TensorOps,
         k: &TensorOps,
         v: &TensorOps,
         gate: &TensorOps,
@@ -996,6 +997,10 @@ impl Attention {
         tokens: usize,
         ctx: &ForwardCtx,
         kv_slots: &TensorOps,
+        cos_d: &TensorOps,
+        sin_d: &TensorOps,
+        pos: &TensorOps,
+        half: usize,
     ) -> TensorOps {
         let poisoned = |why: &str| {
             TensorOps::poisoned(
@@ -1024,24 +1029,38 @@ impl Attention {
         };
         let rows = tokens * self.hq;
         let q_scale = TensorOps::zeros(Dtype::F32, vec![rows]);
-        let q8 = TensorOps::call(SemanticKernel::QuantInt8QkF16)
-            .arg(&q.reshape(vec![rows, self.hd]))
+        let q8 = TensorOps::call(SemanticKernel::NormRopeQInt8F16)
+            .aux(&[tokens, self.hq, self.hd])
+            .arg(q_raw)
+            .arg(&self.q_norm.alpha_decl())
+            .arg(cos_d)
+            .arg(sin_d)
+            .arg(pos)
+            .arg_f32(self.q_norm.eps())
+            .arg_usize(self.hq * self.hd * 2)
+            .arg_usize(self.hd * 2)
+            .arg_usize(half)
+            .arg_i32(1)
             .arg(&q_scale)
-            .arg_i32(rows as i32)
-            .arg_i32(self.hd as i32)
-            .aux(&[rows])
             .with_shape(Dtype::I8, vec![rows, self.hd]);
-        let wr = TensorOps::call(ctx.env.kv.k0_write_op())
-            .aux(&[tokens, self.hkv])
+        let wr = TensorOps::call(SemanticKernel::NormRopeKInt8WriteF16)
+            .aux(&[tokens, self.hkv, self.hd])
             .arg(&k.reshape(vec![tokens, self.hkv, self.hd]))
+            .arg(&self.k_norm.alpha_decl())
+            .arg(cos_d)
+            .arg(sin_d)
+            .arg(pos)
+            .arg_f32(self.k_norm.eps())
+            .arg_usize(self.hkv * self.hd)
+            .arg_usize(self.hd)
+            .arg_usize(half)
+            .arg_i32(1)
+            .arg(kv_slots)
             .arg(&kv.k_cache)
             .arg(&planes.k_scale)
-            .arg(kv_slots)
-            .arg_i32((self.hkv * self.hd) as i32)
             .arg_i32(self.hkv as i32)
             .arg_i32(self.hd as i32)
             .arg_i32(pol.page as i32)
-            .arg_i32(tokens as i32)
             .with_shape(Dtype::F16, vec![1]);
         let vw = TensorOps::call(SemanticKernel::VPackInt8Prefill)
             .aux(&[tokens, self.hkv, pol.page])
@@ -1378,6 +1397,25 @@ impl Attention {
         let v = self.v_proj.forward(xs, ctx); // [T, Hkv*HD]
         // C1 融合:同 decode 臂(norm_rope strided 直取 value 半段)
         let dt_raw = q_raw.dtype;
+        // INT8 KV:NormRope 直接量化为 Q int8 / K int8 写池,跳过 Q/K 的 F16 中间。
+        if ctx.env.kv.is_int8() {
+            if dt_raw != Dtype::F16 {
+                return TensorOps::poisoned(
+                    Dtype::F16,
+                    vec![tokens, self.hq * self.hd],
+                    "attention int8 prefill: 只支持 F16 激活",
+                );
+            }
+            let (cos_d, sin_d) = rope.cos_sin_of(ctx);
+            let gate = narrow_strided(
+                &q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
+                vec![tokens, row_q],
+            );
+            return self.paged_prefill_int8_output(
+                &q_raw, &k, &v, &gate, kv, tokens, ctx, kv_slots,
+                &cos_d, &sin_d, pos, rope.rotary_half(),
+            );
+        }
         let (q, gate, k) = if dt_raw == Dtype::F16 {
             let (cos_d, sin_d) = rope.cos_sin_of(ctx);
             let gate = narrow_strided(&q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
@@ -1425,7 +1463,11 @@ impl Attention {
 
         let dt = q.dtype;
         if ctx.env.kv.is_int8() {
-            return self.paged_prefill_int8_output(&q, &k, &v, &gate, kv, tokens, ctx, kv_slots);
+            return TensorOps::poisoned(
+                Dtype::F16,
+                vec![tokens, self.hq * self.hd],
+                "attention int8 prefill: 只支持 F16 激活",
+            );
         }
         if dt == Dtype::F16 {
             if let Some(pol) = crate::module::kv_paged_policy(dt) {

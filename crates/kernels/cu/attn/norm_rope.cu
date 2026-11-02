@@ -130,3 +130,218 @@ extern "C" __global__ void owl_norm_rope_bf16(
         out[base + d] = __float2bfloat16(n);   // partial 维直通
     }
 }
+
+// ----------------------------------------------------------------------------
+// INT8 KV 专用:norm+rope 后直接量化,去掉 F16 中间写读。
+//   Q: 每 (t,h) 块算 q8 + qscale,布局 [tokens*heads, hd](行连续)。
+//   K: 每 (t,h) 块算完直接写 paged K int8 池 + k_scale(槽映射内联)。
+// 量化约定与 quant_int8_qk.cu / reshape_and_cache_int8.cu 逐式一致:
+//   Q clamp [-127,127],K clamp [-128,127];scale=max(absmax/127,1e-6)。
+// ----------------------------------------------------------------------------
+__device__ __forceinline__ int8_t q_i8_q(float x, float inv) {
+    float q = x * inv;
+    q = (q >= 0.0f) ? (q + 0.5f) : (q - 0.5f);
+    q = fminf(fmaxf(q, -127.0f), 127.0f);
+    return static_cast<int8_t>(q);
+}
+__device__ __forceinline__ int8_t q_i8_k(float x, float inv) {
+    float q = x * inv;
+    q = (q >= 0.0f) ? (q + 0.5f) : (q - 0.5f);
+    q = fminf(fmaxf(q, -128.0f), 127.0f);
+    return static_cast<int8_t>(q);
+}
+
+extern "C" __global__ void owl_norm_rope_q_int8_f16(
+    const __half* __restrict__ x,
+    const __half* __restrict__ w,
+    const __half* __restrict__ cos_t,
+    const __half* __restrict__ sin_t,
+    const float* __restrict__ pos,
+    float eps,
+    size_t row_stride,
+    size_t head_stride,
+    size_t half,
+    int w_off,
+    float* __restrict__ qscale,
+    int8_t* __restrict__ qout)
+{
+    const size_t t = blockIdx.x;
+    const size_t h = blockIdx.y;
+    const size_t d = threadIdx.x;
+    const size_t hd = blockDim.x;
+    const __half* xs = x + t * row_stride + h * head_stride;
+
+    extern __shared__ float smem[];
+    const int warp = static_cast<int>(d >> 5);
+    const int lane = static_cast<int>(d & 31);
+    const int nwarp = static_cast<int>((hd + 31) >> 5);
+    const float xf = __half2float(xs[d]);
+    float ss = xf * xf;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+    if (lane == 0) smem[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < nwarp) ? smem[lane] : 0.0f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_down_sync(0xffffffffu, v, off);
+        if (lane == 0) smem[32] = v;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(smem[32] / (float)hd + eps);
+
+    const float wf = __half2float(w[d]);
+    const float n = xf * inv * (w_off ? (wf + 1.0f) : wf);
+    const size_t p = (size_t)pos[t];
+    float v0 = 0.0f, v1 = 0.0f, amax = 0.0f;
+    if (d < half) {
+        const float xb = __half2float(xs[d + half]);
+        const float wb = __half2float(w[d + half]);
+        const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+        const float cf = __half2float(cos_t[p * half + d]);
+        const float sf = __half2float(sin_t[p * half + d]);
+        v0 = n * cf - nb * sf;
+        v1 = nb * cf + n * sf;
+        // 与旧链逐位一致:先落 F16(NormRope 输出),再统计/量化。
+        v0 = __half2float(__float2half_rn(v0));
+        v1 = __half2float(__float2half_rn(v1));
+        amax = fmaxf(fabsf(v0), fabsf(v1));
+    } else if (d >= 2 * half) {
+        v0 = __half2float(__float2half_rn(n));
+        amax = fabsf(v0);
+    }
+
+    float mm = amax;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        mm = fmaxf(mm, __shfl_down_sync(0xffffffffu, mm, off));
+    if (lane == 0) smem[warp] = mm;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < nwarp) ? smem[lane] : 0.0f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+        if (lane == 0) smem[32] = v;
+    }
+    __syncthreads();
+    const float scale = fmaxf(smem[32] / 127.0f, 1e-6f);
+    const float qinv = 1.0f / scale;
+
+    const size_t base = (t * gridDim.y + h) * hd;
+    if (d < half) {
+        qout[base + d] = q_i8_q(v0, qinv);
+        qout[base + d + half] = q_i8_q(v1, qinv);
+    } else if (d >= 2 * half) {
+        qout[base + d] = q_i8_q(v0, qinv);
+    }
+    if (d == 0) qscale[t * gridDim.y + h] = scale;
+}
+
+extern "C" __global__ void owl_norm_rope_k_int8_write_f16(
+    const __half* __restrict__ x,
+    const __half* __restrict__ w,
+    const __half* __restrict__ cos_t,
+    const __half* __restrict__ sin_t,
+    const float* __restrict__ pos,
+    float eps,
+    size_t row_stride,
+    size_t head_stride,
+    size_t half,
+    int w_off,
+    const float* __restrict__ slots,
+    int8_t* __restrict__ k_cache,
+    float* __restrict__ k_scale,
+    int num_heads,
+    int head_size,
+    int block_size,
+    __half* __restrict__ out)
+{
+    const size_t t = blockIdx.x;
+    const size_t h = blockIdx.y;
+    const size_t d = threadIdx.x;
+    const size_t hd = blockDim.x;
+    const int slot = static_cast<int>(slots[t]);
+    if (slot < 0) {
+        if (threadIdx.x == 0) out[0] = __float2half(0.0f);
+        return;
+    }
+    const __half* xs = x + t * row_stride + h * head_stride;
+
+    extern __shared__ float smem[];
+    const int warp = static_cast<int>(d >> 5);
+    const int lane = static_cast<int>(d & 31);
+    const int nwarp = static_cast<int>((hd + 31) >> 5);
+    const float xf = __half2float(xs[d]);
+    float ss = xf * xf;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+    if (lane == 0) smem[warp] = ss;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < nwarp) ? smem[lane] : 0.0f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_down_sync(0xffffffffu, v, off);
+        if (lane == 0) smem[32] = v;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(smem[32] / (float)hd + eps);
+
+    const float wf = __half2float(w[d]);
+    const float n = xf * inv * (w_off ? (wf + 1.0f) : wf);
+    const size_t p = (size_t)pos[t];
+    float v0 = 0.0f, v1 = 0.0f, amax = 0.0f;
+    if (d < half) {
+        const float xb = __half2float(xs[d + half]);
+        const float wb = __half2float(w[d + half]);
+        const float nb = xb * inv * (w_off ? (wb + 1.0f) : wb);
+        const float cf = __half2float(cos_t[p * half + d]);
+        const float sf = __half2float(sin_t[p * half + d]);
+        v0 = n * cf - nb * sf;
+        v1 = nb * cf + n * sf;
+        // 与旧链逐位一致:先落 F16(NormRope 输出),再统计/量化。
+        v0 = __half2float(__float2half_rn(v0));
+        v1 = __half2float(__float2half_rn(v1));
+        amax = fmaxf(fabsf(v0), fabsf(v1));
+    } else if (d >= 2 * half) {
+        v0 = __half2float(__float2half_rn(n));
+        amax = fabsf(v0);
+    }
+
+    float mm = amax;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        mm = fmaxf(mm, __shfl_down_sync(0xffffffffu, mm, off));
+    if (lane == 0) smem[warp] = mm;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < nwarp) ? smem[lane] : 0.0f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+        if (lane == 0) smem[32] = v;
+    }
+    __syncthreads();
+    const float scale = fmaxf(smem[32] / 127.0f, 1e-6f);
+    const float qinv = 1.0f / scale;
+
+    const int block = slot / block_size;
+    const int offset = slot % block_size;
+    const long long row_base =
+        (static_cast<long long>(block) * block_size + offset) * num_heads * head_size +
+        static_cast<long long>(h) * head_size;
+    if (d < half) {
+        k_cache[row_base + d] = q_i8_k(v0, qinv);
+        k_cache[row_base + d + half] = q_i8_k(v1, qinv);
+    } else if (d >= 2 * half) {
+        k_cache[row_base + d] = q_i8_k(v0, qinv);
+    }
+    if (d == 0) {
+        k_scale[(static_cast<long long>(block) * block_size + offset) * num_heads + h] = scale;
+        out[0] = __float2half(0.0f);
+    }
+}

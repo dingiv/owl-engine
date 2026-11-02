@@ -408,6 +408,8 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "ops.embed" => elems::embed(dt, ax(0)),
         "elems.embed_i8" => elems::embed_i8(ax(0)),
         "attn.norm_rope" => attn::norm_rope(dt, ax(0), ax(1), ax(2)), // aux = [tokens, heads, hd]
+        "attn.norm_rope_q_int8" => attn::norm_rope_q_int8(ax(0), ax(1), ax(2)),
+        "attn.norm_rope_k_int8" => attn::norm_rope_k_int8(ax(0), ax(1), ax(2)),
         "attn.qkv_norm_rope_insert" => {
             let (tokens, hq, hkv, hd, half) = (ax(0), ax(1), ax(2), ax(3), ax(4));
             attn::qkv_norm_rope_insert(dt, tokens, hq, hkv, hd, half) // aux = [tokens, hq, hkv, hd, half]
@@ -1813,6 +1815,24 @@ pub mod attn {
                 smem: (hd * 4) as u32,
             },
         }
+    }
+
+    /// INT8 Q:norm+rope 后直接量化;grid (tokens,hq),block hd,smem hd*4。
+    pub fn norm_rope_q_int8(tokens: usize, hq: usize, hd: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::NormRopeQInt8F16>(Shape {
+            grid: (tokens as u32, hq as u32, 1),
+            block: (hd as u32, 1, 1),
+            smem: (hd * 4) as u32,
+        })
+    }
+
+    /// INT8 K:norm+rope 后直接写 paged K 池;grid (tokens,hkv),block hd。
+    pub fn norm_rope_k_int8(tokens: usize, hkv: usize, hd: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::NormRopeKInt8WriteF16>(Shape {
+            grid: (tokens as u32, hkv as u32, 1),
+            block: (hd as u32, 1, 1),
+            smem: (hd * 4) as u32,
+        })
     }
 
     /// qkv norm+rope+KV 插入(Wave-2 头号;minimax_m3 (token,head-slot)

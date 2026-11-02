@@ -131,6 +131,10 @@ pub enum SemanticKernel {
     K0WriteInt8KOnlyKnhd,
     /// Q per-(token,q_head) int8 量化(aux=[rows=T*Hq])
     QuantInt8QkF16,
+    /// norm+rope 后直接 Q int8 量化(aux=[T,hq,hd])
+    NormRopeQInt8F16,
+    /// norm+rope 后直接写 K int8 池(aux=[T,hkv,hd])
+    NormRopeKInt8WriteF16,
     /// prefill 整页 V scale + pack(aux=[T,hkv,page])
     VPackInt8Prefill,
     /// decode 单 token 追加 V(aux=[T,hkv])
@@ -377,6 +381,8 @@ impl SemanticKernel {
             SemanticKernel::K0WriteFp8Knhd => "attn.k0_write_fp8_knhd",
             SemanticKernel::K0WriteInt8KOnlyKnhd => "attn.k0_write_int8_k_only",
             SemanticKernel::QuantInt8QkF16 => "attn.quant_int8_qk",
+            SemanticKernel::NormRopeQInt8F16 => "attn.norm_rope_q_int8",
+            SemanticKernel::NormRopeKInt8WriteF16 => "attn.norm_rope_k_int8",
             SemanticKernel::VPackInt8Prefill => "attn.v_pack_int8_prefill",
             SemanticKernel::VAppendInt8Paged => "attn.v_append_int8_paged",
             SemanticKernel::Int8PrefillPaged => "attn.int8_prefill_paged",
