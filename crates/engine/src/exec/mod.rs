@@ -23,7 +23,72 @@ use crate::scheduler::BeginPlan;
 /// (346/400 token,28 ms/token vs 投机 12 ms/token)。
 /// 封顶 64 后最坏情况 = 每 64 token 试一轮投机:多付 ≈ (34−28×AL)/64
 /// ≈ 0.1 ms/token,却保证"内容一旦回到可投机域就自动恢复"。
-const DEGRADE_PROBE_MAX: usize = 64;
+/// **2026-11-03 再下修到 32**:探测本身是**保险不是惩罚** —— 一次探测轮 ≈ 一轮
+/// 投机(33 ms),摊到 32 token 上 ≈ 1 ms/token(5%);而"该恢复却还在裸跑"的
+/// 代价是 **2.1×**(健康档 9.8 ms vs 裸 21 ms)。真机实测降级期 `deg` 占到
+/// 解码步的 50%,恢复延迟直接吃吞吐 ⇒ 宁可多探。
+const DEGRADE_PROBE_MAX: usize = 32;
+
+/// **降级确认窗口数**(2026-11-03 用户裁决:不许"一个窗口就降级")。
+///
+/// 降级需要 **2 个连续**"低收益窗口"(16 轮或 600 ms 一窗)。理由是不对称性:
+///
+/// - 误降(健康档被降):9.8 ms/token → 21 ms/token = **2.1×**;
+/// - 误留(死档没降):26 ms/轮 vs 21 ms/token = **1.24×**。
+///
+/// ⇒ 宁可多等一窗(≈1.2 s),也不要误降。连击(m=0×N)只能**减半**确认
+/// (1 窗 + 连击佐证),不再单独构成降级依据。
+pub(crate) const DEGRADE_CONFIRM_WINDOWS: u8 = 2;
+
+/// **降级判决**(纯函数;2026-11-03 抽出以便单测 —— 与 `spec_degrade_transition`
+/// / `break_even_line` 同族)。
+///
+/// 输入:
+/// - `already_degraded`:本轮**进**轮时是否已在降级态;
+/// - `degraded0`:`spec_degrade_transition` 给出的降级位(`m ≥ 1` ⇒ `false`,
+///   即"本轮探测命中" ⇒ **必须能恢复**);
+/// - `streak` / `streak_gate` / `degrade_after`:连击账 + "部分窗 AL 也低于盈亏线";
+/// - `window_done` / `window_starved`:本窗是否刚评估完 / 是否低收益;
+/// - `low_windows`:进入本轮时**已累计**的连续低收益窗口数。
+///
+/// 输出 = `(是否降级, 更新后的连续低窗数)`。
+///
+/// 判决律(2026-11-03 用户裁决:不许"一个窗口就降级",且**必须能反悔**):
+/// 1. 已在降级 + 本轮无命中 ⇒ 保持;
+/// 2. **两个连续**低收益窗口 ⇒ 降级(≈1.2 s 实证);
+/// 3. 连击达阈值 **且** 已有 ≥1 个低收益窗口 **且** 部分窗 AL 也低于盈亏线
+///    ⇒ 降级(连击只**减半**确认,不单独构成依据);
+/// 4. 其余一律不降 —— 特别是"探测命中"(m≥1)时,除非恰好凑满 2 个连续低窗。
+// 结构性豁免(2026-11-03):判据的每一项都是**独立事实**(已降级?/转移位/连击/
+// 部分窗 AL 门/阈值/本窗是否评估/是否低收益/连续低窗数)—— 打包成 struct 只会
+// 让调用点多一堆字段名,而不减少任何耦合。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spec_degrade_verdict(
+    already_degraded: bool,
+    degraded0: bool,
+    streak: usize,
+    streak_gate: bool,
+    degrade_after: usize,
+    window_done: bool,
+    window_starved: bool,
+    low_windows: u8,
+) -> (bool, u8) {
+    let low = if !window_done {
+        low_windows
+    } else if window_starved {
+        low_windows.saturating_add(1)
+    } else {
+        0
+    };
+    let stay = already_degraded && degraded0;
+    let window_confirm = window_done && window_starved && low >= DEGRADE_CONFIRM_WINDOWS;
+    let streak_confirm = degraded0
+        && !already_degraded
+        && streak >= degrade_after
+        && low >= 1
+        && streak_gate;
+    (stay || window_confirm || streak_confirm, low)
+}
 
 /// **双 rank 镜像执行**(S6f):`dev` 必跑;`peer` 在场则**并发**跑同一动作。
 ///

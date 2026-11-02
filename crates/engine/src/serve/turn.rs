@@ -325,8 +325,12 @@ pub(crate) struct TurnSpecState {
     /// B4:本 turn **累计**降级步数(turn 诊断账;不清零 —— 用来回答
     /// "这一轮到底有几成 token 走了裸 decode")。
     pub(crate) spec_degraded_steps: u64,
-    /// B4:当前探测周期(失败 ×2 退避,上限 512)
+    /// B4:当前探测周期(失败 ×2 退避,上限 `DEGRADE_PROBE_MAX`)
     pub(crate) spec_probe_every: usize,
+    /// B4 **连续低收益窗口数**(2026-11-03 确认制):一个窗口就降级 = 太敏感
+    /// (真机实测:健康档 AL 2.6 的 turn 里 `deg=3238/6445`)。降级需 2 个
+    /// **连续**饿窗口,或 1 个饿窗口 + 连击佐证。饿窗口清零。
+    pub(crate) low_windows: u8,
     /// B4 滚动 AL 窗口(2026-10-12):轮数 / 产出 token 数 —— 连击 streak
     /// 会被"偶发 m=1"破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值
     /// < 盈亏线(3.6 tok/轮)即降级,不看连击

@@ -5263,12 +5263,13 @@ fn spec_degrade_transition_branches() {
     // 降级态探测失败 → 退避 ×2
     let (s, d, p) = spec_degrade_transition(7, true, 16, 0, 6, 8);
     assert_eq!((s, d, p), (8, true, 32));
-    // 退避封顶 64(2026-10-27 由 512 下修:实测 48k 请求只有 400 token,
-    // 512 的间隔 = 一次探测都不会发生 ⇒ 整段永久裸 decode)
-    let (s, d, p) = spec_degrade_transition(9, true, 40, 0, 6, 8);
-    assert_eq!((s, d, p), (10, true, 64));
-    let (s, d, p) = spec_degrade_transition(9, true, 64, 0, 6, 8);
-    assert_eq!((s, d, p), (10, true, 64)); // 已在封顶 ⇒ 不再涨
+    // 退避封顶 **32**(2026-10-27 由 512→64;2026-11-03 再 64→32 —— 探测是
+    // 保险不是惩罚:一轮探测摊到 32 token ≈ 1 ms/token(5%),而"该恢复还在
+    // 裸跑"的代价是 2.1×)
+    let (s, d, p) = spec_degrade_transition(9, true, 24, 0, 6, 8);
+    assert_eq!((s, d, p), (10, true, 32));
+    let (s, d, p) = spec_degrade_transition(9, true, 32, 0, 6, 8);
+    assert_eq!((s, d, p), (10, true, 32)); // 已在封顶 ⇒ 不再涨
     // **小首探窗**(2026-10-18 缺省 8):入降级即用 8,探测失败退避到 16
     let (s, d, p) = spec_degrade_transition(5, false, 8, 0, 6, 8);
     assert_eq!((s, d, p), (6, true, 8));
@@ -5277,6 +5278,46 @@ fn spec_degrade_transition_branches() {
     // threshold=0 = 禁用(永不入降级)
     let (s, d, p) = spec_degrade_transition(9, false, 64, 0, 0, 64);
     assert_eq!((s, d, p), (10, false, 64));
+}
+
+/// **降级判决 = 确认制 + 可反悔**(2026-11-03 用户裁决)。
+///
+/// 现场依据(双 3080 / 27B,101k prompt 的 agent turn):整体 AL=2.66 的健康
+/// turn 内部有若干段 16 轮全 m=0 ⇒ 旧判据(**一个**窗口即降级)一次降级后
+/// **53 次探测全部 m=0、`spec.undegrad=0`** ⇒ `deg=3238/6445`(一半解码步
+/// 永久裸跑,吞吐 114→57 t/s)。本门钉住三件事:
+/// ① 一个低收益窗口**不足以**降级(要两个连续);
+/// ② 连击只能**减半**确认(必须已有 ≥1 个低窗 + 部分窗 AL 也低);
+/// ③ **探测命中(m≥1)必须恢复** —— 除非恰好凑满两个连续低窗。
+#[test]
+fn spec_degrade_verdict_requires_confirmation_and_can_recover() {
+    use crate::exec::spec_degrade_verdict as v;
+    const AFTER: usize = 10;
+
+    // ① 健康:无窗口、无连击 ⇒ 不降
+    assert_eq!(v(false, false, 0, false, AFTER, false, false, 0), (false, 0));
+    // ② 一个低收益窗口 ⇒ 仍不降(只记账)
+    assert_eq!(v(false, false, 0, false, AFTER, true, true, 0), (false, 1));
+    // ③ 第二个连续低收益窗口 ⇒ 降
+    assert_eq!(v(false, false, 0, false, AFTER, true, true, 1), (true, 2));
+    // ④ 中间来了一个健康窗 ⇒ 计数清零,不降
+    assert_eq!(v(false, false, 0, false, AFTER, true, false, 1), (false, 0));
+    // ⑤ 连击但**没有**任何低窗 ⇒ 不降(连击不单独构成依据)
+    assert_eq!(v(false, true, AFTER, true, AFTER, false, false, 0), (false, 0));
+    // ⑥ 连击 + 一个低窗 + 部分窗 AL 也低 ⇒ 降(减半确认)
+    assert_eq!(v(false, true, AFTER, true, AFTER, true, true, 0), (true, 1));
+    // ⑦ 连击 + 一个低窗,但部分窗 AL 不低 ⇒ 不降
+    assert_eq!(v(false, true, AFTER, false, AFTER, true, true, 0), (false, 1));
+    // ⑧ 连击未达阈值 ⇒ 不降
+    assert_eq!(v(false, true, AFTER - 1, true, AFTER, true, true, 0), (false, 1));
+    // ⑨ **已在降级 + 探测命中(m≥1 ⇒ degraded0=false)** ⇒ 恢复
+    assert_eq!(v(true, false, 0, false, AFTER, false, false, 0), (false, 0));
+    // ⑩ 已在降级 + 本轮仍无命中 ⇒ 保持
+    assert_eq!(v(true, true, AFTER + 1, true, AFTER, false, false, 0), (true, 0));
+    // ⑪ 已在降级 + 探测命中,但恰满两个连续低窗 ⇒ 仍降(证据压过单次命中)
+    assert_eq!(v(true, false, 0, false, AFTER, true, true, 1), (true, 2));
+    // ⑫ 连击已把计数留在 1:连击路径不重复计数(窗口未评估 ⇒ 原样)
+    assert_eq!(v(true, true, AFTER, true, AFTER, false, false, 1), (true, 1));
 }
 
 /// **降级不是单向门：turn 内必须能自愈**（2026-10-28 现场：前端 decode 速度
@@ -5314,10 +5355,10 @@ fn degraded_turn_heals_within_the_same_turn() {
         }
     }
     assert!(!degraded, "turn 内必须自愈（旧行为是单向门）");
-    assert!(max_probe <= 64, "退避必须封顶 64，实际 {max_probe}");
+    assert!(max_probe <= 32, "退避必须封顶 32，实际 {max_probe}");
     assert!(healed_at.expect("必须愈合") < 200, "愈合太慢：{healed_at:?} 步");
 
-    // ② 域一直差（探测轮也 m=0）：退避停在 64，但探测必须**周期性**发生
+    // ② 域一直差（探测轮也 m=0）：退避停在 32，但探测必须**周期性**发生
     let (mut streak, mut degraded, mut probe, mut steps) = (0usize, false, FLOOR, 0usize);
     let (mut probes, mut max_probe) = (0usize, 0usize);
     for _ in 0..400usize {
@@ -5334,8 +5375,8 @@ fn degraded_turn_heals_within_the_same_turn() {
         }
     }
     assert!(degraded, "真差域必须留在裸 decode（不许振荡回亏本 spec）");
-    assert_eq!(max_probe, 64, "封顶 64");
-    assert!(probes >= 3, "400 步内至少探测 3 次（每 ≤64 步一次），实际 {probes}");
+    assert_eq!(max_probe, 32, "封顶 32（2026-11-03 由 64 下修：探测是保险不是惩罚）");
+    assert!(probes >= 6, "400 步内至少探测 6 次（每 ≤32 步一次），实际 {probes}");
 }
 
 // ============================================================================

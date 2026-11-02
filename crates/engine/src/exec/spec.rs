@@ -378,7 +378,37 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let degraded_now;
         if self.dev.spec_rt.dflash_tap_count > 0 && self.boot.probes.degrade_after > 0 {
             let (degrade_after, probe_every0) = (self.boot.probes.degrade_after, self.boot.probes.probe_every);
+            // **探测轮取证**(2026-11-03 立案):本轮进降级态 ⇒ 这一轮就是“反悔探测”。
+            // 若探测长期 m=0 而普通轮 AL 正常 ⇒ 探测路径本身坏了(草稿面/位置面)。
+            let was_probe = self.tspec_ref()?.spec_degraded;
+            let probe_line = if was_probe {
+                Some(format!(
+                    "pos={pos} m={m} depth={depth} d={:?} ids={:?}",
+                    &drafts[..depth.min(drafts.len())],
+                    &ids[..(depth + 1).min(ids.len())]
+                ))
+            } else {
+                None
+            };
             let spec = self.tspec()?;
+            if let Some(line) = probe_line {
+                // 探测轮取证(2026-11-03 立案面):降级期**唯一**能看见
+                // "草稿与当步目标对不对齐"的地方 —— 陈旧草稿 bug 就是靠
+                // 这行(d[i] 恒 ≠ ids[i]、却 ≈ ids[i-k])定谳的。
+                owl_shared::log_info!(
+                    "spec-probe",
+                    "探测轮(周期 {} tok)⇒ {}(明细 {line})",
+                    spec.spec_probe_every,
+                    if m > 0 {
+                        "命中,下一轮恢复 spec"
+                    } else {
+                        "未命中,继续裸 decode"
+                    }
+                );
+                owl_shared::log_debug!("spec-probe", "{line}");
+                mcnt("spec.probe.round", 1);
+                mcnt("spec.probe.accepted", m as u64);
+            }
             spec.recent_rounds += 1;
             spec.recent_tokens += (m + 1) as u32;
             // 轮时进窗口(时间门 + 绝对吞吐;t_round 在下方 EWMA 处已用)
@@ -415,8 +445,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let break_even = crate::exec::break_even_line(rc, bc);
             const WINDOW_ROUNDS: u32 = 16;
             const WINDOW_MS: f32 = 600.0;
+            // ── **确认制(2026-11-03 用户裁决)** ──
+            //
+            // 旧判据 = **一个**窗口(`16 轮` 或 `600ms`)低于盈亏线就降级。
+            // 真机(双 3080 / 27B,101k prompt / 6445 tok 的 agent turn)实测:
+            // 该 turn 整体 AL=2.66(健康),但内部有若干段 16 轮全 m=0
+            // (工具调用/JSON 结构/随机词)→ **一次性降级 5 次、降级步占 50%
+            // (`deg=3238/6445`)、吞吐从 114 t/s 掉到 57 t/s**。
+            //
+            // 不对称性是关键:
+            // - **误降**(健康档被降):健康档 9.8ms/token vs 裸 21ms ⇒ **2.1×**;
+            // - **误留**(死档没降):spec 26ms/轮 vs 裸 21ms/token ⇒ **1.24×**。
+            // ⇒ 宁可多留在 spec,也不要误降:降级需 **2 个连续饿窗口**
+            // (≈1.2s 的实证),连击只能**减半**确认(1 窗口 + 连击达阈值)。
+            let mut window_done = false;
             let window_starved =
                 if spec.recent_rounds >= WINDOW_ROUNDS || spec.recent_ms >= WINDOW_MS {
+                    window_done = true;
                     let avg = spec.recent_tokens as f32 / spec.recent_rounds.max(1) as f32;
                     let win_tps = spec.recent_tokens as f32 * 1000.0 / spec.recent_ms.max(1.0);
                     spec.recent_rounds = 0;
@@ -430,7 +475,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         } else {
                             ""
                         };
-                        owl_shared::log_warn!("spec-degrade", "窗口 AL={avg:.2} vs 盈亏线 {line}{why}(轮 {rc:.0}ms/裸 {bc:.0}ms;窗口吞吐 {win_tps:.1} tok/s)"
+                        owl_shared::log_warn!("spec-degrade", "窗口 AL={avg:.2} vs 盈亏线 {line}{why}(轮 {rc:.0}ms/裸 {bc:.0}ms;窗口吞吐 {win_tps:.1} tok/s;starved={starved})"
                         );
                     }
                     starved
@@ -456,15 +501,36 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 f32::INFINITY
             };
             let streak_gate = break_even.is_some_and(|line| al_partial < line);
-            let degraded = window_starved || (degraded0 && (spec.spec_degraded || streak_gate));
+            // 降级判决 = 纯函数(单测在 `tests.rs::spec_degrade_verdict_*`)
+            let (degraded, low_windows) = crate::exec::spec_degrade_verdict(
+                spec.spec_degraded,
+                degraded0,
+                streak,
+                streak_gate,
+                degrade_after,
+                window_done,
+                window_starved,
+                spec.low_windows,
+            );
+            let window_confirm =
+                window_done && window_starved && low_windows >= crate::exec::DEGRADE_CONFIRM_WINDOWS;
+            spec.low_windows = low_windows;
             if degraded && !spec.spec_degraded {
                 let line = crate::exec::break_even_text(break_even);
-                owl_shared::log_warn!("spec-degrade", "m=0×{streak} win_starved={window_starved} 盈亏线={line} → 降级裸 decode(probe 每 {probe_every} tok)"
+                owl_shared::log_warn!("spec-degrade", "降级裸 decode(probe 每 {probe_every} tok):m=0×{streak} 连续低窗={} 盈亏线={line} 因={} 窗口AL={al_partial:.2}"
+                    , spec.low_windows
+                    , if window_confirm { "双窗确认" } else { "连击+单窗佐证" }
                 );
                 mcnt("spec.degrade", 1);
+                // 降级即丢草稿账:降级态不产草稿,留着只会被**很久之后**的
+                // 探测轮误当"当步草稿"消费(见 `acquire_drafts` 注)。
                 spec.spec_drafts_host = None;
+                // 探测节奏从本轮重新起算(旧值可能是上一次降级 episode 的残留)
+                spec.spec_steps_degraded = 0;
             } else if !degraded && spec.spec_degraded {
-                owl_shared::log_warn!("spec-degrade", "探测命中 m={m} → 恢复 spec");
+                owl_shared::log_warn!("spec-degrade", "探测命中 m={m} → 恢复 spec(降级步 {} / 探测周期 {})"
+                    , spec.spec_degraded_steps, probe_every
+                );
                 mcnt("spec.undegrad", 1);
                 // **恢复即清窗口**(2026-10-27):窗口里还留着降级前那段低 AL,
                 // 不清就会在下一轮"凑满窗口"时**立刻再判一次亏本** ⇒
@@ -472,6 +538,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 spec.recent_rounds = 0;
                 spec.recent_tokens = 0;
                 spec.recent_ms = 0.0;
+                spec.low_windows = 0;
+                spec.spec_steps_degraded = 0;
             }
             spec.spec_zero_streak = streak;
             spec.spec_degraded = degraded;
@@ -674,7 +742,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let act = self.turns.active()?;
             act.out.len().saturating_add(toks.len()) >= act.max_new
         };
-        if !round_done {
+        // **降级态不产草稿**:本轮已判"裸 decode"(或继续保持降级)⇒ 草稿无人
+        // 消费(下一次探测在 8~64 步后),产了只会变成陈旧账(见 `acquire_drafts`
+        // 注)。恢复轮(`degraded_now = false`)照常产 —— 下一轮正好接上。
+        if !round_done && !degraded_now {
         // DFlash2 lookup 草稿:历史 = prompt_ids + out(含当前 token)
         // + 本轮 verify 块 `toks`(ids[0..=m];末位 bonus 是下一轮 anchor)。
         let lookup = self.dflash_lookup_for_tail(&toks)?;
@@ -1562,6 +1633,19 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         depth: usize,
     ) -> Result<(Vec<u32>, std::time::Duration)> {
         let mut spent = std::time::Duration::ZERO;
+        // **降级态不许消费陈旧草稿**(2026-11-03 立案;`deg` 永不恢复的真凶):
+        //
+        // `spec_drafts_host` 是"**上一轮 ⑦** 为本轮预产的草稿"(位置 = 上一轮
+        // 结束时的 fed)。降级态只在 `probe_every` 步之后开一轮探测 —— 中间隔着
+        // 8~64 枚**裸 decode**,草稿早过期了;而旧实现在探测轮照旧 `take()` 它
+        // ⇒ 每轮都在拿 ~64 token 之前的预测去对现在的 target ⇒ 必然 m=0。
+        // 真机取证(双 3080 / 101k turn):降级 **53 次探测全部 m=0**、
+        // `spec.undegrad=0`、`deg=3238/6445`(一半的解码步永久裸跑)。
+        // ⇒ 降级态一律丢弃,改走下面的**当步 eager propose**。
+        let degraded_now = self.tspec_ref()?.spec_degraded;
+        if degraded_now {
+            self.tspec()?.spec_drafts_host = None;
+        }
         let drafts: Vec<u32> = if let Some(mut d) = self.tspec()?.spec_drafts_host.take() {
             // depth 联动截断(2026-10-09 depth=3 案):⑦ propose 恒产 7
             // 草稿,depth<7 时下轮 block=1+7 行装不进 T=depth+1 捕获图
