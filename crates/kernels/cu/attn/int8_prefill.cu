@@ -29,6 +29,11 @@ __device__ __forceinline__ uint16_t p_code8(float p, float inv) {
     asm("cvt.rni.sat.u8.f32 %0, %1;" : "=h"(r) : "f"(p * inv));
     return r;
 }
+__device__ __forceinline__ float ex2f_fast(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
 }  // namespace
 
 extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
@@ -186,14 +191,14 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
         const float nm1 = fmaxf(run_m1, bm1);
         const float alpha0 = (run_m0 == -CUDART_INF_F)
                                  ? 0.0f
-                                 : exp2f(__fmaf_rn(run_m0, scale_l2, -nm0 * scale_l2));
+                                 : ex2f_fast(__fmaf_rn(run_m0, scale_l2, -nm0 * scale_l2));
         const float alpha1 = (run_m1 == -CUDART_INF_F)
                                  ? 0.0f
-                                 : exp2f(__fmaf_rn(run_m1, scale_l2, -nm1 * scale_l2));
+                                 : ex2f_fast(__fmaf_rn(run_m1, scale_l2, -nm1 * scale_l2));
         const float pmax0 = bm0 > -CUDART_INF_F
-                                ? exp2f(__fmaf_rn(bm0, scale_l2, -nm0 * scale_l2)) : 0.0f;
+                                ? ex2f_fast(__fmaf_rn(bm0, scale_l2, -nm0 * scale_l2)) : 0.0f;
         const float pmax1 = bm1 > -CUDART_INF_F
-                                ? exp2f(__fmaf_rn(bm1, scale_l2, -nm1 * scale_l2)) : 0.0f;
+                                ? ex2f_fast(__fmaf_rn(bm1, scale_l2, -nm1 * scale_l2)) : 0.0f;
         const float ps0 = pmax0 > 0.0f ? pmax0 * (1.0f / 255.0f) : (1.0f / 255.0f);
         const float ps1 = pmax1 > 0.0f ? pmax1 * (1.0f / 255.0f) : (1.0f / 255.0f);
         const float inv0 = pmax0 > 0.0f ? 255.0f / pmax0 : 0.0f;
@@ -204,13 +209,13 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {
             const float p00 = score[nt][0] > -CUDART_INF_F
-                                  ? exp2f(__fmaf_rn(score[nt][0], scale_l2, -nm0s)) : 0.0f;
+                                  ? ex2f_fast(__fmaf_rn(score[nt][0], scale_l2, -nm0s)) : 0.0f;
             const float p01 = score[nt][1] > -CUDART_INF_F
-                                  ? exp2f(__fmaf_rn(score[nt][1], scale_l2, -nm0s)) : 0.0f;
+                                  ? ex2f_fast(__fmaf_rn(score[nt][1], scale_l2, -nm0s)) : 0.0f;
             const float p10 = score[nt][2] > -CUDART_INF_F
-                                  ? exp2f(__fmaf_rn(score[nt][2], scale_l2, -nm1s)) : 0.0f;
+                                  ? ex2f_fast(__fmaf_rn(score[nt][2], scale_l2, -nm1s)) : 0.0f;
             const float p11 = score[nt][3] > -CUDART_INF_F
-                                  ? exp2f(__fmaf_rn(score[nt][3], scale_l2, -nm1s)) : 0.0f;
+                                  ? ex2f_fast(__fmaf_rn(score[nt][3], scale_l2, -nm1s)) : 0.0f;
             sum0 += p00 + p01;
             sum1 += p10 + p11;
             const int col0 = nt * 8 + 2 * lid;
