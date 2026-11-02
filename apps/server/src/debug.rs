@@ -188,13 +188,13 @@ pub fn launches_json(n: usize, kind: Option<&str>) -> Value {
     })
 }
 
+///
 /// **块账本投影**(`GET /debug/blocks`)。
 ///
 /// 与发射账(`/debug/launches`)互补:那张账是"每次命令的块 id + 地址",
 /// 本投影是**当前账本的权威快照**。两份内联不变量直接给出判决:
 /// - `dup_ids`:同一 id 出现两次(账本条目被顶掉/复用)⇒ 写读可能落在不同物理块;
-/// - `overlaps`:两个**活块**的地址区间相交 ⇒ 池把重叠区间发给了两个块。
-/// (仓内 2026-10-08 E5 跨流回收律 / 2026-10-03 FI 表渐进腐败案都栽在这两件事上。)
+/// - `overlaps`:两个**活块**的地址区间相交 ⇒ 池把重叠区间发给了两个块。 (仓内 2026-10-08 E5 跨流回收律 / 2026-10-03 FI 表渐进腐败案都栽在这两件事上。)
 pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
     let mut by_addr: Vec<&owl_cuda::BlockLedgerRow> = rows.iter().collect();
     by_addr.sort_by_key(|r| r.addr);
@@ -245,6 +245,8 @@ pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
 ///
 /// **判据面**:`owners[]` 里同一 owner 的 `bytes` 逐轮**单调爬坡 = 泄漏**;
 /// 持平 = 正常。`system` 桶 = 尚未接线 owner 的存量调用点(随 N4/N5 排空)。
+// 结构性豁免(2026-11-02 clippy 清理):排序键是复合比较(多字段/方向混合),抽 key 会丢掉可读性
+#[allow(clippy::unnecessary_sort_by)]
 pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
     let r = &snap.report;
     let owners: Vec<Value> = r
@@ -556,6 +558,8 @@ fn r_events(rep: &owl_store::StoreReport) -> Vec<(u8, Vec<u64>)> {
 /// - `only_block`:块账房有、事件账没有 ⇒ 该块**没走 DeviceHandle**(或后端自管,如 peer 面);
 /// - `only_event`:事件账有、块账房没有 ⇒ 已销但块仍在(含"被图租约拒收的 free")或**后端已回收但本层未销**;
 /// - `equal`:两面 id 集逐字相等(= 全等门通过)。
+// 结构性豁免(2026-11-02 clippy 清理):排序键是复合比较(多字段/方向混合),抽 key 会丢掉可读性
+#[allow(clippy::unnecessary_sort_by)]
 fn recon_json(
     rank: u8,
     dump: &Result<Vec<owl_iface::contract::BlockLedgerRow>, String>,

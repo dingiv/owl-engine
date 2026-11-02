@@ -1345,8 +1345,9 @@ mod m_scan {
     }
 
     impl WeightSource for OneTensor {
-        fn take(&self, key: &str) -> Taken<Vec<f32>> {
-            if key == self.key { Ok(None) } else { Ok(None) }
+        fn take(&self, _key: &str) -> Taken<Vec<f32>> {
+            // 本桩只服务 `elem_len`/`native_dtype` 两问:take 永远"没有数据"。
+            Ok(None)
         }
         fn elem_len(&self, key: &str) -> Taken<usize> {
             Ok((key == self.key).then_some(self.bytes.len()))
@@ -1421,7 +1422,7 @@ mod m_scan {
             for m in [8usize, 17] {
                 let xb: Vec<u8> = (0..m * inner)
                     .flat_map(|i| {
-                        let v = (((i as f32) * 0.013).sin() * 1.4) as f32;
+                        let v = ((i as f32) * 0.013).sin() * 1.4;
                         half::f16::from_f32(v).to_le_bytes()
                     })
                     .collect();
@@ -1514,7 +1515,7 @@ mod m_scan {
                 }
                 let xb: Vec<u8> = (0..m * in_dim)
                     .flat_map(|i| {
-                        let v = (((i as f32) * 0.013).sin() * 1.4) as f32;
+                        let v = ((i as f32) * 0.013).sin() * 1.4;
                         half::f16::from_f32(v).to_le_bytes()
                     })
                     .collect();
@@ -1567,7 +1568,7 @@ mod m_scan {
                     // 与 f16 侧同源同值(同一 seed 公式),只换 bf16 编码
                     let xb16: Vec<u8> = (0..m * in_dim)
                         .flat_map(|i| {
-                            let v = (((i as f32) * 0.013).sin() * 1.4) as f32;
+                            let v = ((i as f32) * 0.013).sin() * 1.4;
                             half::bf16::from_f32(v).to_le_bytes()
                         })
                         .collect();
@@ -1680,7 +1681,7 @@ mod m_scan {
             let mut prev = 0f64;
             for m in [1usize, 2, 4, 8, 16, 32, 64, 128] {
                 let xv: Vec<f32> = (0..m * in_dim)
-                    .map(|i| ((i as f32 * 0.017).sin() * 1.5) as f32)
+                    .map(|i| (i as f32 * 0.017).sin() * 1.5)
                     .collect();
                 let xb: Vec<u8> = xv.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect();
                 let x = TensorOps::from_host(Dtype::F16, vec![m, in_dim], &xb);

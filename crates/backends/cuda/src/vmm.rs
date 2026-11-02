@@ -259,7 +259,7 @@ pub(super) fn import_mapped(
     }
     let prop = dev_prop(ordinal);
     let gran = min_granularity(&prop)?;
-    if mapped_bytes % gran != 0 {
+    if !mapped_bytes.is_multiple_of(gran) {
         return Err(ModelError::Msg(format!(
             "VMM import:对端映射大小 {mapped_bytes} 不是本端粒度 {gran} 的倍数(拒绝)"
         )));

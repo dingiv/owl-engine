@@ -112,12 +112,22 @@ fn with_runner<R>(f: impl FnOnce(&mut dyn CheckRunner) -> R) -> Option<R> {
     let mut res = TestRes::new(dev);
     let mut exec = Exec::new();
     // 自检面:纯 native 发射(`launch_aot`),注册表只服务家族臂 ⇒ None
-    let mut r = Runner { res: &mut res, exec: &mut exec, registry: None };
+    let mut r = Runner {
+        res: &mut res,
+        exec: &mut exec,
+        registry: None,
+    };
     Some(f(&mut r))
 }
 
 /// 发射一趟(几何与 `driver::elems::quant_int8_row` 单源:grid = rows,block = 256)
-fn run(dt: Dtype, x_bits: &[u8], rows: usize, cols: usize, mul: f32) -> Option<(Vec<i8>, Vec<f32>)> {
+fn run(
+    dt: Dtype,
+    x_bits: &[u8],
+    rows: usize,
+    cols: usize,
+    mul: f32,
+) -> Option<(Vec<i8>, Vec<f32>)> {
     with_runner(|r| {
         let x = r.alloc(x_bits.len(), "s1c.x").expect("alloc x");
         r.upload(x, x_bits).expect("upload x");
@@ -163,7 +173,8 @@ fn run(dt: Dtype, x_bits: &[u8], rows: usize, cols: usize, mul: f32) -> Option<(
 fn cmp_i8(got: &[i8], want: &[i8], cols: usize, what: &str) {
     for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
         assert_eq!(
-            g, w,
+            g,
+            w,
             "{what}: 首处不符 idx={i}(row {}, col {})gpu={g} host={w}",
             i / cols,
             i % cols

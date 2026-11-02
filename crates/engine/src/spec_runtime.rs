@@ -443,7 +443,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             // 且草稿 GEMM 不再付解量化。
             // ⚠️ TP 档暂走 F16 头:原生块的 `eh_proj` 半拆只实现了**单卡全量**
             // (分片下的行/列窗口是另一套块算术);TP 需要的形状由 `shard_draft_plan` 给。
-            let tp1 = inp.tp.as_ref().map_or(true, |p| p.world() == 1);
+            let tp1 = inp.tp.as_ref().is_none_or(|p| p.world() == 1);
             let (mtp, native_blocks) = if is_gguf && tp1 {
                 let g = owl_models::formats::gguf::Gguf::open(dir)?;
                 let table = owl_models::formats::gguf::DraftGgufPlan::new(&g);

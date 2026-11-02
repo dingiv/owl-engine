@@ -262,6 +262,8 @@ fn gen(t: usize, nv: usize, nk: usize) -> In {
     }
 }
 
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 fn fire(
     res: &mut TestRes,
     exec: &mut Exec,
@@ -311,6 +313,8 @@ fn spin_up(
 }
 
 /// K × M 发射的 µs/发(M=1 = host 提交地板;M=8 = 设备读数)
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 fn time_us(
     res: &mut TestRes,
     exec: &mut Exec,

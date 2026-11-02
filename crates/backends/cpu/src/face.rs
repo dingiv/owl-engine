@@ -258,7 +258,7 @@ impl CpuFace {
             .ok_or(ModelError::DeadBlock { id })?
             .f32
             .len();
-        if dsz == 0 || off_bytes % dsz != 0 || len_bytes % dsz != 0 {
+        if dsz == 0 || !off_bytes.is_multiple_of(dsz) || !len_bytes.is_multiple_of(dsz) {
             return Err(ModelError::Msg(format!(
                 "CpuFace::{what}: 偏移/长度须按声明 dtype 对齐(块 {id} 声明 {dtype:?} dsz {dsz};off {off_bytes}B len {len_bytes}B)"
             )));
@@ -1186,8 +1186,7 @@ mod tests {
         let _y = g.alloc(Dtype::F32, 1, "t").await.expect("注入是一次性的");
     }
 
-    /// **复合上传口(§18)**:`upload_and_launch` 按**声明 dtype** 解码(BF16 源)
-    /// + 就地发射 —— 装载 cast 路径在 CPU 档可跑的关键。
+    /// **复合上传口(§18)**:`upload_and_launch` 按**声明 dtype** 解码(BF16 源) + 就地发射 —— 装载 cast 路径在 CPU 档可跑的关键。
     #[tokio::test]
     async fn upload_and_launch_decodes_declared_dtype() {
         let mut f = CpuFace::new();
@@ -1289,6 +1288,8 @@ mod bench {
 mod lut_tests {
     /// 查找表与 `half` 本体**逐位一致**(含 subnormal / ±0 / inf / nan)。
     #[test]
+    // 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+    #[allow(clippy::needless_range_loop)]
     fn f16_lut_matches_half_bit_for_bit() {
         let lut = super::f16_lut();
         for i in 0..65536usize {
@@ -1305,6 +1306,8 @@ mod bench2 {
 
     /// **受控对照(§18.4.2)**:同数据、同写入目标,切分方式不同 + 纯写基线(black_box 防消除)。
     #[test]
+    // 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+    #[allow(clippy::needless_range_loop)]
     fn decode_variants_bench() {
         let n = 10_000_000usize;
         let bytes = vec![0x3Fu8; n * 2];
@@ -1359,6 +1362,8 @@ mod bench3 {
 
     /// **真实规模对照**(134MB 输入 / 268MB 输出 = embed_tokens 档,超 L3)。
     #[test]
+    // 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+    #[allow(clippy::needless_range_loop)]
     fn decode_variants_big() {
         let n = 67_108_864usize; // 与装载实测的块 1 同量级
         let bytes = vec![0x3Fu8; n * 2];
@@ -1467,6 +1472,8 @@ pub fn bench_read(n_bytes: usize) -> f64 {
 }
 
 /// **复刻 `upload_pinned` 的 F16 解码循环**(优化编译;诊断对照用)。
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 pub fn bench_decode_f16(bytes: &[u8], dst: &mut [f32]) -> f64 {
     let lut = f16_lut();
     let n = dst.len().min(bytes.len() / 2);

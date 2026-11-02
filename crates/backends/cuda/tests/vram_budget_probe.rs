@@ -35,8 +35,12 @@ async fn logical_cap_refuses_before_cuda() {
     }
     let mut c = client_with(DiagOpts { vram_budget_mb: Some(1), ..Default::default() }).await;
     // 先占 0.5MiB(在上限内):应放行
-    let ok = c.alloc(Dtype::F32, (512 * 1024) / 4, "probe:budget-ok").await.expect("预算内应放行");
-    drop(ok);
+    let ok = c
+        .alloc(Dtype::F32, (512 * 1024) / 4, "probe:budget-ok")
+        .await
+        .expect("预算内应放行");
+    // 句柄非 `Drop`:归还走 fake client 的显式接口;这里只结束借用(`drop()` 会误导)。
+    let _ = ok;
     // 再要 2MiB:live(0.5MiB 已归还但账已记)… 直接要 2MiB > 1MiB 上限 ⇒ 拒
     let err = c
         .alloc(Dtype::F32, (2 * 1024 * 1024) / 4, "probe:budget-over")

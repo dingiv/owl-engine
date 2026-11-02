@@ -32,7 +32,7 @@
 //! ```
 //! 子集跑(调试):`OWL_G8A_GROUPS=chunk64-pc-on`(逗号分隔的装配组标签)。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use owl_engine::{Engine, EngineConfig, EngineKnobs, RunningEngine, TpEngine};
 use owl_iface::contract::ModelError;
@@ -64,6 +64,8 @@ fn dir_of() -> PathBuf {
 /// 两臂必须逐字段同参(差异只允许在"形状"轴上)。
 /// `raw_completion` = 绕过 chat 模板 ⇒ prompt token 账 = 原样 encode(门要
 /// 直接构造 token 级前缀,greedy + 关采样同 G8-b)。
+// 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
+#[allow(clippy::field_reassign_with_default)]
 fn knobs(prefix_cache: bool) -> EngineKnobs {
     let mut k = EngineKnobs::default();
     k.sampler_enabled = false; // 设备 argmax(逐 token 确定性)
@@ -146,7 +148,7 @@ async fn run_turn(
 async fn assemble(
     oa: usize,
     ob: usize,
-    dir: &PathBuf,
+    dir: &Path,
     chunk: usize,
     prefix_cache: bool,
 ) -> TpEngine<owl_cuda::GpuClient> {
@@ -246,24 +248,32 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
 
         let mut arms: Vec<Arm> = Vec::new();
         // ① 基线:单请求冷启动(sid = 1)
-        arms.push(labeled(&label, "/base", run_turn(&mut r, 1, PROMPT, GEN).await));
+        arms.push(labeled(
+            label,
+            "/base",
+            run_turn(&mut r, 1, PROMPT, GEN).await,
+        ));
         // ② 队列形状:3 个干扰 turn 在前(队列 FIFO),目标 turn 在后(sid = 2)
         for (i, d) in DISTRACT.iter().enumerate() {
             let _ = run_turn(&mut r, 10 + i as u64, d, DISTRACT_GEN)
                 .await
                 .expect("干扰 turn 失败");
         }
-        arms.push(labeled(&label, "/queue3", run_turn(&mut r, 2, PROMPT, GEN).await));
+        arms.push(labeled(
+            label,
+            "/queue3",
+            run_turn(&mut r, 2, PROMPT, GEN).await,
+        ));
         // ③ 跨会话同 prompt(新 sid = 3;pc 开时走跨会话前缀匹配)
         arms.push(labeled(
-            &label,
+            label,
             "/cross-session",
             run_turn(&mut r, 3, PROMPT, GEN).await,
         ));
         // ④ 会话热账:同 sid 重发同 prompt(sid = 1;账 = PROMPT+GEN ⇒ guard 失配,
         //    但前缀匹配/paged 复用仍可达 —— "有旧账要归还"的形状)
         arms.push(labeled(
-            &label,
+            label,
             "/session-replay",
             run_turn(&mut r, 1, PROMPT, GEN).await,
         ));

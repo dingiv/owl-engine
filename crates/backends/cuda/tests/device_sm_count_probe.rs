@@ -15,6 +15,8 @@
 use owl_cuda::ffi;
 
 #[test]
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn sm_count_is_a_real_attribute() {
     // 枚举面显式初始化(ffi 的 device_rows/device_sm_count 内部自管 cuInit;
     // 裸计数口不自管 ⇒ 测试自己先 init,别依赖调用顺序)

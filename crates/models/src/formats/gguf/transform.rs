@@ -58,11 +58,7 @@ impl GgufDims {
     }
     /// 每 k 头挂几个 v 头
     pub fn vpr(&self) -> usize {
-        if self.nk == 0 {
-            0
-        } else {
-            self.nv / self.nk
-        }
+        self.nv.checked_div(self.nk).unwrap_or(0)
     }
     /// GDN 段几何(q|k|v 三段;`conv_dim = 2·nk·hk + nv·hv`)
     pub fn seg(&self) -> (usize, usize, usize) {
@@ -316,7 +312,7 @@ pub fn col_deperm_in_place(
 /// 置换单元与量化块错位 = 静默错值)。表长 = `nv * hd / 32`。
 pub fn vhead_q8_blocks(nk: usize, nv: usize, hd: usize) -> Result<Vec<u32>, ModelError> {
     const Q8: usize = owl_kernels::family::gguf::QK_32;
-    if hd % Q8 != 0 || nk == 0 || nv % nk != 0 {
+    if !hd.is_multiple_of(Q8) || nk == 0 || !nv.is_multiple_of(nk) {
         return Err(ModelError::Msg(format!(
             "v-head 列置换:头维 {hd} 不是 q8_1 块大小 {Q8} 的整数倍(或 nk={nk} 不整除 nv={nv})⇒ 块粒度置换不成立"
         )));

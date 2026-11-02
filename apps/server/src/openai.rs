@@ -476,10 +476,10 @@ impl ChatRequest {
         {
             return v;
         }
-        match self.reasoning_effort.as_deref() {
-            Some(e) if reasoning_off(e) => false,
-            _ => true,
-        }
+        !matches!(
+            self.reasoning_effort.as_deref(),
+            Some(e) if reasoning_off(e)
+        )
     }
 }
 
@@ -503,6 +503,8 @@ pub fn session_id(key: &str) -> u64 {
 // §2 JSON 构造
 // ============================================================================
 
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 pub fn completion_json(
     id: &str,
     model: &str,
@@ -718,6 +720,8 @@ fn dump_request(dir: &std::path::Path, body: &[u8]) {
 }
 
 /// chat completions:提交 actor → 首笔 Accepted/Rejected → 三通道折叠循环。
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     body: &[u8],
@@ -1449,6 +1453,8 @@ async fn abort_turn(tx: &mpsc::Sender<EngineReq>, session: Option<u64>, turn: Op
 }
 
 /// 三通道产出 → SSE 帧(流式)或聚合器(非流式);role 首帧在此处懒发
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 async fn emit_items<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     mode: ReplyMode,

@@ -57,10 +57,7 @@ pub const GEMM_W4A8_AWQ_SLOTS: &str =
 
 /// foreign 分派谓词(server handle_launch 前置检查;cublas 同款)
 pub fn is_foreign(name: &str) -> bool {
-    name == GEMM_W4A16
-        || name == GEMM_W4A16_AWQ
-        || name == GEMM_W4A16_BF16
-        || name == GEMM_W4A8_AWQ
+    name == GEMM_W4A16 || name == GEMM_W4A16_AWQ || name == GEMM_W4A16_BF16 || name == GEMM_W4A8_AWQ
 }
 
 pub const V2_ERR_NO_CONFIG: i32 = 3;
@@ -408,7 +405,11 @@ pub unsafe fn gemm_v2_awq_raw_cfg(
         thread_k,
         thread_n,
     );
-    if err == 0 { Ok(()) } else { Err(err) }
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 /// **配置可注**的 W4A8×AWQ GEMM(2026-11-01;只为**台子**)—— 与
@@ -453,7 +454,11 @@ pub unsafe fn gemm_v2_awq_w4a8_cfg_raw(
         thread_k,
         thread_n,
     );
-    if err == 0 { Ok(()) } else { Err(err) }
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 /// W4A8 × AWQ GEMM(裸指针):`a` = **int8 已量化激活**,`a_scales` = per-token
@@ -497,7 +502,11 @@ pub unsafe fn gemm_v2_awq_w4a8_raw(
         0, // is_bf16 = false(f16 档;bf16 档待接)
         if w4a8_m8 { 1 } else { 0 },
     );
-    if err == 0 { Ok(()) } else { Err(err) }
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 #[cfg(feature = "marlin")]
@@ -537,8 +546,7 @@ mod size_checks {
 
 /// **marlin 后端**(`QuantGemm` 契约的首个实现体)。
 ///
-/// 能力真值 = 架构真值:Marlin 的设备码用 Ampere 原语(`cp.async` + `ldmatrix`
-/// + `mma.sync`),**消费级四代**里 sm86 / sm89 / sm120 答"支持",sm75(RTX 20 系)
+/// 能力真值 = 架构真值:Marlin 的设备码用 Ampere 原语(`cp.async` + `ldmatrix` + `mma.sync`),**消费级四代**里 sm86 / sm89 / sm120 答"支持",sm75(RTX 20 系)
 /// 答"不支持";表外代际(数据中心卡等)按 `caps()` 的硬件事实回答。
 /// **支持 ≠ 该卡已验证**:验证状态归试验台账,装错代际由装配期架构门拦截。
 /// ⚠️ 三处 `match` **故意不写通配臂**:未来新增 `Arch` 变体时,
@@ -585,6 +593,9 @@ mod capability_tests {
             assert!(b.w4a8(a), "w4a8 {a:?}(int8 IMMA 需 sm80+)");
             assert!(b.moe_wna16(a), "moe_wna16 {a:?}");
         }
-        assert!(crate::dispatch(Arch::Sm86).contains("marlin"), "dispatch 指向 marlin 后端");
+        assert!(
+            crate::dispatch(Arch::Sm86).contains("marlin"),
+            "dispatch 指向 marlin 后端"
+        );
     }
 }

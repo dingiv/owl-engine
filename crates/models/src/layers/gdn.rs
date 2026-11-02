@@ -470,6 +470,8 @@ pub(crate) fn recurrence_varlen(
 /// act_silu = true(Qwen3.5)/ false = sigmoid(Qwen4 预留)。
 /// 发射 = (rows·value_dim/group_size,1,1) × (256,1,1)。
 #[allow(clippy::too_many_arguments)]
+// 结构性豁免(2026-11-02 clippy 清理):枚举变体大小差是**形状事实**(工作单元 vs 标量);装箱会把热路径变成间接访存
+#[allow(clippy::large_enum_variant)]
 pub fn norm_act(
     x: &TensorOps,
     z: &TensorOps,
@@ -506,6 +508,9 @@ pub fn norm_act(
 /// (一个 GEMM 吃 `[2K+2V, hidden]`,marlin tile 完美)。
 ///
 /// 判据 = [`SourceFacts::merged_segments_may_differ`](源事实,不是猜)。
+// 结构性豁免(2026-11-02 clippy 清理):变体大小差 = 形状事实(整层权重束 vs 两条),
+// 装箱会把热路径的一次读变成间接访存。
+#[allow(clippy::large_enum_variant)]
 enum GdnProj {
     /// 合并单投影(`in_proj_qkvz`,HF 臂)
     Merged(Linear),

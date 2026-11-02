@@ -50,6 +50,8 @@ fn f16_bits(v: f32) -> u16 {
 
 /// 宿主参考(与 `owl_store::score_blocks(SoftmaxMean)` 逐式同源;
 /// 操作数先过 f16 边界以对齐设备口径)
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn host_ref() -> Vec<f32> {
     let scale = 1.0f32 / (HD as f32).sqrt();
     let gqa = gqa_map();
@@ -57,10 +59,10 @@ fn host_ref() -> Vec<f32> {
     for l in 0..LAYERS {
         let _ = l; // mk 每层各一份;参考里两层同分布(与设备同)
         for t in 0..W {
-            let mut acc = vec![0.0f32; NB];
+            let mut acc = [0.0f32; NB];
             for h in 0..HQ {
                 let g = gqa[h] as usize;
-                let mut logits = vec![0.0f32; NB];
+                let mut logits = [0.0f32; NB];
                 for b in 0..NB {
                     let mut dot = 0.0f32;
                     for d in 0..HD {
@@ -107,8 +109,8 @@ fn run(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Vec<f32> {
     let mut d_gqa = unsafe { stream.alloc::<u32>(gqa.len()) }.unwrap();
     stream.memcpy_htod(&gqa, &mut d_gqa).unwrap();
 
-    let mut d_z = unsafe { stream.alloc::<u16>(W * HQ * NB) }.unwrap();
-    let mut d_ms = unsafe { stream.alloc::<f32>(W * HQ * 2) }.unwrap();
+    let d_z = unsafe { stream.alloc::<u16>(W * HQ * NB) }.unwrap();
+    let d_ms = unsafe { stream.alloc::<f32>(W * HQ * 2) }.unwrap();
     let mut d_out = unsafe { stream.alloc::<f32>(NB) }.unwrap();
     stream.memset_zeros(&mut d_out).unwrap();
 
@@ -116,7 +118,7 @@ fn run(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Vec<f32> {
     let f_maxsum = compile(ctx, "owl_kvscore_maxsum");
     let f_acc = compile(ctx, "owl_kvscore_acc");
 
-    for layer in 0..LAYERS {
+    for _layer in 0..LAYERS {
         // 本层 mean-K（两层同内容 ⇒ 参考里的 `let _ = l` 成立）
         let mk_bits: Vec<u16> = (0..NB * HKV * HD)
             .map(|i| f16_bits(host_mk(i / (HKV * HD), (i / HD) % HKV, i % HD)))
@@ -249,8 +251,8 @@ fn page_softmax_bench_production_shape() {
     stream.memcpy_htod(&mk_bits, &mut d_mk).unwrap();
     let mut d_gqa = unsafe { stream.alloc::<u32>(gqa.len()) }.unwrap();
     stream.memcpy_htod(&gqa, &mut d_gqa).unwrap();
-    let mut d_z = unsafe { stream.alloc::<u16>(BW_ * BHQ * BNB) }.unwrap();
-    let mut d_ms = unsafe { stream.alloc::<f32>(BW_ * BHQ * 2) }.unwrap();
+    let d_z = unsafe { stream.alloc::<u16>(BW_ * BHQ * BNB) }.unwrap();
+    let d_ms = unsafe { stream.alloc::<f32>(BW_ * BHQ * 2) }.unwrap();
     let mut d_out = unsafe { stream.alloc::<f32>(BNB) }.unwrap();
     stream.memset_zeros(&mut d_out).unwrap();
 

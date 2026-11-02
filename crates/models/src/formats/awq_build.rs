@@ -33,6 +33,9 @@ impl AwqSource {
     /// 锁中毒 ⇒ 就地取回 + **清空** + 告警:内容纯由源算出(丢了重算),
     /// 但半成品/半插入不许留 —— 比 §52 的"就地恢复"更强一档。
     /// 恢复必须**可见**(告警 + 该键重算的代价),不许静默。
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     fn cache_guard(&self) -> std::sync::MutexGuard<'_, (HashMap<String, Arc<[u8]>>, usize)> {
         match self.cache.lock() {
             Ok(g) => g,
@@ -57,6 +60,9 @@ impl AwqSource {
     }
 
     /// 索引缓存(可重算)取用口;语义同 [`Self::cache_guard`]。
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     fn idx_guard(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<(usize, usize, IdxKind), Arc<Vec<u32>>>> {
@@ -173,8 +179,7 @@ impl AwqSource {
 
     /// **bf16 源 → marlin scales 字节**(单遍融合;装载热路径)。
     ///
-    /// 原链 = `bf16_par`(源→f32,11MB)+ `pack_marlin_s`(f32→u16,5.6MB)
-    /// + `u16s_le_bytes`(u16→字节,5.6MB):三分配两拷贝,每键 ≈22MB
+    /// 原链 = `bf16_par`(源→f32,11MB)+ `pack_marlin_s`(f32→u16,5.6MB) + `u16s_le_bytes`(u16→字节,5.6MB):三分配两拷贝,每键 ≈22MB
     /// 新堆页。2026-10-16 release 定谳:`.scales` 352 键 **3.42s** 是全载
     /// 最大单项,而三件纯算力只占 ≈3ms/键 —— 余量全在分配/缺页。
     /// 本函数 = 索引表 gather + bf16→f16 + LE 直写 dst,**一分配一路过**,
@@ -600,9 +605,7 @@ impl AwqSource {
     ///
     /// 与 a16 键族**同源不同布局**(同一份 ct packed/scales/zp):
     /// - B  → `pack_marlin_b_a8`(32×32 tile;与 a16 的 16×64+1024-PIPE 不同)
-    /// - s  → `pack_marlin_s_a8`(perm_single + **int16 归一**;第二返回值 =
-    ///        **全局因子** `max/4096` —— 它折进激活量化核的设备标量块,故单独
-    ///        出一个 `{base}.a8_factor` f32[1] 键给层声明 want)
+    /// - s  → `pack_marlin_s_a8`(perm_single + **int16 归一**;第二返回值 =        **全局因子** `max/4096` —— 它折进激活量化核的设备标量块,故单独        出一个 `{base}.a8_factor` f32[1] 键给层声明 want)
     /// - zp → `pack_marlin_z_a8`(**无 n-interleave**)
     ///
     /// ⚠️ a8 **只有 CPU 打包路**(核侧无 a8 repack GPU 核)⇒ 与 27B 生产默认的
@@ -1115,10 +1118,7 @@ unsafe fn quant_i8_row_bf16_avx2(row: &[u8], dst: &mut [u8], s: f32) {
             let w = _mm256_cvtepu16_epi32(bits);
             let f = _mm256_castsi256_ps(_mm256_slli_epi32(w, 16));
             let q = _mm256_div_ps(f, sv);
-            let r = _mm256_round_ps(
-                q,
-                (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC) as i32,
-            );
+            let r = _mm256_round_ps(q, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
             let r = _mm256_min_ps(_mm256_max_ps(r, lo), hi);
             let iv = _mm256_cvttps_epi32(r);
             let mut tmp = [0i32; 8];

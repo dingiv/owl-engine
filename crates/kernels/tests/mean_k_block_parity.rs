@@ -41,6 +41,8 @@ fn cos_sin(b: usize, t: usize, i: usize) -> (f32, f32) {
     (phase.cos(), phase.sin())
 }
 
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn host_ref(pools: &[Vec<f32>], phys: &[usize], cos: &[f32], sin: &[f32]) -> Vec<u16> {
     assert_eq!(pools.len(), LAYERS, "每层一份池内容");
     let mut acc = vec![0.0f64; NB * LAYERS * HKV * HD];
@@ -234,11 +236,11 @@ fn mean_k_block_parity() {
         for l in 0..LAYERS {
             let mut bits = vec![0u16; NB * PAGE * HKV * HD];
             let mut vals = vec![0f32; NB * PAGE * HKV * HD];
-            for b in 0..NB {
+            for (b, &pb) in phys.iter().enumerate() {
                 for t in 0..PAGE {
                     for h in 0..HKV {
                         for d in 0..HD {
-                            let off = ((phys[b] * PAGE + t) * HKV + h) * HD + d;
+                            let off = ((pb * PAGE + t) * HKV + h) * HD + d;
                             bits[off] = f16_bits(k_value(b, l, t, h, d));
                             vals[off] = f16_val(bits[off]);
                         }
@@ -262,12 +264,13 @@ fn mean_k_block_parity() {
         for l in 0..LAYERS {
             let mut codes = vec![0u8; NB * PAGE * HKV * HD];
             let mut vals = vec![0f32; NB * PAGE * HKV * HD];
-            for b in 0..NB {
+            for (b, &pb) in phys.iter().enumerate() {
                 for t in 0..PAGE {
                     for h in 0..HKV {
                         for d in 0..HD {
-                            let off = ((phys[b] * PAGE + t) * HKV + h) * HD + d;
-                            codes[off] = owl_kernels::ops::oracles::e4m3_encode(k_value(b, l, t, h, d));
+                            let off = ((pb * PAGE + t) * HKV + h) * HD + d;
+                            codes[off] =
+                                owl_kernels::ops::oracles::e4m3_encode(k_value(b, l, t, h, d));
                             vals[off] = owl_kernels::ops::oracles::e4m3_decode(codes[off]);
                         }
                     }

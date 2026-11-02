@@ -855,8 +855,7 @@ pub fn argmax_validx(x: &crate::tensor::TensorOps, n: usize, offset: usize) -> c
 
 /// **激活 per-token int8 量化声明**(W4A8 喂料手;S1c)。
 ///
-/// `x[rows, cols]` → `q[rows, cols]`(**u8 字节承载 int8**,引擎分配的瞬时块)
-/// + `scales[rows]`(f32;受 `mul` 缩放)。
+/// `x[rows, cols]` → `q[rows, cols]`(**u8 字节承载 int8**,引擎分配的瞬时块) + `scales[rows]`(f32;受 `mul` 缩放)。
 ///
 /// 槽序与 `ops::elems::QUANT_INT8_ROW_*` 表逐字对齐:
 /// `x / rows(i32) / cols(i32) / mul(设备标量 f32[1]) / scales(入槽,写出) / q(出槽)`。
@@ -955,7 +954,6 @@ mod foreign_call_lock {
     }
 
     /// 层声明形态(chunked;与 layers/gdn.rs 逐字同构)
-    #[allow(clippy::too_many_arguments)]
     /// GDN chunked 声明(P-6b:槽面 + `tables`(cu|coff|idx)与 `nt` 入参;
     /// 顺序与 `layers::gdn::chunked_delta` 逐字同源 —— 线格式单源)
     #[allow(clippy::too_many_arguments)]

@@ -22,6 +22,8 @@ use crate::module::{ForwardCtx, Loadable, LoaderCtx, LoaderOps, Module, PlanSour
 use crate::TensorOps;
 
 /// token mixer 枚举(layer_types 分派;同层二选一)
+// 结构性豁免(2026-11-02 clippy 清理):枚举变体大小差是**形状事实**(工作单元 vs 标量);装箱会把热路径变成间接访存
+#[allow(clippy::large_enum_variant)]
 pub enum TokenMixer {
     /// full_attention 层(4:1 间隔)
     Full(Attention),

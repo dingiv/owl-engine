@@ -245,8 +245,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
     }
 
-    /// 当前请求的 token 历史 = `prompt_ids + out`(out 末位 = 当前 token)
-    /// + 本轮 verify 块 `tail`(首轮空;轮末 = `toks` = ids[0..=m],末位 bonus)。
+    /// 当前请求的 token 历史 = `prompt_ids + out`(out 末位 = 当前 token) + 本轮 verify 块 `tail`(首轮空;轮末 = `toks` = ids[0..=m],末位 bonus)。
     /// 只在 `[spec] lookup = true` 且 DFlash2 档调用。
     pub(crate) fn dflash_lookup_for_tail(&self, tail: &[u32]) -> Result<Option<LookupProposal>> {
         if !self.dev.spec_rt.lookup {
@@ -400,7 +399,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             if pos <= 18 {
                 if let Err(e) = owl_shared::file_loader::write(
-                    &crate::probe_dump::probe_path("owl_dflash_kpool.bin"),
+                    crate::probe_dump::probe_path("owl_dflash_kpool.bin"),
                     &kbuf,
                 ) {
                     owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
@@ -517,7 +516,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let mut blk = vec![0u8; n * 2];
                 face.dtoh(&b, &mut blk).await?;
                 if let Err(e) = owl_shared::file_loader::write(
-                    &crate::probe_dump::probe_path(&format!("owl_p{i}.bin")),
+                    crate::probe_dump::probe_path(&format!("owl_p{i}.bin")),
                     &blk,
                 ) {
                     owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
@@ -529,7 +528,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let mut hbuf = vec![0u8; n * 2];
             face.dtoh(&b, &mut hbuf).await?;
             if let Err(e) = owl_shared::file_loader::write(
-                &crate::probe_dump::probe_path("owl_dflash_hid.bin"),
+                crate::probe_dump::probe_path("owl_dflash_hid.bin"),
                 &hbuf,
             ) {
                 owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
@@ -538,7 +537,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             m.extend_from_slice(&(pos as u32).to_le_bytes());
             m.extend_from_slice(&anchor.to_le_bytes());
             if let Err(e) = owl_shared::file_loader::write(
-                &crate::probe_dump::probe_path("owl_dflash_meta.bin"),
+                crate::probe_dump::probe_path("owl_dflash_meta.bin"),
                 &m,
             ) {
                 owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
@@ -1188,13 +1187,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         Ok(b)
     }
 
-    /// prefill extend(E5-M5;sglang _append_target_hidden_to_draft_kv
-    /// 同语义):chunk 的 (h_p, emb(t_{p+1})) 对 @ 位置 p 写 mtp KV,
-    /// 草稿链看得见提示词。行数 = t_rows(= T-1;末行配对归下一 chunk /
-    /// propose_first)。eager from_host 表(每 chunk 一次;非图)。
+    // prefill extend(E5-M5;sglang _append_target_hidden_to_draft_kv
+    // 同语义):chunk 的 (h_p, emb(t_{p+1})) 对 @ 位置 p 写 mtp KV,
+    // 草稿链看得见提示词。行数 = t_rows(= T-1;末行配对归下一 chunk /
+    // propose_first)。eager from_host 表(每 chunk 一次;非图)。
 
     /// propose 图步(E5-M5;桶 m):装填 extend/链表 + bt_mtp 持久槽
     /// 重写 → 单 graph_launch → drafts dtoh(host 账)。
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     pub(crate) async fn propose_graph_step(
         &mut self,
         m: usize,
@@ -1690,7 +1692,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let mut buf = vec![0u8; n * 2];
             face.dtoh(&outs[0], &mut buf).await?;
             if let Err(e) = owl_shared::file_loader::write(
-                &crate::probe_dump::probe_path("owl_dflash_mem.bin"),
+                crate::probe_dump::probe_path("owl_dflash_mem.bin"),
                 &buf,
             ) {
                 owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");

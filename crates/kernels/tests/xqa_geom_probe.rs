@@ -126,7 +126,7 @@ fn run_one(ctx_c: &std::sync::Arc<CudaContext>, cfg: &Cfg) -> Vec<u16> {
     let d_scratch = unsafe { stream.alloc::<u8>(256 << 20) }.unwrap();
 
     let (kernel, consts) =
-        owl_kernels::family::xqa::load_for_probe(&ctx_c, cfg.name).expect("载 xqa 资产");
+        owl_kernels::family::xqa::load_for_probe(ctx_c, cfg.name).expect("载 xqa 资产");
 
     let args = owl_kernels::family::xqa::XqaArgs {
         q_seq_len: S as u32,

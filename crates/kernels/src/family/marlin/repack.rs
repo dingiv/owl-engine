@@ -252,7 +252,10 @@ pub fn marlin_scales_index_a8(out: usize, groups: usize) -> Vec<u32> {
 /// 索引表共用骨架(`chunk` = perm 表长度:64 = a16 / 32 = a8)
 fn marlin_scales_index_impl(out: usize, groups: usize, sp: &[usize], chunk: usize) -> Vec<u32> {
     use rayon::prelude::*;
-    assert!(groups * out % chunk == 0, "scales 展平长度须为 perm 块整数倍");
+    assert!(
+        (groups * out).is_multiple_of(chunk),
+        "scales 展平长度须为 perm 块整数倍"
+    );
     let mut idx = vec![0u32; groups * out];
     idx.par_chunks_mut(out)
         .enumerate()
@@ -285,8 +288,7 @@ pub fn pack_marlin_s_idx(scales: &[f32], out: usize, groups: usize, idx: &[u32])
 /// scales(f32 行主序 out×groups)→ marlin s((groups, n) fp16 位型,n = out)。
 /// port upstream Layer.pack 的 s 段(flatten → (-1,64)[:, scale_perm] → 还原)。
 ///
-/// 无缓存调用点(测试/单次)走此壳;**装载热路径**用 [`marlin_scales_index`]
-/// + [`pack_marlin_s_idx`](索引表按形状缓存,消每元素两次除法)。
+/// 无缓存调用点(测试/单次)走此壳;**装载热路径**用 [`marlin_scales_index`] + [`pack_marlin_s_idx`](索引表按形状缓存,消每元素两次除法)。
 pub fn pack_marlin_s(scales: &[f32], out: usize, groups: usize) -> Vec<u16> {
     let idx = marlin_scales_index(out, groups);
     pack_marlin_s_idx(scales, out, groups, &idx)

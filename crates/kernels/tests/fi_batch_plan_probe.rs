@@ -33,11 +33,7 @@ struct Sig {
     int_bytes: usize,
 }
 
-fn plan_one(
-    res: &mut TestRes,
-    q_per_seq: usize,
-    nb: &[usize],
-) -> Sig {
+fn plan_one(res: &mut TestRes, q_per_seq: usize, nb: &[usize]) -> Sig {
     let batch = nb.len();
     let total_rows = q_per_seq * batch;
     let float_ws = unsafe { res.stream.alloc::<u8>(FI_FLOAT_WS_BYTES) }.expect("float_ws");
@@ -81,7 +77,13 @@ fn plan_one(
     };
     assert_eq!(rc, 0, "plan 失败 rc={rc} (q={q_per_seq} nb={nb:?})");
     res.stream.synchronize().expect("sync");
-    Sig { plan0: plan15[0], plan3: plan15[3], cta, split, int_bytes }
+    Sig {
+        plan0: plan15[0],
+        plan3: plan15[3],
+        cta,
+        split,
+        int_bytes,
+    }
 }
 
 #[test]
@@ -95,12 +97,8 @@ fn batch_plan_shape_probe() {
 
     // verify 深度 8(1 + 7 提案);contexts 以页计(page=32 ⇒ 1 页 = 32 token)
     // 4k ctx ≈ 128 页;8k ≈ 256 页;16k ≈ 512 页。
-    let combos_2: Vec<Vec<usize>> = vec![
-        vec![128, 128],
-        vec![200, 56],
-        vec![240, 16],
-        vec![250, 6],
-    ];
+    let combos_2: Vec<Vec<usize>> =
+        vec![vec![128, 128], vec![200, 56], vec![240, 16], vec![250, 6]];
     let combos_4: Vec<Vec<usize>> = vec![
         vec![128, 128, 128, 128],
         vec![200, 200, 100, 12],
@@ -117,10 +115,12 @@ fn batch_plan_shape_probe() {
     for graph in [0u32, 1u32] {
         let mode = graph == 1;
         // 族装配参数唯一写点(env 与原子一次落;探针也走同一接口)
-        owl_kernels::family::flashinfer::configure(owl_kernels::family::flashinfer::FlashinferCfg {
-            cuda_graph: mode,
-            ..Default::default()
-        })
+        owl_kernels::family::flashinfer::configure(
+            owl_kernels::family::flashinfer::FlashinferCfg {
+                cuda_graph: mode,
+                ..Default::default()
+            },
+        )
         .expect("族装配参数");
         for (b, combos) in [(2usize, &combos_2), (4, &combos_4), (8, &combos_8)] {
             let mut baseline: Option<Sig> = None;

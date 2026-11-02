@@ -366,8 +366,11 @@ pub fn kernel_tags(attr: TokenStream, item: TokenStream) -> TokenStream {
             if c.ident == "CAPTURE"
                 && c.expr.to_token_stream().to_string().contains("NoHostWork"))
     });
-    if graph_safe && !consts.iter().any(|i| i.to_string() == "FEAT_GRAPH") {
-        consts.push(syn::Ident::new("FEAT_GRAPH", proc_macro2::Span::call_site()));
+    if graph_safe && !consts.iter().any(|i| i == "FEAT_GRAPH") {
+        consts.push(syn::Ident::new(
+            "FEAT_GRAPH",
+            proc_macro2::Span::call_site(),
+        ));
     }
     let consts = consts.iter().map(|i| quote! { crate::spec::KernelTag::#i });
     let konst: syn::ImplItem = syn::parse_quote! {

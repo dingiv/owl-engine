@@ -18,8 +18,7 @@
 //! # 与 engine 现版的等价承诺(HARD)
 //!
 //! 分配序(FIFO 复用)、驱逐序(叶 LRU + 惰性校验)、前缀匹配语义(逐块父链、
-//! 指纹防碰撞、断链即停)、压力驱逐轮次(≤4 轮)全部**逐条对齐** `BlockManager`
-//! + `PrefixCache` 的现役行为 —— 接线刀的门就是"行为不变"(见卷内 §8 S3-2)。
+//! 指纹防碰撞、断链即停)、压力驱逐轮次(≤4 轮)全部**逐条对齐** `BlockManager` + `PrefixCache` 的现役行为 —— 接线刀的门就是"行为不变"(见卷内 §8 S3-2)。
 //!
 //! # 宿主承载(本刀只立形态,搬运在下一刀)
 //!
@@ -171,11 +170,7 @@ impl KvStore {
     /// 这样正常路径没有第二套决策，`ops.ensure_evicted` 应恒为 0。
     ///
     /// 容量检查失败**不留半截块表**（调用方可安全重试）。
-    pub fn ensure_for_len(
-        &mut self,
-        table: &mut Vec<u32>,
-        target_len: usize,
-    ) -> StoreResult<()> {
+    pub fn ensure_for_len(&mut self, table: &mut Vec<u32>, target_len: usize) -> StoreResult<()> {
         let need = self.blocks_for(target_len);
         if need <= table.len() {
             return Ok(());
@@ -340,11 +335,7 @@ impl KvStore {
     ///
     /// 新进树的条目 ⇒ 缓存持一份绑定引用(`incref`);被容量逐出的条目 ⇒
     /// 释放绑定引用(`decref`)。引用配对全在本方法内自洽 —— 调用方不再手工配。
-    pub fn register_chain(
-        &mut self,
-        tokens: &[u32],
-        table: &[u32],
-    ) -> StoreResult<CacheUpdate> {
+    pub fn register_chain(&mut self, tokens: &[u32], table: &[u32]) -> StoreResult<CacheUpdate> {
         let up = self.tree.insert(tokens, table);
         let mut out = CacheUpdate::default();
         self.apply_tree_update(up, &mut out)?;
@@ -394,7 +385,7 @@ impl KvStore {
     ///
     /// 返回 `(链尾, 整链块数, 最老锚的 last_use)`,按最老在前。
     pub fn host_chain_candidates(&self, protect: &[ChainHash]) -> Vec<(ChainHash, usize, u64)> {
-            // **锚必须是叶**(链尾):以任意宿主块为锚会退化成"根前缀"(span=1),
+        // **锚必须是叶**(链尾):以任意宿主块为锚会退化成"根前缀"(span=1),
         // 真机定谳:那样只把根块搬盘 ⇒ 重启只能重建 1-2 块前缀。
         // 条件:叶在宿主 **且** 从根到叶的整条链都在宿主(否则盘上只有半链)。
         let mut out: Vec<(ChainHash, usize, u64)> = Vec::new();
@@ -501,6 +492,9 @@ impl KvStore {
     ///
     /// 返回 `(新登记块身份, 因容量被逐的条目)`。内容不在设备 ⇒ **不占槽**
     /// (`slot = None`);容量收口沿用树的 `cap`(逐出只摘树条目,不碰槽)。
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     pub fn register_chain_offloaded(
         &mut self,
         tokens: &[u32],
@@ -571,7 +565,11 @@ impl KvStore {
             .filter(|(chain, _, _)| !protect.contains(chain))
             .map(|(chain, last_use, slot)| EvictCandidate {
                 leg: Leg::Kv,
-                tier: if slot.is_some() { Tier::Gpu } else { Tier::Host },
+                tier: if slot.is_some() {
+                    Tier::Gpu
+                } else {
+                    Tier::Host
+                },
                 bytes: self.block_bytes,
                 last_use,
                 chain: Some(chain),
@@ -598,7 +596,13 @@ impl KvStore {
 
     /// 定位一块(内容身份 → 所在层)。
     pub fn locate(&self, chain: ChainHash) -> Option<Tier> {
-        self.tree.get(chain).map(|e| if e.slot.is_some() { Tier::Gpu } else { Tier::Host })
+        self.tree.get(chain).map(|e| {
+            if e.slot.is_some() {
+                Tier::Gpu
+            } else {
+                Tier::Host
+            }
+        })
     }
 
     /// **链级可下沉评估**(§14.6 律):整条链(从根到 `tail`)能不能一起下沉,
@@ -749,7 +753,7 @@ mod tests {
     fn incremental_registration_matches_full_registration() {
         let page = crate::id::TOKENS_PER_BLOCK;
         let t = toks(page * 4); // 4 块
-        // ① 全量:一次性登记 4 块
+                                // ① 全量:一次性登记 4 块
         let mut full = kv(8, 8);
         let mut tbl_full: Vec<u32> = Vec::new();
         full.ensure_for_len(&mut tbl_full, t.len()).expect("块表");
@@ -869,7 +873,8 @@ mod tests {
         let toks_a = toks(8 * 32);
         let up = m.register_chain(&toks_a, &ta).expect("登记缓存");
         assert_eq!(up.inserted.len(), 8);
-        m.release_table(&mut ta).expect("归还 A(缓存持引 ⇒ 块不回池)");
+        m.release_table(&mut ta)
+            .expect("归还 A(缓存持引 ⇒ 块不回池)");
         assert_eq!(m.slots_free(), 0, "缓存应持有全部 8 块");
 
         let evicted = m.evict_cached(8).expect("显式逐缓存");
@@ -923,7 +928,11 @@ mod tests {
         assert_eq!(m.locate(tail), Some(Tier::Host), "层变 host");
         assert_eq!(m.slots_free(), 4, "槽已还池");
         assert_eq!(m.match_prefix(&toks_a).matched_blocks, 1, "host 条目仍命中");
-        assert_eq!(m.match_prefix(&toks_a).blocks[0].slot, None, "设备上没有副本");
+        assert_eq!(
+            m.match_prefix(&toks_a).blocks[0].slot,
+            None,
+            "设备上没有副本"
+        );
 
         // 回灌:会话拿一个**新的**槽(旧槽早已被复用),再重绑
         let mut table = Vec::new();
@@ -967,7 +976,10 @@ mod tests {
         assert_eq!(evicted.len(), 2, "先腾出 A 的两块");
         let mut tb = Vec::new();
         m.ensure_for_len(&mut tb, 16).expect("纯分配放行");
-        assert!(tb.contains(&a_tail_slot), "前提:槽 {a_tail_slot} 确实被复用(tb={tb:?})");
+        assert!(
+            tb.contains(&a_tail_slot),
+            "前提:槽 {a_tail_slot} 确实被复用(tb={tb:?})"
+        );
         m.register_chain(&toks_b, &tb).expect("B 登记缓存");
 
         // 身份:游标 ≡ 缓存树,且不随槽号走
@@ -996,7 +1008,9 @@ mod tests {
         let pm = m.match_prefix(&tokens);
         assert_eq!(pm.matched_blocks, 2);
         let mut cur = ChainCursor::new();
-        let got = cur.advance(crate::id::TOKENS_PER_BLOCK, &tokens, 2).expect("游标");
+        let got = cur
+            .advance(crate::id::TOKENS_PER_BLOCK, &tokens, 2)
+            .expect("游标");
         assert_eq!(got, pm.blocks[1].chain, "游标身份 ≡ 缓存条目身份");
         assert_eq!(Some(got), m.tail_hash(&tokens, 2), "游标 ≡ 从零算");
     }
@@ -1028,14 +1042,18 @@ mod tests {
             }
         }
         assert_eq!(m.chain_down_span(tail), None, "全链在宿主 ⇒ 不出票");
-        assert_eq!(m.chain_down_span(crate::id::ChainHash::new(0xDEAD)), None, "不在账");
+        assert_eq!(
+            m.chain_down_span(crate::id::ChainHash::new(0xDEAD)),
+            None,
+            "不在账"
+        );
     }
 
     /// **腾设备槽只逐设备叶**:host 叶被逐腾不出槽、白丢内容(§16 定谳)。
     #[test]
     fn capacity_eviction_skips_host_leaves_so_slots_actually_free() {
         let mut m = kv(3, 8); // 池 3 槽
-        // 链 A(2 块):尾块沉 host ⇒ A 只占 1 设备槽
+                              // 链 A(2 块):尾块沉 host ⇒ A 只占 1 设备槽
         let toks_a = toks(64);
         let mut ta = Vec::new();
         m.ensure_for_len(&mut ta, 64).expect("A 建链");
@@ -1059,7 +1077,11 @@ mod tests {
         let evicted = evict_device_cached(&mut m, 1);
         assert_eq!(evicted.len(), 1, "只需要一个槽:{evicted:?}");
         assert_eq!(evicted[0].0, tail_b, "逐的是设备叶(B 尾)");
-        assert_eq!(m.locate(tail_a), Some(Tier::Host), "host 叶不得被逐设备路径逐掉");
+        assert_eq!(
+            m.locate(tail_a),
+            Some(Tier::Host),
+            "host 叶不得被逐设备路径逐掉"
+        );
         let mut tc = Vec::new();
         m.ensure_for_len(&mut tc, 32).expect("纯分配");
         assert_eq!(tc.len(), 1);
@@ -1087,11 +1109,15 @@ mod tests {
             t.extend(extra..extra + 32);
             t
         };
-        let (t_d1, t_d2, t_s) = (mk(1000), {
-            let mut t = mk(1000);
-            t.extend(2000..2032);
-            t
-        }, mk(3000));
+        let (t_d1, t_d2, t_s) = (
+            mk(1000),
+            {
+                let mut t = mk(1000);
+                t.extend(2000..2032);
+                t
+            },
+            mk(3000),
+        );
 
         for toks_ in [&fork, &t_d1, &t_d2, &t_s] {
             let mut tab = Vec::new();
@@ -1106,7 +1132,13 @@ mod tests {
         );
         let fork_h = m.tail_hash(&fork, 1).expect("F");
 
-        eprintln!("[dbg] cands={:?}", m.evict_candidates(&[]).iter().map(|c| c.chain).collect::<Vec<_>>());
+        eprintln!(
+            "[dbg] cands={:?}",
+            m.evict_candidates(&[])
+                .iter()
+                .map(|c| c.chain)
+                .collect::<Vec<_>>()
+        );
         let leaf_has = |m: &KvStore, h| m.evict_candidates(&[]).iter().any(|c| c.chain == Some(h));
         assert!(leaf_has(&m, d2), "d2 是叶");
         assert!(leaf_has(&m, s), "s 是叶");

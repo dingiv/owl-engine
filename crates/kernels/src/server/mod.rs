@@ -4,10 +4,11 @@
 //! 依赖 = 本 crate 全量(contract/device/registry/family 底座)+
 //! DeviceRes(由后端或测试实现)。对偶面 = [`crate::client`]。
 
+/// 通信族 runtime(TP2 S2;零门)
+pub mod comm;
 /// cuBLAS GEMM runtime(feature=cublas,随底座)
 #[cfg(feature = "cublas")]
-pub mod cublas;#[cfg(feature = "xqa")]
-pub mod xqa;
+pub mod cublas;
 /// FlashInfer prefill runtime(feature=flashinfer,随底座)
 #[cfg(feature = "flashinfer")]
 pub mod flashinfer;
@@ -15,14 +16,14 @@ pub mod flashinfer;
 pub mod gdn_chunked;
 /// GDN scalar runtime(零门)
 pub mod gdn_scalar;
-/// 通信族 runtime(TP2 S2;零门)
-pub mod comm;
 /// Marlin runtime(feature=marlin,随底座)
 #[cfg(feature = "marlin")]
 pub mod marlin;
 /// NVFP4 块缩放 GEMM runtime(feature=nvfp4,随 `arch-sm120`)
 #[cfg(feature = "nvfp4")]
 pub mod nvfp4;
+#[cfg(feature = "xqa")]
+pub mod xqa;
 
 pub mod selfcheck;
 
@@ -58,4 +59,3 @@ pub fn family_factories() -> Vec<FamilyFactory> {
 // 2026-10-29:`DiagTune` / `DiagError` / `configure_diag` 整体退役 ——
 // kernels 直接用 `owl_shared` 的全局日志(用户裁决:对 kernels 开 shared 的口子),
 // 不再需要 boot 期下发 LogSink;C++ 侧 `OWL_LOG_*` 走 shared 提供的同一组 C ABI。
-

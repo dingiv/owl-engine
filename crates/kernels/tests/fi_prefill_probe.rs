@@ -31,8 +31,8 @@
 #![cfg(feature = "device")]
 
 mod fi_support;
-use owl_macros::owl_test;
 use fi_support::{f16_to_f32, TestRes, H, HD, HKV, PAGE};
+use owl_macros::owl_test;
 
 use std::time::Instant;
 
@@ -91,7 +91,11 @@ fn e4m3_sorted() -> &'static [(f32, u8)] {
             .filter(|c| c & 0x7F != 0x7F) // NaN 两种位型不参与编码(原式同)
             .map(|c| (e4m3_decode_exact(c), c))
             .collect();
-        v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+        v.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
         v
     })
 }
@@ -145,7 +149,9 @@ mod encode_opt_tests {
                 cases.push(v - 1e-3);
             }
         }
-        cases.extend([0.0f32, -0.0, 1e-9, -1e-9, 448.0, -448.0, 1e9, -1e9, 1.0, -1.0]);
+        cases.extend([
+            0.0f32, -0.0, 1e-9, -1e-9, 448.0, -448.0, 1e9, -1e9, 1.0, -1.0,
+        ]);
         for i in 0..20_000u32 {
             let x = i.wrapping_mul(0x9E37_79B9).wrapping_add(0x85EB_CA6B);
             cases.push(((x & 0xFFFF) as f32 / 65535.0 - 0.5) * 2.0);
@@ -166,7 +172,9 @@ mod encode_opt_tests {
 fn lcg_u8(n: usize, seed: u32) -> Vec<u8> {
     (0..n)
         .map(|i| {
-            let x = seed.wrapping_mul(0x9E37_79B9).wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            let x = seed
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
             e4m3_encode(((x & 0xFFFF) as f32 / 65535.0 - 0.5) * 2.0)
         })
         .collect()
@@ -174,7 +182,9 @@ fn lcg_u8(n: usize, seed: u32) -> Vec<u8> {
 fn lcg_f16(n: usize, seed: u32) -> Vec<u16> {
     (0..n)
         .map(|i| {
-            let x = seed.wrapping_mul(0x9E37_79B9).wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            let x = seed
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
             half::f16::from_f32(((x & 0xFFFF) as f32 / 65535.0 - 0.5) * 4.0).to_bits()
         })
         .collect()
@@ -305,11 +315,24 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
     let pool = nb * HKV * HD * PAGE;
     let k_fp8 = lcg_u8(pool, 701);
     let v_fp8 = lcg_u8(pool, 702);
-    let k_f16 = if f16_kv { Some(lcg_f16(pool, 701)) } else { None };
-    let v_f16 = if f16_kv { Some(lcg_f16(pool, 702)) } else { None };
+    let k_f16 = if f16_kv {
+        Some(lcg_f16(pool, 701))
+    } else {
+        None
+    };
+    let v_f16 = if f16_kv {
+        Some(lcg_f16(pool, 702))
+    } else {
+        None
+    };
     let q_f16 = lcg_f16(t * H * HD, 703);
 
-    let q_b = res.upload(&q_f16.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+    let q_b = res.upload(
+        &q_f16
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
     let k_b = if let Some(v) = k_f16.as_ref() {
         res.upload(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())
     } else {
@@ -320,10 +343,25 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
     } else {
         res.upload(&v_fp8)
     };
-    let q_cu = res.upload(&[0u32, t as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+    let q_cu = res.upload(
+        &[0u32, t as u32]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
     let indices: Vec<u32> = (0..nb as u32).collect();
-    let idx_b = res.upload(&indices.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
-    let indptr = res.upload(&[0u32, nb as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+    let idx_b = res.upload(
+        &indices
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+    let indptr = res.upload(
+        &[0u32, nb as u32]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
     let last_len = ctx - (nb - 1) * PAGE;
     let ll_b = res.upload(&(last_len as u32).to_le_bytes());
     let wr_b = res.zeros(8);
@@ -332,7 +370,10 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
     let (kernel_name, kv_dtype) = if f16_kv {
         (owl_kernels::client::flashinfer::PREFILL_FI, Dtype::F16)
     } else {
-        (owl_kernels::client::flashinfer::PREFILL_FI_FP8KV, Dtype::U32)
+        (
+            owl_kernels::client::flashinfer::PREFILL_FI_FP8KV,
+            Dtype::U32,
+        )
     };
     let msg = LaunchMsg {
         kernel: KernelSource {
@@ -340,27 +381,62 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
             source: String::new(),
         },
         args: vec![
-            Arg::Block { id: q_b.id, dtype: Dtype::F16, rank: 2 },
-            Arg::Block { id: k_b.id, dtype: kv_dtype, rank: 1 },
-            Arg::Block { id: v_b.id, dtype: kv_dtype, rank: 1 },
-            Arg::Block { id: q_cu.id, dtype: Dtype::U32, rank: 1 },
-            Arg::Block { id: idx_b.id, dtype: Dtype::U32, rank: 1 },
-            Arg::Block { id: indptr.id, dtype: Dtype::U32, rank: 1 },
-            Arg::Block { id: ll_b.id, dtype: Dtype::U32, rank: 1 },
-            Arg::Block { id: wr_b.id, dtype: Dtype::F16, rank: 1 },
-            Arg::Block { id: out_b.id, dtype: Dtype::F16, rank: 2 },
-            Arg::U64(t as u64),      // total_rows
+            Arg::Block {
+                id: q_b.id,
+                dtype: Dtype::F16,
+                rank: 2,
+            },
+            Arg::Block {
+                id: k_b.id,
+                dtype: kv_dtype,
+                rank: 1,
+            },
+            Arg::Block {
+                id: v_b.id,
+                dtype: kv_dtype,
+                rank: 1,
+            },
+            Arg::Block {
+                id: q_cu.id,
+                dtype: Dtype::U32,
+                rank: 1,
+            },
+            Arg::Block {
+                id: idx_b.id,
+                dtype: Dtype::U32,
+                rank: 1,
+            },
+            Arg::Block {
+                id: indptr.id,
+                dtype: Dtype::U32,
+                rank: 1,
+            },
+            Arg::Block {
+                id: ll_b.id,
+                dtype: Dtype::U32,
+                rank: 1,
+            },
+            Arg::Block {
+                id: wr_b.id,
+                dtype: Dtype::F16,
+                rank: 1,
+            },
+            Arg::Block {
+                id: out_b.id,
+                dtype: Dtype::F16,
+                rank: 2,
+            },
+            Arg::U64(t as u64), // total_rows
             // ⚠️ **过供给腿**(2026-10-18 图档桶化立案):`FI_PF_PLAN_CTX=<大 ctx>`
             // ⇒ plan 按大上界算(表布局/瓦片数按上界),而**池表四件套仍按真 ctx**
             // ⇒ 核内用真 kv_len 夹取、多出来的 kv_tile 落空 ⇒ 正是"信封上界 +
             // 运行期夹取"的模拟(图档 plan 烘图后的形态)。判据 = host oracle。
             Arg::U64(plan_ctx as u64), // ctx_total(plan 面)
-
-            Arg::U64(t as u64),      // T
-            Arg::U64(H as u64),      // hq
-            Arg::U64(HKV as u64),    // hkv
-            Arg::U64(HD as u64),     // hd
-            Arg::U64(PAGE as u64),   // page
+            Arg::U64(t as u64),        // T
+            Arg::U64(H as u64),        // hq
+            Arg::U64(HKV as u64),      // hkv
+            Arg::U64(HD as u64),       // hd
+            Arg::U64(PAGE as u64),     // page
             Arg::U64(((1.0f32 / (HD as f32).sqrt()).to_bits()) as u64), // sm_scale 位型
         ],
         grid: (0, 0, 0),
@@ -391,7 +467,13 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
     let mut line = format!("=== FI T={t} ctx={ctx} (nb={nb}) ===\n  FI: {ms:7.3} ms/call");
     let host_opt = if host_check {
         Some(if f16_kv {
-            host_ref_knhd16(&q_f16, k_f16.as_ref().unwrap(), v_f16.as_ref().unwrap(), t, ctx)
+            host_ref_knhd16(
+                &q_f16,
+                k_f16.as_ref().unwrap(),
+                v_f16.as_ref().unwrap(),
+                t,
+                ctx,
+            )
         } else {
             host_ref_knhd(&q_f16, &k_fp8, &v_fp8, t, ctx)
         })
@@ -405,13 +487,19 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
     // - `fi-fp16acc`(QK half)= 2e-2(实测 f16 池大 logits 到 4e-2,见 devlog);
     // - `fi-fp16pv`(PV half)= 2e-2 + cos ≥ 0.99995 + mean|Δ| ≤ 5e-3(该档的口径)。
     let half_acc = cfg!(feature = "fi-fp16acc") || cfg!(feature = "fi-fp16pv");
-    let gate = owl_shared::env_reader::parse::<f32>("FI_PF_GATE")
-        .unwrap_or(if half_acc { 2e-2 } else { 1e-2 });
+    let gate = owl_shared::env_reader::parse::<f32>("FI_PF_GATE").unwrap_or(if half_acc {
+        2e-2
+    } else {
+        1e-2
+    });
     let pv = cfg!(feature = "fi-fp16pv");
-    let cos_gate = owl_shared::env_reader::parse::<f64>("FI_PF_COS")
-        .unwrap_or(if pv { 0.99995 } else { 0.0 });
-    let mean_gate = owl_shared::env_reader::parse::<f64>("FI_PF_MEAN")
-        .unwrap_or(if pv { 5e-3 } else { f64::INFINITY });
+    let cos_gate =
+        owl_shared::env_reader::parse::<f64>("FI_PF_COS").unwrap_or(if pv { 0.99995 } else { 0.0 });
+    let mean_gate = owl_shared::env_reader::parse::<f64>("FI_PF_MEAN").unwrap_or(if pv {
+        5e-3
+    } else {
+        f64::INFINITY
+    });
     if let Some(host) = host_opt {
         let host = &host;
         let d = fx
@@ -463,10 +551,14 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
                     (nb / n).sqrt(),
                     (na.sqrt() / (nb.sqrt() + 1e-30))
                 );
-                let f0: Vec<String> =
-                    fx[..6.min(fx.len())].iter().map(|v| format!("{v:.4}")).collect();
-                let h0: Vec<String> =
-                    host[..6.min(host.len())].iter().map(|v| format!("{v:.4}")).collect();
+                let f0: Vec<String> = fx[..6.min(fx.len())]
+                    .iter()
+                    .map(|v| format!("{v:.4}"))
+                    .collect();
+                let h0: Vec<String> = host[..6.min(host.len())]
+                    .iter()
+                    .map(|v| format!("{v:.4}"))
+                    .collect();
                 println!("  [FI  row0/h0 前6] {f0:?}");
                 println!("  [host row0/h0 前6] {h0:?}");
                 if !f16_kv {
@@ -487,8 +579,11 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
                         })
                         .collect();
                     cors.sort_by(|a, b| b.0.abs().partial_cmp(&a.0.abs()).unwrap());
-                    let top: Vec<String> =
-                        cors.iter().take(6).map(|(c, b)| format!("tok{b}:{c:.3}")).collect();
+                    let top: Vec<String> = cors
+                        .iter()
+                        .take(6)
+                        .map(|(c, b)| format!("tok{b}:{c:.3}"))
+                        .collect();
                     println!("  [FI vs V 余弦 top6] {top:?}  (ctx={ctx})");
                 }
             }
@@ -502,7 +597,11 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
                     .map(|h| {
                         let a = &fx[s * H * HD + h * HD..s * H * HD + (h + 1) * HD];
                         let b = &host[s * H * HD + h * HD..s * H * HD + (h + 1) * HD];
-                        let m = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+                        let m = a
+                            .iter()
+                            .zip(b)
+                            .map(|(x, y)| (x - y).abs())
+                            .fold(0f32, f32::max);
                         format!("{m:.4}")
                     })
                     .collect();

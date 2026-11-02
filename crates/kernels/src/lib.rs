@@ -19,12 +19,12 @@ pub use owl_iface::contract;
 // 与 `owl_shared::metrics`(用户裁决:对 kernels 开 shared 的口子);
 // C++ 侧 `OWL_LOG_*` 走 shared 提供的同一组 C ABI 符号(同一个全局 logger)。
 
+pub mod bootcheck;
+pub mod cu_sig;
 /// 登记表(list:native kernel 名字 → 源 + 槽序契约 + dtype 标注;
 /// 2026-10-12 自 models::kernel 迁入,同日由 native.rs 更名 list.rs ——
 /// "登记表"才是它的本体,native/foreign 之别交给 driver/registry)
 pub mod kernel;
-pub mod bootcheck;
-pub mod cu_sig;
 
 /// 生产算子元数据表(P3;`impl KernelSpec` 声明,按域分模块)
 pub mod ops;
@@ -100,8 +100,8 @@ pub fn fp4_banner() -> Option<&'static str> {
     }
 }
 
-pub use owl_iface::arch::{Arch, Caps, Family};
 pub use admit::{Admit, AdmitCtx, OpFamily};
+pub use owl_iface::arch::{Arch, Caps, Family};
 
 /// 可捕获 kernel 契约(A1.5)—— 实现者签字画押处。
 ///
@@ -149,5 +149,3 @@ pub fn dispatch(arch: Arch) -> &'static str {
 }
 
 pub mod driver;
-
-

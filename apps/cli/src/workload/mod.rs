@@ -29,7 +29,9 @@ pub(crate) struct ToolOutput {
 
 impl ToolOutput {
     pub(crate) fn text(value: Value) -> Self {
-        Self { content: Value::String(value.to_string()) }
+        Self {
+            content: Value::String(value.to_string()),
+        }
     }
 
     pub(crate) fn image_result(text: String, image: String) -> Self {
@@ -56,6 +58,9 @@ pub struct Args {
     pub keep: bool,
 }
 
+// 结构性豁免(2026-11-02 clippy 清理):
+//   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+#[allow(clippy::type_complexity)]
 pub fn run(args: Args) -> i32 {
     let client = Client::new(&args.url, args.model.clone());
     match client.health() {
@@ -91,7 +96,10 @@ pub fn run(args: Args) -> i32 {
     // suite is spec-on, so a short max_tokens can wedge the engine at the tail.
     let max_tokens = args.max_tokens.max(2048);
     let mut reports = Vec::new();
-    let mut cases: Vec<(&str, fn(&Client, &Args, u32, usize) -> Result<ScenarioReport, String>)> = vec![
+    let mut cases: Vec<(
+        &str,
+        fn(&Client, &Args, u32, usize) -> Result<ScenarioReport, String>,
+    )> = vec![
         ("gui_agent_screenshots", scenarios::gui_agent_screenshots),
         ("gui_capability_prompt", scenarios::gui_capability_prompt),
         ("text_multiturn", scenarios::text_multiturn),
@@ -100,8 +108,14 @@ pub fn run(args: Args) -> i32 {
         ("mixed_tool_image", scenarios::mixed_tool_image),
         ("image_delete_marked", scenarios::image_delete_marked),
         ("image_delete_middle", scenarios::image_delete_middle),
-        ("image_delete_last_image", scenarios::image_delete_last_image),
-        ("image_delete_with_tool_round", scenarios::image_delete_with_tool_round),
+        (
+            "image_delete_last_image",
+            scenarios::image_delete_last_image,
+        ),
+        (
+            "image_delete_with_tool_round",
+            scenarios::image_delete_with_tool_round,
+        ),
         ("image_sliding_window", scenarios::image_sliding_window),
     ];
     if suite == "gui" {
@@ -136,7 +150,11 @@ pub fn run(args: Args) -> i32 {
 
     if args.json {
         let arr: Vec<Value> = reports.iter().map(ScenarioReport::to_json).collect();
-        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_else(|e| format!("[{{\"error\":\"{e}\"}}]")));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&arr)
+                .unwrap_or_else(|e| format!("[{{\"error\":\"{e}\"}}]"))
+        );
     } else {
         for r in &reports {
             report::print_report(r);
@@ -265,7 +283,8 @@ impl<'a> Ctx<'a> {
     }
 
     pub(crate) fn system(&mut self, text: &str) {
-        self.history.push(json!({"role": "system", "content": text}));
+        self.history
+            .push(json!({"role": "system", "content": text}));
     }
 
     /// Force the template's thinking flag for this scenario (useful when a
@@ -276,7 +295,8 @@ impl<'a> Ctx<'a> {
 
     /// Push a user message and run the model/tool loop until `stop`.
     pub(crate) fn send(&mut self, content: Value) -> Result<ChatReply, String> {
-        self.history.push(json!({"role": "user", "content": content}));
+        self.history
+            .push(json!({"role": "user", "content": content}));
         self.round()
     }
 
@@ -371,13 +391,12 @@ impl<'a> Ctx<'a> {
     }
 
     fn enforce_image_limit(&mut self) -> Result<(), String> {
-        let Some(limit) = self.image_limit else { return Ok(()) };
+        let Some(limit) = self.image_limit else {
+            return Ok(());
+        };
         while image_count(&self.history) > limit {
             let removed = remove_oldest_image(&mut self.history).ok_or_else(|| {
-                format!(
-                    "{}: 图片数超过上限 {limit} 但找不到可删图片",
-                    self.scenario
-                )
+                format!("{}: 图片数超过上限 {limit} 但找不到可删图片", self.scenario)
             })?;
             self.image_prunes.push(removed);
         }
@@ -453,11 +472,7 @@ pub(crate) fn image_count(history: &[Value]) -> usize {
     history
         .iter()
         .filter_map(|m| m.get("content").and_then(Value::as_array))
-        .map(|a| {
-            a.iter()
-                .filter(|p| p.get("image_url").is_some())
-                .count()
-        })
+        .map(|a| a.iter().filter(|p| p.get("image_url").is_some()).count())
         .sum()
 }
 

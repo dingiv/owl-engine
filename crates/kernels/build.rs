@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod arch;
 use arch::Arch;
 
-
 // ============================================================================
 // native 核**构建期**编 cubin(2026-10-13 用户裁决"零运行期编译,设备码一律 cubin")
 //
@@ -92,7 +91,11 @@ fn single_arch() -> Arch {
 
 /// 代际集的 `sm_XX` 形(日志/错误/资产申报用)
 fn archs_sm(archs: &[Arch]) -> String {
-    archs.iter().map(|a| a.as_sm()).collect::<Vec<_>>().join(",")
+    archs
+        .iter()
+        .map(|a| a.as_sm())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// 构建期 CUDA 编译并发度。`build.rs` 是**单进程**，cargo 的 `-j` 不会
@@ -155,7 +158,9 @@ fn hash_source(s: &str) -> u64 {
 
 /// 递归列 `dir` 下的 `.rs`(`src/` 扫描用;零 walkdir 依赖)
 fn rs_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -184,23 +189,42 @@ fn scan_cu_sources(root: &std::path::Path) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
     let mut ids: Vec<(String, PathBuf)> = Vec::new();
     for f in &rs {
-        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
         for line in text.lines() {
-            if !line.contains("const ") { continue; }
-            let Some(pos) = line.find("\"cu/") else { continue };
-            let Some(end) = line[pos + 1..].find('"') else { continue };
+            if !line.contains("const ") {
+                continue;
+            }
+            let Some(pos) = line.find("\"cu/") else {
+                continue;
+            };
+            let Some(end) = line[pos + 1..].find('"') else {
+                continue;
+            };
             let id = &line[pos + 1..pos + 1 + end];
-            if !id.ends_with(".cu") { continue; }
+            if !id.ends_with(".cu") {
+                continue;
+            }
             let abs = root.join(id);
             let canon = std::fs::canonicalize(&abs).unwrap_or_else(|e| {
-                panic!("资产 id {id:?}(来自 {})解析失败: {e} —— 路径写错或文件已挪", f.display())
+                panic!(
+                    "资产 id {id:?}(来自 {})解析失败: {e} —— 路径写错或文件已挪",
+                    f.display()
+                )
             });
-            if !found.contains(&canon) { found.push(canon.clone()); }
-            if !ids.iter().any(|(i, _)| i == id) { ids.push((id.to_string(), canon)); }
+            if !found.contains(&canon) {
+                found.push(canon.clone());
+            }
+            if !ids.iter().any(|(i, _)| i == id) {
+                ids.push((id.to_string(), canon));
+            }
         }
     }
     // .cu 自身也要进 rerun 集合(内容变了要重编)
-    for c in &found { println!("cargo:rerun-if-changed={}", c.display()); }
+    for c in &found {
+        println!("cargo:rerun-if-changed={}", c.display());
+    }
     found.sort();
     found
 }
@@ -219,7 +243,10 @@ fn symbols_of(text: &str) -> Vec<String> {
     let mut rest = clean.as_str();
     while let Some(p) = rest.find("__global__ void ") {
         rest = &rest[p + "__global__ void ".len()..];
-        let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
         // 全大写 = 宏形参(宏体里 `void NAME(...)` 形态),不是核名 —— 真核名含小写
         if !name.is_empty()
             && rest[name.len()..].trim_start().starts_with('(')
@@ -232,16 +259,28 @@ fn symbols_of(text: &str) -> Vec<String> {
     let mut macros: Vec<String> = Vec::new();
     for line in clean.lines() {
         let t = line.trim_start();
-        let Some(body) = t.strip_prefix("#define ") else { continue };
-        let Some((mac, _)) = body.split_once('(') else { continue };
+        let Some(body) = t.strip_prefix("#define ") else {
+            continue;
+        };
+        let Some((mac, _)) = body.split_once('(') else {
+            continue;
+        };
         let mac = mac.trim();
-        if mac.is_empty() || !mac.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { continue; }
-        if body.contains("void ") { macros.push(mac.to_string()); }
+        if mac.is_empty() || !mac.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        if body.contains("void ") {
+            macros.push(mac.to_string());
+        }
     }
     for line in clean.lines() {
         let t = line.trim_start();
-        let Some((head, rest)) = t.split_once('(') else { continue };
-        if !macros.iter().any(|m| m == head) { continue; }
+        let Some((head, rest)) = t.split_once('(') else {
+            continue;
+        };
+        if !macros.iter().any(|m| m == head) {
+            continue;
+        }
         let first = rest.split(',').next().unwrap_or("").trim();
         // 全大写 = 宏形参(NAME/PARAMS/…),不是核名 —— 真核名一律含小写
         if !first.is_empty()
@@ -270,7 +309,9 @@ fn symbols_of(text: &str) -> Vec<String> {
 /// 规则:凡 `.cu` 文本里出现 `#include "vendor/`(vendored 第三方树),
 /// 就把该目录下**所有文件**的(相对路径, 长度, mtime)混进指纹。
 fn vendor_stamp(src: &std::path::Path) -> String {
-    let Ok(text) = std::fs::read_to_string(src) else { return String::new() };
+    let Ok(text) = std::fs::read_to_string(src) else {
+        return String::new();
+    };
     if !text.contains("#include \"vendor/") {
         return String::new();
     }
@@ -279,7 +320,9 @@ fn vendor_stamp(src: &std::path::Path) -> String {
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     let mut stack = vec![dir];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -300,7 +343,9 @@ fn vendor_stamp(src: &std::path::Path) -> String {
             .unwrap_or(0);
         out.push_str(&format!(
             "{}:{}:{};",
-            p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+            p.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default(),
             md.len(),
             mtime
         ));
@@ -383,7 +428,10 @@ fn build_native_cubins(
     }
     let nvcc = env::var("OWL_NVCC").unwrap_or_else(|_| "nvcc".into());
     let archs = selected_archs();
-    assert!(!archs.is_empty(), "selected_archs 为空(不应发生:零 feature 会落缺省)");
+    assert!(
+        !archs.is_empty(),
+        "selected_archs 为空(不应发生:零 feature 会落缺省)"
+    );
     let cuda_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let sources = scan_cu_sources(&cuda_root);
     assert!(
@@ -420,7 +468,7 @@ fn build_native_cubins(
         // `Option '--cubin' is not allowed when compiling for multiple GPU code instances`)
         // ⇒ 多代际必须用 `-fatbin`(内含多份 cubin;driver 载入 API 完全相同,
         // 运行期由驱动按设备挑最匹配那份)。单代际两者等价 ⇒ 统一用 fatbin。
-        if compile_fatbin(&nvcc, src, dst, &archs, &[]) {
+        if compile_fatbin(&nvcc, src, dst, archs, &[]) {
             rebuilt.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -429,7 +477,14 @@ fn build_native_cubins(
     let mut src_ids: Vec<String> = Vec::new();
     for (src, dst, asset, src_id) in &jobs {
         let text = std::fs::read_to_string(src).expect("read .cu");
-        rows.push((asset.clone(), hash_source(&text), text.len(), src.clone(), dst.clone(), symbols_of(&text)));
+        rows.push((
+            asset.clone(),
+            hash_source(&text),
+            text.len(),
+            src.clone(),
+            dst.clone(),
+            symbols_of(&text),
+        ));
         src_ids.push(src_id.clone());
     }
 
@@ -443,7 +498,13 @@ fn build_native_cubins(
     );
     out.push_str("/// 构建期编出的代际集(设备 sm ∉ 本集 ⇒ 装配期拒启;见 §15.4 架构门)\n");
     out.push_str("pub const CUBIN_ARCHS: &[&str] = &[");
-    out.push_str(&archs.iter().map(|a| format!("\"{}\"", a.as_sm())).collect::<Vec<_>>().join(", "));
+    out.push_str(
+        &archs
+            .iter()
+            .map(|a| format!("\"{}\"", a.as_sm()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
     out.push_str("];\n\n");
     out.push_str("/// 一个 `.cu` 文件产出的 fatbin 资产(E 轮:不再携带源文本 —— 运行期只要身份 + 字节)\npub struct CubinAsset {\n    /// **资产 id** = `cu/` 相对路径(与 `KernelSpec::SRC` 同形;查表键)\n    pub id: &'static str,\n    /// 模块缓存键/诊断名(`cu/` 相对路径,`/` → `__`)\n    pub module: &'static str,\n    /// 源内容 FNV-1a 64(**构建期指纹**;自洽门回算比对用)\n    pub src_hash: u64,\n    /// fatbin 字节(`include_bytes!`;多代际容器)\n    pub bytes: &'static [u8],\n}\n\n");
     out.push_str("pub const CUBIN_ASSETS: &[CubinAsset] = &[\n");
@@ -457,7 +518,11 @@ fn build_native_cubins(
     }
     out.push_str("];\n\n");
     for (_, _, _, _, _, symbols) in &rows {
-        let list = symbols.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
+        let list = symbols
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         syms.push_str(&format!("    (\"@@ID@@\", &[{list}]),\n"));
     }
     syms.push_str("];\n");
@@ -491,9 +556,13 @@ fn build_native_cubins(
     println!(
         "cargo:warning=owl-kernels: 构建期 cubin {} 个源文件 ({}) —— {} 个源可零 NVRTC 发射{}",
         rows.len(),
-        archs_sm(&archs),
+        archs_sm(archs),
         rows.len(),
-        if rebuilt == 0 { "(全增量命中,零 nvcc)".to_string() } else { format!("(本次重编 {rebuilt} 个)") }
+        if rebuilt == 0 {
+            "(全增量命中,零 nvcc)".to_string()
+        } else {
+            format!("(本次重编 {rebuilt} 个)")
+        }
     );
     println!("cargo:rerun-if-env-changed=OWL_CUBIN_SKIP");
 }
@@ -520,11 +589,21 @@ fn build_xqa_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
     let archs = selected_archs();
     // 头文件全量追踪(任一改动 ⇒ 重编)
     for h in [
-        "cu/xqa/mha.cu", "cu/xqa/mha.h", "cu/xqa/defines.h", "cu/xqa/utils.h",
-        "cu/xqa/utils.cuh", "cu/xqa/mhaUtils.cuh", "cu/xqa/mha_components.cuh",
-        "cu/xqa/mha_stdheaders.cuh", "cu/xqa/mma.cuh", "cu/xqa/barriers.cuh",
-        "cu/xqa/ldgsts.cuh", "cu/xqa/cuda_hint.cuh", "cu/xqa/specDec.h",
-        "cu/xqa/platform.h", "cu/xqa/hostUtils.h",
+        "cu/xqa/mha.cu",
+        "cu/xqa/mha.h",
+        "cu/xqa/defines.h",
+        "cu/xqa/utils.h",
+        "cu/xqa/utils.cuh",
+        "cu/xqa/mhaUtils.cuh",
+        "cu/xqa/mha_components.cuh",
+        "cu/xqa/mha_stdheaders.cuh",
+        "cu/xqa/mma.cuh",
+        "cu/xqa/barriers.cuh",
+        "cu/xqa/ldgsts.cuh",
+        "cu/xqa/cuda_hint.cuh",
+        "cu/xqa/specDec.h",
+        "cu/xqa/platform.h",
+        "cu/xqa/hostUtils.h",
     ] {
         println!("cargo:rerun-if-changed={h}");
     }
@@ -566,13 +645,22 @@ fn build_xqa_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
         })
         .collect();
     parallel_for(&jobs, |(name, dst, flags)| {
-        let built =
-            compile_fatbin(&nvcc, std::path::Path::new("cu/xqa/mha.cu"), dst, &archs, flags);
+        let built = compile_fatbin(
+            &nvcc,
+            std::path::Path::new("cu/xqa/mha.cu"),
+            dst,
+            archs,
+            flags,
+        );
         println!(
             "cargo:warning=owl-kernels: xqa_{name}.fatbin [{}] {} B{}",
-            archs_sm(&archs),
+            archs_sm(archs),
             std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0),
-            if built { "" } else { "(增量命中,未重编)" }
+            if built {
+                ""
+            } else {
+                "(增量命中,未重编)"
+            }
         );
     });
     jobs.into_iter().map(|(name, dst, _)| (name, dst)).collect()
@@ -598,7 +686,10 @@ fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
     println!("cargo:rerun-if-env-changed=GDN_TRITON_BUILD");
     println!("cargo:rerun-if-env-changed=GDN_TRITON_PY");
     println!("cargo:rerun-if-env-changed=GDN_TRITON_DEVICE");
-    println!("cargo:warning=owl-kernels: 构建代际集 = [{}]（Cargo feature arch-smXX）", archs_sm(selected_archs()));
+    println!(
+        "cargo:warning=owl-kernels: 构建代际集 = [{}]（Cargo feature arch-smXX）",
+        archs_sm(selected_archs())
+    );
     // **默认自编**(2026-10-13 用户裁决:既然构建期已引入 Python+triton,
     // 就不留入库采集件)。`GDN_TRITON_BUILD=0` = 显式关(无 triton 环境仍能
     // **编过**这个 crate;代价 = 该族的资产表为空 ⇒ 装配期拒启,见 family 侧)。
@@ -663,7 +754,10 @@ fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
     } else {
         println!("cargo:warning=owl-kernels: GDN chunked 六核 AOT 增量命中(零 triton)");
     }
-    NAMES.iter().map(|n| (*n, dir.join(format!("{n}.cubin")))).collect()
+    NAMES
+        .iter()
+        .map(|n| (*n, dir.join(format!("{n}.cubin"))))
+        .collect()
 }
 
 /// `OWL_CUBIN_SKIP` 档的空登记表(纯 NVRTC 基线对照;同一文件形态免分支)
@@ -676,7 +770,10 @@ fn gdn_table_src(rows: &[(&'static str, PathBuf)]) -> String {
          pub const GDN_ASSETS: &[(&str, &[u8])] = &[\n",
     );
     for (name, path) in rows {
-        t.push_str(&format!("    (\"{name}\", include_bytes!(\"{}\")),\n", path.display()));
+        t.push_str(&format!(
+            "    (\"{name}\", include_bytes!(\"{}\")),\n",
+            path.display()
+        ));
     }
     t.push_str("];\n\n/// GDN 资产查表(核名 → cubin 字节;空表返回 None)\npub fn gdn_asset(name: &str) -> Option<&'static [u8]> {\n    GDN_ASSETS.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)\n}\n");
     t
@@ -689,7 +786,10 @@ fn xqa_table_src(rows: &[(&'static str, PathBuf)]) -> String {
          pub const XQA_ASSETS: &[(&str, &[u8])] = &[\n",
     );
     for (name, path) in rows {
-        t.push_str(&format!("    (\"{name}\", include_bytes!(\"{}\")),\n", path.display()));
+        t.push_str(&format!(
+            "    (\"{name}\", include_bytes!(\"{}\")),\n",
+            path.display()
+        ));
     }
     t.push_str("];\n\n/// XQA 资产查表(变体名 → fatbin 字节)\npub fn xqa_asset(name: &str) -> Option<&'static [u8]> {\n    XQA_ASSETS.iter().find(|(n, _)| *n == name).map(|(_, b)| *b)\n}\n");
     t
@@ -725,11 +825,13 @@ fn deps_fingerprint(deps: &[String], flags: &str) -> String {
 fn stamp_hit(dst: &std::path::Path, deps: &[String], flags: &str) -> bool {
     let stamp = dst.with_extension("stamp");
     dst.exists()
-        && std::fs::read_to_string(&stamp).ok().as_deref() == Some(deps_fingerprint(deps, flags).as_str())
+        && std::fs::read_to_string(&stamp).ok().as_deref()
+            == Some(deps_fingerprint(deps, flags).as_str())
 }
 
 fn stamp_write(dst: &std::path::Path, deps: &[String], flags: &str) {
-    std::fs::write(dst.with_extension("stamp"), deps_fingerprint(deps, flags)).expect("write stamp");
+    std::fs::write(dst.with_extension("stamp"), deps_fingerprint(deps, flags))
+        .expect("write stamp");
 }
 
 /// tag 词表 → `KernelTag` / `KERNEL_TAGS` 生成(2026-10-20)。
@@ -752,36 +854,70 @@ fn build_tags(out_dir: &std::path::Path) {
         facet: Option<String>,
     }
     #[derive(serde::Deserialize)]
-    struct Raw { tag: Vec<RawTag> }
+    struct Raw {
+        tag: Vec<RawTag>,
+    }
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read tags.toml: {e}"));
     let raw: Raw = toml::from_str(&text).expect("parse tags.toml");
     assert!(!raw.tag.is_empty(), "tags.toml 为空");
-    assert!(raw.tag.len() <= 64, "tag 数 {} > 64(位集是 u64;扩位集须改 KernelTag::bit)", raw.tag.len());
+    assert!(
+        raw.tag.len() <= 64,
+        "tag 数 {} > 64(位集是 u64;扩位集须改 KernelTag::bit)",
+        raw.tag.len()
+    );
 
     let mut ids = std::collections::BTreeSet::new();
     let mut cnames = std::collections::BTreeSet::new();
     for t in &raw.tag {
         assert!(!t.id.is_empty(), "tag id 为空");
         assert!(ids.insert(t.id.clone()), "tag id 重复:{}", t.id);
-        let cname: String = t.id.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
-            .collect();
-        assert!(cnames.insert(cname.clone()), "tag `{}` 的常量名 `{cname}` 与别的 tag 冲突", t.id);
+        let cname: String =
+            t.id.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
         assert!(
-            t.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-'),
-            "tag id 只允许小写字母/数字/._-:{}", t.id
+            cnames.insert(cname.clone()),
+            "tag `{}` 的常量名 `{cname}` 与别的 tag 冲突",
+            t.id
+        );
+        assert!(
+            t.id.chars().all(|c| c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || c == '.'
+                || c == '_'
+                || c == '-'),
+            "tag id 只允许小写字母/数字/._-:{}",
+            t.id
         );
         if let Some(f) = &t.facet {
             assert!(
-                !f.is_empty() && f.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-'),
-                "tag `{}` 的 facet 名非法:{f:?}", t.id
+                !f.is_empty()
+                    && f.chars().all(|c| c.is_ascii_lowercase()
+                        || c.is_ascii_digit()
+                        || c == '.'
+                        || c == '_'
+                        || c == '-'),
+                "tag `{}` 的 facet 名非法:{f:?}",
+                t.id
             );
         }
     }
 
     fn cname(id: &str) -> String {
         id.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
             .collect()
     }
 
@@ -794,7 +930,12 @@ fn build_tags(out_dir: &std::path::Path) {
     out.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]\n");
     out.push_str("pub struct KernelTag(pub u8);\n\nimpl KernelTag {\n");
     for (i, t) in raw.tag.iter().enumerate() {
-        out.push_str(&format!("    /// `{}` — {}\n    pub const {}: Self = Self({i});\n", t.id, t.desc, cname(&t.id)));
+        out.push_str(&format!(
+            "    /// `{}` — {}\n    pub const {}: Self = Self({i});\n",
+            t.id,
+            t.desc,
+            cname(&t.id)
+        ));
     }
     out.push_str("\n    /// 位掩码(u64;最多 64 个 tag)\n    pub const fn bit(self) -> u64 { 1u64 << self.0 }\n");
     out.push_str("    /// 词表下标\n    pub const fn index(self) -> usize { self.0 as usize }\n");
@@ -803,13 +944,20 @@ fn build_tags(out_dir: &std::path::Path) {
     out.push_str("/// 一条 tag 的静态描述\n#[derive(Clone, Copy, Debug)]\npub struct KernelTagInfo {\n    pub tag: KernelTag,\n    pub id: &'static str,\n    pub desc: &'static str,\n}\n\n");
     out.push_str("/// 全部 tag(顺序 = tags.toml)\npub const KERNEL_TAGS: &[KernelTagInfo] = &[\n");
     for (i, t) in raw.tag.iter().enumerate() {
-        out.push_str(&format!("    KernelTagInfo {{ tag: KernelTag({i}), id: \"{}\", desc: \"{}\" }},\n", t.id, t.desc));
+        out.push_str(&format!(
+            "    KernelTagInfo {{ tag: KernelTag({i}), id: \"{}\", desc: \"{}\" }},\n",
+            t.id, t.desc
+        ));
     }
     out.push_str("];\n\n");
-    out.push_str(&format!("/// tag 总数\npub const KERNEL_TAG_COUNT: usize = {};\n\n", raw.tag.len()));
+    out.push_str(&format!(
+        "/// tag 总数\npub const KERNEL_TAG_COUNT: usize = {};\n\n",
+        raw.tag.len()
+    ));
     // 互斥 facet 组:同组 tag 是“单选”语义;无组 tag = 非约束。
     let mut facet_order: Vec<String> = Vec::new();
-    let mut facet_masks: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut facet_masks: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
     for (i, t) in raw.tag.iter().enumerate() {
         if let Some(f) = &t.facet {
             if !facet_masks.contains_key(f) {
@@ -822,13 +970,19 @@ fn build_tags(out_dir: &std::path::Path) {
     out.push_str("#[derive(Clone, Copy, Debug)]\npub struct KernelTagFacet {\n    pub name: &'static str,\n    pub mask: u64,\n}\n\n");
     out.push_str("/// 参与过滤的互斥 facet(顺序 = 首次出现序)\npub const EXCLUSIVE_TAG_FACETS: &[KernelTagFacet] = &[\n");
     for f in &facet_order {
-        out.push_str(&format!("    KernelTagFacet {{ name: \"{f}\", mask: 0x{:016x} }},\n", facet_masks[f]));
+        out.push_str(&format!(
+            "    KernelTagFacet {{ name: \"{f}\", mask: 0x{:016x} }},\n",
+            facet_masks[f]
+        ));
     }
     out.push_str("];\n\n");
     out.push_str("/// id → tag(线性;boot/诊断面用)\npub fn tag_by_id(id: &str) -> Option<KernelTag> {\n    KERNEL_TAGS.iter().find(|t| t.id == id).map(|t| t.tag)\n}\n\n");
     out.push_str("/// tag 集 → 位掩码\npub fn tag_mask(tags: &[KernelTag]) -> u64 {\n    let mut m = 0u64;\n    for t in tags { m |= t.bit(); }\n    m\n}\n");
     std::fs::write(out_dir.join("kernel_tags.rs"), out).expect("write kernel_tags.rs");
-    println!("cargo:warning=owl-kernels: tag 词表 {} 项(建期生成 KernelTag/KERNEL_TAGS)", raw.tag.len());
+    println!(
+        "cargo:warning=owl-kernels: tag 词表 {} 项(建期生成 KernelTag/KERNEL_TAGS)",
+        raw.tag.len()
+    );
 }
 
 /// **算子总表**(2026-10-20;用户裁决:构建期统计,不手写)。
@@ -849,9 +1003,23 @@ fn build_tags(out_dir: &std::path::Path) {
 /// 各域 `METAS` 数组全部退役(单一真源 = static 提升点)。
 fn build_ops_table(out_dir: &std::path::Path) {
     const DOMAIN_ORDER: &[&str] = &[
-        "attn", "gdn", "gguf", "gdn_chunked", "gdn_scalar", "comm", "elems",
-        "fused", "ln", "dflash", "load", "marlin", "cublas", "flashinfer",
-        "xqa", "vis", "nvfp4",
+        "attn",
+        "gdn",
+        "gguf",
+        "gdn_chunked",
+        "gdn_scalar",
+        "comm",
+        "elems",
+        "fused",
+        "ln",
+        "dflash",
+        "load",
+        "marlin",
+        "cublas",
+        "flashinfer",
+        "xqa",
+        "vis",
+        "nvfp4",
     ];
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let ops_dir = root.join("src").join("ops");
@@ -865,7 +1033,7 @@ fn build_ops_table(out_dir: &std::path::Path) {
             let p = e.path();
             (p.extension().is_some_and(|x| x == "rs")
                 && p.file_name().is_some_and(|n| n != "mod.rs"))
-                .then(|| p.file_stem().unwrap().to_string_lossy().into_owned())
+            .then(|| p.file_stem().unwrap().to_string_lossy().into_owned())
         })
         .collect();
     present.sort();
@@ -890,14 +1058,18 @@ fn build_ops_table(out_dir: &std::path::Path) {
         let mut names = Vec::new();
         for (lineno, line) in prod.lines().enumerate() {
             let t = line.trim();
-            let Some(rest) = t.strip_prefix("pub static ") else { continue };
+            let Some(rest) = t.strip_prefix("pub static ") else {
+                continue;
+            };
             if !rest.contains(": KernelMeta = meta_of::<") {
                 continue;
             }
             let name = rest.split(':').next().unwrap().trim();
             assert!(
                 !name.is_empty()
-                    && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
                 "{d}.rs:{}: 无法解析 static 名 {name:?}",
                 lineno + 1
             );
@@ -908,13 +1080,20 @@ fn build_ops_table(out_dir: &std::path::Path) {
             );
             names.push(name.to_string());
         }
-        assert!(!names.is_empty(), "{d}.rs: 未扫到任何 `pub static ... KernelMeta = meta_of::<...>()`");
+        assert!(
+            !names.is_empty(),
+            "{d}.rs: 未扫到任何 `pub static ... KernelMeta = meta_of::<...>()`"
+        );
         // 字面 impl 必须有对应的 static 提升点 —— 否则总表会静默漏掉它。
         // 宏模板(`impl KernelSpec for $t`)不在此列:它的实例由 static 行覆盖。
         for line in prod.lines() {
             let t = line.trim();
-            let Some(rest) = t.strip_prefix("impl KernelSpec for ") else { continue };
-            let Some(ty) = rest.split_whitespace().next() else { continue };
+            let Some(rest) = t.strip_prefix("impl KernelSpec for ") else {
+                continue;
+            };
+            let Some(ty) = rest.split_whitespace().next() else {
+                continue;
+            };
             let ty = ty.trim_end_matches('{');
             if ty.starts_with('$') || !ty.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 continue;
@@ -929,7 +1108,10 @@ fn build_ops_table(out_dir: &std::path::Path) {
     }
 
     let total: usize = domains.iter().map(|(_, n)| n.len()).sum();
-    assert!(total >= 200, "算子总表只有 {total} 张 —— 扫描器失效(应 ≥200)");
+    assert!(
+        total >= 200,
+        "算子总表只有 {total} 张 —— 扫描器失效(应 ≥200)"
+    );
 
     let mut out = String::from(
         "// @generated by crates/kernels/build.rs —— **勿手改**。\n\
@@ -950,12 +1132,18 @@ fn build_ops_table(out_dir: &std::path::Path) {
         "/// 构建期扫到的生产算子总数(唯一真源;测试/诊断用)\npub const OP_COUNT: usize = {total};\n"
     ));
     std::fs::write(out_dir.join("ops_table.rs"), out).expect("write ops_table.rs");
-    println!("cargo:warning=owl-kernels: 算子总表 {total} 张 / {} 域(构建期扫描 static 提升点)", domains.len());
+    println!(
+        "cargo:warning=owl-kernels: 算子总表 {total} 张 / {} 域(构建期扫描 static 提升点)",
+        domains.len()
+    );
 }
 
 fn main() {
     println!("cargo:rerun-if-env-changed=OWL_BUILD_JOBS");
-    println!("cargo:warning=owl-kernels: CUDA 编译并行度 = {}（OWL_BUILD_JOBS 可覆盖）", build_jobs());
+    println!(
+        "cargo:warning=owl-kernels: CUDA 编译并行度 = {}（OWL_BUILD_JOBS 可覆盖）",
+        build_jobs()
+    );
     {
         let archs = selected_archs();
         let single = single_arch();
@@ -1075,7 +1263,9 @@ fn build_nvfp4() {
         let status = cmd.status().expect("nvfp4: failed to spawn ar");
         assert!(status.success(), "nvfp4: ar failed");
         stamp_write(&lib, &deps, &flags);
-        println!("cargo:warning=owl-kernels: built libnvfp4.a ({sm_a} · CUTLASS 闭包 + 设备量化器)");
+        println!(
+            "cargo:warning=owl-kernels: built libnvfp4.a ({sm_a} · CUTLASS 闭包 + 设备量化器)"
+        );
     }
     let cuda_lib = env::var("CUDA_HOME")
         .map(|h| PathBuf::from(h).join("lib64"))
@@ -1116,7 +1306,11 @@ fn check_marlin_selector(sources: &[PathBuf]) {
         while let Some(pos) = text[i..].find("Marlin<") {
             let start = i + pos + needle.len();
             if let Some(end) = text[start..].find('>') {
-                set.insert(text[start..start + end].split_whitespace().collect::<String>());
+                set.insert(
+                    text[start..start + end]
+                        .split_whitespace()
+                        .collect::<String>(),
+                );
                 i = start + end;
             } else {
                 break;
@@ -1201,12 +1395,12 @@ fn build_marlin() {
             let base = PathBuf::from("cu/marlin");
             let sources = [
                 base.join("marlin_host.cu"),
-                base.join("vllm_marlin/sm80_kernel_float16_u4_float16.cu"),   // AWQ 非对称(kU4)
+                base.join("vllm_marlin/sm80_kernel_float16_u4_float16.cu"), // AWQ 非对称(kU4)
                 base.join("vllm_marlin/sm80_kernel_float16_u4b8_float16.cu"), // GPTQ 对称(kU4B8)
                 base.join("vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu"), // BF16 激活变体(E5-DF3 草稿 BF16 化)
-                base.join("vllm_marlin/sm80_kernel_s8_u4b8_float16.cu"),      // W4A8 s8→f16(S1;selector 引用之)
-                base.join("vllm_marlin/sm80_kernel_s8_u4_float16.cu"),        // W4A8 s8→f16 × AWQ 非对称(kU4;生产 27B 走这条)
-                base.join("vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu"),       // W4A8 s8→bf16 × kU4(BF16 激活档)
+                base.join("vllm_marlin/sm80_kernel_s8_u4b8_float16.cu"), // W4A8 s8→f16(S1;selector 引用之)
+                base.join("vllm_marlin/sm80_kernel_s8_u4_float16.cu"), // W4A8 s8→f16 × AWQ 非对称(kU4;生产 27B 走这条)
+                base.join("vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu"), // W4A8 s8→bf16 × kU4(BF16 激活档)
             ];
             // **源文件必须在增量命中分支之外登记**(2026-10-22 实测):
             // 原先 `rerun-if-changed` 只写在 else(重建)分支 ⇒ 一旦 stamp 命中,
@@ -1272,7 +1466,11 @@ fn build_marlin() {
                         .args(args)
                         .status()
                         .unwrap_or_else(|e| panic!("marlin: failed to spawn {nvcc_m}: {e}"));
-                    assert!(status.success(), "marlin: nvcc failed for {}", src.display());
+                    assert!(
+                        status.success(),
+                        "marlin: nvcc failed for {}",
+                        src.display()
+                    );
                 });
                 let objs: Vec<PathBuf> = jobs.into_iter().map(|(_, obj, _)| obj).collect();
                 let _ = std::fs::remove_file(&lib_out); // ar rcs 是按名替换:旧成员会留存
@@ -1297,12 +1495,13 @@ fn build_marlin() {
         println!("cargo:rustc-link-lib=dylib=stdc++");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());
     }
-
 }
 
 /// 递归列目录下所有文件(指纹/追踪用;零 walkdir 依赖)
 fn all_files(dir: &str, out: &mut Vec<String>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -1342,8 +1541,8 @@ fn build_flashinfer() {
         let fa2_src = "cu/flash_attn/vendor/flash_attn/src";
         let fa2_cutlass = "cu/cutlass/include";
         let fa2_compat = "cu/flash_attn/compat";
-        let fi_include = env::var("FLASHINFER_INCLUDE")
-            .unwrap_or_else(|_| "cu/flashinfer/include".into());
+        let fi_include =
+            env::var("FLASHINFER_INCLUDE").unwrap_or_else(|_| "cu/flashinfer/include".into());
         for f in [src_f16, src_fp8, src_ragged, src_hdr, src_fa2] {
             println!("cargo:rerun-if-changed={f}");
         }
@@ -1413,7 +1612,11 @@ fn build_flashinfer() {
                     PathBuf::from(src).file_stem().unwrap().to_string_lossy()
                 ));
                 // FP16 累加档:prefill.cuh 的 fp16 分支用 `std::bit_cast`(C++20)
-                let std_flag = if fi_fp16acc { "-std=c++20" } else { "-std=c++17" };
+                let std_flag = if fi_fp16acc {
+                    "-std=c++20"
+                } else {
+                    "-std=c++17"
+                };
                 let mut args = vec![
                     "-O3".into(),
                     std_flag.into(),

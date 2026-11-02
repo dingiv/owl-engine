@@ -1,3 +1,4 @@
+//!
 //! **P-6b 红门探针**:桶 padding 下 `gdn_chunked` 的**假行污染**(2026-10-15 立)。
 //!
 //! # 病(设计 §4.3e P-6b)
@@ -19,8 +20,7 @@
 //! 同一批真行(前 64 行)在两种布局下跑:
 //! - **真行布局**:`t = 64`(nt=1),64 行全真;
 //! - **桶布局**:`t = 128`(nt=2),前 64 行真、后 64 行 = **有限垃圾**(仿真:桶
-//!   padding 的假行来自被 padding 的激活,不是零),
-//! 则 **真行输出** 与 **终态 rec** 必须逐位一致。
+//!   padding 的假行来自被 padding 的激活,不是零), 则 **真行输出** 与 **终态 rec** 必须逐位一致。
 //!
 //! ⚠️ 修复前本探针**必须红**(终态不一致)—— 红=病在,绿=修好。修复 = 把三张表
 //! 从 runtime 私有缓存变成**调用入参**(引擎按 `t_real` 写持久槽),与 FLA 原始
@@ -43,15 +43,24 @@ const T_REAL: usize = 64;
 const T_PAD: usize = 128;
 
 fn lcg(seed: u32, i: usize) -> f32 {
-    let x = seed.wrapping_mul(0x9E37_79B9).wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+    let x = seed
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
     ((x >> 8) as f32) / 16_777_216.0
 }
 
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn norm_rows(xs: &mut [f32], rows: usize, heads: usize, d: usize) {
     for r in 0..rows {
         for h in 0..heads {
             let base = r * heads * d + h * d;
-            let n: f32 = xs[base..base + d].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+            let n: f32 = xs[base..base + d]
+                .iter()
+                .map(|x| x * x)
+                .sum::<f32>()
+                .sqrt()
+                .max(1e-6);
             for i in base..base + d {
                 xs[i] /= n;
             }
@@ -60,7 +69,9 @@ fn norm_rows(xs: &mut [f32], rows: usize, heads: usize, d: usize) {
 }
 
 fn f16le(xs: &[f32]) -> Vec<u8> {
-    xs.iter().flat_map(|x| half::f16::from_f32(*x).to_le_bytes()).collect()
+    xs.iter()
+        .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
+        .collect()
 }
 
 /// 一次"桶布局"实验:真行 [0,64) 与布局 [0,t) 的其余行分别由 `real`/`fake` 填充
@@ -86,6 +97,8 @@ impl Case {
     /// true = 表件按**布局**块数铸(nt_layout=ceil(t/BT),coff/idx 铺满布局 ——
     /// 这正是**图内 `nt` 烘死**时引擎必须写的口径:核的 grid = nt_layout,
     /// 多出来的尾部 chunk 是"越界 chunk"(行区间 > t_real ⇒ 读写都被 T 夹回)。
+    // 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+    #[allow(clippy::needless_range_loop)]
     fn new(dev: usize, t: usize, fake: bool, nt_layout: bool) -> Self {
         let mut res = TestRes::new(dev);
         let mut exec = Exec::new();
@@ -141,36 +154,84 @@ impl Case {
         let q_b = leaf(res.upload(&f16le(&q)), owl_kernels::contract::Dtype::F16, 3);
         let k_b = leaf(res.upload(&f16le(&k)), owl_kernels::contract::Dtype::F16, 3);
         let v_b = leaf(res.upload(&f16le(&v)), owl_kernels::contract::Dtype::F16, 3);
-        let beta_b = leaf(res.upload(&f16le(&beta)), owl_kernels::contract::Dtype::F16, 2);
+        let beta_b = leaf(
+            res.upload(&f16le(&beta)),
+            owl_kernels::contract::Dtype::F16,
+            2,
+        );
         let g_b = leaf(res.upload(&f16le(&g)), owl_kernels::contract::Dtype::F16, 2);
         // state 池 [K,V] f32(零态起点;runtime 内部 trans-in/out)
-        let state = leaf(res.zeros(NV * KD * KD * 4), owl_kernels::contract::Dtype::F32, 4);
-        let out = leaf(res.zeros(t * NV * KD * 2), owl_kernels::contract::Dtype::F16, 3);
+        let state = leaf(
+            res.zeros(NV * KD * KD * 4),
+            owl_kernels::contract::Dtype::F32,
+            4,
+        );
+        let out = leaf(
+            res.zeros(t * NV * KD * 2),
+            owl_kernels::contract::Dtype::F16,
+            3,
+        );
         // **序列表按真长度铸**(P-6b):cu[0,t_real] 恒真;`nt`(= coff/idx 的
         // 铺开长度)在两种口径间切:真块数(P-6b 判据)或布局块数(图姿态)。
         let bt = owl_kernels::family::gdn_chunked::BT;
-        let nt = if nt_layout { t.div_ceil(bt) } else { T_REAL.div_ceil(bt) };
+        let nt = if nt_layout {
+            t.div_ceil(bt)
+        } else {
+            T_REAL.div_ceil(bt)
+        };
         let tables = leaf(
-            res.upload(&owl_kernels::family::gdn_chunked::table_host_bytes(T_REAL, nt)),
+            res.upload(&owl_kernels::family::gdn_chunked::table_host_bytes(
+                T_REAL, nt,
+            )),
             owl_kernels::contract::Dtype::U32,
             1,
         );
-        Self { res, exec, rt, q: q_b, k: k_b, v: v_b, beta: beta_b, g: g_b, state, out, tables, nt, t }
+        Self {
+            res,
+            exec,
+            rt,
+            q: q_b,
+            k: k_b,
+            v: v_b,
+            beta: beta_b,
+            g: g_b,
+            state,
+            out,
+            tables,
+            nt,
+            t,
+        }
     }
 
     fn run(&mut self) {
-        let shape = GdnShape { t: self.t as u32, nv: NV as u32, nk: NK as u32, kd: KD as u32 };
+        let shape = GdnShape {
+            t: self.t as u32,
+            nv: NV as u32,
+            nk: NK as u32,
+            kd: KD as u32,
+        };
         let call = GdnChunkedCall::builder(shape)
-            .q(&self.q).expect("q 契约")
-            .k(&self.k).expect("k 契约")
-            .v(&self.v).expect("v 契约")
-            .beta(&self.beta).expect("beta 契约")
-            .gate_raw(&self.g).expect("gate 契约")
-            .state(&self.state, 0).expect("state 契约")
-            .tables(&self.tables, self.nt).expect("tables 契约")
-            .build().expect("家族调用装配");
+            .q(&self.q)
+            .expect("q 契约")
+            .k(&self.k)
+            .expect("k 契约")
+            .v(&self.v)
+            .expect("v 契约")
+            .beta(&self.beta)
+            .expect("beta 契约")
+            .gate_raw(&self.g)
+            .expect("gate 契约")
+            .state(&self.state, 0)
+            .expect("state 契约")
+            .tables(&self.tables, self.nt)
+            .expect("tables 契约")
+            .build()
+            .expect("家族调用装配");
         let msg = call.to_launch(self.out.clone());
-        let _ = self.rt.run(&msg, &mut self.res, &mut self.exec).expect("gdn_chunked run");
+        let _ = self
+            .rt
+            .run(&msg, &mut self.res, &mut self.exec)
+            .expect("gdn_chunked run");
         self.res.stream.synchronize().expect("sync");
     }
 
@@ -187,7 +248,10 @@ impl Case {
 }
 
 fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
 }
 
 #[test]
@@ -260,6 +324,12 @@ fn gdn_bucket_pad_graph_posture_nt_layout_is_inert() {
         "=== 图姿态判据(t_real={T_REAL} 桶={T_PAD} nt_layout={})===\n  真行输出 |Δ| = {d_out:.3e}\n  终态 rec  |Δ| = {d_state:.3e}",
         T_PAD.div_ceil(owl_kernels::family::gdn_chunked::BT)
     );
-    assert!(d_out < 1e-3, "图姿态:真行输出被越界 chunk 影响(Δ={d_out:.3e})");
-    assert!(d_state < 1e-3, "图姿态:终态被越界 chunk 改写(Δ={d_state:.3e})—— 桶图不能这么烘 nt");
+    assert!(
+        d_out < 1e-3,
+        "图姿态:真行输出被越界 chunk 影响(Δ={d_out:.3e})"
+    );
+    assert!(
+        d_state < 1e-3,
+        "图姿态:终态被越界 chunk 改写(Δ={d_state:.3e})—— 桶图不能这么烘 nt"
+    );
 }

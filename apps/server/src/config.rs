@@ -609,7 +609,7 @@ fn pick_distinct(
         // 候选:命中 spec 且尚未占用
         let hit: Vec<&owl_shared::device::DeviceRow> = rows
             .iter()
-            .filter(|r| spec.matches(r) && !used.iter().any(|u| *u == r.uuid))
+            .filter(|r| spec.matches(r) && !used.contains(&r.uuid))
             .collect();
         if hit.is_empty() {
             let table: Vec<String> = rows

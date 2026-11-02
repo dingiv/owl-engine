@@ -37,8 +37,7 @@ pub const PREFILL_FI: &str = "flashinfer_prefill_paged_f16";
 pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
 
 /// **视觉塔注意力**(2026-10-15):ragged(**非分页**)非因果 prefill。
-/// 复用同一份 vendored FlashInfer FA2 家族核(`BatchPrefillWithRaggedKVCacheDispatched`
-/// + `MaskMode::kNone`),与 vLLM 的 ViT 走同路算法;胶水住
+/// 复用同一份 vendored FlashInfer FA2 家族核(`BatchPrefillWithRaggedKVCacheDispatched` + `MaskMode::kNone`),与 vLLM 的 ViT 走同路算法;胶水住
 /// `cu/flashinfer/owl_fi_attn_ragged.cu`。**legacy 单图/多图 varlen**；
 /// 2026-10-23 起视觉塔统一走 FA2，本常量保留但不再被 driver 选中。
 pub const ATTN_RAGGED_F16: &str = "flashinfer_attn_ragged_f16";
@@ -206,7 +205,7 @@ pub fn configure(cfg: FlashinferCfg) -> Result<(), crate::contract::OpError> {
     if cfg.prefill_shadow && cfg.prefill_shadow_cap == 0 {
         return Err(crate::contract::OpError::Contract {
             op: PREFILL_FI.into(),
-            field: "prefill_shadow_cap".into(),
+            field: "prefill_shadow_cap",
             expect: "影子开启 ⇒ cap > 0(容量上界,取 runtime.max_seq)".into(),
             got: "cap = 0(首层将按 0 预留,影子静默不生效)".into(),
         });

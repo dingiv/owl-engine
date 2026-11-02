@@ -293,13 +293,13 @@ async fn step_graph_ref_lease(client: &mut GpuClient) {
     );
 }
 
+///
 /// 步骤 10:**捕获窗内 Free + slab 复用**(M1 峰值口径的真机判据)。
 ///
 /// 手法:默认 slab 64MiB(未设 hint);窗内**交替 alloc/free** 共 6×16MiB
 /// = 96MiB **总和** > 64MiB,而峰值活跃集只有 2×16MiB ⇒
 /// - 有 arena 回收(本刀):`graph_end` 成功;
-/// - 无回收(旧纯 bump):第 5 块即超 64MiB ⇒ `graph_end` 前就得 Err。
-/// ⇒ 本步就是"容量 = 峰值活跃集而非总和"的集成判据。
+/// - 无回收(旧纯 bump):第 5 块即超 64MiB ⇒ `graph_end` 前就得 Err。 ⇒ 本步就是"容量 = 峰值活跃集而非总和"的集成判据。
 async fn step_capture_window_reuse(client: &mut GpuClient) {
     const BLK: usize = 4 << 20; // 4 Mi 元素 × f32 = 16 MiB
     const N: usize = 6;

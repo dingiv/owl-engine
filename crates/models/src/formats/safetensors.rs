@@ -739,6 +739,6 @@ mod tests {
             Err(e) => e,
         };
         assert!(format!("{e}").contains("中毒"), "{e}");
-        assert!(matches!(s.elem_len("w.weight"), Err(_)), "elem_len 同样响亮");
+        assert!(s.elem_len("w.weight").is_err(), "elem_len 同样响亮");
     }
 }

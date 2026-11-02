@@ -5,8 +5,7 @@
 //!    所以"摸显存"的只能是**客户端侧**的咽喉;钩子**挂在客户端**(不许挂到 server:跨线程)。
 //! ② **接口倒置**:[`AllocLedger`] 由 **store 实现**;client 侧只依赖这个 trait
 //!    (方案甲:`Arc<Mutex<dyn AllocLedger>>`,真 `Send` —— 见 §1.1)。
-//! ③ **命令面**:[`Command`](链式构造)+ [`DeviceHandle::exec`] 单条 / [`DeviceHandle::batch`] 多条
-//!    + [`alloc!`](crate::alloc) / [`free!`](crate::free) 宏。
+//! ③ **命令面**:[`Command`](链式构造)+ [`DeviceHandle::exec`] 单条 / [`DeviceHandle::batch`] 多条 + [`alloc!`](crate::alloc) / [`free!`](crate::free) 宏。
 //!
 //! # 纪律
 //! - **本模块一行不改 `cuda` 里实现的 [`DeviceClient`]**:这里是**薄转发 + 钩子**;
@@ -855,16 +854,16 @@ impl<D: DeviceClient> DeviceHandle<D> {
         }
     }
 
-    /// **账本审计探针**(诊断面;`OWL_LEDGER_AUDIT=1`,2026-10-20)。
-    ///
-    /// 判据:**设备回程的新块必须在账上有在借登记**。没登记 = 这条命令的分配
-    /// 绕过了本句柄(服务端/裸 client 直接发)⇒ 显存**账本看不见**、`/debug/vram`
-    /// 的对账面(`recon.only_block`)会涨、store 的钩子也收不回来(§79)。
-    ///
-    /// 定位实测:27B 4k prefill 一轮 ≈ **1000 块 / ~2.7 GiB** 走的是这条路。
-    /// 这里**只报告不改账**(探针,不是功能):要让账本管起来,得改分配路径本身。
-    ///
-    /// 去重:同一命令名只报前 3 次(名字即调用面:kernel 名 / `alloc` / `htod`)。
+    // **账本审计探针**(诊断面;`OWL_LEDGER_AUDIT=1`,2026-10-20)。
+    //
+    // 判据:**设备回程的新块必须在账上有在借登记**。没登记 = 这条命令的分配
+    // 绕过了本句柄(服务端/裸 client 直接发)⇒ 显存**账本看不见**、`/debug/vram`
+    // 的对账面(`recon.only_block`)会涨、store 的钩子也收不回来(§79)。
+    //
+    // 定位实测:27B 4k prefill 一轮 ≈ **1000 块 / ~2.7 GiB** 走的是这条路。
+    // 这里**只报告不改账**(探针,不是功能):要让账本管起来,得改分配路径本身。
+    //
+    // 去重:同一命令名只报前 3 次(名字即调用面:kernel 名 / `alloc` / `htod`)。
     // ── 钩子(全部同步短锁;绝不跨 await 持锁)────────────────────────────
 
     fn ctx(&self) -> MutexGuard<'_, Ctx> {
@@ -1177,6 +1176,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         self.inner.flush()
     }
 
+    // 结构性豁免(2026-11-02 clippy 清理):契约声明 `-> impl Future + Send`,async fn 语法表达不了 `+ Send`
+    #[allow(clippy::manual_async_fn)]
     fn exec_batch(
         &mut self,
         cmds: Vec<crate::command::Command>,
@@ -1218,6 +1219,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         DeviceHandle::ledger_probe(self)
     }
 
+    // 结构性豁免(2026-11-02 clippy 清理):契约声明 `-> impl Future + Send`,async fn 语法表达不了 `+ Send`
+    #[allow(clippy::manual_async_fn)]
     fn drain_temp_pool(&mut self) -> impl Future<Output = usize> + Send {
         // UFCS 钉死走具名实现(见契约面注释:同名解析事故)
         async move { DeviceHandle::drain_pool_to_driver(self).await }
@@ -1231,6 +1234,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         self.inner.device_kernels()
     }
 
+    // 结构性豁免(2026-11-02 clippy 清理):契约声明 `-> impl Future + Send`,async fn 语法表达不了 `+ Send`
+    #[allow(clippy::manual_async_fn)]
     fn graph_begin(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
             self.inner.graph_begin().await?;
@@ -1239,6 +1244,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         }
     }
 
+    // 结构性豁免(2026-11-02 clippy 清理):契约声明 `-> impl Future + Send`,async fn 语法表达不了 `+ Send`
+    #[allow(clippy::manual_async_fn)]
     fn graph_end(&mut self) -> impl Future<Output = Result<GraphId, ModelError>> + Send {
         async move {
             let r = self.inner.graph_end().await;
@@ -1287,6 +1294,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         self.inner.graph_launch(graph)
     }
 
+    // 结构性豁免(2026-11-02 clippy 清理):契约声明 `-> impl Future + Send`,async fn 语法表达不了 `+ Send`
+    #[allow(clippy::manual_async_fn)]
     fn graph_abort(&mut self) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
             let r = self.inner.graph_abort().await;
@@ -1321,7 +1330,12 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         }
     }
 
-    fn graph_destroy(&mut self, graph: GraphId) -> impl Future<Output = Result<(), ModelError>> + Send {
+    // 结构性豁免(2026-11-02 clippy 清理):契约声明 `-> impl Future + Send`,async fn 语法表达不了 `+ Send`
+    #[allow(clippy::manual_async_fn)]
+    fn graph_destroy(
+        &mut self,
+        graph: GraphId,
+    ) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
             let r = self.inner.graph_destroy(graph).await;
             if r.is_ok() {
@@ -1420,6 +1434,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         }
     }
 
+    // 结构性豁免(2026-11-02 clippy 清理):契约声明 `-> impl Future + Send`,async fn 语法表达不了 `+ Send`
+    #[allow(clippy::manual_async_fn)]
     fn htod(
         &mut self,
         dtype: Dtype,
@@ -1437,6 +1453,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         }
     }
 
+    // 结构性豁免(2026-11-02 clippy 清理):契约声明 `-> impl Future + Send`,async fn 语法表达不了 `+ Send`
+    #[allow(clippy::manual_async_fn)]
     fn htod_on(
         &mut self,
         stream: UpStream,
@@ -1536,6 +1554,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
 
     /// **结清口径**:账已由 store 结清(见 `DeviceContract::free_settled`),
     /// 这里只发驱动 free + 摘窗/图存档 —— **不查池、不发事件**。
+    // 结构性豁免(2026-11-02 clippy 清理):契约声明 `-> impl Future + Send`,async fn 语法表达不了 `+ Send`
+    #[allow(clippy::manual_async_fn)]
     fn free_settled(&mut self, ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
             if ids.is_empty() {
@@ -1549,6 +1569,8 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         }
     }
 
+    // 结构性豁免(2026-11-02 clippy 清理):契约声明 `-> impl Future + Send`,async fn 语法表达不了 `+ Send`
+    #[allow(clippy::manual_async_fn)]
     fn free(&mut self, ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
             // **缺口 4**:可池化 ⇒ 入池(不回驱动);其余真归还。池内那条不发 FreeEvent。

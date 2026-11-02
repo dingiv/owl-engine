@@ -27,7 +27,7 @@
 //! ```
 //! `OWL_TP_SAME_DEV`(默认 = dev A)= 同卡档用的 ordinal(**型号必须与跨卡档两卡一致**)。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use owl_engine::{Engine, EngineConfig, EngineKnobs, TpEngine};
 use owl_iface::contract::ModelError;
@@ -45,6 +45,8 @@ fn dir_of() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("../../models/Qwen/Qwen3.5-0.8B"))
 }
 
+// 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
+#[allow(clippy::field_reassign_with_default)]
 fn knobs() -> EngineKnobs {
     let mut k = EngineKnobs::default();
     k.sampler_enabled = false; // greedy(设备 argmax)
@@ -70,8 +72,11 @@ fn card_name(ordinal: usize) -> Result<String, ModelError> {
 async fn load_shards(
     oa: usize,
     ob: usize,
-    dir: &PathBuf,
-) -> (Vec<Engine<owl_cuda::GpuClient>>, Vec<owl_engine::LoadedModel>) {
+    dir: &Path,
+) -> (
+    Vec<Engine<owl_cuda::GpuClient>>,
+    Vec<owl_engine::LoadedModel>,
+) {
     let mut e0 = Engine::new(cfg_of(oa)).expect("engine(rank0)");
     let l0 = e0.loader().slice(0, 2).load_qwen35_0_8b(dir).await.expect("rank0 分片装载");
     let mut e1 = Engine::new_with_ledger(cfg_of(ob), e0.ledger_cell(), 1).expect("engine(rank1)");

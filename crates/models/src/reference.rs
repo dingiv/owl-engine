@@ -548,7 +548,7 @@ impl Interpreter for CpuInterpreter {
         half: usize,
     ) -> Result<Value, ModelError> {
         let row_len = heads * head_dim;
-        if row_len == 0 || x.f32.len() % row_len != 0 {
+        if row_len == 0 || !x.f32.len().is_multiple_of(row_len) {
             return Err(ModelError::Msg(format!(
                 "rope: x 长 {} 不是 heads·head_dim = {row_len} 的整数倍",
                 x.f32.len()
@@ -732,6 +732,8 @@ impl Interpreter for CpuInterpreter {
         Ok(Value { f32: out, shape: vec![rows, dim] })
     }
 
+    // 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+    #[allow(clippy::needless_range_loop)]
     fn attn_full(
         &mut self,
         q: &Value,

@@ -220,7 +220,7 @@ impl AwqSource {
         //（I/O 不饱和）与 3/5 流（NVMe 队列争用）；按字节贪心重排反而
         // 打乱文件顺序，冷载慢 ~1.4s。buffered pread ~2.1GB/s/流，
         // 双流与 CPU 物化重叠后把冷载压到 max(I/O, CPU)。
-        let flows = segs.min(2).max(1);
+        let flows = segs.clamp(1, 2);
         let mut buckets: Vec<Vec<(usize, usize, usize)>> = (0..flows).map(|_| Vec::new()).collect();
         for (i, r) in merged.into_iter().enumerate() {
             buckets[i % flows].push(r);
@@ -1207,7 +1207,7 @@ mod tests {
                 Some(Resolved::View(e)) => e.nbytes,
                 Some(Resolved::Bytes(b, _)) => b.len(),
                 other => {
-                    eprintln!("[iobench] 跳过 {key}(臂 {} 不适用)", matches!(other, None));
+                    eprintln!("[iobench] 跳过 {key}(臂 {} 不适用)", other.is_none());
                     continue;
                 }
             };

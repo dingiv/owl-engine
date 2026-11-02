@@ -68,7 +68,6 @@ pub(crate) fn u32s_as_f32(v: &[u32]) -> Vec<f32> {
     v.iter().map(|x| f32::from_bits(*x)).collect()
 }
 
-
 /// **手工 join 两 future**(S4 ⑤-K3):引擎 lib **不依赖 async 运行时/组合器**
 /// (只有 owl-* + half)—— 两 rank 的设备半必须**并发推进**(见
 /// `phases.rs` 的 TP 驱动注:单边先行会让对端的 AR 撞 5s 自旋超时)。
@@ -163,23 +162,23 @@ pub(crate) fn merge_sample_cands(
 
 pub mod phases;
 
+pub mod coverage;
+pub mod draft;
 /// **E4 接入面(声明;未实现)**——见 `docs/arch/三流事件序-设计与迁移.md` §6
 #[allow(dead_code)] // E4 声明面(未接线;见模块头:全部 Err(未实现),调用即响亮拒 ⇒ 不静默)
 pub mod e4_api;
-pub mod spec;
-pub mod draft;
-pub mod prefill_chunk;
 /// 前缀无感删除:设备半(后缀 K 原地重转)
 pub mod img_evict;
-pub mod turn_end;
-pub mod coverage;
 /// **KV 池页的宿主解码面**(单源;f16 / fp8 e4m3 两侧)
 pub mod kvpage;
-/// **MTP 草稿注意力读视图**(Windowed-MTP;纯函数)
-pub mod mtp_window;
 /// **DFlash2 lookup-augmented drafting**(LABD;宿主后缀查找 + 草稿头融合)
 pub mod lookup;
+/// **MTP 草稿注意力读视图**(Windowed-MTP;纯函数)
+pub mod mtp_window;
+pub mod prefill_chunk;
 pub mod proposal_q;
+pub mod spec;
+pub mod turn_end;
 
 #[cfg(test)]
 mod break_even_tests {
@@ -192,8 +191,14 @@ mod break_even_tests {
     #[test]
     fn break_even_line_pins_32k_sample() {
         let line = break_even_line(77.0, 38.4).expect("两分母都有 ⇒ 必有线");
-        assert!((line - 77.0 / 38.4).abs() < 1e-5, "区间内原样取比,实得 {line}");
-        assert!((line - 2.005).abs() < 1e-3, "32k 实测样本 ≈ 2.0(不是旧兑底 2.5)");
+        assert!(
+            (line - 77.0 / 38.4).abs() < 1e-5,
+            "区间内原样取比,实得 {line}"
+        );
+        assert!(
+            (line - 2.005).abs() < 1e-3,
+            "32k 实测样本 ≈ 2.0(不是旧兑底 2.5)"
+        );
         assert!(
             2.25 >= line,
             "AL 2.25 ≥ 真线 {line:.3} ⇒ 应判**盈利**;旧兑底 2.5 会把它误降级"
@@ -280,7 +285,6 @@ pub(crate) fn break_even_text(line: Option<f32>) -> String {
         None => "未测".to_string(),
     }
 }
-
 
 /// E5-M5 spec 分相探针(owl-metrics 直用 API:release 恒开,热路径每轮
 /// ~8 条环形推入 ≈ µs 级;/debug/metrics 查询。宏是 debug-only,装载域
@@ -373,7 +377,6 @@ pub(crate) fn safe_end(s: &str, stops: &[String]) -> usize {
     }
     end
 }
-
 
 #[cfg(test)]
 mod spec_accept_tests {

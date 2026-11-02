@@ -67,6 +67,9 @@ pub enum EngineReq {
 ///
 /// 为什么三面同屋:它们必须**同一时刻**取(引擎不在 pump 时)—— 分开取会让
 /// "事件账 vs 块账房"的差集混入并发窗口的噪声,判据就不再是判据。
+// 结构性豁免(2026-11-02 clippy 清理):
+//   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+#[allow(clippy::type_complexity)]
 pub struct VramSnapshot {
     /// store 报告(三层账 + owner 维 + 事件账)
     pub report: owl_store::StoreReport,

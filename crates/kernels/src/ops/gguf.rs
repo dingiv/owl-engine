@@ -170,7 +170,6 @@ gguf_mmq2_quant_spec_bf16!(GgufMmq2QuantDs4Bf16, crate::family::gguf::MMQ2_QUANT
 gguf_mmq2_quant_spec_bf16!(GgufMmq2QuantD4Bf16, crate::family::gguf::MMQ2_QUANT_D4_BF16);
 
 /// `owl_mmq2_q8_0_j128` 等 8 个(type × J)
-
 pub struct GgufMmq2Q8_0J64;
 /// 同上
 pub struct GgufMmq2Q8_0J128;

@@ -49,7 +49,7 @@ fn adaptive_should_downshift(rounds: u32, tokens: u32, min_tpr: f32) -> bool {
 /// **平局归 rank0** —— 与旧 host fold 的「取最小索引」逐位一致。
 /// 返回每行**全局索引**(f32 过线,与 `tok` 槽同口径)。
 fn dist_argmax_merge(a: &[f32], b: &[f32], half_vocab: usize) -> Result<Vec<f32>> {
-    if a.len() != b.len() || a.len() % 2 != 0 {
+    if a.len() != b.len() || !a.len().is_multiple_of(2) {
         return Err(ModelError::EngineInvariant {
             what: format!(
                 "分布式 argmax 行尺寸不符:a={} b={}(应为 2×行数)",
@@ -103,8 +103,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let prof = self.boot.probes.step_profile;
         let t0 = prof.then(std::time::Instant::now);
         let t_round = std::time::Instant::now();
-        let t_snap;
-        let t_verify;
+
         let mut t_rollback = std::time::Duration::ZERO;
         let mut t_propose = std::time::Duration::ZERO;
         // **VLM m-RoPE delta**(V5):图像提示经塔后,文本主干的 rope 位置
@@ -127,7 +126,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         );
 
         // ① 快照(轮首;恢复后仍有效 → 只在失效时拍)
-        t_snap = self.ensure_spec_snap(gdn_slot).await?;
+        let t_snap = self.ensure_spec_snap(gdn_slot).await?;
 
         // ② 草稿到位(host 账;轮末 propose 图/eager dtoh 产出。首轮 =
         // prefill seed propose(eager);Dumb = anchor 重复)
@@ -207,7 +206,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 use_cand,
             )
             .await?;
-        t_verify = t_v;
+        let t_verify = t_v;
         if prof {
             owl_shared::log_info!("spec-prof", "pos={pos} verify={:?}", t0.unwrap().elapsed());
         }
@@ -253,10 +252,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     // 非 DFlash2(MTP/Dumb):旧「目标抽样 == draft」等价式。
                     None => {
                         let mut s: Vec<u32> = Vec::with_capacity(live + 1);
-                        for i in 0..=live {
+                        for (i, prow) in p_rows.iter().enumerate().take(live + 1) {
                             let mut rng =
                                 seed_base ^ ((pos + i) as u64).wrapping_mul(0xBF58476D1CE4E5B9);
-                            let tok = crate::sampler::sample_sparse(&p_rows[i], &mut rng);
+                            let tok = crate::sampler::sample_sparse(prow, &mut rng);
                             s.push(tok);
                             hist.push(tok);
                         }
@@ -994,9 +993,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 chain.len()
             )));
         }
-        let has_hole = chain[..need_pages]
-            .iter()
-            .any(|p| *p == crate::scheduler::PENDING_LOAD_PLACEHOLDER);
+        let has_hole = chain[..need_pages].contains(&crate::scheduler::PENDING_LOAD_PLACEHOLDER);
         if !has_hole {
             return Ok(None);
         }
@@ -1120,6 +1117,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 /// 返回 `(ids, hidden, records, hidden_owned, row_logits, 耗时)`。
     /// `hidden_owned = true` ⇒ 调用方负责 free(eager 路的中间块)。
     #[allow(clippy::type_complexity)]
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     async fn verify_round(
         &mut self,
         block: &[u32],
@@ -1519,14 +1518,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             return Err(ModelError::Msg(
                 "spec verify:eager 路径不支持逐行视图页表(select_partial + 有洞);\
                  请开 verify 图(不要 [graph] no_graph)"
-                    .into(),
-            ));
-        }
-        let ts = std::time::Instant::now();
-        let (ids, hidden, row_logits) =
-            self.verify_forward(&block, pos, gdn_slot, sampler_on, vlm_delta).await?;
-        verify_elapsed = ts.elapsed();
-        (ids, hidden, Vec::new(), true, row_logits, None)
+                        .into(),
+                ));
+            }
+            let ts = std::time::Instant::now();
+            let (ids, hidden, row_logits) = self
+                .verify_forward(block, pos, gdn_slot, sampler_on, vlm_delta)
+                .await?;
+            verify_elapsed = ts.elapsed();
+            (ids, hidden, Vec::new(), true, row_logits, None)
         };
         Ok((ids, hidden, records, hidden_owned, row_logits, cand_rows, verify_elapsed))
     }

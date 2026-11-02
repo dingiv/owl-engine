@@ -468,15 +468,21 @@ async fn gpu_paged_attention_v2_reduce_f16_smoke() {
         .arg_f32(1.0)
         .arg_i32(-1)
         .arg_i32(0)
-        .with_shape(Dtype::F16, vec![1 * hq * hd]);  // bs32 变体契约:tmp_out r1
-    let tmp = crate::interpreters::eval_ops(v2.step(), &mut gpu).await.expect("v2 eval");
+        .with_shape(Dtype::F16, vec![hq * hd]); // bs32 变体契约:tmp_out r1
+    let tmp = crate::interpreters::eval_ops(v2.step(), &mut gpu)
+        .await
+        .expect("v2 eval");
 
     // reduce:分片归约 → 终出(aux = [hd, hq, nparts, seqs];E16 seqs 入参)
     let rd = TensorOps::call(SemanticKernel::PagedV2Reduce).aux(&[hd, hq, 1, 1])
         .arg(&TensorOps::of_block(es_b.id, Dtype::F32, vec![1, hq]))
         .arg(&TensorOps::of_block(ml_b.id, Dtype::F32, vec![1, hq]))
-        .arg(&TensorOps::of_block(tmp.id, Dtype::F16, vec![1 * hq * hd]))
-        .arg(&TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t_ctx as f32])))
+        .arg(&TensorOps::of_block(tmp.id, Dtype::F16, vec![hq * hd]))
+        .arg(&TensorOps::from_host(
+            Dtype::F32,
+            vec![1],
+            &f32b(&[t_ctx as f32]),
+        ))
         .arg_i32(1) // max_num_partitions
         .with_shape(Dtype::F16, vec![1, hq * hd]);
     let got = crate::testkit::harvest_f16(&mut gpu, &rd).await;

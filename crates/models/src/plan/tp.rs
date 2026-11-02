@@ -81,7 +81,7 @@ impl TpPlan {
         if self.world == 1 {
             return Ok(0..dim);
         }
-        if dim % self.world != 0 {
+        if !dim.is_multiple_of(self.world) {
             return Err(format!(
                 "TpPlan: 维度 {dim} 不被 world {} 整除(拒绝 —— 不许 pad/静默降级)",
                 self.world
@@ -177,8 +177,11 @@ impl TpPlan {
 ///
 /// 越界/不完整 = **响亮拒**(`Err`)—— 不静默截断。
 pub fn take_rows_f32(w: &[f32], in_dim: usize, rows: Range<usize>) -> Result<Vec<f32>, String> {
-    if in_dim == 0 || w.len() % in_dim != 0 {
-        return Err(format!("take_rows: 权重长 {} 不是 in_dim {in_dim} 的整数倍", w.len()));
+    if in_dim == 0 || !w.len().is_multiple_of(in_dim) {
+        return Err(format!(
+            "take_rows: 权重长 {} 不是 in_dim {in_dim} 的整数倍",
+            w.len()
+        ));
     }
     let out_dim = w.len() / in_dim;
     if rows.start > rows.end || rows.end > out_dim {
@@ -192,8 +195,11 @@ pub fn take_rows_f32(w: &[f32], in_dim: usize, rows: Range<usize>) -> Result<Vec
 
 /// 取列区间子矩阵:`[out, in]` → `out × cols.range`(逐行切片拷贝)。
 pub fn take_cols_f32(w: &[f32], in_dim: usize, cols: Range<usize>) -> Result<Vec<f32>, String> {
-    if in_dim == 0 || w.len() % in_dim != 0 {
-        return Err(format!("take_cols: 权重长 {} 不是 in_dim {in_dim} 的整数倍", w.len()));
+    if in_dim == 0 || !w.len().is_multiple_of(in_dim) {
+        return Err(format!(
+            "take_cols: 权重长 {} 不是 in_dim {in_dim} 的整数倍",
+            w.len()
+        ));
     }
     let out_dim = w.len() / in_dim;
     if cols.start > cols.end || cols.end > in_dim {
@@ -212,9 +218,16 @@ pub fn take_cols_f32(w: &[f32], in_dim: usize, cols: Range<usize>) -> Result<Vec
 }
 
 /// 激活向量的末维切片(`x [.., in_dim]` → `x [.., cols]`;逐行拷贝)。
-pub fn slice_last_dim_f32(x: &[f32], in_dim: usize, cols: Range<usize>) -> Result<Vec<f32>, String> {
-    if in_dim == 0 || x.len() % in_dim != 0 {
-        return Err(format!("slice_last_dim: 输入长 {} 不是 in_dim {in_dim} 的整数倍", x.len()));
+pub fn slice_last_dim_f32(
+    x: &[f32],
+    in_dim: usize,
+    cols: Range<usize>,
+) -> Result<Vec<f32>, String> {
+    if in_dim == 0 || !x.len().is_multiple_of(in_dim) {
+        return Err(format!(
+            "slice_last_dim: 输入长 {} 不是 in_dim {in_dim} 的整数倍",
+            x.len()
+        ));
     }
     if cols.start > cols.end || cols.end > in_dim {
         return Err(format!("slice_last_dim: 列区间 {cols:?} 越界(in_dim={in_dim})"));

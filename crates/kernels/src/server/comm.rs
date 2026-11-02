@@ -74,6 +74,7 @@ fn check_staging(op: OpId, what: &'static str, len: usize, slot_bytes: u64) -> R
     Ok(())
 }
 
+///
 /// **reduce 的 grid 选择**(2026-10-17 §27.7;单 block 打不满本地访存 ——
 /// 实测本地 RMW 37GB/s vs stage 核(copy)114GB/s vs 硬件 500+GB/s)。
 ///
@@ -85,10 +86,8 @@ fn check_staging(op: OpId, what: &'static str, len: usize, slot_bytes: u64) -> R
 /// **那一维 = 块数 × 块内线程数(在飞线程总数)**,两者都扫过:
 /// - 块数:32 块 = 600.5µs / 64 块 = 627.8µs(`L dev` 6.23 vs 16.94)⇒ **32 更好**,
 ///   与 vLLM "too many SMs will cause contention on the bus"(它取 36)同向;
-/// - 块内线程数:`asset::BLOCK` = **512**(256 → 512:`AR(5.24MB)` 608.6 → 590.2µs);
-/// ⇒ 故上限记成**在飞线程总数** `MAX_THREADS`,grid = 它 / BLOCK(256 → 32 块;
+/// - 块内线程数:`asset::BLOCK` = **512**(256 → 512:`AR(5.24MB)` 608.6 → 590.2µs); ⇒ 故上限记成**在飞线程总数** `MAX_THREADS`,grid = 它 / BLOCK(256 → 32 块;
 ///   512 → 16 块;1024 → 8 块 —— 三者扫出来 512 最好)。
-
 fn ar_reduce_grid(dt: Dtype, bytes: u64) -> (u32, u32, u32) {
     /// 每线程的 16B 向量数
     const VEC_PER_THREAD: u64 = 8;

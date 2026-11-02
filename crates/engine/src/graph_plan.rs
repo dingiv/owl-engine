@@ -666,6 +666,7 @@ impl<D: DeviceClient> GraphPlan<D> {
         Ok(outs)
     }
 
+    ///
     /// eager 归约:全输出 eval 入 last(读序由 dtoh 读语义保证)
     ///
     /// **块生命周期(2026-10-14 修复)**:本函数是 eager 臂唯一入口,
@@ -677,11 +678,7 @@ impl<D: DeviceClient> GraphPlan<D> {
     /// 2. **本轮中间块**:`eval_ops_multi_scoped_env`(per-node 活性回收 +
     ///    末次 arena−roots 清扫)。原实现用 plain `eval_ops_multi`
     ///    (块常驻)**每步泄漏全部中间块** ⇒ 实测 ~100 步
-    ///    `CUDA_ERROR_OUT_OF_MEMORY`,且失败后池不可恢复。
-    /// **warmup/干跑归约**(S4 ⑤-K3):与 [`Self::eval_current`] 同路,但
-    /// **TP 上下文置空** —— 装配期(warmup/分段干跑)只服务计量与声明门禁,
-    /// **不得真发射 AR**:AR 是对端配对协议,warmup 单边先行会撞 5s 自旋超时 +
-    /// 游标永久失步(2026-10-17 G8 定谳);真 AR 只在回放期(两 rank 同序入队)。
+    ///    `CUDA_ERROR_OUT_OF_MEMORY`,且失败后池不可恢复。 **warmup/干跑归约**(S4 ⑤-K3):与 [`Self::eval_current`] 同路,但 **TP 上下文置空** —— 装配期(warmup/分段干跑)只服务计量与声明门禁, **不得真发射 AR**:AR 是对端配对协议,warmup 单边先行会撞 5s 自旋超时 + 游标永久失步(2026-10-17 G8 定谳);真 AR 只在回放期(两 rank 同序入队)。
     async fn eval_current_dry(&mut self) -> Result<()> {
         let saved = self.tp.take();
         let r = self.eval_current().await;
@@ -837,8 +834,7 @@ impl<D: DeviceClient> GraphPlan<D> {
         self.last.clear();
     }
 
-    /// **单图退休**(LRU 驱逐 / plan 生命期收尾的底层):销毁图 + 归还输入槽
-    /// + 丢弃输出句柄。次序**不可颠倒**(图先、槽后):图在时槽被租约钉住,
+    /// **单图退休**(LRU 驱逐 / plan 生命期收尾的底层):销毁图 + 归还输入槽 + 丢弃输出句柄。次序**不可颠倒**(图先、槽后):图在时槽被租约钉住,
     /// 先 free 只会被 `free_blocks` 响亮拒收。
     pub async fn close(&mut self) -> Result<()> {
         if let Mode::Captured { graph } = self.mode {

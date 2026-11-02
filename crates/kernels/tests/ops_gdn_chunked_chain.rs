@@ -451,6 +451,8 @@ fn take_f32_unused() {}
 /// (h_buf / v_new / w / o 全在 tags 表里可取)。
 #[test]
 #[allow(clippy::too_many_lines)]
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn gdn_chunked_nt_decomposition_identity() {
     if owl_cuda::test_device_bdf().is_none() {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
@@ -640,6 +642,8 @@ fn gdn_chunked_nt_decomposition_identity() {
 ///   * 判据:两臂精度路径不同 ⇒ **不逐位**,按相对信号 RMS + max|Δ| 报点。
 #[test]
 #[allow(clippy::too_many_lines)]
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn gdn_chunked_matches_varlen_fn_level() {
     if owl_cuda::test_device_bdf().is_none() {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");

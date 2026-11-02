@@ -33,8 +33,8 @@
 #![cfg(feature = "device")]
 
 mod fi_support;
-use owl_macros::owl_test;
 use fi_support::{f16_to_f32, TestRes, PAGE};
+use owl_macros::owl_test;
 
 use owl_kernels::contract::{Arg, Dtype, KernelSource, LaunchMsg};
 use owl_kernels::device::Exec;
@@ -119,14 +119,33 @@ impl Session {
         let k = e4m3_bytes(nb * PAGE * hkv * HD, 0x9E37 + ctx as u32);
         let v = e4m3_bytes(nb * PAGE * hkv * HD, 0x1F3D + ctx as u32);
 
-        let q = res.upload(&q_bits.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        let q = res.upload(
+            &q_bits
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         let k_b = res.upload(&k);
         let v_b = res.upload(&v);
-        let q_cu = res.upload(&[0u32, t as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        let q_cu = res.upload(
+            &[0u32, t as u32]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         let indices: Vec<u32> = (0..nb as u32).collect();
-        let idx_b = res.upload(&indices.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
-        let indptr =
-            res.upload(&[0u32, nb as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        let idx_b = res.upload(
+            &indices
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+        let indptr = res.upload(
+            &[0u32, nb as u32]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         let last_len = ctx - (nb - 1) * PAGE;
         let ll_b = res.upload(&(last_len as u32).to_le_bytes());
         let wr_b = res.zeros(8);
@@ -138,18 +157,54 @@ impl Session {
                 source: String::new(),
             },
             args: vec![
-                Arg::Block { id: q.id, dtype: Dtype::F16, rank: 2 },
-                Arg::Block { id: k_b.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: v_b.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: q_cu.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: idx_b.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: indptr.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: ll_b.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: wr_b.id, dtype: Dtype::F16, rank: 1 },
-                Arg::Block { id: out_b.id, dtype: Dtype::F16, rank: 2 },
-                Arg::U64(t as u64),    // total_rows
-                Arg::U64(ctx as u64),  // ctx_total(plan 键里被抹掉的那一维)
-                Arg::U64(t as u64),    // T
+                Arg::Block {
+                    id: q.id,
+                    dtype: Dtype::F16,
+                    rank: 2,
+                },
+                Arg::Block {
+                    id: k_b.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: v_b.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: q_cu.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: idx_b.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: indptr.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: ll_b.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: wr_b.id,
+                    dtype: Dtype::F16,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: out_b.id,
+                    dtype: Dtype::F16,
+                    rank: 2,
+                },
+                Arg::U64(t as u64),   // total_rows
+                Arg::U64(ctx as u64), // ctx_total(plan 键里被抹掉的那一维)
+                Arg::U64(t as u64),   // T
                 Arg::U64(hq as u64),
                 Arg::U64(hkv as u64),
                 Arg::U64(HD as u64),
@@ -163,7 +218,10 @@ impl Session {
         };
         self.reg.execute(&msg, res, &mut self.exec).expect("FI run");
         res.stream.synchronize().expect("sync");
-        res.take_u16(out_b.id).iter().map(|&h| f16_to_f32(h)).collect()
+        res.take_u16(out_b.id)
+            .iter()
+            .map(|&h| f16_to_f32(h))
+            .collect()
     }
 }
 
@@ -172,7 +230,13 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "输出长度必须相同");
     a.iter()
         .zip(b)
-        .map(|(x, y)| if x.is_nan() || y.is_nan() { f32::INFINITY } else { (x - y).abs() })
+        .map(|(x, y)| {
+            if x.is_nan() || y.is_nan() {
+                f32::INFINITY
+            } else {
+                (x - y).abs()
+            }
+        })
         .fold(0.0f32, f32::max)
 }
 
@@ -199,12 +263,16 @@ fn fi_plan_key_ctx_sweep() {
             // ① 缓存"脏"路:先跑 ctx=t(把首块 plan 钉进缓存),再逐档加大
             let mut dirty = Session::new(dev);
             let _ = dirty.run(hq, hkv, t, t);
-            let stale: Vec<(usize, Vec<f32>)> =
-                steps.iter().map(|s| (t * s, dirty.run(hq, hkv, t, t * s))).collect();
+            let stale: Vec<(usize, Vec<f32>)> = steps
+                .iter()
+                .map(|s| (t * s, dirty.run(hq, hkv, t, t * s)))
+                .collect();
             // ② 缓存干净路:同形状,直接跑(plan 与形状自洽)
             let mut clean = Session::new(dev);
-            let fresh: Vec<(usize, Vec<f32>)> =
-                steps.iter().map(|s| (t * s, clean.run(hq, hkv, t, t * s))).collect();
+            let fresh: Vec<(usize, Vec<f32>)> = steps
+                .iter()
+                .map(|s| (t * s, clean.run(hq, hkv, t, t * s)))
+                .collect();
             for ((ctx, a), (_, b)) in stale.iter().zip(fresh.iter()) {
                 let d = max_abs_diff(a, b);
                 let tag = if d <= 5e-4 { "ok  " } else { "**✗**" };

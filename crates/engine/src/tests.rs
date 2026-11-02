@@ -651,9 +651,8 @@ async fn gdn_row_is_owned_by_the_active_turn() {
         .submit_session(None, &prompt, 16)
         .expect("submit");
     for _ in 0..4 {
-        match running.pump().await.expect("pump") {
-            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败:{err}"),
-            _ => {}
+        if let TurnEvent::Failed { turn, err } = running.pump().await.expect("pump") {
+            panic!("t{turn} 失败:{err}")
         }
         if running.active_turn_id() == Some(tid) {
             break;
@@ -1574,7 +1573,7 @@ async fn index_probe_scenario<D: DeviceClient>(
         .rel
         .index
         .as_ref()
-        .and_then(|_| None::<owl_store::SnapKey>)
+        .and(None::<owl_store::SnapKey>)
     {
         let _ = k; // 占位:幂等由采集口的 `contains` 早退保证(见 exec/spec.rs)
     }
@@ -1650,7 +1649,7 @@ async fn coverage_run_and_report<D: DeviceClient>(
     eprintln!(
         "[cov] 分析边界目标 ctx={at}(0 = 最后一个边界);chunk={} ⇒ {}",
         running.cfg_prefill_chunk(),
-        if at == 0 || at % running.cfg_prefill_chunk().max(1) == 0 {
+        if at == 0 || at.is_multiple_of(running.cfg_prefill_chunk().max(1)) {
             "该 ctx 是合法边界".to_string()
         } else {
             format!(
@@ -2110,7 +2109,7 @@ pub async fn gpu_08b_chunk_invariance_gate() {
             return;
         }
         let at = cfg.knobs.coverage_analyze_at;
-        if at != 0 && at % c != 0 {
+        if at != 0 && !at.is_multiple_of(c) {
             eprintln!(
                 "[chunk-inv] ⚠️ analyze_at_ctx={at} 不是 chunk {c} 的整数倍 ⇒ 取不到同一条边界"
             );
@@ -2699,7 +2698,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
 
     let rep = running.bank.rel.leg.report();
     eprintln!(
-        "[s3-3b] 轮 3 后:自由槽 {}/{} · 缓存 {} 块 · 宿主 {} 块 / {:.2}MiB · 换出 {} 次 {}KiB(drop {} / 同步驱逐 canary {})",
+        "[s3-3b] 轮 3 后:自由槽 {}/{} · 缓存 {} 块 · 宿主 {} 块 / {:.2}MiB · 换出 {} 次 {}KiB(drop {} / 同步驱逐 canary —)",
         rep.slots_free,
         rep.slots_total,
         rep.cached_blocks,
@@ -2707,8 +2706,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
         rep.host_bytes as f64 / 1048576.0,
         rep.ops.offloads,
         rep.ops.offload_bytes >> 10,
-        rep.ops.ensure_evicted,
-        "—"
+        rep.ops.ensure_evicted
     );
     // ── B-3e:stage-in(回灌)实测账 + 27B 工作集外推 ──
     // 论文口径:恢复 174ms@256K("选中集"回灌,不是全 ctx)。我们把实测吞吐外推到
@@ -2942,8 +2940,8 @@ pub async fn gpu_08b_budget_probe() {
         kv_per_tok >> 10,
         mb(gdn_row_bytes as u64),
         mb(gdn_pool),
-        mb(snap_pool as u64),
-        mb(draft_pool as u64)
+        mb(snap_pool),
+        mb(draft_pool)
     );
     eprintln!(
         "[budget] 固定面分解(实测):权重 {:.1}MiB + KV池 {:.1}MiB + GDN格 {:.1}MiB + 快照池 {:.1}MiB + 草稿池 {:.1}MiB + **运行底价(余项)** {:.1}MiB",
@@ -6204,7 +6202,7 @@ pub async fn gpu_image_evict_gate() {
         .match_prefix(&old_tokens)
         .expect("旧链命中");
     assert!(
-        hit.matched_blocks >= (del.end / page) + 1,
+        hit.matched_blocks > (del.end / page),
         "旧链块数 {} 不足以覆盖删点({})",
         hit.matched_blocks,
         del.end / page
@@ -6555,7 +6553,7 @@ pub async fn gpu_image_evict_gate() {
         let g7_text3 = drive_turn(&mut running, g7t3).await;
         assert!(!g7_text3.trim().is_empty(), "G7 t3 必须出文本");
         let s9 = running.bank.sessions.session(9).expect("会话 9");
-        assert_eq!(s9.positioned, true, "第二次删除后位置洞标记仍在");
+        assert!(s9.positioned, "第二次删除后位置洞标记仍在");
         assert_eq!(
             running.img_evict.absorbed,
             absorbed_after_t1 + 2,
@@ -6743,7 +6741,7 @@ pub async fn gpu_image_evict_spec_identity_gate() {
                         &[],
                     )
                     .expect("试算 pad");
-                    if sq.spans.len() == 2 && sq.spans[0].text_start % page == 0 {
+                    if sq.spans.len() == 2 && sq.spans[0].text_start.is_multiple_of(page) {
                         chosen = Some((fill, p));
                         break;
                     }

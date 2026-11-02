@@ -73,7 +73,7 @@ fn rand_f16(n: usize, seed: u32) -> Vec<u16> {
     for _ in 0..n {
         s = s.wrapping_mul(1664525).wrapping_add(1013904223);
         // [−1,1) 内的小数:取 f16 位型的一个安全子集(指数 0x3800 = 2^-1 附近)
-        v.push((0x3800 | ((s >> 16) as u16 & 0x03FF)) as u16);
+        v.push(0x3800 | ((s >> 16) as u16 & 0x03FF));
     }
     v
 }
@@ -120,28 +120,82 @@ impl Fi {
         let k = res.upload(&finite_e4m3(pool, seed));
         let v = res.upload(&finite_e4m3(pool, seed.wrapping_add(1)));
         let q_bits = rand_f16(rows * H * HD, seed.wrapping_add(2));
-        let q = res.upload(&q_bits.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        let q = res.upload(
+            &q_bits
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         let out = res.zeros(out_bytes);
-        let q_cu = res.upload(&[0u32, rows as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        let q_cu = res.upload(
+            &[0u32, rows as u32]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         let wr = res.zeros(8);
         // 页链槽按 **max_ctx** 定容(回放期只改内容不换块 ⇒ 图里指针恒定)
         let idx = res.upload(
-            &vec![0u32; nb].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+            &vec![0u32; nb]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
         );
-        let indptr = res.upload(&[0u32, 0].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        let indptr = res.upload(
+            &[0u32, 0]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         let ll = res.upload(&0u32.to_le_bytes());
-        Self { res, exec, reg, k, v, q, out, q_cu, wr, idx, indptr, ll, rows, q_bits }
+        Self {
+            res,
+            exec,
+            reg,
+            k,
+            v,
+            q,
+            out,
+            q_cu,
+            wr,
+            idx,
+            indptr,
+            ll,
+            rows,
+            q_bits,
+        }
     }
 
     /// 换表件到某个 ctx(= 桶回放期写输入槽;块地址不变、内容变)
     fn tables(&mut self, ctx: usize) {
         let nb = ctx.div_ceil(PAGE);
         let indices: Vec<u32> = (0..nb as u32).collect();
-        rewrite_block(&mut self.res, &self.idx, &indices.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
-        rewrite_block(&mut self.res, &self.indptr, &[0u32, nb as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        rewrite_block(
+            &mut self.res,
+            &self.idx,
+            &indices
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
+        rewrite_block(
+            &mut self.res,
+            &self.indptr,
+            &[0u32, nb as u32]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         let last_len = (ctx - (nb - 1) * PAGE) as u32;
         rewrite_block(&mut self.res, &self.ll, &last_len.to_le_bytes());
-        rewrite_block(&mut self.res, &self.q_cu, &[0u32, self.rows as u32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        rewrite_block(
+            &mut self.res,
+            &self.q_cu,
+            &[0u32, self.rows as u32]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
     }
 
     /// 覆写 q 的行区间(假行实验:把 `[from, rows)` 填 NaN)
@@ -165,17 +219,56 @@ impl Fi {
     /// 并推荐 int_ws",不需要那个形状本身几何自洽)。
     fn msg_geom(&self, total_rows: usize, t: usize, ctx: usize) -> LaunchMsg {
         LaunchMsg {
-            kernel: KernelSource { name: FI_OP.to_string(), source: String::new() },
+            kernel: KernelSource {
+                name: FI_OP.to_string(),
+                source: String::new(),
+            },
             args: vec![
-                Arg::Block { id: self.q.id, dtype: Dtype::F16, rank: 2 },
-                Arg::Block { id: self.k.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: self.v.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: self.q_cu.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: self.idx.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: self.indptr.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: self.ll.id, dtype: Dtype::U32, rank: 1 },
-                Arg::Block { id: self.wr.id, dtype: Dtype::F16, rank: 1 },
-                Arg::Block { id: self.out.id, dtype: Dtype::F16, rank: 1 },
+                Arg::Block {
+                    id: self.q.id,
+                    dtype: Dtype::F16,
+                    rank: 2,
+                },
+                Arg::Block {
+                    id: self.k.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: self.v.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: self.q_cu.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: self.idx.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: self.indptr.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: self.ll.id,
+                    dtype: Dtype::U32,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: self.wr.id,
+                    dtype: Dtype::F16,
+                    rank: 1,
+                },
+                Arg::Block {
+                    id: self.out.id,
+                    dtype: Dtype::F16,
+                    rank: 1,
+                },
                 Arg::U64(total_rows as u64), // total_rows
                 Arg::U64(ctx as u64),        // ctx_total
                 Arg::U64(t as u64),          // T
@@ -196,14 +289,18 @@ impl Fi {
     /// 非法,会把捕获直接 invalidate:实测 `run err 901`)。
     fn exec(&mut self, ctx: usize) {
         let msg = self.msg(ctx);
-        self.reg.execute(&msg, &mut self.res, &mut self.exec).expect("FI run");
+        self.reg
+            .execute(&msg, &mut self.res, &mut self.exec)
+            .expect("FI run");
     }
 
     /// 发一条**别的几何**的消息(同 registry ⇒ 同 FiRuntime/int_ws;
     /// 探针④用它把 int_ws 刷成另一条 plan)
     fn exec_geom(&mut self, total_rows: usize, t: usize, ctx: usize) {
         let msg = self.msg_geom(total_rows, t, ctx);
-        self.reg.execute(&msg, &mut self.res, &mut self.exec).expect("FI run(几何变体)");
+        self.reg
+            .execute(&msg, &mut self.res, &mut self.exec)
+            .expect("FI run(几何变体)");
     }
 
     /// 窗外:eager 参考 / 捕获后的收割
@@ -220,7 +317,10 @@ impl Fi {
 }
 
 fn maxdiff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
 }
 
 fn finite(v: &[f32]) -> bool {
@@ -278,8 +378,14 @@ fn fi_graph_replay_m2a() {
             d_same, d_swap, d_ctx
         );
         assert!(d_same < 1e-6, "①a 同 ctx 回放应逐位:{d_same:.3e}");
-        assert!(d_swap < 1e-6, "①b 换表件回放应≡eager(F-5 未成立?):{d_swap:.3e}");
-        assert!(d_ctx > 1e-3, "①c ctx 必须真生效(否则本实验是空转):{d_ctx:.3e}");
+        assert!(
+            d_swap < 1e-6,
+            "①b 换表件回放应≡eager(F-5 未成立?):{d_swap:.3e}"
+        );
+        assert!(
+            d_ctx > 1e-3,
+            "①c ctx 必须真生效(否则本实验是空转):{d_ctx:.3e}"
+        );
     }
 
     // ── ② 假行 NaN(桶 512 装 64 真行)──────────────────────────────
@@ -310,7 +416,10 @@ fn fi_graph_replay_m2a() {
             finite(real_rows),
             d_real
         );
-        assert!(finite(real_rows), "② 假行 NaN 泄进了真行(违反 design §4.2 律①)");
+        assert!(
+            finite(real_rows),
+            "② 假行 NaN 泄进了真行(违反 design §4.2 律①)"
+        );
         assert!(d_real < 1e-2, "② 真行与真 t 参考不符:{d_real:.3e}");
     }
 
@@ -336,7 +445,8 @@ fn fi_graph_replay_m2a() {
         // 取证档:关掩码 ⇒ 尾部 CTA 真跑(白跑);真行仍不得被写坏(F-8)
         std::env::set_var("FI_NO_MASK", "1");
         let t_unmasked = Instant::now();
-        g.launch(&f.res.ctx, &f.res.stream).expect("launch(no mask)");
+        g.launch(&f.res.ctx, &f.res.stream)
+            .expect("launch(no mask)");
         f.res.stream.synchronize().expect("sync");
         let unmasked_ms = t_unmasked.elapsed().as_secs_f64() * 1e3;
         let out_unmasked = f.read(t);
@@ -348,8 +458,14 @@ fn fi_graph_replay_m2a() {
             d_mask, d_nomask
         );
         assert!(d_mask < 1e-6, "③a 掩码回放应≡eager:{d_mask:.3e}");
-        assert!(d_nomask < 1e-6, "③b 尾部 CTA 写坏了真行(F-8 被否证):{d_nomask:.3e}");
-        assert!(unmasked_ms >= 0.0 && masked_ms >= 0.0, "③c 计时口径自检(地板口径,见头注)");
+        assert!(
+            d_nomask < 1e-6,
+            "③b 尾部 CTA 写坏了真行(F-8 被否证):{d_nomask:.3e}"
+        );
+        assert!(
+            unmasked_ms >= 0.0 && masked_ms >= 0.0,
+            "③c 计时口径自检(地板口径,见头注)"
+        );
     }
 
     // ── ④ int_ws 自携(多 plan 共存;M2b 2026-10-15)─────────────────────
@@ -396,7 +512,8 @@ fn fi_graph_replay_m2a() {
         let first_diff = (0..2048).find(|&i| after_b[i] != before[i]);
         let b_differs = first_diff.is_some();
 
-        g.launch(&f.res.ctx, &f.res.stream).expect("launch after switch");
+        g.launch(&f.res.ctx, &f.res.stream)
+            .expect("launch after switch");
         f.res.stream.synchronize().expect("sync");
         let after = f.read(t);
         let restored = f.res.take_bytes(int_ws);
@@ -405,8 +522,14 @@ fn fi_graph_replay_m2a() {
         println!(
             "[④] 多 plan 共存:B 调用后 int_ws 变了={b_differs}(首个差异字节 {first_diff:?}) | 回放 A 后 int_ws 复位={ws_restored} | 输出 |Δ| = {d:.3e}(取证档 plan_restore=false 应红)"
         );
-        assert!(b_differs, "④ 前提不成立:B 的 plan 没写进 int_ws(本实验是空转)");
-        assert!(ws_restored, "④ int_ws 自携失败(回放读到了别的 plan 的调度表)");
+        assert!(
+            b_differs,
+            "④ 前提不成立:B 的 plan 没写进 int_ws(本实验是空转)"
+        );
+        assert!(
+            ws_restored,
+            "④ int_ws 自携失败(回放读到了别的 plan 的调度表)"
+        );
         assert!(d < 1e-6, "④ 回放输出被别的 plan 影响:{d:.3e}");
     }
 

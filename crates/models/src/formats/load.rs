@@ -135,8 +135,8 @@ where
 ///
 /// 纯读零猜测;未接方案**响亮拒**(带着实测到的 group_size/symmetric)。
 fn quant_family(dir: &Path) -> Result<crate::formats::kind::QuantScheme, ModelError> {
-    use crate::formats::kind::{QUANT_G32_ASYM, QUANT_G128_SYM};
-    let raw = owl_shared::file_loader::read(&dir.join("config.json"))
+    use crate::formats::kind::{QUANT_G128_SYM, QUANT_G32_ASYM};
+    let raw = owl_shared::file_loader::read(dir.join("config.json"))
         .map_err(|e| ModelError::Msg(format!("load_from_dir: 读 config.json: {e}")))?;
     let v: serde_json::Value = serde_json::from_slice(&raw)
         .map_err(|e| ModelError::Msg(format!("load_from_dir: config.json 解析: {e}")))?;
@@ -1048,7 +1048,6 @@ async fn load_direct_device_cast<D: DeviceClient, S: WeightSource + ?Sized>(
 /// 原始字节分块上卡(源元素区间 `[src_off, src_off+len)` → 目标块**槽内**
 /// 首元素;≥64MB 自动分块 + 每 4 块/尾一次栅栏 —— cast 臂与重排臂共用的
 /// 上传口(槽是固定块,故目标偏移恒 0;流式的段偏移在源侧)。
-#[allow(clippy::too_many_arguments)]
 /// 原始 bf16 字节分块**填充** pinned 租约(不上传 —— 块表交给复合口一次带走)。
 /// 源元素区间 `[src_off, src_off+len_total)`;每块 = `CHUNK_BYTES` 粒。
 #[allow(clippy::too_many_arguments)]
@@ -1306,8 +1305,7 @@ async fn load_device_rearrange<D: DeviceClient, S: WeightSource + ?Sized>(
 
 /// **NVFP4 权重打包臂**(2026-10-28 装载管线 P2;设计 §4/§7)。
 ///
-/// 一源二槽:源 = 全精度权重(`[rows, cols]` 行主序)→ `q`(e2m1 对)
-/// + `sf`(e4m3/16 块缩放,CUTLASS 交错)+ `gb`(host 标量)。
+/// 一源二槽:源 = 全精度权重(`[rows, cols]` 行主序)→ `q`(e2m1 对) + `sf`(e4m3/16 块缩放,CUTLASS 交错)+ `gb`(host 标量)。
 ///
 /// **两个落点,一个接口**(2026-10-28 M7):
 /// - **设备臂**(首选,与 AWQ 的 `ct_repack` 同律):源字节直上卡 →
@@ -1375,6 +1373,8 @@ async fn load_nvfp4<D: DeviceClient, S: WeightSource + ?Sized>(
 }
 
 /// **host 打包臂**(回落;CPU 上一次性产出 `q`/`sf`)。
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 async fn load_nvfp4_host<D: DeviceClient>(
     face: &mut D,
     w: &crate::module::Want,
@@ -1461,8 +1461,7 @@ async fn load_nvfp4_host<D: DeviceClient>(
 
 /// **设备打包臂**(2026-10-28 M7;与 AWQ `ct_repack` 同律)。
 ///
-/// 源 `f16/bf16` 直上卡 → `nvfp4_pack_weight`(三发量化核)→ `q` + `sf`(SFB)
-/// + `g`。**host 一遍只做 memcpy**(不再解码/量化 —— 4B 档省下 +11.6 s 的 CPU
+/// 源 `f16/bf16` 直上卡 → `nvfp4_pack_weight`(三发量化核)→ `q` + `sf`(SFB) + `g`。**host 一遍只做 memcpy**(不再解码/量化 —— 4B 档省下 +11.6 s 的 CPU
 /// 量化,只剩 F16 基线的 DMA 底)。
 ///
 /// 顺序契约:
@@ -1470,6 +1469,8 @@ async fn load_nvfp4_host<D: DeviceClient>(
 /// 2. `launch` 只提交(未同步);
 /// 3. `dtoh(g)` 自带"先排空 COMPUTE"语义 ⇒ 回执后核已跑完、**源块可释放**;
 /// 4. 释放源块(键内生命周期;不进常驻账)。
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 async fn load_nvfp4_device<D: DeviceClient>(
     face: &mut D,
     w: &crate::module::Want,
@@ -2326,7 +2327,7 @@ mod generic_entry_tests {
                 _ => unreachable!(),
             };
             // 期望:目标 [c*rows + r] = 源 [r*cols + c]
-            let mut want = vec![0f32; 6];
+            let mut want = [0f32; 6];
             for r in 0..2 {
                 for c in 0..3 {
                     want[c * 2 + r] = src[r * 3 + c];

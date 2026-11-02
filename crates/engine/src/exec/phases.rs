@@ -586,7 +586,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 || last_boundary
                 // `coverage_analyze` 先 `note_boundary()` 再取模；这里预判要
                 // 用**下一个**边界序号，否则 k>1 时会在完整召回边界漏采 Q。
-                || (self.sel.boundaries() + 1) % self.boot.cfg.knobs.recall_every.max(1) == 0
+                || (self.sel.boundaries() + 1).is_multiple_of(self.boot.cfg.knobs.recall_every.max(1))
         } else {
             false
         };
@@ -707,14 +707,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 修法与 `index_every` 同源(那里早就用边界序号了,教训同源)。
             let every = SNAP_EVERY.max(1);
             let snap_keep =
-                last_boundary || (self.sel.boundaries() + 1) % every == 0 || msg_snap;
+                last_boundary || (self.sel.boundaries() + 1).is_multiple_of(every) || msg_snap;
             // **索引采集节奏**：与 `coverage_analyze` 的完整召回同拍 ——
             // 廉价边界只攒身份/页号，不触发 D2H；下次完整召回前一次补齐。
             // `coverage_probe` 诊断档要求每边界都有索引 ⇒ 全采。
             let index_every = self.boot.cfg.knobs.index_cadence();
             let index_now = self.boot.cfg.knobs.coverage_probe
                 || last_boundary
-                || (self.sel.boundaries() + 1) % index_every == 0;
+                || (self.sel.boundaries() + 1).is_multiple_of(index_every);
             // GDN 快照拍摄(**唯一入口** `capture_gdn_snap`:链推进 + 增量登记 +
             // 索引采集 + 快照;内部已 TP 感知 —— peer 在场时两 rank 各拍各自的池,
             // store 的 state 账仍单份)。
@@ -2177,6 +2177,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
     /// `fi` = 本轮的 FI 表规格(每 rank 各自的图都要刷;`None` = 档位/槽不在场);
     /// `want_logits` = 采样档才付那次 dtoh(peer 侧恒 false —— 读数只由主 rank 消费,
     /// 确定性 ⇒ 两 rank 同值)。
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn verify_dev(
         &mut self,
         ins: &[(&str, &[f32])],

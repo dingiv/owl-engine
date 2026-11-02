@@ -69,7 +69,7 @@ impl ShardSel {
         if self.world == 0 {
             return Err(ModelError::Msg(format!("[{key}] world = 0 非法")));
         }
-        if total % self.world != 0 {
+        if !total.is_multiple_of(self.world) {
             return Err(ModelError::Msg(format!(
                 "[{key}] {what} = {total} 不被 world = {} 整除(GGUF 等分切分要求整除;拒绝 pad)",
                 self.world
@@ -187,6 +187,11 @@ impl KeyGeom {
     }
 
     /// **交付长度**(量化键 = 字节;原生键 = 元素;与 `WeightSource::elem_len` 同口径)
+    /// 是否为空(与 `len` 成对;clippy 的长度接口约定)
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn len(&self) -> usize {
         match &self.shape {
             Shape::Mat { rows, .. } => {
@@ -255,7 +260,7 @@ pub fn geom_of(
         (Role::Replicate, _) => unreachable!("上面已提前返回"),
         // ── 2-D 行窗口类(Out / OutHead)──────────────────────────────
         (Role::Out | Role::OutHead, false) => {
-            if f.inner % elem_per_atom != 0 {
+            if !f.inner.is_multiple_of(elem_per_atom) {
                 return Err(ModelError::Msg(format!(
                     "[{key}] 内维 {} 不是原子 {elem_per_atom} 的整数倍",
                     f.inner
@@ -332,7 +337,7 @@ pub fn geom_of(
                     f.inner, d.nv
                 )));
             }
-            if hv % elem_per_atom != 0 {
+            if !hv.is_multiple_of(elem_per_atom) {
                 return Err(ModelError::Msg(format!(
                     "[{key}] v-head 宽 {hv} 不是原子 {elem_per_atom} 的整数倍 ⇒ 块粒度聚合不成立\
                      (该型按头不可分 ⇒ TP 拒;设计 §14.6 ②)"

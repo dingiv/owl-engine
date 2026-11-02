@@ -73,6 +73,8 @@ fn pos_vec() -> Vec<f32> {
 }
 
 /// host 参考：与 `owl_store::derope_pair` 同式
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn host_rope(x: &[f32], c: &[f32], s: &[f32], pos: &[f32], inverse: bool) -> Vec<f32> {
     let mut out = x.to_vec();
     for t in 0..TOKENS {
@@ -87,9 +89,8 @@ fn host_rope(x: &[f32], c: &[f32], s: &[f32], pos: &[f32], inverse: bool) -> Vec
                 out[base + i + HALF] = if inverse { b * ci - a * si } else { b * ci + a * si };
             }
             // partial 直通(2*HALF..HEAD_DIM 必须非空 —— 见文件头 HALF 注)
-            for d in ROTARY_DIM..HEAD_DIM {
-                out[base + d] = x[base + d];
-            }
+            out[base + ROTARY_DIM..base + HEAD_DIM]
+                .copy_from_slice(&x[base + ROTARY_DIM..base + HEAD_DIM]);
         }
     }
     out
@@ -127,11 +128,11 @@ macro_rules! roundtrip_case {
                 let h = |v: &[f32]| {
                     v.iter().map(|x| half::f16::from_f32(*x).to_bits()).collect::<Vec<u16>>()
                 };
-                let d_x = stream.memcpy_stod(&h(&k)).unwrap();
-                let d_c = stream.memcpy_stod(&h(&c)).unwrap();
-                let d_s = stream.memcpy_stod(&h(&s)).unwrap();
-                let d_p = stream.memcpy_stod(&pos).unwrap(); // pos 恒 f32（核签名）
-                let mut d_o = stream.memcpy_stod(&h(&k)).unwrap();
+                let d_x = stream.clone_htod(&h(&k)).unwrap();
+                let d_c = stream.clone_htod(&h(&c)).unwrap();
+                let d_s = stream.clone_htod(&h(&s)).unwrap();
+                let d_p = stream.clone_htod(&pos).unwrap(); // pos 恒 f32（核签名）
+                let d_o = stream.clone_htod(&h(&k)).unwrap();
                 {
                     let (xp, cp, sp, pp, op) = (
                         d_x.device_ptr(&stream).0,
@@ -153,7 +154,7 @@ macro_rules! roundtrip_case {
                     unsafe { b.launch(cfg) }.expect("launch");
                     stream.synchronize().expect("sync");
                 }
-                let got_bits: Vec<u16> = stream.memcpy_dtov(&d_o).unwrap();
+                let got_bits: Vec<u16> = stream.clone_dtoh(&d_o).unwrap();
                 let got: Vec<f32> = got_bits
                     .iter()
                     .map(|b| half::f16::from_bits(*b).to_f32())
@@ -183,11 +184,11 @@ macro_rules! roundtrip_case {
                     }
                 }
             } else {
-                let d_x = stream.memcpy_stod(&k).unwrap();
-                let d_c = stream.memcpy_stod(&c).unwrap();
-                let d_s = stream.memcpy_stod(&s).unwrap();
-                let d_p = stream.memcpy_stod(&pos).unwrap();
-                let mut d_o = stream.memcpy_stod(&k).unwrap();
+                let d_x = stream.clone_htod(&k).unwrap();
+                let d_c = stream.clone_htod(&c).unwrap();
+                let d_s = stream.clone_htod(&s).unwrap();
+                let d_p = stream.clone_htod(&pos).unwrap();
+                let d_o = stream.clone_htod(&k).unwrap();
                 {
                     let (xp, cp, sp, pp, op) = (
                         d_x.device_ptr(&stream).0,
@@ -209,7 +210,7 @@ macro_rules! roundtrip_case {
                     unsafe { b.launch(cfg) }.expect("launch");
                     stream.synchronize().expect("sync");
                 }
-                let got: Vec<f32> = stream.memcpy_dtov(&d_o).unwrap();
+                let got: Vec<f32> = stream.clone_dtoh(&d_o).unwrap();
                 let mut worst = 0f32;
                 for (a, b) in got.iter().zip(post_ref.iter()) {
                     worst = worst.max((a - b).abs());

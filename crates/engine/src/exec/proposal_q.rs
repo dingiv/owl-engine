@@ -154,6 +154,8 @@ impl DraftQ {
 
     /// lookup 改写后：把 q 退化为实际 draft 的 one-hot（确定性 proposal）。
     /// 只改与 `current` 不一致的步；返回被覆写步数。
+    // 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+    #[allow(clippy::needless_range_loop)]
     pub(crate) fn reconcile(&mut self, current: &[u32]) -> usize {
         let n = current.len().min(self.drafts.len());
         let mut hit = 0usize;
@@ -212,7 +214,7 @@ pub(crate) fn accept_rejection(
                 "spec rejection: 第 {i} 步 draft={d} 的 q={qd} 非正/非有限（proposal_q 与 drafts 不同源）"
             )));
         }
-        let accept = (pd / qd).min(1.0).max(0.0);
+        let accept = (pd / qd).clamp(0.0, 1.0);
         if accept_uniform(seed_base, pos + i) < accept {
             emitted.push(d);
             hist.push(d);
@@ -403,7 +405,7 @@ pub(crate) fn accept_rejection_sparse(
                 "spec rejection(稀疏):第 {i} 步 draft={d} 的 q={qd} 非正/非有限（proposal_q 与 drafts 不同源）"
             )));
         }
-        let accept = (pd / qd).min(1.0).max(0.0);
+        let accept = (pd / qd).clamp(0.0, 1.0);
         if accept_uniform(seed_base, pos + i) < accept {
             emitted.push(d);
             hist.push(d);

@@ -44,8 +44,8 @@ mod http;
 // `/debug/load` 内源灌流(服务面并发现场测量)
 mod load;
 // 每拍遥测单元(忙时也能读队列/容量;避免 actor 被诊断查询阻塞)
-mod telemetry;
 mod openai;
+mod telemetry;
 // 跳轮重复探测(只可见不改生成;2026-10-31 立案)
 mod repeat_guard;
 // 会话闸(per-session serialization;合批档 `max_batch>1` 的前置契约)
@@ -91,9 +91,8 @@ const ENGINE_STACK_BYTES: usize = 32 << 20;
 /// 类型 = **设备句柄**(`DeviceHandle<GpuClient>`;2026-10-19 步 3:face 收编到句柄)。
 /// 注意:句柄的账本单元是 `Arc<Mutex<..>>`(真 Send)⇒ 送到 HTTP 线程是安全的
 /// ——这正是选 `Arc<Mutex>` 而不是 `Rc<RefCell>` 的实证理由(设计卷 §十二)。
-type DbgFace = std::sync::Arc<
-    std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<owl_engine::GpuFace>>>,
->;
+type DbgFace =
+    std::sync::Arc<std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<owl_engine::GpuFace>>>>;
 
 #[tokio::main]
 async fn main() {
@@ -185,7 +184,9 @@ async fn main() {
             timestamp: lc.timestamp,
         };
         match owl_shared::log::init_logger(log_cfg) {
-            Ok(()) => owl_shared::log_info!("boot", "log level = {}(log_build={})",
+            Ok(()) => owl_shared::log_info!(
+                "boot",
+                "log level = {}(log_build={})",
                 owl_shared::log::level_name(),
                 owl_shared::log::LOG_BUILD,
             ),
@@ -246,20 +247,22 @@ async fn main() {
             _gpu_locks.iter().map(|g| g.path().to_path_buf()).collect();
         let uuids = config.devices.uuids().join(" + ");
         tokio::spawn(async move {
-            let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    owl_shared::log_warn!("boot", "SIGTERM 监听失败(优雅关停降级): {e}");
-                    return;
-                }
-            };
-            let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(e) => {
-                    owl_shared::log_warn!("boot", "SIGINT 监听失败(优雅关停降级): {e}");
-                    return;
-                }
-            };
+            let mut sigterm =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        owl_shared::log_warn!("boot", "SIGTERM 监听失败(优雅关停降级): {e}");
+                        return;
+                    }
+                };
+            let mut sigint =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        owl_shared::log_warn!("boot", "SIGINT 监听失败(优雅关停降级): {e}");
+                        return;
+                    }
+                };
             tokio::select! { _ = sigterm.recv() => {}, _ = sigint.recv() => {} }
             owl_shared::log_info!("boot", "收到停止信号 ⇒ 优雅关停(释放卡锁 {uuids} + 显存)");
             for p in &lock_paths {
@@ -270,12 +273,18 @@ async fn main() {
     }
     // 性能框架分级(docs/arch/perf-framework.md §一;off = 零成本基线臂)
     owl_shared::metrics::set_level(config.perf_level);
-    owl_shared::log_info!("boot", "perf level = {}(perf_build={};无该 feature 的 release 里钩子空展开)",
+    owl_shared::log_info!(
+        "boot",
+        "perf level = {}(perf_build={};无该 feature 的 release 里钩子空展开)",
         owl_shared::metrics::level_name(),
         owl_shared::metrics::PERF_BUILD,
     );
     if let Some(p) = &config.perf_dump {
-        owl_shared::log_info!("boot", "perf dump → {}(每 turn 终了覆写 CSV + .json)", p.display());
+        owl_shared::log_info!(
+            "boot",
+            "perf dump → {}(每 turn 终了覆写 CSV + .json)",
+            p.display()
+        );
     }
 
     // ── chat 模板(agent 服务面 §3.2):**快照资产**,装配期编译一次 ──
@@ -312,7 +321,9 @@ async fn main() {
     let max_concurrency = config.max_concurrency;
     // 合批上限([runtime] max_batch;早于引擎线程 move 出来 —— 后面告警/诊断要用)
     let max_batch = config.max_batch;
-    owl_shared::log_info!("boot", "并发上限 {max_concurrency}(GDN 格 {gdn_slots};本地服务,排队超出请求)"
+    owl_shared::log_info!(
+        "boot",
+        "并发上限 {max_concurrency}(GDN 格 {gdn_slots};本地服务,排队超出请求)"
     );
 
     let (bind, model_name) = (config.bind.clone(), config.model_name.clone());
@@ -566,7 +577,10 @@ async fn load_shard(
     rank: usize,
     world: usize,
 ) -> owl_engine::Result<owl_engine::LoadedModel> {
-    let mut loader = engine.loader().slice(rank, world).vocab_split(config.tp_vocab_split);
+    let mut loader = engine
+        .loader()
+        .slice(rank, world)
+        .vocab_split(config.tp_vocab_split);
     match arm {
         // AWQ pack-quantized 家族(cyankiwi 系;int4 权重已烘焙)
         owl_engine::LoadArm::AwqInt4 | owl_engine::LoadArm::AwqA8 => {
@@ -777,9 +791,19 @@ async fn actor_main(
     if let Some(c) = running.face_clone() {
         let _ = dbg_face.set(std::sync::Arc::new(tokio::sync::Mutex::new(c)));
     } else {
-        owl_shared::log_info!("boot", "face 克隆不可用 ⇒ /debug/blocks 回 503(该后端不支持)");
+        owl_shared::log_info!(
+            "boot",
+            "face 克隆不可用 ⇒ /debug/blocks 回 503(该后端不支持)"
+        );
     }
-    actor::run_actor(&mut running, rx, config.perf_dump.clone(), shutdown, telemetry).await;
+    actor::run_actor(
+        &mut running,
+        rx,
+        config.perf_dump.clone(),
+        shutdown,
+        telemetry,
+    )
+    .await;
 }
 
 /// panic 载荷 → 可读串(`&str` / `String` 两型覆盖 std 惯例;其余给个兜底)
@@ -850,9 +874,7 @@ async fn serve(mut stream: tokio::net::TcpStream, ctx: ConnCtx) -> std::io::Resu
             http::respond_json(
                 &mut stream,
                 505,
-                &openai::error_json(
-                    "只接 HTTP/1.1(chunked 应答是 1.1 语法;HTTP/1.0 请先升版)",
-                ),
+                &openai::error_json("只接 HTTP/1.1(chunked 应答是 1.1 语法;HTTP/1.0 请先升版)"),
             )
             .await?;
             return Ok(());
@@ -864,7 +886,11 @@ async fn serve(mut stream: tokio::net::TcpStream, ctx: ConnCtx) -> std::io::Resu
         // 廉价只读面（不碰引擎/设备）：不吃 permit —— 否则排队/容量观测会被
         // "并发位"自己挡住（实测 1.19s，等于等一个 turn 跑完）。
         let cheap = matches!(req.path.as_str(), "/debug/queue" | "/health" | "/v1/models");
-        let _permit = if chat_route || cheap { None } else { Some(ctx.gate.acquire().await) };
+        let _permit = if chat_route || cheap {
+            None
+        } else {
+            Some(ctx.gate.acquire().await)
+        };
         handle(&mut stream, &req, &ctx).await?;
         served += 1;
         if close_after || served >= MAX_REQUESTS_PER_CONN {
@@ -882,7 +908,12 @@ async fn handle(
     let mut stream = stream;
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health") => {
-            http::respond_json(&mut stream, 200, &json!({"ok": true, "model": ctx.model_name})).await?;
+            http::respond_json(
+                &mut stream,
+                200,
+                &json!({"ok": true, "model": ctx.model_name}),
+            )
+            .await?;
         }
         ("GET", "/v1/models") => {
             http::respond_json(
@@ -967,7 +998,10 @@ async fn handle(
         }
         // 日志面入口(/debug/log[/level/<name>])
         ("GET", p) if p == "/debug/log" || p.starts_with("/debug/log/") => {
-            let rest = p.strip_prefix("/debug/log").unwrap_or("").trim_start_matches('/');
+            let rest = p
+                .strip_prefix("/debug/log")
+                .unwrap_or("")
+                .trim_start_matches('/');
             if let Some(name) = rest.strip_prefix("level/") {
                 match owl_shared::log::Level::parse_threshold(name) {
                     Some(l) => {
@@ -1029,11 +1063,14 @@ async fn handle(
         //   *    /debug/step/ms/<n>             粘滞间隔
         //   *    /debug/step/every/<n>          每 N 点停一次
         //   POST /debug/step                     便捷:放行 1 步
-        ("GET", p) if p == "/debug/step" => {
+        ("GET", "/debug/step") => {
             http::respond_json(&mut stream, 200, &debug::step_json()).await?;
         }
         (m, p) if p == "/debug/step" || p.starts_with("/debug/step/") => {
-            let rest = p.strip_prefix("/debug/step").unwrap_or("").trim_start_matches('/');
+            let rest = p
+                .strip_prefix("/debug/step")
+                .unwrap_or("")
+                .trim_start_matches('/');
             let (what, arg) = rest.split_once('/').unwrap_or((rest, ""));
             let arg = arg.trim();
             let (ok, msg) = match what {
@@ -1070,9 +1107,7 @@ async fn handle(
                                 http::respond_json(
                                     &mut stream,
                                     400,
-                                    &openai::error_json(format!(
-                                        "release 需要整数或 inf,得 {s:?}"
-                                    )),
+                                    &openai::error_json(format!("release 需要整数或 inf,得 {s:?}")),
                                 )
                                 .await?;
                                 return Ok(());
@@ -1142,7 +1177,13 @@ async fn handle(
         // 纯读账(零副作用、零搬运)—— 泄漏判据面:同一 owner 字节逐轮爬坡 = 漏。
         ("GET", "/debug/vram") => {
             let (rtx, rrx) = tokio::sync::oneshot::channel();
-            if ctx.tx.clone().send(EngineReq::VramReport { reply: rtx }).await.is_err() {
+            if ctx
+                .tx
+                .clone()
+                .send(EngineReq::VramReport { reply: rtx })
+                .await
+                .is_err()
+            {
                 http::respond_json(&mut stream, 503, &openai::error_json("引擎退役")).await?;
                 return Ok(());
             }
@@ -1195,7 +1236,10 @@ async fn handle(
             http::respond_json(&mut stream, 200, &json!({"ok": true, "cleared": n})).await?;
         }
         ("GET", p) if p == "/debug/agent" || p.starts_with("/debug/agent/") => {
-            let rest = p.strip_prefix("/debug/agent").unwrap_or("").trim_start_matches('/');
+            let rest = p
+                .strip_prefix("/debug/agent")
+                .unwrap_or("")
+                .trim_start_matches('/');
             // 空段 = 全仓(0 与 `snapshot` 的取值约定一致);非法段拒绝而不静默回缺省
             let n = if rest.is_empty() {
                 0
@@ -1221,7 +1265,10 @@ async fn handle(
         //   GET /debug/launches[/<n>[/<kind>]]  —— 最近 n 条(缺省 200)按发射序;
         //   kind = 命令类(launch/htod/dtoh/free…)/流名(compute/h2d/d2h)/核名子串
         ("GET", p) if p == "/debug/launches" || p.starts_with("/debug/launches/") => {
-            let rest = p.strip_prefix("/debug/launches").unwrap_or("").trim_start_matches('/');
+            let rest = p
+                .strip_prefix("/debug/launches")
+                .unwrap_or("")
+                .trim_start_matches('/');
             let (ns, kind) = rest.split_once('/').unwrap_or((rest, ""));
             let n = if ns.is_empty() {
                 200
@@ -1240,16 +1287,17 @@ async fn handle(
         // 路径语:[/debug/perf[/epoch][/json|/<prefix>]] + /debug/perf/level/<name>
         // (http 层不保留 query,故用路径段而非 ?epoch=1)
         ("GET", p) if p == "/debug/perf" || p.starts_with("/debug/perf/") => {
-            let rest = p.strip_prefix("/debug/perf").unwrap_or("").trim_start_matches('/');
+            let rest = p
+                .strip_prefix("/debug/perf")
+                .unwrap_or("")
+                .trim_start_matches('/');
             if let Some(name) = rest.strip_prefix("level/") {
                 match debug::perf_set_level(name) {
                     Ok(l) => {
                         http::respond_json(&mut stream, 200, &json!({"ok": true, "level": l}))
                             .await?
                     }
-                    Err(e) => {
-                        http::respond_json(&mut stream, 400, &openai::error_json(e)).await?
-                    }
+                    Err(e) => http::respond_json(&mut stream, 400, &openai::error_json(e)).await?,
                 }
             } else {
                 let (epoch, rest) = match rest.strip_prefix("epoch") {

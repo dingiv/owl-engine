@@ -1,3 +1,4 @@
+//!
 //! **AR 通道微基准(TP 通道工作面;隔离测量)**。
 //!
 //! 设计出处:`docs/arch/TP2-施工设计.md` §22.6(TP2 prefill 0.24× 立案)与
@@ -44,9 +45,7 @@
 //!
 //! - slot = 32MiB × 2(**与生产同参**)⇒ 载荷 ≤32MiB 时相邻两次调用落在
 //!   **相距 32MiB 的不同 slot** ⇒ 不吃 L2 余温(3080 L2 = 6MB,不可缓存满载);
-//! - 载荷尺寸取 27B 真形状(`hidden 5120` × f16):10KB(1 行)/
-//!   1.31MB(128 行)/ 5.24MB(512 行)/ 10.49MB(1024 行)+ 边界 32MiB/+1
-//!   + 80MiB(3 块,管道面 INFO);
+//! - 载荷尺寸取 27B 真形状(`hidden 5120` × f16):10KB(1 行)/ 1.31MB(128 行)/ 5.24MB(512 行)/ 10.49MB(1024 行)+ 边界 32MiB/+1 + 80MiB(3 块,管道面 INFO);
 //! - **host/设备分离**:`enq` = 入队 K 次(每发射 = 一次**同步往返**
 //!   client↔server 线程,实测 **~35-37µs/发射**;`ack` 在**入队后即回**,
 //!   不等核完成 —— 见 `server::handle_launch_inner`);`dev` = `total − enq`
@@ -494,21 +493,21 @@ async fn run_case(
         .expect("B payload htod");
 
     // ── 常态 header(两侧归零;相对游标 ⇒ 任何同值起点都合法)──
-    set_hdr(a, &staging_a, 0, 0).await.expect("A hdr");
-    set_hdr(b, &staging_b, 0, 0).await.expect("B hdr");
+    set_hdr(a, staging_a, 0, 0).await.expect("A hdr");
+    set_hdr(b, staging_b, 0, 0).await.expect("B hdr");
     // ★ **push AR 档**(2026-10-18;§36.7):两核 own/peer 对调(需 RW 别名)
     let push_ar = std::env::var("OWL_ARB_AR_PUSH").is_ok();
     // 先跑 2 次完整 AR 把两个 slot 都填成真 f16(NaN 位型会坏口径)
     for _ in 0..2 {
         let (ra, rb) = if push_ar {
             tokio::join!(
-                emit_ar_push(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout),
-                emit_ar_push(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout),
+                emit_ar_push(a, &payload_a, staging_a, alias_b_on_a, bytes as u64, layout),
+                emit_ar_push(b, &payload_b, staging_b, alias_a_on_b, bytes as u64, layout),
             )
         } else {
             tokio::join!(
-                emit_ar(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout),
-                emit_ar(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout),
+                emit_ar(a, &payload_a, staging_a, alias_b_on_a, bytes as u64, layout),
+                emit_ar(b, &payload_b, staging_b, alias_a_on_b, bytes as u64, layout),
             )
         };
         ra.expect("A 预热");
@@ -524,12 +523,22 @@ async fn run_case(
     {
         let fa = async {
             for _ in 0..k {
-                if push_ar { emit_ar_push(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout).await } else { emit_ar(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout).await }.expect("A 发射");
+                if push_ar {
+                    emit_ar_push(a, &payload_a, staging_a, alias_b_on_a, bytes as u64, layout).await
+                } else {
+                    emit_ar(a, &payload_a, staging_a, alias_b_on_a, bytes as u64, layout).await
+                }
+                .expect("A 发射");
             }
         };
         let fb = async {
             for _ in 0..k {
-                if push_ar { emit_ar_push(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout).await } else { emit_ar(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout).await }.expect("B 发射");
+                if push_ar {
+                    emit_ar_push(b, &payload_b, staging_b, alias_a_on_b, bytes as u64, layout).await
+                } else {
+                    emit_ar(b, &payload_b, staging_b, alias_a_on_b, bytes as u64, layout).await
+                }
+                .expect("B 发射");
             }
         };
         tokio::join!(fa, fb);
@@ -542,8 +551,16 @@ async fn run_case(
     let ar_us = per_call_us(ar_tot, k);
     let ar_enq_us = per_call_us(ar_enq, k);
     let ar_dev_us = per_call_us((ar_tot - ar_enq).max(0.0), k);
-    assert_eq!(read_err(a, &staging_a).await, 0, "A 侧 err 非 0({bytes}B {dt:?})");
-    assert_eq!(read_err(b, &staging_b).await, 0, "B 侧 err 非 0({bytes}B {dt:?})");
+    assert_eq!(
+        read_err(a, staging_a).await,
+        0,
+        "A 侧 err 非 0({bytes}B {dt:?})"
+    );
+    assert_eq!(
+        read_err(b, staging_b).await,
+        0,
+        "B 侧 err 非 0({bytes}B {dt:?})"
+    );
 
     // ── ★ **push 分解**(2026-10-18;§38):把 push AR 的账拆成两笔 ──────────
     //   ① `pS` = **纯写腿**(双边 stage,push 绑定:data = 对端块)—— 含 stage 协议;
@@ -552,20 +569,40 @@ async fn run_case(
     //   判据:`pS + pR` 对 `AR(push)` 的差 = 两核串联 + 两次握手 + 一次发射的税。
     if push_ar && (bytes as u64) <= layout.slot_bytes {
         let (k_s, k_r) = ((k / 2).max(1), (k / 2).max(1));
-        set_hdr(a, &staging_a, 0, 0).await.expect("A hdr(pS)");
-        set_hdr(b, &staging_b, 0, 0).await.expect("B hdr(pS)");
+        set_hdr(a, staging_a, 0, 0).await.expect("A hdr(pS)");
+        set_hdr(b, staging_b, 0, 0).await.expect("B hdr(pS)");
         let t0 = Instant::now();
         {
             let fa = async {
                 for _ in 0..k_s {
-                    emit_one_push(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64,
-                                  &layout, false, true).await.expect("pS A");
+                    emit_one_push(
+                        a,
+                        &payload_a,
+                        staging_a,
+                        alias_b_on_a,
+                        bytes as u64,
+                        layout,
+                        false,
+                        true,
+                    )
+                    .await
+                    .expect("pS A");
                 }
             };
             let fb = async {
                 for _ in 0..k_s {
-                    emit_one_push(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64,
-                                  &layout, false, true).await.expect("pS B");
+                    emit_one_push(
+                        b,
+                        &payload_b,
+                        staging_b,
+                        alias_a_on_b,
+                        bytes as u64,
+                        layout,
+                        false,
+                        true,
+                    )
+                    .await
+                    .expect("pS B");
                 }
             };
             tokio::join!(fa, fb);
@@ -574,20 +611,30 @@ async fn run_case(
         let (sa, sb) = tokio::join!(a.sync(), b.sync());
         sa.expect("A sync"); sb.expect("B sync");
         let ps_dev = per_call_us((t0.elapsed().as_secs_f64() - enq).max(0.0), k_s);
-        assert_eq!(read_err(a, &staging_a).await, 0, "pS A err");
+        assert_eq!(read_err(a, staging_a).await, 0, "pS A err");
 
         // ② 纯本地 RMW(data = 本端块;对端 produced HUGE ⇒ 不等待)
-        set_hdr(a, &staging_a, 0, 0).await.expect("A hdr(pR)");
-        set_hdr(b, &staging_b, HUGE, 0).await.expect("B hdr(pR)");
+        set_hdr(a, staging_a, 0, 0).await.expect("A hdr(pR)");
+        set_hdr(b, staging_b, HUGE, 0).await.expect("B hdr(pR)");
         let t0 = Instant::now();
         for _ in 0..k_r {
-            emit_one_push(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout,
-                          true, true).await.expect("pR A");
+            emit_one_push(
+                a,
+                &payload_a,
+                staging_a,
+                alias_b_on_a,
+                bytes as u64,
+                layout,
+                true,
+                true,
+            )
+            .await
+            .expect("pR A");
         }
         let enq = t0.elapsed().as_secs_f64();
         a.sync().await.expect("A sync");
         let pr_dev = per_call_us((t0.elapsed().as_secs_f64() - enq).max(0.0), k_r);
-        assert_eq!(read_err(a, &staging_a).await, 0, "pR A err");
+        assert_eq!(read_err(a, staging_a).await, 0, "pR A err");
         eprintln!(
             "[arb-push] {bytes:>9} B  **分解**:pS(纯写腿)={ps_dev:8.2} · pR(纯本地 RMW)={pr_dev:7.2}              · 和={:8.2} · AR(push)={ar_us:8.2} ⇒ 串联/握手税={:6.2}",
             ps_dev + pr_dev,
@@ -612,24 +659,36 @@ async fn run_case(
 
     // ── R(纯对端读:produced 置 HUGE ⇒ I2 旁路)──────────────
     // 只由 A 单边循环:对端(CUDA B)不参与 ⇒ 量的是**读对端 + 本地 RMW**。
-    set_hdr(a, &staging_a, 0, 0).await.expect("A hdr");
-    set_hdr(b, &staging_b, HUGE, HUGE).await.expect("B hdr(HUGE)");
+    set_hdr(a, staging_a, 0, 0).await.expect("A hdr");
+    set_hdr(b, staging_b, HUGE, HUGE)
+        .await
+        .expect("B hdr(HUGE)");
     let k_r = (k / 2).max(1);
     let t0 = Instant::now();
     for _ in 0..k_r {
-        emit_one(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout, true)
-            .await
-            .expect("A reduce 发射");
+        emit_one(
+            a,
+            &payload_a,
+            staging_a,
+            alias_b_on_a,
+            bytes as u64,
+            layout,
+            true,
+        )
+        .await
+        .expect("A reduce 发射");
     }
     let r_enq = t0.elapsed().as_secs_f64();
     a.sync().await.expect("A sync");
     let r_tot = t0.elapsed().as_secs_f64();
     let r_dev_us = per_call_us((r_tot - r_enq).max(0.0), k_r);
-    assert_eq!(read_err(a, &staging_a).await, 0, "A 侧 R 探针 err 非 0");
+    assert_eq!(read_err(a, staging_a).await, 0, "A 侧 R 探针 err 非 0");
 
     // ── S(纯本地拷贝:对端 consumed 置 HUGE ⇒ credit 旁路)──
-    set_hdr(a, &staging_a, 0, 0).await.expect("A hdr");
-    set_hdr(b, &staging_b, 0, HUGE).await.expect("B hdr(credit HUGE)");
+    set_hdr(a, staging_a, 0, 0).await.expect("A hdr");
+    set_hdr(b, staging_b, 0, HUGE)
+        .await
+        .expect("B hdr(credit HUGE)");
     // ⚠️ **stage 现在必须双边测**(2026-10-17 加了尾部 rendezvous:它要等对端
     // 本轮已发布 ⇒ 单边跑必然超时 err=1)。双边档 = 生产同形(含 rendezvous),
     // 反而更有代表性。
@@ -640,16 +699,32 @@ async fn run_case(
     {
         let fa = async {
             for _ in 0..k_s {
-                emit_one(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout, false)
-                    .await
-                    .expect("A stage 发射");
+                emit_one(
+                    a,
+                    &payload_a,
+                    staging_a,
+                    alias_b_on_a,
+                    bytes as u64,
+                    layout,
+                    false,
+                )
+                .await
+                .expect("A stage 发射");
             }
         };
         let fb = async {
             for _ in 0..k_s {
-                emit_one(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout, false)
-                    .await
-                    .expect("B stage 发射");
+                emit_one(
+                    b,
+                    &payload_b,
+                    staging_b,
+                    alias_a_on_b,
+                    bytes as u64,
+                    layout,
+                    false,
+                )
+                .await
+                .expect("B stage 发射");
             }
         };
         tokio::join!(fa, fb);
@@ -660,7 +735,7 @@ async fn run_case(
     sb.expect("B sync");
     let s_tot = t0.elapsed().as_secs_f64();
     let s_dev_us = per_call_us((s_tot - s_enq).max(0.0), k_s);
-    assert_eq!(read_err(a, &staging_a).await, 0, "A 侧 S 探针 err 非 0");
+    assert_eq!(read_err(a, staging_a).await, 0, "A 侧 S 探针 err 非 0");
 
     // ── RR(两 rank **同时**互读;SM 路径)────────────────────────
     // ⚠️ **它不是天花板**(2026-10-17 自我纠错,§26.1):`RR` 用的是**我们自己的核**
@@ -675,16 +750,32 @@ async fn run_case(
     {
         let fa = async {
             for _ in 0..k_rr {
-                emit_one(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout, true)
-                    .await
-                    .expect("A reduce 发射");
+                emit_one(
+                    a,
+                    &payload_a,
+                    staging_a,
+                    alias_b_on_a,
+                    bytes as u64,
+                    layout,
+                    true,
+                )
+                .await
+                .expect("A reduce 发射");
             }
         };
         let fb = async {
             for _ in 0..k_rr {
-                emit_one(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout, true)
-                    .await
-                    .expect("B reduce 发射");
+                emit_one(
+                    b,
+                    &payload_b,
+                    staging_b,
+                    alias_a_on_b,
+                    bytes as u64,
+                    layout,
+                    true,
+                )
+                .await
+                .expect("B reduce 发射");
             }
         };
         tokio::join!(fa, fb);
@@ -709,7 +800,7 @@ async fn run_case(
         // C1:单边
         let t0 = Instant::now();
         for _ in 0..k_c {
-            a.copy_block_at(&alias_b_on_a, slot_off as usize, &payload_a, 0, bytes)
+            a.copy_block_at(alias_b_on_a, slot_off as usize, &payload_a, 0, bytes)
                 .await
                 .expect("A CE 拷贝");
         }
@@ -722,14 +813,14 @@ async fn run_case(
         {
             let fa = async {
                 for _ in 0..k_c {
-                    a.copy_block_at(&alias_b_on_a, slot_off as usize, &payload_a, 0, bytes)
+                    a.copy_block_at(alias_b_on_a, slot_off as usize, &payload_a, 0, bytes)
                         .await
                         .expect("A CE 拷贝");
                 }
             };
             let fb = async {
                 for _ in 0..k_c {
-                    b.copy_block_at(&alias_a_on_b, slot_off as usize, &payload_b, 0, bytes)
+                    b.copy_block_at(alias_a_on_b, slot_off as usize, &payload_b, 0, bytes)
                         .await
                         .expect("B CE 拷贝");
                 }
@@ -764,12 +855,26 @@ async fn run_case(
         let t0 = Instant::now();
         for i in 0..k_a2 {
             let off = HDR as u64 + (i as u64 % 2) * layout.slot_bytes;
-            a.copy_block_at(alias_b_on_a, slot_off as usize, inbox_a, off as usize, bytes)
-                .await
-                .expect("A CE 拷进 inbox");
-            emit_one(a, &payload_a, &staging_a, inbox_a, bytes as u64, &layout, true)
-                .await
-                .expect("A 本地加");
+            a.copy_block_at(
+                alias_b_on_a,
+                slot_off as usize,
+                inbox_a,
+                off as usize,
+                bytes,
+            )
+            .await
+            .expect("A CE 拷进 inbox");
+            emit_one(
+                a,
+                &payload_a,
+                staging_a,
+                inbox_a,
+                bytes as u64,
+                layout,
+                true,
+            )
+            .await
+            .expect("A 本地加");
         }
         let enq = t0.elapsed().as_secs_f64();
         a.sync().await.expect("A sync");
@@ -791,14 +896,24 @@ async fn run_case(
     // 它量的是"AR 的本地加法半边"能跑多快 —— 与 `S`(stage 核的本地拷贝)
     // 成对,可拆出"我们单 block 核的本地访存效率"。**不需要 RW 授予**
     // (与 push 无关),故独立于 `OWL_ARB_PUSH` 门。
-// ── L(push 协议的消费半:本端 accum)─────────────────────────
-// 绑定 = `reduce(out=本端 payload, own=本端 staging, peer=本端 staging)`:
-// 等**本端** produced(本地自旋)、读**本端** staging(本地读)+ RMW。
-set_hdr(a, staging_a, HUGE, 0).await.expect("A hdr(produced HUGE)");
-let k_l = (k / 2).max(1);
-let t0 = Instant::now();
-for _ in 0..k_l {
-    emit_one(a, &payload_a, &staging_a, &staging_a, bytes as u64, &layout, true)
+    // ── L(push 协议的消费半:本端 accum)─────────────────────────
+    // 绑定 = `reduce(out=本端 payload, own=本端 staging, peer=本端 staging)`:
+    // 等**本端** produced(本地自旋)、读**本端** staging(本地读)+ RMW。
+    set_hdr(a, staging_a, HUGE, 0)
+        .await
+        .expect("A hdr(produced HUGE)");
+    let k_l = (k / 2).max(1);
+    let t0 = Instant::now();
+    for _ in 0..k_l {
+        emit_one(
+            a,
+            &payload_a,
+            staging_a,
+            staging_a,
+            bytes as u64,
+            layout,
+            true,
+        )
         .await
         .expect("A accum 发射");
 }
@@ -851,8 +966,24 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         set_hdr_slots(b, inbox_b, HUGE, 0, 1).await.expect("B inbox hdr(slots=1)");
         for _ in 0..2 {
             let (ra, rb) = tokio::join!(
-                emit_ce(a, &payload_a, &staging_a, &alias_b_on_a, &inbox_a, bytes as u64, &layout),
-                emit_ce(b, &payload_b, &staging_b, &alias_a_on_b, &inbox_b, bytes as u64, &layout),
+                emit_ce(
+                    a,
+                    &payload_a,
+                    staging_a,
+                    alias_b_on_a,
+                    inbox_a,
+                    bytes as u64,
+                    layout
+                ),
+                emit_ce(
+                    b,
+                    &payload_b,
+                    staging_b,
+                    alias_a_on_b,
+                    inbox_b,
+                    bytes as u64,
+                    layout
+                ),
             );
             ra.expect("A CE 预热");
             rb.expect("B CE 预热");
@@ -864,16 +995,32 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         {
             let fa = async {
                 for _ in 0..k {
-                    emit_ce(a, &payload_a, &staging_a, &alias_b_on_a, &inbox_a, bytes as u64, &layout)
-                        .await
-                        .expect("A CE 发射");
+                    emit_ce(
+                        a,
+                        &payload_a,
+                        staging_a,
+                        alias_b_on_a,
+                        inbox_a,
+                        bytes as u64,
+                        layout,
+                    )
+                    .await
+                    .expect("A CE 发射");
                 }
             };
             let fb = async {
                 for _ in 0..k {
-                    emit_ce(b, &payload_b, &staging_b, &alias_a_on_b, &inbox_b, bytes as u64, &layout)
-                        .await
-                        .expect("B CE 发射");
+                    emit_ce(
+                        b,
+                        &payload_b,
+                        staging_b,
+                        alias_a_on_b,
+                        inbox_b,
+                        bytes as u64,
+                        layout,
+                    )
+                    .await
+                    .expect("B CE 发射");
                 }
             };
             tokio::join!(fa, fb);
@@ -885,8 +1032,8 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         let a3_tot = t0.elapsed().as_secs_f64();
         a3_us = per_call_us(a3_tot, k);
         a3_dev_us = per_call_us((a3_tot - a3_enq).max(0.0), k);
-        assert_eq!(read_err(a, &staging_a).await, 0, "A 侧 A3 探针 err 非 0");
-        assert_eq!(read_err(b, &staging_b).await, 0, "B 侧 A3 探针 err 非 0");
+        assert_eq!(read_err(a, staging_a).await, 0, "A 侧 A3 探针 err 非 0");
+        assert_eq!(read_err(b, staging_b).await, 0, "B 侧 A3 探针 err 非 0");
         // 恢复两格声明(本块接着给下一个 case 用)
         set_hdr(a, staging_a, 0, 0).await.expect("A hdr(恢复)");
         set_hdr(b, staging_b, 0, 0).await.expect("B hdr(恢复)");
@@ -915,14 +1062,24 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         {
             let fa = async {
                 for _ in 0..k {
-                    if push_ar { emit_ar_push(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout).await }
-                    else { emit_ar(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout).await }.expect("A 旁路发射");
+                    if push_ar {
+                        emit_ar_push(a, &payload_a, staging_a, alias_b_on_a, bytes as u64, layout)
+                            .await
+                    } else {
+                        emit_ar(a, &payload_a, staging_a, alias_b_on_a, bytes as u64, layout).await
+                    }
+                    .expect("A 旁路发射");
                 }
             };
             let fb = async {
                 for _ in 0..k {
-                    if push_ar { emit_ar_push(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout).await }
-                    else { emit_ar(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout).await }.expect("B 旁路发射");
+                    if push_ar {
+                        emit_ar_push(b, &payload_b, staging_b, alias_a_on_b, bytes as u64, layout)
+                            .await
+                    } else {
+                        emit_ar(b, &payload_b, staging_b, alias_a_on_b, bytes as u64, layout).await
+                    }
+                    .expect("B 旁路发射");
                 }
             };
             tokio::join!(fa, fb);
@@ -951,22 +1108,26 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         a.graph_begin().await.expect("graph_begin A");
         for _ in 0..n {
             if push_ar {
-                emit_ar_push(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout)
-                    .await.expect("A push 发射");
+                emit_ar_push(a, &payload_a, staging_a, alias_b_on_a, bytes as u64, layout)
+                    .await
+                    .expect("A push 发射");
             } else {
-                emit_ar(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout)
-                    .await.expect("A 发射");
+                emit_ar(a, &payload_a, staging_a, alias_b_on_a, bytes as u64, layout)
+                    .await
+                    .expect("A 发射");
             }
         }
         let ga = a.graph_end().await.expect("graph_end A");
         b.graph_begin().await.expect("graph_begin B");
         for _ in 0..n {
             if push_ar {
-                emit_ar_push(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout)
-                    .await.expect("B push 发射");
+                emit_ar_push(b, &payload_b, staging_b, alias_a_on_b, bytes as u64, layout)
+                    .await
+                    .expect("B push 发射");
             } else {
-                emit_ar(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout)
-                    .await.expect("B 发射");
+                emit_ar(b, &payload_b, staging_b, alias_a_on_b, bytes as u64, layout)
+                    .await
+                    .expect("B 发射");
             }
         }
         let gb = b.graph_end().await.expect("graph_end B");
@@ -1006,8 +1167,8 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
              旁路协议 = {byp:8.2} ⇒ **协议钱 = {:6.2} µs/次**({:.1}%)",
             us - byp, 100.0 * (us - byp) / us.max(1e-9)
         );
-        assert_eq!(read_err(a, &staging_a).await, 0, "图内 A err 非 0");
-        assert_eq!(read_err(b, &staging_b).await, 0, "图内 B err 非 0");
+        assert_eq!(read_err(a, staging_a).await, 0, "图内 A err 非 0");
+        assert_eq!(read_err(b, staging_b).await, 0, "图内 B err 非 0");
         // ★ **核数账**:同样捕 N 个**单核**(reduce 一个),看"每次一个核"的图内成本
         //   ⇒ 与上面的"两核 AR"相减 = **融合两核能省多少**(decode 档唯一还有量的方向)
         {
@@ -1021,14 +1182,32 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
             set_hdr(b, staging_b, 0, HUGE).await.expect("B hdr(单核臂)");
             a.graph_begin().await.expect("gb1");
             for _ in 0..n1 {
-                emit_one(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout, false)
-                    .await.expect("A stage 单核发射");
+                emit_one(
+                    a,
+                    &payload_a,
+                    staging_a,
+                    alias_b_on_a,
+                    bytes as u64,
+                    layout,
+                    false,
+                )
+                .await
+                .expect("A stage 单核发射");
             }
             let ga1 = a.graph_end().await.expect("ge1");
             b.graph_begin().await.expect("gb2");
             for _ in 0..n1 {
-                emit_one(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout, false)
-                    .await.expect("B stage 单核发射");
+                emit_one(
+                    b,
+                    &payload_b,
+                    staging_b,
+                    alias_a_on_b,
+                    bytes as u64,
+                    layout,
+                    false,
+                )
+                .await
+                .expect("B stage 单核发射");
             }
             let gb1 = b.graph_end().await.expect("ge2");
             {
@@ -1068,14 +1247,16 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         set_hdr(b, staging_b, 0, 0).await.expect("B hdr(AR2)");
         a.graph_begin().await.expect("graph_begin A2");
         for _ in 0..n {
-            emit_ar2(a, &payload_a, &staging_a, &alias_b_on_a, bytes as u64, &layout)
-                .await.expect("A AR2 发射");
+            emit_ar2(a, &payload_a, staging_a, alias_b_on_a, bytes as u64, layout)
+                .await
+                .expect("A AR2 发射");
         }
         let ga2 = a.graph_end().await.expect("graph_end A2");
         b.graph_begin().await.expect("graph_begin B2");
         for _ in 0..n {
-            emit_ar2(b, &payload_b, &staging_b, &alias_a_on_b, bytes as u64, &layout)
-                .await.expect("B AR2 发射");
+            emit_ar2(b, &payload_b, staging_b, alias_a_on_b, bytes as u64, layout)
+                .await
+                .expect("B AR2 发射");
         }
         let gb2 = b.graph_end().await.expect("graph_end B2");
         {
@@ -1092,11 +1273,9 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
             sa.expect("AR2 sync A"); sb.expect("AR2 sync B");
         }
         let us = t0.elapsed().as_secs_f64() * 1e6 / (n as f64);
-        eprintln!(
-            "[arb-ar2] {bytes:>9} B n={n:<4} **AR-2 图内 = {us:8.2} µs/次**(真设备时延)"
-        );
-        assert_eq!(read_err(a, &staging_a).await, 0, "AR2 A err 非 0");
-        assert_eq!(read_err(b, &staging_b).await, 0, "AR2 B err 非 0");
+        eprintln!("[arb-ar2] {bytes:>9} B n={n:<4} **AR-2 图内 = {us:8.2} µs/次**(真设备时延)");
+        assert_eq!(read_err(a, staging_a).await, 0, "AR2 A err 非 0");
+        assert_eq!(read_err(b, staging_b).await, 0, "AR2 B err 非 0");
         a.graph_destroy(ga2).await.expect("AR2 destroy A");
         b.graph_destroy(gb2).await.expect("AR2 destroy B");
     }
@@ -1115,8 +1294,8 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
                 a,
                 &payload_a,
                 &one_stage.slot_a,
-                &staging_a,
-                &alias_b_on_a,
+                staging_a,
+                alias_b_on_a,
                 &one_stage.alias_b_on_a,
                 bytes as u64,
             )
@@ -1130,8 +1309,8 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
                 b,
                 &payload_b,
                 &one_stage.slot_b,
-                &staging_b,
-                &alias_a_on_b,
+                staging_b,
+                alias_a_on_b,
                 &one_stage.alias_a_on_b,
                 bytes as u64,
             )
@@ -1156,8 +1335,8 @@ l_dev_us = per_call_us((t0.elapsed().as_secs_f64() - l_enq).max(0.0), k_l);
         eprintln!(
             "[arb-1stage] {bytes:>9} B n={n:<4} **1-stage 图内 = {us:8.2} µs/次**(真设备时延)"
         );
-        assert_eq!(read_err(a, &staging_a).await, 0, "1stage A err 非 0");
-        assert_eq!(read_err(b, &staging_b).await, 0, "1stage B err 非 0");
+        assert_eq!(read_err(a, staging_a).await, 0, "1stage A err 非 0");
+        assert_eq!(read_err(b, staging_b).await, 0, "1stage B err 非 0");
         // 路径存在性:slot 两侧都清零 ⇒ 1-stage 的 out 应为全 0
         // (不是数值门;真数值门在 tp_g8_gate / ar_transport_gate)。
         let mut za = vec![0u8; bytes];

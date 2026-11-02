@@ -90,7 +90,7 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     eprintln!("[ledger] turn 后 open={} 条;hook_fail={hf} window_unclosed={wu} 窗内块={owb}", b.open_count());
     assert_eq!(hf, 0, "全程不许有未入账事件");
     assert_eq!(wu, 0, "没有窗失败 ⇒ 不该有未收窗");
-    assert_eq!(b.open_count() > 0, true, "账必须有内容(否则记了个寂寞)");
+    assert!(b.open_count() > 0, "账必须有内容(否则记了个寂寞)");
     // **缺口 4 门**:turn 内的临时块释放后应进**复用池**(不回驱动),
     // 且池指标是一等输出(不是告警里的一行)。
     let pool = b.pool_stats();

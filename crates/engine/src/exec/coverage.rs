@@ -50,15 +50,13 @@ pub(crate) type QSink = RefCell<Vec<Option<TensorOps>>>;
 /// 数字后再决定要不要为 B 付一枚新核。
 pub(crate) const POS_SCHEME: &str = "A(原位置稀疏)";
 
-/// **query 窗宽**(本 chunk 末 W 行一起当 query;论文的 step 级 query 面对应到
-/// 我们的 chunk 边界 = 末 W 行)。
-///
-/// **2026-10-23 定谳:8 太小**。10k needle + 结尾
-/// `"Reply with only the code, no explanation. Code:"` 时,末 8 行只剩
-/// `"only the code, no explanation. Code:"` —— `"secret"` 被挤出窗,选择层
-/// 直接答 `No`(召回失败)。上游 KVMem 的 query 是 last-user span,最多 512,
-/// 缺省回退 64(`--kvmem-query-last 64`);取 64 把完整问句纳回窗。
-const W_QUERY_TOKENS: usize = 64;
+// **query 窗宽**(本 chunk 末 W 行一起当 query;论文的 step 级 query 面对应到
+// 我们的 chunk 边界 = 末 W 行)。
+// **2026-10-23 定谳:8 太小**(原 `W_QUERY_TOKENS = 8`,已并入调用方参数)。10k needle + 结尾
+// `"Reply with only the code, no explanation. Code:"` 时,末 8 行只剩
+// `"only the code, no explanation. Code:"` —— `"secret"` 被挤出窗,选择层
+// 直接答 `No`(召回失败)。上游 KVMem 的 query 是 last-user span,最多 512,
+// 缺省回退 64(`--kvmem-query-last 64`);取 64 把完整问句纳回窗。
 
 /// 待分析面(Q 已回读成 host f32;等块边界事件补齐索引账)。
 #[derive(Debug)]
@@ -396,7 +394,7 @@ pub(crate) fn true_block_mass(
 ) -> Vec<f32> {
     let (layers, hq, hkv, hd) = geom;
     let tokens = k_post.first().map(|k| k.len() / (hkv * hd)).unwrap_or(0);
-    let n_blocks = if page == 0 { 0 } else { tokens / page };
+    let n_blocks = tokens.checked_div(page).unwrap_or(0);
     let vis = visible.min(tokens);
     if layers == 0 || hq == 0 || n_blocks == 0 || vir_empty(q_post.len(), layers, vis) {
         return vec![0.0; n_blocks];
@@ -517,8 +515,10 @@ fn coverage_of_set(mass: &[f32], picked: &[usize]) -> f64 {
 /// GQA 映射(查询头 → KV 头;核内同律 `head / (hq/hkv)`,见
 /// `cu/attn/pagedattention_f16.cu` 与 `cu/attn/naive_attn_nc.cu`)。
 pub(crate) fn gqa_map(hq: usize, hkv: usize) -> Vec<u16> {
-    let per = if hkv == 0 { 1 } else { (hq / hkv).max(1) };
-    (0..hq).map(|h| (h / per).min(hkv.saturating_sub(1)) as u16).collect()
+    let per = hq.checked_div(hkv).unwrap_or(0).max(1);
+    (0..hq)
+        .map(|h| (h / per).min(hkv.saturating_sub(1)) as u16)
+        .collect()
 }
 
 /// f16/e4m3 字节 → f32(回读解码;f32 池直读)。
@@ -730,7 +730,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // diag-only(store-hook): 选择层诊断直接取搬运计划，不走生产
                 // StoreHook；生产路径只经 pump/store_hook。
                 let p = self.bank.rel.plan_kv_offload_blocks(&hashes)?;
-                if p.skipped.len() > 0 {
+                if !p.skipped.is_empty() {
                     owl_shared::log_warn!(
                         "cov-probe",
                         "逐块下沉票跳过 {} 块(原因见账;LiveRefs = 会话仍持)",
@@ -908,8 +908,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         if base < view_recall {
             let last_lb = (base + t.saturating_sub(1)) / page;
             let has_hole = chain[..=last_lb.min(chain.len().saturating_sub(1))]
-                .iter()
-                .any(|s| *s == crate::scheduler::PENDING_LOAD_PLACEHOLDER);
+                .contains(&crate::scheduler::PENDING_LOAD_PLACEHOLDER);
             if has_hole {
                 owl_shared::counter_inc!("select.prefill_view.dense_with_hole");
                 return Err(ModelError::EngineInvariant {
@@ -936,8 +935,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ∝ctx 变成 ∝工作集(64k 实测 16.3k→11.4k 页可见)。
         let last_lb = (base + t.saturating_sub(1)) / page;
         let has_hole = chain[..=last_lb.min(chain.len().saturating_sub(1))]
-            .iter()
-            .any(|s| *s == crate::scheduler::PENDING_LOAD_PLACEHOLDER);
+            .contains(&crate::scheduler::PENDING_LOAD_PLACEHOLDER);
         // **口径档**(`kvmem.prefill_view`;2026-10-27):
         //   on-hole(缺省)= 旧行为,无洞走全量链(更保真,attention ∝ ctx);
         //   always      = prefill 与 decode 同源视图(attention ∝ 工作集)。
@@ -1019,10 +1017,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             .ok_or_else(|| ModelError::Msg(format!("懒回灌视图:会话 {sid:#x} 不在账")))?;
         let chain = &s.block_table;
         let n_blocks = (seed.cached_len / page).min(chain.len());
-        if n_blocks == 0
-            || !chain[..n_blocks]
-                .iter()
-                .any(|b| *b == crate::scheduler::PENDING_LOAD_PLACEHOLDER)
+        if n_blocks == 0 || !chain[..n_blocks].contains(&crate::scheduler::PENDING_LOAD_PLACEHOLDER)
         {
             return Ok(false); // 链上无洞 ⇒ dense 安全,不需要合成视图
         }
@@ -1407,7 +1402,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             // **占位符守卫**(B-3e-2):部分驻留档下"无视图"是致命的 —— 会话链里
             // 有 `PENDING_LOAD_PLACEHOLDER`(u32::MAX),当页号读 = 静默错页。
             // 响亮打出哨兵(调用方看日志即知:召回点没跑 / 视图被清)。
-            if chain.iter().any(|s| *s == crate::scheduler::PENDING_LOAD_PLACEHOLDER) {
+            if chain.contains(&crate::scheduler::PENDING_LOAD_PLACEHOLDER) {
                 owl_shared::log_error!(
                     "cov-probe",
                     "视图缺位但会话链含占位块({} 项)⇒ 本步页表不可信(部分驻留档必须每步有视图)",
@@ -1514,13 +1509,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // `OWL_COV_ANALYZE_EVERY=k` 仍可显式要求多采点(调试用)。
                 match analyze_every {
                     Some(0) => false,
-                    Some(k) => (ctx_tokens / self.dev.pool.geom.page.max(1)) % k == 0,
+                    Some(k) => (ctx_tokens / self.dev.pool.geom.page.max(1)).is_multiple_of(k),
                     None => ctx_tokens == at,
                 }
             } else {
                 match analyze_every {
                     Some(0) => false,
-                    Some(k) => (ctx_tokens / self.dev.pool.geom.page.max(1)) % k == 0,
+                    Some(k) => (ctx_tokens / self.dev.pool.geom.page.max(1)).is_multiple_of(k),
                     None => last_boundary,
                 }
             };
@@ -1686,7 +1681,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // `analyze_now` **隐含完整召回**:要出诊断读数(mass/curve/oracle/paper)
         // 的那条边界必须有当场的分数与选中集,否则读数无主。
         let recall_now =
-            analyze_now || last_boundary || self.sel.boundaries() % recall_every == 0;
+            analyze_now || last_boundary || self.sel.boundaries().is_multiple_of(recall_every);
         self.sel.note_recall(recall_now);
         // **廉价边界 = 不重新打分,但仍要调和驻留**(两个反面教材都实测过,已废):
         // ① "近期选择 + 调和":近期名单与上次打分名单**互相覆盖** ⇒ 每次完整召回
@@ -2090,6 +2085,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// (27B/8192 tok = 4096 次/边界 ⇒ 20s+);宿主占位块直接跳过(部分驻留)。
     ///
     /// 返回 `(k_post, v_post)`,布局 = `[层][token × head × dim]`(V 仅方案对照档)。
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     async fn read_pool_kv(
         &mut self,
         layers: usize,

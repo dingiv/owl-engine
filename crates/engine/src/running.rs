@@ -120,12 +120,12 @@ pub struct TokenizeReply {
 /// # 结构(2026-10-14 拆万能袋 → 2026-10-21 收户)
 ///
 /// 本体只留**跨域协调**要抓的把手,状态按域入组合:
-/// - [`BootCtx`]:boot 期定型、**运行期只读**(配置/分词器/探针/序号)
-/// - [`crate::turn::TurnLedger`]:排队/活跃/id 发号/事件队列
-/// - [`crate::session::SessionBank`]:会话账 + 双块账房(target/MTP)
-/// - [`crate::select::SelectRuntime`]:B 轴视图/覆盖率探针/驻留账
-/// - [`crate::housekeeping::Housekeeping`]:节拍与计数(调度计时/空转/回收/降级)
-/// - [`RankDev`]:rank0 设备束(池/图/模型/env/spec 运行态/tp)
+/// - `BootCtx`:boot 期定型、**运行期只读**(配置/分词器/探针/序号)
+/// - `crate::turn::TurnLedger`:排队/活跃/id 发号/事件队列
+/// - `crate::session::SessionBank`:会话账 + 双块账房(target/MTP)
+/// - `crate::select::SelectRuntime`:B 轴视图/覆盖率探针/驻留账
+/// - `crate::housekeeping::Housekeeping`:节拍与计数(调度计时/空转/回收/降级)
+/// - `RankDev`:rank0 设备束(池/图/模型/env/spec 运行态/tp)
 ///
 /// 纪律:各户字段**私有**,外部只经方法读写 —— 状态有守门人,
 /// 方法离它操作的状态近(收户前的反例:`self.dev` 被解引 300+ 次、
@@ -822,6 +822,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///
     /// 未开档 ⇒ 只记 spans(网格/诊断用),**一个 pad 都不加**(逐字节旧行为)。
     /// 返回 `(ids, spans, pads, deletion)`;`deletion` 交给调度面做取链/拼接。
+    // 结构性豁免(2026-11-02 clippy 清理):类型面 = 派发/表项签名;起别名会藏住"这一串到底是什么"
+    #[allow(clippy::type_complexity)]
     fn image_pad_law(
         &self,
         session: Option<u64>,
@@ -1018,7 +1020,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 hit.a,
                                 hit.b,
                                 hit.b - hit.a,
-                                (hit.b - hit.a) / page
+                                (hit.b - hit.a).checked_div(page).unwrap_or(0)
                             );
                             let rebuilt =
                                 crate::img_evict::rebuild_after_delete(&s.tokens, &input, &hit)
@@ -1143,14 +1145,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             // **可删标记必须有人接**(前缀无感删除;2026-10-23):客户端打了
             // `owl_evict` 而引擎档没开 = 静默失约(用户以为删了不重算,
             // 实际每轮全量重灌)⇒ 提交边界**响亮拒**,不静默忽略。
-            if !self.boot.cfg.knobs.image_evict {
-                if opts.images.iter().any(|i| i.evict) {
-                    return Err(ModelError::Msg(
-                        "submit: 图像带 evict(可删)标记,但本档 [pool] image_evict = false\
+            if !self.boot.cfg.knobs.image_evict && opts.images.iter().any(|i| i.evict) {
+                return Err(ModelError::Msg(
+                    "submit: 图像带 evict(可删)标记,但本档 [pool] image_evict = false\
                          —— 要么把档位打开,要么去掉标记(不许静默忽略)"
-                            .into(),
-                    ));
-                }
+                        .into(),
+                ));
             }
         }
         let raw_ids = {
@@ -1401,6 +1401,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     /// 拒绝分桶快照（会话, 码, 次数；按次数降序，最多 `limit` 条）
+    // 结构性豁免(2026-11-02 clippy 清理):排序键是复合比较(多字段/方向混合),抽 key 会丢掉可读性
+    #[allow(clippy::unnecessary_sort_by)]
     pub fn reject_snapshot(&self, limit: usize) -> Vec<(u64, String, u64)> {
         let mut v: Vec<(u64, String, u64)> = self
             .turns
@@ -1419,6 +1421,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     /// 排队快照（`/debug/vram → batch.queued`；最多 16 条，按等待降序）
+    // 结构性豁免(2026-11-02 clippy 清理):排序键是复合比较(多字段/方向混合),抽 key 会丢掉可读性
+    #[allow(clippy::unnecessary_sort_by)]
     pub fn queued_snapshot(&self, limit: usize) -> Vec<(u64, u64, u64)> {
         let now = now_ms();
         let mut v: Vec<(u64, u64, u64)> = self
@@ -1702,6 +1706,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         // `cudaHostAlloc` 要 2 GiB 级(~1.3 s/rank)、③ peak 宿主/显存都顶满。
         // 切成窗口后:staging 只有 `W × block_bytes`,第一次分配后**池内复用**,
         // 读盘走批量口,三笔一起降。W 取 1024 块(≈512 MiB/rank 档)。
+        // 死代码豁免(2026-11-02 clippy 清理):盘→宿主回灌的分段宽度档位;批量并行读上线后
+        // 由 `disk_io::read_blocks` 内部定窗,这里留作对照/回归的显式口径。
+        #[allow(dead_code)]
         const LOAD_WINDOW_BLOCKS: usize = 1024;
         let t_fill = std::time::Instant::now();
         // 批量读(整窗一次线程跳 + 4 路并行;逐块口每块一次 spawn_blocking,
@@ -2010,7 +2017,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut trim_bytes = 0u64;
         for (rank, r) in trimmed {
             match r {
-                Ok(n) => trim_bytes += n as u64,
+                Ok(n) => trim_bytes += n,
                 Err(e) => {
                     owl_shared::log_warn!("store", "压力缓解:池缓存回收失败(rank{rank}): {e}")
                 }
@@ -2193,6 +2200,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 为什么要它:`RELEASE_THRESHOLD=∞` 下**已 free 的块仍占物理显存**(池缓存);
     /// 块账只见 live ⇒ "物理 − live" 这部分在双 rank 上只长在 peer 一侧
     /// (实测 +3.3 GiB),不读数就只能瞎猜。
+    // 结构性豁免(2026-11-02 clippy 清理):类型面 = 派发/表项签名;起别名会藏住"这一串到底是什么"
+    #[allow(clippy::type_complexity)]
     pub async fn pool_probe(
         &mut self,
     ) -> Vec<(u8, std::result::Result<(u64, u64, u64, u64), String>)> {
@@ -3318,6 +3327,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 语义：快照用**搬家**（设备/宿主 → 盘），不是复制 —— 一份 148 MiB，
     /// 复制会白吃宿主；丢掉的锚点可重建（复用点变近），命中时由
     /// `fill_snap_from_disk` 回填。
+    // 死代码豁免(2026-11-02 clippy 清理):P1 早期"链尾单快照"入口,已被
+    // `arm_kv_checkpoint`(前缀锚点全落)取代;留作对照,回退时可直接接。
+    #[allow(dead_code)]
     async fn checkpoint_tail_snap(&mut self, tail: owl_store::ChainHash) -> Result<bool> {
         use owl_store::state::SnapDurability;
         use owl_store::Tier;
@@ -3554,7 +3566,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             .plan_fill(chain)?;
         let bytes = crate::disk_io::read_block(plan.path.clone(), plan.bytes)
             .await
-            .map_err(|e| owl_iface::contract::ModelError::Msg(e))?;
+            .map_err(owl_iface::contract::ModelError::Msg)?;
         // 宿主满 ⇒ 先逐最冷再落(与 offload 同一政策;裸 `host_put` 会在
         // 回填前撞 `Exhausted` ⇒ onload 整单失败)
         let r0 = self.bank.rel.leg.host_relief_blocks();
@@ -3728,7 +3740,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             .plan_fill(key)?;
         let bytes = crate::disk_io::read_block(plan.path.clone(), plan.bytes)
             .await
-            .map_err(|e| owl_iface::contract::ModelError::Msg(e))?;
+            .map_err(owl_iface::contract::ModelError::Msg)?;
         self.bank
             .rel
             .snap_host
@@ -3753,6 +3765,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 按 `plane × 单页字节` 落好。
     /// 槽台 = **一次借台**,两条命令之间原箱传递 ⇒ 一次落账、一条链一份预算。
     /// 单卡(`world = 1`)= 与历史逐字相同。
+    // 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+    #[allow(clippy::needless_range_loop)]
     pub(crate) async fn swap_all_ranks(
         &mut self,
         dir: owl_iface::contract::SwapDir,
@@ -4781,6 +4795,8 @@ mod pressure_tests {
     }
 
     #[test]
+    // 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
+    #[allow(clippy::field_reassign_with_default)]
     fn host_pressure_uses_independent_low_watermark_and_disk_room() {
         let p = PressurePolicy::new(12, 25, 20, 40);
         let mut s = PressureSignals::default();
@@ -4828,6 +4844,8 @@ mod pressure_tests {
     }
 
     #[test]
+    // 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
+    #[allow(clippy::field_reassign_with_default)]
     fn driver_headroom_is_part_of_the_signal() {
         let mut s = PressureSignals::default();
         s.driver_free_bytes = 100;

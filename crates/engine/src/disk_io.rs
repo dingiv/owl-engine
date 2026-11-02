@@ -86,6 +86,9 @@ pub(crate) async fn read_block(path: PathBuf, bytes: usize) -> Result<Vec<u8>, S
 ///
 /// 返回顺序与入参**逐项对齐**(`Err` 项带路径与原因,由调用方降级/报错);
 /// 大小不符仍按"账上长度"判(与 [`read_block`] 同律)。
+// 结构性豁免(2026-11-02 clippy 清理):
+//   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+#[allow(clippy::type_complexity)]
 pub(crate) async fn read_blocks(
     items: Vec<(std::path::PathBuf, usize)>,
 ) -> Vec<Result<Vec<u8>, String>> {

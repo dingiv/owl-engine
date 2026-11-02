@@ -144,6 +144,9 @@ impl PlanTable for GgufPlan<'_> {
 ///
 /// 返回 `(型直方图, 未移植型清单)` —— 判据是"**索引里出现的量化型**都必须
 /// 有内核入口",而不是"索引里不许有其它型"(F32 是常态)。
+// 结构性豁免(2026-11-02 clippy 清理):
+//   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+#[allow(clippy::type_complexity)]
 pub fn ty_histogram(g: &Gguf) -> (Vec<(GgmlTy, usize)>, Vec<(GgmlTy, usize)>) {
     let mut all: BTreeMap<u32, usize> = BTreeMap::new();
     for t in &g.tensors {

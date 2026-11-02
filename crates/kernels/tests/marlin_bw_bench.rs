@@ -56,13 +56,13 @@ fn bench_shape(
     stream.memcpy_htod(&z_h, &mut z).unwrap();
     stream.memcpy_htod(&ws_h, &mut ws).unwrap();
 
-    let (a_p, _) = a.device_ptr(&stream);
-    let (b_p, _) = b.device_ptr(&stream);
-    let (c_p, _) = c.device_ptr(&stream);
-    let (s_p, _) = s.device_ptr(&stream);
-    let (z_p, _) = z.device_ptr(&stream);
-    let (ws_p, _) = ws.device_ptr(&stream);
-    let (tmp_p, _) = tmp.device_ptr(&stream);
+    let (a_p, _) = a.device_ptr(stream);
+    let (b_p, _) = b.device_ptr(stream);
+    let (c_p, _) = c.device_ptr(stream);
+    let (s_p, _) = s.device_ptr(stream);
+    let (z_p, _) = z.device_ptr(stream);
+    let (ws_p, _) = ws.device_ptr(stream);
+    let (tmp_p, _) = tmp.device_ptr(stream);
     let cu_stream = stream.cu_stream() as usize;
 
     let launch = |a_p, b_p, c_p, s_p, z_p, ws_p, tmp_p| unsafe {
@@ -148,13 +148,13 @@ fn bench_shape_a8(
     stream.memcpy_htod(&z_h, &mut z).unwrap();
     stream.memcpy_htod(&ws_h, &mut ws).unwrap();
 
-    let (a_p, _) = a.device_ptr(&stream);
-    let (as_p, _) = asd.device_ptr(&stream);
-    let (b_p, _) = b.device_ptr(&stream);
-    let (c_p, _) = c.device_ptr(&stream);
-    let (s_p, _) = s.device_ptr(&stream);
-    let (z_p, _) = z.device_ptr(&stream);
-    let (ws_p, _) = ws.device_ptr(&stream);
+    let (a_p, _) = a.device_ptr(stream);
+    let (as_p, _) = asd.device_ptr(stream);
+    let (b_p, _) = b.device_ptr(stream);
+    let (c_p, _) = c.device_ptr(stream);
+    let (s_p, _) = s.device_ptr(stream);
+    let (z_p, _) = z.device_ptr(stream);
+    let (ws_p, _) = ws.device_ptr(stream);
     let cu_stream = stream.cu_stream() as usize;
 
     let launch = |a_p, as_p, b_p, c_p, s_p, z_p, ws_p| unsafe {
@@ -285,13 +285,12 @@ fn marlin_bandwidth_27b_shapes() {
     }
 }
 
+///
 /// **W4A8 int8 8-row 对拍**(2026-10-22;famp-marlin port 的硬门)。
 ///
 /// 同一组随机数据跑两次:
 /// 1. `w4a8_m8=true`(kS8 grouped,m8 8-row);
-/// 2. `w4a8_m8=false`(旧 16-row 路)。
-/// 两次都与 host 显式反量化参考比;再把 m8 与 16-row 直接比。
-/// 形状取 m=8(g32, n=256, k=512)—— 正好命中 spec verify 的 m8 档。
+/// 2. `w4a8_m8=false`(旧 16-row 路)。 两次都与 host 显式反量化参考比;再把 m8 与 16-row 直接比。 形状取 m=8(g32, n=256, k=512)—— 正好命中 spec verify 的 m8 档。
 #[test]
 fn marlin_w4a8_m8_parity() {
     let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
@@ -535,6 +534,8 @@ fn marlin_tile_sweep() {
 // {(64,256),(64,128),(128,64),(128,128)};auto 档同时打印作对照。
 
 /// 单档计时(µs/发)+ TFLOPS + B 有效带宽
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 fn bench_w4a8_cfg(
     ctx: &std::sync::Arc<CudaContext>,
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
@@ -560,7 +561,7 @@ fn bench_w4a8_cfg(
     let z_h: Vec<i32> = vec![0_i32; (k / G as usize) * (n / 8) + 16];
     let ws_h: Vec<i32> = vec![0_i32; owl_kernels::family::marlin::v2_workspace_len(n)];
 
-    let (mut a, mut asd, mut b, mut c, mut s, mut z, mut ws);
+    let (mut a, mut asd, mut b, c, mut s, mut z, mut ws);
     unsafe {
         a = stream.alloc::<i8>(a_h.len()).unwrap();
         asd = stream.alloc::<f32>(as_h.len()).unwrap();
@@ -577,13 +578,13 @@ fn bench_w4a8_cfg(
     stream.memcpy_htod(&z_h, &mut z).unwrap();
     stream.memcpy_htod(&ws_h, &mut ws).unwrap();
 
-    let (a_p, _) = a.device_ptr(&stream);
-    let (as_p, _) = asd.device_ptr(&stream);
-    let (b_p, _) = b.device_ptr(&stream);
-    let (c_p, _) = c.device_ptr(&stream);
-    let (s_p, _) = s.device_ptr(&stream);
-    let (z_p, _) = z.device_ptr(&stream);
-    let (ws_p, _) = ws.device_ptr(&stream);
+    let (a_p, _) = a.device_ptr(stream);
+    let (as_p, _) = asd.device_ptr(stream);
+    let (b_p, _) = b.device_ptr(stream);
+    let (c_p, _) = c.device_ptr(stream);
+    let (s_p, _) = s.device_ptr(stream);
+    let (z_p, _) = z.device_ptr(stream);
+    let (ws_p, _) = ws.device_ptr(stream);
     let cu_stream = stream.cu_stream() as usize;
     let dev = ctx.ordinal() as i32;
 
@@ -607,9 +608,7 @@ fn bench_w4a8_cfg(
         )
     };
     // 该档未实例化 ⇒ selector 返回 3;先探一发,失败直接报 n/a(不污染计时)
-    if let Err(e) = launch() {
-        return Err(e);
-    }
+    launch()?;
     for _ in 0..4 {
         let _ = launch();
     }

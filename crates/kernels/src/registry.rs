@@ -82,6 +82,8 @@ pub trait KernelFamily: Send {
 
     /// **FI plan 表同步**(W3;仅 FI 族实现)。缺省 = **结构化拒**(不静默):
     /// 非 FI 族被要求刷 plan 表即调用方违约。
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     fn plan_sync(
         &mut self,
         _t: usize,

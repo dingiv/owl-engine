@@ -113,6 +113,8 @@ fn tp_opts() -> TpOpts {
     }
 }
 
+// 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
+#[allow(clippy::field_reassign_with_default)]
 fn knobs_for(plan: QuantPlan, dir: &Path) -> EngineKnobs {
     let mut k = EngineKnobs::default();
     k.sampler_enabled = sample_on();
@@ -400,11 +402,14 @@ async fn run_arm(
 #[test]
 fn tp_head_i8_gate() {
     let arm = std::env::var("OWL_TP_HEAD_ARM").unwrap_or_default();
-    let n: usize = std::env::var("OWL_TP_HEAD_N").ok().and_then(|s| s.parse().ok()).unwrap_or(96);
-    let vsplit = match std::env::var("OWL_TP_HEAD_VSPLIT").as_deref() {
-        Ok("0") | Ok("false") => false,
-        _ => true,
-    };
+    let n: usize = std::env::var("OWL_TP_HEAD_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(96);
+    let vsplit = !matches!(
+        std::env::var("OWL_TP_HEAD_VSPLIT").as_deref(),
+        Ok("0") | Ok("false")
+    );
     // ── 比对臂(零 GPU):读两臂 token → 一致率 ───────────────────────
     if arm == "compare" || arm == "compare_a8" {
         let (left, right) = if arm == "compare_a8" { ("i8", "a8") } else { ("f16", "i8") };

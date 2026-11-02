@@ -416,8 +416,11 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         if !self.vision {
             return Ok(None);
         }
-        let raw = owl_shared::file_loader::read(&dir.join("config.json")).map_err(|e| {
-            ModelError::Msg(format!("视觉装载:config.json 读取失败({}): {e}", dir.display()))
+        let raw = owl_shared::file_loader::read(dir.join("config.json")).map_err(|e| {
+            ModelError::Msg(format!(
+                "视觉装载:config.json 读取失败({}): {e}",
+                dir.display()
+            ))
         })?;
         let vcfg = VlmCfg::from_json(&raw)?;
         let tower = VisionTower::new(vcfg.vision);
@@ -701,7 +704,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         opts.device_repack = self
             .load
             .repack_device()
-            .map_err(|e| ModelError::Msg(e))?
+            .map_err(ModelError::Msg)?
             .or(opts.device_repack);
         load_from_dir(dir, self.face, &model, opts).await?;
         let model = Arc::new(model);

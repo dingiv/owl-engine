@@ -613,6 +613,9 @@ impl Rel {
         (bytes, dropped)
     }
 
+    /// 认领磁盘上的块链(跨重启召回入口):按盘上内容的哈希重建链记录。
+    ///
+    /// 只做记账与链挂接;**不**落盘、不动 KV 池(回灌由调用方按需触发)。
     pub fn adopt_disk_chains(
         &mut self,
         chains: &[crate::disk_index::ChainIndex],
@@ -841,7 +844,7 @@ impl Rel {
 
     /// 状态腿宿主块**大页提示未生效的块数**（0 = 全生效）。
     /// >0 不是错误：只是冷写回到 4 KiB 缺页速度（159 MiB 约 80ms vs 12ms）——
-    /// 引擎在下沉点打点上报（不许静默）。
+    /// > 引擎在下沉点打点上报（不许静默）。
     pub fn snap_host_hint_failures(&self) -> usize {
         self.snap_host.hint_failures()
     }
@@ -927,13 +930,13 @@ impl Rel {
         out
     }
 
+    ///
     /// **一条快照的总字节 = `snap_bytes × world`**(2026-11-01 P1 收尾)。
     ///
     /// 三处口径必须一致,TP 下差一个 `world` 就会"账 159 MB ≠ 布局 79 MB":
     /// - 盘上一个文件(内容腿)= 全平面;
     /// - 宿主层一块(`attach_snap_layout` 按 `bytes × world` 建);
-    /// - `StateStore` 记的 `snap_bytes(key)` = 全平面。
-    /// 单 rank 的 `snap_bytes` 只用于**平面内**偏移(swap piece 的 stride)。
+    /// - `StateStore` 记的 `snap_bytes(key)` = 全平面。 单 rank 的 `snap_bytes` 只用于**平面内**偏移(swap piece 的 stride)。
     pub fn snap_file_bytes(&self) -> usize {
         self.snap_bytes.saturating_mul(self.world)
     }
@@ -1890,7 +1893,7 @@ mod tests {
     fn rel(turns: usize) -> Rel {
         let i = inputs();
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(turns, QueuePolicy::Reject),
             kv_cfg(64, 32),
             cell_for(&i),
@@ -1974,7 +1977,7 @@ mod tests {
         let mut i = inputs();
         i.weights_bytes = 0;
         assert!(Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(1, QueuePolicy::Reject),
             kv_cfg(8, 8),
             cell_for(&i)
@@ -1992,7 +1995,7 @@ mod tests {
         let mut i2 = inputs();
         i2.kv_bytes_per_token = 4096;
         assert!(Rel::open(
-            i2.clone(),
+            i2,
             AdmissionPolicy::new(1, QueuePolicy::Reject),
             kv_cfg(8, 8),
             cell_for(&i2)
@@ -2002,7 +2005,7 @@ mod tests {
         let mut i3 = inputs();
         i3.page_tokens = 16;
         assert!(Rel::open(
-            i3.clone(),
+            i3,
             AdmissionPolicy::new(1, QueuePolicy::Reject),
             kv_cfg(8, 8),
             cell_for(&i3)
@@ -2034,7 +2037,7 @@ mod tests {
         i.runtime_floor_bytes = 0;
         i.kv_face_bytes = 64 * BLOCK_BYTES;
         let r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(1, QueuePolicy::Reject),
             kv_cfg(64, 32),
             cell_for(&i),
@@ -2251,7 +2254,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = 1 << 20; // 宿主体量 = 单块(1MB)⇒ 满
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2323,7 +2326,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = 1 << 20; // 宿主 1 块 ⇒ 满
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2378,7 +2381,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = 2 << 20; // 两条 1MB 块都可进宿主
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2420,7 +2423,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = 4 * 2 * BLOCK_BYTES; // 4 个链块（每块 = 两平面）
         let mut r = Rel::open_world(
-            i.clone(),
+            i,
             AdmissionPolicy::new(1, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2450,7 +2453,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = 2 * 2 * BLOCK_BYTES;
         let mut r = Rel::open_world(
-            i.clone(),
+            i,
             AdmissionPolicy::new(1, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2475,7 +2478,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = BLOCK_BYTES;
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2515,7 +2518,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = BLOCK_BYTES; // 宿主只装一个链块
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2571,7 +2574,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = BLOCK_BYTES;
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2622,7 +2625,7 @@ mod tests {
         // 宿主只容一块 ⇒ B 下沉前必须让位
         cfg.host_bytes = BLOCK_BYTES;
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2673,7 +2676,7 @@ mod tests {
         let mut cfg = kv_cfg(8, 8);
         cfg.host_bytes = i.host_bytes; // 状态腿宿主 = 0(本测试直接造"已在宿主"的账)
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2732,7 +2735,7 @@ mod tests {
         let mut cfg = kv_cfg(8, 8);
         cfg.host_bytes = i.host_bytes;
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2782,7 +2785,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = BLOCK_BYTES; // KV 宿主 1 块
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2891,7 +2894,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = 8 << 20;
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(4, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -2945,7 +2948,7 @@ mod tests {
         let mut cfg = kv_cfg(64, 32);
         cfg.host_bytes = 0; // 两条腿的宿主预算必须一致(装配期交叉校验)
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(4, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -3255,7 +3258,7 @@ mod tests {
     /// 装配带盘层的 Rel(测试辅助)。
     fn rel_with_disk(i: &mut BudgetInputs, kv_bytes: usize, snap_bytes: usize) -> Rel {
         let mut r = Rel::open(
-            i.clone(),
+            *i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             kv_cfg(64, 32),
             cell_for(i),
@@ -3285,7 +3288,7 @@ mod tests {
         let mut cfg = kv_cfg(8, 8);
         cfg.host_bytes = 4 << 20;
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),
@@ -3330,7 +3333,7 @@ mod tests {
         let mut cfg = kv_cfg(8, 8);
         cfg.host_bytes = 4 << 20;
         let mut r = Rel::open(
-            i.clone(),
+            i,
             AdmissionPolicy::new(2, QueuePolicy::Reject),
             cfg,
             cell_for(&i),

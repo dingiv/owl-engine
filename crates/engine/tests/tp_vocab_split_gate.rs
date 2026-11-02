@@ -49,6 +49,8 @@ fn dir_of() -> PathBuf {
 }
 
 /// 两臂同参:greedy(设备 argmax;确定性)+ 关前缀缓存
+// 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
+#[allow(clippy::field_reassign_with_default)]
 fn knobs() -> EngineKnobs {
     let mut k = EngineKnobs::default();
     k.sampler_enabled = false;

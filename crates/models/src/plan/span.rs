@@ -153,6 +153,9 @@ impl SourceSpan {
 ///   写;`KMajor` 的键(量化 marlin 产物)两个维**对调** ⇒
 ///   Col(out) → 第 1 维、Row(k) → 第 0 维、分段沿 n ⇒ **列段**。
 ///   漏给/给错 = 切错维(分片形状与层侧声明不符 ⇒ `build_shard_pass` 当场拒)。
+// 结构性豁免(2026-11-02 clippy 清理):
+//   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+#[allow(clippy::type_complexity)]
 pub fn plan_span(
     rule: WeightRule,
     shape: &[usize],
@@ -264,9 +267,9 @@ pub fn segments_in_key_units(
     if declared == dim_len {
         return Ok(segs_full.to_vec());
     }
-    let (num, den) = if declared != 0 && dim_len % declared == 0 {
+    let (num, den) = if declared != 0 && dim_len.is_multiple_of(declared) {
         (dim_len / declared, 1usize)
-    } else if dim_len != 0 && declared % dim_len == 0 {
+    } else if dim_len != 0 && declared.is_multiple_of(dim_len) {
         (1usize, declared / dim_len)
     } else {
         return Err(format!(

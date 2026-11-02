@@ -307,6 +307,8 @@ async fn m6_capture_join_semantics() {
     c.sync().await.expect("sync");
 
     // 一形状 = 捕一张图;返回 Ok/Err(不 panic —— 本档就是来分类错误的)
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     async fn shape(
         c: &mut GpuClient,
         src: &Bytes,

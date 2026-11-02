@@ -26,8 +26,8 @@
 //! vision ViT(进行中:`feat/vision-tower`;已落 [`layernorm`] 第一件)、MTP、chunked prefill、量化。
 
 pub mod attention;
-pub mod dflash2;
 pub mod decoder;
+pub mod dflash2;
 pub mod embedding;
 pub mod gdn;
 /// 前缀无感删除的 KV 基元(Δ 表 + 池内 K 原地重转)
@@ -122,12 +122,12 @@ pub(crate) fn narrow_strided(
     }
     // f32 语义锚链同通道(名字 = driver 按 dt 单源)
     TensorOps::call(crate::ops::SemanticKernel::Narrow)
-    .arg(src)
-    .arg_usize(outer)
-    .arg_usize(src_dim)
-    .arg_usize(start)
-    .arg_usize(out_dim)
-    .with_shape(dt, shape)
+        .arg(src)
+        .arg_usize(outer)
+        .arg_usize(src_dim)
+        .arg_usize(start)
+        .arg_usize(out_dim)
+        .with_shape(dt, shape)
 }
 
 /// 行栈 concat(PF1a;owl_concat_rows_f16,arity 16):n 份同形 [r, d]
@@ -136,7 +136,11 @@ pub(crate) fn narrow_strided(
 /// dtype 跟随首输入(f16)。
 pub fn concat_rows(inputs: &[&TensorOps], r: usize, d: usize) -> TensorOps {
     let n = inputs.len();
-    assert!((1..=crate::kernel::CONCAT_ROWS_SLOTS).contains(&n), "concat_rows: arity 封顶 {},得 {n}", crate::kernel::CONCAT_ROWS_SLOTS);
+    assert!(
+        (1..=crate::kernel::CONCAT_ROWS_SLOTS).contains(&n),
+        "concat_rows: arity 封顶 {},得 {n}",
+        crate::kernel::CONCAT_ROWS_SLOTS
+    );
     let dt = inputs[0].dtype;
     let mut k = if dt == crate::tensor::Dtype::F16 {
         TensorOps::call(crate::ops::SemanticKernel::Concat) // 哨兵:逐元素核,自动 1D ceil/256

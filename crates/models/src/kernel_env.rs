@@ -201,6 +201,8 @@ impl KernelSelectionEnv {
     }
 
     /// **解析一条语义 op**(白名单派生的最小单元;picker 仍是纯函数)
+    // 结构性豁免(2026-11-02 clippy 清理):两层判断刻意分开:外层是配置面,内层是运行期事实(日志要能分辨)
+    #[allow(clippy::collapsible_if)]
     pub fn resolve(&self, spec: &OpSpec<'_>) -> Result<KernelPick, crate::contract::ModelError> {
         let env = self.op_env();
         let dt = crate::ops::ddt(spec.dt)?;
@@ -228,17 +230,14 @@ impl KernelSelectionEnv {
         // `owl_kernels::driver::{OpFamily, Admit}`(选核唯一出口拥有),
         // 规则的"为什么"写在 `crates/kernels/src/admit.rs`。
         // 认不出族 = 不设门(与 tag filter 同律:没声明就不拦)。
-        if let Some(admit) = pick.admit(&env, self.features.spec_depth) {
-            if let owl_kernels::driver::Admit::Deny(why) = admit {
-                let fam = pick
-                    .isa_family()
-                    .map(|f| f.name())
-                    .unwrap_or("<unknown>");
-                return Err(crate::contract::ModelError::Msg(format!(
-                    "代际准入门:算子 `{}`({fam})不允许在 {} 上跑 —— {why}",
-                    pick.name, env.hw.arch
-                )));
-            }
+        if let Some(owl_kernels::driver::Admit::Deny(why)) =
+            pick.admit(&env, self.features.spec_depth)
+        {
+            let fam = pick.isa_family().map(|f| f.name()).unwrap_or("<unknown>");
+            return Err(crate::contract::ModelError::Msg(format!(
+                "代际准入门:算子 `{}`({fam})不允许在 {} 上跑 —— {why}",
+                pick.name, env.hw.arch
+            )));
         }
         Ok(pick)
     }

@@ -53,6 +53,8 @@ fn topn_of() -> usize {
 
 /// 同一份档(两臂必须逐字段同参 —— 否则比的是配置不是 TP):greedy +
 /// 关前缀缓存(单请求档;快照仍开 ⇒ 快照镜像也被走到)
+// 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
+#[allow(clippy::field_reassign_with_default)]
 fn knobs() -> EngineKnobs {
     let mut k = EngineKnobs::default();
     k.sampler_enabled = false; // 设备 argmax(逐 token 确定性)
@@ -260,9 +262,13 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     // 另一个测试(`body_probe`,走 `assemble` 默认档 = 两核)⇒ 若它先跑,计数已经
     // 不是 0 ⇒ "融合档下 v1 必须为 0"的绝对判据会**假红**(实测 v1=2016 全是它留的)。
     // 判据改成**本臂增量**(turn 前后的差),与测试顺序解耦。
-    let base = ["tp.ar.v1", "tp.ar.fused", "tp.ar.ar2"].map(|t| cnt0(t));
-    let Steps { gen: tp2_gen, logits: tp2_logits } =
-        run_turn_steps(&mut r, 1, PROMPT, MAX_NEW).await.expect("TP2 turn");
+    let base = ["tp.ar.v1", "tp.ar.fused", "tp.ar.ar2"].map(cnt0);
+    let Steps {
+        gen: tp2_gen,
+        logits: tp2_logits,
+    } = run_turn_steps(&mut r, 1, PROMPT, MAX_NEW)
+        .await
+        .expect("TP2 turn");
     let cnt = |t: &str| -> u64 {
         let now: u64 = owl_shared::metrics::query_metrics(
             &owl_shared::metrics::MetricsFilter::new().tag(t),

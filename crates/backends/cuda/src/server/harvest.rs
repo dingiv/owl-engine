@@ -199,7 +199,7 @@ impl GpuServer {
         ack: Ack<Result<(usize, usize), ModelError>>,
     ) {
         let seg = if seg == 0 { super::STAGE_SEG } else { seg };
-        let want = bytes.div_ceil(seg).max(0);
+        let want = bytes.div_ceil(seg);
         let t0 = std::time::Instant::now();
         let have = self.pool.count_ge(seg);
         let mut made = 0usize;
@@ -247,9 +247,9 @@ impl GpuServer {
         offset_bytes: usize,
         len_bytes: usize,
     ) -> Result<(), ModelError> {
-        let stream = match self.ctx().stream(stream_id) {
-            Ok(s) => s.clone(),
-            Err(e) => return Err(e),
+        let stream = {
+            let s = self.ctx().stream(stream_id)?;
+            s.clone()
         };
         // **清零序**(同 try_htod 注):目标块可能是 alloc{zero} 刚给的
         self.ctx_mut().wait_zeroing(dst.id, stream_id)?;
@@ -643,8 +643,6 @@ impl GpuServer {
     ///
     /// 段化成 256 MiB:首段分配后,后续段在池里命中同尺寸桶;D2H 仍**按片序全量
     /// 入队**(同一 d2h 流 FIFO ⇒ 流水线带宽不降),ack 仍只发一次(语义不变)。
-
-
     fn swap_out(
         &mut self,
         pieces: Vec<owl_iface::contract::SwapPiece>,

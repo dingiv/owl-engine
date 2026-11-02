@@ -80,11 +80,11 @@ fn perf_cnt(tag: &str, n: u64) {
     owl_shared::metrics::with_metrics_store(|s| s.counter_add(tag, n, file!(), line!()));
 }
 
-/// 块池预算 / 回收开关的**唯一来源** = `EnvProvider.interp`(2026-10-21
-/// 配置收编:原 `OWL_BLOCK_POOL` / `OWL_NO_RECLAIM` env 已退场)。
-///
-/// 两个旋钮都在**入口一次性定谳**(`[pool] block_pool_bytes / no_reclaim`)
-/// —— 解释器不再有任何 env 读取,热路径零查询。
+// 块池预算 / 回收开关的**唯一来源** = `EnvProvider.interp`(2026-10-21
+// 配置收编:原 `OWL_BLOCK_POOL` / `OWL_NO_RECLAIM` env 已退场)。
+//
+// 两个旋钮都在**入口一次性定谳**(`[pool] block_pool_bytes / no_reclaim`)
+// —— 解释器不再有任何 env 读取,热路径零查询。
 
 /// 分段秒表(`Call` 臂宿主链分段:resolve/build/alloc/lower/launch)
 struct LapTimer {

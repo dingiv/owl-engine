@@ -246,17 +246,22 @@ async fn forwarded_births_are_hooked() {
         .htod(Dtype::F32, &Shape::from(vec![4]), &[0u8; 16], "fwd.htod")
         .await
         .expect("htod");
-    let r = lock(&rec);
-    assert_eq!(r.allocs.len(), 3, "三条出生必须都入账:{:?}", r.allocs);
-    assert_eq!(r.allocs[0].bytes, 32 * Dtype::F16.size_bytes());
-    assert_eq!(r.allocs[1].bytes, 8 * Dtype::F32.size_bytes());
-    assert_eq!(r.allocs[2].bytes, 16, "htod 字节 = 源字节");
-    assert_eq!(r.allocs[1].name, "fwd.uninit", "uninit 也点名(不落 alloc 语义)");
-    for ev in &r.allocs {
-        assert_eq!(ev.class, AssetClass::Weight, "相位类别透传");
-        assert_eq!(ev.owner, Owner::Turn(2));
+    {
+        // 锁的存活期**必须**在下面那个 `.await` 之前结束(跨 await 持锁 = 死锁面)
+        let r = lock(&rec);
+        assert_eq!(r.allocs.len(), 3, "三条出生必须都入账:{:?}", r.allocs);
+        assert_eq!(r.allocs[0].bytes, 32 * Dtype::F16.size_bytes());
+        assert_eq!(r.allocs[1].bytes, 8 * Dtype::F32.size_bytes());
+        assert_eq!(r.allocs[2].bytes, 16, "htod 字节 = 源字节");
+        assert_eq!(
+            r.allocs[1].name, "fwd.uninit",
+            "uninit 也点名(不落 alloc 语义)"
+        );
+        for ev in &r.allocs {
+            assert_eq!(ev.class, AssetClass::Weight, "相位类别透传");
+            assert_eq!(ev.owner, Owner::Turn(2));
+        }
     }
-    drop(r);
     // 死亡面:forward 的 free 也要销账
     dev.free(&[a.id, u.id, h.id]).await.expect("free");
     assert_eq!(lock(&rec).frees.len(), 3, "forward free 必须发三条");

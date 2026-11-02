@@ -723,6 +723,7 @@ impl BlockLeg {
         self.kv.tree_cap()
     }
 
+    /// 空闲槽位总数(账本视图;不触发任何回收)。
     pub fn slots_free(&self) -> usize {
         self.kv.slots_free()
     }

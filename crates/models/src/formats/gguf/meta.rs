@@ -295,6 +295,9 @@ mod tests {
     /// 装载/对拍验证过的维度事实)——GGUF 读出的东西必须与之一致,否则
     /// 后续装载的每一维都错。
     #[test]
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     fn gguf_spec_matches_family_presets() {
         // (资源键, 期望: hidden, inter, 层数, full_heads, gdn_heads, tied)
         let want: &[(&str, usize, usize, usize, (usize, usize, usize), (usize, usize, usize, usize), bool)] = &[

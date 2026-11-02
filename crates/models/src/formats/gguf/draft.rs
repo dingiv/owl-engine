@@ -16,8 +16,7 @@
 //!
 //! # 与主干源的分野(为什么不复用 [`GgufSource`](super::GgufSource))
 //!
-//! 主干源会跑 `spec_from_gguf`(qwen35)+ `transform::xf_for`(GDN 六类逆变换)
-//! + v-head 分片 —— 草稿文件**没有 GDN**,且维度事实是 `dflash.*`。共用会引入
+//! 主干源会跑 `spec_from_gguf`(qwen35)+ `transform::xf_for`(GDN 六类逆变换) + v-head 分片 —— 草稿文件**没有 GDN**,且维度事实是 `dflash.*`。共用会引入
 //! 两套规范(AGENTS:接口不唯一);故草稿源是**独立实现**,但只做"键 → 字节"
 //! 这一件事,零设备知识。
 //!
@@ -289,7 +288,7 @@ impl<'g> GgufDraftSource<'g> {
                 layers = self.spec.layers,
             )));
         }
-        if inner % be != 0 || inner / self.spec.layers % be != 0 {
+        if inner % be != 0 || !(inner / self.spec.layers).is_multiple_of(be) {
             return Err(ModelError::Msg(format!(
                 "GGUF 草稿 `fc.weight` 内维 {inner} / 块 {be} 不整除(tap 列块无法按块重排)"
             )));
@@ -300,6 +299,8 @@ impl<'g> GgufDraftSource<'g> {
     }
 
     /// 按行窗口搬字节(量化键的 U8 通道;`offset/len` = 字节)
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     fn copy_rows(
         &self,
         gkey: &str,
@@ -522,12 +523,10 @@ impl WeightSource for GgufDraftSource<'_> {
     fn native_dtype(&self, key: &str) -> Taken<Dtype> {
         let (gkey, tap) = self.resolve(key)?;
         let _ = tap;
-        Ok(match self.g.get_tensor(&gkey) {
-            // 量化块 ⇒ U8(**唯一**声称原生字节的情形;码本例外在
-            // `convert_chunk_into_bytes` 里按名单处理)
-            Some(t) => Some(t.ty.native_dtype().unwrap_or(Dtype::U8)),
-            None => None,
-        })
+        Ok(self
+            .g
+            .get_tensor(&gkey)
+            .map(|t| t.ty.native_dtype().unwrap_or(Dtype::U8)))
     }
 
     fn convert_chunk_into_bytes(

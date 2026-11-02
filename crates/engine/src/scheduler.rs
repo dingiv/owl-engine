@@ -23,6 +23,8 @@ pub(crate) const PENDING_LOAD_PLACEHOLDER: u32 = owl_store::HOST_PLACEHOLDER;
 type Result<T> = std::result::Result<T, ModelError>;
 
 /// 一次 pump 的调度决策(执行器照办的完整计划)
+// 结构性豁免(2026-11-02 clippy 清理):枚举变体大小差是**形状事实**(工作单元 vs 标量);装箱会把热路径变成间接访存
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum SchedulerOutput {
     /// 队列排空且无活跃(调用方可安全挂起等新提交)
     Idle,
@@ -437,11 +439,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let in_flight_turns = self.bank.rel.in_flight_turns();
         let claimed_free = leg.slots_total.saturating_sub(reserved);
         let free_pages = leg.slots_free.min(claimed_free);
-        let movable_pages = if leg.block_bytes > 0 {
-            leg.movable_bytes / leg.block_bytes
-        } else {
-            0
-        };
+        let movable_pages = leg.movable_bytes.checked_div(leg.block_bytes).unwrap_or(0);
         let cache_pages = movable_pages.min(claimed_free.saturating_sub(free_pages));
         // **磁盘腿**（超卖档的第三层）：`DiskTier` 的块 = 一条链（单卡 = 一页，
         // TP 合并后 = world 页 —— 与宿主槽同粒度；`attach_disk` 按 `host_slot_bytes`
@@ -457,16 +455,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             reserved_pages: reserved,
             in_flight_turns,
             // **宿主腿**（超卖档溢出面）：预算 − 已驻留，按块字节折页。
-            host_free_pages: if leg.block_bytes > 0 {
-                leg.host_budget_bytes.saturating_sub(leg.host_bytes) / leg.block_bytes
-            } else {
-                0
-            },
-            host_used_pages: if leg.block_bytes > 0 {
-                leg.host_bytes / leg.block_bytes
-            } else {
-                0
-            },
+            host_free_pages: leg
+                .host_budget_bytes
+                .saturating_sub(leg.host_bytes)
+                .checked_div(leg.block_bytes)
+                .unwrap_or(0),
+            host_used_pages: leg.host_bytes.checked_div(leg.block_bytes).unwrap_or(0),
             disk_free_pages,
         }
     }
@@ -745,6 +739,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     /// **Fresh 起跑**(零复用):释放旧块表/旧 MTP 链 + 会话账归零。
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     fn plan_fresh(
         &mut self,
         turn: &crate::turn::Turn,
@@ -1029,6 +1026,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     /// leave-gap 删除计划的落账(表/游标/token/位置账);设备半只做盘快照收尾。
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     fn apply_image_leave_gap(
         &mut self,
         d: ImageLeaveGap,
@@ -1078,6 +1078,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///
     /// 返回 `(cached_len, restore_key, pending_loads)`。行为逐字节不变 ——
     /// 抽出来只是为了让「前缀无感删除」能在它**之前**短路(删除路径自己取链)。
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     fn plan_prefix_reuse(
         &mut self,
         turn: &crate::turn::Turn,

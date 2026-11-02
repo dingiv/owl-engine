@@ -7,8 +7,7 @@
 //! - L3 最终答案面(已知 bug 记录):`</think>` 后含正确答案 —— 当前
 //!   think 结论正确但最终答案输出损坏(N/A/"["),xfail 立案,修复后转正
 //!
-//! 门:OWL_E2E=1(需 GPU + 模型路径);server 启动 = CARGO_BIN_EXE_server
-//! + 内嵌配置(8448/8704,split;§三十三:此配置数学 gate 通过)。
+//! 门:OWL_E2E=1(需 GPU + 模型路径);server 启动 = CARGO_BIN_EXE_server + 内嵌配置(8448/8704,split;§三十三:此配置数学 gate 通过)。
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

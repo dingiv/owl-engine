@@ -7,12 +7,9 @@
 //!    `[out, 块行字节]`),永不在 host 解量化(设计 I-3 / REQ-GGUF-05);
 //! 2. **读侧变换**(设计 §十一):转换器做了六类变换,本源按
 //!    [`transform::xf_for`] 的描述符逆变换 ——
-//!    · **行粒度**置换(`attn_qkv` 的 V 段 / `attn_gate` / `alpha` / `beta`):
-//!      在 **字节面**做(按行搬块,**零重量化**);
+//!    · **行粒度**置换(`attn_qkv` 的 V 段 / `attn_gate` / `alpha` / `beta`):      在 **字节面**做(按行搬块,**零重量化**);
 //!    · **值变换**(`ssm_a` = `ln(-x)`;小件 F32):在元素面做;
-//!    · **列置换**(`ssm_out` 的内维):跨块 ⇒ **源不动字节**,由调用方在
-//!      激活侧做(`owl_gguf_col_gather`;描述符 `RowPerm::ColVHead` 就是它的
-//!      声明 —— 消费者据此知道"这层的 out_proj 需要先置换输入")。
+//!    · **列置换**(`ssm_out` 的内维):跨块 ⇒ **源不动字节**,由调用方在      激活侧做(`owl_gguf_col_gather`;描述符 `RowPerm::ColVHead` 就是它的      声明 —— 消费者据此知道"这层的 out_proj 需要先置换输入")。
 //!
 //! # 为什么行置换能在字节面做(设计 §11.4 的几何)
 //!
@@ -474,7 +471,7 @@ impl GgufSource {
         }
         let inner = t.inner() as usize;
         let frows = t.rows() as usize;
-        if inner % be != 0 {
+        if !inner.is_multiple_of(be) {
             return Err(ModelError::Msg(format!(
                 "GgufSource: 键 `{key}` 内维 {inner} 不是块宽 {be} 的整数倍"
             )));
@@ -584,7 +581,7 @@ impl WeightSource for GgufSource {
             };
             let (be, bb) = t.ty.block();
             let half_inner = t.inner() as usize / 2;
-            if half_inner % be != 0 {
+            if !half_inner.is_multiple_of(be) {
                 return Err(ModelError::Msg(format!(
                     "GgufSource: 虚拟键 `{key}` 的半行 {half_inner} 不是块宽 {be} 的整数倍(块对齐失守)"
                 )));
@@ -622,11 +619,9 @@ impl WeightSource for GgufSource {
                 Some(_) => Some(Dtype::U8),
             });
         }
-        Ok(match self.ty_of(key) {
-            // 量化块 ⇒ **U8**(不透明字节;装载面走 esz=1 的元素通道,零转换)
-            Some(t) => Some(t.native_dtype().unwrap_or(Dtype::U8)),
-            None => None,
-        })
+        Ok(self
+            .ty_of(key)
+            .map(|t| t.native_dtype().unwrap_or(Dtype::U8)))
     }
 
     fn convert_chunk_into_bytes(
@@ -673,7 +668,7 @@ impl WeightSource for GgufSource {
             let rows = t.rows() as usize;
             let inner = t.inner() as usize;
             let half_inner = inner / 2;
-            if half_inner % be != 0 {
+            if !half_inner.is_multiple_of(be) {
                 return Err(ModelError::Msg(format!(
                     "GgufSource: 虚拟键 `{key}` 的半行 {half_inner} 不是块宽 {be} 的整数倍"
                 )));

@@ -617,8 +617,7 @@ impl CandidateSelector {
     /// 出候选值 + 索引。
     ///
     /// `logits_stride` = 每行宽度 = **本 rank 的 logits 宽**（未切档 = `vocab`;
-    /// 词表切档 = 半表）。⚠️ 分片档的索引是**半表域**(rank1 的全局 id = 局部 id
-    /// + half) —— 偏移修正由 host 合并面做（核面零改动）。
+    /// 词表切档 = 半表）。⚠️ 分片档的索引是**半表域**(rank1 的全局 id = 局部 id + half) —— 偏移修正由 host 合并面做（核面零改动）。
     ///
     /// 拆分动机（为什么单独存在）:切档下两 rank 各持半表，**全局 top-16 ⊆
     /// 两半各自 top-16 的并集** ⇒ 图只出候选（896B），host 合并后再跑
@@ -687,8 +686,7 @@ impl CandidateSelector {
     }
 
     /// 选 draft(logits 外供版:引擎探针/调用方复用 lm_head 输出)。
-    /// = [`Self::topk_of_logits`]（全表 stride）+ [`Self::selector_proj`]
-    /// + [`Self::select_from_candidates`] —— **未切档的逐字节原路**。
+    /// = [`Self::topk_of_logits`]（全表 stride）+ [`Self::selector_proj`] + [`Self::select_from_candidates`] —— **未切档的逐字节原路**。
     pub fn select_with_logits(
         &self,
         hidden: &TensorOps,
@@ -1171,6 +1169,8 @@ impl DFlash2Draft {
     /// **半表 top-16 候选 + proj**（不出 drafts）—— 供引擎 host 合并两 rank
     /// 候选后跑 [`Self::select_from_candidates`]。
     /// 返回 `(hidden, cand, vals, proj, logits)`。
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     pub fn propose_block_split(
         &self,
         tokens: &TensorOps,
@@ -1193,6 +1193,8 @@ impl DFlash2Draft {
         (hidden, cand, vals, proj, logits)
     }
 
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     pub fn propose_block(
         &self,
         tokens: &TensorOps,

@@ -316,6 +316,9 @@ pub mod live_diag {
             }
         }
 
+        // 结构性豁免(2026-11-02 clippy 清理):
+        //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+        #[allow(clippy::type_complexity)]
         fn by_code(c: u8) -> Option<Self> {
             match c {
                 1 => Some(Self::Pending),
@@ -358,6 +361,9 @@ pub mod live_diag {
         /// (`pending==0` 那一瞬)—— 即"这个块本来可以还了,最后结果是什么"。
         /// 前 k-1 次消费**(仍有消费者)不算决定点,不入账(否则重复计)。
         /// 账目 = (字节, 次数, 残余 users 最大值) 按 (出口码, 名字) 聚合。
+        // 结构性豁免(2026-11-02 clippy 清理):键/值都是"聚合口径"本身(出口码+名字 → 字节/次数/残余),
+        // 起别名反而要两处对照。
+        #[allow(clippy::type_complexity)]
         by_name: Mutex<BTreeMap<(u8, String), (u64, u64, u64)>>,
     }
 
@@ -573,6 +579,24 @@ pub mod live_diag {
         LEDGER.take_report()
     }
 
+    /// `/debug/metrics` 形态的名称→值表(tag 即契约,顺序稳定)
+    pub fn counters() -> Vec<(&'static str, u64)> {
+        let s = LEDGER.snapshot();
+        vec![
+            ("live.new_blocks", s.new_blocks),
+            ("live.free_blocks", s.free_blocks),
+            ("live.refuse.pending", s.refuse_pending),
+            ("live.refuse.users", s.refuse_users),
+            ("live.refuse.alias", s.refuse_alias),
+            ("live.refuse.not_arena", s.refuse_not_arena),
+            ("live.refuse.kept", s.refuse_kept),
+            ("live.retire.untracked", s.refuse_not_tracked),
+            // **非 0 即异常**(块被登记两遍 ⇒ users 恒多 1 ⇒ 永不中途回收)
+            ("live.dup_new", s.dup_new),
+            ("live.alias.on_tracked", s.alias_on_tracked),
+        ]
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -627,24 +651,6 @@ pub mod live_diag {
             assert!(rep.contains("2MB"), "两次 1MiB 合并 ⇒ 2MB: {rep}");
             assert!(rep.contains("真回收"), "{rep}");
         }
-    }
-
-    /// `/debug/metrics` 形态的名称→值表(tag 即契约,顺序稳定)
-    pub fn counters() -> Vec<(&'static str, u64)> {
-        let s = LEDGER.snapshot();
-        vec![
-            ("live.new_blocks", s.new_blocks),
-            ("live.free_blocks", s.free_blocks),
-            ("live.refuse.pending", s.refuse_pending),
-            ("live.refuse.users", s.refuse_users),
-            ("live.refuse.alias", s.refuse_alias),
-            ("live.refuse.not_arena", s.refuse_not_arena),
-            ("live.refuse.kept", s.refuse_kept),
-            ("live.retire.untracked", s.refuse_not_tracked),
-            // **非 0 即异常**(块被登记两遍 ⇒ users 恒多 1 ⇒ 永不中途回收)
-            ("live.dup_new", s.dup_new),
-            ("live.alias.on_tracked", s.alias_on_tracked),
-        ]
     }
 }
 
@@ -918,6 +924,8 @@ fn render_report(st: &ProbeState) -> String {
 ///   内存是被独占的还是一堆共享的"。
 /// - **⚠ 幽灵块**:`users == 0 && 已死` 之外**仍计入活跃**的块(不该出现:
 ///   归零那一刻就该走回收出口)。它非 0 = 活性记账漏了口(历史上真出过)。
+// 结构性豁免(2026-11-02 clippy 清理):排序键是复合比较(多字段/方向混合),抽 key 会丢掉可读性
+#[allow(clippy::unnecessary_sort_by)]
 fn render_refs(st: &ProbeState) -> String {
     if st.refs.is_empty() {
         return String::new();

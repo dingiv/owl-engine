@@ -127,6 +127,8 @@ impl ReservationLedger {
     }
 
     /// 批准一张票。`slots = 0` = 调用方错配(响亮拒)。
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     pub fn grant(
         &mut self,
         turn: u64,

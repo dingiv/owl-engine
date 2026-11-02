@@ -45,9 +45,9 @@
 // §1 硬件档
 // ============================================================================
 
-/// 硬件画像(拾取的全部依据;随感知手段升级扩充字段)。
-/// `Arch` 复用 crate 根枚举(REQ-HW-01 单一分发表键)。
-/// 构造权在引擎侧(boot 感知;kernels 零探测 —— 被动律)。
+// 硬件画像(拾取的全部依据;随感知手段升级扩充字段)。
+// `Arch` 复用 crate 根枚举(REQ-HW-01 单一分发表键)。
+// 构造权在引擎侧(boot 感知;kernels 零探测 —— 被动律)。
 // ============================================================================
 // §2 值类型
 // ============================================================================
@@ -573,7 +573,7 @@ pub const SENTINEL_1D: Shape = Shape { grid: (0, 0, 0), block: (256, 1, 1), smem
 /// 本函数 = 那条契约的**单源**:调用方必须传 ≥ 本值,否则核内 `smem[warp]` 越界。
 /// 改动此处**必须同步**核内归约结构(`cu/ln/rmsnorm.cu` / `cu/ln/fused_add_rmsnorm.cu`)。
 pub const fn row_reduce_smem(block: u32) -> u32 {
-    ((block + 31) / 32) * 4
+    block.div_ceil(32) * 4
 }
 
 /// 行归约族块大小(2026-10-19 §58 刀③:256 → **512**)。
@@ -677,8 +677,7 @@ pub mod gguf {
         }
     }
 
-    /// **smem 复用 GEMM**(prefill 的算术杠杆;W-2b):`grid = (ceil(n/NT), ceil(m/MT))`
-    /// + **动态 smem 66048B**(>48KB ⇒ server 走 opt-in 通道)
+    /// **smem 复用 GEMM**(prefill 的算术杠杆;W-2b):`grid = (ceil(n/NT), ceil(m/MT))` + **动态 smem 66048B**(>48KB ⇒ server 走 opt-in 通道)
     pub fn gemm_smem(ty: GgmlTy, m: usize, n: usize) -> KernelPick {
         let (grid, block) = fam::smem_geom(m, n);
         let shape = Shape { grid, block, smem: fam::smem_bytes() as u32 };
@@ -990,7 +989,7 @@ pub mod gdn {
     /// 不一致不是"性能差一点",而是**覆盖错位**(legacy 的列步长 = 8,快路 = 16)
     /// ⇒ 由单测 `gdn_rec_geometry_matches_route` 钉住。
     pub fn recurrence_varlen_gqa_fast(kd: usize, vd: usize) -> bool {
-        kd == 128 && vd % 2 == 0
+        kd == 128 && vd.is_multiple_of(2)
     }
 
     pub fn recurrence_varlen_gqa(dt: DType, vd: usize, nv: usize, kd: usize, batch: usize) -> KernelPick {
@@ -1692,16 +1691,16 @@ pub mod attn {
         // **几何门(2026-10-18)**:v2 核要求 CTA 内 warp 能覆盖一个 GQA 组
         // (`nwarp ≥ group` 且 `nwarp % group == 0`)—— 不满足回落旧核(慢但正确),
         // 核内另有 `__trap()` 兜底(双保险,不静默)。
-        let group = if hkv > 0 { hq / hkv } else { 0 };
+        let group = hq.checked_div(hkv).unwrap_or(0);
         let nwarp = (hd / 32).max(1);
         let v2 = !fp8kv
             && matches!(dt, DType::BF16)
             && matches!(hd, 128 | 256)
             && hkv > 0
-            && hq % hkv == 0
+            && hq.is_multiple_of(hkv)
             && group > 0
             && nwarp >= group
-            && nwarp % group == 0;
+            && nwarp.is_multiple_of(group);
         // **v3 臂(2026-10-26 propose 刀1)**:页粒度把 K/V 整页搬进 shared
         // (池里一页的 K 块/V 块都是连续 8KB ⇒ 16B 整块搬),键内零同步;
         // v2 的标量 V 散读(单 key 128 个 32B 扇区)与 nsub 段切分是主凶。
@@ -1718,10 +1717,10 @@ pub mod attn {
             && hd == 128
             && (16..=64).contains(&page)
             && hkv > 0
-            && hq % hkv == 0
+            && hq.is_multiple_of(hkv)
             && group > 0
             && v3_nwarp >= group
-            && v3_nwarp % group == 0
+            && v3_nwarp.is_multiple_of(group)
             && v3_smem <= 48 * 1024;
         let name = match (dt, fp8kv) {
             (DType::F16, false) if v3 => "owl_naive_attn_nc_tiled_f16",
@@ -2170,7 +2169,10 @@ pub mod elems {
     /// `tokens > 1` 走多 token 快路(2026-10-22):权重只读一遍,一次算
     /// 7/8 个 spec 行;`tokens == 1` 保持上面的线性核(prefill 末行)。
     pub fn gemv_i8w_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
-        assert!(cols % 16 == 0, "gemv_i8w 要求 cols % 16 == 0(每 lane 16 B 对齐),得 {cols}");
+        assert!(
+            cols.is_multiple_of(16),
+            "gemv_i8w 要求 cols % 16 == 0(每 lane 16 B 对齐),得 {cols}"
+        );
         assert!(tokens > 0, "gemv_i8w 的 tokens 必须 > 0");
         if gemv_i8w_mt_eligible(rows, tokens) {
             return if tokens == GEMV_I8W_MT7_TOK_TILE {
@@ -2187,7 +2189,10 @@ pub mod elems {
     }
 
     pub fn gemv_i8w(rows: usize, cols: usize, tokens: usize) -> KernelPick {
-        assert!(cols % 16 == 0, "gemv_i8w 要求 cols % 16 == 0(每 lane 16 B 对齐),得 {cols}");
+        assert!(
+            cols.is_multiple_of(16),
+            "gemv_i8w 要求 cols % 16 == 0(每 lane 16 B 对齐),得 {cols}"
+        );
         assert!(tokens > 0, "gemv_i8w 的 tokens 必须 > 0");
         if gemv_i8w_mt_eligible(rows, tokens) {
             return if tokens == GEMV_I8W_MT7_TOK_TILE {
@@ -2215,8 +2220,7 @@ pub mod elems {
     /// 多 token 快路是否可用(行数必须被 32 行/块整除;否则回退 m=1 核,
     /// 由 m=1 核按 token 逐发——慢但正确)。模型侧也用它决定是否传 tokens。
     pub fn gemv_i8w_mt_eligible(rows: usize, tokens: usize) -> bool {
-        tokens > 1
-            && rows % (GEMV_I8W_MT_WARPS * GEMV_I8W_MT_ROWS_PER_WARP) == 0
+        tokens > 1 && rows.is_multiple_of(GEMV_I8W_MT_WARPS * GEMV_I8W_MT_ROWS_PER_WARP)
     }
 
     fn gemv_i8w_mt_shape(rows: usize, _cols: usize, tokens: usize, tok_tile: usize) -> Shape {
@@ -2313,7 +2317,10 @@ pub mod elems {
     }
 
     pub fn gemv_i8w_a8_f16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
-        assert!(cols % 16 == 0, "gemv_i8w_a8 要求 cols % 16 == 0,得 {cols}");
+        assert!(
+            cols.is_multiple_of(16),
+            "gemv_i8w_a8 要求 cols % 16 == 0,得 {cols}"
+        );
         assert!(tokens > 1, "W8A8 只接 tokens>1(spec 头)");
         assert!(
             gemv_i8w_mt_eligible(rows, tokens),
@@ -2331,7 +2338,10 @@ pub mod elems {
     }
 
     pub fn gemv_i8w_a8_bf16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
-        assert!(cols % 16 == 0, "gemv_i8w_a8 要求 cols % 16 == 0,得 {cols}");
+        assert!(
+            cols.is_multiple_of(16),
+            "gemv_i8w_a8 要求 cols % 16 == 0,得 {cols}"
+        );
         assert!(tokens > 1, "W8A8 只接 tokens>1(spec 头)");
         assert!(
             gemv_i8w_mt_eligible(rows, tokens),
@@ -2358,7 +2368,7 @@ pub mod elems {
 
     /// TC 头快路是否可用：int8 IMMA 要求 K 32 对齐；M=16 只接 2..=8 token。
     pub fn gemm_i8w_a8_tc_eligible(_rows: usize, cols: usize, tokens: usize) -> bool {
-        cols % 32 == 0 && (2..=8).contains(&tokens)
+        cols.is_multiple_of(32) && (2..=8).contains(&tokens)
     }
 
     pub fn gemm_i8w_a8_tc_f16(rows: usize, cols: usize, tokens: usize) -> KernelPick {
@@ -2405,7 +2415,7 @@ pub mod elems {
     const GEMM_I8W_A16_TC_ROWS_PER_BLOCK: usize = 64;
 
     pub fn gemm_i8w_a16_tc_eligible(_rows: usize, cols: usize, tokens: usize) -> bool {
-        cols % 16 == 0 && (2..=8).contains(&tokens)
+        cols.is_multiple_of(16) && (2..=8).contains(&tokens)
     }
 
     pub fn gemm_i8w_a16_tc_f16(rows: usize, cols: usize, tokens: usize) -> KernelPick {

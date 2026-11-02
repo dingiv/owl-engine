@@ -194,6 +194,8 @@ impl DeviceRes for TestRes {
 // §2 台
 // ============================================================================
 
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 fn fire(
     res: &mut TestRes,
     exec: &mut Exec,
@@ -210,6 +212,8 @@ fn fire(
     }
 }
 
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 fn time_us(
     res: &mut TestRes,
     exec: &mut Exec,
@@ -245,6 +249,8 @@ fn rnd(seed: u32, i: usize) -> f32 {
 }
 
 /// 一档(rows × cols)跑完即报:µs/发、GB/s、与 host f32 参考的相对误差。
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, rows: usize, cols: usize) {
     let mut exec = Exec::new();
     let f = exec.load_aot(res, src, entry, OpId(owl_kernels::spec::NATIVE)).expect("资产");
@@ -330,6 +336,8 @@ fn bench_one(res: &mut TestRes, entry: &'static str, src: &'static str, rows: us
 
 /// **多 token 快路 A/B**:同一份权重/输入,旧核(grid.y=tokens,每 token 重读权重)
 /// vs 新核(权重一次,TOK_TILE=8)对比;输出逐位一致 + 吞吐。
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn bench_mt(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
     let mut exec = Exec::new();
     let src = <owl_kernels::ops::elems::GemvI8wF16 as owl_kernels::spec::KernelSpec>::SRC;
@@ -461,6 +469,8 @@ fn gemv_i8w_mt_bench() {
 /// **W8A8 head A/B**:per-token int8 激活量化 + dp4a 多头 GEMV。
 /// - 小形状(rows<=1024)与 host 整数点积对拍;
 /// - 生产形状只量时间(host 全量点积 5B 次,不跑)。
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn bench_a8(res: &mut TestRes, rows: usize, cols: usize, tokens: usize) {
     let mut exec = Exec::new();
     let fscale = exec
@@ -600,6 +610,8 @@ fn gemv_i8w_a8_bench() {
 /// 判据:
 /// 1. 小形状与 host 整数点积**逐位**相同(f16 输出 bit 比,不是容差);
 /// 2. 生产形状只量时间(0.635 GB 权重;目标 ≥ dp4a 的 477 GB/s)。
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn bench_tc(res: &mut TestRes, rows: usize, cols: usize, tokens: usize, parity: bool) {
     let mut exec = Exec::new();
     let prod = owl_kernels::driver::elems::gemm_i8w_a8_tc_f16(rows, cols, tokens);
@@ -743,6 +755,8 @@ fn gemm_i8w_a8_tc_bench() {
 ///
 /// 判据：小形状与 host 参考一致；生产形状量时间（权重 0.635 GB）。
 /// 这是“学 Marlin W4A16”的同款流水，只是权重 8-bit、激活仍 f16。
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn bench_a16_tc(res: &mut TestRes, rows: usize, cols: usize, tokens: usize, parity: bool) {
     let mut exec = Exec::new();
     let prod = owl_kernels::driver::elems::gemm_i8w_a16_tc_f16(rows, cols, tokens);

@@ -39,17 +39,25 @@ fn e4m3_decode(code: u8) -> f32 {
 fn lcg_u8(n: usize, seed: u32) -> Vec<u8> {
     (0..n)
         .map(|i| {
-            let x = seed.wrapping_mul(0x9E37_79B9).wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            let x = seed
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
             // 只用有限 e4m3 码(0..=0x7E / 0x80..=0xFE)
             let c = (x % 0x7F) as u8;
-            if x & 0x8000_0000 != 0 { c | 0x80 } else { c }
+            if x & 0x8000_0000 != 0 {
+                c | 0x80
+            } else {
+                c
+            }
         })
         .collect()
 }
 fn lcg_f16(n: usize, seed: u32) -> Vec<u16> {
     (0..n)
         .map(|i| {
-            let x = seed.wrapping_mul(0x9E37_79B9).wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
+            let x = seed
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add((i as u32).wrapping_mul(0x85EB_CA6B));
             half::f16::from_f32(((x & 0xFFFF) as f32 / 65535.0 - 0.5) * 4.0).to_bits()
         })
         .collect()
@@ -59,20 +67,74 @@ fn upload_u32(res: &mut TestRes, v: &[u32]) -> Bytes {
     res.upload(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())
 }
 
-fn prefill_msg(name: &str, t: usize, ctx: usize, kv_dtype: Dtype, q: u64, k: u64, v: u64,
-               q_cu: u64, indices: u64, indptr: u64, last_len: u64, wr: u64, out: u64) -> LaunchMsg {
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
+fn prefill_msg(
+    name: &str,
+    t: usize,
+    ctx: usize,
+    kv_dtype: Dtype,
+    q: u64,
+    k: u64,
+    v: u64,
+    q_cu: u64,
+    indices: u64,
+    indptr: u64,
+    last_len: u64,
+    wr: u64,
+    out: u64,
+) -> LaunchMsg {
     LaunchMsg {
-        kernel: KernelSource { name: name.to_string(), source: String::new() },
+        kernel: KernelSource {
+            name: name.to_string(),
+            source: String::new(),
+        },
         args: vec![
-            Arg::Block { id: q, dtype: Dtype::F16, rank: 2 },
-            Arg::Block { id: k, dtype: kv_dtype, rank: 1 },
-            Arg::Block { id: v, dtype: kv_dtype, rank: 1 },
-            Arg::Block { id: q_cu, dtype: Dtype::U32, rank: 1 },
-            Arg::Block { id: indices, dtype: Dtype::U32, rank: 1 },
-            Arg::Block { id: indptr, dtype: Dtype::U32, rank: 1 },
-            Arg::Block { id: last_len, dtype: Dtype::U32, rank: 1 },
-            Arg::Block { id: wr, dtype: Dtype::F16, rank: 1 },
-            Arg::Block { id: out, dtype: Dtype::F16, rank: 2 },
+            Arg::Block {
+                id: q,
+                dtype: Dtype::F16,
+                rank: 2,
+            },
+            Arg::Block {
+                id: k,
+                dtype: kv_dtype,
+                rank: 1,
+            },
+            Arg::Block {
+                id: v,
+                dtype: kv_dtype,
+                rank: 1,
+            },
+            Arg::Block {
+                id: q_cu,
+                dtype: Dtype::U32,
+                rank: 1,
+            },
+            Arg::Block {
+                id: indices,
+                dtype: Dtype::U32,
+                rank: 1,
+            },
+            Arg::Block {
+                id: indptr,
+                dtype: Dtype::U32,
+                rank: 1,
+            },
+            Arg::Block {
+                id: last_len,
+                dtype: Dtype::U32,
+                rank: 1,
+            },
+            Arg::Block {
+                id: wr,
+                dtype: Dtype::F16,
+                rank: 1,
+            },
+            Arg::Block {
+                id: out,
+                dtype: Dtype::F16,
+                rank: 2,
+            },
             Arg::U64(t as u64),
             Arg::U64(ctx as u64),
             Arg::U64(t as u64),
@@ -91,7 +153,11 @@ fn prefill_msg(name: &str, t: usize, ctx: usize, kv_dtype: Dtype, q: u64, k: u64
 
 fn f16_ulp(x: f32) -> f32 {
     let a = x.abs();
-    if a < 6.1035156e-5 { 5.9604645e-8 } else { 2f32.powi((a.log2().floor() as i32) - 10) }
+    if a < 6.1035156e-5 {
+        5.9604645e-8
+    } else {
+        2f32.powi((a.log2().floor() as i32) - 10)
+    }
 }
 
 struct DiffStats {
@@ -130,6 +196,8 @@ fn host_ref(t: usize, ctx: usize, q: &[u16], k: &[u8], v: &[u8]) -> Vec<f32> {
     host_ref_off(t, ctx, q, k, v, 0)
 }
 
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn host_ref_off(t: usize, ctx: usize, q: &[u16], k: &[u8], v: &[u8], off: i32) -> Vec<f32> {
     let qf: Vec<f32> = q.iter().map(|&b| f16_to_f32(b)).collect();
     let kf: Vec<f32> = k.iter().map(|&b| e4m3_decode(b)).collect();
@@ -196,7 +264,11 @@ fn fi_shadow_dequant_and_prefill_parity() {
 
     let k8_b = res.upload(&k8);
     let v8_b = res.upload(&v8);
-    let q_b = res.upload(&q16.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+    let q_b = res.upload(
+        &q16.iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
     let q_cu = upload_u32(&mut res, &[0, t as u32]);
     // **乱序物理页**:逻辑 p → 物理 nb-1-p;反量化必须按 indices 取源页。
     let phys: Vec<u32> = if owl_shared::env_reader::flag("FI_SHADOW_IDX") {
@@ -217,9 +289,15 @@ fn fi_shadow_dequant_and_prefill_parity() {
     let v16 = res.zeros(pool * 2);
     let rc = unsafe {
         owl_kernels::family::flashinfer::owl_fi_dequant_fp8_to_f16(
-            res.ptr(k8_b.id) as *const _, res.ptr(v8_b.id) as *const _,
-            res.ptr(k16.id) as *mut _, res.ptr(v16.id) as *mut _,
-            res.ptr(idx_src.id) as *const i32, nb as i32, HKV as i32, HD as i32, PAGE as i32,
+            res.ptr(k8_b.id) as *const _,
+            res.ptr(v8_b.id) as *const _,
+            res.ptr(k16.id) as *mut _,
+            res.ptr(v16.id) as *mut _,
+            res.ptr(idx_src.id) as *const i32,
+            nb as i32,
+            HKV as i32,
+            HD as i32,
+            PAGE as i32,
             res.stream.cu_stream() as *mut _,
         )
     };
@@ -233,8 +311,12 @@ fn fi_shadow_dequant_and_prefill_parity() {
                 let src = phys[p] as usize * PAGE * HKV * HD + i;
                 let want = half::f16::from_f32(e4m3_decode(k8[src])).to_bits();
                 let d = (f16_to_f32(got[p * PAGE * HKV * HD + i]) - e4m3_decode(k8[src])).abs();
-                if d > worst { worst = d; }
-                if got[p * PAGE * HKV * HD + i] != want { bad += 1; }
+                if d > worst {
+                    worst = d;
+                }
+                if got[p * PAGE * HKV * HD + i] != want {
+                    bad += 1;
+                }
             }
         }
         let got_v = res.take_u16(v16.id);
@@ -242,11 +324,16 @@ fn fi_shadow_dequant_and_prefill_parity() {
             for i in 0..PAGE * HKV * HD {
                 let src = phys[p] as usize * PAGE * HKV * HD + i;
                 let want = half::f16::from_f32(e4m3_decode(v8[src])).to_bits();
-                if got_v[p * PAGE * HKV * HD + i] != want { bad_v += 1; }
+                if got_v[p * PAGE * HKV * HD + i] != want {
+                    bad_v += 1;
+                }
             }
         }
     }
-    println!("[shadow] dequant bad={bad}/{pool} bad_v={bad_v}/{pool} worst={worst:e} (check={})", pool <= 8_000_000);
+    println!(
+        "[shadow] dequant bad={bad}/{pool} bad_v={bad_v}/{pool} worst={worst:e} (check={})",
+        pool <= 8_000_000
+    );
     if !bench {
         assert_eq!(bad, 0, "dequant K 逐位不等");
         assert_eq!(bad_v, 0, "dequant V 逐位不等");
@@ -254,15 +341,37 @@ fn fi_shadow_dequant_and_prefill_parity() {
 
     // 2) fp8 FI vs dequant→f16 FI
     let msg8 = prefill_msg(
-        owl_kernels::client::flashinfer::PREFILL_FI_FP8KV, t, ctx, Dtype::U32,
-        q_b.id, k8_b.id, v8_b.id, q_cu.id, idx_src.id, indptr.id, last_len.id, wr.id, out8.id,
+        owl_kernels::client::flashinfer::PREFILL_FI_FP8KV,
+        t,
+        ctx,
+        Dtype::U32,
+        q_b.id,
+        k8_b.id,
+        v8_b.id,
+        q_cu.id,
+        idx_src.id,
+        indptr.id,
+        last_len.id,
+        wr.id,
+        out8.id,
     );
     reg.execute(&msg8, &mut res, &mut exec).expect("fp8 FI");
     res.stream.synchronize().expect("sync");
     let out16 = res.zeros(out_pad * H * HD * 2);
     let msg16 = prefill_msg(
-        owl_kernels::client::flashinfer::PREFILL_FI, t, ctx, Dtype::F16,
-        q_b.id, k16.id, v16.id, q_cu.id, idx_dst.id, indptr.id, last_len.id, wr.id, out16.id,
+        owl_kernels::client::flashinfer::PREFILL_FI,
+        t,
+        ctx,
+        Dtype::F16,
+        q_b.id,
+        k16.id,
+        v16.id,
+        q_cu.id,
+        idx_dst.id,
+        indptr.id,
+        last_len.id,
+        wr.id,
+        out16.id,
     );
     reg.execute(&msg16, &mut res, &mut exec).expect("f16 FI");
     res.stream.synchronize().expect("sync");
@@ -285,10 +394,16 @@ fn fi_shadow_dequant_and_prefill_parity() {
         for _ in 0..bench_n {
             let rc = unsafe {
                 owl_kernels::family::flashinfer::owl_fi_dequant_fp8_to_f16(
-                    res.ptr(k8_b.id) as *const _, res.ptr(v8_b.id) as *const _,
-                    res.ptr(k16.id) as *mut _, res.ptr(v16.id) as *mut _,
-                    res.ptr(idx_src.id) as *const i32, nb as i32, HKV as i32, HD as i32,
-                    PAGE as i32, res.stream.cu_stream() as *mut _,
+                    res.ptr(k8_b.id) as *const _,
+                    res.ptr(v8_b.id) as *const _,
+                    res.ptr(k16.id) as *mut _,
+                    res.ptr(v16.id) as *mut _,
+                    res.ptr(idx_src.id) as *const i32,
+                    nb as i32,
+                    HKV as i32,
+                    HD as i32,
+                    PAGE as i32,
+                    res.stream.cu_stream() as *mut _,
                 )
             };
             assert_eq!(rc, 0, "bench dequant rc={rc}");
@@ -301,10 +416,16 @@ fn fi_shadow_dequant_and_prefill_parity() {
         for _ in 0..bench_n {
             let rc = unsafe {
                 owl_kernels::family::flashinfer::owl_fi_dequant_fp8_to_f16(
-                    res.ptr(k8_b.id) as *const _, res.ptr(v8_b.id) as *const _,
-                    res.ptr(k16.id) as *mut _, res.ptr(v16.id) as *mut _,
-                    res.ptr(idx_src.id) as *const i32, nb as i32, HKV as i32, HD as i32,
-                    PAGE as i32, res.stream.cu_stream() as *mut _,
+                    res.ptr(k8_b.id) as *const _,
+                    res.ptr(v8_b.id) as *const _,
+                    res.ptr(k16.id) as *mut _,
+                    res.ptr(v16.id) as *mut _,
+                    res.ptr(idx_src.id) as *const i32,
+                    nb as i32,
+                    HKV as i32,
+                    HD as i32,
+                    PAGE as i32,
+                    res.stream.cu_stream() as *mut _,
                 )
             };
             assert_eq!(rc, 0, "bench dequant-only rc={rc}");
@@ -329,9 +450,14 @@ fn fi_shadow_dequant_and_prefill_parity() {
             let mut rd = 0f32;
             let mut hh = 0usize;
             for (i, (x, y)) in a.iter().zip(&b).enumerate() {
-                if i / (H * HD) != s { continue; }
+                if i / (H * HD) != s {
+                    continue;
+                }
                 let d = (f16_to_f32(*x) - f16_to_f32(*y)).abs();
-                if d > rd { rd = d; hh = (i % (H * HD)) / HD; }
+                if d > rd {
+                    rd = d;
+                    hh = (i % (H * HD)) / HD;
+                }
             }
             println!("[shadow] row {s}: maxΔ={rd:e} head={hh}");
         }
@@ -349,10 +475,22 @@ fn fi_shadow_dequant_and_prefill_parity() {
     let vd_b = res.upload(&vd.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
     let outd = res.zeros(out_pad * H * HD * 2);
     let msgd = prefill_msg(
-        owl_kernels::client::flashinfer::PREFILL_FI, t, ctx, Dtype::F16,
-        q_b.id, kd_b.id, vd_b.id, q_cu.id, idx_src.id, indptr.id, last_len.id, wr.id, outd.id,
+        owl_kernels::client::flashinfer::PREFILL_FI,
+        t,
+        ctx,
+        Dtype::F16,
+        q_b.id,
+        kd_b.id,
+        vd_b.id,
+        q_cu.id,
+        idx_src.id,
+        indptr.id,
+        last_len.id,
+        wr.id,
+        outd.id,
     );
-    reg.execute(&msgd, &mut res, &mut exec).expect("f16 direct FI");
+    reg.execute(&msgd, &mut res, &mut exec)
+        .expect("f16 direct FI");
     res.stream.synchronize().expect("sync");
     let d = res.take_u16(outd.id);
     let mut maxd2 = 0f32;
@@ -363,26 +501,54 @@ fn fi_shadow_dequant_and_prefill_parity() {
     let st_direct = diff_stats("fp8-vs-f16(direct)", &a[..t * H * HD], &d[..t * H * HD]);
     if owl_shared::env_reader::flag("FI_SHADOW_HOST") && t * ctx <= 2048 {
         let href = host_ref(t, ctx, &q16, &k8, &v8);
-        let d8 = a.iter().take(t * H * HD).zip(&href)
-            .map(|(x, y)| (f16_to_f32(*x) - *y).abs()).fold(0f32, f32::max);
-        let d16 = b.iter().take(t * H * HD).zip(&href)
-            .map(|(x, y)| (f16_to_f32(*x) - *y).abs()).fold(0f32, f32::max);
+        let d8 = a
+            .iter()
+            .take(t * H * HD)
+            .zip(&href)
+            .map(|(x, y)| (f16_to_f32(*x) - *y).abs())
+            .fold(0f32, f32::max);
+        let d16 = b
+            .iter()
+            .take(t * H * HD)
+            .zip(&href)
+            .map(|(x, y)| (f16_to_f32(*x) - *y).abs())
+            .fold(0f32, f32::max);
         println!("[shadow] vs host(f32): fp8={d8:e} f16={d16:e}");
-        let h16: Vec<u16> = href.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect();
+        let h16: Vec<u16> = href
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
         let st_h8 = diff_stats("fp8-vs-host16", &a[..t * H * HD], &h16);
         let st_h16 = diff_stats("f16-vs-host16", &b[..t * H * HD], &h16);
-        assert!(st_h8.rel_l2 < 5e-4 && st_h16.rel_l2 < 5e-4, "host rel_l2 超门");
+        assert!(
+            st_h8.rel_l2 < 5e-4 && st_h16.rel_l2 < 5e-4,
+            "host rel_l2 超门"
+        );
     }
     if owl_shared::env_reader::flag("FI_SHADOW_DUMP") {
         let dump = |name: &str, bytes: &[u8]| {
             std::fs::write(format!("/tmp/owl-fi-{name}.bin"), bytes).expect("dump");
         };
-        dump("q16", &q16.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        dump(
+            "q16",
+            &q16.iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         dump("k8", &k8);
         dump("v8", &v8);
-        dump("out8", &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
-        dump("out16", &b.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
-        dump("outd", &d.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+        dump(
+            "out8",
+            &a.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        dump(
+            "out16",
+            &b.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+        );
+        dump(
+            "outd",
+            &d.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+        );
         println!("[shadow] dumped q16/k8/v8/out8/out16/outd T={t} ctx={ctx} H={H} HKV={HKV} HD={HD} PAGE={PAGE}");
     }
     if !bench {
@@ -393,7 +559,9 @@ fn fi_shadow_dequant_and_prefill_parity() {
             assert!(
                 st.rel_l2 < 2e-3 && st.rel_max < 3e-2,
                 "{name} 相对门超限:rel_l2={:.3e} rel_max={:.3e} max|d|={:.6e}",
-                st.rel_l2, st.rel_max, st.maxd
+                st.rel_l2,
+                st.rel_max,
+                st.maxd
             );
         };
         gate("shadow", &st_shadow);

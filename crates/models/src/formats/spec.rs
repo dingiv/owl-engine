@@ -47,9 +47,13 @@ impl ModelSpec {
     ///
     /// 终点侧(`Loadable::layout`)要什么形状由模型文件声明;本函数只负责
     /// **起点实测**,两者不符由装载器响亮拒(缺键/形状错归因)。
-    pub fn from_ckpt(dir: &Path, src: SpecSource<'_>) -> Result<(ModelSpec, SpecReport), ModelError> {
-        let cfg = owl_shared::file_loader::read(&dir.join("config.json"))
-            .map_err(|e| ModelError::Msg(format!("from_ckpt: 读 {}/config.json: {e}", dir.display())))?;
+    pub fn from_ckpt(
+        dir: &Path,
+        src: SpecSource<'_>,
+    ) -> Result<(ModelSpec, SpecReport), ModelError> {
+        let cfg = owl_shared::file_loader::read(dir.join("config.json")).map_err(|e| {
+            ModelError::Msg(format!("from_ckpt: 读 {}/config.json: {e}", dir.display()))
+        })?;
         let v: serde_json::Value = serde_json::from_slice(&cfg)
             .map_err(|e| ModelError::Msg(format!("from_ckpt: config.json 解析: {e}")))?;
         let text = v.get("text_config").unwrap_or(&v);
@@ -238,7 +242,7 @@ mod tests {
         assert_eq!(got.inter, want.inter, "[{tag}] inter");
         assert_eq!(got.full_heads, want.full_heads, "[{tag}] full_heads");
         assert_eq!(got.gdn_heads, want.gdn_heads, "[{tag}] gdn_heads");
-        assert_eq!((got.eps - want.eps).abs() < 1e-9, true, "[{tag}] eps");
+        assert!((got.eps - want.eps).abs() < 1e-9, "[{tag}] eps");
         assert_eq!(got.layer_types, want.layer_types, "[{tag}] layer_types");
         assert_eq!(got.tied, want.tied, "[{tag}] tied");
     }
@@ -320,7 +324,7 @@ mod tests {
             owl_shared::testkit::report::skip("4B-VL 检查点不在");
             return;
         };
-        let raw = owl_shared::file_loader::read(&d.join("config.json")).expect("config.json");
+        let raw = owl_shared::file_loader::read(d.join("config.json")).expect("config.json");
         let cfg = crate::vlm::VlmCfg::from_json(&raw).expect("VlmCfg::from_json");
         let (got, rep) = ModelSpec::from_ckpt(&d, SpecSource {
             dtype: cfg.text_spec.dtype,

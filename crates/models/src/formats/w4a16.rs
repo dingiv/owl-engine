@@ -79,6 +79,9 @@ impl W4A16Source {
     /// 装载入口:mmap + 索引(毫秒级,零数据拷贝);重排/反量化全部
     /// 懒到键首触。**无缓存文件**(v1 烘焙缓存随 v1 形态一并废除)。
     /// **可重算缓存**取用口(2026-10-17 审查 §④ 档①:中毒就地取回 + 清空 + 告警)。
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     fn cache_guard(&self) -> std::sync::MutexGuard<'_, (HashMap<String, Arc<[u8]>>, usize)> {
         match self.cache.lock() {
             Ok(g) => g,
@@ -97,6 +100,9 @@ impl W4A16Source {
     }
 
     /// 索引缓存(可重算)取用口;语义同上。
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     fn idx_guard(&self) -> std::sync::MutexGuard<'_, HashMap<(usize, usize), Arc<Vec<u32>>>> {
         match self.idx_cache.lock() {
             Ok(g) => g,
@@ -202,9 +208,8 @@ impl W4A16Source {
         let segs = merged.len();
         let maps = self.maps.clone();
         let t0 = std::time::Instant::now();
-        let flows = segs.min(2).max(1);
-        let mut buckets: Vec<Vec<(usize, usize, usize)>> =
-            (0..flows).map(|_| Vec::new()).collect();
+        let flows = segs.clamp(1, 2);
+        let mut buckets: Vec<Vec<(usize, usize, usize)>> = (0..flows).map(|_| Vec::new()).collect();
         for (i, r) in merged.into_iter().enumerate() {
             buckets[i % flows].push(r);
         }
@@ -351,8 +356,7 @@ impl W4A16Source {
         Ok(None)
     }
 
-    /// fc 列块物化(E5-DF3.5):fc.weight_packed [5120, 3200] I32 列子阵
-    /// + fc.weight_scale [5120, 200] F16 列子阵 → (out=5120, k=5120) 走
+    /// fc 列块物化(E5-DF3.5):fc.weight_packed [5120, 3200] I32 列子阵 + fc.weight_scale [5120, 200] F16 列子阵 → (out=5120, k=5120) 走
     ///   与 build_linear 同式的 marlin 重排(qweight U32 / scales F16)。
     ///   列块恒 eligible(n=5120 % 256 == 0,k=5120 % 128 == 0)。
     ///   fc 列块**原始 ct packed** 字节(设备重排核的输入;不做 marlin 重排)
@@ -670,7 +674,7 @@ impl W4A16Source {
     }
 }
 
-/// `len × esz` 的检查乘法(溢出/越界 ⇒ None,调用方收割为缺键)
+// `len × esz` 的检查乘法(溢出/越界 ⇒ None,调用方收割为缺键)。
 
 enum KeyData {
     Owned(Vec<u8>),

@@ -1061,7 +1061,7 @@ impl LedgerBook {
         let mut ids: Vec<u64> = Vec::new();
         for ((rk, _, _), v) in self.pool.iter_mut() {
             if rank.is_none_or(|r| *rk == r) {
-                ids.extend(v.drain(..));
+                ids.append(v);
             }
         }
         self.pool.retain(|_, v| !v.is_empty());
@@ -1072,6 +1072,8 @@ impl LedgerBook {
     }
 
     /// **按类明细**(P2-3;报告面):`(kind, entries, bytes)`,字节降序。
+    // 结构性豁免(2026-11-02 clippy 清理):排序键是复合比较(多字段/方向混合),抽 key 会丢掉可读性
+    #[allow(clippy::unnecessary_sort_by)]
     pub fn pool_by_class(&self) -> Vec<(AssetKind, usize, usize)> {
         let mut agg: BTreeMap<AssetKind, (usize, usize)> = BTreeMap::new();
         for ((_, kind, bytes), v) in &self.pool {

@@ -917,7 +917,7 @@ impl WeightSource for TableSource<'_> {
 /// 层内短键 → checkpoint 全键的改写规则。Model 在 `layout()` 期经
 /// `LoaderOps::map_keys` 应用约定(声明期改写,Want 清单里已是最终键),
 /// 解释器零约定感知:
-/// - [`LlamaFamily`]:HF/Llama 系默认(`{base}.embed_tokens.weight` /
+/// - `LlamaFamily`:HF/Llama 系默认(`{base}.embed_tokens.weight` /
 ///   `{base}.layers.{i}.{local}.weight` / `{base}.{local}.weight`);
 /// - 模型特有约定住 `specs/<model>.rs`(拆分律 §四 23),如 Qwen3.5
 ///   的 `linear_attn.`/`self_attn.` 子前缀与 `A_log`/`dt_bias` 裸键。
@@ -1068,7 +1068,7 @@ pub struct Sink(SlotCell);
 
 /// **host 标量回填口**(一源**一个**标量;2026-10-28 NVFP4 的权重全局缩放 `gb`)。
 ///
-/// 为什么另开一个口而不复用 [`Sink`]:Sink 交付的是**设备块**(`Bytes` 句柄),
+/// 为什么另开一个口而不复用 `Sink`:Sink 交付的是**设备块**(`Bytes` 句柄),
 /// 装载面按它记 manifest / 做回读校验;而 `gb` 是 4 字节**主机常量**,
 /// 发射时直接作为 kernel 标量参数(`arg_f32`),不上卡、不进 manifest。
 /// 两个东西的生命周期与校验面都不同,合成一个类型只会让两者互相污染。
@@ -1353,8 +1353,7 @@ pub enum QuantPlan {
 ///
 /// 为什么需要:量化型在 GGUF 里是**逐张量**事实 —— `Qwen3.8-27B-Q4_K_M`
 /// 同一模型混存 Q4_K(193 张)/Q8_0(288)/Q6_K(17)/F32(353),
-/// `Holo-3.1-9B-Q5_K_M` 更是**同一角色跨层不同型**(`attn_qkv` Q5_K 12 层
-/// + Q6_K 12 层)⇒ 单一 [`QuantPlan`] 值表达不了。
+/// `Holo-3.1-9B-Q5_K_M` 更是**同一角色跨层不同型**(`attn_qkv` Q5_K 12 层 + Q6_K 12 层)⇒ 单一 [`QuantPlan`] 值表达不了。
 ///
 /// 纪律**不变**:计划仍在**构造期**定形(禁 `enable_*` 可变后置范式)——
 /// 变的只是定形依据,从"全局一个值"变成"检查点全键 → 型"的表。
@@ -1393,8 +1392,7 @@ pub struct SourceFacts {
     /// 产出 grouped 序 ⇒ 消费者必须先在**激活侧**做等价置换
     /// (置换跨量化块 ⇒ 权重字节不可逆;设计 §11.4)。
     ///
-    /// 消费者 = GDN 层:声明 `ssm_out_perm` 虚拟键(源生成 32 元素块序表)
-    /// + `out_proj` 前插一发 `owl_gguf_col_gather`。
+    /// 消费者 = GDN 层:声明 `ssm_out_perm` 虚拟键(源生成 32 元素块序表) + `out_proj` 前插一发 `owl_gguf_col_gather`。
     pub vhead_tiled_columns: bool,
 }
 
@@ -1428,8 +1426,8 @@ impl SourceFacts {
 
 /// **计划来源**(构造期注入;值语义 `Copy`)—— 一切 plan 与源事实的唯一入口。
 ///
-/// - [`PlanKind::Uniform`]:全模型统一计划(既有一切档位;零开销臂);
-/// - [`PlanKind::Keyed`]:逐键查表(混型源,如 GGUF)。
+/// - `PlanKind::Uniform`:全模型统一计划(既有一切档位;零开销臂);
+/// - `PlanKind::Keyed`:逐键查表(混型源,如 GGUF)。
 ///
 /// `QuantPlan` 经 `From` 直落 Uniform 臂 ⇒ 既有调用点写字面量即可 ——
 /// **单接口,非旁路**:Uniform 本身就是一种 [`PlanSource`]。

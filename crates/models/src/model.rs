@@ -1,5 +1,4 @@
-//! 通用解码器主干(批8,2026-09-26 拆分):embed + N×DecoderLayer
-//! + final norm + tied lm_head —— **所有模型共有**的机制,凡本主干
+//! 通用解码器主干(批8,2026-09-26 拆分):embed + N×DecoderLayer + final norm + tied lm_head —— **所有模型共有**的机制,凡本主干
 //!   词汇表内(Full|Gdn 双 mixer)的 hybrid / dense 解码器共用。
 //!   旧世界 `Qwen3_5ForCausalLM`(engine/src/models/qwen3_5.rs)的
 //!   声明式重铸 —— 砍掉的是命令式缓存管理/MTP/DFlash 支线,留下的是
@@ -1199,6 +1198,8 @@ mod tests {
     /// GDN 行(`gdn.slots[]`)。串行臂/合批臂各用**一套独立缓冲**(同零初态 +
     /// 相同 prefill),判据 = logits 逐位/近位相同 + 第二步(状态续跑)仍相同。
     /// 分页 v2 seq 臂(不同 bt 行)由 verify T=8 已证同核,引擎接入另测。
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     async fn model_step(
         gpu: &mut owl_cuda::GpuClient,
         model: &Model,
@@ -1234,12 +1235,15 @@ mod tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![t], &f32b(gslots)),
             })
             .collect();
-        let ctx = ForwardCtx::model_decode(t, &pos_t, &kvs_step, &rp, &gdns_step);
+        let ctx = ForwardCtx::model_decode(t, &pos_t, &kvs_step, rp, &gdns_step);
         let logits = model.forward(&ids, &ctx);
         crate::testkit::harvest(gpu, &logits).await
     }
 
     #[tokio::test]
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     async fn gpu_model_batch_decode_matches_serial() {
         if !gpu_enabled() {
             skip_note();
@@ -1305,6 +1309,8 @@ mod tests {
     /// 分段)与逐会话串行 prefill **logits 同级**。这是 spec 回合合批
     /// (verify 8 行 × B 会话)的模型语义底:GDN 走 varlen 的 `slots[seq_idx]`,
     /// 注意力走逐行 `kv_slots/kv_lens`。
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     async fn model_prefill_step(
         gpu: &mut owl_cuda::GpuClient,
         model: &Model,
@@ -1346,7 +1352,7 @@ mod tests {
             })
             .collect();
         let mut ctx = ForwardCtx::model_prefill(
-            t, &pos_t, &kvs_step, &rp, &gdns_step, &slots_t, &lens_t, &gslot_t, None, 0, None,
+            t, &pos_t, &kvs_step, rp, &gdns_step, &slots_t, &lens_t, &gslot_t, None, 0, None,
         );
         ctx.seq_cu = Some(&cu);
         let logits = model.forward(&ids, &ctx);

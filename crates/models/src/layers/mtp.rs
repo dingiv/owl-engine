@@ -73,6 +73,8 @@ impl MtpPredictor {
     ///   = fp8 池下多 ~16k 上下文,且草稿 GEMM 不再解量化。
     ///
     /// norm 用 GGUF 源事实(`w_off = false`:文件里的 gamma 已烘焙 +1)。
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     pub fn new_gguf(
         hidden: usize,
         inter: usize,

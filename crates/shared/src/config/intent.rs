@@ -444,7 +444,7 @@ pub fn model_profile(key: &str) -> Result<&'static ModelProfile, String> {
     let k = key.trim();
     MODELS
         .iter()
-        .find(|p| p.key == k || p.aliases.iter().any(|a| *a == k))
+        .find(|p| p.key == k || p.aliases.contains(&k))
         .ok_or_else(|| {
             format!(
                 "[intent].model = {k:?} 未登记(可用:{:?})",
@@ -499,7 +499,7 @@ pub fn hardware_profile(key: &str) -> Result<&'static HardwareProfile, String> {
     let k = key.trim();
     HARDWARE
         .iter()
-        .find(|p| p.key == k || p.aliases.iter().any(|a| *a == k))
+        .find(|p| p.key == k || p.aliases.contains(&k))
         .ok_or_else(|| {
             format!(
                 "[intent].hardware = {k:?} 未登记(可用:{:?})",

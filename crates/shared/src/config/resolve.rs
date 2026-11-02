@@ -355,7 +355,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     overcommit = get_bool(&out, "kvmem.pool_overcommit").unwrap_or(overcommit);
 
     // ── ⑥ context 求解(显式 max_seq 优先;池不含在配置里) ──
-    let estimate;
+
     let (act, act_note) = memory::activation_for(
         get_usize(&out, "runtime.prefill_chunk").unwrap_or(512),
         get_usize(&out, "runtime.prefill_tail_merge").unwrap_or(0),
@@ -447,7 +447,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     }
     let est = memory::estimate(&inp, ctx, pool, !overcommit)?;
     warnings.extend(est.notes.iter().cloned());
-    estimate = Some(est);
+    let estimate = Some(est);
 
     *value = out;
     Ok(Some(ResolveMeta {
@@ -692,7 +692,7 @@ mode = "greedy"
         assert_eq!(c.pool.snap_host_mb, 0, "reuse=off ⇒ 快照宿主层关");
         assert!(!c.pool.prefix_cache, "reuse=off ⇒ 前缀缓存关");
         assert_eq!(c.pool.gdn_slots, 1);
-        assert_eq!(c.pool.kv_fp8, true, "kv=fp8");
+        assert!(c.pool.kv_fp8, "kv=fp8");
         assert_eq!(c.pool.vram_target, 0.99);
         assert_eq!(c.pool.vram_reserve_mb, 256);
 

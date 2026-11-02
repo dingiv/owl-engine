@@ -59,8 +59,8 @@ fn gguf_prefers_mmvq_small_n(ty: GgmlTy, m: usize, n: usize, k: usize, l2_mib: u
 /// (`ggml_cuda_should_use_mmq` 的 NVIDIA 条件)⇒ 本仓同门槛。
 pub(crate) const GGUF_CUBLAS_MIN_M: usize = 64;
 
-/// dequant+cuBLAS 臂开关(`[dispatch] gguf_cublas`;缺省开)。
-/// 原 `OWL_GGUF_CUBLAS` env(2026-10-21 收编⇒`env.gguf.cublas`)。
+// dequant+cuBLAS 臂开关(`[dispatch] gguf_cublas`;缺省开)。
+// 原 `OWL_GGUF_CUBLAS` env(2026-10-21 收编⇒`env.gguf.cublas`)。
 
 /// **head 版 int8-MMA MMQ 的最小 token 数**(W-2f;2026-10-21 重定)。
 ///
@@ -70,8 +70,8 @@ pub(crate) const GGUF_CUBLAS_MIN_M: usize = 64;
 /// 详见 `family::gguf::MMQ2_SMALL_M` 的实测表。decode(m=1)不变。
 pub(crate) const GGUF_MMQ2_MIN_M: usize = owl_kernels::family::gguf::MMQ2_SMALL_M;
 
-/// int8-MMA MMQ 开关(`[dispatch] gguf_mmq2`;缺省开)。
-/// 原 `OWL_GGUF_MMQ2` env(2026-10-21 收编⇒`env.gguf.mmq2`)。
+// int8-MMA MMQ 开关(`[dispatch] gguf_mmq2`;缺省开)。
+// 原 `OWL_GGUF_MMQ2` env(2026-10-21 收编⇒`env.gguf.mmq2`)。
 
 /// **官方 MMQ 的最小 token 数**(W-2c)。
 ///
@@ -80,8 +80,8 @@ pub(crate) const GGUF_MMQ2_MIN_M: usize = owl_kernels::family::gguf::MMQ2_SMALL_
 /// CTA、每 CTA 打满 4 token —— 再小就退化成"小批走大 tile",不如 MMVQ。
 pub(crate) const GGUF_MMQ_MIN_M: usize = 32;
 
-/// MMQ 臂开关(`[dispatch] gguf_mmq`;缺省开)。
-/// 原 `OWL_GGUF_MMQ` env(2026-10-21 收编⇒`env.gguf.mmq`)。
+// MMQ 臂开关(`[dispatch] gguf_mmq`;缺省开)。
+// 原 `OWL_GGUF_MMQ` env(2026-10-21 收编⇒`env.gguf.mmq`)。
 
 /// **smem 复用臂的最小 token 数**(W-2b)。窗 = `MT = 64`,故 `m ≥ 64` 才吃满;
 /// 8..63 仍是 vec_dot 复用臂(1.65×),decode/verify 仍 MMVQ。
@@ -92,7 +92,6 @@ pub(crate) const GGUF_SMEM_MIN_M: usize = 64;
 ///
 /// ⚠️ 两臂**不位级相同**(smem 臂喂原始 f16 激活,MMVQ/复用臂喂 q8_1)⇒
 /// 切换只影响数值末位;门 = `kernel_gate::gpu_gguf_smem_gemm_matches_mmvq`。
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gguf_quant_gemm(
     w: &Weight,
@@ -245,7 +244,7 @@ pub(crate) fn gguf_quant_gemm(
     // 2. `k % 32 == 0`(q8_1 块轴;GGUF 计划面已保证);
     // 3. 列序表已在上面 gather 掉(MMQ 不做 tiled 置换)。
     if m >= GGUF_MMQ_MIN_M
-        && k % 32 == 0
+        && k.is_multiple_of(32)
         && col_index.is_none()
         && arms.mmq
         && owl_kernels::family::gguf::mmq_entry_for(ty).is_some()
@@ -287,7 +286,7 @@ pub(crate) fn gguf_quant_gemm(
     // 3. **无内维列序表**(A2 表是单卡 `ssm_out` 的 tiled 列序;本臂的 x 暂存
     //    不做置换 ⇒ 有表就回退,别静默算错)。
     if m >= GGUF_SMEM_MIN_M
-        && k % owl_kernels::family::gguf::SMEM_KC == 0
+        && k.is_multiple_of(owl_kernels::family::gguf::SMEM_KC)
         && xs.dtype == Dtype::F16
         && col_index.is_none()
         && arms.smem
@@ -306,7 +305,7 @@ pub(crate) fn gguf_quant_gemm(
             .aux(&[ty.code() as usize, m, out_dim])
             .with_shape(Dtype::F16, vec![m, out_dim]);
     }
-    if k % 32 != 0 {
+    if !k.is_multiple_of(32) {
         return TensorOps::poisoned(
             Dtype::F16,
             vec![m, out_dim],
@@ -544,7 +543,7 @@ impl Linear {
     fn shape_gguf(&mut self, ty: crate::formats::gguf::GgmlTy) {
         let (be, bb) = ty.block();
         assert!(
-            self.in_dim % be == 0,
+            self.in_dim.is_multiple_of(be),
             "GGUF {}: 最内维 {} 不是块大小 {} 的整数倍(块布局无定义)",
             ty.name(),
             self.in_dim,
@@ -566,7 +565,7 @@ impl Linear {
     /// - `in % 16 == 0`(每 16 个 k 一个缩放)
     /// - `out % 128 == 0`(SF 行按 128 pad;`out % 8 == 0` 是 epilogue 向量化前提)
     fn quantize_nvfp4(&mut self) {
-        if self.in_dim % 16 != 0 || self.out_dim % 128 != 0 {
+        if !self.in_dim.is_multiple_of(16) || !self.out_dim.is_multiple_of(128) {
             // **不静默**:回落到 f16 是这个档位允许的(小头/异形层),但“哪些层没走`
             // fp4”必须可查 —— 否则“算得慢/显存没降”只能靠反推。首次一条 info
             // (说明总体事实),逐层 debug(排查时开 level=debug 看全量)。

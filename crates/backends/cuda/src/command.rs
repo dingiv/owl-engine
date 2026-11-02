@@ -306,8 +306,7 @@ pub enum Command {
     BlockLedgerDump {
         ack: Ack<Result<Vec<owl_iface::contract::BlockLedgerRow>, ModelError>>,
     },
-    /// **UploadAndLaunch**(E2 复合;闭集 1:1,设计 §3.2):一次 pinned 搬运
-    /// + 一次发射。**客户端不出现流/事件/槽** —— 序由 server 内部保证
+    /// **UploadAndLaunch**(E2 复合;闭集 1:1,设计 §3.2):一次 pinned 搬运 + 一次发射。**客户端不出现流/事件/槽** —— 序由 server 内部保证
     /// (E2a:线格式/校验/负门;**E2b 接线** = 完成回调链 → 设备端事件序)。
     /// 失败带**结构化阶段**(transfer / launch)。
     UploadAndLaunch {

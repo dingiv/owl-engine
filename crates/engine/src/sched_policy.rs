@@ -730,7 +730,8 @@ mod tests {
         // 退化输入不许产生 0(0 余量 = 命中面可以吃光池)
         assert_eq!(reclaim_margin(0), 1 + RECLAIM_SAFETY_PAGES);
         // 安全边必须远小于工作集档 —— 否则又回到"白砍密集区间"的老路
-        assert!(RECLAIM_SAFETY_PAGES <= 16);
+        // (常量关系 ⇒ 编译期判,不进运行期)
+        const _: () = assert!(RECLAIM_SAFETY_PAGES <= 16);
     }
 
     /// 懒回灌的待回灌下标判据:必须**两侧都夹**——
@@ -1116,10 +1117,7 @@ mod scenario_tests {
         pub(super) fn step(&mut self) -> bool {
             self.now += 1;
             // ① 准入
-            loop {
-                let Some(head) = self.queued.first().copied() else {
-                    break;
-                };
+            while let Some(head) = self.queued.first().copied() {
                 let s = self.store();
                 match self.adm.decide(&self.l, &s, &self.actives, &head, self.now) {
                     Verdict::Admit => {
@@ -1307,7 +1305,7 @@ mod scenario_tests {
         let steps = sim.run_until_idle(4000);
         assert_eq!(sim.finished.len(), 2, "两人都应完成（{steps} 拍）");
         assert!(
-            sim.kinds.iter().any(|k| *k == Kind::BatchDecode),
+            sim.kinds.contains(&Kind::BatchDecode),
             "同时到达应出现批 decode（kinds={:?}）",
             sim.kinds
                 .iter()
@@ -1753,10 +1751,7 @@ mod edge_tests {
         }
         let _ = sim.run_until_idle(5000);
         assert_eq!(sim.finished.len(), 3, "三人都应完成");
-        assert!(
-            sim.kinds.iter().any(|k| *k == Kind::BatchDecode),
-            "应出现批 decode"
-        );
+        assert!(sim.kinds.contains(&Kind::BatchDecode), "应出现批 decode");
         assert!(sim.rejected.is_empty());
     }
 }

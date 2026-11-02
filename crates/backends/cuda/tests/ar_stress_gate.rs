@@ -624,6 +624,8 @@ async fn push_graph_overlap_probe() {
         .expect("B htod");
 
     // 一臂:捕一张图 + 回放 k 次 ⇒ ms/回放
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     async fn arm(
         a: &mut GpuClient,
         payload_a: &Bytes,
@@ -680,8 +682,7 @@ async fn push_graph_overlap_probe() {
 
     /// ★ **生产 push 绑定的写链**(2026-10-18 §41 收尾):`own = 本端 staging`(header 留本端)、
     /// `peer = 对端别名`、`data = 对端别名`(写对端)——
-    /// 与前面"单边自洽"(把 header 也搬到对端)**不同**:后者核入口的三次校验读 + credit 读
-    /// + `atomicAdd(blocks_done)` **全变远端**,实测把写链从 13.1GB/s 拖到 **6.4GB/s**
+    /// 与前面"单边自洽"(把 header 也搬到对端)**不同**:后者核入口的三次校验读 + credit 读 + `atomicAdd(blocks_done)` **全变远端**,实测把写链从 13.1GB/s 拖到 **6.4GB/s**
     /// (§37 教训的现场重演)。对端 header 用 HUGE 顶满 ⇒ 单边可跑。
     #[allow(clippy::too_many_arguments)]
     async fn arm5(

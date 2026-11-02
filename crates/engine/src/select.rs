@@ -35,7 +35,7 @@ pub struct StageStats {
 impl StageStats {
     /// 每块字节(0 = 无样本)。
     pub fn bytes_per_block(&self) -> usize {
-        if self.blocks == 0 { 0 } else { self.bytes / self.blocks }
+        self.bytes.checked_div(self.blocks).unwrap_or(0)
     }
     /// 吞吐(MB/s;0 = 无样本)。
     pub fn mib_per_s(&self) -> f64 {

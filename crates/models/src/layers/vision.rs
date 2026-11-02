@@ -170,6 +170,8 @@ pub struct VisionTables {
 impl VisionTables {
     /// 由 `grid_thw` 算出全部表(HF `get_vision_interpolation_indices_and_weights`
     /// / `get_vision_position_ids` / rope 三处逐式复刻;见设计文档 §1.2 #3/#4)。
+    // 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+    #[allow(clippy::needless_range_loop)]
     pub fn build(grid: &[GridThw], cfg: VisionCfg) -> Result<VisionTables, ModelError> {
         if grid.is_empty() {
             return Err(ModelError::Msg("VisionTables::build: grid_thw 为空".into()));
@@ -637,11 +639,11 @@ impl Loadable for VisionTower {
 
 #[cfg(test)]
 mod tests {
-    use owl_macros::owl_test;
     use super::*;
     use crate::contract::DeviceClient;
     use crate::testkit::{assert_close, f32_of, st_read, Src};
-    use std::path::PathBuf;
+    use owl_macros::owl_test;
+    use std::path::{Path, PathBuf};
 
     fn golden_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
@@ -657,7 +659,7 @@ mod tests {
     }
 
     /// 金标里的网格(工具已存 f32)
-    fn golden_grid(g: &PathBuf) -> Vec<GridThw> {
+    fn golden_grid(g: &Path) -> Vec<GridThw> {
         let raw = st_read(g, "in.grid_thw");
         let mut out = vec![GridThw::default()];
         out[0] = (raw[0] as usize, raw[1] as usize, raw[2] as usize);
@@ -712,7 +714,7 @@ mod tests {
                 out.insert(name.to_string(), v);
             }
         }
-        let cfg_text = owl_shared::file_loader::read(&dir.join("config.json"))
+        let cfg_text = owl_shared::file_loader::read(dir.join("config.json"))
             .expect("config.json 读入(视觉塔超参唯一来源)");
         let cfg = VisionCfg::from_json(&cfg_text).expect("vision_config 解析");
         (out, cfg)
@@ -774,7 +776,7 @@ mod tests {
         }
     }
 
-    fn tables_match_golden(g: &PathBuf, cfg: VisionCfg, grid: &[GridThw]) {
+    fn tables_match_golden(g: &Path, cfg: VisionCfg, grid: &[GridThw]) {
         let tb = VisionTables::build(grid, cfg).expect("build tables");
         let want_idx = st_read(g, "g.interp_indices");
         let want_wts = st_read(g, "g.interp_weights");
@@ -980,12 +982,10 @@ mod tests {
         }
         gpu.sync().await.expect("sync");
         eprintln!(
-            "[vis-bench] 仅 attn_full(rows={} × {} 头 × hd{};{};{},非因果)⇒ **{:.1} ms/层**",
+            "[vis-bench] 仅 attn_full(rows={} × {} 头 × hd{};FlashInfer ragged(FA2 家族);单图,非因果)⇒ **{:.1} ms/层**",
             tb.rows,
             cfg.heads,
             cfg.head_dim(),
-            "FlashInfer ragged(FA2 家族)",
-            "单图",
             t0.elapsed().as_secs_f64() * 1e2
         );
         gpu.close().await.expect("关机");
@@ -999,7 +999,7 @@ mod tests {
     }
 
     /// 图筛选(env `OWL_VIS_IMAGE=dog` 只跑指定图;缺省全图)
-    fn real_tags(g: &PathBuf) -> Vec<String> {
+    fn real_tags(g: &Path) -> Vec<String> {
         let all = real_tags_all(g);
         match std::env::var("OWL_VIS_IMAGE") {
             Ok(pick) => all.into_iter().filter(|t| pick.split(',').any(|p| p == t)).collect(),
@@ -1007,7 +1007,7 @@ mod tests {
         }
     }
 
-    fn real_tags_all(g: &PathBuf) -> Vec<String> {
+    fn real_tags_all(g: &Path) -> Vec<String> {
         let buf = owl_shared::file_loader::read(g).expect("真图金标读入");
         let st = safetensors::SafeTensors::deserialize(&buf).expect("safetensors 解析");
         let mut tags: Vec<String> = st
@@ -1156,7 +1156,7 @@ mod tests {
         }
     }
 
-    async fn tower_matches_golden(g: &PathBuf, cfg: VisionCfg) {
+    async fn tower_matches_golden(g: &Path, cfg: VisionCfg) {
         let grid = golden_grid(g);
         let tb = VisionTables::build(&grid, cfg).expect("build tables");
         let px = st_read(g, "in.pixel_values");

@@ -106,8 +106,7 @@ impl TpStaging {
 }
 
 /// staging header(64B)字节(**布局权威 = `owl_cuda::comm::ar::hdr` 常量**;与 cuda 门
-/// `write_hdr` 同法):`produced`/`consumed` 归零 + 自描述 `slot_bytes`/`n_slots`
-/// + `magic`(核的串块/未初始化校验门)。
+/// `write_hdr` 同法):`produced`/`consumed` 归零 + 自描述 `slot_bytes`/`n_slots` + `magic`(核的串块/未初始化校验门)。
 fn staging_header_bytes(layout: StagingLayout) -> Vec<u8> {
     let mut b = vec![0u8; owl_cuda::comm::ar::HEADER_BYTES as usize];
     b[16..20].copy_from_slice(&(layout.slot_bytes as u32).to_le_bytes());
@@ -281,7 +280,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         let (rm0, tok0) = l0.into_parts();
         let (rm1, tok1) = l1.into_parts();
         drop(tok1); // host 侧 tokenizer 唯一(rank1 的直接放)
-        let tokenizer = Some(tok0);
+        let tokenizer = tok0;
         if staging1.slot_bytes() != staging0.slot_bytes() {
             return loud("TP staging 布局两侧不一致(协议对称性前提)")
         }
@@ -348,7 +347,7 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         ];
         Ok(Self {
             ranks,
-            tokenizer: tokenizer.expect("rank0 必在"),
+            tokenizer,
             cfg,
             boot,
             weights_per_card,

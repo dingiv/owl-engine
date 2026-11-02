@@ -36,7 +36,7 @@ pub struct CtRepackA8U32;
 impl KernelSpec for CtRepackA8U32 {
     const ENTRY: &'static str = "owl_ct_repack_a8_u32";
     const SRC: &'static str = "cu/load/marlin_repack_ct_a8.cu";
-    const PARAMS: &'static [Param] = &K0_REPACK_PARAMS;
+    const PARAMS: &'static [Param] = K0_REPACK_PARAMS;
     const LAWS: &'static [Law] = &[Law::OutputFinite];
     const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
     const DETERMINISM: Determinism = Determinism::Deterministic;

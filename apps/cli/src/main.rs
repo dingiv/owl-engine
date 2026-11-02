@@ -39,7 +39,7 @@ mod workload;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::time::{SystemTime, Instant};
+use std::time::{Instant, SystemTime};
 
 use serde_json::{json, Value};
 
@@ -74,10 +74,13 @@ fn parse_args() -> Cfg {
         server_log: None,
         json: false,
         keep: false,
-        session: format!("cli-{}", SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)),
+        session: format!(
+            "cli-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ),
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -160,10 +163,14 @@ fn main() {
             }
             "/new" => {
                 history.clear();
-                session = format!("{0}-{1}", cfg.session, SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0));
+                session = format!(
+                    "{0}-{1}",
+                    cfg.session,
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                );
                 eprintln!("[cli] 已开新会话(session {session})");
                 continue;
             }
@@ -278,7 +285,11 @@ fn chat_stream(host: &str, body: &Value) -> std::io::Result<(String, Option<u64>
         }
     }
     let total = t0.elapsed();
-    let tpot = if ntok > 0 { total.as_millis() / ntok as u128 } else { 0 };
+    let tpot = if ntok > 0 {
+        total.as_millis() / ntok as u128
+    } else {
+        0
+    };
     eprintln!(
         "\n[stat] TTFT {:?} | {} chunks | 总 {:.2}s | {:?}/chunk{}",
         ttft.unwrap_or(total),

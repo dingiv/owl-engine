@@ -23,7 +23,6 @@
 
 pub use owl_iface::signal;
 
-pub mod profiles;
 pub mod config;
 pub mod device;
 pub mod env_reader;
@@ -31,7 +30,8 @@ pub mod file_loader;
 pub mod gpu_lock;
 pub mod log;
 pub mod metrics;
-pub mod stepgate;
+pub mod profiles;
 pub mod slab_hint;
-pub mod vram;
+pub mod stepgate;
 pub mod testkit;
+pub mod vram;

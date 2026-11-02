@@ -152,10 +152,12 @@ impl CkptConfig {
 
     /// 读检查点目录的 `config.json`(唯一 I/O 入口;缺失/坏 JSON ⇒ 结构化错误)
     pub fn read(dir: &Path) -> Result<CkptConfig, ModelError> {
-        let raw = owl_shared::file_loader::read(&dir.join("config.json"))
-            .map_err(|e| ModelError::Msg(format!("ckpt config.json 读取({}): {e}", dir.display())))?;
-        let v: serde_json::Value = serde_json::from_slice(&raw)
-            .map_err(|e| ModelError::Msg(format!("ckpt config.json 解析({}): {e}", dir.display())))?;
+        let raw = owl_shared::file_loader::read(dir.join("config.json")).map_err(|e| {
+            ModelError::Msg(format!("ckpt config.json 读取({}): {e}", dir.display()))
+        })?;
+        let v: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
+            ModelError::Msg(format!("ckpt config.json 解析({}): {e}", dir.display()))
+        })?;
         Ok(CkptConfig::from_json(&v))
     }
 

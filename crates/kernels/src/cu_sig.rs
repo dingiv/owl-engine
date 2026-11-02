@@ -144,6 +144,48 @@ pub fn cu_params_of(src: &str, name: &str) -> Option<(String, &'static str)> {
     Some((clean[start..end].to_string(), ""))
 }
 
+// ============================================================================
+// §4 `.cu` 形参**名**解析(名字级互证;2026-10-15 L3 事实面补)
+// ============================================================================
+//
+// 为什么需要它:token 级互证(`parse_cu_sig`)只比 T/sz/i32/f32 的**形状**,
+// 看不见"同形状、不同语义槽位"的漂移 —— 2026-10-15 实测到活体:
+// `owl_qknorm_rope_kv_insert_f16{,_knhd}` 的声明表是**旧签名**
+// (`q, q_raw, kw, beta, cos, sin, k, v, kc, vc, slots, …`),
+// 而 .cu 早已是 `q_raw, k, v, key_cache, value_cache, slots, q_w, k_w, …`
+// —— 两者 token 串**逐字相同**(11×T + f32 + 4×i32 + T),门全绿,
+// 而语义槽位全错位(调用点按新序喂 ⇒ f16 档融合插池读写全错)。
+
+/// **核形参名序列**(名字级互证;与 token 级共用 [`cu_params_of`] 取证口)。
+///
+/// 为什么需要它:token 级只比 T/sz/i32/f32 的**形状**,看不见"同形状、不同
+/// 语义槽位"的漂移 —— 2026-10-15 实测活体 `owl_qknorm_rope_kv_insert_f16{,_knhd}`
+/// (声明旧签名 / .cu 新签名,token 串逐字相同)。
+pub fn parse_cu_param_names(src: &str, name: &str) -> Option<Vec<String>> {
+    let (params, _kind) = cu_params_of(src, name)?;
+    Some(
+        params
+            .split(',')
+            .filter_map(|p| {
+                let p = p
+                    .replace("const ", "")
+                    .replace("__restrict__ ", "")
+                    .replace(['*', '&'], " ");
+                let last = p
+                    .split_whitespace()
+                    .last()?
+                    .trim_matches(|c: char| matches!(c, ')' | '(' | ';' | '{' | '}' | ','))
+                    .to_string();
+                if last.is_empty() {
+                    None
+                } else {
+                    Some(last)
+                }
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,41 +217,3 @@ mod tests {
     }
 
 }
-
-// ============================================================================
-// §4 `.cu` 形参**名**解析(名字级互证;2026-10-15 L3 事实面补)
-// ============================================================================
-//
-// 为什么需要它:token 级互证(`parse_cu_sig`)只比 T/sz/i32/f32 的**形状**,
-// 看不见"同形状、不同语义槽位"的漂移 —— 2026-10-15 实测到活体:
-// `owl_qknorm_rope_kv_insert_f16{,_knhd}` 的声明表是**旧签名**
-// (`q, q_raw, kw, beta, cos, sin, k, v, kc, vc, slots, …`),
-// 而 .cu 早已是 `q_raw, k, v, key_cache, value_cache, slots, q_w, k_w, …`
-// —— 两者 token 串**逐字相同**(11×T + f32 + 4×i32 + T),门全绿,
-// 而语义槽位全错位(调用点按新序喂 ⇒ f16 档融合插池读写全错)。
-
-/// **核形参名序列**(名字级互证;与 token 级共用 [`cu_params_of`] 取证口)。
-///
-/// 为什么需要它:token 级只比 T/sz/i32/f32 的**形状**,看不见"同形状、不同
-/// 语义槽位"的漂移 —— 2026-10-15 实测活体 `owl_qknorm_rope_kv_insert_f16{,_knhd}`
-/// (声明旧签名 / .cu 新签名,token 串逐字相同)。
-pub fn parse_cu_param_names(src: &str, name: &str) -> Option<Vec<String>> {
-    let (params, _kind) = cu_params_of(src, name)?;
-    Some(
-        params
-            .split(',')
-            .filter_map(|p| {
-                let p = p
-                    .replace("const ", "")
-                    .replace("__restrict__ ", "")
-                    .replace('*', " ")
-                    .replace('&', " ");
-                let last = p.split_whitespace().last()?.trim_matches(|c: char| {
-                    matches!(c, ')' | '(' | ';' | '{' | '}' | ',')
-                }).to_string();
-                if last.is_empty() { None } else { Some(last) }
-            })
-            .collect(),
-    )
-}
-

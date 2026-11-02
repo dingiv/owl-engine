@@ -23,6 +23,7 @@ use crate::turn::TurnEvent;
 use owl_macros::owl_test;
 use owl_shared::testkit::{resource, resource_ok};
 
+///
 /// 4B 档的最简引擎配置(单卡 3090 Ti;池只需装下冒烟会话)。
 ///
 /// ⚠️ **两个 knob 是与外部 oracle 对拍的硬前提**:
@@ -30,10 +31,7 @@ use owl_shared::testkit::{resource, resource_ok};
 ///   ChatML)—— 而 llama.cpp 的 `/completion`(裸 prompt) 不做模板
 ///   ⇒ 比的是**两个不同的输入**(2026-10-19 实测:模板态首 token = ` thinking`,
 ///   裸态 = `" Paris"`,两边都"连贯"但根本不是同一道题)。
-/// - `sampler_enabled = false`:贪心(恒等门口径);temp=0 的对手也是 argmax。
-/// **测试侧 GGUF 臂集**(2026-10-21):引擎已零 env —— 本文件把 `OWL_GGUF_*`
-/// 当**用例入参**读一次,显式落到 `EngineKnobs.env.gguf`(语义与原 env 逐字一致:
-/// 未设 = 开,`=0` = 关)。A/B 探针因此仍能在同进程逐臂切换。
+/// - `sampler_enabled = false`:贪心(恒等门口径);temp=0 的对手也是 argmax。 **测试侧 GGUF 臂集**(2026-10-21):引擎已零 env —— 本文件把 `OWL_GGUF_*` 当**用例入参**读一次,显式落到 `EngineKnobs.env.gguf`(语义与原 env 逐字一致: 未设 = 开,`=0` = 关)。A/B 探针因此仍能在同进程逐臂切换。
 fn gguf_arms_from_env() -> owl_models::env::GgufEnv {
     let flag = |k: &str| !matches!(std::env::var(k).ok().as_deref(), Some("0"));
     owl_models::env::GgufEnv {

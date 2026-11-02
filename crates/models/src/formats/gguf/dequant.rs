@@ -73,7 +73,7 @@ pub fn dequant_row(ty: GgmlTy, row: &[u8], out: &mut [f32]) -> Result<(), ModelE
             bb
         )));
     }
-    if out.len() % be != 0 {
+    if !out.len().is_multiple_of(be) {
         return Err(ModelError::Msg(format!(
             "gguf dequant: {} 元素数 {} 不是块大小 {} 的倍数",
             ty.name(),
@@ -177,10 +177,16 @@ pub fn dequant_row(ty: GgmlTy, row: &[u8], out: &mut [f32]) -> Result<(), ModelE
                 while yo < 256 {
                     for l in 0..32 {
                         let is = l / 16;
-                        let q1 = ((ql[qo + l] & 0xF) as i16 | (((qh[qho + l] >> 0) & 3) as i16) << 4) - 32;
-                        let q2 = ((ql[qo + l + 32] & 0xF) as i16 | (((qh[qho + l] >> 2) & 3) as i16) << 4) - 32;
-                        let q3 = ((ql[qo + l] >> 4) as i16 | (((qh[qho + l] >> 4) & 3) as i16) << 4) - 32;
-                        let q4 = ((ql[qo + l + 32] >> 4) as i16 | (((qh[qho + l] >> 6) & 3) as i16) << 4) - 32;
+                        let q1 = ((ql[qo + l] & 0xF) as i16 | ((qh[qho + l] & 3) as i16) << 4) - 32;
+                        let q2 = ((ql[qo + l + 32] & 0xF) as i16
+                            | (((qh[qho + l] >> 2) & 3) as i16) << 4)
+                            - 32;
+                        let q3 = ((ql[qo + l] >> 4) as i16
+                            | (((qh[qho + l] >> 4) & 3) as i16) << 4)
+                            - 32;
+                        let q4 = ((ql[qo + l + 32] >> 4) as i16
+                            | (((qh[qho + l] >> 6) & 3) as i16) << 4)
+                            - 32;
                         y[yo + l] = d * sc[sco + is] as i8 as f32 * q1 as f32;
                         y[yo + l + 32] = d * sc[sco + is + 2] as i8 as f32 * q2 as f32;
                         y[yo + l + 64] = d * sc[sco + is + 4] as i8 as f32 * q3 as f32;
@@ -343,7 +349,7 @@ pub fn dequant_row(ty: GgmlTy, row: &[u8], out: &mut [f32]) -> Result<(), ModelE
                 let tmp = aux[2];
                 aux[2] = ((aux[0] >> 4) & 0x0F0F_0F0F) | (((tmp >> 4) & 0x0303_0303) << 4);
                 aux[3] = ((aux[1] >> 4) & 0x0F0F_0F0F) | (((tmp >> 6) & 0x0303_0303) << 4);
-                aux[0] = (aux[0] & 0x0F0F_0F0F) | (((tmp >> 0) & 0x0303_0303) << 4);
+                aux[0] = (aux[0] & 0x0F0F_0F0F) | ((tmp & 0x0303_0303) << 4);
                 aux[1] = (aux[1] & 0x0F0F_0F0F) | (((tmp >> 2) & 0x0303_0303) << 4);
                 let mut scales = [0i8; 16];
                 for w in 0..4 {

@@ -165,8 +165,7 @@ impl KernelSpec for RecurrenceVarlenGqaF16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
-/// `owl_gdn_decode_step_v2_f16` —— decode 整链融合(v-conv + l2norm×2 + gating
-/// + sigmoid + delta + norm_act;22 参 = 13 块 + 5 sz + 3 f32 + 输出)
+/// `owl_gdn_decode_step_v2_f16` —— decode 整链融合(v-conv + l2norm×2 + gating + sigmoid + delta + norm_act;22 参 = 13 块 + 5 sz + 3 f32 + 输出)
 pub struct DecodeStepV2F16;
 
 #[kernel_tags("dom.gdn", "role.attn", "phase.decode")]

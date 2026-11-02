@@ -281,9 +281,9 @@ fn build_bpe(
     .map_err(|e| bad(format!("预分词正则编译失败({regex}): {e}")))?;
     tok.with_pre_tokenizer(Some(Sequence::new(vec![
         PreTokenizerWrapper::Split(split),
-        PreTokenizerWrapper::ByteLevel(byte_level.clone()),
+        PreTokenizerWrapper::ByteLevel(byte_level),
     ])));
-    tok.with_decoder(Some(byte_level.clone()));
+    tok.with_decoder(Some(byte_level));
     tok.with_post_processor(Some(byte_level));
 
     // 特殊 token = control(3) / user_defined(4):以 AddedToken 注入

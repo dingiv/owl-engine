@@ -646,8 +646,7 @@ impl PerTokBytes {
 }
 
 /// **图 slab 预算项**(实测校准,2026-10-17):spec-dflash 生产档
-/// `slab 总账` = session 32 + verify 165(17 段/16 断点)+ fold 58(7)
-/// + dflash 6 = **261MiB**(ctx16k / fp8 池 / FI 双图;实测精确值略高于 261MiB,
+/// `slab 总账` = session 32 + verify 165(17 段/16 断点)+ fold 58(7) + dflash 6 = **261MiB**(ctx16k / fp8 池 / FI 双图;实测精确值略高于 261MiB,
 /// 故取整到 **262MiB** 上界 —— 日志按 MiB 取整打印,常数不得骑在边界上)。
 /// ⚠️ 随图族变(depth / 臂换代 / 桶)⇒ 捕获后由 [`crate::graph_fleet`]
 /// 把**实测 Σ** 与本品对账,超了打 ⚠️(池上限可能偏大 ⇒ 请求级 OOM 风险)。

@@ -53,14 +53,14 @@
 pub mod arch;
 pub use arch::{Arch, Caps, Family};
 
+pub mod command;
+pub mod contract;
 /// **契约词汇面**(Dtype/Bytes/Arg/LaunchMsg/KernelSource/OpError/OpId/Hw/OpEnv…)。
 ///
 /// 2026-10-29 反置:定义从 `owl-kernels::contract`/`driver` 搬回接口层;
 /// `contract` 模块整体 re-export(旧路径 `owl_iface::contract::X` 不变),
 /// `owl_kernels::contract` / `owl_kernels::driver::{Hw,OpEnv}` 继续可用。
 pub mod contract_vocab;
-pub mod command;
-pub mod contract;
 /// **DeviceHandle:分配账 + 命令面**(2026-10-19;设计卷 device-命令面与分配账)
 pub mod handle;
 
@@ -373,7 +373,11 @@ mod vram_account_tests {
         a.live_add(100);
         assert_eq!(
             a.snapshot(),
-            VramSnapshot { total: 24 << 30, live: 100, free: 16 << 30 }
+            VramSnapshot {
+                total: 24 << 30,
+                live: 100,
+                free: 16 << 30
+            }
         );
     }
 

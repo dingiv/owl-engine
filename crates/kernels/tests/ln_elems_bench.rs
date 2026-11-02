@@ -247,6 +247,8 @@ impl DeviceRes for TestRes {
 // ============================================================================
 
 /// 发射一次(**不校验返回值 —— 发射失败必须响亮**:`expect`)
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 fn fire(
     res: &mut TestRes,
     exec: &mut Exec,
@@ -264,6 +266,8 @@ fn fire(
 }
 
 /// K × M 发射的 µs/发(M=1 = host 提交地板;M=32 = 设备读数)
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 fn time_us(
     res: &mut TestRes,
     exec: &mut Exec,
@@ -357,7 +361,10 @@ fn rmsnorm_bench(res: &mut TestRes, n: usize, rows: usize) {
         }
     }
 
-    println!("  {:>22} {:>10} {:>10}  {}", "臂(block)", "M=1 µs", "M=32 µs", "数值");
+    println!(
+        "  {:>22} {:>10} {:>10}  数值",
+        "臂(block)", "M=1 µs", "M=32 µs"
+    );
     for blk in [256u32, 512, 1024] {
         let bo = res.blk(rows * n * 2, "out");
         let po = res.ptr(bo);
@@ -496,7 +503,10 @@ fn embed_bench(res: &mut TestRes, vocab: usize, d_dim: usize, tokens: usize) {
     res.up(bi, as_bytes_f32(&ids_f));
     let pi = res.ptr(bi);
 
-    println!("  {:>22} {:>10} {:>10}  {}", "臂(block)", "M=1 µs", "M=32 µs", "数值");
+    println!(
+        "  {:>22} {:>10} {:>10}  数值",
+        "臂(block)", "M=1 µs", "M=32 µs"
+    );
     for blk in [1u32, 64, 128, 256, 512, 1024] {
         let bo = res.blk(tokens * d_dim * 2, "out");
         let po = res.ptr(bo);
@@ -558,7 +568,10 @@ fn argmax_bench(res: &mut TestRes, n: usize) {
     let bo = res.blk(4, "out");
     let po = res.ptr(bo);
 
-    println!("  {:>22} {:>10} {:>10}  {}", "臂(block)", "M=1 µs", "M=32 µs", "命中");
+    println!(
+        "  {:>22} {:>10} {:>10}  命中",
+        "臂(block)", "M=1 µs", "M=32 µs"
+    );
     // ⚠️ 只测试 ≤ 256 的块:本核 `__shared__` 静态数组按 `ARGMAX_BLOCK=256` 定长,
     // 块 > 256 = **越界写**(实测 block=1024 触发 `CUDA_ERROR_ILLEGAL_ADDRESS`)。
     // ⇒ "加块"不是本核的可选刀(要改必须同改 ARGMAX_BLOCK/改动态 smem);

@@ -81,8 +81,7 @@ pub struct EngineKnobs {
     ///
     /// 开 = 客户端给图像打可删标记时:页对齐 pad + 删除后**保留位置洞、
     /// 不转 K、不移动幸存 token 的 position**,新 token 从 `max_pos+1` 追加;
-    /// 不重算删点之后的 token,可无限次丢弃旧图片缓存。依赖 `prefix_cache`
-    /// + 分页池(f16 或 fp8-e4m3) + 视觉档(boot 门;任缺 = 拒启)。
+    /// 不重算删点之后的 token,可无限次丢弃旧图片缓存。依赖 `prefix_cache` + 分页池(f16 或 fp8-e4m3) + 视觉档(boot 门;任缺 = 拒启)。
     pub image_evict: bool,
     /// **页对齐 pad 词**(`[pool].image_evict_pad`;缺省 `。`;空串 = 自动)。
     /// 模型敏感项:27B 实测 `\n` 会让回答开头吐 `<`;`。` 干净。必须恰 1 token。
@@ -103,8 +102,7 @@ pub struct EngineKnobs {
     /// **选择层覆盖率探针 —— 诊断面**(缺省关)。`OWL_COVERAGE_PROBE=1`。
     ///
     /// 开则额外做**真重诊断**:K/V 全量回读 + host 逐元素解码 +
-    /// `true_block_mass`(逐 query 行 × (层,头) 扫**全 ctx** 的因果 softmax)
-    /// + 论文口径保真对照 + 方案 A/B 对照 + 覆盖率曲线/上界报告。
+    /// `true_block_mass`(逐 query 行 × (层,头) 扫**全 ctx** 的因果 softmax) + 论文口径保真对照 + 方案 A/B 对照 + 覆盖率曲线/上界报告。
     /// 单边界的成本**含 `ctx` 因子** ⇒ 全军一遍是 **O(ctx²)**
     /// (27B/8k 实测单次 6.3s = 墙钟 32%)⇒ **只在末个边界跑一次**
     /// (`OWL_COV_ANALYZE_EVERY` 可改)。诊断档另有一个副作用:
@@ -127,8 +125,7 @@ pub struct EngineKnobs {
     ///
     /// 开则:每个召回点把**被踢出工作集**的链块 `decref` + 逐块下沉到宿主
     /// (会话表写占位),并把选中的宿主块回灌回来;prefill 的"过去"改走
-    /// **子集页链**(否则会读到占位符)。前提:`select_decode`
-    /// + 宿主层(`OWL_HOST_CACHE_MB` / `OWL_SNAP_HOST_MB`)。
+    /// **子集页链**(否则会读到占位符)。前提:`select_decode` + 宿主层(`OWL_HOST_CACHE_MB` / `OWL_SNAP_HOST_MB`)。
     /// 这正是**低显存档位**(池 < ctx)成立的那一件 —— 不开它,
     /// 链无法超出池容量。
     pub select_partial: bool,
@@ -452,7 +449,6 @@ impl Default for EngineKnobs {
 /// 准入满员姿态解析(`OWL_ADMIT_ON_FULL`):`reject`(缺省)/ `queue` / `queue:30000`。
 ///
 /// 坏值 = **响亮拒启动**(解析失败不许静默回落到缺省 —— 那就变成"配了没生效")。
-
 fn parse_admission_on_full() -> std::result::Result<owl_store::QueuePolicy, String> {
     use owl_store::QueuePolicy;
     let Some(s) = owl_shared::env_reader::parse::<String>("OWL_ADMIT_ON_FULL") else {
@@ -530,7 +526,7 @@ impl EngineKnobs {
     /// 又保证 `workspace + 64 页` 装得进 2676 页池。
     pub(crate) fn index_cadence(&self) -> usize {
         const INDEX_BATCH_CHUNKS_MAX: usize = 4;
-        self.recall_every.max(1).min(INDEX_BATCH_CHUNKS_MAX)
+        self.recall_every.clamp(1, INDEX_BATCH_CHUNKS_MAX)
     }
 
     /// **每 turn 工作集的派生(唯一产地)** —— 对外一个 token 数,内部三件:
@@ -1431,7 +1427,7 @@ pub(crate) fn into_running<D: DeviceClient>(
         }
         // **复用池上限**(缺口 4 收尾 P1-1):配置面显式(=0 ⇒ 不限,仅诊断用)
         let cap = cfg.knobs.pool_cap_mb << 20;
-        b.rel.set_pool_cap(cap.max(0) as usize);
+        b.rel.set_pool_cap(cap);
         owl_shared::log_info!(
             "store",
             "复用池上限 = {}(缺省 256MiB;超限逐块顶出回驱动)",
@@ -1846,7 +1842,7 @@ fn fleet_faces(depths: &[usize]) -> usize {
 /// # 结构(2026-10-21 S4:装载期事实 / 运行态两分)
 ///
 /// 一个 rank 的状态其实有**两种寿命**:
-/// - [`RankBoot`]:装载期定型,之后**只读**(权重/rope/几何/环境/tp/视觉塔);
+/// - `RankBoot`:装载期定型,之后**只读**(权重/rope/几何/环境/tp/视觉塔);
 /// - 运行态:池([`StatePool`])/ 图族([`GraphFleet`])/ spec 域([`SpecRuntime`]),
 ///   它们会分配、捕获、回放、换页 —— 只有这三件需要 `&mut`。
 ///
@@ -2457,6 +2453,8 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
 }
 
 /// **PoolPlan 构造**(S6a):把配置/spec/几何折成池的分配需求。
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 fn boot_pool_plan(
     cfg: &EngineConfig,
     s: usize,
@@ -2470,7 +2468,7 @@ fn boot_pool_plan(
     // **自动档**(2026-10-22):配置项已删除;生产恒自动 = `StatePool::alloc`
     // 按剩余显存算出的 cap。`EngineKnobs.pool_tokens` 只作**测试覆写**
     // (None/0 = 自动;>0 = 小池门)。
-    let pool_auto = cfg.knobs.pool_tokens.map_or(true, |n| n == 0);
+    let pool_auto = cfg.knobs.pool_tokens.is_none_or(|n| n == 0);
     let pool_tokens = cfg.knobs.pool_tokens.filter(|n| *n > 0).unwrap_or(s);
     let plan = crate::state::PoolPlan {
         seq_tokens: s,

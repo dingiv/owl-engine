@@ -42,9 +42,9 @@ pub mod cupti;
 
 pub use command::Command;
 pub use gpu_client::GpuClient;
-pub use state::DiagOpts;
 pub use server::GpuServer;
 pub use state::DeviceSelector;
+pub use state::DiagOpts;
 /// ★ 第二条计算流 id(图内 fork/join 的目标;B1 门)—— 测试/探针引它,别写数字
 pub use state::STREAM_COMPUTE_AUX;
 
@@ -56,8 +56,8 @@ pub use owl_shared::device::PEER_ALLOC_HARD_CAP;
 // 2026-09-25 解除 owl-cuda → owl-models 反向依赖,客户只依赖 owl-cuda
 // 即可组装命令,不必直连任何前端 crate)
 pub use owl_iface::contract::{
-    Arg, BlockLedgerRow, Bytes, ConnSlot, Connector, DeviceClient, GraphId, KernelSource, LaunchMsg,
-    ModelError, SwapDir, SwapPiece, UpChunk,
+    Arg, BlockLedgerRow, Bytes, ConnSlot, Connector, DeviceClient, GraphId, KernelSource,
+    LaunchMsg, ModelError, SwapDir, SwapPiece, UpChunk,
 };
 pub use owl_iface::contract::{Dtype, Shape};
 
@@ -76,7 +76,10 @@ pub fn resolve_ordinal_by_bdf(bdf: &str) -> Result<usize, String> {
             "OWL_TEST_DEVICE={bdf:?} 是纯数字 —— **CUDA 序号已禁用**,请用 BDF(如 `41:00.0`)"
         ));
     }
-    let spec = owl_shared::device::DeviceSpec { bdf: Some(bdf.to_string()), ..Default::default() };
+    let spec = owl_shared::device::DeviceSpec {
+        bdf: Some(bdf.to_string()),
+        ..Default::default()
+    };
     let rows = crate::ffi::device_rows()?;
     let hit = spec.select(&rows);
     match hit.first() {
@@ -96,18 +99,15 @@ pub fn resolve_ordinal_by_bdf(bdf: &str) -> Result<usize, String> {
 /// 同 [`test_device_ordinal`] 的**可失败形态**:未设 = `None`(调用点据此 skip);
 /// 设了但不是合法 BDF / 未命中 = **panic**(不静默当未设)。
 pub fn test_device_ordinal_opt() -> Option<usize> {
-    test_device_bdf().map(|b| {
-        resolve_ordinal_by_bdf(&b).unwrap_or_else(|e| panic!("[owl-cuda] {e}"))
-    })
+    test_device_bdf()
+        .map(|b| resolve_ordinal_by_bdf(&b).unwrap_or_else(|e| panic!("[owl-cuda] {e}")))
 }
 
 /// 测试/示例的设备序(**测试域唯一入口**):`OWL_TEST_DEVICE`(BDF)→ ordinal。
 /// 未设/非法 = **panic**(调用点必须先过 GPU 门;测试面拒绝隐式 CUDA 序号)。
 pub fn test_device_ordinal() -> usize {
     match test_device_bdf() {
-        Some(bdf) => {
-            resolve_ordinal_by_bdf(&bdf).unwrap_or_else(|e| panic!("[owl-cuda] {e}"))
-        }
+        Some(bdf) => resolve_ordinal_by_bdf(&bdf).unwrap_or_else(|e| panic!("[owl-cuda] {e}")),
         None => panic!(
             "[owl-cuda] OWL_TEST_DEVICE 未设:测试钉卡唯一形态 = BDF(如 `41:00.0`);\
              用例应先过 GPU 门(未设 = skip)"

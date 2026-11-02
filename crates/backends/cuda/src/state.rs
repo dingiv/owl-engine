@@ -1,5 +1,4 @@
-//! server 状态面:设备上下文 + 流注册表(三固定流)+ 池块账房
-//! + kernel 编译缓存 + pinned 码头 + 图捕获状态机/图注册表。
+//! server 状态面:设备上下文 + 流注册表(三固定流)+ 池块账房 + kernel 编译缓存 + pinned 码头 + 图捕获状态机/图注册表。
 //!
 //! 只被 actor 线程触碰(单线程所有权;零锁)。
 
@@ -278,13 +277,13 @@ impl DeviceSelector {
 // 池块账房
 // ============================================================================
 
+///
 /// 块的三种形态:
 /// - Owned:图外独立分配(cudaMallocAsync)
 /// - Carved:捕获期从 capture slab 切出的切片(零分配;slab 随块保活)
 ///   `cap_n` = 该块**可用容量**(对齐后;S1.5 回收凭它 —— `bytes` 是账长,
 ///   两者可不同:切 1000B 得 cap_n=1024B)
-/// - Peer:peer 面 VMM 显式授予(TP2 S1;见 [`PeerBlock`])—— 生命周期
-/// 不走设备池:唯一释放口 = `Command::PeerRelease`(D2 裁决)
+/// - Peer:peer 面 VMM 显式授予(TP2 S1;见 [`PeerBlock`])—— 生命周期 不走设备池:唯一释放口 = `Command::PeerRelease`(D2 裁决)
 pub(super) enum Block {
     Owned(CudaSlice<u8>),
     Carved { slab: Arc<CudaSlice<u8>>, off: usize, n: usize, cap_n: usize },
@@ -1329,16 +1328,17 @@ impl GpuCtx {
         Ok(())
     }
 
+    ///
     /// **跨流等待**(E2b 起用;E3 的序消费口):把 `stream` 排到 `dep` 的
     /// **当前尾事件**之后 —— 设备端排队、**零 host 阻塞**(实测提交 p50 180ns,
     /// 对比 host 全排空 1.9ms/键)。
     ///
     /// - **捕获期禁止**(`cuStreamWaitEvent` 不可捕获)⇒ 防御性拒(正常路径由
     ///   server 白名单先拦,此处是第二道);
-    /// - `dep` 尚无完成点 ⇒ 响亮拒(不静默跳过 —— 跳过就等于丢序)。
-    /// **块账本快照**(调试面;`GET /debug/blocks`):迭代活块并解析设备地址。
-    /// 捕获期禁调(解析会登记图引用租约 —— 那是执行语义,不是观测语义)。
-    pub(super) fn block_ledger(&self) -> Result<Vec<owl_iface::contract::BlockLedgerRow>, ModelError> {
+    /// - `dep` 尚无完成点 ⇒ 响亮拒(不静默跳过 —— 跳过就等于丢序)。 **块账本快照**(调试面;`GET /debug/blocks`):迭代活块并解析设备地址。 捕获期禁调(解析会登记图引用租约 —— 那是执行语义,不是观测语义)。
+    pub(super) fn block_ledger(
+        &self,
+    ) -> Result<Vec<owl_iface::contract::BlockLedgerRow>, ModelError> {
         if self.capture_stream() {
             return Err(ModelError::Msg(
                 "block_ledger: 捕获期禁止(解析会登记图引用)".into(),

@@ -552,8 +552,8 @@ pub const MMQ2_TINY_J: usize = 8;
 pub const fn mmq2_ok(ty: GgmlTy, m: usize, n: usize, k: usize) -> bool {
     mmq2_entry_for(ty, m).is_some()
         && m >= MMQ2_SMALL_M
-        && n % mmq2_i(m) == 0
-        && k % MMQ2_QK == 0
+        && n.is_multiple_of(mmq2_i(m))
+        && k.is_multiple_of(MMQ2_QK)
 }
 
 /// **激活缓冲的补齐行数**(`m_pad = ceil(m/J)·J`;2026-10-21 修越界)。
@@ -766,12 +766,19 @@ pub const RANGE_GQ: usize = 256;
 
 /// 本臂前置:`k % GQ == 0`(与 `.cu` 的 `gpr = k / GQ` 同一判据)。
 pub const fn range_ok(ty: GgmlTy, k: usize) -> bool {
-    range_entry_for(ty).is_some() && k % RANGE_GQ == 0
+    range_entry_for(ty).is_some() && k.is_multiple_of(RANGE_GQ)
 }
 
+// 结构性豁免(2026-11-02 clippy 清理):
+//   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+#[allow(clippy::type_complexity)]
 pub fn range_geom(ty: GgmlTy, rows: usize, k: usize) -> Option<((u32, u32, u32), (u32, u32, u32))> {
     let (be, _) = ty.block();
-    if range_entry_for(ty).is_none() || be == 0 || k % be != 0 || k % RANGE_GQ != 0 {
+    if range_entry_for(ty).is_none()
+        || be == 0
+        || !k.is_multiple_of(be)
+        || !k.is_multiple_of(RANGE_GQ)
+    {
         return None;
     }
     let total = (rows.max(1) * (k / RANGE_GQ)).max(1);
@@ -1052,12 +1059,19 @@ pub const fn rows_threads(ty: GgmlTy) -> usize {
 ///
 /// 返 `None` = 形态/型不成立(未移植型 / `k` 不是超块整数倍)—— **响亮拒**
 /// 的真相在调用方:本函数不 panic(声明面零失败路径),调用方按 `None` 报错。
-pub const fn rows_geom(ty: GgmlTy, tokens: usize, k: usize) -> Option<((u32, u32, u32), (u32, u32, u32))> {
+// 结构性豁免(2026-11-02 clippy 清理):
+//   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+#[allow(clippy::type_complexity)]
+pub const fn rows_geom(
+    ty: GgmlTy,
+    tokens: usize,
+    k: usize,
+) -> Option<((u32, u32, u32), (u32, u32, u32))> {
     if rows_entry_for(ty).is_none() {
         return None;
     }
     let (be, _) = ty.block();
-    if be == 0 || k % be != 0 {
+    if be == 0 || !k.is_multiple_of(be) {
         return None;
     }
     let mut gx = tokens as u32;

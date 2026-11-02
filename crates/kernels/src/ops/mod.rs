@@ -36,25 +36,25 @@
 use crate::spec::KernelMeta;
 
 pub mod attn;
+pub mod comm;
 pub mod cublas;
 pub mod dflash;
 pub mod elems;
 pub mod flashinfer;
 pub mod fused;
 pub mod gdn;
-/// **GGUF 族算子声明**(2026-10-19;逐型一条 = H3 的"不许裸 int 路由")
-pub mod gguf;
 pub mod gdn_chunked;
 pub mod gdn_scalar;
-pub mod comm;
+/// **GGUF 族算子声明**(2026-10-19;逐型一条 = H3 的"不许裸 int 路由")
+pub mod gguf;
 pub mod ln;
 pub mod load;
 pub mod marlin;
-pub mod oracles;
 /// **NVFP4 块缩放 GEMM 声明**(零门:算子总表由构建期扫描 `pub static`,
 /// 被 cfg 掉的域会让生成的总表指向不存在的模块 —— 声明面恒在场,
 /// 执行面(`server::nvfp4` + `cu/nvfp4/`)才是 feature 门槛的)
 pub mod nvfp4;
+pub mod oracles;
 pub mod vis;
 pub mod xqa;
 
@@ -129,7 +129,9 @@ pub fn undeclared_symbols() -> Vec<(&'static str, &'static str)> {
     // 防呆:册上每条都必须在符号清单里(改名/删核后忘了清册 = 红)
     for (id, sym) in FAMILY_PRIVATE {
         assert!(
-            crate::cu_sig::ASSET_SYMBOLS.iter().any(|(i, s)| i == id && s.contains(sym)),
+            crate::cu_sig::ASSET_SYMBOLS
+                .iter()
+                .any(|(i, s)| i == id && s.contains(sym)),
             "FAMILY_PRIVATE 登记了不存在的符号:{id} :: {sym}(改名/删核后请同步清册)"
         );
     }
@@ -187,7 +189,11 @@ pub fn audit_pools(metas: &[&crate::spec::KernelMeta]) -> Result<(), crate::cont
     }
 
     /// 池实例键 = (池名, 布局, dtype)
-    type InstKey = (&'static str, Option<crate::spec::LayoutTag>, Option<crate::contract::Dtype>);
+    type InstKey = (
+        &'static str,
+        Option<crate::spec::LayoutTag>,
+        Option<crate::contract::Dtype>,
+    );
     /// 实例账 = (写者, 读者)
     type InstOps = (Vec<&'static str>, Vec<&'static str>);
 
@@ -222,7 +228,10 @@ pub fn audit_pools(metas: &[&crate::spec::KernelMeta]) -> Result<(), crate::cont
     let mut by_name: BTreeMap<WriterKey, WriterList> = BTreeMap::new();
     for m in metas {
         for p in m.pool.iter().filter(|p| p.is_writer()) {
-            by_name.entry((p.pool, p.dtype)).or_default().push((m.entry, p.layout));
+            by_name
+                .entry((p.pool, p.dtype))
+                .or_default()
+                .push((m.entry, p.layout));
         }
     }
     for ((pool, dtype), writers) in &by_name {
@@ -244,9 +253,7 @@ pub fn audit_pools(metas: &[&crate::spec::KernelMeta]) -> Result<(), crate::cont
 }
 
 /// 按白名单过滤后审计(`None` = 全部已建表算子)
-pub fn audit_active(
-    allowed: Option<&[&str]>,
-) -> Result<(), crate::contract::OpError> {
+pub fn audit_active(allowed: Option<&[&str]>) -> Result<(), crate::contract::OpError> {
     let list: Vec<&crate::spec::KernelMeta> = match allowed {
         Some(a) => all().filter(|m| a.contains(&m.entry)).collect(),
         None => all().collect(),
@@ -268,8 +275,7 @@ pub fn audit_active(
 //   ② 池写集穷举审计的输入(`audit_active`);
 //   ③ P3 建表范围的依据(生产集 100% 建表 = 本表 ⊆ `all()`)。
 
-/// `-p profiles/qwen38_27b-3090.toml` 实测发射集(**49 个**;27B AWQ + DFlash2 d7 + fp8 主池
-/// + gdn_chunked + XQA verify/decode + int4 头;A5 后含 f16 主池族 4 项)
+/// `-p profiles/qwen38_27b-3090.toml` 实测发射集(**49 个**;27B AWQ + DFlash2 d7 + fp8 主池 + gdn_chunked + XQA verify/decode + int4 头;A5 后含 f16 主池族 4 项)
 ///
 /// **2026-10-14 A5 补丁**:追加 **f16 主池族**(4 个)。原先本集只锁 fp8 池
 /// (“XQA 前置 = fp8”),导致 `[dispatch] kv_fp8 = false` 的 f16 池档在
@@ -279,7 +285,8 @@ pub fn audit_active(
 pub const PROD_SPEC_DFLASH_2026_10_13: &[&str] = &[
     "cublas_gemm_bf16",
     "cublas_gemm_f16",
-    "flashinfer_prefill_paged_f16", "flashinfer_prefill_paged_fp8kv",
+    "flashinfer_prefill_paged_f16",
+    "flashinfer_prefill_paged_fp8kv",
     "gdn_chunked_delta_rule_fwd",
     "marlin_gemm_w4a16_awq",
     "marlin_gemm_w4a16_bf16",
@@ -455,7 +462,8 @@ pub const PROD_AWQ27B_2026_10_13: &[&str] = &[
 pub const PRODUCTION_UNION_2026_10_13: &[&str] = &[
     "cublas_gemm_bf16",
     "cublas_gemm_f16",
-    "flashinfer_prefill_paged_f16", "flashinfer_prefill_paged_fp8kv",
+    "flashinfer_prefill_paged_f16",
+    "flashinfer_prefill_paged_fp8kv",
     "gdn_chunked_delta_rule_fwd",
     "marlin_gemm_w4a16_awq",
     "marlin_gemm_w4a16_bf16",
@@ -501,7 +509,6 @@ pub const PRODUCTION_UNION_2026_10_13: &[&str] = &[
     "vllm_chunked_prefill_paged_attn_opt_f16_knhd_hd256",
     "vllm_paged_attention_v2_f16_knhd_hd256bs32",
     "vllm_reshape_and_cache_f16_knhd",
-
     "owl_reshape_and_cache_fp8kv_knhd",
     "owl_rmsnorm_bf16",
     "owl_rmsnorm_f16",
@@ -550,7 +557,10 @@ mod tests {
         }
         // 非空门:池面原生算子实测 **63** 名(2026-10-17 全 feature 档;
         // 外族 FI/XQA 7 名自理);投影断了(如 POOL 声明被清空)本行立刻红
-        assert!(checked >= 30, "池面原生算子仅 {checked} 名 —— 投影异常(实测 63)");
+        assert!(
+            checked >= 30,
+            "池面原生算子仅 {checked} 名 —— 投影异常(实测 63)"
+        );
         eprintln!("[pool-manifest] 原生池面算子 {checked} 名全部有源定义;外族自理 {foreign} 名");
     }
 
@@ -568,15 +578,20 @@ mod tests {
             // ① 通则:语义槽(kv_dtype / 池访问)禁 U8
             if let Some(dt) = m.shape.kv_dtype {
                 assert_ne!(
-                    dt, Dtype::U8,
-                    "{}: kv_dtype 不许用 U8 兜(fp8 请点名 F8E4M3/F8E5M2)", m.entry
+                    dt,
+                    Dtype::U8,
+                    "{}: kv_dtype 不许用 U8 兜(fp8 请点名 F8E4M3/F8E5M2)",
+                    m.entry
                 );
             }
             for pa in m.pool {
                 if let Some(dt) = pa.dtype {
                     assert_ne!(
-                        dt, Dtype::U8,
-                        "{}: 池访问({})不许用 U8 兜(点名格式)", m.entry, pa.pool
+                        dt,
+                        Dtype::U8,
+                        "{}: 池访问({})不许用 U8 兜(点名格式)",
+                        m.entry,
+                        pa.pool
                     );
                 }
             }
@@ -597,9 +612,11 @@ mod tests {
                     if let crate::spec::ParamType::Tensor { dtype, .. } = p.ty {
                         if dtype.size_bytes() == 1 {
                             assert_eq!(
-                                dtype, Dtype::I8,
+                                dtype,
+                                Dtype::I8,
                                 "{}::{}: int8 族的 1B 张量槽必须是 I8(有符号),实得 {dtype:?}",
-                                m.entry, p.name
+                                m.entry,
+                                p.name
                             );
                             checked += 1;
                         }
@@ -607,7 +624,10 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 10, "本法应该覆盖到十几处 8 位声明,实得 {checked}(门面失明?)");
+        assert!(
+            checked > 10,
+            "本法应该覆盖到十几处 8 位声明,实得 {checked}(门面失明?)"
+        );
         eprintln!("[8bit-gate] 点名格式 OK:覆盖 {checked} 处语义/张量槽");
     }
 
@@ -679,22 +699,54 @@ mod tests {
     #[test]
     fn audit_passes_on_production_set() {
         const PROD: &[&str] = &[
-            "marlin_gemm_w4a16_awq", "marlin_gemm_w4a16_bf16", "owl_gdn_conv_fwd_f16",
-            "owl_narrow_strided_f16", "owl_gdn_l2norm_f16", "owl_rmsnorm_f16",
-            "owl_silu_and_mul_f16", "owl_fused_add_rmsnorm_f16", "owl_add_f16",
-            "cublas_gemm_f16", "owl_gdn_recurrence_varlen_gqa_f16", "owl_ct_repack_u32",
-            "owl_sigmoid_f16", "owl_gdn_norm_act_f16", "owl_gdn_gating_g_f16",
-            "gdn_chunked_delta_rule_fwd", "owl_norm_rope_f16", "owl_gemv_dual_f16",
-            "owl_sigmoid_gate_mul_f16", "owl_reshape_and_cache_fp8kv_knhd",
-            "flashinfer_prefill_paged_fp8kv", "owl_norm_rope_bf16", "owl_gdn_decode_step_v2_f16",
-            "owl_gdn_conv_upd_dual_f16", "owl_dflash_conv_bf16", "owl_cast_f16_bf16",
-            "vllm_reshape_and_cache_bf16", "owl_add_bf16", "cublas_gemm_bf16",
-            "owl_fused_add_rmsnorm_bf16", "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
-            "owl_xqa_verify", "owl_xqa_decode", "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
-            "owl_argmax_f32idx_f16", "owl_silu_and_mul_bf16", "owl_naive_attn_nc_bf16_v2",
-            "owl_embed_f16", "owl_embed_i8_f16", "owl_rmsnorm_bf16", "owl_concat_rows_f16", "owl_topk16_f16",
-            "owl_dflash_select_bf16", "owl_cast_bf16_f16", "owl_concat_rows_f32", "owl_argmax_validx_f16",
-            "vllm_paged_attention_v2_fp8_knhd_hd256bs32", "vllm_paged_attention_v2_reduce_f16_hd256",
+            "marlin_gemm_w4a16_awq",
+            "marlin_gemm_w4a16_bf16",
+            "owl_gdn_conv_fwd_f16",
+            "owl_narrow_strided_f16",
+            "owl_gdn_l2norm_f16",
+            "owl_rmsnorm_f16",
+            "owl_silu_and_mul_f16",
+            "owl_fused_add_rmsnorm_f16",
+            "owl_add_f16",
+            "cublas_gemm_f16",
+            "owl_gdn_recurrence_varlen_gqa_f16",
+            "owl_ct_repack_u32",
+            "owl_sigmoid_f16",
+            "owl_gdn_norm_act_f16",
+            "owl_gdn_gating_g_f16",
+            "gdn_chunked_delta_rule_fwd",
+            "owl_norm_rope_f16",
+            "owl_gemv_dual_f16",
+            "owl_sigmoid_gate_mul_f16",
+            "owl_reshape_and_cache_fp8kv_knhd",
+            "flashinfer_prefill_paged_fp8kv",
+            "owl_norm_rope_bf16",
+            "owl_gdn_decode_step_v2_f16",
+            "owl_gdn_conv_upd_dual_f16",
+            "owl_dflash_conv_bf16",
+            "owl_cast_f16_bf16",
+            "vllm_reshape_and_cache_bf16",
+            "owl_add_bf16",
+            "cublas_gemm_bf16",
+            "owl_fused_add_rmsnorm_bf16",
+            "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256",
+            "owl_xqa_verify",
+            "owl_xqa_decode",
+            "owl_qknorm_rope_kv_insert_f16_fp8kv_knhd",
+            "owl_argmax_f32idx_f16",
+            "owl_silu_and_mul_bf16",
+            "owl_naive_attn_nc_bf16_v2",
+            "owl_embed_f16",
+            "owl_embed_i8_f16",
+            "owl_rmsnorm_bf16",
+            "owl_concat_rows_f16",
+            "owl_topk16_f16",
+            "owl_dflash_select_bf16",
+            "owl_cast_bf16_f16",
+            "owl_concat_rows_f32",
+            "owl_argmax_validx_f16",
+            "vllm_paged_attention_v2_fp8_knhd_hd256bs32",
+            "vllm_paged_attention_v2_reduce_f16_hd256",
         ];
         audit_active(Some(PROD)).expect("生产集池审计必须通过");
         // 另一套**自洽**配置:classic 池档(主池 classic + 草稿池 classic)
@@ -706,7 +758,10 @@ mod tests {
         ];
         audit_active(Some(CLASSIC_SET)).expect("classic 池档必须通过");
         // fp8 草稿池档(前缀池 e4m3)
-        const FP8_DRAFT: &[&str] = &["owl_reshape_and_cache_fp8kv", "owl_naive_attn_nc_fp8kv_bf16"];
+        const FP8_DRAFT: &[&str] = &[
+            "owl_reshape_and_cache_fp8kv",
+            "owl_naive_attn_nc_fp8kv_bf16",
+        ];
         audit_active(Some(FP8_DRAFT)).expect("fp8 草稿池档必须通过");
         // ⚠️ **knHD 与 classic 混在同一白名单 = 歧义**(池布局是配置选择,
         // 两种同时"活跃"就是 E14 双寻址的温床)⇒ 必须拒
@@ -825,60 +880,596 @@ mod tests {
         // 同型槽对调,类型签名防 dtype/rank 漂移(F16→BF16 / rank3→rank4 ——
         // 只锁名字时这两类变更**不触发任何门**;2026-10-15 审查定谳)。
         const EXPECT: &[(&str, &[&str], &[&str])] = &[
-            (crate::family::gdn_chunked::GDN_CHUNKED_FWD, &["q", "k", "v", "beta", "gate", "state", "tables", "out", "t", "slot", "nv", "nk", "kd", "scale_bits", "nt"], &["F16x3", "F16x3", "F16x3", "F16x2", "F16x2", "F32x4", "U32x1", "F16x3", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64"]),
-            (crate::family::gdn_scalar::GDN_SCALAR_FWD, &["q", "k", "v", "beta", "gate", "state", "out", "t", "slot", "ns", "nv", "nk", "kd", "scale_bits"], &["F32x3", "F32x3", "F32x3", "F32x2", "F32x2", "F32x4", "F16x3", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
-            (crate::family::marlin::GEMM_W4A16_AWQ, &["a", "b", "out", "scales", "zeros", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
-            (crate::family::marlin::GEMM_W4A8_AWQ, &["a", "b", "out", "scales", "zeros", "a_scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["I8x2", "U32x2", "F16x2", "F16x2", "U32x2", "F32x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
-            (crate::family::marlin::GEMM_W4A16_BF16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["BF16x2", "U32x2", "BF16x2", "BF16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
-            (crate::family::marlin::GEMM_W4A16, &["a", "b", "out", "scales", "ws", "c_tmp", "m", "k", "n", "groupsize"], &["F16x2", "U32x2", "F16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64", "U64"]),
-            (crate::family::cublas::GEMM_F16, &["a", "b", "out", "m", "k", "n", "nt"], &["F16x2", "F16x2", "F16x2", "U64", "U64", "U64", "U64"]),
-            (crate::family::cublas::GEMM_BF16, &["a", "b", "out", "m", "k", "n", "nt"], &["BF16x2", "BF16x2", "BF16x2", "U64", "U64", "U64", "U64"]),
+            (
+                crate::family::gdn_chunked::GDN_CHUNKED_FWD,
+                &[
+                    "q",
+                    "k",
+                    "v",
+                    "beta",
+                    "gate",
+                    "state",
+                    "tables",
+                    "out",
+                    "t",
+                    "slot",
+                    "nv",
+                    "nk",
+                    "kd",
+                    "scale_bits",
+                    "nt",
+                ],
+                &[
+                    "F16x3", "F16x3", "F16x3", "F16x2", "F16x2", "F32x4", "U32x1", "F16x3", "U64",
+                    "U64", "U64", "U64", "U64", "F32Bits", "U64",
+                ],
+            ),
+            (
+                crate::family::gdn_scalar::GDN_SCALAR_FWD,
+                &[
+                    "q",
+                    "k",
+                    "v",
+                    "beta",
+                    "gate",
+                    "state",
+                    "out",
+                    "t",
+                    "slot",
+                    "ns",
+                    "nv",
+                    "nk",
+                    "kd",
+                    "scale_bits",
+                ],
+                &[
+                    "F32x3", "F32x3", "F32x3", "F32x2", "F32x2", "F32x4", "F16x3", "U64", "U64",
+                    "U64", "U64", "U64", "U64", "F32Bits",
+                ],
+            ),
+            (
+                crate::family::marlin::GEMM_W4A16_AWQ,
+                &[
+                    "a",
+                    "b",
+                    "out",
+                    "scales",
+                    "zeros",
+                    "ws",
+                    "c_tmp",
+                    "m",
+                    "k",
+                    "n",
+                    "groupsize",
+                ],
+                &[
+                    "F16x2", "U32x2", "F16x2", "F16x2", "U32x2", "U32x1", "U32x1", "U64", "U64",
+                    "U64", "U64",
+                ],
+            ),
+            (
+                crate::family::marlin::GEMM_W4A8_AWQ,
+                &[
+                    "a",
+                    "b",
+                    "out",
+                    "scales",
+                    "zeros",
+                    "a_scales",
+                    "ws",
+                    "c_tmp",
+                    "m",
+                    "k",
+                    "n",
+                    "groupsize",
+                ],
+                &[
+                    "I8x2", "U32x2", "F16x2", "F16x2", "U32x2", "F32x2", "U32x1", "U32x1", "U64",
+                    "U64", "U64", "U64",
+                ],
+            ),
+            (
+                crate::family::marlin::GEMM_W4A16_BF16,
+                &[
+                    "a",
+                    "b",
+                    "out",
+                    "scales",
+                    "ws",
+                    "c_tmp",
+                    "m",
+                    "k",
+                    "n",
+                    "groupsize",
+                ],
+                &[
+                    "BF16x2", "U32x2", "BF16x2", "BF16x2", "U32x1", "U32x1", "U64", "U64", "U64",
+                    "U64",
+                ],
+            ),
+            (
+                crate::family::marlin::GEMM_W4A16,
+                &[
+                    "a",
+                    "b",
+                    "out",
+                    "scales",
+                    "ws",
+                    "c_tmp",
+                    "m",
+                    "k",
+                    "n",
+                    "groupsize",
+                ],
+                &[
+                    "F16x2", "U32x2", "F16x2", "F16x2", "U32x1", "U32x1", "U64", "U64", "U64",
+                    "U64",
+                ],
+            ),
+            (
+                crate::family::cublas::GEMM_F16,
+                &["a", "b", "out", "m", "k", "n", "nt"],
+                &["F16x2", "F16x2", "F16x2", "U64", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::cublas::GEMM_BF16,
+                &["a", "b", "out", "m", "k", "n", "nt"],
+                &["BF16x2", "BF16x2", "BF16x2", "U64", "U64", "U64", "U64"],
+            ),
             // 写列窗臂(W-2d;独立 PARSE_SLOTS_DST;此前漏登本锁)
-            (crate::family::cublas::GEMM_F16_DST, &["a", "b", "out", "m", "k", "n", "nt", "ldc", "off"], &["F16x2", "F16x2", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64"]),
-            (crate::family::flashinfer::PREFILL_FI_FP8KV, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"], &["F16x2", "U32x1", "U32x1", "U32x1", "U32x1", "U32x1", "U32x1", "F16x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
-            (crate::family::flashinfer::PREFILL_FI, &["q", "k_cache", "v_cache", "q_cu", "indices", "indptr", "last_len", "wr", "out", "total_rows", "ctx_total", "t", "hq", "hkv", "hd", "page", "sm_scale_bits"], &["F16x2", "F16x5", "F16x4", "U32x1", "U32x1", "U32x1", "U32x1", "F16x1", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits"]),
+            (
+                crate::family::cublas::GEMM_F16_DST,
+                &["a", "b", "out", "m", "k", "n", "nt", "ldc", "off"],
+                &[
+                    "F16x2", "F16x2", "F16x2", "U64", "U64", "U64", "U64", "U64", "U64",
+                ],
+            ),
+            (
+                crate::family::flashinfer::PREFILL_FI_FP8KV,
+                &[
+                    "q",
+                    "k_cache",
+                    "v_cache",
+                    "q_cu",
+                    "indices",
+                    "indptr",
+                    "last_len",
+                    "wr",
+                    "out",
+                    "total_rows",
+                    "ctx_total",
+                    "t",
+                    "hq",
+                    "hkv",
+                    "hd",
+                    "page",
+                    "sm_scale_bits",
+                ],
+                &[
+                    "F16x2", "U32x1", "U32x1", "U32x1", "U32x1", "U32x1", "U32x1", "F16x1",
+                    "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits",
+                ],
+            ),
+            (
+                crate::family::flashinfer::PREFILL_FI,
+                &[
+                    "q",
+                    "k_cache",
+                    "v_cache",
+                    "q_cu",
+                    "indices",
+                    "indptr",
+                    "last_len",
+                    "wr",
+                    "out",
+                    "total_rows",
+                    "ctx_total",
+                    "t",
+                    "hq",
+                    "hkv",
+                    "hd",
+                    "page",
+                    "sm_scale_bits",
+                ],
+                &[
+                    "F16x2", "F16x5", "F16x4", "U32x1", "U32x1", "U32x1", "U32x1", "F16x1",
+                    "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits",
+                ],
+            ),
             // 视觉塔注意力(ragged 非因果;2026-10-15):槽位与 native
             // `vis::AttnFullF16` **逐字同构**(driver 按 dtype/图数在两臂间分流)
-            (crate::family::flashinfer::ATTN_RAGGED_F16, &["q", "k", "v", "cu_seqlens", "out", "rows", "heads", "head_dim", "n_seq", "scale"], &["F16x3", "F16x3", "F16x3", "F32x1", "F16x3", "U64", "U64", "U64", "I32", "F32"]),
+            (
+                crate::family::flashinfer::ATTN_RAGGED_F16,
+                &[
+                    "q",
+                    "k",
+                    "v",
+                    "cu_seqlens",
+                    "out",
+                    "rows",
+                    "heads",
+                    "head_dim",
+                    "n_seq",
+                    "scale",
+                ],
+                &[
+                    "F16x3", "F16x3", "F16x3", "F32x1", "F16x3", "U64", "U64", "U64", "I32", "F32",
+                ],
+            ),
             // vLLM 原版 FA2 varlen（hd72→96；2026-10-23）：同槽位同类型
-            (crate::family::flashinfer::FA2_VARLEN_F16, &["q", "k", "v", "cu_seqlens", "out", "rows", "heads", "head_dim", "n_seq", "scale"], &["F16x3", "F16x3", "F16x3", "F32x1", "F16x3", "U64", "U64", "U64", "I32", "F32"]),
+            (
+                crate::family::flashinfer::FA2_VARLEN_F16,
+                &[
+                    "q",
+                    "k",
+                    "v",
+                    "cu_seqlens",
+                    "out",
+                    "rows",
+                    "heads",
+                    "head_dim",
+                    "n_seq",
+                    "scale",
+                ],
+                &[
+                    "F16x3", "F16x3", "F16x3", "F32x1", "F16x3", "U64", "U64", "U64", "I32", "F32",
+                ],
+            ),
             // FI plan 表同步(2026-11-01 收编成虚拟算子;槽 =
             // [O out(1 元素哑输出), sz t, sz ctx_total, sz hq, sz hkv, sz hd, sz page])
-            (crate::family::flashinfer::PLAN_SYNC_FI, &["out", "t", "ctx_total", "hq", "hkv", "hd", "page"], &["F16x1", "U64", "U64", "U64", "U64", "U64", "U64"]),
-            (crate::family::xqa::VERIFY_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
-            (crate::family::xqa::DECODE_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
+            (
+                crate::family::flashinfer::PLAN_SYNC_FI,
+                &["out", "t", "ctx_total", "hq", "hkv", "hd", "page"],
+                &["F16x1", "U64", "U64", "U64", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::xqa::VERIFY_XQA,
+                &[
+                    "q",
+                    "k_cache",
+                    "v_cache",
+                    "page_table",
+                    "seq_lens",
+                    "mask",
+                    "semaphores",
+                    "scratch",
+                    "wr",
+                    "out",
+                    "q_seq_len",
+                    "hkv",
+                    "hd",
+                    "page",
+                    "max_seq_len",
+                    "q_scale_bits",
+                    "sm_count",
+                    "stride_page",
+                    "stride_token",
+                    "stride_head",
+                ],
+                &[
+                    "F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1",
+                    "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64",
+                    "U64", "U64",
+                ],
+            ),
+            (
+                crate::family::xqa::DECODE_XQA,
+                &[
+                    "q",
+                    "k_cache",
+                    "v_cache",
+                    "page_table",
+                    "seq_lens",
+                    "mask",
+                    "semaphores",
+                    "scratch",
+                    "wr",
+                    "out",
+                    "q_seq_len",
+                    "hkv",
+                    "hd",
+                    "page",
+                    "max_seq_len",
+                    "q_scale_bits",
+                    "sm_count",
+                    "stride_page",
+                    "stride_token",
+                    "stride_head",
+                ],
+                &[
+                    "F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1",
+                    "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64",
+                    "U64", "U64",
+                ],
+            ),
             // prefill 臂:与 verify/decode **同一张 PARAMS 表**(同资产同槽序;
             // 差别只在 host 侧几何 ⇒ 不在这张表的表达面内)
-            (crate::family::xqa::PREFILL_XQA, &["q", "k_cache", "v_cache", "page_table", "seq_lens", "mask", "semaphores", "scratch", "wr", "out", "q_seq_len", "hkv", "hd", "page", "max_seq_len", "q_scale_bits", "sm_count", "stride_page", "stride_token", "stride_head"], &["F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1", "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64", "U64", "U64"]),
+            (
+                crate::family::xqa::PREFILL_XQA,
+                &[
+                    "q",
+                    "k_cache",
+                    "v_cache",
+                    "page_table",
+                    "seq_lens",
+                    "mask",
+                    "semaphores",
+                    "scratch",
+                    "wr",
+                    "out",
+                    "q_seq_len",
+                    "hkv",
+                    "hd",
+                    "page",
+                    "max_seq_len",
+                    "q_scale_bits",
+                    "sm_count",
+                    "stride_page",
+                    "stride_token",
+                    "stride_head",
+                ],
+                &[
+                    "F16x2", "U32x1", "U32x1", "F32x2", "F32x2", "F32x0", "F32x2", "F16x1",
+                    "F16x0", "F16x2", "U64", "U64", "U64", "U64", "U64", "F32Bits", "U64", "U64",
+                    "U64", "U64",
+                ],
+            ),
             // 通信族(TP2 S2;零门 ⇒ 无条件入锁):stage / reduce 各三 dtype。
             // payload 槽 rank 0(阶数无关:AR 挂任意算子输出);staging 两槽 = U8 字节块。
-            (crate::family::comm::asset::STAGE_F16, &["local", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::STAGE_BF16, &["local", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::STAGE_F32, &["local", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["F32x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::REDUCE_F16, &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::REDUCE_BF16, &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::REDUCE_F32, &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["F32x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (
+                crate::family::comm::asset::STAGE_F16,
+                &[
+                    "local",
+                    "own",
+                    "peer",
+                    "data",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::comm::asset::STAGE_BF16,
+                &[
+                    "local",
+                    "own",
+                    "peer",
+                    "data",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::comm::asset::STAGE_F32,
+                &[
+                    "local",
+                    "own",
+                    "peer",
+                    "data",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["F32x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::comm::asset::REDUCE_F16,
+                &[
+                    "out",
+                    "own",
+                    "peer",
+                    "data",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::comm::asset::REDUCE_BF16,
+                &[
+                    "out",
+                    "own",
+                    "peer",
+                    "data",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::comm::asset::REDUCE_F32,
+                &[
+                    "out",
+                    "own",
+                    "peer",
+                    "data",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["F32x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
             // fp8 载荷档(§47 第二步;槽序/类型与常规档**逐字同形** —— 只有核名与载荷语义不同)
-            (crate::family::comm::asset::STAGE_F8_F16, &["local", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::STAGE_F8_BF16, &["local", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::REDUCE_F8_F16, &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::REDUCE_F8_BF16, &["out", "own", "peer", "data", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (
+                crate::family::comm::asset::STAGE_F8_F16,
+                &[
+                    "local",
+                    "own",
+                    "peer",
+                    "data",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::comm::asset::STAGE_F8_BF16,
+                &[
+                    "local",
+                    "own",
+                    "peer",
+                    "data",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::comm::asset::REDUCE_F8_F16,
+                &[
+                    "out",
+                    "own",
+                    "peer",
+                    "data",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["F16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::comm::asset::REDUCE_F8_BF16,
+                &[
+                    "out",
+                    "own",
+                    "peer",
+                    "data",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["BF16x0", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
             // 1-stage 融合核(§35;对称缓冲 —— 无 stage 段、零拷贝):槽 = out/own/peer/peer_data/bytes
-            (crate::family::comm::asset::ONE_STAGE_F16, &["out", "src", "own", "peer", "peer_data", "bytes"], &["F16x0", "F16x0", "U8x1", "U8x1", "U8x1", "U64"]),
-            (crate::family::comm::asset::ONE_STAGE_BF16, &["out", "src", "own", "peer", "peer_data", "bytes"], &["BF16x0", "BF16x0", "U8x1", "U8x1", "U8x1", "U64"]),
-            (crate::family::comm::asset::ONE_STAGE_F32, &["out", "src", "own", "peer", "peer_data", "bytes"], &["F32x0", "F32x0", "U8x1", "U8x1", "U8x1", "U64"]),
+            (
+                crate::family::comm::asset::ONE_STAGE_F16,
+                &["out", "src", "own", "peer", "peer_data", "bytes"],
+                &["F16x0", "F16x0", "U8x1", "U8x1", "U8x1", "U64"],
+            ),
+            (
+                crate::family::comm::asset::ONE_STAGE_BF16,
+                &["out", "src", "own", "peer", "peer_data", "bytes"],
+                &["BF16x0", "BF16x0", "U8x1", "U8x1", "U8x1", "U64"],
+            ),
+            (
+                crate::family::comm::asset::ONE_STAGE_F32,
+                &["out", "src", "own", "peer", "peer_data", "bytes"],
+                &["F32x0", "F32x0", "U8x1", "U8x1", "U8x1", "U64"],
+            ),
             // v1 两核融合(§11.2;2026-10-19):8 槽 —— data_w/data_r 分开(方向不同)
-            (crate::family::comm::asset::FUSED_F16, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::FUSED_BF16, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::FUSED_F32, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["F32x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (
+                crate::family::comm::asset::FUSED_F16,
+                &[
+                    "payload",
+                    "own",
+                    "peer",
+                    "data_w",
+                    "data_r",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["F16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::comm::asset::FUSED_BF16,
+                &[
+                    "payload",
+                    "own",
+                    "peer",
+                    "data_w",
+                    "data_r",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &[
+                    "BF16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64",
+                ],
+            ),
+            (
+                crate::family::comm::asset::FUSED_F32,
+                &[
+                    "payload",
+                    "own",
+                    "peer",
+                    "data_w",
+                    "data_r",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["F32x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
             // barrier-only AR-2(2026-10-23):与 fused 同 8 槽/同类型
-            (crate::family::comm::asset::BARRIER_F16, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["F16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::BARRIER_BF16, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["BF16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
-            (crate::family::comm::asset::BARRIER_F32, &["payload", "own", "peer", "data_w", "data_r", "bytes", "slot_bytes", "slab_off"], &["F32x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"]),
+            (
+                crate::family::comm::asset::BARRIER_F16,
+                &[
+                    "payload",
+                    "own",
+                    "peer",
+                    "data_w",
+                    "data_r",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["F16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
+            (
+                crate::family::comm::asset::BARRIER_BF16,
+                &[
+                    "payload",
+                    "own",
+                    "peer",
+                    "data_w",
+                    "data_r",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &[
+                    "BF16x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64",
+                ],
+            ),
+            (
+                crate::family::comm::asset::BARRIER_F32,
+                &[
+                    "payload",
+                    "own",
+                    "peer",
+                    "data_w",
+                    "data_r",
+                    "bytes",
+                    "slot_bytes",
+                    "slab_off",
+                ],
+                &["F32x0", "U8x1", "U8x1", "U8x1", "U8x1", "U64", "U64", "U64"],
+            ),
             // NVFP4(2026-10-28 远程线;合并日补登):GEMM + 装载期权重打包。
             // 声明面恒在(feature 只门执行面) ⇒ 本锁无条件列两项。
-            (crate::family::nvfp4::GEMM, &["a", "bq", "bsf", "out", "aq", "asf", "dg", "m", "k", "n", "gb"], &["F16x2", "U8x2", "U8x1", "F16x2", "U8x2", "U8x1", "F32x1", "U64", "U64", "U64", "F32"]),
-            (crate::family::nvfp4::PACK_WEIGHT, &["src", "q", "sf", "g", "n", "k", "src_bf16"], &["U8x2", "U8x2", "U8x1", "F32x1", "U64", "U64", "U64"]),
+            (
+                crate::family::nvfp4::GEMM,
+                &[
+                    "a", "bq", "bsf", "out", "aq", "asf", "dg", "m", "k", "n", "gb",
+                ],
+                &[
+                    "F16x2", "U8x2", "U8x1", "F16x2", "U8x2", "U8x1", "F32x1", "U64", "U64", "U64",
+                    "F32",
+                ],
+            ),
+            (
+                crate::family::nvfp4::PACK_WEIGHT,
+                &["src", "q", "sf", "g", "n", "k", "src_bf16"],
+                &["U8x2", "U8x2", "U8x1", "F32x1", "U64", "U64", "U64"],
+            ),
         ];
         for (entry, want, want_ty) in EXPECT {
             let m = meta(entry).unwrap_or_else(|| panic!("锁表项 {entry} 不在声明表里"));
@@ -897,15 +1488,18 @@ mod tests {
                 })
                 .collect();
             assert_eq!(
-                got_ty,
-                *want_ty,
+                got_ty, *want_ty,
                 "{entry}: 类型签名变了(dtype/rank)—— 名字锁拦不住这类漂移;\
                  请同步审各族 handler 的 dtype 假设与 client face 的 builder"
             );
         }
         // 覆盖率门:族算子一个不漏
         let fam: Vec<&str> = all().filter(|m| m.is_family()).map(|m| m.entry).collect();
-        assert_eq!(fam.len(), EXPECT.len(), "族算子清单与锁表项数不一致:{fam:?}");
+        assert_eq!(
+            fam.len(),
+            EXPECT.len(),
+            "族算子清单与锁表项数不一致:{fam:?}"
+        );
         for e in &fam {
             assert!(EXPECT.iter().any(|(k, _, _)| k == e), "族算子 {e} 未进锁表");
         }
@@ -936,5 +1530,3 @@ mod tests {
         }
     }
 }
-
-

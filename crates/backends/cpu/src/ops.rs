@@ -101,13 +101,13 @@ pub(crate) fn rope_half_partial(
     half: usize,
 ) -> Result<Value, ModelError> {
     let row_len = heads * head_dim;
-    if row_len == 0 || x.f32.len() % row_len != 0 {
+    if row_len == 0 || !x.f32.len().is_multiple_of(row_len) {
         return Err(ModelError::Msg(format!(
             "owl_rope_half_partial: x 长 {} 不是 heads·head_dim = {row_len} 的整数倍",
             x.f32.len()
         )));
     }
-    if cos_t.f32.len() % half.max(1) != 0 || 2 * half > head_dim {
+    if !cos_t.f32.len().is_multiple_of(half.max(1)) || 2 * half > head_dim {
         return Err(ModelError::Msg(format!(
             "owl_rope_half_partial: cos 长 {} / half {half} / head_dim {head_dim} 不齐",
             cos_t.f32.len()
@@ -222,7 +222,7 @@ fn erf64(x: f64) -> f64 {
 
 /// GELU(tanh 近似):0.5x(1+tanh(√(2/π)(x+0.044715x³)))
 pub(crate) fn gelu_tanh(x: &Value) -> Result<Value, ModelError> {
-    const C: f32 = 0.797_884_56_f32; // √(2/π)
+    const C: f32 = 0.797_884_6_f32; // √(2/π)
     Ok(Value {
         f32: x
             .f32
@@ -279,7 +279,7 @@ pub(crate) fn image_scatter(
     dim: usize,
 ) -> Result<Value, ModelError> {
     let dim = dim.max(1);
-    if h.f32.len() % dim != 0 || merged.f32.len() % dim != 0 {
+    if !h.f32.len().is_multiple_of(dim) || !merged.f32.len().is_multiple_of(dim) {
         return Err(ModelError::Msg(format!(
             "owl_image_scatter: h 长 {} / merged 长 {} 不是 dim {dim} 的整数倍",
             h.f32.len(),
@@ -321,7 +321,7 @@ pub(crate) fn pos_embed_bilinear(
     dim: usize,
 ) -> Result<Value, ModelError> {
     let (n_taps, dim) = (n_taps.max(1), dim.max(1));
-    if idx.f32.len() != wts.f32.len() || idx.f32.len() % n_taps != 0 {
+    if idx.f32.len() != wts.f32.len() || !idx.f32.len().is_multiple_of(n_taps) {
         return Err(ModelError::Msg(format!(
             "owl_pos_embed_bilinear: idx 长 {} / wts 长 {} 与 n_taps {n_taps} 不齐",
             idx.f32.len(),
@@ -355,6 +355,10 @@ pub(crate) fn pos_embed_bilinear(
 }
 
 /// 非因果 varlen 全注意力(逐图;无 GQA;两趟 softmax 参考实现)
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 pub(crate) fn attn_full(
     q: &Value,
     k: &Value,

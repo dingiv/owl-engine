@@ -934,13 +934,20 @@ static L3_AUDIT_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// 写 L3 事实面审计开关(boot 期一次;重入以最后一次为准)
+// 结构性豁免(2026-11-02 clippy 清理):
+//   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+#[allow(clippy::type_complexity)]
 pub fn set_l3_audit(on: bool) {
     L3_AUDIT_REQUESTED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 static L3_AUDIT_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-static L3_AUDIT_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<(String, &'static str, u8)>>> =
-    std::sync::OnceLock::new();
+// 结构性豁免(2026-11-02 clippy 清理):审计去重集的类型面就是这四层(OnceLock→Mutex→Set→三元组);
+// 起别名会藏住"这把锁保护什么"。
+#[allow(clippy::type_complexity)]
+static L3_AUDIT_SEEN: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeSet<(String, &'static str, u8)>>,
+> = std::sync::OnceLock::new();
 
 fn l3_audit_note(op: &str, slot: &'static str, rank: u8) {
     let seen = L3_AUDIT_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));

@@ -95,6 +95,8 @@ fn prefill_shadow_cap() -> usize {
 /// 桶化(把 ctx 上取整到桶再进键)**不在这里做** —— 值由引擎侧写进
 /// 宿主标量槽(`[dispatch] fi_plan_bucket`;见 `exec/phases.rs` 的 `plan_ctx`),
 /// 核侧拿到的 `call.ctx_total` 已是桶化值:单一事实源,本侧零 env。
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 fn plan_key(
     total_rows: usize,
     ctx_total: usize,
@@ -122,10 +124,8 @@ fn plan_key(
 /// **图自携 plan restore** 的语义文档(实现住 `family::flashinfer`,见上)。
 ///
 /// 语义(2026-10-18 W2 定稿;**只此一处**,不再是 env):
-///   - `true`  ⇒ 捕获窗内把"本 plan 的表 → int_ws"烘成一条 memcpy 节点
-///                (＝**图自携表**;prefill 桶图靠它);
-///   - `false` ⇒ 窗内不烘 ⇒ **host 成为表的唯一权威**:引擎每次图 launch 之前
-///                用 [`FiRuntime::plan_sync`] 走窗外路径刷当步精确表。
+///   - `true`  ⇒ 捕获窗内把"本 plan 的表 → int_ws"烘成一条 memcpy 节点                (＝**图自携表**;prefill 桶图靠它);
+///   - `false` ⇒ 窗内不烘 ⇒ **host 成为表的唯一权威**:引擎每次图 launch 之前                用 [`FiRuntime::plan_sync`] 走窗外路径刷当步精确表。
 ///
 /// ⚠️ 射程曾经是错的:旧实现(env `OWL_FI_NO_PLAN_RESTORE`)为**取证档**,
 /// 语义 = "关自携 ⇒ 切换后不重刷",在 `activate` 里**无条件 return** ⇒
@@ -360,8 +360,8 @@ impl KernelFamily for FiRuntime {
         Self::ID
     }
 
-    /// 本族**已建表**算子(fp8 臂;f16 臂未建表 —— 它由族主名承担,
-    /// 见 `KernelFamily::names()` 的 id ∪ ops 律)
+    // 本族**已建表**算子(fp8 臂;f16 臂未建表 —— 它由族主名承担,
+    // 见 `KernelFamily::names()` 的 id ∪ ops 律)。
 
 
     /// 构造函数:workspace 预钉(float 64MB + int 32MB + ragged int 8MB;
@@ -839,6 +839,8 @@ impl FiRuntime {
     /// FI 核进捕获图后,`run` 在回放期不再被调用,而表必须每步换成"当步精确
     /// ctx"那张(否则运行期 chunk 数 ≠ 表里工作项数 ⇒ partial 行 stride 错,
     /// 实测:输出 64 个空 token)。
+    // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+    #[allow(clippy::too_many_arguments)]
     fn ensure_plan(
         &mut self,
         geom: &FiPlanGeom,

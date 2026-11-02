@@ -169,7 +169,7 @@ impl Rope {
     /// 表长(位置上限;含 YaRN 外推后的长度)。
     pub fn max_pos(&self) -> usize {
         let half = self.rotary_dim / 2;
-        if half == 0 { 0 } else { self.cos_data.len() / half }
+        self.cos_data.len().checked_div(half).unwrap_or(0)
     }
 
     pub fn tables(&self) -> crate::module::TableSource<'_> {
@@ -264,6 +264,8 @@ mod tests {
     /// factor=1 ⇒ 与旧表逐位相同;factor=2 ⇒ 高频端(i=0, ramp=0)原频、
     /// 低频端(i=half-1, ramp=1)减半,mscale = 0.1·ln2+1。
     #[test]
+    // 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+    #[allow(clippy::needless_range_loop)]
     fn yarn_inv_freq_blends_extrapolation_and_interpolation() {
         let (rotary_dim, half, theta) = (64usize, 32usize, 1e7f32);
         let (base, ms) = yarn_inv_freq(rotary_dim, theta, None);

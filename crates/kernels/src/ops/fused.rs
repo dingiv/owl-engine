@@ -4,8 +4,7 @@ use owl_macros::kernel_tags;
 use crate::contract::{Dtype, Law};
 use crate::spec::{meta_of, pools, CaptureEvidence, Determinism, KernelMeta, KernelSpec, LayoutTag, Param, PoolAccess};
 
-/// `owl_qknorm_rope_kv_insert_f16_fp8kv_knhd` —— qk-norm + rotate-half rope
-/// + KV 散写(主池 e4m3/kNHD)三发合一。
+/// `owl_qknorm_rope_kv_insert_f16_fp8kv_knhd` —— qk-norm + rotate-half rope + KV 散写(主池 e4m3/kNHD)三发合一。
 ///
 /// **E10 案现场**:池 dtype 改造时本核的 fp8 臂曾缺失 ⇒ f16 写落在 1B/elem
 /// 池的 2× 偏移 = 槽区永不落笔全零。本表把"写哪两块池、什么 dtype"写进

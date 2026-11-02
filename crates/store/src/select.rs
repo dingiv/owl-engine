@@ -1230,7 +1230,7 @@ pub fn propagate_adjacent(scores: &[f32], alpha: f32) -> Vec<f32> {
         return scores.to_vec();
     }
     let total: f32 = scores.iter().map(|s| s.max(0.0)).sum();
-    if !(total > 0.0) {
+    if total.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return scores.to_vec();
     }
     let mut out = scores.to_vec();
@@ -1639,9 +1639,12 @@ mod tests {
         let cands: Vec<ChainHash> = (0..8u64).map(|i| ChainHash::new(i + 1)).collect();
         for (i, b) in cands.iter().enumerate() {
             let ang = (i as f32) * 0.35;
-            let v = vec![ang.cos(), ang.sin()];
-            ix.register(*b, vec![entry(0, 0, [v[0], v[1]]), entry(1, 0, [v[0], v[1]])])
-                .expect("登记");
+            let v = [ang.cos(), ang.sin()];
+            ix.register(
+                *b,
+                vec![entry(0, 0, [v[0], v[1]]), entry(1, 0, [v[0], v[1]])],
+            )
+            .expect("登记");
         }
         let mut face = QueryFace::new(2, 2, 1);
         face.push_token(vec![1.0, 0.0, 1.0, 0.0]).expect("面");

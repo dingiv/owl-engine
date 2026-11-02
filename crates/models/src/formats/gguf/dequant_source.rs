@@ -75,7 +75,7 @@ impl GgufDequantSource {
         let v: Arc<Vec<f32>> = match high {
             None => Arc::new(full),
             Some(high) => {
-                if inner % 2 != 0 {
+                if !inner.is_multiple_of(2) {
                     return Err(ModelError::Msg(format!(
                         "GGUF MTP {phys}: 内维 {inner} 不是偶数(不能列半拆)"
                     )));
@@ -106,7 +106,7 @@ impl WeightSource for GgufDequantSource {
             let Some(t) = self.g.get_tensor(&phys) else { return Ok(None) };
             let rows = t.rows() as usize;
             let inner = t.inner() as usize;
-            if inner % 2 != 0 {
+            if !inner.is_multiple_of(2) {
                 return Err(ModelError::Msg(format!(
                     "GGUF MTP {phys}: 内维 {inner} 不是偶数(不能列半拆)"
                 )));

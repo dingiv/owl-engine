@@ -444,8 +444,11 @@ impl Vlm {
         face: &mut D,
         ctx: LoaderCtx,
     ) -> Result<Vlm, ModelError> {
-        let raw = owl_shared::file_loader::read(&dir.join("config.json")).map_err(|e| {
-            ModelError::Msg(format!("Vlm::load: config.json 读入 {}: {e}", dir.display()))
+        let raw = owl_shared::file_loader::read(dir.join("config.json")).map_err(|e| {
+            ModelError::Msg(format!(
+                "Vlm::load: config.json 读入 {}: {e}",
+                dir.display()
+            ))
         })?;
         let cfg = VlmCfg::from_json(&raw)?;
         let vlm = Vlm::new(cfg, QuantPlan::F16, QuantPlan::F16)?;
@@ -749,7 +752,7 @@ mod tests {
         let Some(dir) = owl_shared::testkit::resource("ckpt:27b-awq") else {
             return; // 资源清单缺省 = skip(非失败)
         };
-        let raw = owl_shared::file_loader::read(&std::path::Path::new(&dir).join("config.json"))
+        let raw = owl_shared::file_loader::read(std::path::Path::new(&dir).join("config.json"))
             .expect("27B config.json");
         let cfg = VlmCfg::from_json(&raw).expect("VlmCfg::from_json");
         assert_eq!(cfg.hidden, 5120, "文本 hidden");
@@ -767,7 +770,7 @@ mod tests {
     }
 
     fn cfg4b() -> VlmCfg {
-        let raw = owl_shared::file_loader::read(&ckpt_dir().join("config.json"))
+        let raw = owl_shared::file_loader::read(ckpt_dir().join("config.json"))
             .expect("config.json 读入(ckpt:qwen35-4b 可指路)");
         VlmCfg::from_json(&raw).expect("VlmCfg::from_json")
     }

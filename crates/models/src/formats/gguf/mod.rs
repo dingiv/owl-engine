@@ -32,22 +32,24 @@ pub mod mmproj;
 pub mod plan;
 pub mod reader;
 pub mod shard;
-pub mod tokenizer;
 pub mod source;
+pub mod tokenizer;
 pub mod transform;
 
 pub use convention::GgufConvention;
-pub use draft::{DraftGgufConvention, DraftGgufPlan, GgufDraftBoot, GgufDraftSource};
-pub use draft_meta::{DraftSpec, TargetFacts};
 pub use dequant::{dequant_all, dequant_row};
 pub use dequant_source::GgufDequantSource;
+pub use draft::{DraftGgufConvention, DraftGgufPlan, GgufDraftBoot, GgufDraftSource};
+pub use draft_meta::{DraftSpec, TargetFacts};
+pub use meta::{rope_facts, spec_from_gguf, GgufRopeFacts, GgufSpecReport};
+pub use mmproj::{
+    resolve_path as resolve_mmproj_path, vision_cfg as mmproj_vision_cfg, MmprojSource,
+};
 /// 量化型词表(块几何 + 可跑性映射在同一处;`owl_kernels` 为权威住址)
 pub use owl_kernels::family::gguf::{GgmlTy, Q8_1_BLOCK_BYTES};
-pub use meta::{rope_facts, spec_from_gguf, GgufRopeFacts, GgufSpecReport};
-pub use mmproj::{resolve_path as resolve_mmproj_path, vision_cfg as mmproj_vision_cfg, MmprojSource};
 pub use plan::{require_portable, ty_histogram, GgufPlan};
-pub use shard::{geom_of, role_of, Cols, KeyGeom, Role, ShardSel, Shape, TensorFacts};
-pub use source::GgufSource;
 pub use reader::{Gguf, GgufValue, KvTable, TensorInfo, MAGIC};
+pub use shard::{geom_of, role_of, Cols, KeyGeom, Role, Shape, ShardSel, TensorFacts};
+pub use source::GgufSource;
 pub use tokenizer::{build_vocab, token_id, GgufVocab, SpecialIds, VocabModel};
 pub use transform::{classify, xf_for, GgufDims, KeyClass, KeyXf, RowPerm, ValueXf};

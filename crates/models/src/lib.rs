@@ -57,8 +57,8 @@ pub mod model;
 pub mod module;
 pub mod ops;
 pub mod plan;
-pub mod spec;
 pub mod reference;
+pub mod spec;
 pub mod tensor;
 pub mod tokenizer;
 pub mod vlm;
@@ -72,11 +72,11 @@ pub use kernel::{Kernel, LaunchShape};
 pub use module::{ForwardCtx, KvBuffers, Module};
 pub use tensor::{LazyError, TensorOps};
 
+#[cfg(test)]
+mod port_tests;
 /// 测试套件(就近测试的公共件;仅测试构建编译)
 #[cfg(test)]
 pub mod testkit;
-#[cfg(test)]
-mod port_tests;
 
 /// 本 crate 的结果别名:只用于**边界**(构造期装载 / 执行收割)。
 /// 描述层内部禁止出现(契约五)。

@@ -220,6 +220,8 @@ pub fn padded_prefix_for_raw(
 ///
 /// 返回 [`PaddedSeq`]。`marks.len()` 必须 = 游程数(调用方按占位顺序对齐;
 /// 不符 = 响亮的 `Err`,不许静默错位)。未标记的段**一个 pad 都不加**。
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 pub fn pad_image_spans(
     ids: &[u32],
     marks: &[bool],

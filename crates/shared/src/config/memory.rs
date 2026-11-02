@@ -185,7 +185,7 @@ pub fn budget_parts(inp: &MemoryInputs) -> (FixedParts, u64, u64, usize) {
     let budget = target_total.saturating_sub(spend);
     let per_tok = per_tok_bytes(inp);
     let cap = (budget / per_tok.max(1)) as usize;
-    (fixed, target_total, budget.max(0), cap)
+    (fixed, target_total, budget, cap)
 }
 
 /// `context = "max"` 求解(非超卖:ctx = pool;超卖:ctx = model_max,pool = 预算)

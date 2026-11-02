@@ -62,8 +62,10 @@ impl MropeCfg {
         if merge == 0 {
             return Err(ModelError::Msg("MropeCfg::new: spatial_merge_size = 0".into()));
         }
-        if !(theta > 0.0) {
-            return Err(ModelError::Msg(format!("MropeCfg::new: theta {theta} 非法")));
+        if theta.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            return Err(ModelError::Msg(format!(
+                "MropeCfg::new: theta {theta} 非法"
+            )));
         }
         Ok(MropeCfg { sections, rotary_dim, theta, merge })
     }
@@ -267,8 +269,7 @@ pub fn token_types(ids: &[u32], image_token: u32, video_token: Option<u32>) -> V
         .collect()
 }
 
-/// 视频网格按帧展开(HF `get_rope_index` 入口的 `repeat_interleave(t, dim=0)`
-/// + `grid[:, 0] = 1`):每帧独立成段,T 轴恒 1。
+/// 视频网格按帧展开(HF `get_rope_index` 入口的 `repeat_interleave(t, dim=0)` + `grid[:, 0] = 1`):每帧独立成段,T 轴恒 1。
 pub fn split_video_frames(grids: &[GridThw]) -> Vec<GridThw> {
     let mut out = Vec::new();
     for &(t, h, w) in grids {
@@ -440,6 +441,9 @@ mod tests {
     /// HF parity(`OWL_HF_PARITY=1`):位置号**逐元素整数相等**(f32 形态无损)+
     /// delta 相等 + cos/sin `atol 1e-6`。四例:纯文本 / 单图 / 双图 / 视频两帧。
     #[test]
+    // 结构性豁免(2026-11-02 clippy 清理):
+    //   clippy::type_complexity —— 类型面 = 派发/表项签名,别名会挡住可读性
+    #[allow(clippy::type_complexity)]
     fn parity_matches_hf() {
         use crate::testkit::{hf_python, parity_enabled, skip_note, st_read, st_write, tmp_path};
         if !parity_enabled() {
@@ -496,10 +500,11 @@ mod tests {
                     ("video_grid_thw", &gv, vec![videos.len(), 3]),
                 ],
             );
-            let contract = format!(
-                r#"{{"merge": 2, "head_dim": 256, "rotary_dim": 64, "theta": 1e7, "sections": [11, 11, 10]}}"#
+            let contract = r#"{"merge": 2, "head_dim": 256, "rotary_dim": 64, "theta": 1e7, "sections": [11, 11, 10]}"#.to_string();
+            let manifest = hf_python(
+                "mrope.py",
+                &[inp.to_str().unwrap(), outp.to_str().unwrap(), &contract],
             );
-            let manifest = hf_python("mrope.py", &[inp.to_str().unwrap(), outp.to_str().unwrap(), &contract]);
             eprintln!("[hf manifest] mrope/{name}: {manifest}");
 
             let want_pos = st_read(&outp, "pos_ids");

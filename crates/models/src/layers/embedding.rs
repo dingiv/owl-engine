@@ -106,7 +106,7 @@ impl Embedding {
         // 声明的 `d_dim`;而索引的 `nbytes` 定义是 `elems/be*bb` ⇒ 内维必被
         // 块元素数整除(否则该 GGUF 的字节账本身就不自洽,reader 已拒)
         assert!(
-            be > 0 && self.d_dim % be == 0,
+            be > 0 && self.d_dim.is_multiple_of(be),
             "Embedding: GGUF {} 内维 {} 不是块大小 {be} 的整数倍(块布局无定义)",
             ty.name(),
             self.d_dim

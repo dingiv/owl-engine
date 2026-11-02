@@ -29,6 +29,8 @@ fn dir_of() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("../../models/Qwen/Qwen3.5-0.8B"))
 }
 
+// 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
+#[allow(clippy::field_reassign_with_default)]
 fn cfg_of(ordinal: usize) -> EngineConfig {
     let mut knobs = EngineKnobs::default();
     knobs.sampler_enabled = false;

@@ -190,6 +190,8 @@ impl DeviceRes for TestRes {
 // §2 台
 // ============================================================================
 
+// 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
 fn fire(
     res: &mut TestRes,
     exec: &mut Exec,

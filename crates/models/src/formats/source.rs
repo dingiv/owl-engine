@@ -75,7 +75,7 @@ impl SrcDtype {
 /// `src.len()` 不是 `dt.size_bytes()` 的整数倍、或 `out.len() < n` ⇒ 拒。
 pub fn decode_to_f32(src: &[u8], dt: SrcDtype, out: &mut [f32]) -> Result<(), ModelError> {
     let esz = dt.size_bytes();
-    if src.len() % esz != 0 {
+    if !src.len().is_multiple_of(esz) {
         return Err(ModelError::Msg(format!(
             "源字节长度 {} 不是 {} ({esz}B) 的整数倍",
             src.len(),

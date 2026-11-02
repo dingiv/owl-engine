@@ -153,7 +153,8 @@ pub struct UsageFacts {
 }
 
 impl UsageFacts {
-    fn to_json(&self) -> Json {
+    // `UsageFacts` 是 `Copy` 的小结构(4 个 usize)⇒ 按值收,与 clippy 的 `to_*` 约定一致。
+    fn to_json(self) -> Json {
         json!({
             "prompt_tokens": self.prompt,
             "completion_tokens": self.completion,

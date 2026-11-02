@@ -49,7 +49,10 @@ impl<'a> NamedSlots<'a> {
                 got: format!("{} 槽(线格式)", msg.args.len()),
             });
         }
-        Ok(Self { meta, args: &msg.args })
+        Ok(Self {
+            meta,
+            args: &msg.args,
+        })
     }
 
     /// 声明表(调用方要读声明侧属性时用)
@@ -82,10 +85,16 @@ impl<'a> NamedSlots<'a> {
     pub fn block(&self, name: &str) -> Result<BlockRef, OpError> {
         let a = &self.args[self.at(name)?];
         match a {
-            Arg::Block { id, .. } => Ok(BlockRef { id: *id, byte_offset: 0 }),
-            Arg::BlockSlice { id, byte_offset, .. } => {
-                Ok(BlockRef { id: *id, byte_offset: *byte_offset })
-            }
+            Arg::Block { id, .. } => Ok(BlockRef {
+                id: *id,
+                byte_offset: 0,
+            }),
+            Arg::BlockSlice {
+                id, byte_offset, ..
+            } => Ok(BlockRef {
+                id: *id,
+                byte_offset: *byte_offset,
+            }),
             other => Err(self.mismatch(name, "Block/BlockSlice", other)),
         }
     }
@@ -96,7 +105,13 @@ impl<'a> NamedSlots<'a> {
         let a = &self.args[self.at(name)?];
         match a {
             Arg::Block { id, dtype, rank } => Ok(Bytes::new(*id, 0, *dtype, *rank)),
-            Arg::BlockSlice { id, byte_offset, dtype, rank, .. } => {
+            Arg::BlockSlice {
+                id,
+                byte_offset,
+                dtype,
+                rank,
+                ..
+            } => {
                 if *byte_offset != 0 {
                     return Err(OpError::Contract {
                         op: self.meta.entry.into(),
@@ -161,23 +176,23 @@ impl<'a> NamedSlots<'a> {
     }
 }
 
-/// GDN chunked(face;零门)
-pub mod gdn_chunked;
-#[cfg(feature = "xqa")]
-pub mod xqa;
-/// GDN scalar(face;零门)
-pub mod gdn_scalar;
 /// 通信族(face;零门;TP2 S2)
 pub mod comm;
 /// cuBLAS GEMM face(feature=cublas,随底座)
 #[cfg(feature = "cublas")]
 pub mod cublas;
+/// GDN chunked(face;零门)
+pub mod gdn_chunked;
+/// GDN scalar(face;零门)
+pub mod gdn_scalar;
 /// Marlin face(feature=marlin,随底座)
 #[cfg(feature = "marlin")]
 pub mod marlin;
 /// NVFP4 GEMM face(feature=nvfp4,随 `arch-sm120`)
 #[cfg(feature = "nvfp4")]
 pub mod nvfp4;
+#[cfg(feature = "xqa")]
+pub mod xqa;
 /// FlashInfer 槽序签名 + scale 编码(ungated:models 零 feature 消费方
 /// 也引用;解析面仍在 feature = "flashinfer" 的 flashinfer.rs)
 pub mod fi_sig {
@@ -208,7 +223,10 @@ mod tests {
 
     fn launch(name: &str, args: Vec<Arg>) -> LaunchMsg {
         LaunchMsg {
-            kernel: crate::contract::KernelSource { name: name.into(), source: String::new() },
+            kernel: crate::contract::KernelSource {
+                name: name.into(),
+                source: String::new(),
+            },
             args,
             grid: (0, 0, 0),
             block: (0, 0, 0),
@@ -222,8 +240,18 @@ mod tests {
     fn parse_slots_are_exactly_declared() {
         // FA2 varlen 表始终存在（ops 声明面），client 模块本身在 flashinfer
         // feature 下才编；测试面显式列同一张槽名表，保证“声明面全覆盖”。
-        const FA2_SLOTS: &[&str] =
-            &["q", "k", "v", "cu_seqlens", "out", "rows", "heads", "head_dim", "n_seq", "scale"];
+        const FA2_SLOTS: &[&str] = &[
+            "q",
+            "k",
+            "v",
+            "cu_seqlens",
+            "out",
+            "rows",
+            "heads",
+            "head_dim",
+            "n_seq",
+            "scale",
+        ];
         let mut cases: Vec<(&str, &[&str])> = vec![
             (
                 crate::family::gdn_chunked::GDN_CHUNKED_FWD,
@@ -236,39 +264,111 @@ mod tests {
         ];
         // 通信族(TP2 S2;零门 ⇒ 无条件入锁):stage / reduce 各一条(三 dtype 同表)
         cases.extend([
-            (crate::family::comm::asset::STAGE_F16, crate::client::comm::PARSE_SLOTS),
-            (crate::family::comm::asset::STAGE_BF16, crate::client::comm::PARSE_SLOTS),
-            (crate::family::comm::asset::STAGE_F32, crate::client::comm::PARSE_SLOTS),
-            (crate::family::comm::asset::REDUCE_F16, crate::client::comm::PARSE_SLOTS_REDUCE),
-            (crate::family::comm::asset::REDUCE_BF16, crate::client::comm::PARSE_SLOTS_REDUCE),
-            (crate::family::comm::asset::REDUCE_F32, crate::client::comm::PARSE_SLOTS_REDUCE),
-            (crate::family::comm::asset::ONE_STAGE_F16, crate::client::comm::PARSE_SLOTS_1STAGE),
-            (crate::family::comm::asset::ONE_STAGE_BF16, crate::client::comm::PARSE_SLOTS_1STAGE),
-            (crate::family::comm::asset::ONE_STAGE_F32, crate::client::comm::PARSE_SLOTS_1STAGE),
+            (
+                crate::family::comm::asset::STAGE_F16,
+                crate::client::comm::PARSE_SLOTS,
+            ),
+            (
+                crate::family::comm::asset::STAGE_BF16,
+                crate::client::comm::PARSE_SLOTS,
+            ),
+            (
+                crate::family::comm::asset::STAGE_F32,
+                crate::client::comm::PARSE_SLOTS,
+            ),
+            (
+                crate::family::comm::asset::REDUCE_F16,
+                crate::client::comm::PARSE_SLOTS_REDUCE,
+            ),
+            (
+                crate::family::comm::asset::REDUCE_BF16,
+                crate::client::comm::PARSE_SLOTS_REDUCE,
+            ),
+            (
+                crate::family::comm::asset::REDUCE_F32,
+                crate::client::comm::PARSE_SLOTS_REDUCE,
+            ),
+            (
+                crate::family::comm::asset::ONE_STAGE_F16,
+                crate::client::comm::PARSE_SLOTS_1STAGE,
+            ),
+            (
+                crate::family::comm::asset::ONE_STAGE_BF16,
+                crate::client::comm::PARSE_SLOTS_1STAGE,
+            ),
+            (
+                crate::family::comm::asset::ONE_STAGE_F32,
+                crate::client::comm::PARSE_SLOTS_1STAGE,
+            ),
             // v1 两核融合(§11.2;2026-10-19;8 槽 —— 自己的表)
-            (crate::family::comm::asset::FUSED_F16, crate::client::comm::PARSE_SLOTS_FUSED),
-            (crate::family::comm::asset::FUSED_BF16, crate::client::comm::PARSE_SLOTS_FUSED),
-            (crate::family::comm::asset::FUSED_F32, crate::client::comm::PARSE_SLOTS_FUSED),
+            (
+                crate::family::comm::asset::FUSED_F16,
+                crate::client::comm::PARSE_SLOTS_FUSED,
+            ),
+            (
+                crate::family::comm::asset::FUSED_BF16,
+                crate::client::comm::PARSE_SLOTS_FUSED,
+            ),
+            (
+                crate::family::comm::asset::FUSED_F32,
+                crate::client::comm::PARSE_SLOTS_FUSED,
+            ),
             // barrier-only AR-2(2026-10-23):与 fused 同 8 槽线格式
-            (crate::family::comm::asset::BARRIER_F16, crate::client::comm::PARSE_SLOTS_FUSED),
-            (crate::family::comm::asset::BARRIER_BF16, crate::client::comm::PARSE_SLOTS_FUSED),
-            (crate::family::comm::asset::BARRIER_F32, crate::client::comm::PARSE_SLOTS_FUSED),
+            (
+                crate::family::comm::asset::BARRIER_F16,
+                crate::client::comm::PARSE_SLOTS_FUSED,
+            ),
+            (
+                crate::family::comm::asset::BARRIER_BF16,
+                crate::client::comm::PARSE_SLOTS_FUSED,
+            ),
+            (
+                crate::family::comm::asset::BARRIER_F32,
+                crate::client::comm::PARSE_SLOTS_FUSED,
+            ),
             // fp8 载荷档(§47 第二步;线格式与常规档**逐字同形** —— 只是核名不同)
-            (crate::family::comm::asset::STAGE_F8_F16, crate::client::comm::PARSE_SLOTS),
-            (crate::family::comm::asset::STAGE_F8_BF16, crate::client::comm::PARSE_SLOTS),
-            (crate::family::comm::asset::REDUCE_F8_F16, crate::client::comm::PARSE_SLOTS_REDUCE),
-            (crate::family::comm::asset::REDUCE_F8_BF16, crate::client::comm::PARSE_SLOTS_REDUCE),
+            (
+                crate::family::comm::asset::STAGE_F8_F16,
+                crate::client::comm::PARSE_SLOTS,
+            ),
+            (
+                crate::family::comm::asset::STAGE_F8_BF16,
+                crate::client::comm::PARSE_SLOTS,
+            ),
+            (
+                crate::family::comm::asset::REDUCE_F8_F16,
+                crate::client::comm::PARSE_SLOTS_REDUCE,
+            ),
+            (
+                crate::family::comm::asset::REDUCE_F8_BF16,
+                crate::client::comm::PARSE_SLOTS_REDUCE,
+            ),
         ]);
         #[cfg(feature = "cublas")]
         cases.extend([
-            (crate::family::cublas::GEMM_F16, crate::client::cublas::PARSE_SLOTS),
-            (crate::family::cublas::GEMM_BF16, crate::client::cublas::PARSE_SLOTS),
-            (crate::family::cublas::GEMM_F16_DST, crate::client::cublas::PARSE_SLOTS_DST),
+            (
+                crate::family::cublas::GEMM_F16,
+                crate::client::cublas::PARSE_SLOTS,
+            ),
+            (
+                crate::family::cublas::GEMM_BF16,
+                crate::client::cublas::PARSE_SLOTS,
+            ),
+            (
+                crate::family::cublas::GEMM_F16_DST,
+                crate::client::cublas::PARSE_SLOTS_DST,
+            ),
         ]);
         #[cfg(feature = "marlin")]
         cases.extend([
-            (crate::family::marlin::GEMM_W4A16, crate::client::marlin::PARSE_SLOTS),
-            (crate::family::marlin::GEMM_W4A16_BF16, crate::client::marlin::PARSE_SLOTS),
+            (
+                crate::family::marlin::GEMM_W4A16,
+                crate::client::marlin::PARSE_SLOTS,
+            ),
+            (
+                crate::family::marlin::GEMM_W4A16_BF16,
+                crate::client::marlin::PARSE_SLOTS,
+            ),
             (
                 crate::family::marlin::GEMM_W4A16_AWQ,
                 crate::client::marlin::PARSE_SLOTS_AWQ,
@@ -280,7 +380,10 @@ mod tests {
         ]);
         #[cfg(feature = "flashinfer")]
         cases.extend([
-            (crate::family::flashinfer::PREFILL_FI, crate::client::flashinfer::PARSE_SLOTS),
+            (
+                crate::family::flashinfer::PREFILL_FI,
+                crate::client::flashinfer::PARSE_SLOTS,
+            ),
             (
                 crate::family::flashinfer::PREFILL_FI_FP8KV,
                 crate::client::flashinfer::PARSE_SLOTS,
@@ -296,16 +399,28 @@ mod tests {
         ]);
         #[cfg(feature = "xqa")]
         cases.extend([
-            (crate::family::xqa::VERIFY_XQA, crate::client::xqa::PARSE_SLOTS),
-            (crate::family::xqa::DECODE_XQA, crate::client::xqa::PARSE_SLOTS),
+            (
+                crate::family::xqa::VERIFY_XQA,
+                crate::client::xqa::PARSE_SLOTS,
+            ),
+            (
+                crate::family::xqa::DECODE_XQA,
+                crate::client::xqa::PARSE_SLOTS,
+            ),
             // prefill 臂复用同一张槽序表 ⇒ 同一份 PARSE_SLOTS(覆盖门会强制列出)
-            (crate::family::xqa::PREFILL_XQA, crate::client::xqa::PARSE_SLOTS),
+            (
+                crate::family::xqa::PREFILL_XQA,
+                crate::client::xqa::PARSE_SLOTS,
+            ),
         ]);
         #[cfg(feature = "nvfp4")]
         cases.extend([
             // NVFP4(2026-10-28 远程线;合并日补登):运行期 GEMM + 装载期权重打包
             // 是**两条**族算子、两张槽名表 —— 前一版只落了 client face,漏了本锁
-            (crate::family::nvfp4::GEMM, crate::client::nvfp4::PARSE_SLOTS),
+            (
+                crate::family::nvfp4::GEMM,
+                crate::client::nvfp4::PARSE_SLOTS,
+            ),
             (
                 crate::family::nvfp4::PACK_WEIGHT,
                 crate::client::nvfp4::PARSE_SLOTS_PACK,
@@ -401,7 +516,13 @@ mod tests {
             "parse 槽名锁的 case 列表与【有 parse 面的族算子】清单不一致\
              (新增族算子必须在此显式声明它用哪张槽名表 —— 与 ops 的 A17 锁同律)"
         );
-        #[cfg(all(feature = "cublas", feature = "marlin", feature = "flashinfer", feature = "xqa", feature = "nvfp4"))]
+        #[cfg(all(
+            feature = "cublas",
+            feature = "marlin",
+            feature = "flashinfer",
+            feature = "xqa",
+            feature = "nvfp4"
+        ))]
         {
             // 全 feature(= 标准门跑法)⇒ 面清单必须覆盖**所有**族算子
             let fam: std::collections::BTreeSet<&str> = crate::ops::all()
@@ -423,17 +544,42 @@ mod tests {
         let blk = |id: u64| Arg::block(id, crate::contract::Dtype::F16, 3);
         // P-6b:7 块(q,k,v,beta,gate,state,tables)+ 7 标量(t,slot,nv,nk,kd,scale_bits,nt)
         let good: Vec<Arg> = vec![
-            blk(1), blk(2), blk(3), blk(4), blk(5), blk(6), blk(7), blk(8),
-            Arg::U64(1), Arg::U64(0), Arg::U64(1), Arg::U64(1), Arg::U64(128), Arg::U64(0),
+            blk(1),
+            blk(2),
+            blk(3),
+            blk(4),
+            blk(5),
+            blk(6),
+            blk(7),
+            blk(8),
+            Arg::U64(1),
+            Arg::U64(0),
+            Arg::U64(1),
+            Arg::U64(1),
+            Arg::U64(128),
+            Arg::U64(0),
             Arg::U64(1),
         ];
 
         // ① 未建表算子 ⇒ 拒(不回落位置切片)
-        let e = NamedSlots::new(&launch("不存在的核", good.clone())).err().expect("未建表必拒");
-        assert!(matches!(&e, OpError::Contract { field: "kernel.name", .. }), "{e}");
+        let e = NamedSlots::new(&launch("不存在的核", good.clone()))
+            .err()
+            .expect("未建表必拒");
+        assert!(
+            matches!(
+                &e,
+                OpError::Contract {
+                    field: "kernel.name",
+                    ..
+                }
+            ),
+            "{e}"
+        );
 
         // ② 槽数不符 ⇒ 拒(声明 15 槽)
-        let e = NamedSlots::new(&launch(name, good[..12].to_vec())).err().expect("槽数不符必拒");
+        let e = NamedSlots::new(&launch(name, good[..12].to_vec()))
+            .err()
+            .expect("槽数不符必拒");
         assert!(matches!(&e, OpError::Contract { field: "argc", .. }), "{e}");
 
         // ③ 名字不在声明表 ⇒ 拒(台面上指名道姓:槽名在 expect)
@@ -441,7 +587,12 @@ mod tests {
         let s = NamedSlots::new(&m).expect("建表");
         let e = s.u64("nv2").unwrap_err();
         match &e {
-            OpError::Contract { field: "slot", expect, got, .. } => {
+            OpError::Contract {
+                field: "slot",
+                expect,
+                got,
+                ..
+            } => {
                 assert!(got.contains("nv2"), "错语须指名槽名: {e}");
                 assert!(expect.contains("PARAMS"), "错语须指向声明表: {e}");
             }
@@ -467,8 +618,7 @@ mod tests {
         let e = NamedSlots::new(&ms)
             .expect("建表")
             .out_block("out", 8)
-            .err()
-            .expect("Out 槽 BlockSlice 必拒");
+            .expect_err("Out 槽 BlockSlice 必拒");
         assert!(matches!(&e, OpError::Contract { field: "slot", .. }), "{e}");
     }
 }

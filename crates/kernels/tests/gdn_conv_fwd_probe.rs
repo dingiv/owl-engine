@@ -72,6 +72,8 @@ fn hist_at(
 
 /// 单序列 host 参考:`x [len, d]`、`w [d, 4]`、`st [d, 3]`(原地更新)、
 /// `silu` 门;返回 `out [len, d]`
+// 结构性豁免(2026-11-02 clippy 清理):循环变量是**维度序**(多数组同索引 / 手工归约要显式序);zip 会藏住对应关系
+#[allow(clippy::needless_range_loop)]
 fn host_ref(x: &[f16], w: &[f16], st: &mut [f32], len: usize, d: usize, silu: bool) -> Vec<f16> {
     let mut out = vec![f16::from_f32(0.0); len * d];
     for chan in 0..d {
