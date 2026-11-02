@@ -832,10 +832,10 @@ KV 休眠：~4–7G/模型（可选）
 | `crates/models/src/formats/load.rs` | `load_group` 三臂 | cache hit 分支；manifest 记录 |
 | `crates/models/src/formats/load.rs` | `LoadOpts: Copy` | 引入 `Arc<WeightCache>`（改 Clone） |
 | `crates/engine/src/running.rs` | `RunningEngine` 无热卸载 | 由 worker 进程退出承担；P5 才做进程内 |
-| `crates/engine/src/tp.rs` | `shutdown_tp` / `retire_rank` | 进程退出路径复用；不要绕开 |
+| `crates/engine/src/parallel/tp.rs` | `shutdown_tp` / `retire_rank` | 进程退出路径复用；不要绕开 |
 | `crates/store/src/rel.rs` | disk tier / adopt | `hibernate/resume`；每模型目录 |
 | `crates/engine/src/engine.rs` | `disk_dir` 单目录 | 按模型 state_dir 覆盖 |
-| `crates/engine/src/session.rs` | 内存 session bank | P1 session manifest |
+| `crates/engine/src/serve/session.rs` | 内存 session bank | P1 session manifest |
 | `crates/backends/cuda/src/gpu_client.rs` | `spawn_with` GPU server 线程 | worker 生命周期由进程边界收口 |
 | `crates/backends/cuda/src/state.rs` | `GpuCtx` drop / block ledger | dump 前 sync + 块在场检查 |
 

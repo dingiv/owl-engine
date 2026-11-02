@@ -36,7 +36,7 @@ crates/engine/src/sampler.rs       REP_HISTORY_WINDOW/HISTORY_SENTINEL + penalty
 crates/kernels/cu/elems/topk32.cu  hist 载入 shared + 二分命中 + 惩罚 + top-32
 crates/kernels/src/ops/elems.rs    Topk32Split 参数表（hist/rep_penalty/hist_cap/offset）
 crates/models/src/ops.rs           topk32_of_logits 接 hist/rep/offset
-crates/engine/src/graph_fleet.rs   session/verify 图固定槽 rep_hist + rep_penalty
+crates/engine/src/graph/graph_fleet.rs   session/verify 图固定槽 rep_hist + rep_penalty
 crates/engine/src/exec/phases.rs   decode 每步写 committed history
 crates/engine/src/exec/spec.rs     verify 每轮写 committed history + 打开 use_cand
 crates/kernels/tests/topk32_penalty.rs  5 类 kernel 对拍
@@ -479,7 +479,7 @@ crates/kernels/cu/elems/topk32.cu
 crates/kernels/src/ops/elems.rs
 crates/kernels/src/driver.rs
 crates/models/src/ops.rs
-crates/engine/src/graph_fleet.rs
+crates/engine/src/graph/graph_fleet.rs
 crates/engine/src/exec/phases.rs
 crates/engine/src/exec/spec.rs
 crates/engine/src/sampler.rs

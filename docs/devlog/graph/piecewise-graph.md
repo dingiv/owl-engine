@@ -54,11 +54,11 @@
 | 现有件 | 位置 | 本设计怎么用 |
 |---|---|---|
 | **声明树 + 解释器**(`TensorOps` DAG、`_eval_rec`、**`EvalCtx.memo` 按节点 id 缓存**) | `crates/models/src/interpreters/eval.rs` | **断点的天然落点**:树执行天然有"节点序";memo 就是跨段的接力棒 |
-| `GraphPlan::{plan,step}` + `InputSlot/OutputSlot` | `engine/src/graph_plan.rs` | 段 = 一次 `graph_begin..graph_end`;槽面复用 |
+| `GraphPlan::{plan,step}` + `InputSlot/OutputSlot` | `engine/src/graph/graph_plan.rs` | 段 = 一次 `graph_begin..graph_end`;槽面复用 |
 | `graph_begin/graph_end` + `CaptureState{stream,slab,used}` | `backends/cuda/src/state.rs:456/487` | **要改**:现在是"一 plan 一窗";piecewise 要"一 plan 一条 slab + N 段" |
 | `Block::{Owned,Carved}`、`carve_block`、capture 窗内 `free_blocks` 走 arena 归还 | 同上 + M1/S1.5 | **要动**:跨段存活的值必须**钉住**,否则被归还后地址复用 ⇒ 前一段的烘焙指针指向别人 |
 | 捕获窗白名单(G2) | `backends/cuda/src/server/mod.rs` | 断点在**窗外**执行 ⇒ 不涉白名单;但需新增"续段"语义 |
-| fold 桶族(m=0..6) | `engine/src/graph_fleet.rs` | **先例**:一族多图、逐轮按 m 选图 —— piecewise 是它的"段内版" |
+| fold 桶族(m=0..6) | `engine/src/graph/graph_fleet.rs` | **先例**:一族多图、逐轮按 m 选图 —— piecewise 是它的"段内版" |
 
 **关键判断**:owl 的执行面不是"逐算子 imperative 循环",而是**一张声明树交给解释器**。
 ⇒ piecewise 不该做成"引擎里手写 N 个闭包",而应做成**解释器里的断点原语**(在遍历到被标记的节点时切段),
@@ -133,7 +133,7 @@ graph_launch(seg[N])
 | **A1** | 解释器:`EvalCtx` 增 **`overrides: HashMap<node_id, Bytes>`**(写进给定块)+ **`pins: HashSet<node_id>`**(禁止归还)+ memo 可跨调用带走 | `crates/models/src/interpreters/eval.rs`:`alloc_out` 调用点(635/658/747)改成"有 override 就用它";末尾回收处排除 `pins` | ~40 行 |
 | **A2** | 解释器:断点钩子 **`trait BreakCtx { fn at_break(&mut self, node: &TensorOps) -> Option<Bytes> }`**;`eval_ops_multi_*` 增可选 `break_ctx` 与 `memo_in/out` | 同上 + `eval.rs` 的 `_eval_rec` 入口 | ~60 行 |
 | **A3** | 捕获面:**一条 plan = 一条 slab + N 段**。`graph_end` 不再 `take()` 掉 slab/arena(改成"结算当前段");新增 `graph_end_segment()`/`graph_begin_segment()`(或 `graph_begin{continue_session:bool}`);`free_blocks` 对 Carved 的归还**在段间保持**(但 `pins` 不许还) | `backends/cuda/src/state.rs`(CaptureState 所有权)+ `server/mod.rs`(命令白名单/语义) | ~120 行 |
-| **A4** | plan 侧:**`PiecewisePlan`**(`segments: Vec<GraphId>` + `breaks: Vec<BreakOp>` + `pins` + `slots` + `output_blocks`)+ `step()` 的段循环;`PlanOutcome::CapturedSegmented{..}` | `engine/src/graph_plan.rs` | ~150 行 |
+| **A4** | plan 侧:**`PiecewisePlan`**(`segments: Vec<GraphId>` + `breaks: Vec<BreakOp>` + `pins` + `slots` + `output_blocks`)+ `step()` 的段循环;`PlanOutcome::CapturedSegmented{..}` | `engine/src/graph/graph_plan.rs` | ~150 行 |
 
 **A2 的 `BreakOp` 内容**(回放期可重放的最小闭包):
 ```rust
@@ -262,7 +262,7 @@ seg0 捕获(x+one→out0) → 窗外 eager 断点(mid=out0+out0) → seg1 捕获
 
 ### 10.3 下一步(A4 驱动件;给"别的模块也要用"定的形态)
 
-`engine/src/graph_plan.rs` 增 **`PiecewisePlan`**(与算子无关):
+`engine/src/graph/graph_plan.rs` 增 **`PiecewisePlan`**(与算子无关):
 
 ```rust
 pub struct PiecewisePlan<D> {
@@ -290,7 +290,7 @@ impl PiecewisePlan<D> {
 
 | 件 | 落点 | 说明 |
 |---|---|---|
-| `PlanCtx::break_node(&t)` | `engine/src/graph_plan.rs` | **断点在闭包建树处声明**(见下"形态修正 1") |
+| `PlanCtx::break_node(&t)` | `engine/src/graph/graph_plan.rs` | **断点在闭包建树处声明**(见下"形态修正 1") |
 | `GraphPlan::plan_piecewise(face, env, desc, idempotent, forward)` | 同上 | 逐段:干跑计量 → 捕获 → 窗外断点;尾段同律 |
 | `replay_piecewise()` / `piecewise_shape()` | 同上 | 段→断点→…→尾段顺序回放;段数口径**含尾段**(N 断点 ⇒ N+1 段) |
 | `TensorOps::operands()` | `models/src/tensor.rs` | 操作数只读视图(计划器推导段根用) |
@@ -321,10 +321,10 @@ N 段就是 N 倍显存。⇒ 每段捕获**前**先做一次**逐段干跑**(�
 
 | 件 | 落点 | 说明 |
 |---|---|---|
-| 断点采集面 `break_sink()` | `engine/src/graph_plan.rs` | `PlanCtx.breaks` 改 `Rc<RefCell<…>>`;模型层 push = 本 plan 登记断点(**单一拼写点**)。⚠️ 踩坑:自建一张表 ⇒ 驱动件永远看到 0 断点(实测"piecewise 无断点"降级)|
+| 断点采集面 `break_sink()` | `engine/src/graph/graph_plan.rs` | `PlanCtx.breaks` 改 `Rc<RefCell<…>>`;模型层 push = 本 plan 登记断点(**单一拼写点**)。⚠️ 踩坑:自建一张表 ⇒ 驱动件永远看到 0 断点(实测"piecewise 无断点"降级)|
 | `ForwardCtx.attn_break` | `models/src/module.rs`(+`model.rs::layer_ctx`) | 形态同 `gdn_tap`;7 个构造器全 None(零开销) |
 | 层侧登记 | `models/src/layers/attention.rs::note_attn_kernel` | 三处:**XQA verify/decode/FI** 的**核节点**(不含 GateMul/o_proj) |
-| `plan_verify` 接线 | `engine/src/graph_fleet.rs` | 开关开 ⇒ `plan_piecewise`(零断点 = **退化单图**,与 `plan` 同形 ⇒ 不静默降级为 eager);开关关 ⇒ 单图原路 |
+| `plan_verify` 接线 | `engine/src/graph/graph_fleet.rs` | 开关开 ⇒ `plan_piecewise`(零断点 = **退化单图**,与 `plan` 同形 ⇒ 不静默降级为 eager);开关关 ⇒ 单图原路 |
 | **段边界 keep** | `graph_plan.rs` | 见 11.3(不变量 I-7) |
 | `SegMode::{Capturing,Eager}` | `models/src/interpreters/eval.rs` | 捕获窗内**禁一切回收**(捕获期 free 被服务端白名单拒:实测"图捕获进行中:该操作被拒");口径 = 单图 path 的 `eval_ops_multi`。dry 计量仍走 Eager(回收 + 段末清扫,不泄漏) |
 | 空段/空尾守卫 | `graph_plan.rs` | 根全在 memo ⇒ 不建图(空捕获窗是硬错);`segs: Vec<Option<GraphId>>` + `tail: Option<GraphId>` |

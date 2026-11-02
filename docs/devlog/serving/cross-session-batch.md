@@ -256,7 +256,7 @@ pub(crate) enum StepAction {
 
 1. **先读**：本文；`multi-session.md`（上层边界）；
    `crates/kernels/tests/gdn_decode_batch_probe.rs`（B5.0 门）；
-   `crates/engine/src/graph_fleet.rs::plan_session`（session 图槽面）；
+   `crates/engine/src/graph/graph_fleet.rs::plan_session`（session 图槽面）；
    `crates/engine/src/exec/phases.rs::execute_decode`。
 2. **第一件事 = M0 门**（不改生产路径）：新建 `crates/engine/src/tests.rs::batch_decode_matches_serial`
    - 两会话（不同 prompt，已知 KV 状态）各跑 8 步：串行 vs 合批；

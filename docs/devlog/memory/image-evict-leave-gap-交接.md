@@ -486,12 +486,12 @@ P2 再尝试 idle 预热。
 - `crates/shared/src/config/mod.rs`
   - `ImageEvictMode`；`max_position`；
   - boot gate 按 mode 分支。
-- `crates/engine/src/session.rs`
+- `crates/engine/src/serve/session.rs`
   - `AgentSession.positions: Vec<[i32;3]>`
   - `max_pos`、`positioned`、`epoch`
   - `reset` / `rebase` / `commit_turn` 同步清/写 positions
   - `guard` 仍比 tokens；position 不参与 guard，但参与缓存键。
-- `crates/engine/src/turn.rs`
+- `crates/engine/src/serve/turn.rs`
   - `Turn` 携带新 positions / deletion；
   - `ActiveTurn.next_rope_pos`；
   - `TurnStats` 增加 `max_pos`/`gap_tokens`（可选）。
@@ -501,7 +501,7 @@ P2 再尝试 idle 预热。
 - `crates/engine/src/running.rs::submit_session_ex`
   - 删除识别后构造 `new_tokens/new_positions`；
   - 不再 `rebuild_after_delete` 后走 K 旋转路径。
-- `crates/engine/src/scheduler.rs`
+- `crates/engine/src/sched/scheduler.rs`
   - `plan_image_delete` 改成 `plan_image_evict_leave_gap`：
     - 校验页对齐；
     - 删 block_table 页；
@@ -534,7 +534,7 @@ P2 再尝试 idle 预热。
 - `crates/store` / `ChainCursor`
   - position-aware chain key（P1）；
   - snapshot key 带 epoch（P0 至少不让跨会话命中）。
-- `crates/engine/src/scheduler.rs::plan_prefix_reuse`
+- `crates/engine/src/sched/scheduler.rs::plan_prefix_reuse`
   - positioned 会话的复用规则。
 - `crates/engine/src/exec/img_evict.rs`
   - leave-gap 不再调用 `execute_k_shift`；

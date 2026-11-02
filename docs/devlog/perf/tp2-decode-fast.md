@@ -396,7 +396,7 @@ decode 118.5 / prefill 1419.8（MTP 链 384MiB 在 `[ctx-max] 池落账` 里以
 | `crates/engine/src/exec/spec.rs` | 轮末 `toks` 作为 tail；首轮空 tail |
 | `crates/shared/src/config/mod.rs` | `[spec] lookup` / `lookup_nmin|nmax|nstrong|agree` + 代数门 |
 | `crates/engine/src/engine.rs` | `DraftCfg` / `SpecBootInput` 接线 |
-| `crates/engine/src/spec_runtime.rs` | `SpecRuntime` 字段 + **仅 DFlash2** 的 boot 门 + 日志 |
+| `crates/engine/src/spec/spec_runtime.rs` | `SpecRuntime` 字段 + **仅 DFlash2** 的 boot 门 + 日志 |
 | `crates/engine/src/tests.rs` | `OWL_GATE_LOOKUP` 恒等门臂 |
 | `profiles/full.toml` / `profiles/qwen38_27b-3080_tp2-w4a16.toml` | 缺省关；TP2 主档转正 `lookup=true` |
 

@@ -794,7 +794,7 @@ logits **逐位相同**(`tp_vocab_split_gate`)。
 | 装载规则声明 | `models/src/module.rs`(Want.rule + `with_rule`)/ `layers/linear.rs`(layout 收口,仅真覆盖打标)/ `formats/shard.rs`(`want.rule` 优先) | 层声明 > 键表;`declared_rule_overrides_keytable` 单测 |
 | tied 拒 | `models/src/model.rs::sharded` | `head_split && tied` ⇒ 拒(embed 表切不了) |
 | 配置位 | `shared/src/config.rs`(`tp_vocab_split`)/ `apps/server/src/{config,main}.rs` / `engine/src/loader.rs`(`ModelLoader::vocab_split`) | 单卡给值 ⇒ 拒 |
-| 槽宽/stride | `engine/src/graph_fleet.rs`(decode/verify 槽 + 两处 argmax stride) | 全用 `logits_vocab()` |
+| 槽宽/stride | `engine/src/graph/graph_fleet.rs`(decode/verify 槽 + 两处 argmax stride) | 全用 `logits_vocab()` |
 | 拼接面 | `engine/src/running.rs`(`read_full_logits` + `concat_head_rows`)/ `exec/{phases,spec,draft,prefill_chunk}.rs` | **唯一出口**;判据 = `head_split_active()`(事实,不读意图位) |
 | 草稿档护栏 | `engine/src/engine.rs::boot_rank` | DFlash2/MTP × 切档 ⇒ **响亮拒**(见下) |
 | 门 | `engine/tests/tp_vocab_split_gate.rs`(新,27B)/(`tp_g8_gate` 加 tied-拒档) | L1 结构 / L2 数值 / L3 功能 |

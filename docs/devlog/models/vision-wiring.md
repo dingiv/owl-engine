@@ -223,15 +223,15 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
 | `apps/server/src/config.rs` | V1 ✅ | `--check` vision 校验/告警 |
 | `apps/server/src/openai.rs` | V1/V4 ✅ | `image_url` 解析 + 占位展开 |
 | `crates/models/src/vlm.rs` | V2 | `VlmInputs.cos_host/sin_host` + chunk 切片 |
-| `crates/engine/src/turn.rs` | V2 | `VlmPrepared` / `TurnOpts.images` / `ActiveTurn.vlm` |
+| `crates/engine/src/serve/turn.rs` | V2 | `VlmPrepared` / `TurnOpts.images` / `ActiveTurn.vlm` |
 | `crates/engine/src/exec/phases.rs` | V2 | 首块 prepare/塔 eval;`ChunkHost.vlm` |
 | `crates/engine/src/exec/prefill_chunk.rs` | V2 | mrope/image 绑定;桶图让位 |
 | `crates/engine/src/exec/phases.rs` | V2/V5 | decode `pos` 槽 = pos+delta;eager verify 的 `pos_t` = base+delta |
 | `crates/engine/src/exec/spec.rs` | V5 | verify 图 `pos_f` = pos+i+delta;slots/lens 真值 |
 | `crates/engine/src/exec/draft.rs` | V5 | `verify_forward(..., pos_delta)` 双 rank 透传 |
 | `crates/engine/src/running.rs` | V5/多图 | 移除“图像×spec 必拒”与单图硬门;保留非合批门 |
-| `crates/engine/src/scheduler.rs` | V2 | 图像 turn 的门(非合批;单请求多图) |
-| `crates/engine/src/tp.rs` | V3 | 两 rank 图像 prefill/塔复制 |
+| `crates/engine/src/sched/scheduler.rs` | V2 | 图像 turn 的门(非合批;单请求多图) |
+| `crates/engine/src/parallel/tp.rs` | V3 | 两 rank 图像 prefill/塔复制 |
 | `apps/server/src/vision_processor.rs` | V4 | 解码/缩放/normalize/patchify |
 | `apps/server/src/openai.rs` | V4 | `image_url` 解析 + 图像 part |
 | `apps/server/src/openai.rs` | V4 ✅ | 模板占位 `<|image_pad|>` 按 grid 展开 |

@@ -223,7 +223,7 @@ if self.turns.active.is_empty() {
 
 ### 5.2 调度面
 
-`crates/engine/src/scheduler.rs::plan_prefix_reuse`
+`crates/engine/src/sched/scheduler.rs::plan_prefix_reuse`
 
 ```text
 match_prefix(prompt)
@@ -612,8 +612,8 @@ debug 日志：
 
 ```text
 crates/engine/src/running.rs::step_need
-crates/engine/src/scheduler.rs::plan_prefix_reuse
-crates/engine/src/scheduler.rs::reuse_face
+crates/engine/src/sched/scheduler.rs::plan_prefix_reuse
+crates/engine/src/sched/scheduler.rs::reuse_face
 crates/engine/src/running.rs::store_load
 ```
 

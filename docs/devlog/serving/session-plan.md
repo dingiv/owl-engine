@@ -55,7 +55,7 @@ let logits = plan.read_output_f32("logits")?; // D2H 读槽
 
 ## 三、实现落点
 
-- `crates/engine/src/session.rs`(新):SlotSpec/StepCtx/SessionPlan;
+- `crates/engine/src/serve/session.rs`(新):SlotSpec/StepCtx/SessionPlan;
   捕获循环逻辑自 graphplan.rs 泛化(姿势 6/A1.4 预检/Governor 单档周期/
   哨兵③/seal 全保留);
 - graphplan.rs 保留(decode 专用,标 deprecated 语义;runner 真接线时

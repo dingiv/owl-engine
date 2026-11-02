@@ -289,6 +289,6 @@ fold 族原先按 `m=0..depth-1` 捕 7 张图(每张约 66M 驱动 exec)。fold 
 - 原始数据:本地实测档(`p5-*`/`p5b-*` P5 分相、`fold1-*`、`perm-*`、
   `eager-*`、`fold8-*` fold A/B、`mem2-*` A/B、`cublas-ws`、
   `vram-timeline-2037`;汇总 `P0-P3-2026-10-22.md`、`P5-fold-2026-10-22.md`)。
-- 相关代码:`crates/engine/src/state.rs`(FixedAfter/post/guard)、
+- 相关代码:`crates/engine/src/mem/state.rs`(FixedAfter/post/guard)、
   `crates/kernels/src/server/cublas.rs`(4MB 预绑)、
   `apps/server/src/debug.rs`(`blocks_top`)。

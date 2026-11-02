@@ -123,7 +123,7 @@
 
 ### 1.5 草稿池 ring（已落地）
 
-- `engine/src/state.rs`：DFlash2 草稿池按 `window+block` 的 ring 分配，
+- `engine/src/mem/state.rs`：DFlash2 草稿池按 `window+block` 的 ring 分配，
   不再按 `max_seq` 线性。
 - `naive_attn_nc.cu`：新增 `ring_cap`，逻辑位 `% ring_slots`；
   `ring_cap < 2048 + T` 直接 `__trap()`。
@@ -181,7 +181,7 @@
 - `crates/engine/src/exec/draft.rs`
 - `crates/engine/src/exec/spec.rs`
 - `crates/engine/src/engine.rs` / `spec_runtime.rs`
-- `crates/engine/src/state.rs`
+- `crates/engine/src/mem/state.rs`
 - `crates/kernels/cu/attn/naive_attn_nc.cu`
 - `crates/kernels/src/ops/attn.rs`
 

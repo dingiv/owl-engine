@@ -111,7 +111,7 @@ tspec.spec_seed_hidden = Some(hid)
 
 ### 2.3 图输出面
 
-`crates/engine/src/graph_fleet.rs::plan_session` 的 session 图目前输出：
+`crates/engine/src/graph/graph_fleet.rs::plan_session` 的 session 图目前输出：
 
 ```text
 outputs: logits / token (+ tap0..tap4 仅 DFlash2)

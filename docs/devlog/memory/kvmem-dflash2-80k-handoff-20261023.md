@@ -47,7 +47,7 @@ docs/devlog/memory/kvmem-dflash2-view-verify-design.md   # §9 是最终定位
 |---|---|
 | `crates/engine/src/exec/coverage.rs` | `SelectViewAt`、`view_pages_at`、`select_view_at`、`select_view_step` 复用；驻留/哈希/top8 探针 |
 | `crates/engine/src/exec/spec.rs` | `VerifyViewTables`、`verify_view_tables`、verify_round 接线、`spec.verify.view` 计数、`write_bt` 视图跳过、`xqa_pt_of` 截断、FI 表按臂构建 |
-| `crates/engine/src/select.rs` | `SelectView.blocks: Vec<ChainHash>` |
+| `crates/engine/src/sched/select.rs` | `SelectView.blocks: Vec<ChainHash>` |
 | `crates/shared/src/config/mod.rs` | `select_partial + spec` 只允许 `verify_arm=v2`、`decode_arm=v2`；单测更新 |
 | `crates/engine/src/engine.rs` | `boot_kvmem_check` 纵深臂门 |
 | `profiles/qwen38_27b-3090-w4a16-dflash-kvmem.toml` | 27B AWQ + DFlash2 d7 + KVMem overcommit（8141） |
@@ -81,7 +81,7 @@ pos[r] = logical pos
 
 ### 3.4 前一轮遗留（同一工作树，未提交）
 
-- `crates/engine/src/state.rs`：超卖档允许 auto pool `max_seq > cap`。
+- `crates/engine/src/mem/state.rs`：超卖档允许 auto pool `max_seq > cap`。
 - `crates/store/src/rel.rs`：`host_used` 含腿自报 `Host KvBlock`。
 - `docs/devlog/perf/vram-map.md`：上述记录。
 

@@ -369,9 +369,9 @@ T 虽然只有 ≤4，但核按每个 query 扫全历史 KV；8k ctx 下单次 e
 |---|---|---|
 | scratch 视图 | `crates/models/src/module.rs` | `AttnV2Scratch::prefix(seqs)`：复用 target verify 的 4 序列 scratch，取前 `m+1` 行零拷贝视图；越界返回 None（调用方回落旧路） |
 | 层注入 | `crates/models/src/layers/mtp.rs` | `propose_ext` 新增 `extend_v2` / `extend_bt8`，extend ctx 注入 `attn_v2` + `v2_bt8` |
-| 草稿 env | `crates/engine/src/spec_runtime.rs` | MTP 分支 `env.attn.verify_v2 = true`（只影响草稿 env；主 verify 仍按 FI/`verify_v2` 自己的档位） |
+| 草稿 env | `crates/engine/src/spec/spec_runtime.rs` | MTP 分支 `env.attn.verify_v2 = true`（只影响草稿 env；主 verify 仍按 FI/`verify_v2` 自己的档位） |
 | eager | `crates/engine/src/exec/draft.rs` | `propose_round` 构造 `[m+1, nb]` MTP 页表（每行同一条链，余页补零），取 `verify_attn_v2.prefix(m+1)` |
-| 图族 | `crates/engine/src/graph_fleet.rs` + `exec/draft.rs` | `propose` 桶图新增 `v2_bt8` 输入槽（`[m+1, nb]`）；`plan_propose_family` 按 m 取 scratch 前缀；`propose_graph_step` 每轮装填 |
+| 图族 | `crates/engine/src/graph/graph_fleet.rs` + `exec/draft.rs` | `propose` 桶图新增 `v2_bt8` 输入槽（`[m+1, nb]`）；`plan_propose_family` 按 m 取 scratch 前缀；`propose_graph_step` 每轮装填 |
 
 语义 = 每行一条伪序列：页表 = 同一条 MTP 链，`kv_lens[pos+i] =
 pos+i+1`，K0 先写本块，再由 v2 主核（在线 softmax + LSE 归并）读池。

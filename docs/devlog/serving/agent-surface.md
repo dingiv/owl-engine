@@ -716,7 +716,7 @@ V8 的"单变量"其实同时动了两件事(fp8 池 **与** XQA 激活 —— X
 
 **根因(代码级,一读即明)**:
 
-1. `crates/engine/src/state.rs`(XQA 资源面构造)—— 页表是**写死的恒等链**:
+1. `crates/engine/src/mem/state.rs`(XQA 资源面构造)—— 页表是**写死的恒等链**:
    `// 常量页表:单会话恒等链(0..nb)以 i32 位型走私进 f32 账叶`
    ⇒ 只在「单会话独占池、块从 0 起」时成立。
 2. 两张图的喂槽**不对称**:verify 图声明了 `xqa_pt` 输入槽却**从无写入**
@@ -751,7 +751,7 @@ KV** ⇒ 实测"答上一题"。冷启动第 1 个请求恰好在块 0.. 上 ⇒
 
 **连带发现(两条,均已立案)**:
 1. **`snap_max = 0` 会在运行期 panic**:快照池为空 ⇒ `capture_snap` 的
-   `expect("池非空")`(`crates/engine/src/state.rs:859`)爆在 owl-engine 线程,
+   `expect("池非空")`(`crates/engine/src/mem/state.rs:859`)爆在 owl-engine 线程,
    请求收到 503。**该组合无 boot 校验**(应 boot 期 fail-fast 或彻底禁用快照)。
 2. **白名单缺口**:f16 池需要 spec-dflash flavor 白名单外的算子
    (如 `owl_qknorm_rope_kv_insert_f16_knhd`)⇒ 现以诊断态 `allowed_ops = []` 关闸门绕过;

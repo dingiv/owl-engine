@@ -287,7 +287,7 @@ pub struct Maintain {
 ### Phase 1：引入 `StoreHook` 壳 —— ✅ 已完成（2026-10-25）
 
 - 新增 `StoreHook` / `Acquire` / `Release` / `Maintain` / `StoreOutcome` 类型
-  （`crates/engine/src/store_hook.rs`）；
+  （`crates/engine/src/mem/store_hook.rs`）；
 - `store_hook` 转发到现有 `pool_housekeeping` / `plan_onload` / N4 收尾，
   行为不变；
 - 正式 Node 与 H4 已改为 `store_hook`；旧 `Node` **直接删除**（没有保留
@@ -388,7 +388,7 @@ pub struct Maintain {
 ### 7.1 实际类型
 
 ```rust
-// crates/engine/src/store_hook.rs
+// crates/engine/src/mem/store_hook.rs
 pub(crate) enum StoreHook {
     Acquire(Acquire),
     Release(Release),
@@ -543,7 +543,7 @@ Phase 2 前就不会产生同步驱逐（树无可逐候选）。Phase 2 只验�
 ### 9.1 类型
 
 ```rust
-// crates/engine/src/store_hook.rs
+// crates/engine/src/mem/store_hook.rs
 pub(crate) enum Acquire {
     Capacity(Need),
     Load(LoadRequest),

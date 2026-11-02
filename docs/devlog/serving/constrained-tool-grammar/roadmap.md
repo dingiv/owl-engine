@@ -185,10 +185,10 @@ apps/server/src/openai.rs                   # tools -> GrammarPlan, tool_choice 
 apps/server/src/toolgrammar.rs（新）        # grammar 生成/缓存
 apps/server/src/config.rs                   # tool_grammar 配置
 apps/server/src/agent_trace.rs              # /debug/agent grammar 字段
-crates/engine/src/turn.rs                   # TurnOpts.grammar
+crates/engine/src/serve/turn.rs                   # TurnOpts.grammar
 crates/engine/src/exec/phases.rs            # host sampler 接缝
 crates/engine/src/exec/spec.rs              # spec verify 接缝
-crates/engine/src/graph_fleet.rs            # bitmask 图输入槽（P2）
+crates/engine/src/graph/graph_fleet.rs            # bitmask 图输入槽（P2）
 crates/kernels/...                          # apply_token_bitmask（P2）
 crates/engine/Cargo.toml                    # llguidance
 ```

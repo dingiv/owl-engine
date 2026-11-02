@@ -1009,7 +1009,7 @@ chat：
 | `crates/models/src/ops.rs` | 前向语义算子 | 训练反向算子/训练图 |
 | `crates/engine/src/loader.rs` | 模型装载 | adapter 装载/校验 |
 | `crates/engine/src/running.rs` | 推理执行态 | adapter 激活/图重捕 |
-| `crates/engine/src/graph_fleet.rs` | 推理图族 | adapter 版本化图/重捕 |
+| `crates/engine/src/graph/graph_fleet.rs` | 推理图族 | adapter 版本化图/重捕 |
 | `apps/server/src/openai.rs` | chat 解析 | `adapter` 字段/校验 |
 | `apps/server/src/main.rs` | 单 server | 学习 API 路由；训练不在此进程 |
 | `crates/shared/src/config` | 单模型配置 | adapter/learning 配置段 |

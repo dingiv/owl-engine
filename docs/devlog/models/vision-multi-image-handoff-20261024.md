@@ -85,13 +85,13 @@ The 4B MTP test profile has `snap_msg_boundary=false`, `image_evict=false`, and
 
 | File | Relevant entry |
 |---|---|
-| `crates/engine/src/state.rs` | `capture_spec_snap`, `restore_spec_snap`, `capture_snap`, `restore_snap` |
+| `crates/engine/src/mem/state.rs` | `capture_spec_snap`, `restore_spec_snap`, `capture_snap`, `restore_snap` |
 | `crates/engine/src/exec/spec.rs` | `spec` round; `ensure_spec_snap`; snapshot capture/restore around fold/rollback |
 | `crates/engine/src/running.rs` | image gate, `TurnImage`, `image_pad_law` |
-| `crates/engine/src/img_evict.rs` | `pad_image_spans`, `image_runs`, text delete detection |
+| `crates/engine/src/vision/img_evict.rs` | `pad_image_spans`, `image_runs`, text delete detection |
 | `crates/engine/src/exec/phases.rs` | `prepare_vlm_rank` (multi-image tower preparation) |
-| `crates/engine/src/msg_boundary.rs` | message-boundary snap points (main change) |
-| `crates/engine/src/turn.rs` | `TurnImage`, `ActiveTurn.img_spans/img_pads` |
+| `crates/engine/src/serve/msg_boundary.rs` | message-boundary snap points (main change) |
+| `crates/engine/src/serve/turn.rs` | `TurnImage`, `ActiveTurn.img_spans/img_pads` |
 | `crates/models/src/vlm.rs` | multi-grid `Vlm::inputs`; chunk-local pos |
 | `crates/models/src/layers/mrope.rs` | adjacent image/video grid segmentation |
 | `crates/kernels/src/server/flashinfer.rs` | FA2 varlen, cu cache, legacy FI ragged |

@@ -178,7 +178,7 @@ crates/engine/src/running.rs:2188-2210
 `StoreOutcome` 只有：
 
 ```text
-crates/engine/src/store_hook.rs
+crates/engine/src/mem/store_hook.rs
   applied / loaded_blocks / state_slot
 ```
 
@@ -210,7 +210,7 @@ Release(grant)
 
 ### P1-1 两套准入账没有对账
 
-- `crates/engine/src/sched_policy.rs::Admission`：按 turn 预留页、会话守卫、退避；
+- `crates/engine/src/sched/sched_policy.rs::Admission`：按 turn 预留页、会话守卫、退避；
 - `crates/store/src/budget.rs::Admission`：按 floor/cache/session_held/elastic。
 
 `scheduler::store_facts()` 读 `turns.admission.reserved_pages()`；
@@ -319,7 +319,7 @@ crates/store/src/rel.rs:1133-1171
 ### P2-2 `pool_cap` 的固定面仍是硬编码常数
 
 ```text
-crates/engine/src/state.rs:1939-1972
+crates/engine/src/mem/state.rs:1939-1972
   GRAPH_SLAB_BUDGET = 320MiB
   WARMUP_MISC_BUDGET = 138MiB
   fixed_after = ...

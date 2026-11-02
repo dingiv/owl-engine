@@ -111,12 +111,12 @@ crates/engine/src/exec/phases.rs
 crates/engine/src/exec/prefill_chunk.rs
 crates/engine/src/exec/spec.rs
 crates/engine/src/exec/turn_end.rs
-crates/engine/src/img_evict.rs
+crates/engine/src/vision/img_evict.rs
 crates/engine/src/running.rs
-crates/engine/src/scheduler.rs
-crates/engine/src/session.rs
+crates/engine/src/sched/scheduler.rs
+crates/engine/src/serve/session.rs
 crates/engine/src/tests.rs
-crates/engine/src/turn.rs
+crates/engine/src/serve/turn.rs
 crates/engine/tests/engine.e2e.rs
 crates/models/src/vlm.rs
 crates/shared/src/config/mod.rs
@@ -147,7 +147,7 @@ image_evict = true
 
 ### 2.2 Session 位置账
 
-`crates/engine/src/session.rs`：
+`crates/engine/src/serve/session.rs`：
 
 ```rust
 pub positions: Vec<[i32; 3]>
@@ -164,7 +164,7 @@ pub position_epoch: u32
 
 ### 2.3 删除计划
 
-`crates/engine/src/scheduler.rs`：
+`crates/engine/src/sched/scheduler.rs`：
 
 ```text
 plan_image_leave_gap
@@ -641,7 +641,7 @@ GPU 测试必须串行，先确认卡空闲；不要用 `pkill -f`，用 `nvidia
 
 实现：
 
-- `crates/engine/src/vlm.rs`
+- `crates/engine/src/vision/vlm.rs`
   - `VlmImageKey`：像素 `f32.to_bits()` 双 64 位指纹 + 长度 + grid；
   - `VlmMergedCache`：每 rank 一份，LRU，上限 256 MiB；
   - `merged_rows`：按 `t · (h/merge) · (w/merge)` 校验行数；
@@ -745,7 +745,7 @@ leave-gap 删除时，删除段前的 `pad_before` 块留在 padded 前缀里，
 
 ### 13.3 修复
 
-`crates/engine/src/running.rs` + `crates/engine/src/img_evict.rs`：
+`crates/engine/src/running.rs` + `crates/engine/src/vision/img_evict.rs`：
 
 - 新增 `padded_prefix_for_raw()`：把 unpadded 前缀长度映射回 padded 切点，
   **吞掉切点后的 pad 块**（孤儿 pad 必须留下）。

@@ -2564,7 +2564,7 @@ adopt(entries)         启动扫描后**回填账**(大小不符/超预算/重�
   `.tmp` 残件在扫描时被清理(崩在 rename 前的半块不会被当成好块);
 - **有界**:`budget_bytes = 0` = 关层;越界 = 响亮拒(调用方先 `plan_evict`);
 - **零 I/O**:store 不碰文件系统(§21);真读写由 engine 在 `spawn_blocking` 里做
-  (`engine/src/disk_io.rs`:原子写 / 读回校验大小 / 删文件 / 扫目录)。
+  (`engine/src/mem/disk_io.rs`:原子写 / 读回校验大小 / 删文件 / 扫目录)。
 
 ### 31.3 层级律:**逐层,不跨层**(设备 → 宿主 → 磁盘)
 
@@ -3217,11 +3217,11 @@ interval_ms   = 空转两次之间至少隔多久（节流）
 ```text
 crates/shared/src/config/mod.rs     runtime.host_pressure_request_slots/snaps
 crates/engine/src/engine.rs         EngineKnobs 两字段 + from_config
-crates/engine/src/store_hook.rs     Maintain::HostPressure { kv, snap }
+crates/engine/src/mem/store_hook.rs     Maintain::HostPressure { kv, snap }
 crates/store/src/hooks.rs           Need.host_kv_slots / host_snap_slots
 crates/store/src/hooks.rs           plan_capacity 分腿 host goal
 crates/engine/src/running.rs        pressure_need / idle_tick / relieve_pressure
-crates/engine/src/housekeeping.rs   （可选）每次请求上限的指标/日志
+crates/engine/src/sched/housekeeping.rs   （可选）每次请求上限的指标/日志
 profiles/full.toml                  两个新键
 crates/engine/src/tests.rs          目标裁剪 + 长链前缀 + 快照条数门
 crates/store/src/rel.rs             两腿 HostPressure plan 门

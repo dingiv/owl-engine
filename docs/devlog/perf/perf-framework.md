@@ -382,7 +382,7 @@ count(tag, n)          // 计数
 
 ### 10.4 ✅ 已修:eager 臂 decode 每步泄漏 → ~100 步 OOM(真 bug)
 
-`GraphPlan::replay` 的 `Mode::Eager` 走 [`eval_current`](../crates/engine/src/graph_plan.rs)
+`GraphPlan::replay` 的 `Mode::Eager` 走 [`eval_current`](../crates/engine/src/graph/graph_plan.rs)
 → **`eval_ops_multi`(plain 口径:块常驻,无回收)** ⇒ 每步中间块全留存,
 实测 ~100 步后 `CUDA_ERROR_OUT_OF_MEMORY`,且**失败后池不可恢复**(后续请求立刻再 OOM)。
 生产走 Captured 所以从未暴露。

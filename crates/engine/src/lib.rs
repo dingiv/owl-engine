@@ -30,42 +30,28 @@
 //! 里程碑对齐 charter:M0 骨架 → M1 图治理最小闭环 → M2 TP2 comm →
 //! M3 模型 + DFlash2 对齐线 → M4 冲刺线。
 
-pub mod graph_plan;
-pub mod session;
-pub mod turn;
+// ── 模块归拢(2026-11-03)──────────────────────────────────────────────
+// 目录 = **域**(与 charter / 题面词汇对齐);每个域自己的 `mod.rs` 写"什么进这里"。
+// 根只留**门面**(`engine` 构造/run/submit、`running` 执行态、`loader` 装载)
+// + 跨域叶子(`sampler`:greedy 与 spec 共用)+ 测试面。
+//
+// **对外路径一个字都没变**:下面的 `pub use` 把域内模块重新挂回 crate 根
+// —— 原来平铺时的 `crate::xxx` 与 `owl_engine::xxx` 全部继续有效。
+// 归拢是**物理整理**,不是接口改版。
+mod graph; // 图治理:plan(三态编排)+ fleet(图族账)
+mod kernels; // 算子族装配参数下发(设备能力 ≠ 族装配)
+mod mem; // 内存/存储三层:StatePool / Store 钩子 / 磁盘执行面
+mod parallel; // 并行域:TP2 双 rank 装配
+mod perf; // 诊断/取证:dump 路径唯一构造点
+mod sched; // 调度域(S0 决策半):词汇 / 政策 / 选择层 / 保洁账
+mod serve; // 请求面:Session → Turn → Step + 消息边界
+mod spec; // 投机解码运行域(轮内执行在 exec/)
+mod vision; // 视觉:VLM 请求态 / 塔输出缓存 / 图像段前缀删除
+pub(crate) mod exec; // 执行器(S0 决策/执行分离的**执行半**;本就在目录里)
 
-// engine 面(2026-10-01 拆分:原单文件 1782 行 → 六户;对外路径经
-// re-export 保持不变 —— owl_engine::{Engine, EngineConfig,
-// LoadedModel, ModelLoader, RunningEngine})
-pub(crate) mod disk_io;
-pub(crate) mod engine;
-pub(crate) mod exec;
-pub(crate) mod graph_fleet;
-/// **算子族装配参数的下发面**(设备能力 ≠ 族装配;2026-11-01)
-pub(crate) mod kernel_cfg;
-// **状态域户**(2026-10-21 收户):选择层运行态 / 保洁账 —— 字段私有,
-// 只经语义方法读写(见各模块头)。
-pub(crate) mod housekeeping;
-/// 前缀无感删除:host 纯函数面(识别 / 页对齐 pad / 位置自证)
-pub(crate) mod img_evict;
-pub(crate) mod loader;
-/// 消息边界 → 页对齐 GDN 快照点(纯 host;2026-10-24)
-pub(crate) mod msg_boundary;
-pub(crate) mod running;
+// 跨域叶子:greedy 与 spec 共用的 host 采样器(不属任何单域)
 pub(crate) mod sampler;
-// **调度政策**:准入 + 相位两个独立状态机(纯数据/零 I/O;事实由引擎每拍注入)。
-// 本刀只落骨架与算式,尚未接线 ⇒ 允许死码(接线下一步)。
-pub(crate) mod probe_dump;
-#[allow(dead_code)]
-pub(crate) mod sched_policy;
-pub(crate) mod scheduler;
-pub(crate) mod select;
-pub(crate) mod spec_runtime;
-pub(crate) mod state;
-/// Store 三钩子契约（Acquire / Release / Maintain；2026-10-25 Phase 1）
-pub(crate) mod store_hook;
-pub(crate) mod tp;
-pub(crate) mod vlm;
+
 // 测试分层(test-architecture.md):单元测试走 cfg(test);
 // e2e 场景面(源文件里的 pub async fn,无 #[test])走 feature `e2e`,
 // 由 crates/engine/tests/engine.e2e.rs 手动调用。
@@ -74,6 +60,27 @@ pub mod tests;
 /// GGUF 档 e2e 门(纯测试模块;非测试构建不编译)
 #[cfg(test)]
 pub mod tests_gguf;
+
+// ── 按原可见性把域内模块挂回根(旧路径兼容)──────────────────────────
+pub use graph::graph_plan;
+pub use serve::{session, turn};
+
+pub(crate) use graph::graph_fleet;
+pub(crate) use kernels::kernel_cfg;
+pub(crate) use mem::{disk_io, state, store_hook};
+pub(crate) use parallel::tp;
+pub(crate) use perf::probe_dump;
+pub(crate) use sched::{housekeeping, sched_policy, scheduler, select};
+pub(crate) use serve::msg_boundary;
+pub(crate) use spec::spec_runtime;
+pub(crate) use vision::{img_evict, vlm};
+
+// engine 门面(2026-10-01 拆分:原单文件 1782 行 → 六户;对外路径经
+// re-export 保持不变 —— owl_engine::{Engine, EngineConfig,
+// LoadedModel, ModelLoader, RunningEngine})
+pub(crate) mod engine;
+pub(crate) mod loader;
+pub(crate) mod running;
 
 pub use engine::{Engine, EngineConfig, EngineKnobs};
 pub use owl_iface::handle::{AssetClass, DeviceHandle, Owner};

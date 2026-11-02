@@ -29,7 +29,7 @@ chain 每步 → logits → argmax = d_{j+1}
 返回: concat_rows(drafts)  [depth, 1]
 ```
 
-`crates/engine/src/graph_fleet.rs::plan_propose_family` 输出槽只有：
+`crates/engine/src/graph/graph_fleet.rs::plan_propose_family` 输出槽只有：
 
 ```text
 OutputSlot { name: "drafts", shape: [depth, 1], dtype: F32 }
@@ -37,7 +37,7 @@ OutputSlot { name: "drafts", shape: [depth, 1], dtype: F32 }
 
 ### 1.2 verify 行预算
 
-`crates/engine/src/graph_fleet.rs::plan_verify`：
+`crates/engine/src/graph/graph_fleet.rs::plan_verify`：
 
 ```text
 T = depth + 1 定形（depth1 = boot depth + 1）

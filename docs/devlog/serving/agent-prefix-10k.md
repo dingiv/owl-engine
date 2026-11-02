@@ -163,7 +163,7 @@ snap_msg_min_span = 0      # 0 = 即使边界贴近 chunk 起点也切；>0 可�
 - 新增 `profiles/qwen38_27b-3090-gguf-agent.toml`：GGUF Q4_K_M / 32K /
   `prefix_cache=true` / `snap_max=4` / `snap_host_mb=2048` /
   `implicit_session=true` + 消息边界快照，不启用 KVMem 选择层。
-- 新增 `crates/engine/src/msg_boundary.rs`：`message_snap_points` 纯函数
+- 新增 `crates/engine/src/serve/msg_boundary.rs`：`message_snap_points` 纯函数
   （`open_ids` 是参数，不写死分隔串）+ 单测。
 - `prefill_step_chunk_msg` 接 `msg_snaps`；scheduler/running/phases 四处
   生产调用点同源；`Turn`/`ActiveTurn` 携带 `msg_snaps`。

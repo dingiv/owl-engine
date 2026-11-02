@@ -396,7 +396,7 @@ fn forward(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
 
 ### 15.5 ④ KV/状态池:`ModelDims` 套 plan
 
-`engine/src/state.rs` 的 `ModelDims{hq,hkv,hd,nk,hk,nv,hv,hidden}` 已参数化 ——
+`engine/src/mem/state.rs` 的 `ModelDims{hq,hkv,hd,nk,hk,nv,hv,hidden}` 已参数化 ——
 构造时套同一 plan(与 §15.2 同源;KV 池按头切、GDN 格按 nv 切)。**零新概念**。
 
 ### 15.6 S4e 引擎双 actor(形态)
@@ -543,8 +543,8 @@ q_proj ⇒ SegQGate;in_proj_qkvz ⇒ SegQKVZ;in_proj_a ⇒ PerHead)+
 | `models/src/interpreters/eval.rs` | **7 个求值入口**带 `tp: Option<&TpCtx>`:`eval_ops_env` / `eval_ops_scoped_env` / `eval_ops_scoped_env_pool` / `eval_ops_multi` / `eval_ops_multi_env` / `eval_ops_multi_scoped_env` / `eval_segment`(piecewise **逐段**带上 —— 段内 AR 否则全丢)。EvalCtx 存 `tp.cloned()`(轻句柄) |
 | `models/src/module.rs` | `TpCtx: Clone`(Bytes 小 POD;每图/每次求值各持一份) |
 | **rank 标记点** | 注入处**决策点打标**(发射之前):静态 tag 计数 `tp.ar.r0`/`tp.ar.r1`(metrics;store 缺席 = 静默跳过,纯观测面)+ `log_debug!("tp", "AR 注入 rank=… node=… label=… bytes=… slot=…")`。层键不在节点上(layer 零改动的代价),故记 node/label/字节数 |
-| `engine/src/graph_plan.rs` | `GraphPlan.tp: Option<TpCtx>` + `plan`/`plan_piecewise` 参数;eager/捕获/piecewise 三路求值全带 |
-| `engine/src/graph_fleet.rs` / `prefill_plan.rs` | `FleetBoot.tp` / `BucketBoot.tp`(装配期烘进每张图/每个桶) |
+| `engine/src/graph/graph_plan.rs` | `GraphPlan.tp: Option<TpCtx>` + `plan`/`plan_piecewise` 参数;eager/捕获/piecewise 三路求值全带 |
+| `engine/src/graph/graph_fleet.rs` / `prefill_plan.rs` | `FleetBoot.tp` / `BucketBoot.tp`(装配期烘进每张图/每个桶) |
 | `engine/src/running.rs` + `exec/*` | `RunningEngine.tp`(执行面唯一注入口;K2/K3 填入);exec **全部**求值点透传 `self.tp.as_ref()` |
 | 便利入口(`eval`/`eval_ops`/`eval_ops_scoped`/`eval_ops_tap`) | 签名不变(单卡/测试门面),内部传 `None` |
 
@@ -562,7 +562,7 @@ q_proj ⇒ SegQGate;in_proj_qkvz ⇒ SegQKVZ;in_proj_a ⇒ PerHead)+
 
 | 落点 | 内容 |
 |---|---|
-| `engine/src/tp.rs`(新) | `TpStaging`(own/peer 双块 + `StagingLayout` 单源)/ `TpRank`(分片计划 + staging + `RankModel` + `RankDev`)/ `TpEngine`(装配 + 出口 + `shutdown`) |
+| `engine/src/parallel/tp.rs`(新) | `TpStaging`(own/peer 双块 + `StagingLayout` 单源)/ `TpRank`(分片计划 + staging + `RankModel` + `RankDev`)/ `TpEngine`(装配 + 出口 + `shutdown`) |
 | `TpEngine::assemble`(GpuClient 特化) | **探测** UUID(驱动枚举)→ BAR1(`nvidia-smi -q -d MEMORY`,BDF 键)→ P2P(`cuDeviceCanAccessPeer` **双向**)⇒ `PeerPlan::plan`(**混插/不支持 ⇒ 响亮拒**,D5)⇒ **显式能力事实**入通用装配 |
 | 握手(建图之前) | `peer_alloc`(两侧)→ fd 交叉 → `peer_import`(两侧;所有权归分配侧)⇒ `TpCtx{plan, own, peer, slot_bytes}` |
 | `assemble_with_staging`(通用) | 每 rank `boot_rank`(**唯实现**,与单卡 `Engine::run` 同一条);两侧 slot 布局一致性硬门;rank0 的 tokenizer 归 host(rank1 的**丢弃**) |
@@ -800,7 +800,7 @@ OWL_TP_TEST_DEV_A=0 OWL_TP_TEST_DEV_B=1 OWL_0_8B_DIR=<…/Qwen3.5-0.8B> \
 ### 20.0 你的位置
 
 - worktree:`工作树 w4a8-p1`(分支 `feat/w4a8-p1`);**当前 28 文件改动未提交**
-  (含 `crates/engine/src/tp.rs`、`crates/engine/tests/tp_{assemble,g8}_gate.rs` 三个新文件);
+  (含 `crates/engine/src/parallel/tp.rs`、`crates/engine/tests/tp_{assemble,g8}_gate.rs` 三个新文件);
   提交须等用户点头(工作区纪律)。
 - 真机:TP 门用 **3080 对 = CUDA ordinal 2/3**;`OWL_0_8B_DIR=<…/Qwen/Qwen3.5-0.8B>`
   (0.8B 是 tied 检查点:无 `lm_head.weight`)。
@@ -823,7 +823,7 @@ OWL_TP_TEST_DEV_A=0 OWL_TP_TEST_DEV_B=1 OWL_0_8B_DIR=<…/Qwen3.5-0.8B> \
 |---|---|---|---|---|
 | **T1** | **G8-a 配置内不变性门**(最高价值) | 新 `crates/engine/tests/tp_determinism_gate.rs` | 同 world 下跑同一 prompt 的多组形状:① 顺序单请求 ② 并发 1/2/4(引擎已有 submit 队列)③ `prefill_chunk` 32/64/128 ④ 前缀缓存开/关;逐组取 `session_token_ids` 比**逐位唯一** | "Unique samples: 1" 形态;门名/判据与 §19.2 一致 |
 | **T2** | **G8-b 改比较器** | `crates/engine/tests/tp_g8_gate.rs` | 用 `read_output_f32("logits")` 自算 top-N;判据 = token 相同 或 互为 top-N;**首分歧步 + 分歧率**上屏;分歧即止 | 与 vLLM `check_logprobs_close` 同形;阈值待 20.3 拍板 |
-| **T3** | **方案 A:位级 transport 门** | `crates/engine/src/tp.rs`(加"允许同卡双 rank"的**测试档**入口,生产路径保持拒)+ 新 `tp_transport_bits_gate.rs` | 同卡开两个 `Engine`(同 ordinal)→ `TpEngine::assemble` → 与跨卡 TP2 比 token 账/logits **逐位** | 逐位相等;注意:两臂须**同 GPU 型号**、显存够(0.8B 可) |
+| **T3** | **方案 A:位级 transport 门** | `crates/engine/src/parallel/tp.rs`(加"允许同卡双 rank"的**测试档**入口,生产路径保持拒)+ 新 `tp_transport_bits_gate.rs` | 同卡开两个 `Engine`(同 ordinal)→ `TpEngine::assemble` → 与跨卡 TP2 比 token 账/logits **逐位** | 逐位相等;注意:两臂须**同 GPU 型号**、显存够(0.8B 可) |
 | **T4** | **AR 归约序纪律落地** | `crates/backends/comm` 头注 + 本节表 | 把 19.3-① 写成代码注释与门依赖(S5 后 G8-a 必须仍绿) | 文档 + 门依赖登记 |
 | **T5** | (backlog)**非贪心确定性采样** | `crates/engine/src/sampler.rs` | 种子哈希 Gumbel(抄 SGLang `multinomial_with_seed`) | v1 不做,记 backlog |
 
@@ -1924,7 +1924,7 @@ A 期只换**搬运执行体**(SM 核 → CE),协议语义不变 ⇒ 这正是 A
 **⇒ 落地清单(四步,全部定点,不再有选择)**:
 | # | 改哪 | 改什么 |
 |---|---|---|
-| 1 | `engine/src/tp.rs` | staging 布局 `N_SLOTS: 2 → 1`;新增一块 **inbox**(VMM `peer_alloc`,头 = `slot_bytes=32MB, n_slots=1`),入 TP 上下文 |
+| 1 | `engine/src/parallel/tp.rs` | staging 布局 `N_SLOTS: 2 → 1`;新增一块 **inbox**(VMM `peer_alloc`,头 = `slot_bytes=32MB, n_slots=1`),入 TP 上下文 |
 | 2 | `models/.../eval.rs` 注入点 | **2 发 → 3 发**:`stage`(own=本端 staging)→ **CE 拷**(`copy_block_at(&peer, HDR, &inbox, HDR, n)`;两端固定)→ `add`(`reduce` 核绑 `own=peer=inbox`、`slot_bytes` 同 inbox 头;**核零改动**) |
 | 3 | 门 | 按 §28 的新判据复跑 + `ar_stress_gate`(490 轮 + 20 轮回放,含多 block)+ `tp_g8_gate`/`tp_determinism_gate` |
 | 4 | 读数 | 判据:`AR(5.24MB)` 应 590 → **≤ 450µs**(A2 已量 392);若 `n_slots=1` 的贴身耦合拖慢,则看 `RR`/`AR` 两列决定去留 |
@@ -4086,7 +4086,7 @@ fa->allreduce(stream, reg_buffer, out, numel());      // ② **一个**融合核
 | 族 id | `kernels/src/family/comm.rs` | 95 |
 | **设备侧** | `backends/cuda/src/comm/{ar,peer,mod}.rs` | 586 |
 | | `backends/cuda/src/state.rs`(捕获/图/池,AR 是其中一段)| 2804 |
-| **引擎侧** | `engine/src/tp.rs`(staging + arena + handshake)| 841 |
+| **引擎侧** | `engine/src/parallel/tp.rs`(staging + arena + handshake)| 841 |
 | 注入点 | `models/src/interpreters/eval.rs`(`symmetric_out_slot` + 三处 AR)| — |
 
 #### 55.2 ★ 11 个门/探针**全绿**(复跑记录,ord 2/3)

@@ -57,12 +57,12 @@ mtp-longctx-handoff.md   # 本文
 ```text
 crates/shared/src/config/mod.rs          SpecCfg.mtp_window/mtp_sink + 校验
 crates/engine/src/engine.rs              DraftCfg / SpecBootInput / boot v2 门
-crates/engine/src/spec_runtime.rs        SpecRuntime.mtp_window + 模式/深度校验
+crates/engine/src/spec/spec_runtime.rs        SpecRuntime.mtp_window + 模式/深度校验
 crates/engine/src/exec/mod.rs            mod mtp_window
 tools/fixture/mtp_curve.py
 crates/engine/src/exec/mtp_window.rs     MtpWindowPlan（纯函数 + 9 单测）
 crates/engine/src/exec/draft.rs          propose_first/round/graph_step 接线
-crates/engine/src/graph_fleet.rs         chain c{j}_bt 输入槽
+crates/engine/src/graph/graph_fleet.rs         chain c{j}_bt 输入槽
 crates/engine/src/tests.rs               window 恒等门（长 prompt）
 profiles/full.toml                       schema 缺省 0/64
 profiles/qwen38_27b-3090-w4a16-mtp.toml  生产值 4032/64
@@ -299,7 +299,7 @@ python3 tools/fixture/mtp_curve.py --url http://127.0.0.1:8141 \
 
 ### 当前结构（施工锚点）
 
-- `crates/engine/src/graph_fleet.rs`
+- `crates/engine/src/graph/graph_fleet.rs`
   - `GraphFleet.verify: Option<GraphPlan>`（单张，T=depth+1）
   - `plan_verify()`：`let depth1 = boot.spec.depth + 1;`
   - `plan_propose_family()`：`m=0..spec_depth` 桶；`extra_faces` 按 depth 预算
@@ -307,11 +307,11 @@ python3 tools/fixture/mtp_curve.py --url http://127.0.0.1:8141 \
   - verify 用 `graphs.verify_mut(depth)`
   - propose 用 `graphs.propose_mut(depth, m)`
   - fold 用 `graphs.fold_mut(depth, rows)`
-- `crates/engine/src/scheduler.rs`
+- `crates/engine/src/sched/scheduler.rs`
   - `StepAction::SpecRound { depth }`（轮级 active depth 显式携带）
-- `crates/engine/src/spec_runtime.rs`
+- `crates/engine/src/spec/spec_runtime.rs`
   - `SpecRuntime.depth`（上限）+ `depth_min/adaptive_depth/depth_switch_ctx`
-- `crates/engine/src/turn.rs`
+- `crates/engine/src/serve/turn.rs`
   - `TurnSpecState`（turn 域 spec 状态；不要把 active depth 放进跨 turn 的全局）
 
 ### T1a 实施结果（2026-10-21）
@@ -650,9 +650,9 @@ tools/fixture/mtp_curve.py
 crates/engine/src/exec/mtp_window.rs
 crates/engine/src/exec/draft.rs
 crates/engine/src/exec/spec.rs
-crates/engine/src/graph_fleet.rs
-crates/engine/src/spec_runtime.rs
-crates/engine/src/scheduler.rs
+crates/engine/src/graph/graph_fleet.rs
+crates/engine/src/spec/spec_runtime.rs
+crates/engine/src/sched/scheduler.rs
 crates/engine/src/tests.rs
 crates/shared/src/config/mod.rs
 crates/models/src/layers/mtp.rs

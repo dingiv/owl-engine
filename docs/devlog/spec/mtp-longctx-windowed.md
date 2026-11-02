@@ -451,11 +451,11 @@ metrics（低基数）：
 | 配置 | `crates/shared/src/config/mod.rs` | `SpecCfg.mtp_window/mtp_sink` + 默认值 + 组合校验 |
 | 配置模板 | `profiles/full.toml` | 两键 + 注释（默认 0/64） |
 | 引擎旋钮 | `crates/engine/src/engine.rs` | `DraftCfg` 两字段；`from_config` 搬运；`SpecBootInput` 透传；boot 期 v2 检查 |
-| spec 运行态 | `crates/engine/src/spec_runtime.rs` | `SpecRuntime.mtp_window`；模式/深度/资产校验；boot 日志 |
+| spec 运行态 | `crates/engine/src/spec/spec_runtime.rs` | `SpecRuntime.mtp_window`；模式/深度/资产校验；boot 日志 |
 | 窗口纯函数 | `crates/engine/src/exec/mtp_window.rs`（新） | `MtpWindowCfg` / `MtpRowView` / `MtpWindowPlan` + 单测 |
 | 执行面 | `crates/engine/src/exec/mod.rs` | `mod mtp_window;` |
 | 草稿路径 | `crates/engine/src/exec/draft.rs` | `propose_first` / `propose_round` / `propose_graph_step` 接线 |
-| 图面 | `crates/engine/src/graph_fleet.rs` | chain 的 `c{j}_bt` 输入槽（G1） |
+| 图面 | `crates/engine/src/graph/graph_fleet.rs` | chain 的 `c{j}_bt` 输入槽（G1） |
 | 文档 | `config.md` / `profiles/README.md` | 配置说明 + 验证档 |
 | 本卷 | `mtp-longctx-windowed.md` | 本文 |
 

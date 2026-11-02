@@ -3,7 +3,7 @@
 > 定位:本文件是 **prefill 图**的**设计**文档(不含施工记录)。设计输入有三份,均已入档:
 > ① 分支 `feat/prefill-graph` 的实测台账(`工作树 prefill-graph(旧位置)/docs/arch/prefill-graph-施工.md`,
 >    850 行,S0–S1.5-b + §12 设备侧定谳 + §13/§14/§15 真收益/判死);
-> ② 本仓**现役**图机制(`crates/engine/src/graph_plan.rs` 5 处在用 + `crates/backends/cuda/src/state.rs` 捕获面);
+> ② 本仓**现役**图机制(`crates/engine/src/graph/graph_plan.rs` 5 处在用 + `crates/backends/cuda/src/state.rs` 捕获面);
 > ③ 本轮新取的两把核尺子(`crates/kernels/tests/{fi,xqa}_prefill_probe.rs`)与已落的 `ChunkTables` / FI plan 硬门。
 > ④ **参考实现**(2026-10-15 二轮指定)= `工作树 prefill-graph(旧位置)`(分支
 >    `feat/prefill-graph` @ `dc7027e`,54 个未提交文件;S1/S1.5 已把**整模图跑成 `Captured`**,
@@ -100,7 +100,7 @@
 
 | 面 | 现状 | 位置 |
 |---|---|---|
-| 三态(捕获/回放/eager 兜底) | ✅ `GraphPlan::{plan,step}` + `PlanOutcome::{Captured, EagerFallback}` | `crates/engine/src/graph_plan.rs` |
+| 三态(捕获/回放/eager 兜底) | ✅ `GraphPlan::{plan,step}` + `PlanOutcome::{Captured, EagerFallback}` | `crates/engine/src/graph/graph_plan.rs` |
 | 静态输入缓冲 | ✅ `InputSlot` + `write_block` 原位写(**块 id 面,不是裸指针**) | 同上 |
 | 输出收割 | ✅ `OutputSlot` / `output_block(name)` / `read_output_f32` | 同上 |
 | **桶族先例** | ✅ MTP propose 图族:`for m in 0..=spec_depth { GraphPlan::plan(…) }` —— 一族多图、逐轮按 m 选 | `crates/engine/src/engine.rs:1010+` |

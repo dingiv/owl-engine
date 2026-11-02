@@ -411,11 +411,11 @@ crates/store/src/lib.rs             导出
 crates/store/src/budget.rs          BudgetInputs 投影来源;共享块并集
 crates/store/src/rel.rs             attach_memory_plan / StoreReport.plan
 crates/engine/src/engine.rs         build_memory_plan;assemble_budget 投影
-crates/engine/src/state.rs          memory_components / 分项快照访问器
+crates/engine/src/mem/state.rs          memory_components / 分项快照访问器
 crates/engine/src/running.rs        snap_guard / PressureSignals / PressurePolicy / state slot
 crates/engine/src/exec/spec.rs      capture 后更新 ActiveTurn.last_snap
-crates/engine/src/turn.rs           ActiveTurn.last_snap
-crates/engine/src/scheduler.rs      turn 起初始化 last_snap
+crates/engine/src/serve/turn.rs           ActiveTurn.last_snap
+crates/engine/src/sched/scheduler.rs      turn 起初始化 last_snap
 crates/shared/src/config/mod.rs     runtime.idle_compact / pressure_low_pct / pressure_high_pct
 profiles/full.toml                  三个新键的缺省与注释
 crates/engine/src/tests.rs          状态腿 disk spill 门
