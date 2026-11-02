@@ -98,9 +98,23 @@ cargo build --release -p server --no-default-features --features arch-sm120
 # 多代际 fatbin(一包两代;驱动运行期挑;单份 .a 家族取最高代):
 cargo build --release -p server --no-default-features --features arch-sm86,arch-sm120
 
-# 缺省 = sm_86(可复现基线;在 5070 上会被装配期架构门拒启并告诉你换哪个 feature)
+# 缺省 = sm_86 + **两个 FI 半精度累加档**(fi-fp16acc / fi-fp16pv,2026-11-02 起)
 cargo build --release -p server
+# 要 fp32 累加的可复现基线(对照臂 / 排障):
+cargo build --release -p server --no-default-features --features arch-sm86
 ```
+
+**两个 FI 半精度累加档已进缺省**(`apps/server` 的 `default`):
+
+| feature | 改什么 | 代价 | 数字 |
+|---|---|---|---|
+| `fi-fp16acc` | QK^T 走 `mma...f16.f16.f16.f16` + online softmax 全 half2 | 精度:5e-3~1.2e-2(f16 池大 logits 4e-2) | 核级 1.23~1.27× |
+| `fi-fp16pv` | PV 累加器 `o_frag` 走 half | 精度:cos ≥0.99995 | 核级 1.12~1.26× |
+
+合起来:长 ctx TTFT −7.9%(60k)/ −11.4%(100k),≤8k 中性;质量门通过
+(判据 = **基线自身重复性**,`docs/devlog/kernels/fi-fp16-accum.md` §7)。
+**换代际 / 多代际 fatbin 必须 `--no-default-features` 摘掉**(fp16pv 的模板参依赖
+`__CUDA_ARCH__`;fp16acc 有 `static_assert(__CUDA_ARCH__ >= 800)`)。
 
 **多选语义**:native cubin 出多代际 fatbin;单份 `.a` 家族(Marlin / FlashInfer+FA2 /
 GDN AOT)取**最高**代 —— 一份 `.a` 只能是某一代的 SASS。

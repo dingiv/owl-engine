@@ -26,9 +26,15 @@
 ## 2. 档位与用法
 
 ```bash
-cargo build --release -p server --features fi-fp16acc      # 开
-cargo build --release -p server                            # 缺省关(可复现基线)
+cargo build --release -p server   # 缺省 = 开(2026-11-02 用户裁决:`apps/server` default 带出)
+cargo build --release -p server --no-default-features --features arch-sm86   # 显式要 fp32 基线
+cargo build --release -p server --no-default-features --features arch-sm120  # 换代际(必须摘掉本档)
 ```
+
+**⚠️ 代际**:half 累加走 `mma...f16.f16.f16.f16`(m16n8k16)⇒ **sm_80 起**;
+`prefill.cuh` 里有 `static_assert(__CUDA_ARCH__ >= 800)`,sm_75 会在编译期响亮拒(不是运行期哑弹)。
+`fi-fp16pv` 更严(只验过 sm_86,且其模板参依赖 `__CUDA_ARCH__`)⇒ **多代际 fatbin 与两档不可共存**,
+一律 `--no-default-features` 整体摘掉。
 
 三层转发:`apps/server` → `owl-cuda` → `owl-kernels`。**是 Cargo feature 不是 env**
 (构建档必须进缓存键,同 `arch-smXX` 的裁决)。feature 在 ⇒ `build.rs` 给 FI 三个 TU 加
@@ -98,7 +104,7 @@ OWL_TEST_DEVICE=<BDF> FI_PF_GATE=2e-2 \
 `mean|Δ|` ≤ **1.02e-3** ⇒ PV-half 在 QK-half 之上**几乎不追加误差**
 (两者都是同一类"half 累加"噪声,不叠加放大)。
 
-构建:`cargo build --release -p server --features fi-fp16acc,fi-fp16pv`(两个都缺省关)。
+构建:`cargo build --release -p server`(**两个都已进缺省**,2026-11-02 用户裁决)。
 
 ## 5. 上游该档的两个坑(升级闭包必看)
 

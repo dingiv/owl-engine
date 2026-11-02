@@ -47,7 +47,8 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 "flashinfer" = []
 # **FP16-PV 实验档**(2026-11-02):PV 累加器走 half(`f16f16f16` HMMA),仅
 # GeForce GA10x **sm_86** 的 f16/fp8 KV 预填路径;见 `prefill.cuh` 与
-# `docs/devlog/kernels/fp16-pv-...`。缺省关;需要 `flashinfer`。
+# `docs/devlog/kernels/fp16-pv-...`。需要 `flashinfer`;**已由 `apps/server` 的
+# default 带出(2026-11-02 用户裁决),内核 crate 单测面仍按需显式开**。
 "fi-fp16pv" = ["flashinfer"]
 # **FI prefill 半精度累加档**(2026-11-02):QK^T 走 `mma...f16.f16.f16.f16`(GA10x 上
 # 2× 峰值)+ 整条 online softmax 走 half2(`hexp2`/`hmax2`)。消费级 Ampere 的
@@ -55,7 +56,8 @@ description = "Operator dispatch + unified kernel home: .cu sources, nvrtc compi
 # (**1.26×**),fp8 池 39.46→33.76(**1.17×**);代价 = QK 在 half 里累 16 次
 # ⇒ 数值门从 5e-4 放宽到 ~1.2e-2(仍远小于 fp8 KV 自身的量化噪声)。
 # 为什么是 feature 不是 env:同 arch-smXX —— 构建档必须进 cargo 指纹。
-# 依赖 `flashinfer`;入口 `cargo build --release -p server --features fi-fp16acc`。
+# 依赖 `flashinfer`;**已由 `apps/server` 的 default 带出(同上)**;
+# 单测/对照臂:内核 crate 不带它 = fp32 累加基线。
 "fi-fp16acc" = ["flashinfer"]
 # XQA(kNHD fp8 KV 的 decode/verify 注意力;移植自 vllm-ampere-optimized/flashampere;
 # 预编 .a + foreign-kernel;2026-10-13 长 ctx verify 立案)

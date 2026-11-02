@@ -408,6 +408,13 @@ struct KernelTraits {
       std::conditional_t<USE_SHARED_ROPE_FREQ,
                          SharedStorageWithRopeFreq<BaseSharedStoragePaged, NUM_MMA_D_QK / 2>,
                          BaseSharedStoragePaged>;
+#if defined(__CUDA_ARCH__) && defined(FP16_QK_REDUCTION_SUPPORTED)
+// owl(2026-11-02):half 累加走 `mma.sync...f16.f16.f16.f16`(m16n8k16)⇒ **sm_80 起**。
+// sm_75(20 系)没有这条指令,`mma.cuh` 的 `#else` 只会 `__brkpt()`(静默停摆)
+// ⇒ 在编译期响亮拒,别让它变成运行期哑弹。已验证代际 = sm_86(GA10x)。
+static_assert(__CUDA_ARCH__ >= 800, "FP16_QK_REDUCTION (fi-fp16acc) requires sm_80+ (mma m16n8k16 f16)");
+#endif
+
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {

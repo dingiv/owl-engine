@@ -51,6 +51,31 @@
 
 ---
 
+## 0.2 2026-11-03 基线修正(双 half 档之后)
+
+原设计里的 30.5ms 门是拿 **2026-11-01 的 FI f16+FP16-PV(38.3ms)** 算的。
+`fi-fp16acc` 合流后,基线已经变了(3090 Ti,hd256,hkv4,page32,T=2048):
+
+| 档 | ctx=65k | ctx=139k |
+|---|---:|---:|
+| FI 双 half(f16 池) | **32.98 ms** | **73.4 ms** |
+| FI 双 half(fp8 池) | **42.89 ms** | 90.8 ms |
+| pth int8(2026-11-01 实测) | 58.57 ms | 126.30 ms |
+
+⇒ 两条修正:
+
+1. **30.5ms 已不是“反超”门槛**,只是与双 half 档打平。新门槛 = **T=2048/65k ≤26ms**
+   (相对 32.98ms ≥20%),冲刺 ≤24ms;ctx=139k 目标 ≤58ms(相对 73.4ms)。
+   cos ≥0.9999 不变。
+2. **pth 只做 P0/缓存/planner 参考,不作为性能主线**。pth 当前 prefill 比双 half FI
+   慢 78%,即使接进 owl 也先输 25ms;它的价值是完整的 int8 cache/scale/C ABI
+   和 decode 路径。性能主线 = **FI-A2:在 FI 的 4-warp/tile 流水里做 full int8
+   QK+PV**,A1(int8 存储 + f16 MMA)只作为正确性/缓存接线台阶。
+
+P0 已开工(`packages/owl-worktrees/fi-int8`,分支 `fi-int8`):
+`owl_reshape_and_cache_int8_knhd` + host oracle 已通过(逐字节 + scale 位型),
+下一步是 FI-A2 的 kernel spike,不是继续接 pth。
+
 ## 1. 需求与边界
 
 ### 1.1 要解决的问题

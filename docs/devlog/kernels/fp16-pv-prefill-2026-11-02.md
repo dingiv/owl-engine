@@ -5,7 +5,7 @@
 > `prefill.cuh` 重锚，不直接套补丁）。
 >
 > 结论：**核级 f16 +20~26%，fp8 +12~20%；3090 单卡 60k e2e 约 +6.6%
->（四 seed 均值）/ speedtest +7.5%，输出逐字节一致。** 默认关，Cargo
+>（四 seed 均值）/ speedtest +7.5%，输出逐字节一致。** 2026-11-02 起已由 `apps/server` 的 default 带出（此前默认关），Cargo
 > feature `fi-fp16pv` 显式开。
 
 ---

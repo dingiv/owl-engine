@@ -88,7 +88,9 @@ owl = **在消费级硬件上跑本地模型的推理引擎**(立项 2026-09-22)
 # 构建
 cargo build --release -p server                  # 生产(release 零计时税)
 cargo build --release -p server --features perf  # 基准(计时器保留)
-cargo build --release -p server --features fi-fp16pv  # 3090/3080 sm86:FI FP16-PV 预填(+6~7% 60k e2e;不要与多代际/sm89 同开)
+# **FI 半精度累加两档已进缺省**(2026-11-02):fi-fp16acc(QK half)+ fi-fp16pv(PV half)
+#   ⇒ 生产二进制开箱即用;长 ctx TTFT −8~11%(质量与基线自噪同级:docs/devlog/kernels/fi-fp16-accum.md §7)
+#   要复现基线 / 换代际 / 多代际 fatbin:`--no-default-features --features arch-sm86`(或 arch-sm120)
 
 # 预检 / 生效配置 / 单键解释(不加载权重,~10–20ms)
 ./target/release/server -p profiles/qwen38_27b-3090.toml --check

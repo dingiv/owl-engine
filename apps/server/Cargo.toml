@@ -35,12 +35,22 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 #   cargo build --release -p server --no-default-features --features arch-sm120   # RTX 50 系
 #   cargo build --release -p server --no-default-features --features arch-sm86,arch-sm120  # 双代际 fatbin
 # 可选值：arch-sm75（RTX 20 系）/ arch-sm86（RTX 30 系）/ arch-sm89（RTX 40 系）/ arch-sm120（RTX 50 系）
-"default" = ["arch-sm86"]
+# **缺省 = sm_86 + 两个 FI 半精度累加档**(2026-11-02 用户裁决:双 3080 常驻档默认开)。
+# 依据:3080 TP2 生产档实测 60k/100k TTFT −7.9%/−11.4%,质量与"基线自身重复性"同级
+# (`docs/devlog/kernels/fi-fp16-accum.md` §7)。消费级 GA10x 的 fp32 累加只有半速,
+# 3080/3090(Ti) 同属该代 ⇒ 两个档对它们都是净赚;而短 ctx(≤8k)中性不亏。
+#
+# ⚠️ 换其它代际 / 多代际 fatbin 必须显式去掉缺省:
+#     cargo build --release -p server --no-default-features --features arch-sm120
+#   原因:`fi-fp16pv` 的累加器实现依赖 `__CUDA_ARCH__`(sm_86 已验证,sm75 无 f16 MMA
+#   的 m16n8k16;sm89/120 未验证),多代际 fatbin 与它不可共存 ⇒ 两档都由缺省带出、
+#   由 `--no-default-features` 整体摘掉。
+"default" = ["arch-sm86", "fi-fp16acc", "fi-fp16pv"]
 arch-sm75 = ["owl-cuda/arch-sm75"]
 arch-sm86 = ["owl-cuda/arch-sm86"]
 arch-sm89 = ["owl-cuda/arch-sm89"]
 arch-sm120 = ["owl-cuda/arch-sm120"]
-# FP16-PV 实验档(只对 sm_86 构建开;构建命令 `--features fi-fp16pv`)
+# FP16-PV 累加档(只对 sm_86 构建开;**已进缺省**,见文件头 default)
 fi-fp16pv = ["owl-cuda/fi-fp16pv"]
 stepgate = ["owl-shared/stepgate"]
 
@@ -50,7 +60,7 @@ stepgate = ["owl-shared/stepgate"]
 perf = ["owl-shared/perf", "owl-engine/perf"]
 cupti = ["owl-cuda/cupti"]
 log = ["owl-shared/log", "owl-engine/log"]
-# FI prefill 半精度累加档(见 crates/kernels/Cargo.toml 的同名 feature 注释)
+# FI prefill 半精度累加档(见 crates/kernels/Cargo.toml 的同名 feature 注释;**已进缺省**)
 fi-fp16acc = ["owl-cuda/fi-fp16acc"]
 
 [dev-dependencies]
