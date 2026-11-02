@@ -73,6 +73,12 @@ pub struct ImgSpan {
     pub grid: GridThw,
     /// 客户端标记:这段将来可能被删(未标记 = 永不吸收删除)
     pub evict: bool,
+    /// **图像内容指纹**(64 位;0 = 未知/无内容)。
+    ///
+    /// 用途 = 块身份(`owl_store::BlockTag`):token 流里图像只是字面相同的
+    /// 占位符,**只有它**能把"同文本不同截图"区分开。由 `submit` 侧按
+    /// `VlmImageKey`(像素位哈希)盖章;`pad_image_spans` 本身不知道像素,留 0。
+    pub img_tag: u64,
 }
 
 impl ImgSpan {
@@ -352,6 +358,7 @@ pub fn pad_image_spans(
             pad_after,
             grid: grids[k],
             evict: marks[k],
+            img_tag: 0, // 由调用方按图像像素盖章(本函数只有网格/标记,没有像素)
         });
         cursor = end;
     }
@@ -433,6 +440,41 @@ pub fn rebuild_after_delete(
     out.extend_from_slice(&old_padded[..hit.a]);
     out.extend_from_slice(&raw[hit.text_a..]);
     Ok(out)
+}
+
+/// **逐块多模态指纹**(`owl_store::BlockTag` 的唯一产地)。
+///
+/// 块身份只看 token ⇒ 两张不同截图(占位符字面相同)会被判成同一条链 ⇒ 复用
+/// 陈旧图像 KV(2026-11-03 定谳)。这里把每张图的 `img_tag` 铺到它覆盖的块上,
+/// 同块多图用**可交换折叠**(与 span 顺序无关,幂等)。
+///
+/// 返回空 = 全是纯文本块(调用方传 `&[]`,`hash_block` 走旧身份,零回归)。
+pub fn block_tags(token_len: usize, page: usize, spans: &[ImgSpan]) -> Vec<u64> {
+    if page == 0 || spans.iter().all(|s| s.img_tag == 0) {
+        return Vec::new();
+    }
+    let n = token_len / page;
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![0u64; n];
+    for s in spans {
+        if s.img_tag == 0 {
+            continue;
+        }
+        let lo = s.start / page;
+        let hi = s.end.saturating_sub(1) / page;
+        for slot in out.iter_mut().take((hi + 1).min(n)).skip(lo) {
+            *slot = fold_tag(*slot, s.img_tag);
+        }
+    }
+    out
+}
+
+/// 同块多图的**可交换**折叠(不依赖 span 顺序;0 是单位元)。
+fn fold_tag(acc: u64, tag: u64) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    (acc ^ tag).wrapping_mul(PRIME).rotate_left(7)
 }
 
 /// **位置三元组**(与 `MropeCfg` 的 `[T,H,W]` 同序;i32 足够覆盖 262k)。
@@ -739,6 +781,91 @@ mod tests {
         assert_eq!(unpad(&next.ids, &next.pads).expect("unpad2"), raw);
     }
 
+    /// 🔴 **陈旧图像 KV 红包(2026-11-03)**:
+    /// 同 token 流 + 不同截图 ⇒ **不得**判成同一条链。
+    ///
+    /// 真机口径(修复前):同文本、只换图 ⇒ `cached_tokens` 1088/1100,模型输出
+    /// 逐点等于**上一张图**的方块位置。根因 = 块身份只看 token,而图像只是字面
+    /// 相同的占位符;`block_tags` 是修法的一半(另一半是 `hash_block` 混入指纹)。
+    #[test]
+    fn different_image_content_never_shares_chain() {
+        use owl_store::kv::KvStore;
+        const PAGE: usize = 32;
+        // text32 [img×64] text16 [img×64] text32 = 208 tok ⇒ 6 个整块
+        // (首块纯文本 ⇒ 换图后仍能复用到第一张图之前;这正是"少损失"的判据)
+        let mut ids: Vec<u32> = (0..32).map(|i| 100 + i).collect();
+        let s1 = ids.len();
+        ids.extend(std::iter::repeat_n(IMG, 64));
+        let e1 = ids.len();
+        ids.extend((0..16).map(|i| 200 + i));
+        let s2 = ids.len();
+        ids.extend(std::iter::repeat_n(IMG, 64));
+        let e2 = ids.len();
+        ids.extend((0..32).map(|i| 300 + i));
+
+        let mut spans = vec![
+            ImgSpan {
+                start: s1,
+                end: e1,
+                text_start: 32,
+                text_end: 96,
+                pad_before: 0,
+                pad_after: 0,
+                grid: (1, 8, 8),
+                evict: true,
+                img_tag: 0,
+            },
+            ImgSpan {
+                start: s2,
+                end: e2,
+                text_start: 112,
+                text_end: 176,
+                pad_before: 0,
+                pad_after: 0,
+                grid: (1, 8, 8),
+                evict: true,
+                img_tag: 0,
+            },
+        ];
+        // 纯文本:空 tags(零回归面)
+        assert!(block_tags(ids.len(), PAGE, &spans).is_empty(), "无指纹时必须是纯文本身份");
+
+        // 两张**内容不同**的图 ⇒ 两次请求的指纹不同
+        let mut spans_a = spans.clone();
+        spans_a[0].img_tag = 0xAAAA_1111_2222_3333;
+        spans_a[1].img_tag = 0xBBBB_4444_5555_6666;
+        let mut spans_b = spans.clone();
+        spans_b[0].img_tag = 0xAAAA_1111_2222_3333; // 第一张相同
+        spans_b[1].img_tag = 0xCCCC_7777_8888_9999; // 第二张换了
+        let tags_a = block_tags(ids.len(), PAGE, &spans_a);
+        let tags_b = block_tags(ids.len(), PAGE, &spans_b);
+        assert_eq!(tags_a.len(), ids.len() / PAGE, "逐块指纹数 = 整块数");
+        assert_eq!(tags_a[0], 0, "纯文本块 tag 必须为 0(身份与旧实现一致)");
+        assert_ne!(tags_a[1], 0, "含图块必须有指纹");
+        assert_eq!(tags_a[1], tags_b[1], "同一张图 ⇒ 同指纹(跨会话仍可共享)");
+        assert_eq!(tags_a[2], tags_b[2], "块 2 只覆盖第一张图 ⇒ 不随第二张图变");
+        assert_ne!(tags_a[4], tags_b[4], "换图 ⇒ 该图覆盖的块指纹必变");
+
+        // 端到端(store 面):A 登记后,B 不得命中任何图像块
+        let mut kv = KvStore::new(8, PAGE, 1 << 20, 16);
+        let mut table = Vec::new();
+        kv.ensure_for_len(&mut table, ids.len()).expect("块表");
+        kv.register_chain_tagged(&ids, &table, &tags_a).expect("登记 A");
+
+        let hit_a = kv.match_prefix_tagged(&ids, &tags_a);
+        assert_eq!(hit_a.matched_blocks, ids.len() / PAGE, "同图必须整链命中");
+        let hit_b = kv.match_prefix_tagged(&ids, &tags_b);
+        // 块 0 = 纯文本、块 1/2 = 第一张图(未变)、块 3 起涉及第二张图(已变)
+        assert_eq!(
+            hit_b.matched_blocks, 3,
+            "换第二张图后复用面必须截到块 2 为止(现状:整链命中 ⇒ 陈旧图像 KV)"
+        );
+        // 忘了带指纹(纯文本口径)也不许**吃到**图像链:含图块身份带指纹 ⇒
+        // 空 tags 只能命中纯文本块。失败模式退化为"少复用",而不是"错用旧图"。
+        let hit_plain = kv.match_prefix_tagged(&ids, &[]);
+        assert_eq!(hit_plain.matched_blocks, 1, "空 tags 只能复用纯文本块(宁少不错)");
+    }
+
     #[test]
     fn ledger_prefix_drops_out_of_range_pads_and_spans() {
         let sp = |start, end| ImgSpan {
@@ -750,6 +877,7 @@ mod tests {
             pad_after: 0,
             grid: (1, 2, 2),
             evict: true,
+            img_tag: 0,
         };
         let spans = [sp(0, 4), sp(8, 16)];
         let pads = [(0, 4), (12, 16)];

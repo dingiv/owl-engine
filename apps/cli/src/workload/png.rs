@@ -103,6 +103,43 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+/// **白底 + 一枚红方块**的图(视觉定位门用:方块位置 = 唯一可变内容,
+/// 两张图的 token 流因此**逐字节相同**,只有像素不同 —— 正是陈旧图像 KV 的
+/// 触发形状)。
+pub fn png_square(w: u32, h: u32, cx: u32, cy: u32, side: u32) -> Vec<u8> {
+    let bg = (250u8, 250u8, 250u8);
+    let fg = RED;
+    let x0 = cx.saturating_sub(side / 2);
+    let y0 = cy.saturating_sub(side / 2);
+    let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
+    for y in 0..h {
+        raw.push(0); // filter: None
+        for x in 0..w {
+            let on = x >= x0 && x < x0 + side && y >= y0 && y < y0 + side;
+            let c = if on { fg } else { bg };
+            raw.push(c.0);
+            raw.push(c.1);
+            raw.push(c.2);
+        }
+    }
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+    let idat = stored_zlib(&raw);
+    let mut out = Vec::with_capacity(SIG.len() + 25 + idat.len() + 12 + 12);
+    out.extend_from_slice(&SIG);
+    out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    out.extend_from_slice(&chunk(b"IDAT", &idat));
+    out.extend_from_slice(&chunk(b"IEND", &[]));
+    out
+}
+
+/// 方块图 → data URL。
+pub fn data_url_square(w: u32, h: u32, cx: u32, cy: u32, side: u32) -> String {
+    format!("data:image/png;base64,{}", base64(&png_square(w, h, cx, cy, side)))
+}
+
 pub fn data_url_png(w: u32, h: u32, rgb: (u8, u8, u8)) -> String {
     format!("data:image/png;base64,{}", base64(&png_rgb(w, h, rgb)))
 }

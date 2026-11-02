@@ -38,7 +38,7 @@ use crate::policy::{EvictCandidate, Leg};
 use crate::tier::Tier;
 use tree::PrefixTree;
 
-pub use chain::{hash_block, tail_hash, ChainCursor};
+pub use chain::{hash_block, tail_hash, BlockTag, ChainCursor};
 pub use tree::{MatchedBlock, PrefixMatch};
 
 /// 登记/驱逐的结果(上层据此维护跨腿台账 [`crate::tier::TierLedger`]）。
@@ -255,7 +255,15 @@ impl KvStore {
 
     /// 命中查询(纯查询 + 触达;块级命中/未命中计数入账)。
     pub fn match_prefix(&mut self, tokens: &[u32]) -> PrefixMatch {
-        let m = self.tree.matched_blocks(tokens);
+        self.match_prefix_tagged(tokens, &[])
+    }
+
+    /// 同 [`Self::match_prefix`],但带**逐块多模态指纹**(图像内容;空 = 纯文本)。
+    ///
+    /// 引擎侧 **必须**走本口:带图请求若不传指纹,换一张截图会与上一条判同
+    /// (陈旧 KV 复用)。指纹由 `owl-engine` 的 `img_evict::block_tags` 产出。
+    pub fn match_prefix_tagged(&mut self, tokens: &[u32], tags: &[BlockTag]) -> PrefixMatch {
+        let m = self.tree.matched_blocks(tokens, tags);
         if m.matched_blocks > 0 {
             self.hits += m.matched_blocks as u64;
         } else {
@@ -336,7 +344,17 @@ impl KvStore {
     /// 新进树的条目 ⇒ 缓存持一份绑定引用(`incref`);被容量逐出的条目 ⇒
     /// 释放绑定引用(`decref`)。引用配对全在本方法内自洽 —— 调用方不再手工配。
     pub fn register_chain(&mut self, tokens: &[u32], table: &[u32]) -> StoreResult<CacheUpdate> {
-        let up = self.tree.insert(tokens, table);
+        self.register_chain_tagged(tokens, table, &[])
+    }
+
+    /// 同 [`Self::register_chain`],但带逐块多模态指纹(见 `match_prefix_tagged`)。
+    pub fn register_chain_tagged(
+        &mut self,
+        tokens: &[u32],
+        table: &[u32],
+        tags: &[BlockTag],
+    ) -> StoreResult<CacheUpdate> {
+        let up = self.tree.insert(tokens, table, tags);
         let mut out = CacheUpdate::default();
         self.apply_tree_update(up, &mut out)?;
         Ok(out)
@@ -469,7 +487,18 @@ impl KvStore {
         table: &[u32],
         session: u64,
     ) -> StoreResult<CacheUpdate> {
-        let up = self.register_chain(tokens, table)?;
+        self.register_chain_owned_tagged(tokens, table, session, &[])
+    }
+
+    /// 同 [`Self::register_chain_owned`],但带逐块多模态指纹。
+    pub fn register_chain_owned_tagged(
+        &mut self,
+        tokens: &[u32],
+        table: &[u32],
+        session: u64,
+        tags: &[BlockTag],
+    ) -> StoreResult<CacheUpdate> {
+        let up = self.register_chain_tagged(tokens, table, tags)?;
         if session != crate::policy::NO_SESSION {
             for c in &up.inserted {
                 self.owners.insert(*c, session);
@@ -499,7 +528,21 @@ impl KvStore {
         &mut self,
         tokens: &[u32],
     ) -> StoreResult<(Vec<ChainHash>, Vec<(ChainHash, Option<u32>)>)> {
-        let up = self.tree.insert_offloaded(tokens);
+        self.register_chain_offloaded_tagged(tokens, &[])
+    }
+
+    /// 同 [`Self::register_chain_offloaded`],但带逐块多模态指纹。
+    ///
+    /// ⚠️ 盘上重建不知道图像内容 ⇒ 调用方**只传 `&[]`**(纯文本)或显式指纹;
+    /// 传空时含图链会以"纯文本身份"入树,因此**永远不会**被带指纹的活请求命中
+    /// (宁可少用,也不许把旧图当新图)。
+    #[allow(clippy::type_complexity)]
+    pub fn register_chain_offloaded_tagged(
+        &mut self,
+        tokens: &[u32],
+        tags: &[BlockTag],
+    ) -> StoreResult<(Vec<ChainHash>, Vec<(ChainHash, Option<u32>)>)> {
+        let up = self.tree.insert_offloaded(tokens, tags);
         // **响亮拒绝而非无声吞**:本口是“无设备槽重建”⇒ `insert_one(slot=None)`
         // 结构上不会重绑;`rebound` 非空 = 上游判据失守(静默丢它会漏掉
         // 引用账与幽灵宿主副本,正是 2026-10-24 毒化案的同类)。
@@ -529,7 +572,17 @@ impl KvStore {
         parent0: ChainHash,
         blocks: &[(&[u32], u32)],
     ) -> StoreResult<CacheUpdate> {
-        let up = self.tree.insert_inc(parent0, blocks);
+        self.register_chain_inc_tagged(parent0, blocks, &[])
+    }
+
+    /// 同 [`Self::register_chain_inc`],但带**逐块多模态指纹**(见 `match_prefix_tagged`)。
+    pub fn register_chain_inc_tagged(
+        &mut self,
+        parent0: ChainHash,
+        blocks: &[(&[u32], u32)],
+        tags: &[BlockTag],
+    ) -> StoreResult<CacheUpdate> {
+        let up = self.tree.insert_inc(parent0, blocks, tags);
         let mut out = CacheUpdate::default();
         self.apply_tree_update(up, &mut out)?;
         Ok(out)
@@ -642,7 +695,17 @@ impl KvStore {
 
     /// 从零算一条 token 链的链尾身份(一次性;热路径用 [`ChainCursor`])。
     pub fn tail_hash(&self, tokens: &[u32], full_blocks: usize) -> Option<ChainHash> {
-        chain::tail_hash(tokens, self.block_tokens, full_blocks)
+        chain::tail_hash(tokens, self.block_tokens, full_blocks, &[])
+    }
+
+    /// 同 [`Self::tail_hash`],但带逐块多模态指纹(快照键/播种用)。
+    pub fn tail_hash_tagged(
+        &self,
+        tokens: &[u32],
+        full_blocks: usize,
+        tags: &[BlockTag],
+    ) -> Option<ChainHash> {
+        chain::tail_hash(tokens, self.block_tokens, full_blocks, tags)
     }
 
     /// **摘绑定下沉**(host 卸载的一半:摘绑定 + 还槽)。
@@ -771,8 +834,9 @@ mod tests {
         assert_eq!(up1.inserted.len(), 2, "首段两新块");
         // 段 1 的尾身份 = 从根逐块哈希
         let tail1 = crate::kv::chain::hash_block(
-            crate::kv::chain::hash_block(root, &t[..page]),
+            crate::kv::chain::hash_block(root, &t[..page], 0),
             &t[page..2 * page],
+            0,
         );
         let up2 = inc
             .register_chain_inc(
@@ -986,11 +1050,11 @@ mod tests {
         let pm = m.match_prefix(&toks_b);
         assert_eq!(pm.matched_blocks, tb.len(), "B 全链命中");
         let mut cur_b = ChainCursor::new();
-        let key_b = cur_b.advance(bs, &toks_b, tb.len()).expect("B 链");
+        let key_b = cur_b.advance(bs, &toks_b, tb.len(), &[]).expect("B 链");
         assert_eq!(key_b, pm.blocks[tb.len() - 1].chain, "游标 ≡ 缓存身份");
 
         let mut cur_a = ChainCursor::new();
-        let key_a = cur_a.advance(bs, &toks_a, 2).expect("A 链");
+        let key_a = cur_a.advance(bs, &toks_a, 2, &[]).expect("A 链");
         assert_ne!(key_a, key_b, "槽复用不得制造同一快照键(旧实现会撞)");
     }
 
@@ -1009,7 +1073,7 @@ mod tests {
         assert_eq!(pm.matched_blocks, 2);
         let mut cur = ChainCursor::new();
         let got = cur
-            .advance(crate::id::TOKENS_PER_BLOCK, &tokens, 2)
+            .advance(crate::id::TOKENS_PER_BLOCK, &tokens, 2, &[])
             .expect("游标");
         assert_eq!(got, pm.blocks[1].chain, "游标身份 ≡ 缓存条目身份");
         assert_eq!(Some(got), m.tail_hash(&tokens, 2), "游标 ≡ 从零算");

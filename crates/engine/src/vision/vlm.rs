@@ -66,6 +66,16 @@ impl VlmImageKey {
     }
 }
 
+impl VlmImageKey {
+    /// **图像内容指纹**(64 位;块身份 `owl_store::BlockTag` 的产地)。
+    ///
+    /// 双哈希合成一枚:同图必同值、异图实际必异。用于把"同 token 不同图"
+    /// 从缓存命中里排除(2026-11-03 陈旧图像 KV 定谳)。
+    pub(crate) fn content_tag(&self) -> u64 {
+        self.h1.rotate_left(17) ^ self.h2.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (self.pixels as u64)
+    }
+}
+
 struct VlmMergedEntry {
     key: VlmImageKey,
     rows: usize,

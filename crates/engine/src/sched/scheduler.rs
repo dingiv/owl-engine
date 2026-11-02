@@ -831,7 +831,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             );
             return Ok(None);
         }
-        let (hit, _recall) = self.bank.rel.match_prefix(&old)?;
+        // 指纹 = 会话旧账(删点之前那些图仍在链里)—— 必须与当年登记时**同一批**
+        // 指纹,否则删点前的前缀也匹配不上(图像块身份含内容)。
+        let old_tags = match self.bank.sessions.get(turn.session_id) {
+            Some(sess) => crate::img_evict::block_tags(sess.tokens.len(), page, &sess.img_spans),
+            None => Vec::new(),
+        };
+        let (hit, _recall) = self.bank.rel.match_prefix_tagged(&old, &old_tags)?;
         // leave-gap 会话的链只允许**本会话**复用:token-only 链哈希无法区分
         // 同 token 不同 position 的 K(跨会话命中 = 静默错值)。
         if hit
@@ -900,6 +906,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             );
             return Ok(None);
         };
+        let new_tags =
+            crate::img_evict::block_tags(turn.prompt_ids.len(), page, &turn.img_spans);
         let mut cur = owl_store::ChainCursor::new();
         if a_blocks > 0 {
             cur.seed(a_blocks, hit.hashes[a_blocks - 1]);
@@ -910,7 +918,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         for i in 0..keep {
             let lo = (a_blocks + i) * page;
             let h = cur
-                .advance(page, &turn.prompt_ids[lo..], a_blocks + i + 1)
+                .advance(
+                    page,
+                    &turn.prompt_ids[lo..],
+                    a_blocks + i + 1,
+                    new_tags.get(a_blocks + i..).unwrap_or(&[]),
+                )
                 .ok_or_else(|| ModelError::EngineInvariant {
                     what: format!("leave-gap:新链哈希推进失败(块 {})", a_blocks + i),
                 })?;
@@ -1100,7 +1113,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)。
             // **S3b 收尾**:经 `Rel` 门面**一次问两腿**(块链 + 快照层)
             // —— 少一条"引擎自己分别查两处"的旁路(§10.4 律⑤)。
-            let (hit, recall) = self.bank.rel.match_prefix(&turn.prompt_ids)?;
+            let tags = crate::img_evict::block_tags(
+                turn.prompt_ids.len(),
+                self.dev.pool.geom.page.max(1),
+                &turn.img_spans,
+            );
+            let (hit, recall) = self.bank.rel.match_prefix_tagged(&turn.prompt_ids, &tags)?;
             if positioned
                 && hit
                     .hashes

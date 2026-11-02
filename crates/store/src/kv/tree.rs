@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::chain::{content_fingerprint, hash_block};
+use super::chain::{BlockTag, content_fingerprint, hash_block};
 use crate::id::ChainHash;
 
 /// 树里的一格 = 一个逻辑块(内容身份 + 设备绑定)。
@@ -132,7 +132,9 @@ impl PrefixTree {
     /// 命中查询(**纯查询面:匹配本身要 touch ⇒ 需要 `&mut self`**)。
     ///
     /// 从第一个整块起逐块走父链;任一环缺哈希或指纹不符即停(前缀语义)。
-    pub(crate) fn matched_blocks(&mut self, tokens: &[u32]) -> PrefixMatch {
+    ///
+    /// `tags` = **逐块**多模态指纹(空 = 纯文本;长度不足视作缺项 = 响亮拒)。
+    pub(crate) fn matched_blocks(&mut self, tokens: &[u32], tags: &[BlockTag]) -> PrefixMatch {
         if !self.enabled() {
             return PrefixMatch::default();
         }
@@ -140,13 +142,18 @@ impl PrefixTree {
         if full == 0 {
             return PrefixMatch::default();
         }
+        if !tags.is_empty() && tags.len() < full {
+            // 账不平:宁可整条不复用,也不把图像块当纯文本判同(静默错值的老路)
+            return PrefixMatch::default();
+        }
         let mut matched = 0usize;
         let mut parent = ChainHash::new(0);
         let mut tail = None;
         for block in tokens.chunks(self.block_tokens).take(full) {
-            let hash = hash_block(parent, block);
+            let tag = tags.get(matched).copied().unwrap_or(0);
+            let hash = hash_block(parent, block, tag);
             match self.entries.get(&hash) {
-                Some(e) if e.fingerprint == content_fingerprint(block) => {
+                Some(e) if e.fingerprint == content_fingerprint(block, tag) => {
                     matched += 1;
                     parent = hash;
                     tail = Some(hash);
@@ -173,7 +180,7 @@ impl PrefixTree {
     }
 
     /// 登记一条链(`slots[i]` = 第 i 个逻辑块的设备槽;只登记整块)。
-    pub(crate) fn insert(&mut self, tokens: &[u32], slots: &[u32]) -> TreeUpdate {
+    pub(crate) fn insert(&mut self, tokens: &[u32], slots: &[u32], tags: &[BlockTag]) -> TreeUpdate {
         if !self.enabled() {
             return TreeUpdate::default();
         }
@@ -184,8 +191,9 @@ impl PrefixTree {
         }
         let mut update = TreeUpdate::default();
         let mut base = ChainHash::new(0); // 从根起(全量登记)
-        for (block, &slot) in tokens.chunks(self.block_tokens).take(n).zip(slots) {
-            let Some(next) = self.insert_one(base, block, Some(slot), &mut update) else {
+        for (i, (block, &slot)) in tokens.chunks(self.block_tokens).take(n).zip(slots).enumerate() {
+            let tag = tags.get(i).copied().unwrap_or(0);
+            let Some(next) = self.insert_one(base, block, tag, Some(slot), &mut update) else {
                 break; // 哈希碰撞(指纹不符):当断链处理,响亮地不登记
             };
             base = next;
@@ -200,15 +208,16 @@ impl PrefixTree {
     /// 新条目 `slot = None` —— 内容在盘上(或宿主),`locate` 归 `Tier::Host`
     /// ⇒ 命中后由 `fill_kv_from_disk` 读回宿主。**不复查内容是否存在**
     /// (调用方已按"内容文件在场"截断过 tokens)。
-    pub(crate) fn insert_offloaded(&mut self, tokens: &[u32]) -> TreeUpdate {
+    pub(crate) fn insert_offloaded(&mut self, tokens: &[u32], tags: &[BlockTag]) -> TreeUpdate {
         if !self.enabled() {
             return TreeUpdate::default();
         }
         let n = tokens.len() / self.block_tokens;
         let mut update = TreeUpdate::default();
         let mut base = ChainHash::new(0);
-        for block in tokens.chunks(self.block_tokens).take(n) {
-            let Some(next) = self.insert_one(base, block, None, &mut update) else {
+        for (i, block) in tokens.chunks(self.block_tokens).take(n).enumerate() {
+            let tag = tags.get(i).copied().unwrap_or(0);
+            let Some(next) = self.insert_one(base, block, tag, None, &mut update) else {
                 break;
             };
             base = next;
@@ -224,17 +233,23 @@ impl PrefixTree {
     /// 用在**轮内**登记(链一写完就进树 ⇒ 该块才可被逐块下沉票选中:宿主层按树条目键控)。
     ///
     /// `blocks = &[(tokens_of_block, slot)]`(每项长度必须 = `block_tokens`)。
-    pub(crate) fn insert_inc(&mut self, parent0: ChainHash, blocks: &[(&[u32], u32)]) -> TreeUpdate {
+    pub(crate) fn insert_inc(
+        &mut self,
+        parent0: ChainHash,
+        blocks: &[(&[u32], u32)],
+        tags: &[BlockTag],
+    ) -> TreeUpdate {
         if !self.enabled() || blocks.is_empty() {
             return TreeUpdate::default();
         }
         let mut update = TreeUpdate::default();
         let mut base = parent0;
-        for (block, slot) in blocks {
+        for (k, (block, slot)) in blocks.iter().enumerate() {
             if block.len() != self.block_tokens {
                 break; // 非整块 = 结构错(调用方保证;不静默凑数)
             }
-            let Some(next) = self.insert_one(base, block, Some(*slot), &mut update) else {
+            let tag = tags.get(k).copied().unwrap_or(0);
+            let Some(next) = self.insert_one(base, block, tag, Some(*slot), &mut update) else {
                 break;
             };
             base = next;
@@ -255,12 +270,13 @@ impl PrefixTree {
         &mut self,
         base: ChainHash,
         block: &[u32],
+        tag: BlockTag,
         slot: Option<u32>,
         update: &mut TreeUpdate,
     ) -> Option<ChainHash> {
         let slot = slot.filter(|s| *s != crate::leg::HOST_PLACEHOLDER);
-        let hash = hash_block(base, block);
-        let fingerprint = content_fingerprint(block);
+        let hash = hash_block(base, block, tag);
+        let fingerprint = content_fingerprint(block, tag);
         match self.entries.get(&hash) {
             Some(e) if e.fingerprint == fingerprint => {
                 // 已是同一块:触达 + **必要时重绑新槽**(见 `TreeUpdate::rebound`)。
@@ -480,40 +496,40 @@ mod tests {
     fn match_walks_parent_chain_and_stops_at_miss() {
         let mut t = PrefixTree::new(4, 16);
         let tokens = toks(8);
-        assert_eq!(t.matched_blocks(&tokens).matched_blocks, 0, "空树必 miss");
+        assert_eq!(t.matched_blocks(&tokens, &[]).matched_blocks, 0, "空树必 miss");
 
-        let up = t.insert(&tokens, &[10, 11]);
+        let up = t.insert(&tokens, &[10, 11], &[]);
         assert_eq!(up.inserted.len(), 2);
-        let m = t.matched_blocks(&toks(12));
+        let m = t.matched_blocks(&toks(12), &[]);
         assert_eq!(m.matched_blocks, 2, "只匹配已登记的整块");
         assert_eq!(m.blocks.iter().map(|b| b.slot).collect::<Vec<_>>(), vec![Some(10), Some(11)]);
-        assert_eq!(m.tail, Some(super::super::chain::tail_hash(&tokens, 4, 2).expect("尾哈希")));
+        assert_eq!(m.tail, Some(super::super::chain::tail_hash(&tokens, 4, 2, &[]).expect("尾哈希")));
 
         // 字面相同但历史不同 ⇒ 不同身份(父链在身份里)
         let mut other = PrefixTree::new(4, 16);
         let shifted: Vec<u32> = (1..13).collect();
-        other.insert(&shifted, &[20, 21, 22]);
+        other.insert(&shifted, &[20, 21, 22], &[]);
         let mut mixed = vec![99u32];
         mixed.extend(toks(12));
-        assert_eq!(other.matched_blocks(&mixed).matched_blocks, 0, "父链不同 ⇒ 不命中");
+        assert_eq!(other.matched_blocks(&mixed, &[]).matched_blocks, 0, "父链不同 ⇒ 不命中");
     }
 
     #[test]
     fn insert_reports_excess_eviction_and_leaf_lru_order() {
         let mut t = PrefixTree::new(4, 1);
-        let up = t.insert(&toks(8), &[21, 22]);
+        let up = t.insert(&toks(8), &[21, 22], &[]);
         assert_eq!(up.evicted.len(), 1, "容量 1 ⇒ 逐一");
         assert_eq!(up.evicted[0].1, Some(22), "逐最老叶(块 22 是后插入的叶)");
-        assert_eq!(t.matched_blocks(&toks(8)).matched_blocks, 1);
+        assert_eq!(t.matched_blocks(&toks(8), &[]).matched_blocks, 1);
     }
 
     #[test]
     fn host_binding_keeps_identity_without_slot() {
         let mut t = PrefixTree::new(4, 8);
-        t.insert(&toks(8), &[7, 8]);
-        let tail = super::super::chain::tail_hash(&toks(8), 4, 2).expect("尾哈希");
+        t.insert(&toks(8), &[7, 8], &[]);
+        let tail = super::super::chain::tail_hash(&toks(8), 4, 2, &[]).expect("尾哈希");
         assert_eq!(t.set_slot(tail, None), Some(Some(8)), "摘绑定返回旧槽");
-        let m = t.matched_blocks(&toks(8));
+        let m = t.matched_blocks(&toks(8), &[]);
         assert_eq!(m.matched_blocks, 2, "host 条目仍按内容命中");
         assert_eq!(m.blocks.last().and_then(|b| b.slot), None, "设备上没有副本");
     }
@@ -534,21 +550,21 @@ mod tests {
         a.extend([100u32, 101, 102, 103]); // A 的第三块
         let mut b = base.clone();
         b.extend([200u32, 201, 202, 203]); // B 的第三块
-        t.insert(&a, &[10, 11, 12]);
-        t.insert(&b, &[20, 21, 22]);
-        let ha = t.matched_blocks(&a);
-        let hb = t.matched_blocks(&b);
+        t.insert(&a, &[10, 11, 12], &[]);
+        t.insert(&b, &[20, 21, 22], &[]);
+        let ha = t.matched_blocks(&a, &[]);
+        let hb = t.matched_blocks(&b, &[]);
         assert_eq!((ha.matched_blocks, hb.matched_blocks), (3, 3), "两枝各自整链命中");
         assert_eq!(ha.blocks[0].chain, hb.blocks[0].chain, "共享块 = 同一身份");
         assert_eq!(ha.blocks[1].chain, hb.blocks[1].chain);
         assert_ne!(ha.blocks[2].chain, hb.blocks[2].chain, "分叉点身份不同");
         // 刚用过 A ⇒ B 的尾叶最冷 ⇒ 先逐它
-        let _ = t.matched_blocks(&a);
+        let _ = t.matched_blocks(&a, &[]);
         let ev = t.evict_device(1);
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].1, Some(22), "先逐最冷的叶(B 的尾巴)");
-        assert_eq!(t.matched_blocks(&a).matched_blocks, 3, "A 不受影响");
-        assert_eq!(t.matched_blocks(&b).matched_blocks, 2, "B 只剩共享前缀");
+        assert_eq!(t.matched_blocks(&a, &[]).matched_blocks, 3, "A 不受影响");
+        assert_eq!(t.matched_blocks(&b, &[]).matched_blocks, 2, "B 只剩共享前缀");
         let shared_tail = hb.blocks[1].chain;
         assert_eq!(
             t.get(shared_tail).expect("共享块在").children,
@@ -567,8 +583,8 @@ mod tests {
     #[test]
     fn only_leaves_are_evictable() {
         let mut t = PrefixTree::new(4, 8);
-        t.insert(&toks(8), &[3, 4]);
-        let parent = super::super::chain::tail_hash(&toks(4), 4, 1).expect("首块哈希");
+        t.insert(&toks(8), &[3, 4], &[]);
+        let parent = super::super::chain::tail_hash(&toks(4), 4, 1, &[]).expect("首块哈希");
         let e = t.get(parent).expect("条目在");
         assert_eq!(e.children, 1, "有子链 ⇒ 非叶");
         assert!(t.leaves().iter().all(|(h, _, _)| *h != parent), "非叶不入候选");

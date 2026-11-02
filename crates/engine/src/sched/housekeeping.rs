@@ -38,7 +38,10 @@ pub(crate) struct Housekeeping {
     /// **待执行的 checkpoint**(T9 收尾:turn 收口只**登记**,真正落盘挪到空转拍
     /// —— 写 2400 MiB 要 5 s 量级,挂在收口上就是 agent 的尾延迟)。
     /// 存 **tokens 快照**:空转拍会话可能已出表,而链取址只要 tokens。
-    pending_kv_checkpoint: Option<(u64, Vec<u32>)>,
+    /// 待落盘 KV 的 `(session, tokens, 逐块图像指纹)`。
+    /// 指纹必须**随令牌一起**带过来:落盘时会话可能已出表,而盘上内容的身份
+    /// 必须与缓存树同源(含图像内容),否则重启 adopted 回来的含图链对不上。
+    pending_kv_checkpoint: Option<(u64, Vec<u32>, Vec<owl_store::BlockTag>)>,
 }
 
 impl Housekeeping {
@@ -76,12 +79,19 @@ impl Housekeeping {
     }
 
     /// **登记一次待落盘**(turn 收口调;不占收口时间)。
-    pub(crate) fn arm_kv_checkpoint(&mut self, sid: u64, tokens: Vec<u32>) {
-        self.pending_kv_checkpoint = Some((sid, tokens));
+    pub(crate) fn arm_kv_checkpoint(
+        &mut self,
+        sid: u64,
+        tokens: Vec<u32>,
+        tags: Vec<owl_store::BlockTag>,
+    ) {
+        self.pending_kv_checkpoint = Some((sid, tokens, tags));
     }
 
     /// 取走待落盘(空转拍调;一次一拍,不排队 —— 同会话只留最新)。
-    pub(crate) fn take_kv_checkpoint(&mut self) -> Option<(u64, Vec<u32>)> {
+    pub(crate) fn take_kv_checkpoint(
+        &mut self,
+    ) -> Option<(u64, Vec<u32>, Vec<owl_store::BlockTag>)> {
         self.pending_kv_checkpoint.take()
     }
 

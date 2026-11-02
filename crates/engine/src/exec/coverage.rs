@@ -1649,10 +1649,17 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 候选块身份 = 本会话 token 链的逐块父链哈希(与索引登记同源:
         // `owl_store::hash_block` 是身份的唯一产地)
         let toks = self.tokens_upto(0, n_blocks * page)?;
+        // 身份必须带**逐块图像指纹**(与登记/命中同源);否则含图链的候选身份
+        // 永远查不到索引条目(诊断面静默给 0 覆盖)。
+        let tags = self.turn_block_tags(sid, page);
         let mut parent = owl_store::ChainHash::new(0);
         let mut cands = Vec::with_capacity(n_blocks);
         for b in 0..n_blocks {
-            parent = owl_store::hash_block(parent, &toks[b * page..(b + 1) * page]);
+            parent = owl_store::hash_block(
+                parent,
+                &toks[b * page..(b + 1) * page],
+                tags.get(b).copied().unwrap_or(0),
+            );
             cands.push(parent);
         }
         let Some(index) = self.bank.rel.index.as_ref() else {

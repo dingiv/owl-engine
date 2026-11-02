@@ -376,7 +376,19 @@ impl BlockLeg {
     /// 命中面含宿主承载格(`slot = None`)时**响亮拒** —— 回灌未接线(S3-3b)之前,
     /// 宁可整条不复用,也不静默少用几块(设计卷 §10.4 律⑤)。
     pub fn match_prefix(&mut self, tokens: &[u32]) -> StoreResult<ChainHit> {
-        let pm: PrefixMatch = self.kv.match_prefix(tokens);
+        self.match_prefix_tagged(tokens, &[])
+    }
+
+    /// 同 [`Self::match_prefix`],但带**逐块多模态指纹**(图像内容)。
+    ///
+    /// 引擎侧带图请求**必须**走本口 —— 否则换一张截图(占位符字面相同)会被判
+    /// 成同一条链,直接复用上一条请求的图像 KV(2026-11-03 定谳)。
+    pub fn match_prefix_tagged(
+        &mut self,
+        tokens: &[u32],
+        tags: &[crate::kv::BlockTag],
+    ) -> StoreResult<ChainHit> {
+        let pm: PrefixMatch = self.kv.match_prefix_tagged(tokens, tags);
         if pm.matched_blocks == 0 {
             return Ok(ChainHit::default());
         }
@@ -621,7 +633,18 @@ impl BlockLeg {
         table: &[u32],
         session: u64,
     ) -> StoreResult<CacheUpdate> {
-        let up = self.kv.register_chain_owned(tokens, table, session)?;
+        self.register_chain_owned_tagged(tokens, table, session, &[])
+    }
+
+    /// 同 [`Self::register_chain_owned`],但带逐块多模态指纹。
+    pub fn register_chain_owned_tagged(
+        &mut self,
+        tokens: &[u32],
+        table: &[u32],
+        session: u64,
+        tags: &[crate::kv::BlockTag],
+    ) -> StoreResult<CacheUpdate> {
+        let up = self.kv.register_chain_owned_tagged(tokens, table, session, tags)?;
         self.finish_tree_update(&up)?;
         Ok(up)
     }
@@ -649,6 +672,16 @@ impl BlockLeg {
     /// 整块前缀的内容身份(身份原语的腿面出口;engine 播种链游标 / 测试)。
     pub fn tail_hash(&self, tokens: &[u32], full_blocks: usize) -> Option<ChainHash> {
         self.kv.tail_hash(tokens, full_blocks)
+    }
+
+    /// 同 [`Self::tail_hash`],但带逐块多模态指纹(图像链身份的唯一正确入口)。
+    pub fn tail_hash_tagged(
+        &self,
+        tokens: &[u32],
+        full_blocks: usize,
+        tags: &[crate::kv::BlockTag],
+    ) -> Option<ChainHash> {
+        self.kv.tail_hash_tagged(tokens, full_blocks, tags)
     }
 
     /// 块账统计(内容身份树 + 槽池面;门面报告用 —— 单一真源)。
@@ -836,7 +869,17 @@ impl BlockLeg {
     /// ⚠️ 登记**内部会因容量驱逐**(`cache_cap`)—— 被逐的宿主条目必须把宿主副本
     /// 一起丢掉(`ensure_for_len` 那条路有,这里原先漏了:副本留尸)。
     pub fn register_chain(&mut self, tokens: &[u32], table: &[u32]) -> StoreResult<CacheUpdate> {
-        let up = self.kv.register_chain(tokens, table)?;
+        self.register_chain_tagged(tokens, table, &[])
+    }
+
+    /// 同 [`Self::register_chain`],但带逐块多模态指纹。
+    pub fn register_chain_tagged(
+        &mut self,
+        tokens: &[u32],
+        table: &[u32],
+        tags: &[crate::kv::BlockTag],
+    ) -> StoreResult<CacheUpdate> {
+        let up = self.kv.register_chain_tagged(tokens, table, tags)?;
         self.finish_tree_update(&up)?;
         Ok(up)
     }
@@ -863,7 +906,17 @@ impl BlockLeg {
         parent0: ChainHash,
         blocks: &[(&[u32], u32)],
     ) -> StoreResult<crate::kv::CacheUpdate> {
-        let up = self.kv.register_chain_inc(parent0, blocks)?;
+        self.register_chain_inc_tagged(parent0, blocks, &[])
+    }
+
+    /// 同 [`Self::register_chain_inc`],但带逐块多模态指纹。
+    pub fn register_chain_inc_tagged(
+        &mut self,
+        parent0: ChainHash,
+        blocks: &[(&[u32], u32)],
+        tags: &[crate::kv::BlockTag],
+    ) -> StoreResult<crate::kv::CacheUpdate> {
+        let up = self.kv.register_chain_inc_tagged(parent0, blocks, tags)?;
         self.finish_tree_update(&up)?;
         Ok(up)
     }

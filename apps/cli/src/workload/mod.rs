@@ -83,10 +83,11 @@ pub fn run(args: Args) -> i32 {
     let suite = args.suite.to_ascii_lowercase();
     if !matches!(
         suite.as_str(),
-        "core" | "image-evict" | "gui" | "gui-capability" | "all"
+        "core" | "image-evict" | "gui" | "gui-capability" | "vision-identity" | "all"
     ) {
         eprintln!(
-            "[workload] 未知 suite {suite:?}(core | image-evict | gui | gui-capability | all)"
+            "[workload] 未知 suite {suite:?}(core | image-evict | gui | gui-capability | \
+             vision-identity | all)"
         );
         return 2;
     }
@@ -105,6 +106,10 @@ pub fn run(args: Args) -> i32 {
         ("text_multiturn", scenarios::text_multiturn),
         ("tool_roundtrip", scenarios::tool_roundtrip),
         ("vision_chat", scenarios::vision_chat),
+        (
+            "image_content_identity",
+            scenarios::image_content_identity,
+        ),
         ("mixed_tool_image", scenarios::mixed_tool_image),
         ("image_delete_marked", scenarios::image_delete_marked),
         ("image_delete_middle", scenarios::image_delete_middle),
@@ -122,6 +127,8 @@ pub fn run(args: Args) -> i32 {
         cases.retain(|(n, _)| *n == "gui_agent_screenshots");
     } else if suite == "gui-capability" {
         cases.retain(|(n, _)| *n == "gui_capability_prompt");
+    } else if suite == "vision-identity" {
+        cases.retain(|(n, _)| *n == "image_content_identity");
     } else if suite == "image-evict" {
         cases.retain(|(n, _)| n.starts_with("image_"));
     }

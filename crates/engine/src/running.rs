@@ -1073,7 +1073,41 @@ impl<D: DeviceClient> RunningEngine<D> {
             &inherited,
         )
         .map_err(ModelError::Msg)?;
-        Ok((seq.ids, seq.spans, seq.pads, deletion))
+        // ── ③ **图像内容指纹盖章**(2026-11-03 定谳的陈旧图像 KV):
+        // token 流里图像只是字面相同的占位符 ⇒ 块身份必须另带图像内容指纹,
+        // 否则"同文本 + 换截图"会整条命中上一条请求的 KV(模型对着旧图答)。
+        // 指纹 = 预处理后 pixel_values 的逐位哈希(`VlmImageKey`),与塔输出
+        // 缓存同源 ⇒ 同图同值、异图必异。
+        let mut spans = seq.spans;
+        if spans.len() != images.len() {
+            return Err(ModelError::Msg(format!(
+                "图像指纹盖章:段 {} ≠ 图 {}(账不平;宁可拒也不错位)",
+                spans.len(),
+                images.len()
+            )));
+        }
+        for (sp, img) in spans.iter_mut().zip(images) {
+            sp.img_tag = crate::vlm::VlmImageKey::of(&img.image).content_tag();
+        }
+        Ok((seq.ids, spans, seq.pads, deletion))
+    }
+
+    /// **本轮块指纹**(`owl_store::BlockTag` 的引擎侧唯一入口)。
+    ///
+    /// 优先取**活跃 turn** 的 `img_spans`(submit 已按像素盖章);会话账只在
+    /// turn 不活跃时当退路(收口/空转拍)。
+    ///
+    /// ⚠️ 这与"turn 进行中却读会话账"是两回事:会话账在 turn 收口才写回,
+    /// 轮内读它拿的是**上一轮**的 spans(图像块会被判成纯文本身份)⇒ 游标/快照键
+    /// 与命中面身份不一致 ⇒ 复用面被腰斩(2026-11-03 实测只命中 3 块)。
+    pub(crate) fn turn_block_tags(&self, sid: u64, page: usize) -> Vec<owl_store::BlockTag> {
+        if let Some(act) = self.turns.active.iter().find(|a| a.session_id == sid) {
+            return crate::img_evict::block_tags(act.prompt_ids.len(), page, &act.img_spans);
+        }
+        match self.bank.sessions.get(sid) {
+            Some(s) => crate::img_evict::block_tags(s.tokens.len(), page, &s.img_spans),
+            None => Vec::new(),
+        }
     }
 
     /// 同 [`Self::submit_session_ex`],但携带 per-turn 可选项(采样参数/停止串/种子;
@@ -1842,10 +1876,17 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 盘索引/空转拍仍只给 TurnEnd:中断路径要便宜。
         if release.publish && self.dev.pool.geom.paged {
             if let Some(s) = self.bank.sessions.get(release.session) {
-                let up = self.bank.rel.leg.register_chain_owned(
+                // 指纹 = 会话账的 pad 后坐标(span 已在 submit 侧按像素盖章)
+                let tags = crate::img_evict::block_tags(
+                    s.tokens.len(),
+                    self.dev.pool.geom.page.max(1),
+                    &s.img_spans,
+                );
+                let up = self.bank.rel.leg.register_chain_owned_tagged(
                     &s.tokens,
                     &s.block_table,
                     release.session,
+                    &tags,
                 )?;
                 if self.boot.cfg.knobs.probes.debug {
                     owl_shared::log_debug!(
@@ -1871,13 +1912,37 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .map(|s| s.tokens.clone())
                     .unwrap_or_default();
                 if !toks.is_empty() {
-                    self.write_chain_index(&toks).await?;
+                    let tags = self
+                        .bank
+                        .sessions
+                        .get(release.session)
+                        .map(|s| {
+                            crate::img_evict::block_tags(
+                                s.tokens.len(),
+                                self.dev.pool.geom.page.max(1),
+                                &s.img_spans,
+                            )
+                        })
+                        .unwrap_or_default();
+                    self.write_chain_index(&toks, &tags).await?;
                 }
                 // **S6.2 主动落盘**:turn 收口只**登记**(2026-11-01 收尾)——
                 // 真正落盘挪到空转拍。理由:一次配额写 2400 MiB 是 5 s 量级,
                 // 挂在收口上直接变成 agent 的尾延迟;而空转拍没有人在等回包。
                 // 会话 tokens 在空转拍仍可取(会话未出表),不影响链取址。
-                self.hk.arm_kv_checkpoint(release.session, toks);
+                let tags = self
+                    .bank
+                    .sessions
+                    .get(release.session)
+                    .map(|s| {
+                        crate::img_evict::block_tags(
+                            s.tokens.len(),
+                            self.dev.pool.geom.page.max(1),
+                            &s.img_spans,
+                        )
+                    })
+                    .unwrap_or_default();
+                self.hk.arm_kv_checkpoint(release.session, toks, tags);
             }
             // **索引暂存排空**：正常 prefill 的末边界已清空；这里兜底
             // abort/短轮 —— 必须在 `release_turn_table` 之前采，物理页还在。
@@ -2376,7 +2441,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             if let Some(t) = self.turns.queue.front() {
                 let (sid, plen) = (t.session_id, t.prompt_ids.len());
                 let dev = {
-                    let (hit, recall) = self.bank.rel.match_prefix(&t.prompt_ids)?;
+                    let tags = crate::img_evict::block_tags(t.prompt_ids.len(), page, &t.img_spans);
+                    let (hit, recall) = self.bank.rel.match_prefix_tagged(&t.prompt_ids, &tags)?;
                     Self::reuse_face(&self.bank.rel, &hit, &recall, plen, page).1
                 };
                 let have = self
@@ -3079,6 +3145,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     async fn checkpoint_session_kv(
         &mut self,
         tokens: &[u32],
+        tags: &[owl_store::BlockTag],
         quota_bytes: usize,
     ) -> Result<CheckpointStats> {
         use owl_iface::contract::Connector as _; // `SlotTable::get` 是 trait 方法
@@ -3097,7 +3164,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // **索引与内容成对**(2026-11-01):索引平时由 turn 收口写,而内容由本函数
         // 在空转拍写 —— 两条时序不同 ⇒ 出现过"内容在、索引缺"⇒ 下次 boot 按孤儿
         // 清掉(已改成只报不删)。这里顺手补写一次索引:幂等(同名覆盖),32 KB 级。
-        if let Err(e) = self.write_chain_index(&tokens).await {
+        if let Err(e) = self.write_chain_index(&tokens, tags).await {
             owl_shared::log_warn!("store", "checkpoint 侧索引补写失败(内容仍写):{e}");
         }
         // **身份来源 = tokens**(2026-11-01 P1 定谳):盘上内容的键必须与
@@ -3111,8 +3178,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ⇒ 现在两边统一由 tokens 逐块 `hash_block` 得到,树只当缓存索引。
         let mut parent = owl_store::ChainHash::new(0);
         let mut chain = Vec::with_capacity(full);
-        for block in tokens.chunks(page).take(full) {
-            parent = owl_store::hash_block(parent, block);
+        for (i, block) in tokens.chunks(page).take(full).enumerate() {
+            parent = owl_store::hash_block(parent, block, tags.get(i).copied().unwrap_or(0));
             chain.push(parent);
         }
         let Some(&_tail) = chain.last() else {
@@ -3287,7 +3354,12 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     /// **turn 收口的 checkpoint 调度**（门 + 节拍 + 日志/指标）。
-    async fn maybe_checkpoint_kv(&mut self, sid: u64, tokens: &[u32]) -> Result<()> {
+    async fn maybe_checkpoint_kv(
+        &mut self,
+        sid: u64,
+        tokens: &[u32],
+        tags: &[owl_store::BlockTag],
+    ) -> Result<()> {
         let quota_mb = self.boot.cfg.knobs.checkpoint_max_mb;
         if quota_mb == 0 || !self.bank.rel.disk_enabled() {
             return Ok(());
@@ -3302,7 +3374,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         self.hk.mark_kv_checkpoint();
         let t0 = std::time::Instant::now();
-        let st = self.checkpoint_session_kv(tokens, quota_mb << 20).await?;
+        let st = self.checkpoint_session_kv(tokens, tags, quota_mb << 20).await?;
         if st.blocks() > 0 || st.snap_disk {
             owl_shared::log_info!(
                 "store",
@@ -3431,7 +3503,11 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///
     /// 内容可能**还没溢写到盘** —— 索引先写;`boot` 以"内容文件在场"截断到连续前缀
     /// (没有内容的索引 = 孤儿,boot 会清掉内容/跳过)。8k token 的链 ≈ 32 KB。
-    pub(crate) async fn write_chain_index(&mut self, tokens: &[u32]) -> Result<()> {
+    pub(crate) async fn write_chain_index(
+        &mut self,
+        tokens: &[u32],
+        tags: &[owl_store::BlockTag],
+    ) -> Result<()> {
         if tokens.is_empty() || !self.bank.rel.disk_enabled() {
             return Ok(());
         }
@@ -3440,7 +3516,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         if full == 0 {
             return Ok(());
         }
-        let Some(tail) = self.bank.rel.leg.tail_hash(tokens, full) else {
+        // 身份必须与树**同源**(带图像指纹):否则盘索引写的是"纯文本身份",
+        // 重启 adopted 回来的含图链与活链对不上(且可能被纯文本请求误命中)。
+        let Some(tail) = self.bank.rel.leg.tail_hash_tagged(tokens, full, tags) else {
             return Ok(());
         };
         let Some(root) = self.bank.rel.disk.as_ref().map(|d| d.root().to_path_buf()) else {
@@ -4357,8 +4435,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // **待落盘的 KV checkpoint**(2026-11-01 收尾):空转拍执行,
                 // 一拍一个(不排队)。失败只 WARN —— 落盘是尽力而为,
                 // 不许把空转打断(下一拍还有机会,`checkpoint_min_gap_ms` 另管节拍)。
-                if let Some((sid, toks)) = self.hk.take_kv_checkpoint() {
-                    if let Err(e) = self.maybe_checkpoint_kv(sid, &toks).await {
+                if let Some((sid, toks, tags)) = self.hk.take_kv_checkpoint() {
+                    if let Err(e) = self.maybe_checkpoint_kv(sid, &toks, &tags).await {
                         owl_shared::log_warn!("store", "空转 checkpoint 失败(session={sid:#x}): {e}");
                     }
                 }

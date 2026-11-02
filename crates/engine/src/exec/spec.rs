@@ -1895,6 +1895,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let seg = self.tokens_upto_with(start * page, full_blocks * page, tail)?;
         // 3) 推进身份链(段长不符 = 结构性拒,不静默;逐块哈希在同一处重放
         //    —— 身份与游标同源 `owl_store::hash_block`)
+        //
+        // 逐块**图像指纹**必须在块外取(下面要 `get_mut` 会话账);来源 = 会话
+        // spans(已在 submit 侧按像素盖章)⇒ 游标 / 重放 / 增量登记三处同源。
+        let tags = self.turn_block_tags(sid, page);
         let (key, per_block, parent0) = {
             let s = self
                 .bank
@@ -1902,7 +1906,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .get_mut(sid)
                 .ok_or_else(|| ModelError::Msg(format!("会话 {sid} 不在账")))?;
             let parent0 = s.chain.tail();
-            let tail = s.chain.advance(page, &seg, full_blocks).ok_or_else(|| {
+            let tail = s.chain.advance(page, &seg, full_blocks, tags.get(start..).unwrap_or(&[])).ok_or_else(|| {
                 ModelError::Msg(format!(
                     "链哈希游标推进失败:sid={sid} fed={fed} start={start} 新增 {} 块",
                     full_blocks.saturating_sub(start)
@@ -1917,7 +1921,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let mut parent = parent0;
             for b in start..full_blocks {
                 let lo = (b - start) * page;
-                parent = owl_store::hash_block(parent, &seg[lo..lo + page]);
+                parent = owl_store::hash_block(
+                    parent,
+                    &seg[lo..lo + page],
+                    tags.get(b).copied().unwrap_or(0),
+                );
                 per.push((parent, b));
             }
             debug_assert_eq!(parent, tail, "逐块重放尾哈希须与 advance 一致(身份单源)");
@@ -1952,6 +1960,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if self.boot.cfg.knobs.select_partial {
             let bt = bt_now.clone();
             let mut blk_slices: Vec<(&[u32], u32)> = Vec::new();
+            let mut inc_tags: Vec<owl_store::BlockTag> = Vec::new();
             for (_, blk) in per_block.iter() {
                 let slot = bt.get(*blk).copied().unwrap_or(u32::MAX);
                 if owl_store::is_host_placeholder(slot) {
@@ -1959,9 +1968,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 }
                 let lo = (*blk - start) * page;
                 blk_slices.push((&seg[lo..lo + page], slot));
+                // 指纹必须与 `blk_slices` **一一对齐**(跳过占位块时也要一起跳)
+                inc_tags.push(tags.get(*blk).copied().unwrap_or(0));
             }
             if !blk_slices.is_empty() {
-                let up = self.bank.rel.leg.register_chain_inc(parent0, &blk_slices)?;
+                let up = self
+                    .bank
+                    .rel
+                    .leg
+                    .register_chain_inc_tagged(parent0, &blk_slices, &inc_tags)?;
                 self.bank.rel.leg.set_owner(sid, &up.inserted);
                 mcnt("store.chain.inc.blocks", up.inserted.len() as u64);
                 mcnt("store.chain.inc.evicted", up.evicted.len() as u64);

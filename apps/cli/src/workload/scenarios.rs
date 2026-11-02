@@ -4,7 +4,7 @@
 use serde_json::{json, Value};
 
 use crate::client::{ChatReply, Client};
-use crate::workload::png::{data_url_png, BLUE, CYAN, GREEN, PURPLE, RED, YELLOW};
+use crate::workload::png::{data_url_png, data_url_square, BLUE, CYAN, GREEN, PURPLE, RED, YELLOW};
 use crate::workload::report::{ScenarioReport, TurnRecord};
 use crate::workload::{gui, image_count, remove_oldest_image, report, Args, Ctx, Workspace};
 
@@ -389,6 +389,87 @@ pub(crate) fn vision_chat(
         Ok("red + blue".to_string())
     })();
     Ok(report("vision_chat", ctx, result))
+}
+
+// ── 3bis. **陈旧图像 KV 门**(2026-11-03 定谳) ───────────────────────────────
+//
+// 形状 = 「同提示词 + 不同截图」:**文本逐字节相同,只有像素不同**。
+// 块身份若只看 token(图像只是字面相同的占位符)⇒ 第二条请求整链命中
+// ⇒ 复用上一条的图像 KV ⇒ 模型对着**旧图**答(真机:`cached_tokens` 1088/1100,
+// 输出坐标逐点等于上一张图的方块位置;GUI agent 表现为"点不中、偏几十像素")。
+//
+// 判据:
+//  1. 两次答复的方块坐标必须不同(修前逐字节相同);
+//  2. 第二次的 `cached_tokens` 必须 **小于** 第二次单独重发时的对照组
+//     (即图像块不再被复用) —— 用「同图重发」当正对照。
+pub(crate) fn image_content_identity(
+    client: &Client,
+    args: &Args,
+    pid: u32,
+    max_tokens: usize,
+) -> Result<ScenarioReport, String> {
+    const W: u32 = 640;
+    const H: u32 = 360;
+    let ws = Workspace::new("image_content_identity", pid, args.keep)?;
+    let mut ctx = Ctx::new(
+        client,
+        "image_content_identity",
+        Some(session(pid, "imgid")),
+        false,
+        max_tokens,
+        ws.path(),
+    );
+    ctx.system(SYS_VISION);
+    // 关思考:本门只比"坐标是否随图变",思考会吃掉 max_tokens(实测 2048 全给 reasoning)
+    ctx.template_kwargs = Some(json!({"enable_thinking": false}));
+    // 两个**同形不同位**的方块:左上 vs 右下
+    let tl = data_url_square(W, H, W / 5, H / 5, 48);
+    let br = data_url_square(W, H, W * 4 / 5, H * 4 / 5, 48);
+    let ask = json!([{"type": "text", "text":
+        "Report the centre of the red square on a 0..1000 normalised grid          (x right, y down). Answer with JSON only: {\"x\":<0..1000>,\"y\":<0..1000>}"}]);
+    let n_sys = ctx.history.len(); // 只有 system:每次发完**截回**它 ⇒ 三次请求的
+                                   // 文本逐字节相同、只有图像像素不同(门的形状)
+    let result = (|| -> Result<String, String> {
+        let send = |ctx: &mut Ctx<'_>, img: &str| -> Result<crate::client::ChatReply, String> {
+            ctx.history.truncate(n_sys);
+            let mut content = ask.as_array().cloned().unwrap_or_default();
+            content.insert(0, image_part(img, false));
+            ctx.send(Value::Array(content))
+        };
+        let a1 = send(&mut ctx, &tl)?;
+        let b1 = send(&mut ctx, &br)?; // 同文本、换图
+        let b2 = send(&mut ctx, &br)?; // 同文本、同图(正对照:图像块本就该命中)
+
+        let json_point = |t: &str| -> Option<(f64, f64)> {
+            let s = &t[t.find('{')?..=t.rfind('}')?];
+            let v: Value = serde_json::from_str(s).ok()?;
+            Some((v.get("x")?.as_f64()?, v.get("y")?.as_f64()?))
+        };
+        let (ax, ay) = json_point(a1.text())
+            .ok_or_else(|| format!("A 答复不解析: {:?}", a1.text()))?;
+        let (bx, by) = json_point(b1.text())
+            .ok_or_else(|| format!("B 答复不解析: {:?}", b1.text()))?;
+        // ① 坐标必须**随图变**(修前逐字节相同 = 复用了上一张图的 KV)
+        ensure(
+            (ax, ay) != (bx, by),
+            format!("换图后答复完全相同 ⇒ 复用了上一张图的图像 KV: {ax},{ay}"),
+        )?;
+        // ② 而且要各自**落在自己的方块上**(左上 = 200/1000,右下 = 800/1000)
+        let near = |v: f64, want: f64| (v - want).abs() < 150.0;
+        ensure(
+            near(ax, 200.0) && near(ay, 200.0),
+            format!("A(左上)答偏: {ax},{ay}(期望 ≈200,200)"),
+        )?;
+        ensure(
+            near(bx, 800.0) && near(by, 800.0),
+            format!("B(右下)答偏: {bx},{by}(期望 ≈800,800)"),
+        )?;
+        Ok(format!(
+            "A=({ax},{ay}) B=({bx},{by}) cached(A1)={} cached(B1)={} cached(B2)={}",
+            a1.usage.cached_tokens, b1.usage.cached_tokens, b2.usage.cached_tokens
+        ))
+    })();
+    Ok(report("image_content_identity", ctx, result))
 }
 
 // ── 4. mixed image + tool call ───────────────────────────────────────────

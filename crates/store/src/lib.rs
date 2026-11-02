@@ -65,7 +65,8 @@ pub use hooks::{plan_capacity, Applied, EvictOut, Need, NeedWhy, Room, Sink, Ver
 pub use host::{HostBlock, HostTier, SlotTable};
 pub use id::{ChainHash, PrefixId, SnapKey, TOKENS_PER_BLOCK};
 pub use kv::{
-    hash_block, tail_hash, CacheUpdate, ChainCursor, KvStats, KvStore, MatchedBlock, PrefixMatch,
+    hash_block, tail_hash, BlockTag, CacheUpdate, ChainCursor, KvStats, KvStore, MatchedBlock,
+    PrefixMatch,
 };
 pub use leg::CachePolicy;
 pub use leg::{

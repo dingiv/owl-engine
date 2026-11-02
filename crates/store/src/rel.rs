@@ -636,7 +636,7 @@ impl Rel {
             let mut parent = ChainHash::new(0);
             let mut ok = 0usize;
             for block in idx.tokens.chunks(page) {
-                let h = crate::kv::hash_block(parent, block);
+                let h = crate::kv::hash_block(parent, block, 0);
                 if !disk.contains(h) {
                     break; // 内容不在盘上 ⇒ 连续前缀到此为止
                 }
@@ -650,7 +650,7 @@ impl Rel {
                     idx.tokens.chunks(page).next(),
                     Some(disk.resident_keys()),
                 ) {
-                    let h0 = crate::kv::hash_block(ChainHash::new(0), first);
+                    let h0 = crate::kv::hash_block(ChainHash::new(0), first, 0);
                     let sample: Vec<String> = disk_keys
                         .iter()
                         .take(3)
@@ -988,7 +988,17 @@ impl Rel {
     /// 未绑定的格(`slot = None`)= 内容在宿主层,调用方须在**段边界**回灌
     /// (律③)—— 本方法自身不做设备动作。
     pub fn match_prefix(&mut self, tokens: &[u32]) -> StoreResult<(ChainHit, RecallHit)> {
-        let m = self.leg.match_prefix(tokens)?;
+        self.match_prefix_tagged(tokens, &[])
+    }
+
+    /// 同 [`Self::match_prefix`],但带**逐块多模态指纹**(图像内容;图像链的唯一
+    /// 正确入口 —— 见 `KvStore::match_prefix_tagged`)。
+    pub fn match_prefix_tagged(
+        &mut self,
+        tokens: &[u32],
+        tags: &[crate::kv::BlockTag],
+    ) -> StoreResult<(ChainHit, RecallHit)> {
+        let m = self.leg.match_prefix_tagged(tokens, tags)?;
         let tail = m.hashes.last().copied();
         let kv_tier = tail
             .and_then(|t| self.leg.carrier_of(t).ok())
@@ -1026,6 +1036,16 @@ impl Rel {
     /// 只做 KV 腿;快照腿由 [`StateStore::return_row`] 登记(两腿独立 —— 裁决②)。
     pub fn register_chain(&mut self, tokens: &[u32], table: &[u32]) -> StoreResult<CacheUpdate> {
         self.leg.register_chain(tokens, table)
+    }
+
+    /// 同 [`Self::register_chain`],但带逐块多模态指纹(图像链的唯一正确入口)。
+    pub fn register_chain_tagged(
+        &mut self,
+        tokens: &[u32],
+        table: &[u32],
+        tags: &[crate::kv::BlockTag],
+    ) -> StoreResult<CacheUpdate> {
+        self.leg.register_chain_tagged(tokens, table, tags)
     }
 
     /// **批准一张容量票**(准入后;store 账)。`slots` = 整条上下文/生成预算页面。
@@ -3208,7 +3228,7 @@ mod tests {
         let tokens: Vec<u32> = (0..96).collect(); // 3 块 × 32
         let mut parent = ChainHash::new(0);
         for blk in tokens.chunks(32) {
-            let h = crate::kv::hash_block(parent, blk);
+            let h = crate::kv::hash_block(parent, blk, 0);
             parent = h;
             let plan = r.disk.as_ref().expect("盘").plan_spill(h).expect("计划");
             r.disk
@@ -3235,7 +3255,7 @@ mod tests {
         let tokens: Vec<u32> = (0..96).collect();
         let mut parent = ChainHash::new(0);
         for (k, blk) in tokens.chunks(32).enumerate() {
-            let h = crate::kv::hash_block(parent, blk);
+            let h = crate::kv::hash_block(parent, blk, 0);
             parent = h;
             if k < 2 {
                 let plan = r.disk.as_ref().expect("盘").plan_spill(h).expect("计划");
