@@ -984,7 +984,7 @@ impl Attention {
     }
 
     /// **INT8 prefill**(生产首版):Q per-head int8、K-only writer、整页 V
-    /// scale+pack、`owl_int8_prefill_paged`。输出 f32 → f16 → GateMul。
+    /// scale+pack、`owl_int8_prefill_paged`。输出 f16 → GateMul。
     #[allow(clippy::too_many_arguments)]
     fn paged_prefill_int8_output(
         &self,

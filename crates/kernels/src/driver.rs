@@ -1946,8 +1946,8 @@ pub mod attn {
         KernelPick::of::<crate::ops::attn::Int8PrefillPaged>(Shape {
             grid: (tokens.div_ceil(64) as u32, hq as u32, 1),
             block: (128, 1, 1),
-            // Q 16K + K 16K + P 2K + Kscale 128B
-            smem: (16384 + 16384 + 2048 + 128) as u32,
+            // Q 16K + K双缓冲 16K + V 8K + P 2K + Kscale 2×128B
+            smem: (16384 + 16384 + 8192 + 2048 + 256) as u32,
         })
     }
 

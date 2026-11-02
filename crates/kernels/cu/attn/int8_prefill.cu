@@ -16,10 +16,12 @@ constexpr int Bc = 32;
 constexpr int DB16 = D / 2;
 constexpr int Threads = 128;
 constexpr int QBytes = Br * D;
-constexpr int KVBytes = 16 * 1024;
+constexpr int KBytes = 8 * 1024;
+constexpr int VBytes = 8 * 1024;
+constexpr int KVBytes = 2 * KBytes + VBytes;
 constexpr int PBytes = Br * (Bc / 2) * 2;
 constexpr int ScaleBytes = Bc * sizeof(float);
-constexpr int SmemBytes = QBytes + KVBytes + PBytes + ScaleBytes;
+constexpr int SmemBytes = QBytes + KVBytes + PBytes + 2 * ScaleBytes;
 
 __device__ __forceinline__ int swz(int row, int col) { return (((col >> 3) ^ (row & 7)) << 3) | (col & 7); }
 __device__ __forceinline__ int swz_p(int row, int col) { return (((col >> 3) ^ (row & 1)) << 3) | (col & 7); }
@@ -51,12 +53,13 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
     (void)dep_v;
     extern __shared__ __align__(16) int8_t smem[];
     int8_t* qs = smem;
-    int8_t* ks = smem + QBytes;
-    uint16_t* v_b16 = reinterpret_cast<uint16_t*>(smem + QBytes + 8 * 1024);
+    int8_t* ks0 = smem + QBytes;
+    int8_t* ks1 = ks0 + KBytes;
+    uint16_t* v_b16 = reinterpret_cast<uint16_t*>(smem + QBytes + 2 * KBytes);
     uint16_t* p_b16 = reinterpret_cast<uint16_t*>(smem + QBytes + KVBytes);
-    float* kscale_s = reinterpret_cast<float*>(smem + QBytes + KVBytes + PBytes);
+    float* kscale0 = reinterpret_cast<float*>(smem + QBytes + KVBytes + PBytes);
+    float* kscale1 = reinterpret_cast<float*>(reinterpret_cast<int8_t*>(kscale0) + ScaleBytes);
     __half* q_b16 = reinterpret_cast<__half*>(qs);
-    __half* k_b16 = reinterpret_cast<__half*>(ks);
 
     const int q_block = blockIdx.x;
     const int q_head = blockIdx.y;
@@ -74,6 +77,20 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
         cp_async<16, Cache::cg>(&qs[row * D + swz(row, d / 2) * 2],
                                 &q[((size_t)(q0 + row) * Hq + q_head) * D + d]);
     }
+    // Prologue K0 into buffer 0.
+    for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
+        const int key = chunk / (D / 16);
+        const int d = (chunk % (D / 16)) * 16;
+        int8_t* dst = &ks0[key * D + swz(key, d / 2) * 2];
+        if (key < L) {
+            const int page_idx = static_cast<int>(block_table[0]);
+            cp_async<16, Cache::cg>(dst, &k[((size_t)page_idx * page + key) * Hkv * D +
+                                           (size_t)kv_head * D + d]);
+        } else {
+            store_vec(dst, make_int4(0, 0, 0, 0));
+        }
+    }
+    if (tid < Bc) kscale0[tid] = (tid < L) ? kscale[(size_t)tid * Hkv + kv_head] : 0.0f;
     cp_commit(); cp_wait<0>(); __syncthreads();
 
     const int gid = lane >> 2;
@@ -108,26 +125,11 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int tile_k0 = kb * Bc;
-        for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
-            const int key_l = chunk / (D / 16);
-            const int d = (chunk % (D / 16)) * 16;
-            const int key = tile_k0 + key_l;
-            int8_t* dst = &ks[key_l * D + swz(key_l, d / 2) * 2];
-            if (key < L) {
-                const int page_idx = static_cast<int>(block_table[tile_k0 / page]);
-                cp_async<16, Cache::cg>(
-                    dst, &k[((size_t)page_idx * page + key_l) * Hkv * D +
-                            (size_t)kv_head * D + d]);
-            } else {
-                store_vec(dst, make_int4(0, 0, 0, 0));
-            }
-        }
-        if (tid < Bc) {
-            const int key = tile_k0 + tid;
-            kscale_s[tid] = (key < L) ? kscale[(size_t)key * Hkv + kv_head] : 0.0f;
-        }
-        cp_commit();  // group 0: K
-        // group 1: V 预取,与 QK 重叠;K/V 共享区互不重叠(K 前半,V 后半)。
+        const int buf = kb & 1;
+        const int next = buf ^ 1;
+        __half* k_b16 = reinterpret_cast<__half*>(smem + QBytes + buf * KBytes);
+        float* kscale_s = buf ? kscale1 : kscale0;
+        // V 预取,与 QK 重叠;K[buf] 已由 prologue / 上一轮 prefetch 就绪。
         const int v_page = static_cast<int>(block_table[tile_k0 / page]);
         for (int chunk = tid; chunk < D * (Bc / 2 / 8); chunk += Threads) {
             const int d = chunk / (Bc / 2 / 8);
@@ -138,9 +140,7 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
             uint16_t* dst = &v_b16[d * (Bc / 2) + swz_v(d, pair0)];
             cp_async<16, Cache::cg>(dst, src);
         }
-        cp_commit();  // group 1: V
-        cp_wait<1>(); // 只等 K;V 仍在飞
-        __syncthreads();
+        cp_commit();  // V group;K[buf] already resident
 
         float score[4][4];
 #pragma unroll
@@ -254,10 +254,33 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
             acc[n][3] *= alpha1;
         }
 
-        __syncthreads();  // all QK done; K is free, V can overwrite
-
         cp_wait<0>(); // V 预取完成
         __syncthreads();
+        // K(kb+1) 预取,与 PV(kb) 重叠;写另一 K 缓冲。
+        if (kb + 1 < key_blocks) {
+            const int nk = kb + 1;
+            int8_t* nks = smem + QBytes + next * KBytes;
+            for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
+                const int key_l = chunk / (D / 16);
+                const int d = (chunk % (D / 16)) * 16;
+                const int key = nk * Bc + key_l;
+                int8_t* dst = &nks[key_l * D + swz(key_l, d / 2) * 2];
+                if (key < L) {
+                    const int page_idx = static_cast<int>(block_table[nk]);
+                    cp_async<16, Cache::cg>(
+                        dst, &k[((size_t)page_idx * page + key_l) * Hkv * D +
+                                (size_t)kv_head * D + d]);
+                } else {
+                    store_vec(dst, make_int4(0, 0, 0, 0));
+                }
+            }
+            if (tid < Bc) {
+                const int key = nk * Bc + tid;
+                float* nksc = next ? kscale1 : kscale0;
+                nksc[tid] = (key < L) ? kscale[(size_t)key * Hkv + kv_head] : 0.0f;
+            }
+            cp_commit();
+        }
 
         uint32_t a[4];
         ldmatrix_x4(a[0], a[1], a[2], a[3],
@@ -279,6 +302,7 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
             acc[n][2] = __fmaf_rn(static_cast<float>(c2), s1, acc[n][2]);
             acc[n][3] = __fmaf_rn(static_cast<float>(c3), s1, acc[n][3]);
         }
+        if (kb + 1 < key_blocks) cp_wait<0>();
         __syncthreads();
     }
 

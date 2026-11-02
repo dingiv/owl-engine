@@ -16,7 +16,7 @@ const SRC: &str = "cu/attn/int8_prefill.cu";
 const D: usize = 256;
 const HQ: usize = 24;
 const HKV: usize = 4;
-const SMEM: u32 = 16384 + 16384 + 2048 + 128;
+const SMEM: u32 = 16384 + 16384 + 8192 + 2048 + 256;
 
 fn lcg_u8(n: usize, seed: u32) -> Vec<u8> {
     (0..n)
