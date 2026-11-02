@@ -1833,26 +1833,34 @@ impl<D: DeviceClient> RunningEngine<D> {
                 released.iter().map(|g| g.slots).sum::<usize>()
             );
         }
-        // ── H3：正常 turn 收尾才发布链；abort 的半途链不进缓存 ----------
-        if release.kind == ReleaseKind::TurnEnd {
-            if self.dev.pool.geom.paged {
-                if let Some(s) = self.bank.sessions.get(release.session) {
-                    let up = self.bank.rel.leg.register_chain_owned(
-                        &s.tokens,
-                        &s.block_table,
-                        release.session,
-                    )?;
-                    if self.boot.cfg.knobs.probes.debug {
-                        owl_shared::log_debug!(
-                            "dbg prefix",
-                            "register_chain: 块表={} 新入={} 逐出={}",
-                            s.block_table.len(),
-                            up.inserted.len(),
-                            up.evicted.len()
-                        );
-                    }
+        // ── H3：链登记（两种终局都发）────────────────────────────
+        // **Abort 也发**(2026-11-03):客户端中断时 KV 里已经有 `[0, fed)`
+        // 的真内容,它的内容身份必须进树 —— 否则下一个同前缀请求按内容
+        // 寻址命中 0 ⇒ 整段重算(真机实测 5850 tok 白算 2.39 s)。
+        // 账源由 `exec/turn_end.rs::ledger_written` 在调本钩子前写好
+        // (中断路径已把"已写入"写回会话账)。
+        // 盘索引/空转拍仍只给 TurnEnd:中断路径要便宜。
+        if release.publish && self.dev.pool.geom.paged {
+            if let Some(s) = self.bank.sessions.get(release.session) {
+                let up = self.bank.rel.leg.register_chain_owned(
+                    &s.tokens,
+                    &s.block_table,
+                    release.session,
+                )?;
+                if self.boot.cfg.knobs.probes.debug {
+                    owl_shared::log_debug!(
+                        "dbg prefix",
+                        "register_chain({:?}): 块表={} 新入={} 逐出={}",
+                        release.kind,
+                        s.block_table.len(),
+                        up.inserted.len(),
+                        up.evicted.len()
+                    );
                 }
             }
+        }
+        // ── H3b：盘索引 / 空转拍（只给正常收尾）─────────────────
+        if release.kind == ReleaseKind::TurnEnd {
             // **S6.1：盘上链索引**（内容可能还没溢写 ⇒ boot 按内容截断）。
             // 放在 ephemeral 焚毁之前 —— 会话 tokens 此刻还在。
             if self.dev.pool.geom.paged && self.bank.rel.disk_enabled() {

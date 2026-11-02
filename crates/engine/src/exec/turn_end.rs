@@ -2,6 +2,19 @@
 use super::*;
 use owl_iface::contract::ModelError;
 
+/// 弃置 turn 时**是否发布已写入前缀**(`Release(Abort)` 的 H3 载荷选择)。
+///
+/// 两种弃置的账面可信度不同:
+/// - 客户端中断(断流/取消):KV `[0, fed)` 是**算完的真内容** ⇒ 发布;
+/// - 引擎错误:账面不可信 ⇒ 不发布(`burn_ephemeral` 的注释同一判据)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AbandonPublish {
+    /// 把**已写入**的前缀写回会话账并交给 `Release(Abort)` 登记链身份。
+    WrittenPrefix,
+    /// 只释放资源,不动会话账。
+    Skip,
+}
+
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// **turn 末释放设备表**(S2 引用拆分;§25.1①):表出账归还(引用减一),
     /// `cached_len` 归到**块边界**(缓存里确实还有的整块数 —— 尾块随表释放,
@@ -44,7 +57,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 由服务面继续泵 —— 全清会把无辜会话连坐)。执行选择器缺省 = 活跃首
         // (批动作失败时未选定)。
         if let Some(act) = self.turns.take_exec() {
-            self.abandon_active(act, turn_id).await;
+            // 引擎错误：账面不可信 ⇒ **不发布**已写入前缀（见 `burn_ephemeral` 注释）
+            self.abandon_active(act, turn_id, AbandonPublish::Skip).await;
         }
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(turn_id);
@@ -67,7 +81,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             TurnEvent::Idle => true,
         });
         if let Some(act) = self.turns.take_active(turn) {
-            self.abandon_active(act, turn).await;
+            // 客户端中断（断流/取消）：**已写入**的 KV 是真内容 ⇒ 发布链身份，
+            // 否则下一个同前缀请求内容寻址命中 0 ⇒ 整段重算（见 `ledger_written`）
+            self.abandon_active(act, turn, AbandonPublish::WrittenPrefix)
+                .await;
             self.close_admission(turn);
             return Some(TurnEvent::Failed {
                 turn,
@@ -116,11 +133,23 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 单个活跃 turn 的弃置清理(块链归还 / 还 GDN 行 / N4 节点)。
     /// `turn_id` = 事件与准入口径的 turn id(与 `act.id` 同源,显式传入
     /// 以免调用方各自猜)。
-    pub(crate) async fn abandon_active(&mut self, act: crate::turn::ActiveTurn, turn_id: u64) {
+    pub(crate) async fn abandon_active(
+        &mut self,
+        act: crate::turn::ActiveTurn,
+        turn_id: u64,
+        publish: AbandonPublish,
+    ) {
         debug_assert_eq!(act.id, turn_id, "abandon_active: turn id 与 act 不同源");
         // 墙钟 EWMA（`Retry-After` 估算用；所有终局路径同源）
         self.turns
             .note_turn_ms(crate::running::now_ms().saturating_sub(act.started_ms));
+        // **中断落账**(必须在 `Release(Abort)` 之前:链登记读会话账,且
+        // 设备表此刻还没归还 —— 树要在这个窗口里加引用,内容才沉得住)
+        if publish == AbandonPublish::WrittenPrefix {
+            if let Err(e) = self.ledger_written(&act) {
+                owl_shared::log_warn!("prefix", "中断落账失败(跳过链发布): {e}");
+            }
+        }
         // 草稿账随 act(TurnSpecState)销毁(生命周期收口)。
         // H6 / GDN 行 / 归属下行 / N4 全部由 `Release(Abort)` 统一执行；
         // 弃置路径失败只 WARN，不掩盖原始错误。
@@ -130,11 +159,81 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 act.session_id,
                 act.gdn_slot,
                 act.ephemeral,
+                publish == AbandonPublish::WrittenPrefix,
             ))
             .await
         {
             owl_shared::log_warn!("store", "Release(Abort) 失败(继续收尾): {e}");
         }
+    }
+
+    /// **中断落账**(2026-11-03 前缀缓存命中修复):把**已确认的 prompt 前缀**
+    /// 写回会话账。
+    ///
+    /// # 为什么必须落
+    ///
+    /// `Release(Abort)` 的链登记以**会话账**为 token 源
+    /// (`register_chain_owned(&s.tokens, &s.block_table, ..)`)。客户端中断时
+    /// `commit_turn` 不会跑 ⇒ 账还停在上一轮 ⇒ 本 turn 算出来的整段前缀
+    /// **没有内容身份** ⇒ 下一个同前缀请求 `match_prefix` 命中 0 ⇒ 整段重算
+    /// (2026-11-03 真机实测:5850 tok prompt 中断后再提交,`cache=32/5865`,
+    /// prefill 5833 tok / 2.39 s —— 本应只 prefill 新增的 41 tok)。
+    ///
+    /// # 记账口径 = **已算完的 prompt 前缀**,不含生成段
+    ///
+    /// - `p = min(fed, prompt_len)`:`fed` 是 KV 推进指针(KV 有效域恒为
+    ///   `[0, fed)`),prefill 每 chunk / decode 每步都推进它 ⇒ 中断在
+    ///   prefill 中段也只登记真的算完的那一截;
+    /// - **生成段故意不入账**:它没交付给客户端(中断即被前端丢弃),
+    ///   而一旦写进账本,下一轮 `positions_after_splice` 会看到
+    ///   "旧账尾巴 ≠ 新 prompt" ⇒ `tail_start < old_tokens.len()` ⇒
+    ///   `positioned = true` ⇒ **跨会话内容缓存被关掉**(真机实测:第二次
+    ///   中断后 `leave-gap 会话拒绝跨会话复用 … ⇒ Fresh`,命中面归零)。
+    ///   代价 = 中断时那 ≤ 几个生成页不入缓存(客户端本来也不会重发它们)。
+    /// - 位置账/图像段账**同源截短** —— 否则下一轮 `unpad`/leave-gap 会按
+    ///   错坐标算(`apply_image_leave_gap` 的中途落账同律)。
+    ///
+    /// 链登记本身由 `Release(Abort)` 统一做(单一产地:H3 只在一处);
+    /// 本函数只写账,不碰设备也不碰树。
+    fn ledger_written(&mut self, act: &crate::turn::ActiveTurn) -> Result<()> {
+        // 无块表(paged 关)= 无链身份可发布,写账只会让 `guard()` 更保守
+        if !self.dev.pool.geom.paged {
+            return Ok(());
+        }
+        let written = act.fed.min(act.prompt_ids.len());
+        if written == 0 {
+            return Ok(());
+        }
+        let generated = act.fed.saturating_sub(act.prompt_ids.len());
+        let s = self.bank.sessions.session_mut(act.session_id)?;
+        s.tokens.clear();
+        s.tokens.extend_from_slice(&act.prompt_ids[..written]);
+        s.cached_len = written;
+        // 位置账:长度对不上 = 结构错(写错位置比不写更坏 ⇒ 清空后
+        // leave-gap 自会按"位置账缺失"跳过,而不是拿错坐标算)
+        if act.positions.len() >= written {
+            s.set_positions(&act.positions[..written], act.rope_gap)?;
+        } else {
+            owl_shared::log_warn!(
+                "prefix",
+                "中断落账:位置账 {} < prompt 前缀 {} ⇒ 位置账清空(session={:#x} turn={})",
+                act.positions.len(),
+                written,
+                act.session_id,
+                act.id
+            );
+            s.positions.clear();
+        }
+        let (spans, pads) = crate::img_evict::ledger_prefix(&act.img_spans, &act.img_pads, written);
+        s.set_img_spans(spans, pads);
+        owl_shared::log_info!(
+            "prefix",
+            "中断落账:session={:#x} turn={} prompt 前缀 {} tok 入账(生成段 {generated} tok 不入缓存)⇒ 交给 Release(Abort) 发布链身份",
+            act.session_id,
+            act.id,
+            written
+        );
+        Ok(())
     }
 
     /// **准入账收口**(S3b §23.2):turn 终了 ⇒ 还保留额 + 重算可动面。

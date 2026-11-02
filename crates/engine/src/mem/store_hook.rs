@@ -112,6 +112,13 @@ pub(crate) struct LoadRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Release {
     pub(crate) kind: ReleaseKind,
+    /// **是否发布已写入前缀的链身份**(H3 的前提)。
+    ///
+    /// - `TurnEnd` 恒 `true`;
+    /// - `Abort` 分两种(见 [`ReleaseKind::Abort`]):客户端中断 `true`
+    ///   (会话账已由 `exec/turn_end.rs::ledger_written` 写成"已写入"),
+    ///   引擎错误 `false`(账面不可信 —— 发布错内容 = 静默错值)。
+    pub(crate) publish: bool,
     pub(crate) turn: u64,
     pub(crate) session: u64,
     pub(crate) gdn_slot: usize,
@@ -122,7 +129,7 @@ pub(crate) struct Release {
 pub(crate) enum ReleaseKind {
     /// 正常 turn 收尾：发布链 + 写盘索引。
     TurnEnd,
-    /// 弃置 / 取消：不发布链，但同样要做 H6/N4。
+    /// 弃置 / 取消：同样做 H6/N4；链发布与盘索引看 [`Release::publish`]。
     Abort,
 }
 
@@ -210,6 +217,7 @@ impl StoreHook {
     pub(crate) fn turn_end(turn: u64, session: u64, gdn_slot: usize, ephemeral: bool) -> Self {
         Self::Release(Release {
             kind: ReleaseKind::TurnEnd,
+            publish: true,
             turn,
             session,
             gdn_slot,
@@ -217,9 +225,18 @@ impl StoreHook {
         })
     }
 
-    pub(crate) fn abort(turn: u64, session: u64, gdn_slot: usize, ephemeral: bool) -> Self {
+    /// 弃置。`publish` = 会话账是否已被本 turn 的"已写入前缀"覆盖
+    /// (客户端中断 = true;引擎错误 = false)。
+    pub(crate) fn abort(
+        turn: u64,
+        session: u64,
+        gdn_slot: usize,
+        ephemeral: bool,
+        publish: bool,
+    ) -> Self {
         Self::Release(Release {
             kind: ReleaseKind::Abort,
+            publish,
             turn,
             session,
             gdn_slot,
@@ -294,7 +311,7 @@ mod label_tests {
             StoreHook::turn_end(1, 2, 0, false).label(),
             "release.turn_end"
         );
-        assert_eq!(StoreHook::abort(1, 2, 0, true).label(), "release.abort");
+        assert_eq!(StoreHook::abort(1, 2, 0, true, false).label(), "release.abort");
         assert_eq!(StoreHook::idle(1).label(), "maintain.idle");
         assert_eq!(
             StoreHook::pressure_with_snap(1, 2).label(),

@@ -5541,6 +5541,122 @@ async fn cancel_session_targets_only_that_session() {
     assert!(running.cancel_session(999).await.is_none());
 }
 
+// ===========================================================================
+// 中断(客户端断流/取消)后的前缀缓存命中 —— 2026-11-03 立案
+// ===========================================================================
+
+/// **中断落账 + 链发布**(2026-11-03):客户端在**生成中**中断时,本 turn 已经
+/// 算完的 prompt 前缀必须进内容树 —— 否则下一个同前缀请求 `match_prefix`
+/// 命中 0,整段重算(真机实测 5850 tok prompt 中断后再提交:prefill 5833 tok
+/// / TTFT 2.39 s;修好后 41 tok / 187 ms)。
+///
+/// 门 = **跨会话**(不靠会话守卫兜底,只认内容身份):A 在生成中取消 →
+/// B(不同会话键)= A 的 prompt + 尾巴 ⇒ B 的 prefill chunk 数必须 ≪ A 的全量,
+/// 且起始复用面 = A 的整页前缀。
+#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
+#[tokio::test]
+async fn abort_publishes_written_prompt_prefix() {
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        ..Default::default()
+    };
+    knobs.pool_tokens = Some(2048); // 64 页(页 32)⇒ 前缀面够放
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = 64;
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 2048,
+        prefill_chunk: 32,
+        knobs,
+    };
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    // A 的 prompt(~300 tok ⇒ 跨 9 页);B = A + 尾巴(= 客户端续写新消息)
+    let filler = |i: usize| {
+        format!("第{i}条:观测点{i}记录到信号{i},强度{i}级,来源坐标({i},{i}),持续{i}天。\n")
+    };
+    let mut body = String::new();
+    let mut i = 0usize;
+    while running.boot.tok.encode(&format!("{body}{}", filler(i))).len() < 300 {
+        body = format!("{body}{}", filler(i));
+        i += 1;
+    }
+    let prompt_a = format!("{body}清单结束。按约定,暗号重复一遍:暗号是「");
+    let prompt_b = format!("{prompt_a}蓝鲸二十一号」。\n\n好,现在请用一句话总结上面清单的风格。");
+    let page = running.dev.pool.geom.page;
+
+    // ── A:跑到生成中段再取消(先让 prefill 全部落地)───────────────
+    let (_sa, ta) = running
+        .submit_session(Some(101), prompt_a.clone(), 64)
+        .expect("A");
+    let mut a_chunks = 0usize;
+    let mut a_first_token = false;
+    for _ in 0..512 {
+        match running.pump().await.expect("pump A") {
+            TurnEvent::Prefill { turn, .. } if turn == ta => a_chunks += 1,
+            TurnEvent::Token { turn, .. } if turn == ta => {
+                if a_first_token {
+                    break; // prefill 已完 + 又生成了一枚 ⇒ 真在生成中
+                }
+                a_first_token = true;
+            }
+            TurnEvent::Failed { turn, err } => panic!("A{turn} 失败: {err}"),
+            TurnEvent::Idle => panic!("A 队列丢失"),
+            _ => {}
+        }
+    }
+    assert!(a_first_token, "A 必须进到生成段才能验「生成中中断」");
+    assert!(a_chunks >= 8, "A 的全量 prefill 应跨多 chunk,实测 {a_chunks}");
+    assert!(
+        running.cancel_turn(ta).await.is_some(),
+        "活跃 turn 应可取消"
+    );
+
+    // ── B:不同会话键 + A 的 prompt 再续写 ⇒ 只认内容身份 ──────────
+    let (_sb, tb) = running.submit_session(Some(202), prompt_b, 12).expect("B");
+    let mut b_chunks = 0usize;
+    let mut b_cached = None;
+    for _ in 0..512 {
+        match running.pump().await.expect("pump B") {
+            TurnEvent::Prefill { turn, .. } if turn == tb => {
+                if b_cached.is_none() {
+                    b_cached = running.active_cached_len(tb);
+                }
+                b_chunks += 1;
+            }
+            TurnEvent::Completed { turn, .. } if turn == tb => break,
+            TurnEvent::Failed { turn, err } => panic!("B{turn} 失败: {err}"),
+            TurnEvent::Idle => panic!("B 队列丢失"),
+            _ => {}
+        }
+    }
+    let b_cached = b_cached.unwrap_or(0);
+    eprintln!(
+        "[test] page={page} A prompt={} tok / A chunks={a_chunks} / B chunks={b_chunks} · B 复用面={b_cached} tok",
+        running.boot.tok.encode(&running.boot.tok.chat_wrap(&prompt_a)).len()
+    );
+    assert!(
+        b_cached >= 8 * page,
+        "B 的复用面 {b_cached} tok 太小 —— 中断的已写入前缀没进内容树"
+    );
+    assert!(
+        b_chunks * 3 < a_chunks,
+        "B 的 prefill chunk 数 {b_chunks} 没有远小于 A 的 {a_chunks}(前缀没复用)"
+    );
+}
+
 /// **P0-2 队列上限**（submit 边界）：在飞总数（活跃 + 排队）达上限 ⇒ 拒，
 /// 且错误串带 `admission:` 前缀（服务面据此翻 429 `no_slot`）。
 #[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
