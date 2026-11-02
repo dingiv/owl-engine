@@ -609,4 +609,80 @@ fn int8_decode_matches_host() {
     }
     println!("[int8-decode] split/reduce max|d|={mx2:.6}");
     assert!(mx2 < 2e-4, "split/reduce max|d| {mx2}");
+
+    // ---- GQA + tensor-core split:同一批输入,对照已通过的 split/reduce ----
+    let dtc_out = r.alloc(B * HQ * NPARTS * D * 4, "d.tcout").unwrap();
+    let dtc_stat = r.alloc(B * HQ * NPARTS * 2 * 4, "d.tcstat").unwrap();
+    let dout3 = r.alloc(B * HQ * D * 4, "d.out3").unwrap();
+    let tvals = [
+        LaunchVal::Ptr(dq.ptr),
+        LaunchVal::Ptr(dqs.ptr),
+        LaunchVal::Ptr(dk.ptr),
+        LaunchVal::Ptr(dks.ptr),
+        LaunchVal::Ptr(dvp.ptr),
+        LaunchVal::Ptr(dvs.ptr),
+        LaunchVal::Ptr(dbt.ptr),
+        LaunchVal::Ptr(dlens.ptr),
+        LaunchVal::Ptr(dtc_out.ptr),
+        LaunchVal::Ptr(dtc_stat.ptr),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::I32(B as i32),
+        LaunchVal::I32(HQ as i32),
+        LaunchVal::I32(HK as i32),
+        LaunchVal::I32(PAGE as i32),
+        LaunchVal::I32(PAGES as i32),
+        LaunchVal::I32(NPARTS as i32),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::Ptr(dout.ptr),
+    ];
+    r.launch_aot(
+        "owl_int8_decode_gqa_tc_split",
+        "cu/attn/int8_decode.cu",
+        (HK as u32, B as u32, NPARTS as u32),
+        (256, 1, 1),
+        0,
+        &tvals,
+    )
+    .unwrap();
+    let trvals = [
+        LaunchVal::Ptr(dtc_out.ptr),
+        LaunchVal::Ptr(dtc_stat.ptr),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::Ptr(dout3.ptr),
+        LaunchVal::I32(B as i32),
+        LaunchVal::I32(HQ as i32),
+        LaunchVal::I32(NPARTS as i32),
+        LaunchVal::I32(D as i32),
+    ];
+    r.launch_aot(
+        "owl_int8_decode_reduce",
+        "cu/attn/int8_decode.cu",
+        (HQ as u32, B as u32, 1),
+        (256, 1, 1),
+        0,
+        &trvals,
+    )
+    .unwrap();
+    r.sync().unwrap();
+    let mut out3 = vec![0u8; B * HQ * D * 4];
+    r.download(
+        CheckBuf {
+            ptr: dout3.ptr,
+            bytes: out3.len(),
+        },
+        &mut out3,
+    )
+    .unwrap();
+    let got3: Vec<f32> = out3
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut mx3 = 0f32;
+    for (a, b) in got3.iter().zip(&got2) {
+        mx3 = mx3.max((a - b).abs());
+    }
+    println!("[int8-decode] tc split max|d|={mx3:.6}");
+    // P 8-bit 量化的固有误差（合成随机数据 L=4096 实测 ~5e-3）；
+    // 真实模型走 needle/数学质量门，不靠这个阈值卡精度。
+    assert!(mx3 < 1e-2, "tc split max|d| {mx3}");
 }

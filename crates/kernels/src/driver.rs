@@ -275,6 +275,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.int8_prefill_paged" => attn::int8_prefill_paged(ax(0), ax(1)), // aux=[T,hq]
         "attn.int8_decode_paged" => attn::int8_decode_paged(ax(0), ax(1)), // aux=[B,hq]
         "attn.int8_decode_split" => attn::int8_decode_split(ax(0), ax(1), ax(2)), // aux=[B,hq,nparts]
+        "attn.int8_decode_gqa_tc" => attn::int8_decode_gqa_tc_split(ax(0), ax(2), ax(3)), // aux=[B,hq,hkv,nparts]
         "attn.int8_decode_reduce" => attn::int8_decode_reduce(ax(0), ax(1)), // aux=[B,hq]
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
         "attn.paged_decode_v2" => {
@@ -1963,6 +1964,15 @@ pub mod attn {
     pub fn int8_decode_split(batch: usize, hq: usize, nparts: usize) -> KernelPick {
         KernelPick::of::<crate::ops::attn::Int8DecodeSplit>(Shape {
             grid: (hq as u32, batch as u32, nparts as u32),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// int8 decode GQA+tensor-core split:每 kv_head nparts 个 block 并行。
+    pub fn int8_decode_gqa_tc_split(batch: usize, hkv: usize, nparts: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::Int8DecodeGqaTcSplit>(Shape {
+            grid: (hkv as u32, batch as u32, nparts as u32),
             block: (256, 1, 1),
             smem: 0,
         })

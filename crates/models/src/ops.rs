@@ -141,6 +141,8 @@ pub enum SemanticKernel {
     Int8DecodePaged,
     /// INT8 decode KV split partial(aux=[B,hq,nparts])
     Int8DecodeSplit,
+    /// INT8 decode GQA+tensor-core split(aux=[B,hq,hkv,nparts])
+    Int8DecodeGqaTcSplit,
     /// INT8 decode split reduce(aux=[B,hq,nparts])
     Int8DecodeReduce,
     /// 分页 decode v1(aux = [hd, hq, hkv, nb])
@@ -380,6 +382,7 @@ impl SemanticKernel {
             SemanticKernel::Int8PrefillPaged => "attn.int8_prefill_paged",
             SemanticKernel::Int8DecodePaged => "attn.int8_decode_paged",
             SemanticKernel::Int8DecodeSplit => "attn.int8_decode_split",
+            SemanticKernel::Int8DecodeGqaTcSplit => "attn.int8_decode_gqa_tc",
             SemanticKernel::Int8DecodeReduce => "attn.int8_decode_reduce",
             SemanticKernel::K0WriteFp8 => "attn.k0_write_fp8",
             SemanticKernel::K0WriteFp8Bf16 => "attn.k0_write_fp8_bf16",

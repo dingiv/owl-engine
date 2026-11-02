@@ -43,9 +43,12 @@ extends = [
 `profiles/measurement/` = **测量/实验档**（不计入入口档面；子目录不参与档名发现）：
 
 - `qwen38_27b-gguf.toml` / `qwen38_27b-gguf-iq4.toml` —— GGUF 裸性能口径；
-- `qwen38_27b-3090-int8.toml` —— **INT8 KV 单卡档（8141）**：K int8 + V packed +
-  per-token/per-page scale；spec off；无 image_evict/index/select。用于与 fp8
-  档同卡 A/B（3090 或 4080，需对应 sm_XX 二进制）。
+- `qwen38_27b-3090-int8.toml` —— **INT8 KV 单卡档（8141）**：w4a16、max_seq
+  131072、K int8 + V packed + per-token/per-page scale；spec off；无
+  image_evict/index/select。decode 已切 GQA+tensor-core split（65k 42.6 t/s）。
+  ⚠️ 32k needle 质量门未过（同形 fp8 通过），长文生产前先修 int8 KV/P 精度。
+- `qwen38_27b-3090-fp8.toml` —— **FP8 KV 单卡同形对照档（8144）**：w4a16 /
+  max_seq 131072 / 同 chunk，用于 int8 同卡 A/B。
 - `qwen38_27b-3090_tp2-int8.toml` / `qwen38_27b-3090_tp2-fp8.toml` —— **双 3090
   TP2 INT8/FP8 同形对照档（8142/8143）**：w4a8、262k、spec off。实测长 ctx
   prefill INT8 32k +4.2% / 65k +7.1%，8k 平手；长 ctx decode 仍待 int8 PV

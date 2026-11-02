@@ -930,8 +930,21 @@ impl Attention {
         let nparts: usize = if tokens == 1 { 256 } else { 64 };
         let partial_out = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * self.hd]);
         let partial_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2]);
-        let split = TensorOps::call(SemanticKernel::Int8DecodeSplit)
-            .aux(&[tokens, self.hq, nparts])
+        // GQA 头合并 + tensor-core QK/PV:一个 block 服务同 KV head 的 grp 个
+        // q head,K/V 只读一遍;grp<=8 / hd256 / page32 是核契约。
+        let grp = self.hq.checked_div(self.hkv).unwrap_or(0);
+        let tc_ok = grp > 0
+            && grp <= 8
+            && self.hq % self.hkv == 0
+            && self.hd == 256
+            && pol.page == 32;
+        let split_op = if tc_ok {
+            SemanticKernel::Int8DecodeGqaTcSplit
+        } else {
+            SemanticKernel::Int8DecodeSplit
+        };
+        let split = TensorOps::call(split_op)
+            .aux(&[tokens, self.hq, self.hkv, nparts])
             .arg(&q8)
             .arg(&q_scale)
             .arg(&kv.k_cache)

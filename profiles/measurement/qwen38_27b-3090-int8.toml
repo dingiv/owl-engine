@@ -14,8 +14,14 @@ extends = [
 [server]
 bind = "127.0.0.1:8141"
 
+# 单卡 24G 装不下 262k int8 池（per_tok=33056B）；131072 留足 65k 实测余量。
+# ⚠️ w4a8 虽把 65k prefill 从 1163 提到 1711 t/s，但 8k needle 实测退化
+#    （同 prompt w4a16 命中、w4a8 丢失）⇒ 质量门未过，生产档维持 w4a16。
+[model]
+quant = "w4a16"
+
 [runtime]
-max_seq = 262144
+max_seq = 131072
 prefill_chunk = 2048
 prefill_tail_merge = 0
 implicit_session = true
