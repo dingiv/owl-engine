@@ -30,20 +30,29 @@ extends = [
 
 | 文件 | 端口 | 形状 |
 |---|---|---|
-| `qwen38_27b-3090.toml` | 8134 | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 63456（全特性稳定点）** / chunk 2048 |
+| `qwen38_27b-3090.toml` | 8137 | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 57344（a8 版全特性稳定点）** / chunk 2048 |
 | `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144** / chunk 2048 |
-| `qwen38_27b-gguf_3090.toml` | 8136 | 单 3090 Ti / 27B **GGUF UD-IQ4_XS**（14.3GB）+ **mmproj-F16 视觉塔** / DFlash2 d7 / fp8 KV / 前缀缓存 / **max_seq 172032（168k）** / chunk 2048。prefill 1633–1681 t/s、decode 127–135、128k prompt 零拒发；代价 = prefill 比 8134 的 a8 慢 ~24% |
-| `qwen38_27b-gguf-iq3_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ3_S**（12.0GB）+ mmproj-F16 / DFlash2 d7 / fp8 KV / **max_seq 229376（224k，逼近 native 262144）** / chunk 2048。prefill 1409–1509 t/s、decode 97–121；**与 8136 互斥**（同一张卡二选一），速度慢 ~13%、3bit 质量低一档 |
+| `qwen38_27b-gguf_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ4_XS**（14.3GB）+ **mmproj-F16 视觉塔** / DFlash2 d7 / fp8 KV / 前缀缓存 / **max_seq 172032（168k）** / chunk 2048。prefill 1633–1681 t/s、decode 127–135、128k prompt 零拒发；代价 = prefill 比 a8 档(同端口)慢 ~24% |
+| `qwen38_27b-gguf-iq3_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ3_S**（12.0GB）+ mmproj-F16 / DFlash2 d7 / fp8 KV / **max_seq 229376（224k，逼近 native 262144）** / chunk 2048。prefill 1409–1509 t/s、decode 97–121；**与 8137 上的其它单卡 3090 档互斥**（同一张卡二选一），速度慢 ~13%、3bit 质量低一档 |
 | `qwen38_27b-4080.toml` | 8138 | 单 **4080 SUPER（Ada sm_89 / 32G）** / 27B AWQ-INT4 **a8** + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144（= 模型 native 上限，32 KiB/token ⇒ 池 8192MiB）** / chunk 2048。std 五点三轮（`perf-runs/std-4080-20261030/`）：**spec-off prefill 2392→3084 t/s、decode 35.9 t/s 长 ctx 平坦**；spec-d7 decode ×1.70（60.1@8k）；**同二进制 3090 Ti 对照：prefill ×1.21–1.37、decode ×0.81、TTFT ×0.73–0.83**。**需 sm_89 二进制**（`cargo build --release -p server --no-default-features --features arch-sm89`，落到独立 target 目录）——单份 `.a` 家族取最高代，30 系与 40 系不混在一份构建里 |
 
 这条裁决被**测试钉住**：`crates/shared/src/profiles.rs::入口档面只允许三个常驻档`
 —— 往 `profiles/` 顶层再丢一个 `.toml` 就会红。置顶三档各占一张卡
-（3090×2 在 8134/8136，3080 对在 8135），互不干扰。
+（**端口纪律 2026-11-03 用户裁决**）：
+
+| 形状 | 端口 | 说明 |
+|---|---|---|
+| 双 3080 20G（TP2） | **8135** | `qwen38_27b-3080_tp2.toml` |
+| 双 3090 Ti（TP2） | **8136** | `qwen38_27b-3090_tp2.toml`（本地变体见 `*.local.toml`） |
+| **单卡 3090（任意配置）** | **8137** | AWQ / GGUF-IQ4 / GGUF-IQ3 / KVMem … **统一这一个端口**，同卡互斥 ⇒ 换配置 = 停一个起一个（`--set` 或换档文件，端口不变） |
+| **单 4080 SUPER** | **8138** | 同上：任意单卡 4080 配置都用 8138 |
+
+单卡的"换配置"不换端口：端口 = **硬件形状**，配置 = 档文件 / `--set`。四档各占各的卡（3090 对 8136 占两张 3090 Ti；单卡 3090 档 8137 与它互斥；3080 对 8135；4080 8138），互不干扰。
 
 `profiles/measurement/` = **测量/实验档**（不计入入口档面；子目录不参与档名发现）：
 
 - `qwen38_27b-gguf.toml` / `qwen38_27b-gguf-iq4.toml` —— GGUF 裸性能口径；
-- `qwen38_27b-3090-kvmem.toml` —— **KVMem 单卡档（8140）**：池超卖 5.49× +
+- `qwen38_27b-3090-kvmem.toml` —— **KVMem 单卡档（8137，与单卡 3090 统一端口）**：池超卖 5.49× +
   选择层 + 块下沉。起机 `-p profiles/measurement/qwen38_27b-3090-kvmem.toml`
   （不需要 `--set`）。
   🔴 **真实可用上下文 = 池容量 47744 tok，不是 `max_seq`**：链越过池就有
@@ -96,7 +105,7 @@ image_evict 的前缀块会被下沉到 host（`前缀有宿主占位 ⇒ 不吸
 ./target/release/server -p profiles/qwen38_27b-3090.toml --check
 ./target/release/server -p profiles/qwen38_27b-3080_tp2.toml --check
 
-# 起服（档内已写端口：3090 = 127.0.0.1:8134，3080 TP2 = 127.0.0.1:8135）
+# 起服（档内已写端口：单卡 3090 = 8137 · 3090 对 = 8136 · 3080 对 = 8135 · 4080 = 8138）
 cargo serve -p profiles/qwen38_27b-3090.toml
 ./target/release/server -p profiles/qwen38_27b-3080_tp2.toml \
   --set parallel.device='["GPU-…","GPU-…"]' --log-level info

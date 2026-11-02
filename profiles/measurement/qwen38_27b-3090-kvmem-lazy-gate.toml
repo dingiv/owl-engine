@@ -3,7 +3,7 @@
 # reserve 256 ⇒ 池 76.4k tok) + 大工作集(ws 16384) + 钉空闲那张 3090 Ti。
 #
 # 起机:`./target/release/server -p profiles/measurement/qwen38_27b-3090-kvmem-lazy-gate.toml --log-level info`
-# 收门:`python3 tools/kvmem_ttft_gate.py --port 8140 --ctx 111k --turns 3`
+# 收门:`python3 tools/kvmem_ttft_gate.py --port 8137 --ctx 111k --turns 3`
 #
 # 实测(2026-10-28,台账 `26-10-28-KVMem-懒回灌-施工结案.md` §2):
 #   111k 会话:轮1 TTFT 94.8 s · 轮2 **1.06 s** · 轮3 0.76 s(中段针答对)
@@ -12,7 +12,7 @@
 extends = ["qwen38_27b-3090-kvmem.toml"]
 
 [server]
-bind = "127.0.0.1:8140"
+bind = "127.0.0.1:8137"
 
 [parallel]
 mode = "single"
