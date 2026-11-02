@@ -35,6 +35,13 @@ FP4 是 **arch-specific** 指令（`mxf4nvf4.block_scale`）：目标必须
 `feature nvfp4` 由 `arch-sm120` 打开；未编入时 `nvfp4_stub.rs` 提供**同面替身**
 （`pack_weight_b` 一律响亮拒），上层零 `cfg`。
 
+**立项期探针（不进构建链）** = `tools/fixture/nvfp4/`（原 `crates/kernels/probes/nvfp4/`，
+2026-11-03 按仓内约定迁入 `tools/fixture`）：手工 nvcc 编跑的带 `main()` 判定程序，
+包括算力天花板（5070 Ti：块缩放 MMA **713 TFLOPS** / 无缩放 192 / 现役 MMQ2 ≈145）、
+SF 落位校验、两条数值门，以及手写 GEMM 对照（**66 TFLOPS** ⇒ 没 TMA 流水线
+打不过 MMQ2）与“适配器 459/536 GFLOPS vs M≈128 分水岭”的原始读数 ——
+这些数字只存在那份 README 里，换硬件时是基线。
+
 ### 2.2 布局事实（全部实测，不靠推理）
 
 | 事实 | 数值/依据 |

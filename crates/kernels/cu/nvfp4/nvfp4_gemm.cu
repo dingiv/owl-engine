@@ -1,7 +1,8 @@
 // ============================================================================
 // owl_nvfp4 —— NVFP4(e2m1 + e4m3/16 块缩放)GEMM 库(sm_120a)。
 //
-// 溯源:探针 `probes/nvfp4/nvfp4_gemm.cu`(2026-10-27 跑通,4B 真权重 3.17~3.69× MMQ2)。
+// 溯源:探针 `tools/fixture/nvfp4/nvfp4_gemm.cu`(原 `crates/kernels/probes/nvfp4/`;
+//       2026-10-27 跑通,4B 真权重 3.17~3.69× MMQ2)。
 // 本文件 = 同一份内核的**库形态**:去掉 `main()`,只留 `extern "C"` 面,
 // 让 Rust 侧(`owl_kernels::nvfp4`)能预分配、host 打包、按流发射。
 //
