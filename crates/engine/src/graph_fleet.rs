@@ -430,14 +430,27 @@ impl<D: DeviceClient> GraphFleet<D> {
                     want.to_string()
                 }
             };
+            let kv_label = if boot.pool.geom.kv_int8 {
+                "int8"
+            } else if boot.pool.geom.kv_fp8 {
+                "fp8"
+            } else {
+                "f16"
+            };
             owl_shared::log_info!(
                 "boot",
-                "现役臂: prefill={} | verify={} | decode={} | spec=depth{} | kv_fp8={}",
-                if boot.knobs.env.attn.fi { "FI" } else { "自研读核" },
+                "现役臂: prefill={} | verify={} | decode={} | spec=depth{} | kv={}",
+                if boot.pool.geom.kv_int8 {
+                    "int8"
+                } else if boot.knobs.env.attn.fi {
+                    "FI"
+                } else {
+                    "自研读核"
+                },
                 arm(verify_fi_node, boot.knobs.env.attn.verify_arm.as_str()),
                 arm(decode_fi_node, boot.knobs.env.attn.decode_arm.as_str()),
                 boot.spec.depth,
-                boot.pool.geom.kv_fp8,
+                kv_label,
             );
         }
         // **图显存总账**(2026-10-16;user 令"先归因"):所有已捕获图的 slab
@@ -610,6 +623,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         // taps 层号表(闭包 'static ⇒ Arc 持有;单一事实源 = SpecRuntime)
         let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let kv_caches = pool.kv_caches();
+        let kv_int8: Vec<_> = (0..kv_caches.len())
+            .map(|i| pool.kv_int8_planes(i))
+            .collect();
         let gdn_caches = pool.gdn_caches();
         let bt_leaf = pool.bt_leaf();
         let attn_v2 = pool.attn_v2_scratch();
@@ -660,12 +676,14 @@ impl<D: DeviceClient> GraphFleet<D> {
             };
             let kvs_step: Vec<KvBuffers> = kv_caches
                 .iter()
-                .map(|(k, v)| KvBuffers {
+                .enumerate()
+                .map(|(i, (k, v))| KvBuffers {
                     k_cache: k.clone(),
                     v_cache: v.clone(),
                     slots: kv_slot.clone(),
                     kv_lens: len_step.clone(),
                     block_tables: bt_step.clone(),
+                    int8: kv_int8[i].clone(),
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdn_caches
@@ -909,6 +927,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         let batch = boot.knobs.max_batch;
         let vocab = boot.model.logits_vocab();
         let kv_caches = pool.kv_caches();
+        let kv_int8: Vec<_> = (0..kv_caches.len())
+            .map(|i| pool.kv_int8_planes(i))
+            .collect();
         let gdn_caches = pool.gdn_caches();
         let scratch = pool.batch_attn_v2_scratch().ok_or_else(|| {
             ModelError::EngineInvariant {
@@ -946,12 +967,14 @@ impl<D: DeviceClient> GraphFleet<D> {
             let gdn_slot = sc.input("gdn_slot")?;
             let kvs_step: Vec<KvBuffers> = kv_caches
                 .iter()
-                .map(|(k, v)| KvBuffers {
+                .enumerate()
+                .map(|(i, (k, v))| KvBuffers {
                     k_cache: k.clone(),
                     v_cache: v.clone(),
                     slots: kv_slot.clone(),
                     kv_lens: kv_len.clone(),
                     block_tables: bt8.clone(),
+                    int8: kv_int8[i].clone(),
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdn_caches
@@ -1019,6 +1042,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         let model_v = Arc::clone(&boot.model);
         let rp_v = boot.rope.clone();
         let kv_caches = pool.kv_caches();
+        let kv_int8: Vec<_> = (0..kv_caches.len())
+            .map(|i| pool.kv_int8_planes(i))
+            .collect();
         let gdn_caches = pool.gdn_caches();
         let bt_leaf = pool.bt_leaf_flat();
         let bt_leaf_nb = *bt_leaf.shape().last().unwrap_or(&1);
@@ -1186,12 +1212,14 @@ impl<D: DeviceClient> GraphFleet<D> {
                 let kv_bt = if verify_attn_v2.is_some() { bt8_in.clone() } else { bt_leaf.clone() };
                 let kvs_step: Vec<KvBuffers> = kv_caches
                     .iter()
-                    .map(|(k, v)| KvBuffers {
+                    .enumerate()
+                    .map(|(i, (k, v))| KvBuffers {
                         k_cache: k.clone(),
                         v_cache: v.clone(),
                         slots: slots_in.clone(),
                         kv_lens: lens_in.clone(),
                         block_tables: kv_bt.clone(),
+                        int8: kv_int8[i].clone(),
                     })
                     .collect();
                 let gdns_step: Vec<GdnBuffers> = gdn_caches
@@ -1626,6 +1654,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                         slots: enc_slots.clone(),
                         kv_lens: enc_kv_lens.clone(),
                         block_tables: bt.clone(),
+
+                        int8: None,
                     })
                     .collect();
                 let prop_kvs: Vec<KvBuffers> = kv_leaves
@@ -1636,6 +1666,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                         slots: prop_slots.clone(),
                         kv_lens: prop_kv_lens.clone(),
                         block_tables: bt.clone(),
+
+                        int8: None,
                     })
                     .collect();
                 let mut ctx = ForwardCtx::minimal(block);
@@ -1899,6 +1931,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                         slots: slots_ext.clone(),
                         kv_lens: lens_ext.clone(),
                         block_tables: bt.clone(),
+
+                        int8: None,
                     };
                     let hid_view = TensorOps::of_block(hid.id, dims.dtype, vec![m1, dims.hidden]);
                     let mut chain: Vec<(TensorOps, KvBuffers)> = Vec::new();
@@ -1915,6 +1949,8 @@ impl<D: DeviceClient> GraphFleet<D> {
                                 slots: slots_c.clone(),
                                 kv_lens: lens_c.clone(),
                                 block_tables: bt_c,
+
+                                int8: None,
                             },
                         ));
                     }

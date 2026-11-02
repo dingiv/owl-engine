@@ -69,6 +69,7 @@
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
 //! | pool | kv_fp8 | bool / false(主 KV 池 e4m3;32 KiB/token) |
+//! | pool | kv_int8 | bool / false(主 KV 池 int8;K int8 + V packed + scale,与 kv_fp8 互斥) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
@@ -678,6 +679,9 @@ pub struct PoolCfg {
     /// 2026-10-22 从 `[kernel]` 移入:它决定池的**存储 dtype/几何**,
     /// 与 `gdn_slots`/`snap_max` 同属池面,而不是算子臂。
     pub kv_fp8: bool,
+    /// **主 KV 池 int8**(→ `KvQuant::Int8`;K int8 + V packed + scale,
+    /// 1B/elem)。与 `kv_fp8` 互斥;仅 hd=256 / page=32 / 无投机档。
+    pub kv_int8: bool,
     /// GDN 快照池槽数
     pub snap_max: usize,
     /// **消息边界快照**(缺省 `false` = 逐字节旧行为)。
@@ -1833,6 +1837,7 @@ impl Default for PoolCfg {
         Self {
             gdn_slots: 8,
             kv_fp8: false,
+            kv_int8: false,
             prefill_align_tail: true,
             snap_decode_stride: 1,
             snap_max: 4,
@@ -2646,6 +2651,15 @@ impl OwlConfig {
     /// `exit(1)`),且**只有 server 一条入口守** —— 直接构造 engine 的路径
     /// (tests / cli)裸奔。
     pub fn validate(&self) -> Result<(), String> {
+        if self.pool.kv_fp8 && self.pool.kv_int8 {
+            return Err("[pool] kv_fp8 与 kv_int8 互斥(同一主池只能有一种存储格式)".to_string());
+        }
+        if self.pool.kv_int8 && self.spec.depth != 0 {
+            return Err(format!(
+                "[pool] kv_int8 暂不支持投机解码(spec.depth={});int8 verify 尚未接线,请先设 spec.depth=0",
+                self.spec.depth
+            ));
+        }
         // **投机深度上限**(2026-10-21):verify 图行容量 `SPEC_VERIFY_ROWS_MAX` 是
         // 结构性事实(verify 图 T=depth+1;DFlash2 W=K+1 上限)—— 超限**拒启**,不静默截断。
         if self.spec.depth > SPEC_DEPTH_MAX {

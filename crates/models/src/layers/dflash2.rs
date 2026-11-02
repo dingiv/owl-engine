@@ -1733,6 +1733,8 @@ mod tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![19], &f32b2(&(0..19).map(|i| i as f32).collect::<Vec<_>>())),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![19], &f32b2(&(0..19).map(|i| (i + 1) as f32).collect::<Vec<_>>())),
                 block_tables: bt.clone(),
+
+                int8: None,
             })
             .collect();
         let pos_enc = TensorOps::from_host(Dtype::F32, vec![19], &f32b2(&(0..19).map(|i| i as f32).collect::<Vec<_>>()));
@@ -2297,6 +2299,8 @@ mod tests {
             slots: TensorOps::from_host(Dtype::F32, vec![slots_h.len()], &f32b(&slots_h)),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[5.0])),
             block_tables: bt,
+
+            int8: None,
         };
         let rope = Rope::new(64, hd, hd, 10_000.0).expect("rope");
         crate::interpreters::eval_load(&rope, &mut gpu, &rope.tables(), &LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false })
@@ -2319,6 +2323,8 @@ mod tests {
             slots: kv.slots.slice_view(0, vec![3]),
             kv_lens: kv.kv_lens.clone(),
             block_tables: kv.block_tables.clone(),
+
+            int8: None,
         };
         let dummy = attn.encode_kv(&mem3, &pos3, &kv3, &rope, eps, &ctx);
         let _ = harvest_f16(&mut gpu, &dummy).await; // 触发写
@@ -2334,6 +2340,8 @@ mod tests {
             slots: kv.slots.slice_view(3, vec![2]),
             kv_lens: kv.kv_lens.clone(),
             block_tables: kv.block_tables.clone(),
+
+            int8: None,
         };
         // 手动复算 propose_attn 内部(拆黑盒;pre-o_proj 与 o_proj 双锚)
         let q_raw_self2 = attn.q_proj().forward(&self2, &ctx);
@@ -2804,6 +2812,8 @@ mod tests {
                 slots,
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![8], &f32b(&(0..8).map(|i| (i + 1) as f32).collect::<Vec<_>>())),
                 block_tables: TensorOps::from_host(Dtype::F32, vec![1, nb], &f32b(&(0..nb).map(|i| i as f32).collect::<Vec<_>>())),
+
+                int8: None,
             });
         }
 

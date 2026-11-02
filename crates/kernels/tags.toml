@@ -103,6 +103,11 @@ facet = "kv.main"
 desc = "主 KV 池 e4m3（fp8 存储）"
 
 [[tag]]
+id = "kv.main.int8"
+facet = "kv.main"
+desc = "主 KV 池 int8（per-token/head fp32 scale）"
+
+[[tag]]
 id = "kv.main.f16"
 facet = "kv.main"
 desc = "主 KV 池 f16"

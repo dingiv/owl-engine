@@ -75,6 +75,15 @@ pub(crate) struct GdnSnapPool {
 pub(crate) struct KvBlocks {
     pub(crate) k_cache: BlockN,
     pub(crate) v_cache: BlockN,
+    /// INT8 档的两张 scale 平面(None = f16/fp8)
+    pub(crate) int8: Option<KvInt8Blocks>,
+}
+
+pub(crate) struct KvInt8Blocks {
+    /// `[nb, page, hkv]` f32
+    pub(crate) k_scale: BlockN,
+    /// `[nb, hkv, 4]` f32
+    pub(crate) v_scale: BlockN,
 }
 
 struct GdnBlocks {
@@ -309,6 +318,8 @@ pub(crate) struct PoolGeom {
     /// B6.2:主 KV 池 fp8 e4m3 承载(true = 池块 U32 字节承载 1B/elem;
     /// 读核走 *_fp8 变体,写核 K0 转换写)
     pub(crate) kv_fp8: bool,
+    /// INT8 主池(K int8 / V packed / 两张 scale 平面)
+    pub(crate) kv_int8: bool,
     /// 每页 token 折叠因子(页内行布局;legacy = 1)
     x: usize,
 }
@@ -743,8 +754,13 @@ impl StatePool {
             .kvs
             .iter()
             .map(|kv| {
-                kv.k_cache.1 * elem_bytes(kv.k_cache.0.dtype)
-                    + kv.v_cache.1 * elem_bytes(kv.v_cache.0.dtype)
+                let mut b = kv.k_cache.1 * elem_bytes(kv.k_cache.0.dtype)
+                    + kv.v_cache.1 * elem_bytes(kv.v_cache.0.dtype);
+                if let Some(s) = kv.int8.as_ref() {
+                    b += s.k_scale.1 * elem_bytes(s.k_scale.0.dtype)
+                        + s.v_scale.1 * elem_bytes(s.v_scale.0.dtype);
+                }
+                b
             })
             .sum();
         total / self.geom.nb_kv.max(1)
@@ -753,7 +769,7 @@ impl StatePool {
     /// **主池布局**(engine 注册给 store 的 id 级描述;设计卷 §10.3 推论 A)。
     /// 每层 k/v 各一项;`stride_bytes` = 每页字节(槽步长)。
     pub(crate) fn pool_layout(&self, epoch: u64) -> owl_store::PoolLayout {
-        let mut pieces = Vec::with_capacity(self.kv.kvs.len() * 2);
+        let mut pieces = Vec::with_capacity(self.kv.kvs.len() * 4);
         for kv in &self.kv.kvs {
             pieces.push(owl_store::PieceSpec {
                 buf: kv.k_cache.0.clone(),
@@ -763,6 +779,16 @@ impl StatePool {
                 buf: kv.v_cache.0.clone(),
                 stride_bytes: self.per_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1),
             });
+            if let Some(s) = kv.int8.as_ref() {
+                pieces.push(owl_store::PieceSpec {
+                    buf: s.k_scale.0.clone(),
+                    stride_bytes: self.per_page_bytes(s.k_scale.0.dtype, s.k_scale.1),
+                });
+                pieces.push(owl_store::PieceSpec {
+                    buf: s.v_scale.0.clone(),
+                    stride_bytes: self.per_page_bytes(s.v_scale.0.dtype, s.v_scale.1),
+                });
+            }
         }
         owl_store::PoolLayout {
             class: owl_store::BlockClass::KvPage,
@@ -995,6 +1021,7 @@ impl StatePool {
         let kv_label = match plan.kv {
             owl_models::env::KvQuant::Fp8E4M3 => "kv fp8 e4m3",
             owl_models::env::KvQuant::Fp8E5M2 => "kv fp8 e5m2",
+            owl_models::env::KvQuant::Int8 => "kv int8 (K int8 / V packed / no shadow)",
             owl_models::env::KvQuant::None => "kv f16",
         };
         owl_shared::log_info!("boot", "状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {nb} 页 × {page} tok,页表 nb = {nb},dflash = {df},XQA sm = {xqa_sm})",
@@ -1289,6 +1316,21 @@ impl StatePool {
     /// 逐层 KV cache 叶子句柄((k, v);slots/kv_lens/block_tables 由
     /// 调用方按步注入 —— 图闭包注输入槽,prefill 注 from_host 标量行)
     pub(crate) fn kv_caches(&self) -> Vec<(TensorOps, TensorOps)> {
+        // INT8:K int8 张量 + V packed b16 字节块(两者每页字节数相同)。
+        if self.geom.kv_int8 {
+            let n = self.geom.nb_kv * self.geom.dims.hkv * self.geom.dims.hd * self.geom.page;
+            return self
+                .kv
+                .kvs
+                .iter()
+                .map(|b| {
+                    (
+                        block_leaf_dt(&b.k_cache.0, vec![n], Dtype::I8),
+                        block_leaf_dt(&b.v_cache.0, vec![n], Dtype::I8),
+                    )
+                })
+                .collect();
+        }
         // B6.2:fp8 池 = U32 扁平字节账叶(指针面;读核按元素序自寻址,
         // FI 影子池 fp8 档同款)
         if self.geom.kv_fp8 {
@@ -1318,6 +1360,20 @@ impl StatePool {
                 )
             })
             .collect()
+    }
+
+    /// INT8 档的 scale 平面叶(逐层;None = f16/fp8)。
+    pub(crate) fn kv_int8_planes(&self, layer: usize) -> Option<owl_models::module::KvInt8Planes> {
+        let b = self.kv.kvs.get(layer)?.int8.as_ref()?;
+        let d = &self.geom.dims;
+        Some(owl_models::module::KvInt8Planes {
+            k_scale: block_leaf_dt(
+                &b.k_scale.0,
+                vec![self.geom.nb_kv * self.geom.page * d.hkv],
+                Dtype::F32,
+            ),
+            v_scale: block_leaf_dt(&b.v_scale.0, vec![self.geom.nb_kv * d.hkv * 4], Dtype::F32),
+        })
     }
 
     /// FlashInfer K/V 叶子(统一契约 P3:影子池删除,直读主池 kNHD;
@@ -1990,7 +2046,8 @@ impl<'a> AllocCtx<'a> {
         // `if kv_bytes_elem == 1 {…} else { dims.dtype }`,与门各说各话)
         let kv_dt = owl_models::kernel::kv_pool_dtype(plan.kv, dims.dtype);
         let kv_bytes_elem = kv_dt.size_bytes();
-        let kv_fp8 = kv_bytes_elem == 1;
+        let kv_fp8 = kv_dt == owl_iface::contract::Dtype::F8E4M3;
+        let kv_int8 = kv_dt == owl_iface::contract::Dtype::I8;
         // 未接臂的格式**响亮拒**(e5m2 暂无核臂;不许静默按 e4m3 跑)
         for (tag, q) in [("kv", plan.kv), ("draft_kv", plan.draft_kv)] {
             if q == owl_models::env::KvQuant::Fp8E5M2 {
@@ -2024,7 +2081,7 @@ impl<'a> AllocCtx<'a> {
         // 非追踪实测 = 进程占用 20096MiB − 引擎账 19552MiB = **544MiB**(> reserve 512MB,
         // 即 reserve 量级正确但零余量 ⇒ 见 graph_fleet 的对账行)。
         let mtp_mode = plan.spec_mode == crate::spec_runtime::SpecMode::Mtp;
-        let per_tok = PerTokBytes::of(
+        let mut per_tok = PerTokBytes::of(
             &dims,
             n_full,
             kv_bytes_elem,
@@ -2035,6 +2092,13 @@ impl<'a> AllocCtx<'a> {
             plan.draft_geom,
             mtp_mode.then(|| plan.draft_kv.size_bytes()),
         );
+        if kv_int8 {
+            // Kscale `[nb,page,hkv]` 每 token 每层 4·hkv B;Vscale
+            // `[nb,hkv,4]` 每页 16·hkv B ⇒ 每 token 16·hkv/page。
+            per_tok.main_kv += n_full
+                * (dims.hkv * std::mem::size_of::<f32>()
+                    + dims.hkv * 4 * std::mem::size_of::<f32>() / 32);
+        }
         // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + warmup + 草稿 ring)
         let gdn_slot_elems =
             dims.nk * dims.hk * 3 + dims.nv * dims.hv * 3 + dims.nv * dims.hk * dims.hv;
@@ -2210,6 +2274,7 @@ impl<'a> AllocCtx<'a> {
                 gdn_slots,
                 fi_face,
                 kv_fp8,
+                kv_int8,
                 x,
             },
             kv_dt,
@@ -2318,6 +2383,7 @@ impl KvBank {
         let n_full = ctx.n_full;
         let kv_dt = ctx.kv_dt;
         let kv_bytes_elem = ctx.kv_bytes_elem;
+        let kv_int8 = ctx.geom.kv_int8;
         let mut kvs: Vec<KvBlocks> = Vec::new();
         for l in 0..n_full {
             // B6.2:fp8 池 = U32 字节承载 1B/elem(元素数不变,块大小减半);
@@ -2333,7 +2399,22 @@ impl KvBank {
             let (v_elems, v_dt) = (k_elems, k_dt);
             let k_cache = zero_block_dt(face, k_elems, k_dt, &format!("kv.k.{l}")).await?;
             let v_cache = zero_block_dt(face, v_elems, v_dt, &format!("kv.v.{l}")).await?;
-            kvs.push(KvBlocks { k_cache, v_cache });
+            let int8 = if kv_int8 {
+                // Kscale 每 token/头;Vscale 每页/头/64-dim group。
+                let ks = nb_kv * page * dims.hkv;
+                let vs = nb_kv * dims.hkv * 4;
+                Some(KvInt8Blocks {
+                    k_scale: zero_block_dt(face, ks, Dtype::F32, &format!("kv.ks.{l}")).await?,
+                    v_scale: zero_block_dt(face, vs, Dtype::F32, &format!("kv.vs.{l}")).await?,
+                })
+            } else {
+                None
+            };
+            kvs.push(KvBlocks {
+                k_cache,
+                v_cache,
+                int8,
+            });
         }
         Ok(kvs)
     }
@@ -2628,6 +2709,7 @@ impl DraftBank {
             Some(KvBlocks {
                 k_cache: zero_block_dt(face, mtp_e, mtp_dt, "mtp.kv.k").await?,
                 v_cache: zero_block_dt(face, mtp_e, mtp_dt, "mtp.kv.v").await?,
+                int8: None,
             })
         } else {
             None
@@ -2673,6 +2755,7 @@ impl DraftBank {
                 ks.push(KvBlocks {
                     k_cache: zero_block_dt(face, df_elems, df_dt, &format!("dfk.k.{l}")).await?,
                     v_cache: zero_block_dt(face, df_elems, df_dt, &format!("dfk.v.{l}")).await?,
+                    int8: None,
                 });
             }
             Some(ks)

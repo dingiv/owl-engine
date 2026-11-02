@@ -808,6 +808,8 @@ mod tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                 block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
+
+                int8: None,
             })
             .collect();
         let gdns: Vec<GdnBuffers> = (0..3).map(gdn_buf).collect();
@@ -1133,6 +1135,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
+
+                    int8: None,
                 });
             }
             v
@@ -1170,6 +1174,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])),  // 契约 slots/kv_lens r2(B6 收敛)
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[kv_len])),  // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
+
+                    int8: None,
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns
@@ -1222,6 +1228,8 @@ mod tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![1, t], &f32b(slots)),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1, t], &f32b(lens)),
                 block_tables: kv.block_tables.clone(),
+
+                int8: None,
             })
             .collect();
         let gdns_step: Vec<GdnBuffers> = gdns
@@ -1333,6 +1341,8 @@ mod tests {
                 slots: slots_t.clone(),
                 kv_lens: lens_t.clone(),
                 block_tables: kv.block_tables.clone(),
+
+                int8: None,
             })
             .collect();
         let gdns_step: Vec<GdnBuffers> = gdns
@@ -1380,6 +1390,8 @@ mod tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),
                 block_tables: TensorOps::zeros(Dtype::F32, vec![1]),
+
+                int8: None,
             });
         }
         let key_dim = NK * HK_DIM;
@@ -1477,6 +1489,8 @@ mod tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                 block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
+
+                int8: None,
             });
         }
         let key_dim = NK * HK_DIM;
@@ -1539,6 +1553,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32])),  // 契约 slots/kv_lens r2(B6 收敛)
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32 + 1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
                     block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
+
+                    int8: None,
                 })
                 .collect();
             // 单序列语义:GDN 状态格恒 gdn_slot(=0,与 prefill 一致);

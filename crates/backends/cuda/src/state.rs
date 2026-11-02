@@ -173,7 +173,9 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
         tags.push(T::QUANT_W4A16);
         tags.push(T::QUANT_AWQ);
     }
-    if cfg.pool.kv_fp8 {
+    if cfg.pool.kv_int8 {
+        tags.push(T::KV_MAIN_INT8);
+    } else if cfg.pool.kv_fp8 {
         tags.push(T::KV_MAIN_FP8);
     } else {
         tags.push(T::KV_MAIN_F16);
@@ -3311,6 +3313,25 @@ mod tag_filter_tests {
         assert!(allows(&cfg, "owl_layernorm_f16"));
         assert!(allows(&cfg, "owl_dflash_conv_bf16"));
         assert!(allows(&cfg, "owl_comm_ar_stage_f8_f16"));
+    }
+
+    #[test]
+    fn int8_kv_filter_allows_int8_write_read_and_rejects_f16() {
+        let mut cfg = OwlConfig::default();
+        cfg.model.format = ModelFormat::Awq;
+        cfg.model.quant = QuantScheme::W4a16;
+        cfg.pool.kv_int8 = true;
+        cfg.pool.kv_fp8 = false;
+        assert!(allows(&cfg, "owl_reshape_and_cache_int8_k_only_knhd"));
+        assert!(allows(&cfg, "owl_int8_prefill_paged"));
+        assert!(allows(&cfg, "owl_int8_decode_paged"));
+        assert!(allows(&cfg, "owl_quant_int8_qk_f16"));
+        assert!(allows(&cfg, "owl_v_pack_int8_prefill"));
+        assert!(!allows(&cfg, "vllm_reshape_and_cache_f16_knhd"));
+        assert!(!allows(
+            &cfg,
+            "vllm_chunked_prefill_paged_attn_opt_fp8_knhd_hd256"
+        ));
     }
 
     #[test]

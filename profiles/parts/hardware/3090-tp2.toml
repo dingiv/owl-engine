@@ -1,0 +1,7 @@
+# 硬件组件：两张 3090 Ti 24G，TP2。
+[parallel]
+mode = "tensor"
+device = ["3090", "3090"]
+tp_ar = "ar2"
+tp_ar_f8 = true
+tp_vocab_split = true

@@ -140,6 +140,9 @@ impl KernelSelectionEnv {
                 KvQuant::Fp8E4M3 | KvQuant::Fp8E5M2 => {
                     if main { KernelTag::KV_MAIN_FP8 } else { KernelTag::KV_DRAFT_FP8 }
                 }
+                KvQuant::Int8 => {
+                    if main { KernelTag::KV_MAIN_INT8 } else { KernelTag::KV_DRAFT_FP8 }
+                }
                 KvQuant::None => match kv.dtype {
                     Dtype::BF16 => {
                         if main { KernelTag::KV_MAIN_BF16 } else { KernelTag::KV_DRAFT_BF16 }

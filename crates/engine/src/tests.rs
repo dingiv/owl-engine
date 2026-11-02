@@ -7050,6 +7050,8 @@ pub async fn gpu_mtp_kv_parity() {
             slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot_at(p)])),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(p + 1) as f32])),
             block_tables: bt_step,
+
+            int8: None,
         };
         let pos_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[p as f32]));
         let anchor_t = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[anchor as f32]));

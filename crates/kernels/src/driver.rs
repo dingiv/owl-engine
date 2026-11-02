@@ -268,6 +268,14 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.k0_write_knhd" => attn::k0_write_knhd(dt, ax(0)),
         "attn.k0_write_fp8_knhd" => attn::k0_write_fp8_knhd(ax(0)),
         "attn.k0_write_fp8_bf16" => attn::k0_write_fp8_bf16(ax(0)), // B6:bf16 入 → e4m3 池
+        "attn.k0_write_int8_k_only" => attn::k0_write_int8_k_only(ax(0), ax(1)), // aux=[tokens,hkv]
+        "attn.quant_int8_qk" => attn::quant_int8_qk(ax(0)), // aux=[rows=T*Hq]
+        "attn.v_pack_int8_prefill" => attn::v_pack_int8_prefill(ax(0), ax(1), ax(2)), // aux=[T,hkv,page]
+        "attn.v_append_int8_paged" => attn::v_append_int8_paged(ax(0), ax(1)), // aux=[T,hkv]
+        "attn.int8_prefill_paged" => attn::int8_prefill_paged(ax(0), ax(1)), // aux=[T,hq]
+        "attn.int8_decode_paged" => attn::int8_decode_paged(ax(0), ax(1)), // aux=[B,hq]
+        "attn.int8_decode_split" => attn::int8_decode_split(ax(0), ax(1), ax(2)), // aux=[B,hq,nparts]
+        "attn.int8_decode_reduce" => attn::int8_decode_reduce(ax(0), ax(1)), // aux=[B,hq]
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
         "attn.paged_decode_v2" => {
             // aux = [hd, hq, hkv, nb, nparts];页配对律同 v1(谓词单源)
@@ -393,6 +401,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.xqa_decode" => attn::xqa_decode(),
         "attn.xqa_prefill" => attn::xqa_prefill(),
         "elems.cast_f16_f32" => elems::cast_f16_f32(dt),
+        "elems.cast_f32_f16" => elems::cast_f32_f16(dt),
         "ops.concat" => elems::concat(dt),
         "ops.rope" => elems::rope(dt, ax(0)),
         "ops.embed" => elems::embed(dt, ax(0)),
@@ -1893,6 +1902,81 @@ pub mod attn {
         })
     }
 
+    /// K-only int8 writer:一个 warp 一个 (token, kv_head),4 warps/block。
+    pub fn k0_write_int8_k_only(tokens: usize, hkv: usize) -> KernelPick {
+        let warps = tokens.saturating_mul(hkv);
+        KernelPick::of::<crate::ops::attn::K0WriteInt8KOnlyKnhd>(Shape {
+            grid: (warps.div_ceil(4) as u32, 1, 1),
+            block: (128, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// Q per-(token,q_head) int8 量化(rows = T*Hq,D=256)。
+    pub fn quant_int8_qk(rows: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::QuantInt8QkF16>(Shape {
+            grid: (rows.div_ceil(8) as u32, 1, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// prefill 整页 V scale + pack;grid = (ceil(T/page), Hkv, 4)。
+    pub fn v_pack_int8_prefill(tokens: usize, hkv: usize, page: usize) -> KernelPick {
+        let pages = tokens.div_ceil(page.max(1));
+        KernelPick::of::<crate::ops::attn::VPackInt8Prefill>(Shape {
+            grid: (pages as u32, hkv as u32, 4),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// decode 单 token 追加 V;grid = (T, Hkv, 4),block = 64。
+    pub fn v_append_int8_paged(tokens: usize, hkv: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::VAppendInt8Paged>(Shape {
+            grid: (tokens as u32, hkv as u32, 4),
+            block: (64, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// int8 paged prefill:4 warp / Br=64 / Bc=32。
+    pub fn int8_prefill_paged(tokens: usize, hq: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::Int8PrefillPaged>(Shape {
+            grid: (tokens.div_ceil(64) as u32, hq as u32, 1),
+            block: (128, 1, 1),
+            // Q 16K + K 16K + P 2K + Kscale 128B
+            smem: (16384 + 16384 + 2048 + 128) as u32,
+        })
+    }
+
+    /// int8 decode:一 block 一 (batch, q_head)。
+    pub fn int8_decode_paged(batch: usize, hq: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::Int8DecodePaged>(Shape {
+            grid: (hq as u32, batch as u32, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// int8 decode split:每头 nparts 个 block 并行。
+    pub fn int8_decode_split(batch: usize, hq: usize, nparts: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::Int8DecodeSplit>(Shape {
+            grid: (hq as u32, batch as u32, nparts as u32),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
+    /// int8 decode split 合并。
+    pub fn int8_decode_reduce(batch: usize, hq: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::Int8DecodeReduce>(Shape {
+            grid: (hq as u32, batch as u32, 1),
+            block: (256, 1, 1),
+            smem: 0,
+        })
+    }
+
     /// paged prefill 的 Hw 占位(谓词用;env 之外不可得时)
     pub fn hw_placeholder() -> Hw {
         Hw { arch: crate::Arch::Sm86 }
@@ -2120,6 +2204,12 @@ pub mod elems {
         assert!(matches!(dt, DType::F32), "cast_f16_f32 出 f32,得 {dt:?}");
         KernelPick::of::<crate::ops::elems::CastF16F32>(SENTINEL_1D)
     }
+
+    pub fn cast_f32_f16(dt: DType) -> KernelPick {
+        assert!(matches!(dt, DType::F16), "cast_f32_f16 出 f16,得 {dt:?}");
+        KernelPick::of::<crate::ops::elems::CastF32F16>(SENTINEL_1D)
+    }
+
 
     use super::{DType, KernelPick, Shape, SENTINEL_1D};
 

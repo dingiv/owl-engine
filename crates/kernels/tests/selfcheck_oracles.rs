@@ -18,7 +18,8 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use owl_kernels::contract::{Dtype, OpError};
 use owl_kernels::device::{DeviceRes, Exec, LaunchNote, ScratchBuf};
 use owl_kernels::ops::oracles::{
-    cublas_gemm as cb, k0_fp8_knhd as k0, nc_bf16_v2 as nc, qknorm_insert as qk,
+    cublas_gemm as cb, k0_fp8_knhd as k0, k0_int8_knhd as k0i8, nc_bf16_v2 as nc,
+    qknorm_insert as qk,
 };
 #[cfg(feature = "marlin")]
 use owl_kernels::ops::oracles::marlin as ml;
@@ -373,20 +374,26 @@ fn cublas_oracle_is_sensitive_to_layout() {
 fn oracles_pass_on_real_device() {
     let Some(out) = with_runner(|r| {
         let a = k0::K0Fp8KnhdOracle.run(r);
+        let a8 = k0i8::K0Int8KnhdOracle.run(r);
         let b = nc::NcBf16V2Oracle.run(r);
         let c = qk::QknormInsertOracle.run(r);
-        (a, b, c)
+        (a, a8, b, c)
     }) else {
         owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
         return;
     };
-    let (k0r, ncr, qkr) = out;
+    let (k0r, k0i8r, ncr, qkr) = out;
     let k0r = k0r.unwrap_or_else(|e| panic!("K0 oracle 失败: {e}"));
+    let k0i8r = k0i8r.unwrap_or_else(|e| panic!("K0 int8 oracle 失败: {e}"));
     let ncr = ncr.unwrap_or_else(|e| panic!("NC oracle 失败: {e}"));
     let qkr = qkr.unwrap_or_else(|e| panic!("融合插池 oracle 失败: {e}"));
     println!(
         "[oracle] K0 fp8 knHD ✓ 毒值未写字节 {:?}",
         k0r.poison_untouched
+    );
+    println!(
+        "[oracle] K0 int8 knHD ✓ 毒值未写字节 {:?}",
+        k0i8r.poison_untouched
     );
     println!("[oracle] NC v2 ✓ max|err|={:.3e} ≤ {:.1e}", ncr.worst_abs_err, ncr.tolerance);
     println!(

@@ -16,6 +16,7 @@ pub mod cublas_gemm;
 #[cfg(feature = "nvfp4")]
 pub mod nvfp4;
 pub mod k0_fp8_knhd;
+pub mod k0_int8_knhd;
 /// marlin oracle(需自家 packer ⇒ 随 feature 门;`SELFCHECK` 用互斥 cfg 常量挂)
 #[cfg(feature = "marlin")]
 pub mod marlin;

@@ -904,6 +904,8 @@ mod tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
                 block_tables: TensorOps::of_block(bt.id, Dtype::F32, vec![1, nb]),
+
+                int8: None,
             });
         }
         let mut gdns = Vec::new();
@@ -1043,6 +1045,8 @@ mod tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(t + 1) as f32])),
                 block_tables: kv.block_tables.clone(),
+
+                int8: None,
             }).collect();
             let gdns_step: Vec<crate::layers::gdn::GdnBuffers> = gdns.iter().map(|g| crate::layers::gdn::GdnBuffers {
                 conv_q: g.conv_q.clone(),
@@ -1187,6 +1191,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[(t + 1) as f32])),
                     block_tables: kv.block_tables.clone(),
+
+                    int8: None,
                 }).collect();
                 let gdns_step: Vec<crate::layers::gdn::GdnBuffers> = gdns.iter().map(|g| crate::layers::gdn::GdnBuffers {
                     conv_q: g.conv_q.clone(),

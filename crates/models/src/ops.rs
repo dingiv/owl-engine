@@ -94,6 +94,8 @@ pub enum SemanticKernel {
     // ---- elems.* ----
     /// f16 → f32 铸(GDN scalar/chunked 臂层侧预铸)
     CastF16F32,
+    /// f32 → f16 铸(int8 attention 输出回落 GateMul 前)
+    CastF32F16,
     /// 刀3a':双权 GEMV 单发(b/a 投影;aux = [rows_b, rows_a, cols, tokens])
     GemvDual,
     /// **int8 权重 GEMV × bf16 激活**(P1.5-a;lm_head 专用;aux = [rows, cols, tokens])
@@ -125,6 +127,22 @@ pub enum SemanticKernel {
     K0WriteFp8Bf16,
     K0WriteKnhd,
     K0WriteFp8Knhd,
+    /// INT8 池写者(只写 K;V 走 per-page pack)
+    K0WriteInt8KOnlyKnhd,
+    /// Q per-(token,q_head) int8 量化(aux=[rows=T*Hq])
+    QuantInt8QkF16,
+    /// prefill 整页 V scale + pack(aux=[T,hkv,page])
+    VPackInt8Prefill,
+    /// decode 单 token 追加 V(aux=[T,hkv])
+    VAppendInt8Paged,
+    /// INT8 paged prefill(aux=[T,hq])
+    Int8PrefillPaged,
+    /// INT8 paged decode(aux=[B,hq])
+    Int8DecodePaged,
+    /// INT8 decode KV split partial(aux=[B,hq,nparts])
+    Int8DecodeSplit,
+    /// INT8 decode split reduce(aux=[B,hq,nparts])
+    Int8DecodeReduce,
     /// 分页 decode v1(aux = [hd, hq, hkv, nb])
     PagedDecode,
     /// v2 分页 decode 在线 softmax 主核(分块 PARTITION=512;aux =
@@ -338,6 +356,7 @@ impl SemanticKernel {
             SemanticKernel::Embed => "ops.embed",
             SemanticKernel::EmbedI8 => "elems.embed_i8",
             SemanticKernel::CastF16F32 => "elems.cast_f16_f32",
+            SemanticKernel::CastF32F16 => "elems.cast_f32_f16",
             SemanticKernel::GemvDual => "elems.gemv_dual",
             SemanticKernel::GemvI8wBf16 => "elems.gemv_i8w_bf16",
             SemanticKernel::GemvI8wF16 => "elems.gemv_i8w_f16",
@@ -354,6 +373,14 @@ impl SemanticKernel {
             SemanticKernel::K0Write => "attn.k0_write",
             SemanticKernel::K0WriteKnhd => "attn.k0_write_knhd",
             SemanticKernel::K0WriteFp8Knhd => "attn.k0_write_fp8_knhd",
+            SemanticKernel::K0WriteInt8KOnlyKnhd => "attn.k0_write_int8_k_only",
+            SemanticKernel::QuantInt8QkF16 => "attn.quant_int8_qk",
+            SemanticKernel::VPackInt8Prefill => "attn.v_pack_int8_prefill",
+            SemanticKernel::VAppendInt8Paged => "attn.v_append_int8_paged",
+            SemanticKernel::Int8PrefillPaged => "attn.int8_prefill_paged",
+            SemanticKernel::Int8DecodePaged => "attn.int8_decode_paged",
+            SemanticKernel::Int8DecodeSplit => "attn.int8_decode_split",
+            SemanticKernel::Int8DecodeReduce => "attn.int8_decode_reduce",
             SemanticKernel::K0WriteFp8 => "attn.k0_write_fp8",
             SemanticKernel::K0WriteFp8Bf16 => "attn.k0_write_fp8_bf16",
             SemanticKernel::PagedDecode => "attn.paged_decode",
@@ -944,7 +971,7 @@ mod foreign_call_lock {
     //! 层声明 → lower_kernel → client face parse 逐位对拍。
     use super::*;
     use crate::contract::Dtype;
-    
+
     use crate::tensor::TensorOps;
     use owl_kernels::client::gdn_chunked as fc_chunked;
     use owl_kernels::client::gdn_scalar as fc_scalar;
