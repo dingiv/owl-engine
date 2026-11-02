@@ -43,7 +43,7 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
                               const uint16_t* __restrict__ vp,
                               const float* __restrict__ vscale,
                               const float* __restrict__ block_table,
-                              float* __restrict__ out, int T, int L, int Hq, int Hkv,
+                              __half* __restrict__ out, int T, int L, int Hq, int Hkv,
                               int page, int base_pos,
                               const __half* __restrict__ dep_k,
                               const __half* __restrict__ dep_v) {
@@ -284,14 +284,14 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
     for (int n = 0; n < 32; ++n) {
         const int d0 = n * 8 + 2 * lid;
         if (row0 < tile_rows) {
-            float* p0 = &out[((size_t)(q0 + row0) * Hq + q_head) * D + d0];
-            *reinterpret_cast<float2*>(p0) =
-                make_float2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+            __half* p0 = &out[((size_t)(q0 + row0) * Hq + q_head) * D + d0];
+            *reinterpret_cast<__half2*>(p0) = __floats2half2_rn(
+                acc[n][0] * inv_l0, acc[n][1] * inv_l0);
         }
         if (row1 < tile_rows) {
-            float* p1 = &out[((size_t)(q0 + row1) * Hq + q_head) * D + d0];
-            *reinterpret_cast<float2*>(p1) =
-                make_float2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+            __half* p1 = &out[((size_t)(q0 + row1) * Hq + q_head) * D + d0];
+            *reinterpret_cast<__half2*>(p1) = __floats2half2_rn(
+                acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
 }

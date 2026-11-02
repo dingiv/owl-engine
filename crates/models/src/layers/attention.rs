@@ -973,12 +973,8 @@ impl Attention {
             .arg_i32(self.hq as i32)
             .arg_i32(nparts as i32)
             .arg_i32(self.hd as i32)
-            .with_shape(Dtype::F32, vec![tokens, self.hq * self.hd]);
-        let n = tokens * self.hq * self.hd;
-        let y = TensorOps::call(SemanticKernel::CastF32F16)
-            .arg(&y)
-            .arg_i32(n as i32)
             .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
+        let n = tokens * self.hq * self.hd;
         let y = TensorOps::call(SemanticKernel::GateMul)
             .arg(gate)
             .arg(&y)
@@ -1075,12 +1071,8 @@ impl Attention {
             .arg_i32(self.hkv as i32)
             .arg_i32(pol.page as i32)
             .arg_i32(ctx.ctx_base as i32)
-            .with_shape(Dtype::F32, vec![tokens, self.hq * self.hd]);
-        let n = tokens * self.hq * self.hd;
-        let y = TensorOps::call(SemanticKernel::CastF32F16)
-            .arg(&y)
-            .arg_i32(n as i32)
             .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
+        let n = tokens * self.hq * self.hd;
         let y = TensorOps::call(SemanticKernel::GateMul)
             .arg(gate)
             .arg(&y)

@@ -39,6 +39,16 @@ fn lcg_f32(n: usize, seed: u32, base: f32, span: f32) -> Vec<f32> {
         .collect()
 }
 
+
+fn f16_to_f32(h: u16) -> f32 {
+    let s = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let e = ((h >> 10) & 0x1F) as i32;
+    let m = (h & 0x3FF) as f32;
+    if e == 0 { return s * m * 2f32.powi(-24); }
+    if e == 31 { return if m == 0.0 { s * f32::INFINITY } else { f32::NAN }; }
+    s * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+}
+
 fn run(t: usize, l: usize, timing: bool) -> Option<()> {
     let dev = owl_cuda::test_device_ordinal_opt()?;
     let mut res = fi_support::TestRes::new(dev);
@@ -60,7 +70,7 @@ fn run(t: usize, l: usize, timing: bool) -> Option<()> {
     let bt: Vec<f32> = (0..nblocks as u32).map(|x| x as f32).collect();
     let btb: Vec<u8> = bt.iter().flat_map(|x| x.to_le_bytes()).collect();
     let vs = lcg_f32(nblocks * HKV * 4, 0x6789, 0.005, 0.005);
-    let mut out = vec![0u8; t * HQ * D * 4];
+    let mut out = vec![0u8; t * HQ * D * 2];
 
     let dq = r.alloc(q.len(), "int8.q").unwrap();
     let dqs = r.alloc(qs.len() * 4, "int8.qs").unwrap();
@@ -129,8 +139,8 @@ fn run(t: usize, l: usize, timing: bool) -> Option<()> {
     )
     .unwrap();
     let vals_f: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     let finite = vals_f.iter().all(|x| x.is_finite());
     let nonzero = vals_f.iter().any(|x| x.abs() > 1e-8);
@@ -211,7 +221,7 @@ fn int8_prefill_correctness_small() {
     let dvp = r.alloc(vp.len(), "c.vp").unwrap();
     let dvs = r.alloc(vsb.len(), "c.vs").unwrap();
     let dbt = r.alloc(btb.len(), "c.bt").unwrap();
-    let mut out = vec![0u8; T * HQ * D * 4];
+    let mut out = vec![0u8; T * HQ * D * 2];
     let dout = r.alloc(out.len(), "c.out").unwrap();
     r.upload(dq, &q).unwrap();
     r.upload(dqs, &qsb).unwrap();
@@ -251,8 +261,8 @@ fn int8_prefill_correctness_small() {
     )
     .unwrap();
     let got: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
 
     let mut dot = 0f64;

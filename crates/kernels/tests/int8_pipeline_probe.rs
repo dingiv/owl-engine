@@ -539,7 +539,7 @@ fn int8_decode_matches_host() {
     const NPARTS: usize = 256;
     let dpout = r.alloc(B * HQ * NPARTS * D * 4, "d.pout").unwrap();
     let dpstat = r.alloc(B * HQ * NPARTS * 2 * 4, "d.pstat").unwrap();
-    let dout2 = r.alloc(B * HQ * D * 4, "d.out2").unwrap();
+    let dout2 = r.alloc(B * HQ * D * 2, "d.out2").unwrap();
     let svals = [
         LaunchVal::Ptr(dq.ptr),
         LaunchVal::Ptr(dqs.ptr),
@@ -590,7 +590,7 @@ fn int8_decode_matches_host() {
     )
     .unwrap();
     r.sync().unwrap();
-    let mut out2 = vec![0u8; B * HQ * D * 4];
+    let mut out2 = vec![0u8; B * HQ * D * 2];
     r.download(
         CheckBuf {
             ptr: dout2.ptr,
@@ -600,20 +600,20 @@ fn int8_decode_matches_host() {
     )
     .unwrap();
     let got2: Vec<f32> = out2
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     let mut mx2 = 0f32;
     for (a, b) in got2.iter().zip(&got) {
         mx2 = mx2.max((a - b).abs());
     }
     println!("[int8-decode] split/reduce max|d|={mx2:.6}");
-    assert!(mx2 < 2e-4, "split/reduce max|d| {mx2}");
+    assert!(mx2 < 2e-3, "split/reduce max|d| {mx2}");
 
     // ---- GQA + tensor-core split:同一批输入,对照已通过的 split/reduce ----
     let dtc_out = r.alloc(B * HQ * NPARTS * D * 4, "d.tcout").unwrap();
     let dtc_stat = r.alloc(B * HQ * NPARTS * 2 * 4, "d.tcstat").unwrap();
-    let dout3 = r.alloc(B * HQ * D * 4, "d.out3").unwrap();
+    let dout3 = r.alloc(B * HQ * D * 2, "d.out3").unwrap();
     let tvals = [
         LaunchVal::Ptr(dq.ptr),
         LaunchVal::Ptr(dqs.ptr),
@@ -664,7 +664,7 @@ fn int8_decode_matches_host() {
     )
     .unwrap();
     r.sync().unwrap();
-    let mut out3 = vec![0u8; B * HQ * D * 4];
+    let mut out3 = vec![0u8; B * HQ * D * 2];
     r.download(
         CheckBuf {
             ptr: dout3.ptr,
@@ -674,8 +674,8 @@ fn int8_decode_matches_host() {
     )
     .unwrap();
     let got3: Vec<f32> = out3
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     let mut mx3 = 0f32;
     for (a, b) in got3.iter().zip(&got2) {

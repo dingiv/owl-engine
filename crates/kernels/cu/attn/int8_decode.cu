@@ -315,7 +315,7 @@ extern "C" __global__ void owl_int8_decode_reduce(
     const float* __restrict__ partial_out,
     const float* __restrict__ partial_stat,
     const __half* __restrict__ dep,
-    float* __restrict__ out,
+    __half* __restrict__ out,
     int B,
     int Hq,
     int nparts,
@@ -342,7 +342,7 @@ extern "C" __global__ void owl_int8_decode_reduce(
     sum += l * w;
   }
   out[((static_cast<long long>(b) * Hq + h) * D) + d] =
-      (sum > 0.0f) ? acc / sum : 0.0f;
+      __float2half_rn((sum > 0.0f) ? acc / sum : 0.0f);
 }
 
 namespace tc {
