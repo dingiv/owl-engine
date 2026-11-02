@@ -38,6 +38,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/canon/charter.md`](devlog/canon/charter.md) — **Charter**: axioms A1/A2, ownership boundaries, borrowed materials
 - ⬜ [`devlog/canon/requirements.md`](devlog/canon/requirements.md) — Requirements specification (inherited from the frozen xinfer baseline)
 - ⬜ [`devlog/canon/async-runtime.md`](devlog/canon/async-runtime.md) — Async model: four-layer architecture + declarative tensors
+- ✅ [`arch/服务的线程与循环模型.md`](arch/服务的线程与循环模型.md) — **线程与循环正本**:6 类线程(main/tokio · engine-executor · 每 rank 设备 server · 派发线程 · 装载期 runtime)+ 6 个循环的**粒度与退出条件**;步边界两项状态检查(停服 watch / `sink.is_closed()`);关停一条路径 + 三种退出码;刻意不做的五件事
 
 ## B. Graph execution and capture
 
@@ -101,6 +102,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/spec/gguf-dflash2-survey.md`](devlog/spec/gguf-dflash2-survey.md) — DFlash2 speculative decoding on the GGUF line
 - ⬜ [`devlog/spec/gguf-dflash2-roadmap.md`](devlog/spec/gguf-dflash2-roadmap.md) — GGUF DFlash2 speedup roadmap
 - ⬜ [`devlog/spec/longctx-spec-survey.md`](devlog/spec/longctx-spec-survey.md) — Long-context spec-decode: our decay vs community approaches
+- ✅ [`devlog/spec/spec-degrade-hysteresis-2026-11-03.md`](devlog/spec/spec-degrade-hysteresis-2026-11-03.md) — 投机降级"降了不回头":降级态探测消费 8~64 步前的**陈旧草稿** ⇒ 53 次探测全灭(`undegrad=0`,turn 内永久裸 decode);修草稿账 + 确认制(两连续低窗才降 / 探测命中必恢复 / 探测封顶 64→32);同形状 83.4→116.8 t/s
 
 ## G. Memory, KV and long context
 
@@ -132,6 +134,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ✅ [`devlog/serving/2026-10-26-topk32-device-rep-penalty-handoff.md`](devlog/serving/2026-10-26-topk32-device-rep-penalty-handoff.md) — top-32 设备端 rep_penalty:H=256 committed history、固定图槽、先惩罚后 top-32、3080 A/B 与 kernel 对拍
 - ⬜ [`devlog/serving/2026-10-26-prefill-longctx-attention-kv-thrash-handoff.md`](devlog/serving/2026-10-26-prefill-longctx-attention-kv-thrash-handoff.md) — 长上下文 prefill 交接:100k 内 FlashInfer attention 逼近硬件成本；200k 的 13s TTFT 主要是整链 KV 下沉/回灌（9s 级），准入/复用账待修；**2026-10-26 追加：下一会话只做 P0（准入/复用账）+ P2（f16 CTA64/换核），P1（capped f16 shadow）暂缓**
 - ✅ [`devlog/serving/2026-11-03-abort-prefix-hit.md`](devlog/serving/2026-11-03-abort-prefix-hit.md) — 中断(断流/取消)后前缀缓存命中:Abort 不发布链 ⇒ 整段重算(5850 tok TTFT 2395→186 ms);中断落账 + `Release::publish`;生成段不入账(否则 `positioned` 关掉跨会话缓存)
+- ✅ [`devlog/serving/2026-11-03-prefill-abort-keepalive.md`](devlog/serving/2026-11-03-prefill-abort-keepalive.md) — 长 prefill 期间断流引擎照跑完:流上零写入 ⇒ chunked 写不失败 ⇒ FIN 无人察觉(198495 tok 仍跑满);修**断流三源**(读半 `peek` FIN/RST 瞬时 + 保活帧兜无 FIN 掉线 + 投递失败)+ 中断点补拍边界快照(链发布了没快照 ⇒ `m_raw=1`)
 
 ## I. Performance and engineering (framework · device · pitfalls · bench reports)
 
