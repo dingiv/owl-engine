@@ -796,3 +796,147 @@ smem = Q16 + K8 + V_f16 16 + P4 = 44KB,2 CTA/SM(8 warps);
 
 **判决:速度线复活。** 下一步把 per-token scale + online softmax + 输出
 补齐,目标 ≤30ms(含 scale)且 cos ≥0.9999;然后接 owl 的 K int8/V shadow。
+
+---
+
+## 0.7 2026-11-03 修正:28.3ms 探针无效;正确核 32.9ms ≈ 平手
+
+**0.6 的 28.3ms 不能作为结论。** 那个探针的 P swizzle 用了 `row & 7`,
+而 Bc=32 的 P 行只有 4 个 8-column 组 ⇒ 行 7 的 P 被写到行外,
+`T=8` 时 row7 输出直接错(cos 0.36~0.95)。它快,部分是因为 P 布局越界/错误。
+
+修正后的核(`experiments/int8pv/full_4w_correct.cu`)补齐了:
+
+- per-token/head Q/K scale(score 乘 `q_scale * k_scale`,K scale 预乘 softmax_scale);
+- 真正的 online softmax(running m/l + 每 tile rescale acc);
+- 正确 P 布局(Bc=32 用 `row&3` 或 padding)、V f16 shadow `[key][dim]` + `ldmatrix_x4_t`;
+- 正确输出写回。
+
+正确性(host fp32 参考):
+
+| T | L | cos | max\|Δ\| |
+|---:|---:|---:|---:|
+| 8 | 64 | 0.999999865 | 3.5e-4 |
+| 8 | 512 | 0.999999236 | 3.9e-4 |
+| 64 | 4096 | 0.999995064 | 7.2e-4 |
+
+性能(3090 Ti,T=2048/ctx=65k,Bc=32,4 warp,2 CTA/SM):
+
+| 档 | 时间 |
+|---|---:|
+| 正确核(全量) | **33.5 ms** |
+| 正确核 + P padding | **32.9 ms** |
+| 去掉 Q/K scale | 32.25 ms |
+| FI 双 half | 33.0 ms |
+
+⇒ **正确核 ≈ 32.9~33.5ms,与 FI 33.0ms 基本平手,不是 28.3ms 的胜利。**
+scale 成本约 1.4ms;online/output 成本很小;28.3ms 的差额主要来自无效 P 布局
+和更少的簿记。
+
+**判决(修正版):**
+
+- K int8 + V f16 shadow + int8 QK 在当前 4-warp/Bc32 形态下 **没有确定性优势**;
+- 剩余可试的杠杆只有:
+  1. 8 warp / 2 KV slice 或 CTA_TILE_Q=128(降低 V 重读、增 occupancy);
+  2. 把 P 留在寄存器直接喂 PV(去掉 P smem round-trip);
+  3. 更激进的 V 预取/双缓冲。
+- 这些都需要重写主循环,预期收益 3~5ms,风险高。若不做,**INT8 KV 在 30 系
+  prefill 上应定位为“质量/容量”而非“速度反超”**。
+
+---
+
+## 0.8 公平对比:FP8 无 shadow vs INT8 无 shadow(用户裁决口径)
+
+之前拿 INT8 + V f16 shadow(32.9ms)去对 FI 双 half(33.0ms)是不公平的:
+V f16 shadow 付了额外显存/带宽。按用户裁决,改成 **都不开 shadow**:
+
+| 档 | 时间 | 显存 |
+|---|---:|---|
+| **FP8 无 shadow**（FI fp8 池 + 双 half 核） | **42.89 ms** | 1B/elem |
+| **INT8 无 shadow**（4-warp, K/V int8, P uint8, int8 PV） | **29.24 ms** | 1B/elem + scale |
+| FP8 + f16 shadow | 32.98 ms | 2B/elem |
+| INT8 + V f16 shadow | 32.9 ms | K 1B + V 2B |
+
+⇒ **同无 shadow 口径下,INT8 29.24ms vs FP8 42.89ms = +32%。**
+这是本项目第一次在**公平显存口径**下拿到明确速度优势。
+
+INT8 无 shadow 的形态(`experiments/int8pv/full_4w_i8pv_bench.cu`):
+
+- 4 warp / 128 thread,Bc=32
+- K int8 池 + per-token/head scale(QK 后乘)
+- V int8 预打包 `[Hkv][D][L/2]` b16 + per-(head,64-dim) scale(沿 K 恒定)
+- P 每 (row, 32-key tile) 量化 uint8,`mma.m16n8k32.u8.s8.s32`
+- int32 PV 每 tile 反量化到 float acc
+- smem = Q16 + K8 + V8 + P2 ≈ 34KB,2 CTA/SM
+- 无 V f16 shadow,无额外显存
+
+注意:29.24ms 是 **timing 探针**(未含 Q/K scale、online rescale、输出写回)。
+按 f16-shadow 正确核的拆账,scale+online+output 约 +2~3ms ⇒ **预期正确核 31~32ms**,
+仍比 FP8 无 shadow 42.89ms 快 **25~28%**。
+
+**当前结论:无 shadow 的 INT8 路线成立。** 下一步:
+1. 给 4-warp int8 PV 补 per-token scale / online softmax / 正确输出;
+2. host 对拍 cos ≥0.9999(参考 S1 full int8 的 0.99995);
+3. 若正确核 ≤32ms,接 owl 的 int8 池 + int8 PV 线路(不再需要 V f16 shadow)。
+
+---
+
+## 0.9 2026-11-03 质量门通过:INT8 无 shadow 正确核 34.64ms
+
+4-warp int8 QK + int8 PV(无 V shadow)补齐 per-token scale / online softmax /
+正确输出后,host fp32 对拍:
+
+| T | L | cos | max\|Δ\| |
+|---:|---:|---:|---:|
+| 1 | 64 | 0.999998088 | 1.1e-3 |
+| 8 | 64 | 0.999997940 | 1.8e-3 |
+| 8 | 512 | 0.999997992 | 4.7e-4 |
+| 64 | 4096 | 0.999997908 | 1.6e-4 |
+
+**质量门通过,余量很大。**
+
+性能(3090 Ti,T=2048/ctx=65k,Bc=32,4 warp,无 V shadow):
+
+| 档 | 时间 |
+|---|---:|
+| FP8 无 shadow(FI 双 half) | 42.89 ms |
+| **INT8 无 shadow(正确核)** | **34.64 ms** |
+| INT8 无 shadow(timing 探针) | 29.24 ms |
+
+⇒ **同无 shadow 口径,INT8 34.64ms vs FP8 42.89ms = +19.2%,且无额外显存。**
+timing 探针到正确核的 +5.4ms 来自 scale/online/output 簿记,是后续 profile 的
+第一优化面。
+
+关键 bug(已修):P 是 uint8,必须用 `mma...s32.u8.s8.s32`;此前误用
+`mma_s8`(signed A),P>127 被当负数,cos 变负。改用 `mma_u8s8` 后 cos 0.999998。
+
+**结论:INT8 无 shadow 路线成立(质量 + 速度 + 显存三项都过)。**
+下一步:接 owl,然后按用户要求用 nsys/寄存器/占用率 profile 找瓶颈。
+
+---
+
+## 0.10 2026-11-03 owl 原生核接入(第一步)
+
+已把验证过的 4-warp int8 核搬进 owl 原生 AOT 面:
+
+| 文件 | 内容 |
+|---|---|
+| `crates/kernels/cu/attn/int8_attn_helpers.cuh` | 自包含 inline-PTX helpers(ldmatrix/mma/cp.async/warp reduce) |
+| `crates/kernels/cu/attn/int8_prefill.cu` | `owl_int8_prefill_paged`(4 warp/Bc32/K int8/V prepacked/P uint8) |
+| `crates/kernels/src/ops/attn.rs` | `Int8PrefillPaged` spec + `OWL_INT8_PREFILL_PAGED` |
+| `crates/kernels/tests/int8_prefill_probe.rs` | 原生发射探针(T=8/L=64 smoke + T=2048/65k timing) |
+
+探针结果(3090 Ti):
+
+```text
+[int8-probe] T=8 L=64 finite=true nonzero=true max|o|=0.580928
+[int8-probe] T=2048 L=65536 3 runs: 103.3ms  (~34.4ms/run)
+```
+
+与实验核一致。当前 spec 的已知缺口:
+
+- V prepacked 布局(`[Hkv][D][L/2]` b16)还没有 `LayoutTag`/池访问声明;
+- 目前只声明 K 的 `KV_MAIN` int8 读;scale/V 的 writer/池账待补(FIXME 已写);
+- 还没有接 engine 的 KV cache 分配、prefix cache/snapshot、图路径。
+
+**下一步:V prepack writer + scale plane + engine 配置接线。**
