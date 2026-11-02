@@ -20,6 +20,7 @@ mode = "single"
 device = ["GPU-e565c505-4921-9979-2e0f-2b83490b7aed"]
 
 [runtime]
+keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # 长文档档(W1 的失败现场就是这个组合)
 prefill_chunk = 1024
 max_seq = 262144

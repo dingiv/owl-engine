@@ -84,6 +84,7 @@ bind = "0.0.0.0:8138"
 quant = "w4a8"
 
 [runtime]
+keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # **max_seq = 262144 = 模型 native 上限**(max_pos=262144),2026-10-30 实测采纳。
 # 首次起机装配报告(131072 档):卡可用 31500.1MiB · 权重 18041.5MiB(a8 marlin
 # + 视觉塔 + int8 头)· 运行底价 593.6MiB · 池 4096MiB · 快照 455.6MiB ⇒

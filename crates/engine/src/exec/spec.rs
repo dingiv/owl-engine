@@ -1761,6 +1761,98 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 位置 = `out` 尾的下一枚起 —— `out` 不变式:`out.len() = fed - prompt_len + 1`)、
     /// `durability` = 重要性档(生成段逐页边界 = [`Transient`](owl_store::SnapDurability::Transient):
     /// 链一往前就被取代 ⇒ 逐出即丢,不下沉宿主)。
+    /// **在指定边界拍一张快照**(单一产地:正常 prefill/decode 边界与"中断补拍"
+    /// 共用这一份 —— 槽位选择 / 双 rank 镜像 / 登记账簿 / 保护面全在此)。
+    ///
+    /// `key` = 边界块的内容身份;`full_blocks` = 该边界对应的整块数(记账口径)。
+    async fn capture_snap_at_boundary(
+        &mut self,
+        sid: u64,
+        key: owl_store::SnapKey,
+        full_blocks: usize,
+        durability: owl_store::SnapDurability,
+    ) -> Result<()> {
+        let gdn_slot = self.turns.active().map(|a| a.gdn_slot).unwrap_or(0);
+        let slot = self.snap_ensure_slot(key).await?;
+        // 两 rank 各拍各自的池(镜像分配 ⇒ slot 号同构);
+        // store 的 state 账是 **host 单份** ⇒ 身份只登记一次(内容相同)。
+        {
+            let (dev, peer) = (&mut self.dev, self.peer.as_mut());
+            crate::exec::mirror2!(dev, peer,
+                d => d.snap_dev(gdn_slot, key, slot),
+                p => p.snap_dev(gdn_slot, key, slot))?;
+        }
+        if self.boot.cfg.knobs.probes.debug {
+            owl_shared::log_debug!(
+                "dbg snap",
+                "捕获 blocks={full_blocks} key={key:?} slot={slot} ⇒ used={}",
+                self.dev.pool.snap_used()
+            );
+        }
+        // 登记/触达(层 = 设备;档 = 调用方给的事实)
+        //
+        // ⚠️ 2026-10-28 定谳:必须走 `register_snap_captured`(单源),
+        // 不能直接 `state.register_snap_owned` —— 同名边界快照重拍
+        // (truncate 尾部重算 / 同 prompt 再次到达同一边界)会产生同键,
+        // 若旧键已在宿主/盘就**留尸** ⇒ 下次下沉 `snap_host.put` 撞
+        // 「已在宿主层」⇒ 整个 turn 500(实测第 3 次请求必现)。
+        // **记账单元 = 一条快照的总字节**(单 rank 平面 × world;2026-11-01):
+        // 与盘上文件/宿主块/下沉检查同一口径 —— 按单 rank 记会让 TP2 的
+        // `plan_snap_offload` 报「账 79MB ≠ 布局 159MB」而弃置整个 turn。
+        let ghosts = self.bank.rel.register_snap_captured(
+            key,
+            self.bank.rel.snap_file_bytes(),
+            durability,
+            sid,
+            full_blocks,
+        )?;
+        if ghosts > 0 {
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("store.snap.rebind_ghost_dropped", ghosts as u64, file!(), line!());
+            });
+        }
+        // **P1-2**:本 turn 的最新边界进入显式保护面。快照面没有引用计数,
+        // 若不记在这里,下一次 Idle/Pressure 可能把它当成最冷条目搬走。
+        self.turns.active_mut()?.last_snap = Some(key);
+        Ok(())
+    }
+
+    /// **在游标当前链尾补拍一张快照**(2026-11-03:客户端中断长 prefill 时用)。
+    ///
+    /// 为什么需要:正常路径每个边界都会 `capture_gdn_snap_tail`(它**幂等** ——
+    /// 同一 fed 不重复拍),而**是否真拍**由 `snap_keep` 节奏决定;本档(非虚拟化)
+    /// 的节奏 = `last_boundary || 每 SNAP_EVERY 个边界 || 消息边界`。客户端在
+    /// prefill **中段**断开时,既没有"末边界"也不一定撞上锚点 ⇒ 链虽然发布了
+    /// (中断落账),但**边界上没有快照** ⇒ `reuse_face` 只能退回 1 块
+    /// (实测 `matched=769 m_raw=1`)⇒ 中断前算完的几万 token 下一轮白重算。
+    ///
+    /// 这里强制在**当前链尾**重拍一张(`Durable`:prompt 段值得下沉宿主)——
+    /// 花 ~31 ms 换回"已算完的前缀可复用"。
+    pub(crate) async fn capture_snap_at_cursor(
+        &mut self,
+        sid: u64,
+        durability: owl_store::SnapDurability,
+    ) -> Result<bool> {
+        let (full_blocks, key) = {
+            let s = self
+                .bank
+                .sessions
+                .get(sid)
+                .ok_or_else(|| ModelError::Msg(format!("会话 {sid} 不在账")))?;
+            (s.chain.blocks(), owl_store::SnapKey::at_boundary(s.chain.tail()))
+        };
+        if full_blocks == 0 {
+            return Ok(false);
+        }
+        self.capture_snap_at_boundary(sid, key, full_blocks, durability)
+            .await?;
+        owl_shared::log_info!(
+            "snap",
+            "中断补拍:session={sid:#x} 边界 {full_blocks} 块 的快照已就位(中断前的前缀可复用)"
+        );
+        Ok(true)
+    }
+
     pub(crate) async fn capture_gdn_snap_tail(
         &mut self,
         sid: u64,
@@ -1803,7 +1895,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let seg = self.tokens_upto_with(start * page, full_blocks * page, tail)?;
         // 3) 推进身份链(段长不符 = 结构性拒,不静默;逐块哈希在同一处重放
         //    —— 身份与游标同源 `owl_store::hash_block`)
-        let (gdn_slot, key, per_block, parent0) = {
+        let (key, per_block, parent0) = {
             let s = self
                 .bank
                 .sessions
@@ -1829,9 +1921,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 per.push((parent, b));
             }
             debug_assert_eq!(parent, tail, "逐块重放尾哈希须与 advance 一致(身份单源)");
-            // S2b:快照拍摄用的是**本 turn 的行**(turn 域资源)
             (
-                self.turns.active().map(|a| a.gdn_slot).unwrap_or(0),
                 owl_store::SnapKey::at_boundary(tail),
                 per,
                 parent0, // = 本次推进前的链尾(增量登记起点)
@@ -1841,47 +1931,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // `StateStore`;设备池只做槽位索引。槽满时先**下沉最冷的一条**
         // (内容留宿主),沉不下(宿主满/关)才丢(响亮打点)。
         if snap_on {
-            let slot = self.snap_ensure_slot(key).await?;
-            // 两 rank 各拍各自的池(镜像分配 ⇒ slot 号同构);
-            // store 的 state 账是 **host 单份** ⇒ 身份只登记一次(内容相同)。
-            {
-                let (dev, peer) = (&mut self.dev, self.peer.as_mut());
-                crate::exec::mirror2!(dev, peer,
-                    d => d.snap_dev(gdn_slot, key, slot),
-                    p => p.snap_dev(gdn_slot, key, slot))?;
-            }
-            if self.boot.cfg.knobs.probes.debug {
-                owl_shared::log_debug!(
-                    "dbg snap",
-                    "捕获 fed={fed} key={key:?} slot={slot} ⇒ used={}",
-                    self.dev.pool.snap_used()
-                );
-            }
-            // 登记/触达(层 = 设备;档 = 调用方给的事实)
-            //
-            // ⚠️ 2026-10-28 定谳:必须走 `register_snap_captured`(单源),
-            // 不能直接 `state.register_snap_owned` —— 同名边界快照重拍
-            // (truncate 尾部重算 / 同 prompt 再次到达同一边界)会产生同键,
-            // 若旧键已在宿主/盘就**留尸** ⇒ 下次下沉 `snap_host.put` 撞
-            // 「已在宿主层」⇒ 整个 turn 500(实测第 3 次请求必现)。
-            // **记账单元 = 一条快照的总字节**(单 rank 平面 × world;2026-11-01):
-            // 与盘上文件/宿主块/下沉检查同一口径 —— 按单 rank 记会让 TP2 的
-            // `plan_snap_offload` 报「账 79MB ≠ 布局 159MB」而弃置整个 turn。
-            let ghosts = self.bank.rel.register_snap_captured(
-                key,
-                self.bank.rel.snap_file_bytes(),
-                durability,
-                sid,
-                full_blocks,
-            )?;
-            if ghosts > 0 {
-                owl_shared::metrics::with_metrics_store(|m| {
-                    m.counter_add("store.snap.rebind_ghost_dropped", ghosts as u64, file!(), line!());
-                });
-            }
-            // **P1-2**:本 turn 的最新边界进入显式保护面。快照面没有引用计数,
-            // 若不记在这里,下一次 Idle/Pressure 可能把它当成最冷条目搬走。
-            self.turns.active_mut()?.last_snap = Some(key);
+            self.capture_snap_at_boundary(sid, key, full_blocks, durability)
+                .await?;
         }
         // **B 轴 B-0:同一处顺手采索引**(同一"块边界 + 链尾身份"事件 ⇒
         // 一次算身份、一次推进游标;索引与 GDN 快照共享边界身份)。

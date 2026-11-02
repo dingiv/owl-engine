@@ -47,6 +47,7 @@ path = "../models/bytkim/Qwen3.8-27B-pi-AWQ-INT4"
 quant = "w4a8"
 
 [runtime]
+keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 max_seq = 262144
 max_concurrency = 1
 # 3080 TP2 冷 prefill A/B（2026-10-25，15K/25K/37K）:

@@ -927,7 +927,7 @@ async fn handle(
         }
         ("POST", "/v1/chat/completions") => {
             openai::chat(
-                &mut stream,
+                stream,
                 &req.body,
                 ctx.tx.clone(),
                 &ctx.model_name,

@@ -40,6 +40,7 @@ vision = true
 vision_path = "../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
 
 [runtime]
+keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # 229376 = 7168 页(boot 报的 cap 286041 的 80%,已含 0.9GB 视觉塔);
 # 实测 64k/128k 零拒发、余量 2.1GB。
 max_seq = 229376

@@ -271,6 +271,24 @@ pub async fn sse_end<W: AsyncWriteExt + Unpin>(w: &mut W) -> io::Result<()> {
     w.flush().await
 }
 
+/// **一帧 SSE 注释**(`: <text>\n\n` —— chunked 封装)。
+///
+/// 用途只有一个:**长 prefill 期间探测客户端断流**。prefill 阶段不产 token
+/// ⇒ 流上一个字节都不写 ⇒ 对端 FIN 无人察觉(hand-rolled HTTP + chunked:
+/// 断流只在写失败时暴露)⇒ 引擎会把整段 prefill 白跑完(100k prompt 是分钟级)。
+///
+/// SSE 规范要求解析器**忽略以 `:` 开头的行**(官方 SDK 的 `SSEDecoder` 对
+/// "注释行 + 空行" 返回 None,不会派发空 data 事件);这也是 OpenAI / Anthropic /
+/// OpenRouter 等厂商在长思考期用的同一手法。间隔由 `[runtime] keepalive_ms` 控
+/// (0 = 关)。
+pub async fn sse_comment<W: AsyncWriteExt + Unpin>(w: &mut W, text: &str) -> io::Result<()> {
+    let payload = format!(": {text}\n\n");
+    w.write_all(format!("{:x}\r\n", payload.len()).as_bytes()).await?;
+    w.write_all(payload.as_bytes()).await?;
+    w.write_all(b"\r\n").await?;
+    w.flush().await
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }

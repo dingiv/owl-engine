@@ -12,7 +12,7 @@
 //! = 前缀复用零命中的根因。
 //!
 //! 挂账(M-C):取消/abort 的上游用法(`EngineReq::Abort` 已就位,pi 侧
-//! 断流走路由 actor 自动弃置)。
+//! 断流走路由 executor 自动弃置)。
 
 use std::io::Write;
 use std::sync::Arc;
@@ -719,11 +719,14 @@ fn dump_request(dir: &std::path::Path, body: &[u8]) {
     owl_shared::log_warn!("request-dump", "同一纳秒 100 次文件名冲突，放弃落盘");
 }
 
-/// chat completions:提交 actor → 首笔 Accepted/Rejected → 三通道折叠循环。
+/// chat completions:提交 executor → 首笔 Accepted/Rejected → 三通道折叠循环。
 // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
-    w: &mut W,
+/// **`w` 是具体 `TcpStream` 而不是泛型 `AsyncWrite`**(2026-11-03):流式循环要多
+/// 一路事件源 —— **读半 FIN**(`peek`,非消费)。只有 `TcpStream` 能 `peek`;调用点
+/// 只有 `main::handle` 一处 ⇒ 具体化零代价。
+pub(crate) async fn chat(
+    w: &mut tokio::net::TcpStream,
     body: &[u8],
     tx: mpsc::Sender<EngineReq>,
     model_name: &str,
@@ -930,7 +933,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             }
             return http::respond_json(w, 400, &error_json_for_reject(err)).await
         }
-        // 契约:首笔必为 Accepted/Rejected(actor 在 pump 前投递)⇒ 不会走到
+        // 契约:首笔必为 Accepted/Rejected(executor 在 pump 前投递)⇒ 不会走到
         // 这里(真走到 = 协议序错乱,不静默吞)
         Some(SinkEvent::Session { .. }) => {
             return http::respond_json(
@@ -959,7 +962,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
     // 工具协议错误(畸形/缺 required/未知工具):一旦置位,后续通道全部静音,
     // 终态按错误收口 —— 绝不再把半截工具块或空 stop 当正常结果返回。
     let mut protocol_error: Option<&'static str> = None;
-    // 写失败 ⇒ 显式弃置引擎 turn(AGT-10):actor 侧虽会在下次投递失败时
+    // 写失败 ⇒ 显式弃置引擎 turn(AGT-10):executor 侧虽会在下次投递失败时
     // 发现,但显式 abort 立刻停(长思考/长输出下差几十秒 GPU)。
     // 注:宏必须在 `acc`/`role_sent` 作用域内定义 —— macro_rules 卫生:
     // 宏体内标识符按**定义点**解析,定义在前就看不到(实测踩过)
@@ -978,9 +981,9 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             .await
             {
                 // **先关 sink 再等回执**(2026-10-20 真机定谳):本任务若还持有
-                // `sink_rx` 等 abort 回执,actor 的投递就一直成功 ⇒ 它**察觉不到**
+                // `sink_rx` 等 abort 回执,executor 的投递就一直成功 ⇒ 它**察觉不到**
                 // 断流,会把整个 turn 跑完(实测:256 tok 的流断掉后仍烧满 5s+,
-                // 回执超时、会话闸也被拖住)。`close()` 让 actor 下一笔投递失败
+                // 回执超时、会话闸也被拖住)。`close()` 让 executor 下一笔投递失败
                 // ⇒ 走既有 "断流 ⇒ 弃置"(≤1 采样步)。
                 sink_rx.close();
                 abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
@@ -997,34 +1000,121 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
             None => http::respond_sse_head(w).await?,
         }
     }
-    // **排队超时**(`[agent] queue_wait_ms`;0 = 关):提交后迟迟不见实质进展 ⇒
+    // **排队超时**(`[runtime] queue_wait_ms`;0 = 关):提交后迟迟不见实质进展 ⇒
     // 取消该 turn + 429（D2 的 R 档）。`started` = 已见到 prefill/token/终态。
+    //
+    // **静默保活**(`[runtime] keepalive_ms`;2026-11-03):长 prefill 期间流上
+    // 一个字节都不写 ⇒ chunked 写永远不会失败 ⇒ 对端 FIN 无人察觉 ⇒ **引擎把
+    // 整段 prefill 白跑完**(真机:前端在 100k prompt 的 prefill 中断开,引擎仍
+    // 跑满 50s)。这里按周期写一帧 SSE **注释**(`: keepalive`;解析器按规范忽略),
+    // 写失败 = 连接已死 ⇒ 立刻弃流 + 弃置 turn。
+    let ka_ms = agent.keepalive_ms.min(60_000) as u64;
+    let ka_wait = std::time::Duration::from_millis(ka_ms);
+    let mut ka_at = if mode == ReplyMode::Stream && ka_ms > 0 {
+        Some(tokio::time::Instant::now() + ka_wait)
+    } else {
+        None
+    };
     let mut started = false;
     loop {
-        let next = if !started && agent.queue_wait_ms > 0 {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(agent.queue_wait_ms as u64),
-                sink_rx.recv(),
+        // **保活到点即发**(必须在等事件之前判):`Prefill` 事件本身**不写字节**,
+        // 而它每 chunk 就来一笔(0.7~1.2s);若把保活判断放在 select 分支里,
+        // 密集事件会把它永久饿死(实测:28k prompt 的 prefill 期间一个保活帧都没发,
+        // 断流照样白跑到尾)。
+        if ka_at.is_some_and(|t| tokio::time::Instant::now() >= t) {
+            if let Err(e) = http::sse_comment(w, "keepalive").await {
+                owl_shared::log_info!(
+                    "chat",
+                    "保活帧写失败({e}) ⇒ 客户端已断流,弃置 turn {:?}(prefill 阶段也可停)",
+                    turn.map(|(_, t)| t)
+                );
+                sink_rx.close();
+                abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
+                return Ok(());
+            }
+            ka_at = Some(tokio::time::Instant::now() + ka_wait);
+            continue;
+        }
+        // 排队超时只对"尚未起跑"生效(每拍重算 —— 起跑后即失效)
+        let queue_at = if !started && agent.queue_wait_ms > 0 {
+            Some(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(agent.queue_wait_ms as u64),
             )
-            .await
-            {
-                Ok(v) => v,
-                Err(_) => {
-                    owl_shared::log_warn!(
-                        "chat",
-                        "排队超时 {}ms ⇒ 取消 turn 并回 429（session {:?}）",
-                        agent.queue_wait_ms,
-                        session
-                    );
-                    // 先关 sink（actor 下一笔投递失败 ⇒ 按断流弃置），再指名取消 + 等回执
-                    sink_rx.close();
-                    abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
-                    return respond_queue_timeout(w, mode).await;
+        } else {
+            None
+        };
+        let next = tokio::select! {
+            biased;
+            // ① 引擎事件优先
+            v = sink_rx.recv() => v,
+            // ①' **对端 FIN(读半 EOF)—— 真正的断流事件源**
+            //
+            // 为什么要这一路:`peek` 非消费、**不需要先写**。客户端正常关闭
+            // (浏览器/前端 abort/SDK close)会送 FIN ⇒ 这里**立刻**醒,不必等
+            // 保活帧到点(那一档是给"没有 FIN 的掉线"兜底的)。
+            // 有数据(HTTP 管线化)= 无法区分后续 EOF ⇒ 本请求内不再盯(还在
+            // `peer_fin` 里永久挂起),由保活帧兜底。
+            _ = peer_fin(w) => {
+                owl_shared::log_info!(
+                    "chat",
+                    "读半就绪=对端已关(FIN 或 RST)⇒ 客户端已断流,弃置 turn {:?}(prefill 阶段也可停)",
+                    turn.map(|(_, t)| t)
+                );
+                sink_rx.close();
+                abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
+                return Ok(());
+            }
+            // ② 静默到点 ⇒ 写一帧注释(失败 = 断流)
+            _ = sleep_until_opt(ka_at) => {
+                match http::sse_comment(w, "keepalive").await {
+                    Ok(()) => {
+                        ka_at = Some(tokio::time::Instant::now() + ka_wait);
+                        continue;
+                    }
+                    Err(e) => {
+                        // 与 `emit!` 同一处置:先关 sink(executor 下一笔投递失败 ⇒
+                        // 走"断流 ⇒ 弃置"),再指名取消 + 等回执
+                        owl_shared::log_info!(
+                            "chat",
+                            "保活帧写失败({e}) ⇒ 客户端已断流,弃置 turn {:?}(prefill 阶段也可停)",
+                            turn.map(|(_, t)| t)
+                        );
+                        sink_rx.close();
+                        abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
+                        return Ok(());
+                    }
                 }
             }
-        } else {
-            sink_rx.recv().await
+            // ③ 排队超时
+            _ = sleep_until_opt(queue_at) => {
+                owl_shared::log_warn!(
+                    "chat",
+                    "排队超时 {}ms ⇒ 取消 turn 并回 429（session {:?}）",
+                    agent.queue_wait_ms,
+                    session
+                );
+                // 先关 sink（executor 下一笔投递失败 ⇒ 按断流弃置），再指名取消 + 等回执
+                sink_rx.close();
+                abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
+                return respond_queue_timeout(w, mode).await;
+            }
         };
+        // 只有**真的写了字节**的事件才重置保活计时:`Token` 的处理会写 SSE 帧
+        // 与 flush;`Prefill`/`Session` 只改账本、一字节不写 ⇒ 不能重置(否则
+        // 每 chunk 一笔 Prefill 就把保活推到 1s 之外,断流永远探不到)。
+        if ka_at.is_some()
+            && matches!(
+                next,
+                Some(SinkEvent::Turn(
+                    TurnEvent::Token { .. }
+                        | TurnEvent::Completed { .. }
+                        | TurnEvent::Failed { .. }
+                ))
+            )
+        {
+            ka_at = Some(tokio::time::Instant::now() + ka_wait);
+        }
         if matches!(
             next,
             Some(SinkEvent::Turn(
@@ -1342,7 +1432,7 @@ pub(crate) async fn chat<W: tokio::io::AsyncWrite + Unpin>(
                 return http::respond_json(w, 503, &error_json("引擎连接中断")).await;
             }
             None if mode == ReplyMode::Stream => {
-                led.fail("客户端断开(流式;引擎 turn 由 actor 侧弃置)");
+                led.fail("客户端断开(流式;引擎 turn 由 executor 侧弃置)");
                 break
             }
             None => {
@@ -1433,20 +1523,20 @@ pub fn admission_code(err: &str) -> Option<&str> {
 /// - `turn` 已知(Accepted 之后)= 精确取消该 turn —— **不许**走"弃当前执行 turn"
 ///   (那会杀掉同批别家会话的 turn);
 /// - `turn` 未知(断在受理帧之前)= 按会话找(会话闸保证该会话至多一个 turn);
-/// - **等 actor 回执再返回**:会话闸在本函数返回后才释放(函数尾),这样下一次
+/// - **等 executor 回执再返回**:会话闸在本函数返回后才释放(函数尾),这样下一次
 ///   同会话提交不会撞上引擎的"同会话并发"硬拒。回执超时只告警(不静默)。
 async fn abort_turn(tx: &mpsc::Sender<EngineReq>, session: Option<u64>, turn: Option<u64>) {
-    // 临时会话(None)= 无键可寻;引擎会在 sink drop 后自弃(actor 下一个投递点)
+    // 临时会话(None)= 无键可寻;引擎会在 sink drop 后自弃(executor 下一个投递点)
     let Some(session) = session else { return };
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     if tx.send(EngineReq::Abort { session, turn, ack: ack_tx }).await.is_err() {
-        owl_shared::log_warn!("chat", "abort 投递失败(actor 已退役,引擎随进程退出)");
+        owl_shared::log_warn!("chat", "abort 投递失败(executor 已退役,引擎随进程退出)");
         return;
     }
     match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
         Ok(Ok(())) => {}
         Ok(Err(_)) => {
-            owl_shared::log_debug!("chat", "abort 回执通道关闭(actor 已退役)");
+            owl_shared::log_debug!("chat", "abort 回执通道关闭(executor 已退役)");
         }
         Err(_) => owl_shared::log_warn!("chat", "abort 回执超时(5s;引擎可能正忙) "),
     }
@@ -1454,6 +1544,36 @@ async fn abort_turn(tx: &mpsc::Sender<EngineReq>, session: Option<u64>, turn: Op
 
 /// 三通道产出 → SSE 帧(流式)或聚合器(非流式);role 首帧在此处懒发
 // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
+#[allow(clippy::too_many_arguments)]
+/// **等对端关闭(FIN)**:`peek` 不消费任何字节。
+///
+/// 判据:
+/// - `Ok(0)` ⇒ EOF(对端发了 FIN)⇒ 本 future 返回 ⇒ 断流;
+/// - `Ok(n>0)` ⇒ 有数据(HTTP 管线化的下一个请求 / 非法提前写)⇒ **永久挂起**:
+///   本请求内不再用这条路探测(数据必须留给下一轮 `read_request` 消费);
+/// - `Err(_)` ⇒ 连接已坏 ⇒ 同样算断流。
+async fn peer_fin(s: &tokio::net::TcpStream) {
+    let mut b = [0u8; 1];
+    loop {
+        match s.peek(&mut b).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// `select!` 分支用的"到点唤醒":`None` ⇒ 永不就绪(`select!` 的分支表达式
+/// 即使被 `if` 关掉也会被**构造**,所以不能用 `Option` 直接 await)。
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+// 结构性豁免(2026-11-03 clippy 收口):SSE 帧的**全部**上下文(写口/模式/会话 id/
+// 模型名/聚合账/role 首帧位/协议错位/待发项)都是逐帧必需;打包成 struct 只会在
+// 调用点重复同一组字段名(宏 `emit!` 的定义点还要再抖一遍)。
 #[allow(clippy::too_many_arguments)]
 async fn emit_items<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
@@ -1584,7 +1704,7 @@ fn tokenize_plan(req: &TokenizeRequest) -> Result<(String, bool, &'static str), 
 
 /// `POST /tokenize`:校验 → 旁路引擎 tokenize → 回兼容形状的 JSON。
 ///
-/// ⚠️ **延迟说明**:引擎 actor 单线程且“收件与泵不相交” ⇒ 本请求排在当前
+/// ⚠️ **延迟说明**:引擎 executor 单线程且“收件与泵不相交” ⇒ 本请求排在当前
 /// turn 之后(生成期间调用会等到本轮结束)。毫秒级 CPU 工,单源真理优先。
 pub(crate) async fn tokenize<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,

@@ -404,6 +404,15 @@ pub struct RuntimeCfg {
     /// ⇒ 取消该 turn 并回 `429 + Retry-After`。
     #[serde(default)]
     pub queue_wait_ms: usize,
+    /// **SSE 静默保活间隔(毫秒;0 = 关;缺省 1000)**。
+    ///
+    /// 流上这么久没写过任何字节 ⇒ 写一帧 **SSE 注释**(`: keepalive`)。作用不是
+    /// 防代理超时(附带),而是**探测客户端断流**:长 prefill(100k prompt 是分钟级)
+    /// 期间不产 token ⇒ 手写 HTTP 的 chunked 流没有任何写操作 ⇒ 对端 FIN 无从
+    /// 暴露 ⇒ 引擎把整段 prefill 白跑完。写失败 = 连接已死 ⇒ 立刻弃置该 turn。
+    /// SSE 规范要求解析器忽略 `:` 开头的注释行。
+    #[serde(default)]
+    pub keepalive_ms: usize,
     pub max_seq: usize,
     pub prefill_chunk: usize,
     /// **引擎跨会话合批上限**(B5.1;缺省 **1 = 逐字节现状**)。
@@ -1807,6 +1816,7 @@ impl Default for RuntimeCfg {
             default_max_new: 4096,
             max_new_cap: 8192,
             queue_wait_ms: 0,
+            keepalive_ms: 1000,
             max_seq: 4096,
             prefill_chunk: 512,
             max_batch: 1,

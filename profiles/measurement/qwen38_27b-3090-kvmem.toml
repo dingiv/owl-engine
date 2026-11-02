@@ -128,6 +128,7 @@ bind = "0.0.0.0:8137"
 quant = "w4a8"
 
 [runtime]
+keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # 池自动派生自 max_seq 与显存余量;超卖靠 [kvmem].pool_overcommit。
 # 见档头红线:**这个数不是可用上下文上限**。
 max_seq = 262144

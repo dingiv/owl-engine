@@ -306,6 +306,8 @@ pub struct AgentCfg {
     pub reasoning_effort: Option<String>,
     /// 排队超时毫秒(0 = 关)
     pub queue_wait_ms: usize,
+    /// SSE 静默保活间隔毫秒(0 = 关)—— 长 prefill 期间探断流
+    pub keepalive_ms: usize,
 }
 
 impl AgentCfg {
@@ -330,6 +332,7 @@ impl AgentCfg {
                 .clone()
                 .filter(|s| !s.trim().is_empty()),
             queue_wait_ms: cfg.runtime.queue_wait_ms,
+            keepalive_ms: cfg.runtime.keepalive_ms,
         }
     }
 }

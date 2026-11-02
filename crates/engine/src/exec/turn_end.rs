@@ -80,6 +80,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             | TurnEvent::Failed { turn: t, .. } => *t != turn,
             TurnEvent::Idle => true,
         });
+        // **中断在 prefill 中段 ⇒ 先把"已算完的边界"钉成快照**(2026-11-03)。
+        // 必须在 `take_active` **之前**:补拍要用活跃 turn 的 GDN 行与位置。
+        if self.turns.active_of(turn).is_some() {
+            if let Err(e) = self.capture_abort_snap(turn).await {
+                // 补拍失败不挡收摊(它只是"让已算完的前缀可复用"的加速面);
+                // 但必须响亮 —— 否则下一轮会静默变成全量重算。
+                owl_shared::log_warn!("snap", "中断补拍失败(turn {turn};下一轮可能全量重算): {e}");
+            }
+        }
         if let Some(act) = self.turns.take_active(turn) {
             // 客户端中断（断流/取消）：**已写入**的 KV 是真内容 ⇒ 发布链身份，
             // 否则下一个同前缀请求内容寻址命中 0 ⇒ 整段重算（见 `ledger_written`）
@@ -165,6 +174,31 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         {
             owl_shared::log_warn!("store", "Release(Abort) 失败(继续收尾): {e}");
         }
+    }
+
+    /// **中断点补一张边界快照**(2026-11-03):只在"prefill 中段被取消"时动手。
+    ///
+    /// 判据:
+    /// - `fed < prompt_len`(仍在 prefill;已 prefill 完的 turn 走正常路径的
+    ///   `last_boundary` 快照,不需要补);
+    /// - `fed` **页对齐**(快照键 = 边界块身份;不对齐就没有边界可挂);
+    /// - 前缀缓存与快照池都在场(否则快照没有消费者)。
+    async fn capture_abort_snap(&mut self, turn: u64) -> Result<()> {
+        let Some(act) = self.turns.active_of(turn) else {
+            return Ok(());
+        };
+        let (sid, fed, prompt_len) = (act.session_id, act.fed, act.prompt_ids.len());
+        let page = self.dev.pool.geom.page.max(1);
+        if fed == 0 || fed >= prompt_len || fed % page != 0 {
+            return Ok(());
+        }
+        if !self.boot.cfg.knobs.prefix_cache || self.dev.pool.snap_capacity() == 0 {
+            return Ok(());
+        }
+        let _ = self
+            .capture_snap_at_cursor(sid, owl_store::SnapDurability::Durable)
+            .await?;
+        Ok(())
     }
 
     /// **中断落账**(2026-11-03 前缀缓存命中修复):把**已确认的 prompt 前缀**

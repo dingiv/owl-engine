@@ -65,6 +65,10 @@ default_max_new = 4096
 max_new_cap = 32768
 # 排队超时(毫秒;0 = 关)
 queue_wait_ms = 0
+# **SSE 静默保活(毫秒;0 = 关)**:长 prefill 不产 token ⇒ 流上零写入 ⇒
+# 客户端断流要等到首 token 才暴露(引擎会把整段 prefill 白跑完)。保活帧 =
+# SSE 注释(`: keepalive`),写失败即弃置 turn。
+keepalive_ms = 1000
 # 上下文上限(token)
 max_seq = 32768
 # 预填块长 / 尾块合并阈值(剩余 ≤ chunk + tail_merge ⇒ 一口气吃完)
