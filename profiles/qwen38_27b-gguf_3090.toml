@@ -35,7 +35,7 @@ extends = [
 # 本机有两张 3090 Ti ⇒ 单卡 3090 档与 3090 对档(8136)各占一张(device 按"名字子串 + 空闲占比"
 # 自动挑;先起谁谁先占).要钉死物理卡用 UUID:
 #   --set parallel.device='["GPU-…"]'
-bind = "127.0.0.1:8137"
+bind = "0.0.0.0:8137"
 
 [model]
 # **视觉塔**:GGUF 主干不含 `model.visual.*`,必须指 mmproj。

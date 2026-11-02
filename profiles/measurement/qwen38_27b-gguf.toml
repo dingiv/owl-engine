@@ -19,7 +19,7 @@ extends = [
 ]
 
 [server]
-bind = "127.0.0.1:8137"
+bind = "0.0.0.0:8137"
 
 [runtime]
 max_seq = 32768

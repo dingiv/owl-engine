@@ -36,7 +36,7 @@ extends = [
 ]
 
 [server]
-bind = "127.0.0.1:8135"
+bind = "0.0.0.0:8135"
 
 [model]
 path = "../models/bytkim/Qwen3.8-27B-pi-AWQ-INT4"

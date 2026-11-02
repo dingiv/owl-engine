@@ -35,7 +35,7 @@ extends = [
 ]
 
 [server]
-bind = "127.0.0.1:8137"
+bind = "0.0.0.0:8137"
 
 [model]
 # **W4A8 主干**(2026-10-27 用户裁决默认):激活 per-token int8 × 权重 int4,
