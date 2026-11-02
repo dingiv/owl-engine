@@ -23,7 +23,12 @@ use cudarc::driver::{CudaContext, DevicePtr, LaunchConfig, PushKernelArg};
 const TOKENS: usize = 16;
 const HEADS: usize = 4;
 const HEAD_DIM: usize = 64;
-const HALF: usize = 32; // rotary_dim/2（partial：32..64 直通）
+/// **partial 旋转**:只转前 `2*HALF` 维,其余 `2*HALF..HEAD_DIM` 直通。
+/// 2026-11-02 修:原 `HALF=32` ⇒ `2*HALF == HEAD_DIM` ⇒ "partial 直通" 循环是
+/// **空区间**(clippy `reversed_empty_ranges` 拒绝,而且那几档等于没测到直通路)。
+/// 取 16(rotary_dim=32)⇒ 32..63 真的有直通维。
+const HALF: usize = 16;
+const ROTARY_DIM: usize = 2 * HALF;
 const MAX_POS: usize = 64;
 
 fn dev_index() -> usize {
@@ -38,7 +43,7 @@ fn tables(dtype_f16: bool) -> (Vec<f32>, Vec<f32>) {
     let mut s = vec![0f32; MAX_POS * HALF];
     for p in 0..MAX_POS {
         for i in 0..HALF {
-            let theta = 1.0f64 / 10000f64.powf(2.0 * i as f64 / HEAD_DIM as f64);
+            let theta = 1.0f64 / 10000f64.powf(2.0 * i as f64 / ROTARY_DIM as f64);
             let ang = p as f64 * theta;
             c[p * HALF + i] = ang.cos() as f32;
             s[p * HALF + i] = ang.sin() as f32;
@@ -81,8 +86,8 @@ fn host_rope(x: &[f32], c: &[f32], s: &[f32], pos: &[f32], inverse: bool) -> Vec
                 out[base + i] = if inverse { a * ci + b * si } else { a * ci - b * si };
                 out[base + i + HALF] = if inverse { b * ci - a * si } else { b * ci + a * si };
             }
-            // partial 直通
-            for d in 2 * HALF..HEAD_DIM {
+            // partial 直通(2*HALF..HEAD_DIM 必须非空 —— 见文件头 HALF 注)
+            for d in ROTARY_DIM..HEAD_DIM {
                 out[base + d] = x[base + d];
             }
         }
@@ -168,7 +173,7 @@ macro_rules! roundtrip_case {
                 for t in 0..TOKENS {
                     for hh in 0..HEADS {
                         let base = (t * HEADS + hh) * HEAD_DIM;
-                        for d in 2 * HALF..HEAD_DIM {
+                        for d in ROTARY_DIM..HEAD_DIM {
                             assert_eq!(
                                 half::f16::from_f32(got[base + d]).to_bits(),
                                 half::f16::from_f32(k[base + d]).to_bits(),

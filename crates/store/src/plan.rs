@@ -575,7 +575,7 @@ mod tests {
             TierPlan::default(),
             PlanPolicy { fixed_pool: true },
         )
-        .unwrap_err();
+        .expect_err("固定池不给池必须拒(StoreError::Budget)");
         assert!(matches!(err, StoreError::Budget(_)));
     }
 

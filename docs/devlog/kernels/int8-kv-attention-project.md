@@ -668,3 +668,131 @@ FI 的 int8 改动保留本地 patch 记录（`patches/`）和 `docs/devlog/kern
 **先把 pth 的完整 int8 KV 栈接进来，验证“int8 缓存 + 成熟 attention”在 owl
 形状上到底值多少；同时把 FI 的 int8 线路作为第二条读端，A1 共用缓存，
 A2 只在 A1 证明有速度空间时才打。**
+
+---
+
+## 0.3 2026-11-03 S1 all-warp / QK-only 复测(重要负结果与唯一活口)
+
+在 `fi-int8` 工作树的 `experiments/int8pv` 里把 S1 的 4 producer warp 改成
+**16 warp 全部参与 QK**(4 Q tile × 4 KV slice,每 warp 16 key),P 仍按 64-key
+tile 量化。3090 Ti,T=2048/ctx=65k:
+
+| 档 | 中位 ms | 说明 |
+|---|---:|---|
+| S1 原始 full int8 | 54.1 | 4 producer + 12 consumer |
+| all-warp full int8 | **43.1** | 16 warp 全 QK;correctness 不变(cos 0.999953) |
+| all-warp QK+softmax only(NO_PV) | **29.8** | P 量化也跳过 |
+| raw QK,无 softmax | 20.5 | 只 QK MMA + K load + scale |
+| raw QK,无 scale | 16.0 | 只 QK MMA + K load |
+| QK+softmax,**per-row/per-head scale** | **26.1** | 去掉 per-group scale 的 fma/load |
+| **FI f16 QK+softmax**(临时跳过 PV MMA) | **28.1** | 同形状、同卡 |
+| FI 双 half 全核 | **33.0** | 生产基线 |
+
+判决:
+
+1. **full int8 PV 仍死**:43.1ms,PV+P 量化 13.3ms,怎么调都过不了 33ms。
+2. **per-group scale 是 S1 的额外税**:改成每 token/head 一个 scale 后,
+   QK+softmax 29.8→26.1ms,已经略快于 FI 的 QK+softmax(28.1ms)。
+   我们的 P0 writer 本来就是 per-token/head,所以这才是真实设计,不是近似。
+3. **QK-only 是唯一活口**:26.1ms(QK+softmax)+ 约 5ms f16 PV ≈ **31ms**,
+   对 33ms 只有 ~6% 优势,落在噪声边缘;必须把 softmax 再压到 ~5ms,
+   或把 PV 压到 ~4ms,才有 ≥10% 的确定性。
+4. S1 的 16-warp/128-reg 结构占满 64K 寄存器 ⇒ 1 CTA/SM,占用率差;
+   这是它 QK 只有 ~40 TFLOPS 的原因。后续若继续,应走 **FI 的 4-warp
+   pipeline + int8 QK**,而不是继续堆 S1 的 warp 数。
+
+**下一步(未做)**:实现 `K int8(per-token/head) + Q int8(per-token/head) +
+f16 V/FP16-PV` 的 QK-only 核:
+- QK 用 `mma.m16n8k32.s8.s8.s32`,D 循环后每个 score 只乘一次 `q_scale*k_scale`;
+- P 保持 half/float,**不量化成 uint8**;
+- PV 用现有 f16 MMA,不做 int8 PV;
+- 先测核级 T=2048/65k,门槛 ≤30ms(相对 FI 33ms ≥10%),cos ≥0.9999。
+若过,再接 owl;若不过,INT8 KV 只保留质量/容量定位,速度主线停止。
+
+---
+
+## 0.4 2026-11-03 PV f16 微基准:S1 快修路线也关死
+
+在 `experiments/int8pv/pv_f16_bench.cu` 用 **naive WMMA** 跑同形状 PV
+(64x64 P × 64x256 V → 64x256 O,16 warps,grid=768,iters=1024):
+
+| PV 实现 | 时间 |
+|---|---:|
+| naive WMMA f16 PV(仅 MMA,smem 常驻) | **54.8 ms** |
+| S1 手写 int8 PV(含 P 量化/V load/scale) | 13.3 ms |
+| FI 手写 FP16-PV(从 skip-PV 探针差值估) | ~5 ms |
+
+结论:
+
+- **不能假设 S1 换个 f16 PV 就只要 5ms**。naive WMMA 比 S1 的 int8 PV 还慢 4×;
+  FI 的 5ms 是高度调优的 4-warp pipeline + FP16-PV,不是“换个 dtype”就有。
+- 即使 QK+softmax 做到 26.1ms,加一个现实的手写 f16 PV(9~13ms)仍是
+  **35~39ms > 33ms**。S1 这条线没有赢面。
+- 唯一还剩的路 = **把 int8 QK 塞进 FI 的 4-warp pipeline**,复用 FI 的
+  K/V load、softmax、FP16-PV 和 occupancy;这是大改,且 QK-only 的收益
+  目前只看到 2ms(26.1 vs 28.1),风险高。
+
+⇒ 建议:S1 实验线收口;若继续,只做 FI 端口,不再在 S1 上堆优化。
+
+---
+
+## 0.5 2026-11-03 4-warp FI-like 探针:**正面结果,路还活着**
+
+S1 的 16-warp 结构占满 64K 寄存器(1 CTA/SM)。改成 **4 warp / 128 thread**
+(FI 的 occupancy 形态)后,同形状 3090 Ti,T=2048/ctx=65k:
+
+| 4-warp 探针 | 时间 |
+|---|---:|
+| raw int8 QK(无 scale/softmax/PV) | **10.35 ms** |
+| int8 QK + softmax(无 scale,无 PV) | **11.65 ms** |
+| f16 PV(手写 ldmatrix + m16n8k16,f16 acc;P/V smem 常驻) | **11.36 ms** |
+| S1 16-warp QK+softmax(单 scale) | 26.1 ms |
+| FI f16 QK+softmax | 28.1 ms |
+
+关键结论:
+
+1. **4-warp 形态把 int8 QK+softmax 从 26.1ms 打到 11.65ms**(2.2×)。
+   之前的 16-warp 结果主要输在 occupancy,不是 int8 本身。
+2. QK+softmax 11.65 + f16 PV 11.36 ≈ **23ms**(MMA 级,未含 V global load)。
+   即使 V load/同步再吃 5~10ms,总时仍在 **28~33ms**,有真实赢面。
+3. 下一步 = 把 V load(优先 int8 + dequant 到 f16,或 f16 直读)接进
+   4-warp kernel,测完整 QK+softmax+PV:
+   - 门槛 ≤28ms(相对 FI 33ms ≥15%),cos ≥0.9999;
+   - 若 ≤25ms,直接进 owl 接线。
+4. 仍需补:per-token Q/K scale 的乘法(当前探针用 1.0)、Q 量化 prepass、
+   V 的 int8→f16 dequant/预打包布局。
+
+S1 16-warp 线正式收口;后续只在 4-warp/FI 形态上开发。
+
+---
+
+## 0.6 2026-11-03 完整 4-warp 探针:**K int8 + V f16 shadow = 28.3ms,首次反超**
+
+在 `experiments/int8pv/full_4w_vf16.cu` 把 4-warp QK+softmax 与 f16 PV 合成
+一个核(3090 Ti,T=2048/ctx=65k,Bc=32,128 threads):
+
+| 档 | 时间 |
+|---|---:|
+| QK+softmax only | 14.5 ms |
+| 完整 QK+softmax+V f16 load+PV | **28.3 ms** |
+| FI 双 half 全核 | 33.0 ms |
+
+⇒ **28.3ms 对 33.0ms = +14.2%,第一次真实反超。**
+smem = Q16 + K8 + V_f16 16 + P4 = 44KB,2 CTA/SM(8 warps);
+寄存器 169,无 spill。
+
+关键取舍:
+
+- **V 不能每 tile 从 int8 反量化**:同结构下 per-tile int8→f16 dequant 实测
+  **68ms**(O(T×ctx×D) 的逐元素转换,不是带宽问题)。
+- 必须用 **V f16 shadow**:int8 V 池在 prefill 前/写池时一次性转 f16
+  (O(ctx),不是 O(T×ctx));attention 只读 f16 V。
+- 因此本方案是 **K int8 + V int8 池 + V f16 shadow**:
+  - QK 吃 int8 张量核;
+  - PV 吃 f16 张量核,不付 P 量化税;
+  - attention 读带宽 = K 1B + V 2B = 1.5× f16,比 FI 的 2× f16 少 25%。
+- 探针尚未含:per-token Q/K scale、online softmax rescale、正确输出、
+  Q 量化 prepass、V shadow 转换成本。这些是下一步接线工作。
+
+**判决:速度线复活。** 下一步把 per-token scale + online softmax + 输出
+补齐,目标 ≤30ms(含 scale)且 cos ≥0.9999;然后接 owl 的 K int8/V shadow。

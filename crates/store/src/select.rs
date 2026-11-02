@@ -1658,7 +1658,8 @@ mod tests {
         // ① 排序等价
         let rank = |v: &[f32]| -> Vec<usize> {
             let mut idx: Vec<usize> = (0..v.len()).collect();
-            idx.sort_by(|a, b| v[*b].partial_cmp(&v[*a]).unwrap());
+            // `total_cmp`:全序(NaN 也不 panic),不必 `unwrap`(本 crate deny unwrap_used)
+            idx.sort_by(|a, b| v[*b].total_cmp(&v[*a]));
             idx
         };
         assert_eq!(rank(&soft), rank(&logit), "softmax 单调 ⇒ 两种口径的排序必须一致");
@@ -1742,8 +1743,10 @@ mod tests {
             ScoreTuning { scale: 0.0, mode: ScoreMode::CosineMax },
         )
         .expect("max");
-        assert!((mean[0] - 0.7071).abs() < 1e-3, "mean A = {}", mean[0]);
-        assert!((mean[1] - 0.7071).abs() < 1e-3, "mean B = {}", mean[1]);
+        // 两个正交单位向量的余弦均值 = 1/√2(用常量,别写近似字面量)
+        let frac_1_sqrt_2 = std::f64::consts::FRAC_1_SQRT_2 as f32;
+        assert!((mean[0] - frac_1_sqrt_2).abs() < 1e-3, "mean A = {}", mean[0]);
+        assert!((mean[1] - frac_1_sqrt_2).abs() < 1e-3, "mean B = {}", mean[1]);
         assert!((max[0] - 1.0).abs() < 1e-4, "max A = {}", max[0]);
         assert!((max[1] - 1.0).abs() < 1e-4, "max B = {}", max[1]);
         assert!(max[0] > mean[0] + 0.2 && max[1] > mean[1] + 0.2);
