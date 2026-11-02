@@ -12,13 +12,13 @@
 ## 一、定位(真机取证,不靠读码猜)
 
 `apps/server` 在流式写失败时发 `EngineReq::Abort` ⇒ `drop_turn` ⇒
-`RunningEngine::cancel_turn` ⇒ `abandon_active`(见 `apps/server/src/actor.rs:393`)。
+`RunningEngine::cancel_turn` ⇒ `abandon_active`(见 `apps/server/src/executor.rs:393`)。
 
 复现脚本(5850 tok 随机词池 prompt + `session` 键;`curl` 级断流即可):
 
 ```
 turn 1  受理 …prompt=5850 cached=0        ← 中断(建流后 3 个 chunk 断)
-[WARN]  [actor] 事件投递失败(请求方已断开 ⇒ 本 turn 弃置): channel closed
+[WARN]  [executor] 事件投递失败(请求方已断开 ⇒ 本 turn 弃置): channel closed
 turn 2  受理 …prompt=5865 cached=0        ← 同前缀 + 新增一句
 [kvmem] 复用面:matched=1 m_raw=1 …
 指标:   ttft=2395ms; prefill=2388ms/5833tok; cache=32/5865 (0.5%)

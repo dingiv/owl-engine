@@ -1,13 +1,13 @@
 //! **遥测单元**（每拍更新；HTTP 侧零等待读取）。
 //!
-//! 为什么需要它：actor 是单线程且"泵到 Idle 才收件" ⇒ `/debug/vram` 这类
-//! 走 actor 的查询在**忙时会被拖到整批跑完**才回（实测：3 个 turn 在跑时，
+//! 为什么需要它：executor 是单线程,泵循环期间不收件 ⇒ `/debug/vram` 这类
+//! 走 executor 的查询在**忙时会被拖到整批跑完**才回（实测：3 个 turn 在跑时，
 //! 200ms 后发的 vram 查询要等它们全结束）。队列/活跃/批步这些**每拍都在变**
 //! 的事实必须在泵循环里顺手抄一份到共享单元，HTTP 读它即可（O(1)，不阻塞）。
 //!
 //! 纪律：
 //! - 单元里只放**小尺寸快照**（无 Vec 增长；queued 截断 16 条）；
-//! - 重活（块账房/三层报告）仍走 actor 的 `/debug/vram`（那是空闲期诊断）；
+//! - 重活（块账房/三层报告）仍走 executor 的 `/debug/vram`（那是空闲期诊断）；
 //! - 容量快照（要遍历前缀树算 movable）**降频**（每 32 拍一次）。
 
 use std::sync::{Arc, Mutex};
@@ -41,7 +41,7 @@ pub struct CapacitySnapshot {
     pub n_eff: usize,
 }
 
-/// 共享单元（`Arc` 由 main 建、actor 写、HTTP 读）
+/// 共享单元（`Arc` 由 main 建、executor 写、HTTP 读）
 #[derive(Default)]
 pub struct Telemetry {
     cell: Mutex<QueueSnapshot>,

@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use owl_engine::{TurnEvent, TurnOpts, TurnSampler};
 use crate::config::AgentCfg;
 
-use crate::actor::{EngineReq, SinkEvent};
+use crate::executor::{EngineReq, SinkEvent};
 use crate::agent_trace::{AgentTrace, OutcomeFacts, ReqFacts, TurnLedger, UsageFacts};
 use crate::chat_tpl::{ChatTpl, RenderArgs};
 use crate::http;

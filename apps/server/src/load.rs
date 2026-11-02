@@ -1,7 +1,7 @@
 //! **`POST /debug/load` —— 内源灌流**（服务面并发能力的现场测量）。
 //!
 //! 一次调用 = 同时向引擎灌 N 个 turn，走**与真实请求同一条** `EngineReq::Chat`
-//! 通道（同一 actor / 同一调度 / 同一引擎），每 worker：
+//! 通道（同一 executor / 同一调度 / 同一引擎），每 worker：
 //! - **独立会话**（`session` 键带 nonce ⇒ 会话闸不互相阻塞，且能进同一个批）；
 //! - **固定生成长度**（`ignore_eos`）+ 贪婪采样 ⇒ 读数不被"模型想不想停"干扰；
 //! - **随机前缀**（默认开）⇒ 打掉前缀缓存，测的是真并发算力而不是缓存命中；
@@ -9,7 +9,7 @@
 //!
 //! 为什么不去"对自己发 HTTP"：灌流请求自己也要占 `server.max_concurrency`
 //! 的 permit（N 会被压到 `max_concurrency-1`，还可能自锁）。本驱动直接进
-//! actor 通道，量的是同一段引擎路径，且**不占** permit —— 但 `concurrency`
+//! executor 通道，量的是同一段引擎路径，且**不占** permit —— 但 `concurrency`
 //! 仍按 `max_concurrency` 校验（它就是服务面的并发上限，超了如实拒）。
 //!
 //! **判据**（输出里全给）：
@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use owl_engine::{TurnEvent, TurnOpts, TurnSampler};
 use crate::config::AgentCfg;
 
-use crate::actor::{BatchStatsSnapshot, EngineReq, SinkEvent};
+use crate::executor::{BatchStatsSnapshot, EngineReq, SinkEvent};
 use crate::chat_tpl::{ChatTpl, RenderArgs};
 use crate::http;
 
@@ -374,7 +374,7 @@ pub(crate) async fn load<W: AsyncWrite + Unpin>(
         Ok(s) => s,
         Err(e) => return http::respond_json(w, 503, &json!({"error": e})).await,
     };
-    // 同时起 N 个 worker（submit 全部先进 actor 通道；actor 在泵前一次排空）
+    // 同时起 N 个 worker（submit 全部先进 executor 通道；executor 在泵前一次排空）
     let mut handles = Vec::with_capacity(spec.concurrency);
     if spec.pair {
         assert!(spec.concurrency == 2, "pair 模式要求 concurrency = 2");

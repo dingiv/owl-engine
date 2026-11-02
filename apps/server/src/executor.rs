@@ -1,6 +1,6 @@
-//! engine actor(§A3 同步隔离):`RunningEngine` 单所有权独占设备,
+//! engine executor(§A3 同步隔离):`RunningEngine` 单所有权独占设备,
 //! 外界经 mpsc 提交、经每请求 sink 收事件流。设备侧的一切异步都在
-//! actor 内闭合,HTTP 层零设备句柄。
+//! executor 内闭合,HTTP 层零设备句柄。
 //!
 //! 调度纪律(取消安全):**收件与泵不相交** —— pump 的 await 点半途
 //! 取消会把 GDN 递推状态留在半推进态(设备侧已推进、host 账未记),
@@ -19,7 +19,7 @@ use owl_engine::TurnEvent;
 use owl_iface::contract::DeviceClient;
 use tokio::sync::mpsc;
 
-/// 引擎请求(HTTP 层 → actor)
+/// 引擎请求(HTTP 层 → executor)
 pub enum EngineReq {
     Chat {
         /// None = 临时会话(每请求独立);Some = 连续会话(增量 prefill)
@@ -132,14 +132,14 @@ async fn deliver(sink: &mpsc::Sender<SinkEvent>, ev: SinkEvent) -> bool {
         Ok(()) => true,
         Err(e) => {
             if !WARNED.swap(true, Ordering::Relaxed) {
-                owl_shared::log_warn!("actor", "事件投递失败(请求方已断开 ⇒ 本 turn 弃置): {e}");
+                owl_shared::log_warn!("executor", "事件投递失败(请求方已断开 ⇒ 本 turn 弃置): {e}");
             }
             false
         }
     }
 }
 
-/// actor → 请求方事件(首笔必为 Accepted/Rejected,其后 Turn 流)
+/// executor → 请求方事件(首笔必为 Accepted/Rejected,其后 Turn 流)
 #[derive(Clone, Debug)]
 pub enum SinkEvent {
     Accepted {
@@ -160,14 +160,17 @@ pub enum SinkEvent {
     Turn(TurnEvent),
 }
 
-/// actor 主循环(独占线程内持 `&mut RunningEngine`;随 channel 关闭退出)
-pub async fn run_actor<D: DeviceClient>(
+/// engine executor 主循环(独占线程内持 `&mut RunningEngine`;随停服信号/通道关闭退出)
+pub async fn run_executor<D: DeviceClient>(
     running: &mut RunningEngine<D>,
     mut rx: mpsc::Receiver<EngineReq>,
     perf_dump: Option<std::path::PathBuf>,
-    shutdown: crate::shutdown::Shutdown,
     telemetry: std::sync::Arc<crate::telemetry::Telemetry>,
-) {
+    // 停服信号(`watch`)。**必须**是它、不能只靠 `rx` 关闭:每个连接任务都持有
+    // 一个 `EngineReq` 发送端克隆 ⇒ 长流请求在场时 `rx` 永远不会 None。
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> crate::shutdown::ExitReason {
+    use crate::shutdown::ExitReason;
     // turn_id → 事件回流(sink;Completed/Failed 后摘除)
     let mut sinks: HashMap<u64, mpsc::Sender<SinkEvent>> = HashMap::new();
     // 已发过缓存校正帧的 turn(AGT-12;终态摘除)
@@ -176,21 +179,26 @@ pub async fn run_actor<D: DeviceClient>(
     // 发出 —— 否则短 turn(单 pump 内跑完)会因 sink 已摘除而丢帧(实测踩过:
     // 196 行 prefill 后紧跟 turn end,校正帧无处可投)
     let mut pending_cache: HashMap<u64, usize> = HashMap::new();
-    // AGT-10:客户端断开且尚未弃置(下一个 pump 边界前处理)
-    let mut dropped = false;
+    // AGT-10:**哪一 turn** 的接收方（HTTP 任务）走了 —— 在下一个 pump 边界前弃置。
+    // 语义 = **客户端取消**（不是引擎错误）⇒ 走 `drop_turn`（会发布已写入前缀 +
+    // 中断补拍快照），不走 `abandon_turn`（那档声明"账面不可信、不发布"）。
+    let mut dropped: Option<u64> = None;
     // 遥测：容量快照降频（`movable_bytes` 要遍历前缀树，不能每拍）
     let mut last_capacity: Option<crate::telemetry::CapacitySnapshot> = None;
     let mut tele_tick: u64 = 0;
     loop {
-        // ① 阻塞等首个请求(通道关 = 引擎退役)
-        let Some(req) = rx.recv().await else { return };
+        // ① 阻塞等首个请求(通道关 = 引擎退役 ⇒ 正常收摊,退出码 0)
+        let Some(req) = rx.recv().await else {
+            owl_shared::log_info!("executor", "请求通道关闭 ⇒ executor 泵循环收摊");
+            return ExitReason::Normal;
+        };
         handle_req(running, &mut sinks, req).await;
         // ② 排空积压(pump 前收完,保证收发不相交)
         while let Ok(req) = rx.try_recv() {
             handle_req(running, &mut sinks, req).await;
         }
         // ③ 泵到排空,事件按 turn 路由
-        let actor_prof = std::env::var_os("OWL_ACTOR_PROF").is_some();
+        let exec_prof = std::env::var_os("OWL_EXECUTOR_PROF").is_some();
         loop {
             // **泵间收件**(2026-10-20 真机定谳):旧实现泵到 Idle 才回 outer 收件 ⇒
             // 错峰到达的请求**永远等前一个 turn 跑完**才进引擎(实测:150ms 后到的 B
@@ -200,10 +208,44 @@ pub async fn run_actor<D: DeviceClient>(
             while let Ok(req) = rx.try_recv() {
                 handle_req(running, &mut sinks, req).await;
             }
-            // AGT-10:断流 turn 在下一步之前弃置(≤1 采样步延迟)
-            if dropped {
-                dropped = false;
-                abandon_turn(running, &mut sinks, "客户端断流").await;
+            // ① **停服检查（步边界）**:两条源都要看 ——
+            //    · `stop` 信号(SIGTERM;每连接都可能持有 `rx` 发送端 ⇒ 单看 `rx` 不够);
+            //    · `rx` 已关(所有发送端都没了)。
+            //  命中即**不再推进任何一拍**(长 prefill 也是"下一拍之前停",不是"跑完再说")。
+            if *stop.borrow() || rx.is_closed() {
+                owl_shared::log_info!(
+                    "executor",
+                    "停服信号({})⇒ 本拍不推进,收摊",
+                    if *stop.borrow() {
+                        "watch/SIGTERM"
+                    } else {
+                        "请求通道关闭"
+                    }
+                );
+                return ExitReason::Normal;
+            }
+            // ② **"+还有人要吗"状态检查（步边界;2026-11-03 用户裁决）**:
+            //
+            // 旧实现只在 `dispatch` **投递失败**时才察觉接收方走了 —— 那是**副作用**,
+            // 不是判据:prefill 期的 `Prefill` 事件每 chunk 都投递成功(sink 只是写不
+            // 出去,不在关闭态),于是引擎盲目往后推。现在每拍之前**显式查一次**
+            // `Sender::is_closed()`(relaxed 原子读,零成本):
+            // - HTTP 任务写失败/排队超时/连接被 tokio 取消 ⇒ 它 `close()` 了 sink
+            // ⇒ 这里立刻看见 ⇒ **这一拍就不推了**;
+            // - 覆盖 prefill chunk 与 decode(含 spec 轮 / CUDA 图重放)两种相位:
+            //   判据与相位无关,一律在**图/chunk 发射之前**。
+            if let Some(t) = running.active_turn_id() {
+                if sinks.get(&t).is_some_and(|s| s.is_closed()) {
+                    owl_shared::log_info!(
+                        "executor",
+                        "turn {t} 的接收方已关闭 ⇒ 下一拍之前弃置(客户端断流/取消)"
+                    );
+                    dropped = Some(t);
+                }
+            }
+            // ③ 断流 turn 在下一步之前弃置(≤0 拍延迟)
+            if let Some(t) = dropped.take() {
+                drop_turn(running, &mut sinks, 0, Some(t)).await;
             }
             // AGT-12:turn 已定相 ⇒ 补发真值 `cached_tokens`(块级前缀缓存
             // 命中只有此刻知道;无法掩盖——偏小的数字会误导 pi 的 cacheRead)
@@ -280,21 +322,21 @@ pub async fn run_actor<D: DeviceClient>(
                             // 兜底:正常已被上面取走(留下的 = 号不匹配的脏项)
                             if pending_cache.remove(&turn).is_some() {
                                 owl_shared::log_debug!(
-                                    "actor",
+                                    "executor",
                                     "turn {turn} 终态时仍有待发校正帧(已丢弃)"
                                 );
                             }
                         }
                     }
                     let t_d0 = std::time::Instant::now();
-                    if !dispatch(&mut sinks, ev).await {
-                        // 投递失败 = 客户端已走 ⇒ 本 turn 弃置
-                        dropped = true;
+                    if let Some(t) = dispatch(&mut sinks, ev).await {
+                        // 投递失败 = 客户端已走(接收方没了)⇒ 本 turn 按**客户端取消**弃置
+                        dropped = Some(t);
                     }
-                    if actor_prof {
+                    if exec_prof {
                         let d_disp = t_d0.elapsed();
                         owl_shared::log_info!(
-                            "actor-prof",
+                            "executor-prof",
                             "pump={d_pump:?} disp={d_disp:?} rest={:?}",
                             t_l0.elapsed()
                         );
@@ -311,7 +353,7 @@ pub async fn run_actor<D: DeviceClient>(
                 Err(e) => {
                     // 引擎错误(架子):烧毁 active turn(E5 性能会战:
                     // 弃置滞留 = GDN 格泄漏 → 2 格两轮耗尽)+ 广播
-                    owl_shared::log_warn!("actor", "pump 错误: {e}");
+                    owl_shared::log_warn!("executor", "pump 错误: {e}");
                     abandon_turn(running, &mut sinks, &format!("engine: {e}")).await;
                     // **缺口 3(2026-10-19)**:硬预算/池耗尽 ⇒ **不再直通致命**:
                     // 丢本 turn(客户端拿到 500/503,如实) + **立即收缩**
@@ -323,20 +365,21 @@ pub async fn run_actor<D: DeviceClient>(
                             // **如实报数**:还缓存 0 块也照说(mid-turn 池空是常态 ——
                             // 失败那一刻的块都在使用中,不在池里)
                             Ok((freed, k, hkv, hsnap)) => owl_shared::log_warn!(
-                                "actor",
+                                "executor",
                                 "显存压力:已收缩(还缓存 {freed} 块 + 目标腾 {k} KV 槽 + {hkv} KV 宿主块 + {hsnap} 快照)⇒ 引擎继续(丢本 turn)"
                             ),
                             Err(pe) => owl_shared::log_warn!(
-                                "actor",
+                                "executor",
                                 "收缩失败(继续跑,下次再试): {pe}"
                             ),
                         }
                         continue;
                     }
                     if e.is_fatal() {
-                        owl_shared::log_warn!("actor", "致命引擎错误({e})⇒ 优雅关停");
-                        shutdown.graceful(&format!("引擎不可恢复错误:{e}"));
+                        owl_shared::log_warn!("executor", "致命引擎错误({e})⇒ 交回 main 收摊");
+                        return ExitReason::Fatal(e.to_string());
                     }
+                    // 非致命:丢本 turn(上面已收缩显存),回外层等新请求(旧行为)
                     break;
                 }
             }
@@ -368,7 +411,7 @@ async fn abandon_turn<D: DeviceClient>(
         TurnEvent::Failed { turn, .. } => *turn,
         _ => 0,
     };
-    owl_shared::log_info!("actor", "弃置 turn {failed_turn}({why})");
+    owl_shared::log_info!("executor", "弃置 turn {failed_turn}({why})");
     match sinks.remove(&failed_turn) {
         Some(sink) => {
             deliver(&sink, SinkEvent::Turn(failed)).await;
@@ -395,7 +438,7 @@ async fn drop_turn<D: DeviceClient>(
     };
     let Some(ev) = ev else {
         owl_shared::log_debug!(
-            "actor",
+            "executor",
             "abort 未命中(session {session:#x} turn {turn:?}) —— 可能刚自然终了"
         );
         return;
@@ -406,19 +449,19 @@ async fn drop_turn<D: DeviceClient>(
         Some(sink) => {
             if !deliver(&sink, SinkEvent::Turn(ev)).await {
                 owl_shared::log_debug!(
-                    "actor",
+                    "executor",
                     "abort 终态投递失败(turn {tid};请求方已断开 —— 终态本来就没人收)"
                 );
             }
         }
-        None => owl_shared::log_debug!("actor", "abort 终态无人接收(turn {tid})"),
+        None => owl_shared::log_debug!("executor", "abort 终态无人接收(turn {tid})"),
     }
 }
 
 /// 单条请求处置:Abort = 弃置活跃 turn;Tokenize = 旁路(不落 turn);
 /// Chat = 交 [`accept`]。
 ///
-/// ⚠️ **Tokenize 在 actor 线程内跑**(与采样同线程 ⇒ 排在当前 turn 之后):
+/// ⚠️ **Tokenize 在 executor 线程内跑**(与采样同线程 ⇒ 排在当前 turn 之后):
 /// 这是“tokenizer 单一真源”(归属 `RunningEngine`)的代价;工量 = 毫秒级 CPU。
 /// 若将来要“生成期间也能查”,把 tokenizer 克隆进 HTTP 层的前提是引擎侧
 /// 先导出 `chat_wrap + try_encode` 的组合面(否则包装律两份)—— 另案。
@@ -433,14 +476,14 @@ async fn handle_req<D: DeviceClient>(
             // 回执 = "该 turn 已从引擎账上消失"(会话闸据此释放;发送失败 =
             // 请求方已走,无损失,但留痕)
             if ack.send(()).is_err() {
-                owl_shared::log_debug!("actor", "abort 回执投递失败(请求方已断开)");
+                owl_shared::log_debug!("executor", "abort 回执投递失败(请求方已断开)");
             }
         }
         EngineReq::Tokenize { text, chat_wrap, reply } => {
             let out = running.tokenize(&text, chat_wrap);
             if reply.send(out).is_err() {
                 // 请求方已断开(不许静默:这是可失败返回值)
-                owl_shared::log_debug!("actor", "tokenize 应答投递失败(请求方已断开)");
+                owl_shared::log_debug!("executor", "tokenize 应答投递失败(请求方已断开)");
             }
         }
         EngineReq::BatchStats { reply } => {
@@ -452,7 +495,7 @@ async fn handle_req<D: DeviceClient>(
                 active: running.active_len(),
             };
             if reply.send(snap).is_err() {
-                owl_shared::log_debug!("actor", "batch stats 应答投递失败(请求方已断开)");
+                owl_shared::log_debug!("executor", "batch stats 应答投递失败(请求方已断开)");
             }
         }
         EngineReq::VramReport { reply } => {
@@ -492,7 +535,7 @@ async fn handle_req<D: DeviceClient>(
                 },
             };
             if reply.send(snap).is_err() {
-                owl_shared::log_debug!("actor", "vram 账应答投递失败(请求方已断开)");
+                owl_shared::log_debug!("executor", "vram 账应答投递失败(请求方已断开)");
             }
         }
         req => accept(running, sinks, req).await,
@@ -507,7 +550,7 @@ async fn accept<D: DeviceClient>(
 ) {
     let EngineReq::Chat { session, prompt, max_new, opts, sink } = req else {
         // Abort 由调用方(accept）处理;到达此处 = 编程错误
-        owl_shared::log_warn!("actor", "accept 收到非 Chat 请求(内部错误)");
+        owl_shared::log_warn!("executor", "accept 收到非 Chat 请求(内部错误)");
         return;
     };
     match running.submit_session_opts(session, prompt, max_new, opts) {
@@ -538,24 +581,27 @@ async fn accept<D: DeviceClient>(
 
 /// 事件路由:按 turn id 转发;终态事件后摘 sink。返回 false = 投递失败
 /// (请求方已断开 ⇒ 调用方标记弃置,AGT-10)
+/// 返回 `Some(turn)` = **该 turn 的接收方已不在**(投递失败 ⇒ 客户端取消)。
 async fn dispatch(
     sinks: &mut HashMap<u64, mpsc::Sender<SinkEvent>>,
     ev: TurnEvent,
-) -> bool {
+) -> Option<u64> {
     let (tid, done) = match &ev {
         TurnEvent::Prefill { turn, .. }
         | TurnEvent::Token { turn, .. }
         | TurnEvent::Completed { turn, .. }
         | TurnEvent::Failed { turn, .. } => (*turn, matches!(ev, TurnEvent::Completed { .. } | TurnEvent::Failed { .. })),
-        TurnEvent::Idle => return true,
+        TurnEvent::Idle => return None,
     };
-    let mut ok = true;
+    let mut gone = None;
     if let Some(sink) = sinks.get(&tid) {
-        ok = deliver(sink, SinkEvent::Turn(ev)).await;
+        if !deliver(sink, SinkEvent::Turn(ev)).await {
+            gone = Some(tid);
+        }
     }
     if done {
         // 摘除即 drop(mpsc Sender 无显式 close;对端 recv 尽后自然断流)
         sinks.remove(&tid);
     }
-    ok
+    gone
 }

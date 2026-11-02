@@ -247,7 +247,7 @@ pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
 /// 持平 = 正常。`system` 桶 = 尚未接线 owner 的存量调用点(随 N4/N5 排空)。
 // 结构性豁免(2026-11-02 clippy 清理):排序键是复合比较(多字段/方向混合),抽 key 会丢掉可读性
 #[allow(clippy::unnecessary_sort_by)]
-pub fn vram_json(snap: &crate::actor::VramSnapshot) -> Value {
+pub fn vram_json(snap: &crate::executor::VramSnapshot) -> Value {
     let r = &snap.report;
     let owners: Vec<Value> = r
         .tiers

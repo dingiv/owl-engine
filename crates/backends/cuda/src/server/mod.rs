@@ -684,8 +684,13 @@ impl GpuServer {
 
         // 派发线程:host 回调只投递,真正 finish(含 free_host 等 CUDA 操作)在这跑
         let (dtx, drx) = mpsc::channel::<Finish>();
+        // 短名(comm ≤15 字符):与设备 server 线程 `owl-dev{tag}-srv` 成对
+        let disp_tag = match &self.selector {
+            DeviceSelector::Uuid(u) => format!("u{:02x}", u[0]),
+            DeviceSelector::Ordinal(o) => format!("o{o}"),
+        };
         std::thread::Builder::new()
-            .name(format!("owl-gpu-{}-dispatch", self.selector_debug()))
+            .name(format!("owl-dev-{disp_tag}-dsp"))
             .spawn(move || {
                 for finish in drx {
                     finish();
@@ -762,13 +767,6 @@ impl GpuServer {
             }
         }
         Ok(())
-    }
-
-    fn selector_debug(&self) -> String {
-        match &self.selector {
-            DeviceSelector::Uuid(u) => format!("uuid-{:02x}{:02x}…", u[0], u[1]),
-            DeviceSelector::Ordinal(o) => format!("ordinal-{o}"),
-        }
     }
 
     /// Closing 收尾:设备栅栏(三条流全部落定,在飞搬运/kernel 不悬空)

@@ -187,6 +187,16 @@ impl GpuClient {
         let (tx, rx) = mpsc::channel::<Command>();
         let (boot_tx, boot_rx) = mpsc::channel::<Result<(), String>>();
         let vram = std::sync::Arc::new(VramAccount::new());
+        // **线程名必须显式**(2026-11-03):不定名 ⇒ 新线程 `comm` 继承创建者
+        // (engine-executor)⇒ `/proc/<pid>/task/*/comm` 里一堆同名线程,排障时
+        // 分不清"设备面"与"引擎面"。命名 = `owl-gpu-<sel>-server`(与派发线程
+        // `owl-gpu-<sel>-dispatch` 成对)。注意:必须在 `selector` 被 move 之前算。
+        // 短名(≤15 字符 —— `comm` 会被内核截断):`owl-dev{tag}-srv` / 派发线程
+        // `owl-dev{tag}-dsp`,一眼分得开。
+        let thread_name = match &selector {
+            crate::state::DeviceSelector::Uuid(u) => format!("owl-dev-u{:02x}-srv", u[0]),
+            crate::state::DeviceSelector::Ordinal(o) => format!("owl-dev-o{o}-srv"),
+        };
         let server = GpuServer::with_diag_sink_vram(
             rx,
             selector,
@@ -197,6 +207,7 @@ impl GpuClient {
             vram.clone(),
         );
         std::thread::Builder::new()
+            .name(thread_name)
             .spawn(move || {
                 // server 收摊 → 账房/图注册表随 ctx 析构,派发线程排空后退出。
                 //
