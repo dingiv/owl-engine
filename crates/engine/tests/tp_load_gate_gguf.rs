@@ -1,13 +1,16 @@
-//! **GGUF + TP 分片读的字节门**(W-1;2026-10-19;零 GPU)。
+//! **GGUF + TP 分片读的字节门**(W-1;2026-10-19;零 GPU;2026-11-03 扩原子跨头)。
 //!
-//! 判据(设计 §15 的不变式):
+//! 判据(设计 §15 的不变式;2026-11-03 扩写):
 //!
-//! > 每一 rank 装载后的张量 == 全量逆变换(grouped 序)张量的**连续块**。
+//! > 每一 rank 装载后的张量 == 全量逆变换(grouped 序)张量在**该 rank 头序**
+//! > 下的窗口。`ssm_out` 的 `atom | hv` 档 = 连续块(grouped 窗口);
+//! > `atom > hv`(K/I 超块)= 原子序窗口(列序由 `transform::rank_head_order` 给)。
 //!
 //! 做法(全部 CPU;`GgufSource` 自担分片,不需要 face):
 //! ① 全量源读字节 → `dequant_all` → **逆变换**(行置换 / 列置换)→ grouped 全量 G;
 //! ② 分片源(rank r)读字节 → `dequant_all` → 本 rank 的 S;
-//! ③ 逐元素 `S[t][c] == G[grow(t)][col_first + c]`(逐键按**手算**的窗口表)。
+//! ③ 逐元素 `S[t][c] == G[grow(t)][expected_col]`,其中 `expected_col` 对
+//!    `ssm_out` 按头序换算(其余键 = `col_first + c`)。
 //!
 //! 为什么不用"分片 vs 全量字节对拍"(其它族的门那样):GGUF 的分片是
 //! **行置换 × 块对齐列切**的组合 ⇒ 分片字节在文件里**不是**一段连续区间,
@@ -84,18 +87,21 @@ fn grouped_full(src: &GgufSource, key: &str) -> (usize, usize, Vec<f32>) {
 }
 
 /// **逐键逐位门(全键面)**:blk.0(GDN)+ blk.3(full-attn)两层的**每一个**
-/// 分片键 —— 分片读出的值 == grouped 全量对应窗口(行窗口 × 列起点)。
+/// 分片键 —— 分片读出的值 == grouped 全量对应窗口(行窗口 × 列序)。
 ///
 /// 期望窗口由 `shard::geom_of` 给出(几何本身另有手算钉值门);本门查的是
 /// **读实现**:行置换、块对齐列切、逐头列聚合、1-D 元素窗口、原生行窗口。
-#[test]
-fn gguf_shard_reads_equal_grouped_windows_all_keys() {
-    if !resource_ok("gguf:27b") {
-        owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
+///
+/// 列序按 **`ssm_out` 的头序**换算(`atom > hv` 的原子序也覆盖):
+/// `expected_col = (order[c/hv] - h0)·hv + c%hv`。`atom | hv` 时 order 是
+/// grouped 连续窗口 ⇒ 退化为 `c`,即旧的“连续块”判据。
+fn shard_reads_equal_grouped_windows(res_key: &str) {
+    use owl_models::formats::gguf::shard::{geom_of, role_of, Role, ShardSel, Shape, TensorFacts};
+    use owl_models::formats::gguf::transform::rank_head_order;
+    let Some(path) = resource(res_key).map(std::path::PathBuf::from) else {
+        owl_shared::testkit::report::skip(&format!("资源清单缺 \"{res_key}\""));
         return;
-    }
-    use owl_models::formats::gguf::shard::{geom_of, ShardSel, Shape, TensorFacts};
-    let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));
+    };
     let full = GgufSource::open(&path).expect("全量源");
     let d = *full.dims();
     // 两层足够覆盖全部角色:blk.0 = GDN(含 conv/a/dt/alpha/beta/z/qkv/out),
@@ -121,6 +127,10 @@ fn gguf_shard_reads_equal_grouped_windows_all_keys() {
         } else {
             grouped_full(&full, key)
         };
+        // `ssm_out` 的列序不再是 grouped 连续序(atom > hv 档)—— 头序由
+        // 与本 rank 几何同一张表(`rank_head_order`)给
+        let inhead = matches!(role_of(key, &d, false), Ok(Role::InHead));
+        let atom = t.ty.block().0;
         for rank in 0..2usize {
             let sel = ShardSel { id: rank, world: 2, head_split: false };
             let Some(g) = geom_of(key, &d, &f, Some(sel)).expect("geom") else {
@@ -134,6 +144,28 @@ fn gguf_shard_reads_equal_grouped_windows_all_keys() {
                 let bytes = read_shard(&shard, key);
                 dequant_all(t.ty, &bytes, g.rows(), g.row_elems()).expect("dequant(shard)")
             };
+            // 列序表(仅 ssm_out;其余键 = col_first + c,即旧判据)
+            let head_order = inhead
+                .then(|| {
+                    rank_head_order(d.nk, d.nv, d.hv, atom, 2, rank).expect("rank_head_order")
+                });
+            let (h0, hn) = (rank * (d.nv / 2), d.nv / 2);
+            let expect_col = |c: usize| -> usize {
+                match &head_order {
+                    // 参照物是**全量 grouped** 张量 ⇒ 用绝对头号(不减 h0);
+                    // 全局表在**局部激活**上是另一个口径,不在此处复用
+                    Some(order) => order[c / d.hv] * d.hv + c % d.hv,
+                    None => g.col_first + c,
+                }
+            };
+            if let Some(order) = &head_order {
+                assert_eq!(order.len(), hn, "[{key}] rank{rank} 头序长度");
+                assert!(
+                    order.iter().all(|&h| h >= h0 && h < h0 + hn),
+                    "[{key}] rank{rank} 头序越出窗口 [{h0}, {})",
+                    h0 + hn
+                );
+            }
             match &g.shape {
                 Shape::Elem { first, len } => {
                     assert_eq!(got.len(), *len, "[{key}] rank{rank} 1-D 元素数");
@@ -154,11 +186,12 @@ fn gguf_shard_reads_equal_grouped_windows_all_keys() {
                         for r in *g0..*g0 + *n {
                             for c in 0..rw {
                                 let (a, b) =
-                                    (got[ti * rw + c], grouped[r * inner_f + g.col_first + c]);
+                                    (got[ti * rw + c], grouped[r * inner_f + expect_col(c)]);
                                 assert_eq!(
                                     a.to_bits(),
                                     b.to_bits(),
-                                    "[{key}] rank{rank} 行 {ti}(grouped {r}) 列 {c}:{a} ≠ {b}"
+                                    "[{key}] rank{rank} 行 {ti}(grouped {r}) 列 {c}(expected {})",
+                                    expect_col(c)
                                 );
                             }
                             ti += 1;
@@ -171,9 +204,21 @@ fn gguf_shard_reads_equal_grouped_windows_all_keys() {
         }
     }
     eprintln!(
-        "[gguf-tp] blk.0+blk.3 全键面:{} 个 (键, rank) 组合逐位对拍通过;{} 个 (键, rank) 为 Replicate",
+        "[gguf-tp] {res_key}:blk.0+blk.3 全键面:{} 个 (键, rank) 组合逐位对拍通过;{} 个 (键, rank) 为 Replicate",
         n_split, n_skip
     );
+}
+
+/// **Q8_0 档(32 块量子:atom | hv)**:既有基线(回归门,行为必须逐位不变)
+#[test]
+fn gguf_shard_reads_equal_grouped_windows_all_keys() {
+    shard_reads_equal_grouped_windows("gguf:27b");
+}
+
+/// **K/I 超块档(atom 256 > hv 128)**:原子序列几何 + per-rank 表
+#[test]
+fn gguf_iq4xs_shard_reads_equal_atom_tiled_windows() {
+    shard_reads_equal_grouped_windows("gguf:27b-iq4xs");
 }
 
 /// **27B 分片装载账**(零 GPU):层声明的每个 want 的形状 × = 源交付的
@@ -182,13 +227,11 @@ fn gguf_shard_reads_equal_grouped_windows_all_keys() {
 /// 这条门替代了通用分片 pass 的"形状贯通"硬门(`owns_shard` 的源跳过它):
 /// 任一角色把声明维放大错、或几何的行宽/列窗口算错,都会在这里以
 /// "want n vs elem_len m"当场红。
-#[test]
-fn sharded_plan_shapes_match_source_elem_len() {
-    if !resource_ok("gguf:27b") {
-        owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
+fn sharded_plan_shapes_match_source(res_key: &str) {
+    let Some(path) = resource(res_key).map(std::path::PathBuf::from) else {
+        owl_shared::testkit::report::skip(&format!("资源清单缺 \"{res_key}\""));
         return;
-    }
-    let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));
+    };
     let full = GgufSource::open(&path).expect("全量源");
     let (spec0, _rep) = spec_from_gguf(full.gguf()).expect("spec");
     for rank in 0..2 {
@@ -226,7 +269,7 @@ fn sharded_plan_shapes_match_source_elem_len() {
         let unresolved = plan.take_unresolved();
         assert!(unresolved.is_empty(), "[rank{rank}] 计划表未解析:{unresolved:?}");
         eprintln!(
-            "[gguf-tp] rank{rank}:声明 {} 件(量化 {n_quant} 件)· 量化字节 {:.2} GiB",
+            "[gguf-tp] {res_key} rank{rank}:声明 {} 件(量化 {n_quant} 件)· 量化字节 {:.2} GiB",
             ops.wants().len(),
             bytes as f64 / (1u64 << 30) as f64
         );
@@ -234,10 +277,22 @@ fn sharded_plan_shapes_match_source_elem_len() {
         let file = std::fs::metadata(&path).expect("stat").len() as usize;
         assert!(
             bytes < file / 2 + (file / 5),
-            "[rank{rank}] 量化字节 {bytes} 超出 文件/2 + 20%({})",
+            "[{res_key}] rank{rank} 量化字节 {bytes} 超出 文件/2 + 20%({})",
             file / 2 + file / 5
         );
     }
+}
+
+/// **27B 分片装载账(Q8_0 ssm_out 档:无 per-rank 表)**
+#[test]
+fn sharded_plan_shapes_match_source_elem_len() {
+    sharded_plan_shapes_match_source("gguf:27b");
+}
+
+/// **27B 分片装载账(K/I 超块档:ssm_out 带 per-rank 表)**
+#[test]
+fn sharded_plan_shapes_match_source_iq4xs() {
+    sharded_plan_shapes_match_source("gguf:27b-iq4xs");
 }
 
 /// **GGUF 词表切装载账**(2026-10-28):`output.weight` 开 `head_split` 后
@@ -292,5 +347,33 @@ fn gguf_head_split_plan_and_source_match() {
         assert_eq!(head * 2, full_head, "[rank{rank}] output.weight 应为半表");
         let unresolved = plan.take_unresolved();
         assert!(unresolved.is_empty(), "[rank{rank}] 计划表未解析:{unresolved:?}");
+    }
+}
+
+/// **开箱几何门(逐键,零 dequant)**:27B 的三个 GGUF 档(Q4_K_M / UD-IQ4_XS /
+/// UD-IQ3_S)在两 rank 上都必须通过 `open_shard` 的逐键几何校验。
+///
+/// 覆盖点:Q8_0(atom 32)旧路、K/I 超块(atom 256:Q5_K/Q4_K/Q3_K/IQ4_XS)原子段路、
+/// 32 块 IQ4_NL(IQ3_S 的 `attn_q`)列切、以及原生 F32 小件。未移植的**内核**型不
+/// 影响几何(那是 `GgufPlan` 的活),所以本门对三个文件都应绿。
+#[test]
+fn open_shard_geometry_accepts_all_27b_quants() {
+    for res in ["gguf:27b", "gguf:27b-iq4xs", "gguf:27b-iq3s"] {
+        let Some(path) = resource(res).map(std::path::PathBuf::from) else {
+            owl_shared::testkit::report::skip(&format!("资源清单缺 \"{res}\""));
+            continue;
+        };
+        for rank in 0..2usize {
+            let sel = ShardSel { id: rank, world: 2, head_split: false };
+            let src = GgufSource::open_shard(&path, Some(sel))
+                .unwrap_or_else(|e| panic!("[{res}] rank{rank} 几何拒启:{e}"));
+            let bytes: usize = src
+                .gguf()
+                .tensors
+                .iter()
+                .map(|t| src.elem_len(&t.name).expect("elem_len").unwrap_or(0))
+                .sum();
+            eprintln!("[gguf-tp] {res} rank{rank}:{} 张量几何通过 · 交付 {:.2} GiB", src.gguf().tensors.len(), bytes as f64 / (1u64 << 30) as f64);
+        }
     }
 }

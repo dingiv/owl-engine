@@ -200,8 +200,11 @@ fn tp_logits_gguf_long() {
         return;
     };
     assert_ne!(oa, ob, "TP2 需要两张不同的卡");
-    if !resource_ok("gguf:27b") {
-        owl_shared::testkit::report::skip("资源清单缺 \"gguf:27b\"");
+    // 资源键可用 `OWL_GGUF_TP_RESOURCE` 覆盖(默认 = 27B Q4_K_M;
+    // 2026-11-03 K/I 超块档用 `gguf:27b-iq4xs`)
+    let res = std::env::var("OWL_GGUF_TP_RESOURCE").unwrap_or_else(|_| "gguf:27b".into());
+    if !resource_ok(&res) {
+        owl_shared::testkit::report::skip(&format!("资源清单缺 \"{res}\""));
         return;
     }
     let words: usize = std::env::var("OWL_GGUF_TP_WORDS").ok().and_then(|s| s.parse().ok()).unwrap_or(900);
@@ -214,17 +217,17 @@ fn tp_logits_gguf_long() {
             tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("rt")
-                .block_on(body(oa, ob, words, chunk, max_seq))
+                .block_on(body(oa, ob, words, chunk, max_seq, &res))
         })
         .expect("起测试线程")
         .join()
         .expect("门失败");
 }
 
-async fn body(oa: usize, ob: usize, words: usize, chunk: usize, max_seq: usize) {
-    let path = std::path::PathBuf::from(resource("gguf:27b").expect("列了就有"));
+async fn body(oa: usize, ob: usize, words: usize, chunk: usize, max_seq: usize, res: &str) {
+    let path = std::path::PathBuf::from(resource(res).expect("列了就有"));
     let prompt = long_prompt(words);
-    eprintln!("[gguf-tp-long] chunk={chunk} · 词 {words} · max_seq={max_seq} · 设备 A={oa} B={ob}");
+    eprintln!("[gguf-tp-long] {res} · chunk={chunk} · 词 {words} · max_seq={max_seq} · 设备 A={oa} B={ob}");
 
     let skip_ref = std::env::var_os("OWL_GGUF_TP_SKIP_REF").is_some();
     // ── ① 单卡参考(最后一词 logits)──

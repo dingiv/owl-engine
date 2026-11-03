@@ -23,9 +23,21 @@
 //!
 //! 分段件(`attn_qkv` / `ssm_conv1d`)是"每段各取一个窗口再拼接"——段内仍是
 //! grouped 序的连续块。`attn_q` 不是分段件：它是 per-head `[q_h, gate_h]` 交错，
-//! 只能按整行窗口切（2026-10-24 定谳；源布局与 HF `q_proj` 同序）。这条不变式让
-//! A2 表在 TP 档**不需要** (`SourceFacts::vhead_tiled_columns = false`):每 rank
-//! 的激活本来就是 grouped 序的连续段。
+//! 只能按整行窗口切（2026-10-24 定谳；源布局与 HF `q_proj` 同序）。
+//!
+//! **2026-11-03 补注(列序不再是 grouped 序的一支)**：`ssm_out` 在
+//! `atom > hv`(K/I 超块 256 vs 头宽 128)时,一个原子 = 文件里两个连续头 ⇒
+//! "逐头取整原子"不存在,只能按**文件头升序的整原子段**切。此时本 rank 的
+//! **列序是原子序**,不是 grouped 连续窗口 ⇒ 激活侧需要一张 per-rank 置换表
+//! ([`transform::vhead_q8_blocks_rank`](super::transform::vhead_q8_blocks_rank))。
+//! 不变式因此扩写为:
+//!
+//! > 每一 rank 的列序 == grouped 头集上按
+//! > [`rank_head_order`](super::transform::rank_head_order) 指定的头序窗口;
+//! > `atom | hv` 时该头序 = grouped 连续序(退化为旧不变式),`atom > hv` 时 = 原子序。
+//!
+//! 单卡仍是一张全量 tiled→grouped 表;TP 的 `atom | hv` 档**不需要**表
+//! (源事实 `tp_rank_shard` + 逐层原子宽判据),而 `atom > hv` 档**必须**要(per-rank)。
 //!
 //! # 角色表(GGUF 名 → 切法;**唯一点**)
 //!
@@ -39,7 +51,7 @@
 //! | `attn_gate`(= in_proj_z) | `OutHead` | v-head grouped 行窗口 |
 //! | `ssm_alpha` / `ssm_beta` / `ssm_a` / `ssm_dt` | `OutHead` | 同上(head_dim = 1) |
 //! | `ffn_down` / `attn_output` | `In` | 每行的块对齐列窗口 |
-//! | `ssm_out` | `InHead` | 每行的 **v-head grouped** 列窗口(逐头一段) |
+//! | `ssm_out` | `InHead` | 每行的 **v-head 列窗**:`atom \| hv` 逐头一段;`atom > hv` 整原子段(文件头升序) |
 //! | `output`(仅 `ShardSel.head_split`) | `Out` | 行窗口(lm_head 半表) |
 //! | 其余(norm / embed / q_norm / k_norm / ssm_norm) | `Replicate` | 全量 |
 //!
@@ -82,14 +94,17 @@ impl ShardSel {
 
 /// 目标侧的**列计划**(单位 = 原子 = 一个量化块 / 一个原生元素)。
 ///
-/// 目标坐标恒为 grouped 序(连续),`src_*` 是**文件**序的原子偏移。
+/// 目标坐标 = 本 rank 的**列序**(`atom | hv` 时是 grouped 连续序;`atom > hv`
+/// 时是文件头升序的原子序 —— 见表;[`transform::rank_head_order`]
+/// (super::transform::rank_head_order) 与这里的 `Segs` **同源**),`src_*` 是
+/// **文件**序的原子偏移。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cols {
     /// 整行(不切列)
     Full,
     /// 连续窗口(`ffn_down` / `attn_output`)
     Window { src0: usize, n: usize },
-    /// 逐段拼接(`ssm_out`:每目标头一段,文件里同头连续)
+    /// 逐段拼接(`ssm_out`:每段 = 一个目标**头段/原子段**,文件里同段连续)
     Segs(Vec<(usize, usize)>),
 }
 
@@ -328,8 +343,16 @@ pub fn geom_of(
             }
         }
         (Role::InHead, false) => {
-            // ssm_out:内维 = v-head(hd = hv)。rank 取 grouped 序的连续头集;
-            // 文件里每头一段(hv 元素 ⇒ hv/be 个原子)⇒ 逐头一段
+            // ssm_out:内维 = v-head(hd = hv)。rank 取 grouped 序的连续头集。
+            //
+            // 列几何有两种形态(2026-11-03;见 `transform::rank_head_order`):
+            // ① **原子不跨头**(`hv % atom == 0`,如 32 块量子 Q8_0 / 原生):
+            //    文件里每头一段(hv 元素 ⇒ hv/atom 个原子)⇒ 逐头一段;
+            // ② **原子跨头**(`atom = hpa·hv`,K/I 超块 256 vs hv 128):
+            //    一个原子 = 文件里两个**连续**头 ⇒ 逐头切必然为 0。改按
+            //    "文件头升序的整原子段"切(rank 的 grouped 头窗在文件里本就是
+            //    3 段对齐窗口)。代价:dest 列序不再是 grouped 序 ⇒ 激活侧要
+            //    一张 per-rank 置换表(`transform::vhead_q8_blocks_rank`)。
             let hv = d.hv;
             if hv == 0 || f.inner != d.nv * hv {
                 return Err(ModelError::Msg(format!(
@@ -337,26 +360,64 @@ pub fn geom_of(
                     f.inner, d.nv
                 )));
             }
-            if !hv.is_multiple_of(elem_per_atom) {
+            if d.nk == 0 || !d.nv.is_multiple_of(d.nk) {
                 return Err(ModelError::Msg(format!(
-                    "[{key}] v-head 宽 {hv} 不是原子 {elem_per_atom} 的整数倍 ⇒ 块粒度聚合不成立\
-                     (该型按头不可分 ⇒ TP 拒;设计 §14.6 ②)"
+                    "[{key}] v-head 事实不自洽:nv = {} 不被 nk = {} 整除(无法推出 vpr)",
+                    d.nv, d.nk
                 )));
             }
             let (h0, hn) = sel.window(d.nv, "v-head 数", key)?;
-            let bph = hv / elem_per_atom; // 每头原子数
             let vpr = d.nv / d.nk;
-            let mut segs = Vec::with_capacity(hn);
-            for t in 0..hn {
-                let h = h0 + t; // grouped(owl)头
-                let g = (h % vpr) * d.nk + h / vpr; // 文件头(`vhead_deperm` 同式)
-                segs.push((g * bph, bph));
-            }
+            let file_head = |h: usize| (h % vpr) * d.nk + h / vpr; // 文件头(`vhead_deperm` 同式)
+            let (segs, row_atoms) = if hv.is_multiple_of(elem_per_atom) {
+                // 旧路:每头整数个原子 ⇒ 逐头一段(不变)
+                let bph = hv / elem_per_atom;
+                let segs = (0..hn)
+                    .map(|t| {
+                        let g = file_head(h0 + t);
+                        (g * bph, bph)
+                    })
+                    .collect::<Vec<_>>();
+                (segs, hn * bph)
+            } else {
+                // 新路:原子跨头 ⇒ 按文件头升序切**整原子段**
+                if !elem_per_atom.is_multiple_of(hv) {
+                    return Err(ModelError::Msg(format!(
+                        "[{key}] v-head 宽 {hv} 与量化原子 {elem_per_atom} 互不整除 ⇒ 列序无定义\
+                         (该型按头不可分 ⇒ TP 拒;设计 §14.6 ②)"
+                    )));
+                }
+                let hpa = elem_per_atom / hv; // 一原子跨 hpa 个文件头
+                let mut gs: Vec<usize> = (h0..h0 + hn).map(file_head).collect();
+                gs.sort_unstable();
+                let mut segs = Vec::with_capacity(hn / hpa.max(1));
+                let mut i = 0usize;
+                while i < gs.len() {
+                    let mut j = i + 1;
+                    while j < gs.len() && gs[j] == gs[j - 1] + 1 {
+                        j += 1;
+                    }
+                    let run = j - i;
+                    if !gs[i].is_multiple_of(hpa) || !run.is_multiple_of(hpa) {
+                        return Err(ModelError::Msg(format!(
+                            "[{key}] rank{} 的文件头窗 [{}, {}) 不落整原子(原子 = {elem_per_atom} \
+                             = {hpa} 头)⇒ world = {} 下窗口跨原子 ⇒ TP 拒",
+                            sel.id,
+                            gs[i],
+                            gs[j - 1] + 1,
+                            sel.world
+                        )));
+                    }
+                    segs.push((gs[i] / hpa, run / hpa));
+                    i = j;
+                }
+                (segs, hn * hv / elem_per_atom)
+            };
             KeyGeom {
                 shape: Shape::Mat { wins: vec![(0, f.rows)], rows: f.rows },
                 cols: Cols::Segs(segs),
                 col_first: h0 * hv,
-                row_atoms: hn * bph,
+                row_atoms,
                 atom_bytes,
                 elem_per_atom,
                 quantized,
@@ -690,12 +751,79 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("不落块边界") || e.contains("不被 world"), "{e}");
-        // ssm_out 的 hv 不被原子整除 ⇒ 按头不可分 ⇒ TP 拒
+        // ssm_out 的 hv 与原子互不整除 ⇒ 按头不可分 ⇒ TP 拒
         let d2 = GgufDims { nk: 16, nv: 48, hk: 128, hv: 100, nq: 24, nkv: 4 };
         let f2 = TensorFacts { ty: GgmlTy::Q8_0, rows: 5120, inner: 4800 };
         let e = geom_of("blk.0.ssm_out.weight", &d2, &f2, Some(ShardSel { id: 0, world: 2, head_split: false }))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("不是原子"), "{e}");
+        assert!(e.contains("互不整除"), "{e}");
+    }
+
+    /// **原子跨头条的几何 × 表 互证**(2026-11-03;零设备)。
+    ///
+    /// 27B 的 K/I 量子(`ssm_out` = Q4_K,atom 256 > hv 128):
+    /// ① `Cols::Segs` 必须是三个整原子段(rank0 `[0,4),(8,4),(16,4)`);
+    /// ② 按 Segs 把 dest 块映回文件块 ⇒ 该 rank 的文件块集 = 12 个原子;
+    /// ③ 表值 == 该文件块坐的 grouped 头的局部块号(**同一张头序的两面**);
+    /// ④ 两 rank 的文件块并集 = 全量 24 原子(不重不漏 —— 拼回门)。
+    #[test]
+    fn ssm_out_atom_tiled_geometry_matches_rank_table() {
+        use crate::formats::gguf::transform::{rank_head_order, vhead_q8_blocks_rank};
+        let d = GgufDims { nk: 16, nv: 48, hk: 128, hv: 128, nq: 24, nkv: 4 };
+        let f = TensorFacts { ty: GgmlTy::Q4K, rows: 5120, inner: 6144 };
+        let (atom, atom_bytes) = GgmlTy::Q4K.block();
+        assert_eq!((atom, atom_bytes), (256, 144), "Q4_K 原子事实");
+        let bph = d.hv / 32; // 每头 q8_1 块数 = 4
+        let abl = atom / 32; // 每原子 q8_1 块数 = 8
+        let mut all_file_blocks: Vec<usize> = Vec::new();
+        for rank in 0..2usize {
+            let sel = ShardSel { id: rank, world: 2, head_split: false };
+            let g = geom_of("blk.0.ssm_out.weight", &d, &f, Some(sel))
+                .expect("geom")
+                .expect("ssm_out 应切");
+            let Cols::Segs(segs) = &g.cols else {
+                panic!("ssm_out 应是 Segs,实得 {:?}", g.cols)
+            };
+            // ① 段 = 整原子(27B rank0/1 各 3 段×4 原子)
+            let want: Vec<(usize, usize)> = if rank == 0 {
+                vec![(0, 4), (8, 4), (16, 4)]
+            } else {
+                vec![(4, 4), (12, 4), (20, 4)]
+            };
+            assert_eq!(segs, &want, "rank{rank} 原子段");
+            assert_eq!(g.row_atoms, 12, "rank{rank} 行宽 = 12 原子");
+            assert_eq!(g.len(), f.rows * 12 * atom_bytes, "rank{rank} 交付量");
+            // ② dest 块 → 文件块
+            let dest_file: Vec<usize> = segs
+                .iter()
+                .flat_map(|&(src0, n)| (0..n * abl).map(move |b| src0 * abl + b))
+                .collect();
+            assert_eq!(dest_file.len(), 96, "rank{rank} 列块数");
+            // ③ 表的每一块 = 该文件块坐的 grouped 头的局部块号
+            let table = vhead_q8_blocks_rank(d.nk, d.nv, d.hv, atom, 2, rank).expect("table");
+            let order = rank_head_order(d.nk, d.nv, d.hv, atom, 2, rank).expect("order");
+            assert_eq!(table.len(), dest_file.len());
+            let (h0, hn) = (rank * (d.nv / 2), d.nv / 2);
+            assert_eq!(order.len(), hn);
+            for (dc, fblk) in dest_file.iter().enumerate() {
+                let fh = fblk / bph; // 文件头
+                let h = (fh % d.nk) * (d.nv / d.nk) + fh / d.nk; // grouped 头
+                assert_eq!(h, order[dc / bph], "rank{rank} dest 头 {} 的 grouped 头", dc / bph);
+                assert_eq!(
+                    table[dc],
+                    ((h - h0) * bph + fblk % bph) as u32,
+                    "rank{rank} dest 块 {dc}(文件块 {fblk})"
+                );
+            }
+            all_file_blocks.extend(dest_file);
+        }
+        // ④ 两 rank 文件块并集 = 全量(拼回门:不重不漏)
+        all_file_blocks.sort_unstable();
+        assert_eq!(
+            all_file_blocks,
+            (0..d.nv * bph).collect::<Vec<_>>(),
+            "两 rank 的文件块不重不漏"
+        );
     }
 }

@@ -179,15 +179,31 @@ impl GgufSource {
 
     /// **虚拟键 → 块序表**(`None` = 不是虚拟键;
     /// 是虚拟键但形态不成立 ⇒ **响亮拒**,不静默给恒等表)
+    ///
+    /// 2026-11-03:`ssm_out` 的列序表在 TP 档**重新存在**(K/I 超块
+    /// `atom > hv` 的 rank 列序 = 原子序,不再是 grouped 序)。两种档位的表:
+    /// - 单卡(`shard = None`):全量 tiled→grouped(`vhead_q8_blocks`);
+    /// - 分片(`shard = Some`):**per-rank**(`vhead_q8_blocks_rank`),按同层
+    ///   `ssm_out` 的实际原子宽推导头序(`atom | hv` 自动退化成窗口恒等表)。
+    ///
+    /// 物理键必须存在(表 = 同层权重的内维列序,不能凭空造)。
     fn virtual_perm(&self, key: &str) -> Taken<Vec<u32>> {
         if !key.ends_with(PERM_TAIL) {
             return Ok(None);
         }
-        if self.shard.is_some() {
+        let Some(prefix) = key.strip_suffix(PERM_TAIL) else {
             return Err(ModelError::Msg(format!(
-                "GgufSource: 虚拟键 `{key}`(单卡的 A2 列序表)在 TP 档**不存在**                 —— 分片装载已按 v-head grouped 序聚合 ⇒ 激活侧无需置换                 (`SourceFacts::GGUF_TP.vhead_tiled_columns = false`)"
+                "GgufSource: 虚拟键 `{key}` 词尾不匹配(内部错)"
             )));
-        }
+        };
+        // 同层物理张量(`blk.N.ssm_out.weight`):原子宽/头宽从它取 ——
+        // **逐层**判定(27B 的 ssm_out 逐层混 Q5_K/Q4_K/IQ4_XS/Q3_K)
+        let phys = format!("{prefix}.ssm_out.weight");
+        let Some(t) = self.g.get_tensor(&phys) else {
+            return Err(ModelError::Msg(format!(
+                "GgufSource: 虚拟键 `{key}` 找不到同层物理张量 `{phys}`(列序表的原子宽无处取)"
+            )));
+        };
         if !self.dims.vhead_active() {
             return Err(ModelError::Msg(format!(
                 "GgufSource: 虚拟键 `{key}` 请求列置换表,但本模型 nk == nv({} == {})\
@@ -195,9 +211,14 @@ impl GgufSource {
                 self.dims.nk, self.dims.nv
             )));
         }
-        let t = transform::vhead_q8_blocks(self.dims.nk, self.dims.nv, self.dims.hv)
-            .map_err(|e| ModelError::Msg(format!("GgufSource: 虚拟键 `{key}`: {e}")))?;
-        Ok(Some(t))
+        let (nk, nv, hv) = (self.dims.nk, self.dims.nv, self.dims.hv);
+        let atom = t.ty.block().0; // 量化 = 块元素数;原生 = 1
+        let table = match self.shard {
+            None => transform::vhead_q8_blocks(nk, nv, hv),
+            Some(sel) => transform::vhead_q8_blocks_rank(nk, nv, hv, atom, sel.world, sel.id),
+        }
+        .map_err(|e| ModelError::Msg(format!("GgufSource: 虚拟键 `{key}`: {e}")))?;
+        Ok(Some(table))
     }
 
     fn is_quantized(&self, key: &str) -> bool {

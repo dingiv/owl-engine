@@ -1402,8 +1402,15 @@ pub struct SourceFacts {
     /// 产出 grouped 序 ⇒ 消费者必须先在**激活侧**做等价置换
     /// (置换跨量化块 ⇒ 权重字节不可逆;设计 §11.4)。
     ///
-    /// 消费者 = GDN 层:声明 `ssm_out_perm` 虚拟键(源生成 32 元素块序表) + `out_proj` 前插一发 `owl_gguf_col_gather`。
+    /// **本事实描述的是文件**(恒 true for GGUF);本 rank 装载后的列序到底是
+    /// grouped 还是原子序,由 `ssm_out` 的原子宽与 [`Self::tp_rank_shard`] 共同
+    /// 决定(消费者 = [`crate::layers::gdn::GatedDeltaNet::new`] 的逐层判定):
+    /// 分片档只在 `atom > hv`(K/I 超块)时需要 per-rank 表。
     pub vhead_tiled_columns: bool,
+    /// **TP 分片装载档**(权重每 rank 只驻留窗口;`GgufSource::owns_shard`)⇒
+    /// `ssm_out` 的列序由分片几何(`atom | hv` ⇒ grouped 窗口;否则原子序)
+    /// 决定,而**非**文件全量列序。
+    pub tp_rank_shard: bool,
 }
 
 impl SourceFacts {
@@ -1412,20 +1419,27 @@ impl SourceFacts {
         norm_baked_plus_one: false,
         merged_segments_may_differ: false,
         vhead_tiled_columns: false,
+        tp_rank_shard: false,
     };
     /// GGUF 起点族(norm 已 +1;逐张量型 ⇒ 融合键分段独立;tiled v-head 列序)
     pub const GGUF: SourceFacts = SourceFacts {
         norm_baked_plus_one: true,
         merged_segments_may_differ: true,
         vhead_tiled_columns: true,
+        tp_rank_shard: false,
     };
-    /// **GGUF + TP 分片档**(W-1):装载期已按 v-head **grouped 序聚合**
-    /// (`GgufSource` 自担分片)⇒ 本 rank 的权重内维就是 grouped 序,
-    /// **不需要** A2 激活侧列序表(`vhead_tiled_columns = false`)。
+    /// **GGUF + TP 分片档**(W-1):装载期由 `GgufSource` 自担分片。
+    ///
+    /// `ssm_out` 的列序分两支(2026-11-03):
+    /// - `atom | hv`(32 块量子 / 原生)⇒ 按 grouped 连续窗口聚合,无需表;
+    /// - `atom > hv`(K/I 超块)⇒ 按原子序聚合,**需要** per-rank 表。
+    ///
+    /// 本事实只标记"分片档",具体哪支由 GDN 逐层用 `out_proj` 的量化型算。
     pub const GGUF_TP: SourceFacts = SourceFacts {
         norm_baked_plus_one: true,
         merged_segments_may_differ: true,
-        vhead_tiled_columns: false,
+        vhead_tiled_columns: true,
+        tp_rank_shard: true,
     };
 
     /// norm 的 I/O 语义:GGUF 用 `×w`(`w_off = false`),HF 用 `×(1+w)`

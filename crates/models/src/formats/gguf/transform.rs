@@ -330,6 +330,121 @@ pub fn vhead_q8_blocks(nk: usize, nv: usize, hd: usize) -> Result<Vec<u32>, Mode
     Ok(p)
 }
 
+/// **分片档的 v-head 头序**(dest 位置 → grouped(HF)头号;2026-11-03)。
+///
+/// 为什么需要它:`ssm_out` 的内维 = v-head 轴。**单卡**的 dest 列序 = 文件列序
+/// (tiled),故表 = [`vhead_q8_blocks`](文件位置 → grouped);**分片档**的 dest
+/// 列序由装载几何决定,有两种形态:
+///
+/// | 原子 vs 头宽 | 装载几何(`shard::Cols::Segs` 的单位) | dest 头序 |
+/// |---|---|---|
+/// | `atom \| hv`(32 块量子 / 原生) | 逐头一段(`hv/atom` 原子) | **grouped 连续窗口** `[h0, h0+hn)` |
+/// | `hv \| atom` 且 `atom > hv`(K/I 超块) | 每段 = 整原子(文件头升序) | **原子序**(见下例) |
+///
+/// 27B(`nk=16, nv=48, hv=128, atom=256, world=2, hpa=2`)rank0 的原子序:
+/// ```text
+/// dest 头 = [0,3,6,9,12,15,18,21,  1,4,7,10,13,16,19,22,  2,5,8,11,14,17,20,23]
+///            └─ 文件头 0..7 ─┘      └─ 文件头 16..23 ─┘      └─ 文件头 32..39 ─┘
+/// ```
+/// 这些文件头段起点都 `% hpa == 0`、段长都 `% hpa == 0` ⇒ 每段 = 整原子(不跨
+/// rank)。不落整原子 ⇒ **响亮拒**(该 world 下窗口跨原子 = 无定义,不许静默 pad)。
+///
+/// `atom` = 量化块的元素数(原生件 = 1)。
+pub fn rank_head_order(
+    nk: usize,
+    nv: usize,
+    hv: usize,
+    atom: usize,
+    world: usize,
+    rank: usize,
+) -> Result<Vec<usize>, ModelError> {
+    if world == 0 || rank >= world {
+        return Err(ModelError::Msg(format!(
+            "v-head 头序:world = {world} / rank = {rank} 非法"
+        )));
+    }
+    if atom == 0 || hv == 0 || nk == 0 || !nv.is_multiple_of(nk) || !nv.is_multiple_of(world) {
+        return Err(ModelError::Msg(format!(
+            "v-head 头序:nk = {nk} / nv = {nv} / hv = {hv} / atom = {atom} / world = {world} 形态不成立"
+        )));
+    }
+    let hn = nv / world;
+    let h0 = rank * hn;
+    // ① 原子不跨头(量化 32 块 / 原生):rank 的列序 = grouped 连续窗口
+    if hv.is_multiple_of(atom) {
+        return Ok((h0..h0 + hn).collect());
+    }
+    // ② 原子跨头(atom = hpa·hv):按文件头升序拼整原子
+    if !atom.is_multiple_of(hv) {
+        return Err(ModelError::Msg(format!(
+            "v-head 头序:头维 {hv} 与量化原子 {atom} 互不整除 ⇒ 列序无定义(TP 拒)"
+        )));
+    }
+    let hpa = atom / hv;
+    let vpr = nv / nk;
+    let file_head = |h: usize| (h % vpr) * nk + h / vpr; // 写侧公式(transform 模块头)
+    let mut gs: Vec<usize> = (h0..h0 + hn).map(file_head).collect();
+    gs.sort_unstable();
+    // 自检:每段(文件头连续段)必须整原子(起点与段长都是 hpa 的倍数)
+    let mut i = 0usize;
+    while i < gs.len() {
+        let mut j = i + 1;
+        while j < gs.len() && gs[j] == gs[j - 1] + 1 {
+            j += 1;
+        }
+        let run = j - i;
+        if !gs[i].is_multiple_of(hpa) || !run.is_multiple_of(hpa) {
+            return Err(ModelError::Msg(format!(
+                "v-head 头序:rank{rank} 的文件头窗 [{}, {}) 不落整原子(原子 = {atom} = {hpa} 头)⇒ world = {world} 下 TP 拒",
+                gs[i],
+                gs[j - 1] + 1
+            )));
+        }
+        i = j;
+    }
+    // dest = 文件头升序;给出各自坐的 grouped 头号
+    Ok(gs.iter().map(|&g| (g % nk) * vpr + g / nk).collect())
+}
+
+/// **per-rank 激活列序表**(q8_1 块粒度;分片档的 [`vhead_q8_blocks`])。
+///
+/// 语义与单卡表**同向**:`out_dest[p] = in_grouped_local[table[p]]`,只是
+/// `dest` = 本 rank 的列序(见 [`rank_head_order`]),`in` = 本 rank 的 grouped
+/// 窗口(局部头号 `h - h0`)。表长 = `hn · hv / 32`。
+pub fn vhead_q8_blocks_rank(
+    nk: usize,
+    nv: usize,
+    hv: usize,
+    atom: usize,
+    world: usize,
+    rank: usize,
+) -> Result<Vec<u32>, ModelError> {
+    const Q8: usize = owl_kernels::family::gguf::QK_32;
+    if !hv.is_multiple_of(Q8) {
+        return Err(ModelError::Msg(format!(
+            "v-head 列置换:头维 {hv} 不是 q8_1 块大小 {Q8} 的整数倍 ⇒ 块粒度置换不成立"
+        )));
+    }
+    let order = rank_head_order(nk, nv, hv, atom, world, rank)?;
+    let hn = nv / world;
+    let h0 = rank * hn;
+    let bph = hv / Q8;
+    let mut p = Vec::with_capacity(order.len() * bph);
+    for (d, &h) in order.iter().enumerate() {
+        // 头序必须是本 rank 窗口的排列(否则 = 表与几何各执一词 ⇒ 响亮拒)
+        let Some(loc) = h.checked_sub(h0).filter(|v| *v < hn) else {
+            return Err(ModelError::Msg(format!(
+                "v-head 列置换:dest 头 {d} 映射到 grouped 头 {h},不在本 rank 窗口 [{h0}, {}) 内",
+                h0 + hn
+            )));
+        };
+        for b in 0..bph {
+            p.push((loc * bph + b) as u32);
+        }
+    }
+    Ok(p)
+}
+
 /// 全模型逐键变换清单(诊断/门:列出所有**非恒等**键)
 pub fn non_identity_keys(g: &crate::formats::gguf::reader::Gguf, d: &GgufDims) -> Vec<(String, KeyXf)> {
     let mut out = Vec::new();
@@ -424,6 +539,63 @@ mod tests {
             xf_for("blk.1.attn_qkv.weight", &d27).unwrap().row_perm,
             RowPerm::VSegOnly { nk: 16, nv: 48, hd: 128, seg_off: 4096 }
         );
+    }
+
+    /// **分片档头序**(27B;两种原子档;零设备)
+    ///
+    /// ① `atom = 32`(32 块量子)⇒ grouped 连续窗口;
+    /// ② `atom = 256`(K/I 超块)⇒ 原子序(文件头升序);
+    /// ③ 头宽与原子互不整除 ⇒ 响亮拒。
+    #[test]
+    fn rank_head_order_27b_two_atom_regimes() {
+        let (nk, nv, hv) = (16, 48, 128);
+        let o0 = rank_head_order(nk, nv, hv, 32, 2, 0).expect("order");
+        assert_eq!(o0, (0..24).collect::<Vec<_>>(), "32 块量子 rank0 = grouped 窗口");
+        let o1 = rank_head_order(nk, nv, hv, 32, 2, 1).expect("order");
+        assert_eq!(o1, (24..48).collect::<Vec<_>>(), "32 块量子 rank1 = grouped 窗口");
+        // 原子序 = 文件头 [0..7] ∪ [16..23] ∪ [32..39] 各自的 grouped 头
+        let a0 = rank_head_order(nk, nv, hv, 256, 2, 0).expect("order");
+        assert_eq!(
+            a0,
+            vec![0, 3, 6, 9, 12, 15, 18, 21, 1, 4, 7, 10, 13, 16, 19, 22, 2, 5, 8, 11, 14, 17, 20, 23]
+        );
+        let a1 = rank_head_order(nk, nv, hv, 256, 2, 1).expect("order");
+        assert_eq!(a1.len(), 24);
+        let mut all = a0.clone();
+        all.extend(&a1);
+        all.sort_unstable();
+        assert_eq!(all, (0..48).collect::<Vec<_>>(), "两 rank 头序并集 = 全量、无重");
+        // 互不整除 ⇒ 响亮拒(不许静默 pad)
+        assert!(
+            rank_head_order(nk, nv, 96, 256, 2, 0).is_err(),
+            "hv=96 vs atom=256 应拒"
+        );
+        assert!(rank_head_order(nk, nv, hv, 256, 0, 0).is_err(), "world=0 应拒");
+    }
+
+    /// **per-rank 表**:与头序同源;`atom | hv` ⇒ 窗口恒等;是局部块置换
+    #[test]
+    fn vhead_q8_blocks_rank_is_window_local() {
+        let (nk, nv, hv) = (16, 48, 128);
+        let t0 = vhead_q8_blocks_rank(nk, nv, hv, 32, 2, 0).expect("table");
+        assert_eq!(t0, (0..96).collect::<Vec<u32>>(), "atom=32 档 = 窗口恒等");
+        let t1 = vhead_q8_blocks_rank(nk, nv, hv, 32, 2, 1).expect("table");
+        // 表索引的是**本 rank 的局部激活**(value_dim = 24·128 = 3072 ⇒ 96 块)
+        assert_eq!(t1, (0..96).collect::<Vec<u32>>(), "两 rank 各自局部恒等");
+        // atom=256 档:dest 块 = order[d]*4 + b(rank0 的窗口从 0 起)
+        let order = rank_head_order(nk, nv, hv, 256, 2, 0).expect("order");
+        let a0 = vhead_q8_blocks_rank(nk, nv, hv, 256, 2, 0).expect("table");
+        assert_eq!(a0.len(), 96);
+        for (d, h) in order.iter().enumerate() {
+            for b in 0..4 {
+                assert_eq!(a0[d * 4 + b], (h * 4 + b) as u32, "d={d} b={b}");
+            }
+        }
+        let mut s = a0.clone();
+        s.sort_unstable();
+        assert_eq!(s, (0..96).collect::<Vec<u32>>(), "表应是局部块的置换");
+        // 头宽不被 q8_1 块整除 ⇒ 响亮拒
+        assert!(vhead_q8_blocks_rank(nk, nv, 100, 32, 2, 0).is_err());
     }
 
     /// `vhead_active` 门:full-attn 层(nkv == nq)**无** v-head 概念 ⇒ 恒等;
