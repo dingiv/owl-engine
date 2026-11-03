@@ -150,18 +150,21 @@ extern "C" __global__ void owl_reshape_and_cache_int8_k_only_knhd(
   const long long src = static_cast<long long>(token) * key_stride +
                         static_cast<long long>(head) * head_size;
 
-  float k_abs = 0.0f;
+  float gmax[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
   for (int d = lane; d < head_size; d += 32) {
-    k_abs = fmaxf(k_abs, fabsf(__half2float(key[src + d])));
+    const int g = d / 32;
+    gmax[g] = fmaxf(gmax[g], fabsf(__half2float(key[src + d])));
   }
-  k_abs = warp_max(k_abs);
+#pragma unroll
+  for (int g = 0; g < 8; ++g) gmax[g] = warp_max(gmax[g]);
 
-  const float ks = fmaxf(k_abs / 127.0f, 1e-6f);
-  const float kinv = 1.0f / ks;
+  float ks[8];
+#pragma unroll
+  for (int g = 0; g < 8; ++g) ks[g] = fmaxf(gmax[g] / 127.0f, 1e-6f);
   for (int d = lane; d < head_size; d += 32) {
-    key_cache[row_base + d] = quant_i8(__half2float(key[src + d]), kinv);
+    key_cache[row_base + d] = quant_i8(__half2float(key[src + d]), 1.0f / ks[d / 32]);
   }
-  if (lane == 0) {
-    k_scale[scale_idx] = ks;
+  if (lane < 8) {
+    k_scale[scale_idx * 8 + lane] = ks[lane];
   }
 }

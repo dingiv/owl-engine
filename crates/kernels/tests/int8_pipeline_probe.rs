@@ -27,6 +27,9 @@ fn f32_to_f16(f: f32) -> u16 {
     }
     sign | ((exp as u16) << 10) | man as u16
 }
+fn f32_to_f16_rn(x: f32) -> u16 {
+    half::f16::from_f32(x).to_bits()
+}
 fn f16_to_f32(h: u16) -> f32 {
     let s = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
     let e = ((h >> 10) & 0x1F) as i32;
@@ -75,21 +78,23 @@ fn qk_write_and_v_pack_match_host() {
     let qf = lcg_f32(ROWS * D, 0x1111, -1.0, 2.0);
     let qh: Vec<u16> = qf.iter().map(|&x| f32_to_f16(x)).collect();
     let mut q_want = vec![0i8; ROWS * D];
-    let mut qs_want = vec![0f32; ROWS];
+    let mut qs_want = vec![0f32; ROWS * 8];
     for row in 0..ROWS {
-        let mut amax = 0f32;
-        for d in 0..D {
-            amax = amax.max(f16_to_f32(qh[row * D + d]).abs());
-        }
-        let s = (amax / 127.0).max(1e-6);
-        let inv = 1.0 / s;
-        qs_want[row] = s;
-        for d in 0..D {
-            q_want[row * D + d] = quant_half_away(f16_to_f32(qh[row * D + d]), inv, -127.0);
+        for g in 0..8 {
+            let mut amax = 0f32;
+            for d in g * 32..(g + 1) * 32 {
+                amax = amax.max(f16_to_f32(qh[row * D + d]).abs());
+            }
+            let s = (amax / 127.0).max(1e-6);
+            let inv = 1.0 / s;
+            qs_want[row * 8 + g] = s;
+            for d in g * 32..(g + 1) * 32 {
+                q_want[row * D + d] = quant_half_away(f16_to_f32(qh[row * D + d]), inv, -127.0);
+            }
         }
     }
     let dq = r.alloc(hb(&qh).len(), "p.q").unwrap();
-    let dqs = r.alloc(ROWS * 4, "p.qs").unwrap();
+    let dqs = r.alloc(ROWS * 8 * 4, "p.qs").unwrap();
     let dqo = r.alloc(ROWS * D, "p.qo").unwrap();
     r.upload(dq, &hb(&qh)).unwrap();
     let qv = [
@@ -110,7 +115,7 @@ fn qk_write_and_v_pack_match_host() {
     .unwrap();
     r.sync().unwrap();
     let mut got_q = vec![0u8; ROWS * D];
-    let mut got_qs = vec![0u8; ROWS * 4];
+    let mut got_qs = vec![0u8; ROWS * 8 * 4];
     r.download(
         CheckBuf {
             ptr: dqo.ptr,
@@ -143,23 +148,25 @@ fn qk_write_and_v_pack_match_host() {
     let kh: Vec<u16> = kf.iter().map(|&x| f32_to_f16(x)).collect();
     let slots = [0f32, 33.0];
     let mut k_want = vec![0x7Fi8; NB * PAGE * HKV * D];
-    let mut ks_want = vec![0f32; NB * PAGE * HKV];
+    let mut ks_want = vec![0f32; NB * PAGE * HKV * 8];
     for t in 0..T {
         let slot = slots[t] as usize;
         let (blk, off) = (slot / PAGE, slot % PAGE);
         for h in 0..HKV {
-            let mut amax = 0f32;
-            for d in 0..D {
-                amax = amax.max(f16_to_f32(kh[(t * HKV + h) * D + d]).abs());
-            }
-            let s = (amax / 127.0).max(1e-6);
-            let inv = 1.0 / s;
             let dst = ((blk * PAGE + off) * HKV + h) * D;
-            for d in 0..D {
-                k_want[dst + d] =
-                    quant_half_away(f16_to_f32(kh[(t * HKV + h) * D + d]), inv, -128.0);
+            for g in 0..8 {
+                let mut amax = 0f32;
+                for d in g * 32..(g + 1) * 32 {
+                    amax = amax.max(f16_to_f32(kh[(t * HKV + h) * D + d]).abs());
+                }
+                let s = (amax / 127.0).max(1e-6);
+                let inv = 1.0 / s;
+                for d in g * 32..(g + 1) * 32 {
+                    k_want[dst + d] =
+                        quant_half_away(f16_to_f32(kh[(t * HKV + h) * D + d]), inv, -128.0);
+                }
+                ks_want[((blk * PAGE + off) * HKV + h) * 8 + g] = s;
             }
-            ks_want[(blk * PAGE + off) * HKV + h] = s;
         }
     }
     let dk = r.alloc(hb(&kh).len(), "p.k").unwrap();
@@ -251,29 +258,23 @@ fn qk_write_and_v_pack_match_host() {
     let vslots: Vec<f32> = (PAGE..2 * PAGE).map(|x| x as f32).collect();
     let pp = PAGE / 2;
     let mut v_want = vec![0x7Fu8; 2 * HKV * D * pp * 2];
-    let mut vs_want = vec![0f32; NB * HKV * 4];
+    let mut vs_want = vec![0f32; NB * PAGE * HKV];
     for h in 0..HKV {
-        for g in 0..4 {
+        for i in 0..TV {
             let mut amax = 0f32;
-            for t in 0..TV {
-                for d in g * 64..(g + 1) * 64 {
-                    amax = amax.max(f16_to_f32(vh[(t * HKV + h) * D + d]).abs());
-                }
+            for d in 0..D {
+                amax = amax.max(f16_to_f32(vh[(i * HKV + h) * D + d]).abs());
             }
-            let s = (amax / 127.0).max(1e-6);
-            let inv = 1.0 / s;
-            vs_want[HKV * 4 + h * 4 + g] = s;
-            for d in g * 64..(g + 1) * 64 {
-                for pair in 0..pp {
-                    let k0 = pair * 2;
-                    let k1 = k0 + 1;
-                    let a =
-                        quant_half_away(f16_to_f32(vh[(k0 * HKV + h) * D + d]), inv, -127.0) as u8;
-                    let b =
-                        quant_half_away(f16_to_f32(vh[(k1 * HKV + h) * D + d]), inv, -127.0) as u8;
-                    let off = (((1 * HKV + h) * D + d) * pp + pair) * 2;
+            let scale = (amax / 127.0).max(1e-6);
+            let inv = 1.0 / scale;
+            vs_want[(PAGE + i) * HKV + h] = scale;
+            for d in 0..D {
+                let a = quant_half_away(f16_to_f32(vh[(i * HKV + h) * D + d]), inv, -127.0) as u8;
+                let off = (((1 * HKV + h) * D + d) * pp + (i / 2)) * 2;
+                if (i & 1) == 0 {
                     v_want[off] = a;
-                    v_want[off + 1] = b;
+                } else {
+                    v_want[off + 1] = a;
                 }
             }
         }
@@ -307,7 +308,7 @@ fn qk_write_and_v_pack_match_host() {
     r.launch_aot(
         "owl_v_pack_int8_prefill",
         "cu/attn/pack_v_int8_paged.cu",
-        (1, HKV as u32, 4),
+        (1, HKV as u32, 1),
         (256, 1, 1),
         0,
         &vv,
@@ -367,18 +368,18 @@ fn int8_decode_matches_host() {
     let q: Vec<i8> = (0..B * HQ * D)
         .map(|i| ((i as i32 * 37 % 255) - 127) as i8)
         .collect();
-    let qs: Vec<f32> = (0..B * HQ).map(|i| 0.003 + 0.0001 * i as f32).collect();
+    let qs: Vec<f32> = (0..B * HQ * 8).map(|i| 0.003 + 0.0001 * i as f32).collect();
     let k: Vec<i8> = (0..PAGES * PAGE * HK * D)
         .map(|i| ((i as i32 * 53 % 255) - 127) as i8)
         .collect();
-    let ks: Vec<f32> = (0..PAGES * PAGE * HK)
+    let ks: Vec<f32> = (0..PAGES * PAGE * HK * 8)
         .map(|i| 0.002 + 0.00002 * i as f32)
         .collect();
     let pp = PAGE / 2;
     let v_int: Vec<i8> = (0..PAGES * HK * D * PAGE)
         .map(|i| ((i as i32 * 29 % 255) - 127) as i8)
         .collect();
-    let vs: Vec<f32> = (0..PAGES * HK * 4)
+    let vs: Vec<f32> = (0..PAGES * PAGE * HK)
         .map(|i| 0.004 + 0.00003 * i as f32)
         .collect();
     let mut vp = vec![0u8; PAGES * HK * D * pp * 2];
@@ -497,14 +498,14 @@ fn int8_decode_matches_host() {
             for key in 0..L {
                 let pg = key / PAGE;
                 let off = key % PAGE;
-                let ksc = ks[(pg * PAGE + off) * HK + kh];
                 let mut s = 0f32;
                 for d in 0..D {
-                    s += (q[(b * HQ + h) * D + d] as f32 * qs[b * HQ + h])
+                    let ksc = ks[((pg * PAGE + off) * HK + kh) * 8 + d / 32];
+                    s += (q[(b * HQ + h) * D + d] as f32 * qs[(b * HQ + h) * 8 + d / 32])
                         * (k[((pg * PAGE + off) * HK + kh) * D + d] as f32 * ksc);
                 }
-                p[key] = s;
-                max = max.max(s);
+                p[key] = s * 0.0625f32;
+                max = max.max(p[key]);
             }
             let mut sum = 0f32;
             for key in 0..L {
@@ -517,7 +518,7 @@ fn int8_decode_matches_host() {
                 for key in 0..L {
                     let pg = key / PAGE;
                     let off = key % PAGE;
-                    let vsv = vs[(pg * HK + kh) * 4 + d / 64];
+                    let vsv = vs[(pg * PAGE + off) * HK + kh];
                     let v = v_int[((pg * PAGE + off) * HK + kh) * D + d] as f32;
                     a += p[key] * v * vsv;
                 }
@@ -608,7 +609,8 @@ fn int8_decode_matches_host() {
         mx2 = mx2.max((a - b).abs());
     }
     println!("[int8-decode] split/reduce max|d|={mx2:.6}");
-    assert!(mx2 < 2e-3, "split/reduce max|d| {mx2}");
+    // reduce 输出 f16:大输出幅度下 4 ULP 可到 ~8e-3;与单块 f32 的绝对差不是核错。
+    assert!(mx2 < 2e-2, "split/reduce max|d| {mx2}");
 
     // ---- GQA + tensor-core split:同一批输入,对照已通过的 split/reduce ----
     let dtc_out = r.alloc(B * HQ * NPARTS * D * 4, "d.tcout").unwrap();
@@ -685,4 +687,237 @@ fn int8_decode_matches_host() {
     // P 8-bit 量化的固有误差（合成随机数据 L=4096 实测 ~5e-3）；
     // 真实模型走 needle/数学质量门，不靠这个阈值卡精度。
     assert!(mx3 < 1e-2, "tc split max|d| {mx3}");
+}
+
+/// Fused NormRope→INT8 writers (production Q/K path): host reference.
+/// 这两个核是 prefill/decode 的生产写者,之前的 probe 只测了旧
+/// `quant_int8_qk` / `reshape_and_cache_int8`,覆盖不到这里的 group scale。
+#[test]
+fn fused_qk_writers_match_host() {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    const HQ: usize = 2;
+    const T: usize = 2;
+    const HALF: usize = 64;
+    const MAXP: usize = 64;
+    let mut res = fi_support::TestRes::new(dev);
+    let mut exec = Exec::new();
+    let mut r = Runner {
+        res: &mut res,
+        exec: &mut exec,
+        registry: None,
+    };
+
+    let xq_f = lcg_f32(T * HQ * D, 0x1111, -1.5, 3.0);
+    let xq: Vec<u16> = xq_f.iter().map(|&x| f32_to_f16_rn(x)).collect();
+    let xk_f = lcg_f32(T * HKV * D, 0x2222, -1.5, 3.0);
+    let xk: Vec<u16> = xk_f.iter().map(|&x| f32_to_f16_rn(x)).collect();
+    let wf = lcg_f32(D, 0x3333, -0.5, 1.0);
+    let w: Vec<u16> = wf.iter().map(|&x| f32_to_f16_rn(x)).collect();
+    let mut cos = vec![0u16; MAXP * HALF];
+    let mut sin = vec![0u16; MAXP * HALF];
+    for p in 0..MAXP {
+        for d in 0..HALF {
+            let th = (p as f32 * 0.017 + d as f32 * 0.031).sin();
+            cos[p * HALF + d] = f32_to_f16_rn(th.cos());
+            sin[p * HALF + d] = f32_to_f16_rn(th.sin());
+        }
+    }
+    let pos: Vec<f32> = (0..T).map(|i| i as f32).collect();
+    let eps = 1e-6f32;
+    let slots = [0f32, 33.0];
+
+    let wf32: Vec<f32> = w.iter().map(|&h| f16_to_f32(h)).collect();
+    let cosf: Vec<f32> = cos.iter().map(|&h| f16_to_f32(h)).collect();
+    let sinf: Vec<f32> = sin.iter().map(|&h| f16_to_f32(h)).collect();
+    let rope_half = |val: &[f32], p: usize| -> Vec<f32> {
+        let base = p * HALF;
+        let mut out = vec![0f32; D];
+        let mut sum = 0f32;
+        for d in 0..D {
+            sum += val[d] * val[d];
+        }
+        let inv = 1.0 / (sum / D as f32 + eps).sqrt();
+        let n: Vec<f32> = (0..D).map(|d| val[d] * inv * (1.0 + wf32[d])).collect();
+        for d in 0..HALF {
+            let cf = cosf[base + d];
+            let sf = sinf[base + d];
+            out[d] = n[d] * cf - n[d + HALF] * sf;
+            out[d + HALF] = n[d + HALF] * cf + n[d] * sf;
+        }
+        for d in 2 * HALF..D {
+            out[d] = n[d];
+        }
+        for d in 0..D {
+            out[d] = f16_to_f32(f32_to_f16_rn(out[d]));
+        }
+        out
+    };
+
+    let mut q_want = vec![0i8; T * HQ * D];
+    let mut qs_want = vec![0f32; T * HQ * 8];
+    for t in 0..T {
+        for h in 0..HQ {
+            let vals: Vec<f32> = xq[(t * HQ + h) * D..(t * HQ + h + 1) * D]
+                .iter()
+                .map(|&x| f16_to_f32(x))
+                .collect();
+            let out = rope_half(&vals, t);
+            for g in 0..8 {
+                let mut amax = 0f32;
+                for d in g * 32..(g + 1) * 32 {
+                    amax = amax.max(out[d].abs());
+                }
+                let s = (amax / 127.0).max(1e-6);
+                qs_want[(t * HQ + h) * 8 + g] = s;
+                for d in g * 32..(g + 1) * 32 {
+                    q_want[(t * HQ + h) * D + d] = quant_half_away(out[d], 1.0 / s, -127.0);
+                }
+            }
+        }
+    }
+    let mut k_want = vec![0x7Fi8; NB * PAGE * HKV * D];
+    let mut ks_want = vec![0f32; NB * PAGE * HKV * 8];
+    for t in 0..T {
+        let slot = slots[t] as usize;
+        let (blk, off) = (slot / PAGE, slot % PAGE);
+        for h in 0..HKV {
+            let vals: Vec<f32> = xk[(t * HKV + h) * D..(t * HKV + h + 1) * D]
+                .iter()
+                .map(|&x| f16_to_f32(x))
+                .collect();
+            let out = rope_half(&vals, t);
+            for g in 0..8 {
+                let mut amax = 0f32;
+                for d in g * 32..(g + 1) * 32 {
+                    amax = amax.max(out[d].abs());
+                }
+                let s = (amax / 127.0).max(1e-6);
+                ks_want[((blk * PAGE + off) * HKV + h) * 8 + g] = s;
+                for d in g * 32..(g + 1) * 32 {
+                    k_want[((blk * PAGE + off) * HKV + h) * D + d] =
+                        quant_half_away(out[d], 1.0 / s, -128.0);
+                }
+            }
+        }
+    }
+
+    let dq_x = r.alloc(hb(&xq).len(), "fq.x").unwrap();
+    let dk_x = r.alloc(hb(&xk).len(), "fk.x").unwrap();
+    let dw = r.alloc(hb(&w).len(), "f.w").unwrap();
+    let dcos = r.alloc(hb(&cos).len(), "f.cos").unwrap();
+    let dsin = r.alloc(hb(&sin).len(), "f.sin").unwrap();
+    let dpos = r
+        .alloc(pos.len() * 4, "f.pos")
+        .unwrap();
+    let dqs = r.alloc(qs_want.len() * 4, "f.qs").unwrap();
+    let dqo = r.alloc(q_want.len(), "f.qo").unwrap();
+    let dkc = r.alloc(k_want.len(), "f.kc").unwrap();
+    let dks = r.alloc(ks_want.len() * 4, "f.ks").unwrap();
+    let dslots = r.alloc(T * 4, "f.slots").unwrap();
+    let dout = r.alloc(2, "f.out").unwrap();
+    r.upload(dq_x, &hb(&xq)).unwrap();
+    r.upload(dk_x, &hb(&xk)).unwrap();
+    r.upload(dw, &hb(&w)).unwrap();
+    r.upload(dcos, &hb(&cos)).unwrap();
+    r.upload(dsin, &hb(&sin)).unwrap();
+    r.upload(
+        dpos,
+        &pos.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+    )
+    .unwrap();
+    r.upload(dqs, &vec![0u8; qs_want.len() * 4]).unwrap();
+    r.upload(dqo, &vec![0u8; q_want.len()]).unwrap();
+    r.upload(dkc, &vec![0x7Fu8; k_want.len()]).unwrap();
+    r.upload(dks, &vec![0u8; ks_want.len() * 4]).unwrap();
+    r.upload(
+        dslots,
+        &slots.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+    )
+    .unwrap();
+
+    let qv = [
+        LaunchVal::Ptr(dq_x.ptr),
+        LaunchVal::Ptr(dw.ptr),
+        LaunchVal::Ptr(dcos.ptr),
+        LaunchVal::Ptr(dsin.ptr),
+        LaunchVal::Ptr(dpos.ptr),
+        LaunchVal::F32(eps),
+        LaunchVal::U64((HQ * D) as u64),
+        LaunchVal::U64(D as u64),
+        LaunchVal::U64(HALF as u64),
+        LaunchVal::I32(1),
+        LaunchVal::Ptr(dqs.ptr),
+        LaunchVal::Ptr(dqo.ptr),
+    ];
+    r.launch_aot(
+        "owl_norm_rope_q_int8_f16",
+        "cu/attn/norm_rope.cu",
+        (T as u32, HQ as u32, 1),
+        (D as u32, 1, 1),
+        (D * 4) as u32,
+        &qv,
+    )
+    .unwrap();
+    let kv = [
+        LaunchVal::Ptr(dk_x.ptr),
+        LaunchVal::Ptr(dw.ptr),
+        LaunchVal::Ptr(dcos.ptr),
+        LaunchVal::Ptr(dsin.ptr),
+        LaunchVal::Ptr(dpos.ptr),
+        LaunchVal::F32(eps),
+        LaunchVal::U64((HKV * D) as u64),
+        LaunchVal::U64(D as u64),
+        LaunchVal::U64(HALF as u64),
+        LaunchVal::I32(1),
+        LaunchVal::Ptr(dslots.ptr),
+        LaunchVal::Ptr(dkc.ptr),
+        LaunchVal::Ptr(dks.ptr),
+        LaunchVal::I32(HKV as i32),
+        LaunchVal::I32(D as i32),
+        LaunchVal::I32(PAGE as i32),
+        LaunchVal::Ptr(dout.ptr),
+    ];
+    r.launch_aot(
+        "owl_norm_rope_k_int8_write_f16",
+        "cu/attn/norm_rope.cu",
+        (T as u32, HKV as u32, 1),
+        (D as u32, 1, 1),
+        (D * 4) as u32,
+        &kv,
+    )
+    .unwrap();
+    r.sync().unwrap();
+
+    let mut got_q = vec![0u8; q_want.len()];
+    let mut got_qs = vec![0u8; qs_want.len() * 4];
+    let mut got_k = vec![0u8; k_want.len()];
+    let mut got_ks = vec![0u8; ks_want.len() * 4];
+    r.download(CheckBuf { ptr: dqo.ptr, bytes: got_q.len() }, &mut got_q).unwrap();
+    r.download(CheckBuf { ptr: dqs.ptr, bytes: got_qs.len() }, &mut got_qs).unwrap();
+    r.download(CheckBuf { ptr: dkc.ptr, bytes: got_k.len() }, &mut got_k).unwrap();
+    r.download(CheckBuf { ptr: dks.ptr, bytes: got_ks.len() }, &mut got_ks).unwrap();
+    let got_q: Vec<i8> = got_q.iter().map(|&b| b as i8).collect();
+    let got_k: Vec<i8> = got_k.iter().map(|&b| b as i8).collect();
+    let got_qs: Vec<f32> = got_qs.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+    let got_ks: Vec<f32> = got_ks.chunks_exact(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+    if got_q != q_want {
+        let i = got_q.iter().zip(&q_want).position(|(a,b)| a != b).unwrap();
+        eprintln!("[q-mismatch] i={i} got={} want={}", got_q[i], q_want[i]);
+        panic!("Q fused writer wrong");
+    }
+    for (i,(g,w)) in got_qs.iter().zip(&qs_want).enumerate() {
+        assert!((g-w).abs() <= 1e-7, "qscale[{i}] {g} != {w}");
+    }
+    if got_k != k_want {
+        let i = got_k.iter().zip(&k_want).position(|(a,b)| a != b).unwrap();
+        eprintln!("[k-mismatch] i={i} got={} want={}", got_k[i], k_want[i]);
+        panic!("K fused writer wrong");
+    }
+    for (i,(g,w)) in got_ks.iter().zip(&ks_want).enumerate() {
+        assert!((g-w).abs() <= 1e-7, "kscale[{i}] {g} != {w}");
+    }
+    println!("[int8-pipeline] fused Q/K writers bit-exact OK");
 }

@@ -213,31 +213,39 @@ extern "C" __global__ void owl_norm_rope_q_int8_f16(
         amax = fabsf(v0);
     }
 
-    float mm = amax;
+    float gmax[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    gmax[d / 32] = fmaxf(gmax[d / 32], fabsf(v0));
+    if (d < half) gmax[(d + half) / 32] = fmaxf(gmax[(d + half) / 32], fabsf(v1));
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        mm = fmaxf(mm, __shfl_down_sync(0xffffffffu, mm, off));
-    if (lane == 0) smem[warp] = mm;
-    __syncthreads();
-    if (warp == 0) {
-        float v = (lane < nwarp) ? smem[lane] : 0.0f;
+    for (int g = 0; g < 8; ++g) {
+        float mm = gmax[g];
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
-        if (lane == 0) smem[32] = v;
+            mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, off));
+        if (lane == 0) smem[64 + warp * 8 + g] = mm;
     }
     __syncthreads();
-    const float scale = fmaxf(smem[32] / 127.0f, 1e-6f);
-    const float qinv = 1.0f / scale;
+    if (d < 8) {
+        float mm = 0.0f;
+        for (int w = 0; w < nwarp; ++w) mm = fmaxf(mm, smem[64 + w * 8 + d]);
+        smem[192 + d] = mm;
+    }
+    __syncthreads();
+    const float scale0 = fmaxf(smem[192 + d / 32] / 127.0f, 1e-6f);
+    const float qinv0 = 1.0f / scale0;
+    const float scale1 = fmaxf(smem[192 + (d + half) / 32] / 127.0f, 1e-6f);
+    const float qinv1 = 1.0f / scale1;
 
     const size_t base = (t * gridDim.y + h) * hd;
     if (d < half) {
-        qout[base + d] = q_i8_q(v0, qinv);
-        qout[base + d + half] = q_i8_q(v1, qinv);
+        qout[base + d] = q_i8_q(v0, qinv0);
+        qout[base + d + half] = q_i8_q(v1, qinv1);
     } else if (d >= 2 * half) {
-        qout[base + d] = q_i8_q(v0, qinv);
+        qout[base + d] = q_i8_q(v0, qinv0);
     }
-    if (d == 0) qscale[t * gridDim.y + h] = scale;
+    if (d < 8) {
+        qscale[(t * gridDim.y + h) * 8 + d] = fmaxf(smem[192 + d] / 127.0f, 1e-6f);
+    }
 }
 
 extern "C" __global__ void owl_norm_rope_k_int8_write_f16(
@@ -294,7 +302,8 @@ extern "C" __global__ void owl_norm_rope_k_int8_write_f16(
     const float wf = __half2float(w[d]);
     const float n = xf * inv * (w_off ? (wf + 1.0f) : wf);
     const size_t p = (size_t)pos[t];
-    float v0 = 0.0f, v1 = 0.0f, amax = 0.0f;
+    float v0 = 0.0f, v1 = 0.0f;
+    float gmax[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     if (d < half) {
         const float xb = __half2float(xs[d + half]);
         const float wb = __half2float(w[d + half]);
@@ -306,28 +315,33 @@ extern "C" __global__ void owl_norm_rope_k_int8_write_f16(
         // 与旧链逐位一致:先落 F16(NormRope 输出),再统计/量化。
         v0 = __half2float(__float2half_rn(v0));
         v1 = __half2float(__float2half_rn(v1));
-        amax = fmaxf(fabsf(v0), fabsf(v1));
+        gmax[(d) / 32] = fmaxf(gmax[(d) / 32], fabsf(v0));
+        gmax[(d + half) / 32] = fmaxf(gmax[(d + half) / 32], fabsf(v1));
     } else if (d >= 2 * half) {
         v0 = __half2float(__float2half_rn(n));
-        amax = fabsf(v0);
+        gmax[d / 32] = fmaxf(gmax[d / 32], fabsf(v0));
     }
 
-    float mm = amax;
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        mm = fmaxf(mm, __shfl_down_sync(0xffffffffu, mm, off));
-    if (lane == 0) smem[warp] = mm;
-    __syncthreads();
-    if (warp == 0) {
-        float v = (lane < nwarp) ? smem[lane] : 0.0f;
+    for (int g = 0; g < 8; ++g) {
+        float mm = gmax[g];
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
-        if (lane == 0) smem[32] = v;
+            mm = fmaxf(mm, __shfl_xor_sync(0xffffffffu, mm, off));
+        if (lane == 0) smem[64 + warp * 8 + g] = mm;
     }
     __syncthreads();
-    const float scale = fmaxf(smem[32] / 127.0f, 1e-6f);
-    const float qinv = 1.0f / scale;
+    if (d < 8) {
+        float mm = 0.0f;
+        for (int w = 0; w < nwarp; ++w) mm = fmaxf(mm, smem[64 + w * 8 + d]);
+        smem[192 + d] = mm;
+    }
+    __syncthreads();
+    const float scale0 = fmaxf(smem[192 + d / 32] / 127.0f, 1e-6f);
+    const float qinv0 = 1.0f / scale0;
+    // rotate-half 的 v1 落在 d+half,属于另一个 32-dim group,必须用自己的 scale。
+    const float scale1 = fmaxf(smem[192 + (d + half) / 32] / 127.0f, 1e-6f);
+    const float qinv1 = 1.0f / scale1;
 
     const int block = slot / block_size;
     const int offset = slot % block_size;
@@ -335,13 +349,14 @@ extern "C" __global__ void owl_norm_rope_k_int8_write_f16(
         (static_cast<long long>(block) * block_size + offset) * num_heads * head_size +
         static_cast<long long>(h) * head_size;
     if (d < half) {
-        k_cache[row_base + d] = q_i8_k(v0, qinv);
-        k_cache[row_base + d + half] = q_i8_k(v1, qinv);
+        k_cache[row_base + d] = q_i8_k(v0, qinv0);
+        k_cache[row_base + d + half] = q_i8_k(v1, qinv1);
     } else if (d >= 2 * half) {
-        k_cache[row_base + d] = q_i8_k(v0, qinv);
+        k_cache[row_base + d] = q_i8_k(v0, qinv0);
     }
-    if (d == 0) {
-        k_scale[(static_cast<long long>(block) * block_size + offset) * num_heads + h] = scale;
-        out[0] = __float2half(0.0f);
+    if (d < 8) {
+        k_scale[((static_cast<long long>(block) * block_size + offset) * num_heads + h) * 8 + d] =
+            fmaxf(smem[192 + d] / 127.0f, 1e-6f);
     }
+    if (d == 0) out[0] = __float2half(0.0f);
 }

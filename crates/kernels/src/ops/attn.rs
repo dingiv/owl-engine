@@ -289,6 +289,45 @@ impl KernelSpec for Int8PrefillPaged {
     };
 }
 
+/// `owl_int8_prefill_paged_f16pv` —— int8 QK + f16 PV 的生产核:
+/// P f16×2^8、V f16 shadow(token-major)、f16 accumulator。
+pub struct Int8PrefillPagedF16Pv;
+
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.int8")]
+impl KernelSpec for Int8PrefillPagedF16Pv {
+    const ENTRY: &'static str = "owl_int8_prefill_paged_f16pv";
+    const SRC: &'static str = "cu/attn/int8_prefill_f16pv.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::I8, 2),
+        Param::t_in("qscale", Dtype::F32, 1),
+        Param::t_in("k", Dtype::I8, 1),
+        Param::t_in("kscale", Dtype::F32, 1),
+        Param::t_in("v16", Dtype::F16, 1),
+        Param::t_in("block_table", Dtype::F32, 2),
+        Param::t_out("out", Dtype::F16, 2),
+        Param::i32("T"),
+        Param::i32("L"),
+        Param::i32("Hq"),
+        Param::i32("Hkv"),
+        Param::i32("page"),
+        Param::i32("base_pos"),
+        Param::t_in("dep_k", Dtype::F16, 0),
+        Param::t_in("dep_v", Dtype::F16, 0),
+    ];
+    const POOL: &'static [PoolAccess] =
+        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::I8)];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
 /// `owl_reshape_and_cache_int8_k_only_knhd` —— 只写 K 的 int8 writer。
 ///
 /// int8 PV 的 V 走 per-page pack(见 `VPackInt8Prefill`/`VAppendInt8Paged`),
@@ -924,6 +963,7 @@ pub static INT8_DECODE_SPLIT: KernelMeta = meta_of::<Int8DecodeSplit>();
 pub static INT8_DECODE_GQA_TC_SPLIT: KernelMeta = meta_of::<Int8DecodeGqaTcSplit>();
 pub static INT8_DECODE_REDUCE: KernelMeta = meta_of::<Int8DecodeReduce>();
 pub static OWL_INT8_PREFILL_PAGED: KernelMeta = meta_of::<Int8PrefillPaged>();
+pub static OWL_INT8_PREFILL_PAGED_F16PV: KernelMeta = meta_of::<Int8PrefillPagedF16Pv>();
 pub static CHUNKED_PREFILL_FP8_KNHD_HD256: KernelMeta = meta_of::<ChunkedPrefillFp8KnhdHd256>();
 pub static K0_WRITE_FP8_CLASSIC: KernelMeta = meta_of::<K0WriteFp8Classic>();
 pub static K0_WRITE_BF16: KernelMeta = meta_of::<K0WriteBf16>();

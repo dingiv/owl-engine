@@ -141,6 +141,7 @@ pub enum SemanticKernel {
     VAppendInt8Paged,
     /// INT8 paged prefill(aux=[T,hq])
     Int8PrefillPaged,
+    Int8PrefillPagedF16Pv,
     /// INT8 paged decode(aux=[B,hq])
     Int8DecodePaged,
     /// INT8 decode KV split partial(aux=[B,hq,nparts])
@@ -386,6 +387,7 @@ impl SemanticKernel {
             SemanticKernel::VPackInt8Prefill => "attn.v_pack_int8_prefill",
             SemanticKernel::VAppendInt8Paged => "attn.v_append_int8_paged",
             SemanticKernel::Int8PrefillPaged => "attn.int8_prefill_paged",
+            SemanticKernel::Int8PrefillPagedF16Pv => "attn.int8_prefill_paged_f16pv",
             SemanticKernel::Int8DecodePaged => "attn.int8_decode_paged",
             SemanticKernel::Int8DecodeSplit => "attn.int8_decode_split",
             SemanticKernel::Int8DecodeGqaTcSplit => "attn.int8_decode_gqa_tc",

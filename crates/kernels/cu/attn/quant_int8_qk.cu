@@ -47,18 +47,21 @@ extern "C" __global__ void owl_quant_int8_qk_f16(
     return;
   }
   const __half* src = x + static_cast<long long>(row) * cols;
-  float amax = 0.0f;
+  float gmax[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
   for (int d = lane; d < cols; d += 32) {
-    amax = fmaxf(amax, fabsf(__half2float(src[d])));
+    const int g = d / 32;
+    gmax[g] = fmaxf(gmax[g], fabsf(__half2float(src[d])));
   }
-  amax = warp_max(amax);
-  const float scale = fmaxf(amax / 127.0f, 1e-6f);
-  const float inv = 1.0f / scale;
+#pragma unroll
+  for (int g = 0; g < 8; ++g) gmax[g] = warp_max(gmax[g]);
+  float scales8[8];
+#pragma unroll
+  for (int g = 0; g < 8; ++g) scales8[g] = fmaxf(gmax[g] / 127.0f, 1e-6f);
   int8_t* dst = q + static_cast<long long>(row) * cols;
   for (int d = lane; d < cols; d += 32) {
-    dst[d] = quant_i8_qk(__half2float(src[d]), inv);
+    dst[d] = quant_i8_qk(__half2float(src[d]), 1.0f / scales8[d / 32]);
   }
-  if (lane == 0) {
-    scales[row] = scale;
+  if (lane < 8) {
+    scales[row * 8 + lane] = scales8[lane];
   }
 }

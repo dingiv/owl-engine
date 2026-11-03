@@ -603,7 +603,7 @@ pub struct KvBuffers {
     /// naive 旧核不解引用(测试/回退路径可填哑表)。
     pub block_tables: TensorOps,
     /// INT8 KV 的两张 scale 平面(None = f16/fp8 档)。
-    /// K scale = `[nb, page, hkv]` / V scale = `[nb, hkv, 4]`。
+    /// K scale = `[nb, page, hkv, 8]` / V scale = `[nb, page, hkv]`。
     pub int8: Option<KvInt8Planes>,
 }
 

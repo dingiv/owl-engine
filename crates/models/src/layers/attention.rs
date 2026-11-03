@@ -893,7 +893,7 @@ impl Attention {
             return poisoned("KvBuffers.int8 缺 scale 平面(池未按 int8 建)");
         };
         let rows = tokens * self.hq;
-        let q_scale = TensorOps::zeros(Dtype::F32, vec![rows]);
+        let q_scale = TensorOps::zeros(Dtype::F32, vec![rows * 8]);
         let q8 = TensorOps::call(SemanticKernel::QuantInt8QkF16)
             .arg(&q.reshape(vec![rows, self.hd]))
             .arg(&q_scale)
@@ -1028,7 +1028,7 @@ impl Attention {
             return poisoned("KvBuffers.int8 缺 scale 平面(池未按 int8 建)");
         };
         let rows = tokens * self.hq;
-        let q_scale = TensorOps::zeros(Dtype::F32, vec![rows]);
+        let q_scale = TensorOps::zeros(Dtype::F32, vec![rows * 8]);
         let q8 = TensorOps::call(SemanticKernel::NormRopeQInt8F16)
             .aux(&[tokens, self.hq, self.hd])
             .arg(q_raw)

@@ -273,6 +273,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.v_pack_int8_prefill" => attn::v_pack_int8_prefill(ax(0), ax(1), ax(2)), // aux=[T,hkv,page]
         "attn.v_append_int8_paged" => attn::v_append_int8_paged(ax(0), ax(1)), // aux=[T,hkv]
         "attn.int8_prefill_paged" => attn::int8_prefill_paged(ax(0), ax(1)), // aux=[T,hq]
+        "attn.int8_prefill_paged_f16pv" => attn::int8_prefill_paged_f16pv(ax(0), ax(1)), // aux=[T,hq]
         "attn.int8_decode_paged" => attn::int8_decode_paged(ax(0), ax(1)), // aux=[B,hq]
         "attn.int8_decode_split" => attn::int8_decode_split(ax(0), ax(1), ax(2)), // aux=[B,hq,nparts]
         "attn.int8_decode_gqa_tc" => attn::int8_decode_gqa_tc_split(ax(0), ax(2), ax(3)), // aux=[B,hq,hkv,nparts]
@@ -1966,8 +1967,18 @@ pub mod attn {
         KernelPick::of::<crate::ops::attn::Int8PrefillPaged>(Shape {
             grid: (tokens.div_ceil(64) as u32, hq as u32, 1),
             block: (128, 1, 1),
-            // Q 16K + K双缓冲 16K + V 8K + P 2K + Kscale 2×128B
-            smem: (16384 + 16384 + 8192 + 2048 + 256) as u32,
+            // Q 16K + K 8K + V 8K + P32 8K + Kscale 1K + Vscale 128B
+            smem: (16384 + 8192 + 8192 + 2048 + 1024 + 128) as u32,
+        })
+    }
+
+    /// int8 prefill f16-PV:P f16×256 / V f16 shadow / f16 acc。
+    pub fn int8_prefill_paged_f16pv(tokens: usize, hq: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::Int8PrefillPagedF16Pv>(Shape {
+            grid: (tokens.div_ceil(64) as u32, hq as u32, 1),
+            block: (128, 1, 1),
+            // Q 16K + K 8K + V f16 16K + P f16 4K + Kscale 1K
+            smem: (16384 + 8192 + 16384 + 4096 + 1024) as u32,
         })
     }
 

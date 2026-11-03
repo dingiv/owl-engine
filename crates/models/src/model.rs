@@ -314,6 +314,9 @@ impl Model {
         let mut xs = self.embed.forward(ids, ctx).tag("embed");
         xs = self.vlm_inject(xs, ctx);
         nodes.push(("embed".into(), xs.clone()));
+        // 残差流是**原地块**：后续层的 fused_add_rmsnorm 会改写它。
+        // 层 tap 必须过一发 copy,否则 harvest 到的是被后层污染的值。
+        let tap_zero = TensorOps::zeros(xs.dtype(), vec![ctx.tokens, self.hidden]);
         let (mut kvi, mut gi) = (0usize, 0usize);
         for (li, layer) in self.layers.iter().enumerate() {
             let sub = self.layer_ctx(ctx, kvi, gi);
@@ -340,7 +343,7 @@ impl Model {
             } else {
                 gi += 1;
             }
-            nodes.push((format!("l{li}"), xs.clone()));
+            nodes.push((format!("l{li}"), xs.add(&tap_zero)));
         }
         let fin = self.norm.forward(&xs, ctx);
         nodes.push(("fin".into(), fin.clone()));

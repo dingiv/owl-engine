@@ -15,10 +15,15 @@ extends = [
 bind = "127.0.0.1:8141"
 
 # 单卡 24G 装不下 262k int8 池（per_tok=33056B）；131072 留足 65k 实测余量。
-# ⚠️ w4a8 虽把 65k prefill 从 1163 提到 1711 t/s，但 8k needle 实测退化
-#    （同 prompt w4a16 命中、w4a8 丢失）⇒ 质量门未过，生产档维持 w4a16。
+# 2026-11-03 生产化：w4a8 + int8 P8 已过质量门。
+# - 3 次中位（单 3090 Ti）：65k 1691.4 t/s / TTFT 38.75s；
+#   100k 1488.4 t/s / TTFT 67.19s。
+# - GSM8K n=200（thinking off, greedy）96.5%（193/200；FP8 参考 97.0%，
+#   −0.5pp，在 1pp 门内；4 题 finish=length）。
+# - needle 8k/32k/64k/100k 全 RETRIEVED。
+# 旧“w4a8 8k 丢失”是 norm_rope/K/V scale 旧 bug，不是 W4A8 本身。
 [model]
-quant = "w4a16"
+quant = "w4a8"
 
 [runtime]
 max_seq = 131072
