@@ -813,9 +813,9 @@ llama.cpp 实测 argmax,top-1 领先次高 ≥ 2.5 nat ⇒ 不是 near-tie):
 
 ### 14.5 剩下(刀 9 的真活)
 
-1. **GGUF + TP2**:现状对 `world > 1` **响亮拒**。要做的事(侦察已完成,见 §14.6):
-   块对齐的字节切片 + `ssm_out` 的**按 v-head 整块聚合**(27B 的 `ssm_out` = Q8_0,
-   `hv=128 % 32 = 0` ✓ 合法)或"非按头对齐的型 ⇒ TP 拒";
+1. **GGUF + TP2**:原状对 `world > 1` **响亮拒**。**2026-11-03 已放开 K/I 量子**
+   (块对齐字节切片 + `ssm_out` 原子段聚合 + per-rank 激活置换表;见 §15.8);
+   Q8_0 等 32 块量子的旧路一字未改。
 2. **prefill tile 臂**(R2):27B 的 prefill 现在 ~50 t/s 量级,是 M2 读数的前提;
 3. `flavors/gguf27b.toml` 的 `allowed_ops` 白名单(按发射账生成 + 入两处锁)。
 
@@ -833,10 +833,14 @@ llama.cpp 实测 argmax,top-1 领先次高 ≥ 2.5 nat ⇒ 不是 near-tie):
 
 **唯一的结构难点**:`ssm_out` 的列置换(A2 表)在 TP 下**不能各切一半**
 —— v-head 置换是在**全局** v-head 序上做的,任一 rank 只拿"文件序的一半"会拿到
-**非 grouped 连续**的头集 ⇒ 该 rank 的激活映射跨 rank 失效。两条出路:
+**非 grouped 连续**的头集 ⇒ 该 rank 的激活映射跨 rank 失效。三条出路(前两条已实现):
 ① **装载期按 grouped 头序聚合**(27B 的 Q8_0 允许:每头 4 块)⇒ 该 rank 直接吃
 grouped 激活,**不需要 A2 表**(零运行期成本);
-② 非按头对齐的型(`hv % be != 0`,如 K-quant 的 ssm_out)⇒ **TP 拒**(诚实)。
+② **原子跨头型(K/I 超块 256 > hv 128)**:一个原子 = 文件里两个连续头 ⇒ "逐头整原子"
+不存在。改按**文件头升序的整原子段**聚合,列序 = 原子序(非常规 grouped 序)⇒ 激活侧
+补一张 **per-rank** 32 元素块序表(`transform::vhead_q8_blocks_rank`);
+③ 头宽与原子**互不整除**(如 `hv=96` vs atom 256,或 rank 窗不落整原子)⇒ **TP 拒**(诚实)。
+②的详细几何、不变式改写与门见 §15.8。
 
 ---
 
@@ -862,16 +866,19 @@ grouped 激活,**不需要 A2 表**(零运行期成本);
 
 ### 15.2 一条贯穿全部角色的**不变式**(测试与实现的锚)
 
-> **每一 rank 装载后的张量 == 全量逆变换(grouped 序)张量的连续块**:
-> 行 = grouped 行窗口,列 = grouped 原子窗口;分段件(`attn_qkv`/
-> `ssm_conv1d`)是"每段各取一窗再拼接";`attn_q` 是 per-head `[q_h, gate_h]`
-> 交错，按整行窗口切（2026-10-24 定谳）。
+> **每一 rank 装载后的张量 == 全量逆变换(grouped 序)张量在**该 rank 头序**下的窗口**
+> (行 = grouped 行窗口,列 = 头序窗口;`atom | hv` 时头序 = grouped 连续序):
+> 分段件(`attn_qkv`/`ssm_conv1d`)是"每段各取一窗再拼接";`attn_q` 是 per-head
+> `[q_h, gate_h]` 交错，按整行窗口切（2026-10-24 定谳）。
 
-推论(★ 用户裁决的落地):**TP 档不需要 A2 表** —— 每 rank 的激活本来就是
-grouped 序的连续段 ⇒ `SourceFacts::GGUF_TP.vhead_tiled_columns = false`,
-`ssm_out` 不再声明虚拟键 `ssm_out_perm`(源侧也会**响亮拒**该虚拟键,防两条
-规范并存)。分片档的 `ssm_out` 权重内维 = 本 rank 的 24 个 v-head(grouped 序),
+推论(★ 用户裁决的落地):**32 块量子档不需要 A2 表** —— 每 rank 的激活本来就是
+grouped 序的连续段 ⇒ `vhead_tiled_columns` 在该档下不声明表。
+分片档的 `ssm_out` 权重内维 = 本 rank 的 24 个 v-head(grouped 序),
 逐头一段(vpr=3 时文件里是 3 段 × 8 头),每段 `hv/be` 个原子块。
+
+**2026-11-03 扩写(K/I 超块)**:`atom > hv` 时列序 = **原子序**(不是 grouped 连续序)
+⇒ 不变式改为"按 `rank_head_order` 指定的头序窗口",并补 **per-rank 激活侧块序表**;
+`atom | hv` 时头序 = grouped 连续序 ⇒ 退化为旧不变式(零成本,见 §15.8)。
 
 ### 15.3 角色表(GGUF 名 → 切法;**唯一点** = `shard::role_of`)
 
@@ -881,12 +888,12 @@ grouped 序的连续段 ⇒ `SourceFacts::GGUF_TP.vhead_tiled_columns = false`,
 | `Segs` | `attn_qkv`(q⊕k⊕v)、`ssm_conv1d` | 每段各取行窗口(V 段 grouped) |
 | `OutHead` | `attn_gate`/`ssm_alpha`/`ssm_beta`/`ssm_a`/`ssm_dt.bias` | v-head grouped 行窗口 |
 | `In` | `ffn_down`/`attn_output` | 块对齐列窗口 |
-| `InHead` | `ssm_out` | 逐头列段(v-head grouped) |
+| `InHead` | `ssm_out` | 列段:`atom \| hv` 逐头一段(grouped 序);`atom > hv` 整原子段(文件头升序,需 per-rank 表) |
 | `Replicate` | 各 norm / `token_embd` / `output` | 全量 |
 
 **三条响亮拒**(开箱即验,`GgufSource::open_shard` 逐键跑一遍):切分维不整除;
-量化件列切不落块边界;`hv % be != 0`(按头不可分 ⇒ TP 拒;4B 的 `ssm_out` 是
-K-quant 256 > `hv=128`,正是这条 —— 实测 4B 档被**如实拒**,不静默)。
+量化件列切不落块边界;`hv` 与原子**互不整除**或 rank 文件头窗**不落整原子**
+(⇒ 列序无定义 ⇒ TP 拒;`atom | hv` 与 `hv | atom > hv` 两种合法形态见 §15.8)。
 
 `GgufPlan` 也随档分叉:分片档的层声明是**分片维**,形状门按角色把声明维
 **放大 world 倍**再与文件比(`attn_q` 按整行；`attn_qkv` 的段长从张量本身反推)。
@@ -899,6 +906,8 @@ K-quant 256 > `hv=128`,正是这条 —— 实测 4B 档被**如实拒**,不静�
 | 几何自洽 | 被切的 **640** 键:两 rank 交付量之和 == 全量;切行类列全量、切列类原子两侧之和 == 全量 | `shard::tests::geometry_tiles_full_tensor_27b` |
 | **逐键逐位** | blk.0+blk.3 **全键面**:分片读 == grouped 全量对应窗口(36 个 (键,rank) 组合,含 `ssm_out` 逐头列段、`conv1d` 原生行窗、`ssm_a` 1-D 元素窗) | `tests/tp_load_gate_gguf.rs::gguf_shard_reads_equal_grouped_windows_all_keys` |
 | 装载账 | 分片 spec + `GgufPlan::for_shard` + 源 `elem_len` 三方一致;rank0/1 各 **851** 件(量化 498),量化字节 **9.64 GiB**(文件 17.67) | 同上 `sharded_plan_shapes_match_source_elem_len` |
+| **原子跨头几何×表互证**(2026-11-03) | 27B Q4_K `ssm_out`:rank0 段 = `[(0,4),(8,4),(16,4)]`、rank1 = `[(4,4),(12,4),(20,4)]`;表值 == 文件块坐的 grouped 头的局部块号;两 rank 文件块并集 = 24 原子不重不漏 | `shard::tests::ssm_out_atom_tiled_geometry_matches_rank_table` + `transform::tests::rank_head_order_27b_two_atom_regimes` / `vhead_q8_blocks_rank_is_window_local` |
+| **K/I 超块全键面**(2026-11-03) | `gguf:27b-iq4xs`(ssm_out 逐层 Q5_K/Q4_K/IQ4_XS/Q3_K)blk.0+blk.3 **36 个 (键,rank)** 逐位对拍;装载账 899 件(量化 498)· 7.12 GiB/rank | `tests/tp_load_gate_gguf.rs::gguf_iq4xs_shard_reads_equal_atom_tiled_windows` / `sharded_plan_shapes_match_source_iq4xs` |
 | 双卡 e2e | 首 token `" Paris"` 硬门 + 两 rank logits **逐位相同** + AR 注入对称(r0=r1=256)+ 捕获 `Captured` + rank0 live 9.68 GiB | `tests_gguf::gpu_gguf_27b_tp2` |
 
 ```bash
@@ -946,9 +955,54 @@ AWQ 既有噪声量级内，诊断门放宽为 `max|Δ| < 12`、`cos > 0.95`。
 ### 15.7 与既有设计文档的差异(回写)
 
 - §14.6 的 `ffn_down` 行:内维是 **17408**(不是 5120),68 块 ⇒ 各 34(原文笔误,已改);
-- §14.5 的"GGUF + TP2 待做" ⇒ **已收口**(本节);
+- §14.5 的"GGUF + TP2 待做" ⇒ **已收口**(本节;K/I 量子的另半见 §15.8);
 - `new-format-checklist.md` 的 TP 一节:新增"源自担分片(`owns_shard`)"一条
-  与"分片档源事实(去掉 A2 表)"一条。
+  与"分片档源事实(去/加 A2 表的两支)"一条。
+
+### 15.8 ★ K/I 超块量子放开(2026-11-03;`atom > hv` 的原子序列几何)
+
+> 触发:GGUF 对抗轮发现 `unsloth/…UD-IQ4_XS`(14.25 GB,本机 GGUF 主力档)的
+> `ssm_out` 逐层混 **Q5_K / Q4_K / IQ4_XS / Q3_K**(原子全是 256 > `hv=128`)
+> ⇒ §15.3 的响亮拒被触发,GGUF 线只能单卡。
+
+**几何**:写对 `classify` + `hv=128 < atom=256` 时"逐头取整原子"不存在
+(一原子 = 文件里**两个连续头**)。但 rank 的 grouped 头窗在文件里本就是
+**整原子对齐的 3 段**(27B,`vpr=3`、`hpa = atom/hv = 2`):
+
+| rank | grouped 头 | 文件头 | 原子 | `Cols::Segs`(原子单位) | dest 头序 |
+|---|---|---|---|---|---|
+| 0 | 0..23 | `{0..7}∪{16..23}∪{32..39}` | 12 | `[(0,4),(8,4),(16,4)]` | `[0,3,6,…,21, 1,4,…,22, 2,5,…,23]` |
+| 1 | 24..47 | `{8..15}∪{24..31}∪{40..47}` | 12 | `[(4,4),(12,4),(20,4)]` | 同形 +24 |
+
+⇒ 约束是"逐头"这个实现选择,不是数学。**不变式改写**(§15.2):dest 列序 =
+`rank_head_order` 指定的头序窗口;`atom | hv` 退化为 grouped 连续序,`atom > hv`
+为原子序。代价 = 激活侧要一张 **per-rank** 的 32 元素块序表(单卡是全量表):
+
+| 件 | 位置 | 改动 |
+|---|---|---|
+| 几何 | `formats/gguf/shard.rs` `InHead` 分支 | 原子段切 + 整原子/整窗口自检(不落整原子 ⇒ 响亮拒) |
+| 头序/表 | `formats/gguf/transform.rs` | 新 `rank_head_order` / `vhead_q8_blocks_rank`(纯函数,`QK_32` 块粒度) |
+| 虚拟键 | `formats/gguf/source.rs::virtual_perm` | TP 档**重新放行**,表按**同层** `ssm_out` 的实际原子宽生成 |
+| 消费者 | `layers/gdn.rs` | 逐层判据:`atom > hv` 才声明表(`tp_rank_shard` 事实 + `out_proj` 的计划型) |
+| 源事实 | `module.rs::SourceFacts` | 新增 `tp_rank_shard`;`vhead_tiled_columns` 语义改回"**文件**列序是 tiled" |
+
+**零设备门**(先跑,防"错序不报错只错值"):头序两档钉值 + 表是局部块置换 +
+几何×表互证(§15.4 表);`gguf:27b`(Q8_0)旧门**逐位不变**。
+
+**真机(3090 Ti 对,TP2,`tp_vocab_split=false`,DFlash2 关)**:
+
+| 项 | 结果 |
+|---|---|
+| boot | ✓ IQ4_XS 双卡就绪(权重 **7.7 GiB/rank**;两 rank 对称;零 Xid) |
+| 单卡 vs TP2 首 token(`max_tokens=1`,thinking off,32 prompt) | **31/32 逐字一致** · prompt_tokens 32/32 一致 |
+| 前 16 token | **29/32 一致** |
+| 前 64 token | 22/32(AR 语义的 1 ULP 混沌放大,见 §15.6/`tp2-log.md` §18.5) |
+| prefill(spec off) | 单卡 1768.9/1855.1 · TP2 **2186.3/2520.6**(512/8k)⇒ **1.24×/1.36×** |
+| decode(spec off) | 单卡 42.06/41.52 · TP2 **62.00/61.43** ⇒ **1.47×/1.48×** |
+
+⚠️ **口径修正**:本项目原拟的 G3"与单卡 ≥28/32 逐字一致"**不可达**(AR 的
+"两半各 round 到 f16 再相加"是 TP 固有浮点语义,`tp2-log.md` §18.5 已定谳);
+正确判据 = **首 token/首 16 token 的高一致率 + 两 rank 逐位相同 + 长输出允许混沌**。
 
 ---
 

@@ -64,7 +64,14 @@ extends = [
 
 `profiles/measurement/` = **测量/实验档**（不计入入口档面；子目录不参与档名发现）：
 
-- `qwen38_27b-gguf.toml` / `qwen38_27b-gguf-iq4.toml` —— GGUF 裸性能口径；
+- `qwen38_27b-gguf.toml` / `qwen38_27b-gguf-iq4.toml` —— GGUF 裸性能口径（单卡）；
+- `qwen38_27b-gguf-iq4-tp2.toml` —— **GGUF TP2 档（8136，双 3090 Ti）**：同一
+  `UD-IQ4_XS`（`ssm_out` 是 K/I 超块，2026-11-03 前的几何会响亮拒）；spec off
+  作数值门/性能基线。实测 prefill 1.24–1.36×、decode 1.47× 单卡，权重 7.7 GiB/rank；
+- `qwen38_27b-gguf-iq4-3080tp2.toml` —— **GGUF TP2 档（8135，双 3080 20G）**：
+  `max_seq = 262144`（模型 native 上限；**260k needle 实测 RETRIEVED**）；
+  spec off 基线 decode 1.64× / prefill 1.34–1.43×，d7 档 decode **181/221 t/s**；
+  权重 7.4 GiB/rank。设计与门见 `docs/devlog/models/gguf-tp2-kquant-设计.md`；
 - `qwen38_27b-3090-int8.toml` —— **INT8 KV 单卡档（8141）**：**w4a8**、
   max_seq 131072、K int8 + V packed + per-token/per-page scale；P8 prefill /
   P32 decode；spec off。3 次中位 65k 1691 t/s / TTFT 38.75s，

@@ -1,0 +1,51 @@
+# ── GGUF TP2 测量档(双 3080 20G;2026-11-03;K/I 超块放开后的"便宜硬件"形状)──
+#
+# 用途:同一 `UD-IQ4_XS`(14.25GB,`ssm_out` = Q5_K/Q4_K/IQ4_XS/Q3_K,原子 256 > hv 128)
+# 在 **2×3080 20G TP2** 上的 prefill/decode/上下文档。此前该文件只能单卡
+# (boot 响亮拒);2026-11-03 起按"整原子段"聚合 + per-rank 激活置换表。
+#
+# 实测(本档 spec off;`llm_speedtest` 同口径 nonce 固定,输出 128):
+#   单 3080          : prefill 1409.7/1493.3 · decode 33.91/34.62(512/8k)
+#   本档 TP2(原)     : prefill 1889.6/2142.6 · decode 55.67/56.92 ⇒ 1.34–1.43× / 1.64×
+#   本档 TP2(+GDN TP 形状,2026-11-04):prefill **2036.7/2353.3** · decode 55.34/56.30
+#                                     ⇒ **1.445×/1.576×** / 1.63×
+#   本档 TP2 + d7    : prefill 1846.3/2081.3 · decode **181.06/221.20** · AL 6.32
+#                      (单 3080 + d7:decode 109.03/145.93 · AL 6.82)
+#   权重驻留          : 7.4 GiB/rank(单卡 14.9 GiB;3080 单卡是 16.6 GiB)
+#   上下文            : 262144(模型 native 上限)可达 —— 260k needle **RETRIEVED**
+#                      (238.4 s 端到端;262k 时 11.66 GiB/rank)
+#   IQ3_S(12.0GB)    : 本档 boot ✓ 7.0 GiB/rank、cap ≈ 819k;decode 46.9/47.7(spec off)
+#
+# spec 档另测:加 `--set spec.depth=7 --set spec.lookup=true --set spec.tp_draft=true
+#                    --set spec.draft_path='"../models/syvai/Qwen3.8-27B-DFlash2-W4A16"'`
+# 数值门见 `docs/devlog/models/gguf-tp2-kquant-设计.md`(首 token 31/32、前 16 token 29/32)。
+#
+# ⚠️ `tp_vocab_split=true` + **greedy**(temperature=0) **EOS 不命中**(跑到 max_tokens):
+#    立案 `docs/devlog/serving/vocab-split-greedy-eos-立案.md`。数值门/对照实验请加
+#    `--set parallel.tp_vocab_split=false`;采样档不受影响(cand 路径带 half 偏移)。
+#
+# 端口纪律:双 3080 = 8135(与 `qwen38_27b-3080_tp2.toml` 同端口,同卡互斥)。
+extends = [
+  "../full.toml",
+  "../parts/model/27b-gguf-iq4xs.toml",
+  "../parts/hardware/3080-tp2.toml",
+  "../parts/kernel/fi-graph.toml",
+  "../parts/pool/fp8.toml",
+]
+
+[server]
+bind = "0.0.0.0:8135"
+
+[runtime]
+keepalive_ms = 1000
+# 262144 = 模型 native 上限(再高要 YaRN);实测 260k needle RETRIEVED。
+max_seq = 262144
+max_concurrency = 1
+prefill_chunk = 2048
+prefill_tail_merge = 0
+implicit_session = true
+
+[spec]
+# 数值门口径 = 关投机。性能档见文件头命令(spec.on=d7 + tp_draft)。
+depth = 0
+lookup = false
