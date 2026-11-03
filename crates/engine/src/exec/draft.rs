@@ -4,11 +4,58 @@ use super::mtp_window::{MtpWindowCfg, MtpWindowPlan};
 use super::*;
 use owl_models::ModelError;
 
+/// **两段式 propose 的现场**（发射 → 收割之间携带的最小事实集）。
+///
+/// 全是 `Copy` 标量：跨 `fold`/边界快照的 await 也不持任何借用。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingPropose {
+    /// 本轮 bonus（= 下一轮 anchor + lookup 融合的锚）
+    bonus: u32,
+    /// depth（非切档路的 `sel` 前缀长度）
+    depth: usize,
+    /// 采样档（决定是否读 scores/topk 建 q）
+    sampler_on: bool,
+    q_cfg: crate::sampler::SamplerCfg,
+    q_seed: u64,
+    /// 下一轮的 fed 位（= pos + m + 1）
+    fp: usize,
+}
+
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// DFlash2 propose 单图一轮(E5-DF4):输入槽装填(tokens/anchor/
     /// enc_pos/enc_slots/prop_pos/prop_slots/kv_len)→ replay → drafts
     /// 回读(select 缓冲前 7)。bt 覆盖自保同 eager 路(ensure + write_bt
     /// 同步律);图不消费 bt(草稿池 slots 直写),但槽号换算需要块链。
+    /// **⑦ 的两段式（一）：发射**。
+    ///
+    /// 2026-11-03 立案（P1-④ 无猜测版）：propose 图只依赖 ①verify 的 taps
+    /// ②本轮 anchor ③m —— 与 ⑥ 的 GDN 折叠/边界快照**互不相干**
+    /// （草稿池 vs 主池、taps 是图输出槽）。把发射挪到 fold **之前** ⇒
+    /// fold 的 host 侧入队与快照拷贝（实测 1.28 + 0.82 ms）与 propose 的
+    /// GPU 工作重叠；收割（读两半候选 + select）推迟到 fold 之后。
+    ///
+    /// **为什么不需要猜测锚点**：本函数不重排"谁依赖谁"，只重排"发射次序"
+    /// —— anchor（`bonus`）与 m 在 accept 之后就已确定，猜 m 的乐观路
+    /// （vLLM `next_num_draft_tokens` 同构）在这台机器上期望值为负
+    /// （数学档 `P(m=m_prev) ≈ 0.19`，猜错要重发整图 4.8 ms）。
+    pub(crate) async fn dflash_propose_launch(
+        &mut self,
+        m: usize,
+        pos: usize,
+        bonus: u32,
+    ) -> Result<PendingPropose> {
+        self.dflash_graph_round_launch(m, pos, bonus).await
+    }
+
+    /// **⑦ 的两段式（二）：收割**（读两半候选 → select → lookup 融合）。
+    pub(crate) async fn dflash_propose_harvest(
+        &mut self,
+        p: PendingPropose,
+        lookup: Option<&LookupProposal>,
+    ) -> Result<Vec<u32>> {
+        self.dflash_graph_round_harvest(p, lookup).await
+    }
+
     pub(crate) async fn dflash_graph_round(
         &mut self,
         m: usize,
@@ -16,21 +63,32 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         bonus: u32,
         lookup: Option<&LookupProposal>,
     ) -> Result<Vec<u32>> {
+        let p = self.dflash_graph_round_launch(m, pos, bonus).await?;
+        self.dflash_graph_round_harvest(p, lookup).await
+    }
+
+    async fn dflash_graph_round_launch(
+        &mut self,
+        m: usize,
+        pos: usize,
+        bonus: u32,
+    ) -> Result<PendingPropose> {
         let t_build = std::time::Instant::now();
         let fp = pos + m + 1;
         let depth = self.dev.spec_rt.depth;
         let block = depth + 1;
         self.tspec()?.spec_q_host = None;
         let sampler_on = self.turns.active()?.sampler_on;
-        let (q_temp, q_seed) = if sampler_on {
+        // q 走**请求的采样变换**(C2):top-k/top-p 与 p 同源,免得抽出必被拒的草稿
+        let (q_cfg, q_seed) = if sampler_on {
             let act = self.turns.active()?;
             (
-                act.sampler.temp,
+                act.sampler,
                 act.seed
                     .unwrap_or_else(|| act.id.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
             )
         } else {
-            (0.0, 0)
+            (crate::sampler::SamplerCfg::default(), 0)
         };
         let _page = self.dev.pool.geom.page;
         {
@@ -144,17 +202,65 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
         }
         mrec("spec.propose.launch", t_launch.elapsed());
+        // 纯 GPU 判别（`[probes] step_profile`；2026-11-03 随两段式搬进发射段）：
+        // drain = 排水（吸收上一相的残余，不算 propose 成本）/
+        // first = 首读（含本图首次执行）/ pure = 同步后再 replay（图独占 GPU）。
+        if let (Some(t_drain), Some(t0v)) = (t_drain0, t0) {
+            let pg = self
+                .dev
+                .graphs
+                .dflash
+                .as_mut()
+                .ok_or_else(|| ModelError::EngineInvariant {
+                    what: "dflash_graph 缺席(档位不一致)".into(),
+                })?;
+            let _ = pg.read_output_f32("sel").await?;
+            let t1 = std::time::Instant::now();
+            pg.replay().await?;
+            // 失败已 `?` 上报;成功值此处不需要(仅为同步点)
+            let _ = pg.read_output_f32("sel").await?;
+            let pure = t1.elapsed();
+            owl_shared::log_info!(
+                "dflash-prof",
+                "drain={:?} first_gpu={:?} pure_gpu={pure:?}",
+                t0v - t_drain,
+                t1 - t0v
+            );
+        }
+        Ok(PendingPropose {
+            bonus,
+            depth,
+            sampler_on,
+            q_cfg,
+            q_seed,
+            fp,
+        })
+    }
+
+    async fn dflash_graph_round_harvest(
+        &mut self,
+        p: PendingPropose,
+        lookup: Option<&LookupProposal>,
+    ) -> Result<Vec<u32>> {
+        let PendingPropose {
+            bonus,
+            depth,
+            sampler_on,
+            q_cfg,
+            q_seed,
+            fp,
+        } = p;
         let t_sel = std::time::Instant::now();
-        let t1 = prof.then(std::time::Instant::now);
         // ★ **切档收割面**（P1.1 × P2.1,2026-10-19）:图本档只出半表候选
         // （`drafts` 槽不写）⇒ 走"读两 rank 候选 → host 合并 → rank0 select"。
         if self.head_split_active() {
-            let mut d = self.dflash_select_merged(bonus).await?;
+            let d = self
+                .dflash_select_merged(bonus, sampler_on, q_cfg, q_seed, fp, lookup)
+                .await?;
             mrec("spec.propose.sel", t_sel.elapsed());
             if self.boot.probes.dflash_probe {
-                owl_shared::log_debug!("dflash-probe", "pos={pos} anchor={bonus} drafts={d:?}");
+                owl_shared::log_debug!("dflash-probe", "anchor={bonus} drafts={d:?}");
             }
-            self.apply_dflash_lookup(&mut d, lookup);
             return Ok(d);
         }
         let pg = self
@@ -169,7 +275,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let out = &sel[..depth];
         // proposal_q（采样档）：`sel` 后段是 scores；`topk_all` 是选择器
         // 候选（值区‖索引区）。两槽都由 dflash 图同轮产出。
-        let q_slots = if sampler_on && pg.has_output("sel") && pg.has_output("topk_all") {
+        let q_slots = if self.dev.spec_rt.q_host
+            && sampler_on
+            && pg.has_output("sel")
+            && pg.has_output("topk_all")
+        {
             Some((
                 sel[depth..depth + depth * 16 * 16].to_vec(),
                 pg.read_output_f32("topk_all").await?,
@@ -177,40 +287,41 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             None
         };
-        // 纯 GPU 判别(E5-DF4 性能;2026-10-18 立案改三段):排水后首次执行 vs 二次执行
-        if let (Some(t_drain), Some(t0v), Some(t1v)) = (t_drain0, t0, t1) {
-            let t2 = std::time::Instant::now();
-            let first = t2 - t1v; // 首次发射+读(流已排干 ⇒ 纯本图)
-            pg.replay().await?;
-            // 失败已 `?` 上报;成功值此处不需要(仅为同步点)
-            let _ = pg.read_output_f32("sel").await?;
-            owl_shared::log_info!(
-                "dflash-prof",
-                "drain={:?} first_gpu={first:?} pure_gpu={:?}",
-                t0v - t_drain,
-                t2.elapsed()
-            );
-        }
-        if let (Some(a), Some(b)) = (t0, t1) {
-            // E2 语义勘误(原 fill/launch/read 误导):total = 轮内全程;
-            // step = 装填+发射段;read_extra = 首读段(含队列排水);
-            // pure_gpu(上行)= 同步后裸 replay = 图独占 GPU 时间
-            owl_shared::log_info!(
-                "dflash-prof",
-                "total={:?} step={:?} read_extra={:?}",
-                a.elapsed(),
-                b - a,
-                b.elapsed()
-            );
-        }
         if let Some((scores, topk)) = q_slots {
             let cand_u: Vec<u32> = topk[depth * 16..2 * depth * 16]
                 .iter()
                 .map(|&v| v as u32)
                 .collect();
-            let mut q = super::proposal_q::DraftQ::from_scores(
-                &scores, &cand_u, depth, q_temp, q_seed, fp,
-            )?;
+            // C3 一次性口径提示:请求关掉截断 ⇒ spec 的 p 仍是 top-32 候选口径
+            if !self.dev.spec_rt.q_cfg_warned
+                && q_cfg.topk >= super::proposal_q::CAND
+                && q_cfg.topp >= 1.0
+            {
+                owl_shared::log_warn!(
+                    "spec",
+                    "请求关掉采样截断(top_k={} top_p={})⇒ spec 的目标分布仍按 top-32 \
+                     候选口径成形,与裸 decode 的整词表口径不同(只影响极端尾部质量)",
+                    q_cfg.topk,
+                    q_cfg.topp
+                );
+                self.dev.spec_rt.q_cfg_warned = true;
+            }
+            let mut q = super::proposal_q::DraftQ::from_scores(super::proposal_q::QInput {
+                scores: &scores,
+                cand: &cand_u,
+                depth,
+                // 逐位置边际 = `topk_all` 值半区（`walk = unary` 时被读）
+                unary: Some(&topk[..depth * 16]),
+                walk: self.dev.spec_rt.dflash_walk,
+                cfg: &q_cfg,
+                seed: q_seed,
+                base_pos: fp,
+                alpha: self.dev.spec_rt.q_alpha,
+                floor: self.dev.spec_rt.q_floor,
+            })?;
+            // C3 观测面:请求截断草稿支撑的程度(>0 正常;持续很大 = 草稿头分布很平)
+            super::mcnt("spec.q.trunc", q.truncated_steps() as u64);
+            super::mcnt("spec.q.drop_ppm", (q.dropped_mass() * 1e6) as u64);
             let before = q.drafts().to_vec();
             self.apply_dflash_lookup(q.drafts_mut(), lookup);
             let after = q.drafts().to_vec();
@@ -1316,9 +1427,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 唯一必须主机参与的只剩 peer 候选:两 rank 的图**并发发射**，谁都不能
     /// 读对方本轮产物 ⇒ 一次 dtoh 既取数据也当同步点。
     /// 图缺席（未切档/捕获降级/单卡）⇒ 回落原 host 合并 + eager select。
-    async fn dflash_select_merged(&mut self, bonus: u32) -> Result<Vec<u32>> {
+    async fn dflash_select_merged(
+        &mut self,
+        bonus: u32,
+        sampler_on: bool,
+        q_cfg: crate::sampler::SamplerCfg,
+        q_seed: u64,
+        base_pos: usize,
+        lookup: Option<&LookupProposal>,
+    ) -> Result<Vec<u32>> {
         use owl_models::layers::dflash2::TOP_K;
         let rows = self.dev.spec_rt.depth;
+        // **走格策略**（`[spec] dflash_walk`;AL 消融量具）：conditional = 设备核原律
+        // （零回归）；其余两臂 = 收割面 host 用同一张分数表重走格，需要图的
+        // `mcand` 槽（合并后的 值‖id 两半）。
+        let walk = self.dev.spec_rt.dflash_walk;
         let k = TOP_K;
         let half = self.dev.boot.model.logits_vocab();
         let t_r1 = std::time::Instant::now();
@@ -1384,7 +1507,107 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 half,
                 half
             );
-            return Ok(sel[..rows].iter().map(|&v| v as u32).collect());
+            let dev_drafts: Vec<u32> = sel[..rows].iter().map(|&v| v as u32).collect();
+            // **走格消融臂**（`dflash_walk != conditional`）本来就多读一次边际表
+            // ⇒ 顺手落名次统计面
+            // （`spec.cand.{r0,r4,r8,r16,miss}`；条件档不读表,零回归）。
+            if walk == owl_shared::config::DflashWalk::Conditional {
+                // **生产臂 + 采样档**：把同一张表变成“真实 q”（2026-11-03 校准）。
+                //
+                // 设备 `sel` 是 argmax（q = point mass）⇒ 拒绝采样的每步接受
+                // 概率退化为 `p(argmax)`（实测 = 名次直方图的 r0：创作 0.34 /
+                // 数学 0.755）。这里用图已算出的 `scores`/`mcand` 在 host 建 q
+                // 并按请求温度抽签，接受即拿到 `Σ min(p,q)`；精确性不变
+                // （q 可为任意分布，拒绝采样负责修正）。greedy 档不进场。
+                if !sampler_on || !self.dev.spec_rt.q_host {
+                    return Ok(dev_drafts);
+                }
+                if sel.len() < rows * (k * k + 1) {
+                    return Err(ModelError::EngineInvariant {
+                        what: format!(
+                            "select 图 sel 槽长 {} 装不下 scores（需 rows·(k²+1)={}）",
+                            sel.len(),
+                            rows * (k * k + 1)
+                        ),
+                    });
+                }
+                let mcand = pg.read_output_f32("mcand").await?;
+                if mcand.len() != 2 * rows * k {
+                    return Err(ModelError::EngineInvariant {
+                        what: format!(
+                            "select 图 mcand 槽长 {} ≠ 2·{}·{}",
+                            mcand.len(),
+                            rows,
+                            k
+                        ),
+                    });
+                }
+                let scores = &sel[rows..rows + rows * k * k];
+                let (vals, cands_f) = (&mcand[..rows * k], &mcand[rows * k..]);
+                let cands: Vec<u32> = cands_f.iter().map(|&v| v as u32).collect();
+                let (alpha, floor) =
+                    (self.dev.spec_rt.q_alpha, self.dev.spec_rt.q_floor);
+                let mut q = super::proposal_q::DraftQ::from_scores(super::proposal_q::QInput {
+                    scores,
+                    cand: &cands,
+                    depth: rows,
+                    unary: Some(vals),
+                    walk,
+                    cfg: &q_cfg,
+                    seed: q_seed,
+                    base_pos,
+                    alpha,
+                    floor,
+                })?;
+                super::mcnt("spec.q.trunc", q.truncated_steps() as u64);
+                super::mcnt("spec.q.drop_ppm", (q.dropped_mass() * 1e6) as u64);
+                // lookup 是 host 侧确定性改写 ⇒ q 退化为该步 one-hot（与单卡档同律）
+                let before = q.drafts().to_vec();
+                self.apply_dflash_lookup(q.drafts_mut(), lookup);
+                let after = q.drafts().to_vec();
+                for (i, (&a, &b)) in before.iter().zip(after.iter()).enumerate() {
+                    if a != b {
+                        q.force_one_hot(i, b);
+                    }
+                }
+                let d = q.drafts().to_vec();
+                self.tspec()?.spec_q_host = Some(q);
+                return Ok(d);
+            }
+            // 消融臂：读合并候选 + 逐位置边际（两次读数同流，第二读近零成本），
+            // 然后用**同一张分数表**在 host 侧按 `walk` 重走格。
+            if sel.len() < rows * (k * k + 1) {
+                return Err(ModelError::EngineInvariant {
+                    what: format!(
+                        "select 图 sel 槽长 {} 装不下 scores（需 rows·(k²+1)={}）",
+                        sel.len(),
+                        rows * (k * k + 1)
+                    ),
+                });
+            }
+            let mcand = pg.read_output_f32("mcand").await?;
+            if mcand.len() != 2 * rows * k {
+                return Err(ModelError::EngineInvariant {
+                    what: format!(
+                        "select 图 mcand 槽长 {} ≠ 2·{}·{}",
+                        mcand.len(),
+                        rows,
+                        k
+                    ),
+                });
+            }
+            let scores = &sel[rows..rows + rows * k * k];
+            let (vals, cands_f) = (&mcand[..rows * k], &mcand[rows * k..]);
+            // 设备槽是 f32 承载的 id（契约 5：词表 id < 2²⁴ 精确）
+            let cands: Vec<u32> = cands_f.iter().map(|&v| v as u32).collect();
+            // 名次探针的原料（本轮边际表；`exec/spec.rs` 在 accept 后记账）
+            {
+                let t = self.tspec()?;
+                t.probe_vals = vals.to_vec();
+                t.probe_cand = cands.clone();
+            }
+            self.note_walk_consistency(scores, vals, &cands, &dev_drafts, rows)?;
+            return super::proposal_q::walk_tokens(scores, vals, &cands, rows, walk);
         }
 
         // ---- 兜底:host 合并 + eager select（图缺席时的原路,语义逐字不变）----
@@ -1453,7 +1676,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let proj_t = owl_models::TensorOps::of_block(proj_blk.id, proj_blk.dtype, vec![rows, rank]);
         let anchor_t =
             owl_models::TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[bonus as f32]));
-        let (drafts, _scores) = d2
+        let (drafts, scores_t) = d2
             .selector()
             .select_from_candidates(&cand_t, &vals_t, &proj_t, &anchor_t, rows);
         let t_prep = t_eval.elapsed();
@@ -1480,10 +1703,66 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             half
         );
         mrec("spec.propose.sel.eval", t_eval.elapsed());
-        Ok(buf
+        let dev_drafts: Vec<u32> = buf
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
-            .collect())
+            .collect();
+        // 消融臂：scores 也取回（cold path 的第二次 eval+dtoh；生产档不会到这里）
+        if walk != owl_shared::config::DflashWalk::Conditional {
+            let t = self.tspec()?;
+            t.probe_vals = mv.clone();
+            t.probe_cand = mc.clone();
+        }
+        if walk != owl_shared::config::DflashWalk::Conditional {
+            let face = self.dev.graphs.session.face_mut();
+            let (sb, sarena) = owl_models::interpreters::eval_ops_scoped_env(
+                scores_t.step(),
+                face,
+                self.dev.spec_rt.draft_env,
+                self.dev.boot.tp.as_ref(),
+            )
+            .await?;
+            let mut sbuf = vec![0u8; 4 * rows * k * k];
+            let face = self.dev.graphs.session.face_mut();
+            face.dtoh(&sb, &mut sbuf).await?;
+            face.free(&[sb.id]).await?;
+            face.free(&sarena).await?;
+            let scores: Vec<f32> = sbuf
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            self.note_walk_consistency(&scores, &mv, &mc, &dev_drafts, rows)?;
+            return super::proposal_q::walk_tokens(&scores, &mv, &mc, rows, walk);
+        }
+        Ok(dev_drafts)
+    }
+
+    /// **走格一致性自检**（消融臂）：host `Conditional` 走格必须逐位等于设备 `sel`。
+    ///
+    /// 消融臂之间只能差"读哪一行"一项；条件臂先对不上设备 ⇒ 那组 AL 不可归因。
+    /// 每轮都查（rows×16 次比较，µs 级）；不一致只告警一次 + 计数器（防刷屏）。
+    fn note_walk_consistency(
+        &mut self,
+        scores: &[f32],
+        vals: &[f32],
+        cand: &[u32],
+        dev_drafts: &[u32],
+        rows: usize,
+    ) -> Result<()> {
+        let ok = super::proposal_q::walk_matches_device(scores, vals, cand, dev_drafts, rows)?;
+        super::mcnt("spec.walk.check", 1);
+        if !ok {
+            super::mcnt("spec.walk.mismatch", 1);
+            if !self.dev.spec_rt.walk_warned {
+                owl_shared::log_warn!(
+                    "spec",
+                    "[spec] dflash_walk 消融臂自检失败：host 条件走格 ≠ 设备 sel 槽\
+                     （分数表/候选域不同源）⇒ 本臂 AL 不可归因，先查 select 图 mcand 槽"
+                );
+                self.dev.spec_rt.walk_warned = true;
+            }
+        }
+        Ok(())
     }
 
     /// mtp 链表 ensure(E5-M2b;propose eager 路径用 from_host 表,非持久

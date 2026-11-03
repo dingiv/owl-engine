@@ -1745,11 +1745,20 @@ impl<D: DeviceClient> GraphFleet<D> {
                     InputSlot::f32("peercand", 2 * rows * k),
                     InputSlot::f32("anchor", 1),
                 ],
-                outputs: vec![OutputSlot {
-                    name: "sel".into(),
-                    shape: vec![rows * (k * k + 1)],
-                    dtype: Dtype::F32,
-                }],
+                outputs: vec![
+                    OutputSlot {
+                        name: "sel".into(),
+                        shape: vec![rows * (k * k + 1)],
+                        dtype: Dtype::F32,
+                    },
+                    // 合并后的 值‖id 两半（全表域）：`[spec] dflash_walk` 消融臂
+                    // 的 host 重走格读面（conditional 臂不读，零回归）。
+                    OutputSlot {
+                        name: "mcand".into(),
+                        shape: vec![2 * rows * k],
+                        dtype: Dtype::F32,
+                    },
+                ],
                 capture: !knobs.no_graph,
                 slab_fixed: knobs.cuda.capture_slab_mb.is_some(),
                 debug_probe: knobs.probes.debug,
@@ -1786,6 +1795,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 // (host 从 sel[0..rows] 取 drafts,与未切档档同约定)
                 let _ = drafts;
                 sc.output("sel", &scores)?;
+                sc.output("mcand", &merged)?;
                 Ok(())
             },
         )

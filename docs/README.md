@@ -124,6 +124,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/serving/agent-surface.md`](devlog/serving/agent-surface.md) — Agent serving surface (pi integration)
 - ⬜ [`devlog/serving/constrained-tool-grammar/README.md`](devlog/serving/constrained-tool-grammar/README.md) — Constrained tool grammar project: prototype design, phases, decode-cost budget (design only; not implemented)
 - ⬜ [`devlog/serving/agent-prefix-10k.md`](devlog/serving/agent-prefix-10k.md) — Agent 10K multi-turn prefix hit rate: snapshot verdict, message-boundary anchors, probe
+- ✅ [`devlog/serving/dflash-算法优化-设计.md`](devlog/serving/dflash-算法优化-设计.md) — **DFlash2 算法对齐**(owl/sglang/vLLM 三家同骨架:selector lattice + 并行 draft + 链式 verify + 精确拒绝采样);优化点总表 + 便宜档施工(C1 罚历史只吃已提交、C2 q 走请求采样变换、C3 口径记账);**查出 TP2 档不走 q 路径(C4)**
 - ✅ [`devlog/serving/multimodal-block-identity-立案.md`](devlog/serving/multimodal-block-identity-立案.md) — **多模态块身份缺失**:同文本换截图 ⇒ 整链命中 ⇒ 复用陈旧图像 KV(GUI agent 点不中,偏 30–40 px);修法 = 逐块图像指纹 `BlockTag`(纯文本身份逐位不变);含 4 点交叉验证、感知地板排除与两条门
 - ⬜ [`devlog/serving/multi-session.md`](devlog/serving/multi-session.md) — Multi-session and concurrency
 - ⬜ [`devlog/serving/cross-session-batch.md`](devlog/serving/cross-session-batch.md) — Cross-session batched decode (B5.1)

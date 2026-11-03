@@ -312,6 +312,11 @@ pub(crate) struct TurnSpecState {
     pub(crate) spec_drafts_host: Option<Vec<u32>>,
     /// 与 `spec_drafts_host` 同轮的 proposal q（DFlash2 采样档）。
     pub(crate) spec_q_host: Option<crate::exec::proposal_q::DraftQ>,
+    /// **边际探针**（`[probes] dflash_probe`）：本轮 propose 合并后的逐位置
+    /// 边际表（`[depth,16]` 值 ‖ id）—— 只作"目标选中的 token 在草稿边际里
+    /// 排第几"的名次统计，量产面不读。
+    pub(crate) probe_vals: Vec<f32>,
+    pub(crate) probe_cand: Vec<u32>,
     /// B4:m=0 连击计数(成功轮归零)
     pub(crate) spec_zero_streak: usize,
     /// B4:降级态(true = 调度发裸 Decode;草稿池逐 token 同步)
@@ -331,6 +336,10 @@ pub(crate) struct TurnSpecState {
     /// (真机实测:健康档 AL 2.6 的 turn 里 `deg=3238/6445`)。降级需 2 个
     /// **连续**饿窗口,或 1 个饿窗口 + 连击佐证。饿窗口清零。
     pub(crate) low_windows: u8,
+    /// B4 降级态**连续探测命中数**(2026-11-03 第二版):旧实现一次
+    /// `m ≥ 1` 就恢复,而创作档 `P(m≥1)≈0.29` ⇒ 降级↔恢复振荡(实测 363 轮
+    /// 里 4 降 3 恢复)。恢复改为连续两次命中或一次决定性命中(m≥3)。
+    pub(crate) probe_hits: u8,
     /// B4 滚动 AL 窗口(2026-10-12):轮数 / 产出 token 数 —— 连击 streak
     /// 会被"偶发 m=1"破解(随机域 AL≈1.1 时 9.3 t/s 案),窗口均值
     /// < 盈亏线(3.6 tok/轮)即降级,不看连击
@@ -368,6 +377,10 @@ pub(crate) struct TurnSpecState {
     pub(crate) adaptive_downshift: bool,
     /// 连续低于门的观察窗数（2 窗才降，避免 16k 冷启动瞬态误切）。
     pub(crate) adaptive_low_windows: u8,
+    /// 浅档**饱和**的连续观察窗数（P1-⑤ 升档方向；2 窗才升）。
+    pub(crate) adaptive_full_windows: u8,
+    /// 当前观察窗内**吃满 `depth_min`** 的轮数（升档判据的分子）。
+    pub(crate) adaptive_full_rounds: u32,
 }
 
 /// 播种采样数(盈亏线分母;见 [`TurnSpecState::bare_seed_left`])。

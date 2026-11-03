@@ -81,6 +81,8 @@
 //! | pool | disk_cache_mb / snap_disk_mb | usize / 0、0(**磁盘两层分片**;0 = 关层) |
 //! | pool | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
 //! | spec | depth / draft / dumb / draft_kv_fp8 | usize 0(off)、SpecDraft auto/mtp/dflash2、flag、flag |
+//! | spec | dflash_walk | DflashWalk 枚举("conditional"|"fixed_pred"|"unary")/ conditional(**AL 消融旋钮**;缺省 = 设备核原律) |
+//! | spec | q_alpha / q_floor | f32 / 1.0、0.0(**草稿 q 校准旋钮**;α = logit 缩放,ε = 候选集上的均匀地板) |
 //! | spec | mtp_window / mtp_sink | usize / 0、64(MTP 草稿读视图;0 = full) |
 //! | spec | mtp_window_min_ctx | usize / 0(短 ctx 不压缩的门槛) |
 //! | spec | adaptive_depth / depth_min / depth_switch_ctx / adaptive_min_tpr | flag / false、3、49152、3.0(MTP 两档图族 + T1b 门) |
@@ -1153,6 +1155,38 @@ impl SpecDraft {
     }
 }
 
+/// **DFlash2 选择器 walk 的"读哪一行"策略**(`[spec] dflash_walk`;
+/// 2026-11-03 S0 AL 消融旋钮)。
+///
+/// 选择器的分数表是 `scores[e, prev, c] = unary[e,c] + A[pred]·proj[e]·B[cand]`,
+/// 第 e 步读哪一行决定"条件化"的强弱。设备核
+/// (`crates/kernels/cu/dflash/dflash_select.cu`) 的贪心 walk 是 `Conditional`。
+///
+/// 这**不是调优旋钮,是量具**:DDTree/Bole 一类"树投机"用逐位置**边际**
+/// `q_i(v)` 造树,而 owl 的格 walk 是**条件化**的（依赖上一步选中的候选）。
+/// 两者的 AL 差决定树该按边际造（差 ≈ 0）还是必须按条件兄弟造（差 ≫ 0）。
+/// 生产档保持缺省（逐字节不变）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DflashWalk {
+    /// 核内原律：第 e 步读 `scores[e, 上一步**选中**的候选, ·]`
+    #[default]
+    Conditional,
+    /// 每步都读 `scores[e, 0, ·]`（条件于**固定参考前驱** `cand[e-1][0]`;
+    /// 砍掉"上一步抽中谁 → 这一步读哪行"的反馈环）
+    FixedPred,
+    /// 每步只读 `unary[e, ·]`（逐位置边际，**完全丢弃边缘分**;
+    /// 等价于 DDTree 的 `q_i(v)`）
+    Unary,
+}
+
+impl DflashWalk {
+    /// 缺省 `conditional` 是否要点名（日志/文档用）
+    pub fn is_conditional(&self) -> bool {
+        matches!(self, Self::Conditional)
+    }
+}
+
 /// 投机解码(spec 三态/草稿族/草稿池量化/B4 降级参数/verify 图诊断)
 ///
 /// ⚠️ 非 `Copy`(2026-10-21):`draft_path` 是 `Option<PathBuf>`。
@@ -1173,6 +1207,34 @@ pub struct SpecCfg {
     /// 草稿池按这个窗口做环形缓冲(不再按 pool_tokens 全量物化);
     /// 当前 NC 核只实例化 2048,写非 2048 = boot 拒(等核支持 4k/8k)。
     pub draft_window: usize,
+    /// **DFlash2 选择器 walk 策略**（缺省 `conditional` = 设备核原律）。
+    /// 只服务 DFlash2；MTP/Off 档写非 conditional = boot 拒（不静默忽略）。
+    pub dflash_walk: DflashWalk,
+    /// **草稿 q 的 logit 缩放**（`>0`；1.0 = 原律）。
+    ///
+    /// 选择器边分不是校准 logits（低秩码本内积 + unary）：实测 `q(top1)≈0.97`
+    /// 而目标 `p(top1)≈0.34` ⇒ q 严重过自信 ⇒ `Σ min(p,q) ≈ p(top1)`，
+    /// 拒绝采样拿不到任何好处。乘上 α 把 q 摊开（α→0 = 候选集上的均匀分布）。
+    /// q 可以是任意分布（精确性由拒绝采样保证），本旋钮只影响**接受率**。
+    pub q_alpha: f32,
+    /// **草稿 q 的均匀地板**（`[0,1)`；0 = 不加）。
+    ///
+    /// `q ← (1−ε)·q + ε·uniform(候选集)`：给平坦负载一个保底接受面，
+    /// 免得 α 把某个高熵负载的尾部削掉。与 α 正交。
+    pub q_floor: f32,
+    /// **是否启用 host 侧草稿 q**（拒绝采样路径；缺省 **true**）。
+    ///
+    /// 2026-11-03 真机 A/B（4080 单卡，12 轮 ×2 负载）：开 = 创作 AL 1.450 /
+    /// 数学 3.711；关（设备 argmax + 相等式接受）= 1.334 / 3.470 ⇒ **开高 ~8%**。
+    /// 与离线逐步口径不同的原因未定谳（离线按 `Σ min(p,q)` 算 q 更差）；
+    /// 以真机为准。注意：**对 q 做温度摊平只会更差**（同一批 dump 实测
+    /// α=0.5/0.25 的接受率单调下降）⇒ `q_alpha` 保持 1.0。
+    pub q_host: bool,
+    /// **[标定] 草稿 q 的 dump 路径**（空 = 关）。
+    ///
+    /// 每轮一行 JSONL：raw 行（已乘 α）/ 候选 id / 目标 p（top-32）。
+    /// 这是离线拟合 (α, ε) 的唯一事实源 —— 生产档保持空字符串。
+    pub q_dump: String,
     /// **DFlash2 lookup-augmented drafting(LABD)**：在当前请求的 token 历史里
     /// 找当前后缀的最近一次出现，用其后续 token 覆盖/补齐草稿块。
     /// 只服务 DFlash2（`draft=dflash2` 或 `auto`+`draft_path`）；MTP/Off 写了 = boot 拒。
@@ -1919,6 +1981,11 @@ impl Default for SpecCfg {
             dumb: false,
             draft_kv_fp8: false,
             draft_window: 0,
+            dflash_walk: DflashWalk::Conditional,
+            q_alpha: 1.0,
+            q_floor: 0.0,
+            q_host: true,
+            q_dump: String::new(),
             lookup: false,
             lookup_nmin: 6,
             lookup_nmax: 12,
@@ -2716,6 +2783,20 @@ impl OwlConfig {
             return Err(format!(
                 "[spec] depth = {} 超结构上限 {} (verify 图行容量 {}=depth+1;DFlash2 K=1..15 的 W=K+1 上限;改它需同步 verify 图/拼接槽/kv_slots)",
                 self.spec.depth, SPEC_DEPTH_MAX, SPEC_VERIFY_ROWS_MAX
+            ));
+        }
+        // **草稿 q 校准旋钮**（2026-11-03）：非法值在配置面直接拒启。
+        // α ≤ 0 会让 softmax 除零/反转语义；ε ∉ [0,1) 会让 q 不归一。
+        if !(self.spec.q_alpha.is_finite() && self.spec.q_alpha > 0.0) {
+            return Err(format!(
+                "[spec] q_alpha = {} 非法（需有限且 > 0；1.0 = 原律）",
+                self.spec.q_alpha
+            ));
+        }
+        if !(self.spec.q_floor.is_finite() && (0.0..1.0).contains(&self.spec.q_floor)) {
+            return Err(format!(
+                "[spec] q_floor = {} 非法（需 ∈ [0,1)）",
+                self.spec.q_floor
             ));
         }
         // **prefill shadow 仅限 fp8 主 KV 池**(2026-10-26 用户裁决):
@@ -3612,6 +3693,36 @@ mod auto_pool_tests {
         let bad = OwlConfig::from_toml_str("[spec]\ndepth = 7\nlookup = true\nlookup_nmax = 129\n")
             .expect_err("nmax 超上限必拒");
         assert!(bad.contains("128"), "{bad}");
+    }
+
+    /// **walk 策略枚举**（2026-11-03 S0 量具）：三值严格，缺省 conditional。
+    #[test]
+    fn dflash_walk_parses_strictly() {
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\n").expect("缺省档");
+        assert_eq!(c.spec.dflash_walk, DflashWalk::Conditional);
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\ndflash_walk = \"unary\"\n")
+            .expect("unary 臂");
+        assert_eq!(c.spec.dflash_walk, DflashWalk::Unary);
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\ndflash_walk = \"fixed_pred\"\n")
+            .expect("fixed_pred 臂");
+        assert_eq!(c.spec.dflash_walk, DflashWalk::FixedPred);
+        let bad = OwlConfig::from_toml_str("[spec]\ndflash_walk = \"marginal\"\n")
+            .expect_err("未知名必拒");
+        assert!(bad.contains("dflash_walk"), "{bad}");
+    }
+
+    #[test]
+    fn q_calibration_knobs_parse_and_default() {
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\n").expect("缺省档");
+        assert_eq!(c.spec.q_alpha, 1.0);
+        assert_eq!(c.spec.q_floor, 0.0);
+        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\nq_alpha = 0.3\nq_floor = 0.25\n")
+            .expect("校准档");
+        assert!((c.spec.q_alpha - 0.3).abs() < 1e-6);
+        assert!((c.spec.q_floor - 0.25).abs() < 1e-6);
+        let bad = OwlConfig::from_toml_str("[spec]\ndepth = 7\nq_alpha = 0.0\n")
+            .expect_err("α=0 必须在 boot 期被拒（除零）");
+        assert!(bad.contains("q_alpha"), "{bad}");
     }
 
     #[test]

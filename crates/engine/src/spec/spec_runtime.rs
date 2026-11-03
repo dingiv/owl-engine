@@ -102,6 +102,17 @@ pub(crate) struct SpecRuntime {
     pub lookup_nmax: usize,
     pub lookup_nstrong: usize,
     pub lookup_agree: usize,
+    /// DFlash2 选择器 walk 策略（AL 消融量具；缺省 conditional）
+    pub dflash_walk: owl_shared::config::DflashWalk,
+    /// **草稿 q 的 logit 缩放**（`[spec] q_alpha`;1.0 = 原律）。
+    /// 选择器边分过自信 ⇒ 乘 α 把 q 摊开,让拒绝采样拿到 `Σ min(p,q) > p(argmax)`。
+    pub q_alpha: f32,
+    /// **草稿 q 的均匀地板**（`[spec] q_floor`;0 = 不加）。
+    pub q_floor: f32,
+    /// **是否启用 host 侧草稿 q**（`[spec] q_host`;缺省 false）。
+    pub q_host: bool,
+    /// **[标定] q dump 路径**（`[spec] q_dump`;空 = 关）。
+    pub q_dump: String,
     /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
     pub stats: SpecStats,
     /// taps/memory 探针落盘一次性门(OWL_DFLASH_PROBE;AL=0 排查)
@@ -117,6 +128,24 @@ pub(crate) struct SpecRuntime {
     pub carry_ms: f32,
     /// B4 保鲜 ctx(pos;涨过 25% 即作废,换档后旧采样失真)
     pub carry_ctx: usize,
+    /// **请求关掉截断的一次性提示**(C3;每进程/rank 一次)
+    ///
+    /// 请求 `top_k >= 候选数(16..32) && top_p >= 1.0` 时,spec 的目标分布仍
+    /// 只能在设备 top-32 候选上成形,而裸 decode 走整词表 ⇒ 两条路"口径不同"
+    /// (只影响极端尾部质量)。这是一条**已知口径差**,用一次性 WARN 让它可见,
+    /// 而不是靠人回忆。
+    pub q_cfg_warned: bool,
+    /// **最近一轮 spec 的全程耗时（ms）** —— 决策点用的轮成本口径。
+    ///
+    /// 为什么不能就地量：降级判决发生在 accept 之后、轮尾（fold / 边界快照 /
+    /// ⑦ propose）之前 ⇒ 就地量会**系统性少算 ~6 ms**（实测 22.3 vs 28.3），
+    /// 于是盈亏线偏低（22/19=1.16 被下限夹到 1.35，真值 28.3/19=1.49）⇒
+    /// 引擎以为投机比实际便宜 ⇒ 该降级时迟迟不降（创作档 65% 的轮白亏）。
+    /// 引擎级保鲜（跨 turn 不清零），轮尾写、下一轮决策点读（差一轮,无妨）。
+    pub(crate) last_round_ms: f32,
+    /// **走格消融臂自检失败的一次性告警位**（`dflash_walk != conditional`）：
+    /// host 条件走格与设备 `sel` 对不上 ⇒ 该臂 AL 不可归因，只嚷一次。
+    pub walk_warned: bool,
 }
 
 impl SpecRuntime {
@@ -207,6 +236,18 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) lookup_nmax: usize,
     pub(crate) lookup_nstrong: usize,
     pub(crate) lookup_agree: usize,
+    /// **DFlash2 选择器 walk 策略**（`[spec] dflash_walk`;AL 消融量具）。
+    /// `Conditional` = 设备核原律（零回归）；其余 = 收割面 host 走格
+    /// （读 select 图的 `mcand` 槽）。只服务 DFlash2。
+    pub(crate) dflash_walk: owl_shared::config::DflashWalk,
+    /// **草稿 q 的 logit 缩放**（`[spec] q_alpha`;1.0 = 原律）。
+    pub(crate) q_alpha: f32,
+    /// **草稿 q 的均匀地板**（`[spec] q_floor`;0 = 不加）。
+    pub(crate) q_floor: f32,
+    /// **是否启用 host 侧草稿 q**（`[spec] q_host`;缺省 false）。
+    pub(crate) q_host: bool,
+    /// **[标定] q dump 路径**（`[spec] q_dump`;空 = 关）。
+    pub(crate) q_dump: String,
     /// **target 侧共享事实**(词表/层数/hidden;草稿不自带 —— 仅 GGUF 草稿
     /// 的声明校验与码本行数用)
     pub(crate) target: owl_models::formats::gguf::TargetFacts,
@@ -282,9 +323,14 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         sink: inp.mtp_sink,
         min_ctx: inp.mtp_window_min_ctx,
     };
-    // **自适应 depth 的 boot 门**（2026-10-21）：只在 MTP 上成立；两档
-    // 都必须在启动时预捕获，运行期只换图引用。配置面已做形状门，这里
-    // 再按**实际裁决出的模式**拒一次（auto 可能落到非 MTP）。
+    // **自适应 depth 的 boot 门**（2026-10-21）：两档都必须在启动时预捕获
+    // （`depth_candidates`），运行期只换图引用。配置面已做形状门，这里再按
+    // **实际裁决出的模式**拒一次（auto 可能落到 Off）。
+    //
+    // ⚠️ DFlash2 仍然**不支持**（2026-11-03 实测）：`dflash_select`/propose 图
+    // 只按 `spec.depth` 捕获一套，切档会撞下面的"图族不完整"硬门。要做得多
+    // 捕一整套 propose/fold 图族；阶梯判据本身（`exec::spec::depth_ladder_step`）
+    // 已按接受账做成双向，等图族就位即可复用。
     if inp.adaptive_depth {
         if mode != SpecMode::Mtp {
             return Err(ModelError::Msg(format!(
@@ -364,6 +410,49 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             inp.lookup_nmax,
             inp.lookup_nstrong,
             inp.lookup_agree
+        );
+    }
+    // **q 校准旋钮只服务 DFlash2**（2026-11-03）：只影响接受率，不影响分布正确性。
+    // 非法值 = boot 拒（不静默忽略：落错族/落错值就是白跑 A/B）。
+    if !(inp.q_alpha.is_finite() && inp.q_alpha > 0.0) {
+        return Err(ModelError::Msg(format!(
+            "[spec] q_alpha={} 非法（需有限且 > 0；1.0 = 原律）",
+            inp.q_alpha
+        )));
+    }
+    if !(inp.q_floor.is_finite() && (0.0..1.0).contains(&inp.q_floor)) {
+        return Err(ModelError::Msg(format!(
+            "[spec] q_floor={} 非法（需 ∈ [0,1)）",
+            inp.q_floor
+        )));
+    }
+    if (inp.q_alpha != 1.0 || inp.q_floor != 0.0) && mode != SpecMode::DFlash2 {
+        return Err(ModelError::Msg(format!(
+            "[spec] q_alpha/q_floor 只服务 DFlash2，但当前模式 = {:?}",
+            mode
+        )));
+    }
+    if inp.q_alpha != 1.0 || inp.q_floor != 0.0 {
+        owl_shared::log_info!(
+            "boot",
+            "DFlash2 草稿 q 校准：alpha={} floor={}（采样档：草稿从 q 抽签 + `Σ min(p,q)` 接受）",
+            inp.q_alpha,
+            inp.q_floor
+        );
+    }
+    // **walk 策略只服务 DFlash2**（2026-11-03 S0 量具）：MTP/Off 档写非
+    // conditional = boot 拒（不静默忽略 —— 它是一条消融旋钮，落错族就是白跑 A/B）。
+    if !inp.dflash_walk.is_conditional() {
+        if mode != SpecMode::DFlash2 {
+            return Err(ModelError::Msg(format!(
+                "[spec] dflash_walk={:?} 只服务 DFlash2，但当前模式 = {:?}（depth={}, draft={:?}）",
+                inp.dflash_walk, mode, depth, inp.family
+            )));
+        }
+        owl_shared::log_info!(
+            "boot",
+            "DFlash2 walk = {:?}（AL 消融：绕过设备核条件格 walk，收割面 host 按同一分数表重新走格；设备 sel 槽仅作对照）",
+            inp.dflash_walk
         );
     }
     if mtp_window.active() {
@@ -706,6 +795,11 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         lookup_nmax: inp.lookup_nmax,
         lookup_nstrong: inp.lookup_nstrong,
         lookup_agree: inp.lookup_agree,
+        dflash_walk: inp.dflash_walk,
+        q_alpha: inp.q_alpha,
+        q_floor: inp.q_floor,
+        q_host: inp.q_host,
+        q_dump: inp.q_dump,
         stats: SpecStats::default(),
         mem_dumped: false,
         mem_dumped2: false,
@@ -713,6 +807,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         // B4 分母跨 turn 保鲜(初值 0 = 未采样,首窗口用保守兜底线)
         carry_ms: 0.0,
         carry_ctx: 0,
+            q_cfg_warned: false,
+        last_round_ms: 0.0,
+        walk_warned: false,
     })
 }
 

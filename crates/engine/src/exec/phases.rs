@@ -1351,7 +1351,21 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 2026-10-17:**播种裸步**走同一臂(两者同构:都要同步草稿池 + 计时进分母)
         let degraded = self.tspec_ref()?.spec_degraded;
         let seeding = self.tspec_ref()?.bare_seed_step;
-        if (degraded || seeding) && self.dev.spec_rt.dflash_tap_count > 0 {
+        // **降级期同步的节流**（2026-11-03 实测：`decode.sync` 1.83 ms/步，
+        // 占裸步 18.9 ms 的 **10%** —— 注释里写的"0.5 ms(2%)"是旧口径）。
+        // 同步只为"下一次探测能拿到新鲜的草稿上下文"，而探测每
+        // `probe_every`（8→32）步才一次 ⇒ **每 8 步同步一次 + 探测前最后一步
+        // 必同步**（洞 ≤7 行，在"毒化带 ≤8 token"的既有容忍内）。
+        // 播种步（只 2 步）不节流：它们本身就是分母采样。
+        let sync_due = if seeding || !degraded {
+            true
+        } else {
+            let a = self.tspec_ref()?;
+            let s = a.spec_steps_degraded;
+            let p = a.spec_probe_every.max(1);
+            s % 8 == 0 || s + 1 >= p
+        };
+        if (degraded || seeding) && sync_due && self.dev.spec_rt.dflash_tap_count > 0 {
             // 降级步分相(2026-10-12 探针完善):sync encode 单独计时 ——
             // 9.3 t/s 案的 80ms/步嫌疑犯,一屏定谳
             let t_syn = std::time::Instant::now();
@@ -2162,11 +2176,13 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             self.pool.restore_spec_snap(face, gdn_slot).await?;
         }
         owl_shared::log_debug!("spec-round", "fold:图入队起 rows={rows}");
+        let t_step = std::time::Instant::now();
         let fg = self.graphs.fold_mut(depth, rows)?;
         // `cu` 必须每回复写:单图按最大 rows 捕获,核按 cu=[0,rows] 截断。
         let r = fg
             .step(&[("slots", &[gdn_slot as f32]), ("cu", &[0.0, rows as f32])])
             .await;
+        crate::exec::mrec("spec.fold.step", t_step.elapsed());
         owl_shared::log_debug!("spec-round", "fold:图入队完 rows={rows} ok={}", r.is_ok());
         r
     }

@@ -34,30 +34,187 @@ pub(crate) struct DraftQ {
     q: Vec<f32>,
     /// 每步 one-hot 覆写（None = 用 q/cand）。
     one_hot: Vec<Option<OneHot>>,
+    /// 每步是否被**请求的 top-k/top-p** 截断（C3 观测面）
+    trunc: Vec<bool>,
+    /// 被截断丢掉的质量（逐轮累加；0 = 请求没截断草稿支撑）
+    dropped: f32,
+    /// **每步实际使用的那一行原始分数**（`[K,16]`；已乘 α，未过采样变换）。
+    /// 只为标定测量（`[spec] q_dump`）保留——生产路径不读。
+    raw: Vec<f32>,
+}
+
+/// **`DraftQ::from_scores` 的显式输入包**（走格事实 + RNG 定位）。
+///
+/// 分三个正交的面：①分数表（`scores`/`unary`/`cand`/`depth`）
+/// ②走格策略（`walk`）③采样/RNG（`cfg`/`seed`/`base_pos`）。
+/// 打包而不是八个位置参数，是为了让调用点写清"哪张表喂哪个模式"。
+pub(crate) struct QInput<'a> {
+    /// `[depth, 16, 16]` 边分（`scores[e, prev, c]`）。
+    pub scores: &'a [f32],
+    /// `[depth, 16]` 候选全局 id。
+    pub cand: &'a [u32],
+    pub depth: usize,
+    /// `[depth, 16]` 逐位置边际（选择器 top-k 值半区；`walk = Unary` 时必需）。
+    pub unary: Option<&'a [f32]>,
+    /// 走格读哪一行（`[spec] dflash_walk`）。
+    pub walk: owl_shared::config::DflashWalk,
+    pub cfg: &'a crate::sampler::SamplerCfg,
+    pub seed: u64,
+    pub base_pos: usize,
+    /// **草稿 q 的 logit 缩放**（`[spec] q_alpha`;1.0 = 原律）。
+    /// 选择器边分不是校准 logits ⇒ 默认 softmax 近乎 one-hot ⇒ 拒绝采样的
+    /// 每步接受概率退化为 `p(argmax)`。乘 α 把 q 摊开（α→0 = 候选集上均匀）。
+    pub alpha: f32,
+    /// **候选集上的均匀地板**（`[spec] q_floor`;0 = 不加）。
+    pub floor: f32,
+}
+
+/// 选择器格"第 e 步读哪一行"（单一事实源：采样走格与贪心走格同用）。
+fn row_of<'a>(
+    scores: &'a [f32],
+    unary: &'a [f32],
+    e: usize,
+    prev: usize,
+    walk: owl_shared::config::DflashWalk,
+) -> &'a [f32] {
+    use owl_shared::config::DflashWalk as W;
+    let (src, base) = match walk {
+        // 逐位置边际：丢弃边缘分（DDTree 的 q_i(v)）
+        W::Unary => (unary, e * CAND),
+        // 固定参考前驱 ⇒ 表里第 0 行（`cand[e-1][0]`）
+        W::FixedPred => (scores, e * CAND * CAND),
+        // 条件格：上一步**选中**的前驱
+        W::Conditional => (scores, (e * CAND + prev) * CAND),
+    };
+    &src[base..base + CAND]
+}
+
+/// 走格形状门（`from_scores` / [`walk_greedy`] 共用同一判据）。
+fn check_walk_shape(
+    unary: &[f32],
+    depth: usize,
+    walk: owl_shared::config::DflashWalk,
+) -> Result<(), ModelError> {
+    if depth == 0 || depth > CAND - 1 {
+        return Err(ModelError::Msg(format!(
+            "proposal_q: depth={depth} 越界（1..=15）"
+        )));
+    }
+    if walk == owl_shared::config::DflashWalk::Unary && unary.len() < depth * CAND {
+        return Err(ModelError::Msg(format!(
+            "proposal_q: walk=unary 需要逐位置边际 unary[{depth},{CAND}]（实得 {}）",
+            unary.len()
+        )));
+    }
+    Ok(())
+}
+
+/// **贪心走格**（纯函数；设备核 `owl_dflash_select_*` 的 walk 同律）。
+///
+/// 返回每步选中的**候选下标**（`0..CAND`）。平局取最小下标，与核内
+/// `if (row[c] > best)` 的严格大于同律；整行非有限 = 批次坏，响亮拒。
+///
+/// 用途：①`dflash_walk != conditional` 时在收割面重走格（TP2 词表切分档）
+/// ②门：`conditional` 臂必须与设备 `sel[..depth]` 逐位相同（一致性自检）。
+pub(crate) fn walk_greedy(
+    scores: &[f32],
+    unary: &[f32],
+    depth: usize,
+    walk: owl_shared::config::DflashWalk,
+) -> Result<Vec<usize>, ModelError> {
+    check_walk_shape(unary, depth, walk)?;
+    if scores.len() < depth * CAND * CAND {
+        return Err(ModelError::Msg(format!(
+            "proposal_q: walk 槽尺寸不符 scores={}（需 {}×{}²）",
+            scores.len(),
+            depth,
+            CAND
+        )));
+    }
+    let mut out = Vec::with_capacity(depth);
+    let mut prev = 0usize;
+    for e in 0..depth {
+        let row = row_of(scores, unary, e, prev, walk);
+        if !row.iter().any(|s| s.is_finite()) {
+            return Err(ModelError::Msg(format!(
+                "proposal_q: 第 {e} 步边分全非有限（selector 输出坏）"
+            )));
+        }
+        let mut best = row[0];
+        let mut bi = 0usize;
+        for (c, &s) in row.iter().enumerate().skip(1) {
+            if s > best {
+                best = s;
+                bi = c;
+            }
+        }
+        prev = bi;
+        out.push(bi);
+    }
+    Ok(out)
+}
+
+/// 收割面重走格：候选**下标** → token id（`[spec] dflash_walk` 非 conditional 时用）。
+pub(crate) fn walk_tokens(
+    scores: &[f32],
+    unary: &[f32],
+    cand: &[u32],
+    depth: usize,
+    walk: owl_shared::config::DflashWalk,
+) -> Result<Vec<u32>, ModelError> {
+    let idx = walk_greedy(scores, unary, depth, walk)?;
+    Ok(idx
+        .iter()
+        .enumerate()
+        .map(|(e, &i)| cand[e * CAND + i])
+        .collect())
+}
+
+/// **一致性自检**：host `Conditional` 走格是否与设备 `sel[..depth]` 逐位相同。
+///
+/// 消融臂的所有差异必须只有"读哪一行"这一项；若条件臂本身对不上设备，
+/// 那么 `fixed_pred`/`unary` 的数就是两个变量混在一起，不可归因。
+pub(crate) fn walk_matches_device(
+    scores: &[f32],
+    unary: &[f32],
+    cand: &[u32],
+    dev_tokens: &[u32],
+    depth: usize,
+) -> Result<bool, ModelError> {
+    let idx = walk_greedy(scores, unary, depth, owl_shared::config::DflashWalk::Conditional)?;
+    Ok(idx.len() == dev_tokens.len()
+        && idx
+            .iter()
+            .enumerate()
+            .all(|(e, &i)| cand.get(e * CAND + i).copied() == dev_tokens.get(e).copied()))
 }
 
 impl DraftQ {
     /// 从选择器 `scores [K,16,16]` 与 `cand [K,16]` 构造并抽签。
     ///
     /// 布局与 `owl_dflash_select_*` 一致：`scores[e, prev, c]` 是第 e 步、
-    /// 前驱候选 rank=prev 时选 c 的边分。walk 用**实际抽中的前驱**，
-    /// 与 NInfer 的 conditional walk 同义。
-    pub(crate) fn from_scores(
-        scores: &[f32],
-        cand: &[u32],
-        depth: usize,
-        temperature: f32,
-        seed: u64,
-        base_pos: usize,
-    ) -> Result<Self, ModelError> {
-        if depth == 0 || depth > CAND - 1 {
+    /// 前驱候选 rank=prev 时选 c 的边分。缺省 `dflash_walk = Conditional`
+    /// = 用**实际抽中的前驱**（NInfer 的 conditional walk 同义）；
+    /// `FixedPred` / `Unary` 是 AL 消融臂（见 [`row_of`]）。
+    pub(crate) fn from_scores(inp: QInput<'_>) -> Result<Self, ModelError> {
+        let QInput {
+            scores,
+            cand,
+            depth,
+            unary,
+            walk,
+            cfg,
+            seed,
+            base_pos,
+            alpha,
+            floor,
+        } = inp;
+        let unary = unary.unwrap_or(&[]);
+        check_walk_shape(unary, depth, walk)?;
+        if !(cfg.temp.is_finite() && cfg.temp >= 0.0) {
             return Err(ModelError::Msg(format!(
-                "proposal_q: depth={depth} 越界（1..=15）"
-            )));
-        }
-        if !(temperature.is_finite() && temperature > 0.0) {
-            return Err(ModelError::Msg(format!(
-                "proposal_q: temperature={temperature} 非正/非有限"
+                "proposal_q: temperature={} 非正/非有限",
+                cfg.temp
             )));
         }
         if scores.len() < depth * CAND * CAND || cand.len() < depth * CAND {
@@ -72,42 +229,64 @@ impl DraftQ {
             )));
         }
         let mut qv = vec![0f32; depth * CAND];
+        let mut raw_rows = vec![0f32; depth * CAND];
         let mut drafts = vec![0u32; depth];
+        let mut trunc = vec![false; depth];
+        let mut dropped = 0f32;
         let mut prev = 0usize;
         for e in 0..depth {
-            let row = &scores[(e * CAND + prev) * CAND..(e * CAND + prev + 1) * CAND];
-            let mut mx = f32::NEG_INFINITY;
-            for &s in row {
-                if s.is_finite() && s > mx {
-                    mx = s;
-                }
-            }
-            if !mx.is_finite() {
+            let row = row_of(scores, unary, e, prev, walk);
+            if !row.iter().any(|s| s.is_finite()) {
                 return Err(ModelError::Msg(format!(
                     "proposal_q: 第 {e} 步边分全非有限（selector 输出坏）"
                 )));
             }
-            let mut sum = 0f32;
-            for (c, &s) in row.iter().enumerate() {
-                let p = if s.is_finite() { ((s - mx) / temperature).exp() } else { 0.0 };
-                qv[e * CAND + c] = p;
-                sum += p;
+            // **q 与 p 同一套变换**（temp → top-k → softmax → top-p → 质量重均摊）。
+            //
+            // 为什么必须同源（2026-11-03 C2）：请求的 top-k/top-p 把目标分布 p
+            // 截断到它的支撑上；若 q 仍在被截掉的候选上留质量，抽到那里的草稿
+            // p̃=0 ⇒ **必然整轮拒**（vLLM 同款注释："mass outside support =
+            // guaranteed rejection"）。截断后 q 的支撑 ⊆ p̃ 的支撑，白付消失。
+            // 精确性不受影响：q 可以是任意分布（拒绝采样对 q 无要求）。
+            let mut vals: Vec<f32> = row.to_vec();
+            if !(alpha == 1.0) {
+                for v in vals.iter_mut() {
+                    *v *= alpha;
+                }
             }
-            if !(sum.is_finite() && sum > 0.0) {
+            raw_rows[e * CAND..(e + 1) * CAND].copy_from_slice(&vals);
+            let mut dist = crate::sampler::distribution(&mut vals, cfg, &[]);
+            if dist.is_empty() {
                 return Err(ModelError::Msg(format!(
-                    "proposal_q: 第 {e} 步 softmax 和={sum} 非正/非有限"
+                    "proposal_q: 第 {e} 步采样变换返回空分布"
                 )));
             }
-            for p in &mut qv[e * CAND..(e + 1) * CAND] {
-                *p /= sum;
+            // 均匀地板:支撑不变（仍 ∈ 请求截断后的候选集）,只是把质量往平坦推。
+            // 对高熵负载（创作）这是“把 q 从 one-hot 拉回来”的最便宜形式。
+            if floor > 0.0 {
+                let u = floor / dist.len() as f32;
+                for (_, p) in dist.iter_mut() {
+                    *p = *p * (1.0 - floor) + u;
+                }
             }
+            // C3 记账：请求截断丢掉了多少草稿支撑质量
+            let kept: Vec<u32> = dist.iter().map(|(i, _)| *i).collect();
+            let d = truncated_mass(&vals, cfg, &kept);
+            if d > 1e-6 {
+                trunc[e] = true;
+                dropped += d;
+            }
+            for (idx, p) in &dist {
+                qv[e * CAND + *idx as usize] = *p;
+            }
+            // 抽样：与旧实现同一个 RNG 派生态（位置定序，可复现）
             let u = uniform(seed, base_pos as u64 + e as u64, PURPOSE_PROPOSAL);
             let mut acc = 0f32;
-            let mut pick = CAND - 1;
-            for (c, &p) in qv[e * CAND..(e + 1) * CAND].iter().enumerate() {
-                acc += p;
+            let mut pick = dist[dist.len() - 1].0 as usize;
+            for (idx, p) in &dist {
+                acc += *p;
                 if u < acc {
-                    pick = c;
+                    pick = *idx as usize;
                     break;
                 }
             }
@@ -119,11 +298,33 @@ impl DraftQ {
             cand: cand.to_vec(),
             q: qv,
             one_hot: vec![None; depth],
+            trunc,
+            dropped,
+            raw: raw_rows,
         })
+    }
+
+    /// 被请求 top-k/top-p 截断的步数（C3 观测面；>0 正常）。
+    pub(crate) fn truncated_steps(&self) -> usize {
+        self.trunc.iter().filter(|t| **t).count()
+    }
+
+    /// 被丢掉的质量（逐轮累加；持续 >1e-3 说明草稿头分布很平）。
+    pub(crate) fn dropped_mass(&self) -> f32 {
+        self.dropped
     }
 
     pub(crate) fn drafts(&self) -> &[u32] {
         &self.drafts
+    }
+
+    /// **标定用**：每步使用的原始分数行（`[K,16]`，已乘 α）与候选 id 表。
+    pub(crate) fn raw_rows(&self) -> &[f32] {
+        &self.raw
+    }
+
+    pub(crate) fn cands(&self) -> &[u32] {
+        &self.cand
     }
 
     pub(crate) fn drafts_mut(&mut self) -> &mut [u32] {
@@ -171,6 +372,41 @@ impl DraftQ {
 
 }
 
+
+/// 请求的 top-k/top-p 从**这一步的草稿边分**里砍掉的质量（C3 记账）。
+///
+/// 口径 = 截断前 softmax(边分 / T) 中落在保留集之外的质量和；
+/// `temp = 0`（贪心档）没有"质量"概念 ⇒ 恒 0。
+fn truncated_mass(row: &[f32], cfg: &crate::sampler::SamplerCfg, kept: &[u32]) -> f32 {
+    if !(cfg.temp.is_finite() && cfg.temp > 0.0) {
+        return 0.0;
+    }
+    let mx = row
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !mx.is_finite() {
+        return 0.0;
+    }
+    let mut ps = [0f32; CAND];
+    let mut sum = 0f32;
+    for (c, &v) in row.iter().enumerate().take(CAND) {
+        let p = if v.is_finite() { ((v - mx) / cfg.temp).exp() } else { 0.0 };
+        ps[c] = p;
+        sum += p;
+    }
+    if !(sum.is_finite() && sum > 0.0) {
+        return 0.0;
+    }
+    let mut dropped = 0f32;
+    for (c, p) in ps.iter().enumerate().take(CAND) {
+        if !kept.contains(&(c as u32)) {
+            dropped += p / sum;
+        }
+    }
+    dropped
+}
 
 /// 拒绝采样接受（NInfer `speculative_accept_sparse_drafts` 的 owl 版）。
 ///
@@ -254,9 +490,16 @@ pub(crate) fn residual_sample(
         }
     }
     if !(sum.is_finite() && sum > 0.0) {
-        return Err(ModelError::Msg(format!(
-            "spec residual: 第 {e} 步 max(p-q,0) 总质量={sum}（q 不应支配 p）"
-        )));
+        // **数值兜底（参考实现同律）**：残差被减尽/下溢（q 与 p 在浮点上重合，
+        // 典型出现在 `q(d)/p(d)` 因舍入略小于 1 而被拒的极窄窗口）——直接按**目标
+        // 分布 p** 抽一个 correction token，保证任何数值情形下都有合法输出。
+        //
+        // 为什么不报错：这是可恢复的浮点边界，不是不变量失守；把整个请求 abort
+        // 掉代价太大。但也**不静默**：记 `spec.residual.fallback`，一旦非零就说明
+        // q 已经贴到 p（或 q 口径出了问题），可观测。
+        super::mcnt("spec.residual.fallback", 1);
+        let mut rng = seed ^ ((base_pos as u64 + e as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        return Ok(crate::sampler::sample_sparse(p, &mut rng));
     }
     let u = uniform(seed, base_pos as u64 + e as u64, PURPOSE_CORRECTION);
     let mut acc = 0f32;
@@ -289,20 +532,211 @@ fn uniform(seed: u64, pos: u64, purpose: u64) -> f32 {
 mod tests {
     use super::*;
 
+    /// 无截断的请求档（temp=1 / top-k 覆盖 16 候选 / top-p 关）
+    fn cfg_plain() -> crate::sampler::SamplerCfg {
+        crate::sampler::SamplerCfg { temp: 1.0, topk: 32, topp: 1.0, rep_penalty: 1.0 }
+    }
+
     fn scores(depth: usize) -> Vec<f32> {
         (0..depth * CAND * CAND).map(|i| ((i * 17) % 29) as f32 / 4.0).collect()
+    }
+
+    /// 采样走格的输入包（缺省 `conditional` = 生产律）
+    fn qi<'a>(
+        scores: &'a [f32],
+        cand: &'a [u32],
+        depth: usize,
+        cfg: &'a crate::sampler::SamplerCfg,
+        seed: u64,
+        pos: usize,
+    ) -> QInput<'a> {
+        QInput {
+            scores,
+            cand,
+            depth,
+            unary: None,
+            walk: owl_shared::config::DflashWalk::Conditional,
+            cfg,
+            seed,
+            base_pos: pos,
+            alpha: 1.0,
+            floor: 0.0,
+        }
+    }
+
+    /// 三臂分数表：`conditional` 与 `fixed_pred` **必然不同**。
+    ///
+    /// · 第 0 步（row 0）最大 = c=3；
+    /// · 第 1 步 row **3**（条件于选中的 3）最大 = c=7；
+    /// · 第 1 步 row **0**（固定参考前驱）最大 = c=11。
+    ///
+    /// ⇒ conditional = [3,7]、fixed_pred = [3,11]。其余位置全 -10（平局取小下标）。
+    fn split_table() -> Vec<f32> {
+        let e1 = CAND * CAND; // 第 1 步的基址
+        let mut sc = vec![-10.0f32; 2 * CAND * CAND];
+        sc[3] = 10.0; // e=0、row 0、c=3
+        sc[e1 + 3 * CAND + 7] = 10.0; // e=1、row 3（条件于选中 3）、c=7
+        sc[e1 + 11] = 10.0; // e=1、row 0（固定参考前驱）、c=11
+        sc
+    }
+
+    /// **S0 门：条件格 vs 固定前驱 vs 纯边际**（AL 消融臂的语义锁）。
+    ///
+    /// 三臂必须读不同的行 —— 否则 A/B 量的是同一个东西。
+    #[test]
+    fn walk_arms_read_different_rows() {
+        use owl_shared::config::DflashWalk as W;
+        let sc = split_table();
+        // 边际：逐位置 argmax（与边缘分无关）
+        let mut unary = vec![0f32; 2 * CAND];
+        unary[5] = 1.0;
+        unary[CAND + 9] = 1.0;
+
+        assert_eq!(walk_greedy(&sc, &unary, 2, W::Conditional).unwrap(), vec![3, 7]);
+        assert_eq!(walk_greedy(&sc, &unary, 2, W::FixedPred).unwrap(), vec![3, 11]);
+        assert_eq!(walk_greedy(&sc, &unary, 2, W::Unary).unwrap(), vec![5, 9]);
+    }
+
+    /// **平局取最小下标**（与设备核 `if (row[c] > best)` 严格大于同律）。
+    #[test]
+    fn walk_ties_take_min_index() {
+        use owl_shared::config::DflashWalk as W;
+        let sc = vec![0.0f32; 3 * CAND * CAND];
+        assert_eq!(walk_greedy(&sc, &[], 3, W::Conditional).unwrap(), vec![0, 0, 0]);
+    }
+
+    /// `unary` 臂缺边际表 ⇒ 响亮拒（不静默退成条件格）。
+    #[test]
+    fn unary_walk_requires_marginals() {
+        use owl_shared::config::DflashWalk as W;
+        let e = walk_greedy(&split_table(), &[], 2, W::Unary).unwrap_err();
+        assert!(format!("{e}").contains("unary"), "{e}");
+    }
+
+    /// **一致性自检门**：`walk_matches_device` 只在 token 逐位相同时为真。
+    #[test]
+    fn walk_matches_device_detects_divergence() {
+        let sc = split_table();
+        let cand: Vec<u32> = (0..2 * CAND).map(|i| 500 + i as u32).collect();
+        let unary = vec![0f32; 2 * CAND];
+        let dev = vec![cand[3], cand[CAND + 7]];
+        assert!(walk_matches_device(&sc, &unary, &cand, &dev, 2).unwrap());
+        let bad = vec![cand[3], cand[CAND + 11]];
+        assert!(!walk_matches_device(&sc, &unary, &cand, &bad, 2).unwrap());
+        assert!(!walk_matches_device(&sc, &unary, &cand, &dev[..1], 2).unwrap());
+    }
+
+    /// **采样档 `unary` 臂**：temp=0 时草稿 = 逐位置边际 argmax（边缘分不参与）。
+    /// **q 校准（α / ε）**：同一张过尖的分数表，α 越小 q(top1) 越低、地板再摊平；
+    /// 支撑不变（候选集外 q=0），且 q 归一。
+    #[test]
+    fn q_alpha_and_floor_shape_the_proposal() {
+        let depth = 1usize;
+        let mut scores = vec![0f32; depth * CAND * CAND];
+        // 第 0 行：强尖峰 c=3，次高 c=7（gap 4 nats = 选择器边分的典型过自信）
+        scores[3] = 8.0;
+        scores[7] = 4.0;
+        let cand: Vec<u32> = (0..depth * CAND).map(|i| 900 + i as u32).collect();
+        let cfg = crate::sampler::SamplerCfg {
+            temp: 1.0,
+            topk: 20,
+            topp: 1.0,
+            rep_penalty: 1.0,
+        };
+        let mk = |alpha: f32, floor: f32| {
+            DraftQ::from_scores(QInput {
+                scores: &scores,
+                cand: &cand,
+                depth,
+                unary: None,
+                walk: owl_shared::config::DflashWalk::Conditional,
+                cfg: &cfg,
+                seed: 5,
+                base_pos: 0,
+                alpha,
+                floor,
+            })
+            .unwrap()
+        };
+        let sharp = mk(1.0, 0.0);
+        let flat = mk(0.25, 0.0);
+        let floored = mk(0.25, 0.5);
+        let t1 = cand[3];
+        assert!(
+            sharp.q_of(0, t1) > 0.95,
+            "α=1 应近乎 one-hot：{}",
+            sharp.q_of(0, t1)
+        );
+        assert!(
+            flat.q_of(0, t1) < sharp.q_of(0, t1),
+            "α 缩小必须摊开 q：{} vs {}",
+            flat.q_of(0, t1),
+            sharp.q_of(0, t1)
+        );
+        assert!(
+            floored.q_of(0, t1) < flat.q_of(0, t1),
+            "地板必须再摊平：{} vs {}",
+            floored.q_of(0, t1),
+            flat.q_of(0, t1)
+        );
+        // 支撑不变：候选集外的 token q = 0（不给 p=0 的地方白付拒绝）
+        assert_eq!(floored.q_of(0, 12_345), 0.0);
+        let sum: f32 = (0..CAND).map(|c| floored.q_of(0, cand[c])).sum();
+        assert!((sum - 1.0).abs() < 1e-5, "q 和 {sum}");
+    }
+
+    #[test]
+    fn unary_walk_sampling_ignores_edges() {
+        use owl_shared::config::DflashWalk as W;
+        let depth = 2usize;
+        let sc = split_table();
+        let cand: Vec<u32> = (0..depth * CAND).map(|i| 700 + i as u32).collect();
+        let mut unary = vec![0f32; depth * CAND];
+        unary[5] = 3.0;
+        unary[CAND + 9] = 4.0;
+        let cfg = crate::sampler::SamplerCfg { temp: 0.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        let q = DraftQ::from_scores(QInput {
+            scores: &sc,
+            cand: &cand,
+            depth,
+            unary: Some(&unary),
+            walk: W::Unary,
+            cfg: &cfg,
+            seed: 11,
+            base_pos: 0,
+            alpha: 1.0,
+            floor: 0.0,
+        })
+        .unwrap();
+        assert_eq!(q.drafts(), &[cand[5], cand[CAND + 9]]);
     }
 
     #[test]
     fn q_normalizes_and_walk_is_consistent() {
         let depth = 7;
         let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
-        let q = DraftQ::from_scores(&scores(depth), &cand, depth, 1.0, 42, 1000).unwrap();
+        let q = DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg_plain(), 42, 1000)).unwrap();
         for e in 0..depth {
             let s: f32 = (0..CAND).map(|c| q.q_of(e, cand[e * CAND + c])).sum();
             assert!((s - 1.0).abs() < 1e-5, "e={e} sum={s}");
             assert!(q.drafts().contains(&q.drafts()[e]));
         }
+    }
+
+    #[test]
+    fn residual_falls_back_to_p_when_exhausted() {
+        // **残差兜底**（参考实现同律）：q 与 p 在同一个 token 上重合 ⇒
+        // `Σ max(p−q,0) = 0` 的浮点边界。旧实现直接报错（整个请求 abort）；
+        // 现在回退到按 p 抽 —— 任何数值情形下都要有合法输出。
+        let depth = 1;
+        let cand: Vec<u32> = (0..depth * CAND).map(|i| 500 + i as u32).collect();
+        let mut q = DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg_plain(), 3, 0)).unwrap();
+        let t0 = cand[0];
+        q.force_one_hot(0, t0); // q = δ(t0)
+        let p = vec![(t0, 1.0f32)]; // p 也是 δ(t0) ⇒ 残差全 0
+        assert_eq!(q.q_of(0, t0), 1.0);
+        let got = residual_sample(&p, &q, 0, 7, 0).expect("残差耗尽必须兜底，不得报错");
+        assert_eq!(got, t0, "兜底必须从 p 的支撑里抽");
     }
 
     #[test]
@@ -329,7 +763,7 @@ mod tests {
         for s in 0..n {
             let mut hist = Vec::new();
             // proposal_q 每轮按 seed 重新抽签 ⇒ draft ~ q（不是固定单点）。
-            let q = DraftQ::from_scores(&qlog, &cand, depth, 1.0, s as u64, 0).unwrap();
+            let q = DraftQ::from_scores(qi(&qlog, &cand, depth, &cfg, s as u64, 0)).unwrap();
             let (_, emitted, _) = accept_rejection(
                 &logits, vocab, 2, q.drafts(), depth, &q, &cfg, &mut hist, s as u64, 0,
             )
@@ -347,11 +781,88 @@ mod tests {
         }
     }
 
+    /// **C2**:q 必须走**请求的**采样变换(top-k 截断 + 支撑重归一)。
+    #[test]
+    fn q_honours_request_topk() {
+        let depth = 3usize;
+        let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
+        let cfg = crate::sampler::SamplerCfg { temp: 0.7, topk: 4, topp: 1.0, rep_penalty: 1.0 };
+        let q = DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg, 5, 0)).unwrap();
+        for e in 0..depth {
+            let support = (0..CAND).filter(|c| q.q_of(e, cand[e * CAND + c]) > 0.0).count();
+            assert!(support <= 4, "e={e} 支撑 {support} > 请求 top_k=4(q 未走请求变换)");
+            let sum: f32 = (0..CAND).map(|c| q.q_of(e, cand[e * CAND + c])).sum();
+            assert!((sum - 1.0).abs() < 1e-5, "e={e} Σq={sum}");
+        }
+        assert_eq!(q.truncated_steps(), depth, "每一步都该被 top_k 截断");
+        assert!(q.dropped_mass() > 0.0, "被截掉的质量必须记账(C3)");
+    }
+
+    /// **C2**:请求关掉截断时 q 不截断、不计账(与 p 同口径)。
+    #[test]
+    fn q_untruncated_when_request_keeps_everything() {
+        let depth = 2usize;
+        let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
+        let q = DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg_plain(), 5, 0)).unwrap();
+        assert_eq!(q.truncated_steps(), 0, "无截断请求不许记截断");
+        assert_eq!(q.dropped_mass(), 0.0);
+    }
+
+    /// **C2**:temp=0(贪心请求)== argmax one-hot,与裸 decode 同语义。
+    #[test]
+    fn q_is_one_hot_at_zero_temperature() {
+        let depth = 2usize;
+        let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
+        let sc = scores(depth);
+        let cfg = crate::sampler::SamplerCfg { temp: 0.0, topk: 20, topp: 0.95, rep_penalty: 1.0 };
+        let q = DraftQ::from_scores(qi(&sc, &cand, depth, &cfg, 9, 0)).unwrap();
+        // 第 0 步 argmax(row0)
+        let row0 = &sc[..CAND];
+        let best = row0
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal).then(b.0.cmp(&a.0)))
+            .map(|(c, _)| c)
+            .unwrap();
+        assert_eq!(q.q_of(0, cand[best]), 1.0, "temp=0 ⇒ one-hot(argmax)");
+        assert_eq!(q.drafts()[0], cand[best]);
+        assert_eq!(q.truncated_steps(), 0, "贪心档没有质量可截");
+    }
+
+    /// **C2-c**:q 的支撑与概率必须与 p 侧 `distribution_of_cands` **逐项相同**
+    /// (同一个 `SamplerCfg`;这就是"消灭两套采样规范"的机器门)。
+    #[test]
+    fn q_matches_p_transform() {
+        use crate::sampler::distribution_of_cands;
+        let depth = 1usize; // 单步:prev 恒 0 ⇒ 行 = scores[..CAND]
+        let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
+        let sc = scores(depth);
+        let cfg = crate::sampler::SamplerCfg { temp: 0.8, topk: 6, topp: 0.9, rep_penalty: 1.0 };
+        let q = DraftQ::from_scores(qi(&sc, &cand, depth, &cfg, 3, 0)).unwrap();
+        let row_cands: Vec<(f32, u32)> =
+            sc[..CAND].iter().enumerate().map(|(c, &v)| (v, cand[c])).collect();
+        let p = distribution_of_cands(&row_cands, &cfg);
+        let mut want: Vec<(u32, f32)> = p.clone();
+        let mut got: Vec<(u32, f32)> = cand[..CAND]
+            .iter()
+            .copied()
+            .map(|t| (t, q.q_of(0, t)))
+            .filter(|(_, pr)| *pr > 0.0)
+            .collect();
+        want.sort_unstable_by_key(|(t, _)| *t);
+        got.sort_unstable_by_key(|(t, _)| *t);
+        assert_eq!(want.len(), got.len(), "支撑大小不同:q={got:?} p={want:?}");
+        for (w, g) in want.iter().zip(got.iter()) {
+            assert_eq!(w.0, g.0, "支撑集不同");
+            assert!((w.1 - g.1).abs() < 1e-6, "token {} 概率不同:{} vs {}", w.0, w.1, g.1);
+        }
+    }
+
     #[test]
     fn one_hot_reconcile() {
         let depth = 3;
         let cand: Vec<u32> = (0..depth * CAND).map(|i| 100 + i as u32).collect();
-        let mut q = DraftQ::from_scores(&scores(depth), &cand, depth, 1.0, 7, 0).unwrap();
+        let mut q = DraftQ::from_scores(qi(&scores(depth), &cand, depth, &cfg_plain(), 7, 0)).unwrap();
         let mut cur = q.drafts().to_vec();
         cur[1] = 999;
         assert_eq!(q.reconcile(&cur), 1);
@@ -439,6 +950,29 @@ mod sparse_equivalence {
         SamplerCfg { temp: 0.7, topk: 20, topp: 0.95, rep_penalty: 1.0 }
     }
 
+    /// 采样走格的输入包（本模块只用生产缺省 `conditional`）
+    fn qi<'a>(
+        scores: &'a [f32],
+        cand: &'a [u32],
+        depth: usize,
+        cfg: &'a SamplerCfg,
+        seed: u64,
+        pos: usize,
+    ) -> QInput<'a> {
+        QInput {
+            scores,
+            cand,
+            depth,
+            unary: None,
+            walk: owl_shared::config::DflashWalk::Conditional,
+            cfg,
+            seed,
+            base_pos: pos,
+            alpha: 1.0,
+            floor: 0.0,
+        }
+    }
+
     /// 造一行"有尖峰"的 logits(确定性伪随机,不引 random crate)
     fn row(seed: u32) -> Vec<f32> {
         let mut x = seed.wrapping_mul(2654435761);
@@ -492,7 +1026,7 @@ mod sparse_equivalence {
         let cand: Vec<u32> = (0..depth * CAND).map(|i| 10 + i as u32).collect();
         for seed in 1..6u32 {
             for pos in [0usize, 7, 33] {
-                let q = DraftQ::from_scores(&scores, &cand, depth, 1.0, seed as u64, pos)
+                let q = DraftQ::from_scores(qi(&scores, &cand, depth, &cfg(), seed as u64, pos))
                     .expect("from_scores");
                 // depth+1 行:每行不同尖峰
                 let rows: Vec<Vec<f32>> = (0..=depth).map(|r| row(seed + r as u32)).collect();

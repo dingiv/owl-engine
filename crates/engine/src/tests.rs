@@ -5247,136 +5247,216 @@ pub async fn gpu_head_int8_gate() {
     );
 }
 
-// B4 自适应降级态机(§6.24):纯转移函数逐分支
+// B4 自适应降级态机(§6.24):连击账 + 探测节奏（纯转移函数逐分支）
 #[test]
-fn spec_degrade_transition_branches() {
-    use crate::exec::spec_degrade_transition;
-    // 成功轮:三账全复位(含降级态/退避)
-    let (s, d, p) = spec_degrade_transition(3, true, 256, 2, 6, 64);
-    assert_eq!((s, d, p), (0, false, 64));
-    // 非降级连击未达阈值:streak 累加,态不变
-    let (s, d, p) = spec_degrade_transition(0, false, 64, 0, 6, 64);
-    assert_eq!((s, d, p), (1, false, 64));
-    // 达阈值 → 入降级(探测周期 = 初值)
-    let (s, d, p) = spec_degrade_transition(5, false, 64, 0, 6, 64);
-    assert_eq!((s, d, p), (6, true, 64));
+fn spec_streak_step_branches() {
+    use crate::exec::spec_streak_step as s;
+    // 命中轮:连击清零 + 周期复位到 floor
+    assert_eq!(s(3, true, 256, 2, 64), (0, 64));
+    // 非降级态:连击累加,周期不动
+    assert_eq!(s(0, false, 64, 0, 64), (1, 64));
     // 降级态探测失败 → 退避 ×2
-    let (s, d, p) = spec_degrade_transition(7, true, 16, 0, 6, 8);
-    assert_eq!((s, d, p), (8, true, 32));
-    // 退避封顶 **32**(2026-10-27 由 512→64;2026-11-03 再 64→32 —— 探测是
-    // 保险不是惩罚:一轮探测摊到 32 token ≈ 1 ms/token(5%),而"该恢复还在
-    // 裸跑"的代价是 2.1×)
-    let (s, d, p) = spec_degrade_transition(9, true, 24, 0, 6, 8);
-    assert_eq!((s, d, p), (10, true, 32));
-    let (s, d, p) = spec_degrade_transition(9, true, 32, 0, 6, 8);
-    assert_eq!((s, d, p), (10, true, 32)); // 已在封顶 ⇒ 不再涨
-    // **小首探窗**(2026-10-18 缺省 8):入降级即用 8,探测失败退避到 16
-    let (s, d, p) = spec_degrade_transition(5, false, 8, 0, 6, 8);
-    assert_eq!((s, d, p), (6, true, 8));
-    let (s, d, p) = spec_degrade_transition(6, true, 8, 0, 6, 8);
-    assert_eq!((s, d, p), (7, true, 16));
-    // threshold=0 = 禁用(永不入降级)
-    let (s, d, p) = spec_degrade_transition(9, false, 64, 0, 0, 64);
-    assert_eq!((s, d, p), (10, false, 64));
+    assert_eq!(s(7, true, 16, 0, 8), (8, 32));
+    // 退避封顶 32(探测是保险不是惩罚;一轮探测摊到 32 token ≈ 1 ms/token)
+    assert_eq!(s(9, true, 24, 0, 8), (10, 32));
+    assert_eq!(s(9, true, 32, 0, 8), (10, 32));
+    // 小首探窗:入降级即用 floor,失败退避到 16
+    assert_eq!(s(6, true, 8, 0, 8), (7, 16));
+    // 非降级态周期永不漂移(即使 probe_every 被写大)
+    assert_eq!(s(9, false, 64, 0, 8), (10, 64));
 }
 
-/// **降级判决 = 确认制 + 可反悔**(2026-11-03 用户裁决)。
+/// **降级判决 = 按窗口经济性 + 深饿一窗确认**（2026-11-03 第二版）。
 ///
-/// 现场依据(双 3080 / 27B,101k prompt 的 agent turn):整体 AL=2.66 的健康
-/// turn 内部有若干段 16 轮全 m=0 ⇒ 旧判据(**一个**窗口即降级)一次降级后
-/// **53 次探测全部 m=0、`spec.undegrad=0`** ⇒ `deg=3238/6445`(一半解码步
-/// 永久裸跑,吞吐 114→57 t/s)。本门钉住三件事:
-/// ① 一个低收益窗口**不足以**降级(要两个连续);
-/// ② 连击只能**减半**确认(必须已有 ≥1 个低窗 + 部分窗 AL 也低);
-/// ③ **探测命中(m≥1)必须恢复** —— 除非恰好凑满两个连续低窗。
+/// 现场依据（8135 = 双 3080 / 27B，创作档 AL≈1.36、盈亏线≈1.60、轮 28.3ms /
+/// 裸 17.7ms）：旧判据要 **两个**低收益窗口才降级，而创作档**整条负载都亏**
+/// ⇒ 白亏 1.2 s 才降。而健康档（数学 AL 3.9 / 复制 7.9）离深饿线很远。
+///
+/// 本门钉住：① 盈利窗清零；② 浅饿一窗只记账；③ 深饿一窗即降；
+/// ④ 分母未测 / 窗口未评估 ⇒ 不判（不拿兜底常量乱杀）。
 #[test]
-fn spec_degrade_verdict_requires_confirmation_and_can_recover() {
+fn spec_degrade_verdict_is_window_economic() {
     use crate::exec::spec_degrade_verdict as v;
-    const AFTER: usize = 10;
-
-    // ① 健康:无窗口、无连击 ⇒ 不降
-    assert_eq!(v(false, false, 0, false, AFTER, false, false, 0), (false, 0));
-    // ② 一个低收益窗口 ⇒ 仍不降(只记账)
-    assert_eq!(v(false, false, 0, false, AFTER, true, true, 0), (false, 1));
-    // ③ 第二个连续低收益窗口 ⇒ 降
-    assert_eq!(v(false, false, 0, false, AFTER, true, true, 1), (true, 2));
-    // ④ 中间来了一个健康窗 ⇒ 计数清零,不降
-    assert_eq!(v(false, false, 0, false, AFTER, true, false, 1), (false, 0));
-    // ⑤ 连击但**没有**任何低窗 ⇒ 不降(连击不单独构成依据)
-    assert_eq!(v(false, true, AFTER, true, AFTER, false, false, 0), (false, 0));
-    // ⑥ 连击 + 一个低窗 + 部分窗 AL 也低 ⇒ 降(减半确认)
-    assert_eq!(v(false, true, AFTER, true, AFTER, true, true, 0), (true, 1));
-    // ⑦ 连击 + 一个低窗,但部分窗 AL 不低 ⇒ 不降
-    assert_eq!(v(false, true, AFTER, false, AFTER, true, true, 0), (false, 1));
-    // ⑧ 连击未达阈值 ⇒ 不降
-    assert_eq!(v(false, true, AFTER - 1, true, AFTER, true, true, 0), (false, 1));
-    // ⑨ **已在降级 + 探测命中(m≥1 ⇒ degraded0=false)** ⇒ 恢复
-    assert_eq!(v(true, false, 0, false, AFTER, false, false, 0), (false, 0));
-    // ⑩ 已在降级 + 本轮仍无命中 ⇒ 保持
-    assert_eq!(v(true, true, AFTER + 1, true, AFTER, false, false, 0), (true, 0));
-    // ⑪ 已在降级 + 探测命中,但恰满两个连续低窗 ⇒ 仍降(证据压过单次命中)
-    assert_eq!(v(true, false, 0, false, AFTER, true, true, 1), (true, 2));
-    // ⑫ 连击已把计数留在 1:连击路径不重复计数(窗口未评估 ⇒ 原样)
-    assert_eq!(v(true, true, AFTER, true, AFTER, false, false, 1), (true, 1));
+    let line = Some(1.60);
+    // 健康窗 ⇒ 不降、低窗清零
+    assert_eq!(v(true, 3.90, line, 1), (false, 0));
+    // 浅饿（0.97×线 = 线内噪声带）一窗 ⇒ 只记账
+    assert_eq!(v(true, 1.55, line, 0), (false, 1));
+    // 连续第二个浅饿窗 ⇒ 降
+    assert_eq!(v(true, 1.55, line, 1), (true, 2));
+    // 深饿（0.91×线）**一窗即降**（阈值 0.95：低过线本身已在亏）
+    assert_eq!(v(true, 1.45, line, 0), (true, 2));
+    // 再深（0.85×线）同样一窗
+    assert_eq!(v(true, 1.36, line, 0), (true, 2));
+    // 中间来一个盈利窗 ⇒ 计数清零
+    assert_eq!(v(true, 3.00, line, 1), (false, 0));
+    // 分母未测 ⇒ 不判（账不动）
+    assert_eq!(v(true, 0.50, None, 1), (false, 1));
+    // 窗口未评估 ⇒ 不判（账不动）
+    assert_eq!(v(false, 0.50, line, 1), (false, 1));
+    // 非有限 AL（空窗）⇒ 按饿处理但只走浅饿步
+    assert_eq!(v(true, f32::NAN, line, 0), (false, 1));
 }
 
-/// **降级不是单向门：turn 内必须能自愈**（2026-10-28 现场：前端 decode 速度
-/// 突然掉一半、直到下一轮才恢复）。
-///
-/// 为什么需要这条门：`degrade_after = 0`（旧档面）把降级与探测一起关掉时，
-/// m=0 的投机轮（37 ms/token）**比裸 decode（25-28 ms/token）还慢**，而
-/// `TurnSpecState` 是 turn 域状态 ⇒ 一路掉档到 turn 结束。修复 = 打开降级 +
-/// 封顶 64 的探测（`DEGRADE_PROBE_MAX`）。这里用纯转移函数模拟一整轮：
-/// 断言 (a) 降级后**一次 turn 内**确实探测到并恢复；(b) 退避封顶 64；(c) 域
-/// 一直差时探测仍周期性发生（不是"退避到永不探测"）。
+/// **窗口门**：冷首轮不许一轮成窗（2026-11-03 误降级实测）。
 #[test]
-fn degraded_turn_heals_within_the_same_turn() {
-    use crate::exec::spec_degrade_transition;
-    const FLOOR: usize = 8; // [spec].probe_every 缺省
+fn spec_window_needs_enough_rounds() {
+    use crate::exec::spec_window_done as w;
+    // 一轮 + 超长时间（冷首轮 800ms）⇒ **不成窗**
+    assert!(!w(1, 800.0));
+    assert!(!w(7, 5000.0));
+    // 满 8 轮 + 满 600ms ⇒ 成窗（时间门）
+    assert!(w(8, 600.0));
+    // 满 16 轮 ⇒ 成窗（轮数门;不看时间）
+    assert!(w(16, 10.0));
+    // 8 轮但只 300ms ⇒ 还等
+    assert!(!w(8, 300.0));
+}
 
-    // ① 域会回到可投机：探测轮 m=1 ⇒ 必须在本 turn 内恢复
-    let (mut streak, mut degraded, mut probe, mut steps) = (0usize, false, FLOOR, 0usize);
-    let mut healed_at = None;
-    let mut max_probe = 0usize;
-    for step in 0..400usize {
-        let is_probe = degraded && steps >= probe;
-        if is_probe {
-            steps = 0;
+/// **恢复 = 连续命中制**（2026-11-03 第二版）。
+///
+/// 旧实现一次 `m ≥ 1` 就恢复 ⇒ 创作档（`P(m≥1)≈0.29`）实测 363 轮里
+/// **4 降 3 恢复**（12 s 请求里抖 7 次）。新判据：两次连续命中，或一次
+/// 决定性命中（`m ≥ 3`）。健康档不受损（数学/复制第一探就决定性命中）。
+#[test]
+fn spec_restore_verdict_needs_two_hits() {
+    use crate::exec::spec_restore_verdict as r;
+    use crate::exec::RESTORE_DECISIVE_M;
+    // 单次小命中 ⇒ 不恢复（振荡主因），只记账
+    assert_eq!(r(1, 0), (false, 1));
+    assert_eq!(r(2, 0), (false, 1));
+    // 连续两次 ⇒ 恢复并复位计数
+    assert_eq!(r(1, 1), (true, 0));
+    // 决定性命中 ⇒ 立即恢复
+    assert_eq!(r(RESTORE_DECISIVE_M, 0), (true, 0));
+    assert_eq!(r(7, 0), (true, 0));
+    // 未命中 ⇒ 计数清零（"连续"语义）
+    assert_eq!(r(0, 1), (false, 0));
+}
+
+/// **降级不是单向门，也不能抖成节拍器**（2026-10-28 现场 + 2026-11-03 振荡实测）。
+///
+/// 三个域各模拟一个 turn：
+/// ① **会回到可投机**（探测决定性命中）⇒ 必须在同 turn 内自愈；
+/// ② **一直差**（探测也 m=0）⇒ 留在裸 decode，探测周期封顶 32 但**周期发生**；
+/// ③ **创作型**（m∈{0:71%,1:21%,2:6%,3:2%}）⇒ 以裸 decode 为主、恢复次数极少
+///   （旧"一次命中就恢复"实测 363 轮 4 降 3 恢复 = 节拍器）。
+#[test]
+fn degraded_turn_heals_without_oscillating() {
+    use crate::exec::RESTORE_DECISIVE_M;
+    use crate::exec::{spec_degrade_verdict as dv, spec_restore_verdict as rv, spec_streak_step as ss};
+    const FLOOR: usize = 8;
+    // 模拟框架：返回 (降级轮数, 降级次数, 恢复次数, 最大探测周期, 恢复发生步)
+    struct Sim {
+        streak: usize,
+        degraded: bool,
+        probe: usize,
+        steps: usize,
+        low: u8,
+        hits: u8,
+        recent_r: u32,
+        recent_t: u32,
+        deg_rounds: usize,
+        degrades: usize,
+        restores: usize,
+        max_probe: usize,
+        healed_at: Option<usize>,
+        probes: usize,
+    }
+    impl Sim {
+        fn new() -> Self {
+            Self {
+                streak: 0, degraded: false, probe: FLOOR, steps: 0, low: 0, hits: 0,
+                recent_r: 0, recent_t: 0, deg_rounds: 0, degrades: 0, restores: 0,
+                max_probe: 0, healed_at: None, probes: 0,
+            }
         }
-        let m = usize::from(is_probe); // 探测轮命中
-        let (s, d, p) = spec_degrade_transition(streak, degraded, probe, m, 6, FLOOR);
-        (streak, degraded, probe) = (s, d, p);
-        max_probe = max_probe.max(probe);
-        if degraded {
-            steps += 1;
-        } else if step > 0 {
-            healed_at = Some(step);
-            break;
+        /// `line` 盈亏线；`m_of(round)` 给出该轮接受数；`rounds` 总轮数
+        fn run(&mut self, rounds: usize, line: f32, mut m_of: impl FnMut(usize) -> usize) {
+            for i in 0..rounds {
+                let is_probe = self.degraded && self.steps >= self.probe;
+                // 降级期**非探测**步 = 裸 decode：不产 m、不进窗口、不判降级
+                // （真机上这一路根本不进 `execute_spec_round`）。
+                if self.degraded && !is_probe {
+                    self.steps += 1;
+                    self.deg_rounds += 1;
+                    continue;
+                }
+                if is_probe {
+                    self.steps = 0;
+                    self.probes += 1;
+                }
+                let m = m_of(i);
+                let (s, p) = ss(self.streak, self.degraded, self.probe, m, FLOOR);
+                self.streak = s;
+                self.probe = p;
+                self.max_probe = self.max_probe.max(self.probe);
+                if is_probe {
+                    let (restore, h) = rv(m, self.hits);
+                    self.hits = h;
+                    if restore {
+                        self.degraded = false;
+                        self.restores += 1;
+                        self.low = 0;
+                        self.hits = 0;
+                        self.recent_r = 0;
+                        self.recent_t = 0;
+                        if self.healed_at.is_none() {
+                            self.healed_at = Some(i);
+                        }
+                    }
+                } else {
+                    self.recent_r += 1;
+                    self.recent_t += (m + 1) as u32;
+                    let done = self.recent_r >= 16;
+                    let al = self.recent_t as f32 / self.recent_r.max(1) as f32;
+                    let (d, l) = dv(done, al, Some(line), self.low);
+                    self.low = l;
+                    if done {
+                        self.recent_r = 0;
+                        self.recent_t = 0;
+                    }
+                    if d {
+                        self.degraded = true;
+                        self.degrades += 1;
+                        self.low = 0;
+                        self.hits = 0;
+                        self.steps = 0;
+                    }
+                }
+                if self.degraded {
+                    self.steps += 1;
+                    self.deg_rounds += 1;
+                }
+            }
         }
     }
-    assert!(!degraded, "turn 内必须自愈（旧行为是单向门）");
-    assert!(max_probe <= 32, "退避必须封顶 32，实际 {max_probe}");
-    assert!(healed_at.expect("必须愈合") < 200, "愈合太慢：{healed_at:?} 步");
 
-    // ② 域一直差（探测轮也 m=0）：退避停在 32，但探测必须**周期性**发生
-    let (mut streak, mut degraded, mut probe, mut steps) = (0usize, false, FLOOR, 0usize);
-    let (mut probes, mut max_probe) = (0usize, 0usize);
-    for _ in 0..400usize {
-        let is_probe = degraded && steps >= probe;
-        if is_probe {
-            steps = 0;
-            probes += 1;
-        }
-        let (s, d, p) = spec_degrade_transition(streak, degraded, probe, 0, 6, FLOOR);
-        (streak, degraded, probe) = (s, d, p);
-        max_probe = max_probe.max(probe);
-        if degraded {
-            steps += 1;
-        }
-    }
-    assert!(degraded, "真差域必须留在裸 decode（不许振荡回亏本 spec）");
-    assert_eq!(max_probe, 32, "封顶 32（2026-11-03 由 64 下修：探测是保险不是惩罚）");
-    assert!(probes >= 6, "400 步内至少探测 6 次（每 ≤32 步一次），实际 {probes}");
+    // ① 前 40 轮饿（AL 1.0），之后健康（AL 4.0）
+    let mut a = Sim::new();
+    a.run(363, 1.60, |i| if i < 40 { 0 } else { 3 });
+    assert!(!a.degraded, "turn 内必须能自愈");
+    assert!(a.degrades >= 1, "饿段必须降级（实际 {} 次）", a.degrades);
+    let healed = a.healed_at.expect("必须愈合");
+    assert!(healed < 120, "愈合太慢:{healed} 轮");
+
+    // ② 一直差：探测也 m=0
+    let mut b = Sim::new();
+    b.run(400, 1.60, |_| 0);
+    assert!(b.degraded, "真差域必须留在裸 decode");
+    assert_eq!(b.max_probe, 32, "探测周期封顶 32");
+    assert!(b.probes >= 12, "400 轮内必须周期探测（实际 {}）", b.probes);
+    assert_eq!(b.restores, 0, "从不命中就不许恢复");
+
+    // ③ 创作型分布：以裸 decode 为主，恢复极少（旧实现是节拍器）
+    const CREATIVE: [usize; 16] = [0, 0, 1, 0, 0, 1, 2, 0, 0, 1, 0, 0, 0, 1, 0, 3];
+    let mut c = Sim::new();
+    c.run(363, 1.60, |i| CREATIVE[i % CREATIVE.len()]);
+    assert!(c.deg_rounds * 100 / 363 >= 60, "创作档该以裸 decode 为主（覆盖率 {}%）", c.deg_rounds * 100 / 363);
+    assert!(c.restores <= 3, "恢复次数 {}（旧实现 363 轮 3 次 = 节拍器）", c.restores);
+    assert!(c.deg_rounds > 0 && c.degrades >= 1);
+    // 决定性命中门槛来自常量（防"改了常量忘了门"）
+    assert_eq!(RESTORE_DECISIVE_M, 3);
 }
 
 // ============================================================================

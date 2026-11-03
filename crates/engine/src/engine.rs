@@ -712,6 +712,11 @@ impl EngineKnobs {
                 depth_switch_ctx: cfg.spec.depth_switch_ctx,
                 adaptive_min_tpr: cfg.spec.adaptive_min_tpr,
                 lookup: cfg.spec.lookup,
+                dflash_walk: cfg.spec.dflash_walk,
+                q_alpha: cfg.spec.q_alpha,
+                q_floor: cfg.spec.q_floor,
+                q_host: cfg.spec.q_host,
+                q_dump: cfg.spec.q_dump.clone(),
                 lookup_nmin: cfg.spec.lookup_nmin,
                 lookup_nmax: cfg.spec.lookup_nmax,
                 lookup_nstrong: cfg.spec.lookup_nstrong,
@@ -871,6 +876,16 @@ pub struct DraftCfg {
     pub adaptive_min_tpr: f32,
     /// DFlash2 lookup-augmented drafting（LABD；仅 DFlash2）
     pub lookup: bool,
+    /// DFlash2 选择器 walk 策略（AL 消融量具；缺省 conditional = 核内原律）
+    pub dflash_walk: owl_shared::config::DflashWalk,
+    /// 草稿 q 的 logit 缩放（AL 校准；1.0 = 原律）
+    pub q_alpha: f32,
+    /// 草稿 q 的均匀地板（AL 校准；0 = 不加）
+    pub q_floor: f32,
+    /// 是否启用 host 侧草稿 q（缺省 true：真机 A/B 高 ~8% AL）
+    pub q_host: bool,
+    /// 草稿 q 标定 dump 路径（空 = 关）
+    pub q_dump: String,
     pub lookup_nmin: usize,
     pub lookup_nmax: usize,
     pub lookup_nstrong: usize,
@@ -900,6 +915,11 @@ impl Default for DraftCfg {
             depth_switch_ctx: 49152,
             adaptive_min_tpr: 3.0,
             lookup: false,
+            dflash_walk: owl_shared::config::DflashWalk::Conditional,
+            q_alpha: 1.0,
+            q_floor: 0.0,
+            q_host: true,
+            q_dump: String::new(),
             lookup_nmin: 6,
             lookup_nmax: 12,
             lookup_nstrong: 6,
@@ -2380,6 +2400,11 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             depth_switch_ctx: cfg.knobs.draft.depth_switch_ctx,
             adaptive_min_tpr: cfg.knobs.draft.adaptive_min_tpr,
             lookup: cfg.knobs.draft.lookup,
+            dflash_walk: cfg.knobs.draft.dflash_walk,
+            q_alpha: cfg.knobs.draft.q_alpha,
+            q_floor: cfg.knobs.draft.q_floor,
+            q_host: cfg.knobs.draft.q_host,
+            q_dump: cfg.knobs.draft.q_dump.clone(),
             lookup_nmin: cfg.knobs.draft.lookup_nmin,
             lookup_nmax: cfg.knobs.draft.lookup_nmax,
             lookup_nstrong: cfg.knobs.draft.lookup_nstrong,

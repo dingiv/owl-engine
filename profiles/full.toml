@@ -248,6 +248,26 @@ dumb = false
 draft_kv_fp8 = false
 # DFlash2 草稿环窗口(token;0 = auto = 检查点声明,缺声明 = 家族 2048;当前核支持 2048)
 draft_window = 0
+# DFlash2 选择器 walk 策略（**AL 消融量具,不是调优旋钮**;仅 DFlash2 档）
+#   conditional = 设备核原律:第 e 步读 scores[e, 上一步选中的候选, ·]（缺省）
+#   fixed_pred  = 每步读 scores[e, 0, ·]（固定参考前驱 ⇒ 砍掉条件反馈环）
+#   unary       = 每步只读 unary[e, ·]（逐位置边际 ⇒ 丢掉全部边缘分;DDTree 的 q_i(v)）
+# 背景:roadmap.local/26-11-03-ddtree-AL升级-交接.md §4 S0。
+# 收割面读 `mcand` 槽只在非 conditional 档发生(~0.9KB/轮);conditional = 零回归。
+dflash_walk = "conditional"
+# **草稿 q 校准旋钮**（2026-11-03;只影响 AL,不影响分布正确性）
+# 选择器边分不是校准 logits:实测 q(top1)≈0.97 而目标 p(top1)≈0.34 ⇒ 拒绝采样
+# 的 `Σ min(p,q)` 退化到 `p(top1)`。q_alpha 乘在行上（1.0 = 原律,0 → 均匀）,
+# q_floor 再加均匀地板（∈[0,1),0 = 不加）。两者都只在 TP2 切分档生效。
+q_alpha = 1.0
+q_floor = 0.0
+# **host 侧草稿 q**（拒绝采样路径）。**缺省 true**（2026-11-03 真机 A/B，4080 单卡
+# 12 轮 ×2 负载：开 = 1.450/3.711，关 = 1.334/3.470 ⇒ 开高 ~8%）。
+# ⚠️ q_alpha/q_floor 保持 1.0/0.0：**把 q 摊平只会掉 AL**（同一批 dump 实测
+# α=0.5/0.25 的逐步接受率单调下降 —— 选择器的非 top-1 质量对 p 是反信息）。
+q_host = true
+# **[标定] q dump 路径**（空 = 关；每轮一行 JSONL：raw 行 / 候选 id / 目标 p）
+q_dump = ""
 # DFlash2 lookup-augmented drafting（LABD；仅 DFlash2 档可开）
 # 在当前请求 token 历史里找当前后缀的最近一次出现，用其后续 token 覆盖草稿头；
 # 缺省关 = 旧档逐字节不变。nmin/nmax/nstrong/agree 语义见 docs/devlog/perf/tp2-decode-fast.md §10。

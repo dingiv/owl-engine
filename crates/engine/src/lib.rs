@@ -311,3 +311,10 @@ mod load_arm_tests {
         }
     }
 }
+
+/// **mem 域的定时探针**（`exec::mrec` 的 crate 级孪生：mem/state.rs 也要记账）。
+pub(crate) fn mem_mrec(tag: &str, dur: std::time::Duration) {
+    owl_shared::metrics::with_metrics_store(|s| {
+        s.timer_record_tag(tag, dur, file!(), line!());
+    });
+}

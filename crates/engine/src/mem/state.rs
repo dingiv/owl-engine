@@ -1755,6 +1755,7 @@ impl StatePool {
                 ModelError::Msg("spec 快照缓冲未分配(OWL_SPEC_DEPTH 未开)".into())
             })?;
         // E5-M4:批量通道(192 次 actor 往返 → 1;单 ack 保序)
+        let t_build = std::time::Instant::now();
         let mut copies: Vec<(owl_iface::Bytes, usize, owl_iface::Bytes, usize, usize)> =
             Vec::with_capacity(n * 4);
         for (li, g) in self.gdn.gdns.iter().enumerate() {
@@ -1776,7 +1777,10 @@ impl StatePool {
                 ));
             }
         }
+        crate::mem_mrec("spec.snap.build", t_build.elapsed());
+        let t_send = std::time::Instant::now();
         face.copy_batch(copies.as_slice()).await?;
+        crate::mem_mrec("spec.snap.send", t_send.elapsed());
         let _ = n;
         Ok(())
     }
@@ -1815,7 +1819,9 @@ impl StatePool {
                 ));
             }
         }
+        let t_send = std::time::Instant::now();
         face.copy_batch(copies.as_slice()).await?;
+        crate::mem_mrec("spec.restore.send", t_send.elapsed());
         let _ = n;
         Ok(())
     }

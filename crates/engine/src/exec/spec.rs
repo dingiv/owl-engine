@@ -38,10 +38,79 @@ fn live_depth_for_budget(depth: usize, remaining: usize) -> usize {
         depth.min(remaining - 1)
     }
 }
-/// 纯函数（单测锚）：滚动 tokens/round 是否低于降档门。
-fn adaptive_should_downshift(rounds: u32, tokens: u32, min_tpr: f32) -> bool {
-    rounds >= SPEC_ADAPTIVE_WARMUP_ROUNDS && (tokens as f32 / rounds as f32) < min_tpr
+/// **深度阶梯的动作**(P1-⑤,2026-11-03)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LadderAct {
+    /// 不动
+    Hold,
+    /// 档位真切了(调用方记日志/记指标)
+    Moved,
 }
+
+/// 阶梯的一步判决(纯函数;降/升都带滞回,绝不抖动)。
+///
+/// **为什么双向**(实测:129 轮里 verify 占 21.4ms/轮 = 76%,AL 2.1 ⇒ 9.1ms/token;
+/// 而 m0 全拒轮占比可达 60%+ ⇒ 深档在低收益段是纯浪费):
+///
+/// - **降**:高 AL 线(`down_line` = `adaptive_min_tpr`,缺省 3.0)连续
+///   [`LADDER_DOWN_WINDOWS`] 个观察窗都够不着 ⇒ 切浅档(verify 行数 K+1 → dmin+1);
+/// - **升**:浅档**饱和**(窗口内 ≥ [`LADDER_FULL_RATIO`] 的轮把 `depth_min`
+///   全部吃满)连续 [`LADDER_UP_WINDOWS`] 个窗 ⇒ 回深档 —— 这是 vLLM
+///   `next_num_draft_tokens` 的 "copy 检测" 同族信号(对 pi agent 的
+///   "整段重写/复制粘贴"形状直接有效),只是判据落在接受账上而不在 lookup 上;
+/// - **滞回**:两方向各自计数,切换即清零;观察窗由调用方给(≥
+///   [`SPEC_ADAPTIVE_WARMUP_ROUNDS`] 轮)。
+///
+/// 返回 `(新 down 态, 新 low_windows, 新 full_windows, 动作)`。
+pub(crate) fn depth_ladder_step(
+    down: bool,
+    depth_min: usize,
+    rounds: u32,
+    tokens: u32,
+    full: u32,
+    down_line: f32,
+    low_windows: u8,
+    full_windows: u8,
+) -> (bool, u8, u8, LadderAct) {
+    if rounds < SPEC_ADAPTIVE_WARMUP_ROUNDS {
+        return (down, low_windows, full_windows, LadderAct::Hold);
+    }
+    let al = tokens as f32 / rounds as f32;
+    if !down {
+        // 高 AL 线:连续够不着 ⇒ 降
+        if al < down_line {
+            let n = low_windows.saturating_add(1);
+            if n >= LADDER_DOWN_WINDOWS {
+                (true, 0, 0, LadderAct::Moved)
+            } else {
+                (false, n, 0, LadderAct::Hold)
+            }
+        } else {
+            (false, 0, 0, LadderAct::Hold)
+        }
+    } else {
+        // 浅档饱和 ⇒ 升(饱和 = 把 depth_min 全吃满的轮占比够高)
+        let full_ratio = full as f32 / rounds as f32;
+        let sat = full_ratio >= LADDER_FULL_RATIO && al >= depth_min as f32 + 0.5;
+        if sat {
+            let n = full_windows.saturating_add(1);
+            if n >= LADDER_UP_WINDOWS {
+                (false, 0, 0, LadderAct::Moved)
+            } else {
+                (true, 0, n, LadderAct::Hold)
+            }
+        } else {
+            (true, 0, 0, LadderAct::Hold)
+        }
+    }
+}
+
+/// 降档需要连续几个观察窗(缺省 2;一窗就切 = 太敏感,与 B4 确认制同口径)
+const LADDER_DOWN_WINDOWS: u8 = 2;
+/// 升档需要连续几个饱和窗(缺省 2;升档更保守 —— 误升只在下一窗降回来)
+const LADDER_UP_WINDOWS: u8 = 2;
+/// "浅档饱和"的轮占比门(吃满 `depth_min` 的轮 ≥ 一半)
+const LADDER_FULL_RATIO: f32 = 0.5;
 
 /// **两半表 (max 值, 索引) 合并**(2026-10-26 分布式 argmax)。
 ///
@@ -229,7 +298,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .iter()
                     .map(|row| crate::sampler::distribution_of_cands(row, &sampler_cfg))
                     .collect();
-                match proposal_q.as_ref() {
+                let (m, emitted, bonus) = match proposal_q.as_ref() {
                     // **DFlash2 拒绝采样**(2026-10-31 合流):q 路径需要的是
                     // "目标分布"本身,而稀疏 p 的支撑 ⊆ top-20 ⊆ 设备 top-32
                     // ⇒ 候选行足以给出逐项相同的 p,不再强制回读整行 logits
@@ -250,19 +319,32 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         (m, emitted, bonus)
                     }
                     // 非 DFlash2(MTP/Dumb):旧「目标抽样 == draft」等价式。
+                    //
+                    // 罚历史**只吃已提交 token**(2026-11-03 定谳):先把 live+1 行
+                    // 全抽出来(每行都看**轮前**同一个 `hist`,不被前面几行的抽样
+                    // 污染),再判接受长度,最后按 emitted 入账。
                     None => {
                         let mut s: Vec<u32> = Vec::with_capacity(live + 1);
                         for (i, prow) in p_rows.iter().enumerate().take(live + 1) {
                             let mut rng =
                                 seed_base ^ ((pos + i) as u64).wrapping_mul(0xBF58476D1CE4E5B9);
-                            let tok = crate::sampler::sample_sparse(prow, &mut rng);
-                            s.push(tok);
-                            hist.push(tok);
+                            s.push(crate::sampler::sample_sparse(prow, &mut rng));
                         }
-                        let m = spec_sampled_accept_prefix(&drafts[..live], &s[..live]);
-                        (m, s[..=m].to_vec(), s[m])
+                        let (m, emitted) = super::sample_accept(&drafts[..live], &s);
+                        super::hist_commit(&mut hist, &emitted);
+                        let bonus = emitted.last().copied().unwrap_or(0);
+                        (m, emitted, bonus)
                     }
-                }
+                };
+                dump_q_calibration(
+                    &self.dev.spec_rt.q_dump,
+                    pos,
+                    live,
+                    m,
+                    proposal_q.as_ref(),
+                    &p_rows,
+                )?;
+                (m, emitted, bonus)
             } else {
             let Some(lg) = row_logits.as_ref() else {
                 return Err(ModelError::Msg(
@@ -298,6 +380,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 (m, emitted, bonus)
             } else {
                 // 非 DFlash2（MTP/Dumb）：旧「目标抽样 == draft」等价式。
+                //
+                // 罚历史两处都收口(2026-11-03):①每行抽样都看**轮前**同一个
+                // `hist`(旧实现边抽边 push ⇒ 第 i 行看到前 i-1 行的抽样,口径错);
+                // ②只把已提交的 `emitted` 入账(旧实现把 live+1 个全入账)。
                 let mut s: Vec<u32> = Vec::with_capacity(live + 1);
                 let mut scratch: Vec<f32> = Vec::with_capacity(vocab);
                 for i in 0..=live {
@@ -307,12 +393,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     // 免得降级态换路后抽点错位)
                     let mut rng =
                         seed_base ^ ((pos + i) as u64).wrapping_mul(0xBF58476D1CE4E5B9);
-                    let tok = crate::sampler::sample(&mut scratch, &sampler_cfg, &mut rng, &hist);
-                    s.push(tok);
-                    hist.push(tok); // 已发出的 token 进惩罚集(与逐 token 解码同语义)
+                    s.push(crate::sampler::sample(&mut scratch, &sampler_cfg, &mut rng, &hist));
                 }
-                let m = spec_sampled_accept_prefix(&drafts[..live], &s[..live]);
-                (m, s[..=m].to_vec(), s[m])
+                let (m, emitted) = super::sample_accept(&drafts[..live], &s);
+                super::hist_commit(&mut hist, &emitted);
+                let bonus = emitted.last().copied().unwrap_or(0);
+                (m, emitted, bonus)
             }
             } // 候选式采样 / logits 老路
         } else {
@@ -327,49 +413,90 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // `spec.recent_*`(与本计数无关,不受影响)。
         mcnt("spec.sample.rounds", 1);
         mcnt("spec.sample.accepted", m as u64);
+        // **边际名次探针**（只在 `dflash_walk` 消融臂记账；2026-11-03 S0 第二量具）：
+        //
+        // 目标在第 0 个草稿位选中的 token（`emitted[0]`；m=0 时它就是 bonus =
+        // 目标自己的抽样）在草稿**边际候选表**里的名次。
+        // 量的是"扇宽 W 的第一层能捞回多少"：AL_star(W) ≈ 1 + P(rank < W)。
+        // 名次在表外 = `spec.cand.rank_miss`（该 token 根本不在 top-16）。
+        if self.dev.spec_rt.dflash_walk != owl_shared::config::DflashWalk::Conditional {
+            let (picked, row) = {
+                let t = self.tspec()?;
+                (
+                    emitted.first().copied(),
+                    t.probe_cand.get(..super::proposal_q::CAND).map(|r| r.to_vec()),
+                )
+            };
+            if let (Some(tok), Some(row)) = (picked, row) {
+                mcnt("spec.cand.rounds", 1);
+                // 有界 tag 集（`/debug/metrics` 有行数上限；逐名次拆开会挤掉
+                // `spec.verify` 等生产行）⇒ 只留四条累计曲线。
+                match row.iter().position(|&c| c == tok) {
+                    Some(r) => {
+                        mcnt("spec.cand.r0", (r < 1) as u64);
+                        mcnt("spec.cand.r4", (r < 4) as u64);
+                        mcnt("spec.cand.r8", (r < 8) as u64);
+                        mcnt("spec.cand.r16", 1);
+                    }
+                    None => mcnt("spec.cand.miss", 1),
+                }
+            }
+        }
         // 自适应 depth 的 active 事实（tag 有界：d3/d7；/debug/metrics 直读）
         mcnt(&format!("spec.depth.d{depth}"), 1);
         // **AL/成本降档门（T1b）**：滚动 tokens/round 低于阈值 ⇒ 只降不升。
         // 静态 ctx 阈值在 DOCS 29.7k 会误选 d7；这个门用真实接受账补上。
         if self.dev.spec_rt.adaptive_depth {
-            let min_depth = self.dev.spec_rt.depth_min;
-            let min_tpr = self.dev.spec_rt.adaptive_min_tpr;
+            // ── **P1-⑤ 双向深度阶梯**(2026-11-03)──
+            //
+            // 旧实现"只降不升"+ 位置门:一次误判吃到 turn 末;而 verify 占一轮
+            // 76% 的实测下,低收益段留在深档是纯浪费、复制粘贴段留在浅档是纯亏。
+            // 判据全落在**接受账**上(down = AL 够不着;up = 浅档吃满饱和),
+            // 与 vLLM 的 copy 检测同族但不需要额外的 lookup 信号。
+            let (min_depth, down_line) =
+                (self.dev.spec_rt.depth_min, self.dev.spec_rt.adaptive_min_tpr);
             let t = self.tspec()?;
             t.adaptive_rounds = t.adaptive_rounds.saturating_add(1);
             t.adaptive_tokens = t.adaptive_tokens.saturating_add((m + 1) as u32);
-            let avg = t.adaptive_tokens as f32 / t.adaptive_rounds as f32;
-            let ready = t.adaptive_rounds >= SPEC_ADAPTIVE_WARMUP_ROUNDS;
-            let low = adaptive_should_downshift(t.adaptive_rounds, t.adaptive_tokens, min_tpr);
-            let down = !t.adaptive_downshift && low && t.adaptive_low_windows >= 1;
-            // **per-round m 账**（T1b 校准用）:窗口内每轮一行，直接看 AL 形状。
-            owl_shared::log_info!(
-                "spec-adaptive",
-                "pos={pos} depth={depth} m={m} window_rounds={} window_tokens={} tpr={avg:.2} min_tpr={min_tpr:.2} ready={ready} low={low} low_windows={} down={down}",
-                t.adaptive_rounds,
-                t.adaptive_tokens,
-                t.adaptive_low_windows
-            );
-            if !t.adaptive_downshift {
-                if low {
-                    t.adaptive_low_windows = t.adaptive_low_windows.saturating_add(1);
-                } else if ready {
-                    t.adaptive_low_windows = 0;
-                }
+            if t.adaptive_downshift && m >= min_depth {
+                // 浅档饱和:本轮把 `depth_min` 全部吃满(还有 bonus)
+                t.adaptive_full_rounds = t.adaptive_full_rounds.saturating_add(1);
             }
-            if down {
-                t.adaptive_downshift = true;
-                mcnt("spec.adaptive.down", 1);
-                owl_shared::log_info!(
-                    "spec-adaptive",
-                    "pos={pos} 连续 2 窗 tokens/round={avg:.2} < {min_tpr:.2}（{} 轮）⇒ depth {} → {}（只降不升）",
-                    t.adaptive_rounds,
-                    depth,
-                    min_depth
-                );
-            } else if ready && !t.adaptive_downshift {
-                // 本窗不降：开下一个观察窗（累计平均会拖到 70+ 轮才看见尾部衰减）
+            let (rd, tk, fu) = (t.adaptive_rounds, t.adaptive_tokens, t.adaptive_full_rounds);
+            let (down0, lw, fw, act) = depth_ladder_step(
+                t.adaptive_downshift,
+                min_depth,
+                rd,
+                tk,
+                fu,
+                down_line,
+                t.adaptive_low_windows,
+                t.adaptive_full_windows,
+            );
+            t.adaptive_low_windows = lw;
+            t.adaptive_full_windows = fw;
+            t.adaptive_downshift = down0;
+            if act == LadderAct::Moved {
+                // 切档后重开观察窗(新旧档的 AL 不可比)
                 t.adaptive_rounds = 0;
                 t.adaptive_tokens = 0;
+                t.adaptive_full_rounds = 0;
+                let to_min = down0;
+                mcnt(
+                    if to_min { "spec.ladder.down" } else { "spec.ladder.up" },
+                    1,
+                );
+                owl_shared::log_info!(
+                    "spec-ladder",
+                    "pos={pos} 深度阶梯:{} → {}(窗 {rd} 轮 / {tk} tok / 饱和 {fu} 轮;线 {down_line:.2})",
+                    if to_min { depth } else { min_depth },
+                    if to_min { min_depth } else { depth },
+                );
+            } else if rd >= SPEC_ADAPTIVE_WARMUP_ROUNDS {
+                // 本窗不切 ⇒ 重开窗(累计平均会拖到几十轮才看见尾部衰减)
+                t.adaptive_rounds = 0;
+                t.adaptive_tokens = 0;
+                t.adaptive_full_rounds = 0;
             }
         }
         // B4 自适应降级态机(§6.24;DFlash2 专属 —— 同步机制走 dflash encode)
@@ -381,6 +508,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // **探测轮取证**(2026-11-03 立案):本轮进降级态 ⇒ 这一轮就是“反悔探测”。
             // 若探测长期 m=0 而普通轮 AL 正常 ⇒ 探测路径本身坏了(草稿面/位置面)。
             let was_probe = self.tspec_ref()?.spec_degraded;
+            // 轮成本口径的引擎级保鲜值（借用 `tspec()` 前取出，见下）
+            let last_round_ms = self.dev.spec_rt.last_round_ms;
             let probe_line = if was_probe {
                 Some(format!(
                     "pos={pos} m={m} depth={depth} d={:?} ids={:?}",
@@ -409,153 +538,146 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 mcnt("spec.probe.round", 1);
                 mcnt("spec.probe.accepted", m as u64);
             }
-            spec.recent_rounds += 1;
-            spec.recent_tokens += (m + 1) as u32;
-            // 轮时进窗口(时间门 + 绝对吞吐;t_round 在下方 EWMA 处已用)
-            let round_ms_now = t_round.elapsed().as_secs_f32() * 1000.0;
-            spec.recent_ms += round_ms_now;
-            let (streak, degraded0, probe_every) = spec_degrade_transition(
+            // ── 本轮账分两条路：**探测轮只判恢复**（不累计窗口），
+            //    正常投机轮累计窗口 + 判降级。旧实现把探测轮也混进窗口 ⇒
+            //    窗口 AL 被降级期的少数探针稀释，判据两头失真。 ──
+            let (streak, probe_every) = crate::exec::spec_streak_step(
                 spec.spec_zero_streak,
-                spec.spec_degraded,
+                was_probe,
                 spec.spec_probe_every,
                 m,
-                degrade_after,
                 probe_every0,
             );
-            // 动态盈亏线(2026-10-09;2026-10-14 修口径):
-            // threshold = 滚动轮成本/裸步成本(夹 [2.0, 6.0])。
-            // **三处修正**(旧判据偏软的根因):
-            // ① **分母保鲜**:裸步 EWMA 只在降级期采样(非降级期没有裸步
-            //    ⇒ 分母是上一次降级期的陈值,跨 ctx 换档后失真)⇒ ctx 涨过
-            //    25% 即作废分母,并在重新采样前取**保守下限 2.5**
-            //    (旧兜底 1.2 远低于真线,是"AL 1.2~4 亏本区"的来源);
-            // ② **时间门**:窗口满 16 轮 **或** 满 600ms 即评估
-            //    (超长轮 150-300ms 下等 16 轮 = 2.4-4.8s,反应太慢);
-            // ③ 评估时给出**绝对吞吐**读数(tok/s)便于日志对账。
-            let _ctx_sampled = spec.bare_cost_ctx;
-            // ⚠️ **2026-10-14 那条结论已被 2026-10-17 实测推翻**:当时看“裸步成本
-            // 几乎不随 ctx 变(25.3→26.4 ms @610→9010,±5%)”⇒ 取消 ctx 作废;
-            // 但在 **32k** 上裸步 = 38.4 ms(pos 564 时为 24.5 ms,**+57%**)——
-            // 那条实测只覆盖到 9k ⇒ 作废规则已**恢复**(`scheduler.rs` “分母与
-            // ctx 配对”),并用**播种步**重采(否则作废后会回到无分母态)。
-            let (rc, bc) = (spec.round_cost_ewma_ms, spec.bare_cost_ewma_ms);
-            // 盈亏线 = 轮/裸 实测比(夹 [2.0,6.0]);`None` = 分母未测
-            // ⇒ **窗口判据不生效**(2026-10-17:旧兜底常量 2.5 在 32k 会把
-            // 盈利档 AL 2.25 误降级;分母已由首 turn 播种步补上,见 break_even_line)
-            let break_even = crate::exec::break_even_line(rc, bc);
-            const WINDOW_ROUNDS: u32 = 16;
-            const WINDOW_MS: f32 = 600.0;
-            // ── **确认制(2026-11-03 用户裁决)** ──
+            let mut probe_next = probe_every;
+            // 滚动轮成本 ewma（动态盈亏线分子;α=0.15;emit 前 —— 轮尾
+            // tspec 可能已随 complete 消失,P0 同款）
             //
-            // 旧判据 = **一个**窗口(`16 轮` 或 `600ms`)低于盈亏线就降级。
-            // 真机(双 3080 / 27B,101k prompt / 6445 tok 的 agent turn)实测:
-            // 该 turn 整体 AL=2.66(健康),但内部有若干段 16 轮全 m=0
-            // (工具调用/JSON 结构/随机词)→ **一次性降级 5 次、降级步占 50%
-            // (`deg=3238/6445`)、吞吐从 114 t/s 掉到 57 t/s**。
-            //
-            // 不对称性是关键:
-            // - **误降**(健康档被降):健康档 9.8ms/token vs 裸 21ms ⇒ **2.1×**;
-            // - **误留**(死档没降):spec 26ms/轮 vs 裸 21ms/token ⇒ **1.24×**。
-            // ⇒ 宁可多留在 spec,也不要误降:降级需 **2 个连续饿窗口**
-            // (≈1.2s 的实证),连击只能**减半**确认(1 窗口 + 连击达阈值)。
-            let mut window_done = false;
-            let window_starved =
-                if spec.recent_rounds >= WINDOW_ROUNDS || spec.recent_ms >= WINDOW_MS {
-                    window_done = true;
-                    let avg = spec.recent_tokens as f32 / spec.recent_rounds.max(1) as f32;
-                    let win_tps = spec.recent_tokens as f32 * 1000.0 / spec.recent_ms.max(1.0);
-                    spec.recent_rounds = 0;
-                    spec.recent_tokens = 0;
-                    spec.recent_ms = 0.0;
-                    let starved = break_even.is_some_and(|line| avg < line);
-                    if starved || break_even.is_none() {
-                        let line = crate::exec::break_even_text(break_even);
-                        let why = if break_even.is_none() {
-                            "(分母未测 ⇒ 本轮不判;播种步在首 turn 发出)"
-                        } else {
-                            ""
-                        };
-                        owl_shared::log_warn!("spec-degrade", "窗口 AL={avg:.2} vs 盈亏线 {line}{why}(轮 {rc:.0}ms/裸 {bc:.0}ms;窗口吞吐 {win_tps:.1} tok/s;starved={starved})"
-                        );
-                    }
-                    starved
-                } else {
-                    false
-                };
-            // ── **连击判据的闸门**(2026-10-18 实测立案)──
-            //
-            // 连击(m=0×6)只说明"最近 6 轮草稿全灭",**不代表投机本身亏本**:
-            // 实测(重复上下文,ctx 8.5k)一次连击触发降级时,窗口 AL ≈ **2.9-3.9
-            // tok/轮**,而盈亏线 = 轮/裸 ≈ 2.0 ⇒ 留在 spec 每 token ≈ 9.4 ms,
-            // 降级裸步 **27.5 ms/token** ⇒ **一次误降级罚 ~1.4 s**(占该请求
-            // 解码相位 35%)。而连击真正该抓的是"草稿系统性坏掉"(此时窗口 AL
-            // 也会塌到线下)。
-            //
-            // ⇒ 连击只在**窗口 AL 也低于盈亏线**时才降级(用**当前部分窗口**,
-            // 不等 16 轮门);已降级态照旧保持(出口 = 探测命中)。
-            // 分母未测(break_even=None)⇒ 不因连击降级(保守留在 spec;窗口判据
-            // 此时同样不生效,播种步会在首 turn 补上分母)。
-            let al_partial = if spec.recent_rounds > 0 {
-                spec.recent_tokens as f32 / spec.recent_rounds as f32
-            } else {
-                f32::INFINITY
-            };
-            let streak_gate = break_even.is_some_and(|line| al_partial < line);
-            // 降级判决 = 纯函数(单测在 `tests.rs::spec_degrade_verdict_*`)
-            let (degraded, low_windows) = crate::exec::spec_degrade_verdict(
-                spec.spec_degraded,
-                degraded0,
-                streak,
-                streak_gate,
-                degrade_after,
-                window_done,
-                window_starved,
-                spec.low_windows,
-            );
-            let window_confirm =
-                window_done && window_starved && low_windows >= crate::exec::DEGRADE_CONFIRM_WINDOWS;
-            spec.low_windows = low_windows;
-            if degraded && !spec.spec_degraded {
-                let line = crate::exec::break_even_text(break_even);
-                owl_shared::log_warn!("spec-degrade", "降级裸 decode(probe 每 {probe_every} tok):m=0×{streak} 连续低窗={} 盈亏线={line} 因={} 窗口AL={al_partial:.2}"
-                    , spec.low_windows
-                    , if window_confirm { "双窗确认" } else { "连击+单窗佐证" }
-                );
-                mcnt("spec.degrade", 1);
-                // 降级即丢草稿账:降级态不产草稿,留着只会被**很久之后**的
-                // 探测轮误当"当步草稿"消费(见 `acquire_drafts` 注)。
-                spec.spec_drafts_host = None;
-                // 探测节奏从本轮重新起算(旧值可能是上一次降级 episode 的残留)
-                spec.spec_steps_degraded = 0;
-            } else if !degraded && spec.spec_degraded {
-                owl_shared::log_warn!("spec-degrade", "探测命中 m={m} → 恢复 spec(降级步 {} / 探测周期 {})"
-                    , spec.spec_degraded_steps, probe_every
-                );
-                mcnt("spec.undegrad", 1);
-                // **恢复即清窗口**(2026-10-27):窗口里还留着降级前那段低 AL,
-                // 不清就会在下一轮"凑满窗口"时**立刻再判一次亏本** ⇒
-                // 降级↔恢复 振荡(实测日志成对出现)。恢复后应从干净窗口重新观察。
-                spec.recent_rounds = 0;
-                spec.recent_tokens = 0;
-                spec.recent_ms = 0.0;
-                spec.low_windows = 0;
-                spec.spec_steps_degraded = 0;
-            }
-            spec.spec_zero_streak = streak;
-            spec.spec_degraded = degraded;
-            spec.spec_probe_every = probe_every;
-            // 滚动轮成本 ewma(动态盈亏线分子;α=0.15;emit 前 —— 轮尾
-            // tspec 可能已随 complete 消失,P0 同款)
+            // **口径修正（2026-11-03）**：本决策点在 accept 之后、轮尾之前，
+            // 就地量会少算 fold/边界快照/⑦propose（实测 22.3 vs 全程 28.3）
+            // ⇒ 盈亏线偏低 ⇒ 该降不降。改用引擎级保鲜的**上一轮全程**
+            // （`SpecRuntime::last_round_ms`；轮尾写入，见函数末）。
             {
-                let rc = t_round.elapsed().as_secs_f32() * 1000.0;
+                let rc = if last_round_ms > 0.0 {
+                    last_round_ms
+                } else {
+                    t_round.elapsed().as_secs_f32() * 1000.0
+                };
                 spec.round_cost_ewma_ms = if spec.round_cost_ewma_ms > 0.0 {
                     spec.round_cost_ewma_ms * 0.85 + rc * 0.15
                 } else {
                     rc
                 };
             }
-            // 滚动 AL gauge(窗口均值 ×100;/debug/metrics 一屏可见盈亏)
-            mcnt("spec.al.win", u64::from(spec.recent_tokens * 100 / spec.recent_rounds.max(1)));
+            let break_even =
+                crate::exec::break_even_line(spec.round_cost_ewma_ms, spec.bare_cost_ewma_ms);
+            let mut degraded = spec.spec_degraded;
+            if was_probe {
+                // **降级态探测**：连续命中制（`spec_restore_verdict`）。
+                let (restore, hits) = crate::exec::spec_restore_verdict(m, spec.probe_hits);
+                spec.probe_hits = hits;
+                if restore {
+                    let line = crate::exec::break_even_text(break_even);
+                    owl_shared::log_warn!(
+                        "spec-degrade",
+                        "探测命中 m={m}（连续命中 {}/{}）→ 恢复 spec（降级步 {} / 盈亏线 {line}）",
+                        if m >= crate::exec::RESTORE_DECISIVE_M { crate::exec::RESTORE_HITS } else { hits },
+                        crate::exec::RESTORE_HITS,
+                        spec.spec_degraded_steps
+                    );
+                    mcnt("spec.undegrad", 1);
+                    // 恢复即清窗口（旧账里还留着降级前的低 AL）
+                    spec.recent_rounds = 0;
+                    spec.recent_tokens = 0;
+                    spec.recent_ms = 0.0;
+                    spec.low_windows = 0;
+                    spec.spec_steps_degraded = 0;
+                    degraded = false;
+                } else {
+                    if m >= 1 {
+                        owl_shared::log_info!(
+                            "spec-probe",
+                            "探测小命中 m={m}（连续 {hits}/{}）⇒ 继续裸 decode（决定性命中 = m≥{}）",
+                            crate::exec::RESTORE_HITS,
+                            crate::exec::RESTORE_DECISIVE_M
+                        );
+                    }
+                    degraded = true;
+                }
+            } else {
+                // **正常投机轮**：窗口累计（16 轮或 600 ms 一窗）+ 经济性判决
+                spec.recent_rounds += 1;
+                spec.recent_tokens += (m + 1) as u32;
+                spec.recent_ms += if last_round_ms > 0.0 {
+                    last_round_ms
+                } else {
+                    t_round.elapsed().as_secs_f32() * 1000.0
+                };
+                let window_done =
+                    crate::exec::spec_window_done(spec.recent_rounds, spec.recent_ms);
+                let mut window_al = f32::NAN;
+                if window_done {
+                    window_al = spec.recent_tokens as f32 / spec.recent_rounds.max(1) as f32;
+                    let win_tps = spec.recent_tokens as f32 * 1000.0 / spec.recent_ms.max(1.0);
+                    let line = crate::exec::break_even_text(break_even);
+                    let deep = break_even.is_some_and(|l| window_al < l * crate::exec::DEGRADE_DEEP_RATIO);
+                    if break_even.is_some_and(|l| window_al < l) {
+                        owl_shared::log_warn!(
+                            "spec-degrade",
+                            "窗口 AL={window_al:.2} vs 盈亏线 {line}（{};轮 {:.0}ms/裸 {:.0}ms;窗口吞吐 {win_tps:.1} tok/s）",
+                            if deep { "深饿" } else { "浅饿" },
+                            spec.round_cost_ewma_ms,
+                            spec.bare_cost_ewma_ms
+                        );
+                    }
+                    spec.recent_rounds = 0;
+                    spec.recent_tokens = 0;
+                    spec.recent_ms = 0.0;
+                }
+                let (win_degrade, low) = crate::exec::spec_degrade_verdict(
+                    window_done,
+                    window_al,
+                    break_even,
+                    spec.low_windows,
+                );
+                spec.low_windows = low;
+                // **连击捷径**（草稿系统性坏掉的保险）：连击达阈值 **且** 已有低窗
+                // **且** 当前部分窗 AL 也低于盈亏线 —— 连击只减半确认，不单独构成依据。
+                let al_partial = if spec.recent_rounds > 0 {
+                    spec.recent_tokens as f32 / spec.recent_rounds as f32
+                } else {
+                    f32::INFINITY
+                };
+                let streak_confirm = streak >= degrade_after
+                    && low >= 1
+                    && break_even.is_some_and(|l| al_partial < l);
+                if win_degrade || streak_confirm {
+                    let line = crate::exec::break_even_text(break_even);
+                    owl_shared::log_warn!(
+                        "spec-degrade",
+                        "降级裸 decode（probe 每 {probe_every} tok）：连续低窗={low} 盈亏线={line} 因={} 窗口AL={window_al:.2} 连击={streak}",
+                        if win_degrade { "窗口经济性" } else { "连击+低窗佐证" }
+                    );
+                    mcnt("spec.degrade", 1);
+                    // 降级即丢草稿账（降级态不产草稿，留着会被很久之后的探测轮误用）
+                    spec.spec_drafts_host = None;
+                    spec.spec_steps_degraded = 0;
+                    spec.probe_hits = 0;
+                    spec.low_windows = 0;
+                    // **探测周期从 floor 起算**（必须是实测值 —— 旧转移函数在
+                    // 入降级时顺手写 floor;漏了它就沿用 turn 初值 0 ⇒
+                    // `steps >= 0` 恒真 ⇒ 每一步都当探测轮 = 降级根本站不住)
+                    probe_next = probe_every0;
+                    degraded = true;
+                }
+            }
+            spec.spec_zero_streak = streak;
+            spec.spec_degraded = degraded;
+            spec.spec_probe_every = probe_next;
+            // 滚动 AL gauge（窗口均值 ×100；/debug/metrics 一屏可见盈亏）
+            mcnt(
+                "spec.al.win",
+                u64::from(spec.recent_tokens * 100 / spec.recent_rounds.max(1)),
+            );
             degraded_now = degraded;
         } else {
             degraded_now = self.tspec_ref()?.spec_degraded;
@@ -610,6 +732,38 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 归还点统一在后一个（⑦ 之后，那也是本轮最后一次用 `hidden`）。
         }
         owl_shared::log_debug!("spec-round", "⑤ 草稿入参准备完成(propose 统一在⑦)");
+        // ⑦-a **提前发射 propose**（2026-11-03；P1-④ 的"无猜测版"）：
+        //
+        // propose 的捕获图只吃 ①verify 的 taps（图输出槽）②本轮 anchor ③m；
+        // ⑥ 的 GDN 折叠 / 轮内边界快照写的是**主池**，propose 写的是**草稿池**
+        // ⇒ 两者没有数据依赖，只是原来**串行发射**。
+        //
+        // 为什么值得动：实测 fold 的 host 侧（restore 拷贝 + 图入队）1.28 ms、
+        // 轮内边界快照拷贝再加 0.82 ms/边界，全部**暴露在关键路径上**；而
+        // propose 图自身有 ~2.8 ms GPU 工作。把发射提前 ⇒ 这些拷贝/入队与
+        // propose 的 GPU 重叠，收割推迟到 ⑥ 之后（那时它多半已经算完）。
+        //
+        // 不做"猜锚点"：猜 m 的乐观路在这台机器上期望值为负（数学档
+        // P(m=m_prev) ≈ 0.19，猜错要重发整图 4.8 ms；而可藏的量只有 ~2 ms）。
+        let round_done_early = {
+            let act = self.turns.active()?;
+            act.out.len().saturating_add(toks.len()) >= act.max_new
+        };
+        let early_propose = if !round_done_early
+            && !degraded_now
+            && self.dev.graphs.dflash.is_some()
+            && matches!(
+                self.dev.spec_rt.drafter.as_ref(),
+                Some(crate::spec_runtime::Drafter::DFlash2(_))
+            )
+        {
+            let ts = std::time::Instant::now();
+            let p = self.dflash_propose_launch(m, pos, toks[m]).await?;
+            t_propose += ts.elapsed();
+            Some(p)
+        } else {
+            None
+        };
         // ⑥ fold(尾部:图发射异步,restore 单命令;下一轮 verify 流序
         // 排其后,GPU ~1ms 藏于前端)
         //
@@ -749,6 +903,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // DFlash2 lookup 草稿:历史 = prompt_ids + out(含当前 token)
         // + 本轮 verify 块 `toks`(ids[0..=m];末位 bonus 是下一轮 anchor)。
         let lookup = self.dflash_lookup_for_tail(&toks)?;
+        // ⑦-b 收割（提前发射过的那个 propose；未提前发 ⇒ 走下面的原链）
+        if let Some(p) = early_propose {
+            let ts = std::time::Instant::now();
+            let d = self.dflash_propose_harvest(p, lookup.as_ref()).await?;
+            t_propose += ts.elapsed();
+            self.tspec()?.spec_drafts_host = Some(d);
+        } else {
         let d2_arc7 = match self.dev.spec_rt.drafter.as_ref() {
             Some(crate::spec_runtime::Drafter::DFlash2(d)) => Some(std::sync::Arc::clone(d)),
             _ => None,
@@ -809,6 +970,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .collect(),
             );
         }
+        }
         } else {
             self.tspec()?.spec_drafts_host = None;
             mcnt("spec.propose.skip", 1);
@@ -864,6 +1026,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         self.turns.pending_events = merged;
         // E5-M5:spec 分相落账(/debug/metrics;与 spec_stats 同源双面)
         let t_all = t_round.elapsed();
+        // 轮成本口径的唯一真源（见 `SpecRuntime::last_round_ms` 注）
+        self.dev.spec_rt.last_round_ms = t_all.as_secs_f32() * 1000.0;
         mrec("spec.round", t_all);
         mrec("spec.verify", t_verify);
         if t_snap > std::time::Duration::ZERO {
@@ -2540,17 +2704,64 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
 mod adaptive_tests {
     use super::*;
 
+    const W: u32 = SPEC_ADAPTIVE_WARMUP_ROUNDS;
+    const DMIN: usize = 3;
+
+    /// 一个观察窗:`tokens` 总产出、`full` 吃满 dmin 的轮数。
+    fn win(tokens: u32, full: u32) -> (u32, u32, u32) {
+        (W, tokens, full)
+    }
+
+    /// 降档:连 2 个低窗才切;warmup 前双路都不动。
     #[test]
-    fn downshift_only_after_warmup_and_below_threshold() {
-        assert!(!adaptive_should_downshift(0, 0, 3.0));
-        assert!(!adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS - 1, 100, 3.0));
-        // DOCS 29.7k d7: 2.8 tokens/round -> 降
-        assert!(adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS, 23, 3.0));
-        // MATH 32k d7: 4.98 -> 不降
-        assert!(!adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS, 40, 3.0));
-        // 4.0 早降门
-        assert!(adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS, 28, 4.0));
-        assert!(!adaptive_should_downshift(SPEC_ADAPTIVE_WARMUP_ROUNDS, 36, 4.0));
+    fn ladder_downs_after_two_low_windows() {
+        // warmup 前(W-1 轮):不判
+        let (d, _, _, act) = depth_ladder_step(false, DMIN, W - 1, 1, 0, 3.0, 0, 0);
+        assert!(!d && act == LadderAct::Hold, "warmup 前不许切");
+        // 第 1 个低窗(AL 2.0 < 3.0)⇒ 只记数
+        let (d, lw, _, act) = depth_ladder_step(false, DMIN, W, W * 2, 0, 3.0, 0, 0);
+        assert!(!d && lw == 1 && act == LadderAct::Hold, "一窗就切 = 太敏感");
+        // 第 2 个低窗 ⇒ 切浅档,计数清零
+        let (d, lw, fw, act) = depth_ladder_step(false, DMIN, W, W * 2, 0, 3.0, 1, 0);
+        assert!(d && lw == 0 && fw == 0 && act == LadderAct::Moved);
+    }
+
+    /// 高收益窗**打断**降档计数(不许累积跨窗口的偶发低点)。
+    #[test]
+    fn healthy_window_resets_down_counter() {
+        let (d, lw, _, act) = depth_ladder_step(false, DMIN, W, W * 5, 0, 3.0, 1, 0);
+        assert!(!d && lw == 0 && act == LadderAct::Hold);
+    }
+
+    /// 升档:浅档**饱和**(≥50% 轮吃满 + AL ≥ dmin+0.5)连 2 窗才回深档。
+    #[test]
+    fn ladder_ups_after_two_saturated_windows() {
+        // 饱和:每轮 m+1 ≥ dmin+1 ⇒ tokens = W*(DMIN+1),且 full/rounds ≥ 0.5
+        let (tk, fu) = (W * (DMIN as u32 + 1), W / 2);
+        let (d, _, fw, act) = depth_ladder_step(true, DMIN, W, tk, fu, 3.0, 0, 0);
+        assert!(d && fw == 1 && act == LadderAct::Hold, "一窗不升");
+        let (d, _, fw, act) = depth_ladder_step(true, DMIN, W, tk, fu, 3.0, 0, 1);
+        assert!(!d && fw == 0 && act == LadderAct::Moved, "两饱和窗 ⇒ 升高档");
+    }
+
+    /// 不饱和(吃满占比 < 50%)⇒ 不升,计数清零。
+    #[test]
+    fn unsaturated_shallow_stays_down() {
+        let (d, _, fw, act) = depth_ladder_step(true, DMIN, W, W * (DMIN as u32 + 1), W / 3, 3.0, 0, 1);
+        assert!(d && fw == 0 && act == LadderAct::Hold);
+        // AL 不够(dmin+0.5)也不升
+        let (d, _, fw, _) = depth_ladder_step(true, DMIN, W, W * 2, W, 3.0, 0, 1);
+        assert!(d && fw == 0);
+    }
+
+    /// 滞回:降档后的窗口不会立刻又降(只可能在饱和时升),不会抖动。
+    #[test]
+    fn no_flip_flop_on_marginal_windows() {
+        let tk = W * 3; // AL 3.0 = 恰好压在线上
+        let (d, lw, _, act) = depth_ladder_step(false, DMIN, W, tk, 0, 3.0, 1, 0);
+        assert!(!d && lw == 0 && act == LadderAct::Hold, "压线窗不算低收益");
+        let (d, _, fw, act) = depth_ladder_step(true, DMIN, W, tk, 0, 3.0, 0, 1);
+        assert!(d && fw == 0 && act == LadderAct::Hold, "不饱和不升");
     }
 }
 
@@ -2568,4 +2779,93 @@ mod live_depth_tests {
         assert_eq!(live_depth_for_budget(15, 16), 15);
         assert_eq!(live_depth_for_budget(7, 100), 7);
     }
+}
+
+/// **[标定] 草稿 q 的 dump**（`[spec] q_dump = "<path>"`；空 = 关）。
+///
+/// 每轮一行 JSONL：`raw`（第 e 步实际使用的 16 个分数，已乘 α）/ `cand`（全局 id）
+/// / `p`（目标 verify 各行的 top-32 候选及其概率）。离线据此拟合 (α, ε)：
+///
+///   q_α ∝ softmax(α·raw / T)   →   P_accept(e) = Σ_d min(q_α(d), p(d))
+///
+/// 这是"q 的尾巴到底落在 p 的支撑上还是落在 p=0 的地方"的唯一事实源；
+/// 生产档不写（空路径 = 零开销）。
+fn dump_q_calibration(
+    path: &str,
+    pos: usize,
+    depth: usize,
+    m: usize,
+    q: Option<&super::proposal_q::DraftQ>,
+    p_rows: &[Vec<(u32, f32)>],
+) -> Result<()> {
+    use std::io::Write;
+    if path.is_empty() || depth == 0 {
+        return Ok(());
+    }
+    let Some(q) = q else { return Ok(()) };
+    let raw = q.raw_rows();
+    let cand = q.cands();
+    if raw.len() < depth * super::proposal_q::CAND
+        || cand.len() < depth * super::proposal_q::CAND
+    {
+        return Err(ModelError::Msg(format!(
+            "q_dump: raw/cand 槽长不符 raw={} cand={} depth={depth}",
+            raw.len(),
+            cand.len()
+        )));
+    }
+    let k = super::proposal_q::CAND;
+    let mut s = String::with_capacity(2048 + depth * (k * 12 + p_rows.len() * 320));
+    s.push_str(&format!("{{\"pos\":{pos},\"depth\":{depth},\"m\":{m},\"k\":{k}"));
+    s.push_str(",\"raw\":[");
+    for e in 0..depth {
+        if e > 0 {
+            s.push(',');
+        }
+        s.push('[');
+        for (i, v) in raw[e * k..(e + 1) * k].iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("{v:.5}"));
+        }
+        s.push(']');
+    }
+    s.push_str("],\"cand\":[");
+    for e in 0..depth {
+        if e > 0 {
+            s.push(',');
+        }
+        s.push('[');
+        for (i, v) in cand[e * k..(e + 1) * k].iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("{v}"));
+        }
+        s.push(']');
+    }
+    s.push_str("],\"p\":[");
+    for (r, row) in p_rows.iter().enumerate() {
+        if r > 0 {
+            s.push(',');
+        }
+        s.push('[');
+        for (i, (tok, p)) in row.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("[{tok},{p:.6}]"));
+        }
+        s.push(']');
+    }
+    s.push_str("]}\n");
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| ModelError::Msg(format!("q_dump: 打开 {path} 失败: {e}")))?;
+    f.write_all(s.as_bytes())
+        .map_err(|e| ModelError::Msg(format!("q_dump: 写 {path} 失败: {e}")))?;
+    Ok(())
 }

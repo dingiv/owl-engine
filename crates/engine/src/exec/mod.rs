@@ -40,54 +40,113 @@ const DEGRADE_PROBE_MAX: usize = 32;
 /// (1 窗 + 连击佐证),不再单独构成降级依据。
 pub(crate) const DEGRADE_CONFIRM_WINDOWS: u8 = 2;
 
-/// **降级判决**(纯函数;2026-11-03 抽出以便单测 —— 与 `spec_degrade_transition`
-/// / `break_even_line` 同族)。
+/// **深饿阈值**：本窗 `AL < 盈亏线 × 本值` ⇒ **一窗确认**（浅饿仍要两窗）。
+/// 取 0.95 = "低到噪声之外"（16 轮窗口的 AL 噪声 ≈ ±0.1，线 ≈1.5 ⇒ 3%，
+/// 0.95 留一倍余量）：低过线本身就已经在亏，不必再等一窗。
 ///
-/// 输入:
-/// - `already_degraded`:本轮**进**轮时是否已在降级态;
-/// - `degraded0`:`spec_degrade_transition` 给出的降级位(`m ≥ 1` ⇒ `false`,
-///   即"本轮探测命中" ⇒ **必须能恢复**);
-/// - `streak` / `streak_gate` / `degrade_after`:连击账 + "部分窗 AL 也低于盈亏线";
-/// - `window_done` / `window_starved`:本窗是否刚评估完 / 是否低收益;
-/// - `low_windows`:进入本轮时**已累计**的连续低收益窗口数。
+/// 依据（2026-11-03 真机，双 3080 / 27B）：创作类负载 AL ≈ 1.36、盈亏线
+/// ≈ 1.60（轮 28.3 / 裸 17.7）⇒ 比 0.85 —— 这不是"偶发一段饿"，而是
+/// **整条负载都亏**。等第二个窗口 = 白亏 1.2 s；一窗（600 ms）足够定罪。
+/// 健康档（数学 AL 3.9 / 复制 7.9）要到 `AL < 0.9×线 ≈ 1.44` 才会走快路，
+/// 实测不触发。
+pub(crate) const DEGRADE_DEEP_RATIO: f32 = 0.95;
+
+/// **恢复需要的连续探测命中数**（2026-11-03 第二版）。
 ///
-/// 输出 = `(是否降级, 更新后的连续低窗数)`。
+/// 旧实现 = 一次探测 `m ≥ 1` 就恢复。真机 3 条创作请求（363 轮）实测
+/// `spec.degrade = 4 / spec.undegrad = 3` —— 12 s 的请求里降级↔恢复抖了 7 次，
+/// 而该负载 `P(m ≥ 1) ≈ 0.29` ⇒ 单次命中不能证明"内容回到可投机域"。
+/// ⇒ 恢复改为**连续两次命中**（`≈0.08`）**或**一次决定性命中。
 ///
-/// 判决律(2026-11-03 用户裁决:不许"一个窗口就降级",且**必须能反悔**):
-/// 1. 已在降级 + 本轮无命中 ⇒ 保持;
-/// 2. **两个连续**低收益窗口 ⇒ 降级(≈1.2 s 实证);
-/// 3. 连击达阈值 **且** 已有 ≥1 个低收益窗口 **且** 部分窗 AL 也低于盈亏线
-///    ⇒ 降级(连击只**减半**确认,不单独构成依据);
-/// 4. 其余一律不降 —— 特别是"探测命中"(m≥1)时,除非恰好凑满 2 个连续低窗。
-// 结构性豁免(2026-11-03):判据的每一项都是**独立事实**(已降级?/转移位/连击/
-// 部分窗 AL 门/阈值/本窗是否评估/是否低收益/连续低窗数)—— 打包成 struct 只会
-// 让调用点多一堆字段名,而不减少任何耦合。
-#[allow(clippy::too_many_arguments)]
+/// 健康档不受损：数学/复制 `P(m ≥ 1) ≈ 1`，第一探就命中 ⇒ 周期复位到 8，
+/// 第二次探测 8 token 后到达，恢复延迟 ≈ 8 token（≈0.14 s）。
+pub(crate) const RESTORE_HITS: u8 = 2;
+
+/// **决定性命中**：单次探测 `m ≥ 本值` ⇒ 立即恢复（一轮吃满 = 确定可投机）。
+pub(crate) const RESTORE_DECISIVE_M: usize = 3;
+
+/// 判据窗口：满 `ROUNDS` 轮，或 满 `MS` 毫秒**且**至少 `MIN_ROUNDS` 轮。
+///
+/// `MIN_ROUNDS` 的来历（2026-11-03 真机）：turn 的**第一轮**常是冷轮
+/// （eager seed propose / 首次图发射），可以花几百毫秒；时间门 `ms ≥ 600`
+/// 于是让它**一轮成窗**，AL=1.0（恰好 m=0）< 深饿线 ⇒ 误降级（实测复制档
+/// 首个请求 204 tok/s vs 278）。窗口至少要有 8 轮（≈16 个样本 token）才配定罪。
+pub(crate) const WINDOW_ROUNDS: u32 = 16;
+pub(crate) const WINDOW_MIN_ROUNDS: u32 = 8;
+pub(crate) const WINDOW_MS: f32 = 600.0;
+
+/// 窗口是否评估（纯函数；见 [`WINDOW_ROUNDS`] 族常量）。
+pub(crate) fn spec_window_done(rounds: u32, ms: f32) -> bool {
+    rounds >= WINDOW_ROUNDS || (ms >= WINDOW_MS && rounds >= WINDOW_MIN_ROUNDS)
+}
+
+/// **spec 态降级判决**（纯函数；按**窗口经济性**判，不按单轮命中）。
+///
+/// `window_done` = 本窗刚评估完；`window_al` = 本窗 tokens/轮；
+/// `line` = 盈亏线（`None` = 分母未测 ⇒ 不判，由播种步补分母）；
+/// `low0` = 进入本窗时已累计的连续低收益窗口数。
+///
+/// 返回 `(是否降级, 更新后的连续低窗数)`：
+/// 盈利窗 ⇒ 清零；浅饿 ⇒ `+1`（两窗确认）；深饿（[`DEGRADE_DEEP_RATIO`]）
+/// ⇒ `+2`（一窗即降）。
 pub(crate) fn spec_degrade_verdict(
-    already_degraded: bool,
-    degraded0: bool,
-    streak: usize,
-    streak_gate: bool,
-    degrade_after: usize,
     window_done: bool,
-    window_starved: bool,
-    low_windows: u8,
+    window_al: f32,
+    line: Option<f32>,
+    low0: u8,
 ) -> (bool, u8) {
-    let low = if !window_done {
-        low_windows
-    } else if window_starved {
-        low_windows.saturating_add(1)
-    } else {
-        0
+    let (Some(line), true) = (line, window_done) else {
+        return (false, low0);
     };
-    let stay = already_degraded && degraded0;
-    let window_confirm = window_done && window_starved && low >= DEGRADE_CONFIRM_WINDOWS;
-    let streak_confirm = degraded0
-        && !already_degraded
-        && streak >= degrade_after
-        && low >= 1
-        && streak_gate;
-    (stay || window_confirm || streak_confirm, low)
+    if !(window_al.is_finite() && window_al >= line) {
+        let step = if window_al < line * DEGRADE_DEEP_RATIO {
+            2
+        } else {
+            1
+        };
+        let low = low0.saturating_add(step);
+        return (low >= DEGRADE_CONFIRM_WINDOWS, low);
+    }
+    (false, 0)
+}
+
+/// **降级态恢复判决**（纯函数；连续命中制，见 [`RESTORE_HITS`]）。
+/// 返回 `(是否恢复, 更新后的连续命中数)`。
+pub(crate) fn spec_restore_verdict(m: usize, hits0: u8) -> (bool, u8) {
+    if m >= RESTORE_DECISIVE_M {
+        return (true, 0);
+    }
+    if m >= 1 {
+        let hits = hits0.saturating_add(1);
+        return (
+            hits >= RESTORE_HITS,
+            if hits >= RESTORE_HITS { 0 } else { hits },
+        );
+    }
+    (false, 0)
+}
+
+/// **连击账 + 探测节奏**（纯函数；原 `spec_degrade_transition` 的漂移量部分）。
+///
+/// 返回 `(streak, 下一个探测周期)`：`m ≥ 1` ⇒ 连击清零、周期复位；
+/// 降级态探测失败 ⇒ 周期 `×2`（封顶 [`DEGRADE_PROBE_MAX`]）；
+/// 非降级态 ⇒ 周期不动。
+pub(crate) fn spec_streak_step(
+    streak: usize,
+    degraded: bool,
+    probe_every: usize,
+    m: usize,
+    floor: usize,
+) -> (usize, usize) {
+    if m >= 1 {
+        return (0, floor);
+    }
+    let streak = streak + 1;
+    if degraded {
+        (streak, (probe_every * 2).clamp(1, DEGRADE_PROBE_MAX))
+    } else {
+        (streak, probe_every)
+    }
 }
 
 /// **双 rank 镜像执行**(S6f):`dev` 必跑;`peer` 在场则**并发**跑同一动作。
@@ -291,26 +350,6 @@ mod break_even_tests {
     }
 }
 
-pub(crate) fn spec_degrade_transition(
-    streak: usize,
-    degraded: bool,
-    probe_every: usize,
-    m: usize,
-    threshold: usize,
-    probe_floor: usize,
-) -> (usize, bool, usize) {
-    if m >= 1 {
-        return (0, false, probe_floor);
-    }
-    let streak = streak + 1;
-    if degraded {
-        (streak, true, (probe_every * 2).min(DEGRADE_PROBE_MAX))
-    } else if threshold > 0 && streak >= threshold {
-        (streak, true, probe_floor)
-    } else {
-        (streak, false, probe_every)
-    }
-}
 use crate::turn::TurnEvent;
 
 /// **盈亏线夹取区间**(2026-10-09 立;下限 = 32k 实测比,上限 = 防超长轮)
@@ -412,6 +451,26 @@ pub(crate) fn spec_sampled_accept_prefix(drafts: &[u32], sampled: &[u32]) -> usi
         .count()
 }
 
+/// **非 DFlash2（one-hot 草稿）采样接受的纯逻辑**:`sampled` = 逐行目标抽样
+/// (长 `live+1`),返回 `(m, 提交序列)`。
+///
+/// 提交序列 = `sampled[0..=m]`:前 m 个恰等于 drafts(被接受),末位是拒绝点的
+/// 重抽(可能全接受 ⇒ 末位 = 第 live 行抽样 = bonus)。
+pub(crate) fn sample_accept(drafts: &[u32], sampled: &[u32]) -> (usize, Vec<u32>) {
+    let m = spec_sampled_accept_prefix(drafts, sampled);
+    (m, sampled[..=m.min(sampled.len().saturating_sub(1))].to_vec())
+}
+
+/// **惩罚历史入账**(`rep_penalty` 的成员集):只吃**已提交**的 token。
+///
+/// 2026-11-03 定谳:旧实现边抽样边 `hist.push`,把 `live+1` 个候选全部入账,
+/// 而真正提交的只有 `m+1` 个 ⇒ 被拒/未提交的 token 也进了惩罚集
+/// (`rep_penalty = 1.0` 时无感;开启后是语义错,与裸 decode 不一致)。
+/// 统一走这里,新路径想漏也漏不了。
+pub(crate) fn hist_commit(hist: &mut Vec<u32>, emitted: &[u32]) {
+    hist.extend_from_slice(emitted);
+}
+
 /// 字节偏移向下取 char 边界(超界 = 全长;切 `&str` 前必须过一道)
 pub(crate) fn floor_boundary(s: &str, i: usize) -> usize {
     if i >= s.len() {
@@ -465,6 +524,33 @@ mod spec_accept_tests {
     fn bounds_are_safe() {
         assert_eq!(spec_sampled_accept_prefix(&[], &[1]), 0);
         assert_eq!(spec_sampled_accept_prefix(&[1, 2], &[1]), 1);
+    }
+
+    /// 🔴 **红包(2026-11-03)**:`hist` 只许吃**已提交** token。
+    ///
+    /// 修前:边抽样边 push(live+1 个全进惩罚集),而实际只提交 m+1 个
+    /// ⇒ 被拒/未提交的 token 也进 `rep_penalty` 历史。修后:先判接受,
+    /// 再按 emitted 入账。
+    #[test]
+    fn hist_only_gets_committed_tokens() {
+        use super::{hist_commit, sample_accept};
+        // drafts = [5,6,7];逐行抽样 = [5,6,9,10] ⇒ 第 2 位拒,bonus=9
+        let drafts = [5u32, 6, 7];
+        let sampled = [5u32, 6, 9, 10];
+        let (m, emitted) = sample_accept(&drafts, &sampled);
+        assert_eq!((m, emitted.as_slice()), (2, &[5u32, 6, 9][..]));
+        let mut hist = vec![1u32];
+        hist_commit(&mut hist, &emitted);
+        assert_eq!(hist, vec![1, 5, 6, 9], "只有已提交 token 能进惩罚集");
+        assert!(!hist.contains(&7), "未提交的 draft 不得入账");
+        assert!(!hist.contains(&10), "被拒行之后的抽样不得入账");
+
+        // 全接受:emitted = drafts + bonus(第 live 行抽样)
+        let (m, emitted) = sample_accept(&drafts, &[5, 6, 7, 11]);
+        assert_eq!((m, emitted.as_slice()), (3, &[5u32, 6, 7, 11][..]));
+        let mut hist = Vec::new();
+        hist_commit(&mut hist, &emitted);
+        assert_eq!(hist, vec![5, 6, 7, 11]);
     }
 }
 

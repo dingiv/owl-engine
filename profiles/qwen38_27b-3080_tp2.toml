@@ -115,6 +115,9 @@ prefill_shadow = true
 [spec]
 # TP2 草稿族放行(缺它 = tp.rs 装配期响亮拒)
 tp_draft = true
+# 深度阶梯**未启用**（2026-11-03 实测）：DFlash2 要切档就得给每个 depth 各捕获
+# 一套 propose/fold 图族（boot 门：`depth=3 图族不完整 fold 1/3 propose 0/4`）——
+# 20G 卡上多一套图族的显存与捕获代价待评估 ⇒ 暂留单档 d7。
 # 2026-10-29 用户指定草稿口径 = INT4(syvai W4A16,GPTQ):
 # 与 pi 源 BF16 草稿同源(incoai),1.19G/TP2 = 0.6G/卡。
 draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
