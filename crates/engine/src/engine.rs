@@ -1728,9 +1728,12 @@ pub(crate) fn into_running<D: DeviceClient>(
         }
         if !dev.pool.geom.paged {
             return Err(ModelError::Msg(format!(
-                "[pool] image_evict = true 需要 f16 或 fp8-e4m3 分页 KV 池\
-                 (paged={} kv_fp8={} dtype={:?})",
-                dev.pool.geom.paged, dev.pool.geom.kv_fp8, dev.pool.geom.dims.dtype
+                "[pool] image_evict = true 需要分页 KV 池（f16/fp8-e4m3/int8）\
+                 (paged={} kv_fp8={} kv_int8={} dtype={:?})",
+                dev.pool.geom.paged,
+                dev.pool.geom.kv_fp8,
+                dev.pool.geom.kv_int8,
+                dev.pool.geom.dims.dtype
             )));
         }
         // **pad 词校验**(模型敏感项,必须恰 1 token):空串 = 运行时自动挑;
@@ -1755,7 +1758,13 @@ pub(crate) fn into_running<D: DeviceClient>(
         owl_shared::log_info!(
             "boot",
             "前缀无感删除:开({} 池;leave-gap 保留位置洞、不改 K;可删图像段页对齐 pad = {:?};页 {} tok)",
-            if dev.pool.geom.kv_fp8 { "fp8-e4m3" } else { "f16" },
+            if dev.pool.geom.kv_int8 {
+                "int8"
+            } else if dev.pool.geom.kv_fp8 {
+                "fp8-e4m3"
+            } else {
+                "f16"
+            },
             if cfg.knobs.image_evict_pad.is_empty() { "(自动)" } else { cfg.knobs.image_evict_pad.as_str() },
             dev.pool.geom.page
         );
@@ -2394,25 +2403,31 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
                 dims.hd, env.kv.page, env.kv.paged
             )));
         }
-        if cfg.knobs.draft.depth != 0 {
-            return Err(ModelError::Msg(format!(
-                "[pool] kv_int8 暂不支持投机解码(spec.depth={}):verify 核未接线",
-                cfg.knobs.draft.depth
-            )));
-        }
+        // verify 已接线（2026-11-03 P1）：INT8 复用
+        // owl_int8_decode_gqa_tc_split + owl_int8_decode_reduce（B=T，256 片，
+        // f32 partial/stat），T=depth+1 行各自一条 bt8 页链/逐行 lens；
+        // 不再拒绝 spec。
         if cfg.knobs.env.attn.force_naive_prefill {
             return Err(ModelError::Msg(
                 "[pool] kv_int8 不支持 force_naive_prefill(naive 路径按 f16/fp8 池寻址)".into(),
             ));
         }
-        if cfg.knobs.index_probe
-            || cfg.knobs.coverage_probe
-            || cfg.knobs.select_decode
-            || cfg.knobs.select_partial
-            || cfg.knobs.image_evict
-        {
+        // index/coverage 的 host 回读、select_decode 的页表/视图、image_evict
+        // 的页链搬移都已走格式多态（KvPageCodec / pool_layout 四件套）。
+        // select_partial 仍拒：INT8 稀疏 prefill 的子集页链/因果口径未验收，
+        // 静默放开会在 prefill 后段读错页。
+        if cfg.knobs.select_partial {
             return Err(ModelError::Msg(
-                "[pool] kv_int8 暂不支持 index/coverage/select/image_evict(这些面按 f16/fp8 K 页解码)".into(),
+                "[pool] kv_int8 暂不支持 select_partial(稀疏 prefill 视图未验收);\
+                 index/select_decode 可用"
+                    .into(),
+            ));
+        }
+        if cfg.knobs.image_evict {
+            return Err(ModelError::Msg(
+                "[pool] kv_int8 暂不支持 image_evict(INT8 视觉/m-RoPE prefill 未验收;\
+                 纯文本 index/select_decode 可用)"
+                    .into(),
             ));
         }
         owl_shared::log_info!(

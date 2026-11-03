@@ -2785,12 +2785,8 @@ impl OwlConfig {
         if self.pool.kv_fp8 && self.pool.kv_int8 {
             return Err("[pool] kv_fp8 与 kv_int8 互斥(同一主池只能有一种存储格式)".to_string());
         }
-        if self.pool.kv_int8 && self.spec.depth != 0 {
-            return Err(format!(
-                "[pool] kv_int8 暂不支持投机解码(spec.depth={});int8 verify 尚未接线,请先设 spec.depth=0",
-                self.spec.depth
-            ));
-        }
+        // INT8 verify 已接线（2026-11-03 P1）：T=depth+1 行复用
+        // owl_int8_decode_gqa_tc_split + reduce；配置面不再拒绝 spec。
         // **投机深度上限**(2026-10-21):verify 图行容量 `SPEC_VERIFY_ROWS_MAX` 是
         // 结构性事实(verify 图 T=depth+1;DFlash2 W=K+1 上限)—— 超限**拒启**,不静默截断。
         if self.spec.depth > SPEC_DEPTH_MAX {
@@ -3090,6 +3086,12 @@ impl OwlConfig {
         // `select_partial` 下沉过的块在会话链上是宿主占位符;verify 必须走
         // **逐行视图页表**(`exec/spec.rs::verify_view_tables`)。第一版只实现
         // v2 臂;FI/XQA 的逐行页表未实现 ⇒ 响亮拒,不静默跑错。
+        if self.pool.kv_int8 && self.kvmem.select_partial {
+            return Err(
+                "[kvmem] select_partial 暂不支持 INT8 KV：稀疏 prefill 的子集页链/因果                 口径尚未在 int8 prefill 核上验收；index/select_decode/image_evict 可用。"
+                    .to_string(),
+            );
+        }
         if self.kvmem.select_partial {
             if !matches!(self.kernel.decode_arm, DecodeArm::V2) {
                 return Err(

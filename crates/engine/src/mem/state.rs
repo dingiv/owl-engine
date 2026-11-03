@@ -366,7 +366,12 @@ impl KvBank {
         nparts: usize,
         seqs: usize,
         tag: &str,
+        tmp_dtype: Dtype,
+        tmp_stride: usize,
     ) -> Result<owl_models::module::AttnV2Scratch> {
+        // tmp_stride = 每 (seq,head,part) 的 partial 槽宽。普通 v2 = hd；
+        // INT8 verify 复用 f32 partial + 交错 (m,l) 统计，槽宽 = hd+2。
+        let tmp_elems = seqs * dims.hq * nparts * tmp_stride;
         let es = zero_block_dt(
             face,
             seqs * dims.hq * nparts,
@@ -383,15 +388,15 @@ impl KvBank {
         .await?;
         let to = zero_block_dt(
             face,
-            seqs * dims.hq * nparts * dims.hd,
-            dims.dtype,
+            tmp_elems,
+            tmp_dtype,
             &format!("{tag}.tmp_out"),
         )
         .await?;
         Ok(owl_models::module::AttnV2Scratch {
             exp_sums: block_leaf(&es.0, vec![seqs, dims.hq * nparts]),
             max_logits: block_leaf(&ml.0, vec![seqs, dims.hq * nparts]),
-            tmp_out: block_leaf_dt(&to.0, vec![seqs * dims.hq * nparts * dims.hd], dims.dtype),
+            tmp_out: block_leaf_dt(&to.0, vec![tmp_elems], tmp_dtype),
             nparts,
             seqs,
         })
@@ -2509,17 +2514,51 @@ impl KvBank {
         let nparts = (nb * page).div_ceil(V2_PARTITION_TOKENS);
         let max_batch = plan.max_batch.max(1);
         let attn_v2 = if paged {
-            Some(Self::alloc_attn_v2(face, dims, nparts, 1, "attn2").await?)
+            Some(
+                Self::alloc_attn_v2(face, dims, nparts, 1, "attn2", dims.dtype, dims.hd)
+                    .await?,
+            )
         } else {
             None
         };
+        // INT8 verify 复用 decode 的页偶数分片（nparts=256）与 f32 partial，
+        // 让 verify 与 no-spec decode 走同一数值/分片路径；普通 FP8 仍走 f16 v2。
+        let (vparts, vdt, vstride) = if plan.kv == owl_models::env::KvQuant::Int8 {
+            // 生产 verify 固定复用 decode 的 256 片（不是池上界）；
+            // 即便 262k 池也只需 256 槽，省 ~50% verify scratch。
+            (256, Dtype::F32, dims.hd + 2)
+        } else {
+            (nparts, dims.dtype, dims.hd)
+        };
         let verify_attn_v2 = if paged && plan.spec_depth > 0 {
-            Some(Self::alloc_attn_v2(face, dims, nparts, plan.spec_depth + 1, "vattn2").await?)
+            Some(
+                Self::alloc_attn_v2(
+                    face,
+                    dims,
+                    vparts,
+                    plan.spec_depth + 1,
+                    "vattn2",
+                    vdt,
+                    vstride,
+                )
+                .await?,
+            )
         } else {
             None
         };
         let batch_attn_v2 = if paged && max_batch > 1 {
-            Some(Self::alloc_attn_v2(face, dims, nparts, max_batch, "battn2").await?)
+            Some(
+                Self::alloc_attn_v2(
+                    face,
+                    dims,
+                    nparts,
+                    max_batch,
+                    "battn2",
+                    dims.dtype,
+                    dims.hd,
+                )
+                .await?,
+            )
         } else {
             None
         };

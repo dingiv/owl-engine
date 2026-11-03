@@ -2,8 +2,10 @@
 #
 # 约束（boot 响亮拒）：
 #   - hd=256 / page=32 / paged；
-#   - spec.depth=0（verify 未接）；
-#   - 不开 index/coverage/select/image_evict（这些面按 f16/fp8 K 页解码）。
+#   - spec 已接（2026-11-03 P1：专用 verify 臂，T=depth+1）；
+#   - index/coverage/select_decode 已接（KvPageCodec 多态；K 带 Kscale、V 解 packed）；
+#   - select_partial 暂拒（INT8 稀疏 prefill 视图未验收）；
+#   - image_evict 暂拒（INT8 视觉/m-RoPE prefill 未验收）。
 [pool]
 kv_fp8 = false
 kv_int8 = true

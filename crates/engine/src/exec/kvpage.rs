@@ -1,42 +1,26 @@
 //! **KV 池页的宿主解码面**(单源)。
 //!
-//! 为什么要有这一件:凡是"把池里的 K/V 页搬回 host 再算"的家(索引采集的
-//! Mean-K、覆盖率诊断的真实质量)都必须按**池的实际字节格式**解码。此前这些
-//! 家各自写死 `elem = 2`(f16)并在 fp8 档上**响亮拒** ⇒ 27B 的 fp8 生产档
-//! 根本开不了选择层。
-//!
-//! # 布局与格式(单源出处:池写核)
-//!
-//! `owl_qknorm_rope_kv_insert_f16_{knhd,fp8kv_knhd}`
-//! (`crates/kernels/cu/fused/qknorm_insert.cu`):
+//! 索引采集的 Mean-K、覆盖率诊断的真实质量等"把池页搬回 host 再算"的家,
+//! 必须按池的实际字节格式解码。K 与 V 的布局在 INT8 档**不同**：
 //!
 //! ```text
-//! key_cache / value_cache: [nb, page, Hkv, hd]      (kNHD 单布局,K/V 同址)
-//! 偏移  kk = ((block·page + off_in_page)·Hkv + kh)·hd + d
-//! f16 : __half           2B/elem
-//! fp8 : unsigned char    1B/elem,值 = __nv_fp8_e4m3(n).__x —— **裸 e4m3 转换,无 scale**
+//! f16 / fp8 : K/V 都是 [nb, page, Hkv, hd]（kNHD）
+//! INT8 K    : [nb, page, Hkv, hd] int8 + Kscale [nb, page, Hkv, 8] f32
+//! INT8 V    : [nb, Hkv, hd, page/2] b16 + Vscale [nb, page, Hkv] f32
 //! ```
 //!
-//! 两侧**寻址式逐式相同**,只有元素宽与转换律不同 ⇒ 分支点只有两个:
-//! 每页字节数、以及「字节 → f32」的转换。转换律走
-//! [`owl_models::kernel::e4m3_decode`](独立手写、已被 GPU 逐字节验证的参考),
-//! **本模块不写第二份 e4m3**。
-//!
-//! # 格式从哪来
-//!
-//! 一律从**池实况**取(`StatePool::kv_fp8`),不从第二个配置项猜 ——
-//! 配置项只决定池怎么建,建完之后的真相在池里。两个声明源 = 迟早对不上。
+//! 因此这里提供 **`KvPageCodec` trait**，把"元素宽 / K 行 / V 行 / scale 槽"
+//! 收进格式对象；调用点只拿 `&dyn KvPageCodec`，不再各自写
+//! `if kv_fp8 { ... } else if kv_int8 { ... }`。格式从池实况取
+//! (`KvPageFormat::of_pool`)，不从第二个配置项猜。
 
 use owl_iface::contract::ModelError;
 
 /// 池页的宿主解码格式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KvPageFormat {
-    /// f16(2B/elem;`Dtype::F16` 池)。
     F16,
-    /// fp8 e4m3(1B/elem;池以 `Dtype::U32` 承载,元素数 ÷4;值 = 裸 e4m3)。
     Fp8E4M3,
-    /// int8(K int8 字节;scale 平面不在页内,诊断解码按裸 int8 读)。
     Int8,
 }
 
@@ -52,67 +36,268 @@ impl KvPageFormat {
         }
     }
 
-    /// 元素宽(字节)。
-    pub(crate) fn elem_bytes(self) -> usize {
+    /// 格式对象。分支只在这里发生一次；行解码走 trait。
+    pub(crate) fn codec(self) -> &'static dyn KvPageCodec {
         match self {
-            Self::F16 => 2,
-            Self::Fp8E4M3 | Self::Int8 => 1,
+            Self::F16 => &F16_CODEC,
+            Self::Fp8E4M3 => &FP8_CODEC,
+            Self::Int8 => &INT8_CODEC,
         }
     }
 
-    /// 单页字节数(K 或 V 之一;几何 = `[page, Hkv, hd]`)。
+    #[cfg(test)]
+    pub(crate) fn elem_bytes(self) -> usize {
+        self.codec().elem_bytes()
+    }
+
+    #[cfg(test)]
     pub(crate) fn page_bytes(self, page: usize, hkv: usize, hd: usize) -> usize {
+        self.codec().page_bytes(page, hkv, hd)
+    }
+}
+
+/// 一页的 scale 视图。f16/fp8 用空切片；INT8 用 page-local 的
+/// `[page,Hkv,8]` / `[page,Hkv]` f32。
+pub(crate) struct KvRowScale<'a> {
+    pub(crate) k: &'a [f32],
+    pub(crate) v: &'a [f32],
+}
+
+impl<'a> KvRowScale<'a> {
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self { k: &[], v: &[] }
+    }
+}
+
+/// 池页宿主解码契约。**K 与 V 分开**：INT8 V 是 packed dim-major，
+/// 不能再拿 K 的 kNHD 行式冒充。
+pub(crate) trait KvPageCodec: Sync {
+    fn elem_bytes(&self) -> usize;
+
+    fn page_bytes(&self, page: usize, hkv: usize, hd: usize) -> usize {
         page * hkv * hd * self.elem_bytes()
     }
 
-    /// 把一整页的某个 `(token, head)` 行解成 f32(长度 = `hd`)。
-    ///
-    /// 页内序 = `[token][head][dim]`(kNHD 的 `off_in_page` 段)——
-    /// 行首 = `(t·hkv + h)·hd`(**元素**偏移,不是字节)。
-    pub(crate) fn decode_row(
-        self,
-        page_bytes: &[u8],
+    /// 每页 K scale 的 f32 元素数(0 = 该格式无 scale)。
+    fn k_scale_elems(&self, _page: usize, _hkv: usize) -> usize {
+        0
+    }
+
+    /// 每页 V scale 的 f32 元素数(0 = 该格式无 scale)。
+    fn v_scale_elems(&self, _page: usize, _hkv: usize) -> usize {
+        0
+    }
+
+    fn k_row(
+        &self,
+        page: &[u8],
+        scale: &KvRowScale<'_>,
+        t: usize,
+        h: usize,
+        hkv: usize,
+        hd: usize,
+        out: &mut [f32],
+    ) -> Result<(), ModelError>;
+
+    fn v_row(
+        &self,
+        page: &[u8],
+        scale: &KvRowScale<'_>,
+        t: usize,
+        h: usize,
+        hkv: usize,
+        hd: usize,
+        out: &mut [f32],
+    ) -> Result<(), ModelError>;
+}
+
+fn check_row(
+    what: &str,
+    page_bytes: usize,
+    elem_bytes: usize,
+    base: usize,
+    hd: usize,
+    out_len: usize,
+) -> Result<(), ModelError> {
+    let need = page_bytes / elem_bytes;
+    if out_len != hd || base + hd > need {
+        return Err(ModelError::Msg(format!(
+            "KV 页解码越界:{what} 片 {page_bytes}B ⇒ {need} 元素,要 [{base}, {}) 行(长 {hd})",
+            base + hd
+        )));
+    }
+    Ok(())
+}
+
+struct F16Codec;
+static F16_CODEC: F16Codec = F16Codec;
+
+impl KvPageCodec for F16Codec {
+    fn elem_bytes(&self) -> usize {
+        2
+    }
+
+    fn k_row(
+        &self,
+        page: &[u8],
+        _scale: &KvRowScale<'_>,
         t: usize,
         h: usize,
         hkv: usize,
         hd: usize,
         out: &mut [f32],
     ) -> Result<(), ModelError> {
-        let need = page_bytes.len() / self.elem_bytes();
         let base = (t * hkv + h) * hd;
-        if out.len() != hd || base + hd > need {
+        check_row("f16", page.len(), 2, base, hd, out.len())?;
+        let lo = base * 2;
+        let raw = &page[lo..lo + out.len() * 2];
+        for (o, c) in out.iter_mut().zip(raw.chunks_exact(2)) {
+            *o = half::f16::from_le_bytes([c[0], c[1]]).to_f32();
+        }
+        Ok(())
+    }
+
+    fn v_row(
+        &self,
+        page: &[u8],
+        scale: &KvRowScale<'_>,
+        t: usize,
+        h: usize,
+        hkv: usize,
+        hd: usize,
+        out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        // f16 的 V 与 K 同布局。
+        self.k_row(page, scale, t, h, hkv, hd, out)
+    }
+}
+
+struct Fp8Codec;
+static FP8_CODEC: Fp8Codec = Fp8Codec;
+
+impl KvPageCodec for Fp8Codec {
+    fn elem_bytes(&self) -> usize {
+        1
+    }
+
+    fn k_row(
+        &self,
+        page: &[u8],
+        _scale: &KvRowScale<'_>,
+        t: usize,
+        h: usize,
+        hkv: usize,
+        hd: usize,
+        out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        let base = (t * hkv + h) * hd;
+        check_row("fp8", page.len(), 1, base, hd, out.len())?;
+        let lut = owl_models::kernel::e4m3_lut();
+        let n = out.len();
+        for (o, b) in out.iter_mut().zip(&page[base..base + n]) {
+            *o = lut[*b as usize];
+        }
+        Ok(())
+    }
+
+    fn v_row(
+        &self,
+        page: &[u8],
+        scale: &KvRowScale<'_>,
+        t: usize,
+        h: usize,
+        hkv: usize,
+        hd: usize,
+        out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        // fp8 的 V 与 K 同布局。
+        self.k_row(page, scale, t, h, hkv, hd, out)
+    }
+}
+
+struct Int8Codec;
+static INT8_CODEC: Int8Codec = Int8Codec;
+
+impl KvPageCodec for Int8Codec {
+    fn elem_bytes(&self) -> usize {
+        1
+    }
+
+    fn k_scale_elems(&self, page: usize, hkv: usize) -> usize {
+        page * hkv * 8
+    }
+
+    fn v_scale_elems(&self, page: usize, hkv: usize) -> usize {
+        page * hkv
+    }
+
+    fn k_row(
+        &self,
+        page: &[u8],
+        scale: &KvRowScale<'_>,
+        t: usize,
+        h: usize,
+        hkv: usize,
+        hd: usize,
+        out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        let base = (t * hkv + h) * hd;
+        check_row("int8-K", page.len(), 1, base, hd, out.len())?;
+        let row = (t * hkv + h) * 8;
+        if scale.k.len() < (t + 1) * hkv * 8 {
             return Err(ModelError::Msg(format!(
-                "KV 页解码越界:{:?} 片 {}B ⇒ {need} 元素,要 [{base}, {}) 行(长 {hd})",
-                self,
-                page_bytes.len(),
-                base + hd
+                "INT8 K scale 片太小:{} < {}",
+                scale.k.len(),
+                (t + 1) * hkv * 8
             )));
         }
-        // **格式分支在循环外 + e4m3 表一次取**(2026-10-19 A3 热路修正):
-        // 原式逐元素 `elem_at`(match + `OnceLock` 原子读)⇒ 11 µs/行;
-        // 本式逐元素只有一次查表/转换(单块 52 万元素的采集热路上是数量级差)。
-        match self {
-            Self::F16 => {
-                let lo = base * 2;
-                let raw = &page_bytes[lo..lo + out.len() * 2];
-                for (o, c) in out.iter_mut().zip(raw.chunks_exact(2)) {
-                    *o = half::f16::from_le_bytes([c[0], c[1]]).to_f32();
-                }
+        for (d, o) in out.iter_mut().enumerate() {
+            *o = (page[base + d] as i8) as f32 * scale.k[row + d / 32];
+        }
+        Ok(())
+    }
+
+    fn v_row(
+        &self,
+        page: &[u8],
+        scale: &KvRowScale<'_>,
+        t: usize,
+        h: usize,
+        hkv: usize,
+        hd: usize,
+        out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        if t >= page.len() / (hkv * hd).max(1) || h >= hkv || out.len() != hd {
+            return Err(ModelError::Msg(format!(
+                "INT8 V 行越界:t={t} h={h} hkv={hkv} hd={hd} 片 {}B",
+                page.len()
+            )));
+        }
+        let vs = t * hkv + h;
+        if scale.v.len() <= vs {
+            return Err(ModelError::Msg(format!(
+                "INT8 V scale 片太小:{} <= {vs}",
+                scale.v.len()
+            )));
+        }
+        let pp = page.len() / (hkv * hd).max(1) / 2;
+        let word_base = (h * hd) * pp + t / 2;
+        for (d, o) in out.iter_mut().enumerate() {
+            let off = (word_base + d * pp) * 2;
+            if off + 1 >= page.len() {
+                return Err(ModelError::Msg(format!(
+                    "INT8 V packed 越界:off={off} 片 {}B",
+                    page.len()
+                )));
             }
-            Self::Fp8E4M3 => {
-                let lut = owl_models::kernel::e4m3_lut();
-                let n = out.len();
-                for (o, b) in out.iter_mut().zip(&page_bytes[base..base + n]) {
-                    *o = lut[*b as usize];
-                }
-            }
-            Self::Int8 => {
-                // 诊断/索引回读:裸 int8 → f32;真实注意力必须乘 Kscale 平面。
-                let n = out.len();
-                for (o, b) in out.iter_mut().zip(&page_bytes[base..base + n]) {
-                    *o = (*b as i8) as f32;
-                }
-            }
+            let word = u16::from_le_bytes([page[off], page[off + 1]]);
+            let byte = if (t & 1) == 0 {
+                (word & 0xFF) as u8
+            } else {
+                (word >> 8) as u8
+            };
+            *o = (byte as i8) as f32 * scale.v[vs];
         }
         Ok(())
     }
@@ -122,7 +307,6 @@ impl KvPageFormat {
 mod tests {
     use super::*;
 
-    /// 格式选择单源:池实况 → 格式(第二处若各写一份 `if kv_fp8` 即在此失守)。
     #[test]
     fn 格式从池实况定() {
         assert_eq!(KvPageFormat::of_pool(false, false), KvPageFormat::F16);
@@ -135,60 +319,50 @@ mod tests {
 
     #[test]
     fn 页字节数按元素宽() {
-        // 27B 几何:page 32 × hkv 4 × hd 256
         let (page, hkv, hd) = (32, 4, 256);
-        assert_eq!(KvPageFormat::F16.page_bytes(page, hkv, hd), 65536); // 64 KiB
-        assert_eq!(KvPageFormat::Fp8E4M3.page_bytes(page, hkv, hd), 32768); // 32 KiB
+        assert_eq!(KvPageFormat::F16.page_bytes(page, hkv, hd), 65536);
+        assert_eq!(KvPageFormat::Fp8E4M3.page_bytes(page, hkv, hd), 32768);
+        assert_eq!(KvPageFormat::Int8.page_bytes(page, hkv, hd), 32768);
     }
 
-    /// f16 侧:解码与手写 f16 → f32 逐位同。
     #[test]
     fn f16行解码逐位同() {
-        let (hkv, hd) = (2, 4); // 1 token = 2×4 = 8 元素 ⇒ 要读 token 1 需 2 token 数据
+        let (hkv, hd) = (2, 4);
         let vals: [f32; 16] = [
-            0.0, 1.0, -2.5, 0.125, 100.0, -0.0, 3.0, -7.5, // token 0
-            9.0, -1.5, 0.25, -64.0, 2.0, 0.5, -0.125, 7.0, // token 1
+            0.0, 1.0, -2.5, 0.125, 100.0, -0.0, 3.0, -7.5, 9.0, -1.5, 0.25, -64.0, 2.0, 0.5,
+            -0.125, 7.0,
         ];
         let mut bytes = Vec::new();
         for v in vals {
             bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
         }
+        let codec = KvPageFormat::F16.codec();
+        let scale = KvRowScale::empty();
         let mut out = [0.0f32; 4];
-        KvPageFormat::F16
-            .decode_row(&bytes, 1, 0, hkv, hd, &mut out)
-            .expect("行 1/头 0");
+        codec.k_row(&bytes, &scale, 1, 0, hkv, hd, &mut out).unwrap();
         assert_eq!(out, [9.0, -1.5, 0.25, -64.0]);
-        KvPageFormat::F16
-            .decode_row(&bytes, 0, 1, hkv, hd, &mut out)
-            .expect("行 0/头 1");
+        codec.k_row(&bytes, &scale, 0, 1, hkv, hd, &mut out).unwrap();
         assert_eq!(out, [100.0, -0.0, 3.0, -7.5]);
     }
 
-    /// fp8 侧:**与 kernels 的单源参考逐位同**(不是"差不多")。
-    /// 若将来有人在本文件里手写第二份 e4m3,这条会因两式分歧而红。
     #[test]
     fn fp8行解码与kernels参考同源() {
         let (hkv, hd) = (2, 4);
-        // 2 token × 2 头 × hd4 = 16 码(含 0x7F = e4m3 NaN,判据取位型 §
-        // 比 f32::NAN 相等更严)
         let codes: [u8; 16] = [
-            0x00, 0x38, 0xB8, 0x30, 0x7E, 0x80, 0x40, 0xC1, // token 0
-            0x01, 0x7F, 0xFF, 0x08, 0x48, 0x88, 0x20, 0x60, // token 1
+            0x00, 0x38, 0xB8, 0x30, 0x7E, 0x80, 0x40, 0xC1, 0x01, 0x7F, 0xFF, 0x08, 0x48,
+            0x88, 0x20, 0x60,
         ];
+        let codec = KvPageFormat::Fp8E4M3.codec();
+        let scale = KvRowScale::empty();
         let mut out = [0.0f32; 4];
-        KvPageFormat::Fp8E4M3
-            .decode_row(&codes, 1, 0, hkv, hd, &mut out)
-            .expect("行 1/头 0");
+        codec.k_row(&codes, &scale, 1, 0, hkv, hd, &mut out).unwrap();
         for (i, c) in codes[8..12].iter().enumerate() {
             assert_eq!(
                 out[i].to_bits(),
-                owl_models::kernel::e4m3_decode(*c).to_bits(),
-                "第 {i} 个元素与 kernels 参考不一致"
+                owl_models::kernel::e4m3_decode(*c).to_bits()
             );
         }
-        KvPageFormat::Fp8E4M3
-            .decode_row(&codes, 0, 1, hkv, hd, &mut out)
-            .expect("行 0/头 1");
+        codec.k_row(&codes, &scale, 0, 1, hkv, hd, &mut out).unwrap();
         for (i, c) in codes[4..8].iter().enumerate() {
             assert_eq!(
                 out[i].to_bits(),
@@ -197,16 +371,65 @@ mod tests {
         }
     }
 
-    /// 越界 = 响亮拒(不许静默读片外)。
+    #[test]
+    fn int8_k行乘scale() {
+        let (page, hkv, hd) = (2, 1, 4);
+        let codes: [i8; 8] = [1, -2, 3, -4, 5, -6, 7, -8];
+        let mut bytes = Vec::new();
+        for c in codes {
+            bytes.push(c as u8);
+        }
+        let ks = [
+            0.5f32, 0.25, 2.0, 4.0, 1.0, 1.5, 2.5, 3.5, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.0,
+            9.0,
+        ];
+        let scale = KvRowScale {
+            k: &ks,
+            v: &[],
+        };
+        let codec = KvPageFormat::Int8.codec();
+        assert_eq!(codec.k_scale_elems(page, hkv), 16);
+        let mut out = [0.0f32; 4];
+        codec.k_row(&bytes, &scale, 1, 0, hkv, hd, &mut out).unwrap();
+        assert_eq!(out, [45.0, -54.0, 63.0, -72.0]);
+    }
+
+    #[test]
+    fn int8_v行解packed() {
+        let (page, hkv, hd) = (4, 1, 2);
+        // [Hkv][D][page/2] b16: d0: t0=1,t1=2 | t2=3,t3=4；d1: ...
+        let words: [[u16; 2]; 2] = [[0x0201, 0x0403], [0x0605, 0x0807]];
+        let mut page_bytes = Vec::new();
+        for d in 0..hd {
+            for w in words[d] {
+                page_bytes.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        let vs = [0.5f32, 1.0, 2.0, 4.0];
+        let scale = KvRowScale {
+            k: &[],
+            v: &vs,
+        };
+        let codec = KvPageFormat::Int8.codec();
+        assert_eq!(codec.v_scale_elems(page, hkv), 4);
+        let mut out = [0.0f32; 2];
+        for t in 0..page {
+            codec
+                .v_row(&page_bytes, &scale, t, 0, hkv, hd, &mut out)
+                .unwrap();
+            let d0 = (t + 1) as f32 * vs[t];
+            let d1 = (t + 5) as f32 * vs[t];
+            assert_eq!(out, [d0, d1], "t={t}");
+        }
+    }
+
     #[test]
     fn 越界响亮拒() {
         let bytes = [0u8; 32];
         let mut out = [0.0f32; 4];
-        assert!(KvPageFormat::F16
-            .decode_row(&bytes, 2, 0, 2, 4, &mut out)
-            .is_err());
-        assert!(KvPageFormat::F16
-            .decode_row(&bytes, 0, 0, 2, 8, &mut out)
-            .is_err());
+        let codec = KvPageFormat::F16.codec();
+        let scale = KvRowScale::empty();
+        assert!(codec.k_row(&bytes, &scale, 2, 0, 2, 4, &mut out).is_err());
+        assert!(codec.k_row(&bytes, &scale, 0, 0, 2, 8, &mut out).is_err());
     }
 }

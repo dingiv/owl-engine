@@ -217,15 +217,19 @@ impl KvEnv {
         }
     }
 
-    /// verify 伪序列变体(grid.y = seqs;§三十一)
-    pub fn decode_v2_seq_op(&self) -> crate::ops::SemanticKernel {
+    /// verify 伪序列变体(grid.y = seqs;§三十一)。
+    ///
+    /// INT8 不走这条通用 v2 臂：它复用 `Int8DecodeGqaTcSplit` + f32 partial
+    /// (`paged_verify_int8_output`)，以保持与 no-spec decode 同分片/同数值。
+    /// 返回 `Err` 而不是 panic，调用方必须显式毒化或换臂。
+    pub fn decode_v2_seq_op(&self) -> Result<crate::ops::SemanticKernel, &'static str> {
         // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
         match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedDecodeV2Fp8SeqKnhd,
+            KvQuant::Fp8E4M3 => Ok(crate::ops::SemanticKernel::PagedDecodeV2Fp8SeqKnhd),
             // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
-            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
-            KvQuant::Int8 => unimplemented!("int8 KV 无 verify 伪序列臂(走 Int8PrefillPaged)"),
-            KvQuant::None => crate::ops::SemanticKernel::PagedDecodeV2SeqKnhd,
+            KvQuant::Fp8E5M2 => Err("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
+            KvQuant::Int8 => Err("int8 KV verify 走 paged_verify_int8_output，不用通用 v2 seq 臂"),
+            KvQuant::None => Ok(crate::ops::SemanticKernel::PagedDecodeV2SeqKnhd),
         }
     }
 

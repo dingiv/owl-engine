@@ -2198,3 +2198,111 @@ KV 带宽/布局 bound,不是 P 字节 bound。
   **V 的池布局/读流水**(token-major / pthfa 式分组 load)或
   **KV 压缩**,属于独立的 decode 布局项目。探针保留在
   `int8_pipeline_probe::int8_decode_nparts_timing_65k`。
+
+### 0.20.11 INT8 verify 接线（P1，2026-11-03）
+
+目标：让 `spec.depth=7`（DFlash2 d7）在 INT8 KV 上跑 verify，不再被
+boot/config 门拒绝；同时保持与 no-spec decode 同源，避免 verify 自己
+成为新的数值/质量变量。
+
+#### 实现
+
+- **复用 decode 分片，不新写 attention 核**：
+  `paged_verify_int8_output` 对 T=depth+1 行调用
+  `owl_int8_decode_gqa_tc_split`（B=T，`bt8` 每行一条页链，`kv_lens` 逐行），
+  再走 `owl_int8_decode_reduce`。
+  - 分片 = **256**（与 no-spec 单 token decode 完全一致），页偶数
+    `per=ceil(pages/256)`；不使用 verify v2 的 512-token 分片。
+  - partial/stat 用 **f32**，直接复用 `AttnV2Scratch` 的 f32 verify
+    scratch（`vattn2.tmp_out`，槽宽 = `hd+2`：partial + 交错 (m,l)）；
+    T=8 时约 50MiB，一块 scratch 跨 16 层复用，图内零逐层 f32 分配。
+- Q/K 走与 no-spec decode **同一条链**：
+  `NormRope`（f16）→ `QuantInt8QkF16` / `K0WriteInt8KOnly`；
+  不再用 prefill 的 fused `NormRopeQ/KInt8`。V 仍逐 token `VAppend`，
+  并在 kernel 后加 `dep` 边把同页两 token 的 read-modify-write 串行化。
+- boot 门：删除 `engine.rs` 的 `spec.depth != 0` 拒启；删除
+  `shared/config` 的 `kv_int8 + spec` 语义门。
+- `KvEnv::decode_v2_seq_op` 改为 `Result`：INT8 返回显式 `Err`
+  （通用 v2 臂不适用），`verify_v2_arm` 收到错误时毒化，不再
+  `unimplemented!` panic。
+- 尝试过的新核（固定 512 分区 + f16 partial + 通用 v2 reduce）能过
+  host parity（cos 0.99999998），但与 no-spec decode 分片不同，greedy
+  轨迹仍有差异；未接生产，已删除，避免两套 verify 语义。
+
+#### 验证（单 3090 Ti，W4A8 + INT8 P8，spec d7，GPU2）
+
+| 项目 | 结果 |
+|---|---|
+| 短问答 | `17*23` → 391 |
+| needle 8k | RETRIEVED，3.76s |
+| needle 32k | RETRIEVED，16.32s |
+| needle 64k | RETRIEVED，37.31s（max_seq=81920） |
+| needle 100k | RETRIEVED，68.67s（max_seq=101376；`vram_reserve_mb=256` + `prefill_chunk=1024`） |
+| GSM8K n=200 | **194/200 = 97.0%**（4 题 finish=length，7.6min） |
+
+显存/上限：
+
+- 24G 单卡 + DFlash2 d7 + f32 verify scratch 时，`max_seq=98304` 下
+  64k prompt 会撞 `vram-hard-budget`（chunk 2048 需 136MiB，
+  驱动 free−reserve 仅 ~10MiB）；降到 81920 后 64k 通过。
+- 100k 需要约 101376 max_seq；把 `pool.vram_reserve_mb` 从 512 降到 256
+  且 chunk 1024 后才够 transient。**这是单卡 24G 的容量边界，不是核错误**；
+  3080 TP2 / 3090 TP2 应重新做 20G/rank 预算（P3）。
+- verify scratch 改 f32 使 `vattn2` 从 18MiB → ~50MiB（T=8），
+  仍在预算内；图 slab 实测 0MiB（scratch 是持久块，不进图 slab）。
+
+#### 质量口径说明
+
+- `greedy spec ≡ no-spec` 的“逐位”门在**当前 DFlash2 生产档本身**也未成立：
+  用 FP8 3090 生产档做对照，5 条短 prompt 中 3 条 spec-on/off 文本有
+  措辞差异（同一批 prompt，INT8 为 2~3 条）。差异集中在首词/近义改写，
+  不是 INT8 特有；INT8 verify 已把 Q/K/分片/reduce 全部对齐 no-spec
+  decode，未再引入额外的 attention 分片差异。
+- 因此本轮质量判据采用：长上下文 needle 全过 + GSM8K 不劣化 + 与
+  FP8 生产档同量级的 spec 文本波动；若后续要求严格逐 token，需要先
+  把 DFlash2 的采样/接受链本身改成严格 greedy，而不是只改 KV 核。
+
+### 0.20.12 P2 页解码/index/coverage/select（部分，2026-11-03）
+
+#### KvPageCodec（trait 化）
+
+旧 `KvPageFormat::decode_row` 只有一条 kNHD 行式，INT8 V（dim-major
+packed b16）会被当成 K 行读错；K 也没有乘 Kscale。P2 把它改成：
+
+```text
+trait KvPageCodec {
+    elem_bytes / page_bytes
+    k_scale_elems / v_scale_elems      // f16/fp8 = 0
+    k_row(page, KvRowScale, t, h, ...) // INT8 = code × Kscale[group]
+    v_row(page, KvRowScale, t, h, ...) // INT8 = packed b16 × Vscale[token]
+}
+```
+
+- `KvPageFormat::codec()` 是唯一的格式 switch；调用点只拿
+  `&dyn KvPageCodec`。
+- `KvRowScale` 是 page-local 的 `&[f32]` K/V scale 视图；f16/fp8
+  传空切片。
+- INT8 K/V 单测：`int8_k行乘scale` / `int8_v行解packed`，以及原有
+  f16/fp8 逐位门全部绿。
+- `index`/`coverage` 回读时按页把 **K 页 + Kscale +（可选）V 页 +
+  Vscale** 一起 D2H；scale 字节一次转 f32，再按 `(block,layer)` 切片。
+- `index_gpu` 只有 f16/fp8 Mean-K 核；INT8 暂时走 host 回读（一次
+  分支，不是调用点散落）。
+
+#### 选择层/门控
+
+- `index` / `coverage_probe` / `select_decode` 对 INT8 放行。
+- `select_decode` 纯文本 8k needle：`ZXCVBNM12345` RETRIEVED（4.0s），
+  `view` 页表/页链与 INT8 decode split 正常配合。
+- coverage-only 8k：needle RETRIEVED；覆盖率探针输出 top1/top8 曲线
+  （top1 10.8% @8k，与 FP8 11.4% 同量级）。
+- 仍拒：
+  - `select_partial`：INT8 稀疏 prefill 的子集页链/因果口径未验收。
+    8k 实测打开后 prefill 后段读错页（答成复读吸引子），config/engine
+    双层拒启。
+  - `image_evict`：INT8 视觉/m-RoPE prefill 未验收。同图 FP8 12/12
+    命中，INT8 坐标全错/退化；不是 `pool_layout` 页搬移的问题，已拒启。
+
+P2b 入口：INT8 sparse prefill（`fi_plan_ctx` 视图口径已作为前置接进
+`paged_prefill_int8_output`，但还未通过选择层质量门）与 VLM/m-RoPE
+INT8 prefill。

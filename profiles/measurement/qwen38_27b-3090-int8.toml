@@ -1,7 +1,9 @@
 # INT8 KV 测量档（不计入入口档面）：单 3090 Ti / 27B AWQ-INT4。
 #
 # 形状：K int8 + V packed b16 + per-token/per-page scale；无 V shadow；
-#       spec off（int8 verify 未接线）；无 index/coverage/select/image_evict。
+#       spec off（本档保持无 spec 的 prefill/decode 测量基线；verify 已接线，
+#       生产转正见 docs/devlog/kernels/int8-kv-attention-project.md §0.20.11）；
+#       无 index/coverage/select/image_evict。
 # 口径：与 fp8 档同为 1B/elem，池容量 ≈ 262k；用于 prefill/decode 对比。
 extends = [
   "../full.toml",
