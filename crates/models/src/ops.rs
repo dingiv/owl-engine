@@ -946,6 +946,7 @@ pub(crate) fn foreign_sig(name: &str) -> Option<&'static str> {
         x if x == owl_kernels::family::marlin::GEMM_W4A16_BF16 => Some(owl_kernels::client::marlin::SIG),
         x if x == owl_kernels::family::flashinfer::PREFILL_FI => Some(owl_kernels::client::fi_sig::SIG),
         x if x == owl_kernels::family::flashinfer::PREFILL_FI_FP8KV => Some(owl_kernels::client::fi_sig::SIG),
+        x if x == owl_kernels::family::flashinfer::PREFILL_FI_FP8MMA => Some(owl_kernels::client::fi_sig::SIG),
         // 通信族(TP2 S4;三 dtype 同 sig —— 槽序不随 dtype 变)
         x if x == owl_kernels::family::comm::asset::STAGE_F32 => Some(owl_kernels::client::comm::SIG),
         x if x == owl_kernels::family::comm::asset::STAGE_F16 => Some(owl_kernels::client::comm::SIG),

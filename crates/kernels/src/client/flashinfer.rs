@@ -12,6 +12,7 @@ pub use super::BlockRef;
 
 pub const PREFILL_FI: &str = crate::family::flashinfer::PREFILL_FI;
 pub const PREFILL_FI_FP8KV: &str = crate::family::flashinfer::PREFILL_FI_FP8KV;
+pub const PREFILL_FI_FP8MMA: &str = crate::family::flashinfer::PREFILL_FI_FP8MMA;
 
 pub use super::fi_sig::{scale_bits, SIG};
 
@@ -42,8 +43,10 @@ pub struct FiPrefillCall {
     pub hd: usize,
     pub page: usize,
     pub sm_scale: f32,
-    /// fp8kv 变体(按名字路由)
+    /// fp8kv 变体(按名字路由;含 native e4m3-Q 臂)
     pub fp8kv: bool,
+    /// 40 系原生 FP8 MMA 臂(按 KernelPick 选中的入口名)
+    pub fp8mma: bool,
 }
 
 /// 解析(9 Block + 8 sz)。**按名取址**(F3):槽名/槽序取自声明表
@@ -68,7 +71,9 @@ pub fn parse_prefill(msg: &LaunchMsg) -> Result<FiPrefillCall, OpError> {
         hkv: s.u64("hkv")? as usize,
         hd: s.u64("hd")? as usize,
         page: s.u64("page")? as usize,
-        sm_scale: f32::from_bits(s.u64("sm_scale_bits")? as u32),        fp8kv: msg.kernel.name == PREFILL_FI_FP8KV,
+        sm_scale: f32::from_bits(s.u64("sm_scale_bits")? as u32),
+        fp8kv: matches!(msg.kernel.name.as_str(), PREFILL_FI_FP8KV | PREFILL_FI_FP8MMA),
+        fp8mma: msg.kernel.name == PREFILL_FI_FP8MMA,
     })
 }
 

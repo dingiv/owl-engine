@@ -1051,6 +1051,32 @@ mod tests {
                 ],
             ),
             (
+                crate::family::flashinfer::PREFILL_FI_FP8MMA,
+                &[
+                    "q",
+                    "k_cache",
+                    "v_cache",
+                    "q_cu",
+                    "indices",
+                    "indptr",
+                    "last_len",
+                    "wr",
+                    "out",
+                    "total_rows",
+                    "ctx_total",
+                    "t",
+                    "hq",
+                    "hkv",
+                    "hd",
+                    "page",
+                    "sm_scale_bits",
+                ],
+                &[
+                    "F16x2", "U32x1", "U32x1", "U32x1", "U32x1", "U32x1", "U32x1", "F16x1",
+                    "F16x2", "U64", "U64", "U64", "U64", "U64", "U64", "U64", "F32Bits",
+                ],
+            ),
+            (
                 crate::family::flashinfer::PREFILL_FI,
                 &[
                     "q",

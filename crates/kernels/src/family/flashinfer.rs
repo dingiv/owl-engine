@@ -35,6 +35,8 @@ use std::ffi::c_void;
 pub const PREFILL_FI: &str = "flashinfer_prefill_paged_f16";
 /// fp8 KV 变体(e4m3 KV + half Q/Out;槽序同 PREFILL_FI)
 pub const PREFILL_FI_FP8KV: &str = "flashinfer_prefill_paged_fp8kv";
+/// **40 系原生 FP8 MMA 臂**(e4m3 Q×KV;仅 Ada/SM89 由 picker 选择)
+pub const PREFILL_FI_FP8MMA: &str = "flashinfer_prefill_paged_fp8mma";
 
 /// **视觉塔注意力**(2026-10-15):ragged(**非分页**)非因果 prefill。
 /// 复用同一份 vendored FlashInfer FA2 家族核(`BatchPrefillWithRaggedKVCacheDispatched` + `MaskMode::kNone`),与 vLLM 的 ViT 走同路算法;胶水住
@@ -79,6 +81,7 @@ pub const FI_HOST_STAGING_BYTES: usize = 32 * 1024 * 1024;
 pub fn is_foreign(name: &str) -> bool {
     name == PREFILL_FI
         || name == PREFILL_FI_FP8KV
+        || name == PREFILL_FI_FP8MMA
         || name == ATTN_RAGGED_F16
         || name == FA2_VARLEN_F16
         || name == PLAN_SYNC_FI
@@ -169,6 +172,8 @@ pub struct FlashinferCfg {
     pub prefill_shadow: bool,
     /// 影子容量上界(token;`runtime.max_seq`):首层按它一次预留。
     pub prefill_shadow_cap: usize,
+    /// **40 系原生 FP8 MMA 臂**(由引擎从运行期 `Arch::Sm89` 投影;非编译 feature)
+    pub fp8_native: bool,
 }
 
 impl Default for FlashinferCfg {
@@ -180,6 +185,7 @@ impl Default for FlashinferCfg {
             cuda_graph: false,
             prefill_shadow: false,
             prefill_shadow_cap: 0,
+            fp8_native: false,
         }
     }
 }
@@ -195,6 +201,9 @@ static PREFILL_SHADOW: std::sync::atomic::AtomicBool =
 /// 影子容量上限(token;0 = 未下发)
 static PREFILL_SHADOW_CAP: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// 40 系原生 FP8 MMA(引擎 boot 从 `Arch::Sm89` 投影)
+static FP8_NATIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// **族装配参数唯一写点**(引擎装配期一次;boot 期,任何 plan/捕获之前)。
 ///
@@ -210,12 +219,23 @@ pub fn configure(cfg: FlashinferCfg) -> Result<(), crate::contract::OpError> {
             got: "cap = 0(首层将按 0 预留,影子静默不生效)".into(),
         });
     }
+    // 原生 FP8 MMA 只在 arch-sm89/120 构建里有设备符号；运行期 arch 由引擎
+    // 投影，二者不一致 = 配置/构建错配，响亮拒（不回退到“看起来能用”）。
+    if cfg.fp8_native && !cfg!(any(feature = "arch-sm89", feature = "arch-sm120")) {
+        return Err(crate::contract::OpError::Contract {
+            op: PREFILL_FI.into(),
+            field: "fp8_native",
+            expect: "arch-sm89/arch-sm120 构建的二进制".into(),
+            got: "当前构建未编 native FP8 MMA".into(),
+        });
+    }
     // C++ 适配器(上游 ABI 不动)只认 env ⇒ 与本侧原子同一次写入
     std::env::set_var("FI_CUDA_GRAPH", if cfg.cuda_graph { "1" } else { "0" });
     PLAN_RESTORE.store(cfg.plan_restore, std::sync::atomic::Ordering::Relaxed);
     CUDA_GRAPH.store(cfg.cuda_graph, std::sync::atomic::Ordering::Relaxed);
     PREFILL_SHADOW.store(cfg.prefill_shadow, std::sync::atomic::Ordering::Relaxed);
     PREFILL_SHADOW_CAP.store(cfg.prefill_shadow_cap, std::sync::atomic::Ordering::Relaxed);
+    FP8_NATIVE.store(cfg.fp8_native, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -237,6 +257,10 @@ pub(crate) fn prefill_shadow_on() -> bool {
 /// 读:影子容量上界(token)
 pub(crate) fn prefill_shadow_cap() -> usize {
     PREFILL_SHADOW_CAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// 读:40 系原生 FP8 MMA(引擎 boot 投影)
+pub(crate) fn fp8_native() -> bool {
+    FP8_NATIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 extern "C" {
@@ -275,6 +299,25 @@ extern "C" {
         num_qo_heads: i32, num_kv_heads: i32,
         head_dim: i32, page_size: i32,
         kv_bytes: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// **40/50 系原生 FP8 MMA 专用 plan**（arch-sm89/120 构建；force CTA16，split 沿用上游）
+    #[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
+    pub fn owl_fi_prefill_plan_fp8mma(
+        float_ws: *mut c_void, float_ws_size: usize,
+        int_ws: *mut c_void, int_ws_size: usize,
+        page_locked: *mut c_void, page_locked_size: usize,
+        out_plan15: *mut i64,
+        out_cta_tile_q: *mut i32,
+        out_split_kv: *mut i32,
+        out_int_bytes: *mut usize,
+        qo_indptr_h: *const i32,
+        kv_indptr_h: *const i32,
+        total_num_rows: i32,
+        batch_size: i32,
+        num_qo_heads: i32, num_kv_heads: i32,
+        head_dim: i32, page_size: i32,
         stream: *mut c_void,
     ) -> i32;
 
@@ -339,6 +382,40 @@ extern "C" {
         block_valid_mask: *const c_void,
         stream: *mut c_void,
     ) -> i32;
+
+    /// **40/50 系原生 FP8 MMA**(2026-11-04;arch-sm89/120 构建)
+    /// Q 已是 e4m3 的 paged prefill。参数表与 `owl_fi_prefill_run_fp8kv` 逐字相同。
+    #[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
+    pub fn owl_fi_prefill_run_fp8mma(
+        q_ptr: *const c_void,
+        k_data: *const c_void,
+        v_data: *const c_void,
+        out_ptr: *mut c_void,
+        q_cu_seqlens: *mut i32,
+        indices: *mut i32,
+        indptr: *mut i32,
+        last_len: *mut i32,
+        plan15: *const i64,
+        int_ws: *mut c_void, int_ws_size: usize,
+        float_ws: *mut c_void, float_ws_size: usize,
+        batch_size: i32,
+        num_qo_heads: i32, num_kv_heads: i32,
+        head_dim: i32, page_size: i32,
+        total_num_rows: i32,
+        sm_scale: f32,
+        block_valid_mask: *const c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
+    /// **Q f16 → e4m3**（原生 FP8 MMA 前置）
+    #[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
+    pub fn owl_fi_quant_f16_to_fp8(
+        src: *const c_void,
+        dst: *mut c_void,
+        n: i64,
+        stream: *mut c_void,
+    ) -> i32;
+
     /// 视觉塔 ragged plan(host;每 (rows,heads,hd,cu) 一次；多图按 cu 分段)
     pub fn owl_fi_attn_ragged_plan(
         float_ws: *mut std::ffi::c_void,
@@ -428,12 +505,14 @@ mod cfg_tests {
             cuda_graph: cuda_graph(),
             prefill_shadow: prefill_shadow_on(),
             prefill_shadow_cap: prefill_shadow_cap(),
+            fp8_native: fp8_native(),
         };
         configure(FlashinferCfg {
             plan_restore: false,
             cuda_graph: true,
             prefill_shadow: true,
             prefill_shadow_cap: 4096,
+            fp8_native: false,
         })
         .expect("合法组合");
         assert!(!plan_restore());

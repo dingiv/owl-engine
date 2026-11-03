@@ -16,7 +16,7 @@
 //! - 配置面归**族自己**:`owl_kernels::family::flashinfer::FlashinferCfg` +
 //!   `configure()`(整快照,含自洽门;写原子与 C++ 侧 env 一次落)。
 //! - **写者唯一 = 本模块**(引擎装配期 = 配置持有者),读侧 = 族 runtime。
-//! - 位置纪律:必须在**任何 plan / 图捕获 / warmup 之前**(`boot_knobs_check` 内)。
+//! - 位置纪律:必须在**任何 plan / 图捕获 / warmup 之前**(`boot_rank` 的 env 感知后)。
 //!
 //! 加新的族装配参数时:配置键 → [`EngineKnobs`](crate::EngineKnobs) →
 //! 本函数 → 族 `configure`,不要回到 trait 上加方法。
@@ -26,7 +26,11 @@ use owl_iface::contract::ModelError;
 use crate::engine::EngineKnobs;
 
 /// 把引擎旋钮里的**族装配参数**下发给各族(新的族 `configure` 在此排队)。
-pub(crate) fn apply(knobs: &EngineKnobs, max_seq_tokens: usize) -> Result<(), ModelError> {
+pub(crate) fn apply(
+    knobs: &EngineKnobs,
+    max_seq_tokens: usize,
+    arch: Option<owl_kernels::Arch>,
+) -> Result<(), ModelError> {
     // ── FlashInfer 族 ──
     // 影子容量只在开启时给值:自洽门要求 `prefill_shadow ⇒ cap > 0`
     // (cap = 0 会让首层按 0 预留 ⇒ 开关静默不生效);关时给 0 以免误导。
@@ -35,6 +39,12 @@ pub(crate) fn apply(knobs: &EngineKnobs, max_seq_tokens: usize) -> Result<(), Mo
         cuda_graph: knobs.fi_cuda_graph,
         prefill_shadow: knobs.prefill_shadow,
         prefill_shadow_cap: if knobs.prefill_shadow { max_seq_tokens } else { 0 },
+        // 40/50 系原生 FP8 MMA：唯一判据 = **运行期 GPU 代际**（非编译 feature）。
+        // 这里只负责把引擎的事实投影给族；选核名由 KernelPick 自己按 OpEnv 选。
+        fp8_native: matches!(
+            arch,
+            Some(owl_kernels::Arch::Sm89 | owl_kernels::Arch::Sm120)
+        ),
     };
     owl_kernels::family::flashinfer::configure(cfg)
         .map_err(|e| ModelError::Msg(format!("算子族装配参数下发失败(flashinfer): {e}")))?;
@@ -42,11 +52,12 @@ pub(crate) fn apply(knobs: &EngineKnobs, max_seq_tokens: usize) -> Result<(), Mo
     // 说是“开了”而实际没开 = 最难查的一类)
     owl_shared::log_info!(
         "kernel_cfg",
-        "flashinfer: plan_restore={} cuda_graph={} prefill_shadow={} cap={}",
+        "flashinfer: plan_restore={} cuda_graph={} prefill_shadow={} cap={} fp8_native={}",
         cfg.plan_restore,
         cfg.cuda_graph,
         cfg.prefill_shadow,
-        cfg.prefill_shadow_cap
+        cfg.prefill_shadow_cap,
+        cfg.fp8_native
     );
     Ok(())
 }

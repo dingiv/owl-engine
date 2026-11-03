@@ -15,6 +15,10 @@ use crate::family::flashinfer::{
     owl_fi_prefill_run_fp8kv, FI_FLOAT_WS_BYTES, FI_HOST_STAGING_BYTES, FI_INT_WS_BYTES,
     FI_RAGGED_INT_WS_BYTES,
 };
+#[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
+use crate::family::flashinfer::{
+    owl_fi_prefill_plan_fp8mma, owl_fi_prefill_run_fp8mma, owl_fi_quant_f16_to_fp8,
+};
 use crate::registry::{FamilyGuard, KernelFamily};
 
 type FiRunFn = unsafe extern "C" fn(
@@ -209,6 +213,9 @@ pub struct FiRuntime {
     shadow: Option<ScratchBuf>,
     /// shadow 的 identity 页表(`[0,1,..,pages-1]`;让 FI 读 dense shadow)
     shadow_indices: Option<ScratchBuf>,
+    /// **原生 FP8 MMA 的 Q 量化 scratch**(f16 → e4m3;arch-sm89/120 使用)
+    #[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
+    q8: Option<ScratchBuf>,
 }
 /// 视觉塔 ragged plan 键
 #[derive(Clone, Copy, PartialEq)]
@@ -350,6 +357,8 @@ impl Default for FiRuntime {
             fa2_key: None,
             shadow: None,
             shadow_indices: None,
+            #[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
+            q8: None,
         }
     }
 }
@@ -389,6 +398,8 @@ impl KernelFamily for FiRuntime {
             fa2_key: None,
             shadow: None,
             shadow_indices: None,
+            #[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
+            q8: None,
         };
         Ok(FamilyGuard::boxed(me))
     }
@@ -519,6 +530,7 @@ impl KernelFamily for FiRuntime {
             &stream,
             &msg.kernel.name,
             kv_bytes,
+            call.fp8mma && !shadow,
         )?;
         // ── int_ws 激活(多 plan 共存;M2b 2026-10-15)──
         //
@@ -544,7 +556,7 @@ impl KernelFamily for FiRuntime {
 
         // **f16 shadow**:先把当前 ctx 的物理页一次性反量化到 dense f16
         // (identity 页表),再走 f16 臂。失败 = 结构化拒,不静默回落。
-        let (run, kc_run, vc_run, indices_run) = if shadow {
+        let (run, q_run, kc_run, vc_run, indices_run) = if shadow {
             let pages = call.ctx_total.div_ceil(call.page.max(1)).max(1);
             let (sk, sv, sidx) = self.ensure_shadow(res, pages, call.page, call.hkv, call.hd)?;
             let rc = unsafe {
@@ -568,18 +580,58 @@ impl KernelFamily for FiRuntime {
                     detail: format!("fi shadow dequant err {rc}(pages={pages})"),
                 });
             }
-            (owl_fi_prefill_run as FiRunFn, sk, sv, sidx)
+            (owl_fi_prefill_run as FiRunFn, q, sk, sv, sidx)
+        } else if call.fp8mma {
+            #[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
+            {
+                // 40 系原生 FP8 MMA：Q 先 f16→e4m3（scale=1.0；qk-norm 后 RMS≈1）。
+                let n = call
+                    .total_rows
+                    .checked_mul(call.hq)
+                    .and_then(|v| v.checked_mul(call.hd))
+                    .ok_or_else(|| OpError::Contract {
+                        op: PREFILL_FI.into(),
+                        field: "q8.elems",
+                        expect: "total_rows*hq*hd 不溢出".into(),
+                        got: format!("rows={} hq={} hd={}", call.total_rows, call.hq, call.hd),
+                    })?;
+                let q8 = self.ensure_q8(res, n)?;
+                let rc = unsafe {
+                    owl_fi_quant_f16_to_fp8(
+                        q as *const std::ffi::c_void,
+                        q8 as *mut std::ffi::c_void,
+                        n as i64,
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                    )
+                };
+                if rc != 0 {
+                    return Err(OpError::Launch {
+                        op: msg.kernel.name.clone(),
+                        stage: crate::contract::Stage::Compute,
+                        detail: format!("fi native Q quant err {rc}(n={n})"),
+                    });
+                }
+                (owl_fi_prefill_run_fp8mma as FiRunFn, q8, kc, vc, indices)
+            }
+            #[cfg(not(any(feature = "arch-sm89", feature = "arch-sm120")))]
+            {
+                return Err(OpError::Launch {
+                    op: msg.kernel.name.clone(),
+                    stage: crate::contract::Stage::Load,
+                    detail: "KernelPick 选了原生 FP8 MMA，但本二进制未编 arch-sm89/120".into(),
+                });
+            }
         } else if call.fp8kv {
-            (owl_fi_prefill_run_fp8kv as FiRunFn, kc, vc, indices)
+            (owl_fi_prefill_run_fp8kv as FiRunFn, q, kc, vc, indices)
         } else {
-            (owl_fi_prefill_run as FiRunFn, kc, vc, indices)
+            (owl_fi_prefill_run as FiRunFn, q, kc, vc, indices)
         };
         // 家族面入账(A13 补漏):FlashInfer = **直连 FFI 发射**(plan/run 均不经
         // `Exec::launch`),账上本无痕;ptrs = q/kc/vc/out 四块地址。
-        res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[q, kc_run, vc_run, out_ptr]);
+        res.note_device("fam_ffi_launch", &msg.kernel.name, 0, &[q_run, kc_run, vc_run, out_ptr]);
         let rc = unsafe {
             run(
-                q as *const std::ffi::c_void,
+                q_run as *const std::ffi::c_void,
                 kc_run as *const std::ffi::c_void,
                 vc_run as *const std::ffi::c_void,
                 out_ptr as *mut std::ffi::c_void,
@@ -851,6 +903,7 @@ impl FiRuntime {
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         op_name: &str,
         kv_bytes: usize,
+        fp8mma: bool,
     ) -> Result<(), OpError> {
         let key = plan_key(
             geom.total_rows,
@@ -921,6 +974,35 @@ impl FiRuntime {
                     kv_bytes as i32,
                     stream.cu_stream() as *mut std::ffi::c_void,
                 )
+            } else if fp8mma {
+                #[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
+                {
+                    owl_fi_prefill_plan_fp8mma(
+                        float_ws.0 as *mut std::ffi::c_void,
+                        float_ws.1,
+                        int_ws.0 as *mut std::ffi::c_void,
+                        int_ws.1,
+                        self.host_staging.as_mut_ptr() as *mut std::ffi::c_void,
+                        self.host_staging.len(),
+                        plan15.as_mut_ptr(),
+                        &mut cta_tile_q,
+                        &mut split_kv,
+                        &mut int_bytes,
+                        qo_indptr.as_ptr(),
+                        kv_indptr.as_ptr(),
+                        geom.total_rows as i32,
+                        1,
+                        geom.hq as i32,
+                        geom.hkv as i32,
+                        geom.hd as i32,
+                        geom.page as i32,
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                    )
+                }
+                #[cfg(not(any(feature = "arch-sm89", feature = "arch-sm120")))]
+                {
+                    unreachable!("kv_bytes=1 + non-sm89 不走原生 FP8 plan")
+                }
             } else {
                 owl_fi_prefill_plan(
                     float_ws.0 as *mut std::ffi::c_void,
@@ -1121,6 +1203,37 @@ impl FiRuntime {
         Ok((base, base + k_bytes as u64, idx))
     }
 
+    /// **原生 FP8 MMA 的 Q8 scratch**:按当前 q 元素数分配/复用。
+    /// 捕获窗内未预留 ⇒ 结构化拒（不在图里做 cudaMalloc）。
+    #[cfg(any(feature = "arch-sm89", feature = "arch-sm120"))]
+    fn ensure_q8(
+        &mut self,
+        res: &mut dyn crate::device::DeviceRes,
+        bytes: usize,
+    ) -> Result<u64, OpError> {
+        if bytes == 0 || bytes % 4 != 0 {
+            return Err(OpError::Contract {
+                op: PREFILL_FI.into(),
+                field: "q8.bytes",
+                expect: ">0 且 4 字节对齐(e4m3 打包)".into(),
+                got: format!("{bytes}"),
+            });
+        }
+        if let Some(b) = self.q8.as_ref().filter(|b| b.bytes >= bytes) {
+            return Ok(b.ptr);
+        }
+        if res.capturing()? {
+            return Err(OpError::Launch {
+                op: PREFILL_FI.into(),
+                stage: crate::contract::Stage::Load,
+                detail: "Q8 scratch 未预留而处于捕获窗(eager warmup 必须先跑过)".into(),
+            });
+        }
+        let sb = res.alloc(bytes, "fi.q8")?;
+        self.q8 = Some(sb);
+        Ok(sb.ptr)
+    }
+
     /// **plan 表同步**(W3):保证 (geom, ctx) 的 plan 在场,并把它的表刷进
     /// `int_ws`(窗外路径 ⇒ `activate` 必刷)。**调用方 = 引擎**(每步图 launch
     /// 之前),用于"FI 核在图内 + 图不烘 restore"的档。
@@ -1141,7 +1254,17 @@ impl FiRuntime {
         let (fp, fb) = (float_ws.ptr, float_ws.bytes);
         let (ip, ib) = (int_ws.ptr, int_ws.bytes);
         let stream = res.stream()?;
-        self.ensure_plan(geom, ctx_total, res, (fp, fb), (ip, ib), &stream, "plan-sync", 1)?;
+        self.ensure_plan(
+            geom,
+            ctx_total,
+            res,
+            (fp, fb),
+            (ip, ib),
+            &stream,
+            "plan-sync",
+            1,
+            fam::fp8_native(),
+        )?;
         let key = plan_key(
             geom.total_rows,
             ctx_total,

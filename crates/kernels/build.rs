@@ -1556,6 +1556,9 @@ fn build_flashinfer() {
         // **ABI 零改动**。
         let src_f16 = "cu/flashinfer/owl_fi_attention.cu";
         let src_fp8 = "cu/flashinfer/owl_fi_attention_fp8.cu";
+        // 40 系原生 FP8 MMA 臂（2026-11-04）：Q/KV 都是 e4m3，仅 arch >= sm89
+        // 编入（sm86 的 MMA 指令门在 mma.cuh，`__CUDA_ARCH__ < 890` 时没有该指令）。
+        let src_fp8mma = "cu/flashinfer/owl_fi_attention_fp8mma.cu";
         // 视觉塔注意力(2026-10-15):**同仓 FlashInfer ragged 非因果臂**
         // (复用 vendored FA2 家族核,零自研核;见该 .cu 头注)
         let src_ragged = "cu/flashinfer/owl_fi_attn_ragged.cu";
@@ -1570,7 +1573,7 @@ fn build_flashinfer() {
         let fa2_compat = "cu/flash_attn/compat";
         let fi_include =
             env::var("FLASHINFER_INCLUDE").unwrap_or_else(|_| "cu/flashinfer/include".into());
-        for f in [src_f16, src_fp8, src_ragged, src_hdr, src_fa2] {
+        for f in [src_f16, src_fp8, src_fp8mma, src_ragged, src_hdr, src_fa2] {
             println!("cargo:rerun-if-changed={f}");
         }
         println!("cargo:rerun-if-changed={fi_include}");
@@ -1579,7 +1582,7 @@ fn build_flashinfer() {
         println!("cargo:rerun-if-changed={fa2_compat}");
         println!("cargo:rerun-if-env-changed=FLASHINFER_FORCE_BUILD");
         println!("cargo:rerun-if-env-changed=FLASHINFER_INCLUDE");
-        // **FP16 累加档**(2026-11-02,Cargo feature `fi-fp16acc`):FI 三个 TU 加
+        // **FP16 累加档**(2026-11-02,Cargo feature `fi-fp16acc`):FI 各 TU 加
         // `-DFP16_QK_REDUCTION_SUPPORTED` + `-std=c++20`(prefill.cuh 的
         // `std::bit_cast` 需要),走**半精度 QK 累加 + 半精度 softmax**路径。
         // 该宏同时决定 `owl_fi_attention_common.h` 的 `OWL_FP16_QK_REDUCTION`
@@ -1615,6 +1618,7 @@ fn build_flashinfer() {
         let mut deps: Vec<String> = vec![
             src_f16.to_string(),
             src_fp8.to_string(),
+            src_fp8mma.to_string(),
             src_ragged.to_string(),
             src_hdr.to_string(),
             src_fa2.to_string(),
@@ -1633,7 +1637,11 @@ fn build_flashinfer() {
             // (历史坑留档:旧预编 `.a` 带该宏、从源路径起初没带 ⇒ 链接期
             //  undefined symbol;换源后这类"配方不一致"面自然消失)
             let mut jobs: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
-            for src in [src_f16, src_fp8, src_ragged] {
+            let mut fi_sources = vec![src_f16, src_fp8, src_ragged];
+            if fi_arch >= Arch::Sm89 {
+                fi_sources.push(src_fp8mma);
+            }
+            for src in fi_sources {
                 let obj = fi_dir.join(format!(
                     "{}.o",
                     PathBuf::from(src).file_stem().unwrap().to_string_lossy()
@@ -1706,7 +1714,8 @@ fn build_flashinfer() {
             assert!(status.success(), "flashinfer: ar failed");
             stamp_write(&lib, &deps, &flags);
             println!(
-                "cargo:warning=owl-kernels: built libowl_flashinfer.a from source (in-tree FI 3 TU + vLLM FA2 hdim96)"
+                "cargo:warning=owl-kernels: built libowl_flashinfer.a from source (in-tree FI {} TU + vLLM FA2 hdim96)",
+                if fi_arch >= Arch::Sm89 { "4" } else { "3" }
             );
         }
         let cuda_lib = env::var("CUDA_HOME")

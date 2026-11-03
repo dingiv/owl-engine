@@ -84,8 +84,11 @@ bind = "0.0.0.0:8138"
 quant = "w4a8"
 
 [kernel]
-# Ada 有原生 fp8 MMA，fp8 KV 的 prefill 不走 sm86 的 e4m3→half 反量化慢路径，
-# prefill_shadow 无收益；显式关，避免与 30 系档混淆。
+# Ada 原生 fp8 MMA（2026-11-04 落地；KernelPick 按运行期 arch=Sm89/120 选中）：prefill 走
+# e4m3 Q × e4m3 KV 的 m16n8k32 MMA，不再把 K/V 反量化成 half；Q 由
+# `owl_fi_quant_f16_to_fp8` 先量化（scale=1.0，qk-norm 后 RMS≈1）。
+# 原生路径固定 CTA_TILE_Q=16（upstream 已验证的 NUM_WARPS_Q=1 布局），
+# split-kv 沿用上游计划。`prefill_shadow` 无收益，显式关。
 prefill_shadow = false
 
 [runtime]

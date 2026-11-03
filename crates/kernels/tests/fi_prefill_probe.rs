@@ -289,6 +289,13 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
     let plan_ctx = owl_shared::env_reader::parse::<usize>("FI_PF_PLAN_CTX").unwrap_or(ctx);
     let mut res = TestRes::new(owl_cuda::test_device_ordinal());
     let mut exec = Exec::new();
+    // arch-sm89/120 构建直接打原生 e4m3-Q 臂；sm86 仍打旧 dequant 臂。
+    // （生产选臂走 KernelPick；这里绕过 picker 是为了单核隔离。）
+    let fp8_name = if cfg!(any(feature = "arch-sm89", feature = "arch-sm120")) {
+        owl_kernels::family::flashinfer::PREFILL_FI_FP8MMA
+    } else {
+        owl_kernels::family::flashinfer::PREFILL_FI_FP8KV
+    };
     // 激活集 = 本探针要发射的那一个算子(A20/A16 之后:白名单外的声明不审
     // 孤儿 —— 见 registry::init_all_inner 的射程注)
     // 读+写都要在场:池审计 E10(读该池实例的算子必须有 ≥1 个写者)——
@@ -300,7 +307,7 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
         ]
     } else {
         &[
-            owl_kernels::family::flashinfer::PREFILL_FI_FP8KV,
+            fp8_name,
             "owl_reshape_and_cache_fp8kv_knhd",
         ]
     };
@@ -370,10 +377,7 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
     let (kernel_name, kv_dtype) = if f16_kv {
         (owl_kernels::client::flashinfer::PREFILL_FI, Dtype::F16)
     } else {
-        (
-            owl_kernels::client::flashinfer::PREFILL_FI_FP8KV,
-            Dtype::U32,
-        )
+        (fp8_name, Dtype::U32)
     };
     let msg = LaunchMsg {
         kernel: KernelSource {
@@ -487,15 +491,27 @@ fn run_case_dtype(t: usize, ctx: usize, host_check: bool, iters: usize, f16_kv: 
     // - `fi-fp16acc`(QK half)= 2e-2(实测 f16 池大 logits 到 4e-2,见 devlog);
     // - `fi-fp16pv`(PV half)= 2e-2 + cos ≥ 0.99995 + mean|Δ| ≤ 5e-3(该档的口径)。
     let half_acc = cfg!(feature = "fi-fp16acc") || cfg!(feature = "fi-fp16pv");
-    let gate = owl_shared::env_reader::parse::<f32>("FI_PF_GATE").unwrap_or(if half_acc {
+    // 40/50 系原生 FP8 MMA（arch-sm89/120, e4m3 Q + e4m3 KV）：Q 与 softmax P 都多一次
+    // e4m3 量化 ⇒ 绝对误差门放宽到 3e-2；cos/mean 仍按 FP8 attention 口径收紧。
+    let fp8_native = cfg!(any(feature = "arch-sm89", feature = "arch-sm120")) && !f16_kv;
+    let gate = owl_shared::env_reader::parse::<f32>("FI_PF_GATE").unwrap_or(if fp8_native {
+        3e-2
+    } else if half_acc {
         2e-2
     } else {
         1e-2
     });
     let pv = cfg!(feature = "fi-fp16pv");
-    let cos_gate =
-        owl_shared::env_reader::parse::<f64>("FI_PF_COS").unwrap_or(if pv { 0.99995 } else { 0.0 });
-    let mean_gate = owl_shared::env_reader::parse::<f64>("FI_PF_MEAN").unwrap_or(if pv {
+    let cos_gate = owl_shared::env_reader::parse::<f64>("FI_PF_COS").unwrap_or(if fp8_native {
+        0.9999
+    } else if pv {
+        0.99995
+    } else {
+        0.0
+    });
+    let mean_gate = owl_shared::env_reader::parse::<f64>("FI_PF_MEAN").unwrap_or(if fp8_native {
+        5e-3
+    } else if pv {
         5e-3
     } else {
         f64::INFINITY

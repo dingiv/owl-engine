@@ -148,7 +148,7 @@ static cudaError_t owl_fi_dispatch(Params& params, OwlOut* tmp_v, float* tmp_s,
 // ---------------------------------------------------------------------------
 // run 公共体:plan blob → params → 发射(两条臂只差 DTypeKV)
 // ---------------------------------------------------------------------------
-template <typename DTypeKV>
+template <typename DTypeKV, typename DTypeQ = OwlQ>
 static int owl_fi_run_impl(
     const void* q_ptr, const void* k_data, const void* v_data, void* out_ptr,
     int32_t* q_cu_seqlens, int32_t* indices, int32_t* indptr, int32_t* last_len,
@@ -156,7 +156,7 @@ static int owl_fi_run_impl(
     size_t float_ws_size, int32_t batch_size, int32_t num_qo_heads, int32_t num_kv_heads,
     int32_t head_dim, int32_t page_size, int32_t total_num_rows, float sm_scale,
     const void* block_valid_mask, cudaStream_t stream, const char* tag) {
-  using ParamsType = BatchPrefillPagedParams<OwlQ, DTypeKV, OwlOut, OwlId>;
+  using ParamsType = BatchPrefillPagedParams<DTypeQ, DTypeKV, OwlOut, OwlId>;
 
   // plan blob(15×int64;字段序 = PrefillPlanInfo,两端同源)
   PrefillPlanInfo plan_info;
@@ -169,7 +169,7 @@ static int owl_fi_run_impl(
   }
 
   ParamsType params;  // 上游结构体 = 默认构造 + 逐字段赋值
-  params.q = (OwlQ*)q_ptr;
+  params.q = (DTypeQ*)q_ptr;
   params.paged_kv = paged_kv_t<DTypeKV, OwlId>(
       (uint32_t)num_kv_heads, (uint32_t)page_size, (uint32_t)head_dim, (uint32_t)batch_size,
       QKVLayout::kNHD, (DTypeKV*)k_data, (DTypeKV*)v_data, indices, indptr, last_len,

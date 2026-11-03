@@ -61,13 +61,13 @@ static int owl_fi_prefill_plan_impl(
     int32_t batch_size,
     int32_t num_qo_heads, int32_t num_kv_heads,
     int32_t head_dim, int32_t page_size,
-    uint32_t kv_bytes,
+    uint32_t kv_bytes, bool force_cta16, bool force_disable_split,
     cudaStream_t stream) {
   try {
     auto* qo_h = const_cast<int32_t*>(qo_indptr_h);
     auto* kv_h = const_cast<int32_t*>(kv_indptr_h);
     if (kv_bytes != 1 && kv_bytes != 2) return -203;
-    const bool disable_split_kv = !owl_fi_split_kv_enabled();
+    const bool disable_split_kv = force_disable_split || !owl_fi_split_kv_enabled();
 
     // ① 先问所需 workspace(上游要求尺寸精确;不够就**报出来**,不静默)
     size_t need_float = 0, need_int = 0;
@@ -76,7 +76,7 @@ static int owl_fi_prefill_plan_impl(
         (uint32_t)num_qo_heads, (uint32_t)num_kv_heads, (uint32_t)head_dim, (uint32_t)head_dim,
         (uint32_t)page_size, /*enable_cuda_graph=*/owl_fi_cuda_graph(), /*sizeof_dtype_o=*/sizeof(half),
         /*window_left=*/-1, /*fixed_split_size=*/0, disable_split_kv, /*num_colocated_ctas=*/0,
-        /*uniform_q_len=*/(int64_t)0, stream, kv_bytes);
+        /*uniform_q_len=*/(int64_t)0, stream, kv_bytes, force_cta16);
     if (werr != cudaSuccess) return (int)werr;
     if (need_float > float_ws_size || need_int > int_ws_size || need_int > page_locked_size) {
       // 错误码路径(-202 上抛):ERROR 级直落日志(默认 warn 档也可见)
@@ -98,7 +98,7 @@ static int owl_fi_prefill_plan_impl(
         /*window_left=*/-1,
         /*fixed_split_size=*/0,
         /*disable_split_kv=*/disable_split_kv,
-        /*num_colocated_ctas=*/0, /*uniform_q_len=*/(int64_t)0, stream, kv_bytes);
+        /*num_colocated_ctas=*/0, /*uniform_q_len=*/(int64_t)0, stream, kv_bytes, force_cta16);
     if (err != cudaSuccess) return (int)err;
     OWL_LOG_DEBUG("owl-fi",
                   "[plan] padded_batch=%lld total_rows=%lld split=%d cta_tile_q=%lld "
@@ -138,7 +138,8 @@ extern "C" int owl_fi_prefill_plan(
                                   page_locked_size, out_plan15, out_cta_tile_q, out_split_kv,
                                   out_int_bytes, qo_indptr_h, kv_indptr_h, total_num_rows,
                                   batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
-                                  owl_fi_kv_bytes(), stream);
+                                  owl_fi_kv_bytes(), /*force_cta16=*/false,
+                                  /*force_disable_split=*/false, stream);
 }
 
 /// **f16 shadow 专用 plan**:显式 `kv_bytes`(2 = f16),不读 env。
@@ -162,7 +163,34 @@ extern "C" int owl_fi_prefill_plan2(
                                   page_locked_size, out_plan15, out_cta_tile_q, out_split_kv,
                                   out_int_bytes, qo_indptr_h, kv_indptr_h, total_num_rows,
                                   batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
-                                  (uint32_t)kv_bytes, stream);
+                                  (uint32_t)kv_bytes, /*force_cta16=*/false,
+                                  /*force_disable_split=*/false, stream);
+}
+
+/// **40 系原生 FP8 MMA 专用 plan**：强制 CTA_TILE_Q=16（NUM_WARPS_Q=1 的
+/// 已验证布局；multi-Q-warp 在 e4m3 Q 上尚未验证）。split-kv 沿用上游计划
+/// （CTA16 下 T=1/3072 已对拍）。调用方按 arch 选择本入口。
+extern "C" int owl_fi_prefill_plan_fp8mma(
+    void* float_ws, size_t float_ws_size,
+    void* int_ws, size_t int_ws_size,
+    void* page_locked, size_t page_locked_size,
+    int64_t* out_plan15,
+    int32_t* out_cta_tile_q,
+    int32_t* out_split_kv,
+    size_t* out_int_bytes,
+    const int32_t* qo_indptr_h,
+    const int32_t* kv_indptr_h,
+    int32_t total_num_rows,
+    int32_t batch_size,
+    int32_t num_qo_heads, int32_t num_kv_heads,
+    int32_t head_dim, int32_t page_size,
+    cudaStream_t stream) {
+  return owl_fi_prefill_plan_impl(float_ws, float_ws_size, int_ws, int_ws_size, page_locked,
+                                  page_locked_size, out_plan15, out_cta_tile_q, out_split_kv,
+                                  out_int_bytes, qo_indptr_h, kv_indptr_h, total_num_rows,
+                                  batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
+                                  /*kv_bytes=*/1, /*force_cta16=*/true,
+                                  /*force_disable_split=*/false, stream);
 }
 
 // ---------------------------------------------------------------------------

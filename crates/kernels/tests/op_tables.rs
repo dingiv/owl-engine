@@ -146,6 +146,12 @@ fn production_picks_carry_admission_meta() {
     use owl_kernels::driver::{self, DType, Hw, OpEnv};
 
     let env = OpEnv { hw: Hw { arch: owl_kernels::Arch::Sm86 }, page: 32, head_dim: 256, grp: 6 };
+    let env_sm89 = OpEnv {
+        hw: Hw { arch: owl_kernels::Arch::Sm89 },
+        page: 32,
+        head_dim: 256,
+        grp: 6,
+    };
     // NC 注意力:shapes[0][0] = T,scalars = [hq, ?, hd]
     let nc_shapes = vec![vec![8usize, 256]];
     let nc_scalars = vec![24i64, 4, 256];
@@ -181,7 +187,8 @@ fn production_picks_carry_admission_meta() {
             "chunked prefill fp8 knhd",
             driver::attn::paged_prefill_fp8_knhd(&env, DType::F16, 256, 4, 24, 2540),
         ),
-        ("fi prefill fp8", driver::attn::fi_prefill(true)),
+        ("fi prefill fp8", driver::attn::fi_prefill(&env, true)),
+        ("fi prefill fp8 native", driver::attn::fi_prefill(&env_sm89, true)),
         ("norm rope f16", driver::attn::norm_rope(DType::F16, 8, 24, 256)),
         ("norm rope bf16", driver::attn::norm_rope(DType::BF16, 8, 24, 256)),
         (
@@ -353,3 +360,36 @@ fn pool_writers_have_a_carrying_slot() {
     }
 }
 
+
+/// **KernelPick 必须按运行期 GPU 代际选 FP8 prefill 臂**（不是编译 feature）：
+/// Ada/SM89 → 原生 e4m3 MMA；Ampere/SM86 → 旧 dequant 臂。
+#[test]
+fn fi_pick_uses_runtime_arch() {
+    use owl_kernels::driver::{self, Hw, OpEnv};
+
+    let env = |arch| OpEnv { hw: Hw { arch }, page: 32, head_dim: 256, grp: 6 };
+    let sm86 = env(owl_kernels::Arch::Sm86);
+    let sm89 = env(owl_kernels::Arch::Sm89);
+    let sm120 = env(owl_kernels::Arch::Sm120);
+
+    assert_eq!(
+        driver::attn::fi_prefill(&sm86, true).name,
+        owl_kernels::family::flashinfer::PREFILL_FI_FP8KV,
+        "SM86 仍走旧 e4m3→half 反量化臂"
+    );
+    assert_eq!(
+        driver::attn::fi_prefill(&sm89, true).name,
+        owl_kernels::family::flashinfer::PREFILL_FI_FP8MMA,
+        "SM89 必须选原生 e4m3 Q×KV MMA 臂"
+    );
+    assert_eq!(
+        driver::attn::fi_prefill(&sm120, true).name,
+        owl_kernels::family::flashinfer::PREFILL_FI_FP8MMA,
+        "SM120（50 系）也必须选原生 e4m3 Q×KV MMA 臂"
+    );
+    assert_eq!(
+        driver::attn::fi_prefill(&sm89, false).name,
+        owl_kernels::family::flashinfer::PREFILL_FI,
+        "非 fp8 池不受影响"
+    );
+}

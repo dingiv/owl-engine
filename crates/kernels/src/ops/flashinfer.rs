@@ -62,6 +62,57 @@ impl KernelSpec for FiPrefillFp8kv {
     };
 }
 
+/// `flashinfer_prefill_paged_fp8mma` —— **40 系原生 FP8 MMA** paged prefill。
+///
+/// 与 `FiPrefillFp8kv` 参数表/池声明/形状族逐字相同；区别只在入口：
+/// driver 在 `Arch::Sm89` 上选本臂（Q/KV 均 e4m3，走 m16n8k32 MMA），
+/// 其他代际仍选旧 `PREFILL_FI_FP8KV`。
+pub struct FiPrefillFp8mma;
+
+#[kernel_tags("dom.flashinfer", "role.attn", "phase.prefill", "kv.main.fp8")]
+impl KernelSpec for FiPrefillFp8mma {
+    const FAMILY: crate::contract::OpId = crate::contract::OpId(crate::family::flashinfer::PREFILL_FI);
+    const ENTRY: &'static str = crate::family::flashinfer::PREFILL_FI_FP8MMA;
+    const SRC: &'static str = "";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::F16, 2),
+        Param::t_in("k_cache", Dtype::U32, 1),
+        Param::t_in("v_cache", Dtype::U32, 1),
+        Param::t_in("q_cu", Dtype::U32, 1),
+        Param::t_in("indices", Dtype::U32, 1),
+        Param::t_in("indptr", Dtype::U32, 1),
+        Param::t_in("last_len", Dtype::U32, 1),
+        Param::t_in("wr", Dtype::F16, 1),
+        Param::t_out("out", Dtype::F16, 2),
+        Param::sz("total_rows"),
+        Param::sz("ctx_total"),
+        Param::sz("t"),
+        Param::sz("hq"),
+        Param::sz("hkv"),
+        Param::sz("hd"),
+        Param::sz("page"),
+        Param::s("sm_scale_bits", crate::spec::ScalarTy::F32Bits),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const POOL: &'static [crate::spec::PoolAccess] =
+        &[crate::spec::PoolAccess::read(
+            crate::spec::pools::KV_MAIN,
+            crate::spec::LayoutTag::Knhd,
+            Dtype::F8E4M3,
+        )];
+    const SHAPE: ShapeFamily = ShapeFamily {
+        kv_dtype: Some(Dtype::F8E4M3),
+        head_dim: &[256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
+    };
+}
+
+pub static PREFILL_FI_FP8MMA: KernelMeta = meta_of::<FiPrefillFp8mma>();
+
 /// `flashinfer_prefill_paged_f16` —— paged prefill(**f16 主池**;fp8kv 孪生)。
 ///
 /// 槽序与 fp8kv 版逐位同形(适配器同一 plan;只有池元素宽不同)——

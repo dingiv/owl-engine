@@ -2018,12 +2018,12 @@ fn boot_knobs_check(cfg: &EngineConfig, tp: Option<&owl_models::module::TpCtx>) 
     // ⇒ **图里没有 restore 节点、引擎又不刷表** ⇒ 回放读到上一个 plan 的
     // 调度表 ⇒ 0.8B 桶门 IMA(`q_indptr[5]` 越界)/错值。
     // 单源 = 引擎旋钮(生产两处同源于 `[dispatch]`,行为不变;测试/直连档
-    // 以后者为准)。写点必须在**图族装配之前**(boot_rank 内)。
+    // 以后者为准)。写点已移到 boot_rank 的 **env 感知之后**(见下方
+    // `kernel_cfg::apply(..., boot_arch)`)，仍早于任何 plan/图捕获。
     //
     // ⚠️ 这两项**不走 `DeviceClient`**(2026-11-01 用户裁决):那是设备能力契约,
     // 装不下"某个族的 prefill 走哪条臂"这类算子级事实 —— 摆在 trait 上只能给
     // 缺省空实现 = 静默托管。现形状 = 族自己拥有配置面,引擎装配期唯一写者。
-    crate::kernel_cfg::apply(&cfg.knobs, cfg.max_seq_tokens)?;
     // **合批档自洽门**(B5.1;2026-10-20):每会话一格 GDN + 单卡 AR 语义未审
     if cfg.knobs.max_batch > 1 {
         if tp.is_some() {
@@ -2727,6 +2727,13 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 让分页策略/scratch 与执行域 dtype 解耦(单独一刀),不在 mock 刀里扫。
         let (dims, env, fi_quant, spec) =
             boot_env_and_spec(&mut face, cfg, &rm, tp.as_ref()).await?;
+        // 族装配参数必须在 env 感知之后、任何 plan/图捕获之前下发：
+        // `fp8_native` 的唯一真值 = 运行期 `env.hw`（不是编译 feature）。
+        let boot_arch = match env.hw {
+            owl_models::env::HwEnv::Cuda(a) => Some(a),
+            owl_models::env::HwEnv::Cpu => None,
+        };
+        crate::kernel_cfg::apply(&cfg.knobs, cfg.max_seq_tokens, boot_arch)?;
         phase.mark(&mut face, "env+spec(草稿/环境)").await;
         // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
         // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 =

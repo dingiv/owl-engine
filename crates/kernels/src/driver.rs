@@ -397,8 +397,8 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.naive_nc_fp8kv" => attn::naive_nc(dt, true, req.shapes, req.scalars),
         "marlin.w4a16" => marlin::w4a16(req.shapes, dt),
         "marlin.w4a8_awq" => marlin::w4a8_awq(),
-        "attn.fi_prefill" => attn::fi_prefill(false),
-        "attn.fi_prefill_fp8kv" => attn::fi_prefill(true),
+        "attn.fi_prefill" => attn::fi_prefill(req.env, false),
+        "attn.fi_prefill_fp8kv" => attn::fi_prefill(req.env, true),
         "attn.xqa_verify" => attn::xqa_verify(),
         "attn.xqa_decode" => attn::xqa_decode(),
         "attn.xqa_prefill" => attn::xqa_prefill(),
@@ -1785,9 +1785,15 @@ pub mod attn {
     }
 
     /// FlashInfer paged prefill(foreign 家族臂;plan 缓存 + run 在家族 runtime)
-    pub fn fi_prefill(fp8kv: bool) -> KernelPick {
+    ///
+    /// **40/50 系走原生 FP8 MMA**(e4m3 Q×KV);其他代际仍走旧 dequant 臂。
+    /// 这是选核唯一出口 —— 家族 runtime 不再自行按编译 feature 猜。
+    pub fn fi_prefill(env: &OpEnv, fp8kv: bool) -> KernelPick {
+        let native_fp8 = fp8kv && matches!(env.hw.arch, crate::Arch::Sm89 | crate::Arch::Sm120);
         KernelPick {
-            name: if fp8kv {
+            name: if native_fp8 {
+                crate::family::flashinfer::PREFILL_FI_FP8MMA
+            } else if fp8kv {
                 crate::family::flashinfer::PREFILL_FI_FP8KV
             } else {
                 crate::family::flashinfer::PREFILL_FI

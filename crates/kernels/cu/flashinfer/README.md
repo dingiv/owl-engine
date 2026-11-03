@@ -58,17 +58,35 @@ prefill 核体逐字未变 ⇒ adapter **零改动**、速度中性(15/15 输出
 | `include/flashinfer/fp16.h` | **新增文件**(OWL 自有,非上游拷贝):`fp16_ieee_{to,from}_fp32_value` 的**硬件 `cvt` 版**(上游是软件位运算 + boost;device 侧十几条位运算 vs 一条 `cvt`) |
 | `attention/prefill.cuh` | ① `logits_transform` 的两处 half↔float 往返**显式给位型**(`__half_as_ushort`/`__ushort_as_half`)—— 原写法 `half` → `uint16_t` 形参走的是**数值**转换(负值饱和 0、正值取整)⇒ S 全毁;② `getNegInf<half>()` 用常量位型 `0xFC00`(原运行期转换函数不是 constexpr);③ hd≥512 vo-split 路 3 处 `half` 二义显式转 float(只影响编译面) |
 | `attention/variant_helper.cuh` | `OutputTransform` 的 `m != -inf` 在 `T_M=half` 时二义 ⇒ `float(m)` |
-| `build.rs`(非闭包) | feature 在 ⇒ 三个 TU 加 `-DFP16_QK_REDUCTION_SUPPORTED -std=c++20 --expt-relaxed-constexpr` |
+| `build.rs`(非闭包) | feature 在 ⇒ FI 各 TU 加 `-DFP16_QK_REDUCTION_SUPPORTED -std=c++20 --expt-relaxed-constexpr` |
 
 **ABI 逐字未变**(`owl_fi_prefill_plan` / `owl_fi_prefill_run` /
 `owl_fi_prefill_run_fp8kv`;15×int64 plan blob、槽序、`FI_SPLIT_KV`/`FI_DEBUG`
 旋钮全保留)⇒ Rust 侧(`family/server/探针`)**零改动**。
+
+## 40/50 系原生 FP8 MMA(2026-11-04;arch-sm89/120)
+
+`owl_fi_attention_fp8mma.cu` 是第四个 FI TU:实例化
+`BatchPrefillPagedParams<__nv_fp8_e4m3, __nv_fp8_e4m3, half>`，Q/K/V 全走
+`m16n8k32 e4m3.e4m3.f32` MMA，不再把 K/V 反量化成 half。Q 由同 TU 的
+`owl_fi_quant_f16_to_fp8` 预先量化(scale=1.0，qk-norm 后 RMS≈1)。
+
+- **选臂**:`KernelPick` 按运行期 `OpEnv.hw.arch` 选 —— Sm89/Sm120+FP8 → 原生臂，
+  其他代际 → 旧 dequant 臂；`build.rs` 只在 `single_arch() >= Arch::Sm89` 时
+  编入设备符号（sm86 不编，sm120 编）；选到 native 而二进制未编 = 结构化拒；
+- **布局约束**:沿用上游 `INVALID_FP8_MMA` —— `NUM_WARPS_Q == 1`、
+  `CTA_TILE_KV == 64`、`USE_VO_SPLIT`、float QK 累加。计划侧
+  `owl_fi_prefill_plan_fp8mma` 强制 `CTA_TILE_Q=16`；
+- **实测(4080 SUPER)**:std 1024–8192 均值 3113.4 t/s(旧 3029.8，+2.8%)，
+  32k 2844.5(旧 2379.3，+19.6%)，65k 2434.6(旧 2099.4，+16.0%)；decode 不变。
+- 全案:`docs/bench/fp8-sm89-native-mma-2026-11-04.md`。
 
 **本目录文件**
 | 文件 | 说明 |
 |---|---|
 | `include/` | 上游闭包 + owl 两个实验档的 in-tree changes(**两个宏都缺省 0 ⇒ 默认档逐字等价**;升级 = 重扫闭包 + 重放 `patches/fp16-pv-0.7.2.patch` + 对照下表) |
 | `patches/fp16-pv-0.7.2.patch` | owl 本地 FP16-PV 改动(相对上游 0.7.2.post1) |
+| `owl_fi_attention_fp8mma.cu` | 40/50 系原生 FP8 MMA(Q 量化 + e4m3 Q/KV run;arch>=sm89 编) |
 | `owl_fi_attention.cu` | owl adapter(换源记录见文件头注:plan 前置 `PrefillPlanWorkspaceSize` 尺寸校验 / `kv_dtype_bytes` / params 改逐字段赋值 / 模板加 `SAME_KV_STRIDES` / fp8 免宏) |
 | `bench/` | 候选核单测台架(不参与构建):`FI_SRC=$(cd .. && pwd) ./run.sh`(f16)/ `FP8=1 ...`(fp8 池) |
 
