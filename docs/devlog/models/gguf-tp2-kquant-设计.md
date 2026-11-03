@@ -535,6 +535,15 @@ AR 现在占 per-device 的 **20.9%**（694 ms）；norm/add 与 q8_1 量化复�
 （生产 3080 档是 sampling 档，`cand` 路径带 `half` 偏移，未见此症状；greedy 客户端
 会撞上。）
 
+**✅ 2026-11-04 当晚已修（根因 = GGUF 装载面）**：`load_gguf` 构造 `LoadOpts` 时
+漏传 `head_split` ⇒ `load_from_dir` 内的 `GgufSource` 以 `head_split=false` 打开
+⇒ `output.weight` 走 Replicate，**两 rank 都拿"全表的前半"**（形状恰好相等 ⇒
+静默错值）。所以只有 **GGUF** 档中招，AWQ 档（`shard_opts` 传了 head_split）正常。
+修法两处：`opts.head_split = self.vocab_split` + 新增"源自担分片对账门"
+（`load_group` 对 `owns_shard` 源断言 `elem_len == shape.product()`，这类漏传今后
+在装载期响亮拒）。验收：split=true 的 greedy 正常 stop，且 logits top-8 与单卡
+**逐值相同**；32-prompt 门回到 **31/29/22**（与未切档一致）。
+
 ---
 
 ## §14 AR 天花板定谳（2026-11-04；实测 + 历史证据）

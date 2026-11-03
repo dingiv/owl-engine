@@ -322,6 +322,12 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let mut opts = LoadOpts::plain(spec.dtype);
         opts.shard = self.slice.1;
         opts.slice_id = self.slice.0;
+        // **词表切必须传给装载源**(2026-11-04 修):`load_from_dir` 用它构造
+        // `GgufSource` 的 `ShardSel.head_split`;漏传 ⇒ `output.weight` 走
+        // Replicate ⇒ **两 rank 都拿全表的前半** ⇒ 拼接后高半是低半的副本,
+        // 高半 token(含 EOS)永不可达(greedy 永不 stop;立案
+        // `docs/devlog/serving/vocab-split-greedy-eos-立案.md`)。
+        opts.head_split = self.vocab_split;
         // 旋钮来自 `[load]`(配置面单源;用户裁决 2026-10-19:不读 env)
         opts.debug_tap = self.load.debug_tap;
         opts.verify = self.load.verify;

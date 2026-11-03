@@ -311,6 +311,7 @@ fn gguf_head_split_plan_and_source_match() {
         .expect("output.weight 在");
     let (mut spec0, _rep) = spec_from_gguf(full.gguf()).expect("spec");
     spec0.head_split = true;
+    let mut halves: Vec<(usize, Vec<u8>)> = Vec::new();
     for rank in 0..2 {
         let sel = ShardSel { id: rank, world: 2, head_split: true };
         let spec = spec0
@@ -345,9 +346,22 @@ fn gguf_head_split_plan_and_source_match() {
             .expect("elem_len(head)")
             .expect("output.weight 在");
         assert_eq!(head * 2, full_head, "[rank{rank}] output.weight 应为半表");
+        // **两 rank 的半表必须是不同的行窗**(2026-11-04 EOS 立案):只比长度不够 ——
+        // 若两侧交付同一窗,拼接后高半是低半的副本 ⇒ 高半 token(含 EOS)永不可达。
+        {
+            let head_elems = full_head / 2; // 半表行数(元素口径)
+            let mut first = vec![0u8; 64.min(head * 1)];
+            src.convert_chunk_into_bytes("output.weight", 0, first.len(), &mut first, Dtype::U8)
+                .expect("读首块")
+                .expect("首块在");
+            halves.push((rank, first));
+            let _ = head_elems;
+        }
         let unresolved = plan.take_unresolved();
         assert!(unresolved.is_empty(), "[rank{rank}] 计划表未解析:{unresolved:?}");
     }
+    assert_eq!(halves.len(), 2, "两 rank 都应读到 output.weight");
+    assert_ne!(halves[0].1, halves[1].1, "两 rank 的 output.weight 首块相同 —— head_split 行窗没生效!");
 }
 
 /// **开箱几何门(逐键,零 dequant)**:27B 的三个 GGUF 档(Q4_K_M / UD-IQ4_XS /

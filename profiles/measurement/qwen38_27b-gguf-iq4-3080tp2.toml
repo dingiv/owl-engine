@@ -20,9 +20,9 @@
 #                    --set spec.draft_path='"../models/syvai/Qwen3.8-27B-DFlash2-W4A16"'`
 # 数值门见 `docs/devlog/models/gguf-tp2-kquant-设计.md`(首 token 31/32、前 16 token 29/32)。
 #
-# ⚠️ `tp_vocab_split=true` + **greedy**(temperature=0) **EOS 不命中**(跑到 max_tokens):
-#    立案 `docs/devlog/serving/vocab-split-greedy-eos-立案.md`。数值门/对照实验请加
-#    `--set parallel.tp_vocab_split=false`;采样档不受影响(cand 路径带 half 偏移)。
+# 词表切档 + greedy 曾因"两 rank 拿同一半表"而 EOS 不命中(2026-11-04 已修:
+# `load_gguf` 漏传 `LoadOpts.head_split`;立案与根因见
+# `docs/devlog/serving/vocab-split-greedy-eos-立案.md`)。现 split 档 greedy 正常 stop。
 #
 # 端口纪律:双 3080 = 8135(与 `qwen38_27b-3080_tp2.toml` 同端口,同卡互斥)。
 extends = [

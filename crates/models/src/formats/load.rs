@@ -736,6 +736,20 @@ async fn load_group<D: DeviceClient, S: WeightSource + ?Sized>(
     let mut manifest = Vec::new();
     for w in group {
         let n: usize = w.shape.iter().product();
+        // **源自担分片的对账门**(2026-11-04):`owns_shard` 源会**跳过**通用分片
+        // pass(那一步本来承担"声明形状 ↔ 源区间"的贯通检查)⇒ 这里必须自己查。
+        // 抓到的第一例:`load_gguf` 漏传 `head_split` ⇒ GGUF 的 `output.weight`
+        // 两 rank 交付同一半(形状恰好相等,静默错值/EOS 不可达)。
+        if src.owns_shard() {
+            if let Some(got) = src.elem_len(&w.key)? {
+                if got != n {
+                    return Err(ModelError::Msg(format!(
+                        "键 `{}`:源交付量 {got} ≠ 声明形状 {:?} = {n}                         (源自担分片档的 shapes 贯通失守 —— 查 ShardSel/LoadOpts)",
+                        w.key, w.shape
+                    )));
+                }
+            }
+        }
         // **NVFP4 打包臂**(2026-10-28,P2):一源二槽 + host 标量 —— 产出与
         // 交付都在臂内(它一次产两个 `LoadEntry`,套不进下面"单 entry"的形状)
         if let Layout::NvFp4Weight { rows, cols } = w.layout {

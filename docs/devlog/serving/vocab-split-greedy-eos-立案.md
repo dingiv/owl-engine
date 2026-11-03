@@ -1,9 +1,12 @@
 # 词表切档 × greedy：EOS 永不命中（2026-11-04 立案）
 
+> **✅ 已结案（2026-11-04 当晚；根因 = GGUF 装载面漏传 head_split，见 §5）**
+>
 > **一句话**：`parallel.tp_vocab_split=true` 且请求走 **greedy** 时，模型永不输出
 > EOS，一直生成到 `max_tokens`；同一 prompt 关掉词表切档即正常 `stop`。
-> **影响面**：3080 生产档（`qwen38_27b-3080_tp2.toml`，`tp_vocab_split=true`）的
-> **greedy 客户端**（`temperature=0`）；sampling 档（`cand` 候选路径）未见症状。
+> **影响面**：**GGUF** 档（`load_gguf` 路径）的 greedy；AWQ 档正文（生产 3080
+> 档是 AWQ + sampling，`cand` 路径带 half 偏移）不受影响 —— 本立案的复现环境是
+> GGUF IQ4_XS TP2。
 >
 > 发现路径：GGUF TP2 prefill 排查（`gguf-tp2-kquant-设计.md` §13.5）的数值门副产品。
 
@@ -60,3 +63,32 @@
 - 切档档位要跑 greedy：加 `--set parallel.tp_vocab_split=false`（或客户端用采样）；
 - 生产 3080 档（sampling 0.7）不受影响的前提是 `cand` 路径确实带 peer 半表 ——
   建议顺手用 `/debug/agent` 复核一次 stop 行为。
+
+
+---
+
+## §5 定谳与修复（2026-11-04 当晚）
+
+**根因**：`crates/engine/src/loader.rs::load_gguf` 构造 `LoadOpts` 时**漏传
+`head_split`**（默认 false），而 `formats/load.rs` 用 `opts.head_split` 去开
+`GgufSource` 的 `ShardSel.head_split`。后果：
+
+- `role_of("output.weight")` 落 `Replicate` ⇒ 两 rank 都交付**全表的前 half 行**；
+- 目标槽宽恰好 = 半表 ⇒ 形状门不报，**静默错值**；
+- 拼接 = `[half | half]`（logits top-8 出现**成对同值**，实测 27.30/'9' 与
+  27.30/'奖惩'），高半 token（EOS 151645 恰在高半）**永不可达**。
+
+AWQ 档走 `shard_opts()`（`head_split: self.vocab_split`）所以正常 —— 这解释了
+"同引擎、AWQ 切档 greedy 能 stop、GGUF 不能"。
+
+**修复**（两处）：
+
+1. `opts.head_split = self.vocab_split;`（根因）；
+2. **源自担分片对账门**：`load_group` 对 `owns_shard` 源断言
+   `src.elem_len(key)? == w.shape.product()` —— 这类"跳过通用 pass ⇒ 无贯通检查"
+   的漏传从此在装载期**响亮拒**（错误信息点名 ShardSel/LoadOpts）。
+
+**验收**：GGUF TP2 + `tp_vocab_split=true` 的 greedy 正常 `stop`（3 tok）；
+logits top-8 与单卡（未切档）**逐值相同**；32-prompt 门 **31/32 · 29/32 · 22/32**
+（与未切档一致，修复前 24/32 token 数一致）；`tp_load_gate_gguf` 的 head_split
+门新增"两 rank 首块必须不同"断言。
