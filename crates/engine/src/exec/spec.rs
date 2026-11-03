@@ -2389,12 +2389,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 "索引几何与池不符:index (dim={dim}, hkv={kv_heads}) ≠ pool (hd={hd}, hkv={hkv})"
             )));
         }
-        // **池页格式从池实况取**(单源:`KvPageFormat::of_pool`)——
-        // f16 / fp8 e4m3 两侧同一寻址式,只差元素宽与转换律。
-        let fmt = crate::exec::kvpage::KvPageFormat::of_pool(
+        // **池页格式从池实况取**(单源:`KvPageFormat::of_pool`)。
+        // 行解码/scale 槽由 `KvPageCodec` 多态提供；调用点不写格式分支。
+        let codec = crate::exec::kvpage::KvPageFormat::of_pool(
             self.dev.pool.geom.kv_fp8,
             self.dev.pool.geom.kv_int8,
-        );
+        )
+        .codec();
+        let k_scale_elems = codec.k_scale_elems(page, hkv);
+        let k_scale_bytes = k_scale_elems * std::mem::size_of::<f32>();
         let todo: Vec<&(owl_store::ChainHash, usize, usize)> = items
             .iter()
             .filter(|(h, _, _)| {
@@ -2404,24 +2407,51 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if todo.is_empty() {
             return Ok(());
         }
-        if self.boot.cfg.knobs.index_gpu {
+        // INT8 Mean-K 暂无 GPU 块级核；走本函数的 host K+scale 回读路径。
+        // （f16/fp8 保持既有 GPU 快路。）
+        if self.boot.cfg.knobs.index_gpu && !self.dev.pool.geom.kv_int8 {
             return self.collect_index_gpu(&todo, dim, layers, kv_heads).await;
         }
         let t_index = std::time::Instant::now();
-        let page_bytes = fmt.page_bytes(page, hkv, hd);
+        let page_bytes = codec.page_bytes(page, hkv, hd);
         let per_block_bytes = layers * page_bytes;
         // 一条批命令读完 N 块 × layers 层的 K 页(片序 = 块, 层)
         let mut pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> =
             Vec::with_capacity(todo.len() * layers);
+        // INT8 的 K scale 与 K 页同序取回（普通格式槽数 = 0）。
+        let mut scale_pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> =
+            Vec::with_capacity(todo.len() * layers);
         for (_, _, phys) in &todo {
             for kv in self.dev.pool.kvs().iter().take(layers) {
                 pieces.push((&kv.k_cache.0, *phys * page_bytes, page_bytes));
+                if k_scale_bytes > 0 {
+                    let Some(int8) = kv.int8.as_ref() else {
+                        return Err(owl_iface::contract::ModelError::Msg(
+                            "INT8 索引采集缺 K scale 平面".into(),
+                        ));
+                    };
+                    scale_pieces.push((
+                        &int8.k_scale.0,
+                        *phys * k_scale_bytes,
+                        k_scale_bytes,
+                    ));
+                }
             }
         }
         let all = {
             let face = self.dev.graphs.session.face_mut();
             face.dtoh_batch(&pieces).await?
         };
+        let scale_all = if scale_pieces.is_empty() {
+            Vec::new()
+        } else {
+            let face = self.dev.graphs.session.face_mut();
+            face.dtoh_batch(&scale_pieces).await?
+        };
+        let scale_f32: Vec<f32> = scale_all
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         // **cos/sin 表在主机线程取好**(位置 = 逻辑块;`Rope` 句柄不跨线程共享)
         let ropes: Vec<Vec<(Vec<f32>, Vec<f32>)>> = todo
             .iter()
@@ -2448,7 +2478,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let results: Vec<(usize, Vec<owl_store::MeanKEntry>)> = std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(n_threads);
             for _ in 0..n_threads {
-                let (next, todo, all, ropes) = (&next, &todo, &all, &ropes);
+                let (next, todo, all, ropes, scale_f32) =
+                    (&next, &todo, &all, &ropes, &scale_f32);
                 handles.push(s.spawn(
                     move || -> Result<Vec<(usize, Vec<owl_store::MeanKEntry>)>> {
                         let mut local = Vec::new();
@@ -2462,13 +2493,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                             let mut row = vec![0.0f32; hd];
                             for li in 0..layers {
                                 let lb = &kbuf[li * page_bytes..(li + 1) * page_bytes];
+                                let sb = (i * layers + li) * k_scale_elems;
+                                let scale = crate::exec::kvpage::KvRowScale {
+                                    k: &scale_f32[sb..sb + k_scale_elems],
+                                    v: &[],
+                                };
                                 for t in 0..page {
                                     let Some((cos, sin)) = ropes[i].get(t) else { continue };
                                     if cos.is_empty() {
                                         continue; // 位置超 rope 表(与旧版 `continue` 同)
                                     }
                                     for h in 0..hkv {
-                                        fmt.decode_row(lb, t, h, hkv, hd, &mut row)?;
+                                        codec.k_row(lb, &scale, t, h, hkv, hd, &mut row)?;
                                         collector.push_post_rope_halves(li, h, &row, cos, sin)?;
                                     }
                                 }

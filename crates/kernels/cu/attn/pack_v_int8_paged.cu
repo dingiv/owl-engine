@@ -120,10 +120,14 @@ extern "C" __global__ void owl_v_append_int8_paged(
     int D,
     int page,
     float* __restrict__ vscale,         // [nb, page, Hkv]
-    uint16_t* __restrict__ vp) {        // [nb, Hkv, D, page/2]
+    uint16_t* __restrict__ vp,          // [nb, Hkv, D, page/2]
+    const __half* __restrict__ dep,     // 树序依赖边(不解引用)
+    __half* __restrict__ out) {         // 哑输出(槽序契约 4)
   const int t = blockIdx.x;
   const int h = blockIdx.y;
   const int lane = threadIdx.x & 31;
+  (void)dep;
+  (void)out;
   if (t >= T || threadIdx.x >= 32) {
     return;
   }

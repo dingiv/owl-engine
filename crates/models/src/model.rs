@@ -387,6 +387,45 @@ impl Model {
         }
     }
 
+    /// **诊断专用**:与 [`last_hidden`] **逐式同源**(含 F16 的
+    /// fused_add_rmsnorm 原地路),只在指定层后克隆残差流。返回
+    /// `(末层 hidden pre-final-norm, taps 按 tap_ids 序)`。
+    ///
+    /// 与 [`prefill_bisect`] 的区别:`prefill_bisect` 的 stage 展开走
+    /// 非融合 add+rmsnorm,会改变数值路径;本函数用于“真实生产路径”
+    /// 的层间对拍,不提供层内 stage。
+    pub fn last_hidden_taps(
+        &self,
+        ids: &TensorOps,
+        ctx: &ForwardCtx,
+        tap_ids: &[usize],
+    ) -> (TensorOps, Vec<TensorOps>) {
+        let mut taps: Vec<Option<TensorOps>> = vec![None; tap_ids.len()];
+        let mut xs = self.embed.forward(ids, ctx).tag("embed");
+        xs = self.vlm_inject(xs, ctx);
+        let (mut kvi, mut gi) = (0usize, 0usize);
+        for (li, layer) in self.layers.iter().enumerate() {
+            let sub = self.layer_ctx(ctx, kvi, gi);
+            xs = layer
+                .forward(&xs, &sub)
+                .tag(format!("L{li}.{}", if layer.is_full() { "attn" } else { "gdn" }));
+            if let Some(pos) = tap_ids.iter().position(|&t| t == li) {
+                taps[pos] = Some(xs.clone().tag(format!("tap{li}")));
+            }
+            if layer.is_full() {
+                kvi += 1;
+            } else {
+                gi += 1;
+            }
+        }
+        (
+            xs,
+            taps.into_iter()
+                .map(|t| t.expect("tap_ids 层号非法"))
+                .collect(),
+        )
+    }
+
     /// 层输出 taps 采集(E5-DF2;DFlash2 memory 面配套):层循环同构,
     /// tap_ids 层输出残差流克隆收集(sglang capture residual 同语义;
     /// tap = 树内别名节点,eval 共享前向零额外计算)。返回 (末层 hidden

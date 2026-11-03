@@ -71,6 +71,8 @@ queue_wait_ms = 0
 keepalive_ms = 1000
 # 上下文上限(token)
 max_seq = 32768
+# INT8 prefill 末块前设备栅栏（1k 质量门；false 仅 A/B/性能测量）
+int8_prefill_sync = true
 # 预填块长 / 尾块合并阈值(剩余 ≤ chunk + tail_merge ⇒ 一口气吃完)
 # 实测(2026-10-27,单 3090 / 27B AWQ / DFlash2 d7 / ctx 63456,**冷 boot 逐档**):
 #   chunk 512 / tail 512 : 4k 1320 · 8k 1308 t/s ; 32k 1173 t/s(TTFT 27.9s)
@@ -429,6 +431,7 @@ dflash_probe = false
 raw_completion = false
 prompt_dump = false
 live_diag = false
+prefill_bisect = false
 # 单步/粘滞调试门(需 --features stepgate 构建)
 step_gate = "off"
 step_gate_ms = 50

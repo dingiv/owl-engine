@@ -464,6 +464,8 @@ impl KernelSpec for VAppendInt8Paged {
         Param::i32("page"),
         Param::t_in("vscale", Dtype::F32, 1),
         Param::t_in("vp", Dtype::I8, 1),
+        // 多 token verify 逐 token 串行追加时的树序依赖边(不解引用)。
+        Param::t_in("dep", Dtype::F16, 0),
         Param::t_out("out", Dtype::F16, 1),
     ];
     const POOL: &'static [PoolAccess] = &[PoolAccess::write(

@@ -303,7 +303,7 @@ fn conv_fwd_chunked_state_matches_whole_run() {
         .expect("fatbin 载入");
     let f = module.load_function("owl_gdn_conv_fwd_f16").expect("load fn");
 
-    let (d, total) = (512usize, 991usize);
+    let (d, total) = (512usize, 1024usize);
     let x = gen(total * d, 21);
     let w = gen(d * 4, 23);
     let st0 = vec![0.0f32; d * 3];
@@ -313,8 +313,8 @@ fn conv_fwd_chunked_state_matches_whole_run() {
     let mut want_st = st0.clone();
     let want = host_ref(&x, &w, &mut want_st, total, d, true);
 
-    // 分块:461 + 461 + 69(与生产的 512 级 chunk 同数量级),state 逐块携带
-    let chunks = [461usize, 461, 69];
+    // 分块:16 × 64（1k 质量门的实际 chunk 形）,state 逐块携带
+    let chunks = [64usize; 16];
     let mut st = st0.clone();
     let mut base = 0usize;
     for (ci, &len) in chunks.iter().enumerate() {
@@ -329,7 +329,7 @@ fn conv_fwd_chunked_state_matches_whole_run() {
         base += len;
     }
     check_f32("chunked 串联终态", &st, &want_st);
-    eprintln!("N1 判据 2 绿:3 段串联(461+461+69)与整段 991 一致,终态一致");
+    eprintln!("N1 判据 2 绿:16×64 串联与整段 1024 一致,终态一致");
 }
 
 // ---------------------------------------------------------------------------

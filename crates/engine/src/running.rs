@@ -78,6 +78,8 @@ pub struct StepProbes {
     pub kv_dump_at: Option<usize>,
     /// 解释器活性收尾归因打印(原 `OWL_LIVE_DIAG`)
     pub live_diag: bool,
+    /// 层间 prefill bisect(诊断;只回读 token 512 行)
+    pub prefill_bisect: bool,
     // 2026-10-27 配置面剪枝:一次性排障旗标(ck/mfact/view-hash/propose-eager/
     // dflash-*/gdn_dbg/pf_fence/B 轴六件)已随 `[probes]` 一起退役。
 }
@@ -103,6 +105,7 @@ impl StepProbes {
                 owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP").filter(|v| *v > 0)
             }),
             live_diag: p.live_diag,
+            prefill_bisect: p.prefill_bisect,
         }
     }
 }

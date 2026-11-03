@@ -75,6 +75,8 @@ pub struct EngineKnobs {
     pub draft: DraftCfg,
     /// 前缀缓存(缺省开;原 OWL_PREFIX_CACHE≠"0")
     pub prefix_cache: bool,
+    /// INT8 prefill 末块前设备栅栏（缺省 true；false 仅 A/B）
+    pub int8_prefill_sync: bool,
     /// **整枝塌缩**(`[kvmem].bulk_drop_when_tier_full`;缺省 false = 保守)。
     pub bulk_drop_when_tier_full: bool,
     /// **前缀无感删除(图像段)**(`[pool].image_evict`;缺省关)。
@@ -363,6 +365,7 @@ impl Default for EngineKnobs {
             pool_tokens: None,
             draft: DraftCfg::default(),
             prefix_cache: true,
+            int8_prefill_sync: true,
             bulk_drop_when_tier_full: false,
             image_evict: false,
             image_evict_pad: "。".to_string(),
@@ -725,6 +728,7 @@ impl EngineKnobs {
                 tp_draft: cfg.spec.tp_draft,
             },
             prefix_cache: cfg.pool.prefix_cache,
+            int8_prefill_sync: cfg.runtime.int8_prefill_sync,
             bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
             image_evict: cfg.pool.image_evict,
             image_evict_pad: cfg.pool.image_evict_pad.clone(),
@@ -1728,9 +1732,12 @@ pub(crate) fn into_running<D: DeviceClient>(
         }
         if !dev.pool.geom.paged {
             return Err(ModelError::Msg(format!(
-                "[pool] image_evict = true 需要 f16 或 fp8-e4m3 分页 KV 池\
-                 (paged={} kv_fp8={} dtype={:?})",
-                dev.pool.geom.paged, dev.pool.geom.kv_fp8, dev.pool.geom.dims.dtype
+                "[pool] image_evict = true 需要分页 KV 池（f16/fp8-e4m3/int8）\
+                 (paged={} kv_fp8={} kv_int8={} dtype={:?})",
+                dev.pool.geom.paged,
+                dev.pool.geom.kv_fp8,
+                dev.pool.geom.kv_int8,
+                dev.pool.geom.dims.dtype
             )));
         }
         // **pad 词校验**(模型敏感项,必须恰 1 token):空串 = 运行时自动挑;
@@ -1755,7 +1762,13 @@ pub(crate) fn into_running<D: DeviceClient>(
         owl_shared::log_info!(
             "boot",
             "前缀无感删除:开({} 池;leave-gap 保留位置洞、不改 K;可删图像段页对齐 pad = {:?};页 {} tok)",
-            if dev.pool.geom.kv_fp8 { "fp8-e4m3" } else { "f16" },
+            if dev.pool.geom.kv_int8 {
+                "int8"
+            } else if dev.pool.geom.kv_fp8 {
+                "fp8-e4m3"
+            } else {
+                "f16"
+            },
             if cfg.knobs.image_evict_pad.is_empty() { "(自动)" } else { cfg.knobs.image_evict_pad.as_str() },
             dev.pool.geom.page
         );
@@ -2394,27 +2407,27 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
                 dims.hd, env.kv.page, env.kv.paged
             )));
         }
-        if cfg.knobs.draft.depth != 0 {
-            return Err(ModelError::Msg(format!(
-                "[pool] kv_int8 暂不支持投机解码(spec.depth={}):verify 核未接线",
-                cfg.knobs.draft.depth
-            )));
-        }
+        // verify 已接线（2026-11-03 P1）：INT8 复用
+        // owl_int8_decode_gqa_tc_split + owl_int8_decode_reduce（B=T，256 片，
+        // f32 partial/stat），T=depth+1 行各自一条 bt8 页链/逐行 lens；
+        // 不再拒绝 spec。
         if cfg.knobs.env.attn.force_naive_prefill {
             return Err(ModelError::Msg(
                 "[pool] kv_int8 不支持 force_naive_prefill(naive 路径按 f16/fp8 池寻址)".into(),
             ));
         }
-        if cfg.knobs.index_probe
-            || cfg.knobs.coverage_probe
-            || cfg.knobs.select_decode
-            || cfg.knobs.select_partial
-            || cfg.knobs.image_evict
-        {
-            return Err(ModelError::Msg(
-                "[pool] kv_int8 暂不支持 index/coverage/select/image_evict(这些面按 f16/fp8 K 页解码)".into(),
-            ));
-        }
+        // index/coverage 的 host 回读、select_decode 的页表/视图、select_partial
+        // 的稀疏 prefill、image_evict 的页链搬移都已走格式多态
+        // （KvPageCodec / pool_layout 四件套）。select_partial 的稠密 prefill
+        // 另有一条 INT8 专属路径：块表必须按 chunk 从会话链重建，不能读
+        // turn 起点写死的 `bt_leaf`（见 prefill_chunk::dense_int8_bt_values）。
+        // 2026-11-04 结案：INT8 视觉/`image_evict` 的失败不是 m-RoPE/
+        // 页搬移/W4A8 批形状，而是与非末块 KV/GDN 写相关的漏 event。
+        // `prefill_chunk_enqueue` 在 INT8 末块前加一次 sync 后：
+        //   - 无 evict：grounding 36/36、slope 0.9989/0.9995、hit@16px 100%；
+        //   - 带 `owl_evict`：36/36、slope 0.9981/0.9990、hit@16px 100%。
+        // 因此不再对 INT8 + image_evict 单独拒启；页链搬移走既有
+        // KvPageCodec/pool_layout 多态。
         owl_shared::log_info!(
             "boot",
             "KV 池 int8(K int8 [nb,page,hkv,hd] / V packed b16 / Kscale per-token / Vscale per-page;无 V shadow)"

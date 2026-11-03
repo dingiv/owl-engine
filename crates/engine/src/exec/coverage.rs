@@ -1295,7 +1295,13 @@ impl<D: DeviceClient> RunningEngine<D> {
     async fn probe_view_page_hash(&mut self, page_id: usize, tag: &str) -> Result<u64> {
         let d = &self.dev.pool.geom.dims;
         let page = self.dev.pool.geom.page.max(1);
-        let esize = if self.dev.pool.geom.kv_fp8 { 1 } else { d.dtype.size_bytes() };
+        // INT8 的 K/V 都是 1B/elem（V 是 b16 成对打包，按元素仍 1B）；
+        // 沿用 f16 的 2B 会把页偏移算成两倍 ⇒ 探针取页直接越界。
+        let esize = if self.dev.pool.geom.kv_fp8 || self.dev.pool.geom.kv_int8 {
+            1
+        } else {
+            d.dtype.size_bytes()
+        };
         let n = d.hkv * d.hd * esize * page;
         let caches = self.dev.pool.kv_caches();
         let face = self.dev.graphs.session.face_mut();
@@ -2107,48 +2113,75 @@ impl<D: DeviceClient> RunningEngine<D> {
     ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
         let mut k_post: Vec<Vec<f32>> = vec![vec![0.0f32; ctx_tokens * hkv * hd]; layers];
         let t_mass = std::time::Instant::now();
-        // **池页格式从池实况取**(单源;f16 / fp8 e4m3 同一寻址式)
-        let fmt = crate::exec::kvpage::KvPageFormat::of_pool(
+        // 格式/行解码走 `KvPageCodec` 多态；K 与 V 的布局差异封在 codec 内。
+        let codec = crate::exec::kvpage::KvPageFormat::of_pool(
             self.dev.pool.geom.kv_fp8,
             self.dev.pool.geom.kv_int8,
-        );
-        let _ = fmt.elem_bytes(); // 元素宽已由 KvPageFormat 内部用(此处只留显式读口)
-        let page_bytes = fmt.page_bytes(page, hkv, hd);
-        // V 面(方案 A/B 的**输出级对照**要用;同段同布局,Layout = [token][head][dim])
+        )
+        .codec();
+        let k_scale_elems = codec.k_scale_elems(page, hkv);
+        let v_scale_elems = codec.v_scale_elems(page, hkv);
+        let k_scale_bytes = k_scale_elems * std::mem::size_of::<f32>();
+        let v_scale_bytes = v_scale_elems * std::mem::size_of::<f32>();
+        let page_bytes = codec.page_bytes(page, hkv, hd);
         let mut v_post: Vec<Vec<f32>> = if want_scheme {
             vec![vec![0.0f32; ctx_tokens * hkv * hd]; layers]
         } else {
-        Vec::new()
+            Vec::new()
         };
-        // **一条批量命令**读完所有 (层, 页) 的 K(与可选 V)—— 原实现每 (层,页)
-        // 一次同步 `dtoh_at`:27B/8192 tok = 16×256 = 4096 次往返/边界 ⇒ 20s+ 边界,
-        // 65 个边界就把一次 27B prefill 拖成 20 分钟(实测"像卡死")。
         let host_skipped = bt
-        .iter()
-        .take(n_blocks)
-        .filter(|p| owl_store::is_host_placeholder(**p))
-        .count();
+            .iter()
+            .take(n_blocks)
+            .filter(|p| owl_store::is_host_placeholder(**p))
+            .count();
         let mut pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> = Vec::new();
+        let mut scale_pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> = Vec::new();
         for kv in self.dev.pool.kvs().iter().take(layers) {
-            for (lb, phys) in bt.iter().take(n_blocks).enumerate() {
-                let _ = lb;
+            for (_, phys) in bt.iter().take(n_blocks).enumerate() {
                 if owl_store::is_host_placeholder(*phys) {
                     continue;
                 }
-            let off = (*phys as usize) * page_bytes;
-            pieces.push((&kv.k_cache.0, off, page_bytes));
-            if want_scheme {
-                pieces.push((&kv.v_cache.0, off, page_bytes));
+                let off = (*phys as usize) * page_bytes;
+                pieces.push((&kv.k_cache.0, off, page_bytes));
+                if want_scheme {
+                    pieces.push((&kv.v_cache.0, off, page_bytes));
+                }
+                if k_scale_bytes > 0 {
+                    let Some(int8) = kv.int8.as_ref() else {
+                        return Err(owl_iface::contract::ModelError::Msg(
+                            "覆盖率回读:INT8 池缺 K scale 平面".into(),
+                        ));
+                    };
+                    let soff = (*phys as usize) * k_scale_bytes;
+                    scale_pieces.push((&int8.k_scale.0, soff, k_scale_bytes));
+                    if want_scheme {
+                        let Some(int8) = kv.int8.as_ref() else {
+                            return Err(owl_iface::contract::ModelError::Msg(
+                                "覆盖率回读:INT8 池缺 V scale 平面".into(),
+                            ));
+                        };
+                        let soff = (*phys as usize) * v_scale_bytes;
+                        scale_pieces.push((&int8.v_scale.0, soff, v_scale_bytes));
+                    }
+                }
             }
-        }
         }
         let all = {
             let face = self.dev.graphs.session.face_mut();
             face.dtoh_batch(&pieces).await?
         };
-        // 按同一顺序切回(每块 K(+V));`host_skipped` 早已在收集时跳过 ⇒ 顺序自洽
-        let per_page = if want_scheme { page_bytes * 2 } else { page_bytes };
+        let scale_all = if scale_pieces.is_empty() {
+            Vec::new()
+        } else {
+            let face = self.dev.graphs.session.face_mut();
+            face.dtoh_batch(&scale_pieces).await?
+        };
+        let scale_f32: Vec<f32> = scale_all
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         let mut cursor = 0usize;
+        let mut scale_cursor = 0usize;
         for (li, _kv) in self.dev.pool.kvs().iter().enumerate().take(layers) {
             let dst = &mut k_post[li];
             let mut vdst = if want_scheme { v_post.get_mut(li) } else { None };
@@ -2156,38 +2189,48 @@ impl<D: DeviceClient> RunningEngine<D> {
                 if owl_store::is_host_placeholder(*phys) {
                     continue;
                 }
-            let kbuf = &all[cursor..cursor + page_bytes];
-            cursor += page_bytes;
-            let vbuf = if want_scheme {
-                let b = &all[cursor..cursor + page_bytes];
+                let _ = lb;
+                let kbuf = &all[cursor..cursor + page_bytes];
                 cursor += page_bytes;
-                Some(b)
-            } else {
-            None
-        };
-        let _ = per_page;
-        // 页内序 = [token][head][dim](knhd_offset 单源);
-        // 元素→f32 走 `KvPageFormat`(f16 / fp8 e4m3 两支)
-        let mut krow = vec![0.0f32; hd];
-        let mut vrow = vec![0.0f32; hd];
-        for p in 0..page {
-            let tok = lb * page + p;
-            for h in 0..hkv {
-                let off = (tok * hkv + h) * hd;
-                fmt.decode_row(kbuf, p, h, hkv, hd, &mut krow)?;
-                dst[off..off + hd].copy_from_slice(&krow);
-                if let (Some(v), Some(vb)) = (vdst.as_deref_mut(), vbuf) {
-                    fmt.decode_row(vb, p, h, hkv, hd, &mut vrow)?;
-                    v[off..off + hd].copy_from_slice(&vrow);
+                let vbuf = if want_scheme {
+                    let b = &all[cursor..cursor + page_bytes];
+                    cursor += page_bytes;
+                    Some(b)
+                } else {
+                    None
+                };
+                let (ks, vs) = if want_scheme {
+                    let k = &scale_f32[scale_cursor..scale_cursor + k_scale_elems];
+                    scale_cursor += k_scale_elems;
+                    let v = &scale_f32[scale_cursor..scale_cursor + v_scale_elems];
+                    scale_cursor += v_scale_elems;
+                    (k, v)
+                } else {
+                    let k = &scale_f32[scale_cursor..scale_cursor + k_scale_elems];
+                    scale_cursor += k_scale_elems;
+                    (k, &[][..])
+                };
+                let scale = crate::exec::kvpage::KvRowScale { k: ks, v: vs };
+                let mut krow = vec![0.0f32; hd];
+                let mut vrow = vec![0.0f32; hd];
+                for p in 0..page {
+                    let tok = lb * page + p;
+                    for h in 0..hkv {
+                        let off = (tok * hkv + h) * hd;
+                        codec.k_row(kbuf, &scale, p, h, hkv, hd, &mut krow)?;
+                        dst[off..off + hd].copy_from_slice(&krow);
+                        if let (Some(v), Some(vb)) = (vdst.as_deref_mut(), vbuf) {
+                            codec.v_row(vb, &scale, p, h, hkv, hd, &mut vrow)?;
+                            v[off..off + hd].copy_from_slice(&vrow);
+                        }
+                    }
                 }
-        }
-        }
-        }
+            }
         }
         if host_skipped > 0 {
             owl_shared::log_info!(
-            "cov-probe",
-            "覆盖率读数口径:{host_skipped}/{n_blocks} 块在宿主(部分驻留)⇒ 真实质量/方案对照只覆盖设备驻留子集"
+                "cov-probe",
+                "覆盖率读数口径:{host_skipped}/{n_blocks} 块在宿主(部分驻留)⇒ 真实质量/方案对照只覆盖设备驻留子集"
             );
         }
         self.sel.note_mass(t_mass.elapsed().as_secs_f64() * 1000.0);

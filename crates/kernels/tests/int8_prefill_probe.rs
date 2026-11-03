@@ -594,3 +594,343 @@ fn int8_prefill_f16pv_correctness_small() {
     assert!(cos > 0.9999, "cos {cos}");
     assert!(mx < 2e-2, "max|d| {mx}");
 }
+
+/// 长单块 T=L=1024：只对最后 16 行做 host 对照。用来钉住
+/// “多 q block + 尾部 16 行”的口径（1k prompt / 图像 prompt 的实测形态）。
+#[test]
+fn int8_prefill_1024_tail_rows_match_host() {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    const T: usize = 1024;
+    const L: usize = 1024;
+    const PAGE: usize = 32;
+    const NB: usize = L.div_ceil(PAGE);
+    let mut res = fi_support::TestRes::new(dev);
+    let mut exec = Exec::new();
+    let mut r = Runner {
+        res: &mut res,
+        exec: &mut exec,
+        registry: None,
+    };
+
+    let q = lcg_u8(T * HQ * D, 0x1111)
+        .iter()
+        .map(|&x| (x as i8) as u8)
+        .collect::<Vec<u8>>();
+    let qs = lcg_f32(T * HQ * 8, 0x2222, 0.004, 0.004);
+    let k = lcg_u8(L * HKV * D, 0x3333)
+        .iter()
+        .map(|&x| (x as i8) as u8)
+        .collect::<Vec<u8>>();
+    let ks = lcg_f32(L * HKV * 8, 0x4444, 0.004, 0.004);
+    let v = lcg_u8(L * HKV * D, 0x5555)
+        .iter()
+        .map(|&x| (x as i8) as u8)
+        .collect::<Vec<u8>>();
+    let vs = lcg_f32(L * HKV, 0x6666, 0.005, 0.005);
+    let pp = PAGE / 2;
+    let mut vp = vec![0u8; NB * HKV * D * pp * 2];
+    for pg in 0..NB {
+        for h in 0..HKV {
+            for d in 0..D {
+                for pair in 0..pp {
+                    let key0 = pg * PAGE + pair * 2;
+                    let key1 = key0 + 1;
+                    if key1 >= L {
+                        continue;
+                    }
+                    let a = v[(key0 * HKV + h) * D + d];
+                    let b = v[(key1 * HKV + h) * D + d];
+                    let off = (((pg * HKV + h) * D + d) * pp + pair) * 2;
+                    vp[off] = a;
+                    vp[off + 1] = b;
+                }
+            }
+        }
+    }
+    let bt: Vec<f32> = (0..NB as u32).map(|x| x as f32).collect();
+    let btb: Vec<u8> = bt.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let qsb: Vec<u8> = qs.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let ksb: Vec<u8> = ks.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let vsb: Vec<u8> = vs.iter().flat_map(|x| x.to_le_bytes()).collect();
+
+    let dq = r.alloc(q.len(), "lt.q").unwrap();
+    let dqs = r.alloc(qsb.len(), "lt.qs").unwrap();
+    let dk = r.alloc(k.len(), "lt.k").unwrap();
+    let dks = r.alloc(ksb.len(), "lt.ks").unwrap();
+    let dvp = r.alloc(vp.len(), "lt.vp").unwrap();
+    let dvs = r.alloc(vsb.len(), "lt.vs").unwrap();
+    let dbt = r.alloc(btb.len(), "lt.bt").unwrap();
+    let mut out = vec![0u8; T * HQ * D * 2];
+    let dout = r.alloc(out.len(), "lt.out").unwrap();
+    r.upload(dq, &q).unwrap();
+    r.upload(dqs, &qsb).unwrap();
+    r.upload(dk, &k).unwrap();
+    r.upload(dks, &ksb).unwrap();
+    r.upload(dvp, &vp).unwrap();
+    r.upload(dvs, &vsb).unwrap();
+    r.upload(dbt, &btb).unwrap();
+
+    let vals = [
+        LaunchVal::Ptr(dq.ptr),
+        LaunchVal::Ptr(dqs.ptr),
+        LaunchVal::Ptr(dk.ptr),
+        LaunchVal::Ptr(dks.ptr),
+        LaunchVal::Ptr(dvp.ptr),
+        LaunchVal::Ptr(dvs.ptr),
+        LaunchVal::Ptr(dbt.ptr),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::I32(T as i32),
+        LaunchVal::I32(L as i32),
+        LaunchVal::I32(HQ as i32),
+        LaunchVal::I32(HKV as i32),
+        LaunchVal::I32(PAGE as i32),
+        LaunchVal::I32(0),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::Ptr(dout.ptr),
+    ];
+    r.launch_aot(
+        ENTRY,
+        SRC,
+        (T.div_ceil(64) as u32, HQ as u32, 1),
+        (128, 1, 1),
+        SMEM,
+        &vals,
+    )
+    .unwrap();
+    r.sync().unwrap();
+    r.download(CheckBuf { ptr: dout.ptr, bytes: out.len() }, &mut out).unwrap();
+    let got: Vec<f32> = out
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+
+    let mut dot = 0f64;
+    let mut na = 0f64;
+    let mut nb = 0f64;
+    let mut mx = 0f32;
+    for t in (T - 16)..T {
+        for qh in 0..HQ {
+            let kh = qh / (HQ / HKV);
+            let mut p = vec![0f32; L];
+            let mut max = f32::NEG_INFINITY;
+            for key in 0..L {
+                if key > t {
+                    p[key] = f32::NEG_INFINITY;
+                    continue;
+                }
+                let mut s = 0f32;
+                for d in 0..D {
+                    let qsc = qs[(t * HQ + qh) * 8 + d / 32];
+                    let ksc = ks[(key * HKV + kh) * 8 + d / 32];
+                    s += (q[(t * HQ + qh) * D + d] as i8 as f32 * qsc)
+                        * (k[(key * HKV + kh) * D + d] as i8 as f32 * ksc);
+                }
+                let s = s * 0.0625f32;
+                p[key] = s;
+                max = max.max(s);
+            }
+            let mut sum = 0f32;
+            for key in 0..L {
+                if p[key] > f32::NEG_INFINITY {
+                    p[key] = (p[key] - max).exp();
+                    sum += p[key];
+                } else {
+                    p[key] = 0.0;
+                }
+            }
+            let inv = 1.0 / sum;
+            for d in 0..D {
+                let mut a = 0f32;
+                for key in 0..L {
+                    let vsc = vs[key * HKV + kh];
+                    a += p[key] * (v[(key * HKV + kh) * D + d] as i8 as f32 * vsc);
+                }
+                let want = a * inv;
+                let g = got[(t * HQ + qh) * D + d];
+                dot += g as f64 * want as f64;
+                na += g as f64 * g as f64;
+                nb += want as f64 * want as f64;
+                mx = mx.max((g - want).abs());
+            }
+        }
+    }
+    let cos = dot / (na.sqrt() * nb.sqrt() + 1e-30);
+    println!("[int8-1024tail] cos={cos:.9} max|d|={mx:.6}");
+    assert!(cos > 0.9999, "cos {cos}");
+    assert!(mx < 2e-2, "max|d| {mx}");
+}
+
+/// chunk 形态：T=69 / L=1093 / base_pos=1024（图像 prompt 被 1024 切块的尾块）。
+/// 只对块内最后 5 行（全局 1088..1092）做 host 对照。
+#[test]
+fn int8_prefill_chunk_tail_rows_match_host() {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    const TC: usize = 69;
+    const L: usize = 1093;
+    const BASE: usize = 1024;
+    const PAGE: usize = 32;
+    const NB: usize = L.div_ceil(PAGE);
+    let mut res = fi_support::TestRes::new(dev);
+    let mut exec = Exec::new();
+    let mut r = Runner {
+        res: &mut res,
+        exec: &mut exec,
+        registry: None,
+    };
+
+    let q_all = lcg_u8(L * HQ * D, 0x1111)
+        .iter()
+        .map(|&x| (x as i8) as u8)
+        .collect::<Vec<u8>>();
+    let q = q_all[BASE * HQ * D..(BASE + TC) * HQ * D].to_vec();
+    let qs_all = lcg_f32(L * HQ * 8, 0x2222, 0.004, 0.004);
+    let qs = qs_all[BASE * HQ * 8..(BASE + TC) * HQ * 8].to_vec();
+    let k = lcg_u8(L * HKV * D, 0x3333)
+        .iter()
+        .map(|&x| (x as i8) as u8)
+        .collect::<Vec<u8>>();
+    let ks = lcg_f32(L * HKV * 8, 0x4444, 0.004, 0.004);
+    let v = lcg_u8(L * HKV * D, 0x5555)
+        .iter()
+        .map(|&x| (x as i8) as u8)
+        .collect::<Vec<u8>>();
+    let vs = lcg_f32(L * HKV, 0x6666, 0.005, 0.005);
+    let pp = PAGE / 2;
+    let mut vp = vec![0u8; NB * HKV * D * pp * 2];
+    for pg in 0..NB {
+        for h in 0..HKV {
+            for d in 0..D {
+                for pair in 0..pp {
+                    let key0 = pg * PAGE + pair * 2;
+                    let key1 = key0 + 1;
+                    if key1 >= L {
+                        continue;
+                    }
+                    let a = v[(key0 * HKV + h) * D + d];
+                    let b = v[(key1 * HKV + h) * D + d];
+                    let off = (((pg * HKV + h) * D + d) * pp + pair) * 2;
+                    vp[off] = a;
+                    vp[off + 1] = b;
+                }
+            }
+        }
+    }
+    let bt: Vec<f32> = (0..NB as u32).map(|x| x as f32).collect();
+    let btb: Vec<u8> = bt.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let qsb: Vec<u8> = qs.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let ksb: Vec<u8> = ks.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let vsb: Vec<u8> = vs.iter().flat_map(|x| x.to_le_bytes()).collect();
+
+    let dq = r.alloc(q.len(), "ct.q").unwrap();
+    let dqs = r.alloc(qsb.len(), "ct.qs").unwrap();
+    let dk = r.alloc(k.len(), "ct.k").unwrap();
+    let dks = r.alloc(ksb.len(), "ct.ks").unwrap();
+    let dvp = r.alloc(vp.len(), "ct.vp").unwrap();
+    let dvs = r.alloc(vsb.len(), "ct.vs").unwrap();
+    let dbt = r.alloc(btb.len(), "ct.bt").unwrap();
+    let mut out = vec![0u8; TC * HQ * D * 2];
+    let dout = r.alloc(out.len(), "ct.out").unwrap();
+    r.upload(dq, &q).unwrap();
+    r.upload(dqs, &qsb).unwrap();
+    r.upload(dk, &k).unwrap();
+    r.upload(dks, &ksb).unwrap();
+    r.upload(dvp, &vp).unwrap();
+    r.upload(dvs, &vsb).unwrap();
+    r.upload(dbt, &btb).unwrap();
+
+    let vals = [
+        LaunchVal::Ptr(dq.ptr),
+        LaunchVal::Ptr(dqs.ptr),
+        LaunchVal::Ptr(dk.ptr),
+        LaunchVal::Ptr(dks.ptr),
+        LaunchVal::Ptr(dvp.ptr),
+        LaunchVal::Ptr(dvs.ptr),
+        LaunchVal::Ptr(dbt.ptr),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::I32(TC as i32),
+        LaunchVal::I32(L as i32),
+        LaunchVal::I32(HQ as i32),
+        LaunchVal::I32(HKV as i32),
+        LaunchVal::I32(PAGE as i32),
+        LaunchVal::I32(BASE as i32),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::Ptr(dout.ptr),
+    ];
+    r.launch_aot(
+        ENTRY,
+        SRC,
+        (TC.div_ceil(64) as u32, HQ as u32, 1),
+        (128, 1, 1),
+        SMEM,
+        &vals,
+    )
+    .unwrap();
+    r.sync().unwrap();
+    r.download(CheckBuf { ptr: dout.ptr, bytes: out.len() }, &mut out).unwrap();
+    let got: Vec<f32> = out
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+
+    let mut dot = 0f64;
+    let mut na = 0f64;
+    let mut nb = 0f64;
+    let mut mx = 0f32;
+    for gt in (L - 5)..L {
+        let ct = gt - BASE;
+        for qh in 0..HQ {
+            let kh = qh / (HQ / HKV);
+            let mut p = vec![0f32; L];
+            let mut max = f32::NEG_INFINITY;
+            for key in 0..L {
+                if key > gt {
+                    p[key] = f32::NEG_INFINITY;
+                    continue;
+                }
+                let mut s = 0f32;
+                for d in 0..D {
+                    let qsc = qs[(ct * HQ + qh) * 8 + d / 32];
+                    let ksc = ks[(key * HKV + kh) * 8 + d / 32];
+                    s += (q[(ct * HQ + qh) * D + d] as i8 as f32 * qsc)
+                        * (k[(key * HKV + kh) * D + d] as i8 as f32 * ksc);
+                }
+                let s = s * 0.0625f32;
+                p[key] = s;
+                max = max.max(s);
+            }
+            let mut sum = 0f32;
+            for key in 0..L {
+                if p[key] > f32::NEG_INFINITY {
+                    p[key] = (p[key] - max).exp();
+                    sum += p[key];
+                } else {
+                    p[key] = 0.0;
+                }
+            }
+            let inv = 1.0 / sum;
+            for d in 0..D {
+                let mut a = 0f32;
+                for key in 0..L {
+                    let vsc = vs[key * HKV + kh];
+                    a += p[key] * (v[(key * HKV + kh) * D + d] as i8 as f32 * vsc);
+                }
+                let want = a * inv;
+                let g = got[(ct * HQ + qh) * D + d];
+                dot += g as f64 * want as f64;
+                na += g as f64 * g as f64;
+                nb += want as f64 * want as f64;
+                mx = mx.max((g - want).abs());
+            }
+        }
+    }
+    let cos = dot / (na.sqrt() * nb.sqrt() + 1e-30);
+    println!("[int8-chunktail] cos={cos:.9} max|d|={mx:.6}");
+    assert!(cos > 0.9999, "cos {cos}");
+    assert!(mx < 2e-2, "max|d| {mx}");
+}
