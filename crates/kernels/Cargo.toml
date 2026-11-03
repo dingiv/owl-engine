@@ -101,3 +101,5 @@ half = { version = "2", optional = true }
 # tags.toml → KernelTag / KERNEL_TAGS 生成（构建期一次；不污染 lib 依赖面）
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 serde = { version = "1", features = ["derive"] }
+# `triton/gdn_chunked_aot.json::extra_shapes` 读标签（2026-11-04:TP 形状）
+serde_json = "1"

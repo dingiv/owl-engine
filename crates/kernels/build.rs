@@ -403,7 +403,7 @@ fn compile_fatbin(
 fn build_native_cubins(
     out_dir: &std::path::Path,
     xqa_rows: &[(&'static str, PathBuf)],
-    gdn_rows: &[(&'static str, PathBuf)],
+    gdn_rows: &[(String, PathBuf)],
 ) {
     let manifest_path = out_dir.join("cubin_assets.rs");
     // ⚠️ 必须在**两条分支之外**发这条指令:指令只在 build.rs 真的跑过那次才被
@@ -545,7 +545,7 @@ fn build_native_cubins(
             mix(&b);
         }
     }
-    for (_, bin) in xqa_rows.iter().chain(gdn_rows.iter()) {
+    for (_, bin) in xqa_rows.iter().map(|(n, p)| (*n, p)).chain(gdn_rows.iter().map(|(n, p)| (n.as_str(), p))) {
         if let Ok(b) = std::fs::read(bin) {
             mix(&b);
         }
@@ -678,8 +678,25 @@ fn build_xqa_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
 // 旋钮:`GDN_TRITON_PY`(解释器;缺省探工作区 `vllm-test/.venv`)、
 //      `GDN_TRITON_DEVICE`(warmup 取 target 的设备,缺省 cuda:0)。
 // ============================================================================
-fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
+fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(String, PathBuf)> {
     const NAMES: &[&str] = &["cumsum", "kkt", "merge", "wu", "h", "o"];
+    // **额外形状**(`triton/gdn_chunked_aot.json::extra_shapes`;2026-11-04):
+    // TP 档的 GDN 头按 rank 切半(nk=8/nv=24)⇒ 六核的 constexpr 形状变了,
+    // 必须按同配置再编一套;产物名 = `<核>_<tag>.cubin`。
+    let cfg_txt = std::fs::read_to_string("triton/gdn_chunked_aot.json")
+        .expect("读 triton/gdn_chunked_aot.json");
+    let cfg: serde_json::Value = serde_json::from_str(&cfg_txt).expect("解析 gdn_chunked_aot.json");
+    let extra_tags: Vec<String> = cfg
+        .get("extra_shapes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|e| {
+                    e.get("tag").and_then(|t| t.as_str()).expect("extra_shapes[].tag 必填").to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     // ⚠️ 三条 env 指令必须**无条件**发(cargo 只在 build.rs 真跑过那次才记住它):
     // 写在 early-return 之后 = 缺省构建从不登记 ⇒ 之后设 env 不会触发重跑
     // (实测踩过 OWL_CUBIN_SKIP 同款坑)
@@ -746,6 +763,10 @@ fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
         for n in NAMES {
             let p = dir.join(format!("{n}.cubin"));
             assert!(p.exists(), "gdn-aot: 自编未产出 {n}.cubin");
+            for tag in &extra_tags {
+                let tp = dir.join(format!("{n}_{tag}.cubin"));
+                assert!(tp.exists(), "gdn-aot: 自编未产出 {n}_{tag}.cubin(extra_shapes)");
+            }
         }
         stamp_write(&probe, &deps, &flags);
         println!(
@@ -754,17 +775,23 @@ fn build_gdn_assets(out_dir: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
     } else {
         println!("cargo:warning=owl-kernels: GDN chunked 六核 AOT 增量命中(零 triton)");
     }
-    NAMES
+    let mut rows: Vec<(String, PathBuf)> = NAMES
         .iter()
-        .map(|n| (*n, dir.join(format!("{n}.cubin"))))
-        .collect()
+        .map(|n| ((*n).to_string(), dir.join(format!("{n}.cubin"))))
+        .collect();
+    for tag in &extra_tags {
+        for n in NAMES {
+            rows.push((format!("{n}_{tag}"), dir.join(format!("{n}_{tag}.cubin"))));
+        }
+    }
+    rows
 }
 
 /// `OWL_CUBIN_SKIP` 档的空登记表(纯 NVRTC 基线对照;同一文件形态免分支)
 const EMPTY_ASSETS_RS: &str = "// @generated (OWL_CUBIN_SKIP)\npub const CUBIN_ARCHS: &[&str] = &[];\n\npub struct CubinAsset {\n    pub id: &'static str,\n    pub module: &'static str,\n    pub src_hash: u64,\n    pub bytes: &'static [u8],\n}\n\npub const CUBIN_ASSETS: &[CubinAsset] = &[];\n\npub const XQA_ASSETS: &[(&str, &[u8])] = &[];\n\npub fn xqa_asset(_name: &str) -> Option<&'static [u8]> {\n    None\n}\n\npub const GDN_ASSETS: &[(&str, &[u8])] = &[];\n\npub fn gdn_asset(_name: &str) -> Option<&'static [u8]> {\n    None\n}\n";
 
 /// 生成 GDN chunked 资产表(opt-in 自编;空表 = 用入库采集件)
-fn gdn_table_src(rows: &[(&'static str, PathBuf)]) -> String {
+fn gdn_table_src(rows: &[(String, PathBuf)]) -> String {
     let mut t = String::from(
         "/// GDN chunked 六核(opt-in `GDN_TRITON_BUILD=1` 构建期 AOT 自编;空 = 用入库采集件)\n\
          pub const GDN_ASSETS: &[(&str, &[u8])] = &[\n",

@@ -722,6 +722,7 @@ dependencies = [
  "owl-shared",
  "rayon",
  "serde",
+ "serde_json",
  "toml",
 ]
 

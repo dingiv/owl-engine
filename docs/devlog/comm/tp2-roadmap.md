@@ -9,6 +9,11 @@
 
 ## 0. 现状一句话(2026-10-19,全部本轮实测)
 
+> **2026-11-04 补记**:GDN chunked 臂原先按**全模型形状**硬编(`nk=16/nv=48`),
+> TP2 档因此掉进串行 recurrence(实测 per-device 453ms vs 132ms)。已按
+> `nk=8/nv=24` 再编一套 AOT(六核,`extra_shapes`),GGUF TP2 prefill
+> 1.455→**1.589×**(+9.8%)。详见 `docs/devlog/models/gguf-tp2-kquant-设计.md` §13。
+
 ```
 prefill:TP2 1489.5 t/s / TP1 973.7 t/s = **1.530×**(AR 占 18.3%)
 decode :TP2   45.1 t/s / TP1  33.6 t/s = **1.342×**

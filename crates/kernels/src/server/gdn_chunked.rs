@@ -94,7 +94,11 @@ fn ensure_one(
 /// 家族 runtime(FamilyRuntime;注册于 backends::ops M4 切换面)
 #[derive(Default)]
 pub struct GdnChunkedRuntime {
+    /// 主形状(nk=16/nv=48)六核
     fns: HashMap<&'static str, Arc<CudaFunction>>,
+    /// **TP2 形状**(nk=8/nv=24)六核 —— FLA 核把 NK/NV 烘 constexpr,TP 档的头
+    /// 按 rank 切半 ⇒ 必须是另一套 cubin(2026-11-04;`cubins::TP_TAG`)。
+    fns_tp: HashMap<&'static str, Arc<CudaFunction>>,
     scratch: Scratch,
 }
 
@@ -128,6 +132,21 @@ impl KernelFamily for GdnChunkedRuntime {
         ];
         let missing: Vec<&str> =
             table.iter().filter(|(_, b, _)| b.is_none()).map(|(n, _, _)| *n).collect();
+        let missing_tp: Vec<&str> = table
+            .iter()
+            .filter(|(n, _, _)| cubins::for_shape(n, true).is_none())
+            .map(|(n, _, _)| *n)
+            .collect();
+        if !missing_tp.is_empty() {
+            return Err(OpError::Asset {
+                op: OP.0.to_string(),
+                detail: format!(
+                    "gdn_chunked TP 形状资产缺失 {missing_tp:?}(tag = {:?})—— 构建期 \
+                     `extra_shapes` 未编?见 triton/gdn_chunked_aot.json",
+                    cubins::TP_TAG
+                ),
+            });
+        }
         if !missing.is_empty() {
             return Err(OpError::Asset {
                 op: OP.0.to_string(),
@@ -143,6 +162,10 @@ impl KernelFamily for GdnChunkedRuntime {
             let bytes = bytes.expect("上方已查缺失");
             let f = exec.load_cubin(res, ASSET, bytes, symbol, OP)?;
             me.fns.insert(name, f);
+            // TP2 形状同一符号名进第二张表(run 期按调用形状选表)
+            let btp = cubins::for_shape(name, true).expect("上方已查缺失");
+            let ftp = exec.load_cubin(res, ASSET, btp, symbol, OP)?;
+            me.fns_tp.insert(name, ftp);
         }
         // 构建期资产(源哈希查表;`cu/owl/cast.cu` + `cu/owl/state_transpose.cu`
         // 都已在 include_str! 闭包内)。源按入口名取自算子自托管面(R5);
@@ -170,6 +193,8 @@ impl KernelFamily for GdnChunkedRuntime {
             ("o", LC::O_SHARED),
         ] {
             Exec::set_shared_limit(me.fns.get(name).expect("刚装载"), sz)?;
+            // TP 形状的 smem 与主形状同值(编译期 `shared` 严格校验;见 AOT 脚本)
+            Exec::set_shared_limit(me.fns_tp.get(name).expect("刚装载"), sz)?;
         }
         Ok(FamilyGuard::boxed(me))
     }
@@ -188,12 +213,23 @@ impl KernelFamily for GdnChunkedRuntime {
         // 拆借:res / exec / self 字段三方独立可变借
         let Self {
             fns,
+            fns_tp,
             scratch: st,
         } = self;
+        // **形状选表**(2026-11-04):FLA 六核把 NK/NV 烘成 constexpr ⇒ TP2 档
+        // (nk=8/nv=24)必须用 `_nk8nv24` 那套(numerics 与原形状同源,只是
+        // 头数不同)。其它形状沿用主套。
+        let tp = (nk, hv) == (8, 24);
         let f = |name: &str| -> Result<Arc<CudaFunction>, OpError> {
-            fns.get(name).cloned().ok_or_else(|| OpError::Asset {
+            // 先查形状表(TP 档 = 六核的另一套 cubin),再回落主表 ——
+            // cast / state_transpose 等**形状无关**的符号只装在主表。
+            // `&*` = 每次调用重新借用(`&mut` 被移动进闭包会 E0382)。
+            let primary: &HashMap<&'static str, Arc<CudaFunction>> = &*fns;
+            let shaped_map: &HashMap<&'static str, Arc<CudaFunction>> = &*fns_tp;
+            let hit = shaped_map.get(name).filter(|_| tp).or_else(|| primary.get(name));
+            hit.cloned().ok_or_else(|| OpError::Asset {
                 op: OP.0.to_string(),
-                detail: format!("符号 {name} 未装载"),
+                detail: format!("符号 {name} 未装载(shape tp={tp})"),
             })
         };
 

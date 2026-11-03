@@ -113,35 +113,60 @@ pub mod asset {
 
 pub mod cubins {
     #[cfg(feature = "device")]
-    fn asset(name: &'static str) -> Option<&'static [u8]> {
+    fn asset(name: &str) -> Option<&'static [u8]> {
         crate::family::cubins::gdn_asset(name)
     }
     #[cfg(not(feature = "device"))]
-    fn asset(_name: &'static str) -> Option<&'static [u8]> {
+    fn asset(_name: &str) -> Option<&'static [u8]> {
         None
     }
 
     pub fn cumsum() -> Option<&'static [u8]> {
-        asset("cumsum")
+        shaped("cumsum", false)
     }
     pub fn kkt() -> Option<&'static [u8]> {
-        asset("kkt")
+        shaped("kkt", false)
     }
     pub fn wu() -> Option<&'static [u8]> {
-        asset("wu")
+        shaped("wu", false)
     }
     pub fn h() -> Option<&'static [u8]> {
-        asset("h")
+        shaped("h", false)
     }
     pub fn o() -> Option<&'static [u8]> {
-        asset("o")
+        shaped("o", false)
     }
     /// solve_tril(BT=64)单核形态:merge_16x16_to_64x64_inverse
     pub fn merge() -> Option<&'static [u8]> {
-        asset("merge")
+        shaped("merge", false)
     }
     /// 六核清单(装配期报告/缺件报错用)
     pub const NAMES: &[&str] = &["cumsum", "kkt", "merge", "wu", "h", "o"];
+
+    /// **TP2 形状标签**(`triton/gdn_chunked_aot.json::extra_shapes[].tag`)。
+    ///
+    /// 为什么需要:六核把 `NK/NV` 烘成 constexpr(见模块头 ABI);TP 档 spec 按
+    /// rank 切头(`nk=8/nv=24`)⇒ 必须另有一套 cubin。标签是两边(BUILD 产物名
+    /// 与运行期查表)的**同一字面量**;仓库单测 `bt_matches_aot_config` 邻位
+    /// 钉住"表里有这条 tag"。
+    pub const TP_TAG: &str = "nk8nv24";
+
+    /// 按 `(nk, nv)` 取资产:TP2 形状 → `_<TP_TAG>` 后缀件;其余 → 主形状件。
+    /// 返回 `None` = 该核/该形状缺失(装配期响亮拒)。
+    fn shaped(name: &str, tp: bool) -> Option<&'static [u8]> {
+        if tp {
+            // 单一真源 = `TP_TAG`(配置表 + 产物名 + 查表三处同一条标签);
+            // 每次装配只调用 6 次,格式化开销可忽略。
+            asset(&format!("{name}_{TP_TAG}"))
+        } else {
+            asset(name)
+        }
+    }
+
+    /// 六核取件(含形状):`tp = (nk, nv) == (8, 24)`(TP2 27B 档)
+    pub fn for_shape(name: &'static str, tp: bool) -> Option<&'static [u8]> {
+        shaped(name, tp)
+    }
 
     /// 发射常量(2026-10-11 fork-bf16 重采集:torch profiler 实测指纹,
     /// 采集于 T=1024/NK16/NV48/KD=VD=128/g-f32 配方;变体 = autotune 选中)
@@ -174,6 +199,33 @@ mod table_layout_tests {
         const CFG: &str = include_str!("../../triton/gdn_chunked_aot.json");
         let want = format!("\"BT\": {}", super::BT);
         assert!(CFG.contains(&want), "AOT 配置里找不到 {want}(BT 漂移?)");
+    }
+
+    /// **TP 形状锁**(2026-11-04):`TP_TAG` 必须真实出现在 AOT 配置的
+    /// `extra_shapes` 里 —— 否则构建期不会产出 `_<tag>` 后缀件,而运行期
+    /// 查表会静默落 None(装配期拒启)。
+    #[test]
+    fn tp_tag_matches_aot_config() {
+        const CFG: &str = include_str!("../../triton/gdn_chunked_aot.json");
+        let want = format!("\"tag\": \"{}\"", super::cubins::TP_TAG);
+        assert!(CFG.contains(&want), "AOT 配置 extra_shapes 里找不到 {want}(TP 标签漂移?)");
+    }
+
+    /// **TP 形状六核齐全**(构建期真编过才判;`GDN_TRITON_BUILD=0`/`OWL_CUBIN_SKIP`
+    /// 的空表档跳过 —— 那两档整族装配期本就拒启)。
+    #[test]
+    fn tp_shape_assets_present() {
+        if super::cubins::cumsum().is_none() {
+            eprintln!("(skip)构建期未编 gdn 资产");
+            return;
+        }
+        for n in super::cubins::NAMES {
+            assert!(
+                super::cubins::for_shape(n, true).is_some(),
+                "TP 形状缺核 {n}(tag = {})",
+                super::cubins::TP_TAG
+            );
+        }
     }
 
     /// 表布局自洽:cu/coff/idx 的偏移与内容长度严格对应

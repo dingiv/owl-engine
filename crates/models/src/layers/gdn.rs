@@ -577,11 +577,27 @@ impl GatedDeltaNet {
         // 两条臂分派(同一条不变式:装载后的权重序 ≡ 喂进去的激活序):
         // · **量化臂**:折进激活量化核(零额外发射)= 本表;
         // · **原生臂**:源侧装载期做**元素面**列置换(`ColVHead`)⇒ 无需表。
+        //
+        // **分片档(2026-11-03)**:本 rank 的列序 = 分片几何的产物:
+        // · `atom | hv`(32 块量子 / 原生)⇒ grouped 连续窗口 ⇒ **不需要**表;
+        // · `atom > hv`(K/I 超块,如 256 > 128)⇒ 装载按原子序聚合 ⇒ **必须**
+        //   要 per-rank 表(源侧同名虚拟键按同层 `ssm_out` 型生成)。
+        // 判据用 `out_proj` 自己的计划型(**逐层**;27B 的 ssm_out 逐层混
+        // Q5_K/Q4_K/IQ4_XS/Q3_K),不靠全局常量猜。
+        //
         // 表长与量化核的块数同口径(`in_dim / 32`);若 `hv_dim % 32 != 0`
-        // (置换单元与量化块错位)则由源侧 `vhead_q8_blocks` **响亮拒**(不静默)。
+        // (置换单元与量化块错位)则由源侧 `vhead_q8_blocks*` **响亮拒**(不静默)。
         let out_plan = p.of("out_proj", hidden, value_dim);
         let mut out_proj = Linear::new("out_proj", hidden, value_dim, out_plan);
-        if facts.vhead_tiled_columns && nk != nv && matches!(out_plan, QuantPlan::Gguf(_)) {
+        let atom = match out_plan {
+            QuantPlan::Gguf(ty) => Some(ty.block().0),
+            _ => None,
+        };
+        // 单卡:文件列序 = tiled ⇒ 恒需表;分片:仅原子跨头时才需
+        let need_col_perm = facts.vhead_tiled_columns
+            && nk != nv
+            && atom.is_some_and(|a| !facts.tp_rank_shard || a > hv_dim);
+        if need_col_perm {
             out_proj.set_gguf_col_index(Weight::new_typed_u32(
                 "ssm_out_perm",
                 vec![value_dim / 32],
@@ -801,10 +817,15 @@ impl GatedDeltaNet {
             b.push(g.clone());
             b.push(beta.clone());
         }
-        // 形状守卫(2026-10-09 语义崩案):chunked cubin 烘 constexpr
-        // NV=48/KD=VD=128(BT=64),scalar cubin d 仅支持 128 —— 形状不配
-        // 的档位(0.8B NV=16)强制回落 varlen,防核静默写飞
-        let chunked_shape_ok = self.nv == 48 && self.nk == 16 && self.hk_dim == 128 && self.hv_dim == 128;
+        // 形状守卫(2026-10-09 语义崩案;2026-11-04 加 TP2 形状):chunked cubin
+        // 把 NK/NV 烘成 constexpr,故只认**已编形状白名单**:
+        //   · 主形状 (nk,nv) = (16, 48)   —— 单卡 27B;
+        //   · **TP2 形状 (8, 24)**        —— TP2 档每 rank 切半(AOT `extra_shapes`);
+        // KD=VD=128 / BT=64 两形状共用。其它形状(0.8B 16/16、4B 16/32)继续
+        // 回落 varlen —— 防核按错形状静默写飞(错值而非崩)。
+        let chunked_shape_ok = self.hk_dim == 128
+            && self.hv_dim == 128
+            && matches!((self.nk, self.nv), (16, 48) | (8, 24));
         let scalar_shape_ok = self.hk_dim == 128 && self.hv_dim == 128;
         // 槽号真值(A13 定谳,2026-10-14):chunked/scalar 两臂的状态寻址
         // 吃 **host 标量** —— 它必须由调用方注入;缺了就是「把本会话的

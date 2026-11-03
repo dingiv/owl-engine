@@ -29,7 +29,8 @@ Triton 核的编译选项空间是 **autotune 选出来的**,不是从源码唯�
     #   不发射,`CompiledKernel` 的设备句柄是惰性的(不 launch 就不 _init_handles)
     # --device cuda:N    = 用真实设备取 target(排障/对照)
 
-产物:`<目录>/{cumsum,kkt,merge,wu,h,o}.cubin` + 同名 `.json`(本次编译选项)。
+产物:`<目录>/{cumsum,kkt,merge,wu,h,o}.cubin`(主形状)+ 配置表 `extra_shapes`
+里每个形状一套 `{核}_{tag}.cubin`(如 TP2 `nk8nv24`);同名 `.json` 记本次编译选项。
 
 # 判据
 
@@ -127,8 +128,6 @@ def main() -> int:
     with open(CFG_PATH) as f:
         CFG = json.load(f)
     KCFG = CFG["kernels"]
-    sh = CFG["shape"]
-    NK, NV, KD, VD, T, BT = sh["NK"], sh["NV"], sh["KD"], sh["VD"], sh["T"], sh["BT"]
 
     # 张量簿记用 **CPU torch**(`uv sync` 装的是 CPU 轮子,见 pyproject.toml):
     # FLA 的 wrapper 会做 `len()`/`.to()`/`torch.empty_like()` 等真张量操作,
@@ -210,105 +209,141 @@ def main() -> int:
             wy_fast,
         )
 
-    # dtype 配方 = 引擎实参(family/gdn_chunked.rs + server 的 cast-in 链):
-    #   handler 先 owl_cast_f16_bf16 把 f16 输入转 **bf16**,再喂 Triton 核
-    #   ⇒ 激活域 = bf16;g / g_cum / A / state(h0,ht) = f32
-    #   (资产侧 `origin` 亦记 "bf16+g_f32";harvest 脚本里的 DT=f16 是历史残留)
-    def z(*shape, dtype="bf16"):
-        return torch.zeros(*shape, dtype=DTYPES[dtype])  # CPU;值无关(warmup 只取 dtype/shape)
+    def z_factory(torch, T, NK, NV, KD, VD, BT):
+        DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                  "fp32": torch.float32, "i64": torch.int64}
 
-    # stub 实参(**按名**给,不用位置元组 —— 位置元组极易与闭包的取值下标错位,
-    # 实测踩过:kkt 的 beta/g 互换 ⇒ 内核拿到 f16 的 g ⇒ exp 的 fp32 检查炸)。
-    # dtype 配方 = family/gdn_chunked.rs ABI 注记:
-    #   q/k/v/beta = f16;g / g_cum / A / h 缓冲 / h0 = **f32**(核内 exp/log 只吃 fp32)
-    S = {
-        "q": z(1, T, NK, KD),
-        "k": z(1, T, NK, KD),
-        "v": z(1, T, NV, VD),
-        "beta": z(1, T, NV),
-        "g32": z(1, T, NV, dtype="fp32"),
-        "A32": z(1, T, NV, BT, dtype="fp32"),
-        "Ai": z(1, T, NV, BT),
-        "w": z(1, T, NV, KD),
-        "u": z(1, T, NV, VD),
-        "h32": z(T // BT, NV, KD, VD),          # h_buf:bf16(引擎 h_buf 2B/元素)
-        "h0": z(1, NV, KD, VD, dtype="fp32"),
-        "cu": z(2, dtype="i64"),
-        "ci": z(T // BT, 2, dtype="i64"),
+        def z(*shape, dtype="bf16"):
+            return torch.zeros(*shape, dtype=DTYPES[dtype])
+
+        return z
+
+    # **pristine 符号快照**(多形状循环的前提):`_install` 会把模块符号换成
+    # 编译代理;第二个形状若不从这里取原件,就会拿到"代理的代理"
+    # ⇒ `'_WarmupProxy' object has no attribute 'warmup'`(实测)。
+    ORIG = {
+        "cumsum": getattr(cumsum, "chunk_local_cumsum_scalar_kernel"),
+        "kkt": getattr(chunk_scaled_dot_kkt, "chunk_scaled_dot_kkt_fwd_kernel"),
+        "merge": getattr(solve_tril, "merge_16x16_to_64x64_inverse_kernel"),
+        "wu": getattr(wy_fast, "recompute_w_u_fwd_kernel"),
+        "h": getattr(chunk_delta_h, "chunk_gated_delta_rule_fwd_kernel_h_blockdim64"),
+        "o": getattr(chunk_o, "chunk_fwd_kernel_o"),
     }
+    # **JITFunction 快照**:`_install` 会把 `Heuristics.fn` 换成代理 ⇒ 第二个
+    # 形状再从 `ORIG` 解引用就拿到"代理的代理"(`'_WarmupProxy' object has no
+    # attribute 'warmup'`)。故在循环前把真身固定下来。
+    JIT = {k: _jit_of(v) for k, v in ORIG.items()}
 
-    def call_cumsum(proxy, original):
-        _install(cumsum, "chunk_local_cumsum_scalar_kernel", original, proxy)
-        # 引擎:raw g(f16 镜像)→ cast f32 → cumsum → g_cum(f32)
-        return cumsum.chunk_local_cumsum_scalar(
-            S["g32"], chunk_size=BT, cu_seqlens=S["cu"], chunk_indices=S["ci"])
+    def emit(tag: str, sh: dict) -> int:
+        NK, NV, KD, VD, T, BT = sh["NK"], sh["NV"], sh["KD"], sh["VD"], sh["T"], sh["BT"]
+        z = z_factory(torch, T, NK, NV, KD, VD, BT)
+        # dtype 配方 = 引擎实参(family/gdn_chunked.rs + server 的 cast-in 链):
+        #   handler 先 owl_cast_f16_bf16 把 f16 输入转 **bf16**,再喂 Triton 核
+        #   ⇒ 激活域 = bf16;g / g_cum / A / state(h0,ht) = f32
+        #   (资产侧 `origin` 亦记 "bf16+g_f32";harvest 脚本里的 DT=f16 是历史残留)
 
-    def call_kkt(proxy, original):
-        _install(chunk_scaled_dot_kkt, "chunk_scaled_dot_kkt_fwd_kernel", original, proxy)
-        return chunk_scaled_dot_kkt.chunk_scaled_dot_kkt_fwd(
-            k=S["k"], beta=S["beta"], g=S["g32"], cu_seqlens=S["cu"],
-            chunk_indices=S["ci"], output_dtype=torch.float32)
+        # stub 实参(**按名**给,不用位置元组 —— 位置元组极易与闭包的取值下标错位,
+        # 实测踩过:kkt 的 beta/g 互换 ⇒ 内核拿到 f16 的 g ⇒ exp 的 fp32 检查炸)。
+        # dtype 配方 = family/gdn_chunked.rs ABI 注记:
+        #   q/k/v/beta = f16;g / g_cum / A / h 缓冲 / h0 = **f32**(核内 exp/log 只吃 fp32)
+        S = {
+            "q": z(1, T, NK, KD),
+            "k": z(1, T, NK, KD),
+            "v": z(1, T, NV, VD),
+            "beta": z(1, T, NV),
+            "g32": z(1, T, NV, dtype="fp32"),
+            "A32": z(1, T, NV, BT, dtype="fp32"),
+            "Ai": z(1, T, NV, BT),
+            "w": z(1, T, NV, KD),
+            "u": z(1, T, NV, VD),
+            "h32": z(T // BT, NV, KD, VD),          # h_buf:bf16(引擎 h_buf 2B/元素)
+            "h0": z(1, NV, KD, VD, dtype="fp32"),
+            "cu": z(2, dtype="i64"),
+            "ci": z(T // BT, 2, dtype="i64"),
+        }
 
-    def call_merge(proxy, original):
-        _install(solve_tril, "merge_16x16_to_64x64_inverse_kernel", original, proxy)
-        return solve_tril.solve_tril(A=S["A32"], cu_seqlens=S["cu"],
-                                     chunk_indices=S["ci"], output_dtype=torch.bfloat16)
+        def call_cumsum(proxy, original):
+            _install(cumsum, "chunk_local_cumsum_scalar_kernel", original, proxy)
+            # 引擎:raw g(f16 镜像)→ cast f32 → cumsum → g_cum(f32)
+            return cumsum.chunk_local_cumsum_scalar(
+                S["g32"], chunk_size=BT, cu_seqlens=S["cu"], chunk_indices=S["ci"])
 
-    def call_wu(proxy, original):
-        _install(wy_fast, "recompute_w_u_fwd_kernel", original, proxy)
-        return wy_fast.recompute_w_u_fwd(
-            k=S["k"], v=S["v"], beta=S["beta"], A=S["Ai"], g_cumsum=S["g32"],
-            cu_seqlens=S["cu"], chunk_indices=S["ci"])
+        def call_kkt(proxy, original):
+            _install(chunk_scaled_dot_kkt, "chunk_scaled_dot_kkt_fwd_kernel", original, proxy)
+            return chunk_scaled_dot_kkt.chunk_scaled_dot_kkt_fwd(
+                k=S["k"], beta=S["beta"], g=S["g32"], cu_seqlens=S["cu"],
+                chunk_indices=S["ci"], output_dtype=torch.float32)
 
-    def call_h(proxy, original):
-        _install(chunk_delta_h, "chunk_gated_delta_rule_fwd_kernel_h_blockdim64", original, proxy)
-        return chunk_delta_h.chunk_gated_delta_rule_fwd_h(
-            k=S["k"], w=S["w"], u=S["u"], g=S["g32"], initial_state=S["h0"],
-            output_final_state=True, cu_seqlens=S["cu"], chunk_indices=S["ci"])
+        def call_merge(proxy, original):
+            _install(solve_tril, "merge_16x16_to_64x64_inverse_kernel", original, proxy)
+            return solve_tril.solve_tril(A=S["A32"], cu_seqlens=S["cu"],
+                                         chunk_indices=S["ci"], output_dtype=torch.bfloat16)
 
-    def call_o(proxy, original):
-        _install(chunk_o, "chunk_fwd_kernel_o", original, proxy)
-        return chunk_o.chunk_fwd_o(q=S["q"], k=S["k"], v=S["v"], h=S["h32"], g=S["g32"],
-                                   scale=KD**-0.5, cu_seqlens=S["cu"], chunk_indices=S["ci"])
+        def call_wu(proxy, original):
+            _install(wy_fast, "recompute_w_u_fwd_kernel", original, proxy)
+            return wy_fast.recompute_w_u_fwd(
+                k=S["k"], v=S["v"], beta=S["beta"], A=S["Ai"], g_cumsum=S["g32"],
+                cu_seqlens=S["cu"], chunk_indices=S["ci"])
 
-    specs = [
-        ("cumsum", cumsum, "chunk_local_cumsum_scalar_kernel", call_cumsum),
-        ("kkt", chunk_scaled_dot_kkt, "chunk_scaled_dot_kkt_fwd_kernel", call_kkt),
-        ("merge", solve_tril, "merge_16x16_to_64x64_inverse_kernel", call_merge),
-        ("wu", wy_fast, "recompute_w_u_fwd_kernel", call_wu),
-        ("h", chunk_delta_h, "chunk_gated_delta_rule_fwd_kernel_h_blockdim64", call_h),
-        ("o", chunk_o, "chunk_fwd_kernel_o", call_o),
-    ]
+        def call_h(proxy, original):
+            _install(chunk_delta_h, "chunk_gated_delta_rule_fwd_kernel_h_blockdim64", original, proxy)
+            return chunk_delta_h.chunk_gated_delta_rule_fwd_h(
+                k=S["k"], w=S["w"], u=S["u"], g=S["g32"], initial_state=S["h0"],
+                output_final_state=True, cu_seqlens=S["cu"], chunk_indices=S["ci"])
 
-    print(f"[aot] 形状 T={T} NK={NK} NV={NV} KD={KD} VD={VD} BT={BT} dev={dev}")
-    for asset, mod, sym, call in specs:
-        cfg = KCFG[asset]
-        w, st, kw = cfg["num_warps"], cfg["num_stages"], cfg.get("kwargs", {})
-        original = getattr(mod, sym)
-        pristine = _jit_of(original)
-        proxy = _WarmupProxy(pristine, w, st, kw)
-        call(proxy, original)
-        shared = getattr(proxy.compiled.metadata, "shared", None)
-        # `shared` 期望值分代际:表里的 `shared` = **采集代际(sm_86)** 的值;
-        # 其它代际可写 `shared_by_arch`(键 = SM 数字形)。两者都没收录的代际
-        # **只警告不拒**:表不是在该代际采集的,拿 86 的数去否 120 的产物是
-        # 假判据(源/配置漂移才是本检查要抓的东西)。
-        want = cfg.get("shared_by_arch", {}).get(str(_sm), cfg["shared"])
-        if shared != want:
-            if str(_sm) in cfg.get("shared_by_arch", {}):
-                print(f"[aot] ❌ {asset}: 编译产物 shared={shared} ≠ sm_{_sm} 表值 {want}"
-                      f"(配置 {kw} w{w} s{st})—— 源/配置漂移,拒用", file=sys.stderr)
-                return 1
-            print(f"[aot] ⚠ {asset}: shared={shared}(sm_{_sm})≠ sm_86 表值 {want}"
-                  f"—— 该代际未收录(不是漂移);如要钉住请写入 shared_by_arch.\"{_sm}\"",
-                  file=sys.stderr)
-        else:
-            print(f"[aot] ✓ {asset}: w{w} s{st} {kw} shared={shared}(= 表值)")
-        cubin = proxy.compiled.asm["cubin"]
-        dst = os.path.join(args.out, f"{asset}.cubin")
-        with open(dst, "wb") as f:
-            f.write(cubin)
-        print(f"[aot] → {dst} {len(cubin)}B")
+        def call_o(proxy, original):
+            _install(chunk_o, "chunk_fwd_kernel_o", original, proxy)
+            return chunk_o.chunk_fwd_o(q=S["q"], k=S["k"], v=S["v"], h=S["h32"], g=S["g32"],
+                                       scale=KD**-0.5, cu_seqlens=S["cu"], chunk_indices=S["ci"])
+
+        specs = [
+            ("cumsum", cumsum, "chunk_local_cumsum_scalar_kernel", call_cumsum),
+            ("kkt", chunk_scaled_dot_kkt, "chunk_scaled_dot_kkt_fwd_kernel", call_kkt),
+            ("merge", solve_tril, "merge_16x16_to_64x64_inverse_kernel", call_merge),
+            ("wu", wy_fast, "recompute_w_u_fwd_kernel", call_wu),
+            ("h", chunk_delta_h, "chunk_gated_delta_rule_fwd_kernel_h_blockdim64", call_h),
+            ("o", chunk_o, "chunk_fwd_kernel_o", call_o),
+        ]
+
+        print(f"[aot] 形状 tag={tag or 'primary'} T={T} NK={NK} NV={NV} KD={KD} VD={VD} BT={BT} dev={dev}")
+        suffix = f"_{tag}" if tag else ""
+        for asset, mod, sym, call in specs:
+            cfg = KCFG[asset]
+            w, st, kw = cfg["num_warps"], cfg["num_stages"], cfg.get("kwargs", {})
+            original = ORIG[asset]
+            pristine = JIT[asset]
+            proxy = _WarmupProxy(pristine, w, st, kw)
+            call(proxy, original)
+            shared = getattr(proxy.compiled.metadata, "shared", None)
+            # `shared` 期望值分代际:表里的 `shared` = **采集代际(sm_86)** 的值;
+            # 其它代际可写 `shared_by_arch`(键 = SM 数字形)。两者都没收录的代际
+            # **只警告不拒**:表不是在该代际采集的,拿 86 的数去否 120 的产物是
+            # 假判据(源/配置漂移才是本检查要抓的东西)。
+            want = cfg.get("shared_by_arch", {}).get(str(_sm), cfg["shared"])
+            if shared != want:
+                # 主形状沿用旧语义;`extra_shapes`(tag 非空)一律严格 ——
+                # 运行期 `set_shared_limit` 用的是主形状常量,smem 变大会越界。
+                if tag or str(_sm) in cfg.get("shared_by_arch", {}):
+                    print(f"[aot] ❌ {asset}: 编译产物 shared={shared} ≠ sm_{_sm} 表值 {want}"
+                          f"(配置 {kw} w{w} s{st})—— 源/配置漂移,拒用", file=sys.stderr)
+                    return 1
+                print(f"[aot] ⚠ {asset}: shared={shared}(sm_{_sm})≠ sm_86 表值 {want}"
+                      f"—— 该代际未收录(不是漂移);如要钉住请写入 shared_by_arch.\"{_sm}\"",
+                      file=sys.stderr)
+            else:
+                print(f"[aot] ✓ {asset}: w{w} s{st} {kw} shared={shared}(= 表值)")
+            cubin = proxy.compiled.asm["cubin"]
+            dst = os.path.join(args.out, f"{asset}{suffix}.cubin")
+            with open(dst, "wb") as f:
+                f.write(cubin)
+            print(f"[aot] → {dst} {len(cubin)}B")
+        return 0
+
+    shapes = [("", CFG["shape"])] + [(e["tag"], e) for e in CFG.get("extra_shapes", [])]
+    for tag, sh in shapes:
+        rc = emit(tag, sh)
+        if rc != 0:
+            return rc
     return 0
 
 
