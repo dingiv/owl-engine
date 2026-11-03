@@ -987,8 +987,12 @@ impl Attention {
             .with_shape(Dtype::F16, vec![1]);
         let bt_stride = kv.block_tables.shape().last().copied().unwrap_or(1).max(1);
         // KV 页按 nparts 分片并行;partial = (未归一化 acc, m, l),reduce 合并。
-        // 单序列 decode 用 256 片(65k 时仍 8 页/片);批 decode 降到 64 片省 scratch。
-        let nparts: usize = if tokens == 1 { 256 } else { 64 };
+        // 单序列 decode 用 56 片:4 kv_head × 56 = 224 blocks,~2.7 wave,
+        // 每片约 37 页(65k);256 片的 reduce 税在 65k 达 0.1ms/层,
+        // 且短 ctx 空 block 过多。56 片在 8k~140k 全档最优或近最优
+        // (2026-11-04 3090 Ti 扫档;u8s8 split+reduce 65k 683→543us)。
+        // 批 decode 仍 64 片,避免 scratch 按 56 重排。
+        let nparts: usize = if tokens == 1 { 56 } else { 64 };
         let partial_out = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * self.hd]);
         let partial_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2]);
         // GQA 头合并 + tensor-core QK/PV:一个 block 服务同 KV head 的 grp 个
