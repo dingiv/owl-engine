@@ -2162,3 +2162,39 @@ decode 账(65k,7 步):step 25.54ms/token;Marlin 16.54ms(64.7%),
 INT8 decode attention+reduce 3.39ms(13.3%),其余 ~22%。
 decode 也是 Marlin-bound;P8 decode 无收益,因为 attention 是
 KV 带宽/布局 bound,不是 P 字节 bound。
+
+### 0.20.10 decode 下滑的 nparts/occupancy 探针(负结果,2026-11-03)
+
+目标:把 INT8 decode 对 FP8 的 ~4% 下滑拉回来。先做两项不改布局的尝试。
+
+#### (1) nparts sweep(65k,T=1)
+
+`int8_decode_gqa_tc_split + reduce`,3 次总时:
+
+| nparts | split | split+reduce | 每 token 折算 |
+|---:|---:|---:|---:|
+| 32 | 668 µs | 690 µs | 230 µs |
+| 64 | 716 µs | 738 µs | 246 µs |
+| 128 | 608 µs | **659 µs** | **220 µs** |
+| 256 | 572 µs | 682 µs | 227 µs |
+
+128 比 256 约 −3% attention。但端到端 100k W4A8 decode
+(3 次中位)为 **36.70 t/s vs 36.38 t/s**,没有可靠收益,已回退到 256。
+
+#### (2) 双缓冲 / 4 CTA occupancy
+
+- 双缓冲 K/V/scale:shared 26→43KB,CTA 从 3 降到 2;
+  nparts=32 从 690→668µs,但旧版 128 已是 659µs,**没有净赢**。
+- 把 `s_score` 与 `s_p24` 共用 1KB,加 `__launch_bounds__(256,4)`,
+  做到 64 regs / 25,088B / 4 CTA。但 4 CTA 需要 ~100KB shared
+  carveout,**L1 被挤没**,split 从 0.6ms 崩到 **2.9ms**;已回退。
+  3 CTA 版本(76 regs)回到 0.6~0.7ms,与基线持平/略慢,也未保留。
+
+#### 判决
+
+- decode 下滑不是 nparts 或 occupancy 能解决的:
+  attention 仅 3.39ms / 25.54ms step(13.3%),且是 **KV 带宽/布局 bound**。
+- 当前 256 nparts + 单缓冲保持生产;要再往下走,必须动
+  **V 的池布局/读流水**(token-major / pthfa 式分组 load)或
+  **KV 压缩**,属于独立的 decode 布局项目。探针保留在
+  `int8_pipeline_probe::int8_decode_nparts_timing_65k`。
