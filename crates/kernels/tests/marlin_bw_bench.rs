@@ -716,3 +716,153 @@ fn marlin_w4a8_narrow_n_sweep() {
         }
     }
 }
+
+/// **W4A8 M-split 尾部一致性**（2026-11-04，1k 质量门定位）：
+/// 同一份 A 用 m=1040 跑（host 会拆 1024+16）与只跑尾部 16 行，
+/// 应逐位一致；同时 m=1040 的前 1024 行应与 m=1024 单发一致。
+/// 若不一致，根因在 host 的 M-split 指针/c_tmp 复用，而非 prefill 核。
+#[test]
+fn marlin_w4a8_m_split_tail_parity() {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let ctx = CudaContext::new(dev).expect("ctx");
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+    let (m_full, m_head, m_tail) = (1040usize, 1024usize, 16usize);
+    let (n, k) = (1024usize, 5120usize);
+    let g = G as usize;
+    let groups = k / g;
+
+    let a_i8: Vec<i8> = (0..m_full * k)
+        .map(|i| (((i * 13 + 7) % 255) as i32 - 127) as i8)
+        .collect();
+    let a_s: Vec<f32> = (0..m_full).map(|i| 0.02 + (i % 37) as f32 * 0.001).collect();
+    let q: Vec<u8> = (0..n * k).map(|i| ((i * 7 + 3) % 8 + 8) as u8).collect();
+    let s: Vec<f32> = (0..n * groups)
+        .map(|i| 0.02 + ((i * 13) % 13) as f32 * 0.004)
+        .collect();
+    let zp: Vec<u8> = (0..n * groups).map(|i| ((i * 5 + 2) % 8) as u8).collect();
+
+    let b_packed = owl_kernels::family::marlin::repack::pack_marlin_b_a8(&q, k, n);
+    let (s_bits, factor) = owl_kernels::family::marlin::repack::pack_marlin_s_a8(&s, n, groups);
+    let z_packed = owl_kernels::family::marlin::repack::pack_marlin_z_a8(&zp, n, groups);
+    let ws = vec![0i32; owl_kernels::family::marlin::v2_workspace_len(n)];
+
+    // 三份 A / a_s / C：full=1040、head=1024、tail=16（tail 取全量的 1024..1039）
+    let a_head = &a_i8[..m_head * k];
+    let a_tail = &a_i8[m_head * k..];
+    let as_head: Vec<f32> = a_s[..m_head].iter().map(|x| x * factor).collect();
+    let as_tail: Vec<f32> = a_s[m_head..].iter().map(|x| x * factor).collect();
+    let as_full: Vec<f32> = a_s.iter().map(|x| x * factor).collect();
+
+    unsafe {
+        let mut da_full = stream.alloc::<i8>(m_full * k).unwrap();
+        let mut das_full = stream.alloc::<f32>(m_full).unwrap();
+        let mut dc_full = stream.alloc::<u16>(m_full * n).unwrap();
+        let mut da_head = stream.alloc::<i8>(m_head * k).unwrap();
+        let mut das_head = stream.alloc::<f32>(m_head).unwrap();
+        let mut dc_head = stream.alloc::<u16>(m_head * n).unwrap();
+        let mut da_tail = stream.alloc::<i8>(m_tail * k).unwrap();
+        let mut das_tail = stream.alloc::<f32>(m_tail).unwrap();
+        let mut dc_tail = stream.alloc::<u16>(m_tail * n).unwrap();
+        let m_small = 64usize;
+        let mut da_small = stream.alloc::<i8>(m_small * k).unwrap();
+        let mut das_small = stream.alloc::<f32>(m_small).unwrap();
+        let mut dc_small = stream.alloc::<u16>(m_small * n).unwrap();
+        let mut db = stream.alloc::<i32>(b_packed.len()).unwrap();
+        let mut ds = stream.alloc::<u16>(s_bits.len()).unwrap();
+        let mut dz = stream.alloc::<i32>(z_packed.len()).unwrap();
+        let mut dws = stream.alloc::<i32>(ws.len()).unwrap();
+        stream.memcpy_htod(&a_i8, &mut da_full).unwrap();
+        stream.memcpy_htod(&as_full, &mut das_full).unwrap();
+        stream.memcpy_htod(&vec![0u16; m_full * n], &mut dc_full).unwrap();
+        stream.memcpy_htod(a_head, &mut da_head).unwrap();
+        stream.memcpy_htod(&as_head, &mut das_head).unwrap();
+        stream.memcpy_htod(&vec![0u16; m_head * n], &mut dc_head).unwrap();
+        stream.memcpy_htod(a_tail, &mut da_tail).unwrap();
+        stream.memcpy_htod(&as_tail, &mut das_tail).unwrap();
+        stream.memcpy_htod(&vec![0u16; m_tail * n], &mut dc_tail).unwrap();
+        stream.memcpy_htod(&a_i8[..m_small * k], &mut da_small).unwrap();
+        stream.memcpy_htod(&as_full[..m_small], &mut das_small).unwrap();
+        stream.memcpy_htod(&vec![0u16; m_small * n], &mut dc_small).unwrap();
+        stream.memcpy_htod(&b_packed, &mut db).unwrap();
+        stream.memcpy_htod(&s_bits, &mut ds).unwrap();
+        stream.memcpy_htod(&z_packed, &mut dz).unwrap();
+        stream.memcpy_htod(&ws, &mut dws).unwrap();
+
+        let (b_p, _) = db.device_ptr(&stream);
+        let (s_p, _) = ds.device_ptr(&stream);
+        let (z_p, _) = dz.device_ptr(&stream);
+        let (ws_p, _) = dws.device_ptr(&stream);
+        let cu_stream = stream.cu_stream() as usize;
+        let run = |a: &cudarc::driver::CudaSlice<i8>,
+                   a_s: &cudarc::driver::CudaSlice<f32>,
+                   c: &mut cudarc::driver::CudaSlice<u16>,
+                   m: usize| {
+            let (a_p, _) = a.device_ptr(&stream);
+            let (as_p, _) = a_s.device_ptr(&stream);
+            let (c_p, _) = c.device_ptr(&stream);
+            owl_kernels::family::marlin::gemm_v2_awq_w4a8_raw(
+                a_p as *const i8,
+                b_p as *const i32,
+                c_p as *mut u16,
+                s_p as *const u16,
+                z_p as *const i32,
+                as_p as *const f32,
+                std::ptr::null(),
+                m as i32,
+                n as i32,
+                k as i32,
+                ws_p as *mut i32,
+                G,
+                dev as i32,
+                cu_stream,
+                false,
+            )
+            .expect("marlin w4a8 launch");
+        };
+        run(&da_full, &das_full, &mut dc_full, m_full);
+        run(&da_head, &das_head, &mut dc_head, m_head);
+        run(&da_tail, &das_tail, &mut dc_tail, m_tail);
+        run(&da_small, &das_small, &mut dc_small, m_small);
+        stream.synchronize().unwrap();
+
+        let mut c_full = vec![0u16; m_full * n];
+        let mut c_head = vec![0u16; m_head * n];
+        let mut c_tail = vec![0u16; m_tail * n];
+        let mut c_small = vec![0u16; m_small * n];
+        stream.memcpy_dtoh(&dc_full, &mut c_full).unwrap();
+        stream.memcpy_dtoh(&dc_head, &mut c_head).unwrap();
+        stream.memcpy_dtoh(&dc_tail, &mut c_tail).unwrap();
+        stream.memcpy_dtoh(&dc_small, &mut c_small).unwrap();
+
+        // 1) full 的前 1024 行 vs 单发 head
+        let d_head = c_full[..m_head * n]
+            .iter()
+            .zip(&c_head)
+            .filter(|(a, b)| a != b)
+            .count();
+        // 2) full 的尾 16 行 vs 单发 tail
+        let d_tail = c_full[m_head * n..]
+            .iter()
+            .zip(&c_tail)
+            .filter(|(a, b)| a != b)
+            .count();
+        let d_small = c_full[..m_small * n]
+            .iter()
+            .zip(&c_small)
+            .filter(|(a, b)| a != b)
+            .count();
+        println!(
+            "[w4a8-msplit] full={m_full} n={n} k={k}: head_diff_bits={d_head}/{} tail_diff_bits={d_tail}/{} m64_diff_bits={d_small}/{}",
+            m_head * n,
+            m_tail * n,
+            m_small * n
+        );
+        assert_eq!(d_head, 0, "m=1040 的前 1024 行与 m=1024 单发不逐位一致");
+        assert_eq!(d_tail, 0, "m=1040 的尾 16 行与 m=16 单发不逐位一致");
+        assert_eq!(d_small, 0, "m=1040 的前 64 行与 m=64 单发不逐位一致");
+    }
+}

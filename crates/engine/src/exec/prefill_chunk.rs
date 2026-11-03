@@ -16,11 +16,38 @@ use owl_iface::contract::ModelError;
 // (值逐字节相同 ⇒ 零行为变化,纯命令数下降)。
 //
 // ⚠️ 上游的图路(prefill-graph S0/S1)未取;本结构只服务 eager 路 + XQA 表件。
+/// **INT8 稠密 prefill 的块表值**（= 本 chunk 的会话链，而不是持久
+/// `bt_leaf` 的陈旧前缀）。
+///
+/// 背景：`select_partial` 关掉 Strict 准入地板后，会话链按 chunk 增量
+/// `ensure_for_len`；`bt_leaf` 只在 turn 起点写一次。INT8 prefill 核直接读
+/// `block_tables` 取物理页 ⇒ 新页不在表里时会被当成 0 号页（静默错页）。
+/// FP8 走 FI 表（`indices` 每 chunk 从 `bt_chain` 重建）所以不受影响。
+///
+/// 视图页链（`past_view`）仍走 `select_view_leaf`，本函数只服务稠密 chunk。
+fn dense_int8_bt_values(bt_chain: &[u32]) -> Result<Vec<f32>> {
+    if let Some((i, _)) = bt_chain
+        .iter()
+        .enumerate()
+        .find(|(_, b)| owl_store::is_host_placeholder(**b))
+    {
+        return Err(ModelError::EngineInvariant {
+            what: format!(
+                "INT8 稠密 prefill 的会话链第 {i} 项是宿主占位符（{} 项）—— \
+                 应走视图页表，不能把占位符当页号喂核",
+                bt_chain.len()
+            ),
+        });
+    }
+    Ok(bt_chain.iter().map(|b| *b as f32).collect())
+}
+
 /// **本 chunk 的设备输入束**(S6i):KV/GDN 逐层缓冲 + 五张逐行叶子 + 块表。
 ///
 /// 为什么成对象:这些叶子全是**池缓冲的视图**(地址由 `StatePool` 拥有)——
 /// 执行函数只该拿"一手交齐"的束去建 `ForwardCtx`,不该逐行摊开 9 个 `let`
 /// 与两段 `map`(旧形 40 行,一改池几何就要在 5 处同步)。
+
 pub(crate) struct ChunkInputs {
     pub kvs_step: Vec<KvBuffers>,
     pub gdns_step: Vec<GdnBuffers>,
@@ -318,6 +345,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
 
     /// **prefill 入队半**(S4 ⑤-K3 分相):除末块 token 回读外**零同步**
     /// (TP 镜像块契约)—— 末块返回 `PrefillTail`(收割票据,由主 rank 读回)。
+    /// ⚠️ 唯一例外:INT8 池在末块前有一次全设备 sync(2026-11-04 1k 质量门;
+    /// 见函数体内注释),FP8/非 INT8 不受影响。
     pub(crate) async fn prefill_chunk_enqueue(
         &mut self,
         host: &mut ChunkHost<'_>,
@@ -329,6 +358,21 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let mut t_ext = std::time::Duration::ZERO;
         let d = self.pool.geom.dims;
         let t = ids.len();
+        // **INT8 prefill 末块前栅栏（2026-11-04 1k/2k 质量门）**：
+        // 非末块把 KV/GDN 写在 COMPUTE 流上；末块的 host 表/调度与
+        // 跨流复用之间存在漏 event 的窗口（实测：不加栅栏，1k 固定答
+        // `ZXCVBN12345` 丢 `M`；加一次全设备 sync 即 RETRIEVED，且
+        // 3/3 fresh server 可复现）。每请求只付一次（末块前），不是每
+        // chunk 税；FP8/非 INT8 不走此路。
+        if is_last
+            && base > 0
+            && self.pool.geom.kv_int8
+            && host.knobs.int8_prefill_sync
+        {
+            let face = self.graphs.session.face_mut();
+            face.sync().await?;
+            owl_shared::log_debug!("pf-sync", "INT8 末块前栅栏 base={base} t={t}");
+        }
         // E2b:活跃会话块链 + GDN 格(逻辑位 → 物理槽由块表换算)
         // 块链/gdn 槽 = 主机侧事实(唯一取值点:调用方从账房取好传入)
         let (bt_chain, gdn_slot_v) = (host.bt_chain.to_vec(), host.gdn_slot);
@@ -362,6 +406,27 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                         "部分驻留档缺视图表槽(PoolPlan::select_view 未开?)".into(),
                     )
                 })?
+            }
+            // INT8 prefill 核直接从 `block_tables` 取物理页；持久 `bt_leaf`
+            // 只在 turn 起点写一次，而 `select_partial` 档的会话链按 chunk
+            // 增量增长 ⇒ 新页从未进过持久表，核会把 0 当页号读（静默错页）。
+            // 稠密 prefill 直接用本 chunk 的会话链做一次性页表；它只在
+            // eager prefill 里活一个 chunk，不跨步复用。
+            None if self.pool.geom.kv_int8 => {
+                let need = (base + t).div_ceil(self.pool.geom.page.max(1));
+                if bt_chain.len() < need {
+                    return Err(ModelError::EngineInvariant {
+                        what: format!(
+                            "INT8 稠密 prefill 块表失守:会话链 {} 页 < 本 chunk 需要 {need} 页 \
+                             (base={base} t={t} page={})",
+                            bt_chain.len(),
+                            self.pool.geom.page.max(1)
+                        ),
+                    });
+                }
+                let chain = dense_int8_bt_values(&bt_chain)?;
+                let n = chain.len().max(1);
+                TensorOps::from_host(Dtype::F32, vec![1, n], &f32b(&chain))
             }
             None => self.pool.bt_leaf_flat(),
         };
@@ -418,6 +483,10 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             Some(gdn_slot_v),
             base, fi,
         );
+        // W4A8 prefill 固定 M tile：Marlin 的 `parallel` 随批 M 变，同一 token
+        // 的 K 归约顺序会漂。固定 512 后 1024/2048 由 host 拆成 512 段，
+        // 尾段由 Linear 补零到 512；token 行号恒为 `global_pos % 512`。
+        // 只在这里设；decode/verify 的 ForwardCtx 保持 None。
         // 🔴 **FI 的 plan ctx 必须是“视图口径”,不是绝对位置**(2026-10-28 定谳)。
         //
         // 子集档(`prefill_view = always` / 超池后被迫稀疏)下,给 FI 的页链只有
@@ -701,7 +770,83 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         } else {
             // 中间块:last_hidden 根(状态推进完整;lm_head 免算)。
             // DFlash2:同构 concat 单根(taps 随块回收前切片 encode)
-            let (tree, prefill_taps) = if self.spec_rt.dflash_tap_count > 0 {
+            const BISECT_ROW: usize = 520;
+            let bisect_on = host.probes.prefill_bisect
+                && self.spec_rt.dflash_tap_count == 0
+                && base <= BISECT_ROW
+                && BISECT_ROW < base + t;
+            let (tree, prefill_taps) = if bisect_on {
+                // 诊断：与生产 `last_hidden` **逐式同源**（含 F16 的
+                // fused_add_rmsnorm 原地路）；只额外克隆 l0..l4。单根
+                // concat 求值，避免多 root 改变批/发射边界。
+                let tap_ids = [0usize, 1, 2, 3, 4, 7, 15, 31, 47, 63];
+                let (hidden, taps) =
+                    self.boot.model.last_hidden_taps(&ci.ids_t, &ctx, &tap_ids);
+                let mut all: Vec<&TensorOps> = Vec::with_capacity(taps.len() + 1);
+                all.push(&hidden);
+                all.extend(taps.iter());
+                let root = owl_models::layers::concat_rows(&all, t, d.hidden);
+                let n = all.len();
+                let (b, arena) = {
+                    let env = self.env();
+                    let face = self.graphs.session.face_mut();
+                    owl_models::interpreters::eval_ops_scoped_env(
+                        root.step(),
+                        face,
+                        env,
+                        self.boot.tp.as_ref(),
+                    )
+                    .await?
+                };
+                if host.bank.is_some() {
+                    let local_row = BISECT_ROW - base;
+                    let esz = d.dtype.size_bytes();
+                    let mut buf = vec![0u8; b.len * esz];
+                    {
+                        let face = self.graphs.session.face_mut();
+                        face.dtoh(&b, &mut buf).await?;
+                    }
+                    for (i, tap) in tap_ids.iter().enumerate() {
+                        // 行序 = [hidden, l0, l1, l2, l3, l4]
+                        let start = (i + 1) * t * d.hidden * esz
+                            + local_row * d.hidden * esz;
+                        let row = &buf[start..start + d.hidden * esz];
+                        let (fnv, rms, mx) = row_stats(row, d.dtype);
+                        owl_shared::log_info!(
+                            "pf-bisect",
+                            "base={base} t={t} row={BISECT_ROW} l{tap} fnv={fnv:016x} rms={rms:.6e} max={mx:.6e}"
+                        );
+                    }
+                    // 本 chunk 结束后的 GDN 常驻态（rec/conv）。chunk512 的
+                    // probe 块止于 1024，chunk1024 的块也止于 1024 ⇒ 直接比
+                    // “第一个 1024 token 之后”的 state。
+                    for (j, g) in self.pool.gdn_caches().iter().enumerate() {
+                        for (name, leaf) in [
+                            ("convq", &g.conv_q),
+                            ("convk", &g.conv_k),
+                            ("convv", &g.conv_v),
+                            ("rec", &g.rec),
+                        ] {
+                            let n: usize = leaf.shape().iter().product();
+                            let mut sb = vec![0u8; n * 4];
+                            let face = self.graphs.session.face_mut();
+                            let blk = owl_models::interpreters::eval_ops(leaf.step(), face).await?;
+                            face.dtoh(&blk, &mut sb).await?;
+                            let (fnv, _, _) = row_stats(&sb, Dtype::F32);
+                            owl_shared::log_info!(
+                                "gd-state",
+                                "base={base} t={t} g{j}.{name} fnv={fnv:016x}"
+                            );
+                        }
+                    }
+                }
+                if !arena.is_empty() {
+                    let face = self.graphs.session.face_mut();
+                    face.free(&arena).await?;
+                }
+                let tree = TensorOps::of_block(b.id, d.dtype, vec![n * t, d.hidden]);
+                (tree, None)
+            } else if self.spec_rt.dflash_tap_count > 0 {
                 let (h, tp) = self.boot.model.tapped_hidden(&ci.ids_t, &ctx, &self.spec_rt.dflash_tap_ids);
                 let mut c = TensorOps::call(owl_models::ops::SemanticKernel::Concat).arg(&h);
                 for tt in &tp {
@@ -783,8 +928,6 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             Ok(None)
         }
     }
-
-
 }
 
 // =====================================================================
@@ -801,6 +944,41 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
 //   - 引用计数推送次数(证明求值器真在推,不是面断了)。
 //
 // 用法:`OWL_LIVE_DIAG=1`,跑一个 prefill 档,看 `[live-diag]` 四行。
+/// 行 checksum:FNV-1a over **原始 dtype 字节**(NaN/±0 不归一;逐位可复现)。
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// 行统计:(FNV, RMS, max|v|)。只接受 hidden 面实际会出现的三种 dtype;
+/// 其他类型响亮 panic **仅限诊断路**(未知 dtype 不能静默算错)。
+fn row_stats(raw: &[u8], dt: Dtype) -> (u64, f32, f32) {
+    let mut sum = 0f64;
+    let mut mx = 0f32;
+    let mut n = 0usize;
+    let take = |b: &[u8]| -> f32 {
+        match dt {
+            Dtype::F16 => half::f16::from_le_bytes([b[0], b[1]]).to_f32(),
+            Dtype::BF16 => half::bf16::from_le_bytes([b[0], b[1]]).to_f32(),
+            Dtype::F32 => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            other => panic!("pf-bisect: 未处理 dtype {other:?}"),
+        }
+    };
+    let esz = dt.size_bytes();
+    for c in raw.chunks_exact(esz) {
+        let v = take(c);
+        sum += f64::from(v) * f64::from(v);
+        mx = mx.max(v.abs());
+        n += 1;
+    }
+    let rms = if n == 0 { 0.0 } else { (sum / n as f64).sqrt() as f32 };
+    (fnv1a64(raw), rms, mx)
+}
+
 fn live_diag_begin(on: bool) -> bool {
     if !on {
         return false;
@@ -835,4 +1013,19 @@ owl_shared::slab_hint::live_diag::take_report()
         "引用计数推送 {} 次",
 owl_shared::slab_hint::refs_pushed()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_int8_bt_uses_current_chain_and_rejects_holes() {
+        let vals = dense_int8_bt_values(&[0, 7, 9]).expect("无洞链应可转成页表");
+        assert_eq!(vals, vec![0.0, 7.0, 9.0]);
+
+        let err = dense_int8_bt_values(&[0, u32::MAX]).expect_err("占位符必须响亮拒");
+        let msg = format!("{err}");
+        assert!(msg.contains("占位符"), "错误信息应点名占位符: {msg}");
+    }
 }

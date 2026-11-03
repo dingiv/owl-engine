@@ -75,6 +75,16 @@ impl TestRes {
             .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect()
     }
+
+    /// f16 字节块 → f32（输出口真实 dtype；旧 NT 测试误用 bf16 读 f16，
+    /// 结果被压成 ~1e-16，整条门形同虚设）。
+    fn take_bytes_f16(&self, id: u64) -> Vec<f32> {
+        let s = self.slice_of(id);
+        let host = self.stream.clone_dtoh(s).expect("dtoh");
+        host.chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()
+    }
 }
 
 impl DeviceRes for TestRes {
@@ -463,7 +473,7 @@ fn gdn_chunked_nt_decomposition_identity() {
     let mut exec = Exec::new();
     let mut rt = <GdnChunkedRuntime as KernelFamily>::assemble(&mut res, &mut exec).expect("runtime assemble");
 
-    const T_BIG: usize = 512;
+    const T_BIG: usize = 1024;
     const T_SM: usize = 64;
     const NT: usize = T_BIG / T_SM;
 
@@ -556,7 +566,7 @@ fn gdn_chunked_nt_decomposition_identity() {
         let msg: LaunchMsg = call.to_launch(out_b.clone());
         rt.run(&msg, res, exec).expect("runtime run");
         res.stream.synchronize().expect("sync");
-        let o = res.take_bytes_bf16(out_id);
+        let o = res.take_bytes_f16(out_id);
         // 态回读(池布局 [K,V] f32;handler 已转置写回同块)
         let st = res.take_bytes_f32(state_b.id);
         (o, st)
@@ -596,7 +606,7 @@ fn gdn_chunked_nt_decomposition_identity() {
             let msg: LaunchMsg = call.to_launch(out_b.clone());
             rt.run(&msg, &mut res, &mut exec).expect("runtime run");
             res.stream.synchronize().expect("sync");
-            o_b.extend(res.take_bytes_bf16(out_id));
+            o_b.extend(res.take_bytes_f16(out_id));
         }
         st_b = res.take_bytes_f32(state_b.id);
     }

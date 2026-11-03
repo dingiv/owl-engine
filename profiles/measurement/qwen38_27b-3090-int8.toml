@@ -29,6 +29,15 @@ quant = "w4a8"
 
 [runtime]
 max_seq = 131072
+# ✅ **1k 质量门已过（2026-11-04 结案）**：根因 = INT8 prefill 非末块
+# 的 KV/GDN 写与末块 host/调度之间存在漏 event 的窗口；`prefill_chunk_enqueue`
+# 在末块前加一次全设备 sync 后，1k/2k/8k/32k/120k 文本 needle 全 RETRIEVED
+# （fresh server 3/3）。**不是** W4A8 批形状问题；固定 M/GEMV 实验已回滚。
+# A/B/文本 1k 均已过：B 视觉与 `image_evict` 在 sync 后 36/36、slope≈1.0、
+# hit@16px 100%；删除吸收实测 cached=192（保留后缀 5 页/192 tok）。
+# 仍保持 measurement 直到 GSM8K/多图/长会话等更广质量集与正式性能复测闭环。sync 税已由 `llm_speedtest` 复测：std avg −0.02%，
+# 32k/65k 在方差内；开关 `[runtime] int8_prefill_sync` 缺省 true。
+# 最小门：`python3 tools/fixture/int8_text_gate.py --base http://127.0.0.1:8141`
 prefill_chunk = 2048
 prefill_tail_merge = 0
 implicit_session = true

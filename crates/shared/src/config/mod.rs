@@ -54,6 +54,7 @@
 //! | runtime | implicit_session / default_max_new / max_new_cap | 会话面(见字段注) |
 //! | runtime | max_seq | usize / 4096 |
 //! | runtime | prefill_chunk / prefill_tail_merge | usize / 512、0 |
+//! | runtime | int8_prefill_sync | flag / true(INT8 末块前设备栅栏；false 仅 A/B) |
 //! | runtime | max_batch | usize / 1(合批上限;>1 需 gdn_slots≥它、单卡、无选择层) |
 //! | runtime | idle_compact / pressure_low_pct / pressure_high_pct | bool、usize、usize / false、12、25(空转默认不预搬;低触发/高目标) |
 //! | runtime | host_pressure_low_pct / host_pressure_high_pct / host_pressure_interval_ms | usize、usize、usize / 12、25、1000(宿主低触发/高目标/空转节流) |
@@ -113,6 +114,7 @@
 //! | probes | step_gate / step_gate_ms / step_gate_us / step_gate_every | StepMode("off"\|"sticky"\|"single") / 50 / 0(覆盖 ms) / 1 |
 //! | log | level / tags_allow / tags_deny / file / max_mb / keep / timestamp | 见模块 |
 //! | probes | trace_gate / dflash_probe / raw_completion / prompt_dump / live_diag | flag / false |
+//! | probes | prefill_bisect | flag / false(层间 hidden 行 checksum;诊断) |
 //! | probes | kv_dump_at | Option<usize> / None(KV 页差分落点) |
 //! | cuda | srv_timing / cap_prof / launch_sync / launch_time | flag / false |
 //! | cuda | trace_ring | usize / 0(关;>0 = 发射账容量) |
@@ -418,6 +420,10 @@ pub struct RuntimeCfg {
     pub keepalive_ms: usize,
     pub max_seq: usize,
     pub prefill_chunk: usize,
+    /// **INT8 prefill 末块前设备栅栏**（2026-11-04 1k 质量门；缺省 true）。
+    /// 关闭仅供 A/B / 性能测量：1k needle 会固定丢 `M`。
+    #[serde(default = "default_true")]
+    pub int8_prefill_sync: bool,
     /// **引擎跨会话合批上限**(B5.1;缺省 **1 = 逐字节现状**)。
     ///
     /// >1 ⇒ 调度面把最多 N 个活跃 turn 的 decode 拼成一次 T=N 前向
@@ -1666,6 +1672,14 @@ pub struct ProbesCfg {
     /// OWL_PROMPT_DUMP env,2026-10-15 随 env 退出配置链收编)
     #[serde(default)]
     pub prompt_dump: bool,
+    /// **层间 prefill bisect**(诊断,非生产):在含全局 token 520 的
+    /// **非末块**上用 `Model::last_hidden_taps` 单遍求值,回读
+    /// `l0..l4/l7/l15/l31/l47/l63` 的该行 checksum。
+    /// ⚠️ 探针自身会额外 alloc/dtoh;其 dtoh 会顺带同步设备,曾因此
+    /// 把 1k 质量门「治好」(真实修复是末块前 sync,见 2026-11-04 交接)。
+    /// 只用于层间定位,不能当生产路径或质量门。
+    #[serde(default)]
+    pub prefill_bisect: bool,
     // ---- 2026-10-21 env 收编 ----
     /// 解释器活性收尾归因打印(原 `OWL_LIVE_DIAG`;`models::eval` 消费)
     #[serde(default)]
@@ -1885,6 +1899,7 @@ impl Default for RuntimeCfg {
             keepalive_ms: 1000,
             max_seq: 4096,
             prefill_chunk: 512,
+            int8_prefill_sync: true,
             max_batch: 1,
             prefill_tail_merge: 0,
             slice_every: 0,
@@ -3086,12 +3101,6 @@ impl OwlConfig {
         // `select_partial` 下沉过的块在会话链上是宿主占位符;verify 必须走
         // **逐行视图页表**(`exec/spec.rs::verify_view_tables`)。第一版只实现
         // v2 臂;FI/XQA 的逐行页表未实现 ⇒ 响亮拒,不静默跑错。
-        if self.pool.kv_int8 && self.kvmem.select_partial {
-            return Err(
-                "[kvmem] select_partial 暂不支持 INT8 KV：稀疏 prefill 的子集页链/因果                 口径尚未在 int8 prefill 核上验收；index/select_decode/image_evict 可用。"
-                    .to_string(),
-            );
-        }
         if self.kvmem.select_partial {
             if !matches!(self.kernel.decode_arm, DecodeArm::V2) {
                 return Err(
