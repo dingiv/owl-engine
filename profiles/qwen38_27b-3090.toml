@@ -46,6 +46,14 @@ bind = "0.0.0.0:8137"
 #   McNemar p≈0.69 不显著 ⇒ 按"统计等价"取舍,见 roadmap 26-10-27 两份台账。
 quant = "w4a8"
 
+[kernel]
+# 单 3090 57k 档**不能开** prefill_shadow：boot 后仅 ~1.6GiB 余量，
+# shadow 首次分配 + Marlin 瞬态要 24~64MiB 时直接 vram-hard-budget 拒发。
+# 实测 49k + shadow：4k/8k/32k prefill = 2140/2279/2038 t/s，
+# 对 57k 无 shadow 的 2130/2194/2007 只 +0.5%/+3.9%/+1.5%，
+# 不值得用 4k 上下文换。TP2 档(3080/3090)显存分半，已开 true。
+prefill_shadow = false
+
 [runtime]
 keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # ⚠️ a8 的显存体积比 a16 大(marlin 工作区 84MiB×2 + 激活量化缓冲):

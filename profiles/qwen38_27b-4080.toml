@@ -83,6 +83,11 @@ bind = "0.0.0.0:8138"
 # 但这是推论不是实测 —— 要质量门请照 ① 的 battery 口径另跑一轮。
 quant = "w4a8"
 
+[kernel]
+# Ada 有原生 fp8 MMA，fp8 KV 的 prefill 不走 sm86 的 e4m3→half 反量化慢路径，
+# prefill_shadow 无收益；显式关，避免与 30 系档混淆。
+prefill_shadow = false
+
 [runtime]
 keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # **max_seq = 262144 = 模型 native 上限**(max_pos=262144),2026-10-30 实测采纳。
