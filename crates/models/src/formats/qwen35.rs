@@ -1037,6 +1037,8 @@ mod tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
                 block_tables: TensorOps::of_block(bt0.id, Dtype::F32, vec![1, 1]),
+
+                int8: None,
             });
         }
         for _ in 0..gdns_n {
@@ -1092,6 +1094,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[kv_len])),
                     block_tables: kv.block_tables.clone(),
+
+                    int8: None,
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns
@@ -1388,6 +1392,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
                     block_tables: TensorOps::of_block(bt.id, Dtype::F32, vec![1, nb]),
+
+                    int8: None,
                 });
             }
             let mut gdns = Vec::new();
@@ -1428,6 +1434,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
                     block_tables: kv.block_tables.clone(),
+
+                    int8: None,
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns_ref
@@ -1505,6 +1513,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[t as f32 + 1.0])),
                     block_tables: kv.block_tables.clone(),
+
+                    int8: None,
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns_pre
@@ -1599,6 +1609,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
                     block_tables: TensorOps::of_block(bt.id, Dtype::F32, vec![1, nb]),
+
+                    int8: None,
                 });
             }
             v
@@ -1636,6 +1648,8 @@ mod tests {
                     slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot])),
                     kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[kv_len])),
                     block_tables: kv.block_tables.clone(),
+
+                    int8: None,
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdns
@@ -1862,6 +1876,343 @@ mod tests {
         gpu.close().await.expect("关机");
     }
 
+
+    /// 0.8B 逐层 KV 格式对照(诊断):同一权重/prompt/GDN 状态,只切
+    /// `KvEnv`。T / stage 由测试环境变量给(仅测试;生产零读取)。
+    /// 2026-11-03 修复后:T=8/64/1024 的 int8-vs-int8 均逐位为 0;
+    /// 多页/tile 读 K0、融合 Q/K scale 归约偏移、漏 1/sqrt(hd) 均已修。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gpu_int8_vs_fp8_layerwise() -> Result<(), ModelError> {
+        use crate::env::{EnvProvider, KvEnv, KvQuant};
+        use crate::layers::gdn::GdnBuffers;
+        use crate::layers::rope::Rope;
+        use crate::module::{KvBuffers, KvInt8Planes};
+        use crate::TensorOps;
+
+        if !crate::testkit::gpu_enabled() {
+            crate::testkit::skip_note();
+            return Ok(());
+        }
+        let dir = [
+            manifest_dir().join("assets/Qwen3.5-0.8B"),
+            manifest_dir().join("../../../models/Qwen/Qwen3.5-0.8B"),
+        ]
+        .into_iter()
+        .find(|p| p.is_dir())
+        .expect("0.8B 资产目录(assets/Qwen3.5-0.8B 或 workspace models)");
+        // 测试注册表默认 wildcard 会把 nvfp4 声明也纳入激活集(本机 sm86
+        // 无 FP4 家族 ⇒ boot 拒)。这里显式排除 quant.nvfp4,其余全放行。
+        let tags: Vec<_> = owl_kernels::spec::KERNEL_TAGS
+            .iter()
+            .filter(|e| !e.id.contains("nvfp4"))
+            .map(|e| e.tag)
+            .collect();
+        let filter = owl_kernels::tag_filter::TagFilter::from_tags(&tags).with_prod_kv_layouts();
+        let diag = owl_cuda::DiagOpts {
+            tag_filter: filter,
+            ..Default::default()
+        };
+        let mut gpu = owl_cuda::GpuClient::spawn_with(
+            owl_cuda::DeviceSelector::Ordinal(owl_cuda::test_device_ordinal()),
+            diag,
+            false,
+            owl_shared::log::LogSink::none(),
+        )
+        .expect("gpu server boot(layerwise)");
+        let model = load_0_8b(&dir, &mut gpu).await?;
+        let rp = Rope::new(262_144, HD, 64, 10_000_000.0)?;
+        crate::interpreters::eval_load(
+            &rp,
+            &mut gpu,
+            &rp.tables(),
+            &crate::module::LoaderCtx {
+                dtype: Dtype::F16,
+                shard: 1,
+                slice_id: 0,
+                device_repack: false,
+                verify: false,
+                debug_tap: false,
+                staging_mb: 128,
+                dump: false,
+            },
+        )
+        .await?;
+
+        async fn zero_u32(gpu: &mut owl_cuda::GpuClient, n: usize, shape: Vec<usize>) -> TensorOps {
+            let b = crate::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::U32, vec![n], &vec![0u8; n * 4]).step(),
+                gpu,
+            )
+            .await
+            .expect("zero u32");
+            TensorOps::of_block(b.id, Dtype::U32, shape)
+        }
+        async fn zero_i8(gpu: &mut owl_cuda::GpuClient, n: usize, shape: Vec<usize>) -> TensorOps {
+            let b = crate::interpreters::eval_ops(
+                TensorOps::from_host(Dtype::I8, vec![n], &vec![0u8; n]).step(),
+                gpu,
+            )
+            .await
+            .expect("zero i8");
+            TensorOps::of_block(b.id, Dtype::I8, shape)
+        }
+
+        let t = std::env::var("OWL_INT8_T")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(8);
+        let stage = std::env::var("OWL_INT8_STAGE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        let nb = t.div_ceil(32);
+        let long = std::env::var("OWL_INT8_LONG").is_ok();
+        eprintln!("[int8-layerwise] T={t} NB={nb} stage={stage:?} long={long}");
+        let kv_bytes = nb * HKV * HD * 32;
+        let u32_n = kv_bytes / 4;
+        let slots_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t],
+            &f32b(&(0..t).map(|i| i as f32).collect::<Vec<_>>()),
+        );
+        let lens_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![t],
+            &f32b(&(1..=t).map(|i| i as f32).collect::<Vec<_>>()),
+        );
+        let bt_data: Vec<u8> = (0..nb).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let bt = crate::interpreters::eval_ops(
+            TensorOps::from_host(Dtype::F32, vec![1, nb], &bt_data).step(),
+            &mut gpu,
+        )
+        .await?;
+        let bt = TensorOps::of_block(bt.id, Dtype::F32, vec![1, nb]);
+        let gslot = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
+        let cu = TensorOps::from_host(Dtype::F32, vec![2], &f32b(&[0.0, t as f32]));
+
+        async fn mk_kvs(
+            gpu: &mut owl_cuda::GpuClient,
+            mode: u8, // 0=fp8, 1=int8, 2=f16
+            u32_n: usize,
+            kv_bytes: usize,
+            nb: usize,
+            slots: &TensorOps,
+            lens: &TensorOps,
+            bt: &TensorOps,
+        ) -> Vec<KvBuffers> {
+            let mut out = Vec::new();
+            for _ in 0..6 {
+                let (k, v) = if mode == 1 {
+                    (
+                        zero_i8(gpu, kv_bytes, vec![kv_bytes]).await,
+                        zero_i8(gpu, kv_bytes, vec![kv_bytes]).await,
+                    )
+                } else if mode == 2 {
+                    (
+                        zero_block_f16(gpu, kv_bytes, vec![nb, HKV, HD / 8, 32, 8]).await,
+                        zero_block_f16(gpu, kv_bytes, vec![nb, HKV, HD, 32]).await,
+                    )
+                } else {
+                    (
+                        zero_u32(gpu, u32_n, vec![u32_n]).await,
+                        zero_u32(gpu, u32_n, vec![u32_n]).await,
+                    )
+                };
+                let int8_planes = if mode == 1 {
+                    Some(KvInt8Planes {
+                        k_scale: zero_block(gpu, nb * 32 * HKV * 8, vec![nb * 32 * HKV * 8]).await,
+                        v_scale: zero_block(gpu, nb * 32 * HKV, vec![nb * 32 * HKV]).await,
+                    })
+                } else {
+                    None
+                };
+                out.push(KvBuffers {
+                    k_cache: k,
+                    v_cache: v,
+                    slots: slots.clone(),
+                    kv_lens: lens.clone(),
+                    block_tables: bt.clone(),
+                    int8: int8_planes,
+                });
+            }
+            out
+        }
+
+        async fn mk_gdns(gpu: &mut owl_cuda::GpuClient) -> Vec<GdnBuffers> {
+            let mut out = Vec::new();
+            for _ in 0..18 {
+                out.push(GdnBuffers {
+                    conv_q: zero_block(gpu, 4 * 2048 * 3, vec![4, 2048, 3]).await,
+                    conv_k: zero_block(gpu, 4 * 2048 * 3, vec![4, 2048, 3]).await,
+                    conv_v: zero_block(gpu, 4 * 2048 * 3, vec![4, 2048, 3]).await,
+                    rec: zero_block(gpu, 4 * 16 * 128 * 128, vec![4, 16, 128, 128]).await,
+                    slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0])),
+                });
+            }
+            out
+        }
+
+        let int8_env = EnvProvider {
+            kv: KvEnv {
+                head_dim: HD,
+                grp: 4,
+                ..KvEnv::int8_paged()
+            },
+            ..Default::default()
+        };
+        let fp8_env = EnvProvider {
+            kv: KvEnv {
+                quant: KvQuant::Fp8E4M3,
+                dtype: Dtype::F16,
+                page: 32,
+                x: 8,
+                paged: true,
+                head_dim: HD,
+                grp: 4,
+            },
+            ..Default::default()
+        };
+
+        let f16_env = EnvProvider {
+            kv: KvEnv {
+                head_dim: HD,
+                grp: 4,
+                ..KvEnv::f16_paged()
+            },
+            ..Default::default()
+        };
+
+        let ids: Vec<f32> = (0..t).map(|i| ((985 + i * 37) % 20_000) as f32).collect();
+        let ids_t = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&ids));
+        let pos_t = TensorOps::from_host(
+            Dtype::F32,
+            vec![1, t],
+            &f32b(&(0..t).map(|i| i as f32).collect::<Vec<_>>()),
+        );
+
+        async fn run_arm(
+            gpu: &mut owl_cuda::GpuClient,
+            model: &Model,
+            rp: &Rope,
+            ids: &TensorOps,
+            pos: &TensorOps,
+            slots: &TensorOps,
+            lens: &TensorOps,
+            gslot: &TensorOps,
+            cu: &TensorOps,
+            env: EnvProvider,
+            mode: u8,
+            u32_n: usize,
+            kv_bytes: usize,
+            nb: usize,
+            t: usize,
+            stage: Option<usize>,
+            bt: &TensorOps,
+        ) -> Result<(Vec<String>, Vec<Vec<f32>>), ModelError> {
+            let kvs = mk_kvs(gpu, mode, u32_n, kv_bytes, nb, slots, lens, bt).await;
+            let gdns = mk_gdns(gpu).await;
+            let mut ctx = ForwardCtx::model_prefill(
+                t, pos, &kvs, rp, &gdns, slots, lens, gslot, None, 0, None,
+            );
+            ctx.seq_cu = Some(cu);
+            ctx.env = env;
+            let (_, nodes) = model.prefill_bisect(ids, &ctx, stage);
+            let names: Vec<String> = nodes.iter().map(|(n, _)| n.clone()).collect();
+            let roots: Vec<&TensorOps> = nodes.iter().map(|(_, t)| t).collect();
+            let outs = crate::interpreters::eval_ops_multi_env(&roots, gpu, env, None).await?;
+            let mut vals = Vec::with_capacity(outs.len());
+            for ((_, node), b) in nodes.iter().zip(&outs) {
+                let dt = b.dtype;
+                let mut buf = vec![0u8; b.len * dt.size_bytes()];
+                gpu.dtoh(b, &mut buf)
+                    .await
+                    .map_err(|e| ModelError::Msg(format!("layerwise dtoh: {e:?}")))?;
+                let v: Vec<f32> = match dt {
+                    Dtype::F16 => buf
+                        .chunks_exact(2)
+                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect(),
+                    Dtype::F32 => buf
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                    other => {
+                        return Err(ModelError::Msg(format!(
+                            "layerwise: 未处理的 dtype {other:?} (node shape {:?})",
+                            node.shape()
+                        )))
+                    }
+                };
+                vals.push(v);
+            }
+            Ok((names, vals))
+        }
+
+        let fp8 = run_arm(
+            &mut gpu, &model, &rp, &ids_t, &pos_t, &slots_t, &lens_t, &gslot, &cu,
+            fp8_env, 0, u32_n, kv_bytes, nb, t, stage, &bt,
+        )
+        .await?;
+        let int8 = run_arm(
+            &mut gpu, &model, &rp, &ids_t, &pos_t, &slots_t, &lens_t, &gslot, &cu,
+            int8_env, 1, u32_n, kv_bytes, nb, t, stage, &bt,
+        )
+        .await?;
+        let int8b = if long {
+            None
+        } else {
+            Some(
+                run_arm(
+                    &mut gpu, &model, &rp, &ids_t, &pos_t, &slots_t, &lens_t, &gslot, &cu,
+                    int8_env, 1, u32_n, kv_bytes, nb, t, stage, &bt,
+                )
+                .await?,
+            )
+        };
+
+        let rel = |a: &[f32], b: &[f32]| {
+            let (mut se, mut sr, mut mx) = (0f64, 0f64, 0f32);
+            for (x, y) in a.iter().zip(b) {
+                let d = (x - y).abs();
+                se += (d as f64) * (d as f64);
+                sr += (*x as f64) * (*x as f64);
+                mx = mx.max(d);
+            }
+            ((se / sr.max(1e-30)).sqrt(), mx)
+        };
+        if let Some(int8b) = &int8b {
+            for (i, name) in int8.0.iter().enumerate() {
+                let (r, mx) = rel(&int8.1[i], &int8b.1[i]);
+                println!("[int8-vs-int8] {name:10} rel_rms={r:.4e} max|d|={mx:.4e}");
+            }
+        }
+        let f16 = if long {
+            None
+        } else {
+            Some(
+                run_arm(
+                    &mut gpu, &model, &rp, &ids_t, &pos_t, &slots_t, &lens_t, &gslot, &cu,
+                    f16_env, 2, u32_n, kv_bytes, nb, t, stage, &bt,
+                )
+                .await?,
+            )
+        };
+        for (i, name) in fp8.0.iter().enumerate() {
+            let (r, mx) = rel(&fp8.1[i], &int8.1[i]);
+            println!("[int8-vs-fp8] {name:10} rel_rms={r:.4e} max|d|={mx:.4e}");
+        }
+        if let Some(f16) = &f16 {
+            for (i, name) in f16.0.iter().enumerate() {
+                let (r, mx) = rel(&f16.1[i], &fp8.1[i]);
+                println!("[fp8-vs-f16]  {name:10} rel_rms={r:.4e} max|d|={mx:.4e}");
+            }
+            for (i, name) in f16.0.iter().enumerate() {
+                let (r, mx) = rel(&f16.1[i], &int8.1[i]);
+                println!("[int8-vs-f16] {name:10} rel_rms={r:.4e} max|d|={mx:.4e}");
+            }
+        }
+        gpu.close().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

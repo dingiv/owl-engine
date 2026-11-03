@@ -65,6 +65,15 @@ extends = [
 `profiles/measurement/` = **测量/实验档**（不计入入口档面；子目录不参与档名发现）：
 
 - `qwen38_27b-gguf.toml` / `qwen38_27b-gguf-iq4.toml` —— GGUF 裸性能口径；
+- `qwen38_27b-3090-int8.toml` —— **INT8 KV 单卡档（8141）**：**w4a8**、
+  max_seq 131072、K int8 + V packed + per-token/per-page scale；P8 prefill /
+  P32 decode；spec off。3 次中位 65k 1691 t/s / TTFT 38.75s，
+  100k 1488 / 67.19s；GSM8K 200 96.5%，needle 8k/32k/64k/100k 全过。
+- `qwen38_27b-3090-fp8.toml` —— **FP8 KV 单卡同形对照档（8144）**：默认
+  w4a16，A/B 时用 `--set model.quant=w4a8` 与 int8 档同形。
+- `qwen38_27b-3090_tp2-int8.toml` / `qwen38_27b-3090_tp2-fp8.toml` —— **双 3090
+  TP2 INT8/FP8 同形对照档（8142/8143）**：w4a8、262k、spec off。
+  65k INT8 2483.8 t/s / decode 58.97；100k 2222.5 / 57.48。
 - `qwen38_27b-3090-kvmem.toml` —— **KVMem 单卡档（8137，与单卡 3090 统一端口）**：池超卖 5.49× +
   选择层 + 块下沉。起机 `-p profiles/measurement/qwen38_27b-3090-kvmem.toml`
   （不需要 `--set`）。
@@ -143,7 +152,7 @@ profiles/
     model/                     # 模型资产（path/format/quant/head；含 0.8B/4B/27B GGUF 与 AWQ）
     hardware/                  # 卡位 + TP 开关（3090-single / 3080-tp2 / 4080-single / 5070ti-single）
     kernel/                    # fi-graph / v2 臂
-    pool/                      # fp8 / f16 池
+    pool/                      # fp8 / f16 / int8 池
     feature/                   # vision / dflash2 / mtp / kvmem / agent / w4a8 / image-evict
 ```
 

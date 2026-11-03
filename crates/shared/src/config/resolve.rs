@@ -366,7 +366,8 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         reserve_bytes: (get_usize(&out, "pool.vram_reserve_mb").unwrap_or(1024) as u64) << 20,
         model,
         spec_dflash: intent.spec == SpecIntent::Dflash,
-        kv_fp8: get_bool(&out, "pool.kv_fp8").unwrap_or(false),
+        kv_fp8: get_bool(&out, "pool.kv_fp8").unwrap_or(false)
+            || get_bool(&out, "pool.kv_int8").unwrap_or(false),
         gdn_slots: get_usize(&out, "pool.gdn_slots").unwrap_or(8),
         snap_max: get_usize(&out, "pool.snap_max").unwrap_or(4),
         sessions: c,

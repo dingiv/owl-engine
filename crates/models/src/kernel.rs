@@ -136,7 +136,7 @@ pub fn kv_manifest_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use owl_iface::contract::{Arg, Dtype};
     use owl_kernels::contract::Bytes;
 
@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn kv_manifest_gate_is_derived_from_pool_declarations() {
         use crate::contract::Dtype;
-        for dt in [Dtype::F16, Dtype::BF16, Dtype::F8E4M3] {
+        for dt in [Dtype::F16, Dtype::BF16, Dtype::F8E4M3, Dtype::I8] {
             kv_manifest_gate(dt, false).expect("声明面投影应全绿");
             kv_manifest_gate(dt, true).expect("FI 信息行不应影响判定");
         }

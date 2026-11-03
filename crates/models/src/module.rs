@@ -602,6 +602,16 @@ pub struct KvBuffers {
     /// 后续 FlashInfer 共用)。恒等表 = 单序列连续分配(物理块 = 逻辑块)。
     /// naive 旧核不解引用(测试/回退路径可填哑表)。
     pub block_tables: TensorOps,
+    /// INT8 KV 的两张 scale 平面(None = f16/fp8 档)。
+    /// K scale = `[nb, page, hkv, 8]` / V scale = `[nb, page, hkv]`。
+    pub int8: Option<KvInt8Planes>,
+}
+
+/// INT8 KV 的 scale 平面(K/V 与包内 K/V 同生命周期)。
+#[derive(Clone)]
+pub struct KvInt8Planes {
+    pub k_scale: TensorOps,
+    pub v_scale: TensorOps,
 }
 
 /// v2 分页 decode scratch(在线 softmax 分块 + LSE 归并;E-decode 主攻

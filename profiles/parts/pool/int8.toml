@@ -1,0 +1,13 @@
+# 池组件：INT8 KV（K int8 + V packed + per-token/per-page scale）。
+#
+# 约束（boot 响亮拒）：
+#   - hd=256 / page=32 / paged；
+#   - spec.depth=0（verify 未接）；
+#   - 不开 index/coverage/select/image_evict（这些面按 f16/fp8 K 页解码）。
+[pool]
+kv_fp8 = false
+kv_int8 = true
+gdn_slots = 1
+vram_target = 0.99
+vram_reserve_mb = 256
+transient_reserve_mb = 1024

@@ -186,6 +186,456 @@ impl KernelSpec for K0WriteFp8Knhd {
 }
 
 // ============================================================================
+// INT8 KV 专项 P0:int8 池写者(kNHD + per-token/head fp32 scale)
+// ============================================================================
+
+/// `owl_reshape_and_cache_int8_knhd` —— 批量 KV 写池(f16 入 → int8 池 +
+/// fp32 scale 平面)。量化约定 = pth/vLLM `int8_per_token_head` writer 的镜像。
+///
+/// **FIXME(int8-kv)**:scale 目前作为独立 tensor 传入,尚未纳入池写集审计;
+/// 接生产池时必须把 scale plane 加进 `POOL`/E10 写者穷举。
+pub struct K0WriteInt8Knhd;
+
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.int8"
+)]
+impl KernelSpec for K0WriteInt8Knhd {
+    const ENTRY: &'static str = "owl_reshape_and_cache_int8_knhd";
+    const SRC: &'static str = "cu/attn/reshape_and_cache_int8.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("key", Dtype::F16, 3),
+        Param::t_in("value", Dtype::F16, 3),
+        Param::t_in("key_cache", Dtype::I8, 1),
+        Param::t_in("value_cache", Dtype::I8, 1),
+        Param::t_in("k_scale", Dtype::F32, 1),
+        Param::t_in("v_scale", Dtype::F32, 1),
+        Param::t_in("slot_mapping", Dtype::F32, 0),
+        Param::i32("key_stride"),
+        Param::i32("value_stride"),
+        Param::i32("num_heads"),
+        Param::i32("head_size"),
+        Param::i32("block_size"),
+        Param::i32("num_tokens"),
+        Param::t_out("out", Dtype::F16, 1),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::I8,
+    )];
+    const SELFCHECK: Option<&'static dyn crate::bootcheck::BootCheck> =
+        Some(&crate::ops::oracles::k0_int8_knhd::K0Int8KnhdOracle);
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[128, 256],
+        page: &[16, 32, 64, 128],
+        grp: None,
+        tile: None,
+    };
+}
+
+// ============================================================================
+// INT8 KV 专项:4-warp int8 paged prefill(K int8 + V int8 prepacked + P uint8)
+// ============================================================================
+
+/// `owl_int8_prefill_paged` —— 4 warp / Bc=32 / Br=64 / D=256 的 int8 预填核。
+/// K 走 int8 张量核;P 量化 uint8;V 走预打包 `[Hkv][D][L/2]` b16。
+/// **无 V f16 shadow**。
+///
+/// **FIXME(int8-kv)**:V prepacked 布局尚无 `LayoutTag`;目前只声明 K 的主池读。
+/// 接生产池前必须补齐 V/scale 的池访问声明与 writer。
+pub struct Int8PrefillPaged;
+
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.int8")]
+impl KernelSpec for Int8PrefillPaged {
+    const ENTRY: &'static str = "owl_int8_prefill_paged";
+    const SRC: &'static str = "cu/attn/int8_prefill.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::I8, 2),
+        Param::t_in("qscale", Dtype::F32, 1),
+        Param::t_in("k", Dtype::I8, 1),
+        Param::t_in("kscale", Dtype::F32, 1),
+        Param::t_in("vp", Dtype::I8, 1),
+        Param::t_in("vscale", Dtype::F32, 1),
+        Param::t_in("block_table", Dtype::F32, 2),
+        Param::t_out("out", Dtype::F16, 2),
+        Param::i32("T"),
+        Param::i32("L"),
+        Param::i32("Hq"),
+        Param::i32("Hkv"),
+        Param::i32("page"),
+        Param::i32("base_pos"),
+        Param::t_in("dep_k", Dtype::F16, 0),
+        Param::t_in("dep_v", Dtype::F16, 0),
+    ];
+    const POOL: &'static [PoolAccess] =
+        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::I8)];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_int8_prefill_paged_f16pv` —— int8 QK + f16 PV 的生产核:
+/// P f16×2^8、V f16 shadow(token-major)、f16 accumulator。
+pub struct Int8PrefillPagedF16Pv;
+
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "kv.main.int8")]
+impl KernelSpec for Int8PrefillPagedF16Pv {
+    const ENTRY: &'static str = "owl_int8_prefill_paged_f16pv";
+    const SRC: &'static str = "cu/attn/int8_prefill_f16pv.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::I8, 2),
+        Param::t_in("qscale", Dtype::F32, 1),
+        Param::t_in("k", Dtype::I8, 1),
+        Param::t_in("kscale", Dtype::F32, 1),
+        Param::t_in("v16", Dtype::F16, 1),
+        Param::t_in("block_table", Dtype::F32, 2),
+        Param::t_out("out", Dtype::F16, 2),
+        Param::i32("T"),
+        Param::i32("L"),
+        Param::i32("Hq"),
+        Param::i32("Hkv"),
+        Param::i32("page"),
+        Param::i32("base_pos"),
+        Param::t_in("dep_k", Dtype::F16, 0),
+        Param::t_in("dep_v", Dtype::F16, 0),
+    ];
+    const POOL: &'static [PoolAccess] =
+        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::I8)];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_reshape_and_cache_int8_k_only_knhd` —— 只写 K 的 int8 writer。
+///
+/// int8 PV 的 V 走 per-page pack(见 `VPackInt8Prefill`/`VAppendInt8Paged`),
+/// 因此 prefill/decode 都不应再让 K writer 顺带写一份 V int8(白写 + 白占池)。
+pub struct K0WriteInt8KOnlyKnhd;
+
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.int8"
+)]
+impl KernelSpec for K0WriteInt8KOnlyKnhd {
+    const ENTRY: &'static str = "owl_reshape_and_cache_int8_k_only_knhd";
+    const SRC: &'static str = "cu/attn/reshape_and_cache_int8.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("key", Dtype::F16, 3),
+        Param::t_in("key_cache", Dtype::I8, 1),
+        Param::t_in("k_scale", Dtype::F32, 1),
+        Param::t_in("slot_mapping", Dtype::F32, 0),
+        Param::i32("key_stride"),
+        Param::i32("num_heads"),
+        Param::i32("head_size"),
+        Param::i32("block_size"),
+        Param::i32("num_tokens"),
+        Param::t_out("out", Dtype::F16, 1),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::I8,
+    )];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_quant_int8_qk_f16` —— Q 的 per-(token, q_head) int8 量化。
+/// 输出槽 `scales` 由调用方备块;`q` 是节点输出。
+pub struct QuantInt8QkF16;
+
+#[kernel_tags("dom.attn", "role.attn", "phase.prefill", "phase.decode")]
+impl KernelSpec for QuantInt8QkF16 {
+    const ENTRY: &'static str = "owl_quant_int8_qk_f16";
+    const SRC: &'static str = "cu/attn/quant_int8_qk.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::i32("rows"),
+        Param::i32("cols"),
+        Param::t_in("scales", Dtype::F32, 1),
+        Param::t_out("q", Dtype::I8, 2),
+    ];
+    // 输出是 int8:有限性律不适用(饱和由核内 clamp 保证)。
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_v_pack_int8_prefill` —— prefill 整页 V scale + 打包。
+pub struct VPackInt8Prefill;
+
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.prefill",
+    "kv.main.int8"
+)]
+impl KernelSpec for VPackInt8Prefill {
+    const ENTRY: &'static str = "owl_v_pack_int8_prefill";
+    const SRC: &'static str = "cu/attn/pack_v_int8_paged.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("v", Dtype::F16, 3),
+        Param::t_in("slots", Dtype::F32, 0),
+        Param::i32("T"),
+        Param::i32("Hkv"),
+        Param::i32("D"),
+        Param::i32("page"),
+        Param::t_in("vscale", Dtype::F32, 1),
+        Param::t_in("vp", Dtype::I8, 1),
+        Param::t_out("out", Dtype::F16, 1),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::I8,
+    )];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_v_append_int8_paged` —— decode 单 token 追加 V。
+pub struct VAppendInt8Paged;
+
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.kv_write",
+    "phase.decode",
+    "kv.main.int8"
+)]
+impl KernelSpec for VAppendInt8Paged {
+    const ENTRY: &'static str = "owl_v_append_int8_paged";
+    const SRC: &'static str = "cu/attn/pack_v_int8_paged.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("v", Dtype::F16, 3),
+        Param::t_in("slots", Dtype::F32, 0),
+        Param::i32("T"),
+        Param::i32("Hkv"),
+        Param::i32("D"),
+        Param::i32("page"),
+        Param::t_in("vscale", Dtype::F32, 1),
+        Param::t_in("vp", Dtype::I8, 1),
+        Param::t_out("out", Dtype::F16, 1),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::I8,
+    )];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_int8_decode_paged` —— 单 token decode(K int8 / V packed / per-page scale)。
+pub struct Int8DecodePaged;
+
+#[kernel_tags("dom.attn", "role.attn", "phase.decode", "kv.main.int8")]
+impl KernelSpec for Int8DecodePaged {
+    const ENTRY: &'static str = "owl_int8_decode_paged";
+    const SRC: &'static str = "cu/attn/int8_decode.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::I8, 2),
+        Param::t_in("qscale", Dtype::F32, 1),
+        Param::t_in("k", Dtype::I8, 1),
+        Param::t_in("kscale", Dtype::F32, 1),
+        Param::t_in("vp", Dtype::I8, 1),
+        Param::t_in("vscale", Dtype::F32, 1),
+        Param::t_in("block_table", Dtype::F32, 2),
+        Param::t_in("kv_lens", Dtype::F32, 0),
+        Param::t_out("out", Dtype::F32, 2),
+        Param::i32("B"),
+        Param::i32("Hq"),
+        Param::i32("Hkv"),
+        Param::i32("page"),
+        Param::i32("bt_stride"),
+        Param::t_in("dep_k", Dtype::F16, 0),
+        Param::t_in("dep_v", Dtype::F16, 0),
+    ];
+    const POOL: &'static [PoolAccess] =
+        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::I8)];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_int8_decode_paged_split` —— decode 的 KV 分片 partial。
+pub struct Int8DecodeSplit;
+
+#[kernel_tags("dom.attn", "role.attn", "phase.decode", "kv.main.int8")]
+impl KernelSpec for Int8DecodeSplit {
+    const ENTRY: &'static str = "owl_int8_decode_paged_split";
+    const SRC: &'static str = "cu/attn/int8_decode.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::I8, 2),
+        Param::t_in("qscale", Dtype::F32, 1),
+        Param::t_in("k", Dtype::I8, 1),
+        Param::t_in("kscale", Dtype::F32, 1),
+        Param::t_in("vp", Dtype::I8, 1),
+        Param::t_in("vscale", Dtype::F32, 1),
+        Param::t_in("block_table", Dtype::F32, 2),
+        Param::t_in("kv_lens", Dtype::F32, 0),
+        Param::t_in("partial_out", Dtype::F32, 1),
+        Param::t_in("partial_stat", Dtype::F32, 1),
+        Param::t_out("out_dummy", Dtype::F16, 1),
+        Param::i32("B"),
+        Param::i32("Hq"),
+        Param::i32("Hkv"),
+        Param::i32("page"),
+        Param::i32("bt_stride"),
+        Param::i32("nparts"),
+        Param::t_in("dep_k", Dtype::F16, 0),
+        Param::t_in("dep_v", Dtype::F16, 0),
+    ];
+    const POOL: &'static [PoolAccess] =
+        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::I8)];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_int8_decode_gqa_tc_split` —— GQA 共享 K/V + tensor-core QK/PV 的 decode 分片。
+pub struct Int8DecodeGqaTcSplit;
+
+#[kernel_tags("dom.attn", "role.attn", "phase.decode", "kv.main.int8")]
+impl KernelSpec for Int8DecodeGqaTcSplit {
+    const ENTRY: &'static str = "owl_int8_decode_gqa_tc_split";
+    const SRC: &'static str = "cu/attn/int8_decode.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("q", Dtype::I8, 2),
+        Param::t_in("qscale", Dtype::F32, 1),
+        Param::t_in("k", Dtype::I8, 1),
+        Param::t_in("kscale", Dtype::F32, 1),
+        Param::t_in("vp", Dtype::I8, 1),
+        Param::t_in("vscale", Dtype::F32, 1),
+        Param::t_in("block_table", Dtype::F32, 2),
+        Param::t_in("kv_lens", Dtype::F32, 0),
+        Param::t_in("partial_out", Dtype::F32, 1),
+        Param::t_in("partial_stat", Dtype::F32, 1),
+        Param::t_out("out_dummy", Dtype::F16, 1),
+        Param::i32("B"),
+        Param::i32("Hq"),
+        Param::i32("Hkv"),
+        Param::i32("page"),
+        Param::i32("bt_stride"),
+        Param::i32("nparts"),
+        Param::t_in("dep_k", Dtype::F16, 0),
+        Param::t_in("dep_v", Dtype::F16, 0),
+    ];
+    const POOL: &'static [PoolAccess] =
+        &[PoolAccess::read(pools::KV_MAIN, LayoutTag::Knhd, Dtype::I8)];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_int8_decode_reduce` —— 合并 split partial(在线 softmax LSE)。
+pub struct Int8DecodeReduce;
+
+#[kernel_tags("dom.attn", "role.attn", "phase.decode")]
+impl KernelSpec for Int8DecodeReduce {
+    const ENTRY: &'static str = "owl_int8_decode_reduce";
+    const SRC: &'static str = "cu/attn/int8_decode.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("partial_out", Dtype::F32, 1),
+        Param::t_in("partial_stat", Dtype::F32, 1),
+        Param::t_in("dep", Dtype::F16, 0),
+        Param::t_out("out", Dtype::F16, 2),
+        Param::i32("B"),
+        Param::i32("Hq"),
+        Param::i32("nparts"),
+        Param::i32("D"),
+    ];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+// ============================================================================
 // 池访问族补齐(2026-10-13 B1b):**生产里每一个池写者/读者都要有声明**
 // (E10「漏写者 ⇒ 槽区全零」/ E14 双寻址 / E15 契约腐烂 的机器面)
 // ============================================================================
@@ -408,6 +858,89 @@ impl KernelSpec for NormRopeBf16 {
     const DETERMINISM: Determinism = Determinism::Deterministic;
 }
 
+/// `owl_norm_rope_q_int8_f16` —— norm+rope 后直接 Q int8 量化。
+pub struct NormRopeQInt8F16;
+
+#[kernel_tags("dom.attn", "role.attn", "role.norm", "role.rope", "kv.main.int8")]
+impl KernelSpec for NormRopeQInt8F16 {
+    const ENTRY: &'static str = "owl_norm_rope_q_int8_f16";
+    const SRC: &'static str = "cu/attn/norm_rope.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 2),
+        Param::t_in("w", Dtype::F16, 1),
+        Param::t_in("cos_t", Dtype::F16, 2),
+        Param::t_in("sin_t", Dtype::F16, 2),
+        Param::t_in("pos", Dtype::F32, 0),
+        Param::f32("eps"),
+        Param::sz("row_stride"),
+        Param::sz("head_stride"),
+        Param::sz("half"),
+        Param::i32("w_off"),
+        Param::t_in("qscale", Dtype::F32, 1),
+        Param::t_out("q", Dtype::I8, 2),
+    ];
+    const LAWS: &'static [Law] = &[];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
+/// `owl_norm_rope_k_int8_write_f16` —— norm+rope 后直接写 K int8 池 + scale。
+pub struct NormRopeKInt8WriteF16;
+
+#[kernel_tags(
+    "dom.attn",
+    "role.attn",
+    "role.norm",
+    "role.rope",
+    "role.kv_write",
+    "kv.main.int8"
+)]
+impl KernelSpec for NormRopeKInt8WriteF16 {
+    const ENTRY: &'static str = "owl_norm_rope_k_int8_write_f16";
+    const SRC: &'static str = "cu/attn/norm_rope.cu";
+    const PARAMS: &'static [Param] = &[
+        Param::t_in("x", Dtype::F16, 3),
+        Param::t_in("w", Dtype::F16, 1),
+        Param::t_in("cos_t", Dtype::F16, 2),
+        Param::t_in("sin_t", Dtype::F16, 2),
+        Param::t_in("pos", Dtype::F32, 0),
+        Param::f32("eps"),
+        Param::sz("row_stride"),
+        Param::sz("head_stride"),
+        Param::sz("half"),
+        Param::i32("w_off"),
+        Param::t_in("slots", Dtype::F32, 0),
+        Param::t_in("k_cache", Dtype::I8, 1),
+        Param::t_in("k_scale", Dtype::F32, 1),
+        Param::i32("num_heads"),
+        Param::i32("head_size"),
+        Param::i32("block_size"),
+        Param::t_out("out", Dtype::F16, 1),
+    ];
+    const POOL: &'static [PoolAccess] = &[PoolAccess::write(
+        pools::KV_MAIN,
+        LayoutTag::Knhd,
+        Dtype::I8,
+    )];
+    const LAWS: &'static [Law] = &[Law::OutputFinite];
+    const CAPTURE: CaptureEvidence = CaptureEvidence::NoHostWork;
+    const DETERMINISM: Determinism = Determinism::Deterministic;
+    const SHAPE: crate::spec::ShapeFamily = crate::spec::ShapeFamily {
+        kv_dtype: Some(Dtype::I8),
+        head_dim: &[256],
+        page: &[32],
+        grp: None,
+        tile: None,
+    };
+}
+
 // ============================================================================
 // 命名 static(**单一提升点**;域表与族表共用同一份 KernelMeta)
 // ============================================================================
@@ -420,11 +953,24 @@ pub static NC_ATTN_TILED_FP8KV_F16: KernelMeta = meta_of::<NcAttnTiledFp8kvF16>(
 pub static PAGED_V2_FP8_KNHD_HD256BS32: KernelMeta = meta_of::<PagedAttnV2Fp8KnhdHd256Bs32>();
 pub static PAGED_V2_REDUCE_F16_HD256: KernelMeta = meta_of::<PagedAttnV2ReduceF16Hd256>();
 pub static K0_WRITE_FP8_KNHD: KernelMeta = meta_of::<K0WriteFp8Knhd>();
+pub static K0_WRITE_INT8_KNHD: KernelMeta = meta_of::<K0WriteInt8Knhd>();
+pub static K0_WRITE_INT8_K_ONLY_KNHD: KernelMeta = meta_of::<K0WriteInt8KOnlyKnhd>();
+pub static QUANT_INT8_QK_F16: KernelMeta = meta_of::<QuantInt8QkF16>();
+pub static V_PACK_INT8_PREFILL: KernelMeta = meta_of::<VPackInt8Prefill>();
+pub static V_APPEND_INT8_PAGED: KernelMeta = meta_of::<VAppendInt8Paged>();
+pub static INT8_DECODE_PAGED: KernelMeta = meta_of::<Int8DecodePaged>();
+pub static INT8_DECODE_SPLIT: KernelMeta = meta_of::<Int8DecodeSplit>();
+pub static INT8_DECODE_GQA_TC_SPLIT: KernelMeta = meta_of::<Int8DecodeGqaTcSplit>();
+pub static INT8_DECODE_REDUCE: KernelMeta = meta_of::<Int8DecodeReduce>();
+pub static OWL_INT8_PREFILL_PAGED: KernelMeta = meta_of::<Int8PrefillPaged>();
+pub static OWL_INT8_PREFILL_PAGED_F16PV: KernelMeta = meta_of::<Int8PrefillPagedF16Pv>();
 pub static CHUNKED_PREFILL_FP8_KNHD_HD256: KernelMeta = meta_of::<ChunkedPrefillFp8KnhdHd256>();
 pub static K0_WRITE_FP8_CLASSIC: KernelMeta = meta_of::<K0WriteFp8Classic>();
 pub static K0_WRITE_BF16: KernelMeta = meta_of::<K0WriteBf16>();
 pub static NC_ATTN_FP8KV_BF16: KernelMeta = meta_of::<NcAttnFp8kvBf16>();
 pub static NORM_ROPE_F16: KernelMeta = meta_of::<NormRopeF16>();
+pub static NORM_ROPE_Q_INT8_F16: KernelMeta = meta_of::<NormRopeQInt8F16>();
+pub static NORM_ROPE_K_INT8_WRITE_F16: KernelMeta = meta_of::<NormRopeKInt8WriteF16>();
 pub static NORM_ROPE_BF16: KernelMeta = meta_of::<NormRopeBf16>();
 
 // ============================================================================

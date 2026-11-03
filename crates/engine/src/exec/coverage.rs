@@ -2108,7 +2108,10 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut k_post: Vec<Vec<f32>> = vec![vec![0.0f32; ctx_tokens * hkv * hd]; layers];
         let t_mass = std::time::Instant::now();
         // **池页格式从池实况取**(单源;f16 / fp8 e4m3 同一寻址式)
-        let fmt = crate::exec::kvpage::KvPageFormat::of_pool(self.dev.pool.geom.kv_fp8);
+        let fmt = crate::exec::kvpage::KvPageFormat::of_pool(
+            self.dev.pool.geom.kv_fp8,
+            self.dev.pool.geom.kv_int8,
+        );
         let _ = fmt.elem_bytes(); // 元素宽已由 KvPageFormat 内部用(此处只留显式读口)
         let page_bytes = fmt.page_bytes(page, hkv, hd);
         // V 面(方案 A/B 的**输出级对照**要用;同段同布局,Layout = [token][head][dim])

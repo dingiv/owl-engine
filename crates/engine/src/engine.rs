@@ -606,6 +606,7 @@ impl EngineKnobs {
             owl_models::env::KvQuant::Fp8E4M3 => "fp8",
             // 主干新增变体(暂无核臂,选了会响亮拒);digest 只做标注
             owl_models::env::KvQuant::Fp8E5M2 => "fp8e5m2",
+            owl_models::env::KvQuant::Int8 => "int8",
         };
         let ev = match self.evict_policy {
             owl_store::EvictPolicyKind::Lru => "lru".to_string(),
@@ -2369,14 +2370,56 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         Err(why) => return Err(ModelError::Msg(why)),
     }
     // FI 面启用(量化恒 = 主池;影子池已删,本值只作"启用 + 池量化"携带)
-    // FI 面启用条件 = **能力条件**(f16 池 + paged 页表),不是开关:
+    // FI 面启用条件 = **能力条件**(f16/fp8-e4m3 池 + paged 页表),不是开关:
     // 2026-10-13 起配置面无 flashinfer 选项,FI 恒启用(env.attn.fi 仅门/诊断用)
-    let fi_quant = if env.attn.fi && env.kv.paged && rm.spec.dtype == owl_models::tensor::Dtype::F16
-    {
+    // INT8 不走 FI(自有 int8 prefill/decode 核),fi_quant = None。
+    let fi_quant = if env.attn.fi
+        && env.kv.paged
+        && rm.spec.dtype == owl_models::tensor::Dtype::F16
+        && matches!(
+            env.kv.quant,
+            owl_models::env::KvQuant::None | owl_models::env::KvQuant::Fp8E4M3
+        ) {
         Some(env.kv.quant)
     } else {
         None
     };
+
+    // **INT8 KV 的结构性约束**(2026-11-03):当前核只覆盖 hd=256/page=32、
+    // 无投机、无选择层/索引/图像删除。违反 = 装配期拒启(不静默回退)。
+    if env.kv.quant == owl_models::env::KvQuant::Int8 {
+        if dims.hd != 256 || env.kv.page != 32 || !env.kv.paged {
+            return Err(ModelError::Msg(format!(
+                "[pool] kv_int8 只支持 hd=256/page=32/paged,得 hd={} page={} paged={}",
+                dims.hd, env.kv.page, env.kv.paged
+            )));
+        }
+        if cfg.knobs.draft.depth != 0 {
+            return Err(ModelError::Msg(format!(
+                "[pool] kv_int8 暂不支持投机解码(spec.depth={}):verify 核未接线",
+                cfg.knobs.draft.depth
+            )));
+        }
+        if cfg.knobs.env.attn.force_naive_prefill {
+            return Err(ModelError::Msg(
+                "[pool] kv_int8 不支持 force_naive_prefill(naive 路径按 f16/fp8 池寻址)".into(),
+            ));
+        }
+        if cfg.knobs.index_probe
+            || cfg.knobs.coverage_probe
+            || cfg.knobs.select_decode
+            || cfg.knobs.select_partial
+            || cfg.knobs.image_evict
+        {
+            return Err(ModelError::Msg(
+                "[pool] kv_int8 暂不支持 index/coverage/select/image_evict(这些面按 f16/fp8 K 页解码)".into(),
+            ));
+        }
+        owl_shared::log_info!(
+            "boot",
+            "KV 池 int8(K int8 [nb,page,hkv,hd] / V packed b16 / Kscale per-token / Vscale per-page;无 V shadow)"
+        );
+    }
 
     // spec 域装载(spec_runtime.rs:模式三态裁决 + 草稿器 + 草稿 rope;
     // E5-M2b/C7 —— depth>0 且检查点有 mtp.* → Mtp;dumb 诊断位 → Dumb;

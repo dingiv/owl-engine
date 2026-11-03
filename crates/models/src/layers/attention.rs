@@ -239,6 +239,8 @@ impl Attention {
                 && tokens == 1
                 && !force_naive
                 && ctx.env.attn.qkv_fuse
+                // INT8 没有融合插池臂:走 K-only writer + V append(见下)
+                && !ctx.env.kv.is_int8()
                 && crate::ops::paged_decode_ok(self.hd, p.page)
         });
         if let Some(pol) = insert_pol {
@@ -353,6 +355,9 @@ impl Attention {
         // naive decode attention(slot 直排;一线程一 (t, q_head));
         // 核名/输出 dtype 跟随 q 声明(F5 整模切换;KV cache f16)
         let dt = q.dtype;
+        if ctx.env.kv.is_int8() {
+            return self.paged_decode_int8_output(&q, &k, &v, &gate, kv, tokens, ctx);
+        }
         // 诊断开关(OWL_FORCE_NAIVE=1):强制 naive 回退路径 —— paged 核
         // 数值质量的 A/B 对照(2026-09-27 文本退化排查)
         let force_naive = ctx.env.attn.force_naive_prefill;
@@ -906,7 +911,248 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
-    /// paged prefill(PF1 终;F16 hd∈{128,256}):K0 批量写池(T 行散写) + chunked prefill 批核(bs16 特化;因果语义 = 查询 token t 看
+    /// **INT8 decode**(生产首版):Q per-head int8 → K-only writer → V per-page
+    /// append → `owl_int8_decode_paged`。V scale 每页恒定,追加 token 复用页 scale。
+    #[allow(clippy::too_many_arguments)]
+    fn paged_decode_int8_output(
+        &self,
+        q: &TensorOps,
+        k: &TensorOps,
+        v: &TensorOps,
+        gate: &TensorOps,
+        kv: &KvBuffers,
+        tokens: usize,
+        ctx: &ForwardCtx,
+    ) -> TensorOps {
+        let poisoned = |why: &str| {
+            TensorOps::poisoned(
+                Dtype::F16,
+                vec![tokens, self.hq * self.hd],
+                format!("attention int8 decode: {why}"),
+            )
+        };
+        let Some(pol) = ctx.env.kv.policy() else {
+            return poisoned("缺 paged policy");
+        };
+        if self.hd != 256 || pol.page != 32 {
+            return poisoned(&format!(
+                "只支持 hd=256/page=32,得 hd={}/page={}",
+                self.hd, pol.page
+            ));
+        }
+        let Some(planes) = kv.int8.as_ref() else {
+            return poisoned("KvBuffers.int8 缺 scale 平面(池未按 int8 建)");
+        };
+        let rows = tokens * self.hq;
+        let q_scale = TensorOps::zeros(Dtype::F32, vec![rows * 8]);
+        let q8 = TensorOps::call(SemanticKernel::QuantInt8QkF16)
+            .arg(&q.reshape(vec![rows, self.hd]))
+            .arg(&q_scale)
+            .arg_i32(rows as i32)
+            .arg_i32(self.hd as i32)
+            .aux(&[rows])
+            .with_shape(Dtype::I8, vec![rows, self.hd]);
+        let wr = TensorOps::call(ctx.env.kv.k0_write_op())
+            .aux(&[tokens, self.hkv])
+            .arg(&k.reshape(vec![tokens, self.hkv, self.hd]))
+            .arg(&kv.k_cache)
+            .arg(&planes.k_scale)
+            .arg(&kv.slots)
+            .arg_i32((self.hkv * self.hd) as i32)
+            .arg_i32(self.hkv as i32)
+            .arg_i32(self.hd as i32)
+            .arg_i32(pol.page as i32)
+            .arg_i32(tokens as i32)
+            .with_shape(Dtype::F16, vec![1]);
+        let vw = TensorOps::call(SemanticKernel::VAppendInt8Paged)
+            .aux(&[tokens, self.hkv])
+            .arg(&v.reshape(vec![tokens, self.hkv, self.hd]))
+            .arg(&kv.slots)
+            .arg_i32(tokens as i32)
+            .arg_i32(self.hkv as i32)
+            .arg_i32(self.hd as i32)
+            .arg_i32(pol.page as i32)
+            .arg(&planes.v_scale)
+            .arg(&kv.v_cache)
+            .with_shape(Dtype::F16, vec![1]);
+        let bt_stride = kv.block_tables.shape().last().copied().unwrap_or(1).max(1);
+        // KV 页按 nparts 分片并行;partial = (未归一化 acc, m, l),reduce 合并。
+        // 单序列 decode 用 256 片(65k 时仍 8 页/片);批 decode 降到 64 片省 scratch。
+        let nparts: usize = if tokens == 1 { 256 } else { 64 };
+        let partial_out = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * self.hd]);
+        let partial_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2]);
+        // GQA 头合并 + tensor-core QK/PV:一个 block 服务同 KV head 的 grp 个
+        // q head,K/V 只读一遍;grp<=8 / hd256 / page32 是核契约。
+        let grp = self.hq.checked_div(self.hkv).unwrap_or(0);
+        let tc_ok = grp > 0
+            && grp <= 8
+            && self.hq % self.hkv == 0
+            && self.hd == 256
+            && pol.page == 32;
+        let split_op = if tc_ok {
+            SemanticKernel::Int8DecodeGqaTcSplit
+        } else {
+            SemanticKernel::Int8DecodeSplit
+        };
+        let split = TensorOps::call(split_op)
+            .aux(&[tokens, self.hq, self.hkv, nparts])
+            .arg(&q8)
+            .arg(&q_scale)
+            .arg(&kv.k_cache)
+            .arg(&planes.k_scale)
+            .arg(&kv.v_cache)
+            .arg(&planes.v_scale)
+            .arg(&kv.block_tables)
+            .arg(&kv.kv_lens)
+            .arg(&partial_out)
+            .arg(&partial_stat)
+            .arg(&wr)
+            .arg(&vw)
+            .arg_i32(tokens as i32)
+            .arg_i32(self.hq as i32)
+            .arg_i32(self.hkv as i32)
+            .arg_i32(pol.page as i32)
+            .arg_i32(bt_stride as i32)
+            .arg_i32(nparts as i32)
+            .with_shape(Dtype::F16, vec![1]);
+        let y = TensorOps::call(SemanticKernel::Int8DecodeReduce)
+            .aux(&[tokens, self.hq, nparts])
+            .arg(&partial_out)
+            .arg(&partial_stat)
+            .arg(&split)
+            .arg_i32(tokens as i32)
+            .arg_i32(self.hq as i32)
+            .arg_i32(nparts as i32)
+            .arg_i32(self.hd as i32)
+            .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
+        let n = tokens * self.hq * self.hd;
+        let y = TensorOps::call(SemanticKernel::GateMul)
+            .arg(gate)
+            .arg(&y)
+            .arg_usize(n)
+            .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
+        self.o_proj.forward(&y, ctx)
+    }
+
+    /// **INT8 prefill(融合版)**:NormRope 后直接 Q int8 / K int8 写池,
+    /// 去掉 Q/K 的 F16 中间写读与独立 QuantInt8/K-only writer。
+    /// V 仍走 per-page pack;attention 输出 F16 → GateMul。
+    #[allow(clippy::too_many_arguments)]
+    fn paged_prefill_int8_output(
+        &self,
+        q_raw: &TensorOps,
+        k: &TensorOps,
+        v: &TensorOps,
+        gate: &TensorOps,
+        kv: &KvBuffers,
+        tokens: usize,
+        ctx: &ForwardCtx,
+        kv_slots: &TensorOps,
+        cos_d: &TensorOps,
+        sin_d: &TensorOps,
+        pos: &TensorOps,
+        half: usize,
+    ) -> TensorOps {
+        let poisoned = |why: &str| {
+            TensorOps::poisoned(
+                Dtype::F16,
+                vec![tokens, self.hq * self.hd],
+                format!("attention int8 prefill: {why}"),
+            )
+        };
+        let Some(pol) = ctx.env.kv.policy() else {
+            return poisoned("缺 paged policy");
+        };
+        if self.hd != 256 || pol.page != 32 {
+            return poisoned(&format!(
+                "只支持 hd=256/page=32,得 hd={}/page={}",
+                self.hd, pol.page
+            ));
+        }
+        if ctx.ctx_base % pol.page != 0 {
+            return poisoned(&format!(
+                "chunk 起点未页对齐(ctx_base={} page={});V per-page scale 不能跨 chunk 重算",
+                ctx.ctx_base, pol.page
+            ));
+        }
+        let Some(planes) = kv.int8.as_ref() else {
+            return poisoned("KvBuffers.int8 缺 scale 平面(池未按 int8 建)");
+        };
+        let rows = tokens * self.hq;
+        let q_scale = TensorOps::zeros(Dtype::F32, vec![rows * 8]);
+        let q8 = TensorOps::call(SemanticKernel::NormRopeQInt8F16)
+            .aux(&[tokens, self.hq, self.hd])
+            .arg(q_raw)
+            .arg(&self.q_norm.alpha_decl())
+            .arg(cos_d)
+            .arg(sin_d)
+            .arg(pos)
+            .arg_f32(self.q_norm.eps())
+            .arg_usize(self.hq * self.hd * 2)
+            .arg_usize(self.hd * 2)
+            .arg_usize(half)
+            .arg_i32(1)
+            .arg(&q_scale)
+            .with_shape(Dtype::I8, vec![rows, self.hd]);
+        let wr = TensorOps::call(SemanticKernel::NormRopeKInt8WriteF16)
+            .aux(&[tokens, self.hkv, self.hd])
+            .arg(&k.reshape(vec![tokens, self.hkv, self.hd]))
+            .arg(&self.k_norm.alpha_decl())
+            .arg(cos_d)
+            .arg(sin_d)
+            .arg(pos)
+            .arg_f32(self.k_norm.eps())
+            .arg_usize(self.hkv * self.hd)
+            .arg_usize(self.hd)
+            .arg_usize(half)
+            .arg_i32(1)
+            .arg(kv_slots)
+            .arg(&kv.k_cache)
+            .arg(&planes.k_scale)
+            .arg_i32(self.hkv as i32)
+            .arg_i32(self.hd as i32)
+            .arg_i32(pol.page as i32)
+            .with_shape(Dtype::F16, vec![1]);
+        let vw = TensorOps::call(SemanticKernel::VPackInt8Prefill)
+            .aux(&[tokens, self.hkv, pol.page])
+            .arg(&v.reshape(vec![tokens, self.hkv, self.hd]))
+            .arg(kv_slots)
+            .arg_i32(tokens as i32)
+            .arg_i32(self.hkv as i32)
+            .arg_i32(self.hd as i32)
+            .arg_i32(pol.page as i32)
+            .arg(&planes.v_scale)
+            .arg(&kv.v_cache)
+            .with_shape(Dtype::F16, vec![1]);
+        let y = TensorOps::call(ctx.env.kv.prefill_paged_attn_op())
+            .aux(&[tokens, self.hq])
+            .arg(&q8)
+            .arg(&q_scale)
+            .arg(&kv.k_cache)
+            .arg(&planes.k_scale)
+            .arg(&kv.v_cache)
+            .arg(&planes.v_scale)
+            .arg(&kv.block_tables)
+            .arg(&wr)
+            .arg(&vw)
+            .arg_i32(tokens as i32)
+            .arg_i32((ctx.ctx_base + tokens) as i32)
+            .arg_i32(self.hq as i32)
+            .arg_i32(self.hkv as i32)
+            .arg_i32(pol.page as i32)
+            .arg_i32(ctx.ctx_base as i32)
+            .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
+        let n = tokens * self.hq * self.hd;
+        let y = TensorOps::call(SemanticKernel::GateMul)
+            .arg(gate)
+            .arg(&y)
+            .arg_usize(n)
+            .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
+        self.o_proj.forward(&y, ctx)
+    }
+
+    /// paged prefill(PF1 终;F16 hd∈{128,256}):K0 批量写池(T 行散写)
+    /// + chunked prefill 批核(bs16 特化;因果语义 = 查询 token t 看
     ///   [0, seq_start+t])。naive 逐 token 路径保留为回退。
     #[allow(clippy::too_many_arguments)]
     fn paged_prefill_output(
@@ -1212,6 +1458,25 @@ impl Attention {
         let v = self.v_proj.forward(xs, ctx); // [T, Hkv*HD]
                                               // C1 融合:同 decode 臂(norm_rope strided 直取 value 半段)
         let dt_raw = q_raw.dtype;
+        // INT8 KV:NormRope 直接量化为 Q int8 / K int8 写池,跳过 Q/K 的 F16 中间。
+        if ctx.env.kv.is_int8() {
+            if dt_raw != Dtype::F16 {
+                return TensorOps::poisoned(
+                    Dtype::F16,
+                    vec![tokens, self.hq * self.hd],
+                    "attention int8 prefill: 只支持 F16 激活",
+                );
+            }
+            let (cos_d, sin_d) = rope.cos_sin_of(ctx);
+            let gate = narrow_strided(
+                &q_raw, tokens * self.hq, self.hd * 2, self.hd, self.hd,
+                vec![tokens, row_q],
+            );
+            return self.paged_prefill_int8_output(
+                &q_raw, &k, &v, &gate, kv, tokens, ctx, kv_slots,
+                &cos_d, &sin_d, pos, rope.rotary_half(),
+            );
+        }
         let (q, gate, k) = if dt_raw == Dtype::F16 {
             let (cos_d, sin_d) = rope.cos_sin_of(ctx);
             let gate = narrow_strided(
@@ -1278,6 +1543,13 @@ impl Attention {
         self.tap_q(ctx, &q);
 
         let dt = q.dtype;
+        if ctx.env.kv.is_int8() {
+            return TensorOps::poisoned(
+                Dtype::F16,
+                vec![tokens, self.hq * self.hd],
+                "attention int8 prefill: 只支持 F16 激活",
+            );
+        }
         if dt == Dtype::F16 {
             if let Some(pol) = crate::module::kv_paged_policy(dt) {
                 // 页守卫(2026-10-01 配对律):prefill 核 bs32 特化(vendor
@@ -1525,6 +1797,8 @@ mod tests {
             slots: slots.clone(),
             kv_lens: lens.clone(),
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]),
+
+            int8: None,
         };
 
         // 槽预置哨兵(第 3 格):写者只能动自己那一格,不得清别人的账
@@ -1558,6 +1832,8 @@ mod tests {
             slots: dslots,
             kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]),
+
+            int8: None,
         };
         let sink2 = std::cell::RefCell::new(Vec::new());
         let dctx = crate::module::ForwardCtx::decode(1, &dpos, &dkv, &rp).with_q_sink(&sink2);
@@ -1632,6 +1908,8 @@ mod tests {
             slots: TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[0.0])),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![tokens], &f32b(&[1.0])),
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
+
+            int8: None,
         };
         let ctx = crate::module::ForwardCtx::decode(tokens, &pos, &kv, &rp);
 
@@ -1992,6 +2270,8 @@ mod f16_tests {
             slots: TensorOps::from_host(Dtype::F32, vec![slots.len()], &f32b(&slots)),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![lens.len()], &f32b(&lens)),
             block_tables: bt.clone(),
+
+            int8: None,
         };
 
         let xs_f32: Vec<f32> = (0..t_len * hidden)
@@ -2091,7 +2371,7 @@ mod f16_tests {
             }
             if maxd > 2e-2 {
                 eprintln!(  // 诊断期:RED 全量打印(定位 hd128 档)
-                
+
                     "[v1-isolation][RED] hd{hd} hq{hq} hkv{hkv} t{t_len} 行{t} 偏差 {maxd:.4}\n  got = {:?}\n  want= {:?}\n  |got|={:?}",
                     &got[..6], &want[..6],
                     got.iter().fold(0f32, |a, &b| f32::max(a, b))
@@ -2460,6 +2740,8 @@ mod f16_tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32])), // 契约 slots/kv_lens r2(B6 收敛)
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[t as f32 + 1.0])), // 契约 slots/kv_lens r2(B6 收敛)
                 block_tables: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[0.0])),
+
+                int8: None,
             };
             let mut ctx = ForwardCtx::decode(1, &pos_t, &kv, rp);
             ctx.env.attn.qkv_fuse = qkv_fuse;
@@ -2566,6 +2848,8 @@ mod f16_tests {
             slots: TensorOps::from_host(Dtype::F32, vec![1, slots.len()], &f32b(&slots)),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![1, lens.len()], &f32b(&lens)),
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
+
+            int8: None,
         };
 
         // 输入(f16 位型量化)
@@ -2726,6 +3010,8 @@ mod f16_tests {
             slots: TensorOps::from_host(Dtype::F32, vec![1, slots.len()], &f32b(&slots)),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![1, lens.len()], &f32b(&lens)),
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
+
+            int8: None,
         };
 
         let xs_f32: Vec<f32> = (0..t_len * hidden)
@@ -2794,6 +3080,8 @@ mod owl_port_tests {
             slots: TensorOps::zeros(Dtype::F32, vec![1]),
             kv_lens: TensorOps::zeros(Dtype::F32, vec![1]),
             block_tables: TensorOps::zeros(Dtype::F32, vec![]), // 空形状 = 失守
+
+            int8: None,
         };
         let p = match nb_pages(&kv, Dtype::F16, vec![1, 8], "gate") {
             Ok(n) => panic!("空形状必须毒化,得 nb = {n}"),
@@ -2980,6 +3268,7 @@ mod owl_port_tests {
                 vec![1, nb],
                 &crate::testkit::f32b(&(0..nb).map(|i| i as f32).collect::<Vec<_>>()),
             ),
+            int8: None,
         };
         let bt8 = TensorOps::from_host(
             Dtype::F32,
@@ -3333,6 +3622,8 @@ mod view_alias_tests {
             slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot as f32])),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[1.0])),
             block_tables: TensorOps::from_host(Dtype::F32, vec![1, nb], &f32b(&bt)),
+
+            int8: None,
         };
         // ── 写阶段 ──
         // 内容区 A(视图页 3/5/7)与副本区 B(页 0/1/2)写**同一批** (xs,pos)
@@ -3370,6 +3661,8 @@ mod view_alias_tests {
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[192.0])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[96.0])),
                 block_tables: TensorOps::from_host(Dtype::F32, vec![1, nb], &f32b(&bt)),
+
+                int8: None,
             };
             let mut ctx = ForwardCtx::decode(1, &pos_q, &kv, &rp);
             ctx.attn_v2 = Some(scratch.clone());

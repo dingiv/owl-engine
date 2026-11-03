@@ -384,6 +384,8 @@ mod tests {
             slots: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&[0.0])),  // 契约 slots/kv_lens r2(B6 收敛)
             kv_lens: TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&[1.0])),  // 契约 slots/kv_lens r2(B6 收敛)
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
+
+            int8: None,
         };
         let pos = TensorOps::from_host(Dtype::F32, vec![1, tokens], &crate::testkit::f32b(&pos_v));  // 契约 pos r2
         let xs_t = TensorOps::from_host(Dtype::F32, vec![tokens, hidden], &crate::testkit::f32b(&xs));

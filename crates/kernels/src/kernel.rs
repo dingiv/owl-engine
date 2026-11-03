@@ -159,6 +159,14 @@ mod tests {
                 "vllm_paged_attention_v2_f16_knhd_hd128",
                 "同上",
             ),
+            (
+                "owl_reshape_and_cache_int8_knhd",
+                "INT8 专项:K int8 + scale 无 classic 对偶(池只有 kNHD)",
+            ),
+            (
+                "owl_reshape_and_cache_int8_k_only_knhd",
+                "INT8 专项:只写 K 的 writer,无 classic 对偶",
+            ),
         ];
         let mut paired = 0usize;
         for e in ops::all() {

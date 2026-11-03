@@ -482,6 +482,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     &f32b(&(0..block).map(|i| (pos + 1 + i) as f32).collect::<Vec<_>>()),
                 ),
                 block_tables: bt.clone(),
+
+                int8: None,
             })
             .collect();
         let mut ctx = ForwardCtx::minimal(block);
@@ -583,6 +585,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         &f32b(&(0..block).map(|i| (pos + 1 + i) as f32).collect::<Vec<_>>()),
                     ),
                     block_tables: bt_p.clone(),
+
+                    int8: None,
                 })
                 .collect();
             // ⚠️ 用 **peer 自己的 drafter / rope**(每 rank 各一份实例、各一套设备块;
@@ -911,6 +915,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     &f32b(&(0..rows).map(|i| (pos + i + 1) as f32).collect::<Vec<_>>()),
                 ),
                 block_tables: bt.clone(),
+
+                int8: None,
             })
             .collect();
         let ctx = ForwardCtx::minimal(rows);
@@ -1051,6 +1057,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 ),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[view.visible as f32])),
                 block_tables: bt_step,
+
+                int8: None,
             });
             pos_ts.push(TensorOps::from_host(
                 Dtype::F32,
@@ -1191,6 +1199,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             slots: TensorOps::from_host(Dtype::F32, vec![m + 1], &f32b(&slots_x)),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![m + 1], &f32b(&lens_x)),
             block_tables: bt_t.clone(),
+
+            int8: None,
         };
         let tokens_t = TensorOps::from_host(
             Dtype::F32,
@@ -1221,6 +1231,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 slots: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[slot_at(p)])),
                 kv_lens: TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[view.visible as f32])),
                 block_tables: bt_step,
+
+                int8: None,
             };
             let pt = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[p as f32]));
             chain.push((pt, kv));
@@ -1942,6 +1954,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     &f32b(&(0..t).map(|i| (base + i + 1) as f32).collect::<Vec<_>>()),
                 ),
                 block_tables: bt.clone(),
+
+                int8: None,
             })
             .collect();
         let ctx = ForwardCtx::minimal(t);
@@ -2061,6 +2075,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 vec![1, bt.len()],
                 &f32b(&bt.iter().map(|&b| b as f32).collect::<Vec<_>>()),
             ),
+
+            int8: None,
         };
         mrec("spec.extend.pre", t_all.elapsed());
         let ts_eval = std::time::Instant::now();

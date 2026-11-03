@@ -1,0 +1,40 @@
+# FP8 KV 单 3090 Ti 对照档（与 int8 档同形，仅池格式不同）。
+#
+# 形状：KV fp8 e4m3；与 int8 档同 w4a16 / max_seq / chunk，用于同卡 A/B。
+extends = [
+  "../full.toml",
+  "../parts/model/27b-awq.toml",
+  "../parts/hardware/3090-single.toml",
+  "../parts/kernel/fi-graph.toml",
+  "../parts/pool/fp8.toml",
+]
+
+[server]
+bind = "127.0.0.1:8144"
+
+# 单卡 24G 装不下 262k int8 池（per_tok=33056B）；131072 留足 65k 实测余量。
+# w4a8 是单卡 prefill 的主杠杆：同卡同档 65k 从 w4a16 的 1163 提到 1711 t/s。
+[model]
+quant = "w4a16"
+
+[runtime]
+max_seq = 131072
+prefill_chunk = 2048
+prefill_tail_merge = 0
+implicit_session = true
+
+[spec]
+depth = 0
+lookup = false
+draft_path = ""
+
+[pool]
+kv_int8 = false
+kv_fp8 = true
+prefix_cache = true
+image_evict = false
+snap_max = 2
+host_cache_mb = 10240
+snap_host_mb = 3072
+vram_reserve_mb = 512
+transient_reserve_mb = 1024

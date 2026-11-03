@@ -2391,7 +2391,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // **池页格式从池实况取**(单源:`KvPageFormat::of_pool`)——
         // f16 / fp8 e4m3 两侧同一寻址式,只差元素宽与转换律。
-        let fmt = crate::exec::kvpage::KvPageFormat::of_pool(self.dev.pool.geom.kv_fp8);
+        let fmt = crate::exec::kvpage::KvPageFormat::of_pool(
+            self.dev.pool.geom.kv_fp8,
+            self.dev.pool.geom.kv_int8,
+        );
         let todo: Vec<&(owl_store::ChainHash, usize, usize)> = items
             .iter()
             .filter(|(h, _, _)| {

@@ -46,12 +46,14 @@ impl ChunkInputs {
         let kvs_step = pool
             .kv_caches()
             .iter()
-            .map(|(k, v)| KvBuffers {
+            .enumerate()
+            .map(|(i, (k, v))| KvBuffers {
                 k_cache: k.clone(),
                 v_cache: v.clone(),
                 slots: slots_leaf.clone(),
                 kv_lens: lens_leaf.clone(),
                 block_tables: bt_leaf.clone(),
+                int8: pool.kv_int8_planes(i),
             })
             .collect();
         let gdns_step = pool

@@ -36,12 +36,16 @@ pub(crate) enum KvPageFormat {
     F16,
     /// fp8 e4m3(1B/elem;池以 `Dtype::U32` 承载,元素数 ÷4;值 = 裸 e4m3)。
     Fp8E4M3,
+    /// int8(K int8 字节;scale 平面不在页内,诊断解码按裸 int8 读)。
+    Int8,
 }
 
 impl KvPageFormat {
     /// **从池实况定格式**(唯一产地;第二处出现即违反单源)。
-    pub(crate) fn of_pool(kv_fp8: bool) -> Self {
-        if kv_fp8 {
+    pub(crate) fn of_pool(kv_fp8: bool, kv_int8: bool) -> Self {
+        if kv_int8 {
+            Self::Int8
+        } else if kv_fp8 {
             Self::Fp8E4M3
         } else {
             Self::F16
@@ -52,7 +56,7 @@ impl KvPageFormat {
     pub(crate) fn elem_bytes(self) -> usize {
         match self {
             Self::F16 => 2,
-            Self::Fp8E4M3 => 1,
+            Self::Fp8E4M3 | Self::Int8 => 1,
         }
     }
 
@@ -102,6 +106,13 @@ impl KvPageFormat {
                     *o = lut[*b as usize];
                 }
             }
+            Self::Int8 => {
+                // 诊断/索引回读:裸 int8 → f32;真实注意力必须乘 Kscale 平面。
+                let n = out.len();
+                for (o, b) in out.iter_mut().zip(&page_bytes[base..base + n]) {
+                    *o = (*b as i8) as f32;
+                }
+            }
         }
         Ok(())
     }
@@ -114,10 +125,12 @@ mod tests {
     /// 格式选择单源:池实况 → 格式(第二处若各写一份 `if kv_fp8` 即在此失守)。
     #[test]
     fn 格式从池实况定() {
-        assert_eq!(KvPageFormat::of_pool(false), KvPageFormat::F16);
-        assert_eq!(KvPageFormat::of_pool(true), KvPageFormat::Fp8E4M3);
+        assert_eq!(KvPageFormat::of_pool(false, false), KvPageFormat::F16);
+        assert_eq!(KvPageFormat::of_pool(true, false), KvPageFormat::Fp8E4M3);
+        assert_eq!(KvPageFormat::of_pool(false, true), KvPageFormat::Int8);
         assert_eq!(KvPageFormat::F16.elem_bytes(), 2);
         assert_eq!(KvPageFormat::Fp8E4M3.elem_bytes(), 1);
+        assert_eq!(KvPageFormat::Int8.elem_bytes(), 1);
     }
 
     #[test]
@@ -141,9 +154,13 @@ mod tests {
             bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
         }
         let mut out = [0.0f32; 4];
-        KvPageFormat::F16.decode_row(&bytes, 1, 0, hkv, hd, &mut out).expect("行 1/头 0");
+        KvPageFormat::F16
+            .decode_row(&bytes, 1, 0, hkv, hd, &mut out)
+            .expect("行 1/头 0");
         assert_eq!(out, [9.0, -1.5, 0.25, -64.0]);
-        KvPageFormat::F16.decode_row(&bytes, 0, 1, hkv, hd, &mut out).expect("行 0/头 1");
+        KvPageFormat::F16
+            .decode_row(&bytes, 0, 1, hkv, hd, &mut out)
+            .expect("行 0/头 1");
         assert_eq!(out, [100.0, -0.0, 3.0, -7.5]);
     }
 
@@ -159,7 +176,9 @@ mod tests {
             0x01, 0x7F, 0xFF, 0x08, 0x48, 0x88, 0x20, 0x60, // token 1
         ];
         let mut out = [0.0f32; 4];
-        KvPageFormat::Fp8E4M3.decode_row(&codes, 1, 0, hkv, hd, &mut out).expect("行 1/头 0");
+        KvPageFormat::Fp8E4M3
+            .decode_row(&codes, 1, 0, hkv, hd, &mut out)
+            .expect("行 1/头 0");
         for (i, c) in codes[8..12].iter().enumerate() {
             assert_eq!(
                 out[i].to_bits(),
@@ -167,9 +186,14 @@ mod tests {
                 "第 {i} 个元素与 kernels 参考不一致"
             );
         }
-        KvPageFormat::Fp8E4M3.decode_row(&codes, 0, 1, hkv, hd, &mut out).expect("行 0/头 1");
+        KvPageFormat::Fp8E4M3
+            .decode_row(&codes, 0, 1, hkv, hd, &mut out)
+            .expect("行 0/头 1");
         for (i, c) in codes[4..8].iter().enumerate() {
-            assert_eq!(out[i].to_bits(), owl_models::kernel::e4m3_decode(*c).to_bits());
+            assert_eq!(
+                out[i].to_bits(),
+                owl_models::kernel::e4m3_decode(*c).to_bits()
+            );
         }
     }
 
@@ -178,7 +202,11 @@ mod tests {
     fn 越界响亮拒() {
         let bytes = [0u8; 32];
         let mut out = [0.0f32; 4];
-        assert!(KvPageFormat::F16.decode_row(&bytes, 2, 0, 2, 4, &mut out).is_err());
-        assert!(KvPageFormat::F16.decode_row(&bytes, 0, 0, 2, 8, &mut out).is_err());
+        assert!(KvPageFormat::F16
+            .decode_row(&bytes, 2, 0, 2, 4, &mut out)
+            .is_err());
+        assert!(KvPageFormat::F16
+            .decode_row(&bytes, 0, 0, 2, 8, &mut out)
+            .is_err());
     }
 }

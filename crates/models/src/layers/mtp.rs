@@ -358,7 +358,7 @@ impl MtpPredictor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use crate::tensor::Dtype;
     use crate::testkit::{assert_close, gpu_client, gpu_enabled, harvest_f16};
     use std::path::Path;
@@ -569,6 +569,8 @@ mod wiring_tests {
             slots: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[slot])),  // 契约 r2
             kv_lens: TensorOps::from_host(Dtype::F32, vec![1, 1], &f32b(&[len])),  // 契约 slots/kv_lens r2(B6 收敛)
             block_tables: bt.clone(),
+
+            int8: None,
         };
         let kvs: Vec<KvBuffers> = (0..3).map(|i| mtp_kv(i as f32, (i + 1) as f32)).collect();
         let pos_t: Vec<TensorOps> = (0..3)

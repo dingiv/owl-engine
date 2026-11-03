@@ -1539,12 +1539,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     .pool
                     .kv_caches()
                     .iter()
-                    .map(|(k, v)| KvBuffers {
+                    .enumerate()
+                    .map(|(i, (k, v))| KvBuffers {
                         k_cache: k.clone(),
                         v_cache: v.clone(),
                         slots: slots_t.clone(),
                         kv_lens: lens_t.clone(),
                         block_tables: bt8.clone(),
+                        int8: self.dev.pool.kv_int8_planes(i),
                     })
                     .collect();
                 let gdns_step: Vec<GdnBuffers> = self
@@ -1931,7 +1933,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             let f32b = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
             kv_caches
                 .iter()
-                .map(|(k, v)| KvBuffers {
+                .enumerate()
+                .map(|(i, (k, v))| KvBuffers {
                     k_cache: k.clone(),
                     v_cache: v.clone(),
                     slots: TensorOps::from_host(Dtype::F32, vec![t], &f32b(&phys)),
@@ -1941,6 +1944,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                         &f32b(&((base + 1..=base + t).map(|v| v as f32).collect::<Vec<_>>())),
                     ),
                     block_tables: self.pool.bt_leaf_flat(),
+                    int8: self.pool.kv_int8_planes(i),
                 })
                 .collect()
         };
