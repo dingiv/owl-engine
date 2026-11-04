@@ -1,13 +1,15 @@
 # ── 唯二常驻档 ①:单张 3090 Ti / 27B AWQ-INT4 满血档 ──────────────────────
 #
 # 形状:prefill = eager + Marlin W4A16;decode = FlashInfer + CUDA graph;
-#       投机 = DFlash2 d7(W4A16 草稿);KV = fp8 e4m3;**视觉塔开**;
-#       前缀缓存 + 三层账全开 + image_evict(FP8, delta_limit=4)。
+#       投机 = DFlash2 d7(W4A16 草稿);KV = **int8**(30 系默认);**视觉塔开**;
+#       前缀缓存 + 三层账全开 + image_evict(INT8)。
+# 2026-11-04 INT8 默认验收：1k/2k/8k 文本 needle 绿；视觉 grounding +
+# image_evict 36/36、hit@16px 100%；末块 sync 的 prefill 税 ≈0。
 #
 # **max_seq = 57344 / snap_max = 2 —— 2026-10-27 a8 版全特性稳定点**
 # (原 a16 版 63456;换 a8 后显存账变小,见 [runtime] 注)
 #
-# 24G 卡上:27B + 视觉塔 + DFlash2 d7 + fp8 KV + 前缀缓存 + image_evict
+# 24G 卡上:27B + 视觉塔 + DFlash2 d7 + INT8 KV + 前缀缓存 + image_evict
 # 全部同时开。fresh boot 驱动余量 >1GiB;前缀缓存饱和后可能短暂出现 N6
 # 压力 WARN(功能/删除/缓存实测仍通过)。`image_delete_marked` / GUI 三图
 # 窗口均通过。79872 + snap1 是更大 ctx,但驱动余量贴 1GiB 压力地板,
@@ -31,7 +33,7 @@ extends = [
   "parts/feature/dflash2-27b.toml",
   "parts/hardware/3090-single.toml",
   "parts/kernel/fi-graph.toml",
-  "parts/pool/fp8.toml",
+  "parts/pool/int8.toml",
 ]
 
 [server]
@@ -47,11 +49,8 @@ bind = "0.0.0.0:8137"
 quant = "w4a8"
 
 [kernel]
-# 单 3090 57k 档**不能开** prefill_shadow：boot 后仅 ~1.6GiB 余量，
-# shadow 首次分配 + Marlin 瞬态要 24~64MiB 时直接 vram-hard-budget 拒发。
-# 实测 49k + shadow：4k/8k/32k prefill = 2140/2279/2038 t/s，
-# 对 57k 无 shadow 的 2130/2194/2007 只 +0.5%/+3.9%/+1.5%，
-# 不值得用 4k 上下文换。TP2 档(3080/3090)显存分半，已开 true。
+# INT8 主池没有 FP8→F16 shadow（`prefill_shadow` 仅 kv_fp8 有效；
+# 配置面会拒 `prefill_shadow && !kv_fp8`）。INT8 prefill 走专用 P8 核。
 prefill_shadow = false
 
 [runtime]
