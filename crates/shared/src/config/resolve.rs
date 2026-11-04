@@ -370,11 +370,11 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         reserve_bytes: (get_usize(&out, "pool.vram_reserve_mb").unwrap_or(1024) as u64) << 20,
         model,
         spec_dflash: intent.spec == SpecIntent::Dflash,
-        // 内存模型只关心"每元素几字节":f16 = 2B,其余 = 1B(字段名沿用历史)。
-        kv_fp8: !matches!(
-            get_str(&out, "pool.kv_dtype").unwrap_or("f16"),
-            "f16"
-        ),
+        // 内存模型只关心"每元素几字节"——直接给字节数,不再用布尔表达格式。
+        kv_bytes_per_elem: match get_str(&out, "pool.kv_dtype").unwrap_or("f16") {
+            "fp8" | "int8" => 1,
+            _ => 2,
+        },
         gdn_slots: get_usize(&out, "pool.gdn_slots").unwrap_or(8),
         snap_max: get_usize(&out, "pool.snap_max").unwrap_or(4),
         sessions: c,

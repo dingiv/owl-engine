@@ -212,8 +212,9 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) spec: &'a owl_models::model::ModelSpec,
     /// 哑草稿诊断位(无真草稿器时的 Dumb 档)
     pub(crate) dumb: bool,
-    /// 草稿池 e4m3(B6 偷显存;AL 有损需 A/B)
-    pub(crate) draft_kv_fp8: bool,
+    /// 草稿池存储 dtype(`Bf16` 缺省 / `F8E4M3` = B6 偷显存;AL 有损需 A/B)。
+    /// 单一真源 = `[spec] draft_kv_dtype`;内部一律用 dtype,不留布尔副本。
+    pub(crate) draft_kv_dt: owl_models::contract::Dtype,
     /// 草稿环窗口(0 = auto = 检查点 sliding_window)
     pub(crate) draft_window: usize,
     /// MTP 草稿注意力窗口(tok;0 = 关)
@@ -607,7 +608,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     gs.layers, gs.hq, gs.hkv, gs.hd, gs.tap_ids,
                     gs.block, gs.conv_taps, gs.conv_group, gs.rank, gs.top_k, gs.mask_token
                 );
-                let d2 = boot.draft(draft_dt, inp.draft_kv_fp8)?;
+                let d2 = boot.draft(draft_dt, inp.draft_kv_dt)?;
                 let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
                 let manifest = boot.load(face, &d2, opts).await?;
                 owl_models::formats::load::manifest_mem_ledger(&manifest, "draft-mem");
@@ -629,9 +630,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                 // 装载走通用入口(BF16 全程;设备重排 = 能力自述裁决)
                 let d2 = match inp.tp {
                     Some(tp) if !tp.is_single() => {
-                        owl_models::formats::qwen35::dflash2_draft_sharded(path, inp.draft_kv_fp8, tp)?
+                        owl_models::formats::qwen35::dflash2_draft_sharded(path, inp.draft_kv_dt, tp)?
                     }
-                    _ => owl_models::formats::qwen35::dflash2_draft(path, inp.draft_kv_fp8)?,
+                    _ => owl_models::formats::qwen35::dflash2_draft(path, inp.draft_kv_dt)?,
                 };
                 let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
                 let draft_manifest =
@@ -692,7 +693,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     // 草稿池几何(**分片后**;P2.1-b):从检查点声明 + 本 rank 计划算(不再用写死的 const)
     let (draft_geom, draft_window, draft_env) = match &drafter {
         Some(Drafter::Mtp(_)) => {
-            // MTP 草稿链池 = 独立页池,**存储 dtype 由 `[spec] draft_kv_fp8` 定**
+            // MTP 草稿链池 = 独立页池,**存储 dtype 由 `[spec] draft_kv_dtype` 定**
             // (2026-10-21:此前恒 F16 —— 那条 864 MiB@192k 就是这么白吃的):
             // - fp8 ⇒ e4m3(U32 扁平字节账;每 token 2 KiB)
             // - 否则 ⇒ `draft_dt`(F16;每 token 4 KiB)
@@ -700,12 +701,13 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             // ⇒ 草稿全垃圾(2026-10-13 守卫就抓过这条)。
             let mut env = inp.base_env;
             env.quant = owl_models::module::QuantPlan::F16;
-            env.kv.quant = if inp.draft_kv_fp8 {
+            let fp8 = inp.draft_kv_dt == owl_models::contract::Dtype::F8E4M3;
+            env.kv.quant = if fp8 {
                 owl_models::env::KvQuant::Fp8E4M3
             } else {
                 owl_models::env::KvQuant::None
             };
-            env.kv.dtype = if inp.draft_kv_fp8 {
+            env.kv.dtype = if fp8 {
                 owl_models::contract::Dtype::U32
             } else {
                 draft_dt
@@ -737,9 +739,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             env.kv.head_dim = g.hd;
             env.kv.grp = g.grp();
             // **草稿池的存储真值**:主池 fp8 不代表草稿池 fp8。草稿池
-            // 默认 BF16;`draft_kv_fp8` 才切 e4m3。env 必须跟着走,
+            // 默认 BF16;`draft_kv_dt` 才切 e4m3。env 必须跟着走,
             // 否则 KernelSelectionEnv 会把主池的 fp8 误报给草稿 picker。
-            env.kv.quant = if inp.draft_kv_fp8 {
+            env.kv.quant = if inp.draft_kv_dt == owl_models::contract::Dtype::F8E4M3 {
                 owl_models::env::KvQuant::Fp8E4M3
             } else {
                 owl_models::env::KvQuant::None

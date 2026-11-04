@@ -135,10 +135,10 @@ pub(crate) struct GdnLeaf {
 pub(crate) fn kv_per_tok_bytes(
     n_full: usize,
     dims: &ModelDims,
-    kv_fp8: bool,
+    kv_1byte: bool,
     dflash: bool,
 ) -> usize {
-    (n_full * 2 * dims.hkv * dims.hd) * if kv_fp8 { 1 } else { 2 }
+    (n_full * 2 * dims.hkv * dims.hd) * if kv_1byte { 1 } else { 2 }
         + if dflash { 5 * 2 * 8 * 128 * 2 } else { 0 } // 草稿池按 token 线性(页取整后略同)
 }
 
@@ -315,13 +315,25 @@ pub(crate) struct PoolGeom {
     pub(crate) gdn_slots: usize,
     /// FI 直读旗标(统一契约 P3:影子池删除,FI 直读主池 kNHD 叶子)
     pub(crate) fi_face: bool,
-    /// B6.2:主 KV 池 fp8 e4m3 承载(true = 池块 U32 字节承载 1B/elem;
-    /// 读核走 *_fp8 变体,写核 K0 转换写)
-    pub(crate) kv_fp8: bool,
-    /// INT8 主池(K int8 / V token-major / 两张 scale 平面)
-    pub(crate) kv_int8: bool,
+    /// **主 KV 池存储 dtype**(单一真源;`F8E4M3` = 池块 U32 字节承载 1B/elem、
+    /// 读核走 *_fp8 变体;`I8` = K int8 / V token-major / 两张 scale 平面;
+    /// 其余 = f16 元素账)。派生谓词见 `is_fp8()/is_int8()`,不许再存布尔副本。
+    pub(crate) kv_dtype: Dtype,
     /// 每页 token 折叠因子(页内行布局;legacy = 1)
     x: usize,
+}
+
+impl PoolGeom {
+    /// 主池 fp8 e4m3(派生:**唯一**判定入口)。
+    #[inline]
+    pub(crate) fn is_fp8(&self) -> bool {
+        self.kv_dtype == Dtype::F8E4M3
+    }
+    /// 主池 int8(派生:**唯一**判定入口)。
+    #[inline]
+    pub(crate) fn is_int8(&self) -> bool {
+        self.kv_dtype == Dtype::I8
+    }
 }
 
 /// **主 KV 池 + 页表 + attention scratch + 表槽**(运行期重写内容,地址恒定)。
@@ -1321,7 +1333,7 @@ impl StatePool {
     /// 调用方按步注入 —— 图闭包注输入槽,prefill 注 from_host 标量行)
     pub(crate) fn kv_caches(&self) -> Vec<(TensorOps, TensorOps)> {
         // INT8:K int8 张量 + V token-major int8 字节块(两者每页字节数相同)。
-        if self.geom.kv_int8 {
+        if self.geom.is_int8() {
             let n = self.geom.nb_kv * self.geom.dims.hkv * self.geom.dims.hd * self.geom.page;
             return self
                 .kv
@@ -1337,7 +1349,7 @@ impl StatePool {
         }
         // B6.2:fp8 池 = U32 扁平字节账叶(指针面;读核按元素序自寻址,
         // FI 影子池 fp8 档同款)
-        if self.geom.kv_fp8 {
+        if self.geom.is_fp8() {
             let shape =
                 vec![self.geom.nb_kv * self.geom.dims.hkv * self.geom.dims.hd * self.geom.page / 4];
             return self
@@ -2060,13 +2072,12 @@ impl<'a> AllocCtx<'a> {
         // `if kv_bytes_elem == 1 {…} else { dims.dtype }`,与门各说各话)
         let kv_dt = owl_models::kernel::kv_pool_dtype(plan.kv, dims.dtype);
         let kv_bytes_elem = kv_dt.size_bytes();
-        let kv_fp8 = kv_dt == owl_iface::contract::Dtype::F8E4M3;
-        let kv_int8 = kv_dt == owl_iface::contract::Dtype::I8;
+        let kv_1byte = kv_dt.size_bytes() == 1;
         // 未接臂的格式**响亮拒**(e5m2 暂无核臂;不许静默按 e4m3 跑)
         for (tag, q) in [("kv", plan.kv), ("draft_kv", plan.draft_kv)] {
             if q == owl_models::env::KvQuant::Fp8E5M2 {
                 return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "{tag} = fp8-e5m2:本仓尚无 e5m2 核臂(只有 e4m3);请改 kv_fp8 档或等臂接入"
+                    "{tag} = fp8-e5m2:本仓尚无 e5m2 核臂(只有 e4m3);请改 [pool] kv_dtype = \"fp8\" 或等臂接入"
                 )));
             }
         }
@@ -2080,7 +2091,7 @@ impl<'a> AllocCtx<'a> {
         let paged = pol.is_some();
         owl_shared::log_info!(
             "boot",
-            "StatePool::alloc 进入(n_full={n_full} kv_fp8={kv_fp8})"
+            "StatePool::alloc 进入(n_full={n_full} kv_dtype={kv_dt:?})"
         );
 
         // B6.5 显存硬预算治理(2026-10-10):池容量 =
@@ -2106,7 +2117,7 @@ impl<'a> AllocCtx<'a> {
             plan.draft_geom,
             mtp_mode.then(|| plan.draft_kv.size_bytes()),
         );
-        if kv_int8 {
+        if kv_dt == owl_iface::contract::Dtype::I8 {
             // Kscale `[nb,page,hkv,8]` 每 token 每层 32·hkv B;Vscale
             // `[nb,page,hkv]` 每 token 4·hkv B。
             per_tok.main_kv += n_full
@@ -2287,8 +2298,7 @@ impl<'a> AllocCtx<'a> {
                 paged,
                 gdn_slots,
                 fi_face,
-                kv_fp8,
-                kv_int8,
+                kv_dtype: kv_dt,
                 x,
             },
             kv_dt,
@@ -2397,7 +2407,7 @@ impl KvBank {
         let n_full = ctx.n_full;
         let kv_dt = ctx.kv_dt;
         let kv_bytes_elem = ctx.kv_bytes_elem;
-        let kv_int8 = ctx.geom.kv_int8;
+        let is_int8 = ctx.geom.is_int8();
         let mut kvs: Vec<KvBlocks> = Vec::new();
         for l in 0..n_full {
             // B6.2:fp8 池 = U32 字节承载 1B/elem(元素数不变,块大小减半);
@@ -2413,7 +2423,7 @@ impl KvBank {
             let (v_elems, v_dt) = (k_elems, k_dt);
             let k_cache = zero_block_dt(face, k_elems, k_dt, &format!("kv.k.{l}")).await?;
             let v_cache = zero_block_dt(face, v_elems, v_dt, &format!("kv.v.{l}")).await?;
-            let int8 = if kv_int8 {
+            let int8 = if is_int8 {
                 // Kscale 每 token/头/8 个 32-dim group;Vscale 每 token/头。
                 let ks = nb_kv * page * dims.hkv * 8;
                 let vs = nb_kv * page * dims.hkv;

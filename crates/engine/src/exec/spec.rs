@@ -2203,7 +2203,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             )));
         }
         let n = todo.len();
-        let fp8 = self.dev.pool.geom.kv_fp8;
+        let fp8 = self.dev.pool.geom.is_fp8();
         let entry = if fp8 { "owl_mean_k_block_fp8" } else { "owl_mean_k_block_f16" };
         // 池格式与索引几何必须同口径（f16 走 `__half`，bf16 尚未建臂）
         let per_block_elems = layers * kv_heads * dim;
@@ -2391,10 +2391,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // **池页格式从池实况取**(单源:`KvPageFormat::of_pool`)。
         // 行解码/scale 槽由 `KvPageCodec` 多态提供；调用点不写格式分支。
-        let codec = crate::exec::kvpage::KvPageFormat::of_pool(
-            self.dev.pool.geom.kv_fp8,
-            self.dev.pool.geom.kv_int8,
-        )
+        let codec = crate::exec::kvpage::KvPageFormat::of_pool(self.dev.pool.geom.kv_dtype)
         .codec();
         let k_scale_elems = codec.k_scale_elems(page, hkv);
         let k_scale_bytes = k_scale_elems * std::mem::size_of::<f32>();
@@ -2409,7 +2406,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // INT8 Mean-K 暂无 GPU 块级核；走本函数的 host K+scale 回读路径。
         // （f16/fp8 保持既有 GPU 快路。）
-        if self.boot.cfg.knobs.index_gpu && !self.dev.pool.geom.kv_int8 {
+        if self.boot.cfg.knobs.index_gpu && !self.dev.pool.geom.is_int8() {
             return self.collect_index_gpu(&todo, dim, layers, kv_heads).await;
         }
         let t_index = std::time::Instant::now();

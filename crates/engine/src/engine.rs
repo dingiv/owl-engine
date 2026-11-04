@@ -702,10 +702,9 @@ impl EngineKnobs {
                     .filter(|p| !p.as_os_str().is_empty())
                     .map(|p| p.display().to_string()),
                 mtp_dir: cfg.model.mtp_dir.as_ref().map(std::path::PathBuf::from),
-                kv_quant: if cfg.spec.draft_kv_fp8 {
-                    owl_models::env::KvQuant::Fp8E4M3
-                } else {
-                    owl_models::env::KvQuant::None
+                kv_quant: match cfg.spec.draft_kv_dtype {
+                    owl_shared::config::DraftKvDtype::Fp8 => owl_models::env::KvQuant::Fp8E4M3,
+                    owl_shared::config::DraftKvDtype::Bf16 => owl_models::env::KvQuant::None,
                 },
                 draft_window: cfg.spec.draft_window,
                 mtp_window: cfg.spec.mtp_window,
@@ -861,7 +860,7 @@ pub struct DraftCfg {
     pub dflash2_dir: Option<String>,
     /// MTP 头覆盖路径(目录或 `.gguf`;None = 检查点自带)
     pub mtp_dir: Option<std::path::PathBuf>,
-    /// 草稿池 KV 存储(None = f16;Fp8E4M3 = 偷显存档,原 draft_kv_fp8 布尔)
+    /// 草稿池 KV 存储(None = f16;Fp8E4M3 = 偷显存档;真源 = `[spec] draft_kv_dtype`)
     pub kv_quant: owl_models::env::KvQuant,
     /// DFlash2 草稿环窗口(0 = auto = 检查点 sliding_window)
     pub draft_window: usize,
@@ -1574,7 +1573,7 @@ pub(crate) fn into_running<D: DeviceClient>(
             // 进程 adopt,会被当 token-major 读 ⇒ 静默错值。这里给 INT8
             // 单独一个子目录命名空间(旧目录原样保留,不删数据);切回
             // f16/fp8 时仍用原路径。
-            let disk_root = if dev.pool.geom.kv_int8 && !cfg.knobs.disk_dir.is_empty() {
+            let disk_root = if dev.pool.geom.is_int8() && !cfg.knobs.disk_dir.is_empty() {
                 format!("{}.int8-v2-token-major", cfg.knobs.disk_dir)
             } else {
                 cfg.knobs.disk_dir.clone()
@@ -1744,10 +1743,9 @@ pub(crate) fn into_running<D: DeviceClient>(
         if !dev.pool.geom.paged {
             return Err(ModelError::Msg(format!(
                 "[pool] image_evict = true 需要分页 KV 池（f16/fp8-e4m3/int8）\
-                 (paged={} kv_fp8={} kv_int8={} dtype={:?})",
+                 (paged={} kv_dtype={:?} dtype={:?})",
                 dev.pool.geom.paged,
-                dev.pool.geom.kv_fp8,
-                dev.pool.geom.kv_int8,
+                dev.pool.geom.kv_dtype,
                 dev.pool.geom.dims.dtype
             )));
         }
@@ -1773,9 +1771,9 @@ pub(crate) fn into_running<D: DeviceClient>(
         owl_shared::log_info!(
             "boot",
             "前缀无感删除:开({} 池;leave-gap 保留位置洞、不改 K;可删图像段页对齐 pad = {:?};页 {} tok)",
-            if dev.pool.geom.kv_int8 {
+            if dev.pool.geom.is_int8() {
                 "int8"
-            } else if dev.pool.geom.kv_fp8 {
+            } else if dev.pool.geom.is_fp8() {
                 "fp8-e4m3"
             } else {
                 "f16"
@@ -2425,7 +2423,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     if env.kv.quant == owl_models::env::KvQuant::Int8 {
         if dims.hd != 256 || env.kv.page != 32 || !env.kv.paged {
             return Err(ModelError::Msg(format!(
-                "[pool] kv_int8 只支持 hd=256/page=32/paged,得 hd={} page={} paged={}",
+                "[pool] kv_dtype=\"int8\" 只支持 hd=256/page=32/paged,得 hd={} page={} paged={}",
                 dims.hd, env.kv.page, env.kv.paged
             )));
         }
@@ -2435,7 +2433,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         // 不再拒绝 spec。
         if cfg.knobs.env.attn.force_naive_prefill {
             return Err(ModelError::Msg(
-                "[pool] kv_int8 不支持 force_naive_prefill(naive 路径按 f16/fp8 池寻址)".into(),
+                "[pool] kv_dtype=\"int8\" 不支持 force_naive_prefill(naive 路径按 f16/fp8 池寻址)".into(),
             ));
         }
         // index/coverage 的 host 回读、select_decode 的页表/视图、select_partial
@@ -2468,7 +2466,11 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             mtp_dir: rm.mtp_dir.as_deref(),
             spec: &rm.spec,
             dumb: cfg.knobs.draft.dumb,
-            draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
+            draft_kv_dt: if cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3 {
+            owl_models::contract::Dtype::F8E4M3
+        } else {
+            owl_models::contract::Dtype::BF16
+        },
             draft_window: cfg.knobs.draft.draft_window,
             mtp_window: cfg.knobs.draft.mtp_window,
             mtp_sink: cfg.knobs.draft.mtp_sink,
@@ -2538,7 +2540,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         spec.draft_env.kernel_env = Some(k);
     }
 
-    // B6.2:主 KV 池 fp8 承载(draft_kv_fp8 / kv.fp8 → env.kv.quant)
+    // B6.2:主 KV 池 fp8 承载(draft_kv_dtype / kv_dtype → env.kv.quant)
     // KV 池清单门(收口律机器门;E1 2026-10-17 改为**声明面投影**):
     // 期望集从每个算子的 `POOL` 声明(`池名/布局/dtype`)投影出来,逐个
     // 核 `.cu` 源在场;缺声明/缺源 = 装配失败(池 dtype 改造漏网即启动

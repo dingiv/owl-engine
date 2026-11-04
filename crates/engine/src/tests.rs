@@ -2898,7 +2898,7 @@ pub async fn gpu_08b_budget_probe() {
     snapshot("③run 后");
 
     // 池几何先**拷出来**(下面要 &mut running 跑 turn;借用不重叠)
-    let (nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged) = {
+    let (nb, nb_kv, page, n_full, n_gdn, kv_is_fp8, gdn_slots, snap_slots, paged) = {
         let pool = &running.dev.pool;
         (
             pool.geom.nb,
@@ -2906,7 +2906,7 @@ pub async fn gpu_08b_budget_probe() {
             pool.geom.page,
             pool.kvs().len(),
             pool.gdn_count(),
-            pool.geom.kv_fp8,
+            pool.geom.is_fp8(),
             pool.geom.gdn_slots,
             pool.snap_capacity(),
             pool.geom.paged,
@@ -2932,8 +2932,8 @@ pub async fn gpu_08b_budget_probe() {
         .saturating_sub(kv_pool + gdn_pool + snap_pool + draft_pool);
 
     eprintln!(
-        "[budget] 池几何 nb={} nb_kv={} page={} n_full={} n_gdn={} kv_fp8={} gdn_slots={} snap_slots={} paged={}",
-        nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged
+        "[budget] 池几何 nb={} nb_kv={} page={} n_full={} n_gdn={} kv_is_fp8={} gdn_slots={} snap_slots={} paged={}",
+        nb, nb_kv, page, n_full, n_gdn, kv_is_fp8, gdn_slots, snap_slots, paged
     );
     eprintln!(
         "[budget] 导出 kv_bytes_per_token={kv_per_tok}B({}KiB) gdn_row={:.2}MiB gdn_pool={:.2}MiB snap_pool={:.2}MiB draft_pool={:.2}MiB",

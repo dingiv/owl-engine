@@ -430,9 +430,9 @@ impl<D: DeviceClient> GraphFleet<D> {
                     want.to_string()
                 }
             };
-            let kv_label = if boot.pool.geom.kv_int8 {
+            let kv_label = if boot.pool.geom.is_int8() {
                 "int8"
-            } else if boot.pool.geom.kv_fp8 {
+            } else if boot.pool.geom.is_fp8() {
                 "fp8"
             } else {
                 "f16"
@@ -440,7 +440,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             owl_shared::log_info!(
                 "boot",
                 "现役臂: prefill={} | verify={} | decode={} | spec=depth{} | kv={}",
-                if boot.pool.geom.kv_int8 {
+                if boot.pool.geom.is_int8() {
                     "int8"
                 } else if boot.knobs.env.attn.fi {
                     "FI"
@@ -623,7 +623,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         // taps 层号表(闭包 'static ⇒ Arc 持有;单一事实源 = SpecRuntime)
         let tap_ids = std::sync::Arc::clone(&boot.spec.dflash_tap_ids);
         let kv_caches = pool.kv_caches();
-        let kv_int8: Vec<_> = (0..kv_caches.len())
+        let int8_planes: Vec<_> = (0..kv_caches.len())
             .map(|i| pool.kv_int8_planes(i))
             .collect();
         let gdn_caches = pool.gdn_caches();
@@ -683,7 +683,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                     slots: kv_slot.clone(),
                     kv_lens: len_step.clone(),
                     block_tables: bt_step.clone(),
-                    int8: kv_int8[i].clone(),
+                    int8: int8_planes[i].clone(),
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdn_caches
@@ -927,7 +927,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let batch = boot.knobs.max_batch;
         let vocab = boot.model.logits_vocab();
         let kv_caches = pool.kv_caches();
-        let kv_int8: Vec<_> = (0..kv_caches.len())
+        let int8_planes: Vec<_> = (0..kv_caches.len())
             .map(|i| pool.kv_int8_planes(i))
             .collect();
         let gdn_caches = pool.gdn_caches();
@@ -974,7 +974,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                     slots: kv_slot.clone(),
                     kv_lens: kv_len.clone(),
                     block_tables: bt8.clone(),
-                    int8: kv_int8[i].clone(),
+                    int8: int8_planes[i].clone(),
                 })
                 .collect();
             let gdns_step: Vec<GdnBuffers> = gdn_caches
@@ -1042,7 +1042,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let model_v = Arc::clone(&boot.model);
         let rp_v = boot.rope.clone();
         let kv_caches = pool.kv_caches();
-        let kv_int8: Vec<_> = (0..kv_caches.len())
+        let int8_planes: Vec<_> = (0..kv_caches.len())
             .map(|i| pool.kv_int8_planes(i))
             .collect();
         let gdn_caches = pool.gdn_caches();
@@ -1219,7 +1219,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                         slots: slots_in.clone(),
                         kv_lens: lens_in.clone(),
                         block_tables: kv_bt.clone(),
-                        int8: kv_int8[i].clone(),
+                        int8: int8_planes[i].clone(),
                     })
                     .collect();
                 let gdns_step: Vec<GdnBuffers> = gdn_caches

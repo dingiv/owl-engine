@@ -81,7 +81,7 @@
 //! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
 //! | pool | disk_cache_mb / snap_disk_mb | usize / 0、0(**磁盘两层分片**;0 = 关层) |
 //! | pool | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
-//! | spec | depth / draft / dumb / draft_kv_fp8 | usize 0(off)、SpecDraft auto/mtp/dflash2、flag、flag |
+//! | spec | depth / draft / dumb / draft_kv_dtype | usize 0(off)、SpecDraft auto/mtp/dflash2、flag、DraftKvDtype `bf16\|fp8` |
 //! | spec | dflash_walk | DflashWalk 枚举("conditional"|"fixed_pred"|"unary")/ conditional(**AL 消融旋钮**;缺省 = 设备核原律) |
 //! | spec | q_alpha / q_floor | f32 / 1.0、0.0(**草稿 q 校准旋钮**;α = logit 缩放,ε = 候选集上的均匀地板) |
 //! | spec | mtp_window / mtp_sink | usize / 0、64(MTP 草稿读视图;0 = full) |
@@ -268,6 +268,36 @@ impl KvDtype {
             Self::F16 => 2,
             Self::Fp8 | Self::Int8 => 1,
         }
+    }
+}
+
+/// **草稿池 KV 存储格式**(`[spec] draft_kv_dtype`)。
+///
+/// 2026-11-04 与主池同批:草稿池原先也是"布尔当 dtype"(`draft_kv_fp8`),
+/// 收敛成枚举。草稿只有两档:BF16(缺省,环窗口 2048 的 bf16 池)/ fp8 e4m3
+/// (偷显存档 —— 池体积减半,读核走 K0WriteFp8 / NaiveAttnNcFp8kv)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DraftKvDtype {
+    /// bf16(缺省;草稿执行 dtype = BF16)
+    #[default]
+    Bf16,
+    /// fp8 e4m3
+    Fp8,
+}
+
+impl DraftKvDtype {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Fp8 => "fp8",
+        }
+    }
+}
+
+impl std::fmt::Display for DraftKvDtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1256,7 +1286,8 @@ pub struct SpecCfg {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_path: Option<PathBuf>,
     pub dumb: bool,
-    pub draft_kv_fp8: bool,
+    /// 草稿池存储格式(枚举;缺省 bf16)。见 [`DraftKvDtype`]。
+    pub draft_kv_dtype: DraftKvDtype,
     /// **DFlash2 草稿环窗口(token;0 = auto = 检查点 `sliding_window`)**。
     /// 草稿池按这个窗口做环形缓冲(不再按 pool_tokens 全量物化);
     /// 当前 NC 核只实例化 2048,写非 2048 = boot 拒(等核支持 4k/8k)。
@@ -2042,7 +2073,7 @@ impl Default for SpecCfg {
             draft: SpecDraft::Auto,
             draft_path: None,
             dumb: false,
-            draft_kv_fp8: false,
+            draft_kv_dtype: DraftKvDtype::Bf16,
             draft_window: 0,
             dflash_walk: DflashWalk::Conditional,
             q_alpha: 1.0,

@@ -191,7 +191,7 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
             // DFlash2 草稿自持 W4A16 权重(与主干 plan 独立;MTP = F16 不需)。
             tags.push(T::QUANT_W4A16);
             tags.push(T::QUANT_AWQ);
-            if cfg.spec.draft_kv_fp8 {
+            if cfg.spec.draft_kv_dtype == owl_shared::config::DraftKvDtype::Fp8 {
                 tags.push(T::KV_DRAFT_FP8);
             } else {
                 tags.push(T::KV_DRAFT_BF16);

@@ -476,7 +476,7 @@ impl KernelFamily for FiRuntime {
         let stream = res.stream()?;
         // **prefill-only f16 shadow**:verify/decode(t=1/8)不启用(每步全 ctx
         // 反量化净亏);t>=64 覆盖主 prefill chunk,尾块仍走 fp8。
-        // **仅 fp8 主池**:配置面 `validate` 已拒 `prefill_shadow && !kv_fp8`;
+        // **仅 fp8 主池**:配置面 `validate` 已拒 `prefill_shadow && kv_dtype != "fp8"`;
         // 这里再以 `call.fp8kv` 双保险 —— f16 池的 `PREFILL_FI` 绝不应触发。
         let shadow = prefill_shadow_on()
             && call.fp8kv

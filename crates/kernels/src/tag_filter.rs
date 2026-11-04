@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn draft_fp8_writers_are_draft_pool_only() {
-        // draft_kv_fp8 档：classic 写核（K0WriteFp8/f16 输入与 bf16 输入）
+        // 草稿池 fp8 档（`[spec] draft_kv_dtype = "fp8"`）：classic 写核（K0WriteFp8/f16 输入与 bf16 输入）
         // 只写草稿池；主池仍走 KnHD。布局门必须让它们存活，同时不能把
         // 它们误当主池写者（E14）。
         let f = TagFilter::from_tags(&[

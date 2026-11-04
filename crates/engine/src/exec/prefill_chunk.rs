@@ -366,7 +366,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // chunk 税；FP8/非 INT8 不走此路。
         if is_last
             && base > 0
-            && self.pool.geom.kv_int8
+            && self.pool.geom.is_int8()
             && host.knobs.int8_prefill_sync
         {
             let face = self.graphs.session.face_mut();
@@ -412,7 +412,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             // 增量增长 ⇒ 新页从未进过持久表，核会把 0 当页号读（静默错页）。
             // 稠密 prefill 直接用本 chunk 的会话链做一次性页表；它只在
             // eager prefill 里活一个 chunk，不跨步复用。
-            None if self.pool.geom.kv_int8 => {
+            None if self.pool.geom.is_int8() => {
                 let need = (base + t).div_ceil(self.pool.geom.page.max(1));
                 if bt_chain.len() < need {
                     return Err(ModelError::EngineInvariant {

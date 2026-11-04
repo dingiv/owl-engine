@@ -248,7 +248,7 @@ draft_path = ""
 # 哑草稿诊断面(无草稿器时)
 dumb = false
 # 草稿池 fp8(关 = bf16)
-draft_kv_fp8 = false
+draft_kv_dtype = "bf16"
 # DFlash2 草稿环窗口(token;0 = auto = 检查点声明,缺声明 = 家族 2048;当前核支持 2048)
 draft_window = 0
 # DFlash2 选择器 walk 策略（**AL 消融量具,不是调优旋钮**;仅 DFlash2 档）

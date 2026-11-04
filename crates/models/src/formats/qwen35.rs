@@ -393,7 +393,7 @@ pub fn draft_exec_dt() -> crate::contract::Dtype {
 
 pub fn dflash2_draft(
     dir: &Path,
-    kv_fp8: bool,
+    kv_dt: crate::contract::Dtype,
 ) -> Result<crate::layers::dflash2::DFlash2Draft, ModelError> {
     use crate::formats::kind::CheckpointKind;
     let (spec, rep) = ModelSpec::from_ckpt(
@@ -423,7 +423,7 @@ pub fn dflash2_draft(
             "boot",
             "DFlash2 草稿 = 未量化原生家族(BF16 直载;AL 实测 3.10/4.96,与 W4A16 家族同量级 —— 生产仍推荐 W4A16 省显存)"
         );
-        owl_shared::log_info!("boot", "dflash draft-pool kv_fp8 = {kv_fp8}");
+        owl_shared::log_info!("boot", "dflash draft-pool kv_dt = {kv_dt:?}");
     }
     let plan = if is_q {
         crate::module::QuantPlan::W4A16
@@ -436,7 +436,7 @@ pub fn dflash2_draft(
         &spec,
         plan,
         dt,
-        kv_fp8,
+        kv_dt,
     ))
 }
 
@@ -444,7 +444,7 @@ pub fn dflash2_draft(
 /// spec 先过 [`shard_draft_spec`](`plan.is_single()` ⇒ 与旧路径逐字节同物)。
 pub fn dflash2_draft_sharded(
     dir: &Path,
-    kv_fp8: bool,
+    kv_dt: crate::contract::Dtype,
     tp: crate::plan::tp::TpPlan,
 ) -> Result<crate::layers::dflash2::DFlash2Draft, ModelError> {
     use crate::formats::kind::CheckpointKind;
@@ -468,7 +468,7 @@ pub fn dflash2_draft_sharded(
         &spec,
         plan,
         draft_exec_dt(),
-        kv_fp8,
+        kv_dt,
     ))
 }
 
@@ -597,10 +597,10 @@ mod tests {
     async fn load_dflash2_draft<D: crate::contract::DeviceClient>(
         dir: &Path,
         face: &mut D,
-        kv_fp8: bool,
+        kv_dt: crate::contract::Dtype,
         device_repack: Option<bool>,
     ) -> Result<(crate::layers::dflash2::DFlash2Draft, crate::module::LoadManifest), ModelError> {
-        let draft = dflash2_draft(dir, kv_fp8)?;
+        let draft = dflash2_draft(dir, kv_dt)?;
         let opts = LoadOpts {
             // 与 `dflash2_draft` 的 dt 同一判据(草稿执行 dtype 单源)
             dtype: draft_exec_dt(),
@@ -658,7 +658,7 @@ mod tests {
         // ① 生产姿势装载(设备重排臂)计时
         let t0 = std::time::Instant::now();
         let (draft_dev, manifest) =
-            load_dflash2_draft(std::path::Path::new(&dir), &mut gpu, false, Some(true))
+            load_dflash2_draft(std::path::Path::new(&dir), &mut gpu, crate::contract::Dtype::BF16, Some(true))
                 .await
                 .expect("草稿装载(设备重排)");
         eprintln!(
@@ -795,7 +795,7 @@ mod tests {
         }
         let t_cpu = std::time::Instant::now();
         let (draft_cpu, _m2) =
-            load_dflash2_draft(std::path::Path::new(&dir), &mut gpu, false, Some(false))
+            load_dflash2_draft(std::path::Path::new(&dir), &mut gpu, crate::contract::Dtype::BF16, Some(false))
                 .await
                 .expect("草稿装载(CPU 臂)");
         eprintln!("[draft-bench] CPU 臂装载(对照) {:?}", t_cpu.elapsed());
@@ -1691,7 +1691,7 @@ mod tests {
         };
         let dir = std::path::Path::new(&dir);
         let mut gpu = crate::testkit::gpu_client().await;
-        let (draft, manifest) = load_dflash2_draft(dir, &mut gpu, false, None)
+        let (draft, manifest) = load_dflash2_draft(dir, &mut gpu, crate::contract::Dtype::BF16, None)
             .await
             .expect("DFlash2 装载");
         assert_eq!(draft.hidden(), 5120);

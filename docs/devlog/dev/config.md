@@ -325,6 +325,10 @@ ls profiles/
   → `kv_dtype = "int8"`;全 false → `kv_dtype = "f16"`。
   同批:`prefill_shadow = true` 现在会校验主池必须是 `"fp8"`(f16/int8 主池
   没有可反量化的源,旧档静默无效)。
+- **`spec.draft_kv_fp8` 已退役**(2026-11-04,同批):草稿池也是"布尔当 dtype"
+  ⇒ **`spec.draft_kv_dtype = "bf16" | "fp8"`**(缺省 bf16)。旧档同样被
+  `deny_unknown_fields` 响亮拒(报错里列出 `draft_kv_dtype`)。
+  迁移:`draft_kv_fp8 = false` → `draft_kv_dtype = "bf16"`;`true` → `"fp8"`。
 - **allowed_ops 已退役**(2026-10-20):配置按 `model.format/quant/head_quant`、
   `pool.kv_dtype`、`spec.depth`、`model.vision`、`parallel.mode` 自动派生
   tag filter;`[kernel] tag_wildcard = true` 是诊断 `*` 逃生门。

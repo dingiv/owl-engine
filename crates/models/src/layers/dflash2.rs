@@ -216,7 +216,7 @@ pub struct DfAttn {
     /// 激活/池 dtype(同日十四;池叶子由引擎侧同 dtype 分配)
     dt: Dtype,
     /// B6 偷显存:前缀池 e4m3(写/读走 fp8kv 变体;默认 false)
-    kv_fp8: bool,
+    kv_dt: Dtype,
     /// **草稿池 ring 槽数**(0 = 线性全池;>0 = 逻辑位 `% ring_cap`)。
     /// 由引擎按 `draft_ring_slots(page)` 设置(检查点滑窗 2048 + 自块 8)。
     ring_cap: usize,
@@ -234,7 +234,7 @@ impl DfAttn {
         eps: f32,
         plan: impl Into<PlanSource<'a>>,
         dt: Dtype,
-        kv_fp8: bool,
+        kv_dt: Dtype,
     ) -> Self {
         // 计划 = 逐键来源(Uniform 臂忽略键);层内局部键是**声明面事实**
         let p = plan.into();
@@ -264,7 +264,7 @@ impl DfAttn {
             hd,
             hidden,
             dt,
-            kv_fp8,
+            kv_dt,
             ring_cap: 0,
         }
     }
@@ -339,12 +339,15 @@ impl DfAttn {
         let row_kv = self.hkv * self.hd;
         // B6 偷显存:fp8 池 → K0 转换写(按输入 dtype 选 f16/bf16 变体)
         static DBG: std::sync::Once = std::sync::Once::new();
-        DBG.call_once(|| owl_shared::log_info!("boot", "DfAttn dt={:?} kv_fp8={}", self.dt, self.kv_fp8));
-        let k0_op = match (self.dt, self.kv_fp8) {
-            (_, false) => crate::ops::SemanticKernel::K0Write,
-            (Dtype::F16, true) => crate::ops::SemanticKernel::K0WriteFp8,
-            (Dtype::BF16, true) => crate::ops::SemanticKernel::K0WriteFp8Bf16,
-            other => panic!("K0 fp8 无 {other:?} 变体"),
+        DBG.call_once(|| owl_shared::log_info!("boot", "DfAttn dt={:?} kv_dt={:?}", self.dt, self.kv_dt));
+        let k0_op = if self.kv_dt == Dtype::F8E4M3 {
+            match self.dt {
+                Dtype::F16 => crate::ops::SemanticKernel::K0WriteFp8,
+                Dtype::BF16 => crate::ops::SemanticKernel::K0WriteFp8Bf16,
+                other => panic!("K0 fp8 无 {other:?} 变体"),
+            }
+        } else {
+            crate::ops::SemanticKernel::K0Write
         };
         TensorOps::call(k0_op)
             .aux(&[t])
@@ -392,12 +395,10 @@ impl DfAttn {
         // kNonCausal 变体挂 DF-4,KV 全走池 + wr 依赖边)
         // v2:grid (T, Hq) × block (hd) —— block-per-head flash 式
         // B6 偷显存:fp8 池 → NC fp8kv 变体(前缀 e4m3 读;自块原 dtype)
-        let y = TensorOps::call(match (self.dt, self.kv_fp8) {
-            (Dtype::F16, false) => SemanticKernel::NaiveAttnNc,
-            (Dtype::F16, true) => SemanticKernel::NaiveAttnNcFp8kv,
-            (Dtype::BF16, false) => SemanticKernel::NaiveAttnNc,
-            (Dtype::BF16, true) => SemanticKernel::NaiveAttnNcFp8kv,
-            other => panic!("owl_naive_attn_nc 无 {other:?} 变体"),
+        let y = TensorOps::call(if self.kv_dt == Dtype::F8E4M3 {
+            SemanticKernel::NaiveAttnNcFp8kv
+        } else {
+            SemanticKernel::NaiveAttnNc
         })
         .arg(&q)
         .arg(&k.reshape(vec![t, self.hkv, self.hd]))
@@ -466,7 +467,7 @@ impl DfLayer {
         block_size: usize,
         plan: impl Into<PlanSource<'a>>,
         dt: Dtype,
-        kv_fp8: bool,
+        kv_dt: Dtype,
     ) -> Self {
         let p = plan.into();
         // conv 投影的计划:Uniform 档恒 F16(检查点原生);Keyed(GGUF)逐键
@@ -476,7 +477,7 @@ impl DfLayer {
         Self {
             input_ln: RmsNorm::new("input_layernorm", hidden, eps),
             attn_conv: GroupedConv::new(hidden, block_size, dt, attn_conv_plan),
-            attn: DfAttn::new(hq, hkv, hd, hidden, eps, p, dt, kv_fp8),
+            attn: DfAttn::new(hq, hkv, hd, hidden, eps, p, dt, kv_dt),
             post_ln: RmsNorm::new("post_attention_layernorm", hidden, eps),
             mlp_conv: GroupedConv::new(hidden, block_size, dt, mlp_conv_plan),
             mlp: Mlp::new(hidden, inter, p).with_out_dtype(dt),
@@ -755,7 +756,7 @@ pub struct DFlash2Draft {
     vocab: usize,
     /// B6 偷显存:草稿池 e4m3(encode 写/NC 读走 fp8kv;默认 false)
     #[allow(dead_code)]
-    pub(crate) kv_fp8: bool,
+    pub(crate) kv_dt: Dtype,
     /// 草稿激活 dtype(**恒 BF16** —— 单源 `qwen35::draft_exec_dt`;F16 仅存量
     /// 测试面:propose 残差流实测到 6.3e4 → INF/NaN,装不下)
     dt: Dtype,
@@ -809,7 +810,7 @@ impl DFlash2Draft {
         n_layers: usize,
         eps: f32,
         vocab: usize,
-        kv_fp8: bool,
+        kv_dt: Dtype,
     ) -> Self {
         Self::new_with_plan_dt(
             hidden,
@@ -822,7 +823,7 @@ impl DFlash2Draft {
             vocab,
             QuantPlan::F16,
             Dtype::F16,
-            kv_fp8,
+            kv_dt,
         )
     }
 
@@ -839,15 +840,15 @@ impl DFlash2Draft {
         eps: f32,
         vocab: usize,
         plan: QuantPlan,
-        kv_fp8: bool,
+        kv_dt: Dtype,
     ) -> Self {
-        Self::new_with_plan_dt(hidden, inter, hq, hkv, hd, n_layers, eps, vocab, plan, Dtype::F16, kv_fp8)
+        Self::new_with_plan_dt(hidden, inter, hq, hkv, hd, n_layers, eps, vocab, plan, Dtype::F16, kv_dt)
     }
 
     /// **声明构造**(起点侧事实 → 声明):维度全从草稿检查点的 spec 取
     /// (config.json:hidden/inter/FA 头/层数/eps/vocab);fc 臂由量化计划定。
     /// 无自持常量 ⇒ 换 DFlash2 家族(W4A16/BF16/W8…)不动代码。
-    pub fn from_spec(spec: &crate::model::ModelSpec, plan: QuantPlan, dt: Dtype, kv_fp8: bool) -> Self {
+    pub fn from_spec(spec: &crate::model::ModelSpec, plan: QuantPlan, dt: Dtype, kv_dt: Dtype) -> Self {
         Self::new_with_plan_dt(
             spec.hidden,
             spec.inter,
@@ -859,7 +860,7 @@ impl DFlash2Draft {
             spec.vocab,
             plan,
             dt,
-            kv_fp8,
+            kv_dt,
         )
     }
 
@@ -878,7 +879,7 @@ impl DFlash2Draft {
         vocab: usize,
         plan: QuantPlan,
         dt: Dtype,
-        kv_fp8: bool,
+        kv_dt: Dtype,
     ) -> Self {
         let fc = match plan {
             QuantPlan::W4A16 => DraftFc::Q(
@@ -902,7 +903,7 @@ impl DFlash2Draft {
             // HF:selector 投影恒 F16(检查点原生)
             QuantPlan::F16,
             dt,
-            kv_fp8,
+            kv_dt,
         )
     }
 
@@ -930,7 +931,7 @@ impl DFlash2Draft {
         fc_plan: QuantPlan,
         selector_plan: QuantPlan,
         dt: Dtype,
-        kv_fp8: bool,
+        kv_dt: Dtype,
     ) -> Self {
         let fc = DraftFc::G(
             (0..n_layers)
@@ -938,7 +939,7 @@ impl DFlash2Draft {
                 .collect(),
         );
         Self::assemble(
-            hidden, inter, hq, hkv, hd, n_layers, eps, vocab, fc, plan, selector_plan, dt, kv_fp8,
+            hidden, inter, hq, hkv, hd, n_layers, eps, vocab, fc, plan, selector_plan, dt, kv_dt,
         )
     }
 
@@ -958,14 +959,14 @@ impl DFlash2Draft {
         plan: crate::module::PlanSource<'_>,
         selector_plan: QuantPlan,
         dt: Dtype,
-        kv_fp8: bool,
+        kv_dt: Dtype,
     ) -> Self {
         Self {
             fc,
             hidden_norm: RmsNorm::new("hidden_norm", hidden, eps),
             layers: (0..n_layers)
                 .map(|i| {
-                    DfLayer::new(hq, hkv, hd, hidden, inter, eps, BLOCK, plan.at_layer(i), dt, kv_fp8)
+                    DfLayer::new(hq, hkv, hd, hidden, inter, eps, BLOCK, plan.at_layer(i), dt, kv_dt)
                 })
                 .collect(),
             norm: RmsNorm::new("norm", hidden, eps),
@@ -976,7 +977,7 @@ impl DFlash2Draft {
             eps,
             vocab,
             dt,
-            kv_fp8,
+            kv_dt,
         }
     }
 
@@ -1553,7 +1554,7 @@ mod tests {
     async fn gpu_dflash_fc_split_matches_host() {
         let (hidden, n) = (32usize, 4usize);
         let fan = n * hidden;
-        let draft = DFlash2Draft::new(hidden, hidden, 2, 1, 16, n, 1e-6, 23, false);
+        let draft = DFlash2Draft::new(hidden, hidden, 2, 1, 16, n, 1e-6, 23, Dtype::BF16);
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
         let w_fc: Vec<f32> = (0..hidden * fan)
             .map(|i| half::f16::from_f32(((i as f32) * 0.11).sin() * 0.5).to_f32())
@@ -1658,7 +1659,7 @@ mod tests {
 
         let (hidden, inter, hq, hkv, hd, nl) = (5120usize, 17408usize, 32usize, 8usize, 128usize, 5usize);
         let (vocab, _topk) = (248320usize, 16usize);
-        let _draft = DFlash2Draft::new_with_plan(hidden, inter, hq, hkv, hd, nl, 1e-6, vocab, QuantPlan::W4A16, false);
+        let _draft = DFlash2Draft::new_with_plan(hidden, inter, hq, hkv, hd, nl, 1e-6, vocab, QuantPlan::W4A16, Dtype::BF16);
 
         // 公式 E/LM(f16 网格;与 python 同式)→ Embedding 装载
         let gen = |n: usize, seed: f64| -> Vec<f32> {
@@ -1686,7 +1687,7 @@ mod tests {
 
         // 草稿装载(W4A16)
         let draft = {
-            let d = DFlash2Draft::new_with_plan(hidden, inter, hq, hkv, hd, nl, 1e-6, vocab, QuantPlan::W4A16, false);
+            let d = DFlash2Draft::new_with_plan(hidden, inter, hq, hkv, hd, nl, 1e-6, vocab, QuantPlan::W4A16, Dtype::BF16);
             let src = crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir)).unwrap();
             crate::interpreters::eval_load(&d, &mut gpu, &src, &lctx).await.expect("draft 装载");
             d
@@ -2020,7 +2021,7 @@ mod tests {
         let mut gpu = gpu_client().await;
         let lctx = LoaderCtx { dtype: Dtype::F16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         let draft = DFlash2Draft::new_with_plan(
-            5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, false,
+            5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, Dtype::BF16,
         );
         let src = crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir))
             .expect("源打开");
@@ -2271,7 +2272,7 @@ mod tests {
     async fn gpu_dflash_nc_attn_roundtrip() {
         let (hq, hkv, hd, hidden) = (4usize, 2usize, 16usize, 32usize);
         let eps = 1e-6f32;
-        let attn = DfAttn::new(hq, hkv, hd, hidden, eps, QuantPlan::F16, Dtype::F16, false);
+        let attn = DfAttn::new(hq, hkv, hd, hidden, eps, QuantPlan::F16, Dtype::F16, Dtype::BF16);
         let mut src: HashMap<String, Vec<f32>> = HashMap::new();
         src.insert("k_proj".into(), gen(hkv * hd * hidden, 21.0));
         src.insert("v_proj".into(), gen(hkv * hd * hidden, 22.0));
@@ -2764,7 +2765,7 @@ mod tests {
         let mut gpu = gpu_client().await;
         let lctx = LoaderCtx { dtype: Dtype::BF16, shard: 1, slice_id: 0, device_repack: false, verify: false, debug_tap: false, staging_mb: 128, dump: false };
         let draft = DFlash2Draft::new_with_plan_dt(
-            5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, Dtype::BF16, false,
+            5120, 17408, 32, 8, 128, 5, 1e-6, 248320, QuantPlan::W4A16, Dtype::BF16, Dtype::BF16,
         );
         let src = crate::formats::w4a16::W4A16Source::open_dir(std::path::Path::new(&dir))
             .expect("源打开");

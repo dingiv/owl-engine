@@ -605,7 +605,7 @@ impl GgufDraftBoot {
     }
 
     /// 声明草稿容器(逐张量计划;构造期取走 unresolved ⇒ 有未解析 = 响亮拒)
-    pub fn draft(&self, dt: Dtype, kv_fp8: bool) -> Result<DFlash2Draft, ModelError> {
+    pub fn draft(&self, dt: Dtype, kv_dt: Dtype) -> Result<DFlash2Draft, ModelError> {
         let plan = DraftGgufPlan::new(&self.gguf);
         let keys = DraftGgufConvention;
         // 草稿 norm **未烘焙 +1**(实测 max|Δ|=0);且 DFlash2Draft 的 RmsNorm
@@ -640,7 +640,7 @@ impl GgufDraftBoot {
             fc_plan,
             selector_plan,
             dt,
-            kv_fp8,
+            kv_dt,
         );
         let unresolved = crate::module::PlanTable::take_unresolved(&plan);
         if !unresolved.is_empty() {
@@ -746,7 +746,7 @@ mod tests {
 
         // 覆盖双向(85 wants ↔ 81 张量)
         use crate::module::Loadable;
-        let d = b.draft(Dtype::BF16, false).expect("声明草稿");
+        let d = b.draft(Dtype::BF16, Dtype::BF16).expect("声明草稿");
         let ctx = crate::module::LoaderCtx { dtype: Dtype::BF16, ..Default::default() };
         let ops = d.layout(&ctx);
         let mut wanted = std::collections::BTreeSet::new();
@@ -889,7 +889,7 @@ mod tests {
             owl_shared::testkit::report::skip("资源清单缺 gguf:draft-q4");
             return;
         };
-        let d = b.draft(Dtype::BF16, false).expect("声明草稿");
+        let d = b.draft(Dtype::BF16, Dtype::BF16).expect("声明草稿");
         let ctx = crate::module::LoaderCtx {
             dtype: Dtype::BF16,
             ..Default::default()
@@ -1098,11 +1098,11 @@ mod tests {
         let mut gpu = crate::testkit::gpu_client().await;
 
         // ① 两侧装载(同一执行 dtype = 草稿单源 BF16)
-        let g = b.draft(Dtype::BF16, false).expect("GGUF 草稿声明");
+        let g = b.draft(Dtype::BF16, Dtype::BF16).expect("GGUF 草稿声明");
         let opts = crate::formats::load::LoadOpts::new(&gpu, Dtype::BF16);
         let man = b.load(&mut gpu, &g, opts).await.expect("GGUF 草稿装载");
         crate::formats::load::manifest_mem_ledger(&man, "gguf-draft-mem");
-        let hf = crate::formats::qwen35::dflash2_draft(std::path::Path::new(&hf_dir), false)
+        let hf = crate::formats::qwen35::dflash2_draft(std::path::Path::new(&hf_dir), Dtype::BF16)
             .expect("HF 草稿声明");
         let opts = crate::formats::load::LoadOpts::new(&gpu, Dtype::BF16);
         let src = crate::formats::safetensors::SafeTensorsSource::open_dir(std::path::Path::new(

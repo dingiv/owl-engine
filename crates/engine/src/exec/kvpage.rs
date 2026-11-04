@@ -11,7 +11,7 @@
 //!
 //! 因此这里提供 **`KvPageCodec` trait**，把"元素宽 / K 行 / V 行 / scale 槽"
 //! 收进格式对象；调用点只拿 `&dyn KvPageCodec`，不再各自写
-//! `if kv_fp8 { ... } else if kv_int8 { ... }`。格式从池实况取
+//! `match pool.geom.kv_dtype { I8 => …, F8E4M3 => …, _ => … }`。格式从池实况取
 //! (`KvPageFormat::of_pool`)，不从第二个配置项猜。
 
 use owl_iface::contract::ModelError;
@@ -25,14 +25,12 @@ pub(crate) enum KvPageFormat {
 }
 
 impl KvPageFormat {
-    /// **从池实况定格式**(唯一产地;第二处出现即违反单源)。
-    pub(crate) fn of_pool(kv_fp8: bool, kv_int8: bool) -> Self {
-        if kv_int8 {
-            Self::Int8
-        } else if kv_fp8 {
-            Self::Fp8E4M3
-        } else {
-            Self::F16
+    /// **从池存储 dtype 定格式**(唯一产地;第二处出现即违反单源)。
+    pub(crate) fn of_pool(kv_dtype: owl_iface::contract::Dtype) -> Self {
+        match kv_dtype {
+            owl_iface::contract::Dtype::I8 => Self::Int8,
+            owl_iface::contract::Dtype::F8E4M3 => Self::Fp8E4M3,
+            _ => Self::F16,
         }
     }
 
@@ -296,9 +294,10 @@ mod tests {
 
     #[test]
     fn 格式从池实况定() {
-        assert_eq!(KvPageFormat::of_pool(false, false), KvPageFormat::F16);
-        assert_eq!(KvPageFormat::of_pool(true, false), KvPageFormat::Fp8E4M3);
-        assert_eq!(KvPageFormat::of_pool(false, true), KvPageFormat::Int8);
+        use owl_iface::contract::Dtype;
+        assert_eq!(KvPageFormat::of_pool(Dtype::F16), KvPageFormat::F16);
+        assert_eq!(KvPageFormat::of_pool(Dtype::F8E4M3), KvPageFormat::Fp8E4M3);
+        assert_eq!(KvPageFormat::of_pool(Dtype::I8), KvPageFormat::Int8);
         assert_eq!(KvPageFormat::F16.elem_bytes(), 2);
         assert_eq!(KvPageFormat::Fp8E4M3.elem_bytes(), 1);
         assert_eq!(KvPageFormat::Int8.elem_bytes(), 1);
