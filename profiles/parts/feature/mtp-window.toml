@@ -1,4 +1,9 @@
 # 特性组件：MTP window（草稿读 sink=64 + 最近 4032 tok；target verify 全上下文）。
+#
+# `mtp_window_min_ctx` = 上下文超过它才启用窗口。**全局保持 12288**：
+# W4A16 的 8k+输出曾因尾部压缩回归（历史门，见 mtp-longctx-windowed.md）。
+# W4A8+INT8 是例外：8k 就启用窗口能显著恢复 AL，覆盖值写在该测量档
+# `profiles/measurement/qwen38_27b-3090-mtp-int8.toml`（min_ctx=4096）。
 [spec]
 mtp_window = 4032
 mtp_sink = 64
