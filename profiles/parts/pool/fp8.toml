@@ -1,4 +1,6 @@
-# 池组件：fp8 KV + 单会话 GDN。
+# 池组件：FP8 KV + 单会话 GDN。**40/50 系默认池**；30 系默认改用 int8。
+# ⚠️ FI/Decode 的 FP8 路径仍 dequant→half（compute 不是 FP8 MMA），
+# 存储/带宽收益为主；详见 profiles/README.md。
 [pool]
 kv_fp8 = true
 gdn_slots = 1

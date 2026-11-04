@@ -13,7 +13,7 @@ extends = [
   "parts/model/27b-awq.toml",
   "parts/hardware/3090-single.toml",
   "parts/kernel/fi-graph.toml",
-  "parts/pool/fp8.toml",
+  "parts/pool/fp8.toml",   # 30 系换成 parts/pool/int8.toml；40/50 保持 fp8
 ]
 ```
 
@@ -32,6 +32,19 @@ extends = [
   所以 N>1 的效果是"第二路**进引擎队列**（`/debug/queue` 可见、有 turn id），
   而不是在 HTTP permit 上干等"；设备拍仍串行。
 
+## KV 池代际默认（2026-11-04）
+
+- **30 系（3090 / 3080）**：默认 `parts/pool/int8.toml`
+  （唯一例外：GGUF IQ3_S 3-bit 档保持 FP8 —— INT8 下 1k needle 稳定拒答，
+  FP8 同题通过；不是 INT8 机制错，是 3-bit 主干对 KV 量化误差更敏感）
+  （K int8 + V packed + per-token/per-page scale）。
+  INT8 文本 1k/2k/8k/32k/120k、视觉 grounding、`image_evict` 删除吸收
+  均已过门；默认档不再走 FP8。
+- **40 系 / 50 系**：继续 `parts/pool/fp8.toml`；`KernelPick` 在
+  `Arch=Sm89/Sm120` 自动选**原生 FP8 MMA**（e4m3 Q×KV，不再反量化到
+  half）。4080 实测 std 1024–8192 +2.8%、32k +19.6%、65k +16.0%；
+  **50 系共用同核，待真机质量/性能验收**。
+
 ## 常驻档（入口面）
 
 2026-10-24 用户裁决：入口档只留硬件形状，其余 27 个历史档删除
@@ -40,10 +53,10 @@ extends = [
 
 | 文件 | 端口 | 形状 |
 |---|---|---|
-| `qwen38_27b-3090.toml` | 8137 | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 57344（a8 版全特性稳定点）** / chunk 2048 |
-| `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144** / chunk 2048 / **并发 2（`gdn_slots=2` · `snap_max=3`；2026-11-03 用户裁决）** |
+| `qwen38_27b-3090.toml` | 8137 | 单 3090 Ti / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / FI+图 / **INT8 KV（30 系默认）** / 前缀缓存 / image_evict / **max_seq 57344（a8 版全特性稳定点）** / chunk 2048 |
+| `qwen38_27b-3080_tp2.toml` | 8135 | 2×3080 20G TP2 / 27B AWQ-INT4 + 视觉 / DFlash2 d7 / **INT8 KV（30 系默认）** / 前缀缓存 / image_evict / **max_seq 262144** / chunk 2048 / **并发 2（`gdn_slots=2` · `snap_max=3`；2026-11-03 用户裁决）** |
 | `qwen38_27b-gguf_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ4_XS**（14.3GB）+ **mmproj-F16 视觉塔** / DFlash2 d7 / fp8 KV / 前缀缓存 / **max_seq 172032（168k）** / chunk 2048。prefill 1633–1681 t/s、decode 127–135、128k prompt 零拒发；代价 = prefill 比 a8 档(同端口)慢 ~24% |
-| `qwen38_27b-gguf-iq3_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ3_S**（12.0GB）+ mmproj-F16 / DFlash2 d7 / fp8 KV / **max_seq 229376（224k，逼近 native 262144）** / chunk 2048。prefill 1409–1509 t/s、decode 97–121；**与 8137 上的其它单卡 3090 档互斥**（同一张卡二选一），速度慢 ~13%、3bit 质量低一档 |
+| `qwen38_27b-gguf-iq3_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ3_S**（12.0GB）+ mmproj-F16 / DFlash2 d7 / **FP8 KV（例外：3-bit 主干对 INT8 KV 的 1k needle 敏感）** / **max_seq 229376（224k，逼近 native 262144）** / chunk 2048。prefill 1409–1509 t/s、decode 97–121；**与 8137 上的其它单卡 3090 档互斥**（同一张卡二选一），速度慢 ~13%、3bit 质量低一档 |
 | `qwen38_27b-4080.toml` | 8138 | 单 **4080 SUPER（Ada sm_89 / 32G）** / 27B AWQ-INT4 **a8** + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144（= 模型 native 上限，32 KiB/token ⇒ 池 8192MiB）** / chunk 2048。std 五点三轮（`perf-runs/std-4080-20261030/`）：**spec-off prefill 2392→3084 t/s、decode 35.9 t/s 长 ctx 平坦**；spec-d7 decode ×1.70（60.1@8k）；**同二进制 3090 Ti 对照：prefill ×1.21–1.37、decode ×0.81、TTFT ×0.73–0.83**。**需 sm_89 二进制**（`cargo build --release -p server --no-default-features --features arch-sm89`，落到独立 target 目录）——单份 `.a` 家族取最高代，30 系与 40 系不混在一份构建里。**2026-11-04 原生 FP8 MMA**（KernelPick 按运行期 Sm89/Sm120 选臂；e4m3 Q×KV，CTA16）：std 1024–8192 均值 3113 t/s（旧 3030，+2.8%）、32k 2844（旧 2379，+19.6%）、65k 2435（旧 2099，+16.0%），decode 不变；1k/8k/65k needle + 视觉 36/36 全绿（`docs/bench/fp8-sm89-native-mma-2026-11-04.md`） |
 
 这条裁决被**测试钉住**：`crates/shared/src/profiles.rs::入口档面只允许三个常驻档`

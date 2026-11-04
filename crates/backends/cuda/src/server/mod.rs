@@ -1548,9 +1548,15 @@ impl GpuServer {
                 let _ = stream.synchronize(); // 归因同步(错误由 sticky 面另报)
             }
             let dt: std::time::Duration = t0.elapsed();
+            let base_tag = format!("gpu.{name}");
             owl_shared::metrics::with_metrics_store(|s| {
-                s.timer_record_tag(&shape_tag, dt, file!(), 0);
-                s.timer_record_tag(&format!("gpu.{name}"), dt, file!(), 0);
+                s.timer_record_tag(&base_tag, dt, file!(), 0);
+                // 非 marlin 的 `shape_tag` 与 `base_tag` 相同；再记一次会**双计**
+                // （2026-11-04 实测：int8 prefill 784 发被记成 1600 发/52.6s，
+                //  nsys 同窗 27.5s）。只在有形状特化时多记一条。
+                if shape_tag != base_tag {
+                    s.timer_record_tag(&shape_tag, dt, file!(), 0);
+                }
             });
             return;
         }

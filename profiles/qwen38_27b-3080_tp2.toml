@@ -3,7 +3,9 @@
 # 形状:TP2(张量并行)+ 词表切分 + fp8 全 reduce + 融合 AR;
 #       prefill = eager + Marlin W4A16;decode = FlashInfer + CUDA graph;
 #       投机 = DFlash2 d7(W4A16 草稿,TP2 需 `spec.tp_draft = true`);
-#       KV = fp8 e4m3;视觉塔开(与 3090 档同形)。
+#       KV = **int8**(30 系默认);视觉塔开(与 3090 档同形)。
+# 2026-11-04 INT8 默认验收：1k/8k 文本绿；视觉 grounding + image_evict
+# 36/36、hit@16px 100%；max_seq 262144 boot/池账通过。
 #
 # 卡位:靠 `parts/hardware/3080-tp2.toml` 的名字子串("3080"×2)去重消费;
 #       **禁 CUDA 序号**(本机 nvidia-smi 序 ≠ CUDA 序,数字序会被重解释成混插对)。
@@ -32,7 +34,7 @@ extends = [
   "parts/feature/dflash2-27b.toml",
   "parts/hardware/3080-tp2.toml",
   "parts/kernel/fi-graph.toml",
-  "parts/pool/fp8.toml",
+  "parts/pool/int8.toml",
 ]
 
 [server]
@@ -101,16 +103,10 @@ topp = 0.95
 rep_penalty = 1.05
 
 [kernel]
-# **prefill f16 影子:开**(2026-10-31 算子级实测 + e2e 复验)。
-# 单 3080 单算子尺(hd256/hkv4/page32/ctx139264):fp8 KV 的 prefill 注意力
-# **比 f16 慢 21~26%**(sm86 无 fp8 MMA,kernel 每瓦片 e4m3→half 反量化),
-# 而 decode(T=1)上 fp8 快 2× ⇒ 影子只服务 prefill,主池保持 fp8(容量不变)。
-# e2e(真实 dump 回放):冷 139k prefill **103.8 s → 92.5 s(−10.9%)**;
-# 热追加 −5~35%(Δnew 1132→−20%, 931→−10%, 396→−6%)。
-# 代价:单层 staging,fp8 主池 + 本键 ⇒ 262k ≈ **512 MiB/rank**。
-# 质量抽检:8/8 数值题答案逐字相同;两句自由文本措辞不同(不同 plan/累加序 ⇒
-# 平局翻转),语义等价。
-prefill_shadow = true
+# INT8 主池没有 FP8→F16 shadow（`prefill_shadow` 仅 kv_fp8 有效；
+# 配置面会拒 `prefill_shadow && !kv_fp8`）。INT8 prefill 走专用 P8 核，
+# 不再需要 fp8 时代的 512 MiB/rank f16 staging。
+prefill_shadow = false
 
 [spec]
 # TP2 草稿族放行(缺它 = tp.rs 装配期响亮拒)

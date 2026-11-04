@@ -22,12 +22,15 @@
 #     烟雾实测:三色横带图 ⇒ 回答"红、绿、蓝"正确。
 #   · prefill 比 a8 AWQ 慢 24%,换的是 3.4× 上下文 —— 长文/大 prompt 用本档,
 #     短 prompt 低时延用档①(AWQ 单 3090,同端口 8137 ⇒ 互为替代)。
+#   · 2026-11-04 起 KV 切 INT8（30 系默认）：1k/8k needle、视觉 grounding
+#     36/36 已过；本档未开 image_evict（snap1 预算），仍保留 FP8 的 3-bit
+#     IQ3 档是唯一例外。
 extends = [
   "full.toml",
   "parts/model/27b-gguf-iq4xs.toml",
   "parts/hardware/3090-single.toml",
   "parts/kernel/fi-graph.toml",
-  "parts/pool/fp8.toml",
+  "parts/pool/int8.toml",
 ]
 
 [server]

@@ -1,4 +1,5 @@
 # 池组件：INT8 KV（K int8 + V token-major + per-token V scale）。
+# **30 系（3090/3080）默认池**（2026-11-04）；40/50 系仍用 fp8。
 #
 # 约束（boot 响亮拒）：
 #   - hd=256 / page=32 / paged；

@@ -57,6 +57,9 @@ depth = 7
 draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 lookup = true
 
+# ⚠️ 30 系默认是 INT8 KV，但本档例外保持 FP8：IQ3_S 3-bit 主干 +
+# INT8 KV 在 1k needle 上稳定拒答（"I cannot provide..."），同题 FP8 通过；
+# 这是 3-bit 主干对 KV 量化误差更敏感，不是 INT8 机制错。IQ4 档已切 INT8。
 [pool]
 snap_max = 1
 prefix_cache = true

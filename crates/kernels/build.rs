@@ -353,6 +353,72 @@ fn vendor_stamp(src: &std::path::Path) -> String {
     out
 }
 
+/// **native 核的本地头文件清单**(`cu/**` 下的 `.cuh/.h`,排除第三方子树)。
+///
+/// 为什么需要(2026-11-04 实测):native cubin 的增量闸 `fingerprint` 只看 `.cu`
+/// 自身 + 旗子;而 cargo 只对 `include_str!` 命中的 `.cu` 发 `rerun-if-changed`。
+/// 于是**改 `.cuh` 既不触发 build.rs 重跑、也不进指纹** ⇒ 旧 cubin 静默留用
+/// (本轮改 `int8_scale_groups.cuh` 时踩到:编译 0.1s 显示"全增量命中",
+/// 跑出来还是上一代语义)。
+///
+/// 修法:`.cuh/.h` 全部登记 `rerun-if-changed`,并把它们的 `len:mtime` 摘要
+/// 折进每个 native 源的指纹。**保守**(任一本地头变 ⇒ native 全量重编,
+/// 冷编 ~1 min),胜在不会再静默用旧码;第三方子树(cutlass/vllm_marlin/
+/// vendor/flashinfer/xqa 的 vendor 面)各有自己的增量闸,不在此列。
+fn native_headers(cu_root: &std::path::Path) -> Vec<PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if p.is_dir() {
+                if matches!(name, "cutlass" | "vllm_marlin" | "vendor" | "flashinfer" | "triton") {
+                    continue;
+                }
+                walk(&p, out);
+            } else if name.ends_with(".cuh") || name.ends_with(".h") {
+                out.push(p);
+            }
+        }
+    }
+    let mut v = Vec::new();
+    walk(cu_root, &mut v);
+    v.sort();
+    v
+}
+
+/// 头文件指纹(路径 + len + mtime;任一变化 ⇒ 全部 native 源重编)。
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn native_header_stamp(cu_root: &std::path::Path) -> String {
+    let mut s = String::new();
+    for h in native_headers(cu_root) {
+        let md = std::fs::metadata(&h).ok();
+        let (len, mtime) = md
+            .as_ref()
+            .map(|m| {
+                (
+                    m.len(),
+                    m.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        s.push_str(&format!("{}:{}:{};", h.display(), len, mtime));
+    }
+    s
+}
+
 fn fingerprint(src: &std::path::Path, archs: &[Arch], extra: &[&str]) -> String {
     let md = std::fs::metadata(src).expect("stat .cu");
     let mtime = md
@@ -361,14 +427,17 @@ fn fingerprint(src: &std::path::Path, archs: &[Arch], extra: &[&str]) -> String 
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    // 本地头(.cuh/.h)摘要折叠进来 —— 见 `native_header_stamp` 的踩坑记录。
+    let hdr = native_header_stamp(&PathBuf::from("cu"));
     format!(
-        "src={} len={} mtime={} archs={} flags={}{}",
+        "src={} len={} mtime={} archs={} flags={}{} hdr={:x}",
         src.display(),
         md.len(),
         mtime,
         archs_sm(archs),
         extra.join(" "),
-        vendor_stamp(src)
+        vendor_stamp(src),
+        fnv1a(hdr.as_bytes())
     )
 }
 
@@ -445,6 +514,10 @@ fn build_native_cubins(
 
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
+    }
+    // 本地头:改 `.cuh` 必须让 build.rs 重跑(否则连指纹都不会被重算)。
+    for h in native_headers(&cu_root) {
+        println!("cargo:rerun-if-changed={}", h.display());
     }
     // 每个源独立:源路径、fatbin 目标、资产 id 先算好，再并行编。
     let jobs: Vec<(PathBuf, PathBuf, String, String)> = sources
