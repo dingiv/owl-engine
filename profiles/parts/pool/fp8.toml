@@ -4,8 +4,9 @@
 [pool]
 kv_fp8 = true
 gdn_slots = 1
-vram_target = 0.99
+# 2026-11-04 收紧(同 int8 池):target=1.0 合法,reserve 仍 256MiB。
+vram_target = 1.0
 vram_reserve_mb = 256
 
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
-transient_reserve_mb = 1024
+transient_reserve_mb = 512

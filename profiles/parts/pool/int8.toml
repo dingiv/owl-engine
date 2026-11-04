@@ -11,6 +11,8 @@
 kv_fp8 = false
 kv_int8 = true
 gdn_slots = 1
-vram_target = 0.99
+# 2026-11-04 收紧:`target=1.0` 合法(base = 驱动 free,reserve 保有 256MiB);
+# 旧 0.99 在 24G 上白留 236MiB。瞬态余量只服务超卖档 ⇒ 1024→512。
+vram_target = 1.0
 vram_reserve_mb = 256
-transient_reserve_mb = 1024
+transient_reserve_mb = 512
