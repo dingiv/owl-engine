@@ -201,7 +201,11 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
     }
     const int qabs0 = (row0 < tile_rows) ? base_pos + q0 + row0 : -1;
     const int qabs1 = (row1 < tile_rows) ? base_pos + q0 + row1 : -1;
-    float run_m0 = -CUDART_INF_F, run_m1 = -CUDART_INF_F;
+    // 用 **有限** 的极小值而不是 -inf 起跑:全掩码块(越界行/未来块)里
+    // nm = max(run_m, bm) 因此有限 ⇒ exp2(-inf - finite) = 0,不需要每条 p
+    // 都套一层「score > -inf ? ... : 0」的 FSETP+FSEL(每块 32 条)。
+    constexpr float kNegHuge = -1e30f;
+    float run_m0 = kNegHuge, run_m1 = kNegHuge;
     float run_l0 = 0.0f, run_l1 = 0.0f;
 
     float acc[32][4];
@@ -302,12 +306,9 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
 
         const float nm0 = fmaxf(run_m0, bm0);
         const float nm1 = fmaxf(run_m1, bm1);
-        const float alpha0 = (run_m0 == -CUDART_INF_F)
-                                 ? 0.0f
-                                 : ex2f_fast(__fmaf_rn(run_m0, scale_l2, -nm0 * scale_l2));
-        const float alpha1 = (run_m1 == -CUDART_INF_F)
-                                 ? 0.0f
-                                 : ex2f_fast(__fmaf_rn(run_m1, scale_l2, -nm1 * scale_l2));
+        // run_m 起跑 -1e30 ⇒ 首块(ex2(-huge))与全掩码块都自然得 0,无需分支。
+        const float alpha0 = ex2f_fast(__fmaf_rn(run_m0, scale_l2, -nm0 * scale_l2));
+        const float alpha1 = ex2f_fast(__fmaf_rn(run_m1, scale_l2, -nm1 * scale_l2));
         float pmaxv0 = 0.0f, pmaxv1 = 0.0f;
         float inv0 = 0.0f, inv1 = 0.0f;
         float ps0 = (1.0f / 255.0f), ps1 = (1.0f / 255.0f);
@@ -317,14 +318,11 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
         float pv[4][4];
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {
-            const float p00 = score[nt][0] > -CUDART_INF_F
-                                  ? ex2f_fast(__fmaf_rn(score[nt][0], scale_l2, -nm0s)) : 0.0f;
-            const float p01 = score[nt][1] > -CUDART_INF_F
-                                  ? ex2f_fast(__fmaf_rn(score[nt][1], scale_l2, -nm0s)) : 0.0f;
-            const float p10 = score[nt][2] > -CUDART_INF_F
-                                  ? ex2f_fast(__fmaf_rn(score[nt][2], scale_l2, -nm1s)) : 0.0f;
-            const float p11 = score[nt][3] > -CUDART_INF_F
-                                  ? ex2f_fast(__fmaf_rn(score[nt][3], scale_l2, -nm1s)) : 0.0f;
+            // 掩码行 score = -inf ⇒ ex2(-inf) = +0(PTX 定义),不需要 select。
+            const float p00 = ex2f_fast(__fmaf_rn(score[nt][0], scale_l2, -nm0s));
+            const float p01 = ex2f_fast(__fmaf_rn(score[nt][1], scale_l2, -nm0s));
+            const float p10 = ex2f_fast(__fmaf_rn(score[nt][2], scale_l2, -nm1s));
+            const float p11 = ex2f_fast(__fmaf_rn(score[nt][3], scale_l2, -nm1s));
             sum0 += p00 + p01;
             sum1 += p10 + p11;
             const int col0 = nt * 8 + 2 * lid;
