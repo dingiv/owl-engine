@@ -711,6 +711,7 @@ impl EngineKnobs {
                 mtp_window: cfg.spec.mtp_window,
                 mtp_sink: cfg.spec.mtp_sink,
                 mtp_window_min_ctx: cfg.spec.mtp_window_min_ctx,
+                mtp_ring: cfg.spec.mtp_ring,
                 adaptive_depth: cfg.spec.adaptive_depth,
                 depth_min: cfg.spec.depth_min,
                 depth_switch_ctx: cfg.spec.depth_switch_ctx,
@@ -871,6 +872,8 @@ pub struct DraftCfg {
     pub mtp_sink: usize,
     /// 窗口生效的最小绝对 ctx(tok;0 = 不设额外门槛)
     pub mtp_window_min_ctx: usize,
+    /// MTP 草稿 KV 物理环(T5;仅 MTP + window>0)
+    pub mtp_ring: bool,
     /// 自适应 depth（仅 MTP；两档图族 boot 期预捕获）
     pub adaptive_depth: bool,
     /// 自适应档下限 depth
@@ -915,6 +918,7 @@ impl Default for DraftCfg {
             mtp_window: 0,
             mtp_sink: 64,
             mtp_window_min_ctx: 0,
+            mtp_ring: false,
             adaptive_depth: false,
             depth_min: 3,
             depth_switch_ctx: 49152,
@@ -1432,6 +1436,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                 paged: dev.pool.geom.paged,
                 prefix_cache: cfg.knobs.prefix_cache,
                 mtp: dev.spec_rt.mode == SpecMode::Mtp,
+                mtp_ring: dev.spec_rt.mtp_ring.is_some(),
                 // 宿主层预算(REQ C4:默认关;0 = 关层)—— 与预算入参**同源**
                 // (腿不得超总账;`Rel::open` 交叉校验)
                 host_bytes,
@@ -2473,6 +2478,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             mtp_window: cfg.knobs.draft.mtp_window,
             mtp_sink: cfg.knobs.draft.mtp_sink,
             mtp_window_min_ctx: cfg.knobs.draft.mtp_window_min_ctx,
+            mtp_ring: cfg.knobs.draft.mtp_ring,
             adaptive_depth: cfg.knobs.draft.adaptive_depth,
             depth_min: cfg.knobs.draft.depth_min,
             depth_switch_ctx: cfg.knobs.draft.depth_switch_ctx,
@@ -2601,6 +2607,7 @@ fn boot_pool_plan(
         draft_dt: spec.draft_dt,
         spec_mode: spec.mode,
         spec_depth: spec.depth,
+        mtp_ring: spec.mtp_ring,
         xqa_verify: matches!(
             cfg.knobs.env.attn.verify_arm,
             owl_shared::config::VerifyArm::Xqa

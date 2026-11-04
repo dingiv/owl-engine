@@ -286,6 +286,10 @@ mtp_window = 0
 mtp_sink = 64
 # 窗口生效的最小绝对 ctx(0 = 不设额外门槛;短 ctx 保完整历史)
 mtp_window_min_ctx = 0
+# **MTP 草稿 KV 物理环**(T5;缺省 false)。只服务 MTP + window>0。
+# 容量 = max(min_ctx, sink + window + depth + page),页对齐；短 ctx 仍保留
+# 完整历史，长 ctx 只回收当前读集外的旧槽。**不改变读集**。
+mtp_ring = false
 # 自适应 depth(仅 MTP;短 ctx 用 depth,长 ctx 回 depth_min)。
 # 两档图族在 boot 期预捕获;缺省关 = 旧档逐字节不变。
 adaptive_depth = false

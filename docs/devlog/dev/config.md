@@ -253,6 +253,15 @@ ls profiles/
     `--set spec.mtp_window=0`。`full.toml` 只保留 schema 缺省 0/64/0。
     `mtp_window_min_ctx` 是短 ctx 不压缩的门槛（8k prompt+输出会跨 8192，
     取 12288 才真正保 full）。
+  - **MTP KV ring（T5，2026-11-04）**：`[spec] mtp_ring = true`（默认 false；
+    仅 MTP + `mtp_window > 0`）。把草稿 KV 的物理存储压成固定环：
+    `capacity = align_up(max(min_ctx, sink + window + depth + page), page)`，
+    sink 单独钉住，其余按 `(pos - sink) % (capacity - sink)` 回卷。
+    `capacity >= min_ctx` 保证短 ctx 仍读完整历史；窗口生效后只覆盖读集外
+    旧槽，**读集/RoPE/visible 口径不变**。57k 档 capacity=12288 tok（384 页），
+    fp8 草稿池固定 24 MiB（F16 48 MiB）。测量档：
+    `profiles/measurement/qwen38_27b-3090-mtp-mem.toml`；线性对照：
+    `--set spec.mtp_ring=false`。门：`cargo test -p owl-engine --lib mtp_ring`。
   - **自适应 depth（2026-10-21/22，T1a+T1b v2）**：`[spec] adaptive_depth = true`
     （默认 false）+ `depth_min = 3` + `depth_switch_ctx = 49152` +
     `adaptive_min_tpr = 3.0`。`depth` 为上限（建议 7）；`pos >= depth_switch_ctx`

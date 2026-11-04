@@ -21,6 +21,8 @@ use owl_models::module::kv_paged_policy;
 use owl_models::TensorOps;
 use owl_store::SnapKey;
 
+use crate::exec::mtp_ring::MtpRingPlan;
+
 type Result<T> = std::result::Result<T, ModelError>;
 
 pub(crate) type BlockN = (Bytes, usize); // (块句柄, 元素数;重置分块写用)
@@ -199,6 +201,8 @@ pub(crate) struct PoolPlan {
     pub spec_mode: crate::spec_runtime::SpecMode,
     /// 投机深度(verify 块 = depth+1;verify v2 scratch 定形用;0 = off)
     pub spec_depth: usize,
+    /// MTP 草稿 KV 物理环(T5;None = 线性分配)
+    pub mtp_ring: Option<MtpRingPlan>,
     /// XQA verify 臂(SPEC_DEC=1 `M_TILESIZE=32`)
     pub xqa_verify: bool,
     /// XQA 裸 decode 臂(SPEC_DEC=1 `M_TILESIZE=16`)
@@ -528,6 +532,8 @@ pub(crate) struct DraftBank {
     replay_snap: Option<SpecSnapBuf>,
     /// MTP 草稿链 KV 池(E5-M2b;独立页池,1 层)
     mtp_kvs: Option<KvBlocks>,
+    /// MTP 池物理页数(ring = 固定容量;线性 = `geom.nb`)
+    mtp_pages: usize,
     /// DFlash2 草稿 KV 池(E5-DF2;独立页池,5 层草稿几何 8/128)
     dflash_kvs: Option<Vec<KvBlocks>>,
     /// MTP 链持久块表槽(E5-M5 propose 图烘焙;[1, nb] f32)
@@ -810,11 +816,11 @@ impl StatePool {
             pieces: vec![
                 owl_store::PieceSpec {
                     buf: kv.k_cache.0.clone(),
-                    stride_bytes: self.per_page_bytes(kv.k_cache.0.dtype, kv.k_cache.1),
+                    stride_bytes: self.mtp_page_bytes(kv.k_cache.0.dtype, kv.k_cache.1),
                 },
                 owl_store::PieceSpec {
                     buf: kv.v_cache.0.clone(),
-                    stride_bytes: self.per_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1),
+                    stride_bytes: self.mtp_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1),
                 },
             ],
         })
@@ -826,8 +832,8 @@ impl StatePool {
             .mtp_kvs
             .as_ref()
             .map(|kv| {
-                self.per_page_bytes(kv.k_cache.0.dtype, kv.k_cache.1)
-                    + self.per_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1)
+                self.mtp_page_bytes(kv.k_cache.0.dtype, kv.k_cache.1)
+                    + self.mtp_page_bytes(kv.v_cache.0.dtype, kv.v_cache.1)
             })
             .unwrap_or(0)
     }
@@ -835,6 +841,11 @@ impl StatePool {
     /// 一个缓冲的每页字节(元素数 × 元素宽 ÷ 管理面页数)。
     fn per_page_bytes(&self, dtype: Dtype, elems: usize) -> usize {
         elems * elem_bytes(dtype) / self.geom.nb_kv.max(1)
+    }
+
+    /// MTP 池的每页字节:ring 时页数 = 固定容量,不是主池 `nb_kv`。
+    fn mtp_page_bytes(&self, dtype: Dtype, elems: usize) -> usize {
+        elems * elem_bytes(dtype) / self.draft.mtp_pages.max(1)
     }
 
     // ── 下面三件：**测试对账面**（`tests.rs` 用它们把"池真分配"与预算算式对账）。
@@ -2095,16 +2106,18 @@ impl<'a> AllocCtx<'a> {
         // 非追踪实测 = 进程占用 20096MiB − 引擎账 19552MiB = **544MiB**(> reserve 512MB,
         // 即 reserve 量级正确但零余量 ⇒ 见 graph_fleet 的对账行)。
         let mtp_mode = plan.spec_mode == crate::spec_runtime::SpecMode::Mtp;
+        let page_for_draft = pol.map(|p| p.page).unwrap_or(32);
         let mut per_tok = PerTokBytes::of(
             &dims,
             n_full,
             kv_bytes_elem,
             // **DFlash2 草稿池不再按 token 线性**(2026-10-22 ring):
             // 草稿 config 是 sliding_window=2048;池只留窗口+自块,固定项进
-            // `FixedAfter.draft_ring`(见下)。MTP 链仍按 token 线性。
+            // `FixedAfter.draft_ring`(见下)。MTP 链线性时才进 per_tok;
+            // T5 ring 时改走固定项 `mtp_ring_bytes`。
             None,
             plan.draft_geom,
-            mtp_mode.then(|| plan.draft_kv.size_bytes()),
+            (mtp_mode && plan.mtp_ring.is_none()).then(|| plan.draft_kv.size_bytes()),
         );
         if kv_int8 {
             // Kscale `[nb,page,hkv,8]` 每 token 每层 32·hkv B;Vscale
@@ -2116,8 +2129,7 @@ impl<'a> AllocCtx<'a> {
         // 治理器之后的固定分配(GDN 格/快照 f32 同式;图 slab + warmup + 草稿 ring)
         let gdn_slot_elems =
             dims.nk * dims.hk * 3 + dims.nv * dims.hv * 3 + dims.nv * dims.hk * dims.hv;
-        let page_for_draft = kv_paged_policy(dims.dtype).map(|p| p.page).unwrap_or(32);
-        let draft_ring = if dflash {
+        let dflash_ring = if dflash {
             let geom = plan
                 .draft_geom
                 .map(|(l, h, d)| DraftPoolGeom::from_geom(l, h, d))
@@ -2127,6 +2139,17 @@ impl<'a> AllocCtx<'a> {
         } else {
             0
         };
+        let mtp_ring_bytes = plan
+            .mtp_ring
+            .map(|r| {
+                r.capacity_pages()
+                    * dims.hkv
+                    * dims.hd
+                    * page_for_draft
+                    * plan.draft_kv.size_bytes()
+            })
+            .unwrap_or(0);
+        let draft_ring = dflash_ring + mtp_ring_bytes;
         let fixed_after = FixedAfter::of(
             n_gdn,
             gdn_slots,
@@ -2747,7 +2770,11 @@ impl DraftBank {
         // 定,存储与主池同款:**U32 扁平字节账**(元素数 = 字节/4,1 B/elem)
         // ⇒ 每 token 4 KiB → 2 KiB。读核由 `draft_env.kv.quant` 同步成 e4m3。
         let mtp_elem_b = plan.draft_kv.size_bytes();
-        let mtp_elems = nb * dims.hkv * dims.hd * page;
+        let mtp_ring = plan.mtp_ring;
+        let mtp_pages = mtp_ring
+            .map(|r| r.capacity_pages())
+            .unwrap_or(nb);
+        let mtp_elems = mtp_pages * dims.hkv * dims.hd * page;
         let (mtp_e, mtp_dt) = if mtp_elem_b == 1 {
             (mtp_elems / 4, Dtype::U32)
         } else {
@@ -2846,6 +2873,7 @@ impl DraftBank {
             spec_snap,
             replay_snap,
             mtp_kvs,
+            mtp_pages,
             dflash_kvs,
             bt_mtp,
             fp8: plan.draft_kv.size_bytes() == 1,

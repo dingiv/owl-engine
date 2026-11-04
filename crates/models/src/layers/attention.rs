@@ -1185,9 +1185,23 @@ impl Attention {
         // bt8 在 verify 图里可能是 [T, nb] 或扁平的 [T*nb]；行 stride 按
         // 总元素 / seqs 推（与 verify_v2_arm 同口径）。
         let bt_stride = (bt8.shape().iter().product::<usize>() / s2.seqs).max(1);
-        // no-spec int8 decode 对单 token 固定用 256 片；verify 逐行复用同一
-        // 页偶数分片 + f32 partial/stat，避免分片差异成为额外变量。
-        let nparts = 256usize;
+        // **verify 与 no-spec decode 同 PTH 分片**（2026-11-04）：
+        // no-spec 单 token 已切 PTH producer/consumer（3090 nparts=21 /
+        // 3080 nparts=34）；verify 仍用 256 片 GQA 会在长 ctx 因累加序
+        // 不同翻 token。PTH 核支持 B=depth+1 行，读每行独立
+        // `bt8`/`kv_lens`，partial/stat 格式与 GQA 臂一致。
+        // `grp<=6` 是 PTH 核契约；其余几何回退旧的 256 片 GQA。
+        let grp = self.hq.checked_div(self.hkv).unwrap_or(0);
+        let pth_ok = grp > 0 && grp <= 6 && self.hq % self.hkv == 0;
+        let nparts = if pth_ok {
+            if ctx.env.sm_count > 0 && ctx.env.sm_count < 80 {
+                34
+            } else {
+                21
+            }
+        } else {
+            256
+        };
         if s2.tmp_out.dtype != Dtype::F32 {
             return poisoned("verify scratch tmp_out 必须是 f32（int8 verify 复用 decode 分片）");
         }
@@ -1203,7 +1217,11 @@ impl Attention {
         }
         let partial_out = s2.tmp_out.slice_view(0, vec![partial_elems]);
         let partial_stat = s2.tmp_out.slice_view(partial_elems, vec![stat_elems]);
-        let split = TensorOps::call(SemanticKernel::Int8DecodeGqaTcSplit)
+        let split = TensorOps::call(if pth_ok {
+            SemanticKernel::Int8DecodePthPcSplit
+        } else {
+            SemanticKernel::Int8DecodeGqaTcSplit
+        })
             .aux(&[tokens, self.hq, self.hkv, nparts])
             .arg(&q8)
             .arg(&q_scale)

@@ -1,0 +1,51 @@
+# MTP × INT8 KV 测量档（不计入入口档面）。
+#
+# 形状：单 3090 Ti / 27B AWQ / W4A8 主干 + 检查点自带 MTP 头（d3）
+#       + INT8 KV（K int8 + V token-major）/ greedy / 无视觉。
+# 口径：MTP 专项基线；prefix_cache 与 image_evict 关闭以隔离 decode，
+#       MTP window 保留生产值（8k 点不触发，>12k 才生效）。
+#
+# ⚠️ 本档默认 W4A8，用于复现“长 MATH AL 崩塌”；稳定参考臂见
+#    qwen38_27b-3090-mtp-int8-w4a16.toml（或 --set model.quant=w4a16）。
+extends = [
+  "../full.toml",
+  "../parts/model/27b-awq.toml",
+  "../parts/feature/mtp.toml",
+  "../parts/feature/mtp-window.toml",
+  "../parts/hardware/3090-single.toml",
+  "../parts/kernel/fi-graph.toml",
+  "../parts/pool/int8.toml",
+]
+
+[server]
+bind = "127.0.0.1:8141"
+
+[model]
+quant = "w4a8"
+vision = false
+
+[runtime]
+max_seq = 32768
+prefill_chunk = 2048
+prefill_tail_merge = 0
+implicit_session = true
+
+[spec]
+depth = 3
+draft = "mtp"
+draft_path = ""
+lookup = false
+mtp_window = 4032
+mtp_sink = 64
+mtp_window_min_ctx = 12288
+# MTP 目前没有草稿 KV 追赶臂；先关自动降级，避免 m=0 连击误切。
+degrade_after = 0
+
+[pool]
+prefix_cache = false
+image_evict = false
+snap_max = 0
+host_cache_mb = 0
+snap_host_mb = 0
+vram_reserve_mb = 512
+transient_reserve_mb = 1024

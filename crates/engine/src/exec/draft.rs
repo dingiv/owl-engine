@@ -1,5 +1,6 @@
 //! 草稿器面(DFlash2 单图 encode+propose / eager / MTP 链 / verify 前向)
 use super::lookup::{fuse_lookup, suffix_lookup, LookupCfg, LookupProposal};
+use super::mtp_ring::MtpRingPlan;
 use super::mtp_window::{MtpWindowCfg, MtpWindowPlan};
 use super::*;
 use owl_models::ModelError;
@@ -19,6 +20,32 @@ pub(crate) struct PendingPropose {
     q_seed: u64,
     /// 下一轮的 fed 位（= pos + m + 1）
     fp: usize,
+}
+
+/// MTP 链页表:线性档向 `leg_mtp` 领页;T5 ring 档只生成固定容量映射表。
+///
+/// `ring.table(pages)` 的值是**物理环页号**；调用方仍按绝对位置
+/// `bt[p/page] * page + p%page` 取 slot，所以写核/读核不需要第二套
+/// 地址语义。ring 档不再调用 `ensure_for_len`，也不向 leg_mtp 归还。
+fn mtp_table_for_session(
+    bank: &mut crate::session::SessionBank,
+    ring: Option<MtpRingPlan>,
+    page: usize,
+    sid: u64,
+    cover: usize,
+) -> Result<Vec<u32>> {
+    let (sessions, leg) = (&mut bank.sessions, &mut bank.leg_mtp);
+    let s = sessions.get_mut(sid).expect("账在");
+    if let Some(ring) = ring {
+        let pages = cover.div_ceil(page.max(1));
+        let table = ring.table(pages);
+        s.mtp_block_table = table.clone();
+        Ok(table)
+    } else {
+        // MTP 腿 cache=Off ⇒ 纯分配；长度由 generation_target 配对覆盖。
+        leg.ensure_for_len(&mut s.mtp_block_table, cover)?;
+        Ok(s.mtp_block_table.clone())
+    }
 }
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
@@ -1330,13 +1357,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let page = self.dev.pool.geom.page;
         let bt = {
             let sid = self.turns.active()?.session_id;
-            let s = self.bank.sessions.get_mut(sid).expect("账在");
-            // MTP 腿 cache=Off、无宿主 ⇒ 本函数只做纯分配（无同步驱逐可收）；
-            // 长度由 target 的 `generation_target`（MTP = pos+2d）配对覆盖。
-            self.bank
-                .leg_mtp
-                .ensure_for_len(&mut s.mtp_block_table, pos + m + depth)?;
-            s.mtp_block_table.clone()
+            mtp_table_for_session(
+                &mut self.bank,
+                self.dev.spec_rt.mtp_ring,
+                page,
+                sid,
+                pos + m + depth,
+            )?
         };
         {
             let ts_w = std::time::Instant::now();
@@ -1781,13 +1808,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// bt 块 —— 图不烘焙 mtp 链)。返回 host 块链副本。
     pub(crate) fn mtp_chain_bt(&mut self, cover: usize) -> Result<Vec<u32>> {
         let sid = self.turns.active()?.session_id;
-        let s = self.bank.sessions.get_mut(sid).expect("账在");
-        // MTP 腿 cache=Off ⇒ 纯分配；长度由 `generation_target`（MTP=pos+2d）
-        // 配对覆盖。
-        self.bank
-            .leg_mtp
-            .ensure_for_len(&mut s.mtp_block_table, cover)?;
-        Ok(s.mtp_block_table.clone())
+        mtp_table_for_session(
+            &mut self.bank,
+            self.dev.spec_rt.mtp_ring,
+            self.dev.pool.geom.page,
+            sid,
+            cover,
+        )
     }
 
     /// verify 块前向(E5-M2b):prefill 通道 T = 块长(base = F,FI 表四件套
@@ -2015,15 +2042,13 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         }
         let d = self.pool.geom.dims;
         let page = self.pool.geom.page;
-        let bt = {
-            // MTP 腿 cache=Off ⇒ 纯分配；prefill 的 target 长度由
-            // `step_need` 的 prefill 分支（fed+chunk）配对覆盖。
-            bank.leg_mtp.ensure_for_len(
-                &mut bank.sessions.session_mut(sid)?.mtp_block_table,
-                base + t_rows,
-            )?;
-            bank.sessions.session(sid)?.mtp_block_table.clone()
-        };
+        let bt = mtp_table_for_session(
+            bank,
+            self.spec_rt.mtp_ring,
+            page,
+            sid,
+            base + t_rows,
+        )?;
         let (kc, vc) = self
             .pool
             .mtp_kv_leaf()

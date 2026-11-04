@@ -16,6 +16,7 @@ use owl_shared::config::SpecDraft;
 use crate::Result;
 use owl_iface::contract::ModelError;
 
+use crate::exec::mtp_ring::MtpRingPlan;
 use crate::exec::mtp_window::MtpWindowCfg;
 
 /// E5-M2b:spec 模式三态(C7 回退挂钩)。裁决在 boot:
@@ -90,6 +91,8 @@ pub(crate) struct SpecRuntime {
     pub draft_dt: owl_models::contract::Dtype,
     /// MTP 草稿注意力窗口(0 = full;仅 MTP 有消费者)
     pub mtp_window: MtpWindowCfg,
+    /// MTP 草稿 KV 物理环(T5;None = 线性分配)
+    pub mtp_ring: Option<MtpRingPlan>,
     /// 自适应 depth（仅 MTP；`depth` = 上限，`depth_min` = 长 ctx 下限）
     pub adaptive_depth: bool,
     pub depth_min: usize,
@@ -218,6 +221,8 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) draft_window: usize,
     /// MTP 草稿注意力窗口(tok;0 = 关)
     pub(crate) mtp_window: usize,
+    /// MTP 草稿 KV 物理环(T5)
+    pub(crate) mtp_ring: bool,
     /// MTP 草稿注意力 sink(tok;仅 window>0 生效)
     pub(crate) mtp_sink: usize,
     /// 窗口生效的最小绝对 ctx(tok;0 = 不设额外门槛)
@@ -481,6 +486,41 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             mode
         );
     }
+    // **T5 MTP 草稿 KV 物理环**(2026-11-04):只服务 MTP + window>0。
+    // 容量 = max(min_ctx, sink + window + depth + page)，页对齐；短 ctx
+    // 仍保留完整历史，长 ctx 只回收当前读集外的旧槽。读集不变。
+    let mtp_ring = if inp.mtp_ring {
+        if mode != SpecMode::Mtp {
+            return Err(ModelError::Msg(format!(
+                "[spec] mtp_ring = true 只服务 MTP，当前模式 = {mode:?}"
+            )));
+        }
+        if !mtp_window.active() {
+            return Err(ModelError::Msg(
+                "[spec] mtp_ring = true 需要 mtp_window > 0".into(),
+            ));
+        }
+        let page = inp.base_env.kv.page;
+        if page == 0 {
+            return Err(ModelError::Msg(
+                "[spec] mtp_ring: 池 page = 0（池几何未定）".into(),
+            ));
+        }
+        let ring = MtpRingPlan::new(page, mtp_window, depth, mtp_window.min_ctx)?;
+        owl_shared::log_info!(
+            "boot",
+            "MTP ring: capacity={} tok / {} pages (sink={} ring={} depth={} min_ctx={})",
+            ring.capacity_tokens(),
+            ring.capacity_pages(),
+            ring.sink_tokens(),
+            ring.ring_tokens(),
+            ring.depth(),
+            ring.min_ctx()
+        );
+        Some(ring)
+    } else {
+        None
+    };
     // 草稿器装载(C7;embed/lm_head 均共享 target)
     // 草稿 dtype:缺省 BF16(量化族/无草稿);DFlash2 分支按**检查点事实**改写
     // DFlash2 草稿池 ring(2026-10-22):检查点 config `sliding_window=2048`,
@@ -786,6 +826,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         draft_env,
         draft_dt,
         mtp_window,
+        mtp_ring,
         adaptive_depth: inp.adaptive_depth,
         depth_min: inp.depth_min,
         depth_switch_ctx: inp.depth_switch_ctx,

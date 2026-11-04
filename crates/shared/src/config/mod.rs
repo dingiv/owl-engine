@@ -1272,6 +1272,10 @@ pub struct SpecCfg {
     /// 窗口生效的最小绝对上下文(token;0 = 不设额外门槛)。
     /// 短 ctx 下草稿尾部仍需要完整历史;8k d7 实测 window=4032 会掉 AL。
     pub mtp_window_min_ctx: usize,
+    /// **MTP 草稿 KV 物理环**(T5;缺省 false)。只服务 MTP + window>0。
+    /// 容量 = `max(min_ctx, sink + window + depth + page)`(页对齐)：
+    /// 短 ctx 仍保留完整历史，长 ctx 只覆盖当前读集，**不改变读集**。
+    pub mtp_ring: bool,
     /// **自适应 depth(仅 MTP)**：短 ctx 用 `depth`，长 ctx 回 `depth_min`。
     /// 两档都必须在 boot 期预捕获 verify/fold/propose 图族；运行期只换图引用，
     /// 禁止在线重捕。缺省 false（旧档逐字节不变）。
@@ -2014,6 +2018,7 @@ impl Default for SpecCfg {
             mtp_window: 0,
             mtp_sink: 64,
             mtp_window_min_ctx: 0,
+            mtp_ring: false,
             adaptive_depth: false,
             depth_min: 3,
             depth_switch_ctx: 49152,
@@ -2890,6 +2895,38 @@ impl OwlConfig {
             if self.spec.depth == 0 {
                 return Err(
                     "[spec] mtp_window > 0 但 depth = 0（MTP 已关，窗口无消费者）".to_string(),
+                );
+            }
+        }
+        // **MTP ring 自洽**(2026-11-04):ring 只服务窗口读视图；没有
+        // window 就没有可回收的读集，必须拒启而不是静默退化成线性。
+        if self.spec.mtp_ring {
+            if self.spec.mtp_window == 0 {
+                return Err("[spec] mtp_ring = true 但 mtp_window = 0（ring 只服务窗口读视图）".to_string());
+            }
+            if self.spec.depth == 0 {
+                return Err("[spec] mtp_ring = true 但 depth = 0（MTP 已关）".to_string());
+            }
+            if !matches!(self.spec.draft, SpecDraft::Mtp) {
+                let dflash2_auto = matches!(self.spec.draft, SpecDraft::Auto)
+                    && self
+                        .spec
+                        .draft_path
+                        .as_ref()
+                        .is_some_and(|p| !p.as_os_str().is_empty());
+                if dflash2_auto || matches!(self.spec.draft, SpecDraft::Dflash2) {
+                    return Err("[spec] mtp_ring 只服务 MTP；当前档是 DFlash2".to_string());
+                }
+            }
+            // ring 是**单会话固定池**：同一物理环不按会话分片。多会话并发会
+            // 互相覆盖对方仍可能恢复的 MTP 链。当前只放行隐式单会话 + 不批。
+            if !self.runtime.implicit_session
+                || self.runtime.max_concurrency > 1
+                || self.runtime.max_batch > 1
+            {
+                return Err(
+                    "[spec] mtp_ring 需要单会话固定环：请开 runtime.implicit_session=true，                     并保持 max_concurrency=1 / max_batch=1（多会话需每会话独立 ring，尚未实现）"
+                        .to_string(),
                 );
             }
         }

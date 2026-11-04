@@ -199,12 +199,22 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
                 tags.push(T::KV_DRAFT_BF16);
             }
         } else {
-            // MTP 链池按目标模型 dtype 分配 = F16。MTP 层复用**标准
-            // attention**（不是 DFlash2 的 naive NC 核），写/读核声明在
-            // `kv.main.*` 命名空间（K0WriteKnhd / paged v2 f16），池布局
-            // 仍是主池 KnHD；因此主/草稿两面都要放行 F16（不是 bf16/fp8）。
-            tags.push(T::KV_MAIN_F16);
-            tags.push(T::KV_DRAFT_F16);
+            // MTP 层复用**标准 attention**（不是 DFlash2 的 naive NC 核），
+            // 写/读核声明在 `kv.main.*` 命名空间（K0WriteKnhd / paged v2），
+            // 池布局仍是主池 KnHD。
+            //
+            // **2026-11-04 修**：此前这里无条件派生 F16；MTP 开
+            // `[spec] draft_kv_fp8 = true` 时池实际是 e4m3（U32 承载），
+            // 但全局 tag filter 只放行 `kv.main.f16/kv.draft.f16`，
+            // `owl_reshape_and_cache_fp8kv_knhd` 在 boot 直接拒。
+            // 池 dtype 必须跟 `draft_kv_fp8` 走；主/草稿两面同改。
+            if cfg.spec.draft_kv_fp8 {
+                tags.push(T::KV_MAIN_FP8);
+                tags.push(T::KV_DRAFT_FP8);
+            } else {
+                tags.push(T::KV_MAIN_F16);
+                tags.push(T::KV_DRAFT_F16);
+            }
         }
     }
     if cfg.model.vision {
@@ -3370,6 +3380,23 @@ mod tag_filter_tests {
         assert!(allows(&cfg, "owl_naive_attn_nc_f16"), "MTP 链 = F16");
         assert!(allows(&cfg, "vllm_reshape_and_cache_f16_knhd"), "MTP 写核走主池 KnHD f16");
         assert!(!allows(&cfg, "owl_naive_attn_nc_bf16"), "MTP 不应派生 BF16 草稿池");
+    }
+
+    #[test]
+    fn mtp_fp8_draft_uses_fp8_pool_tags() {
+        // 2026-11-04:主池 INT8 + MTP 草稿池 FP8。MTP 的 KV 写/读核在
+        // `kv.main.*` 命名空间，不能因为主池 int8 就把草稿 fp8 写者拒掉。
+        let mut cfg = OwlConfig::default();
+        cfg.model.format = ModelFormat::Awq;
+        cfg.model.quant = QuantScheme::W4a16;
+        cfg.pool.kv_int8 = true;
+        cfg.pool.kv_fp8 = false;
+        cfg.spec.draft = SpecDraft::Mtp;
+        cfg.spec.depth = 7;
+        cfg.spec.draft_kv_fp8 = true;
+        assert!(allows(&cfg, "owl_reshape_and_cache_fp8kv_knhd"), "MTP fp8 写核应放行");
+        assert!(allows(&cfg, "vllm_reshape_and_cache_f16_knhd") == false, "MTP fp8 档不应再派生 F16");
+        assert!(allows(&cfg, "owl_naive_attn_nc_bf16") == false, "MTP 不是 BF16");
     }
 
     #[test]
