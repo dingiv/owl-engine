@@ -748,14 +748,14 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         ));
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool=auto(剩余显存;boot 报 cap) chunk={} tail={} \
-             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
+             gdn_slots={} max_batch={} max_concurrency={} kv_dtype={}\n",
             c.runtime.max_seq,
             c.runtime.prefill_chunk,
             c.runtime.prefill_tail_merge,
             c.pool.gdn_slots,
             c.runtime.max_batch,
             c.runtime.max_concurrency,
-            c.pool.kv_fp8,
+            c.pool.kv_dtype,
         ));
         if let Some(e) = r.estimate() {
             out.push_str(&format!(
@@ -798,14 +798,14 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         );
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool=auto(剩余显存;boot 报 cap) chunk={} tail={} \
-             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
+             gdn_slots={} max_batch={} max_concurrency={} kv_dtype={}\n",
             c.runtime.max_seq,
             c.runtime.prefill_chunk,
             c.runtime.prefill_tail_merge,
             c.pool.gdn_slots,
             c.runtime.max_batch,
             c.runtime.max_concurrency,
-            c.pool.kv_fp8,
+            c.pool.kv_dtype,
         ));
     }
 

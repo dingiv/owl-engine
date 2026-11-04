@@ -8,8 +8,7 @@
 #   - select_partial 已接（2026-11-04：稠密 prefill 按 chunk 会话链重建块表）；
 #   - image_evict 已接（2026-11-04：末块 sync 后视觉 grounding/删除吸收全绿）。
 [pool]
-kv_fp8 = false
-kv_int8 = true
+kv_dtype = "int8"
 gdn_slots = 1
 # 2026-11-04 收紧:`target=1.0` 合法(base = 驱动 free,reserve 保有 256MiB);
 # 旧 0.99 在 24G 上白留 236MiB。瞬态余量只服务超卖档 ⇒ 1024→512。

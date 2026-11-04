@@ -486,12 +486,10 @@ impl EnvProvider {
                 fused_decode_v2: d.gdn_fused_decode_v2,
             },
             kv: KvEnv {
-                quant: if cfg.pool.kv_int8 {
-                    KvQuant::Int8
-                } else if cfg.pool.kv_fp8 {
-                    KvQuant::Fp8E4M3
-                } else {
-                    KvQuant::None
+                quant: match cfg.pool.kv_dtype {
+                    owl_shared::config::KvDtype::Int8 => KvQuant::Int8,
+                    owl_shared::config::KvDtype::Fp8 => KvQuant::Fp8E4M3,
+                    owl_shared::config::KvDtype::F16 => KvQuant::None,
                 },
                 ..KvEnv::default()
             },

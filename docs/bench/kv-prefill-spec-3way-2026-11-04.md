@@ -11,7 +11,7 @@
 |---|---|---|---:|---|
 | `int8` | `measurement/qwen38_27b-3090-int8.toml` | K int8 + packed V（token-major，无 shadow） | 1 122 304 B | 本仓 P8 核 |
 | `fp8s` | `measurement/qwen38_27b-3090-fp8.toml` + `kernel.prefill_shadow=true` | fp8 e4m3 + **f16 staging shadow** | 1 048 576 B | FI `flashinfer_prefill_paged_f16` |
-| `fp16` | 同上 + `pool.kv_fp8=false` | f16 | 2 097 152 B | FI `flashinfer_prefill_paged_f16` |
+| `fp16` | 同上 + `pool.kv_dtype=f16` | f16 | 2 097 152 B | FI `flashinfer_prefill_paged_f16` |
 
 `[kernel-env]` 实测标签：`kv.main.int8` / `kv.main.fp8` / `kv.main.f16` + 三者
 `kv.draft.bf16 · feat.dflash · feat.spec`，`vision=false` ✓。
@@ -69,7 +69,7 @@ TTFT（ms，与上表同序）：
 ## 5. 复现
 
 ```bash
-# int8（fp8s 换 -p ...-fp8.toml + kernel.prefill_shadow=true；f16 再 + pool.kv_fp8=false）
+# int8（fp8s 换 -p ...-fp8.toml + kernel.prefill_shadow=true；f16 再 + pool.kv_dtype=f16）
 ./target/release/server -p profiles/measurement/qwen38_27b-3090-int8.toml \
   --set 'parallel.device=["0000:41:00.0"]' --set 'model.quant="w4a8"' \
   --set 'pool.prefix_cache=false' --set 'runtime.max_seq=73728' \

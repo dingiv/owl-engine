@@ -27,7 +27,6 @@ lookup = false
 draft_path = ""
 
 [pool]
-kv_int8 = false
 prefix_cache = true
 image_evict = false
 snap_max = 2

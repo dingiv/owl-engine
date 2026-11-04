@@ -69,8 +69,7 @@
 //! | model | vision / vision_path | bool / false + Option(视觉塔;GGUF 档 = `mmproj-*.gguf` 单文件) |
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
-//! | pool | kv_fp8 | bool / false(主 KV 池 e4m3;32 KiB/token) |
-//! | pool | kv_int8 | bool / false(主 KV 池 int8;K int8 + V token-major + 两张 scale,与 kv_fp8 互斥) |
+//! | pool | kv_dtype | KvDtype 枚举 `f16\|fp8\|int8` / f16(主 KV 池存储格式;2026-11-04 由两个布尔合成单键) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
@@ -231,6 +230,51 @@ pub enum SamplerMode {
     /// 采样(缺省 = 成功推理默认姿势)
     #[default]
     Sampling,
+}
+
+/// **主 KV 池存储格式**(`[pool] kv_dtype`)。
+///
+/// 2026-11-04 用户裁决:原 `kv_fp8` / `kv_int8` **两个布尔**表达三种状态,
+/// 既允许 `true+true`(互斥门才拦)、也让"f16"只能靠"都没写"隐含表达 ——
+/// 违「模型状态不收隐式组合」。收敛成一个枚举:`f16 | fp8 | int8`。
+///
+/// 类型纪律:非法值 = 反序列化期响亮拒(`deny_unknown_fields` 之上再加
+/// serde 枚举,`--set pool.kv_dtype=x` 当场上报可用值)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvDtype {
+    /// 主池 f16(缺省;64 KiB/token)
+    #[default]
+    F16,
+    /// fp8 **e4m3**(32 KiB/token;`kernel.prefill_shadow` 只对本档有效)
+    Fp8,
+    /// **int8**(K int8 + V token-major + 两张 scale;30 系默认档)
+    Int8,
+}
+
+impl KvDtype {
+    /// 日志/`--print-config` 用的稳定词形(与 TOML 取值逐字一致)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Fp8 => "fp8",
+            Self::Int8 => "int8",
+        }
+    }
+
+    /// 主池每元素字节数(K 与 V 同宽):f16 = 2,其余 = 1。
+    pub fn bytes_per_elem(self) -> usize {
+        match self {
+            Self::F16 => 2,
+            Self::Fp8 | Self::Int8 => 1,
+        }
+    }
+}
+
+impl std::fmt::Display for KvDtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// lm_head 量化方案(model.head_quant;2026-10-11 由 bool 升格:
@@ -692,13 +736,13 @@ pub struct PoolCfg {
     /// 需求会撞 `vram-hard-budget` 拒发**(响亮,不静默)。扫档记录见
     /// `roadmap.local/26-10-28-KVMem-位置定谳与三修.md` §13。
     pub transient_reserve_mb: u64,
-    /// **主 KV 池 fp8**(→ `KvQuant::Fp8E4M3`;32 KiB/token,容量翻倍)。
-    /// 2026-10-22 从 `[kernel]` 移入:它决定池的**存储 dtype/几何**,
-    /// 与 `gdn_slots`/`snap_max` 同属池面,而不是算子臂。
-    pub kv_fp8: bool,
-    /// **主 KV 池 int8**(→ `KvQuant::Int8`;K int8 + V token-major + 两张 scale,
-    /// 1B/elem)。与 `kv_fp8` 互斥;仅 hd=256 / page=32 / 无投机档。
-    pub kv_int8: bool,
+    /// **主 KV 池存储格式**(→ `KvQuant`)。既是存储 dtype 也是池几何
+    /// (32/64 KiB 每 token),所以归池面而不是算子臂。
+    ///
+    /// 2026-11-04:`kv_fp8`/`kv_int8` 两布尔合成本枚举(见 [`KvDtype`]);
+    /// 旧键已被 `deny_unknown_fields` 拒启 —— 迁移 = 写一行
+    /// `kv_dtype = "int8"`(`--set pool.kv_dtype=int8`)。
+    pub kv_dtype: KvDtype,
     /// GDN 快照池槽数
     pub snap_max: usize,
     /// **消息边界快照**(缺省 `false` = 逐字节旧行为)。
@@ -1544,7 +1588,7 @@ pub struct KernelCfg {
     /// 瓦片要把 e4m3 反量化成 half 再算),而 decode(T=1)上 fp8 快 2×。
     /// 影子 = 保留 fp8 主池(容量),prefill 先反量化本层 KV 进 dense f16 staging,
     /// 再走 FI f16 臂。代价:单层 staging,262k ≈ 512 MiB/rank。
-    /// **仅 `[pool] kv_fp8 = true` 有效**(f16 主池没有可反量化的源)。
+    /// **仅 `[pool] kv_dtype = "fp8"` 有效**(f16/int8 主池没有可反量化的源)。
     #[serde(default)]
     pub prefill_shadow: bool,
     /// FlashInfer prefill 面
@@ -1925,8 +1969,7 @@ impl Default for PoolCfg {
     fn default() -> Self {
         Self {
             gdn_slots: 8,
-            kv_fp8: false,
-            kv_int8: false,
+            kv_dtype: KvDtype::F16,
             prefill_align_tail: true,
             snap_decode_stride: 1,
             snap_max: 4,
@@ -2185,7 +2228,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
         (
             "kernel",
             "allowed_ops",
-            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`pool.kv_fp8`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
+            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`pool.kv_dtype`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
         ),
         (
             "kernel",
@@ -2797,8 +2840,15 @@ impl OwlConfig {
     /// `exit(1)`),且**只有 server 一条入口守** —— 直接构造 engine 的路径
     /// (tests / cli)裸奔。
     pub fn validate(&self) -> Result<(), String> {
-        if self.pool.kv_fp8 && self.pool.kv_int8 {
-            return Err("[pool] kv_fp8 与 kv_int8 互斥(同一主池只能有一种存储格式)".to_string());
+        // 2026-11-04:`kv_fp8`/`kv_int8` 两布尔已并为 `kv_dtype`(枚举三类)。
+        // 旧键在反序列化期就被 `deny_unknown_fields` 拒 ⇒ 这里不再有"互斥"可查。
+        // 唯一保留的跨键语义:`prefill_shadow` 只对 fp8 主池有意义。
+        if self.kernel.prefill_shadow && self.pool.kv_dtype != KvDtype::Fp8 {
+            return Err(format!(
+                "[kernel] prefill_shadow = true 只对 fp8 主池有效(当前 [pool] kv_dtype = \"{}\");\
+                 请改 kv_dtype = \"fp8\" 或关掉 prefill_shadow",
+                self.pool.kv_dtype
+            ));
         }
         // INT8 verify 已接线（2026-11-03 P1）：T=depth+1 行复用
         // owl_int8_decode_gqa_tc_split + reduce；配置面不再拒绝 spec。
@@ -3648,7 +3698,9 @@ mod extends_tests {
         assert_eq!(c.spec.depth, 5, "文件覆盖基准");
         assert_eq!(c.runtime.max_seq, 2048, "文件键到手");
         assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");
-        assert!(c.pool.kv_fp8, "基准行为面保留");
+        // 基准档 `qwen38_27b-3090` 自 2026-11-04 起是 **INT8 主池**
+        // (旧断言写 `kv_fp8` —— 本轮换枚举时发现它早就红了,一并订正)。
+        assert_eq!(c.pool.kv_dtype, KvDtype::Int8, "基准行为面保留");
         let _ = std::fs::remove_dir_all(&d);
     }
 

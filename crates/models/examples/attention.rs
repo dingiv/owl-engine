@@ -248,6 +248,7 @@ async fn main() {
             slots: TensorOps::from_host(Dtype::F32, vec![bs], &f32b(slots)),
             kv_lens: TensorOps::from_host(Dtype::F32, vec![bs], &f32b(kv_lens)),
             block_tables: TensorOps::zeros(Dtype::F32, vec![1]), // 哑表(legacy 路径不解引用)
+            int8: None, // 本示例走 f32/f16 路径(INT8 主池需要两张 scale 平面)
         };
         let xs_t = TensorOps::from_host(Dtype::F32, vec![bs, HIDDEN], &f32b(xs));
         let pos_t = TensorOps::from_host(Dtype::F32, vec![bs], &f32b(pos));

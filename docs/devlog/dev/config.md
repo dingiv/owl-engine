@@ -126,7 +126,7 @@ reuse       = "off"               # off | session | global;不写 = goal 决定
 | `concurrency=C` | `gdn_slots=C`、`runtime.max_concurrency=C`、`max_batch=min(C,8)` |
 | `spec=dflash` | `depth=7` + 草稿目录必填 + **草稿环固定 ~40MiB**(窗口 2048,见下) |
 | `[spec] draft` | `auto`（缺省，DFlash2 目录优先 → 检查点 MTP）\| `mtp` \| `dflash2`；显式档缺资产 = boot 拒 |
-| `kv=fp8/f16` | `pool.kv_fp8` |
+| `kv=fp8/f16` | `pool.kv_dtype`（`f16\|fp8`；int8 档直接写枚举） |
 | `kvmem=off` | 选择层/索引/超卖四键全关 + 宿主/磁盘腿清零 |
 | `kvmem=overcommit` | 四键全开 + 宿主腿 + 强制 prefix_cache |
 | `graphs=auto` | FI 单图 decode + `fi_plan="baked"`（2026-10-27 单键化；原 bake/restore 两布尔）+ 窗刷表（prefill 桶已退役） |
@@ -316,8 +316,17 @@ ls profiles/
 - `OWL_MAX_SEQ` / `OWL_PREFILL_CHUNK` **已删除**(2026-10-20):它们会在
   意图派生后再改一次,造成 `max_seq` 双源。临时调压请
   `--set runtime.max_seq=…`(池自动跟随剩余显存)。
+- **`pool.kv_fp8` / `pool.kv_int8` 已退役**(2026-11-04,用户裁决):
+  两个布尔表达三种状态("f16" 只能靠"两个都不写"隐含)违「状态不收隐式组合」
+  ⇒ 合成单键 **`pool.kv_dtype = "f16" | "fp8" | "int8"`**(serde 枚举,
+  非法值当场报 `expected one of f16, fp8, int8`)。旧档不迁移也能**响亮**暴露:
+  `deny_unknown_fields` 会报 `unknown field kv_fp8, expected one of …kv_dtype…`。
+  迁移:`kv_fp8 = true` → `kv_dtype = "fp8"`;`kv_int8 = true`(配 `kv_fp8 = false`)
+  → `kv_dtype = "int8"`;全 false → `kv_dtype = "f16"`。
+  同批:`prefill_shadow = true` 现在会校验主池必须是 `"fp8"`(f16/int8 主池
+  没有可反量化的源,旧档静默无效)。
 - **allowed_ops 已退役**(2026-10-20):配置按 `model.format/quant/head_quant`、
-  `pool.kv_fp8`、`spec.depth`、`model.vision`、`parallel.mode` 自动派生
+  `pool.kv_dtype`、`spec.depth`、`model.vision`、`parallel.mode` 自动派生
   tag filter;`[kernel] tag_wildcard = true` 是诊断 `*` 逃生门。
 - **P2 未做**:旧档迁移器、`context=max` 校准探测、长跑泄漏余量曲线。
 - 配置层 `deny_unknown_fields` 仍全 module 生效;退役键有专门迁移提示。

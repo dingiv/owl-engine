@@ -49,8 +49,8 @@ bind = "0.0.0.0:8137"
 quant = "w4a8"
 
 [kernel]
-# INT8 主池没有 FP8→F16 shadow（`prefill_shadow` 仅 kv_fp8 有效；
-# 配置面会拒 `prefill_shadow && !kv_fp8`）。INT8 prefill 走专用 P8 核。
+# INT8 主池没有 FP8→F16 shadow（`prefill_shadow` 仅 `kv_dtype = "fp8"` 有效；
+# 配置面会拒 `prefill_shadow && kv_dtype != "fp8"`）。INT8 prefill 走专用 P8 核。
 prefill_shadow = false
 
 [runtime]

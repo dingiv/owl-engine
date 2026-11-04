@@ -2,7 +2,7 @@
 # ⚠️ FI/Decode 的 FP8 路径仍 dequant→half（compute 不是 FP8 MMA），
 # 存储/带宽收益为主；详见 profiles/README.md。
 [pool]
-kv_fp8 = true
+kv_dtype = "fp8"
 gdn_slots = 1
 # 2026-11-04 收紧(同 int8 池):target=1.0 合法,reserve 仍 256MiB。
 vram_target = 1.0

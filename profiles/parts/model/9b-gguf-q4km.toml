@@ -4,7 +4,7 @@
 # full_attention_interval=4 / nextn_predict_layers=1 ⇒ 自带 MTP 头）。
 [model]
 name = "qwen3.8-9b-gguf"
-path = "/home/ubuntu/gui_agent/models/empero-ai/Qwen3.8-9B-Distill-GGUF/Qwen3.8-9B-Q4_K_M.gguf"
+path = "../models/empero-ai/Qwen3.8-9B-Distill-GGUF/Qwen3.8-9B-Q4_K_M.gguf"
 format = "gguf"
 quant = "q4k"
 head_quant = "off"

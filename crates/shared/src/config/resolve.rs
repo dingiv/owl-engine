@@ -219,10 +219,14 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
 
     match intent.kv {
         KvIntent::Fp8 => {
-            b.set("pool.kv_fp8", true.into(), "intent.kv = fp8(容量 ×2;FI 读核前提)");
+            b.set(
+                "pool.kv_dtype",
+                "fp8".into(),
+                "intent.kv = fp8(容量 ×2;FI 读核前提)",
+            );
         }
         KvIntent::F16 => {
-            b.set("pool.kv_fp8", false.into(), "intent.kv = f16");
+            b.set("pool.kv_dtype", "f16".into(), "intent.kv = f16");
         }
     }
 
@@ -366,8 +370,11 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         reserve_bytes: (get_usize(&out, "pool.vram_reserve_mb").unwrap_or(1024) as u64) << 20,
         model,
         spec_dflash: intent.spec == SpecIntent::Dflash,
-        kv_fp8: get_bool(&out, "pool.kv_fp8").unwrap_or(false)
-            || get_bool(&out, "pool.kv_int8").unwrap_or(false),
+        // 内存模型只关心"每元素几字节":f16 = 2B,其余 = 1B(字段名沿用历史)。
+        kv_fp8: !matches!(
+            get_str(&out, "pool.kv_dtype").unwrap_or("f16"),
+            "f16"
+        ),
         gdn_slots: get_usize(&out, "pool.gdn_slots").unwrap_or(8),
         snap_max: get_usize(&out, "pool.snap_max").unwrap_or(4),
         sessions: c,
@@ -603,6 +610,11 @@ pub(crate) fn get_bool(v: &Value, path: &str) -> Option<bool> {
     get(v, path).and_then(|x| x.as_bool())
 }
 
+/// 字符串叶子(枚举型键在**派生期**只读词形;合法性仍由反序列化期拒)。
+pub(crate) fn get_str<'a>(v: &'a Value, path: &str) -> Option<&'a str> {
+    get(v, path).and_then(|x| x.as_str())
+}
+
 pub(crate) fn get_f64(v: &Value, path: &str) -> Option<f64> {
     get(v, path).and_then(|x| match x {
         Value::Float(f) => Some(*f),
@@ -693,7 +705,7 @@ mode = "greedy"
         assert_eq!(c.pool.snap_host_mb, 0, "reuse=off ⇒ 快照宿主层关");
         assert!(!c.pool.prefix_cache, "reuse=off ⇒ 前缀缓存关");
         assert_eq!(c.pool.gdn_slots, 1);
-        assert!(c.pool.kv_fp8, "kv=fp8");
+        assert_eq!(c.pool.kv_dtype, super::super::KvDtype::Fp8, "kv=fp8");
         assert_eq!(c.pool.vram_target, 0.99);
         assert_eq!(c.pool.vram_reserve_mb, 256);
 

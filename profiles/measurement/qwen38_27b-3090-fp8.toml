@@ -29,8 +29,7 @@ lookup = false
 draft_path = ""
 
 [pool]
-kv_int8 = false
-kv_fp8 = true
+kv_dtype = "fp8"
 prefix_cache = true
 image_evict = false
 # 2026-11-04 收紧:单流测量档只用 1 槽(2 槽=228MiB 白留);生产档不改。
