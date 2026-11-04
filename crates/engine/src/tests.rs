@@ -11,6 +11,7 @@
 //! 会话连续 / 4k 长 ctx / W4A16 / 27B AWQ / 多会话隔离 / 前缀缓存命中 /
 //! S0 调度决策面。
 
+use crate::spec_runtime::DraftHead as _;
 use crate::engine::{Engine, EngineConfig, EngineKnobs};
 #[cfg(test)] // 仅单元档的 decode 差分用例消费;e2e 档不编该函数
 use crate::exec::decode_delta;
@@ -2898,7 +2899,7 @@ pub async fn gpu_08b_budget_probe() {
     snapshot("③run 后");
 
     // 池几何先**拷出来**(下面要 &mut running 跑 turn;借用不重叠)
-    let (nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged) = {
+    let (nb, nb_kv, page, n_full, n_gdn, kv_is_fp8, gdn_slots, snap_slots, paged) = {
         let pool = &running.dev.pool;
         (
             pool.geom.nb,
@@ -2906,7 +2907,7 @@ pub async fn gpu_08b_budget_probe() {
             pool.geom.page,
             pool.kvs().len(),
             pool.gdn_count(),
-            pool.geom.kv_fp8,
+            pool.geom.is_fp8(),
             pool.geom.gdn_slots,
             pool.snap_capacity(),
             pool.geom.paged,
@@ -2932,8 +2933,8 @@ pub async fn gpu_08b_budget_probe() {
         .saturating_sub(kv_pool + gdn_pool + snap_pool + draft_pool);
 
     eprintln!(
-        "[budget] 池几何 nb={} nb_kv={} page={} n_full={} n_gdn={} kv_fp8={} gdn_slots={} snap_slots={} paged={}",
-        nb, nb_kv, page, n_full, n_gdn, kv_fp8, gdn_slots, snap_slots, paged
+        "[budget] 池几何 nb={} nb_kv={} page={} n_full={} n_gdn={} kv_is_fp8={} gdn_slots={} snap_slots={} paged={}",
+        nb, nb_kv, page, n_full, n_gdn, kv_is_fp8, gdn_slots, snap_slots, paged
     );
     eprintln!(
         "[budget] 导出 kv_bytes_per_token={kv_per_tok}B({}KiB) gdn_row={:.2}MiB gdn_pool={:.2}MiB snap_pool={:.2}MiB draft_pool={:.2}MiB",
@@ -6180,7 +6181,7 @@ pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
     eprintln!("[f1-27b] 装载+装配 {:?}", t0.elapsed());
     assert!(
         running.dev.boot.vlm.is_some(),
-        "[model].vision = true 必须有视觉塔(27B)"
+        "[vision] enabled = true 必须有视觉塔(27B)"
     );
 
     let l_img = 64usize; // 网格 (1,16,16) ⇒ (16/2)² = 64 tok
@@ -7295,8 +7296,15 @@ pub async fn gpu_mtp_kv_parity() {
         let vocab = running.dev.boot.model.vocab_size();
         let rope = running.dev.boot.rope.clone();
         let attn_v2 = running.dev.pool.attn_v2_scratch();
-        let drafts = match running.dev.spec_rt.drafter.as_ref().expect("drafter") {
-            crate::spec_runtime::Drafter::Mtp(m) => m.propose(
+        let drafts = match running
+            .dev
+            .spec_rt
+            .drafter
+            .as_ref()
+            .and_then(|d| d.as_mtp())
+            .expect("MTP drafter")
+        {
+            m => m.propose(
                 &anchor_t,
                 &seed_view,
                 1,
@@ -7308,7 +7316,6 @@ pub async fn gpu_mtp_kv_parity() {
                 env,
                 attn_v2,
             ),
-            _ => panic!("MTP only"),
         };
         let tp = running.dev.boot.tp.clone();
         let (b, arena) = {

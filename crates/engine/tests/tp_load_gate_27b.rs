@@ -622,7 +622,7 @@ async fn load_draft_once(
         &spec,
         QuantPlan::W4A16,
         owl_models::contract::Dtype::BF16,
-        false,
+        owl_models::contract::Dtype::BF16,
     );
     // **CPU 物化面关掉**(用户裁决 2026-10-19:"CPU 面先关掉,先把 GPU 打通")
     // —— 分片档只走设备重排臂;CPU 臂在 shard>1 下本就响亮拒(不可矩形切)

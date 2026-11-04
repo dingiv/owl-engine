@@ -66,23 +66,23 @@
 //! | model | format | ModelFormat 枚举 safetensors\|awq\|gguf / safetensors |
 //! | model | path / name | Option<PathBuf> / None(模型目录或 .gguf 单文件) |
 //! | model | quant | QuantScheme(safetensors/awq: w4a16\|w4a8;gguf: q4k\|iq4\|iq3) |
-//! | model | vision / vision_path | bool / false + Option(视觉塔;GGUF 档 = `mmproj-*.gguf` 单文件) |
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
-//! | pool | kv_fp8 | bool / false(主 KV 池 e4m3;32 KiB/token) |
-//! | pool | kv_int8 | bool / false(主 KV 池 int8;K int8 + V token-major + 两张 scale,与 kv_fp8 互斥) |
+//! | pool | kv_dtype | KvDtype 枚举 `f16\|fp8\|int8` / f16(主 KV 池存储格式;2026-11-04 由两个布尔合成单键) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
-//! | pool | image_evict | bool / false(**前缀无感删除**:客户端给可删图像打标记 ⇒ 引擎页对齐 + 删除即位置帧平移) |
-//! | pool | image_evict_pad | str / "。"(页对齐 pad 词;必须恰 1 token;空 = 自动 `。`→` `→`\\n`) |
+//! | vision | enabled | bool / false(视觉塔开关;GGUF 档另有 `path` 指向 `mmproj-*.gguf`) |
+//! | vision | image_evict | bool / false(**前缀无感删除**:图像段打标记 ⇒ 页对齐 + 删除即位置帧平移,需 `[pool] prefix_cache`) |
+//! | vision | image_evict_pad | str / "。"(图像段页对齐 pad 词;必须恰 1 token;空 = 自动) |
+//! | vision | max_pixels / path | usize 0 / Option None(图像预处理像素封顶 / 视觉塔权重路径) |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
 //! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
 //! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
 //! | pool | disk_cache_mb / snap_disk_mb | usize / 0、0(**磁盘两层分片**;0 = 关层) |
 //! | pool | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
-//! | spec | depth / draft / dumb / draft_kv_fp8 | usize 0(off)、SpecDraft auto/mtp/dflash2、flag、flag |
+//! | spec | depth / draft / dumb / draft_kv_dtype | usize 0(off)、SpecDraft auto/mtp/dflash2、flag、DraftKvDtype `bf16\|fp8` |
 //! | spec | dflash_walk | DflashWalk 枚举("conditional"|"fixed_pred"|"unary")/ conditional(**AL 消融旋钮**;缺省 = 设备核原律) |
 //! | spec | q_alpha / q_floor | f32 / 1.0、0.0(**草稿 q 校准旋钮**;α = logit 缩放,ε = 候选集上的均匀地板) |
 //! | spec | mtp_window / mtp_sink | usize / 0、64(MTP 草稿读视图;0 = full) |
@@ -256,6 +256,81 @@ pub enum SamplerMode {
     /// 采样(缺省 = 成功推理默认姿势)
     #[default]
     Sampling,
+}
+
+/// **主 KV 池存储格式**(`[pool] kv_dtype`)。
+///
+/// 2026-11-04 用户裁决:原 `kv_fp8` / `kv_int8` **两个布尔**表达三种状态,
+/// 既允许 `true+true`(互斥门才拦)、也让"f16"只能靠"都没写"隐含表达 ——
+/// 违「模型状态不收隐式组合」。收敛成一个枚举:`f16 | fp8 | int8`。
+///
+/// 类型纪律:非法值 = 反序列化期响亮拒(`deny_unknown_fields` 之上再加
+/// serde 枚举,`--set pool.kv_dtype=x` 当场上报可用值)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvDtype {
+    /// 主池 f16(缺省;64 KiB/token)
+    #[default]
+    F16,
+    /// fp8 **e4m3**(32 KiB/token;`kernel.prefill_shadow` 只对本档有效)
+    Fp8,
+    /// **int8**(K int8 + V token-major + 两张 scale;30 系默认档)
+    Int8,
+}
+
+impl KvDtype {
+    /// 日志/`--print-config` 用的稳定词形(与 TOML 取值逐字一致)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Fp8 => "fp8",
+            Self::Int8 => "int8",
+        }
+    }
+
+    /// 主池每元素字节数(K 与 V 同宽):f16 = 2,其余 = 1。
+    pub fn bytes_per_elem(self) -> usize {
+        match self {
+            Self::F16 => 2,
+            Self::Fp8 | Self::Int8 => 1,
+        }
+    }
+}
+
+/// **草稿池 KV 存储格式**(`[spec] draft_kv_dtype`)。
+///
+/// 2026-11-04 与主池同批:草稿池原先也是"布尔当 dtype"(`draft_kv_fp8`),
+/// 收敛成枚举。草稿只有两档:BF16(缺省,环窗口 2048 的 bf16 池)/ fp8 e4m3
+/// (偷显存档 —— 池体积减半,读核走 K0WriteFp8 / NaiveAttnNcFp8kv)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DraftKvDtype {
+    /// bf16(缺省;草稿执行 dtype = BF16)
+    #[default]
+    Bf16,
+    /// fp8 e4m3
+    Fp8,
+}
+
+impl DraftKvDtype {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Fp8 => "fp8",
+        }
+    }
+}
+
+impl std::fmt::Display for DraftKvDtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for KvDtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// lm_head 量化方案(model.head_quant;2026-10-11 由 bool 升格:
@@ -634,6 +709,50 @@ impl RopeCfg {
     }
 }
 
+/// **视觉面**(`[vision]`)。2026-11-04 用户裁决:视觉相关键原本散在
+/// `[model]`(塔开关/路径)、`[server]`(像素上限)、`[pool]`(图像段删除)三处,
+/// 收编成一个 section —— "开塔/换塔/限像素/删图缓存"是一件事的四个侧面。
+///
+/// **缺省 = 纯文本**:`enabled = false` 时其余字段零副作用,文本路径逐字节不变。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VisionCfg {
+    /// **视觉塔开关**。`true` = 装载视觉塔(检查点 `model.visual.*`,GGUF 档为
+    /// `path` 指向的 `mmproj-*.gguf`),引擎允许 VLM 请求。检查点没有
+    /// `vision_config` 而置 true = 装载期响亮拒。
+    pub enabled: bool,
+    /// **视觉塔权重路径**(不写 = 检查点内置)。
+    /// - HF/AWQ:预留目录形式(当前装载器只支持检查点内置);
+    /// - GGUF:指向 `mmproj-*.gguf` 单文件;不写 = 同目录**唯一**候选
+    ///   (多个/没有 ⇒ 响亮拒);
+    /// - `enabled = false` 却给了 path = 配置自相矛盾(装载期响亮拒)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// **单图像素上限**(`smart_resize` 封顶;0 = 内置 4096² = 实际不缩)。
+    /// 图像 token 数 ∝ 像素:1 MP ≈ 646 tok、0.5 MP ≈ 281 tok;
+    /// 真机 GUI agent 每轮 +1 张截图 ⇒ 每 100 tok ≈ 135 ms prefill(135k 上下文)。
+    pub max_pixels: usize,
+    /// **前缀无感删除(图像段)**。客户端给图像打 `owl_evict` 标记 ⇒ 引擎把
+    /// 该段补 pad 到页对齐并记为候选;真删时保留后缀页、**不转 K、不移动
+    /// 幸存 token 的 position**。需 `[pool] prefix_cache` + 分页 KV。
+    /// 缺省 false = 逐字节旧行为(引擎不自作主张)。
+    pub image_evict: bool,
+    /// 图像段页对齐 pad 词(**必须恰 1 token**;空串 = 自动 `。`→` `→`\\n`)。
+    pub image_evict_pad: String,
+}
+
+impl Default for VisionCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            max_pixels: 0,
+            image_evict: false,
+            image_evict_pad: "。".to_string(),
+        }
+    }
+}
+
 /// 模型资产面
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -643,22 +762,6 @@ pub struct ModelCfg {
     pub format: ModelFormat,
     /// **rope 外推/缩放**(`[model.rope]`;缺省关。GGUF 档生效)
     pub rope: RopeCfg,
-    /// **视觉塔**(VLM;2026-10-20 视觉接线):`true` = 装载检查点
-    /// `config.json:vision_config` 的 `model.visual.*` 权重,引擎可走 VLM
-    /// prefill 面。**缺省 false = 纯文本路径逐字节不变**;检查点无
-    /// `vision_config` 而置 true = 装载期响亮拒。
-    ///
-    /// **GGUF 档**(2026-10-21):`true` 时装 `vision_path` 指向的视觉塔;
-    /// GGUF 主文件本身不含 `model.visual.*`。
-    #[serde(default)]
-    pub vision: bool,
-    /// **视觉塔权重路径**(留空/不写 = 用检查点内置 `model.visual.*`)。
-    ///
-    /// - HF/AWQ:预留目录形式(当前装载器只支持检查点内置);
-    /// - GGUF(2026-10-21):指向同目录 `mmproj-*.gguf` 单文件;缺省在
-    ///   `model.path` 同目录找**唯一** `mmproj*.gguf`(多个/没有 ⇒ 响亮拒)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vision_path: Option<PathBuf>,
     /// **模型路径**:目录(`safetensors`/`awq` 检查点)或 `.gguf` 单文件
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -723,13 +826,13 @@ pub struct PoolCfg {
     /// 需求会撞 `vram-hard-budget` 拒发**(响亮,不静默)。扫档记录见
     /// `roadmap.local/26-10-28-KVMem-位置定谳与三修.md` §13。
     pub transient_reserve_mb: u64,
-    /// **主 KV 池 fp8**(→ `KvQuant::Fp8E4M3`;32 KiB/token,容量翻倍)。
-    /// 2026-10-22 从 `[kernel]` 移入:它决定池的**存储 dtype/几何**,
-    /// 与 `gdn_slots`/`snap_max` 同属池面,而不是算子臂。
-    pub kv_fp8: bool,
-    /// **主 KV 池 int8**(→ `KvQuant::Int8`;K int8 + V token-major + 两张 scale,
-    /// 1B/elem)。与 `kv_fp8` 互斥;仅 hd=256 / page=32 / 无投机档。
-    pub kv_int8: bool,
+    /// **主 KV 池存储格式**(→ `KvQuant`)。既是存储 dtype 也是池几何
+    /// (32/64 KiB 每 token),所以归池面而不是算子臂。
+    ///
+    /// 2026-11-04:`kv_fp8`/`kv_int8` 两布尔合成本枚举(见 [`KvDtype`]);
+    /// 旧键已被 `deny_unknown_fields` 拒启 —— 迁移 = 写一行
+    /// `kv_dtype = "int8"`(`--set pool.kv_dtype=int8`)。
+    pub kv_dtype: KvDtype,
     /// GDN 快照池槽数
     pub snap_max: usize,
     /// **消息边界快照**(缺省 `false` = 逐字节旧行为)。
@@ -788,28 +891,6 @@ pub struct PoolCfg {
     pub vram_target: f64,
     pub vram_reserve_mb: u64,
     pub prefix_cache: bool,
-    /// **前缀无感删除(图像段)** —— 2026-10-23 用户裁决:引擎**不自作主张**,
-    /// 必须由客户端显式给图像打「将来可能被删」标记(`TurnImage::evict`)且本键开。
-    ///
-    /// 开 = 对**带标记**的图像段做两件事:
-    /// ① 页对齐 pad(段首落页边界、整段整页 —— 删除后块表拼接零搬运);
-    /// ② 下一轮若识别到「历史里正好少了这一段」,保留后缀页、**不转 K、
-    ///    不移动幸存 token 的 position**,新 token 从 `max_pos+1` 追加;
-    ///    不重算前缀之后的任何 token,可无限次丢弃旧图片缓存。
-    ///
-    /// 关 = 逐字节旧行为(标记被忽略;带了标记也**响亮拒**,不静默降级)。
-    /// 依赖:`prefix_cache = true`(内容寻址取旧链)与分页 kNHD KV
-    /// (f16 或 fp8-e4m3)。
-    pub image_evict: bool,
-    /// **页对齐 pad 的填充词**(`[pool].image_evict_pad`;缺省 **`。`**;空串 = 自动)。
-    ///
-    /// 为什么要可配:pad 词是**模型敏感项** —— 27B/TP2 实测,`\n`(一串空行)从第 3 张
-    /// 标记图起就让回答开头吐 `< >`;` `(空格)推到 ≥7 张;`。`(正常标点)8 图 / 8 次删除
-    /// 都干净。不同模型/不同 chat 模板对此的容忍度不同 ⇒ **不写死**。
-    ///
-    /// 约束:**必须恰 1 token**(boot 门校验,不符即拒启);pad 按区间记账、`unpad`
-    /// 整段剥 ⇒ 对客户端**完全不可见**。空串 = 按 `。`→` `→`\n` 顺序自动挑第一个。
-    pub image_evict_pad: String,
     /// **解释器块池预算**(字节;0 = 关 = 逐节点 alloc/free 存量路径)。
     /// 原 `OWL_BLOCK_POOL` env;P1″ 块竞技场(见 `interpreters::eval`)。
     pub block_pool_bytes: usize,
@@ -1243,7 +1324,8 @@ pub struct SpecCfg {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_path: Option<PathBuf>,
     pub dumb: bool,
-    pub draft_kv_fp8: bool,
+    /// 草稿池存储格式(枚举;缺省 bf16)。见 [`DraftKvDtype`]。
+    pub draft_kv_dtype: DraftKvDtype,
     /// **DFlash2 草稿环窗口(token;0 = auto = 检查点 `sliding_window`)**。
     /// 草稿池按这个窗口做环形缓冲(不再按 pool_tokens 全量物化);
     /// 当前 NC 核只实例化 2048,写非 2048 = boot 拒(等核支持 4k/8k)。
@@ -1303,6 +1385,10 @@ pub struct SpecCfg {
     /// 窗口生效的最小绝对上下文(token;0 = 不设额外门槛)。
     /// 短 ctx 下草稿尾部仍需要完整历史;8k d7 实测 window=4032 会掉 AL。
     pub mtp_window_min_ctx: usize,
+    /// **MTP 草稿 KV 物理环**(T5;缺省 false)。只服务 MTP + window>0。
+    /// 容量 = `max(min_ctx, sink + window + depth + page)`(页对齐)：
+    /// 短 ctx 仍保留完整历史，长 ctx 只覆盖当前读集，**不改变读集**。
+    pub mtp_ring: bool,
     /// **自适应 depth(仅 MTP)**：短 ctx 用 `depth`，长 ctx 回 `depth_min`。
     /// 两档都必须在 boot 期预捕获 verify/fold/propose 图族；运行期只换图引用，
     /// 禁止在线重捕。缺省 false（旧档逐字节不变）。
@@ -1575,7 +1661,7 @@ pub struct KernelCfg {
     /// 瓦片要把 e4m3 反量化成 half 再算),而 decode(T=1)上 fp8 快 2×。
     /// 影子 = 保留 fp8 主池(容量),prefill 先反量化本层 KV 进 dense f16 staging,
     /// 再走 FI f16 臂。代价:单层 staging,262k ≈ 512 MiB/rank。
-    /// **仅 `[pool] kv_fp8 = true` 有效**(f16 主池没有可反量化的源)。
+    /// **仅 `[pool] kv_dtype = "fp8"` 有效**(f16/int8 主池没有可反量化的源)。
     #[serde(default)]
     pub prefill_shadow: bool,
     /// FlashInfer prefill 面
@@ -1858,12 +1944,6 @@ pub struct ServerCfg {
     /// **原始请求 JSON 落盘目录**(空 = 关;每请求一份 body,供前端联调
     /// 精确复现。含业务数据/图片 data URL,开启前确认隐私与磁盘容量)。
     pub request_dump_dir: String,
-    /// **单图像素上限**(视觉预处理 `smart_resize` 的封顶;0 = 内置 4096²=不缩）。
-    ///
-    /// 图像 token 数 ∝ 像素；真实 GUI agent 每轮 +1 张截图 ≈880 tok ⇒ 在 135k
-    /// 上下文里每轮多付 ~1.2 s prefill。封顶到 1 MP ⇒ 646 tok、0.5 MP ⇒ 281 tok。
-    /// 代价 = 小字号 UI 的可读性（产品权衡，默认 0 = 老行为）。
-    pub vision_max_pixels: usize,
     /// 模板路径覆盖:None/空 = 模型快照 `<model.path>/chat_template.jinja`;
     /// 相对路径 = 相对模型目录。**不动快照**换模板的运维抓手。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1885,7 +1965,6 @@ impl Default for ServerCfg {
         Self {
             bind: "127.0.0.1:8135".into(),
             request_dump_dir: String::new(),
-            vision_max_pixels: 0,
             template_path: None,
             parse_tool_calls: true,
             tool_call_format: ToolCallFormat::Xml,
@@ -1905,6 +1984,8 @@ impl Default for ServerCfg {
 pub struct OwlConfig {
     pub runtime: RuntimeCfg,
     pub model: ModelCfg,
+    /// 视觉面(见 [`VisionCfg`])
+    pub vision: VisionCfg,
     pub pool: PoolCfg,
     pub kvmem: KvmemCfg,
     pub spec: SpecCfg,
@@ -1956,8 +2037,7 @@ impl Default for PoolCfg {
     fn default() -> Self {
         Self {
             gdn_slots: 8,
-            kv_fp8: false,
-            kv_int8: false,
+            kv_dtype: KvDtype::F16,
             prefill_align_tail: true,
             snap_decode_stride: 1,
             snap_max: 4,
@@ -1977,8 +2057,6 @@ impl Default for PoolCfg {
             vram_reserve_mb: 1024,
             transient_reserve_mb: 1024,
             prefix_cache: true,
-            image_evict: false,
-            image_evict_pad: "。".to_string(),
             block_pool_bytes: 0,
             no_reclaim: false,
             vram_budget_mb: None,
@@ -2030,7 +2108,7 @@ impl Default for SpecCfg {
             draft: SpecDraft::Auto,
             draft_path: None,
             dumb: false,
-            draft_kv_fp8: false,
+            draft_kv_dtype: DraftKvDtype::Bf16,
             draft_window: 0,
             dflash_walk: DflashWalk::Conditional,
             q_alpha: 1.0,
@@ -2045,6 +2123,7 @@ impl Default for SpecCfg {
             mtp_window: 0,
             mtp_sink: 64,
             mtp_window_min_ctx: 0,
+            mtp_ring: false,
             adaptive_depth: false,
             depth_min: 3,
             depth_switch_ctx: 49152,
@@ -2216,7 +2295,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
         (
             "kernel",
             "allowed_ops",
-            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`pool.kv_fp8`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
+            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`pool.kv_dtype`、`spec.depth`、`vision.enabled`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
         ),
         (
             "kernel",
@@ -2422,7 +2501,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
         (
             "model",
             "vision_dir",
-            "已更名为 `[model] vision_path`(留空 = 检查点内置视觉塔)",
+            "已更名为 `[vision] path`(留空 = 检查点内置视觉塔)",
         ),
     ];
     for (module, key, hint) in MOVED_KEYS {
@@ -2828,8 +2907,15 @@ impl OwlConfig {
     /// `exit(1)`),且**只有 server 一条入口守** —— 直接构造 engine 的路径
     /// (tests / cli)裸奔。
     pub fn validate(&self) -> Result<(), String> {
-        if self.pool.kv_fp8 && self.pool.kv_int8 {
-            return Err("[pool] kv_fp8 与 kv_int8 互斥(同一主池只能有一种存储格式)".to_string());
+        // 2026-11-04:`kv_fp8`/`kv_int8` 两布尔已并为 `kv_dtype`(枚举三类)。
+        // 旧键在反序列化期就被 `deny_unknown_fields` 拒 ⇒ 这里不再有"互斥"可查。
+        // 唯一保留的跨键语义:`prefill_shadow` 只对 fp8 主池有意义。
+        if self.kernel.prefill_shadow && self.pool.kv_dtype != KvDtype::Fp8 {
+            return Err(format!(
+                "[kernel] prefill_shadow = true 只对 fp8 主池有效(当前 [pool] kv_dtype = \"{}\");\
+                 请改 kv_dtype = \"fp8\" 或关掉 prefill_shadow",
+                self.pool.kv_dtype
+            ));
         }
         // INT8 verify 已接线（2026-11-03 P1）：T=depth+1 行复用
         // owl_int8_decode_gqa_tc_split + reduce；配置面不再拒绝 spec。
@@ -2921,6 +3007,38 @@ impl OwlConfig {
             if self.spec.depth == 0 {
                 return Err(
                     "[spec] mtp_window > 0 但 depth = 0（MTP 已关，窗口无消费者）".to_string(),
+                );
+            }
+        }
+        // **MTP ring 自洽**(2026-11-04):ring 只服务窗口读视图；没有
+        // window 就没有可回收的读集，必须拒启而不是静默退化成线性。
+        if self.spec.mtp_ring {
+            if self.spec.mtp_window == 0 {
+                return Err("[spec] mtp_ring = true 但 mtp_window = 0（ring 只服务窗口读视图）".to_string());
+            }
+            if self.spec.depth == 0 {
+                return Err("[spec] mtp_ring = true 但 depth = 0（MTP 已关）".to_string());
+            }
+            if !matches!(self.spec.draft, SpecDraft::Mtp) {
+                let dflash2_auto = matches!(self.spec.draft, SpecDraft::Auto)
+                    && self
+                        .spec
+                        .draft_path
+                        .as_ref()
+                        .is_some_and(|p| !p.as_os_str().is_empty());
+                if dflash2_auto || matches!(self.spec.draft, SpecDraft::Dflash2) {
+                    return Err("[spec] mtp_ring 只服务 MTP；当前档是 DFlash2".to_string());
+                }
+            }
+            // ring 是**单会话固定池**：同一物理环不按会话分片。多会话并发会
+            // 互相覆盖对方仍可能恢复的 MTP 链。当前只放行隐式单会话 + 不批。
+            if !self.runtime.implicit_session
+                || self.runtime.max_concurrency > 1
+                || self.runtime.max_batch > 1
+            {
+                return Err(
+                    "[spec] mtp_ring 需要单会话固定环：请开 runtime.implicit_session=true，                     并保持 max_concurrency=1 / max_batch=1（多会话需每会话独立 ring，尚未实现）"
+                        .to_string(),
                 );
             }
         }
@@ -3071,8 +3189,8 @@ impl OwlConfig {
         // **前缀无感删除的依赖门**(2026-10-23):删除路径靠**内容寻址**取回旧链,
         // 没有前缀缓存就没有旧链可拼接 ⇒ 开着 `image_evict` 却没开 `prefix_cache`
         // 是"配了但永远不会生效",按静默降级拒启。
-        if self.pool.image_evict && !self.pool.prefix_cache {
-            return Err("[pool] image_evict = true 需要 prefix_cache = true\
+        if self.vision.image_evict && !self.pool.prefix_cache {
+            return Err("[vision] image_evict = true 需要 [pool] prefix_cache = true\
                  (删除路径要按内容身份取回旧链,前缀缓存关掉就没有可拼接的旧链)"
                 .to_string());
         }
@@ -3718,7 +3836,9 @@ mod extends_tests {
         assert_eq!(c.spec.depth, 5, "文件覆盖基准");
         assert_eq!(c.runtime.max_seq, 2048, "文件键到手");
         assert_eq!(c.sampling.mode, SamplerMode::Greedy, "基准未覆盖处保留");
-        assert!(c.pool.kv_fp8, "基准行为面保留");
+        // 基准档 `qwen38_27b-3090` 自 2026-11-04 起是 **INT8 主池**
+        // (旧断言写 `kv_fp8` —— 本轮换枚举时发现它早就红了,一并订正)。
+        assert_eq!(c.pool.kv_dtype, KvDtype::Int8, "基准行为面保留");
         let _ = std::fs::remove_dir_all(&d);
     }
 

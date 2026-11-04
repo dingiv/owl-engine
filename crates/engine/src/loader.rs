@@ -37,7 +37,7 @@ pub struct LoadedModel {
     pub(crate) quant_plan: Option<owl_models::module::QuantPlan>,
     /// MTP 头检查点目录(E5-M2b;Some = 检查点自带 mtp.*,spec 可选真草稿)
     pub(crate) mtp_dir: Option<std::path::PathBuf>,
-    /// **视觉塔装配**(`[model].vision`;Some = 本档是 VLM)。
+    /// **视觉塔装配**(`[vision] enabled`;Some = 本档是 VLM)。
     /// 文本主干与 `model` **同一份 Arc**;塔是额外权重(每 rank 一份)。
     pub(crate) vlm: Option<std::sync::Arc<Vlm>>,
 }
@@ -85,9 +85,9 @@ pub struct ModelLoader<'a, D: DeviceClient> {
     rope: owl_shared::config::RopeCfg,
     /// 单 turn 预算(`runtime.max_seq`;YaRN 表长至少覆盖它)
     max_seq: usize,
-    /// 视觉塔(`[model].vision`;false = 纯文本路径逐字节不变)
+    /// 视觉塔(`[vision] enabled`;false = 纯文本路径逐字节不变)
     vision: bool,
-    /// GGUF 视觉塔单文件(`[model].vision_path`;None = 同目录唯一候选)
+    /// GGUF 视觉塔单文件(`[vision] path`;None = 同目录唯一候选)
     mmproj: Option<std::path::PathBuf>,
     /// MTP 头覆盖路径(目录或 `.gguf`;None = 检查点自带)
     mtp_override: Option<std::path::PathBuf>,
@@ -132,14 +132,14 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         self
     }
 
-    /// **视觉塔装载**(`[model].vision`;2026-10-20 视觉接线第一刀)。
+    /// **视觉塔装载**(`[vision] enabled`;2026-10-20 视觉接线第一刀)。
     /// 缺省 false = 纯文本路径逐字节不变。
     pub fn vision(mut self, on: bool) -> Self {
         self.vision = on;
         self
     }
 
-    /// **GGUF 视觉塔单文件**(`[model].vision_path`;None = 同目录唯一
+    /// **GGUF 视觉塔单文件**(`[vision] path`;None = 同目录唯一
     /// `mmproj*.gguf`)。仅 GGUF 档消费;HF/AWQ 档写本键 = 响亮拒。
     pub fn mmproj(mut self, p: Option<std::path::PathBuf>) -> Self {
         self.mmproj = p;
@@ -201,6 +201,53 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             debug_tap: false,
             staging_mb: self.load.staging_mb,
             dump: false,
+        }
+    }
+
+    /// **按装载臂装载 —— 唯一分派点**(2026-11-04 clean-code)。
+    ///
+    /// 三条臂的差异收敛在这里(而不是 server 的 `load_shard`):
+    /// - 旋钮统一走 [`LoadIntent`];每臂**只取自己认的**,
+    ///   不认的**响亮拒**(不再静默忽略 —— GGUF 的 head/embed 就是历史静默项);
+    /// - `mtp_override` 是 loader 的构造期字段(引擎注入),与臂无关。
+    pub async fn load_arm(
+        &mut self,
+        dir: &Path,
+        arm: crate::LoadArm,
+        intent: &crate::LoadIntent,
+    ) -> Result<LoadedModel> {
+        match arm {
+            // AWQ pack-quantized 家族(cyankiwi 系;int4 已由产出方烘焙)
+            crate::LoadArm::AwqInt4 | crate::LoadArm::AwqA8 => {
+                self.load_qwen38_27b_awq_with_embed(
+                    dir,
+                    dir,
+                    intent.head,
+                    intent.quant,
+                    intent.embed,
+                )
+                .await
+            }
+            // 普通 HF safetensors 目录(白名单下只有 nvfp4 / f16 基线两档)
+            crate::LoadArm::NvFp4 | crate::LoadArm::F16Base => {
+                self.load_qwen35_safetensors(dir, intent.quant, intent.head, intent.embed)
+                    .await
+            }
+            // GGUF 单文件:超参/词表/rope/权重全从文件来 ⇒ head/embed 覆盖无意义
+            // (计划是**逐张量**事实)。给了 = 配置在说谎 ⇒ 响亮拒。
+            crate::LoadArm::Gguf(_) => {
+                if intent.head != owl_models::module::QuantPlan::F16 || intent.embed.is_some() {
+                    return Err(ModelError::Msg(format!(
+                        "GGUF 装载的 lm_head/embedding 计划由文件逐张量决定,\
+                         不接受覆盖:请把 [model] head_quant 保持 \"off\"、embed_quant 保持 \"f16\"\
+                         (当前 head={:?} embed={:?},来源 arm={})",
+                        intent.head,
+                        intent.embed,
+                        arm.name()
+                    )));
+                }
+                self.load_gguf(dir).await
+            }
         }
     }
 
@@ -402,7 +449,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     }
 
 
-    /// **视觉塔装载**(`[model].vision`;两档共用同一份 —— 0.8B 与 27B 的
+    /// **视觉塔装载**(`[vision] enabled`;两档共用同一份 —— 0.8B 与 27B 的
     /// 检查点都是 `Qwen3_5ForConditionalGeneration`,自带 `model.visual.*`)。
     ///
     /// 文本主干已装好(量化/分片/头计划)⇒ 只补视觉段;塔权重**每 rank 全量**
@@ -415,7 +462,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     ) -> Result<Option<Arc<Vlm>>> {
         if self.mmproj.is_some() {
             return Err(ModelError::Msg(
-                "[model].vision_path 仅用于 format = \"gguf\"：HF/AWQ 档的视觉塔权重在检查点目录的 model.visual.*"
+                "[vision] path 仅用于 format = \"gguf\"：HF/AWQ 档的视觉塔权重在检查点目录的 model.visual.*"
                     .into(),
             ));
         }
@@ -466,7 +513,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         if !self.vision {
             if self.mmproj.is_some() {
                 return Err(ModelError::Msg(
-                    "[model].vision_path 已设置但 [model].vision = false（配置自相矛盾）".into(),
+                    "[vision] path 已设置但 [vision] enabled = false（配置自相矛盾）".into(),
                 ));
             }
             return Ok(None);
@@ -593,12 +640,12 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     ) -> Result<LoadedModel> {
         if self.vision {
             return Err(ModelError::Msg(
-                "[model].vision = true:0.8B 档尚未接视觉塔(仅 27B AWQ 档)".into(),
+                "[vision] enabled = true:0.8B 档尚未接视觉塔(仅 27B AWQ 档)".into(),
             ));
         }
         if self.mmproj.is_some() {
             return Err(ModelError::Msg(
-                "[model].vision_path 仅用于 format = \"gguf\"（0.8B-W4A16 档无 mmproj 路径）".into(),
+                "[vision] path 仅用于 format = \"gguf\"（0.8B-W4A16 档无 mmproj 路径）".into(),
             ));
         }
         let (spec, rep) = ModelSpec::from_ckpt(dir, SpecSource::family(&qwen3_5_0_8b()))?;

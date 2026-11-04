@@ -1,3 +1,4 @@
-# 特性组件：视觉塔（HF/AWQ 用检查点内置 model.visual.*）。
-[model]
-vision = true
+# 特性组件：视觉塔(2026-11-04 起归 [vision] 段；原 [model] vision=true)。
+# HF/AWQ 用检查点内置 model.visual.*（path 留空）；GGUF 档在站点档写 path。
+[vision]
+enabled = true

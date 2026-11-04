@@ -1,0 +1,9 @@
+# MTP × INT8 KV 稳定参考臂（W4A16 主干）。
+#
+# 与 qwen38_27b-3090-mtp-int8.toml 完全同形，只把主干换回 W4A16：
+# 2026-11-04 实测长 MATH 8192 的 MTP AL 稳定（3.47–3.82），
+# W4A8 同 prompt 会塌到 2.45–2.69。
+extends = ["qwen38_27b-3090-mtp-int8.toml"]
+
+[model]
+quant = "w4a16"

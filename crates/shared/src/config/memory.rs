@@ -69,7 +69,8 @@ pub struct MemoryInputs {
     pub reserve_bytes: u64,
     pub model: &'static ModelProfile,
     pub spec_dflash: bool,
-    pub kv_fp8: bool,
+    /// 主 KV 池每元素字节数(f16=2;fp8/int8=1)。**不用布尔表达格式**。
+    pub kv_bytes_per_elem: usize,
     pub gdn_slots: usize,
     pub snap_max: usize,
     /// 并发会话数(非超卖档池 = 上下文 × sessions;每会话一份整上下文预算)
@@ -165,7 +166,7 @@ pub fn weights_bytes(inp: &MemoryInputs) -> u64 {
 /// 本档每卡每 token KV(主池 + 草稿池都按 world 摊)
 pub fn per_tok_bytes(inp: &MemoryInputs) -> u64 {
     let world = inp.tp_world.max(1) as u64;
-    (inp.model.kv_bytes_per_token(inp.kv_fp8)
+    (inp.model.kv_bytes_per_token(inp.kv_bytes_per_elem)
         + if inp.spec_dflash { inp.model.draft_bytes_per_token() } else { 0 })
         / world
 }
@@ -246,7 +247,7 @@ pub fn estimate(
 ) -> Result<MemoryEstimate, String> {
     let (fixed, target_total, budget, cap) = budget_parts(inp);
     let world = inp.tp_world.max(1) as u64;
-    let per_tok_main = inp.model.kv_bytes_per_token(inp.kv_fp8) / world;
+    let per_tok_main = inp.model.kv_bytes_per_token(inp.kv_bytes_per_elem) / world;
     let per_tok_draft = if inp.spec_dflash {
         inp.model.draft_bytes_per_token() / world
     } else {
@@ -324,7 +325,7 @@ mod tests {
     use super::*;
     use crate::config::intent::{RTX_3090TI_24G, QWEN38_27B_AWQ};
 
-    fn inputs(kv_fp8: bool, chunk: usize, tail: usize, snap_max: usize) -> MemoryInputs {
+    fn inputs(kv_1byte: bool, chunk: usize, tail: usize, snap_max: usize) -> MemoryInputs {
         let (act, note) = activation_for(chunk, tail);
         MemoryInputs {
             total_bytes: RTX_3090TI_24G.total_bytes,
@@ -332,7 +333,7 @@ mod tests {
             reserve_bytes: 256 << 20,
             model: &QWEN38_27B_AWQ,
             spec_dflash: false,
-            kv_fp8,
+            kv_bytes_per_elem: if kv_1byte { 1 } else { 2 },
             gdn_slots: 1,
             snap_max,
             sessions: 1,

@@ -759,7 +759,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut table = std::mem::take(&mut s.block_table);
         self.bank.rel.leg.release_table(&mut table)?;
         let mut mold = std::mem::take(&mut s.mtp_block_table);
-        self.bank.leg_mtp.release_table(&mut mold)?;
+        if self.bank.mtp_ring {
+            mold.clear();
+        } else {
+            self.bank.leg_mtp.release_table(&mut mold)?;
+        }
         s.rebase();
         Ok((0, None, Vec::new(), None))
     }
@@ -1055,7 +1059,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         let page = self.dev.pool.geom.page;
         let s = self.bank.sessions.session_mut(turn.session_id)?;
         let mut mold = std::mem::take(&mut s.mtp_block_table);
-        self.bank.leg_mtp.release_table(&mut mold)?;
+        if self.bank.mtp_ring {
+            mold.clear();
+        } else {
+            self.bank.leg_mtp.release_table(&mut mold)?;
+        }
         s.block_table = d.table;
         s.cached_len = d.cached_len;
         s.tokens.clear();
@@ -1394,7 +1402,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // 无 prefill extend,重建面 = 0 起步(草稿质量降,
                 // 恒等不受影响 —— 草稿只影响速度)
                 let mut mold = std::mem::take(&mut s.mtp_block_table);
-                self.bank.leg_mtp.release_table(&mut mold)?;
+                if self.bank.mtp_ring {
+            mold.clear();
+        } else {
+            self.bank.leg_mtp.release_table(&mut mold)?;
+        }
                 s.reset();
                 // 链哈希游标播种:身份从缓存哈希链接管(此后 prefill/
                 // decode 的边界快照键从游标出,不再碰物理块号)

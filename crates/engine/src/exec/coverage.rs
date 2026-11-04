@@ -1297,7 +1297,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let page = self.dev.pool.geom.page.max(1);
         // INT8 的 K/V 都是 1B/elem（V 是 token-major int8）；
         // 沿用 f16 的 2B 会把页偏移算成两倍 ⇒ 探针取页直接越界。
-        let esize = if self.dev.pool.geom.kv_fp8 || self.dev.pool.geom.kv_int8 {
+        let esize = if self.dev.pool.geom.is_fp8() || self.dev.pool.geom.is_int8() {
             1
         } else {
             d.dtype.size_bytes()
@@ -2114,10 +2114,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut k_post: Vec<Vec<f32>> = vec![vec![0.0f32; ctx_tokens * hkv * hd]; layers];
         let t_mass = std::time::Instant::now();
         // 格式/行解码走 `KvPageCodec` 多态；K 与 V 的布局差异封在 codec 内。
-        let codec = crate::exec::kvpage::KvPageFormat::of_pool(
-            self.dev.pool.geom.kv_fp8,
-            self.dev.pool.geom.kv_int8,
-        )
+        let codec = crate::exec::kvpage::KvPageFormat::of_pool(self.dev.pool.geom.kv_dtype)
         .codec();
         let k_scale_elems = codec.k_scale_elems(page, hkv);
         let v_scale_elems = codec.v_scale_elems(page, hkv);

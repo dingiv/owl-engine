@@ -53,6 +53,49 @@ pub enum KvQuant {
 mod kvquant_tests {
     use super::*;
 
+    /// **KV 内核矩阵单源门**(2026-11-04 clean-code):本测把「哪种格式有哪几条臂」
+    /// 逐格钉在 `KvQuant::kernels()` 这一张表上 —— 分派点不再各自
+    /// `match self.quant`,也不再靠 `is_int8()` 反推"有没有这条臂"。
+    #[test]
+    fn kv_kernel_matrix_is_single_sourced() {
+        use crate::ops::SemanticKernel as K;
+
+        // f16 / fp8:全臂在场
+        for (q, k0, prefill, v2) in [
+            (KvQuant::None, K::K0WriteKnhd, K::PagedPrefillKnhd, K::PagedDecodeV2Knhd),
+            (KvQuant::Fp8E4M3, K::K0WriteFp8Knhd, K::PagedPrefillFp8Knhd, K::PagedDecodeV2Fp8Knhd),
+        ] {
+            let k = q.kernels().expect("f16/fp8 有核臂");
+            assert_eq!(k.k0_write, k0, "{q:?} k0");
+            assert_eq!(k.prefill_paged, prefill, "{q:?} prefill");
+            assert_eq!(k.decode_v2, v2, "{q:?} decode_v2");
+            assert!(k.fused_insert.is_some(), "{q:?} 有融合插池臂");
+            assert!(k.decode_v2_seq.is_some(), "{q:?} 有 v2 seq 臂");
+            assert!(k.fi_prefill.is_some(), "{q:?} 走 FI");
+        }
+
+        // int8:K-only 写 + 专用 prefill/decode;无 FP8/FI/split/融合臂
+        let k = KvQuant::Int8.kernels().expect("int8 有核臂");
+        assert_eq!(k.k0_write, K::K0WriteInt8KOnlyKnhd);
+        assert_eq!(k.prefill_paged, K::Int8PrefillPaged);
+        assert_eq!(k.decode_v2, K::Int8DecodePaged);
+        assert!(k.fused_insert.is_none(), "int8 无融合插池臂");
+        assert!(k.decode_v2_seq.is_none(), "int8 verify 走专用 GQA-TC 臂");
+        assert!(k.fi_prefill.is_none(), "int8 不走 FI");
+
+        // e5m2:只有类型、没有核臂 —— 是 `Err`(数据),不是分派点 panic
+        assert!(KvQuant::Fp8E5M2.kernels().is_err(), "e5m2 必须响亮缺臂");
+
+        // 能力谓词 = 表里那一格(is_some),与表恒等
+        for q in [KvQuant::None, KvQuant::Fp8E4M3, KvQuant::Int8, KvQuant::Fp8E5M2] {
+            let env = KvEnv { quant: q, ..KvEnv::f16_paged() };
+            let tbl = q.kernels().ok();
+            assert_eq!(env.supports_fused_insert(), tbl.map(|t| t.fused_insert.is_some()).unwrap_or(false));
+            assert_eq!(env.supports_v2_seq(), tbl.map(|t| t.decode_v2_seq.is_some()).unwrap_or(false));
+            assert_eq!(env.supports_fi_prefill(), tbl.map(|t| t.fi_prefill.is_some()).unwrap_or(false));
+        }
+    }
+
     /// **配置 → 类型 的单一映射门**(2026-10-16):FP8 的两种格式**并列**,
     /// 且字节数由枚举自己给 —— 禁"用 bool 传格式"(那正是 F16/BF16 案的翻版)。
     #[test]
@@ -96,6 +139,88 @@ impl KvQuant {
     /// 每元素字节(1B = fp8 两族;2B = f16)
     pub fn size_bytes(self) -> usize {
         self.dtype().size_bytes()
+    }
+}
+
+/// **KV 内核表** —— 每个「池格式 × 用途」一格,**唯一产地**
+/// (`KvQuant::kernels()`)。`None` = 该格式没有这条臂:"不支持"是一等**数据**
+/// (调用方按能力选臂),不再是 7 处复制粘贴的 `unimplemented!`。
+///
+/// 病史(2026-11-04 清账):此前 `KvEnv` 有 7 个访问器,每个自带一份
+/// 4-arm `match self.quant`(e5m2 的响亮拒文案抄了 7 遍,顺带两处 int8
+/// 的"没有这条臂"也散着)⇒ 新增格式/新增臂要改 7 处,漏一处 = 静默错臂。
+/// 现在:新增格式 = 给 `kernels()` 加一行;新增用途 = 给本表加一列。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvKernels {
+    /// K0 批量写(naive decode / chunked prefill / naive prefill 共用)。
+    /// int8 档 = **K-only** 写(V 另走 token-major 打包)。
+    pub k0_write: crate::ops::SemanticKernel,
+    /// chunked paged prefill 批读。
+    pub prefill_paged: crate::ops::SemanticKernel,
+    /// v2 分页 decode 打分。
+    pub decode_v2: crate::ops::SemanticKernel,
+    /// verify 伪序列变体(grid.y = seqs)。`None` = 该格式走专用 verify 臂
+    /// (int8 复用 `Int8DecodeGqaTcSplit`,见 `paged_verify_int8_output`)。
+    pub decode_v2_seq: Option<crate::ops::SemanticKernel>,
+    /// decode 融合插池(qk-norm+rope+K/V 插池三合一)。`None` = 无融合臂。
+    pub fused_insert: Option<crate::ops::SemanticKernel>,
+    /// FI paged prefill 虚核名(Kernel::new 直名族)。`None` = 不走 FI。
+    pub fi_prefill: Option<&'static str>,
+}
+
+impl KvQuant {
+    /// **KV 内核唯一分派点**:一条 match 描述"这个格式有哪几条臂"。
+    ///
+    /// `Err` = 本仓没有该格式的任何核臂(e5m2 只有类型、没有实现)——
+    /// 由调用方在 boot/装配边界响亮传播,不在分派点 panic。
+    pub fn kernels(self) -> Result<KvKernels, &'static str> {
+        use crate::ops::SemanticKernel as K;
+        use owl_kernels::family::flashinfer as fi;
+        match self {
+            // f16:全臂都在(生产基线)
+            KvQuant::None => Ok(KvKernels {
+                k0_write: K::K0WriteKnhd,
+                prefill_paged: K::PagedPrefillKnhd,
+                decode_v2: K::PagedDecodeV2Knhd,
+                decode_v2_seq: Some(K::PagedDecodeV2SeqKnhd),
+                fused_insert: Some(K::QkvNormRopeInsertKnhd),
+                fi_prefill: Some(fi::PREFILL_FI),
+            }),
+            // fp8 e4m3:全臂都在(读核走 e4m3 直读/转换写)
+            KvQuant::Fp8E4M3 => Ok(KvKernels {
+                k0_write: K::K0WriteFp8Knhd,
+                prefill_paged: K::PagedPrefillFp8Knhd,
+                decode_v2: K::PagedDecodeV2Fp8Knhd,
+                decode_v2_seq: Some(K::PagedDecodeV2Fp8SeqKnhd),
+                fused_insert: Some(K::QkvNormRopeInsertFp8kvKnhd),
+                fi_prefill: Some(fi::PREFILL_FI_FP8KV),
+            }),
+            // e5m2:类型体系能表达,**核臂全缺** ⇒ 统一在这里拒(不再是 7 处文案)
+            KvQuant::Fp8E5M2 => Err("fp8-e5m2 暂无核臂(本仓只有 e4m3);请改 [pool] kv_dtype = \"fp8\""),
+            // int8:K int8 + V token-major + 两张 scale —— 没有 FP8/FI 系列臂,
+            // 也没有 split(走整块 Int8PrefillPaged);verify 走专用 GQA-TC 臂。
+            KvQuant::Int8 => Ok(KvKernels {
+                k0_write: K::K0WriteInt8KOnlyKnhd,
+                prefill_paged: K::Int8PrefillPaged,
+                decode_v2: K::Int8DecodePaged,
+                decode_v2_seq: None,
+                fused_insert: None,
+                fi_prefill: None,
+            }),
+        }
+    }
+
+    /// 本格式的内核表(装配期已经过一次 boot 门 ⇒ 这里可放心 `expect`)。
+    ///
+    /// 唯一允许 panic 的位置与理由:配置面 `KvQuant` 由 `[pool] kv_dtype`
+    /// 唯一派生,`validate`/boot 门已把 e5m2 挡在启动之外;真跑到这里说明
+    /// 有人绕过了装配边界 —— **响亮**比静默错臂好。
+    #[inline]
+    fn kernels_or_loud(self) -> KvKernels {
+        match self.kernels() {
+            Ok(t) => t,
+            Err(why) => panic!("{why}"),
+        }
     }
 }
 
@@ -170,51 +295,18 @@ impl KvEnv {
 
     /// K0 批量写(classic 池;naive decode / chunked prefill / naive prefill 共用)
     pub fn k0_write_op(&self) -> crate::ops::SemanticKernel {
-        // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::K0WriteFp8Knhd,
-            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
-            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
-            KvQuant::Int8 => crate::ops::SemanticKernel::K0WriteInt8KOnlyKnhd,
-            KvQuant::None => crate::ops::SemanticKernel::K0WriteKnhd,
-        }
+        self.quant.kernels_or_loud().k0_write
     }
 
     /// chunked paged prefill 批读
     pub fn prefill_paged_attn_op(&self) -> crate::ops::SemanticKernel {
-        // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedPrefillFp8Knhd,
-            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
-            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
-            KvQuant::Int8 => crate::ops::SemanticKernel::Int8PrefillPaged,
-            KvQuant::None => crate::ops::SemanticKernel::PagedPrefillKnhd,
-        }
+        self.quant.kernels_or_loud().prefill_paged
     }
 
-    /// prefill split 读(flash-decoding;fp8 池必须走 fp8kv 直读 —— f16 核
-    /// 读 e4m3 字节池 = 字节错位,2026-10-12 埋雷实录)
-    pub fn prefill_split_op(&self) -> crate::ops::SemanticKernel {
-        // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PrefillSplitFp8kvKnhd,
-            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
-            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
-            KvQuant::Int8 => unimplemented!("int8 KV 无 split 臂(走 Int8PrefillPaged)"),
-            KvQuant::None => crate::ops::SemanticKernel::PrefillSplitKnhd,
-        }
-    }
 
     /// v2 分页 decode 打分
     pub fn decode_v2_op(&self) -> crate::ops::SemanticKernel {
-        // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::PagedDecodeV2Fp8Knhd,
-            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
-            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
-            KvQuant::Int8 => crate::ops::SemanticKernel::Int8DecodePaged,
-            KvQuant::None => crate::ops::SemanticKernel::PagedDecodeV2Knhd,
-        }
+        self.quant.kernels_or_loud().decode_v2
     }
 
     /// verify 伪序列变体(grid.y = seqs;§三十一)。
@@ -223,40 +315,26 @@ impl KvEnv {
     /// (`paged_verify_int8_output`)，以保持与 no-spec decode 同分片/同数值。
     /// 返回 `Err` 而不是 panic，调用方必须显式毒化或换臂。
     pub fn decode_v2_seq_op(&self) -> Result<crate::ops::SemanticKernel, &'static str> {
-        // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
-        match self.quant {
-            KvQuant::Fp8E4M3 => Ok(crate::ops::SemanticKernel::PagedDecodeV2Fp8SeqKnhd),
-            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
-            KvQuant::Fp8E5M2 => Err("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
-            KvQuant::Int8 => Err("int8 KV verify 走 paged_verify_int8_output，不用通用 v2 seq 臂"),
-            KvQuant::None => Ok(crate::ops::SemanticKernel::PagedDecodeV2SeqKnhd),
-        }
+        self.quant.kernels_or_loud().decode_v2_seq.ok_or(
+            "本格式无通用 v2 seq 臂(int8 复用 paged_verify_int8_output;能力查询见 supports_v2_seq)",
+        )
     }
 
     /// decode 融合插池(qk-norm+rope+K/V 插池三合一)
     pub fn fused_insert_op(&self) -> crate::ops::SemanticKernel {
-        // 单布局(P6-A):knhd 名唯一(臂/名成对律见 kernels::list 不变量门)
-        match self.quant {
-            KvQuant::Fp8E4M3 => crate::ops::SemanticKernel::QkvNormRopeInsertFp8kvKnhd,
-            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
-            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
-            KvQuant::Int8 => {
-                unimplemented!("int8 KV 无 fused insert 臂(走 K-only writer + V pack)")
-            }
-            KvQuant::None => crate::ops::SemanticKernel::QkvNormRopeInsertKnhd,
-        }
+        self.quant
+            .kernels_or_loud()
+            .fused_insert
+            .expect("本格式无 fused insert 臂(能力查询见 supports_fused_insert)")
     }
 
     /// FI paged prefill 虚核名(Kernel::new 直名族;字面量住址 =
     /// `owl_kernels::family::flashinfer`,零本地字面量)
     pub fn fi_prefill_name(&self) -> &'static str {
-        match self.quant {
-            KvQuant::Fp8E4M3 => owl_kernels::family::flashinfer::PREFILL_FI_FP8KV,
-            // e5m2 与 e4m3 并列但**暂无核臂** ⇒ 响亮拒(不静默当 e4m3 跑)
-            KvQuant::Fp8E5M2 => unimplemented!("fp8-e5m2 暂无核臂(本仓只有 e4m3)"),
-            KvQuant::Int8 => unimplemented!("int8 KV 不走 FlashInfer 路径"),
-            KvQuant::None => owl_kernels::family::flashinfer::PREFILL_FI,
-        }
+        self.quant
+            .kernels_or_loud()
+            .fi_prefill
+            .expect("本格式不走 FlashInfer 路径(能力查询见 supports_fi_prefill)")
     }
 
     /// KV 池 head stride(单布局 = hd;页内 [page,hkv,hd] 连续。
@@ -266,6 +344,23 @@ impl KvEnv {
     }
     pub fn kv_block_stride(&self, hkv: usize, hd: usize, page: i32) -> i32 {
         hkv as i32 * hd as i32 * page
+    }
+
+    // ── **能力谓词**(分派点用"有没有这条臂"选路,不再猜格式身份)──
+    // 病史:融合插池谓词写的是 `!is_int8()`(隐含"int8 之外都有")—— 新增
+    // 一种无融合臂的格式就会静默错臂。谓词 = 表里那一格 `is_some()`。
+
+    /// 有 decode 融合插池臂?
+    pub fn supports_fused_insert(&self) -> bool {
+        self.quant.kernels().map(|k| k.fused_insert.is_some()).unwrap_or(false)
+    }
+    /// 有通用 v2 verify 伪序列臂?
+    pub fn supports_v2_seq(&self) -> bool {
+        self.quant.kernels().map(|k| k.decode_v2_seq.is_some()).unwrap_or(false)
+    }
+    /// 走 FlashInfer prefill 路径?
+    pub fn supports_fi_prefill(&self) -> bool {
+        self.quant.kernels().map(|k| k.fi_prefill.is_some()).unwrap_or(false)
     }
 
     /// 主池是否 e4m3 字节承载(池账/几何消费;非内核选择)
@@ -486,12 +581,10 @@ impl EnvProvider {
                 fused_decode_v2: d.gdn_fused_decode_v2,
             },
             kv: KvEnv {
-                quant: if cfg.pool.kv_int8 {
-                    KvQuant::Int8
-                } else if cfg.pool.kv_fp8 {
-                    KvQuant::Fp8E4M3
-                } else {
-                    KvQuant::None
+                quant: match cfg.pool.kv_dtype {
+                    owl_shared::config::KvDtype::Int8 => KvQuant::Int8,
+                    owl_shared::config::KvDtype::Fp8 => KvQuant::Fp8E4M3,
+                    owl_shared::config::KvDtype::F16 => KvQuant::None,
                 },
                 ..KvEnv::default()
             },

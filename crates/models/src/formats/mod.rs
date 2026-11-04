@@ -24,6 +24,8 @@
 pub mod awq;
 pub(crate) mod awq_build;
 pub mod ckpt_config;
+/// **检查点声明面**(源无关;`--check` 单一路径的接口;2026-11-04 clean-code)
+pub mod decl;
 /// **GGUF 起点族**(2026-10-19;容器解析 + 元数据 + 内嵌词表 + 键约定 + 块字节源)
 pub mod gguf;
 pub mod kind;

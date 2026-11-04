@@ -63,7 +63,7 @@ pub struct DiagOpts {
     /// 命令(launch/htod/dtoh/alloc/free/memset/copy;见 `crate::trace`)。
     pub trace_ring: usize,
     /// **配置派生的 tag 过滤**(2026-10-20;不显式列 allow_tags)。
-    /// 由 `model.kind/quant/head_quant`、`pool.kv_fp8`、`spec`、`vision`、
+    /// 由 `model.kind/quant/head_quant`、`pool.kv_dtype`、`spec`、`vision`、
     /// `runtime.tp_ordinals` 自动推导;`*`/Default = 全放行(诊断/测试)。
     pub tag_filter: owl_kernels::tag_filter::TagFilter,
 }
@@ -172,12 +172,10 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
         tags.push(T::QUANT_W4A16);
         tags.push(T::QUANT_AWQ);
     }
-    if cfg.pool.kv_int8 {
-        tags.push(T::KV_MAIN_INT8);
-    } else if cfg.pool.kv_fp8 {
-        tags.push(T::KV_MAIN_FP8);
-    } else {
-        tags.push(T::KV_MAIN_F16);
+    match cfg.pool.kv_dtype {
+        owl_shared::config::KvDtype::Int8 => tags.push(T::KV_MAIN_INT8),
+        owl_shared::config::KvDtype::Fp8 => tags.push(T::KV_MAIN_FP8),
+        owl_shared::config::KvDtype::F16 => tags.push(T::KV_MAIN_F16),
     }
     if cfg.spec.depth > 0 {
         tags.push(T::FEAT_DFLASH);
@@ -193,21 +191,31 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
             // DFlash2 草稿自持 W4A16 权重(与主干 plan 独立;MTP = F16 不需)。
             tags.push(T::QUANT_W4A16);
             tags.push(T::QUANT_AWQ);
-            if cfg.spec.draft_kv_fp8 {
+            if cfg.spec.draft_kv_dtype == owl_shared::config::DraftKvDtype::Fp8 {
                 tags.push(T::KV_DRAFT_FP8);
             } else {
                 tags.push(T::KV_DRAFT_BF16);
             }
         } else {
-            // MTP 链池按目标模型 dtype 分配 = F16。MTP 层复用**标准
-            // attention**（不是 DFlash2 的 naive NC 核），写/读核声明在
-            // `kv.main.*` 命名空间（K0WriteKnhd / paged v2 f16），池布局
-            // 仍是主池 KnHD；因此主/草稿两面都要放行 F16（不是 bf16/fp8）。
-            tags.push(T::KV_MAIN_F16);
-            tags.push(T::KV_DRAFT_F16);
+            // MTP 层复用**标准 attention**（不是 DFlash2 的 naive NC 核），
+            // 写/读核声明在 `kv.main.*` 命名空间（K0WriteKnhd / paged v2），
+            // 池布局仍是主池 KnHD。
+            //
+            // **2026-11-04 修**：此前这里无条件派生 F16；MTP 开
+            // `[spec] draft_kv_dtype = "fp8"` 时池实际是 e4m3（U32 承载），
+            // 但全局 tag filter 只放行 `kv.main.f16/kv.draft.f16`，
+            // `owl_reshape_and_cache_fp8kv_knhd` 在 boot 直接拒。
+            // 池 dtype 必须跟 `draft_kv_dtype` 走；主/草稿两面同改。
+            if cfg.spec.draft_kv_dtype == owl_shared::config::DraftKvDtype::Fp8 {
+                tags.push(T::KV_MAIN_FP8);
+                tags.push(T::KV_DRAFT_FP8);
+            } else {
+                tags.push(T::KV_MAIN_F16);
+                tags.push(T::KV_DRAFT_F16);
+            }
         }
     }
-    if cfg.model.vision {
+    if cfg.vision.enabled {
         tags.push(T::FEAT_VISION);
     }
     if cfg.parallel.mode != owl_shared::config::ParallelMode::Single {
@@ -3538,8 +3546,8 @@ mod tag_filter_tests {
         cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a16;
         cfg.model.head_quant = HeadQuant::RtnInt8Row;
-        cfg.model.vision = true;
-        cfg.pool.kv_fp8 = true;
+        cfg.vision.enabled = true;
+        cfg.pool.kv_dtype = owl_shared::config::KvDtype::Fp8;
         cfg.spec.depth = 7;
         // 该门覆盖 DFlash2 草稿档；不给 draft_path 会按 MTP(F16) 派生。
         cfg.spec.draft = SpecDraft::Dflash2;
@@ -3563,8 +3571,7 @@ mod tag_filter_tests {
         let mut cfg = OwlConfig::default();
         cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a16;
-        cfg.pool.kv_int8 = true;
-        cfg.pool.kv_fp8 = false;
+        cfg.pool.kv_dtype = owl_shared::config::KvDtype::Int8;
         assert!(allows(&cfg, "owl_reshape_and_cache_int8_k_only_knhd"));
         assert!(allows(&cfg, "owl_int8_prefill_paged"));
         assert!(allows(&cfg, "owl_int8_decode_paged"));
@@ -3616,6 +3623,22 @@ mod tag_filter_tests {
     }
 
     #[test]
+    fn mtp_fp8_draft_uses_fp8_pool_tags() {
+        // 2026-11-04:主池 INT8 + MTP 草稿池 FP8。MTP 的 KV 写/读核在
+        // `kv.main.*` 命名空间，不能因为主池 int8 就把草稿 fp8 写者拒掉。
+        let mut cfg = OwlConfig::default();
+        cfg.model.format = ModelFormat::Awq;
+        cfg.model.quant = QuantScheme::W4a16;
+        cfg.pool.kv_dtype = owl_shared::config::KvDtype::Int8;
+        cfg.spec.draft = SpecDraft::Mtp;
+        cfg.spec.depth = 7;
+        cfg.spec.draft_kv_dtype = owl_shared::config::DraftKvDtype::Fp8;
+        assert!(allows(&cfg, "owl_reshape_and_cache_fp8kv_knhd"), "MTP fp8 写核应放行");
+        assert!(allows(&cfg, "vllm_reshape_and_cache_f16_knhd") == false, "MTP fp8 档不应再派生 F16");
+        assert!(allows(&cfg, "owl_naive_attn_nc_bf16") == false, "MTP 不是 BF16");
+    }
+
+    #[test]
     fn tag_wildcard_escapes_all_facets() {
         let mut cfg = OwlConfig::default();
         cfg.model.format = ModelFormat::Gguf;
@@ -3628,7 +3651,7 @@ mod tag_filter_tests {
     fn gguf_filter() {
         let mut cfg = OwlConfig::default();
         cfg.model.format = ModelFormat::Gguf;
-        cfg.pool.kv_fp8 = false;
+        cfg.pool.kv_dtype = owl_shared::config::KvDtype::F16;
         assert!(allows(&cfg, "owl_gguf_gemm_q4k"));
         assert!(!allows(&cfg, "marlin_gemm_w4a16_awq"));
         assert!(allows(&cfg, "owl_add_f16"));

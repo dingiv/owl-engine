@@ -136,6 +136,38 @@ pub enum LoadArm {
     F16Base,
 }
 
+/// **装载意图**(2026-11-04 clean-code):所有格式共用的旋钮捆。
+///
+/// 病史:server 的 `load_shard` 原先按臂各抄一段"取哪些计划"——
+/// AWQ 要 `(head, quant, embed)`,safetensors 要 `(quant, head, embed)`,
+/// GGUF 什么都不收(于是 `head_quant`/`embed_quant` 在 GGUF 档被**静默忽略**)。
+/// 现在三者都吃同一份 [`LoadIntent`];"哪个旋钮对哪条路径有效"由装载器自己
+/// **响亮**判定(见 `ModelLoader::load_arm` 的 GGUF 门),不再散在调用方。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadIntent {
+    /// 主干权重计划(= `arm.quant_plan()`)
+    pub quant: owl_models::module::QuantPlan,
+    /// lm_head 计划(`head_plan_of`;GGUF 档必须是 `F16` = off,计划逐张量)
+    pub head: owl_models::module::QuantPlan,
+    /// embedding 表计划(`embed_plan_of`;`None` = 检查点原表;GGUF 档必须是 None)
+    pub embed: Option<owl_models::module::QuantPlan>,
+}
+
+impl LoadIntent {
+    /// 由臂 + 两个头/表覆盖位构造(**唯一换算入口**;调用方不再各取各的)。
+    pub fn of(
+        arm: LoadArm,
+        head_quant: owl_shared::config::HeadQuant,
+        embed_quant: owl_shared::config::EmbedQuant,
+    ) -> Self {
+        Self {
+            quant: arm.quant_plan(),
+            head: head_plan_of(head_quant),
+            embed: embed_plan_of(embed_quant),
+        }
+    }
+}
+
 impl LoadArm {
     /// 臂 → owl_models `QuantPlan`(白名单臂的**唯一**换算处)
     pub fn quant_plan(self) -> owl_models::module::QuantPlan {

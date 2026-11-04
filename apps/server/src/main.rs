@@ -663,36 +663,10 @@ async fn load_shard(
         .loader()
         .slice(rank, world)
         .vocab_split(config.tp_vocab_split);
-    match arm {
-        // AWQ pack-quantized 家族(cyankiwi 系;int4 权重已烘焙)
-        owl_engine::LoadArm::AwqInt4 | owl_engine::LoadArm::AwqA8 => {
-            // head/embed 计划 = 唯一映射点;主干计划由白名单臂给出
-            let head_plan = owl_engine::head_plan_of(config.head_quant);
-            let quant = arm.quant_plan();
-            let embed_plan = owl_engine::embed_plan_of(config.embed_quant);
-            loader
-                .load_qwen38_27b_awq_with_embed(
-                    &config.model_dir,
-                    &config.model_dir,
-                    head_plan,
-                    quant,
-                    embed_plan,
-                )
-                .await
-        }
-        // 普通 HF safetensors 目录:白名单下只有 `nvfp4`(预量化块缩放)与
-        // `w4a16`(裸 f16/bf16 基线,开发档)两臂,别无其它
-        owl_engine::LoadArm::NvFp4 | owl_engine::LoadArm::F16Base => {
-            let head_plan = owl_engine::head_plan_of(config.head_quant);
-            let quant = arm.quant_plan();
-            let embed_plan = owl_engine::embed_plan_of(config.embed_quant);
-            loader
-                .load_qwen35_safetensors(&config.model_dir, quant, head_plan, embed_plan)
-                .await
-        }
-        // GGUF 单文件:超参/词表/模板/rope/权重全从 `model.path` 那个文件取
-        owl_engine::LoadArm::Gguf(_) => loader.load_gguf(&config.model_dir).await,
-    }
+    // **一条装载路径**(2026-11-04 clean-code):旋钮统一走 `LoadIntent`,
+    // 臂 → 装载器 的映射唯一在 `ModelLoader::load_arm`(不认的旋钮在那里响亮拒)。
+    let intent = owl_engine::LoadIntent::of(arm, config.head_quant, config.embed_quant);
+    loader.load_arm(&config.model_dir, arm, &intent).await
 }
 
 /// executor 线程主:引擎生命周期 facade(装配)→ 事件泵(executor::run_executor)。
@@ -727,28 +701,10 @@ async fn executor_main(
         match world {
             // ── 单卡档(原路径;分片 = 恒等)─────────────────────────────
             1 => {
-                // 装载 = 白名单臂分发(唯一接线点 owl_engine::load_arm_of)
-                let model = match arm {
-                    owl_engine::LoadArm::AwqInt4 | owl_engine::LoadArm::AwqA8 => {
-                        load_shard(&config, &mut engine, arm, 0, 1).await?
-                    }
-                    owl_engine::LoadArm::NvFp4 | owl_engine::LoadArm::F16Base => {
-                        let head_plan = owl_engine::head_plan_of(config.head_quant);
-                        let embed_plan = owl_engine::embed_plan_of(config.embed_quant);
-                        engine
-                            .loader()
-                            .load_qwen35_safetensors(
-                                &config.model_dir,
-                                arm.quant_plan(),
-                                head_plan,
-                                embed_plan,
-                            )
-                            .await?
-                    }
-                    owl_engine::LoadArm::Gguf(_) => {
-                        engine.loader().load_gguf(&config.model_dir).await?
-                    }
-                };
+                // 装载 = **唯一条路径**(2026-11-04 clean-code):单卡 = 恒等分片,
+                // 与 TP 走同一个 `load_shard`(臂 → 装载器的分派只在
+                // `ModelLoader::load_arm`;这里是历史第二套 match,已删)。
+                let model = load_shard(&config, &mut engine, arm, 0, 1).await?;
                 owl_shared::log_info!("boot", "权重/tokenizer/rope 装载 {:.2}s", t0.elapsed().as_secs_f32());
                 vram_phase("server:weights", engine.mem_info().await, &mut phase_used);
                 let running = engine.run(model).await?;

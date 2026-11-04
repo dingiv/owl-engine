@@ -1,0 +1,27 @@
+# MTP 显存回退档（单 3090 Ti / 24G）。
+#
+# 定位：不是速度档，而是“DFlash 草稿放不下/要拿显存给主池”时的回退。
+# 形状：W4A16 主干 + INT8 KV + MTP d7 + **MTP 草稿 KV fp8**（2 KiB/token）。
+# 显存账（草稿侧，不含 target/主池）：
+#   MTP 头 0.791 GiB + T5 ring 24 MiB（fp8，capacity 12288 tok）= 0.814 GiB
+#   DFlash W4A16 1.193 GiB + ring 21.3 MiB = 1.214 GiB
+#   ⇒ 约省 0.40 GiB ≈ 13k int8 KV token
+# T5 ring 容量 = max(min_ctx=12288, sink+window+depth+page)，页对齐；
+# 短 ctx 仍保留完整历史，读集不变。
+extends = ["qwen38_27b-3090-mtp-int8-w4a16.toml"]
+
+[runtime]
+max_seq = 57344
+
+[spec]
+depth = 7
+draft_kv_dtype = "fp8"
+mtp_ring = true
+
+[pool]
+prefix_cache = false
+snap_max = 0
+host_cache_mb = 0
+snap_host_mb = 0
+vram_reserve_mb = 512
+transient_reserve_mb = 1024

@@ -56,10 +56,10 @@ pub struct EngineKnobs {
     pub load: owl_shared::config::LoadCfg,
     /// **rope 外推/缩放**(`[model.rope]`;GGUF 档生效;缺省关)
     pub rope: owl_shared::config::RopeCfg,
-    /// **视觉塔**(`[model].vision`):装载 `model.visual.*` + 允许 VLM 请求。
+    /// **视觉塔**(`[vision] enabled`):装载 `model.visual.*` + 允许 VLM 请求。
     /// 缺省 false = 纯文本路径逐字节不变(27B 视觉档显式开)。
     pub vision: bool,
-    /// **GGUF 视觉塔单文件**(`[model].vision_path`;None = 同目录唯一候选)。
+    /// **GGUF 视觉塔单文件**(`[vision] path`;None = 同目录唯一候选)。
     /// 仅 GGUF 档 + `vision = true` 消费。
     pub mmproj: Option<std::path::PathBuf>,
     /// lm_head 量化方案(`[model].head_quant`;boot 投影到 tag filter)
@@ -79,13 +79,13 @@ pub struct EngineKnobs {
     pub int8_prefill_sync: bool,
     /// **整枝塌缩**(`[kvmem].bulk_drop_when_tier_full`;缺省 false = 保守)。
     pub bulk_drop_when_tier_full: bool,
-    /// **前缀无感删除(图像段)**(`[pool].image_evict`;缺省关)。
+    /// **前缀无感删除(图像段)**(`[vision] image_evict`;缺省关)。
     ///
     /// 开 = 客户端给图像打可删标记时:页对齐 pad + 删除后**保留位置洞、
     /// 不转 K、不移动幸存 token 的 position**,新 token 从 `max_pos+1` 追加;
     /// 不重算删点之后的 token,可无限次丢弃旧图片缓存。依赖 `prefix_cache` + 分页池(f16 或 fp8-e4m3) + 视觉档(boot 门;任缺 = 拒启)。
     pub image_evict: bool,
-    /// **页对齐 pad 词**(`[pool].image_evict_pad`;缺省 `。`;空串 = 自动)。
+    /// **页对齐 pad 词**(`[vision] image_evict_pad`;缺省 `。`;空串 = 自动)。
     /// 模型敏感项:27B 实测 `\n` 会让回答开头吐 `<`;`。` 干净。必须恰 1 token。
     pub image_evict_pad: String,
     /// **宿主层预算 MiB**(状态存储三层的中层;缺省 **0 = 关层**,REQ C4)。
@@ -673,10 +673,10 @@ impl EngineKnobs {
         Self {
             load: cfg.load.clone(),
             rope: cfg.model.rope.clone(),
-            vision: cfg.model.vision,
+            vision: cfg.vision.enabled,
             mmproj: cfg
-                .model
-                .vision_path
+                .vision
+                .path
                 .clone()
                 .filter(|p| !p.as_os_str().is_empty()),
             head_quant: cfg.model.head_quant,
@@ -702,15 +702,15 @@ impl EngineKnobs {
                     .filter(|p| !p.as_os_str().is_empty())
                     .map(|p| p.display().to_string()),
                 mtp_dir: cfg.model.mtp_dir.as_ref().map(std::path::PathBuf::from),
-                kv_quant: if cfg.spec.draft_kv_fp8 {
-                    owl_models::env::KvQuant::Fp8E4M3
-                } else {
-                    owl_models::env::KvQuant::None
+                kv_quant: match cfg.spec.draft_kv_dtype {
+                    owl_shared::config::DraftKvDtype::Fp8 => owl_models::env::KvQuant::Fp8E4M3,
+                    owl_shared::config::DraftKvDtype::Bf16 => owl_models::env::KvQuant::None,
                 },
                 draft_window: cfg.spec.draft_window,
                 mtp_window: cfg.spec.mtp_window,
                 mtp_sink: cfg.spec.mtp_sink,
                 mtp_window_min_ctx: cfg.spec.mtp_window_min_ctx,
+                mtp_ring: cfg.spec.mtp_ring,
                 adaptive_depth: cfg.spec.adaptive_depth,
                 depth_min: cfg.spec.depth_min,
                 depth_switch_ctx: cfg.spec.depth_switch_ctx,
@@ -730,8 +730,8 @@ impl EngineKnobs {
             prefix_cache: cfg.pool.prefix_cache,
             int8_prefill_sync: cfg.runtime.int8_prefill_sync,
             bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
-            image_evict: cfg.pool.image_evict,
-            image_evict_pad: cfg.pool.image_evict_pad.clone(),
+            image_evict: cfg.vision.image_evict,
+            image_evict_pad: cfg.vision.image_evict_pad.clone(),
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
             host_cache_mb: cfg.pool.host_cache_mb,
             disk_cache_mb: cfg.pool.disk_cache_mb,
@@ -861,7 +861,7 @@ pub struct DraftCfg {
     pub dflash2_dir: Option<String>,
     /// MTP 头覆盖路径(目录或 `.gguf`;None = 检查点自带)
     pub mtp_dir: Option<std::path::PathBuf>,
-    /// 草稿池 KV 存储(None = f16;Fp8E4M3 = 偷显存档,原 draft_kv_fp8 布尔)
+    /// 草稿池 KV 存储(None = f16;Fp8E4M3 = 偷显存档;真源 = `[spec] draft_kv_dtype`)
     pub kv_quant: owl_models::env::KvQuant,
     /// DFlash2 草稿环窗口(0 = auto = 检查点 sliding_window)
     pub draft_window: usize,
@@ -871,6 +871,8 @@ pub struct DraftCfg {
     pub mtp_sink: usize,
     /// 窗口生效的最小绝对 ctx(tok;0 = 不设额外门槛)
     pub mtp_window_min_ctx: usize,
+    /// MTP 草稿 KV 物理环(T5;仅 MTP + window>0)
+    pub mtp_ring: bool,
     /// 自适应 depth（仅 MTP；两档图族 boot 期预捕获）
     pub adaptive_depth: bool,
     /// 自适应档下限 depth
@@ -915,6 +917,7 @@ impl Default for DraftCfg {
             mtp_window: 0,
             mtp_sink: 64,
             mtp_window_min_ctx: 0,
+            mtp_ring: false,
             adaptive_depth: false,
             depth_min: 3,
             depth_switch_ctx: 49152,
@@ -1432,6 +1435,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                 paged: dev.pool.geom.paged,
                 prefix_cache: cfg.knobs.prefix_cache,
                 mtp: dev.spec_rt.mode == SpecMode::Mtp,
+                mtp_ring: dev.spec_rt.mtp_ring.is_some(),
                 // 宿主层预算(REQ C4:默认关;0 = 关层)—— 与预算入参**同源**
                 // (腿不得超总账;`Rel::open` 交叉校验)
                 host_bytes,
@@ -1574,7 +1578,7 @@ pub(crate) fn into_running<D: DeviceClient>(
             // 进程 adopt,会被当 token-major 读 ⇒ 静默错值。这里给 INT8
             // 单独一个子目录命名空间(旧目录原样保留,不删数据);切回
             // f16/fp8 时仍用原路径。
-            let disk_root = if dev.pool.geom.kv_int8 && !cfg.knobs.disk_dir.is_empty() {
+            let disk_root = if dev.pool.geom.is_int8() && !cfg.knobs.disk_dir.is_empty() {
                 format!("{}.int8-v2-token-major", cfg.knobs.disk_dir)
             } else {
                 cfg.knobs.disk_dir.clone()
@@ -1738,16 +1742,15 @@ pub(crate) fn into_running<D: DeviceClient>(
     if cfg.knobs.image_evict {
         if dev.boot.vlm.is_none() {
             return Err(ModelError::Msg(
-                "[pool] image_evict = true 需要 [model].vision = true(图像段识别依赖视觉档)".into(),
+                "[vision] image_evict = true 需要 [vision] enabled = true(图像段识别依赖视觉档)".into(),
             ));
         }
         if !dev.pool.geom.paged {
             return Err(ModelError::Msg(format!(
-                "[pool] image_evict = true 需要分页 KV 池（f16/fp8-e4m3/int8）\
-                 (paged={} kv_fp8={} kv_int8={} dtype={:?})",
+                "[vision] image_evict = true 需要分页 KV 池（f16/fp8-e4m3/int8）\
+                 (paged={} kv_dtype={:?} dtype={:?})",
                 dev.pool.geom.paged,
-                dev.pool.geom.kv_fp8,
-                dev.pool.geom.kv_int8,
+                dev.pool.geom.kv_dtype,
                 dev.pool.geom.dims.dtype
             )));
         }
@@ -1759,13 +1762,13 @@ pub(crate) fn into_running<D: DeviceClient>(
                 Ok(v) if v.len() == 1 => {}
                 Ok(v) => {
                     return Err(ModelError::Msg(format!(
-                        "[pool] image_evict_pad = {tok:?} 必须恰 1 token(实测 {} tok:{v:?})",
+                        "[vision] image_evict_pad = {tok:?} 必须恰 1 token(实测 {} tok:{v:?})",
                         v.len()
                     )))
                 }
                 Err(e) => {
                     return Err(ModelError::Msg(format!(
-                        "[pool] image_evict_pad = {tok:?} 编码失败:{e}"
+                        "[vision] image_evict_pad = {tok:?} 编码失败:{e}"
                     )))
                 }
             }
@@ -1773,9 +1776,9 @@ pub(crate) fn into_running<D: DeviceClient>(
         owl_shared::log_info!(
             "boot",
             "前缀无感删除:开({} 池;leave-gap 保留位置洞、不改 K;可删图像段页对齐 pad = {:?};页 {} tok)",
-            if dev.pool.geom.kv_int8 {
+            if dev.pool.geom.is_int8() {
                 "int8"
-            } else if dev.pool.geom.kv_fp8 {
+            } else if dev.pool.geom.is_fp8() {
                 "fp8-e4m3"
             } else {
                 "f16"
@@ -1934,7 +1937,7 @@ pub(crate) struct RankBoot {
     /// 张量并行上下文(本 rank 的;`None` = 单卡)—— 执行面所有求值调用
     /// 把它传给解释器(行并行 allreduce 注入靠它;装配期填入,烘进每张图)
     pub(crate) tp: Option<owl_models::module::TpCtx>,
-    /// **视觉塔装配**(`[model].vision`;Some = VLM)。塔是 prefill-only 的
+    /// **视觉塔装配**(`[vision] enabled`;Some = VLM)。塔是 prefill-only 的
     /// 额外权重;文本 `model` 与它是同一份 Arc(见 `Vlm::from_model`)。
     pub(crate) vlm: Option<std::sync::Arc<owl_models::vlm::Vlm>>,
 }
@@ -2425,7 +2428,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     if env.kv.quant == owl_models::env::KvQuant::Int8 {
         if dims.hd != 256 || env.kv.page != 32 || !env.kv.paged {
             return Err(ModelError::Msg(format!(
-                "[pool] kv_int8 只支持 hd=256/page=32/paged,得 hd={} page={} paged={}",
+                "[pool] kv_dtype=\"int8\" 只支持 hd=256/page=32/paged,得 hd={} page={} paged={}",
                 dims.hd, env.kv.page, env.kv.paged
             )));
         }
@@ -2435,7 +2438,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         // 不再拒绝 spec。
         if cfg.knobs.env.attn.force_naive_prefill {
             return Err(ModelError::Msg(
-                "[pool] kv_int8 不支持 force_naive_prefill(naive 路径按 f16/fp8 池寻址)".into(),
+                "[pool] kv_dtype=\"int8\" 不支持 force_naive_prefill(naive 路径按 f16/fp8 池寻址)".into(),
             ));
         }
         // index/coverage 的 host 回读、select_decode 的页表/视图、select_partial
@@ -2468,11 +2471,16 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             mtp_dir: rm.mtp_dir.as_deref(),
             spec: &rm.spec,
             dumb: cfg.knobs.draft.dumb,
-            draft_kv_fp8: cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3,
+            draft_kv_dt: if cfg.knobs.draft.kv_quant == owl_models::env::KvQuant::Fp8E4M3 {
+            owl_models::contract::Dtype::F8E4M3
+        } else {
+            owl_models::contract::Dtype::BF16
+        },
             draft_window: cfg.knobs.draft.draft_window,
             mtp_window: cfg.knobs.draft.mtp_window,
             mtp_sink: cfg.knobs.draft.mtp_sink,
             mtp_window_min_ctx: cfg.knobs.draft.mtp_window_min_ctx,
+            mtp_ring: cfg.knobs.draft.mtp_ring,
             adaptive_depth: cfg.knobs.draft.adaptive_depth,
             depth_min: cfg.knobs.draft.depth_min,
             depth_switch_ctx: cfg.knobs.draft.depth_switch_ctx,
@@ -2538,7 +2546,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         spec.draft_env.kernel_env = Some(k);
     }
 
-    // B6.2:主 KV 池 fp8 承载(draft_kv_fp8 / kv.fp8 → env.kv.quant)
+    // B6.2:主 KV 池 fp8 承载(draft_kv_dtype / kv_dtype → env.kv.quant)
     // KV 池清单门(收口律机器门;E1 2026-10-17 改为**声明面投影**):
     // 期望集从每个算子的 `POOL` 声明(`池名/布局/dtype`)投影出来,逐个
     // 核 `.cu` 源在场;缺声明/缺源 = 装配失败(池 dtype 改造漏网即启动
@@ -2601,6 +2609,7 @@ fn boot_pool_plan(
         draft_dt: spec.draft_dt,
         spec_mode: spec.mode,
         spec_depth: spec.depth,
+        mtp_ring: spec.mtp_ring,
         xqa_verify: matches!(
             cfg.knobs.env.attn.verify_arm,
             owl_shared::config::VerifyArm::Xqa

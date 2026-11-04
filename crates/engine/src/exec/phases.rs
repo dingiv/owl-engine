@@ -1131,7 +1131,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // B6.3:fp8 池字节域同序(1B/elem,e4m3);A/B 池对拍仪表
             // (f16 boot 半值 vs fp8 boot 字节,host RNE 桥对)
             if self.boot.probes.debug && step < 16 {
-                let fp8 = self.dev.pool.geom.kv_fp8;
+                let fp8 = self.dev.pool.geom.is_fp8();
                 let esz = if fp8 { 1usize } else { 2usize };
                 let kv0 = &self.dev.pool.kvs()[0].k_cache;
                 let mut whole = vec![0u8; kv0.1 * esz];
@@ -1818,7 +1818,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let (hkv, hd) = (d.hkv, d.hd);
         // fp8/int8 池 = 1B/元素(扁平 u8 账;int8 V 是 token-major int8);
         // f16 池 = 2B ✓。旧口径把 int8 当 f16 ⇒ 页字节翻倍、dump 越界。
-        let esize = if self.dev.pool.geom.kv_fp8 || self.dev.pool.geom.kv_int8 {
+        let esize = if self.dev.pool.geom.is_fp8() || self.dev.pool.geom.is_int8() {
             1
         } else {
             d.dtype.size_bytes()

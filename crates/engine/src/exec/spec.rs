@@ -1,4 +1,5 @@
 //! spec 轮机器(execute_spec_round)+ 块表写 + GDN 快照
+use crate::spec_runtime::DraftHead as _;
 use super::*;
 use owl_models::ModelError;
 
@@ -752,10 +753,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let early_propose = if !round_done_early
             && !degraded_now
             && self.dev.graphs.dflash.is_some()
-            && matches!(
-                self.dev.spec_rt.drafter.as_ref(),
-                Some(crate::spec_runtime::Drafter::DFlash2(_))
-            )
+            && self
+                .dev
+                .spec_rt
+                .drafter
+                .as_ref()
+                .map(|d| d.as_dflash2().is_some())
+                .unwrap_or(false)
         {
             let ts = std::time::Instant::now();
             let p = self.dflash_propose_launch(m, pos, toks[m]).await?;
@@ -910,10 +914,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             t_propose += ts.elapsed();
             self.tspec()?.spec_drafts_host = Some(d);
         } else {
-        let d2_arc7 = match self.dev.spec_rt.drafter.as_ref() {
-            Some(crate::spec_runtime::Drafter::DFlash2(d)) => Some(std::sync::Arc::clone(d)),
-            _ => None,
-        };
+        let d2_arc7 = self
+            .dev
+            .spec_rt
+            .drafter
+            .as_ref()
+            .and_then(|d| d.dflash2_arc());
         if let Some(d2) = d2_arc7 {
             let ts = std::time::Instant::now();
             // E5-DF4:图态(单图一轮 encode+propose);图降级才走 eager 路
@@ -1817,8 +1823,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // d.truncate(depth) 同款,收口在消费点单处。
             d.truncate(depth);
             d
-        } else if let Some(crate::spec_runtime::Drafter::DFlash2(_)) =
-            self.dev.spec_rt.drafter.as_ref()
+        } else if self
+            .dev
+            .spec_rt
+            .drafter
+            .as_ref()
+            .map(|d| d.as_dflash2().is_some())
+            .unwrap_or(false)
         {
             let ts = std::time::Instant::now();
             let lookup = self.dflash_lookup_for_tail(&[])?;
@@ -2203,7 +2214,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             )));
         }
         let n = todo.len();
-        let fp8 = self.dev.pool.geom.kv_fp8;
+        let fp8 = self.dev.pool.geom.is_fp8();
         let entry = if fp8 { "owl_mean_k_block_fp8" } else { "owl_mean_k_block_f16" };
         // 池格式与索引几何必须同口径（f16 走 `__half`，bf16 尚未建臂）
         let per_block_elems = layers * kv_heads * dim;
@@ -2391,10 +2402,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // **池页格式从池实况取**(单源:`KvPageFormat::of_pool`)。
         // 行解码/scale 槽由 `KvPageCodec` 多态提供；调用点不写格式分支。
-        let codec = crate::exec::kvpage::KvPageFormat::of_pool(
-            self.dev.pool.geom.kv_fp8,
-            self.dev.pool.geom.kv_int8,
-        )
+        let codec = crate::exec::kvpage::KvPageFormat::of_pool(self.dev.pool.geom.kv_dtype)
         .codec();
         let k_scale_elems = codec.k_scale_elems(page, hkv);
         let k_scale_bytes = k_scale_elems * std::mem::size_of::<f32>();
@@ -2409,7 +2417,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // INT8 Mean-K 暂无 GPU 块级核；走本函数的 host K+scale 回读路径。
         // （f16/fp8 保持既有 GPU 快路。）
-        if self.boot.cfg.knobs.index_gpu && !self.dev.pool.geom.kv_int8 {
+        if self.boot.cfg.knobs.index_gpu && !self.dev.pool.geom.is_int8() {
             return self.collect_index_gpu(&todo, dim, layers, kv_heads).await;
         }
         let t_index = std::time::Instant::now();

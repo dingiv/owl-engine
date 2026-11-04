@@ -128,7 +128,7 @@ reuse       = "off"               # off | session | global;不写 = goal 决定
 | `concurrency=C` | `gdn_slots=C`、`runtime.max_concurrency=C`、`max_batch=min(C,8)` |
 | `spec=dflash` | `depth=7` + 草稿目录必填 + **草稿环固定 ~40MiB**(窗口 2048,见下) |
 | `[spec] draft` | `auto`（缺省，DFlash2 目录优先 → 检查点 MTP）\| `mtp` \| `dflash2`；显式档缺资产 = boot 拒 |
-| `kv=fp8/f16` | `pool.kv_fp8` |
+| `kv=fp8/f16` | `pool.kv_dtype`（`f16\|fp8`；int8 档直接写枚举） |
 | `kvmem=off` | 选择层/索引/超卖四键全关 + 宿主/磁盘腿清零 |
 | `kvmem=overcommit` | 四键全开 + 宿主腿 + 强制 prefix_cache |
 | `graphs=auto` | FI 单图 decode + `fi_plan="baked"`（2026-10-27 单键化；原 bake/restore 两布尔）+ 窗刷表（prefill 桶已退役） |
@@ -225,20 +225,25 @@ ls profiles/
    `live`(权重是否换了家族)/ `fixed_after`(并发/快照);
 4. 实验档用 `-p <path> <overlay.toml>` 或 `--set`(不再有 legacy 目录)。
 
-## 7.1 视觉塔(`[model].vision`)
+## 7.1 视觉塔(`[vision]`;2026-11-04 起单段收编)
 
-- **HF/AWQ 档**:`[model] vision = true` ⇒ 装载检查点 `config.json:vision_config`
+> 视觉相关的四个键(`enabled`/`path`/`max_pixels`/`image_evict*`)原先散在
+> `[model]`/`[server]`/`[pool]` 三处,现统一在 **`[vision]`** 段;
+> 旧键(`model.vision`/`model.vision_path`/`server.vision_max_pixels`/
+> `pool.image_evict`/`pool.image_evict_pad`)= `deny_unknown_fields` 响亮拒。
+
+- **HF/AWQ 档**:`[vision] enabled = true` ⇒ 装载检查点 `config.json:vision_config`
   的 `model.visual.*`(27B AWQ 档;0.8B 响亮拒)。
-- **GGUF 档**(2026-10-21):文本 `.gguf` 只带主干;`vision = true` 时用
-  `[model] vision_path = "…/mmproj-*.gguf"` 指向视觉塔。缺省会在 `model.path`
+- **GGUF 档**(2026-10-21):文本 `.gguf` 只带主干;`enabled = true` 时用
+  `[vision] path = "…/mmproj-*.gguf"` 指向视觉塔。缺省会在 `model.path`
   同目录找**唯一** `mmproj*.gguf`;多个候选/没有 = 装载期响亮拒并列出候选。
   视觉塔走 host 解量化(F16/F32/Q8_0… → F16),文本主干仍走 GGUF 零解量化
   通道;patch_embd 的两个时间片按 HF `[out][in][t][p][p]` **按 in 通道交错**
   还原(直接 concat = 静默错值)。
   - `profiles/qwen35_4b-3090-q4km-vlm.toml`(4B Q4_K_M + mmproj-F16,单卡 3090 Ti)
   - `profiles/qwen38_27b-3090-q4km-vlm.toml`(27B Q4_K_M + mmproj-Q8_0,单卡 3090 Ti)
-  - 把 `vision_path` 写到 HF/AWQ 档 = 响亮拒(塔权重在检查点目录);
-    `vision = false` 却写 `vision_path` 同样拒。
+  - 把 `path` 写到 HF/AWQ 档 = 响亮拒(塔权重在检查点目录);
+    `enabled = false` 却写 `path` 同样拒。
 - 视觉塔装载 + 引擎图像 prefill + **OpenAI `image_url` / Rust 预处理**已接
   (data URL;单图;TP2 两 rank 各备塔输出)。
 - **MTP 头投机**（`[spec] draft = "mtp"`，2026-10-21）：27B AWQ 检查点自带
@@ -255,6 +260,15 @@ ls profiles/
     `--set spec.mtp_window=0`。`full.toml` 只保留 schema 缺省 0/64/0。
     `mtp_window_min_ctx` 是短 ctx 不压缩的门槛（8k prompt+输出会跨 8192，
     取 12288 才真正保 full）。
+  - **MTP KV ring（T5，2026-11-04）**：`[spec] mtp_ring = true`（默认 false；
+    仅 MTP + `mtp_window > 0`）。把草稿 KV 的物理存储压成固定环：
+    `capacity = align_up(max(min_ctx, sink + window + depth + page), page)`，
+    sink 单独钉住，其余按 `(pos - sink) % (capacity - sink)` 回卷。
+    `capacity >= min_ctx` 保证短 ctx 仍读完整历史；窗口生效后只覆盖读集外
+    旧槽，**读集/RoPE/visible 口径不变**。57k 档 capacity=12288 tok（384 页），
+    fp8 草稿池固定 24 MiB（F16 48 MiB）。测量档：
+    `profiles/measurement/qwen38_27b-3090-mtp-mem.toml`；线性对照：
+    `--set spec.mtp_ring=false`。门：`cargo test -p owl-engine --lib mtp_ring`。
   - **自适应 depth（2026-10-21/22，T1a+T1b v2）**：`[spec] adaptive_depth = true`
     （默认 false）+ `depth_min = 3` + `depth_switch_ctx = 49152` +
     `adaptive_min_tpr = 3.0`。`depth` 为上限（建议 7）；`pos >= depth_switch_ctx`
@@ -281,7 +295,7 @@ ls profiles/
   （262k 全设备池档按新 schema 另行生成;视觉塔算子由 `feat.vision` tag + 配置派生 TagFilter 自动放行,
   不再手抄 `allowed_ops`/`VISION_OPS`)。
 - `--check` 的 HF/AWQ 分支检查 `vision_config`/`image_token_id`;GGUF 分支改读
-  文件 KV(arch/hidden/layers/kv_heads/head_dim/vocab/ctx)并打开 `vision_path`
+  文件 KV(arch/hidden/layers/kv_heads/head_dim/vocab/ctx)并打开 `[vision] path`
   校验塔层数/out_hidden/`<|image_pad|>` id。详见
   `vision-wiring.md` 与
   `gguf-format.md` §23.14。
@@ -292,7 +306,7 @@ ls profiles/
 
 | 面 | 形态 | 说明 |
 |---|---|---|
-| 引擎配置 | `[pool] image_evict = false` | 缺省关 = 逐字节旧行为。开 ⇒ boot 门要求**视觉档 + 分页 KV（f16 或 fp8-e4m3） + 前缀缓存**,任缺**拒启** |
+| 引擎配置 | `[vision] image_evict = false` | 缺省关 = 逐字节旧行为。开 ⇒ boot 门要求**`[vision] enabled = true` + 分页 KV（f16/fp8/int8） + `[pool] prefix_cache`**,任缺**拒启**;pad 词 = `[vision] image_evict_pad`(须恰 1 token) |
 | 客户端标记 | 图像 content part `"owl_evict": true` | 「这张图将来可能从历史里删」。未标记 = 零行为差异;带标记但档位没开 = 提交**响亮拒** |
 
 - **生效形态（唯一方案 = leave-gap）**:带标记的图像段被补 pad 到「段首页对齐 +
@@ -318,8 +332,26 @@ ls profiles/
 - `OWL_MAX_SEQ` / `OWL_PREFILL_CHUNK` **已删除**(2026-10-20):它们会在
   意图派生后再改一次,造成 `max_seq` 双源。临时调压请
   `--set runtime.max_seq=…`(池自动跟随剩余显存)。
+- **`pool.kv_fp8` / `pool.kv_int8` 已退役**(2026-11-04,用户裁决):
+  两个布尔表达三种状态("f16" 只能靠"两个都不写"隐含)违「状态不收隐式组合」
+  ⇒ 合成单键 **`pool.kv_dtype = "f16" | "fp8" | "int8"`**(serde 枚举,
+  非法值当场报 `expected one of f16, fp8, int8`)。旧档不迁移也能**响亮**暴露:
+  `deny_unknown_fields` 会报 `unknown field kv_fp8, expected one of …kv_dtype…`。
+  迁移:`kv_fp8 = true` → `kv_dtype = "fp8"`;`kv_int8 = true`(配 `kv_fp8 = false`)
+  → `kv_dtype = "int8"`;全 false → `kv_dtype = "f16"`。
+  同批:`prefill_shadow = true` 现在会校验主池必须是 `"fp8"`(f16/int8 主池
+  没有可反量化的源,旧档静默无效)。
+- **视觉面收编为 `[vision]` 段**(2026-11-04,用户裁决):`model.vision` →
+  `vision.enabled`、`model.vision_path` → `vision.path`、
+  `server.vision_max_pixels` → `vision.max_pixels`、`pool.image_evict` /
+  `pool.image_evict_pad` → `vision.image_evict` / `vision.image_evict_pad`。
+  旧键全部 `deny_unknown_fields` 响亮拒(报错里列出新键名)。
+- **`spec.draft_kv_fp8` 已退役**(2026-11-04,同批):草稿池也是"布尔当 dtype"
+  ⇒ **`spec.draft_kv_dtype = "bf16" | "fp8"`**(缺省 bf16)。旧档同样被
+  `deny_unknown_fields` 响亮拒(报错里列出 `draft_kv_dtype`)。
+  迁移:`draft_kv_fp8 = false` → `draft_kv_dtype = "bf16"`;`true` → `"fp8"`。
 - **allowed_ops 已退役**(2026-10-20):配置按 `model.format/quant/head_quant`、
-  `pool.kv_fp8`、`spec.depth`、`model.vision`、`parallel.mode` 自动派生
+  `pool.kv_dtype`、`spec.depth`、`vision.enabled`、`parallel.mode` 自动派生
   tag filter;`[kernel] tag_wildcard = true` 是诊断 `*` 逃生门。
 - **P2 未做**:旧档迁移器、`context=max` 校准探测、长跑泄漏余量曲线。
 - 配置层 `deny_unknown_fields` 仍全 module 生效;退役键有专门迁移提示。

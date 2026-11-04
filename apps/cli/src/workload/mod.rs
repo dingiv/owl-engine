@@ -70,7 +70,7 @@ pub fn run(args: Args) -> i32 {
             eprintln!(
                 "[workload] 8135 图像无感删除测试档示例:\n\
                  ./target/release/server -p profiles/qwen38_27b-3080_tp2.toml \\\n\
-                   --set pool.image_evict=true \\\n\
+                   --set vision.image_evict=true \\\n\
                    --set pool.prefix_cache=true --set pool.snap_max=2 \\\n\
                    --set pool.snap_host_mb=1024 --set runtime.max_seq=131072 \\\n\
                    --set runtime.implicit_session=true --log-level info\n\

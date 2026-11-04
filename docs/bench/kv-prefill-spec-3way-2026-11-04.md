@@ -11,7 +11,7 @@
 |---|---|---|---:|---|
 | `int8` | `measurement/qwen38_27b-3090-int8.toml` | K int8 + packed V（token-major，无 shadow） | 1 122 304 B | 本仓 P8 核 |
 | `fp8s` | `measurement/qwen38_27b-3090-fp8.toml` + `kernel.prefill_shadow=true` | fp8 e4m3 + **f16 staging shadow** | 1 048 576 B | FI `flashinfer_prefill_paged_f16` |
-| `fp16` | 同上 + `pool.kv_fp8=false` | f16 | 2 097 152 B | FI `flashinfer_prefill_paged_f16` |
+| `fp16` | 同上 + `pool.kv_dtype=f16` | f16 | 2 097 152 B | FI `flashinfer_prefill_paged_f16` |
 
 `[kernel-env]` 实测标签：`kv.main.int8` / `kv.main.fp8` / `kv.main.f16` + 三者
 `kv.draft.bf16 · feat.dflash · feat.spec`，`vision=false` ✓。
@@ -69,7 +69,7 @@ TTFT（ms，与上表同序）：
 ## 5. 复现
 
 ```bash
-# int8（fp8s 换 -p ...-fp8.toml + kernel.prefill_shadow=true；f16 再 + pool.kv_fp8=false）
+# int8（fp8s 换 -p ...-fp8.toml + kernel.prefill_shadow=true；f16 再 + pool.kv_dtype=f16）
 ./target/release/server -p profiles/measurement/qwen38_27b-3090-int8.toml \
   --set 'parallel.device=["0000:41:00.0"]' --set 'model.quant="w4a8"' \
   --set 'pool.prefix_cache=false' --set 'runtime.max_seq=73728' \
@@ -83,3 +83,59 @@ cd ../llm_speedtest && uv run cli --api-url http://127.0.0.1:8151/v1/chat/comple
 
 > 端口用 8151 是因为同期 8141/8144 上有别的实验；判决前先 `curl /health`。
 > 原始 JSON（每点 TTFT/decode 逐请求）落在 `/tmp/kvbench/`，按上面命令可重跑。
+
+---
+
+# 6. 配置层收紧：显存预留太保守（2026-11-04 用户裁决后落地）
+
+§4 的 OOM 不是算错，是**预留口径太保守**。`pool_cap` 的账是：
+
+```text
+base   = min(free, free − total×(1−target))      # target 只作上限
+budget = base − reserve − fixed_after            # fixed_after = 权重外的固定项
+cap    = budget / per_tok
+运行时闸 = driver_free − reserve ≥ 本次申请字节    # 每条 alloc/htod 都过
+```
+
+24G 单卡上，旧档光「白留」就有 **~1.7 GiB**：`target=0.99/0.97`（236/708 MiB）
++ `reserve=1024`（f16） + `snap_max=2` 的第二槽（152 MiB）+ store 复用池 256 MiB。
+
+## 6.1 改了什么
+
+| 项 | 旧 | 新 | 位置 | 依据 |
+|---|---|---|---|---|
+| `vram_target` | 0.99（int8/fp8）· 0.97（f16） | **1.0** | `parts/pool/{int8,fp8,f16}.toml` | `1.0` 是合法档（`base` 直接用驱动 free）；runtime 闸仍以 `reserve` 兜底 |
+| `vram_reserve_mb` | f16 `1024` · 测量档 `512` | **f16 512 · 测量档 384** | 同上 + 两个测量档 | 池外瞬态实测峰值 **20~25 MiB/块**（`gdn_conv`/`narrow_strided`/`embed`）⇒ 384~512 已是 15~20× |
+| `transient_reserve_mb` | 1024 | **512** | 同上 | 该项只服务 `[kvmem]` **超卖档**；非超卖档本来就无感（§代码注 2026-10-28） |
+| `snap_max` | 2（测量档） | **1** | `measurement/qwen38_27b-3090-{int8,fp8}.toml` | GDN 快照池 297→148 MiB；单流测量用不到第二槽（`prefix_cache=false` 时更用不到） |
+| `pool_cap_mb` | 256 | **64** | 同上 | store 搬运复用池（设备面）；单流 64 MiB 足够（超限逐块顶出回驱动，只慢不错） |
+
+> 生产档（`qwen38_27b-3090.toml`、3080/4080/5070ti 各档）只吃到「`target→1.0`、
+> `transient→512`」这两条由池组件带下去的变化；`snap_max`/`pool_cap_mb` 的收紧
+> **只作用于两个测量档**，不动生产的前缀缓存/搬运面。
+
+## 6.2 实测效果（f16，`max_seq=40960`，同 profile 同参数）
+
+| | `[vram-gov]` | 请求结果 |
+|---|---|---|
+| 旧（`target=99%` + `reserve=1024`） | `budget=2.83G cap=43160 tok` | 预填后 **24 MiB 瞬态被拒**（`free=1036 − reserve=1024 = 12 MiB`）⇒ `PoolExhausted` ⇒ **空补全** |
+| 新（`target=100%` + `reserve=384` + `snap_max=1`） | `budget=3.84G cap=62887 tok` | **跑通**：prefill **2090.4 t/s** / TTFT 15.68 s / decode 54.9 t/s |
+
+f16 可用上下文（单 24G，权重 17.2G，spec d7）：
+
+| 档 | 上限 | 证据 |
+|---|---:|---|
+| 旧配置 | ~34.8k | `max_seq=36864` 时 `cap=14555`（`target=0.95` 更糟）；`40960` 请求期 OOM |
+| **新配置（`snap_max=1`）** | **40 960 跑通** | cap 62 887 |
+| **新配置 + `snap_max=0`** | **49 152 跑通** | prefill **1952.4 t/s** / TTFT 25.18 s / decode 55.9 t/s（`fixed_after` 0.92G→0.78G） |
+| 65k | 仍差 ~0.2 GB | `fixed_after` 里 `图slab = 320 MiB` 是**保守上界**（同档实测 0.0 MiB）⇒ 要吃它得改 `crates/store/src/plan.rs`（代码层） |
+
+int8 回归（同批配置收紧后，单次）：32k **2059.8** t/s（旧 2074.7，−0.7%）、
+65k **1775.2**（旧 1789.4，−0.8%）——在单次噪声内；`cap=117 511 tok` ≫ `max_seq`，
+说明 int8/fp8 的限制本来就在 `max_seq`，收紧只把余量还给运行时闸。
+
+## 6.3 压力行为（收紧后仍然优雅）
+
+`target=1.0` 把最后的缓冲交给 `reserve` + runtime 闸：
+日志实测多次走「硬预算前回收默认池缓存 320/256/224 MiB ⇒ 复判通过」——
+即先 trim 池缓存再复判，只有确实腾不出才拒发。收紧**不是**拆掉这道闸。

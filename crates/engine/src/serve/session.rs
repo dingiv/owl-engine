@@ -346,6 +346,8 @@ pub(crate) struct BankPlan {
     pub paged: bool,
     /// MTP 草稿链页池启用
     pub mtp: bool,
+    /// MTP 草稿 KV 物理环(占位不向 BlockLeg 领页;表由 ring 映射)
+    pub mtp_ring: bool,
     /// 前缀缓存开关(容量策略见 [`owl_store::CachePolicy`])
     pub prefix_cache: bool,
     /// target 腿宿主层预算(字节;0 = 关层,REQ C4 默认关)
@@ -373,6 +375,8 @@ pub(crate) struct SessionBank {
     pub rel: Rel,
     /// MTP 链块腿(独立页池,无前缀缓存;宿主面恒关 —— 裁决④推后)
     pub leg_mtp: BlockLeg,
+    /// MTP 草稿 KV 物理环(T5;true = 不向 leg_mtp 领页/不归还)
+    pub(crate) mtp_ring: bool,
 }
 
 impl SessionBank {
@@ -414,19 +418,22 @@ impl SessionBank {
             plan.world.max(1),
         )?;
         rel.leg.attach_pool(target_layout)?;
+        let mtp_ring = plan.mtp_ring;
         let mut leg_mtp = BlockLeg::open(LegConfig {
-            slots: if plan.mtp { plan.nb } else { 0 },
+            slots: if plan.mtp && !mtp_ring { plan.nb } else { 0 },
             block_tokens: plan.page,
-            block_bytes: if plan.mtp { plan.mtp_block_bytes } else { 1 },
+            block_bytes: if plan.mtp && !mtp_ring { plan.mtp_block_bytes } else { 1 },
             cache: owl_store::CachePolicy::Off,
             host_bytes: 0,
             class: BlockClass::KvPage,
             label: "mtp",
         })?;
-        if let Some(l) = mtp_layout {
-            leg_mtp.attach_pool(l)?;
+        if !mtp_ring {
+            if let Some(l) = mtp_layout {
+                leg_mtp.attach_pool(l)?;
+            }
         }
-        Ok(Self { sessions: SessionTable::new(), rel, leg_mtp })
+        Ok(Self { sessions: SessionTable::new(), rel, leg_mtp, mtp_ring })
     }
 
     // （块腿的复合口做成**自由函数**:借用只落在 `&mut KvStore` 那一个字段上
@@ -471,8 +478,19 @@ impl SessionBank {
             mtp_table = std::mem::take(&mut s.mtp_block_table);
         }
         self.rel.release_table(&mut table)?;
-        self.leg_mtp.release_table(&mut mtp_table)?;
+        self.release_mtp_table(&mut mtp_table)?;
         Ok(())
+    }
+
+    /// MTP 链归还:线性档走块腿;ring 档只清表(页池固定,不归槽)。
+    pub(crate) fn release_mtp_table(&mut self, table: &mut Vec<u32>) -> Result<()> {
+        if self.mtp_ring {
+            table.clear();
+            Ok(())
+        } else {
+            self.leg_mtp.release_table(table)?;
+            Ok(())
+        }
     }
 }
 
@@ -581,6 +599,7 @@ mod bank_tests {
             mtp_block_bytes: 1 << 20,
             paged: true,
             mtp,
+            mtp_ring: false,
             prefix_cache,
             host_bytes: 0,
             world: 1, // 测试：单卡平面（TP 宿主腿的 world 语义由 store 门覆盖）

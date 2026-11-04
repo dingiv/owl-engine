@@ -49,9 +49,15 @@ draft_path = ""
 
 [pool]
 prefix_cache = true
-image_evict = false
-snap_max = 2
+# 2026-11-04 收紧:单流测量档只用 1 槽(2 槽=228MiB 白留);生产档不改。
+snap_max = 1
 host_cache_mb = 10240
 snap_host_mb = 3072
-vram_reserve_mb = 512
-transient_reserve_mb = 1024
+# 池外瞬态实测 20~25MiB/块 ⇒ 512→384 仍留 15× 余量(用户裁决:预留太保守)。
+vram_reserve_mb = 384
+transient_reserve_mb = 512
+# store 搬运缺口(设备面);256→64MiB。
+pool_cap_mb = 64
+
+[vision]
+image_evict = false
