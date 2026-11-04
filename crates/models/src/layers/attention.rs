@@ -239,8 +239,9 @@ impl Attention {
                 && tokens == 1
                 && !force_naive
                 && ctx.env.attn.qkv_fuse
-                // INT8 没有融合插池臂:走 K-only writer + V append(见下)
-                && !ctx.env.kv.is_int8()
+                // **按能力选臂**(不是按格式身份猜):没有融合插池臂的格式
+                // (int8)自然落到 K-only writer + V append 分支
+                && ctx.env.kv.supports_fused_insert()
                 && crate::ops::paged_decode_ok(self.hd, p.page)
         });
         if let Some(pol) = insert_pol {
