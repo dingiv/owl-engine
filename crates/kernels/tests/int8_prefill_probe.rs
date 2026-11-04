@@ -58,7 +58,7 @@ fn f16_to_f32(h: u16) -> f32 {
     s * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
 }
 
-fn run(t: usize, l: usize, timing: bool) -> Option<()> {
+fn run(t: usize, l: usize, timing: bool) -> Option<Vec<u8>> {
     let dev = owl_cuda::test_device_ordinal_opt()?;
     let mut res = fi_support::TestRes::new(dev);
     let mut exec = Exec::new();
@@ -121,8 +121,6 @@ fn run(t: usize, l: usize, timing: bool) -> Option<()> {
         LaunchVal::Ptr(dout.ptr),
     ];
     let grid = (((t + 63) / 64) as u32, HQ as u32, 1);
-    let launch = || {};
-    launch();
     for _ in 0..2 {
         r.launch_aot(ENTRY, SRC, grid, (128, 1, 1), SMEM, &vals)
             .unwrap();
@@ -157,7 +155,23 @@ fn run(t: usize, l: usize, timing: bool) -> Option<()> {
     println!("[int8-probe] T={t} L={l} finite={finite} nonzero={nonzero} max|o|={max:.6}");
     assert!(finite, "non-finite output");
     assert!(nonzero, "all-zero output");
-    Some(())
+    Some(out)
+}
+
+/// **独立微基准**：只跑 `owl_int8_prefill_paged`，不经过引擎/tokenizer/Marlin。
+/// 每个 L 取 `T=2048`、`base=L-T`（最后一个 chunk 的最坏因果形状），3 发取总时。
+/// 用法：`OWL_TEST_DEVICE=41:00.0 cargo test -p owl-kernels --release \
+///        --features device --test int8_prefill_probe int8_prefill_bench_lengths -- --nocapture`
+#[test]
+fn int8_prefill_bench_lengths() {
+    if owl_cuda::test_device_ordinal_opt().is_none() {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    }
+    for l in [8192usize, 32768, 65536, 100000, 140000] {
+        println!("[int8-bench] ===== L={l} T=2048 =====");
+        run(2048, l, true).unwrap();
+    }
 }
 
 #[test]

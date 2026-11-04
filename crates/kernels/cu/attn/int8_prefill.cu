@@ -43,6 +43,69 @@ __device__ __forceinline__ float ex2f_fast(float x) {
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
 }
+// ---------------------------------------------------------------------------
+// staging(K/V/scales 装载)的**块不变量**
+//
+// 三处装载都是"线程 t 固定负责若干 chunk、跨块只换页基址",而同一线程的
+// 各 chunk 只差**常数步长**(key_l += 8 / d += 64 / g += 4),并且 swizzle 里
+// 用到的低位(key_l&7 / d&1 / pair0)在块间、chunk 间都不变。原实现把
+// `chunk/16`、`i/Bc` 这类**有符号除法**(SASS 上是 SHF+LEA.HI+LOP3 四条一套)
+// 与 swizzle 每 chunk 重算一遍,还把 `block_table[nk]` 每 chunk 重载一次
+// (LDG + F2I)—— 每块 ~230 条整数指令(占循环体 12%)。
+// 这里把地址数学整体提出块循环:块内只剩 1 次页号读取 + 常数步长加法。
+// ---------------------------------------------------------------------------
+struct StageGeom {
+    // 每线程迭代数
+    int k_iters;
+    int v_iters;
+    int s_iters;
+    // 迭代步长(= 跨线程覆盖同一 tile 的"跳跃")
+    int k_step;
+    int v_step;
+    int s_step;
+    // 本线程首个元素
+    int k_smem0;
+    int k_off0;
+    int k_key0;
+    int v_smem0;
+    int v_off0;
+    int s_smem0;
+    int s_off0;
+    int s_key;
+};
+
+__device__ __forceinline__ StageGeom stage_geom(int tid, int Hkv, int page) {
+    StageGeom g;
+    // 线程 t 负责 chunk = t + Threads*j；chunk → (key_l, d) 是 chunk/16, chunk%16
+    // ⇒ key_l = t/16 + (Threads/16)j,d 不变;V 侧 d = t/2 + (Threads/2)j,pair 不变;
+    // scale 侧 g = t/32 + (Threads/32)j,key 不变。**步长按 Threads 算,不是按迭代数。**
+    constexpr int KIters = (Bc * (D / 16)) / Threads;
+    constexpr int VIters = (D * (Bc / 2 / 8)) / Threads;
+    constexpr int SIters = (8 * Bc) / Threads;
+    constexpr int KStep = Threads / (D / 16);
+    constexpr int VStep = Threads / (Bc / 2 / 8);
+    constexpr int SStep = Threads / Bc;
+    g.k_iters = KIters;
+    g.v_iters = VIters;
+    g.s_iters = SIters;
+    g.k_step = KStep;
+    g.v_step = VStep;
+    g.s_step = SStep;
+    const int k_key_l0 = tid / (D / 16);
+    const int k_d = (tid % (D / 16)) * 16;
+    g.k_key0 = k_key_l0;
+    g.k_smem0 = k_key_l0 * D + swz(k_key_l0, k_d / 2) * 2;
+    g.k_off0 = k_key_l0 * Hkv * D + k_d;
+    const int v_d0 = tid / (Bc / 2 / 8);
+    const int v_pair0 = (tid % (Bc / 2 / 8)) * 8;
+    g.v_smem0 = v_d0 * (Bc / 2) + swz_v(v_d0, v_pair0);
+    g.v_off0 = v_d0 * (page / 2) + v_pair0;
+    g.s_key = tid % Bc;
+    g.s_smem0 = tid;
+    g.s_off0 = (tid % Bc) * Hkv * 8 + (tid / Bc);
+    return g;
+}
+
 }  // namespace
 
 extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
@@ -83,32 +146,33 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
         cp_async<16, Cache::cg>(&qs[row * D + swz(row, d / 2) * 2],
                                 &q[((size_t)(q0 + row) * Hq + q_head) * D + d]);
     }
-    // Prologue K0 into buffer 0.
-    for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
-        const int key = chunk / (D / 16);
-        const int d = (chunk % (D / 16)) * 16;
-        int8_t* dst = &ks0[key * D + swz(key, d / 2) * 2];
-        if (key < L) {
-            const int page_idx = static_cast<int>(block_table[0]);
-            cp_async<16, Cache::cg>(dst, &k[((size_t)page_idx * page + key) * Hkv * D +
-                                           (size_t)kv_head * D + d]);
-        } else {
-            store_vec(dst, make_int4(0, 0, 0, 0));
+    const StageGeom sg = stage_geom(tid, Hkv, page);
+    // Prologue K0 + scales(块不变量 + 常数步长,见 StageGeom)。
+    {
+        const int phys0 = static_cast<int>(block_table[0]);
+        const int8_t* kpage = k + (size_t)phys0 * page * Hkv * D + (size_t)kv_head * D;
+#pragma unroll
+        for (int j = 0; j < sg.k_iters; ++j) {
+            int8_t* dst = ks0 + sg.k_smem0 + j * (sg.k_step * D);
+            const int key = sg.k_key0 + j * sg.k_step;
+            if (key < L) {
+                cp_async<16, Cache::cg>(dst, kpage + sg.k_off0 + j * (sg.k_step * Hkv * D));
+            } else {
+                store_vec(dst, make_int4(0, 0, 0, 0));
+            }
         }
-    }
-    for (int i = tid; i < 8 * Bc; i += Threads) {
-        const int g = i / Bc;
-        const int key = i % Bc;
-        const int phys = static_cast<int>(block_table[0]);
-        kscale0[i] = (key < L)
-                         ? kscale[((size_t)(phys * page + key) * Hkv + kv_head) * 8 + g]
-                         : 0.0f;
-    }
-    for (int i = tid; i < Bc; i += Threads) {
-        const int phys = static_cast<int>(block_table[0]);
-        vscale_s[i] = (i < L)
-                          ? vscale[((size_t)(phys * page + i) * Hkv + kv_head)]
-                          : 1.0f;
+        const float* sbase =
+            kscale + (size_t)phys0 * page * Hkv * 8 + (size_t)kv_head * 8;
+#pragma unroll
+        for (int j = 0; j < sg.s_iters; ++j) {
+            kscale0[sg.s_smem0 + j * (sg.s_step * Bc)] =
+                (sg.s_key < L) ? sbase[sg.s_off0 + j * sg.s_step] : 0.0f;
+        }
+        if (tid < Bc) {
+            vscale_s[tid] = (tid < L)
+                                ? vscale[(size_t)(phys0 * page + tid) * Hkv + kv_head]
+                                : 1.0f;
+        }
     }
     cp_commit(); cp_wait<0>(); __syncthreads();
 
@@ -155,15 +219,15 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
         __half* k_b16 = reinterpret_cast<__half*>(smem + QBytes);
         float* kscale_s = kscale0;
         // V 预取,与 QK 重叠;K 单缓冲在 QK 完成后由下一轮 prefetch 覆盖。
-        const int v_page = static_cast<int>(block_table[tile_k0 / page]);
-        for (int chunk = tid; chunk < D * (Bc / 2 / 8); chunk += Threads) {
-            const int d = chunk / (Bc / 2 / 8);
-            const int pair0 = (chunk % (Bc / 2 / 8)) * 8;
-            const uint16_t* src = &vp[((size_t)v_page * Hkv + kv_head) * D *
-                                          (page / 2) +
-                                      (size_t)d * (page / 2) + pair0];
-            uint16_t* dst = &v_b16[d * (Bc / 2) + swz_v(d, pair0)];
-            cp_async<16, Cache::cg>(dst, src);
+        {
+            const int v_page = static_cast<int>(block_table[tile_k0 / page]);
+            const uint16_t* vpage =
+                vp + ((size_t)v_page * Hkv + kv_head) * D * (page / 2);
+#pragma unroll
+            for (int j = 0; j < sg.v_iters; ++j) {
+                cp_async<16, Cache::cg>(v_b16 + sg.v_smem0 + j * (sg.v_step * (Bc / 2)),
+                                        vpage + sg.v_off0 + j * (sg.v_step * (page / 2)));
+            }
         }
         cp_commit();  // V group;K[buf] already resident
 
@@ -210,14 +274,22 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
         }
 
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
+        // 因果掩码只在**对角块**做:块尾 key ≤ 本 tile 最小 query 绝对位置时,
+        // 掩码对所有行恒不触发(严格因果)。`key_blocks` 是按**最大** query 圈定的,
+        // 所以早行所在的块仍需要对角逐块掩码 —— 判据必须用 min(base_pos+q0)。
+        // 越界行(row>=tile_rows)结果不写出 ⇒ 它们不需要掩码。
+        // 指令账(issue-bound 核):非对角块每块省 ~40 条 ISETP/FSEL。
+        const bool tail_mask = (tile_k0 + Bc - 1) > (base_pos + q0);
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {
-            const int key0 = tile_k0 + nt * 8 + 2 * lid;
-            const int key1 = key0 + 1;
-            if (key0 > qabs0) score[nt][0] = -CUDART_INF_F;
-            if (key1 > qabs0) score[nt][1] = -CUDART_INF_F;
-            if (key0 > qabs1) score[nt][2] = -CUDART_INF_F;
-            if (key1 > qabs1) score[nt][3] = -CUDART_INF_F;
+            if (tail_mask) {
+                const int key0 = tile_k0 + nt * 8 + 2 * lid;
+                const int key1 = key0 + 1;
+                if (key0 > qabs0) score[nt][0] = -CUDART_INF_F;
+                if (key1 > qabs0) score[nt][1] = -CUDART_INF_F;
+                if (key0 > qabs1) score[nt][2] = -CUDART_INF_F;
+                if (key1 > qabs1) score[nt][3] = -CUDART_INF_F;
+            }
             bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
             bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
         }
@@ -296,36 +368,30 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
         // K(kb+1) 预取,与 PV(kb) 重叠;写另一 K 缓冲。
         if (kb + 1 < key_blocks) {
             const int nk = kb + 1;
+            const int phys = static_cast<int>(block_table[nk]);   // 每块只读一次
             int8_t* nks = smem + QBytes;
-            for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
-                const int key_l = chunk / (D / 16);
-                const int d = (chunk % (D / 16)) * 16;
-                const int key = nk * Bc + key_l;
-                int8_t* dst = &nks[key_l * D + swz(key_l, d / 2) * 2];
-                if (key < L) {
-                    const int page_idx = static_cast<int>(block_table[nk]);
-                    cp_async<16, Cache::cg>(
-                        dst, &k[((size_t)page_idx * page + key_l) * Hkv * D +
-                                (size_t)kv_head * D + d]);
+            const int8_t* kpage = k + (size_t)phys * page * Hkv * D + (size_t)kv_head * D;
+#pragma unroll
+            for (int j = 0; j < sg.k_iters; ++j) {
+                int8_t* dst = nks + sg.k_smem0 + j * (sg.k_step * D);
+                const int key = sg.k_key0 + j * sg.k_step;
+                if (nk * Bc + key < L) {
+                    cp_async<16, Cache::cg>(dst, kpage + sg.k_off0 + j * (sg.k_step * Hkv * D));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }
             }
-            for (int i = tid; i < 8 * Bc; i += Threads) {
-                const int g = i / Bc;
-                const int key_l = i % Bc;
-                const int key = nk * Bc + key_l;
-                const int phys = static_cast<int>(block_table[nk]);
-                kscale0[i] = (key < L)
-                                 ? kscale[((size_t)(phys * page + key_l) * Hkv + kv_head) * 8 + g]
-                                 : 0.0f;
+            const float* sbase =
+                kscale + (size_t)phys * page * Hkv * 8 + (size_t)kv_head * 8;
+#pragma unroll
+            for (int j = 0; j < sg.s_iters; ++j) {
+                kscale0[sg.s_smem0 + j * (sg.s_step * Bc)] =
+                    (nk * Bc + sg.s_key < L) ? sbase[sg.s_off0 + j * sg.s_step] : 0.0f;
             }
-            for (int i = tid; i < Bc; i += Threads) {
-                const int phys = static_cast<int>(block_table[nk]);
-                const int key = nk * Bc + i;
-                vscale_s[i] = (key < L)
-                                  ? vscale[((size_t)(phys * page + i) * Hkv + kv_head)]
-                                  : 1.0f;
+            if (tid < Bc) {
+                vscale_s[tid] = (nk * Bc + tid < L)
+                                    ? vscale[(size_t)(phys * page + tid) * Hkv + kv_head]
+                                    : 1.0f;
             }
             cp_commit();
         }
