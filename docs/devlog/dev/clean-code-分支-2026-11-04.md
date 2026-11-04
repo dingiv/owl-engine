@@ -236,7 +236,11 @@ impl ModelLoader {
 - 负例:GGUF + `model.head_quant="rtn-int8-row"` ⇒ **boot 拒**并点名修法;
 - workspace check 0 error;owl-models 316 / owl-shared 127 / engine config 全绿。
 
-### 3.3c 装载器第三步(未做):`ModelSource` trait(AWQ/safetensors vs GGUF)
+### 3.3c 装载器第三步(未做):`ModelSource` 统一流
+
+**已出交接卷**:[`loader-refactor-ModelSource-设计-2026-11-04.md`](loader-refactor-ModelSource-设计-2026-11-04.md)
+—— 含现状地图(S1-S3 分阶段)、目标接口、**装载性能基线**(AWQ+spec / AWQ / GGUF
+三档 ×3 次热态中位数)与不回归硬门(load/key-loop/wall ≤ ×1.05)、行为等价门、已知坑。
 
 现状:`loader.rs`(810 行)+ `formats/qwen35.rs`(2.2k)+ `formats/gguf/*`(10.5k)
 两套并行,`ModelFormat::` 44 处分叉,`--check` 另有一套。目标:
