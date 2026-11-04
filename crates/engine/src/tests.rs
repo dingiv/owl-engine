@@ -6180,7 +6180,7 @@ pub async fn gpu_vlm_first_turn_probe_27b(first_image: bool) {
     eprintln!("[f1-27b] 装载+装配 {:?}", t0.elapsed());
     assert!(
         running.dev.boot.vlm.is_some(),
-        "[model].vision = true 必须有视觉塔(27B)"
+        "[vision] enabled = true 必须有视觉塔(27B)"
     );
 
     let l_img = 64usize; // 网格 (1,16,16) ⇒ (16/2)² = 64 tok

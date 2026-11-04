@@ -379,7 +379,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         snap_max: get_usize(&out, "pool.snap_max").unwrap_or(4),
         sessions: c,
         tp_world: if tp { 2 } else { 1 },
-        vision: get_bool(&out, "model.vision").unwrap_or(false),
+        vision: get_bool(&out, "vision.enabled").unwrap_or(false),
         activation_bytes: act,
         activation_note: act_note,
         stability_margin_bytes: STABILITY_MARGIN_BYTES,

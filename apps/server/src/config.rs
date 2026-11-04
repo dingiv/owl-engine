@@ -478,7 +478,7 @@ impl ServerConfig {
                 let p = cfg.server.request_dump_dir.trim();
                 (!p.is_empty()).then(|| PathBuf::from(p))
             },
-            vision_max_pixels: cfg.server.vision_max_pixels,
+            vision_max_pixels: cfg.vision.max_pixels,
             model_dir: cfg
                 .model
                 .path
@@ -824,12 +824,8 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     };
     match dir_owned.as_deref() {
         Some(dir) if dir.is_file() => {
-            let vision_path = c
-                .model
-                .vision_path
-                .as_deref()
-                .filter(|p| !p.as_os_str().is_empty());
-            match check_gguf_model(dir, profile, c.runtime.max_seq, c.model.vision, vision_path) {
+            let vision_path = c.vision.path.as_deref().filter(|p| !p.as_os_str().is_empty());
+            match check_gguf_model(dir, profile, c.runtime.max_seq, c.vision.enabled, vision_path) {
                 Ok(note) => out.push_str(&format!("[check] model dir: {note}\n")),
                 Err(e) => {
                     ok = false;
@@ -838,7 +834,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             }
         }
         Some(dir) => match profile {
-            Some(p) => match check_model_dir(dir, p, c.runtime.max_seq, c.model.vision) {
+            Some(p) => match check_model_dir(dir, p, c.runtime.max_seq, c.vision.enabled) {
                 Ok(Some(note)) => out.push_str(&format!("[check] model dir: {note}\n")),
                 Ok(None) => {}
                 Err(e) => {
@@ -919,9 +915,9 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         c.spec.draft,
         if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
         c.runtime.max_batch,
-        if c.model.vision { "on" } else { "off" },
+        if c.vision.enabled { "on" } else { "off" },
     ));
-    if c.model.vision {
+    if c.vision.enabled {
         if c.spec.depth > 0 {
             out.push_str(
                 "[check] note: vision=on + spec>0:图像 × 投机已接(V5)—— verify 的 rope \
@@ -931,7 +927,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         } else {
             out.push_str(
                 "[check] note: vision=on + spec=off:图像路径可用(单请求多图;data URL;\
-                 TP2 两 rank 各备塔输出;`[pool] image_evict` = 前缀无感删除)\n",
+                 TP2 两 rank 各备塔输出;`[vision] image_evict` = 前缀无感删除)\n",
             );
         }
     }
@@ -1065,7 +1061,7 @@ fn check_gguf_model(
         ));
     } else if vision_path.is_some() {
         return Err(format!(
-            "{}:[model].vision_path 已设置但 [model].vision = false（配置自相矛盾）",
+            "{}:[vision] path 已设置但 [vision] enabled = false（配置自相矛盾）",
             path.display()
         ));
     }
@@ -1093,13 +1089,13 @@ fn check_model_dir(
     if vision {
         if v.get("vision_config").is_none() {
             return Err(format!(
-                "[model].vision = true,但 {} 的 config.json 无 vision_config(不是 VLM 检查点)",
+                "[vision] enabled = true,但 {} 的 config.json 无 vision_config(不是 VLM 检查点)",
                 dir.display()
             ));
         }
         if v.get("image_token_id").and_then(|x| x.as_u64()).is_none() {
             return Err(format!(
-                "[model].vision = true,但 {} 的 config.json 缺 image_token_id",
+                "[vision] enabled = true,但 {} 的 config.json 缺 image_token_id",
                 dir.display()
             ));
         }

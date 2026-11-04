@@ -66,7 +66,6 @@
 //! | model | format | ModelFormat 枚举 safetensors\|awq\|gguf / safetensors |
 //! | model | path / name | Option<PathBuf> / None(模型目录或 .gguf 单文件) |
 //! | model | quant | QuantScheme(safetensors/awq: w4a16\|w4a8;gguf: q4k\|iq4\|iq3) |
-//! | model | vision / vision_path | bool / false + Option(视觉塔;GGUF 档 = `mmproj-*.gguf` 单文件) |
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
 //! | pool | kv_dtype | KvDtype 枚举 `f16\|fp8\|int8` / f16(主 KV 池存储格式;2026-11-04 由两个布尔合成单键) |
@@ -74,8 +73,10 @@
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
-//! | pool | image_evict | bool / false(**前缀无感删除**:客户端给可删图像打标记 ⇒ 引擎页对齐 + 删除即位置帧平移) |
-//! | pool | image_evict_pad | str / "。"(页对齐 pad 词;必须恰 1 token;空 = 自动 `。`→` `→`\\n`) |
+//! | vision | enabled | bool / false(视觉塔开关;GGUF 档另有 `path` 指向 `mmproj-*.gguf`) |
+//! | vision | image_evict | bool / false(**前缀无感删除**:图像段打标记 ⇒ 页对齐 + 删除即位置帧平移,需 `[pool] prefix_cache`) |
+//! | vision | image_evict_pad | str / "。"(图像段页对齐 pad 词;必须恰 1 token;空 = 自动) |
+//! | vision | max_pixels / path | usize 0 / Option None(图像预处理像素封顶 / 视觉塔权重路径) |
 //! | pool | prefill_align_tail | bool / **true**(块边界快照须页对齐;单块档多切一刀) |
 //! | pool | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
 //! | pool | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
@@ -677,6 +678,50 @@ impl RopeCfg {
     }
 }
 
+/// **视觉面**(`[vision]`)。2026-11-04 用户裁决:视觉相关键原本散在
+/// `[model]`(塔开关/路径)、`[server]`(像素上限)、`[pool]`(图像段删除)三处,
+/// 收编成一个 section —— "开塔/换塔/限像素/删图缓存"是一件事的四个侧面。
+///
+/// **缺省 = 纯文本**:`enabled = false` 时其余字段零副作用,文本路径逐字节不变。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VisionCfg {
+    /// **视觉塔开关**。`true` = 装载视觉塔(检查点 `model.visual.*`,GGUF 档为
+    /// `path` 指向的 `mmproj-*.gguf`),引擎允许 VLM 请求。检查点没有
+    /// `vision_config` 而置 true = 装载期响亮拒。
+    pub enabled: bool,
+    /// **视觉塔权重路径**(不写 = 检查点内置)。
+    /// - HF/AWQ:预留目录形式(当前装载器只支持检查点内置);
+    /// - GGUF:指向 `mmproj-*.gguf` 单文件;不写 = 同目录**唯一**候选
+    ///   (多个/没有 ⇒ 响亮拒);
+    /// - `enabled = false` 却给了 path = 配置自相矛盾(装载期响亮拒)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// **单图像素上限**(`smart_resize` 封顶;0 = 内置 4096² = 实际不缩)。
+    /// 图像 token 数 ∝ 像素:1 MP ≈ 646 tok、0.5 MP ≈ 281 tok;
+    /// 真机 GUI agent 每轮 +1 张截图 ⇒ 每 100 tok ≈ 135 ms prefill(135k 上下文)。
+    pub max_pixels: usize,
+    /// **前缀无感删除(图像段)**。客户端给图像打 `owl_evict` 标记 ⇒ 引擎把
+    /// 该段补 pad 到页对齐并记为候选;真删时保留后缀页、**不转 K、不移动
+    /// 幸存 token 的 position**。需 `[pool] prefix_cache` + 分页 KV。
+    /// 缺省 false = 逐字节旧行为(引擎不自作主张)。
+    pub image_evict: bool,
+    /// 图像段页对齐 pad 词(**必须恰 1 token**;空串 = 自动 `。`→` `→`\\n`)。
+    pub image_evict_pad: String,
+}
+
+impl Default for VisionCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            max_pixels: 0,
+            image_evict: false,
+            image_evict_pad: "。".to_string(),
+        }
+    }
+}
+
 /// 模型资产面
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -686,22 +731,6 @@ pub struct ModelCfg {
     pub format: ModelFormat,
     /// **rope 外推/缩放**(`[model.rope]`;缺省关。GGUF 档生效)
     pub rope: RopeCfg,
-    /// **视觉塔**(VLM;2026-10-20 视觉接线):`true` = 装载检查点
-    /// `config.json:vision_config` 的 `model.visual.*` 权重,引擎可走 VLM
-    /// prefill 面。**缺省 false = 纯文本路径逐字节不变**;检查点无
-    /// `vision_config` 而置 true = 装载期响亮拒。
-    ///
-    /// **GGUF 档**(2026-10-21):`true` 时装 `vision_path` 指向的视觉塔;
-    /// GGUF 主文件本身不含 `model.visual.*`。
-    #[serde(default)]
-    pub vision: bool,
-    /// **视觉塔权重路径**(留空/不写 = 用检查点内置 `model.visual.*`)。
-    ///
-    /// - HF/AWQ:预留目录形式(当前装载器只支持检查点内置);
-    /// - GGUF(2026-10-21):指向同目录 `mmproj-*.gguf` 单文件;缺省在
-    ///   `model.path` 同目录找**唯一** `mmproj*.gguf`(多个/没有 ⇒ 响亮拒)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vision_path: Option<PathBuf>,
     /// **模型路径**:目录(`safetensors`/`awq` 检查点)或 `.gguf` 单文件
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -831,28 +860,6 @@ pub struct PoolCfg {
     pub vram_target: f64,
     pub vram_reserve_mb: u64,
     pub prefix_cache: bool,
-    /// **前缀无感删除(图像段)** —— 2026-10-23 用户裁决:引擎**不自作主张**,
-    /// 必须由客户端显式给图像打「将来可能被删」标记(`TurnImage::evict`)且本键开。
-    ///
-    /// 开 = 对**带标记**的图像段做两件事:
-    /// ① 页对齐 pad(段首落页边界、整段整页 —— 删除后块表拼接零搬运);
-    /// ② 下一轮若识别到「历史里正好少了这一段」,保留后缀页、**不转 K、
-    ///    不移动幸存 token 的 position**,新 token 从 `max_pos+1` 追加;
-    ///    不重算前缀之后的任何 token,可无限次丢弃旧图片缓存。
-    ///
-    /// 关 = 逐字节旧行为(标记被忽略;带了标记也**响亮拒**,不静默降级)。
-    /// 依赖:`prefix_cache = true`(内容寻址取旧链)与分页 kNHD KV
-    /// (f16 或 fp8-e4m3)。
-    pub image_evict: bool,
-    /// **页对齐 pad 的填充词**(`[pool].image_evict_pad`;缺省 **`。`**;空串 = 自动)。
-    ///
-    /// 为什么要可配:pad 词是**模型敏感项** —— 27B/TP2 实测,`\n`(一串空行)从第 3 张
-    /// 标记图起就让回答开头吐 `< >`;` `(空格)推到 ≥7 张;`。`(正常标点)8 图 / 8 次删除
-    /// 都干净。不同模型/不同 chat 模板对此的容忍度不同 ⇒ **不写死**。
-    ///
-    /// 约束:**必须恰 1 token**(boot 门校验,不符即拒启);pad 按区间记账、`unpad`
-    /// 整段剥 ⇒ 对客户端**完全不可见**。空串 = 按 `。`→` `→`\n` 顺序自动挑第一个。
-    pub image_evict_pad: String,
     /// **解释器块池预算**(字节;0 = 关 = 逐节点 alloc/free 存量路径)。
     /// 原 `OWL_BLOCK_POOL` env;P1″ 块竞技场(见 `interpreters::eval`)。
     pub block_pool_bytes: usize,
@@ -1902,12 +1909,6 @@ pub struct ServerCfg {
     /// **原始请求 JSON 落盘目录**(空 = 关;每请求一份 body,供前端联调
     /// 精确复现。含业务数据/图片 data URL,开启前确认隐私与磁盘容量)。
     pub request_dump_dir: String,
-    /// **单图像素上限**(视觉预处理 `smart_resize` 的封顶;0 = 内置 4096²=不缩）。
-    ///
-    /// 图像 token 数 ∝ 像素；真实 GUI agent 每轮 +1 张截图 ≈880 tok ⇒ 在 135k
-    /// 上下文里每轮多付 ~1.2 s prefill。封顶到 1 MP ⇒ 646 tok、0.5 MP ⇒ 281 tok。
-    /// 代价 = 小字号 UI 的可读性（产品权衡，默认 0 = 老行为）。
-    pub vision_max_pixels: usize,
     /// 模板路径覆盖:None/空 = 模型快照 `<model.path>/chat_template.jinja`;
     /// 相对路径 = 相对模型目录。**不动快照**换模板的运维抓手。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1929,7 +1930,6 @@ impl Default for ServerCfg {
         Self {
             bind: "127.0.0.1:8135".into(),
             request_dump_dir: String::new(),
-            vision_max_pixels: 0,
             template_path: None,
             parse_tool_calls: true,
             tool_call_format: ToolCallFormat::Xml,
@@ -1949,6 +1949,8 @@ impl Default for ServerCfg {
 pub struct OwlConfig {
     pub runtime: RuntimeCfg,
     pub model: ModelCfg,
+    /// 视觉面(见 [`VisionCfg`])
+    pub vision: VisionCfg,
     pub pool: PoolCfg,
     pub kvmem: KvmemCfg,
     pub spec: SpecCfg,
@@ -2020,8 +2022,6 @@ impl Default for PoolCfg {
             vram_reserve_mb: 1024,
             transient_reserve_mb: 1024,
             prefix_cache: true,
-            image_evict: false,
-            image_evict_pad: "。".to_string(),
             block_pool_bytes: 0,
             no_reclaim: false,
             vram_budget_mb: None,
@@ -2259,7 +2259,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
         (
             "kernel",
             "allowed_ops",
-            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`pool.kv_dtype`、`spec.depth`、`model.vision`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
+            "算子白名单已退役(2026-10-20):准入由 `model.kind/quant/head_quant`、`pool.kv_dtype`、`spec.depth`、`vision.enabled`、`runtime.tp_ordinals` 自动派生 tag filter;删掉本键。诊断需要全放行时用 `tag_wildcard = true`",
         ),
         (
             "kernel",
@@ -2465,7 +2465,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
         (
             "model",
             "vision_dir",
-            "已更名为 `[model] vision_path`(留空 = 检查点内置视觉塔)",
+            "已更名为 `[vision] path`(留空 = 检查点内置视觉塔)",
         ),
     ];
     for (module, key, hint) in MOVED_KEYS {
@@ -3108,8 +3108,8 @@ impl OwlConfig {
         // **前缀无感删除的依赖门**(2026-10-23):删除路径靠**内容寻址**取回旧链,
         // 没有前缀缓存就没有旧链可拼接 ⇒ 开着 `image_evict` 却没开 `prefix_cache`
         // 是"配了但永远不会生效",按静默降级拒启。
-        if self.pool.image_evict && !self.pool.prefix_cache {
-            return Err("[pool] image_evict = true 需要 prefix_cache = true\
+        if self.vision.image_evict && !self.pool.prefix_cache {
+            return Err("[vision] image_evict = true 需要 [pool] prefix_cache = true\
                  (删除路径要按内容身份取回旧链,前缀缓存关掉就没有可拼接的旧链)"
                 .to_string());
         }

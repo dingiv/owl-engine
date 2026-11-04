@@ -28,8 +28,6 @@ host_pressure_interval_ms = 1000
 
 [model]
 format = "gguf"
-vision = true
-vision_path = "../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
 path = "../models/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf"
 name = "qwen3.8-27b-gguf-iq4"
 head_quant = "off"
@@ -65,8 +63,6 @@ disk_dir = ""
 vram_target = 0.99
 vram_reserve_mb = 256
 prefix_cache = true
-image_evict = false
-image_evict_pad = "。"
 block_pool_bytes = 0
 no_reclaim = false
 vram_budget_mb = 0
@@ -203,7 +199,6 @@ upload = false
 [server]
 bind = "0.0.0.0:8137"
 request_dump_dir = ""
-vision_max_pixels = 0
 template_path = ""
 parse_tool_calls = true
 tool_call_format = "xml"
@@ -217,3 +212,10 @@ tags_deny = []
 max_mb = 0
 keep = 0
 timestamp = false
+
+[vision]
+enabled = true
+path = "../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"
+max_pixels = 0
+image_evict = false
+image_evict_pad = "。"

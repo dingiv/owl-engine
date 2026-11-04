@@ -28,9 +28,11 @@ draft_path = ""
 
 [pool]
 prefix_cache = true
-image_evict = false
 snap_max = 2
 host_cache_mb = 10240
 snap_host_mb = 3072
 vram_reserve_mb = 512
 transient_reserve_mb = 1024
+
+[vision]
+image_evict = false

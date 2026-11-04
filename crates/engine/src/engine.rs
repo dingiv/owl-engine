@@ -56,10 +56,10 @@ pub struct EngineKnobs {
     pub load: owl_shared::config::LoadCfg,
     /// **rope 外推/缩放**(`[model.rope]`;GGUF 档生效;缺省关)
     pub rope: owl_shared::config::RopeCfg,
-    /// **视觉塔**(`[model].vision`):装载 `model.visual.*` + 允许 VLM 请求。
+    /// **视觉塔**(`[vision] enabled`):装载 `model.visual.*` + 允许 VLM 请求。
     /// 缺省 false = 纯文本路径逐字节不变(27B 视觉档显式开)。
     pub vision: bool,
-    /// **GGUF 视觉塔单文件**(`[model].vision_path`;None = 同目录唯一候选)。
+    /// **GGUF 视觉塔单文件**(`[vision] path`;None = 同目录唯一候选)。
     /// 仅 GGUF 档 + `vision = true` 消费。
     pub mmproj: Option<std::path::PathBuf>,
     /// lm_head 量化方案(`[model].head_quant`;boot 投影到 tag filter)
@@ -79,13 +79,13 @@ pub struct EngineKnobs {
     pub int8_prefill_sync: bool,
     /// **整枝塌缩**(`[kvmem].bulk_drop_when_tier_full`;缺省 false = 保守)。
     pub bulk_drop_when_tier_full: bool,
-    /// **前缀无感删除(图像段)**(`[pool].image_evict`;缺省关)。
+    /// **前缀无感删除(图像段)**(`[vision] image_evict`;缺省关)。
     ///
     /// 开 = 客户端给图像打可删标记时:页对齐 pad + 删除后**保留位置洞、
     /// 不转 K、不移动幸存 token 的 position**,新 token 从 `max_pos+1` 追加;
     /// 不重算删点之后的 token,可无限次丢弃旧图片缓存。依赖 `prefix_cache` + 分页池(f16 或 fp8-e4m3) + 视觉档(boot 门;任缺 = 拒启)。
     pub image_evict: bool,
-    /// **页对齐 pad 词**(`[pool].image_evict_pad`;缺省 `。`;空串 = 自动)。
+    /// **页对齐 pad 词**(`[vision] image_evict_pad`;缺省 `。`;空串 = 自动)。
     /// 模型敏感项:27B 实测 `\n` 会让回答开头吐 `<`;`。` 干净。必须恰 1 token。
     pub image_evict_pad: String,
     /// **宿主层预算 MiB**(状态存储三层的中层;缺省 **0 = 关层**,REQ C4)。
@@ -673,10 +673,10 @@ impl EngineKnobs {
         Self {
             load: cfg.load.clone(),
             rope: cfg.model.rope.clone(),
-            vision: cfg.model.vision,
+            vision: cfg.vision.enabled,
             mmproj: cfg
-                .model
-                .vision_path
+                .vision
+                .path
                 .clone()
                 .filter(|p| !p.as_os_str().is_empty()),
             head_quant: cfg.model.head_quant,
@@ -729,8 +729,8 @@ impl EngineKnobs {
             prefix_cache: cfg.pool.prefix_cache,
             int8_prefill_sync: cfg.runtime.int8_prefill_sync,
             bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
-            image_evict: cfg.pool.image_evict,
-            image_evict_pad: cfg.pool.image_evict_pad.clone(),
+            image_evict: cfg.vision.image_evict,
+            image_evict_pad: cfg.vision.image_evict_pad.clone(),
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
             host_cache_mb: cfg.pool.host_cache_mb,
             disk_cache_mb: cfg.pool.disk_cache_mb,
@@ -1737,12 +1737,12 @@ pub(crate) fn into_running<D: DeviceClient>(
     if cfg.knobs.image_evict {
         if dev.boot.vlm.is_none() {
             return Err(ModelError::Msg(
-                "[pool] image_evict = true 需要 [model].vision = true(图像段识别依赖视觉档)".into(),
+                "[vision] image_evict = true 需要 [vision] enabled = true(图像段识别依赖视觉档)".into(),
             ));
         }
         if !dev.pool.geom.paged {
             return Err(ModelError::Msg(format!(
-                "[pool] image_evict = true 需要分页 KV 池（f16/fp8-e4m3/int8）\
+                "[vision] image_evict = true 需要分页 KV 池（f16/fp8-e4m3/int8）\
                  (paged={} kv_dtype={:?} dtype={:?})",
                 dev.pool.geom.paged,
                 dev.pool.geom.kv_dtype,
@@ -1757,13 +1757,13 @@ pub(crate) fn into_running<D: DeviceClient>(
                 Ok(v) if v.len() == 1 => {}
                 Ok(v) => {
                     return Err(ModelError::Msg(format!(
-                        "[pool] image_evict_pad = {tok:?} 必须恰 1 token(实测 {} tok:{v:?})",
+                        "[vision] image_evict_pad = {tok:?} 必须恰 1 token(实测 {} tok:{v:?})",
                         v.len()
                     )))
                 }
                 Err(e) => {
                     return Err(ModelError::Msg(format!(
-                        "[pool] image_evict_pad = {tok:?} 编码失败:{e}"
+                        "[vision] image_evict_pad = {tok:?} 编码失败:{e}"
                     )))
                 }
             }
@@ -1932,7 +1932,7 @@ pub(crate) struct RankBoot {
     /// 张量并行上下文(本 rank 的;`None` = 单卡)—— 执行面所有求值调用
     /// 把它传给解释器(行并行 allreduce 注入靠它;装配期填入,烘进每张图)
     pub(crate) tp: Option<owl_models::module::TpCtx>,
-    /// **视觉塔装配**(`[model].vision`;Some = VLM)。塔是 prefill-only 的
+    /// **视觉塔装配**(`[vision] enabled`;Some = VLM)。塔是 prefill-only 的
     /// 额外权重;文本 `model` 与它是同一份 Arc(见 `Vlm::from_model`)。
     pub(crate) vlm: Option<std::sync::Arc<owl_models::vlm::Vlm>>,
 }

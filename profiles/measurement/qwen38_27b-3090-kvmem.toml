@@ -172,7 +172,6 @@ vram_reserve_mb = 512
 #   ⇒ 池 47.7k → **76.4k(+60%)**,代价 prefill −17%(255k 首答 192→228 s)。
 #   实测表见 roadmap.local/26-10-28-KVMem-位置定谳与三修.md §13.6。
 transient_reserve_mb = 1024
-image_evict = true
 snap_msg_boundary = true
 snap_msg_delim = ""
 snap_msg_min_gap = 2048
@@ -248,3 +247,7 @@ fi_cuda_graph = true
 depth = 7
 # 见档头第 3 条:开启降级 + 64-token 愈合探测(m=0 时裸 decode 更快;探测命中即回 spec)
 degrade_after = 6
+
+[vision]
+# 图像前缀无感删除(leave-gap)。
+image_evict = true

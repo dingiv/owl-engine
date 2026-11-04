@@ -205,7 +205,7 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
             tags.push(T::KV_DRAFT_F16);
         }
     }
-    if cfg.model.vision {
+    if cfg.vision.enabled {
         tags.push(T::FEAT_VISION);
     }
     if cfg.parallel.mode != owl_shared::config::ParallelMode::Single {
@@ -3293,7 +3293,7 @@ mod tag_filter_tests {
         cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a16;
         cfg.model.head_quant = HeadQuant::RtnInt8Row;
-        cfg.model.vision = true;
+        cfg.vision.enabled = true;
         cfg.pool.kv_dtype = owl_shared::config::KvDtype::Fp8;
         cfg.spec.depth = 7;
         // 该门覆盖 DFlash2 草稿档；不给 draft_path 会按 MTP(F16) 派生。

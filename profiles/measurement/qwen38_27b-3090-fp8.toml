@@ -31,7 +31,6 @@ draft_path = ""
 [pool]
 kv_dtype = "fp8"
 prefix_cache = true
-image_evict = false
 # 2026-11-04 收紧:单流测量档只用 1 槽(2 槽=228MiB 白留);生产档不改。
 snap_max = 1
 host_cache_mb = 10240
@@ -41,3 +40,6 @@ vram_reserve_mb = 384
 transient_reserve_mb = 512
 # store 搬运缺口(设备面);256→64MiB。
 pool_cap_mb = 64
+
+[vision]
+image_evict = false

@@ -9,4 +9,6 @@ format = "gguf"
 quant = "q4k"
 head_quant = "off"
 # 该 GGUF 不带视觉塔（纯文本蒸馏档）
-vision = false
+
+[vision]
+enabled = false

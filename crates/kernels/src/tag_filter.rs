@@ -14,7 +14,7 @@
 //! - `model.quant=w4a16` ⇒ 允许集含 `quant.w4a16` ⇒ W4A8/GGUF 核被拒；
 //! - `pool.kv_dtype = "fp8"` ⇒ 允许集含 `kv.main.fp8` ⇒ f16 主池核被拒；
 //!   草稿池独立为 `kv.draft.*`，不会与主池 facet 混淆。
-//! - `model.vision` ⇒ 允许集含 `feat.vision` ⇒ 视觉核放行；
+//! - `[vision] enabled` ⇒ 允许集含 `feat.vision` ⇒ 视觉核放行；
 //!   未开时视觉核被拒（配置声明与实际发射不一致会响亮暴露）。
 
 use crate::spec::{KernelMeta, KernelTag, LayoutTag, EXCLUSIVE_TAG_FACETS, KERNEL_TAGS};

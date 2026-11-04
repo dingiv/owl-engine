@@ -2072,7 +2072,6 @@ impl<'a> AllocCtx<'a> {
         // `if kv_bytes_elem == 1 {…} else { dims.dtype }`,与门各说各话)
         let kv_dt = owl_models::kernel::kv_pool_dtype(plan.kv, dims.dtype);
         let kv_bytes_elem = kv_dt.size_bytes();
-        let kv_1byte = kv_dt.size_bytes() == 1;
         // 未接臂的格式**响亮拒**(e5m2 暂无核臂;不许静默按 e4m3 跑)
         for (tag, q) in [("kv", plan.kv), ("draft_kv", plan.draft_kv)] {
             if q == owl_models::env::KvQuant::Fp8E5M2 {

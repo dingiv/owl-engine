@@ -1171,7 +1171,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         if !opts.images.is_empty() {
             if self.dev.boot.vlm.is_none() {
                 return Err(ModelError::Msg(
-                    "submit: 请求带图,但本档 [model].vision != true(引擎无视觉塔)".into(),
+                    "submit: 请求带图,但本档 [vision] enabled != true(引擎无视觉塔)".into(),
                 ));
             }
             if self.boot.cfg.knobs.max_batch > 1 {
@@ -1184,7 +1184,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 实际每轮全量重灌)⇒ 提交边界**响亮拒**,不静默忽略。
             if !self.boot.cfg.knobs.image_evict && opts.images.iter().any(|i| i.evict) {
                 return Err(ModelError::Msg(
-                    "submit: 图像带 evict(可删)标记,但本档 [pool] image_evict = false\
+                    "submit: 图像带 evict(可删)标记,但本档 [vision] image_evict = false\
                          —— 要么把档位打开,要么去掉标记(不许静默忽略)"
                         .into(),
                 ));
@@ -1217,7 +1217,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             self.boot.tok.encode(&wrapped)
         };
         // **前缀无感删除的页对齐 pad 律**(2026-10-23):只对**带标记**的图像段
-        // 做(且只在 `[pool] image_evict` 开时)—— 未标记/未开档 = 逐字节旧行为。
+        // 做(且只在 `[vision] image_evict` 开时)—— 未标记/未开档 = 逐字节旧行为。
         // 产出的 `spans` 随 turn 走到收口,写回会话账(下一轮删除识别的唯一输入)。
         let (prompt_ids, img_spans, img_pads, deletion) =
             self.image_pad_law(session, raw_ids, &opts.images)?;
