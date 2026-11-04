@@ -152,3 +152,35 @@ if is_last && base > 0 && self.pool.geom.kv_int8 {
 - B（视觉 / `image_evict`）已过：sync 后无 evict 36/36、带 evict
   36/36，slope≈1.0、hit@16px 100%；`engine.rs` 的 INT8 拒启已删。
 - 文本质量门与 sync 税已闭环；转正仍待 B/视觉与更广质量集。
+
+---
+
+## 7. **更正（2026-11-04 晚）**：§3 的「W4A8 投影 GEMM 随批 T 变化」被证伪
+
+§3 把"同一 token 的 K 在不同 chunking 下 41.5% 字节不同"归因于
+**W4A8 投影 GEMM 随 prefill 批 T 变化**，并据此把"GEMM 行分块与批 T 解耦"
+排成 §4 的第一前置。**新探针实测该归因不成立**：
+
+`crates/kernels/tests/marlin_m_determinism.rs`（新增，1.5 s）：
+
+- 形状 n=5120/k=5120 与 n=34816/k=5120（27B 的真实投影面）；
+- 同一份权重、同一批激活，M ∈ {1, 8, 16, 64, 128, 256, 320, 512, 1024}，
+  以 M=2048 为基准**逐位**比对输出 half；
+- **差异 0 / 全等**，max|Δ| = 0.000000 —— 含跨 `thread_m_blocks` 档位表
+  （M≤16 走 `{128,128,256}`，M≥64 走 `{64,256,256}`，thread_k 128 vs 64）
+  与 **K-slice 分支**（M<320 时 `global_mn_tiles < gridDim.x`，走
+  `global_reduce` 部分和再相加）两条路径。
+
+原因：W4A8 的累加器是 **int32**（int16 尺度当整数乘进去），**整数加法精确且
+与顺序无关**；per-token 的 a_scale / b_scale 只在**每个输出元素**上乘一次。
+⇒ 任何 tiling / split / segment 都不会改变结果位型（只要不溢出，而生产
+a8 因子已保证不溢出）。
+
+**连带结论**：
+1. §4「W4A8 GEMM 行分块与批 T 解耦」**不必做**（做了也不会解锁什么）。
+2. 因此 **per-token K scale（+12~15% 核级）的闸门是纯精度，不是确定性**：
+   KG=1 打穿 1k 门、KG=4 打穿 8k 门（3/3 确定性），与 chunking 无关。
+   详见 `docs/devlog/kernels/int8-prefill-opt-community-2026-11-04.md` §7。
+3. §3 观察到的 41.5% K 字节差异，最可能的解释是**当时的漏 event 窗口**
+   （§6 已用末块前全设备 sync 修掉）造成的陈旧/重复 KV 写，而不是 GEMM。
+   若将来还要追这条线，先在**已修 sync 的树**上复测那份差异。
