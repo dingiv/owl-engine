@@ -71,7 +71,54 @@ impl KvQuant { pub fn kernels(self) -> Result<KvKernels, &'static str> }
 (含新门)全绿;int8 / fp8+shadow 两档实机 8k 预填 **2348.0 / 2372.4 t/s**
 (改造前 2337~2377,噪声内),decode 正常。
 
-## 3. 后续三刀(各自独立可验收)
+## 2.5 已落地（slice B）：attention 决策/执行分离（`AttnPlan`）
+
+### 改法
+
+`layers/attention.rs` 三个**纯决策函数** + 三个臂枚举，臂体原样搬进 `match`
+（不重检前置条件）：
+
+| 决策函数 | 产物 | 首选序（= 行为契约） |
+|---|---|---|
+| `plan_decode` | `DecodeArm::{Fused, Int8, BatchV2, BatchMissingFace, Paged, Naive}` | 融合插池 → int8 族 → 批 verify → 单行分页 → naive |
+| `plan_int8_prefill` | `Int8PrefillArm::{NonF16, MissingScratch, Verify, Plain}` | 结构违约 → verify 面 → 普通 |
+| `plan_prefill` | `PrefillArm::{VerifyXqa, VerifyV2, Fi, Chunked, Naive}` | XQA → v2 → FI → chunked → naive |
+
+### 效果（同文件同函数量）
+
+| 函数 | 行数 | `if` | `match` |
+|---|---:|---:|---:|
+| `forward_decl`（前 → 后） | 266 → **217** | 15 → **6** | 2 |
+| `forward_prefill_decl`（前 → 后） | 331 → **249** | 22 → **7** | 3 |
+| `plan_decode`（新） | — | 9 | 1 |
+| `plan_int8_prefill`（新） | — | 3 | 1 |
+| `plan_prefill`（新） | — | 8 | 0 |
+
+净效果：**37 个散点 `if` → 3 个纯决策函数（共 20 个门，全部单点可测）+ 3 个
+`match`**；臂体零改动（数值路径逐字不变）。
+
+### 顺带的三处定谳
+
+1. **删死分支**：`forward_prefill_decl` 里 `if is_int8() { poison("只支持 F16 激活") }`
+   在 int8 段全路径返回之后 ⇒ **不可达**，已删（-6 行）。
+2. **补一个暗道**：融合插池臂的判据原先取 `kv_paged_policy(dtype)`（不看 `paged`）
+   ⇒ legacy 直排 + `qkv_fuse` 会选到**写页池**的核（生产不可达，因为
+   `qkv_fuse` 只在 paged 档开；但决策矩阵不该有这条暗道）。决策函数里补
+   `ctx.env.kv.paged` 门。
+3. **钉住既有次序**：`force_naive_prefill` **只拦预填族（FI/chunked），不拦
+   verify 的 v2/XQA 臂** —— 单元测试把它写成断言，防未来"顺手统一"改坏。
+
+### 门与验证
+
+- 新增 `plan_decode_matrix_is_ordered_and_total`（8 条断言：融合/int8 优先/
+  批 verify/缺批面/force_naive/legacy 直排）
+- 新增 `plan_prefill_matrix_is_ordered_and_total`（9 条断言：chunked、XQA 缺面
+  落 v2、`verify_arm=fi` 跳过 v2、force_naive 语义、小几何落 naive、int8 三态）
+- `owl-models` **316 项全绿**；workspace check 0 error；
+  int8 / fp8+shadow / f16 三档实机 8k 预填 **2353.1 / 2373.1 / 2364.8 t/s**
+  （改造前 2348/2372/2361，噪声内），spec d7 的 verify 路径同轮跑通。
+
+## 3. 后续两刀(各自独立可验收)
 
 ### 3.1 attention:决策与执行分离(`AttnPlan`)
 
@@ -115,11 +162,13 @@ trait ModelSource { fn spec(&self) -> ModelSpec; fn plan(&self) -> QuantPlan;
 
 装载流程(单条)只吃 trait;格式差异(零解量化/mmap/分片键名)封在实现里。
 
-### 3.4 死臂裁决(需用户点头)
+### 3.4 死臂清理(已按用户裁决删除,2026-11-04)
 
-`paged_prefill_split_output` + `prefill_split_op` + 表里的 `prefill_split` 列:
-**删除**(≈100 行 + allow-list 3 行),或**接回**到 prefill 分派(作为
-`page=64/长 ctx` 的可选臂)。当前状态 = 退役未清账。
+`paged_prefill_split_output`(89 行)+ `KvEnv::prefill_split_op()` +
+`KvKernels.prefill_split` 列 + `supports_prefill_split` 能力谓词 —— 全部删除
+(该臂自 2026-10-19 起无调用点:FI 恒在 ⇒ split 不可达)。内核 `PrefillSplit*`
+仍注册(内核级探针在测),但**不再有层臂入口**;若将来要接回,按 §2 加一行
+`Some(..)` 即可。
 
 ## 4. 本次确认的纪律(别退化)
 

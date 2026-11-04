@@ -70,7 +70,6 @@ mod kvquant_tests {
             assert_eq!(k.prefill_paged, prefill, "{q:?} prefill");
             assert_eq!(k.decode_v2, v2, "{q:?} decode_v2");
             assert!(k.fused_insert.is_some(), "{q:?} 有融合插池臂");
-            assert!(k.prefill_split.is_some(), "{q:?} 有 split 臂");
             assert!(k.decode_v2_seq.is_some(), "{q:?} 有 v2 seq 臂");
             assert!(k.fi_prefill.is_some(), "{q:?} 走 FI");
         }
@@ -81,7 +80,6 @@ mod kvquant_tests {
         assert_eq!(k.prefill_paged, K::Int8PrefillPaged);
         assert_eq!(k.decode_v2, K::Int8DecodePaged);
         assert!(k.fused_insert.is_none(), "int8 无融合插池臂");
-        assert!(k.prefill_split.is_none(), "int8 无 split 臂");
         assert!(k.decode_v2_seq.is_none(), "int8 verify 走专用 GQA-TC 臂");
         assert!(k.fi_prefill.is_none(), "int8 不走 FI");
 
@@ -93,7 +91,6 @@ mod kvquant_tests {
             let env = KvEnv { quant: q, ..KvEnv::f16_paged() };
             let tbl = q.kernels().ok();
             assert_eq!(env.supports_fused_insert(), tbl.map(|t| t.fused_insert.is_some()).unwrap_or(false));
-            assert_eq!(env.supports_prefill_split(), tbl.map(|t| t.prefill_split.is_some()).unwrap_or(false));
             assert_eq!(env.supports_v2_seq(), tbl.map(|t| t.decode_v2_seq.is_some()).unwrap_or(false));
             assert_eq!(env.supports_fi_prefill(), tbl.map(|t| t.fi_prefill.is_some()).unwrap_or(false));
         }
@@ -160,8 +157,6 @@ pub struct KvKernels {
     pub k0_write: crate::ops::SemanticKernel,
     /// chunked paged prefill 批读。
     pub prefill_paged: crate::ops::SemanticKernel,
-    /// prefill split 读(flash-decoding)。`None` = 该格式无此臂。
-    pub prefill_split: Option<crate::ops::SemanticKernel>,
     /// v2 分页 decode 打分。
     pub decode_v2: crate::ops::SemanticKernel,
     /// verify 伪序列变体(grid.y = seqs)。`None` = 该格式走专用 verify 臂
@@ -186,7 +181,6 @@ impl KvQuant {
             KvQuant::None => Ok(KvKernels {
                 k0_write: K::K0WriteKnhd,
                 prefill_paged: K::PagedPrefillKnhd,
-                prefill_split: Some(K::PrefillSplitKnhd),
                 decode_v2: K::PagedDecodeV2Knhd,
                 decode_v2_seq: Some(K::PagedDecodeV2SeqKnhd),
                 fused_insert: Some(K::QkvNormRopeInsertKnhd),
@@ -196,7 +190,6 @@ impl KvQuant {
             KvQuant::Fp8E4M3 => Ok(KvKernels {
                 k0_write: K::K0WriteFp8Knhd,
                 prefill_paged: K::PagedPrefillFp8Knhd,
-                prefill_split: Some(K::PrefillSplitFp8kvKnhd),
                 decode_v2: K::PagedDecodeV2Fp8Knhd,
                 decode_v2_seq: Some(K::PagedDecodeV2Fp8SeqKnhd),
                 fused_insert: Some(K::QkvNormRopeInsertFp8kvKnhd),
@@ -209,7 +202,6 @@ impl KvQuant {
             KvQuant::Int8 => Ok(KvKernels {
                 k0_write: K::K0WriteInt8KOnlyKnhd,
                 prefill_paged: K::Int8PrefillPaged,
-                prefill_split: None,
                 decode_v2: K::Int8DecodePaged,
                 decode_v2_seq: None,
                 fused_insert: None,
@@ -311,14 +303,6 @@ impl KvEnv {
         self.quant.kernels_or_loud().prefill_paged
     }
 
-    /// prefill split 读(flash-decoding;fp8 池必须走 fp8kv 直读 —— f16 核
-    /// 读 e4m3 字节池 = 字节错位,2026-10-12 埋雷实录)
-    pub fn prefill_split_op(&self) -> crate::ops::SemanticKernel {
-        self.quant
-            .kernels_or_loud()
-            .prefill_split
-            .expect("本格式无 prefill split 臂(能力查询见 supports_prefill_split)")
-    }
 
     /// v2 分页 decode 打分
     pub fn decode_v2_op(&self) -> crate::ops::SemanticKernel {
@@ -369,10 +353,6 @@ impl KvEnv {
     /// 有 decode 融合插池臂?
     pub fn supports_fused_insert(&self) -> bool {
         self.quant.kernels().map(|k| k.fused_insert.is_some()).unwrap_or(false)
-    }
-    /// 有 prefill split 臂?(flash-decoding 分块)
-    pub fn supports_prefill_split(&self) -> bool {
-        self.quant.kernels().map(|k| k.prefill_split.is_some()).unwrap_or(false)
     }
     /// 有通用 v2 verify 伪序列臂?
     pub fn supports_v2_seq(&self) -> bool {

@@ -139,6 +139,60 @@ fn nb_pages(kv: &KvBuffers, dt: Dtype, shape: Vec<usize>, what: &str) -> Result<
     }
 }
 
+/// **decode 分派臂**(决策产物;2026-11-04 clean-code)。
+///
+/// 决策 = [`Self::plan_decode`](纯函数:只读 ctx/env/几何,不建节点),
+/// 执行 = 臂体原样(不重检前置条件)。新增一档 = 加一个变体 + 在
+/// `plan_decode` 的**首选序**里插一行,不必再改动 15 个 `if` 的嵌套。
+enum DecodeArm<'c> {
+    /// 融合插池(qknorm+rope+K/V 插入三合一);scratch 在场走 v2 分块
+    Fused { pol: crate::module::KvPagedPolicy, v2: Option<&'c crate::module::AttnV2Scratch> },
+    /// int8 专用族(K int8 + token-major V + 两张 scale;自带 verify 分片)
+    Int8,
+    /// 批 decode(T>1):伪序列 verify 臂(v2 scratch + v2_bt8)
+    BatchV2 { pol: crate::module::KvPagedPolicy, s2: &'c crate::module::AttnV2Scratch, bt8: &'c TensorOps },
+    /// T>1 但缺批面(scratch/bt8 不齐)⇒ 显式毒化,不许静默落单行
+    BatchMissingFace,
+    /// 单行分页(K0 写池 → v1/v2 打分)
+    Paged { pol: crate::module::KvPagedPolicy, v2: Option<&'c crate::module::AttnV2Scratch> },
+    /// 槽窗 naive(无策略 / 小几何 / force_naive 对照)
+    Naive,
+}
+
+/// **int8 prefill 臂**(决策产物;int8 走独立序:量化 Q/K 直写池,不产出
+/// f16 post-RoPE Q,故 prologue 与其它格式不同)。
+enum Int8PrefillArm<'c> {
+    /// 激活不是 f16 ⇒ 结构违约
+    NonF16,
+    /// verify 面在场但 scratch/seqs 不配 ⇒ 显式毒化(不许落按页寻址的核)
+    MissingScratch,
+    /// verify 伪序列臂(T 行各自一条页链)
+    Verify { s2: &'c crate::module::AttnV2Scratch, bt8: &'c TensorOps },
+    /// 普通 chunk prefill
+    Plain,
+}
+
+/// **prefill 臂**(非 int8 族);决策 = `plan_prefill`,执行 = 臂体。
+enum PrefillArm<'c> {
+    /// verify 臂 = XQA(q=1+K 单遍)
+    VerifyXqa {
+        pol: crate::module::KvPagedPolicy,
+        x: &'c crate::module::XqaVerifyCtx,
+    },
+    /// verify 臂 = v2 伪序列(flash-decoding 形态)
+    VerifyV2 {
+        pol: crate::module::KvPagedPolicy,
+        s2: &'c crate::module::AttnV2Scratch,
+        bt8: &'c TensorOps,
+    },
+    /// FlashInfer 主臂(prefill 面 / `verify_arm="fi"` 的 verify 面)
+    Fi { pol: crate::module::KvPagedPolicy, fi: &'c crate::module::FiPrefillCtx<'c> },
+    /// chunked_opt(读 classic 主池)
+    Chunked { pol: crate::module::KvPagedPolicy },
+    /// 逐 token naive 段(f32 锚链 / force_naive 对照 / 非分页 / 小几何)
+    Naive,
+}
+
 impl Attention {
     /// 准备容器(0.8B:hq=8, hkv=2, hd=256 → q_proj out 4096 / kv out 512;
     /// `plan` = 量化计划构造期注入,尺寸门控在 Linear 内定形)
@@ -199,6 +253,122 @@ impl Attention {
     /// 计算声明(decode;xs [T, hidden],T = ctx.tokens;C4 后回归 Module)。
     /// rope 表与 pos / KV 引用由 ctx 注入(rope 全局一份,表已是设备块);
     /// 缺任一动态依赖 → 毒值声明(eval 边界收割,与未装载槽同构)。
+    /// **decode 臂决策 —— 纯函数**(无节点、无 I/O、无 GPU ⇒ 可单测矩阵)。
+    ///
+    /// **首选序 = 行为契约**(与 2026-11-04 之前的嵌套 if 逐字等价):
+    /// 融合插池 → int8 族 → 批 verify → 单行分页 → naive。
+    /// 每条的能力门都用**能力谓词/表**(`supports_fused_insert`、
+    /// `paged_*_ok`、`scratch 在场`),不再用格式身份反推。
+    fn plan_decode<'c>(&self, ctx: &'c ForwardCtx, dt_raw: Dtype, tokens: usize) -> DecodeArm<'c> {
+        // ① 融合插池:仅 f16 有该臂(`kv_paged_policy` 只对 f16 返回 policy)
+        if let Some(pol) = crate::module::kv_paged_policy(dt_raw) {
+            if tokens == 1
+                && !ctx.env.attn.force_naive_prefill
+                && ctx.env.attn.qkv_fuse
+                // 融合核写的是**页池**(page/x 来自 policy)⇒ 非分页档不许走
+                // (2026-11-04 决策表落地时补的门:此前按 dtype 取 policy,不看
+                //  `paged`,legacy 池 + qkv_fuse 会选到写页池的核 —— 生产不可达,
+                //  但决策矩阵不该有这条暗道)
+                && ctx.env.kv.paged
+                && ctx.env.kv.supports_fused_insert()
+                && crate::ops::paged_decode_ok(self.hd, pol.page)
+            {
+                return DecodeArm::Fused { pol, v2: ctx.attn_v2.as_ref() };
+            }
+        }
+        // ② int8 族(自带 verify 分片;不分 T)
+        if ctx.env.kv.is_int8() {
+            return DecodeArm::Int8;
+        }
+        // ③ 批 decode:T>1 必须走伪序列 verify 面
+        if tokens > 1 {
+            if let Some(pol) = ctx.env.kv.policy() {
+                if crate::ops::paged_prefill_ok(self.hd, pol.page) {
+                    return match (ctx.attn_v2.as_ref(), ctx.v2_bt8) {
+                        (Some(s2), Some(bt8)) if s2.seqs == tokens => {
+                            DecodeArm::BatchV2 { pol, s2, bt8 }
+                        }
+                        _ => DecodeArm::BatchMissingFace,
+                    };
+                }
+            }
+            // 小几何/无策略 ⇒ 与单行同律往下走(历史行为)
+        }
+        // ④ 单行分页
+        if let Some(pol) = ctx.env.kv.policy() {
+            if !ctx.env.attn.force_naive_prefill && crate::ops::paged_decode_ok(self.hd, pol.page) {
+                return DecodeArm::Paged { pol, v2: ctx.attn_v2.as_ref() };
+            }
+        }
+        DecodeArm::Naive
+    }
+
+    /// **int8 prefill 臂决策**(纯函数;首选序 = 行为契约)。
+    ///
+    /// verify 面(v2_bt8 在场)必须配 `scratch.seqs == tokens`,否则显式毒化
+    /// —— 不许落回按页对齐寻址的 chunk prefill 核(会读错页链)。
+    fn plan_int8_prefill<'c>(
+        &self,
+        ctx: &'c ForwardCtx,
+        dt_raw: Dtype,
+        tokens: usize,
+    ) -> Int8PrefillArm<'c> {
+        if dt_raw != Dtype::F16 {
+            return Int8PrefillArm::NonF16;
+        }
+        if ctx.v2_bt8.is_some() {
+            return match (ctx.attn_v2.as_ref(), ctx.v2_bt8) {
+                (Some(s2), Some(bt8)) if tokens > 1 && s2.seqs == tokens => {
+                    Int8PrefillArm::Verify { s2, bt8 }
+                }
+                _ => Int8PrefillArm::MissingScratch,
+            };
+        }
+        Int8PrefillArm::Plain
+    }
+
+    /// **prefill 臂决策 —— 纯函数**。首选序(XQA → v2 → FI → chunked → naive)
+    /// 与 2026-11-04 之前的嵌套 if 逐字等价;每级的能力门都是
+    /// 「面在场 + 臂单值 + scratch 形状 + 几何谓词」,不含格式身份猜测。
+    fn plan_prefill<'c>(&self, ctx: &'c ForwardCtx, dt: Dtype, tokens: usize) -> PrefillArm<'c> {
+        let Some(pol) = crate::module::kv_paged_policy(dt) else {
+            return PrefillArm::Naive;
+        };
+        if !crate::ops::paged_prefill_ok(self.hd, pol.page) {
+            return PrefillArm::Naive;
+        }
+        let varm = ctx.env.attn.verify_arm;
+        // ① XQA(verify 臂单值;q 形状门)
+        if tokens <= 16 && matches!(varm, owl_shared::config::VerifyArm::Xqa) {
+            if let Some(x) = ctx.xqa.as_ref().filter(|x| x.q_seq_len == tokens) {
+                return PrefillArm::VerifyXqa { pol, x };
+            }
+        }
+        // ② v2 伪序列(verify 面;`fi`/`prefill` 两臂不许偷跑)
+        if tokens <= 16
+            && !matches!(
+                varm,
+                owl_shared::config::VerifyArm::Fi | owl_shared::config::VerifyArm::Prefill
+            )
+        {
+            if let (Some(s2), Some(bt8)) = (ctx.attn_v2.as_ref(), ctx.v2_bt8.as_ref()) {
+                if s2.seqs == tokens {
+                    return PrefillArm::VerifyV2 { pol, s2, bt8 };
+                }
+            }
+        }
+        if ctx.env.attn.force_naive_prefill {
+            return PrefillArm::Naive;
+        }
+        // ③ FI 主臂(`v2_bt8` 在场 = verify 图 ⇒ 仅 `verify_arm="fi"` 许走)
+        let fi_allowed = ctx.v2_bt8.is_none() || varm.uses_fi();
+        if let Some(fi) = ctx.fi.as_ref().filter(|_| fi_allowed) {
+            return PrefillArm::Fi { pol, fi };
+        }
+        // ④ chunked_opt(split 臂 2026-10-19 已退役:FI 恒在 ⇒ 不可达)
+        PrefillArm::Chunked { pol }
+    }
+
     fn forward_decl(&self, xs: &TensorOps, ctx: &ForwardCtx) -> TensorOps {
         // PF1a 分派(批P4 实装):槽/kv_len 表 [T],逐 token 窄视图 +
         // naive_attn 单发(写-打分同 launch 的跨 token 竞态 ⇒ 不批)
@@ -227,24 +397,9 @@ impl Attention {
         // 三级验证全绿 + 27B e2e 逐字一致后与 D1 同律;OWL_QKV_NO_FUSE
         // 反开关退出)→ qkv_norm_rope_insert 单发(norm+rope+KV 插入,
         // 替 norm_rope×2 + K0 三发)
-        let pol = crate::module::kv_paged_policy(dt_raw);
-        let force_naive = ctx.env.attn.force_naive_prefill;
-        // **判据链不拆**(2026-10-17 审查 §五轮):原先 `page_ok` 布尔 + 三处
-        // `pol.as_ref().unwrap()` —— "必然在场"由派生布尔维持,不是结构保证;
-        // 改成一次 `filter`,拿到 `pol` 才进分支(热路径,谓词求值一处分发)。
-        let insert_pol = pol.as_ref().filter(|p| {
-            dt_raw == Dtype::F16
-                // 融合插池核是**单行形状**(B5.1:批 decode 走下面的
-                // verify_v2_arm 自带 K0 多行写;两臂不重叠)
-                && tokens == 1
-                && !force_naive
-                && ctx.env.attn.qkv_fuse
-                // **按能力选臂**(不是按格式身份猜):没有融合插池臂的格式
-                // (int8)自然落到 K-only writer + V append 分支
-                && ctx.env.kv.supports_fused_insert()
-                && crate::ops::paged_decode_ok(self.hd, p.page)
-        });
-        if let Some(pol) = insert_pol {
+        // **臂决策一次**(纯函数;见 `plan_decode`)。臂体只跑不判。
+        let arm = self.plan_decode(ctx, dt_raw, tokens);
+        if let DecodeArm::Fused { pol, v2 } = arm {
             let page = pol.page;
             let (cos_d, sin_d) = rope.cos_sin_of(ctx);
             let gate = narrow_strided(
@@ -279,12 +434,12 @@ impl Attention {
                 .with_shape(Dtype::F16, vec![tokens, self.hq * self.hd]);
             // B 轴探针:把融合核返回的 Q(post-RoPE)挂出(缺省槽空 = 零开销)
             self.tap_q(ctx, &q);
-            // 融合分派:v2 优先( scratch 在场 → 在线 softmax 分块 + LSE
+            // 融合分派:v2 优先(scratch 在场 → 在线 softmax 分块 + LSE
             // 归并,wr = q 同款哑槽)否则 v1;均免 K0(cache 已由融合核写)
-            if let Some(v2) = ctx.attn_v2.as_ref() {
-                return self.paged_decode_v2_k0(&q, &gate, &q, kv, tokens, ctx, pol, v2);
+            if let Some(v2) = v2 {
+                return self.paged_decode_v2_k0(&q, &gate, &q, kv, tokens, ctx, &pol, v2);
             }
-            return self.paged_decode_v1(&q, &gate, kv, tokens, ctx, pol);
+            return self.paged_decode_v1(&q, &gate, kv, tokens, ctx, &pol);
         }
         let (q, gate, k) = if dt_raw == Dtype::F16 {
             // 融合:qk-norm(×(1+w))+ rotate-half partial rope 单发;
@@ -356,62 +511,28 @@ impl Attention {
         // naive decode attention(slot 直排;一线程一 (t, q_head));
         // 核名/输出 dtype 跟随 q 声明(F5 整模切换;KV cache f16)
         let dt = q.dtype;
-        if ctx.env.kv.is_int8() {
-            return self.paged_decode_int8_output(&q, &k, &v, &gate, kv, tokens, ctx);
-        }
-        // 诊断开关(OWL_FORCE_NAIVE=1):强制 naive 回退路径 —— paged 核
-        // 数值质量的 A/B 对照(2026-09-27 文本退化排查)
-        let force_naive = ctx.env.attn.force_naive_prefill;
-        // **批 decode 臂**(B5.1 M1;2026-10-20):T>1 = B 个会话各一步。
-        // 语义 = verify 的 seq 维(T 伪序列,每行一条页链 `bt8 [T,nb]`),
-        // 但 GDN 走 decode 路径的 per-row `slots[b]`(不是 varlen 块)。
-        // 显式失败:分页池 + T>1 缺批面(v2 scratch `seqs==T` + `v2_bt8`)
-        // ⇒ 毒化声明,不许落回单 seq 核读错链。
-        if tokens > 1 {
-            // 无分页策略(CPU 锚链/legacy 池)⇒ 落 `NaiveDecode` 逐行槽窗
-            // (核原生 `slots[t]/kv_lens[t]`;M0 模型门已证 T=2 ≡ 2×T=1)。
-            if let Some(pol) = ctx.env.kv.policy() {
-                // 页配对不支持的小几何(fixture hd=4 等)⇒ 与 T=1 同律回落
-                // `NaiveDecode`(逐行槽窗),**不是错误**(谓词门与单行路径同源)。
-                if crate::ops::paged_prefill_ok(self.hd, pol.page) {
-                    match (ctx.attn_v2.as_ref(), ctx.v2_bt8.as_ref()) {
-                        (Some(s2), Some(bt8)) if s2.seqs == tokens => {
-                            note_arm("attn.arm.decode.batch");
-                            return self.verify_v2_arm(
-                                &q,
-                                &k,
-                                &v,
-                                &gate,
-                                kv,
-                                tokens,
-                                ctx,
-                                &pol,
-                                &kv.slots,
-                                &kv.kv_lens,
-                                bt8,
-                                s2,
-                            );
-                        }
-                        _ => {
-                            return TensorOps::poisoned(
-                                Dtype::F32,
-                                vec![tokens, self.hq * self.hd],
-                                "attn: decode T>1 缺批面(需 attn_v2.seqs==T + v2_bt8)",
-                            )
-                        }
-                    }
-                } // if paged_prefill_ok —— 小几何回落 naive
-            } // if let Some(pol) —— 无策略 = naive 逐行
-        }
-        if let Some(pol) = ctx.env.kv.policy() {
-            // paged 分派(K1):K0 写核 + v1 分页打分(vLLM classic 布局;
-            // 页/x 来自 kv_paged_policy,块表语义见 block_tables 头注。
-            // 页配对律住 driver(attn::paged_decode_ok / resolve 内 wrapper
-            // 选择)—— 谓词门控声明,执行期 env.page 终审)
-            if !force_naive && crate::ops::paged_decode_ok(self.hd, pol.page) {
-                // 可达性:`fused_insert` 的 filter 已覆盖同谓词;防御臂(理论不可达)
-                // —— K0 形态保留以防 future 分派变化
-                // B6.2:fp8 池 → K0 转换写(f16 输入 → e4m3 池)
+        // **非融合臂**(决策已定;臂体原样,不再自检前置条件)
+        match arm {
+            DecodeArm::Fused { .. } => unreachable!("融合臂已在上面早返"),
+            DecodeArm::Int8 => return self.paged_decode_int8_output(&q, &k, &v, &gate, kv, tokens, ctx),
+            DecodeArm::BatchV2 { pol, s2, bt8 } => {
+                note_arm("attn.arm.decode.batch");
+                return self.verify_v2_arm(
+                    &q, &k, &v, &gate, kv, tokens, ctx, &pol, &kv.slots, &kv.kv_lens, bt8, s2,
+                );
+            }
+            DecodeArm::BatchMissingFace => {
+                return TensorOps::poisoned(
+                    Dtype::F32,
+                    vec![tokens, self.hq * self.hd],
+                    "attn: decode T>1 缺批面(需 attn_v2.seqs==T + v2_bt8)",
+                )
+            }
+            DecodeArm::Paged { pol, v2 } => {
+                // paged 分派(K1):K0 写核 + v1/v2 分页打分(vLLM classic 布局;
+                // 页/x 来自 kv_paged_policy,块表语义见 block_tables 头注)。
+                // 可达性:`fused_insert` 能力门已覆盖同谓词;防御臂(理论不可达)
+                // —— K0 形态保留以防 future 分派变化。
                 let k0_op = ctx.env.kv.k0_write_op();
                 let wr = TensorOps::call(k0_op)
                     .aux(&[tokens])
@@ -427,14 +548,13 @@ impl Attention {
                     .arg_i32(pol.page as i32)
                     .arg_i32(pol.x as i32)
                     .with_shape(dt, vec![1]);
-                // v2 分派(E-decode 长 ctx 衰减主修 2026-10-04):scratch
-                // 在场 → 在线 softmax 分块(v2)+ LSE 归并;None = v1 既有
-                // (存量测试/无 scratch 构造点零迁移;页配对律同源 driver)
-                if let Some(v2) = ctx.attn_v2.as_ref() {
+                // v2 分派(在线 softmax 分块 + LSE 归并;None = v1 既有)
+                if let Some(v2) = v2 {
                     return self.paged_decode_v2_k0(&q, &gate, &wr, kv, tokens, ctx, &pol, v2);
                 }
                 return self.paged_decode_v1_k0(&q, &gate, &wr, kv, tokens, ctx, &pol);
             }
+            DecodeArm::Naive => {}
         }
         let y = TensorOps::call(SemanticKernel::NaiveDecode) // 哨兵;核内有 bs 上界 guard
             .arg(&q)
@@ -1469,103 +1589,6 @@ impl Attention {
         self.o_proj.forward(&y, ctx)
     }
 
-    /// 长 ctx split attention(flash-decoding;2026-10-02;prefill 主案):
-    /// nparts = ceil(max_ctx/512) ≥ 4(max_ctx > 2048)即走;K0 写池 →
-    /// K1 分块在线 softmax(partial + (m,l) 入 scratch)→ K2 归一化合并。
-    /// 块数 ×nparts(occupancy 主升),scratch 由活性回收随 chunk 归池。
-    // 死代码豁免(2026-11-02 clippy 清理):早期 flash-decoding split prefill 的落地形态,
-    // 现役走向量 FI 核;留作回落/对照的**完整实现**,接线时直接可用(删了就只剩 git 历史)。
-    #[allow(clippy::too_many_arguments, dead_code)]
-    fn paged_prefill_split_output(
-        &self,
-        q: &TensorOps,
-        k: &TensorOps,
-        v: &TensorOps,
-        gate: &TensorOps,
-        kv: &KvBuffers,
-        tokens: usize,
-        ctx: &ForwardCtx,
-        pol: &crate::module::KvPagedPolicy,
-        kv_slots: &TensorOps,
-        nparts: usize,
-    ) -> TensorOps {
-        let dt = q.dtype;
-        let page = pol.page as i32;
-        // ① K0 批量写池(本 chunk k/v 先入池;slots [T] = 物理槽表,engine 单源)
-        // B6.2:fp8 池 → K0 转换写(env.kv.quant 单源)
-        let k0_op = ctx.env.kv.k0_write_op();
-        let wr = TensorOps::call(k0_op)
-            .aux(&[tokens])
-            .arg(&k.reshape(vec![tokens, self.hkv, self.hd]))
-            .arg(&v.reshape(vec![tokens, self.hkv, self.hd]))
-            .arg(&kv.k_cache)
-            .arg(&kv.v_cache)
-            .arg(kv_slots)
-            .arg_i32(self.hkv as i32 * self.hd as i32)
-            .arg_i32(self.hkv as i32 * self.hd as i32)
-            .arg_i32(self.hkv as i32)
-            .arg_i32(self.hd as i32)
-            .arg_i32(page)
-            .arg_i32(pol.x as i32)
-            .with_shape(dt, vec![1]); // 哑输出(契约 4)
-                                      // ② K1 分块在线 softmax(partial + (m,l) 入 scratch;wr = 树序依赖边)
-                                      //
-                                      // **契约 rank = 2**(`PrefillSplit*` 的 `scr_out` F16 r2 / `scr_stat` F32 r2;
-                                      // 见 `kernels/ops/attn.rs` 的 PARAMS)。
-                                      // 2026-10-19 修复:此处原先声明为 **r1**(一维扁平),而同一内核在
-                                      // `attention.rs` 另一条调用路(分块 prefill 的独立验径)声明的是 r2
-                                      // ⇒ **开 `prefill_split` 必撞算子准入门**:
-                                      //   `scr_out 期望 rank = 2(声明) 实得 1(线格式事实)`。
-                                      // 后果:生产主力 prefill 核在本分支上**根本开不起来** ⇒ 所有 27B
-                                      // prefill 读数都是"未开分块核"档(实测与裸档基线差 ≈ 2×)。
-                                      // 修法 = **只改声明、零新节点**(`with_shape` 就是那个口子):
-                                      // 元素数不变(`tokens·hq·nparts·hd`),仅 rank 从 1 改 2。
-        let scr_out = TensorOps::zeros(dt, vec![tokens * self.hq * nparts * self.hd])
-            .with_shape(dt, vec![tokens * self.hq * nparts, self.hd]);
-        let scr_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2])
-            .with_shape(Dtype::F32, vec![tokens * self.hq * nparts, 2]);
-        let scale = 1.0 / (self.hd as f32).sqrt();
-        // 核按 KV 池档位选(fp8 池 → fp8kv 直读;f16 核读 e4m3 字节池 = 错位雷)
-        let sp = TensorOps::call(ctx.env.kv.prefill_split_op())
-            .arg(q)
-            .arg(&kv.k_cache)
-            .arg(&kv.v_cache)
-            .arg(&kv.block_tables)
-            .arg(&scr_out)
-            .arg(&scr_stat)
-            .arg(&wr) // 树序依赖边(K0 先于分块读池;核不解引用)
-            .arg_f32(scale)
-            .arg_i32(self.hkv as i32)
-            .arg_i32(tokens as i32)
-            .arg_i32(ctx.ctx_base as i32)
-            .arg_i32(nparts as i32)
-            .arg_i32(self.hkv as i32 * self.hd as i32 * page) // kv_block_stride
-            .arg_i32(ctx.env.kv.kv_head_stride(self.hd, page)) // kv_head_stride(布局单源)
-            .arg_i32(page)
-            .arg_i32(self.hq as i32)
-            .aux(&[self.hd, self.hkv, self.hq, tokens, nparts])
-            .with_shape(dt, vec![1]); // 哑输出(真输出 = reduce)
-                                      // ③ K2 归一化合并(split 哑输出 = 树序依赖边;out [T, Hq*hd])
-        let y = TensorOps::call(SemanticKernel::PrefillSplitReduce)
-            .arg(&sp)
-            .arg(&scr_out)
-            .arg(&scr_stat)
-            .arg_i32(nparts as i32)
-            .arg_i32(self.hq as i32)
-            .arg_i32(self.hd as i32)
-            .arg_i32(tokens as i32)
-            .aux(&[tokens, self.hq])
-            .with_shape(dt, vec![tokens, self.hq * self.hd]);
-        // ④ 输出门(f16 融合单发)+ 出投影(与旧路径同)
-        let n = tokens * self.hq * self.hd;
-        let y = TensorOps::call(SemanticKernel::GateMul)
-            .arg(gate)
-            .arg(&y)
-            .arg_usize(n)
-            .with_shape(dt, vec![tokens, self.hq * self.hd]);
-        self.o_proj.forward(&y, ctx)
-    }
-
     /// FlashInfer paged prefill(E1.5;OWL_FLASHINFER=1,engine 注入
     /// ForwardCtx.fi):K0-dual 写池(classic + kHND 影子)→ FI 虚拟核
     /// (server plan 缓存 + run;FA2 级 tensor-core,causal chunked 语义
@@ -1678,8 +1701,10 @@ impl Attention {
                                               // C1 融合:同 decode 臂(norm_rope strided 直取 value 半段)
         let dt_raw = q_raw.dtype;
         // INT8 KV:NormRope 直接量化为 Q int8 / K int8 写池,跳过 Q/K 的 F16 中间。
+        // 臂 = `plan_int8_prefill`(纯函数;verify/MissingScratch/Plain 三态)。
         if ctx.env.kv.is_int8() {
-            if dt_raw != Dtype::F16 {
+            let i8arm = self.plan_int8_prefill(ctx, dt_raw, tokens);
+            if matches!(i8arm, Int8PrefillArm::NonF16) {
                 return TensorOps::poisoned(
                     Dtype::F16,
                     vec![tokens, self.hq * self.hd],
@@ -1709,22 +1734,22 @@ impl Attention {
                     .with_shape(Dtype::F16, vec![tokens, row_q]);
                 self.tap_q(ctx, &q_probe);
             }
-            // verify 图：T 行各自一条页链 + 逐行 lens。走专用 INT8 verify 臂；
-            // 缺 scratch 必须响亮毒化，不能落回按页对齐寻址的 prefill 核。
-            if let (Some(s2), Some(bt8)) = (ctx.attn_v2.as_ref(), ctx.v2_bt8.as_ref()) {
-                if tokens > 1 && s2.seqs == tokens {
+            // verify 图:T 行各自一条页链 + 逐行 lens(决策已定,臂体不重检)
+            match i8arm {
+                Int8PrefillArm::Verify { s2, bt8 } => {
                     return self.paged_verify_int8_output(
                         &q_raw, &k, &v, &gate, kv, tokens, ctx, kv_slots, kv_lens, bt8, s2,
                         &cos_d, &sin_d, pos, rope.rotary_half(),
                     );
                 }
-            }
-            if ctx.v2_bt8.is_some() {
-                return TensorOps::poisoned(
-                    Dtype::F16,
-                    vec![tokens, self.hq * self.hd],
-                    "attention int8 verify: 缺 AttnV2Scratch(seqs==tokens) 或 bt8",
-                );
+                Int8PrefillArm::MissingScratch => {
+                    return TensorOps::poisoned(
+                        Dtype::F16,
+                        vec![tokens, self.hq * self.hd],
+                        "attention int8 verify: 缺 AttnV2Scratch(seqs==tokens) 或 bt8",
+                    );
+                }
+                Int8PrefillArm::NonF16 | Int8PrefillArm::Plain => {}
             }
             return self.paged_prefill_int8_output(
                 &q_raw, &k, &v, &gate, kv, tokens, ctx, kv_slots,
@@ -1797,130 +1822,45 @@ impl Attention {
         self.tap_q(ctx, &q);
 
         let dt = q.dtype;
-        if ctx.env.kv.is_int8() {
-            return TensorOps::poisoned(
-                Dtype::F16,
-                vec![tokens, self.hq * self.hd],
-                "attention int8 prefill: 只支持 F16 激活",
-            );
-        }
-        if dt == Dtype::F16 {
-            if let Some(pol) = crate::module::kv_paged_policy(dt) {
-                // 页守卫(2026-10-01 配对律):prefill 核 bs32 特化(vendor
-                // 契约 BLOCK∈{32,64}),仅页 32 池可进;页 16 池回退 naive
-                //(bs16 prefill 实例化 = 越契约,挂账)。smem 公式的 page 项
-                // 与核 BLOCK 同源,见 paged_prefill_output
-                if crate::ops::paged_prefill_ok(self.hd, pol.page) {
-                    // verify v2 臂(§三十一;2026-10-12):T=8 大 KV 下
-                    // chunked/split/FI 三核全为延迟灾难(593ms/轮);v2 核
-                    // 8 伪序列(bill 表 = bt8)+ partition 维 = flash-
-                    // decoding 形态,grid (Hq, seqs, nparts) 并行。触发 =
-                    // ctx.v2_bt8 在(仅 verify 图)+ scratch.seqs == tokens
-                    // (防 decode/verify scratch 误配)。
-                    // 无 ctx 下限(§三十二·补订正):此前"短 ctx 半崩"的
-                    // 观测实为 chunked 老路径的崩(86ms 延迟特征),v2 探针
-                    // 已证 2-partition 形态数值正确(softcap=1.0 修正后
-                    // PASS,误差 1e-4)。全 ctx 走 v2 臂。
-                    // XQA 臂(2026-10-13 D3):kNHD fp8 池 + spec-dec q=1+K 单遍。
-                    // 语义与 v2 伪序列臂等价(因果块 [anchor, d1..dk]),但 KV 只
-                    // 读一遍 + GQA 内共享读;单算子实测 ctx8192 5.40×。
-                    // **臂 = 单值**(2026-10-21):XQA 只在 `verify_arm = "xqa"`;
-                    // 能力门(xqa 面/q 形状)不满足则**显式落下一级**(v2 →
-                    // 预填族),不是静默换臂 —— 落哪级由 boot 的 `attn.arm.verify.*`
-                    // 计数自证。
-                    let varm = ctx.env.attn.verify_arm;
-                    if tokens <= 16 && matches!(varm, owl_shared::config::VerifyArm::Xqa) {
-                        if let Some(x) = ctx.xqa.as_ref() {
-                            if x.q_seq_len == tokens {
-                                note_arm("attn.arm.verify.xqa");
-                                return self.xqa_specdec_arm(
-                                    SemanticKernel::XqaVerify,
-                                    &q,
-                                    &k,
-                                    &v,
-                                    &gate,
-                                    kv,
-                                    tokens,
-                                    ctx,
-                                    &pol,
-                                    kv_slots,
-                                    x,
-                                );
-                            }
-                        }
-                    }
-                    // v2 是 `xqa` 的**回落级**,也是 `v2` 的本臂;`fi` / `prefill`
-                    // 两臂都**不许**偷跑 v2(历史坑:`verify_v2` 缺省 true 曾把
-                    // FI 整条臂吃掉)。
-                    if tokens <= 16
-                        && !matches!(
-                            varm,
-                            owl_shared::config::VerifyArm::Fi
-                                | owl_shared::config::VerifyArm::Prefill
-                        )
-                    {
-                        if let (Some(s2), Some(bt8)) = (ctx.attn_v2.as_ref(), ctx.v2_bt8.as_ref()) {
-                            if s2.seqs == tokens {
-                                // F4(2026-10-19 审查):原为**热路径 eprintln!**(每层每轮
-                                // 无条件刷 stderr)⇒ 改臂事实计数 + debug 级日志。
-                                note_arm("attn.arm.verify.v2");
-                                owl_shared::log_debug!(
-                                    "verify-v2",
-                                    "臂触发 tokens={tokens} nparts={} nb={}",
-                                    s2.nparts,
-                                    bt8.shape().iter().product::<usize>() / s2.seqs
-                                );
-                                return self.verify_v2_arm(
-                                    &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, kv_lens,
-                                    bt8, s2,
-                                );
-                            }
-                        }
-                    }
-                    // verify_v2=false:本处落到 prefill 族(split / chunked_opt),
-                    // 即 qo_len=T 单遍形态(D3 立案 A/B 臂;见 config.rs 注释)
-                    // 诊断二分开关保留(OWL_FORCE_NAIVE_PREFILL=1 走逐 token
-                    // 对照;2026-10-01 撤销遗留的 if false 硬禁用 —— 它让
-                    // 全部 prefill 注意力落 naive 逐 token 路径)
-                    if !ctx.env.attn.force_naive_prefill {
-                        // FlashInfer prefill(E1.5;OWL_FLASHINFER=1 → engine
-                        // 注入 ForwardCtx.fi):FA2 级 tensor-core,主臂。
-                        // 门槛分派(2026-10-12 A1 定性):FI 对小 qo(T=8
-                        // verify)形状低效且随 ctx 线性放大(mt 阶梯实测
-                        // 18→36ms/tok;split 同形状平坦 ~14-17)—— 大 chunk
-                        // 走 FI 吃 tensor-core 收益(prefill −25%),小 T 回落
-                        // chunked_opt(读 classic 主池,零影子依赖)。
-                        // **FI 通吃**(原 `dispatch.fi_min_tokens` 已于 2026-10-27
-                        // 退役:缺省恒 1、所有档都是 1,已退化为常量)。
-                        // 依据:2026-10-14 单测 `fi_prefill_probe` —— FI 在
-                        // T=1/8/54/128 × ctx=3072 = 0.287/0.435/0.437/0.438 ms/层,
-                        // 而旧门槛(128)以下的回落核同形状 6.7 ms/层(FI 快 15×)。
-                        // **verify 面的 FI 由臂单值定**(2026-10-21):`verify_bt8`
-                        // 在场 = 这是 verify 图,此时只有 `verify_arm = "fi"` 才许
-                        // 走 FI;`v2`/`xqa`/`prefill` 三臂都**跳过**它(从前 FI 在
-                        // 预填族里无条件先命中 ⇒ 「关掉 v2 就自动变 FI」的暗道)。
-                        // prefill 面(v2_bt8 缺席)行为不变:FI 仍是主臂。
-                        let fi_allowed = ctx.v2_bt8.is_none() || varm.uses_fi();
-                        if let Some(fi) = ctx.fi.as_ref().filter(|_| fi_allowed) {
-                            // 同一条臂服务 prefill 与 verify;`v2_bt8` 只在 verify 图声明
-                            note_arm(if ctx.v2_bt8.is_some() {
-                                "attn.arm.verify.fi"
-                            } else {
-                                "attn.arm.prefill.fi"
-                            });
-                            return self.paged_prefill_fi_output(
-                                &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, fi,
-                            );
-                        }
-                        // (原 `prefill_split` 分块路径已退役:2026-10-19 审计定谳
-                        //  "主路走 FI,split 只在 FI 缺席时上阵",而 FI 面自
-                        //  2026-10-13 起恒在 ⇒ 分支不可达;且该核有契约 rank bug。)
-                        return self.paged_prefill_output(
-                            &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, kv_lens,
-                        );
-                    }
-                }
+        // **臂决策一次**(纯函数;首选序 XQA→v2→FI→chunked→naive)。臂体只跑不判。
+        // 原 `if is_int8() { poison }` 已删:上面的 int8 段全路径返回 ⇒ 该分支不可达
+        // (2026-11-04 clean-code 顺手清掉的死分支)。
+        match self.plan_prefill(ctx, dt, tokens) {
+            PrefillArm::VerifyXqa { pol, x } => {
+                note_arm("attn.arm.verify.xqa");
+                return self.xqa_specdec_arm(
+                    SemanticKernel::XqaVerify, &q, &k, &v, &gate, kv, tokens, ctx, &pol,
+                    kv_slots, x,
+                );
             }
+            PrefillArm::VerifyV2 { pol, s2, bt8 } => {
+                note_arm("attn.arm.verify.v2");
+                owl_shared::log_debug!(
+                    "verify-v2",
+                    "臂触发 tokens={tokens} nparts={} nb={}",
+                    s2.nparts,
+                    bt8.shape().iter().product::<usize>() / s2.seqs
+                );
+                return self.verify_v2_arm(
+                    &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, kv_lens, bt8, s2,
+                );
+            }
+            PrefillArm::Fi { pol, fi } => {
+                note_arm(if ctx.v2_bt8.is_some() {
+                    "attn.arm.verify.fi"
+                } else {
+                    "attn.arm.prefill.fi"
+                });
+                return self.paged_prefill_fi_output(
+                    &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, fi,
+                );
+            }
+            PrefillArm::Chunked { pol } => {
+                return self.paged_prefill_output(
+                    &q, &k, &v, &gate, kv, tokens, ctx, &pol, kv_slots, kv_lens,
+                );
+            }
+            PrefillArm::Naive => {}
         }
 
         // 逐 token 段:naive_attn 单发(bs=1;槽/kv_len 取表行 t 窄视图)
@@ -2012,6 +1952,194 @@ mod tests {
     use crate::tensor::Dtype;
     use crate::testkit::{f32b, harvest, Src};
     use owl_macros::owl_test;
+
+    /// **prefill 臂决策矩阵门**(2026-11-04 clean-code):与 decode 门同款 ——
+    /// 首选序 + 能力门全部钉在纯函数上,不需要 GPU。
+    #[test]
+    fn plan_prefill_matrix_is_ordered_and_total() {
+        use crate::env::{AttnEnv, EnvProvider, KvEnv};
+        use crate::module::{AttnV2Scratch, ForwardCtx};
+        use crate::tensor::Dtype;
+        use owl_shared::config::VerifyArm;
+
+        let (hq, hkv, hd, hidden) = (2usize, 1usize, 256usize, 8usize);
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
+        let rope = RopeT::new(64, hd, 2, 10_000.0).expect("rope new");
+        let pos = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&[0.0; 8]));
+        let slots = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&[0.0; 8]));
+        let lens = TensorOps::from_host(Dtype::F32, vec![8], &f32b(&[1.0; 8]));
+        let kv = KvBuffers {
+            k_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
+            v_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
+            slots: slots.clone(),
+            kv_lens: lens.clone(),
+            block_tables: TensorOps::zeros(Dtype::F32, vec![1]),
+            int8: None,
+        };
+        let scratch = |seqs: usize| AttnV2Scratch {
+            exp_sums: TensorOps::zeros(Dtype::F32, vec![1]),
+            max_logits: TensorOps::zeros(Dtype::F32, vec![1]),
+            tmp_out: TensorOps::zeros(Dtype::F32, vec![1]),
+            nparts: 4,
+            seqs,
+        };
+        let bt8 = TensorOps::zeros(Dtype::F32, vec![1]);
+        let mk = |tokens: usize| {
+            crate::module::ForwardCtx::attn_prefill(tokens, &pos, &kv, &rope, &slots, &lens)
+        };
+        macro_rules! arm_of {
+            ($c:expr, $t:expr) => {{
+                match attn.plan_prefill($c, Dtype::F16, $t) {
+                    PrefillArm::VerifyXqa { .. } => 0u8,
+                    PrefillArm::VerifyV2 { .. } => 1,
+                    PrefillArm::Fi { .. } => 2,
+                    PrefillArm::Chunked { .. } => 3,
+                    PrefillArm::Naive => 4,
+                }
+            }};
+        }
+        let (v2, chunked, naive) = (1u8, 3u8, 4u8);
+
+        // ① 无 FI 面、无 verify 面 ⇒ chunked_opt
+        let mut c = mk(8);
+        c.env = EnvProvider { kv: KvEnv::f16_paged(), ..Default::default() };
+        assert_eq!(arm_of!(&c, 8), chunked, "无面 ⇒ chunked_opt");
+
+        // ② vibverify 面(v2_bt8 + scratch.seqs==T)+ verify_arm 缺省 ⇒ v2 优先于 FI
+        c.env.attn = AttnEnv { verify_arm: VerifyArm::Xqa, ..Default::default() };
+        c.attn_v2 = Some(scratch(8));
+        c.v2_bt8 = Some(&bt8);
+        c.env.attn.verify_arm = VerifyArm::Xqa; // Xqa 但无 xqa 面 ⇒ 落 v2
+        assert_eq!(arm_of!(&c, 8), v2, "XQA 面缺 ⇒ 下一级 v2");
+
+        // ③ verify_arm = Fi ⇒ 跳过 v2
+        c.env.attn.verify_arm = VerifyArm::Fi;
+        assert_eq!(arm_of!(&c, 8), chunked, "Fi 臂但无 FI 面 ⇒ chunked(不是 v2)");
+
+        // ④ force_naive 只拦**预填族**(FI/chunked),不拦 verify 臂(v2 仍在前面;
+        //    这是 2026-11-04 之前的既有次序,决策表按原样钉住)
+        c.env.attn = AttnEnv { force_naive_prefill: true, ..Default::default() };
+        assert_eq!(arm_of!(&c, 8), v2, "force_naive 不拦 verify v2 臂");
+        //    撤掉 verify 面后,force_naive 才轮到 naive
+        c.v2_bt8 = None;
+        c.attn_v2 = None;
+        assert_eq!(arm_of!(&c, 8), naive, "force_naive + 无 verify 面 ⇒ naive");
+
+        // ⑤ 小几何(hd 不配对)⇒ naive
+        let attn_small = Attention::new(hq, hkv, 32, hidden, 1e-6, QuantPlan::F16);
+        let mut c2 = mk(8);
+        c2.env = EnvProvider { kv: KvEnv::f16_paged(), ..Default::default() };
+        assert_eq!(
+            match attn_small.plan_prefill(&c2, Dtype::F16, 8) {
+                PrefillArm::Naive => naive,
+                _ => 255,
+            },
+            naive,
+            "hd=32 不配对 ⇒ naive"
+        );
+
+        // int8 族:三态(Plain / Verify / MissingScratch / NonF16)
+        let i8arm = |c: &ForwardCtx, dt: Dtype, t: usize| {
+            match attn.plan_int8_prefill(c, dt, t) {
+                Int8PrefillArm::NonF16 => 0u8,
+                Int8PrefillArm::MissingScratch => 1,
+                Int8PrefillArm::Verify { .. } => 2,
+                Int8PrefillArm::Plain => 3,
+            }
+        };
+        let mut c3 = mk(8);
+        c3.env = EnvProvider { kv: KvEnv::int8_paged(), ..Default::default() };
+        assert_eq!(i8arm(&c3, Dtype::F16, 8), 3, "int8 普通 chunk");
+        assert_eq!(i8arm(&c3, Dtype::F32, 8), 0, "int8 非 f16 = 结构违约");
+        c3.v2_bt8 = Some(&bt8);
+        assert_eq!(i8arm(&c3, Dtype::F16, 8), 1, "verify 面缺 scratch ⇒ 毒化");
+        c3.attn_v2 = Some(scratch(8));
+        assert_eq!(i8arm(&c3, Dtype::F16, 8), 2, "verify 面齐 ⇒ int8 verify 臂");
+    }
+
+    /// **decode 臂决策矩阵门**(2026-11-04 clean-code):`plan_decode` 是纯函数
+    /// ⇒ 不需要 GPU/节点就能把「首选序 + 能力门」逐格钉住。改分派时先过本测。
+    #[test]
+    fn plan_decode_matrix_is_ordered_and_total() {
+        use crate::env::{AttnEnv, EnvProvider, KvEnv};
+        use crate::module::{AttnV2Scratch, ForwardCtx};
+        use crate::tensor::Dtype;
+
+        // 几何必须过页配对律(hd=256/page=32),否则决策合法地落 naive
+        let (hq, hkv, hd, hidden) = (2usize, 1usize, 256usize, 8usize);
+        let attn = Attention::new(hq, hkv, hd, hidden, 1e-6, QuantPlan::F16);
+        let rope = RopeT::new(64, hd, 2, 10_000.0).expect("rope new");
+        let pos = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[3.0]));
+        let slots = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[0.0]));
+        let lens = TensorOps::from_host(Dtype::F32, vec![1], &f32b(&[4.0]));
+        let kv = KvBuffers {
+            k_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
+            v_cache: TensorOps::zeros(Dtype::F32, vec![4, hkv, hd]),
+            slots: slots.clone(),
+            kv_lens: lens.clone(),
+            block_tables: TensorOps::zeros(Dtype::F32, vec![1]),
+            int8: None,
+        };
+        let scratch = |seqs: usize| AttnV2Scratch {
+            exp_sums: TensorOps::zeros(Dtype::F32, vec![1]),
+            max_logits: TensorOps::zeros(Dtype::F32, vec![1]),
+            tmp_out: TensorOps::zeros(Dtype::F32, vec![1]),
+            nparts: 4,
+            seqs,
+        };
+        let env_with = |kv_env: KvEnv, qkv_fuse: bool, force_naive: bool| EnvProvider {
+            kv: kv_env,
+            attn: AttnEnv { qkv_fuse, force_naive_prefill: force_naive, ..Default::default() },
+            ..Default::default()
+        };
+        let base = || ForwardCtx::decode(1, &pos, &kv, &rope);
+        // 只比"落哪个变体";用宏避免闭包的 lifetime 推断把 Discriminant 绑死
+        macro_rules! arm_of {
+            ($c:expr, $dt:expr, $t:expr) => {{
+                let a = attn.plan_decode($c, $dt, $t);
+                match a {
+                    DecodeArm::Fused { .. } => 0u8,
+                    DecodeArm::Int8 => 1,
+                    DecodeArm::BatchV2 { .. } => 2,
+                    DecodeArm::BatchMissingFace => 3,
+                    DecodeArm::Paged { .. } => 4,
+                    DecodeArm::Naive => 5,
+                }
+            }};
+        }
+        let (fused, int8d, batch, missing, paged, naive) = (0u8, 1u8, 2u8, 3u8, 4u8, 5u8);
+
+        // ① f16 + qkv_fuse + paged 几何 ⇒ 融合臂(scratch 在 ⇒ v2 标记)
+        let mut c = base();
+        c.env = env_with(KvEnv::f16_paged(), true, false);
+        c.attn_v2 = Some(scratch(1));
+        assert_eq!(arm_of!(&c, Dtype::F16, 1), fused, "f16 首臂 = 融合插池");
+        // 关掉 qkv_fuse ⇒ 落单行分页
+        c.env = env_with(KvEnv::f16_paged(), false, false);
+        assert_eq!(arm_of!(&c, Dtype::F16, 1), paged, "无融合 ⇒ 单行分页");
+        // ② int8 族:即便 qkv_fuse 开、scratch 在场,也不许走融合臂
+        c.env = env_with(KvEnv::int8_paged(), true, false);
+        assert_eq!(arm_of!(&c, Dtype::F16, 1), int8d, "int8 优先于融合(能力门)");
+        // int8 也优先于批 verify(T>1 仍走 int8 族自带分片)
+        assert_eq!(arm_of!(&c, Dtype::F16, 3), int8d, "int8 不分 T");
+        // ③ 批 verify:T>1 + scratch.seqs==T + bt8 ⇒ BatchV2;缺 bt8 ⇒ 显式失败
+        let bt8 = TensorOps::zeros(Dtype::F32, vec![1]);
+        let mut c = base();
+        c.env = env_with(KvEnv::f16_paged(), false, false);
+        c.attn_v2 = Some(scratch(3));
+        c.v2_bt8 = Some(&bt8);
+        assert_eq!(arm_of!(&c, Dtype::F16, 3), batch, "T>1 走伪序列 verify");
+        c.v2_bt8 = None;
+        assert_eq!(arm_of!(&c, Dtype::F16, 3), missing, "缺批面 = 显式失败");
+        // ④ 诊断对照(force_naive)⇒ naive(即使几何可用)
+        let mut c = base();
+        c.env = env_with(KvEnv::f16_paged(), true, true);
+        assert_eq!(arm_of!(&c, Dtype::F16, 1), naive, "force_naive 直落 naive");
+        // ⑤ 非 paged 池 ⇒ naive
+        let mut c = base();
+        c.env = env_with(KvEnv { paged: false, ..KvEnv::f16_paged() }, true, false);
+        assert_eq!(arm_of!(&c, Dtype::F16, 1), naive, "legacy 直排 = naive");
+    }
 
     /// **B 轴 Q 输出槽**(B-1 前置件;kvmem 卷 §8.7)声明级接线门。
     ///
