@@ -138,6 +138,9 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
     const int warp = tid >> 5;
     const int lane = tid & 31;
     if (q0 >= T) return;
+    // 本核 K 预取按 `block_table[nk]`(每块一页)寻址 ⇒ **要求 page == Bc**。
+    // 形状族已强约束(page=32),这里显式拒一次,不留"两种寻址并存"的暗门。
+    if (page != Bc) return;
 
     for (int chunk = tid; chunk < Br * (D / 16); chunk += Threads) {
         const int row = chunk / (D / 16);
@@ -165,13 +168,13 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
             kscale + (size_t)phys0 * page * Hkv * 8 + (size_t)kv_head * 8;
 #pragma unroll
         for (int j = 0; j < sg.s_iters; ++j) {
-            kscale0[sg.s_smem0 + j * (sg.s_step * Bc)] =
-                (sg.s_key < L) ? sbase[sg.s_off0 + j * sg.s_step] : 0.0f;
+            // 无条件读(页已分配,槽必在池内)+ FSEL:免掉 BSSY/条件 LDG 分支
+            const float raw = sbase[sg.s_off0 + j * sg.s_step];
+            kscale0[sg.s_smem0 + j * (sg.s_step * Bc)] = (sg.s_key < L) ? raw : 0.0f;
         }
         if (tid < Bc) {
-            vscale_s[tid] = (tid < L)
-                                ? vscale[(size_t)(phys0 * page + tid) * Hkv + kv_head]
-                                : 1.0f;
+            const float raw = vscale[(size_t)(phys0 * page + tid) * Hkv + kv_head];
+            vscale_s[tid] = (tid < L) ? raw : 1.0f;
         }
     }
     cp_commit(); cp_wait<0>(); __syncthreads();
@@ -220,7 +223,7 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
         float* kscale_s = kscale0;
         // V 预取,与 QK 重叠;K 单缓冲在 QK 完成后由下一轮 prefetch 覆盖。
         {
-            const int v_page = static_cast<int>(block_table[tile_k0 / page]);
+            const int v_page = static_cast<int>(block_table[kb]);  // page==Bc ⇒ 块号即页号
             const uint16_t* vpage =
                 vp + ((size_t)v_page * Hkv + kv_head) * D * (page / 2);
 #pragma unroll
@@ -371,27 +374,37 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
             const int phys = static_cast<int>(block_table[nk]);   // 每块只读一次
             int8_t* nks = smem + QBytes;
             const int8_t* kpage = k + (size_t)phys * page * Hkv * D + (size_t)kv_head * D;
+            // 整块都在界内(常态,>99%)走无分支快路径;只有尾块逐 chunk 判。
+            if (nk * Bc + Bc <= L) {
 #pragma unroll
-            for (int j = 0; j < sg.k_iters; ++j) {
-                int8_t* dst = nks + sg.k_smem0 + j * (sg.k_step * D);
-                const int key = sg.k_key0 + j * sg.k_step;
-                if (nk * Bc + key < L) {
-                    cp_async<16, Cache::cg>(dst, kpage + sg.k_off0 + j * (sg.k_step * Hkv * D));
-                } else {
-                    store_vec(dst, make_int4(0, 0, 0, 0));
+                for (int j = 0; j < sg.k_iters; ++j) {
+                    cp_async<16, Cache::cg>(nks + sg.k_smem0 + j * (sg.k_step * D),
+                                            kpage + sg.k_off0 + j * (sg.k_step * Hkv * D));
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < sg.k_iters; ++j) {
+                    int8_t* dst = nks + sg.k_smem0 + j * (sg.k_step * D);
+                    const int key = sg.k_key0 + j * sg.k_step;
+                    if (nk * Bc + key < L) {
+                        cp_async<16, Cache::cg>(dst,
+                                                kpage + sg.k_off0 + j * (sg.k_step * Hkv * D));
+                    } else {
+                        store_vec(dst, make_int4(0, 0, 0, 0));
+                    }
                 }
             }
             const float* sbase =
                 kscale + (size_t)phys * page * Hkv * 8 + (size_t)kv_head * 8;
 #pragma unroll
             for (int j = 0; j < sg.s_iters; ++j) {
+                const float raw = sbase[sg.s_off0 + j * sg.s_step];
                 kscale0[sg.s_smem0 + j * (sg.s_step * Bc)] =
-                    (nk * Bc + sg.s_key < L) ? sbase[sg.s_off0 + j * sg.s_step] : 0.0f;
+                    (nk * Bc + sg.s_key < L) ? raw : 0.0f;
             }
             if (tid < Bc) {
-                vscale_s[tid] = (nk * Bc + tid < L)
-                                    ? vscale[(size_t)(phys * page + tid) * Hkv + kv_head]
-                                    : 1.0f;
+                const float raw = vscale[(size_t)(phys * page + tid) * Hkv + kv_head];
+                vscale_s[tid] = (nk * Bc + tid < L) ? raw : 1.0f;
             }
             cp_commit();
         }
