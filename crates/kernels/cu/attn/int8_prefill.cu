@@ -215,16 +215,22 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
         __half* k_b16 = reinterpret_cast<__half*>(smem + QBytes);
         float* kscale_s = kscale0;
         // V 预取,与 QK 重叠;K 单缓冲在 QK 完成后由下一轮 prefetch 覆盖。
-        // token-major 源:[key, Hkv, D],每个 key 的 D 字节连续。
+        // token-major 源:[key, Hkv, D],每个 key 的 D 字节连续 ⇒ 与 K 同款
+        // **块不变量 + 常数步长**(线程 t 的相邻 chunk 只差 key += Threads/16):
+        // 每块省掉 4 次 `chunk/16` 与 4 套 64 位地址重算。
         {
             const int v_page = static_cast<int>(block_table[kb]);  // page==Bc ⇒ 块号即页号
-            for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
-                const int key = chunk / (D / 16);
-                const int off = (chunk % (D / 16)) * 16;
-                const int8_t* src =
-                    v + ((size_t)(v_page * page + key) * Hkv + kv_head) * D + off;
-                int8_t* dst = &s_vt[key * D + off];
-                cp_async<16, Cache::cg>(dst, src);
+            constexpr int VIters = (Bc * (D / 16)) / Threads;
+            constexpr int VStep = Threads / (D / 16);   // key 步长
+            const int key0 = tid / (D / 16);
+            const int off = (tid % (D / 16)) * 16;
+            const int8_t* vsrc =
+                v + ((size_t)v_page * page + key0) * Hkv * D + (size_t)kv_head * D + off;
+            int8_t* vdst = s_vt + key0 * D + off;
+#pragma unroll
+            for (int j = 0; j < VIters; ++j) {
+                cp_async<16, Cache::cg>(vdst + j * (VStep * D),
+                                        vsrc + j * (VStep * Hkv * D));
             }
         }
         cp_commit();  // V group;K[buf] already resident
