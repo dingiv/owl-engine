@@ -131,6 +131,28 @@ pub enum Command {
         ids: Vec<u64>,
         ack: Ack<Result<(), ModelError>>,
     },
+    /// **pinned host-mapped 分配**(host relay;2026-11-04)。
+    ///
+    /// 语义 = `cudaHostAlloc(MAPPED|PORTABLE)` + `cuMemHostGetDevicePointer_v2`：
+    /// 返回块句柄与 **host 地址**(供同进程对端 `host_attach`)。
+    /// 不触碰 BAR1 / P2P,故无 P2P 驱动的机器也能用；host 字节单独记账。
+    HostAlloc {
+        bytes: usize,
+        name: String,
+        ack: Ack<Result<(Bytes, u64), ModelError>>,
+    },
+    /// **attach 到已存在的 host-mapped 段**(不拥有、不 free)。
+    HostAttach {
+        host: u64,
+        bytes: usize,
+        name: String,
+        ack: Ack<Result<Bytes, ModelError>>,
+    },
+    /// **host-mapped 释放**(owner free_host;attach 只销账;图租约拒收)。
+    HostRelease {
+        ids: Vec<u64>,
+        ack: Ack<Result<(), ModelError>>,
+    },
     /// 块清零(设备侧 memset_d8;引擎 turn-open GDN 状态重置专用;
     /// E2b 增 offset_bytes = 按格重置,多会话各清各格)
     MemsetZero {
@@ -396,6 +418,9 @@ impl Command {
             Self::PeerAlloc { .. } => "peer_alloc",
             Self::PeerImport { .. } => "peer_import",
             Self::PeerRelease { .. } => "peer_release",
+            Self::HostAlloc { .. } => "host_alloc",
+            Self::HostAttach { .. } => "host_attach",
+            Self::HostRelease { .. } => "host_release",
             Self::Batch { .. } => "batch",
             Self::Close { .. } => "close",
         }
@@ -441,6 +466,9 @@ impl Command {
             Self::PeerAlloc { ack, .. } => ack.created_at(),
             Self::PeerImport { ack, .. } => ack.created_at(),
             Self::PeerRelease { ack, .. } => ack.created_at(),
+            Self::HostAlloc { ack, .. } => ack.created_at(),
+            Self::HostAttach { ack, .. } => ack.created_at(),
+            Self::HostRelease { ack, .. } => ack.created_at(),
             Self::Batch { ack, .. } => ack.created_at(),
             Self::Close { ack, .. } => ack.created_at(),
         }
@@ -628,6 +656,16 @@ pub fn envelope_of(cmd: DeviceCommand, ack: Ack<Result<Outcome, ModelError>>) ->
                 Command::Dtoh { id, want_bytes, ack: bytes_ack(ack) }
             } else {
                 Command::DtohAt { id, off_bytes, want_bytes, ack: bytes_ack(ack) }
+            }
+        }
+        DeviceCommand::CopyBlock { src, src_off_bytes, dst, dst_off_bytes, len_bytes } => {
+            Command::CopyBlock {
+                src,
+                src_off_bytes,
+                dst,
+                dst_off_bytes,
+                len_bytes,
+                ack: done_ack(ack),
             }
         }
         DeviceCommand::Launch { msg } => Command::Launch { msg, ack: buf_ack(ack) },

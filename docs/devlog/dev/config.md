@@ -56,6 +56,8 @@ $EDITOR ~/my-27b.toml          # 改 model.path / server.bind / [parallel] 卡�
   [parallel]
   mode = "single"                       # single | tensor | layer(暂未支持)
   device = ["41:00.0", "GPU-…"]         # BDF / UUID / 名字子串;"3090" 亦可
+  tp_comm = "p2p"                       # p2p(缺省)| host(无 P2P 驱动兜底;
+                                        #   host 当前只配 tp_ar = "v1")
   ```
 
   - 空列表 = 自动挑空闲卡（single 1 张 / tensor 2 张）；

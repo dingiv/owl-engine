@@ -127,6 +127,13 @@ pub struct TpCtx {
     /// ★ **barrier-only AR-2**(2026-10-23):小包 graph 专用;与 fused 同线格式,
     /// 复用 v1 produced/consumed 相对游标,单 block 去掉尾部 rendezvous。
     pub ar2: bool,
+    /// ★ **host-mapped staging 的 host 视图**(2026-11-04;0 = P2P 通道)。
+    /// 只给装配期自证/诊断直读 header 用,不参与热路径计算。
+    pub host_own: u64,
+    /// host f8 CE 的设备侧量化暂存(payload → fp8 + scales;None = P2P/raw)
+    pub host_quant: Option<crate::contract::Bytes>,
+    /// host f8 CE 的量化专用 dummy header(64B 设备块;不参与真实协议)
+    pub host_dummy: Option<crate::contract::Bytes>,
 }
 
 impl TpCtx {

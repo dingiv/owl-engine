@@ -299,6 +299,12 @@ pub fn allreduce(tp: &TpCtx, buf: &BytesView, plan: &ArPlan, out_kernels: &mut K
 | 融合核(1-stage)| ⚠️ **不可用**:L1 逐位门**间歇性失败**(§57.4)| `runtime.tp_one_stage = true`(需 `tp_ordinals`,与 `tp_push` 互斥;2026-10-21 起取代 `OWL_TP_1STAGE`) |
 | 卡对 | 3090 Ti 对 = **ord 0/1**(`Static`,BAR1 32G)· 3080 对 = **ord 2/3**(`Window`,BAR1 256M)| flavor 的 `device_ordinal` |
 | 链路 | **PCIe Gen3 x16**(D2H 13.19 / H2D 13.07 / P2P 单向 12.7 GB/s = 理论 15.75 的 81%)| — |
+| **无 P2P 兜底** | **pinned host-mapped staging**(`cudaHostAlloc MAPPED / PORTABLE`;rank0 owner / rank1 attach),复用 v1 两核与相对游标;可图回放 | `[parallel] tp_comm = "host"`(当前仅 `tp_ar = "v1"`)|
+
+> **2026-11-04 host-relay**:无 P2P 驱动的机器走 `tp_comm = "host"`;详见
+> [`host-relay-2026-11-04.md`](host-relay-2026-11-04.md)。它不替代现役 P2P;
+> release/std 下 host 比 P2P 慢约 **prefill 32% / decode 19% / TTFT 49%**。
+> copy-engine DMA stage 试过但引擎级 L1 可见性未闭合,未采用。
 
 ⚠️ **CUDA ordinal ≠ nvidia-smi 序**(CUDA 走 `FASTEST_FIRST`);把 CVD 传给 vLLM 会被它按
 `PCI_BUS_ID` 重解释 ⇒ **判据 = 双 worker 启动日志的显存容量一致**。

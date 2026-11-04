@@ -451,6 +451,9 @@ impl DeviceClient for StubFace {
                 Ok(Outcome::Buf(self.htod(dtype, &shape, &src, &name).await?))
             }
             C::Dtoh { want_bytes, .. } => Ok(Outcome::Bytes(vec![0u8; want_bytes])),
+            C::CopyBlock { .. } => Err(owl_iface::contract::ModelError::Msg(
+                "StubFace: CopyBlock 未实现(仅测试替身)".into(),
+            )),
             C::Launch { msg } => Ok(Outcome::Buf(self.launch(msg).await?)),
             C::Sync => {
                 self.sync().await?;

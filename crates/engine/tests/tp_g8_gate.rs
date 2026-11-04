@@ -51,6 +51,15 @@ fn topn_of() -> usize {
     std::env::var("OWL_G8B_TOPN").ok().and_then(|s| s.parse().ok()).unwrap_or(5)
 }
 
+/// 测试档通信通道(生产走 `[parallel] tp_comm`;测试允许 env 显式选臂)
+fn tp_comm() -> owl_shared::config::TpCommMode {
+    if std::env::var_os("OWL_TP_COMM_HOST").is_some() {
+        owl_shared::config::TpCommMode::Host
+    } else {
+        owl_shared::config::TpCommMode::P2p
+    }
+}
+
 /// 同一份档(两臂必须逐字段同参 —— 否则比的是配置不是 TP):greedy +
 /// 关前缀缓存(单请求档;快照仍开 ⇒ 快照镜像也被走到)
 // 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
@@ -59,6 +68,16 @@ fn knobs() -> EngineKnobs {
     let mut k = EngineKnobs::default();
     k.sampler_enabled = false; // 设备 argmax(逐 token 确定性)
     k.prefix_cache = false;
+    // 低层门/当前默认构建未带 nvfp4 家族:显式非通配 tag filter,避免
+    // registry 把 nvfp4 声明当孤儿(生产配置派生 filter 本来就会排除它)。
+    let ids: Vec<&str> = owl_kernels::spec::KERNEL_TAGS
+        .iter()
+        .map(|t| t.id)
+        .filter(|id| *id != "quant.nvfp4")
+        .collect();
+    k.cuda.tag_filter = owl_kernels::tag_filter::TagFilter::from_ids(&ids)
+        .expect("tag filter")
+        .with_prod_kv_layouts();
     k
 }
 
@@ -75,7 +94,19 @@ fn pf_map(prefix: &str) -> std::collections::BTreeMap<String, u64> {
 }
 
 fn cfg_of(ordinal: usize) -> EngineConfig {
-    EngineConfig { device_ordinal: ordinal, max_seq_tokens: 256, prefill_chunk: 64, knobs: knobs() }
+    // 测试例外:允许用 env 放大 prefill chunk,专门覆盖 host f8 的大包腿
+    // (0.8B 默认 64 tok ⇒ 128KiB < 256KiB 阈值,永远走不到 f8)。
+    let chunk = std::env::var("OWL_TP_PREFILL_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    let c = EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 256,
+        prefill_chunk: chunk,
+        knobs: knobs(),
+    };
+    c
 }
 
 /// 一步一采样：一个 turn 的**逐步**产物
@@ -242,6 +273,7 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
             ar_f8,
             ar_fused,
             ar2,
+            comm: tp_comm(),
         },
     )
         .await
@@ -497,6 +529,7 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
         ar_f8: flag("OWL_TP_AR_F8"),
         ar_fused: flag("OWL_TP_AR_FUSED"),
         ar2: flag("OWL_TP_AR2"),
+        comm: tp_comm(),
     };
     let tp = TpEngine::assemble_with(vec![e0, e1], vec![l0, l1], opts)
         .await

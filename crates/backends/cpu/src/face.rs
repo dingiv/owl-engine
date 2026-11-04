@@ -462,6 +462,9 @@ impl DeviceClient for CpuFace {
                 }
                 Ok(Outcome::Bytes(out))
             }
+            C::CopyBlock { .. } => Err(ModelError::Msg(
+                "CpuFace: CopyBlock 是设备块搬运,CPU 面没有设备流(拒绝)".into(),
+            )),
             C::Launch { msg } => Ok(Outcome::Buf(self.launch(msg).await?)),
             C::Sync => {
                 self.sync().await?;

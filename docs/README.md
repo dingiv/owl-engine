@@ -56,6 +56,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/comm/tp2-design.md`](devlog/comm/tp2-design.md) — TP2 construction design (commit slicing)
 - ⬜ [`devlog/comm/tp2-log.md`](devlog/comm/tp2-log.md) — TP2 war log (full construction and battle accounts)
 - ⬜ [`devlog/comm/tp2-roadmap.md`](devlog/comm/tp2-roadmap.md) — TP2 prefill/decode speedup roadmap
+- ✅ [`devlog/comm/host-relay-2026-11-04.md`](devlog/comm/host-relay-2026-11-04.md) — TP2 host-relay fallback: pinned host-mapped staging, no P2P driver, graph-capturable; gates and limits
 
 ## D. Operators and kernels
 

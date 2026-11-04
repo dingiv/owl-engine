@@ -380,6 +380,8 @@ pub struct ServerConfig {
     pub tp_vocab_split: bool,
     /// **AR 拓扑档**（parallel.tp_ar;v1|fused|ar2,2026-10-27 单键化）⇒ 交 `TpOpts`
     pub tp_ar: owl_shared::config::TpArMode,
+    /// **TP 卡间通信通道**（parallel.tp_comm;p2p|host,2026-11-04）⇒ 交 `TpOpts`
+    pub tp_comm: owl_shared::config::TpCommMode,
     /// 性能账落盘基名(--perf-dump;None = 不落盘)
     pub perf_dump: Option<PathBuf>,
     /// 性能分级(probes.perf_level,可被 --perf-level 覆盖)
@@ -503,6 +505,7 @@ impl ServerConfig {
             embed_quant: cfg.model.embed_quant,
             quant: cfg.model.quant,
             tp_ar_f8: cfg.parallel.tp_ar_f8,
+            tp_comm: cfg.parallel.tp_comm,
             tp_vocab_split: cfg.parallel.tp_vocab_split,
             tp_ar: cfg.parallel.tp_ar,
             max_concurrency: cfg.runtime.max_concurrency,

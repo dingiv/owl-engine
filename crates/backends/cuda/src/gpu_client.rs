@@ -288,6 +288,34 @@ impl GpuClient {
         self.submit(move |ack| Command::PeerRelease { ids, ack })?.await
     }
 
+    /// **pinned host-mapped 分配**(host relay;2026-11-04)。
+    /// 返回 `(块句柄, host 地址)`;host 地址交给同进程对端 [`Self::host_attach`]。
+    /// 不依赖 P2P/BAR1;分配期(建图前)调用。
+    pub async fn host_alloc(
+        &self,
+        bytes: usize,
+        name: impl Into<String>,
+    ) -> Result<(Bytes, u64), ModelError> {
+        let name = name.into();
+        self.submit(move |ack| Command::HostAlloc { bytes, name, ack })?.await
+    }
+
+    /// **attach 到已有 host-mapped 段**(不拥有、不 free;同进程/UVA)。
+    pub async fn host_attach(
+        &self,
+        host: u64,
+        bytes: usize,
+        name: impl Into<String>,
+    ) -> Result<Bytes, ModelError> {
+        let name = name.into();
+        self.submit(move |ack| Command::HostAttach { host, bytes, name, ack })?.await
+    }
+
+    /// **host-mapped 释放**(owner free_host;attach 只销账;图租约拒收)。
+    pub async fn host_release(&self, ids: Vec<u64>) -> Result<(), ModelError> {
+        self.submit(move |ack| Command::HostRelease { ids, ack })?.await
+    }
+
     /// 优雅关机:server 进入 Closing —— 排空积压(结构化拒绝)+ 设备栅栏
     /// 后线程退出。本调用回执 = 关机流程已启动并完成排空。
     pub async fn close(&self) -> Result<(), ModelError> {

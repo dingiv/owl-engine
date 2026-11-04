@@ -17,12 +17,13 @@
 use owl_cuda::comm::ar::StagingLayout;
 use owl_cuda::comm::peer::{PeerCaps, PeerPlan};
 use owl_cuda::{DeviceClient, GpuClient};
-use owl_iface::contract::{Bytes, ModelError};
+use owl_iface::contract::{Bytes, Dtype, ModelError, Shape};
 use owl_iface::handle::DeviceHandle;
 use owl_models::model::ModelSpec;
 use owl_models::module::TpCtx;
 use owl_models::plan::tp::TpPlan;
 use owl_models::tokenizer::Tokenizer;
+use owl_shared::config::TpCommMode;
 
 use crate::engine::{boot_rank, Engine, EngineConfig, RankDev};
 use crate::graph_plan::PlanOutcome;
@@ -55,6 +56,9 @@ pub struct TpOpts {
     /// 复用 v1 的 produced/consumed 相对游标 + 双槽,但去掉尾部 rendezvous、
     /// wait_done/blocks_done 与全线程 system fence。peer 只读别名即可。
     pub ar2: bool,
+    /// **卡间通信通道**(2026-11-04):`P2p` = VMM peer alias(现役);
+    /// `Host` = pinned host-mapped 中转(无 P2P 驱动兜底)。由入口显式传入。
+    pub comm: TpCommMode,
 }
 
 /// staging 的双块与布局量(布局算术单源 = `owl_cuda::comm::ar::StagingLayout` ——
@@ -71,6 +75,16 @@ pub struct TpStaging {
     ar_fused: bool,
     /// **barrier-only AR-2**(与 `TpOpts::ar2` 同值;2026-10-23)
     ar2: bool,
+    /// **host-mapped 通道**(与 `TpOpts::comm` 同值;2026-11-04)
+    host_mode: bool,
+    /// host staging 的 host 视图(base;0 = P2P)。header 初始化/诊断直读用。
+    host_own: u64,
+    /// 对端 host staging 的 host 视图(base;0 = P2P)
+    host_peer: u64,
+    /// host f8 CE 的**设备侧量化暂存**(payload → fp8 + scales;None = P2P/raw host)
+    host_quant: Option<Bytes>,
+    /// host f8 CE 的**量化专用 dummy header**(64B 设备块;不参与真实协议)
+    host_dummy: Option<Bytes>,
     pub(crate) layout: StagingLayout,
 }
 
@@ -87,9 +101,24 @@ impl TpStaging {
     pub fn slot_bytes(&self) -> u64 {
         self.layout.slot_bytes
     }
-    /// 整块字节数(= VMM 授予额度)
+    /// 整块字节数(= VMM 授予额度 / host 分配额度)
     pub fn total_bytes(&self) -> u64 {
         self.layout.total_bytes()
+    }
+
+    /// 是否 host-mapped 通道
+    pub fn host_mode(&self) -> bool {
+        self.host_mode
+    }
+
+    /// 本端 host 视图(0 = P2P)
+    pub fn host_own(&self) -> Option<u64> {
+        (self.host_own != 0).then_some(self.host_own)
+    }
+
+    /// 对端 host 视图(0 = P2P)
+    pub fn host_peer(&self) -> Option<u64> {
+        (self.host_peer != 0).then_some(self.host_peer)
     }
 
     fn ctx(&self, plan: TpPlan) -> TpCtx {
@@ -101,6 +130,9 @@ impl TpStaging {
             ar_f8: self.ar_f8,
             ar_fused: self.ar_fused,
             ar2: self.ar2,
+            host_own: self.host_own,
+            host_quant: self.host_quant.clone(),
+            host_dummy: self.host_dummy.clone(),
         }
     }
 }
@@ -137,9 +169,16 @@ async fn init_staging_header<D: DeviceClient>(
     face: &mut D,
     own: &Bytes,
     layout: StagingLayout,
+    host: Option<u64>,
     tag: &str,
 ) -> Result<()> {
     let n = owl_cuda::comm::ar::HEADER_BYTES as usize;
+    // host-mapped:CPU 直接写 host 段(建图之前;无 H2D/无流序)
+    if let Some(h) = host {
+        let b = staging_header_bytes(layout);
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), h as *mut u8, n) };
+        return Ok(());
+    }
     let mut pin = face.alloc_pinned(n, tag).await?;
     // ⚠️ 租约是**池化区域**(容量 ≥ 请求)⇒ 只写前 n 字节
     pin.slice_bytes_mut()[..n].copy_from_slice(&staging_header_bytes(layout));
@@ -148,10 +187,18 @@ async fn init_staging_header<D: DeviceClient>(
 }
 
 /// 读回 header(装配后自证用)
-async fn read_staging_header<D: DeviceClient>(face: &mut D, own: &Bytes) -> Result<[u8; 64]> {
+async fn read_staging_header<D: DeviceClient>(
+    face: &mut D,
+    own: &Bytes,
+    host: Option<u64>,
+) -> Result<[u8; 64]> {
+    let mut out = [0u8; 64];
+    if let Some(h) = host {
+        unsafe { std::ptr::copy_nonoverlapping(h as *const u8, out.as_mut_ptr(), out.len()) };
+        return Ok(out);
+    }
     let mut buf = vec![0u8; owl_cuda::comm::ar::HEADER_BYTES as usize];
     face.dtoh(own, &mut buf).await?;
-    let mut out = [0u8; 64];
     out.copy_from_slice(&buf);
     Ok(out)
 }
@@ -288,8 +335,22 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         let plan1 = TpPlan::new(1, world).map_err(ModelError::Msg)?;
         // ── staging header 初始化(**建图之前**;漏了 = 核 err=3 空转)──
         let (mut face0, mut face1) = (face0, face1);
-        init_staging_header(&mut face0, staging0.own(), staging0.layout, "tp.hdr.r0").await?;
-        init_staging_header(&mut face1, staging1.own(), staging1.layout, "tp.hdr.r1").await?;
+        init_staging_header(
+            &mut face0,
+            staging0.own(),
+            staging0.layout,
+            staging0.host_own(),
+            "tp.hdr.r0",
+        )
+        .await?;
+        init_staging_header(
+            &mut face1,
+            staging1.own(),
+            staging1.layout,
+            staging1.host_own(),
+            "tp.hdr.r1",
+        )
+        .await?;
         let ctx0 = staging0.ctx(plan0);
         let ctx1 = staging1.ctx(plan1);
         // **池前 live 基线**(per-device!2026-10-24):每 rank 读自己的 account
@@ -321,7 +382,12 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
             let Some(mut f) = dev.graphs.face_clone() else {
                 return loud(format!("TP rank{i} 装配后 face 句柄耗尽"));
             };
-            let h = read_staging_header(&mut f, &tp_ctx.own).await?;
+            let h = read_staging_header(
+                &mut f,
+                &tp_ctx.own,
+                (tp_ctx.host_own != 0).then_some(tp_ctx.host_own),
+            )
+            .await?;
             let produced = u64::from_le_bytes(h[0..8].try_into().unwrap());
             let consumed = u64::from_le_bytes(h[8..16].try_into().unwrap());
             let err = u32::from_le_bytes(h[28..32].try_into().unwrap());
@@ -453,28 +519,47 @@ impl TpEngine<GpuClient> {
             ));
         }
         let (oa, ob) = (engines[0].device_ordinal(), engines[1].device_ordinal());
-        let caps = [probe_caps_pair(oa, ob)?];
-        let (caps0, caps1) = (caps[0].0.clone(), caps[0].1.clone());
-        if caps0.uuid == caps1.uuid {
+        // host CE-push:数据目标偏移必须**主机侧可知** ⇒ 固定单槽(slot 0)。
+        // P2P 保持双槽乒乓(数据目标由设备侧 produced 决定)。
+        let layout = if opts.comm == TpCommMode::Host {
+            StagingLayout::new(StagingLayout::default_layout().slot_bytes, 1)
+        } else {
+            StagingLayout::default_layout()
+        };
+        let (uuid0, uuid1) = if opts.comm == TpCommMode::Host {
+            let (u0, u1) = probe_uuids_pair(oa, ob)?;
+            owl_shared::log_info!(
+                "tp",
+                "TP2 通信通道 = host(pinned mapped)‖ staging {}/rank = {}×{}MiB + {}B header \
+                 —— 跳过 BAR1/P2P 分档",
+                layout.total_bytes() >> 20,
+                layout.slots,
+                layout.slot_bytes >> 20,
+                owl_cuda::comm::ar::HEADER_BYTES,
+            );
+            (u0, u1)
+        } else {
+            let (caps0, caps1) = probe_caps_pair(oa, ob)?;
+            // ── ① 分档:混插/不支持 ⇒ 响亮拒(D5);额度 = staging 总额 ──────
+            let plan = PeerPlan::plan(&caps0, &caps1, layout.total_bytes())
+                .map_err(|e| ModelError::Msg(format!("TP 分档被拒:{e}")))?;
+            owl_shared::log_info!(
+                "tp",
+                "TP2 分档:{:?}(单笔上限 {}MiB)‖ staging {}/rank = {}×{}MiB + {}B header",
+                plan.mechanism,
+                plan.per_alloc_limit >> 20,
+                layout.total_bytes() >> 20,
+                layout.slots,
+                layout.slot_bytes >> 20,
+                owl_cuda::comm::ar::HEADER_BYTES,
+            );
+            (caps0.uuid.clone(), caps1.uuid.clone())
+        };
+        if uuid0 == uuid1 {
             return loud(format!(
-                "TP 两侧是同一张卡({}) —— 双 rank 协议无意义(请给两张卡)",
-                caps0.uuid
+                "TP 两侧是同一张卡({uuid0}) —— 双 rank 协议无意义(请给两张卡)"
             ));
         }
-        // ── ① 分档:混插/不支持 ⇒ 响亮拒(D5);额度 = staging 总额 ──────
-        let layout = StagingLayout::default_layout();
-        let plan = PeerPlan::plan(&caps0, &caps1, layout.total_bytes())
-            .map_err(|e| ModelError::Msg(format!("TP 分档被拒:{e}")))?;
-        owl_shared::log_info!(
-            "tp",
-            "TP2 分档:{:?}(单笔上限 {}MiB)‖ staging {}/rank = {}×{}MiB + {}B header",
-            plan.mechanism,
-            plan.per_alloc_limit >> 20,
-            layout.total_bytes() >> 20,
-            layout.slots,
-            layout.slot_bytes >> 20,
-            owl_cuda::comm::ar::HEADER_BYTES,
-        );
         // ── ② staging 对称握手(**建图之前**)───────────────────────────
         let mut it = engines.into_iter();
         let (face0, cfg, cell0, boot0) = it.next().expect("world = 2 已守门").into_parts();
@@ -501,7 +586,13 @@ impl TpEngine<GpuClient> {
             })?;
         owl_shared::log_info!("tp", "事件账:两 rank 合流到同一本(rank 维区分卡)");
         let (staging0, staging1) =
-            handshake_staging(&mut face0, &mut face1, &caps0.uuid, &caps1.uuid, layout, opts).await?;
+            handshake_staging(&mut face0, &mut face1, &uuid0, &uuid1, layout, opts).await?;
+        if let (Some(own), Some(peer)) = (staging0.host_own(), staging0.host_peer()) {
+            owl_shared::log_info!(
+                "tp",
+                "host staging rank0: own={own:#x} peer={peer:#x}(rank1 镜像 attach)"
+            );
+        }
         // ── ③ 通用装配(每 rank boot_rank;图捕获在此发生)──────────────
         let engines = vec![
             Engine::from_handle(cfg.clone(), face0, cell0.clone(), boot0)
@@ -583,18 +674,31 @@ impl TpEngine<GpuClient> {
             .await
     }
 
-    /// **收尾**:先卸图(图租约钉住 staging ⇒ 必须先销毁图),再 `PeerRelease`
-    /// 释放 staging 双块(own = 分配块,peer = 别名块;D2 全有或全无)。
+    /// **收尾**:先卸图(图租约钉住 staging ⇒ 必须先销毁图),再
+    /// `PeerRelease` / `HostRelease` 释放 staging 双块(own = 分配块,
+    /// peer = 别名/attach 块;D2 全有或全无)。
     /// 失败不短路(全量尝试;首错上抛)。
     ///
     /// ⚠️ 收尾面是 **GpuClient 特化**(`peer_release` 是 GpuClient 固有方法,
     /// 不在 `DeviceClient` trait 上)—— 见本块位置。
     pub async fn shutdown(mut self) -> Result<()> {
         let mut first: Option<ModelError> = None;
-        for (i, r) in self.ranks.iter_mut().enumerate() {
-            if let Some(e) = retire_rank(&mut r.dev, &format!("rank{i}")).await {
-                if first.is_none() {
-                    first = Some(e);
+        // host 通道的 owner 在 rank0;必须先收 rank1 的 attach,再 free owner。
+        let host = self.ranks.iter().any(|r| r.staging.host_mode());
+        if host {
+            for i in (0..self.ranks.len()).rev() {
+                if let Some(e) = retire_rank(&mut self.ranks[i].dev, &format!("rank{i}")).await {
+                    if first.is_none() {
+                        first = Some(e);
+                    }
+                }
+            }
+        } else {
+            for (i, r) in self.ranks.iter_mut().enumerate() {
+                if let Some(e) = retire_rank(&mut r.dev, &format!("rank{i}")).await {
+                    if first.is_none() {
+                        first = Some(e);
+                    }
                 }
             }
         }
@@ -605,12 +709,13 @@ impl TpEngine<GpuClient> {
     }
 }
 
-/// **单 rank 收尾**(卸图 → `PeerRelease` 双块;装配态与执行态共用):
+/// **单 rank 收尾**(卸图 → `PeerRelease` / `HostRelease` 双块;装配态与执行态共用):
 /// 图租约钉住 staging ⇒ **必须先销毁整族图**;失败**不短路**(记录首错,
 /// 继续走 PeerRelease —— 调用方的多 rank 循环才做"全量尝试")。
 /// 返回 `None` = 干净;`Some(err)` = 首错(已告警)。
 ///
-/// `GpuClient` 特化:`peer_release` 是 GpuClient 固有方法(非 trait 面)。
+/// `GpuClient` 特化:`peer_release` / `host_release` 是 GpuClient 固有方法
+/// (非 trait 面)。
 async fn retire_rank(
     dev: &mut RankDev<DeviceHandle<GpuClient>>,
     tag: &str,
@@ -636,12 +741,35 @@ async fn retire_rank(
                 &mut first,
             ),
             Some(tp) => {
+                // host f8 CE 的设备侧 scratch/dummy 是普通 Owned 块,
+                // 图族已关 ⇒ 先走普通 Free(失败不阻断 host 段收尾)。
+                let mut dev_ids = Vec::new();
+                if let Some(q) = tp.host_quant.as_ref() {
+                    dev_ids.push(q.id);
+                }
+                if let Some(d) = tp.host_dummy.as_ref() {
+                    dev_ids.push(d.id);
+                }
+                if !dev_ids.is_empty() {
+                    // raw GpuClient 分配(绕开 DeviceHandle 块池/事件账)⇒ 原路 raw 释放
+                    if let Err(e) = face.client_mut().free(&dev_ids).await {
+                        note(
+                            ModelError::Msg(format!("{tag} host f8 scratch 释放失败:{e}")),
+                            &mut first,
+                        );
+                    }
+                }
                 // staging 两块(own + peer 别名)
                 let ids = vec![tp.own.id, tp.peer.id];
-                // peer 面不经 `DeviceClient`(自成命令族)⇒ 走可变直通口
+                // peer/host 面不经 `DeviceClient`(自成命令族)⇒ 走可变直通口
                 // (设计卷 §六 白名单:peer_* 指令;**这些块不入事件账** —— 见 §十二 步 3 注)
-                if let Err(e) = face.client_mut().peer_release(ids).await {
-                    note(ModelError::Msg(format!("{tag} PeerRelease 失败:{e}")), &mut first);
+                let released = if tp.host_own != 0 {
+                    face.client_mut().host_release(ids).await.map(|_| "HostRelease")
+                } else {
+                    face.client_mut().peer_release(ids).await.map(|_| "PeerRelease")
+                };
+                if let Err(e) = released {
+                    note(ModelError::Msg(format!("{tag} staging 释放失败:{e}")), &mut first);
                 }
             }
         },
@@ -659,7 +787,13 @@ async fn staging_state_of(dev: &mut RankDev<DeviceHandle<GpuClient>>) -> Result<
         return loud("TP staging: face 句柄耗尽");
     };
     let mut buf = [0u8; 32];
-    f.dtoh(&tp.own, &mut buf).await?;
+    if tp.host_own != 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(tp.host_own as *const u8, buf.as_mut_ptr(), buf.len())
+        };
+    } else {
+        f.dtoh(&tp.own, &mut buf).await?;
+    }
     Ok((
         u64::from_le_bytes(buf[0..8].try_into().unwrap()),
         u64::from_le_bytes(buf[8..16].try_into().unwrap()),
@@ -694,13 +828,33 @@ impl RunningEngine<DeviceHandle<GpuClient>> {
             return loud("shutdown_tp: 本引擎不是 TP 态(无 peer 束;单卡请走 Drop)");
         }
         let mut first: Option<ModelError> = None;
-        if let Some(e) = retire_rank(&mut self.dev, "rank0").await {
-            first = Some(e);
-        }
-        if let Some(peer) = self.peer.as_mut() {
-            if let Some(e) = retire_rank(peer, "rank1").await {
+        let host = self
+            .dev
+            .boot
+            .tp
+            .as_ref()
+            .is_some_and(|tp| tp.host_own != 0);
+        if host {
+            // host owner 在 rank0:先收 rank1 的 attach
+            if let Some(peer) = self.peer.as_mut() {
+                if let Some(e) = retire_rank(peer, "rank1").await {
+                    first = Some(e);
+                }
+            }
+            if let Some(e) = retire_rank(&mut self.dev, "rank0").await {
                 if first.is_none() {
                     first = Some(e);
+                }
+            }
+        } else {
+            if let Some(e) = retire_rank(&mut self.dev, "rank0").await {
+                first = Some(e);
+            }
+            if let Some(peer) = self.peer.as_mut() {
+                if let Some(e) = retire_rank(peer, "rank1").await {
+                    if first.is_none() {
+                        first = Some(e);
+                    }
                 }
             }
         }
@@ -728,6 +882,149 @@ async fn handshake_staging(
     let face0 = face0.client_mut();
     let face1 = face1.client_mut();
     let bytes = layout.total_bytes() as usize;
+
+    // ── host-mapped 兜底通道(2026-11-04)────────────────────────────────
+    //
+    // 两段 host staging 都由 rank0 的 actor 分配(owner 记账在 rank0),
+    // rank1 只 attach(不拥有、不 free)。rank0 own=H0 / peer=H1;
+    // rank1 own=H1 / peer=H0。这样 shutdown 时先收 rank1 的 attach,再收
+    // rank0 的 owner,host 段生命周期严格覆盖两份账。
+    if opts.comm == TpCommMode::Host {
+        if layout.slots != 1 {
+            return loud(format!(
+                "host CE-push staging 需要 n_slots = 1(实得 {});\
+                 多槽的 slot 偏移由设备侧 produced 决定,主机侧无法烘进 CopyBlock",
+                layout.slots
+            ));
+        }
+        if opts.ar_f8 {
+            owl_shared::log_info!(
+                "tp",
+                "host CE-push f8:device quant scratch → CE 搬紧凑 fp8 载荷 → 本地 host reduce 反量化"
+            );
+        }
+        let (own0, h0) = face0
+            .host_alloc(bytes, "tp.host.r0")
+            .await
+            .map_err(|e| ModelError::Msg(format!("TP host staging 分配失败(rank0/H0):{e}")))?;
+        let (own1, h1) = match face0.host_alloc(bytes, "tp.host.r1").await {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(er) = face0.host_release(vec![own0.id]).await {
+                    owl_shared::log_warn!("tp", "host staging 回滚 H0 失败: {er}");
+                }
+                return Err(ModelError::Msg(format!(
+                    "TP host staging 分配失败(rank0/H1):{e}"
+                )));
+            }
+        };
+        let p0 = match face1.host_attach(h1, bytes, "tp.host.own.r1").await {
+            Ok(b) => b,
+            Err(e) => {
+                if let Err(er) = face0.host_release(vec![own0.id, own1.id]).await {
+                    owl_shared::log_warn!("tp", "host staging 回滚 H0/H1 失败: {er}");
+                }
+                return Err(ModelError::Msg(format!(
+                    "TP host staging attach 失败(rank1 ← H1):{e}"
+                )));
+            }
+        };
+        let p1 = match face1.host_attach(h0, bytes, "tp.host.peer.r1").await {
+            Ok(b) => b,
+            Err(e) => {
+                if let Err(er) = face1.host_release(vec![p0.id]).await {
+                    owl_shared::log_warn!("tp", "host staging 回滚 attach H1 失败: {er}");
+                }
+                if let Err(er) = face0.host_release(vec![own0.id, own1.id]).await {
+                    owl_shared::log_warn!("tp", "host staging 回滚 H0/H1 失败: {er}");
+                }
+                return Err(ModelError::Msg(format!(
+                    "TP host staging attach 失败(rank1 ← H0):{e}"
+                )));
+            }
+        };
+        // host f8 CE 的可选设备侧臂:payload 先量化进本端 device scratch,
+        // 再由 CE 把 fp8 载荷(约 0.515×)搬到对端 host。dummy header 让
+        // 现役 stage f8 核可以只做“量化+写 device”,不触碰真实 produced。
+        let (host_quant0, host_dummy0) = if opts.ar_f8 {
+            let q = face0
+                .alloc_uninit(
+                    Dtype::U8,
+                    (layout.slot_bytes + owl_cuda::comm::ar::HEADER_BYTES) as usize,
+                    "tp.host.quant.r0",
+                )
+                .await
+                .map_err(|e| ModelError::Msg(format!("TP host f8 quant scratch 分配失败(rank0):{e}")))?;
+            let d = face0
+                .htod(
+                    Dtype::U8,
+                    &Shape::from(vec![owl_cuda::comm::ar::HEADER_BYTES as usize]),
+                    &staging_header_bytes(StagingLayout::new(0, 1)),
+                    "tp.host.dummy.r0",
+                )
+                .await
+                .map_err(|e| ModelError::Msg(format!("TP host f8 dummy header 写入失败(rank0):{e}")))?;
+            (Some(q.view(Dtype::U8, 1)), Some(d))
+        } else {
+            (None, None)
+        };
+        let (host_quant1, host_dummy1) = if opts.ar_f8 {
+            let q = face1
+                .alloc_uninit(
+                    Dtype::U8,
+                    (layout.slot_bytes + owl_cuda::comm::ar::HEADER_BYTES) as usize,
+                    "tp.host.quant.r1",
+                )
+                .await
+                .map_err(|e| ModelError::Msg(format!("TP host f8 quant scratch 分配失败(rank1):{e}")))?;
+            let d = face1
+                .htod(
+                    Dtype::U8,
+                    &Shape::from(vec![owl_cuda::comm::ar::HEADER_BYTES as usize]),
+                    &staging_header_bytes(StagingLayout::new(0, 1)),
+                    "tp.host.dummy.r1",
+                )
+                .await
+                .map_err(|e| ModelError::Msg(format!("TP host f8 dummy header 写入失败(rank1):{e}")))?;
+            (Some(q.view(Dtype::U8, 1)), Some(d))
+        } else {
+            (None, None)
+        };
+        owl_shared::log_info!(
+            "tp",
+            "TP2 通信通道 = host(pinned mapped;rank0 H0={h0:#x}/H1={h1:#x};无需 P2P;f8={})",
+            if opts.ar_f8 { "CE quant" } else { "raw" }
+        );
+        return Ok((
+            TpStaging {
+                own: own0,
+                peer: own1,
+                ar_f8: opts.ar_f8,
+                ar_fused: false,
+                ar2: false,
+                host_mode: true,
+                host_own: h0,
+                host_peer: h1,
+                host_quant: host_quant0,
+                host_dummy: host_dummy0,
+                layout,
+            },
+            TpStaging {
+                own: p0,
+                peer: p1,
+                ar_f8: opts.ar_f8,
+                ar_fused: false,
+                ar2: false,
+                host_mode: true,
+                host_own: h1,
+                host_peer: h0,
+                host_quant: host_quant1,
+                host_dummy: host_dummy1,
+                layout,
+            },
+        ));
+    }
+
     let (own0, cred0) = face0
         .peer_alloc(bytes, "tp.staging.r0")
         .await
@@ -748,13 +1045,52 @@ async fn handshake_staging(
         .await
         .map_err(|e| ModelError::Msg(format!("TP staging 导入失败(rank1 ← rank0):{e}")))?;
     Ok((
-        TpStaging { own: own0, peer: p0, ar_f8: opts.ar_f8, ar_fused: opts.ar_fused, ar2: opts.ar2, layout },
-        TpStaging { own: own1, peer: p1, ar_f8: opts.ar_f8, ar_fused: opts.ar_fused, ar2: opts.ar2, layout },
+        TpStaging {
+            own: own0,
+            peer: p0,
+            ar_f8: opts.ar_f8,
+            ar_fused: opts.ar_fused,
+            ar2: opts.ar2,
+            host_mode: false,
+            host_own: 0,
+            host_peer: 0,
+            host_quant: None,
+            host_dummy: None,
+            layout,
+        },
+        TpStaging {
+            own: own1,
+            peer: p1,
+            ar_f8: opts.ar_f8,
+            ar_fused: opts.ar_fused,
+            ar2: opts.ar2,
+            host_mode: false,
+            host_own: 0,
+            host_peer: 0,
+            host_quant: None,
+            host_dummy: None,
+            layout,
+        },
     ))
 }
 
 /// 一对 ordinal 的 peer 能力(驱动枚举 UUID + nvidia-smi BAR1 +
 /// `cuDeviceCanAccessPeer` 双向)。
+fn probe_uuids_pair(a: usize, b: usize) -> Result<(String, String)> {
+    let rows = owl_cuda::ffi::device_rows()
+        .map_err(|e| ModelError::Msg(format!("TP 探测:设备枚举失败 {e}")))?;
+    let row_of = |o: usize| -> Result<&owl_shared::device::DeviceRow> {
+        rows.iter().find(|r| r.ordinal == o).ok_or_else(|| {
+            ModelError::Msg(format!("TP 探测:ordinal {o} 不在设备表(共 {} 张)", rows.len()))
+        })
+    };
+    let (ra, rb) = (row_of(a)?, row_of(b)?);
+    Ok((
+        owl_shared::device::uuid_norm(&ra.uuid),
+        owl_shared::device::uuid_norm(&rb.uuid),
+    ))
+}
+
 fn probe_caps_pair(a: usize, b: usize) -> Result<(PeerCaps, PeerCaps)> {
     let rows = owl_cuda::ffi::device_rows()
         .map_err(|e| ModelError::Msg(format!("TP 探测:设备枚举失败 {e}")))?;

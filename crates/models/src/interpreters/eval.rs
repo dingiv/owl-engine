@@ -24,6 +24,31 @@ use super::planner::BlockPool;
 /// 256KiB 覆盖 verify/propose,且远小于 prefill chunk(1.3MB)。
 const TP_AR2_MAX_BYTES: usize = 256 * 1024;
 
+/// host CE-push 的 fp8 紧凑载荷字节数(`[q n_elems B][scales ng×f16]`)。
+///
+/// 与 `cu/comm/ar_stage.cu` 的 `OWL_AR_FP8_SC_OFF` 同式:尺度区从**偶对齐**
+/// 的元素字节偏移开始;本函数只用于 CE 搬运长度,不重写核内布局。
+fn host_f8_compact_bytes(n_bytes: usize, dtype: Dtype) -> Result<usize, ModelError> {
+    let w = dtype.size_bytes();
+    if !matches!(dtype, Dtype::F16 | Dtype::BF16) || w == 0 {
+        return Err(ModelError::Msg(format!(
+            "host CE fp8: 载荷 dtype 必须是 F16/BF16(实得 {dtype:?})"
+        )));
+    }
+    let n = n_bytes / w;
+    let sc_off = (n + 1) & !1;
+    let ng = n.div_ceil(64);
+    let total = sc_off.checked_add(ng * 2).ok_or_else(|| {
+        ModelError::Msg(format!("host CE fp8: 紧凑长度溢出(n={n}, ng={ng})"))
+    })?;
+    if total > n_bytes {
+        return Err(ModelError::Msg(format!(
+            "host CE fp8: 紧凑载荷 {total}B > 原载荷 {n_bytes}B(布局异常)"
+        )));
+    }
+    Ok(total)
+}
+
 // ============================================================================
 // §0 性能钩子(perf-framework.md §四)
 // ============================================================================
@@ -1181,9 +1206,91 @@ where
                     // 令牌** —— 把它们搬到对端会让 15 个 block 紧自旋**远端读**,实测把
                     // AR 从 601µs 拉到 1225µs(§36.8)。协议(credit/produced/rendezvous)
                     // 在两种绑法下都成立(推导见 §36.6)。
-                    // 数据块:v1 恒为"stage 写本端槽 → reduce 读对端槽"
-                    // (push 档已退役;AR-2 / fused 各自显式传槽)
-                    let (stage_data, reduce_data) = (tp.own.clone(), tp.peer.clone());
+                    // 数据块:v1 = stage 写本端槽 → reduce 读对端槽;
+                    // host CE-push = stage 写**对端** host 槽 → reduce 读**本端**
+                    // host 槽(消费者读本地 pinned 内存,避免对端 GPU 直接读
+                    // 另一张卡 CE 写出的 host 段 —— 2026-11-04 的可见性坑)。
+                    let host_push = tp.host_own != 0;
+                    let (stage_data, reduce_data) = if host_push {
+                        (tp.peer.clone(), tp.own.clone())
+                    } else {
+                        (tp.own.clone(), tp.peer.clone())
+                    };
+                    // host CE stage:payload 先由 copy engine D2H 到对端 host
+                    // 槽(13 GB/s 级),随后 stage 核只用 16B 幂等写发布 produced。
+                    // 单槽布局(host handshake 强制 slots=1)⇒ slot 偏移固定 64。
+                    //
+                    // fp8 档(host_f8):先在本端 device scratch 上量化(现役
+                    // stage f8 核 + dummy header),再 CE 搬约 0.515× 的紧凑
+                    // 载荷;reduce 读本地 host 并反量化。这样 CE 与 host 读都
+                    // 减半,且不改变真实 produced/consumed 的发布序。
+                    let host_f8 = host_push
+                        && tp.ar_f8
+                        && n_bytes >= 262_144
+                        && matches!(dtype, Dtype::F16 | Dtype::BF16);
+                    let (stage_local, copy_len) = if host_push {
+                        owl_shared::metrics::with_metrics_store(|s| {
+                            s.counter_add("tp.ar.host_push", 1, file!(), line!())
+                        });
+                        if host_f8 {
+                            owl_shared::metrics::with_metrics_store(|s| {
+                                s.counter_add("tp.ar.host_f8", 1, file!(), line!())
+                            });
+                            let q = tp.host_quant.as_ref().ok_or_else(|| {
+                                ModelError::Msg(
+                                    "host CE fp8: TpCtx 缺 host_quant scratch(装配路径错)".into(),
+                                )
+                            })?;
+                            let d = tp.host_dummy.as_ref().ok_or_else(|| {
+                                ModelError::Msg(
+                                    "host CE fp8: TpCtx 缺 host_dummy header(装配路径错)".into(),
+                                )
+                            })?;
+                            // 只量化到 device;dummy header 与真实协议隔离。
+                            let quant = owl_kernels::client::comm::ArStageCall::new(
+                                out.clone(),
+                                d.clone(),
+                                d.clone(),
+                                q.clone(),
+                                n_bytes as u64,
+                                0,
+                                0,
+                            )
+                            .with_f8(true)
+                            .to_launch();
+                            emit_launch_pooled(ctx.face, ctx.pool.is_some(), quant).await?;
+                            // signal 核按 payload dtype 选实例;q 本身是 U8 raw,
+                            // 只借用其字节视图(16B 幂等写)。
+                            (q.clone().view(dtype, 1), host_f8_compact_bytes(n_bytes, dtype)?)
+                        } else {
+                            (out.clone(), n_bytes)
+                        }
+                    } else {
+                        (out.clone(), n_bytes)
+                    };
+                    if host_push {
+                        // raw 档 src 是 payload 块(偏移 0);f8 档 src 是
+                        // 带 64B 头前缀的 device scratch(数据从 64 起)。
+                        let src_off = if host_f8 {
+                            owl_kernels::family::comm::asset::AR_HDR_BYTES as usize
+                        } else {
+                            0
+                        };
+                        let copy = DevCommand::CopyBlock {
+                            src: stage_local.id,
+                            src_off_bytes: src_off,
+                            dst: tp.peer.id,
+                            dst_off_bytes: owl_kernels::family::comm::asset::AR_HDR_BYTES
+                                as usize,
+                            len_bytes: copy_len,
+                        };
+                        if ctx.pool.is_some() {
+                            // 与前后 Launch 同批提交(不能在 AR 热路径 flush)。
+                            let _ = ctx.face.queue(copy)?;
+                        } else {
+                            ctx.face.exec(copy).await?.into_done("tp.host.stage_copy")?;
+                        }
+                    }
                     // **融合档**(§11.2;缺省关 —— 配置显式开):一核做完两段。
                     // 只非 fp8 载荷(fp8 腿仍两核 —— 阈值与 `ar_f8` 同源)。
                     let f8_leg = tp.ar_f8 && n_bytes >= 262_144;
@@ -1236,13 +1343,20 @@ where
                     owl_shared::metrics::with_metrics_store(|s| {
                         s.counter_add("tp.ar.v1", 1, file!(), line!())
                     });
-                    // 两段(私有 payload ⇒ 先 stage 到 staging,再归约对端/本端 slot)
+                    // 两段(私有 payload ⇒ 先 stage 到 staging,再归约对端/本端 slot)。
+                    // host CE-push 的 stage 数据已由 CopyBlock 搬完;这里只发
+                    // **幂等 16B 写 + produced 发布**(stage 核的最低输出元素是 1)。
+                    let stage_bytes = if host_push {
+                        copy_len.min(16) as u64
+                    } else {
+                        n_bytes as u64
+                    };
                     let stage = owl_kernels::client::comm::ArStageCall::new(
-                        out.clone(),
+                        stage_local.clone(),
                         tp.own.clone(),
                         tp.peer.clone(),
                         stage_data,
-                        n_bytes as u64,
+                        stage_bytes,
                         tp.slot_bytes,
                         0,
                     )
@@ -1250,7 +1364,7 @@ where
                     // —— 2026-10-19 实测:prefill(10.5MB/次)+7.3%,而 decode
                     // (10KB/次)量化开销 > 省下的传输(-6.4%)。阈值 256KB 落在两
                     // 者之间(chunk128 ⇒ 1.3MB、decode ⇒ 10KB)。
-                    .with_f8(tp.ar_f8 && n_bytes >= 262_144)
+                    .with_f8(!host_push && tp.ar_f8 && n_bytes >= 262_144)
                     .to_launch();
                     emit_launch_pooled(ctx.face, ctx.pool.is_some(), stage).await?;
                     let reduce = owl_kernels::client::comm::ArReduceCall::new(
@@ -1262,7 +1376,7 @@ where
                         tp.slot_bytes,
                         0,
                     )
-                    .with_f8(tp.ar_f8 && n_bytes >= 262_144)
+                    .with_f8(host_f8 || (!host_push && tp.ar_f8 && n_bytes >= 262_144))
                     .to_launch();
                     emit_launch_pooled(ctx.face, ctx.pool.is_some(), reduce).await?;
                     out // 别名:payload 原地累加(v1/push 两段路径:原地加在 payload 上)
@@ -1434,6 +1548,9 @@ mod tp_injection_tests {
             ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
             ar_fused: false, // 测试档:两核路(融合档由配置开)
             ar2: false, // 测试档:不走 barrier-only
+            host_own: 0, // 测试档:P2P
+            host_quant: None,
+            host_dummy: None,
         };
         let err = eval_ops_scoped_env(
             &row_node(),
@@ -1472,6 +1589,9 @@ mod tp_injection_tests {
             ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
             ar_fused: false, // 测试档:两核路(融合档由配置开)
             ar2: false, // 测试档:不走 barrier-only
+            host_own: 0, // 测试档:P2P
+            host_quant: None,
+            host_dummy: None,
         };
         let err = eval_ops_scoped_env(
             &row_node(),

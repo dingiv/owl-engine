@@ -77,6 +77,14 @@ pub mod sys {
         CUDA_MEM_ALLOC_NODE_PARAMS, cuGraphMemAllocNodeGetParams, cuGraphMemFreeNodeGetParams,
         CUDA_MEMCPY_NODE_PARAMS, cuGraphMemcpyNodeGetParams,
         cuFuncGetName,
+        // **pinned host-mapped 面**(2026-11-04,host relay 兜底通道):
+        // `cuMemHostAlloc` 由 cudarc `malloc_host` 包装;这里只补
+        // `cuMemHostGetDevicePointer_v2` 与两个 flags。准入(A4):纯查询/
+        // 分配 flag,无编译、无懒状态;host relay 的 Block 解析需要稳定的
+        // device alias(for `block_ptr` 与核参数)。证据:cudarc 0.19.10
+        // `driver/sys/mod.rs:12839` / `:256` / `:257`。
+        CU_MEMHOSTALLOC_DEVICEMAP, CU_MEMHOSTALLOC_PORTABLE,
+        cuMemHostGetDevicePointer_v2,
     };
 
     /// cuBLAS FFI(matmul/workspace/stream 重绑)

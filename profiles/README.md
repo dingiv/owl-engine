@@ -154,6 +154,8 @@ cargo serve -p profiles/qwen38_27b-3090.toml
 
 # 临时变体（不再建文件）
 --set spec.depth=0 --set spec.lookup=false     # 关投机对照臂
+# 无 P2P 驱动环境:切 pinned host-mapped 中转(当前需同时落回 v1 两核)
+--set parallel.tp_comm=host --set parallel.tp_ar=v1
 # 默认 63456 + snap2;要更大 ctx 见上面 79872 的取舍
 ```
 

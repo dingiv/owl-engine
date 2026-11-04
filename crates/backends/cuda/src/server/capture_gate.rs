@@ -55,6 +55,9 @@ pub(super) fn reject_closed(cmd: Command) {
             Command::PeerAlloc { ack, .. } => closed!(ack),
             Command::PeerImport { ack, .. } => closed!(ack),
             Command::PeerRelease { ack, .. } => closed!(ack),
+            Command::HostAlloc { ack, .. } => closed!(ack),
+            Command::HostAttach { ack, .. } => closed!(ack),
+            Command::HostRelease { ack, .. } => closed!(ack),
             Command::CaptureRoute { ack, .. } => closed!(ack),
             Command::CaptureJoin { ack, .. } => closed!(ack),
         }
@@ -100,6 +103,9 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::PeerAlloc { .. } => "PeerAlloc",
             Command::PeerImport { .. } => "PeerImport",
             Command::PeerRelease { .. } => "PeerRelease",
+            Command::HostAlloc { .. } => "HostAlloc",
+            Command::HostAttach { .. } => "HostAttach",
+            Command::HostRelease { .. } => "HostRelease",
             Command::CaptureRoute { .. } => "CaptureRoute",
             Command::CaptureJoin { .. } => "CaptureJoin",
             Command::Batch { .. } => "Batch",
@@ -157,6 +163,10 @@ pub(super) fn reject_with(cmd: Command, why: String, sink: owl_shared::log::LogS
             Command::PeerAlloc { ack, .. } => reject!(ack),
             Command::PeerImport { ack, .. } => reject!(ack),
             Command::PeerRelease { ack, .. } => reject!(ack),
+            // host relay 分配/attach/释放 = host 侧映射动作 ⇒ 捕获期结构化拒
+            Command::HostAlloc { ack, .. } => reject!(ack),
+            Command::HostAttach { ack, .. } => reject!(ack),
+            Command::HostRelease { ack, .. } => reject!(ack),
             // 批外壳:本条路径不该到(捕获期由 `handle_batch` 逐条过白名单)
             Command::Batch { ack, .. } => reject!(ack),
             Command::Close { ack } => ack.send(Ok(())), // 幂等

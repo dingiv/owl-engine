@@ -118,6 +118,7 @@ async fn body(oa: usize, ob: usize, dir: PathBuf) {
             ar_f8: flag("OWL_TP_AR_F8"),
             ar_fused: flag("OWL_TP_AR_FUSED"),
             ar2: flag("OWL_TP_AR2"),
+            comm: Default::default(),
         },
     )
     .await

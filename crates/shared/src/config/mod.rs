@@ -222,6 +222,31 @@ impl TpArMode {
     }
 }
 
+/// **TP 卡间通信通道**(`parallel.tp_comm`;2026-11-04)。
+///
+/// - `p2p`(缺省)= 现役 VMM peer alias + 自研 AR 核(需要可用的 P2P 驱动);
+/// - `host` = pinned host-mapped staging(`cudaHostAlloc MAPPED|PORTABLE`),
+///   复用同一套 stage/reduce 协议与图回放;不需要 `cuDeviceCanAccessPeer`/BAR1。
+///   这是无 P2P 驱动环境的兜底通道,带宽/延迟低于 P2P。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TpCommMode {
+    /// 现役 P2P(VMM peer alias)
+    #[default]
+    P2p,
+    /// pinned host-mapped 中转(无 P2P 兜底)
+    Host,
+}
+
+impl TpCommMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::P2p => "p2p",
+            Self::Host => "host",
+        }
+    }
+}
+
 /// 采样模式(sampling.mode;原 `!= "greedy"` 字符串和稀泥废除)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -544,6 +569,11 @@ pub struct ParallelCfg {
     /// `tp_push`(3090 对读写对称)、`tp_one_stage`(对称 arena,实测中性)。
     #[serde(default)]
     pub tp_ar: TpArMode,
+    /// **TP 卡间通信通道**(2026-11-04;`p2p` | `host`)。
+    /// `host` = pinned host-mapped 中转,专供**没有 P2P 驱动**的环境;
+    /// 与 `tp_ar` 正交(但当前 host 只支持 `tp_ar = "v1"`)。
+    #[serde(default)]
+    pub tp_comm: TpCommMode,
 }
 
 impl Default for ParallelCfg {
@@ -554,6 +584,7 @@ impl Default for ParallelCfg {
             tp_ar_f8: false,
             tp_vocab_split: false,
             tp_ar: TpArMode::V1,
+            tp_comm: TpCommMode::P2p,
         }
     }
 }
@@ -2956,6 +2987,19 @@ impl OwlConfig {
                 par.tp_ar.as_str()
             ));
         }
+        if par.tp_comm != TpCommMode::P2p && par.mode != ParallelMode::Tensor {
+            return Err(format!(
+                "[parallel] tp_comm = \"{}\" 需 mode = \"tensor\"(单卡档无卡间通信,通道无效)",
+                par.tp_comm.as_str()
+            ));
+        }
+        if par.tp_comm == TpCommMode::Host && par.tp_ar != TpArMode::V1 {
+            return Err(format!(
+                "[parallel] tp_comm = \"host\" 当前只支持 tp_ar = \"v1\"(实得 \"{}\");\
+                 fused/ar2 的 host 腿尚未验收,响亮拒启",
+                par.tp_ar.as_str()
+            ));
+        }
         // **format × quant 的组合门**(2026-10-21;2026-10-30 收紧为白名单口径)。
         //
         // 语义权威 = `owl_engine::load_arm_of`(装载臂白名单:awq+w4a16 /
@@ -3463,6 +3507,32 @@ mod tp_ar_tests {
                 .expect_err("退役键必须拒");
             assert!(e.contains("退役"), "{key} 拒语应点名退役: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tp_comm_tests {
+    use super::*;
+
+    /// `tp_comm` 缺省 p2p;host 需 tensor;host 当前只配 v1;字面量严格。
+    #[test]
+    fn tp_comm_defaults_p2p_and_host_requires_v1_tensor() {
+        let c = OwlConfig::from_toml_str("[runtime]\nmax_seq = 128\n").expect("解析");
+        assert_eq!(c.parallel.tp_comm, TpCommMode::P2p, "缺省必须 p2p");
+        let e = OwlConfig::from_toml_str("[parallel]\ntp_comm = \"host\"\n")
+            .expect_err("单卡必须拒");
+        assert!(e.contains("tensor"), "拒语应点名 tensor: {e}");
+        let c = OwlConfig::from_toml_str(
+            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\ntp_comm = \"host\"\n",
+        )
+        .expect("TP2 + host 合法");
+        assert_eq!(c.parallel.tp_comm, TpCommMode::Host);
+        let e = OwlConfig::from_toml_str(
+            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\ntp_comm = \"host\"\ntp_ar = \"fused\"\n",
+        )
+        .expect_err("host+fused 暂拒");
+        assert!(e.contains("v1"), "拒语应点名 v1: {e}");
+        assert!(OwlConfig::from_toml_str("[parallel]\ntp_comm = \"shm\"\n").is_err());
     }
 }
 

@@ -122,6 +122,7 @@ impl ServerProbes {
 }
 
 mod harvest;
+mod host;
 mod peer;
 
 /// actor 编号(全局静态计数;DeadBlock 跨账本定谳用:每个 GpuServer = 一个
@@ -387,6 +388,9 @@ impl GpuServer {
         // peer 段(TP2 S1;G5 门机器可读面 —— 与账报文本 `peer_report` 同源)
         out.push_str(",\"peer\":");
         out.push_str(&self.ctx().peer_json());
+        // host relay 段(2026-11-04;无 P2P 兜底通道的独立账)
+        out.push_str(",\"host\":");
+        out.push_str(&self.ctx().host_json());
         out.push('}');
         out
     }
@@ -517,7 +521,7 @@ impl GpuServer {
     fn ledger_report(&self, top: usize) -> String {
         let unnamed = self.ctx().unnamed_blocks();
         format!(
-            "{}{} ‖ {} ‖ {}",
+            "{}{} ‖ {} ‖ {} ‖ {}",
             self.ctx().block_report_by_name(top),
             match unnamed {
                 0 => String::new(),
@@ -525,7 +529,9 @@ impl GpuServer {
             },
             self.scratch_report_by_name(top.min(8)),
             // peer 账(TP2 S1;G5 门读它:生命周期闭合)
-            self.ctx().peer_report()
+            self.ctx().peer_report(),
+            // host relay 账(2026-11-04)
+            self.ctx().host_report()
         )
     }
 
@@ -1023,6 +1029,11 @@ impl GpuServer {
                 ack,
             } => self.handle_peer_import(credential, bytes, peer_uuid, name, rw, ack),
             Command::PeerRelease { ids, ack } => self.handle_peer_release(ids, ack),
+            Command::HostAlloc { bytes, name, ack } => self.handle_host_alloc(bytes, name, ack),
+            Command::HostAttach { host, bytes, name, ack } => {
+                self.handle_host_attach(host, bytes, name, ack)
+            }
+            Command::HostRelease { ids, ack } => self.handle_host_release(ids, ack),
             Command::Htod {
                 data,
                 name,

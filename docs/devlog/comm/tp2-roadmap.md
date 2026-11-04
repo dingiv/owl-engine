@@ -13,6 +13,14 @@
 > TP2 档因此掉进串行 recurrence(实测 per-device 453ms vs 132ms)。已按
 > `nk=8/nv=24` 再编一套 AOT(六核,`extra_shapes`),GGUF TP2 prefill
 > 1.455→**1.589×**(+9.8%)。详见 `docs/devlog/models/gguf-tp2-kquant-设计.md` §13。
+>
+> **2026-11-04 host relay**:无 P2P 驱动的兜底通道已落地
+> (`[parallel] tp_comm = "host"`;pinned host-mapped + 现役 stage/reduce,
+> 可图回放)。低层 G1/G2/G3 门 + 0.8B TP2 等价门(双 3080 / 双 3090)全绿;
+> P2P 回归无损。release/std:host 比 P2P 慢 **prefill ~32% / decode ~19% /
+> TTFT ~49%**。copy-engine DMA stage 试过(独立探针快 2.14×),但引擎级
+> L1 可见性未闭合,未采用;下一步 H2D pull。详见
+> `docs/devlog/comm/host-relay-2026-11-04.md`。
 
 ```
 prefill:TP2 1489.5 t/s / TP1 973.7 t/s = **1.530×**(AR 占 18.3%)

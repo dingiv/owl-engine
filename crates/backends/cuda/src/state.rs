@@ -290,6 +290,10 @@ pub(super) enum Block {
     Owned(CudaSlice<u8>),
     Carved { slab: Arc<CudaSlice<u8>>, off: usize, n: usize, cap_n: usize },
     Peer(PeerBlock),
+    /// **pinned host-mapped 块**(2026-11-04;TP host relay 兜底通道)。
+    /// 不是设备显存:账长记 host 字节,`block_ptr` 给设备侧 alias。
+    /// 生命周期专属 `host_release`(与 Peer 的 `peer_release` 同律)。
+    HostMapped(HostMapped),
 }
 
 /// peer 块的两种形态(TP2 S1;设计出处 `docs/arch/TP2-施工设计.md` §2.2)。
@@ -332,6 +336,24 @@ pub(super) struct PeerAlias {
     /// 对端 UUID(诊断;钉卡凭据 —— 数字序不可表达)
     pub(super) peer_uuid: String,
     pub(super) gran: u64,
+}
+
+/// **pinned host-mapped 块**(TP host relay;2026-11-04)。
+///
+/// 一个 `cudaHostAlloc(MAPPED|PORTABLE)` 段在两卡都可见(同一进程/UVA),
+/// `dev` 是 `cuMemHostGetDevicePointer_v2` 的设备别名。`owner = true` 的
+/// 条目负责 `cudaFreeHost`;`owner = false` 是 attach 到同一段的第二份账。
+/// 这不是设备显存,故不进 `vram::live`;单独记 `host_mapped_bytes`。
+pub(super) struct HostMapped {
+    /// host 视图地址(`cudaHostAlloc` 返回的句柄;u64 以避免把 raw ptr
+    /// 放进可能跨线程移动的账本类型)
+    pub(super) host: u64,
+    /// 设备视图地址(`cuMemHostGetDevicePointer_v2`)
+    pub(super) dev: u64,
+    /// 账长(请求字节)
+    pub(super) bytes: usize,
+    /// true = 本条目是分配者;false = attach(不得 free_host)
+    pub(super) owner: bool,
 }
 
 /// 账本内块 id 位编码(裁决 2,2026-10-13):单 u64 高位 ledger、低 40 位
@@ -932,6 +954,11 @@ pub(super) struct GpuCtx {
     /// **单笔 peer 分配硬上限**(server 权威门 —— **不是**调用方自觉;
     /// 默认 = `owl_shared::device::PEER_ALLOC_HARD_CAP`,纪律出处见常量注释)
     peer_alloc_cap: u64,
+    /// **host relay 账**:本 actor 账下的 host-mapped 字节(含 attach 副本;
+    /// 不占设备 FB,不进 `vram::live`)
+    host_mapped_bytes: u64,
+    /// host-mapped 块笔数(owner + attach;生命周期闭合判据)
+    host_mappings: usize,
     /// 本账本编号(= GpuServer actor 序号;块 id 高位编码此值)
     ledger: u32,
     /// 动态 smem 每块上限(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
@@ -1294,6 +1321,8 @@ impl GpuCtx {
             peer_alias_bytes: 0,
             peer_mappings: 0,
             peer_alloc_cap: owl_shared::device::PEER_ALLOC_HARD_CAP,
+            host_mapped_bytes: 0,
+            host_mappings: 0,
             ledger,
             sink,
             vram,
@@ -2153,7 +2182,9 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         // 陈旧指针。`Carved` 的安全由**类型**保证(捕获后 free 一律 no-op;
         // 窗内 free = 回 arena 复用 —— 正是 M1 峰值口径的来源,不能被租约
         // 拦下)。Peer 块由 `peer_release` 的前置校验读租约(拒收被钉块)。
-        if self.capture.is_some() && matches!(e.block, Block::Owned(_) | Block::Peer(_)) {
+        if self.capture.is_some()
+            && matches!(e.block, Block::Owned(_) | Block::Peer(_) | Block::HostMapped(_))
+        {
             self.graph_refs.borrow_mut().record(id);
         }
         // 块账自洽(哨兵)。**判据升级(2026-10-17 审查)**:原为 `debug_assert!`
@@ -2195,6 +2226,8 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
             // peer 块(TP2 S1):裸 VA + 映射字节(AR 核参数直吃);账长可能
             // 是请求值(≤ 映射值),这里给**真实可用长度**
             Block::Peer(p) => Ok((p.map().va, p.mapped_bytes())),
+            // host-mapped 块(host relay):设备别名 + 账长
+            Block::HostMapped(h) => Ok((h.dev, h.bytes)),
         }
     }
 
@@ -2426,6 +2459,8 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                 // peer 块(TP2 S1):普通 Free **不碰** —— VMM 生命周期专属
                 // `PeerRelease`(D2);走该分支 = 响亮计数(不静默、不致命)
                 Block::Peer(_) => (2u8, 0usize, 0usize),
+                // host-mapped 块:普通 Free **不碰** —— 专属 `host_release`
+                Block::HostMapped(_) => (3u8, 0usize, 0usize),
             }) else {
                 continue;
             };
@@ -2464,6 +2499,10 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
                 // ── Peer(TP2 S1):普通 Free 不碰(见上面 2u8);响亮计数
                 2 => {
                     self.sink.count("srv.count.free_peer_reject", 1);
+                }
+                // ── HostMapped(host relay):专属 release;普通 Free 响亮计数
+                3 => {
+                    self.sink.count("srv.count.free_host_reject", 1);
                 }
                 _ => {
                     self.sink.count("srv.count.free_carved_noop", 1);
@@ -2513,6 +2552,167 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
     //    3080 档 enable = 进程级急切映射 = BAR1 预算墙);
     // 3. **释放唯一口** = `peer_release`(D2:同时收 shared 与 alias);`Free`
     //    对 peer 块是响亮计数 no-op,`Drop`(GpuCtx 级)是兜底。
+
+    // ======================================================================
+    // host-mapped 面(host relay 兜底通道;2026-11-04)
+    // ======================================================================
+    //
+    // 与 peer 面并列,但**不走 VMM**:`cudaHostAlloc(MAPPED|PORTABLE)` 的
+    // host 段在两卡均有设备别名;AR 核直接按 alias 读写。它不需要
+    // `cudaDeviceCanAccessPeer`/BAR1,因此可在无 P2P 驱动的机器上工作。
+    // 生命周期纪律同 peer:分配侧 owner 负责 `cudaFreeHost`,attach 侧只销账;
+    // 释放前必须过图租约(`graph_destroy` 先行)。
+
+    /// **分配 host-mapped staging**(owner = 本 actor)。返回 `(块 id, host 地址)`。
+    /// 两卡要共享同一段时:owner 侧分配一次,对端用 [`Self::host_attach`]。
+    pub(super) fn host_alloc(
+        &mut self,
+        bytes: usize,
+        name: &str,
+    ) -> Result<(u64, u64), ModelError> {
+        debug_assert!(
+            !name.is_empty(),
+            "host_alloc: 空名 = 分配点未记名(全量记名纪律;见 BlockEntry::name)"
+        );
+        if bytes == 0 {
+            return Err(ModelError::Msg("host_alloc: bytes = 0(拒绝)".into()));
+        }
+        let flags = crate::ffi::sys::CU_MEMHOSTALLOC_DEVICEMAP
+            | crate::ffi::sys::CU_MEMHOSTALLOC_PORTABLE;
+        let host = unsafe { malloc_host(bytes, flags) }
+            .map_err(|e| ModelError::Msg(format!("host_alloc malloc_host({bytes}B): {e:?}")))?;
+        if host.is_null() {
+            return Err(ModelError::Msg(format!(
+                "host_alloc malloc_host({bytes}B) 返回空指针(锁页内存耗尽?检查 ulimit -l)"
+            )));
+        }
+        let mut dev: crate::ffi::sys::CUdeviceptr = 0;
+        let rc = unsafe { crate::ffi::sys::cuMemHostGetDevicePointer_v2(&mut dev, host, 0) };
+        if rc != crate::ffi::sys::CUresult::CUDA_SUCCESS {
+            let _ = unsafe { free_host(host) };
+            return Err(ModelError::Msg(format!(
+                "host_alloc cuMemHostGetDevicePointer_v2 失败: {rc:?}(已回收 host 段)"
+            )));
+        }
+        let host_u64 = host as u64;
+        let id = self.new_host_block(
+            HostMapped { host: host_u64, dev: dev as u64, bytes, owner: true },
+            bytes,
+            name,
+        );
+        Ok((id, host_u64))
+    }
+
+    /// **attach 到已存在的 host-mapped 段**(不拥有、不 free)。
+    /// 同进程/UVA 下 `host` 就是对端 owner 返回的 host 地址。
+    pub(super) fn host_attach(
+        &mut self,
+        host: u64,
+        bytes: usize,
+        name: &str,
+    ) -> Result<u64, ModelError> {
+        debug_assert!(
+            !name.is_empty(),
+            "host_attach: 空名 = 分配点未记名(全量记名纪律)"
+        );
+        if host == 0 || bytes == 0 {
+            return Err(ModelError::Msg(format!(
+                "host_attach 参数非法:host={host:#x} bytes={bytes}(拒绝)"
+            )));
+        }
+        let mut dev: crate::ffi::sys::CUdeviceptr = 0;
+        let rc = unsafe {
+            crate::ffi::sys::cuMemHostGetDevicePointer_v2(
+                &mut dev,
+                host as *mut std::ffi::c_void,
+                0,
+            )
+        };
+        if rc != crate::ffi::sys::CUresult::CUDA_SUCCESS {
+            return Err(ModelError::Msg(format!(
+                "host_attach cuMemHostGetDevicePointer_v2 失败: {rc:?}(host={host:#x})"
+            )));
+        }
+        Ok(self.new_host_block(
+            HostMapped { host, dev: dev as u64, bytes, owner: false },
+            bytes,
+            name,
+        ))
+    }
+
+    /// **host-mapped 释放**(owner free_host;attach 只销账)。
+    /// 与 `peer_release` 同律:全有或全无校验 + 图租约拒收 + 失败不短路。
+    pub(super) fn host_release(&mut self, ids: &[u64]) -> Result<usize, ModelError> {
+        for id in ids {
+            assert_ledger(*id, self.ledger)?;
+            let Some(e) = self.blocks.get(id) else {
+                return Err(ModelError::DeadBlock { id: *id });
+            };
+            if !matches!(e.block, Block::HostMapped(_)) {
+                return Err(ModelError::Msg(format!(
+                    "host_release: 块 {id} 不是 host-mapped 块(普通块走 Free;拒绝)"
+                )));
+            }
+            if self.graph_refs.borrow().is_pinned(*id) {
+                return Err(ModelError::Msg(format!(
+                    "host_release: 块 {id} 被图引用租约钉住(地址已烘进图;先 graph_destroy)\
+                     —— 释放会让图踩陈旧 host 段"
+                )));
+            }
+        }
+        let mut errs: Vec<String> = Vec::new();
+        let mut n = 0usize;
+        for id in ids {
+            let Some(e) = self.blocks.remove(id) else { continue };
+            let Block::HostMapped(h) = e.block else { continue };
+            self.host_mapped_bytes = self.host_mapped_bytes.saturating_sub(h.bytes as u64);
+            self.host_mappings = self.host_mappings.saturating_sub(1);
+            if h.owner {
+                if let Err(er) = unsafe { free_host(h.host as *mut std::ffi::c_void) } {
+                    errs.push(format!("id={id}(host freed {:#x}): {er:?}", h.host));
+                }
+            }
+            n += 1;
+        }
+        if errs.is_empty() {
+            Ok(n)
+        } else {
+            Err(ModelError::Msg(format!(
+                "host_release 存在失败步骤({n} 块已处理;逐条):{}",
+                errs.join(" ‖ ")
+            )))
+        }
+    }
+
+    /// host 账结构化段(诊断)
+    pub(super) fn host_json(&self) -> String {
+        format!(
+            "{{\"bytes\":{},\"mappings\":{}}}",
+            self.host_mapped_bytes, self.host_mappings
+        )
+    }
+
+    /// host 账一行(账报追加段)
+    pub(super) fn host_report(&self) -> String {
+        if self.host_mappings == 0 {
+            return "host: 无".to_string();
+        }
+        let mut s = format!(
+            "host: mapped={}MiB(n={}):",
+            self.host_mapped_bytes >> 20,
+            self.host_mappings
+        );
+        for (id, e) in &self.blocks {
+            let Block::HostMapped(h) = &e.block else { continue };
+            s.push_str(&format!(
+                " id{id}={}MiB@{:#x}({})",
+                h.bytes >> 20,
+                h.dev,
+                if h.owner { "owner" } else { "attach" }
+            ));
+        }
+        s
+    }
 
     /// peer 账结构化段(G5 门读它;JSON 与 `LedgerJson` 同源)
     pub(super) fn peer_json(&self) -> String {
@@ -2710,6 +2910,27 @@ fn end_capture_err(e: crate::ffi::DriverError) -> ModelError {
         }
     }
 
+    /// 内部:host-mapped 块入册(账长 = 请求值;不占设备 FB)
+    fn new_host_block(&mut self, block: HostMapped, req_bytes: usize, name: &str) -> u64 {
+        let local = self.next_block;
+        self.next_block += 1;
+        let id = pack_block_id(self.ledger, local);
+        self.blocks.insert(
+            id,
+            BlockEntry {
+                block: Block::HostMapped(block),
+                bytes: req_bytes,
+                ledger: self.ledger,
+                dtype: BlockDtype::Bytes,
+                shape: vec![req_bytes],
+                name: name.to_string(),
+            },
+        );
+        self.host_mapped_bytes += req_bytes as u64;
+        self.host_mappings += 1;
+        id
+    }
+
     /// 内部:peer 块入册(账长 = 请求值;映射值在 `PeerBlock` 里)
     fn new_peer_block(&mut self, block: PeerBlock, req_bytes: usize, name: &str) -> u64 {
         let local = self.next_block;
@@ -2740,24 +2961,37 @@ impl Drop for GpuCtx {
     fn drop(&mut self) {
         let sink = self.sink;
         let mut leaked = 0usize;
+        let mut leaked_host = 0usize;
         let mut errs: Vec<String> = Vec::new();
         for (id, e) in self.blocks.drain() {
-            let Block::Peer(p) = e.block else { continue };
-            leaked += 1;
-            match p {
-                PeerBlock::Shared(s) => {
-                    for fd in &s.fds {
-                        crate::vmm::close_fd(*fd);
-                    }
-                    if let Err(er) = crate::vmm::release(s.map) {
-                        errs.push(format!("id={id}(shared): {er}"));
+            match e.block {
+                Block::Peer(p) => {
+                    leaked += 1;
+                    match p {
+                        PeerBlock::Shared(s) => {
+                            for fd in &s.fds {
+                                crate::vmm::close_fd(*fd);
+                            }
+                            if let Err(er) = crate::vmm::release(s.map) {
+                                errs.push(format!("id={id}(shared): {er}"));
+                            }
+                        }
+                        PeerBlock::Alias(a) => {
+                            if let Err(er) = crate::vmm::release(a.map) {
+                                errs.push(format!("id={id}(alias): {er}"));
+                            }
+                        }
                     }
                 }
-                PeerBlock::Alias(a) => {
-                    if let Err(er) = crate::vmm::release(a.map) {
-                        errs.push(format!("id={id}(alias): {er}"));
+                Block::HostMapped(h) => {
+                    leaked_host += 1;
+                    if h.owner {
+                        if let Err(er) = unsafe { free_host(h.host as *mut std::ffi::c_void) } {
+                            errs.push(format!("id={id}(host {:#x}): {er:?}", h.host));
+                        }
                     }
                 }
+                _ => {}
             }
         }
         if leaked > 0 {
@@ -2766,6 +3000,15 @@ impl Drop for GpuCtx {
                 "peer-drop",
                 format_args!(
                     "GpuCtx 销毁时回收 {leaked} 个未显式释放的 peer 块(调用方漏 PeerRelease;兜底已收)"
+                ),
+            );
+        }
+        if leaked_host > 0 {
+            sink.logf(
+                owl_shared::log::LVL_WARN,
+                "host-drop",
+                format_args!(
+                    "GpuCtx 销毁时回收 {leaked_host} 个未显式释放的 host-mapped 块(调用方漏 host_release;兜底已收)"
                 ),
             );
         }

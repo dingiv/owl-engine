@@ -825,6 +825,7 @@ async fn executor_main(
                         ar_f8: config.tp_ar_f8,
                         ar_fused: config.tp_ar.uses_fused(),
                         ar2: config.tp_ar.uses_ar2(),
+                        comm: config.tp_comm,
                     },
                 )
                 .await?;
@@ -879,7 +880,20 @@ async fn executor_main(
             "face 克隆不可用 ⇒ /debug/blocks 回 503(该后端不支持)"
         );
     }
-    executor::run_executor(&mut running, rx, config.perf_dump.clone(), telemetry, stop).await
+    let mut reason =
+        executor::run_executor(&mut running, rx, config.perf_dump.clone(), telemetry, stop).await;
+    // **TP 收尾显式化**:RunningEngine 的 Drop 只兜底;peer/host staging 的
+    // 正规释放口是 shutdown_tp(先卸图,再 PeerRelease/HostRelease)。
+    // 不调它 = P2P 别名/host 段落到 GpuCtx::Drop 的 WARN 兜底(账不闭合)。
+    if running.has_peer() {
+        if let Err(e) = running.shutdown_tp().await {
+            owl_shared::log_warn!("boot", "TP 收尾失败:{e}");
+            if matches!(reason, shutdown::ExitReason::Normal) {
+                reason = shutdown::ExitReason::Fatal(format!("TP 收尾失败:{e}"));
+            }
+        }
+    }
+    reason
 }
 
 /// panic 载荷 → 可读串(`&str` / `String` 两型覆盖 std 惯例;其余给个兜底)

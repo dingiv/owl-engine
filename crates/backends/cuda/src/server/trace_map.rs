@@ -145,6 +145,10 @@ pub(super) fn entry_of(ctx: &GpuCtx, cmd: &Command) -> TraceEntry {
             Command::PeerAlloc { bytes, .. } => E::new("peer_alloc", "").bytes(*bytes),
             Command::PeerImport { bytes, .. } => E::new("peer_import", "").bytes(*bytes),
             Command::PeerRelease { .. } => E::new("peer_release", ""),
+            // host relay 面(2026-11-04):pinned host mapped,不触设备流
+            Command::HostAlloc { bytes, .. } => E::new("host_alloc", "").bytes(*bytes),
+            Command::HostAttach { bytes, .. } => E::new("host_attach", "").bytes(*bytes),
+            Command::HostRelease { .. } => E::new("host_release", ""),
             // 捕获期发射路由切换(图内 fork/join;B1 门):不触流(只建图的依赖边)
             Command::CaptureRoute { .. } => E::new("capture_route", ""),
             Command::CaptureJoin { .. } => E::new("capture_join", ""),

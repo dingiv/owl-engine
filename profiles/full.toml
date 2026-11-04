@@ -125,6 +125,9 @@ device = []
 tp_ar = "v1"
 # TP AR 载荷 fp8(两侧同档)
 tp_ar_f8 = false
+# TP 卡间通信通道:p2p(现役 VMM peer alias)| host(pinned host-mapped 中转,
+# 无 P2P 驱动环境兜底;当前只支持 tp_ar = "v1")
+tp_comm = "p2p"
 # lm_head 词表切(每 rank 只持半表;需 mode = tensor)
 tp_vocab_split = false
 

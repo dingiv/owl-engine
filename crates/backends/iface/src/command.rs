@@ -53,6 +53,20 @@ pub enum Command {
         off_bytes: usize,
         want_bytes: usize,
     },
+    /// **块→块字节拷贝**(设备流序;源/目标都是块)。
+    ///
+    /// 用途(2026-11-04 host relay CE stage):`src` 是设备 payload、
+    /// `dst` 是 host-mapped staging 的设备别名 —— `cuMemcpyDtoDAsync`
+    /// 在同流上把数据搬进 pinned host;也用于 D2D/H2D 固定块搬运。
+    /// 两端偏移均为**字节**口径。捕获期是合法图节点(见 CUDA
+    /// `handle_copy_block` 的判据)。
+    CopyBlock {
+        src: u64,
+        src_off_bytes: usize,
+        dst: u64,
+        dst_off_bytes: usize,
+        len_bytes: usize,
+    },
     /// kernel 发射(COMPUTE 流)。
     Launch { msg: LaunchMsg },
     /// 全设备栅栏(三条流此前工作落定)。
@@ -79,6 +93,7 @@ impl Command {
             Command::Free { .. } => "free",
             Command::Htod { .. } => "htod",
             Command::Dtoh { .. } => "dtoh",
+            Command::CopyBlock { .. } => "copy_block",
             Command::Launch { .. } => "launch",
             Command::Sync => "sync",
             Command::GraphBegin => "graph_begin",
