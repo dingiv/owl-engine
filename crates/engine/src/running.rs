@@ -10,6 +10,7 @@
 //! KV 由「kv_len 窗口 + 先写后打分」语义天然隔离);真并发随调度层铺开
 //! S3 拼批换入,submit/pump 形状不变。
 
+use crate::spec_runtime::DraftHead as _;
 use owl_iface::contract::{DeviceClient, ModelError};
 use owl_models::tokenizer::Tokenizer;
 
@@ -2511,10 +2512,11 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// 本进程的草稿档位（`generation_target_for` 的档位入参真源）。
     fn generation_kind(&self) -> GenerationKind {
-        match self.dev.spec_rt.drafter.as_ref() {
-            Some(crate::spec_runtime::Drafter::DFlash2(_)) => GenerationKind::DFlash2,
-            Some(crate::spec_runtime::Drafter::Mtp(_)) => GenerationKind::Mtp,
-            None => GenerationKind::None,
+        // 族 = 数据(trait 单点);这里只做三态映射,不再模式匹配变体
+        match self.dev.spec_rt.drafter.as_ref().map(|d| d.family()) {
+            Some(crate::spec_runtime::SpecMode::DFlash2) => GenerationKind::DFlash2,
+            Some(crate::spec_runtime::SpecMode::Mtp) => GenerationKind::Mtp,
+            _ => GenerationKind::None,
         }
     }
 

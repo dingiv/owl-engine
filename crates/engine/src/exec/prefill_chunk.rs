@@ -1,4 +1,5 @@
 //! 块式 prefill(树根装配与执行;taps/encode/BISECT 取证)
+use crate::spec_runtime::DraftHead as _;
 use super::*;
 use crate::engine::EngineKnobs;
 use crate::running::StepProbes;
@@ -738,7 +739,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     }
                 }
             }
-            if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
+            if self.spec_rt.drafter.as_ref().map(|d| d.as_mtp().is_some()).unwrap_or(false) && t > 1 {
                 // prefill extend(E5-M5):本 chunk 行 0..T-1 的 mtp KV
                 // (行 T-1 的配对需下一 chunk 首 token,由其 extend 补;
                 // 末位 P-1 由首轮 propose_first 的 extend 行补)
@@ -910,7 +911,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                         })
                         .collect();
                     self.prefill_dflash_encode(host.probes, &tap_views, base).await?;
-                } else if matches!(self.spec_rt.drafter.as_ref(), Some(crate::spec_runtime::Drafter::Mtp(_))) && t > 1 {
+                } else if self.spec_rt.drafter.as_ref().map(|d| d.as_mtp().is_some()).unwrap_or(false) && t > 1 {
                     let ts = std::time::Instant::now();
                     let sid = host.sid;
                     let bank = host.bank_mut()?;

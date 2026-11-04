@@ -139,16 +139,36 @@ fn plan_prefill(ctx, shape) -> PrefillArm
 - **风险控制**:臂体原样不动(只搬条件),boot + `note_arm` 对比。
 - **前置**:先给 `paged_*_ok` 谓词补表驱动(与 §2 同款)。
 
-### 3.2 `Drafter` 从 enum 升级为 trait
+### 3.2 草稿族:`DraftHead` trait(已落地,2026-11-04 第二批)
+
+**判断:两族的差异是结构性的,不是可互换行为** —— MTP 走链式 block
+(m+1 自回归 + 链池),DFlash2 走噪声块 + 码本选择器 + 环窗口 + taps;
+propose 的签名、图拓扑、KV 布局都不同。把**行为**硬塞进 `Box<dyn>`,
+只会把编译期 match 换成运行期 downcast,**分支一个不减**。
+
+落地的接口 = **族判定 + 类型化下探**(共享面),族专行为留在族内:
 
 ```rust
-trait Drafter { fn propose(..) -> Draft; fn verify_plan(..) -> VerifyPlan;
-                fn kv_dtype(&self) -> Dtype; /* … */ }
+pub(crate) trait DraftHead {
+    fn family(&self) -> SpecMode;                       // 数据,不是变体
+    fn as_dflash2(&self) -> Option<&DFlash2Draft> { None }
+    fn dflash2_arc(&self) -> Option<Arc<DFlash2Draft>> { None }
+    fn as_mtp(&self) -> Option<&MtpPredictor> { None }
+    fn mtp_arc(&self) -> Option<Arc<MtpPredictor>> { None }
+}
+impl DraftHead for Drafter { /* 全仓唯一一处变体 match */ }
 ```
 
-`Mtp` / `DFlash2` 两实现;`spec_runtime`/`graph_fleet`/`exec/spec` 里的
-13 处 `Drafter::` 匹配收成 1(构造点)+ 1(能力查询)。MTP 的"链池 1 层"
-与 DFlash2 的"环窗口 2048"从 match 分支变成实现里的字段。
+**效果**:`Drafter::` 模式匹配从 **17 处(spec_runtime 6 / graph_fleet 4 /
+exec/spec 3 / exec/draft 4)→ 0 处**(枚举只在「构造点 + trait impl」出现,
+其余全走 `family()/as_*()`)。`generation_kind`、`propose_first/ext`、
+`prefill_extend` 的"是不是 MTP"判断改写成 `as_mtp().is_some()` 或
+`family() == …`,并顺手把 `unreachable!("DFlash2 不走 propose_first")` 一类的
+"先匹配再断言"改成 **`ok_or_else` 结构化错误**(缺句柄 = 装配违约,不是 panic)。
+
+验证:`owl-models` 316 / `owl-shared` 127 / `owl-cuda` 40 / engine config 全绿;
+实机 DFlash2 d7 双档(int8 8k **2313.5 t/s**、fp8+shadow 32k **2094.3 t/s**)
+propose/select/verify 全路径跑通。
 
 ### 3.3 装载器:`ModelSource` trait(AWQ/safetensors vs GGUF)
 

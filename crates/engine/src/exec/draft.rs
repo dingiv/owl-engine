@@ -1,4 +1,5 @@
 //! 草稿器面(DFlash2 单图 encode+propose / eager / MTP 链 / verify 前向)
+use crate::spec_runtime::DraftHead as _;
 use super::lookup::{fuse_lookup, suffix_lookup, LookupCfg, LookupProposal};
 use super::mtp_window::{MtpWindowCfg, MtpWindowPlan};
 use super::*;
@@ -388,10 +389,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         pos: usize,
         lookup: Option<&LookupProposal>,
     ) -> Result<Vec<u32>> {
-        let d2 = match self.dev.spec_rt.drafter.as_ref() {
-            Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
-            _ => unreachable!("dflash_propose 非 dflash 模式"),
-        };
+        let d2 = self
+            .dev
+            .spec_rt
+            .drafter
+            .as_ref()
+            .and_then(|d| d.dflash2_arc())
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: "dflash_propose 需要 DFlash2 草稿头(装配不一致)".into(),
+            })?;
         let rope = self
             .dev
             .spec_rt
@@ -591,9 +597,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .collect();
             // ⚠️ 用 **peer 自己的 drafter / rope**(每 rank 各一份实例、各一套设备块;
             // 用 rank0 的 `d2`/`rope` 建树 ⇒ 权重块不在 peer 账本 ⇒ 当场拒)
-            let d2_p = match p.spec_rt.drafter.as_ref() {
-                Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
-                _ => {
+            let d2_p = match p.spec_rt.drafter.as_ref().and_then(|d| d.dflash2_arc()) {
+                Some(d) => d,
+                None => {
                     return Err(ModelError::EngineInvariant {
                         what: "peer 草稿器缺席/非 DFlash2(镜像装配不一致)".into(),
                     })
@@ -1079,12 +1085,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let rope = self.dev.boot.rope.clone();
                 // 链步 decode 读核跟池布局:kNH 池必须走 v2(否则落 v1 classic
                 // ↠ 布局错位、草稿全垃圾;2026-10-13 布局守卫捕获)
-                match self.dev.spec_rt.drafter.as_ref().ok_or_else(|| {
-                    ModelError::EngineInvariant {
-                        what: "drafter 句柄缺席(草稿档位不一致)".into(),
-                    }
-                })? {
-                    crate::spec_runtime::Drafter::Mtp(mtp) => mtp.propose(
+                match self
+                    .dev
+                    .spec_rt
+                    .drafter
+                    .as_ref()
+                    .and_then(|d| d.as_mtp())
+                    .ok_or_else(|| ModelError::EngineInvariant {
+                        what: "propose_first 需要 MTP 草稿头(DFlash2 走 dflash_propose)".into(),
+                    })?
+                {
+                    mtp => mtp.propose(
                         &anchor_t,
                         &seed_view,
                         depth,
@@ -1096,9 +1107,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         env,
                         attn_v2,
                     ),
-                    crate::spec_runtime::Drafter::DFlash2(_) => {
-                        unreachable!("DFlash2 不走 propose_first(seed 链)")
-                    }
                 }
             };
         let (b, arena) = {
@@ -1263,12 +1271,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let env = self.dev.spec_rt.draft_env;
                 let vocab = self.dev.boot.model.vocab_size();
                 let rope = self.dev.boot.rope.clone();
-                match self.dev.spec_rt.drafter.as_ref().ok_or_else(|| {
-                    ModelError::EngineInvariant {
-                        what: "drafter 句柄缺席(草稿档位不一致)".into(),
-                    }
-                })? {
-                    crate::spec_runtime::Drafter::Mtp(mtp) => mtp.propose_ext(
+                match self
+                    .dev
+                    .spec_rt
+                    .drafter
+                    .as_ref()
+                    .and_then(|d| d.as_mtp())
+                    .ok_or_else(|| ModelError::EngineInvariant {
+                        what: "propose_ext 需要 MTP 草稿头(DFlash2 走 dflash_propose)".into(),
+                    })?
+                {
+                    mtp => mtp.propose_ext(
                         &tokens_t,
                         &hiddens,
                         &extend_pos,
@@ -1285,9 +1298,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         extend_v2,
                         Some(&bt8_t),
                     ),
-                    crate::spec_runtime::Drafter::DFlash2(_) => {
-                        unreachable!("DFlash2 走 dflash_propose")
-                    }
                 }
             };
         mrec("spec.propose.build", ts_build.elapsed());
@@ -1658,14 +1668,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         mrec("spec.propose.sel.merge", t_merge.elapsed());
         let t_eval = std::time::Instant::now();
         // rank0 select（eager;全表域 —— 候选已合并、码本全量）
-        let d2 = match self.dev.spec_rt.drafter.as_ref() {
-            Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
-            _ => {
-                return Err(ModelError::EngineInvariant {
-                    what: "切档 propose 收割:草稿器缺席/非 DFlash2".into(),
-                })
-            }
-        };
+        let d2 = self
+            .dev
+            .spec_rt
+            .drafter
+            .as_ref()
+            .and_then(|x| x.dflash2_arc())
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: "切档 propose 收割:草稿器缺席/非 DFlash2".into(),
+            })?;
         let rank = d2.selector_rank();
         if mv.len() != rows * k || mc.len() != rows * k || proj_blk.len != rows * rank {
             return Err(ModelError::EngineInvariant {
@@ -1911,10 +1922,14 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         tap_views: &[TensorOps],
         base: usize,
     ) -> Result<()> {
-        let d2 = match self.spec_rt.drafter.as_ref() {
-            Some(crate::spec_runtime::Drafter::DFlash2(d)) => std::sync::Arc::clone(d),
-            _ => unreachable!("prefill_dflash_encode 非 dflash 模式"),
-        };
+        let d2 = self
+            .spec_rt
+            .drafter
+            .as_ref()
+            .and_then(|x| x.dflash2_arc())
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: "prefill_dflash_encode 需要 DFlash2 草稿头".into(),
+            })?;
         let rope = self
             .spec_rt
             .draft_rope
@@ -2007,10 +2022,14 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let t_all = std::time::Instant::now();
         // DFlash2 早退(无链式 extend;草稿 KV 走 prefill_dflash_encode)
         // —— 门必须先于 blocks_mtp 预留(mtp 账房非 mtp 模式 = 0 块)
-        if !matches!(
-            self.spec_rt.drafter.as_ref(),
-            Some(crate::spec_runtime::Drafter::Mtp(_))
-        ) {
+        if self
+            .spec_rt
+            .drafter
+            .as_ref()
+            .map(|d| d.as_mtp().is_some())
+            .unwrap_or(false)
+            == false
+        {
             return Ok(());
         }
         let d = self.pool.geom.dims;
@@ -2080,9 +2099,8 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         };
         mrec("spec.extend.pre", t_all.elapsed());
         let ts_eval = std::time::Instant::now();
-        let mtp = match self.spec_rt.drafter.as_ref() {
-            Some(crate::spec_runtime::Drafter::Mtp(m)) => m,
-            _ => return Ok(()), // DFlash2 无链式 extend(草稿 KV 走 dflash_encode)
+        let Some(mtp) = self.spec_rt.drafter.as_ref().and_then(|d| d.as_mtp()) else {
+            return Ok(()); // DFlash2 无链式 extend(草稿 KV 走 dflash_encode)
         };
         // MTP 链池是 F16；主 env 生产是 fp8，必须显式用草稿 env
         // （否则 K0 写核选 fp8 变体，槽 2 的 F16 cache 当场 dtype 拒绝）。

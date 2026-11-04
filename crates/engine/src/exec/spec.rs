@@ -1,4 +1,5 @@
 //! spec 轮机器(execute_spec_round)+ 块表写 + GDN 快照
+use crate::spec_runtime::DraftHead as _;
 use super::*;
 use owl_models::ModelError;
 
@@ -752,10 +753,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let early_propose = if !round_done_early
             && !degraded_now
             && self.dev.graphs.dflash.is_some()
-            && matches!(
-                self.dev.spec_rt.drafter.as_ref(),
-                Some(crate::spec_runtime::Drafter::DFlash2(_))
-            )
+            && self
+                .dev
+                .spec_rt
+                .drafter
+                .as_ref()
+                .map(|d| d.as_dflash2().is_some())
+                .unwrap_or(false)
         {
             let ts = std::time::Instant::now();
             let p = self.dflash_propose_launch(m, pos, toks[m]).await?;
@@ -910,10 +914,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             t_propose += ts.elapsed();
             self.tspec()?.spec_drafts_host = Some(d);
         } else {
-        let d2_arc7 = match self.dev.spec_rt.drafter.as_ref() {
-            Some(crate::spec_runtime::Drafter::DFlash2(d)) => Some(std::sync::Arc::clone(d)),
-            _ => None,
-        };
+        let d2_arc7 = self
+            .dev
+            .spec_rt
+            .drafter
+            .as_ref()
+            .and_then(|d| d.dflash2_arc());
         if let Some(d2) = d2_arc7 {
             let ts = std::time::Instant::now();
             // E5-DF4:图态(单图一轮 encode+propose);图降级才走 eager 路
@@ -1817,8 +1823,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // d.truncate(depth) 同款,收口在消费点单处。
             d.truncate(depth);
             d
-        } else if let Some(crate::spec_runtime::Drafter::DFlash2(_)) =
-            self.dev.spec_rt.drafter.as_ref()
+        } else if self
+            .dev
+            .spec_rt
+            .drafter
+            .as_ref()
+            .map(|d| d.as_dflash2().is_some())
+            .unwrap_or(false)
         {
             let ts = std::time::Instant::now();
             let lookup = self.dflash_lookup_for_tail(&[])?;

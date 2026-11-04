@@ -11,6 +11,7 @@
 //! 会话连续 / 4k 长 ctx / W4A16 / 27B AWQ / 多会话隔离 / 前缀缓存命中 /
 //! S0 调度决策面。
 
+use crate::spec_runtime::DraftHead as _;
 use crate::engine::{Engine, EngineConfig, EngineKnobs};
 #[cfg(test)] // 仅单元档的 decode 差分用例消费;e2e 档不编该函数
 use crate::exec::decode_delta;
@@ -7295,8 +7296,15 @@ pub async fn gpu_mtp_kv_parity() {
         let vocab = running.dev.boot.model.vocab_size();
         let rope = running.dev.boot.rope.clone();
         let attn_v2 = running.dev.pool.attn_v2_scratch();
-        let drafts = match running.dev.spec_rt.drafter.as_ref().expect("drafter") {
-            crate::spec_runtime::Drafter::Mtp(m) => m.propose(
+        let drafts = match running
+            .dev
+            .spec_rt
+            .drafter
+            .as_ref()
+            .and_then(|d| d.as_mtp())
+            .expect("MTP drafter")
+        {
+            m => m.propose(
                 &anchor_t,
                 &seed_view,
                 1,
@@ -7308,7 +7316,6 @@ pub async fn gpu_mtp_kv_parity() {
                 env,
                 attn_v2,
             ),
-            _ => panic!("MTP only"),
         };
         let tp = running.dev.boot.tp.clone();
         let (b, arena) = {

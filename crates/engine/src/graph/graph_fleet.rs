@@ -23,7 +23,8 @@ use owl_models::tensor::TensorOps;
 use crate::engine::EngineKnobs;
 use crate::graph_plan::{GraphPlan, GraphPlanDesc, InputSlot, OutputSlot, PlanCtx, PlanOutcome};
 use crate::sampler::{REP_HISTORY_SENTINEL, REP_HISTORY_WINDOW};
-use crate::spec_runtime::{Drafter, SpecRuntime};
+use crate::spec_runtime::SpecRuntime;
+use crate::spec_runtime::DraftHead as _;
 use crate::state::{ModelDims, StatePool};
 use crate::Result;
 
@@ -380,8 +381,9 @@ impl<D: DeviceClient> GraphFleet<D> {
         // 吃 dflash 图的 topk/sel_proj 输出块(刀2 已验证 of_block 这条路)
         // + peer 候选输入槽 ⇒ 图内合并 + selector,输出 select 单缓冲。
         let dflash_select = match (dflash.as_ref(), boot.spec.drafter.as_ref()) {
-            (Some(dg), Some(Drafter::DFlash2(_)))
-                if boot.model.logits_vocab() != boot.model.vocab_size()
+            (Some(dg), Some(d))
+                if d.family() == crate::spec_runtime::SpecMode::DFlash2
+                    && boot.model.logits_vocab() != boot.model.vocab_size()
                     && boot.tp.as_ref().map(|t| t.plan.rank()).unwrap_or(0) == 0 =>
             {
                 Self::plan_dflash_select(dg, &mut extra_faces, &boot, t0).await?
@@ -1543,7 +1545,12 @@ impl<D: DeviceClient> GraphFleet<D> {
         boot: &FleetBoot<'_>,
         t0: T,
     ) -> Result<Option<GraphPlan<D>>> {
-        let Some(Drafter::DFlash2(d2)) = boot.spec.drafter.as_ref() else {
+        let Some(d2) = boot
+            .spec
+            .drafter
+            .as_ref()
+            .and_then(|d| d.dflash2_arc())
+        else {
             return Ok(None);
         };
         let pool = boot.pool;
@@ -1564,7 +1571,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         let bt_leaf = pool.bt_leaf_flat();
         let model_df = Arc::clone(&boot.model);
         let rp_df = boot.spec.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();
-        let d2g = Arc::clone(d2);
+        let d2g = Arc::clone(&d2);
         let block = d2.block();
         let depth = d2.depth();
         // **切档形态**（P1.1 × P2.1）:propose 图只出"半表 top-16 候选 + proj" ——
@@ -1736,7 +1743,12 @@ impl<D: DeviceClient> GraphFleet<D> {
         boot: &FleetBoot<'_>,
         t0: T,
     ) -> Result<Option<GraphPlan<D>>> {
-        let Some(Drafter::DFlash2(d2)) = boot.spec.drafter.as_ref() else {
+        let Some(d2) = boot
+            .spec
+            .drafter
+            .as_ref()
+            .and_then(|d| d.dflash2_arc())
+        else {
             return Ok(None);
         };
         let rows = d2.depth();
@@ -1766,7 +1778,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             owl_shared::log_warn!("boot", "select 图 face 耗尽 → 回落 host 合并 + eager select");
             return Ok(None);
         };
-        let d2s = Arc::clone(d2);
+        let d2s = Arc::clone(&d2);
         let (sg, sout) = GraphPlan::plan(
             sface,
             env,
@@ -1861,7 +1873,7 @@ impl<D: DeviceClient> GraphFleet<D> {
         _t0: T,
         depth: usize,
     ) -> Result<Vec<GraphPlan<D>>> {
-        let Some(Drafter::Mtp(mtp)) = boot.spec.drafter.as_ref() else {
+        let Some(mtp) = boot.spec.drafter.as_ref().and_then(|d| d.mtp_arc()) else {
             return Ok(Vec::new());
         };
         let pool = boot.pool;
@@ -1884,7 +1896,7 @@ impl<D: DeviceClient> GraphFleet<D> {
             let extend_v2_p = extend_v2_pool.as_ref().and_then(|s| s.prefix(m + 1));
             let m1 = m + 1;
             let model_p = Arc::clone(&boot.model);
-            let mtp = Arc::clone(mtp);
+            let mtp = Arc::clone(&mtp);
             let rp_p = boot.rope.clone();
             let kv_leaf = pool.mtp_kv_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP KV 池句柄缺席(draft 档位不一致)".into() })?;
             let bt_leaf = pool.bt_mtp_leaf().ok_or_else(|| ModelError::EngineInvariant { what: "MTP 块表槽缺席(草稿档位不一致)".into() })?;
