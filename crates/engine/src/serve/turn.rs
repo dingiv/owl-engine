@@ -82,7 +82,7 @@ pub struct TurnOpts {
 
 /// 一张输入图像 + **可删除标记**(前缀无感删除;2026-10-23 用户裁决)。
 ///
-/// 引擎**不自作主张**:只有带标记、且 `[pool] image_evict = true` 的图像段
+/// 引擎**不自作主张**:只有带标记、且 `[vision] image_evict = true` 的图像段
 /// 才会被补 pad 到页对齐并进删除候选;未标记 = 零行为差异。
 #[derive(Clone, Debug)]
 pub struct TurnImage {

@@ -31,10 +31,79 @@ pub(crate) enum SpecMode {
     DFlash2,
 }
 
-/// 草稿器枚举(E5-DF;MTP 链式 / DFlash2 噪声块式双族)
+/// 草稿器枚举(E5-DF;MTP 链式 / DFlash2 噪声块式双族)。
+///
+/// **只允许本模块与 [`DraftHead`] 的实现匹配它**;全仓其它位置一律走
+/// trait 方法(族 = 数据 `family()`,族专面 = 显式下探 `as_dflash2()/as_mtp()`)。
 pub(crate) enum Drafter {
     Mtp(Arc<owl_models::layers::mtp::MtpPredictor>),
     DFlash2(Arc<owl_models::layers::dflash2::DFlash2Draft>),
+}
+
+/// **草稿头族的共同面**(2026-11-04 clean-code)。
+///
+/// 为什么是「trait = 族/下探」而不是 `Box<dyn DraftHead>` 把 propose/verify
+/// 也虚化:**两族的差异是结构性的,不是可互换行为** —— MTP 走链式 block
+/// (m+1 步自回归 + 链池),DFlash2 走噪声块 + 码本选择器 + 环窗口 + taps,
+/// 图拓扑、KV 布局、propose 签名都不同。把它们的**行为**硬塞进一个 dyn 接口,
+/// 只会把编译期 match 换成运行期 downcast,**分支一个不减**。
+///
+/// 真正共享的是**族判定 + 深度/几何/窗口这些事实**:这些方法把"是哪个族"
+/// 收敛到唯一一处 `match`(本文件),调用点不再出现 `Drafter::` 模式匹配;
+/// 族专面的调用必须在 `as_*()` 之后进行(拿不到 = 该族不适用,提前返回)。
+pub(crate) trait DraftHead {
+    /// 族(数据;不是 `Drafter` 变体本身)
+    fn family(&self) -> SpecMode;
+    /// 族专面:DFlash2(选择器/环窗口/taps 全在这上面)
+    fn as_dflash2(&self) -> Option<&owl_models::layers::dflash2::DFlash2Draft> {
+        None
+    }
+    /// 族专面:DFlash2 的 Arc(propose 图闭包共享所有权用)
+    fn dflash2_arc(&self) -> Option<Arc<owl_models::layers::dflash2::DFlash2Draft>> {
+        None
+    }
+    /// 族专面:MTP 链式草稿头
+    fn as_mtp(&self) -> Option<&owl_models::layers::mtp::MtpPredictor> {
+        None
+    }
+    /// MTP 的 Arc(图闭包共享所有权用)
+    fn mtp_arc(&self) -> Option<Arc<owl_models::layers::mtp::MtpPredictor>> {
+        None
+    }
+}
+
+impl DraftHead for Drafter {
+    /// **全仓唯一的族匹配**。
+    fn family(&self) -> SpecMode {
+        match self {
+            Drafter::Mtp(_) => SpecMode::Mtp,
+            Drafter::DFlash2(_) => SpecMode::DFlash2,
+        }
+    }
+    fn as_dflash2(&self) -> Option<&owl_models::layers::dflash2::DFlash2Draft> {
+        match self {
+            Drafter::DFlash2(d) => Some(d),
+            Drafter::Mtp(_) => None,
+        }
+    }
+    fn dflash2_arc(&self) -> Option<Arc<owl_models::layers::dflash2::DFlash2Draft>> {
+        match self {
+            Drafter::DFlash2(d) => Some(Arc::clone(d)),
+            Drafter::Mtp(_) => None,
+        }
+    }
+    fn as_mtp(&self) -> Option<&owl_models::layers::mtp::MtpPredictor> {
+        match self {
+            Drafter::Mtp(m) => Some(m),
+            Drafter::DFlash2(_) => None,
+        }
+    }
+    fn mtp_arc(&self) -> Option<Arc<owl_models::layers::mtp::MtpPredictor>> {
+        match self {
+            Drafter::Mtp(m) => Some(Arc::clone(m)),
+            Drafter::DFlash2(_) => None,
+        }
+    }
 }
 
 /// spec 接受账(轮级;恒等门/接受率观测面)
@@ -215,8 +284,9 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) spec: &'a owl_models::model::ModelSpec,
     /// 哑草稿诊断位(无真草稿器时的 Dumb 档)
     pub(crate) dumb: bool,
-    /// 草稿池 e4m3(B6 偷显存;AL 有损需 A/B)
-    pub(crate) draft_kv_fp8: bool,
+    /// 草稿池存储 dtype(`Bf16` 缺省 / `F8E4M3` = B6 偷显存;AL 有损需 A/B)。
+    /// 单一真源 = `[spec] draft_kv_dtype`;内部一律用 dtype,不留布尔副本。
+    pub(crate) draft_kv_dt: owl_models::contract::Dtype,
     /// 草稿环窗口(0 = auto = 检查点 sliding_window)
     pub(crate) draft_window: usize,
     /// MTP 草稿注意力窗口(tok;0 = 关)
@@ -647,7 +717,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     gs.layers, gs.hq, gs.hkv, gs.hd, gs.tap_ids,
                     gs.block, gs.conv_taps, gs.conv_group, gs.rank, gs.top_k, gs.mask_token
                 );
-                let d2 = boot.draft(draft_dt, inp.draft_kv_fp8)?;
+                let d2 = boot.draft(draft_dt, inp.draft_kv_dt)?;
                 let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
                 let manifest = boot.load(face, &d2, opts).await?;
                 owl_models::formats::load::manifest_mem_ledger(&manifest, "draft-mem");
@@ -669,9 +739,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                 // 装载走通用入口(BF16 全程;设备重排 = 能力自述裁决)
                 let d2 = match inp.tp {
                     Some(tp) if !tp.is_single() => {
-                        owl_models::formats::qwen35::dflash2_draft_sharded(path, inp.draft_kv_fp8, tp)?
+                        owl_models::formats::qwen35::dflash2_draft_sharded(path, inp.draft_kv_dt, tp)?
                     }
-                    _ => owl_models::formats::qwen35::dflash2_draft(path, inp.draft_kv_fp8)?,
+                    _ => owl_models::formats::qwen35::dflash2_draft(path, inp.draft_kv_dt)?,
                 };
                 let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
                 let draft_manifest =
@@ -689,8 +759,8 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         _ => None,
     };
     // DFlash2 草稿 rope(θ 1e7;z-lab 检查点家族)
-    let draft_rope = match &drafter {
-        Some(Drafter::DFlash2(_)) => {
+    let draft_rope = match drafter.as_ref().map(|d| d.family()) {
+        Some(SpecMode::DFlash2) => {
             let (max_pos, dim, theta) = draft_rope_facts.unwrap_or((262_144, 128, 1.0e7));
             let dr = Rope::new(max_pos, dim, dim, theta)?;
             let (shard, slice_id) = match inp.tp {
@@ -730,9 +800,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
         }
     }
     // 草稿池几何(**分片后**;P2.1-b):从检查点声明 + 本 rank 计划算(不再用写死的 const)
-    let (draft_geom, draft_window, draft_env) = match &drafter {
-        Some(Drafter::Mtp(_)) => {
-            // MTP 草稿链池 = 独立页池,**存储 dtype 由 `[spec] draft_kv_fp8` 定**
+    let (draft_geom, draft_window, draft_env) = match drafter.as_ref().map(|d| d.family()) {
+        Some(SpecMode::Mtp) => {
+            // MTP 草稿链池 = 独立页池,**存储 dtype 由 `[spec] draft_kv_dtype` 定**
             // (2026-10-21:此前恒 F16 —— 那条 864 MiB@192k 就是这么白吃的):
             // - fp8 ⇒ e4m3(U32 扁平字节账;每 token 2 KiB)
             // - 否则 ⇒ `draft_dt`(F16;每 token 4 KiB)
@@ -740,12 +810,13 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             // ⇒ 草稿全垃圾(2026-10-13 守卫就抓过这条)。
             let mut env = inp.base_env;
             env.quant = owl_models::module::QuantPlan::F16;
-            env.kv.quant = if inp.draft_kv_fp8 {
+            let fp8 = inp.draft_kv_dt == owl_models::contract::Dtype::F8E4M3;
+            env.kv.quant = if fp8 {
                 owl_models::env::KvQuant::Fp8E4M3
             } else {
                 owl_models::env::KvQuant::None
             };
-            env.kv.dtype = if inp.draft_kv_fp8 {
+            env.kv.dtype = if fp8 {
                 owl_models::contract::Dtype::U32
             } else {
                 draft_dt
@@ -757,7 +828,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             env.attn.verify_arm = owl_shared::config::VerifyArm::V2;
             (None, 0, env)
         }
-        Some(Drafter::DFlash2(_)) => {
+        Some(SpecMode::DFlash2) => {
             // GGUF 草稿:几何已在开箱时定(不重开容器);HF:从 config + 本 rank 计划算
             let g = match draft_geom_raw {
                 Some((layers, hkv, hd, hq, window)) => {
@@ -777,9 +848,9 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
             env.kv.head_dim = g.hd;
             env.kv.grp = g.grp();
             // **草稿池的存储真值**:主池 fp8 不代表草稿池 fp8。草稿池
-            // 默认 BF16;`draft_kv_fp8` 才切 e4m3。env 必须跟着走,
+            // 默认 BF16;`draft_kv_dt` 才切 e4m3。env 必须跟着走,
             // 否则 KernelSelectionEnv 会把主池的 fp8 误报给草稿 picker。
-            env.kv.quant = if inp.draft_kv_fp8 {
+            env.kv.quant = if inp.draft_kv_dt == owl_models::contract::Dtype::F8E4M3 {
                 owl_models::env::KvQuant::Fp8E4M3
             } else {
                 owl_models::env::KvQuant::None

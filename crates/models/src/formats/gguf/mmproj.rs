@@ -43,7 +43,7 @@ pub fn resolve_path(text_path: &Path, explicit: Option<&Path>) -> Result<PathBuf
     if let Some(p) = explicit {
         if !p.is_file() {
             return Err(ModelError::Msg(format!(
-                "[model].vision_path 不是文件: {}",
+                "[vision] path 不是文件: {}",
                 p.display()
             )));
         }
@@ -73,12 +73,12 @@ pub fn resolve_path(text_path: &Path, explicit: Option<&Path>) -> Result<PathBuf
     match candidates.as_slice() {
         [one] => Ok(one.clone()),
         [] => Err(ModelError::Msg(format!(
-            "GGUF 视觉塔:[model].vision = true,但 {} 下没有 `mmproj*.gguf`\
-             —— 请把 [model].vision_path 指向塔文件",
+            "GGUF 视觉塔:[vision] enabled = true,但 {} 下没有 `mmproj*.gguf`\
+             —— 请把 [vision] path 指向塔文件",
             dir.display()
         ))),
         many => Err(ModelError::Msg(format!(
-            "GGUF 视觉塔:{} 下有 {} 个 mmproj 候选（{}）—— 请用 [model].vision_path 显式指定",
+            "GGUF 视觉塔:{} 下有 {} 个 mmproj 候选（{}）—— 请用 [vision] path 显式指定",
             dir.display(),
             many.len(),
             many.iter()

@@ -6,7 +6,7 @@
 //! 「harness 从历史里抽掉一张旧截图,前缀缓存不许失效、删点之后不许重算。」
 //!
 //! 引擎**不自作主张**:客户端在图像上打「将来可能被删」标记(`TurnImage::evict`),
-//! 且 `[pool] image_evict = true` 才启用。没有标记的图 → 逐字节旧路径。
+//! 且 `[vision] image_evict = true` 才启用。没有标记的图 → 逐字节旧路径。
 //!
 //! # 为什么是 leave-gap(而不是旋转 K)
 //!
@@ -208,7 +208,7 @@ pub fn padded_prefix_for_raw(
     ))
 }
 
-/// **页对齐 pad 律**(只在 `[pool] image_evict` 且该图带标记时执行)。
+/// **页对齐 pad 律**(只在 `[vision] image_evict` 且该图带标记时执行)。
 ///
 /// 对每段**可删**图像占位(含 `<|vision_start|>` / `<|vision_end|>` 标记,
 /// 若在场):

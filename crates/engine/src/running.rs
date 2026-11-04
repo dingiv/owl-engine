@@ -10,6 +10,7 @@
 //! KV 由「kv_len 窗口 + 先写后打分」语义天然隔离);真并发随调度层铺开
 //! S3 拼批换入,submit/pump 形状不变。
 
+use crate::spec_runtime::DraftHead as _;
 use owl_iface::contract::{DeviceClient, ModelError};
 use owl_models::tokenizer::Tokenizer;
 
@@ -1171,7 +1172,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         if !opts.images.is_empty() {
             if self.dev.boot.vlm.is_none() {
                 return Err(ModelError::Msg(
-                    "submit: 请求带图,但本档 [model].vision != true(引擎无视觉塔)".into(),
+                    "submit: 请求带图,但本档 [vision] enabled != true(引擎无视觉塔)".into(),
                 ));
             }
             if self.boot.cfg.knobs.max_batch > 1 {
@@ -1184,7 +1185,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 实际每轮全量重灌)⇒ 提交边界**响亮拒**,不静默忽略。
             if !self.boot.cfg.knobs.image_evict && opts.images.iter().any(|i| i.evict) {
                 return Err(ModelError::Msg(
-                    "submit: 图像带 evict(可删)标记,但本档 [pool] image_evict = false\
+                    "submit: 图像带 evict(可删)标记,但本档 [vision] image_evict = false\
                          —— 要么把档位打开,要么去掉标记(不许静默忽略)"
                         .into(),
                 ));
@@ -1217,7 +1218,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             self.boot.tok.encode(&wrapped)
         };
         // **前缀无感删除的页对齐 pad 律**(2026-10-23):只对**带标记**的图像段
-        // 做(且只在 `[pool] image_evict` 开时)—— 未标记/未开档 = 逐字节旧行为。
+        // 做(且只在 `[vision] image_evict` 开时)—— 未标记/未开档 = 逐字节旧行为。
         // 产出的 `spans` 随 turn 走到收口,写回会话账(下一轮删除识别的唯一输入)。
         let (prompt_ids, img_spans, img_pads, deletion) =
             self.image_pad_law(session, raw_ids, &opts.images)?;
@@ -2511,10 +2512,11 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// 本进程的草稿档位（`generation_target_for` 的档位入参真源）。
     fn generation_kind(&self) -> GenerationKind {
-        match self.dev.spec_rt.drafter.as_ref() {
-            Some(crate::spec_runtime::Drafter::DFlash2(_)) => GenerationKind::DFlash2,
-            Some(crate::spec_runtime::Drafter::Mtp(_)) => GenerationKind::Mtp,
-            None => GenerationKind::None,
+        // 族 = 数据(trait 单点);这里只做三态映射,不再模式匹配变体
+        match self.dev.spec_rt.drafter.as_ref().map(|d| d.family()) {
+            Some(crate::spec_runtime::SpecMode::DFlash2) => GenerationKind::DFlash2,
+            Some(crate::spec_runtime::SpecMode::Mtp) => GenerationKind::Mtp,
+            _ => GenerationKind::None,
         }
     }
 

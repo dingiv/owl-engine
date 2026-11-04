@@ -307,9 +307,8 @@ pub struct ModelProfile {
 
 impl ModelProfile {
     /// 主池每 token 字节(K+V × n_full 层 × 头 × 头维 × elem)
-    pub fn kv_bytes_per_token(&self, fp8: bool) -> u64 {
-        let elem = if fp8 { 1 } else { 2 };
-        (self.geom.n_full * 2 * self.geom.n_kv_heads * self.geom.head_dim * elem) as u64
+    pub fn kv_bytes_per_token(&self, kv_bytes_per_elem: usize) -> u64 {
+        (self.geom.n_full * 2 * self.geom.n_kv_heads * self.geom.head_dim * kv_bytes_per_elem) as u64
     }
 
     /// 草稿池每 token 字节(f16;草稿池固定 bf16 档)
@@ -539,8 +538,8 @@ mod tests {
     fn m27b_geometry_matches_engine_calibration() {
         let p = model_profile("qwen3.8-27b-awq").expect("注册表");
         assert_eq!(p.gdn_row_bytes(), 155_713_536, "GDN 单行 = 148.5 MiB(engine 实测)");
-        assert_eq!(p.kv_bytes_per_token(true), 32768, "fp8 主池 = 32 KiB/token");
-        assert_eq!(p.kv_bytes_per_token(false), 65536, "f16 主池 = 64 KiB/token");
+        assert_eq!(p.kv_bytes_per_token(1), 32768, "fp8 主池 = 32 KiB/token");
+        assert_eq!(p.kv_bytes_per_token(2), 65536, "f16 主池 = 64 KiB/token");
         assert_eq!(p.draft_bytes_per_token(), 20480, "草稿池 bf16 = 20 KiB/token");
         assert_eq!(p.weights_bytes(false), 16_650 << 20);
         assert_eq!(p.weights_bytes(true), (16_650 + 1_290) << 20);
@@ -552,8 +551,8 @@ mod tests {
     fn m08b_geometry() {
         let p = model_profile("0.8b").expect("别名");
         assert_eq!(p.geom.n_full, 6);
-        assert_eq!(p.kv_bytes_per_token(true), 6144);
-        assert_eq!(p.kv_bytes_per_token(false), 12288);
+        assert_eq!(p.kv_bytes_per_token(1), 6144);
+        assert_eq!(p.kv_bytes_per_token(2), 12288);
         assert_eq!(p.gdn_row_bytes(), 19_759_104, "= 18 层 × 274,432 × 4");
         assert!(!p.calibrated);
     }

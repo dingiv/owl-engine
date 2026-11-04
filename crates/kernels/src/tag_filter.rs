@@ -12,9 +12,9 @@
 //! 用例：
 //! - `model.kind=gguf` ⇒ 允许集含 `quant.gguf` ⇒ marlin/W4A16 核被拒；
 //! - `model.quant=w4a16` ⇒ 允许集含 `quant.w4a16` ⇒ W4A8/GGUF 核被拒；
-//! - `pool.kv_fp8` ⇒ 允许集含 `kv.main.fp8` ⇒ f16 主池核被拒；
+//! - `pool.kv_dtype = "fp8"` ⇒ 允许集含 `kv.main.fp8` ⇒ f16 主池核被拒；
 //!   草稿池独立为 `kv.draft.*`，不会与主池 facet 混淆。
-//! - `model.vision` ⇒ 允许集含 `feat.vision` ⇒ 视觉核放行；
+//! - `[vision] enabled` ⇒ 允许集含 `feat.vision` ⇒ 视觉核放行；
 //!   未开时视觉核被拒（配置声明与实际发射不一致会响亮暴露）。
 
 use crate::spec::{KernelMeta, KernelTag, LayoutTag, EXCLUSIVE_TAG_FACETS, KERNEL_TAGS};
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn draft_fp8_writers_are_draft_pool_only() {
-        // draft_kv_fp8 档：classic 写核（K0WriteFp8/f16 输入与 bf16 输入）
+        // 草稿池 fp8 档（`[spec] draft_kv_dtype = "fp8"`）：classic 写核（K0WriteFp8/f16 输入与 bf16 输入）
         // 只写草稿池；主池仍走 KnHD。布局门必须让它们存活，同时不能把
         // 它们误当主池写者（E14）。
         let f = TagFilter::from_tags(&[

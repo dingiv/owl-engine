@@ -312,7 +312,7 @@ impl ChatRequest {
     ///
     /// **可删标记**(前缀无感删除;2026-10-23 用户裁决):图像 content part 上
     /// 的 `owl_evict: true` = 「这张图将来可能从历史里被删」。引擎**不自作
-    /// 主张**:只有打了标 + `[pool] image_evict = true` 才补页对齐 pad 并
+    /// 主张**:只有打了标 + `[vision] image_evict = true` 才补页对齐 pad 并
     /// 进删除候选;没打标 = 零行为差异。
     pub fn images(&self, max_pixels: usize) -> Result<Vec<owl_engine::TurnImage>, String> {
         let mut out = Vec::new();

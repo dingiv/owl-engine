@@ -478,7 +478,7 @@ impl ServerConfig {
                 let p = cfg.server.request_dump_dir.trim();
                 (!p.is_empty()).then(|| PathBuf::from(p))
             },
-            vision_max_pixels: cfg.server.vision_max_pixels,
+            vision_max_pixels: cfg.vision.max_pixels,
             model_dir: cfg
                 .model
                 .path
@@ -748,14 +748,14 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         ));
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool=auto(剩余显存;boot 报 cap) chunk={} tail={} \
-             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
+             gdn_slots={} max_batch={} max_concurrency={} kv_dtype={}\n",
             c.runtime.max_seq,
             c.runtime.prefill_chunk,
             c.runtime.prefill_tail_merge,
             c.pool.gdn_slots,
             c.runtime.max_batch,
             c.runtime.max_concurrency,
-            c.pool.kv_fp8,
+            c.pool.kv_dtype,
         ));
         if let Some(e) = r.estimate() {
             out.push_str(&format!(
@@ -798,14 +798,14 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         );
         out.push_str(&format!(
             "[check] resolved: max_seq={} pool=auto(剩余显存;boot 报 cap) chunk={} tail={} \
-             gdn_slots={} max_batch={} max_concurrency={} kv_fp8={}\n",
+             gdn_slots={} max_batch={} max_concurrency={} kv_dtype={}\n",
             c.runtime.max_seq,
             c.runtime.prefill_chunk,
             c.runtime.prefill_tail_merge,
             c.pool.gdn_slots,
             c.runtime.max_batch,
             c.runtime.max_concurrency,
-            c.pool.kv_fp8,
+            c.pool.kv_dtype,
         ));
     }
 
@@ -823,13 +823,16 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         None => None,
     };
     match dir_owned.as_deref() {
-        Some(dir) if dir.is_file() => {
-            let vision_path = c
-                .model
-                .vision_path
-                .as_deref()
-                .filter(|p| !p.as_os_str().is_empty());
-            match check_gguf_model(dir, profile, c.runtime.max_seq, c.model.vision, vision_path) {
+        Some(dir) => {
+            // **一条路径**:源格式(目录 vs 单文件)只决定 `open_decl` 的 gguf 位,
+            // 几何对账 / 视觉声明 / 摘要全部走 `CheckpointDecl` 接口。
+            let vision_path = c.vision.path.as_deref().filter(|p| !p.as_os_str().is_empty());
+            let gguf = dir.is_file();
+            if profile.is_none() && !gguf {
+                out.push_str("[check] model dir: 注册表无该 format ⇒ 几何校验跳过\n");
+            }
+            match check_model_decl(dir, gguf, profile, c.runtime.max_seq, c.vision.enabled, vision_path)
+            {
                 Ok(note) => out.push_str(&format!("[check] model dir: {note}\n")),
                 Err(e) => {
                     ok = false;
@@ -837,17 +840,6 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
                 }
             }
         }
-        Some(dir) => match profile {
-            Some(p) => match check_model_dir(dir, p, c.runtime.max_seq, c.model.vision) {
-                Ok(Some(note)) => out.push_str(&format!("[check] model dir: {note}\n")),
-                Ok(None) => {}
-                Err(e) => {
-                    ok = false;
-                    out.push_str(&format!("[check] FAIL: {e}\n"));
-                }
-            },
-            None => out.push_str("[check] model dir: 注册表无该 format ⇒ 几何校验跳过\n"),
-        },
         None => {
             ok = false;
             out.push_str(
@@ -919,9 +911,9 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         c.spec.draft,
         if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
         c.runtime.max_batch,
-        if c.model.vision { "on" } else { "off" },
+        if c.vision.enabled { "on" } else { "off" },
     ));
-    if c.model.vision {
+    if c.vision.enabled {
         if c.spec.depth > 0 {
             out.push_str(
                 "[check] note: vision=on + spec>0:图像 × 投机已接(V5)—— verify 的 rope \
@@ -931,7 +923,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         } else {
             out.push_str(
                 "[check] note: vision=on + spec=off:图像路径可用(单请求多图;data URL;\
-                 TP2 两 rank 各备塔输出;`[pool] image_evict` = 前缀无感删除)\n",
+                 TP2 两 rank 各备塔输出;`[vision] image_evict` = 前缀无感删除)\n",
             );
         }
     }
@@ -1004,159 +996,47 @@ fn check_mtp_head(dir: &Path) -> Result<String, String> {
 ///
 /// 与 [`check_model_dir`] 的分工:GGUF 没有 `config.json`,超参/词表/rope
 /// 全在文件内;视觉塔在**同目录 mmproj**。本函数只读索引,不装权重。
-fn check_gguf_model(
+/// **检查点对账(`--check` 单一入口;2026-11-04 clean-code)**。
+///
+/// 两条旧的格式专用路径(`check_gguf_model` / `check_model_dir`)合并为一条:
+/// 声明事实由 `owl_models::formats::decl::open_decl` 按源格式分派(唯一一处
+/// `gguf=?` 判断),几何对账 / 视觉声明 / 摘要全部走 `CheckpointDecl` 接口。
+fn check_model_decl(
     path: &Path,
+    gguf: bool,
     profile: Option<&owl_shared::config::intent::ModelProfile>,
-    ctx: usize,
+    max_seq: usize,
     vision: bool,
     vision_path: Option<&Path>,
 ) -> Result<String, String> {
-    use owl_models::formats::gguf::{resolve_mmproj_path, rope_facts, spec_from_gguf, Gguf};
-    let g = Gguf::open(path).map_err(|e| format!("打开 GGUF {} 失败: {e}", path.display()))?;
-    let (spec, rep) = spec_from_gguf(&g).map_err(|e| format!("{} GGUF 超参: {e}", path.display()))?;
-    let rf = rope_facts(&g).map_err(|e| format!("{} GGUF rope: {e}", path.display()))?;
-    if let Some(p) = profile {
-        let geom = p.geom;
-        let (_, hkv, hd) = spec.full_heads;
-        for (what, got, want) in [
-            ("hidden", spec.hidden, geom.hidden),
-            ("layers", spec.layer_types.len(), geom.n_layers),
-            ("kv_heads", hkv, geom.n_kv_heads),
-            ("head_dim", hd, geom.head_dim),
-            ("vocab", spec.vocab, geom.vocab),
-        ] {
-            if got != want {
-                return Err(format!(
-                    "{} 与 intent.model={:?} 不匹配:{what}={got} 期望 {want}",
-                    path.display(),
-                    p.key
-                ));
-            }
-        }
-    }
-    let mut note = format!(
-        "{} ✓ GGUF {} · hidden={} layers={}(full {}) kv_heads={} hd={} vocab={} · ctx={}{}",
-        path.display(),
-        rep.arch,
-        spec.hidden,
-        spec.layer_types.len(),
-        spec.layer_types.iter().filter(|f| **f).count(),
-        spec.full_heads.1,
-        spec.full_heads.2,
-        spec.vocab,
-        rf.max_pos,
-        if ctx > rf.max_pos {
-            format!("（runtime.max_seq={ctx} > 模型 ctx；需 YaRN）")
-        } else {
-            String::new()
-        }
-    );
-    if vision {
-        let mm = resolve_mmproj_path(path, vision_path).map_err(|e| e.to_string())?;
-        let mg = Gguf::open(&mm).map_err(|e| format!("打开 mmproj {} 失败: {e}", mm.display()))?;
-        let vcfg = owl_models::vlm::VlmCfg::from_gguf(&g, &mg, spec).map_err(|e| e.to_string())?;
-        note.push_str(&format!(
-            " · vision={}（塔 {} 层 / hidden {} / out {} / image_token {}）",
-            mm.display(),
-            vcfg.vision.depth,
-            vcfg.vision.hidden,
-            vcfg.vision.out_hidden,
-            vcfg.image_token
+    use owl_models::formats::decl::{check_geom_against, open_decl, MaxPosPolicy};
+
+    let Some(decl) = open_decl(path, gguf)? else {
+        return Ok(format!(
+            "{} 不可读(config.json 缺失)—— 几何校验跳过(真启动会失败)",
+            path.display()
         ));
+    };
+    if let Some(p) = profile {
+        check_geom_against(decl.as_ref(), p, max_seq)?;
+    }
+    let mut note = decl.summary();
+    // max_pos 的**软**超标只在摘要里提示(HF 是硬拒,已在 check_geom_against 抛)
+    let g = decl.geom();
+    if decl.max_pos_policy() == MaxPosPolicy::WarnYarn && g.max_pos != 0 && max_seq > g.max_pos {
+        note.push_str(&format!("（runtime.max_seq={max_seq} > 模型 ctx；需 YaRN）"));
+    }
+    if vision {
+        if let Some(v) = decl.vision(vision_path)? {
+            note.push_str(&format!(" · vision={}", v.note));
+        }
     } else if vision_path.is_some() {
         return Err(format!(
-            "{}:[model].vision_path 已设置但 [model].vision = false（配置自相矛盾）",
+            "{}:[vision] path 已设置但 [vision] enabled = false（配置自相矛盾）",
             path.display()
         ));
     }
     Ok(note)
-}
-
-
-fn check_model_dir(
-    dir: &Path,
-    profile: &owl_shared::config::intent::ModelProfile,
-    ctx: usize,
-    vision: bool,
-) -> Result<Option<String>, String> {
-    let p = dir.join("config.json");
-    if !p.is_file() {
-        return Ok(Some(format!(
-            "{} 不可读(config.json 缺失)—— 几何校验跳过(真启动会失败)",
-            dir.display()
-        )));
-    }
-    let raw = owl_shared::file_loader::read_to_string(&p)
-        .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
-    if vision {
-        if v.get("vision_config").is_none() {
-            return Err(format!(
-                "[model].vision = true,但 {} 的 config.json 无 vision_config(不是 VLM 检查点)",
-                dir.display()
-            ));
-        }
-        if v.get("image_token_id").and_then(|x| x.as_u64()).is_none() {
-            return Err(format!(
-                "[model].vision = true,但 {} 的 config.json 缺 image_token_id",
-                dir.display()
-            ));
-        }
-    }
-    let g = v.get("text_config").unwrap_or(&v);
-    let getu = |k: &str| g.get(k).and_then(|x| x.as_u64()).map(|n| n as usize);
-    let geom = profile.geom;
-    for (k, want) in [
-        ("hidden_size", geom.hidden),
-        ("num_hidden_layers", geom.n_layers),
-        ("num_key_value_heads", geom.n_kv_heads),
-        ("head_dim", geom.head_dim),
-        ("vocab_size", geom.vocab),
-    ] {
-        if let Some(got) = getu(k) {
-            if got != want {
-                return Err(format!(
-                    "模型目录与 intent.model={:?} 不匹配:{k}={got} 期望 {want}\n\
-                     —— 检查 [model].path / [site].model_dir 是否指向了别的检查点",
-                    profile.key
-                ));
-            }
-        }
-    }
-    if let Some(pos) = getu("max_position_embeddings") {
-        if ctx > pos {
-            return Err(format!(
-                "max_seq={ctx} 超过检查点 max_position_embeddings={pos}(模型装不下)"
-            ));
-        }
-        if pos != geom.max_pos {
-            return Err(format!(
-                "检查点 max_position_embeddings={pos} 与注册表 {:?} 的 {} 不一致 —— \
-                 注册表需按该检查点重建(或换回注册表对应模型)",
-                profile.key, geom.max_pos
-            ));
-        }
-    }
-    if let Some(interval) = getu("full_attention_interval") {
-        if interval > 0 && geom.n_layers / interval != geom.n_full {
-            return Err(format!(
-                "检查点 full_attention_interval={interval} ⇒ n_full={},注册表 n_full={} —— 几何漂移",
-                geom.n_layers / interval,
-                geom.n_full
-            ));
-        }
-    }
-    Ok(Some(format!(
-        "{} ✓ hidden={} layers={}(full {}) kv_heads={} hd={} max_pos={}",
-        dir.display(),
-        geom.hidden,
-        geom.n_layers,
-        geom.n_full,
-        geom.n_kv_heads,
-        geom.head_dim,
-        geom.max_pos
-    )))
 }
 
 /// 草稿 `config.json` 校验(DFlash2 + W4A16 pack-quantized;BF16 源 = AL 0)

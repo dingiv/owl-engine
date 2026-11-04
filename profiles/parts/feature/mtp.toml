@@ -2,4 +2,4 @@
 [spec]
 depth = 3
 draft = "mtp"
-draft_kv_fp8 = false
+draft_kv_dtype = "bf16"
