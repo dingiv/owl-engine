@@ -277,6 +277,7 @@ pub fn resolve(req: OpReq) -> KernelPick {
         "attn.int8_decode_paged" => attn::int8_decode_paged(ax(0), ax(1)), // aux=[B,hq]
         "attn.int8_decode_split" => attn::int8_decode_split(ax(0), ax(1), ax(2)), // aux=[B,hq,nparts]
         "attn.int8_decode_gqa_tc" => attn::int8_decode_gqa_tc_split(ax(0), ax(2), ax(3)), // aux=[B,hq,hkv,nparts]
+        "attn.int8_decode_pth_pc" => attn::int8_decode_pth_pc_split(ax(0), ax(2), ax(3)), // aux=[B,hq,hkv,nparts]
         "attn.int8_decode_reduce" => attn::int8_decode_reduce(ax(0), ax(1)), // aux=[B,hq]
         "attn.paged_decode" => attn::paged_decode_v1(req.env, dt, ax(0), ax(1), ax(2), ax(3)), // aux = [hd, hq, hkv, nb]
         "attn.paged_decode_v2" => {
@@ -1972,8 +1973,9 @@ pub mod attn {
         KernelPick::of::<crate::ops::attn::Int8PrefillPaged>(Shape {
             grid: (tokens.div_ceil(64) as u32, hq as u32, 1),
             block: (128, 1, 1),
-            // Q 16K + K 8K + V 8K + P32 8K + Kscale 1K + Vscale 128B
-            smem: (16384 + 8192 + 8192 + 2048 + 1024 + 128) as u32,
+            // Q 16K + K 8K + V(dim-major b16) 8K + P32 8K + Kscale 1K
+            // + Vscale 128B + token-major V staging 8K
+            smem: (16384 + 8192 + 8192 + 2048 + 1024 + 128 + 8192) as u32,
         })
     }
 
@@ -2011,6 +2013,16 @@ pub mod attn {
             grid: (hkv as u32, batch as u32, nparts as u32),
             block: (256, 1, 1),
             smem: 0,
+        })
+    }
+
+    /// int8 decode PTH producer/consumer 臂:4 compute + 4 producer warps,
+    /// 2-stage 64-token tile,1 CTA/SM;smem = 78944B(>48K,生产 launch 走 opt-in)。
+    pub fn int8_decode_pth_pc_split(batch: usize, hkv: usize, nparts: usize) -> KernelPick {
+        KernelPick::of::<crate::ops::attn::Int8DecodePthPcSplit>(Shape {
+            grid: (hkv as u32, batch as u32, nparts as u32),
+            block: (256, 1, 1),
+            smem: 78944,
         })
     }
 

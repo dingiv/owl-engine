@@ -1,17 +1,20 @@
 // ============================================================================
-// INT8 V 的生产写者(2026-11-03,INT8 KV 生产接线)
+// INT8 V 的生产写者(2026-11-03,INT8 KV 生产接线;2026-11-04 token-major)
 //
-// 布局(与 int8_prefill.cu 的读侧逐字同源):
-//   vp:     [nb, Hkv, D, page/2] b16(low = 页内 key0, high = key1)
-//   vscale: [nb, page, Hkv] f32(per token/head;沿 K 不再恒定)
+// 布局:
+//   v:      [nb, page, Hkv, D] int8       (token-major;每 token 的 D 维连续)
+//   vscale: [nb, page, Hkv] f32           (per token/head)
 //
 // 2026-11-03 质量修复:V scale 从"每页/每头/8-dim"改为"每 token/每头"。
 // 页内 32 token 共用一个 absmax 会把 needle token 压扁;per-token scale
 // 直接跟 token 走。PV 端把 s_t 折进 P(P' = P·s_t,V 存 v/s_t),因此
 // tensor-core PV 仍只需一个沿 K 恒定的 scale(=1),不需要额外 mma 或 V shadow。
 //
-// prefill:一个 block 负责 (逻辑页, kv_head);8 warp 各管两个 token 对,
-// 每对一次写完整 uint16(b16 低/高字节),无需 block barrier。decode:单 token 追加。
+// 2026-11-04:PTH 对照实验证明 V 的 token-major 布局是 decode 的另一半
+// 收益(65k split 181us -> 159us)。池字节数与 block_bytes 不变,只是把
+// 同一页的 32KB 从 [Hkv,D,page/2] b16 重新解释为 [page,Hkv,D] int8;
+// K/Kscale 完全不动。prefill 一个 block 负责 (逻辑页, kv_head),8 warp
+// 各管一个 token;decode 单 token 直接写 D 字节,不再有 b16 RMW。
 // ============================================================================
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -34,9 +37,22 @@ __device__ __forceinline__ float warp_max(float x) {
   }
   return x;
 }
+
+__device__ __forceinline__ uint2 pack_i8x8(const int8_t q[8]) {
+  uint2 r;
+  r.x = static_cast<uint32_t>(static_cast<uint8_t>(q[0])) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(q[1])) << 8) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(q[2])) << 16) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(q[3])) << 24);
+  r.y = static_cast<uint32_t>(static_cast<uint8_t>(q[4])) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(q[5])) << 8) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(q[6])) << 16) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(q[7])) << 24);
+  return r;
+}
 }  // namespace
 
-/// 整页统计 + 打包(prefill)。grid = (npages_logical, Hkv, 1),block = 256。
+/// 整页 V 量化(prefill)。grid = (npages_logical, Hkv, 1),block = 256。
 extern "C" __global__ void owl_v_pack_int8_prefill(
     const __half* __restrict__ v,       // [T, Hkv, D]
     const float* __restrict__ slots,    // [T] 物理槽
@@ -45,69 +61,47 @@ extern "C" __global__ void owl_v_pack_int8_prefill(
     int D,
     int page,
     float* __restrict__ vscale,         // [nb, page, Hkv]
-    uint16_t* __restrict__ vp) {        // [nb, Hkv, D, page/2]
+    int8_t* __restrict__ v8) {          // [nb, page, Hkv, D]
   const int lp = blockIdx.x;
   const int h = blockIdx.y;
   const int t0 = lp * page;
   if (t0 >= T) {
     return;
   }
-  const int slot0 = static_cast<int>(slots[t0]);
-  if (slot0 < 0) {
-    return;
-  }
-  const int phys = slot0 / page;
-  if ((slot0 % page) != 0) {
-    return;
-  }
 
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int n = min(page, T - t0);
-  const int PP = page / 2;
-  const int npair = (n + 1) / 2;
-  // 一个 warp 负责一个 token 对：两 token 的 256 维 absmax 用 warp shuffle，
-  // 且同一 warp 写同一 uint16 的两个字节 ⇒ 无跨 warp 读改写竞争、无 block barrier。
-  for (int pair = warp; pair < npair; pair += kThreads / 32) {
-    const int i0 = pair * 2;
-    const int i1 = i0 + 1;
-    const long long row0 = ((long long)(t0 + i0) * Hkv + h) * D;
-    const long long row1 = ((long long)(t0 + i1) * Hkv + h) * D;
-    const bool have1 = i1 < n;
-    float x0[8], x1[8];
-    float amax0 = 0.0f, amax1 = 0.0f;
+  // 一个 warp 负责一个 token:lane 读 8 个 half(16B),写 8 个 int8(8B)。
+  // 同 warp 内 32 lane 覆盖 D=256,无跨 warp 读改写竞争,无需 block barrier。
+  for (int i = warp; i < n; i += kThreads / 32) {
+    const int slot = static_cast<int>(slots[t0 + i]);
+    if (slot < 0) {
+      continue;
+    }
+    const long long row = ((long long)(t0 + i) * Hkv + h) * D;
+    float x[8];
+    float amax = 0.0f;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       const int d = lane * 8 + j;
-      x0[j] = __half2float(v[row0 + d]);
-      amax0 = fmaxf(amax0, fabsf(x0[j]));
-      if (have1) {
-        x1[j] = __half2float(v[row1 + d]);
-        amax1 = fmaxf(amax1, fabsf(x1[j]));
-      } else {
-        x1[j] = 0.0f;
-      }
+      x[j] = __half2float(v[row + d]);
+      amax = fmaxf(amax, fabsf(x[j]));
     }
-    amax0 = warp_max(amax0);
-    amax1 = warp_max(amax1);
-    const float scale0 = fmaxf(amax0 / 127.0f, 1e-6f);
-    const float scale1 = fmaxf(amax1 / 127.0f, 1e-6f);
+    amax = warp_max(amax);
+    const float scale = fmaxf(amax / 127.0f, 1e-6f);
     if (lane == 0) {
-      vscale[((long long)(phys * page + i0) * Hkv) + h] = scale0;
-      if (have1) {
-        vscale[((long long)(phys * page + i1) * Hkv) + h] = scale1;
-      }
+      vscale[(long long)slot * Hkv + h] = scale;
     }
-    const float inv0 = 1.0f / scale0;
-    const float inv1 = 1.0f / scale1;
+    const float inv = 1.0f / scale;
+    int8_t q[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      const int d = lane * 8 + j;
-      const uint8_t b0 = static_cast<uint8_t>(quant_v_i8(x0[j], inv0));
-      const uint8_t b1 = static_cast<uint8_t>(quant_v_i8(x1[j], inv1));
-      vp[(((long long)phys * Hkv + h) * D + d) * PP + pair] =
-          static_cast<uint16_t>(b0 | (static_cast<uint16_t>(b1) << 8));
+      q[j] = quant_v_i8(x[j], inv);
     }
+    // slot = phys*page + key ⇒ [key, Hkv, D] 的 token 行。
+    int8_t* dst = v8 + ((long long)slot * Hkv + h) * D + lane * 8;
+    *reinterpret_cast<uint2*>(dst) = pack_i8x8(q);
   }
 }
 
@@ -120,7 +114,7 @@ extern "C" __global__ void owl_v_append_int8_paged(
     int D,
     int page,
     float* __restrict__ vscale,         // [nb, page, Hkv]
-    uint16_t* __restrict__ vp,          // [nb, Hkv, D, page/2]
+    int8_t* __restrict__ v8,            // [nb, page, Hkv, D]
     const __half* __restrict__ dep,     // 树序依赖边(不解引用)
     __half* __restrict__ out) {         // 哑输出(槽序契约 4)
   const int t = blockIdx.x;
@@ -135,10 +129,6 @@ extern "C" __global__ void owl_v_append_int8_paged(
   if (slot < 0) {
     return;
   }
-  const int phys = slot / page;
-  const int off = slot % page;
-  const int PP = page / 2;
-  const int pair = off / 2;
   const long long row = ((long long)t * Hkv + h) * D;
   float x[8];
   float amax = 0.0f;
@@ -151,18 +141,14 @@ extern "C" __global__ void owl_v_append_int8_paged(
   amax = warp_max(amax);
   const float scale = fmaxf(amax / 127.0f, 1e-6f);
   if (lane == 0) {
-    vscale[((long long)slot * Hkv) + h] = scale;
+    vscale[(long long)slot * Hkv + h] = scale;
   }
   const float inv = 1.0f / scale;
+  int8_t q[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    const int d = lane * 8 + j;
-    const uint8_t byte = static_cast<uint8_t>(quant_v_i8(x[j], inv));
-    uint16_t* word = &vp[(((long long)phys * Hkv + h) * D + d) * PP + pair];
-    if ((off & 1) == 0) {
-      *word = static_cast<uint16_t>((*word & 0xFF00u) | byte);
-    } else {
-      *word = static_cast<uint16_t>((*word & 0x00FFu) | (static_cast<uint16_t>(byte) << 8));
-    }
+    q[j] = quant_v_i8(x[j], inv);
   }
+  int8_t* dst = v8 + ((long long)slot * Hkv + h) * D + lane * 8;
+  *reinterpret_cast<uint2*>(dst) = pack_i8x8(q);
 }

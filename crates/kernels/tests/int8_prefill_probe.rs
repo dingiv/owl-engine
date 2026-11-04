@@ -18,7 +18,7 @@ const SRC_F16PV: &str = "cu/attn/int8_prefill_f16pv.cu";
 const D: usize = 256;
 const HQ: usize = 24;
 const HKV: usize = 4;
-const SMEM: u32 = 16384 + 8192 + 8192 + 2048 + 1024 + 128;
+const SMEM: u32 = 16384 + 8192 + 8192 + 2048 + 1024 + 128 + 8192;
 
 fn lcg_u8(n: usize, seed: u32) -> Vec<u8> {
     (0..n)
@@ -72,9 +72,9 @@ fn run(t: usize, l: usize, timing: bool) -> Option<()> {
     let qs = lcg_f32(t * HQ * 8, 0x2345, 0.004, 0.004);
     let k = lcg_u8(l * HKV * D, 0x3456);
     let ks = lcg_f32(l * HKV * 8, 0x4567, 0.004, 0.004);
-    // V prepacked [Hkv][D][L/2] b16, random bytes.
+    // V token-major [L, Hkv, D] int8, random bytes.
     let page = 32usize;
-    let vp = lcg_u8(HKV * D * (l / 2) * 2, 0x5678);
+    let vp = lcg_u8(HKV * D * l, 0x5678);
     let nblocks = l / page;
     let bt: Vec<f32> = (0..nblocks as u32).map(|x| x as f32).collect();
     let btb: Vec<u8> = bt.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -202,21 +202,7 @@ fn int8_prefill_correctness_small() {
         .map(|&x| (x as i8) as u8)
         .collect::<Vec<u8>>();
     let vs = lcg_f32(L * HKV, 0x6666, 0.005, 0.005);
-    let pp = PAGE / 2;
-    let mut vp = vec![0u8; HKV * D * pp * 2];
-    for h in 0..HKV {
-        for d in 0..D {
-            for pair in 0..pp {
-                let k0 = pair * 2;
-                let k1 = k0 + 1;
-                let a = v[(k0 * HKV + h) * D + d];
-                let b = v[(k1 * HKV + h) * D + d];
-                let off = ((h * D + d) * pp + pair) * 2;
-                vp[off] = a;
-                vp[off + 1] = b;
-            }
-        }
-    }
+    let vp = v.clone();
     let bt = [0f32];
     let btb: Vec<u8> = bt.iter().flat_map(|x| x.to_le_bytes()).collect();
     let qsb: Vec<u8> = qs.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -353,23 +339,7 @@ fn int8_prefill_correctness_multi_page() {
         .map(|&x| (x as i8) as u8)
         .collect::<Vec<u8>>();
     let vs = lcg_f32(L * HKV, 0x6666, 0.005, 0.005);
-    let pp = PAGE / 2;
-    let mut vp = vec![0u8; NB * HKV * D * pp * 2];
-    for pg in 0..NB {
-        for h in 0..HKV {
-            for d in 0..D {
-                for pair in 0..pp {
-                    let key0 = pg * PAGE + pair * 2;
-                    let key1 = key0 + 1;
-                    let a = v[(key0 * HKV + h) * D + d];
-                    let b = v[(key1 * HKV + h) * D + d];
-                    let off = (((pg * HKV + h) * D + d) * pp + pair) * 2;
-                    vp[off] = a;
-                    vp[off + 1] = b;
-                }
-            }
-        }
-    }
+    let vp = v.clone();
     let bt = [0f32, 1f32];
     let btb: Vec<u8> = bt.iter().flat_map(|x| x.to_le_bytes()).collect();
     let qsb: Vec<u8> = qs.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -630,26 +600,7 @@ fn int8_prefill_1024_tail_rows_match_host() {
         .map(|&x| (x as i8) as u8)
         .collect::<Vec<u8>>();
     let vs = lcg_f32(L * HKV, 0x6666, 0.005, 0.005);
-    let pp = PAGE / 2;
-    let mut vp = vec![0u8; NB * HKV * D * pp * 2];
-    for pg in 0..NB {
-        for h in 0..HKV {
-            for d in 0..D {
-                for pair in 0..pp {
-                    let key0 = pg * PAGE + pair * 2;
-                    let key1 = key0 + 1;
-                    if key1 >= L {
-                        continue;
-                    }
-                    let a = v[(key0 * HKV + h) * D + d];
-                    let b = v[(key1 * HKV + h) * D + d];
-                    let off = (((pg * HKV + h) * D + d) * pp + pair) * 2;
-                    vp[off] = a;
-                    vp[off + 1] = b;
-                }
-            }
-        }
-    }
+    let vp = v.clone();
     let bt: Vec<f32> = (0..NB as u32).map(|x| x as f32).collect();
     let btb: Vec<u8> = bt.iter().flat_map(|x| x.to_le_bytes()).collect();
     let qsb: Vec<u8> = qs.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -801,26 +752,7 @@ fn int8_prefill_chunk_tail_rows_match_host() {
         .map(|&x| (x as i8) as u8)
         .collect::<Vec<u8>>();
     let vs = lcg_f32(L * HKV, 0x6666, 0.005, 0.005);
-    let pp = PAGE / 2;
-    let mut vp = vec![0u8; NB * HKV * D * pp * 2];
-    for pg in 0..NB {
-        for h in 0..HKV {
-            for d in 0..D {
-                for pair in 0..pp {
-                    let key0 = pg * PAGE + pair * 2;
-                    let key1 = key0 + 1;
-                    if key1 >= L {
-                        continue;
-                    }
-                    let a = v[(key0 * HKV + h) * D + d];
-                    let b = v[(key1 * HKV + h) * D + d];
-                    let off = (((pg * HKV + h) * D + d) * pp + pair) * 2;
-                    vp[off] = a;
-                    vp[off + 1] = b;
-                }
-            }
-        }
-    }
+    let vp = v.clone();
     let bt: Vec<f32> = (0..NB as u32).map(|x| x as f32).collect();
     let btb: Vec<u8> = bt.iter().flat_map(|x| x.to_le_bytes()).collect();
     let qsb: Vec<u8> = qs.iter().flat_map(|x| x.to_le_bytes()).collect();

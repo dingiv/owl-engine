@@ -604,6 +604,7 @@ pub struct KvBuffers {
     pub block_tables: TensorOps,
     /// INT8 KV 的两张 scale 平面(None = f16/fp8 档)。
     /// K scale = `[nb, page, hkv, 8]` / V scale = `[nb, page, hkv]`。
+    /// INT8 档 `v_cache` = token-major `[nb, page, hkv, hd] int8`。
     pub int8: Option<KvInt8Planes>,
 }
 

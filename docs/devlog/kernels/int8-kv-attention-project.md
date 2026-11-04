@@ -2306,3 +2306,21 @@ trait KvPageCodec {
 P2b 入口：INT8 sparse prefill（`fi_plan_ctx` 视图口径已作为前置接进
 `paged_prefill_int8_output`，但还未通过选择层质量门）与 VLM/m-RoPE
 INT8 prefill。
+
+---
+
+## 2026-11-04：V token-major 生产化（decode）
+
+PTH 对照实验定谳“V 池布局也是 decode 的一半收益”后，生产格式从
+`[nb,Hkv,D,page/2] b16` 改为 `[nb,page,Hkv,D] int8`；K/Kscale/QK 不动。
+
+- writer：prefill 一 warp 一 token、append 单 token 直写 D 字节，删 b16 RMW；
+- prefill P8：token-major 连续预取 → shared transpose 回 dim-major b16，
+  P 量化/softmax 原样；
+- decode：新增 `owl_int8_decode_pth_pc_split`（4+4 warp、2-stage 64-token、
+  named barrier、f16 swap-AB PV、nparts=21/34、78944B smem）；
+- `KvPageCodec::v_row` 改 token-major；INT8 磁盘目录加 `.int8-v2-token-major`
+  防止旧 packed 字节被新进程误读；
+- 313 models / 215 engine / 5 pipeline / 6 prefill 单测全绿；3090 65k
+  kernel 160.5us，3080 TP2 65k e2e 51.8 t/s（旧 47.1~47.4）。
+  prefill transpose 向量化后 65k e2e 1629 t/s（旧 1691，−3.7%）。

@@ -2,7 +2,7 @@
 // owl INT8 QK + f16 PV probe. 4-warp / Bc=32 / Br=64 / D=256.
 //
 // 契约:v16 必须是**已反量化的 V shadow**(f16(code * vscale)),本核不再乘
-// vscale。生产 P8 核(`int8_prefill.cu`)读 V int8 packed + vscale,不要把这个
+// vscale。生产 P8 核(`int8_prefill.cu`)读 V token-major int8 + vscale,不要把这个
 // 研究核直接接进池;要接必须先补 vscale 参数或改 writer 契约。
 #include "int8_attn_helpers.cuh"
 

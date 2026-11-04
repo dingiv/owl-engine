@@ -1,9 +1,9 @@
-# 池组件：INT8 KV（K int8 + V packed + per-token/per-page scale）。
+# 池组件：INT8 KV（K int8 + V token-major + per-token V scale）。
 #
 # 约束（boot 响亮拒）：
 #   - hd=256 / page=32 / paged；
 #   - spec 已接（2026-11-03 P1：专用 verify 臂，T=depth+1）；
-#   - index/coverage/select_decode 已接（KvPageCodec 多态；K 带 Kscale、V 解 packed）；
+#   - index/coverage/select_decode 已接（KvPageCodec 多态；K 带 Kscale、V 解 token-major）；
 #   - select_partial 已接（2026-11-04：稠密 prefill 按 chunk 会话链重建块表）；
 #   - image_evict 已接（2026-11-04：末块 sync 后视觉 grounding/删除吸收全绿）。
 [pool]

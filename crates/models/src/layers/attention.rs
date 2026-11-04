@@ -986,15 +986,6 @@ impl Attention {
             .arg(&wr)
             .with_shape(Dtype::F16, vec![1]);
         let bt_stride = kv.block_tables.shape().last().copied().unwrap_or(1).max(1);
-        // KV 页按 nparts 分片并行;partial = (未归一化 acc, m, l),reduce 合并。
-        // 单序列 decode 用 56 片:4 kv_head × 56 = 224 blocks,~2.7 wave,
-        // 每片约 37 页(65k);256 片的 reduce 税在 65k 达 0.1ms/层,
-        // 且短 ctx 空 block 过多。56 片在 8k~140k 全档最优或近最优
-        // (2026-11-04 3090 Ti 扫档;u8s8 split+reduce 65k 683→543us)。
-        // 批 decode 仍 64 片,避免 scratch 按 56 重排。
-        let nparts: usize = if tokens == 1 { 56 } else { 64 };
-        let partial_out = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * self.hd]);
-        let partial_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2]);
         // GQA 头合并 + tensor-core QK/PV:一个 block 服务同 KV head 的 grp 个
         // q head,K/V 只读一遍;grp<=8 / hd256 / page32 是核契约。
         let grp = self.hq.checked_div(self.hkv).unwrap_or(0);
@@ -1003,7 +994,31 @@ impl Attention {
             && self.hq % self.hkv == 0
             && self.hd == 256
             && pol.page == 32;
-        let split_op = if tc_ok {
+        // 单序列 decode 走 PTH producer/consumer 臂(4+4 warp,2-stage
+        // 64-token tile,1 CTA/SM):3090 84 SM 取 4 kv_head × 21 = 84 blocks,
+        // 正好一波。批 decode/verify 仍走旧 64/256 片,避免 64-token 单序列
+        // 核套到多序列页链。
+        let pth_ok = tokens == 1 && tc_ok;
+        // 3090 Ti 84 SM:4 kv_head × 21 = 84 blocks(一波);
+        // 3080 68 SM:实测 34 片更快(136 blocks/两波;21 片单波反而
+        // 每块 tile 太多,65k kernel 264→215us)。0 = 未知 ⇒ 21。
+        let pth_nparts = if ctx.env.sm_count > 0 && ctx.env.sm_count < 80 {
+            34
+        } else {
+            21
+        };
+        let nparts: usize = if pth_ok {
+            pth_nparts
+        } else if tokens == 1 {
+            56 // 旧 GQA 臂(非 PTH 几何/回退)的 65k 最优档
+        } else {
+            64
+        };
+        let partial_out = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * self.hd]);
+        let partial_stat = TensorOps::zeros(Dtype::F32, vec![tokens * self.hq * nparts * 2]);
+        let split_op = if pth_ok {
+            SemanticKernel::Int8DecodePthPcSplit
+        } else if tc_ok {
             SemanticKernel::Int8DecodeGqaTcSplit
         } else {
             SemanticKernel::Int8DecodeSplit
@@ -1265,7 +1280,7 @@ impl Attention {
         }
         if ctx.ctx_base % pol.page != 0 {
             return poisoned(&format!(
-                "chunk 起点未页对齐(ctx_base={} page={});V per-page scale 不能跨 chunk 重算",
+                "chunk 起点未页对齐(ctx_base={} page={});V token-major scale 不能跨 chunk 重算",
                 ctx.ctx_base, pol.page
             ));
         }

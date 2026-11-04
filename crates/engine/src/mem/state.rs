@@ -318,7 +318,7 @@ pub(crate) struct PoolGeom {
     /// B6.2:主 KV 池 fp8 e4m3 承载(true = 池块 U32 字节承载 1B/elem;
     /// 读核走 *_fp8 变体,写核 K0 转换写)
     pub(crate) kv_fp8: bool,
-    /// INT8 主池(K int8 / V packed / 两张 scale 平面)
+    /// INT8 主池(K int8 / V token-major / 两张 scale 平面)
     pub(crate) kv_int8: bool,
     /// 每页 token 折叠因子(页内行布局;legacy = 1)
     x: usize,
@@ -1025,7 +1025,7 @@ impl StatePool {
         let kv_label = match plan.kv {
             owl_models::env::KvQuant::Fp8E4M3 => "kv fp8 e4m3",
             owl_models::env::KvQuant::Fp8E5M2 => "kv fp8 e5m2",
-            owl_models::env::KvQuant::Int8 => "kv int8 (K int8 / V packed / no shadow)",
+            owl_models::env::KvQuant::Int8 => "kv int8 (K int8 / V token-major / no shadow)",
             owl_models::env::KvQuant::None => "kv f16",
         };
         owl_shared::log_info!("boot", "状态块分配 {:.2}s({kv_label} ×{} / gdn ×{},会话容量 {},池 {nb} 页 × {page} tok,页表 nb = {nb},dflash = {df},XQA sm = {xqa_sm})",
@@ -1320,7 +1320,7 @@ impl StatePool {
     /// 逐层 KV cache 叶子句柄((k, v);slots/kv_lens/block_tables 由
     /// 调用方按步注入 —— 图闭包注输入槽,prefill 注 from_host 标量行)
     pub(crate) fn kv_caches(&self) -> Vec<(TensorOps, TensorOps)> {
-        // INT8:K int8 张量 + V packed b16 字节块(两者每页字节数相同)。
+        // INT8:K int8 张量 + V token-major int8 字节块(两者每页字节数相同)。
         if self.geom.kv_int8 {
             let n = self.geom.nb_kv * self.geom.dims.hkv * self.geom.dims.hd * self.geom.page;
             return self

@@ -1,4 +1,4 @@
-// owl native INT8 paged prefill (K int8 + V int8 prepacked + P uint8), no V shadow.
+// owl native INT8 paged prefill (K int8 + V token-major int8 + P uint8), no V shadow.
 // 4-warp / Bc=32 / Br=64 / D=256. Ported from the validated fi-int8 experiment.
 //
 // 2026-11-03 质量复测:此前 P8/P24 的 32k 失败根因是 norm_rope 归约/K scale/
@@ -28,7 +28,10 @@ constexpr int KVBytes = KBytes + VBytes;  // 单 K 缓冲 + V
 constexpr int PBytes = Br * (Bc / 2) * 2;
 constexpr int ScaleBytes = 8 * Bc * sizeof(float);
 constexpr int VSBytes = Bc * sizeof(float);
-constexpr int SmemBytes = QBytes + KVBytes + PBytes + ScaleBytes + VSBytes;
+// token-major V 的 8KB staging:cp.async 先按 [token][dim] 连续读,
+// 再在 shared 内转成 PV 所需的 dim-major b16。池布局只此一处换序。
+constexpr int VTBytes = Bc * D;
+constexpr int SmemBytes = QBytes + KVBytes + PBytes + ScaleBytes + VSBytes + VTBytes;
 
 __device__ __forceinline__ int swz(int row, int col) { return (((col >> 3) ^ (row & 7)) << 3) | (col & 7); }
 __device__ __forceinline__ int swz_p(int row, int col) { return (((col >> 3) ^ (row & 1)) << 3) | (col & 7); }
@@ -49,7 +52,7 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
                               const float* __restrict__ qscale,
                               const int8_t* __restrict__ k,
                               const float* __restrict__ kscale,
-                              const uint16_t* __restrict__ vp,
+                              const int8_t* __restrict__ v,
                               const float* __restrict__ vscale,
                               const float* __restrict__ block_table,
                               __half* __restrict__ out, int T, int L, int Hq, int Hkv,
@@ -65,6 +68,8 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
     uint16_t* p_b16 = reinterpret_cast<uint16_t*>(smem + QBytes + KVBytes);
     float* kscale0 = reinterpret_cast<float*>(smem + QBytes + KVBytes + PBytes);
     float* vscale_s = reinterpret_cast<float*>(reinterpret_cast<int8_t*>(kscale0) + ScaleBytes);
+    int8_t* s_vt = reinterpret_cast<int8_t*>(smem + QBytes + KVBytes + PBytes +
+                                            ScaleBytes + VSBytes);
     __half* q_b16 = reinterpret_cast<__half*>(qs);
 
     const int q_block = blockIdx.x;
@@ -155,14 +160,13 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
         __half* k_b16 = reinterpret_cast<__half*>(smem + QBytes);
         float* kscale_s = kscale0;
         // V 预取,与 QK 重叠;K 单缓冲在 QK 完成后由下一轮 prefetch 覆盖。
+        // token-major 源:[key, Hkv, D],每个 key 的 D 字节连续。
         const int v_page = static_cast<int>(block_table[tile_k0 / page]);
-        for (int chunk = tid; chunk < D * (Bc / 2 / 8); chunk += Threads) {
-            const int d = chunk / (Bc / 2 / 8);
-            const int pair0 = (chunk % (Bc / 2 / 8)) * 8;
-            const uint16_t* src = &vp[((size_t)v_page * Hkv + kv_head) * D *
-                                          (page / 2) +
-                                      (size_t)d * (page / 2) + pair0];
-            uint16_t* dst = &v_b16[d * (Bc / 2) + swz_v(d, pair0)];
+        for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
+            const int key = chunk / (D / 16);
+            const int off = (chunk % (D / 16)) * 16;
+            const int8_t* src = v + ((size_t)(v_page * page + key) * Hkv + kv_head) * D + off;
+            int8_t* dst = &s_vt[key * D + off];
             cp_async<16, Cache::cg>(dst, src);
         }
         cp_commit();  // V group;K[buf] already resident
@@ -329,6 +333,35 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
             }
             cp_commit();
         }
+
+        // s_vt[key][d] -> v_b16[d][pair](pair = key/2,低/高字节 = key&1)。
+        // 仍走 P8 的 u8s8 PV,不改变 P 量化/softmax 数值路径。
+        for (int d = tid; d < D; d += Threads) {
+            // thread 独占一个 dim:32 个 key 行各读 1B(跨 lane 为连续 d),
+            // 16 个 pair 连续存;比“1 word/线程、16 线程读同一字节”少 8x store。
+            uint16_t w[16];
+#pragma unroll
+            for (int p = 0; p < 16; ++p) {
+                const int k0 = 2 * p;
+                const uint32_t b0 = static_cast<uint8_t>(s_vt[k0 * D + d]);
+                const uint32_t b1 = static_cast<uint8_t>(s_vt[(k0 + 1) * D + d]);
+                w[p] = static_cast<uint16_t>(b0 | (b1 << 8));
+            }
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                uint4 v;
+                v.x = static_cast<uint32_t>(w[g * 8]) |
+                      (static_cast<uint32_t>(w[g * 8 + 1]) << 16);
+                v.y = static_cast<uint32_t>(w[g * 8 + 2]) |
+                      (static_cast<uint32_t>(w[g * 8 + 3]) << 16);
+                v.z = static_cast<uint32_t>(w[g * 8 + 4]) |
+                      (static_cast<uint32_t>(w[g * 8 + 5]) << 16);
+                v.w = static_cast<uint32_t>(w[g * 8 + 6]) |
+                      (static_cast<uint32_t>(w[g * 8 + 7]) << 16);
+                *reinterpret_cast<uint4*>(&v_b16[d * (Bc / 2) + swz_v(d, g * 8)]) = v;
+            }
+        }
+        __syncthreads();
 
         uint32_t a[4];
         ldmatrix_x4(a[0], a[1], a[2], a[3],

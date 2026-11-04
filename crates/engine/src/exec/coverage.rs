@@ -1295,7 +1295,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     async fn probe_view_page_hash(&mut self, page_id: usize, tag: &str) -> Result<u64> {
         let d = &self.dev.pool.geom.dims;
         let page = self.dev.pool.geom.page.max(1);
-        // INT8 的 K/V 都是 1B/elem（V 是 b16 成对打包，按元素仍 1B）；
+        // INT8 的 K/V 都是 1B/elem（V 是 token-major int8）；
         // 沿用 f16 的 2B 会把页偏移算成两倍 ⇒ 探针取页直接越界。
         let esize = if self.dev.pool.geom.kv_fp8 || self.dev.pool.geom.kv_int8 {
             1

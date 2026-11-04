@@ -1,6 +1,6 @@
 # INT8 KV 双 3090 Ti TP2 测量档（不计入入口档面）。
 #
-# 形状：TP2 + 词表切分 + K int8 / V packed / per-token+per-page scale；
+# 形状：TP2 + 词表切分 + K int8 / V token-major / per-token scale；
 #       spec off（int8 verify 未接）；无 index/coverage/select/image_evict。
 # 口径：与 fp8 同 w4a8、同 max_seq、同 chunk；卡位用 UUID 覆盖更稳。
 extends = [

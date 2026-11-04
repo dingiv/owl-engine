@@ -1816,7 +1816,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let d = &self.dev.pool.geom.dims;
         let page = self.dev.pool.geom.page;
         let (hkv, hd) = (d.hkv, d.hd);
-        // fp8/int8 池 = 1B/元素(扁平 u8 账;int8 V 是 b16 成对打包,按元素仍 1B);
+        // fp8/int8 池 = 1B/元素(扁平 u8 账;int8 V 是 token-major int8);
         // f16 池 = 2B ✓。旧口径把 int8 当 f16 ⇒ 页字节翻倍、dump 越界。
         let esize = if self.dev.pool.geom.kv_fp8 || self.dev.pool.geom.kv_int8 {
             1

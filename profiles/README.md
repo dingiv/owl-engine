@@ -73,7 +73,7 @@ extends = [
   spec off 基线 decode 1.64× / prefill 1.34–1.43×，d7 档 decode **181/221 t/s**；
   权重 7.4 GiB/rank。设计与门见 `docs/devlog/models/gguf-tp2-kquant-设计.md`；
 - `qwen38_27b-3090-int8.toml` —— **INT8 KV 单卡档（8141）**：**w4a8**、
-  max_seq 131072、K int8 + V packed + per-token/per-page scale；P8 prefill /
+  max_seq 131072、K int8 + V token-major + per-token scale；P8 prefill /
   P32 decode；spec off。3 次中位 65k 1691 t/s / TTFT 38.75s，
   100k 1488 / 67.19s；GSM8K 200 96.5%，needle 8k/32k/64k/100k 全过。
 - `qwen38_27b-3090-fp8.toml` —— **FP8 KV 单卡同形对照档（8144）**：默认

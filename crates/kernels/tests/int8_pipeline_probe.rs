@@ -256,8 +256,7 @@ fn qk_write_and_v_pack_match_host() {
     let vf = lcg_f32(TV * HKV * D, 0x3333, -1.5, 3.0);
     let vh: Vec<u16> = vf.iter().map(|&x| f32_to_f16(x)).collect();
     let vslots: Vec<f32> = (PAGE..2 * PAGE).map(|x| x as f32).collect();
-    let pp = PAGE / 2;
-    let mut v_want = vec![0x7Fu8; 2 * HKV * D * pp * 2];
+    let mut v_want = vec![0x7Fu8; NB * PAGE * HKV * D];
     let mut vs_want = vec![0f32; NB * PAGE * HKV];
     for h in 0..HKV {
         for i in 0..TV {
@@ -270,12 +269,7 @@ fn qk_write_and_v_pack_match_host() {
             vs_want[(PAGE + i) * HKV + h] = scale;
             for d in 0..D {
                 let a = quant_half_away(f16_to_f32(vh[(i * HKV + h) * D + d]), inv, -127.0) as u8;
-                let off = (((1 * HKV + h) * D + d) * pp + (i / 2)) * 2;
-                if (i & 1) == 0 {
-                    v_want[off] = a;
-                } else {
-                    v_want[off + 1] = a;
-                }
+                v_want[((PAGE + i) * HKV + h) * D + d] = a;
             }
         }
     }
@@ -333,7 +327,7 @@ fn qk_write_and_v_pack_match_host() {
         &mut got_vs,
     )
     .unwrap();
-    assert_eq!(got_vp, v_want, "V packed 字节");
+    assert_eq!(got_vp, v_want, "V token-major 字节");
     let got_vs: Vec<f32> = got_vs
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -343,6 +337,71 @@ fn qk_write_and_v_pack_match_host() {
     }
 
     println!("[int8-pipeline] Q/K/V writers bit-exact OK");
+}
+
+/// V decode append:token-major 直接写 D 字节 + per-token scale,无 b16 RMW。
+#[test]
+fn v_append_token_major_matches_host() {
+    let Some(dev) = owl_cuda::test_device_ordinal_opt() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    const H: usize = 2;
+    const T: usize = 1;
+    const PAGE: usize = 32;
+    const NB: usize = 2;
+    let mut res = fi_support::TestRes::new(dev);
+    let mut exec = Exec::new();
+    let mut r = Runner { res: &mut res, exec: &mut exec, registry: None };
+
+    let vf = lcg_f32(T * H * D, 0x7777, -1.5, 3.0);
+    let vh: Vec<u16> = vf.iter().map(|&x| f32_to_f16_rn(x)).collect();
+    let slot = (PAGE + 1) as f32;
+    let mut v_want = vec![0x7Fu8; NB * PAGE * H * D];
+    let mut vs_want = vec![0f32; NB * PAGE * H];
+    for h in 0..H {
+        let mut amax = 0f32;
+        for d in 0..D {
+            amax = amax.max(f16_to_f32(vh[h * D + d]).abs());
+        }
+        let scale = (amax / 127.0).max(1e-6);
+        vs_want[slot as usize * H + h] = scale;
+        let inv = 1.0 / scale;
+        for d in 0..D {
+            let q = quant_half_away(f16_to_f32(vh[h * D + d]), inv, -127.0) as u8;
+            v_want[((slot as usize * H) + h) * D + d] = q;
+        }
+    }
+    let dv = r.alloc(hb(&vh).len(), "va.v").unwrap();
+    let dvc = r.alloc(v_want.len(), "va.vc").unwrap();
+    let dvs = r.alloc(vs_want.len() * 4, "va.vs").unwrap();
+    let dslots = r.alloc(4, "va.slot").unwrap();
+    let ddummy = r.alloc(2, "va.dummy").unwrap();
+    r.upload(dv, &hb(&vh)).unwrap();
+    r.upload(dvc, &vec![0x7Fu8; v_want.len()]).unwrap();
+    r.upload(dvs, &vec![0u8; vs_want.len() * 4]).unwrap();
+    r.upload(dslots, &slot.to_le_bytes()).unwrap();
+    let vals = [
+        LaunchVal::Ptr(dv.ptr), LaunchVal::Ptr(dslots.ptr),
+        LaunchVal::I32(T as i32), LaunchVal::I32(H as i32), LaunchVal::I32(D as i32),
+        LaunchVal::I32(PAGE as i32), LaunchVal::Ptr(dvs.ptr), LaunchVal::Ptr(dvc.ptr),
+        LaunchVal::Ptr(ddummy.ptr), LaunchVal::Ptr(ddummy.ptr),
+    ];
+    r.launch_aot("owl_v_append_int8_paged", "cu/attn/pack_v_int8_paged.cu",
+        (T as u32, H as u32, 4), (64, 1, 1), 0, &vals).unwrap();
+    r.sync().unwrap();
+    let mut got_v = vec![0u8; v_want.len()];
+    let mut got_vs = vec![0u8; vs_want.len() * 4];
+    r.download(CheckBuf { ptr: dvc.ptr, bytes: got_v.len() }, &mut got_v).unwrap();
+    r.download(CheckBuf { ptr: dvs.ptr, bytes: got_vs.len() }, &mut got_vs).unwrap();
+    assert_eq!(got_v, v_want, "V append token-major 字节");
+    let got_vs: Vec<f32> = got_vs
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    for (i, (g, w)) in got_vs.iter().zip(&vs_want).enumerate() {
+        assert!((g - w).abs() <= 1e-7, "vscale[{i}] {g} != {w}");
+    }
 }
 
 /// INT8 decode:2 页 / 33 keys,对照 host 参考(无 /16)。
@@ -375,29 +434,13 @@ fn int8_decode_matches_host() {
     let ks: Vec<f32> = (0..PAGES * PAGE * HK * 8)
         .map(|i| 0.002 + 0.00002 * i as f32)
         .collect();
-    let pp = PAGE / 2;
     let v_int: Vec<i8> = (0..PAGES * HK * D * PAGE)
         .map(|i| ((i as i32 * 29 % 255) - 127) as i8)
         .collect();
     let vs: Vec<f32> = (0..PAGES * PAGE * HK)
         .map(|i| 0.004 + 0.00003 * i as f32)
         .collect();
-    let mut vp = vec![0u8; PAGES * HK * D * pp * 2];
-    for pg in 0..PAGES {
-        for h in 0..HK {
-            for d in 0..D {
-                for pair in 0..pp {
-                    let key0 = pair * 2;
-                    let key1 = key0 + 1;
-                    let a = v_int[((pg * PAGE + key0) * HK + h) * D + d] as u8;
-                    let b = v_int[((pg * PAGE + key1) * HK + h) * D + d] as u8;
-                    let off = (((pg * HK + h) * D + d) * pp + pair) * 2;
-                    vp[off] = a;
-                    vp[off + 1] = b;
-                }
-            }
-        }
-    }
+    let vp: Vec<u8> = v_int.iter().map(|&x| x as u8).collect();
     let bt: Vec<f32> = (0..PAGES).map(|x| x as f32).collect();
     let lens = [L as f32];
 
@@ -687,6 +730,80 @@ fn int8_decode_matches_host() {
     // P 8-bit 量化的固有误差（合成随机数据 L=4096 实测 ~5e-3）；
     // 真实模型走 needle/数学质量门，不靠这个阈值卡精度。
     assert!(mx3 < 1e-2, "tc split max|d| {mx3}");
+
+    // ---- PTH 结构实验臂：4 producer + 4 compute，2-stage 64-token ----
+    const PN: usize = 21;
+    let dout4 = r.alloc(B * HQ * D * 2, "d.out4").unwrap();
+    let pvals = [
+        LaunchVal::Ptr(dq.ptr),
+        LaunchVal::Ptr(dqs.ptr),
+        LaunchVal::Ptr(dk.ptr),
+        LaunchVal::Ptr(dks.ptr),
+        LaunchVal::Ptr(dvp.ptr),
+        LaunchVal::Ptr(dvs.ptr),
+        LaunchVal::Ptr(dbt.ptr),
+        LaunchVal::Ptr(dlens.ptr),
+        LaunchVal::Ptr(dtc_out.ptr),
+        LaunchVal::Ptr(dtc_stat.ptr),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::I32(B as i32),
+        LaunchVal::I32(HQ as i32),
+        LaunchVal::I32(HK as i32),
+        LaunchVal::I32(PAGE as i32),
+        LaunchVal::I32(PAGES as i32),
+        LaunchVal::I32(PN as i32),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::Ptr(dout.ptr),
+    ];
+    r.launch_aot(
+        "owl_int8_decode_pth_pc_split",
+        "cu/attn/int8_decode.cu",
+        (HK as u32, B as u32, PN as u32),
+        (256, 1, 1),
+        78944,
+        &pvals,
+    )
+    .unwrap();
+    let prvals = [
+        LaunchVal::Ptr(dtc_out.ptr),
+        LaunchVal::Ptr(dtc_stat.ptr),
+        LaunchVal::Ptr(dout.ptr),
+        LaunchVal::Ptr(dout4.ptr),
+        LaunchVal::I32(B as i32),
+        LaunchVal::I32(HQ as i32),
+        LaunchVal::I32(PN as i32),
+        LaunchVal::I32(D as i32),
+    ];
+    r.launch_aot(
+        "owl_int8_decode_reduce",
+        "cu/attn/int8_decode.cu",
+        (HQ as u32, B as u32, 1),
+        (256, 1, 1),
+        0,
+        &prvals,
+    )
+    .unwrap();
+    r.sync().unwrap();
+    let mut out4 = vec![0u8; B * HQ * D * 2];
+    r.download(CheckBuf { ptr: dout4.ptr, bytes: out4.len() }, &mut out4).unwrap();
+    let got4: Vec<f32> = out4
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let mut mx4 = 0f32;
+    let mut dot = 0f64;
+    let mut na = 0f64;
+    let mut nb = 0f64;
+    for ((a, b), c) in got4.iter().zip(&got2).zip(&got) {
+        mx4 = mx4.max((a - b).abs());
+        dot += *a as f64 * *c as f64;
+        na += *a as f64 * *a as f64;
+        nb += *c as f64 * *c as f64;
+    }
+    let cos4 = dot / (na.sqrt() * nb.sqrt() + 1e-30);
+    println!("[int8-decode] pthpc vs split/reduce max|d|={mx4:.6} cos(vs f32)={cos4:.9}");
+    assert!(cos4 > 0.9999, "pthpc cos {cos4}");
+    assert!(mx4 < 8e-2, "pthpc vs host-path max|d| {mx4}");
 }
 
 /// Fused NormRope→INT8 writers (production Q/K path): host reference.
@@ -1072,7 +1189,82 @@ fn int8_decode_nparts_timing_65k() {
         let both = t1.elapsed();
         println!(
             "[int8-decode-parts] nparts={nparts} split={:?} split+reduce={:?} reduce≈{:?}",
-            split, both, both - split
+            split, both, both.saturating_sub(split)
+        );
+    }
+
+    // PTH 结构实验臂：4 producer + 4 compute，2-stage 64-token。
+    for nparts in [21usize, 28, 34, 42, 56] {
+        let pvals = [
+            LaunchVal::Ptr(dq.ptr), LaunchVal::Ptr(dqs.ptr),
+            LaunchVal::Ptr(dk.ptr), LaunchVal::Ptr(dks.ptr),
+            LaunchVal::Ptr(dvp.ptr), LaunchVal::Ptr(dvs.ptr),
+            LaunchVal::Ptr(dbt.ptr), LaunchVal::Ptr(dlens.ptr),
+            LaunchVal::Ptr(dpart.ptr), LaunchVal::Ptr(dstat.ptr),
+            LaunchVal::Ptr(ddep.ptr),
+            LaunchVal::I32(1), LaunchVal::I32(HQ as i32),
+            LaunchVal::I32(HKV as i32), LaunchVal::I32(PAGE as i32),
+            LaunchVal::I32(PAGES as i32), LaunchVal::I32(nparts as i32),
+            LaunchVal::Ptr(ddep.ptr), LaunchVal::Ptr(ddep.ptr),
+        ];
+        let prvals = [
+            LaunchVal::Ptr(dpart.ptr), LaunchVal::Ptr(dstat.ptr),
+            LaunchVal::Ptr(ddep.ptr), LaunchVal::Ptr(dout.ptr),
+            LaunchVal::I32(1), LaunchVal::I32(HQ as i32),
+            LaunchVal::I32(nparts as i32), LaunchVal::I32(D as i32),
+        ];
+        for _ in 0..2 {
+            r.launch_aot(
+                "owl_int8_decode_pth_pc_split",
+                "cu/attn/int8_decode.cu",
+                (HKV as u32, 1, nparts as u32),
+                (256, 1, 1),
+                78944,
+                &pvals,
+            )
+            .unwrap();
+        }
+        r.sync().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            r.launch_aot(
+                "owl_int8_decode_pth_pc_split",
+                "cu/attn/int8_decode.cu",
+                (HKV as u32, 1, nparts as u32),
+                (256, 1, 1),
+                78944,
+                &pvals,
+            )
+            .unwrap();
+        }
+        r.sync().unwrap();
+        let split = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        for _ in 0..3 {
+            r.launch_aot(
+                "owl_int8_decode_pth_pc_split",
+                "cu/attn/int8_decode.cu",
+                (HKV as u32, 1, nparts as u32),
+                (256, 1, 1),
+                78944,
+                &pvals,
+            )
+            .unwrap();
+            r.launch_aot(
+                "owl_int8_decode_reduce",
+                "cu/attn/int8_decode.cu",
+                (HQ as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                &prvals,
+            )
+            .unwrap();
+        }
+        r.sync().unwrap();
+        let both = t1.elapsed();
+        println!(
+            "[int8-decode-pthpc] nparts={nparts} split={:?} split+reduce={:?} reduce≈{:?}",
+            split, both, both.saturating_sub(split)
         );
     }
 }

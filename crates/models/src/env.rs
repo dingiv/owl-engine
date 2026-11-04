@@ -45,7 +45,7 @@ pub enum KvQuant {
     /// **e5m2**(范围更大、精度更低;与 e4m3 并列的另一种 fp8 ——
     /// 暂无核臂(选了会在臂选择处**响亮拒**),先让类型体系能表达)
     Fp8E5M2,
-    /// **int8**(K int8 + per-token/head scale;V int8 packed + per-page scale)
+    /// **int8**(K int8 + per-token/head scale;V token-major int8 + per-token scale)
     Int8,
 }
 
@@ -149,7 +149,7 @@ impl KvEnv {
         }
     }
 
-    /// INT8 生产档:K int8 + V packed;Q/Out 仍是 f16。
+    /// INT8 生产档:K int8 + V token-major;Q/Out 仍是 f16。
     pub fn int8_paged() -> Self {
         Self {
             quant: KvQuant::Int8,
@@ -418,6 +418,9 @@ pub struct EnvProvider {
     /// GGUF 块型臂旋钮(小 n 判据等)
     pub gguf: GgufEnv,
     pub hw: HwEnv,
+    /// 设备 SM 数(0 = 未知/CPU;引擎 boot 从 iface 合入)。
+    /// 只作选核几何提示(INT8 PTH decode 的 nparts),不是能力判定。
+    pub sm_count: usize,
     /// 量化方案(F16 / W4A16 / W4A16Awq;W4A8 = REQ-CTX-01 一 flag 宿主)
     pub quant: QuantPlan,
     pub kv: KvEnv,

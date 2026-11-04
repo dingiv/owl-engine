@@ -410,6 +410,11 @@ impl Exec {
         if res.capturing()? {
             res.record_capture(LaunchNote { op: op.0.to_string(), kernel, grid, block, shared_mem })?;
         }
+        // >48K 动态 smem 需按函数 opt-in（与生产 `launch.rs` 同律；
+        // 自检/测试走本入口，漏这一步 = CUDA_ERROR_INVALID_VALUE）。
+        if shared_mem > 49152 {
+            Self::set_shared_limit(f, shared_mem)?;
+        }
         let stream = res.stream()?;
         launch_vals(&stream, f, grid, block, shared_mem, vals).map_err(|e| {
             OpError::Launch {

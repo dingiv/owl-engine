@@ -81,6 +81,16 @@ __device__ __forceinline__ void mma_u8s8(int& c0, int& c1, int& c2, int& c3, uns
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// FP16 PV:m16n8k16, f32 累加（PTH 结构的 PV 快路）。
+__device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& c3,
+                                        unsigned a0, unsigned a1, unsigned a2,
+                                        unsigned a3, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 template <int Width = 32>
 __device__ __forceinline__ float warp_sum(float x, unsigned mask = 0xffffffffu) {
     static_assert(Width > 0 && Width <= 32 && (Width & (Width - 1)) == 0);

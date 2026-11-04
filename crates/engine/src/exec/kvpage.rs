@@ -6,7 +6,7 @@
 //! ```text
 //! f16 / fp8 : K/V 都是 [nb, page, Hkv, hd]（kNHD）
 //! INT8 K    : [nb, page, Hkv, hd] int8 + Kscale [nb, page, Hkv, 8] f32
-//! INT8 V    : [nb, Hkv, hd, page/2] b16 + Vscale [nb, page, Hkv] f32
+//! INT8 V    : [nb, page, Hkv, hd] int8 + Vscale [nb, page, Hkv] f32
 //! ```
 //!
 //! 因此这里提供 **`KvPageCodec` trait**，把"元素宽 / K 行 / V 行 / scale 槽"
@@ -70,8 +70,8 @@ impl<'a> KvRowScale<'a> {
     }
 }
 
-/// 池页宿主解码契约。**K 与 V 分开**：INT8 V 是 packed dim-major，
-/// 不能再拿 K 的 kNHD 行式冒充。
+/// 池页宿主解码契约。**K 与 V 分开**：INT8 V 是 token-major
+/// `[page,Hkv,hd]`，与 K 的 kNHD 行式同形但字节语义不同（K 有 8 组 scale）。
 pub(crate) trait KvPageCodec: Sync {
     fn elem_bytes(&self) -> usize;
 
@@ -281,23 +281,10 @@ impl KvPageCodec for Int8Codec {
                 scale.v.len()
             )));
         }
-        let pp = page.len() / (hkv * hd).max(1) / 2;
-        let word_base = (h * hd) * pp + t / 2;
+        let base = (t * hkv + h) * hd;
+        check_row("int8-V", page.len(), 1, base, hd, out.len())?;
         for (d, o) in out.iter_mut().enumerate() {
-            let off = (word_base + d * pp) * 2;
-            if off + 1 >= page.len() {
-                return Err(ModelError::Msg(format!(
-                    "INT8 V packed 越界:off={off} 片 {}B",
-                    page.len()
-                )));
-            }
-            let word = u16::from_le_bytes([page[off], page[off + 1]]);
-            let byte = if (t & 1) == 0 {
-                (word & 0xFF) as u8
-            } else {
-                (word >> 8) as u8
-            };
-            *o = (byte as i8) as f32 * scale.v[vs];
+            *o = (page[base + d] as i8) as f32 * scale.v[vs];
         }
         Ok(())
     }
@@ -395,14 +382,14 @@ mod tests {
     }
 
     #[test]
-    fn int8_v行解packed() {
+    fn int8_v行解token_major() {
         let (page, hkv, hd) = (4, 1, 2);
-        // [Hkv][D][page/2] b16: d0: t0=1,t1=2 | t2=3,t3=4；d1: ...
-        let words: [[u16; 2]; 2] = [[0x0201, 0x0403], [0x0605, 0x0807]];
+        // [page][Hkv][D] int8:t0=(1,5), t1=(2,6), t2=(3,7), t3=(4,8)。
+        let vals: [[i8; 2]; 4] = [[1, 5], [2, 6], [3, 7], [4, 8]];
         let mut page_bytes = Vec::new();
-        for d in 0..hd {
-            for w in words[d] {
-                page_bytes.extend_from_slice(&w.to_le_bytes());
+        for row in vals {
+            for v in row {
+                page_bytes.push(v as u8);
             }
         }
         let vs = [0.5f32, 1.0, 2.0, 4.0];

@@ -70,7 +70,7 @@
 //! | model | mtp_dir | Option<String> / None(MTP 头覆盖;None = 检查点自带 / 同 GGUF 文件) |
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
 //! | pool | kv_fp8 | bool / false(主 KV 池 e4m3;32 KiB/token) |
-//! | pool | kv_int8 | bool / false(主 KV 池 int8;K int8 + V packed + scale,与 kv_fp8 互斥) |
+//! | pool | kv_int8 | bool / false(主 KV 池 int8;K int8 + V token-major + 两张 scale,与 kv_fp8 互斥) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
 //! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
@@ -696,7 +696,7 @@ pub struct PoolCfg {
     /// 2026-10-22 从 `[kernel]` 移入:它决定池的**存储 dtype/几何**,
     /// 与 `gdn_slots`/`snap_max` 同属池面,而不是算子臂。
     pub kv_fp8: bool,
-    /// **主 KV 池 int8**(→ `KvQuant::Int8`;K int8 + V packed + scale,
+    /// **主 KV 池 int8**(→ `KvQuant::Int8`;K int8 + V token-major + 两张 scale,
     /// 1B/elem)。与 `kv_fp8` 互斥;仅 hd=256 / page=32 / 无投机档。
     pub kv_int8: bool,
     /// GDN 快照池槽数

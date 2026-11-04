@@ -3325,6 +3325,7 @@ mod tag_filter_tests {
         assert!(allows(&cfg, "owl_reshape_and_cache_int8_k_only_knhd"));
         assert!(allows(&cfg, "owl_int8_prefill_paged"));
         assert!(allows(&cfg, "owl_int8_decode_paged"));
+        assert!(allows(&cfg, "owl_int8_decode_pth_pc_split"));
         assert!(allows(&cfg, "owl_quant_int8_qk_f16"));
         assert!(allows(&cfg, "owl_v_pack_int8_prefill"));
         assert!(!allows(&cfg, "vllm_reshape_and_cache_f16_knhd"));

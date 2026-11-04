@@ -1568,8 +1568,19 @@ pub(crate) fn into_running<D: DeviceClient>(
                     );
                 }
             }
+            // **INT8 V 布局版本隔离**(2026-11-04):V 从 packed dim-major
+            // 改成 token-major 后,同一页的字节数不变但语义全变;磁盘 KV/
+            // 快照文件名只按 token 链哈希,不携带布局版本。旧缓存若被新
+            // 进程 adopt,会被当 token-major 读 ⇒ 静默错值。这里给 INT8
+            // 单独一个子目录命名空间(旧目录原样保留,不删数据);切回
+            // f16/fp8 时仍用原路径。
+            let disk_root = if dev.pool.geom.kv_int8 && !cfg.knobs.disk_dir.is_empty() {
+                format!("{}.int8-v2-token-major", cfg.knobs.disk_dir)
+            } else {
+                cfg.knobs.disk_dir.clone()
+            };
             let attach = b.rel.attach_disk(
-                cfg.knobs.disk_dir.clone(),
+                disk_root.clone(),
                 cfg.knobs.disk_cache_mb << 20,
                 snap_disk_bytes,
             )?;
@@ -1592,7 +1603,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                     cfg.knobs.disk_cache_mb + cfg.knobs.snap_disk_mb,
                     cfg.knobs.disk_cache_mb,
                     snap_disk_bytes >> 20,
-                    cfg.knobs.disk_dir,
+                    disk_root,
                     ra.adopted,
                     n_kv,
                     rb.adopted,
@@ -2355,6 +2366,17 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
             )))
         }
     }
+    // 设备 SM 数(与代际同律:引擎 = 环境事实来源,选核层零探测)。
+    // 0 = host/无卡测试;INT8 PTH decode 只在有真值时按 SM 选 nparts。
+    match face.sm_count().await {
+        Ok(n) => env.sm_count = n,
+        Err(_) if face.op_env().is_none() => {}
+        Err(e) => {
+            return Err(ModelError::Msg(format!(
+                "boot SM 数感知失败(GPU 面已就绪但 sm_count 不可用): {e}"
+            )))
+        }
+    }
     // 模型几何事实合入(2026-10-13 P4:算子准入的几何门对账面)——
     // 与 hw 同律:引擎 = 环境事实来源,算子层零探测
     env.kv.head_dim = hd;
@@ -2430,7 +2452,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         // KvPageCodec/pool_layout 多态。
         owl_shared::log_info!(
             "boot",
-            "KV 池 int8(K int8 [nb,page,hkv,hd] / V packed b16 / Kscale per-token / Vscale per-page;无 V shadow)"
+            "KV 池 int8(K int8 [nb,page,hkv,hd] / V token-major [nb,page,hkv,hd] / Kscale per-token / Vscale per-token;无 V shadow)"
         );
     }
 
