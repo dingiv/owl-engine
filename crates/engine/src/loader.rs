@@ -204,6 +204,53 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         }
     }
 
+    /// **按装载臂装载 —— 唯一分派点**(2026-11-04 clean-code)。
+    ///
+    /// 三条臂的差异收敛在这里(而不是 server 的 `load_shard`):
+    /// - 旋钮统一走 [`LoadIntent`];每臂**只取自己认的**,
+    ///   不认的**响亮拒**(不再静默忽略 —— GGUF 的 head/embed 就是历史静默项);
+    /// - `mtp_override` 是 loader 的构造期字段(引擎注入),与臂无关。
+    pub async fn load_arm(
+        &mut self,
+        dir: &Path,
+        arm: crate::LoadArm,
+        intent: &crate::LoadIntent,
+    ) -> Result<LoadedModel> {
+        match arm {
+            // AWQ pack-quantized 家族(cyankiwi 系;int4 已由产出方烘焙)
+            crate::LoadArm::AwqInt4 | crate::LoadArm::AwqA8 => {
+                self.load_qwen38_27b_awq_with_embed(
+                    dir,
+                    dir,
+                    intent.head,
+                    intent.quant,
+                    intent.embed,
+                )
+                .await
+            }
+            // 普通 HF safetensors 目录(白名单下只有 nvfp4 / f16 基线两档)
+            crate::LoadArm::NvFp4 | crate::LoadArm::F16Base => {
+                self.load_qwen35_safetensors(dir, intent.quant, intent.head, intent.embed)
+                    .await
+            }
+            // GGUF 单文件:超参/词表/rope/权重全从文件来 ⇒ head/embed 覆盖无意义
+            // (计划是**逐张量**事实)。给了 = 配置在说谎 ⇒ 响亮拒。
+            crate::LoadArm::Gguf(_) => {
+                if intent.head != owl_models::module::QuantPlan::F16 || intent.embed.is_some() {
+                    return Err(ModelError::Msg(format!(
+                        "GGUF 装载的 lm_head/embedding 计划由文件逐张量决定,\
+                         不接受覆盖:请把 [model] head_quant 保持 \"off\"、embed_quant 保持 \"f16\"\
+                         (当前 head={:?} embed={:?},来源 arm={})",
+                        intent.head,
+                        intent.embed,
+                        arm.name()
+                    )));
+                }
+                self.load_gguf(dir).await
+            }
+        }
+    }
+
     /// **通用 Qwen3.5 HF 目录装载**(维度事实 = `config.json` + 形状兜底;
     /// `preset` = 家族声明基座)。
     ///

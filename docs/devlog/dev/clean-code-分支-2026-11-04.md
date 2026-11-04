@@ -204,7 +204,39 @@ pub fn check_geom_against(decl, profile, max_seq) -> Result<(), String>;  // 源
 GGUF 档 `enabled=false` 却给 path ⇒ 自相矛盾、HF 目录缺 `config.json` ⇒
 只提示"几何校验跳过"不判失败。
 
-### 3.3b 装载器(第二步,未做):`ModelSource` trait(AWQ/safetensors vs GGUF)
+### 3.3b 装载器第二步:`LoadIntent` + `load_arm`(2026-11-04 第四批,已落地)
+
+**盘点时发现的真问题**:臂 → 装载器的分派**有两套**——
+`load_shard`(TP rank 与单卡 AWQ 用)和 `executor_main` 单卡分支里的
+**第二套 match**(`NvFp4|F16Base` / `Gguf` 内联)。后果:
+① 同一件事两处维护;② GGUF 档的 `head_quant`/`embed_quant` 被**静默忽略**
+(实测:`--set model.head_quant=rtn-int8-row` 仍能正常起机)。
+
+改法:
+
+```rust
+pub struct LoadIntent { quant: QuantPlan, head: QuantPlan, embed: Option<QuantPlan> }
+impl LoadIntent { pub fn of(arm, head_quant, embed_quant) -> Self }   // 唯一换算入口
+
+impl ModelLoader {
+    pub async fn load_arm(&mut self, dir: &Path, arm: LoadArm, intent: &LoadIntent)
+        -> Result<LoadedModel>        // **唯一分派点**
+}
+```
+
+- server 的 `load_shard` = 组 `LoadIntent` + `load_arm`(3 行);
+  **单卡分支的第二套 match 删除**,与 TP 同走 `load_shard`(恒等分片);
+- 旋钮的适用性由装载器判定:GGUF 臂显式拒 `head != F16 || embed.is_some()`
+  (报错点名 `head=… embed=… 来源 arm=gguf`),静默忽略变响亮拒;
+- `mtp_override` 仍是 loader 构造期字段(引擎注入),与臂无关。
+
+验证:
+- AWQ(W4A8+INT8+spec d7)8k 预填 **2327.3 t/s**(改造前 2313~2353,噪声内);
+- GGUF(Q4 系 + IQ4_XS,16k ctx,spec off)起机 + 32 token 正常出词;
+- 负例:GGUF + `model.head_quant="rtn-int8-row"` ⇒ **boot 拒**并点名修法;
+- workspace check 0 error;owl-models 316 / owl-shared 127 / engine config 全绿。
+
+### 3.3c 装载器第三步(未做):`ModelSource` trait(AWQ/safetensors vs GGUF)
 
 现状:`loader.rs`(810 行)+ `formats/qwen35.rs`(2.2k)+ `formats/gguf/*`(10.5k)
 两套并行,`ModelFormat::` 44 处分叉,`--check` 另有一套。目标:
