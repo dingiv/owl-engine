@@ -202,11 +202,11 @@ fn tag_filter_from_config(cfg: &owl_shared::config::OwlConfig) -> owl_kernels::t
             // 池布局仍是主池 KnHD。
             //
             // **2026-11-04 修**：此前这里无条件派生 F16；MTP 开
-            // `[spec] draft_kv_fp8 = true` 时池实际是 e4m3（U32 承载），
+            // `[spec] draft_kv_dtype = "fp8"` 时池实际是 e4m3（U32 承载），
             // 但全局 tag filter 只放行 `kv.main.f16/kv.draft.f16`，
             // `owl_reshape_and_cache_fp8kv_knhd` 在 boot 直接拒。
-            // 池 dtype 必须跟 `draft_kv_fp8` 走；主/草稿两面同改。
-            if cfg.spec.draft_kv_fp8 {
+            // 池 dtype 必须跟 `draft_kv_dtype` 走；主/草稿两面同改。
+            if cfg.spec.draft_kv_dtype == owl_shared::config::DraftKvDtype::Fp8 {
                 tags.push(T::KV_MAIN_FP8);
                 tags.push(T::KV_DRAFT_FP8);
             } else {
@@ -3386,11 +3386,10 @@ mod tag_filter_tests {
         let mut cfg = OwlConfig::default();
         cfg.model.format = ModelFormat::Awq;
         cfg.model.quant = QuantScheme::W4a16;
-        cfg.pool.kv_int8 = true;
-        cfg.pool.kv_fp8 = false;
+        cfg.pool.kv_dtype = owl_shared::config::KvDtype::Int8;
         cfg.spec.draft = SpecDraft::Mtp;
         cfg.spec.depth = 7;
-        cfg.spec.draft_kv_fp8 = true;
+        cfg.spec.draft_kv_dtype = owl_shared::config::DraftKvDtype::Fp8;
         assert!(allows(&cfg, "owl_reshape_and_cache_fp8kv_knhd"), "MTP fp8 写核应放行");
         assert!(allows(&cfg, "vllm_reshape_and_cache_f16_knhd") == false, "MTP fp8 档不应再派生 F16");
         assert!(allows(&cfg, "owl_naive_attn_nc_bf16") == false, "MTP 不是 BF16");

@@ -22,7 +22,6 @@ bind = "127.0.0.1:8141"
 
 [model]
 quant = "w4a8"
-vision = false
 
 [runtime]
 max_seq = 32768
@@ -43,7 +42,6 @@ degrade_after = 0
 
 [pool]
 prefix_cache = false
-image_evict = false
 snap_max = 0
 host_cache_mb = 0
 snap_host_mb = 0
