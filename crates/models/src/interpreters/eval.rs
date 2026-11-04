@@ -24,6 +24,11 @@ use super::planner::BlockPool;
 /// 256KiB 覆盖 verify/propose,且远小于 prefill chunk(1.3MB)。
 const TP_AR2_MAX_BYTES: usize = 256 * 1024;
 
+/// host 小包快路上限:CE 的 3 节点(拷贝+signal+reduce)对 10KB 级包
+/// 节点税 > 带宽收益;这段直接走 barrier-only fused 单核(SM 写 peer host,
+/// 读 own host),覆盖 decode 10KB / verify 80KB。超过则回 CE push。
+const TP_HOST_BARRIER_MAX_BYTES: usize = 128 * 1024;
+
 /// host CE-push 的 fp8 紧凑载荷字节数(`[q n_elems B][scales ng×f16]`)。
 ///
 /// 与 `cu/comm/ar_stage.cu` 的 `OWL_AR_FP8_SC_OFF` 同式:尺度区从**偶对齐**
@@ -1224,6 +1229,31 @@ where
                     // stage f8 核 + dummy header),再 CE 搬约 0.515× 的紧凑
                     // 载荷;reduce 读本地 host 并反量化。这样 CE 与 host 读都
                     // 减半,且不改变真实 produced/consumed 的发布序。
+                    // host 小包快路:barrier-only 单核,写 peer host / 读 own host。
+                    // CE 的 CopyBlock + stage signal + reduce 三节点对 10KB 级
+                    // decode 是节点税主导;barrier 核只有一次发射/一次往返。
+                    // 它使用 header +48/+56 的独立 32-bit 游标,与 prefill f8 的
+                    // v1 produced/consumed(+0/+8)互不干扰。
+                    let host_barrier = host_push && n_bytes <= TP_HOST_BARRIER_MAX_BYTES;
+                    if host_barrier {
+                        owl_shared::metrics::with_metrics_store(|s| {
+                            s.counter_add("tp.ar.host_barrier", 1, file!(), line!())
+                        });
+                        let call = owl_kernels::client::comm::ArFusedCall::new(
+                            out.clone(),
+                            tp.own.clone(),
+                            tp.peer.clone(),
+                            tp.peer.clone(), // data_w: 写对端 host
+                            tp.own.clone(),  // data_r: 读本端 host
+                            n_bytes as u64,
+                            tp.slot_bytes,
+                            0,
+                        )
+                        .with_barrier(true)
+                        .to_launch();
+                        emit_launch_pooled(ctx.face, ctx.pool.is_some(), call).await?;
+                        return Ok(out);
+                    }
                     let host_f8 = host_push
                         && tp.ar_f8
                         && n_bytes >= 262_144

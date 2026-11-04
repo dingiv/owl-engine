@@ -294,7 +294,7 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
     // 另一个测试(`body_probe`,走 `assemble` 默认档 = 两核)⇒ 若它先跑,计数已经
     // 不是 0 ⇒ "融合档下 v1 必须为 0"的绝对判据会**假红**(实测 v1=2016 全是它留的)。
     // 判据改成**本臂增量**(turn 前后的差),与测试顺序解耦。
-    let base = ["tp.ar.v1", "tp.ar.fused", "tp.ar.ar2"].map(cnt0);
+    let base = ["tp.ar.v1", "tp.ar.fused", "tp.ar.ar2", "tp.ar.host_barrier"].map(cnt0);
     let Steps {
         gen: tp2_gen,
         logits: tp2_logits,
@@ -311,19 +311,32 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
         let i = match t {
             "tp.ar.v1" => 0,
             "tp.ar.fused" => 1,
-            _ => 2,
+            "tp.ar.ar2" => 2,
+            "tp.ar.host_barrier" => 3,
+            _ => panic!("未登记路径计数 {t}"),
         };
         now.saturating_sub(base[i])
     };
     let n_v1 = cnt("tp.ar.v1");
     let n_fused = cnt("tp.ar.fused");
     let n_ar2 = cnt("tp.ar.ar2");
-    eprintln!("[g8b] 路径判据:v1={n_v1} · fused={n_fused} · ar2={n_ar2}(融合={ar_fused} · ar2={ar2})");
+    let n_host_barrier = cnt("tp.ar.host_barrier");
+    eprintln!(
+        "[g8b] 路径判据:v1={n_v1} · fused={n_fused} · ar2={n_ar2} · host_barrier={n_host_barrier}\
+         (融合={ar_fused} · ar2={ar2} · host={:?})",
+        tp_comm()
+    );
     if ar_fused {
         // **融合档的路径判据**(§11.2;2026-10-19):必须走到 fused,且 v1 为 0
         // (否则"开了融合档但没走"= 静默不生效,与 1-stage §60.2 同族坑)
         assert!(n_fused > 0, "开了融合档但一次都没走到(tp.ar.fused = 0)");
         assert_eq!(n_v1, 0, "融合档下不应走 v1 两核(tp.ar.v1 = {n_v1})");
+    } else if tp_comm() == owl_shared::config::TpCommMode::Host {
+        // host 小包走 barrier-only 快路;大包仍可走 v1(CE/f8)。
+        assert!(
+            n_v1 > 0 || n_host_barrier > 0,
+            "host 档应有 tp.ar.v1 或 tp.ar.host_barrier > 0"
+        );
     } else {
         assert!(n_v1 > 0, "v1 档应有 tp.ar.v1 > 0");
     }

@@ -18,6 +18,8 @@
   - 双方都不再让“对端 GPU 直接读本端 CE 写出的 host”。
 - host staging 固定 **1 slot / rank**(32MiB + 64B header):
   CE 目标偏移必须主机侧静态可知,多槽的 `produced % slots` 只有设备知道。
+- **小包(≤128KiB)走 barrier-only fused 单核**:SM 写 peer host、读 own host,
+  一次发射完成;覆盖 decode 10KB / verify 80KB,避开 CE 三节点税。
 - 大包(≥256KiB、F16/BF16)走 **f8 紧凑载荷**:
   - 本端 device scratch 上先量化(payload → fp8 + scales,约 0.515×);
   - CE 只搬紧凑载荷到对端 host;
@@ -90,7 +92,28 @@ ar_reduce(out=payload, data=B.own(H_B), own=B.H_B, peer=B.H_A)
 - 图内 `CopyBlock` 是合法 memcpy 节点(`handle_copy_block` 已登记图引用租约);
 - 单 slot ⇒ CE 目标偏移固定 `HDR`(64),无需知道 `produced` 奇偶。
 
-### 3.3 f8 紧凑载荷(prefill)
+### 3.3 小包 barrier-only 快路(decode)
+
+`n_bytes ≤ 128KiB` 时不再走 CE 三节点,直接发射
+`owl_comm_ar_barrier_*`(与 P2P AR-2 同族):
+
+```text
+payload --SM 写--> peer host slot[slot]
+→ st.release.sys 发布 own.produced(+48/+56 独立 32-bit 游标)
+→ 等 peer.produced
+→ 读 own host slot 累加
+→ 发布 own.consumed
+```
+
+- 10KB 级 packet 的瓶颈是节点税,不是带宽;CE 的 `CopyBlock + stage + reduce`
+  三节点比单核慢。
+- barrier 用 header `+48/+56` 的独立游标,与 prefill f8 的 v1
+  `produced/consumed(+0/+8)` 互不干扰。
+- 单 block;`n_slots=1` 的 credit 由 barrier 自己的游标维护。
+- 覆盖 decode 10KB、verify 80KB;`128KiB < n ≤ 256KiB` 仍是 raw CE,
+  `>256KiB` 走 f8 CE。
+
+### 3.4 f8 紧凑载荷(prefill)
 
 ```text
 payload(本端 device)
@@ -110,7 +133,7 @@ payload(本端 device)
 - f8 只用于 `n_bytes ≥ 256KiB` 且 dtype F16/BF16;decode/小包走 raw。
 - f8 的数值语义与现役 P2P f8 腿一致(对称量化 + 两 rank 同一对值相加)。
 
-### 3.4 图安全
+### 3.5 图安全
 
 - 图捕获期 `HostAlloc/HostAttach/HostRelease` 由 `capture_gate` 结构化拒;
   分配/attach 必须在建图前完成。
@@ -174,7 +197,7 @@ OWL_PEER_TEST_DEV_A=0 OWL_PEER_TEST_DEV_B=1 \
 
 | 卡对 | 结果 |
 |---|---|
-| 双 3080(20G) | L1 末步 logits **0 项不同**;16/16 token 与 TP1 一致 |
+| 双 3080(20G) | L1 末步 logits **0 项不同**;16/16 token 与 TP1 一致;`host_barrier=96` |
 | 双 3090 Ti | L1 **0 项不同**;16/16 token 一致 |
 
 同一门不设 `OWL_TP_COMM_HOST` 走 P2P,仍全绿(回归)。
@@ -226,29 +249,31 @@ VMM-read-2way     551.87 us    9.50 GB/s
 P2P 用生产档;host 强制 `tp_comm=host` + `tp_ar=v1` + `tp_ar_f8=true`。
 `llm_speedtest --flavor std`(512/1024/2048/4096/8192 × 3,输出 256)。
 
-| 长度 | prefill P2P | prefill host f8 | host 慢 | decode P2P | decode host f8 | host 慢 |
+| 长度 | prefill P2P | prefill host | host 慢 | decode P2P | decode host | host 慢 |
 |---:|---:|---:|---:|---:|---:|---:|
-| 512 | 2099.6 | 1853.8 | **11.7%** | 252.7 | 194.5 | **23.0%** |
-| 1024 | 2474.8 | 2158.3 | **12.8%** | 188.4 | 172.2 | **8.6%** |
-| 2048 | 2706.0 | 2471.0 | **8.7%** | 186.5 | 190.1 | **-1.9%** |
-| 4096 | 2691.9 | 2418.7 | **10.1%** | 133.7 | 110.5 | **17.3%** |
-| 8192 | 2825.6 | 2518.5 | **10.9%** | 129.1 | 81.0 | **37.3%** |
+| 512 | 2099.6 | 1858.4 | **11.5%** | 252.7 | 227.3 | **10.0%** |
+| 1024 | 2474.8 | 2184.1 | **11.7%** | 188.4 | 200.5 | **-6.4%** |
+| 2048 | 2706.0 | 2479.5 | **8.4%** | 186.5 | 215.9 | **-15.8%** |
+| 4096 | 2691.9 | 2414.4 | **10.3%** | 133.7 | 120.9 | **9.6%** |
+| 8192 | 2825.6 | 2511.3 | **11.1%** | 129.1 | 92.4 | **28.4%** |
 
 汇总:
 
-| 指标 | P2P | host f8 | host 慢 |
+| 指标 | P2P | host（f8 CE + barrier decode） | host 慢 |
 |---|---:|---:|---:|
-| prefill 均值 | **2559.5 t/s** | 2284.1 t/s | **10.8%** |
-| decode 均值 | **178.1 t/s** | 149.7 t/s | **15.9%** |
-| TTFT 均值 | **1169.7 ms** | 1307.5 ms | **11.8%** |
+| prefill 均值 | **2559.5 t/s** | 2289.5 t/s | **10.5%** |
+| decode 均值 | **178.1 t/s** | 171.4 t/s | **3.8%** |
+| TTFT 均值 | **1169.7 ms** | 1308.3 ms | **11.8%** |
 
-> decode 逐点受 spec 接受率/降级态影响呈双峰(75~201 t/s);配对汇总
-> 仍慢 15.9%,但绝对差距已从 33.6 t/s 缩到 28.4 t/s。prefill/TTFT 均
-> **达到 30% 目标**。f8 只影响大包 prefill;decode 仍走 raw CE。
+> decode 逐点仍受 spec 接受率/降级态影响呈双峰(86~237 t/s);汇总慢
+> 3.8%,绝对差距从 33.6 t/s 缩到 6.7 t/s。prefill/TTFT 均达到 30% 目标。
 > 15/15 成功,无 Xid,无 AR err,停服无 host-drop。
-
-旧 SM stage 基线(仅历史对照):prefill 1739.8 / decode 144.5 / TTFT 1737.6,
-分别慢 32.0% / 18.8% / 48.5%。
+>
+> 中间档(无 barrier 快路):prefill 2284.1 / decode 149.7 / TTFT 1307.5,
+> decode 慢 15.9%。barrier 快路主要收益在 decode/verify 小包。
+>
+> 旧 SM stage 基线(仅历史对照):prefill 1739.8 / decode 144.5 / TTFT 1737.6,
+> 分别慢 32.0% / 18.8% / 48.5%。
 
 ## 6. 历史失败:DMA stage 直读(未采用,勿原样重做)
 
@@ -315,11 +340,11 @@ staging: produced=1536 consumed=768 err=0(无超时)
    只有设备知道。要上多槽必须把 slot 选择也做成 host 侧可静态展开的序。
 3. **host pinned 限额**:32MiB/rank + 64B header = 64MiB/进程;
    低 `ulimit -l` 环境会 `host_alloc` 响亮失败。
-4. **f8 只覆盖大包**:<256KiB 或 F32 走 raw CE。decode 的 host 差距
-   (15.9%)主要是协议/图节点/启动税,不是带宽。
+4. **分段策略**:`≤128KiB` 走 barrier 单核;`128KiB~256KiB` 走 raw CE;
+   `>256KiB` 且 F16/BF16 走 f8 CE。F32 大包仍 raw CE。
 5. **f8 低位门尚未单独立**:0.8B 默认 prompt 过不了 256KiB 阈值;
-   27B std 已覆盖真实 f8 数据路径。后续可加一个低层 f8 CE 门或加大
-   0.8B prompt。
+   27B std 已覆盖真实 f8 数据路径。barrier 快路由 0.8B host 门
+   (`host_barrier=96`)与 27B decode 覆盖。后续可加一个低层 f8 CE 门。
 6. **CPU relay** 是另一条后续腿:D2H→CPU sum→H2D,`SegmentBoundary`,
    不如图路;本次不做。
 7. **27B std 已过**:15/15,无 Xid;停服无 host-drop;release 二进制
