@@ -404,31 +404,46 @@ extern "C" __global__ void owl_int8_prefill_paged(const int8_t* __restrict__ q,
             cp_commit();
         }
 
-        // s_vt[key][d] -> v_b16[d][pair](pair = key/2,低/高字节 = key&1)。
-        // 仍走 P8 的 u8s8 PV,不改变 P 量化/softmax 数值路径。
-        for (int d = tid; d < D; d += Threads) {
-            // thread 独占一个 dim:32 个 key 行各读 1B(跨 lane 为连续 d),
-            // 16 个 pair 连续存;比“1 word/线程、16 线程读同一字节”少 8x store。
-            uint16_t w[16];
+        // s_vt[key][d](token-major int8 staging)→ v_b16[d][pair](2 keys/16bit),
+        // 供 P8 的 u8s8 PV 使用(不改 P 量化/softmax 数值路径)。
+        //
+        // **4 维 × 8 key 一块**:每 key 一次 LDS.32(4 个连续 dim)+ 6 条 PRMT
+        // 拼 2 个 32 位字 + 1 条 STS.64。原实现按 dim 做 32 条**字节** LDS
+        // (64 条/线程)+ 16 个 uint16 临时量(压出 STACK 96 溢出);本版
+        // 16 条 LDS + 48 条 PRMT,零临时数组。
+        {
+            constexpr int Units = (Bc / 8) * (D / 4);   // 4 组 key-pair × 64 组 dim
+            constexpr int Per = Units / Threads;        // 2
+            static_assert(Units % Threads == 0);
 #pragma unroll
-            for (int p = 0; p < 16; ++p) {
-                const int k0 = 2 * p;
-                const uint32_t b0 = static_cast<uint8_t>(s_vt[k0 * D + d]);
-                const uint32_t b1 = static_cast<uint8_t>(s_vt[(k0 + 1) * D + d]);
-                w[p] = static_cast<uint16_t>(b0 | (b1 << 8));
-            }
+            for (int u0 = 0; u0 < Per; ++u0) {
+                const int u = tid + u0 * Threads;
+                const int kq = u & 3;                   // 4 个 key-pair 一组(key 8 个)
+                const int dq = u >> 2;                  // 4 个 dim 一组
+                const int k0 = kq * 8;
+                const int d0 = dq * 4;
+                uint32_t b[8];
 #pragma unroll
-            for (int g = 0; g < 2; ++g) {
-                uint4 v;
-                v.x = static_cast<uint32_t>(w[g * 8]) |
-                      (static_cast<uint32_t>(w[g * 8 + 1]) << 16);
-                v.y = static_cast<uint32_t>(w[g * 8 + 2]) |
-                      (static_cast<uint32_t>(w[g * 8 + 3]) << 16);
-                v.z = static_cast<uint32_t>(w[g * 8 + 4]) |
-                      (static_cast<uint32_t>(w[g * 8 + 5]) << 16);
-                v.w = static_cast<uint32_t>(w[g * 8 + 6]) |
-                      (static_cast<uint32_t>(w[g * 8 + 7]) << 16);
-                *reinterpret_cast<uint4*>(&v_b16[d * (Bc / 2) + swz_v(d, g * 8)]) = v;
+                for (int j = 0; j < 8; ++j)
+                    b[j] = *reinterpret_cast<const uint32_t*>(&s_vt[(k0 + j) * D + d0]);
+#pragma unroll
+                for (int dd = 0; dd < 4; ++dd) {
+                    // sel:byte0 = x[dd], byte1 = y[dd](高两字节不用)
+                    const uint32_t sel = static_cast<uint32_t>(dd) |
+                                         (static_cast<uint32_t>(dd + 4) << 4);
+                    const uint32_t w0 = __byte_perm(b[0], b[1], sel);
+                    const uint32_t w1 = __byte_perm(b[2], b[3], sel);
+                    const uint32_t w2 = __byte_perm(b[4], b[5], sel);
+                    const uint32_t w3 = __byte_perm(b[6], b[7], sel);
+                    // lo = 4 字节 = pair(k0,k0+1) + pair(k0+2,k0+3)
+                    const uint32_t lo = __byte_perm(w0, w1, 0x5410);
+                    const uint32_t hi = __byte_perm(w2, w3, 0x5410);
+                    const int d = d0 + dd;
+                    uint32_t* dst = reinterpret_cast<uint32_t*>(
+                        &v_b16[d * (Bc / 2) + swz_v(d, kq * 4)]);
+                    dst[0] = lo;
+                    dst[1] = hi;
+                }
             }
         }
         __syncthreads();
