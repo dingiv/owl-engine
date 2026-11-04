@@ -170,7 +170,41 @@ exec/spec 3 / exec/draft 4)→ 0 处**(枚举只在「构造点 + trait impl」�
 实机 DFlash2 d7 双档(int8 8k **2313.5 t/s**、fp8+shadow 32k **2094.3 t/s**)
 propose/select/verify 全路径跑通。
 
-### 3.3 装载器:`ModelSource` trait(AWQ/safetensors vs GGUF)
+### 3.3 装载器:`CheckpointDecl`(第一步已落地,2026-11-04 第三批)
+
+**先做的判断**:装载器里真正的"两套并行实现"其实是 **权重装载**
+(`formats/qwen35` vs `formats/gguf`),而 `LoadArm` 枚举早已是唯一分派点
+(`load_shard` 一个 match)。真正在**重复校验逻辑**的是 `--check`:
+`check_model_dir`(读 `config.json`)与 `check_gguf_model`(读 GGUF KV +
+`rope_facts`)各写一遍「几何对账 + 视觉声明 + 一句话摘要」。
+
+所以第一步收的是**声明面**:
+
+```rust
+pub trait CheckpointDecl {           // formats/decl.rs(纯 host,无 async/无设备)
+    fn geom(&self) -> &DeclGeom;      // 唯一几何事实(各源自己的解析器填)
+    fn format_name(&self) -> &'static str;
+    fn summary(&self) -> String;      // 格式 + 关键事实(不含比对结论)
+    fn max_pos_policy(&self) -> MaxPosPolicy;   // HF 硬拒 / GGUF 软警告(YaRN)
+    fn vision(&self, path: Option<&Path>) -> Result<Option<VisionDecl>, String>;
+    fn draft(&self) -> DraftDecl;
+}
+pub fn open_decl(path, gguf: bool) -> Result<Option<Box<dyn CheckpointDecl>>, String>;
+pub fn check_geom_against(decl, profile, max_seq) -> Result<(), String>;  // 源无关对账
+```
+
+**效果**:`apps/server/src/config.rs` 里两个格式专用校验函数(合计 ~150 行)
+→ **一个 `check_model_decl`(≈35 行)**;调用点从「按 `is_file()` 二选一」
+→ 一条路径(只把 `gguf` 位交给 `open_decl`)。几何/`max_pos`/视觉/摘要
+全部单点;新增源格式 = 加一个 `impl CheckpointDecl`。
+
+**输出保真**(三档实跑逐行对拍):HF/GGUF/int8 三档的 `model dir:` 行**逐字一致**,
+唯一差异 = HF 档在 `vision=on` 时也追加 `· vision=model.visual.*`(GGUF 一直有;
+属信息补齐)。负例同样保真:HF 档给 `[vision] path` ⇒ 响亮拒(与装载期同律)、
+GGUF 档 `enabled=false` 却给 path ⇒ 自相矛盾、HF 目录缺 `config.json` ⇒
+只提示"几何校验跳过"不判失败。
+
+### 3.3b 装载器(第二步,未做):`ModelSource` trait(AWQ/safetensors vs GGUF)
 
 现状:`loader.rs`(810 行)+ `formats/qwen35.rs`(2.2k)+ `formats/gguf/*`(10.5k)
 两套并行,`ModelFormat::` 44 处分叉,`--check` 另有一套。目标:
