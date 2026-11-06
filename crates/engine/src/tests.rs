@@ -158,7 +158,9 @@ async fn mock_snap_engine(
     let cfg = EngineConfig {
         device_ordinal: 0,
         max_seq_tokens: 256,
-        prefill_chunk: 32,
+        // 单块 64 tok：让 40 tok 的 prompt 走**单 chunk**（CPU mock 不支持多 chunk），
+        // 且跨过 32-tok 页边界 ⇒ 末边界快照存在 ⇒ 第二轮真的能命中前缀链。
+        prefill_chunk: 64,
         knobs,
     };
     let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
@@ -406,8 +408,32 @@ async fn failed_start_returns_gdn_row() {
         .expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
 
+    // 先跑完一轮（建立可复用前缀链 + 末边界快照）。
+    let prompt = (0..16)
+        .map(|i| ((i * 7) % 997).to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (_sid, warm) = running
+        .submit_session_opts(Some(7), prompt.clone(), 8, Default::default())
+        .expect("submit warm");
+    loop {
+        match running.pump().await.expect("pump warm") {
+            crate::turn::TurnEvent::Completed { turn, .. }
+            | crate::turn::TurnEvent::Failed { turn, .. }
+                if turn == warm =>
+            {
+                break
+            }
+            _ => {}
+        }
+    }
+    let held_before = running.store_report().session_held_bytes;
+    assert_eq!(held_before, 0, "turn 收口后不应有会话持有面");
+
+    // 同一前缀再来一轮：plan_prefix_reuse 会把复用链挂进会话表（incref）；
+    // 用坏 Grant 让 start_one 在 ensure 处失败 ⇒ 回滚必须**连链一起还**。
     let (_sid, tid) = running
-        .submit_session_opts(Some(7), "hello world", 32, Default::default())
+        .submit_session_opts(Some(7), prompt, 8, Default::default())
         .expect("submit");
     let turn = running.turns.queue.pop_front().expect("queued turn");
     assert_eq!(turn.id, tid);
@@ -425,16 +451,21 @@ async fn failed_start_returns_gdn_row() {
         alloc_slots: 0,
         alloc_bytes: 0,
     };
-    let err = match running.start_one(turn, bad_grant) {
+    let err = match running.start_one(turn, bad_grant).await {
         Ok(_) => panic!("坏 Grant 必须让 start_one 失败"),
         Err(e) => e,
     };
     eprintln!("[f17] start_one 拒: {err}");
 
-    let rows_after = running.store_report().state.rows_free;
+    let rep = running.store_report();
     assert_eq!(
-        rows_after, rows_before,
-        "启动失败必须归还 GDN 行（F-17）：before {rows_before}, after {rows_after}"
+        rep.state.rows_free, rows_before,
+        "启动失败必须归还 GDN 行（F-17）：before {rows_before}, after {}",
+        rep.state.rows_free
+    );
+    assert_eq!(
+        rep.session_held_bytes, held_before,
+        "启动失败必须还掉计划阶段挂上的复用链（否则 refs>1 永久占不可动面）"
     );
 }
 

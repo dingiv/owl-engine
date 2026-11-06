@@ -556,7 +556,11 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 从 `schedule()` 抽出（2026-10-20）：准入判决必须**在启动之外**做
     /// `Hold/Reject` —— 判决嵌在启动体里时，Hold 早退会停摆已有活跃、
     /// 不早退则队首照常被弹起（准入形同虚设）。**行为逐字节不变**。
-    pub(crate) fn start_one(&mut self, turn: crate::turn::Turn, grant: owl_store::Grant) -> Result<BeginPlan> {
+    pub(crate) async fn start_one(
+        &mut self,
+        turn: crate::turn::Turn,
+        grant: owl_store::Grant,
+    ) -> Result<BeginPlan> {
         let grant_id = grant.id;
         // **准入登记**(S3b §23.2):turn 从此占用一块保留额(实占随
         // `sync_pool_account` 在段边界更新;天花板门 count 靠它)。
@@ -575,7 +579,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             Err(e) => {
                 // 行耗尽是"拒绝启动"而非"引擎故障"——准入账已登记，必须收口。
                 // 此刻**没有拿到行**（borrow 失败），传 None。
-                self.rollback_failed_start(turn.id, None);
+                self.rollback_failed_start(turn.id, None, turn.session_id);
                 return Err(e.into());
             }
         };
@@ -585,7 +589,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let row_grant = match self.bank.rel.reserve_row(turn.id) {
             Ok(g) => g,
             Err(e) => {
-                self.rollback_failed_start(turn.id, Some(gdn_row));
+                self.rollback_failed_start(turn.id, Some(gdn_row), turn.session_id);
                 return Err(e.into());
             }
         };
@@ -602,6 +606,29 @@ impl<D: DeviceClient> RunningEngine<D> {
         // (G5 兜底,`plan_image_delete` 全程纯读,失败零副作用)。
         // **前缀无感删除 = leave-gap 唯一路径**(2026-10-26):删图后保留
         // 幸存 position、不转 K;不命中则逐字节旧前缀复用路径。
+        // **起点分配目标**（唯一算式；分配在 plan 之后按真实表长算缺口 ——
+        // 见 `ensure_start_chain`）。
+        //
+        // 锁①后半(2026-10-19):非虚拟化档覆盖整条 prompt;虚拟化档只长到
+        // 首个 chunk 的那几页,后续由 `execute_prefill` 逐 chunk 增量长。
+        let start_target = if self.boot.cfg.knobs.kvmem_virtualization {
+            Self::prefill_step_chunk_msg(
+                0,
+                turn.prompt_ids.len(),
+                self.boot.cfg.prefill_chunk,
+                self.boot.cfg.knobs.prefill_tail_merge,
+                Self::prefill_align_page(
+                    self.boot.cfg.knobs.prefill_align_tail,
+                    self.boot.cfg.knobs.prefix_cache,
+                    self.dev.pool.geom.page,
+                ),
+                &turn.msg_snaps,
+                self.boot.cfg.knobs.snap_msg_min_span,
+            )
+            .unwrap_or(1)
+        } else {
+            turn.prompt_ids.len()
+        };
         let prep = (|| -> Result<(
             usize,
             Option<owl_store::SnapKey>,
@@ -625,49 +652,24 @@ impl<D: DeviceClient> RunningEngine<D> {
                     let (c, r, pl, lz) = self.plan_prefix_reuse(&turn)?;
                     (c, r, pl, None, lz)
                 };
-            // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
-            //
-            // **锁①后半(2026-10-19)**:原实现一次长到**整个 prompt** ——
-            // 池 ≥ ctx 时从不暴露;池 < ctx(虚拟化档)时那一步就要几千页槽
-            // ⇒ 必 `Exhausted`。虚拟化档只长到**首个 chunk** 的那几页,
-            // 后面由 `execute_prefill` 逐 chunk 增量长(用到哪长到哪);
-            // 腾位归召回点的驻留调和。
-            {
-                // 会话账缺失 = 内部不变量失守 ⇒ 显式 Err 上抛到泵循环
-                // （长驻服务禁 panic；F-24）。
-                let s = self.bank.sessions.session_mut(turn.session_id)?;
-                let target = if self.boot.cfg.knobs.kvmem_virtualization {
-                    Self::prefill_step_chunk_msg(
-                        0,
-                        turn.prompt_ids.len(),
-                        self.boot.cfg.prefill_chunk,
-                        self.boot.cfg.knobs.prefill_tail_merge,
-                        Self::prefill_align_page(
-                            self.boot.cfg.knobs.prefill_align_tail,
-                            self.boot.cfg.knobs.prefix_cache,
-                            self.dev.pool.geom.page,
-                        ),
-                        &turn.msg_snaps,
-                        self.boot.cfg.knobs.snap_msg_min_span,
-                    )
-                    .unwrap_or(1)
-                } else {
-                    turn.prompt_ids.len()
-                };
-                // **P0-4**：只消费准入 Grant（分配失败会把额度回滚）。
-                self.bank
-                    .rel
-                    .ensure_for_len(grant_id, &mut s.block_table, target)?;
-            }
             Ok((cached_len, restore_key, pending_loads, image_exec, lazy_view))
         })();
         let (cached_len, restore_key, pending_loads, image_exec, lazy_view) = match prep {
             Ok(v) => v,
             Err(e) => {
-                self.rollback_failed_start(turn.id, Some(gdn_row));
+                self.rollback_failed_start(turn.id, Some(gdn_row), turn.session_id);
                 return Err(e);
             }
         };
+        // **起点分配**：按 plan 后的真实表长算缺口；池不够先让 store 把
+        // 缓存 KV 下沉宿主（`step_need` 的 dev/have 估算可能偏小）。
+        if let Err(e) = self
+            .ensure_start_chain(turn.id, turn.session_id, grant_id, start_target)
+            .await
+        {
+            self.rollback_failed_start(turn.id, Some(gdn_row), turn.session_id);
+            return Err(e);
+        }
         let begin = BeginPlan {
             session_id: turn.session_id,
             gdn_slot: gdn_row,
@@ -770,6 +772,58 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(begin)
     }
 
+    /// **起点块表分配**（真实缺口 → 先腾位 → 再纯分配）。
+    ///
+    /// 不能只靠 `step_need` 的估算：它用 `dev/have` 近似复用面（快照边界
+    /// 回退、池帽裁剪、宿主待回灌面都不在算式里），偏小时 `ensure_for_len`
+    /// 直接撞 `Exhausted`（2026-11-06 真机：free 53 / delta 107，而缓存
+    /// 8147 页明明可以下沉宿主）。这里按 plan 后的**真实表长**算缺口，
+    /// 缺口大于空闲就先跑一次腾位（KV 下沉宿主 / 可驱逐面），再纯分配。
+    async fn ensure_start_chain(
+        &mut self,
+        turn: u64,
+        session_id: u64,
+        grant: owl_store::ReservationId,
+        target: usize,
+    ) -> Result<()> {
+        let page = self.dev.pool.geom.page.max(1);
+        let delta = {
+            let s = self.bank.sessions.session(session_id)?;
+            target.div_ceil(page).saturating_sub(s.block_table.len())
+        };
+        if delta == 0 {
+            return Ok(());
+        }
+        let free = self.bank.rel.leg.report().slots_free;
+        if free < delta {
+            let shortage = delta - free;
+            owl_shared::log_info!(
+                "store",
+                "turn {turn} 起点缺口 {shortage} 槽（需 {delta} / 空闲 {free}）⇒ 先腾位"
+            );
+            let applied = self
+                .pool_housekeeping(
+                    owl_store::Need::kv(shortage, owl_store::NeedWhy::Grow),
+                    &[],
+                    None,
+                )
+                .await?;
+            owl_shared::log_info!(
+                "store",
+                "turn {turn} 起点腾位：KV 下沉 {} / 驱逐 {} / 溢盘 {} / 跳忙 {}",
+                applied.offloaded,
+                applied.dropped,
+                applied.spilled,
+                applied.skipped_busy
+            );
+        }
+        let s = self.bank.sessions.session_mut(session_id)?;
+        self.bank
+            .rel
+            .ensure_for_len(grant, &mut s.block_table, target)?;
+        Ok(())
+    }
+
     /// **启动失败的半态回滚**（F-17）。
     ///
     /// `start_one` 已借的一切（准入账 / Grant / GDN 行）都经 store 的
@@ -783,7 +837,32 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// - HEAD：行在这里还（幂等成立）；
     /// - `finish_turn` 已还：拿到"重复归还"错误，按 debug 忽略（不是故障）。
     /// 两版引擎都能自洽；等 store 单一围栏提交后再删掉这次补还。
-    fn rollback_failed_start(&mut self, turn_id: u64, gdn_row: Option<usize>) {
+    fn rollback_failed_start(&mut self, turn_id: u64, gdn_row: Option<usize>, session_id: u64) {
+        // **计划阶段已把复用链挂进会话表**（`plan_prefix_reuse` 对 m 块 incref）：
+        // start 失败必须原样还掉，否则这些块 refs>1 ⇒ `sync_pool_account` 把整条
+        // 链算进"会话持有面"（不可动面）⇒ 之后腾位搬不动、准入被拒。
+        // 2026-11-06 双并发门实测：连续两次启动失败后 2.9 GiB 设备 KV 变成
+        // `session_held`，`plan_need` 只能凑出 11/116 槽 ⇒ 池墙假死。
+        let mut table = Vec::new();
+        let mut mtp_table = Vec::new();
+        if let Some(s) = self.bank.sessions.get_mut(session_id) {
+            table = std::mem::take(&mut s.block_table);
+            mtp_table = std::mem::take(&mut s.mtp_block_table);
+        }
+        if let Err(e) = self.bank.rel.leg.release_table(&mut table) {
+            owl_shared::log_warn!(
+                "sched",
+                "start_one 回滚:还复用链失败(turn {turn_id}, session {session_id:#x}): {e}"
+            );
+        }
+        if self.bank.mtp_ring {
+            mtp_table.clear();
+        } else if let Err(e) = self.bank.leg_mtp.release_table(&mut mtp_table) {
+            owl_shared::log_warn!(
+                "sched",
+                "start_one 回滚:还 MTP 链失败(turn {turn_id}, session {session_id:#x}): {e}"
+            );
+        }
         self.close_admission(turn_id);
         if let Some(row) = gdn_row {
             if let Err(e) = self.bank.rel.state.return_row(row, None) {
@@ -1616,7 +1695,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 what: "准入放行但无 Grant（store 账未发）".into(),
                             })?;
                     let turn_id = turn.id;
-                    begin = Some(match self.start_one(turn, grant) {
+                    begin = Some(match self.start_one(turn, grant).await {
                         Ok(b) => b,
                         Err(e) => {
                             // 启动失败 ⇒ 票必须归还，不能让一次失败吞掉容量。

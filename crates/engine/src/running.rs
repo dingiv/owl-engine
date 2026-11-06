@@ -2519,8 +2519,12 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .get(sid)
                     .map(|s| s.block_table.len())
                     .unwrap_or(0);
+                // `dev`（复用面里在设备的块）与 `have`（会话当前表）可能指向
+                // **同一批前缀**：直接相减会双重扣减（2026-11-06 真机：need=0
+                // ⇒ 一拍不腾位 ⇒ ensure 撞墙）。取两者上限（安全下界；精确缺口
+                // 由 `start_one → ensure_start_chain` 在 plan 之后补算）。
                 return Ok(owl_store::Need::kv(
-                    slots_for(plen).saturating_sub(dev).saturating_sub(have),
+                    slots_for(plen).saturating_sub(dev.max(have)),
                     NeedWhy::Admit,
                 ));
             }
@@ -4323,7 +4327,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         )
     }
 
-    async fn pool_housekeeping(
+    pub(crate) async fn pool_housekeeping(
         &mut self,
         need: owl_store::Need,
         extra_snaps: &[owl_store::SnapKey],
