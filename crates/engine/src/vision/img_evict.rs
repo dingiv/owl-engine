@@ -579,6 +579,16 @@ pub fn positions_after_splice(
             spans.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>()
         ));
     }
+    // **紧凑文本的截断/改写 = 无洞**（2026-11-06 双并发门定谳）：
+    // 纯文本会话的位置就是下标；客户端把旧尾巴截短（最常见：不带上一轮生成段
+    // 重发前缀）时，正确做法是让新尾巴从**分歧点** `tail_start` 续写，而不是从
+    // 旧 `max+1` 起（后者会凭空造一个位置洞 ⇒ 会话被标 `positioned` ⇒
+    // 跨会话复用被永久关闭，真机表现为"明明有 KV 却命中 0"）。
+    // mRoPE/图像会话（old_pos 非紧凑）保持旧语义：分歧/删除 = 真位置洞。
+    let compact_old = old_pos
+        .iter()
+        .enumerate()
+        .all(|(i, p)| p.iter().all(|v| *v == i as i32));
     let tail = &new_ids[tail_start..];
     if !tail.is_empty() {
         let grids: Vec<GridThw> = spans
@@ -590,13 +600,18 @@ pub fn positions_after_splice(
         let index = mrope
             .rope_index(tail, &tt, &grids, &[])
             .map_err(|e| format!("positions_after_splice: 新尾巴 rope_index: {e}"))?;
-        let base = old_pos
-            .iter()
-            .flat_map(|p| p.iter())
-            .copied()
-            .max()
-            .unwrap_or(-1)
-            .saturating_add(1);
+        let base: i32 = if deletion.is_none() && compact_old {
+            i32::try_from(tail_start)
+                .map_err(|_| "positions_after_splice: tail_start 越 i32")?
+        } else {
+            old_pos
+                .iter()
+                .flat_map(|p| p.iter())
+                .copied()
+                .max()
+                .unwrap_or(-1)
+                .saturating_add(1)
+        };
         for p in index.pos {
             let add = |v: i64| -> Result<i32, String> {
                 i32::try_from(v)
@@ -615,7 +630,10 @@ pub fn positions_after_splice(
         ));
     }
     let max_pos = pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0);
-    Ok((pos, max_pos, deletion.is_some() || tail_start < old_tokens.len()))
+    // 洞的判据 = 删除（leave-gap）**或** 非紧凑序列上的分歧；紧凑文本的分歧
+    // 已按 `tail_start` 连续续写，不再产生洞。
+    let gap = deletion.is_some() || (tail_start < old_tokens.len() && !compact_old);
+    Ok((pos, max_pos, gap))
 }
 
 #[cfg(test)]
