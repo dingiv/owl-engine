@@ -33,5 +33,18 @@ pub mod marlin;
 /// **族身份零门**(与 `family::cublas` 同律 —— `driver::resolve` 的表要它);
 /// 执行面 `server::nvfp4` 与源 `cu/nvfp4/` 才是 feature 门槛的。
 pub mod nvfp4;
+
+/// **声明恒在、执行面随 feature 门控**的家族 id(装配门例外名单)。
+///
+/// 只有"声明面必须无条件存在、执行面由 feature 决定"的族才进这里;
+/// 孤儿门对它们豁免(否则 `tag_wildcard` 测试档会把"本构建没有该执行面"
+/// 误判成"家族遗漏")。真正不可跑仍由 [`crate::admit`] 拒绝。
+pub const BUILD_GATED_FAMILIES: &[&str] = &[nvfp4::FAMILY_ID];
+
+/// 该家族是否"构建期可选"(见 [`BUILD_GATED_FAMILIES`])。
+#[must_use]
+pub fn is_build_gated_family(id: &str) -> bool {
+    BUILD_GATED_FAMILIES.contains(&id)
+}
 /// XQA 契约 + FFI(feature=xqa 时链接;契约面零门 —— 层侧 sig 查询要它)
 pub mod xqa;

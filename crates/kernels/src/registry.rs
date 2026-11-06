@@ -481,6 +481,11 @@ impl OpRegistry {
         let ids: HashSet<&'static str> = families.iter().map(|f| f.id().0).collect();
         let orphan: Vec<&str> = crate::ops::all()
             .filter(|m| m.is_family() && !ids.contains(m.family.0))
+            // **构建期可选家族**:声明面恒在、执行面由 feature 门控(如 nvfp4 随
+            // arch-sm120)。未编入执行面时"家族不在装配表"是**预期事实**,不是
+            // 声明遗漏;真正不可跑由 `admit` 在选核期响亮拒。名单只收这类族
+            // (见 `family::BUILD_GATED_FAMILIES`),不许拿来给漏装配打补丁。
+            .filter(|m| !crate::family::is_build_gated_family(m.family.0))
             .filter(|m| match allowed {
                 Some(a) => a.contains(&m.entry),
                 None => true,
@@ -668,6 +673,28 @@ mod tests {
     /// 非 Native 声明必须有族" —— 空工厂表 + 全量激活 = 11 条孤儿 ⇒ 直接拒
     /// (本测试自 A16 起挂红)。用**空激活集** `Some(&[])` ⇒ 零激活声明 ⇒
     /// 裸注册表可构造，纪律照测。
+    /// **构建期可选家族**的孤儿门豁免是显式决策(名单 + 声明面同一份字面量)。
+    ///
+    /// 动机:测试档 `tag_wildcard`(全量激活)在**未编入 nvfp4 执行面**的构建里
+    /// 曾因 `nvfp4_gemm` / `nvfp4_pack_weight` 声明"无家族"而拒启 —— 那不是
+    /// 声明遗漏,而是"该执行面本就随 arch-sm120 feature 走"。这里锁死:
+    /// ① 名单恰好只有 nvfp4(新增条目必须改测试留痕);② 声明面确实引用该 id。
+    #[test]
+    fn build_gated_families_are_exempt_from_orphan_gate() {
+        assert_eq!(
+            crate::family::BUILD_GATED_FAMILIES,
+            &[crate::family::nvfp4::FAMILY_ID],
+            "新增构建期可选家族 = 显式决策(孤儿门豁免),必须在本测试留痕"
+        );
+        let m = crate::ops::meta(crate::family::nvfp4::GEMM).expect("声明面恒在");
+        assert!(m.is_family(), "nvfp4_gemm 是家族路由名");
+        assert!(crate::family::is_build_gated_family(m.family.0));
+        // 反向:普通家族不得误入豁免名单(拿 marlin 当非可选代表)
+        assert!(!crate::family::is_build_gated_family(
+            crate::family::marlin::GEMM_W4A16
+        ));
+    }
+
     #[test]
     fn knows_and_execute_share_the_table() {
         // 零 DeviceRes 环境无法 boot 真家族(assemble 需 GPU);这里用空工厂表

@@ -129,25 +129,57 @@ mod tests {
 
     #[test]
     fn kv_tags_correspond_to_declared_pool_access() {
-        // tag 是选核声明:带 kv.* 的算子必须真的声明了 KV 池访问;
-        // 没有 POOL 的通用 norm/rope 不得因为 dtype 后缀被误打 kv tag
-        // (否则 fp8 档的 tag filter 会误杀它们)。
+        // tag 是选核声明:带 kv.* 的算子必须有**事实依据**。两种合法形态:
+        // ① 真的声明了 KV 池访问(`POOL` 含同池);
+        // ② 不碰池、但属于该 KV dtype 的**路径**(`SHAPE.kv_dtype` 与之相等)——
+        //    例:int8-KV prefill 的 `norm_rope_q_int8` 只量化激活,不读写池,
+        //    却必须只在 int8-KV 档激活(否则 fp8/f16 档 tag filter 会误杀/误放)。
+        // 没有 POOL 也没有 KV 形状事实的通用 norm/rope 不得误打 kv tag。
+        let shape_covers = |m: &crate::spec::KernelMeta, prefix: &str| {
+            let mut any = false;
+            for t in m.tags {
+                let Some(rest) = t.as_str().strip_prefix(prefix) else { continue };
+                any = true;
+                let want = match rest {
+                    "f16" => Some(crate::contract::Dtype::F16),
+                    "bf16" => Some(crate::contract::Dtype::BF16),
+                    "fp8" => Some(crate::contract::Dtype::F8E4M3),
+                    "int8" => Some(crate::contract::Dtype::I8),
+                    _ => None,
+                };
+                if want.is_none() || m.shape.kv_dtype != want {
+                    return false;
+                }
+            }
+            any
+        };
         let mut bad = Vec::new();
         for m in crate::ops::all() {
             let has = |prefix: &str| m.tags.iter().any(|t| t.as_str().starts_with(prefix));
             let main_pool = m.pool.iter().any(|p| p.pool == "kv.main");
             let draft_pool = m.pool.iter().any(|p| p.pool == "kv.draft");
-            if main_pool != has("kv.main.") || draft_pool != has("kv.draft.") {
+            let main_ok = if main_pool {
+                has("kv.main.")
+            } else {
+                !has("kv.main.") || shape_covers(m, "kv.main.")
+            };
+            let draft_ok = if draft_pool {
+                has("kv.draft.")
+            } else {
+                !has("kv.draft.") || shape_covers(m, "kv.draft.")
+            };
+            if !main_ok || !draft_ok {
                 bad.push((
                     m.entry,
                     main_pool,
                     draft_pool,
                     m.pool.iter().map(|p| p.pool).collect::<Vec<_>>(),
+                    m.shape.kv_dtype,
                     m.tag_ids(),
                 ));
             }
         }
-        assert!(bad.is_empty(), "kv.main/kv.draft tag 与 POOL 不一致: {bad:#?}");
+        assert!(bad.is_empty(), "kv.main/kv.draft tag 与 POOL/形状事实不一致: {bad:#?}");
     }
 
     #[test]

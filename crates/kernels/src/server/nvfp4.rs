@@ -37,7 +37,7 @@ pub struct Nvfp4Runtime {
 }
 
 impl Nvfp4Runtime {
-    pub const ID: OpId = OpId(GEMM);
+    pub const ID: OpId = OpId(FAMILY_ID);
 
     /// **计划缓存上限**(S4,2026-10-28)。
     ///

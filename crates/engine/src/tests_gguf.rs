@@ -474,8 +474,13 @@ async fn tp2_body(key: &str, layers: usize, want_first: &str, oa: usize, ob: usi
     let cfg = gguf_cfg(oa, 4096, 4096, 1);
     // ── ⓪ 单卡参考的**首步 logits**(TP2 的数值判据;比"全序列逐 token"强得多)──
     //    单卡与 TP2 不能同卡共存(24G 装不下两份)⇒ 先跑单卡、drop、再上 TP2。
+    // 单卡参考**放在 rank1 的卡上**:同卡先跑全量再 drop 时,驱动侧回收可能滞后,
+    // 而 `into_running` 的预算用 **rank0 的 boot free 快照** ⇒ 参考若占 rank0 的卡,
+    // 会把上一份 18GB 误算进"卡可用"(实测 5.34GB)。跑在 rank1 卡上,rank0 快照干净;
+    // rank1 的 boot 快照不参与预算(TP 只取 rank0 那份)。
     let ref_logits = {
-        let mut e = Engine::new(cfg.clone()).expect("engine(单卡参考)");
+        let mut e = Engine::new(EngineConfig { device_ordinal: ob, ..cfg.clone() })
+            .expect("engine(单卡参考)");
         let loaded = e.loader().load_gguf(&path).await.expect("单卡装载");
         let mut r = e.run(loaded).await.expect("单卡装配");
         let v = first_logits_gguf(&mut r, "The capital of France is").await;
@@ -484,10 +489,19 @@ async fn tp2_body(key: &str, layers: usize, want_first: &str, oa: usize, ob: usi
     };
     eprintln!("[gguf-tp2] 单卡参考:{} 项 logits", ref_logits.len());
     let mut e0 = Engine::new(cfg.clone()).expect("engine(rank0)");
+    // **事件账合流必须在装载之前**(2026-10-20 定谳):装即发事件,事后接管会把
+    // 这批事件丢进孤儿账 ⇒ rank1 这里就用 rank0 的账本构造(装配期那次 adopt
+    // 退化为幂等复核)。
+    let ledger0 = e0.ledger_cell();
     let live0 = owl_shared::vram::live_bytes();
     let l0 = e0.loader().slice(0, 2).load_gguf(&path).await.expect("rank0 分片装载");
     let g0 = owl_shared::vram::live_bytes().saturating_sub(live0) as f64 / (1u64 << 30) as f64;
-    let mut e1 = Engine::new(EngineConfig { device_ordinal: ob, ..cfg }).expect("engine(rank1)");
+    let mut e1 = Engine::new_with_ledger(
+        EngineConfig { device_ordinal: ob, ..cfg },
+        ledger0,
+        1,
+    )
+    .expect("engine(rank1)");
     let l1 = e1.loader().slice(1, 2).load_gguf(&path).await.expect("rank1 分片装载");
     eprintln!(
         "[gguf-tp2] 分片装载:rank0 {g0:.2} GiB(文件 {file_gib:.2});两侧层数 {}/{}",

@@ -85,6 +85,13 @@ fn sync_probe() { }
   `nvidia-smi --query-gpu=pci.bus_id` 查）。纯数字 = 响亮拒。
   需要 ordinal 的底层测试用 `owl_cuda::test_device_ordinal(_opt)`（唯一解析入口）。
 
+- **通配激活 × 构建期可选家族**（2026-11-05 定）：测试档 `tag_wildcard` = 全量激活，
+  装配门的"孤儿声明"检查会把**声明面恒在、执行面随 feature** 的家族误判成漏装配。
+  这类家族登记在 `owl_kernels::family::BUILD_GATED_FAMILIES`（目前只有 `nvfp4`，
+  执行面随 `arch-sm120`），孤儿门对其豁免；真正不可跑仍由 `admit` 在选核期拒。
+  **新增条目 = 显式决策**，必须同步改
+  `registry::tests::build_gated_families_are_exempt_from_orphan_gate`。
+
 ## 4. 决策表：我要做什么 → 改哪里
 
 | 诉求 | 动作 |

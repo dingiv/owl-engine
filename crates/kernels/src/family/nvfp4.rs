@@ -17,6 +17,15 @@
 /// foreign-kernel 核名(server 分派臂;**字面量住址 = 本模块**)
 pub const GEMM: &str = "nvfp4_gemm";
 
+/// **本族 id**(= [`GEMM`];执行面 `Nvfp4Runtime::ID` 与声明面 `FAMILY` 同源)。
+///
+/// **执行面随 feature 门控**(`feature = "nvfp4"`,由 `arch-sm120` 带出),
+/// 声明面恒在(见 [`crate::ops::nvfp4`])⇒ 该 id 登记在
+/// [`crate::family::BUILD_GATED_FAMILIES`]:未编入执行面的构建里,装配门把本族
+/// 当"构建期可选",**不算孤儿声明**;真正不可跑由
+/// [`crate::admit::OpFamily::NvFp4Cutlass`] 在选核期拒绝(响亮,带换档建议)。
+pub const FAMILY_ID: &str = GEMM;
+
 /// **装载期设备侧权重打包**核名(2026-10-28 M7)。
 ///
 /// 与 [`GEMM`] 同族同 plan(`sfb` 步长只依赖 `N,K`),但**不是 GEMM**:
