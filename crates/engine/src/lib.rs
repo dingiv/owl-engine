@@ -166,6 +166,21 @@ impl LoadIntent {
             embed: embed_plan_of(embed_quant),
         }
     }
+
+    /// **臂能力门**(装载器与 `--check` 共用;真实执行仍由源 `build_model` 复核)。
+    ///
+    /// 今天唯一一条:GGUF 的计划是**逐张量**事实 ⇒ `head_quant`/`embed_quant`
+    /// 覆盖无意义(给了 = 配置在说谎)。文案与 `GgufFileSource::build_model`
+    /// 同源(同一个 `check_keyed_overrides`)。
+    pub fn check_arm(&self, arm: LoadArm) -> std::result::Result<(), String> {
+        match arm {
+            LoadArm::Gguf(_) => {
+                owl_models::formats::model_source::check_keyed_overrides(self.head, self.embed)
+                    .map_err(|e| e.to_string())
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl LoadArm {
@@ -189,6 +204,16 @@ impl LoadArm {
             LoadArm::NvFp4 => "nvfp4",
             LoadArm::Gguf(_) => "gguf",
             LoadArm::F16Base => "f16/bf16",
+        }
+    }
+
+    /// **臂 → 声明面源族**(`--check` 与 boot 同一分派;不再由 `is_file` 猜)
+    pub fn decl_source(self) -> owl_models::formats::decl::DeclSource {
+        match self {
+            LoadArm::Gguf(_) => owl_models::formats::decl::DeclSource::Gguf,
+            LoadArm::AwqInt4 | LoadArm::AwqA8 | LoadArm::NvFp4 | LoadArm::F16Base => {
+                owl_models::formats::decl::DeclSource::Hf
+            }
         }
     }
 }

@@ -1,17 +1,28 @@
-//! **检查点声明面**(`CheckpointDecl`)—— 2026-11-04 clean-code 第一步。
+//! **检查点声明面**(`CheckpointDecl`)—— 2026-11-04 clean-code。
 //!
 //! # 为什么
 //!
 //! `--check` 原先有**两条平行的校验路径**(`check_model_dir` 读 HF
 //! `config.json` / `check_gguf_model` 读 GGUF KV + `rope_facts`),
 //! 两份代码各自做「几何对账 + 视觉塔声明 + 一句话摘要」,字段名与错误文案
-//! 各写一遍 ⇒ 新增一个源格式 = 再抄一份校验。这里把**声明事实**抽成一个
-//! 源无关的接口:消费者(`--check`)只有一条路径,格式差异封在两个 impl 里。
+//! 各写一遍 ⇒ 新增一个源格式 = 再抄一份校验。
+//!
+//! **第二刀(2026-11-04 深夜)**:两个 impl 曾经各持一套解析器(`HfDecl` 读
+//! `config.json`、`GgufDecl` 读 KV),与装载器仍是两份事实。现在 impl 直接落在
+//! **源的事实载体**上:
+//!
+//! | 声明实现 | 事实来源(与装载同一次解析) |
+//! |---|---|
+//! | [`HfFacts`](super::model_source::HfFacts) | `ModelSpec::from_ckpt` 的 `SpecReport` |
+//! | [`GgufFacts`](super::model_source::GgufFacts) | `GgufSource` 的 `spec` + `spec_report` + `rope_facts` |
+//!
+//! ⇒ 第三套读取器删除;`--check` 看到的就是装载器将看到的那份事实。
 //!
 //! # 边界
 //!
 //! 本接口**只读元数据,不装权重**(纯 host 面,无设备、无 async)。
-//! 权重装载路径(§2 第二步)复用同一套事实,但那是后续刀的范围。
+//! `--check` 构造的是**声明事实载体**(不是完整 `ModelSource`):不打开设备、
+//! 不物化权重槽,也不产生装载日志。
 //!
 //! # 纪律
 //!
@@ -23,6 +34,7 @@
 
 use std::path::Path;
 
+use super::model_source::{GgufFacts, HfFacts};
 
 /// 源无关的**几何声明**(检查点自己说了什么)。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -80,198 +92,48 @@ pub trait CheckpointDecl {
     fn draft(&self) -> DraftDecl;
 }
 
-/// **打开检查点声明**:按源格式分派**唯一一处**。
+/// **声明面的源族**(由装载臂决定,不再由 `path.is_file()` 猜)。
 ///
-/// `gguf = true` ⇒ 单文件容器;否则 ⇒ HF/AWQ 目录(`config.json`)。
+/// `--check` 与 boot 必须用**同一个**臂分派(`load_arm_of(format, quant)`):
+/// 历史上按文件形态猜源 ⇒ `format=awq` + `.gguf` 路径可以"检查通过、启动失败"。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclSource {
+    /// HF/AWQ/W4A16 目录(`config.json` + 索引)
+    Hf,
+    /// GGUF 单文件
+    Gguf,
+}
+
+/// **打开检查点声明**:按 [`DeclSource`] 分派**唯一一处**。
+///
 /// `Ok(None)` = 该源**文件不在**(HF 缺 `config.json`)—— 与历史行为一致:
 /// `--check` 只提示"几何校验跳过",不判失败(真启动会失败)。
-pub fn open_decl(path: &Path, gguf: bool) -> Result<Option<Box<dyn CheckpointDecl>>, String> {
-    if gguf {
-        return Ok(Some(Box::new(GgufDecl::open(path)?)));
-    }
-    if !path.join("config.json").is_file() {
-        return Ok(None);
-    }
-    Ok(Some(Box::new(HfDecl::open(path)?)))
-}
-
-// ============================================================================
-// HF / AWQ 目录(声明源 = `config.json` 的 `text_config.*`)
-// ============================================================================
-
-struct HfDecl {
-    dir: std::path::PathBuf,
-    geom: DeclGeom,
-    /// `full_attention_interval`(0 = 未声明)
-    full_interval: usize,
-    /// `vision_config` 在场(塔权重在检查点目录 `model.visual.*`)
-    has_vision_cfg: bool,
-    has_image_token: bool,
-}
-
-impl HfDecl {
-    fn open(dir: &Path) -> Result<Self, String> {
-        let p = dir.join("config.json");
-        let raw = owl_shared::file_loader::read_to_string(&p)
-            .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
-        let v: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
-        let g = v.get("text_config").unwrap_or(&v);
-        let getu = |k: &str| g.get(k).and_then(|x| x.as_u64()).map(|n| n as usize);
-        let n_layers = getu("num_hidden_layers").unwrap_or(0);
-        let full_interval = getu("full_attention_interval").unwrap_or(0);
-        let n_full = if full_interval > 0 { n_layers / full_interval } else { 0 };
-        let geom = DeclGeom {
-            hidden: getu("hidden_size").unwrap_or(0),
-            n_layers,
-            n_full,
-            n_kv_heads: getu("num_key_value_heads").unwrap_or(0),
-            head_dim: getu("head_dim").unwrap_or(0),
-            vocab: getu("vocab_size").unwrap_or(0),
-            max_pos: getu("max_position_embeddings").unwrap_or(0),
-        };
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            geom,
-            full_interval,
-            has_vision_cfg: v.get("vision_config").is_some(),
-            has_image_token: v.get("image_token_id").and_then(|x| x.as_u64()).is_some(),
-        })
-    }
-}
-
-impl CheckpointDecl for HfDecl {
-    fn geom(&self) -> &DeclGeom {
-        &self.geom
-    }
-    fn format_name(&self) -> &'static str {
-        "hf"
-    }
-    fn summary(&self) -> String {
-        let g = &self.geom;
-        format!(
-            "{} ✓ hidden={} layers={}(full {}) kv_heads={} hd={} max_pos={}",
-            self.dir.display(),
-            g.hidden,
-            g.n_layers,
-            g.n_full,
-            g.n_kv_heads,
-            g.head_dim,
-            g.max_pos
-        )
-    }
-    fn max_pos_policy(&self) -> MaxPosPolicy {
-        MaxPosPolicy::Hard
-    }
-    fn vision(&self, vision_path: Option<&Path>) -> Result<Option<VisionDecl>, String> {
-        if vision_path.is_some() {
-            return Err(format!(
-                "{}:[vision] path 仅用于 format = \"gguf\"：HF/AWQ 档的视觉塔权重在检查点目录的 model.visual.*",
-                self.dir.display()
-            ));
+///
+/// 返回的实现是**事实载体**(`HfFacts` / `GgufFacts`):与装载路径同一份解析,
+/// 但不开设备、不物化权重、不写装载日志。
+pub fn open_decl(path: &Path, src: DeclSource) -> Result<Option<Box<dyn CheckpointDecl>>, String> {
+    match src {
+        DeclSource::Gguf => Ok(Some(Box::new(
+            GgufFacts::open(path).map_err(|e| e.to_string())?,
+        ))),
+        DeclSource::Hf => {
+            // 臂 = HF/AWQ,路径却是文件 ⇒ 与 boot 同律响亮拒(不再退化成
+            // "config.json 缺失 ⇒ 跳过",那会让 `format=awq` + `.gguf` 检查通过)
+            if path.is_file() {
+                return Err(format!(
+                    "HF/AWQ 档的 model.path 必须是**目录**(config.json + 索引),实得文件 {}",
+                    path.display()
+                ));
+            }
+            if !path.join("config.json").is_file() {
+                return Ok(None);
+            }
+            // 声明面只需要族预设的 dtype/tokenizer 声明;几何全部来自检查点。
+            let preset = super::qwen3_5_0_8b();
+            Ok(Some(Box::new(
+                HfFacts::open(path, &preset, (0, 1), false).map_err(|e| e.to_string())?,
+            )))
         }
-        if !self.has_vision_cfg {
-            return Err(format!(
-                "[vision] enabled = true,但 {} 的 config.json 无 vision_config(不是 VLM 检查点)",
-                self.dir.display()
-            ));
-        }
-        if !self.has_image_token {
-            return Err(format!(
-                "[vision] enabled = true,但 {} 的 config.json 缺 image_token_id",
-                self.dir.display()
-            ));
-        }
-        // HF 档的塔事实由装载期校验(此处只声明"在场")
-        Ok(Some(VisionDecl { note: "model.visual.*".into() }))
-    }
-    fn draft(&self) -> DraftDecl {
-        // MTP 头是否自带:由 `mtp.*` 张量索引声明(装载期读索引),此处不预读。
-        DraftDecl::default()
-    }
-}
-
-// ============================================================================
-// GGUF 单文件(声明源 = 文件 KV + rope_facts)
-// ============================================================================
-
-struct GgufDecl {
-    path: std::path::PathBuf,
-    geom: DeclGeom,
-    arch: String,
-    /// 视觉塔事实(GGUF 的塔是独立单文件,声明在 `mmproj`)
-    vision_note: Option<String>,
-}
-
-impl GgufDecl {
-    fn open(path: &Path) -> Result<Self, String> {
-        use crate::formats::gguf::{rope_facts, spec_from_gguf, Gguf};
-        let g = Gguf::open(path).map_err(|e| format!("打开 GGUF {} 失败: {e}", path.display()))?;
-        let (spec, rep) =
-            spec_from_gguf(&g).map_err(|e| format!("{} GGUF 超参: {e}", path.display()))?;
-        let rf = rope_facts(&g).map_err(|e| format!("{} GGUF rope: {e}", path.display()))?;
-        let geom = DeclGeom {
-            hidden: spec.hidden,
-            n_layers: spec.layer_types.len(),
-            n_full: spec.layer_types.iter().filter(|f| **f).count(),
-            n_kv_heads: spec.full_heads.1,
-            head_dim: spec.full_heads.2,
-            vocab: spec.vocab,
-            max_pos: rf.max_pos,
-        };
-        Ok(Self { path: path.to_path_buf(), geom, arch: rep.arch, vision_note: None })
-    }
-}
-
-impl CheckpointDecl for GgufDecl {
-    fn geom(&self) -> &DeclGeom {
-        &self.geom
-    }
-    fn format_name(&self) -> &'static str {
-        "gguf"
-    }
-    fn summary(&self) -> String {
-        let g = &self.geom;
-        format!(
-            "{} ✓ GGUF {} · hidden={} layers={}(full {}) kv_heads={} hd={} vocab={} · ctx={}",
-            self.path.display(),
-            self.arch,
-            g.hidden,
-            g.n_layers,
-            g.n_full,
-            g.n_kv_heads,
-            g.head_dim,
-            g.vocab,
-            g.max_pos
-        )
-    }
-    fn max_pos_policy(&self) -> MaxPosPolicy {
-        MaxPosPolicy::WarnYarn
-    }
-    fn vision(&self, vision_path: Option<&Path>) -> Result<Option<VisionDecl>, String> {
-        use crate::formats::gguf::{resolve_mmproj_path, Gguf};
-        // `--check` 面:path 缺席且同目录无候选 = 无塔(装载期才会拒)
-        let Ok(mm) = resolve_mmproj_path(&self.path, vision_path) else {
-            return Ok(None);
-        };
-        let text = Gguf::open(&self.path)
-            .map_err(|e| format!("打开 GGUF {} 失败: {e}", self.path.display()))?;
-        let mg = Gguf::open(&mm).map_err(|e| format!("打开 mmproj {} 失败: {e}", mm.display()))?;
-        let (spec, _) = crate::formats::gguf::spec_from_gguf(&text)
-            .map_err(|e| format!("{} GGUF 超参: {e}", self.path.display()))?;
-        let vcfg = crate::vlm::VlmCfg::from_gguf(&text, &mg, spec).map_err(|e| e.to_string())?;
-        let note = format!(
-            "{}（塔 {} 层 / hidden {} / out {} / image_token {}）",
-            mm.display(),
-            vcfg.vision.depth,
-            vcfg.vision.hidden,
-            vcfg.vision.out_hidden,
-            vcfg.image_token
-        );
-        Ok(Some(VisionDecl { note }))
-    }
-    fn draft(&self) -> DraftDecl {
-        DraftDecl::default()
     }
 }
 

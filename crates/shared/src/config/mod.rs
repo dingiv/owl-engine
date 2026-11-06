@@ -2907,6 +2907,17 @@ impl OwlConfig {
     /// `exit(1)`),且**只有 server 一条入口守** —— 直接构造 engine 的路径
     /// (tests / cli)裸奔。
     pub fn validate(&self) -> Result<(), String> {
+        // **[model.rope] 只对 GGUF 单文件档生效**(2026-11-05 响亮拒):
+        // HF/AWQ 档的 rope 事实由装载器硬编码(family 参数),YaRN 无接线。
+        // 配置写了却静默不生效 = 配置说谎(用户以为 1M,实际仍是 262k 表)。
+        if self.model.rope.yarn_on() && self.model.format != ModelFormat::Gguf {
+            return Err(format!(
+                "[model.rope] yarn_factor = {} 只对 format = \"gguf\" 生效;\
+                 {:?} 档的 rope 事实硬编码在装载器里(不支持 YaRN)—— \
+                 请改用 GGUF 档或把 yarn_factor 设回 1.0",
+                self.model.rope.yarn_factor, self.model.format
+            ));
+        }
         // 2026-11-04:`kv_fp8`/`kv_int8` 两布尔已并为 `kv_dtype`(枚举三类)。
         // 旧键在反序列化期就被 `deny_unknown_fields` 拒 ⇒ 这里不再有"互斥"可查。
         // 唯一保留的跨键语义:`prefill_shadow` 只对 fp8 主池有意义。
@@ -4089,5 +4100,30 @@ mod auto_pool_tests {
             "[runtime]\nmax_batch = 3\nmax_concurrency = 2\n[pool]\ngdn_slots = 0\n",
         );
         assert!(e.is_err(), "gdn_slots(auto)=2 < max_batch=3 应拒");
+    }
+}
+
+#[cfg(test)]
+mod rope_cfg_tests {
+    use super::*;
+
+    /// YaRN 只在 GGUF 单文件档有接线;其余档给了 = 配置说谎 ⇒ 拒启。
+    #[test]
+    fn yarn_is_gguf_only() {
+        let mut c = OwlConfig::default();
+        c.model.format = ModelFormat::Awq;
+        c.model.rope.yarn_factor = 2.0;
+        let e = c.validate().expect_err("AWQ + YaRN 必须拒");
+        assert!(e.contains("只对 format = \"gguf\" 生效"), "{e}");
+
+        c.model.format = ModelFormat::Gguf;
+        c.model.quant = QuantScheme::Q4k;
+        c.validate().expect("GGUF 档 YaRN 合法");
+
+        // yarn 关(1.0)= 惰性字段,任何档位都合法
+        c.model.format = ModelFormat::Awq;
+        c.model.quant = QuantScheme::W4a16;
+        c.model.rope.yarn_factor = 1.0;
+        c.validate().expect("yarn_factor = 1.0 不参与");
     }
 }

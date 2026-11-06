@@ -813,6 +813,14 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     }
 
     // ── 模型/草稿目录几何校验(目录不存在 ⇒ 告警跳过,CI 假路径可跑) ──
+    //
+    // **臂 = boot 同源**:`load_arm_of(format, quant)` 是装载的唯一分派点,
+    // `--check` 不再按 `path.is_file()` 猜源(历史错位:`format=awq` + `.gguf`
+    // 路径"检查通过、启动失败")。
+    let arm = owl_engine::load_arm_of(c.model.format, c.model.quant)
+        .map_err(|e| format!("装载臂分派失败:{e}"))?;
+    let load_intent =
+        owl_engine::LoadIntent::of(arm, c.model.head_quant, c.model.embed_quant);
     let profile = match intent {
         Some(m) => Some(owl_shared::config::intent::model_profile(&m.intent.model)?),
         None => owl_shared::config::intent::model_by_format(c.model.format),
@@ -827,15 +835,23 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     };
     match dir_owned.as_deref() {
         Some(dir) => {
-            // **一条路径**:源格式(目录 vs 单文件)只决定 `open_decl` 的 gguf 位,
-            // 几何对账 / 视觉声明 / 摘要全部走 `CheckpointDecl` 接口。
+            // **一条路径**:臂 → 源族 → 声明事实;几何对账 / 视觉声明 / 摘要
+            // 全部走 `CheckpointDecl` 接口(与 boot 同一份解析)。
             let vision_path = c.vision.path.as_deref().filter(|p| !p.as_os_str().is_empty());
-            let gguf = dir.is_file();
-            if profile.is_none() && !gguf {
+            if profile.is_none()
+                && arm.decl_source() == owl_models::formats::decl::DeclSource::Hf
+            {
                 out.push_str("[check] model dir: 注册表无该 format ⇒ 几何校验跳过\n");
             }
-            match check_model_decl(dir, gguf, profile, c.runtime.max_seq, c.vision.enabled, vision_path)
-            {
+            match check_model_decl(
+                dir,
+                arm,
+                &load_intent,
+                profile,
+                c.runtime.max_seq,
+                c.vision.enabled,
+                vision_path,
+            ) {
                 Ok(note) => out.push_str(&format!("[check] model dir: {note}\n")),
                 Err(e) => {
                     ok = false;
@@ -1002,11 +1018,15 @@ fn check_mtp_head(dir: &Path) -> Result<String, String> {
 /// **检查点对账(`--check` 单一入口;2026-11-04 clean-code)**。
 ///
 /// 两条旧的格式专用路径(`check_gguf_model` / `check_model_dir`)合并为一条:
-/// 声明事实由 `owl_models::formats::decl::open_decl` 按源格式分派(唯一一处
-/// `gguf=?` 判断),几何对账 / 视觉声明 / 摘要全部走 `CheckpointDecl` 接口。
+/// 声明事实由 `owl_models::formats::decl::open_decl` 按**装载臂**分派(唯一一处),
+/// 几何对账 / 视觉声明 / 摘要全部走 `CheckpointDecl` 接口。
+///
+/// **旋钮能力门**也在这里跑(`LoadIntent::check_arm`):`--check` 必须与 boot
+/// 用同一条拒绝规则(例:GGUF 的 `head_quant`/`embed_quant` 覆盖)。
 fn check_model_decl(
     path: &Path,
-    gguf: bool,
+    arm: owl_engine::LoadArm,
+    intent: &owl_engine::LoadIntent,
     profile: Option<&owl_shared::config::intent::ModelProfile>,
     max_seq: usize,
     vision: bool,
@@ -1014,7 +1034,8 @@ fn check_model_decl(
 ) -> Result<String, String> {
     use owl_models::formats::decl::{check_geom_against, open_decl, MaxPosPolicy};
 
-    let Some(decl) = open_decl(path, gguf)? else {
+    intent.check_arm(arm)?;
+    let Some(decl) = open_decl(path, arm.decl_source())? else {
         return Ok(format!(
             "{} 不可读(config.json 缺失)—— 几何校验跳过(真启动会失败)",
             path.display()
@@ -1024,6 +1045,11 @@ fn check_model_decl(
         check_geom_against(decl.as_ref(), p, max_seq)?;
     }
     let mut note = decl.summary();
+    // 自带 MTP/NextN 头是检查点事实(同一份解析);0 = 不带,不打扰输出
+    let draft = decl.draft();
+    if draft.mtp_layers > 0 {
+        note.push_str(&format!(" · mtp={}", draft.mtp_layers));
+    }
     // max_pos 的**软**超标只在摘要里提示(HF 是硬拒,已在 check_geom_against 抛)
     let g = decl.geom();
     if decl.max_pos_policy() == MaxPosPolicy::WarnYarn && g.max_pos != 0 && max_seq > g.max_pos {
