@@ -348,7 +348,7 @@ V_avail          = v_card − weights − runtime_floor − gdn_row×gdn_slots �
 | F-02 | ✅ | `EngineKnobs::from_config -> Result<Self>`；`[runtime] admission_on_full`（`reject|queue|queue:<ms>`）收编，删除 `OWL_ADMIT_ON_FULL` 与 `process::exit(2)`；`ServerConfig::from_config/from_resolved` 同步 Result；新增 `knobs_from_config_rejects_bad_admission_on_full` |
 | F-03 | ✅ | 删除 engine 生产侧全部 env 读取：`OWL_MAX_ACTIVE_TURNS/OWL_GDN_SLOTS/OWL_SNAP_MAX/OWL_DEBUG/OWL_KV_DUMP/OWL_SCHEME_PROBE/OWL_SCHEME_MIN_CTX/OWL_COV_ANALYZE_EVERY`；新增 `[kvmem] coverage_scheme_*` / `coverage_analyze_every`；8 个 profile 显式补键 |
 | F-04 | ✅ | TP2 重装引擎壳时 rank1 用自己的 `cfg1`/`boot1`（不再传 `boot0`）；同卡档同步 |
-| F-05 | 🟡 部分 | TP `boot_rank` 失败/自证失败时先 `graphs.close()`；单卡 `prewarm` 失败走 `close_graphs_on_boot_failure`；纯配置护栏（`check_assemble_guards`）前移到 staging 握手前。**staging 双块的 PeerRelease 仍需 GpuClient 特化面**，泛型路径以“进程退出回收”为契约（显式 WARN） |
+| F-05 | 🟡 基本 | TP 装配改为「inner 只借用 staging + wrapper 持原始值」：任何 inner 失败后由 `release_staging_pair` 用预克隆 face 执行 `PeerRelease`/`HostRelease`（host 先 rank1 后 rank0）；纯配置护栏前移到握手前；`boot_rank`/自证失败先 `graphs.close()`。**单卡 `into_running` 失败**仍以进程退出为契约（无异步收尾点） |
 | F-06 | ✅ | P2P 握手分支补齐与 host 分支对称的回滚（`peer_alloc`/`peer_import` 任一步失败 `peer_release` 已分配块/别名） |
 | F-08 | ✅ | GPU 面 `weights_bytes == 0` 从 WARN 改为拒启（A5.1） |
 | F-11 | ✅（澄清） | `(prof || true)` → `Some(Instant::now())`；保留“恒开打点”的原意，去掉误导表达式 |

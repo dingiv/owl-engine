@@ -278,11 +278,11 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
     /// **装配内核**(通用):两侧的 staging 已由调用方备好(见
     /// [`TpEngine::assemble`] 的真机握手路)—— 本函数只做:参数校验 →
     /// 每 rank `boot_rank`(分片 spec/池/图 + `TpCtx` 注入)。
-    async fn assemble_with_staging(
+    async fn assemble_with_staging_inner(
         engines: Vec<Engine<D>>,
         loadeds: Vec<LoadedModel>,
-        staging0: TpStaging,
-        staging1: TpStaging,
+        staging0: &TpStaging,
+        staging1: &TpStaging,
     ) -> Result<Self> {
         let world = loadeds.len();
         if world != 2 {
@@ -416,8 +416,8 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
             return Err(e);
         }
         let ranks = vec![
-            TpRank { plan: plan0, staging: staging0, dev: dev0 },
-            TpRank { plan: plan1, staging: staging1, dev: dev1 },
+            TpRank { plan: plan0, staging: staging0.clone(), dev: dev0 },
+            TpRank { plan: plan1, staging: staging1.clone(), dev: dev1 },
         ];
         Ok(Self {
             ranks,
@@ -504,6 +504,25 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
 // ============================================================================
 
 impl TpEngine<GpuClient> {
+    /// **装配 + 失败收尾包装**（F-05）：`assemble_with_staging_inner` 只借用
+    /// staging 并在成功时 clone 进 rank 束 ⇒ 失败路径仍持有原始 staging，
+    /// 这里用预先克隆的 face 把双块 `PeerRelease`/`HostRelease` 掉。
+    async fn assemble_with_staging(
+        engines: Vec<Engine<GpuClient>>,
+        loadeds: Vec<LoadedModel>,
+        staging0: TpStaging,
+        staging1: TpStaging,
+    ) -> Result<TpEngine<GpuClient>> {
+        // face 克隆必须在 `into_parts` / boot_rank 之前拿（失败时原句柄已 drop）。
+        let mut cleanup_faces: Vec<Option<DeviceHandle<GpuClient>>> =
+            engines.iter().map(|e| e.device().face_clone()).collect();
+        let out = Self::assemble_with_staging_inner(engines, loadeds, &staging0, &staging1).await;
+        if out.is_err() {
+            release_staging_pair(&staging0, &staging1, &mut cleanup_faces).await;
+        }
+        out
+    }
+
     /// **真机装配**:分档(UUID/BAR1/P2P 自动探测;混插/不支持 ⇒ 响亮拒)
     /// → staging VMM 对称握手(**建图之前**)→ 每 rank `boot_rank`。
     ///
@@ -771,6 +790,38 @@ async fn verify_staging_headers<D: DeviceClient>(
         }
     }
     Ok(())
+}
+
+/// **装配失败时的 staging 双块释放**（F-05）：host 模式先收 rank1 的 attach、
+/// 再收 rank0 的 owner；P2P 模式两 rank 各自 `[own, peer]`。
+async fn release_staging_pair(
+    staging0: &TpStaging,
+    staging1: &TpStaging,
+    faces: &mut [Option<DeviceHandle<GpuClient>>],
+) {
+    let host = staging0.host_mode();
+    // host：owner 在 rank0 ⇒ 先 rank1(attach) 后 rank0(owner)。
+    let order: [usize; 2] = if host { [1, 0] } else { [0, 1] };
+    for i in order {
+        let (st, tag) = if i == 0 { (staging0, "rank0") } else { (staging1, "rank1") };
+        let Some(face) = faces.get_mut(i).and_then(Option::as_mut) else {
+            owl_shared::log_warn!(
+                "tp",
+                "装配失败收尾:{tag} 无可用 face 克隆 ⇒ staging 双块留待进程退出"
+            );
+            continue;
+        };
+        let ids = vec![st.own().id, st.peer().id];
+        let r = if host {
+            face.client_mut().host_release(ids).await
+        } else {
+            face.client_mut().peer_release(ids).await
+        };
+        match r {
+            Ok(()) => owl_shared::log_info!("tp", "装配失败收尾:{tag} staging 已释放"),
+            Err(e) => owl_shared::log_warn!("tp", "装配失败收尾:{tag} staging 释放失败: {e}"),
+        }
+    }
 }
 
 /// **单 rank 收尾**(卸图 → `PeerRelease` / `HostRelease` 双块;装配态与执行态共用):
