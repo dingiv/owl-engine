@@ -710,7 +710,12 @@ struct FixedAfter {
     spec_snap: usize,
     /// **query replay 回滚缓冲**(独立于 spec 快照;`query_replay` 且 paged 时分配)
     replay_snap: usize,
-    /// 图 slab 预算(见 [`GRAPH_SLAB_BUDGET`])
+    /// 图 slab 预算(见 [`GRAPH_SLAB_BUDGET`])。
+    ///
+    /// ⚠️ 本结构**不含池后 scratch**（attn_v2 三档 / XQA / FI 表 / 块表）——
+    /// 它们由 [`KvBank::alloc_scratch`]/[`KvBank::alloc_xqa`]/[`KvBank::alloc_tables`]
+    /// 分配，`[vram-gov]` 日志会显式标注"未计"，由 `reserve`（1 GiB）覆盖。
+    /// 精确并入预算另案（F-26；避免在预算与分配两处各写一份公式）。
     graph_slab: usize,
     /// warmup 瞬态 + 杂项(见 [`WARMUP_MISC_BUDGET`])
     warmup_misc: usize,
@@ -2376,7 +2381,7 @@ fn pool_cap(plan: &PoolPlan, per_tok: &PerTokBytes, fixed_after: &FixedAfter) ->
         // 用 `eprintln!`(取证行惯例):`log_*` 在无 `log` feature 的构建里被编译剔除,
         // 而本行必须在探针/测试里可见。
         eprintln!(
-                "[vram-gov] total={:.2}G free={:.2}G target={:.0}% reserve={}M fixed_after={:.2}G[{}] live={:.2}G(引擎账;仅参考;ranks={}) per_tok={}B[{}] ⇒ budget={:.2}G cap={} tok(manual={})",
+                "[vram-gov] total={:.2}G free={:.2}G target={:.0}% reserve={}M fixed_after={:.2}G[{}](+scratch 未计: attn_v2/xqa/fi 表/bt) live={:.2}G(引擎账;仅参考;ranks={}) per_tok={}B[{}] ⇒ budget={:.2}G cap={} tok(manual={})",
                 vram_total as f64 / 1073741824.0,
                 free as f64 / 1073741824.0,
                 plan.vram_target * 100.0,

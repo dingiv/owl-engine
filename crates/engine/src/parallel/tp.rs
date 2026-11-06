@@ -36,6 +36,43 @@ fn loud<T>(msg: impl Into<String>) -> Result<T> {
     Err(ModelError::Msg(msg.into()))
 }
 
+/// **TP 装配的纯配置护栏**（无设备动作；`assemble_with` 在 staging 握手前
+/// 先调一次，`assemble_with_staging` 仍保留为直接调用者的兜底）。
+fn check_assemble_guards(cfg: &EngineConfig, loadeds: &[LoadedModel]) -> Result<()> {
+    // ① 投机草稿:verify/fold/propose 族图与草稿 prefill extend 是**双 rank
+    //    未接线面**(S6+);
+    // ② prefill 桶族已退役(2026-10-21),不再有该面。
+    // ③ 读数类探针:prefill 入队半里的 dtoh/sync 会撞 AR 自旋(见 on_peer 契约)。
+    let k = &cfg.knobs;
+    if k.draft.depth != 0 && !k.draft.tp_draft {
+        return loud(format!(
+            "TP v1 不支持投机草稿(draft.depth = {};双 rank 草稿族未接线)。\
+             若要走 P2.1 的草稿双 rank 路,显式开 `[spec] tp_draft = true`\
+             (草稿 spec/权重按本 rank 计划分片 + 草稿池几何按分片 hkv)",
+            k.draft.depth
+        ));
+    }
+    let bad_probes: Vec<&str> = [("dflash_probe", k.probes.dflash_probe)]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(n, _)| n)
+        .collect();
+    if !bad_probes.is_empty() {
+        return loud(format!(
+            "TP v1 不支持读数类探针 {bad_probes:?}(入队半必须零同步;见 on_peer 契约)"
+        ));
+    }
+    // ④ 量化档:两 rank 的量化方案必须同档(混档 = 权重语义不同)。
+    if loadeds.len() == 2 && loadeds[0].quant_plan() != loadeds[1].quant_plan() {
+        return loud(format!(
+            "TP 两 rank 量化方案不一致(rank0={:?} / rank1={:?})—— 权重语义不同,拒绝",
+            loadeds[0].quant_plan(),
+            loadeds[1].quant_plan()
+        ));
+    }
+    Ok(())
+}
+
 // ============================================================================
 // §1 staging(双块 + 布局量)
 // ============================================================================
@@ -284,40 +321,9 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
                 ));
             }
         }
-        // ── v1 范围护栏(响亮拒;分相纪律的边界)──────────────────────
-        // ① 投机草稿:verify/fold/propose 族图与草稿 prefill extend 是**双 rank
-        //    未接线面**(S6+);
-        // ② prefill 桶族已退役(2026-10-21),不再有该面。
-        // ③ 读数类探针:prefill 入队半里的 dtoh/sync 会撞 AR 自旋(见 on_peer 契约)。
-        let k = &cfg0.knobs;
-        if k.draft.depth != 0 && !k.draft.tp_draft {
-            return loud(format!(
-                "TP v1 不支持投机草稿(draft.depth = {};双 rank 草稿族未接线)。\
-                 若要走 P2.1 的草稿双 rank 路,显式开 `[spec] tp_draft = true`\
-                 (草稿 spec/权重按本 rank 计划分片 + 草稿池几何按分片 hkv)",
-                k.draft.depth
-            ));
-        }
-        let bad_probes: Vec<&str> = [("dflash_probe", k.probes.dflash_probe)]
-        .into_iter()
-        .filter(|(_, on)| *on)
-        .map(|(n, _)| n)
-        .collect();
-        if !bad_probes.is_empty() {
-            return loud(format!(
-                "TP v1 不支持读数类探针 {bad_probes:?}(入队半必须零同步;见 on_peer 契约)"
-            ));
-        }
-        // ④ 量化档:2026-10-17 定谳的"两 rank 读同一段"已修(§22.4 落地;
-        //    派生键规则 + want 坐标序 + 列段切)。此处只做**一致性自证** ——
-        //    两 rank 的量化方案必须同档(混档 = 权重语义不同,比的是两台机器)。
-        if loadeds[0].quant_plan() != loadeds[1].quant_plan() {
-            return loud(format!(
-                "TP 两 rank 量化方案不一致(rank0={:?} / rank1={:?})—— 权重语义不同,拒绝",
-                loadeds[0].quant_plan(),
-                loadeds[1].quant_plan()
-            ));
-        }
+        // ── v1 范围护栏（纯配置：`assemble_with` 在 staging 握手前也会先调，
+        //    避免坏配置白分配 staging）──────────────────────────────────
+        check_assemble_guards(&cfg0, &loadeds)?;
 
         let mut loadeds = loadeds.into_iter();
         let (l0, l1) = (
@@ -567,6 +573,8 @@ impl TpEngine<GpuClient> {
         let (face0, cfg, cell0, boot0) = it.next().expect("world = 2 已守门").into_parts();
         let (mut face1, cfg1, _cell1, boot1) =
             it.next().expect("world = 2 已守门").into_parts();
+        // 纯配置护栏在 staging 握手之前（F-05：坏配置不白分配 staging）。
+        check_assemble_guards(&cfg, &loadeds)?;
         let mut face0 = face0;
         // **事件账合流(TP 纪律)**:两 rank 写**同一本**账(单卡档 = 同一本;
         // 分卡靠事件里的 `rank` 维,不靠两本账)。
@@ -655,6 +663,7 @@ impl TpEngine<GpuClient> {
         let (face0, cfg, cell0, boot0) = it.next().expect("world = 2 已守门").into_parts();
         let (mut face1, cfg1, _cell1, boot1) =
             it.next().expect("world = 2 已守门").into_parts();
+        check_assemble_guards(&cfg, &loadeds)?;
         let mut face0 = face0;
         face1.set_dev_rank(1);
         face1
