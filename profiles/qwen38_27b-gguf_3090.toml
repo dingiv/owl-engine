@@ -46,6 +46,8 @@ bind = "0.0.0.0:8137"
 # ⚠️ 它吃 0.9GB ⇒ ctx 从 192k 收到 168k(见 [runtime] 注)。
 
 [runtime]
+# 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
+admission_on_full = "reject"
 keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # 172032 = 5376 页(boot 报的 cap = 218457 的 79%,已含 0.9GB 视觉塔)。
 # 实测 64k / 128k prompt 零拒发,余量 1.79GB;196608 时 64k 就撞 68MiB 硬预算。

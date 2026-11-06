@@ -556,7 +556,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 从 `schedule()` 抽出（2026-10-20）：准入判决必须**在启动之外**做
     /// `Hold/Reject` —— 判决嵌在启动体里时，Hold 早退会停摆已有活跃、
     /// 不早退则队首照常被弹起（准入形同虚设）。**行为逐字节不变**。
-    fn start_one(&mut self, turn: crate::turn::Turn, grant: owl_store::Grant) -> Result<BeginPlan> {
+    pub(crate) fn start_one(&mut self, turn: crate::turn::Turn, grant: owl_store::Grant) -> Result<BeginPlan> {
         let grant_id = grant.id;
         // **准入登记**(S3b §23.2):turn 从此占用一块保留额(实占随
         // `sync_pool_account` 在段边界更新;天花板门 count 靠它)。
@@ -565,13 +565,29 @@ impl<D: DeviceClient> RunningEngine<D> {
         // **S2b(§28):turn 起借 GDN 行**(账在 store:行 = 活跃 turn 的资源;
         // 物理行号就是账里的行号 —— 一本账,不两份)。行耗尽 = 响亮拒
         // (`Exhausted`;正常路径由准入面 `gdn_slots` 天花板先挡)。
-        let gdn_row = self
+        let gdn_row = match self
             .bank
             .rel
             .state
-            .borrow_row(owl_store::tier::Owner::Turn(turn.id))?;
+            .borrow_row(owl_store::tier::Owner::Turn(turn.id))
+        {
+            Ok(row) => row,
+            Err(e) => {
+                // 行耗尽是"拒绝启动"而非"引擎故障"——准入账已登记，必须收口。
+                self.rollback_failed_start(turn.id);
+                return Err(e.into());
+            }
+        };
         // **P0-4 x P1-5**：行也进同一本 ReservationLedger（turn 生命周期）。
-        let row_grant = self.bank.rel.reserve_row(turn.id)?;
+        // 失败回滚：行已借出 ⇒ 必须显式还，否则 `row_owners` 残留、反复失败
+        // 会耗尽行池（F-17）。
+        let row_grant = match self.bank.rel.reserve_row(turn.id) {
+            Ok(g) => g,
+            Err(e) => {
+                self.rollback_failed_start(turn.id);
+                return Err(e.into());
+            }
+        };
         debug_assert_eq!(row_grant.kind, owl_store::ReservationKind::Row);
         // E2c 复用形态:**PrefixHit(内容寻址,块链复用 + 快照恢复)/ Fresh(全量)**
         //
@@ -585,57 +601,74 @@ impl<D: DeviceClient> RunningEngine<D> {
         // (G5 兜底,`plan_image_delete` 全程纯读,失败零副作用)。
         // **前缀无感删除 = leave-gap 唯一路径**(2026-10-26):删图后保留
         // 幸存 position、不转 K;不命中则逐字节旧前缀复用路径。
-        let (cached_len, restore_key, pending_loads, image_exec, lazy_view) = if turn.deletion.is_some() {
-            match self.plan_image_leave_gap(&turn)? {
-                Some(p) => {
-                    let (c, r, pl, im) = self.apply_image_leave_gap(p, &turn)?;
-                    (c, r, pl, im, None)
-                }
-                None => {
+        let prep = (|| -> Result<(
+            usize,
+            Option<owl_store::SnapKey>,
+            Vec<(usize, owl_store::ChainHash)>,
+            Option<ImageExec>,
+            Option<LazySeed>,
+        )> {
+            let (cached_len, restore_key, pending_loads, image_exec, lazy_view) =
+                if turn.deletion.is_some() {
+                    match self.plan_image_leave_gap(&turn)? {
+                        Some(p) => {
+                            let (c, r, pl, im) = self.apply_image_leave_gap(p, &turn)?;
+                            (c, r, pl, im, None)
+                        }
+                        None => {
+                            let (c, r, pl, lz) = self.plan_prefix_reuse(&turn)?;
+                            (c, r, pl, None, lz)
+                        }
+                    }
+                } else {
                     let (c, r, pl, lz) = self.plan_prefix_reuse(&turn)?;
                     (c, r, pl, None, lz)
-                }
+                };
+            // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
+            //
+            // **锁①后半(2026-10-19)**:原实现一次长到**整个 prompt** ——
+            // 池 ≥ ctx 时从不暴露;池 < ctx(虚拟化档)时那一步就要几千页槽
+            // ⇒ 必 `Exhausted`。虚拟化档只长到**首个 chunk** 的那几页,
+            // 后面由 `execute_prefill` 逐 chunk 增量长(用到哪长到哪);
+            // 腾位归召回点的驻留调和。
+            {
+                let s = self
+                    .bank
+                    .sessions
+                    .get_mut(turn.session_id)
+                    .expect("submit 已建会话账");
+                let target = if self.boot.cfg.knobs.kvmem_virtualization {
+                    Self::prefill_step_chunk_msg(
+                        0,
+                        turn.prompt_ids.len(),
+                        self.boot.cfg.prefill_chunk,
+                        self.boot.cfg.knobs.prefill_tail_merge,
+                        Self::prefill_align_page(
+                            self.boot.cfg.knobs.prefill_align_tail,
+                            self.boot.cfg.knobs.prefix_cache,
+                            self.dev.pool.geom.page,
+                        ),
+                        &turn.msg_snaps,
+                        self.boot.cfg.knobs.snap_msg_min_span,
+                    )
+                    .unwrap_or(1)
+                } else {
+                    turn.prompt_ids.len()
+                };
+                // **P0-4**：只消费准入 Grant（分配失败会把额度回滚）。
+                self.bank
+                    .rel
+                    .ensure_for_len(grant_id, &mut s.block_table, target)?;
             }
-        } else {
-            let (c, r, pl, lz) = self.plan_prefix_reuse(&turn)?;
-            (c, r, pl, None, lz)
+            Ok((cached_len, restore_key, pending_loads, image_exec, lazy_view))
+        })();
+        let (cached_len, restore_key, pending_loads, image_exec, lazy_view) = match prep {
+            Ok(v) => v,
+            Err(e) => {
+                self.rollback_failed_start(turn.id);
+                return Err(e);
+            }
         };
-        // E2b:块表确保覆盖 prompt(增量 turn 块链已存,只长新增段)
-        //
-        // **锁①后半(2026-10-19)**:原实现一次长到**整个 prompt** ——
-        // 池 ≥ ctx 时从不暴露;池 < ctx(虚拟化档)时那一步就要几千页槽
-        // ⇒ 必 `Exhausted`。虚拟化档只长到**首个 chunk** 的那几页,
-        // 后面由 `execute_prefill` 逐 chunk 增量长(用到哪长到哪);
-        // 腾位归召回点的驻留调和。
-        {
-            let s = self
-                .bank
-                .sessions
-                .get_mut(turn.session_id)
-                .expect("submit 已建会话账");
-            let target = if self.boot.cfg.knobs.kvmem_virtualization {
-                Self::prefill_step_chunk_msg(
-                    0,
-                    turn.prompt_ids.len(),
-                    self.boot.cfg.prefill_chunk,
-                    self.boot.cfg.knobs.prefill_tail_merge,
-                    Self::prefill_align_page(
-                        self.boot.cfg.knobs.prefill_align_tail,
-                        self.boot.cfg.knobs.prefix_cache,
-                        self.dev.pool.geom.page,
-                    ),
-                    &turn.msg_snaps,
-                    self.boot.cfg.knobs.snap_msg_min_span,
-                )
-                .unwrap_or(1)
-            } else {
-                turn.prompt_ids.len()
-            };
-            // **P0-4**：只消费准入 Grant（分配失败会把额度回滚）。
-            self.bank
-                .rel
-                .ensure_for_len(grant_id, &mut s.block_table, target)?;
-        }
         let begin = BeginPlan {
             session_id: turn.session_id,
             gdn_slot: gdn_row,
@@ -736,6 +769,15 @@ impl<D: DeviceClient> RunningEngine<D> {
             },
         });
         Ok(begin)
+    }
+
+    /// **启动失败的半态回滚**（F-17）。
+    ///
+    /// `start_one` 已借的一切（准入账 / Grant / GDN 行）都经 store 的
+    /// **单一围栏** `close_admission → Rel::finish_turn` 一次归还 ——
+    /// 不逐项手还，避免"漏还一项"的经典半态（2026-11-06 真机 3080）。
+    fn rollback_failed_start(&mut self, turn_id: u64) {
+        self.close_admission(turn_id);
     }
 
     /// **Fresh 起跑**(零复用):释放旧块表/旧 MTP 链 + 会话账归零。
@@ -1530,6 +1572,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 what: "admission: 刚判过的队首消失".into(),
                             }
                         })?;
+                        // **F-18**: 排队终局统一收口（ephemeral 焚毁/准入账）。
+                        self.drop_queued_turn(&t);
                         self.turns
                             .admission
                             .note_rejected(head_facts.session, now_ms, reason);
@@ -1796,14 +1840,10 @@ impl<D: DeviceClient> RunningEngine<D> {
         } else {
             0
         };
-        let gdn_row = self
-            .turns
-            .active
-            .first()
-            .map(|a| a.gdn_slot)
-            .ok_or_else(|| {
-                owl_iface::contract::ModelError::Msg("decode 相位:无活跃 turn(行号真源缺失)".into())
-            })?;
+        // **本步执行者的行号**（F-16）：必须取 `turns.active()`（`executing` 选中
+        // 的 turn），不能取 `active.first()` —— 合批档 + spec 时多活跃，轮转选中
+        // 的可能是 #2；取错 = 用别家会话的 GDN 行做 verify/decode。
+        let gdn_row = self.turns.active()?.gdn_slot;
         let grant = self.turns.active()?.grant;
         let (kv_slot, kv_slots, gdn_slot, grew) = {
             let s = self.bank.sessions.session_mut(sid)?;

@@ -434,6 +434,11 @@ impl Admission {
     }
 
     /// **放行判定**（唯一放行口）。`now_ms` = 单调时钟毫秒（由引擎注入）。
+    /// **准入第二段：槽位/同会话/退避判决**。
+    ///
+    /// 与 `RunningEngine::admission_gate`（第一段：`rel.check` 地板/腾位）的
+    /// 分工见那里（F-20）：本函数只在第一段 Admit 之后运行；第一段
+    /// Reject/Queue 的 turn 到不了这里。两套状态机合并是挂账。
     pub fn decide(
         &mut self,
         l: &Limits,

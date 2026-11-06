@@ -125,7 +125,7 @@ async fn cpu_construct_and_load(cfg: &OwlConfig) {
             device_ordinal: 0, // CPU face 不看卡位(卡位改由 [parallel] device 表达)
             max_seq_tokens: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
-            knobs: EngineKnobs::from_config(cfg),
+            knobs: EngineKnobs::from_config(cfg).expect("knobs 组装"),
         },
         CpuFace::new(),
     )
@@ -173,6 +173,269 @@ async fn mock_snap_engine(
         .await
         .expect("装载");
     engine.run(loaded).await.expect("装配")
+}
+
+/// **F-16 回归门**：合批档 + spec 时，decode 步的 GDN 行必须取
+/// **本步执行者**（`turns.active()` / `executing`），不能取 `active.first()`。
+///
+/// 构造：`max_batch=2` 两会话都进生成相；`depth=1` 让调度绕开批 decode 门
+/// （批门要求 depth==0），走单 turn 路径；`rr=1` 让调度选中第二个 turn。
+/// 修复前 `gdn_slot` = active[0] 的行；修复后 = active[1] 的行。
+#[cfg(test)]
+#[tokio::test]
+async fn multi_active_decode_uses_selected_turn_gdn_row() {
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 2,
+        gdn_slots: 2,
+        // 本用例是 2 页级小 turn；默认 256 的"新人陪跑"门会把第二个拒掉。
+        min_gen_tokens: 1,
+        ..Default::default()
+    };
+    knobs.pool_tokens = Some(256);
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = 1;
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 256,
+        prefill_chunk: 32,
+        knobs,
+    };
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let (_s1, t1) = running
+        .submit_session_opts(Some(1), "hello", 32, Default::default())
+        .expect("submit t1");
+    let (_s2, t2) = running
+        .submit_session_opts(Some(2), "world", 32, Default::default())
+        .expect("submit t2");
+    assert_ne!(t1, t2);
+
+    // 每次 pump 可能先吐 pending 事件（不调度）；循环到两 turn 都活跃且
+    // prefill 完成（max_new 给大，避免提前终了）。
+    for _ in 0..12 {
+        running.pump().await.expect("pump");
+        let ready = running.active_len() == 2
+            && running
+                .turns
+                .active
+                .iter()
+                .all(|a| a.fed >= a.prompt_ids.len());
+        if ready {
+            break;
+        }
+    }
+    assert_eq!(running.active_len(), 2, "两 turn 应都入活跃");
+    assert_eq!(running.turns.active[0].fed, running.turns.active[0].prompt_ids.len());
+    assert_eq!(running.turns.active[1].fed, running.turns.active[1].prompt_ids.len());
+
+    // 轮转选中第二个 turn。**只抬 depth 到 1 用于本次 `schedule`**：让调度
+    // 绕开批 decode 门（批门要求 depth==0）；不执行本步，故不需要 spec 缓冲。
+    running.dev.spec_rt.depth = 1;
+    running.turns.rr = 1;
+    let out = running.schedule().await.expect("schedule");
+    match out {
+        SchedulerOutput::Step {
+            action: StepAction::Decode { gdn_slot, .. },
+            ..
+        } => {
+            let want = running.turns.active[1].gdn_slot;
+            let other = running.turns.active[0].gdn_slot;
+            assert_eq!(
+                gdn_slot, want,
+                "decode 应使用选中 turn 的 GDN 行（F-16）：got {gdn_slot}, want {want}, other {other}"
+            );
+        }
+        _ => panic!("应走单 turn decode 路径"),
+    }
+}
+
+/// **F-18 回归门**：排队 turn 被客户端取消时，ephemeral 会话必须焚毁。
+///
+/// 修复前 `cancel_turn` 的排队分支只出队 + `close_admission`，不 `burn` ⇒
+/// 临时会话永久留在 `SessionTable`。
+#[cfg(test)]
+#[tokio::test]
+async fn queued_ephemeral_session_is_burned_on_cancel() {
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 1,
+        gdn_slots: 1,
+        min_gen_tokens: 1,
+        ..Default::default()
+    };
+    knobs.pool_tokens = Some(256);
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = 1;
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 256,
+        prefill_chunk: 32,
+        knobs,
+    };
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let (s1, _t1) = running
+        .submit_session_opts(None, "hello", 32, Default::default())
+        .expect("submit 活跃");
+    running.pump().await.expect("pump 起 t1");
+    assert_eq!(running.active_len(), 1);
+
+    let (s2, t2) = running
+        .submit_session_opts(None, "world", 32, Default::default())
+        .expect("submit 排队");
+    assert_eq!(running.queue_len(), 1);
+
+    let ev = running.cancel_turn(t2).await.expect("取消排队 turn");
+    assert!(matches!(ev, TurnEvent::Failed { turn, .. } if turn == t2));
+    assert!(
+        running.bank.sessions.get(s2).is_none(),
+        "排队取消必须焚毁 ephemeral 会话（F-18）"
+    );
+    assert!(
+        running.bank.sessions.get(s1).is_some(),
+        "活跃会话不能被误焚"
+    );
+}
+
+/// **F-01 回归门**：纯配置门必须返回 `Err`（旧实现 `process::exit(2)`），
+/// 且 `boot_rank` 在任何设备动作前就会拒（`boot_kvmem_check` 前移）。
+#[cfg(test)]
+#[test]
+fn boot_kvmem_check_rejects_partial_without_decode() {
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 256,
+        prefill_chunk: 32,
+        knobs: EngineKnobs {
+            select_partial: true,
+            select_decode: false,
+            prefix_cache: true,
+            ..Default::default()
+        },
+    };
+    let err = match crate::engine::boot_kvmem_check(&cfg) {
+        Ok(()) => panic!("select_partial 缺 select_decode 必须拒"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("select_decode"), "{err}");
+}
+
+/// **F-02 回归门**：`[runtime] admission_on_full` 坏值必须在 `from_config`
+/// 就拒（旧实现读 env 并 `process::exit(2)`）。
+#[cfg(test)]
+#[test]
+fn knobs_from_config_rejects_bad_admission_on_full() {
+    let mut cfg = OwlConfig::default();
+    cfg.runtime.admission_on_full = "queue:oops".into();
+    let err = match EngineKnobs::from_config(&cfg) {
+        Ok(_) => panic!("坏值必须拒"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("admission_on_full"),
+        "错误文案应点名配置键: {err}"
+    );
+    cfg.runtime.admission_on_full = "queue:1500".into();
+    let knobs = EngineKnobs::from_config(&cfg).expect("合法值");
+    assert!(matches!(
+        knobs.admission_on_full,
+        owl_store::QueuePolicy::Queue { max_wait_ms: 1500 }
+    ));
+}
+
+/// **F-17 回归门**：`start_one` 在借了 GDN 行之后的任何失败都必须回滚行。
+///
+/// 构造：从队列取出 turn，喂一张**未在账上**的 Grant（`consume` 必失败）；
+/// `start_one` 已经 `borrow_row` ⇒ 修复前行永久挂在 `row_owners`，修复后
+/// `rows_free` 回到起点。
+#[cfg(test)]
+#[tokio::test]
+async fn failed_start_returns_gdn_row() {
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 1,
+        gdn_slots: 1,
+        min_gen_tokens: 1,
+        ..Default::default()
+    };
+    knobs.pool_tokens = Some(256);
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = 1;
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 256,
+        prefill_chunk: 32,
+        knobs,
+    };
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let (_sid, tid) = running
+        .submit_session_opts(Some(7), "hello world", 32, Default::default())
+        .expect("submit");
+    let turn = running.turns.queue.pop_front().expect("queued turn");
+    assert_eq!(turn.id, tid);
+    let rows_before = running.store_report().state.rows_free;
+
+    // 未在 ReservationLedger 注册的票 ⇒ ensure_for_len 必失败（且发生在
+    // borrow_row 之后）。
+    let bad_grant = owl_store::Grant {
+        id: owl_store::ReservationId(9999),
+        turn: tid,
+        owner: owl_iface::handle::Owner::Turn(tid),
+        kind: owl_store::ReservationKind::ActiveFloor,
+        slots: 0,
+        bytes: 0,
+        alloc_slots: 0,
+        alloc_bytes: 0,
+    };
+    let err = match running.start_one(turn, bad_grant) {
+        Ok(_) => panic!("坏 Grant 必须让 start_one 失败"),
+        Err(e) => e,
+    };
+    eprintln!("[f17] start_one 拒: {err}");
+
+    let rows_after = running.store_report().state.rows_free;
+    assert_eq!(
+        rows_after, rows_before,
+        "启动失败必须归还 GDN 行（F-17）：before {rows_before}, after {rows_after}"
+    );
 }
 
 /// **P2-2 图 slab 实测回填门**：GraphFleet 捕获后，MemoryPlan 的 GraphSlab
@@ -1097,7 +1360,7 @@ async fn cpu_incremental_decode_multibyte(cfg: &OwlConfig) {
             device_ordinal: 0, // CPU face 不看卡位(卡位改由 [parallel] device 表达)
             max_seq_tokens: cfg.runtime.max_seq,
             prefill_chunk: cfg.runtime.prefill_chunk,
-            knobs: EngineKnobs::from_config(cfg),
+            knobs: EngineKnobs::from_config(cfg).expect("knobs 组装"),
         },
         CpuFace::new(),
     )
@@ -2225,7 +2488,7 @@ fn probe_engine_config(ordinal: usize, default_flavor: &str) -> EngineConfig {
     let overlay = owl_shared::env_reader::str("OWL_PROBE_OVERLAY").map(std::path::PathBuf::from);
     let cfg = owl_shared::config::OwlConfig::load(Some(&base), overlay.as_deref())
         .expect("探针配置装载(账外键/非法值 = 拒)");
-    let mut knobs = EngineKnobs::from_config(&cfg);
+    let mut knobs = EngineKnobs::from_config(&cfg).expect("knobs 组装");
     // 探针档**不改变行为面**,只关掉与本档无关的采样(它不影响 prefill/decode 数值)
     knobs.sampler_enabled = false;
     eprintln!(

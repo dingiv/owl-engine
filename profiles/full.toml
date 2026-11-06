@@ -49,6 +49,8 @@ reasoning_effort = ""
 # [runtime] —— 引擎运行时(上下文 / 调度 / 准入 / 会话缺省)
 # ---------------------------------------------------------------------------
 [runtime]
+# 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
+admission_on_full = "reject"
 # 自动挑卡的空闲显存阈值(0..1;低于它就跳过该卡)
 gpu_min_free_ratio = 0.9
 # 并发闸门:在跑 + 排队上限;须 ≤ pool.gdn_slots(每会话一格 GDN 状态)
@@ -313,6 +315,10 @@ dump = false
 # [kvmem] —— 池虚拟化/选择层
 # ---------------------------------------------------------------------------
 [kvmem]
+# 诊断面:方案 A/B 对照 / 最小 ctx / 重诊断步进(0 = 每边界)
+coverage_scheme_probe = false
+coverage_scheme_min_ctx = 0
+coverage_analyze_every = 0
 select_decode = false
 select_partial = false
 index = false

@@ -2175,8 +2175,11 @@ impl<'a> AllocCtx<'a> {
         // 自动档把"池多大"从配置里拿掉:池只为 `max_seq` 分配(页对齐),
         // 显存治理器的 `cap` 只做两件事 —— ① 兜底:`max_seq` 超预算即拒启;
         // ② 报告:`ctx_max = cap − 1 页`(Strict 准入 = 整 ctx 常驻)。
-        let page_guess = 32usize; // 与 `kv_paged_policy` 同值(下面会再取权威值)
-        let ctx_max = pool_cap.map(|c| c.saturating_sub(page_guess));
+        // **对齐余量 = 真页宽**（F-25）：paged 档取布局策略的 page；legacy
+        // 档无页概念 ⇒ 0（别拿 32 冒充，也别拿 seq_tokens 当页宽——后者会把
+        // 上限算成 cap − ctx，等于要求两倍显存）。
+        let page_align = pol.as_ref().map_or(0, |p| p.page);
+        let ctx_max = pool_cap.map(|c| c.saturating_sub(page_align));
         let pool_tokens = if plan.pool_auto {
             match ctx_max {
                 Some(m) if plan.seq_tokens > m => {
@@ -2253,7 +2256,7 @@ impl<'a> AllocCtx<'a> {
                     pool_mib,
                     if plan.pool_auto { "(自动)" } else { "(手写)" }
                 );
-                if plan.seq_tokens + page_guess > m {
+                if plan.seq_tokens + page_align > m {
                     eprintln!(
                         "[ctx-max] ⚠️ max_seq 已到算式上限(剩 {} tok;再大要降 per_tok 或加卡)",
                         m.saturating_sub(plan.seq_tokens)

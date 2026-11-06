@@ -92,8 +92,8 @@ impl StepProbes {
         Self {
             step_profile: p.step_profile,
             gdn_dump: p.gdn_dump,
-            // 既有命名:OWL_DEBUG(通用诊断;preset 的 [probes] debug 可覆盖)
-            debug: p.debug || owl_shared::env_reader::flag("OWL_DEBUG"),
+            // 配置单源（F-03）：`[probes] debug`；不再读 `OWL_DEBUG`。
+            debug: p.debug,
             degrade_after: cfg.spec.degrade_after,
             probe_every: cfg.spec.probe_every,
             trace_gate: p.trace_gate,
@@ -102,9 +102,8 @@ impl StepProbes {
             // ⚠️ `0` = 关(与 full.toml 的文档口径一致):`Option` 会把 toml 的
             // `kv_dump_at = 0` 解析成 **Some(0)** —— 那意味着"每个请求 pos 0
             // 各 d2h 一页",是纯税(2026-10-27 配置面 review 抓到的现役 bug)。
-            kv_dump_at: p.kv_dump_at.filter(|v| *v > 0).or_else(|| {
-                owl_shared::env_reader::parse::<usize>("OWL_KV_DUMP").filter(|v| *v > 0)
-            }),
+            // 配置单源（F-03）：`[probes] kv_dump_at`；不再读 `OWL_KV_DUMP`。
+            kv_dump_at: p.kv_dump_at.filter(|v| *v > 0),
             live_diag: p.live_diag,
             prefill_bisect: p.prefill_bisect,
         }
@@ -1477,6 +1476,18 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 队列长度(待跑 turn 数;服务面诊断/准入门读)。
     pub fn queue_len(&self) -> usize {
         self.turns.queue.len()
+    }
+
+    /// **准入排队中的队首 turn**（F-19）：`Some(id)` 表示泵循环不应因
+    /// `Idle` 断流 —— `admission_on_full = Queue` 的重判与超时都靠下一次
+    /// `pump`，没有外部事件时必须由服务面定时重试。
+    pub fn admission_pending(&self) -> Option<u64> {
+        let (id, _) = self.turns.admit_wait?;
+        self.turns
+            .queue
+            .front()
+            .filter(|t| t.id == id)
+            .map(|t| t.id)
     }
 
     /// 活跃 turn 数(B5.1 多活跃;服务面灌流测量读 —— 并发是否真进引擎)。
@@ -2864,6 +2875,17 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 腾不够就带数字拒。
     // H1 的地板层（有意保留）：scheduler 的 `turns.admission.decide` 管批量策略，
     // 本函数只管单 turn VRAM 地板；两层共享 store facts，不合并。
+    /// **准入第一段：地板/腾位判决**（F-20 的分工注释）。
+    ///
+    /// 两套判决并存且顺序固定：
+    /// 1. 本函数（pump 循环头）= `rel.check`：**per-turn 显存地板**
+    ///    （Admit / EvictThen / Queue / Reject）；
+    /// 2. `sched_policy::Admission::decide`（`schedule` 内）= **槽位/同会话/
+    ///    退避**（Admit / Hold / Reject）。
+    ///
+    /// 本函数 Reject/Queue 后本拍不再进 `decide`；本函数 Admit 只表示
+    /// "地板可兑现"，槽位仍可能 Hold。合并两套状态机是挂账（F-20），
+    /// 在合并前不许在别处再加第三处准入判据。
     fn admission_gate(&mut self, need: &mut owl_store::Need) -> Result<()> {
         use owl_store::AdmissionVerdict;
         if need.why != owl_store::NeedWhy::Admit {
@@ -2943,6 +2965,20 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(())
     }
 
+    /// **排队 turn 的统一终局清理**（F-18）：排队 turn 没占设备资源
+    /// （块链/GDN 行都在 `start_one` 才借），但 **ephemeral 会话是 submit
+    /// 时建的** —— 不焚就永久留在 `SessionTable`。三条终局（准入拒/准入超时/
+    /// 客户端取消）必须走同一处，否则又是一套语义。
+    pub(crate) fn drop_queued_turn(&mut self, t: &crate::turn::Turn) {
+        if t.ephemeral {
+            self.bank.burn(t.session_id);
+        }
+        if self.turns.admit_wait.map(|(id, _)| id) == Some(t.id) {
+            self.turns.admit_wait = None;
+        }
+        self.close_admission(t.id);
+    }
+
     /// **拒一个待准入 turn**(§23.4):出队 + 临时会话焚毁 + `Failed` 事件入队。
     ///
     /// 不掉 `ensure_for_len` 的 `Exhausted` —— 拒的文案不带 "超预算" 字样:
@@ -2954,12 +2990,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(()); // 已被别处取走(幂等)
         };
         let t = self.turns.queue.remove(pos).expect("刚定位过");
-        if self.turns.admit_wait.map(|(id, _)| id) == Some(turn_id) {
-            self.turns.admit_wait = None;
-        }
-        if t.ephemeral {
-            self.bank.burn(t.session_id); // 临时会话：历史不落地，链/格随 turn 死
-        }
+        self.drop_queued_turn(&t);
         owl_shared::log_warn!("store", "{why}（turn {turn_id}）");
         owl_shared::metrics::with_metrics_store(|m| {
             m.counter_add("store.admit.reject", 1, file!(), line!());
@@ -3936,6 +3967,20 @@ impl<D: DeviceClient> RunningEngine<D> {
         Ok(w)
     }
 
+    /// **装配后置失败时的收尾**（F-05）：只关图族（staging 的 PeerRelease
+    /// 需要 `TpEngine` 的 GpuClient 特化面，不在此处）。给 `Engine::run`
+    /// 在 prewarm 失败时用，避免已捕获的图族被无声 Drop。
+    pub(crate) async fn close_graphs_on_boot_failure(mut self) {
+        if let Err(e) = self.dev.graphs.close().await {
+            owl_shared::log_warn!("boot", "装配失败收尾:rank0 图族关闭失败: {e}");
+        }
+        if let Some(peer) = self.peer.as_mut() {
+            if let Err(e) = peer.graphs.close().await {
+                owl_shared::log_warn!("boot", "装配失败收尾:rank1 图族关闭失败: {e}");
+            }
+        }
+    }
+
     /// **boot 后预热 pinned staging 池**(2026-10-27)。
     ///
     /// 预算 = 池总量(`slots_total × block_bytes`):选择层一次下沉最多搬
@@ -4334,7 +4379,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 不再有同步驱逐。`ops.ensure_evicted` 是回归 canary（应恒 0）。
         // P0.3 定谳(2026-10-19):**循环头**耗时(需求驱动保洁:need/gate/housekeeping)
         // —— 它是"步墙钟 − 设备 − fill/launch − 采样"的缺口候选(此前未打点)。
-        let t_loophead = (prof || true).then(std::time::Instant::now);
+        // 恒开（P0.3 定谳：纳秒级打点；`prof` 只控制下面的分相打印）——
+        // 不用 `(prof || true)` 那种让人误以为有条件的形式。
+        let t_loophead = Some(std::time::Instant::now());
         let need = self.step_need()?;
         let mut need = need;
         self.admission_gate(&mut need)?;
@@ -4351,7 +4398,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             .unwrap_or(0.0);
         let t_lh1 = prof.then(std::time::Instant::now); // 循环头之后
         owl_shared::timer_start!("engine.pump.schedule");
-        let t_sched = (prof || true).then(std::time::Instant::now);
+        let t_sched = Some(std::time::Instant::now());
         let out = self.schedule().await?;
         let t_sc1 = prof.then(std::time::Instant::now); // schedule 之后
         if let Some(ts) = t_sched {

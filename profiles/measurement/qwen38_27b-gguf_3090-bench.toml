@@ -1,5 +1,7 @@
 # owl 生效配置(层:profiles/qwen38_27b-gguf_3090.toml)
 [runtime]
+# 准入满员姿态(reject | queue | queue:<ms>)
+admission_on_full = "reject"
 gpu_min_free_ratio = 0.9
 max_concurrency = 1
 implicit_session = true
@@ -68,6 +70,9 @@ no_reclaim = false
 vram_budget_mb = 0
 
 [kvmem]
+coverage_scheme_probe = false
+coverage_scheme_min_ctx = 0
+coverage_analyze_every = 0
 select_decode = false
 select_partial = false
 index = false

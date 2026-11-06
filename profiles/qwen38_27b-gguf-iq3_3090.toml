@@ -38,6 +38,8 @@ bind = "0.0.0.0:8137"
 # 视觉塔(GGUF 主干不含 model.visual.*)
 
 [runtime]
+# 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
+admission_on_full = "reject"
 keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # 229376 = 7168 页(boot 报的 cap 286041 的 80%,已含 0.9GB 视觉塔);
 # 实测 64k/128k 零拒发、余量 2.1GB。

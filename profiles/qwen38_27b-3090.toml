@@ -54,6 +54,8 @@ quant = "w4a8"
 prefill_shadow = false
 
 [runtime]
+# 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
+admission_on_full = "reject"
 keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # ⚠️ a8 的显存体积比 a16 大(marlin 工作区 84MiB×2 + 激活量化缓冲):
 # 63.4k 档实测 8k 请求就撞硬预算(拒发 19-34MiB)⇒ 全特性档收到 **57.3k**

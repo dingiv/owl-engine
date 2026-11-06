@@ -371,41 +371,43 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
             boot_rank(face0, &mut cfg0, rm0, Some(ctx0), baseline0, t_boot),
             boot_rank(face1, &mut cfg1, rm1, Some(ctx1), baseline1, t_boot),
         );
-        let dev0 = r0.map_err(|e| ModelError::Msg(format!("TP rank0 装配失败:{e}")))?;
-        let dev1 = r1.map_err(|e| ModelError::Msg(format!("TP rank1 装配失败:{e}")))?;
+        let (dev0, dev1) = match (r0, r1) {
+            (Ok(a), Ok(b)) => (a, b),
+            (r0, r1) => {
+                let msg = match (&r0, &r1) {
+                    (Err(e), _) => format!("TP rank0 装配失败:{e}"),
+                    (_, Err(e)) => format!("TP rank1 装配失败:{e}"),
+                    _ => "TP 装配失败(未知)".to_string(),
+                };
+                // F-05：成功的那一 rank 已捕图/建池 —— 先关图族（尽力），
+                // 再让 Drop 收其余；staging 是 GpuClient 固有命令族，泛型面
+                // 无法在这里 PeerRelease（进程退出回收，显式留痕）。
+                if let Ok(mut d) = r0 {
+                    close_graphs_best_effort(&mut d, "rank0").await;
+                }
+                if let Ok(mut d) = r1 {
+                    close_graphs_best_effort(&mut d, "rank1").await;
+                }
+                owl_shared::log_warn!(
+                    "tp",
+                    "TP 装配失败 ⇒ staging 双块未 PeerRelease（泛型面不可达；进程退出回收）"
+                );
+                return Err(ModelError::Msg(msg));
+            }
+        };
         let cfg = cfg0;
         // ── 装配后自证:warmup 的 AR 已**对称配对**(produced == consumed、err = 0)──
-        for (i, dev) in [&dev0, &dev1].into_iter().enumerate() {
-            let Some(tp_ctx) = dev.boot.tp.as_ref() else {
-                return loud(format!("TP rank{i} 装配后无 TpCtx(装配路径错)"));
-            };
-            let Some(mut f) = dev.graphs.face_clone() else {
-                return loud(format!("TP rank{i} 装配后 face 句柄耗尽"));
-            };
-            let h = read_staging_header(
-                &mut f,
-                &tp_ctx.own,
-                (tp_ctx.host_own != 0).then_some(tp_ctx.host_own),
-            )
-            .await?;
-            let produced = u64::from_le_bytes(h[0..8].try_into().unwrap());
-            let consumed = u64::from_le_bytes(h[8..16].try_into().unwrap());
-            let err = u32::from_le_bytes(h[28..32].try_into().unwrap());
-            owl_shared::log_info!(
+        if let Err(e) = verify_staging_headers(&dev0, &dev1).await {
+            // 自证失败 = 已捕图的半装配态，同样先关图族再上抛。
+            let mut dev0 = dev0;
+            let mut dev1 = dev1;
+            close_graphs_best_effort(&mut dev0, "rank0").await;
+            close_graphs_best_effort(&mut dev1, "rank1").await;
+            owl_shared::log_warn!(
                 "tp",
-                "rank{i} staging 自证:produced={produced} consumed={consumed} err={err}"
+                "TP staging 自证失败 ⇒ staging 双块未 PeerRelease（泛型面不可达；进程退出回收）"
             );
-            if err != 0 {
-                return loud(format!(
-                    "TP rank{i} staging err={err}(1=stage 超时 / 2=reduce 超时 / 3=header 校验失败)                     —— 装配期 AR 未能配对(见 tp.rs 的 header 初始化与并发 boot 注记)"
-                ));
-            }
-            if produced != 0 || consumed != 0 {
-                return loud(format!(
-                    "TP rank{i} 装配期出现了 AR 流量:produced={produced} consumed={consumed}\
-                     (装配/warmup 必须零 AR —— 真 AR 只在回放期两 rank 同序入队)"
-                ));
-            }
+            return Err(e);
         }
         let ranks = vec![
             TpRank { plan: plan0, staging: staging0, dev: dev0 },
@@ -563,7 +565,7 @@ impl TpEngine<GpuClient> {
         // ── ② staging 对称握手(**建图之前**)───────────────────────────
         let mut it = engines.into_iter();
         let (face0, cfg, cell0, boot0) = it.next().expect("world = 2 已守门").into_parts();
-        let (mut face1, _cfg1, _cell1, _boot1) =
+        let (mut face1, cfg1, _cell1, boot1) =
             it.next().expect("world = 2 已守门").into_parts();
         let mut face0 = face0;
         // **事件账合流(TP 纪律)**:两 rank 写**同一本**账(单卡档 = 同一本;
@@ -595,9 +597,12 @@ impl TpEngine<GpuClient> {
         }
         // ── ③ 通用装配(每 rank boot_rank;图捕获在此发生)──────────────
         let engines = vec![
-            Engine::from_handle(cfg.clone(), face0, cell0.clone(), boot0)
+            Engine::from_handle(cfg, face0, cell0.clone(), boot0)
                 .map_err(|e| ModelError::Msg(format!("TP 重装 rank0 引擎壳失败:{e}")))?,
-            Engine::from_handle(cfg.clone(), face1, cell0.clone(), boot0)
+            // **rank1 用自己的 cfg/boot 快照**（F-04）：`boot1.live_at_new` 是
+            // rank1 装载前的基线，`assemble_with_staging` 的 per-card 权重账
+            // 靠它；传 `boot0` 会把 rank0 的基线摊到 rank1。
+            Engine::from_handle(cfg1, face1, cell0.clone(), boot1)
                 .map_err(|e| ModelError::Msg(format!("TP 重装 rank1 引擎壳失败:{e}")))?,
         ];
         Self::assemble_with_staging(engines, loadeds, staging0, staging1)
@@ -648,7 +653,7 @@ impl TpEngine<GpuClient> {
         );
         let mut it = engines.into_iter();
         let (face0, cfg, cell0, boot0) = it.next().expect("world = 2 已守门").into_parts();
-        let (mut face1, _cfg1, _cell1, _boot1) =
+        let (mut face1, cfg1, _cell1, boot1) =
             it.next().expect("world = 2 已守门").into_parts();
         let mut face0 = face0;
         face1.set_dev_rank(1);
@@ -665,9 +670,12 @@ impl TpEngine<GpuClient> {
             handshake_staging(&mut face0, &mut face1, &uuid, &uuid, layout, TpOpts::default())
                 .await?;
         let engines = vec![
-            Engine::from_handle(cfg.clone(), face0, cell0.clone(), boot0)
+            Engine::from_handle(cfg, face0, cell0.clone(), boot0)
                 .map_err(|e| ModelError::Msg(format!("同卡档重装 rank0 引擎壳失败:{e}")))?,
-            Engine::from_handle(cfg.clone(), face1, cell0.clone(), boot0)
+            // 同卡档两 rank 共用一张卡，但 rank1 的 boot 快照仍是它自己构造时的
+            // 读数（同卡场景两者通常相同）；保持 per-rank 语义，别把 rank0 的
+            // 基线摊过来（与 `assemble_with` 同律）。
+            Engine::from_handle(cfg1, face1, cell0.clone(), boot1)
                 .map_err(|e| ModelError::Msg(format!("同卡档重装 rank1 引擎壳失败:{e}")))?,
         ];
         Self::assemble_with_staging(engines, loadeds, staging0, staging1)
@@ -707,6 +715,53 @@ impl TpEngine<GpuClient> {
             None => Ok(()),
         }
     }
+}
+
+/// **装配失败时的图族尽力收尾**（F-05；泛型面，无 staging 命令）。
+async fn close_graphs_best_effort<D: DeviceClient>(dev: &mut RankDev<D>, tag: &str) {
+    if let Err(e) = dev.graphs.close().await {
+        owl_shared::log_warn!("tp", "{tag} 装配失败收尾:图族关闭失败: {e}");
+    }
+}
+
+/// **staging header 装配后自证**：produced == consumed == 0 且 err == 0。
+async fn verify_staging_headers<D: DeviceClient>(
+    dev0: &RankDev<D>,
+    dev1: &RankDev<D>,
+) -> Result<()> {
+    for (i, dev) in [dev0, dev1].into_iter().enumerate() {
+        let Some(tp_ctx) = dev.boot.tp.as_ref() else {
+            return loud(format!("TP rank{i} 装配后无 TpCtx(装配路径错)"));
+        };
+        let Some(mut f) = dev.graphs.face_clone() else {
+            return loud(format!("TP rank{i} 装配后 face 句柄耗尽"));
+        };
+        let h = read_staging_header(
+            &mut f,
+            &tp_ctx.own,
+            (tp_ctx.host_own != 0).then_some(tp_ctx.host_own),
+        )
+        .await?;
+        let produced = u64::from_le_bytes(h[0..8].try_into().unwrap());
+        let consumed = u64::from_le_bytes(h[8..16].try_into().unwrap());
+        let err = u32::from_le_bytes(h[28..32].try_into().unwrap());
+        owl_shared::log_info!(
+            "tp",
+            "rank{i} staging 自证:produced={produced} consumed={consumed} err={err}"
+        );
+        if err != 0 {
+            return loud(format!(
+                "TP rank{i} staging err={err}(1=stage 超时 / 2=reduce 超时 / 3=header 校验失败) —— 装配期 AR 未能配对(见 tp.rs 的 header 初始化与并发 boot 注记)"
+            ));
+        }
+        if produced != 0 || consumed != 0 {
+            return loud(format!(
+                "TP rank{i} 装配期出现了 AR 流量:produced={produced} consumed={consumed}\
+                 (装配/warmup 必须零 AR —— 真 AR 只在回放期两 rank 同序入队)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// **单 rank 收尾**(卸图 → `PeerRelease` / `HostRelease` 双块;装配态与执行态共用):
@@ -1025,25 +1080,60 @@ async fn handshake_staging(
         ));
     }
 
-    let (own0, cred0) = face0
-        .peer_alloc(bytes, "tp.staging.r0")
-        .await
-        .map_err(|e| ModelError::Msg(format!("TP staging 分配失败(rank0):{e}")))?;
-    let (own1, cred1) = face1
-        .peer_alloc(bytes, "tp.staging.r1")
-        .await
-        .map_err(|e| ModelError::Msg(format!("TP staging 分配失败(rank1):{e}")))?;
+    // **P2P 握手失败回滚（F-06）**：与 host 分支对称 —— 已分配的 VMM 块/别名
+    // 必须在失败路径显式 `PeerRelease`，否则半握手会在进程内累积 VMM/句柄。
+    let (own0, cred0) = match face0.peer_alloc(bytes, "tp.staging.r0").await {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(ModelError::Msg(format!("TP staging 分配失败(rank0):{e}")));
+        }
+    };
+    let (own1, cred1) = match face1.peer_alloc(bytes, "tp.staging.r1").await {
+        Ok(v) => v,
+        Err(e) => {
+            if let Err(er) = face0.peer_release(vec![own0.id]).await {
+                owl_shared::log_warn!("tp", "P2P 握手回滚:释放 rank0 staging 失败: {er}");
+            }
+            return Err(ModelError::Msg(format!("TP staging 分配失败(rank1):{e}")));
+        }
+    };
     // staging 别名**恒只读导入**(v1 数据腿:stage 写本端槽 → reduce 读对端槽)。
     // push(写对端)与 1-stage 对称 arena 两个实验档已在 2026-10-27 配置面剪枝中退役
     // (3090 对读写对称 / 对称 arena 实测中性,详见 `roadmap.local/26-10-27-配置面-review.md`)。
-    let p0 = face0
+    let p0 = match face0
         .peer_import(cred1, bytes, uuid1.to_string(), "tp.peer.r0")
         .await
-        .map_err(|e| ModelError::Msg(format!("TP staging 导入失败(rank0 ← rank1):{e}")))?;
-    let p1 = face1
+    {
+        Ok(v) => v,
+        Err(e) => {
+            if let Err(er) = face0.peer_release(vec![own0.id]).await {
+                owl_shared::log_warn!("tp", "P2P 握手回滚:释放 rank0 staging 失败: {er}");
+            }
+            if let Err(er) = face1.peer_release(vec![own1.id]).await {
+                owl_shared::log_warn!("tp", "P2P 握手回滚:释放 rank1 staging 失败: {er}");
+            }
+            return Err(ModelError::Msg(format!(
+                "TP staging 导入失败(rank0 ← rank1):{e}"
+            )));
+        }
+    };
+    let p1 = match face1
         .peer_import(cred0, bytes, uuid0.to_string(), "tp.peer.r1")
         .await
-        .map_err(|e| ModelError::Msg(format!("TP staging 导入失败(rank1 ← rank0):{e}")))?;
+    {
+        Ok(v) => v,
+        Err(e) => {
+            if let Err(er) = face0.peer_release(vec![p0.id, own0.id]).await {
+                owl_shared::log_warn!("tp", "P2P 握手回滚:释放 rank0 staging/别名失败: {er}");
+            }
+            if let Err(er) = face1.peer_release(vec![own1.id]).await {
+                owl_shared::log_warn!("tp", "P2P 握手回滚:释放 rank1 staging 失败: {er}");
+            }
+            return Err(ModelError::Msg(format!(
+                "TP staging 导入失败(rank1 ← rank0):{e}"
+            )));
+        }
+    };
     Ok((
         TpStaging {
             own: own0,

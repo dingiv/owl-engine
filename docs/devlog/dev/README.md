@@ -11,6 +11,8 @@
 | `debug-tools.md` | 诊断面速查:`/debug/*` 端点、日志分级、metrics 各族、探针、排障顺序、杀进程纪律 | 服务行为可疑、要量分相、要抓现场 |
 | `fixtures.md` | 夹具与门控:testkit / 金标资产 / 探针测试 / e2e 两入口 / lint 门 / 怎么加新场景 | 写测试、改算子、跑回归 |
 | `profiling.md` | nsys 用法 + 统一测速口径(`llm_speedtest`)+ A/B 方法论与常见误读 | 调性能、判收益、写验收表 |
+| `engine-review-清单-2026-11-05.md` | **engine crate 下一轮 review 清单**:解释目标(10 问)/ P0-P2 分域 / 横切 grep / 验收门 / 已知坑 | 接手 engine 运行时核心前先读 |
+| `engine-crate-导读.md` | **engine 运行时导读 v1**:boot/run/TP2 装配 calltree、所有权与失败路径表、F-01..F-15 findings | 读/改 `engine.rs`、`tp.rs` 前先读 |
 
 ## 三条先记
 

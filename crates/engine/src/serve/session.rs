@@ -108,7 +108,14 @@ impl AgentSession {
     /// 是否与账本逐 id 一致。true = 增量 prefill 安全;false = 失配,
     /// 调用方须 [`Self::reset`] 后全量重算(GDN 状态一并重置)。
     pub fn guard(&self, prompt: &[u32]) -> bool {
-        prompt.len() >= self.cached_len && self.tokens[..self.cached_len] == prompt[..self.cached_len]
+        // `cached_len ≤ tokens.len()` 是跨方法不变量；这里显式校验，
+        // 不变量失守时按"失配"处理（回退全量重算），而不是切片 panic
+        // —— 长驻服务里账坏掉的代价必须是重算，不是打死引擎线程（F-23）。
+        if self.cached_len > self.tokens.len() {
+            return false;
+        }
+        prompt.len() >= self.cached_len
+            && self.tokens[..self.cached_len] == prompt[..self.cached_len]
     }
 
     /// **首个分叉位置**(诊断;`None` = 前缀全同)。

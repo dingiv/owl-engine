@@ -357,11 +357,7 @@ impl Default for EngineKnobs {
             mmproj: None,
             head_quant: owl_shared::config::HeadQuant::Off,
             tag_wildcard: false,
-            probes: crate::running::StepProbes {
-                // 命中面/调试打印:env 覆盖(实测排障用 `OWL_PROBES_DEBUG=1`)
-                debug: owl_shared::env_reader::flag("OWL_DEBUG"),
-                ..Default::default()
-            },
+            probes: crate::running::StepProbes::default(),
             pool_tokens: None,
             draft: DraftCfg::default(),
             prefix_cache: true,
@@ -446,30 +442,6 @@ impl Default for EngineKnobs {
             cuda: owl_cuda::DiagOpts::default(),
             env: owl_models::env::EnvProvider::default(),
         }
-    }
-}
-
-/// 准入满员姿态解析(`OWL_ADMIT_ON_FULL`):`reject`(缺省)/ `queue` / `queue:30000`。
-///
-/// 坏值 = **响亮拒启动**(解析失败不许静默回落到缺省 —— 那就变成"配了没生效")。
-fn parse_admission_on_full() -> std::result::Result<owl_store::QueuePolicy, String> {
-    use owl_store::QueuePolicy;
-    let Some(s) = owl_shared::env_reader::parse::<String>("OWL_ADMIT_ON_FULL") else {
-        return Ok(QueuePolicy::Reject);
-    };
-    let s = s.trim().to_ascii_lowercase();
-    match s.split_once(':') {
-        None if s == "reject" => Ok(QueuePolicy::Reject),
-        None if s == "queue" => Ok(QueuePolicy::Queue {
-            max_wait_ms: 30_000,
-        }),
-        Some(("queue", ms)) => match ms.parse::<u64>() {
-            Ok(max_wait_ms) => Ok(QueuePolicy::Queue { max_wait_ms }),
-            Err(_) => Err(format!("OWL_ADMIT_ON_FULL 坏值:{s}(期望 queue:<毫秒>)")),
-        },
-        _ => Err(format!(
-            "OWL_ADMIT_ON_FULL 坏值:{s}(期望 reject | queue | queue:<毫秒>)"
-        )),
     }
 }
 
@@ -601,8 +573,9 @@ impl EngineKnobs {
     /// **一次运行的条件摘要**(单行;boot 与探针都打)。
     ///
     /// 目的 = **让每个数字自带条件** —— 之前"左一个数字右一个数字对不上",
-    /// 就是因为条件散在多个入口/env 里。凡影响行为的旋钮都在这行里;
-    /// 不在这行里的就不影响行为。
+    /// 就是因为条件散在多个入口/env 里。本行是**关键子集**（池/层/KVMem/
+    /// 图门），不是完整清单：`depth/max_batch/sampler/image_evict` 等仍有
+    /// 独立日志行；改摘要时别把它当成"唯一事实源"。
     pub fn digest(&self) -> String {
         let q = match self.env.kv.quant {
             owl_models::env::KvQuant::None => "f16",
@@ -626,7 +599,7 @@ impl EngineKnobs {
             }
         };
         format!(
-            "pool={:?} turns={} snap_max={} host={}M snap_host={}M disk={}M snap_disk={}M dir={:?} prefix_cache={} align_tail={} bnd_stride={} | kvmem={}[idx={} gpu={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@32tok/page) every={} evict={} floor={}] | fi={} gdn_chunked={} kv={} graph_off={}",
+            "pool={:?} turns={} snap_max={} host={}M snap_host={}M disk={}M snap_disk={}M dir={:?} prefix_cache={} align_tail={} bnd_stride={} | kvmem={}[idx={} gpu={} cov={} view={} part={} ws={}tok(sink{}+recent{}+topk{}@{}tok/page) every={} evict={} floor={}] | fi={} gdn_chunked={} kv={} graph_off={}",
             self.pool_tokens,
             self.gdn_slots,
             self.snap_max,
@@ -648,6 +621,7 @@ impl EngineKnobs {
             self.select_sink,
             self.select_recent,
             self.select_blocks,
+            self.env.kv.page.max(1),
             self.recall_every,
             ev,
             fl,
@@ -669,8 +643,18 @@ impl EngineKnobs {
     /// [`owl_shared::config::OwlConfig`] 显式组装,引擎内部零 env 读取。
     /// env → OwlConfig 的映射统一在 config loader(总账唯一登记点);
     /// 本函数只做 module → 旋钮的字段搬运。
-    pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Self {
-        Self {
+    pub fn from_config(cfg: &owl_shared::config::OwlConfig) -> Result<Self> {
+        // **准入姿态 = 配置单源**（F-02/F-03）：`[runtime] admission_on_full`，
+        // 解析失败在构造期响亮拒（旧实现读 `OWL_ADMIT_ON_FULL` 并在坏值时
+        // `process::exit(2)`）。
+        let admission_on_full = match cfg.runtime.parse_admission_on_full() {
+            Ok(owl_shared::config::AdmissionOnFullCfg::Reject) => owl_store::QueuePolicy::Reject,
+            Ok(owl_shared::config::AdmissionOnFullCfg::Queue { max_wait_ms }) => {
+                owl_store::QueuePolicy::Queue { max_wait_ms }
+            }
+            Err(e) => return Err(owl_iface::contract::ModelError::Msg(e)),
+        };
+        Ok(Self {
             load: cfg.load.clone(),
             rope: cfg.model.rope.clone(),
             vision: cfg.vision.enabled,
@@ -750,11 +734,11 @@ impl EngineKnobs {
             index_gpu: cfg.kvmem.index_gpu,
             coverage_probe: cfg.kvmem.coverage_probe,
             coverage_analyze_at: cfg.kvmem.analyze_at_ctx,
-            // 诊断面的两个 env 旋钮在**入口**一次性收编(引擎内部零 env 读取)
-            coverage_scheme_probe: owl_shared::env_reader::flag("OWL_SCHEME_PROBE"),
-            coverage_scheme_min_ctx: owl_shared::env_reader::parse::<usize>("OWL_SCHEME_MIN_CTX")
-                .unwrap_or(0),
-            coverage_analyze_every: owl_shared::env_reader::parse::<usize>("OWL_COV_ANALYZE_EVERY"),
+            // 诊断面也一律配置单源（F-03）：`[kvmem] coverage_*`。
+            coverage_scheme_probe: cfg.kvmem.coverage_scheme_probe,
+            coverage_scheme_min_ctx: cfg.kvmem.coverage_scheme_min_ctx,
+            coverage_analyze_every: (cfg.kvmem.coverage_analyze_every > 0)
+                .then_some(cfg.kvmem.coverage_analyze_every),
             select_decode: cfg.kvmem.select_decode,
             select_partial: cfg.kvmem.select_partial,
             prefill_view: cfg.kvmem.prefill_view,
@@ -782,13 +766,8 @@ impl EngineKnobs {
             kvmem_virtualization: cfg.kvmem.virtualization_enabled(),
             // 地板 = **事实**(MiB 配置项);页数在装配期按池页宽落(`derive_turn_ws`)。
             dense_floor_mib: cfg.kvmem.dense_floor_mib,
-            // 准入姿态(S3b):env 覆盖(`reject` / `queue[:ms]`);缺省响亮拒。
-            // 坏值 = **响亮拒**(§24.5④:不再 panic;启动期结构化失败,
-            // 归 §18.5 的"配置错误静默 exit 1"红线同一族)
-            admission_on_full: parse_admission_on_full().unwrap_or_else(|e| {
-                owl_shared::log_error!("boot", "{e} —— 拒绝启动");
-                std::process::exit(2);
-            }),
+            // 准入姿态(S3b):`[runtime] admission_on_full`;缺省响亮拒。
+            admission_on_full,
             // per-turn 地板缺省。三态(2026-10-19 配置化;A7 改页口径):
             // - 虚拟化未开 ⇒ **Strict**(全量 dense;唯一诚实值)
             // - 虚拟化开 + `[kvmem].dense_floor_mib = N` ⇒ `Pages(ceil(N·MiB / 页字节))`
@@ -805,10 +784,9 @@ impl EngineKnobs {
             fi_plan_bake: cfg.kernel.fi_plan.bakes().then_some(cfg.runtime.max_seq),
             fi_plan_restore: !cfg.kernel.fi_plan.bakes(),
             ts_probe: cfg.kernel.ts_probe,
-            // S2b 正名:env 新名优先,旧名 `OWL_GDN_SLOTS` 兼容(旧档脚本不炸)
-            gdn_slots: owl_shared::env_reader::parse("OWL_MAX_ACTIVE_TURNS")
-                .or_else(|| owl_shared::env_reader::parse("OWL_GDN_SLOTS"))
-                .unwrap_or(cfg.pool.gdn_slots),
+            // 配置单源（2026-11-05 F-03）：不再读 `OWL_MAX_ACTIVE_TURNS` /
+            // `OWL_GDN_SLOTS`；旧 env 残留由 config-ux 迁移清单收尾。
+            gdn_slots: cfg.pool.gdn_slots,
             // 合批上限:配置文件单源(`[runtime] max_batch`;env 不参与 ——
             // 用户裁决 2026-10-19:引擎行为参数只许配置文件显式声明)
             max_batch: cfg.runtime.max_batch,
@@ -829,8 +807,8 @@ impl EngineKnobs {
             host_pressure_interval_ms: cfg.runtime.host_pressure_interval_ms,
             prefill_align_tail: cfg.pool.prefill_align_tail,
             snap_decode_stride: cfg.pool.snap_decode_stride,
-            // 快照池容量:env 覆盖(实测调压;命中面要求边界快照在场)
-            snap_max: owl_shared::env_reader::parse("OWL_SNAP_MAX").unwrap_or(cfg.pool.snap_max),
+            // 快照池容量 = 配置单源（F-03；不再读 `OWL_SNAP_MAX`）
+            snap_max: cfg.pool.snap_max,
             snap_msg_boundary: cfg.pool.snap_msg_boundary,
             snap_msg_delim: cfg.pool.snap_msg_delim.clone(),
             snap_msg_min_gap: cfg.pool.snap_msg_min_gap,
@@ -843,7 +821,7 @@ impl EngineKnobs {
             sampler: crate::sampler::SamplerCfg::from_sampling(&cfg.sampling),
             cuda: owl_cuda::DiagOpts::from_config(cfg),
             env: owl_models::env::EnvProvider::from_config(cfg),
-        }
+        })
     }
 }
 
@@ -1091,30 +1069,17 @@ fn assemble_budget(
     cfg: &EngineConfig,
     plan: &owl_store::MemoryPlan,
 ) -> Result<owl_store::BudgetInputs> {
-    // 准入地板语义(S3b §23.5):**2026-10-19 拆护栏**。
-    //
-    // 旧护栏:非 Strict 一律拒 —— 因为当时选择层(B 轴)未落地,`Bytes` 的
-    // 地板语义无从兑现。**B 轴已落地并拆出生产门**(`[kvmem].select_decode`),
-    // 所以改成**条件放行**:只有配置里**显式开了虚拟化**
-    // (`[kvmem].select_decode` + `select_partial` 两条同时为真)才允许非 Strict;
-    // 否则依旧响亮拒(不许静默当 Strict 用 —— 那等于把"选择层会不会兜住"
-    // 交给调用方的默认值)。
-    if !cfg.knobs.dense_floor.is_strict() && !cfg.knobs.kvmem_virtualization {
-        return Err(owl_iface::contract::ModelError::Msg(
-            "boot: 非 Strict 的 dense_floor 需要**显式开启虚拟化** \
-             ([kvmem].select_decode = true **且** select_partial = true)—— \
-             地板语义只有选择层在场才能兜住;两者任一为假就响亮拒,不静默降级"
-                .into(),
-        ));
-    }
+    // 非 Strict 地板需要虚拟化两扇门 —— 已前移到 `boot_knobs_check`（F-07）
+    check_dense_floor_gate(cfg)?;
     let inputs = plan.to_budget_inputs()?;
     let mb = |b: usize| b as f64 / 1048576.0;
     if plan.card.total_bytes > 0 && inputs.weights_bytes == 0 {
-        // 有设备账却算出权重 0 = 测量病(不是"没权重");不许静默
-        owl_shared::log_warn!(
-            "boot",
-            "准入预算:权重字节实测为 0(引擎 live 账未动?装载路径绕过账本?)—— 请核对"
-        );
+        // 有设备账却算出权重 0 = 测量病（不是"没权重"）。A5.1：没有数字的项
+        // 不许进预算式 —— 旧行为只 WARN，预算会按 0 权重放宽（F-08）。
+        return Err(owl_iface::contract::ModelError::Msg(
+            "准入预算:权重字节实测为 0(引擎 live 账未动?装载路径绕过账本?)—— 拒绝启动"
+                .into(),
+        ));
     }
     let snap_pool = plan
         .component(owl_store::ComponentId::GdnSnapshots)
@@ -1353,7 +1318,11 @@ impl<D: DeviceClient + 'static> Engine<D> {
         // **staging 预热放在就绪之前**(2026-10-27):把首次大下沉的
         // `cudaHostAlloc(≈600 ms)` 从 TTFT 关键路径搬到 boot。只在部分驻留档
         // 生效(其它档 = 后端 no-op)。
-        engine.prewarm_pinned_staging().await?;
+        // 失败 = 整机装配失败；已捕获的图族先显式关闭（F-05），不让 Drop 静默收。
+        if let Err(e) = engine.prewarm_pinned_staging().await {
+            engine.close_graphs_on_boot_failure().await;
+            return Err(e);
+        }
         Ok(engine)
     }
 
@@ -2013,17 +1982,29 @@ pub(crate) async fn launch_fi_plan_sync<D: DeviceClient>(
     Ok(())
 }
 
-/// **rank 设备侧装配(唯实现)**:几何 → 环境 → spec 域 → KV 写者门 →
-/// 状态池 → 图族(warmup + 捕获)。
+/// **准入地板自洽门**（F-07；纯配置，装配最早期）。
 ///
-/// `tp` = 张量并行上下文(**必须在图捕获之前**传入 —— 捕获期拒三个 `Peer*`
-/// 命令;staging 的 VMM 握手由调用方在更早完成,见 `tp.rs`)。
-#[allow(clippy::arc_with_non_send_sync)]
+/// 非 Strict 地板只有选择层在场才能兜住；配置路径由
+/// `dense_floor_of` 归一成 Strict，这里兜测试/直构 knobs 的档。
+/// 单源：`assemble_budget` 也调本函数（不再各写一份判据）。
+fn check_dense_floor_gate(cfg: &EngineConfig) -> Result<()> {
+    if !cfg.knobs.dense_floor.is_strict() && !cfg.knobs.kvmem_virtualization {
+        return Err(owl_iface::contract::ModelError::Msg(
+            "boot: 非 Strict 的 dense_floor 需要**显式开启虚拟化** \
+             ([kvmem].select_decode = true **且** select_partial = true)—— \
+             地板语义只有选择层在场才能兜住;两者任一为假就响亮拒,不静默降级"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// **boot 配置定形门**(S6a;纯判据,任何设备动作之前)。
 ///
 /// 这些组合一旦放进运行期才爆,现场都很难查(0.8B 桶门 IMA / 首个 verify
 /// 步越界 / 图档瓦与表内容不同构)。集中在这里 = 坏配置毫秒级拒。
 fn boot_knobs_check(cfg: &EngineConfig, tp: Option<&owl_models::module::TpCtx>) -> Result<()> {
+    check_dense_floor_gate(cfg)?;
     // **算子族装配参数:装配期下发**(2026-10-19 桶门立案;2026-11-01 分层修正)。
     //
     // 双源曾分叉:引擎旋钮 `knobs.fi_plan_restore`(桶图用它决定"图自携 vs
@@ -2383,7 +2364,13 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     // 模型几何事实合入(2026-10-13 P4:算子准入的几何门对账面)——
     // 与 hw 同律:引擎 = 环境事实来源,算子层零探测
     env.kv.head_dim = hd;
-    env.kv.grp = hq.checked_div(hkv).unwrap_or(0);
+    // hkv=0 是声明错误（不是"未知"）—— 静默落 0 会让 OpEnv/选核面拿 0 组
+    // 继续跑，比拒启难查（F-13）。
+    env.kv.grp = hq.checked_div(hkv).ok_or_else(|| {
+        ModelError::Msg(format!(
+            "boot: full_heads 声明 hkv = 0(hq = {hq})—— 无法计算 GQA 组数"
+        ))
+    })?;
     // 逐张量计划(GGUF)不注入单值 —— 计划的**真源**已在构造期烧进层容器
     // (`PlanSource::Keyed`);此字段只服务"单一方案"档位的一致性/准入面。
     if let Some(q) = rm.quant_plan {
@@ -2633,7 +2620,7 @@ fn boot_pool_plan(
 }
 
 /// **KVMem 前置校验**(S6a):虚拟化三件套的自洽门(响亮拒,不静默降级)。
-fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
+pub(crate) fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
     // **前缀复用的快照面自洽门(2026-10-24)**:
     // `reuse_face` 的可复用边界必须有一张 GDN 快照;混合模型(Qwen3.8 的
     // GDN 层)不能从 KV 反推这个递推态。因此 `prefix_cache=true` 却让
@@ -2677,11 +2664,11 @@ fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
         ));
     }
     if cfg.knobs.select_partial && !cfg.knobs.select_decode {
-        owl_shared::log_error!(
-            "boot",
-            "OWL_SELECT_PARTIAL=1 需同时开 OWL_SELECT_DECODE=1(链上出洞后必须有视图消费方)—— 拒绝启动"
-        );
-        std::process::exit(2);
+        return Err(owl_iface::contract::ModelError::Msg(
+            "boot: `[kvmem].select_partial = true` 要求 `select_decode = true` \
+             (链上出洞后必须有视图消费方)—— 拒绝启动"
+                .into(),
+        ));
     }
     if cfg.knobs.query_replay {
         if !cfg.knobs.select_decode {
@@ -2735,6 +2722,12 @@ fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
     Ok(())
 }
 
+/// **rank 设备侧装配(唯实现)**:几何 → 环境 → spec 域 → KV 写者门 →
+/// 状态池 → 图族(warmup + 捕获)。
+///
+/// `tp` = 张量并行上下文(**必须在图捕获之前**传入 —— 捕获期拒三个 `Peer*`
+/// 命令;staging 的 VMM 握手由调用方在更早完成,见 `tp.rs`)。
+#[allow(clippy::arc_with_non_send_sync)]
 pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     mut face: DeviceHandle<D>,
     cfg: &mut EngineConfig,
@@ -2744,6 +2737,10 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     t_run: std::time::Instant,
 ) -> Result<RankDev<DeviceHandle<D>>> {
         boot_knobs_check(cfg, tp.as_ref())?;
+        // **纯配置门前移**（F-01）：`boot_kvmem_check` 只读 knobs，必须在
+        // 草稿装载/设备动作之前拒 —— 早前它排在 `boot_env_and_spec` 之后，
+        // 坏配置要先把草稿权重拉起来才发现。
+        boot_kvmem_check(cfg)?;
         // **NVFP4 已可进图**(2026-10-28 进图刀):原来这里有一条“NVFP4 ⇒ 自动
         // 关图捕获”的降级(因为本族发射前要回读 4B `ga`),alpha 设备化后不再需要。
         // 保留一句痕迹只为了将来排查“为何 NVFP4 档没图”——先看算子声明
@@ -2769,7 +2766,6 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
         // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 =
         // min(剩余显存 cap, max_seq×并发 + 1 页)(knobs.pool_tokens 仅测试覆写)。
-        boot_kvmem_check(cfg)?;
         // **池前 settle(2026-10-22)**:装载期临时块(store 复用池)与
         // cudaMallocAsync 缓存会残留到 `free@池` 的读数里;不排空则同一档
         // 不同 boot 的 cap 抖动(79k–116k)。先把它们还驱动/还 OS,再让

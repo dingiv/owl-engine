@@ -58,7 +58,7 @@ Intent（意图） → Resolve（派生） → Verify（预检） → Explain（
 | 10 | "虚拟化"要同时开 `select_decode + select_partial + index + pool_overcommit` 四键 | 易错 | 意图（KVMem=overcommit）没有单键 |
 | 11 | 并发一个概念三处名：`server.max_concurrency` / `pool.gdn_slots` / `runtime.max_batch` | 易错 | 没有意图键 `concurrency` |
 | 12 | 启动日志是长墙；`[boot] 现役臂`、`[vram-gov]`、`slab 总账` 分散 | 排障慢 | 没有"一行摘要 + 可机读 effective config" |
-| 13 | env 仍有残留（`OWL_MAX_ACTIVE_TURNS` / `OWL_SNAP_MAX` 等）与"env 退出配置链"裁决冲突 | 双源 | 迁移未收尾 |
+| 13 | ~~env 仍有残留（`OWL_MAX_ACTIVE_TURNS` / `OWL_SNAP_MAX` 等）~~ **2026-11-05 已收尾（engine 面）**：`admission_on_full` 进 `[runtime]`，覆盖/探针旋钮进 `[kvmem]/[probes]`；engine 生产侧零 env | 已解 | 仅剩 server/入口面的运行器 env |
 
 ---
 
@@ -346,7 +346,7 @@ server --migrate-config old.toml --to profile > new.toml
 | 低层键 | 全部保留；profile 里写低层键 = advanced 覆盖（provenance=Profile） |
 | 改名（`gdn_slots` 类） | `#[serde(alias = "旧名")]` 收一个版本 + 弃用警告；P2 移除 |
 | `fi_plan_bake = 0` | 新枚举 `auto`（0 继续兼容） |
-| env 残留 | `OWL_MAX_ACTIVE_TURNS/OWL_SNAP_MAX` → 配置键；env 只留 `OWL_CONFIG` |
+| env 残留 | ✅ engine 面已解（2026-11-05，见 `engine-crate-导读.md` §12）；入口运行器 env 另计 |
 | `deny_unknown` | 保留；`--check` 的报错附"你是不是想写 X" |
 | 版本 | `config_version = 2` 可选；`--migrate-config` 输出 v2 |
 

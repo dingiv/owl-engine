@@ -287,7 +287,16 @@ pub async fn run_executor<D: DeviceClient>(
             // pump(引擎侧)/dispatch(事件投递)/账务 三段。
             let t_l0 = std::time::Instant::now();
             match running.pump().await {
-                Ok(TurnEvent::Idle) => break,
+                Ok(TurnEvent::Idle) => {
+                    // **F-19**：`admission_on_full = Queue` 时，队首在等池腾位；
+                    // 重判与超时都发生在 `pump` 里 ⇒ 不能在这里断流去等新请求
+                    // （单请求场景会永远等不到下一次 pump）。小幅 sleep 避免空转。
+                    if running.admission_pending().is_some() {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        continue;
+                    }
+                    break;
+                }
                 Ok(ev) => {
                     let d_pump = t_l0.elapsed();
                     // turn 终了 = 性能账落盘点(每 turn 覆写,进程被 kill 也不丢)
@@ -416,10 +425,19 @@ async fn abandon_turn<D: DeviceClient>(
         Some(sink) => {
             deliver(&sink, SinkEvent::Turn(failed)).await;
         }
-        None => {
+        // 0 = 引擎没有给出归属 turn（无活跃时的早退）。只有这种"无归属"
+        // 才保留广播兜底；**已知 turn 的 sink 不在 = 请求方已走**，广播会
+        // 把 A 的失败终态投给 B 的连接（F-21）。
+        None if failed_turn == 0 => {
             for (_, sink) in sinks.drain() {
                 deliver(&sink, SinkEvent::Turn(failed.clone())).await;
             }
+        }
+        None => {
+            owl_shared::log_debug!(
+                "executor",
+                "弃置 turn {failed_turn} 的 sink 已不在（请求方已断开）"
+            );
         }
     }
 }

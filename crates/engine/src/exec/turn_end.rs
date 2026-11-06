@@ -103,10 +103,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if let Some(pos) = self.turns.queue.iter().position(|t| t.id == turn) {
             if let Some(t) = self.turns.queue.remove(pos) {
                 // 排队 turn 未占设备资源(块链/GDN 行都在起 turn 时借)⇒ 只清账。
-                if self.turns.admit_wait.map(|(id, _)| id) == Some(t.id) {
-                    self.turns.admit_wait = None;
-                }
-                self.close_admission(turn);
+                // **ephemeral 必须焚**（F-18）：会话是 submit 时建的，排队终局
+                // 没有 `Release` 钩子来收它。
+                self.drop_queued_turn(&t);
                 return Some(TurnEvent::Failed {
                     turn,
                     err: "客户端取消(排队中)".into(),

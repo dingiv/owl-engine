@@ -444,7 +444,7 @@ impl ServerConfig {
         &resolved.config.parallel,
         resolved.config.runtime.gpu_min_free_ratio,
     )?;
-        let mut out = Self::from_config(resolved.config);
+        let mut out = Self::from_config(resolved.config)?;
         out.devices = devices;
         out.perf_dump = args.perf_dump.clone();
         Ok(out)
@@ -471,10 +471,10 @@ impl ServerConfig {
     }
 
     /// app 面组装(已加载配置 → server 形态;测试可直接喂 default/定制)
-    pub fn from_config(cfg: OwlConfig) -> Self {
+    pub fn from_config(cfg: OwlConfig) -> Result<Self, String> {
         // 先组装 app 面视图(要整份 cfg);后面按值搬移各 module
         let agent = AgentCfg::from_config(&cfg);
-        Self {
+        Ok(Self {
             bind: cfg.server.bind.clone(),
             request_dump_dir: {
                 let p = cfg.server.request_dump_dir.trim();
@@ -493,7 +493,8 @@ impl ServerConfig {
                 .name
                 .clone()
                 .unwrap_or_else(|| Self::default_model_name(cfg.model.format, cfg.model.path.as_deref())),
-            knobs: owl_engine::EngineKnobs::from_config(&cfg),
+            knobs: owl_engine::EngineKnobs::from_config(&cfg)
+                .map_err(|e| format!("engine knobs: {e}"))?,
             // 占位:真值由 `load()` 的声明式选卡回填(设备表 + 卡锁都在那边)
             devices: Devices::placeholder(),
             // 上下文/块长:**单一来源 = 配置**(2026-10-20 删除 OWL_MAX_SEQ /
@@ -518,7 +519,7 @@ impl ServerConfig {
             step_gate_ms: cfg.probes.step_gate_ms,
             step_gate_us: cfg.probes.step_gate_us,
             step_gate_every: cfg.probes.step_gate_every,
-        }
+        })
     }
 
     /// agent 面缺省模板变量(`[agent]` → jinja 变量;请求 kwargs 覆盖之)。

@@ -56,6 +56,7 @@
 //! | runtime | prefill_chunk / prefill_tail_merge | usize / 512、0 |
 //! | runtime | int8_prefill_sync | flag / true(INT8 末块前设备栅栏；false 仅 A/B) |
 //! | runtime | max_batch | usize / 1(合批上限;>1 需 gdn_slots≥它、单卡、无选择层) |
+//! | runtime | admission_on_full | String / "reject"(准入满员姿态;`reject` \| `queue` \| `queue:<ms>`) |
 //! | runtime | idle_compact / pressure_low_pct / pressure_high_pct | bool、usize、usize / false、12、25(空转默认不预搬;低触发/高目标) |
 //! | runtime | host_pressure_low_pct / host_pressure_high_pct / host_pressure_interval_ms | usize、usize、usize / 12、25、1000(宿主低触发/高目标/空转节流) |
 //! | runtime | host_pressure_request_slots / host_pressure_request_snaps | usize、usize / 16、1(每请求 KV/快照搬迁上限) |
@@ -108,7 +109,8 @@
 //! | dispatch | tag_wildcard | bool / false(诊断 `*`:跳过 tag 过滤) |
 //! | kvmem | select_decode / select_partial / index / index_gpu / pool_overcommit | flag / false、true(index_gpu 缺省 true) |
 //! | kvmem | workspace_per_req / select_sink / select_recent / recall_every | usize / 2240、2、4、1 |
-//! | kvmem | coverage_probe / analyze_at_ctx / evict_policy / dense_floor_mib | 见字段注(lru\|lrfu[:λ]) |
+//! | kvmem | coverage_probe / analyze_at_ctx / coverage_scheme_probe / coverage_scheme_min_ctx / coverage_analyze_every | 见字段注(诊断面) |
+//! | kvmem | evict_policy / dense_floor_mib | 见字段注(lru\|lrfu[:λ]) |
 //! | kvmem | bulk_drop_when_tier_full | bool / false(整枝塌缩:宿主/磁盘装不下时允许一次丢整段) |
 //! | probes | step_profile / perf_level / gdn_dump / debug | flag / false |
 //! | probes | step_gate / step_gate_ms / step_gate_us / step_gate_every | StepMode("off"\|"sticky"\|"single") / 50 / 0(覆盖 ms) / 1 |
@@ -455,6 +457,10 @@ fn default_min_gen() -> usize {
     256
 }
 
+fn default_admission_on_full() -> String {
+    "reject".to_string()
+}
+
 fn default_max_batch() -> usize {
     1
 }
@@ -560,6 +566,11 @@ pub struct RuntimeCfg {
     /// **准入:等待队列上限**(0 = 无界;超出 ⇒ 新来者 429 `no_slot`)
     #[serde(default)]
     pub max_queue: usize,
+    /// **准入满员姿态**（`[runtime] admission_on_full`；2026-11-05 从 env 收编）：
+    /// `"reject"`（缺省）/ `"queue"`（最多等 30s）/ `"queue:<ms>"`。
+    /// 坏值 = boot 拒启（`validate` 与引擎构造都走同一解析）。
+    #[serde(default = "default_admission_on_full")]
+    pub admission_on_full: String,
     /// **空转整理策略**(缺省 `false` = 不预搬)。
     ///
     /// `false` = 空转只做池缓存回收，不主动把设备块搬到宿主/磁盘；
@@ -601,6 +612,33 @@ pub struct RuntimeCfg {
     /// (如 `41:00.0`)。`Some` = GPU 门已过。**CUDA 序号禁用**(序会漂)。
     #[serde(skip)]
     pub test_device: Option<String>,
+}
+
+/// **准入满员姿态**（配置词汇；引擎侧映射到 `owl_store::QueuePolicy`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionOnFullCfg {
+    Reject,
+    Queue { max_wait_ms: u64 },
+}
+
+impl RuntimeCfg {
+    /// **唯一解析**：`reject` / `queue` / `queue:<ms>`（大小写不敏感）。
+    /// `validate` 与 `EngineKnobs::from_config` 都调这里 —— 不许第二套解析。
+    pub fn parse_admission_on_full(&self) -> Result<AdmissionOnFullCfg, String> {
+        let s = self.admission_on_full.trim().to_ascii_lowercase();
+        match s.split_once(':') {
+            None if s == "reject" => Ok(AdmissionOnFullCfg::Reject),
+            None if s == "queue" => Ok(AdmissionOnFullCfg::Queue { max_wait_ms: 30_000 }),
+            Some(("queue", ms)) => ms.parse::<u64>().map(|max_wait_ms| {
+                AdmissionOnFullCfg::Queue { max_wait_ms }
+            }).map_err(|_| {
+                format!("[runtime] admission_on_full 坏值:{s}(期望 queue:<毫秒>)")
+            }),
+            _ => Err(format!(
+                "[runtime] admission_on_full 坏值:{s}(期望 reject | queue | queue:<毫秒>)"
+            )),
+        }
+    }
 }
 
 /// **并行面**(`[parallel]`;2026-10-21 从 runtime 拆出，卡位与 TP 旋钮归此)。
@@ -1198,6 +1236,13 @@ pub struct KvmemCfg {
     /// 钉住 ctx 后:query 面 `[ctx−8, ctx)` 与块数 `ctx/page` **都与 chunk 无关**
     /// ⇒ 读数逐位可比。要求该 ctx 是 chunk 的整数倍(否则取不到该边界)。
     pub analyze_at_ctx: usize,
+    /// **方案 A/B 对照档**（诊断面；2026-11-05 从 env 收编）：多读一份 V +
+    /// host 侧算 A/B/dense。只在 `coverage_probe` 时有意义。
+    pub coverage_scheme_probe: bool,
+    /// 方案对照的最小 ctx（0 = 每个边界都算）。
+    pub coverage_scheme_min_ctx: usize,
+    /// **重诊断步进**（0 = 每个边界都诊断；诊断面）。
+    pub coverage_analyze_every: usize,
     /// **驱逐策略**(缺省 `lru`):`lru` = 纯近期;`lrfu[:λ]` = attention-aware
     /// LRFU(召回点选中的块抬 keep-score)⇒ 出序时"又冷又没被注意力用过"的先下沉。
     /// λ 参数在此解析(A4 收口,2026-10-19)。
@@ -2020,6 +2065,7 @@ impl Default for RuntimeCfg {
             min_gen_tokens: 256,
             reserve_pages: 0,
             max_queue: 0,
+            admission_on_full: default_admission_on_full(),
             idle_compact: false,
             pressure_low_pct: 12,
             pressure_high_pct: 25,
@@ -2092,6 +2138,9 @@ impl Default for KvmemCfg {
             recall_every: 1,
             coverage_probe: false,
             analyze_at_ctx: 0,
+            coverage_scheme_probe: false,
+            coverage_scheme_min_ctx: 0,
+            coverage_analyze_every: 0,
             evict_policy: EvictPolicyCfg::Lru,
             bulk_drop_when_tier_full: false,
             dense_floor_mib: None,
@@ -3254,6 +3303,8 @@ impl OwlConfig {
                 );
             }
         }
+        // 准入姿态：坏值必须在 boot 前拒（env 收编后的单一解析点）。
+        self.runtime.parse_admission_on_full()?;
         if self.pool.gdn_slots < self.runtime.max_concurrency {
             return Err(format!(
                 "[pool] gdn_slots({}) < [runtime] max_concurrency({})—— GDN 状态格 = 每并发会话一格,\n              并发超格数会把活跃会话的状态格 LRU 逐出(跨会话状态污染);请调 gdn_slots ≥ max_concurrency",
@@ -3412,6 +3463,33 @@ mod tests {
     /// 拒语要点出病因(状态格逐出 = 跨会话污染)与调法;合规组合(生产档 1/1、
     /// 缺省 8/8)必须过。
     /// **合批上限自洽门**(B5.1):gdn_slots 不足 / 与 TP / 选择层互斥 ⇒ 拒启
+    #[test]
+    fn admission_on_full_parses_three_forms_and_rejects_bad() {
+        use super::AdmissionOnFullCfg;
+        let mut cfg = OwlConfig::default();
+        assert_eq!(
+            cfg.runtime.parse_admission_on_full(),
+            Ok(AdmissionOnFullCfg::Reject)
+        );
+        cfg.runtime.admission_on_full = "queue".into();
+        assert_eq!(
+            cfg.runtime.parse_admission_on_full(),
+            Ok(AdmissionOnFullCfg::Queue { max_wait_ms: 30_000 })
+        );
+        cfg.runtime.admission_on_full = "queue:1500".into();
+        assert_eq!(
+            cfg.runtime.parse_admission_on_full(),
+            Ok(AdmissionOnFullCfg::Queue { max_wait_ms: 1500 })
+        );
+        cfg.runtime.admission_on_full = "queue:abc".into();
+        assert!(cfg.runtime.parse_admission_on_full().is_err());
+        cfg.runtime.admission_on_full = "reject:1".into();
+        assert!(cfg.runtime.parse_admission_on_full().is_err());
+        // validate 必须复用同一解析（坏值 boot 前拒）。
+        cfg.runtime.admission_on_full = "nope".into();
+        assert!(cfg.validate().is_err(), "坏值必须被 validate 拒");
+    }
+
     #[test]
     fn max_batch_requires_gdn_slots_and_no_virtualization() {
         let parse = |t: &str| OwlConfig::from_toml_str(t);
