@@ -40,6 +40,14 @@ pub struct SpecReport {
     pub keys_base: String,
     /// 失配条目(`字段: config=X 形状=Y(采形状)`)
     pub mismatches: Vec<String>,
+    /// 检查点声明的最大位置(`config.json: max_position_embeddings`;0 = 未声明)
+    pub max_pos: usize,
+    /// 根级 `vision_config` 在场(VLM 检查点)
+    pub has_vision_cfg: bool,
+    /// 根级 `image_token_id` 在场
+    pub has_image_token: bool,
+    /// 自带 MTP/NextN 层数(`mtp.layers.<n>.*` 去重计数;0 = 无)
+    pub mtp_layers: usize,
 }
 
 impl ModelSpec {
@@ -67,7 +75,26 @@ impl ModelSpec {
             .keys()
             .find_map(|k| k.strip_suffix("embed_tokens.weight").map(|b| b.to_string()))
             .unwrap_or_default();
-        let mut rep = SpecReport { keys_base: base.clone(), mismatches: Vec::new() };
+        // 自带 MTP/NextN 头(键面事实;装载器与 `--check` 共用一条判据)
+        let mtp_layers = {
+            let mut idxs = std::collections::BTreeSet::new();
+            for k in idx.keys() {
+                if let Some(rest) = k.strip_prefix("mtp.layers.") {
+                    if let Some(n) = rest.split('.').next().and_then(|x| x.parse::<usize>().ok()) {
+                        idxs.insert(n);
+                    }
+                }
+            }
+            idxs.len()
+        };
+        let mut rep = SpecReport {
+            keys_base: base.clone(),
+            mismatches: Vec::new(),
+            max_pos: text.get("max_position_embeddings").and_then(|x| x.as_u64()).map(|n| n as usize).unwrap_or(0),
+            has_vision_cfg: v.get("vision_config").is_some(),
+            has_image_token: v.get("image_token_id").and_then(|x| x.as_u64()).is_some(),
+            mtp_layers,
+        };
 
         // ---- 形状探针(指数级:`.weight` 直取;量化族 `.weight_packed` 配 `.weight_shape`)----
         let shape_of = |key: &str| -> Option<Vec<usize>> {

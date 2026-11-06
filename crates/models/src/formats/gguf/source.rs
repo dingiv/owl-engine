@@ -73,6 +73,8 @@ pub struct GgufSource {
     /// 维度事实(开箱时从同一索引推出;**装载面与转渡面同源** —— 不让调用方
     /// 再开一次容器推 spec,避免两处推法漂移)
     spec: crate::model::ModelSpec,
+    /// 起点读取账(arch + 宽松项;**与 spec 同一次解析**)
+    report: super::meta::GgufSpecReport,
     dims: GgufDims,
     /// 行映射缓存(键 → 目标行←源行;懒算 —— 同键多槽只算一次)
     perms: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<u32>>>>,
@@ -97,12 +99,13 @@ impl GgufSource {
         shard: Option<ShardSel>,
     ) -> Result<Self, ModelError> {
         let g = Gguf::open(path)?;
-        let (spec, _rep) = spec_from_gguf(&g)?;
+        let (spec, report) = spec_from_gguf(&g)?;
         let (nk, hk, nv, hv) = spec.gdn_heads;
         let (nq, nkv, _hd) = spec.full_heads;
         let me = Self {
             g,
             spec,
+            report,
             dims: GgufDims { nk, nv, hk, hv, nq, nkv },
             perms: std::sync::Mutex::new(Default::default()),
             shard,
@@ -160,6 +163,11 @@ impl GgufSource {
     /// 容器(诊断/上层推导用;词表/模板同源)
     pub fn gguf(&self) -> &Gguf {
         &self.g
+    }
+
+    /// 起点读取账(arch + 宽松项;与 [`Self::spec`] 同一次解析)
+    pub fn spec_report(&self) -> &super::meta::GgufSpecReport {
+        &self.report
     }
 
     /// 维度事实(变换表输入)

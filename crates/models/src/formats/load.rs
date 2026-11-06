@@ -83,6 +83,24 @@ impl LoadOpts {
         Self { dtype, shard: 1, slice_id: 0, head_split: false, device_repack: Some(false), verify: false, debug_tap: false, staging_mb: 128, dump: false, gguf_dequant: false }
     }
 
+    /// **应用 `[load]` 配置**(唯一映射点:诊断/校验/暂存/dump/重排三态)。
+    ///
+    /// `repack = "auto"` 保留调用方 base 的能力裁决(见 [`Self::new`] /
+    /// [`Self::plain`]);显式 `device`/`cpu` 覆盖。
+    ///
+    /// 非法 `repack` 值 = **响亮拒**:历史草稿路径用 `if let Ok(..)` 吞过这条错
+    /// (配置面已校验,但直接构造 `EngineKnobs` 的测试/工具面会静默按 auto 跑)。
+    pub fn with_cfg(mut self, cfg: &owl_shared::config::LoadCfg) -> Result<Self, ModelError> {
+        self.verify = cfg.verify;
+        self.debug_tap = cfg.debug_tap;
+        self.staging_mb = cfg.staging_mb;
+        self.dump = cfg.dump;
+        if let Some(dev) = cfg.repack_device().map_err(ModelError::Msg)? {
+            self.device_repack = Some(dev);
+        }
+        Ok(self)
+    }
+
     /// 装载 ctx(旋钮 → LoaderCtx;唯一产地)
     pub fn ctx(&self) -> crate::module::LoaderCtx {
         crate::module::LoaderCtx {
@@ -166,6 +184,11 @@ fn quant_family(dir: &Path) -> Result<crate::formats::kind::QuantScheme, ModelEr
 
 /// **起点开箱**:目录 → (探测格式, 源) —— 起点轴收口(设计 §2.2)。
 ///
+/// ⚠️ 本函数内含**格式探测**(索引嗅探 + 量化方案 config 读),是**一次性组件
+/// 装载**的入口(视觉塔 / MTP 头 / 草稿头 / 测试)。主模型装载走 `ModelSource`
+/// (源只开一次);已知源族时不要再调本函数,直接用
+/// [`load_component`] + 已打开的 `WeightSource`。
+///
 /// 三族全接:
 /// - `SafeTensors` → [`SafeTensorsSource`];
 /// - `PackQuantized` / `AwqGemm` → 按 `quant_method` 选族
@@ -180,54 +203,68 @@ where
     T: crate::module::Loadable,
     D: DeviceClient,
 {
+    let kind = crate::formats::kind::detect(path)?.kind;
+    let src = open_source(path, kind, &opts)?;
+    load_component(face, comp, &*src, opts).await
+}
+
+/// **按已知起点族打开权重源**(探测与执行分离;`load_component` 的前半步)。
+///
+/// - `kind` 由 [`crate::formats::kind::detect`] 或调用方更早的探测给出;
+///   已知族时用它可跳过 `load_from_dir` 的二次探测(当前 drafter 装配仍
+///   走 one-shot `load_from_dir`,见该函数注)。
+/// - 量化族在此消费 `opts.device_repack`(**首键物化前**注入)与 GGUF 的
+///   `ShardSel`(由 `opts.shard/slice_id/head_split` 派生)。
+///
+/// 返回的源是 host 对象(索引/mmap;无设备分配),交给
+/// [`load_component`] 执行。
+pub fn open_source(
+    path: &Path,
+    kind: crate::formats::kind::CheckpointKind,
+    opts: &LoadOpts,
+) -> Result<Box<dyn crate::module::WeightSource>, ModelError> {
     use crate::formats::kind::CheckpointKind;
-    let det = crate::formats::kind::detect(path)?;
-    match det.kind {
+    Ok(match kind {
         CheckpointKind::SafeTensors => {
-            let src = crate::formats::safetensors::SafeTensorsSource::open_dir(path)?;
-            load_component(face, comp, &src, opts).await
+            Box::new(crate::formats::safetensors::SafeTensorsSource::open_dir(path)?)
         }
-        CheckpointKind::PackQuantized | CheckpointKind::AwqGemm => {
-            match quant_family(path)? {
-                crate::formats::kind::QUANT_G32_ASYM => {
-                    let src = crate::formats::awq::AwqSource::open_dir(path)?;
-                    // 源侧重排模式注入(起点开箱的一环:量化大键的 marlin B
-                    // 由 CPU 还是 GPU repack 产出;**须在首键物化前**)
-                    src.set_device_repack(opts.device_repack.unwrap_or(false));
-                    load_component(face, comp, &src, opts).await
-                }
-                crate::formats::kind::QUANT_G128_SYM => {
-                    let src = crate::formats::w4a16::W4A16Source::open_dir(path)?;
-                    src.set_device_repack(opts.device_repack.unwrap_or(false));
-                    load_component(face, comp, &src, opts).await
-                }
-                other => Err(ModelError::Msg(format!(
-                    "load_from_dir: 量化方案 {other} 未接源族(响亮拒,不许猜)"
-                ))),
+        CheckpointKind::PackQuantized | CheckpointKind::AwqGemm => match quant_family(path)? {
+            crate::formats::kind::QUANT_G32_ASYM => {
+                let src = crate::formats::awq::AwqSource::open_dir(path)?;
+                // 源侧重排模式注入(起点开箱的一环:量化大键的 marlin B
+                // 由 CPU 还是 GPU repack 产出;**须在首键物化前**)
+                src.set_device_repack(opts.device_repack.unwrap_or(false));
+                Box::new(src)
             }
-        }
+            crate::formats::kind::QUANT_G128_SYM => {
+                let src = crate::formats::w4a16::W4A16Source::open_dir(path)?;
+                src.set_device_repack(opts.device_repack.unwrap_or(false));
+                Box::new(src)
+            }
+            other => {
+                return Err(ModelError::Msg(format!(
+                    "open_source: 量化方案 {other} 未接源族(响亮拒,不许猜)"
+                )))
+            }
+        },
         // **GGUF 臂**(2026-10-19 刀 7c 接线):容器解析(刀 1)+ 内嵌超参(刀 3)
         // + 反变换权重源(刀 4c)。源的契约与其他三族**一致**(键 → 字节):
         // 量化键交给装载面的是**压缩块字节**(槽 dtype = `U8`),永不在 host
         // 解量化(设计 I-3);行置换/`ln(-x)` 在源侧完成(逐键描述符)。
-        // 起点的**事实面**(超参 / 词表 / 模板)不在这里 —— 它们由引擎侧从
-        // 同一索引取(刀 2/刀 3):本函数只管"键 → 字节"。
         CheckpointKind::Gguf => {
             if opts.gguf_dequant {
                 // 小件/异型头(MTP)专用:host 解成 f32 → 目标 F16
-                let src = crate::formats::gguf::GgufDequantSource::open(path)?;
-                load_component(face, comp, &src, opts).await
+                Box::new(crate::formats::gguf::GgufDequantSource::open(path)?)
             } else {
                 let sel = (opts.shard > 1).then_some(crate::formats::gguf::ShardSel {
                     id: opts.slice_id,
                     world: opts.shard,
                     head_split: opts.head_split,
                 });
-                let src = crate::formats::gguf::GgufSource::open_shard(path, sel)?;
-                load_component(face, comp, &src, opts).await
+                Box::new(crate::formats::gguf::GgufSource::open_shard(path, sel)?)
             }
         }
-    }
+    })
 }
 
 /// 装载执行(层级入口):驱动层的 `Loadable::layout` 需求并物化。
@@ -2356,5 +2393,43 @@ mod generic_entry_tests {
             }
         }
         eprintln!("[loader] 转置臂 dtype 交付门:bf16/f16 逐元素 ✓");
+    }
+}
+
+
+#[cfg(test)]
+mod load_opts_tests {
+    use super::*;
+    use crate::contract::Dtype;
+
+    /// `[load]` → opts 的唯一映射:四项旋钮 + repack 三态;非法值必须上抛。
+    #[test]
+    fn with_cfg_maps_knobs_and_rejects_bad_repack() {
+        let cfg = owl_shared::config::LoadCfg {
+            verify: true,
+            debug_tap: true,
+            staging_mb: 7,
+            dump: true,
+            repack: "cpu".into(),
+        };
+        let o = LoadOpts::plain(Dtype::F16)
+            .with_cfg(&cfg)
+            .expect("cpu 合法");
+        assert!(o.verify && o.debug_tap && o.dump);
+        assert_eq!(o.staging_mb, 7);
+        assert_eq!(o.device_repack, Some(false), "显式 cpu 覆盖 base");
+
+        let bad = owl_shared::config::LoadCfg { repack: "nope".into(), ..cfg };
+        assert!(
+            LoadOpts::plain(Dtype::F16).with_cfg(&bad).is_err(),
+            "非法 repack 必须响亮拒(不许静默按 auto)"
+        );
+
+        // auto 保留 base 的能力裁决
+        let auto = owl_shared::config::LoadCfg { repack: "auto".into(), ..Default::default() };
+        assert_eq!(
+            LoadOpts::plain(Dtype::F16).with_cfg(&auto).expect("auto 合法").device_repack,
+            Some(false)
+        );
     }
 }

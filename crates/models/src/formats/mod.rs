@@ -31,6 +31,8 @@ pub mod gguf;
 pub mod kind;
 pub mod load;
 pub mod mmap;
+/// **模型源统一个口**(`ModelSource`;装载流只认接口,不认格式;2026-11-04 clean-code)
+pub mod model_source;
 pub mod qwen35;
 pub mod safetensors;
 /// **装载面分片化**(S4 ②;确定性分片协议:pass + 源包装)
@@ -67,7 +69,7 @@ pub(crate) fn split_merged(base: &str) -> Option<(String, String)> {
 
 pub use awq::AwqSource;
 pub use kind::{detect, CheckpointKind, Detection, QuantScheme};
-pub use load::{eval_load, load_component, load_from_dir, LoadOpts};
+pub use load::{eval_load, load_component, load_from_dir, open_source, LoadOpts};
 pub use qwen35::{hybrid_3to1, load_tokenizer, qwen3_5_0_8b, qwen3_8_27b, Qwen35Convention};
 pub use safetensors::SafeTensorsSource;
 pub use util::{marlin_eligible, marlin_n_pack};
