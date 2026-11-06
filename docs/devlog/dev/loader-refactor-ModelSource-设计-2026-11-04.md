@@ -218,3 +218,177 @@ packages/owl/tools/bench/boot_time.sh gguf         # GGUF 27B IQ4_XS(16k,spec of
 2. 报告里贴 §5.3 的表(改前 / 改后 / 比值),并注明是否与并发负载同窗;
 3. 未完成项/风险写成清单(别埋在提交里);
 4. 若发现本卷前提有误(例如某个差异其实是行为,不是重复),**先停手写清楚**再改代码。
+
+---
+
+## 9. 完成实录（2026-11-04 深夜；S1+S2+S3 一次落）
+
+> 工作树状态：**未提交**（owl `AGENTS.md` §D-21：提交须等用户明确指示）。
+
+### 9.1 落地形态
+
+**新模块** `crates/models/src/formats/model_source.rs`（第一刀 753 行；
+第二刀把声明事实载体并入后 972 行，含 6 条纯 host 单测）：
+
+- trait `ModelSource`：`name/root/spec/build_model/weights/tokenizer/rope/
+  vision/draft_dir/device_repack/open_duration/log_facts/log_phases`；
+- `HfDirSource`（SafeTensors / AWQ / W4A16 三 kind，一处实现）；
+- `GgufFileSource`（单文件；**自持 `GgufSource`**，不再像旧流那样开两次容器）；
+- `build_model` = 计划换算 + 能力校验 + `Model::new*` 的唯一落点 ⇒ GGUF 的
+  `PlanSource::Keyed` **生命周期不出函数**，`quant_plan = None` 语义天然成立；
+- `shard_spec` 分片换算唯一产地（词表切的单卡门随迁）。
+
+**`crates/engine/src/loader.rs`**（857 → 675 行）：
+
+- 唯一装载流 `load_source`（建模 → 权重 → 词表 → rope → 视觉 → 分相日志）；
+- 六个 `load_*` 入口变薄壳，**公开签名全保留**（engine 单测/集成测试零改动）；
+- `load_arm` 只做「臂 → 源」；
+- 删 `shard_spec` / `shard_opts` / `convention_base` / `log_spec_report` /
+  `log_gguf_report` / `build_gguf_rope`（全部迁入源或由源回答）。
+
+### 9.2 行为等价门
+
+| 门 | 结果 |
+|---|---|
+| `--check` 三档摘要 | HF / GGUF 逐字不变（与 §3.3c 记录同口径） |
+| AWQ + DFlash2 d7 | 起机 + 32 tok 出词（thinking 正常） |
+| GGUF + mmproj | 起机 + 24 tok 出词；视觉塔/词表/rope 摘要行照旧 |
+| `owl-models` 单测 | 316 + 新增 6 = **322 全绿** |
+| `cargo check --workspace --all-targets` | 0 error |
+| HF ↔ GGUF 交叉对拍 | **未跑**：本机 4B GGUF 资源不在盘（清单路径缺失）；用 0.8B 替换被测试基础设施挡住（见 §9.4-2） |
+
+### 9.3 性能（热态 3 次中位数；同卡 3090 Ti `41:00`、同参数）
+
+| 档 | `load` 前→后 | 比值 | `assemble` 前→后 | 比值 | 主权重 key loop 前→后 | 比值 |
+|---|---|---|---|---|---|---|
+| AWQ + spec d7 | 7.73 → **7.87** | 1.018 | 9.46 → **9.56** | 1.011 | 6.43 → **6.52** | 1.014 |
+| AWQ spec off | 7.82 → **7.76** | 0.992 | 8.06 → **7.96** | 0.988 | 6.64 → **6.53** | 0.984 |
+| GGUF IQ4_XS（7 次中位） | 7.44 → **7.39** | 0.993 | 7.75 → **7.67** | 0.990 | 2.86 → **2.86** | 1.000 |
+
+说明：
+
+- 三档全部在 §5.3 的 ×1.05 硬门内；
+- AWQ 的 +1~2% 与 key loop 同向，属噪声带（同参数三次极差 ±0.12s）；
+- GGUF 的视觉塔分相方差 ±0.4s（`mmproj` 读盘），故取 7 次中位；
+- `wall_to_health` 由脚本 0.5s 轮询量化，只作参考（本次与基线同量级：
+  10.26–10.77s vs 9.74–9.75s 的差几乎全是轮询相位，`assemble` 才是可比值）。
+
+### 9.4 遗留（按影响排序）
+
+1. **GGUF 源释放 ~0.45s 不在分相账内**：`GgufSource` 的 munmap + 行列缓存
+   在 `load_source` 返回后才释放，因此 `[gguf] 装载分相` 的「词表/rope」残差
+   不含它（`[boot] 权重/tokenizer/rope 装载` 含）。旧流把第二份源的释放算进
+   「权重」相 —— 总量未变，只是归属移动。若将来要更严的分相账，可让
+   `load_source` 显式接管源所有权并在日志前释放。
+2. **GPU 测试面被既有注册表门挡住** —— **已修（2026-11-05 凌晨）**：
+   `tag_wildcard`（`allowed=None`）下，`nvfp4_*` 声明无家族（执行面随
+   `arch-sm120` feature）被孤儿门误判。现在这类"声明恒在、执行面构建期可选"
+   的家族登记在 `owl_kernels::family::BUILD_GATED_FAMILIES`，孤儿门豁免；
+   真正不可跑仍由 `admit` 在选核期拒。新增条目有测试留痕门。
+   随后 GPU 套件实测：27B GGUF 冒烟（首 token = oracle ` Paris`）、27B VLM
+   图片冒烟、0.8B IQ4_XS↔Q4_K_M 首 token 对拍全绿。
+   **27B GGUF TP2 已恢复（同日）**：原失败是**测试布置**问题 —— 单卡参考
+   引擎与 rank0 同卡、驱动侧回收滞后，而 TP 预算取 **rank0 的 boot free
+   快照**（实测把上一份 18GB 误算进"卡可用" ⇒ 5.34GB）。把单卡参考放到
+   rank1 的卡上即可（rank1 的 boot 快照不参与预算）。修后 TP2 全绿：
+   logits `max|Δ|=0.32 / cos=0.99981 / top1 相同`、两 rank logits 逐位相同、
+   `Captured`、24 token 与单卡逐字相同。
+3. 4B GGUF 资源缺失 ⇒ 交叉源对拍待资源恢复后补跑（命令与判据见 §6）。
+4. `HfDirSource` 的 `device_repack` 由引擎裁决后作为构造入参（源不读配置）：
+   这是有意的显式依赖，新增源族时别改成源内默认。
+
+### 9.5 后续第二刀：`--check` 收编（2026-11-04 深夜）
+
+`CheckpointDecl` 的两个 impl 改为**源的事实载体**：
+
+- `HfFacts`（`crates/models/src/formats/model_source.rs`）= `ModelSpec::from_ckpt`
+  + `SpecReport`（本次扩展：`max_pos` / `has_vision_cfg` / `has_image_token` /
+  `mtp_layers`）；`HfDirSource` 持有一份、`--check` 直接用同一结构。
+- `GgufFacts` = `GgufSource` 的 `spec` + `spec_report` + `rope_facts`（同一次
+  `spec_from_gguf`；`GgufSource` 新增 `spec_report()` 存读取账）。
+- `decl.rs` 的 `HfDecl` / `GgufDecl`（约 230 行）删除；`open_decl` 只剩分派。
+- `--check` 现在会打印 `· mtp=N`（N>0）；这是相对 §9.2 "逐字不变"的**唯一
+  有意增量**（27B AWQ / IQ4_XS 各 1 层 NextN）。
+- 顺手修：engine 的 tokio `macros` feature（P0）、两段死守卫、GGUF rope 错误文案。
+
+性能：GGUF 开箱少一次 `spec_from_gguf`；热态中位 `load` 7.23s（基线 7.44）、
+`assemble` 7.47s（基线 7.75）；AWQ+spec `load` 7.99s（基线 7.73，×1.034）。
+
+### 9.6 第三刀（2026-11-05）：`--check` 与 boot 同源 + 两条安全门
+
+review `apps/server` 配置/检查面时发现三处"检查与启动不一致 / 配置说谎"：
+
+| # | 问题 | 修法 |
+|---|---|---|
+| 1 | `--check` 按 `path.is_file()` 猜源，boot 按 `load_arm_of(format, quant)` ⇒ `format=awq` + `.gguf` 路径"检查通过、启动失败"（反向同理） | `DeclSource` + `LoadArm::decl_source()`；`open_decl(path, src)`；HF 档遇文件 / GGUF 档遇目录都**响亮拒** |
+| 2 | `--check` 不跑旋钮能力门：GGUF + `head_quant`/`embed_quant` 检查通过、boot 拒 | `LoadIntent::check_arm(arm)` + 共享 `check_keyed_overrides`（与 `GgufFileSource::build_model` **同一份文案**） |
+| 3 | `[model.rope]` 在 HF/AWQ 档静默无效；HF rope 表长 262144，`max_seq` 超表时 `owl_rope_*` 按 `pos` 直索引 cos/sin ⇒ **设备 OOB** | `OwlConfig::validate` 拒非 GGUF 的 `yarn_factor > 1`；`build_hf_rope` 在 `max_seq > 表长` 时装载期响亮拒（先于池分配） |
+
+**验证矩阵**（全部实跑）：
+
+- 正常 AWQ / GGUF `--check` 输出不变（除既有 `· mtp=N`）；
+- AWQ 档 + `.gguf` 路径 → `FAIL: HF/AWQ 档的 model.path 必须是目录…`；
+- GGUF 档 + AWQ 目录 → `FAIL: 是目录；GGUF 是单文件格式…`；
+- GGUF + `head_quant=rtn-int8-row` → `FAIL`（与 boot 同文案）；
+- AWQ + `[model.rope] yarn_factor=2` → 配置拒启；
+- `runtime.max_seq=262145`（HF）实机 boot → **装载期**拒启：
+  `max_seq=262145 > HF rope 表长=262144`（exit 1，先于 KV 池）；
+- 单测：`owl-shared` 129 / `owl-models` 324 / `owl-engine` CPU 221 全绿；
+  `cargo check --workspace --all-targets` 0 error。
+
+### 9.7 第四刀（2026-11-05）：`formats/load.rs` 开箱面
+
+review 附属件装载入口（视觉塔 / MTP 头 / DFlash2 草稿）时发现：
+
+| # | 问题 | 处理 |
+|---|---|---|
+| 1 | `[load]` 旋钮映射有 **4 份**：主干 loader、`spec_runtime::draft_load_opts`、视觉塔、件测试辅助；其中 `draft_load_opts` 用 `if let Ok(..)` **吞掉非法 repack** | `LoadOpts::with_cfg(&LoadCfg)` 成为唯一映射点（四项旋钮 + repack 三态；非法值响亮拒）；`draft_load_opts` 改 `Result` 并 `?` 上抛；主干/视觉改用 |
+| 2 | `load_from_dir` 把「探测 → 开源源 → 执行」焊在一起，调用方无法只取源；主模型已走 `ModelSource`，附属件仍是一次性入口 | 拆出 `open_source(path, kind, &opts)`（host 源 + `ShardSel`/repack 注入）；`load_from_dir` = `detect` + `open_source` + `load_component`；文档明示它只是**一次性组件入口** |
+| 3 | `dflash2_draft` 先 `detect`，随后 `load_from_dir` 再 `detect`（草稿索引 ~81 项，多一次 mmap/扫描） | **保留**（一次性路径，~ms 级）；要彻底消除需让 drafter 返回 `CheckpointKind` 再走 `open_source` —— 收益不抵接口面积，写在此备忘 |
+
+**验证**（各路径都实跑）：
+
+- AWQ + DFlash2：起机 + 生成（`load_from_dir` HF 草稿）；
+- MTP × HF（AWQ 检查点自带头）：`MTP 草稿头装载(HF/AWQ;权重=F16)` + 生成；
+- MTP × GGUF（IQ4_XS 的 `blk.64.nextn`）：`MTP 草稿头装载(GGUF;权重=原生块)` + 生成；
+- GGUF + mmproj：起机 + 生成（视觉走 `load_component`）；
+- 单测：`owl-models` 325（+1 `with_cfg`）/ `owl-shared` 129；`owl-engine` CPU 221；
+  `cargo check --workspace --all-targets` 0 error；
+- 装载性能：`awq-spec` `load 7.94s` / GGUF `load 7.62s`（同前噪声带，无回归）。
+
+### 9.8 第五刀（2026-11-05）：`spec_runtime` 守卫面
+
+review `load_spec_runtime` 的 boot 守卫链（模式裁决后约 200 行校验）：
+
+**发现（真缺陷）**：`q_host` / `q_dump` **缺族门**。
+
+- `q_dump` 在 `exec::spec::dump_q_calibration` 里遇到 `q=None` 直接 return ⇒
+  MTP/Off 档写 `q_dump = "/tmp/x"` 是**静默 no-op**（用户以为有 JSONL，实际没有）；
+- `q_host` 缺省 **true**（所有模式），所以只能拦"显式关掉"用在非 DFlash2 档；
+- 与 GGUF 的 `head_quant` 静默忽略同一类"配置说谎"。
+
+**修法**：把 q 旋钮的校验收成纯函数 `check_q_knobs(mode, α, ε, host, dump)`：
+
+| 规则 | 行为 |
+|---|---|
+| α 有限且 >0；ε ∈ [0,1) | 值域拒启（原样迁入） |
+| 非默认 α/ε 且 mode ≠ DFlash2 | 拒（原样） |
+| `q_host = false` 且 mode ≠ DFlash2 | **新增拒**（缺省 true 不消费；显式关 = 说谎） |
+| `q_dump` 非空且 mode ≠ DFlash2 | **新增拒** |
+| `q_dump` 非空且 `q_host = false` | **新增拒**（没有 q 可 dump） |
+
+新增 `q_knob_tests::q_knobs_validate_value_and_family`（11 条断言，覆盖四模式 ×
+缺省/调参/显式关/dump）。
+
+**保留 inline 的其余守卫**（adaptive / lookup / dflash_walk / mtp_window /
+mtp_ring）：每条都带**值域谓词 + 定制文案 + 顺序语义**，泛化成"表"只会把
+`depth_min < depth` / `sink < window` 这类谓词塞进闭包，收益不抵可读性；
+q 这一族是唯一有"值域 + 族门"同构重复的，故只抽它。
+
+**验证**：
+
+- 单测：`owl-engine` CPU **222**（+1 q 矩阵）；
+- 实机负例：MTP 档 + `--set spec.q_dump=/tmp/q.jsonl` ⇒ 装载期（spec boot）
+  `exit 1`，点名"只服务 DFlash2，但当前模式 = Mtp"；
+- 正常 MTP HF/GGUF、DFlash2、GGUF+vision 起机 + 生成照旧通过；
+- `cargo check --workspace --all-targets` 0 error。

@@ -236,7 +236,14 @@ impl ModelLoader {
 - 负例:GGUF + `model.head_quant="rtn-int8-row"` ⇒ **boot 拒**并点名修法;
 - workspace check 0 error;owl-models 316 / owl-shared 127 / engine config 全绿。
 
-### 3.3c 装载器第三步(未做):`ModelSource` 统一流
+### 3.3c 装载器第三步(`ModelSource` 统一流;2026-11-04 已落地)
+
+> **状态**:S1/S2/S3 一次落;`loader.rs` 857 → 675 行,`ModelSource` 753 行
+> (含 6 条纯 host 单测)。实测三档 `load/assemble/key loop` 全在基线 ×1.05
+> 内,行为门(起机 + 生成 + `--check` 逐字 + models 322 全绿)通过。
+> **细节、性能表与遗留**见
+> [`loader-refactor-ModelSource-设计-2026-11-04.md`](loader-refactor-ModelSource-设计-2026-11-04.md)
+> §9(完成实录)。
 
 **已出交接卷**:[`loader-refactor-ModelSource-设计-2026-11-04.md`](loader-refactor-ModelSource-设计-2026-11-04.md)
 —— 含现状地图(S1-S3 分阶段)、目标接口、**装载性能基线**(AWQ+spec / AWQ / GGUF
@@ -267,3 +274,62 @@ trait ModelSource { fn spec(&self) -> ModelSpec; fn plan(&self) -> QuantPlan;
 3. **按能力选臂**,不按格式身份(`supports_*`,不是 `is_int8()`)。
 4. **决策与执行分离**:决策是纯函数(可单测矩阵),执行体只跑不判。
 5. 新增一档 = **加表项/加列**(改 1 处),不是回去巡检 7 处谓词。
+
+### 3.3d `--check` 收编到源(2026-11-04 深夜,第二刀)
+
+**动机**:§3.3 的 `CheckpointDecl` 虽已是单一路径,但两个 impl(`HfDecl` /
+`GgufDecl`)仍各持一套解析器 —— 与装载器是**第三份事实**。本刀把 impl 直接
+落在源的事实载体上。
+
+| 变化 | 前 | 后 |
+|---|---|---|
+| HF 声明 | `HfDecl` 手读 `config.json`(只读配置) | `HfFacts` = `ModelSpec::from_ckpt` + `SpecReport`(config↔形状同一套) |
+| GGUF 声明 | `GgufDecl` 读 KV + `rope_facts`(再开文本容器) | `GgufFacts` = `GgufSource` 的 `spec/spec_report/rope`(**同一次解析**) |
+| `decl.rs` 行数 | 340 | **181**(删两个 struct 及其 impl) |
+| `--check` 的 MTP | `DraftDecl` 空转(永远 0) | `SpecReport.mtp_layers`(`mtp.layers.<n>` 去重)⇒ 打印 `· mtp=N` |
+| 装载路径 GGUF 开箱 | `spec_from_gguf` 解析两次 | **一次**(`GgufSource` 存 `GgufSpecReport`) |
+
+**输出**:三档(27B AWQ / int8 / GGUF IQ4_XS)除新增 `· mtp=N` 外**逐字不变**;
+负例(`[vision] path` on HF)文案不变。实测:27B AWQ `mtp=1`、IQ4_XS `mtp=1`
+(两者都自带 NextN 头,`--check` 以前完全看不见)。
+
+**顺带修掉的确定缺陷**:
+
+1. **P0** `owl-engine` lib 的 tokio 依赖缺 `macros`,但 `parallel/tp.rs` 用
+   `tokio::join!` ⇒ `cargo check -p owl-engine --lib` 必炸(此前靠 server 的
+   feature 合并救活)。已补 `macros`(dev-dep 同步去重)。
+2. **P1** `load_vision_into` / `load_vision_gguf` 的 mmproj/vision 前置守卫
+   在源接口化后已不可达,删除(改由 `VisionSource` 的构造前置保证)。
+3. **P2** `build_gguf_rope` 的 YaRN 错误文案里的脏换行/空格已清。
+
+**验证**:`owl-models` 322 全绿;`cargo check -p owl-engine --lib` 通过;
+workspace `--all-targets` 0 error;AWQ+DFlash2 / GGUF+mmproj 起机 + 出词;
+性能(热态中位):AWQ spec load 7.99s(基线 7.73,×1.034)、GGUF load 7.23s
+(基线 7.44,×0.972)—— 在 §5.3 硬门内,GGUF 视觉塔分相方差 ±0.4s 照旧。
+
+### 3.5 配置面一致性（2026-11-05 review）
+
+`--check` 与 boot 的**源判定/能力门**收成同一套（细节见
+[`loader-refactor-ModelSource-设计`](loader-refactor-ModelSource-设计-2026-11-04.md) §9.6）：
+
+1. `--check` 的源族由 `LoadArm::decl_source()` 决定（不再 `path.is_file()` 猜）；
+2. GGUF 的 head/embed 覆盖门在 `--check` 也跑（`LoadIntent::check_arm`，与装载器
+   共用 `check_keyed_overrides`）；
+3. `[model.rope]` 非 GGUF 档 = 配置拒启；HF 档 `max_seq > rope 表长` = 装载期
+   响亮拒（防 `owl_rope_*` 的 pos 直索引 OOB）。
+
+### 3.6 附属件开箱面（2026-11-05 review）
+
+- `[load]` 配置 → `LoadOpts` 的唯一映射 = `LoadOpts::with_cfg`（此前 4 处手拼，
+  草稿路径还吞非法 `repack` 的错）；`draft_load_opts` 改 `Result` 上抛。
+- `load_from_dir` 拆出 `open_source(path, kind, &opts)`：探测 / 开源 / 执行分离；
+  `load_from_dir` 明确为**一次性组件入口**（视觉塔/MTP/草稿/测试），主模型走
+  `ModelSource`（源只开一次）。细节与保留项见
+  [`loader-refactor-ModelSource-设计`](loader-refactor-ModelSource-设计-2026-11-04.md) §9.7。
+
+### 3.7 spec 守卫面（2026-11-05 review）
+
+`q_host`/`q_dump` 缺族门（MTP/Off 写 `q_dump` 是静默 no-op）⇒ 抽出纯函数
+`check_q_knobs` + 四模式矩阵测试；其余 adaptive/lookup/walk/mtp_window/mtp_ring
+守卫保留 inline（值域谓词/定制文案/顺序语义，泛化表会丢信息）。
+细节见 [`loader-refactor-ModelSource-设计`](loader-refactor-ModelSource-设计-2026-11-04.md) §9.8。
