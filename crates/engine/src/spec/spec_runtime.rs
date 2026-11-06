@@ -338,6 +338,55 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) base_env: owl_models::env::EnvProvider,
 }
 
+/// **q 校准旋钮的族门**(纯函数;单测锚)。
+///
+/// - `q_alpha`/`q_floor` 值域:α 有限且 >0;ε ∈ [0,1);
+/// - 非默认值时只服务 DFlash2(其余模式不消费 q,写了 = 白跑 A/B);
+/// - `q_host` 缺省 **true**,所以只拦**显式关掉**(`false`)用在非 DFlash2 档;
+/// - `q_dump` 非空只服务 DFlash2,且需要 `q_host = true`(否则 dump 拿不到 q,
+///   是静默 no-op —— `dump_q_calibration` 在 `q=None` 时直接返回)。
+fn check_q_knobs(
+    mode: SpecMode,
+    q_alpha: f32,
+    q_floor: f32,
+    q_host: bool,
+    q_dump: &str,
+) -> Result<()> {
+    if !(q_alpha.is_finite() && q_alpha > 0.0) {
+        return Err(ModelError::Msg(format!(
+            "[spec] q_alpha={q_alpha} 非法（需有限且 > 0；1.0 = 原律）"
+        )));
+    }
+    if !(q_floor.is_finite() && (0.0..1.0).contains(&q_floor)) {
+        return Err(ModelError::Msg(format!(
+            "[spec] q_floor={q_floor} 非法（需 ∈ [0,1)）"
+        )));
+    }
+    if (q_alpha != 1.0 || q_floor != 0.0) && mode != SpecMode::DFlash2 {
+        return Err(ModelError::Msg(format!(
+            "[spec] q_alpha/q_floor 只服务 DFlash2，但当前模式 = {mode:?}"
+        )));
+    }
+    if !q_host && mode != SpecMode::DFlash2 {
+        return Err(ModelError::Msg(format!(
+            "[spec] q_host = false 只服务 DFlash2（当前模式 = {mode:?}；缺省 true 不消费,但显式关掉 = 配置说谎）"
+        )));
+    }
+    if !q_dump.is_empty() {
+        if mode != SpecMode::DFlash2 {
+            return Err(ModelError::Msg(format!(
+                "[spec] q_dump = {q_dump:?} 只服务 DFlash2，但当前模式 = {mode:?}"
+            )));
+        }
+        if !q_host {
+            return Err(ModelError::Msg(
+                "[spec] q_dump 需要 q_host = true（q_host 关时没有 q 可 dump）".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// **E5-M2b/C7:spec 模式三态裁决** + 草稿器装载(草稿 embed/lm_head
 /// 均共享 target 不持有)+ DFlash2 草稿 rope(θ 1e7,rotary 全维 128;
 /// z-lab 检查点家族)。
@@ -489,24 +538,10 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     }
     // **q 校准旋钮只服务 DFlash2**（2026-11-03）：只影响接受率，不影响分布正确性。
     // 非法值 = boot 拒（不静默忽略：落错族/落错值就是白跑 A/B）。
-    if !(inp.q_alpha.is_finite() && inp.q_alpha > 0.0) {
-        return Err(ModelError::Msg(format!(
-            "[spec] q_alpha={} 非法（需有限且 > 0；1.0 = 原律）",
-            inp.q_alpha
-        )));
-    }
-    if !(inp.q_floor.is_finite() && (0.0..1.0).contains(&inp.q_floor)) {
-        return Err(ModelError::Msg(format!(
-            "[spec] q_floor={} 非法（需 ∈ [0,1)）",
-            inp.q_floor
-        )));
-    }
-    if (inp.q_alpha != 1.0 || inp.q_floor != 0.0) && mode != SpecMode::DFlash2 {
-        return Err(ModelError::Msg(format!(
-            "[spec] q_alpha/q_floor 只服务 DFlash2，但当前模式 = {:?}",
-            mode
-        )));
-    }
+    // 块实现收在 `check_q_knobs`（纯函数,单测锚）——含 q_host/q_dump 的族门：
+    // 旧实现漏了这两条 ⇒ MTP/Off 档写 `q_dump` 是**静默 no-op**（dump 函数在
+    // `q=None` 时直接返回），与 GGUF head_quant 静默忽略同一类配置说谎。
+    check_q_knobs(mode, inp.q_alpha, inp.q_floor, inp.q_host, &inp.q_dump)?;
     if inp.q_alpha != 1.0 || inp.q_floor != 0.0 {
         owl_shared::log_info!(
             "boot",
@@ -675,7 +710,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     false,
                 )
             };
-            let mut opts = draft_load_opts(face, owl_models::contract::Dtype::F16, inp.tp, &inp.load);
+            let mut opts = draft_load_opts(face, owl_models::contract::Dtype::F16, inp.tp, &inp.load)?;
             // 原生块路径:源直接给压缩块字节(槽 U8),不再走 host 解量化
             opts.gguf_dequant = is_gguf && !native_blocks;
             owl_models::formats::load::load_from_dir(dir, face, &mtp, opts).await?;
@@ -718,7 +753,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     gs.block, gs.conv_taps, gs.conv_group, gs.rank, gs.top_k, gs.mask_token
                 );
                 let d2 = boot.draft(draft_dt, inp.draft_kv_dt)?;
-                let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
+                let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load)?;
                 let manifest = boot.load(face, &d2, opts).await?;
                 owl_models::formats::load::manifest_mem_ledger(&manifest, "draft-mem");
                 dflash_tap_ids = std::sync::Arc::new(gs.tap_ids.clone());
@@ -743,7 +778,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
                     }
                     _ => owl_models::formats::qwen35::dflash2_draft(path, inp.draft_kv_dt)?,
                 };
-                let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load);
+                let opts = draft_load_opts(face, draft_dt, inp.tp, &inp.load)?;
                 let draft_manifest =
                     owl_models::formats::load::load_from_dir(path, face, &d2, opts).await?;
                 owl_models::formats::load::manifest_mem_ledger(&draft_manifest, "draft-mem");
@@ -933,24 +968,19 @@ fn draft_load_opts<D: DeviceClient>(
     dtype: owl_models::contract::Dtype,
     tp: Option<owl_models::plan::tp::TpPlan>,
     load: &owl_shared::config::LoadCfg,
-) -> owl_models::formats::load::LoadOpts {
-    let mut base = owl_models::formats::load::LoadOpts::new(face, dtype);
-    // **与主干 loader 同源**(一处配置两处消费)
-    base.verify = load.verify;
-    base.debug_tap = load.debug_tap;
-    base.staging_mb = load.staging_mb;
-    base.dump = load.dump;
-    if let Ok(Some(dev)) = load.repack_device() {
-        base.device_repack = Some(dev);
-    }
-    match tp {
+) -> Result<owl_models::formats::load::LoadOpts> {
+    // **与主干 loader 同源**(一处配置两处消费;`with_cfg` 是唯一映射点)。
+    // 旧实现用 `if let Ok` 吞掉非法 repack —— 配置面已校验,但直接构造
+    // `EngineKnobs` 的测试/工具面会静默按 auto 跑;现在响亮上抛。
+    let base = owl_models::formats::load::LoadOpts::new(face, dtype).with_cfg(load)?;
+    Ok(match tp {
         Some(tp) if !tp.is_single() => owl_models::formats::load::LoadOpts {
             shard: tp.world(),
             slice_id: tp.rank(),
             ..base
         },
         _ => base,
-    }
+    })
 }
 
 /// **草稿 spec 分片**(P2.1-a;纯函数委托 —— 形状单源在
@@ -965,6 +995,34 @@ fn shard_draft_plan(
     }
 }
 
+
+#[cfg(test)]
+mod q_knob_tests {
+    use super::*;
+
+    /// q 旋钮:值域 + 族门 + `q_dump` 对 `q_host` 的依赖。
+    #[test]
+    fn q_knobs_validate_value_and_family() {
+        // 缺省(q_host=true)在任何模式都合法
+        for m in [SpecMode::Off, SpecMode::Mtp, SpecMode::DFlash2, SpecMode::Dumb] {
+            assert!(check_q_knobs(m, 1.0, 0.0, true, "").is_ok(), "{m:?} 缺省应放行");
+        }
+        // 值域
+        assert!(check_q_knobs(SpecMode::DFlash2, 0.0, 0.0, true, "").is_err());
+        assert!(check_q_knobs(SpecMode::DFlash2, f32::NAN, 0.0, true, "").is_err());
+        assert!(check_q_knobs(SpecMode::DFlash2, 1.0, 1.0, true, "").is_err());
+        // 非默认 q 校准只服务 DFlash2
+        assert!(check_q_knobs(SpecMode::Mtp, 1.5, 0.0, true, "").is_err());
+        assert!(check_q_knobs(SpecMode::Off, 1.0, 0.2, true, "").is_err());
+        // q_host 显式关:只服务 DFlash2
+        assert!(check_q_knobs(SpecMode::Mtp, 1.0, 0.0, false, "").is_err());
+        assert!(check_q_knobs(SpecMode::DFlash2, 1.0, 0.0, false, "").is_ok());
+        // q_dump:只服务 DFlash2,且需要 q_host
+        assert!(check_q_knobs(SpecMode::Mtp, 1.0, 0.0, true, "/tmp/q.jsonl").is_err());
+        assert!(check_q_knobs(SpecMode::DFlash2, 1.0, 0.0, false, "/tmp/q.jsonl").is_err());
+        assert!(check_q_knobs(SpecMode::DFlash2, 1.0, 0.0, true, "/tmp/q.jsonl").is_ok());
+    }
+}
 
 #[cfg(test)]
 mod adaptive_depth_tests {
