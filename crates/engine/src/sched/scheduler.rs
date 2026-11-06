@@ -574,7 +574,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             Ok(row) => row,
             Err(e) => {
                 // 行耗尽是"拒绝启动"而非"引擎故障"——准入账已登记，必须收口。
-                self.rollback_failed_start(turn.id);
+                // 此刻**没有拿到行**（borrow 失败），传 None。
+                self.rollback_failed_start(turn.id, None);
                 return Err(e.into());
             }
         };
@@ -584,7 +585,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let row_grant = match self.bank.rel.reserve_row(turn.id) {
             Ok(g) => g,
             Err(e) => {
-                self.rollback_failed_start(turn.id);
+                self.rollback_failed_start(turn.id, Some(gdn_row));
                 return Err(e.into());
             }
         };
@@ -663,7 +664,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let (cached_len, restore_key, pending_loads, image_exec, lazy_view) = match prep {
             Ok(v) => v,
             Err(e) => {
-                self.rollback_failed_start(turn.id);
+                self.rollback_failed_start(turn.id, Some(gdn_row));
                 return Err(e);
             }
         };
@@ -774,8 +775,27 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// `start_one` 已借的一切（准入账 / Grant / GDN 行）都经 store 的
     /// **单一围栏** `close_admission → Rel::finish_turn` 一次归还 ——
     /// 不逐项手还，避免"漏还一项"的经典半态（2026-11-06 真机 3080）。
-    fn rollback_failed_start(&mut self, turn_id: u64) {
+    /// `gdn_row = None` = 行还没借到（`borrow_row` 失败）；`Some` = 行已借出。
+    ///
+    /// **先走准入收口**：HEAD 版 `close_admission` 还 Grant + 准入账；
+    /// 若 store 侧升级成 `finish_turn` 单一围栏（Grant+准入+行一次还），
+    /// 行也会被它收走。随后再补一次 `return_row`：
+    /// - HEAD：行在这里还（幂等成立）；
+    /// - `finish_turn` 已还：拿到"重复归还"错误，按 debug 忽略（不是故障）。
+    /// 两版引擎都能自洽；等 store 单一围栏提交后再删掉这次补还。
+    fn rollback_failed_start(&mut self, turn_id: u64, gdn_row: Option<usize>) {
         self.close_admission(turn_id);
+        if let Some(row) = gdn_row {
+            if let Err(e) = self.bank.rel.state.return_row(row, None) {
+                owl_shared::log_debug!(
+                    "sched",
+                    "start_one 回滚:GDN 行已由准入围栏收走(turn {turn_id}, row {row}): {e}"
+                );
+            }
+        }
+        if let Err(e) = self.sync_pool_account() {
+            owl_shared::log_warn!("sched", "start_one 回滚后账同步失败(turn {turn_id}): {e}");
+        }
     }
 
     /// **Fresh 起跑**(零复用):释放旧块表/旧 MTP 链 + 会话账归零。
