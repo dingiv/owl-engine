@@ -178,6 +178,8 @@ kv_dtype = "fp8"
 #   prefix_cache=true  → cap(整池可被前缀缓存持有,新请求逐出到 host/disk)
 # 并发上限(每活跃会话一格 GDN 状态;0 = 自动 = runtime.max_concurrency)
 gdn_slots = 1
+# 前缀缓存开/关
+prefix_cache = true
 # 末段页对齐(前缀复用闭环;单块档多切一刀)
 prefill_align_tail = true
 # 生成相位页边界快照页步长(0 = 关)
@@ -218,8 +220,6 @@ vram_reserve_mb = 256
 transient_reserve_mb = 1024
 # 显存硬上限 MiB(留空 = 只按驱动账判)
 vram_budget_mb = 0
-# 前缀缓存开/关
-prefix_cache = true
 # 解释器块池预算(字节;0 = 关)
 block_pool_bytes = 0
 # 关活性中途回收(诊断;开会无界常驻)
@@ -289,6 +289,26 @@ tp_draft = false
 # m=0 连击降级阈值(0 = 禁用)/ 降级后的探测窗口(tokens)
 degrade_after = 6
 probe_every = 8
+
+# ---------------------------------------------------------------------------
+# [vision] —— 视觉面
+# ---------------------------------------------------------------------------
+# 视觉相关的四件事收编在此(原散在 [model]/[server]/[pool]):
+#   enabled/path     视觉塔开关与权重(空 = 检查点内置 model.visual.*;
+#                    GGUF 档 = 同目录唯一 mmproj-*.gguf)
+#   max_pixels       图像预处理 `smart_resize` 封顶(0 = 4096² = 实际不缩)。
+#                    图像 token 数 ∝ 像素:1920×1088 ⇒ 646 tok / 2560×1440 ⇒ 1160 tok;
+#                    真实 GUI agent 每轮 +1 张截图 ⇒ 每 100 tok ≈ 135 ms prefill(135k)。
+#   image_evict      前缀无感删除(图像段;leave-gap):客户端给图打 `owl_evict`
+#                    ⇒ 段落页对齐 + 删除即位置帧平移,不转 K/不动幸存 token;
+#                    需 [pool] prefix_cache + 分页 KV。缺省关 = 逐字节旧行为。
+#   image_evict_pad  删除段的页对齐 pad 词(必须恰 1 token;空 = 自动 `。`→` `→`\n`)。
+[vision]
+enabled = false
+path = ""
+max_pixels = 0
+image_evict = false
+image_evict_pad = "。"
 
 # ---------------------------------------------------------------------------
 # [sampling] —— 采样
@@ -468,23 +488,3 @@ tags_deny = []
 max_mb = 0
 keep = 0
 timestamp = false
-
-# ---------------------------------------------------------------------------
-# [vision] —— 视觉面
-# ---------------------------------------------------------------------------
-# 视觉相关的四件事收编在此(原散在 [model]/[server]/[pool]):
-#   enabled/path     视觉塔开关与权重(空 = 检查点内置 model.visual.*;
-#                    GGUF 档 = 同目录唯一 mmproj-*.gguf)
-#   max_pixels       图像预处理 `smart_resize` 封顶(0 = 4096² = 实际不缩)。
-#                    图像 token 数 ∝ 像素:1920×1088 ⇒ 646 tok / 2560×1440 ⇒ 1160 tok;
-#                    真实 GUI agent 每轮 +1 张截图 ⇒ 每 100 tok ≈ 135 ms prefill(135k)。
-#   image_evict      前缀无感删除(图像段;leave-gap):客户端给图打 `owl_evict`
-#                    ⇒ 段落页对齐 + 删除即位置帧平移,不转 K/不动幸存 token;
-#                    需 [pool] prefix_cache + 分页 KV。缺省关 = 逐字节旧行为。
-#   image_evict_pad  删除段的页对齐 pad 词(必须恰 1 token;空 = 自动 `。`→` `→`\n`)。
-[vision]
-enabled = false
-path = ""
-max_pixels = 0
-image_evict = false
-image_evict_pad = "。"
