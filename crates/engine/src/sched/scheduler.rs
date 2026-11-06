@@ -632,11 +632,9 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 后面由 `execute_prefill` 逐 chunk 增量长(用到哪长到哪);
             // 腾位归召回点的驻留调和。
             {
-                let s = self
-                    .bank
-                    .sessions
-                    .get_mut(turn.session_id)
-                    .expect("submit 已建会话账");
+                // 会话账缺失 = 内部不变量失守 ⇒ 显式 Err 上抛到泵循环
+                // （长驻服务禁 panic；F-24）。
+                let s = self.bank.sessions.session_mut(turn.session_id)?;
                 let target = if self.boot.cfg.knobs.kvmem_virtualization {
                     Self::prefill_step_chunk_msg(
                         0,
@@ -793,11 +791,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         Vec<(usize, owl_store::ChainHash)>,
         Option<LazySeed>,
     )> {
-        let s = self
-            .bank
-            .sessions
-            .get_mut(turn.session_id)
-            .expect("submit 已建会话账");
+        let s = self.bank.sessions.session_mut(turn.session_id)?;
         let mut table = std::mem::take(&mut s.block_table);
         self.bank.rel.leg.release_table(&mut table)?;
         let mut mold = std::mem::take(&mut s.mtp_block_table);
@@ -1153,11 +1147,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         Vec<(usize, owl_store::ChainHash)>,
         Option<LazySeed>,
     )> {
-        let s = self
-            .bank
-            .sessions
-            .get_mut(turn.session_id)
-            .expect("submit 已建会话账");
+        let s = self.bank.sessions.session_mut(turn.session_id)?;
         let positioned = s.positioned;
         if self.dev.pool.geom.paged {
             // 前缀缓存匹配(先匹配后释放旧链;内容寻址 = 跨会话)。

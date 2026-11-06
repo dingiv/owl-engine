@@ -49,6 +49,8 @@ reasoning_effort = ""
 # [runtime] —— 引擎运行时(上下文 / 调度 / 准入 / 会话缺省)
 # ---------------------------------------------------------------------------
 [runtime]
+# 会话表软上限(0 = 不限;>0 = 新请求前按 LRU 淘汰空闲会话)
+max_sessions = 0
 # 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
 admission_on_full = "reject"
 # 自动挑卡的空闲显存阈值(0..1;低于它就跳过该卡)

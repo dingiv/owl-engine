@@ -438,6 +438,79 @@ async fn failed_start_returns_gdn_row() {
     );
 }
 
+/// 通用 CPU mock 引擎（自定义 knobs；F-22 用例等）。
+#[cfg(test)]
+async fn mock_engine_with(
+    knobs: EngineKnobs,
+) -> RunningEngine<owl_iface::handle::DeviceHandle<owl_cpu::CpuFace>> {
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 256,
+        prefill_chunk: 32,
+        knobs,
+    };
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
+    engine.run(loaded).await.expect("装配")
+}
+
+/// **F-22 回归门**：`[runtime] max_sessions > 0` 时，新请求前按 LRU 淘汰
+/// **空闲**会话；活跃/排队会话不动，被淘汰的只是 host 账（下轮全量重算）。
+#[cfg(test)]
+#[tokio::test]
+async fn session_cap_evicts_lru_idle() {
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 1,
+        gdn_slots: 1,
+        min_gen_tokens: 1,
+        max_sessions: 2,
+        ..Default::default()
+    };
+    knobs.pool_tokens = Some(256);
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = 1;
+    let mut running = mock_engine_with(knobs).await;
+
+    for sid in 1u64..=3 {
+        let (_s, tid) = running
+            .submit_session_opts(Some(sid), "hello", 1, Default::default())
+            .expect("submit");
+        loop {
+            match running.pump().await.expect("pump") {
+                ev @ (TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. })
+                    if turn == tid =>
+                {
+                    assert!(matches!(ev, TurnEvent::Completed { .. }), "turn 应完成：{ev:?}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            running.bank.sessions.len() <= 2,
+            "会话表应被软上限约束（sid={sid}, len={}）",
+            running.bank.sessions.len()
+        );
+    }
+    assert!(
+        running.bank.sessions.get(1).is_none(),
+        "LRU 会话 1 应被淘汰"
+    );
+    assert!(running.bank.sessions.get(2).is_some(), "会话 2 应保留");
+    assert!(running.bank.sessions.get(3).is_some(), "会话 3 应保留");
+}
+
 /// **P2-2 图 slab 实测回填门**：GraphFleet 捕获后，MemoryPlan 的 GraphSlab
 /// 必须标为 `Measured`；WarmupMisc 仍保留 `Conservative`（瞬态上界语义不变）。
 #[cfg(test)]

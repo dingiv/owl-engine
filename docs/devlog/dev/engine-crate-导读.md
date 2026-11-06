@@ -358,14 +358,14 @@ V_avail          = v_card − weights − runtime_floor − gdn_row×gdn_slots �
 | F-23 | ✅ | `AgentSession::guard` 先校验 `cached_len <= tokens.len()`，失守按失配（回退全量）而不是切片 panic |
 | F-25 | ✅ | `pool_cap` 的 `ctx_max` 用真页宽（`pol.page`；legacy = 0），删除 `page_guess=32` |
 | F-20 | 🟡 注释 | 已在 `admission_gate` 与 `Admission::decide` 补"两段分工/顺序固定"注释；**状态机合并仍挂账**（改行为风险高） |
-| F-22 | ⏳ | `SessionTable` 无淘汰/`close_session` 无服务面调用；需单独设计（LRU/上限 + host token 预算） |
-| F-24 | ⏳ | 跨 `await` 的 `expect("判过")` 审计未逐条完成 |
+| F-22 | ✅ | 新增 `[runtime] max_sessions`（0 = 不限）；`enforce_session_cap` 在新请求前按 LRU 淘汰**空闲**会话（活跃/排队不动）；`SessionTable::{len,lru_victim_excluding}`；新增 `session_cap_evicts_lru_idle`（修复前 len=3，修复后 ≤2） |
+| F-24 | ✅ 主要 | 生产路径 5 处 `expect` 改为显式 `Result`/`if let`（3×`submit 已建会话账`、探测 `刚查过`、队列 `刚定位过`）；剩余 `expect` 均为测试 helper、`world==2` 前置门或 64B 固定头（结构上不可失败），已注明 |
 | F-26 | ⏳ | `FixedAfter` 未计 attention/XQA/FI 表等池后 scratch；S3，暂以 reserve 覆盖 |
 
 ### 验证
 
 ```bash
-cargo test -p owl-engine --lib -- --test-threads=1        # 227 passed
+cargo test -p owl-engine --lib -- --test-threads=1        # 228 passed
 cargo test -p owl-shared --lib -- --test-threads=1        # 130 passed
 cargo test -p owl-engine --test store_admission_gate -- --test-threads=1  # 7 passed
 cargo test -p server --bins -- --test-threads=1           # 104 passed / 1 known-skip

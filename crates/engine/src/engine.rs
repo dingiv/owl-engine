@@ -268,6 +268,9 @@ pub struct EngineKnobs {
     pub reserve_pages: usize,
     /// 等待队列上限(0 = 无界;超出 ⇒ 429 `no_slot`)
     pub max_queue: usize,
+    /// **会话表软上限**（`[runtime] max_sessions`；0 = 不限；F-22）。
+    /// 新请求进来前按 LRU 淘汰空闲会话（活跃/排队不淘汰）。
+    pub max_sessions: usize,
     /// **空转整理策略**(`[runtime] idle_compact`;缺省 false = 不预搬)。
     /// true = 池自由低于低水位时按高水位目标 compact。
     pub idle_compact: bool,
@@ -411,6 +414,7 @@ impl Default for EngineKnobs {
             min_gen_tokens: 256,
             reserve_pages: 0,
             max_queue: 0,
+            max_sessions: 0,
             idle_compact: false,
             pressure_low_pct: 12,
             pressure_high_pct: 25,
@@ -797,6 +801,7 @@ impl EngineKnobs {
             min_gen_tokens: cfg.runtime.min_gen_tokens,
             reserve_pages: cfg.runtime.reserve_pages,
             max_queue: cfg.runtime.max_queue,
+            max_sessions: cfg.runtime.max_sessions,
             idle_compact: cfg.runtime.idle_compact,
             pressure_low_pct: cfg.runtime.pressure_low_pct,
             pressure_high_pct: cfg.runtime.pressure_high_pct,

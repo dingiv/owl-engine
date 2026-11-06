@@ -49,6 +49,8 @@ path = "../models/bytkim/Qwen3.8-27B-pi-AWQ-INT4"
 quant = "w4a8"
 
 [runtime]
+# 会话表软上限(0 = 不限;>0 = 新请求前按 LRU 淘汰空闲会话)
+max_sessions = 0
 # 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
 admission_on_full = "reject"
 keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流

@@ -316,6 +316,29 @@ impl SessionTable {
             .map(|s| s.id)
     }
 
+    /// 会话数（会话表上限的判据；F-22）。
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    /// **LRU 淘汰候选（排除忙碌会话）**：`busy` 至少包含活跃/排队 turn 的
+    /// 会话 id；空闲会话才可被淘汰（设备表在 turn 收口已归还，淘汰只丢
+    /// host token 历史 ⇒ 下轮全量重算，正确性不变）。
+    pub fn lru_victim_excluding(
+        &self,
+        busy: &std::collections::HashSet<u64>,
+    ) -> Option<u64> {
+        self.sessions
+            .values()
+            .filter(|s| !busy.contains(&s.id))
+            .min_by_key(|s| s.last_use)
+            .map(|s| s.id)
+    }
+
     pub fn get(&self, id: u64) -> Option<&AgentSession> {
         self.sessions.get(&id)
     }

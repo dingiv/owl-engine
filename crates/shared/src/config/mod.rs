@@ -50,7 +50,7 @@
 //! | server | parse_tool_calls / tool_call_format / auto_disable_thinking_with_tools | 工具面(见字段注) |
 //! | server | template_path / reasoning_effort | Option / None(模板覆盖 / 思考档缺省) |
 //! | runtime | gpu_min_free_ratio | f64 / 0.9(自动挑卡的空闲占比阈值) |
-//! | runtime | max_concurrency / queue_wait_ms | usize / 8、0(服务面并发与排队超时) |
+//! | runtime | max_concurrency / max_sessions / queue_wait_ms | usize / 8、0、0(并发 / 会话表软上限 / 排队超时) |
 //! | runtime | implicit_session / default_max_new / max_new_cap | 会话面(见字段注) |
 //! | runtime | max_seq | usize / 4096 |
 //! | runtime | prefill_chunk / prefill_tail_merge | usize / 512、0 |
@@ -503,6 +503,14 @@ pub struct RuntimeCfg {
     /// **最大并发请求数**(在跑 + 排队;超出者排队等待)。须 ≤ `pool.gdn_slots`
     /// (每并发会话占一格 DDN 行)—— 启动校验不足即拒。
     pub max_concurrency: usize,
+    /// **会话表上限**（`[runtime] max_sessions`；0 = 不限；2026-11-05 F-22）。
+    ///
+    /// 键控会话（客户端任意 `session` 键）会长期留在 `SessionTable`，只增不减。
+    /// >0 ⇒ 新请求进来前按 LRU 淘汰**空闲**会话（不淘汰活跃/排队）；被淘汰的
+    /// 只是 host 侧 token 历史/链游标（设备表在 turn 收口已归还）⇒ 下轮全量
+    /// 重算，正确性不变。活跃会话数受限并发，故 cap 是"软上限"。
+    #[serde(default)]
+    pub max_sessions: usize,
     /// **隐式默认会话**(AGT-09):请求不带 `session` 键时落到会话 0。
     /// pi 每轮全量重发历史 ⇒ 前缀增量命中;false = 每请求临时会话。
     #[serde(default)]
@@ -2049,6 +2057,7 @@ impl Default for RuntimeCfg {
         Self {
             gpu_min_free_ratio: 0.9,
             max_concurrency: 8,
+            max_sessions: 0,
             implicit_session: false,
             default_max_new: 4096,
             max_new_cap: 8192,

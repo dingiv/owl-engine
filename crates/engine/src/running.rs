@@ -1190,6 +1190,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 ));
             }
         }
+        // **会话表软上限**（F-22）：在真正创建/复用会话前淘汰 LRU 空闲会话。
+        // 放在 tokenize 之前，避免被淘汰的请求白付 tokenizer 成本。
+        self.enforce_session_cap(session);
         let raw_ids = {
             // 诊断开关(knobs.raw_completion):裸续写,绕过 chat 模板 ——
             // 模型健康度鉴别(模板态病 vs 权重病)的 A/B 臂
@@ -1278,27 +1281,31 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // "assistant 轮边界" = 渲染/切分不对称;分叉在别处 = 客户端回填不同。
                 Some((id, cached, false)) => {
                     if self.boot.probes.debug {
-                        let s = self.bank.sessions.get(id).expect("刚查过");
-                        match s.first_divergence(&prompt_ids) {
-                            Some(i) => {
-                                let lo = i;
-                                let hi_old = (i + 8).min(s.tokens.len());
-                                let hi_new = (i + 8).min(prompt_ids.len());
-                                let (a, b) = (&s.tokens[lo..hi_old], &prompt_ids[lo..hi_new]);
-                                owl_shared::log_debug!(
+                        // 会话可被并发回收？单线程内不会；但这里仍按"可能缺失"
+                        // 处理，避免诊断分支 panic（F-24）。
+                        if let Some(s) = self.bank.sessions.get(id) {
+                            match s.first_divergence(&prompt_ids) {
+                                Some(i) => {
+                                    let lo = i;
+                                    let hi_old = (i + 8).min(s.tokens.len());
+                                    let hi_new = (i + 8).min(prompt_ids.len());
+                                    let (a, b) =
+                                        (&s.tokens[lo..hi_old], &prompt_ids[lo..hi_new]);
+                                    owl_shared::log_debug!(
+                                        "prefix",
+                                        "守卫失配 session={id} cached_len={cached} 首个分叉 idx={i} \
+                                         旧(已入 KV)={a:?} ⇒ {:?} ‖ 新(本轮)={b:?} ⇒ {:?}",
+                                        self.boot.tok.decode(a),
+                                        self.boot.tok.decode(b)
+                                    );
+                                }
+                                None => owl_shared::log_debug!(
                                     "prefix",
-                                    "守卫失配 session={id} cached_len={cached} 首个分叉 idx={i} \
-                                     旧(已入 KV)={a:?} ⇒ {:?} ‖ 新(本轮)={b:?} ⇒ {:?}",
-                                    self.boot.tok.decode(a),
-                                    self.boot.tok.decode(b)
-                                );
+                                    "守卫失配 session={id} cached_len={cached} 但前缀全同\
+                                     (长度不足?prompt={})",
+                                    prompt_ids.len()
+                                ),
                             }
-                            None => owl_shared::log_debug!(
-                                "prefix",
-                                "守卫失配 session={id} cached_len={cached} 但前缀全同\
-                                 (长度不足?prompt={})",
-                                prompt_ids.len()
-                            ),
                         }
                     }
                     0
@@ -1488,6 +1495,52 @@ impl<D: DeviceClient> RunningEngine<D> {
             .front()
             .filter(|t| t.id == id)
             .map(|t| t.id)
+    }
+
+    /// **会话表软上限收口**（F-22）：新请求前按 LRU 淘汰空闲会话。
+    ///
+    /// - `0` = 不限（旧行为）；
+    /// - 活跃/排队 turn 的会话**绝不淘汰**（避免把正在用的块链/快照打掉）；
+    /// - 淘汰只清 host 账 + 链票（空闲会话的设备表已在 turn 收口归还），
+    ///   下轮同 key 请求 = 新会话、全量重算 ⇒ 正确性不变；
+    /// - 全部会话都忙 ⇒ 允许暂时超过上限（软上限，活跃数另受并发栅门约束）。
+    fn enforce_session_cap(&mut self, protect: Option<u64>) {
+        let cap = self.boot.cfg.knobs.max_sessions;
+        if cap == 0 {
+            return;
+        }
+        let mut busy: std::collections::HashSet<u64> = self
+            .turns
+            .active
+            .iter()
+            .map(|a| a.session_id)
+            .chain(self.turns.queue.iter().map(|t| t.session_id))
+            .collect();
+        if let Some(p) = protect {
+            busy.insert(p);
+        }
+        let mut evicted = 0usize;
+        while self.bank.sessions.len() >= cap {
+            let Some(victim) = self.bank.sessions.lru_victim_excluding(&busy) else {
+                break;
+            };
+            // 失败也记入 busy，避免同一候选死循环；账房错误只 WARN（软上限）。
+            busy.insert(victim);
+            match self.bank.close(victim) {
+                Ok(()) => evicted += 1,
+                Err(e) => owl_shared::log_warn!(
+                    "session",
+                    "会话上限淘汰失败（session {victim:#x}，继续）：{e}"
+                ),
+            }
+        }
+        if evicted > 0 {
+            owl_shared::log_info!(
+                "session",
+                "会话表上限 {cap}：淘汰 {evicted} 个空闲会话（LRU；剩余 {}）",
+                self.bank.sessions.len()
+            );
+        }
     }
 
     /// 活跃 turn 数(B5.1 多活跃;服务面灌流测量读 —— 并发是否真进引擎)。
@@ -2989,7 +3042,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         let Some(pos) = self.turns.queue.iter().position(|t| t.id == turn_id) else {
             return Ok(()); // 已被别处取走(幂等)
         };
-        let t = self.turns.queue.remove(pos).expect("刚定位过");
+        let Some(t) = self.turns.queue.remove(pos) else {
+            return Ok(()); // 竞态下已被别处取走（幂等）
+        };
         self.drop_queued_turn(&t);
         owl_shared::log_warn!("store", "{why}（turn {turn_id}）");
         owl_shared::metrics::with_metrics_store(|m| {
