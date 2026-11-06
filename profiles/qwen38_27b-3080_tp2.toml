@@ -128,12 +128,14 @@ draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 # 前缀缓存必须开;宿主预算避免 Transient 快照顶掉 durable 边界)。
 # 27B agent prompt 实测 49k token 二次命中 99.9%(TTFT 37.9s→0.21s)。
 # **快照设备槽 3 个**(2026-11-03 随并发 2 上调;2026-10-31 前是 2)。
-# 规律:`snap_max ≥ max_concurrency + 1` —— 每个活跃 turn 的 `last_snap` 各占一格
-# (受 `snap_guard` 保护,逐不动),再留一格给"刚收口那条链的尾边界"。
-# 只有 2 格时,新一轮的第一个边界拍摄就会把上一轮刚发布的边界**挤到宿主**
-# (实测 `尾快照层=Host`,复用虽 100% 但要回灌 159MB/轮);3 格时它留在设备。
-# 显存代价 = +1 张 × 159MB(TP2 两 rank 各 79.6MB);boot 余量 ~3.2GiB/card,够。
-snap_max = 3
+# 规律:**2 并发用 6**(2026-11-06 双会话门实测:`snap_max=3` 时空闲会话的
+# 尾锚点会被另一会话的拍摄挤掉 ⇒ 下一轮复用面被迫裁到上一个快照
+# (命中 71.6% vs 期望 86%)；4 仍偶发,6 稳定。单并发 2 格仍是够的。
+# 每个活跃 turn 的 `last_snap` 各占一格(受 `snap_guard` 保护,逐不动)，
+# 再给**每个在场会话**留一格尾边界(空闲会话的锚点也必须活到下一轮)，
+# 最后留一格给"刚收口那条链的尾边界"。
+# 代价 = +1 张 × 159MB(TP2 两 rank 各 79.6MB);boot 余量 ~3.2GiB/card,够。
+snap_max = 6
 # GDN 状态格 = 每活跃 turn 一格;boot 门要求 `gdn_slots ≥ max_concurrency`,
 # 否则拒启(`parts/pool/fp8.toml` 里是 1 ⇒ 本档显式覆盖成 2)。
 gdn_slots = 2

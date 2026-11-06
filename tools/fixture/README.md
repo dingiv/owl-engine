@@ -8,6 +8,7 @@
 | 性能 / 分账 | `ctxladder.py`、`prefill-account.sh`、`prefill_account.py`、`nsys-decode-account.sh`、`nsys_decode_account.py`、`tp-ab-std.sh`、`vram_timeline.py` |
 | KVMem 门 | `kvmem_visibility_gate.py`、`kvmem_ttft_gate.py`、`kvmem_material_gate.py`、`kvmem_repro_sparse_prefill.sh`、`kv_footprint.py` |
 | GPU 探针 | `ar-*.cu`、`p2p-*.cu`、`vmm-*.cu`、`gdn-rec-probe.cu`、`nccl-ar-probe.cu`、`nvfp4/`(NVFP4 立项期判定集:算力天花板/布局校准/数值门/手写 GEMM 对照) |
+| 双会话并发 | `two_session_concurrency.py`（P0 冷启/P1 重发/P2 跨会话/P3 增长/P4 召回/P5 终局；主机+磁盘两层下沉与召回） |
 | 启动 / 跑批 | `serve-w4a16-3090.sh`、`run-agent-workload.sh`、`run-dflash-longctx-probe.sh`、`run-nsys-dflash.sh` |
 | 辅助 | `fixedtail_prompt.py`、`trunc_ckpt_layers.py`、`select_fingerprint.py`、`gen_third_party_licenses.py` |
 
