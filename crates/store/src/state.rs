@@ -138,6 +138,24 @@ impl StateStore {
         Ok(())
     }
 
+    /// **按归属还一行**（turn 终局单一围栏用；幂等）。
+    ///
+    /// 找不到该 owner 的行 = `Ok(None)`（已还/从未借）；同一 owner 至多一行。
+    pub fn release_row_of(&mut self, owner: Owner) -> StoreResult<Option<usize>> {
+        let row = self
+            .row_owners
+            .iter()
+            .find(|(_, o)| **o == owner)
+            .map(|(r, _)| *r);
+        match row {
+            Some(row) => {
+                self.return_row(row, None)?;
+                Ok(Some(row))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// 空闲行数。
     pub fn rows_free(&self) -> usize {
         self.rows_free.len()

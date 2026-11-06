@@ -62,6 +62,30 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(turn_id);
+        if turn_id == 0 {
+            // **归属不明 = 启动半态**（start_one 在 push 进 active 之前失败）。
+            // 引擎侧已无 turn 可弃，但 store 账里可能留着准入/Grant/行 ——
+            // 不收口就会永久占并发天花板。按"活跃集之外的准入条目 = 孤儿"收。
+            let live: Vec<u64> = self.turns.active.iter().map(|a| a.id).collect();
+            match self.bank.rel.finish_orphan_turns(&live) {
+                Ok(reps) if !reps.is_empty() => {
+                    for (t, r) in reps {
+                        owl_shared::log_warn!(
+                            "store",
+                            "孤儿 turn {t} 已收口（准入={} Grant={} 行={:?}）",
+                            r.admission,
+                            r.grants,
+                            r.row
+                        );
+                    }
+                    if let Err(e) = self.sync_pool_account() {
+                        owl_shared::log_warn!("store", "孤儿收口后账同步失败：{e}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => owl_shared::log_warn!("store", "孤儿 turn 收口失败：{e}"),
+            }
+        }
         TurnEvent::Failed { turn: turn_id, err }
     }
 
@@ -277,18 +301,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 准入状态机归还预留(幂等;complete/abandon/腿终局全走这里)
         self.turns.admission.note_finished(turn_id);
-        // **P0-4**：Grant 是 store 的账，准入收口也必须归还（store_hook::Release
-        // 正常路径已还；这里兜底排队取消 / 拒绝 / 早退路径，幂等）。
-        let released = self.bank.rel.release_turn_grants(turn_id);
-        if !released.is_empty() {
-            owl_shared::log_debug!(
+        // **store 单一围栏**：Grant + 准入账 + GDN 行一次归还（幂等）。
+        // 不在这里逐项手还 —— 三本账同源，拆开就必然有半态（2026-11-06 真机）。
+        match self.bank.rel.finish_turn(turn_id) {
+            Ok(r) => {
+                if r.admission || r.grants > 0 || r.row.is_some() {
+                    owl_shared::log_debug!(
+                        "store",
+                        "turn {turn_id} 终局归还：准入={} Grant={} 行={:?}",
+                        r.admission,
+                        r.grants,
+                        r.row
+                    );
+                }
+            }
+            Err(e) => owl_shared::log_warn!(
                 "store",
-                "准入收口归还 Grant：turn {turn_id} {} 张",
-                released.len()
-            );
-        }
-        if let Err(e) = self.bank.rel.admission.release(turn_id) {
-            owl_shared::log_debug!("store", "准入账收口：turn {turn_id} 不在账上（{e}）");
+                "turn {turn_id} 终局归还失败（继续收尾）：{e}"
+            ),
         }
         if let Err(e) = self.sync_pool_account() {
             owl_shared::log_warn!("store", "准入账同步失败：{e}");
@@ -350,15 +380,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 链登记 / 盘索引 / 表释放 / GDN 行 / 归属下行 / N4 全部由
             // `StoreHook::Release(TurnEnd)` 统一执行（Phase 3）。
         }
-        self.store_hook(crate::store_hook::StoreHook::turn_end(
-            act.id,
-            act.session_id,
-            act.gdn_slot,
-            act.ephemeral,
-        ))
-        .await?;
+        // **收口顺序**：先跑 Release 钩子（块链/行/N4），再无条件走准入围栏，
+        // 最后才把钩子错误上抛 —— `store_hook(...)?` 直接早退会跳过收口，
+        // 一次收尾失败就会把 turn 永久留在准入账里（2026-11-06 真机）。
+        let released = self
+            .store_hook(crate::store_hook::StoreHook::turn_end(
+                act.id,
+                act.session_id,
+                act.gdn_slot,
+                act.ephemeral,
+            ))
+            .await;
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(act.id);
+        released?;
         // **B-3d**:选择层视图态随 turn 收口(视图是 turn 域资源 —— 下一 turn
         // 的召回点重新产出;不清 = 用旧视图读新会话的块,静默错值)
         self.sel.clear_view();

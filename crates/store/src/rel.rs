@@ -93,6 +93,17 @@ pub struct Protected {
     pub snaps: Vec<SnapKey>,
 }
 
+/// **turn 终局归还报告**（[`Rel::finish_turn`] 的返回值；诊断/日志用）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnRelease {
+    /// 准入账里确实有该 turn 并被移除。
+    pub admission: bool,
+    /// 归还的 Grant 张数。
+    pub grants: usize,
+    /// 归还的 GDN 行（`None` = 该 turn 无在借行）。
+    pub row: Option<usize>,
+}
+
 /// 全量报告(设计卷 §2.4 报告面)。
 #[derive(Clone, Debug, Default)]
 pub struct StoreReport {
@@ -1147,6 +1158,47 @@ impl Rel {
         self.reservations.release_turn(turn)
     }
 
+    /// **turn 终局单一围栏**：把该 turn 在 store 里的**一切**一次归还 ——
+    /// Grant（ReservationLedger）+ 准入账（Admission）+ GDN 行（StateStore）。
+    ///
+    /// 为什么必须原子成一处：三本账同源（turn 生命周期），拆成三个调用就必然
+    /// 出现"还了票没还准入 / 还了准入没还行"的半态 —— 2026-11-06 真机 3080：
+    /// `start_one` 在 `admit + borrow_row` 之后失败，三本账只还了票，
+    /// 准入与行永久挂着 ⇒ 之后每个请求都撞"活跃 turn 天花板(1/1)"。
+    ///
+    /// 幂等：重复调用 = 全零报告。**调用方只该调这一个**，不要再分三步。
+    pub fn finish_turn(&mut self, turn: u64) -> StoreResult<TurnRelease> {
+        let grants = self.release_turn_grants(turn).len();
+        // release 返回 Unknown = 本来就不在账上（幂等语义，不是错）。
+        let admission = self.admission.release(turn).is_ok();
+        let row = self.state.release_row_of(crate::tier::Owner::Turn(turn))?;
+        Ok(TurnRelease {
+            admission,
+            grants,
+            row,
+        })
+    }
+
+    /// **孤儿收口**：准入账里有、但不在 `live`（引擎当前活跃集）里的 turn。
+    ///
+    /// 这种条目只可能来自"start 半态"（`finish_turn` 没跑到）。引擎在
+    /// `abandon` 拿不到归属 turn 时调它 —— 保证泄漏能自愈，而不是永久占天花板。
+    pub fn finish_orphan_turns(
+        &mut self,
+        live: &[u64],
+    ) -> StoreResult<Vec<(u64, TurnRelease)>> {
+        let orphans: Vec<u64> = self
+            .admission
+            .active_ids()
+            .filter(|id| !live.contains(id))
+            .collect();
+        let mut out = Vec::with_capacity(orphans.len());
+        for id in orphans {
+            out.push((id, self.finish_turn(id)?));
+        }
+        Ok(out)
+    }
+
     /// 准入面:已批准总量(槽;含已兑现的活跃块,不能减)。
     pub fn reserved_slots(&self) -> usize {
         // 准入/槽位策略只读 KV 地板；Row/Snap/Load/Temp 是分维度票，
@@ -1935,6 +1987,58 @@ mod tests {
 
     fn toks(n: usize) -> Vec<u32> {
         (0..n as u32).collect()
+    }
+
+    /// **turn 终局单一围栏**：准入账 + Grant + GDN 行一次归还，重复调用幂等。
+    ///
+    /// 这条门锁死 2026-11-06 真机事故的形状：start 半态只还了 Grant，
+    /// 准入与行仍挂着 ⇒ 后续请求永久撞"活跃 turn 天花板(1/1)"。
+    #[test]
+    fn finish_turn_releases_admission_grants_and_row() {
+        let mut r = rel(1);
+        r.admission.admit(7, 0, 0).expect("准入登记");
+        let g = r
+            .reserve_capacity(7, 4, 8, crate::reservations::ReservationKind::ActiveFloor)
+            .expect("Grant");
+        let row = r
+            .state
+            .borrow_row(crate::tier::Owner::Turn(7))
+            .expect("借行");
+        assert_eq!(r.admission.active_turns(), 1);
+
+        let rep = r.finish_turn(7).expect("终局收口");
+        assert!(rep.admission, "准入账必须归还");
+        assert_eq!(rep.grants, 1, "Grant 必须归还");
+        assert_eq!(rep.row, Some(row), "GDN 行必须归还");
+        assert_eq!(r.admission.active_turns(), 0);
+        assert!(r.reservations.get(g.id).is_none());
+        assert_eq!(r.state.rows_free(), r.state.rows_total());
+
+        // 幂等：重复收口 = 全零，不再报错、不再改账。
+        assert_eq!(
+            r.finish_turn(7).expect("重复收口"),
+            TurnRelease::default()
+        );
+    }
+
+    /// **孤儿收口**：准入账里有、但不在活跃集里的 turn 由围栏一次清掉。
+    #[test]
+    fn finish_orphan_turns_closes_entries_outside_live_set() {
+        let mut r = rel(2);
+        r.admission.admit(1, 0, 0).expect("t1");
+        r.admission.admit(2, 0, 0).expect("t2");
+        let row = r
+            .state
+            .borrow_row(crate::tier::Owner::Turn(1))
+            .expect("借行");
+
+        let reps = r.finish_orphan_turns(&[2]).expect("孤儿收口");
+        assert_eq!(reps.len(), 1, "只收孤儿：{reps:?}");
+        assert_eq!(reps[0].0, 1);
+        assert!(reps[0].1.admission);
+        assert_eq!(reps[0].1.row, Some(row));
+        assert_eq!(r.admission.active_turns(), 1, "在册 turn 不得被动");
+        assert_eq!(r.state.rows_free(), r.state.rows_total());
     }
 
     /// **P0-4**：`ensure_for_len` 必须吃 grant；无票/不足 = 结构化预算错。

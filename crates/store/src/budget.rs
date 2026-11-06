@@ -285,6 +285,11 @@ impl Admission {
         Ok((t.floor_bytes, t.elastic_bytes))
     }
 
+    /// **在册活跃 turn 的 id**（孤儿对账用；顺序 = turn id）。
+    pub fn active_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.active.keys().copied()
+    }
+
     /// 弹性余量增删(池压力下回收/恢复;地板不动 —— 保留额不变量)。
     pub fn set_elastic(&mut self, turn: u64, bytes: usize) -> StoreResult<()> {
         let t = self
