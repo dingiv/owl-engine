@@ -22,7 +22,7 @@ use crate::error::{StoreError, StoreResult};
 use crate::host::HostTier;
 use crate::host::SlotTable;
 use crate::id::{ChainHash, PrefixId, SnapKey};
-use crate::kv::{CacheUpdate, KvStats};
+use crate::kv::{CacheUpdate, KvDiag, KvStats};
 use crate::leg::{BlockLeg, ChainHit, LegConfig, LegStats};
 use crate::plan::MemoryPlan;
 use crate::policy::{AdmissionPolicy, EvictCandidate, EvictPolicy, LruPolicy};
@@ -111,6 +111,8 @@ pub struct StoreReport {
     pub tiers: TierReport,
     /// attention 腿统计。
     pub kv: KvStats,
+    /// **槽引用 / 可下沉性诊断**(为何腾不出槽的判据面;`/debug/vram`)。
+    pub kv_diag: KvDiag,
     /// 状态腿统计。
     pub state: StateStats,
     /// 活跃 turn 数。
@@ -1714,6 +1716,7 @@ impl Rel {
                 k.host_drop_missing = self.leg.host_drop_missing();
                 k
             },
+            kv_diag: self.leg.kv_diag(),
             state: self.state.stats(),
             active_turns: self.admission.active_turns(),
             reserved_bytes: self.admission.reserved_bytes(),

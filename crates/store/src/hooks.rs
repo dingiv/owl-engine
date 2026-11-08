@@ -39,10 +39,18 @@ use crate::tier::Tier;
 /// - `host_snap_slots` = **快照宿主条数**(HostPressure;每张票 1 条)。
 ///
 /// 压力/空转节点里它们是"**目标腾出量**"(零缺口也搬);准入/增长节点里
-/// `slots` 读作"缺口"(已扣自由槽),其余三个目标恒 0。
+/// `slots` 读作"**我想要多少空闲槽**"(`plan_capacity` 会再减 `slots_free`
+/// 折成腾位目标 ⇒ 传"已扣过 free 的差额"会被再扣一次,腾位变 no-op)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Need {
-    /// 需要的**设备槽数**(KV 腿;周转量,不是总量)。
+    /// 需要的**空闲**设备槽数(KV 腿;单位 = 空闲槽,不是总量,也不是
+    /// "要搬走的块数")。
+    ///
+    /// - `Admit`/`Grow`:本步要新占多少槽(缺口的**上界**);
+    /// - `Pressure`/`Idle`:直接就是目标腾出量。
+    ///
+    /// 两种读法单位一致(都是对"空闲槽"的期望),差别只在 `plan_capacity`
+    /// 是否再减当前 `slots_free`;契约由 `grow_need_is_absolute_free_slots_not_deficit` 单测钉住。
     pub slots: usize,
     /// 需要的**状态腿设备字节**(快照;0 = 不动状态腿)。
     pub snap_bytes: usize,
@@ -297,11 +305,38 @@ pub fn plan_capacity(
     let mut got_host_snap = 0usize;
     let mut picked: Vec<ChainHash> = protect_chains.to_vec();
     let mut kv_host_room = if host_disk_only { 0 } else { room.host_kv_slots };
+    // 诊断面（deny 报文用）：入口余位 + 轮零探到的最小可沉链跨度。
+    let host_room0 = kv_host_room;
+    let mut min0: Option<usize> = None;
     let mut snap_host_room = if host_disk_only {
         0
     } else {
         room.host_snap_slots
     };
+
+    // ── 轮一候选（**提前算**：轮零要用"按策略实际要沉的这组链"判断宿主余位） ──
+    //
+    // 为什么要提前：轮零的旧判据只看"缺口 ≤ 宿主余位"（`goal` 槽），而轮一
+    // 出票的单位是**整链**（`span` 槽）。余位夹在两者之间时（goal=67 < 余位
+    // =526 < 链=786），轮零认为"房间够"不腾、轮一又装不下任何链 ⇒ 计划死锁
+    // （2026-11-08 长活服务第 7 轮定谳：每拍只凑 5–6 槽，24k turn 必 500）。
+    let mut cands: Vec<EvictCandidate> = Vec::new();
+    if got_slots < kv_goal {
+        let want = (kv_goal - got_slots).max(1);
+        for c in kv.chain_offload_candidates(&picked, want) {
+            cands.push(EvictCandidate {
+                leg: Leg::Kv,
+                tier: Tier::Gpu,
+                // 整链下沉腾出的设备字节(span 由 bytes/slot_bytes 还原)
+                bytes: c.dev_blocks * slot_bytes,
+                last_use: c.last_use,
+                session: kv.session_of(c.tail),
+                depth: kv.depth_of(c.tail),
+                chain: Some(c.tail),
+                snap: None,
+            });
+        }
+    }
 
     // ── 轮零：宿主满 ⇒ 先腾宿主位（否则轮一无位可出票） ─────────────────────
     //
@@ -313,7 +348,33 @@ pub fn plan_capacity(
     let mut disk_kv = room.disk_kv_slots;
     if kv.host_enabled() && got_slots < kv_goal {
         let want = (kv_goal - got_slots).max(1);
-        let mut short = want.saturating_sub(kv_host_room);
+        // **宿主该腾多少？** 不是“缺口 − 余位”，而是“装下轮一实际要沉的这组链”。
+        //
+        // 旧判据只看缺口（goal 槽），轮一出票却是**整链**（span 槽）：余位夹在
+        // 两者之间（goal=67 < 余位=526 < 链=786）时，轮零认为“房间够”不腾、
+        // 轮一又装不下任何链 ⇒ 计划死锁（2026-11-08 长活服务第 7 轮定谳：
+        // 每拍只凑 5–6 槽，24k turn 必 500）。
+        //
+        // 正解：按轮一的**实际出票顺序**（LRU）累计到 goal —— 每沉一条链就吃掉
+        // 它自己那么多宿主槽 ⇒ 需要 `Σ span`（不是最大 span，也不是缺口）。
+        let mut acc = 0usize;
+        let mut need_room = 0usize;
+        for c in &cands {
+            if acc >= want {
+                break;
+            }
+            let span = (c.bytes / slot_bytes).max(1);
+            need_room = need_room.saturating_add(span);
+            acc = acc.saturating_add(span);
+        }
+        // 候选凑不满 goal ⇒ 腾了也白腾（真正不足由轮二按政策处理）；
+        // 需求比整个宿主预算还大 ⇒ 腾空也装不下（F4“链 > 宿主”档），不做无谓牺牲。
+        let mut short = if acc >= want && need_room <= kv.host_total_slots() {
+            min0 = Some(need_room);
+            need_room.saturating_sub(kv_host_room)
+        } else {
+            0
+        };
         if short > 0 && disk_kv > 0 {
             // 整链搬盘（与轮 1.5 同判据：半链无复用价值）；执行序在下文 Host 票之前
             for (tail, span, _) in kv.host_chain_candidates(&picked) {
@@ -332,33 +393,26 @@ pub fn plan_capacity(
             }
         }
         if short > 0 {
-            // 盘也装不下（或无盘层）⇒ 丢宿主最冷：从链尾向内削，前缀留着
-            for chain in kv.host_prune_candidates(&picked, short) {
-                v.out.push(EvictOut::Kv { chain, sink: Sink::Drop, span: 1 });
+            // 盘也装不下（或无盘层）⇒ 丢宿主最冷：从链尾向内削，前缀留着。
+            //
+            // ⚠️ **一张票可带 span**（只跨连续的宿主块）：旧实现一链一票只丢 1 块，
+            // 而宿主里往往只有几条长链 ⇒ 要腾 786 槽却只能出 4 票（2026-11-08
+            // 第 7 轮：轮零腾不动 ⇒ 轮一继续零票）。执行侧 `prune_branch(span)`
+            // 逐块丢宿主副本；`host_droppable_tail_span` 保证不跨到设备块。
+            let mut need = short;
+            for chain in kv.host_prune_candidates(&picked, need) {
+                if need == 0 {
+                    break;
+                }
+                let span = kv.host_droppable_tail_span(chain).max(1).min(need);
+                v.out.push(EvictOut::Kv { chain, sink: Sink::Drop, span });
                 picked.push(chain);
-                kv_host_room += 1;
+                kv_host_room += span;
+                need -= span;
             }
         }
     }
 
-    // ── 轮一：先下沉（宿主有位就搬，内容不丢） ─────────────────────────────
-    let mut cands: Vec<EvictCandidate> = Vec::new();
-    if got_slots < kv_goal {
-        let want = (kv_goal - got_slots).max(1);
-        for c in kv.chain_offload_candidates(&picked, want) {
-            cands.push(EvictCandidate {
-                leg: Leg::Kv,
-                tier: Tier::Gpu,
-                // 整链下沉腾出的设备字节(span 由 bytes/slot_bytes 还原)
-                bytes: c.dev_blocks * slot_bytes,
-                last_use: c.last_use,
-                session: kv.session_of(c.tail),
-                depth: kv.depth_of(c.tail),
-                chain: Some(c.tail),
-                snap: None,
-            });
-        }
-    }
     if got_snap < snap_goal {
         cands.extend(
             state
@@ -508,6 +562,9 @@ pub fn plan_capacity(
     // **`host_relief` 优先**(内容不丢):本轮已把宿主里最冷的挪去磁盘 ⇒
     // 宿主位下一拍就回来。此时**不做 Drop、不 deny** —— 设备缺口留一拍
     // (节点每拍都跑);代价是那一拍 `ensure_for_len` 可能响亮拒,而丢掉的是内容。
+    let mut n_bulk = 0usize;
+    let mut n_trickle = 0usize;
+    let mut n_cands2 = 0usize;
     if !host_disk_only
         && !host_relief
         && !host_relief_host
@@ -539,6 +596,7 @@ pub fn plan_capacity(
                     }),
             );
         }
+        n_cands2 = cands2.len();
         for c in order_candidates(policy, cands2, state) {
             if got_slots >= kv_goal && got_snap >= snap_goal {
                 break;
@@ -558,19 +616,46 @@ pub fn plan_capacity(
                     // 个调度轮,整枝一次丢才合理。
                     // 何时允许整枝：
                     // · **没有分层可搬**（宿主/磁盘都没有）⇒ 只能丢，一次丢干净；
-                    // · 或开了 `bulk_drop_when_tier_full` **且这条链这一轮搬不走**
-                    //   （`collapsible_span > 宿主剩余槽`：逐层律要求整链才搬，装不下
-                    //   就等于搬不走 ⇒ 再逐块只会拖 O(深度) 个调度轮）。
-                    // 有分层且装得下 ⇒ 保持逐块（轮一/轮 1.5 会把内容搬走）。
+                    // · **这条链这一轮搬不走**：装不下宿主余位，**或前缀被活跃面
+                    //   钉住**（`chain_down_span = None`：链内某块 refs≠1）。
+                    //   后一种是 2026-11-08 定谳的池毒化：活跃 turn 持着一块
+                    //   共享前缀 ⇒ 所有共享该前缀的缓存链全都不可下沉；逐块丢
+                    //   在“长链 × 多链”上每拍只能凑 5–9 槽（实测），起 267 槽
+                    //   的 turn 永远凑不够。
+                    // · 或开了 `bulk_drop_when_tier_full` 且装不下（既有语义）。
+                    // 有分层且装得下且无人钉住 ⇒ 保持逐块（轮一/轮 1.5 会搬走）。
+                    //
+                    // ⚠️ 塌缩长度必须**∩ 从尾向内连续可丢的长度**：
+                    // `collapsible_span` 只看分叉点，可能跨过被钉住的中间块；
+                    // `prune_branch` 会在那里停 ⇒ 计划不可越过（否则本拍腾位
+                    // 过度承诺，`got_slots` 虚高，下一步还是撞墙）。
                     let span_full = kv.collapsible_span(tail);
+                    let droppable = kv.droppable_tail_span(tail);
                     let no_tier = room.host_kv_slots == 0 && room.disk_kv_slots == 0;
-                    let tier_cannot_take = span_full > kv_host_room;
-                    let bulk = no_tier || (room.bulk_drop_when_tier_full && tier_cannot_take);
+                    let busy = kv.chain_dev_span(tail).is_none();
+                    let tier_cannot_take = busy || span_full > kv_host_room;
+                    // **无盘层 + 前场节点（Admit/Grow）**：宿主就是终点站，链装不下
+                    // 余位时只能丢；整枝丢的**损失上界 = 本拍缺口**（`goal - got`
+                    // 封顶），与逐块丢相同，但逐块每拍每链只丢 1 块 ⇒ 长链永远追不上
+                    // 缺口（2026-11-08 第 7 轮：9 条长链 + 一个活跃 turn ⇒ 每拍 5–6 槽）。
+                    //
+                    // 压力/空转（force）**不走这条**：那些节点每拍可重试，逐块把链
+                    // 削到装得进宿主再下沉 = 内容优先保留（`drop_span_stays_one…` 门）。
+                    let no_disk = room.disk_kv_slots == 0;
+                    let bulk = no_tier
+                        || busy
+                        || (!force && no_disk && tier_cannot_take)
+                        || (room.bulk_drop_when_tier_full && tier_cannot_take);
                     let span = if bulk {
-                        span_full.clamp(1, kv_goal - got_slots)
+                        span_full.min(droppable).clamp(1, kv_goal - got_slots)
                     } else {
                         1
                     };
+                    if bulk {
+                        n_bulk += 1;
+                    } else {
+                        n_trickle += 1;
+                    }
                     v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Drop, span });
                     got_slots += span;
                 }
@@ -597,6 +682,7 @@ pub fn plan_capacity(
             "{} 判据:KV 需求 {} 槽(自由 {}),状态腿需求 {} B,宿主需求 {} KV 块/{} 快照;\
              可搬面凑出 {} 槽/{} B/{} KV 宿主块/{} 宿主快照\
              (短 {} 槽/{} B/{} KV/{} 快照);\
+             轮零余位 {} 槽/最小可沉链 {:?};轮二候选 {} 条(整枝 {}/逐块 {});\
              宿主预算 KV {} B/{} 槽、状态腿 {} 张",
             kv.label(),
             kv_goal,
@@ -612,6 +698,11 @@ pub fn plan_capacity(
             snap_goal.saturating_sub(got_snap),
             host_kv_goal.saturating_sub(got_host_kv),
             host_snap_goal.saturating_sub(got_host_snap),
+            host_room0,
+            min0,
+            n_cands2,
+            n_bulk,
+            n_trickle,
             kv.host_budget_bytes(),
             room.host_kv_slots,
             room.host_snap_slots,

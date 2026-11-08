@@ -401,6 +401,346 @@ async fn pressure_offloads_without_deficit_and_prefers_host() {
     assert!(idle.out.iter().all(|o| o.sink() == Sink::Host), "空转整理同样先下沉");
     assert!(idle.deny.is_none(), "有可搬面 ⇒ 不拒");
 }
+/// **`Need::kv` 的单位 = "我想要多少空闲槽"**（不是"已扣 free 的差额"）。
+///
+/// 回归背景（2026-11-06 真机）：`step_need`/`ensure_start_chain` 都传"要新占
+/// 多少槽"，`plan_capacity` 再减 `slots_free` 折成腾位目标；调用方若先自己
+/// 减一遍 free，就会变成 `need - 2*free`，free 大时直接 no-op（腾位假死）。
+#[tokio::test]
+async fn grow_need_is_absolute_free_slots_not_deficit() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let mut l = leg(6);
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
+        .expect("注册布局");
+    // 4 条单块链 ⇒ 6 槽池里 free = 2（缓存独占，可下沉）。
+    for k in 0..4u32 {
+        let base = k * 1000;
+        let toks: Vec<u32> = (base..base + PAGE_TOKENS as u32).collect();
+        let cs = build_chain(&mut l, &toks).await;
+        assert_eq!(cs.len(), 1, "单块链应只产生一张链身份票");
+    }
+    assert_eq!(l.slots_free(), 2, "6 槽 - 4 块 = 2 空");
+
+    // 想要 4 个空闲槽 ⇒ 目标 = 4 - 2 = 2；若是"差额再减 free"会算出 2-2=0。
+    let v = plan_kv(&l, Need::kv(4, NeedWhy::Grow));
+    assert!(v.deny.is_none(), "可下沉面充足 ⇒ 不拒：{:?}", v.deny);
+    assert_eq!(
+        v.out.iter().map(|o| o.kv_span()).sum::<usize>(),
+        2,
+        "需 4 / 空 2 ⇒ 必须腾 2（不是 no-op）"
+    );
+    // 对照：想要 ≤ 空闲 ⇒ 不动（非压力节点零缺口不搬）。
+    assert!(
+        plan_kv(&l, Need::kv(2, NeedWhy::Grow)).is_noop(),
+        "需 2 / 空 2 ⇒ 零缺口，不许无谓搬"
+    );
+}
+
+/// **轮零：“宿主余位夹在缺口与整链跨度之间”**（2026-11-08 长活服务第 7 轮定谳）。
+///
+/// 形状：goal=2 < 宿主余位=3 < 最小可沉链=4。旧代码认为“房间够”不腾宿主，
+/// 轮一又因“整链 4 > 余位 3”一张票不出 ⇒ 只能逐块丢设备内容（或直接 500）。
+/// 正解：先逐宿主最冷 1 块腾到 4 槽，再用**一张整链 Host 票**搬走 4 块
+/// （设备内容不丢）。
+#[tokio::test]
+async fn host_room_between_goal_and_chain_span_prunes_host_first() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 10).await;
+    let block_bytes = PIECE_BYTES * 2;
+    let mut l = BlockLeg::open(LegConfig {
+        slots: 10,
+        block_tokens: PAGE_TOKENS,
+        block_bytes,
+        cache: owl_store::CachePolicy::Cap(18),
+        host_bytes: block_bytes * 5, // 宿主只装 5 块
+        class: BlockClass::KvPage,
+        label: "host-room",
+    })
+    .expect("开腿");
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
+        .expect("注册布局");
+
+    let toks = |base: u32, blocks: u32| -> Vec<u32> {
+        (base..base + blocks * PAGE_TOKENS as u32).collect()
+    };
+    // 设备先塞满：A(4) + C(4) + B(2) = 10 槽。
+    let a_cs = build_chain(&mut l, &toks(0, 4)).await;
+    let c_cs = build_chain(&mut l, &toks(4000, 4)).await;
+    let b_cs = build_chain(&mut l, &toks(8000, 2)).await;
+    assert_eq!((a_cs.len(), c_cs.len(), b_cs.len()), (4, 4, 2));
+    assert_eq!(l.slots_free(), 0, "设备满");
+    // B 整链沉宿主 ⇒ 宿主用 2/5（余位 3），设备空出 2 槽。
+    engine_offload(&mut l, &mut face, *b_cs.last().expect("B 链尾"))
+        .await
+        .expect("B 下沉");
+    assert_eq!(l.slots_free(), 2);
+    assert_eq!(l.host_free_slots(), 3, "宿主余位 3 块");
+
+    // 想要 4 个空闲槽 ⇒ 缺口 2 < 余位 3 < 最小可沉链 4。
+    let v = plan_kv(&l, Need::kv(4, NeedWhy::Grow));
+    assert!(v.deny.is_none(), "腾得出来 ⇒ 不拒：{:?}", v.deny);
+    let sinks: Vec<Sink> = v.out.iter().map(|o| o.sink()).collect();
+    assert_eq!(
+        sinks,
+        vec![Sink::Drop, Sink::Host],
+        "先逐宿主最冷 1 块（内容丢），再整链下沉 4 块（内容留）：{:?}",
+        v.out
+    );
+    assert_eq!(v.out[1].kv_span(), 4, "一张整链票：{:?}", v.out);
+}
+
+/// **无盘层 + 宿主满 + 链装不下余位**：整枝丢（损失被 goal 封顶），不逐块拖拍。
+///
+/// 真机形状（2026-11-08 第 7 轮）：宿主满（余位 1）、设备只空 2 槽、缺口 166，
+/// 能沉的链都 > 166 ⇒ 轮一零票；轮二逐块每链 1 块 ⇒ 每拍凑 5–6 槽，永远不够。
+#[tokio::test]
+async fn no_disk_tier_collapses_chain_that_cannot_fit_host() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 8).await;
+    let block_bytes = PIECE_BYTES * 2;
+    let mut l = BlockLeg::open(LegConfig {
+        slots: 8,
+        block_tokens: PAGE_TOKENS,
+        block_bytes,
+        cache: owl_store::CachePolicy::Cap(16),
+        host_bytes: block_bytes * 2, // 宿主只装 2 块
+        class: BlockClass::KvPage,
+        label: "no-disk",
+    })
+    .expect("开腿");
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
+        .expect("注册布局");
+
+    let toks = |base: u32, blocks: u32| -> Vec<u32> {
+        (base..base + blocks * PAGE_TOKENS as u32).collect()
+    };
+    // A(3) + C(3) + B(2) = 8 槽；B 沉宿主 ⇒ 宿主 2/2 满，设备空 2 槽。
+    let a_cs = build_chain(&mut l, &toks(0, 3)).await;
+    let c_cs = build_chain(&mut l, &toks(4000, 3)).await;
+    let b_cs = build_chain(&mut l, &toks(8000, 2)).await;
+    assert_eq!((a_cs.len(), c_cs.len(), b_cs.len()), (3, 3, 2));
+    engine_offload(&mut l, &mut face, *b_cs.last().expect("B 链尾"))
+        .await
+        .expect("B 下沉");
+    assert_eq!(l.host_free_slots(), 0, "宿主满");
+
+    // 想要 5 个空闲槽 ⇒ 缺口 3；两条可沉链各 3 块都装不下宿主余位。
+    let v = plan_kv(&l, Need::kv(5, NeedWhy::Grow));
+    assert!(v.deny.is_none(), "整枝丢要能凑够：{:?}", v.deny);
+    let max_drop = v
+        .out
+        .iter()
+        .filter(|o| o.sink() == Sink::Drop)
+        .map(|o| o.kv_span())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(max_drop, 3, "一张整枝票 span=3（旧行为是每链 1 块 ⇒ 短 1）：{:?}", v.out);
+}
+
+/// **宿主腾位必须一张票跨多块**（旧实现一链一票只丢 1 块）。
+///
+/// 形状：宿主里只有一条长链（10 块，余位 2），要腾 2 槽。旧代码只丢 1 块
+/// ⇒ 余位 3 < 整链 4 ⇒ 轮一零票，只能退化成丢设备内容；新代码一张票 span=2
+/// ⇒ 余位 4 ⇒ 整链下沉（内容留）。
+#[tokio::test]
+async fn host_prune_uses_multi_block_span() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 12).await;
+    let block_bytes = PIECE_BYTES * 2;
+    let mut l = BlockLeg::open(LegConfig {
+        slots: 12,
+        block_tokens: PAGE_TOKENS,
+        block_bytes,
+        cache: owl_store::CachePolicy::Cap(24),
+        host_bytes: block_bytes * 12,
+        class: BlockClass::KvPage,
+        label: "host-span",
+    })
+    .expect("开腿");
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
+        .expect("注册布局");
+
+    let toks = |base: u32, blocks: u32| -> Vec<u32> {
+        (base..base + blocks * PAGE_TOKENS as u32).collect()
+    };
+    // 长链 H(10) 先沉宿主（余位 2），设备再放 A(4)/C(4)。
+    let h_cs = build_chain(&mut l, &toks(0, 10)).await;
+    engine_offload(&mut l, &mut face, *h_cs.last().expect("H 链尾"))
+        .await
+        .expect("H 下沉");
+    let a_cs = build_chain(&mut l, &toks(4000, 4)).await;
+    let _c_cs = build_chain(&mut l, &toks(8000, 4)).await;
+    assert_eq!((h_cs.len(), a_cs.len()), (10, 4));
+    assert_eq!(l.slots_free(), 4, "H 下沉后空出 10，A+C 用 8 ⇒ free 4");
+    assert_eq!(l.host_free_slots(), 2, "宿主 12 - H(10) = 余位 2");
+
+    // 想要 6 个空闲槽 ⇒ 缺口 = 6 - 4 = 2；候选链 A 跨度 4 > 余位 2。
+    let v = plan_kv(&l, Need::kv(6, NeedWhy::Grow));
+    assert!(v.deny.is_none(), "腾得出来 ⇒ 不拒：{:?}", v.deny);
+    let drops: Vec<usize> = v
+        .out
+        .iter()
+        .filter(|o| o.sink() == Sink::Drop)
+        .map(|o| o.kv_span())
+        .collect();
+    let hosts: Vec<usize> = v
+        .out
+        .iter()
+        .filter(|o| o.sink() == Sink::Host)
+        .map(|o| o.kv_span())
+        .collect();
+    assert_eq!(drops, vec![2], "宿主腾位一张票跨 2 块：{:?}", v.out);
+    let mut drop_chains: Vec<(ChainHash, usize)> = Vec::new();
+    for o in &v.out {
+        if let EvictOut::Kv { chain, sink: Sink::Drop, span } = o {
+            drop_chains.push((*chain, *span));
+        }
+    }
+    assert_eq!(
+        drop_chains,
+        vec![(*h_cs.last().expect("H 链尾"), 2)],
+        "被动的是宿主链 H（设备内容不动）：{:?}",
+        v.out
+    );
+    assert_eq!(hosts, vec![4], "腾够后整链下沉 A：{:?}", v.out);
+
+    // **执行整张判据**（与 engine `apply_verdict` 同序：先 Drop 后 Host）：
+    // 宿主腾位票必须真删宿主副本并腾出槽，随后整链下沉才能拿到位。
+    for o in &v.out {
+        match o {
+            EvictOut::Kv { chain, sink: Sink::Drop, span } => {
+                let n = l.prune_branch(*chain, (*span).max(1)).expect("宿主逐出");
+                assert_eq!(n, *span, "一张宿主票应删满 span 块：{:?}", v.out);
+            }
+            EvictOut::Kv { chain, sink: Sink::Host, .. } => {
+                engine_offload(&mut l, &mut face, *chain).await.expect("整链下沉");
+            }
+            other => panic!("本档不应出别的票：{other:?}"),
+        }
+    }
+    let a_tail = *a_cs.last().expect("A 链尾");
+    assert_eq!(l.carrier_of(a_tail).expect("A 在账"), owl_store::Carrier::Host);
+    assert!(
+        l.carrier_of(*h_cs.last().expect("H 链尾")).is_err(),
+        "宿主最冷的 2 块必须真删"
+    );
+}
+
+/// **轮零按"轮一实际要沉的这组链"求和**，不是"最小/最大单链跨度"。
+///
+/// 形状：LRU 前缀 = 小链 1 + 大链 4（goal 2）⇒ 需要 5 槽余位（Σ），
+/// 只按最小（1）会判"够"不腾 ⇒ 大链装不下 ⇒ 退化成丢设备内容。
+#[tokio::test]
+async fn host_room_target_sums_the_lru_prefix() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 8).await;
+    let block_bytes = PIECE_BYTES * 2;
+    let mut l = BlockLeg::open(LegConfig {
+        slots: 8,
+        block_tokens: PAGE_TOKENS,
+        block_bytes,
+        cache: owl_store::CachePolicy::Cap(16),
+        host_bytes: block_bytes * 7,
+        class: BlockClass::KvPage,
+        label: "host-sum",
+    })
+    .expect("开腿");
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
+        .expect("注册布局");
+
+    let toks = |base: u32, blocks: u32| -> Vec<u32> {
+        (base..base + blocks * PAGE_TOKENS as u32).collect()
+    };
+    // H(5) 沉宿主（余位 2）；设备 A(1) + C(4)（free 3）。A 比 C 冷（先建）。
+    let h_cs = build_chain(&mut l, &toks(0, 5)).await;
+    engine_offload(&mut l, &mut face, *h_cs.last().expect("H 链尾"))
+        .await
+        .expect("H 下沉");
+    let _a_cs = build_chain(&mut l, &toks(4000, 1)).await;
+    let _c_cs = build_chain(&mut l, &toks(8000, 4)).await;
+    assert_eq!(l.slots_free(), 3);
+    assert_eq!(l.host_free_slots(), 2);
+
+    // 想要 5 个空闲槽 ⇒ 缺口 2；LRU 前缀 = A(1) + C(4) = 5 ⇒ 需余位 5。
+    let v = plan_kv(&l, Need::kv(5, NeedWhy::Grow));
+    assert!(v.deny.is_none(), "{:?}", v.deny);
+    let hosts: Vec<usize> = v
+        .out
+        .iter()
+        .filter(|o| o.sink() == Sink::Host)
+        .map(|o| o.kv_span())
+        .collect();
+    assert_eq!(hosts, vec![1, 4], "两条链都下沉（内容留）：{:?}", v.out);
+    // 唯一一张 Drop 必须是**宿主链 H**（腾宿主位），设备链 A/C 都下沉（内容留）。
+    let mut drop_chains: Vec<(ChainHash, usize)> = Vec::new();
+    for o in &v.out {
+        if let EvictOut::Kv { chain, sink: Sink::Drop, span } = o {
+            drop_chains.push((*chain, *span));
+        }
+    }
+    assert_eq!(
+        drop_chains,
+        vec![(*h_cs.last().expect("H 链尾"), 3)],
+        "只丢宿主最冷（一张票 3 块），不丢设备内容：{:?}",
+        v.out
+    );
+}
+
+// ───────────────── 2026-11-08 池毒化:共享前缀被钉住 ⇒ 整链不可沉 ─────────────────
+//
+// 真机：一个活跃 turn 持有共享前缀块 ⇒ `chain_down_span` 对所有共享该前缀
+// 的缓存链都返回 `None` ⇒ 轮一零票；轮二逐块只丢 1 块/链 ⇒ 9 条长链
+// 每拍只凑 5–9 槽，起 267 槽的 turn 永远撞「纯分配不足」。
+// 修：链“搬不走”与“装不下”同级 ⇒ 允许整枝塌缩（仍受本拍目标封顶，
+// 执行侧 `prune_branch` 逐块校验 refs，不碰活跃面）。
+#[tokio::test]
+async fn busy_shared_prefix_collapses_unshared_tail_in_one_ticket() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 8).await;
+    let mut l = leg(8);
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
+        .expect("注册布局");
+    let pg = PAGE_TOKENS as u32;
+    let shared: Vec<u32> = (0..pg).collect();
+    // A = 共享 1 块 + 独有 1 块；表**留着**（模拟活跃 turn 持着共享前缀）。
+    let a_tokens: Vec<u32> = shared.iter().copied().chain(1000..1000 + pg).collect();
+    let mut ta = Vec::new();
+    l.ensure_for_len(&mut ta, a_tokens.len()).expect("A 块表");
+    l.register_chain(&a_tokens, &ta).expect("A 登记");
+    // B = 共享 1 块 + 独有 3 块（同 session 的后续轮，缓存独占）。
+    let b_tokens: Vec<u32> = shared
+        .iter()
+        .copied()
+        .chain(2000..2000 + pg)
+        .chain(3000..3000 + pg)
+        .chain(4000..4000 + pg)
+        .collect();
+    let hit = l.match_prefix(&shared).expect("共享前缀命中");
+    let mut tb: Vec<u32> = hit.slots.iter().flatten().copied().collect();
+    for &slot in &tb {
+        l.incref(slot).expect("复用面 incref"); // engine: plan_prefix_reuse 同律
+    }
+    l.ensure_for_len(&mut tb, b_tokens.len()).expect("B 块表");
+    l.register_chain(&b_tokens, &tb).expect("B 登记");
+    l.release_table(&mut tb).expect("B 表归还");
+
+    // 自检：两条链都因共享块被钉住而不可沉；B 的独有尾巴 3 块可丢。
+    let d = l.kv_diag();
+    assert_eq!(d.chain_busy, 2, "两条链都被同一块共享前缀钉住：{d:?}");
+    // 共享块（A/B 两条链各算一次）+ A 自己的独有块（也被 A 持着）= 3。
+    assert_eq!(d.stuck_shared, 3, "{d:?}");
+    assert_eq!(l.slots_free(), 3, "8 槽 - 5 块 = 3 空");
+
+    // 需要 5 个空闲槽 ⇒ 目标 2。轮一零票（两条链都不可沉）⇒ 只能整枝
+    // 塌缩 B 的独有尾：**一张票 span=2**（旧行为是 1 块/链 ⇒ deny 短 1 槽）。
+    let v = plan_kv(&l, Need::kv(5, NeedWhy::Grow));
+    assert!(v.deny.is_none(), "独有尾能覆盖缺口 ⇒ 不拒：{:?}", v.deny);
+    assert_eq!(v.out.len(), 1, "应是一张整枝票：{:?}", v.out);
+    assert_eq!(v.out[0].sink(), Sink::Drop, "搬不走 ⇒ 只能丢：{:?}", v.out);
+    assert_eq!(v.out[0].kv_span(), 2, "塌缩到本拍目标（不是整链 3）：{:?}", v.out);
+}
+
 // ───────────────── 生产路径回归:重算重绑不得留宿主幽灵 ─────────────────
 //
 // 2026-10-24 定谳案:`BlockLeg::register_chain_owned` 缺一步

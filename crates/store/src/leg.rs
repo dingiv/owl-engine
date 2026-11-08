@@ -32,7 +32,7 @@ use owl_iface::contract::{Bytes, ConnSlot, Connector, SwapPiece};
 use crate::error::{StoreError, StoreResult};
 use crate::host::{HostBlock, HostTier, SlotTable};
 use crate::id::ChainHash;
-use crate::kv::{CacheUpdate, KvStore, PrefixMatch};
+use crate::kv::{CacheUpdate, KvDiag, KvStore, PrefixMatch};
 #[cfg(test)]
 use crate::moves::{download_span, upload_span}; // 测试的种图样/读回路径
 use crate::policy::EvictCandidate;
@@ -669,6 +669,19 @@ impl BlockLeg {
         self.kv.chain_down_span(tail)
     }
 
+    /// **从链尾向内连续在宿主的块数**（宿主腾位的整枝票长）。
+    pub fn host_droppable_tail_span(&self, tail: ChainHash) -> usize {
+        self.kv.host_droppable_tail_span(tail)
+    }
+
+    /// **从链尾向内连续可丢的设备块数**（`prune_branch` 的真实可达长度）。
+    ///
+    /// 计划器的整枝 `span` 必须与本值取小：分叉点之上可能还有被会话钉住的
+    /// 块（2026-11-08 池毒化），越过它就会本拍过度承诺。
+    pub fn droppable_tail_span(&self, tail: ChainHash) -> usize {
+        self.kv.droppable_tail_span(tail)
+    }
+
     /// 整块前缀的内容身份(身份原语的腿面出口;engine 播种链游标 / 测试)。
     pub fn tail_hash(&self, tokens: &[u32], full_blocks: usize) -> Option<ChainHash> {
         self.kv.tail_hash(tokens, full_blocks)
@@ -1000,6 +1013,11 @@ impl BlockLeg {
             Some(crate::tier::Tier::Disk) => Ok(Carrier::Disk),
             None => Err(StoreError::Unknown(format!("块 {chain:?} 不在账里"))),
         }
+    }
+
+    /// **槽引用 / 可下沉性诊断**(纯读;`/debug/vram` 用)。
+    pub fn kv_diag(&self) -> KvDiag {
+        self.kv.diag()
     }
 
     /// 报告。

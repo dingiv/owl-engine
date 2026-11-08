@@ -91,6 +91,39 @@ pub struct KvStats {
     pub host_drop_missing: u64,
 }
 
+/// **KV 槽引用 / 可下沉性诊断**（`/debug/vram` 只读面；2026-11-08 池毒化立案）。
+///
+/// 为什么单列：`KvStats` 只说“多少块”，说不清“为什么搬不动”。整链下沉的
+/// 闸门 = [`KvStore::chain_down_span`]（链内**任一**设备块 `refs != 1` ⇒
+/// 整条不出票）⇒ 毒化面必须按“引用数分布 + 不可下沉链的原因”单独报。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KvDiag {
+    /// 全池槽的引用数直方图（下标 = refs，`[8]` = ≥8；0 = 自由槽）。
+    pub refs_hist: [usize; 9],
+    /// 仅**树绑定（设备驻留）**块的引用数直方图（口径同上）。
+    pub bound_refs_hist: [usize; 9],
+    /// 叶子链总数。
+    pub chains: usize,
+    /// `chain_down_span` 会判“不可下沉”的链数（= busy + all_host + missing）。
+    pub chain_unavailable: usize,
+    /// 至少有一块设备块 `refs != 1` 的链数（活跃/共享面）。
+    pub chain_busy: usize,
+    /// 整链都已在宿主（无设备槽可腾）的链数。
+    pub chain_all_host: usize,
+    /// 链尾不在树里/链为空（账面断链）。
+    pub chain_missing: usize,
+    /// 不可下沉链里 `refs != 1` 的设备块总数（毒化面大小）。
+    pub stuck_blocks: usize,
+    /// 其中 `refs == 0`（树说有槽、池说自由 ⇒ 漏 incref/decref）。
+    pub stuck_refs0: usize,
+    /// 其中 `refs >= 2`（仍被会话/别处持有）。
+    pub stuck_shared: usize,
+}
+
+fn hist_idx(refs: u32) -> usize {
+    (refs as usize).min(8)
+}
+
 /// attention 块腿(槽池 + 前缀树)。
 pub struct KvStore {
     /// **会话归属**(链 → session id;2026-10-19 会话感知淘汰;0/缺省 = 无归属)。
@@ -683,6 +716,39 @@ impl KvStore {
         (span > 0).then_some(span)
     }
 
+    /// **从链尾向内连续在宿主的块数**（宿主腾位的整枝票长）。
+    ///
+    /// 与 [`Self::droppable_tail_span`] 对称：宿主票必须只跨**连续的宿主块**，
+    /// 落到设备块上就会把"腾宿主位"记成"腾设备槽"，账面会虚。
+    pub fn host_droppable_tail_span(&self, tail: ChainHash) -> usize {
+        let mut n = 0usize;
+        for b in self.tree.chain_of(tail).iter().rev() {
+            if b.slot.is_some() {
+                break;
+            }
+            n += 1;
+        }
+        n
+    }
+
+    /// **从链尾向内连续可丢的设备块数**（`prune_branch` 的真实可达长度）。
+    ///
+    /// 判据：从尾往根走，遇到第一块 **`refs != 1`**（被会话/活跃 turn 持着）
+    /// 或 **已无设备槽**（宿主块腾不出设备槽）即停。`collapsible_span` 只看
+    /// 分叉点，可能跨过这样的块；计划器的 `span` 必须再与本值取小，否则
+    /// 腾位量虚高（2026-11-08 池毒化：共享前缀被钉住时整链不可下沉）。
+    pub fn droppable_tail_span(&self, tail: ChainHash) -> usize {
+        let mut n = 0usize;
+        for b in self.tree.chain_of(tail).iter().rev() {
+            let Some(slot) = b.slot else { break };
+            if self.pool.refs(slot) != 1 {
+                break;
+            }
+            n += 1;
+        }
+        n
+    }
+
     /// 链块序(逻辑序,根→尾;`slot = None` = 已在宿主层)。
     pub fn chain_of(&self, tail: ChainHash) -> Vec<MatchedBlock> {
         self.tree.chain_of(tail)
@@ -782,6 +848,54 @@ impl KvStore {
             }
         });
         n * self.block_bytes
+    }
+
+    /// **槽引用 / 可下沉性诊断**(纯读;`/debug/vram` 用)。
+    ///
+    /// 只读两次遍历:① 全池槽引用分布;② 逐叶链按 `chain_down_span` 的同一
+    /// 判据分类(不可下沉 = 链内有设备块 `refs != 1`,或整链已在宿主)。
+    /// 任何一类“不可下沉”非零而设备又被缓存满时,腾位就会系统性不足。
+    pub fn diag(&self) -> KvDiag {
+        let mut d = KvDiag::default();
+        for slot in 0..self.pool.capacity() as u32 {
+            d.refs_hist[hist_idx(self.pool.refs(slot))] += 1;
+        }
+        self.tree.for_each_bound(|slot| {
+            d.bound_refs_hist[hist_idx(self.pool.refs(slot))] += 1;
+        });
+        for (tail, _, _) in self.tree.leaves() {
+            d.chains += 1;
+            let blocks = self.tree.chain_of(tail);
+            if blocks.is_empty() {
+                d.chain_missing += 1;
+                d.chain_unavailable += 1;
+                continue;
+            }
+            let mut busy = 0usize;
+            let mut dev = 0usize;
+            for b in &blocks {
+                let Some(slot) = b.slot else { continue };
+                dev += 1;
+                let refs = self.pool.refs(slot);
+                if refs != 1 {
+                    busy += 1;
+                    if refs == 0 {
+                        d.stuck_refs0 += 1;
+                    } else {
+                        d.stuck_shared += 1;
+                    }
+                }
+            }
+            if busy > 0 {
+                d.chain_busy += 1;
+                d.chain_unavailable += 1;
+                d.stuck_blocks += busy;
+            } else if dev == 0 {
+                d.chain_all_host += 1;
+                d.chain_unavailable += 1;
+            }
+        }
+        d
     }
 }
 
@@ -1243,5 +1357,37 @@ mod tests {
         assert_eq!(cands[0].bytes, 1 << 20);
         assert!(m.evict_candidates(&[tail]).is_empty(), "保护面绝不入候选");
         assert_ne!(first, tail, "两块身份不同");
+    }
+
+    /// **诊断面自检**：`diag()` 对“不可下沉”的归因必须与 `chain_down_span` 同源。
+    ///
+    /// 2026-11-08 池毒化立案：整链下沉的闸门是“链内每块 refs == 1”。
+    /// 这里用“会话仍持表”造 refs=2，再断言诊断把它归到 `chain_busy/stuck_shared`，
+    /// 还表后回到可下沉 —— 防止诊断自己成为新的“第二套规范”。
+    #[test]
+    fn diag_attributes_unsinkable_chain_to_refs() {
+        let mut m = kv(8, 8);
+        let toks_a = toks(64); // 2 块
+        let mut ta = Vec::new();
+        m.ensure_for_len(&mut ta, 64).expect("建链");
+        m.register_chain(&toks_a, &ta).expect("登记"); // 表 1 + 树 1 ⇒ refs=2
+        let tail = m.tail_hash(&toks_a, 2).expect("尾身份");
+
+        let d = m.diag();
+        assert_eq!(d.chains, 1, "{d:?}");
+        assert_eq!((d.chain_busy, d.chain_unavailable), (1, 1), "{d:?}");
+        assert_eq!(d.stuck_shared, 2, "两块都被会话持着：{d:?}");
+        assert_eq!(d.bound_refs_hist[2], 2, "{d:?}");
+        assert!(m.chain_down_span(tail).is_none(), "整链不可下沉");
+
+        m.release_table(&mut ta).expect("会话归还");
+        let d = m.diag();
+        assert_eq!(
+            (d.chain_busy, d.chain_unavailable, d.stuck_shared),
+            (0, 0, 0),
+            "缓存独占 ⇒ 链可下沉：{d:?}"
+        );
+        assert_eq!(d.bound_refs_hist[1], 2, "{d:?}");
+        assert_eq!(m.chain_down_span(tail), Some(2));
     }
 }
