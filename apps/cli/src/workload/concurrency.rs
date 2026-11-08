@@ -129,6 +129,38 @@ pub fn run(args: &Args, pid: u32) -> i32 {
     if failed == 0 { 0 } else { 1 }
 }
 
+/// 等引擎静默：`active == 0 && queue_len == 0` 连续 3 拍（≈300ms）。
+///
+/// 为什么不是"读完上一用例的 Completed 就够"：终局清理在事件之后还有一拍
+/// （块表归还/快照重挂），此时共享前缀仍被钉着，整链下沉会全部失效。
+fn wait_quiescent(c: &Client, cap: Duration) -> Result<(), String> {
+    let until = Instant::now() + cap;
+    let mut quiet_since: Option<Instant> = None;
+    while Instant::now() < until {
+        let quiet = c
+            .get_json("/debug/queue")
+            .ok()
+            .map(|q| {
+                q.get("active").and_then(Value::as_u64).unwrap_or(1) == 0
+                    && q.get("queue_len").and_then(Value::as_u64).unwrap_or(1) == 0
+            })
+            .unwrap_or(false);
+        if quiet {
+            let t0 = *quiet_since.get_or_insert_with(Instant::now);
+            if t0.elapsed() >= Duration::from_millis(300) {
+                return Ok(());
+            }
+        } else {
+            quiet_since = None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "引擎 {}s 内未静默（上一用例的 turn 未收摊？）",
+        cap.as_secs()
+    ))
+}
+
 /// 一个流式进程（请求 + 逐 delta 时刻）。
 struct Streamed {
     reply: ChatReply,
@@ -169,8 +201,10 @@ struct BroadcastStream {
 
 impl BroadcastStream {
     fn into_streamed(self) -> Result<Streamed, String> {
-        let deltas = self.times.lock().map(|v| v.clone()).unwrap_or_default();
+        // ⚠️ **先 join 再取时间戳**：反过来的话，线程在 clone 之后、退出之前
+        // 产生的 delta 会丢（尾段 ITL/gap 统计被截断，窗口末尾假绿）。
         let (r, started, ended) = self.handle.join().map_err(|_| "流式线程 panic".to_string())?;
+        let deltas = self.times.lock().map(|v| v.clone()).unwrap_or_default();
         let reply = r.map_err(|e| format!("chat 失败: {e}"))?;
         Ok(Streamed {
             reply,
@@ -196,6 +230,14 @@ struct Monitor {
 }
 
 fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String> {
+    // **用例之间必须回到静默**（2026-11-08 第 7 轮误红）：
+    // 上一用例的收尾 turn 只要还在 active，它就钉着共享前缀（refs=2）
+    // ⇒ 本用例起点的整链下沉全被判"不可沉"，而 host 又刚好满 ⇒ 起点腾位
+    // 只能逐块丢，长的 24k turn 必红。等 active/queue 归零（连续 3 拍）再起。
+    {
+        let c = Client::new(&args.url, args.model.clone());
+        wait_quiescent(&c, Duration::from_secs(60))?;
+    }
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -227,43 +269,62 @@ fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String
         req(&sess_b, &decode_prompt, case.decode_max)
     };
 
-    // 监控（`/debug/queue` cheap 高频；`/debug/vram` 降频）。
+    // 监控分**两条独立线程**：
+    // · queue 高频（50ms）且**绝不阻塞** —— 它是 active/queue 的唯一证词；
+    // · vram 低频（1s）—— `/debug/vram` 走 executor，忙时阻塞数秒。
+    // 两者同线程的后果实测过：prefill 窗口内 queue 采样被 vram 整段搭死
+    // ⇒ `active_max` 永远停在 1（误报“遥测低报”）。
     let stop = Arc::new(AtomicBool::new(false));
     let second_started = Arc::new(AtomicBool::new(false));
-    let stop_mon = Arc::clone(&stop);
-    let second_flag = Arc::clone(&second_started);
     let mon_state = Arc::new(Mutex::new(Monitor::default()));
-    let ms_clone = Arc::clone(&mon_state);
-    let mon_url = args.url.clone();
-    let mon_model = args.model.clone();
-    let monitor = thread::spawn(move || {
-        let client = Client::new(&mon_url, mon_model);
-        let mut tick = 0u32;
-        while !stop_mon.load(Ordering::Relaxed) {
-            if let Ok(q) = client.get_json("/debug/queue") {
-                let active = q.get("active").and_then(Value::as_u64).unwrap_or(0);
-                let queued = q.get("queue_len").and_then(Value::as_u64).unwrap_or(0);
-                if std::env::var_os("OWL_DP_DEBUG").is_some() {
-                    eprintln!("[dp-mon] active={active} queue={queued}");
-                }
-                if let Ok(mut st) = ms_clone.lock() {
-                    st.max_active = st.max_active.max(active);
-                    st.max_queue = st.max_queue.max(queued);
-                    if active >= 2 {
-                        st.active2_samples += 1;
+    // 环境变量只读一次（原来在 20Hz 采样循环里每拍查一次）。
+    let dp_debug = std::env::var_os("OWL_DP_DEBUG").is_some();
+
+    let monitor = {
+        let stop = Arc::clone(&stop);
+        let second_flag = Arc::clone(&second_started);
+        let ms = Arc::clone(&mon_state);
+        let url = args.url.clone();
+        let model = args.model.clone();
+        thread::spawn(move || {
+            let client = Client::new(&url, model);
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(q) = client.get_json("/debug/queue") {
+                    let active = q.get("active").and_then(Value::as_u64).unwrap_or(0);
+                    let queued = q.get("queue_len").and_then(Value::as_u64).unwrap_or(0);
+                    if dp_debug {
+                        eprintln!("[dp-mon] active={active} queue={queued}");
                     }
-                    // 第二路发出后**持续**排队（连续采样）⇒ 它是被 queue 住的。
-                    // 只看"有无"会把 submit→admit 之间的 50ms 瞬时排队误判成排队档。
-                    if queued > 0 && second_flag.load(Ordering::Relaxed) {
-                        st.queued_after_second += 1;
-                        st.queued_streak += 1;
-                        st.max_queued_streak = st.max_queued_streak.max(st.queued_streak);
-                    } else {
-                        st.queued_streak = 0;
+                    if let Ok(mut st) = ms.lock() {
+                        st.max_active = st.max_active.max(active);
+                        st.max_queue = st.max_queue.max(queued);
+                        if active >= 2 {
+                            st.active2_samples += 1;
+                        }
+                        // 第二路发出后**持续**排队（连续采样）⇒ 它是被 queue 住的。
+                        // 只看"有无"会把 submit→admit 之间的 50ms 瞬时排队误判成排队档。
+                        if queued > 0 && second_flag.load(Ordering::Relaxed) {
+                            st.queued_after_second += 1;
+                            st.queued_streak += 1;
+                            st.max_queued_streak = st.max_queued_streak.max(st.queued_streak);
+                        } else {
+                            st.queued_streak = 0;
+                        }
                     }
                 }
+                thread::sleep(Duration::from_millis(50));
             }
-            if tick.is_multiple_of(10) {
+        })
+    };
+
+    let vram_mon = {
+        let stop = Arc::clone(&stop);
+        let ms = Arc::clone(&mon_state);
+        let url = args.url.clone();
+        let model = args.model.clone();
+        thread::spawn(move || {
+            let client = Client::new(&url, model);
+            while !stop.load(Ordering::Relaxed) {
                 if let Ok(v) = client.get_json("/debug/vram") {
                     let free = v
                         .get("kv")
@@ -273,7 +334,7 @@ fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String
                         .get("kv")
                         .and_then(|k| k.get("host_blocks"))
                         .and_then(Value::as_u64);
-                    if let Ok(mut st) = ms_clone.lock() {
+                    if let Ok(mut st) = ms.lock() {
                         if let Some(f) = free {
                             st.free_min = Some(st.free_min.map_or(f, |x| x.min(f)));
                         }
@@ -282,11 +343,12 @@ fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String
                         }
                     }
                 }
+                thread::sleep(Duration::from_millis(1000));
             }
-            tick = tick.wrapping_add(1);
-            thread::sleep(Duration::from_millis(50));
-        }
-    });
+        })
+    };
+    // 早退（首 token 超时 / 第二路失败 / panic）也要停掉监控线程。
+    let _mon_guard = StopOnDrop(Arc::clone(&stop));
 
     let first_stream = spawn_stream(args.url.clone(), args.model.clone(), first_req);
     if first_is_decode {
@@ -324,6 +386,7 @@ fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String
     let first = first_stream.into_streamed()?;
     stop.store(true, Ordering::Relaxed);
     let _ = monitor.join();
+    let _ = vram_mon.join();
     let mon = mon_state.lock().map(|s| s.clone()).unwrap_or_default();
 
     let second = Streamed {
@@ -347,9 +410,17 @@ fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String
         .count();
     let max_gap = max_gap(&decode.deltas, w0, w1);
 
-    // 并发判定：第二路发出后**没有**持续排队 = 它被准入并参与调度；
-    // `active>=2` 采样是补充证据（该字段在部分交错形态下会低报，实测）。
-    let concurrent = mon.max_queued_streak < 3;
+    // 并发判定：第二路**排队等了多久**。
+    //
+    // `max_batch=1` 的队列档会一直排到第一路结束（秒级）；真并发档只有
+    // "submit → 下一次调度" 的准入延迟（实测 0–0.5s，prefill 正忙时最长 ~0.45s）。
+    // 阈值 1s 把两者分开；原先的 `streak < 3`（≈150ms）会把正常的准入延迟
+    // 误判成队列档（已实测：450ms 的等待 + overlap 112 tok 被判 queued）。
+    let queue_wait_ms = mon.max_queued_streak as u128 * 50;
+    let concurrent = queue_wait_ms < 1_000;
+    // `active>=2` 是正向证据；若判并发却从没到 2，**先查采样线程**
+    // （`/debug/vram` 阻塞会把 50ms 采样整段搭死），再怀疑服务端字段。
+    let tele_suspect = concurrent && mon.max_active < 2;
     let dec_turn = TurnRecord {
         scenario: case.name.to_string(),
         turn: 1,
@@ -423,8 +494,8 @@ fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String
     };
     let detail = format!(
         "{role} · mode={mode} · overlap={overlap} tok · max_gap={max_gap}ms · \
-         active_max={amax} queue_max={qmax} queued_after_second={qas} max_streak={qst} active2_samples={a2} · free_min={free:?} · \
-         host_max={host} · 解码 {dec:.2}s / 预填 {pre:.2}s",
+         active_max={amax} queue_max={qmax} qwait={qwait}ms queued_after_second={qas} max_streak={qst} active2_samples={a2} · free_min={free:?} · \
+         host_max={host} · 解码 {dec:.2}s / 预填 {pre:.2}s{tele}",
         mode = if concurrent {
             "concurrent"
         } else {
@@ -432,6 +503,7 @@ fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String
         },
         amax = mon.max_active,
         qmax = mon.max_queue,
+        qwait = queue_wait_ms,
         qas = mon.queued_after_second,
         qst = mon.max_queued_streak,
         a2 = mon.active2_samples,
@@ -439,6 +511,11 @@ fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String
         host = mon.host_max,
         dec = decode.reply.elapsed_ms as f64 / 1000.0,
         pre = prefill.reply.elapsed_ms as f64 / 1000.0,
+        tele = if tele_suspect {
+            " · ⚠ 判并发但 active_max<2（/debug/queue 低报？）"
+        } else {
+            ""
+        },
     );
     Ok(ScenarioReport {
         name: case.name.to_string(),
@@ -452,13 +529,33 @@ fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String
     })
 }
 
-/// 窗口内相邻 delta 的最大间隔（只看 delta 之间；窗口首尾空白不算）。
+/// 监控线程存活门：任何早退路径（`?`/panic）都要把 `stop` 置位，
+/// 否则 20Hz 轮询线程会跟着进程泄漏到下一个用例。
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 窗口内相邻 delta 的最大间隔。
+///
+/// ⚠️ 必须带上**窗口前最后一个 delta** 作锚点：冻结往往就发生在 prefill 开始的
+/// 那一瞬间，若窗口里只有一个点（`windows(2)` 为空）会算出 0 ⇒ 假绿。
 fn max_gap(times: &[Instant], t0: Instant, t1: Instant) -> u128 {
     let mut pts: Vec<Instant> = times
         .iter()
         .copied()
         .filter(|t| *t >= t0 && *t <= t1)
         .collect();
+    if let Some(prev) = times.iter().copied().filter(|t| *t < t0).max() {
+        // 只把"紧邻窗口"的点当锚点（≤1s）：更早的发呆属于窗口前抖动，
+        // 算进来会把既有停顿误判成 prefill 冻结。
+        if t0.duration_since(prev) <= Duration::from_millis(1000) {
+            pts.push(prev);
+        }
+    }
     pts.sort();
     pts.windows(2)
         .map(|w| w[1].duration_since(w[0]).as_millis())

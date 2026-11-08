@@ -378,6 +378,21 @@ pub fn vram_json(snap: &crate::executor::VramSnapshot) -> Value {
             // 账漂指纹:非零 = 树账说宿主、内容已不在(幂等删除已计数;2026-10-25 案)
             "host_drop_missing": r.kv.host_drop_missing,
         },
+        // **槽引用 / 可下沉性诊断**(2026-11-08 池毒化立案):
+        // `chain_unavailable > 0` 且设备被缓存满时，腾位会系统性不足 ——
+        // 看 `chain_busy`/`stuck_refs0`/`stuck_shared` 定位是谁在持着。
+        "kv_diag": {
+            "refs_hist": r.kv_diag.refs_hist,
+            "bound_refs_hist": r.kv_diag.bound_refs_hist,
+            "chains": r.kv_diag.chains,
+            "chain_unavailable": r.kv_diag.chain_unavailable,
+            "chain_busy": r.kv_diag.chain_busy,
+            "chain_all_host": r.kv_diag.chain_all_host,
+            "chain_missing": r.kv_diag.chain_missing,
+            "stuck_blocks": r.kv_diag.stuck_blocks,
+            "stuck_refs0": r.kv_diag.stuck_refs0,
+            "stuck_shared": r.kv_diag.stuck_shared,
+        },
         "state": {
             // **淘汰序预览**(会话感知:同会话 depth 降序 = 末端先走)
             "evict_order": snap.snap_evict.iter().map(|e| json!({

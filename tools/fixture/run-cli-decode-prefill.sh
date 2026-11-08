@@ -40,10 +40,21 @@ PORT=$(echo "$URL" | sed -n 's#.*:\([0-9][0-9]*\)/*$#\1#p')
 echo "[cli-dp] build cli..." >&2
 cargo build --release -p cli >/dev/null 2>&1 || { echo "[cli-dp] cli 构建失败" >&2; exit 2; }
 
-healthy() { curl -s -o /dev/null --max-time 2 "$URL/health"; }
+healthy() { curl -sf -o /dev/null --max-time 2 "$URL/health"; }
 
 if ! healthy; then
-  [ -f "$PROFILE" ] || { echo "[cli-dp] $URL 未就绪且 profile 不存在: $PROFILE" >&2; exit 2; }
+  if [ ! -f "$PROFILE" ]; then
+    cat >&2 <<EOF
+[cli-dp] $URL 未就绪，且档不存在: $PROFILE
+         本机档是 *.local.toml（不入库）。先按下面的形状建一份，或改用 --url 指向已起服务：
+           extends = ["profiles/qwen38_27b-3090.toml"]
+           [parallel] device = ["GPU-<uuid>"]      # 单卡，UUID 钉卡
+           [runtime] max_concurrency = 2, max_batch = 2, slice_every = 8
+           [pool]    gdn_slots = 2, snap_max = 6
+           [spec]    depth = 0, lookup = false
+EOF
+    exit 2
+  fi
   echo "[cli-dp] $URL 未就绪 ⇒ 启动 $PROFILE" >&2
   setsid nohup ./target/release/server -p "$PROFILE" > /tmp/owl-cli-dp.log 2>&1 < /dev/null &
   for i in $(seq 1 35); do
@@ -60,8 +71,16 @@ fi
 
 cleanup() {
   if [ -n "$STARTED" ] && kill -0 "$STARTED" 2>/dev/null; then
+    # setsid 起的不一定是独占组：先试组杀（TP worker 一起走），再回落单 pid。
     echo "[cli-dp] 停测试服务 pid=$STARTED" >&2
-    kill -KILL "$STARTED" 2>/dev/null
+    kill -TERM -- "-$STARTED" 2>/dev/null || kill -TERM "$STARTED" 2>/dev/null
+    for _ in $(seq 1 20); do
+      kill -0 "$STARTED" 2>/dev/null || break
+      sleep 0.5
+    done
+    if kill -0 "$STARTED" 2>/dev/null; then
+      kill -KILL -- "-$STARTED" 2>/dev/null || kill -KILL "$STARTED" 2>/dev/null
+    fi
   fi
 }
 trap cleanup EXIT
