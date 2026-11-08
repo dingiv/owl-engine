@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use crate::contract::{Bytes, Dtype, LaunchMsg, OpError, OpId};
 
 use crate::client::nvfp4::{parse_gemm, parse_pack, GEMM, PACK_WEIGHT};
+// 族身份(单一真源在 `family::nvfp4`;`client` 只重导出核名)
+use crate::family::nvfp4::FAMILY_ID;
 use crate::nvfp4::Nvfp4Plan;
 use crate::registry::{FamilyGuard, KernelFamily};
 
