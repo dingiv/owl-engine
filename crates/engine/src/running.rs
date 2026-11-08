@@ -2993,8 +2993,16 @@ impl<D: DeviceClient> RunningEngine<D> {
                 floor_bytes,
             } => {
                 // 抬需求到"腾够就能进":同一次段边界搬完(下沉不丢内容)
+                //
+                // ⚠️ `need_bytes` 是对 `face` 的**净值**(已把空闲面算进抵扣),
+                // 而 `plan_capacity` 非 force 分支会再减 `slots_free` ⇒ 直接塞
+                // `want` 会少腾 `slots_free` 个槽(准入反复判 EvictThen、每次都不够,
+                // 拖到 `admission_max_wait_ms` 变 429)。这里换回"想要多少空闲槽"
+                // 的口径(与 `step_need` / `ensure_start_chain` 同源)。
                 let want = need_bytes.div_ceil(self.dev.pool.block_bytes().max(1));
-                need.slots = need.slots.max(want);
+                need.slots = need
+                    .slots
+                    .max(want.saturating_add(self.bank.rel.leg.slots_free()));
                 self.log_floor_grant(turn_id, floor, ctx_tokens, page, page_bytes, floor_bytes);
             }
             AdmissionVerdict::Queue { reason } => {
@@ -4652,7 +4660,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 便捷入口:提交一个 turn 并泵到其完成,返回全文
     /// (多 turn 并发场景用 submit + pump 手动驱动)
     pub async fn generate(&mut self, prompt: impl Into<String>, max_new: usize) -> Result<String> {
-        let id = self.submit(prompt, max_new)?;
+        let id: u64 = self.submit(prompt, max_new)?;
         loop {
             match self.pump().await? {
                 TurnEvent::Completed { turn, text, .. } if turn == id => return Ok(text),

@@ -469,6 +469,71 @@ async fn failed_start_returns_gdn_row() {
     );
 }
 
+/// **P0 回归门（2026-11-08 真机）**：起 turn 失败只能弃**该 turn**。
+///
+/// 修复前：`schedule()` 把 `start_one` 失败当**引擎错误**上抛 ⇒ executor 走
+/// `abandon()`，而失败的 turn 从没进过 `active`，`abandon` 只能猜“活跃首” ⇒
+/// ① 在跑的 A 被连坐弃掉（客户端收 500）；② 失败请求的 sink 永远收不到终态，
+/// HTTP 永挂（`/debug/agent` 记“未结算”）。
+#[cfg(test)]
+#[tokio::test]
+async fn failed_start_does_not_kill_active_turn() {
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 2,
+        gdn_slots: 2,
+        min_gen_tokens: 1,
+        ..Default::default()
+    };
+    knobs.pool_tokens = Some(512);
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = 2;
+    let mut running = mock_engine_with(knobs).await;
+
+    // A：长 prompt（40 段 ≈ 157 tok），chunk=32 ⇒ 起 B 时仍在 prefill。
+    let prompt_a: Vec<String> = (0..40).map(|i| ((i * 13) % 97).to_string()).collect();
+    let (_s, a) = running
+        .submit_session_opts(Some(11), prompt_a.join(" "), 8, Default::default())
+        .expect("submit A");
+    for _ in 0..8 {
+        if running.turns.active_of(a).is_some() {
+            break;
+        }
+        running.pump().await.expect("pump A");
+    }
+    assert!(running.turns.active_of(a).is_some(), "A 应已起动");
+
+    // B：不同 prompt。把最后一行藏起来 ⇒ B 的 start_one 在 `borrow_row` 处拒。
+    let (_s, b) = running
+        .submit_session_opts(Some(12), "beta alpha gamma", 4, Default::default())
+        .expect("submit B");
+    running
+        .bank
+        .rel
+        .state
+        .borrow_row(owl_store::tier::Owner::System)
+        .expect("借走最后一行");
+
+    // 起 B 失败必须是**事件**（Failed{turn=B}），不是 `Err`（`Err` 会触发 abandon）。
+    let mut got_own_fail = false;
+    for _ in 0..32 {
+        match running.pump().await.expect("单 turn 启动失败不得报引擎错误") {
+            TurnEvent::Failed { turn, .. } if turn == b => {
+                got_own_fail = true;
+                break;
+            }
+            TurnEvent::Failed { turn, .. } => {
+                panic!("失败事件发给了错误的 turn {turn}（期望 {b}）")
+            }
+            _ => {}
+        }
+    }
+    assert!(got_own_fail, "启动失败的 turn 必须收到自己的 Failed（否则 HTTP 永挂）");
+    assert!(running.turns.active_of(a).is_some(), "在跑的 A 不得被连坐弃掉");
+    assert!(running.turns.active_of(b).is_none(), "B 从没进 active");
+}
+
 /// 通用 CPU mock 引擎（自定义 knobs；F-22 用例等）。
 #[cfg(test)]
 async fn mock_engine_with(

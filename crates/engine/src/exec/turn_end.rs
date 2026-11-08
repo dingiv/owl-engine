@@ -48,11 +48,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         );
     }
     pub async fn abandon(&mut self, err: String) -> TurnEvent {
-        let turn_id = self
-            .turns
-            .executing
+        // **归属只从显式选择器取**（`schedule` 为本步选中的单 turn）；
+        // 无选择器时才退回“活跃首”（批动作失败 = 整批失败，弃行首让泵
+        // 继续 —— B5.1 的既有妥协）。⚠️ 启动失败**不得**走这里：那种 turn
+        // 从没进过 `active`，猜中谁都错（见 `schedule` 的 `start_one` 失败臂）。
+        let exec = self.turns.executing;
+        let turn_id = exec
             .or_else(|| self.turns.active.first().map(|a| a.id))
             .unwrap_or(0);
+        if exec.is_none() && !self.turns.active.is_empty() {
+            owl_shared::log_warn!(
+                "sched",
+                "abandon 无执行选择器（批动作/循环头错误）⇒ 按活跃首弃置 turn {turn_id}"
+            );
+        }
         // B5.1:只弃**本步执行 turn**(批步错 = 该行失败;其余活跃行留场,
         // 由服务面继续泵 —— 全清会把无辜会话连坐)。执行选择器缺省 = 活跃首
         // (批动作失败时未选定)。
@@ -62,29 +71,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(turn_id);
-        if turn_id == 0 {
-            // **归属不明 = 启动半态**（start_one 在 push 进 active 之前失败）。
-            // 引擎侧已无 turn 可弃，但 store 账里可能留着准入/Grant/行 ——
-            // 不收口就会永久占并发天花板。按"活跃集之外的准入条目 = 孤儿"收。
-            let live: Vec<u64> = self.turns.active.iter().map(|a| a.id).collect();
-            match self.bank.rel.finish_orphan_turns(&live) {
-                Ok(reps) if !reps.is_empty() => {
-                    for (t, r) in reps {
-                        owl_shared::log_warn!(
-                            "store",
-                            "孤儿 turn {t} 已收口（准入={} Grant={} 行={:?}）",
-                            r.admission,
-                            r.grants,
-                            r.row
-                        );
-                    }
-                    if let Err(e) = self.sync_pool_account() {
-                        owl_shared::log_warn!("store", "孤儿收口后账同步失败：{e}");
-                    }
+        // **孤儿收口恒开**（不只 `turn_id == 0`）：准入账里有、活跃集里没有的
+        // 条目只可能来自启动半态，收掉它是幂等且安全的（在册 turn 不被动）；
+        // 恒开 = 任何没被本函数归属到的半态都能自愈，而不是等下一次巧合同形。
+        let live: Vec<u64> = self.turns.active.iter().map(|a| a.id).collect();
+        match self.bank.rel.finish_orphan_turns(&live) {
+            Ok(reps) if !reps.is_empty() => {
+                for (t, r) in reps {
+                    owl_shared::log_warn!(
+                        "store",
+                        "孤儿 turn {t} 已收口（准入={} Grant={} 行={:?}）",
+                        r.admission,
+                        r.grants,
+                        r.row
+                    );
                 }
-                Ok(_) => {}
-                Err(e) => owl_shared::log_warn!("store", "孤儿 turn 收口失败：{e}"),
+                if let Err(e) = self.sync_pool_account() {
+                    owl_shared::log_warn!("store", "孤儿收口后账同步失败：{e}");
+                }
             }
+            Ok(_) => {}
+            Err(e) => owl_shared::log_warn!("store", "孤儿 turn 收口失败：{e}"),
         }
         TurnEvent::Failed { turn: turn_id, err }
     }

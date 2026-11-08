@@ -833,12 +833,9 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 不逐项手还，避免"漏还一项"的经典半态（2026-11-06 真机 3080）。
     /// `gdn_row = None` = 行还没借到（`borrow_row` 失败）；`Some` = 行已借出。
     ///
-    /// **先走准入收口**：HEAD 版 `close_admission` 还 Grant + 准入账；
-    /// 若 store 侧升级成 `finish_turn` 单一围栏（Grant+准入+行一次还），
-    /// 行也会被它收走。随后再补一次 `return_row`：
-    /// - HEAD：行在这里还（幂等成立）；
-    /// - `finish_turn` 已还：拿到"重复归还"错误，按 debug 忽略（不是故障）。
-    /// 两版引擎都能自洽；等 store 单一围栏提交后再删掉这次补还。
+    /// 行由围栏按 owner 收回；这里只做**正向核对**（`row_owner` 仍在 ⇒
+    /// 围栏没跑完，响亮 WARN）。不二次归还：重复归还必定 `Invariant`，
+    /// 拿错误当控制流会把真故障一起吞掉。
     fn rollback_failed_start(&mut self, turn_id: u64, gdn_row: Option<usize>, session_id: u64) {
         // **计划阶段已把复用链挂进会话表**（`plan_prefix_reuse` 对 m 块 incref）：
         // start 失败必须原样还掉，否则这些块 refs>1 ⇒ `sync_pool_account` 把整条
@@ -866,11 +863,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             );
         }
         self.close_admission(turn_id);
+        // 单一围栏已还行：这里只核对"确实不在账上"（不再二次归还 ——
+        // 重复归还必然 `Invariant`，用错误当控制流会把真故障也一起吞掉）。
         if let Some(row) = gdn_row {
-            if let Err(e) = self.bank.rel.state.return_row(row, None) {
-                owl_shared::log_debug!(
+            if self.bank.rel.state.row_owner(row).is_some() {
+                owl_shared::log_warn!(
                     "sched",
-                    "start_one 回滚:GDN 行已由准入围栏收走(turn {turn_id}, row {row}): {e}"
+                    "start_one 回滚:GDN 行 {row} 仍在账上（turn {turn_id}）—— 围栏未收走"
                 );
             }
         }
@@ -1697,15 +1696,45 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 what: "准入放行但无 Grant（store 账未发）".into(),
                             })?;
                     let turn_id = turn.id;
-                    begin = Some(match self.start_one(turn, grant).await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            // 启动失败 ⇒ 票必须归还，不能让一次失败吞掉容量。
-                            self.bank.rel.release_turn_grants(turn_id);
-                            return Err(e);
+                    match self.start_one(turn, grant).await {
+                        Ok(b) => {
+                            begin = Some(b);
+                            self.turns.admission.note_started(&facts);
                         }
-                    });
-                    self.turns.admission.note_started(&facts);
+                        Err(e) => {
+                            // **turn 级失败，不是引擎级失败**（2026-11-08 真机 P0）。
+                            // 启动失败的 turn 从没进过 `active`，而 `abandon` 只能
+                            // 从 `executing`/活跃首猜归属 ⇒ 返回 `Err` 会：① 把别家
+                            // 活跃 turn 连坐弃掉并给它发 500；② 失败请求的 sink 收
+                            // 不到终态（HTTP 永挂）。
+                            // 与 `reject_queued_turn` 同一口径：坏一个 turn，就只给
+                            // 它一个 `Failed`，泵继续跑（`Idle`/下一步都会排空队列）。
+                            self.bank.rel.release_turn_grants(turn_id);
+                            owl_shared::log_warn!(
+                                "sched",
+                                "turn {turn_id} 启动失败（只弃本 turn）：{e}"
+                            );
+                            // 错误不再上抛 ⇒  executor 的 `PoolExhausted ⇒
+                            // relieve_pressure` 也得在这里补上，否则池一直紧着，
+                            // 下一个长请求还会以同一形状失败。
+                            if matches!(e, ModelError::PoolExhausted { .. }) {
+                                match self.relieve_pressure().await {
+                                    Ok((freed, k, hkv, hsnap)) => owl_shared::log_warn!(
+                                        "store",
+                                        "显存压力:已收缩(还缓存 {freed} 块 + 目标腾 {k} KV 槽 + {hkv} KV 宿主块 + {hsnap} 快照)⇒ 泵继续"
+                                    ),
+                                    Err(pe) => owl_shared::log_warn!(
+                                        "store",
+                                        "收缩失败（继续跑,下次再试）: {pe}"
+                                    ),
+                                }
+                            }
+                            self.turns.pending_events.push_back(crate::turn::TurnEvent::Failed {
+                                turn: turn_id,
+                                err: e.to_string(),
+                            });
+                        }
+                    }
                 } else if let Some(g) = admission_grant.take() {
                     // 队首在判决后消失（理论竞态）⇒ 票必须归还。
                     self.bank.rel.release_turn_grants(g.turn);
