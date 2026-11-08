@@ -12,10 +12,10 @@
 | 🧠 | **KV-cache virtualization** — each turn materializes only its working set on the device; the full KV stays virtual and is recalled by attention-aware scoring | ✅ |
 | ⚡ | **Speculative decoding** — DFlash2 draft (d7) and MTP head, with spec-aware graph capture | ✅ |
 | 👁 | **Vision** — Qwen3.8-VL vision tower (m-RoPE, image scatter) served by the same engine | ✅ |
-| 🖥 | **CUDA + AMD (ROCm) ecosystems** — the backend is a vendor-agnostic HAL today; the second implementation is planned | 🎯 planned |
-| 🖼 | **Image KV transparent deletion** — drop an old screenshot from the history and keep the prefix cache hit (for GUI agents) | 🚧 upcoming |
-| 🧩 | **LoRA adapters + dynamic LoRA fine-tuning** — adapter registration, hot activation and rollback, with the full lifecycle (data → train → eval → serve) scoped in the design log | 🎯 planned |
+| 🖼 | **Image KV transparent deletion** — drop an old screenshot from the history and keep the prefix cache hit (for GUI agents) | ✅ |
 | 🔄 | **Model hot-swap** — drain in-flight turns, park the current model's weights (host RAM or disk) and bring another one up **on the same GPU**, so one deployment switches models without a restart | 🎯 planned |
+| 🖥 | **CUDA + AMD (ROCm) ecosystems** — the backend is a vendor-agnostic HAL today; the second implementation is planned | 🎯 planned |
+| 🧩 | **LoRA adapters + dynamic LoRA fine-tuning** — adapter registration, hot activation and rollback, with the full lifecycle (data → train → eval → serve) scoped in the design log | 🎯 planned |
 
 `✅ implemented` · `🎯 planned` · `🚧 in design`
 

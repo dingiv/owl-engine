@@ -85,6 +85,9 @@ pub struct EngineKnobs {
     /// 不转 K、不移动幸存 token 的 position**,新 token 从 `max_pos+1` 追加;
     /// 不重算删点之后的 token,可无限次丢弃旧图片缓存。依赖 `prefix_cache` + 分页池(f16 或 fp8-e4m3) + 视觉档(boot 门;任缺 = 拒启)。
     pub image_evict: bool,
+    /// **图片 leave-gap 的位置空洞预留**（token 数；`[runtime] gap_reserve_factor`）。
+    /// rope 表按 `max_seq + 本值` 建；多出来的位置只允许 gap 会话消费。
+    pub gap_reserve: usize,
     /// **页对齐 pad 词**(`[vision] image_evict_pad`;缺省 `。`;空串 = 自动)。
     /// 模型敏感项:27B 实测 `\n` 会让回答开头吐 `<`;`。` 干净。必须恰 1 token。
     pub image_evict_pad: String,
@@ -367,6 +370,7 @@ impl Default for EngineKnobs {
             int8_prefill_sync: true,
             bulk_drop_when_tier_full: false,
             image_evict: false,
+            gap_reserve: 0,
             image_evict_pad: "。".to_string(),
             host_cache_mb: 0,
             snap_host_mb: 0,
@@ -719,6 +723,7 @@ impl EngineKnobs {
             int8_prefill_sync: cfg.runtime.int8_prefill_sync,
             bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
             image_evict: cfg.vision.image_evict,
+            gap_reserve: cfg.runtime.gap_reserve_tokens(),
             image_evict_pad: cfg.vision.image_evict_pad.clone(),
             // 宿主层预算(S3-3;`[pool].host_cache_mb`)
             host_cache_mb: cfg.pool.host_cache_mb,
@@ -1290,9 +1295,23 @@ impl<D: DeviceClient + 'static> Engine<D> {
     /// 面类型 = 句柄(`DeviceHandle<D>`)—— 装载期的每一块都进事件账(Weight 类);
     /// `load` 旋钮来自配置(`[load]` 段;用户裁决 2026-10-19:不读 env)。
     pub fn loader(&mut self) -> ModelLoader<'_, DeviceHandle<D>> {
+        // **位置容量**：可用上下文（token 预算）仍是 max_seq；rope 表必须按
+        // `max_seq + gap 预留` 建 —— 预留只给 image leave-gap，正常会话到不了。
+        owl_shared::log_info!(
+            "boot",
+            "rope 位置容量：max_seq={} + gap 预留={} ⇒ 表长 ≥ {}（预留只给 image leave-gap）",
+            self.cfg.max_seq_tokens,
+            self.cfg.knobs.gap_reserve,
+            self.cfg.max_seq_tokens.saturating_add(self.cfg.knobs.gap_reserve)
+        );
         ModelLoader::new(&mut self.face, self.cfg.knobs.load.clone())
             .mtp_override(self.cfg.knobs.draft.mtp_dir.clone())
             .rope(self.cfg.knobs.rope.clone(), self.cfg.max_seq_tokens)
+            .rope_pos_cap(
+                self.cfg
+                    .max_seq_tokens
+                    .saturating_add(self.cfg.knobs.gap_reserve),
+            )
             .vision(self.cfg.knobs.vision)
             .mmproj(self.cfg.knobs.mmproj.clone())
     }

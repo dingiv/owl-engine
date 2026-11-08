@@ -534,6 +534,85 @@ async fn failed_start_does_not_kill_active_turn() {
     assert!(running.turns.active_of(b).is_none(), "B 从没进 active");
 }
 
+/// **位置压实（2026-11-08 图片 gap 预留）**：位置高水位用尽 ⇒ 本次不再
+/// leave-gap，而是重置位置账 + 复用紧凑前缀冷灌。
+///
+/// 构造：暖一轮建立紧凑前缀链；把会话位置账抬到 `pos_cap` 附近（模拟历史
+/// 删图留下的 gap）；下一 turn 的 `pos_hi + max_new` 越界 ⇒ 必须触发。
+#[cfg(test)]
+#[tokio::test]
+async fn position_consolidation_resets_high_water() {
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 1,
+        gdn_slots: 1,
+        min_gen_tokens: 1,
+        // mock 的 max_seq_tokens = 256 ⇒ pos_cap = 256 + 64 = 320
+        gap_reserve: 64,
+        ..Default::default()
+    };
+    knobs.pool_tokens = Some(256);
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = 2;
+    let mut running = mock_engine_with(knobs).await;
+
+    // 暖一轮：建立会话 + 紧凑位置账 + 前缀链（进缓存）。
+    let prompt = "amber basin cobalt delta ember";
+    let (sid, warm) = running
+        .submit_session_opts(Some(7), prompt, 4, Default::default())
+        .expect("submit warm");
+    loop {
+        match running.pump().await.expect("pump warm") {
+            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. }
+                if turn == warm =>
+            {
+                break
+            }
+            _ => {}
+        }
+    }
+    assert!(!running.bank.sessions.get(sid).expect("会话").positioned);
+
+    // 模拟“删图留下的大 gap”：把位置账抬到 319（末位）。
+    {
+        let s = running.bank.sessions.get_mut(sid).expect("会话");
+        let n = s.positions.len();
+        let base = 319 - (n as i32 - 1);
+        for (i, p) in s.positions.iter_mut().enumerate() {
+            *p = [base + i as i32; 3];
+        }
+        s.max_pos = 319;
+        s.positioned = true;
+    }
+
+    // 下一 turn：pos_hi 319 + max_new 8 = 327 ≥ 320 ⇒ 本次压实。
+    let prompt2 = format!("{prompt} fable");
+    let (_s, tid) = running
+        .submit_session_opts(Some(7), prompt2, 8, Default::default())
+        .expect("submit compact");
+    let mut done = false;
+    for _ in 0..64 {
+        match running.pump().await.expect("pump compact") {
+            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. }
+                if turn == tid =>
+            {
+                done = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(done, "压实 turn 必须完成");
+    let s = running.bank.sessions.get(sid).expect("会话");
+    assert!(
+        s.max_pos < 256,
+        "压实后位置必须回到紧凑坐标：max_pos={}",
+        s.max_pos
+    );
+    assert!(!s.positioned, "压实后不再带位置洞");
+}
+
 /// 通用 CPU mock 引擎（自定义 knobs；F-22 用例等）。
 #[cfg(test)]
 async fn mock_engine_with(

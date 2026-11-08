@@ -70,6 +70,11 @@ queue_wait_ms = 0
 keepalive_ms = 1000
 # 上下文上限(token)
 max_seq = 32768
+# **图片 leave-gap 的位置空洞预留**（`max_seq` 的倍数；0 = 关）。
+# 可用上下文仍是 max_seq，rope 表按 max_seq + 本值×max_seq 建；多出来的位置
+# 只允许被 image 无感删除的 gap 消费（正常会话 pos_hi = n_tokens，进不来）。
+# 0.5 ⇒ 32768 档预留 16384 位置（≈8 张 2k 截图）；用尽即触发一次位置压实。
+gap_reserve_factor = 0.5
 # INT8 prefill 末块前设备栅栏（1k 质量门；false 仅 A/B/性能测量）
 int8_prefill_sync = true
 # 预填块长 / 尾块合并阈值(剩余 ≤ chunk + tail_merge ⇒ 一口气吃完)
@@ -137,7 +142,7 @@ tp_vocab_split = false
 # 对外模型名(空 = GGUF 用文件名 / 其它用服务端缺省)
 name = "qwen3.8-27b"
 # 模型路径:目录(safetensors / awq)或 .gguf 单文件
-path = "../../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
+path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
 # 权重摆放格式:safetensors | awq | gguf
 format = "awq"
 # 主干量化方案(2026-10-30 白名单口径;权威表 = owl_engine::load_arm_of):

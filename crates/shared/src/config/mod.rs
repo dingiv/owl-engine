@@ -533,6 +533,14 @@ pub struct RuntimeCfg {
     #[serde(default)]
     pub keepalive_ms: usize,
     pub max_seq: usize,
+    /// **图片 leave-gap 的位置空洞预留**（以 `max_seq` 为单位；默认 **0.5**，0 = 关）。
+    ///
+    /// 语义：可用上下文仍是 `max_seq`（token 预算不变），但 rope 表按
+    /// `max_seq + 0.5·max_seq` 建 —— 多出来的位置**只允许被 image leave-gap 消费**
+    /// （正常会话 pos_hi = n_tokens ≤ max_seq，进不了这一段）。
+    /// 262144 档 ⇒ 预留 131072 位置（≈65 张 2k 截图）；用尽即触发一次位置压实。
+    #[serde(default = "default_gap_reserve_factor")]
+    pub gap_reserve_factor: f64,
     pub prefill_chunk: usize,
     /// **INT8 prefill 末块前设备栅栏**（2026-11-04 1k 质量门；缺省 true）。
     /// 关闭仅供 A/B / 性能测量：1k needle 会固定丢 `M`。
@@ -1819,6 +1827,11 @@ pub struct LogCfg {
 }
 
 /// serde 缺省 = true(布尔配置项的显式缺省;避免 `#[serde(default)]` 落到 false)
+/// 图片 leave-gap 的位置预留（`max_seq` 的倍数；0 = 关）。
+fn default_gap_reserve_factor() -> f64 {
+    0.5
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2052,6 +2065,27 @@ pub struct OwlConfig {
     pub log: LogCfg,
 }
 
+impl RuntimeCfg {
+    /// **gap 预留的 token 数**（0 = 关）。
+    ///
+    /// `gap_reserve_factor = 0.5` ⇒ `max_seq / 2`。只影响 rope 表长与位置压实
+    /// 触发点，**不改** token 预算（`max_seq`）。
+    pub fn gap_reserve_tokens(&self) -> usize {
+        if !self.gap_reserve_factor.is_finite() || self.gap_reserve_factor <= 0.0 {
+            return 0;
+        }
+        (self.max_seq as f64 * self.gap_reserve_factor).round() as usize
+    }
+
+    /// **rope 表的位置容量** = 可用上下文 + gap 预留。
+    ///
+    /// 正常会话永远到不了 `(max_seq, pos_cap]`（pos_hi = n_tokens ≤ max_seq）；
+    /// 这一段专属 leave-gap。核里对 pos 无边界检查 ⇒ 超限必须在引擎侧挡/压实。
+    pub fn rope_pos_cap(&self) -> usize {
+        self.max_seq.saturating_add(self.gap_reserve_tokens())
+    }
+}
+
 impl Default for RuntimeCfg {
     fn default() -> Self {
         Self {
@@ -2064,6 +2098,7 @@ impl Default for RuntimeCfg {
             queue_wait_ms: 0,
             keepalive_ms: 1000,
             max_seq: 4096,
+            gap_reserve_factor: default_gap_reserve_factor(),
             prefill_chunk: 512,
             int8_prefill_sync: true,
             max_batch: 1,
@@ -2976,6 +3011,16 @@ impl OwlConfig {
                 self.model.rope.yarn_factor, self.model.format
             ));
         }
+        // **图片 gap 预留**（2026-11-08）：倍数必须有限且非负；上限 8 防手滑
+        // （当前档 max_seq ≤ 1M，8× 会让 rope 表吃掉几十 GB）。
+        if !(self.runtime.gap_reserve_factor.is_finite()
+            && (0.0..=8.0).contains(&self.runtime.gap_reserve_factor))
+        {
+            return Err(format!(
+                "[runtime] gap_reserve_factor = {} 非法（需有限且 ∈ [0,8]；0 = 关）",
+                self.runtime.gap_reserve_factor
+            ));
+        }
         // 2026-11-04:`kv_fp8`/`kv_int8` 两布尔已并为 `kv_dtype`(枚举三类)。
         // 旧键在反序列化期就被 `deny_unknown_fields` 拒 ⇒ 这里不再有"互斥"可查。
         // 唯一保留的跨键语义:`prefill_shadow` 只对 fp8 主池有意义。
@@ -3792,6 +3837,37 @@ mod extends_tests {
         assert_eq!(c.pool.snap_max, 2, "后列覆盖前列");
         assert_eq!(c.runtime.max_concurrency, 1, "自身键生效");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **图片 gap 预留**（2026-11-08）：默认 0.5×max_seq，0 = 关；
+    /// 非法倍数必须在配置面拒启（不在跑起来后除以负数/NaN）。
+    #[test]
+    fn gap_reserve_derives_from_max_seq() {
+        let c = OwlConfig::from_toml_str("[runtime]\nmax_seq = 262144\n").expect("解析");
+        assert!((c.runtime.gap_reserve_factor - 0.5).abs() < 1e-12, "默认 0.5");
+        assert_eq!(c.runtime.gap_reserve_tokens(), 131_072, "0.5 × 262144");
+        assert_eq!(c.runtime.rope_pos_cap(), 393_216, "ctx + 预留");
+
+        let c = OwlConfig::from_toml_str(
+            "[runtime]\nmax_seq = 1024\ngap_reserve_factor = 0.0\n",
+        )
+        .expect("解析");
+        assert_eq!(c.runtime.gap_reserve_tokens(), 0, "0 = 关");
+        assert_eq!(c.runtime.rope_pos_cap(), 1024);
+
+        let c = OwlConfig::from_toml_str(
+            "[runtime]\nmax_seq = 1000\ngap_reserve_factor = 0.25\n",
+        )
+        .expect("解析");
+        assert_eq!(c.runtime.gap_reserve_tokens(), 250);
+
+        for bad in ["-1.0", "9.0", "nan"] {
+            let e = OwlConfig::from_toml_str(&format!(
+                "[runtime]\ngap_reserve_factor = {bad}\n"
+            ))
+            .expect_err("非法倍数必须拒");
+            assert!(e.contains("gap_reserve_factor"), "{e}");
+        }
     }
 
     /// **绝对路径 + 环检测**:`a → b → a` 必须响亮拒(打印链)。

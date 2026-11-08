@@ -446,6 +446,20 @@ pub fn budget_clamp(
     Ok(room)
 }
 
+/// **位置压实判定**（图片 leave-gap 的位置空洞用尽）。
+///
+/// `pos_hi` = 本 turn 已用到的最大 rope 位置（0 基）。本 turn 还要生成
+/// `max_new` 枚 token ⇒ 会用到 `pos_hi+1 ..= pos_hi+max_new`；rope 表合法下标
+/// 是 `0..pos_cap-1` ⇒ 安全条件 `pos_hi + max_new < pos_cap`。
+///
+/// 违反 ⇒ **本 turn 必须先压实**（位置账归零重算），否则核会越界读 rope 表
+/// （`rope_f32.cu` 对 pos 无边界检查）。正常（非 gap）会话不可能触发：
+/// token 预算保证 `pos_hi = n_tokens ≤ max_seq < pos_cap`。
+pub fn needs_consolidation(pos_hi: i32, max_new: usize, pos_cap: usize) -> bool {
+    let pos_hi = pos_hi.max(0) as usize;
+    pos_hi.saturating_add(max_new) >= pos_cap
+}
+
 /// **半表行拼接**（P1.1 词表切；纯函数 —— 判据可单测）：
 /// `[rows, half] × 2 → [rows, 2·half]`。
 ///
@@ -737,7 +751,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///
     /// 返回 `(positions, positions_gap)`;`positions_gap=true` 表示位置已
     /// 离开紧凑坐标,调用方须禁用跨会话内容缓存。
-    fn prompt_positions(
+    pub(crate) fn prompt_positions(
         &self,
         session: Option<u64>,
         prompt_ids: &[u32],
@@ -1923,6 +1937,54 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// **生命周期收尾**（Phase 3）：H3 链登记/盘索引 + H6 表/引用归零 +
     /// GDN 行归还 + 归属下行 + N4 清点/force release/trim。
+    /// **H3 链登记**（TurnEnd/Abort 都发）。
+    ///
+    /// **位置空洞会话不发布**（2026-11-08）：链身份只有 token（+图像指纹），
+    /// 位置基准不在身份里；gapped 会话的 KV 是在非紧凑坐标下算的，发布出去
+    /// 会被别的紧凑会话按 token 命中 ⇒ **静默错值**。
+    ///
+    /// 第一个 gap 之前的前缀在早先的紧凑 turn 里已经登记过（position 未变），
+    /// 压实后仍能复用它；这里只拦 gapped 尾巴，不影响“尽量复用”。
+    fn publish_turn_chain(
+        &mut self,
+        session: u64,
+        turn: u64,
+        kind: ReleaseKind,
+    ) -> Result<()> {
+        let Some(s) = self.bank.sessions.get(session) else {
+            return Ok(());
+        };
+        if s.positioned {
+            owl_shared::log_debug!(
+                "prefix",
+                "leave-gap 会话不发布链：session={session:#x} turn={turn}（位置非紧凑）"
+            );
+            return Ok(());
+        }
+        // 指纹 = 会话账的 pad 后坐标(span 已在 submit 侧按像素盖章)
+        let tags = crate::img_evict::block_tags(
+            s.tokens.len(),
+            self.dev.pool.geom.page.max(1),
+            &s.img_spans,
+        );
+        let up = self.bank.rel.leg.register_chain_owned_tagged(
+            &s.tokens,
+            &s.block_table,
+            session,
+            &tags,
+        )?;
+        if self.boot.cfg.knobs.probes.debug {
+            owl_shared::log_debug!(
+                "dbg prefix",
+                "register_chain({kind:?}): 块表={} 新入={} 逐出={}",
+                s.block_table.len(),
+                up.inserted.len(),
+                up.evicted.len()
+            );
+        }
+        Ok(())
+    }
+
     async fn store_release(&mut self, release: Release) -> Result<StoreOutcome> {
         let turn = release.turn;
         // **P0-4：Release 归还本 turn 的全部 Grant**（幂等；准入收口也会再调一次）。
@@ -1943,30 +2005,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // (中断路径已把"已写入"写回会话账)。
         // 盘索引/空转拍仍只给 TurnEnd:中断路径要便宜。
         if release.publish && self.dev.pool.geom.paged {
-            if let Some(s) = self.bank.sessions.get(release.session) {
-                // 指纹 = 会话账的 pad 后坐标(span 已在 submit 侧按像素盖章)
-                let tags = crate::img_evict::block_tags(
-                    s.tokens.len(),
-                    self.dev.pool.geom.page.max(1),
-                    &s.img_spans,
-                );
-                let up = self.bank.rel.leg.register_chain_owned_tagged(
-                    &s.tokens,
-                    &s.block_table,
-                    release.session,
-                    &tags,
-                )?;
-                if self.boot.cfg.knobs.probes.debug {
-                    owl_shared::log_debug!(
-                        "dbg prefix",
-                        "register_chain({:?}): 块表={} 新入={} 逐出={}",
-                        release.kind,
-                        s.block_table.len(),
-                        up.inserted.len(),
-                        up.evicted.len()
-                    );
-                }
-            }
+            self.publish_turn_chain(release.session, turn, release.kind)?;
         }
         // ── H3b：盘索引 / 空转拍（只给正常收尾）─────────────────
         if release.kind == ReleaseKind::TurnEnd {
@@ -4766,6 +4805,25 @@ mod head_concat_tests {
 mod budget_tests {
     //! 预算收缩单测(纯;工作区 pi 场景的实际数字)
     use super::{budget_clamp, _MIN_GEN_TOKENS};
+
+    /// **位置压实触发边界**（2026-11-08 图片 gap 预留）：
+    /// 安全条件 = `pos_hi + max_new < pos_cap`；`==` 已越界。
+    #[test]
+    fn consolidates_only_when_positions_would_overflow() {
+        use super::needs_consolidation;
+        // 262144 ctx + 0.5 预留 = 393216；leading gap 用到 393200 时：
+        assert!(needs_consolidation(393_200, 16, 393_216), "末位 393216 越界");
+        assert!(!needs_consolidation(393_200, 15, 393_216), "末位 393215 安全");
+        // 边界：末位 = pos_cap-1 安全；= pos_cap 触发
+        assert!(!needs_consolidation(98, 1, 100), "末位 99 安全");
+        assert!(needs_consolidation(99, 1, 100), "末位 100 越界");
+        assert!(!needs_consolidation(99, 0, 100), "prompt 末位 99 安全");
+        assert!(needs_consolidation(100, 0, 100), "prompt 本身已越界");
+        // 非 gap 会话：pos_hi = n_tokens ≤ max_seq < pos_cap ⇒ 永不触发
+        assert!(!needs_consolidation(262_144, 0, 393_216));
+        // 负数/异常账不得 panic，按 0 处理
+        assert!(!needs_consolidation(-5, 0, 10));
+    }
 
     #[test]
     fn clamps_instead_of_rejecting() {

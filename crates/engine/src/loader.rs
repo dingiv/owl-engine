@@ -118,6 +118,8 @@ pub struct ModelLoader<'a, D: DeviceClient> {
     rope: owl_shared::config::RopeCfg,
     /// 单 turn 预算(`runtime.max_seq`;YaRN 表长至少覆盖它)
     max_seq: usize,
+    /// **rope 表位置容量**(= max_seq + 图片 gap 预留;0 = 同 max_seq)。
+    rope_pos_cap: usize,
     /// 视觉塔(`[vision] enabled`;false = 纯文本路径逐字节不变)
     vision: bool,
     /// GGUF 视觉塔单文件(`[vision] path`;None = 同目录唯一候选)
@@ -139,6 +141,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
             vocab_split: false,
             rope: owl_shared::config::RopeCfg::default(),
             max_seq: 0,
+            rope_pos_cap: 0,
             vision: false,
             mmproj: None,
             mtp_override: None,
@@ -157,6 +160,15 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
     pub fn rope(mut self, rope: owl_shared::config::RopeCfg, max_seq: usize) -> Self {
         self.rope = rope;
         self.max_seq = max_seq;
+        self
+    }
+
+    /// **rope 表位置容量**（`runtime.max_seq + gap 预留`）。
+    ///
+    /// 表长 = `max(模型原生, 本值)`；多出来的位置只允许被图片 leave-gap 消费
+    /// （正常会话 `pos_hi = n_tokens ≤ max_seq` 进不来）。
+    pub fn rope_pos_cap(mut self, pos_cap: usize) -> Self {
+        self.rope_pos_cap = pos_cap;
         self
     }
 
@@ -276,7 +288,7 @@ impl<D: DeviceClient + 'static> ModelLoader<'_, D> {
         let model = Arc::new(built.model);
 
         let tok = src.tokenizer()?;
-        let rope = src.rope(&self.rope, self.max_seq)?;
+        let rope = src.rope(&self.rope, self.max_seq, self.rope_pos_cap.max(self.max_seq))?;
         src.log_facts(&rope, tok.n_tokens, &self.rope);
         let ctx = self.shard_ctx(spec.dtype);
         owl_models::interpreters::eval_load(&rope, self.face, &rope.tables(), &ctx).await?;

@@ -629,6 +629,75 @@ impl<D: DeviceClient> RunningEngine<D> {
         } else {
             turn.prompt_ids.len()
         };
+        // **位置压实判定**（图片 leave-gap 的位置空洞用尽；2026-11-08）。
+        //
+        // 只看位置高水位：`pos_hi + max_new >= pos_cap` ⇒ 本 turn 不再走
+        // leave-gap（这次不秒回），而是**重置位置账 + 冷灌**。`pos_cap =
+        // max_seq + gap 预留`；正常（非 gap）会话 pos_hi = n_tokens ≤ max_seq，
+        // 永远不会触发。
+        let consolidate = {
+            let pos_hi = turn
+                .positions
+                .iter()
+                .flat_map(|p| p.iter())
+                .copied()
+                .max()
+                .unwrap_or(-1);
+            let pos_cap = self
+                .boot
+                .cfg
+                .max_seq_tokens
+                .saturating_add(self.boot.cfg.knobs.gap_reserve);
+            turn.positions_gap && crate::running::needs_consolidation(pos_hi, turn.spec.max_new, pos_cap)
+        };
+        let mut turn = turn;
+        if consolidate {
+            let pos_before = turn.positions.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(-1);
+            // 重置会话位置账 ⇒ 之后 `prompt_positions` 走 compact 分支
+            self.reset_session_for_rebuild(turn.session_id)?;
+            let (pos, gap) = self.prompt_positions(
+                Some(turn.session_id),
+                &turn.prompt_ids,
+                &turn.img_spans,
+                None,
+            )?;
+            turn.positions = pos;
+            turn.positions_gap = gap;
+            owl_shared::log_info!(
+                "img-evict",
+                "位置压实：turn {} session={:#x} pos {pos_before} → {}（tokens {}，pos_cap {}）⇒ 本次冷灌并复用紧凑前缀",
+                turn.id,
+                turn.session_id,
+                turn.positions.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(-1),
+                turn.prompt_ids.len(),
+                self.boot.cfg.max_seq_tokens.saturating_add(self.boot.cfg.knobs.gap_reserve)
+            );
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("img_evict.consolidate", 1, file!(), line!());
+            });
+        }
+
+        // **硬护栏**：本 turn 用到的位置必须落在 rope 表内（核里对 pos 无边界
+        // 检查 —— `rope_f32.cu` 直接 `cos_t[p*half]`）。表长 = max(模型原生,
+        // max_seq + gap 预留)；压实后 pos_hi 是紧凑坐标，正常远低于表长。
+        {
+            let table = self.dev.boot.rope.max_pos();
+            let pos_hi = turn
+                .positions
+                .iter()
+                .flat_map(|p| p.iter())
+                .copied()
+                .max()
+                .unwrap_or(-1)
+                .max(0) as usize;
+            if pos_hi.saturating_add(turn.spec.max_new) >= table {
+                return Err(ModelError::Msg(format!(
+                    "rope 位置越界：pos_hi {pos_hi} + max_new {} ≥ 表长 {table}                     （gap 预留未接线 / 位置压实未触发）",
+                    turn.spec.max_new
+                )));
+            }
+        }
+
         let prep = (|| -> Result<(
             usize,
             Option<owl_store::SnapKey>,
@@ -637,7 +706,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             Option<LazySeed>,
         )> {
             let (cached_len, restore_key, pending_loads, image_exec, lazy_view) =
-                if turn.deletion.is_some() {
+                if consolidate {
+                    // 压实：位置账已归零，直接复用缓存里的紧凑前缀（不走 leave-gap）
+                    let (c, r, pl, lz) = self.plan_prefix_reuse(&turn)?;
+                    (c, r, pl, None, lz)
+                } else if turn.deletion.is_some() {
                     match self.plan_image_leave_gap(&turn)? {
                         Some(p) => {
                             let (c, r, pl, im) = self.apply_image_leave_gap(p, &turn)?;
@@ -891,7 +964,17 @@ impl<D: DeviceClient> RunningEngine<D> {
         Vec<(usize, owl_store::ChainHash)>,
         Option<LazySeed>,
     )> {
-        let s = self.bank.sessions.session_mut(turn.session_id)?;
+        self.reset_session_for_rebuild(turn.session_id)?;
+        Ok((0, None, Vec::new(), None))
+    }
+
+    /// **会话重建前置**：释放块表/MTP 链 + 会话账归零（`rebase`）。
+    ///
+    /// 两个调用者：`plan_fresh`（零复用冷灌）与**位置压实**（之后还要
+    /// `plan_prefix_reuse` 捞紧凑前缀）。`rebase` 会清 positions/max_pos/
+    /// positioned 并 `position_epoch += 1`。
+    fn reset_session_for_rebuild(&mut self, session_id: u64) -> Result<()> {
+        let s = self.bank.sessions.session_mut(session_id)?;
         let mut table = std::mem::take(&mut s.block_table);
         self.bank.rel.leg.release_table(&mut table)?;
         let mut mold = std::mem::take(&mut s.mtp_block_table);
@@ -901,7 +984,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             self.bank.leg_mtp.release_table(&mut mold)?;
         }
         s.rebase();
-        Ok((0, None, Vec::new(), None))
+        Ok(())
     }
 
     /// **leave-gap 删除计划**(纯 host):摘掉被删图像页,保留前缀/后缀页,
