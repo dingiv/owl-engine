@@ -120,7 +120,7 @@ impl Client {
         Ok(total)
     }
 
-    pub fn chat(&self, req: ChatRequest) -> io::Result<ChatReply> {
+    fn request_body(&self, req: &ChatRequest) -> Value {
         let mut body = serde_json::json!({
             "messages": req.messages,
             "stream": true,
@@ -140,7 +140,11 @@ impl Client {
         if let Some(kwargs) = &req.chat_template_kwargs {
             body["chat_template_kwargs"] = kwargs.clone();
         }
-        let payload = body.to_string();
+        body
+    }
+
+    pub fn chat(&self, req: ChatRequest) -> io::Result<ChatReply> {
+        let payload = self.request_body(&req).to_string();
         let t0 = Instant::now();
         let mut stream = self.connect()?;
         let head = format!(
@@ -169,6 +173,55 @@ impl Client {
         Ok(reply)
     }
 
+    /// **流式 chat**(逐 delta 回调;双会话并发门用)。
+    ///
+    /// 与 [`Self::chat`] 同一条请求/同一份解析,只是**不等整个 body** ——
+    /// 每读到一个内容/推理 delta 就回调一次(用于"等第一个 token / 记录 ITL")。
+    /// 回调里**不许做阻塞 I/O**(它在 SSE 读取线程上)。
+    pub fn chat_stream<F>(&self, req: ChatRequest, mut on_delta: F) -> io::Result<ChatReply>
+    where
+        F: FnMut(&str),
+    {
+        let payload = self.request_body(&req).to_string();
+        let t0 = Instant::now();
+        let mut stream = self.connect()?;
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            self.host,
+            payload.len()
+        );
+        stream.write_all(head.as_bytes())?;
+        stream.write_all(payload.as_bytes())?;
+        let (status, mut reader, chunked) = read_head(stream)?;
+        if status != 200 {
+            let raw = read_body(&mut reader, chunked)?;
+            let msg = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or(raw);
+            return Err(io::Error::other(format!("HTTP {status}: {msg}")));
+        }
+        let mut acc = SseAccum::default();
+        if chunked {
+            let mut br = BufReader::new(DechunkReader {
+                inner: &mut reader,
+                remaining: 0,
+                done: false,
+            });
+            pump_sse(&mut br, &mut acc, &mut on_delta)?;
+        } else {
+            pump_sse(&mut reader, &mut acc, &mut on_delta)?;
+        }
+        let mut reply = acc.finish()?;
+        reply.elapsed_ms = t0.elapsed().as_millis();
+        Ok(reply)
+    }
+
     fn connect(&self) -> io::Result<TcpStream> {
         let s = TcpStream::connect(&self.host).map_err(|e| match e.kind() {
             io::ErrorKind::ConnectionRefused => {
@@ -183,23 +236,66 @@ impl Client {
 }
 
 fn parse_sse(raw: &str) -> io::Result<ChatReply> {
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
-    let mut finish: Option<String> = None;
-    let mut usage = Usage::default();
-    let mut saw_done = false;
+    let mut acc = SseAccum::default();
     for line in raw.lines() {
         let line = line.trim_end_matches('\r');
         let Some(data) = line.strip_prefix("data: ") else { continue };
         if data.trim() == "[DONE]" {
-            saw_done = true;
+            acc.done = true;
             break;
         }
         let v: Value = match serde_json::from_str(data) {
             Ok(v) => v,
             Err(_) => continue,
         };
+        drop(acc.apply(&v)?);
+    }
+    acc.finish()
+}
+
+/// **逐行 SSE 泵**(流式面):读到 `[DONE]`/EOF 即止,delta 逐条回调。
+fn pump_sse<R: BufRead, F: FnMut(&str)>(
+    reader: &mut R,
+    acc: &mut SseAccum,
+    on_delta: &mut F,
+) -> io::Result<()> {
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        let line = line.trim_end_matches('\n').trim_end_matches('\r');
+        let Some(data) = line.strip_prefix("data: ") else { continue };
+        if data.trim() == "[DONE]" {
+            acc.done = true;
+            break;
+        }
+        let v: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(piece) = acc.apply(&v)? {
+            on_delta(&piece);
+        }
+    }
+    Ok(())
+}
+
+/// SSE 事件累加器(整体解析与流式解析**同源**)。
+#[derive(Default)]
+struct SseAccum {
+    content: String,
+    reasoning: String,
+    calls: BTreeMap<usize, ToolCall>,
+    finish: Option<String>,
+    usage: Usage,
+    done: bool,
+}
+
+impl SseAccum {
+    /// 应用一条 `data:` JSON;返回本次新增的文本片段(无则 None)。
+    fn apply(&mut self, v: &Value) -> io::Result<Option<String>> {
         if let Some(err) = v.get("error") {
             let msg = err
                 .get("message")
@@ -209,15 +305,15 @@ fn parse_sse(raw: &str) -> io::Result<ChatReply> {
             return Err(io::Error::other(format!("流内错误: {msg}")));
         }
         if let Some(u) = v.get("usage") {
-            usage.prompt_tokens = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-            usage.completion_tokens =
+            self.usage.prompt_tokens = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+            self.usage.completion_tokens =
                 u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
-            usage.cached_tokens = u
+            self.usage.cached_tokens = u
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            usage.reasoning_tokens = u
+            self.usage.reasoning_tokens = u
                 .get("completion_tokens_details")
                 .and_then(|d| d.get("reasoning_tokens"))
                 .and_then(Value::as_u64)
@@ -228,25 +324,28 @@ fn parse_sse(raw: &str) -> io::Result<ChatReply> {
             .and_then(|c| c.as_array())
             .and_then(|a| a.first())
         else {
-            continue;
+            return Ok(None);
         };
         if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
-            finish = Some(fr.to_string());
+            self.finish = Some(fr.to_string());
         }
-        let Some(delta) = choice.get("delta") else { continue };
+        let Some(delta) = choice.get("delta") else { return Ok(None) };
+        let mut piece = String::new();
         if let Some(s) = delta.get("content").and_then(Value::as_str) {
-            content.push_str(s);
+            self.content.push_str(s);
+            piece.push_str(s);
         }
         for key in ["reasoning_content", "reasoning", "reasoning_text"] {
             if let Some(s) = delta.get(key).and_then(Value::as_str) {
-                reasoning.push_str(s);
+                self.reasoning.push_str(s);
+                piece.push_str(s);
                 break;
             }
         }
         if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
             for tc in tcs {
                 let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let e = calls.entry(idx).or_insert_with(|| ToolCall {
+                let e = self.calls.entry(idx).or_insert_with(|| ToolCall {
                     index: idx,
                     id: String::new(),
                     name: String::new(),
@@ -265,29 +364,33 @@ fn parse_sse(raw: &str) -> io::Result<ChatReply> {
                 }
             }
         }
+        Ok(if piece.is_empty() { None } else { Some(piece) })
     }
-    let mut tool_calls: Vec<ToolCall> = calls.into_values().collect();
-    for tc in &mut tool_calls {
-        if tc.arguments.trim().is_empty() {
-            tc.arguments = "{}".to_string();
+
+    fn finish(self) -> io::Result<ChatReply> {
+        let mut tool_calls: Vec<ToolCall> = self.calls.into_values().collect();
+        for tc in &mut tool_calls {
+            if tc.arguments.trim().is_empty() {
+                tc.arguments = "{}".to_string();
+            }
+            if tc.name.is_empty() {
+                return Err(io::Error::other(format!("tool_call[{0}] 缺 name", tc.index)));
+            }
         }
-        if tc.name.is_empty() {
-            return Err(io::Error::other(format!("tool_call[{0}] 缺 name", tc.index)));
+        if !self.done && self.finish.is_none() {
+            return Err(io::Error::other(
+                "SSE 结束但既无 [DONE] 也无 finish_reason(服务端可能被中断)",
+            ));
         }
+        Ok(ChatReply {
+            content: self.content,
+            reasoning: self.reasoning,
+            tool_calls,
+            finish_reason: self.finish.unwrap_or_else(|| "stop".to_string()),
+            usage: self.usage,
+            elapsed_ms: 0,
+        })
     }
-    if !saw_done && finish.is_none() {
-        return Err(io::Error::other(
-            "SSE 结束但既无 [DONE] 也无 finish_reason(服务端可能被中断)",
-        ));
-    }
-    Ok(ChatReply {
-        content,
-        reasoning,
-        tool_calls,
-        finish_reason: finish.unwrap_or_else(|| "stop".to_string()),
-        usage,
-        elapsed_ms: 0,
-    })
 }
 
 fn read_head(stream: TcpStream) -> io::Result<(u16, BufReader<TcpStream>, bool)> {

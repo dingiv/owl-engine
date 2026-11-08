@@ -801,9 +801,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                 "store",
                 "turn {turn} 起点缺口 {shortage} 槽（需 {delta} / 空闲 {free}）⇒ 先腾位"
             );
+            // ⚠️ `Need.slots` = **绝对需求**（`plan_capacity` 自己减 `slots_free`）；
+            // 传差额会把腾位量算成 `delta - 2*free`（free 大时直接 no-op）。
             let applied = self
                 .pool_housekeeping(
-                    owl_store::Need::kv(shortage, owl_store::NeedWhy::Grow),
+                    owl_store::Need::kv(delta, owl_store::NeedWhy::Grow),
                     &[],
                     None,
                 )

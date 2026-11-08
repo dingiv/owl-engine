@@ -8,6 +8,7 @@
 //! window), `gui-capability` (ambiguous capability prompt must still call
 //! screenshot), `image-evict` (image-deletion shapes), and `all` (alias of core).
 
+pub mod concurrency;
 pub mod gui;
 pub mod png;
 pub mod report;
@@ -84,15 +85,20 @@ pub fn run(args: Args) -> i32 {
     if !matches!(
         suite.as_str(),
         "core" | "image-evict" | "gui" | "gui-capability" | "vision-identity" | "all"
+            | "decode-prefill"
     ) {
         eprintln!(
             "[workload] 未知 suite {suite:?}(core | image-evict | gui | gui-capability | \
-             vision-identity | all)"
+             vision-identity | decode-prefill | all)"
         );
         return 2;
     }
 
     let pid = std::process::id();
+    // **双会话并发门**（一 decode 一 prefill）走独立线程模型，不进 legacy 场景表。
+    if suite == "decode-prefill" {
+        return concurrency::run(&args, pid);
+    }
     // Keep well above the known DFlash2 tail-cap P0 (remaining <= depth): the
     // suite is spec-on, so a short max_tokens can wedge the engine at the tail.
     let max_tokens = args.max_tokens.max(2048);
