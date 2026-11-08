@@ -36,7 +36,9 @@
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cute/arch/cluster_sm90.hpp"
 #include "cutlass/arch/reg_reconfig.h"
-#include "cutlass/arch/mma_sm90.h"
+// `cutlass/arch/mma_sm90.h` 只在这颗头里被引,而它定义的是 2.x 风格的
+// `arch::Mma<SM90_*>` 算子（本 TU 用 **cute atom**，一个都没用到）⇒ 已删。
+// （它还会连带 `mma.h` → 整棵 2.x arch 树与 `cutlass/matrix.h` 355KB。）
 #include "cutlass/epilogue/collective/detail.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/dispatch_policy.hpp"

@@ -698,10 +698,11 @@ print(ThrMMA<TiledMMA, ThrVMNK> const& thr_mma)
 // 本仓只用 **sm120 稠密** 的块缩放 atom。
 // `sm75` 是 **FA2(vLLM fork)在 sm86 代际**要的(`SM75_16x8x8_F32F16F16F32_TN`
 // 当 `MMA_Atom_Arch`)—— 那份 vendor 源不在我们的裁切范围里,必须留着。
+// **sm90 / sm90_gmma 已裁(2026-10-29)**:本仓不例化任何 SM90 GMMA atom;
+// 只用到它们的 smem 布局原子与三个选路函数 —— 那些已搬到
+// `cu/nvfp4/owl_cutlass_gmma_shim.hpp`。
 #include <cute/atom/mma_traits_sm75.hpp>
 #include <cute/atom/mma_traits_sm80.hpp>
-#include <cute/atom/mma_traits_sm90.hpp>
-#include <cute/atom/mma_traits_sm90_gmma.hpp>
 #include <cute/atom/mma_traits_sm120.hpp>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

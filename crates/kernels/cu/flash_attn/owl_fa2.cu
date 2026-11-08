@@ -27,6 +27,12 @@
 #define FLASHATTENTION_DISABLE_LOCAL 1
 #define FLASHATTENTION_DISABLE_ALIBI 1
 
+// **必先于任何 cute/cutlass 头**(2026-10-29 CUTLASS 第二刀):补齐被裁掉的
+// sm90 GMMA smem 布局原子 —— 上游 vendored FA2 经 `cute/atom/copy_atom.hpp` →
+// `copy_traits_sm90_tma.hpp` 在**定义处**引用 `GMMA::Layout_MN_SW128_Atom`,
+// 而那个定义所在的 1MB 级头已被裁掉。详见该头文件头注。
+#include "../../nvfp4/owl_cutlass_gmma_shim.hpp"
+
 #include "flash_fwd_launch_template.h"
 
 extern "C" int owl_fa2_varlen_fwd_f16(

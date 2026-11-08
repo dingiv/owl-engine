@@ -34,7 +34,8 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/kernel/sm100_tile_scheduler.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp" // KernelSchedule1Sm, KernelSchedule2Sm
-#include "cutlass/gemm/collective/builders/sm90_common.inl" // detail::sm90_cluster_shape_to_tma_atom()
+// **owl 裁剪点(2026-10-29)**:同 `sm1xx_common.inl` —— 只用
+// `detail::sm90_cluster_shape_to_tma_atom()`,已搬到 owl shim。
 #include "cutlass/numeric_types.h" // all numeric types
 #include "cutlass/detail/dependent_false.hpp" // detail::dependent_false
 #include "cutlass/pipeline/pipeline.hpp"

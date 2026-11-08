@@ -60,13 +60,13 @@ struct StaticPersistentScheduler { };
 ////////////////////////////////////////////////////////////////////////////////
 
 #include "cutlass/gemm/kernel/sm90_tile_scheduler.hpp"
-#include "cutlass/gemm/kernel/sm100_static_tile_scheduler.hpp" 
 
-#include "cutlass/gemm/kernel/sm90_tile_scheduler_stream_k.hpp"
-#include "cutlass/gemm/kernel/sm90_tile_scheduler_group.hpp"
+// StreamK 调度器:本仓不用(只要 `PersistentScheduler`)。这两个头会连带拉进
+// `block_striped.h` → `wmma_array.h` → `cutlass/arch/mma.h` 整棵 2.x arch 树
+// (含 `cutlass/matrix.h` 355KB)⇒ 已连同无用的 arch 兄弟头一起删除。
+// 需要 StreamK / Group / Static 时恢复这些 include 并找回被删文件
+// (TRIMMED.md §2 第 3/4 轮)。
 #include "cutlass/gemm/kernel/sm100_tile_scheduler.hpp"            
-#include "cutlass/gemm/kernel/sm100_tile_scheduler_stream_k.hpp"   
-#include "cutlass/gemm/kernel/sm100_tile_scheduler_group.hpp"      
 ////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::kernel::detail {
@@ -127,20 +127,8 @@ struct TileSchedulerSelector<
   >::Scheduler;
 };
 
-template <
-  class TileShape,
-  class ClusterShape
-  , uint32_t SchedulerPipelineStageCount     
->
-struct TileSchedulerSelector<
-    StreamKScheduler,
-    arch::Sm90,
-    TileShape,
-    ClusterShape
-    , SchedulerPipelineStageCount              
-  > {
-  using Scheduler = PersistentTileSchedulerSm90StreamK<TileShape, ClusterShape>;
-};
+// StreamK 调度器（Sm90）：本仓不用 ⇒ 连同 `sm90_tile_scheduler_stream_k.hpp` 一起删。
+// 需要时从上游恢复这一段 + 那个头。
 
 template <
   class ArchTag,
@@ -172,7 +160,7 @@ struct TileSchedulerSelector<
     , SchedulerPipelineStageCount              
     , GroupProblemShape
   > {
-  using Scheduler = PersistentTileSchedulerSm90Group<GroupProblemShape, SchedulerPipelineStageCount>;
+  // Group 调度器已删（本仓只用 PersistentScheduler；见 TRIMMED.md §2 第 4 轮）
 };
 
 template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
@@ -254,22 +242,10 @@ struct TileSchedulerSelector<
     SchedulerPipelineStageCount,
     GroupProblemShape
   > {
-  using Scheduler = PersistentTileSchedulerSm100Group<GroupProblemShape, SchedulerPipelineStageCount>;
+  // Group 调度器已删（本仓只用 PersistentScheduler；见 TRIMMED.md §2 第 4 轮）
 };
 
-// SM100 stream-K scheduler
-template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
-struct TileSchedulerSelector<
-    StreamKScheduler,
-    arch::Sm100,
-    TileShape,
-    ClusterShape,
-    SchedulerPipelineStageCount> {
-  using Scheduler = PersistentTileSchedulerSm100StreamK<
-                        TileShape,
-                        ClusterShape,
-                        SchedulerPipelineStageCount>;
-};
+// SM100 stream-K scheduler：已删（本仓不用）
 
 // SM100 dynamic tile scheduler
 template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
@@ -295,7 +271,7 @@ struct TileSchedulerSelector<
     TileShape,
     ClusterShape,
     SchedulerPipelineStageCount> {
-  using Scheduler = StaticPersistentTileScheduler100;
+  // Static 持久调度器已删（同上）
 };
 
 template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
@@ -342,7 +318,7 @@ struct TileSchedulerSelector<
     SchedulerPipelineStageCount,
     GroupProblemShape
   > {
-  using Scheduler = PersistentTileSchedulerSm100Group<GroupProblemShape, SchedulerPipelineStageCount>;
+  // Group 调度器已删（本仓只用 PersistentScheduler；见 TRIMMED.md §2 第 4 轮）
 };
 
 template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
@@ -352,10 +328,7 @@ struct TileSchedulerSelector<
     TileShape,
     ClusterShape,
     SchedulerPipelineStageCount> {
-  using Scheduler = PersistentTileSchedulerSm100StreamK<
-                        TileShape,
-                        ClusterShape,
-                        SchedulerPipelineStageCount>;
+  // Sm103 的 StreamK 同 Sm100：一并删
 };
 
 // Default (void) for Sm120 maps to PersistentTileSchedulerSm100
@@ -384,19 +357,7 @@ struct TileSchedulerSelector<
 };
 
 
-// StreamKScheduler for Sm120 maps to PersistentTileSchedulerSm100StreamK
-template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
-struct TileSchedulerSelector<
-    StreamKScheduler,
-    arch::Sm120,
-    TileShape,
-    ClusterShape,
-    SchedulerPipelineStageCount> {
-  using Scheduler = PersistentTileSchedulerSm100StreamK<
-                        TileShape,
-                        ClusterShape,
-                        SchedulerPipelineStageCount>;
-};
+// StreamK for Sm120：已删（本仓不用，且它会把 sm90 的 block_striped/arch 树拉回来）
 
 // SM120 Group tile scheduler
 template <
@@ -413,7 +374,7 @@ struct TileSchedulerSelector<
     SchedulerPipelineStageCount,
     GroupProblemShape
   > {
-  using Scheduler = PersistentTileSchedulerSm90Group<GroupProblemShape, SchedulerPipelineStageCount>;
+  // Group 调度器已删（本仓只用 PersistentScheduler；见 TRIMMED.md §2 第 4 轮）
 };
 
 template <
@@ -427,7 +388,7 @@ struct TileSchedulerSelector<
     TileShape,
     ClusterShape,
     SchedulerPipelineStageCount> {
-  using Scheduler = StaticPersistentTileScheduler100;
+  // Static 持久调度器已删（同上）
 };
 
 template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
@@ -509,7 +470,7 @@ struct TileSchedulerSelector<
     SchedulerPipelineStageCount,
     GroupProblemShape
   > {
-  using Scheduler = PersistentTileSchedulerSm100Group<GroupProblemShape, SchedulerPipelineStageCount>;
+  // Group 调度器已删（本仓只用 PersistentScheduler；见 TRIMMED.md §2 第 4 轮）
 };
 
 template <class TileShape, class ClusterShape, uint32_t SchedulerPipelineStageCount>
@@ -519,10 +480,7 @@ struct TileSchedulerSelector<
     TileShape,
     ClusterShape,
     SchedulerPipelineStageCount> {
-  using Scheduler = PersistentTileSchedulerSm100StreamK<
-                        TileShape,
-                        ClusterShape,
-                        SchedulerPipelineStageCount>;
+  // Sm107 的 StreamK 同 Sm100：一并删
 };
 
 // SM107 dynamic tile scheduler

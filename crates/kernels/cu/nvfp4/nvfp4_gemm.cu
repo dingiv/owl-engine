@@ -40,9 +40,22 @@
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
 
+// **必先于任何 cute/cutlass 头**(2026-10-29 第二刀):补齐被裁掉的
+// sm90 GMMA smem 布局原子 + 三个选路函数 —— 上游 `copy_traits_sm90_tma.hpp`
+// 在定义处就引用 `GMMA::Layout_MN_SW128_Atom`。详见该头文件头注。
+#include "owl_cutlass_gmma_shim.hpp"
+// **同律第三刀**(2026-10-29):`cutlass::arch::OpClass*` 标签 —— 原来在
+// `cutlass/arch/mma.h` 里，而那颗头还会连带整棵 2.x arch 树（含 355KB 的
+// `cutlass/matrix.h`）。我们只用到两个空标签 ⇒ 抄成 owl 自己的头，原头整批删。
+// **必须先于任何 collective/epilogue builder 头**（它们把标签当非依赖名用）。
+#include "owl_cutlass_arch_tags.hpp"
+
 #include "cutlass/gemm/collective/collective_mma_decl.hpp"
 #include "cutlass/gemm/collective/sm120_blockscaled_mma_tma.hpp"
 #include "cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp"
+// epilogue 集合面(**裁剪版**:只留 sm90 TMA warp-specialized + default 两族;
+// 原版经 `sm90_builder.inl` 间引,2026-10-29 改成显式引入)
+#include "cutlass/epilogue/collective/collective_epilogue.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 // epilogue 融合算子(alpha 设备指针面;见 `Epilogue` 的 `fusion::LinearCombination`)
 #include "cutlass/epilogue/fusion/operations.hpp"

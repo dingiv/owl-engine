@@ -65,11 +65,116 @@ sparse/array/emulated/interleaved/planar/mixed-input 变体都是死重。
 | 4B 文本 | `17*23 → 391`，3.81 B/tok | `391`，3.76 B/tok |
 | 9B GGUF 生产档 | 137/94/757 B | **137/94/757 B（逐字节一致）** |
 
-## 五、下一步（还没做）
+## 五、第二轮（2026-10-29）：把"只用到几个符号"的大头换成 owl shim
 
-- 若要把最后两个"整文件 glue"也去掉：把 `ss_smem_selector` /
-  `sm90_get_epilogue_smem_swizzle_layout_atom` / stage-count 启发式搬成
-  owl 侧 shim（约 150 行），收益再 ~1.2 MB（sm90 GMMA 稠密链）。
-- sm100 UMMA trait 的 sparse 分支（`mma_sm90_gmma_sparse.hpp` 1 MB）目前
-  被 `mma_traits_sm100.hpp` 的 `Sp` 布局 atom 需要 —— 想砍得连那批 atom
-  一起自己写，风险/收益不划算（这些布局必须与硬件逐位一致）。
+第一轮之后重新量：**闭包外已零文件**（243/243 都在闭包里），只能继续改
+include 半径。最大一块是 **sm90 GMMA 家族 2.85 MB（33%）**，而我们对它的
+需求量是：**8 个稠密 smem 布局原子 + 8 个稀疏变体 + 3 个小函数**
+（`ss_smem_selector` / `sm90_get_epilogue_smem_swizzle_layout_atom` /
+`sm90_cluster_shape_to_tma_atom`）+ `Major` 枚举 + `DescriptorIterator`。
+
+于是把这一小撮逐字搬进 owl 侧 `cu/nvfp4/owl_cutlass_gmma_shim.hpp`（纯类型
+别名 + 纯 `constexpr`，零代码生成），让 **12 个文件 / 3.04 MB** 从树里消失。
+
+| 口径 | 原始 | 第一轮 | **第二轮** |
+|---|---:|---:|---:|
+| 文件数 | 517 | 246 | **235** |
+| 体积 | 17 MB | 8.8 MB | **5.9 MB** |
+| nvfp4 闭包 | 513 头 / 15.7 MB | 238 / 8.4 MB | **228 / 5.41 MB** |
+| fa2 闭包 | — | 129 / 5.34 MB | **127 / 2.75 MB** |
+
+### 5.1 两条纪律（不然会静默错）
+
+1. **shim 必须先于任何 `cute/…` 头**：上游 `copy_traits_sm90_tma.hpp` 在
+   *定义处* 引用 `GMMA::Layout_MN_SW128_Atom`（非依赖名）⇒ `nvfp4_gemm.cu` 与
+   `owl_fa2.cu` 两个 TU 都在最前面 include 它。
+2. 上游靠 `namespace cute { using namespace SM90; }` 才能写 `cute::GMMA::…`；
+   原头被裁后这条可见性要在 shim 里补回来。
+
+### 5.2 验收：用 PTX 证明"代码生成没变"
+
+跑分会被卡上其它负载干扰（本轮 prefill 实测 10.6~16.3k tok/s 波动，
+decode 8.347 ms 稳定），所以这轮的硬判据是**编译产物比对**：
+
+- 两个 TU 各跑 `nvcc -ptx`，去掉 `//` 与 `_INTERNAL_<hash>_`（随 include 集合
+  变化的 TU id）后 **diff = 0 行**；
+- `.o` 大小逐字节相同（236,056 B），差异字节只有那些 TU-id 符号串。
+
+同时：装配期 oracle 5 档仍 `max|err| = 0`；4B 文本 `391` / 3.81 B/tok；
+9B GGUF 1、2 号探针逐字节一致（137/94），3 号 757 → 745 字节且**同二进制可重复**
+—— 两个 CUDA TU 已证明 PTX 相同，该差异来自这一轮之间上游合入的引擎改动
+（scheduler/vision/并发），与本裁剪无关。
+
+## 六、第三轮（2026-10-29）："用到什么就抄什么" —— 2.x arch 整支 + StreamK 下树
+
+第二轮之后剩下的体积**全是真被编译的代码**，于是换了个问法：不再问"哪个文件
+没被 include"，而是问 **"这个文件里我们到底用到了哪几个符号"** —— 用到的
+抄成 owl 侧小头，没用到的那一支整批删。这是用户定的"正向增量"路线：
+**从"我们需要什么"出发，把要的东西复刻过来**，而不是猜哪个文件可以删。
+
+### 6.1 目标：`cutlass/arch/mma.h` 那条链
+
+```
+sm90_tile_scheduler_stream_k.hpp  (StreamK；本仓只用 PersistentScheduler)
+  → block_striped.h → wmma_array.h → arch/mma.h
+      → arch/mma_sm{50,60,61,70,75,80,89,90}.h
+      → arch/mma_sparse_sm{80,89}.h · arch/wmma{,_sm70,_sm75}.h
+      → mma_sm50.h → quaternion.h → cutlass/matrix.h   ← 355 KB
+```
+
+我们从 `arch/mma.h` 真正用到的只有**两个空标签**：`arch::OpClassTensorOp` /
+`arch::OpClassBlockScaledTensorOp`（epilogue 与 blockscaled 主循环的算子类别）。
+它们进了 **`cu/nvfp4/owl_cutlass_arch_tags.hpp`**（纯 struct，零代码生成）。
+`arch/mma_sm90.h` 只被 kernel 头引进来、内容是 2.x 的 `arch::Mma<SM90_*>`
+—— 我们用的是 **cute atom**（`cute/arch/mma_sm120.hpp`），一个没用到 ⇒
+连同那行 include 一起删。
+
+删掉 20 个文件 / ≈ 668 KB（名单见 `TRIMMED.md` §2 第 3 轮），另改 2 个文件：
+`gemm/kernel/tile_scheduler.hpp`（去掉 2 行 StreamK include + 5 个 StreamK 选择器
+特化）、`gemm/kernel/sm90_gemm_tma_warpspecialized_cooperative.hpp`（去掉
+`arch/mma_sm90.h`）。
+
+### 6.2 规模与验收（本轮全部实测）
+
+| 口径 | 第 2 轮 | **第 3 轮** | **第 4 轮（现在）** |
+|---|---:|---:|---:|
+| 文件数 | 235 | **211** | **208** |
+| 体积 | 5.9 MB | **5.15 MB** | **4.74 MB** |
+| nvfp4 TU 闭包 | 228 头 / 5.41 MB | **205 头 / 4.69 MB** | **202 头 / 4.65 MB** |
+| fa2 TU 闭包 | 127 头 / 2.75 MB | **127 头 / 2.75 MB**（未动） | **127 头 / 2.75 MB** |
+| 两 TU 并集 | 231 头 / 5.48 MB | **209 头 / 4.76 MB** | **206 头 / 4.72 MB** |
+
+第 4 轮（同门刀法的最后一勺）：`GroupScheduler` / `StaticPersistentScheduler`
+三支选择器（≈ 45 KB）—— 本仓只用 `PersistentScheduler`，选择器壳子保留、
+`using Scheduler = …` 换成注释，永不会实例化。
+
+- **PTX 逐行相同**：`nvfp4_gemm.cu` 前后各出一次 `-ptx`，去 `//` 与
+  `_INTERNAL_<hash>_` 后 **diff = 0 行**，文件同为 **173,768 B**。
+- 装配期 oracle 5 档 **`max|err| = 0`**；4B NVFP4 `391`、3.81 B/tok、
+  **decode 8.258 ms/step**（第 2 轮 8.347，判据 ≤ 8.49 ✓）；
+  9B GGUF 探针 **137 / 94 / 745** 字节（与第 2 轮逐字节一致）。
+
+### 6.3 同轮的一个**否掉的方案**（记录以免重走）
+
+“正向”的另一读法是**自研整个主循环**（裸 PTX atom + 自写 cp.async 流水 +
+自有 SF 布局），曾完整实现并数值全绿（`nvfp4_owl.cu` + `nvfp4_mma_sm120.cuh`）。
+但**性能差 1.3~2.1 倍**（单核微基准：prefill 272 vs CUTLASS 554 TFLOP/s；
+decode 权重流 200~366 vs 305~546 GB/s）—— 差在 CUTLASS 的 TMA 多级流水与
+warp-specialization，补齐它就是“重新研发”。**用户裁决：不重写，尊重现有实现**
+⇒ **两个文件已删除**（它们与 `nvfp4_gemm.cu` **FFI 符号同名**，留在树里是
+“被误加进 `build.rs` 就重复定义”的隐患）。事实与数据集保留：
+`sm120-fp4-mma-facts.md` + `cu/probe/fp4_mma_sm120{,_sf}_probe.cu`（裸 PTX 探针，
+不进构建、不引 CUTLASS）。
+
+## 七、下一步（还可以砍什么）
+
+- 剩下 4.7 MB 的**大头都是真被实例化的代码**：`copy_sm100.hpp`(356K)、
+  `numeric_conversion.h`(287K)、`mma_traits_sm100.hpp`(172K)、
+  `copy_traits_sm100.hpp`(146K)、`sm90_callbacks_tma_warpspecialized.hpp`(112K)。
+  砍它们要**逐个特化做符号级外科**（拿掉文件前必须先把引用它的
+  `Copy_Traits<…>` / `NumericArrayConverter<…>` 特化一并剪掉，否则解析就报错），
+  每切一刀都要一次真编译 + PTX 比对。
+- 机械可做的还有一档：`GroupScheduler` / `StaticPersistentScheduler` /
+  `DynamicPersistentScheduler` 三支选择器（≈45 KB），与 StreamK 同律。
+- **不建议**动 `cute/atom/mma_traits_sm100.hpp` 的 UMMA 布局代数 —— 那是
+  "重写硬件布局描述"，风险与收益不匹配。

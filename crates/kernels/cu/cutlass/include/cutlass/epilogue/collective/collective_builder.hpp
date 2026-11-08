@@ -118,15 +118,14 @@ struct CallbacksBuilder<
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-// **owl 裁剪点(2026-10-28)**:原版把 sm90/sm100/sm103/sm107/sm120 五份
+// **owl 裁剪点(2026-10-28 / 10-29)**:原版把 sm90/sm100/sm103/sm107/sm120 五份
 // builder 全 include 进来。我们只走 **sm120**(`sm120_builder.inl` 自己带
 // sm120_common),其余代际的 epilogue 构造器一律不留。
 //
-// 两份 sm90 公共面是必需的 glue:
-// - `gemm/collective/builders/sm90_common.inl` → `ss_smem_selector`(smem 布局选路)
-// - `builders/sm90_builder.inl` → `sm90_get_epilogue_smem_swizzle_layout_atom`
-#include "cutlass/gemm/collective/builders/sm90_common.inl"
-#include "builders/sm90_builder.inl"
+// 原本还需要两份 sm90 公共面(`ss_smem_selector` /
+// `sm90_get_epilogue_smem_swizzle_layout_atom`);2026-10-29 已把它们连同 sm90
+// GMMA 布局原子搬进 `cu/nvfp4/owl_cutlass_gmma_shim.hpp`(省 ~2.9 MB),
+// 因此这里只剩 sm120 一份。
 #include "builders/sm120_builder.inl"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
