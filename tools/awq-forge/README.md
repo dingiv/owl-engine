@@ -37,6 +37,20 @@ uv run awq-forge inspect /home/div/Documents/codes/models/Qwen/Qwen3.5-0.8B
 当前已实现 `inspect`；`run/verify` 尚未接入。量化尖刺脚本：
 
 ```bash
+# **RTN g32 基线**（不做 AWQ 的 scale 搜索；速度 A/B 的对照臂用这条）
+uv run python -u scripts/convert_rtn_g32.py \
+  --source /path/to/<bf16-ckpt> --output /path/to/<out>-RTN-g32 \
+  --device cpu            # 4B 需 ~9.3GB 宿主内存；GPU 档会与常驻推理抢显存
+# 同脚本加 --mode awq 换成真 AWQ（scale 搜索；产物布局/内核完全一致，速度面不变）
+```
+
+> 为什么要有 RTN 档：owl 的 NVFP4 臂本身就是**装载期 RTN**，所以
+> "RTN-g32-int4 vs RTN-nvfp4" 是同算法、不同布局/内核的严格对照
+> （实测见 `docs/devlog/kernels/nvfp4-vs-awq-int4-5070ti.md`）。
+> 校准集首次会去拉 `HuggingFaceH4/ultrachat_200k`；本机 HF 不可达时脚本会
+> 自动退到本地兜底文本（RTN 只观察权重，文本不参与任何数值）。
+
+```bash
 # 主后端（llm-compressor）
 /tmp/llmcomp-venv/bin/python scripts/spike_llmcompressor.py \
   --source models/Qwen/Qwen3.5-0.8B \
