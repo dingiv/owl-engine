@@ -2005,27 +2005,48 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 覆盖到 9k,2026-10-14 据此取消“ctx 换档作废分母”= 长 ctx 上分母
             // 偏小 ⇒ 盈亏线偏高 ⇒ **把盈利档误降级**(32k:线 3.22 vs 真线 2.06,
             // AL 2.25 ⇒ 实测 decode 24.5 t/s,而修后 38.0 t/s)。
-            // ⇒ **上行超 25% 即作废并重新播种**(播种 = 唯一实测重采路径);
-            // **下行不作废**:真实比在各档实测都是 1.86–2.06,而 [`BREAK_EVEN_MIN`]
-            // = 2.0 的下限把它卡住 ⇒ 陈旧的大分母对判据无影响(少发无谓播种步)。
+            // ⇒ **上行超 25% 即作废并重新播种**（播种 = 唯一实测重采路径）；
+            // **下行不作废**：真实比在各档实测都是 1.86–2.06，而 [`BREAK_EVEN_MIN`]
+            // = 2.0 的下限把它卡住 ⇒ 陈旧的大分母对判据无影响（少发无谓播种步）。
+            //
+            // 2026-11-12 冷启动 AL 立案：旧实现只有相对门、且播种中也会触发，
+            // 短 ctx 下 `48 → 62` 就已 +29% ⇒ 每 20–30 token 一次裸步，首 turn 的
+            // AL 被打穿（256 token 里 7 轮 m=0）。现在：相对门 + 绝对下限 +
+            // 播种中不重采（见 [`crate::exec::BARE_COST_CTX_MIN_GROWTH`]）。
             {
                 let a = &mut self.turns.active_mut()?.spec;
-                if a.bare_cost_ctx > 0 && pos as f32 > a.bare_cost_ctx as f32 * 1.25 {
+                if crate::exec::bare_cost_rearm(
+                    pos,
+                    a.bare_cost_ctx,
+                    a.bare_cost_ewma_ms,
+                    a.bare_seed_left,
+                ) {
                     a.bare_cost_ewma_ms = 0.0;
                     a.bare_seed_left = crate::turn::SPEC_SEED_SAMPLES;
                 }
             }
-            // **分母播种**:盈亏线的分母(裸步成本)只在降级期采样 ⇒ 新进程
-            // 首个窗口没分母(旧:兑底常量 2.5 ⇒ 长 ctx 误降级)。分母未测
-            // 时先跑 `SPEC_SEED_SAMPLES` 步裸 decode(合法产出)把它量出来。
-            let seed_due = {
-                let a = &self.turns.active()?.spec;
-                a.bare_cost_ewma_ms <= 0.0 && a.bare_seed_left > 0
-            };
+            // **分母播种**：盈亏线的分母（裸步成本）只在降级期采样 ⇒ 新进程
+            // 首个窗口没分母（旧：兑底常量 2.5 ⇒ 长 ctx 误降级）。分母未测
+            // 时先跑 `SPEC_SEED_SAMPLES` 步裸 decode（合法产出）把它量出来。
+            //
+            // 2026-11-12：旧条件 `ewma <= 0` 让“已采 1 个样本就置了 ewma”
+            // 把第 2 个样本永久卡死（`SPEC_SEED_SAMPLES = 2` 名不副实）；
+            // 现在只看欠账（`left > 0`），两个样本背靠背采完，EWMA 自会
+            // 用 α 混合（phases 侧 `was_unmeasured` 只对第 1 个生效）。
+            let seed_due = self.turns.active()?.spec.bare_seed_left > 0;
             if seed_due {
                 let a = &mut self.turns.active_mut()?.spec;
                 a.bare_seed_left -= 1;
                 a.bare_seed_step = true;
+                // **裸步即作废预产草稿**（2026-11-12 冷启动 AL 立案）：
+                // 上一轮 ⑦ 的 `spec_drafts_host` 是按“本步做 verify”预产的
+                // （fp = 上一轮 pos+m+1）；本步改走播种裸 decode ⇒ 那个位置已被
+                // 裸步吃掉,下一轮再 `take()` 就是整体错位一格 ⇒ **必然 m=0**。
+                // 降级裸步 2026-11-03 已修同类（`degraded_now ⇒ 丢草稿`），
+                // 播种裸步当时漏了;真机签名 = `acquire src=stored` 后紧跟
+                // `m=0`、且下一轮满接受（一错即自愈）。
+                a.spec_drafts_host = None;
+                a.spec_q_host = None;
                 owl_shared::log_info!(
                     "spec-seed",
                     "分母未测 ⇒ 本步发播种裸 decode(还欠 {} 步)",

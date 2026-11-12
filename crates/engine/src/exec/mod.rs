@@ -75,6 +75,36 @@ pub(crate) const WINDOW_ROUNDS: u32 = 16;
 pub(crate) const WINDOW_MIN_ROUNDS: u32 = 8;
 pub(crate) const WINDOW_MS: f32 = 600.0;
 
+/// **分母 ctx 配对的门限**（2026-11-12 冷启动 AL 立案）。
+///
+/// 裸步成本随 ctx 上行（实测 24.1 ms@564 → 41.7 ms@32k），所以分母要在
+/// ctx 涨过 [`BARE_COST_CTX_GROW`] 后重采。但旧实现只有相对门
+/// （`pos > ctx*1.25`）且**在播种中也会触发**，短 ctx 下变成每 ~30 token
+/// 一次裸步：首 turn 的 AL 每次都被打掉一轮（真机 38 轮里 7 轮 m=0）。
+///
+/// 修法 = 两个门都要过：
+/// - 相对：`pos > ctx * 1.25`（原义，长 ctx 换档才重采）；
+/// - **绝对下限** [`BARE_COST_CTX_MIN_GROWTH`]（≤4k 时裸步成本接近平坦，
+///   频繁重采只亏不赚）；
+/// - **播种中不重采**（`bare_seed_left > 0` ⇒ 跳过，否则 2 样本永远采不完）。
+pub(crate) const BARE_COST_CTX_GROW: f32 = 1.25;
+pub(crate) const BARE_COST_CTX_MIN_GROWTH: usize = 4096;
+
+/// **分母是否该重采**(纯函数;判据见 [`BARE_COST_CTX_GROW`] 族常量)。
+///
+/// `pos` = 本步 ctx,`ctx` = 上次测量时的 ctx,`ewma_ms` = 已有分母,
+/// `seed_left` = 播种欠账。三个条件**同时**成立才重采:
+/// 已有有效分母(未测时由 turn 初的播种负责)、不处于播种中、
+/// ctx 同时越过相对门与绝对下限。
+pub(crate) fn bare_cost_rearm(pos: usize, ctx: usize, ewma_ms: f32, seed_left: usize) -> bool {
+    seed_left == 0
+        && ewma_ms > 0.0
+        && ctx > 0
+        && pos > ctx
+        && pos as f32 > ctx as f32 * BARE_COST_CTX_GROW
+        && pos - ctx >= BARE_COST_CTX_MIN_GROWTH
+}
+
 /// 窗口是否评估（纯函数；见 [`WINDOW_ROUNDS`] 族常量）。
 pub(crate) fn spec_window_done(rounds: u32, ms: f32) -> bool {
     rounds >= WINDOW_ROUNDS || (ms >= WINDOW_MS && rounds >= WINDOW_MIN_ROUNDS)
@@ -304,6 +334,46 @@ pub mod prefill_chunk;
 pub mod proposal_q;
 pub mod spec;
 pub mod turn_end;
+
+#[cfg(test)]
+mod bare_cost_rearm_tests {
+    use super::*;
+
+    /// **冷启动 AL 门**（2026-11-12）：短 ctx 下旧实现每 ~25% 就重采分母
+    /// ⇒ 真机 256 token 里 7 轮裸步、每轮后必 m=0。本门钉住：
+    /// 相对门与绝对下限**同时**过才重采。
+    #[test]
+    fn short_ctx_growth_does_not_rearm() {
+        // 真机签名：48 → 62/80/106… 旧代码这里会 arm 2 个播种步
+        assert!(!bare_cost_rearm(62, 48, 18.0, 0), "相对门过、绝对下限不过");
+        assert!(!bare_cost_rearm(80, 48, 18.0, 0));
+        assert!(!bare_cost_rearm(1_000, 48, 18.0, 0));
+        assert!(!bare_cost_rearm(48 + 4_095, 48, 18.0, 0), "差 1 token 不过");
+        assert!(bare_cost_rearm(48 + 4_096, 48, 18.0, 0), "两个门都过才重采");
+    }
+
+    /// 长 ctx：相对门（25%）仍生效（32k 样本的原始意图）
+    #[test]
+    fn long_ctx_keeps_relative_gate() {
+        assert!(!bare_cost_rearm(250_000, 200_000, 38.0, 0), "↑25% 未过");
+        assert!(bare_cost_rearm(250_001, 200_000, 38.0, 0));
+    }
+
+    /// 播种中不重采（否则 2 样本永远采不完 —— 旧冻结真凶之一）
+    #[test]
+    fn no_rearm_while_seeding() {
+        assert!(!bare_cost_rearm(1_000_000, 48, 0.0, 1));
+        assert!(!bare_cost_rearm(1_000_000, 48, 18.0, 2));
+    }
+
+    /// 未测/无基线 ⇒ 不 rearm（交给 turn 初播种）
+    #[test]
+    fn unmeasured_or_no_baseline_does_not_rearm() {
+        assert!(!bare_cost_rearm(1_000_000, 48, 0.0, 0));
+        assert!(!bare_cost_rearm(1_000_000, 0, 18.0, 0));
+        assert!(!bare_cost_rearm(48, 48, 18.0, 0), "pos 不前进");
+    }
+}
 
 #[cfg(test)]
 mod break_even_tests {

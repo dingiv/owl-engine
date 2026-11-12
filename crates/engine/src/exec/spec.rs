@@ -709,6 +709,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // pos = 本轮入口位置(接受前)。带上它 ⇒ 不用 `step_profile`(会加
         // ~30ms/轮同步读、实测把 AL 从 2.90 抬到 4.54)也能画 AL-vs-position。
         owl_shared::log_debug!("spec-round", "pos={pos} 接受完成 m={m} bonus={bonus} emitted={}", emitted.len());
+        // 冷启动 AL 诊断（2026-11-12）：草稿 vs 目标验证行的逐位对齐。
+        // `d[i] == ids[i+1]` = 草稿整体前移一格（播种裸步插队后的经典指纹）。
+        owl_shared::log_debug!(
+            "spec-round",
+            "对齐 pos={pos} m={m} drafts={:?} ids={:?}",
+            &drafts[..depth.min(drafts.len())],
+            &ids[..(depth + 1).min(ids.len())]
+        );
         // ⑤ 部分接受 → GDN 回滚 + 已接受前缀重放(v1 窗口重处理,施工
         // 方案 §四.4);快照无条件失效(下轮轮首重拍)。
         // 轮不变量:restore 只回到 state@F-1,而下一轮需要 state@fed'-1
@@ -1822,6 +1830,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // (ids 8≠4 装填拒,pump 退役)。与轮首直调分支的
             // d.truncate(depth) 同款,收口在消费点单处。
             d.truncate(depth);
+            owl_shared::log_debug!("spec-round", "acquire pos={pos} src=stored");
             d
         } else if self
             .dev
@@ -1838,6 +1847,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .await?;
             d.truncate(depth); // depth ≤ 7(草稿恒 7 产;T 图定形 depth+1)
             spent = ts.elapsed();
+            owl_shared::log_debug!("spec-round", "acquire pos={pos} src=eager");
             d
         } else if self.dev.spec_rt.drafter.is_some() {
             let ts = std::time::Instant::now();
