@@ -3,11 +3,16 @@
 //! 库本体 = `cu/nvfp4/nvfp4_gemm.cu`(nvcc → `libnvfp4.a`,目标是
 //! `compute_120a/sm_120a`)。本模块只是**薄 FFI 包装**,不含任何调度决策:
 //! 选不选这条臂由 [`crate::driver::KernelPick`] 的准入表说话(`Caps::fp4_blockscale`
-//! 这一条;M **不设门** —— 统一臂,decode 的 m=1 也走这条),不在这里另起一套 if。
+//! 这一条;M **不设门**),不在这里另起一套 if。
+//!
+//! **`m ≤ 8` 的 decode 形状由库**内部**分流到 `cu/nvfp4/nvfp4_gemv.cu`
+//! (纯 SIMT 流式反量化,FP4 张量核在 m=1 上只会空转 128 行 tile);
+//! 声明面/槽序/图节点全不变 —— 分流条件(形状 + SF 布局)在**建 plan 时**
+//! 算一次(`owl_nvfp4_gemv_ok`),发射期零判断。
 //!
 //! ## 生命周期(调用方职责)
-//! 1. [`Nvfp4Plan::new`] —— 形状 `(M,N,K)` 定死;**M 任意**(tile 谓词自己处理),`N ≡ 0 (mod 8)`,
-//!    `K ≡ 0 (mod 16)`。
+//! 1. [`Nvfp4Plan::new`] —— 形状 `(M,N,K)` 定死;**M 任意**(库内按 `m ≤ 8` 分到
+//!    decode GEMV / CUTLASS 主循环),`N ≡ 0 (mod 8)`,`K ≡ 0 (mod 16)`。
 //! 2. **权重**(B):`pack_b` 一次,产出 `q`(`N*K/2` 字节)+ `sf`(`sfb_bytes`),跨 M 复用
 //!    (SFB 布局只依赖 `N,K`)。
 //! 3. **激活**(A):每个 chunk `pack_a`(`M*K/2` + `sfa_bytes`);设备侧量化器见后续刀。
@@ -53,6 +58,10 @@ extern "C" {
     fn owl_nvfp4_banner() -> *const c_char;
     /// SFB 仿射步长（设备侧权重量化器用；`out` ≥ 5 个 `i32`）
     fn owl_nvfp4_sfb_strides(plan: *mut c_void, out: *mut i32) -> i32;
+    /// SFA 仿射步长 + 原点（decode GEMV / 诊断面；`out` ≥ 6 个 `i32`）
+    fn owl_nvfp4_sfa_strides(plan: *mut c_void, out: *mut i32) -> i32;
+    /// decode 臂是否就绪（`1` = `m ≤ 8` 且 SF 布局命中；建 plan 时已定）
+    fn owl_nvfp4_plan_gemv_ok(plan: *mut c_void) -> i32;
     /// **设备侧权重打包**（源 f16/bf16 直上卡 → q + SFB + `d_g[0]=gb`）
     fn owl_nvfp4_pack_b_dev(
         plan: *mut c_void,
@@ -231,6 +240,21 @@ impl Nvfp4Plan {
     #[must_use]
     pub const fn ws_bytes(&self) -> usize {
         self.ws_bytes
+    }
+    /// **decode 臂是否就绪**(`m ≤ 8` 且 SF 布局命中 GEMV 的前置):建 plan 时已算好,
+    /// 发射时分支不看它(库内自己分派)—— 只供诊断/日志与 A/B 取证。
+    #[must_use]
+    pub fn gemv_ok(&self) -> bool {
+        // SAFETY: `ptr` 由 `new` 保证非空,`plan_free` 才有所有权转移。
+        unsafe { owl_nvfp4_plan_gemv_ok(self.ptr) != 0 }
+    }
+    /// SFA 仿射步长 + 原点(`[s0,s1,s2,s3,s4,base]`;诊断/decode GEMV 面用)
+    #[must_use]
+    pub fn sfa_strides(&self) -> Option<[i32; 6]> {
+        let mut out = [0i32; 6];
+        // SAFETY: 同上;`out` 是本地 6 个 i32,C 侧只写前 6 个。
+        let rc = unsafe { owl_nvfp4_sfa_strides(self.ptr, out.as_mut_ptr()) };
+        (rc == 0).then_some(out)
     }
     #[must_use]
     pub const fn a_q_bytes(&self) -> usize {

@@ -1339,7 +1339,8 @@ pub enum QuantPlan {
     /// CUTLASS 交错布局),另带 per-tensor 全局缩放 `gb`(host 标量)。
     ///
     /// 前向 = **一次 `nvfp4_gemm`**(家族内自己做设备侧激活量化 + CUTLASS
-    /// `m16n8k64` 块缩放 MMA)。**统一臂**:不按 m 分流(decode m=1 也走这条)。
+    /// `m16n8k64` 块缩放 MMA)。**层侧不按 m 分流**:库内按 `m ≤ 8` 选 decode GEMV
+    /// (纯 SIMT)还是 CUTLASS 主循环,two 者同槽序、同数值口径(2026-11-08)。
     NvFp4,
     /// **GGUF 块型**(2026-10-19 gguf 轮):权重以 **GGUF 块字节原样驻留**
     /// (槽 dtype = `U8`、形状 `[out, row_bytes]`),forward = **两发**:

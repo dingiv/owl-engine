@@ -191,3 +191,12 @@ cargo build --release -p server --no-default-features --features arch-sm120
 [selfcheck] nvfp4_gemm ✓ max|err|  ≤ 1e-2  # 装配期 oracle
 [chat] 指标: decode=… spec rounds=… al=…   # 文本质量（B/tok > 2.5）+ 接受率
 ```
+
+## 九、后续（2026-11-08）：decode 不再走这条主循环
+
+"统一臂"（`m=1` 也走 128×128×256 的 CUTLASS 主循环）在 decode 上代价很大：
+实测只有 **242 GB/s**（每 token 权重 2.049 GB / 8.48 ms = 峰值 27%）。
+现已按 `m ≤ 8` 分流到 `cu/nvfp4/nvfp4_gemv.cu`（纯 SIMT 流式反量化）：
+**decode 8.47 → 6.89 ms**、单核 685 GB/s，数值与主循环**逐位相同**；
+声明面/槽序/图节点零改动（分流条件建 plan 时算一次）。
+实测与取舍判据见 `nvfp4-vs-awq-int4-5070ti.md`。
