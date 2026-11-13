@@ -214,8 +214,8 @@ pub(crate) struct PoolPlan {
     pub max_batch: usize,
     /// spec 快照池深度
     pub snap_max: usize,
-    /// VRAM 预算目标占比(0 = 治理禁用)
-    pub vram_target: f64,
+    /// **显存治理占比**(0 = 治理禁用;1.0 = 吃满驱动 free)
+    pub vram_budget: f64,
     /// VRAM 预留 MiB
     pub vram_reserve_mb: u64,
     /// **超卖档「池外瞬态余量」MiB**(= `[pool].transient_reserve_mb`)。
@@ -2269,7 +2269,7 @@ impl<'a> AllocCtx<'a> {
                 }
             }
             _ => eprintln!(
-                "[ctx-max] 显存治理禁用(vram_target=0 或 total 未知)⇒ 池按 max_seq={} tok 分配(自动档无上限校验)",
+                "[ctx-max] 显存治理禁用(vram_budget=0 或 total 未知)⇒ 池按 max_seq={} tok 分配(自动档无上限校验)",
                 plan.seq_tokens
             ),
         }
@@ -2351,11 +2351,11 @@ fn pool_cap(plan: &PoolPlan, per_tok: &PerTokBytes, fixed_after: &FixedAfter) ->
     let per_tok_bytes = per_tok.total();
     let vram_reserve = plan.vram_reserve_mb << 20;
     let vram_total = plan.vram.total;
-    // `vram_target = 0` = 治理禁用;**`1.0` 是合法档**(吃满总显存,`reserve`
+    // `vram_budget = 0` = 治理禁用;**`1.0` 是合法档**(吃满总显存,`reserve`
     // 仍是唯一缓冲)—— 旧条件写 `target < 1.0` 把 1.0 当"禁用" ⇒ 硬预算
     // 静默失效(2026-10-21 实测:`target=1.0` 的档 boot 里根本没有 cap 行,
     // 池怎么设都不校验,直到驱动 OOM)。
-    if plan.vram_target > 0.0 && vram_total > 0 {
+    if plan.vram_budget > 0.0 && vram_total > 0 {
         // ★ **按卡账**(2026-10-24):本 rank 的 total/free/live 全部来自
         // `PoolPlan.vram`(设备 account 快照),不再有进程级 LIVE 摊分。
         let live_per_card = plan.live_baseline_per_card.unwrap_or(plan.vram.live);
@@ -2367,12 +2367,12 @@ fn pool_cap(plan: &PoolPlan, per_tok: &PerTokBytes, fixed_after: &FixedAfter) ->
         // target 仍作**上限**(防别的进程刚释放时把池吃满):
         //   target_cap = free − total×(1−target)
         let free = plan.vram.free;
-        let target_cap = free as i64 - ((vram_total as f64 * (1.0 - plan.vram_target)) as i64);
+        let target_cap = free as i64 - ((vram_total as f64 * (1.0 - plan.vram_budget)) as i64);
         // 无 free 落账(测试/旧路)⇒ 回退旧口径
         let base = if free > 0 {
             (free as i64).min(target_cap.max(0))
         } else {
-            (vram_total as f64 * plan.vram_target) as i64 - live_per_card as i64
+            (vram_total as f64 * plan.vram_budget) as i64 - live_per_card as i64
         };
         let budget = base - vram_reserve as i64 - fixed_after.total() as i64;
         let cap = (budget.max(0) as u64 / per_tok_bytes.max(1) as u64) as usize;
@@ -2384,7 +2384,7 @@ fn pool_cap(plan: &PoolPlan, per_tok: &PerTokBytes, fixed_after: &FixedAfter) ->
                 "[vram-gov] total={:.2}G free={:.2}G target={:.0}% reserve={}M fixed_after={:.2}G[{}](+scratch 未计: attn_v2/xqa/fi 表/bt) live={:.2}G(引擎账;仅参考;ranks={}) per_tok={}B[{}] ⇒ budget={:.2}G cap={} tok(manual={})",
                 vram_total as f64 / 1073741824.0,
                 free as f64 / 1073741824.0,
-                plan.vram_target * 100.0,
+                plan.vram_budget * 100.0,
                 vram_reserve >> 20,
                 fixed_after.total() as f64 / 1073741824.0,
                 fixed_after.explain(),

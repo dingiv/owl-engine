@@ -833,10 +833,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             });
         }
         // 末块:末行采样(eos / 预算 / Token)
-        self.sample_and_emit(last_row.ok_or_else(|| ModelError::EngineInvariant {
-            what: "末块缺 logits(采样面与声明不一致)".into(),
-        })?)
-        .await
+        let ev = self
+            .sample_and_emit(last_row.ok_or_else(|| ModelError::EngineInvariant {
+                what: "末块缺 logits(采样面与声明不一致)".into(),
+            })?)
+            .await?;
+        // **首 token 已投递**：DFlash2 草稿 KV encode 现在补跑。它只服务
+        // 后续 spec propose，不参与首 token ⇒ 移出 TTFT 临界路径。
+        let t_drain = std::time::Instant::now();
+        self.dev.drain_pending_dflash().await?;
+        if let Some(p) = self.peer.as_mut() {
+            p.drain_pending_dflash().await?;
+        }
+        mrec("dflash.drain", t_drain.elapsed());
+        Ok(ev)
     }
 
     /// decode 单步执行(设备侧;host 派生量由决策面备齐)
@@ -1070,6 +1080,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     owl_store::SnapDurability::Transient,
                     true,
                     true,
+                    owl_store::SnapClass::Transient,
                 )
                 .await?;
             }
@@ -1621,6 +1632,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     owl_store::SnapDurability::Transient,
                     true,
                     true,
+                    owl_store::SnapClass::Transient,
                 )
                 .await?;
             }

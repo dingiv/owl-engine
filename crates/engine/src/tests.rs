@@ -572,7 +572,6 @@ async fn position_consolidation_resets_high_water() {
             _ => {}
         }
     }
-    assert!(!running.bank.sessions.get(sid).expect("会话").positioned);
 
     // 模拟“删图留下的大 gap”：把位置账抬到 319（末位）。
     {
@@ -583,7 +582,6 @@ async fn position_consolidation_resets_high_water() {
             *p = [base + i as i32; 3];
         }
         s.max_pos = 319;
-        s.positioned = true;
     }
 
     // 下一 turn：pos_hi 319 + max_new 8 = 327 ≥ 320 ⇒ 本次压实。
@@ -610,7 +608,6 @@ async fn position_consolidation_resets_high_water() {
         "压实后位置必须回到紧凑坐标：max_pos={}",
         s.max_pos
     );
-    assert!(!s.positioned, "压实后不再带位置洞");
 }
 
 /// 通用 CPU mock 引擎（自定义 knobs；F-22 用例等）。
@@ -1765,7 +1762,6 @@ pub async fn gpu_schedule_decision_surface() {
             &act.prompt_ids,
             &[],
             &act.positions[..act.prompt_ids.len()],
-            act.rope_gap,
         )
         .expect("提交位置账");
         s.cached_len -= 2;
@@ -6256,6 +6252,22 @@ async fn abort_publishes_written_prompt_prefix() {
         running.cancel_turn(ta).await.is_some(),
         "活跃 turn 应可取消"
     );
+    let a_prompt_len = running
+        .boot
+        .tok
+        .encode(&running.boot.tok.chat_wrap(&prompt_a))
+        .len();
+    let a_sess = running.bank.sessions.session(101).expect("A 会话账");
+    assert!(
+        a_sess.tail_snap.is_some(),
+        "decode 中段中断必须补拍断点快照（不能只发布 prompt 前缀）"
+    );
+    assert!(
+        a_sess.tokens.len() > a_prompt_len,
+        "decode 中断的已生成段也应入账：tokens={} prompt={}",
+        a_sess.tokens.len(),
+        a_prompt_len
+    );
 
     // ── B:不同会话键 + A 的 prompt 再续写 ⇒ 只认内容身份 ──────────
     let (_sb, tb) = running.submit_session(Some(202), prompt_b, 12).expect("B");
@@ -7117,7 +7129,6 @@ pub async fn gpu_image_evict_gate() {
     // ⑤ 位置账：幸存后缀逐 token 不变，max_pos 不回退
     {
         let s = running.bank.sessions.session(sid).expect("会话账");
-        assert!(s.positioned, "删除后必须标记位置洞");
         assert_eq!(s.positions.len(), s.tokens.len(), "位置账与 token 账等长");
         assert!(s.max_pos >= old_max, "max_pos 不回退");
         let k = old_tokens[del.end..]
@@ -7301,8 +7312,6 @@ pub async fn gpu_image_evict_gate() {
             .expect("G7 t3 提交");
         let g7_text3 = drive_turn(&mut running, g7t3).await;
         assert!(!g7_text3.trim().is_empty(), "G7 t3 必须出文本");
-        let s9 = running.bank.sessions.session(9).expect("会话 9");
-        assert!(s9.positioned, "第二次删除后位置洞标记仍在");
         assert_eq!(
             running.img_evict.absorbed,
             absorbed_after_t1 + 2,

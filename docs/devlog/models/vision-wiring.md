@@ -170,7 +170,7 @@ TurnOpts.images: Vec<VlmImage { pixel_values: Vec<f32>, grid: GridThw }>
 
 - `profiles/qwen38_27b-3080_tp2-w4a16-vlm.toml`:262,144 tok 全设备池(非超卖)、
   fp8 主 KV(4 GiB/rank)+ BF16 草稿池(2.5 GiB/rank)、vision、d7、
-  `vram_target=0.99` / reserve 256 MiB。
+  `vram_budget=0.99` / reserve 256 MiB。
 - 真机(2×3080 TP2):boot 成功;`nvidia-smi` 19.19G/20.48G,
   free ~0.92G;图像+spec 64-token 后 free ~0.46G。
   `/debug/vram`:Weight 10.44G/card + Pool 6.75G/card。

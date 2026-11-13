@@ -46,9 +46,23 @@ pub struct AgentSession {
     /// 会话 token 账(S1 前缀守卫的比对基准):已入 KV 的 token 原文,
     /// 顺序 = prompt 段 + 生成段;`guard()` 逐 id 比对
     pub tokens: Vec<u32>,
-    /// 物理块链(E2b 真块表):逻辑块序 → 物理块 id;块池共享,
-    /// 跨 turn 存续(会话存活期间块不归还)
+    /// 物理块链(E2b 真块表):逻辑块序 → 物理块 id;块池共享。
+    /// 只在 turn 内由本表持有；turn 末 `release_turn_table` 归还，
+    /// 下一轮按内容/位置重新取链或全量重建，不跨 turn 钉住块。
     pub block_table: Vec<u32>,
+    /// **逐块内容身份**(与 `block_table` 对齐;2026-11-13 leave-gap 同会话复用)。
+    ///
+    /// 长度 = `chain.blocks()`(完整块数)。只为 **gapped 链** 做
+    /// session-local hit:leave-gap 后的新链不发布到共享树(位置基准不在身份里
+    /// ⇒ 跨会话会静默错值),但同一会话的 `block_table` 仍持有 prefix+suffix
+    /// 的槽 ⇒ 用这份身份绕过树直接复用。普通档仍以 `match_prefix` 为准。
+    pub block_hashes: Vec<owl_store::ChainHash>,
+    /// **本会话是否持有一条 gapped 链**（leave-gap 后；2026-11-13）。
+    ///
+    /// gapped 链不发布到共享树，`block_table` 是它唯一的设备槽账；turn 末
+    /// 本字段只表示**当前 turn 内**持有 leave-gap 链；turn 末表一律释放，
+    /// 下一轮按内容/快照重新 reuse，不保留跨 turn 表引用。
+    pub local_chain: bool,
     /// **图像段账**(前缀无感删除;2026-10-23):上轮 prompt 里各图像占位段
     /// (含页对齐 pad)的会话坐标 + 网格 + 客户端可删标记。
     /// 生命周期跟随 `tokens`:turn 收口由 `set_img_spans` 写回,`reset` 清空。
@@ -59,13 +73,10 @@ pub struct AgentSession {
     /// **逐 token 的 m-RoPE 绝对位置**(leave-gap;2026-10-25)。
     /// 与 `tokens` 等长;文本 `[p,p,p]`,图像 `[t,h,w]`。
     /// 删除图标段后幸存 token 的位置**不移动**,新尾巴从 `max_pos+1` 追加。
-    /// 未启用 leave-gap(`positioned = false`)时仍写紧凑位置,作为统一账。
+    /// 非 leave-gap 时写紧凑位置，作为统一账。
     pub positions: Vec<[i32; 3]>,
     /// 当前最大绝对位置(三轴取 max;空账 = 0)。
     pub max_pos: i32,
-    /// **位置账是否已离开紧凑坐标**(leave-gap 删除后为 true)。
-    /// 用于禁用跨会话内容缓存(同 token 不同 position 的 K 不同)。
-    pub positioned: bool,
     /// 位置账代数(consolidation/rebase 时递增;缓存/诊断面用)。
     pub position_epoch: u32,
     /// E5:LRU 逐出账(SessionTable.tick 触达时间;越小越老)
@@ -76,6 +87,26 @@ pub struct AgentSession {
     //  与 `StateStore::{borrow_row, return_row}`;会话只剩身份 + token 历史)
     /// E5:LRU 触达时间(SessionTable.tick;越小越老,逐出候选)
     pub last_use: u64,
+    /// **会话尾锚点快照**(L1 资产;2026-11-12)。
+    ///
+    /// 上轮 turn 的最新边界快照。跨 turn 保留 —— 空闲会话的尾部锚点是
+    /// **Dense 档**(最后淘汰,但空间不足时可逐出;不是 pin),append 的
+    /// 100% 命中靠它。前缀失配 `reset()` 时清空。
+    pub tail_snap: Option<owl_store::SnapKey>,
+    /// **最近 K 个 turn 尾快照**（L1 资产；`snap_msg_recent`；不是 pin，
+    /// 只是 `Dense` 档优先保留；超出 K 的旧尾降为 `Extra`）。
+    pub recent_tails: Vec<owl_store::SnapKey>,
+    /// **上轮 prompt 的消息边界**(页对齐 token offset;L1 资产)。
+    ///
+    /// turn 收口时从 `ActiveTurn.msg_snaps` 写回,跨 turn 保留;下一轮用于
+    /// 回撤定位（Dense 档 / Binary 稀疏锚点）。前缀失配 `reset()` 时清空。
+    pub msg_snaps: Vec<usize>,
+    /// **与 `msg_snaps` 同序的快照键**(L1 资产;2026-11-12 二刀)。
+    ///
+    /// 会话增长后旧的 dense 尾巴要降级为 Binary/Extra —— 没有键就只能
+    /// 重拍 159MiB 才能改档。这里记录每个边界实际拍到的 `SnapKey`,
+    /// 下一轮 submit 只做**重分类**(不搬内容)。`None` = 该边界没拍/已被逐出。
+    pub msg_snap_keys: Vec<Option<owl_store::SnapKey>>,
     /// **链哈希游标**(快照键真源):已哈希整块数 + 链尾内容身份。
     /// 懒惰推进(只喂新增整块)⇒ 全 turn O(n);键必须是**内容身份**
     /// (物理块号会被回收复用 —— `owl_store::ChainCursor` 头注)。
@@ -92,14 +123,19 @@ impl AgentSession {
             slot_base,
             tokens: Vec::new(),
             block_table: Vec::new(),
+            block_hashes: Vec::new(),
+            local_chain: false,
             mtp_block_table: Vec::new(),
             last_use: 0,
+            tail_snap: None,
+            recent_tails: Vec::new(),
+            msg_snaps: Vec::new(),
+            msg_snap_keys: Vec::new(),
             chain: ChainCursor::new(),
             img_spans: Vec::new(),
             pads: Vec::new(),
             positions: Vec::new(),
             max_pos: 0,
-            positioned: false,
             position_epoch: 0,
         }
     }
@@ -128,32 +164,67 @@ impl AgentSession {
         (0..n).find(|&i| self.tokens[i] != prompt[i])
     }
 
-    /// 账本重置(前缀失配回退):清账 + 清块表(块归还由引擎调账房,
-    /// 本函数只负责账面 —— 引擎在 reset 路径调 `release_table`)。
-    /// 链哈希游标一并归零(新链从零起 —— 身份跟着链走)。
+    /// 账本重置(链面):清 `tokens/positions/chain` + 块表(块归还由引擎
+    /// 调账房,本函数只负责账面 —— 引擎在 reset 路径调 `release_table`)。
+    ///
+    /// **不清 L1 资产**(`tail_snap` / `msg_snaps` / `msg_snap_keys`):
+    /// 前缀命中的续写路径也会调本函数,那一次 `reset` 不是重建;L1 资产
+    /// 要到 turn 收口/fresh 重建时才由 `rebase` 处理。否则每轮命中都会
+    /// 把旧 tail 的 Dense 归属丢掉(旧 key 永久留在 Dense 档,见 2026-11-13
+    /// 前置评审)。
     pub fn reset(&mut self) {
         self.cached_len = 0;
         self.tokens.clear();
+        self.block_hashes.clear();
         self.chain.reset();
         self.img_spans.clear();
         self.pads.clear();
         self.positions.clear();
         self.max_pos = 0;
-        self.positioned = false;
     }
 
-    /// **整段重建**(前缀失配):`reset` + 位置账代数递增。
+    /// **记录 turn 尾快照**：最近 `keep` 个保持 `Dense` 档；更老的返回给
+    /// 调用方降为 `Extra`。只是淘汰优先级，不是 pin。
+    pub fn push_recent_tail(&mut self, key: owl_store::SnapKey, keep: usize) -> Option<owl_store::SnapKey> {
+        let keep = keep.max(1);
+        if self.recent_tails.last().copied() == Some(key) {
+            return None;
+        }
+        if let Some(old) = self.tail_snap {
+            if old != key && !self.recent_tails.contains(&old) {
+                self.recent_tails.push(old);
+            }
+        }
+        if !self.recent_tails.contains(&key) {
+            self.recent_tails.push(key);
+        }
+        let mut demoted = None;
+        while self.recent_tails.len() > keep {
+            demoted = Some(self.recent_tails.remove(0));
+        }
+        demoted
+    }
+
+    /// **整段重建**(前缀失配 / 位置压实):`reset` + L1 资产失效 +
+    /// 位置账代数递增。
     ///
-    /// 前缀命中的续写路径不得清零(它也会调 `reset()`,但那不是重建)。
+    /// 只有真正换了一条链才清 L1 快照资产;前缀命中的续写路径不得清零
+    /// (它也会调 `reset()`,但那不是重建)。
     pub fn rebase(&mut self) {
         self.reset();
+        // 旧 tail/消息边界属于旧链;内容仍可由 L2/L3 按 LRU/档位回收。
+        self.tail_snap = None;
+        self.recent_tails.clear();
+        self.msg_snaps.clear();
+        self.msg_snap_keys.clear();
+        self.local_chain = false;
         self.position_epoch = self.position_epoch.wrapping_add(1);
     }
 
     /// **写入当前前缀的位置账**(删除/前缀命中后、turn 收口前使用)。
     ///
     /// `positions` 必须与 `tokens` 同长;越界 = 结构错(显式拒,不静默截断)。
-    pub fn set_positions(&mut self, positions: &[[i32; 3]], positioned: bool) -> Result<()> {
+    pub fn set_positions(&mut self, positions: &[[i32; 3]]) -> Result<()> {
         if positions.len() != self.tokens.len() {
             return Err(owl_iface::contract::ModelError::EngineInvariant {
                 what: format!(
@@ -173,7 +244,6 @@ impl AgentSession {
             .copied()
             .max()
             .unwrap_or(0);
-        self.positioned = positioned;
         Ok(())
     }
 
@@ -214,7 +284,6 @@ impl AgentSession {
         prompt: &[u32],
         generated: &[u32],
         positions: &[[i32; 3]],
-        positioned: bool,
     ) -> Result<()> {
         let total = prompt.len() + generated.len();
         if positions.len() != total {
@@ -240,9 +309,44 @@ impl AgentSession {
             .copied()
             .max()
             .unwrap_or(0);
-        self.positioned = positioned;
         Ok(())
     }
+}
+
+/// **L1 快照键沿用**(纯;2026-11-12 二刀)。
+///
+/// 按 token offset 对齐上一轮的 `msg_snaps` / `msg_snap_keys`:纯 append
+/// (前缀守卫生效)时位置一一对应;新出现的边界 = `None`(等本 turn 拍)。
+/// old 位置不在 new 里(截短/回撤)= 丢弃;old 键已被逐出 = `None`。
+pub(crate) fn carry_msg_snap_keys(
+    old_points: &[usize],
+    old_keys: &[Option<owl_store::SnapKey>],
+    new_points: &[usize],
+) -> Vec<Option<owl_store::SnapKey>> {
+    let mut out = vec![None; new_points.len()];
+    for (i, at) in new_points.iter().enumerate() {
+        if let Ok(j) = old_points.binary_search(at) {
+            out[i] = old_keys.get(j).copied().flatten();
+        }
+    }
+    out
+}
+
+/// **L1 会话资产只读投影**(2026-11-12 三层架构)。
+///
+/// 只回答"这个会话拥有哪些资产":KV 前缀长度、尾锚点快照、消息边界;
+/// 不暴露物理槽号 / tier —— 那些属于 L2/L3。
+#[derive(Clone, Debug)]
+pub struct SessionAssets {
+    pub id: u64,
+    pub cached_len: usize,
+    pub tail_snap: Option<owl_store::SnapKey>,
+    pub msg_snaps: Vec<usize>,
+    /// 与 `msg_snaps` 同序的快照键（`None` = 未拍/已逐出；2026-11-12 二刀）
+    pub msg_snap_keys: Vec<Option<owl_store::SnapKey>>,
+    /// 是否为 leave-gap 后的本地链（仅 turn 内）
+    pub local_chain: bool,
+    pub last_use: u64,
 }
 
 /// 会话注册表(E2b 多会话:会话 × 块链 × GDN 格绑定;池容量策略在
@@ -345,6 +449,30 @@ impl SessionTable {
 
     pub fn get_mut(&mut self, id: u64) -> Option<&mut AgentSession> {
         self.sessions.get_mut(&id)
+    }
+
+    /// 全部会话(只读;会话资产投影 / 诊断)。
+    pub fn iter(&self) -> impl Iterator<Item = &AgentSession> {
+        self.sessions.values()
+    }
+
+    /// **L1 资产只读投影**(`/debug/vram` 的 `sessions` 面;按会话 id 升序)。
+    pub fn assets(&self) -> Vec<SessionAssets> {
+        let mut out: Vec<SessionAssets> = self
+            .sessions
+            .values()
+            .map(|s| SessionAssets {
+                id: s.id,
+                cached_len: s.cached_len,
+                tail_snap: s.tail_snap,
+                msg_snaps: s.msg_snaps.clone(),
+                msg_snap_keys: s.msg_snap_keys.clone(),
+                local_chain: s.local_chain,
+                last_use: s.last_use,
+            })
+            .collect();
+        out.sort_by_key(|s| s.id);
+        out
     }
 
     /// 会话结束(客户端显式关闭;KV 区域归还 —— M0.5 单槽 = 账本清理)
@@ -541,7 +669,7 @@ mod tests {
         assert!(s.guard(&p1));
         assert_eq!(s.delta_range(10), Some((0, 10)));
         let pos1: Vec<[i32;3]> = (0..12).map(|i| [i,i,i]).collect();
-        s.commit_turn(&p1, &[90, 91], &pos1, false).expect("收口 turn1");
+        s.commit_turn(&p1, &[90, 91], &pos1).expect("收口 turn1");
         assert_eq!(s.cached_len, 12);
         assert_eq!(s.tokens, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 90, 91]);
 
@@ -552,7 +680,7 @@ mod tests {
         assert!(s.guard(&p2), "历史逐 id 一致应命中");
         assert_eq!(s.delta_range(14), Some((12, 14)));
         let pos2: Vec<[i32;3]> = (0..15).map(|i| [i,i,i]).collect();
-        s.commit_turn(&p2, &[42], &pos2, false).expect("收口 turn2");
+        s.commit_turn(&p2, &[42], &pos2).expect("收口 turn2");
         assert_eq!(s.cached_len, 15);
 
         // turn3:纯生成续段(无新增 prompt)→ None
@@ -571,7 +699,7 @@ mod tests {
 
         // 截短的历史(prompt 比账本还短)也拒
         let pos2: Vec<[i32;3]> = (0..p2.len()).map(|i| [i as i32,i as i32,i as i32]).collect();
-        s.commit_turn(&p2, &[], &pos2, false).expect("收口 turn3");
+        s.commit_turn(&p2, &[], &pos2).expect("收口 turn3");
         assert!(!s.guard(&p2[..8]));
     }
 
@@ -702,5 +830,59 @@ mod bank_tests {
         bank.rel.leg.ensure_for_len(&mut s.block_table, 8).expect("target 块");
         bank.close(id).expect("close");
         assert!(bank.sessions.get(id).is_none());
+    }
+
+    /// L1 键沿用:append 位置对齐;截短/回撤丢弃;缺键 = None。
+    #[test]
+    fn carry_msg_snap_keys_aligns_by_offset() {
+        let a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(1));
+        let b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(2));
+        let old_points = vec![32usize, 64, 96];
+        let old_keys = vec![Some(a), None, Some(b)];
+        assert_eq!(
+            carry_msg_snap_keys(&old_points, &old_keys, &[32, 64, 96, 128]),
+            vec![Some(a), None, Some(b), None],
+            "append:旧边界沿用,新边界等本 turn 拍"
+        );
+        assert_eq!(
+            carry_msg_snap_keys(&old_points, &old_keys, &[32, 64]),
+            vec![Some(a), None],
+            "截短:只保留仍在 new 里的位置"
+        );
+        assert_eq!(
+            carry_msg_snap_keys(&old_points, &old_keys, &[32, 80]),
+            vec![Some(a), None],
+            "回撤后位置变了:旧 96 不沿用"
+        );
+        assert_eq!(
+            carry_msg_snap_keys(&old_points, &[Some(a)], &[32, 64]),
+            vec![Some(a), None],
+            "old_keys 短于 old_points 时按缺键处理(不 panic)"
+        );
+    }
+
+    /// **前缀命中路径的 reset 必须保留 L1 资产**；只有 `rebase`（真换链）
+    /// 才清 tail/msg keys。否则旧 tail 永远等不到降级，Dense 档会积累。
+    #[test]
+    fn reset_preserves_l1_assets_but_rebase_clears_them() {
+        let mut st = SessionTable::new();
+        let (_, s) = st.get_or_create(Some(7)).expect("建会话");
+        let k = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(9));
+        s.tail_snap = Some(k);
+        s.msg_snaps = vec![32, 64];
+        s.msg_snap_keys = vec![Some(k), None];
+        s.local_chain = true;
+
+        s.reset();
+        assert_eq!(s.tail_snap, Some(k), "命中续写不得丢 tail 归属");
+        assert_eq!(s.msg_snaps, vec![32, 64], "命中续写不得丢消息边界");
+        assert_eq!(s.msg_snap_keys, vec![Some(k), None], "键沿用不得断");
+        assert!(s.local_chain, "命中续写仍持 gapped 链");
+
+        s.rebase();
+        assert!(!s.local_chain, "真换链必须解除 gapped 表保留");
+        assert!(s.tail_snap.is_none(), "真换链清 tail");
+        assert!(s.msg_snaps.is_empty(), "真换链清消息边界");
+        assert!(s.msg_snap_keys.is_empty(), "真换链清键");
     }
 }

@@ -110,7 +110,7 @@ pub fn embed_plan_of(eq: owl_shared::config::EmbedQuant) -> Option<owl_models::m
 }
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use running::{RunningEngine, TokenizeReply};
-pub use session::{AgentSession, SessionTable};
+pub use session::{AgentSession, SessionAssets, SessionTable};
 pub use tp::{TpEngine, TpOpts, TpStaging};
 pub use turn::{TurnEvent, TurnImage, TurnOpts, TurnSampler, TurnSpec};
 

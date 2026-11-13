@@ -219,6 +219,8 @@ pub struct SnapEvictPreview {
     pub depth: usize,
     /// 是否为生成段(逐出即丢)。
     pub transient: bool,
+    /// 淘汰优先级档(Dense/Binary/Extra/Transient;2026-11-12)。
+    pub class: crate::state::SnapClass,
 }
 
 /// **盘上链索引重建报告**(S6.1;boot)。
@@ -565,6 +567,10 @@ impl Rel {
                     depth,
                     transient: self.state.snap_durability(k)
                         == Some(crate::state::SnapDurability::Transient),
+                    class: self
+                        .state
+                        .snap_class(k)
+                        .unwrap_or(crate::state::SnapClass::Extra),
                 }
             })
             .collect()
@@ -822,6 +828,7 @@ impl Rel {
         durability: crate::state::SnapDurability,
         session: u64,
         depth: usize,
+        class: crate::state::SnapClass,
     ) -> StoreResult<usize> {
         let mut ghosts = 0usize;
         if self.snap_host.get(key).is_some() {
@@ -834,8 +841,15 @@ impl Rel {
                 ghosts += 1;
             }
         }
-        self.state
-            .register_snap_owned(key, bytes, Tier::Gpu, durability, session, depth);
+        self.state.register_snap_owned_class(
+            key,
+            bytes,
+            Tier::Gpu,
+            durability,
+            session,
+            depth,
+            class,
+        );
         if ghosts > 0 {
             owl_shared::log_debug!(
                 "snap-trace",
@@ -843,6 +857,32 @@ impl Rel {
             );
         }
         Ok(ghosts)
+    }
+
+    /// **快照准入(纯账;不搬内容)** —— 引擎在 `snap_ensure_slot` 之前调用。
+    ///
+    /// `Skip` ⇒ 调用方必须**不拷贝**;`Replace(victim)` ⇒ 调用方先释放该
+    /// victim 的设备槽/宿主/盘副本,再照常 capture。
+    pub fn admit_snap(
+        &self,
+        session: u64,
+        key: SnapKey,
+        class: crate::state::SnapClass,
+        policy: crate::state::SnapAdmitPolicy,
+        protect: &[SnapKey],
+    ) -> crate::state::SnapAdmit {
+        self.state.admit_snap(session, key, class, policy, protect)
+    }
+
+    /// **只重分类快照条目的淘汰档**(不搬内容;2026-11-12 二刀)。
+    /// 返回 `false` = 键已不在账(正常逐出)。
+    pub fn reclassify_snap(&mut self, key: SnapKey, class: crate::state::SnapClass) -> bool {
+        self.state.reclassify_snap(key, class)
+    }
+
+    /// **会话关闭:释放该会话的快照归属**(不丢内容;2026-11-12 二刀)。
+    pub fn detach_session_snaps(&mut self, session: u64) -> usize {
+        self.state.detach_session(session)
     }
 
     /// 状态腿宿主层预算(字节;0 = 关层)。
@@ -994,6 +1034,44 @@ impl Rel {
         self.leg.note_probe(hit.kv_tier.is_some());
         self.state.note_probe(hit.snap_tier.is_some());
         hit
+    }
+
+    /// **前缀复用面**（单源；engine 的 submit / step_need / scheduler 共用）。
+    ///
+    /// 返回 `(m, dev)`：
+    /// - `m` = **可复用块数**（完全对齐保留末块重算；边界快照不在场则降一）；
+    /// - `dev` = 其中**设备已驻留**的块数（换入时不占新槽）。
+    ///
+    /// host 命中的块虽“命中”，回灌时照样要设备槽 ⇒ 需求侧只能减 `dev`，
+    /// 不能减 `m`。这条判据住在 store，engine 只消费结果。
+    pub fn reuse_face(
+        &self,
+        hit: &ChainHit,
+        recall: &RecallHit,
+        prompt_len: usize,
+        page: usize,
+    ) -> (usize, usize) {
+        let mut m = hit.matched_blocks;
+        let tail = m;
+        if m > 0 && m.saturating_mul(page) == prompt_len {
+            m -= 1; // 完全对齐保留末块重算（非空 prefill）
+        }
+        if m > 0 && m == tail && recall.snap_tier.is_some() {
+            let dev = hit.slots[..m].iter().filter(|s| s.is_some()).count();
+            return (m, dev);
+        }
+        while m > 0 {
+            if self
+                .state
+                .locate(SnapKey::at_boundary(hit.hashes[m - 1]))
+                .is_some()
+            {
+                break;
+            }
+            m -= 1; // 无快照的边界不可复用（GDN 态对不上）
+        }
+        let dev = hit.slots[..m].iter().filter(|s| s.is_some()).count();
+        (m, dev)
     }
 
     /// **按 token 命中查询**(engine L1 的第一跳):逐块内容匹配,回块链 + 绑定。
@@ -1288,7 +1366,7 @@ impl Rel {
     /// **唯一调度入口**(§30):给需求 ⇒ 两腿统一的“谁走谁进/拒”。纯 host、零 I/O。
     ///
     /// 判据全在 [`crate::hooks::plan_capacity`](唯一产地);本方法只做两件事:
-    /// 算两腿的宿主可容纳量、把 `Rel` 的两腿账与策略对象递进去。
+    /// 算各层可容纳量与“盘层是否启用”、把 `Rel` 的两腿账与策略对象递进去。
     /// engine 在**段边界**调本方法取单,自己发 `swap`/`drop`(§21 裁决)。
     pub fn plan_need(
         &self,
@@ -1296,10 +1374,12 @@ impl Rel {
         protect: &Protected,
     ) -> crate::hooks::Verdict {
         let room = crate::hooks::Room {
+            host_enabled: self.leg.host_enabled() || self.snap_host_budget() > 0,
             host_kv_slots: self.leg.host_free_slots(),
             host_snap_slots: self.snap_host_free_slots(),
             disk_kv_slots: self.disk.as_ref().map(|d| d.free_slots()).unwrap_or(0),
             disk_snap_slots: self.snap_disk.as_ref().map(|d| d.free_slots()).unwrap_or(0),
+            disk_enabled: self.disk.is_some() || self.snap_disk.is_some(),
             bulk_drop_when_tier_full: self.bulk_drop_when_tier_full,
         };
         crate::hooks::plan_capacity(
@@ -1448,17 +1528,21 @@ impl Rel {
         // 的"部分前缀"复用面从 ~97% 塔到 29%(7k 共享只复用 2k = 白重算 5k
         // token ≈ 5 s/请求)。
         //
-        // 政策 = **同一份策略对象**(`EvictPolicy`,与 KV 腿共用):只比 `Tier::Host`
-        // 的候选,排序后取第一个。代价说明:先逐后搬 ⇒ 若接下来的 DMA 失败
-        // (`abort_snap_offload`),冷条目已丢(比"丢新条目"代价小 —— 冷条目
-        // 本来就要被逐)。
+        // 政策 = **同一份快照出序**(`order_snap_victims`):先按 `SnapClass`
+        // 档位(`Transient → Extra → 老 Binary → Dense`),同档再交给
+        // `EvictPolicy`。只比 `Tier::Host` 的候选,排序后取第一个。
+        //
+        // 不能直接 `self.evict.order`:那会绕过 SnapClass,宿主满时可能先丢
+        // 一条 Dense 尾锚点,却留下更冷的 Extra。代价说明:先逐后搬 ⇒ 若接下来
+        // 的 DMA 失败(`abort_snap_offload`),被逐条目已丢(比"丢新条目"代价小
+        // —— 它本来就在淘汰序最前)。
         let last = self.snap_host.used_bytes();
         let mut guard = 0usize;
         let buf = loop {
             match self.snap_host.acquire() {
                 Ok(b) => break b,
                 Err(StoreError::Exhausted(why)) => {
-                    let mut cands: Vec<EvictCandidate> = self
+                    let cands: Vec<EvictCandidate> = self
                         .state
                         .evict_candidates(&[])
                         .into_iter()
@@ -1470,10 +1554,15 @@ impl Rel {
                             "宿主梯满且无 Host 层候选可逐({why};层账={last}B)"
                         )));
                     }
-                    self.evict.order(&mut cands);
-                    let v = cands[0]
-                        .snap
-                        .ok_or_else(|| StoreError::Invariant("驱逐候选缺 snap 键".into()))?;
+                    let v = crate::hooks::order_snap_victims(
+                        self.evict.as_ref(),
+                        cands,
+                        &self.state,
+                    )
+                    .into_iter()
+                    .filter_map(|c| c.snap)
+                    .next()
+                    .ok_or_else(|| StoreError::Invariant("驱逐候选缺 snap 键".into()))?;
                     let freed = self.snap_host.evict(v)?;
                     self.state.drop_snap(v)?;
                     let _ = freed;
@@ -1648,6 +1737,32 @@ impl Rel {
     /// ⇒ 条目一并删(不留假账;与 KV 腿 `abort_offload` 同律)。
     pub fn abort_snap_onload(&mut self, key: SnapKey) {
         let _ = self.state.drop_snap(key);
+    }
+
+    /// **整体丢弃一条快照资产**(准入替换路径;2026-11-12)。
+    ///
+    /// 与 `drop_snap_host` 的区别:本函数同时清**宿主 + 盘 + 状态账**,
+    /// 并返回丢弃前所在层 —— 设备层的槽必须由引擎的池清(store 不持句柄)。
+    /// 不在账 = 响亮拒(账/槽不平不允许静默)。
+    pub fn drop_snap_asset(&mut self, key: SnapKey) -> StoreResult<(crate::tier::Tier, usize)> {
+        let tier = self
+            .state
+            .locate(key)
+            .ok_or_else(|| StoreError::Unknown(format!("快照 {key:?}")))?;
+        if self.snap_host.get(key).is_some() {
+            self.snap_host.evict(key)?;
+        }
+        if let Some(d) = self.snap_disk.as_mut() {
+            if d.contains(key) {
+                d.commit_evict(&[key]);
+            }
+        }
+        let bytes = self.state.drop_snap(key)?;
+        owl_shared::log_debug!(
+            "snap-trace",
+            "drop-asset {key:?} tier={tier:?} bytes={bytes}"
+        );
+        Ok((tier, bytes))
     }
 
     /// 丢弃一条快照的宿主副本(内容整体淘汰时;不在宿主 = 幂等)。
@@ -3012,6 +3127,45 @@ mod tests {
     }
 
     /// **快照键重挂**(前缀无感删除):宿主层连内容一起换身份(零搬运),
+    /// **准入替换的资产清理**:宿主内容 + 状态账一起消;未知键响亮拒。
+    #[test]
+    fn drop_snap_asset_clears_host_and_state() {
+        let mut i = inputs();
+        i.host_bytes = 16 << 20;
+        let mut cfg = kv_cfg(64, 32);
+        cfg.host_bytes = 8 << 20;
+        let mut r = Rel::open(
+            i,
+            AdmissionPolicy::new(4, QueuePolicy::Reject),
+            cfg,
+            cell_for(&i),
+        )
+        .expect("装配");
+        r.attach_snap_layout(crate::leg::PoolLayout {
+            class: crate::leg::BlockClass::GdnRow,
+            epoch: 1,
+            pieces: vec![crate::leg::PieceSpec {
+                buf: owl_iface::contract::Bytes::new(0, 1, owl_iface::contract::Dtype::F32, 1),
+                stride_bytes: BLOCK_BYTES,
+            }],
+        })
+        .expect("状态腿布局");
+        let key = SnapKey::at_boundary(ChainHash::new(0xD9));
+        r.state
+            .register_snap(key, BLOCK_BYTES, Tier::Host, SnapDurability::Durable);
+        let buf = r.snap_host.acquire().expect("借缓冲");
+        r.snap_host.put(key, buf).expect("驻留");
+        assert_eq!(r.snap_host.used_bytes(), BLOCK_BYTES);
+
+        let (tier, bytes) = r.drop_snap_asset(key).expect("整体丢弃");
+        assert_eq!(tier, Tier::Host, "丢弃前所在层要报出来(设备槽由引擎清)");
+        assert_eq!(bytes, BLOCK_BYTES);
+        assert!(r.state.locate(key).is_none(), "状态账已消");
+        assert!(r.snap_host.get(key).is_none(), "宿主内容已消");
+        assert_eq!(r.snap_host.used_bytes(), 0);
+        assert!(r.drop_snap_asset(key).is_err(), "未知键必须响亮拒");
+    }
+
     /// 设备层只动账(槽是池的活);目标已在账 / 账表不平 ⇒ 拒且原样不动。
     #[test]
     fn rekey_snap_moves_host_content_without_copy() {

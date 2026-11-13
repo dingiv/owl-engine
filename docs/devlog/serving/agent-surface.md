@@ -1359,9 +1359,12 @@ DMA 已到 PCIe 上限,要再降只剩"宿主内容 pin"(被形态律 1 否)。
 旧行为:宿主满 ⇒ `acquire()` 直接 `Exhausted` ⇒ 引擎回落"丢**新**快照"
 ⇒ 开机做过几轮会话后,3 GB 宿主梯被旧链边界**永久占满** ⇒ 14k prompt 的 28 个边界里
 **18 个被丢**。
-修:**满 ⇒ 先用同一份 `EvictPolicy` 逐最冷的 `Tier::Host` 条目**(政策住 store,
-与 KV 腿共用一本策略;逐出量经 `snap_host_evicted_bytes` 差分上报 + `store.snap.host_evict_bytes`
-指标——store 零日志依赖)。store 门 `snap_leg.rs::③` 从"满即拒"改写为"满⇒逐最冷腾位"(含零副作用/un 断言)。
+修:**满 ⇒ 先用同一份快照出序 `order_snap_victims` 逐 `Tier::Host` 条目**
+(先 `SnapClass` 档位，同档再交给 `EvictPolicy`;逐出量经 `snap_host_evicted_bytes`
+差分上报 + `store.snap.host_evict_bytes` 指标——store 零日志依赖)。store 门
+`snap_leg.rs::③` 从"满即拒"改写为"满⇒逐最冷腾位"(含零副作用/un 断言);
+2026-11-13 补门 `host_eviction_respects_snap_class_before_lru`，防宿主淘汰
+绕过 `Dense/Extra` 档位。
 
 #### (10.4) 实测(同二进制 + 同"脏"启动状态,前置三连 9.1k 会话污染宿主梯)
 

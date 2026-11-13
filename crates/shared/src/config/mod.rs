@@ -72,7 +72,7 @@
 //! | pool | kv_dtype | KvDtype 枚举 `f16\|fp8\|int8` / f16(主 KV 池存储格式;2026-11-04 由两个布尔合成单键) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
 //! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
-//! | pool | vram_target / vram_reserve_mb | f64、u64 / 0.97、1024 |
+//! | pool | vram_budget / vram_reserve_mb | f64、u64 / 0.97、1024 |
 //! | pool | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
 //! | vision | enabled | bool / false(视觉塔开关;GGUF 档另有 `path` 指向 `mmproj-*.gguf`) |
 //! | vision | image_evict | bool / false(**前缀无感删除**:图像段打标记 ⇒ 页对齐 + 删除即位置帧平移,需 `[pool] prefix_cache`) |
@@ -905,6 +905,26 @@ pub struct PoolCfg {
     /// system 结束），之后距上一条不足本值的边界跳过，避免 10K 多消息
     /// 场景一次拍出几十张 27B 快照（152 MiB/张）。
     pub snap_msg_min_gap: usize,
+    /// **最近 K 条消息边界无条件保留**（dense tail；2026-11-12 分层）。
+    ///
+    /// Agent 前端只在消息末尾追加；最近几条消息可能回撤，且对 TTFT 最敏感。
+    /// 这几条边界即使距上一条不足 `snap_msg_min_gap` 也要拍快照（并在 L1
+    /// 会话资产里记录）——它们正是"新增一条消息 → 前面 100% 命中"的锚点。
+    /// 0 = 旧行为（仅第一条无条件 + min_gap）。
+    pub snap_msg_recent: usize,
+    /// **每会话快照上限**（2026-11-12；0 = 不限 = 旧行为）。
+    ///
+    /// 只数**非 Transient** 条目（设备 + 宿主 + 盘都算）；`Transient` 是
+    /// decode/spec rollback 的页边界快照，设备槽内自限、逐出零成本，不计入。
+    /// 超限时按 `SnapClass` 档位选 victim：`Extra` → 老 `Binary` → 最老
+    /// `Dense`；新条目档位不高于 victim 才替换，否则**跳过拍摄**（不拷贝）。
+    pub snap_session_cap: usize,
+    /// **结构档保留位**（2026-11-12；仅 `snap_session_cap > 0` 时生效）。
+    ///
+    /// `Extra` 最多占 `snap_session_cap - snap_structural_reserve` 格，
+    /// 剩余名额留给 `Dense`/`Binary`。不是 pin：结构档满手时 `Dense` 也按
+    /// LRU 替换，`Binary` 不会逆档挤掉 `Dense`。
+    pub snap_structural_reserve: usize,
     /// 消息边界切块的**最小步长**（token）。距当前 `fed` 太近的边界不单独
     /// 切块，避免 20-token 消息制造大量小 prefill chunk。
     pub snap_msg_min_span: usize,
@@ -942,7 +962,12 @@ pub struct PoolCfg {
     /// 目录必须**独占**(同一目录给两个引擎用会互相扫到对方的块);
     /// 不存在时 boot 自动创建。
     pub disk_dir: String,
-    pub vram_target: f64,
+    /// **显存治理占比**(0..1;0 = 治理禁用,1.0 = 吃满驱动 free)。
+    ///
+    /// `target_total = 驱动 total × vram_budget`;与 [`Self::vram_budget_mb`]
+    /// (绝对硬上限)是两个不同量。2026-11-13 由 `vram_target` 更名,
+    /// 语义不变(旧键已拒)。
+    pub vram_budget: f64,
     pub vram_reserve_mb: u64,
     pub prefix_cache: bool,
     /// **解释器块池预算**(字节;0 = 关 = 逐节点 alloc/free 存量路径)。
@@ -952,7 +977,7 @@ pub struct PoolCfg {
     /// 原 `OWL_NO_RECLAIM` env。⚠️ 开会无界常驻(长请求 OOM),只作取证。
     pub no_reclaim: bool,
     /// **驱动账逻辑上限 MiB**(`None` / **`0`** = 只按驱动账判;原 `OWL_VRAM_BUDGET_MB`)。
-    /// 适合"这台卡只准 owl 用 N GB"的部署口径;与 `vram_target`(占比)
+    /// 适合"这台卡只准 owl 用 N GB"的部署口径;与 `vram_budget`(占比)
     /// 是两个不同量:本键是硬上限,超出即主动拒发。
     /// ⚠️ `0` 与 `None` 同义(各档显式写 `0` 表示"不限")—— 归一点在
     /// `DiagOpts` 构造(`state.rs`);**不要**把它当"0 字节预算"。
@@ -2134,6 +2159,9 @@ impl Default for PoolCfg {
             snap_msg_boundary: false,
             snap_msg_delim: String::new(),
             snap_msg_min_gap: 2048,
+            snap_msg_recent: 4,
+            snap_session_cap: 0,
+            snap_structural_reserve: 4,
             snap_msg_min_span: 0,
             host_cache_mb: 0,
             snap_host_mb: 0,
@@ -2143,7 +2171,7 @@ impl Default for PoolCfg {
             checkpoint_min_gap_ms: 5000,
             disk_dir: String::new(),
             pool_cap_mb: 256,
-            vram_target: 0.97,
+            vram_budget: 0.97,
             vram_reserve_mb: 1024,
             transient_reserve_mb: 1024,
             prefix_cache: true,
@@ -2380,6 +2408,11 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
     }
     /// (module, 退役键, 迁移指引)
     const RETIRED: &[(&str, &str, &str)] = &[
+        (
+            "pool",
+            "vram_target",
+            "已更名(2026-11-13): 改用 `[pool] vram_budget`(0..1 占比,语义不变);绝对硬上限仍是 `[pool] vram_budget_mb`",
+        ),
         (
             "model",
             "w4a8",
@@ -3326,6 +3359,15 @@ impl OwlConfig {
                     .to_string(),
             );
         }
+        if self.pool.snap_session_cap > 0
+            && self.pool.snap_structural_reserve > self.pool.snap_session_cap
+        {
+            return Err(format!(
+                "[pool] snap_structural_reserve={} > snap_session_cap={} —— \
+                 保留位不能超过会话快照上限(否则 Extra 永远拍不了)",
+                self.pool.snap_structural_reserve, self.pool.snap_session_cap
+            ));
+        }
         // **合批上限的自洽门**(B5.1;2026-10-20):批 = 每会话一行 GDN 状态,
         // 且 M1 的页表按行铺(无选择层视图)。任一不成立 ⇒ 拒启(不许"配了
         // 但静默退回串行")。
@@ -3513,6 +3555,17 @@ mod tests {
         assert!(e.contains("退役键") && e.contains("tag_wildcard"), "{e}");
     }
 
+    /// `vram_target` 更名为 `vram_budget`:旧键必须响亮拒并指向新键。
+    #[test]
+    fn vram_target_退役键指向_vram_budget() {
+        let e = OwlConfig::from_toml_str("[pool]\nvram_target = 0.99\n")
+            .expect_err("旧 vram_target 必须拒");
+        assert!(
+            e.contains("退役键") && e.contains("vram_budget") && e.contains("vram_budget_mb"),
+            "{e}"
+        );
+    }
+
     /// **跨字段语义门**(D1,2026-10-17):`gdn_slots < max_concurrency` 必拒,
     /// 拒语要点出病因(状态格逐出 = 跨会话污染)与调法;合规组合(生产档 1/1、
     /// 缺省 8/8)必须过。
@@ -3564,6 +3617,25 @@ mod tests {
                 .is_err(),
             "合批 + 选择层视图应拒"
         );
+    }
+
+    #[test]
+    fn validate_rejects_structural_reserve_over_session_cap() {
+        let e = OwlConfig::from_toml_str(
+            "[pool]\nsnap_session_cap = 4\nsnap_structural_reserve = 5\n",
+        )
+        .expect_err("保留位 > 会话上限必须拒");
+        assert!(
+            e.contains("snap_structural_reserve") && e.contains("snap_session_cap"),
+            "拒语应可行动: {e}"
+        );
+        OwlConfig::from_toml_str(
+            "[pool]\nsnap_session_cap = 20\nsnap_structural_reserve = 4\n",
+        )
+        .expect("20/4 = 合规");
+        OwlConfig::default()
+            .validate()
+            .expect("缺省 cap=0(不启用 per-session 上限)");
     }
 
     #[test]

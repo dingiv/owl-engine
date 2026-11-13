@@ -10,7 +10,7 @@ use owl_cpu::CpuFace;
 use owl_iface::contract::{DeviceClient, Dtype, HeapRegion, PinnedRegion, SwapDir};
 use owl_store::{
     AdmissionPolicy, BlockClass, BudgetInputs, ChainHash, LegConfig, PieceSpec, PoolLayout,
-    QueuePolicy, Rel, SnapDurability, SnapKey, StoreError, Tier,
+    QueuePolicy, Rel, SnapClass, SnapDurability, SnapKey, StoreError, Tier,
 };
 
 const ROW_BYTES: usize = 64; // 一条"行宽"(片步长)
@@ -201,8 +201,15 @@ async fn recapture_drops_stale_host_copy() {
         .expect("布局");
     let k = key(21);
     seed(&mut face, &ps, 0, 0x33).await;
-    r.register_snap_captured(k, SNAP_BYTES, SnapDurability::Durable, 7, 4)
-        .expect("首拍");
+    r.register_snap_captured(
+        k,
+        SNAP_BYTES,
+        SnapDurability::Durable,
+        7,
+        4,
+        owl_store::SnapClass::Extra,
+    )
+    .expect("首拍");
     // 沉到宿主(此刻宿主真有内容)
     let (pieces, table) = r.plan_snap_offload(k, 0).expect("下沉计划");
     let conn = face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await.expect("swap");
@@ -212,7 +219,14 @@ async fn recapture_drops_stale_host_copy() {
 
     // 重拍同一边界(同键):幽灵必须当场丢
     let ghosts = r
-        .register_snap_captured(k, SNAP_BYTES, SnapDurability::Durable, 7, 4)
+        .register_snap_captured(
+            k,
+            SNAP_BYTES,
+            SnapDurability::Durable,
+            7,
+            4,
+            owl_store::SnapClass::Extra,
+        )
         .expect("重拍");
     assert_eq!(ghosts, 1, "应丢掉一份旧副本");
     assert_eq!(r.snap_host_used(), 0, "宿主账必须清零(否则是幽灵)");
@@ -225,3 +239,73 @@ async fn recapture_drops_stale_host_copy() {
         .expect("再沉落账(不得撞不变量)");
     assert_eq!(r.state.locate(k), Some(Tier::Host));
 }
+
+/// ⑦ **宿主满时的淘汰也必须遵守 SnapClass**（2026-11-13）。
+///
+/// 宿主梯旧实现直接 `EvictPolicy::order`，绕过了 `Dense/Extra` 档位：
+/// 一条更老的 Dense 尾锚点会比一条更新的 Extra 先被逐掉。门用
+/// “Dense 更老 + Extra 更新”构造，正确序必须先走 Extra。
+#[tokio::test]
+async fn host_eviction_respects_snap_class_before_lru() {
+    let mut face = CpuFace::new();
+    let ps = snap_pieces(&mut face, 4).await;
+    let mut r = rel(2 * SNAP_BYTES);
+    r.attach_snap_layout(PoolLayout { class: BlockClass::GdnRow, epoch: 0, pieces: ps.clone() })
+        .expect("布局");
+
+    let k_dense = key(31);
+    let k_extra = key(32);
+    let k_new = key(33);
+    r.register_snap_captured(
+        k_dense,
+        SNAP_BYTES,
+        SnapDurability::Durable,
+        7,
+        1,
+        SnapClass::Dense,
+    )
+    .expect("登记 Dense");
+    r.register_snap_captured(
+        k_extra,
+        SNAP_BYTES,
+        SnapDurability::Durable,
+        7,
+        2,
+        SnapClass::Extra,
+    )
+    .expect("登记 Extra");
+
+    for (k, slot) in [(k_dense, 0u32), (k_extra, 1u32)] {
+        let (pieces, table) = r.plan_snap_offload(k, slot).expect("下沉计划");
+        let conn = face
+            .swap(SwapDir::Out, &pieces[0], Box::new(table))
+            .await
+            .expect("swap(Out)");
+        r.commit_snap_offload(k, owl_store::reclaim_slot_table(conn).expect("台"))
+            .expect("下沉落账");
+    }
+    assert_eq!(r.snap_host_free_slots(), 0, "宿主应已满");
+
+    r.register_snap_captured(
+        k_new,
+        SNAP_BYTES,
+        SnapDurability::Durable,
+        7,
+        3,
+        SnapClass::Extra,
+    )
+    .expect("登记新 Extra");
+    let _ = r.plan_snap_offload(k_new, 2).expect("宿主满 ⇒ 按档位逐一条");
+
+    assert_eq!(
+        r.state.locate(k_extra),
+        None,
+        "更新的 Extra 必须先于更老的 Dense 被逐"
+    );
+    assert_eq!(
+        r.state.locate(k_dense),
+        Some(Tier::Host),
+        "Dense 是最后淘汰档，不应先走"
+    );
+}
+

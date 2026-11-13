@@ -815,6 +815,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         owl_store::SnapDurability::Transient,
                         true,
                         true,
+                        owl_store::SnapClass::Transient,
                     )
                     .await?;
                     owl_shared::log_debug!("spec-round", "边界:snap_tail 完");
@@ -1920,6 +1921,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 只有"拍快照 + 槽满 DtoH 下沉(159 MB ≈ 31 ms)"这一半按节奏做 ——
         // 冷长 prefill 每 512/1024 tok 都拍 = 纯开销;复用只需要**末边界** +
         // 稀疏锚点(见 `phases.rs` 的 `SNAP_EVERY`)。
+        // 淘汰优先级档(2026-11-12):末边界 = Dense;消息边界按 dense/binary/extra;
+        // 其余 chunk 锚点 = Extra。
+        let class = self.prefill_snap_class(fed);
         self.capture_gdn_snap_tail(
             sid,
             fed,
@@ -1927,27 +1931,108 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             owl_store::SnapDurability::Durable,
             snap_keep,
             index_now,
+            class,
         )
         .await
     }
 
-    /// 同上,但 `tail` = 最后几个**已提交尚未入 `act.out`** 的 token
-    /// (spec 轮内边界快照:提交在 emit 之前,`out` 还差本轮那几枚;
-    /// 位置 = `out` 尾的下一枚起 —— `out` 不变式:`out.len() = fed - prompt_len + 1`)、
-    /// `durability` = 重要性档(生成段逐页边界 = [`Transient`](owl_store::SnapDurability::Transient):
-    /// 链一往前就被取代 ⇒ 逐出即丢,不下沉宿主)。
+    /// prefill 边界的快照档:末边界/消息边界(按 `msg_snap_classes`)→
+    /// 否则 Extra。不是 pin —— 只决定淘汰顺序。
+    fn prefill_snap_class(&self, fed: usize) -> owl_store::SnapClass {
+        let Ok(act) = self.turns.active() else {
+            return owl_store::SnapClass::Extra;
+        };
+        if fed >= act.prompt_ids.len() {
+            return owl_store::SnapClass::Dense;
+        }
+        match act.msg_snaps.binary_search(&fed) {
+            Ok(i) => act
+                .msg_snap_classes
+                .get(i)
+                .copied()
+                .unwrap_or(owl_store::SnapClass::Extra),
+            Err(_) => owl_store::SnapClass::Extra,
+        }
+    }
+
+    /// **准入替换**:整体释放一条快照资产(设备槽 + 宿主/盘 + 状态账)。
+    ///
+    /// store 只持账,不持设备句柄 ⇒ 设备槽的清理留在引擎(两 rank 镜像)。
+    /// 账在设备层但池内无槽 = 账/槽不平,响亮拒(不静默丢)。
+    fn drop_snap_asset_for_admit(&mut self, key: owl_store::SnapKey) -> Result<()> {
+        let (tier, bytes) = self.bank.rel.drop_snap_asset(key)?;
+        if tier == owl_store::Tier::Gpu {
+            let slot = self.dev.pool.snap_slot_of(key).ok_or_else(|| {
+                ModelError::Msg(format!("快照 {key:?} 在设备层但池内无槽(账/槽不平)"))
+            })?;
+            self.dev.pool.snap_clear_slot(slot);
+            if let Some(pr) = self.peer.as_mut() {
+                pr.pool.snap_clear_slot(slot);
+            }
+        }
+        owl_shared::log_debug!(
+            "snap",
+            "准入替换:淘汰 {key:?}(tier={tier:?}, {bytes} B)"
+        );
+        Ok(())
+    }
+
     /// **在指定边界拍一张快照**(单一产地:正常 prefill/decode 边界与"中断补拍"
     /// 共用这一份 —— 槽位选择 / 双 rank 镜像 / 登记账簿 / 保护面全在此)。
     ///
     /// `key` = 边界块的内容身份;`full_blocks` = 该边界对应的整块数(记账口径)。
+    /// 返回 `true` = 快照已在账(含同键 Touch);`false` = 准入 Skip(未拷贝)。
     async fn capture_snap_at_boundary(
         &mut self,
         sid: u64,
         key: owl_store::SnapKey,
         full_blocks: usize,
         durability: owl_store::SnapDurability,
-    ) -> Result<()> {
+        class: owl_store::SnapClass,
+    ) -> Result<bool> {
         let gdn_slot = self.turns.active().map(|a| a.gdn_slot).unwrap_or(0);
+        // **准入(2026-11-12)**:先问账,再选槽/拷贝。
+        //
+        // - `Skip` ⇒ 不占格、不选槽、不搬 159 MiB;
+        // - `Replace(victim)` ⇒ 先整体释放 victim(设备槽 + 宿主/盘 + 账),
+        //   再照常 capture(同一笔操作内完成,避免中间态超容);
+        // - `Touch` ⇒ 同键已在账:照常重拍(内容刷新),不占新格;
+        // - `Transient` / 无会话归属 / `session_cap=0` ⇒ `Add`(旧行为)。
+        //
+        // 快照准入只按 class 优先级，不按活跃会话点名保护。
+        let policy = owl_store::SnapAdmitPolicy {
+            session_cap: self.boot.cfg.knobs.snap_session_cap,
+            structural_reserve: self.boot.cfg.knobs.snap_structural_reserve,
+        };
+        // 快照准入只按 class 优先级；不在 admission 里按活跃会话点名保护。
+        match self.bank.rel.admit_snap(sid, key, class, policy, &[]) {
+            owl_store::SnapAdmit::Add => {
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("snap.admit.add", 1, file!(), line!());
+                });
+            }
+            owl_store::SnapAdmit::Touch => {
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("snap.admit.touch", 1, file!(), line!());
+                });
+            }
+            owl_store::SnapAdmit::Skip(reason) => {
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("snap.admit.skip", 1, file!(), line!());
+                });
+                owl_shared::log_debug!(
+                    "snap",
+                    "准入跳过:session={sid:#x} key={key:?} class={class:?} reason={reason:?}"
+                );
+                return Ok(false);
+            }
+            owl_store::SnapAdmit::Replace(victim) => {
+                owl_shared::metrics::with_metrics_store(|m| {
+                    m.counter_add("snap.admit.replace", 1, file!(), line!());
+                });
+                self.drop_snap_asset_for_admit(victim)?;
+            }
+        }
         let slot = self.snap_ensure_slot(key).await?;
         // 两 rank 各拍各自的池(镜像分配 ⇒ slot 号同构);
         // store 的 state 账是 **host 单份** ⇒ 身份只登记一次(内容相同)。
@@ -1980,6 +2065,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             durability,
             sid,
             full_blocks,
+            class,
         )?;
         if ghosts > 0 {
             owl_shared::metrics::with_metrics_store(|m| {
@@ -1989,7 +2075,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **P1-2**:本 turn 的最新边界进入显式保护面。快照面没有引用计数,
         // 若不记在这里,下一次 Idle/Pressure 可能把它当成最冷条目搬走。
         self.turns.active_mut()?.last_snap = Some(key);
-        Ok(())
+        Ok(true)
     }
 
     /// **在游标当前链尾补拍一张快照**(2026-11-03:客户端中断长 prefill 时用)。
@@ -2007,6 +2093,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         &mut self,
         sid: u64,
         durability: owl_store::SnapDurability,
+        class: owl_store::SnapClass,
     ) -> Result<bool> {
         let (full_blocks, key) = {
             let s = self
@@ -2019,15 +2106,32 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if full_blocks == 0 {
             return Ok(false);
         }
-        self.capture_snap_at_boundary(sid, key, full_blocks, durability)
+        let captured = self
+            .capture_snap_at_boundary(sid, key, full_blocks, durability, class)
             .await?;
-        owl_shared::log_info!(
-            "snap",
-            "中断补拍:session={sid:#x} 边界 {full_blocks} 块 的快照已就位(中断前的前缀可复用)"
-        );
-        Ok(true)
+        if captured {
+            // **L1 键回填**:cursor 边界若正好是某个消息边界,记下 key
+            // （turn 末 Dense 尾锚点通常在最后一个消息边界之后，不匹配 = 正常）。
+            let page = self.dev.pool.geom.page.max(1);
+            let at = full_blocks * page;
+            if let Ok(act) = self.turns.active_mut() {
+                if let Ok(i) = act.msg_snaps.binary_search(&at) {
+                    act.msg_snap_keys[i] = Some(key);
+                }
+            }
+            owl_shared::log_info!(
+                "snap",
+                "cursor 补拍:session={sid:#x} 边界 {full_blocks} 块 的快照已就位(class={class:?})"
+            );
+        }
+        Ok(captured)
     }
 
+    /// 同上,但 `tail` = 最后几个**已提交尚未入 `act.out`** 的 token
+    /// (spec 轮内边界快照:提交在 emit 之前,`out` 还差本轮那几枚;
+    /// 位置 = `out` 尾的下一枚起 —— `out` 不变式:`out.len() = fed - prompt_len + 1`)、
+    /// `durability` = 重要性档(生成段逐页边界 = [`Transient`](owl_store::SnapDurability::Transient):
+    /// 链一往前就被取代 ⇒ 逐出即丢,不下沉宿主)。
     pub(crate) async fn capture_gdn_snap_tail(
         &mut self,
         sid: u64,
@@ -2036,6 +2140,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         durability: owl_store::SnapDurability,
         snap_keep: bool,
         index_now: bool,
+        class: owl_store::SnapClass,
     ) -> Result<()> {
         // 快照面开关(只门住第 ④ 步;前三步照走)。
         //
@@ -2073,7 +2178,17 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         //
         // 逐块**图像指纹**必须在块外取(下面要 `get_mut` 会话账);来源 = 会话
         // spans(已在 submit 侧按像素盖章)⇒ 游标 / 重放 / 增量登记三处同源。
-        let tags = self.turn_block_tags(sid, page);
+        let mut tags = self.turn_block_tags(sid, page);
+        // `tail`（spec 轮内已提交未入 out 的 token）也是链的一部分；尾部
+        // 一定是生成文本，tag=0。补齐到 full_blocks，避免 advance 因
+        // `seg_tags.len() < n` 响亮拒（2026-11-13）。
+        //
+        // 纯文本链 `block_tags` 返回空 = 无图像身份，`advance` 接受空
+        // 指纹；只有"确有图像 tag 但长度不够"才补零，避免每块白分配
+        // 全链 tag 向量。
+        if !tags.is_empty() && tags.len() < full_blocks {
+            tags.resize(full_blocks, 0);
+        }
         let (key, per_block, parent0) = {
             let s = self
                 .bank
@@ -2104,6 +2219,30 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 per.push((parent, b));
             }
             debug_assert_eq!(parent, tail, "逐块重放尾哈希须与 advance 一致(身份单源)");
+            // **同会话复用的逐块身份**(2026-11-13):与 `block_table` 对齐,
+            // 长度必须 = 链游标。截断/前缀命中后 `plan_prefix_reuse` 会播种;
+            // 若长度不齐(旧账/旁路),清空并禁用本会话的 session-local 复用
+            // (响亮留痕,不静默错位)。
+            let mut hashes_ok = s.block_hashes.len() == start;
+            if s.block_hashes.len() > start {
+                s.block_hashes.truncate(start);
+                hashes_ok = true;
+            }
+            if !hashes_ok {
+                owl_shared::log_warn!(
+                    "snap",
+                    "block_hashes 长度 {} ≠ 链游标 {}（session={sid:#x}）⇒ 清空;本会话暂不做 session-local 复用",
+                    s.block_hashes.len(),
+                    start
+                );
+                s.block_hashes.clear();
+            }
+            // 失配时**不能**只追加 `per`：那会让长度 = 新增块数而非链长，
+            // 下轮仍失配且向量内容与 block_table 错位。清空后等一次
+            // `rebase`/零起点重建；期间 session-local 明确禁用。
+            if hashes_ok {
+                s.block_hashes.extend(per.iter().map(|(h, _)| *h));
+            }
             (
                 owl_store::SnapKey::at_boundary(tail),
                 per,
@@ -2113,9 +2252,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **S2(§25.2)**:槽位选择 + 冷快照下沉 —— 快照账的真源是 store 的
         // `StateStore`;设备池只做槽位索引。槽满时先**下沉最冷的一条**
         // (内容留宿主),沉不下(宿主满/关)才丢(响亮打点)。
+        let mut captured = false;
         if snap_on {
-            self.capture_snap_at_boundary(sid, key, full_blocks, durability)
+            captured = self
+                .capture_snap_at_boundary(sid, key, full_blocks, durability, class)
                 .await?;
+            if !captured {
+                owl_shared::log_debug!(
+                    "snap",
+                    "边界快照准入跳过(链/索引照常):session={sid:#x} key={key:?}"
+                );
+            }
+        }
+        // **L1 键回填**(2026-11-12 二刀):本边界确实拍到了 ⇒ 记下 key,
+        // 下一轮 submit 只重分类(不搬内容)。消息边界以外的 chunk 锚点
+        // 不在 `msg_snaps` 里,`binary_search` 失败即忽略。
+        if captured {
+            if let Ok(act) = self.turns.active_mut() {
+                if let Ok(i) = act.msg_snaps.binary_search(&fed) {
+                    act.msg_snap_keys[i] = Some(key);
+                }
+            }
         }
         // **B 轴 B-0:同一处顺手采索引**(同一"块边界 + 链尾身份"事件 ⇒
         // 一次算身份、一次推进游标;索引与 GDN 快照共享边界身份)。

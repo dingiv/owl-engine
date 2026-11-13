@@ -331,10 +331,16 @@ pub struct EngineKnobs {
     pub snap_msg_delim: String,
     /// 后续消息边界稀疏间隔(token)
     pub snap_msg_min_gap: usize,
+    /// 最近 K 条消息边界无条件保留（dense tail；`[pool].snap_msg_recent`）
+    pub snap_msg_recent: usize,
+    /// **每会话快照上限**（`[pool].snap_session_cap`；0 = 不限 = 旧行为）
+    pub snap_session_cap: usize,
+    /// **结构档保留位**（`[pool].snap_structural_reserve`；仅 cap > 0 生效）
+    pub snap_structural_reserve: usize,
     /// 消息边界切块最小步长(token)
     pub snap_msg_min_span: usize,
-    /// VRAM 预算目标占比(缺省 0.97;原 OWL_VRAM_TARGET)
-    pub vram_target: f64,
+    /// **显存治理占比**(`[pool].vram_budget`;缺省 0.97;0 = 治理禁用)
+    pub vram_budget: f64,
     /// VRAM 预留 MiB(缺省 1024;原 OWL_VRAM_RESERVE_MB)
     pub vram_reserve_mb: u64,
     /// **超卖档池外瞬态余量 MiB**(`[pool].transient_reserve_mb`;缺省 1024)。
@@ -440,8 +446,11 @@ impl Default for EngineKnobs {
             snap_msg_boundary: false,
             snap_msg_delim: String::new(),
             snap_msg_min_gap: 2048,
+            snap_msg_recent: 4,
+            snap_session_cap: 0,
+            snap_structural_reserve: 4,
             snap_msg_min_span: 0,
-            vram_target: 0.97,
+            vram_budget: 0.97,
             vram_reserve_mb: 1024,
             transient_reserve_mb: 1024,
             raw_completion: false,
@@ -822,8 +831,11 @@ impl EngineKnobs {
             snap_msg_boundary: cfg.pool.snap_msg_boundary,
             snap_msg_delim: cfg.pool.snap_msg_delim.clone(),
             snap_msg_min_gap: cfg.pool.snap_msg_min_gap,
+            snap_msg_recent: cfg.pool.snap_msg_recent,
+            snap_session_cap: cfg.pool.snap_session_cap,
+            snap_structural_reserve: cfg.pool.snap_structural_reserve,
             snap_msg_min_span: cfg.pool.snap_msg_min_span,
-            vram_target: cfg.pool.vram_target,
+            vram_budget: cfg.pool.vram_budget,
             vram_reserve_mb: cfg.pool.vram_reserve_mb,
             transient_reserve_mb: cfg.pool.transient_reserve_mb,
             raw_completion: cfg.probes.raw_completion,
@@ -1822,10 +1834,11 @@ pub(crate) fn into_running<D: DeviceClient>(
             } else {
                 owl_shared::log_info!(
                     "boot",
-                    "消息边界快照:开 · delim={delim:?} → {} token {:?} · min_gap={} · min_span={}",
+                    "消息边界快照:开 · delim={delim:?} → {} token {:?} · min_gap={} · recent={} · min_span={}",
                     ids.len(),
                     ids,
                     cfg.knobs.snap_msg_min_gap,
+                    cfg.knobs.snap_msg_recent,
                     cfg.knobs.snap_msg_min_span
                 );
             }
@@ -1834,6 +1847,15 @@ pub(crate) fn into_running<D: DeviceClient>(
     } else {
         Vec::new()
     };
+
+    if cfg.knobs.snap_session_cap > 0 {
+        owl_shared::log_info!(
+            "boot",
+            "快照准入:每会话上限 {} 张(设备+宿主+盘;结构档保留 {} 格;Transient 不计)",
+            cfg.knobs.snap_session_cap,
+            cfg.knobs.snap_structural_reserve
+        );
+    }
 
     let boot = crate::running::BootCtx {
         probes: cfg.knobs.probes,
@@ -1912,6 +1934,25 @@ pub(crate) struct RankDev<D: DeviceClient> {
     /// 该算子不写它 ⇒ 按 **face 指针**缓存复用:session/verify 是两本独立
     /// 账本,且图重捕会给新 face;只缓存一个块会在下一 turn 撞"块不在本账本"。
     pub(crate) fi_plan_out: std::collections::HashMap<usize, owl_iface::contract::Bytes>,
+    /// **DFlash2 prefill encode 的延迟队列**（2026-11-13）。
+    ///
+    /// 草稿 KV 只服务首 token 之后的 spec propose，**不参与首 token**。
+    /// 旧实现把 encode 放在 prefill chunk 内 ⇒ 首 token 前白等 ~264ms。
+    /// 这里把 tap 根块挂起，`execute_prefill` 在 `sample_and_emit` 之后
+    /// 再统一 encode；根块不 free（arena/中间块仍按原路回收）。
+    pub(crate) pending_dflash: Vec<PendingDflash>,
+    /// 挂起队列的 token 数（cap = 4096，避免长冷 prefill 把 tap 根块攒爆）
+    pub(crate) pending_dflash_tokens: usize,
+}
+
+/// 一条待编码的 DFlash2 tap 根块（只存根 + 重建视图所需的标量）。
+pub(crate) struct PendingDflash {
+    pub root: owl_models::contract::Bytes,
+    pub t: usize,
+    pub n_tp: usize,
+    pub d_model: usize,
+    pub dtype: owl_models::Dtype,
+    pub base: usize,
 }
 
 /// **装载期定型、运行期只读**的 rank 事实(权重是分片的,每 rank 一份)。
@@ -2633,7 +2674,7 @@ fn boot_pool_plan(
         gdn_slots: cfg.knobs.gdn_slots,
         max_batch: cfg.knobs.max_batch,
         snap_max: cfg.knobs.snap_max,
-        vram_target: cfg.knobs.vram_target,
+        vram_budget: cfg.knobs.vram_budget,
         vram_reserve_mb: cfg.knobs.vram_reserve_mb,
         transient_reserve_mb: cfg.knobs.transient_reserve_mb,
         // B-2:选择层视图面(**生产档也要** —— 视图是 decode 的消费方;
@@ -2956,6 +2997,8 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         phase: boot_env.phase,
         spec_rt: spec,
         fi_plan_out: std::collections::HashMap::new(),
+        pending_dflash: Vec::new(),
+        pending_dflash_tokens: 0,
         pool,
         graphs,
     })

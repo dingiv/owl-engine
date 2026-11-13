@@ -3,7 +3,7 @@
 //! 与引擎治理器(`crates/engine/src/state.rs` 的 `[vram-gov]`)**同一算式**:
 //!
 //! ```text
-//! target_total = total × vram_target
+//! target_total = total × vram_budget
 //! fixed        = gdn_row × (gdn_slots + snap_max) + 图 slab 640MiB + warmup 138MiB
 //! budget       = target_total − reserve − fixed − live(权重/运行底价)
 //! cap          = budget / per_tok                （治理器会夹池到这个上限）
@@ -65,7 +65,7 @@ impl FixedParts {
 #[derive(Clone, Copy, Debug)]
 pub struct MemoryInputs {
     pub total_bytes: u64,
-    pub vram_target: f64,
+    pub vram_budget: f64,
     pub reserve_bytes: u64,
     pub model: &'static ModelProfile,
     pub spec_dflash: bool,
@@ -88,7 +88,7 @@ pub struct MemoryInputs {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MemoryEstimate {
     pub total_bytes: u64,
-    pub vram_target: String,
+    pub vram_budget: String,
     pub target_total_bytes: u64,
     pub reserve_bytes: u64,
     pub weights_bytes: u64,
@@ -180,7 +180,7 @@ pub fn budget_parts(inp: &MemoryInputs) -> (FixedParts, u64, u64, usize) {
         graph_slab: GRAPH_SLAB_BYTES,
         warmup_misc: WARMUP_MISC_BYTES,
     };
-    let target_total = (inp.total_bytes as f64 * inp.vram_target) as u64;
+    let target_total = (inp.total_bytes as f64 * inp.vram_budget) as u64;
     let weights = weights_bytes(inp);
     let spend = inp.reserve_bytes + fixed.total() + weights;
     let budget = target_total.saturating_sub(spend);
@@ -205,7 +205,7 @@ pub fn solve_max(inp: &MemoryInputs, model_max: usize, overcommit: bool) -> Resu
             inp.activation_bytes as f64 / GB,
             inp.stability_margin_bytes as f64 / GB,
             inp.total_bytes as f64 / GB,
-            inp.vram_target * 100.0,
+            inp.vram_budget * 100.0,
             inp.reserve_bytes as f64 / GB,
             fixed.total() as f64 / GB,
             crate::config::memory::weights_bytes(inp) as f64 / GB,
@@ -294,7 +294,7 @@ pub fn estimate(
     }
     Ok(MemoryEstimate {
         total_bytes: inp.total_bytes,
-        vram_target: format!("{:.0}%", inp.vram_target * 100.0),
+        vram_budget: format!("{:.0}%", inp.vram_budget * 100.0),
         target_total_bytes: target_total,
         reserve_bytes: inp.reserve_bytes,
         weights_bytes: weights_bytes(inp),
@@ -329,7 +329,7 @@ mod tests {
         let (act, note) = activation_for(chunk, tail);
         MemoryInputs {
             total_bytes: RTX_3090TI_24G.total_bytes,
-            vram_target: 0.99,
+            vram_budget: 0.99,
             reserve_bytes: 256 << 20,
             model: &QWEN38_27B_AWQ,
             spec_dflash: false,

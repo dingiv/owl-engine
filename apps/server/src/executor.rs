@@ -83,6 +83,8 @@ pub struct VramSnapshot {
     pub open_window_blocks: usize,
     /// **状态腿淘汰序预览**(前 8 条;会话感知淘汰的可观测面)
     pub snap_evict: Vec<owl_store::SnapEvictPreview>,
+    /// **L1 会话资产投影**(每会话的 tail 快照 / 消息边界;2026-11-12)
+    pub sessions: Vec<owl_engine::SessionAssets>,
     /// **默认池账(逐 rank)**:(used, used_high, reserved, reserved_high)。
     /// 与块账之差 = **池缓存**(已 free 仍占物理显存;`RELEASE_THRESHOLD=∞`)。
     pub pools: Vec<(u8, Result<(u64, u64, u64, u64), String>)>,
@@ -526,6 +528,7 @@ async fn handle_req<D: DeviceClient>(
             let report = running.store_report();
             let device = running.mem_info().await;
             let snap_evict = running.snap_evict_preview(8);
+            let sessions = running.session_assets();
             let snap = VramSnapshot {
                 report,
                 blocks,
@@ -533,6 +536,7 @@ async fn handle_req<D: DeviceClient>(
                 window_unclosed,
                 open_window_blocks,
                 snap_evict,
+                sessions,
                 pools,
                 device,
                 batch: {

@@ -152,25 +152,25 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
         Goal::MaxContext => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=max-context:桶上界 1024");
             b.set("runtime.prefill_tail_merge", 512i64.into(), "goal=max-context:尾块并入桶");
-            b.set("pool.vram_target", 0.99f64.into(), "goal=max-context:贴顶");
+            b.set("pool.vram_budget", 0.99f64.into(), "goal=max-context:贴顶");
             b.set("pool.vram_reserve_mb", 256i64.into(), "goal=max-context:最小守卫");
         }
         Goal::MaxSpeed => {
             b.set("runtime.prefill_chunk", 1024i64.into(), "goal=max-speed:大块摊薄固定税");
             b.set("runtime.prefill_tail_merge", 0i64.into(), "goal=max-speed:不做尾合并");
-            b.set("pool.vram_target", 0.99f64.into(), "goal=max-speed:贴顶");
+            b.set("pool.vram_budget", 0.99f64.into(), "goal=max-speed:贴顶");
             b.set("pool.vram_reserve_mb", 512i64.into(), "goal=max-speed:留瞬态余量");
         }
         Goal::Balanced => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=balanced");
             b.set("runtime.prefill_tail_merge", 512i64.into(), "goal=balanced");
-            b.set("pool.vram_target", 0.97f64.into(), "goal=balanced");
+            b.set("pool.vram_budget", 0.97f64.into(), "goal=balanced");
             b.set("pool.vram_reserve_mb", 512i64.into(), "goal=balanced");
         }
         Goal::LowMemory => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=low-memory:小激活面");
             b.set("runtime.prefill_tail_merge", 0i64.into(), "goal=low-memory");
-            b.set("pool.vram_target", 0.99f64.into(), "goal=low-memory");
+            b.set("pool.vram_budget", 0.99f64.into(), "goal=low-memory");
             b.set("pool.vram_reserve_mb", 512i64.into(), "goal=low-memory:留瞬态余量");
         }
     }
@@ -366,7 +366,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     );
     let inp = MemoryInputs {
         total_bytes: hw.total_bytes,
-        vram_target: get_f64(&out, "pool.vram_target").unwrap_or(0.97),
+        vram_budget: get_f64(&out, "pool.vram_budget").unwrap_or(0.97),
         reserve_bytes: (get_usize(&out, "pool.vram_reserve_mb").unwrap_or(1024) as u64) << 20,
         model,
         spec_dflash: intent.spec == SpecIntent::Dflash,
@@ -432,7 +432,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             "intent.context"
         },
         hw.total_bytes as f64 / GB,
-        inp.vram_target * 100.0,
+        inp.vram_budget * 100.0,
         inp.reserve_bytes as f64 / GB,
         (memory::budget_parts(&inp).0).total() as f64 / GB,
         memory::weights_bytes(&inp) as f64 / GB,
@@ -706,7 +706,7 @@ mode = "greedy"
         assert!(!c.pool.prefix_cache, "reuse=off ⇒ 前缀缓存关");
         assert_eq!(c.pool.gdn_slots, 1);
         assert_eq!(c.pool.kv_dtype, super::super::KvDtype::Fp8, "kv=fp8");
-        assert_eq!(c.pool.vram_target, 0.99);
+        assert_eq!(c.pool.vram_budget, 0.99);
         assert_eq!(c.pool.vram_reserve_mb, 256);
 
         // 投机关(spec=off)

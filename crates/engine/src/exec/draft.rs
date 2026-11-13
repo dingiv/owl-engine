@@ -1943,6 +1943,88 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 use crate::session::SessionBank;
 
 impl<D: DeviceClient> crate::engine::RankDev<D> {
+    /// **DFlash2 encode 的延迟上限**（token；2026-11-13）。
+    ///
+    /// tap 根块 = `(n_tp+1) * t * hidden * 2B`（27B / 5 taps ≈ 67MiB / 1.3k tok）。
+    /// 4096 覆盖单图/短 append 的全部 chunk；长冷 prefill 只挂起前 4k，
+    /// 后面的 chunk 仍即时 encode（首 token 前的一小段尾巴不会把根块攒爆）。
+    const PENDING_DFLASH_MAX_TOKENS: usize = 4096;
+
+    /// 挂起一条 DFlash2 tap 根块（true = 已挂起，调用方**不要 free 根块**）。
+    pub(crate) fn defer_dflash_encode(
+        &mut self,
+        root: owl_models::contract::Bytes,
+        t: usize,
+        n_tp: usize,
+        d_model: usize,
+        dtype: owl_models::Dtype,
+        base: usize,
+    ) -> bool {
+        if n_tp == 0 || t == 0 {
+            return false;
+        }
+        if self.pending_dflash_tokens + t > Self::PENDING_DFLASH_MAX_TOKENS {
+            return false;
+        }
+        self.pending_dflash_tokens += t;
+        self.pending_dflash.push(crate::engine::PendingDflash {
+            root,
+            t,
+            n_tp,
+            d_model,
+            dtype,
+            base,
+        });
+        true
+    }
+
+    /// 丢弃尚未 drain 的 tap 根块（turn 中断/错误路径；不 encode）。
+    pub(crate) async fn discard_pending_dflash(&mut self) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending_dflash);
+        self.pending_dflash_tokens = 0;
+        let ids: Vec<u64> = pending.iter().map(|p| p.root.id).collect();
+        if !ids.is_empty() {
+            self.graphs.session.face_mut().free(&ids).await?;
+        }
+        Ok(())
+    }
+
+    /// **首 token 之后**统一补 encode（草稿 KV 只服务后续 spec propose）。
+    ///
+    /// 必须在 `sample_and_emit` **之后**调用：首 token 已经投递，encode
+    /// 不再计入 TTFT。失败 = 上抛（spec 下一轮会缺草稿 KV，不能静默）。
+    pub(crate) async fn drain_pending_dflash(&mut self) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending_dflash);
+        self.pending_dflash_tokens = 0;
+        for p in pending {
+            let root = TensorOps::of_block(
+                p.root.id,
+                p.dtype,
+                vec![(p.n_tp + 1) * p.t, p.d_model],
+            );
+            let tap_views: Vec<TensorOps> = (0..p.n_tp)
+                .map(|i| {
+                    root.slice_view(
+                        (i + 1) * p.t * p.d_model,
+                        vec![p.t, p.d_model],
+                    )
+                })
+                .collect();
+            let root_id = p.root.id;
+            let enc = self
+                .prefill_dflash_encode(
+                    crate::running::StepProbes::default(),
+                    &tap_views,
+                    p.base,
+                )
+                .await;
+            // 根块在 encode 之后才可回收；失败也回收，不把块吊在队列外。
+            self.graphs.session.face_mut().free(&[root_id]).await?;
+            enc?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn prefill_dflash_encode(
         &mut self,
         probes: crate::running::StepProbes,
@@ -1976,25 +2058,24 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let _page = self.pool.geom.page;
         let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
         let bt = self.pool.bt_leaf_flat();
+        // **逐层表必须共享 Htod**（2026-11-13）：DFlash2 的 5 层 encode 用
+        // 同一份 `slots`/`kv_lens`（只依赖 base/t，不依赖层），旧实现把
+        // `from_host` 放在 `leaves.iter().map` 里 ⇒ 每层一次 Htod ack
+        // （实测 82 tok 图场景 50 个 `interp.host.node.unk.htod`、~450ms）。
+        // 提到循环外 = 2 条 Htod 服务全部层；值逐字节不变。
+        let slots_host: Vec<f32> = (0..t)
+            .map(|i| self.pool.draft_dflash_encode_slot(base, i))
+            .collect();
+        let slots_t = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&slots_host));
+        let lens_host: Vec<f32> = (0..t).map(|i| (base + i + 1) as f32).collect();
+        let lens_t = TensorOps::from_host(Dtype::F32, vec![t], &f32b(&lens_host));
         let kvs: Vec<KvBuffers> = leaves
             .iter()
             .map(|(k, v)| KvBuffers {
                 k_cache: k.clone(),
                 v_cache: v.clone(),
-                slots: TensorOps::from_host(
-                    Dtype::F32,
-                    vec![t],
-                    &f32b(
-                        &(0..t)
-                            .map(|i| self.pool.draft_dflash_encode_slot(base, i))
-                            .collect::<Vec<_>>(),
-                    ),
-                ),
-                kv_lens: TensorOps::from_host(
-                    Dtype::F32,
-                    vec![t],
-                    &f32b(&(0..t).map(|i| (base + i + 1) as f32).collect::<Vec<_>>()),
-                ),
+                slots: slots_t.clone(),
+                kv_lens: lens_t.clone(),
                 block_tables: bt.clone(),
 
                 int8: None,

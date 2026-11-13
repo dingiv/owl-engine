@@ -105,10 +105,12 @@ fn leg(slots: usize) -> BlockLeg {
 fn plan_kv(l: &BlockLeg, need: Need) -> owl_store::Verdict {
     let state = StateStore::new(1, 0);
     let room = Room {
+        host_enabled: l.host_enabled(),
         host_kv_slots: l.host_free_slots(),
         host_snap_slots: 0,
         disk_kv_slots: 0,
         disk_snap_slots: 0,
+        disk_enabled: false,
         bulk_drop_when_tier_full: false,
     };
     plan_capacity(l, &state, &LruPolicy, need, &[], &[], room)
@@ -1029,4 +1031,253 @@ async fn two_active_sessions_block_migration_until_one_rotates_out() {
         assert_eq!(read_slot(&mut face, &ps, *slot).await, b_before[i], "B 第 {i} 块");
     }
     assert_eq!(l.report().host_blocks, 0, "轮换结束无宿主残留");
+}
+
+// ───────────────── 三档调度器（2026-11-13） ─────────────────
+//
+// 同一份 `plan_capacity` 入口按**实际启用的池**分派：
+//   GPU only / GPU+Host / GPU+Host+Disk。
+// 级联方向固定：设备缺口先往下一级移，下一级也满才 Drop。
+
+/// 单池档：没有宿主/磁盘，缺口只能 Drop；不得出现 Host/Disk 票。
+#[tokio::test]
+async fn gpu_only_planner_drops_without_lower_tier() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let block_bytes = PIECE_BYTES * 2;
+    let mut l = BlockLeg::open(LegConfig {
+        slots: 6,
+        block_tokens: PAGE_TOKENS,
+        block_bytes,
+        cache: owl_store::CachePolicy::Cap(12),
+        host_bytes: 0, // 单池：宿主关
+        class: BlockClass::KvPage,
+        label: "gpu-only",
+    })
+    .expect("开腿");
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
+        .expect("注册布局");
+
+    let toks = |base: u32| -> Vec<u32> { (base..base + 3 * PAGE_TOKENS as u32).collect() };
+    let _a = build_chain(&mut l, &toks(0)).await;
+    let _b = build_chain(&mut l, &toks(4000)).await;
+    assert_eq!(l.slots_free(), 0, "6 槽应由两条 3 块链占满");
+
+    let state = StateStore::new(1, 0);
+    let room = Room {
+        host_enabled: false,
+        host_kv_slots: 0,
+        host_snap_slots: 0,
+        disk_kv_slots: 0,
+        disk_snap_slots: 0,
+        disk_enabled: false,
+        bulk_drop_when_tier_full: false,
+    };
+    let v = plan_capacity(
+        &l,
+        &state,
+        &LruPolicy,
+        Need::kv(2, NeedWhy::Grow),
+        &[],
+        &[],
+        room,
+    );
+    assert!(v.deny.is_none(), "可丢面足够 ⇒ 不拒：{:?}", v.deny);
+    assert!(!v.out.is_empty(), "单池缺口必须出 Drop 票");
+    assert!(
+        v.out.iter().all(|o| o.sink() == Sink::Drop),
+        "单池没有下一级，不得出 Host/Disk：{:?}",
+        v.out
+    );
+    assert!(
+        v.out.iter().map(|o| o.kv_span()).sum::<usize>() >= 2,
+        "Drop 面应覆盖缺口：{:?}",
+        v.out
+    );
+}
+
+/// 三池档：宿主满时先把宿主冷链溢写到 Disk，腾出宿主位后再把设备链
+/// 下沉到 Host；**不得**直接 Drop 设备内容。
+#[tokio::test]
+async fn three_pool_planner_spills_host_to_disk_before_dropping_device() {
+    let mut face = CpuFace::new();
+    let ps = pieces(&mut face, 6).await;
+    let block_bytes = PIECE_BYTES * 2;
+    let mut l = BlockLeg::open(LegConfig {
+        slots: 6,
+        block_tokens: PAGE_TOKENS,
+        block_bytes,
+        cache: owl_store::CachePolicy::Cap(12),
+        host_bytes: block_bytes * 3, // 宿主只装 3 块
+        class: BlockClass::KvPage,
+        label: "gpu-host-disk",
+    })
+    .expect("开腿");
+    l.attach_pool(PoolLayout { class: BlockClass::KvPage, epoch: 1, pieces: ps })
+        .expect("注册布局");
+
+    let toks = |base: u32| -> Vec<u32> { (base..base + 3 * PAGE_TOKENS as u32).collect() };
+    // H 整链沉宿主 ⇒ 宿主 3/3 满，设备空 6 槽。
+    let h = build_chain(&mut l, &toks(0)).await;
+    engine_offload(&mut l, &mut face, *h.last().expect("H 链尾"))
+        .await
+        .expect("H 下沉");
+    assert_eq!(l.host_free_slots(), 0, "宿主应已满");
+    // A(冷) + C(热) 占满设备。
+    let a = build_chain(&mut l, &toks(4000)).await;
+    let _c = build_chain(&mut l, &toks(8000)).await;
+    assert_eq!(l.slots_free(), 0, "设备应已满");
+
+    let state = StateStore::new(1, 0);
+    let room = Room {
+        host_enabled: true,
+        host_kv_slots: 0, // 宿主满
+        host_snap_slots: 0,
+        disk_kv_slots: 3, // 盘层还能装 H 的 3 块
+        disk_snap_slots: 0,
+        disk_enabled: true,
+        bulk_drop_when_tier_full: false,
+    };
+    let v = plan_capacity(
+        &l,
+        &state,
+        &LruPolicy,
+        Need::kv(3, NeedWhy::Grow),
+        &[],
+        &[],
+        room,
+    );
+    assert!(v.deny.is_none(), "级联可满足 ⇒ 不拒：{:?}", v.deny);
+    let sinks: Vec<Sink> = v.out.iter().map(|o| o.sink()).collect();
+    assert_eq!(
+        sinks,
+        vec![Sink::Disk, Sink::Host],
+        "宿主冷链先溢盘，再下沉设备冷链：{:?}",
+        v.out
+    );
+    assert_eq!(
+        v.out.iter().map(|o| o.kv_span()).sum::<usize>(),
+        6,
+        "H 3 块溢盘 + A 3 块下沉"
+    );
+    assert!(
+        v.out.iter().all(|o| o.sink() != Sink::Drop),
+        "有下一级时不得 Drop 设备内容：{:?}",
+        v.out
+    );
+    // 盘票指向 H（宿主最冷链），Host 票指向 A（设备最冷链）。
+    let h_tail = *h.last().expect("H 链尾");
+    let a_tail = *a.last().expect("A 链尾");
+    assert!(
+        v.out.iter().any(|o| matches!(o, EvictOut::Kv { chain, sink: Sink::Disk, span: 3 } if *chain == h_tail)),
+        "盘票应是 H 整链：{:?}",
+        v.out
+    );
+    assert!(
+        v.out.iter().any(|o| matches!(o, EvictOut::Kv { chain, sink: Sink::Host, span: 3 } if *chain == a_tail)),
+        "Host 票应是 A 整链：{:?}",
+        v.out
+    );
+}
+
+/// 状态腿也必须先级联再 Drop：宿主快照满、盘有位时，先把宿主快照溢盘，
+/// 再让设备快照下沉；不得因为宿主瞬时无位就把设备快照 Drop。
+#[test]
+fn snapshot_cascade_spills_host_before_dropping_gpu() {
+    let l = leg(1); // 宿主腿开启（plan 只读几何/开关）
+    let mut state = StateStore::new(1, 64);
+    let host_key = owl_store::SnapKey::at_boundary(ChainHash::new(0x11));
+    let gpu_key = owl_store::SnapKey::at_boundary(ChainHash::new(0x22));
+    state.register_snap_owned_class(
+        host_key,
+        64,
+        owl_store::Tier::Host,
+        owl_store::SnapDurability::Durable,
+        1,
+        1,
+        owl_store::SnapClass::Extra,
+    );
+    state.register_snap_owned_class(
+        gpu_key,
+        64,
+        owl_store::Tier::Gpu,
+        owl_store::SnapDurability::Durable,
+        1,
+        2,
+        owl_store::SnapClass::Dense,
+    );
+    let room = Room {
+        host_enabled: true,
+        host_kv_slots: 0,
+        host_snap_slots: 0, // 宿主快照满
+        disk_kv_slots: 0,
+        disk_snap_slots: 1, // 盘还能装一条
+        disk_enabled: true,
+        bulk_drop_when_tier_full: false,
+    };
+    let v = plan_capacity(
+        &l,
+        &state,
+        &LruPolicy,
+        Need {
+            slots: 0,
+            snap_bytes: 64,
+            host_kv_slots: 0,
+            host_snap_slots: 0,
+            why: NeedWhy::Grow,
+        },
+        &[],
+        &[],
+        room,
+    );
+    assert!(v.deny.is_none(), "级联可满足 ⇒ 不拒：{:?}", v.deny);
+    assert_eq!(v.out.len(), 1, "宿主满时先只出溢盘票：{:?}", v.out);
+    assert!(
+        matches!(v.out[0], EvictOut::Snap { key, sink: Sink::Disk } if key == host_key),
+        "第一张票应是宿主快照溢盘：{:?}",
+        v.out
+    );
+    assert!(
+        v.out.iter().all(|o| o.sink() != Sink::Drop),
+        "有下一级时不得 Drop 快照：{:?}",
+        v.out
+    );
+
+    // 下一拍：宿主快照已在盘上 ⇒ 设备快照下沉到刚腾出的宿主位。
+    state.set_tier(host_key, owl_store::Tier::Disk).expect("模拟溢盘落账");
+    let room = Room {
+        host_enabled: true,
+        host_kv_slots: 0,
+        host_snap_slots: 1,
+        disk_kv_slots: 0,
+        disk_snap_slots: 0,
+        disk_enabled: true,
+        bulk_drop_when_tier_full: false,
+    };
+    let v2 = plan_capacity(
+        &l,
+        &state,
+        &LruPolicy,
+        Need {
+            slots: 0,
+            snap_bytes: 64,
+            host_kv_slots: 0,
+            host_snap_slots: 0,
+            why: NeedWhy::Grow,
+        },
+        &[],
+        &[],
+        room,
+    );
+    assert!(v2.deny.is_none(), "第二拍应可满足：{:?}", v2.deny);
+    assert!(
+        v2.out.iter().any(|o| matches!(o, EvictOut::Snap { key, sink: Sink::Host } if *key == gpu_key)),
+        "第二拍应把设备快照下沉：{:?}",
+        v2.out
+    );
+    assert!(
+        v2.out.iter().all(|o| o.sink() != Sink::Drop),
+        "第二拍也不得 Drop 快照：{:?}",
+        v2.out
+    );
 }

@@ -112,6 +112,25 @@ pub struct TextDelete {
     pub text_b: usize,
 }
 
+/// **多段删除计划**（2026-11-13）：一次请求里删掉多段**不连续**的旧图。
+///
+/// 与 [`TextDelete`] 的区别：`ranges` 按文本/padded 坐标升序排列，段之间
+/// 可以夹着幸存文本。调用方仍需保证每段 `a/b` 页对齐；只有所有旧图都被
+/// 删除、且客户端 raw 以“旧文本去掉这些段”为前缀时才返回。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletionPlan {
+    pub ranges: Vec<TextDelete>,
+}
+
+impl DeletionPlan {
+    pub fn first(&self) -> Option<TextDelete> {
+        self.ranges.first().copied()
+    }
+    pub fn last(&self) -> Option<TextDelete> {
+        self.ranges.last().copied()
+    }
+}
+
 /// 图像占位游程(`[start, end)`,**仅 image token 本身**,不含标记)。
 fn image_runs(ids: &[u32], image_token: u32) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
@@ -380,41 +399,201 @@ pub fn pad_image_spans(
 /// 2. `old_text[tb..]` 与 `raw[ta..]` 至少有 **1 个 token** 相同(后缀可能
 ///    很长;分叉点由调用方按 padded 序列精确算)。
 ///
-/// 相邻的已标记图像段先合并(连删两张时文本区间才是连续的)。
+/// **旧账兼容口**（`img_tag == 0` / 无指纹）：相邻已标记图像段先合并，
+/// 只能识别“整组一起删”。新账请走 [`detect_text_delete_tagged`]。
 /// 返回命中的文本区间 + 对应的 padded 删除区间。
 pub fn detect_text_delete(
     old_text: &[u32],
     raw: &[u32],
     spans: &[ImgSpan],
 ) -> Option<TextDelete> {
-    let mut merged: Vec<(usize, usize, usize, usize)> = Vec::new(); // (ta,tb,a,b)
-    for s in spans.iter().filter(|s| s.evict) {
-        match merged.last_mut() {
-            Some(last) if last.1 == s.text_start => {
-                last.1 = s.text_end;
-                last.3 = s.end;
+    detect_text_delete_inner(old_text, raw, spans, None)
+}
+
+/// **带内容指纹的删除识别**（2026-11-13）。
+///
+/// 相邻的已标记图像在文本坐标里首尾相接；旧实现把整段相邻游程合并成一个
+/// 候选，只能识别“整组一起删”。真实 agent 形态是**只删其中第一张、保留
+/// 第二张**（截一张新图替换旧图）——合并候选的后缀从第二张之后开始，与
+/// 客户端 raw 的第二张对不上，`k=0` ⇒ 整轮只命中图片前的 26k。
+///
+/// 本函数遍历游程内**所有连续子段**，并用新旧图像内容指纹确认“哪些旧图
+/// 真的不在了”：`new_tags` 必须以 `old_tags` 删除该子段后的序列为前缀
+/// （尾部允许追加新图）。token 占位符相同但内容不同时，只有指纹能区分
+/// 删的是第一张还是第二张，避免把旧图 KV 错绑到新图上。
+pub fn detect_text_delete_tagged(
+    old_text: &[u32],
+    raw: &[u32],
+    spans: &[ImgSpan],
+    new_tags: &[u64],
+) -> Option<TextDelete> {
+    detect_text_delete_inner(old_text, raw, spans, Some(new_tags))
+}
+
+/// **多段删除识别**（仅覆盖“所有旧图都被删”的形态）。
+///
+/// 真实 agent 会一次替换整组截图：旧图可能分散在多个 tool result 里，
+/// 新图追加在末尾。单段 `detect_text_delete_tagged` 无法把这种形态拼成
+/// 一个连续区间；这里直接删除**全部旧图段**，保留夹在中间的所有文本，
+/// 并验证客户端 raw 的前缀 = “旧文本去掉这些段”。
+///
+/// 要求：
+/// - 旧 spans 全部带 `evict`（有一张未标记就不吸收）；
+/// - 新图集合里没有任何旧图内容（同内容新图也保守放弃）；
+/// - 至少两段（单段仍走原路径，保留旧 pad/快照逻辑）。
+pub fn detect_all_images_deleted_tagged(
+    old_text: &[u32],
+    raw: &[u32],
+    spans: &[ImgSpan],
+    new_tags: &[u64],
+) -> Option<DeletionPlan> {
+    owl_shared::log_debug!(
+        "img-evict",
+        "multi try: spans={} evict={:?} tags={:?} new={:?} old={} raw={}",
+        spans.len(),
+        spans.iter().map(|s| s.evict).collect::<Vec<_>>(),
+        spans.iter().map(|s| s.img_tag).collect::<Vec<_>>(),
+        new_tags,
+        old_text.len(),
+        raw.len()
+    );
+    if spans.len() < 2 || spans.iter().any(|s| !s.evict || s.img_tag == 0) {
+        return None;
+    }
+    if spans
+        .iter()
+        .any(|s| new_tags.iter().any(|t| *t == s.img_tag))
+    {
+        return None;
+    }
+    let mut ranges: Vec<TextDelete> = spans
+        .iter()
+        .map(|s| TextDelete {
+            a: s.start,
+            b: s.end,
+            text_a: s.text_start,
+            text_b: s.text_end,
+        })
+        .collect();
+    ranges.sort_by_key(|r| r.text_a);
+    if ranges.len() < 2 || ranges.iter().any(|r| r.text_a >= r.text_b) {
+        return None;
+    }
+    // 去掉所有旧图后的客户端文本；raw 必须以其为前缀（后面才是新尾巴）。
+    let mut survivors = Vec::with_capacity(old_text.len());
+    let mut cursor = 0usize;
+    for r in &ranges {
+        if r.text_a < cursor || r.text_b > old_text.len() {
+            return None;
+        }
+        survivors.extend_from_slice(&old_text[cursor..r.text_a]);
+        cursor = r.text_b;
+    }
+    survivors.extend_from_slice(&old_text[cursor..]);
+    let common = raw
+        .iter()
+        .zip(&survivors)
+        .take_while(|(a, b)| a == b)
+        .count();
+    // raw 至少要包含最后一段删除之前的幸存前缀；后面可以接新图/新尾巴，
+    // 旧 session 的生成尾巴也可以不在新 prompt 里（common 会提前停）。
+    let last_b = ranges.last().map(|r| r.text_b).unwrap_or(0);
+    let after_last = old_text.len().saturating_sub(last_b);
+    let required = survivors.len().saturating_sub(after_last);
+    owl_shared::log_debug!(
+        "img-evict",
+        "multi calc: common={} required={} survivors={} last_b={} ranges={:?}",
+        common,
+        required,
+        survivors.len(),
+        last_b,
+        ranges.iter().map(|r| (r.text_a, r.text_b, r.a, r.b)).collect::<Vec<_>>()
+    );
+    if common < required || common == 0 {
+        return None;
+    }
+    Some(DeletionPlan { ranges })
+}
+
+fn detect_text_delete_inner(
+    old_text: &[u32],
+    raw: &[u32],
+    spans: &[ImgSpan],
+    new_tags: Option<&[u64]>,
+) -> Option<TextDelete> {
+    // 指纹不可用（旧账 tag=0 / 未传）时保持旧行为：只试完整相邻游程，
+    // 宁可少吸收，也不做 token 盲猜。
+    let use_tags = new_tags.is_some()
+        && !spans.is_empty()
+        && spans.iter().all(|s| s.img_tag != 0);
+    let old_tags: Vec<u64> = spans.iter().map(|s| s.img_tag).collect();
+    // 相邻已标记图像 = 一个游程（下标闭开区间）。
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (i, s) in spans.iter().enumerate() {
+        if !s.evict {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((_, hi)) if spans[*hi - 1].text_end == s.text_start => *hi = i + 1,
+            _ => runs.push((i, i + 1)),
+        }
+    }
+    let mut best: Option<(usize, usize, TextDelete)> = None; // (suffix_k, deleted_bytes, hit)
+    for (lo, hi) in runs {
+        let starts: Vec<usize> = if use_tags {
+            (lo..hi).collect()
+        } else {
+            vec![lo]
+        };
+        for i in starts {
+            let ends: Vec<usize> = if use_tags {
+                (i + 1..=hi).collect()
+            } else {
+                vec![hi]
+            };
+            for j in ends {
+                let (ta, tb) = (spans[i].text_start, spans[j - 1].text_end);
+                if tb > old_text.len() || ta >= tb || ta > old_text.len() || ta > raw.len() {
+                    continue;
+                }
+                if old_text[..ta] != raw[..ta] {
+                    continue;
+                }
+                let k = old_text[tb..]
+                    .iter()
+                    .zip(&raw[ta..])
+                    .take_while(|(x, y)| x == y)
+                    .count();
+                if k == 0 {
+                    continue;
+                }
+                if use_tags {
+                    let nt = new_tags.expect("use_tags ⇒ Some");
+                    let mut expected = Vec::with_capacity(old_tags.len() - (j - i));
+                    expected.extend_from_slice(&old_tags[..i]);
+                    expected.extend_from_slice(&old_tags[j..]);
+                    if !nt.starts_with(&expected) {
+                        continue;
+                    }
+                }
+                let delete_bytes = spans[j - 1].end - spans[i].start;
+                let cand = TextDelete {
+                    a: spans[i].start,
+                    b: spans[j - 1].end,
+                    text_a: ta,
+                    text_b: tb,
+                };
+                let better = match best {
+                    None => true,
+                    Some((bk, bd, _)) => k > bk || (k == bk && delete_bytes > bd),
+                };
+                if better {
+                    best = Some((k, delete_bytes, cand));
+                }
             }
-            _ => merged.push((s.text_start, s.text_end, s.start, s.end)),
         }
     }
-    for (ta, tb, a, b) in merged {
-        if tb > old_text.len() || ta >= tb || ta > raw.len() {
-            continue;
-        }
-        if old_text[..ta] != raw[..ta] {
-            continue;
-        }
-        let k = old_text[tb..]
-            .iter()
-            .zip(&raw[ta..])
-            .take_while(|(x, y)| x == y)
-            .count();
-        if k == 0 {
-            continue;
-        }
-        return Some(TextDelete { a, b, text_a: ta, text_b: tb });
-    }
-    None
+    best.map(|(_, _, hit)| hit)
 }
 
 /// **重建**:`old[..a]`(含旧 pad 块)+ 客户端删点之后的文本。
@@ -636,6 +815,97 @@ pub fn positions_after_splice(
     Ok((pos, max_pos, gap))
 }
 
+/// **多段删除后的位置账**（2026-11-13）：保留所有幸存段的旧 position，
+/// 新尾巴从旧 `max_pos+1` 追加。要求新 prompt 前缀 = 旧序列去掉所有
+/// `plan.ranges` 后的幸存序列（多段全部页对齐、段间文本逐 token 不变）。
+pub fn positions_after_deletes(
+    old_tokens: &[u32],
+    old_pos: &[Pos3],
+    new_ids: &[u32],
+    spans: &[ImgSpan],
+    plan: &DeletionPlan,
+    image_token: u32,
+    mrope: &MropeCfg,
+) -> Result<(Vec<Pos3>, i32, bool), String> {
+    if old_tokens.len() != old_pos.len() {
+        return Err(format!(
+            "positions_after_deletes: 旧 token {} ≠ 旧位置 {}",
+            old_tokens.len(),
+            old_pos.len()
+        ));
+    }
+    if new_ids.is_empty() {
+        return Err("positions_after_deletes: 新序列为空".to_string());
+    }
+    let mut surv_tokens: Vec<u32> = Vec::with_capacity(old_tokens.len());
+    let mut surv_pos: Vec<Pos3> = Vec::with_capacity(old_pos.len());
+    let mut cursor = 0usize;
+    for r in &plan.ranges {
+        if r.a < cursor || r.a > r.b || r.b > old_tokens.len() {
+            return Err(format!(
+                "positions_after_deletes: 删除区间 [{},{}) 重叠/越界(旧 {} / cursor {})",
+                r.a,
+                r.b,
+                old_tokens.len(),
+                cursor
+            ));
+        }
+        surv_tokens.extend_from_slice(&old_tokens[cursor..r.a]);
+        surv_pos.extend_from_slice(&old_pos[cursor..r.a]);
+        cursor = r.b;
+    }
+    surv_tokens.extend_from_slice(&old_tokens[cursor..]);
+    surv_pos.extend_from_slice(&old_pos[cursor..]);
+    let k = surv_tokens
+        .iter()
+        .zip(new_ids)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if k == 0 {
+        return Err("positions_after_deletes: 新 prompt 与幸存序列无公共前缀".to_string());
+    }
+    // `k` 可以小于幸存序列（旧生成尾巴/客户端新尾巴在分叉点）：只保留
+    // k 之前的旧 position，之后按新尾巴从 max+1 重算。
+    let mut pos = surv_pos[..k].to_vec();
+    let tail = &new_ids[k..];
+    if !tail.is_empty() {
+        let grids: Vec<GridThw> = spans
+            .iter()
+            .filter(|s| s.start >= k)
+            .map(|s| s.grid)
+            .collect();
+        let tt = owl_models::layers::mrope::token_types(tail, image_token, None);
+        let index = mrope
+            .rope_index(tail, &tt, &grids, &[])
+            .map_err(|e| format!("positions_after_deletes: 新尾巴 rope_index: {e}"))?;
+        let base = old_pos
+            .iter()
+            .flat_map(|p| p.iter())
+            .copied()
+            .max()
+            .unwrap_or(-1)
+            .saturating_add(1);
+        for p in index.pos {
+            let add = |v: i64| -> Result<i32, String> {
+                i32::try_from(v)
+                    .ok()
+                    .and_then(|x| x.checked_add(base))
+                    .ok_or_else(|| format!("positions_after_deletes: 位置 {v}+{base} 越 i32"))
+            };
+            pos.push([add(p[0])?, add(p[1])?, add(p[2])?]);
+        }
+    }
+    if pos.len() != new_ids.len() {
+        return Err(format!(
+            "positions_after_deletes: 位置 {} ≠ 新序列 {}",
+            pos.len(),
+            new_ids.len()
+        ));
+    }
+    let max_pos = pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0);
+    Ok((pos, max_pos, true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +1031,127 @@ mod tests {
         // ③ 下一轮的文本坐标账仍然自洽(unpad 回到"删掉一张图"的文本)
         let back = unpad(&next.ids, &next.pads).expect("unpad2");
         assert_eq!(back, raw, "重建后的文本坐标必须 = 客户端原文");
+    }
+
+    /// **非连续多图全删**（2026-11-13 真机：旧图分散在多个 tool result，
+    /// 新图整体追加到末尾）。验证：多段范围全部识别、幸存文本保留。
+    #[test]
+    fn all_old_images_deleted_multi_splice() {
+        // 三张图各夹在文本之间，模拟 message 14 / 19 / 138 的分隔。
+        let ids = build(&[1, 1, 1], 5);
+        let mut seq = pad(&ids, &[true, true, true], &[grid(), grid(), grid()]);
+        seq.spans[0].img_tag = 0xA1;
+        seq.spans[1].img_tag = 0xB2;
+        seq.spans[2].img_tag = 0xC3;
+        let text = unpad(&seq.ids, &seq.pads).expect("unpad");
+        let mut survivors = text.clone();
+        for sp in seq.spans.iter().rev() {
+            survivors.drain(sp.text_start..sp.text_end);
+        }
+        let mut raw = survivors.clone();
+        raw.extend([777u32, 778, 779]);
+        let plan = super::detect_all_images_deleted_tagged(
+            &text,
+            &raw,
+            &seq.spans,
+            &[0xD4],
+        )
+        .expect("三张旧图全删应识别");
+        assert_eq!(plan.ranges.len(), 3);
+        assert_eq!(plan.ranges[0].text_a, seq.spans[0].text_start);
+        assert_eq!(plan.ranges[2].text_b, seq.spans[2].text_end);
+
+        let (old_pos, _) = compact_positions(&seq.ids, &seq.spans, IMG, &MropeCfg::new([11, 11, 10], 64, 1e7, 2).expect("mrope")).expect("pos");
+        let next_spans: Vec<ImgSpan> = Vec::new();
+        let mut pos_ids = seq.ids.clone();
+        for r in plan.ranges.iter().rev() {
+            pos_ids.drain(r.a..r.b);
+        }
+        pos_ids.extend([777u32, 778, 779]);
+        let (pos, _max, gap) = positions_after_deletes(
+            &seq.ids,
+            &old_pos,
+            &pos_ids,
+            &next_spans,
+            &plan,
+            IMG,
+            &MropeCfg::new([11, 11, 10], 64, 1e7, 2).expect("mrope"),
+        )
+        .expect("多段位置");
+        assert!(gap);
+        // 幸存文本的旧 position 逐 token 保留；新尾巴从旧 max+1 起。
+        let mut expected = Vec::new();
+        let mut cursor = 0usize;
+        for r in &plan.ranges {
+            expected.extend_from_slice(&old_pos[cursor..r.a]);
+            cursor = r.b;
+        }
+        expected.extend_from_slice(&old_pos[cursor..]);
+        assert_eq!(&pos[..expected.len()], expected.as_slice());
+        let base = old_pos.iter().flat_map(|p| p.iter()).copied().max().unwrap_or(0) + 1;
+        assert_eq!(pos[expected.len()], [base; 3]);
+    }
+
+    /// **相邻图像只删第一张**（2026-11-13 真机：截图替换旧图）。
+    ///
+    /// 相邻图像在文本坐标里首尾相接；旧实现合并整个游程，只能识别“整组删”。
+    /// 这里验证：legacy 识别不了半删，带内容指纹的新识别能精确选第一/第二张，
+    /// 且不把保留图的 KV 错绑到删除图内容上。
+    #[test]
+    fn partial_adjacent_image_delete_uses_content_tags() {
+        let mut ids = build(&[1, 1], 0);
+        ids.extend([7, 8, 9, 10]);
+        let mut seq = pad(&ids, &[true, true], &[grid(), grid()]);
+        seq.spans[0].img_tag = 0xA1;
+        seq.spans[1].img_tag = 0xB2;
+        let a = seq.spans[0];
+        let b = seq.spans[1];
+        let text = unpad(&seq.ids, &seq.pads).expect("unpad");
+
+        // 只删第一张：旧合并识别必须失败（k 从第二张之后起，对不上 raw 的第二张）。
+        let raw_first: Vec<u32> = text[..a.text_start]
+            .iter()
+            .chain(&text[a.text_end..])
+            .copied()
+            .collect();
+        assert!(
+            detect_text_delete(&text, &raw_first, &seq.spans).is_none(),
+            "legacy 合并游程不能识别半删"
+        );
+        let hit = detect_text_delete_tagged(
+            &text,
+            &raw_first,
+            &seq.spans,
+            &[b.img_tag],
+        )
+        .expect("内容指纹应识别第一张删除");
+        assert_eq!((hit.text_a, hit.text_b), (a.text_start, a.text_end));
+        assert_eq!((hit.a, hit.b), (a.start, a.end));
+
+        // 只删第二张：同样必须精确命中第二张，而不是第一张。
+        let raw_second: Vec<u32> = text[..b.text_start]
+            .iter()
+            .chain(&text[b.text_end..])
+            .copied()
+            .collect();
+        let hit2 = detect_text_delete_tagged(
+            &text,
+            &raw_second,
+            &seq.spans,
+            &[a.img_tag],
+        )
+        .expect("内容指纹应识别第二张删除");
+        assert_eq!((hit2.text_a, hit2.text_b), (b.text_start, b.text_end));
+
+        // 两张一起删：tail 为空标签，整段游程命中。
+        let raw_both: Vec<u32> = text[..a.text_start]
+            .iter()
+            .chain(&text[b.text_end..])
+            .copied()
+            .collect();
+        let hit3 = detect_text_delete_tagged(&text, &raw_both, &seq.spans, &[])
+            .expect("两张一起删");
+        assert_eq!((hit3.text_a, hit3.text_b), (a.text_start, b.text_end));
     }
 
     /// **中间图删除**:三图删第二张，删点之前必须仍逐字节不变。

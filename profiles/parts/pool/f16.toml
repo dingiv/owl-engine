@@ -7,7 +7,7 @@ gdn_slots = 1
 # + 1GiB(reserve) —— 实测 32k 上下文都挤不进。改为:
 #   · target = 1.0(**合法档**:base 直接用驱动 free,reserve 是唯一缓冲);
 #   · reserve = 512MiB(池外瞬态实测峰值 20~25MiB/块,512 = 20× 余量)。
-vram_target = 1.0
+vram_budget = 1.0
 vram_reserve_mb = 512
 
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)

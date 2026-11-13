@@ -215,6 +215,13 @@ pub struct TurnFacts {
     pub session: u64,
     /// prompt token 数（已 tokenize）
     pub prompt_tokens: usize,
+    /// **已驻留会话前缀**（`cached_hit`；0 = 无复用）。
+    ///
+    /// 准入/封顶必须把这段当作"已在池里"而不是再要一份：
+    /// 旧算式把 `session_held` 与全量 ctx 地板相加，128k 会话每轮都被
+    /// 双算，最终把 `max_new` 压到 0 并拒掉明明放得下的请求
+    /// （2026-11-13 真机 turn5：ctx 133597 + 已驻留 131904 ⇒ 4175+4122 > 8192）。
+    pub cached_tokens: usize,
     /// 本 turn 生成预算（含预算收缩前的请求值）
     pub max_new: usize,
     /// 已喂入的 prompt token 数（prefill 进度；= prompt_tokens 即进 gen）
@@ -238,6 +245,16 @@ pub enum PhaseSz {
 }
 
 impl TurnFacts {
+    /// 复用的会话前缀（不超过 prompt 本身）。
+    pub fn reusable_prefix(&self) -> usize {
+        self.cached_tokens.min(self.prompt_tokens)
+    }
+
+    /// **本 turn 真正需要新进设备的 prompt 段**（总 prompt − 已驻留前缀）。
+    pub fn incremental_prompt(&self) -> usize {
+        self.prompt_tokens.saturating_sub(self.reusable_prefix())
+    }
+
     /// **超卖档：需要沉到宿主/磁盘的页数**（= 全量 ctx − 设备工作集）。
     /// 非超卖 = 0（全量驻留，不沉）。
     pub fn offload_pages(&self, l: &Limits) -> usize {
@@ -265,9 +282,10 @@ impl TurnFacts {
             // 超卖：只驻工作集 + 本拍 chunk（生成预算不额外占设备）
             l.workspace_pages + l.chunk_pages
         } else {
-            // 不超卖：**整条链**（prompt + 生成预算）必须驻留
+            // 不超卖：**新增链段**（未驻留 prompt + 生成预算）必须驻留；
+            // 已驻留前缀在 `session_held` 里，不能再要一份。
             let new = self.max_new.min(cap);
-            let tokens = self.prompt_tokens.saturating_add(new);
+            let tokens = self.incremental_prompt().saturating_add(new);
             tokens.div_ceil(l.page.max(1)).max(1)
         }
     }
@@ -375,7 +393,9 @@ impl Admission {
         }
         // `usable` 已是**剩余**（不含任何已预留）⇒ 这里只减本 turn 的 prompt。
         let usable_tokens = s.usable_pages(l.reserve_pages).saturating_mul(l.page);
-        let free_after_prompt = usable_tokens.saturating_sub(head.prompt_tokens);
+        // 只减**未驻留** prompt 段：已命中前缀已占 `session_held`，在
+        // `usable` 里本来就不存在第二次。
+        let free_after_prompt = usable_tokens.saturating_sub(head.incremental_prompt());
         let reserve_new = l
             .newcomer_min_tokens
             .saturating_mul(self.n_target(l).saturating_sub(1));
@@ -793,6 +813,7 @@ mod tests {
             turn: id,
             session: sess,
             prompt_tokens: prompt,
+            cached_tokens: 0,
             max_new,
             fed: prompt, // 默认已进 gen
             out_len: 0,
@@ -808,6 +829,37 @@ mod tests {
             host_free_pages: 1 << 20,
             ..Default::default()
         }
+    }
+
+    /// **已驻留前缀不双算**（2026-11-13 真机 turn5）：
+    /// 1000 tok prompt 里 900 已命中，池只该为新增 100 + 200 gen 留页；
+    /// 旧算式按全量 1000 prompt 扣，20 页池会算出 cap 0。
+    #[test]
+    fn cached_prefix_is_not_double_counted_in_cap_and_need() {
+        let l = Limits {
+            page: 32,
+            max_batch: 1,
+            gdn_slots: 1,
+            max_concurrency: 1,
+            reserve_pages: 8,
+            newcomer_min_tokens: 0,
+            min_gen_tokens: 1,
+            ..Default::default()
+        };
+        let s = StoreFacts {
+            free_pages: 20,
+            ..Default::default()
+        };
+        let mut t = turn(1, 1, 1000, 200);
+        t.cached_tokens = 900;
+        assert_eq!(t.reusable_prefix(), 900);
+        assert_eq!(t.incremental_prompt(), 100);
+        assert_eq!(t.need_pages(&l, 200), 10, "300 新增 tok / 32 = 10 页");
+        let cap = Admission::new().cap_for(&l, &s, &t);
+        assert!(
+            cap >= 200,
+            "已驻留 900 tok 后，20 页池应能容纳 200 tok 生成；实际 cap={cap}"
+        );
     }
 
     /// 不超卖：两路各 4k prompt + 4k gen（256 页）在 528 页池里 ⇒ 2 个；
@@ -1239,6 +1291,7 @@ mod scenario_tests {
             turn: id,
             session: sess,
             prompt_tokens: prompt,
+            cached_tokens: 0,
             max_new,
             fed: prompt,
             out_len: out,
@@ -1252,6 +1305,7 @@ mod scenario_tests {
             turn: id,
             session: sess,
             prompt_tokens: prompt,
+            cached_tokens: 0,
             max_new,
             fed: 0,
             out_len: 0,
@@ -1392,6 +1446,7 @@ mod edge_tests {
             turn: id,
             session: sess,
             prompt_tokens: prompt,
+            cached_tokens: 0,
             max_new,
             fed: prompt,
             out_len: 0,
@@ -1405,6 +1460,7 @@ mod edge_tests {
             turn: id,
             session: sess,
             prompt_tokens: prompt,
+            cached_tokens: 0,
             max_new,
             fed,
             out_len: 0,
@@ -1506,6 +1562,7 @@ mod edge_tests {
             turn: 1,
             session: 1,
             prompt_tokens: 199_744,
+            cached_tokens: 0,
             max_new: 64,
             fed: 0,
             out_len: 0,
@@ -1788,6 +1845,7 @@ mod more_tests {
             turn: id,
             session: sess,
             prompt_tokens: prompt,
+            cached_tokens: 0,
             max_new,
             fed: prompt,
             out_len: 0,
@@ -1952,6 +2010,7 @@ mod p0_tests {
             turn: id,
             session: sess,
             prompt_tokens: prompt,
+            cached_tokens: 0,
             max_new,
             fed: prompt,
             out_len: 0,

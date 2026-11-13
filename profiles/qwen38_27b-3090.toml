@@ -103,7 +103,6 @@ rep_penalty = 1.00
 [pool]
 # 2 槽 = 297MiB:给压力地板(1GiB)留余量,同时覆盖三图窗口的删除快照。
 snap_max = 2
-prefix_cache = true
 vram_reserve_mb = 512
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
 transient_reserve_mb = 1024
@@ -114,11 +113,8 @@ transient_reserve_mb = 1024
 # 10GiB ≈ 容纳 4 条 63k 链(每条 1983 块)的冷缓存。
 host_cache_mb = 10240
 snap_host_mb = 3072
-# agent 消息边界快照:delim 空 = 用模型 ChatFormat.im_open(实测 = 1 token [248045])
+# agent 消息边界快照:delim/gap/span 走 full.toml 默认（delim 空 = 模型 ChatFormat.im_open）
 snap_msg_boundary = true
-snap_msg_delim = ""
-snap_msg_min_gap = 2048
-snap_msg_min_span = 0
 
 [vision]
 # 图像前缀无感删除(leave-gap;snap2 覆盖三图窗口)。
