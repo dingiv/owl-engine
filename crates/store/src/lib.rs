@@ -50,6 +50,7 @@ pub mod policy;
 pub mod rel;
 pub mod reservations;
 pub mod select;
+pub mod session;
 pub mod state;
 pub mod tier;
 

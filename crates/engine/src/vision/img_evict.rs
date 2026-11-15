@@ -49,47 +49,9 @@
 use owl_models::layers::mrope::MropeCfg;
 use owl_models::layers::vision::GridThw;
 
-/// 一段图像占位(**含** `<|vision_start|>` / `<|vision_end|>` 标记)的坐标账。
-///
-/// 两套坐标(必须同时记):
-/// - `[start, end)` = **padded** 序列里的删除候选(整页对齐;连 pad 一起删);
-/// - `[text_start, text_end)` = **unpadded**(客户端可见)序列里的图像项 ——
-///   下一轮的删除识别在文本坐标里做。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImgSpan {
-    /// padded 段首(= pad_before 块起点;**页对齐**)
-    pub start: usize,
-    /// padded 段尾(不含;含 pad_after 块)
-    pub end: usize,
-    /// unpadded 段首(客户端文本坐标)
-    pub text_start: usize,
-    /// unpadded 段尾(不含)
-    pub text_end: usize,
-    /// 段首 pad 块长度(padded `start` → 图像项起点)
-    pub pad_before: usize,
-    /// 段尾 pad 块长度(padded `end` 前的尾巴)
-    pub pad_after: usize,
-    /// 图像 patch 网格(重建 m-RoPE 位置表要用 —— 位置推进 `max(h,w)/merge`)
-    pub grid: GridThw,
-    /// 客户端标记:这段将来可能被删(未标记 = 永不吸收删除)
-    pub evict: bool,
-    /// **图像内容指纹**(64 位;0 = 未知/无内容)。
-    ///
-    /// 用途 = 块身份(`owl_store::BlockTag`):token 流里图像只是字面相同的
-    /// 占位符,**只有它**能把"同文本不同截图"区分开。由 `submit` 侧按
-    /// `VlmImageKey`(像素位哈希)盖章;`pad_image_spans` 本身不知道像素,留 0。
-    pub img_tag: u64,
-}
-
-impl ImgSpan {
-    /// padded 序列里的两个 pad 块(`(lo, hi)` 半开区间)。
-    pub fn pad_ranges(&self) -> [(usize, usize); 2] {
-        [
-            (self.start - self.pad_before, self.start),
-            (self.end - self.pad_after, self.end),
-        ]
-    }
-}
+/// 图像段/位置账类型已随会话账下沉 `owl-store::session`（2026-11-15）；
+/// 这里保留 `crate::img_evict::{ImgSpan, Pos3}` 路径兼容。
+pub use owl_store::session::{ImgSpan, Pos3};
 
 /// pad 律的产物:整条序列 + 每段的坐标账 + **全部 pad 区间**(padded 坐标,
 /// 升序、互不重叠 —— 会话账原样存它,`unpad` 用它还原客户端可见序列)。
@@ -788,8 +750,6 @@ fn fold_tag(acc: u64, tag: u64) -> u64 {
     (acc ^ tag).wrapping_mul(PRIME).rotate_left(7)
 }
 
-/// **位置三元组**(与 `MropeCfg` 的 `[T,H,W]` 同序;i32 足够覆盖 262k)。
-pub type Pos3 = [i32; 3];
 
 /// **带位置签名的块指纹**（2026-11-13）。
 ///
