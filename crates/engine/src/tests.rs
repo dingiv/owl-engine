@@ -7556,6 +7556,22 @@ pub async fn gpu_image_evict_anchor_gate() {
     let (_, t2) = running
         .submit_session_opts(Some(21), prompt2.as_str(), 12, crate::turn::TurnOpts::default())
         .expect("anchor t2 提交");
+    // **删除轮的 admission 估计门**（2026-11-15）：submit 的 `cached` 必须覆盖
+    // 第一段删除之前的旧前缀（真机 bug：leave-gap 轮 cached=0 ⇒ floor 按全量
+    // ctx 预留，30k 会话删图轮 1952 页 vs 正常 1036 页，多留 ~1GB）。
+    {
+        let est = running
+            .turns
+            .queue
+            .back()
+            .expect("t2 在队列里")
+            .cached;
+        assert!(
+            est >= del0.start,
+            "删除轮 admission cached 估计不足：{est} < 删除前前缀 {}",
+            del0.start
+        );
+    }
     let text2 = drive_turn(&mut running, t2).await;
     assert!(!text2.trim().is_empty(), "anchor t2 必须出文本");
     let trace = running
@@ -8122,6 +8138,19 @@ pub async fn gpu_image_evict_multi_gate() {
     let (_, t2) = running
         .submit_session_opts(Some(11), prompt2.as_str(), 12, crate::turn::TurnOpts::default())
         .expect("multi t2 提交");
+    {
+        let est = running
+            .turns
+            .queue
+            .back()
+            .expect("multi t2 在队列里")
+            .cached;
+        assert!(
+            est >= del0.start,
+            "多段删除轮 admission cached 估计不足：{est} < 第一段删点 {}",
+            del0.start
+        );
+    }
     // 机械门：两段的设备槽在 begin 之后引用必须归零（旧链尾已摘）。
     let mut deleted_slots: Vec<u32> = Vec::new();
     for sp in [del0, del1] {
