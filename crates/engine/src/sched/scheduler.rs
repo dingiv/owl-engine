@@ -20,13 +20,15 @@ use crate::running::RunningEngine;
 /// `write_bt` 之前必须把全部占位替换成真槽 —— 否则写进设备的就是坏块表)。
 pub(crate) const PENDING_LOAD_PLACEHOLDER: u32 = owl_store::HOST_PLACEHOLDER;
 
-/// **已有锚点时，小尾块不再为快照切碎的最小剩余 token 数**（2026-11-13）。
+/// **小尾块不再为“块内消息边界”切碎的最小剩余 token 数**（2026-11-13）。
 ///
-/// 低于本值时，末块不再为“最后一个整页边界”或块内消息边界多切 chunk：
-/// 对齐只买到 `last_boundary - fed` 个 token 的下轮复用，而 chunk 固定税与
-/// token 数无关。1024 是保守值（约 1.3 ms/token 时，复用收益 ≈ 1.3 s ≫
-/// 一次 chunk 税）。
-const ALIGN_TAIL_MIN_REMAINING: usize = 1024;
+/// 只节流**消息边界**切分：agent append 的 82 tok 尾巴里常含 2~3 个消息
+/// 边界，逐边界切会把一个块打碎成 3~4 个固定税块。
+///
+/// ⚠️ **页对齐不在此列**（2026-11-15 用户裁决：客户端每一次请求都必须
+/// 落一张页对齐快照）。末段一律切到最后一个整页边界；<page 的残余单独
+/// 成块（它不产生快照，但会让“下一轮复用面 = 上一页边界”）。
+const MSG_SPLIT_MIN_REMAINING: usize = 1024;
 
 type Result<T> = std::result::Result<T, ModelError>;
 
@@ -338,21 +340,22 @@ impl<D: DeviceClient> RunningEngine<D> {
         };
         // 页对齐(**只看尾端**:最后一段 + 尾端不对齐 + 有可落的整页边界)。
         //
-        // **已有锚点时小尾块不再为快照切碎**(2026-11-13；页对齐与消息边界
-        // 共用这一判据)。对齐的收益 = 下轮少重算 `last_boundary - fed` 个
-        // token；代价 = 本轮多一个与尺寸无关的 chunk 固定税。agent append
-        // 实测(3080 对，82 tok)：对齐成 80+2 两块 = 195ms，一块 = 104ms；
-        // 2-token 尾巴只换来下轮 80 token 复用，固定税已吃光收益。
+        // **每个请求必须落一张页对齐快照**(2026-11-15 用户裁决；优先级高于
+        // 2026-11-13 的“小尾巴省一个 chunk”优化)：末段一律切到最后一个
+        // 整页边界，残余 <page 单独成块。`capture_gdn_snap` 只在
+        // `fed % page == 0` 时推进链游标/拍快照 ⇒ 不切这一刀，小追加
+        // （≤1024 tok）会让复用面永远停在旧边界、累计尾巴每轮白重算
+        // （27B 实测：cached 卡 3488 六轮，重算 203→1068 tok，TTFT 157→496ms）。
         //
-        // `fed == 0` = 冷 prompt，仍按旧行为切出第一个锚点；`step < remaining`
-        // = 非末块，仍按块内消息边界切(不能因“总剩余小”丢中段锚点)。
+        // 对齐的代价 = 本轮多一个 <page 的固定税块（≈90ms）；对“一次请求
+        // 只问一句”的纯 chat 是净亏，但对 agent 追问（每轮都会续写）是
+        // 必须的锚点。配置侧无需旋钮：`prefill_align_page` 已经由
+        // `prefill_align_tail && prefix_cache` 门控，关缓存档不受影响。
         let small_tail =
-            fed > 0 && step == remaining && remaining <= ALIGN_TAIL_MIN_REMAINING;
+            fed > 0 && step == remaining && remaining <= MSG_SPLIT_MIN_REMAINING;
         if page > 0 && step == remaining && !(fed + step).is_multiple_of(page) {
             let last_boundary = (fed + step) / page * page;
-            let already_anchored = fed > 0 && fed.is_multiple_of(page);
-            let skip_small_tail = already_anchored && small_tail;
-            if last_boundary > fed && !skip_small_tail {
+            if last_boundary > fed {
                 step = last_boundary - fed;
             }
         }
@@ -2625,10 +2628,13 @@ mod prefill_tail_merge_tests {
         assert_eq!(R::prefill_step_chunk(0, 1, 512, 512, 0), Some(1));
     }
 
-    /// **页对齐**(page = 32;前缀复用闭环):只在"至今没有对齐边界"的单块档
-    /// 切一刀,切点 = **最后一个整页边界**;多 chunk 档(L4 合并)不受影响。
+    /// **页对齐**(page = 32;前缀复用闭环):末段一律切到最后一个整页边界。
+    ///
+    /// 2026-11-15 用户裁决：**客户端每一次请求都必须落一张页对齐快照**，
+    /// 所以“已有锚点的小尾块省一刀”（2026-11-13）只保留给消息边界切分，
+    /// 页对齐不再节流。
     #[test]
-    fn page_align_only_for_single_chunk_prompts() {
+    fn page_align_runs_for_every_tail() {
         // 单块 + 尾端不对齐 ⇒ 切在最后一个整页边界(64 + 19)
         assert_eq!(R::prefill_step_chunk(0, 83, 512, 512, 32), Some(64));
         assert_eq!(R::prefill_step_chunk(64, 83, 512, 512, 32), Some(19));
@@ -2640,16 +2646,18 @@ mod prefill_tail_merge_tests {
         assert_eq!(R::prefill_step_chunk(0, 20, 512, 512, 32), Some(20));
         // **中途段**仍按配置(不是最后一段 ⇒ 不动)
         assert_eq!(R::prefill_step_chunk(512, 8244, 512, 512, 32), Some(512));
-        // **L4 长尾段 + 已有对齐锚点**(fed=7680 是页边界):564 tok ≤ 1024
-        // ⇒ 不再为最后一个页边界多切 544+20 两块,直接吃完(2026-11-13)。
-        assert_eq!(R::prefill_step_chunk(7680, 8244, 512, 1024, 32), Some(564));
+        // **小尾块也必须切**（569→544+20；27B 追问缓存回归的硬门）：
+        // fed=3488 页对齐、剩余 203 也必须切到 3680，下一轮才有快照可用。
+        assert_eq!(R::prefill_step_chunk(3488, 3691, 2048, 0, 32), Some(192));
+        assert_eq!(R::prefill_step_chunk(3680, 3691, 2048, 0, 32), Some(11));
+        assert_eq!(R::prefill_step_chunk(7680, 8244, 512, 1024, 32), Some(544));
         assert_eq!(R::prefill_step_chunk(8224, 8244, 512, 1024, 32), Some(20));
-        // tail_merge=0 ⇒ 前段 512;尾段 52 ≤ 1024 ⇒ 一块吃完(不再切 32+20)
+        // tail_merge=0 ⇒ 前段 512；尾段 52 也要切 32+20（每请求一快照）
         assert_eq!(R::prefill_step_chunk(7680, 8244, 512, 0, 32), Some(512));
-        assert_eq!(R::prefill_step_chunk(8192, 8244, 512, 0, 32), Some(52));
+        assert_eq!(R::prefill_step_chunk(8192, 8244, 512, 0, 32), Some(32));
         // 关对齐(page = 0)= 纯 L4
         assert_eq!(R::prefill_step_chunk(0, 83, 512, 512, 0), Some(83));
-        // 已有锚点但尾块 > 1024 ⇒ 仍对齐（下轮少重算 ~1k token，值得多一块）
+        // 尾块 > 1024 ⇒ 同样对齐
         assert_eq!(R::prefill_step_chunk(1024, 2100, 2048, 0, 32), Some(1056));
     }
 
@@ -2686,10 +2694,11 @@ mod prefill_tail_merge_tests {
             R::prefill_step_chunk_msg(9728, 12000, 512, 0, page, &[9792, 9920], &[], 128),
             Some(192)
         );
-        // 小尾块(564 ≤ 1024)不按消息边界切：step 原本 564，直接吃完。
+        // 小尾块(564 ≤ 1024)不按**消息边界**切；但**页对齐**仍切一刀
+        // （2026-11-15：每请求必须落快照）⇒ 544 + 20，不切 8192。
         assert_eq!(
             R::prefill_step_chunk_msg(7680, 8244, 512, 1024, page, &[8192], &[], 0),
-            Some(564)
+            Some(544)
         );
         // 尾块 > 1024 时仍按消息边界切（大段尾块的快照收益值得多一块）。
         assert_eq!(

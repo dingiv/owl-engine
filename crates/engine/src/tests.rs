@@ -6795,6 +6795,10 @@ pub async fn gpu_image_evict_gate() {
             // 钉小池（门只跑 ~700 tok；auto 池算式在本机会被“预算可服务上限”
             // 拒 —— 与本特性无关的既有面）
             pool_tokens: Some(2048),
+            // **每请求一张快照**（2026-11-15）后，门里多条臂共享快照池：
+            // 4 槽会把当前臂的“图前锚点”当最冷 Extra 挤掉（机制门不该被
+            // 预算淘汰干扰）⇒ 给足槽位；淘汰顺序本身由 store 门单独锁死。
+            snap_max: 16,
             ..Default::default()
         },
     })
@@ -7380,6 +7384,10 @@ pub async fn gpu_image_evict_anchor_gate() {
             prefix_cache: true,
             image_evict: true,
             pool_tokens: Some(2048),
+            // 三条臂共享快照池；锚点/尾锚点都是可淘汰 Extra/Dense（不是 pin）
+            // ⇒ 机制门给足槽位，避免当前臂的锚点被后续快照挤出
+            // （淘汰顺序由 store 门 evict_anchor_snapshot_is_extra_and_evictable 锁）。
+            snap_max: 16,
             ..Default::default()
         },
     })
@@ -7892,6 +7900,9 @@ pub async fn gpu_image_evict_multi_gate() {
             image_evict: true,
             // 钉小池（门只跑 ~800 tok；auto 池算式会被本机“预算可服务上限”拒）
             pool_tokens: Some(2048),
+            // 三条臂共享快照池；锚点是 Extra（不是 pin）⇒ 给足槽位避免
+            // 当前臂的锚点被后续快照挤出（淘汰顺序由 store 门单独验证）。
+            snap_max: 16,
             ..Default::default()
         },
     })
