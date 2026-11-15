@@ -481,7 +481,8 @@ impl KvBank {
     /// 返回 `(表叶子, nt)`;无 GDN 层 = `None`。
     /// `t_real` = 本块**真行数**(表的 `cu`/内容口径);`nt` = 布局口径的 chunk 数
     /// (eager = `ceil(t_real/BT)`;桶路 = `ceil(t_pad/BT)` —— 图内烘的是它)。
-    /// 写入流恒为默认流(桶路已退役 ⇒ 单一路径;原 `GdnTableStream` 参数删除)。
+    /// **写入流 = COMPUTE(与消费者同流)**：本表每 chunk 覆写持久槽，
+    /// 写 H2D 会与前一 chunk 仍在跑的 GDN 核跨流无序（见下方内联注释）。
     pub(crate) async fn write_gdn_tables<D: DeviceClient>(
         &self,
         face: &mut D,
@@ -503,7 +504,12 @@ impl KvBank {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().expect("4 字节")))
             .collect();
-        face.write_block_f32(&gt.table, 0, &f32bits).await?;
+        // **必须与消费者同流(COMPUTE)**：本表是**持久槽**，每个 chunk 覆写；
+        // 若写在 H2D 流，前一 chunk 仍在 COMPUTE 上跑的 GDN 核会读到被本次
+        // 覆写的表（2026-11-04 “INT8 末块丢 `M`” 的真根因：当时用末块前全设备
+        // sync 遮住了这条跨流竞态；2026-11-16 改为同流写，删掉 sync）。
+        face.write_block_f32_on(owl_iface::contract::UpStream::Compute, &gt.table, 0, &f32bits)
+            .await?;
         Ok(Some(GdnTableSlotOwned {
             leaf: TensorOps::of_block(
                 gt.table.id,
@@ -2027,6 +2033,8 @@ impl StatePool {
     ///
     /// 超容量 = **响亮拒**(调用方必须先按预算裁到 `nb` 以内 —— 静默截断 =
     /// 静默漏块,选择层的账就假了)。
+    /// **写入流 = COMPUTE**:视图槽会被召回路径逐 chunk 覆写,必须与
+    /// attention 消费者同流(否则前一 chunk 的核会读到被覆写的表)。
     pub(crate) async fn write_select_view<D: DeviceClient>(
         &self,
         face: &mut D,
@@ -2046,7 +2054,9 @@ impl StatePool {
         for (i, p) in pages.iter().enumerate() {
             v[i] = *p as f32;
         }
-        face.write_block_f32(b, 0, &v).await
+        // 持久视图槽逐 chunk 覆写 ⇒ 同流写（与 GDN 表同律；见 `write_gdn_tables`）。
+        face.write_block_f32_on(owl_iface::contract::UpStream::Compute, b, 0, &v)
+            .await
     }
 
     /// 视图页表叶子(`[1, nb]` f32;喂 `KvBuffers::block_tables`)。

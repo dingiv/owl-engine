@@ -346,8 +346,11 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
 
     /// **prefill 入队半**(S4 ⑤-K3 分相):除末块 token 回读外**零同步**
     /// (TP 镜像块契约)—— 末块返回 `PrefillTail`(收割票据,由主 rank 读回)。
-    /// ⚠️ 唯一例外:INT8 池在末块前有一次全设备 sync(2026-11-04 1k 质量门;
-    /// 见函数体内注释),FP8/非 INT8 不受影响。
+    ///
+    /// 2026-11-16:原 INT8 末块前的全设备栅栏已**删除**。真根因是
+    /// `StatePool::write_gdn_tables` 用 H2D 流覆写持久槽,与 COMPUTE 上的
+    /// 前一 chunk GDN 核跨流无序（详见 `mem/state.rs` 与 1k 质量门文档）。
+    /// 改为同流写后,本函数对 FP8/INT8 都是零同步。
     pub(crate) async fn prefill_chunk_enqueue(
         &mut self,
         host: &mut ChunkHost<'_>,
@@ -359,21 +362,12 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         let mut t_ext = std::time::Duration::ZERO;
         let d = self.pool.geom.dims;
         let t = ids.len();
-        // **INT8 prefill 末块前栅栏（2026-11-04 1k/2k 质量门）**：
-        // 非末块把 KV/GDN 写在 COMPUTE 流上；末块的 host 表/调度与
-        // 跨流复用之间存在漏 event 的窗口（实测：不加栅栏，1k 固定答
-        // `ZXCVBN12345` 丢 `M`；加一次全设备 sync 即 RETRIEVED，且
-        // 3/3 fresh server 可复现）。每请求只付一次（末块前），不是每
-        // chunk 税；FP8/非 INT8 不走此路。
-        if is_last
-            && base > 0
-            && self.pool.geom.is_int8()
-            && host.knobs.int8_prefill_sync
-        {
-            let face = self.graphs.session.face_mut();
-            face.sync().await?;
-            owl_shared::log_debug!("pf-sync", "INT8 末块前栅栏 base={base} t={t}");
-        }
+        // 2026-11-16:**此前的 INT8 末块前全设备栅栏已删除**。真根因不是
+        // “末块需要 sync”，而是 `write_gdn_tables` 把每 chunk 覆写的持久
+        // GDN 表写在 **H2D 流**上，前一 chunk 仍在 COMPUTE 上跑的 GDN 核会
+        // 读到被覆写的表（1k/2k needle 丢 `M`）。修法 = 持久表写入与消费者
+        // 同流（COMPUTE），零事件、零栅栏；A/B 证据见
+        // docs/bench/int8-1k-quality-gate-2026-11-04.md §6.6。
         // E2b:活跃会话块链 + GDN 格(逻辑位 → 物理槽由块表换算)
         // 块链/gdn 槽 = 主机侧事实(唯一取值点:调用方从账房取好传入)
         let (bt_chain, gdn_slot_v) = (host.bt_chain.to_vec(), host.gdn_slot);

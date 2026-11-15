@@ -95,7 +95,7 @@ vlm-cost: images=1 新图=1 | host=12.6ms tower=285ms combine=1.9ms | prompt=318
 | `kv_dtype=fp8`（FI prefill） | 新图 1.38s、tower 0 时 752ms；与 int8 持平，不换默认 |
 | `block_pool_bytes=256MiB`（图场景） | `interp.host.node.gemm` 280→2.3ms，但 prefill 1300→1270ms、TTFT 1448→1440ms：**GEMM host 不在关键路径** |
 | DFlash 逐层 Htod 去重（50→34 节点） | `srv.wait.htod`/TTFT 不变：**Htod 数量不是关键路径** |
-| `int8_prefill_sync=false` | 文本 append 无变化；图未单独 A/B，风险不值 |
+| `int8_prefill_sync=false` | 文本 append 无变化；图未单独 A/B，风险不值（该键已于 2026-11-16 删除；同日根因修复后栅栏也已删除，见 1k 门 §6.6；此行保留当时记录） |
 | 同图重复 | tower 0，但图片 KV 仍要按位置重算；不是免费 |
 
 ## 4. 下一刀（按收益）

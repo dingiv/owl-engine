@@ -75,8 +75,6 @@ pub struct EngineKnobs {
     pub draft: DraftCfg,
     /// 前缀缓存(缺省开;原 OWL_PREFIX_CACHE≠"0")
     pub prefix_cache: bool,
-    /// INT8 prefill 末块前设备栅栏（缺省 true；false 仅 A/B）
-    pub int8_prefill_sync: bool,
     /// **整枝塌缩**(`[kvmem].bulk_drop_when_tier_full`;缺省 false = 保守)。
     pub bulk_drop_when_tier_full: bool,
     /// **前缀无感删除(图像段)**(`[vision] image_evict`;缺省关)。
@@ -378,7 +376,6 @@ impl Default for EngineKnobs {
             pool_tokens: None,
             draft: DraftCfg::default(),
             prefix_cache: true,
-            int8_prefill_sync: true,
             bulk_drop_when_tier_full: false,
             image_evict: false,
             gap_reserve: 0,
@@ -735,7 +732,6 @@ impl EngineKnobs {
                 tp_draft: cfg.spec.tp_draft,
             },
             prefix_cache: cfg.pool.prefix_cache,
-            int8_prefill_sync: cfg.runtime.int8_prefill_sync,
             bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
             image_evict: cfg.vision.image_evict,
             gap_reserve: cfg.runtime.gap_reserve_tokens(),
