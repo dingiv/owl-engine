@@ -12,7 +12,7 @@
 //! = 前缀复用零命中的根因。
 //!
 //! 挂账(M-C):取消/abort 的上游用法(`EngineReq::Abort` 已就位,pi 侧
-//! 断流走路由 executor 自动弃置)。
+//! 断流由引擎泵循环自动弃置)。
 
 use std::io::Write;
 use std::sync::Arc;
@@ -21,10 +21,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 
-use owl_engine::{TurnEvent, TurnOpts, TurnSampler};
+use owl_engine::{EngineClient, StreamEvent, TurnEvent, TurnOpts, TurnSampler};
 use crate::config::AgentCfg;
-
-use crate::executor::{EngineReq, SinkEvent};
 use crate::agent_trace::{AgentTrace, OutcomeFacts, ReqFacts, TurnLedger, UsageFacts};
 use crate::chat_tpl::{ChatTpl, RenderArgs};
 use crate::http;
@@ -719,7 +717,7 @@ fn dump_request(dir: &std::path::Path, body: &[u8]) {
     owl_shared::log_warn!("request-dump", "同一纳秒 100 次文件名冲突，放弃落盘");
 }
 
-/// chat completions:提交 executor → 首笔 Accepted/Rejected → 三通道折叠循环。
+/// chat completions:提交引擎 → 首笔 Accepted/Rejected → 三通道折叠循环。
 // 结构性豁免(2026-11-02 clippy 清理):派发/契约 ABI:参数表就是调用面,拆结构体会把每个调用点变成二次装箱
 #[allow(clippy::too_many_arguments)]
 /// **`w` 是具体 `TcpStream` 而不是泛型 `AsyncWrite`**(2026-11-03):流式循环要多
@@ -728,7 +726,7 @@ fn dump_request(dir: &std::path::Path, body: &[u8]) {
 pub(crate) async fn chat(
     w: &mut tokio::net::TcpStream,
     body: &[u8],
-    tx: mpsc::Sender<EngineReq>,
+    tx: EngineClient,
     model_name: &str,
     tpl: &Arc<ChatTpl>,
     agent: &AgentCfg,
@@ -805,7 +803,7 @@ pub(crate) async fn chat(
             Err(e) => return http::respond_json(w, 400, &error_json(e)).await,
         };
     }
-    let (sink_tx, mut sink_rx) = mpsc::channel::<SinkEvent>(SINK_CAPACITY);
+    let (sink_tx, mut sink_rx) = mpsc::channel::<StreamEvent>(SINK_CAPACITY);
     // 请求级图像事实（日志/诊断；图像 token = 视觉占位展开量的真源）。
     let image_count = images.len();
     let image_tokens = images
@@ -869,11 +867,7 @@ pub(crate) async fn chat(
         repeat: repeat.take(),
     });
     led.set_prompt(&prompt);
-    let engine_req = EngineReq::Chat {
-        session,
-        prompt,
-        max_new,
-        opts: TurnOpts {
+    let chat_opts = TurnOpts {
             ignore_eos: req.ignore_eos,
             sampler: req.sampler_override(),
             stop,
@@ -884,10 +878,12 @@ pub(crate) async fn chat(
             // (选择层 B 轴未落地,地板语义无从兼现)。
             dense_floor: None,
             images,
-        },
-        sink: sink_tx,
     };
-    if tx.send(engine_req).await.is_err() {
+    if tx
+        .chat(session, prompt, max_new, chat_opts, sink_tx)
+        .await
+        .is_err()
+    {
         return http::respond_json(w, 503, &error_json("引擎退役")).await;
     }
 
@@ -896,7 +892,7 @@ pub(crate) async fn chat(
     // 预算被夹紧 ⇒ 响应头如实带出（`X-Owl-Max-New`；非私有 body 字段）
     let mut clamped_max_new: Option<usize> = None;
     let turn = match sink_rx.recv().await {
-        Some(SinkEvent::Accepted { session, turn, prompt_tokens, cached_tokens, max_new }) => {
+        Some(StreamEvent::Accepted { session, turn, prompt_tokens, cached_tokens, max_new }) => {
             usage.prompt = prompt_tokens;
             usage.cached = cached_tokens;
             // 预算被准入夹紧 ⇒ 如实留痕（客户端会看到 finish_reason=length）
@@ -917,7 +913,7 @@ pub(crate) async fn chat(
             );
             Some((session, turn))
         }
-        Some(SinkEvent::Rejected { err }) => {
+        Some(StreamEvent::Rejected { err }) => {
             led.fail(format!("提交被拒:{err}"));
             // **容量拒绝**（引擎 submit 边界的 `admission:<code>`）⇒ 429；
             // 其余（预算越界）仍走 pi 能认的 400 context-overflow 报文。
@@ -935,7 +931,7 @@ pub(crate) async fn chat(
         }
         // 契约:首笔必为 Accepted/Rejected(executor 在 pump 前投递)⇒ 不会走到
         // 这里(真走到 = 协议序错乱,不静默吞)
-        Some(SinkEvent::Session { .. }) => {
+        Some(StreamEvent::CachedTokens { .. }) => {
             return http::respond_json(
                 w,
                 503,
@@ -1106,7 +1102,7 @@ pub(crate) async fn chat(
         if ka_at.is_some()
             && matches!(
                 next,
-                Some(SinkEvent::Turn(
+                Some(StreamEvent::Turn(
                     TurnEvent::Token { .. }
                         | TurnEvent::Completed { .. }
                         | TurnEvent::Failed { .. }
@@ -1117,7 +1113,7 @@ pub(crate) async fn chat(
         }
         if matches!(
             next,
-            Some(SinkEvent::Turn(
+            Some(StreamEvent::Turn(
                 TurnEvent::Prefill { .. }
                     | TurnEvent::Token { .. }
                     | TurnEvent::Completed { .. }
@@ -1127,18 +1123,18 @@ pub(crate) async fn chat(
             started = true;
         }
         match next {
-            Some(SinkEvent::Turn(TurnEvent::Token { delta, .. })) => {
+            Some(StreamEvent::Turn(TurnEvent::Token { delta, .. })) => {
                 usage.completion += 1;
                 led.first_token(); // TTFT(幂等)
                 let items = splitter.push(&delta);
                 emit!(items);
             }
             // Prefill 进度帧(末笔 total = prompt token 数,入 usage)
-            Some(SinkEvent::Turn(TurnEvent::Prefill { total, .. })) => {
+            Some(StreamEvent::Turn(TurnEvent::Prefill { total, .. })) => {
                 usage.prompt = total;
             }
             // 缓存校正帧(AGT-12):块级前缀缓存命中的真值(覆盖 submit 时估值)
-            Some(SinkEvent::Session { turn: t, cached_tokens }) => {
+            Some(StreamEvent::CachedTokens { turn: t, cached_tokens }) => {
                 if turn.map(|(_, x)| x) == Some(t) && cached_tokens != usage.cached {
                     owl_shared::log_info!(
                         "chat",
@@ -1149,7 +1145,7 @@ pub(crate) async fn chat(
                     usage.cached = cached_tokens;
                 }
             }
-            Some(SinkEvent::Turn(TurnEvent::Completed {
+            Some(StreamEvent::Turn(TurnEvent::Completed {
                 text, finish, stats, ..
             })) => {
                 let items = splitter.finish();
@@ -1366,7 +1362,7 @@ pub(crate) async fn chat(
                     }
                 };
             }
-            Some(SinkEvent::Turn(TurnEvent::Failed { err, .. })) => {
+            Some(StreamEvent::Turn(TurnEvent::Failed { err, .. })) => {
                 led.fail(format!("turn 失败:{err}"));
                 // **准入拒绝**(`admission:<code>`)：用 OpenAI 协议内的标准手段
                 // 表达 —— 非流式 `429 + Retry-After`;流式头已发,走既有错误帧收口
@@ -1419,15 +1415,15 @@ pub(crate) async fn chat(
                     ReplyMode::Aggregate => http::respond_json(w, 500, &error_json(err)).await,
                 };
             }
-            Some(SinkEvent::Turn(_)) => {}
+            Some(StreamEvent::Turn(_)) => {}
             // 协议不变式:首笔之后不再有 Accepted/Rejected(与断流同处置)
-            Some(SinkEvent::Accepted { .. }) | Some(SinkEvent::Rejected { .. })
+            Some(StreamEvent::Accepted { .. }) | Some(StreamEvent::Rejected { .. })
                 if mode == ReplyMode::Stream =>
             {
                 led.fail("协议序错乱:受理帧之后再现受理/拒绝帧");
                 break
             }
-            Some(SinkEvent::Accepted { .. }) | Some(SinkEvent::Rejected { .. }) => {
+            Some(StreamEvent::Accepted { .. }) | Some(StreamEvent::Rejected { .. }) => {
                 led.fail("引擎连接中断(受理帧之后)");
                 return http::respond_json(w, 503, &error_json("引擎连接中断")).await;
             }
@@ -1525,19 +1521,12 @@ pub fn admission_code(err: &str) -> Option<&str> {
 /// - `turn` 未知(断在受理帧之前)= 按会话找(会话闸保证该会话至多一个 turn);
 /// - **等 executor 回执再返回**:会话闸在本函数返回后才释放(函数尾),这样下一次
 ///   同会话提交不会撞上引擎的"同会话并发"硬拒。回执超时只告警(不静默)。
-async fn abort_turn(tx: &mpsc::Sender<EngineReq>, session: Option<u64>, turn: Option<u64>) {
+async fn abort_turn(tx: &EngineClient, session: Option<u64>, turn: Option<u64>) {
     // 临时会话(None)= 无键可寻;引擎会在 sink drop 后自弃(executor 下一个投递点)
     let Some(session) = session else { return };
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    if tx.send(EngineReq::Abort { session, turn, ack: ack_tx }).await.is_err() {
-        owl_shared::log_warn!("chat", "abort 投递失败(executor 已退役,引擎随进程退出)");
-        return;
-    }
-    match tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            owl_shared::log_debug!("chat", "abort 回执通道关闭(executor 已退役)");
-        }
+    let cancel = tx.cancel(session, turn);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), cancel).await {
+        Ok(Ok(())) | Ok(Err(_)) => {}
         Err(_) => owl_shared::log_warn!("chat", "abort 回执超时(5s;引擎可能正忙) "),
     }
 }
@@ -1709,7 +1698,7 @@ fn tokenize_plan(req: &TokenizeRequest) -> Result<(String, bool, &'static str), 
 pub(crate) async fn tokenize<W: tokio::io::AsyncWrite + Unpin>(
     w: &mut W,
     body: &[u8],
-    tx: mpsc::Sender<EngineReq>,
+    tx: EngineClient,
 ) -> std::io::Result<()> {
     let req: TokenizeRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
@@ -1719,12 +1708,8 @@ pub(crate) async fn tokenize<W: tokio::io::AsyncWrite + Unpin>(
         Ok(v) => v,
         Err(e) => return http::respond_json(w, 400, &error_json(e)).await,
     };
-    let (rtx, rrx) = tokio::sync::oneshot::channel();
-    if tx.send(EngineReq::Tokenize { text, chat_wrap, reply: rtx }).await.is_err() {
-        return http::respond_json(w, 503, &error_json("引擎退役")).await;
-    }
-    match rrx.await {
-        Ok(Ok(rep)) => {
+    match tx.tokenize(text, chat_wrap).await {
+        Ok(rep) => {
             http::respond_json(
                 w,
                 200,
@@ -1739,11 +1724,7 @@ pub(crate) async fn tokenize<W: tokio::io::AsyncWrite + Unpin>(
             .await
         }
         // 编码失败(显式上抛;不混淆“文本是空的”)
-        Ok(Err(e)) => http::respond_json(w, 400, &error_json(e)).await,
-        Err(_) => {
-            http::respond_json(w, 503, &error_json("引擎连接中断(tokenize 应答通道关闭)"))
-                .await
-        }
+        Err(e) => http::respond_json(w, 400, &error_json(e)).await,
     }
 }
 

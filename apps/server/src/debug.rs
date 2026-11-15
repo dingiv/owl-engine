@@ -237,6 +237,26 @@ pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
     })
 }
 
+/// 逐 rank 的块账投影（`/debug/blocks`；单卡档输出与旧形状一致）。
+pub fn blocks_ranks_json(
+    ranks: &[(u8, Result<Vec<owl_cuda::BlockLedgerRow>, String>)],
+) -> Value {
+    if ranks.len() == 1 {
+        return match &ranks[0].1 {
+            Ok(rows) => blocks_json(rows),
+            Err(e) => json!({"ok": false, "error": e.clone()}),
+        };
+    }
+    let list: Vec<Value> = ranks
+        .iter()
+        .map(|(rank, r)| match r {
+            Ok(rows) => json!({"rank": rank, "ok": blocks_json(rows)}),
+            Err(e) => json!({"rank": rank, "error": e.clone()}),
+        })
+        .collect();
+    json!({"ranks": list})
+}
+
 // ============================================================================
 // `/debug/vram` —— store 三层账 + **owner 维明细**(第 0 刀)
 // ============================================================================
@@ -247,7 +267,7 @@ pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
 /// 持平 = 正常。`system` 桶 = 尚未接线 owner 的存量调用点(随 N4/N5 排空)。
 // 结构性豁免(2026-11-02 clippy 清理):排序键是复合比较(多字段/方向混合),抽 key 会丢掉可读性
 #[allow(clippy::unnecessary_sort_by)]
-pub fn vram_json(snap: &crate::executor::VramSnapshot) -> Value {
+pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
     let r = &snap.report;
     let owners: Vec<Value> = r
         .tiers

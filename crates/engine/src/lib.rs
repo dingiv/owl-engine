@@ -81,6 +81,8 @@ pub(crate) use vision::{img_evict, vlm};
 pub(crate) mod engine;
 pub(crate) mod loader;
 pub(crate) mod running;
+/// **引擎服务面**（init + 泵 + Send 句柄；2026-11-15 业务下沉 P1）
+pub mod service;
 
 pub use engine::{Engine, EngineConfig, EngineKnobs};
 pub use owl_iface::handle::{AssetClass, DeviceHandle, Owner};
@@ -108,6 +110,10 @@ pub fn embed_plan_of(eq: owl_shared::config::EmbedQuant) -> Option<owl_models::m
         owl_shared::config::EmbedQuant::I8 => Some(owl_models::module::QuantPlan::I8W),
     }
 }
+pub use service::{
+    BatchStatsSnapshot, BootSpec, Booted, DeviceOpts, DiagSnapshot, EngineClient, EngineService,
+    QueueFacts, ServiceExit, StepGate, StreamEvent,
+};
 pub use graph_plan::{GraphPlan, GraphPlanDesc, PlanOutcome};
 pub use running::{RunningEngine, TokenizeReply};
 pub use session::{AgentSession, SessionAssets, SessionTable};

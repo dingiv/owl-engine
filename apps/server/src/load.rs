@@ -1,7 +1,7 @@
 //! **`POST /debug/load` —— 内源灌流**（服务面并发能力的现场测量）。
 //!
 //! 一次调用 = 同时向引擎灌 N 个 turn，走**与真实请求同一条** `EngineReq::Chat`
-//! 通道（同一 executor / 同一调度 / 同一引擎），每 worker：
+//! 通道（同一引擎泵 / 同一调度），每 worker：
 //! - **独立会话**（`session` 键带 nonce ⇒ 会话闸不互相阻塞，且能进同一个批）；
 //! - **固定生成长度**（`ignore_eos`）+ 贪婪采样 ⇒ 读数不被"模型想不想停"干扰；
 //! - **随机前缀**（默认开）⇒ 打掉前缀缓存，测的是真并发算力而不是缓存命中；
@@ -9,7 +9,7 @@
 //!
 //! 为什么不去"对自己发 HTTP"：灌流请求自己也要占 `server.max_concurrency`
 //! 的 permit（N 会被压到 `max_concurrency-1`，还可能自锁）。本驱动直接进
-//! executor 通道，量的是同一段引擎路径，且**不占** permit —— 但 `concurrency`
+//! 引擎请求通道，量的是同一段引擎路径，且**不占** permit —— 但 `concurrency`
 //! 仍按 `max_concurrency` 校验（它就是服务面的并发上限，超了如实拒）。
 //!
 //! **判据**（输出里全给）：
@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use owl_engine::{TurnEvent, TurnOpts, TurnSampler};
 use crate::config::AgentCfg;
 
-use crate::executor::{BatchStatsSnapshot, EngineReq, SinkEvent};
+use owl_engine::{BatchStatsSnapshot, EngineClient, StreamEvent};
 use crate::chat_tpl::{ChatTpl, RenderArgs};
 use crate::http;
 
@@ -223,7 +223,7 @@ fn session_of(prefix: &str, idx: usize) -> u64 {
 
 /// 单 worker：渲染 → 提交 → 数事件
 async fn run_one(
-    tx: mpsc::Sender<EngineReq>,
+    tx: EngineClient,
     tpl: Arc<ChatTpl>,
     spec: NormSpec,
     idx: usize,
@@ -260,32 +260,30 @@ async fn run_one(
             return out;
         }
     };
-    let (sink_tx, mut sink_rx) = mpsc::channel::<SinkEvent>(LOAD_SINK_CAP);
+    let (sink_tx, mut sink_rx) = mpsc::channel::<StreamEvent>(LOAD_SINK_CAP);
     let t0 = Instant::now();
-    let req = EngineReq::Chat {
-        session: Some(out.session),
-        prompt,
-        max_new: gen_tokens,
-        opts: TurnOpts {
-            // 固定长度（不受 EOS 影响）+ 贪婪（读数可复现）
-            ignore_eos: true,
-            sampler: Some(TurnSampler {
-                temp: Some(0.0),
-                topk: None,
-                topp: None,
-            }),
-            ..Default::default()
-        },
-        sink: sink_tx,
+    let opts = TurnOpts {
+        // 固定长度（不受 EOS 影响）+ 贪婪（读数可复现）
+        ignore_eos: true,
+        sampler: Some(TurnSampler {
+            temp: Some(0.0),
+            topk: None,
+            topp: None,
+        }),
+        ..Default::default()
     };
-    if tx.send(req).await.is_err() {
+    if tx
+        .chat(Some(out.session), prompt, gen_tokens, opts, sink_tx)
+        .await
+        .is_err()
+    {
         out.err = Some("引擎退役(提交通道关闭)".into());
         out.wall_ms = t0.elapsed().as_secs_f64() * 1e3;
         return out;
     }
     while let Some(ev) = sink_rx.recv().await {
         match ev {
-            SinkEvent::Accepted {
+            StreamEvent::Accepted {
                 turn,
                 prompt_tokens,
                 cached_tokens,
@@ -295,14 +293,14 @@ async fn run_one(
                 out.prompt_tokens = prompt_tokens;
                 out.cached_tokens = cached_tokens;
             }
-            SinkEvent::Session { cached_tokens, .. } => {
+            StreamEvent::CachedTokens { cached_tokens, .. } => {
                 out.cached_tokens = cached_tokens;
             }
-            SinkEvent::Rejected { err } => {
+            StreamEvent::Rejected { err } => {
                 out.err = Some(format!("提交被拒:{err}"));
                 break;
             }
-            SinkEvent::Turn(TurnEvent::Token { .. }) => {
+            StreamEvent::Turn(TurnEvent::Token { .. }) => {
                 let now = t0.elapsed().as_secs_f64() * 1e3;
                 match out.ttft_ms {
                     None => out.ttft_ms = Some(now),
@@ -316,19 +314,19 @@ async fn run_one(
                 // 契约:1 事件 = 1 采样步 = 1 token（`usage` 同源口径）
                 out.completion_tokens += 1;
             }
-            SinkEvent::Turn(TurnEvent::Prefill { total, .. }) => {
+            StreamEvent::Turn(TurnEvent::Prefill { total, .. }) => {
                 out.prompt_tokens = total;
             }
-            SinkEvent::Turn(TurnEvent::Completed { finish, .. }) => {
+            StreamEvent::Turn(TurnEvent::Completed { finish, .. }) => {
                 out.finish = Some(format!("{finish:?}"));
                 break;
             }
-            SinkEvent::Turn(TurnEvent::Failed { err, .. }) => {
+            StreamEvent::Turn(TurnEvent::Failed { err, .. }) => {
                 out.err = Some(err);
                 break;
             }
             // Idle 不该出现在单 turn 的 sink 上（出现 = 引擎退役，如实记）
-            SinkEvent::Turn(TurnEvent::Idle) => {
+            StreamEvent::Turn(TurnEvent::Idle) => {
                 out.err = Some("引擎 Idle(提交丢失)".into());
                 break;
             }
@@ -339,19 +337,15 @@ async fn run_one(
 }
 
 /// 取一次引擎事实（前后各一次，算 `batch_steps` 差值）
-async fn stats(tx: &mpsc::Sender<EngineReq>) -> Result<BatchStatsSnapshot, String> {
-    let (reply, rx) = tokio::sync::oneshot::channel();
-    tx.send(EngineReq::BatchStats { reply })
-        .await
-        .map_err(|_| "引擎退役(BatchStats 通道关闭)".to_string())?;
-    rx.await.map_err(|_| "引擎退役(BatchStats 应答丢失)".to_string())
+async fn stats(tx: &EngineClient) -> Result<BatchStatsSnapshot, String> {
+    tx.batch_stats().await
 }
 
 /// HTTP 入口
 pub(crate) async fn load<W: AsyncWrite + Unpin>(
     w: &mut W,
     body: &[u8],
-    tx: mpsc::Sender<EngineReq>,
+    tx: EngineClient,
     tpl: &Arc<ChatTpl>,
     agent: &AgentCfg,
     max_concurrency: usize,
@@ -374,7 +368,7 @@ pub(crate) async fn load<W: AsyncWrite + Unpin>(
         Ok(s) => s,
         Err(e) => return http::respond_json(w, 503, &json!({"error": e})).await,
     };
-    // 同时起 N 个 worker（submit 全部先进 executor 通道；executor 在泵前一次排空）
+    // 同时起 N 个 worker（submit 全部先进引擎请求通道；引擎在泵前一次排空）
     let mut handles = Vec::with_capacity(spec.concurrency);
     if spec.pair {
         assert!(spec.concurrency == 2, "pair 模式要求 concurrency = 2");

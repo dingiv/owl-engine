@@ -226,59 +226,6 @@ pub(crate) const HELP: &str = "用法: server -p <profile_path> [CONFIG] [选项
   --log-level/-file      日志覆盖;--perf-level/--perf-dump 性能账\n\
   --step-gate[-ms|-us|-every]  单步/粘滞调试门\n";
 
-/// **本进程持有的设备束**(boot 边界定形;rank 序 = 列表序)。
-///
-/// 单卡档 world = 1(声明式选卡/自动挑空闲的结果);TP 档 world = 2
-/// (`runtime.tp_ordinals`;S6 2026-10-17)。**唯一真源** —— 引擎 ordinal、卡锁、
-/// 日志身份全从这里取,单卡/TP 两条路径不各存一份。
-#[derive(Clone, Debug)]
-pub struct Devices {
-    /// 引擎 ordinal(rank 序 = 列表序;交引擎 cudaSetDevice)
-    ordinals: Vec<usize>,
-    /// 设备 UUID(卡锁 + 日志身份;与 `ordinals` 同长同序)
-    uuids: Vec<String>,
-}
-
-impl Devices {
-    /// 构造即校验(空/长度不齐 = 拒;字段私有 ⇒ 这是唯一入口)
-    fn new(ordinals: Vec<usize>, uuids: Vec<String>) -> Result<Self, String> {
-        if ordinals.is_empty() {
-            return Err("设备束为空(至少要一张卡)".into());
-        }
-        if ordinals.len() != uuids.len() {
-            return Err(format!(
-                "设备束长度不齐:ordinals={} uuids={}(内部不变量)",
-                ordinals.len(),
-                uuids.len()
-            ));
-        }
-        Ok(Self { ordinals, uuids })
-    }
-
-    /// `from_config` 用的占位(world = 1、ordinal 0、UUID 空)—— 真值由
-    /// [`ServerConfig::load`] 的选卡回填;喂 `from_config` 的测试不碰设备面。
-    fn placeholder() -> Self {
-        Self { ordinals: vec![0], uuids: vec![String::new()] }
-    }
-
-    /// rank 数(单卡 = 1;TP v1 恒 2)
-    pub fn world(&self) -> usize {
-        self.ordinals.len()
-    }
-    /// 全部 rank 的 ordinal(rank 序 = 列表序)
-    pub fn ordinals(&self) -> &[usize] {
-        &self.ordinals
-    }
-    /// 全部 rank 的 UUID(与 [`Self::ordinals`] 同长同序)
-    pub fn uuids(&self) -> &[String] {
-        &self.uuids
-    }
-    /// rank0(单卡档即唯一那张)的引擎 ordinal
-    pub fn device(&self) -> usize {
-        self.ordinals[0]
-    }
-}
-
 /// **服务面处理器视图**(`[runtime]` + `[server]` 的组装体;不是配置段)。
 ///
 /// 为什么保留这个名字:模板/工具解析/会话缺省在 `openai.rs` / `load.rs` /
@@ -354,9 +301,9 @@ pub struct ServerConfig {
     pub model_name: String,
     /// 引擎旋钮(全量配置 engine/cuda/sampling module 的显式搬运)
     pub knobs: owl_engine::EngineKnobs,
-    /// **本进程持有的设备束**(单卡 world = 1 / TP world = 2;rank 序 = 列表序)。
-    /// 单卡档 = 声明式选卡/自动挑空闲的结果;TP 档 = `runtime.tp_ordinals`。
-    pub devices: Devices,
+    /// 设备所有权面（`[parallel]` + 空闲阈值；卡锁端口由 main 回填）。
+    /// **选卡在引擎 boot 内**（2026-11-15 业务下沉 P1），server 只搬配置字段。
+    pub device_opts: owl_engine::DeviceOpts,
     /// attention 窗上限(runtime.max_seq)
     pub max_seq: usize,
     /// 预填 chunk(runtime.prefill_chunk)
@@ -430,22 +377,12 @@ impl ServerConfig {
         Ok(resolved)
     }
 
-    /// 完整解析产物 → server 形态(**选卡在这里**;`--check` 不走)。
+    /// 完整解析产物 → server 形态（设备选卡已下沉到 `EngineService::boot`）。
     pub fn from_resolved(
         resolved: ResolvedConfig,
         args: &CliArgs,
     ) -> Result<Self, String> {
-        // 选卡(S6 2026-10-17 起两条规范:单卡声明式 / TP 显式双卡;互斥):
-        //   单卡 = 声明式选卡(2026-10-16):规格 → 设备表过滤 → 剔 gpu_lock 已占
-        //          → 取首张(空规格 = 全部候选 ⇒ 自动挑空闲卡);
-        //   TP   = `runtime.tp_ordinals` 显式双卡(零自动挑卡,见 resolve_tp_devices);
-        //   命中全列日志,无候选/全被占/口径混填 = 响亮拒启。
-        let devices = resolve_devices(
-        &resolved.config.parallel,
-        resolved.config.runtime.gpu_min_free_ratio,
-    )?;
         let mut out = Self::from_config(resolved.config)?;
-        out.devices = devices;
         out.perf_dump = args.perf_dump.clone();
         Ok(out)
     }
@@ -495,8 +432,12 @@ impl ServerConfig {
                 .unwrap_or_else(|| Self::default_model_name(cfg.model.format, cfg.model.path.as_deref())),
             knobs: owl_engine::EngineKnobs::from_config(&cfg)
                 .map_err(|e| format!("engine knobs: {e}"))?,
-            // 占位:真值由 `load()` 的声明式选卡回填(设备表 + 卡锁都在那边)
-            devices: Devices::placeholder(),
+            device_opts: owl_engine::DeviceOpts {
+                parallel: cfg.parallel.clone(),
+                gpu_min_free_ratio: cfg.runtime.gpu_min_free_ratio,
+                lock_port: 0,
+                lock_role: None,
+            },
             // 上下文/块长:**单一来源 = 配置**(2026-10-20 删除 OWL_MAX_SEQ /
             // OWL_PREFILL_CHUNK —— 它们会在意图派生后再改一次 ⇒ max_seq 与
             // max_seq 失配的双源;要临时调请 `--set`）。
@@ -538,145 +479,6 @@ impl ServerConfig {
         }
         m
     }
-}
-
-/// nvidia-smi 实占(按 UUID → 空闲占比)。None = 取不到(命令失败/不可用)
-fn vram_free_ratio_map() -> Option<std::collections::HashMap<String, f64>> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=uuid,memory.free,memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let map = owl_shared::device::parse_nvidia_smi_mem(&String::from_utf8_lossy(&out.stdout));
-    if map.is_empty() {
-        None
-    } else {
-        Some(map)
-    }
-}
-
-/// **选卡总入口**(2026-10-21 起唯一真源 = `[parallel]`)。
-///
-/// 语义:
-/// - `mode = "single"` ⇒ 一条 `device`(空 = 自动挑 1 张空闲卡);
-/// - `mode = "tensor"` ⇒ 两条(空 = 自动挑 2 张);
-/// - `mode = "layer"` 由 `validate` 拒(暂未支持)。
-///
-/// **卡位只用 BDF / UUID / 名字子串**(`DeviceSpec::parse` 拒 CUDA 序号);
-/// 列表按**去重消费**解析:`["3090","3090"]` = 两张不同的 3090。
-fn resolve_devices(par: &owl_shared::config::ParallelCfg, min_free_ratio: f64) -> Result<Devices, String> {
-    use owl_shared::config::ParallelMode;
-    let specs = par.device
-        .iter()
-        .map(|s| owl_shared::device::DeviceSpec::parse(s))
-        .collect::<Result<Vec<_>, String>>()?;
-    match par.mode {
-        ParallelMode::Single => {
-            let picked = pick_distinct(&specs, 1, min_free_ratio)?;
-            eprintln!(
-                "[boot] 选卡(mode=single, device={:?}):ordinal {} [{}|{}] {}",
-                par.device, picked[0].ordinal, picked[0].bdf, picked[0].name, picked[0].uuid
-            );
-            Devices::new(vec![picked[0].ordinal], vec![picked[0].uuid.clone()])
-        }
-        ParallelMode::Tensor => {
-            let picked = pick_distinct(&specs, 2, min_free_ratio)?;
-            eprintln!(
-                "[boot] 选卡(TP 档, device={:?}):rank0 = ordinal {} → {};rank1 = ordinal {} → {}(rank 序 = 列表序;logger 前 ⇒ 裸输出)",
-                par.device, picked[0].ordinal, picked[0].uuid, picked[1].ordinal, picked[1].uuid
-            );
-            Devices::new(
-                picked.iter().map(|r| r.ordinal).collect(),
-                picked.iter().map(|r| r.uuid.clone()).collect(),
-            )
-        }
-    }
-}
-
-/// **按序取 N 张互不相同的卡**(去重消费;`specs` 空 = 自动挑空闲卡)。
-///
-/// 每条 spec 只在"本列表尚未占用"的候选里取;取不满 ⇒ 响亮 Err 并列出
-/// 设备表 / 持有者 / 内存占比 —— 卡位错误必须在 boot 前说清楚。
-fn pick_distinct(
-    specs: &[owl_shared::device::DeviceSpec],
-    n: usize,
-    min_free_ratio: f64,
-) -> Result<Vec<owl_shared::device::DeviceRow>, String> {
-    let rows = owl_cuda::ffi::device_rows()?;
-    let live = owl_shared::gpu_lock::live_locks();
-    let mem = vram_free_ratio_map();
-    let wildcard = owl_shared::device::DeviceSpec::default();
-    let mut used: Vec<String> = Vec::new();
-    let mut out: Vec<owl_shared::device::DeviceRow> = Vec::new();
-    for i in 0..n {
-        // 第 i 条 spec(空列表 ⇒ 通配 = 自动挑)
-        let spec = specs.get(i).unwrap_or(&wildcard);
-        // 候选:命中 spec 且尚未占用
-        let hit: Vec<&owl_shared::device::DeviceRow> = rows
-            .iter()
-            .filter(|r| spec.matches(r) && !used.contains(&r.uuid))
-            .collect();
-        if hit.is_empty() {
-            let table: Vec<String> = rows
-                .iter()
-                .map(|r| format!("{}[{}|{}|{}]", r.ordinal, r.bdf, r.name, r.uuid))
-                .collect();
-            return Err(format!(
-                "[parallel] device 第 {i} 项 = {} 未命中任何**未占用**设备(设备表={table:?})",
-                spec.describe()
-            ));
-        }
-        // ① 卡锁(owl 实例)
-        let free: Vec<&owl_shared::device::DeviceRow> =
-            hit.iter().copied().filter(|r| !live.iter().any(|l| l.uuid == r.uuid)).collect();
-        // ② 实占内存过滤(锁只认 owl;别的进程也要避让)
-        let free = match &mem {
-            Some(m) => {
-                let mut keep = Vec::new();
-                let mut skipped: Vec<String> = Vec::new();
-                for r in free {
-                    match m.get(&r.uuid) {
-                        Some(ratio) if *ratio < min_free_ratio => {
-                            skipped.push(format!("{} {} free={:.0}%", r.uuid, r.bdf, ratio * 100.0));
-                        }
-                        _ => keep.push(r),
-                    }
-                }
-                if !skipped.is_empty() {
-                    eprintln!(
-                        "[boot] 选卡:按实占内存跳过 {} 台(阈值 {:.0}%):{skipped:?}",
-                        skipped.len(),
-                        min_free_ratio * 100.0
-                    );
-                }
-                keep
-            }
-            None => {
-                if i == 0 {
-                    eprintln!(
-                        "[boot] 选卡:nvidia-smi 内存查询不可用 ⇒ 跳过实占内存过滤(只按卡锁避让)"
-                    );
-                }
-                free
-            }
-        };
-        let picked = free.into_iter().next().ok_or_else(|| {
-            let holders: Vec<String> = live
-                .iter()
-                .map(|l| format!("{} pid={} port={}", l.uuid, l.pid, l.port))
-                .collect();
-            format!(
-                "[parallel] device 第 {i} 项 = {} 的候选全部被占(spec 命中 {} 台;持有者={holders:?})",
-                spec.describe(),
-                hit.len()
-            )
-        })?;
-        used.push(picked.uuid.clone());
-        out.push(picked.clone());
-    }
-    Ok(out)
 }
 
 // ============================================================================
