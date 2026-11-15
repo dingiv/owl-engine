@@ -196,6 +196,12 @@ snap_max = 0
 # prefill 在边界切块并拍 Durable 快照，供同 system/tool 前缀跨会话复用。
 # 依赖 prefix_cache=true + snap_max>0；无消费者 = boot 告警（full 模板 snap_max=0 ⇒ 保持 false）。
 snap_msg_boundary = false
+# 可删图前锚点快照（缺省开；2026-11-13）。开 = 在**每张可删图的段起点**
+# 强制切块并拍一张快照（Extra 档；旧图同键 Touch，稳态≈新进图数）。
+# 解决“截图在 prompt 尾部”时尾快照落在被删页、删除只能退回 fresh 的问题；
+# 同游程只删后几张时也能复用到前几张。
+# 只在 image_evict=true + prefix_cache=true + snap_max>0 时有消费者。
+snap_evict_anchor = true
 # 消息开启标记文本覆盖（空 = 用模型 ChatFormat.im_open，如 Qwen <|im_start|>）
 # 引擎 boot 时 tokenize；扫描函数只收 open_ids 参数，不写死字面量。
 snap_msg_delim = ""

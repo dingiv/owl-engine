@@ -155,6 +155,9 @@ transient_reserve_mb = 1024
 # 图像前缀无感删除(leave-gap:删后不转 K、保留位置洞)。
 # 消息边界快照:pi 每轮重发全历史;delim/gap/span 走 full.toml 默认。
 snap_msg_boundary = true
+# 截图在 prompt 尾部时的删除锚点(2026-11-13):每张可删图段起点一张快照,
+# 把「被删图之前」的复用面兜住(否则尾删只能退回 fresh;同游程删后缀也覆盖)。
+snap_evict_anchor = true
 
 [vision]
 # 图像前缀无感删除(leave-gap)。
