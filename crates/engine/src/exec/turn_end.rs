@@ -222,62 +222,32 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
     }
 
-    /// **中断点补一张边界快照**（2026-11-03；2026-11-13 扩到 decode）。
+    /// **中断点补一张边界快照**(2026-11-03):只在"prefill 中段被取消"时动手。
     ///
-    /// 判据：
-    /// - 有已写入 token（`fed > 0`）；
-    /// - 前缀缓存与快照池都在场（否则快照没有消费者）；
-    /// - 取 `fed` 之前**最后一个整页边界**（快照键 = 边界块身份）。
-    ///
-    /// 旧实现只补 `fed < prompt_len` 的 prefill 中断；decode 中段断流时
-    /// `fed > prompt_len` 直接返回 ⇒ 已生成段没有快照，下一轮只能复用
-    /// prompt 前缀。现在 decode 也补：先把链游标推进到 boundary，再拍
-    /// `Dense` 快照；若游标已经越过 boundary，则按当前 cursor 补拍。
+    /// 判据:
+    /// - `fed < prompt_len`(仍在 prefill;已 prefill 完的 turn 走正常路径的
+    ///   `last_boundary` 快照,不需要补);
+    /// - `fed` **页对齐**(快照键 = 边界块身份;不对齐就没有边界可挂);
+    /// - 前缀缓存与快照池都在场(否则快照没有消费者)。
     async fn capture_abort_snap(&mut self, turn: u64) -> Result<()> {
         let Some(act) = self.turns.active_of(turn) else {
             return Ok(());
         };
-        let (sid, fed) = (act.session_id, act.fed);
+        let (sid, fed, prompt_len) = (act.session_id, act.fed, act.prompt_ids.len());
         let page = self.dev.pool.geom.page.max(1);
-        if fed == 0 || !self.boot.cfg.knobs.prefix_cache || self.dev.pool.snap_capacity() == 0 {
+        if fed == 0 || fed >= prompt_len || fed % page != 0 {
             return Ok(());
         }
-        let boundary = fed / page * page;
-        if boundary == 0 {
+        if !self.boot.cfg.knobs.prefix_cache || self.dev.pool.snap_capacity() == 0 {
             return Ok(());
         }
-        let full_blocks = boundary / page;
-        let current = self
-            .bank
-            .sessions
-            .get(sid)
-            .map(|s| s.chain.blocks())
-            .unwrap_or(0);
-        if current < full_blocks {
-            self.capture_gdn_snap_tail(
+        let _captured = self
+            .capture_snap_at_cursor(
                 sid,
-                boundary,
-                &[],
                 owl_store::SnapDurability::Durable,
-                true,
-                false,
                 owl_store::SnapClass::Dense,
             )
             .await?;
-        } else {
-            // 链游标已到/越过 boundary：按当前 cursor 补拍（幂等 Touch）。
-            let _ = self
-                .capture_snap_at_cursor(
-                    sid,
-                    owl_store::SnapDurability::Durable,
-                    owl_store::SnapClass::Dense,
-                )
-                .await?;
-        }
-        owl_shared::log_info!(
-            "snap",
-            "中断补拍:session={sid:#x} fed={fed} boundary={boundary} class=Dense"
-        );
         Ok(())
     }
 
@@ -293,13 +263,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// (2026-11-03 真机实测:5850 tok prompt 中断后再提交,`cache=32/5865`,
     /// prefill 5833 tok / 2.39 s —— 本应只 prefill 新增的 41 tok)。
     ///
-    /// # 记账口径 = **已算完的 `[0, fed)`**（prompt + 已生成）
+    /// # 记账口径 = **已算完的 prompt 前缀**,不含生成段
     ///
-    /// - `fed` 是 KV 推进指针(KV 有效域恒为 `[0, fed)`),prefill 每 chunk /
-    ///   decode 每步都推进它 ⇒ 中断时只登记真的算完的那一截;
-    /// - **decode 中段中断也把已生成段入账**（2026-11-13）：否则断点快照
-    ///   没有对应的链身份,`reuse_face` 只能复用 prompt 前缀。客户端重试
-    ///   若不带生成段,内容寻址自然只命中 prompt 前缀（guard/匹配不会错值）。
+    /// - `p = min(fed, prompt_len)`:`fed` 是 KV 推进指针(KV 有效域恒为
+    ///   `[0, fed)`),prefill 每 chunk / decode 每步都推进它 ⇒ 中断在
+    ///   prefill 中段也只登记真的算完的那一截;
+    /// - **生成段故意不入账**:它没交付给客户端(中断即被前端丢弃),
+    ///   而一旦写进账本,下一轮 `positions_after_splice` 会看到
+    ///   "旧账尾巴 ≠ 新 prompt" ⇒ 位置账/复用面错位。
     /// - 位置账/图像段账**同源截短** —— 否则下一轮 `unpad`/leave-gap 会按
     ///   错坐标算(`apply_image_leave_gap` 的中途落账同律)。
     ///
@@ -310,22 +281,15 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if !self.dev.pool.geom.paged {
             return Ok(());
         }
-        // 中断点也把**已生成段**入账：decode 断流时 KV 里确实有
-        // `[prompt, fed)`；只写 prompt 会让断点快照成为孤儿。
-        let written = act
-            .fed
-            .min(act.prompt_ids.len().saturating_add(act.out.len()));
+        let written = act.fed.min(act.prompt_ids.len());
         if written == 0 {
             return Ok(());
         }
-        let prompt_written = written.min(act.prompt_ids.len());
-        let generated = written.saturating_sub(prompt_written);
+        let generated = act.fed.saturating_sub(act.prompt_ids.len());
+        let mut demote_tail = None;
         let s = self.bank.sessions.session_mut(act.session_id)?;
         s.tokens.clear();
-        s.tokens.extend_from_slice(&act.prompt_ids[..prompt_written]);
-        if generated > 0 {
-            s.tokens.extend_from_slice(&act.out[..generated]);
-        }
+        s.tokens.extend_from_slice(&act.prompt_ids[..written]);
         s.cached_len = written;
         // 位置账:长度对不上 = 结构错(写错位置比不写更坏 ⇒ 清空后
         // leave-gap 自会按"位置账缺失"跳过,而不是拿错坐标算)
@@ -334,7 +298,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         } else {
             owl_shared::log_warn!(
                 "prefix",
-                "中断落账:位置账 {} < 已写入 {} ⇒ 位置账清空(session={:#x} turn={})",
+                "中断落账:位置账 {} < prompt 前缀 {} ⇒ 位置账清空(session={:#x} turn={})",
                 act.positions.len(),
                 written,
                 act.session_id,
@@ -349,7 +313,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if act.last_snap.is_some() {
             let key = act.last_snap.expect("刚判过");
             s.tail_snap = Some(key);
-            let _ = s.push_recent_tail(
+            // 与 complete 同律：最近 K 个尾保持 Dense，溢出者降 Extra。
+            demote_tail = s.push_recent_tail(
                 key,
                 self.boot.cfg.knobs.snap_msg_recent.max(1),
             );
@@ -369,15 +334,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             .map(|(_, key)| key)
             .collect();
         s.msg_snap_keys = kept_keys.clone();
-        let demote_tail = None;
         owl_shared::log_info!(
             "prefix",
-            "中断落账:session={:#x} turn={} 已写入 {} tok 入账(prompt {} + 生成 {})⇒ 交给 Release(Abort) 发布链身份",
+            "中断落账:session={:#x} turn={} prompt 前缀 {} tok 入账(生成段 {generated} tok 不入缓存)⇒ 交给 Release(Abort) 发布链身份",
             act.session_id,
             act.id,
-            written,
-            prompt_written,
-            generated
+            written
         );
         if let Some(old) = demote_tail {
             if self
@@ -485,9 +447,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 收割刷新;泄漏 = 线性下降)
         owl_shared::log_debug!(
             "vram-trace",
-            "turn end: free={:.0}MiB out={}",
+            "turn end: free={:.0}MiB out={} rope_gap={}",
             owl_shared::vram::free_bytes() as f64 / 1024.0 / 1024.0,
-            act.out.len()
+            act.out.len(),
+            act.rope_gap
         );
         // spec 轮机器状态随 act(TurnSpecState)销毁 —— 跨 turn 残留
         // 结构性消失(2026-10-10 生命周期收口;原手动 spec_drafts_host 清)

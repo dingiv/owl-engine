@@ -327,6 +327,11 @@ pub struct EngineKnobs {
     pub snap_max: usize,
     /// 消息边界快照总开关(`[pool].snap_msg_boundary`;缺省 false)
     pub snap_msg_boundary: bool,
+    /// **可删图前锚点快照**(`[pool].snap_evict_anchor`;缺省 true)。
+    /// 开 = **每张可删图段起点**(页边界)强制切块并拍快照(删除发生时从
+    /// 「被删图之前」的 GDN 态续跑;同游程删后缀也能复用到前几张)。
+    /// 关 = 旧行为(尾删退回 fresh)。
+    pub snap_evict_anchor: bool,
     /// 消息开启标记文本覆盖(空 = 模型 `ChatFormat.im_open`)
     pub snap_msg_delim: String,
     /// 后续消息边界稀疏间隔(token)
@@ -444,6 +449,7 @@ impl Default for EngineKnobs {
             max_batch: 1,
             snap_max: 4,
             snap_msg_boundary: false,
+            snap_evict_anchor: true,
             snap_msg_delim: String::new(),
             snap_msg_min_gap: 2048,
             snap_msg_recent: 4,
@@ -829,6 +835,7 @@ impl EngineKnobs {
             // 快照池容量 = 配置单源（F-03；不再读 `OWL_SNAP_MAX`）
             snap_max: cfg.pool.snap_max,
             snap_msg_boundary: cfg.pool.snap_msg_boundary,
+            snap_evict_anchor: cfg.pool.snap_evict_anchor,
             snap_msg_delim: cfg.pool.snap_msg_delim.clone(),
             snap_msg_min_gap: cfg.pool.snap_msg_min_gap,
             snap_msg_recent: cfg.pool.snap_msg_recent,

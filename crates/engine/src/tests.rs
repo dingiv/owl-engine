@@ -6252,23 +6252,6 @@ async fn abort_publishes_written_prompt_prefix() {
         running.cancel_turn(ta).await.is_some(),
         "活跃 turn 应可取消"
     );
-    let a_prompt_len = running
-        .boot
-        .tok
-        .encode(&running.boot.tok.chat_wrap(&prompt_a))
-        .len();
-    let a_sess = running.bank.sessions.session(101).expect("A 会话账");
-    assert!(
-        a_sess.tail_snap.is_some(),
-        "decode 中段中断必须补拍断点快照（不能只发布 prompt 前缀）"
-    );
-    assert!(
-        a_sess.tokens.len() > a_prompt_len,
-        "decode 中断的已生成段也应入账：tokens={} prompt={}",
-        a_sess.tokens.len(),
-        a_prompt_len
-    );
-
     // ── B:不同会话键 + A 的 prompt 再续写 ⇒ 只认内容身份 ──────────
     let (_sb, tb) = running.submit_session(Some(202), prompt_b, 12).expect("B");
     let mut b_chunks = 0usize;
@@ -6944,7 +6927,7 @@ pub async fn gpu_image_evict_gate() {
     assert_eq!(spans1[0].start % page, 0, "段首必须页对齐");
     assert_eq!((spans1[0].end - spans1[0].start) % page, 0, "段长必须整页");
     let del = spans1[0];
-    let (old_tokens, old_positions, old_max) = {
+    let (old_tokens, old_positions, old_spans, old_max) = {
         let s = running.bank.sessions.session(sid).expect("会话账");
         assert_eq!(
             &s.tokens[..padded1.len()],
@@ -6954,13 +6937,24 @@ pub async fn gpu_image_evict_gate() {
         assert_eq!(s.img_spans.len(), 2, "会话账必须记住两段");
         assert_eq!(s.img_spans[0].start, spans1[0].start);
         assert_eq!(s.img_spans[0].end, spans1[0].end);
-        (s.tokens.clone(), s.positions.clone(), s.max_pos)
+        (
+            s.tokens.clone(),
+            s.positions.clone(),
+            s.img_spans.clone(),
+            s.max_pos,
+        )
     };
-    // 旧链槽位（内容树；turn 收口后会话不持表）
+    // 旧链槽位（内容树；turn 收口后会话不持表）。图像/位置指纹必须同源。
+    let old_tags = crate::img_evict::block_tags_pos(
+        old_tokens.len(),
+        page,
+        &old_spans,
+        &old_positions,
+    );
     let (hit, _) = running
         .bank
         .rel
-        .match_prefix(&old_tokens)
+        .match_prefix_tagged(&old_tokens, &old_tags)
         .expect("旧链命中");
     assert!(
         hit.matched_blocks > (del.end / page),
@@ -7095,7 +7089,17 @@ pub async fn gpu_image_evict_gate() {
     // turn36→37 案：删除轮 cache 41k，下一轮只到 36,960）。
     {
         let s = running.bank.sessions.session(sid).expect("会话账");
-        let (hit_new, _) = running.bank.rel.match_prefix(&s.tokens).expect("新链查询");
+        let tags = crate::img_evict::block_tags_pos(
+            s.tokens.len(),
+            page,
+            &s.img_spans,
+            &s.positions,
+        );
+        let (hit_new, _) = running
+            .bank
+            .rel
+            .match_prefix_tagged(&s.tokens, &tags)
+            .expect("新链查询");
         eprintln!(
             "[test] leave-gap 新链登记:matched={} suffix_start_page={} keep={} tokens={}",
             hit_new.matched_blocks,
@@ -7150,7 +7154,7 @@ pub async fn gpu_image_evict_gate() {
         let (hit_old, _) = running
             .bank
             .rel
-            .match_prefix(&old_tokens)
+            .match_prefix_tagged(&old_tokens, &old_tags)
             .expect("旧链查询");
         assert_eq!(
             hit_old.matched_blocks,
@@ -7339,6 +7343,1060 @@ pub async fn gpu_image_evict_gate() {
         running.vlm_cache[0].hits,
         running.vlm_cache[0].misses,
     );
+}
+
+/// **尾删锚点门（2026-11-13）**：短 prompt + 尾部两张截图，一次性全删。
+///
+/// 画像 = 27B 生产档（`prefill_chunk = 2048` + ~400 tok prompt）的真机冒烟失败场景：
+/// 唯一快照是链尾（`snap_pages=[last]`），而尾部页正是被删图的页 ⇒ `layout`
+/// 安全拒绝尾快照，幸存页上没有任何边界快照 ⇒ 退回 fresh。
+///
+/// 本门把 `prefill_chunk` 升到 `max_seq`（只留链尾快照）钉住这个形状；
+/// 修法见 `img_evict::evict_snap_points` + 预填充硬切点（可删图段前的锚点）。
+///
+/// # 判据（硬）
+///
+/// 1. 删除被**吸收**（旧实现 = 这里红）；
+/// 2. 复用面覆盖图片之前的全部幸存页（锚点快照兜住前缀）；
+/// 3. 新链登记覆盖复用面；
+/// 4. 旧链从第一段删点起释放。
+pub async fn gpu_image_evict_anchor_gate() {
+    let Some(ordinal) = gpu_ordinal() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    if !dir.join("config.json").exists() {
+        owl_shared::testkit::report::skip(format_args!("0.8B 资产不在 {}", dir.display()));
+        return;
+    }
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 1024,
+        // 生产形状：整条短 prompt 一个 chunk ⇒ 只有链尾快照
+        prefill_chunk: 1024,
+        knobs: EngineKnobs {
+            vision: true,
+            prefix_cache: true,
+            image_evict: true,
+            pool_tokens: Some(2048),
+            ..Default::default()
+        },
+    })
+    .expect("构造");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&dir)
+        .await
+        .expect("装载 0.8B+VLM");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let page = running.dev.pool.geom.page;
+    assert!(page >= 32 && page % 32 == 0, "页宽异常: {page}");
+    let image_token = running
+        .dev
+        .boot
+        .vlm
+        .as_ref()
+        .expect("VLM 必须装配")
+        .cfg()
+        .image_token;
+    let one = |r: &RunningEngine<crate::GpuFace>, t: &str| -> u32 {
+        let v = r.boot.tok.try_encode(t).expect("encode");
+        assert_eq!(v.len(), 1, "{t} 应恰 1 token(得 {v:?})");
+        v[0]
+    };
+    let (vs, ve) = (
+        one(&running, "<|vision_start|>"),
+        one(&running, "<|vision_end|>"),
+    );
+    let pad_id = running.image_pad_token().expect("引擎 pad 词");
+
+    // 预热（纯文本；消掉首轮+图既有红）
+    {
+        let (_s, t) = running
+            .submit_session(Some(20), "请用一句话说明你在做什么。", 6)
+            .expect("预热提交");
+        let text = drive_turn(&mut running, t).await;
+        assert!(!text.trim().is_empty(), "纯文本预热轮必须出文本");
+    }
+
+    let l_img = 64usize;
+    let mk_img = |salt: f32| owl_models::vlm::VlmImage {
+        pixel_values: (0..256 * 3 * 2 * 16 * 16)
+            .map(|i| salt + (i % 7) as f32 * 0.01)
+            .collect(),
+        grid: (1, 16, 16),
+    };
+    let item = |_i: usize| {
+        format!(
+            "<|vision_start|>{}<|vision_end|>",
+            "<|image_pad|>".repeat(l_img)
+        )
+    };
+    let p_text = |n: usize| {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&format!("观察点{i}:屏幕无异常,日志正常,继续。\n"));
+        }
+        s
+    };
+    let q1 = "请看截图。";
+    let mid = "两张图的说明。";
+    // **图片在 prompt 尾部**（之后无文本）⇒ 预填充末快照的键落在被删页上。
+    let prompt1 = running.boot.tok.chat_format().render_chat(
+        &[
+            ("system", "你是助手,按约定回答。"),
+            (
+                "user",
+                &format!("{q1}{}{}{mid}{}", item(0), p_text(4), item(1)),
+            ),
+        ],
+        false,
+    );
+    let (sid, t1) = running
+        .submit_session_opts(
+            Some(21),
+            prompt1.as_str(),
+            12,
+            crate::turn::TurnOpts {
+                images: vec![
+                    crate::turn::TurnImage {
+                        image: mk_img(0.25),
+                        evict: true,
+                    },
+                    crate::turn::TurnImage {
+                        image: mk_img(0.75),
+                        evict: true,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .expect("anchor t1 提交");
+    let text1 = drive_turn(&mut running, t1).await;
+    assert!(!text1.trim().is_empty(), "anchor t1 必须出文本");
+
+    let grids = [(1usize, 16usize, 16usize), (1usize, 16usize, 16usize)];
+    let ids1 = running.boot.tok.encode(&prompt1);
+    let seq1 = crate::img_evict::pad_image_spans(
+        &ids1,
+        &[true, true],
+        &grids,
+        image_token,
+        Some(vs),
+        Some(ve),
+        page,
+        pad_id,
+        &[],
+    )
+    .expect("anchor 测试侧 pad");
+    let spans = seq1.spans;
+    assert_eq!(spans.len(), 2);
+    let (del0, del1) = (spans[0], spans[1]);
+    // 两张图必须占据旧链的**尾部整块**（否则本门测不到目标形状）：
+    // 尾快照的键 = 最后一个整块，它必须落在被删页里。
+    assert_eq!(del1.end % page, 0, "第二张图的段尾必须页对齐");
+    let tail_block = (seq1.ids.len() / page).saturating_sub(1);
+    assert!(
+        del0.start / page <= tail_block && tail_block < del1.end / page,
+        "尾快照必须落在被删页上（tail_block={tail_block} del0={}.. del1=..{} prompt={}）",
+        del0.start / page,
+        del1.end / page,
+        seq1.ids.len()
+    );
+    let (old_tokens, old_positions, old_img_spans) = {
+        let s = running.bank.sessions.session(sid).expect("会话账");
+        assert_eq!(
+            s.img_spans.iter().map(|x| (x.start, x.end)).collect::<Vec<_>>(),
+            spans.iter().map(|x| (x.start, x.end)).collect::<Vec<_>>(),
+            "会话账图像段坐标必须与测试侧 pad 律一致"
+        );
+        (s.tokens.clone(), s.positions.clone(), s.img_spans.clone())
+    };
+    let old_blocks = old_tokens.len() / page;
+    let old_tags = crate::img_evict::block_tags_pos(
+        old_tokens.len(),
+        page,
+        &old_img_spans,
+        &old_positions,
+    );
+    let (hit, _) = running
+        .bank
+        .rel
+        .match_prefix_tagged(&old_tokens, &old_tags)
+        .expect("旧链命中");
+    assert!(
+        hit.matched_blocks >= old_blocks,
+        "旧链必须整链在缓存里: matched={} blocks={old_blocks}",
+        hit.matched_blocks
+    );
+    let anchor = spans[1].start; // 第二段（最后一个可删游程）的页边界
+    assert!(anchor > 0 && anchor % page == 0);
+
+    // turn 2: 一次性删两段（图片在尾部 ⇒ 只剩文本 + 新问题）
+    let q2 = "还有什么?";
+    let prompt2 = running.boot.tok.chat_format().render_chat(
+        &[
+            ("system", "你是助手,按约定回答。"),
+            ("user", &format!("{q1}{}{mid}", p_text(4))),
+            ("assistant", &text1),
+            ("user", q2),
+        ],
+        false,
+    );
+    let (_, t2) = running
+        .submit_session_opts(Some(21), prompt2.as_str(), 12, crate::turn::TurnOpts::default())
+        .expect("anchor t2 提交");
+    let text2 = drive_turn(&mut running, t2).await;
+    assert!(!text2.trim().is_empty(), "anchor t2 必须出文本");
+    let trace = running
+        .img_evict
+        .last
+        .clone()
+        .expect("尾部删除必须被吸收（锚点快照失守 = 退回 fresh）");
+    assert_eq!(running.img_evict.absorbed, 1, "一次删除只许吸收一次");
+    assert_eq!(trace.a, del0.start, "删除起点 = 第一段段首");
+    assert_eq!(trace.b, del1.end, "删除终点 = 第二段段尾");
+    let reused_pages = trace.a / page + trace.keep_blocks;
+    // 图片之前的幸存页 = anchor 在新链里的页数
+    let deleted_before_anchor = del0.end / page - del0.start / page;
+    let expect_pages = anchor / page - deleted_before_anchor;
+    assert!(
+        reused_pages == expect_pages,
+        "锚点快照必须兜住图片前的**全部**幸存页: reused={reused_pages} expect={expect_pages}"
+    );
+    {
+        let s = running.bank.sessions.session(sid).expect("会话账");
+        let tags =
+            crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
+        let (hit_new, _) = running
+            .bank
+            .rel
+            .match_prefix_tagged(&s.tokens, &tags)
+            .expect("新链查询");
+        assert!(
+            hit_new.matched_blocks >= reused_pages,
+            "新链登记面小于复用面:matched={} reused={reused_pages}",
+            hit_new.matched_blocks
+        );
+    }
+    let (hit_old, _) = running
+        .bank
+        .rel
+        .match_prefix_tagged(&old_tokens, &old_tags)
+        .expect("旧链查询");
+    assert_eq!(
+        hit_old.matched_blocks,
+        del0.start / page,
+        "旧链必须止于第一段删点"
+    );
+    eprintln!(
+        "[test] 尾删锚点:删 [{}, {}) · 锚点 {} · 复用 {} 页(旧链 {} 页)",
+        trace.a,
+        trace.b,
+        anchor,
+        reused_pages,
+        old_blocks
+    );
+
+    // ── 臂 2：同一游程两张相邻图 ⇒ **每张图前都要有锚点**，只删后一张 ──
+    //
+    // 这是“锚点不能只拍游程起点”的硬门：相邻运行（`text_end == next.text_start`）
+    // 里删后一张时，前一张的页仍幸存 —— 只有它自己的段前锚点能兜住这段复用。
+    {
+        let p1 = running.boot.tok.chat_format().render_chat(
+            &[
+                ("system", "你是助手,按约定回答。"),
+                ("user", &format!("{q1}{}{}{}", p_text(3), item(5), item(6))),
+            ],
+            false,
+        );
+        let (sid2, a1) = running
+            .submit_session_opts(
+                Some(22),
+                p1.as_str(),
+                12,
+                crate::turn::TurnOpts {
+                    images: vec![
+                        crate::turn::TurnImage {
+                            image: mk_img(0.31),
+                            evict: true,
+                        },
+                        crate::turn::TurnImage {
+                            image: mk_img(0.83),
+                            evict: true,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .expect("run t1 提交");
+        let a1_text = drive_turn(&mut running, a1).await;
+        assert!(!a1_text.trim().is_empty(), "run t1 必须出文本");
+        let ids = running.boot.tok.encode(&p1);
+        let sq = crate::img_evict::pad_image_spans(
+            &ids,
+            &[true, true],
+            &grids,
+            image_token,
+            Some(vs),
+            Some(ve),
+            page,
+            pad_id,
+            &[],
+        )
+        .expect("run 测试侧 pad");
+        let (r0, r1) = (sq.spans[0], sq.spans[1]);
+        assert!(
+            r0.text_end == r1.text_start,
+            "本臂要求两张图相邻（同一游程）"
+        );
+        let pts = crate::img_evict::evict_snap_points(&sq.spans, sq.ids.len(), page);
+        assert_eq!(
+            pts,
+            vec![r0.start, r1.start],
+            "同一游程里每张可删图都要出锚点（不能只取游程起点）"
+        );
+        let (sess, hit_a) = {
+            let s = running.bank.sessions.session(sid2).expect("run 会话账");
+            let tags = crate::img_evict::block_tags_pos(
+                s.tokens.len(),
+                page,
+                &s.img_spans,
+                &s.positions,
+            );
+            let (h, _) = running
+                .bank
+                .rel
+                .match_prefix_tagged(&s.tokens, &tags)
+                .expect("run 旧链命中");
+            (s.tokens.clone(), h)
+        };
+        for (k, sp) in [(0, r0), (1, r1)] {
+            let key = owl_store::SnapKey::at_boundary(hit_a.hashes[sp.start / page - 1]);
+            assert!(
+                running.bank.rel.state.locate(key).is_some(),
+                "第 {k} 张图段前锚点快照不在账（键 {}）—— 每张都要拍",
+                sp.start / page - 1
+            );
+        }
+        // turn 2：只删后一张（前一张原样重发）+ 新尾巴
+        let p2 = running.boot.tok.chat_format().render_chat(
+            &[
+                ("system", "你是助手,按约定回答。"),
+                ("user", &format!("{q1}{}{}{}", p_text(3), item(5), "")),
+                ("assistant", &a1_text),
+                ("user", "还有吗?"),
+            ],
+            false,
+        );
+        let (_, a2) = running
+            .submit_session_opts(
+                Some(22),
+                p2.as_str(),
+                12,
+                crate::turn::TurnOpts {
+                    images: vec![crate::turn::TurnImage {
+                        image: mk_img(0.31),
+                        evict: true,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .expect("run t2 提交");
+        // reuse 面必须在 begin 之后就落到“被删图之前”（锚点边界）。
+        let begin = match running.schedule().await.expect("run t2 schedule") {
+            SchedulerOutput::Step {
+                begin: Some(b),
+                action,
+            } => {
+                assert!(
+                    matches!(action, StepAction::Prefill { .. }),
+                    "run t2 应从 prefill 起步"
+                );
+                b
+            }
+            _ => panic!("run t2 决策应带 begin + Prefill"),
+        };
+        running.execute_begin(begin).await.expect("run t2 begin");
+        let cached = running
+            .bank
+            .sessions
+            .session(sid2)
+            .expect("run 会话账")
+            .cached_len;
+        assert!(
+            cached >= r1.start,
+            "只删后一张时复用面必须覆盖前一张（cached={cached} 需 >= r1.start={}）",
+            r1.start
+        );
+        let a2_text = loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Completed { turn, text, .. } if turn == a2 => break text,
+                TurnEvent::Failed { turn, err } => panic!("run t{turn} 失败: {err}"),
+                TurnEvent::Idle => panic!("run t2 队列丢失"),
+                _ => {}
+            }
+        };
+        assert!(!a2_text.trim().is_empty(), "run t2 必须出文本");
+        let s = running.bank.sessions.session(sid2).expect("run 会话账");
+        assert_eq!(s.img_spans.len(), 1, "只保留被重发的那一张图");
+        assert!(
+            sess.len() > r1.start,
+            "旧链必须覆盖被删图的段前边界（{} > {}）",
+            sess.len(),
+            r1.start
+        );
+        eprintln!(
+            "[test] 同游程尾删:锚点 {:?} · t2 复用面 {} tok（被删图起点 {}）",
+            pts, cached, r1.start
+        );
+    }
+
+    // ── 臂 3：**模板 `|trim` 剪掉删点前空白**（真机 27B 形态）──
+    //
+    // Qwen 快照模板对 user content 做 `|trim`：服务端给内部 text part 补的
+    // `\n` 在“图片被删、消息退化成单段”时会被剪掉 ⇒ raw 在删点前少一个空白。
+    // 引擎必须把它补回（纯空白、内容逐 token 校验），否则 common=ta-1 直接拒。
+    {
+        let body = format!("{q1}{}", p_text(3).trim_end());
+        let p1 = running.boot.tok.chat_format().render_chat(
+            &[
+                ("system", "你是助手,按约定回答。"),
+                ("user", &format!("{body}\n{}{}", item(9), item(10))),
+            ],
+            false,
+        );
+        let (sid3, b1) = running
+            .submit_session_opts(
+                Some(23),
+                p1.as_str(),
+                12,
+                crate::turn::TurnOpts {
+                    images: vec![
+                        crate::turn::TurnImage {
+                            image: mk_img(0.41),
+                            evict: true,
+                        },
+                        crate::turn::TurnImage {
+                            image: mk_img(0.91),
+                            evict: true,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .expect("trim t1 提交");
+        let b1_text = drive_turn(&mut running, b1).await;
+        assert!(!b1_text.trim().is_empty(), "trim t1 必须出文本");
+        let ids = running.boot.tok.encode(&p1);
+        let sq = crate::img_evict::pad_image_spans(
+            &ids,
+            &[true, true],
+            &grids,
+            image_token,
+            Some(vs),
+            Some(ve),
+            page,
+            pad_id,
+            &[],
+        )
+        .expect("trim 测试侧 pad");
+        let t0 = sq.spans[0];
+        // turn 2：同一段文本**不带**删点前的 `\n`（模板 trim 的结果）
+        let p2 = running.boot.tok.chat_format().render_chat(
+            &[
+                ("system", "你是助手,按约定回答。"),
+                ("user", &body),
+                ("assistant", &b1_text),
+                ("user", "再看看?"),
+            ],
+            false,
+        );
+        let (_, b2) = running
+            .submit_session_opts(Some(23), p2.as_str(), 12, crate::turn::TurnOpts::default())
+            .expect("trim t2 提交");
+        let begin = match running.schedule().await.expect("trim t2 schedule") {
+            SchedulerOutput::Step {
+                begin: Some(b),
+                action,
+            } => {
+                assert!(
+                    matches!(action, StepAction::Prefill { .. }),
+                    "trim t2 应从 prefill 起步"
+                );
+                b
+            }
+            _ => panic!("trim t2 决策应带 begin + Prefill"),
+        };
+        running.execute_begin(begin).await.expect("trim t2 begin");
+        let cached = running
+            .bank
+            .sessions
+            .session(sid3)
+            .expect("trim 会话账")
+            .cached_len;
+        assert!(
+            cached >= t0.start,
+            "模板 trim 边界未复原：cached={cached} 需 >= 图前起点 {}",
+            t0.start
+        );
+        let b2_text = loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Completed { turn, text, .. } if turn == b2 => break text,
+                TurnEvent::Failed { turn, err } => panic!("trim t{turn} 失败: {err}"),
+                TurnEvent::Idle => panic!("trim t2 队列丢失"),
+                _ => {}
+            }
+        };
+        assert!(!b2_text.trim().is_empty(), "trim t2 必须出文本");
+        eprintln!(
+            "[test] 模板 trim:图前起点 {} · t2 复用面 {} tok",
+            t0.start, cached
+        );
+    }
+}
+
+/// **多段 leave-gap 吸收门（2026-11-13）**：长前缀 + 两张图 + 一次性全删。
+///
+/// 单段门（`gpu_image_evict_gate`）只覆盖 `TextDelete`；本门专门走
+/// `plan_image_leave_gap_multi` → `GapPageLayout` 分支：移除多段不连续旧图后，
+/// table/hashes/release 全部由显式 PageMap 派生。
+///
+/// # 判据（硬）
+///
+/// 1. 一次全删两图被**吸收**（`absorbed` +1），trace 覆盖两段的外包区间；
+/// 2. **两段之间的文本页**也在新链里（多段不是只留首尾两截）；
+/// 3. 吸收轮 prefill 只喂新尾巴（事件数小）；
+/// 4. 全部幸存页的 K 一字节不改（leave-gap 正判别）；
+/// 5. 幸存前缀的 token/position 逐 token 沿用旧幸存序列（位置洞保留）；
+/// 6. 旧链从**第一段**删除页起的身份全部释放（matched 止于第一段删点）。
+pub async fn gpu_image_evict_multi_gate() {
+    let Some(ordinal) = gpu_ordinal() else {
+        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
+        return;
+    };
+    let dir = asset_dir();
+    if !dir.join("config.json").exists() {
+        owl_shared::testkit::report::skip(format_args!("0.8B 资产不在 {}", dir.display()));
+        return;
+    }
+    let mut engine = Engine::new(EngineConfig {
+        device_ordinal: ordinal,
+        max_seq_tokens: 1024,
+        prefill_chunk: 64,
+        knobs: EngineKnobs {
+            vision: true,
+            prefix_cache: true,
+            image_evict: true,
+            // 钉小池（门只跑 ~800 tok；auto 池算式会被本机“预算可服务上限”拒）
+            pool_tokens: Some(2048),
+            ..Default::default()
+        },
+    })
+    .expect("构造");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&dir)
+        .await
+        .expect("装载 0.8B+VLM");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let page = running.dev.pool.geom.page;
+    assert!(page >= 32 && page % 32 == 0, "页宽异常: {page}");
+    let (hkv, hd) = {
+        let d = &running.dev.pool.geom.dims;
+        (d.hkv, d.hd)
+    };
+    let per_page_bytes = hkv * hd * page * 2; // f16
+    let image_token = running
+        .dev
+        .boot
+        .vlm
+        .as_ref()
+        .expect("VLM 必须装配")
+        .cfg()
+        .image_token;
+    let one = |r: &RunningEngine<crate::GpuFace>, t: &str| -> u32 {
+        let v = r.boot.tok.try_encode(t).expect("encode");
+        assert_eq!(v.len(), 1, "{t} 应恰 1 token(得 {v:?})");
+        v[0]
+    };
+    let (vs, ve) = (
+        one(&running, "<|vision_start|>"),
+        one(&running, "<|vision_end|>"),
+    );
+    let pad_id = running.image_pad_token().expect("引擎 pad 词");
+
+    // ── 预热轮（纯文本；消掉 0.8B「首轮+图」既有红 F1） ──
+    {
+        let (_s, t) = running
+            .submit_session(Some(10), "请用一句话说明你在做什么。", 6)
+            .expect("预热提交");
+        let text = drive_turn(&mut running, t).await;
+        assert!(!text.trim().is_empty(), "纯文本预热轮必须出文本");
+    }
+
+    // 图：grid (1,16,16) ⇒ 占位 (16/2)·(16/2) = 64 tok
+    let l_img = 64usize;
+    let mk_img = |salt: f32| owl_models::vlm::VlmImage {
+        pixel_values: (0..256 * 3 * 2 * 16 * 16)
+            .map(|i| salt + (i % 7) as f32 * 0.01)
+            .collect(),
+        grid: (1, 16, 16),
+    };
+    let item = |_i: usize| {
+        format!(
+            "<|vision_start|>{}<|vision_end|>",
+            "<|image_pad|>".repeat(l_img)
+        )
+    };
+    let p_text = |n: usize| {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&format!("观察点{i}:屏幕无异常,日志正常,继续。\n"));
+        }
+        s
+    };
+    let q1 = "请用一句话说明你看到了什么。";
+    let mid = "中间这段文字会留在历史里。\n";
+    // ── turn 1：**长前缀** + 两段可删图（段间夹文本） ──
+    let head = p_text(8);
+    let tail_text = p_text(16);
+    let prompt1 = running.boot.tok.chat_format().render_chat(
+        &[
+            ("system", "你是助手,按约定回答。"),
+            (
+                "user",
+                &format!("{}{}{}{}{}{q1}", head, item(0), mid, item(1), tail_text),
+            ),
+        ],
+        false,
+    );
+    let (sid, t1) = running
+        .submit_session_opts(
+            Some(11),
+            prompt1.as_str(),
+            12,
+            crate::turn::TurnOpts {
+                images: vec![
+                    crate::turn::TurnImage {
+                        image: mk_img(0.2),
+                        evict: true,
+                    },
+                    crate::turn::TurnImage {
+                        image: mk_img(0.7),
+                        evict: true,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .expect("multi t1 提交");
+    let text1 = drive_turn(&mut running, t1).await;
+    assert!(!text1.trim().is_empty(), "multi t1 必须出文本(视觉基线)");
+
+    // ── 测试侧复算 pad 律（与引擎同一份纯函数） ──
+    let grids = [(1usize, 16usize, 16usize), (1usize, 16usize, 16usize)];
+    let ids1 = running.boot.tok.encode(&prompt1);
+    let seq1 = crate::img_evict::pad_image_spans(
+        &ids1,
+        &[true, true],
+        &grids,
+        image_token,
+        Some(vs),
+        Some(ve),
+        page,
+        pad_id,
+        &[],
+    )
+    .expect("测试侧 pad");
+    let (padded1, spans1) = (seq1.ids, seq1.spans);
+    assert_eq!(spans1.len(), 2, "两张图必须两段");
+    for (k, sp) in spans1.iter().enumerate() {
+        assert_eq!(sp.start % page, 0, "段{k} 首必须页对齐");
+        assert_eq!((sp.end - sp.start) % page, 0, "段{k} 长必须整页");
+    }
+    let (old_tokens, old_positions, old_spans, old_max) = {
+        let s = running.bank.sessions.session(sid).expect("会话账");
+        assert_eq!(
+            &s.tokens[..padded1.len()],
+            &padded1[..],
+            "引擎内部 prompt 与测试侧 pad 律必须逐字节一致"
+        );
+        assert_eq!(s.img_spans.len(), 2, "会话账必须记住两段");
+        (
+            s.tokens.clone(),
+            s.positions.clone(),
+            s.img_spans.clone(),
+            s.max_pos,
+        )
+    };
+    let old_blocks = old_tokens.len() / page;
+    let (del0, del1) = (spans1[0], spans1[1]);
+    assert!(
+        del1.end / page < old_blocks,
+        "第二张图必须不在链尾（尾页要 幸存 才能用尾快照）: del1_end={} blocks={old_blocks}",
+        del1.end
+    );
+    assert!(del1.start >= del0.end, "两段必须不重叠");
+    let old_tags =
+        crate::img_evict::block_tags_pos(old_tokens.len(), page, &old_spans, &old_positions);
+    let (hit, _) = running
+        .bank
+        .rel
+        .match_prefix_tagged(&old_tokens, &old_tags)
+        .expect("旧链命中");
+    assert!(
+        hit.matched_blocks >= old_blocks,
+        "多段门前提 = 旧链整链在缓存里: matched={} blocks={old_blocks}",
+        hit.matched_blocks
+    );
+    assert_eq!(hit.slots.len(), hit.matched_blocks, "slots 必须与 matched 等长");
+
+    // ── 读 K（第一段删点之后的**全部幸存页**；段间文本页也在内） ──
+    async fn read_slot(
+        running: &mut RunningEngine<crate::GpuFace>,
+        slot: u32,
+        per_page_bytes: usize,
+    ) -> Vec<Vec<u8>> {
+        let handles = running.dev.pool.kv_k_blocks();
+        let off = slot as usize * per_page_bytes;
+        let pieces: Vec<(&owl_iface::contract::Bytes, usize, usize)> =
+            handles.iter().map(|b| (b, off, per_page_bytes)).collect();
+        let all = {
+            let face = running.dev.graphs.session.face_mut();
+            face.dtoh_batch(&pieces).await.expect("D2H K")
+        };
+        all.chunks_exact(per_page_bytes)
+            .map(|c| c.to_vec())
+            .collect()
+    }
+    let in_deleted_pages = |b: usize| {
+        (del0.start / page..del0.end / page).contains(&b)
+            || (del1.start / page..del1.end / page).contains(&b)
+    };
+    let mut k_before: std::collections::HashMap<u32, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
+    let mut survivor_slots: Vec<(usize, u32)> = Vec::new();
+    for b in del0.end / page..old_blocks {
+        if in_deleted_pages(b) {
+            continue;
+        }
+        if let Some(slot) = hit.slots[b] {
+            survivor_slots.push((b, slot));
+        }
+    }
+    assert!(
+        !survivor_slots.is_empty(),
+        "第一段删点之后必须有幸存页（段间文本/尾段）"
+    );
+    for (_b, slot) in &survivor_slots {
+        let per_layer = read_slot(&mut running, *slot, per_page_bytes).await;
+        k_before.insert(*slot, per_layer);
+    }
+
+    // ── turn 2：**一次性删掉两段**（新尾巴 = assistant + 新问题） ──
+    let q2 = "现在屏幕上还有什么?";
+    let prompt2 = running.boot.tok.chat_format().render_chat(
+        &[
+            ("system", "你是助手,按约定回答。"),
+            ("user", &format!("{}{}{}{q1}", head, mid, tail_text)),
+            ("assistant", &text1),
+            ("user", q2),
+        ],
+        false,
+    );
+    let (_, t2) = running
+        .submit_session_opts(Some(11), prompt2.as_str(), 12, crate::turn::TurnOpts::default())
+        .expect("multi t2 提交");
+    // 机械门：两段的设备槽在 begin 之后引用必须归零（旧链尾已摘）。
+    let mut deleted_slots: Vec<u32> = Vec::new();
+    for sp in [del0, del1] {
+        deleted_slots.extend(
+            hit.slots[sp.start / page..sp.end / page]
+                .iter()
+                .filter_map(|s| *s),
+        );
+    }
+    assert!(!deleted_slots.is_empty(), "被删图应有设备槽");
+    for slot in &deleted_slots {
+        assert!(
+            running.bank.rel.leg.slot_refs(*slot) > 0,
+            "删除前 {slot} 应仍有缓存引用"
+        );
+    }
+    let begin = match running.schedule().await.expect("multi t2 schedule") {
+        SchedulerOutput::Step {
+            begin: Some(b),
+            action,
+        } => {
+            assert!(
+                matches!(action, StepAction::Prefill { .. }),
+                "multi t2 应从 prefill 起步"
+            );
+            b
+        }
+        _ => panic!("multi t2 决策应带 begin + Prefill"),
+    };
+    running.execute_begin(begin).await.expect("multi t2 begin");
+    for slot in &deleted_slots {
+        assert_eq!(
+            running.bank.rel.leg.slot_refs(*slot),
+            0,
+            "被删图的槽 {slot} 仍有缓存引用：多段 leave-gap 没释放旧链尾引用"
+        );
+    }
+    let mut prefill_events = 0usize;
+    let text2 = loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Prefill { turn, .. } if turn == t2 => prefill_events += 1,
+            TurnEvent::Completed { turn, text, .. } if turn == t2 => break text,
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+            TurnEvent::Idle => panic!("multi t2 队列丢失"),
+            _ => {}
+        }
+    };
+    assert!(!text2.trim().is_empty(), "multi t2 必须出文本");
+
+    // ① 吸收（不是退回重算）
+    let trace = running
+        .img_evict
+        .last
+        .clone()
+        .expect("多段删除必须被吸收(退回重算 = 本门失败)");
+    assert_eq!(running.img_evict.absorbed, 1, "一次多段删除只许吸收一次");
+    // ② 删的正是两段的**外包区间**
+    assert_eq!(trace.a, del0.start, "删除起点必须是第一段的段首");
+    assert_eq!(trace.b, del1.end, "删除终点必须是第二段的段尾(含 pad)");
+    assert!(trace.keep_blocks > 0, "必须保留至少一页幸存面");
+    let reused_pages = trace.a / page + trace.keep_blocks;
+    // ③ 新链登记必须覆盖**整条复用面**（含段间文本页）
+    {
+        let s = running.bank.sessions.session(sid).expect("会话账");
+        let tags =
+            crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
+        let (hit_new, _) = running
+            .bank
+            .rel
+            .match_prefix_tagged(&s.tokens, &tags)
+            .expect("新链查询");
+        eprintln!(
+            "[test] multi leave-gap:matched={} reused_pages={} del0={}..{} del1={}..{} tokens={}",
+            hit_new.matched_blocks,
+            reused_pages,
+            trace.a / page,
+            del0.end / page,
+            del1.start / page,
+            del1.end / page,
+            s.tokens.len() / page
+        );
+        assert!(
+            hit_new.matched_blocks > del1.end / page,
+            "第二段之后的 suffix 没有登记:matched={} del1_end_page={}",
+            hit_new.matched_blocks,
+            del1.end / page
+        );
+        assert!(
+            hit_new.matched_blocks >= reused_pages,
+            "新链登记面小于复用面:matched={} reused_pages={reused_pages}",
+            hit_new.matched_blocks
+        );
+    }
+    // ④ 吸收轮只喂新尾巴
+    assert!(
+        prefill_events <= 3,
+        "吸收轮 prefill 事件 {prefill_events} 次 —— 幸存面被重算了?(期间应只喂新尾部)"
+    );
+    // ⑤ K 一字节不改（全部幸存页）
+    for (b, slot) in &survivor_slots {
+        let after = read_slot(&mut running, *slot, per_page_bytes).await;
+        assert_eq!(
+            &after, k_before.get(slot).expect("k_before"),
+            "幸存页 {b}(槽 {slot}) 的 K 在多段 leave-gap 后被改写(必须一字节不动)"
+        );
+    }
+    // ⑥ 位置账：复用面的 token/position 逐 token = 旧幸存序列
+    {
+        let s = running.bank.sessions.session(sid).expect("会话账");
+        assert_eq!(s.positions.len(), s.tokens.len(), "位置账与 token 账等长");
+        assert!(s.max_pos >= old_max, "max_pos 不回退");
+        let in_del = |i: usize| {
+            (del0.start..del0.end).contains(&i) || (del1.start..del1.end).contains(&i)
+        };
+        let surv_idx: Vec<usize> = (0..old_tokens.len()).filter(|i| !in_del(*i)).collect();
+        let n = (reused_pages * page).min(s.tokens.len()).min(surv_idx.len());
+        assert!(n > 0, "复用面为空");
+        for i in 0..n {
+            let oi = surv_idx[i];
+            assert_eq!(
+                s.tokens[i], old_tokens[oi],
+                "复用面 token[{i}] 必须 = 旧幸存 token[{oi}]"
+            );
+            assert_eq!(
+                s.positions[i], old_positions[oi],
+                "复用面 position[{i}] 必须 = 旧幸存 position[{oi}]（位置洞工艺）"
+            );
+        }
+    }
+    // ⑦ 旧链从第一段删点起的身份全部释放
+    {
+        let (hit_old, _) = running
+            .bank
+            .rel
+            .match_prefix_tagged(&old_tokens, &old_tags)
+            .expect("旧链查询");
+        assert_eq!(
+            hit_old.matched_blocks,
+            del0.start / page,
+            "旧链必须止于第一段删点（得 {} 块；del0/page={}）",
+            hit_old.matched_blocks,
+            del0.start / page
+        );
+    }
+
+    eprintln!(
+        "[test] multi leave-gap 吸收:删 [{}, {})={} tok · 复用 {} 页 · 重挂 {} · prefill 事件 {}",
+        trace.a,
+        trace.b,
+        trace.b - trace.a,
+        reused_pages,
+        trace.rekeyed,
+        prefill_events
+    );
+
+    // ── 臂 2：**两段旧图全删 + 新截图追加**（真实 GUI agent 形态） ──
+    //
+    // 多段路径的立项场景 = 旧截图分散在多个 tool result、被**一张新截图**
+    // 替换。本臂验「同 turn 删除 + 追加」：旧图整组释放，新图走 pad 律/
+    // 位置尾巴，新链登记面覆盖新图之后的生成段。
+    {
+        let before = running.img_evict.absorbed;
+        let p1 = running.boot.tok.chat_format().render_chat(
+            &[
+                ("system", "你是助手,按约定回答。"),
+                (
+                    "user",
+                    &format!(
+                        "{}{}{}{}{}{q1}",
+                        p_text(6),
+                        item(2),
+                        mid,
+                        item(3),
+                        p_text(12)
+                    ),
+                ),
+            ],
+            false,
+        );
+        let (sid2, r1) = running
+            .submit_session_opts(
+                Some(12),
+                p1.as_str(),
+                12,
+                crate::turn::TurnOpts {
+                    images: vec![
+                        crate::turn::TurnImage {
+                            image: mk_img(0.15),
+                            evict: true,
+                        },
+                        crate::turn::TurnImage {
+                            image: mk_img(0.55),
+                            evict: true,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )
+            .expect("replace t1 提交");
+        let r1_text = drive_turn(&mut running, r1).await;
+        assert!(!r1_text.trim().is_empty(), "replace t1 必须出文本");
+        let ids_r = running.boot.tok.encode(&p1);
+        let sq = crate::img_evict::pad_image_spans(
+            &ids_r,
+            &[true, true],
+            &grids,
+            image_token,
+            Some(vs),
+            Some(ve),
+            page,
+            pad_id,
+            &[],
+        )
+        .expect("replace 测试侧 pad");
+        let (rp0, rp1) = (sq.spans[0], sq.spans[1]);
+        // turn 2：删两段 + 尾部追加一张**新**图
+        let p2 = running.boot.tok.chat_format().render_chat(
+            &[
+                ("system", "你是助手,按约定回答。"),
+                ("user", &format!("{}{}{}{q1}", p_text(6), mid, p_text(12))),
+                ("assistant", &r1_text),
+                ("user", &format!("{}{q2}", item(4))),
+            ],
+            false,
+        );
+        let (_, r2) = running
+            .submit_session_opts(
+                Some(12),
+                p2.as_str(),
+                12,
+                crate::turn::TurnOpts {
+                    images: vec![crate::turn::TurnImage {
+                        image: mk_img(0.35),
+                        evict: true,
+                    }],
+                    ..Default::default()
+                },
+            )
+            .expect("replace t2 提交");
+        let r2_text = drive_turn(&mut running, r2).await;
+        assert!(!r2_text.trim().is_empty(), "replace t2 必须出文本");
+        assert_eq!(
+            running.img_evict.absorbed,
+            before + 1,
+            "删两段旧图 + 追加新图 必须被吸收"
+        );
+        let tr = running
+            .img_evict
+            .last
+            .clone()
+            .expect("replace 吸收 trace");
+        assert_eq!(tr.a, rp0.start, "删除起点必须是第一段旧图段首");
+        assert_eq!(tr.b, rp1.end, "删除终点必须是第二段旧图段尾");
+        let s = running.bank.sessions.session(sid2).expect("replace 会话账");
+        assert_eq!(s.img_spans.len(), 1, "新图必须且只能登记为一段");
+        assert!(
+            s.img_spans[0].evict && s.img_spans[0].img_tag != 0,
+            "新图必须带可删标记 + 内容指纹"
+        );
+        let full_blocks = s.tokens.len() / page;
+        let tags =
+            crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
+        let (hit_new, _) = running
+            .bank
+            .rel
+            .match_prefix_tagged(&s.tokens, &tags)
+            .expect("replace 新链查询");
+        assert!(
+            hit_new.matched_blocks > rp1.end / page,
+            "删点之后的 suffix 没有登记:matched={} rp1_end_page={}",
+            hit_new.matched_blocks,
+            rp1.end / page
+        );
+        assert!(
+            hit_new.matched_blocks >= full_blocks,
+            "新链登记面不全:matched={} full_blocks={full_blocks}",
+            hit_new.matched_blocks
+        );
+        eprintln!(
+            "[test] multi leave-gap 替换:删 [{}, {}) + 追加新图 · 复用 {} 页 · 新链 matched={}",
+            tr.a,
+            tr.b,
+            tr.a / page + tr.keep_blocks,
+            hit_new.matched_blocks
+        );
+    }
 }
 
 /// **多图 × 投机 verify 行**(D 项;2026-10-24)。

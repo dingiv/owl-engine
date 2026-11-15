@@ -1938,12 +1938,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
     /// prefill 边界的快照档:末边界/消息边界(按 `msg_snap_classes`)→
     /// 否则 Extra。不是 pin —— 只决定淘汰顺序。
+    ///
+    /// **可删图锚点（`evict_snaps`）恒落 `Extra`**（2026-11-13）：它们是
+    /// 删除发生时的恢复面，但**不是长期资产** —— 不进 `msg_snap_keys` /
+    /// `tail_snap` / `recent_tails`，也不进 `Protected`；槽位/宿主/盘紧张时
+    /// 与其它 Extra 一样按 LRU 先走。`fed == prompt_len` 的末边界仍走 Dense。
     fn prefill_snap_class(&self, fed: usize) -> owl_store::SnapClass {
         let Ok(act) = self.turns.active() else {
             return owl_store::SnapClass::Extra;
         };
         if fed >= act.prompt_ids.len() {
             return owl_store::SnapClass::Dense;
+        }
+        if act.evict_snaps.binary_search(&fed).is_ok() {
+            return owl_store::SnapClass::Extra;
         }
         match act.msg_snaps.binary_search(&fed) {
             Ok(i) => act
@@ -2178,14 +2186,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         //
         // 逐块**图像指纹**必须在块外取(下面要 `get_mut` 会话账);来源 = 会话
         // spans(已在 submit 侧按像素盖章)⇒ 游标 / 重放 / 增量登记三处同源。
-        let mut tags = self.turn_block_tags(sid, page);
-        // `tail`（spec 轮内已提交未入 out 的 token）也是链的一部分；尾部
-        // 一定是生成文本，tag=0。补齐到 full_blocks，避免 advance 因
-        // `seg_tags.len() < n` 响亮拒（2026-11-13）。
-        //
-        // 纯文本链 `block_tags` 返回空 = 无图像身份，`advance` 接受空
-        // 指纹；只有"确有图像 tag 但长度不够"才补零，避免每块白分配
-        // 全链 tag 向量。
+        let mut tags = self.turn_block_tags_with_tail(sid, page, tail);
+        // `tail`（spec 轮内已提交未入 out 的 token）也是链的一部分；
+        // `turn_block_tags_with_tail` 已按 `next_rope_pos` 补齐位置签名。
+        // 仍不足整块 = 结构账未齐，补零避免 advance 因长度拒；纯文本链
+        // `block_tags` 返回空 = 无图像/位置身份，`advance` 接受空指纹。
         if !tags.is_empty() && tags.len() < full_blocks {
             tags.resize(full_blocks, 0);
         }

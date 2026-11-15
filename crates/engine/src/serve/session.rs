@@ -52,16 +52,15 @@ pub struct AgentSession {
     pub block_table: Vec<u32>,
     /// **逐块内容身份**(与 `block_table` 对齐;2026-11-13 leave-gap 同会话复用)。
     ///
-    /// 长度 = `chain.blocks()`(完整块数)。只为 **gapped 链** 做
-    /// session-local hit:leave-gap 后的新链不发布到共享树(位置基准不在身份里
-    /// ⇒ 跨会话会静默错值),但同一会话的 `block_table` 仍持有 prefix+suffix
-    /// 的槽 ⇒ 用这份身份绕过树直接复用。普通档仍以 `match_prefix` 为准。
+    /// 长度 = `chain.blocks()`(完整块数)。leave-gap 后的 gapped 链会把
+    /// **非紧凑 position 签名**折进块身份（`block_tags_pos`），因此它也能
+    /// 安全发布到共享树；这里仍保留 session-local 快路：同一 turn 内表还在手
+    /// 时直接用 `block_hashes`，少一次树查询。
     pub block_hashes: Vec<owl_store::ChainHash>,
     /// **本会话是否持有一条 gapped 链**（leave-gap 后；2026-11-13）。
     ///
-    /// gapped 链不发布到共享树，`block_table` 是它唯一的设备槽账；turn 末
-    /// 本字段只表示**当前 turn 内**持有 leave-gap 链；turn 末表一律释放，
-    /// 下一轮按内容/快照重新 reuse，不保留跨 turn 表引用。
+    /// 只表示**当前 turn 内**持有 leave-gap 链；turn 末表一律释放，下一轮按
+    /// 内容+位置签名重新 reuse，不保留跨 turn 表引用。
     pub local_chain: bool,
     /// **图像段账**(前缀无感删除;2026-10-23):上轮 prompt 里各图像占位段
     /// (含页对齐 pad)的会话坐标 + 网格 + 客户端可删标记。

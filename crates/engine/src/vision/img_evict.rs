@@ -131,6 +131,138 @@ impl DeletionPlan {
     }
 }
 
+/// **多段 leave-gap 的页映射**（2026-11-13）。
+///
+/// 删除计划编译成显式页表，后续 hash/table/release/snapshot 都只读这一份，
+/// 不再各自用 `survivors/common_pages/used_len` 反推坐标。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GapPageLayout {
+    /// 新序列前 `used_pages` 页对应的旧页号（升序、无重复）。
+    pub survivors: Vec<usize>,
+    /// 新链第一个**需要重算身份**的页 = 第一段删除的页号。
+    pub first_changed_page: usize,
+    /// 按 token 公共前缀得到的安全复用上限（页）。
+    pub target_pages: usize,
+    /// 实际复用页数（再受 GDN 快照边界约束）。
+    pub used_pages: usize,
+    /// GDN 恢复点：旧尾快照，或某个旧边界上的快照。
+    pub restore: GapRestore,
+}
+
+/// 多段删除后的 GDN 恢复来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapRestore {
+    /// 旧链末尾的 Dense 尾锚点（仅当全部幸存页都保留）。
+    TailSnapshot,
+    /// 旧链某个边界上的快照（含被删页内的边界也可：GDN 态包含“删掉的记忆”）。
+    OldBoundary(usize),
+}
+
+impl GapPageLayout {
+    /// 新链身份可从旧链直接沿用的页数。
+    pub fn hash_prefix_pages(&self) -> usize {
+        self.used_pages.min(self.first_changed_page)
+    }
+
+    /// 需要按新 prompt 重算身份的页区间。
+    pub fn hash_recompute_pages(&self) -> std::ops::Range<usize> {
+        let from = self.hash_prefix_pages();
+        from..self.used_pages
+    }
+}
+
+/// **编译多段删除计划**（纯函数，无设备/无 store）。
+///
+/// `snap_pages` = 旧链上有快照的边界页号（升序）；`tail_snap` = 旧链末尾
+/// 是否有 Dense 尾锚点。返回 `None` = 没有可用恢复点（调用方退回普通复用/重建）。
+///
+/// 关键约束：
+/// - `used_pages` 永远不超过 `target_pages`（token 公共前缀）；
+/// - 尾快照**只在全部幸存页都保留时**可用；否则 GDN 态会包含缓存面之外的 token；
+/// - 其余快照按“覆盖的幸存页数”截断 `used_pages`，绝不让恢复点越过缓存面。
+pub fn layout_multi_delete(
+    old_blocks: usize,
+    page: usize,
+    ranges: &[TextDelete],
+    common_tokens: usize,
+    snap_pages: &[usize],
+    tail_snap: bool,
+) -> Result<Option<GapPageLayout>, String> {
+    if page == 0 || old_blocks == 0 || ranges.is_empty() {
+        return Ok(None);
+    }
+    let old_len = old_blocks
+        .checked_mul(page)
+        .ok_or_else(|| "layout_multi_delete: old_blocks×page 溢出".to_string())?;
+    let mut cursor = 0usize;
+    for r in ranges {
+        if r.a >= r.b || r.a % page != 0 || r.b % page != 0 || r.b > old_len {
+            return Err(format!(
+                "layout_multi_delete: 删除区间 [{},{}) 非整页/越界(old={old_len}, page={page})",
+                r.a, r.b
+            ));
+        }
+        if r.a < cursor {
+            return Err(format!(
+                "layout_multi_delete: 删除区间 [{},{}) 重叠/未升序(cursor={cursor})",
+                r.a, r.b
+            ));
+        }
+        cursor = r.b;
+    }
+    let deleted: Vec<(usize, usize)> = ranges.iter().map(|r| (r.a / page, r.b / page)).collect();
+    let mut survivors = Vec::with_capacity(old_blocks);
+    let mut d = 0usize;
+    for b in 0..old_blocks {
+        while d < deleted.len() && deleted[d].1 <= b {
+            d += 1;
+        }
+        if d < deleted.len() && deleted[d].0 <= b && b < deleted[d].1 {
+            continue;
+        }
+        survivors.push(b);
+    }
+    if survivors.is_empty() {
+        return Ok(None);
+    }
+    let target_pages = survivors.len().min(common_tokens / page);
+    if target_pages == 0 {
+        return Ok(None);
+    }
+    let first_changed_page = deleted[0].0;
+
+    // 尾快照代表“旧链全部幸存页 + 旧生成尾”。只有**最后一个旧页仍幸存**时才
+    // 对齐：若尾部页被删，尾快照的 GDN 态包含新 prefix 之外的已删 token。
+    if tail_snap && target_pages == survivors.len() && survivors.last() == Some(&(old_blocks - 1)) {
+        return Ok(Some(GapPageLayout {
+            survivors,
+            first_changed_page,
+            target_pages,
+            used_pages: target_pages,
+            restore: GapRestore::TailSnapshot,
+        }));
+    }
+
+    // 非尾快照必须是**幸存页**上的边界：落到被删页 = GDN 态包含新 prefix
+    // 之外的 token（即使它后面没有幸存页，也已经“算过头”）。
+    let mut best: Option<(usize, usize)> = None; // (覆盖幸存页数, 旧页号)
+    for (idx, &p) in survivors.iter().enumerate().take(target_pages) {
+        if snap_pages.binary_search(&p).is_ok() {
+            best = Some((idx + 1, p));
+        }
+    }
+    let Some((used_pages, old_page)) = best else {
+        return Ok(None);
+    };
+    Ok(Some(GapPageLayout {
+        survivors,
+        first_changed_page,
+        target_pages,
+        used_pages,
+        restore: GapRestore::OldBoundary(old_page),
+    }))
+}
+
 /// 图像占位游程(`[start, end)`,**仅 image token 本身**,不含标记)。
 fn image_runs(ids: &[u32], image_token: u32) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
@@ -658,6 +790,194 @@ fn fold_tag(acc: u64, tag: u64) -> u64 {
 
 /// **位置三元组**(与 `MropeCfg` 的 `[T,H,W]` 同序;i32 足够覆盖 262k)。
 pub type Pos3 = [i32; 3];
+
+/// **带位置签名的块指纹**（2026-11-13）。
+///
+/// 前缀链的内容身份原先只有 token + 图像指纹；两条 token 完全相同、但
+/// position 基准不同的链（leave-gap 后的非紧凑序列 vs 普通紧凑序列）会
+/// 撞成同一个 `ChainHash` ⇒ 跨会话复用错 K。这里把**非紧凑位置**折进
+/// 每个整块的 tag：
+///
+/// - 位置紧凑（`p[i] == i`）⇒ 返回原 [`block_tags`]，老链身份逐字节不变；
+/// - 位置非紧凑 ⇒ 每块 tag 混入该块内逐 token 的 `(index, [T,H,W])`；
+///   父链哈希已包含前块签名，所以任意前缀位置不同都会断开命中。
+///
+/// 调用方必须对**同一条链**使用同一份 positions（submit 的 `turn.positions`、
+/// 会话账的 `s.positions`、活跃 turn 的 `act.positions`）。
+pub fn block_tags_pos(
+    token_len: usize,
+    page: usize,
+    spans: &[ImgSpan],
+    positions: &[Pos3],
+) -> Vec<u64> {
+    let mut tags = block_tags(token_len, page, spans);
+    let n = if page == 0 { 0 } else { token_len / page };
+    if n == 0 || positions.len() < n * page {
+        return tags;
+    }
+    let positioned = positions
+        .iter()
+        .take(n * page)
+        .enumerate()
+        .any(|(i, p)| *p != [i as i32; 3]);
+    if !positioned {
+        return tags;
+    }
+    if tags.is_empty() {
+        tags.resize(n, 0);
+    }
+    for (b, slot) in tags.iter_mut().enumerate().take(n) {
+        let mut acc = *slot;
+        let mut block_positioned = false;
+        for (off, p) in positions[b * page..(b + 1) * page].iter().enumerate() {
+            let idx = b * page + off;
+            // 只把**本块内确实离开紧凑坐标**的 token 折进去：洞之前的块
+            // 保持旧身份（共享前缀不因后面的洞而失效）。
+            if *p == [idx as i32; 3] {
+                continue;
+            }
+            block_positioned = true;
+            let sig = (p[0] as u32 as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(17)
+                ^ (p[1] as u32 as u64)
+                    .wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+                    .rotate_left(31)
+                ^ (p[2] as u32 as u64)
+                    .wrapping_mul(0x1656_67B1_9E37_79F9)
+                    .rotate_left(47)
+                ^ (idx as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+                | 1;
+            acc = fold_tag(acc, sig);
+        }
+        if block_positioned {
+            *slot = acc;
+        }
+    }
+    tags
+}
+
+/// **可删图前的快照锚点**（2026-11-13，纯函数）。
+///
+/// 返回**每一张 `evict` 标记图段起点**的页边界（升序、去重）。
+///
+/// # 为什么需要它
+///
+/// 真实形态“截图在 prompt 尾部”下，预填充末快照的键落在**被删页**上
+/// （`prompt_end` 的最后一个整块就是那页截图）⇒ `layout_multi_delete` 与
+/// 单段路径都会安全拒绝尾快照，幸存页上又没有边界快照 ⇒ 整段退回 fresh。
+/// 在每张可删图的段起点拍一张快照，删除发生时就能从**被删图之前**
+/// 的那个 GDN 态续跑；同一游程里只删后几张时，也能复用到前几张的页。
+///
+/// # 语义与成本
+///
+/// - 锚点只对 `evict` 标记的图生效 —— 未标记的图是引擎“不得自作主张”的红线；
+/// - 页边界由 pad 律保证（`span.start` 已页对齐）；`0` 与 `>= prompt_len`
+///   的点没有可复用前缀 / 不在链内，直接丢弃；
+/// - 稳态成本 ≈ **本轮新进 prompt 的可删图数**：旧图的锚点键是内容身份，
+///   前缀命中时 prefill 不会跨过那些 offset ⇒ 同键 Touch，不占新槽；
+/// - 设备/宿主/盘的快照预算仍由 `admit_snap`（`snap_max`/`snap_session_cap`/
+///   `SnapClass`）兜底 —— 满了就跳过，不会静默错值。
+pub fn evict_snap_points(spans: &[ImgSpan], prompt_len: usize, page: usize) -> Vec<usize> {
+    if page == 0 || spans.is_empty() || prompt_len <= page {
+        return Vec::new();
+    }
+    let mut pts: Vec<usize> = spans
+        .iter()
+        .filter(|sp| sp.evict)
+        .map(|sp| sp.start / page * page)
+        .filter(|&a| a > 0 && a < prompt_len)
+        .collect();
+    pts.sort_unstable();
+    pts.dedup();
+    pts
+}
+
+/// **模板 trim 边界复原**（2026-11-15，纯函数）。
+///
+/// # 病灶（真机定谳）
+///
+/// Qwen 系快照模板对消息内容做 `|trim`（`chat_template.jinja`）；服务端给
+/// 多段 content 的 text part 补的 `\n` 只在**内部 part 边界**幸存。于是
+/// “截图在消息尾部”的形态里：
+/// - turn N：text part 被补 `…。\n`，随后才是图片；
+/// - turn N+1：图片被删、同一段文本退化成单一 content ⇒ `|trim` 把 `\n`
+///   剪掉 ⇒ raw 在删点前**少一个空白 token**，`common = ta-1`，
+///   删除识别/锚点全部失配。
+///
+/// 这里在识别之前把旧前缀里的这段空白**插回 raw**（只允许纯空白、只发生在
+/// 可删图段的起点之前、且跳过空白后的下一个 token 必须与旧幸存序列一致）。
+/// raw 因此回到规范形式，后续识别/重建/位置账全部走原路径。
+///
+/// `is_ws` = 单 token 是否**可见空白**（特殊 token 解码为空 ⇒ 必须返回 false）。
+/// 返回插入的 token 数；`None` = 不需要/不能安全复原。
+pub fn restore_trimmed_prefix(
+    old_text: &[u32],
+    input: &mut Vec<u32>,
+    spans: &[ImgSpan],
+    is_ws: impl Fn(u32) -> bool,
+) -> Option<usize> {
+    const MAX_TRIM: usize = 8;
+    if spans.is_empty() || old_text.is_empty() || input.is_empty() {
+        return None;
+    }
+    let n = old_text.len().min(input.len());
+    let mut c = 0usize;
+    while c < n && old_text[c] == input[c] {
+        c += 1;
+    }
+    if c == 0 || c == n {
+        return None; // 无分歧 / 一方是另一方前缀
+    }
+    // 候选 1：全删（旧文本去掉**所有**可删段）。
+    let all_deleted: Option<Vec<u32>> = {
+        let mut out: Vec<u32> = Vec::with_capacity(old_text.len());
+        let mut cursor = 0usize;
+        let mut ok = true;
+        for sp in spans.iter().filter(|sp| sp.evict) {
+            let (lo, hi) = (sp.text_start, sp.text_end);
+            if lo < cursor || hi > old_text.len() || lo >= hi {
+                ok = false;
+                break;
+            }
+            out.extend_from_slice(&old_text[cursor..lo]);
+            cursor = hi;
+        }
+        if ok {
+            out.extend_from_slice(&old_text[cursor..]);
+            Some(out)
+        } else {
+            None
+        }
+    };
+    for sp in spans.iter().filter(|sp| sp.evict) {
+        let ta = sp.text_start;
+        if ta <= c || ta - c > MAX_TRIM || ta > old_text.len() {
+            continue;
+        }
+        if !old_text[c..ta].iter().all(|&t| is_ws(t)) {
+            continue;
+        }
+        let k = ta - c;
+        // 单删这一段 / 全删：跳过空白后的下一个 token 必须与旧幸存序列一致。
+        let single_match = sp.text_end <= old_text.len()
+            && old_text[sp.text_end..]
+                .first()
+                .zip(input.get(c))
+                .is_some_and(|(a, b)| a == b);
+        let all_match = all_deleted
+            .as_ref()
+            .and_then(|p| p.get(c + k).zip(input.get(c)))
+            .is_some_and(|(a, b)| a == b);
+        if !single_match && !all_match {
+            continue;
+        }
+        let inserted: Vec<u32> = old_text[c..ta].to_vec();
+        input.splice(c..c, inserted.iter().copied());
+        return Some(k);
+    }
+    None
+}
 
 /// **紧凑位置账**:从 token 0 起按 m-RoPE 重新计算(普通 turn / 整段重建)。
 pub fn compact_positions(
@@ -1212,7 +1532,7 @@ mod tests {
         let e2 = ids.len();
         ids.extend((0..32).map(|i| 300 + i));
 
-        let mut spans = vec![
+        let spans = vec![
             ImgSpan {
                 start: s1,
                 end: e1,
@@ -1273,6 +1593,250 @@ mod tests {
         // 空 tags 只能命中纯文本块。失败模式退化为"少复用",而不是"错用旧图"。
         let hit_plain = kv.match_prefix_tagged(&ids, &[]);
         assert_eq!(hit_plain.matched_blocks, 1, "空 tags 只能复用纯文本块(宁少不错)");
+    }
+
+    /// **可删图锚点门（2026-11-13）**：每张 `evict` 图段起点都要出锚点
+    /// （同一游程内也一样 —— 只删后几张时才能复用到前几张的页）；未标记图、
+    /// 首块之前、链外、`page = 0` 一律不出点。
+    #[test]
+    fn evict_snap_points_cover_each_marked_image() {
+        let page = 32usize;
+        let span = |start: usize, len: usize, text_start: usize, text_end: usize, evict: bool| {
+            ImgSpan {
+                start,
+                end: start + len,
+                text_start,
+                text_end,
+                pad_before: 0,
+                pad_after: 0,
+                grid: (1, 8, 8),
+                evict,
+                img_tag: if evict { 1 } else { 0 },
+            }
+        };
+        // 无图 / 全部未标记 ⇒ 不拍
+        assert!(evict_snap_points(&[], 320, page).is_empty());
+        assert!(evict_snap_points(&[span(64, 64, 32, 96, false)], 320, page).is_empty());
+        // 一张可删图 ⇒ 段起点
+        assert_eq!(
+            evict_snap_points(&[span(64, 64, 32, 96, true)], 320, page),
+            vec![64]
+        );
+        // 同游程两段（无文本间隔）⇒ **各段起点都出点**（只删后一张时，
+        // 前一张的页仍可复用）；顺序升序。
+        let run = [
+            span(64, 64, 32, 96, true),
+            span(160, 64, 96, 160, true),
+        ];
+        assert_eq!(evict_snap_points(&run, 320, page), vec![64, 160]);
+        // 中间夹未标记图 ⇒ 只出可删的那两张
+        let mixed = [
+            span(32, 32, 16, 48, true),
+            span(64, 64, 48, 112, false),
+            span(160, 64, 112, 176, true),
+        ];
+        assert_eq!(evict_snap_points(&mixed, 320, page), vec![32, 160]);
+        // 首块之前 / 链外 ⇒ 丢弃（0 边界没有可复用前缀；96 == prompt_len 不在链内）
+        assert_eq!(
+            evict_snap_points(
+                &[span(0, 64, 0, 64, true), span(96, 64, 64, 128, true)],
+                96,
+                page
+            ),
+            Vec::<usize>::new(),
+            "0 与 >= prompt_len 的锚点都不可用"
+        );
+        // prompt 太短 / page 关 ⇒ 空
+        assert!(evict_snap_points(&[span(64, 64, 32, 96, true)], 64, page).is_empty());
+        assert!(evict_snap_points(&[span(64, 64, 32, 96, true)], 320, 0).is_empty());
+    }
+
+    /// **模板 trim 边界复原门（2026-11-15）**：删点前被模板 `|trim` 剪掉的
+    /// 尾部空白可以补回；内容改动、未标记图、图仍在场一律不猜。
+    #[test]
+    fn restore_trimmed_prefix_only_bridges_whitespace() {
+        let ws = 7u32; // 测试用“空白” token（谓词注入，不依赖 tokenizer）
+        let is_ws = |t: u32| t == ws;
+        let (text, img, tail) = ([10u32, 11, 12], [20u32, 21, 22, 23], [30u32, 31]);
+        let mut old: Vec<u32> = text.to_vec();
+        old.push(ws);
+        old.extend_from_slice(&img);
+        old.extend_from_slice(&tail);
+        let span = ImgSpan {
+            start: 4,
+            end: 8,
+            text_start: 4,
+            text_end: 8,
+            pad_before: 0,
+            pad_after: 0,
+            grid: (1, 8, 8),
+            evict: true,
+            img_tag: 1,
+        };
+        // ① 图片被删 + 模板剪掉空白 ⇒ 补回 1 个空白
+        let mut raw = text.to_vec();
+        raw.extend_from_slice(&tail);
+        assert_eq!(
+            restore_trimmed_prefix(&old, &mut raw, &[span], is_ws),
+            Some(1)
+        );
+        assert_eq!(raw, [10, 11, 12, ws, 30, 31], "空白插回删点之前");
+        // ② 内容 token 改了（不是纯空白）⇒ 不插
+        let mut edited = [10u32, 11, 99].to_vec();
+        edited.extend_from_slice(&tail);
+        assert_eq!(restore_trimmed_prefix(&old, &mut edited, &[span], is_ws), None);
+        // ③ 未标记的图 ⇒ 引擎不自作主张
+        let mut unmarked = span;
+        unmarked.evict = false;
+        let mut raw2 = text.to_vec();
+        raw2.extend_from_slice(&tail);
+        assert_eq!(restore_trimmed_prefix(&old, &mut raw2, &[unmarked], is_ws), None);
+        // ④ 图片仍在场（raw 在删点处是图片首 token）⇒ 不插
+        let mut keep = text.to_vec();
+        keep.extend_from_slice(&img);
+        keep.extend_from_slice(&tail);
+        assert_eq!(restore_trimmed_prefix(&old, &mut keep, &[span], is_ws), None);
+        // ⑤ 只复原**第一个分歧**处的空白：模板 `|trim` 只会剪消息内容的
+        //    外尾部 ⇒ 真实形态只有一个缺口；后续缺口交给识别拒绝（宁少不错）。
+    }
+
+    /// **多段 leave-gap 页映射门（2026-11-13）**：显式 PageMap 必须把
+    /// 公共前缀不足、尾快照越界、最后一张图在尾部三种边界都收干净。
+    #[test]
+    fn multi_delete_layout_bounds_prefix_and_snapshot() {
+        let page = 32usize;
+        let old_blocks = 10usize;
+        let del = |a: usize, b: usize| TextDelete {
+            a,
+            b,
+            text_a: a,
+            text_b: b,
+        };
+        let ranges = vec![del(2 * page, 3 * page), del(5 * page, 6 * page)];
+
+        // ① 公共前缀 < 第一段删除页：只能复用洞前页，hash 不得越过 used。
+        let l = layout_multi_delete(old_blocks, page, &ranges, 2 * page - 1, &[0], false)
+            .expect("layout")
+            .expect("应可复用第 0 页");
+        assert_eq!(l.target_pages, 1);
+        assert_eq!(l.used_pages, 1);
+        assert_eq!(l.first_changed_page, 2);
+        assert_eq!(l.hash_prefix_pages(), 1);
+        assert_eq!(l.hash_recompute_pages(), 1..1);
+        assert_eq!(l.survivors[..1], [0]);
+
+        // ② 公共前缀跨过第一段删除：身份从第一段删除页起重算，长度仍 = used。
+        let l = layout_multi_delete(old_blocks, page, &ranges, 3 * page, &[3], false)
+            .expect("layout")
+            .expect("边界 3 应可恢复");
+        assert_eq!(l.target_pages, 3);
+        assert_eq!(l.used_pages, 3);
+        assert_eq!(l.survivors[..3], [0, 1, 3]);
+        assert_eq!(l.hash_prefix_pages(), 2);
+        assert_eq!(l.hash_recompute_pages(), 2..3);
+
+        // ③ 有尾快照但公共前缀不足：绝不能拿尾快照恢复（GDN 态越过缓存面）。
+        let l = layout_multi_delete(old_blocks, page, &ranges, 7 * page, &[8], true)
+            .expect("layout")
+            .expect("应退回边界 8");
+        assert_eq!(l.used_pages, 7);
+        assert_eq!(l.restore, GapRestore::OldBoundary(8));
+        assert!(l.used_pages < l.survivors.len());
+
+        // ④ **最后一张图在尾部**：尾快照落在被删页 ⇒ 不得用（GDN 态越过
+        //    新 prefix）；幸存页 8 上有边界快照时，用它且 used 仍 = 全部幸存页。
+        let tail_del = vec![del(9 * page, 10 * page)];
+        assert!(
+            layout_multi_delete(old_blocks, page, &tail_del, 9 * page, &[], true)
+                .expect("layout")
+                .is_none(),
+            "尾部页被删且无幸存边界快照 ⇒ 不许拿尾快照"
+        );
+        let l = layout_multi_delete(old_blocks, page, &tail_del, 9 * page, &[8], true)
+            .expect("layout")
+            .expect("幸存页 8 的快照可用");
+        assert_eq!(l.used_pages, 9);
+        assert_eq!(l.restore, GapRestore::OldBoundary(8));
+        assert_eq!(l.hash_prefix_pages(), 9);
+        assert_eq!(l.hash_recompute_pages(), 9..9);
+
+        // ④b 尾页仍幸存 ⇒ 尾快照合法。
+        let mid_del = vec![del(2 * page, 3 * page)];
+        let l = layout_multi_delete(old_blocks, page, &mid_del, 9 * page, &[], true)
+            .expect("layout")
+            .expect("尾页幸存时尾快照可用");
+        assert_eq!(l.used_pages, 9);
+        assert_eq!(l.restore, GapRestore::TailSnapshot);
+        assert_eq!(l.hash_prefix_pages(), 2);
+        assert_eq!(l.hash_recompute_pages(), 2..9);
+
+        // ⑤ 非整页/重叠区间必须响亮拒，不静默截断。
+        assert!(layout_multi_delete(old_blocks, page, &[del(1, 2)], 64, &[0], false).is_err());
+        assert!(layout_multi_delete(
+            old_blocks,
+            page,
+            &[del(2 * page, 4 * page), del(3 * page, 5 * page)],
+            128,
+            &[0],
+            false
+        )
+        .is_err());
+    }
+
+    /// **位置签名门（2026-11-13）**：同 token 不同 position 基的链不得共享
+    /// 块身份；位置紧凑时保持旧身份（零回归）。
+    #[test]
+    fn position_signature_separates_gapped_and_compact_chains() {
+        let ids = build(&[1, 1], 5);
+        let mut seq = pad(&ids, &[true, true], &[grid(), grid()]);
+        seq.spans[0].img_tag = 0xA1;
+        seq.spans[1].img_tag = 0xB2;
+        let n = seq.ids.len() / PAGE;
+        let compact: Vec<Pos3> = (0..seq.ids.len()).map(|i| [i as i32; 3]).collect();
+
+        let old = block_tags(seq.ids.len(), PAGE, &seq.spans);
+        let compact_tags = block_tags_pos(seq.ids.len(), PAGE, &seq.spans, &compact);
+        assert_eq!(compact_tags, old, "紧凑位置必须逐字节复用旧身份");
+        assert_eq!(compact_tags.len(), n);
+
+        // 只在第 2 页之后产生位置洞：之前的块身份不变，之后的必须全变。
+        let hole_at = 2 * PAGE + 5;
+        let mut gapped = compact.clone();
+        for p in gapped.iter_mut().skip(hole_at) {
+            p[0] += 100;
+            p[1] += 100;
+            p[2] += 100;
+        }
+        let gapped_tags = block_tags_pos(seq.ids.len(), PAGE, &seq.spans, &gapped);
+        assert_eq!(gapped_tags.len(), n, "非紧凑链也必须逐块出 tag");
+        assert_eq!(
+            &gapped_tags[..2],
+            &compact_tags[..2],
+            "洞之前的块身份不得变化"
+        );
+        assert!(
+            gapped_tags[2..]
+                .iter()
+                .zip(&compact_tags[2..])
+                .all(|(a, b)| a != b),
+            "洞之后的块身份必须全部不同（含纯文本块）"
+        );
+
+        // store 面硬门：gapped 链登记后，紧凑会话只能命中洞前前缀。
+        let mut kv = owl_store::kv::KvStore::new(16, PAGE, 1 << 20, 16);
+        let mut table = Vec::new();
+        kv.ensure_for_len(&mut table, seq.ids.len()).expect("块表");
+        kv.register_chain_tagged(&seq.ids, &table, &gapped_tags)
+            .expect("登记 gapped 链");
+        let hit = kv.match_prefix_tagged(&seq.ids, &compact_tags);
+        assert_eq!(
+            hit.matched_blocks, 2,
+            "紧凑位置只能复用洞前前缀，不得吃到 gapped 链"
+        );
+
+        // positions 不完整 = 结构账未就绪 ⇒ 退回旧身份，不猜。
+        let short = block_tags_pos(seq.ids.len(), PAGE, &seq.spans, &gapped[..PAGE]);
+        assert_eq!(short, old, "位置账不足整块时必须退回旧身份");
     }
 
     #[test]

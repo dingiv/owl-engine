@@ -1996,6 +1996,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
     pub(crate) async fn drain_pending_dflash(&mut self) -> Result<()> {
         let pending = std::mem::take(&mut self.pending_dflash);
         self.pending_dflash_tokens = 0;
+        let mut first_err: Option<ModelError> = None;
         for p in pending {
             let root = TensorOps::of_block(
                 p.root.id,
@@ -2018,11 +2019,21 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     p.base,
                 )
                 .await;
-            // 根块在 encode 之后才可回收；失败也回收，不把块吊在队列外。
-            self.graphs.session.face_mut().free(&[root_id]).await?;
-            enc?;
+            // 根块在 encode 之后才可回收；encode 失败也必须尝试回收，
+            // 且不能因为一个 root 失败就跳过后面所有 root。
+            let free = self.graphs.session.face_mut().free(&[root_id]).await;
+            if first_err.is_none() {
+                if let Err(e) = enc {
+                    first_err = Some(e);
+                } else if let Err(e) = free {
+                    first_err = Some(e);
+                }
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn prefill_dflash_encode(

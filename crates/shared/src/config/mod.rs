@@ -897,6 +897,19 @@ pub struct PoolCfg {
     /// 结尾常有 ≤2K token 的复用损失）。依赖 `prefix_cache=true` +
     /// `snap_max>0`；无消费者时 boot 告警。
     pub snap_msg_boundary: bool,
+    /// **可删图前锚点快照**（缺省 `true`；2026-11-13）。
+    ///
+    /// 开 = 在**每张 `evict` 标记图的段起点**（页边界）强制切块并拍 Durable
+    /// 快照。它解决真实形态“截图在 prompt 尾部”：预填充末快照的键落在被删页
+    /// 上，删除发生时幸存页没有边界快照，只能退回 fresh；锚点让「被删图之前」
+    /// 的状态始终可续跑。同一游程里只删后几张时，也能复用到前几张的页。
+    ///
+    /// 代价 ≈ **本轮新进 prompt 的可删图数**（旧图锚点键 = 内容身份，前缀命中
+    /// 时 prefill 不跨那些 offset ⇒ 同键 Touch，不占新槽）。27B 每张约
+    /// 148 MiB，`Extra` 档优先淘汰；`snap_max`/`snap_session_cap` 满时
+    /// `admit_snap` 跳过（不拷贝、不静默错值）。关闭 = 旧行为（尾删退回 fresh）。
+    /// 只在 `image_evict=true` + `prefix_cache=true` + `snap_max>0` 时有消费者。
+    pub snap_evict_anchor: bool,
     /// 消息开启标记的**文本覆盖**（空 = 用模型的 `ChatFormat.im_open`，
     /// 如 Qwen 系 `<|im_start|>`）。引擎 boot 时把它 tokenize 成 id 序列；
     /// 扫描代码只认参数 `open_ids`，不写死任何字面量。
@@ -2157,6 +2170,7 @@ impl Default for PoolCfg {
             snap_decode_stride: 1,
             snap_max: 4,
             snap_msg_boundary: false,
+            snap_evict_anchor: true,
             snap_msg_delim: String::new(),
             snap_msg_min_gap: 2048,
             snap_msg_recent: 4,

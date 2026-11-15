@@ -175,6 +175,12 @@ async fn e2e_body() {
     // ── **前缀无感删除（leave-gap；2026-10-25）**：两图 → 连续删 → 不转 K / 不重建 ──
     run!(gpu_image_evict_gate);
 
+    // ── **多段 leave-gap（2026-11-13）**：长前缀 + 两图 + 一次性全删 ──
+    run!(gpu_image_evict_multi_gate);
+
+    // ── **尾删锚点（2026-11-13）**：短 prompt + 尾部两图全删（生产 prefill_chunk 形状）──
+    run!(gpu_image_evict_anchor_gate);
+
     // ── **多图 × 投机 verify 行**(D 项):spec on/off 贪心 token 逐位相同 ──
     run!(gpu_image_evict_spec_identity_gate);
 

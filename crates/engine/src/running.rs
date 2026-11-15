@@ -770,50 +770,67 @@ impl<D: DeviceClient> RunningEngine<D> {
         if let Some(sid) = session {
             if let Some(s) = self.bank.sessions.get(sid) {
                 if !s.positions.is_empty() && s.positions.len() == s.tokens.len() {
-                    let (pos, _max, gap) = match deletion {
-                        Some(plan) if plan.ranges.len() > 1 => {
-                            crate::img_evict::positions_after_deletes(
+                    // **只有与新 prompt 有传承关系时才沿用旧位置账**：
+                    // 纯换分支（公共前缀为 0）若仍从旧 `max_pos+1` 起算，
+                    // 会把上一条链的位置洞带进一条毫不相干的新链。删除计划
+                    // 例外：它本身就是按旧序列的幸存段构造的，必须沿用旧位。
+                    let common = s
+                        .tokens
+                        .iter()
+                        .zip(prompt_ids.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    if common == 0 && deletion.is_none() {
+                        owl_shared::log_debug!(
+                            "img-evict",
+                            "位置账:session={sid:#x} 新 prompt 与旧链无公共前缀 ⇒ 紧凑重算（不继承旧洞）"
+                        );
+                    } else {
+                        let (pos, _max, gap) = match deletion {
+                            Some(plan) if plan.ranges.len() > 1 => {
+                                crate::img_evict::positions_after_deletes(
+                                    &s.tokens,
+                                    &s.positions,
+                                    prompt_ids,
+                                    spans,
+                                    plan,
+                                    image_token,
+                                    mrope,
+                                )
+                            }
+                            Some(plan) => crate::img_evict::positions_after_splice(
                                 &s.tokens,
                                 &s.positions,
                                 prompt_ids,
                                 spans,
-                                plan,
+                                plan.first(),
                                 image_token,
                                 mrope,
-                            )
+                            ),
+                            None => crate::img_evict::positions_after_splice(
+                                &s.tokens,
+                                &s.positions,
+                                prompt_ids,
+                                spans,
+                                None,
+                                image_token,
+                                mrope,
+                            ),
                         }
-                        Some(plan) => crate::img_evict::positions_after_splice(
-                            &s.tokens,
-                            &s.positions,
-                            prompt_ids,
-                            spans,
-                            plan.first(),
-                            image_token,
-                            mrope,
-                        ),
-                        None => crate::img_evict::positions_after_splice(
-                            &s.tokens,
-                            &s.positions,
-                            prompt_ids,
-                            spans,
-                            None,
-                            image_token,
-                            mrope,
-                        ),
+                        .map_err(ModelError::Msg)?;
+                        // 位置洞由本次 splice/deletes 的返回值和 turn 账携带，
+                        // 不再在会话上保留额外状态位。
+                        owl_shared::log_debug!(
+                            "img-evict",
+                            "位置账:session={sid:#x} old={} new={} deletion={} gap={} max_pos={}",
+                            s.tokens.len(),
+                            prompt_ids.len(),
+                            deletion.is_some(),
+                            gap,
+                            s.max_pos
+                        );
+                        return Ok((pos, gap));
                     }
-                    .map_err(ModelError::Msg)?;
-                    // 位置洞由本次 splice/deletes 的返回值和 turn 账携带，
-                    // 不再在会话上保留额外状态位。
-                    owl_shared::log_debug!(
-                        "img-evict",
-                        "位置账:session={sid:#x} old={} new={} deletion={} gap={} max_pos={}",
-                        s.tokens.len(),
-                        prompt_ids.len(),
-                        deletion.is_some(),
-                        gap,
-                        s.max_pos
-                    );
-                    return Ok((pos, gap));
                 }
             }
         }
@@ -862,6 +879,15 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 返回 `(ids, spans, pads, deletion)`;`deletion` 交给调度面做取链/拼接。
     // 结构性豁免(2026-11-02 clippy 清理):类型面 = 派发/表项签名;起别名会藏住"这一串到底是什么"
     #[allow(clippy::type_complexity)]
+    /// 单 token 是否为**可见空白**（特殊 token 解码为空 ⇒ false）。
+    ///
+    /// 只给删除边界复原用：`decode(&[t])` 为空串的 token 可能是任何特殊标记
+    /// （`<|im_end|>` 等），绝不能当成“可省略的空白”。
+    fn token_is_visible_whitespace(&self, t: u32) -> bool {
+        let s = self.boot.tok.decode(&[t]);
+        !s.is_empty() && s.trim().is_empty()
+    }
+
     fn image_pad_law(
         &self,
         session: Option<u64>,
@@ -930,6 +956,25 @@ impl<D: DeviceClient> RunningEngine<D> {
                     if !s.tokens.is_empty() && !s.img_spans.is_empty() {
                         let old_text =
                             crate::img_evict::unpad(&s.tokens, &s.pads).map_err(ModelError::Msg)?;
+                        // **模板 trim 边界复原**（2026-11-15）：Qwen 快照模板对
+                        // user content 做 `|trim`，删图后“图片前最后一段文本”的
+                        // `\n` 会被剪掉（服务端补的边界 token 只在内部 part 幸存）。
+                        // 若 raw 与旧文本的唯一差异是**删点前的尾部空白**，把旧
+                        // 前缀的空白插回 raw —— 后续识别/重建/位置账全部走原路径。
+                        let restored = crate::img_evict::restore_trimmed_prefix(
+                            &old_text,
+                            &mut input,
+                            &s.img_spans,
+                            |t| self.token_is_visible_whitespace(t),
+                        );
+                        if let Some(k) = restored {
+                            owl_shared::log_debug!(
+                                "img-evict",
+                                "模板 trim 边界复原:session={sid:#x} 补回 {k} 个空白 token(old={} raw={})",
+                                old_text.len(),
+                                input.len()
+                            );
+                        }
                         // 旧账 tag=0（升级前拍的 spans）没有内容指纹，退回
                         // 只能整游程识别的旧口；新账一律走带指纹的精确口。
                         let tags_ready = s.img_spans.iter().all(|sp| sp.img_tag != 0);
@@ -981,11 +1026,27 @@ impl<D: DeviceClient> RunningEngine<D> {
                             if let Some(i) = first_diff {
                                 let lo = i.saturating_sub(24);
                                 let hi = (i + 40).min(n);
+                                // 删点边界诊断：逐 token id + 单 token 文本。BPE 在
+                                // “文本→图片/结束标记”处的合并差异只有这里看得见。
+                                let w = i.saturating_sub(3)..(i + 4).min(n);
                                 owl_shared::log_debug!(
                                     "img-evict",
                                     "first_diff={i} old_win={:?} raw_win={:?}",
                                     self.boot.tok.decode(&old_text[lo..hi]),
                                     self.boot.tok.decode(&input[lo..hi])
+                                );
+                                owl_shared::log_debug!(
+                                    "img-evict",
+                                    "first_diff={i} old_ids={:?} raw_ids={:?} old_tok={:?} raw_tok={:?}",
+                                    &old_text[w.clone()],
+                                    &input[w.clone()],
+                                    old_text[w.clone()]
+                                        .iter()
+                                        .map(|t| self.boot.tok.decode(&[*t]))
+                                        .collect::<Vec<_>>(),
+                                    input[w].iter()
+                                        .map(|t| self.boot.tok.decode(&[*t]))
+                                        .collect::<Vec<_>>()
                                 );
                             }
                             for sp in s.img_spans.iter().filter(|x| x.evict) {
@@ -1273,13 +1334,51 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 跨 prompt/生成边界的块缺 tag，`ChainCursor::advance` 直接拒
             // （实测 `链哈希游标推进失败 ... fed=36704 start=1115 新增 32 块`）。
             // `img_spans` 只覆盖 prompt 区，`block_tags` 对超出部分自然给 0。
+            // 位置签名必须同源：非紧凑链（leave-gap）的 K 只在同一 position
+            // 基下有效，必须折进块身份，否则跨会话会按 token 撞链。
             let total = act.prompt_ids.len() + act.out.len();
-            return crate::img_evict::block_tags(total, page, &act.img_spans);
+            return crate::img_evict::block_tags_pos(
+                total,
+                page,
+                &act.img_spans,
+                &act.positions,
+            );
         }
         match self.bank.sessions.get(sid) {
-            Some(s) => crate::img_evict::block_tags(s.tokens.len(), page, &s.img_spans),
+            Some(s) => crate::img_evict::block_tags_pos(
+                s.tokens.len(),
+                page,
+                &s.img_spans,
+                &s.positions,
+            ),
             None => Vec::new(),
         }
+    }
+
+    /// 同 [`Self::turn_block_tags`]，但把 **spec 轮内已提交、尚未进
+    /// `act.out`** 的尾 token 也算进块身份。
+    ///
+    /// 这些 token 的位置按 `act.next_rope_pos` 连续推进；如果只用
+    /// `prompt+out` 造 tag，后面真正提交时会得到另一套位置签名 ⇒
+    /// 链游标/快照键与发布身份分叉。
+    pub(crate) fn turn_block_tags_with_tail(
+        &self,
+        sid: u64,
+        page: usize,
+        tail: &[u32],
+    ) -> Vec<owl_store::BlockTag> {
+        let Some(act) = self.turns.active.iter().find(|a| a.session_id == sid) else {
+            return self.turn_block_tags(sid, page);
+        };
+        let total = act.prompt_ids.len() + act.out.len() + tail.len();
+        let mut positions = act.positions.clone();
+        if positions.len() < total {
+            let base = act.next_rope_pos;
+            positions.extend((0..total - positions.len()).map(|i| {
+                [base.saturating_add(i as i32); 3]
+            }));
+        }
+        crate::img_evict::block_tags_pos(total, page, &act.img_spans, &positions)
     }
 
     /// 同 [`Self::submit_session_ex`],但携带 per-turn 可选项(采样参数/停止串/种子;
@@ -1427,6 +1526,25 @@ impl<D: DeviceClient> RunningEngine<D> {
                 self.boot.cfg.knobs.snap_msg_recent,
             )
         };
+        // **可删图前的硬快照点**（2026-11-13）：截图在 prompt 尾部时，预填充末
+        // 快照的键落在被删页上 ⇒ 删除发生时幸存页没有任何边界快照，只能退回
+        // fresh。锚点 = **每张可删图段起点**（同游程也各拍）；预填充必须在这些
+        // 边界**强制切块**才能拍出 GDN 态（见 `prefill_step_chunk_msg` 的
+        // `hard_snaps`）。旧图的锚点键是内容身份，前缀命中时不会重拍。
+        let evict_snaps: Vec<usize> = if self.boot.cfg.knobs.snap_evict_anchor
+            && self.boot.cfg.knobs.image_evict
+            && self.boot.cfg.knobs.prefix_cache
+            && self.dev.pool.geom.paged
+            && self.dev.pool.snap_capacity() > 0
+        {
+            crate::img_evict::evict_snap_points(
+                &img_spans,
+                prompt_ids.len(),
+                self.dev.pool.geom.page,
+            )
+        } else {
+            Vec::new()
+        };
         // 准入地板(S3b §23.5 / A7-bis 接线 2026-10-19):
         //
         // 非 Strict 地板 = "允许选择层按需物化" ⇒ **必须有执行面**才收:
@@ -1500,8 +1618,32 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 用空表把命中面归零，会让 admission 按全量 ctx 腾位，反而把刚释放
         // 的缓存整链下沉到 host，下一拍再整链 swap-in（TTFT 异常）。
         let page = self.dev.pool.geom.page.max(1);
-        let store_cached = if self.boot.cfg.knobs.prefix_cache && self.dev.pool.geom.paged {
-            let tags = crate::img_evict::block_tags(prompt_ids.len(), page, &img_spans);
+        // **只信本会话的 token 账**：store 的内容树是跨会话的，直接拿
+        // `match_prefix` 当 admission 的 cached_hit 会把别的会话（或
+        // leave-gap 的另一套位置）算成本轮已驻留，导致少腾槽/复用错链。
+        // 先取本会话 tokens 与本轮 prompt 的公共前缀，再用 store 命中面封顶。
+        let session_prefix = session
+            .and_then(|id| self.bank.sessions.get(id))
+            .map(|s| {
+                s.tokens
+                    .iter()
+                    .zip(prompt_ids.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            })
+            .unwrap_or(0);
+        let store_cached = if self.boot.cfg.knobs.prefix_cache
+            && self.dev.pool.geom.paged
+            && deletion.is_none()
+            && !positions_gap
+            && session_prefix > 0
+        {
+            let tags = crate::img_evict::block_tags_pos(
+                prompt_ids.len(),
+                page,
+                &img_spans,
+                &positions,
+            );
             let (hit, recall) = self
                 .bank
                 .rel
@@ -1510,7 +1652,9 @@ impl<D: DeviceClient> RunningEngine<D> {
                 .bank
                 .rel
                 .reuse_face(&hit, &recall, prompt_ids.len(), page);
-            m.saturating_mul(page).min(prompt_ids.len())
+            m.saturating_mul(page)
+                .min(session_prefix)
+                .min(prompt_ids.len())
         } else {
             0
         };
@@ -1679,6 +1823,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             msg_snaps,
             msg_snap_classes,
             msg_snap_keys,
+            evict_snaps,
             img_spans,
             img_pads,
             positions,
@@ -2219,12 +2364,12 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// GDN 行归还 + 归属下行 + N4 清点/force release/trim。
     /// **H3 链登记**（TurnEnd/Abort 都发）。
     ///
-    /// **位置空洞会话不发布**（2026-11-08）：链身份只有 token（+图像指纹），
-    /// 位置基准不在身份里；gapped 会话的 KV 是在非紧凑坐标下算的，发布出去
-    /// 会被别的紧凑会话按 token 命中 ⇒ **静默错值**。
+    /// **位置空洞会话的发布**（2026-11-13 修正）：链身份现在混入非紧凑
+    /// position 签名（[`crate::img_evict::block_tags_pos`]）⇒ gapped 链与
+    /// 紧凑链不会撞哈希，发布是安全的，也能让同会话跨 turn 继续复用。
     ///
-    /// 第一个 gap 之前的前缀在早先的紧凑 turn 里已经登记过（position 未变），
-    /// 压实后仍能复用它；这里只拦 gapped 尾巴，不影响“尽量复用”。
+    /// 位置账与 token 账必须等长；不齐 = 结构错，拒绝发布（宁可下轮重算，
+    /// 不许把无位置签名/错位置的链写进共享树）。
     fn publish_turn_chain(
         &mut self,
         session: u64,
@@ -2234,19 +2379,22 @@ impl<D: DeviceClient> RunningEngine<D> {
         let Some(s) = self.bank.sessions.get(session) else {
             return Ok(());
         };
-        // 位置洞是当前 turn 的事实；不在会话上保留状态位。
-        if self.turns.active_of(turn).map(|a| a.rope_gap).unwrap_or(false) {
-            owl_shared::log_debug!(
+        if s.positions.len() != s.tokens.len() {
+            owl_shared::log_warn!(
                 "prefix",
-                "leave-gap 会话不发布链：session={session:#x} turn={turn}（位置非紧凑）"
+                "链发布跳过：session={session:#x} turn={turn} 位置账 {} ≠ token {}（位置签名不可信）",
+                s.positions.len(),
+                s.tokens.len()
             );
             return Ok(());
         }
-        // 指纹 = 会话账的 pad 后坐标(span 已在 submit 侧按像素盖章)
-        let tags = crate::img_evict::block_tags(
+        // 指纹 = 会话账的 pad 后坐标(span 已在 submit 侧按像素盖章)，
+        // 并混入位置签名：leave-gap 的非紧凑链不能与紧凑链共享身份。
+        let tags = crate::img_evict::block_tags_pos(
             s.tokens.len(),
             self.dev.pool.geom.page.max(1),
             &s.img_spans,
+            &s.positions,
         );
         let up = self.bank.rel.leg.register_chain_owned_tagged(
             &s.tokens,
@@ -2305,10 +2453,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                         .sessions
                         .get(release.session)
                         .map(|s| {
-                            crate::img_evict::block_tags(
+                            crate::img_evict::block_tags_pos(
                                 s.tokens.len(),
                                 self.dev.pool.geom.page.max(1),
                                 &s.img_spans,
+                                &s.positions,
                             )
                         })
                         .unwrap_or_default();
@@ -2323,10 +2472,11 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .sessions
                     .get(release.session)
                     .map(|s| {
-                        crate::img_evict::block_tags(
+                        crate::img_evict::block_tags_pos(
                             s.tokens.len(),
                             self.dev.pool.geom.page.max(1),
                             &s.img_spans,
+                            &s.positions,
                         )
                     })
                     .unwrap_or_default();
@@ -2829,7 +2979,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             if let Some(t) = self.turns.queue.front() {
                 let (sid, plen) = (t.session_id, t.prompt_ids.len());
                 let dev = {
-                    let tags = crate::img_evict::block_tags(t.prompt_ids.len(), page, &t.img_spans);
+                    let tags = crate::img_evict::block_tags_pos(
+                        t.prompt_ids.len(),
+                        page,
+                        &t.img_spans,
+                        &t.positions,
+                    );
                     let (hit, recall) = self.bank.rel.match_prefix_tagged(&t.prompt_ids, &tags)?;
                     self.bank.rel.reuse_face(&hit, &recall, plen, page).1
                 };
@@ -2865,6 +3020,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     self.dev.pool.geom.page,
                 ),
                 &act.msg_snaps,
+                &act.evict_snaps,
                 self.boot.cfg.knobs.snap_msg_min_span,
             ) {
                 Some(chunk) => act.fed + chunk,
@@ -4003,11 +4159,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         };
         let stem = owl_store::DiskKey::stem(tail);
         let path = root.join(format!("{stem}.idx"));
-        if crate::disk_io::exists(&path) {
-            return Ok(()); // 同链已写过(幂等;链尾相同 = 前缀相同)
-        }
+        // 不因“文件已在”而早退：`OWLIDX01` 的旧文件没有逐块指纹，
+        // 只能用新格式原子覆盖（否则重启后图像/位置链身份对不上）。
         let tmp = root.join(format!("{stem}.idx.tmp"));
-        let idx = match owl_store::ChainIndex::new(page, tokens.to_vec()) {
+        let idx = match owl_store::ChainIndex::with_tags(
+            page,
+            tokens.to_vec(),
+            tags.iter().take(full).copied().collect(),
+        ) {
             Ok(i) => i,
             Err(e) => {
                 owl_shared::log_warn!("store", "链索引构造失败(tail={tail:?}):{e}");

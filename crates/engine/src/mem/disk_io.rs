@@ -234,11 +234,6 @@ pub(crate) fn scan_index_sync<K: DiskKey>(dir: &Path) -> Vec<(K, PathBuf)> {
     out
 }
 
-/// 文件是否存在(单次 `stat`;只用于"索引是否已写"的幂等判定 —— 不是数据 I/O)。
-pub(crate) fn exists(p: &Path) -> bool {
-    std::fs::metadata(p).is_ok()
-}
-
 /// **清掉"未入账"的盘上文件**(2026-11-01 用户裁决:删除时机 = 写盘腾位时)。
 ///
 /// 为什么要清:`DiskTier::adopt` 对「大小不符 / 重复键 / 外来物」只跳过不入账,
