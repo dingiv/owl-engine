@@ -132,6 +132,7 @@ Body documents are written in **Chinese**; this index and all meta documents
 - ⬜ [`devlog/serving/cross-session-batch.md`](devlog/serving/cross-session-batch.md) — Cross-session batched decode (B5.1)
 - ⬜ [`devlog/serving/session-plan.md`](devlog/serving/session-plan.md) — Session orchestration surface
 - ⬜ [`devlog/serving/config-ux.md`](devlog/serving/config-ux.md) — Configuration UX (fully explicit fields)
+- ⬜ [`devlog/serving/server-engine-boundary-review-2026-11-15.md`](devlog/serving/server-engine-boundary-review-2026-11-15.md) — **server↔engine 边界评审(业务下沉立案)**:13k 行模块归属地图 + 5 组下沉候选(engine init / 泵策略 / 诊断快照 / 预检 / 视觉预处理)+ 分批与门
 - ⬜ [`devlog/serving/spec-tailcap-gpu-spin-立案.md`](devlog/serving/spec-tailcap-gpu-spin-立案.md) — DFlash2 尾批裁剪 ⇒ verify 图档形状错配 ⇒ **设备核自旋整台钉死**(已修;含根因、复现与回归门)
 - ⬜ [`devlog/serving/2026-10-26-leave-gap-frontend-handoff.md`](devlog/serving/2026-10-26-leave-gap-frontend-handoff.md) — leave-gap 前端联调交接:KV 引用解除、turn35 重复输出、turn38 压缩全量 prefill、视觉塔缓存复用
 - ⬜ [`devlog/serving/2026-10-26-prefill-f16-shadow-3080实测.md`](devlog/serving/2026-10-26-prefill-f16-shadow-3080实测.md) — prefill FP8→F16 shadow:3080 TP2 +3~9%、1.265× attention、cap 预留修 OOM、相对数值门
