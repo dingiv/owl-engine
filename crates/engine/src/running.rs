@@ -1658,7 +1658,61 @@ impl<D: DeviceClient> RunningEngine<D> {
         } else {
             0
         };
-        let cached_hit = cached_hit.max(store_cached).min(prompt_ids.len());
+        // **删除轮的复用面下界**（2026-11-15 真机定谳）：
+        //
+        // leave-gap 的复用决策在 `schedule` 之后才落地；submit 侧的守卫
+        // （`s.guard(&prompt_ids)`）对“旧 padded 序列 + 新 gapped 序列”必然
+        // 失配，`store_cached` 也因 `deletion.is_some()/positions_gap` 被跳过
+        // ⇒ `cached_hit=0` ⇒ **admission 按全量 ctx 预留**。真机签名（30k
+        // 会话、每轮删一张旧截图）：正常轮 1036 页，删图轮 **1952 页 / 复用 0**
+        // （多留 ~1GB），资源充足时也会逼出无谓的腾位/下沉。
+        //
+        // 这里只取**第一段删除之前**的旧前缀（删除检测已保证逐 token 相同），
+        // 用它在内容树里的**设备驻留块数**作下界：真正的复用面（含后缀页 +
+        // 快照恢复）只会 ≥ 它，所以 admission 不会少留；日志/usage 也不再
+        // 把删图轮报成 0。
+        let deletion_cached = match deletion.as_ref().and_then(|p| p.first()) {
+            Some(first) => {
+                let a = first.a;
+                if a == 0 || !a.is_multiple_of(page) {
+                    0
+                } else {
+                    let prefix_tags = session
+                        .and_then(|id| self.bank.sessions.get(id))
+                        .filter(|s| a <= s.tokens.len() && a <= prompt_ids.len() && s.tokens[..a] == prompt_ids[..a])
+                        .map(|s| {
+                            (
+                                s.tokens[..a].to_vec(),
+                                crate::img_evict::block_tags_pos(
+                                    a,
+                                    page,
+                                    &s.img_spans,
+                                    &s.positions,
+                                ),
+                            )
+                        });
+                    match prefix_tags {
+                        Some((prefix, tags)) => {
+                            let (hit, _) =
+                                self.bank.rel.match_prefix_tagged(&prefix, &tags)?;
+                            let resident = hit
+                                .slots
+                                .iter()
+                                .take(hit.matched_blocks)
+                                .filter(|slot| slot.is_some())
+                                .count();
+                            resident.saturating_mul(page).min(a)
+                        }
+                        None => 0,
+                    }
+                }
+            }
+            None => 0,
+        };
+        let cached_hit = cached_hit
+            .max(store_cached)
+            .max(deletion_cached)
+            .min(prompt_ids.len());
         // 预算(会话感知):base = max(prompt, cached,命中增量段时前缀仍占槽)
         // 不足 ⇒ **先收缩生成长度**(不是直接拒):agent 客户端(pi)每轮重发
         // 系统提示 + 工具 schema + 历史,工作区 `AGENTS.md`+skills 一注入
