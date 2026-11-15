@@ -76,8 +76,12 @@ max_seq = 32768
 # 只允许被 image 无感删除的 gap 消费（正常会话 pos_hi = n_tokens，进不来）。
 # 0.5 ⇒ 32768 档预留 16384 位置（≈8 张 2k 截图）；用尽即触发一次位置压实。
 gap_reserve_factor = 0.5
-# INT8 prefill 末块前设备栅栏（1k 质量门；false 仅 A/B/性能测量）
-int8_prefill_sync = true
+# **每 chunk 覆写的持久表必须与消费者同流**（2026-11-16 根因修复）。
+# 例：GDN 序列表 / 选择层视图槽曾用 H2D 流写、COMPUTE 核读 —— 前一 chunk
+# 的核还没跑完，下一 chunk 的表就把它覆写（1k needle 固定丢 `M`）。
+# 修法 = 持久表写入走 COMPUTE（与 FI/块表同律），零事件、零栅栏；
+# 原 `[runtime] int8_prefill_sync` 与末块前全设备 sync 均已删除。
+# 回归门：`tools/fixture/int8_text_gate.py`（1k/3k/8k）。
 # 预填块长 / 尾块合并阈值(剩余 ≤ chunk + tail_merge ⇒ 一口气吃完)
 # 实测(2026-10-27,单 3090 / 27B AWQ / DFlash2 d7 / ctx 63456,**冷 boot 逐档**):
 #   chunk 512 / tail 512 : 4k 1320 · 8k 1308 t/s ; 32k 1173 t/s(TTFT 27.9s)

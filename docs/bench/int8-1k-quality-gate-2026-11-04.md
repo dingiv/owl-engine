@@ -1,8 +1,9 @@
 # INT8 KV 1k 文本质量门（2026-11-04）
 
-> **最终结论（2026-11-04 结案）：1k 门已过。** 根因 = INT8 prefill
-> 末块前缺一次设备同步；修复见 §6。A（`select_partial`）不受影响；
-> B（视觉/`image_evict`）也在同一 sync 修复后 36/36 全绿（见 B 定谳文档）。
+> **最终结论（2026-11-04 结案；2026-11-16 根因修复）：1k 门已过。**
+> 2026-11-04 的黑盒结论是“末块前缺一次设备同步”（§6）；2026-11-16 找到
+> 真根因 = **GDN 序列表用 H2D 流覆写、COMPUTE 核读**，改为同流写后
+> **栅栏已删除**（§6.6）。A/B 与跨硬件验收见 §6.6.3。
 >
 > §2–§5 是定位过程（含中途误判），最终定谳以 §6 为准。
 
@@ -122,8 +123,10 @@ if is_last && base > 0 && self.pool.geom.kv_int8 {
 
 ### 6.4 `llm_speedtest` 复测：sync 税 ≈ 0
 
-开关：`[runtime] int8_prefill_sync`（缺省 true；false 仅 A/B，关掉会
-重新丢 `M`）。同一 prompt nonce、`rounds=1`、fresh server：
+开关：`[runtime] int8_prefill_sync`（当时缺省 true；false 仅 A/B，关掉会
+重新丢 `M`）。**该键已于 2026-11-16 删除；同日的根因修复又删除了栅栏
+本身**（§6.6：GDN 表同流写，不再需要任何 sync）。同一 prompt nonce、
+`rounds=1`、fresh server：
 
 **标准矩阵（512/1024/2048/4096/8192，输出 256）**
 
@@ -144,14 +147,67 @@ if is_last && base > 0 && self.pool.geom.kv_int8 {
 结论：**每请求一次的末块栅栏没有可测开销**；32k/65k 的 on/off 差在
 逐次运行方差内（on 甚至略快）。sync 不是吞吐税。
 
-### 6.5 仍开放
+### 6.5 仍开放（2026-11-16 已结）
 
-- 末块前 sync 是**一次每请求的栅栏**，不是最小根因；后续应找出
+- ~~末块前 sync 是**一次每请求的栅栏**，不是最小根因；后续应找出
   具体漏掉的 stream event（KV/GDN 写 → 末块 host/调度/跨流复用），
-  用 event 替代全设备 sync。
+  用 event 替代全设备 sync~~ → 真根因不是“漏一个 event”，而是
+  **GDN 持久表写错流**；同流写即消除竞态，无需 event/sync，见 §6.6。
 - B（视觉 / `image_evict`）已过：sync 后无 evict 36/36、带 evict
   36/36，slope≈1.0、hit@16px 100%；`engine.rs` 的 INT8 拒启已删。
 - 文本质量门与 sync 税已闭环；转正仍待 B/视觉与更广质量集。
+
+---
+
+## 6.6 2026-11-16 根因修复：GDN 持久表 H2D 写 vs COMPUTE 读
+
+### 6.6.1 真根因
+
+`[cuda] trace_ring` 在 chunk 边界拍到（原文可复现）：
+
+```
+23548 htod_chunk h2d  bytes=288 ids=[gdn.table]
+26200 htod_chunk h2d  bytes=48  ids=[gdn.table]   # 尾块表，紧跟在 159MB copy_batch 之后
+```
+
+- `StatePool::write_gdn_tables` 旧实现 `face.write_block_f32(...)`，默认落
+  **H2D 流**；GDN chunked 核在 **COMPUTE** 读同一持久槽。
+- 该槽**每个 chunk 覆写**；H2D copy 的 ack 只保证自己完成，不保证
+  COMPUTE 上前一 chunk 的 GDN 核已读完 ⇒ 下一 chunk 的表会把正在被读的
+  表覆盖。
+- 为什么 1024 触发、512 不触发：纯时序窗口（host 走到下一 chunk 表写
+  相对前一 chunk 核收尾），是竞态而非数学。
+- 排除：`snap_max=0`、`prefix_cache=false` 仍 MISSED（不是快照/前缀缓存）；
+  `CUDA_LAUNCH_BLOCKING=1` 或 `CUDA_DEVICE_MAX_CONNECTIONS=1` 则 RETRIEVED
+  —— 异步/跨流竞态，不是数值。
+- 同族：`write_select_view`（select_partial 的视图槽）也是逐 chunk 覆写
+  + H2D，已一并改同流。
+
+### 6.6.2 修法（已落地）
+
+- `write_gdn_tables` / `write_select_view` ⇒
+  `write_block_f32_on(UpStream::Compute, ...)`（与 FI 表/块表同律）。
+- **删除** `prefill_chunk_enqueue` 的末块 `face.sync()`；
+  `[runtime] int8_prefill_sync` 键删除。
+- 架构不变量：**每 chunk 覆写的持久表必须与消费者同流**；
+  boot 期常量（XQA 页表/掩码）仍可走 H2D，因为它们不在消费者在飞时重写。
+
+### 6.6.3 验收（fresh server，**无栅栏**）
+
+| 硬件 / KV | 1k | 3k | 8k |
+|---|---|---|---|
+| 3090 Ti / int8 | **3/3 RETRIEVED** | RETRIEVED | RETRIEVED |
+| 3090 Ti / fp8 | — | RETRIEVED | — |
+| 4080S / int8 | — | RETRIEVED（修复前同形 MISSED） | — |
+| 4080S / fp8 | — | RETRIEVED | — |
+
+- 32k（3090 Ti / int8，生产档）：RETRIEVED **15.5s**；与 2026-11-04 的
+  同门记录 15.9s 同量级（档位/测量面不完全相同，非严格 A/B）⇒ 同流写的
+  ack 等待**未见可测回退**。
+
+A/B：把 GDN 表写回 H2D（或临时加回末块 sync 之前）时，1k 固定答
+`ZXCVBN12345`/`ZXCVBNM`（丢 `M`）；同流写后连续 3 次 fresh server 均
+`ZXCVBNM12345`。栅栏与键都不再存在。
 
 ---
 

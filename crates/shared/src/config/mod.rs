@@ -54,7 +54,6 @@
 //! | runtime | implicit_session / default_max_new / max_new_cap | 会话面(见字段注) |
 //! | runtime | max_seq | usize / 4096 |
 //! | runtime | prefill_chunk / prefill_tail_merge | usize / 512、0 |
-//! | runtime | int8_prefill_sync | flag / true(INT8 末块前设备栅栏；false 仅 A/B) |
 //! | runtime | max_batch | usize / 1(合批上限;>1 需 gdn_slots≥它、单卡、无选择层) |
 //! | runtime | admission_on_full | String / "reject"(准入满员姿态;`reject` \| `queue` \| `queue:<ms>`) |
 //! | runtime | idle_compact / pressure_low_pct / pressure_high_pct | bool、usize、usize / false、12、25(空转默认不预搬;低触发/高目标) |
@@ -542,10 +541,6 @@ pub struct RuntimeCfg {
     #[serde(default = "default_gap_reserve_factor")]
     pub gap_reserve_factor: f64,
     pub prefill_chunk: usize,
-    /// **INT8 prefill 末块前设备栅栏**（2026-11-04 1k 质量门；缺省 true）。
-    /// 关闭仅供 A/B / 性能测量：1k needle 会固定丢 `M`。
-    #[serde(default = "default_true")]
-    pub int8_prefill_sync: bool,
     /// **引擎跨会话合批上限**(B5.1;缺省 **1 = 逐字节现状**)。
     ///
     /// >1 ⇒ 调度面把最多 N 个活跃 turn 的 decode 拼成一次 T=N 前向
@@ -2138,7 +2133,6 @@ impl Default for RuntimeCfg {
             max_seq: 4096,
             gap_reserve_factor: default_gap_reserve_factor(),
             prefill_chunk: 512,
-            int8_prefill_sync: true,
             max_batch: 1,
             prefill_tail_merge: 0,
             slice_every: 0,
@@ -3533,6 +3527,12 @@ mod tests {
     fn 账外键拒_deny_unknown() {
         assert!(OwlConfig::from_toml_str("[model]\nformatz = \"awq\"").is_err());
         assert!(OwlConfig::from_toml_str("[no such module]\nx = 1").is_err());
+        // 2026-11-16:`int8_prefill_sync` 删除;同日根因修复(GDN 表同流)后,
+        // 末块栅栏本身也已删除 —— 不再有任何运行时 sync。
+        // 旧档写这个键 = 响亮拒启(不许静默继承/忽略)。
+        let e = OwlConfig::from_toml_str("[runtime]\nint8_prefill_sync = false\n")
+            .expect_err("已删键必须拒启");
+        assert!(e.contains("int8_prefill_sync"), "拒语应点名旧键: {e}");
     }
 
     /// **主干量化方案**(2026-10-17 由 `w4a8: bool` 升格):缺省 = w4a16

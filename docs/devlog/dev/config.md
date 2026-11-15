@@ -350,6 +350,14 @@ ls profiles/
   ⇒ **`spec.draft_kv_dtype = "bf16" | "fp8"`**(缺省 bf16)。旧档同样被
   `deny_unknown_fields` 响亮拒(报错里列出 `draft_kv_dtype`)。
   迁移:`draft_kv_fp8 = false` → `draft_kv_dtype = "bf16"`;`true` → `"fp8"`。
+- **`runtime.int8_prefill_sync` 已删除**(2026-11-16,配置认领 3.2)。同日追到
+  真根因：`write_gdn_tables` 把**每 chunk 覆写**的 GDN 持久槽写在 H2D 流，
+  而 GDN 核在 COMPUTE 读 —— 前一 chunk 的核未收尾，下一 chunk 的表就覆盖
+  正在被读的表（1k needle 丢 `M`）。修法 = 持久表写入与消费者同流
+  (`write_block_f32_on(Compute, …)`)，**末块前全设备 sync 与这个键都已删除**。
+  架构不变量：每 chunk 覆写的持久表必须与消费者同流；boot 期常量仍可走 H2D。
+  旧档写这个键 = `deny_unknown_fields` 拒启。证据与跨硬件验收见
+  `docs/bench/int8-1k-quality-gate-2026-11-04.md` §6.6。
 - **allowed_ops 已退役**(2026-10-20):配置按 `model.format/quant/head_quant`、
   `pool.kv_dtype`、`spec.depth`、`vision.enabled`、`parallel.mode` 自动派生
   tag filter;`[kernel] tag_wildcard = true` 是诊断 `*` 逃生门。

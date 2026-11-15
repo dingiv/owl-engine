@@ -85,7 +85,7 @@ const ALIGN_TAIL_MIN_REMAINING: usize = 1024;
 |---|---|
 | `pool.block_pool_bytes=256MiB`（累计批 + 块池） | append 141→142ms，无变化；host 不是客户端往返 |
 | `pool.kv_dtype=fp8` | 104ms，与 int8 持平；不是量化核问题 |
-| `runtime.int8_prefill_sync=false` | 106ms，无变化；末块前全设备 sync 不是主项 |
+| `runtime.int8_prefill_sync=false` | 106ms，无变化；末块前全设备 sync 不是主项（该键已于 2026-11-16 删除；同日根因修复后栅栏也已删除，见 1k 门 §6.6；此行保留当时记录） |
 | `prefill_chunk=128` | 已证伪（上一轮）：append 不变，cold 30k 5× 慢 |
 
 ## 5. 下一步：单块 105ms 的硬仗
