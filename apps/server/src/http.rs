@@ -21,6 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
+#[derive(Debug)]
 pub struct Request {
     pub method: String,
     /// 不含 query 的路径
@@ -61,14 +62,30 @@ pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Opti
     // 版本:请求行第三段(缺省/异形 = 非 1.1 ⇒ 后续 serve 拒;
     // chunked 应答是 1.1 语法,静默降级会跟复用判定撞车)
     let http_11 = request_line.split_whitespace().nth(2) == Some("HTTP/1.1");
-    let mut content_length = 0usize;
+    // Content-Length 用 `Option` 记账:**重复且不一致** = 走私向量,必须拒
+    let mut content_length: Option<usize> = None;
     let mut chunked = false;
     let mut conn_close = false;
     let mut conn_keep_alive = false;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             if k.trim().eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
+                // **不许静默降级**:头写坏当空体 ⇒ 下游只能报"JSON 非法",真因丢失
+                let n = v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Content-Length 非法: {:?}", v.trim()),
+                    )
+                })?;
+                if let Some(prev) = content_length {
+                    if prev != n {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("Content-Length 重复且不一致({prev} vs {n})"),
+                        ));
+                    }
+                }
+                content_length = Some(n);
             } else if k.trim().eq_ignore_ascii_case("transfer-encoding")
                 && v.to_ascii_lowercase().contains("chunked")
             {
@@ -87,6 +104,14 @@ pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Opti
         }
     }
     let keep_alive = if http_11 { !conn_close } else { conn_keep_alive && !conn_close };
+    // 两种定界同时给 = 经典走私向量(不同层取不同长度)⇒ 响亮拒
+    if chunked && content_length.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "同时给了 Content-Length 与 Transfer-Encoding: chunked",
+        ));
+    }
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_BODY {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "body 过大"));
     }
@@ -101,7 +126,23 @@ pub async fn read_request<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Opti
             }
             body.extend_from_slice(&chunk[..n]);
         }
-        body.truncate(content_length);
+        // 收到的字节数必须与声明**逐字节相等**:少 = 截断(不许静默当短体解析),
+        // 多 = 帧后残留(管线化 / 走私填充)—— 本服务面不支持,响亮拒。
+        if body.len() < content_length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("请求体截断:声明 {content_length}B,实收 {}B", body.len()),
+            ));
+        }
+        if body.len() > content_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "请求体后残留 {}B(不支持 HTTP 管线化)",
+                    body.len() - content_length
+                ),
+            ));
+        }
     }
     if body.len() > MAX_BODY {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "body 过大"));
@@ -146,7 +187,41 @@ async fn read_chunked<R: AsyncReadExt + Unpin>(
         let n = usize::from_str_radix(hex, 16)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("chunked 块长非法:{hex:?}")))?;
         if n == 0 {
-            return Ok(out); // 终止块(不解析 trailer —— 没人在此场景发)
+            // 终止块:先按语法跳过**可选 trailer 段**(空行结尾),再看残留。
+            // 旧实现直接 return ⇒ trailer 被当垃圾丢弃、管线化请求被静默吞掉。
+            loop {
+                let line_end = loop {
+                    if let Some(p) = find(&pending, b"\r\n") {
+                        break p;
+                    }
+                    if pending.len() > MAX_HEAD {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "chunked trailer 过长",
+                        ));
+                    }
+                    let got = r.read(&mut read).await?;
+                    if got == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "chunked 终止块后 trailer 未收全",
+                        ));
+                    }
+                    pending.extend_from_slice(&read[..got]);
+                };
+                let empty = line_end == 0;
+                pending.drain(..line_end + 2);
+                if empty {
+                    break;
+                }
+            }
+            if !pending.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("chunked 终止块后残留 {}B(不支持 HTTP 管线化)", pending.len()),
+                ));
+            }
+            return Ok(out);
         }
         if out.len() + n > MAX_BODY {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "body 过大"));
@@ -164,15 +239,22 @@ async fn read_chunked<R: AsyncReadExt + Unpin>(
     }
 }
 
+/// 状态行的 reason-phrase。
+///
+/// **未知码不再回落 "OK"**(2026-11-16):那会让线上的 `505`/`502` 变成
+/// `HTTP/1.1 505 OK` —— 状态行说谎比缺文案更糟。新增响应码时必须在这里登记;
+/// 未登记 = `Unknown`,一眼可见。
 fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
         400 => "Bad Request",
-        429 => "Too Many Requests",
         404 => "Not Found",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
-        _ => "OK",
+        505 => "HTTP Version Not Supported",
+        _ => "Unknown",
     }
 }
 
@@ -413,5 +495,102 @@ mod tests {
             "{s:?}"
         );
         assert!(s.ends_with("0\r\n\r\n"), "终止块:{s:?}");
+    }
+
+    // ── 2026-11-16 定界/状态行收口(全部零 GPU,纯帧)──
+
+    /// 状态行的 reason-phrase 不得撒谎(旧版未知码回落 "OK" ⇒ `505 OK`)
+    #[tokio::test]
+    async fn status_line_reason_phrase_matches_code() {
+        for (code, want) in [
+            (502u16, "HTTP/1.1 502 Bad Gateway"),
+            (505, "HTTP/1.1 505 HTTP Version Not Supported"),
+            (429, "HTTP/1.1 429 Too Many Requests"),
+        ] {
+            let mut out: Vec<u8> = Vec::new();
+            super::respond_json(&mut out, code, &serde_json::json!({}))
+                .await
+                .expect("respond");
+            let s = String::from_utf8(out).expect("utf8");
+            assert!(s.starts_with(want), "{code} 状态行:{s}");
+        }
+        assert_eq!(super::status_text(599), "Unknown", "未登记的码不许冒充 OK");
+    }
+
+    /// 声明长度 ≠ 实收:少 = 截断,必须报错(旧版静默 truncate)
+    #[tokio::test]
+    async fn truncated_body_is_rejected() {
+        let raw = "POST /x HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc";
+        let mut cur = raw.as_bytes();
+        let err = read_request(&mut cur).await.expect_err("应拒");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{err}");
+        assert!(err.to_string().contains("截断"), "{err}");
+    }
+
+    /// Content-Length 非法不再当 0(旧版 `unwrap_or(0)`)
+    #[tokio::test]
+    async fn invalid_content_length_is_rejected() {
+        let raw = "POST /x HTTP/1.1\r\nContent-Length: ten\r\n\r\n";
+        let mut cur = raw.as_bytes();
+        let err = read_request(&mut cur).await.expect_err("应拒");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("Content-Length 非法"), "{err}");
+    }
+
+    /// 重复且不一致的 Content-Length = 走私向量
+    #[tokio::test]
+    async fn duplicate_content_length_is_rejected() {
+        let raw = "POST /x HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab";
+        let mut cur = raw.as_bytes();
+        let err = read_request(&mut cur).await.expect_err("应拒");
+        assert!(err.to_string().contains("重复且不一致"), "{err}");
+    }
+
+    /// CL + chunked 同时给 = 两种定界 ⇒ 拒
+    #[tokio::test]
+    async fn content_length_plus_chunked_is_rejected() {
+        let raw = concat!(
+            "POST /x HTTP/1.1\r\n",
+            "Content-Length: 3\r\n",
+            "Transfer-Encoding: chunked\r\n\r\n",
+            "3\r\nabc\r\n0\r\n\r\n"
+        );
+        let mut cur = raw.as_bytes();
+        let err = read_request(&mut cur).await.expect_err("应拒");
+        assert!(err.to_string().contains("同时给了"), "{err}");
+    }
+
+    /// 帧后残留(管线化/走私填充)显式拒 —— 旧版直接丢弃
+    #[tokio::test]
+    async fn pipelined_bytes_are_rejected() {
+        let raw = "POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\n\r\n";
+        let mut cur = raw.as_bytes();
+        let err = read_request(&mut cur).await.expect_err("应拒");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("管线化"), "{err}");
+    }
+
+    /// chunked 合法 trailer 要**跳过**(旧版当垃圾丢;新增解析不能误拒)
+    #[tokio::test]
+    async fn chunked_trailer_is_skipped() {
+        let raw = concat!(
+            "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "3\r\nabc\r\n0\r\nX-Sum: 1\r\n\r\n"
+        );
+        let mut cur = raw.as_bytes();
+        let req = read_request(&mut cur).await.expect("read").expect("some");
+        assert_eq!(req.body, b"abc");
+    }
+
+    /// chunked 终止块之后还有字节 = 管线化 ⇒ 拒
+    #[tokio::test]
+    async fn chunked_leftover_after_terminal_is_rejected() {
+        let raw = concat!(
+            "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "3\r\nabc\r\n0\r\n\r\nGET /next HTTP/1.1\r\n\r\n"
+        );
+        let mut cur = raw.as_bytes();
+        let err = read_request(&mut cur).await.expect_err("应拒");
+        assert!(err.to_string().contains("管线化"), "{err}");
     }
 }

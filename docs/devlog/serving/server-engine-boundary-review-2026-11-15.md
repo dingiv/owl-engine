@@ -315,3 +315,330 @@ SIGTERM 后主线程 join 挂死（实测 30s 未退，只能 KILL）。修法�
 - `/debug/launches` 与 `BlockLedgerRow` 的投影归 engine（C 组收尾）；
 - 会话串行下沉（P4，删 `session_gate`）；
 - 视觉预处理 → `owl_models`（P5）。
+
+---
+
+## 8. B 组缺陷修复（2026-11-16，复审第二轮）
+
+> 同一工作树 `review/server-sink`；P1 已提交（`104a1547`），本节改动**未提交**。
+> 触发：P1 之后复审 server 代码，发现的问题全部属"server 自己的实现"而非边界归属。
+
+### 8.1 判据
+
+P1 把设备/装配/泵切干净后，server 只剩 HTTP/SSE、OpenAI/agent 协议、进程生命周期。
+这轮复审确认**没有新的结构性违规**，但实现层有 6 处该响不响 / 该快不快的地方。
+
+### 8.2 修了什么
+
+| 编号 | 问题 | 位置 | 修法 |
+|---|---|---|---|
+| **H1** | 状态行说谎：`status_text` 缺 502/505，`_ => "OK"` ⇒ 线上是 `HTTP/1.1 505 OK` / `502 OK` | `http.rs:status_text` | 补 502 `Bad Gateway` / 505 `HTTP Version Not Supported`；未登记码回落 `Unknown`（新增响应码必须登记） |
+| **H2** | permit 白名单只收 `/debug/queue|/health|/v1/models`，其余一律先占 turn 位 ⇒ 满并发时 `/debug/metrics`、`/debug/launches`、`/debug/perf`、`/debug/log`、`/debug/step` 被并发位自己锁死；`/debug/load` 自己绕 permit 却占一位跑完全程 | `main.rs::serve` | 显式 `PermitScope{Free,Engine,Turn}` 策略表：`Turn` 仅 chat（在会话闸后自取）、`Engine` 仅 `/tokenize`、其余（含全部 `/debug/*`、`/debug/load`、未知路径）`Free` |
+| **H3** | 会话闸拿在模板渲染 + 图像预处理**之后** ⇒ 同会话第二个请求白做 ~430ms/张的预处理 | `openai.rs::chat` | 会话 id 计算 + `gates.acquire` 提到 `tpl.render` 之前；permit 仍在闸之后、提交之前 |
+| **M1** | 请求定界静默降级：`content_length = parse().unwrap_or(0)`；短体直接 `truncate`；管线化残留字节丢弃；chunked trailer/残留丢弃 | `http.rs::read_request` / `read_chunked` / `serve` | 非法/重复不一致 Content-Length 拒；CL+chunked 同给拒；短体报"截断"；帧后残留报"不支持管线化"；chunked trailer 按语法跳过、终止块后残留拒；`serve` 对帧错误**先回 400 再关** |
+| **M2** | 断流收尾 4 处手写（关 sink → 取消 → 等回执），超时 5s 内的两把锁语义没写清 | `openai.rs` | 收成 `close_and_abort()` + `drop_turn!` 宏单一路径；`ABORT_ACK_TIMEOUT` 具名并写清"为何必须持会话闸等回执"（真解在 P4） |
+| **M3** | `/debug/queue`、`/debug/step` 回执、`/debug/log` 状态的 JSON 形状内联在 `main::handle` | `main.rs` → `debug.rs` | 搬成 `debug::{queue_json, step_action_json, log_state_json}`，现都可单测 |
+
+### 8.3 证据
+
+```text
+cargo check -p server --tests       零错零 warning
+cargo test -p server --bin server   113 passed（新增:http 定界/状态行 8 项、permit 策略表 1 项）
+cargo test -p server --test config_check  3 红 = 存量（期望 max_seq=79872 / profile 是 57344），无新增
+--check（qwen38_27b-3090.toml）     输出形状不变，exit 0
+单 3090（UUID 钉卡，8399，max_concurrency=1，spec off）:
+  chat 非流式 / SSE / tokenize / queue / vram / blocks   全通
+  H2 证明:流式 turn 占满唯一 permit 时 /debug/metrics 0.10s、/debug/vram 0.16s 返回
+  M1 证明(裸 socket): 非法 CL → 400 Bad Request；管线化 → 400；
+                      短体 → 400「请求体截断:声明 20B,实收 15B」；HTTP/1.0 → 505 正确文案
+  SIGTERM → 0.85s 退出、GPU 归 18MiB
+```
+
+### 8.4 这轮**没有**做（仍是 P2–P5）
+
+- `config.rs` 的检查点几何预检（P2，`engine::preflight`）；
+- 结构化准入拒绝 + `/debug/launches`/`BlockLedgerRow` 投影收编（P3）；
+- 会话串行下沉 / 删 `session_gate`（P4）—— M2 的 5s 等待真解在这里；
+- `vision_processor` → `owl_models`（P5）。
+
+### 8.5 复审新发现、留给后续的边界残留
+
+| 位置 | 内容 | 建议 |
+|---|---|---|
+| `chat_tpl.rs::load_gguf` | server 直接 `Gguf::open` 读 `tokenizer.chat_template` KV —— 模型格式知识漏到协议层 | `owl_models` 出「模板资产」loader（与 GGUF/快照同源） |
+| `openai.rs::SINK_CAPACITY` / `main.rs::CHANNEL_CAPACITY` | 事件通道深度与请求通道深度都由 server 定；`deliver().await` 背压直接决定引擎每拍节奏 | 默认值给 engine（server 可覆盖），或明确记为"服务面契约" |
+| `debug.rs::r_events` / `recon_json` | 投影签名钉死 `owl_store::StoreReport` / `owl_iface::contract::BlockLedgerRow` | 让 `DiagSnapshot` 给投影中立形状，server 才能真删后端依赖 |
+
+---
+
+## 9. P2 预检下沉（2026-11-16）
+
+> 工作树 `review/server-sink`；改动**未提交**（与 §8 同批）。
+
+### 9.1 形态
+
+新增 `crates/engine/src/preflight.rs`（387 行，含 4 项单测）：
+
+```rust
+pub enum CheckItem { Pass(String), Fail(String) }      // 报告文本，不带 [check] 前缀
+pub struct CheckLines { pub items: Vec<CheckItem> }    // 顺序即报告顺序
+
+pub struct ModelCheckSpec<'a> { path, format, quant, head_quant, embed_quant,
+                                max_seq, vision, vision_path, profile }
+pub fn check_model_dir(spec) -> Result<CheckLines, String>;  // Err 仅配置级（臂分派）
+pub fn check_draft_dir(dir: &Path) -> CheckLines;            // DFlash2 / pack-quantized / GGUF
+pub fn check_mtp_head(dir: &Path) -> CheckLines;             // mtp.* 键 / nextn.eh_proj
+```
+
+engine 内部完成 `load_arm_of → LoadIntent → open_decl → check_geom_against →
+视觉声明 → 摘要`（与 boot 同一份解析），server 只：
+1. 决定「该查哪个目录」（配置语义：`model.path` 缺省 0.8B 资产、`spec.draft`
+   的 dflash2/mtp/dumb 分支、`model.mtp_dir` 覆盖）；
+2. 用 `push_check()` 按既有前缀打印。
+
+**server 不再认识** `LoadArm` / `LoadIntent` / `open_decl` / `pack-quantized` /
+`mtp.*`——`config.rs` 净减 ~130 行（`check_model_decl`/`check_draft_dir`/
+`check_mtp_head` 三个函数 162 行整体删除，换 33 行排版 + 26 行调用）。
+
+### 9.2 硬门：`--check` 输出逐字不变
+
+基线在改动**前**用同一台机器抓取（`/tmp/chk-before/`），改后重跑 diff：
+
+```text
+IDENTICAL full.out
+IDENTICAL qwen38_27b-3080_tp2.out
+IDENTICAL qwen38_27b-3090.out
+IDENTICAL qwen38_27b-4080.out
+IDENTICAL qwen38_27b-gguf_3090.out
+IDENTICAL qwen38_27b-gguf-iq3_3090.out
+IDENTICAL bad-awq-gguf.out      （format=awq + .gguf 路径，exit 1）
+IDENTICAL bad-bf16-draft.out    （z-lab BF16 草稿，exit 1）
+```
+
+其余门：`cargo test -p owl-engine --lib` **244 passed**（含 preflight 4 项）；
+`cargo check -p server --tests` 零错零 warning；`config_check` 3 红 = 存量。
+
+### 9.3 真机：双 3090 Ti TP2（8398，UUID 钉卡，spec off）
+
+```text
+起机 27s（TP2 装配 25.6s；rank0/rank1 staging 自证 err=0；捕获态 Captured）
+chat 非流式  → 「中国」（prompt 57 / completion 22 / reasoning 20，usage 真账）
+chat SSE     → include_usage 末帧正确（cached_tokens=32 命中校正）
+tokenize     → count=2 / max_model_len=8448
+/debug/blocks → 逐 rank（3050 块，dup_ids/overlaps 空，clean）
+/debug/vram  → recon only_block=13，名字全可解释：tp.peer.r0 / tp.staging.r0 / selfcheck.marlin.*
+断流弃置      → FIN 分支命中：「弃置 turn Some(3)」+ executor「投递失败 ⇒ 弃置」
+H2           → 在飞唯一 turn 时 /debug/metrics 0.14s、/debug/vram 0.33s
+SIGTERM      → 1.28s 退出、两把卡锁释放、两张 3090 归 18MiB
+```
+
+> 生产 8135（双 3080 TP2）全程未动；期间观察到它被外部重启两次
+> （`499133 → 557365 → 578445`，cgroup 在 `session-2.scope`，非 systemd），
+> 与本轮无关。
+
+### 9.4 剩余（P3–P5）
+
+P3 结构化准入拒绝 + `/debug/launches`/`BlockLedgerRow` 收编；P4 会话串行下沉；
+P5 视觉预处理 → `owl_models`。另见 §8.5 的三条新边界残留。
+
+---
+
+## 10. P3 准入结构化 + 诊断投影收编（2026-11-16）
+
+> 工作树 `review/server-sink`；改动**未提交**（与 §8/§9 同批）。
+
+### 10.1 结构化准入拒绝（去掉错误串解析）
+
+引擎新增（`crates/engine/src/serve/turn.rs`）：
+
+```rust
+pub struct AdmissionReject { code: &'static str, retry_in_ms: Option<u64>, detail: String }
+impl Display for AdmissionReject   // 仍是 "admission:<code> retry_ms=<n> —— <detail>"（日志不变）
+
+pub struct TurnError { message: String, reject: Option<AdmissionReject> }
+impl Display for TurnError          // 仍是 message（日志/既有断言不变）
+
+pub enum SubmitError { Rejected(AdmissionReject), Engine(ModelError) }   // running.rs
+impl RunningEngine {
+    pub fn submit_session_opts(..)    -> Result<..>        // 旧面，43 个调用点零改动
+    pub fn submit_session_checked(..) -> Result<.., SubmitError>   // 新面（service 用）
+}
+```
+
+事件形状：`TurnEvent::Failed { turn, err: TurnError }`、`StreamEvent::Rejected { err: TurnError }`
+—— 字段名不变、`Display` 不变，所以**引擎 50+ 处测试模式零改动**（`{ turn, err }` 仍匹配）。
+
+三个产生点全部结构化：`submit` 的 `no_slot`（带 `retry_ms` EWMA）、调度准入的
+`no_memory`/`queue_timeout`/`session_busy`、`reject_queued_turn` 的池墙拒。
+
+服务面（`openai.rs`）删除 `admission_code()` / `admission_retry_ms()`（**不再解析任何错误串**），
+改为 `err.reject()` + `retry_after_secs(&AdmissionReject)`（`ceil(ms/1000)` 夹 1..=30，
+无估计 = 5s，与旧口径逐值一致）。`error_json_for_reject` 的"超预算 → 400
+context_length_exceeded"路径不变（那是另一类拒绝，仍看文案标记）。
+
+### 10.2 诊断投影收编（server 摘掉 `owl-cuda` / `owl-iface`）
+
+`service/diag.rs` 新增引擎面稳定形状：
+
+```rust
+pub struct BlockRow { id, bytes, addr, ledger, name }        // From<owl_iface::..BlockLedgerRow>
+pub struct LaunchRow { seq, t_us, cmd, stream, name, grid, block, smem, bytes, ids, out_id, ptrs }
+pub struct LaunchTrace { enabled, capacity, in_ring, total, rows }
+pub fn launch_trace(n, kind) -> LaunchTrace                  // 进程级 trace 环，零引擎往返
+```
+
+`DiagSnapshot.blocks` 改为 `Vec<(u8, Result<Vec<BlockRow>, String>)>`；
+`debug.rs` 只做 JSON。`apps/server/Cargo.toml` 删 `owl-cuda` / `owl-iface` 两个依赖，
+build-time 代际 feature 改由 `owl-engine` 代转（engine 新增 `arch-*` / `fi-*` / `cupti`
+转发，单源仍是 `owl-kernels`）。`owl-store` 仍留（`StoreReport` 尚未投影中立化，见 §8.5）。
+
+### 10.3 证据
+
+```text
+cargo test -p owl-engine --lib                    244 passed
+cargo test -p owl-engine --test store_admission_gate  7 passed（新增 no_memory 结构化断言）
+cargo test -p server --bin server                 114 passed（admission 测试改为结构面）
+cargo check -p server --tests                     零错零 warning
+--check 6 档 + 2 坏例                             仍逐字 IDENTICAL
+```
+
+双 3090 Ti TP2 真机（8398，`trace_ring=256`，`max_queue=1`，`max_concurrency=4`）：
+
+| 场景 | 结果 |
+|---|---|
+| chat | 200，usage 真账 |
+| **并发 4 打 `no_slot`** | #1/#2 200；**#3/#4 → `429` + `Retry-After: 6` + `code:"no_slot"`**（结构穿透，零解析） |
+| `/debug/launches/3` | `enabled=true cap=256 in_ring=256 total=30177`，行含 `cmd/stream/ptrs`；`/launches/2/launch` 过滤生效 |
+| `/debug/blocks` | 逐 rank 3022 块 `clean:true`，键 = `name/id/bytes/addr/ledger`（BlockRow） |
+| `/debug/vram` | 双 rank recon 正常（13 unaccounted = tp.peer/staging/selfcheck，可解释） |
+| SIGTERM | 1.26s，双卡归 18MiB |
+
+> 老行为保持：`429` 的 `type`/`code`/`Retry-After` 与旧版逐值一致（旧版是从
+> `retry_ms=5xxx` 解出 6）。
+
+### 10.4 剩余
+
+P4 会话串行下沉（删 `session_gate`；M2 的 5s 回执等待随之消失）、P5 视觉预处理 →
+`owl_models`；§8.5 三条边界残留（模板 loader / 通道容量 / `StoreReport` 中立化）。
+
+---
+
+## 11. P4 会话串行下沉（2026-11-16）
+
+> 工作树 `review/server-sink`；改动**未提交**（与 §8–§10 同批）。
+
+### 11.1 形态
+
+同会话串行从"服务面闸"搬进引擎队列：
+
+| 位置 | 旧 | 新 |
+|---|---|---|
+| 引擎 `submit` | `max_batch>1` 且同会话已有活跃/排队 ⇒ **硬拒**（`submit: 会话 … 已有活跃/排队 turn`） | **接受并入队**；顺序在队里 |
+| 引擎 `scheduler::schedule` | `queue.front()` 判决 + `pop_front()` 起跑 | `startable_queue_idx()` 选**第一个会话空闲**的候选；判决/出队/起跑都用它 |
+| 引擎 `admission_gate` | 判 `queue.front()`（会把还不能起的 turn 误判/误拒） | 判同一个候选 |
+| 引擎 `admission_pending` | 与队首比 | 与候选比 |
+| 服务面 | `session_gate.rs`（127 行 + 3 单测）在提交前串行 | **模块删除**；`ConnCtx` / `chat()` 去掉闸参数 |
+| 提交预算 | 命中估计 = 会话账现值 | **同会话有活跃/排队 turn 时记 0**（会话仍在写 ⇒ 账是未来态；真值由 `CachedTokens` 帧校正） |
+
+`Reason::SessionBusy` 与 `sched_policy` 的会话守卫**保留**：现在它是"候选选择失守"
+的不变量兜底（正常路径不可达，单测仍覆盖）。
+
+**断流取消的按会话兜底也补了一刀**：P4 之后同会话可以"活跃 1 条 + 排队 N 条"，
+而客户端在 `Accepted` 之前断开时只带 session。旧 `cancel_session` 先取活跃 ⇒
+会误杀**上一条**请求。新增 `RunningEngine::session_turns(session)`（活跃在前，
+其后按提交序），pump 的按会话取消改为**优先挑接收方已关的那一条**，都不关才回
+老口径。
+
+### 11.2 行为变化（有意）
+
+- 同会话并发**不再 429 / 不再被服务面阻塞**，而是进引擎队列（`/debug/queue` 可见）；
+- 断流取消的回执等待（`ABORT_ACK_TIMEOUT`）不再是正确性依赖，只用于尽快让取消落地；
+- 合批档（`max_batch>1`）下同会话仍严格串行；跨会话照旧合批。
+
+### 11.3 证据
+
+```text
+cargo test -p owl-engine --lib      245 passed（新增 same_session_queues_instead_of_rejecting）
+cargo test -p server --bin server   111 passed（−3 = 删掉的 session_gate 单测）
+cargo check -p server --tests       零错零 warning
+config_check                        3 红 = 存量
+```
+
+真机（**双 3090 TP2** 8398，`max_batch=1` 与 TP 不兼容）：同会话两个并发请求
+→ 中途 `/debug/queue` 拍到 `queue 1 active 1`、`queued[0].waited_ms≈978`，
+两个都 **200**，`rejects` 为空（旧行为：第二个会被服务面闸挡住或撞 429）。
+
+真机（**单 3090** 8397，`max_batch=2`，`gdn_slots=4`）：
+
+| 场景 | 结果 |
+|---|---|
+| 跨会话并发两请求 | `active=2 batch_steps 0→95`（真合批），两个 200，各 3.07s |
+| 同会话并发两请求 | 全程 `active` 最大 = **1**（串行），两个 200（2.37s / 1.96s） |
+| 同会话排队中客户端断开 | t=2s 拍到 `queue 1 active 1`；先到的那条**不受影响**（200 / `finish=length` / 160 tok），只有断开的 turn 被弃置 |
+| SIGTERM | 0.85s，卡锁释放，GPU 归 18MiB |
+
+### 11.4 剩余
+
+P5 视觉预处理 → `owl_models`；§8.5 三条边界残留（模板 loader / 通道容量 /
+`StoreReport` 中立化）；§6.2 双闸中"`max_concurrency` 是服务面策略"已在
+`PermitScope` 里定调（turn 位），引擎准入仍是硬约束。
+
+---
+
+## 12. P5 视觉预处理 → `owl_models`（2026-11-16）
+
+> 工作树 `review/server-sink`；改动**未提交**（与 §8–§11 同批）。
+
+### 12.1 形态
+
+```text
+owl_models::vlm::preprocess                        ← 新增（crates/models/src/vlm/preprocess.rs）
+  pub const PATCH/TEMPORAL/MERGE/MIN_PIXELS/MAX_PIXELS
+  pub fn smart_resize(h, w, max_pixels) -> Result<(usize, usize), String>
+  pub fn from_bytes(bytes: &[u8], max_pixels) -> Result<VlmImage, String>
+  pub fn from_image(img: DynamicImage, max_pixels) -> Result<VlmImage, String>
+  （内部：PIL BICUBIC 两趟 u8 重采样 / weights / bicubic / clamp / patchify 原样搬）
+
+apps/server/src/vision_processor.rs                ← 394 → 152 行
+  pub fn from_data_url(url, max_pixels) -> Result<VlmImage, String>
+    = data URL 解析（base64）+ LRU 内容缓存（8 张）+ 调 models::preprocess::from_bytes
+```
+
+`crates/models/src/vlm.rs` → `crates/models/src/vlm/mod.rs`（加 `pub mod preprocess;`）。
+`owl-models` 新增 `image` 依赖（png/jpeg）；`apps/server` **删掉 `image` 依赖**
+（server 只剩 base64）。
+
+### 12.2 门
+
+**像素指纹（搬家门）**：搬家**前**在旧实现（server）上采真图全链指纹，
+搬家后固化为常量：
+
+```text
+assets/images/bird.png → grid=(1,34,22)  len=1_148_928
+FNV-1a(f32 bits) = 0xd44c4b2a274d0a91
+```
+
+`vlm::preprocess::parity_exact::bird_pixel_fingerprint` 断言这三项 ⇒ **一个 bit
+都没动**。（顺带修了两个陈年死测试：`parity_probe` / `parity_exact` 的资产路径
+`../../../../assets/bird.png` 从来读不到，一直在静默 return；现改为
+`../../assets/images/bird.png`，真跑。）
+
+```text
+cargo test -p owl-models --lib                 330 passed（+5 = preprocess）
+cargo test -p server --bin server              108 passed（−4 搬家 +1 bad_base64）
+cargo check -p server --tests                  零错零 warning
+```
+
+**VLM e2e（答案不变）**：单 3090、`vision.enabled=true`、bird.png 走 data URL、
+`temperature=0 seed=7 max_tokens=220`，搬前/搬后（各自冷启实例）逐字节相同：
+
+```text
+content = "Penguin"
+reasoning = （66 tok，逐字相同）  finish = stop
+usage = prompt 249 / completion 69   （搬前搬后一致）
+```
+
+### 12.3 剩余
+
+§8.5 三条边界残留（模板 loader / 通道容量 / `StoreReport` 中立化）。
+评审卷 §5 的 P1–P5 到此**全部落地**。

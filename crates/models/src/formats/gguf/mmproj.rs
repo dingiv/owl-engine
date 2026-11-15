@@ -132,7 +132,7 @@ pub fn vision_cfg(g: &Gguf) -> Result<VisionCfg, ModelError> {
         .opt_f32("clip.vision.attention.layer_norm_epsilon")
         .map_err(&ctx)?
         .unwrap_or(1e-6);
-    // 预处理面(srv `vision_processor`)固定 mean/std=0.5;mmproj 若声明别的值,
+    // 预处理面(`vlm::preprocess`,2026-11-16 P5 从 server 迁入)固定 mean/std=0.5;mmproj 若声明别的值,
     // 塔的输入分布就不成立 —— 装载期拒,别让服务面静默错值。
     for (key, want) in [("clip.vision.image_mean", 0.5f32), ("clip.vision.image_std", 0.5f32)] {
         if let Some(v) = kv.opt_f32s(key).map_err(&ctx)? {

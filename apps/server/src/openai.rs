@@ -305,7 +305,8 @@ impl ChatRequest {
 
     /// **收集并预处理图像**(内容顺序 = 模板 `<|image_pad|>` 顺序)。
     ///
-    /// 仅 data URL;`vision_processor` 负责 Qwen2VL 的 resize/patchify。
+    /// 仅 data URL;`vision_processor` 只做 base64 解码 + 内容缓存（P5 起
+/// Qwen2VL 的 resize/patchify 在 `owl_models::vlm::preprocess`）。
     /// 无图像 = 空(纯文本逐字节旧行为)。
     ///
     /// **可删标记**(前缀无感删除;2026-10-23 用户裁决):图像 content part 上
@@ -618,6 +619,14 @@ fn preview(s: &str) -> String {
 /// 引擎事件回流通道深度(与提交通道同档;R2 命名)
 const SINK_CAPACITY: usize = 64;
 
+/// **取消回执的等待上限**。
+///
+/// 2026-11-16 P4 后它**不再是正确性依赖**（会话串行在引擎队列里，同会话后继
+/// turn 自己会等前一个终了）。仍等回执是为了让取消尽快落地、别把队列位占着。
+/// 引擎在**步边界**处理取消，实测通常 <1.2s；5s 是「引擎已经不正常」的兜底，
+/// 超时只告警（不静默）并继续收尾。
+const ABORT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 应答出口策略(流式 = 逐帧发射;非流式 = 聚合整包)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReplyMode {
@@ -732,9 +741,7 @@ pub(crate) async fn chat(
     agent: &AgentCfg,
     // `/debug/agent` 诊断环(G5②):每轮必落一条(`TurnLedger` 的 Drop 是兜底网)
     trace: &Arc<AgentTrace>,
-    // **会话闸**(B5.1):同会话串行(引擎在 max_batch>1 时对同会话并发硬拒)
-    gates: &Arc<crate::session_gate::SessionGates>,
-    // **并发 permit**(P0):必须在会话闸**之后**取 —— 见 `serve()` 的注释
+    // **并发 permit**：在会话解析之后取（同会话的排队交给引擎，不再占位）
     gate: &Arc<tokio::sync::Semaphore>,
     // 原始请求 JSON 落盘目录（None = 关）
     request_dump_dir: Option<&std::path::Path>,
@@ -781,6 +788,17 @@ pub(crate) async fn chat(
     // (模板自持值域: none|low|medium|high|xhigh|…)。请求 > 配置缺省
     let kw = req.effective_template_kwargs();
     let kw_ref = if kw.is_empty() { None } else { Some(&kw) };
+    // ── 会话身份 ──
+    //
+    // 会话 id 只有两个消费者：前缀复用（同会话增量）与断流取消点名。
+    // **会话串行已下沉引擎**（2026-11-16 P4）：同会话第二个 turn 由引擎排队，
+    // 在会话空闲前不会起跑（`startable_queue_idx`）—— 服务面不再有闸，
+    // 也不再需要"闸之后才取 permit"的次序纪律（合并批档 SSE 语义不变）。
+    let session = match req.session.as_deref().map(session_id) {
+        Some(id) => Some(id),
+        None if agent.implicit_session => Some(IMPLICIT_SESSION),
+        None => None,
+    };
     // 渲染:唯一权威 = 快照模板(§4.3 R2);模板拒(如 system 含图像)= 400
     let mut prompt = match tpl.render(RenderArgs {
         messages: &req.messages,
@@ -811,22 +829,6 @@ pub(crate) async fn chat(
         .map(|i| (i.image.grid.1 * i.image.grid.2) / 4)
         .sum::<usize>();
     let evict_images = images.iter().filter(|i| i.evict).count();
-    // 会话身份:显式 `session` 键优先;缺省按 [agent] implicit_session 落到
-    // 隐式会话 0(AGT-09:pi 每轮全量重发历史 ⇒ 前缀增量命中;守卫失配
-    // 自回退全量重算,正确性不依赖客户端)
-    let session = match req.session.as_deref().map(session_id) {
-        Some(id) => Some(id),
-        None if agent.implicit_session => Some(IMPLICIT_SESSION),
-        None => None,
-    };
-    // **会话闸**(B5.1 服务面契约):同一会话在引擎里**只许一个 turn**
-    // (引擎 `submit_session_opts` 在 max_batch>1 时对同会话并发**硬拒** ——
-    // 共享 KV/GDN = 结构性互踩,调度修不了)。闸覆盖 提交 → 终态 → 响应收尾;
-    // 跨会话不受影响(那正是合批的原料)。无会话(临时)= 不需要闸。
-    let _session_guard = match session {
-        Some(id) => Some(gates.acquire(id).await),
-        None => None,
-    };
     // **并发位**：闸之后再占（同会话排队不占 permit；跨会话才竞争）
     let _permit = gate.acquire().await;
     // G5②:诊断环开账(此后的每一条返回路径都可见 —— 显式 fail 或 Drop 兜底)
@@ -915,19 +917,23 @@ pub(crate) async fn chat(
         }
         Some(StreamEvent::Rejected { err }) => {
             led.fail(format!("提交被拒:{err}"));
-            // **容量拒绝**（引擎 submit 边界的 `admission:<code>`）⇒ 429；
+            // **容量拒绝**（引擎 submit 边界的结构化 `AdmissionReject`）⇒ 429；
             // 其余（预算越界）仍走 pi 能认的 400 context-overflow 报文。
-            if let Some(code) = admission_code(&err) {
-                let retry = retry_after_secs(&err).to_string();
+            if let Some(reject) = err.reject() {
+                let retry = retry_after_secs(reject).to_string();
                 return http::respond_json_hdr(
                     w,
                     429,
-                    &error_json_rate_limit(code, "服务端容量不足（排队已满）—— 请按 Retry-After 退避重试"),
+                    &error_json_rate_limit(
+                        reject.code(),
+                        "服务端容量不足（排队已满）—— 请按 Retry-After 退避重试",
+                    ),
                     &[("Retry-After", retry.as_str())],
                 )
                 .await;
             }
-            return http::respond_json(w, 400, &error_json_for_reject(err)).await
+            return http::respond_json(w, 400, &error_json_for_reject(err.message().to_string()))
+                .await;
         }
         // 契约:首笔必为 Accepted/Rejected(executor 在 pump 前投递)⇒ 不会走到
         // 这里(真走到 = 协议序错乱,不静默吞)
@@ -979,13 +985,23 @@ pub(crate) async fn chat(
                 // **先关 sink 再等回执**(2026-10-20 真机定谳):本任务若还持有
                 // `sink_rx` 等 abort 回执,executor 的投递就一直成功 ⇒ 它**察觉不到**
                 // 断流,会把整个 turn 跑完(实测:256 tok 的流断掉后仍烧满 5s+,
-                // 回执超时、会话闸也被拖住)。`close()` 让 executor 下一笔投递失败
+                // 回执超时、队列位也被拖住)。`close()` 让 executor 下一笔投递失败
                 // ⇒ 走既有 "断流 ⇒ 弃置"(≤1 采样步)。
                 sink_rx.close();
                 abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
                 return Err(e);
             }
         };
+    }
+    // **断流收尾单一路径**:日志 → 关 sink → 指名取消 → 等回执 → 返回。
+    // 三处断流源(保活写失败 / 对端 FIN / select 里的保活到点)共用它 ——
+    // 旧版三份手写序列,改一处漏两处。
+    macro_rules! drop_turn {
+        ($fmt:literal $(, $arg:expr)*) => {{
+            owl_shared::log_info!("chat", $fmt, $($arg),*);
+            close_and_abort(&mut sink_rx, &tx, session, turn).await;
+            return Ok(());
+        }};
     }
     if mode == ReplyMode::Stream {
         match clamped_max_new {
@@ -1019,14 +1035,10 @@ pub(crate) async fn chat(
         // 断流照样白跑到尾)。
         if ka_at.is_some_and(|t| tokio::time::Instant::now() >= t) {
             if let Err(e) = http::sse_comment(w, "keepalive").await {
-                owl_shared::log_info!(
-                    "chat",
+                drop_turn!(
                     "保活帧写失败({e}) ⇒ 客户端已断流,弃置 turn {:?}(prefill 阶段也可停)",
                     turn.map(|(_, t)| t)
                 );
-                sink_rx.close();
-                abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
-                return Ok(());
             }
             ka_at = Some(tokio::time::Instant::now() + ka_wait);
             continue;
@@ -1052,14 +1064,10 @@ pub(crate) async fn chat(
             // 有数据(HTTP 管线化)= 无法区分后续 EOF ⇒ 本请求内不再盯(还在
             // `peer_fin` 里永久挂起),由保活帧兜底。
             _ = peer_fin(w) => {
-                owl_shared::log_info!(
-                    "chat",
+                drop_turn!(
                     "读半就绪=对端已关(FIN 或 RST)⇒ 客户端已断流,弃置 turn {:?}(prefill 阶段也可停)",
                     turn.map(|(_, t)| t)
                 );
-                sink_rx.close();
-                abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
-                return Ok(());
             }
             // ② 静默到点 ⇒ 写一帧注释(失败 = 断流)
             _ = sleep_until_opt(ka_at) => {
@@ -1071,14 +1079,10 @@ pub(crate) async fn chat(
                     Err(e) => {
                         // 与 `emit!` 同一处置:先关 sink(executor 下一笔投递失败 ⇒
                         // 走"断流 ⇒ 弃置"),再指名取消 + 等回执
-                        owl_shared::log_info!(
-                            "chat",
+                        drop_turn!(
                             "保活帧写失败({e}) ⇒ 客户端已断流,弃置 turn {:?}(prefill 阶段也可停)",
                             turn.map(|(_, t)| t)
                         );
-                        sink_rx.close();
-                        abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
-                        return Ok(());
                     }
                 }
             }
@@ -1091,8 +1095,7 @@ pub(crate) async fn chat(
                     session
                 );
                 // 先关 sink（executor 下一笔投递失败 ⇒ 按断流弃置），再指名取消 + 等回执
-                sink_rx.close();
-                abort_turn(&tx, session, turn.map(|(_, t)| t)).await;
+                close_and_abort(&mut sink_rx, &tx, session, turn).await;
                 return respond_queue_timeout(w, mode).await;
             }
         };
@@ -1364,11 +1367,12 @@ pub(crate) async fn chat(
             }
             Some(StreamEvent::Turn(TurnEvent::Failed { err, .. })) => {
                 led.fail(format!("turn 失败:{err}"));
-                // **准入拒绝**(`admission:<code>`)：用 OpenAI 协议内的标准手段
-                // 表达 —— 非流式 `429 + Retry-After`;流式头已发,走既有错误帧收口
-                // (不自造 SSE 事件类型)。
-                if let Some(code) = admission_code(&err) {
-                    let retry = retry_after_secs(&err).to_string();
+                // **准入拒绝**(引擎结构化 `AdmissionReject`)：用 OpenAI 协议内的
+                // 标准手段表达 —— 非流式 `429 + Retry-After`;流式头已发,走既有
+                // 错误帧收口(不自造 SSE 事件类型)。
+                if let Some(reject) = err.reject() {
+                    let retry = retry_after_secs(reject).to_string();
+                    let code = reject.code();
                     let msg = format!(
                         "服务端容量不足（{code}）—— 在跑请求优先;请按 Retry-After 退避重试"
                     );
@@ -1396,11 +1400,12 @@ pub(crate) async fn chat(
                         }
                     };
                 }
+                let msg = err.message().to_string();
                 return match mode {
                     // SSE 中途错误:协议无标准错误帧,error json + DONE 收口
                     ReplyMode::Stream => {
                         // 客户端可能已断开(写失败属正常),但不许静默(律 #1)
-                        if let Err(e) = http::sse_data(w, &error_json(err).to_string()).await {
+                        if let Err(e) = http::sse_data(w, &error_json(&msg).to_string()).await {
                             owl_shared::log_info!("chat", "流式错误帧写失败(客户端可能已断开): {e}");
                         }
                         if let Err(e) = http::sse_data(w, "[DONE]").await {
@@ -1412,7 +1417,7 @@ pub(crate) async fn chat(
                         }
                         Ok(())
                     }
-                    ReplyMode::Aggregate => http::respond_json(w, 500, &error_json(err)).await,
+                    ReplyMode::Aggregate => http::respond_json(w, 500, &error_json(&msg)).await,
                 };
             }
             Some(StreamEvent::Turn(_)) => {}
@@ -1485,32 +1490,16 @@ async fn respond_queue_timeout<W: tokio::io::AsyncWrite + Unpin>(
     }
 }
 
-/// **引擎给出的退避建议**（`admission:<code> retry_ms=<n>`；无则 `None`）
-pub fn admission_retry_ms(err: &str) -> Option<u64> {
-    err.split_whitespace()
-        .find_map(|w| w.strip_prefix("retry_ms="))
-        .and_then(|v| v.parse::<u64>().ok())
-}
-
-/// 退避秒数 = `ceil(ms/1000)`，夹在 1..=30（客户端不该被估成分钟级）
-pub fn retry_after_secs(err: &str) -> u64 {
-    admission_retry_ms(err)
+/// **退避秒数**（引擎结构化拒绝的 `retry_in_ms` → `Retry-After`）。
+///
+/// 口径与旧版一致：`ceil(ms/1000)` 夹在 1..=30（客户端不该被估成分钟级）；
+/// 引擎没给估计 = 5s 保守值。**2026-11-16 P3**：输入从错误串改为结构化字段
+/// （`AdmissionReject`），服务面不再解析人读文本。
+pub fn retry_after_secs(reject: &owl_engine::turn::AdmissionReject) -> u64 {
+    reject
+        .retry_in_ms()
         .map(|ms| ms.div_ceil(1000).clamp(1, 30))
         .unwrap_or(5)
-}
-
-/// **准入拒绝的错误码**（引擎 `Failed{err:"admission:<code>"}` 的协议面投影）。
-///
-/// 单源：服务面只认这个前缀 —— 不新造 SSE 事件类型、不加私有字段；
-/// 非流式翻 `429 + Retry-After`（OpenAI 协议内的标准手段），流式走既有
-/// 错误帧收口。空码/非法码 = `None`（不猜，走普通错误路径）。
-pub fn admission_code(err: &str) -> Option<&str> {
-    // 只取**第一个词**作为码（引擎的错误串是 `admission:<code> —— 人类可读细节`；
-    // 把整段当 `code` 会污染客户端可见的协议字段）。
-    err.strip_prefix("admission:")
-        .map(|rest| rest.trim())
-        .and_then(|rest| rest.split_whitespace().next())
-        .filter(|c| !c.is_empty())
 }
 
 /// 客户端写失败 ⇒ 请求引擎弃置**该 turn**(AGT-10;B5.1 起必须指名)。
@@ -1518,17 +1507,37 @@ pub fn admission_code(err: &str) -> Option<&str> {
 /// 语义要点(合批档):
 /// - `turn` 已知(Accepted 之后)= 精确取消该 turn —— **不许**走"弃当前执行 turn"
 ///   (那会杀掉同批别家会话的 turn);
-/// - `turn` 未知(断在受理帧之前)= 按会话找(会话闸保证该会话至多一个 turn);
-/// - **等 executor 回执再返回**:会话闸在本函数返回后才释放(函数尾),这样下一次
-///   同会话提交不会撞上引擎的"同会话并发"硬拒。回执超时只告警(不静默)。
+/// - `turn` 未知(断在受理帧之前)= 按会话找（P4 后同会话可能有排队 turn，
+///   引擎按会话取消最早的那个）；
+/// - **等 executor 回执再返回**:让取消在步边界尽快落地（P4 后不再是闸的正确性
+///   依赖）。回执超时只告警(不静默)。
 async fn abort_turn(tx: &EngineClient, session: Option<u64>, turn: Option<u64>) {
     // 临时会话(None)= 无键可寻;引擎会在 sink drop 后自弃(executor 下一个投递点)
     let Some(session) = session else { return };
     let cancel = tx.cancel(session, turn);
-    match tokio::time::timeout(std::time::Duration::from_secs(5), cancel).await {
+    match tokio::time::timeout(ABORT_ACK_TIMEOUT, cancel).await {
         Ok(Ok(())) | Ok(Err(_)) => {}
-        Err(_) => owl_shared::log_warn!("chat", "abort 回执超时(5s;引擎可能正忙) "),
+        Err(_) => owl_shared::log_warn!(
+            "chat",
+            "abort 回执超时({ABORT_ACK_TIMEOUT:?};引擎可能正忙) "
+        ),
     }
+}
+
+/// 断流/取消收尾的**唯一路径**：关 sink → 指名取消 → 等回执。
+///
+/// 次序不可互换（2026-10-20 真机定谳）：本任务若还持有 `sink_rx` 等 abort 回执，
+/// 引擎的投递就一直成功 ⇒ 它**察觉不到**断流，会把整个 turn 跑完（实测：256 tok
+/// 的流断掉后仍烧满 5s+）。`close()` 让引擎下一笔投递失败 ⇒ 走既有「断流 ⇒ 弃置」
+/// （≤1 采样步），再叠加一次指名取消。
+async fn close_and_abort(
+    sink: &mut mpsc::Receiver<StreamEvent>,
+    tx: &EngineClient,
+    session: Option<u64>,
+    turn: Option<(u64, u64)>,
+) {
+    sink.close();
+    abort_turn(tx, session, turn.map(|(_, t)| t)).await;
 }
 
 /// 三通道产出 → SSE 帧(流式)或聚合器(非流式);role 首帧在此处懒发
@@ -1988,25 +1997,51 @@ mod tests {
 
 #[cfg(test)]
 mod admission_tests {
-    use super::{admission_code, admission_retry_ms, retry_after_secs};
+    use super::retry_after_secs;
+    use owl_engine::turn::AdmissionReject;
 
+    /// **协议面只认结构**（2026-11-16 P3）：退避秒数来自 `retry_in_ms`，
+    /// 与错误串的写法无关 —— 以前解析 `admission:<code> retry_ms=<n>`，改一个
+    /// 字就静默改变 HTTP 语义。
     #[test]
-    fn admission_prefix_is_the_only_protocol_surface() {
-        assert_eq!(admission_code("admission:no_memory"), Some("no_memory"));
-        assert_eq!(admission_code("admission: no_slot "), Some("no_slot"));
-        assert_eq!(admission_code("admission:"), None, "空码不许当拒绝语义");
-        assert_eq!(admission_code("boom"), None);
-        assert_eq!(admission_code("admission"), None, "缺冒号 = 普通错误");
+    fn retry_after_comes_from_structured_estimate() {
+        let r = |ms| AdmissionReject::new("no_memory", ms, "在飞 8 已达上限 8");
+        assert_eq!(retry_after_secs(&r(Some(12_000))), 12);
+        assert_eq!(retry_after_secs(&r(Some(200))), 1, "不足 1s 夹到 1");
+        assert_eq!(retry_after_secs(&r(Some(999_999))), 30, "封顶 30");
+        assert_eq!(retry_after_secs(&r(None)), 5, "无建议值 = 5s 保守");
     }
 
-    /// 引擎的退避建议：`admission:<code> retry_ms=<n>` → 秒（1..=30）
+    /// 结构化拒绝的显示串保持旧口径（日志/既有断言不动），服务面不再解析它。
     #[test]
-    fn retry_after_comes_from_engine_estimate() {
-        assert_eq!(admission_retry_ms("admission:no_memory retry_ms=12000"), Some(12_000));
-        assert_eq!(retry_after_secs("admission:no_memory retry_ms=12000"), 12);
-        assert_eq!(retry_after_secs("admission:no_memory retry_ms=200"), 1, "不足 1s 夹到 1");
-        assert_eq!(retry_after_secs("admission:no_memory retry_ms=999999"), 30, "封顶 30");
-        assert_eq!(retry_after_secs("admission:no_slot"), 5, "无建议值 = 5s 保守");
+    fn display_keeps_the_legacy_wire_for_logs() {
+        assert_eq!(
+            AdmissionReject::new("no_slot", Some(137), "在飞 8 已达上限 8").to_string(),
+            "admission:no_slot retry_ms=137 —— 在飞 8 已达上限 8"
+        );
+        assert_eq!(
+            AdmissionReject::new("no_memory", None, "工作集不够").to_string(),
+            "admission:no_memory 工作集不够"
+        );
+        assert_eq!(
+            AdmissionReject::new("queue_timeout", Some(900), "").to_string(),
+            "admission:queue_timeout retry_ms=900"
+        );
+    }
+
+    /// `TurnError` 只在**产生点**决定"是不是准入拒绝"；显示串同源。
+    #[test]
+    fn turn_error_carries_reject_only_when_structured() {
+        let plain = owl_engine::turn::TurnError::new("submit: 空 prompt");
+        assert!(plain.reject().is_none());
+        assert_eq!(plain.to_string(), "submit: 空 prompt");
+        let rejected = owl_engine::turn::TurnError::rejected(AdmissionReject::new(
+            "no_memory",
+            Some(1000),
+            "池满",
+        ));
+        assert_eq!(rejected.reject().map(|r| r.code()), Some("no_memory"));
+        assert!(rejected.to_string().starts_with("admission:no_memory"));
     }
 }
 

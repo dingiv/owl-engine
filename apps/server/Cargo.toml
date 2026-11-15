@@ -11,15 +11,14 @@ owl-engine = { path = "../../crates/engine" }
 # 模型面:GGUF 起点族(模板自给 —— `tokenizer.chat_template` 在 .gguf 文件里;
 # 2026-10-19 gguf 轮 REQ-GGUF-02)
 owl-models = { path = "../../crates/models" }
-# GPU 绑定(Engine::new 的 GpuClient 特化;actor 泛型界见 iface)
-owl-cuda = { path = "../../crates/backends/cuda" }
-owl-iface = { path = "../../crates/backends/iface" }
+# 注：`owl-cuda` / `owl-iface` 已于 2026-11-16（业务下沉 P3）移出 ——
+# `/debug/launches` 与块账投影改吃 `owl_engine` 的稳定形状（引擎给的投影行），
+# server 不再认识后端类型。
 # 诊断:/debug/metrics 读 GPU 逐核归因分账(OWL_GPU_PROF 写入同进程 store)
 owl-shared = { path = "../../crates/shared" }
 # 诊断:/debug/vram —— store 三层账 + owner 维明细(第 0 刀;纯投影,不决策)
 owl-store = { path = "../../crates/store" }
-# 视觉塔输入契约(`VlmImage`)/图像预处理(png/jpeg)
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# 视觉塔输入契约(`VlmImage`)；预处理已在 `owl-models::vlm::preprocess`(P5)
 base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -46,22 +45,22 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 #   的 m16n8k16;sm89/120 未验证),多代际 fatbin 与它不可共存 ⇒ 两档都由缺省带出、
 #   由 `--no-default-features` 整体摘掉。
 "default" = ["arch-sm86", "fi-fp16acc", "fi-fp16pv"]
-arch-sm75 = ["owl-cuda/arch-sm75"]
-arch-sm86 = ["owl-cuda/arch-sm86"]
-arch-sm89 = ["owl-cuda/arch-sm89"]
-arch-sm120 = ["owl-cuda/arch-sm120"]
+arch-sm75 = ["owl-engine/arch-sm75"]
+arch-sm86 = ["owl-engine/arch-sm86"]
+arch-sm89 = ["owl-engine/arch-sm89"]
+arch-sm120 = ["owl-engine/arch-sm120"]
 # FP16-PV 累加档(只对 sm_86 构建开;**已进缺省**,见文件头 default)
-fi-fp16pv = ["owl-cuda/fi-fp16pv"]
+fi-fp16pv = ["owl-engine/fi-fp16pv"]
 stepgate = ["owl-shared/stepgate"]
 
 # 性能框架(docs/arch/perf-framework.md):带本 feature 的 release 构建里
 # 计时宏/钩子全速采集;不带 = 生产二进制零成本。
 #   用法: cargo build --release -p server --features perf
 perf = ["owl-shared/perf", "owl-engine/perf"]
-cupti = ["owl-cuda/cupti"]
+cupti = ["owl-engine/cupti"]
 log = ["owl-shared/log", "owl-engine/log"]
 # FI prefill 半精度累加档(见 crates/kernels/Cargo.toml 的同名 feature 注释;**已进缺省**)
-fi-fp16acc = ["owl-cuda/fi-fp16acc"]
+fi-fp16acc = ["owl-engine/fi-fp16acc"]
 
 [dev-dependencies]
 # e2e 骨架用 prctl(PR_SET_PDEATHSIG):父进程被 SIGKILL 时子 server 必须随之

@@ -99,7 +99,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             Ok(_) => {}
             Err(e) => owl_shared::log_warn!("store", "孤儿 turn 收口失败：{e}"),
         }
-        TurnEvent::Failed { turn: turn_id, err }
+        TurnEvent::Failed { turn: turn_id, err: err.into() }
     }
 
     /// **按 turn 精确终结**(B5.1 服务面契约:合批档下"取消"必须指名 turn,

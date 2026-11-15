@@ -14,6 +14,98 @@ use std::sync::{Arc, Mutex};
 use crate::RunningEngine;
 use owl_iface::contract::DeviceClient;
 
+/// **块账行**（engine 面投影）。
+///
+/// 2026-11-16 P3：`/debug/blocks` 的投影以前直接吃
+/// `owl_iface::contract::BlockLedgerRow` ⇒ server 永远摘不掉后端依赖。
+/// 这里是引擎给出的稳定形状；JSON 排版仍是 server 的事。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockRow {
+    pub id: u64,
+    /// 账长（字节口径；块账本形态为字节，不带 dtype）
+    pub bytes: usize,
+    /// 设备地址（解析当刻）
+    pub addr: u64,
+    /// 所属账本（actor 序号）
+    pub ledger: u32,
+    /// 分配点点名（`selfcheck.*` / `kv.*` / 层名 / 核名）
+    pub name: String,
+}
+
+impl From<owl_iface::contract::BlockLedgerRow> for BlockRow {
+    fn from(r: owl_iface::contract::BlockLedgerRow) -> Self {
+        Self {
+            id: r.id,
+            bytes: r.bytes,
+            addr: r.addr,
+            ledger: r.ledger,
+            name: r.name,
+        }
+    }
+}
+
+/// **发射账行**（`/debug/launches` 的投影面）。
+///
+/// `ptrs` = 块 id → 设备地址（地址复用是跨流 UAF 类缺陷的唯一钥匙）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaunchRow {
+    pub seq: u64,
+    /// host 单调时钟（微秒）
+    pub t_us: u64,
+    pub cmd: &'static str,
+    pub stream: &'static str,
+    pub name: String,
+    pub grid: (u32, u32, u32),
+    pub block: (u32, u32, u32),
+    pub smem: u32,
+    pub bytes: usize,
+    pub ids: Vec<u64>,
+    pub out_id: u64,
+    pub ptrs: Vec<u64>,
+}
+
+/// 发射账快照（`enabled=false` = 该档没开 trace 环）。
+#[derive(Clone, Debug, Default)]
+pub struct LaunchTrace {
+    pub enabled: bool,
+    pub capacity: usize,
+    pub in_ring: usize,
+    pub total: u64,
+    pub rows: Vec<LaunchRow>,
+}
+
+/// 读**发射账**（进程级 trace 环；`[cuda] trace_ring = N` 开启）。
+///
+/// 为什么是自由函数而不是 `EngineClient` 请求：这账是**后端写入的进程内环形**，
+/// 读它不需要引擎线程（也不该排在 turn 后面）。HTTP 线程直接调，零往返。
+pub fn launch_trace(n: usize, kind: Option<&str>) -> LaunchTrace {
+    let (in_ring, total, capacity) = owl_cuda::trace::stats();
+    let rows = owl_cuda::trace::recent(n, kind)
+        .into_iter()
+        .map(|e| LaunchRow {
+            seq: e.seq,
+            t_us: e.host_ns / 1000,
+            cmd: e.cmd,
+            stream: e.stream,
+            name: e.name,
+            grid: e.grid,
+            block: e.block,
+            smem: e.smem,
+            bytes: e.bytes,
+            ids: e.ids,
+            out_id: e.out_id,
+            ptrs: e.ptrs,
+        })
+        .collect();
+    LaunchTrace {
+        enabled: capacity > 0,
+        capacity,
+        in_ring,
+        total,
+        rows,
+    }
+}
+
 /// **`/debug/vram` 的一次快照**（三面事实：store 账 / 块账房 / 句柄计数）。
 ///
 /// 为什么三面同屋：它们必须**同一时刻**取（引擎不在 pump 时）—— 分开取会让
@@ -24,7 +116,7 @@ pub struct DiagSnapshot {
     /// store 报告（三层账 + owner 维 + 事件账）
     pub report: owl_store::StoreReport,
     /// 块账房快照（逐 rank；`Err` = 后端不支持/读失败，如实带出，不静默）
-    pub blocks: Vec<(u8, Result<Vec<owl_iface::contract::BlockLedgerRow>, String>)>,
+    pub blocks: Vec<(u8, Result<Vec<BlockRow>, String>)>,
     /// 记账失败计数（非零 = 有事件没入账）
     pub hook_fail: u64,
     /// 窗未收次数（图窗失败且去向未定）
@@ -167,7 +259,13 @@ impl FactsCell {
 /// **一次诊断快照**（引擎线程内调用；零副作用）。
 pub async fn snapshot<D: DeviceClient>(running: &mut RunningEngine<D>) -> DiagSnapshot {
     let (hook_fail, window_unclosed, open_window_blocks) = running.handle_probe();
-    let blocks = running.block_ledger_probe().await;
+    // 后端行 → 引擎投影行（服务面不认 `owl_iface`/`owl_cuda` 类型；P3）
+    let blocks = running
+        .block_ledger_probe()
+        .await
+        .into_iter()
+        .map(|(rank, rows)| (rank, rows.map(|rs| rs.into_iter().map(BlockRow::from).collect())))
+        .collect();
     let pools = running.pool_probe().await;
     let report = running.store_report();
     let device = running.mem_info().await;

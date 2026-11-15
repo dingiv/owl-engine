@@ -86,8 +86,9 @@ pub enum StreamEvent {
         /// 实际生成预算（准入夹紧后的值）
         max_new: usize,
     },
+    /// 提交边界拒绝（预算/准入）；`err.reject()` 非空 = 准入拒绝，服务面翻 429
     Rejected {
-        err: String,
+        err: crate::turn::TurnError,
     },
     /// 定相后的真实前缀命中量校正帧（块级命中在 submit 时尚未决定）。
     CachedTokens {

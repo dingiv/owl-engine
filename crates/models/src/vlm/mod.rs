@@ -24,6 +24,12 @@
 //!   塔侧同款;m-RoPE 表按行号直取 ⇒ 行号即 token 号);
 //! - decode 增量位 = `past + delta`(HF `mrope_position_deltas` 同义)。
 
+/// **图像预处理**（preprocessor_config.json 语义；2026-11-16 业务下沉 P5）。
+///
+/// 服务面/库使用者只需要 `pixel_values + grid`；解码/缩放/归一化是**视觉塔
+/// 契约的产地**，不是 HTTP 应用的事。
+pub mod preprocess;
+
 use std::sync::Arc;
 
 use crate::contract::{Dtype, ModelError};
@@ -38,8 +44,8 @@ use crate::TensorOps;
 /// **一张图的预处理结果**(服务面 → 引擎的显式输入;值全为 host f32)。
 ///
 /// `pixel_values` = `[n_patch, 3·temporal·16·16]`(processor 的 2×2 块序);
-/// `grid` = `(t, h_patches, w_patches)`。**不在这里解码/缩放** —— 预处理是
-/// 服务面(`vision_processor`)的职责;引擎只消费这个契约。
+/// `grid` = `(t, h_patches, w_patches)`。产出方 = [`preprocess`]（本 crate）；
+/// 引擎只消费这个契约。
 #[derive(Clone, Debug, PartialEq)]
 pub struct VlmImage {
     pub pixel_values: Vec<f32>,

@@ -83,6 +83,10 @@ pub(crate) mod loader;
 pub(crate) mod running;
 /// **引擎服务面**（init + 泵 + Send 句柄；2026-11-15 业务下沉 P1）
 pub mod service;
+/// 诊断投影类型（`/debug/*` 的稳定形状；server 不认后端类型 —— P3）
+pub use service::diag::{launch_trace, BlockRow, LaunchRow, LaunchTrace};
+/// **装载前预检**（`--check` 的检查点事实；2026-11-16 业务下沉 P2）
+pub mod preflight;
 
 pub use engine::{Engine, EngineConfig, EngineKnobs};
 pub use owl_iface::handle::{AssetClass, DeviceHandle, Owner};

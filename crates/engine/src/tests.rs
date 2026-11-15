@@ -4630,11 +4630,15 @@ pub async fn gpu_batch_decode_matches_serial() {
     assert_eq!(samp_serial[1], s2.expect("采样 t2 完成"), "采样档 B 不一致");
     eprintln!("[batch] ✅ 采样档(seed 固定)逐字相同");
 
-    // 同会话并发 = 结构性互踩 ⇒ 必须在提交边界响亮拒(合批档)
+    // 同会话并发 = 结构性互踩 ⇒ **引擎排队串行**（2026-11-16 P4：
+    // 不再在 submit 硬拒；`startable_queue_idx` 只放行会话空闲的候选）
     let (_sid, live) = running.submit_session(Some(77), p1, 8).expect("live turn");
-    let dup = running.submit_session(Some(77), p2, 8);
-    assert!(dup.is_err(), "同会话已有活跃 turn,第二个 submit 应拒");
+    let (_sid2, queued) = running
+        .submit_session(Some(77), p2, 8)
+        .expect("同会话第二个应排队而不是拒");
+    assert!(running.queue_len() >= 2, "两个同会话 turn 都应在队里");
     let _ = drive(&mut running, live).await;
+    let _ = drive(&mut running, queued).await;
 }
 
 /// **B5.1 合批 decode 吞吐台(27B AWQ;spec off)** —— M1b 图臂的实测账。
@@ -6116,7 +6120,7 @@ async fn cancel_queued_turn_is_precise() {
     match ev {
         TurnEvent::Failed { turn, ref err } => {
             assert_eq!(turn, t2);
-            assert!(err.contains("排队"), "口径应写明排队中:{err}");
+            assert!(err.message().contains("排队"), "口径应写明排队中:{err}");
         }
         other => panic!("应为 Failed,得到 {other:?}"),
     }
@@ -6333,9 +6337,91 @@ async fn queue_bound_rejects_at_submit() {
         }
         Ok(_) => panic!("在飞已达上限 2，第 3 个应被拒"),
     }
+    // **结构化面**（P3）：同一拒绝走 `submit_session_checked` 时必须是
+    // `Rejected(no_slot)`，且带引擎退避估计 —— 服务面据此翻 429，不再解析串。
+    match running.submit_session_checked(Some(3), p, 8, Default::default()) {
+        Err(e) => {
+            let r = e.reject().expect("应是结构化准入拒绝");
+            assert_eq!(r.code(), "no_slot");
+            assert!(r.retry_in_ms().is_some(), "引擎应给退避估计");
+            assert!(r.detail().contains("已达上限"), "明细应说明在飞上限:{}", r.detail());
+        }
+        Ok(_) => panic!("在飞已达上限 2，第 3 个应被拒"),
+    }
     // 无界档（max_queue=0）不拒 —— 旧行为不变
     running.boot.cfg.knobs.max_queue = 0;
     running.submit_session(Some(4), p, 8).expect("无界档不拒");
+}
+
+/// **P4 同会话串行**（CPU mock）：同会话第二个 turn **不再在 submit 硬拒**，
+/// 而是排队；前一个终了之前它不许起跑（同会话共享 KV/GDN = 结构性互踩）。
+#[cfg(test)]
+#[tokio::test]
+async fn same_session_queues_instead_of_rejecting() {
+    let knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 2, // 批位容得下两个 —— 串行只能由会话判据挡住
+        gdn_slots: 2,
+        pool_tokens: Some(512),
+        host_cache_mb: 8,
+        snap_host_mb: 64,
+        snap_max: 1,
+        ..Default::default()
+    };
+    let cfg = EngineConfig {
+        device_ordinal: 0,
+        max_seq_tokens: 512,
+        prefill_chunk: 32,
+        knobs,
+    };
+    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
+        null_kernels: true,
+        graph_capture: true,
+        ..Default::default()
+    });
+    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
+    let loaded = engine
+        .loader()
+        .load_qwen35_0_8b(&asset_dir())
+        .await
+        .expect("装载");
+    let mut running = engine.run(loaded).await.expect("装配");
+
+    let p1 = "alpha bravo cedar delta";
+    let p2 = "ember falcon garden harbor";
+    let (_, a) = running.submit_session(Some(77), p1, 4).expect("第一个");
+    let (_, b) = running
+        .submit_session(Some(77), p2, 4)
+        .expect("同会话第二个应排队（P4 不再硬拒）");
+    assert_eq!(running.queue_len(), 2, "两个都应在队里");
+    // 按会话点名（断流取消用）：活跃在前，其后按提交序
+    assert_eq!(
+        running.session_turns(77),
+        vec![a, b],
+        "会话 turn 集应保持提交序（活跃/最早排队优先）"
+    );
+
+    let mut order = Vec::new();
+    loop {
+        // **串行不变量**：同会话任何时刻至多一个活跃 turn
+        assert!(
+            running.active_len() <= 1,
+            "同会话出现了并行 turn(active={})",
+            running.active_len()
+        );
+        match running.pump().await.expect("pump") {
+            TurnEvent::Completed { turn, .. } => {
+                order.push(turn);
+                if order.len() == 2 {
+                    break;
+                }
+            }
+            TurnEvent::Failed { turn, err } => panic!("t{turn} 失败: {err}"),
+            TurnEvent::Idle => panic!("队列还有 turn 却 Idle(同会话后继被饿死)"),
+            _ => {}
+        }
+    }
+    assert_eq!(order, vec![a, b], "同会话必须按提交序串行完成");
 }
 
 /// **P3 退避估算/直方图**（纯函数；无卡）
@@ -6471,7 +6557,9 @@ pub async fn gpu_vlm_image_baseline() {
     let out: Result<String, String> = loop {
         match running.pump().await {
             Ok(TurnEvent::Completed { turn, text, .. }) if turn == t => break Ok(text),
-            Ok(TurnEvent::Failed { turn, err }) if turn == t => break Err(err),
+            Ok(TurnEvent::Failed { turn, err }) if turn == t => {
+                break Err(err.message().to_string())
+            }
             Ok(TurnEvent::Idle) => break Err("队列丢失".into()),
             Ok(_) => {}
             Err(e) => break Err(e.to_string()),

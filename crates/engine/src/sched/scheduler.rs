@@ -2146,11 +2146,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 的权利在准入判决手里;弹了就会绕过判决直接撞 `ensure_for_len`。
         // ⚠ 段首既有“排队中 = Idle”在**多活跃**下必须收窄:已有活跃 turn
         // 时不许因队首被准入卡住而停泵(否则活跃会话被饿死)。
-        let admit_blocked = self
-            .turns
-            .admit_wait
-            .map(|(id, _)| self.turns.queue.front().map(|t| t.id) == Some(id))
-            .unwrap_or(false);
+        // **P4 会话串行**：本拍可起跑的候选 = 队列里第一个"会话无活跃 turn"的
+        // 排队项（同会话后继留队等前一个终了；不同会话按 FIFO）。
+        let cand = self.startable_queue_idx();
+        // 准入排队中的那个 turn 若正好是候选 ⇒ 本拍不抢跑（它由准入重判放行）
+        let admit_blocked = match (self.turns.admit_wait, cand) {
+            (Some((id, _)), Some(ci)) => self.turns.queue[ci].id == id,
+            _ => false,
+        };
         if self.turns.active.len() < self.boot.cfg.knobs.max_batch.max(1) && !admit_blocked {
             // **准入（唯一放行口）**：纯状态机 + store 事实注入。
             // · Admit  → 领 grant → 启动（`start_one`）并入账；
@@ -2158,7 +2161,9 @@ impl<D: DeviceClient> RunningEngine<D> {
             // · Reject → 出队 + `Failed{admission:<code>}`（服务面翻 429）。
             let mut start_ok = true;
             let mut admission_grant: Option<owl_store::Grant> = None;
-            if let Some(head_facts) = self.turns.queue.front().map(Self::facts_of_queued) {
+            if let Some(head_facts) =
+                cand.map(|ci| Self::facts_of_queued(&self.turns.queue[ci]))
+            {
                 let l = self.admission_limits();
                 let s = self.store_facts();
                 let running: Vec<crate::sched_policy::TurnFacts> =
@@ -2231,10 +2236,12 @@ impl<D: DeviceClient> RunningEngine<D> {
                             )
                         });
                         start_ok = false;
-                        let t = self.turns.queue.pop_front().ok_or_else(|| {
-                            ModelError::EngineInvariant {
-                                what: "admission: 刚判过的队首消失".into(),
-                            }
+                        let t = match cand {
+                            Some(ci) if ci < self.turns.queue.len() => self.turns.queue.remove(ci),
+                            _ => None,
+                        }
+                        .ok_or_else(|| ModelError::EngineInvariant {
+                            what: "admission: 刚判过的候选消失".into(),
                         })?;
                         // **F-18**: 排队终局统一收口（ephemeral 焚毁/准入账）。
                         self.drop_queued_turn(&t);
@@ -2255,13 +2262,25 @@ impl<D: DeviceClient> RunningEngine<D> {
                             .pending_events
                             .push_back(crate::turn::TurnEvent::Failed {
                                 turn: t.id,
-                                err: format!("admission:{} retry_ms={eta}", reason.code()),
+                                err: crate::turn::TurnError::rejected(
+                                    crate::turn::AdmissionReject::new(
+                                        reason.code(),
+                                        Some(eta),
+                                        "",
+                                    ),
+                                ),
                             });
                     }
                 }
             }
             if start_ok {
-                if let Some(turn) = self.turns.queue.pop_front() {
+                // 起跑的就是本拍选中的候选（不是盲目 `pop_front` —— 队首可能
+                // 被同会话串行挡住，弹错对象 = 结构互踩）。P4
+                let picked = match cand {
+                    Some(ci) if ci < self.turns.queue.len() => self.turns.queue.remove(ci),
+                    _ => None,
+                };
+                if let Some(turn) = picked {
                     let facts = Self::facts_of_queued(&turn);
                     let grant =
                         admission_grant
@@ -2305,7 +2324,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                             }
                             self.turns.pending_events.push_back(crate::turn::TurnEvent::Failed {
                                 turn: turn_id,
-                                err: e.to_string(),
+                                err: e.to_string().into(),
                             });
                         }
                     }

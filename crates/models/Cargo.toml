@@ -32,6 +32,9 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # 转换段 45ms/MB 是装载慢的主因,非 DMA/非排队)
 half = "2"
 tokio = { version = "1", features = ["rt"] }
+# 图像预处理（vlm/preprocess.rs；PNG/JPEG 解码 + PIL BICUBIC 复刻。
+# 2026-11-16 P5：从 apps/server 迁入 —— 预处理是视觉塔契约的产地）
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [features]
 # 性能/日志框架:release 也展开计时宏与日志宏(见 docs/arch/perf-framework.md)

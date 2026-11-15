@@ -584,8 +584,15 @@ async fn per_turn_floor_above_workspace_is_refused_loudly() {
         TurnEvent::Failed { err, .. } => {
             eprintln!("[gate] 超工作集地板拒原文: {err}");
             assert!(
-                err.contains("工作集") && err.contains("workspace_per_req"),
+                err.message().contains("工作集") && err.message().contains("workspace_per_req"),
                 "拒语应点名病因与调法: {err}"
+            );
+            // **结构化面**(P3):调度准入拒必须带码 —— 服务面据此翻 429，
+            // 不再解析 `admission:<code>` 字符串。
+            assert_eq!(
+                err.reject().map(|r| r.code()),
+                Some("no_memory"),
+                "调度拒应带结构化码: {err}"
             );
         }
         other => panic!("超工作集地板必须响亮拒,得 {other:?}"),

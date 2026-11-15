@@ -153,17 +153,78 @@ pub fn step_json() -> Value {
     })
 }
 
-/// **发射账投影**(`GET /debug/launches[/<n>[/<kind>]]`;见 `owl_cuda::trace` 模块头)。
+/// 调试门**控制回执**投影(`/debug/step/{mode,release,ms,us,every}`)。
+///
+/// `applied` = 控制通道有没有消费者(引擎未编入 stepgate feature / 已退出 ⇒
+/// `false`,不谎报 ok);`action` = 人读的动作名。形状住这里,路由只转发。
+pub fn step_action_json(applied: bool, action: &str) -> Value {
+    let mut v = step_json();
+    v["applied"] = json!(applied);
+    v["action"] = json!(action);
+    v
+}
+
+/// 日志面状态投影(`GET /debug/log`):当前级别 + tag 过滤表。
+pub fn log_state_json() -> Value {
+    let (allow, deny) = owl_shared::log::with_logger(|g| g.tags()).unwrap_or_default();
+    json!({
+        "level": owl_shared::log::level_name(),
+        "log_build": owl_shared::log::LOG_BUILD,
+        "tags_allow": allow,
+        "tags_deny": deny,
+    })
+}
+
+/// **队列/容量快照投影**(`GET /debug/queue`;每拍事实,零等待)。
+///
+/// 数据来自 `EngineClient::queue_facts`(泵循环每拍写 `FactsCell`),本函数
+/// **纯投影** —— 旧版形状内联在 `main::handle` 里,现搬来这里供单测与复用。
+pub fn queue_json(snap: &owl_engine::QueueFacts) -> Value {
+    json!({
+        "queue_len": snap.queue_len,
+        "active": snap.active,
+        "batch_steps": snap.batch_steps,
+        "max_batch": snap.max_batch,
+        "graph": snap.has_graph,
+        "queued": snap.queued.iter().map(|(t, s, ms)| json!({
+            "turn": t, "session": format!("{s:#x}"), "waited_ms": ms,
+        })).collect::<Vec<_>>(),
+        "rejects": snap.rejects.iter().map(|(s, code, n)| json!({
+            "session": format!("{s:#x}"), "code": code, "count": n,
+        })).collect::<Vec<_>>(),
+        "wait_hist": {
+            "lt_50ms": snap.wait_hist[0],
+            "lt_200ms": snap.wait_hist[1],
+            "lt_1s": snap.wait_hist[2],
+            "lt_5s": snap.wait_hist[3],
+            "ge_5s": snap.wait_hist[4],
+        },
+        "capacity": snap.capacity.map(|c| json!({
+            "free_pages": c.free_pages,
+            "cache_pages": c.cache_pages,
+            "reserved_pages": c.reserved_pages,
+            "usable_pages": c.usable_pages,
+            "n_slots": c.n_slots,
+            "n_mem": c.n_mem,
+            "n_eff": c.n_eff,
+        })),
+    })
+}
+
+/// **发射账投影**(`GET /debug/launches[/<n>[/<kind>]]`)。
+///
+/// 数据面在 `owl_engine::launch_trace`（引擎给的稳定形状）；本函数只做 JSON。
 /// `kind` 可匹配命令类(`launch`/`htod`/`dtoh`/`free`…)、流名(`compute`/`h2d`/`d2h`)
 /// 或核名子串。`ptrs` 以十六进制给出 —— 地址复用是跨流 UAF 类缺陷的唯一钥匙。
 pub fn launches_json(n: usize, kind: Option<&str>) -> Value {
-    let (in_ring, total, cap) = owl_cuda::trace::stats();
-    let rows: Vec<Value> = owl_cuda::trace::recent(n, kind)
-        .into_iter()
+    let t = owl_engine::launch_trace(n, kind);
+    let rows: Vec<Value> = t
+        .rows
+        .iter()
         .map(|e| {
             json!({
                 "seq": e.seq,
-                "t_us": e.host_ns / 1000,
+                "t_us": e.t_us,
                 "cmd": e.cmd,
                 "stream": e.stream,
                 "name": e.name,
@@ -178,10 +239,10 @@ pub fn launches_json(n: usize, kind: Option<&str>) -> Value {
         })
         .collect();
     json!({
-        "enabled": cap > 0,
-        "capacity": cap,
-        "in_ring": in_ring,
-        "total": total,
+        "enabled": t.enabled,
+        "capacity": t.capacity,
+        "in_ring": t.in_ring,
+        "total": t.total,
         "n": n,
         "kind": kind,
         "rows": rows,
@@ -195,8 +256,8 @@ pub fn launches_json(n: usize, kind: Option<&str>) -> Value {
 /// 本投影是**当前账本的权威快照**。两份内联不变量直接给出判决:
 /// - `dup_ids`:同一 id 出现两次(账本条目被顶掉/复用)⇒ 写读可能落在不同物理块;
 /// - `overlaps`:两个**活块**的地址区间相交 ⇒ 池把重叠区间发给了两个块。 (仓内 2026-10-08 E5 跨流回收律 / 2026-10-03 FI 表渐进腐败案都栽在这两件事上。)
-pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
-    let mut by_addr: Vec<&owl_cuda::BlockLedgerRow> = rows.iter().collect();
+pub fn blocks_json(rows: &[owl_engine::BlockRow]) -> Value {
+    let mut by_addr: Vec<&owl_engine::BlockRow> = rows.iter().collect();
     by_addr.sort_by_key(|r| r.addr);
     let mut overlaps: Vec<Value> = Vec::new();
     for w in by_addr.windows(2) {
@@ -239,7 +300,7 @@ pub fn blocks_json(rows: &[owl_cuda::BlockLedgerRow]) -> Value {
 
 /// 逐 rank 的块账投影（`/debug/blocks`；单卡档输出与旧形状一致）。
 pub fn blocks_ranks_json(
-    ranks: &[(u8, Result<Vec<owl_cuda::BlockLedgerRow>, String>)],
+    ranks: &[(u8, Result<Vec<owl_engine::BlockRow>, String>)],
 ) -> Value {
     if ranks.len() == 1 {
         return match &ranks[0].1 {
@@ -526,7 +587,7 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
         },
         // **合批事实**(B5.1):上限 / 已走批步数 / 批图在场。
         // 服务面判据:`max_batch>1` 而 `steps` 不涨 = 批门从未成立
-        // (并发不足,或同会话被会话闸串行 —— 见 `session_gate` 模块头)。
+        // (并发不足,或同会话被引擎串行 —— P4 起串行在引擎队列里)。
         "batch": {
             "max_batch": snap.batch.max_batch,
             "steps": snap.batch.steps,
@@ -618,7 +679,7 @@ fn r_events(rep: &owl_store::StoreReport) -> Vec<(u8, Vec<u64>)> {
 #[allow(clippy::unnecessary_sort_by)]
 fn recon_json(
     rank: u8,
-    dump: &Result<Vec<owl_iface::contract::BlockLedgerRow>, String>,
+    dump: &Result<Vec<owl_engine::BlockRow>, String>,
     events: &[(u8, Vec<u64>)],
 ) -> Value {
     let ev: Vec<u64> = events

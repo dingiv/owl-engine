@@ -551,6 +551,67 @@ pub(crate) fn merge_topk_two_halves(
     Ok((out_v, out_i))
 }
 
+/// **提交边界的错误面**（2026-11-16 P3）。
+///
+/// 为什么需要：服务面要按「是不是准入拒绝」选 HTTP 语义（429 + `Retry-After`
+/// vs 400/500）。旧做法 = 解析 `admission:<code> retry_ms=<n>` 错误串 —— 那是
+/// 人读文本，改一个字就静默改变协议行为。现在拒绝在产生点结构化。
+#[derive(Clone, Debug)]
+pub enum SubmitError {
+    /// 准入拒绝（服务面翻 429）
+    Rejected(crate::turn::AdmissionReject),
+    /// 其余错误（原样；`Display` 与旧口径一致）
+    Engine(ModelError),
+}
+
+impl SubmitError {
+    /// 退回旧错误面（`ModelError::Msg`，文案 = 结构化拒绝的 `Display`）。
+    pub fn into_model_error(self) -> ModelError {
+        match self {
+            Self::Rejected(r) => ModelError::Msg(r.to_string()),
+            Self::Engine(e) => e,
+        }
+    }
+
+    /// 转成 turn 事件面（`Rejected`/`Failed` 的 `err` 字段）。
+    pub fn into_turn_error(self) -> crate::turn::TurnError {
+        match self {
+            Self::Rejected(r) => crate::turn::TurnError::rejected(r),
+            Self::Engine(e) => crate::turn::TurnError::new(e.to_string()),
+        }
+    }
+
+    /// 结构化拒绝（非准入错误 = `None`）。
+    pub fn reject(&self) -> Option<&crate::turn::AdmissionReject> {
+        match self {
+            Self::Rejected(r) => Some(r),
+            Self::Engine(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(r) => f.write_str(&r.to_string()),
+            Self::Engine(e) => std::fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+impl From<ModelError> for SubmitError {
+    fn from(e: ModelError) -> Self {
+        Self::Engine(e)
+    }
+}
+
+impl From<owl_store::StoreError> for SubmitError {
+    fn from(e: owl_store::StoreError) -> Self {
+        // store 侧已有 `From<StoreError> for ModelError`(唯一换算在 store)
+        Self::Engine(e.into())
+    }
+}
+
 impl<D: DeviceClient> RunningEngine<D> {
     /// 本档 prefill 块长（探针排版用；与调度器取**同一份配置** ⇒ 不会对不上）
     #[cfg(any(test, feature = "e2e"))]
@@ -1383,6 +1444,9 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     /// 同 [`Self::submit_session_ex`],但携带 per-turn 可选项(采样参数/停止串/种子;
     /// AGT-06)。`ignore_eos` 在 `opts` 内。
+    ///
+    /// 只保留**旧错误面**(`ModelError`);需要结构化准入拒绝的服务面请用
+    /// [`Self::submit_session_checked`](后者是本函数的实现体)。
     pub fn submit_session_opts(
         &mut self,
         session: impl Into<Option<u64>>,
@@ -1390,6 +1454,22 @@ impl<D: DeviceClient> RunningEngine<D> {
         max_new: usize,
         opts: crate::turn::TurnOpts,
     ) -> Result<(u64, u64)> {
+        self.submit_session_checked(session, prompt, max_new, opts)
+            .map_err(SubmitError::into_model_error)
+    }
+
+    /// **提交（结构化拒绝版）**：准入拒绝以 [`SubmitError::Rejected`] 返回，
+    /// 其余错误原样包在 [`SubmitError::Engine`] 里。
+    ///
+    /// 服务面（`service::pump::accept`）用这个：HTTP 语义（429 + `Retry-After`）
+    /// 由结构化字段决定，不再解析错误串（2026-11-16 P3）。
+    pub fn submit_session_checked(
+        &mut self,
+        session: impl Into<Option<u64>>,
+        prompt: impl Into<String>,
+        max_new: usize,
+        opts: crate::turn::TurnOpts,
+    ) -> std::result::Result<(u64, u64), SubmitError> {
         let session = session.into();
         // **在飞总数上限**（P0-2）：批位 + 队列 都有界。
         // 为什么放在 submit 而不是 `schedule`：槽满时判决根本不跑（
@@ -1411,26 +1491,23 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .turns
                     .eta_ms(self.boot.cfg.knobs.max_batch.max(1), self.turns.queue.len());
                 self.turns.note_reject(session.unwrap_or(0), "no_slot");
-                return Err(ModelError::Msg(format!(
-                    "admission:no_slot retry_ms={eta} —— 在飞 {in_flight} 已达上限 {cap}\
-                     （批位 {} + 队列 {max_queue}）",
-                    self.boot.cfg.knobs.max_batch.max(1)
+                return Err(SubmitError::Rejected(crate::turn::AdmissionReject::new(
+                    "no_slot",
+                    Some(eta),
+                    format!(
+                        "在飞 {in_flight} 已达上限 {cap}（批位 {} + 队列 {max_queue}）",
+                        self.boot.cfg.knobs.max_batch.max(1)
+                    ),
                 )));
             }
         }
-        // **同会话并发守卫**(B5.1):合批档下两个同会话 turn 会共享同一份
-        // KV/GDN 状态 ⇒ 结构性互踩。亮拒(上层应按会话串行)。
-        if self.boot.cfg.knobs.max_batch > 1 {
-            if let Some(id) = session {
-                if self.turns.active.iter().any(|a| a.session_id == id)
-                    || self.turns.queue.iter().any(|t| t.session_id == id)
-                {
-                    return Err(ModelError::Msg(format!(
-                        "submit: 会话 {id} 已有活跃/排队 turn —— 合批档不支持同会话并发"
-                    )));
-                }
-            }
-        }
+        // **同会话并发（2026-11-16 P4：引擎排队，不再硬拒）**
+        //
+        // 同会话两 turn 会共享同一份 KV/GDN 状态 ⇒ 结构性互踩，**必须串行**。
+        // 旧做法 = submit 边界硬拒（服务面用 `session_gate` 补一层串行，结果
+        // 串行契约有两个真源）。现在引擎自己保证：`startable_queue_idx()` 只
+        // 放行"会话无活跃 turn"的队首候选，同会话后继 turn 就排在队里等前一个
+        // 终了 —— 顺序优先，不插队，也不 429。
         let prompt = prompt.into();
         // **VLM 输入门**(2026-10-20 视觉接线 V5;2026-10-23 多图):
         // 单请求可带多图(按内容序),但图像 × 合批仍拒;图像 × 投机已接
@@ -1438,24 +1515,24 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 邻接多图的 m-RoPE 由 `MropeCfg::rope_index` 按 grid 顺序分段。
         if !opts.images.is_empty() {
             if self.dev.boot.vlm.is_none() {
-                return Err(ModelError::Msg(
+                return Err(SubmitError::Engine(ModelError::Msg(
                     "submit: 请求带图,但本档 [vision] enabled != true(引擎无视觉塔)".into(),
-                ));
+                )));
             }
             if self.boot.cfg.knobs.max_batch > 1 {
-                return Err(ModelError::Msg(
+                return Err(SubmitError::Engine(ModelError::Msg(
                     "submit: VLM 图像首版不支持合批(max_batch > 1)".into(),
-                ));
+                )));
             }
             // **可删标记必须有人接**(前缀无感删除;2026-10-23):客户端打了
             // `owl_evict` 而引擎档没开 = 静默失约(用户以为删了不重算,
             // 实际每轮全量重灌)⇒ 提交边界**响亮拒**,不静默忽略。
             if !self.boot.cfg.knobs.image_evict && opts.images.iter().any(|i| i.evict) {
-                return Err(ModelError::Msg(
+                return Err(SubmitError::Engine(ModelError::Msg(
                     "submit: 图像带 evict(可删)标记,但本档 [vision] image_evict = false\
                          —— 要么把档位打开,要么去掉标记(不许静默忽略)"
                         .into(),
-                ));
+                )));
             }
         }
         // **会话表软上限**（F-22）：在真正创建/复用会话前淘汰 LRU 空闲会话。
@@ -1493,7 +1570,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let (prompt_ids, img_spans, img_pads, deletion) =
             self.image_pad_law(session, raw_ids, &opts.images)?;
         if prompt_ids.is_empty() {
-            return Err(ModelError::Msg("submit: 空 prompt".into()));
+            return Err(SubmitError::Engine(ModelError::Msg("submit: 空 prompt".into())));
         }
         let (positions, positions_gap) =
             self.prompt_positions(session, &prompt_ids, &img_spans, deletion.as_ref())?;
@@ -1554,13 +1631,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 页数上限在准入处按**本档工作集**再校一遍(ctx 长度那时才知道)。
         if let Some(f) = opts.dense_floor {
             if !f.is_strict() && !self.boot.cfg.knobs.kvmem_virtualization {
-                return Err(ModelError::Msg(
+                return Err(SubmitError::Engine(ModelError::Msg(
                     "submit: per-turn 非 Strict 地板需要**虚拟化两扇门**\
                      ([kvmem].select_decode = true **且** select_partial = true)——\
                      地板语义只有选择层在场才能兜住(设计卷 §2.4/§23.5);\
                      两者任一为假 = 响亮拒,不静默降级"
                         .into(),
-                ));
+                )));
             }
         }
         // 预算(会话感知):命中账本的 turn 按 max(prompt, cached) 记账
@@ -1709,10 +1786,22 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
             None => 0,
         };
-        let cached_hit = cached_hit
-            .max(store_cached)
-            .max(deletion_cached)
-            .min(prompt_ids.len());
+        // **同会话串行排队期（P4）**：本会话已有活跃/排队 turn ⇒ 会话仍在写，
+        // 此刻的账（tokens / 内容树）是"未来态"——命中估计不可作预算依据。
+        // 记 0（保守 = 按全量预留）；真正的命中量在起跑定相后由 `CachedTokens`
+        // 帧校正（AGT-12），正确性不依赖这个估值。
+        let session_busy = session.is_some_and(|id| {
+            self.turns.active.iter().any(|a| a.session_id == id)
+                || self.turns.queue.iter().any(|t| t.session_id == id)
+        });
+        let cached_hit = if session_busy {
+            0
+        } else {
+            cached_hit
+                .max(store_cached)
+                .max(deletion_cached)
+                .min(prompt_ids.len())
+        };
         // 预算(会话感知):base = max(prompt, cached,命中增量段时前缀仍占槽)
         // 不足 ⇒ **先收缩生成长度**(不是直接拒):agent 客户端(pi)每轮重发
         // 系统提示 + 工具 schema + 历史,工作区 `AGENTS.md`+skills 一注入
@@ -1738,12 +1827,12 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // 连 [_MIN_GEN_TOKENS] 都放不下 ⇒ 真溢出:客户端该压缩上下文。
                 // 报文保留"超预算"字样(server 面据此归一化为 context-overflow
                 // 语义,客户端才会自动 compact;见 apps/server/src/openai.rs)
-                return Err(ModelError::Msg(format!(
+                return Err(SubmitError::Engine(ModelError::Msg(format!(
                     "submit: prompt {} + 生成 {} 超预算 {}",
                     prompt_ids.len(),
                     max_new,
                     self.boot.cfg.max_seq_tokens
-                )));
+                ))));
             }
         };
         let (session_id, ephemeral) = match session {
@@ -1982,16 +2071,52 @@ impl<D: DeviceClient> RunningEngine<D> {
         self.turns.queue.len()
     }
 
-    /// **准入排队中的队首 turn**（F-19）：`Some(id)` 表示泵循环不应因
+    /// **准入排队中的候选 turn**（F-19）：`Some(id)` 表示泵循环不应因
     /// `Idle` 断流 —— `admission_on_full = Queue` 的重判与超时都靠下一次
     /// `pump`，没有外部事件时必须由服务面定时重试。
     pub fn admission_pending(&self) -> Option<u64> {
         let (id, _) = self.turns.admit_wait?;
+        let cand = self.startable_queue_idx()?;
+        (self.turns.queue[cand].id == id).then_some(id)
+    }
+
+    /// 本会话的 turn 集（**活跃在前，其后按排队序**）。
+    ///
+    /// 用途（P4）：同会话现在可以"活跃 1 条 + 排队 N 条"，而断流取消可能只带
+    /// session（客户端在 `Accepted` 之前就断了）。调用方据此挑**接收方已关**的
+    /// 那一条，而不是盲取消活跃 turn（否则会误杀上一条请求）。
+    pub fn session_turns(&self, session: u64) -> Vec<u64> {
         self.turns
-            .queue
-            .front()
-            .filter(|t| t.id == id)
-            .map(|t| t.id)
+            .active
+            .iter()
+            .filter(|a| a.session_id == session)
+            .map(|a| a.id)
+            .chain(
+                self.turns
+                    .queue
+                    .iter()
+                    .filter(|t| t.session_id == session)
+                    .map(|t| t.id),
+            )
+            .collect()
+    }
+
+    /// **本拍可起跑的候选** = 队列里第一个"会话无活跃 turn"的排队项。
+    ///
+    /// 2026-11-16 P4：同会话串行的**唯一判据**。同会话后继 turn 排在队里等
+    /// 前一个终了（`Reason::SessionBusy` 因此只在 `sched_policy` 单测里作为
+    /// 不变量出现）；不同会话按 FIFO，不插队。
+    ///
+    /// 为什么"按位置取第一个"就够：同一会话的多个排队 turn 里，最靠前的那个
+    /// 总是先被选中（前面的位置优先），所以不存在"后一个抢跑"。
+    pub(crate) fn startable_queue_idx(&self) -> Option<usize> {
+        self.turns.queue.iter().position(|t| {
+            !self
+                .turns
+                .active
+                .iter()
+                .any(|a| a.session_id == t.session_id)
+        })
     }
 
     /// **会话表软上限收口**（F-22）：新请求前按 LRU 淘汰空闲会话。
@@ -3502,8 +3627,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(());
         }
         self.sync_pool_account()?;
+        // 判**本拍可起跑的候选**（不是队首 —— 队首可能被同会话串行挡住；
+        // 判错对象会把一个还不能跑的 turn 误拒/误腾位）。P4。
         let Some((turn_id, ctx_tokens, cached_tokens, floor)) =
-            self.turns.queue.front().map(|t| {
+            self.startable_queue_idx().map(|i| {
+                let t = &self.turns.queue[i];
                 (
                     t.id,
                     // 上界 = prompt + 生成长度 + spec 深度(安全方向:多算只是多腾几个槽)
@@ -3630,7 +3758,8 @@ impl<D: DeviceClient> RunningEngine<D> {
     fn reject_queued_turn(
         &mut self,
         turn_id: u64,
-        code: &str,
+        // 码是静态词表（与调度判决 `Reason::code()` 同一套）；调用点全是字面量
+        code: &'static str,
         why: String,
     ) -> Result<()> {
         let Some(pos) = self.turns.queue.iter().position(|t| t.id == turn_id) else {
@@ -3648,7 +3777,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 落进普通 500/SSE 错误路径，agent 客户端看起来就像“请求卡死”。
         self.turns.pending_events.push_back(TurnEvent::Failed {
             turn: turn_id,
-            err: format!("admission:{code} {why}"),
+            err: crate::turn::TurnError::rejected(crate::turn::AdmissionReject::new(
+                code, None, why,
+            )),
         });
         self.sync_pool_account()?;
         Ok(())

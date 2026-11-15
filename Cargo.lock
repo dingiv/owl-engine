@@ -699,6 +699,7 @@ dependencies = [
  "owl-models",
  "owl-shared",
  "owl-store",
+ "serde_json",
  "tokio",
 ]
 
@@ -742,6 +743,7 @@ dependencies = [
  "ahash",
  "futures-util",
  "half",
+ "image",
  "libc",
  "owl-cpu",
  "owl-cuda",
@@ -1078,11 +1080,8 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "hf-chat-template",
- "image",
  "libc",
- "owl-cuda",
  "owl-engine",
- "owl-iface",
  "owl-models",
  "owl-shared",
  "owl-store",

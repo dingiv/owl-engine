@@ -43,8 +43,6 @@ mod load;
 mod openai;
 // 跳轮重复探测(只可见不改生成;2026-10-31 立案)
 mod repeat_guard;
-// 会话闸(per-session serialization;合批档 `max_batch>1` 的前置契约)
-mod session_gate;
 // 视觉输入(主分支 V1–V5)
 mod vision_processor;
 // 三通道流式解析器(增量文本 → 思考/正文/工具调用;agent 服务面 §4.5)
@@ -365,10 +363,8 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
     // → 跨会话状态污染。不足即拒启(账外组合不静默)。
     // 并发闸门(permit = max_concurrency;在跑 + 排队 ≤ 上限,超出排队等待)
     let concurrency_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
-    // **会话闸**(B5.1 服务面):同会话串行 / 跨会话并行。
-    // 引擎在 `max_batch > 1` 时对同会话并发**硬拒**(共享 KV/GDN = 结构性互踩),
-    // 契约是"上层按会话串行" —— 本闸就是那一层(详见 `session_gate` 模块头)。
-    let session_gates = std::sync::Arc::new(session_gate::SessionGates::new());
+    // **会话串行已下沉引擎**（2026-11-16 P4）：同会话后继 turn 在引擎队列里
+    // 等前一个终了（`startable_queue_idx`），服务面不再需要 per-session 闸。
     // 口径告警(不拒启:语义仍然正确,只是这类客户端拿不到合批收益)
     if max_batch > 1 && !agent.implicit_session {
         if max_batch < max_concurrency {
@@ -389,7 +385,7 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
         owl_shared::log_warn!(
             "boot",
             "隐式会话开着(implicit_session=true)且 max_batch={} —— 无 session 键的请求\
-             全落会话 0 ⇒ 会被会话闸串行(合批无收益)。要合批:客户端带 session 键,\
+             全落会话 0 ⇒ 会被引擎按会话串行(合批无收益)。要合批:客户端带 session 键,\
              或关 implicit_session",
             max_batch
         );
@@ -427,8 +423,6 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
                     // keep-alive 下连接会长时间存活,连接级 permit =
                     // 空闲连接占死并发位)
                     gate: concurrency_gate.clone(),
-                    // 会话闸(同会话串行;跨会话并行)
-                    sessions: session_gates.clone(),
                     max_concurrency,
                 };
                 tokio::spawn(async move {
@@ -478,8 +472,6 @@ struct ConnCtx {
     trace: std::sync::Arc<agent_trace::AgentTrace>,
     /// 并发闸门(G5④:**每请求**获取;在跑 + 排队 ≤ max_concurrency)
     gate: std::sync::Arc<tokio::sync::Semaphore>,
-    /// **会话闸**(B5.1:同会话串行 / 跨会话并行;`session_gate` 模块头)
-    sessions: std::sync::Arc<session_gate::SessionGates>,
     /// 服务面并发上限(`server.max_concurrency`;`/debug/load` 按它校验)
     max_concurrency: usize,
 }
@@ -487,10 +479,12 @@ struct ConnCtx {
 /// 单连接服务(**keep-alive 请求循环**;G5④)。
 ///
 /// 连接生命周期纪律:
-/// - **permit 每请求获取**:空闲等待(读下一请求/排队)不占并发位;
+/// - **permit 每请求获取**(按 [`permit_scope`] 定档):空闲等待不占并发位;
 /// - **空闲超时** [`KEEP_ALIVE_IDLE`] / **请求数上限** [`MAX_REQUESTS_PER_CONN`];
 /// - **非 HTTP/1.1 请求响亮拒**(505 + 关)—— chunked 应答是 1.1 语法,
 ///   静默降级成 close 定界会让“复用判定”与“帧语法”两套律打架;
+/// - **帧非法**(定界/长度/trailer 残留)先回 400 再关 —— 只 reset 不回话会把
+///   真因埋进客户端超时里;
 /// - 处理函数返 Err(含 SSE 中途写失败)= 帧不可信 ⇒ 关连接不重用。
 async fn serve(mut stream: tokio::net::TcpStream, ctx: ConnCtx) -> std::io::Result<()> {
     let mut served = 0usize;
@@ -500,7 +494,20 @@ async fn serve(mut stream: tokio::net::TcpStream, ctx: ConnCtx) -> std::io::Resu
         {
             Ok(Ok(Some(r))) => r,
             Ok(Ok(None)) => return Ok(()), // 对端关
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                // 客户端帧错误 ≠ 连接噪声:回 400 让对端看见原因,再关(不重用)
+                if e.kind() == std::io::ErrorKind::InvalidData
+                    || e.kind() == std::io::ErrorKind::UnexpectedEof
+                {
+                    let _ = http::respond_json(
+                        &mut stream,
+                        400,
+                        &openai::error_json(format!("请求帧非法: {e}")),
+                    )
+                    .await;
+                }
+                return Err(e);
+            }
             Err(_) => {
                 owl_shared::log_debug!(
                     "conn",
@@ -520,23 +527,50 @@ async fn serve(mut stream: tokio::net::TcpStream, ctx: ConnCtx) -> std::io::Resu
             .await?;
             return Ok(());
         }
-        // 并发闸门:permit 在本请求处理期间持有(G5④:从连接级改成请求级)。
-        // **聊天面例外**(2026-10-21,P0):permit 延后到 `chat` 里、**会话闸之后**
-        // 再取 —— 否则同会话的排队请求会占着全局 permit 把别家会话饿住。
-        let chat_route = req.method == "POST" && req.path == "/v1/chat/completions";
-        // 廉价只读面（不碰引擎/设备）：不吃 permit —— 否则排队/容量观测会被
-        // "并发位"自己挡住（实测 1.19s，等于等一个 turn 跑完）。
-        let cheap = matches!(req.path.as_str(), "/debug/queue" | "/health" | "/v1/models");
-        let _permit = if chat_route || cheap {
-            None
-        } else {
-            Some(ctx.gate.acquire().await)
+        // 并发闸门:按 **permit 策略表**取(2026-11-16 收拢;
+        // 旧版 = `chat_route || cheap` 两条件 —— 诊断面被顺手挡在门外)
+        let _permit = match permit_scope(req.method.as_str(), req.path.as_str()) {
+            PermitScope::Engine => Some(ctx.gate.acquire().await),
+            // Turn 的位在 `openai::chat` 里取(会话解析之后);Free 不占位
+            PermitScope::Free | PermitScope::Turn => None,
         };
         handle(&mut stream, &req, &ctx).await?;
         served += 1;
         if close_after || served >= MAX_REQUESTS_PER_CONN {
             return Ok(());
         }
+    }
+}
+
+/// **并发位策略**（permit = 一个 **turn** 位，`server.max_concurrency`）。
+///
+/// 2026-11-16 定策。旧版是 `serve` 里的 `chat_route || cheap` 两条条件，白名单
+/// 只收了当时想到的三条路径 ⇒ `/debug/metrics`、`/debug/launches`、`/debug/perf`、
+/// `/debug/log` 这些**纯进程内读**也得排队等一个 turn 让出 permit，满并发时
+/// 排障入口被并发位自己锁死（`/debug/vram`、`/debug/blocks` 还要绕一圈引擎）。
+///
+/// 三档语义：
+/// - [`Free`](PermitScope::Free)：不占 turn 位。纯进程内读/控制面
+///   （`/health`、`/v1/models`、`/debug/*`）与**自限流**的 `/debug/load`
+///   （它自己校验 `concurrency <= max_concurrency` 且绕过 permit 直进引擎通道，
+///   再占一位只会让读数少一档）；未知路径 404 也走这档。
+/// - [`Engine`](PermitScope::Engine)：进 handler 前占位 —— 消耗引擎时间但不产生
+///   turn 的客户端面（`/tokenize`）。
+/// - [`Turn`](PermitScope::Turn)：**不在此处取**，由 `openai::chat` 在解析会话后、
+///   提交之前取 —— 同会话排队不占位，否则会把别家会话饿住。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermitScope {
+    Free,
+    Engine,
+    Turn,
+}
+
+/// 路由 → 并发位档位（新增引擎面路由时必须在这里表态）。
+fn permit_scope(method: &str, path: &str) -> PermitScope {
+    match (method, path) {
+        ("POST", "/v1/chat/completions") => PermitScope::Turn,
+        ("POST", "/tokenize") => PermitScope::Engine,
+        _ => PermitScope::Free,
     }
 }
 
@@ -575,50 +609,16 @@ async fn handle(
                 &ctx.tpl,
                 &ctx.agent,
                 &ctx.trace,
-                &ctx.sessions,
                 &ctx.gate,
                 ctx.request_dump_dir.as_deref(),
                 ctx.vision_max_pixels,
             )
             .await?;
         }
-        // **队列/容量快照**(忙时也能读;见 `telemetry` 模块头)
+        // **队列/容量快照**(忙时也能读;零等待 —— 每拍事实)
         ("GET", "/debug/queue") => {
             let snap = ctx.client.queue_facts();
-            http::respond_json(
-                &mut stream,
-                200,
-                &json!({
-                    "queue_len": snap.queue_len,
-                    "active": snap.active,
-                    "batch_steps": snap.batch_steps,
-                    "max_batch": snap.max_batch,
-                    "graph": snap.has_graph,
-                    "queued": snap.queued.iter().map(|(t, s, ms)| json!({
-                        "turn": t, "session": format!("{s:#x}"), "waited_ms": ms,
-                    })).collect::<Vec<_>>(),
-                    "rejects": snap.rejects.iter().map(|(s, code, n)| json!({
-                        "session": format!("{s:#x}"), "code": code, "count": n,
-                    })).collect::<Vec<_>>(),
-                    "wait_hist": {
-                        "lt_50ms": snap.wait_hist[0],
-                        "lt_200ms": snap.wait_hist[1],
-                        "lt_1s": snap.wait_hist[2],
-                        "lt_5s": snap.wait_hist[3],
-                        "ge_5s": snap.wait_hist[4],
-                    },
-                    "capacity": snap.capacity.map(|c| json!({
-                        "free_pages": c.free_pages,
-                        "cache_pages": c.cache_pages,
-                        "reserved_pages": c.reserved_pages,
-                        "usable_pages": c.usable_pages,
-                        "n_slots": c.n_slots,
-                        "n_mem": c.n_mem,
-                        "n_eff": c.n_eff,
-                    })),
-                }),
-            )
-            .await?;
+            http::respond_json(&mut stream, 200, &debug::queue_json(&snap)).await?;
         }
         // **内源灌流面**(服务面并发能力的现场测量;见 `load` 模块头)
         ("POST", "/debug/load") => {
@@ -681,18 +681,7 @@ async fn handle(
                 )
                 .await?;
             } else {
-                let (allow, deny) = owl_shared::log::with_logger(|g| g.tags()).unwrap_or_default();
-                http::respond_json(
-                    &mut stream,
-                    200,
-                    &json!({
-                        "level": owl_shared::log::level_name(),
-                        "log_build": owl_shared::log::LOG_BUILD,
-                        "tags_allow": allow,
-                        "tags_deny": deny,
-                    }),
-                )
-                .await?;
+                http::respond_json(&mut stream, 200, &debug::log_state_json()).await?;
             }
         }
         // **单步/粘滞调试门**(docs/arch/perf-framework.md §五;投影在
@@ -809,10 +798,7 @@ async fn handle(
                 }
             };
             // 控制通道没消费者(引擎侧未编入 feature / 已退出)= 如实报,不谎报 ok
-            let mut v = debug::step_json();
-            v["applied"] = json!(ok);
-            v["action"] = json!(msg);
-            http::respond_json(&mut stream, 200, &v).await?;
+            http::respond_json(&mut stream, 200, &debug::step_action_json(ok, &msg)).await?;
         }
         // **store 账查询面**(第 0 刀;`/debug/vram`):三层账 + **owner 维明细**。
         // 纯读账(零副作用、零搬运)—— 泄漏判据面:同一 owner 字节逐轮爬坡 = 漏。
@@ -938,4 +924,40 @@ async fn handle(
     // 注:**不调 `stream.shutdown()`** —— 那是“一请求一连接”时代的收尾(发 FIN),
     // keep-alive 下会把连接直接杀掉(G5④ 实测踩过:客户端复用时报 dead)
     Ok(())
+}
+
+#[cfg(test)]
+mod permit_tests {
+    use super::{permit_scope, PermitScope};
+
+    /// **permit 策略表**（2026-11-16）：turn 位只跟"会产生 turn 的请求"挂钩。
+    /// 诊断/控制面必须随时可进 —— 旧版白名单只放三条路径，满并发时排障入口
+    /// 被并发位自己锁死（`/debug/metrics` 要等一个 turn 跑完才返回）。
+    #[test]
+    fn turn_slots_only_for_turns() {
+        assert_eq!(
+            permit_scope("POST", "/v1/chat/completions"),
+            PermitScope::Turn
+        );
+        assert_eq!(permit_scope("POST", "/tokenize"), PermitScope::Engine);
+        for (m, p) in [
+            ("GET", "/health"),
+            ("GET", "/v1/models"),
+            ("GET", "/debug/queue"),
+            ("GET", "/debug/metrics"),
+            ("GET", "/debug/launches/50/launch"),
+            ("GET", "/debug/vram"),
+            ("GET", "/debug/blocks"),
+            ("GET", "/debug/perf/json"),
+            ("GET", "/debug/agent/8"),
+            ("GET", "/debug/log"),
+            ("POST", "/debug/log/level/info"),
+            ("GET", "/debug/step"),
+            ("POST", "/debug/step"),
+            ("POST", "/debug/load"),
+            ("POST", "/nope"),
+        ] {
+            assert_eq!(permit_scope(m, p), PermitScope::Free, "{m} {p}");
+        }
+    }
 }

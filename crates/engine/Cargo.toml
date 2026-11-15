@@ -27,6 +27,8 @@ owl-kernels = { path = "../kernels" }
 # 方向与 owl-cuda 同:engine → backends/*(无环)。
 owl-cpu = { path = "../backends/cpu" }
 half = "2"
+# 预检读检查点 JSON（config.json / model.safetensors.index.json；2026-11-16 P2）
+serde_json = { workspace = true }
 # 异步运行时(S6:磁盘 I/O 跑在 `spawn_blocking` —— 写盘 159MiB 不许钉住 actor)。
 # 只取 rt(不需要 net/time;actor 运行时由 apps/server 建)。
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
@@ -36,6 +38,19 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 owl-macros = { path = "../macros" }
 
 [features]
+# **代际/内核旋钮转发**（2026-11-16 P3）：server 不再直接依赖 `owl-cuda`
+# （它只经 `owl-engine` 拿设备面），但构建期代际选择必须还能一路透传到
+# `owl-kernels`（单源）—— 所以由本 crate 代转一层。
+#   用法不变：`cargo build -p server --features arch-sm120`
+arch-sm75 = ["owl-cuda/arch-sm75"]
+arch-sm86 = ["owl-cuda/arch-sm86"]
+arch-sm89 = ["owl-cuda/arch-sm89"]
+arch-sm120 = ["owl-cuda/arch-sm120"]
+# FP16-PV / FP16-acc（见 owl-kernels 同名 feature）
+fi-fp16pv = ["owl-cuda/fi-fp16pv"]
+fi-fp16acc = ["owl-cuda/fi-fp16acc"]
+# CUPTI 进程内归因 shim
+cupti = ["owl-cuda/cupti"]
 # 性能框架:release 也展开计时宏(见 workpace docs/arch/perf-framework.md)
 perf = ["owl-shared/perf", "owl-models/perf"]
 # logger 框架:不开时五级日志宏全是空语句(编译期剔除)

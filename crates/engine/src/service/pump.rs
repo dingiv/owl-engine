@@ -280,7 +280,21 @@ async fn cancel_turn<D: DeviceClient>(
 ) {
     let ev = match turn {
         Some(t) => running.cancel_turn(t).await,
-        None => running.cancel_session(session).await,
+        // 不知道 turn（客户端在 `Accepted` 之前就断了）：同会话可能"活跃 1 条 +
+        // 排队 N 条"（P4 起），所以**优先挑接收方已关的那一条**；都不关（正常
+        // 的会话级取消）才按老口径取活跃/最早排队。
+        None => {
+            let candidates = running.session_turns(session);
+            let pick = candidates
+                .iter()
+                .copied()
+                .find(|tid| sinks.get(tid).is_some_and(|s| s.is_closed()))
+                .or_else(|| candidates.first().copied());
+            match pick {
+                Some(t) => running.cancel_turn(t).await,
+                None => None,
+            }
+        }
     };
     let Some(ev) = ev else {
         owl_shared::log_debug!(
@@ -354,7 +368,8 @@ async fn accept<D: DeviceClient>(
         owl_shared::log_warn!("executor", "accept 收到非 Chat 请求(内部错误)");
         return;
     };
-    match running.submit_session_opts(session, prompt, max_new, opts) {
+    // 用**结构化拒绝版**：429 语义由 `TurnError::reject()` 决定（P3）
+    match running.submit_session_checked(session, prompt, max_new, opts) {
         Ok((sid, tid)) => {
             // usage 真账：prompt token 数 = 队列/活跃 turn 的 prompt_ids 长度
             // （末块 prefill 不发 Prefill 事件，submit 后即刻取，单源）
@@ -374,7 +389,7 @@ async fn accept<D: DeviceClient>(
             .await;
         }
         Err(e) => {
-            deliver(&sink, StreamEvent::Rejected { err: e.to_string() }).await;
+            deliver(&sink, StreamEvent::Rejected { err: e.into_turn_error() }).await;
         }
     }
 }

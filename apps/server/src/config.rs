@@ -318,7 +318,7 @@ pub struct ServerConfig {
     /// 最大并发请求(runtime.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
     pub max_concurrency: usize,
     /// **合批上限**([runtime] max_batch;1 = 串行现状)。服务面用它做两件事:
-    /// 会话闸的配套告警(隐式会话 + 合批 ⇒ 串行)与 `/debug/vram` 的如实报数。
+    /// 会话串行的配套告警(隐式会话 + 合批 ⇒ 串行)与 `/debug/vram` 的如实报数。
     pub max_batch: usize,
     /// **TP AR 载荷 fp8 档**（parallel.tp_ar_f8；§47 第二步）⇒ 交 `TpOpts.ar_f8`
     pub tp_ar_f8: bool,
@@ -617,13 +617,12 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
 
     // ── 模型/草稿目录几何校验(目录不存在 ⇒ 告警跳过,CI 假路径可跑) ──
     //
-    // **臂 = boot 同源**:`load_arm_of(format, quant)` 是装载的唯一分派点,
-    // `--check` 不再按 `path.is_file()` 猜源(历史错位:`format=awq` + `.gguf`
-    // 路径"检查通过、启动失败")。
-    let arm = owl_engine::load_arm_of(c.model.format, c.model.quant)
-        .map_err(|e| format!("装载臂分派失败:{e}"))?;
-    let load_intent =
-        owl_engine::LoadIntent::of(arm, c.model.head_quant, c.model.embed_quant);
+    // **检查点事实归 engine**（2026-11-16 业务下沉 P2）：臂分派
+    // （`load_arm_of`）→ `LoadIntent` → `open_decl`/几何对账/视觉声明、
+    // 草稿族判定、MTP 键全部在 `owl_engine::preflight`（与 boot 同一份解析）。
+    // server 只算"该查哪个目录"（配置语义）并按既有前缀打印 —— 不再认识
+    // `LoadArm` / `pack-quantized` / `mtp.*`（历史错位：`format=awq` +
+    // `.gguf` 路径"检查通过、启动失败"）。
     let profile = match intent {
         Some(m) => Some(owl_shared::config::intent::model_profile(&m.intent.model)?),
         None => owl_shared::config::intent::model_by_format(c.model.format),
@@ -641,21 +640,19 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             // **一条路径**:臂 → 源族 → 声明事实;几何对账 / 视觉声明 / 摘要
             // 全部走 `CheckpointDecl` 接口(与 boot 同一份解析)。
             let vision_path = c.vision.path.as_deref().filter(|p| !p.as_os_str().is_empty());
-            if profile.is_none()
-                && arm.decl_source() == owl_models::formats::decl::DeclSource::Hf
-            {
-                out.push_str("[check] model dir: 注册表无该 format ⇒ 几何校验跳过\n");
-            }
-            match check_model_decl(
-                dir,
-                arm,
-                &load_intent,
-                profile,
-                c.runtime.max_seq,
-                c.vision.enabled,
+            let spec = owl_engine::preflight::ModelCheckSpec {
+                path: dir,
+                format: c.model.format,
+                quant: c.model.quant,
+                head_quant: c.model.head_quant,
+                embed_quant: c.model.embed_quant,
+                max_seq: c.runtime.max_seq,
+                vision: c.vision.enabled,
                 vision_path,
-            ) {
-                Ok(note) => out.push_str(&format!("[check] model dir: {note}\n")),
+                profile,
+            };
+            match owl_engine::preflight::check_model_dir(&spec) {
+                Ok(lines) => push_check(&mut out, &mut ok, "model dir", lines),
                 Err(e) => {
                     ok = false;
                     out.push_str(&format!("[check] FAIL: {e}\n"));
@@ -678,13 +675,12 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         };
         if dflash2 {
             match c.spec.draft_path.as_deref() {
-                Some(dir) => match check_draft_dir(dir) {
-                    Ok(note) => out.push_str(&format!("[check] draft dir: {note}\n")),
-                    Err(e) => {
-                        ok = false;
-                        out.push_str(&format!("[check] FAIL: {e}\n"));
-                    }
-                },
+                Some(dir) => push_check(
+                    &mut out,
+                    &mut ok,
+                    "draft dir",
+                    owl_engine::preflight::check_draft_dir(dir),
+                ),
                 None => {
                     ok = false;
                     out.push_str("[check] FAIL: spec.draft=dflash2 但 spec.draft_path 为空\n");
@@ -706,13 +702,12 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
                         .as_deref()
                         .map(Path::new)
                         .unwrap_or_else(|| Path::new(dir));
-                    match check_mtp_head(mtp) {
-                        Ok(note) => out.push_str(&format!("[check] draft: {note}\n")),
-                        Err(e) => {
-                            ok = false;
-                            out.push_str(&format!("[check] FAIL: {e}\n"));
-                        }
-                    }
+                    push_check(
+                        &mut out,
+                        &mut ok,
+                        "draft",
+                        owl_engine::preflight::check_mtp_head(mtp),
+                    );
                 }
                 None => out.push_str(
                     "[check] draft: MTP 头随检查点装载;缺 model.path 时无法预检 mtp.* 键\n",
@@ -763,166 +758,26 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
     Ok(CheckReport { text: out, ok })
 }
 
-/// 模型 `config.json` 几何校验(读 `text_config`;与注册表逐项比对)
-fn check_mtp_head(dir: &Path) -> Result<String, String> {
-    // GGUF 单文件:NextN 块 = `blk.<n>.nextn.eh_proj.weight`
-    if dir.is_file() {
-        if dir.extension().and_then(|s| s.to_str()) != Some("gguf") {
-            return Err(format!(
-                "MTP 头 {} 既不是目录也不是 .gguf 单文件",
-                dir.display()
-            ));
-        }
-        let g = owl_models::formats::gguf::Gguf::open(dir)
-            .map_err(|e| format!("打开 GGUF {} 失败: {e}", dir.display()))?;
-        let n = g
-            .tensors
-            .iter()
-            .filter(|t| t.name.starts_with("blk.") && t.name.contains(".nextn.eh_proj."))
-            .count();
-        if n == 0 {
-            return Err(format!(
-                "spec.draft=mtp 但 {} 没有 blk.<n>.nextn.eh_proj.*（该 GGUF 不带 MTP 头）",
-                dir.display()
-            ));
-        }
-        return Ok(format!("{} ✓ GGUF MTP / {} 个 NextN 块", dir.display(), n));
-    }
-    let p = dir.join("model.safetensors.index.json");
-    if !p.is_file() {
-        return Ok(format!(
-            "{} 无 model.safetensors.index.json —— 跳过 mtp.* 预检(装载期验证)",
-            dir.display()
-        ));
-    }
-    let raw = owl_shared::file_loader::read_to_string(&p)
-        .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
-    let n = v
-        .get("weight_map")
-        .and_then(|x| x.as_object())
-        .map(|m| m.keys().filter(|k| k.starts_with("mtp.")).count())
-        .unwrap_or(0);
-    if n == 0 {
-        return Err(format!(
-            "spec.draft=mtp 但 {} 的权重索引没有 mtp.* 键（该检查点不是 MTP 档；请改用 dflash2 或关 spec）",
-            dir.display()
-        ));
-    }
-    Ok(format!("{} ✓ MTP 头 / {} 个 mtp.* 键", dir.display(), n))
-}
-
-
-/// **GGUF 单文件几何 + 视觉塔预检**(2026-10-21;`--check` 专用)。
+/// 预检行 → 报告文本(顺序即报告顺序;`Fail` 统一打 `[check] FAIL:`)。
 ///
-/// 与 [`check_model_dir`] 的分工:GGUF 没有 `config.json`,超参/词表/rope
-/// 全在文件内;视觉塔在**同目录 mmproj**。本函数只读索引,不装权重。
-/// **检查点对账(`--check` 单一入口;2026-11-04 clean-code)**。
-///
-/// 两条旧的格式专用路径(`check_gguf_model` / `check_model_dir`)合并为一条:
-/// 声明事实由 `owl_models::formats::decl::open_decl` 按**装载臂**分派(唯一一处),
-/// 几何对账 / 视觉声明 / 摘要全部走 `CheckpointDecl` 接口。
-///
-/// **旋钮能力门**也在这里跑(`LoadIntent::check_arm`):`--check` 必须与 boot
-/// 用同一条拒绝规则(例:GGUF 的 `head_quant`/`embed_quant` 覆盖)。
-fn check_model_decl(
-    path: &Path,
-    arm: owl_engine::LoadArm,
-    intent: &owl_engine::LoadIntent,
-    profile: Option<&owl_shared::config::intent::ModelProfile>,
-    max_seq: usize,
-    vision: bool,
-    vision_path: Option<&Path>,
-) -> Result<String, String> {
-    use owl_models::formats::decl::{check_geom_against, open_decl, MaxPosPolicy};
-
-    intent.check_arm(arm)?;
-    let Some(decl) = open_decl(path, arm.decl_source())? else {
-        return Ok(format!(
-            "{} 不可读(config.json 缺失)—— 几何校验跳过(真启动会失败)",
-            path.display()
-        ));
-    };
-    if let Some(p) = profile {
-        check_geom_against(decl.as_ref(), p, max_seq)?;
-    }
-    let mut note = decl.summary();
-    // 自带 MTP/NextN 头是检查点事实(同一份解析);0 = 不带,不打扰输出
-    let draft = decl.draft();
-    if draft.mtp_layers > 0 {
-        note.push_str(&format!(" · mtp={}", draft.mtp_layers));
-    }
-    // max_pos 的**软**超标只在摘要里提示(HF 是硬拒,已在 check_geom_against 抛)
-    let g = decl.geom();
-    if decl.max_pos_policy() == MaxPosPolicy::WarnYarn && g.max_pos != 0 && max_seq > g.max_pos {
-        note.push_str(&format!("（runtime.max_seq={max_seq} > 模型 ctx；需 YaRN）"));
-    }
-    if vision {
-        if let Some(v) = decl.vision(vision_path)? {
-            note.push_str(&format!(" · vision={}", v.note));
+/// 检查点事实由 `owl_engine::preflight` 产出(与 boot 同源),这里只排版。
+fn push_check(
+    out: &mut String,
+    ok: &mut bool,
+    label: &str,
+    lines: owl_engine::preflight::CheckLines,
+) {
+    for item in lines.items {
+        match item {
+            owl_engine::preflight::CheckItem::Pass(t) => {
+                out.push_str(&format!("[check] {label}: {t}\n"))
+            }
+            owl_engine::preflight::CheckItem::Fail(e) => {
+                *ok = false;
+                out.push_str(&format!("[check] FAIL: {e}\n"));
+            }
         }
-    } else if vision_path.is_some() {
-        return Err(format!(
-            "{}:[vision] path 已设置但 [vision] enabled = false（配置自相矛盾）",
-            path.display()
-        ));
     }
-    Ok(note)
-}
-
-/// 草稿 `config.json` 校验(DFlash2 + W4A16 pack-quantized;BF16 源 = AL 0)
-fn check_draft_dir(dir: &Path) -> Result<String, String> {
-    // GGUF 草稿单文件(DFlash2-GGUF;2026-10-21 feat/gguf 线)
-    if dir.is_file() {
-        if dir.extension().and_then(|s| s.to_str()) != Some("gguf") {
-            return Err(format!("草稿 {} 既不是目录也不是 .gguf 单文件", dir.display()));
-        }
-        let g = owl_models::formats::gguf::Gguf::open(dir)
-            .map_err(|e| format!("打开草稿 GGUF {} 失败: {e}", dir.display()))?;
-        return Ok(format!(
-            "{} ✓ GGUF 草稿 / {} 张量(arch={})",
-            dir.display(),
-            g.tensors.len(),
-            g.arch().map(|a| a.to_string()).unwrap_or_else(|_| "?".into())
-        ));
-    }
-    let p = dir.join("config.json");
-    if !p.is_file() {
-        return Ok(format!("{} 不可读(config.json 缺失)—— 校验跳过(真启动会失败)", dir.display()));
-    }
-    let raw = owl_shared::file_loader::read_to_string(&p)
-        .map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("{} 不是合法 JSON: {e}", p.display()))?;
-    let arch: Vec<String> = v
-        .get("architectures")
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
-    if !arch.iter().any(|a| a.contains("DFlash2")) {
-        return Err(format!(
-            "草稿目录 {} 的 architectures={arch:?} 不是 DFlash2 —— 检查 [site].draft_dir",
-            dir.display()
-        ));
-    }
-    let fmt = v
-        .get("quantization_config")
-        .and_then(|q| q.get("format"))
-        .and_then(|x| x.as_str());
-    if fmt != Some("pack-quantized") {
-        return Err(format!(
-            "草稿目录 {} 不是 W4A16 pack-quantized(quantization_config.format={fmt:?})\n\
-             —— BF16 源(z-lab 系)喂引擎 = 草稿全噪声 AL=0;生产用 syvai W4A16 系",
-            dir.display()
-        ));
-    }
-    let layers = v.get("num_hidden_layers").and_then(|x| x.as_u64());
-    Ok(format!(
-        "{} ✓ DFlash2 / pack-quantized{}",
-        dir.display(),
-        layers.map(|n| format!(" / {n} 层")).unwrap_or_default()
-    ))
 }
 
 /// `--print-config` / `--explain` 输出(TOML 或 JSON;JSON 含来源/估算)

@@ -132,7 +132,125 @@ pub enum TurnEvent {
         stats: TurnStats,
     },
     /// turn 失败(槽/执行错误;槽已释放,队列继续)
-    Failed { turn: u64, err: String },
+    Failed {
+        turn: u64,
+        /// 错误事实：显示串 + **可选的结构化准入拒绝**（见 [`TurnError`]）
+        err: TurnError,
+    },
+}
+
+/// **准入拒绝**（引擎词表；服务面只做协议映射，不再解析错误串）。
+///
+/// 2026-11-16 业务下沉 P3。背景：此前服务面按
+/// `admission:<code> retry_ms=<n> —— …` **字符串**解析出 429 语义 ——
+/// 错误串是人读文本，改一个字就静默改变 HTTP 行为。现在拒绝在**产生点**就是
+/// 结构化的；[`Display`] 仍产出同一条旧串（日志与既有断言不变）。
+///
+/// 词表（引擎唯一产地）：
+/// - `no_slot` — 在飞（批位 + 队列）已达上限（submit 边界）；
+/// - `no_memory` / `queue_timeout` / `session_busy` — 调度准入判决（排队边界）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionReject {
+    code: &'static str,
+    retry_in_ms: Option<u64>,
+    detail: String,
+}
+
+impl AdmissionReject {
+    pub fn new(code: &'static str, retry_in_ms: Option<u64>, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            retry_in_ms,
+            detail: detail.into(),
+        }
+    }
+
+    /// 引擎词表码（服务面用它做 `429` 的 `code` 字段）。
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// 引擎给的退避建议（毫秒）；`None` = 未估计。
+    pub fn retry_in_ms(&self) -> Option<u64> {
+        self.retry_in_ms
+    }
+
+    /// 人读明细（不含 `admission:` 前缀与 `retry_ms=` 字段）。
+    pub fn detail(&self) -> &str {
+        self.detail.as_str()
+    }
+}
+
+impl std::fmt::Display for AdmissionReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "admission:{}", self.code)?;
+        if let Some(n) = self.retry_in_ms {
+            write!(f, " retry_ms={n}")?;
+        }
+        if !self.detail.is_empty() {
+            if self.retry_in_ms.is_some() {
+                write!(f, " —— {}", self.detail)
+            } else {
+                write!(f, " {}", self.detail)
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// **turn 失败信息**：显示串 + 可选结构化拒绝。
+///
+/// 为什么不直接拿 `String`：服务面要根据“是不是准入拒绝”选 HTTP 语义
+/// （429 + `Retry-After` vs 400/500）。把判定放在**产生点**，服务面零解析、
+/// 零字符串契约。`Display` 保持旧串不变（日志可读性/既有断言不动）。
+#[derive(Clone, Debug)]
+pub struct TurnError {
+    message: String,
+    reject: Option<AdmissionReject>,
+}
+
+impl TurnError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            reject: None,
+        }
+    }
+
+    /// 由准入拒绝构造（`message` = 旧串，两者不会再漂）。
+    pub fn rejected(reject: AdmissionReject) -> Self {
+        Self {
+            message: reject.to_string(),
+            reject: Some(reject),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        self.message.as_str()
+    }
+
+    pub fn reject(&self) -> Option<&AdmissionReject> {
+        self.reject.as_ref()
+    }
+}
+
+impl std::fmt::Display for TurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for TurnError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
+impl From<&str> for TurnError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
 }
 
 /// 单 turn 的诊断账(与 `TurnEvent::Completed` 同源)。

@@ -12,6 +12,12 @@
 //! 引擎请求通道，量的是同一段引擎路径，且**不占** permit —— 但 `concurrency`
 //! 仍按 `max_concurrency` 校验（它就是服务面的并发上限，超了如实拒）。
 //!
+//! **路由层面的口径（2026-11-16 更正）**：`/debug/load` 整条路由也走
+//! `PermitScope::Free`（不再在 `serve` 里占一个 turn 位）。旧行为是“workers 不占、
+//! 但自己占一位并持有到跑完” ⇒ 真实在飞 = `concurrency + 1 + 其它流量`，
+//! `concurrency` 校验也不是服务面真上限。本面是**开发测量工具**：与生产流量
+//! 同时跑时读数无效（排队/批位都会被别家 turn 污染），要准就地停业务。
+//!
 //! **判据**（输出里全给）：
 //! - `batch.steps_delta > 0` 且 `max_batch > 1` ⇒ 真的合批；
 //!   `steps_delta == 0` 而并发 >1 ⇒ "并发进引擎但批门未成立"（相位/采样档/
@@ -322,7 +328,7 @@ async fn run_one(
                 break;
             }
             StreamEvent::Turn(TurnEvent::Failed { err, .. }) => {
-                out.err = Some(err);
+                out.err = Some(err.to_string());
                 break;
             }
             // Idle 不该出现在单 turn 的 sink 上（出现 = 引擎退役，如实记）
