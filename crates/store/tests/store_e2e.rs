@@ -1281,3 +1281,128 @@ fn snapshot_cascade_spills_host_before_dropping_gpu() {
         v2.out
     );
 }
+
+/// **两池档（无盘）宿主快照满**：必须按 `SnapClass` 先淘汰更冷的宿主快照，
+/// 不能因为宿主瞬时无位就把设备的 `Dense` 快照 Drop（2026-11-13）。
+#[test]
+fn two_tier_host_snapshot_relief_respects_class() {
+    let l = leg(1); // 宿主开启；磁盘由 Room 显式关掉
+    let mut state = StateStore::new(1, 64);
+    let host_key = owl_store::SnapKey::at_boundary(ChainHash::new(0x31));
+    let gpu_key = owl_store::SnapKey::at_boundary(ChainHash::new(0x32));
+    state.register_snap_owned_class(
+        host_key,
+        64,
+        owl_store::Tier::Host,
+        owl_store::SnapDurability::Durable,
+        1,
+        1,
+        owl_store::SnapClass::Extra,
+    );
+    state.register_snap_owned_class(
+        gpu_key,
+        64,
+        owl_store::Tier::Gpu,
+        owl_store::SnapDurability::Durable,
+        1,
+        2,
+        owl_store::SnapClass::Dense,
+    );
+    let room = Room {
+        host_enabled: true,
+        host_kv_slots: 0,
+        host_snap_slots: 0, // 宿主快照满
+        disk_kv_slots: 0,
+        disk_snap_slots: 0,
+        disk_enabled: false,
+        bulk_drop_when_tier_full: false,
+    };
+    let v = plan_capacity(
+        &l,
+        &state,
+        &LruPolicy,
+        Need {
+            slots: 0,
+            snap_bytes: 64,
+            host_kv_slots: 0,
+            host_snap_slots: 0,
+            why: NeedWhy::Grow,
+        },
+        &[],
+        &[],
+        room,
+    );
+    assert!(v.deny.is_none(), "应可满足：{:?}", v.deny);
+    assert!(
+        v.out.iter().any(
+            |o| matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == host_key)
+        ),
+        "必须先 Drop 更冷的宿主 Extra：{:?}",
+        v.out
+    );
+    assert!(
+        v.out.iter().any(
+            |o| matches!(o, EvictOut::Snap { key, sink: Sink::Host } if *key == gpu_key)
+        ),
+        "再让设备 Dense 下沉：{:?}",
+        v.out
+    );
+    assert!(
+        v.out.iter().all(
+            |o| !matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == gpu_key)
+        ),
+        "设备 Dense 不得被 Drop：{:?}",
+        v.out
+    );
+
+    // 反向：宿主是 Dense、设备是 Extra ⇒ 应丢设备 Extra，宿主 Dense 留下。
+    let mut state = StateStore::new(1, 64);
+    state.register_snap_owned_class(
+        host_key,
+        64,
+        owl_store::Tier::Host,
+        owl_store::SnapDurability::Durable,
+        1,
+        1,
+        owl_store::SnapClass::Dense,
+    );
+    state.register_snap_owned_class(
+        gpu_key,
+        64,
+        owl_store::Tier::Gpu,
+        owl_store::SnapDurability::Durable,
+        1,
+        2,
+        owl_store::SnapClass::Extra,
+    );
+    let v = plan_capacity(
+        &l,
+        &state,
+        &LruPolicy,
+        Need {
+            slots: 0,
+            snap_bytes: 64,
+            host_kv_slots: 0,
+            host_snap_slots: 0,
+            why: NeedWhy::Grow,
+        },
+        &[],
+        &[],
+        room,
+    );
+    assert!(v.deny.is_none(), "应可满足：{:?}", v.deny);
+    assert!(
+        v.out.iter().all(
+            |o| !matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == host_key)
+        ),
+        "宿主 Dense 不得为设备 Extra 让位：{:?}",
+        v.out
+    );
+    assert!(
+        v.out.iter().any(
+            |o| matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == gpu_key)
+        ),
+        "设备 Extra 应被 Drop：{:?}",
+        v.out
+    );
+}

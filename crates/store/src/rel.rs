@@ -654,8 +654,9 @@ impl Rel {
             }
             let mut parent = ChainHash::new(0);
             let mut ok = 0usize;
-            for block in idx.tokens.chunks(page) {
-                let h = crate::kv::hash_block(parent, block, 0);
+            for (i, block) in idx.tokens.chunks(page).enumerate() {
+                let tag = idx.tags.get(i).copied().unwrap_or(0);
+                let h = crate::kv::hash_block(parent, block, tag);
                 if !disk.contains(h) {
                     break; // 内容不在盘上 ⇒ 连续前缀到此为止
                 }
@@ -691,7 +692,9 @@ impl Rel {
                 continue;
             }
             let prefix = idx.truncated(ok);
-            let inserted = self.leg.register_chain_offloaded(&prefix.tokens)?;
+            let inserted = self
+                .leg
+                .register_chain_offloaded_tagged(&prefix.tokens, &prefix.tags)?;
             rep.chains += 1;
             rep.blocks += inserted.len();
             rep.kept.extend(inserted);
@@ -2438,6 +2441,48 @@ mod tests {
         );
     }
 
+    /// **可删图锚点可淘汰门（2026-11-13）**：锚点是 `Extra` 档、不进任何
+    /// 保护面 ⇒ 空间不足时**先于 Dense** 被逐出。这是“不搞 pin”的硬门：
+    /// 谁把锚点提到 `Dense` 或塞进 `Protected`，这里就红。
+    #[test]
+    fn evict_anchor_snapshot_is_extra_and_evictable() {
+        use crate::state::SnapClass;
+        let mut r = rel(2);
+        let anchor = SnapKey::at_boundary(ChainHash::new(0xA1));
+        let dense = SnapKey::at_boundary(ChainHash::new(0xA2));
+        // 同一会话：锚点 = Extra（capture 路径的 class），尾锚点 = Dense。
+        r.state.register_snap_owned_class(
+            anchor,
+            BLOCK_BYTES,
+            Tier::Gpu,
+            SnapDurability::Durable,
+            7,
+            5,
+            SnapClass::Extra,
+        );
+        r.state.register_snap_owned_class(
+            dense,
+            BLOCK_BYTES,
+            Tier::Gpu,
+            SnapDurability::Durable,
+            7,
+            6,
+            SnapClass::Dense,
+        );
+        assert_eq!(r.state.snap_class(anchor), Some(SnapClass::Extra));
+        assert_eq!(
+            r.snap_victim_order(&[]).first(),
+            Some(&anchor),
+            "Extra 档的锚点必须先进淘汰序（不是 pin）"
+        );
+        // 锚点不在 `Protected` 面里；只有**正在载入**的 key 才被显式挡住。
+        assert_eq!(
+            r.snap_victim_order(&[anchor]),
+            vec![dense],
+            "显式 protect（正在载入）才挡；引擎不会把锚点塞进 protect"
+        );
+    }
+
     /// **状态腿出序唯一(§30.6-②)**:`snap_victim_order` 与 `plan_need` 的
     /// `Snap` 票**同序**(事实档 + 策略),且 Transient 永远先走。
     #[test]
@@ -3166,6 +3211,81 @@ mod tests {
         assert!(r.drop_snap_asset(key).is_err(), "未知键必须响亮拒");
     }
 
+    /// **复用面裁剪门（2026-11-13）**：`reuse_face` 是引擎复用面的**单源**
+    /// （末块重算 + 快照边界裁剪 + recall 快路），直接钉死三条语义：
+    /// ① 命中面恰好对齐 prompt ⇒ 末块留给 prefill（非空 chunk）；
+    /// ② 尾边界无快照 ⇒ 一路往回裁到最近在账的快照；
+    /// ③ recall 命中快照腿且无需重算尾块 ⇒ 不裁（快路）；
+    /// ④ `dev` 只数设备槽（宿主占位 `None` 不算）。
+    #[test]
+    fn reuse_face_trims_to_snapshot_boundary_and_keeps_tail_for_prefill() {
+        let mut r = rel(1);
+        let page = 32usize;
+        let hashes: Vec<ChainHash> = (1..=5u64).map(ChainHash::new).collect();
+        let hit = ChainHit {
+            matched_blocks: 5,
+            slots: vec![Some(0), Some(1), Some(2), None, None],
+            hashes: hashes.clone(),
+        };
+        let recall = RecallHit {
+            kv_tier: Some(Tier::Gpu),
+            snap_tier: None,
+            blocks: 5,
+        };
+        // ① 完全对齐 ⇒ 末块重算（哪怕快照就在末边界）。
+        r.state.register_snap(
+            SnapKey::at_boundary(hashes[3]),
+            BLOCK_BYTES,
+            Tier::Gpu,
+            SnapDurability::Durable,
+        );
+        let (m, dev) = r.reuse_face(&hit, &recall, 5 * page, page);
+        assert_eq!(m, 4, "完全对齐必须保留末块重算");
+        assert_eq!(dev, 3, "dev 只数设备槽（块 3/4 是宿主占位）");
+
+        // ② 尾边界无快照 ⇒ 裁到最近在账的边界：只留边界 1 的快照。
+        r.drop_snap_asset(SnapKey::at_boundary(hashes[3]))
+            .expect("撤边界 3");
+        r.state.register_snap(
+            SnapKey::at_boundary(hashes[1]),
+            BLOCK_BYTES,
+            Tier::Gpu,
+            SnapDurability::Durable,
+        );
+        let (m, dev) = r.reuse_face(&hit, &recall, 5 * page + 7, page);
+        assert_eq!(m, 2, "必须裁到最后一个有快照的边界（块 1 之后）");
+        assert_eq!(dev, 2, "裁后的设备槽数");
+
+        // ③ recall 命中快照腿 + 无需重算 ⇒ 快路不裁。
+        let recall_snap = RecallHit {
+            kv_tier: Some(Tier::Gpu),
+            snap_tier: Some(Tier::Gpu),
+            blocks: 5,
+        };
+        let (m, dev) = r.reuse_face(&hit, &recall_snap, 5 * page + 7, page);
+        assert_eq!(m, 5, "recall 命中快照 + 不对齐 ⇒ 不裁");
+        assert_eq!(dev, 3);
+
+        // ④ 完全对齐时快路不生效（仍要留末块）⇒ 仍走快照裁剪。
+        r.state.register_snap(
+            SnapKey::at_boundary(hashes[3]),
+            BLOCK_BYTES,
+            Tier::Gpu,
+            SnapDurability::Durable,
+        );
+        let (m, _) = r.reuse_face(&hit, &recall_snap, 5 * page, page);
+        assert_eq!(m, 4, "对齐 ⇒ 末块重算优先于 recall 快路");
+
+        // ⑤ 一个快照都不在账 ⇒ 复用面为 0（宁少不错）。
+        let empty = ChainHit {
+            matched_blocks: 5,
+            slots: vec![Some(0); 5],
+            hashes: (11..=15u64).map(ChainHash::new).collect(),
+        };
+        let (m, dev) = r.reuse_face(&empty, &recall, 5 * page + 7, page);
+        assert_eq!((m, dev), (0, 0), "无快照边界 = 不可复用");
+    }
+
     /// 设备层只动账(槽是池的活);目标已在账 / 账表不平 ⇒ 拒且原样不动。
     #[test]
     fn rekey_snap_moves_host_content_without_copy() {
@@ -3505,6 +3625,40 @@ mod tests {
         assert_eq!(r.leg.kv_stats().host_blocks, 3, "重建条目应为非设备层");
         let (hit, _recall) = r.match_prefix(&tokens).expect("命中");
         assert_eq!(hit.matched_blocks, 3, "命中面应按重建的树工作");
+    }
+
+    /// **S6.1 带指纹重建**：盘上内容键由 `(tokens, tags)` 算出；索引必须
+    /// 用同一份 tags 重建，否则图像/位置链一块都对不上（2026-11-13）。
+    #[test]
+    fn adopt_disk_chains_uses_index_tags() {
+        let mut i = inputs();
+        i.disk_bytes = 8 << 20;
+        let mut r = rel_with_disk(&mut i, 4 << 20, 0);
+        let tokens: Vec<u32> = (0..96).collect();
+        let tags = vec![0xAAu64, 0, 0xCC];
+        let mut parent = ChainHash::new(0);
+        for (blk, tag) in tokens.chunks(32).zip(&tags) {
+            let h = crate::kv::hash_block(parent, blk, *tag);
+            parent = h;
+            let plan = r.disk.as_ref().expect("盘").plan_spill(h).expect("计划");
+            r.disk
+                .as_mut()
+                .expect("盘")
+                .commit_spill(&plan)
+                .expect("落账");
+        }
+        let idx = crate::disk_index::ChainIndex::with_tags(
+            32,
+            tokens.clone(),
+            tags.clone(),
+        )
+        .expect("索引");
+        let rep = r.adopt_disk_chains(&[idx]).expect("重建");
+        assert_eq!((rep.chains, rep.blocks), (1, 3), "{rep:?}");
+        let (hit, _) = r.match_prefix_tagged(&tokens, &tags).expect("命中");
+        assert_eq!(hit.matched_blocks, 3, "带指纹链必须完整命中");
+        let (plain, _) = r.match_prefix_tagged(&tokens, &[]).expect("无指纹");
+        assert_eq!(plain.matched_blocks, 0, "无指纹不得误命中带指纹链");
     }
 
     /// **S6.1 截断**:索引 3 块、盘上只有前 2 块 ⇒ 重建 2 块 + 记截断。

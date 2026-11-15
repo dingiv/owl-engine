@@ -9,10 +9,12 @@
 //! # 形态(自包含、廉价)
 //!
 //! ```text
-//! magic  "OWLIDX01"        8 B
+//! magic  "OWLIDX02"        8 B
 //! block_tokens  u32 LE     4 B   (本引擎恒 32)
 //! n_tokens      u32 LE     4 B
+//! n_tags        u32 LE     4 B   (0 或 = n_tokens/block_tokens)
 //! tokens        n × u32 LE      (4 B/token)
+//! tags          n_tags × u64 LE (图像/位置签名；与块同序)
 //! ```
 //!
 //! 8k token 的链 ≈ **32 KB**(相对内容 2 MiB/块的千分之几)。**只增不删**:
@@ -30,7 +32,7 @@
 use crate::error::{StoreError, StoreResult};
 
 /// 索引文件魔数(带版本;不认 = 响亮拒,不猜)。
-pub const INDEX_MAGIC: [u8; 8] = *b"OWLIDX01";
+pub const INDEX_MAGIC: [u8; 8] = *b"OWLIDX02";
 
 /// 一条链的索引(重建树所需的最小信息)。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +41,8 @@ pub struct ChainIndex {
     pub block_tokens: usize,
     /// 整链 token 序列(从根开始;尾部不满一块的部分**不重建**)。
     pub tokens: Vec<u32>,
+    /// 逐块身份指纹（图像内容 + 非紧凑位置签名）；空 = 旧链/纯文本身份。
+    pub tags: Vec<u64>,
 }
 
 impl ChainIndex {
@@ -54,7 +58,29 @@ impl ChainIndex {
                 block_tokens
             )));
         }
-        Ok(Self { block_tokens, tokens })
+        Ok(Self {
+            block_tokens,
+            tokens,
+            tags: Vec::new(),
+        })
+    }
+
+    /// 带逐块指纹构造（指纹长度必须 = 整块数，否则拒绝）。
+    pub fn with_tags(
+        block_tokens: usize,
+        tokens: Vec<u32>,
+        tags: Vec<u64>,
+    ) -> StoreResult<Self> {
+        let mut idx = Self::new(block_tokens, tokens)?;
+        if !tags.is_empty() && tags.len() != idx.blocks() {
+            return Err(StoreError::Invariant(format!(
+                "索引指纹数 {} ≠ 整块数 {}",
+                tags.len(),
+                idx.blocks()
+            )));
+        }
+        idx.tags = tags;
+        Ok(idx)
     }
 
     /// 整块数(向下取整;尾部残块不参与身份)。
@@ -64,7 +90,7 @@ impl ChainIndex {
 
     /// 编码后的字节数。
     pub fn encoded_len(&self) -> usize {
-        16 + self.tokens.len() * 4
+        20 + self.tokens.len() * 4 + self.tags.len() * 8
     }
 
     /// 编码(固定小端;见模块头注的布局)。
@@ -73,7 +99,11 @@ impl ChainIndex {
         out.extend_from_slice(&INDEX_MAGIC);
         out.extend_from_slice(&(self.block_tokens as u32).to_le_bytes());
         out.extend_from_slice(&(self.tokens.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.tags.len() as u32).to_le_bytes());
         for t in &self.tokens {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        for t in &self.tags {
             out.extend_from_slice(&t.to_le_bytes());
         }
         out
@@ -81,9 +111,9 @@ impl ChainIndex {
 
     /// 解码(魔数/长度/几何任一不符 = **响亮拒**,不静默截断)。
     pub fn decode(bytes: &[u8]) -> StoreResult<Self> {
-        if bytes.len() < 16 {
+        if bytes.len() < 20 {
             return Err(StoreError::Invariant(format!(
-                "索引太短:{} < 16(文件损坏?)",
+                "索引太短:{} < 20(文件损坏?)",
                 bytes.len()
             )));
         }
@@ -94,7 +124,8 @@ impl ChainIndex {
         }
         let block_tokens = u32::from_le_bytes(bytes[8..12].try_into().expect("切片长度由上面保证")) as usize;
         let n = u32::from_le_bytes(bytes[12..16].try_into().expect("同上")) as usize;
-        let want = 16 + n * 4;
+        let n_tags = u32::from_le_bytes(bytes[16..20].try_into().expect("同上")) as usize;
+        let want = 20 + n * 4 + n_tags * 8;
         if bytes.len() != want {
             return Err(StoreError::Invariant(format!(
                 "索引长度不符:{} ≠ 声明 {}(截断/多余字节)",
@@ -104,10 +135,17 @@ impl ChainIndex {
         }
         let mut tokens = Vec::with_capacity(n);
         for i in 0..n {
-            let at = 16 + i * 4;
+            let at = 20 + i * 4;
             tokens.push(u32::from_le_bytes(bytes[at..at + 4].try_into().expect("上面校验过")));
         }
-        ChainIndex::new(block_tokens, tokens)
+        let mut tags = Vec::with_capacity(n_tags);
+        for i in 0..n_tags {
+            let at = 20 + n * 4 + i * 8;
+            tags.push(u64::from_le_bytes(
+                bytes[at..at + 8].try_into().expect("上面校验过"),
+            ));
+        }
+        ChainIndex::with_tags(block_tokens, tokens, tags)
     }
 
     /// 截断到 `n` 个整块(按"内容在场"的连续前缀重建用)。
@@ -116,6 +154,7 @@ impl ChainIndex {
         ChainIndex {
             block_tokens: self.block_tokens,
             tokens: self.tokens[..n * self.block_tokens].to_vec(),
+            tags: self.tags[..n.min(self.tags.len())].to_vec(),
         }
     }
 }
@@ -126,7 +165,12 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip() {
-        let idx = ChainIndex::new(32, (0..96u32).collect()).expect("构造");
+        let idx = ChainIndex::with_tags(
+            32,
+            (0..96u32).collect(),
+            vec![0x11, 0x22, 0x33],
+        )
+        .expect("构造");
         assert_eq!(idx.blocks(), 3);
         let bytes = idx.encode();
         assert_eq!(bytes.len(), idx.encoded_len());

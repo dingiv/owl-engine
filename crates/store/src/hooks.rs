@@ -225,7 +225,11 @@ pub struct Applied {
 }
 
 /// **各层可容纳量**(两腿 × 各层;§30.2)。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// ⚠️ **不实现 `Default`**（2026-11-13 API 收口）：全零 `Room` 会让
+/// `plan_capacity` 落到 `plan_gpu_only`（单池档）并静默 `Drop` —— 一个
+/// `..Default::default()` 就能把三层档降成单池。构造必须逐字段显式给。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Room {
     /// 宿主层是否**配置为开启**（KV 腿或状态腿任一有预算；与“这一拍满没满”无关）。
     pub host_enabled: bool,
@@ -591,6 +595,73 @@ pub fn plan_gpu_host_disk(
                 kv_host_room += span;
                 need -= span;
             }
+        }
+    }
+
+    // ── 轮零（状态腿）：宿主快照满且无盘 ⇒ 先淘汰更冷的宿主快照 ─────────
+    //
+    // 没有磁盘时，宿主快照满会让轮一完全不出 Host 票；轮二只从 GPU 快照
+    // 里 Drop ⇒ 若宿主是更冷的 Extra、设备是 Dense，会先丢 Dense，违反
+    // `Transient → Extra → Binary → Dense`。这里按档位/新鲜度做一对一配对：
+    // 只有宿主 victim 不比它要换下的 GPU 候选更热时才 Drop 宿主。
+    if !host_disk_only
+        && got_snap < snap_goal
+        && snap_host_room == 0
+        && room.disk_snap_slots == 0
+    {
+        let snap_key = |c: &EvictCandidate| {
+            let rank = c
+                .snap
+                .and_then(|k| state.snap_class(k))
+                .map(|cl| cl.evict_rank())
+                .unwrap_or((1, 0));
+            (rank.0, rank.1, c.last_use)
+        };
+        let gpu = order_snap_victims(
+            policy,
+            state
+                .evict_candidates(protect_snaps)
+                .into_iter()
+                .filter(|c| {
+                    c.tier == Tier::Gpu
+                        && c.snap.is_some_and(|k| {
+                            state.snap_durability(k) != Some(SnapDurability::Transient)
+                        })
+                })
+                .collect(),
+            state,
+        );
+        let host = order_snap_victims(
+            policy,
+            state
+                .evict_candidates(protect_snaps)
+                .into_iter()
+                .filter(|c| c.tier == Tier::Host && c.snap.is_some())
+                .collect(),
+            state,
+        );
+        // 需要几张 GPU 快照下沉才能覆盖 snap_goal。
+        let mut need = 0usize;
+        let mut bytes = 0usize;
+        for c in &gpu {
+            if bytes >= snap_goal {
+                break;
+            }
+            if c.bytes > 0 {
+                need += 1;
+                bytes += c.bytes;
+            }
+        }
+        for (g, h) in gpu.iter().take(need).zip(host.iter()) {
+            if snap_key(h) > snap_key(g) {
+                break;
+            }
+            let Some(key) = h.snap else { continue };
+            v.out.push(EvictOut::Snap {
+                key,
+                sink: Sink::Drop,
+            });
+            snap_host_room += 1;
         }
     }
 
