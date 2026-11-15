@@ -677,7 +677,7 @@ K.10 把三条律写下来后,按律把配置面收口,**期间发现合并(`5f7
    - **池 ≥ `max_seq`**,且 `Strict` 准入是整 ctx 常驻 ⇒ `131072` 的 prompt 配
      `pool=131328` 差 172 tok 被 `no_memory` 拒。
    ⇒ 本档取 **`max_seq = pool = 34816`**:32k prompt + 256 生成 + 余量全装得下。
-5. **硬预算的实际上限 = 96k**(`vram_target=1.0` / `vram_reserve_mb=128`):
+5. **硬预算的实际上限 = 96k**(`vram_budget=1.0` / `vram_reserve_mb=128`):
    权重 live 12.96 GiB + 固定 1.17 GiB + 池 6.0 GiB ≈ 20.1 GiB,其余全是
    **per-turn scratch**(实测 34–74 MiB,随 prompt 长度变)与 boot 期 258 MiB。
    池再大就"能启动、不能服务":100k ⇒ 1/3 成功、108k ⇒ 0/3、112k ⇒ 每 turn 必败、
@@ -702,7 +702,7 @@ K.10 把三条律写下来后,按律把配置面收口,**期间发现合并(`5f7
 
 | 档 | 配置 | 用途 |
 |---|---|---|
-| **`gguf27b-mtp`(默认)** | `max_seq = pool = 98304`,f16,`vram_target=1.0`/`reserve=128` | **ctx 顶满**(硬预算上限):96k / 51.8 t/s / 100–120 s TTFT / 6.0 GiB 池 |
+| **`gguf27b-mtp`(默认)** | `max_seq = pool = 98304`,f16,`vram_budget=1.0`/`reserve=128` | **ctx 顶满**(硬预算上限):96k / 51.8 t/s / 100–120 s TTFT / 6.0 GiB 池 |
 | 64k(临时) | `--set runtime.max_seq=66048 --set pool.pool_tokens=66048` | 更"均衡"的档:57.5 t/s / 59 s TTFT |
 | 32k(临时) | `--set runtime.max_seq=34816 --set pool.pool_tokens=34816` | 交互优先:67.9 t/s / 24 s TTFT |
 | 128k(极端) | `--set pool.kv_fp8=true --set runtime.max_seq=140000 --set pool.pool_tokens=140000` | 批处理/离线;38.4 t/s / 3 min TTFT(**f16 装不下**) |
@@ -739,7 +739,7 @@ K.10 把三条律写下来后,按律把配置面收口,**期间发现合并(`5f7
 | 100k | fp8 | 861 | **51.2** | 94–134 s | 三轮中位 |
 | 184.8k | fp8 | 623 | — | **297 s** | 单发(池上限内) |
 
-池上限(实测,`vram_target=1.0` / `reserve=128`):**192k 稳**(6.0 GiB);
+池上限(实测,`vram_budget=1.0` / `reserve=128`):**192k 稳**(6.0 GiB);
 216k 能启动但每 turn 差 **34 MiB** 被 `vram-hard-budget` 拒;235k 起不来
 (`mtp.kv.k/v` 各 432 MiB + 权重 12.96 GiB + 固定 1.17 GiB)。
 
@@ -791,7 +791,7 @@ partial 行 stride 错)。224k 只差 10 MiB 的真凶 = **每 turn 的 prefill 
 | `[pool].pool_tokens` | **不写 = 自动**:池 = 本档 `max_seq`(页对齐);手写值仍可钉(多会话/省显存),但**不再用来"开大 ctx"** |
 | boot 报告 | 新增两行 `[ctx-max]`:① `per_tok` 分解 + 预算 `cap` + **算式上限 ctx**(`cap − 1 页`)+ 当前 `max_seq` 占比;② 池落账(页数 × 页宽、工作集常驻口径) |
 | 拒启 | 自动档下 `max_seq > 算式上限` ⇒ 响亮拒并给出可服务上限(不再靠"池静默夹紧") |
-| **治理器 bug** | `pool_cap` 的启用条件写成 `target > 0 && target < 1.0` ⇒ **`vram_target = 1.0` 时治理静默失效**(boot 里根本没有 cap 行,池怎么设都不校验,直到驱动 OOM —— 上一轮 224k 的"boot OK / turn 全挂"就是这么来的)。改为 `target > 0` |
+| **治理器 bug** | `pool_cap` 的启用条件写成 `target > 0 && target < 1.0` ⇒ **`vram_budget = 1.0` 时治理静默失效**(boot 里根本没有 cap 行,池怎么设都不校验,直到驱动 OOM —— 上一轮 224k 的"boot OK / turn 全挂"就是这么来的)。改为 `target > 0` |
 
 **算式上限 vs 真机上限**(本档 `per_tok = 34816 B`:主池 32768 + MTP 链 2048):
 

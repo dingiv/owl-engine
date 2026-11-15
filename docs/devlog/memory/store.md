@@ -1048,7 +1048,7 @@ P1(E2c 快照迁 `copy_batch`,纯收益)→ 批读直写宿主缓冲(省一次�
 
 | 层 | 容量 | 现状旋钮 |
 |---|---|---|
-| 设备 | `S_dev = nb` 槽(槽 = 32 token 页) | `pool_tokens` / `vram_target`(治理夹) |
+| 设备 | `S_dev = nb` 槽(槽 = 32 token 页) | `pool_tokens` / `vram_budget`(治理夹) |
 | 宿主 | `S_host = host_bytes / slot_bytes` | `host_cache_mb`(**0 = 关层**) |
 | 盘 | `S_disk`(S6;位留着) | — |
 
@@ -2385,7 +2385,20 @@ pub fn plan_need(&self, need: Need, protect: &Protected) -> Verdict
 - **策略对象第一次上生产**:`plan_need` 内部用 `self.evict`(`Lru`/`Lrfu(attention)`)
   给候选出序;`note_recall` 的召回信号从此真的影响"谁先让位"。
 
-### 30.2 算法(两轮 + 事实档 + 策略档)
+### 30.2 算法(按池数分三档 + 事实档 + 策略档)
+
+`plan_capacity` 只做分派，实际算法按启用的池拆成三个显式入口：
+
+```text
+GPU only          plan_gpu_only          Drop
+GPU + Host        plan_gpu_host          GPU → Host → Drop
+GPU + Host + Disk plan_gpu_host_disk     GPU → Host → Disk → Drop
+```
+
+层数由 `kv.host_enabled()` 与 `Room.disk_enabled` 决定；`disk_*_slots = 0`
+只表示这一拍盘满，不表示盘层关闭。engine 只消费 `Verdict`，不复制级联判据。
+
+三池档的完整轮次：
 
 ```text
 轮一 先下沉(内容不丢):KV 链级候选(§14.6)+ 状态腿快照候选 → 同一候选表

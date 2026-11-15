@@ -119,7 +119,7 @@ reuse       = "off"               # off | session | global;不写 = goal 决定
 | 意图 | 派生 |
 |---|---|
 | `model` | `[model] kind/quant/head_quant/embed_quant`(与显式值冲突 = 拒) |
-| `goal=max-context` | 复用 off、`512+512`、`vram_target=0.99`、`reserve=256M` |
+| `goal=max-context` | 复用 off、`512+512`、`vram_budget=0.99`、`reserve=256M` |
 | `goal=max-speed` | 复用 global、`1024+0`、贴顶 |
 | `goal=balanced` | 复用 session、`512+512`、0.97 |
 | `goal=low-memory` | kvmem overcommit、复用 global、小激活面 |
@@ -146,7 +146,7 @@ TP 档。降级后仍保留普通 decode 图,但 FI 臂/桶关。
 与引擎治理器 `[vram-gov]` **同一算式**,再补两项治理器不知道的:
 
 ```text
-target_total = total × vram_target
+target_total = total × vram_budget
 fixed        = gdn_row × (gdn_slots + snap_max) + 图 slab 640M + warmup 138M
 budget       = target_total − reserve − fixed − live(权重/运行底价)
 usable       = budget − activation − stability_margin

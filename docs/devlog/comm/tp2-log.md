@@ -5830,7 +5830,7 @@ TTFT/prefill 不变**符合结构**:prefill 也在**末行窄切后**调头(`for
 两条与本刀无关的观察(记在这,免得下轮白查):
 1. **3080 对 × `tp27b` 档,≥4096 prompt 撞池上限**:`池 used=18671MiB / reserved=18720MiB`、
    驱动 free 1011MiB ⇒ `vram-hard-budget` 硬拒(该 turn 被优雅丢弃,不崩)。
-   档的 `max_seq = 8704` 是按 24G 卡算的;20G 对得上更小的池或更低的 `vram_target`。
+   档的 `max_seq = 8704` 是按 24G 卡算的;20G 对得上更小的池或更低的 `vram_budget`。
 2. **停服后进程不退**:SIGTERM 走完优雅关停(打印 + 释放卡锁 + `exit 0`)后
    RSS 4.1GB 仍存活,需 `kill -9`(卡上内存随之释放)。别用 `pkill -f`(自杀陷阱)。
 

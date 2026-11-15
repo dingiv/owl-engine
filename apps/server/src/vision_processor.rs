@@ -12,6 +12,10 @@
 //! **端到端答案已对拍**:bird → penguin、dog.png(实为小猫)→ kitten,与 HF
 //! 金标一致。1e-5 像素门未达(见 `parity_exact` 的 1e-2 护栏)。
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
+
 use base64::Engine as _;
 use image::{DynamicImage, RgbImage};
 use owl_models::vlm::VlmImage;
@@ -27,7 +31,52 @@ pub const MIN_PIXELS: usize = 65_536;
 pub const MAX_PIXELS: usize = 16_777_216;
 
 /// **data URL → VlmImage**(`data:image/png;base64,...`;http URL 暂不支持)
+///
+/// **内容缓存**：同一张图（同 data URL + 同 `max_pixels`）在 GUI agent 的
+/// 多轮请求里会被反复重发；预处理（base64/解码/resize/patchify）实测 ~430ms/张，
+/// 不缓存会直接进 TTFT。缓存按 LRU 保留最近 8 张（≈100MB host）。
 pub fn from_data_url(url: &str, max_pixels: usize) -> Result<VlmImage, String> {
+    let key = cache_key(url, max_pixels);
+    {
+        let mut c = cache()
+            .lock()
+            .map_err(|_| "图像缓存锁不可用".to_string())?;
+        c.tick += 1;
+        let tick = c.tick;
+        if let Some(e) = c.map.get_mut(&key) {
+            e.tick = tick;
+            return Ok(e.image.clone());
+        }
+    }
+    let image = from_data_url_uncached(url, max_pixels)?;
+    {
+        let mut c = cache()
+            .lock()
+            .map_err(|_| "图像缓存锁不可用".to_string())?;
+        c.tick += 1;
+        let tick = c.tick;
+        if c.map.len() >= IMAGE_CACHE_CAP {
+            if let Some(old) = c
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.tick)
+                .map(|(k, _)| *k)
+            {
+                c.map.remove(&old);
+            }
+        }
+        c.map.insert(
+            key,
+            CachedImage {
+                image: image.clone(),
+                tick,
+            },
+        );
+    }
+    Ok(image)
+}
+
+fn from_data_url_uncached(url: &str, max_pixels: usize) -> Result<VlmImage, String> {
     let rest = url
         .strip_prefix("data:")
         .ok_or_else(|| "图像 URL 只支持 data:image/...;base64,...(http 暂未接)".to_string())?;
@@ -41,6 +90,31 @@ pub fn from_data_url(url: &str, max_pixels: usize) -> Result<VlmImage, String> {
         .decode(b64.as_bytes())
         .map_err(|e| format!("data URL base64 解码失败: {e}"))?;
     from_bytes(&bytes, max_pixels)
+}
+
+const IMAGE_CACHE_CAP: usize = 8;
+
+struct CachedImage {
+    image: VlmImage,
+    tick: u64,
+}
+
+#[derive(Default)]
+struct ImageCache {
+    map: HashMap<u64, CachedImage>,
+    tick: u64,
+}
+
+fn cache() -> &'static Mutex<ImageCache> {
+    static CACHE: OnceLock<Mutex<ImageCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ImageCache::default()))
+}
+
+fn cache_key(url: &str, max_pixels: usize) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut h);
+    max_pixels.hash(&mut h);
+    h.finish()
 }
 
 /// **字节流 → VlmImage**(PNG/JPEG;其他格式由 image crate 报错)

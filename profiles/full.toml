@@ -17,6 +17,7 @@
 #   server -p profiles/full.toml --print-config   # 生效值(+ 来源)
 #
 # 本文件里的值 = **一个可跑的单卡 27B AWQ 配置**(3090 Ti 24G / 128k);
+# 0 / false / 空串 = 关闭或默认，**生产 leaf 不要照抄全量**，只写与模板/组件不同的键。
 # 复制出去改站点事实即可(改完记得 `--check`)。
 # ============================================================================
 
@@ -175,13 +176,13 @@ attention_factor = 1.0
 # [pool] —— 设备池与显存治理
 # ---------------------------------------------------------------------------
 [pool]
-# 主 KV 池 fp8 e4m3(32 KiB/token;容量翻倍)
+# 主 KV 池 dtype（full 模板默认 fp8；30 系 leaf 由 parts/pool/int8.toml 覆盖为 int8）
 kv_dtype = "fp8"
-# INT8 KV 主池(2026-11-03 接入。缺省关,测量档显式开)
-# 设备 KV 池(2026-10-22;不再有手工容量键):
+# 设备 KV 池（2026-10-22；不再有手工容量键）:
 #   prefix_cache=false → min(剩余显存 cap, max_seq×并发 + 1 页)
 #   prefix_cache=true  → cap(整池可被前缀缓存持有,新请求逐出到 host/disk)
-# 并发上限(每活跃会话一格 GDN 状态;0 = 自动 = runtime.max_concurrency)
+# GDN 状态格数（每活跃 turn 一格）；0 = 自动 = runtime.max_concurrency。
+# full 模板给 1；多并发 leaf 显式覆盖（如 3080 档 2）。
 gdn_slots = 1
 # 前缀缓存开/关
 prefix_cache = true
@@ -193,13 +194,27 @@ snap_decode_stride = 1
 snap_max = 0
 # 消息边界快照（缺省关；agent 档开）。开 = 在消息开启标记前取页对齐边界，
 # prefill 在边界切块并拍 Durable 快照，供同 system/tool 前缀跨会话复用。
-# 依赖 prefix_cache=true + snap_max>0；无消费者 = boot 告警。
+# 依赖 prefix_cache=true + snap_max>0；无消费者 = boot 告警（full 模板 snap_max=0 ⇒ 保持 false）。
 snap_msg_boundary = false
+# 可删图前锚点快照（缺省开；2026-11-13）。开 = 在**每张可删图的段起点**
+# 强制切块并拍一张快照（Extra 档；旧图同键 Touch，稳态≈新进图数）。
+# 解决“截图在 prompt 尾部”时尾快照落在被删页、删除只能退回 fresh 的问题；
+# 同游程只删后几张时也能复用到前几张。
+# 只在 image_evict=true + prefix_cache=true + snap_max>0 时有消费者。
+snap_evict_anchor = true
 # 消息开启标记文本覆盖（空 = 用模型 ChatFormat.im_open，如 Qwen <|im_start|>）
 # 引擎 boot 时 tokenize；扫描函数只收 open_ids 参数，不写死字面量。
 snap_msg_delim = ""
 # 后续消息边界的稀疏间隔（token；第一条边界无条件保留）
 snap_msg_min_gap = 2048
+# 最近 K 条消息边界无条件保留（dense tail；0 = 旧行为）
+snap_msg_recent = 4
+# 每会话快照上限（0 = 不限 = 旧行为；只数非 Transient 条目，
+# 设备+宿主+盘都算）；**与 snap_max（设备槽数）是两个量**。
+# 超限时按 SnapClass 档位替换/跳过
+snap_session_cap = 0
+# 结构档（Dense/Binary）保留位；仅约束 Extra（Extra ≤ cap − reserve）
+snap_structural_reserve = 4
 # 距当前 fed 小于本值（token）的边界不单独切块；0 = 不设下限（推荐，
 # 否则边界落在 chunk 起点附近会被跳过，system 前缀反而丢）
 snap_msg_min_span = 0
@@ -214,16 +229,19 @@ disk_dir = ""
 # 开 = turn 收口把活跃会话的 KV 块**复制**一份到盘(不动运行期驻留)⇒ 引擎重启后
 # 仍能按盘上索引召回前缀;关 = 旧行为(只有宿主压力才被动溢写)。
 checkpoint_max_mb = 0
-# 两次 checkpoint 的最小间隔 ms(0 = 每 turn 都试)
+# 两次 checkpoint 的最小间隔 ms（仅 checkpoint_max_mb>0 时生效；0 = 每 turn 都试）
 checkpoint_min_gap_ms = 5000
 # 临时块复用池上限(MiB;0 = 不限)
 pool_cap_mb = 256
-# 显存目标占比 / 预留 MiB
-vram_target = 0.99
+# **显存治理（二选一）**：
+#   vram_budget    = 驱动 total 的占比(0..1;0 = 关治理;1.0 = 吃满 free)
+#   vram_budget_mb = 绝对硬上限 MiB(0 = 只按驱动账;适合“这台卡只准用 N GB”)
+# target_total = total × vram_budget；vram_reserve_mb 是额外预留。
+vram_budget = 0.99
 vram_reserve_mb = 256
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
 transient_reserve_mb = 1024
-# 显存硬上限 MiB(留空 = 只按驱动账判)
+# 显存硬上限 MiB(留空 / 0 = 只按驱动账判)
 vram_budget_mb = 0
 # 解释器块池预算(字节;0 = 关)
 block_pool_bytes = 0

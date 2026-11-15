@@ -74,7 +74,7 @@ macro_rules! run {
 // 现象:`gpu_spec_identity_gate` 套件内红"KV 块池耗尽"、单跑绿(2026-10-13 已记
 // 症状;2026-10-16 定谳 = 池被夹到 4 块,账目本身自洽)。
 // 候选修法(未拍):①收尾给引擎发 Free(`Drop for StatePool/GraphFleet`)②门档
-// `vram_target=0` 关治理(有真 OOM 风险)③按场景拆进程。**别**用"等 live 回落"
+// `vram_budget=0` 关治理(有真 OOM 风险)③按场景拆进程。**别**用"等 live 回落"
 // 的屏障 —— 实测 20s 也不回落(它压根不释放)。
 
 /// **非 async 入口**:场景含图捕获的声明树走查(深递归),而入口把多层
@@ -174,6 +174,12 @@ async fn e2e_body() {
 
     // ── **前缀无感删除（leave-gap；2026-10-25）**：两图 → 连续删 → 不转 K / 不重建 ──
     run!(gpu_image_evict_gate);
+
+    // ── **多段 leave-gap（2026-11-13）**：长前缀 + 两图 + 一次性全删 ──
+    run!(gpu_image_evict_multi_gate);
+
+    // ── **尾删锚点（2026-11-13）**：短 prompt + 尾部两图全删（生产 prefill_chunk 形状）──
+    run!(gpu_image_evict_anchor_gate);
 
     // ── **多图 × 投机 verify 行**(D 项):spec on/off 贪心 token 逐位相同 ──
     run!(gpu_image_evict_spec_identity_gate);

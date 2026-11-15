@@ -59,7 +59,7 @@ TTFT（ms，与上表同序）：
 |---|---|---|
 | **开不起来**（`target=0.95` + `reserve=2048`） | `budget=0.89G ⇒ cap=14555 tok < 36864`，boot 直接拒 | f16 `per_tok=65536B`（16 个全注意力层 × K+V × 2B）⇒ 2.3 GB 池才算 35k 上下文 |
 | **能开、请求时炸**（`max_seq=40960`，池 2.56G） | `PoolExhausted: vram-hard-budget 需 25 165 824B 余 13 172 736B`（`reserve=1024`）⇒ `丢本 turn`，API 回**空补全** | 每 chunk 的 `gdn_conv_fwd` / `narrow_strided` / `embed` 各要 ~20~24 MiB 瞬态；池把余量吃干后**硬预算门**拒发 |
-| **可用档** | `max_seq=34816`（1088 槽 × 2 MiB = 2.18 GB，`vram_target=0.99`、`reserve=1024`）⇒ 8k/32k 均跑通 | 65k 需 ≥ 65 568 tok ⇒ 池 ≥ 4.1 GB ⇒ 24G 单卡（权重 17.2G + 固定 1.07G）**装不下** |
+| **可用档** | `max_seq=34816`（1088 槽 × 2 MiB = 2.18 GB，`vram_budget=0.99`、`reserve=1024`）⇒ 8k/32k 均跑通 | 65k 需 ≥ 65 568 tok ⇒ 池 ≥ 4.1 GB ⇒ 24G 单卡（权重 17.2G + 固定 1.07G）**装不下** |
 
 ⚠️ **测量陷阱（务必记）**：f16 池 OOM 时，`llm_speedtest` 会**降级**成
 「本地估算 + 0 输出 token」，打印出 `prefill=324204 t/s / TTFT=27ms` 这种
@@ -104,7 +104,7 @@ cap    = budget / per_tok
 
 | 项 | 旧 | 新 | 位置 | 依据 |
 |---|---|---|---|---|
-| `vram_target` | 0.99（int8/fp8）· 0.97（f16） | **1.0** | `parts/pool/{int8,fp8,f16}.toml` | `1.0` 是合法档（`base` 直接用驱动 free）；runtime 闸仍以 `reserve` 兜底 |
+| `vram_budget` | 0.99（int8/fp8）· 0.97（f16） | **1.0** | `parts/pool/{int8,fp8,f16}.toml` | `1.0` 是合法档（`base` 直接用驱动 free）；runtime 闸仍以 `reserve` 兜底 |
 | `vram_reserve_mb` | f16 `1024` · 测量档 `512` | **f16 512 · 测量档 384** | 同上 + 两个测量档 | 池外瞬态实测峰值 **20~25 MiB/块**（`gdn_conv`/`narrow_strided`/`embed`）⇒ 384~512 已是 15~20× |
 | `transient_reserve_mb` | 1024 | **512** | 同上 | 该项只服务 `[kvmem]` **超卖档**；非超卖档本来就无感（§代码注 2026-10-28） |
 | `snap_max` | 2（测量档） | **1** | `measurement/qwen38_27b-3090-{int8,fp8}.toml` | GDN 快照池 297→148 MiB；单流测量用不到第二槽（`prefix_cache=false` 时更用不到） |

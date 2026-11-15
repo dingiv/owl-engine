@@ -1187,7 +1187,7 @@ impl GpuCtx {
         //    (干脆不 free)⇒ **77-117 ms(5×)**,但无界常驻 OOM ⇒ 要的是
         //    "能复用"而不是"不释放"。
         //    (池归属 = 设备默认池:server 用 `cuMemAllocAsync`,即默认池。
-        //     预算纪律不变:`vram_target` 侧仍可随时 `cuMemPoolTrimTo` 回收。)
+        //     预算纪律不变:`vram_budget` 侧仍可随时 `cuMemPoolTrimTo` 回收。)
         // 裸 sys 层调用(cudarc `result::` 包装在 cuda-13020 档被 cfg 掉;
         // 原始绑定不门控 —— 本项目已有 sys 直用先例,见下方 MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
         let pool_setup = || -> Result<(), String> {

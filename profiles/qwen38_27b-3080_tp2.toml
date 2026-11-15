@@ -136,21 +136,28 @@ draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 # 最后留一格给"刚收口那条链的尾边界"。
 # 代价 = +1 张 × 159MB(TP2 两 rank 各 79.6MB);boot 余量 ~3.2GiB/card,够。
 snap_max = 6
+# **快照准入(2026-11-12)**:单会话最多 20 张(设备+宿主+盘都算;
+# Transient 不计)。结构档(Dense/Binary)预留 4 格 ⇒ Extra 最多 16 张;
+# 超限时只替换更冷/更低档的条目,满手 Dense 时 Extra 直接跳过拍摄
+# (不选槽、不拷贝 159MB)。0 = 关闭 per-session 上限(旧行为)。
+# 两会话共享 host 3G(≈19 张);全局 host/device 压力仍按
+# 「冷会话先 + SnapClass 档位」淘汰 —— 本键只防单会话无限积累。
+snap_session_cap = 20
+snap_structural_reserve = 4
 # GDN 状态格 = 每活跃 turn 一格;boot 门要求 `gdn_slots ≥ max_concurrency`,
 # 否则拒启(`parts/pool/fp8.toml` 里是 1 ⇒ 本档显式覆盖成 2)。
 gdn_slots = 2
-prefix_cache = true
 snap_host_mb = 3072
 host_cache_mb = 10240
 vram_reserve_mb = 512
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
 transient_reserve_mb = 1024
 # 图像前缀无感删除(leave-gap:删后不转 K、保留位置洞)。
-# 消息边界快照:pi 每轮重发全历史;与 3090 生产档同形。
+# 消息边界快照:pi 每轮重发全历史;delim/gap/span 走 full.toml 默认。
 snap_msg_boundary = true
-snap_msg_delim = ""
-snap_msg_min_gap = 2048
-snap_msg_min_span = 0
+# 截图在 prompt 尾部时的删除锚点(2026-11-13):每张可删图段起点一张快照,
+# 把「被删图之前」的复用面兜住(否则尾删只能退回 fresh;同游程删后缀也覆盖)。
+snap_evict_anchor = true
 
 [vision]
 # 图像前缀无感删除(leave-gap)。

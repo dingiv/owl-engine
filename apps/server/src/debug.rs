@@ -351,8 +351,28 @@ pub fn vram_json(snap: &crate::executor::VramSnapshot) -> Value {
         }
         Err(e) => json!({ "error": e }),
     };
+    // **L1 会话资产投影**(2026-11-12 三层架构):会话 → tail 快照/消息边界。
+    // 只读、不碰 store 账;用于验证"append 命中上一条消息末尾"与 pin 面。
+    let sessions: Vec<Value> = snap
+        .sessions
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "cached_len": s.cached_len,
+                "tail_snap": s.tail_snap.map(|k| format!("{k:?}")),
+                "msg_snaps": s.msg_snaps,
+                "msg_snap_keys": s.msg_snap_keys.iter()
+                    .map(|k| k.map(|k| format!("{k:?}")))
+                    .collect::<Vec<_>>(),
+                "local_chain": s.local_chain,
+                "last_use": s.last_use,
+            })
+        })
+        .collect();
     json!({
         "device": device_json,
+        "sessions": sessions,
         "pools": pools,
         "blocks_top": block_rows,
         "tiers": {
@@ -397,6 +417,7 @@ pub fn vram_json(snap: &crate::executor::VramSnapshot) -> Value {
             // **淘汰序预览**(会话感知:同会话 depth 降序 = 末端先走)
             "evict_order": snap.snap_evict.iter().map(|e| json!({
                 "key": format!("{:?}", e.key),
+                "class": format!("{:?}", e.class),
                 // 无归属 = null(会话 id 0 是合法 id,不能用 0 表示"无主")
                 "session": if e.session == u64::MAX { serde_json::Value::Null } else { json!(e.session) },
                 "depth": e.depth,

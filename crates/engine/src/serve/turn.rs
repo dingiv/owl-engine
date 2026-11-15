@@ -212,6 +212,15 @@ pub(crate) struct Turn {
     pub(crate) prompt_ids: Vec<u32>,
     /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
     pub(crate) msg_snaps: Vec<usize>,
+    /// 与 `msg_snaps` 同序的淘汰优先级档（Dense/Binary/Extra；2026-11-12）
+    pub(crate) msg_snap_classes: Vec<owl_store::SnapClass>,
+    /// 与 `msg_snaps` 同序的快照键（`None` = 尚未拍/已逐出；2026-11-12 二刀）
+    pub(crate) msg_snap_keys: Vec<Option<owl_store::SnapKey>>,
+    /// **可删图前的硬快照点**（token offset；2026-11-13）。
+    ///
+    /// 与 `msg_snaps` 分开：锚点必须**无条件切块**（不受 `snap_msg_min_span`
+    /// 节流），否则删除发生时拿不到“图前前缀”的 GDN 态。
+    pub(crate) evict_snaps: Vec<usize>,
     /// 本轮 prompt 的图像段(含 pad;本轮坐标)—— 收口写回会话账
     pub(crate) img_spans: Vec<crate::img_evict::ImgSpan>,
     /// 本轮 prompt 的 pad 区间(升序;与 `img_spans` 同一次写回)
@@ -222,7 +231,7 @@ pub(crate) struct Turn {
     /// 本轮位置是否已离开紧凑坐标(leave-gap 删除后 true;缓存/投机门用)。
     pub(crate) positions_gap: bool,
     /// **前缀无感删除命中**(本轮识别到的删除;`None` = 普通 turn)
-    pub(crate) deletion: Option<crate::img_evict::TextDelete>,
+    pub(crate) deletion: Option<crate::img_evict::DeletionPlan>,
     /// per-turn 可选项(AGT-06)
     pub(crate) opts: TurnOpts,
     /// 提交时前缀命中量(usage `cached_tokens` 真源;AGT-12)
@@ -250,6 +259,12 @@ pub(crate) struct ActiveTurn {
     pub(crate) prompt_ids: Vec<u32>,
     /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
     pub(crate) msg_snaps: Vec<usize>,
+    /// 与 `msg_snaps` 同序的淘汰优先级档（Dense/Binary/Extra；2026-11-12）
+    pub(crate) msg_snap_classes: Vec<owl_store::SnapClass>,
+    /// 与 `msg_snaps` 同序的快照键（`None` = 尚未拍/已逐出；2026-11-12 二刀）
+    pub(crate) msg_snap_keys: Vec<Option<owl_store::SnapKey>>,
+    /// **可删图前的硬快照点**（token offset；2026-11-13；见 `Turn::evict_snaps`）
+    pub(crate) evict_snaps: Vec<usize>,
     pub(crate) max_new: usize,
     /// **本轮 prompt 的逐 token 绝对位置**(与 `prompt_ids` 等长;prefill
     /// 的 `pos` 槽与 VLM cos/sin 都从这里切)。

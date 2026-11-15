@@ -900,7 +900,16 @@ impl BlockLeg {
     /// 归还会话块表。
     /// **无设备绑定的链登记**(S6.1:启动按盘上索引重建树)。
     pub fn register_chain_offloaded(&mut self, tokens: &[u32]) -> StoreResult<Vec<crate::id::ChainHash>> {
-        let (inserted, evicted) = self.kv.register_chain_offloaded(tokens)?;
+        self.register_chain_offloaded_tagged(tokens, &[])
+    }
+
+    /// 同 [`Self::register_chain_offloaded`]，但带逐块指纹（盘索引重建用）。
+    pub fn register_chain_offloaded_tagged(
+        &mut self,
+        tokens: &[u32],
+        tags: &[crate::kv::BlockTag],
+    ) -> StoreResult<Vec<crate::id::ChainHash>> {
+        let (inserted, evicted) = self.kv.register_chain_offloaded_tagged(tokens, tags)?;
         if !evicted.is_empty() {
             self.ops.tree_evicted += evicted.len() as u64;
         }

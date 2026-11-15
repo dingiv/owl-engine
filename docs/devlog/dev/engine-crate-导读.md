@@ -299,7 +299,7 @@ V_avail          = v_card − weights − runtime_floor − gdn_row×gdn_slots �
 | # | 级 | 位置 | 事实 | 影响 | 建议 |
 |---|---|---|---|---|---|
 | F-25 | S3 | `mem/state.rs:2181,2197,2257` | `page_guess = 32` 写死，用于 `ctx_max = cap − page_guess` 与“还剩多少”告警；真页宽由 `kv_paged_policy` 得，可能不是 32（legacy 档 `pol=None` 时 page=seq_tokens） | `ctx_max` 报告与自动池的 `seq_tokens > ctx_max` 判据按错页宽算：小幅多拒/少拒；与后面按真页宽的硬门各说各话 | 先由 `pol` 得到 page，再做 `ctx_max`；去掉 `page_guess` |
-| F-26 | S3 | `mem/state.rs:700-742`；`KvBank::alloc_scratch/alloc_xqa/alloc_tables` | `FixedAfter` 不含 attention v2 scratch / verify / batch / XQA / `fi_tables` / `bt`（都在池后分配）；`[vram-gov] fixed_after` 只报已列项 | `vram_target≈1.0` 时 cap 可能高估几十 MiB（通常被 reserve 1GiB 盖住）；budget 报告不是全量 | 加一个 `scratch` 固定项（按 geometry 算）或把 reserve 的覆盖范围写进日志 |
+| F-26 | S3 | `mem/state.rs:700-742`；`KvBank::alloc_scratch/alloc_xqa/alloc_tables` | `FixedAfter` 不含 attention v2 scratch / verify / batch / XQA / `fi_tables` / `bt`（都在池后分配）；`[vram-gov] fixed_after` 只报已列项 | `vram_budget≈1.0` 时 cap 可能高估几十 MiB（通常被 reserve 1GiB 盖住）；budget 报告不是全量 | 加一个 `scratch` 固定项（按 geometry 算）或把 reserve 的覆盖范围写进日志 |
 
 ---
 

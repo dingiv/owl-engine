@@ -618,35 +618,57 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     self.coverage_mark_cheap(base, t, pc)?;
                 }
             }
-            // DFlash2:草稿 KV 物化(root 块行 [T, 6T) 切片出 taps → encode)
+            // DFlash2:草稿 KV 物化(root 块行 [T, 6T) 切片出 taps → encode)。
+            // **首 token 不依赖草稿 KV**：挂起到 `sample_and_emit` 之后再 encode
+            // （2026-11-13）；根块不 free，由 drain 统一回收。
+            let mut keep_hfb = false;
             if let Some(tp) = &prefill_taps {
                 let ts = std::time::Instant::now();
                 let n_tp = tp.len();
-                let tap_views: Vec<TensorOps> = (0..n_tp)
-                    .map(|i| {
-                        TensorOps::of_block(hfb.id, d.dtype, vec![n_tp * t + t, d_model])
-                            .slice_view((i + 1) * t * d_model, vec![t, d_model])
-                    })
-                    .collect();
-                self.prefill_dflash_encode(host.probes, &tap_views, base).await?;
-                // 探针:concat 父块整块落盘(python 对拍 taps;真块 dtoh)
-                if host.probes.dflash_probe && !self.spec_rt.mem_dumped2 {
-                    self.spec_rt.mem_dumped2 = true;
-                    let face = self.graphs.session.face_mut();
-                    let mut rbuf = vec![0u8; (n_tp + 1) * t * d_model * 2];
-                    face.dtoh(&hfb, &mut rbuf).await?;
-                    if let Err(e) = owl_shared::file_loader::write(
-                        crate::probe_dump::probe_path("owl_dflash_root.bin"),
-                        &rbuf,
-                    ) {
-                        owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
-                    }
-                    owl_shared::log_debug!(
-                        "dflash-probe",
-                        "concat 父块落盘 /tmp/owl_dflash_root.bin t={t}"
+                let defer = !host.probes.dflash_probe
+                    && self.defer_dflash_encode(
+                        hfb.clone(),
+                        t,
+                        n_tp,
+                        d_model,
+                        d.dtype,
+                        base,
                     );
+                if defer {
+                    keep_hfb = true;
+                    owl_shared::log_debug!(
+                        "dflash",
+                        "prefill encode 延迟到首 token 后:t={t} base={base} n_tp={n_tp}"
+                    );
+                } else {
+                    let tap_views: Vec<TensorOps> = (0..n_tp)
+                        .map(|i| {
+                            TensorOps::of_block(hfb.id, d.dtype, vec![n_tp * t + t, d_model])
+                                .slice_view((i + 1) * t * d_model, vec![t, d_model])
+                        })
+                        .collect();
+                    let t_de = std::time::Instant::now();
+                    self.prefill_dflash_encode(host.probes, &tap_views, base).await?;
+                    mrec("dflash.encode", t_de.elapsed());
+                    // 探针:concat 父块整块落盘(python 对拍 taps;真块 dtoh)
+                    if host.probes.dflash_probe && !self.spec_rt.mem_dumped2 {
+                        self.spec_rt.mem_dumped2 = true;
+                        let face = self.graphs.session.face_mut();
+                        let mut rbuf = vec![0u8; (n_tp + 1) * t * d_model * 2];
+                        face.dtoh(&hfb, &mut rbuf).await?;
+                        if let Err(e) = owl_shared::file_loader::write(
+                            crate::probe_dump::probe_path("owl_dflash_root.bin"),
+                            &rbuf,
+                        ) {
+                            owl_shared::log_error!("dump", "落盘失败(诊断面不许静默): {e}");
+                        }
+                        owl_shared::log_debug!(
+                            "dflash-probe",
+                            "concat 父块落盘 /tmp/owl_dflash_root.bin t={t}"
+                        );
+                    }
+                    owl_shared::log_debug!("dflash", "prefill encode {t} rows @{} {:?}", base, ts.elapsed());
                 }
-                owl_shared::log_debug!("dflash", "prefill encode {t} rows @{} {:?}", base, ts.elapsed());
             }
             let hview = TensorOps::of_block(hfb.id, d.dtype, vec![t, d_model]);
             // 末行窄切 **物化**(OPS_NARROW):SliceView 作根透传父块丢偏移
@@ -760,7 +782,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 } else {
                     face.free(&[hb.id]).await?;
                 }
-                face.free(&[hfb.id]).await?;
+                if !keep_hfb {
+                    face.free(&[hfb.id]).await?;
+                }
                 face.free(&arena1).await?; // E2a:中间块归池(每 chunk 零净增)
             }
 
@@ -901,16 +925,37 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                 let _ = (&face, rows_b, esz);
                 // prefill extend(E5-M5):行 0..T-1 的 mtp KV(行 T-1 配对需
                 // 下一 chunk 首 token,由其 extend 补)。DFlash2:草稿 KV
-                // 物化(整 chunk 全行 taps → encode)
+                // 物化(整 chunk 全行 taps → encode)；首 token 前不 encode，
+                // 根块 b 挂起，`execute_prefill` 在首 token 后统一 drain。
+                let mut keep_b = false;
                 if let Some((tp, dd)) = &prefill_taps {
                     let n_tp = tp.len();
-                    let tap_views: Vec<TensorOps> = (0..n_tp)
-                        .map(|i| {
-                            TensorOps::of_block(b.id, d.dtype, vec![n_tp * t + t, *dd])
-                                .slice_view((i + 1) * t * (*dd), vec![t, *dd])
-                        })
-                        .collect();
-                    self.prefill_dflash_encode(host.probes, &tap_views, base).await?;
+                    let defer = !host.probes.dflash_probe
+                        && self.defer_dflash_encode(
+                            b.clone(),
+                            t,
+                            n_tp,
+                            *dd,
+                            d.dtype,
+                            base,
+                        );
+                    if defer {
+                        keep_b = true;
+                        owl_shared::log_debug!(
+                            "dflash",
+                            "prefill encode 延迟到首 token 后:t={t} base={base} n_tp={n_tp}"
+                        );
+                    } else {
+                        let tap_views: Vec<TensorOps> = (0..n_tp)
+                            .map(|i| {
+                                TensorOps::of_block(b.id, d.dtype, vec![n_tp * t + t, *dd])
+                                    .slice_view((i + 1) * t * (*dd), vec![t, *dd])
+                            })
+                            .collect();
+                        let t_de = std::time::Instant::now();
+                        self.prefill_dflash_encode(host.probes, &tap_views, base).await?;
+                        mrec("dflash.encode", t_de.elapsed());
+                    }
                 } else if self.spec_rt.drafter.as_ref().map(|d| d.as_mtp().is_some()).unwrap_or(false) && t > 1 {
                     let ts = std::time::Instant::now();
                     let sid = host.sid;
@@ -919,7 +964,9 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     t_ext += ts.elapsed();
                 }
                 let face = self.graphs.session.face_mut();
-                face.free(&[b.id]).await?;
+                if !keep_b {
+                    face.free(&[b.id]).await?;
+                }
                 face.free(&arena).await?; // E2a:中间块归池(每 chunk 零净增)
             }
             mrec("prefill.chunk", t_chunk.elapsed());

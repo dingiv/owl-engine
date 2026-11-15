@@ -749,7 +749,7 @@ device_ledger 2(断言"turn 后池非空 + hits+misses>0")· 真机三轮同上�
 `ModelError::PoolExhausted{..}` ⇒ 丢本 turn(客户端如实拿 500)+ **`relieve_pressure()`**
 (先池排空、再 N6 节点)+ **`continue` 继续泵**;只有 `ServerClosed` / `EngineInvariant` 仍致命。
 
-**真机实录(27B / 3090 Ti / `vram_target=0.98` / `reserve=2048MiB` / `host_cache_mb=32` /
+**真机实录(27B / 3090 Ti / `vram_budget=0.98` / `reserve=2048MiB` / `host_cache_mb=32` /
 `snap_host_mb=0`,6×2400-token 长 prompt)**:
 
 ```

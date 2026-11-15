@@ -96,7 +96,9 @@ pub use select::{
     MeanKEntry, MeanKIndex, PosAction, PosFrame, QueryFace, ScoreMode, ScoreTuning, SelectBudget,
     ViewPlan,
 };
-pub use state::{SnapDurability, StateStore};
+pub use state::{
+    SnapAdmit, SnapAdmitPolicy, SnapClass, SnapDurability, SnapSkip, StateStore,
+};
 pub use tier::{
     book_lock, ledger_entry, shared_ledger, tier_budget_of, AssetKind, EventRow, LedgerBook,
     LedgerEntry, Loan, Owner, OwnerRow, SharedLedger, Tier, TierBudget, TierLedger, TierReport,

@@ -565,6 +565,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .first()
                 .map(|a| a.msg_snaps.as_slice())
                 .unwrap_or(&[]);
+            let evict_snaps = self
+                .turns
+                .active
+                .first()
+                .map(|a| a.evict_snaps.as_slice())
+                .unwrap_or(&[]);
             let next_end = Self::prefill_step_chunk_msg(
                 new_fed,
                 prompt_len,
@@ -576,6 +582,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     self.dev.pool.geom.page,
                 ),
                 msg_snaps,
+                evict_snaps,
                 self.boot.cfg.knobs.snap_msg_min_span,
             )
             .map(|n| new_fed + n)
@@ -673,6 +680,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .first()
                 .map(|a| a.msg_snaps.as_slice())
                 .unwrap_or(&[]);
+            let evict_snaps = self
+                .turns
+                .active
+                .first()
+                .map(|a| a.evict_snaps.as_slice())
+                .unwrap_or(&[]);
             let next_end = Self::prefill_step_chunk_msg(
                 new_fed,
                 prompt_len,
@@ -684,6 +697,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     self.dev.pool.geom.page,
                 ),
                 msg_snaps,
+                evict_snaps,
                 self.boot.cfg.knobs.snap_msg_min_span,
             )
             .map(|n| new_fed + n)
@@ -695,6 +709,13 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .active
                 .first()
                 .is_some_and(|a| a.msg_snaps.binary_search(&new_fed).is_ok());
+            // **可删图锚点**（2026-11-13）：必须无条件拍 —— 删除发生时它是
+            // “图前前缀”唯一的 GDN 恢复面（尾快照会落在被删页上被安全拒绝）。
+            let evict_snap = self
+                .turns
+                .active
+                .first()
+                .is_some_and(|a| a.evict_snaps.binary_search(&new_fed).is_ok());
             // GDN 快照**节奏化**(2026-10-20):末边界 + 每 `SNAP_EVERY` 个 chunk 一个锚点。
             // 冷 prefill 每边界都拍 = 槽满后每拍一次 DtoH(159 MB ≈ 31 ms);
             // 复用只需要**末边界**(append 场景)与稀疏锚点(分叉场景)。
@@ -706,8 +727,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // **前缀缓存复用率 ≈ 0(等价全量重算)**。
             // 修法与 `index_every` 同源(那里早就用边界序号了,教训同源)。
             let every = SNAP_EVERY.max(1);
-            let snap_keep =
-                last_boundary || (self.sel.boundaries() + 1).is_multiple_of(every) || msg_snap;
+            let snap_keep = last_boundary
+                || (self.sel.boundaries() + 1).is_multiple_of(every)
+                || msg_snap
+                || evict_snap;
             // **索引采集节奏**：与 `coverage_analyze` 的完整召回同拍 ——
             // 廉价边界只攒身份/页号，不触发 D2H；下次完整召回前一次补齐。
             // `coverage_probe` 诊断档要求每边界都有索引 ⇒ 全采。
@@ -833,10 +856,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             });
         }
         // 末块:末行采样(eos / 预算 / Token)
-        self.sample_and_emit(last_row.ok_or_else(|| ModelError::EngineInvariant {
-            what: "末块缺 logits(采样面与声明不一致)".into(),
-        })?)
-        .await
+        let ev = self
+            .sample_and_emit(last_row.ok_or_else(|| ModelError::EngineInvariant {
+                what: "末块缺 logits(采样面与声明不一致)".into(),
+            })?)
+            .await?;
+        // **首 token 已投递**：DFlash2 草稿 KV encode 现在补跑。它只服务
+        // 后续 spec propose，不参与首 token ⇒ 移出 TTFT 临界路径。
+        let t_drain = std::time::Instant::now();
+        self.dev.drain_pending_dflash().await?;
+        if let Some(p) = self.peer.as_mut() {
+            p.drain_pending_dflash().await?;
+        }
+        mrec("dflash.drain", t_drain.elapsed());
+        Ok(ev)
     }
 
     /// decode 单步执行(设备侧;host 派生量由决策面备齐)
@@ -1070,6 +1103,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     owl_store::SnapDurability::Transient,
                     true,
                     true,
+                    owl_store::SnapClass::Transient,
                 )
                 .await?;
             }
@@ -1621,6 +1655,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     owl_store::SnapDurability::Transient,
                     true,
                     true,
+                    owl_store::SnapClass::Transient,
                 )
                 .await?;
             }
