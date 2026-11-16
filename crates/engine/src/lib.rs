@@ -88,7 +88,7 @@ pub use service::diag::{launch_trace, BlockRow, LaunchRow, LaunchTrace};
 /// **装载前预检**（`--check` 的检查点事实；2026-11-16 业务下沉 P2）
 pub mod preflight;
 
-pub use engine::{Engine, EngineConfig, EngineKnobs};
+pub use engine::{Engine, EngineConfig, EngineKnobs, PREFILL_TAIL_MERGE};
 pub use owl_iface::handle::{AssetClass, DeviceHandle, Owner};
 
 /// **DFlash2 草稿权重的块名前缀**(事件账/`/debug/vram` 共用的唯一词表)。

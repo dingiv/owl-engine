@@ -190,8 +190,9 @@ async fn multi_active_decode_uses_selected_turn_gdn_row() {
         sampler_enabled: false,
         max_batch: 2,
         gdn_slots: 2,
-        // 本用例是 2 页级小 turn；默认 256 的"新人陪跑"门会把第二个拒掉。
-        min_gen_tokens: 1,
+        // 本用例是 2 页级小 turn：256 tok 窗口配 8192 的输出上限会让单轮
+        // 预留吃满整窗（新预算律 = 上下文 + 最大输出长度）⇒ 第二个进不来。
+        max_new_cap: 64,
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
@@ -264,64 +265,256 @@ async fn multi_active_decode_uses_selected_turn_gdn_row() {
     }
 }
 
-/// **F-18 回归门**：排队 turn 被客户端取消时，ephemeral 会话必须焚毁。
+/// **会话身份 = 内容身份（一）**：原样重发 ⇒ 认到同一条会话，且**内容树**
+/// 给出命中（`cached_start`）。
 ///
-/// 修复前 `cancel_turn` 的排队分支只出队 + `close_admission`，不 `burn` ⇒
-/// 临时会话永久留在 `SessionTable`。
+/// 注：2026-11-16 语义收口后，`tokens.len()` 是历史唯一真源，设备驻留前缀
+/// 由 `ActiveTurn.cached_start` 持有（submit 侧的 `cached` 恒 0）—— 所以这里
+/// 真跑一轮、再判第二轮的起跑命中，而不是看提交时的估算。
 #[cfg(test)]
 #[tokio::test]
-async fn queued_ephemeral_session_is_burned_on_cancel() {
+async fn keyless_repeat_hits_cached_prefix() {
+    let knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 1,
+        gdn_slots: 2,
+        // 裸续写：prompt 原文直接进 tokenizer（不套 chat 模板）。
+        raw_completion: true,
+        prefix_cache: true,
+        ..Default::default()
+    };
+    let mut running = mock_engine_with(knobs).await;
+    let page = running.dev.pool.geom.page.max(1);
+
+    // 跨一页的历史（mock 档 max_seq=256，别撑爆）
+    let mut p1 = String::new();
+    while running.boot.tok.encode(&p1).len() <= page {
+        p1.push_str("word ");
+    }
+
+    // t1：真跑一轮（收口 ⇒ 链发布进内容树）
+    let (sid, t1) = running
+        .submit_session_opts(None, p1.clone(), 8, Default::default())
+        .expect("submit t1");
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. } if turn == t1 => {
+                break
+            }
+            TurnEvent::Idle => panic!("turn {t1} 丢失"),
+            _ => {}
+        }
+    }
+
+    // t2：同一 prompt 重发 ⇒ 同会话；内容树命中 ⇒ 起跑时 cached_start > 0
+    let (s2, t2) = running
+        .submit_session_opts(None, p1.clone(), 8, Default::default())
+        .expect("submit 重发");
+    assert_eq!(s2, sid, "无键请求必须按内容认出同一条会话");
+    running.pump().await.expect("pump 起 t2");
+    let cached = running.active_cached_len(t2).unwrap_or(0);
+    assert!(
+        cached > 0,
+        "同 prompt 重发必须命中内容树（cached_start = {cached}）"
+    );
+}
+
+/// **会话身份 = 内容身份（二）**：历史 + 新问题 ⇒ 仍是同一条会话（前缀命中
+/// 跨页）；另一段内容 ⇒ 另一条会话（不串）。
+///
+/// ⚠️ 这里**不**断言 `cached_tokens`：BPE 跨边界会合并（`p1` 末尾与新问题首
+/// 词合成一个 token），`guard` 因此失配 ⇒ cached 归零走全量重算 —— 这是
+/// 正确性优先的既定语义（store 仍可按内容树命中前缀块）。
+#[cfg(test)]
+#[tokio::test]
+async fn keyless_continuation_matches_session_by_prefix() {
+    let knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 1,
+        gdn_slots: 2,
+        raw_completion: true,
+        prefix_cache: true,
+        ..Default::default()
+    };
+    let mut running = mock_engine_with(knobs).await;
+    let page = running.dev.pool.geom.page.max(1);
+
+    let mut p1 = String::new();
+    let mut ids1 = Vec::new();
+    while ids1.len() <= page {
+        p1.push_str("word ");
+        ids1 = running.boot.tok.encode(&p1);
+    }
+    let sid = {
+        let (id, s) = running.bank.sessions.get_or_create(None).expect("建会话");
+        let pos: Vec<[i32; 3]> = (0..ids1.len() as i32).map(|i| [i, i, i]).collect();
+        s.commit_turn(&ids1, &[], &pos).expect("种账");
+        id
+    };
+
+    // 续写：同历史 + 新问题 ⇒ 同会话
+    let (s2, t2) = running
+        .submit_session_opts(None, format!("{p1}new question"), 8, Default::default())
+        .expect("submit 续写");
+    assert_eq!(s2, sid, "无键续写必须认出同一条会话（内容身份）");
+    // 跑到终局，让会话回到 idle（否则下一条会被"忙会话不参与匹配"跳过）
+    loop {
+        match running.pump().await.expect("pump") {
+            TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. }
+                if turn == t2 => break,
+            TurnEvent::Idle => panic!("turn {t2} 丢失"),
+            _ => {}
+        }
+    }
+
+    // 另一段内容（首 token 就分叉）⇒ 新会话，不串账
+    let (s3, _t3) = running
+        .submit_session_opts(None, "zzz totally different", 8, Default::default())
+        .expect("submit 新对话");
+    assert_ne!(s3, sid, "不同内容不得复用旧会话");
+}
+
+/// **整会话淘汰**（原始算法 §30/§32；2026-11-16）。
+///
+/// 池压力下逐块收缩仍不够 ⇒ 按 LRU 关掉最冷的**空闲**会话：它的缓存独占块
+/// 从叶向内逐掉（真还页），账出表（快照归属降 Extra）。
+#[cfg(test)]
+#[tokio::test]
+async fn pressure_evicts_cold_sessions_whole() {
     let mut knobs = EngineKnobs {
         sampler_enabled: false,
         max_batch: 1,
-        gdn_slots: 1,
-        min_gen_tokens: 1,
+        gdn_slots: 2,
+        raw_completion: true,
+        prefix_cache: true,
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
     knobs.host_cache_mb = 8;
     knobs.snap_host_mb = 64;
     knobs.snap_max = 1;
-    let cfg = EngineConfig {
-        device_ordinal: 0,
-        max_seq_tokens: 256,
-        prefill_chunk: 32,
-        knobs,
-    };
-    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
-        null_kernels: true,
-        graph_capture: true,
+    let mut running = mock_engine_with(knobs).await;
+
+    // 三条互不共享前缀的会话（首 token 就分叉 ⇒ 不会被内容身份合并）
+    for i in 0..3u32 {
+        let mut p = format!("{i} ");
+        while running.boot.tok.encode(&p).len() < 80 {
+            p.push_str("alpha beta gamma delta ");
+        }
+        let (_sid, tid) = running
+            .submit_session_opts(None, p, 4, Default::default())
+            .expect("submit");
+        loop {
+            match running.pump().await.expect("pump") {
+                TurnEvent::Completed { turn, .. } if turn == tid => break,
+                TurnEvent::Failed { turn, err } => panic!("turn {turn} 失败: {err}"),
+                TurnEvent::Idle => panic!("turn {tid} 丢失"),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(running.bank.sessions.len(), 3, "三条会话都在表里");
+    let total = running.bank.rel.slots_total();
+    let free_before = running.bank.rel.slots_free();
+
+    let (n, pages) = running.evict_cold_sessions(total);
+    assert_eq!(n, 3, "空闲会话应逐个被淘汰（最冷优先）");
+    assert!(running.bank.sessions.is_empty(), "淘汰后会话表应清空");
+    assert!(
+        pages > 0,
+        "整会话淘汰必须真还页：{free_before} → {}（共 {total}）",
+        running.bank.rel.slots_free()
+    );
+    assert_eq!(running.bank.rel.slots_free(), total, "目标 = 全自由");
+}
+
+/// **准入预算 = 上下文 + 本档最大输出长度**（2026-11-16 用户裁决）。
+///
+/// - 短 ctx ⇒ 预留 = `max_new_cap`；
+/// - 长 ctx ⇒ 被上下文窗口夹到 `max_seq − prompt`（再留就不是"能用到的"）；
+/// - 请求的 `max_tokens` 只决定**实际**生成上限（≤ 预留），不改预留。
+#[cfg(test)]
+#[tokio::test]
+async fn submit_reserves_ctx_plus_max_output_cap() {
+    let mut knobs = EngineKnobs {
+        sampler_enabled: false,
+        raw_completion: true,
+        max_batch: 1,
+        gdn_slots: 1,
+        max_new_cap: 64,
         ..Default::default()
-    });
-    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
-    let loaded = engine
-        .loader()
-        .load_qwen35_0_8b(&asset_dir())
-        .await
-        .expect("装载");
-    let mut running = engine.run(loaded).await.expect("装配");
+    };
+    knobs.pool_tokens = Some(256);
+    knobs.host_cache_mb = 8;
+    knobs.snap_host_mb = 64;
+    knobs.snap_max = 1;
+    let mut running = mock_engine_with(knobs).await;
+
+    // 短 prompt：预留 = 上限 64（与请求的 8 无关）
+    let (_s1, _t1) = running
+        .submit_session_opts(None, "short", 8, Default::default())
+        .expect("submit 短");
+    {
+        let t = running.turns.queue.back().expect("排队项");
+        assert_eq!(t.reserve_new, 64, "短 ctx 的预留 = max_new_cap");
+        assert_eq!(t.spec.max_new, 8, "实际生成上限仍是请求值");
+    }
+
+    // 长 prompt（~200 tok / 256 窗口）：预留被窗口夹到 max_seq − prompt
+    let mut long = String::new();
+    while running.boot.tok.encode(&long).len() < 200 {
+        long.push_str("word ");
+    }
+    let (_s2, _t2) = running
+        .submit_session_opts(None, long.clone(), 8, Default::default())
+        .expect("submit 长");
+    {
+        let t = running.turns.queue.back().expect("排队项");
+        let n = t.prompt_ids.len();
+        assert_eq!(
+            t.reserve_new,
+            256 - n,
+            "长 ctx 的预留 = 上下文窗口余量（prompt {n}）"
+        );
+        assert!(t.reserve_new > 0);
+        assert_eq!(t.spec.max_new, 8);
+    }
+}
+
+/// **排队取消不动会话账**（2026-11-16 原始算法：会话一律持久）。
+///
+/// 旧 F-18 门要求"排队取消必须焚毁 ephemeral 会话" —— ephemeral 概念已退休
+/// （自动会话一律持久，idle 会话的快照/前缀账是下一轮的内容身份依据）。
+#[cfg(test)]
+#[tokio::test]
+async fn queued_cancel_keeps_persistent_session() {
+    let knobs = EngineKnobs {
+        sampler_enabled: false,
+        max_batch: 1,
+        gdn_slots: 1,
+        raw_completion: true,
+        ..Default::default()
+    };
+    let mut running = mock_engine_with(knobs).await;
 
     let (s1, _t1) = running
-        .submit_session_opts(None, "hello", 32, Default::default())
+        .submit_session_opts(None, "hello there", 32, Default::default())
         .expect("submit 活跃");
     running.pump().await.expect("pump 起 t1");
     assert_eq!(running.active_len(), 1);
 
-    let (s2, t2) = running
-        .submit_session_opts(None, "world", 32, Default::default())
+    let (_s2, t2) = running
+        .submit_session_opts(None, "world away", 32, Default::default())
         .expect("submit 排队");
     assert_eq!(running.queue_len(), 1);
 
     let ev = running.cancel_turn(t2).await.expect("取消排队 turn");
     assert!(matches!(ev, TurnEvent::Failed { turn, .. } if turn == t2));
     assert!(
-        running.bank.sessions.get(s2).is_none(),
-        "排队取消必须焚毁 ephemeral 会话（F-18）"
+        !running.bank.sessions.is_empty(),
+        "会话是持久资产：排队取消不得抹掉会话账"
     );
-    assert!(
-        running.bank.sessions.get(s1).is_some(),
-        "活跃会话不能被误焚"
-    );
+    assert!(running.bank.sessions.get(s1).is_some(), "活跃会话原样");
 }
 
 /// **F-01 回归门**：纯配置门必须返回 `Err`（旧实现 `process::exit(2)`），
@@ -382,7 +575,6 @@ async fn failed_start_returns_gdn_row() {
         sampler_enabled: false,
         max_batch: 1,
         gdn_slots: 1,
-        min_gen_tokens: 1,
         ..Default::default()
     };
     knobs.pool_tokens = Some(256);
@@ -482,7 +674,6 @@ async fn failed_start_does_not_kill_active_turn() {
         sampler_enabled: false,
         max_batch: 2,
         gdn_slots: 2,
-        min_gen_tokens: 1,
         ..Default::default()
     };
     knobs.pool_tokens = Some(512);
@@ -545,7 +736,6 @@ async fn position_consolidation_resets_high_water() {
         sampler_enabled: false,
         max_batch: 1,
         gdn_slots: 1,
-        min_gen_tokens: 1,
         // mock 的 max_seq_tokens = 256 ⇒ pos_cap = 256 + 64 = 320
         gap_reserve: 64,
         ..Default::default()
@@ -632,54 +822,6 @@ async fn mock_engine_with(
         .await
         .expect("装载");
     engine.run(loaded).await.expect("装配")
-}
-
-/// **F-22 回归门**：`[runtime] max_sessions > 0` 时，新请求前按 LRU 淘汰
-/// **空闲**会话；活跃/排队会话不动，被淘汰的只是 host 账（下轮全量重算）。
-#[cfg(test)]
-#[tokio::test]
-async fn session_cap_evicts_lru_idle() {
-    let mut knobs = EngineKnobs {
-        sampler_enabled: false,
-        max_batch: 1,
-        gdn_slots: 1,
-        min_gen_tokens: 1,
-        max_sessions: 2,
-        ..Default::default()
-    };
-    knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 8;
-    knobs.snap_host_mb = 64;
-    knobs.snap_max = 1;
-    let mut running = mock_engine_with(knobs).await;
-
-    for sid in 1u64..=3 {
-        let (_s, tid) = running
-            .submit_session_opts(Some(sid), "hello", 1, Default::default())
-            .expect("submit");
-        loop {
-            match running.pump().await.expect("pump") {
-                ev @ (TurnEvent::Completed { turn, .. } | TurnEvent::Failed { turn, .. })
-                    if turn == tid =>
-                {
-                    assert!(matches!(ev, TurnEvent::Completed { .. }), "turn 应完成：{ev:?}");
-                    break;
-                }
-                _ => {}
-            }
-        }
-        assert!(
-            running.bank.sessions.len() <= 2,
-            "会话表应被软上限约束（sid={sid}, len={}）",
-            running.bank.sessions.len()
-        );
-    }
-    assert!(
-        running.bank.sessions.get(1).is_none(),
-        "LRU 会话 1 应被淘汰"
-    );
-    assert!(running.bank.sessions.get(2).is_some(), "会话 2 应保留");
-    assert!(running.bank.sessions.get(3).is_some(), "会话 3 应保留");
 }
 
 /// **P2-2 图 slab 实测回填门**：GraphFleet 捕获后，MemoryPlan 的 GraphSlab
@@ -3143,7 +3285,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     let hot: Vec<String> = (0..2).map(|i| mk(i, 88)).collect(); // 各 ~89 tok ⇒ 3 块
     let long = mk(9, 240); // ~240 tok ⇒ 8 块(**需求**:8 − free 2 = 6 槽)
 
-    // 跑 ephemeral turn(终了焚链 ⇒ 缓存独占 ⇒ 可下沉)
+    // 跑两个 turn(终局还设备表 ⇒ 缓存独占 ⇒ 可下沉)
     // 门③基线:**冷启动**(轮 1)= 无缓存路径的生成全文
     let mut cold_text: Option<String> = None;
     for (i, p) in hot.iter().enumerate() {
@@ -3285,7 +3427,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     // 真正要看的:回灌发生了、且没有同步驱逐(上两条)。
 }
 
-/// 跑一个 ephemeral turn 到完成(探针共用;返回生成全文)。
+/// 跑一个 turn 到完成(探针共用;返回生成全文)。
 async fn probe_run_turn<D: DeviceClient>(running: &mut RunningEngine<D>, prompt: &str) -> String {
     let (_, tid) = running.submit_session(None, prompt, 8).expect("submit");
     let mut n = 0usize;
@@ -6138,6 +6280,8 @@ async fn cancel_session_targets_only_that_session() {
 async fn abort_publishes_written_prompt_prefix() {
     let mut knobs = EngineKnobs {
         sampler_enabled: false,
+        // 2048 tok 窗口：输出上限取 64，否则"上下文 + 最大输出"的预留会吃满整窗
+        max_new_cap: 64,
         ..Default::default()
     };
     knobs.pool_tokens = Some(2048); // 64 页(页 32)⇒ 前缀面够放
@@ -6234,70 +6378,6 @@ async fn abort_publishes_written_prompt_prefix() {
         b_chunks * 3 < a_chunks,
         "B 的 prefill chunk 数 {b_chunks} 没有远小于 A 的 {a_chunks}(前缀没复用)"
     );
-}
-
-/// **P0-2 队列上限**（submit 边界）：在飞总数（活跃 + 排队）达上限 ⇒ 拒，
-/// 且错误串带 `admission:` 前缀（服务面据此翻 429 `no_slot`）。
-#[cfg(test)] // 单元档专属(dev-dep tokio/macros);e2e 档不编该用例
-#[tokio::test]
-async fn queue_bound_rejects_at_submit() {
-    let mut knobs = EngineKnobs {
-        sampler_enabled: false,
-        ..Default::default()
-    };
-    knobs.pool_tokens = Some(256);
-    knobs.host_cache_mb = 8;
-    knobs.snap_host_mb = 64;
-    knobs.snap_max = 1;
-    knobs.max_batch = 1;
-    knobs.max_queue = 1; // 批位 1 + 队列 1 ⇒ 在飞上限 2
-    let cfg = EngineConfig {
-        device_ordinal: 0,
-        max_seq_tokens: 256,
-        prefill_chunk: 32,
-        knobs,
-    };
-    let face = owl_cpu::CpuFace::mock(owl_cpu::MockLimits {
-        null_kernels: true,
-        graph_capture: true,
-        ..Default::default()
-    });
-    let mut engine = Engine::on(cfg, face).expect("构造(CPU mock)");
-    let loaded = engine
-        .loader()
-        .load_qwen35_0_8b(&asset_dir())
-        .await
-        .expect("装载");
-    let mut running = engine.run(loaded).await.expect("装配");
-
-    let p = "alpha bravo cedar delta ember falcon";
-    running
-        .submit_session(Some(1), p, 8)
-        .expect("第 1 个(活跃)");
-    running
-        .submit_session(Some(2), p, 8)
-        .expect("第 2 个(排队)");
-    match running.submit_session(Some(3), p, 8) {
-        Err(e) => {
-            let msg = format!("{e}");
-            assert!(msg.contains("admission:no_slot"), "错误串应带准入码：{msg}");
-        }
-        Ok(_) => panic!("在飞已达上限 2，第 3 个应被拒"),
-    }
-    // **结构化面**（P3）：同一拒绝走 `submit_session_checked` 时必须是
-    // `Rejected(no_slot)`，且带引擎退避估计 —— 服务面据此翻 429，不再解析串。
-    match running.submit_session_checked(Some(3), p, 8, Default::default()) {
-        Err(e) => {
-            let r = e.reject().expect("应是结构化准入拒绝");
-            assert_eq!(r.code(), "no_slot");
-            assert!(r.retry_in_ms().is_some(), "引擎应给退避估计");
-            assert!(r.detail().contains("已达上限"), "明细应说明在飞上限:{}", r.detail());
-        }
-        Ok(_) => panic!("在飞已达上限 2，第 3 个应被拒"),
-    }
-    // 无界档（max_queue=0）不拒 —— 旧行为不变
-    running.boot.cfg.knobs.max_queue = 0;
-    running.submit_session(Some(4), p, 8).expect("无界档不拒");
 }
 
 /// **P4 同会话串行**（CPU mock）：同会话第二个 turn **不再在 submit 硬拒**，

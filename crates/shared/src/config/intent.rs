@@ -216,7 +216,7 @@ pub struct Intent {
     pub goal: Goal,
     /// 必填:显式 token 或 `"max"`(启动前求解)
     pub context: ContextSpec,
-    /// 并发会话数(派生 `gdn_slots / max_concurrency / max_batch`)
+    /// 并发会话数(派生 `gdn_slots`(唯一真源) / `max_batch`)
     #[serde(default = "one")]
     pub concurrency: usize,
     #[serde(default)]

@@ -277,6 +277,16 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
     ) {
         Ok(t) => {
             owl_shared::log_info!("boot", "chat 模板已装载({})", t.source());
+            // 模板变量（2026-11-16 起独立文件，不属于引擎配置）
+            match &config.agent.vars_source {
+                Some(p) => owl_shared::log_info!(
+                    "boot",
+                    "chat 模板变量:{} ({} 项)",
+                    p.display(),
+                    config.agent.vars.len()
+                ),
+                None => owl_shared::log_info!("boot", "chat 模板变量:无文件(模板取自身缺省)"),
+            }
             std::sync::Arc::new(t)
         }
         Err(e) => {
@@ -290,12 +300,13 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
     // 卡锁 / 选卡 / 单卡与 TP 双 rank 并行装载 / 图捕获 / 泵循环 / 卡锁释放
     // 全部由 `owl_engine::EngineService::boot` 在**引擎自己的 OS 线程**内完成
     //（与 `owl-cuda` 的 `GpuServer` 同形）。server 这一步只搬配置字段。
-    let gdn_slots = config.knobs.gdn_slots;
+    // 并发上限的**唯一真源 = `pool.gdn_slots`**（2026-11-16：`[runtime]
+    // max_concurrency` 已删，permit 数与引擎槽位上限都从这里出）。
     let max_concurrency = config.max_concurrency;
     let max_batch = config.max_batch;
     owl_shared::log_info!(
         "boot",
-        "并发上限 {max_concurrency}(GDN 格 {gdn_slots};本地服务,排队超出请求)"
+        "并发上限 {max_concurrency}(= pool.gdn_slots;本地服务,排队超出请求)"
     );
     let (bind, model_name) = (config.bind.clone(), config.model_name.clone());
     // 请求原文落盘目录（诊断开关；空 = 关）。写入失败 = 启动失败，
@@ -360,15 +371,14 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
     };
     let client = service.client();
 
-    // 并发上限守卫(§三十五 server 上层):GDN 行 = 每并发会话一格,
-    // max_concurrency 超格数 = 第 N+1 会话状态格耗尽(LRU 逐出活跃会话)
-    // → 跨会话状态污染。不足即拒启(账外组合不静默)。
-    // 并发闸门(permit = max_concurrency;在跑 + 排队 ≤ 上限,超出排队等待)
+    // 并发闸门（permit = `pool.gdn_slots`；在跑 + 排队 ≤ 它）。
+    // 两者同一口径是**类型级**保证：`max_concurrency` 就是 `gdn_slots` 的投影，
+    // 不再有"配错会污染状态格"的组合（旧的 `gdn_slots ≥ max_concurrency` 门已删）。
     let concurrency_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
     // **会话串行已下沉引擎**（2026-11-16 P4）：同会话后继 turn 在引擎队列里
     // 等前一个终了（`startable_queue_idx`），服务面不再需要 per-session 闸。
     // 口径告警(不拒启:语义仍然正确,只是这类客户端拿不到合批收益)
-    if max_batch > 1 && !agent.implicit_session {
+    if max_batch > 1 {
         if max_batch < max_concurrency {
             owl_shared::log_info!(
                 "boot",
@@ -379,18 +389,9 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
             owl_shared::log_warn!(
                 "boot",
                 "合批上限 {max_batch} > 并发上限 {max_concurrency} ⇒ 批位闲置(服务面进不来那么多) \
-                 —— 想让批吃满,`server.max_concurrency` 应 ≥ `runtime.max_batch`"
+                 —— 想让批吃满,`pool.gdn_slots` 应 ≥ `runtime.max_batch`"
             );
         }
-    }
-    if max_batch > 1 && agent.implicit_session {
-        owl_shared::log_warn!(
-            "boot",
-            "隐式会话开着(implicit_session=true)且 max_batch={} —— 无 session 键的请求\
-             全落会话 0 ⇒ 会被引擎按会话串行(合批无收益)。要合批:客户端带 session 键,\
-             或关 implicit_session",
-            max_batch
-        );
     }
 
     let listener = TcpListener::bind(&bind).await.expect("bind");

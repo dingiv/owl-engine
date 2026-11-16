@@ -72,8 +72,6 @@ pub struct Limits {
     pub max_batch: usize,
     /// GDN 状态格数（每条活跃 turn 占一格）
     pub gdn_slots: usize,
-    /// 服务面请求上限（**不是容量**；只做请求侧闸）
-    pub max_concurrency: usize,
     /// 超卖两扇门都开（`select_decode ∧ select_partial`）
     pub oversub: bool,
     /// 超卖档：每条 turn 的设备工作集页数（`ceil(workspace_per_req / page)`）
@@ -86,13 +84,10 @@ pub struct Limits {
     pub slice_every: usize,
     /// 时间片：单片 prefill token 数（0 = 用整 chunk）
     pub slice_tokens: usize,
-    /// **给未来新人的预留**（token/人；不超卖档用来反推在位者的生成封顶）
-    pub newcomer_min_tokens: usize,
-    /// 在位者的最小生成量（低于它就不留新人预留 —— 在位者优先）
-    pub min_gen_tokens: usize,
-    /// **等待队列上限**（0 = 无界）。`Hold` 的 turn 数超过它 ⇒ 改判
-    /// `Reject{NoSlot}`（429），否则狂发请求会把 host 队列撑爆。
-    pub max_queue: usize,
+    // **公平性三旋钮已删**（2026-11-16 用户裁决）：一轮在 submit 时就按
+    // 「上下文 + 本档最大输出长度」预留整份预算（`TurnFacts::max_new`），
+    // 装不下即拒/排队 ⇒ 在跑者天然不被新人挤占，不需要"给新人留头寸"/
+    // "在位者最小生成量"/"队列上限"这三个补丁旋钮。
 }
 
 impl Default for Limits {
@@ -101,16 +96,12 @@ impl Default for Limits {
             page: 32,
             max_batch: 1,
             gdn_slots: 1,
-            max_concurrency: 1,
             oversub: false,
             workspace_pages: 0,
             chunk_pages: 0,
             reserve_pages: 8,
             slice_every: 4,
             slice_tokens: 64,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
-            max_queue: 0,
         }
     }
 }
@@ -274,18 +265,19 @@ impl TurnFacts {
         self.prompt_tokens.saturating_sub(self.fed)
     }
 
-    /// **A2 预留口径**：本 turn 需要多少设备页（`cap` = 生成封顶；
-    /// `usize::MAX` = 不封顶）。封顶由 [`Admission::cap_for`] 反推 ——
-    /// 见"在位者优先 + 给新人留头寸"的口径（工作单 §七）。
-    pub fn need_pages(&self, l: &Limits, cap: usize) -> usize {
+    /// **A2 预留口径**：本 turn 需要多少设备页。
+    ///
+    /// `max_new` = **整份生成预算**（submit 时按"上下文 + 本档最大输出长度"
+    /// 定死；2026-11-16 用户裁决），不再有"按剩余空间反推封顶"这一步 ——
+    /// 装不下就是装不下（准入拒/排队），绝不把在跑者的预算切一块给新人。
+    pub fn need_pages(&self, l: &Limits) -> usize {
         if l.oversub {
             // 超卖：只驻工作集 + 本拍 chunk（生成预算不额外占设备）
             l.workspace_pages + l.chunk_pages
         } else {
             // 不超卖：**新增链段**（未驻留 prompt + 生成预算）必须驻留；
             // 已驻留前缀在 `session_held` 里，不能再要一份。
-            let new = self.max_new.min(cap);
-            let tokens = self.incremental_prompt().saturating_add(new);
+            let tokens = self.incremental_prompt().saturating_add(self.max_new);
             tokens.div_ceil(l.page.max(1)).max(1)
         }
     }
@@ -298,7 +290,7 @@ impl TurnFacts {
 /// 容量快照（诊断/门用；一次判定的中间结果，纯值）
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capacity {
-    /// 槽位上限 = `min(max_batch, gdn_slots, max_concurrency)`
+    /// 槽位上限 = `min(max_batch, gdn_slots)`（并发唯一真源 = gdn_slots）
     pub n_slots: usize,
     /// 内存上限（当前事实下还能再进几个同尺寸 turn）
     pub n_mem: usize,
@@ -370,43 +362,11 @@ impl Admission {
         Self::default()
     }
 
-    /// 目标并发（份额分母）：`min(max_batch, gdn_slots, max_concurrency)`
-    pub fn n_target(&self, l: &Limits) -> usize {
-        l.max_batch
-            .min(l.gdn_slots)
-            .min(l.max_concurrency.max(1))
-            .max(1)
-    }
-
-    /// **在位者优先 + 给新人留头寸** 的生成封顶（token）。
+    /// **本轮生成预算**（token；2026-11-16 用户裁决）。
     ///
-    /// 口径（用户裁决 2026-10-20）：
-    /// ```text
-    /// 可用 token = store.usable_pages × page
-    /// 封顶 = 可用 − 其它在跑 turn 的预留 − (n_target−1) × newcomer_min − 本 turn prompt
-    /// 若该值 < min_gen（把在位者压得不能生成）⇒ **放弃新人预留**，封顶 = 可用 − 其它 − prompt
-    /// ```
-    /// 超卖档：生成不额外占设备 ⇒ 返回 `max_new`（不封顶）。
-    pub fn cap_for(&self, l: &Limits, s: &StoreFacts, head: &TurnFacts) -> usize {
-        if l.oversub {
-            return head.max_new;
-        }
-        // `usable` 已是**剩余**（不含任何已预留）⇒ 这里只减本 turn 的 prompt。
-        let usable_tokens = s.usable_pages(l.reserve_pages).saturating_mul(l.page);
-        // 只减**未驻留** prompt 段：已命中前缀已占 `session_held`，在
-        // `usable` 里本来就不存在第二次。
-        let free_after_prompt = usable_tokens.saturating_sub(head.incremental_prompt());
-        let reserve_new = l
-            .newcomer_min_tokens
-            .saturating_mul(self.n_target(l).saturating_sub(1));
-        let with_reserve = free_after_prompt.saturating_sub(reserve_new);
-        if with_reserve >= l.min_gen_tokens {
-            with_reserve
-        } else {
-            free_after_prompt
-        }
-    }
-
+    /// 不再"按剩余空间反推封顶"：预算在 submit 时定死 = `min(max_new_cap,
+    /// max_seq − prompt)`，由 [`TurnFacts::max_new`] 带进准入。
+    /// 池装不下整份预算 ⇒ 拒/排队（见 [`Self::decide`]）；**不切在跑者的份额**。
     /// **容量快照**（纯函数；门/诊断/单测直接用）。
     ///
     /// `running` = 活跃 turn（它们已占预留）；`incoming` = 待判 turn。
@@ -421,17 +381,11 @@ impl Admission {
         // 叠加 `running` 的 need —— 那会双算（本骨架第一版就踩了,测试抓到））。
         let used_pages = s.reserved_pages;
         let usable = s.usable_pages(l.reserve_pages);
-        let n_slots = l.max_batch.min(l.gdn_slots).min(l.max_concurrency.max(1));
-        let cap_tokens = self.cap_for(l, s, incoming);
-        // 与 `decide` 同判据：非超卖档下 cap < min_gen = 进得来也吐不出 token
-        // ⇒ 不计入容量（否则 n_mem 会给出"能进 1 个"的假象）。
-        let per_turn = incoming.need_pages(l, cap_tokens).max(1);
+        let n_slots = l.max_batch.min(l.gdn_slots).max(1);
+        // 预留 = 整份预算（prompt 新增段 + 生成预算）；不再有"按剩余反推"。
+        let per_turn = incoming.need_pages(l).max(1);
         let n_mem = if !l.oversub {
-            if cap_tokens < l.min_gen_tokens {
-                0
-            } else {
-                usable / per_turn
-            }
+            usable / per_turn
         } else {
             // 超卖档：设备工作集之外的空间要落宿主/磁盘 ⇒ 两腿取小
             let offload = incoming.offload_pages(l).max(1);
@@ -441,7 +395,7 @@ impl Admission {
         // `running` 的用途 = 诊断（最大在跑 turn 的尺寸;门/日志读）
         let largest_running = running
             .iter()
-            .map(|t| t.need_pages(l, usize::MAX))
+            .map(|t| t.need_pages(l))
             .max()
             .unwrap_or(0);
         glue(capacity_result(
@@ -476,24 +430,9 @@ impl Admission {
                 };
             }
         }
-        // ② 槽位
+        // ② 槽位 / 预算装得下吗（**整份预算**：上下文 + 最大输出长度）
         let cap = self.capacity(l, s, running, head);
-        let gen_cap = self.cap_for(l, s, head);
-        // 非超卖档：
-        // · 连 1 token 都放不下 ⇒ 拒（进来也吐不出东西）；
-        // · 有**同住者**且本 turn 的生成余量 < `min_gen` ⇒ 拒（别让新人当陪跑）；
-        // · **独自一人**时即便余量 < min_gen 也放行（大 prompt 独占是合法形态，
-        //   生成到 `cap` 就 `length` 收尾）—— 判据是"有没有别人"，不是绝对值。
-        if !l.oversub && (gen_cap == 0 || (gen_cap < l.min_gen_tokens && s.in_flight_turns > 0)) {
-            return Verdict::Reject {
-                reason: Reason::NoMemory {
-                    need_pages: head.need_pages(l, 0),
-                    free_pages: 0,
-                },
-                retry_after_ms: 1000,
-            };
-        }
-        let need = head.need_pages(l, gen_cap);
+        let need = head.need_pages(l);
         if need > cap.usable_pages {
             return Verdict::Reject {
                 reason: Reason::NoMemory {
@@ -784,7 +723,6 @@ mod tests {
             page: 32,
             max_batch: 2,
             gdn_slots: 2,
-            max_concurrency: 8,
             reserve_pages: 8,
             ..Default::default()
         }
@@ -795,16 +733,12 @@ mod tests {
             page: 32,
             max_batch: 8,
             gdn_slots: 8,
-            max_concurrency: 8,
             oversub: true,
             workspace_pages: 32, // 1024 tok
             chunk_pages: 32,     // 1024 tok
             reserve_pages: 8,
             slice_every: 4,
             slice_tokens: 64,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
-            max_queue: 0,
         }
     }
 
@@ -832,18 +766,14 @@ mod tests {
     }
 
     /// **已驻留前缀不双算**（2026-11-13 真机 turn5）：
-    /// 1000 tok prompt 里 900 已命中，池只该为新增 100 + 200 gen 留页；
-    /// 旧算式按全量 1000 prompt 扣，20 页池会算出 cap 0。
+    /// 1000 tok prompt 里 900 已命中，池只该为新增 100 + 200 gen 留页。
     #[test]
-    fn cached_prefix_is_not_double_counted_in_cap_and_need() {
+    fn cached_prefix_is_not_double_counted_in_need() {
         let l = Limits {
             page: 32,
             max_batch: 1,
             gdn_slots: 1,
-            max_concurrency: 1,
             reserve_pages: 8,
-            newcomer_min_tokens: 0,
-            min_gen_tokens: 1,
             ..Default::default()
         };
         let s = StoreFacts {
@@ -854,12 +784,9 @@ mod tests {
         t.cached_tokens = 900;
         assert_eq!(t.reusable_prefix(), 900);
         assert_eq!(t.incremental_prompt(), 100);
-        assert_eq!(t.need_pages(&l, 200), 10, "300 新增 tok / 32 = 10 页");
-        let cap = Admission::new().cap_for(&l, &s, &t);
-        assert!(
-            cap >= 200,
-            "已驻留 900 tok 后，20 页池应能容纳 200 tok 生成；实际 cap={cap}"
-        );
+        assert_eq!(t.need_pages(&l), 10, "300 新增 tok / 32 = 10 页");
+        let c = Admission::new().capacity(&l, &s, &[], &t);
+        assert_eq!(c.n_mem, 1, "20 页池装得下一份 10 页的预留");
     }
 
     /// 不超卖：两路各 4k prompt + 4k gen（256 页）在 528 页池里 ⇒ 2 个；
@@ -870,11 +797,11 @@ mod tests {
         let a = Admission::new();
         let s = store(520, 0);
         let t = turn(1, 10, 4096, 4096);
-        assert_eq!(t.need_pages(&l, usize::MAX), 256);
+        assert_eq!(t.need_pages(&l), 256);
         let cap = a.capacity(&l, &s, &[], &t);
         assert_eq!(cap.n_mem, 2);
         let big = turn(2, 11, 8192, 8192);
-        assert_eq!(big.need_pages(&l, usize::MAX), 512);
+        assert_eq!(big.need_pages(&l), 512);
         let cap = a.capacity(&l, &s, &[], &big);
         assert_eq!(cap.n_mem, 1);
         // 两路 half ctx 已在跑（store 已记 512 页预留）⇒ 新人放不下
@@ -897,8 +824,8 @@ mod tests {
         let s = store(1016, 0);
         let small = turn(1, 10, 2048, 2048);
         let huge = turn(2, 11, 200_000, 8192);
-        assert_eq!(small.need_pages(&l, usize::MAX), 64);
-        assert_eq!(huge.need_pages(&l, usize::MAX), 64, "超卖:只驻工作集");
+        assert_eq!(small.need_pages(&l), 64);
+        assert_eq!(huge.need_pages(&l), 64, "超卖:只驻工作集");
         assert_eq!(a.capacity(&l, &s, &[], &small).n_mem, 15);
         assert_eq!(a.capacity(&l, &s, &[], &huge).n_mem, 15);
     }
@@ -945,104 +872,75 @@ mod tests {
         assert_eq!(a.in_flight(), 1);
     }
 
-    /// **用户场景门（2026-10-20 裁决）**：200K 池、A 已 150K、B 全新进来。
-    ///
-    /// 口径 = "在位者优先 + 给新人留头寸"：
-    /// `cap = usable − 其它预留 − (n_target−1)×newcomer_min − prompt`；
-    /// 若把在位者压到 < min_gen ⇒ 放弃新人预留（在位者独占）。
+    /// **用户裁决门（2026-11-16）**：预算 = 上下文 + 本档最大输出长度，
+    /// 装不下 ⇒ 拒；**在跑者已预留的空间不会被新人挤占**（也不需要给新人
+    /// 留头寸 —— 它自己的预算先要装得下）。
     #[test]
-    fn incumbent_cap_leaves_room_for_newcomer() {
+    fn budget_is_ctx_plus_max_output_and_not_squeezable() {
         let l = Limits {
             page: 32,
             max_batch: 2,
             gdn_slots: 2,
-            max_concurrency: 2,
             reserve_pages: 8,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
             ..Default::default()
         };
         let mut a = Admission::new();
-        // 200K 池 = 6250 页;可用 = 6242 页 = 199,744 tok
+        // 200K 池 = 6250 页；可用 = 6242 页 = 199,744 tok
         let s0 = StoreFacts {
             free_pages: 6250,
             ..Default::default()
         };
-        // A:prompt 142K,请求 50K 生成（约占满 192K）
+        // A：ctx 142K + 预算 50K ⇒ 6000 页
         let ta = turn(1, 10, 142_000, 50_000);
-        assert_eq!(a.cap_for(&l, &s0, &ta), 53_648, "A 的封顶（留 4K 给新人）");
-        assert_eq!(ta.need_pages(&l, a.cap_for(&l, &s0, &ta)), 6000);
+        assert_eq!(ta.need_pages(&l), 6000);
+        assert_eq!(a.decide(&l, &s0, &[], &ta, 0), Verdict::Admit);
         a.note_started(&ta);
-        // B:全新,prompt 300,请求 8K ⇒ 被夹到 3,348（**必须如实告知客户端**）
+        // B：ctx 300 + 预算 8192 ⇒ 266 页 > 剩余 242 ⇒ **拒**（不是挤压 A）
         let tb = turn(2, 11, 300, 8192);
+        assert_eq!(tb.need_pages(&l), 266);
         let s1 = StoreFacts {
             free_pages: 250,
             reserved_pages: 6000,
             in_flight_turns: 1,
             ..Default::default()
         };
-        let cap_b = a.cap_for(&l, &s1, &tb);
-        assert_eq!(cap_b, 3_348, "B 的生成封顶（A 已占 192K）");
-        assert_eq!(tb.need_pages(&l, cap_b), 114);
-        assert_eq!(
-            a.decide(&l, &s1, &[ta], &tb, 0),
-            Verdict::Admit,
-            "B 应能进来"
-        );
-    }
-
-    /// 在位者把池吃满（prompt 196K + 生成）⇒ 新人**响亮拒**（不是进来撞墙）。
-    #[test]
-    fn newcomer_rejected_when_incumbent_claims_pool() {
-        let l = Limits {
-            page: 32,
-            max_batch: 2,
-            gdn_slots: 2,
-            max_concurrency: 2,
-            reserve_pages: 8,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
-            ..Default::default()
-        };
-        let mut a = Admission::new();
-        let s0 = StoreFacts {
-            free_pages: 6250,
-            ..Default::default()
-        };
-        let ta = turn(1, 10, 196_000, 8192);
-        // 新人预留会把 A 压到不能生成 ⇒ 放弃预留,A 吃掉剩余（3,744 tok）
-        assert_eq!(a.cap_for(&l, &s0, &ta), 3_744);
-        assert_eq!(ta.need_pages(&l, 3_744), 6242);
-        a.note_started(&ta);
-        let tb = turn(2, 11, 300, 8192);
-        let s1 = StoreFacts {
-            free_pages: 8,
-            reserved_pages: 6242,
-            in_flight_turns: 1,
-            ..Default::default()
-        };
         match a.decide(&l, &s1, &[ta], &tb, 0) {
             Verdict::Reject {
-                reason:
-                    Reason::NoMemory {
-                        need_pages,
-                        free_pages,
-                    },
+                reason: Reason::NoMemory { need_pages, free_pages },
                 ..
             } => {
-                assert_eq!(need_pages, 10);
-                assert_eq!(free_pages, 0);
+                assert_eq!((need_pages, free_pages), (266, 242));
                 assert_eq!(
-                    Reason::NoMemory {
-                        need_pages,
-                        free_pages
-                    }
-                    .code(),
+                    Reason::NoMemory { need_pages, free_pages }.code(),
                     "no_memory"
                 );
             }
-            other => panic!("应拒（newcomer_rejected）,得到 {other:?}"),
+            other => panic!("预算装不下应拒，得到 {other:?}"),
         }
+        // A 终了 ⇒ 预留回来 ⇒ B 放行（B 的预算从来没被改写过）
+        a.note_finished(1);
+        let s2 = StoreFacts {
+            free_pages: 6250,
+            ..Default::default()
+        };
+        assert_eq!(a.decide(&l, &s2, &[], &tb, 0), Verdict::Admit);
+        assert_eq!(tb.max_new, 8192, "预算不得被准入改写（不再有封顶）");
+    }
+
+    /// **预留预算 = min(本档最大输出, 上下文窗口余量)**（submit 侧算式）。
+    #[test]
+    fn reserve_is_capped_by_context_window() {
+        let max_seq = 32_768usize;
+        // 32k 窗口 / 32k 最大输出：ctx 30k ⇒ 预算只剩 2,768（窗口是硬边界）
+        assert_eq!(
+            32_768usize.min(max_seq.saturating_sub(30_000)),
+            2_768
+        );
+        // 8k 最大输出 / 32k 窗口：小 ctx ⇒ 预算 = 配置的最大输出
+        let cap = 8_192usize;
+        assert_eq!(cap.min(max_seq - 1_000), 8_192);
+        // 同一档，ctx 30k ⇒ 预算被窗口压到 2,768
+        assert_eq!(cap.min(max_seq - 30_000), 2_768);
     }
 
     /// 相位：全 gen 两行 ⇒ BatchDecode；混合 ⇒ 每 4 拍 decode 后插 1 片 prefill。
@@ -1155,7 +1053,7 @@ mod scenario_tests {
             let used: usize = self
                 .actives
                 .iter()
-                .map(|t| t.need_pages(&self.l, usize::MAX))
+                .map(|t| t.need_pages(&self.l))
                 .sum();
             StoreFacts {
                 free_pages: self.total_pages.saturating_sub(used),
@@ -1178,12 +1076,8 @@ mod scenario_tests {
                 let s = self.store();
                 match self.adm.decide(&self.l, &s, &self.actives, &head, self.now) {
                     Verdict::Admit => {
-                        let cap = self.adm.cap_for(&self.l, &s, &head);
-                        let mut t = self.queued.remove(0);
-                        if t.max_new > cap {
-                            self.clamped.push((t.turn, cap));
-                            t.max_new = cap.max(1);
-                        }
+                        // 预算在 submit 时定死（不再有"按剩余反推封顶"）
+                        let t = self.queued.remove(0);
                         self.adm.note_started(&t);
                         self.actives.push(t);
                     }
@@ -1276,10 +1170,7 @@ mod scenario_tests {
             page: 32,
             max_batch: 2,
             gdn_slots: 2,
-            max_concurrency: 2,
             reserve_pages: 8,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
             slice_every: 4,
             slice_tokens: 64,
             ..Default::default()
@@ -1399,16 +1290,12 @@ mod scenario_tests {
             page: 32,
             max_batch: 2,
             gdn_slots: 2,
-            max_concurrency: 2,
             oversub: true,
             workspace_pages: 32,
             chunk_pages: 32,
             slice_every: 4,
             slice_tokens: 64,
             reserve_pages: 8,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
-            max_queue: 0,
         };
         let mut sim = Sim::new(l, 1024); // 32K 池
         sim.submit(fresh(1, 10, 200_000, 32));
@@ -1431,10 +1318,7 @@ mod edge_tests {
             page: 32,
             max_batch: 2,
             gdn_slots: 2,
-            max_concurrency: 2,
             reserve_pages: 8,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
             slice_every: 4,
             slice_tokens: 64,
             ..Default::default()
@@ -1551,7 +1435,7 @@ mod edge_tests {
 
     // ── 准入：容量算式边界 ───────────────────────────────────────
 
-    /// prompt 恰好占满可用池 ⇒ cap 0 ⇒ 拒（连一个 token 都生不出来）。
+    /// prompt 恰好占满可用池 ⇒ 预算装不下 ⇒ 拒（不是"进来再夹生成"）。
     #[test]
     fn prompt_that_fills_pool_is_rejected() {
         let l = l();
@@ -1569,7 +1453,7 @@ mod edge_tests {
             phase: PhaseSz::Prefill,
             spec: false,
         };
-        assert_eq!(a.cap_for(&l, &s, &t), 0);
+        assert_eq!(t.need_pages(&l), 6244, "199,744 + 64 tok = 6244 页");
         assert!(matches!(
             a.decide(&l, &s, &[], &t, 0),
             Verdict::Reject {
@@ -1579,9 +1463,9 @@ mod edge_tests {
         ));
     }
 
-    /// 超卖档：生成预算**不占设备** ⇒ 永不夹（哪怕 200 万 token 的 max_new）。
+    /// 超卖档：生成预算**不占设备** ⇒ 预算再大也只按工作集算页。
     #[test]
-    fn oversub_never_caps_generation() {
+    fn oversub_budget_does_not_touch_device_pages() {
         let mut l = l();
         l.oversub = true;
         l.workspace_pages = 32;
@@ -1589,45 +1473,12 @@ mod edge_tests {
         let s = store(4, 0, 0); // 只剩 4 页，但超卖只看工作集
         let t = gen(1, 10, 200_000, 2_000_000);
         let a = Admission::new();
-        assert_eq!(a.cap_for(&l, &s, &t), 2_000_000, "超卖不夹生成");
+        assert_eq!(t.need_pages(&l), 64, "超卖只看工作集 + chunk");
         assert_eq!(
             a.capacity(&l, &s, &[], &t).n_mem,
             0,
             "但设备侧仍按工作集算不进来"
         );
-    }
-
-    /// `n_target` 取三者最小：`max_batch=8, gdn_slots=2` ⇒ 新人预留只按 2 人算。
-    #[test]
-    fn n_target_is_min_of_batch_slots_and_concurrency() {
-        let mut l = l();
-        l.max_batch = 8;
-        l.gdn_slots = 2;
-        l.max_concurrency = 8;
-        let s = store(6250, 0, 0);
-        let a = Admission::new();
-        let t = gen(1, 10, 1000, 1000);
-        // usable 199,744；预留 = (n_target−1)×4096 = 4096；cap = 199,744−4,096−1,000
-        assert_eq!(a.n_target(&l), 2);
-        assert_eq!(a.cap_for(&l, &s, &t), 194_648);
-        // gdn_slots = 8 ⇒ 预留 7×4096
-        l.gdn_slots = 8;
-        assert_eq!(a.n_target(&l), 8);
-        assert_eq!(a.cap_for(&l, &s, &t), 199_744 - 7 * 4096 - 1000);
-    }
-
-    /// 新人预留会把在位者压到 < min_gen ⇒ **放弃预留**（在位者独占）。
-    #[test]
-    fn min_gen_floor_drops_the_newcomer_reserve() {
-        let l = l();
-        let s = store(6250, 0, 0);
-        let a = Admission::new();
-        // prompt 199,600 ⇒ 剩余 144 < min_gen 256 ⇒ 放弃预留（否则 cap=0）
-        let t = gen(1, 10, 199_600, 64);
-        assert_eq!(a.cap_for(&l, &s, &t), 144);
-        // 剩余 = 4,596 ⇒ 留 4,096 后还剩 500 ≥ 256 ⇒ 保预留
-        let t2 = gen(2, 11, 195_148, 64);
-        assert_eq!(a.cap_for(&l, &s, &t2), 500);
     }
 
     /// 缓存页可回收 ⇒ 计入容量；保留页要扣。
@@ -1750,7 +1601,6 @@ mod edge_tests {
         let mut l = l();
         l.max_batch = 3;
         l.gdn_slots = 3;
-        l.max_concurrency = 3;
         let mut p = PhaseSched::new();
         let acts = [
             gen(1, 10, 100, 64),
@@ -1806,7 +1656,6 @@ mod edge_tests {
         let mut l = l();
         l.max_batch = 3;
         l.gdn_slots = 3;
-        l.max_concurrency = 3;
         let mut sim = Sim::new(l, 6250);
         for i in 0..3 {
             sim.submit(super::scenario_tests::fresh(i + 1, 10 + i, 300, 24));
@@ -1830,10 +1679,7 @@ mod more_tests {
             page: 32,
             max_batch: 2,
             gdn_slots: 2,
-            max_concurrency: 2,
             reserve_pages: 8,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
             slice_every: 4,
             slice_tokens: 64,
             ..Default::default()
@@ -1872,7 +1718,7 @@ mod more_tests {
         let running = gen(1, 10, 199_000, 64);
         a.note_started(&running);
         let before = a.in_flight();
-        let used = running.need_pages(&l, usize::MAX);
+        let used = running.need_pages(&l);
         let s2 = StoreFacts {
             free_pages: 6250 - used,
             reserved_pages: used,
@@ -1893,28 +1739,6 @@ mod more_tests {
             "{v:?}"
         );
         assert_eq!(a.in_flight(), before, "在跑者名额不许被拒新扰动");
-    }
-
-    /// **预算夹紧真的进预留**：夹紧后的 `need_pages` 必须小于未夹紧（否则会撞墙）。
-    #[test]
-    fn clamped_budget_is_what_gets_reserved() {
-        let l = l();
-        let s = store(6250, 0, 0);
-        let a = Admission::new();
-        let t = gen(1, 10, 1000, 300_000);
-        let cap = a.cap_for(&l, &s, &t);
-        assert!(cap < 300_000, "应被夹（cap={cap}）");
-        let clamped = t.need_pages(&l, cap);
-        let uncapped = t.need_pages(&l, usize::MAX);
-        assert!(
-            clamped < uncapped,
-            "夹紧后预留必须变小（{clamped} vs {uncapped}）"
-        );
-        assert_eq!(
-            clamped,
-            (1000 + cap).div_ceil(32),
-            "预留 = prompt + min(max_new, cap)"
-        );
     }
 
     /// **缓存页可回收**：`free=0` 但 `cache>0` 时仍能进人（先逐缓存，不逐活跃）。
@@ -1949,7 +1773,6 @@ mod more_tests {
         l.chunk_pages = 32;
         l.max_batch = 16;
         l.gdn_slots = 16;
-        l.max_concurrency = 16;
         let a = Admission::new();
         let t = gen(1, 10, 10_000, 64);
         // 1024 页池：usable 1016；每人对 64 页 ⇒ 15
@@ -1983,7 +1806,7 @@ mod more_tests {
 }
 
 // ===========================================================================
-// §9 P0 验收（队列上限 / 超卖宿主腿）
+// §9 P0 验收（超卖宿主腿 / 磁盘腿）
 // ===========================================================================
 #[cfg(test)]
 mod p0_tests {
@@ -1994,11 +1817,7 @@ mod p0_tests {
             page: 32,
             max_batch: 1,
             gdn_slots: 1,
-            max_concurrency: 1,
             reserve_pages: 8,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
-            max_queue: 2,
             slice_every: 0,
             slice_tokens: 0,
             ..Default::default()
@@ -2035,7 +1854,6 @@ mod p0_tests {
         l.chunk_pages = 32;
         l.max_batch = 2;
         l.gdn_slots = 2;
-        l.max_concurrency = 2;
         let mut a = Admission::new();
         let t = gen(1, 10, 200_000, 64);
         let off = t.offload_pages(&l);
@@ -2082,7 +1900,6 @@ mod p0_tests {
         l.chunk_pages = 32;
         l.max_batch = 2;
         l.gdn_slots = 2;
-        l.max_concurrency = 2;
         let mut a = Admission::new();
         let t = gen(1, 10, 200_000, 64);
         let off = t.offload_pages(&l);
@@ -2104,7 +1921,8 @@ mod p0_tests {
         );
     }
 
-    /// 非超卖档不看宿主（全量驻留设备）—— 回归：别把 host 门误开。    #[test]
+    /// 非超卖档不看宿主（全量驻留设备）—— 回归：别把 host 门误开。
+    #[test]
     fn non_oversub_ignores_host_tier() {
         let l = l();
         let s = StoreFacts {

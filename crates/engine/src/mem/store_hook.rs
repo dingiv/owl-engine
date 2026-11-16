@@ -122,7 +122,6 @@ pub(crate) struct Release {
     pub(crate) turn: u64,
     pub(crate) session: u64,
     pub(crate) gdn_slot: usize,
-    pub(crate) ephemeral: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,14 +213,13 @@ impl StoreHook {
         Self::Acquire(Acquire::State(StateAcquire::Slot { key }))
     }
 
-    pub(crate) fn turn_end(turn: u64, session: u64, gdn_slot: usize, ephemeral: bool) -> Self {
+    pub(crate) fn turn_end(turn: u64, session: u64, gdn_slot: usize) -> Self {
         Self::Release(Release {
             kind: ReleaseKind::TurnEnd,
             publish: true,
             turn,
             session,
             gdn_slot,
-            ephemeral,
         })
     }
 
@@ -231,7 +229,6 @@ impl StoreHook {
         turn: u64,
         session: u64,
         gdn_slot: usize,
-        ephemeral: bool,
         publish: bool,
     ) -> Self {
         Self::Release(Release {
@@ -240,7 +237,6 @@ impl StoreHook {
             turn,
             session,
             gdn_slot,
-            ephemeral,
         })
     }
 
@@ -308,10 +304,10 @@ mod label_tests {
         assert_eq!(StoreHook::state(key).label(), "acquire.state.resident");
         assert_eq!(StoreHook::state_slot(key).label(), "acquire.state.slot");
         assert_eq!(
-            StoreHook::turn_end(1, 2, 0, false).label(),
+            StoreHook::turn_end(1, 2, 0).label(),
             "release.turn_end"
         );
-        assert_eq!(StoreHook::abort(1, 2, 0, true, false).label(), "release.abort");
+        assert_eq!(StoreHook::abort(1, 2, 0, true).label(), "release.abort");
         assert_eq!(StoreHook::idle(1).label(), "maintain.idle");
         assert_eq!(
             StoreHook::pressure_with_snap(1, 2).label(),

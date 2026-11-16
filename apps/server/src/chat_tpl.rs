@@ -409,7 +409,20 @@ mod tests {
                 owl_shared::testkit::report::skip(format_args!("资源清单缺 {gk}/{hk}"));
                 continue;
             };
-            let g = owl_models::formats::gguf::Gguf::open(std::path::Path::new(&gguf)).expect("开 GGUF");
+            let g = {
+                // 资源清单是**站点事实**（`testdata/resources.toml` 绑本机路径）:
+                // 文件不在盘上时按**跳过**处理，而不是把整套测试搞成红灯（环境缺件
+                // ≠ 代码回归）。
+                let gp = std::path::Path::new(&gguf);
+                let ht = std::path::Path::new(&hf_dir).join(TPL_FILE);
+                if !gp.is_file() || !ht.is_file() {
+                    owl_shared::testkit::report::skip(format_args!(
+                        "{gk}/{hk} 不在本机磁盘（资源清单指向的路径不存在）"
+                    ));
+                    continue;
+                }
+                owl_models::formats::gguf::Gguf::open(gp).expect("开 GGUF")
+            };
             let from_gguf = g.kv.opt_str("tokenizer.chat_template").expect("KV 形态").expect("模板在场");
             let hf = std::fs::read_to_string(std::path::Path::new(&hf_dir).join(TPL_FILE)).expect("HF 模板");
             // ① 字节等价

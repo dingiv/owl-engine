@@ -151,25 +151,21 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     match intent.goal {
         Goal::MaxContext => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=max-context:桶上界 1024");
-            b.set("runtime.prefill_tail_merge", 512i64.into(), "goal=max-context:尾块并入桶");
             b.set("pool.vram_budget", 0.99f64.into(), "goal=max-context:贴顶");
             b.set("pool.vram_reserve_mb", 714i64.into(), "goal=max-context:总预留(含图/warmup/碎片)");
         }
         Goal::MaxSpeed => {
             b.set("runtime.prefill_chunk", 1024i64.into(), "goal=max-speed:大块摊薄固定税");
-            b.set("runtime.prefill_tail_merge", 0i64.into(), "goal=max-speed:不做尾合并");
             b.set("pool.vram_budget", 0.99f64.into(), "goal=max-speed:贴顶");
             b.set("pool.vram_reserve_mb", 970i64.into(), "goal=max-speed:总预留(含图/warmup/碎片)");
         }
         Goal::Balanced => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=balanced");
-            b.set("runtime.prefill_tail_merge", 512i64.into(), "goal=balanced");
             b.set("pool.vram_budget", 0.97f64.into(), "goal=balanced");
             b.set("pool.vram_reserve_mb", 970i64.into(), "goal=balanced:总预留");
         }
         Goal::LowMemory => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=low-memory:小激活面");
-            b.set("runtime.prefill_tail_merge", 0i64.into(), "goal=low-memory");
             b.set("pool.vram_budget", 0.99f64.into(), "goal=low-memory");
             b.set("pool.vram_reserve_mb", 970i64.into(), "goal=low-memory:总预留");
         }
@@ -185,7 +181,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     let _ = tp;
     if c > 8 {
         warnings.push(format!(
-            "concurrency={c} > 8:max_batch 限制为 8(Concat 8 槽),其余请求按 max_concurrency 排队"
+            "concurrency={c} > 8:max_batch 限制为 8(Concat 8 槽),其余请求在引擎队列里等"
         ));
     }
     if c > 1 {
@@ -194,8 +190,9 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
              非超卖档池按上下文×{c} 计"
         ));
     }
-    b.set("pool.gdn_slots", (c as i64).into(), "intent.concurrency → GDN 状态格");
-    b.set("runtime.max_concurrency", (c as i64).into(), "intent.concurrency → 并发闸门");
+    // 并发唯一真源 = `pool.gdn_slots`（2026-11-16：`[runtime] max_concurrency` 已删；
+    // 服务面 permit 数与引擎活跃槽位上限都从它来）
+    b.set("pool.gdn_slots", (c as i64).into(), "intent.concurrency → GDN 状态格 = 并发唯一真源");
     b.set("runtime.max_batch", (max_batch as i64).into(), "intent.concurrency → 合批上限(≤8)");
 
     match intent.spec {
@@ -361,9 +358,10 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
 
     // ── ⑥ context 求解(显式 max_seq 优先;池不含在配置里) ──
 
+    // 尾块合并 = 引擎定值 0（2026-11-16：`runtime.prefill_tail_merge` 已删）
     let (act, act_note) = memory::activation_for(
         get_usize(&out, "runtime.prefill_chunk").unwrap_or(512),
-        get_usize(&out, "runtime.prefill_tail_merge").unwrap_or(0),
+        0,
     );
     let inp = MemoryInputs {
         total_bytes: hw.total_bytes,
@@ -695,10 +693,9 @@ mode = "greedy"
 
         // 上下文/并发/预填充
         assert_eq!(c.runtime.max_seq, 143_360, "context=max ⇒ 合并预留后的模型上限");
-        assert_eq!(c.runtime.max_concurrency, 1);
+        assert_eq!(c.pool.gdn_slots, 1, "并发唯一真源 = gdn_slots");
         assert_eq!(c.runtime.max_batch, 1);
         assert_eq!(c.runtime.prefill_chunk, 512);
-        assert_eq!(c.runtime.prefill_tail_merge, 512);
 
         // 复用关(reuse=off ⇒ 快照/宿主/前缀缓存全零)
         assert_eq!(c.pool.snap_max, 0, "reuse=off ⇒ 快照池关");
@@ -808,8 +805,10 @@ context = "max"
         super::apply(&mut v, &mut origins).expect("resolve");
         assert_eq!(get_usize(&v, "runtime.prefill_chunk"), Some(1024));
         assert_eq!(origins.get("runtime.prefill_chunk"), Some(&Origin::Cli));
-        // 激活面随之变化(1024 档),context=max 解更小
-        assert_eq!(get_usize(&v, "runtime.max_seq"), Some(106_496));
+        // 激活面随之变化(1024 档),context=max 解更小。
+        // 2026-11-16:尾块合并退休(=0)⇒ 激活面只按 chunk 算(旧口径 chunk+512),
+        // 解出的 ctx 比旧口径更大(106,496 → 126,976)。
+        assert_eq!(get_usize(&v, "runtime.max_seq"), Some(126_976));
     }
 
     /// 意图与显式 [model] 冲突 = 拒(模型只能有一个真源)

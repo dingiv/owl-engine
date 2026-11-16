@@ -47,6 +47,7 @@ pub mod leg;
 pub mod moves;
 pub mod plan;
 pub mod policy;
+pub mod pressure;
 pub mod rel;
 pub mod reservations;
 pub mod select;
@@ -78,6 +79,7 @@ pub use leg::{
     LegStats, OutPlan, PieceSpec, PoolLayout, ReadPlan, SkipWhy, HOST_PLACEHOLDER,
 };
 pub use moves::{bytes_of, download_span, offload_to_host, onload_from_host, upload_span};
+pub use pressure::{PressurePolicy, PressureSignals};
 pub use plan::{
     CardPlan, ComponentId, MemComponent, MemoryPlan, PlanCheck, PlanPolicy, PlanSource, PoolPlan,
     TierPlan,

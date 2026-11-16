@@ -164,6 +164,13 @@ pub struct AgentSession {
     /// 重拍 159MiB 才能改档。这里记录每个边界实际拍到的 `SnapKey`,
     /// 下一轮 submit 只做**重分类**(不搬内容)。`None` = 该边界没拍/已被逐出。
     pub msg_snap_keys: Vec<Option<crate::SnapKey>>,
+    /// **上一轮 prompt 段的 padded 长度**（生成段接在其后）。
+    ///
+    /// 内容身份只要求覆盖到这里：生成段是**模型产物**，客户端回填时按文本
+    /// 重新渲染再分词，末段本来就对不上（2026-11-16 真机定谳：要求覆盖整账
+    /// 会让每一轮都认不出会话 ⇒ 会话表每轮 +1）。`0` = 还没收过口 ⇒ 不可
+    /// 用于身份匹配。
+    pub prompt_boundary: usize,
     /// **链哈希游标**(快照键真源):已哈希整块数 + 链尾内容身份。
     /// 懒惰推进(只喂新增整块)⇒ 全 turn O(n);键必须是**内容身份**
     /// (物理块号会被回收复用 —— `crate::ChainCursor` 头注)。
@@ -188,6 +195,7 @@ impl AgentSession {
             msg_snaps: Vec::new(),
             msg_snap_keys: Vec::new(),
             chain: ChainCursor::new(),
+            prompt_boundary: 0,
             img_spans: Vec::new(),
             pads: Vec::new(),
             positions: Vec::new(),
@@ -204,6 +212,59 @@ impl AgentSession {
     pub fn guard(&self, prompt: &[u32]) -> bool {
         prompt.len() >= self.tokens.len()
             && self.tokens == prompt[..self.tokens.len()]
+    }
+
+    /// **上一轮 prompt 段的可见长度**（unpadded；内容身份的参考长度）。
+    ///
+    /// `None` = 还没收过口（`prompt_boundary = 0`）或 pad 账坏（越界/乱序/
+    /// 跨出 prompt 段）—— 调用方据此把该会话排除在身份匹配之外。
+    pub fn prompt_visible_len(&self) -> Option<usize> {
+        if self.prompt_boundary == 0 || self.prompt_boundary > self.tokens.len() {
+            return None;
+        }
+        let mut cursor = 0usize;
+        let mut skip = 0usize;
+        for &(lo, hi) in &self.pads {
+            if lo < cursor || hi <= lo || hi > self.prompt_boundary {
+                return None;
+            }
+            skip += hi - lo;
+            cursor = hi;
+        }
+        Some(self.prompt_boundary - skip)
+    }
+
+    /// **客户端可见前缀的公共长度**(内容身份;2026-11-16)。
+    ///
+    /// 与 [`Self::guard`] 的分工:`guard` 比的是 **padded** 序列(它守的是
+    /// KV 账);这里比的是 **unpadded**(客户端可见)序列 —— 会话身份来自
+    /// 客户端发来的原文,图像 pad 是引擎侧派生量,不参与身份。
+    ///
+    /// 实现上**跳过 pad 区间**而不是构造 unpad 副本(零分配;会话账可达
+    /// 数十万 token,每轮重建副本会把 submit 变成 O(历史) 拷贝)。
+    ///
+    /// 返回 = 从头逐 id 相同的可见 token 数。`pads` 账非法(越界/乱序/
+    /// 空区间)⇒ 按"到此为止"处理:宁可判成不是同一条链,也不按坏账拼接。
+    pub fn common_prefix_text(&self, prompt: &[u32]) -> usize {
+        let mut i = 0usize;
+        let mut pad = 0usize;
+        let mut n = 0usize;
+        while i < self.tokens.len() && n < prompt.len() {
+            while pad < self.pads.len() && self.pads[pad].0 <= i {
+                let (lo, hi) = self.pads[pad];
+                if lo != i || hi <= lo || hi > self.tokens.len() {
+                    return n;
+                }
+                i = hi;
+                pad += 1;
+            }
+            if i >= self.tokens.len() || self.tokens[i] != prompt[n] {
+                break;
+            }
+            i += 1;
+            n += 1;
+        }
+        n
     }
 
     /// **首个分叉位置**(诊断;`None` = 前缀全同)。
@@ -225,6 +286,8 @@ impl AgentSession {
     /// 把旧 tail 的 Dense 归属丢掉(旧 key 永久留在 Dense 档,见 2026-11-13
     /// 前置评审)。
     pub fn reset(&mut self) {  // FIXME: 不推荐使用可变范式。你要用新的，你就直接创建一个新的，你不要搞这个什么reset。把那个不要的东西销毁掉，创建一个全全新的session
+        // 内容身份的参考边界随账清零（历史长度唯一真源 = `tokens.len()`）
+        self.prompt_boundary = 0;
         self.tokens.clear();
         self.block_hashes.clear();
         self.chain.reset();
@@ -352,6 +415,9 @@ impl AgentSession {
         self.tokens.clear();
         self.tokens.extend_from_slice(prompt);
         self.tokens.extend_from_slice(generated);
+        // 内容身份只要求覆盖**上一轮 prompt 段**（生成段由客户端按文本重渲染，
+        // 尾部必然不同 —— 2026-11-16 真机定谳）
+        self.prompt_boundary = prompt.len();
         self.positions.clear();
         self.positions.extend_from_slice(positions);
         self.max_pos = self
@@ -405,6 +471,16 @@ pub struct SessionAssets {
     /// LRU 触达时钟(越小越老；仅淘汰顺序用)。
     pub last_use: u64,
 }
+
+/// **内容身份匹配的尾部容差**（token）。
+///
+/// 客户端把新消息接在会话账后面时，BPE 会在**接缝**处重新合并（会话账末尾
+/// 1~3 个 token 的编号可能变）⇒ "短方被完整覆盖"允许末尾这么多对不上。
+///
+/// **不能大**：容差就是"认错对话"的窗口 —— 容差 ≥ chat 模板前缀长度时，
+/// 无关对话只靠模板前缀就能匹配上（2026-11-16 真机故障形态：每个请求都
+/// 命中 MRU 会话，`cached_tokens` 报一个假 32）。
+pub const MATCH_TAIL_TOLERANCE: usize = 4;
 
 /// 会话注册表(E2b 多会话:会话 × 块链 × GDN 格绑定;池容量策略在
 /// 引擎侧账房)
@@ -467,6 +543,67 @@ impl SessionTable {
         s.last_use = tick;
         self.next_id = next.max(id + 1);
         Ok((id, s))
+    }
+
+    /// **会话身份 = 内容身份**:在**空闲**会话里找与 `prompt` 最长公共前缀的
+    /// 一条(原始算法 §32;2026-11-16)。
+    ///
+    /// - **完整覆盖**：公共前缀必须盖住 `min(会话可见长, prompt 长)` ——
+    ///   同一条对话的续写（会话账 ⊑ prompt）或客户端截短重发（prompt ⊑ 会话账）
+    ///   都满足；只在**模板前缀**上撞车的无关对话盖不住 ⇒ 不算。
+    ///   ⚠️ 这条 2026-11-16 真机定谳：只按"≥ 一页"判会让所有请求都匹配到
+    ///   MRU 会话（chat 模板的 `<|im_start|>system…` 本身就超过一页），
+    ///   于是每轮都把别人的账 rebase 掉（`cached_tokens` 假命中 32）。
+    /// - `min_tokens` = 命中下限(实参 = 一页):更短的对话没有区分度;
+    /// - 平手取 `last_use` 最大(MRU):同前缀的两条会话里,刚用过的那条才是
+    ///   客户端正在续写的那条;
+    /// - `busy` = 活跃/排队会话:它们的账是"未来态"(尾部正在写),不参与匹配
+    ///   —— 匹配到它们会让 P4 的同会话串行把两个不相干的请求串成一串。
+    ///
+    /// 返回 `(会话 id, 命中可见 token 数)`;`None` = 没有会话够格(调用方新建)。
+    /// 匹配是**只读**的(不 touch `last_use`):"命中"只有引擎确认要续写时才成立。
+    pub fn match_prefix(
+        &self,
+        prompt: &[u32],
+        min_tokens: usize,
+        busy: &std::collections::HashSet<u64>,
+    ) -> Option<(u64, usize)> {
+        if prompt.is_empty() {
+            return None;
+        }
+        // (id, 命中长度, last_use)
+        let mut best: Option<(u64, usize, u64)> = None;
+        for s in self.sessions.values() {
+            if busy.contains(&s.id) {
+                continue;
+            }
+            // 上界剪枝:(tokens 的可见长 ≤ tokens.len(),故它只是**上界**)
+            // 连上界都赢不过现最佳就不必扫。取 `<` 而非 `<=`:平手仍可能
+            // 靠 MRU 胜出。
+            if let Some((_, bn, _)) = best {
+                if s.tokens.len().min(prompt.len()) < bn {
+                    continue;
+                }
+            }
+            // 参考长 = **上一轮 prompt 段**（不含生成段）。账不可信（未收口/
+            // pad 坏）⇒ 该会话退出身份匹配，不猜一个数字。
+            let Some(ref_len) = s.prompt_visible_len() else { continue };
+            let n = s.common_prefix_text(prompt);
+            // 短的一方必须被完整覆盖（接缝处允许 `MATCH_TAIL_TOLERANCE`）
+            if n < min_tokens
+                || n + MATCH_TAIL_TOLERANCE < ref_len.min(prompt.len())
+            {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((_, bn, bl)) => n > bn || (n == bn && s.last_use > bl),
+            };
+            if better {
+                best = Some((s.id, n, s.last_use));
+            }
+        }
+        best.map(|(id, n, _)| (id, n))
     }
 
     /// E5:LRU 逐出候选(最老触达;调用方保证无活跃 turn ——
@@ -690,17 +827,6 @@ impl SessionBank {
         }
     }
 
-    /// 临时会话烧毁(complete/abandon 共用;块链归账房 + 表移除释放格,
-    /// 双链同还)。关闭失败不许静默(律 #1)。
-    pub fn burn(&mut self, session_id: u64) {
-        if let Err(e) = self.release_session_chains(session_id) {
-            owl_shared::log_warn!("session", "临时会话 #{session_id} 链归还失败: {e}");
-        }
-        if let Err(e) = self.sessions.close(session_id) {
-            owl_shared::log_warn!("session", "临时会话 #{session_id} 关闭失败: {e}");
-        }
-    }
-
     /// 单会话双链归还(target 链 + MTP 链;逐出/关闭/烧毁共用的
     /// 复合操作 —— 链归还必须与账本操作同屋,防单边清理)。
     /// 归还失败(槽引用账不平)**不许静默**:记 warn 再抛(律 #1)。
@@ -826,46 +952,9 @@ impl SessionBank {
         Ok(())
     }
 
-    /// **会话表软上限**（LRU；2026-11-15 自 engine 下沉）。
-    ///
-    /// `busy` = 活跃/排队 turn 的会话（不许淘汰）；`protect` = 本次请求的
-    /// 会话（即使还不在 busy 里也保留）。`need_slot` = 本次是否**会新建**会话：
-    /// - `true`：要腾到 `cap-1`，给新会话留位；
-    /// - `false`：复用已有会话，只压到 `cap`，不得为不存在的“新会话”多淘汰。
-    ///
-    /// 返回实际淘汰数。
-    pub fn enforce_session_cap(
-        &mut self,
-        cap: usize,
-        busy: &std::collections::HashSet<u64>,
-        need_slot: bool,
-    ) -> Result<usize> {
-        if cap == 0 {
-            return Ok(0);
-        }
-        let target = if need_slot {
-            cap.saturating_sub(1)
-        } else {
-            cap
-        };
-        let mut busy = busy.clone();
-        let mut evicted = 0usize;
-        while self.sessions.len() > target {
-            let Some(victim) = self.sessions.lru_victim_excluding(&busy) else {
-                break;
-            };
-            // 失败也记入 busy，避免同一候选死循环；账房错误只 WARN（软上限）。
-            busy.insert(victim);
-            match self.close(victim) {
-                Ok(()) => evicted += 1,
-                Err(e) => owl_shared::log_warn!(
-                    "session",
-                    "会话上限淘汰失败（session {victim:#x}，继续）：{e}"
-                ),
-            }
-        }
-        Ok(evicted)
-    }
+    // **会话表软上限已退休**（2026-11-16 用户裁决：会话数不设上限 ——
+    // 常驻成本 = 元数据 + 可驱逐资产，上限由池 + host/disk 预算 + 淘汰机制给；
+    // 硬约束只有"同时推进" = `pool.gdn_slots`）。原 `enforce_session_cap` 删除。
 
     /// MTP 链归还:线性档走块腿;ring 档只清表(页池固定,不归槽)。
     pub fn release_mtp_table(&mut self, table: &mut Vec<u32>) -> Result<()> {
@@ -1029,36 +1118,6 @@ mod bank_tests {
         SessionBank::new(p, inputs, policy, target, mtp, cell).expect("装配块腿")
     }
 
-    /// **会话表软上限下沉后的门**：空闲 LRU 被淘汰，忙碌会话保留。
-    #[test]
-    fn enforce_cap_evicts_idle_lru_and_keeps_busy() {
-        let mut bank = bank_of(plan(64, 8, true, false));
-        for i in 1..=3u64 {
-            bank.get_or_create(Some(i)).expect("建会话");
-        }
-        let mut busy = std::collections::HashSet::new();
-        busy.insert(2u64);
-        let n = bank.enforce_session_cap(3, &busy, true).expect("淘汰");
-        assert_eq!(n, 1, "cap=3 且要新建会话：只该淘汰 1 个");
-        assert!(bank.sessions.get(1).is_none(), "最老空闲 1 应被淘汰");
-        assert!(bank.sessions.get(2).is_some(), "忙碌会话不许淘汰");
-        assert!(bank.sessions.get(3).is_some(), "新会话保留");
-    }
-
-    /// **复用已有会话时不得多淘汰**：cap 已满但本次不新建会话。
-    #[test]
-    fn enforce_cap_does_not_evict_for_existing_session() {
-        let mut bank = bank_of(plan(64, 8, true, false));
-        for i in 1..=3u64 {
-            bank.get_or_create(Some(i)).expect("建会话");
-        }
-        let mut busy = std::collections::HashSet::new();
-        busy.insert(2u64);
-        let n = bank.enforce_session_cap(3, &busy, false).expect("淘汰");
-        assert_eq!(n, 0, "复用已有会话：cap=3/len=3 不应淘汰");
-        assert!(bank.sessions.get(1).is_some(), "空闲会话必须保留");
-    }
-
     /// **release_turn_table 不得清历史**：turn 末释放设备表后，guard 仍能
     /// 用 tokens 判断客户端重发的历史是否连续（实际复用面另由内容树决定）。
     #[test]
@@ -1163,6 +1222,139 @@ mod bank_tests {
             carry_msg_snap_keys(&old_points, &[Some(a)], &[32, 64]),
             vec![Some(a), None],
             "old_keys 短于 old_points 时按缺键处理(不 panic)"
+        );
+    }
+
+    /// **内容身份三态**（`match_prefix`；2026-11-16）。
+    ///
+    /// 判据 = **短的一方被完整覆盖**：同一条对话的续写（会话账 ⊑ prompt）
+    /// 命中；只在模板前缀上相同的无关对话不命中（真机定谳：只按"≥ 一页"判
+    /// 会让所有请求串到 MRU 会话）。
+    #[test]
+    fn match_prefix_requires_full_coverage_of_the_shorter_side() {
+        let mut st = SessionTable::new();
+        let a_toks: Vec<u32> = (0..40).collect();
+        let b_toks: Vec<u32> = (0..40).chain(100..140).collect();
+        {
+            let (_, a) = st.get_or_create(Some(1)).expect("A");
+            a.tokens = a_toks.clone();
+            a.prompt_boundary = a_toks.len();
+            let (_, b) = st.get_or_create(Some(2)).expect("B");
+            b.tokens = b_toks.clone();
+            b.prompt_boundary = b_toks.len();
+        }
+        let busy = std::collections::HashSet::new();
+
+        // A 的续写（prompt = A 账 + 新 12 token）：A 被完整覆盖 ⇒ 命中 A；
+        // B 只覆盖到第 40 个（prompt 52 > 40 + 容差）⇒ 不构成完整覆盖 ⇒ 不参与。
+        let mut p = a_toks.clone();
+        p.extend(7..19);
+        assert_eq!(st.match_prefix(&p, 32, &busy), Some((1, 40)));
+
+        // **接缝容差**：BPE 会在"会话账末尾 + 新消息"的接缝处重合并（末尾
+        // 几个 token 变号）⇒ 允许末尾 `MATCH_TAIL_TOLERANCE` 个对不上。
+        let mut seam = a_toks.clone();
+        let n = seam.len();
+        seam[n - 2] = 999;
+        seam[n - 1] = 998;
+        let (seam_id, seam_n) = st
+            .match_prefix(&seam, 32, &busy)
+            .expect("接缝容差：2 个 token 变号仍应认到会话");
+        assert_eq!(seam_n, 38, "命中长度 = 分歧点（38）");
+        assert!(
+            seam_id == 1 || seam_id == 2,
+            "A/B 都被覆盖 ⇒ 按 MRU 取（实际 {seam_id}）"
+        );
+
+        // B 的续写：B（80）完整覆盖，A（40）也覆盖但短 ⇒ 取更长 / 更具体。
+        let mut pb = b_toks.clone();
+        pb.extend([9]);
+        assert_eq!(st.match_prefix(&pb, 32, &busy), Some((2, 80)));
+
+        // 全新对话（只有 4 token 公共前缀）⇒ 不完整覆盖 ⇒ None。
+        assert_eq!(st.match_prefix(&[0, 1, 2, 3, 99], 32, &busy), None);
+        // 空 prompt ⇒ None（没有身份证据）。
+        assert_eq!(st.match_prefix(&[], 32, &busy), None);
+        // **模板前缀撞车**：C 与 prompt 只共享 A 那 40 个 token（= 系统提示），
+        // 之后各自展开 40 个不同 token ⇒ 不算同一条对话（C 出局），
+        // 而 A 账（40）被 prompt 完整覆盖 ⇒ 命中 A（截短续写）。
+        let mut p2: Vec<u32> = a_toks.clone();
+        p2.extend(700..740);
+        let (_, c) = st.get_or_create(Some(3)).expect("C");
+        c.tokens = a_toks.iter().copied().chain(500..540).collect();
+        c.prompt_boundary = c.tokens.len();
+        assert_eq!(st.match_prefix(&p2, 32, &busy), Some((1, 40)));
+    }
+
+    /// 忙会话不参与匹配（尾账正在写，是未来态）。
+    #[test]
+    fn match_prefix_skips_busy_sessions() {
+        let mut st = SessionTable::new();
+        let toks: Vec<u32> = (0..64).collect();
+        {
+            let (_, s) = st.get_or_create(Some(5)).expect("建会话");
+            s.tokens = toks.clone();
+            s.prompt_boundary = toks.len();
+        }
+        let mut busy = std::collections::HashSet::new();
+        busy.insert(5u64);
+        assert_eq!(st.match_prefix(&toks, 32, &busy), None, "忙会话不得被匹配");
+        busy.clear();
+        assert_eq!(st.match_prefix(&toks, 32, &busy), Some((5, 64)));
+    }
+
+    /// 图像 pad 不算身份：会话账是 padded 序列，客户端 prompt 是原文。
+    #[test]
+    fn match_prefix_compares_visible_tokens_only() {
+        let mut st = SessionTable::new();
+        {
+            let (_, s) = st.get_or_create(Some(1)).expect("建会话");
+            // 可见 = [1,2,3,4,5]；[900,901] 是图像 pad 块。
+            s.tokens = vec![1, 2, 3, 900, 901, 4, 5];
+            s.pads = vec![(3, 5)];
+            s.prompt_boundary = s.tokens.len();
+        }
+        let busy = std::collections::HashSet::new();
+        // 可见账 = [1..5]（5 tok）被 prompt 完整覆盖 ⇒ 命中。
+        assert_eq!(st.match_prefix(&[1, 2, 3, 4, 5, 6], 3, &busy), Some((1, 5)));
+        // 坏 pad 账（越界）不得拼接出假命中：公共前缀止于 pad 之前（3 tok）
+        // ⇒ 盖不住"短的一方"（5）⇒ None（宁可不认，也不认错）。
+        st.session_mut(1).expect("会话").pads = vec![(3, 99)];
+        assert_eq!(st.match_prefix(&[1, 2, 3, 4, 5, 6], 3, &busy), None);
+    }
+
+    /// **生成段不参与身份**（真机定谳 2026-11-16）：会话账 = 上一轮 prompt +
+    /// 模型生成的尾部；客户端回填的是按文本重渲染的 prompt ⇒ 尾部对不上是
+    /// **常态**。身份判据只要求覆盖到上一轮的 **prompt 边界**。
+    #[test]
+    fn match_prefix_ignores_generated_tail() {
+        let mut st = SessionTable::new();
+        let prompt: Vec<u32> = (0..64).collect();
+        let generated: Vec<u32> = (900..924).collect(); // 模型产物（客户端回填后不同）
+        {
+            let (_, s) = st.get_or_create(Some(1)).expect("建会话");
+            s.tokens = prompt.iter().copied().chain(generated).collect();
+            s.prompt_boundary = prompt.len();
+        }
+        let busy = std::collections::HashSet::new();
+        // 续写：上一轮 prompt + 新的用户消息（客户端重渲染 ⇒ 生成段不出现）
+        let mut next = prompt.clone();
+        next.extend([700, 701, 702]);
+        assert_eq!(
+            st.match_prefix(&next, 32, &busy),
+            Some((1, 64)),
+            "覆盖到 prompt 边界即算同一条会话"
+        );
+        // 未收口的会话（prompt_boundary = 0）不得参与匹配
+        {
+            let (_, s) = st.get_or_create(Some(2)).expect("建会话");
+            s.tokens = (0..64).collect();
+            s.prompt_boundary = 0;
+        }
+        assert_eq!(
+            st.match_prefix(&next, 32, &busy),
+            Some((1, 64)),
+            "未收口会话出局，仍命中已收口的那条"
         );
     }
 

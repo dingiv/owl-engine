@@ -567,7 +567,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 new_fed,
                 prompt_len,
                 self.boot.cfg.prefill_chunk,
-                self.boot.cfg.knobs.prefill_tail_merge,
+                crate::engine::PREFILL_TAIL_MERGE,
                 Self::prefill_align_page(
                     self.boot.cfg.knobs.prefill_align_tail,
                     self.boot.cfg.knobs.prefix_cache,
@@ -672,7 +672,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 new_fed,
                 prompt_len,
                 self.boot.cfg.prefill_chunk,
-                self.boot.cfg.knobs.prefill_tail_merge,
+                crate::engine::PREFILL_TAIL_MERGE,
                 Self::prefill_align_page(
                     self.boot.cfg.knobs.prefill_align_tail,
                     self.boot.cfg.knobs.prefix_cache,

@@ -54,24 +54,16 @@ quant = "w4a8"
 prefill_shadow = false
 
 [runtime]
-# 会话表软上限(0 = 不限;>0 = 新请求前按 LRU 淘汰空闲会话)
-max_sessions = 0
 # 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
 admission_on_full = "reject"
-keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # ⚠️ a8 的显存体积比 a16 大(marlin 工作区 84MiB×2 + 激活量化缓冲):
 # 63.4k 档实测 8k 请求就撞硬预算(拒发 19-34MiB)⇒ 全特性档收到 **57.3k**
 # (32k/24k 连发零拒发,余量 1.3GB)。要 63k 就不开 a8(回到 w4a16)。
 max_seq = 57344
-max_concurrency = 1
 # **prefill 块长 2048 / 尾块 0**(2026-10-27 逐档实测,详见 full.toml 注):
 # 4k 1320→1360、8k 1308→1358 t/s(+3.3%),32k TTFT 27.9→26.6s;
 # 4096 会撞显存硬预算(272MiB 工作区)⇒ 2048 是单卡天花板。
 prefill_chunk = 2048
-prefill_tail_merge = 0
-# pi 不发 session 键:隐式会话 0 让工具轮/图片删除有稳定会话;
-# 跨会话前缀仍由内容寻址缓存兜底。
-implicit_session = true
 
 [sampling]
 # 2026-10-30 定调（复读立案）：本档原为 `greedy`（继承 full.toml）。

@@ -1,0 +1,33 @@
+# ============================================================================
+# chat 模板变量（**不属于引擎配置**；2026-11-16 用户裁决）
+# ============================================================================
+#
+# 位置（优先级）：
+#   1. `[server] template_vars = "<path>"`（相对 = 相对模型目录）
+#   2. `<model.path>/chat_template.toml`（快照旁边，跟模型走）
+#   3. 无文件 = 空表（模板取自身缺省，与 HF oracle 逐字节同源）
+#
+# 形态 = **扁平 TOML 表**，一个键 = 一个 jinja 变量（直通模板，不做映射）。
+# 请求体的 `chat_template_kwargs` 覆盖这里；这里覆盖模板自带缺省。
+#
+# 改这个文件不需要重启引擎？—— 需要（模板在 boot 期编译一次）。
+# `--check` 会校验本文件（坏 TOML / 坏 tool_call_format = FAIL）。
+# ============================================================================
+
+# 工具调用块格式：xml（模板缺省）| json。
+# ⚠️ 模板按它选分支；解析器按**内容形状**自识别（两格式都认）。
+# 写坏值 = 启动期拒启（不静默回落）。
+tool_call_format = "xml"
+
+# 有工具就关思考：Qwen3.8 官方模板变量
+# （模板里 `{%- if auto_disable_thinking_with_tools and _has_tools %}`）。
+# 开 = agent 场景"工具轮不思考"；缺省 false = 模板缺省。
+auto_disable_thinking_with_tools = false
+
+# 思考档位缺省（OpenAI 同名协议值；请求带 `reasoning_effort` 时以请求为准）。
+# 值直通模板：none / low / medium / high / xhigh…（不做映射）。
+# reasoning_effort = "medium"
+
+# 其它模板变量按需直通（值只接 TOML 标量/数组/表）：
+# enable_thinking = true
+# preserve_thinking = false

@@ -528,23 +528,15 @@ impl<D: DeviceClient> RunningEngine<D> {
             page,
             max_batch: self.boot.cfg.knobs.max_batch.max(1),
             gdn_slots: self.boot.cfg.knobs.gdn_slots.max(1),
-            // 引擎不知道服务面的请求上限 ⇒ 用格数当 n_target 的上界
-            // （`n_target = min(max_batch, gdn_slots, max_concurrency)`）
-            max_concurrency: self.boot.cfg.knobs.gdn_slots.max(1),
             oversub: self.boot.cfg.knobs.kvmem_virtualization,
             workspace_pages: self.boot.cfg.knobs.workspace_per_req.div_ceil(page),
             chunk_pages: self.boot.cfg.prefill_chunk.div_ceil(page),
-            // 池保留：0 = 自动（按池比例、上限 8 页；小池不被"保留"吃光）
-            reserve_pages: if self.boot.cfg.knobs.reserve_pages == 0 {
-                (self.dev.pool.geom.nb / 64).min(8)
-            } else {
-                self.boot.cfg.knobs.reserve_pages
-            },
+            // 池保留 = **引擎自算**（按池比例、上限 8 页；小池不被"保留"
+            // 吃光）。2026-11-16 认领：这个值是池几何的函数，操作员没有
+            // 信息量去覆盖它（旧键 `[runtime] reserve_pages` 已删）。
+            reserve_pages: (self.dev.pool.geom.nb / 64).min(8),
             slice_every: self.boot.cfg.knobs.slice_every,
             slice_tokens: self.boot.cfg.knobs.slice_tokens,
-            newcomer_min_tokens: self.boot.cfg.knobs.newcomer_min_tokens,
-            min_gen_tokens: self.boot.cfg.knobs.min_gen_tokens,
-            max_queue: self.boot.cfg.knobs.max_queue,
         }
     }
 
@@ -555,7 +547,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             session: t.session_id,
             prompt_tokens: t.prompt_ids.len(),
             cached_tokens: t.cached,
-            max_new: t.spec.max_new,
+            max_new: t.reserve_new,
             fed: 0,
             out_len: 0,
             phase: crate::sched_policy::PhaseSz::Prefill,
@@ -571,7 +563,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             session: a.session_id,
             prompt_tokens: a.prompt_ids.len(),
             cached_tokens: a.cached_start.min(a.prompt_ids.len()),
-            max_new: a.max_new,
+            max_new: a.reserve_new,
             fed,
             out_len: a.out.len(),
             phase: if fed < a.prompt_ids.len() {
@@ -647,7 +639,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 0,
                 turn.prompt_ids.len(),
                 self.boot.cfg.prefill_chunk,
-                self.boot.cfg.knobs.prefill_tail_merge,
+                crate::engine::PREFILL_TAIL_MERGE,
                 Self::prefill_align_page(
                     self.boot.cfg.knobs.prefill_align_tail,
                     self.boot.cfg.knobs.prefix_cache,
@@ -859,13 +851,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 回滚键 = 当前 turn 的第一个已知边界;capture 后会被更新。
             last_snap: restore_key,
             started_ms,
-            ephemeral: turn.ephemeral,
             prompt_ids: turn.prompt_ids,
             msg_snaps: turn.msg_snaps,
             msg_snap_classes: turn.msg_snap_classes,
             msg_snap_keys: turn.msg_snap_keys,
             evict_snaps: turn.evict_snaps,
             max_new: turn.spec.max_new,
+            reserve_new: turn.reserve_new,
             positions: turn.positions,
             next_rope_pos,
             rope_gap: turn.positions_gap,
@@ -1667,6 +1659,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             s.block_hashes = d.hashes;
             s.tokens.clear();
             s.tokens.extend_from_slice(&turn.prompt_ids[..d.cached_len]);
+            // 内容身份的参考边界 = 落账的 prompt 前缀（本 turn 还没生成段）
+            s.prompt_boundary = d.cached_len;
             // **中途落账也必须自洽**：Abort 不会再 commit_turn；pad/spans 若仍
             // 指向被截掉的后缀，下一轮 unpad 会 400。
             let (spans, pads) =
@@ -2168,14 +2162,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                     .unwrap_or(0);
                 owl_shared::log_debug!(
                     "admit-dbg",
-                    "head turn {} prompt={} max_new={} | free={} reserved={} usable={} cap={} run={} in_flight={}",
+                    "head turn {} prompt={} 预算={} | free={} reserved={} usable={} run={} in_flight={}",
                     head_facts.turn,
                     head_facts.prompt_tokens,
                     head_facts.max_new,
                     s.free_pages,
                     s.reserved_pages,
                     s.usable_pages(l.reserve_pages),
-                    self.turns.admission.cap_for(&l, &s, &head_facts),
                     running.len(),
                     s.in_flight_turns
                 );
@@ -2190,8 +2183,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                         });
                         // **Grant 必须在判决之后发**：否则它会进入本次判决的
                         // `StoreFacts.reserved_pages`，变成“自己占自己的位”。
-                        let cap = self.turns.admission.cap_for(&l, &s, &head_facts);
-                        let reserved_slots = head_facts.need_pages(&l, cap).max(1);
+                        // 预留 = **整份预算**（上下文 + 本档最大输出长度）
+                        let reserved_slots = head_facts.need_pages(&l).max(1);
                         // **分配面**必须覆盖整条块表（超卖档的准入面只是工作集，
                         // 后续 prefill 仍会按 chunk 长表）；非超卖档两者相等。
                         // 上界单源 = `RunningEngine::chain_alloc_slots`（
@@ -2237,7 +2230,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         .ok_or_else(|| ModelError::EngineInvariant {
                             what: "admission: 刚判过的候选消失".into(),
                         })?;
-                        // **F-18**: 排队终局统一收口（ephemeral 焚毁/准入账）。
+                        // **F-18**: 排队终局统一收口（准入账/等待槽）。
                         self.drop_queued_turn(&t);
                         self.turns
                             .admission
@@ -2396,7 +2389,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                         session: a.session_id,
                         prompt_tokens: a.prompt_ids.len(),
                         cached_tokens: a.cached_start.min(a.prompt_ids.len()),
-                        max_new: a.max_new,
+                        max_new: a.reserve_new,
                         fed,
                         out_len: a.out.len(),
                         phase,
@@ -2450,7 +2443,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 base,
                 act.prompt_ids.len(),
                 self.boot.cfg.prefill_chunk,
-                self.boot.cfg.knobs.prefill_tail_merge,
+                crate::engine::PREFILL_TAIL_MERGE,
                 Self::prefill_align_page(
                     self.boot.cfg.knobs.prefill_align_tail,
                     self.boot.cfg.knobs.prefix_cache,

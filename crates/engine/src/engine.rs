@@ -46,6 +46,13 @@ use crate::state::{ModelDims, StatePool};
 
 type Result<T> = std::result::Result<T, ModelError>;
 
+/// **prefill 尾块合并**（tokens；0 = 不合并）。
+///
+/// 2026-11-16：`[runtime] prefill_tail_merge` 键已删 —— 合并与否取决于
+/// **prefill 的激活工作区预算**（2048+512 = 2560 会贴 OOM 边，全档实测都是 0），
+/// 那是引擎自己的账。等工作区预算可查询后改成自算（roadmap 3.4）。
+pub const PREFILL_TAIL_MERGE: usize = 0;
+
 /// boot 旋钮(显式依赖律,2026-10-10:环境变量是隐式依赖,引擎内部
 /// **零 env 读取** —— env 派生数据由入口(server config)/ 测试用例经
 /// 本结构显式传入;[`EngineKnobs::from_config`] 是唯一的入口侧构造器,
@@ -250,40 +257,18 @@ pub struct EngineKnobs {
     pub dense_floor: owl_store::TurnFloor,
     /// eager 直发,跳过图捕获(原 OWL_NO_GRAPH;**总闸**)
     pub no_graph: bool,
-    /// **prefill 尾块合并**(tokens;L4,2026-10-18;`[runtime] prefill_tail_merge`):
-    /// 剩余 ≤ `prefill_chunk + 本值` ⇒ 本步吃完(消灭与尺寸无关的固定宿主税
-    /// ~250ms/chunk 的尾块;缺省 0 = 关 = 旧行为)。见 `scheduler::prefill_step_chunk`。
-    pub prefill_tail_merge: usize,
+    // **`prefill_tail_merge` 字段已删**（2026-11-16 用户裁决）：合并由
+    // prefill 的激活工作区预算决定（引擎的账）。当前定值 = [`PREFILL_TAIL_MERGE`]。
     /// 相位时间片(0 = 关;`[runtime] slice_every/slice_tokens`)
     pub slice_every: usize,
     pub slice_tokens: usize,
-    /// 准入三旋钮(`[runtime]`;见 `sched_policy::Limits`)
-    pub newcomer_min_tokens: usize,
-    pub min_gen_tokens: usize,
-    /// 池保留页(0 = 自动 `min(nb/64, 8)`)
-    pub reserve_pages: usize,
-    /// 等待队列上限(0 = 无界;超出 ⇒ 429 `no_slot`)
-    pub max_queue: usize,
-    /// **会话表软上限**（`[runtime] max_sessions`；0 = 不限；F-22）。
-    /// 新请求进来前按 LRU 淘汰空闲会话（活跃/排队不淘汰）。
-    pub max_sessions: usize,
-    /// **空转整理策略**(`[runtime] idle_compact`;缺省 false = 不预搬)。
-    /// true = 池自由低于低水位时按高水位目标 compact。
-    pub idle_compact: bool,
-    /// 压力低水位(主池页百分比;缺省 12)
-    pub pressure_low_pct: usize,
-    /// 压力高水位/目标(主池页百分比;缺省 25)
-    pub pressure_high_pct: usize,
-    /// 宿主压力低水位(宿主该腿总槽百分比;缺省 12)
-    pub host_pressure_low_pct: usize,
-    /// 宿主压力高水位/目标(宿主该腿总槽百分比;缺省 25)
-    pub host_pressure_high_pct: usize,
-    /// 每请求 KV 宿主搬迁上限(缺省 16;0 = 不设每请求上限)
-    pub host_pressure_request_slots: usize,
-    /// 每请求快照宿主搬迁上限(缺省 1;0 = 不设每请求上限)
-    pub host_pressure_request_snaps: usize,
-    /// HostPressure 空转节流(毫秒;缺省 1000)
-    pub host_pressure_interval_ms: usize,
+    /// **本档配置的最大输出长度**（`[runtime] max_new_cap`；2026-11-16 用户裁决）。
+    ///
+    /// 准入预算 = 本请求上下文 + 这个值（被上下文窗口夹到 `max_seq − prompt`）
+    /// —— 一轮在 submit 时就把它预留住，在跑的 turn 不会被新人挤占。
+    pub max_new_cap: usize,
+    // **腾挪/压力 8 个字段已删**（2026-11-16 用户裁决）：策略在
+    // `owl_store::PressurePolicy`（零旋钮），引擎不再需要把它们从配置搬进来。
     /// **末段页对齐**(前缀复用闭环,2026-10-19;`[pool] prefill_align_tail`,
     /// 缺省 **true**)。块边界快照只在**页对齐**处拍 ⇒ 单块档(整个 prompt 落进
     /// 一个 chunk)L4 会把尾端不对齐地一口吃完 ⇒ 一个快照都没有 ⇒ 下一轮全量
@@ -411,22 +396,9 @@ impl Default for EngineKnobs {
             admission_on_full: owl_store::QueuePolicy::Reject,
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
-            prefill_tail_merge: 0,
             slice_every: 0,
             slice_tokens: 0,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
-            reserve_pages: 0,
-            max_queue: 0,
-            max_sessions: 0,
-            idle_compact: false,
-            pressure_low_pct: 12,
-            pressure_high_pct: 25,
-            host_pressure_low_pct: 12,
-            host_pressure_high_pct: 25,
-            host_pressure_request_slots: 16,
-            host_pressure_request_snaps: 1,
-            host_pressure_interval_ms: 1000,
+            max_new_cap: 8192,
             prefill_align_tail: true,
             snap_decode_stride: 1,
             prefill_shadow: false,
@@ -800,22 +772,9 @@ impl EngineKnobs {
             // 合批上限:配置文件单源(`[runtime] max_batch`;env 不参与 ——
             // 用户裁决 2026-10-19:引擎行为参数只许配置文件显式声明)
             max_batch: cfg.runtime.max_batch,
-            prefill_tail_merge: cfg.runtime.prefill_tail_merge,
             slice_every: cfg.runtime.slice_every,
             slice_tokens: cfg.runtime.slice_tokens,
-            newcomer_min_tokens: cfg.runtime.newcomer_min_tokens,
-            min_gen_tokens: cfg.runtime.min_gen_tokens,
-            reserve_pages: cfg.runtime.reserve_pages,
-            max_queue: cfg.runtime.max_queue,
-            max_sessions: cfg.runtime.max_sessions,
-            idle_compact: cfg.runtime.idle_compact,
-            pressure_low_pct: cfg.runtime.pressure_low_pct,
-            pressure_high_pct: cfg.runtime.pressure_high_pct,
-            host_pressure_low_pct: cfg.runtime.host_pressure_low_pct,
-            host_pressure_high_pct: cfg.runtime.host_pressure_high_pct,
-            host_pressure_request_slots: cfg.runtime.host_pressure_request_slots,
-            host_pressure_request_snaps: cfg.runtime.host_pressure_request_snaps,
-            host_pressure_interval_ms: cfg.runtime.host_pressure_interval_ms,
+            max_new_cap: cfg.runtime.max_new_cap,
             prefill_align_tail: cfg.pool.prefill_align_tail,
             snap_decode_stride: cfg.pool.snap_decode_stride,
             // 快照池容量 = 配置单源（F-03；不再读 `OWL_SNAP_MAX`）

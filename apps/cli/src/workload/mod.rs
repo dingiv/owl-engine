@@ -74,7 +74,7 @@ pub fn run(args: Args) -> i32 {
                    --set vision.image_evict=true \\\n\
                    --set pool.prefix_cache=true --set pool.snap_max=2 \\\n\
                    --set pool.snap_host_mb=1024 --set runtime.max_seq=131072 \\\n\
-                   --set runtime.implicit_session=true --log-level info\n\
+                   --log-level info\n\
                  或直接:tools/run-agent-workload.sh gui"
             );
             return 2;

@@ -34,8 +34,6 @@ fn cfg_of(ordinal: usize) -> EngineConfig {
             prefix_cache: false,
             // 0.8B 小档：池 = 2 × ctx（并发自动池的测试形状）。
             pool_tokens: Some(2 * MAX_SEQ),
-            // 小 turn 不被"新人陪跑"门拒。
-            min_gen_tokens: 1,
             ..Default::default()
         },
     }

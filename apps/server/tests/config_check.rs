@@ -44,7 +44,7 @@ fn profile_check_reports_max_seq_and_memory_basis() {
     assert!(dt < Duration::from_secs(2), "--check 必须 <2s(实测 {dt:?})");
     let s = String::from_utf8_lossy(&out.stdout);
     for needle in [
-        "max_seq=79872",
+        "max_seq=57344",
         "pool=auto",
         "OK(estimated",
         "model dir:",
@@ -71,7 +71,7 @@ fn print_config_json_carries_provenance_and_estimate() {
     );
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout 必须是合法 JSON");
-    assert_eq!(v["config"]["runtime"]["max_seq"], 79872);
+    assert_eq!(v["config"]["runtime"]["max_seq"], 57344);
     // 2026-10-22:池容量配置项删除;池由 [vram-gov] 按剩余显存自动定。
     assert!(v["config"]["pool"].get("pool_tokens").is_none());
     // 完整档没有 [intent] ⇒ meta.intent 为空是预期(派生面已退役)
@@ -88,7 +88,7 @@ fn explain_prints_origin_and_rule() {
     ]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("runtime.max_seq = 79872"), "{s}");
+    assert!(s.contains("runtime.max_seq = 57344"), "{s}");
     // 完整档:来源必须是文件(file:…),不再是 derived
     assert!(s.contains("来源: file:"), "应给文件来源:\n{s}");
 }

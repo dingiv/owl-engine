@@ -231,56 +231,130 @@ pub(crate) const HELP: &str = "用法: server -p <profile_path> [CONFIG] [选项
 /// 为什么保留这个名字:模板/工具解析/会话缺省在 `openai.rs` / `load.rs` /
 /// `main.rs` 是**整包传递**的(处理一条请求要同时看"格式 + 缺省 + 上限");
 /// 拆成两个结构反而每次都要搬两份参数。配置面已按职责拆散
-/// (`[runtime] implicit_session/...` + `[server] parse_tool_calls/...`),
+/// ( `[runtime]` 的收到/生成面 + `[server]` 的工具/模板面 ),
 /// 本结构只是它们在 app 层的投影。
 #[derive(Clone, Debug, Default)]
 pub struct AgentCfg {
     /// 模板路径覆盖(None = 模型快照 `<model.path>/chat_template.jinja`)
     pub template_path: Option<String>,
-    /// 隐式默认会话(请求不带 session 键时落到会话 0)
-    pub implicit_session: bool,
     /// 未带 `max_tokens` 时的生成步数
     pub default_max_new: usize,
     /// `max_tokens` 夹紧上限
     pub max_new_cap: usize,
-    /// 工具三通道解析
-    pub parse_tool_calls: bool,
-    /// 工具格式(必须与模板同值)
-    pub tool_call_format: owl_shared::config::ToolCallFormat,
-    /// 有工具即关思考
-    pub auto_disable_thinking_with_tools: bool,
-    /// 思考档位缺省(None = 模板自决)
-    pub reasoning_effort: Option<String>,
-    /// 排队超时毫秒(0 = 关)
+    /// **chat 模板变量**（`chat_template.toml`；2026-11-16 用户裁决：模板
+    /// 变量不属于引擎配置）。扁平表，一个键 = 一个 jinja 变量；请求
+    /// `chat_template_kwargs` 覆盖这里。
+    pub vars: serde_json::Map<String, serde_json::Value>,
+    /// 变量文件来源（日志/排障；None = 无文件，模板取自己的缺省）
+    pub vars_source: Option<PathBuf>,
+    /// **排队超时毫秒**（0 = 关）：**派生自** `[runtime] admission_on_full`
+    /// （2026-11-16：`queue_wait_ms` 键已删 —— 它与 `"queue:<ms>"` 是同一个
+    /// "等多久"，两处毫秒必有一处失效）。
     pub queue_wait_ms: usize,
-    /// SSE 静默保活间隔毫秒(0 = 关)—— 长 prefill 期间探断流
-    pub keepalive_ms: usize,
 }
 
 impl AgentCfg {
-    /// **唯一组装点**:`[runtime]` 的会话面 + `[server]` 的模板/工具面。
-    pub fn from_config(cfg: &OwlConfig) -> Self {
-        Self {
+    /// **唯一组装点**:`[runtime]` 的会话面 + `[server]` 的模板面 +
+    /// `chat_template.toml`（模板变量）。
+    ///
+    /// `Err` = 变量文件读不了/不是合法 TOML/`tool_call_format` 值非法
+    /// （启动期响亮拒，不许"静默回落到模板缺省"）。
+    pub fn from_config(cfg: &OwlConfig, model_dir: &Path) -> Result<Self, String> {
+        let (vars, source) = load_template_vars(cfg, model_dir)?;
+        Ok(Self {
             // 空串 = 未设(TOML 里写 `template_path = ""` 的语义)
             template_path: cfg
                 .server
                 .template_path
                 .clone()
                 .filter(|s| !s.trim().is_empty()),
-            implicit_session: cfg.runtime.implicit_session,
+            queue_wait_ms: match cfg.runtime.parse_admission_on_full() {
+                Ok(owl_shared::config::AdmissionOnFullCfg::Reject) => 0,
+                Ok(owl_shared::config::AdmissionOnFullCfg::Queue { max_wait_ms }) => {
+                    max_wait_ms as usize
+                }
+                // 坏值：boot 会拒启（引擎构造用同一解析）；这里如实上抛，
+                // 不静默给 0（那会把"配置写错"变成"排队超时关"）。
+                Err(e) => return Err(e),
+            },
             default_max_new: cfg.runtime.default_max_new,
             max_new_cap: cfg.runtime.max_new_cap,
-            parse_tool_calls: cfg.server.parse_tool_calls,
-            tool_call_format: cfg.server.tool_call_format,
-            auto_disable_thinking_with_tools: cfg.server.auto_disable_thinking_with_tools,
-            reasoning_effort: cfg
-                .server
-                .reasoning_effort
-                .clone()
-                .filter(|s| !s.trim().is_empty()),
-            queue_wait_ms: cfg.runtime.queue_wait_ms,
-            keepalive_ms: cfg.runtime.keepalive_ms,
+            vars,
+            vars_source: source,
+        })
+    }
+}
+
+/// **chat 模板变量文件**（`chat_template.toml`；2026-11-16 用户裁决：
+/// **模板变量不属于引擎配置**，单独一个文件承载）。
+///
+/// 位置解析（优先级）：
+/// 1. `[server] template_vars`（相对路径 = 相对模型目录）；
+/// 2. `<model.dir>/chat_template.toml`（快照旁边，跟模型走）；
+/// 3. 无文件 = 空表（模板取自己的缺省，与 HF oracle 逐字节同源）。
+///
+/// 文件形态 = **扁平 TOML 表**，一个键 = 一个 jinja 变量：
+/// ```toml
+/// auto_disable_thinking_with_tools = false
+/// tool_call_format = "xml"
+/// # reasoning_effort = "medium"
+/// ```
+/// 校验：`tool_call_format` 若出现必须是 `"xml"` 或 `"json"`（模板按它选
+/// 分支）；其余键原样转 JSON 交给模板（值域由模板自持 —— 服务端不做映射）。
+fn load_template_vars(
+    cfg: &OwlConfig,
+    model_dir: &Path,
+) -> Result<(serde_json::Map<String, serde_json::Value>, Option<PathBuf>), String> {
+    const FILE: &str = "chat_template.toml";
+    let explicit = cfg.server.template_vars.trim();
+    let path = if !explicit.is_empty() {
+        let p = PathBuf::from(explicit);
+        Some(if p.is_absolute() { p } else { model_dir.join(p) })
+    } else {
+        let p = model_dir.join(FILE);
+        p.is_file().then_some(p)
+    };
+    let Some(path) = path else {
+        return Ok((serde_json::Map::new(), None));
+    };
+    let raw = owl_shared::file_loader::read_to_string(&path)
+        .map_err(|e| format!("chat 模板变量文件读取失败 {}: {e}", path.display()))?;
+    let doc: toml::Value = toml::from_str(&raw)
+        .map_err(|e| format!("chat 模板变量文件不是合法 TOML {}: {e}", path.display()))?;
+    let toml::Value::Table(table) = doc else {
+        return Err(format!(
+            "chat 模板变量文件必须是扁平表(一个键 = 一个模板变量) {}",
+            path.display()
+        ));
+    };
+    let mut vars = serde_json::Map::new();
+    for (k, v) in table {
+        vars.insert(k, toml_to_json(&v));
+    }
+    if let Some(v) = vars.get("tool_call_format") {
+        if !matches!(v.as_str(), Some("xml") | Some("json")) {
+            return Err(format!(
+                "chat 模板变量 tool_call_format 只接 \"xml\" | \"json\"，实得 {v}（{}）",
+                path.display()
+            ));
         }
+    }
+    Ok((vars, Some(path)))
+}
+
+/// TOML 值 → 模板 kwargs 的 JSON 值（日期转字符串）。
+fn toml_to_json(v: &toml::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        toml::Value::String(s) => J::String(s.clone()),
+        toml::Value::Integer(i) => J::from(*i),
+        toml::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(J::Number)
+            .unwrap_or(J::Null),
+        toml::Value::Boolean(b) => J::Bool(*b),
+        toml::Value::Datetime(d) => J::String(d.to_string()),
+        toml::Value::Array(a) => J::Array(a.iter().map(toml_to_json).collect()),
+        toml::Value::Table(t) => J::Object(t.iter().map(|(k, v)| (k.clone(), toml_to_json(v))).collect()),
     }
 }
 
@@ -315,7 +389,8 @@ pub struct ServerConfig {
     /// **主干量化方案**(model.quant;S2 2026-10-17;枚举严格 —— 原
     /// `w4a8: bool` 已退役,旧键响亮拒)
     pub quant: owl_shared::config::QuantScheme,
-    /// 最大并发请求(runtime.max_concurrency;默认 8;须 ≤ knobs.gdn_slots)
+    /// **并发闸门** = `pool.gdn_slots`（同时推进的 turn 上限；2026-11-16 起
+    /// 它是唯一真源 —— 旧的 `[runtime] max_concurrency` 已删）。
     pub max_concurrency: usize,
     /// **合批上限**([runtime] max_batch;1 = 串行现状)。服务面用它做两件事:
     /// 会话串行的配套告警(隐式会话 + 合批 ⇒ 串行)与 `/debug/vram` 的如实报数。
@@ -409,8 +484,15 @@ impl ServerConfig {
 
     /// app 面组装(已加载配置 → server 形态;测试可直接喂 default/定制)
     pub fn from_config(cfg: OwlConfig) -> Result<Self, String> {
+        // 模型目录先落定（模板变量文件的默认位置就挂在它旁边）
+        let model_dir = cfg
+            .model
+            .path
+            .clone()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR));
         // 先组装 app 面视图(要整份 cfg);后面按值搬移各 module
-        let agent = AgentCfg::from_config(&cfg);
+        let agent = AgentCfg::from_config(&cfg, &model_dir)?;
         Ok(Self {
             bind: cfg.server.bind.clone(),
             request_dump_dir: {
@@ -418,12 +500,7 @@ impl ServerConfig {
                 (!p.is_empty()).then(|| PathBuf::from(p))
             },
             vision_max_pixels: cfg.vision.max_pixels,
-            model_dir: cfg
-                .model
-                .path
-                .clone()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_DIR)),
+            model_dir,
             model_format: cfg.model.format,
             model_name: cfg
                 .model
@@ -434,7 +511,8 @@ impl ServerConfig {
                 .map_err(|e| format!("engine knobs: {e}"))?,
             device_opts: owl_engine::DeviceOpts {
                 parallel: cfg.parallel.clone(),
-                gpu_min_free_ratio: cfg.runtime.gpu_min_free_ratio,
+                // 自动选卡的避让阈值 = 引擎定值（`GPU_MIN_FREE_RATIO`；2026-11-16 键已删）
+                gpu_min_free_ratio: owl_shared::config::GPU_MIN_FREE_RATIO,
                 lock_port: 0,
                 lock_role: None,
             },
@@ -450,7 +528,7 @@ impl ServerConfig {
             tp_comm: cfg.parallel.tp_comm,
             tp_vocab_split: cfg.parallel.tp_vocab_split,
             tp_ar: cfg.parallel.tp_ar,
-            max_concurrency: cfg.runtime.max_concurrency,
+            max_concurrency: cfg.pool.gdn_slots,
             max_batch: cfg.runtime.max_batch,
             perf_dump: None,
             perf_level: cfg.probes.perf_level.to_u8(),
@@ -463,21 +541,11 @@ impl ServerConfig {
         })
     }
 
-    /// agent 面缺省模板变量(`[agent]` → jinja 变量;请求 kwargs 覆盖之)。
-    /// **只装非缺省项** ⇒ 缺省档与 HF oracle(无 kwargs)逐字节同源。
+    /// agent 面缺省模板变量 = **变量文件原样**（`chat_template.toml`；
+    /// 请求 `chat_template_kwargs` 覆盖之）。2026-11-16：模板变量不再是
+    /// 引擎配置键，这里不再有任何"按字段拼装"的逻辑。
     pub fn agent_template_defaults(&self) -> serde_json::Map<String, serde_json::Value> {
-        use owl_shared::config::ToolCallFormat;
-        let mut m = serde_json::Map::new();
-        if self.agent.tool_call_format != ToolCallFormat::Xml {
-            m.insert("tool_call_format".into(), serde_json::json!("json"));
-        }
-        if self.agent.auto_disable_thinking_with_tools {
-            m.insert("auto_disable_thinking_with_tools".into(), serde_json::json!(true));
-        }
-        if let Some(e) = &self.agent.reasoning_effort {
-            m.insert("reasoning_effort".into(), serde_json::json!(e));
-        }
-        m
+        self.agent.vars.clone()
     }
 }
 
@@ -515,7 +583,7 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
         gib(e.total_bytes.saturating_sub(e.used_bytes())),
         if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
         if c.spec.depth > 0 { format!("dflash{}", c.spec.depth) } else { "off".into() },
-        c.runtime.max_concurrency,
+        c.pool.gdn_slots,
     ))
 }
 
@@ -557,10 +625,10 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
              gdn_slots={} max_batch={} max_concurrency={} kv_dtype={}\n",
             c.runtime.max_seq,
             c.runtime.prefill_chunk,
-            c.runtime.prefill_tail_merge,
+            owl_engine::PREFILL_TAIL_MERGE,
             c.pool.gdn_slots,
             c.runtime.max_batch,
-            c.runtime.max_concurrency,
+            c.pool.gdn_slots,
             c.pool.kv_dtype,
         ));
         if let Some(e) = r.estimate() {
@@ -606,10 +674,10 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
              gdn_slots={} max_batch={} max_concurrency={} kv_dtype={}\n",
             c.runtime.max_seq,
             c.runtime.prefill_chunk,
-            c.runtime.prefill_tail_merge,
+            owl_engine::PREFILL_TAIL_MERGE,
             c.pool.gdn_slots,
             c.runtime.max_batch,
-            c.runtime.max_concurrency,
+            c.pool.gdn_slots,
             c.pool.kv_dtype,
         ));
     }
@@ -712,6 +780,28 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
                     "[check] draft: MTP 头随检查点装载;缺 model.path 时无法预检 mtp.* 键\n",
                 ),
             }
+        }
+    }
+
+    // ── chat 模板变量文件（2026-11-16：模板变量不属于引擎配置）──
+    //
+    // 与 boot 同源（`AgentCfg::from_config` 的同一个 loader）：坏文件/坏
+    // `tool_call_format` 在 `--check` 也要 FAIL，不能等起机才发现。
+    let tpl_dir = dir_owned
+        .as_deref()
+        .unwrap_or_else(|| Path::new(DEFAULT_MODEL_DIR));
+    match load_template_vars(c, tpl_dir) {
+        Ok((vars, src)) => match src {
+            Some(p) => out.push_str(&format!(
+                "[check] template vars: {} ({} 项)\n",
+                p.display(),
+                vars.len()
+            )),
+            None => out.push_str("[check] template vars: 无文件(模板取自身缺省)\n"),
+        },
+        Err(e) => {
+            ok = false;
+            out.push_str(&format!("[check] FAIL: {e}\n"));
         }
     }
 
@@ -827,4 +917,116 @@ pub fn inspect(args: &CliArgs, r: &ResolvedConfig) -> Result<(), String> {
         return Err("预检未通过(见上方 [check] FAIL)".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod template_vars_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "owl-ctvars-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("tmp");
+        p
+    }
+
+    fn cfg_with(path: &str) -> OwlConfig {
+        OwlConfig::from_toml_str(&format!("[server]\ntemplate_vars = {path:?}\n"))
+            .expect("配置应可解析")
+    }
+
+    /// 显式路径：扁平表 → JSON kwargs；`tool_call_format` 参与校验。
+    #[test]
+    fn explicit_file_is_parsed() {
+        let dir = tmp("explicit");
+        let f = dir.join("ct.toml");
+        std::fs::write(
+            &f,
+            "tool_call_format = \"json\"\nauto_disable_thinking_with_tools = true\nreasoning_effort = \"medium\"\nn = 3\n",
+        )
+        .expect("写文件");
+        let model = dir.join("model");
+        let (vars, src) = load_template_vars(&cfg_with(&f.display().to_string()), &model)
+            .expect("应加载");
+        assert_eq!(src.as_deref(), Some(f.as_path()));
+        assert_eq!(vars.get("tool_call_format"), Some(&serde_json::json!("json")));
+        assert_eq!(
+            vars.get("auto_disable_thinking_with_tools"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(vars.get("n"), Some(&serde_json::json!(3)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 模型目录旁的 `chat_template.toml` 自动加载（快照跟模型走）。
+    #[test]
+    fn snapshot_adjacent_file_is_auto_detected() {
+        let dir = tmp("auto");
+        std::fs::write(
+            dir.join("chat_template.toml"),
+            "auto_disable_thinking_with_tools = true\n",
+        )
+        .expect("写文件");
+        let (vars, src) = load_template_vars(&OwlConfig::default(), &dir).expect("应加载");
+        assert!(src.is_some(), "应自动发现快照旁的 chat_template.toml");
+        assert_eq!(
+            vars.get("auto_disable_thinking_with_tools"),
+            Some(&serde_json::json!(true))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 无文件 = 空表（模板取自身缺省），不报错。
+    #[test]
+    fn missing_file_is_empty_not_an_error() {
+        let dir = tmp("missing");
+        let (vars, src) = load_template_vars(&OwlConfig::default(), &dir).expect("应通过");
+        assert!(vars.is_empty());
+        assert!(src.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `tool_call_format` 坏值 = 启动期响亮拒（不许静默回落模板缺省）。
+    #[test]
+    fn bad_tool_call_format_is_rejected() {
+        let dir = tmp("badfmt");
+        let f = dir.join("ct.toml");
+        std::fs::write(&f, "tool_call_format = \"yaml\"\n").expect("写文件");
+        let err = load_template_vars(&cfg_with(&f.display().to_string()), &dir).expect_err("应拒");
+        assert!(err.contains("tool_call_format"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 显式路径不存在 = 拒启（写错了不能静默当"无文件"）。
+    #[test]
+    fn explicit_missing_path_is_rejected() {
+        let dir = tmp("gone");
+        let err = load_template_vars(
+            &cfg_with(&dir.join("nope.toml").display().to_string()),
+            &dir,
+        )
+        .expect_err("应拒");
+        assert!(err.contains("读取失败"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AgentCfg 的缺省模板变量 = 文件原样（不再有字段拼装）。
+    #[test]
+    fn defaults_are_the_file_verbatim() {
+        let dir = tmp("defaults");
+        std::fs::write(
+            dir.join("chat_template.toml"),
+            "tool_call_format = \"json\"\nreasoning_effort = \"high\"\n",
+        )
+        .expect("写文件");
+        let cfg = OwlConfig::default();
+        let agent = AgentCfg::from_config(&cfg, &dir).expect("应加载");
+        assert_eq!(agent.vars.len(), 2);
+        assert_eq!(agent.vars.get("reasoning_effort"), Some(&serde_json::json!("high")));
+        assert!(agent.vars_source.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

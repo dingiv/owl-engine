@@ -37,52 +37,36 @@ request_dump_dir = ""
 # 模板路径覆盖:空 = 用模型快照 `<model.path>/chat_template.jinja`;
 # 相对路径 = 相对模型目录。
 template_path = ""
-# 工具三通道解析(关 = 工具文本原样进 content —— 诊断臂)
-parse_tool_calls = true
-# 工具格式(必须与模板同值):xml | json
-tool_call_format = "xml"
-# 有工具即关思考(模板同名变量)
-auto_disable_thinking_with_tools = false
-# 思考档位缺省(OpenAI 同名协议值;请求带 reasoning_effort 时以请求为准)
-reasoning_effort = ""
+# **工具/思考等模板变量住独立文件**（2026-11-16 用户裁决：模板里的
+# 变量不属于引擎配置）。空 = 自动找 `<model.path>/chat_template.toml`；
+# 相对路径 = 相对模型目录。文件形态 = 扁平 TOML 表，一个键 = 一个 jinja
+# 变量，例如：
+#   tool_call_format = "xml"                       # xml | json（模板按它选分支）
+#   auto_disable_thinking_with_tools = false
+#   reasoning_effort = "medium"
+# 请求 `chat_template_kwargs` 覆盖文件；文件覆盖模板自带缺省。
+template_vars = ""
 
 # ---------------------------------------------------------------------------
 # [runtime] —— 引擎运行时(上下文 / 调度 / 准入 / 会话缺省)
 # ---------------------------------------------------------------------------
 [runtime]
-# 会话表软上限(0 = 不限;>0 = 新请求前按 LRU 淘汰空闲会话)
-max_sessions = 0
 # 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
 admission_on_full = "reject"
-# 自动挑卡的空闲显存阈值(0..1;低于它就跳过该卡)
-gpu_min_free_ratio = 0.9
-# 并发闸门:在跑 + 排队上限;须 ≤ pool.gdn_slots(每会话一格 GDN 状态)
-max_concurrency = 1
-# 隐式默认会话(请求不带 session 时落到会话 0;false = 每请求临时会话)
-implicit_session = false
 # 未带 max_tokens 时的生成步数 / 夹紧上限
 default_max_new = 4096
 max_new_cap = 32768
-# 排队超时(毫秒;0 = 关)
-queue_wait_ms = 0
-# **SSE 静默保活(毫秒;0 = 关)**:长 prefill 不产 token ⇒ 流上零写入 ⇒
-# 客户端断流要等到首 token 才暴露(引擎会把整段 prefill 白跑完)。保活帧 =
-# SSE 注释(`: keepalive`),写失败即弃置 turn。
-keepalive_ms = 1000
-# 上下文上限(token)
+# **上下文上限(token)**
+# （SSE 保活/排队超时/选卡阈值/gap 预留 已从配置退休：前两者是传输层与
+#  `admission_on_full` 的事，后两者是引擎定值 —— 2026-11-16 用户裁决）
 max_seq = 32768
-# **图片 leave-gap 的位置空洞预留**（`max_seq` 的倍数；0 = 关）。
-# 可用上下文仍是 max_seq，rope 表按 max_seq + 本值×max_seq 建；多出来的位置
-# 只允许被 image 无感删除的 gap 消费（正常会话 pos_hi = n_tokens，进不来）。
-# 0.5 ⇒ 32768 档预留 16384 位置（≈8 张 2k 截图）；用尽即触发一次位置压实。
-gap_reserve_factor = 0.5
 # **每 chunk 覆写的持久表必须与消费者同流**（2026-11-16 根因修复）。
 # 例：GDN 序列表 / 选择层视图槽曾用 H2D 流写、COMPUTE 核读 —— 前一 chunk
 # 的核还没跑完，下一 chunk 的表就把它覆写（1k needle 固定丢 `M`）。
 # 修法 = 持久表写入走 COMPUTE（与 FI/块表同律），零事件、零栅栏；
 # 原 `[runtime] int8_prefill_sync` 与末块前全设备 sync 均已删除。
 # 回归门：`tools/fixture/int8_text_gate.py`（1k/3k/8k）。
-# 预填块长 / 尾块合并阈值(剩余 ≤ chunk + tail_merge ⇒ 一口气吃完)
+# 预填块长（尾块合并已收成引擎定值 0：它取决于 prefill 的激活工作区预算）
 # 实测(2026-10-27,单 3090 / 27B AWQ / DFlash2 d7 / ctx 63456,**冷 boot 逐档**):
 #   chunk 512 / tail 512 : 4k 1320 · 8k 1308 t/s ; 32k 1173 t/s(TTFT 27.9s)
 #   chunk 1024 / tail 0  : 4k 1328 · 8k 1350 t/s
@@ -91,32 +75,28 @@ gap_reserve_factor = 0.5
 # ⚠️ **4096 不可用**:单 3090 在 prefix_cache 吃满池后,4096 块的 marlin 工作区
 #    (272MiB)会撞 vram 硬预算 ⇒ 请求直接 PoolExhausted。2048 的工作区 ≈136MiB,
 #    32k 连跑三次仍有余量(free ≈1.1G)。要再上去得先给预填留专用预算。
-# 尾块合并取 0:合并会把块撑到 chunk+tail(2048+512=2560)⇒ 工作区跟着变大,
-#    而收益只是"少一发尾块";稳态档不值得这个 OOM 边。
 prefill_chunk = 512
-prefill_tail_merge = 0
-# 跨会话合批上限(1 = 串行;>1 需 gdn_slots ≥ 它、单卡、无选择层)
+# **跨会话合批上限**(1 = 串行;缺省)。
+# >1 的前置:`pool.gdn_slots ≥ max_batch`、**单卡**(TP 的 AR 批语义未审,
+# 配置校验直接拒)、`kvmem.select_decode = false`(M1 页表按行)。
+# 效果:最多 N 个活跃 turn 的 decode 拼成一次 T=N 前向;单 turn 语义不变。
 max_batch = 1
-# 相位时间片:每 slice_every 拍 decode 插一片 prefill(0 = 关)
+# **相位时间片**:每 `slice_every` 拍 decode 之后插**一片** prefill
+# (0 = 关 = prefill 独占泵,缺省)。只对"有在位者 decode"有意义:给长 prompt
+# 的 prefill 开个口子,牺牲在位者 ITL 换新请求的 TTFT。
 slice_every = 0
+# 单片 prefill token 数(0 = 用整 `prefill_chunk`)
 slice_tokens = 0
-# 准入:给未来新人的预留 token / 在位者最小生成量 / 池保留页 / 队列上限
-newcomer_min_tokens = 4096
-min_gen_tokens = 256
-reserve_pages = 0
-max_queue = 0
-# 空转整理:false = 只回收池缓存、不预搬(缺省);true = 低水位时后台 compact
-idle_compact = false
-# 压力水位(占主池页百分比):自由页 < low 触发,补到 high 目标
-pressure_low_pct = 12
-pressure_high_pct = 25
-# 宿主压力低/高水位(占该腿总槽百分比)与空转 HostPressure 节流(ms)
-host_pressure_low_pct = 12
-host_pressure_high_pct = 25
-# 每请求搬迁上限(KV 槽 / 快照条数);8 并发最坏 = 8×16 KV + 8×1 快照
-host_pressure_request_slots = 16
-host_pressure_request_snaps = 1
-host_pressure_interval_ms = 1000
+# **准入预算**(2026-11-16 用户裁决):一轮的预留 = 本请求上下文 +
+# `max_new_cap`(被 `max_seq` 窗口夹住)。装不下 ⇒ 拒/排队,**不切在跑者的
+# 份额** ⇒ 旧的"给新人留头寸/在位者最小生成/队列上限"三旋钮已删。
+# ⚠️ `max_new_cap` 必须显著小于池(自动池 = `max_seq`),否则每轮都预留到
+# 窗口边缘,并发会退化成 1;`max_new_cap ≥ max_seq` 等于一请求都进不来。
+# **腾挪/压力策略不在配置里**（2026-11-16 用户裁决）：水位（主池/宿主低 12%→
+# 高 25%）、单次腾挪上限、空转要不要整理 —— 全是 `owl_store::PressurePolicy`
+# 的内部定值。理由：水位是**池几何的函数**（池多大由 store 分配，操作员算不出），
+# 单次搬运量是**延迟预算**，空转整理由**真实余量**回答（低水位才触发）。
+# 旧 8 键（idle_compact / pressure_* / host_pressure_*）已删，写了即拒启。
 
 # ---------------------------------------------------------------------------
 # [parallel] —— 并行与卡位(唯一真源)
@@ -177,51 +157,52 @@ beta_slow = 1.0
 attention_factor = 1.0
 
 # ---------------------------------------------------------------------------
-# [pool] —— 设备池与显存治理
+# [pool] —— 设备池与显存治理   # FIXME: 改名为 [store]
 # ---------------------------------------------------------------------------
-[pool]
+[pool]   # FIXME: 增加嵌套配置, 普通 kv 作为一个子域, gdn 作为一个子域
 # 主 KV 池 dtype（full 模板默认 fp8；30 系 leaf 由 parts/pool/int8.toml 覆盖为 int8）
 kv_dtype = "fp8"
 # 设备 KV 池（2026-10-22；不再有手工容量键）:
 #   prefix_cache=false → min(剩余显存 cap, max_seq×并发 + 1 页)
 #   prefix_cache=true  → cap(整池可被前缀缓存持有,新请求逐出到 host/disk)
-# GDN 状态格数（每活跃 turn 一格）；0 = 自动 = runtime.max_concurrency。
+# **GDN 状态格数 = 同时推进的 turn 上限**（每活跃 turn 一格；2026-11-16 起
+# 它是并发唯一真源：服务面 permit 数也用它）。必须显式 ≥ 1。
 # full 模板给 1；多并发 leaf 显式覆盖（如 3080 档 2）。
 gdn_slots = 1
 # 前缀缓存开/关
 prefix_cache = true
 # 末段页对齐(前缀复用闭环;单块档多切一刀)
-prefill_align_tail = true
+prefill_align_tail = true   # FIXME: 删除配置项目, 默认开
 # 生成相位页边界快照页步长(0 = 关)
-snap_decode_stride = 1
+snap_decode_stride = 1   # FIXME: ?? 
 # GDN 快照池槽数
-snap_max = 0
+snap_max = 0          # FIXME: ?? 
 # 消息边界快照（缺省关；agent 档开）。开 = 在消息开启标记前取页对齐边界，
 # prefill 在边界切块并拍 Durable 快照，供同 system/tool 前缀跨会话复用。
 # 依赖 prefix_cache=true + snap_max>0；无消费者 = boot 告警（full 模板 snap_max=0 ⇒ 保持 false）。
-snap_msg_boundary = false
+snap_msg_boundary = false  # FIXME: 删除配置项目, 默认开
 # 可删图前锚点快照（缺省开；2026-11-13）。开 = 在**每张可删图的段起点**
 # 强制切块并拍一张快照（Extra 档；旧图同键 Touch，稳态≈新进图数）。
 # 解决“截图在 prompt 尾部”时尾快照落在被删页、删除只能退回 fresh 的问题；
 # 同游程只删后几张时也能复用到前几张。
 # 只在 image_evict=true + prefix_cache=true + snap_max>0 时有消费者。
-snap_evict_anchor = true
+snap_evict_anchor = true   # FIXME: 删除配置项目, 默认开
 # 消息开启标记文本覆盖（空 = 用模型 ChatFormat.im_open，如 Qwen <|im_start|>）
 # 引擎 boot 时 tokenize；扫描函数只收 open_ids 参数，不写死字面量。
 snap_msg_delim = ""
 # 后续消息边界的稀疏间隔（token；第一条边界无条件保留）
-snap_msg_min_gap = 2048
+snap_msg_min_gap = 2048   # FIXME: ??? 
 # 最近 K 条消息边界无条件保留（dense tail；0 = 旧行为）
 snap_msg_recent = 4
 # 每会话快照上限（0 = 不限 = 旧行为；只数非 Transient 条目，
 # 设备+宿主+盘都算）；**与 snap_max（设备槽数）是两个量**。
 # 超限时按 SnapClass 档位替换/跳过
-snap_session_cap = 0
+snap_session_cap = 0    # FIXME: ???
 # 结构档（Dense/Binary）保留位；仅约束 Extra（Extra ≤ cap − reserve）
-snap_structural_reserve = 4
+snap_structural_reserve = 4    # FIXME: ??? 
 # 距当前 fed 小于本值（token）的边界不单独切块；0 = 不设下限（推荐，
 # 否则边界落在 chunk 起点附近会被跳过，system 前缀反而丢）
-snap_msg_min_span = 0
+snap_msg_min_span = 0    # FIXME: ???
 # 宿主 KV 腿 / 快照腿 / 盘层两腿(MiB;0 = 关)
 host_cache_mb = 0
 snap_host_mb = 0
@@ -232,7 +213,7 @@ disk_dir = ""
 # **磁盘 KV 主动 checkpoint 单次配额 MiB**(S6.2;0 = 关)。
 # 开 = turn 收口把活跃会话的 KV 块**复制**一份到盘(不动运行期驻留)⇒ 引擎重启后
 # 仍能按盘上索引召回前缀;关 = 旧行为(只有宿主压力才被动溢写)。
-checkpoint_max_mb = 0
+checkpoint_max_mb = 0     # FIXME: ??? 
 # 两次 checkpoint 的最小间隔 ms（仅 checkpoint_max_mb>0 时生效；0 = 每 turn 都试）
 checkpoint_min_gap_ms = 5000
 # 临时块复用池上限(MiB;0 = 不限)
@@ -242,12 +223,12 @@ checkpoint_min_gap_ms = 5000
 # target_total = total × vram_budget；vram_reserve_mb 是**单值总预留**
 # (含图执行/warmup/碎片;prefill 瞬态由代码按 runtime.prefill_chunk 派生)。
 vram_budget = 0.99
-vram_reserve_mb = 714
+vram_reserve_mb = 714  # FIXME: 删除配置项目, 和 vram_budget 重复
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
 # 显存硬上限 MiB(留空 / 0 = 只按驱动账判)
-vram_budget_mb = 0
+vram_budget_mb = 0  # FIXME: 删除配置项目, 和 vram_budget 重复
 # 解释器块池预算(字节;0 = 关)
-block_pool_bytes = 0
+block_pool_bytes = 0 # FIXME: 删除配置项目, 和 vram_budget 重复
 # 关活性中途回收(诊断;开会无界常驻)
 no_reclaim = false
 
@@ -262,7 +243,7 @@ draft_path = ""
 # 哑草稿诊断面(无草稿器时)
 dumb = false
 # 草稿池 fp8(关 = bf16)
-draft_kv_dtype = "bf16"
+draft_kv_dtype = "bf16"  # FIXME: 移动到 [pool]
 # DFlash2 草稿环窗口(token;0 = auto = 检查点声明,缺声明 = 家族 2048;当前核支持 2048)
 draft_window = 0
 # DFlash2 选择器 walk 策略（**AL 消融量具,不是调优旋钮**;仅 DFlash2 档）
@@ -271,20 +252,20 @@ draft_window = 0
 #   unary       = 每步只读 unary[e, ·]（逐位置边际 ⇒ 丢掉全部边缘分;DDTree 的 q_i(v)）
 # 背景:roadmap.local/26-11-03-ddtree-AL升级-交接.md §4 S0。
 # 收割面读 `mcand` 槽只在非 conditional 档发生(~0.9KB/轮);conditional = 零回归。
-dflash_walk = "conditional"
+dflash_walk = "conditional"  # FIXME: ??? 
 # **草稿 q 校准旋钮**（2026-11-03;只影响 AL,不影响分布正确性）
 # 选择器边分不是校准 logits:实测 q(top1)≈0.97 而目标 p(top1)≈0.34 ⇒ 拒绝采样
 # 的 `Σ min(p,q)` 退化到 `p(top1)`。q_alpha 乘在行上（1.0 = 原律,0 → 均匀）,
 # q_floor 再加均匀地板（∈[0,1),0 = 不加）。两者都只在 TP2 切分档生效。
-q_alpha = 1.0
-q_floor = 0.0
+q_alpha = 1.0  # FIXME: ??? 
+q_floor = 0.0  # FIXME: ??? 
 # **host 侧草稿 q**（拒绝采样路径）。**缺省 true**（2026-11-03 真机 A/B，4080 单卡
 # 12 轮 ×2 负载：开 = 1.450/3.711，关 = 1.334/3.470 ⇒ 开高 ~8%）。
 # ⚠️ q_alpha/q_floor 保持 1.0/0.0：**把 q 摊平只会掉 AL**（同一批 dump 实测
 # α=0.5/0.25 的逐步接受率单调下降 —— 选择器的非 top-1 质量对 p 是反信息）。
-q_host = true
+q_host = true  # FIXME: ??? 
 # **[标定] q dump 路径**（空 = 关；每轮一行 JSONL：raw 行 / 候选 id / 目标 p）
-q_dump = ""
+q_dump = ""   # FIXME: ??? 
 # DFlash2 lookup-augmented drafting（LABD；仅 DFlash2 档可开）
 # 在当前请求 token 历史里找当前后缀的最近一次出现，用其后续 token 覆盖草稿头；
 # 缺省关 = 旧档逐字节不变。nmin/nmax/nstrong/agree 语义见 docs/devlog/perf/tp2-decode-fast.md §10。

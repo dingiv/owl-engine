@@ -49,11 +49,8 @@ path = "../models/bytkim/Qwen3.8-27B-pi-AWQ-INT4"
 quant = "w4a8"
 
 [runtime]
-# 会话表软上限(0 = 不限;>0 = 新请求前按 LRU 淘汰空闲会话)
-max_sessions = 0
 # 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
 admission_on_full = "reject"
-keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 max_seq = 262144
 # **并发上限 2**(2026-11-03 用户裁决:TP2 档默认开双并发;
 # 2026-11-15 升为真批 AR)。
@@ -65,7 +62,7 @@ max_seq = 262144
 # - ⚠️ 批路当前只覆盖 **bare decode**;DFlash2 的 spec verify 批化是下一刀
 #   (多活跃时 spec 轮的草稿 KV 已按会话隔离,不再互踩)。要现在拿真批吞吐:
 #   `--set spec.depth=0 --set spec.lookup=false`(文本并发档)。
-max_concurrency = 2
+# 并发唯一真源 = `pool.gdn_slots`(2026-11-16：`runtime.max_concurrency` 已删)
 max_batch = 2
 # 3080 TP2 冷 prefill A/B（2026-10-25，15K/25K/37K）:
 #   512  = 1486 / 1446 / 1359 t/s
@@ -74,10 +71,6 @@ max_batch = 2
 # 只改本 TP2 档;3090 档 2026-10-27 亦提到 2048(单卡实测 +3~5%)。
 # 尾块合并取 0:同 full.toml 注 —— 合并会把块撑到 2560,工作区跟着变大。
 prefill_chunk = 2048
-prefill_tail_merge = 0
-# pi 不发 session 键:隐式会话 0 让工具轮/图片删除有稳定会话;
-# 跨会话前缀仍由内容寻址缓存兜底(实测 49k prompt 99.9% 命中)。
-implicit_session = true
 
 [sampling]
 # GUI agent 联调：打破 greedy 复读；客户端显式 temperature=0 仍可逐请求回落贪心。
@@ -146,7 +139,7 @@ snap_max = 6
 # 「冷会话先 + SnapClass 档位」淘汰 —— 本键只防单会话无限积累。
 snap_session_cap = 20
 snap_structural_reserve = 4
-# GDN 状态格 = 每活跃 turn 一格;boot 门要求 `gdn_slots ≥ max_concurrency`,
+# GDN 状态格 = 每活跃 turn 一格 = **并发唯一真源**(服务面 permit 也用它),
 # 否则拒启(`parts/pool/fp8.toml` 里是 1 ⇒ 本档显式覆盖成 2)。
 gdn_slots = 2
 snap_host_mb = 3072

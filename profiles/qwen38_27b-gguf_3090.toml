@@ -46,21 +46,14 @@ bind = "0.0.0.0:8137"
 # ⚠️ 它吃 0.9GB ⇒ ctx 从 192k 收到 168k(见 [runtime] 注)。
 
 [runtime]
-# 会话表软上限(0 = 不限;>0 = 新请求前按 LRU 淘汰空闲会话)
-max_sessions = 0
 # 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
 admission_on_full = "reject"
-keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # 172032 = 5376 页(boot 报的 cap = 218457 的 79%,已含 0.9GB 视觉塔)。
 # 实测 64k / 128k prompt 零拒发,余量 1.79GB;196608 时 64k 就撞 68MiB 硬预算。
 max_seq = 172032
-max_concurrency = 1
 # 与档①同款:GGUF 的 prefill 走 MMQ2,块越大发射越少(实测 512→2048 +8~15%,
 # 4096 在 8k prompt 上会 prefill 边界降级 ⇒ 2048 是安全上限)。
 prefill_chunk = 2048
-prefill_tail_merge = 0
-# pi 不发 session 键:隐式会话 0 让工具轮有稳定会话;跨轮前缀由内容寻址缓存兜底。
-implicit_session = true
 
 [spec]
 # DFlash2 d7:草稿仍是 W4A16 pack-quantized 检查点(与主干格式无关;

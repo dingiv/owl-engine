@@ -8,14 +8,17 @@
 # 端口 8137 / CUDA ordinal 0,见该档头注)。脚本**不启 server、不杀进程**
 # (杀进程纪律:只杀自己的 PID —— 见 AGENTS.md / 设计 §八施工纪律)。
 #
-# 三把门(缺一不可;谁都不能替代谁):
+# 四把门(缺一不可;谁都不能替代谁):
 #   1. lag_probe.py   —— **多请求内容正确性**(吞吐 bench 测不出来的那一类:
 #                        XQA 页表恒等链 bug 就是被它抓住的)
 #   2. agent_wire_smoke.py —— wire 契约(三通道帧序/finish_reason/usage/400 面)
-#   3. e2e.rs(27B 黑盒,cargo test -p server --test e2e)
+#   3. session_identity_probe.py —— **会话身份 = 内容身份**(无 session 键的续写
+#                        必须认回同一条会话、不同对话不许串;看会话表不只看
+#                        cached_tokens —— 后者含跨会话内容树命中)
+#   4. e2e.rs(27B 黑盒,cargo test -p server --test e2e)
 #                        —— L1 协议面 + agent 面(工具历史/stop/400/工具闭环)
 #
-# 判据:三者全绿 = 本专项回归通过。任何一把先红 = 停止后续门(不掩盖)。
+# 判据:四者全绿 = 本专项回归通过。任何一把先红 = 停止后续门(不掩盖)。
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:8137}"
@@ -33,14 +36,17 @@ done
 
 echo "=== agent 回归门 @ ${BASE_URL}(model=${MODEL})==="
 
-echo "--- [1/3] lag_probe(多请求内容正确性)---"
+echo "--- [1/4] lag_probe(多请求内容正确性)---"
 python3 "${HERE}/lag_probe.py" --base-url "${BASE_URL}" --model "${MODEL}"
 
-echo "--- [2/3] agent_wire_smoke(wire 契约 17 项)---"
+echo "--- [2/4] agent_wire_smoke(wire 契约 17 项)---"
 python3 "${HERE}/agent_wire_smoke.py" --base-url "${BASE_URL}" --model "${MODEL}"
 
-echo "--- [3/3] e2e(27B 黑盒;自带 boot,端口 8135)---"
+echo "--- [3/4] session_identity_probe(会话身份 = 内容身份 11 项)---"
+python3 "${HERE}/session_identity_probe.py" --base-url "${BASE_URL}" --model "${MODEL}"
+
+echo "--- [4/4] e2e(27B 黑盒;自带 boot,端口 8135)---"
 echo "注:e2e 自起进程(8135/CUDA 1),启用前请确认该卡空闲(上面那个 server 在 8137)"
 (cd "${HERE}/../../.." && cargo test -p server --test e2e -- --nocapture)
 
-echo "=== 三门全绿 ==="
+echo "=== 四门全绿 ==="

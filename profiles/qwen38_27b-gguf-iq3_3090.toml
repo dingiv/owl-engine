@@ -38,19 +38,13 @@ bind = "0.0.0.0:8137"
 # 视觉塔(GGUF 主干不含 model.visual.*)
 
 [runtime]
-# 会话表软上限(0 = 不限;>0 = 新请求前按 LRU 淘汰空闲会话)
-max_sessions = 0
 # 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
 admission_on_full = "reject"
-keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 # 229376 = 7168 页(boot 报的 cap 286041 的 80%,已含 0.9GB 视觉塔);
 # 实测 64k/128k 零拒发、余量 2.1GB。
 max_seq = 229376
-max_concurrency = 1
 # GGUF prefill 走 MMQ2;512→2048 实测 +8~15%,4096 在 8k prompt 上会边界降级。
 prefill_chunk = 2048
-prefill_tail_merge = 0
-implicit_session = true
 
 [spec]
 # 同档③:外部 DFlash2 W4A16 草稿(depth>0 + draft_path ⇒ tag filter 同时放行

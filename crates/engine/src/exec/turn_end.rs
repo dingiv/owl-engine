@@ -1,4 +1,4 @@
-//! turn 终局(burn_ephemeral / abandon / complete)
+//! turn 终局(abandon / complete / cancel)
 use super::*;
 use owl_iface::contract::ModelError;
 
@@ -6,7 +6,7 @@ use owl_iface::contract::ModelError;
 ///
 /// 两种弃置的账面可信度不同:
 /// - 客户端中断(断流/取消):KV `[0, fed)` 是**算完的真内容** ⇒ 发布;
-/// - 引擎错误:账面不可信 ⇒ 不发布(`burn_ephemeral` 的注释同一判据)。
+/// - 引擎错误:账面不可信 ⇒ 不发布(turn 账不可信，但**会话保留**)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AbandonPublish {
     /// 把**已写入**的前缀写回会话账并交给 `Release(Abort)` 登记链身份。
@@ -28,21 +28,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         self.bank.release_turn_table(session_id)
     }
 
-    /// turn 烧毁(E5 性能会战:server 泵错误路径的原先弃置会让 active
-    /// 会话滞留 → GDN 格泄漏 → 2 格两轮耗尽)。与 complete 同构的清理,
-    /// 但**不 commit_turn/不进前缀缓存**(引擎错误后账面不可信;ephemeral
-    /// 直接焚,键控会话保留账本 —— 前缀守卫失配自动回退全量重算,安全)。
-    /// E1:ephemeral 会话终了焚毁(块链/MTP 链归账房 + 表移除释放格)。
-    /// complete 与 abandon 共用 —— 两路径的清理原 ~20 行双写。
-    pub(crate) fn burn_ephemeral(&mut self, session_id: u64) {
-        self.bank.burn(session_id);
-        // **[N5 SessionClose]**:会话关闭 ⇒ 归属回 `System`(会话面已交还给
-        //    缓存/池;后续分配没有会话归属可谈)
-        self.set_dev_ctx(
-            owl_iface::handle::Owner::System,
-            owl_iface::handle::AssetClass::Unclassified,
-        );
-    }
     pub async fn abandon(&mut self, err: String) -> TurnEvent {
         // **归属只从显式选择器取**（`schedule` 为本步选中的单 turn）；
         // 无选择器时才退回“活跃首”（批动作失败 = 整批失败，弃行首让泵
@@ -62,7 +47,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 由服务面继续泵 —— 全清会把无辜会话连坐)。执行选择器缺省 = 活跃首
         // (批动作失败时未选定)。
         if let Some(act) = self.turns.take_exec() {
-            // 引擎错误：账面不可信 ⇒ **不发布**已写入前缀（见 `burn_ephemeral` 注释）
+            // 引擎错误：账面不可信 ⇒ **不发布**已写入前缀（会话保留，前缀守卫失配自会回退全量）
             self.abandon_active(act, turn_id, AbandonPublish::Skip).await;
         }
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
@@ -130,8 +115,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if let Some(pos) = self.turns.queue.iter().position(|t| t.id == turn) {
             if let Some(t) = self.turns.queue.remove(pos) {
                 // 排队 turn 未占设备资源(块链/GDN 行都在起 turn 时借)⇒ 只清账。
-                // **ephemeral 必须焚**（F-18）：会话是 submit 时建的，排队终局
-                // 没有 `Release` 钩子来收它。
+                // **会话保留**：它是 submit 时按内容身份建的持久账（F-18 的
+                // "临时会话漏焚"已随 ephemeral 概念一起退休 —— 2026-11-16）。
                 self.drop_queued_turn(&t);
                 return Some(TurnEvent::Failed {
                     turn,
@@ -203,7 +188,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 act.id,
                 act.session_id,
                 act.gdn_slot,
-                act.ephemeral,
                 publish == AbandonPublish::WrittenPrefix,
             ))
             .await
@@ -280,6 +264,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let s = self.bank.sessions.session_mut(act.session_id)?;
         s.tokens.clear();
         s.tokens.extend_from_slice(&act.prompt_ids[..written]);
+        // 内容身份的参考边界 = 已写入的 prompt 段（中断时 generation 尚未落账）
+        // 历史长度唯一真源 = `tokens.len()`（2026-11-16 收口，无 cached_len）
+        s.prompt_boundary = written;
         // 位置账:长度对不上 = 结构错(写错位置比不写更坏 ⇒ 清空后
         // leave-gap 自会按"位置账缺失"跳过,而不是拿错坐标算)
         if act.positions.len() >= written {
@@ -487,7 +474,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 act.id,
                 act.session_id,
                 act.gdn_slot,
-                act.ephemeral,
             ))
             .await;
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死

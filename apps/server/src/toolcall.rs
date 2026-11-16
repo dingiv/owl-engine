@@ -330,8 +330,8 @@ pub struct ChannelSplitter {
     buf: String,
     schemas: ToolSchemas,
     tool_index: usize,
-    /// 工具块解析开关(`[agent] parse_tool_calls`;关 = `<tool_call>` 原文
-    /// 进 `content` —— 诊断臂/兼容旧客户端)
+    /// 工具块解析开关(产品面**恒开**;`with_tool_parsing(false)` 只留给
+    /// 单测/诊断调用方 —— `<tool_call>` 原文进 `content`)
     tool_on: bool,
     /// 游标标记计数(如关思考时仍吐 `</thinking>`)—— 一律**吞掉**不泄漏
     /// 进通道,但计数交给上层记日志(不许静默)
@@ -385,8 +385,8 @@ impl ChannelSplitter {
         }
     }
 
-    /// 关工具块解析(`[agent] parse_tool_calls = false`):工具标记不再进
-    /// 工具通道,而是**按普通文本放行**(诊断/回退臂)。思考通道不受影响。
+    /// 关工具块解析(单测/诊断用):工具标记不再进工具通道,而是**按普通
+    /// 文本放行**。思考通道不受影响。产品面不暴露这个开关(2026-11-16)。
     pub fn with_tool_parsing(mut self, on: bool) -> Self {
         self.tool_on = on;
         self
@@ -2322,7 +2322,7 @@ mod tests {
         assert_eq!(split(&items), "R:推理|T:答案|");
     }
 
-    /// `[agent] parse_tool_calls = false`(诊断/回退臂):工具标记**按普通文本
+    /// 工具解析关(单测/诊断臂):工具标记**按普通文本
     /// 放行**,而思考通道不受影响
     #[test]
     fn tool_parsing_can_be_disabled() {

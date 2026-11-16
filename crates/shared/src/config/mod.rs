@@ -47,18 +47,15 @@
 //! | (顶层) | site | 表 / 无 —— **站点映射**(model_path/draft_path/bind/device;
 //! |   |   | 派生后摘除;路径/卡位不入库) |
 //! | server | bind | String / "127.0.0.1:8135" |
-//! | server | parse_tool_calls / tool_call_format / auto_disable_thinking_with_tools | 工具面(见字段注) |
-//! | server | template_path / reasoning_effort | Option / None(模板覆盖 / 思考档缺省) |
-//! | runtime | gpu_min_free_ratio | f64 / 0.9(自动挑卡的空闲占比阈值) |
-//! | runtime | max_concurrency / max_sessions / queue_wait_ms | usize / 8、0、0(并发 / 会话表软上限 / 排队超时) |
-//! | runtime | implicit_session / default_max_new / max_new_cap | 会话面(见字段注) |
+//! | server | template_vars | String / ""(chat 模板变量文件；模板变量不属于引擎配置) |
+//! | server | template_path | Option / None(模板覆盖) |
+//! | ~~runtime~~ | *(max_concurrency 2026-11-16 退役 → `pool.gdn_slots` 唯一真源)* |
+//! | runtime | default_max_new / max_new_cap | 生成缺省与上限(见字段注；会话身份已改为**内容身份**，无 implicit_session 键) |
 //! | runtime | max_seq | usize / 4096 |
-//! | runtime | prefill_chunk / prefill_tail_merge | usize / 512、0 |
+//! | runtime | prefill_chunk | usize / 512（性能旋钮；尾块合并收成引擎定值 0） |
 //! | runtime | max_batch | usize / 1(合批上限;>1 需 gdn_slots≥它、单卡、无选择层) |
 //! | runtime | admission_on_full | String / "reject"(准入满员姿态;`reject` \| `queue` \| `queue:<ms>`) |
-//! | runtime | idle_compact / pressure_low_pct / pressure_high_pct | bool、usize、usize / false、12、25(空转默认不预搬;低触发/高目标) |
-//! | runtime | host_pressure_low_pct / host_pressure_high_pct / host_pressure_interval_ms | usize、usize、usize / 12、25、1000(宿主低触发/高目标/空转节流) |
-//! | runtime | host_pressure_request_slots / host_pressure_request_snaps | usize、usize / 16、1(每请求 KV/快照搬迁上限) |
+//! | ~~runtime~~ | *(腾挪/压力 8 键 2026-11-16 退役：`idle_compact` / `pressure_*` / `host_pressure_*`)* | → `owl_store::PressurePolicy`（零旋钮；水位由池几何导出） |
 //! | runtime | test_device | 测试域(不入 toml) |
 //! | parallel | mode | ParallelMode 枚举 single\|tensor / single |
 //! | parallel | device | [String] 卡位(BDF / UUID / find-name;**禁 CUDA 序号**);空 = 自动挑空闲卡 |
@@ -123,13 +120,10 @@
 //! | cuda | capture_slab_mb | Option<usize> / None(hint 定量) |
 //! | cuda | *(nvrtc_include/native_aot 2026-10-13 退役 —— NVRTC 已删)* | — |
 //! | graph | no_graph | flag / false(总闸:eager 直发,跳过**全部**图捕获) |
-//! | agent | template_path | Option<String> / None(相对路径 = 相对 model.dir) |
-//! | agent | implicit_session | flag / false(AGT-09:不带 session 键 ⇒ 会话 0) |
+//! | agent | template_path | Option<String> / None(相对路径 = 相对 model.dir;`[agent]` 段已解散，现住 `[server]`) |
 //! | agent | default_max_new / max_new_cap | usize / 4096、8192 |
-//! | agent | parse_tool_calls | flag / true(工具三通道解析) |
-//! | agent | tool_call_format | ToolCallFormat 枚举("xml"\|"json")/ xml |
 //! | agent | auto_disable_thinking_with_tools | flag / false(有工具即关思考) |
-//! | agent | reasoning_effort | Option<String> / None(OpenAI 同名协议值,
+//! | agent | default_reasoning_effort | Option<String> / None(OpenAI 同名协议值,
 //! |   |   | 模板值域 none/low/medium/high…;None = 不传让模板取默认) |
 //!
 //! 账外键(不入公共面):测试私有旋钮(OWL_GATE_*/OWL_E2E_*/OWL_SWEEP_*/
@@ -447,14 +441,6 @@ fn default_gguf_mmvq_l2_mib() -> usize {
     4
 }
 
-fn default_newcomer_min() -> usize {
-    4096
-}
-
-fn default_min_gen() -> usize {
-    256
-}
-
 fn default_admission_on_full() -> String {
     "reject".to_string()
 }
@@ -463,82 +449,36 @@ fn default_max_batch() -> usize {
     1
 }
 
-fn default_pressure_low_pct() -> usize {
-    12
-}
-
-fn default_pressure_high_pct() -> usize {
-    25
-}
-
-fn default_host_pressure_low_pct() -> usize {
-    12
-}
-
-fn default_host_pressure_interval_ms() -> usize {
-    1000
-}
-
-fn default_host_pressure_high_pct() -> usize {
-    25
-}
-
-fn default_host_pressure_request_slots() -> usize {
-    16
-}
-
-fn default_host_pressure_request_snaps() -> usize {
-    1
-}
-
 /// 进程装配面
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeCfg {
-    /// **自动选卡的空闲占比阈值**(0..1;默认 0.9):候选卡的 `memory.free/total` 低于它
-    /// ⇒ auto-pick 跳过(避让非 owl 进程/未持锁实例);显式 spec 命中且全被跳 ⇒ 响亮拒启。
-    pub gpu_min_free_ratio: f64,
-    /// **最大并发请求数**(在跑 + 排队;超出者排队等待)。须 ≤ `pool.gdn_slots`
-    /// (每并发会话占一格 DDN 行)—— 启动校验不足即拒。
-    pub max_concurrency: usize,
-    /// **会话表上限**（`[runtime] max_sessions`；0 = 不限；2026-11-05 F-22）。
+    // **`gpu_min_free_ratio` 已删**（2026-11-16 用户裁决）：自动选卡的"避让
+    // 阈值"是引擎自决（`GPU_MIN_FREE_RATIO` = 0.9），不是操作员旋钮。
+    // **`max_concurrency` 已删**（2026-11-16 用户裁决）：它与 `pool.gdn_slots`
+    // 是同一个"同时推进"上限（旧的启动校验就强制 ≤，`gdn_slots = 0` 还反过来
+    // 派生自它）。现在**唯一真源 = `pool.gdn_slots`**：服务面的 permit 数、
+    // 引擎的活跃 turn 槽位上限，全从它来。
+    /// **会话总数不设上限**（2026-11-16 原始算法裁决）。
     ///
-    /// 键控会话（客户端任意 `session` 键）会长期留在 `SessionTable`，只增不减。
-    /// >0 ⇒ 新请求进来前按 LRU 淘汰**空闲**会话（不淘汰活跃/排队）；被淘汰的
-    /// 只是 host 侧 token 历史/链游标（设备表在 turn 收口已归还）⇒ 下轮全量
-    /// 重算，正确性不变。活跃会话数受限并发，故 cap 是"软上限"。
-    #[serde(default)]
-    pub max_sessions: usize,
-    /// **隐式默认会话**(AGT-09):请求不带 `session` 键时落到会话 0。
-    /// pi 每轮全量重发历史 ⇒ 前缀增量命中;false = 每请求临时会话。
-    #[serde(default)]
-    pub implicit_session: bool,
-    /// 未带 `max_tokens` 时的生成步数
+    /// 常驻成本 = 元数据 + **可驱逐资产**（块链/快照/索引）；上限由池 +
+    /// host/disk 预算 + 淘汰机制给。硬约束只有"同时推进"：
+    /// `gdn_slots`。旧 `max_sessions` 软上限已删。
+    ///
+    /// 会话身份 = **内容身份**（无键请求按 prompt 前缀认会话），因此也不再
+    /// 需要"隐式会话 0"开关（旧 `implicit_session`）。
     pub default_max_new: usize,
     /// `max_tokens` 夹紧上限
     pub max_new_cap: usize,
-    /// **排队超时(毫秒;0 = 关)**:提交后这么久还没看到第一个 prefill/token
-    /// ⇒ 取消该 turn 并回 `429 + Retry-After`。
-    #[serde(default)]
-    pub queue_wait_ms: usize,
-    /// **SSE 静默保活间隔(毫秒;0 = 关;缺省 1000)**。
-    ///
-    /// 流上这么久没写过任何字节 ⇒ 写一帧 **SSE 注释**(`: keepalive`)。作用不是
-    /// 防代理超时(附带),而是**探测客户端断流**:长 prefill(100k prompt 是分钟级)
-    /// 期间不产 token ⇒ 手写 HTTP 的 chunked 流没有任何写操作 ⇒ 对端 FIN 无从
-    /// 暴露 ⇒ 引擎把整段 prefill 白跑完。写失败 = 连接已死 ⇒ 立刻弃置该 turn。
-    /// SSE 规范要求解析器忽略 `:` 开头的注释行。
-    #[serde(default)]
-    pub keepalive_ms: usize,
+    // **`queue_wait_ms` 已删**（2026-11-16 用户裁决）：它与
+    // `admission_on_full = "queue:<ms>"` 是同一个"等多久"（两处毫秒必有一处
+    // 失效）⇒ 唯一来源 = `admission_on_full`，服务面的 HTTP 排队超时也从它派生。
+    // **`keepalive_ms` 已删**（2026-11-16 用户裁决）：SSE 探活是**传输层策略**
+    // （服务面定值 1000ms），不是引擎行为。
     pub max_seq: usize,
-    /// **图片 leave-gap 的位置空洞预留**（以 `max_seq` 为单位；默认 **0.5**，0 = 关）。
-    ///
-    /// 语义：可用上下文仍是 `max_seq`（token 预算不变），但 rope 表按
-    /// `max_seq + 0.5·max_seq` 建 —— 多出来的位置**只允许被 image leave-gap 消费**
-    /// （正常会话 pos_hi = n_tokens ≤ max_seq，进不了这一段）。
-    /// 262144 档 ⇒ 预留 131072 位置（≈65 张 2k 截图）；用尽即触发一次位置压实。
-    #[serde(default = "default_gap_reserve_factor")]
-    pub gap_reserve_factor: f64,
+    // **`gap_reserve_factor` 已删**（2026-11-16 用户裁决）：图片 leave-gap 的
+    // 位置预留是**引擎实现细节**（定值 = `GAP_RESERVE_FACTOR` = 0.5×max_seq），
+    // 操作员既算不出也不该算 —— rope 表长与位置压实的触发点是引擎自己的账。
     pub prefill_chunk: usize,
     /// **引擎跨会话合批上限**(B5.1;缺省 **1 = 逐字节现状**)。
     ///
@@ -548,14 +488,10 @@ pub struct RuntimeCfg {
     /// > 批语义未审)、`kvmem.select_decode = false`(M1 页表按行,不做视图)。
     #[serde(default = "default_max_batch")]
     pub max_batch: usize,
-    /// **尾块合并**(tokens;L4,2026-10-18):`剩余 ≤ prefill_chunk + 本值`
-    /// ⇒ 本步一口气吃完剩余(块长上限 = chunk + tail_merge)。
-    ///
-    /// 动机(实测,`perf-runs/prefill-prof-2026-10-18/REPORT.md` §4):每 chunk
-    /// 有一份**与尺寸无关**的固定宿主税(~250ms:6395 条命令 alloc/launch/free
-    /// 往返;4-token 的尾块也要 249ms)⇒ `<chunk` 的尾块是纯亏。
-    /// 默认 **0 = 关 = 逐字节旧行为**(块长 = min(chunk, 剩余))。
-    pub prefill_tail_merge: usize,
+    // **`prefill_tail_merge` 已删**（2026-11-16 用户裁决）：合并与否取决于
+    // 「prefill 的激活工作区预算」，那是引擎自己的账。当前定值 =
+    // `PREFILL_TAIL_MERGE = 0`（不合并；2048+512 会贴 OOM 边，全档实测值），
+    // 等工作区预算可查询后再自算（roadmap 3.4 保持 🧭）。
     /// **相位时间片**:每 `slice_every` 拍 decode 之后插**一片** prefill
     /// (0 = 关 = 旧行为:prefill 独占泵)。在位者 ITL 上界 ≈
     /// `solo + slice_ms / (slice_every+1)`。见 `sched_policy` 模块头 P1。
@@ -564,60 +500,23 @@ pub struct RuntimeCfg {
     /// 时间片单片 prefill token 数(0 = 用整 `prefill_chunk`)
     #[serde(default)]
     pub slice_tokens: usize,
-    /// **准入:给未来新人的预留**(token/人;反推在位者的生成封顶)
-    #[serde(default = "default_newcomer_min")]
-    pub newcomer_min_tokens: usize,
-    /// **准入:在位者的最小生成量**(低于它就不留新人预留 —— 在位者优先)
-    #[serde(default = "default_min_gen")]
-    pub min_gen_tokens: usize,
-    /// **准入:池保留页**(0 = 自动 `min(nb/64, 8)`)
-    #[serde(default)]
-    pub reserve_pages: usize,
-    /// **准入:等待队列上限**(0 = 无界;超出 ⇒ 新来者 429 `no_slot`)
-    #[serde(default)]
-    pub max_queue: usize,
+    // **准入三旋钮已删**（2026-11-16 用户裁决）：
+    // `newcomer_min_tokens` / `min_gen_tokens` / `max_queue` 是"给新人留头寸"
+    // 的补丁层。原始算法的预算已经**保底**：一轮在 submit 时就按
+    // 「本请求上下文 + 本档最大输出长度(`max_new_cap`)」预留，装不下就拒/排队
+    // ⇒ 在跑的 turn 不会被新人挤占，也不需要公平性旋钮去补贴它。
     /// **准入满员姿态**（`[runtime] admission_on_full`；2026-11-05 从 env 收编）：
     /// `"reject"`（缺省）/ `"queue"`（最多等 30s）/ `"queue:<ms>"`。
     /// 坏值 = boot 拒启（`validate` 与引擎构造都走同一解析）。
     #[serde(default = "default_admission_on_full")]
     pub admission_on_full: String,
-    /// **空转整理策略**(缺省 `false` = 不预搬)。
-    ///
-    /// `false` = 空转只做池缓存回收，不主动把设备块搬到宿主/磁盘；
-    /// `true` = 池自由页低于 [`Self::pressure_low_pct`] 时按
-    /// [`Self::pressure_high_pct`] 做一次后台 compact。
-    #[serde(default)]
-    pub idle_compact: bool,
-    /// **压力低水位**(占主池页数百分比；缺省 12)。
-    /// 自由页低于它才算“池在压力下”；仅在 `idle_compact` 或
-    /// `PoolExhausted` 后的收缩路径消费。
-    #[serde(default = "default_pressure_low_pct")]
-    pub pressure_low_pct: usize,
-    /// **压力高水位/目标水位**(占主池页数百分比；缺省 25)。
-    /// 触发后把自由页补到该水位，形成“低触发 / 高目标”的滞回，
-    /// 避免每拍在阈值附近抖动。
-    #[serde(default = "default_pressure_high_pct")]
-    pub pressure_high_pct: usize,
-    /// **宿主压力低水位**(占宿主该腿总槽数百分比；缺省 12)。
-    /// 低于它才发 `HostPressure`；KV 宿主与快照宿主各自独立套用。
-    #[serde(default = "default_host_pressure_low_pct")]
-    pub host_pressure_low_pct: usize,
-    /// **宿主压力高水位/目标**(占该腿总槽百分比；缺省 25)。
-    /// 低水位触发后补到该值；策略层保证 high ≥ low。
-    #[serde(default = "default_host_pressure_high_pct")]
-    pub host_pressure_high_pct: usize,
-    /// **每请求 KV 宿主搬迁上限**(HostPressure;缺省 16 槽)。
-    /// 0 = 不设每请求上限（仍受单次绝对 cap 64）。
-    #[serde(default = "default_host_pressure_request_slots")]
-    pub host_pressure_request_slots: usize,
-    /// **每请求快照宿主搬迁上限**(HostPressure;缺省 1 条)。
-    /// 快照单条约 152MiB，不能和 KV 槽共用配额。
-    #[serde(default = "default_host_pressure_request_snaps")]
-    pub host_pressure_request_snaps: usize,
-    /// **HostPressure 最小间隔**(毫秒；缺省 1000)。
-    /// 只节流空转 compact；`PoolExhausted` 的应急收缩不走这个间隔。
-    #[serde(default = "default_host_pressure_interval_ms")]
-    pub host_pressure_interval_ms: usize,
+    // **腾挪/压力策略的 8 个键已删**（2026-11-16 用户裁决）：
+    // `idle_compact` / `pressure_low_pct` / `pressure_high_pct` /
+    // `host_pressure_low_pct` / `host_pressure_high_pct` /
+    // `host_pressure_request_slots` / `host_pressure_request_snaps` /
+    // `host_pressure_interval_ms` —— 水位是池几何的函数、每次腾多少是 store
+    // 的延迟预算、空转要不要整理由**真实余量**回答 ⇒ 全部搬进
+    // `owl_store::PressurePolicy`（零旋钮），引擎只读现场信号并执行。
     /// **测试设备门控值**(不入 toml;测试入口自填):`OWL_TEST_DEVICE` 的 **BDF**
     /// (如 `41:00.0`)。`Some` = GPU 门已过。**CUDA 序号禁用**(序会漂)。
     #[serde(skip)]
@@ -845,9 +744,9 @@ pub const POOL_GRAPH_WARMUP_RESERVE_MB: u64 = 458;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PoolCfg {
-    /// 并发上限(每活跃 turn 一套 GDN 行;也是池下限算式的 N_active)。
-    /// **0 = 自动 = `[runtime] max_concurrency`**(并发数配几个就几格 —— 用户裁决
-    /// 2026-10-20);非 0 = 显式值(旧档逐字节不变)。
+    /// **同时推进的 turn 上限**（每活跃 turn 一套 GDN 行；也是池下限算式的
+    /// N_active）。**必须显式 ≥ 1**（2026-11-16：旧的"0 = 自动 = max_concurrency"
+    /// 已随那个键一起退休 —— 现在它就是唯一真源，服务面 permit 数也用它）。
     #[serde(default = "default_gdn_slots")]
     pub gdn_slots: usize,
     /// **末段页对齐**(缺省 `true`;前缀复用闭环)。
@@ -1850,10 +1749,17 @@ pub struct LogCfg {
 }
 
 /// serde 缺省 = true(布尔配置项的显式缺省;避免 `#[serde(default)]` 落到 false)
-/// 图片 leave-gap 的位置预留（`max_seq` 的倍数；0 = 关）。
-fn default_gap_reserve_factor() -> f64 {
-    0.5
-}
+/// **图片 leave-gap 的位置预留**（`max_seq` 的倍数；引擎定值，不是配置项）。
+///
+/// 语义：可用上下文仍是 `max_seq`（token 预算不变），但 rope 表按
+/// `max_seq + 0.5·max_seq` 建 —— 多出来的位置**只允许被 image leave-gap 消费**
+/// （正常会话 pos_hi = n_tokens ≤ max_seq，进不了这一段）。
+/// 262144 档 ⇒ 预留 131072 位置（≈65 张 2k 截图）；用尽即触发一次位置压实。
+pub const GAP_RESERVE_FACTOR: f64 = 0.5;
+
+/// **自动选卡的空闲占比阈值**（引擎定值）：候选卡 `free/total` 低于它 ⇒
+/// auto-pick 跳过（避让非 owl 进程/未持锁实例）；显式 spec 命中且全被跳 ⇒ 响亮拒启。
+pub const GPU_MIN_FREE_RATIO: f64 = 0.9;
 
 fn default_true() -> bool {
     true
@@ -2011,19 +1917,6 @@ pub mod sync_bit {
     pub const ALL: u32 = HTOD | DTOH | FENCE | LAUNCH | GRAPH | ALLOC;
 }
 
-/// 工具调用输出格式(agent.tool_call_format;**jinja 模板同名变量**)。
-/// xml = `<function=…><parameter=…>` 块;json = `<tool_call>{"name":…}` 单行。
-/// 解析器两格式都认(`toolcall.rs`),**切换时必须与模板同批**。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ToolCallFormat {
-    /// 模板缺省(厂商推荐)
-    #[default]
-    Xml,
-    /// 单行 JSON(部分实现/工具链更易解析)
-    Json,
-}
-
 /// 服务面(HTTP 监听 + 模板/工具链;2026-10-21 由 `[server]`+`[agent]` 合并)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -2037,16 +1930,15 @@ pub struct ServerCfg {
     /// 相对路径 = 相对模型目录。**不动快照**换模板的运维抓手。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_path: Option<String>,
-    /// 工具三通道解析(关 = 工具文本原样进 `content` —— 诊断臂)
-    pub parse_tool_calls: bool,
-    /// 工具格式(**必须与模板同值**:模板按它选分支,解析器按它选状态机)
-    pub tool_call_format: ToolCallFormat,
-    /// 有工具即关思考(模板同名变量;产品选择待真机 A/B)
-    pub auto_disable_thinking_with_tools: bool,
-    /// 思考档位缺省(OpenAI 同名协议值;请求带 `reasoning_effort` 时以请求为准)。
-    /// None = 不传 ⇒ 模板取自己的缺省
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
+    /// **chat 模板变量文件**（`chat_template.toml`；空 = 自动找
+    /// `<model.dir>/chat_template.toml`；相对路径 = 相对模型目录）。
+    ///
+    /// 2026-11-16 用户裁决：**模板变量不属于引擎配置**。`tool_call_format` /
+    /// `auto_disable_thinking_with_tools` / `reasoning_effort` 这些 jinja 变量
+    /// 全部搬进这个独立文件（扁平表，一个键 = 一个模板变量）；引擎配置里只留
+    /// 这个**文件路径**。
+    #[serde(default)]
+    pub template_vars: String,
 }
 
 impl Default for ServerCfg {
@@ -2055,10 +1947,7 @@ impl Default for ServerCfg {
             bind: "127.0.0.1:8135".into(),
             request_dump_dir: String::new(),
             template_path: None,
-            parse_tool_calls: true,
-            tool_call_format: ToolCallFormat::Xml,
-            auto_disable_thinking_with_tools: false,
-            reasoning_effort: None,
+            template_vars: String::new(),
         }
     }
 }
@@ -2091,13 +1980,12 @@ pub struct OwlConfig {
 impl RuntimeCfg {
     /// **gap 预留的 token 数**（0 = 关）。
     ///
-    /// `gap_reserve_factor = 0.5` ⇒ `max_seq / 2`。只影响 rope 表长与位置压实
+    /// `GAP_RESERVE_FACTOR = 0.5` ⇒ `max_seq / 2`。只影响 rope 表长与位置压实
     /// 触发点，**不改** token 预算（`max_seq`）。
+    ///
+    /// 2026-11-16：倍数不是配置项（引擎定值），operator 没有信息量去改它。
     pub fn gap_reserve_tokens(&self) -> usize {
-        if !self.gap_reserve_factor.is_finite() || self.gap_reserve_factor <= 0.0 {
-            return 0;
-        }
-        (self.max_seq as f64 * self.gap_reserve_factor).round() as usize
+        (self.max_seq as f64 * GAP_RESERVE_FACTOR).round() as usize
     }
 
     /// **rope 表的位置容量** = 可用上下文 + gap 预留。
@@ -2112,34 +2000,14 @@ impl RuntimeCfg {
 impl Default for RuntimeCfg {
     fn default() -> Self {
         Self {
-            gpu_min_free_ratio: 0.9,
-            max_concurrency: 8,
-            max_sessions: 0,
-            implicit_session: false,
             default_max_new: 4096,
             max_new_cap: 8192,
-            queue_wait_ms: 0,
-            keepalive_ms: 1000,
             max_seq: 4096,
-            gap_reserve_factor: default_gap_reserve_factor(),
             prefill_chunk: 512,
             max_batch: 1,
-            prefill_tail_merge: 0,
             slice_every: 0,
             slice_tokens: 0,
-            newcomer_min_tokens: 4096,
-            min_gen_tokens: 256,
-            reserve_pages: 0,
-            max_queue: 0,
             admission_on_full: default_admission_on_full(),
-            idle_compact: false,
-            pressure_low_pct: 12,
-            pressure_high_pct: 25,
-            host_pressure_low_pct: 12,
-            host_pressure_high_pct: 25,
-            host_pressure_request_slots: 16,
-            host_pressure_request_snaps: 1,
-            host_pressure_interval_ms: 1000,
             test_device: None,
         }
     }
@@ -2579,7 +2447,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
     // 整段搬走的用"段存在即拒",单键搬走的逐键拒 —— 一律给出可行动的新写法。
     const MOVED_SECTIONS: &[(&str, &str)] = &[
         ("graph", "`[graph] no_graph` 已并入 `[cuda] graph`(语义取正:graph = false 才是 eager 直发)"),
-        ("agent", "`[agent]` 已解散:并发/会话旋钮 → `[runtime]`(max_concurrency / implicit_session / default_max_new / max_new_cap / queue_wait_ms);模板与工具面 → `[server]`(template_path / parse_tool_calls / tool_call_format / auto_disable_thinking_with_tools / reasoning_effort)"),
+        ("agent", "`[agent]` 已解散:并发旋钮 → `[runtime]`(max_concurrency / default_max_new / max_new_cap / queue_wait_ms);模板面 → `[server]`(template_path / template_vars)；**模板变量本身**住 `chat_template.toml`(2026-11-16)；会话身份 = 内容身份(无 implicit_session/max_sessions 键) - 2026-11-16 原始算法"),
         ("dispatch", "`[dispatch]` 已更名为 `[kernel]`(字段名不变)"),
     ];
     for (section, hint) in MOVED_SECTIONS {
@@ -2607,7 +2475,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
         (
             "server",
             "max_concurrency",
-            "已搬到 `[runtime] max_concurrency`(与 gdn_slots 的校验同一处)",
+            "并发上限的唯一真源现在是 `[pool] gdn_slots`(2026-11-16：`[runtime] max_concurrency` 已删)",
         ),
         (
             "model",
@@ -2840,31 +2708,6 @@ pub fn parse_cli_set(s: &str) -> Result<(String, toml::Value), String> {
     Ok((key.to_string(), val))
 }
 
-/// **自动派生**:`[pool].gdn_slots = 0` ⇒ `[runtime] max_concurrency`
-/// (并发数配几个就几格 —— 用户裁决 2026-10-20)。显式非 0 值逐字节不变。
-fn derive_auto_pool(v: &mut toml::Value) -> Result<(), String> {
-    let Some(root) = v.as_table_mut() else {
-        return Ok(());
-    };
-    let concurrency = root
-        .get("runtime")
-        .and_then(|s| s.get("max_concurrency"))
-        .and_then(|c| c.as_integer())
-        .unwrap_or(8)
-        .max(1) as usize;
-    let Some(pool) = root.get_mut("pool").and_then(|p| p.as_table_mut()) else {
-        return Ok(());
-    };
-    let g = pool
-        .get("gdn_slots")
-        .and_then(|g| g.as_integer())
-        .unwrap_or(-1);
-    if g == 0 {
-        pool.insert("gdn_slots".into(), toml::Value::Integer(concurrency as i64));
-    }
-    Ok(())
-}
-
 /// **配置档完整度策略**(2026-10-21)。
 ///
 /// 背景:生产/预检要求「档必须全字段显式」(缺一拒启,启动点可复现);
@@ -2969,7 +2812,6 @@ impl OwlConfig {
             layer_names.push("cli".into());
         }
         let meta = resolve::apply(&mut v, &mut origins)?;
-        derive_auto_pool(&mut v)?;
         reject_retired_keys(&v)?;
         let config: Self = v
             .try_into()
@@ -3003,7 +2845,6 @@ impl OwlConfig {
         let mut origins = Origins::new();
         record_origins(&v, "", &Origin::File("<inline>".into()), &mut origins);
         let meta = resolve::apply(&mut v, &mut origins)?;
-        derive_auto_pool(&mut v)?;
         reject_retired_keys(&v)?;
         let config: Self = v
             .try_into()
@@ -3022,12 +2863,9 @@ impl OwlConfig {
     /// 枚举合法),字段之间的**语义**在这里拒 —— 三处入口(server / cli /
     /// 配置档)同守,不再各自写一份。
     ///
-    /// 规则①`pool.gdn_slots ≥ server.max_concurrency`:GDN 状态格 = 每并发会话
-    /// 一格;并发超格数 ⇒ 第 N+1 会话把**活跃**会话的状态格 LRU 逐出 =
-    /// 跨会话状态污染(不是“排队等待”那种良性降级)。
-    /// 原写法在 `apps/server/src/main.rs`(server 要读引擎内部容量、直接
-    /// `exit(1)`),且**只有 server 一条入口守** —— 直接构造 engine 的路径
-    /// (tests / cli)裸奔。
+    /// 规则①`pool.gdn_slots ≥ 1`（**唯一真源**，2026-11-16）：它是"同时推进
+    /// 的 turn 上限"，服务面 permit 数与引擎活跃槽位上限都从它来；旧
+    /// `[runtime] max_concurrency` 已删，`0 = 自动` 也一并退休。
     pub fn validate(&self) -> Result<(), String> {
         // **[model.rope] 只对 GGUF 单文件档生效**(2026-11-05 响亮拒):
         // HF/AWQ 档的 rope 事实由装载器硬编码(family 参数),YaRN 无接线。
@@ -3038,16 +2876,6 @@ impl OwlConfig {
                  {:?} 档的 rope 事实硬编码在装载器里(不支持 YaRN)—— \
                  请改用 GGUF 档或把 yarn_factor 设回 1.0",
                 self.model.rope.yarn_factor, self.model.format
-            ));
-        }
-        // **图片 gap 预留**（2026-11-08）：倍数必须有限且非负；上限 8 防手滑
-        // （当前档 max_seq ≤ 1M，8× 会让 rope 表吃掉几十 GB）。
-        if !(self.runtime.gap_reserve_factor.is_finite()
-            && (0.0..=8.0).contains(&self.runtime.gap_reserve_factor))
-        {
-            return Err(format!(
-                "[runtime] gap_reserve_factor = {} 非法（需有限且 ∈ [0,8]；0 = 关）",
-                self.runtime.gap_reserve_factor
             ));
         }
         // 2026-11-04:`kv_fp8`/`kv_int8` 两布尔已并为 `kv_dtype`(枚举三类)。
@@ -3173,14 +3001,12 @@ impl OwlConfig {
                     return Err("[spec] mtp_ring 只服务 MTP；当前档是 DFlash2".to_string());
                 }
             }
-            // ring 是**单会话固定池**：同一物理环不按会话分片。多会话并发会
-            // 互相覆盖对方仍可能恢复的 MTP 链。当前只放行隐式单会话 + 不批。
-            if !self.runtime.implicit_session
-                || self.runtime.max_concurrency > 1
-                || self.runtime.max_batch > 1
-            {
+            // ring 是**单物理环**：同一环不按会话分片，两个并发 turn 的草稿写
+            // 会互相覆盖。`mtp_ring` 只服务"一次一个 turn"的档位（开环的档位
+            // 本来就是低并发测速档）。
+            if self.pool.gdn_slots > 1 || self.runtime.max_batch > 1 {
                 return Err(
-                    "[spec] mtp_ring 需要单会话固定环：请开 runtime.implicit_session=true，                     并保持 max_concurrency=1 / max_batch=1（多会话需每会话独立 ring，尚未实现）"
+                    "[spec] mtp_ring 是单 turn 的固定物理环：请保持 pool.gdn_slots=1 / max_batch=1（并发两 turn 会互相覆盖环内容）"
                         .to_string(),
                 );
             }
@@ -3321,12 +3147,6 @@ impl OwlConfig {
                 ));
             }
         }
-        if !(0.0..=1.0).contains(&self.runtime.gpu_min_free_ratio) {
-            return Err(format!(
-                "[runtime] gpu_min_free_ratio({}) 越界:须 0..=1(自动挑卡的空闲占比阈值)",
-                self.runtime.gpu_min_free_ratio
-            ));
-        }
         // **前缀缓存份额**:0..=1(0 = 不留缓存设备份额;1 = 可占满设备池)。
         // 越界 = 配置错(算式在 store,静默夹会让"我要 150% 池"变成别的东西)。
         // **前缀无感删除的依赖门**(2026-10-23):删除路径靠**内容寻址**取回旧链,
@@ -3352,6 +3172,16 @@ impl OwlConfig {
             return Err(
                 "[pool] snap_disk_mb > 0 但 snap_max = 0(没有快照池,盘上分片无意义)\
                  —— 清掉 snap_disk_mb 或给快照池"
+                    .to_string(),
+            );
+        }
+        // **生成预算自洽**（2026-11-16 用户裁决：预留 = 上下文 + max_new_cap）。
+        // `max_new_cap = 0` ⇒ 任何请求都算不出预留（一进来就被拒）——
+        // 那是配置错误，不是"关掉生成"的开关。
+        if self.runtime.max_new_cap == 0 {
+            return Err(
+                "[runtime] max_new_cap = 0 —— 准入预算是「上下文 + 本档最大输出长度」；\
+                 上限为 0 等于所有请求都无法准入（要短生成就把请求的 max_tokens 调小）"
                     .to_string(),
             );
         }
@@ -3392,11 +3222,14 @@ impl OwlConfig {
         }
         // 准入姿态：坏值必须在 boot 前拒（env 收编后的单一解析点）。
         self.runtime.parse_admission_on_full()?;
-        if self.pool.gdn_slots < self.runtime.max_concurrency {
-            return Err(format!(
-                "[pool] gdn_slots({}) < [runtime] max_concurrency({})—— GDN 状态格 = 每并发会话一格,\n              并发超格数会把活跃会话的状态格 LRU 逐出(跨会话状态污染);请调 gdn_slots ≥ max_concurrency",
-                self.pool.gdn_slots, self.runtime.max_concurrency
-            ));
+        // **`gdn_slots` 是"同时推进"的唯一真源**（2026-11-16）：服务面 permit 数、
+        // 引擎活跃槽位上限都从它来 ⇒ 0（旧"自动"）与 0 以下一律拒启。
+        if self.pool.gdn_slots == 0 {
+            return Err(
+                "[pool] gdn_slots = 0 —— 它是「同时推进的 turn 上限」的唯一真源\
+                 （服务面 permit / 引擎槽位都从它来）；请显式写 ≥ 1"
+                    .to_string(),
+            );
         }
         // **FI 单图烘 plan 的上界律**(2026-10-18 W3):喂进去的 `ctx_total` 被烘死
         // ⇒ 图自携的表按该上界枚举工作项;若真实 ctx 超过它,运行期算出的 chunk 数
@@ -3475,27 +3308,33 @@ mod tests {
     fn 会话与模板面缺省与账外键() {
         let c = OwlConfig::default();
         assert!(c.server.template_path.is_none());
-        assert!(!c.runtime.implicit_session, "隐式会话默认关(旧行为不变)");
         assert_eq!(c.runtime.default_max_new, 4096);
         assert_eq!(c.runtime.max_new_cap, 8192);
-        assert!(c.server.parse_tool_calls);
-        assert_eq!(c.server.tool_call_format, ToolCallFormat::Xml);
-        assert!(!c.server.auto_disable_thinking_with_tools);
-        assert!(c.server.reasoning_effort.is_none());
+        assert_eq!(c.server.template_vars, "", "空 = 自动找快照旁的 chat_template.toml");
         // 账外键 / 非法枚举 = 拒启(deny_unknown_fields + 严格枚举)
         assert!(OwlConfig::from_toml_str("[server]\ntemplate_pathz = \"x\"").is_err());
-        assert!(OwlConfig::from_toml_str("[server]\ntool_call_format = \"yaml\"").is_err());
+        // **模板变量不再是引擎配置键**（2026-11-16 用户裁决）
+        assert!(
+            OwlConfig::from_toml_str("[server]\ntool_call_format = \"yaml\"").is_err(),
+            "模板变量必须去 chat_template.toml"
+        );
         let c = OwlConfig::from_toml_str(
-            "[runtime]\nimplicit_session = true\nmax_new_cap = 32768\n\
-             [server]\ntool_call_format = \"json\"\nreasoning_effort = \"high\"\n",
+            "[runtime]\nmax_new_cap = 32768\n\
+             [server]\ntemplate_vars = \"/tmp/ct.toml\"\n",
         )
         .expect("合法键应通过");
-        assert!(c.runtime.implicit_session);
-        assert_eq!(c.server.tool_call_format, ToolCallFormat::Json);
+        assert_eq!(c.server.template_vars, "/tmp/ct.toml");
         assert_eq!(c.runtime.max_new_cap, 32768);
-        assert_eq!(c.server.reasoning_effort.as_deref(), Some("high"));
+        // **会话面旧键已退役**（2026-11-16 原始算法：会话数不设上限、身份 = 内容身份）
+        for k in ["max_sessions", "implicit_session"] {
+            let src = format!("[runtime]\n{k} = 1\n");
+            assert!(
+                OwlConfig::from_toml_str(&src).is_err(),
+                "{k} 必须被 unknown-field 拒启"
+            );
+        }
         // 旧段 = 响亮退役提示
-        let e = OwlConfig::from_toml_str("[agent]\nparse_tool_calls = true\n").expect_err("必须拒");
+        let e = OwlConfig::from_toml_str("[agent]\ntool_call_format = \"xml\"\n").expect_err("必须拒");
         assert!(e.contains("[agent]"), "拒语应点名段: {e}");
     }
 
@@ -3563,10 +3402,8 @@ mod tests {
         );
     }
 
-    /// **跨字段语义门**(D1,2026-10-17):`gdn_slots < max_concurrency` 必拒,
-    /// 拒语要点出病因(状态格逐出 = 跨会话污染)与调法;合规组合(生产档 1/1、
-    /// 缺省 8/8)必须过。
     /// **合批上限自洽门**(B5.1):gdn_slots 不足 / 与 TP / 选择层互斥 ⇒ 拒启
+    /// （顺带覆盖 `admission_on_full` 的三种形态解析）
     #[test]
     fn admission_on_full_parses_three_forms_and_rejects_bad() {
         use super::AdmissionOnFullCfg;
@@ -3597,17 +3434,18 @@ mod tests {
     #[test]
     fn max_batch_requires_gdn_slots_and_no_virtualization() {
         let parse = |t: &str| OwlConfig::from_toml_str(t);
-        parse("[runtime]\nmax_batch = 2\nmax_concurrency = 2\n[pool]\ngdn_slots = 2\n")
+        parse("[runtime]\nmax_batch = 2\n[pool]\ngdn_slots = 2\n")
             .expect("合法合批档应接受");
         assert!(
-            parse("[runtime]\nmax_batch = 3\nmax_concurrency = 2\n[pool]\ngdn_slots = 2\n")
+            parse("[runtime]\nmax_batch = 3\n[pool]\ngdn_slots = 2\n")
                 .is_err(),
             "gdn_slots < max_batch 应拒"
         );
-        parse("[runtime]\nmax_batch = 2\nmax_concurrency = 2\n[pool]\ngdn_slots = 2\n[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\n")
-            .expect("TP2 真批已落地:max_batch=2 应接受");
+        // 2026-11-16 起 **TP2 真批已落地**（两 rank 各跑一份 batch 图，图内含 AR）
+        parse("[runtime]\nmax_batch = 2\n[pool]\ngdn_slots = 2\n[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\n")
+            .expect("TP2 真批:max_batch=2 应接受");
         assert!(
-            parse("[runtime]\nmax_batch = 2\nmax_concurrency = 2\n[kvmem]\nselect_decode = true\n[pool]\ngdn_slots = 2\n")
+            parse("[runtime]\nmax_batch = 2\n[kvmem]\nselect_decode = true\n[pool]\ngdn_slots = 2\n")
                 .is_err(),
             "合批 + 选择层视图应拒"
         );
@@ -3632,19 +3470,30 @@ mod tests {
             .expect("缺省 cap=0(不启用 per-session 上限)");
     }
 
+    /// **`max_new_cap = 0` 拒启**（2026-11-16：准入预算 = 上下文 + 该值，
+    /// 0 等于所有请求都算不出预留）。
     #[test]
-    fn validate_rejects_concurrency_over_gdn_slots() {
-        let e = OwlConfig::from_toml_str("[pool]\ngdn_slots = 1\n[runtime]\nmax_concurrency = 8\n")
-            .expect_err("1 格 vs 8 并发必须拒");
+    fn validate_rejects_zero_max_new_cap() {
+        let e = OwlConfig::from_toml_str("[runtime]\nmax_new_cap = 0\n")
+            .expect_err("max_new_cap = 0 必须拒启");
+        assert!(e.contains("max_new_cap"), "拒语应点名键: {e}");
+        OwlConfig::from_toml_str("[runtime]\nmax_new_cap = 8192\n").expect("正数合规");
+    }
+
+    /// **`gdn_slots` = 同时推进的唯一真源**（2026-11-16）：0（旧"自动"）拒启；
+    /// 旧键 `[runtime] max_concurrency` 已删（unknown-field 拒启）。
+    #[test]
+    fn gdn_slots_is_the_only_concurrency_truth() {
+        let e = OwlConfig::from_toml_str("[pool]\ngdn_slots = 0\n")
+            .expect_err("gdn_slots = 0 必须拒启");
+        assert!(e.contains("gdn_slots") && e.contains("唯一真源"), "拒语应可行动: {e}");
+        OwlConfig::from_toml_str("[pool]\ngdn_slots = 1\n").expect("显式 1 合规");
+        OwlConfig::from_toml_str("[pool]\ngdn_slots = 8\n").expect("显式 8 合规");
         assert!(
-            e.contains("gdn_slots") && e.contains("跨会话状态污染"),
-            "拒语应可行动: {e}"
+            OwlConfig::from_toml_str("[runtime]\nmax_concurrency = 2\n").is_err(),
+            "max_concurrency 必须被 unknown-field 拒启"
         );
-        OwlConfig::from_toml_str("[pool]\ngdn_slots = 1\n[runtime]\nmax_concurrency = 1\n")
-            .expect("相等 = 合规(生产 spec-dflash 档即此)");
-        OwlConfig::from_toml_str("[pool]\ngdn_slots = 8\n[runtime]\nmax_concurrency = 2\n")
-            .expect("格多于并发 = 合规");
-        OwlConfig::default().validate().expect("缺省档 8/8");
+        OwlConfig::default().validate().expect("缺省档合规");
     }
 
     /// **注意力臂单键化(2026-10-21)**:verify/decode 各**一个**枚举值。
@@ -3772,11 +3621,9 @@ mod tests {
 
     #[test]
     fn 正语义分派与合法文件() {
-        // 注:`max_concurrency = 1` 是 **D1 语义门**(2026-10-17)要求的 ——
-        // 本 fixture 原为 `gdn_slots = 1` + 缺省 `max_concurrency = 8`,
-        // 那是“能反序列化但语义非法”的组合(server 侧原先会在 boot 拒启)。
+        // 并发唯一真源 = `pool.gdn_slots`（2026-11-16：`[runtime] max_concurrency` 已删）
         let c = OwlConfig::from_toml_str(
-            "[kernel]\nqkv_fuse = false\ngdn_fused_decode_v2 = false\n[pool]\ngdn_slots = 1\n[runtime]\nmax_concurrency = 1\n",
+            "[kernel]\nqkv_fuse = false\ngdn_fused_decode_v2 = false\n[pool]\ngdn_slots = 1\n",
         )
         .expect("合法文件应通过");
         assert!(!c.kernel.qkv_fuse);
@@ -3786,18 +3633,29 @@ mod tests {
 }
 
 #[cfg(test)]
-mod prefill_tail_merge_tests {
+mod retired_runtime_keys {
     use super::*;
 
-    /// L4(2026-10-18):`[runtime] prefill_tail_merge` 缺省 **0 = 关**(旧行为),
-    /// 显式给值可开;非法(负数)由类型拒。
+    /// **2026-11-16 第二批退役键**：`queue_wait_ms`（并入 `admission_on_full`）、
+    /// `keepalive_ms`（传输层定值）、`prefill_tail_merge`（引擎定值 0）、
+    /// `gpu_min_free_ratio` / `gap_reserve_factor`（引擎定值）。
     #[test]
-    fn prefill_tail_merge_defaults_off_and_parses() {
-        let c = OwlConfig::from_toml_str("[runtime]\nmax_seq = 128\n").expect("解析");
-        assert_eq!(c.runtime.prefill_tail_merge, 0, "缺省必须关(旧行为)");
-        let c2 = OwlConfig::from_toml_str("[runtime]\nprefill_tail_merge = 1024\n").expect("解析");
-        assert_eq!(c2.runtime.prefill_tail_merge, 1024);
-        assert!(OwlConfig::from_toml_str("[runtime]\nprefill_tail_merge = -1\n").is_err());
+    fn retired_runtime_keys_are_rejected() {
+        for k in [
+            "queue_wait_ms",
+            "keepalive_ms",
+            "prefill_tail_merge",
+            "gpu_min_free_ratio",
+            "gap_reserve_factor",
+            "max_concurrency",
+        ] {
+            let src = format!("[runtime]\n{k} = 1\n");
+            assert!(
+                OwlConfig::from_toml_str(&src).is_err(),
+                "{k} 必须被 unknown-field 拒启（已删/已派生）"
+            );
+        }
+        OwlConfig::from_toml_str("[runtime]\nmax_seq = 128\n").expect("合法档");
     }
 }
 
@@ -3896,43 +3754,30 @@ mod extends_tests {
         let child = d.join("child.toml");
         write(
             &child,
-            "extends = [\"a.toml\", \"b.toml\"]\n\n[runtime]\nmax_concurrency = 1\n",
+            "extends = [\"a.toml\", \"b.toml\"]\n\n[pool]\ngdn_slots = 1\n",
         );
         let c = OwlConfig::load(None, Some(&child)).expect("load");
         assert_eq!(c.runtime.max_seq, 222, "后列覆盖前列");
         assert_eq!(c.pool.snap_max, 2, "后列覆盖前列");
-        assert_eq!(c.runtime.max_concurrency, 1, "自身键生效");
+        assert_eq!(c.pool.gdn_slots, 1, "自身键生效");
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// **图片 gap 预留**（2026-11-08）：默认 0.5×max_seq，0 = 关；
-    /// 非法倍数必须在配置面拒启（不在跑起来后除以负数/NaN）。
+    /// **图片 gap 预留是引擎定值**（2026-11-16：倍数不再是配置项）：
+    /// `GAP_RESERVE_FACTOR = 0.5` ⇒ `max_seq / 2`；旧键写了即拒启。
     #[test]
-    fn gap_reserve_derives_from_max_seq() {
+    fn gap_reserve_is_engine_fixed() {
         let c = OwlConfig::from_toml_str("[runtime]\nmax_seq = 262144\n").expect("解析");
-        assert!((c.runtime.gap_reserve_factor - 0.5).abs() < 1e-12, "默认 0.5");
         assert_eq!(c.runtime.gap_reserve_tokens(), 131_072, "0.5 × 262144");
         assert_eq!(c.runtime.rope_pos_cap(), 393_216, "ctx + 预留");
-
-        let c = OwlConfig::from_toml_str(
-            "[runtime]\nmax_seq = 1024\ngap_reserve_factor = 0.0\n",
-        )
-        .expect("解析");
-        assert_eq!(c.runtime.gap_reserve_tokens(), 0, "0 = 关");
-        assert_eq!(c.runtime.rope_pos_cap(), 1024);
-
-        let c = OwlConfig::from_toml_str(
-            "[runtime]\nmax_seq = 1000\ngap_reserve_factor = 0.25\n",
-        )
-        .expect("解析");
-        assert_eq!(c.runtime.gap_reserve_tokens(), 250);
-
-        for bad in ["-1.0", "9.0", "nan"] {
-            let e = OwlConfig::from_toml_str(&format!(
-                "[runtime]\ngap_reserve_factor = {bad}\n"
-            ))
-            .expect_err("非法倍数必须拒");
-            assert!(e.contains("gap_reserve_factor"), "{e}");
+        let c = OwlConfig::from_toml_str("[runtime]\nmax_seq = 1024\n").expect("解析");
+        assert_eq!(c.runtime.gap_reserve_tokens(), 512);
+        for k in ["gap_reserve_factor", "gpu_min_free_ratio"] {
+            let src = format!("[runtime]\n{k} = 0.5\n");
+            assert!(
+                OwlConfig::from_toml_str(&src).is_err(),
+                "{k} 必须被 unknown-field 拒启（引擎定值）"
+            );
         }
     }
 
@@ -4122,17 +3967,6 @@ mod config_overlay_tests {
 mod auto_pool_tests {
     use super::*;
 
-    /// `[pool].gdn_slots = 0` ⇒ 自动 = `[server].max_concurrency`（并发数配几个几格）
-    #[test]
-    fn gdn_slots_auto_follows_concurrency() {
-        let c = OwlConfig::from_toml_str("[runtime]\nmax_concurrency = 3\n[pool]\ngdn_slots = 0\n")
-            .expect("合法档");
-        assert_eq!(c.pool.gdn_slots, 3);
-        // 缺省 server.max_concurrency = 8
-        let c = OwlConfig::from_toml_str("[pool]\ngdn_slots = 0\n").expect("合法档");
-        assert_eq!(c.pool.gdn_slots, 8);
-    }
-
     #[test]
     fn dflash2_lookup_validation() {
         let ok = OwlConfig::from_toml_str(
@@ -4259,74 +4093,55 @@ mod auto_pool_tests {
         assert!(e.contains("depth = 0"), "{e}");
     }
 
-    /// 显式值逐字节不变（旧档零行为差）
+    /// 显式值逐字节不变（旧档零行为差；`max_concurrency` 已删）
     #[test]
     fn explicit_gdn_slots_is_untouched() {
-        let c = OwlConfig::from_toml_str("[runtime]\nmax_concurrency = 2\n[pool]\ngdn_slots = 6\n")
-            .expect("合法档");
+        let c = OwlConfig::from_toml_str("[pool]\ngdn_slots = 6\n").expect("合法档");
         assert_eq!(c.pool.gdn_slots, 6);
     }
 
-    /// 准入三旋钮的缺省与显式值
+    /// **准入三旋钮已退役**（2026-11-16 用户裁决）：预算 = 上下文 + 最大输出
+    /// 长度，在 submit 时预留；旧键 = `unknown field` 拒启。
     #[test]
-    fn admission_knobs_defaults_and_overrides() {
-        let c = OwlConfig::from_toml_str("").expect("空档");
-        assert_eq!(c.runtime.newcomer_min_tokens, 4096);
-        assert_eq!(c.runtime.min_gen_tokens, 256);
-        assert_eq!(c.runtime.reserve_pages, 0, "0 = 自动");
-        assert_eq!(c.runtime.queue_wait_ms, 0, "排队超时缺省关");
-        let c = OwlConfig::from_toml_str(
-            "[runtime]\nnewcomer_min_tokens = 2048\nmin_gen_tokens = 128\nreserve_pages = 4\n\
-             queue_wait_ms = 15000\n",
-        )
-        .expect("合法档");
-        assert_eq!(
-            (c.runtime.newcomer_min_tokens, c.runtime.min_gen_tokens),
-            (2048, 128)
-        );
-        assert_eq!(c.runtime.reserve_pages, 4);
-        assert_eq!(c.runtime.queue_wait_ms, 15000);
+    fn admission_knobs_are_retired() {
+        for k in ["newcomer_min_tokens", "min_gen_tokens", "max_queue"] {
+            let src = format!("[runtime]\n{k} = 1\n");
+            assert!(
+                OwlConfig::from_toml_str(&src).is_err(),
+                "{k} 必须被 unknown-field 拒启（已删）"
+            );
+        }
     }
 
-    /// 空转/压力水位：缺省不预搬，显式才开；百分比原样保留（策略层再钳位）
+    /// **腾挪/压力 8 键已退役**（2026-11-16 用户裁决）：策略搬进
+    /// `owl_store::PressurePolicy`（零旋钮，水位由池几何导出）⇒ 旧键必须拒启。
     #[test]
-    fn idle_and_pressure_defaults_are_conservative() {
-        let c = OwlConfig::from_toml_str("").expect("空档");
-        assert!(!c.runtime.idle_compact, "缺省不做空转预搬");
-        assert_eq!(c.runtime.pressure_low_pct, 12);
-        assert_eq!(c.runtime.pressure_high_pct, 25);
-        assert_eq!(c.runtime.host_pressure_low_pct, 12);
-        assert_eq!(c.runtime.host_pressure_high_pct, 25);
-        assert_eq!(c.runtime.host_pressure_request_slots, 16);
-        assert_eq!(c.runtime.host_pressure_request_snaps, 1);
-        assert_eq!(c.runtime.host_pressure_interval_ms, 1000);
-        let c = OwlConfig::from_toml_str(
-            "[runtime]\nidle_compact = true\npressure_low_pct = 20\npressure_high_pct = 40\n\
-             host_pressure_low_pct = 15\nhost_pressure_high_pct = 35\nhost_pressure_request_slots = 8\nhost_pressure_request_snaps = 2\nhost_pressure_interval_ms = 500\n",
-        )
-        .expect("显式档");
-        assert!(c.runtime.idle_compact);
-        assert_eq!(
-            (c.runtime.pressure_low_pct, c.runtime.pressure_high_pct),
-            (20, 40)
-        );
-        assert_eq!(
-            (
-                c.runtime.host_pressure_low_pct,
-                c.runtime.host_pressure_high_pct,
-                c.runtime.host_pressure_request_slots,
-                c.runtime.host_pressure_request_snaps,
-                c.runtime.host_pressure_interval_ms
-            ),
-            (15, 35, 8, 2, 500)
-        );
+    fn pressure_knobs_are_retired() {
+        for k in [
+            "idle_compact",
+            "pressure_low_pct",
+            "pressure_high_pct",
+            "host_pressure_low_pct",
+            "host_pressure_high_pct",
+            "host_pressure_request_slots",
+            "host_pressure_request_snaps",
+            "host_pressure_interval_ms",
+        ] {
+            let src = format!("[runtime]\n{k} = 1\n");
+            assert!(
+                OwlConfig::from_toml_str(&src).is_err(),
+                "{k} 必须被 unknown-field 拒启（已搬进 store）"
+            );
+        }
+        // 健康档不受影响（水位/上限全在 store 内部）
+        OwlConfig::from_toml_str("[pool]\ngdn_slots = 1\n").expect("合法档");
     }
 
     /// 自动 gdn_slots 与 max_batch 的自洽门：并发 2 + 批 3 ⇒ 拒（批位吃不到）
     #[test]
     fn auto_gdn_slots_still_guards_max_batch() {
         let e = OwlConfig::from_toml_str(
-            "[runtime]\nmax_batch = 3\nmax_concurrency = 2\n[pool]\ngdn_slots = 0\n",
+            "[runtime]\nmax_batch = 3\n[pool]\ngdn_slots = 0\n",
         );
         assert!(e.is_err(), "gdn_slots(auto)=2 < max_batch=3 应拒");
     }

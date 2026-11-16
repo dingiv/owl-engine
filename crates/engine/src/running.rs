@@ -232,130 +232,8 @@ pub(crate) struct BootCtx {
     pub(crate) seq: u64,
 }
 
-/// **紧急压力单次腾槽上限**（`PoolExhausted` 后的收缩；原 N6 改名）：
-/// 一次最多腾这么多槽，避免"一口气搬空"把正在跑的 turn 的工作集也冲掉。
-const PRESSURE_MAX_SLOTS: usize = 64;
-
-/// 空转 compact 单次腾槽上限（显式 `idle_compact=true` 才走）。
-const IDLE_COMPACT_MAX_SLOTS: usize = 16;
-
-/// 单次 HostPressure 最多补多少宿主槽（防止低水位目标过大时一次搬空）。
-const HOST_PRESSURE_MAX_SLOTS: usize = 64;
-
-/// **压力信号快照**（P1-3）：把"池/宿主/磁盘/驱动"的余量一次读齐。
-///
-/// 读的时候全部是纯 host 账；不触发 I/O，也不改任何状态。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PressureSignals {
-    pub(crate) pool_free_pages: usize,
-    pub(crate) pool_total_pages: usize,
-    /// KV 宿主腿 + 状态腿的剩余槽（合计；用于判断是否还能下沉）。
-    pub(crate) host_free_slots: usize,
-    /// 分腿余量/开关：启用的腿低于低水位 ⇒ 需要 HostPressure。
-    pub(crate) host_kv_enabled: bool,
-    pub(crate) host_snap_enabled: bool,
-    pub(crate) host_kv_total_slots: usize,
-    pub(crate) host_snap_total_slots: usize,
-    pub(crate) host_kv_free_slots: usize,
-    pub(crate) host_snap_free_slots: usize,
-    /// KV 盘腿 + 状态盘腿的剩余槽。
-    pub(crate) disk_free_slots: usize,
-    pub(crate) disk_kv_free_slots: usize,
-    pub(crate) disk_snap_free_slots: usize,
-    /// 最紧一张卡的驱动 free（TP2 取两 rank 的 min）。
-    pub(crate) driver_free_bytes: u64,
-    pub(crate) reserve_bytes: u64,
-}
-
-impl PressureSignals {
-    /// 驱动余量已低于 boot 预留。
-    pub(crate) fn driver_below_reserve(&self) -> bool {
-        self.driver_free_bytes < self.reserve_bytes
-    }
-
-    /// 一行诊断（日志/报告；不参与判据）。
-    pub(crate) fn summary(&self) -> String {
-        format!(
-            "pool {}/{} 页 · host {} 槽 · disk {} 槽 · driver {:.0}MiB/reserve {:.0}MiB{}",
-            self.pool_free_pages,
-            self.pool_total_pages,
-            self.host_free_slots,
-            self.disk_free_slots,
-            self.driver_free_bytes as f64 / 1048576.0,
-            self.reserve_bytes as f64 / 1048576.0,
-            if self.driver_below_reserve() { " · 驱动低于预留" } else { "" }
-        )
-    }
-}
-
-/// **压力水位策略**：低水位触发、高水位目标（滞回）。
-///
-/// 百分比是主池页数的占比，不是驱动字节；固定池档的池墙才是主判据。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PressurePolicy {
-    low_pct: usize,
-    high_pct: usize,
-    host_low_pct: usize,
-    host_high_pct: usize,
-}
-
-impl Default for PressurePolicy {
-    fn default() -> Self {
-        Self {
-            low_pct: 12,
-            high_pct: 25,
-            host_low_pct: 12,
-            host_high_pct: 25,
-        }
-    }
-}
-
-impl PressurePolicy {
-    pub(crate) fn new(
-        low_pct: usize,
-        high_pct: usize,
-        host_low_pct: usize,
-        host_high_pct: usize,
-    ) -> Self {
-        let low = low_pct.clamp(1, 100);
-        let high = high_pct.clamp(low, 100);
-        let host_low = host_low_pct.clamp(1, 100);
-        let host_high = host_high_pct.clamp(host_low, 100);
-        Self {
-            low_pct: low,
-            high_pct: high,
-            host_low_pct: host_low,
-            host_high_pct: host_high,
-        }
-    }
-
-    /// 宿主腿低水位（按该腿总槽数）。
-    pub(crate) fn host_low_slots(&self, total: usize) -> usize {
-        Self::slots_at(total, self.host_low_pct)
-    }
-
-    /// 宿主腿目标水位（触发后补到该值；≥ 低水位）。
-    pub(crate) fn host_high_slots(&self, total: usize) -> usize {
-        Self::slots_at(total, self.host_high_pct).max(self.host_low_slots(total))
-    }
-
-    fn slots_at(total: usize, pct: usize) -> usize {
-        if total == 0 {
-            return 0;
-        }
-        (total.saturating_mul(pct) / 100).clamp(1, total)
-    }
-
-    /// 触发当前压力所需的目标。`free >= low` 返回 0（不搬）。
-    pub(crate) fn target_slots(&self, total: usize, free: usize, cap: usize) -> usize {
-        let low = Self::slots_at(total, self.low_pct);
-        if free >= low {
-            return 0;
-        }
-        let high = Self::slots_at(total, self.high_pct).max(low);
-        high.saturating_sub(free).min(cap)
-    }
-}
+/// **压力信号**（store 自持的类型；这里只做别名，避免调用点全改）。
+pub(crate) use owl_store::PressureSignals;
 
 /// 生成相位 spec 档位（只用于 `generation_target_for` 的纯算式）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1346,7 +1224,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     owl_shared::log_debug!("img-evict", "detect skipped: session={sid:#x} 不在表");
                 }
             } else {
-                owl_shared::log_debug!("img-evict", "detect skipped: 无 session(ephemeral)");
+                owl_shared::log_debug!("img-evict", "detect skipped: 无 session(新建会话)");
             }
         }
 
@@ -1473,36 +1351,6 @@ impl<D: DeviceClient> RunningEngine<D> {
         opts: crate::turn::TurnOpts,
     ) -> std::result::Result<(u64, u64), SubmitError> {
         let session = session.into();
-        // **在飞总数上限**（P0-2）：批位 + 队列 都有界。
-        // 为什么放在 submit 而不是 `schedule`：槽满时判决根本不跑（
-        // `active.len() < max_batch` 的闸先关），队列会无界膨胀；submit 是
-        // 唯一能看见"活跃 + 排队"总数的地方。0 = 无界（旧行为）。
-        let max_queue = self.boot.cfg.knobs.max_queue;
-        if max_queue > 0 {
-            let in_flight = self.turns.active.len() + self.turns.queue.len();
-            let cap = self
-                .boot
-                .cfg
-                .knobs
-                .max_batch
-                .max(1)
-                .saturating_add(max_queue);
-            if in_flight >= cap {
-                // 退避建议（P3-c）：EWMA × 需要的波数（含自己）
-                let eta = self
-                    .turns
-                    .eta_ms(self.boot.cfg.knobs.max_batch.max(1), self.turns.queue.len());
-                self.turns.note_reject(session.unwrap_or(0), "no_slot");
-                return Err(SubmitError::Rejected(crate::turn::AdmissionReject::new(
-                    "no_slot",
-                    Some(eta),
-                    format!(
-                        "在飞 {in_flight} 已达上限 {cap}（批位 {} + 队列 {max_queue}）",
-                        self.boot.cfg.knobs.max_batch.max(1)
-                    ),
-                )));
-            }
-        }
         // **同会话并发（2026-11-16 P4：引擎排队，不再硬拒）**
         //
         // 同会话两 turn 会共享同一份 KV/GDN 状态 ⇒ 结构性互踩，**必须串行**。
@@ -1535,9 +1383,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 )));
             }
         }
-        // **会话表软上限**（F-22）：在真正创建/复用会话前淘汰 LRU 空闲会话。
-        // 放在 tokenize 之前，避免被淘汰的请求白付 tokenizer 成本。
-        self.enforce_session_cap(session);
         let raw_ids = {
             // 诊断开关(knobs.raw_completion):裸续写,绕过 chat 模板 ——
             // 模型健康度鉴别(模板态病 vs 权重病)的 A/B 臂
@@ -1563,6 +1408,17 @@ impl<D: DeviceClient> RunningEngine<D> {
                 }
             }
             self.boot.tok.encode(&wrapped)
+        };
+        // **会话身份 = 内容身份**（原始算法 §32；2026-11-16）：
+        // - 显式 `session` 键 = **粘性提示**（保留兼容；客户端声明它是哪条对话）；
+        // - 无键 ⇒ 用 prompt 原文在**空闲**会话里找最长公共前缀（≥ 一页）——
+        //   "同一条历史对话的续写"由内容本身认定，不再靠客户端身份。
+        //
+        // 位置：必须在 tokenize 之后（匹配要 token 原文）、在 `image_pad_law`
+        // 之前（删除检测/pad 律要先知道是哪条会话的账）。
+        let session = match session {
+            Some(id) => Some(id),
+            None => self.match_idle_session(&raw_ids),
         };
         // **前缀无感删除的页对齐 pad 律**(2026-10-23):只对**带标记**的图像段
         // 做(且只在 `[vision] image_evict` 开时)—— 未标记/未开档 = 逐字节旧行为。
@@ -1826,11 +1682,10 @@ impl<D: DeviceClient> RunningEngine<D> {
                 ))));
             }
         };
-        let (session_id, ephemeral) = match session {
-            // S2b:建会话不再占 GDN 行(行随 turn 借还)⇒ 无逐出重试
-            Some(id) => (self.bank.get_or_create(Some(id))?, false),
-            None => (self.bank.get_or_create(None)?, true),
-        };
+        // 会话**一律持久**（2026-11-16 原始算法 §32）：无论显式键还是内容身份，
+        // turn 终局只还设备表，不焚会话（idle 会话的快照/前缀账是下一轮命中的
+        // 依据，焚掉等于内容身份失效）。
+        let session_id = self.bank.get_or_create(session)?;
         // **L1 快照键沿用 + 重分类**(2026-11-12 二刀)
         //
         // 纯 append 时位置对齐(前缀守卫生效)⇒ 直接沿用上轮 `msg_snap_keys`;
@@ -1916,43 +1771,38 @@ impl<D: DeviceClient> RunningEngine<D> {
                 m.counter_add("snap.reclassify.miss", reclass_miss as u64, file!(), line!());
             });
         }
-        // **准入封顶**（`sched_policy::cap_for`）：预留 = prompt + min(max_new, cap)。
-        // 不夹的话，turn 会生成超出预留 ⇒ 撞墙/重灌（与准入账打架）。
-        let max_new = {
-            let l = self.admission_limits();
-            let s = self.store_facts();
-            let facts = crate::sched_policy::TurnFacts {
-                turn: 0, // 尚未发号；`cap_for` 只用到 prompt/max_new/oversub
-                session: session_id,
-                prompt_tokens: prompt_ids.len(),
-                cached_tokens: cached_hit,
-                max_new,
-                fed: 0,
-                out_len: 0,
-                phase: crate::sched_policy::PhaseSz::Prefill,
-                spec: false,
-            };
-            let cap = self.turns.admission.cap_for(&l, &s, &facts);
-            if cap < max_new {
-                owl_shared::log_warn!(
-                    "admit",
-                    "生成预算夹紧：max_new {max_new} → {cap}（会话 {session_id:#x}；                     在位者优先 + 给新人留头寸；客户端会看到 finish_reason=length）"
-                );
-                cap.max(1)
-            } else {
-                max_new
-            }
-        };
+        // **生成预算 = 上下文 + 本档最大输出长度**（2026-11-16 用户裁决）。
+        //
+        // 预算是**预留口径**：submit 时就按"这轮最多会长到多少"占住池，
+        // 在跑的 turn 因此不会被新人挤占（准入装不下就拒/排队，不切在跑者的
+        // 份额）。上界同时被**上下文窗口**夹住：`max_seq − prompt`
+        // —— 否则 32k 档里一个 26k prompt 永远"预留 32K 输出"而无法准入。
+        //
+        // `max_new`（实际生成长度）仍 = 请求值，≤ 预留（请求要多少给多少）。
+        let reserve_new = self
+            .boot
+            .cfg
+            .knobs
+            .max_new_cap
+            .min(self.boot.cfg.max_seq_tokens.saturating_sub(prompt_ids.len()));
+        if reserve_new == 0 {
+            return Err(SubmitError::Engine(ModelError::Msg(format!(
+                "submit: prompt {} 已占满上下文窗口（max_seq {}）—— 连 1 token 的输出预算都没有",
+                prompt_ids.len(),
+                self.boot.cfg.max_seq_tokens
+            ))));
+        }
+        let max_new = max_new.min(reserve_new);
         let id = self.turns.alloc_id();
         self.turns.queue.push_back(Turn {
             id,
             session_id,
-            ephemeral,
             spec: TurnSpec {
                 prompt,
                 max_new,
                 ignore_eos: opts.ignore_eos,
             },
+            reserve_new,
             prompt_ids,
             msg_snaps,
             msg_snap_classes,
@@ -2103,38 +1953,31 @@ impl<D: DeviceClient> RunningEngine<D> {
         })
     }
 
-    /// **会话表软上限收口**（F-22）：新请求前按 LRU 淘汰空闲会话。
+    /// **无键请求的会话解析**（内容身份；原始算法 §32；2026-11-16）。
     ///
-    /// - `0` = 不限（旧行为）；
-    /// - 活跃/排队 turn 的会话**绝不淘汰**（避免把正在用的块链/快照打掉）；
-    /// - 淘汰只清 host 账 + 链票（空闲会话的设备表已在 turn 收口归还），
-    ///   下轮同 key 请求 = 新会话、全量重算 ⇒ 正确性不变；
-    /// - 全部会话都忙 ⇒ 允许暂时超过上限（软上限，活跃数另受并发栅门约束）。
-    fn enforce_session_cap(&mut self, protect: Option<u64>) {
-        let cap = self.boot.cfg.knobs.max_sessions;
-        if cap == 0 {
-            return;
+    /// 活跃/排队会话不参与匹配：它们的账是"未来态"（尾部正在写）。
+    /// 匹配下限 = 一页：短于它的公共前缀没有区分度（所有 agent 会话都共享
+    /// 同一段系统提示）。
+    fn match_idle_session(&self, prompt: &[u32]) -> Option<u64> {
+        if !self.boot.cfg.knobs.prefix_cache {
+            return None;
         }
-        let mut busy: std::collections::HashSet<u64> = self
+        let page = self.dev.pool.geom.page.max(1);
+        let busy: std::collections::HashSet<u64> = self
             .turns
             .active
             .iter()
             .map(|a| a.session_id)
             .chain(self.turns.queue.iter().map(|t| t.session_id))
             .collect();
-        if let Some(p) = protect {
-            busy.insert(p);
-        }
-        let need_slot = protect.is_none_or(|id| self.bank.sessions.get(id).is_none());
-        match self.bank.enforce_session_cap(cap, &busy, need_slot) {
-            Ok(0) => {}
-            Ok(evicted) => owl_shared::log_info!(
+        let hit = self.bank.sessions.match_prefix(prompt, page, &busy);
+        if let Some((id, matched)) = hit {
+            owl_shared::log_debug!(
                 "session",
-                "会话表上限 {cap}：淘汰 {evicted} 个空闲会话（LRU；剩余 {}）",
-                self.bank.sessions.len()
-            ),
-            Err(e) => owl_shared::log_warn!("session", "会话上限淘汰失败（继续）：{e}"),
+                "内容身份命中：session={id:#x} 公共前缀 {matched} tok（无键请求）"
+            );
         }
+        hit.map(|(id, _)| id)
     }
 
     /// 活跃 turn 数(B5.1 多活跃;服务面灌流测量读 —— 并发是否真进引擎)。
@@ -2595,7 +2438,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ── H3b：盘索引 / 空转拍（只给正常收尾）─────────────────
         if release.kind == ReleaseKind::TurnEnd {
             // **S6.1：盘上链索引**（内容可能还没溢写 ⇒ boot 按内容截断）。
-            // 放在 ephemeral 焚毁之前 —— 会话 tokens 此刻还在。
+            // 会话账此刻仍在（turn 终局不再抹账）。
             if self.dev.pool.geom.paged && self.bank.rel.disk_enabled() {
                 let toks = self
                     .bank
@@ -2650,10 +2493,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         }
 
-        // ── H6：表/引用归零（ephemeral = 焚毁；否则只释放设备表） ----------
-        if release.ephemeral {
-            self.burn_ephemeral(release.session);
-        } else {
+        // ── H6：表/引用归零（会话账留着；只还设备表） ----------------------
+        {
             let r = self.release_turn_table(release.session);
             match (release.kind, r) {
                 (_, Ok(())) => {}
@@ -2671,8 +2512,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             owl_shared::log_warn!("session", "turn {} 还 GDN 行失败: {e}", release.turn);
         }
 
-        // ── 归属下行（会话仍活 ⇒ Session(s)，焚毁 ⇒ System） ---------------
-        self.set_ctx_after_turn(release.session, release.ephemeral);
+        // ── 归属下行（会话恒活 ⇒ Session(s)） ----------------------------
+        self.set_ctx_after_turn(release.session);
 
         // ── N4：池清点 + 未归还清单 + 兜底释放 + trim ---------------------
         // **先交还 eager 档的瞬态输出**(2026-10-28):那批块是 plan 自己持有的
@@ -2824,10 +2665,95 @@ impl<D: DeviceClient> RunningEngine<D> {
                 snap_bytes as f64 / 1048576.0,
                 signals.summary()
             );
+            // 记录收缩前的自由页：`slots` 是"缺口到高水位",不是绝对目标。
+            let free_before = self.bank.rel.slots_free();
             self.store_hook(StoreHook::pressure_with_snap(slots, snap_bytes))
                 .await?;
+            // **第四级：整会话淘汰**（原始算法 §30/§32；2026-11-16）。
+            // 逐块/逐快照收缩之后仍不够 ⇒ 从**最冷空闲会话**的末端向内丢掉
+            // 它挂着的缓存独占块，并把它从会话表里关掉（快照归属降 Extra）。
+            // 不动活跃/排队会话；被别家共用的前缀块引用不为 1 ⇒ `prune_branch`
+            // 自然停手（内容不丢）。
+            if slots > 0 {
+                let want_free = free_before.saturating_add(slots);
+                let (n, pages) = self.evict_cold_sessions(want_free);
+                if n > 0 {
+                    owl_shared::log_warn!(
+                        "store",
+                        "压力缓解:整会话淘汰 {n} 个（LRU 最冷）腾 {pages} 页（目标 {want_free}，现有 {}）",
+                        self.bank.rel.slots_free()
+                    );
+                }
+            }
         }
         Ok((freed, slots, host_kv, host_snap))
+    }
+
+    /// **整会话淘汰到自由页目标**（原始算法 §30/§32；2026-11-16）。
+    ///
+    /// 次序（每淘汰一个会话）：
+    /// 1. 先取**链尾身份**（关账后会话账里就取不到了）；
+    /// 2. `close_session` —— 还双链引用 + 快照归属降 `Extra`（内容仍在树上）；
+    /// 3. `prune_branch(tail, 整链块数)` —— **从叶向内**逐掉引用为 1 的
+    ///    缓存独占块（别的会话还在用的共享前缀引用 > 1，自动停住）。
+    ///
+    /// 返回 `(淘汰会话数, 腾出的池页数)`。活跃/排队会话不参与；淘汰失败只
+    /// WARN 并拉黑该候选（不静默、不死循环 —— 压力路径不能把 turn 拖死）。
+    pub(crate) fn evict_cold_sessions(&mut self, want_free: usize) -> (usize, usize) {
+        let mut busy: std::collections::HashSet<u64> = self
+            .turns
+            .active
+            .iter()
+            .map(|a| a.session_id)
+            .chain(self.turns.queue.iter().map(|t| t.session_id))
+            .collect();
+        let free0 = self.bank.rel.slots_free();
+        let mut evicted = 0usize;
+        while self.bank.rel.slots_free() < want_free {
+            let Some(victim) = self.bank.sessions.lru_victim_excluding(&busy) else {
+                break; // 只剩忙会话 ⇒ 压力只能由后续 turn 自行消化
+            };
+            busy.insert(victim);
+            let tail = self.session_tail_hash(victim);
+            if let Err(e) = self.close_session(victim) {
+                owl_shared::log_warn!(
+                    "session",
+                    "压力缓解:关会话 {victim:#x} 失败（继续下一个）：{e}"
+                );
+                continue;
+            }
+            if let Some(tail) = tail {
+                let span = self.bank.rel.chain_blocks(tail).len();
+                if span > 0 {
+                    match self.bank.rel.prune_branch(tail, span) {
+                        Ok(_) => {}
+                        Err(e) => owl_shared::log_warn!(
+                            "store",
+                            "压力缓解:会话 {victim:#x} 整链回退失败（继续）：{e}"
+                        ),
+                    }
+                }
+            }
+            evicted += 1;
+        }
+        (evicted, self.bank.rel.slots_free().saturating_sub(free0))
+    }
+
+    /// 会话当前链尾的内容身份（压力淘汰用；`None` = 不足一整块/不在树上）。
+    fn session_tail_hash(&self, id: u64) -> Option<owl_store::ChainHash> {
+        let s = self.bank.sessions.get(id)?;
+        let page = self.dev.pool.geom.page.max(1);
+        let full = s.tokens.len() / page;
+        if full == 0 {
+            return None;
+        }
+        let tags = crate::img_evict::block_tags_pos(
+            s.tokens.len(),
+            page,
+            &s.img_spans,
+            &s.positions,
+        );
+        self.bank.rel.tail_hash_tagged(&s.tokens, full, &tags)
     }
 
     /// **压力信号快照**（P1-3；纯 host 账，零 I/O）。
@@ -2862,36 +2788,14 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
     }
 
-    fn pressure_policy(&self) -> PressurePolicy {
-        PressurePolicy::new(
-            self.boot.cfg.knobs.pressure_low_pct,
-            self.boot.cfg.knobs.pressure_high_pct,
-            self.boot.cfg.knobs.host_pressure_low_pct,
-            self.boot.cfg.knobs.host_pressure_high_pct,
-        )
-    }
-
-    /// HostPressure 每请求目标（KV 前缀块 / 快照条数；分腿裁剪）。
-    fn request_host_pressure(&self, signals: &PressureSignals) -> (usize, usize) {
-        let (planned_kv, planned_snap) = host_pressure_targets(signals, &self.pressure_policy());
-        clamp_host_pressure(
-            planned_kv,
-            planned_snap,
-            self.boot.cfg.knobs.host_pressure_request_slots,
-            self.boot.cfg.knobs.host_pressure_request_snaps,
-        )
-    }
-
-    /// **紧急池压力目标**（`PoolExhausted` 后；不是每拍 N6）。
+    /// **紧急池压力目标**（`PoolExhausted` 后；不是每拍）。
     ///
-    /// 判据 = **压力信号 + 低/高双水位**：自由页低于 low 才触发，目标补到 high
-    /// （滞回，避免阈值附近 churn）。状态腿在宿主有位时带一条快照。
+    /// 判据/水位/上限**全在 `owl_store::PressurePolicy`**（2026-11-16 裁决：
+    /// 这些不是操作员旋钮）；这里只取现场数值并执行。状态腿在宿主有位时
+    /// 带一条快照 —— 字节数只有 `Rel` 知道（`snap_bytes()`）。
     fn pressure_need(&self, signals: &PressureSignals) -> (usize, usize, usize, usize) {
-        let slots = self.pressure_policy().target_slots(
-            signals.pool_total_pages,
-            signals.pool_free_pages,
-            PRESSURE_MAX_SLOTS,
-        );
+        let p = owl_store::PressurePolicy::new();
+        let slots = p.relief_pool_slots(signals.pool_total_pages, signals.pool_free_pages);
         let snap_bytes = if slots > 0
             && signals.host_free_slots > 0
             && self.bank.rel.state_stats().snap_gpu.0 > 0
@@ -2900,34 +2804,25 @@ impl<D: DeviceClient> RunningEngine<D> {
         } else {
             0
         };
-        let (host_kv, host_snap) = self.request_host_pressure(signals);
+        let (host_kv, host_snap) = p.host_targets(signals);
         (slots, snap_bytes, host_kv, host_snap)
     }
 
     /// **H5 空转整理节拍**（Idle pump 计数；每 N 拍问一次）。
     ///
-    /// **默认不预搬**：`runtime.idle_compact=false` 时只让 `pump` 走池缓存
-    /// 回收（`trim_pools`），不触发 `Maintain::Idle`。显式开启后也只按
-    /// 压力信号的低水位触发、补到高水位，不再用固定 `pool/8` 目标。
+    /// **要不要整理由 store 回答**（2026-11-16 裁决，`runtime.idle_compact`
+    /// 键已删）：低水位才触发、补到高水位；余量健康时目标恒 0 ⇒ 空转不做
+    /// 任何搬运。这里只负责"到点了吗 + 把目标交给执行臂"。
     fn idle_tick(&mut self) -> Option<(usize, usize, usize)> {
         if !self.hk.note_idle_pump() {
             return None;
         }
-        if !self.boot.cfg.knobs.idle_compact {
-            return None;
-        }
+        let p = owl_store::PressurePolicy::new();
         let signals = self.pressure_signals();
-        let slots = self.pressure_policy().target_slots(
-            signals.pool_total_pages,
-            signals.pool_free_pages,
-            IDLE_COMPACT_MAX_SLOTS,
-        );
-        let (mut host_kv, mut host_snap) = self.request_host_pressure(&signals);
+        let slots = p.idle_pool_slots(signals.pool_total_pages, signals.pool_free_pages);
+        let (mut host_kv, mut host_snap) = p.host_targets(&signals);
         if host_kv > 0 || host_snap > 0 {
-            let interval = std::time::Duration::from_millis(
-                self.boot.cfg.knobs.host_pressure_interval_ms as u64,
-            );
-            if self.hk.host_pressure_due(interval) {
+            if self.hk.host_pressure_due(p.host_interval()) {
                 self.hk.mark_host_pressure();
             } else {
                 host_kv = 0;
@@ -3081,13 +2976,11 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// **N4 TurnEnd**:turn 收尾后的归属 —— 会话仍活 ⇒ `Session(s)`(它持有 KV/快照
     /// 与 GDN 行,跨 turn),临时会话焚毁 ⇒ `System`;类别回 `Unclassified`
     /// (turn 相位结束,后续分配未分类就**可见地**落 Unclassified 桶)。
-    pub(crate) fn set_ctx_after_turn(&mut self, session_id: u64, burned: bool) {
-        let owner = if burned {
-            owl_iface::handle::Owner::System
-        } else {
-            owl_iface::handle::Owner::Session(session_id)
-        };
-        self.set_dev_ctx(owner, owl_iface::handle::AssetClass::Unclassified);
+    pub(crate) fn set_ctx_after_turn(&mut self, session_id: u64) {
+        self.set_dev_ctx(
+            owl_iface::handle::Owner::Session(session_id),
+            owl_iface::handle::AssetClass::Unclassified,
+        );
     }
 
     /// 当前活跃 turn 的容量票（P0-4；exec 子模块的块表增长入口用）。
@@ -3178,7 +3071,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 act.fed,
                 act.prompt_ids.len(),
                 self.boot.cfg.prefill_chunk,
-                self.boot.cfg.knobs.prefill_tail_merge,
+                crate::engine::PREFILL_TAIL_MERGE,
                 Self::prefill_align_page(
                     self.boot.cfg.knobs.prefill_align_tail,
                     self.boot.cfg.knobs.prefix_cache,
@@ -3629,13 +3522,10 @@ impl<D: DeviceClient> RunningEngine<D> {
     }
 
     /// **排队 turn 的统一终局清理**（F-18）：排队 turn 没占设备资源
-    /// （块链/GDN 行都在 `start_one` 才借），但 **ephemeral 会话是 submit
-    /// 时建的** —— 不焚就永久留在 `SessionTable`。三条终局（准入拒/准入超时/
-    /// 客户端取消）必须走同一处，否则又是一套语义。
+    /// （块链/GDN 行都在 `start_one` 才借），也不动会话账 —— 会话是持久资产
+    /// （2026-11-16 内容身份），一条排队请求被取消/拒收不应抹掉历史。
+    /// 三条终局（准入拒/准入超时/客户端取消）必须走同一处，否则又是一套语义。
     pub(crate) fn drop_queued_turn(&mut self, t: &crate::turn::Turn) {
-        if t.ephemeral {
-            self.bank.burn(t.session_id);
-        }
         if self.turns.admit_wait.map(|(id, _)| id) == Some(t.id) {
             self.turns.admit_wait = None;
         }
@@ -4901,139 +4791,3 @@ mod generation_target_tests {
     }
 }
 
-
-
-/// 宿主腿低于低水位且盘有位 ⇒ 把该腿补回**高水位**（未裁剪的期望值）。
-fn host_pressure_targets(
-    signals: &PressureSignals,
-    policy: &PressurePolicy,
-) -> (usize, usize) {
-    let kv = if signals.host_kv_enabled
-        && signals.host_kv_free_slots < policy.host_low_slots(signals.host_kv_total_slots)
-        && signals.disk_kv_free_slots > 0
-    {
-        policy
-            .host_high_slots(signals.host_kv_total_slots)
-            .saturating_sub(signals.host_kv_free_slots)
-    } else {
-        0
-    };
-    let snap = if signals.host_snap_enabled
-        && signals.host_snap_free_slots < policy.host_low_slots(signals.host_snap_total_slots)
-        && signals.disk_snap_free_slots > 0
-    {
-        policy
-            .host_high_slots(signals.host_snap_total_slots)
-            .saturating_sub(signals.host_snap_free_slots)
-    } else {
-        0
-    };
-    (kv, snap)
-}
-
-/// 每请求分腿配额：KV 槽 / 快照条数分别裁剪（0 = 该腿不设每请求上限）。
-fn clamp_host_pressure(
-    planned_kv: usize,
-    planned_snap: usize,
-    request_slots: usize,
-    request_snaps: usize,
-) -> (usize, usize) {
-    let kv = if request_slots == 0 {
-        planned_kv.min(HOST_PRESSURE_MAX_SLOTS)
-    } else {
-        planned_kv.min(request_slots).min(HOST_PRESSURE_MAX_SLOTS)
-    };
-    let snap = if request_snaps == 0 {
-        planned_snap
-    } else {
-        planned_snap.min(request_snaps)
-    };
-    (kv, snap)
-}
-
-#[cfg(test)]
-mod pressure_tests {
-    use super::{
-        clamp_host_pressure, host_pressure_targets, PressurePolicy, PressureSignals,
-    };
-
-    #[test]
-    fn low_watermark_triggers_and_high_is_the_target() {
-        let p = PressurePolicy::new(12, 25, 12, 25);
-        assert_eq!(p.target_slots(100, 11, 64), 14, "低水位下补到高水位");
-        assert_eq!(p.target_slots(100, 12, 64), 0, "等于低水位不触发");
-        assert_eq!(p.target_slots(100, 0, 64), 25, "空池补到高水位");
-        assert_eq!(p.target_slots(100, 0, 8), 8, "单次上限生效");
-        assert_eq!(p.target_slots(0, 0, 64), 0, "无池不触发");
-    }
-
-    #[test]
-    fn small_pool_and_bad_percentages_are_clamped() {
-        let p = PressurePolicy::new(0, 0, 0, 0);
-        assert_eq!(p.target_slots(4, 0, 64), 1, "1% 至少取 1 页");
-        let p = PressurePolicy::new(80, 10, 12, 25);
-        assert_eq!(p.target_slots(100, 79, 64), 1, "high < low 时按 low 封底");
-    }
-
-    #[test]
-    // 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
-    #[allow(clippy::field_reassign_with_default)]
-    fn host_pressure_uses_independent_low_watermark_and_disk_room() {
-        let p = PressurePolicy::new(12, 25, 20, 40);
-        let mut s = PressureSignals::default();
-        s.host_kv_enabled = true;
-        s.host_snap_enabled = true;
-        s.host_kv_total_slots = 100; // low = 20, high = 40
-        s.host_kv_free_slots = 19;
-        s.disk_kv_free_slots = 100;
-        assert_eq!(
-            host_pressure_targets(&s, &p),
-            (21, 0),
-            "低于低水位补到高水位"
-        );
-        s.host_kv_free_slots = 0;
-        assert_eq!(host_pressure_targets(&s, &p), (40, 0), "空宿主补到高水位");
-        s.host_kv_free_slots = 20;
-        assert_eq!(host_pressure_targets(&s, &p), (0, 0), "等于低水位不触发");
-
-        s.host_snap_total_slots = 10; // low = 2, high = 4
-        s.host_snap_free_slots = 0;
-        s.disk_snap_free_slots = 10;
-        assert_eq!(host_pressure_targets(&s, &p), (0, 4), "状态腿独立高水位");
-        s.disk_kv_free_slots = 0;
-        assert_eq!(host_pressure_targets(&s, &p), (0, 4), "KV 无盘位不影响快照");
-        s.host_kv_free_slots = 0; // KV 仍低但无盘位
-        assert_eq!(host_pressure_targets(&s, &p), (0, 4));
-        s.host_snap_free_slots = 4;
-        assert_eq!(host_pressure_targets(&s, &p), (0, 0));
-    }
-
-    #[test]
-    fn request_quota_clamps_kv_and_snapshot_independently() {
-        assert_eq!(
-            clamp_host_pressure(40, 3, 16, 1),
-            (16, 1),
-            "KV/快照各自裁剪"
-        );
-        assert_eq!(clamp_host_pressure(40, 3, 0, 0), (40, 3), "0 = 不设每请求上限");
-        assert_eq!(
-            clamp_host_pressure(100, 2, 0, 0),
-            (64, 2),
-            "KV 仍受绝对 cap 64"
-        );
-        assert_eq!(clamp_host_pressure(0, 5, 16, 1), (0, 1));
-    }
-
-    #[test]
-    // 结构性豁免(2026-11-02 clippy 清理):用例逐项赋"非缺省"字段:保持与配置面逐行对照的可读性
-    #[allow(clippy::field_reassign_with_default)]
-    fn driver_headroom_is_part_of_the_signal() {
-        let mut s = PressureSignals::default();
-        s.driver_free_bytes = 100;
-        s.reserve_bytes = 200;
-        assert!(s.driver_below_reserve());
-        assert!(s.summary().contains("驱动低于预留"));
-        s.driver_free_bytes = 300;
-        assert!(!s.driver_below_reserve());
-    }
-}

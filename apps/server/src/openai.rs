@@ -450,11 +450,24 @@ impl ChatRequest {
     /// 关思考、`ChannelSplitter` 却按默认 true 启动，答案会被整段吞进
     /// `reasoning_content`。这里在请求层归一化：显式 `enable_thinking`
     /// 优先；否则 `reasoning_effort` 存在时同步派生。
-    pub fn effective_template_kwargs(&self) -> Map<String, Value> {
-        let mut kw = self.chat_template_kwargs.clone().unwrap_or_default();
+    /// `defaults` = `chat_template.toml` 里的变量（2026-11-16 起模板变量
+    /// 不在引擎配置里）；请求 kwargs 覆盖它。
+    pub fn effective_template_kwargs(&self, defaults: &Map<String, Value>) -> Map<String, Value> {
+        let mut kw = defaults.clone();
+        if let Some(req) = &self.chat_template_kwargs {
+            for (k, v) in req {
+                kw.insert(k.clone(), v.clone());
+            }
+        }
+        let req_enable = self
+            .chat_template_kwargs
+            .as_ref()
+            .and_then(|k| k.get("enable_thinking"));
         if let Some(e) = &self.reasoning_effort {
             kw.insert("reasoning_effort".into(), json!(e));
-            if !kw.contains_key("enable_thinking") {
+            // 请求显式 `enable_thinking` 优先；否则由请求档位派生
+            // （覆盖文件里的缺省 —— 请求 > 文件 > 模板自带）。
+            if req_enable.is_none() {
                 kw.insert("enable_thinking".into(), json!(!reasoning_off(e)));
             }
         }
@@ -466,31 +479,50 @@ impl ChatRequest {
     /// 与 [`effective_template_kwargs`](Self::effective_template_kwargs)
     /// 同口径：显式 `enable_thinking` > `reasoning_effort` none/off > true。
     /// 不能让模板关思考而 splitter 仍按 think 态启动。
-    pub fn enable_thinking(&self) -> bool {
-        if let Some(v) = self
-            .chat_template_kwargs
-            .as_ref()
-            .and_then(|k| k.get("enable_thinking"))
-            .and_then(|v| v.as_bool())
-        {
+    pub fn enable_thinking(&self, defaults: &Map<String, Value>, has_tools: bool) -> bool {
+        let kw = self.effective_template_kwargs(defaults);
+        if let Some(v) = kw.get("enable_thinking").and_then(Value::as_bool) {
             return v;
         }
-        !matches!(
-            self.reasoning_effort.as_deref(),
-            Some(e) if reasoning_off(e)
-        )
+        if let Some(e) = kw.get("reasoning_effort").and_then(Value::as_str) {
+            if reasoning_off(e) {
+                return false;
+            }
+        }
+        // **模板对称律**：Qwen 模板里 `auto_disable_thinking_with_tools and
+        // _has_tools` 会关思考 ⇒ splitter 必须同相启动，否则正文全被吞进
+        // `reasoning_content`。变量现在住 `chat_template.toml`。
+        if has_tools
+            && kw
+                .get("auto_disable_thinking_with_tools")
+                .and_then(Value::as_bool)
+                == Some(true)
+        {
+            return false;
+        }
+        true
     }
 }
+
+/// **SSE 静默保活间隔（毫秒；传输层策略，不是引擎配置）**。
+///
+/// 长 prefill（100k prompt 是分钟级）期间流上一个字节都不写 ⇒ chunked 写永远
+/// 不会失败 ⇒ 对端 FIN 无人察觉 ⇒ 引擎把整段 prefill 白跑完。这里按周期写一帧
+/// SSE **注释**（`: keepalive`；解析器按规范忽略），写失败 = 连接已死 ⇒ 立刻弃流。
+///
+/// 2026-11-16：`[runtime] keepalive_ms` 键已删 —— 这是传输层决定，操作员没有
+/// 信息量去改它。
+const SSE_KEEPALIVE_MS: u64 = 1000;
 
 /// `reasoning_effort` 的关思考词（与快照模板同口径；大小写不敏感）。
 fn reasoning_off(e: &str) -> bool {
     e.eq_ignore_ascii_case("none") || e.eq_ignore_ascii_case("off")
 }
 
-/// 隐式默认会话 id(AGT-09;`[agent] implicit_session` = true 时无 session 键的请求落此)
-pub const IMPLICIT_SESSION: u64 = 0;
-
 /// OpenAI 协议会话键 → 引擎 u64 会话 id(进程内哈希;同键同 id)
+///
+/// **只做哈希,不做缺省**：请求不带键 ⇒ `None`,引擎按 **prompt 内容身份**
+/// 认会话（2026-11-16 原始算法 §32；旧 `implicit_session` 已删）。
 pub fn session_id(key: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -786,19 +818,20 @@ pub(crate) async fn chat(
     }
     // 思考档位(AGT-07):OpenAI `reasoning_effort` **直通模板变量**
     // (模板自持值域: none|low|medium|high|xhigh|…)。请求 > 配置缺省
-    let kw = req.effective_template_kwargs();
+    let kw = req.effective_template_kwargs(&agent.vars);
     let kw_ref = if kw.is_empty() { None } else { Some(&kw) };
+    // 模板变量 + 请求 kwargs 合并后的思考态（splitter / 日志 / 诊断同一份）
+    let thinking = req.enable_thinking(
+        &agent.vars,
+        req.tools.as_ref().is_some_and(|t| !t.is_empty()),
+    );
     // ── 会话身份 ──
     //
     // 会话 id 只有两个消费者：前缀复用（同会话增量）与断流取消点名。
     // **会话串行已下沉引擎**（2026-11-16 P4）：同会话第二个 turn 由引擎排队，
     // 在会话空闲前不会起跑（`startable_queue_idx`）—— 服务面不再有闸，
     // 也不再需要"闸之后才取 permit"的次序纪律（合并批档 SSE 语义不变）。
-    let session = match req.session.as_deref().map(session_id) {
-        Some(id) => Some(id),
-        None if agent.implicit_session => Some(IMPLICIT_SESSION),
-        None => None,
-    };
+    let session = req.session.as_deref().map(session_id);
     // 渲染:唯一权威 = 快照模板(§4.3 R2);模板拒(如 system 含图像)= 400
     let mut prompt = match tpl.render(RenderArgs {
         messages: &req.messages,
@@ -860,7 +893,7 @@ pub(crate) async fn chat(
         images: image_count,
         image_tokens,
         evict_images,
-        thinking: req.enable_thinking(),
+        thinking,
         reasoning_effort: req.reasoning_effort.clone(),
         session,
         max_new,
@@ -911,7 +944,7 @@ pub(crate) async fn chat(
                 "受理 session {session:#x} turn {turn}(stream={};tools={};images={image_count}/tokens={image_tokens}/evict={evict_images};think={};prompt={prompt_tokens};cached={cached_tokens};max_new={max_new})",
                 mode == ReplyMode::Stream,
                 req.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-                req.enable_thinking(),
+                thinking,
             );
             Some((session, turn))
         }
@@ -950,10 +983,13 @@ pub(crate) async fn chat(
 
     let id = completion_id();
     let mut splitter = ChannelSplitter::new(
-        req.enable_thinking(),
+        thinking,
         ToolSchemas::from_tools(req.tools.as_deref().unwrap_or(&[])),
     )
-    .with_tool_parsing(agent.parse_tool_calls);
+    // 工具解析**恒开**（2026-11-16 认领 `[server] parse_tool_calls`：
+    // 没有生产档关过它；唯一用途是"工具标记按普通文本放行"的诊断臂，
+    // 该需求由 `/debug/agent` 的结构轨迹覆盖。旧键已删 = 旧档里写它会被拒）。
+    .with_tool_parsing(true);
     let mut acc = Agg {
         seed: unix().as_nanos() as u64,
         ..Default::default()
@@ -1015,14 +1051,13 @@ pub(crate) async fn chat(
     // **排队超时**(`[runtime] queue_wait_ms`;0 = 关):提交后迟迟不见实质进展 ⇒
     // 取消该 turn + 429（D2 的 R 档）。`started` = 已见到 prefill/token/终态。
     //
-    // **静默保活**(`[runtime] keepalive_ms`;2026-11-03):长 prefill 期间流上
+    // **静默保活**(传输层定值,见 `SSE_KEEPALIVE_MS`;2026-11-03):长 prefill 期间流上
     // 一个字节都不写 ⇒ chunked 写永远不会失败 ⇒ 对端 FIN 无人察觉 ⇒ **引擎把
     // 整段 prefill 白跑完**(真机:前端在 100k prompt 的 prefill 中断开,引擎仍
     // 跑满 50s)。这里按周期写一帧 SSE **注释**(`: keepalive`;解析器按规范忽略),
     // 写失败 = 连接已死 ⇒ 立刻弃流 + 弃置 turn。
-    let ka_ms = agent.keepalive_ms.min(60_000) as u64;
-    let ka_wait = std::time::Duration::from_millis(ka_ms);
-    let mut ka_at = if mode == ReplyMode::Stream && ka_ms > 0 {
+    let ka_wait = std::time::Duration::from_millis(SSE_KEEPALIVE_MS);
+    let mut ka_at = if mode == ReplyMode::Stream {
         Some(tokio::time::Instant::now() + ka_wait)
     } else {
         None
@@ -1877,40 +1912,61 @@ mod tests {
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}]})).expect("parse");
         assert_eq!(r.max_new(&agent), (agent.default_max_new, false));
+        // `defaults` = `chat_template.toml`（模板变量；空表 = 无文件）
+        let none = serde_json::Map::new();
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
             "chat_template_kwargs": {"enable_thinking": false}})).expect("parse");
-        assert!(!r.enable_thinking());
+        assert!(!r.enable_thinking(&none, false));
         // `reasoning_effort=none/off` 与模板同口径：splitter 也必须按关思考启动
         for off in ["none", "off", "NONE", "Off"] {
             let r: ChatRequest = serde_json::from_value(json!({
                 "messages":[{"role":"user","content":"x"}],
                 "reasoning_effort": off})).expect("parse");
-            assert!(!r.enable_thinking(), "reasoning_effort={off} 应关思考");
+            assert!(!r.enable_thinking(&none, false), "reasoning_effort={off} 应关思考");
         }
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
             "reasoning_effort": "high"})).expect("parse");
-        assert!(r.enable_thinking(), "reasoning_effort=high 应开思考");
+        assert!(r.enable_thinking(&none, false), "reasoning_effort=high 应开思考");
         // 显式 enable_thinking 覆盖 reasoning_effort
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
             "reasoning_effort": "none",
             "chat_template_kwargs": {"enable_thinking": true}})).expect("parse");
-        assert!(r.enable_thinking(), "显式 enable_thinking=true 应优先");
+        assert!(r.enable_thinking(&none, false), "显式 enable_thinking=true 应优先");
+
+        // **模板变量文件**（2026-11-16）：文件缺省 < 请求
+        let mut defaults = serde_json::Map::new();
+        defaults.insert("auto_disable_thinking_with_tools".into(), json!(true));
+        defaults.insert("reasoning_effort".into(), json!("none"));
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"x"}], "tools": [{"type":"function","function":{"name":"f"}}]
+        })).expect("parse");
+        assert!(
+            !r.enable_thinking(&defaults, true),
+            "文件里的 reasoning_effort=none / auto_disable+tools 都要落到 splitter"
+        );
+        let r: ChatRequest = serde_json::from_value(json!({
+            "messages":[{"role":"user","content":"x"}],
+            "reasoning_effort": "high"})).expect("parse");
+        assert!(
+            r.enable_thinking(&defaults, false),
+            "请求档位覆盖文件缺省"
+        );
 
         // vLLM 同款归一化：reasoning_effort 必须同步派生 enable_thinking
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
             "reasoning_effort": "none"})).expect("parse");
-        let kw = r.effective_template_kwargs();
+        let kw = r.effective_template_kwargs(&none);
         assert_eq!(kw.get("reasoning_effort"), Some(&json!("none")));
         assert_eq!(kw.get("enable_thinking"), Some(&json!(false)));
         let r: ChatRequest = serde_json::from_value(json!({
             "messages":[{"role":"user","content":"x"}],
             "reasoning_effort": "high"})).expect("parse");
         assert_eq!(
-            r.effective_template_kwargs().get("enable_thinking"),
+            r.effective_template_kwargs(&none).get("enable_thinking"),
             Some(&json!(true))
         );
         // 显式 enable_thinking 不被派生值覆盖(与 vLLM build_chat_params 一致)
@@ -1919,8 +1975,21 @@ mod tests {
             "reasoning_effort": "none",
             "chat_template_kwargs": {"enable_thinking": true}})).expect("parse");
         assert_eq!(
-            r.effective_template_kwargs().get("enable_thinking"),
+            r.effective_template_kwargs(&none).get("enable_thinking"),
             Some(&json!(true))
+        );
+        // 文件缺省的 merge：请求 kwargs 覆盖同名键
+        let mut file_high = serde_json::Map::new();
+        file_high.insert("reasoning_effort".into(), json!("high"));
+        assert_eq!(
+            r.effective_template_kwargs(&file_high).get("reasoning_effort"),
+            Some(&json!("none")),
+            "请求里的 reasoning_effort 覆盖文件值"
+        );
+        assert_eq!(
+            r.effective_template_kwargs(&file_high).get("enable_thinking"),
+            Some(&json!(true)),
+            "请求显式 enable_thinking 覆盖文件"
         );
 
         // [agent] 定制上限生效(配置面唯一旋钮)

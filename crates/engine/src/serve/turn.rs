@@ -322,11 +322,15 @@ impl TurnStats {
 /// 队列中待跑的 turn(提交面快照)
 pub(crate) struct Turn {
     pub(crate) id: u64,
-    /// 归属会话(已解析 id;None 提交在 submit 时已建临时账)
+    /// 归属会话(已解析 id;submit 时已按内容身份/显式键建账)
     pub(crate) session_id: u64,
-    /// 临时会话(终了即焚;行为同 M0.5 每 turn 全量重算)
-    pub(crate) ephemeral: bool,
     pub(crate) spec: TurnSpec,
+    /// **准入预留的生成预算**（token；2026-11-16 用户裁决）。
+    ///
+    /// = `min([runtime] max_new_cap, max_seq − prompt)`：一轮在 submit 时就按
+    /// 「上下文 + 本档最大输出长度」把整份空间预留住（在跑者不被新人挤占）。
+    /// `spec.max_new` 仍是**实际**生成上限（≤ 本值；请求要多少给多少）。
+    pub(crate) reserve_new: usize,
     pub(crate) prompt_ids: Vec<u32>,
     /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
     pub(crate) msg_snaps: Vec<usize>,
@@ -373,7 +377,6 @@ pub(crate) struct ActiveTurn {
     /// 每次 capture 成功后更新。store 保洁/驱逐把它当显式保护面 ——
     /// 快照面没有引用计数,不能像 KV 那样靠 `refs > 1` 兜底。
     pub(crate) last_snap: Option<owl_store::SnapKey>,
-    pub(crate) ephemeral: bool,
     pub(crate) prompt_ids: Vec<u32>,
     /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
     pub(crate) msg_snaps: Vec<usize>,
@@ -383,7 +386,10 @@ pub(crate) struct ActiveTurn {
     pub(crate) msg_snap_keys: Vec<Option<owl_store::SnapKey>>,
     /// **可删图前的硬快照点**（token offset；2026-11-13；见 `Turn::evict_snaps`）
     pub(crate) evict_snaps: Vec<usize>,
+    /// 实际生成上限（`spec.max_new` 的落地值）
     pub(crate) max_new: usize,
+    /// 准入预留的生成预算（见 [`Turn::reserve_new`]）
+    pub(crate) reserve_new: usize,
     /// **本轮 prompt 的逐 token 绝对位置**(与 `prompt_ids` 等长;prefill
     /// 的 `pos` 槽与 VLM cos/sin 都从这里切)。
     pub(crate) positions: Vec<crate::img_evict::Pos3>,
