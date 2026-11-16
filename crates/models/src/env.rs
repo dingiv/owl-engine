@@ -415,10 +415,11 @@ pub struct DiagEnv {
     pub live_diag: bool,
 }
 
-/// 解释器内存治理(`[store]`;原 `OWL_BLOCK_POOL` / `OWL_NO_RECLAIM` env)
+/// 解释器内存治理（内部/测试面；`no_reclaim` 仍来自 `[store]`）。
+/// `block_pool_bytes` 的配置键已退休，生产固定 0；测试可直接注入。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InterpEnv {
-    /// 块池预算字节(0 = 关 = 逐节点 alloc/free)
+    /// 块池预算字节（0 = 关 = 逐节点 alloc/free；仅测试注入）
     pub block_pool_bytes: usize,
     /// 关活性中途回收(诊断)
     pub no_reclaim: bool,
@@ -595,7 +596,9 @@ impl EnvProvider {
                 live_diag: cfg.probes.live_diag,
             },
             interp: InterpEnv {
-                block_pool_bytes: cfg.store.block_pool_bytes,
+                // 配置键已退休：解释器块池固定关（0）；实验面由测试直接注入
+                // `InterpEnv.block_pool_bytes`，不再从 OwlConfig 读。
+                block_pool_bytes: 0,
                 no_reclaim: cfg.store.no_reclaim,
             },
             ..Self::default()

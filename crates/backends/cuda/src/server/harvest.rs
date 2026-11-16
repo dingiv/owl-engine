@@ -67,7 +67,6 @@ impl GpuServer {
         if let Err(e) = self.vram_guard.check(
             n,
             self.diag.vram_reserve_mb << 20,
-            self.diag.vram_budget_mb.map(|m| m << 20),
             &self.vram,
         ) {
             self.sink.logf(

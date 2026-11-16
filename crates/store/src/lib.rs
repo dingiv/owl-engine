@@ -89,8 +89,8 @@ pub use policy::{
     QueuePolicy,
 };
 pub use rel::{
-    AdoptChainsReport, DiskAttach, DiskSessionUsage, EventBook, KvConfig, OpenLoan, Protected,
-    RecallHit, RecallMode, Rel, SnapEvictPreview, StoreReport,
+    AdoptChainsReport, DiskAttach, DiskSessionUsage, EventBook, KvCheckpointPlan, KvConfig,
+    OpenLoan, Protected, RecallHit, RecallMode, Rel, SnapEvictPreview, StoreReport,
 };
 pub use reservations::{Grant, GrantReport, ReservationId, ReservationKind, ReservationLedger};
 pub use select::{

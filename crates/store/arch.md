@@ -99,5 +99,16 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
     先避开活跃 session，不够才回落到活跃面；`StoreReport.disk_sessions` 给出
     逐 session 的盘上 KV/快照账。三级级联（GPU → Host → Disk → Drop）的候选
     出序也统一带会话档：`order_candidates`（KV/状态）与 `order_snap_victims`
-    （快照）都是“冷会话先、会话内再按 LRU/LRFU”。下一步:`SessionBank` 的 `sessions`/`rel`/`leg_mtp`
-    需要 split-borrow 门面(`parts_mut`)才能私有化；checkpoint 编排簇仍可继续抽。
+    （快照）都是“冷会话先、会话内再按 LRU/LRFU”。
+    2026-11-16 第二刀已落:`SessionBank` 的 `sessions`/`rel`/`leg_mtp`/`mtp_ring`
+    已私有化；engine 统一走 `SessionBank::parts()` / `parts_mut()` split-borrow
+    或 `reset_session_for_rebuild` / `reopen_session_chain` 这类复合语义口。
+    `AgentSession::rebase` / `reopen_chain` 都是消费式（销毁旧账 → 新账放回），
+    `reset` 已收为私有。
+    2026-11-16 第三刀：报告面拆 `disk_blocks`（`KvStats`/`LegStats`），
+    `Rel::report`/`leg_stats` 从 DiskTier 扣除盘上-only；checkpoint 的 store
+    侧计划收为 `Rel::plan_checkpoint_kv`（连续前缀 + 真实 carrier + 配额），
+    engine 只执行 D2H/宿主 clone/spill；写盘循环再收进
+    `DiskRuntime::{spill_host_blocks,spill_device_table}`；死代码
+    `checkpoint_tail_snap` 已删。运行期盘满 = 内容留宿主，下一拍压力决定 Drop
+    （指标 `store.disk.*_full`）。下一步：配置段收口。

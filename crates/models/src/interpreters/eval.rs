@@ -113,7 +113,7 @@ fn perf_cnt(tag: &str, n: u64) {
 // 块池预算 / 回收开关的**唯一来源** = `EnvProvider.interp`(2026-10-21
 // 配置收编:原 `OWL_BLOCK_POOL` / `OWL_NO_RECLAIM` env 已退场)。
 //
-// 两个旋钮都在**入口一次性定谳**(`[store] block_pool_bytes / no_reclaim`)
+// 两个旋钮都在**入口一次性定谳**(内部 `InterpEnv` / `[store] no_reclaim`)
 // —— 解释器不再有任何 env 读取,热路径零查询。
 
 /// 分段秒表(`Call` 臂宿主链分段:resolve/build/alloc/lower/launch)
@@ -431,7 +431,7 @@ where
 /// 与 [`eval_ops_side_effect_env`] 同口径(根只用于触发执行,收尾即还),但
 /// 显式给出块池预算 ⇒ `pool_budget > 0` 时逐节点走 `queue`、作用域收尾一次
 /// `flush` —— **N 个根只花一条信箱往返**。用途:池内原地算子族(如 K 重转
-/// 逐层一发)在 `[interp] block_pool_bytes = 0` 的档位也要批量发射
+/// 逐层一发)在块池关闭（生产固定 0）的档位也要批量发射
 /// (27B/TP2 实测:16 层 × 2 rank 逐发 ≈ 6.3 ms,其中发射占 ~95%)。
 pub fn eval_ops_side_effect_env_pool<'a, D>(
     roots: &'a [&'a TensorOps],

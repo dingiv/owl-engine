@@ -635,9 +635,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         use owl_store::ChainHash;
         // ① 分拣:表项 + 身份 + 归属(设备槽 / 占位)
         let mut table: Vec<u32> = self
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
         table.truncate(n_blocks);
@@ -675,12 +673,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         let margin = crate::sched_policy::reclaim_margin(
             self.boot.cfg.prefill_chunk.div_ceil(page),
         );
-        if !sink.is_empty() && self.bank.rel.slots_free() >= margin + need.len() {
+        if !sink.is_empty() && self.bank.parts().rel.slots_free() >= margin + need.len() {
             self.sel.note_lazy_keep(sink.len());
             owl_shared::log_debug!(
                 "cov-probe",
                 "懒沉:池余 {} 槽 ≥ 余量 {margin} ⇒ 本轮 {} 块保持常驻",
-                self.bank.rel.slots_free(),
+                self.bank.parts().rel.slots_free(),
                 sink.len()
             );
             sink.clear();
@@ -693,7 +691,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut sinkable: Vec<(usize, owl_store::ChainHash, u32)> = Vec::new();
         let mut not_in_tree = 0usize;
         for (i, h, slot) in sink.drain(..) {
-            if self.bank.rel.slot_refs(slot) == 2 {
+            if self.bank.parts().rel.slot_refs(slot) == 2 {
                 sinkable.push((i, h, slot));
             } else {
                 not_in_tree += 1;
@@ -718,7 +716,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         // ② 放开会话引用(只对双持块:decref 后 refs == 1 = 缓存独占)
         for (_, _, slot) in &sink {
-            if let Err(e) = self.bank.rel.decref(*slot) {
+            if let Err(e) = self.bank.parts_mut().rel.decref(*slot) {
                 owl_shared::log_warn!("cov-probe", "下沉前 decref 槽 {slot} 失败:{e}(跳过该块)");
             }
         }
@@ -729,7 +727,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let (blocks, pieces, tbl) = {
                 // diag-only(store-hook): 选择层诊断直接取搬运计划，不走生产
                 // StoreHook；生产路径只经 pump/store_hook。
-                let p = self.bank.rel.plan_kv_offload_blocks(&hashes)?;
+                let p = self.bank.parts_mut().rel.plan_kv_offload_blocks(&hashes)?;
                 if !p.skipped.is_empty() {
                     owl_shared::log_warn!(
                         "cov-probe",
@@ -752,7 +750,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     let waiter = match self.swap_out_begin(&pieces, tbl) {
                         Ok(w) => w,
                         Err(e) => {
-                            self.bank.rel.abort_offload(&blocks);
+                            self.bank.parts_mut().rel.abort_offload(&blocks);
                             return Err(owl_iface::contract::ModelError::Msg(format!(
                                 "分离式下沉提交失败: {e}"
                             )));
@@ -776,7 +774,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                             }
                         }
                     }
-                    if let Some(s) = self.bank.sessions.get_mut(sid) {
+                    if let Some(s) = self.bank.parts_mut().sessions.get_mut(sid) {
                         s.block_table[..n_blocks].copy_from_slice(&table[..n_blocks]);
                     }
                     self.pending_out = Some(crate::running::PendingOut {
@@ -794,13 +792,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                     {
                         Ok(t) => t,
                         Err(e) => {
-                            self.bank.rel.abort_offload(&blocks);
+                            self.bank.parts_mut().rel.abort_offload(&blocks);
                             return Err(e);
                         }
                     };
                     rec_phase("select.rec.out_swap", t_swap);
                     let t_commit = std::time::Instant::now();
-                    let n = self.bank.rel.commit_offload(&blocks, t)?;
+                    let n = self.bank.parts_mut().rel.commit_offload(&blocks, t)?;
                     rec_phase("select.rec.out_commit", t_commit);
                     let sunk_set: std::collections::HashSet<ChainHash> =
                         blocks.iter().map(|(h, _)| *h).collect();
@@ -809,7 +807,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                             table[*i] = crate::scheduler::PENDING_LOAD_PLACEHOLDER;
                         }
                     }
-                    if let Some(s) = self.bank.sessions.get_mut(sid) {
+                    if let Some(s) = self.bank.parts_mut().sessions.get_mut(sid) {
                         s.block_table[..n_blocks].copy_from_slice(&table[..n_blocks]);
                     }
                     let _ = n;
@@ -830,12 +828,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             let hashes: Vec<ChainHash> = need.iter().map(|(_, h)| *h).collect();
             // **S6**:盘上的块先读回宿主(与 phases.rs 同一口)
             let t_host = std::time::Instant::now();
-            let _ = self.disk.ensure_host_resident(&mut self.bank.rel, &hashes).await?;
+            let rel = self.bank.parts_mut().rel;
+            let _ = self.disk.ensure_host_resident(rel, &hashes).await?;
             rec_phase("select.rec.in_host", t_host);
             let t_plan = std::time::Instant::now();
             let (cs, slots, pieces, tbl) = {
                 // diag-only(store-hook): 同上；仅诊断/选择层探针。
-                let p = self.bank.rel.plan_onload(&hashes)?;
+                let p = self.bank.parts_mut().rel.plan_onload(&hashes)?;
                 (p.chains, p.slots, p.pieces, p.table)
             };
             rec_phase("select.rec.in_plan", t_plan);
@@ -847,20 +846,20 @@ impl<D: DeviceClient> RunningEngine<D> {
             {
                 Ok(t) => t,
                 Err(e) => {
-                    self.bank.rel.abort_onload(&cs, &slots);
+                    self.bank.parts_mut().rel.abort_onload(&cs, &slots);
                     return Err(e);
                 }
             };
             rec_phase("select.rec.in_swap", t_swap);
             let t_commit = std::time::Instant::now();
-            let got = self.bank.rel.commit_onload(&cs, &slots, tbl)?;
+            let got = self.bank.parts_mut().rel.commit_onload(&cs, &slots, tbl)?;
             rec_phase("select.rec.in_commit", t_commit);
             staged = got.len();
             // 槽写回表(同序:need 与 cs 同序)
             for ((i, _), slot) in need.iter().zip(&got) {
                 table[*i] = *slot;
             }
-            if let Some(s) = self.bank.sessions.get_mut(sid) {
+            if let Some(s) = self.bank.parts_mut().sessions.get_mut(sid) {
                 s.block_table[..n_blocks].copy_from_slice(&table[..n_blocks]);
             }
         }
@@ -894,7 +893,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             .turns
             .active()
             .ok()
-            .and_then(|a| self.bank.sessions.get(a.session_id))
+            .and_then(|a| self.bank.parts().sessions.get(a.session_id))
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
         // **P0-2 守卫(2026-10-27)**:`base < recall_pos` 时视图不覆盖本 chunk,
@@ -1012,9 +1011,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let page = self.dev.pool.geom.page.max(1);
         let s = self
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .ok_or_else(|| ModelError::Msg(format!("懒回灌视图:会话 {sid:#x} 不在账")))?;
         let chain = &s.block_table;
         let n_blocks = (seed.cached_len / page).min(chain.len());
@@ -1350,9 +1347,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let page = self.dev.pool.geom.page.max(1);
         let chain: Vec<u32> = self
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
         let (pages, len) = view_pages_at(&v.pages, v.tokens, &chain, v.recall_pos, pos, page)?;
@@ -1368,7 +1363,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 );
             } else {
                 for (b, &pg) in v.blocks.iter().zip(v.pages.iter()) {
-                    match self.bank.rel.carrier_of(*b) {
+                    match self.bank.parts().rel.carrier_of(*b) {
                         Ok(owl_store::Carrier::Device(slot)) if slot == pg => {}
                         Ok(owl_store::Carrier::Device(slot)) => owl_shared::log_error!(
                             "view-diag",
@@ -1400,9 +1395,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     pub(crate) fn select_view_step(&mut self, sid: u64, pos: usize) -> (Vec<f32>, usize) {
         let nb = self.dev.pool.geom.nb;
         let chain: Vec<u32> = self
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
         let Some(v) = self.select_view_at(sid, pos) else {
@@ -1555,9 +1548,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let n_blocks = ctx_tokens / page;
         let bt: Vec<u32> = self
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
         if bt.len() < n_blocks {
@@ -1669,7 +1660,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             );
             cands.push(parent);
         }
-        let Some(index) = self.bank.rel.index() else {
+        let Some(index) = self.bank.parts().rel.index() else {
             return Err(ModelError::Msg(
                 "覆盖率探针:索引账不在场(index_probe 未开?两枚旋钮需同开)".into(),
             ));
@@ -1825,7 +1816,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ⚠️ **只在完整召回档发信号**:廉价档的名单是**纯近期序**推出来的,不含任何
         // 注意力信息 ⇒ 拿它喂 LRFU 等于用"最近"冒充"被注意力用过"(自激回路)。
         if recall_now {
-            self.bank.rel.note_recall(&set.blocks);
+            self.bank.parts().rel.note_recall(&set.blocks);
         }
         let picked: Vec<usize> = set
             .blocks
@@ -1905,9 +1896,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 留 B-3 当对照实验(同一套门跑两遍比数字)。
         // 用**调和后**的会话表(回灌已把新槽写回;先装配再回灌 = 页表带占位符 ⇒ 非法地址)
         let bt_after: Vec<u32> = self
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
         let t_view = std::time::Instant::now();

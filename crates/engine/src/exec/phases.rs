@@ -260,8 +260,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     "vlm-dbg",
                     "restore key={:?} tier={:?} owner={:?} reset_gdn={}",
                     k,
-                    self.bank.rel.state_locate(k),
-                    self.bank.rel.snap_session_info(k),
+                    self.bank.parts().rel.state_locate(k),
+                    self.bank.parts().rel.snap_session_info(k),
                     b.reset_gdn
                 ),
                 None => owl_shared::log_info!(
@@ -309,7 +309,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if let Some(ex) = b.image_exec.as_ref() {
             let mut released = 0usize;
             for h in &ex.release_chains {
-                if self.bank.rel.drop_chain(*h)? {
+                if self.bank.parts_mut().rel.drop_chain(*h)? {
                     released += 1;
                 }
             }
@@ -329,9 +329,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let _seeded = self.seed_turn_start_view(b.session_id, seed)?;
         }
         let table = self
-            .bank
-            .sessions
-            .session(b.session_id)?
+            .bank.parts().sessions.session(b.session_id)?
             .block_table
             .clone();
         // 设备半(两 rank **并发**推进):GDN 重置/快照恢复 + 持久块表重写
@@ -510,26 +508,24 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if self.pending_out.is_some() {
                 let page = self.dev.pool.geom.page.max(1);
                 let grow = chunk_ids.len().div_ceil(page).max(1);
-                if self.bank.rel.leg_stats().slots_free < grow {
+                if self.bank.parts().rel.leg_stats().slots_free < grow {
                     owl_shared::counter_inc!("select.rec.drain_for_slots");
                     self.drain_pending_out().await?;
                 }
             }
             let grant = self.grant_of_session(sid)?;
-            let s = self
-                .bank
+            let bank = self.bank.parts_mut();
+            let s = bank
                 .sessions
                 .get_mut(sid)
                 .ok_or_else(|| ModelError::Msg("prefill 块表增长:会话账不在场".into()))?;
             // **P0-4**：消费本 turn 的准入 Grant。
-            self.bank
-                .rel
-                .ensure_for_len(grant, &mut s.block_table, need)?;
+            bank.rel.ensure_for_len(grant, &mut s.block_table, need)?;
         }
         // ── 主机侧事实(唯一取值点;两 rank 共用)────────────────────────
         let (bt_chain, gdn_slot) = {
             let act = self.turns.active()?;
-            let s = self.bank.sessions.session(act.session_id)?;
+            let s = self.bank.parts().sessions.session(act.session_id)?;
             (s.block_table.clone(), act.gdn_slot)
         };
         // **KVMem 最终 query replay**:末 chunk 前拍 GDN 快照。最终召回
@@ -740,7 +736,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 pool.restore_replay_snap(graphs.session.face_mut(), gdn_slot)
                     .await?;
             }
-            let replay_bt = self.bank.sessions.session(sid)?.block_table.clone();
+            let replay_bt = self.bank.parts().sessions.session(sid)?.block_table.clone();
             let replay_past = self.past_view_of(base, chunk_ids.len())?;
             let mut replay_knobs = self.boot.cfg.knobs.clone();
             replay_knobs.select_decode = false;
@@ -905,7 +901,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // 四件套:真值(与承载无关 —— 图内/窗外都读同一批槽)
             let page = self.dev.pool.geom.page;
             let bt_chain = {
-                let s = self.bank.sessions.session(sid)?;
+                let s = self.bank.parts().sessions.session(sid)?;
                 s.block_table.clone()
             };
             // ⚠️ **响亮拒(2026-10-19 审查)**:`.min(bt_chain.len())` 只防"链过长",
@@ -994,9 +990,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 洞 = 占位符,写进设备块表就是把 u32::MAX 当页号 —— 守卫会响亮拒且白跑)。
         // 设备半(每 rank 各自写)在 `decode_dev` 里;这里只算出表内容。
         let grow_bt = (grew && !self.sel.has_view()).then(|| {
-            self.bank
-                .sessions
-                .get(sid)
+            self.bank.parts().sessions.get(sid)
                 .expect("账在")
                 .block_table
                 .clone()
@@ -1452,9 +1446,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let mut tables: Vec<Vec<u32>> = Vec::with_capacity(t_rows);
         for r in &rows {
             tables.push(
-                self.bank
-                    .sessions
-                    .session(r.session_id)?
+                self.bank.parts().sessions.session(r.session_id)?
                     .block_table
                     .clone(),
             );
@@ -1856,7 +1848,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         let row_bytes = hkv * hd * esize;
         let blk = {
-            let s = self.bank.sessions.session(sid)?;
+            let s = self.bank.parts().sessions.session(sid)?;
             let p = (kv_slot as usize) / page;
             s.block_table.get(p).copied().unwrap_or(0)
         };

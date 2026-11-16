@@ -238,10 +238,10 @@ pub struct EngineKnobs {
     pub snap_disk_mb: usize,
     /// **磁盘内容目录**(空 = 关层)。
     pub disk_dir: String,
-    /// **KV 主动 checkpoint 单次配额 MiB**(S6.2;0 = 关)。
-    pub checkpoint_max_mb: usize,
-    /// **两次 checkpoint 的最小间隔 ms**(0 = 每 turn)。
-    pub checkpoint_min_gap_ms: u64,
+    /// **主动 checkpoint 的内部节奏**（不是配置键）：磁盘层启用后自动运行。
+    /// `step_bytes = 0` 仅供测试关路径；生产缺省见
+    /// [`CheckpointPolicy::default`]。
+    pub checkpoint_policy: crate::running::CheckpointPolicy,
     /// **准入满员姿态**(S3b;缺省响亮拒)。`OWL_ADMIT_ON_FULL=reject|queue[:ms]`。
     ///
     /// `Reject` = 准入拒(客户端该降并发/重试,不是压缩上下文);
@@ -360,8 +360,7 @@ impl Default for EngineKnobs {
             snap_host_mb: 0,
             disk_cache_mb: 0,
             snap_disk_mb: 0,
-            checkpoint_max_mb: 0,
-            checkpoint_min_gap_ms: 5000,
+            checkpoint_policy: crate::running::CheckpointPolicy::default(),
             disk_dir: String::new(),
             index_probe: false,
             index_gpu: true,
@@ -695,8 +694,7 @@ impl EngineKnobs {
             host_cache_mb: cfg.store.host_cache_mb,
             disk_cache_mb: cfg.store.disk_cache_mb,
             snap_disk_mb: cfg.store.snap_disk_mb,
-            checkpoint_max_mb: cfg.store.checkpoint_max_mb,
-            checkpoint_min_gap_ms: cfg.store.checkpoint_min_gap_ms,
+            checkpoint_policy: crate::running::CheckpointPolicy::default(),
             disk_dir: cfg.store.disk_dir.clone(),
             // 状态腿宿主预算(S2;`[store].snap_host_mb`;两条腿各有热区,别互相饿死)
             snap_host_mb: cfg.store.snap_host_mb,
@@ -1425,17 +1423,16 @@ pub(crate) fn into_running<D: DeviceClient>(
         // **TP:peer 平面布局**(2026-10-20 双卡 KVMem)。两 rank 的池句柄 id
         // 是两套 ⇒ 每个平面必须用**自己那套** `PieceSpec` 组片(靠偏移平移不行)。
         if let Some(pr) = peer.as_ref() {
-            b.rel.attach_pool_peer(pr.pool.pool_layout(0))?;
+            b.parts_mut().rel.attach_pool_peer(pr.pool.pool_layout(0))?;
         }
         // **B-4 驱逐策略装配**(boot 一次;缺省 LRU ⇒ 与历史逐字一致)
-        b.rel.set_evict_policy(cfg.knobs.evict_policy.build());
+        b.parts_mut().rel.set_evict_policy(cfg.knobs.evict_policy.build());
         // 整枝塌缩(2026-10-23):宿主/磁盘**装不下整链**时允许一张票丢整段
-        b.rel
-            .set_bulk_drop_when_tier_full(cfg.knobs.bulk_drop_when_tier_full);
-        owl_shared::log_info!("store", "驱逐策略 = {}", b.rel.evict_policy_name());
+        b.parts_mut().rel.set_bulk_drop_when_tier_full(cfg.knobs.bulk_drop_when_tier_full);
+        owl_shared::log_info!("store", "驱逐策略 = {}", b.parts().rel.evict_policy_name());
         if cfg.knobs.index_probe {
             // B 轴索引几何:层 = 全注意力层数,头 = KV 头数,dim = head_dim
-            b.rel.attach_index(
+            b.parts_mut().rel.attach_index(
                 dev.pool.geom.dims.hd,
                 dev.pool.kvs().len(),
                 dev.pool.geom.dims.hkv,
@@ -1446,20 +1443,20 @@ pub(crate) fn into_running<D: DeviceClient>(
                 dev.pool.geom.dims.hd,
                 dev.pool.kvs().len(),
                 dev.pool.geom.dims.hkv,
-                b.rel.index().map(|i| i.block_bytes()).unwrap_or(0)
+                b.parts().rel.index().map(|i| i.block_bytes()).unwrap_or(0)
             );
         }
         if dev.pool.geom.paged && dev.pool.snap_capacity() > 0 {
-            let epoch = b.rel.attach_snap_layout(dev.pool.snap_pool_layout(0))?;
+            let epoch = b.parts_mut().rel.attach_snap_layout(dev.pool.snap_pool_layout(0))?;
             if let Some(pr) = peer.as_ref() {
-                b.rel.attach_snap_layout_peer(pr.pool.snap_pool_layout(0))?;
+                b.parts_mut().rel.attach_snap_layout_peer(pr.pool.snap_pool_layout(0))?;
             }
             owl_shared::log_info!(
                 "boot",
                 "状态腿三层化:快照 {} 槽 × {}B/条(布局 epoch {epoch})· 宿主预算 {:.1}MiB",
                 dev.pool.snap_capacity(),
                 dev.pool.snap_bytes(),
-                b.rel.snap_host_budget() as f64 / 1048576.0
+                b.parts().rel.snap_host_budget() as f64 / 1048576.0
             );
         }
         // **磁盘层接线 + 启动回加载**(S6;用户 2026-10-19):配置给配额与目录 ⇒
@@ -1468,14 +1465,16 @@ pub(crate) fn into_running<D: DeviceClient>(
         // **S6.2 防坑告警**：只 checkpoint KV 而快照没有盘腿 ⇒ 混合模型的复用面
         // 会被 `reuse_face` 裁到 0（实测 `cache=0/4753`，全量重算）——
         // 因为锚点（Durable GDN 快照）不在盘上，重启后 `state.locate == None`。
-        if cfg.knobs.checkpoint_max_mb > 0
-            && cfg.knobs.snap_max == 0
+        if cfg.knobs.checkpoint_policy.step_bytes > 0
+            && cfg.knobs.snap_max > 0
+            && cfg.knobs.snap_disk_mb == 0
             && cfg.knobs.disk_cache_mb > 0
         {
             owl_shared::log_warn!(
                 "store",
-                "[store].checkpoint_max_mb={} 但 snap_max=0 ⇒ 只落 KV 不落 GDN 快照:                 重启后 `reuse_face` 找不到锚点,复用面会被裁到 0(等于没有跨重启召回)。                 混档请同时给 snap_max / snap_host_mb / snap_disk_mb。",
-                cfg.knobs.checkpoint_max_mb
+                "磁盘层已启用且 snap_max>0，但 snap_disk_mb=0 ⇒ 自动 checkpoint 只能落 KV，\
+                 重启后 `reuse_face` 找不到 Durable 锚点，复用面会被裁到 0。\
+                 混档请同时给 snap_disk_mb。"
             );
         }
         if (cfg.knobs.disk_cache_mb + cfg.knobs.snap_disk_mb) > 0 && !cfg.knobs.disk_dir.is_empty()
@@ -1492,7 +1491,7 @@ pub(crate) fn into_running<D: DeviceClient>(
             // 第 4 条起「超预算」逐条隔离(实测:锚点每轮在丢,跨重启召回被裁)。
             // 这里**响亮点名**该给多少,不静默按更小的容量跑。
             if snap_disk_bytes > 0 {
-                let per_file = dev.pool.snap_bytes().saturating_mul(b.rel.world());
+                let per_file = dev.pool.snap_bytes().saturating_mul(b.parts().rel.world());
                 let cap = dev.pool.snap_capacity();
                 let fit = per_file.max(1);
                 let n_fit = snap_disk_bytes / fit;
@@ -1503,7 +1502,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                         cfg.knobs.snap_disk_mb,
                         per_file,
                         dev.pool.snap_bytes(),
-                        b.rel.world(),
+                        b.parts().rel.world(),
                         need_mb.max(1)
                     )));
                 }
@@ -1517,7 +1516,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                         cap,
                         per_file >> 20,
                         dev.pool.snap_bytes(),
-                        b.rel.world(),
+                        b.parts().rel.world(),
                         need_mb.max(1)
                     );
                 } else {
@@ -1529,7 +1528,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                         cap,
                         per_file >> 20,
                         dev.pool.snap_bytes(),
-                        b.rel.world()
+                        b.parts().rel.world()
                     );
                 }
             }
@@ -1544,7 +1543,7 @@ pub(crate) fn into_running<D: DeviceClient>(
             } else {
                 cfg.knobs.disk_dir.clone()
             };
-            let attach = b.rel.attach_disk(
+            let attach = b.parts_mut().rel.attach_disk(
                 disk_root.clone(),
                 cfg.knobs.disk_cache_mb << 20,
                 snap_disk_bytes,
@@ -1561,7 +1560,7 @@ pub(crate) fn into_running<D: DeviceClient>(
             let (n_kv, n_snap) = (kv_entries.len(), snap_entries.len());
             // boot 档:**不按预算裁**(预算交给索引重建之后的带保护集对账,
             // 否则按扫描序裁会砍掉链根 ⇒ 整链重建不出来)
-            let (ra, rb) = b.rel.adopt_disk_boot(kv_entries, snap_entries);
+            let (ra, rb) = b.parts_mut().rel.adopt_disk_boot(kv_entries, snap_entries);
             owl_shared::log_info!(
                     "store",
                     "磁盘层:配额 {}MiB(KV {} / 快照 {})· 目录 {} · 回填内容 KV {}/{} 快照 {}/{} 条 · 隔离 {}+{} 条(内容惰性读回)",
@@ -1599,22 +1598,20 @@ pub(crate) fn into_running<D: DeviceClient>(
                     }
                 }
             }
-            let rep = b.rel.adopt_disk_chains(&idxs)?;
+            let rep = b.parts_mut().rel.adopt_disk_chains(&idxs)?;
             // **树容量对账**(2026-11-01 P1 收尾):adopt 之后树里到底留了几条、上限多少。
             // 少了 = `cache_cap` 把链根裁掉(树只能从根连续匹配 ⇒ 复用面归零),
             // 这是"盘上 3072 块却只匹到 184"这类问题的第一现场。
             owl_shared::log_info!(
                 "store",
                 "树对账:adopt 后 entries={} cap={}(设备池 {} 槽 × 份额 + 宿主槽)",
-                b.rel.tree_len(),
-                b.rel.tree_cap(),
-                b.rel.slots_total(),
+                b.parts().rel.tree_len(),
+                b.parts().rel.tree_cap(),
+                b.parts().rel.slots_total(),
             );
             {
                 let kept: std::collections::HashSet<_> = rep.kept.iter().copied().collect();
-                let orphans: Vec<owl_store::ChainHash> = b
-                    .rel
-                    .kv_disk_resident_keys()
+                let orphans: Vec<owl_store::ChainHash> = b.parts().rel.kv_disk_resident_keys()
                     .into_iter()
                     .filter(|k| !kept.contains(k))
                     .collect();
@@ -1629,7 +1626,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                     // 想主动清就删目录(运维动作),引擎不代劳。
                     let paths: Vec<std::path::PathBuf> = orphans
                         .iter()
-                        .filter_map(|k| b.rel.kv_disk_path_of(*k).map(|p| p.to_path_buf()))
+                        .filter_map(|k| b.parts().rel.kv_disk_path_of(*k).map(|p| p.to_path_buf()))
                         .collect();
                     let _ = &paths; // 只报不删(见上)
                     owl_shared::log_warn!(
@@ -1672,17 +1669,17 @@ pub(crate) fn into_running<D: DeviceClient>(
                  快照 物理 {:.0} MiB / 账上 {:.0} MiB / 配额 {} MiB \
                  (超配额不在此删;下次写盘腾位时按 LRU + 未入账先清)",
                 kv_p as f64 / 1048576.0,
-                b.rel.disk_used_bytes() as f64 / 1048576.0,
+                b.parts().rel.disk_used_bytes() as f64 / 1048576.0,
                 (cfg.knobs.disk_cache_mb << 20) >> 20,
                 snap_p as f64 / 1048576.0,
-                b.rel.snap_disk_used_bytes() as f64 / 1048576.0,
+                b.parts().rel.snap_disk_used_bytes() as f64 / 1048576.0,
                 cfg.knobs.snap_disk_mb,
             );
         }
         b
     };
     // **V0/V1:计划与准入账交叉校验**（plan 投影必须与 Rel::open 的入参逐字一致）。
-    bank.rel.attach_memory_plan(memory_plan.clone())?;
+    bank.parts_mut().rel.attach_memory_plan(memory_plan.clone())?;
 
     // **前缀无感删除的 boot 门**(2026-10-23;2026-10-26 只保留 leave-gap):
     // 开了就必须具备执行面 —— ① 视觉塔(图像段识别 / m-RoPE 位置自证)

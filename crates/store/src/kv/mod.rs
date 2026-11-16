@@ -71,8 +71,10 @@ pub struct KvStats {
     pub slots_free: usize,
     /// 缓存驻留块数(树条目)。
     pub cached_blocks: usize,
-    /// 其中 host 承载的块数(`slot = None`)。
+    /// 其中 `slot = None` 的块数（`KvStore` 原生；`Rel::report` 会扣除盘上-only）。
     pub host_blocks: usize,
+    /// 其中盘上驻留的块数（`Rel::report` 从 DiskTier 合并；`KvStore` 原生看不到）。
+    pub disk_blocks: usize,
     /// 缓存驻留字节(GPU 绑定块 × 单块字节)。
     pub gpu_bytes: usize,
     /// 命中次数(块级)。
@@ -864,6 +866,7 @@ impl KvStore {
             slots_free: self.pool.free(),
             cached_blocks,
             host_blocks: cached_blocks.saturating_sub(bound),
+            disk_blocks: 0,
             gpu_bytes: bound * self.block_bytes,
             hits: self.hits,
             misses: self.misses,

@@ -367,7 +367,7 @@ async fn keyless_continuation_matches_session_by_prefix() {
         ids1 = running.boot.tok.encode(&p1);
     }
     let sid = {
-        let (id, s) = running.bank.sessions.get_or_create(None).expect("建会话");
+        let (id, s) = running.bank.parts_mut().sessions.get_or_create(None).expect("建会话");
         let pos: Vec<[i32; 3]> = (0..ids1.len() as i32).map(|i| [i, i, i]).collect();
         s.commit_turn(&ids1, &[], &pos).expect("种账");
         id
@@ -434,19 +434,19 @@ async fn pressure_evicts_cold_sessions_whole() {
             }
         }
     }
-    assert_eq!(running.bank.sessions.len(), 3, "三条会话都在表里");
-    let total = running.bank.rel.slots_total();
-    let free_before = running.bank.rel.slots_free();
+    assert_eq!(running.bank.parts().sessions.len(), 3, "三条会话都在表里");
+    let total = running.bank.parts().rel.slots_total();
+    let free_before = running.bank.parts().rel.slots_free();
 
     let (n, pages) = running.evict_cold_sessions(total);
     assert_eq!(n, 3, "空闲会话应逐个被淘汰（最冷优先）");
-    assert!(running.bank.sessions.is_empty(), "淘汰后会话表应清空");
+    assert!(running.bank.parts().sessions.is_empty(), "淘汰后会话表应清空");
     assert!(
         pages > 0,
         "整会话淘汰必须真还页：{free_before} → {}（共 {total}）",
-        running.bank.rel.slots_free()
+        running.bank.parts().rel.slots_free()
     );
-    assert_eq!(running.bank.rel.slots_free(), total, "目标 = 全自由");
+    assert_eq!(running.bank.parts().rel.slots_free(), total, "目标 = 全自由");
 }
 
 /// **准入预算 = 上下文 + 本档最大输出长度**（2026-11-16 用户裁决）。
@@ -532,10 +532,10 @@ async fn queued_cancel_keeps_persistent_session() {
     let ev = running.cancel_turn(t2).await.expect("取消排队 turn");
     assert!(matches!(ev, TurnEvent::Failed { turn, .. } if turn == t2));
     assert!(
-        !running.bank.sessions.is_empty(),
+        !running.bank.parts().sessions.is_empty(),
         "会话是持久资产：排队取消不得抹掉会话账"
     );
-    assert!(running.bank.sessions.get(s1).is_some(), "活跃会话原样");
+    assert!(running.bank.parts().sessions.get(s1).is_some(), "活跃会话原样");
 }
 
 /// **F-01 回归门**：纯配置门必须返回 `Err`（旧实现 `process::exit(2)`），
@@ -721,9 +721,7 @@ async fn failed_start_does_not_kill_active_turn() {
         .submit_session_opts(Some(12), "beta alpha gamma", 4, Default::default())
         .expect("submit B");
     running
-        .bank
-        .rel
-        .borrow_row(owl_store::tier::Owner::System)
+        .bank.parts_mut().rel.borrow_row(owl_store::tier::Owner::System)
         .expect("借走最后一行");
 
     // 起 B 失败必须是**事件**（Failed{turn=B}），不是 `Err`（`Err` 会触发 abandon）。
@@ -785,7 +783,7 @@ async fn position_consolidation_resets_high_water() {
 
     // 模拟“删图留下的大 gap”：把位置账抬到 319（末位）。
     {
-        let s = running.bank.sessions.get_mut(sid).expect("会话");
+        let s = running.bank.parts_mut().sessions.get_mut(sid).expect("会话");
         let n = s.positions.len();
         let base = 319 - (n as i32 - 1);
         for (i, p) in s.positions.iter_mut().enumerate() {
@@ -812,7 +810,7 @@ async fn position_consolidation_resets_high_water() {
         }
     }
     assert!(done, "压实 turn 必须完成");
-    let s = running.bank.sessions.get(sid).expect("会话");
+    let s = running.bank.parts().sessions.get(sid).expect("会话");
     assert!(
         s.max_pos < 256,
         "压实后位置必须回到紧凑坐标：max_pos={}",
@@ -851,7 +849,7 @@ async fn mock_engine_with(
 #[tokio::test]
 async fn memory_plan_uses_measured_graph_slab_after_capture() {
     let running = mock_snap_engine(1).await;
-    let plan = running.bank.rel.memory_plan().expect("MemoryPlan 应已注入");
+    let plan = running.bank.parts().rel.memory_plan().expect("MemoryPlan 应已注入");
     let slab = plan
         .component(owl_store::ComponentId::GraphSlab)
         .expect("GraphSlab 项");
@@ -876,17 +874,17 @@ async fn idle_node_offloads_device_snapshot_via_store_plan() {
     let mut running = mock_snap_engine(1).await;
 
     // boot 已注册状态腿布局 ⇒ "一条快照的字节" > 0;宿主分片 64MiB 留位
-    let bytes = running.bank.rel.snap_bytes();
+    let bytes = running.bank.parts().rel.snap_bytes();
     assert!(bytes > 0, "状态腿布局应在 boot 注册(snap_max>0 + paged)");
     assert!(
-        running.bank.rel.snap_host_free_slots() > 0,
+        running.bank.parts().rel.snap_host_free_slots() > 0,
         "宿主分片应留位"
     );
     assert!(running.dev.pool.snap_capacity() > 0, "设备槽应 >= 1");
 
     // 手工登记一条 Durable 设备快照(不经 capture:本门只验调度 + 执行臂)
     let key = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0x5A5A));
-    running.bank.rel.register_snap_account(
+    running.bank.parts_mut().rel.register_snap_account(
         key,
         bytes,
         owl_store::Tier::Gpu,
@@ -900,7 +898,7 @@ async fn idle_node_offloads_device_snapshot_via_store_plan() {
         .expect("Idle 节点");
 
     assert_eq!(
-        running.bank.rel.state_locate(key),
+        running.bank.parts().rel.state_locate(key),
         Some(owl_store::Tier::Host),
         "store 判 Host ⇒ engine 必须真沉(执行臂闭环)"
     );
@@ -913,13 +911,13 @@ async fn idle_node_offloads_device_snapshot_via_store_plan() {
 #[tokio::test]
 async fn state_hook_slot_offload_and_resident_roundtrip() {
     let mut running = mock_snap_engine(2).await;
-    let bytes = running.bank.rel.snap_bytes();
+    let bytes = running.bank.parts().rel.snap_bytes();
     assert!(bytes > 0, "状态腿布局应已注册");
     let k_a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xA31));
     let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB32));
     let k_new = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xC33));
     for k in [k_a, k_b] {
-        running.bank.rel.register_snap_account(
+        running.bank.parts_mut().rel.register_snap_account(
             k,
             bytes,
             owl_store::Tier::Gpu,
@@ -934,10 +932,10 @@ async fn state_hook_slot_offload_and_resident_roundtrip() {
     let slot = running.snap_ensure_slot(k_new).await.expect("State::Slot");
     let victim = [k_a, k_b]
         .into_iter()
-        .find(|k| running.bank.rel.state_locate(*k) == Some(owl_store::Tier::Host))
+        .find(|k| running.bank.parts().rel.state_locate(*k) == Some(owl_store::Tier::Host))
         .expect("应有一条被沉到宿主");
     assert!(
-        running.bank.rel.snap_host_contains(victim),
+        running.bank.parts().rel.snap_host_contains(victim),
         "宿主应有内容"
     );
     assert_eq!(running.dev.pool.snap_used(), 1, "受害者设备槽已释放");
@@ -949,7 +947,7 @@ async fn state_hook_slot_offload_and_resident_roundtrip() {
         .await
         .expect("State::Resident");
     assert_eq!(
-        running.bank.rel.state_locate(victim),
+        running.bank.parts().rel.state_locate(victim),
         Some(owl_store::Tier::Gpu),
         "回灌后层账应回设备"
     );
@@ -959,7 +957,7 @@ async fn state_hook_slot_offload_and_resident_roundtrip() {
         "槽索引应记上"
     );
     assert!(
-        !running.bank.rel.snap_host_contains(victim),
+        !running.bank.parts().rel.snap_host_contains(victim),
         "宿主副本已取走"
     );
     assert_eq!(running.dev.pool.snap_used(), 2, "两槽重新占满");
@@ -1004,24 +1002,24 @@ async fn disk_spill_and_fill_roundtrip() {
         .expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
 
-    let bytes = running.bank.rel.snap_bytes();
+    let bytes = running.bank.parts().rel.snap_bytes();
     assert!(bytes > 0, "状态腿布局应已注册");
-    assert!(running.bank.rel.disk_enabled(), "盘层应已接线(配额+目录)");
+    assert!(running.bank.parts().rel.disk_enabled(), "盘层应已接线(配额+目录)");
     // **P2 磁盘腿入准入**：`store_facts()` 必须看见盘上余量（旧行为恒 0
     // ⇒ 超卖档配了盘也不用，宿主满 = 拒新）。单卡：盘块 = 一页 ⇒ 页数 = 槽数。
     let facts = running.store_facts();
-    let slots = running.bank.rel.kv_disk_free_slots();
+    let slots = running.bank.parts().rel.kv_disk_free_slots();
     assert!(slots > 0, "盘配额应给出空位（实得 {slots}）");
     assert_eq!(facts.disk_free_pages, slots, "盘槽 → 页的折算必须一一对应");
     assert_eq!(
-        running.bank.rel.snap_disk_free_slots(),
+        running.bank.parts().rel.snap_disk_free_slots(),
         1,
         "24MiB / 一条"
     );
     let k_a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xA11));
     let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB22));
     for k in [k_a, k_b] {
-        running.bank.rel.register_snap_account(
+        running.bank.parts_mut().rel.register_snap_account(
             k,
             bytes,
             owl_store::Tier::Gpu,
@@ -1041,7 +1039,7 @@ async fn disk_spill_and_fill_roundtrip() {
         ))
         .await
         .expect("拍 1");
-    let st1 = running.bank.rel.state_stats();
+    let st1 = running.bank.parts().rel.state_stats();
     assert_eq!(
         (st1.snap_gpu.0, st1.snap_host.0),
         (1, 1),
@@ -1049,7 +1047,7 @@ async fn disk_spill_and_fill_roundtrip() {
     );
     let in_host = [k_a, k_b]
         .into_iter()
-        .find(|k| running.bank.rel.state_locate(*k) == Some(owl_store::Tier::Host))
+        .find(|k| running.bank.parts().rel.state_locate(*k) == Some(owl_store::Tier::Host))
         .expect("应有一张在宿主");
     let other = if in_host == k_a { k_b } else { k_a };
 
@@ -1063,24 +1061,24 @@ async fn disk_spill_and_fill_roundtrip() {
         ))
         .await
         .expect("拍 2");
-    let disk = running.bank.rel.snap_disk_resident_count();
+    let disk = running.bank.parts().rel.snap_disk_resident_count();
     assert_eq!(
         disk,
         1,
         "宿主满 ⇒ 一张落磁盘:{:?}",
-        running.bank.rel.state_stats()
+        running.bank.parts().rel.state_stats()
     );
     assert_eq!(
-        running.bank.rel.state_locate(in_host),
+        running.bank.parts().rel.state_locate(in_host),
         Some(owl_store::Tier::Disk),
         "被挪去盘的是宿主里那张"
     );
     assert_eq!(
-        running.bank.rel.state_locate(other),
+        running.bank.parts().rel.state_locate(other),
         Some(owl_store::Tier::Gpu),
         "设备那张仍在(内容不丢优先:本轮不出 Drop)"
     );
-    let path = running.bank.rel.snap_disk_path_of(in_host).unwrap().to_path_buf();
+    let path = running.bank.parts().rel.snap_disk_path_of(in_host).unwrap().to_path_buf();
     assert!(path.exists(), "文件应真写盘:{}", path.display());
     assert_eq!(
         std::fs::metadata(&path).unwrap().len() as usize,
@@ -1089,22 +1087,19 @@ async fn disk_spill_and_fill_roundtrip() {
     );
 
     // 回填:盘 → 宿主(层账回 Host;磁盘副本仍在 = 权威)
-    assert!(running
-        .disk
-        .fill_snap(&mut running.bank.rel, in_host)
-        .await
-        .expect("回填"));
+    let rel = running.bank.parts_mut().rel;
+    assert!(running.disk.fill_snap(rel, in_host).await.expect("回填"));
     assert_eq!(
-        running.bank.rel.state_locate(in_host),
+        running.bank.parts().rel.state_locate(in_host),
         Some(owl_store::Tier::Host),
         "回填后层账 = Host"
     );
     assert!(
-        running.bank.rel.snap_host_contains(in_host),
+        running.bank.parts().rel.snap_host_contains(in_host),
         "宿主应有内容"
     );
     assert!(
-        running.bank.rel.snap_disk_contains(in_host),
+        running.bank.parts().rel.snap_disk_contains(in_host),
         "磁盘副本仍在(权威)"
     );
 
@@ -1147,15 +1142,15 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
         .expect("装载");
     let mut running = engine.run(loaded).await.expect("装配");
 
-    let bytes = running.bank.rel.snap_bytes();
+    let bytes = running.bank.parts().rel.snap_bytes();
     assert!(bytes > 0, "状态腿布局应已注册");
-    assert!(running.bank.rel.disk_enabled(), "盘层应已接线");
+    assert!(running.bank.parts().rel.disk_enabled(), "盘层应已接线");
     let k_a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xA41));
     let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB42));
     let k_c = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xC43));
     let k_d = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xD44));
     for k in [k_a, k_b] {
-        running.bank.rel.register_snap_account(
+        running.bank.parts_mut().rel.register_snap_account(
             k,
             bytes,
             owl_store::Tier::Gpu,
@@ -1171,14 +1166,14 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
         .await
         .expect("第一次 State::Slot");
     running.dev.pool.snap_place(slot_c, k_c);
-    running.bank.rel.register_snap_account(
+    running.bank.parts_mut().rel.register_snap_account(
         k_c,
         bytes,
         owl_store::Tier::Gpu,
         owl_store::SnapDurability::Durable,
     );
-    let st1 = running.bank.rel.state_stats();
-    let disk1 = running.bank.rel.snap_disk_resident_count();
+    let st1 = running.bank.parts().rel.state_stats();
+    let disk1 = running.bank.parts().rel.snap_disk_resident_count();
     assert_eq!(
         (st1.snap_gpu.0, st1.snap_host.0, disk1),
         (2, 1, 0),
@@ -1192,8 +1187,8 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
         .snap_ensure_slot(k_d)
         .await
         .expect("第二次 State::Slot");
-    let st2 = running.bank.rel.state_stats();
-    let disk2 = running.bank.rel.snap_disk_resident_count();
+    let st2 = running.bank.parts().rel.state_stats();
+    let disk2 = running.bank.parts().rel.snap_disk_resident_count();
     assert_eq!(
         (st2.snap_gpu.0, st2.snap_host.0, disk2),
         (1, 1, 1),
@@ -1202,12 +1197,12 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
     // 三条旧快照都还在账（没有内容被丢）。
     for k in [k_a, k_b, k_c] {
         assert!(
-            running.bank.rel.state_locate(k).is_some(),
+            running.bank.parts().rel.state_locate(k).is_some(),
             "快照 {k:?} 被丢了"
         );
     }
     assert_eq!(
-        running.bank.rel.snap_disk_resident_count(),
+        running.bank.parts().rel.snap_disk_resident_count(),
         1,
         "盘上应有一条"
     );
@@ -1238,29 +1233,25 @@ async fn turn_records_session_ownership_for_kv_and_snaps() {
     let full = toks.len() / page;
     assert!(full >= 2, "prompt 应覆盖至少两块");
     let tail = running
-        .bank
-        .rel
-        .tail_hash(&toks, full)
+        .bank.parts().rel.tail_hash(&toks, full)
         .expect("链尾身份");
     assert_eq!(
-        running.bank.rel.session_of(tail),
+        running.bank.parts().rel.session_of(tail),
         sid,
         "KV 尾块应归本会话"
     );
-    assert_eq!(running.bank.rel.depth_of(tail), full, "深度 = 块数");
+    assert_eq!(running.bank.parts().rel.depth_of(tail), full, "深度 = 块数");
 
     // 快照(页边界)也要带归属与深度
     let snaps: Vec<_> = running
-        .bank
-        .rel
-        .snap_evict_candidates(&[])
+        .bank.parts().rel.snap_evict_candidates(&[])
         .into_iter()
         .filter_map(|c| c.snap)
         .collect();
     assert!(!snaps.is_empty(), "应有页边界快照");
     let mut seen_depth = false;
     for k in snaps {
-        let (s, d) = running.bank.rel.snap_session_info(k).expect("在账");
+        let (s, d) = running.bank.parts().rel.snap_session_info(k).expect("在账");
         assert_eq!(s, sid, "快照应归本会话");
         if d > 0 {
             seen_depth = true;
@@ -1302,7 +1293,7 @@ async fn gdn_row_is_owned_by_the_active_turn() {
         })
         .expect("行应归 Turn(tid)");
     assert_eq!(row.entries, 1, "本 turn 应恰好借一行:{row:?}");
-    assert_eq!(row.bytes, running.bank.rel.row_bytes());
+    assert_eq!(row.bytes, running.bank.parts().rel.row_bytes());
     let row_grant = rep
         .grants
         .iter()
@@ -1311,13 +1302,21 @@ async fn gdn_row_is_owned_by_the_active_turn() {
     assert_eq!(row_grant.slots, 1, "Row 票 = 1 行");
 }
 
+/// **主动 checkpoint 默认是自动的**（不是配置开关）：生产 policy 必须非零。
+#[test]
+fn checkpoint_policy_is_automatic_by_default() {
+    let p = crate::running::CheckpointPolicy::default();
+    assert!(p.step_bytes > 0, "生产默认必须启用主动 checkpoint");
+    assert!(!p.min_gap.is_zero(), "生产默认必须有节拍，避免空闲拍连写");
+}
+
 /// **S6.2 验收门：无宿主压力下，主动 checkpoint 让重启后仍能召回**。
 ///
 /// 与 [`disk_chain_index_enables_cross_restart_reuse`] 的差别就是**去掉压力**：
 /// 旧门靠手工打 6 次 `Maintain::Pressure` 把内容逼上盘 —— 那正是本特性要取代的
 /// 路径（宿主够大时它永不发生 ⇒ 重启后索引在、内容不在 ⇒ 召回 = 0）。
 ///
-/// 两个分支对照（同一套参数，只差 `checkpoint_max_mb`）：
+/// 两个分支对照（同一套参数，只差内部 checkpoint policy 的 step；test-only 0 = 关）：
 /// | 分支 | 盘上应有 `.bin` | 重启后应命中 |
 /// |---|---|---|
 /// | 关（0，旧行为） | **0** | **否**（内容只在设备/宿主） |
@@ -1350,9 +1349,11 @@ async fn disk_checkpoint_survives_restart_without_host_pressure() {
             knobs.disk_cache_mb = 8;
             knobs.snap_disk_mb = 0;
             knobs.disk_dir = dir.display().to_string();
-            // 本门的主角：主动 checkpoint（对照组 = 0 = 旧行为）
-            knobs.checkpoint_max_mb = ckpt_mb;
-            knobs.checkpoint_min_gap_ms = 0; // 每 turn 都试
+            // 本门的主角：主动 checkpoint（对照组 = 0 = 测试关闭；生产自动）
+            knobs.checkpoint_policy = crate::running::CheckpointPolicy {
+                step_bytes: ckpt_mb << 20,
+                min_gap: std::time::Duration::ZERO,
+            };
             EngineConfig {
                 device_ordinal: 0,
                 max_seq_tokens: 256,
@@ -1404,30 +1405,30 @@ async fn disk_checkpoint_survives_restart_without_host_pressure() {
                         .count()
                 })
                 .unwrap_or(0);
-            eprintln!("[ckpt] checkpoint_max_mb={ckpt_mb} ⇒ 盘上 .bin = {bins}");
+            eprintln!("[ckpt] checkpoint_step_mb={ckpt_mb} ⇒ 盘上 .bin = {bins}");
             if ckpt_mb > 0 {
                 assert!(bins > 0, "开 checkpoint 时**无压力**也必须主动写盘");
             } else {
                 assert_eq!(bins, 0, "关 checkpoint 且宿主够大 ⇒ 不该有盘上内容(旧行为)");
             }
             let t0 = running.tokenize(&prompt, true).expect("tokenize").tokens;
-            let (h, _) = running.bank.rel.match_prefix(&t0).expect("命中查询");
+            let (h, _) = running.bank.parts_mut().rel.match_prefix(&t0).expect("命中查询");
             (t0, h.matched_blocks)
         };
         assert!(matched0 > 0, "重启前同进程应命中(对照组另说:内容在宿主)");
 
         // ── 第二次进程：同目录 ⇒ boot 按索引 adopt ⇒ 命中面来自盘层
         let mut running2 = boot(mk(&dir)).await;
-        let (h2, _) = running2.bank.rel.match_prefix(&t0).expect("重启后命中查询");
+        let (h2, _) = running2.bank.parts_mut().rel.match_prefix(&t0).expect("重启后命中查询");
         eprintln!(
             "[ckpt] 重启后: ckpt={ckpt_mb} 盘 entries={} matched={}",
-            running2.bank.rel.kv_disk_resident_count(),
+            running2.bank.parts().rel.kv_disk_resident_count(),
             h2.matched_blocks
         );
         assert_eq!(
             h2.matched_blocks > 0,
             expect_hit,
-            "checkpoint_max_mb={ckpt_mb}:重启后命中={} (期望 {expect_hit})",
+            "checkpoint_step_mb={ckpt_mb}:重启后命中={} (期望 {expect_hit})",
             h2.matched_blocks
         );
         // 开了 checkpoint 的分支：命中块必须真的覆盖 prompt 前缀（≥ 1 整块）
@@ -1514,12 +1515,12 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
                 .await
                 .expect("保洁");
         }
-        let disk_entries = running.bank.rel.kv_disk_resident_count();
+        let disk_entries = running.bank.parts().rel.kv_disk_resident_count();
         assert!(disk_entries > 0, "应已有链内容溢写到盘");
         // 重启前的对照:同一份 token 化应命中(证明索引 tokens 与查询同源)
         // 提交路径会套 chat 模板 ⇒ 查询侧同口径(chat_wrap = true)
         let t0 = running.tokenize(&prompt, true).expect("tokenize").tokens;
-        let (h0, _) = running.bank.rel.match_prefix(&t0).expect("命中");
+        let (h0, _) = running.bank.parts_mut().rel.match_prefix(&t0).expect("命中");
         assert!(h0.matched_blocks > 0, "重启前应命中(否则 tokens 不同源)");
         let idx_n = std::fs::read_dir(dir.join("kv"))
             .map(|rd| {
@@ -1550,13 +1551,13 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
     let mut running2 = boot(mk(&dir)).await;
     eprintln!(
         "[idx] 重启后: 盘 entries={} / 树 host_blocks={}",
-        running2.bank.rel.kv_disk_resident_count(),
-        running2.bank.rel.kv_stats().host_blocks
+        running2.bank.parts().rel.kv_disk_resident_count(),
+        running2.bank.parts().rel.kv_stats().host_blocks
     );
-    let rebuilt = running2.bank.rel.kv_stats().host_blocks;
+    let rebuilt = running2.bank.parts().rel.kv_stats().host_blocks;
     assert!(rebuilt > 0, "重启后应按索引重建出条目(非设备层)");
     let toks = running2.tokenize(&prompt, true).expect("tokenize").tokens;
-    let (hit, _recall) = running2.bank.rel.match_prefix(&toks).expect("命中");
+    let (hit, _recall) = running2.bank.parts_mut().rel.match_prefix(&toks).expect("命中");
     assert!(hit.matched_blocks > 0, "重建的树应命中同一 prompt 前缀");
     // 命中面允许回读(内容在盘 ⇒ pending_host/回灌路径);这里只验"选得中"
     assert_eq!(
@@ -1613,8 +1614,8 @@ async fn disk_adopt_on_boot_restores_ledger() {
     // ── 第一次进程:把一张快照搬到盘上(拍 1 宿主 → 拍 2 盘)
     {
         let mut running = boot(mk(&dir)).await;
-        let bytes = running.bank.rel.snap_bytes();
-        running.bank.rel.register_snap_account(
+        let bytes = running.bank.parts().rel.snap_bytes();
+        running.bank.parts_mut().rel.register_snap_account(
             key,
             bytes,
             owl_store::Tier::Gpu,
@@ -1633,7 +1634,7 @@ async fn disk_adopt_on_boot_restores_ledger() {
                 .expect("保洁");
         }
         assert_eq!(
-            running.bank.rel.state_locate(key),
+            running.bank.parts().rel.state_locate(key),
             Some(owl_store::Tier::Disk),
             "第一次进程里应已落盘"
         );
@@ -1642,22 +1643,22 @@ async fn disk_adopt_on_boot_restores_ledger() {
     // ── 第二次进程:同目录 ⇒ boot 扫盘回填账(不搬内容)
     let running2 = boot(mk(&dir)).await;
     assert_eq!(
-        running2.bank.rel.snap_disk_resident_count(),
+        running2.bank.parts().rel.snap_disk_resident_count(),
         1,
         "盘上条目应被回填进账"
     );
     assert!(
-        running2.bank.rel.snap_disk_contains(key),
+        running2.bank.parts().rel.snap_disk_contains(key),
         "回填的正是那张快照"
     );
     assert_eq!(
-        running2.bank.rel.state_locate(key),
+        running2.bank.parts().rel.state_locate(key),
         Some(owl_store::Tier::Disk),
         "层账回填到 Disk"
     );
     // 启动期**不读内容**:宿主里还没有它(惰性)
     assert!(
-        !running2.bank.rel.snap_host_contains(key),
+        !running2.bank.parts().rel.snap_host_contains(key),
         "启动不回读内容"
     );
 
@@ -1675,17 +1676,17 @@ async fn disk_adopt_on_boot_restores_ledger() {
 async fn snapshot_victim_follows_store_order() {
     use crate::state::SnapSlotPick;
     let mut running = mock_snap_engine(2).await;
-    let bytes = running.bank.rel.snap_bytes();
+    let bytes = running.bank.parts().rel.snap_bytes();
     assert!(bytes > 0);
     let k_a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xA1));
     let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB2));
-    running.bank.rel.register_snap_account(
+    running.bank.parts_mut().rel.register_snap_account(
         k_a,
         bytes,
         owl_store::Tier::Gpu,
         owl_store::SnapDurability::Durable,
     );
-    running.bank.rel.register_snap_account(
+    running.bank.parts_mut().rel.register_snap_account(
         k_b,
         bytes,
         owl_store::Tier::Gpu,
@@ -1696,7 +1697,7 @@ async fn snapshot_victim_follows_store_order() {
     running.dev.pool.snap_place(0, k_a);
     assert_eq!(running.dev.pool.snap_used(), 2, "两槽已满");
 
-    let order = running.bank.rel.snap_victim_order(&[]);
+    let order = running.bank.parts().rel.snap_victim_order(&[]);
     assert_eq!(
         order.first(),
         Some(&k_a),
@@ -1852,7 +1853,7 @@ pub async fn gpu_schedule_decision_surface() {
                     // 物理槽 = 块表[pos/page]×page + pos%page(页 16 后
                     // 17 token 提示词跨入块 1,恒 b0 假设已不成立)
                     let expect_slot =
-                        eng.bank.sessions.get(sid).unwrap().block_table[n / page] as usize * page
+                        eng.bank.parts().sessions.get(sid).unwrap().block_table[n / page] as usize * page
                             + n % page;
                     assert_eq!(kv_slot as usize, expect_slot, "物理槽 = 块链换算");
                     assert_eq!(gdn_slot, 0, "首会话格 0");
@@ -1874,7 +1875,7 @@ pub async fn gpu_schedule_decision_surface() {
         let act = eng.turns.active.pop().expect("模拟器活跃 turn");
         eng.turns.select(None);
         eng.close_admission(act.id);
-        let s = eng.bank.sessions.get_mut(act.session_id).unwrap();
+        let s = eng.bank.parts_mut().sessions.get_mut(act.session_id).unwrap();
         s.commit_turn(
             &act.prompt_ids,
             &[],
@@ -2000,19 +2001,17 @@ async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D
 
     // ② 宿主 → 设备回灌:找一条宿主层快照,就位到设备槽
     let host_key = running
-        .bank
-        .rel
-        .snap_evict_candidates(&[])
+        .bank.parts().rel.snap_evict_candidates(&[])
         .into_iter()
         .filter_map(|c| c.snap)
-        .find(|k| running.bank.rel.state_locate(*k) == Some(owl_store::Tier::Host))
+        .find(|k| running.bank.parts().rel.state_locate(*k) == Some(owl_store::Tier::Host))
         .expect("应有宿主层快照");
     let slot = running
         .snap_ensure_resident(host_key)
         .await
         .expect("回灌就位");
     assert_eq!(
-        running.bank.rel.state_locate(host_key),
+        running.bank.parts().rel.state_locate(host_key),
         Some(owl_store::Tier::Gpu),
         "回灌后层账应回设备"
     );
@@ -2036,7 +2035,7 @@ async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D
         "[s2] 回灌后:快照 设备 {:?} / 宿主 {:?}(条, 字节)· 宿主驻留 {}B",
         rep2.state.snap_gpu,
         rep2.state.snap_host,
-        running.bank.rel.snap_host_used()
+        running.bank.parts().rel.snap_host_used()
     );
     assert_eq!(
         rep2.state.snap_host.0 + rep2.state.snap_gpu.0,
@@ -2133,7 +2132,7 @@ async fn index_probe_scenario<D: DeviceClient>(
     running: &mut RunningEngine<D>,
     expect_nonzero: bool,
 ) {
-    let _before = running.bank.rel.index_bytes();
+    let _before = running.bank.parts().rel.index_bytes();
     // 生成段要够长:页边界(32)才出块 ⇒ 才触发采集
     let (_, tid) = running
         .submit_session(Some(1), "索引采集探针:第一段。", 80)
@@ -2146,12 +2145,10 @@ async fn index_probe_scenario<D: DeviceClient>(
             _ => {}
         }
     }
-    let after = running.bank.rel.index_bytes();
+    let after = running.bank.parts().rel.index_bytes();
     let rep = running.store_report();
     let (blocks, per_block) = running
-        .bank
-        .rel
-        .index()
+        .bank.parts().rel.index()
         .as_ref()
         .map(|i| (i.len(), i.block_bytes()))
         .unwrap_or((0, 0));
@@ -2170,7 +2167,7 @@ async fn index_probe_scenario<D: DeviceClient>(
     assert_eq!(after, blocks * per_block, "索引体量 = 块数 × 每块字节");
     if expect_nonzero {
         // 真卡档:索引必须来自真实 K（全零 = GPU 路径/切片偏移失守）
-        let ix = running.bank.rel.index().expect("索引账在场");
+        let ix = running.bank.parts().rel.index().expect("索引账在场");
         let first = ix
             .evict_candidates(&[])
             .first()
@@ -2192,9 +2189,7 @@ async fn index_probe_scenario<D: DeviceClient>(
     // 幂等:同一 fed 再跑一次采集(直接调采集口)不应重复登记
     let n0 = blocks;
     if let Some(k) = running
-        .bank
-        .rel
-        .index()
+        .bank.parts().rel.index()
         .as_ref()
         .and(None::<owl_store::SnapKey>)
     {
@@ -2202,9 +2197,7 @@ async fn index_probe_scenario<D: DeviceClient>(
     }
     assert_eq!(
         running
-            .bank
-            .rel
-            .index()
+            .bank.parts().rel.index()
             .as_ref()
             .map(|i| i.len())
             .unwrap_or(0),
@@ -2916,7 +2909,7 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
         rep1.host_resident_bytes as f64 / 1048576.0,
         rep1.kv.slots_free,
         rep1.kv.slots_total,
-        running.bank.rel.leg_stats().ops.offloads
+        running.bank.parts().rel.leg_stats().ops.offloads
     );
     // ② 会话 2:造压 ⇒ 下沉
     {
@@ -2936,8 +2929,8 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
         rep2.kv.cached_blocks,
         rep2.kv.host_blocks,
         rep2.host_resident_bytes as f64 / 1048576.0,
-        running.bank.rel.leg_stats().ops.offloads,
-        running.bank.rel.leg_stats().ops.offload_bytes >> 10,
+        running.bank.parts().rel.leg_stats().ops.offloads,
+        running.bank.parts().rel.leg_stats().ops.offload_bytes >> 10,
         rep2.kv.slots_free
     );
     let _stage_before = running.sel.stage().blocks;
@@ -2958,8 +2951,8 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
     eprintln!("[b3e] {}", st.line());
     eprintln!(
         "[b3e] 轮 3 后:回灌 {} 次/{}KiB(命中面复用)· 宿主仍驻留 {:.2}MiB",
-        running.bank.rel.leg_stats().ops.onloads,
-        running.bank.rel.leg_stats().ops.onload_bytes >> 10,
+        running.bank.parts().rel.leg_stats().ops.onloads,
+        running.bank.parts().rel.leg_stats().ops.onload_bytes >> 10,
         rep3.host_resident_bytes as f64 / 1048576.0
     );
     // 27B 外推(每块 K+V = 16 层 × 32 tok × 4 头 × 256 dim × 2B × 2)
@@ -2977,11 +2970,11 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
     );
     let _ = s1;
     assert!(
-        running.bank.rel.leg_stats().ops.offloads > 0,
+        running.bank.parts().rel.leg_stats().ops.offloads > 0,
         "门①:没造出下沉(宿主层/压力不够?)"
     );
     assert!(
-        st.blocks > 0 && running.bank.rel.leg_stats().ops.onloads > 0,
+        st.blocks > 0 && running.bank.parts().rel.leg_stats().ops.onloads > 0,
         "门②:回灌没发生(前缀命中的块不在宿主层?下沉量不够?)"
     );
 }
@@ -3320,7 +3313,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     // 保洁按链把 A+B(各 3 块)整条沉到宿主(内容不丢,不是被同步驱逐掉)
     let _ = probe_run_turn(&mut *running, &long).await;
 
-    let rep = running.bank.rel.leg_stats();
+    let rep = running.bank.parts().rel.leg_stats();
     eprintln!(
         "[s3-3b] 轮 3 后:自由槽 {}/{} · 缓存 {} 块 · 宿主 {} 块 / {:.2}MiB · 换出 {} 次 {}KiB(drop {} / 同步驱逐 canary —)",
         rep.slots_free,
@@ -3375,7 +3368,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
         let mut diag = |tag: &str, p: &str| {
             let wrapped = running.boot.tok.chat_wrap(p);
             let ids = running.boot.tok.encode(&wrapped);
-            let hit = running.bank.rel.match_prefix(&ids).expect("match").0;
+            let hit = running.bank.parts_mut().rel.match_prefix(&ids).expect("match").0;
             let rows: Vec<String> = hit
                 .hashes
                 .iter()
@@ -3387,9 +3380,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
                         if s.is_some() { "dev" } else { "host" },
                         // S2:在场性查 **store 的层账**(设备/宿主都算)
                         if running
-                            .bank
-                            .rel
-                            .state_locate(owl_store::SnapKey::at_boundary(*h))
+                            .bank.parts().rel.state_locate(owl_store::SnapKey::at_boundary(*h))
                             .is_some()
                         {
                             "Y"
@@ -3423,7 +3414,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     let cold = cold_text.as_deref().expect("轮 1 冷启动基线在场");
     assert_eq!(text, cold, "门③:命中路径输出必须与冷启动逐字节一致");
 
-    let rep2 = running.bank.rel.leg_stats();
+    let rep2 = running.bank.parts().rel.leg_stats();
     eprintln!(
         "[s3-3b] 轮 4 后:宿主 {} 块 / {:.2}MiB · 换出 {} 块/{} 命令 · 回灌 {} 块/{} 命令 · 同步驱逐 canary {}",
         rep2.host_blocks,
@@ -3646,12 +3637,13 @@ runtime_floor_bytes={runtime_floor} draft_pool_bytes={draft_pool} gdn_row_bytes=
     );
 
     // ── **显存硬预算实证**(2026-10-16):小预算 ⇒ server 侧**主动拒发** ──
-    // 判据(cuda::state::vram_budget_guard):驱动账 free−reserve / live 账上限;
+    // 判据(cuda::state::vram_budget_guard):驱动账 free−reserve;
     // 拒发 = 结构化 `PoolExhausted`(+ is_fatal ⇒ 服务面优雅关停)。
     // 目的:证明"引擎装配遇到超预算"是**干净的结构化失败**,不是 CUDA 抛错。
     {
         let mut knobs = EngineKnobs::default();
-        knobs.cuda.vram_budget_mb = Some(64); // 64MiB:装不下池(96MiB KV + 154MiB GDN)
+        // 绝对上限键已退休；用拉满 reserve 模拟同一道硬预算门。
+        knobs.cuda.vram_reserve_mb = 1 << 20;
         let mut e2 = Engine::new(EngineConfig {
             device_ordinal: ordinal,
             max_seq_tokens: 4096,
@@ -4283,9 +4275,7 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
         .tok
         .encode(&running.boot.tok.chat_wrap(a_prompt.as_str()));
     let (a_hit_1, _) = running
-        .bank
-        .rel
-        .match_prefix(&a_tokens)
+        .bank.parts_mut().rel.match_prefix(&a_tokens)
         .expect("A 命中查询");
     assert!(a_hit_1.matched_blocks >= 1, "A 的历史应进缓存(内容身份)");
 
@@ -4298,9 +4288,7 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
 
     // 隔离断言 ①:B 的 turn 后,A 的**内容链**与账本都不变
     let (a_hit_2, _) = running
-        .bank
-        .rel
-        .match_prefix(&a_tokens)
+        .bank.parts_mut().rel.match_prefix(&a_tokens)
         .expect("A 命中查询");
     assert_eq!(
         a_hit_1.hashes, a_hit_2.hashes,
@@ -4317,9 +4305,7 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
         .tok
         .encode(&running.boot.tok.chat_wrap("我的代号是贝塔。"));
     let (b_hit, _) = running
-        .bank
-        .rel
-        .match_prefix(&b_tokens)
+        .bank.parts_mut().rel.match_prefix(&b_tokens)
         .expect("B 命中查询");
     assert!(
         b_hit.hashes.iter().all(|h| !a_hit_2.hashes.contains(h)),
@@ -4468,14 +4454,10 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFa
         .tok
         .encode(&running.boot.tok.chat_wrap(prompt_b.as_str()));
     let (hit_a, _) = running
-        .bank
-        .rel
-        .match_prefix(&a_ids)
+        .bank.parts_mut().rel.match_prefix(&a_ids)
         .expect("A 命中查询");
     let (hit_b, _) = running
-        .bank
-        .rel
-        .match_prefix(&b_ids)
+        .bank.parts_mut().rel.match_prefix(&b_ids)
         .expect("B 命中查询");
     let shared = hit_b
         .hashes
@@ -4488,7 +4470,7 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFa
         "B 应命中 ≥8 块,得 {}",
         hit_b.matched_blocks
     );
-    let rep = running.bank.rel.leg_stats();
+    let rep = running.bank.parts().rel.leg_stats();
     assert!(
         rep.cached_blocks >= 8,
         "缓存面应有 ≥8 条目,得 {}",
@@ -5044,9 +5026,7 @@ pub async fn gpu_spec_identity_gate() {
                 .expect("submit");
             let text = drive_turn(&mut running, id).await;
             let toks = running
-                .bank
-                .sessions
-                .get(sid)
+                .bank.parts().sessions.get(sid)
                 .map(|s| s.tokens.clone())
                 .unwrap_or_default();
             out.push((text, toks));
@@ -5063,9 +5043,7 @@ pub async fn gpu_spec_identity_gate() {
                 .expect("submit(ignore_eos)");
             let text_ie = drive_turn(&mut running, id_ie).await;
             let n = running
-                .bank
-                .sessions
-                .get(sid_ie)
+                .bank.parts().sessions.get(sid_ie)
                 .map(|s| s.tokens.len())
                 .unwrap_or(0);
             eprintln!("[spec-gate] 预算尽门(ignore_eos): {n} tok,文本 {text_ie:?}");
@@ -5194,9 +5172,7 @@ pub async fn gpu_spec_identity_gate_27b() {
         let (sid, id) = running.submit_session(Some(7), prompt, 40).expect("submit");
         let text = drive_turn(running, id).await;
         let toks = running
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .map(|s| s.tokens.clone())
             .unwrap_or_default();
         let st = running.dev.spec_rt.stats;
@@ -5360,9 +5336,7 @@ pub async fn gpu_dflash2_identity_gate_27b() {
         let text = drive_turn(running, id).await;
         let t_gen = tg.elapsed();
         let toks = running
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .map(|s| s.tokens.clone())
             .unwrap_or_default();
         let gen_n = toks.len().saturating_sub(prompt_len);
@@ -5620,9 +5594,7 @@ pub async fn gpu_decode_marginal_bench() {
         let _text = drive_turn(&mut running, id).await;
         let wall = t0.elapsed().as_secs_f64();
         let n = running
-            .bank
-            .sessions
-            .get(7)
+            .bank.parts().sessions.get(7)
             .map(|v| v.tokens.len())
             .unwrap_or(0);
         drop(running);
@@ -5759,9 +5731,7 @@ pub async fn gpu_head_int8_gate() {
         let (_sid, id) = running.submit_session(Some(7), prompt, n).expect("submit");
         let _ = drive_turn(&mut running, id).await;
         let toks = running
-            .bank
-            .sessions
-            .get(7)
+            .bank.parts().sessions.get(7)
             .map(|s| s.tokens.clone())
             .unwrap_or_default();
         drop(running);
@@ -5813,9 +5783,7 @@ pub async fn gpu_head_int8_gate() {
             let (_s, id) = running.submit_session(Some(sid), *p, n).expect("submit");
             let _ = drive_turn(&mut running, id).await;
             let t = running
-                .bank
-                .sessions
-                .get(sid)
+                .bank.parts().sessions.get(sid)
                 .map(|s| s.tokens.clone())
                 .unwrap_or_default();
             eprintln!(
@@ -7068,7 +7036,7 @@ pub async fn gpu_image_evict_gate() {
     assert_eq!((spans1[0].end - spans1[0].start) % page, 0, "段长必须整页");
     let del = spans1[0];
     let (old_tokens, old_positions, old_spans, old_max) = {
-        let s = running.bank.sessions.session(sid).expect("会话账");
+        let s = running.bank.parts().sessions.session(sid).expect("会话账");
         assert_eq!(
             &s.tokens[..padded1.len()],
             &padded1[..],
@@ -7092,9 +7060,7 @@ pub async fn gpu_image_evict_gate() {
         &old_positions,
     );
     let (hit, _) = running
-        .bank
-        .rel
-        .match_prefix_tagged(&old_tokens, &old_tags)
+        .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
         .expect("旧链命中");
     assert!(
         hit.matched_blocks > (del.end / page),
@@ -7174,7 +7140,7 @@ pub async fn gpu_image_evict_gate() {
     assert!(!deleted_slots.is_empty(), "被删图应有设备槽");
     for slot in &deleted_slots {
         assert!(
-            running.bank.rel.slot_refs(*slot) > 0,
+            running.bank.parts().rel.slot_refs(*slot) > 0,
             "删除前 {slot} 应仍有缓存引用（否则本门没有可验对象）"
         );
     }
@@ -7194,7 +7160,7 @@ pub async fn gpu_image_evict_gate() {
     running.execute_begin(begin).await.expect("t2 begin");
     for slot in &deleted_slots {
         assert_eq!(
-            running.bank.rel.slot_refs(*slot),
+            running.bank.parts().rel.slot_refs(*slot),
             0,
             "被删图的槽 {slot} 仍有缓存引用：leave-gap 没有解除旧链尾引用"
         );
@@ -7228,15 +7194,15 @@ pub async fn gpu_image_evict_gate() {
     // 到删点之前，`reuse_face` 再退快照也救不回来（2026-10-26 前端
     // turn36→37 案：删除轮 cache 41k，下一轮只到 36,960）。
     {
-        let s = running.bank.sessions.session(sid).expect("会话账");
+        let bank = running.bank.parts_mut();
+        let s = bank.sessions.session(sid).expect("会话账");
         let tags = crate::img_evict::block_tags_pos(
             s.tokens.len(),
             page,
             &s.img_spans,
             &s.positions,
         );
-        let (hit_new, _) = running
-            .bank
+        let (hit_new, _) = bank
             .rel
             .match_prefix_tagged(&s.tokens, &tags)
             .expect("新链查询");
@@ -7272,7 +7238,7 @@ pub async fn gpu_image_evict_gate() {
 
     // ⑤ 位置账：幸存后缀逐 token 不变，max_pos 不回退
     {
-        let s = running.bank.sessions.session(sid).expect("会话账");
+        let s = running.bank.parts().sessions.session(sid).expect("会话账");
         assert_eq!(s.positions.len(), s.tokens.len(), "位置账与 token 账等长");
         assert!(s.max_pos >= old_max, "max_pos 不回退");
         let k = old_tokens[del.end..]
@@ -7292,9 +7258,7 @@ pub async fn gpu_image_evict_gate() {
     // KV 槽不再被缓存引用站住；保留前缀仍可命中。
     {
         let (hit_old, _) = running
-            .bank
-            .rel
-            .match_prefix_tagged(&old_tokens, &old_tags)
+            .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
             .expect("旧链查询");
         assert_eq!(
             hit_old.matched_blocks,
@@ -7650,7 +7614,7 @@ pub async fn gpu_image_evict_anchor_gate() {
         seq1.ids.len()
     );
     let (old_tokens, old_positions, old_img_spans) = {
-        let s = running.bank.sessions.session(sid).expect("会话账");
+        let s = running.bank.parts().sessions.session(sid).expect("会话账");
         assert_eq!(
             s.img_spans.iter().map(|x| (x.start, x.end)).collect::<Vec<_>>(),
             spans.iter().map(|x| (x.start, x.end)).collect::<Vec<_>>(),
@@ -7666,9 +7630,7 @@ pub async fn gpu_image_evict_anchor_gate() {
         &old_positions,
     );
     let (hit, _) = running
-        .bank
-        .rel
-        .match_prefix_tagged(&old_tokens, &old_tags)
+        .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
         .expect("旧链命中");
     assert!(
         hit.matched_blocks >= old_blocks,
@@ -7727,11 +7689,11 @@ pub async fn gpu_image_evict_anchor_gate() {
         "锚点快照必须兜住图片前的**全部**幸存页: reused={reused_pages} expect={expect_pages}"
     );
     {
-        let s = running.bank.sessions.session(sid).expect("会话账");
+        let bank = running.bank.parts_mut();
+        let s = bank.sessions.session(sid).expect("会话账");
         let tags =
             crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
-        let (hit_new, _) = running
-            .bank
+        let (hit_new, _) = bank
             .rel
             .match_prefix_tagged(&s.tokens, &tags)
             .expect("新链查询");
@@ -7742,9 +7704,7 @@ pub async fn gpu_image_evict_anchor_gate() {
         );
     }
     let (hit_old, _) = running
-        .bank
-        .rel
-        .match_prefix_tagged(&old_tokens, &old_tags)
+        .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
         .expect("旧链查询");
     assert_eq!(
         hit_old.matched_blocks,
@@ -7819,15 +7779,15 @@ pub async fn gpu_image_evict_anchor_gate() {
             "同一游程里每张可删图都要出锚点（不能只取游程起点）"
         );
         let (sess, hit_a) = {
-            let s = running.bank.sessions.session(sid2).expect("run 会话账");
+            let bank = running.bank.parts_mut();
+            let s = bank.sessions.session(sid2).expect("run 会话账");
             let tags = crate::img_evict::block_tags_pos(
                 s.tokens.len(),
                 page,
                 &s.img_spans,
                 &s.positions,
             );
-            let (h, _) = running
-                .bank
+            let (h, _) = bank
                 .rel
                 .match_prefix_tagged(&s.tokens, &tags)
                 .expect("run 旧链命中");
@@ -7836,7 +7796,7 @@ pub async fn gpu_image_evict_anchor_gate() {
         for (k, sp) in [(0, r0), (1, r1)] {
             let key = owl_store::SnapKey::at_boundary(hit_a.hashes[sp.start / page - 1]);
             assert!(
-                running.bank.rel.state_locate(key).is_some(),
+                running.bank.parts().rel.state_locate(key).is_some(),
                 "第 {k} 张图段前锚点快照不在账（键 {}）—— 每张都要拍",
                 sp.start / page - 1
             );
@@ -7897,7 +7857,7 @@ pub async fn gpu_image_evict_anchor_gate() {
             }
         };
         assert!(!a2_text.trim().is_empty(), "run t2 必须出文本");
-        let s = running.bank.sessions.session(sid2).expect("run 会话账");
+        let s = running.bank.parts().sessions.session(sid2).expect("run 会话账");
         assert_eq!(s.img_spans.len(), 1, "只保留被重发的那一张图");
         assert!(
             sess.len() > r1.start,
@@ -8176,7 +8136,7 @@ pub async fn gpu_image_evict_multi_gate() {
         assert_eq!((sp.end - sp.start) % page, 0, "段{k} 长必须整页");
     }
     let (old_tokens, old_positions, old_spans, old_max) = {
-        let s = running.bank.sessions.session(sid).expect("会话账");
+        let s = running.bank.parts().sessions.session(sid).expect("会话账");
         assert_eq!(
             &s.tokens[..padded1.len()],
             &padded1[..],
@@ -8201,9 +8161,7 @@ pub async fn gpu_image_evict_multi_gate() {
     let old_tags =
         crate::img_evict::block_tags_pos(old_tokens.len(), page, &old_spans, &old_positions);
     let (hit, _) = running
-        .bank
-        .rel
-        .match_prefix_tagged(&old_tokens, &old_tags)
+        .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
         .expect("旧链命中");
     assert!(
         hit.matched_blocks >= old_blocks,
@@ -8293,7 +8251,7 @@ pub async fn gpu_image_evict_multi_gate() {
     assert!(!deleted_slots.is_empty(), "被删图应有设备槽");
     for slot in &deleted_slots {
         assert!(
-            running.bank.rel.slot_refs(*slot) > 0,
+            running.bank.parts().rel.slot_refs(*slot) > 0,
             "删除前 {slot} 应仍有缓存引用"
         );
     }
@@ -8313,7 +8271,7 @@ pub async fn gpu_image_evict_multi_gate() {
     running.execute_begin(begin).await.expect("multi t2 begin");
     for slot in &deleted_slots {
         assert_eq!(
-            running.bank.rel.slot_refs(*slot),
+            running.bank.parts().rel.slot_refs(*slot),
             0,
             "被删图的槽 {slot} 仍有缓存引用：多段 leave-gap 没释放旧链尾引用"
         );
@@ -8344,11 +8302,11 @@ pub async fn gpu_image_evict_multi_gate() {
     let reused_pages = trace.a / page + trace.keep_blocks;
     // ③ 新链登记必须覆盖**整条复用面**（含段间文本页）
     {
-        let s = running.bank.sessions.session(sid).expect("会话账");
+        let bank = running.bank.parts_mut();
+        let s = bank.sessions.session(sid).expect("会话账");
         let tags =
             crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
-        let (hit_new, _) = running
-            .bank
+        let (hit_new, _) = bank
             .rel
             .match_prefix_tagged(&s.tokens, &tags)
             .expect("新链查询");
@@ -8389,7 +8347,7 @@ pub async fn gpu_image_evict_multi_gate() {
     }
     // ⑥ 位置账：复用面的 token/position 逐 token = 旧幸存序列
     {
-        let s = running.bank.sessions.session(sid).expect("会话账");
+        let s = running.bank.parts().sessions.session(sid).expect("会话账");
         assert_eq!(s.positions.len(), s.tokens.len(), "位置账与 token 账等长");
         assert!(s.max_pos >= old_max, "max_pos 不回退");
         let in_del = |i: usize| {
@@ -8413,9 +8371,7 @@ pub async fn gpu_image_evict_multi_gate() {
     // ⑦ 旧链从第一段删点起的身份全部释放
     {
         let (hit_old, _) = running
-            .bank
-            .rel
-            .match_prefix_tagged(&old_tokens, &old_tags)
+            .bank.parts_mut().rel.match_prefix_tagged(&old_tokens, &old_tags)
             .expect("旧链查询");
         assert_eq!(
             hit_old.matched_blocks,
@@ -8534,7 +8490,8 @@ pub async fn gpu_image_evict_multi_gate() {
             .expect("replace 吸收 trace");
         assert_eq!(tr.a, rp0.start, "删除起点必须是第一段旧图段首");
         assert_eq!(tr.b, rp1.end, "删除终点必须是第二段旧图段尾");
-        let s = running.bank.sessions.session(sid2).expect("replace 会话账");
+        let bank = running.bank.parts_mut();
+        let s = bank.sessions.session(sid2).expect("replace 会话账");
         assert_eq!(s.img_spans.len(), 1, "新图必须且只能登记为一段");
         assert!(
             s.img_spans[0].evict && s.img_spans[0].img_tag != 0,
@@ -8543,8 +8500,7 @@ pub async fn gpu_image_evict_multi_gate() {
         let full_blocks = s.tokens.len() / page;
         let tags =
             crate::img_evict::block_tags_pos(s.tokens.len(), page, &s.img_spans, &s.positions);
-        let (hit_new, _) = running
-            .bank
+        let (hit_new, _) = bank
             .rel
             .match_prefix_tagged(&s.tokens, &tags)
             .expect("replace 新链查询");
@@ -8774,18 +8730,14 @@ pub async fn gpu_image_evict_spec_identity_gate() {
             }
         }
         let gen1: Vec<u32> = running
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .map(|s| s.tokens[plen1.min(s.tokens.len())..].to_vec())
             .unwrap_or_default();
         eprintln!("[D] t1 生成(len={}) {gen1:?}", gen1.len());
         // 文本由 token 账反解(仅供 prompt2 回填;与客户端回同一份文本同等语义)
         let text1 = {
             let ids: Vec<u32> = running
-                .bank
-                .sessions
-                .get(sid)
+                .bank.parts().sessions.get(sid)
                 .map(|s| s.tokens[plen1.min(s.tokens.len())..].to_vec())
                 .unwrap_or_default();
             running.boot.tok.decode(&ids)
@@ -8887,9 +8839,7 @@ pub async fn gpu_image_evict_spec_identity_gate() {
         let absorbed = running.img_evict.absorbed == 1;
         let pages = 0usize; // leave-gap 不转 K
         let toks = running
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .map(|s| s.tokens[plen2.min(s.tokens.len())..].to_vec())
             .unwrap_or_default();
         (toks, absorbed, pages)
@@ -9014,9 +8964,7 @@ pub async fn gpu_mtp_kv_parity() {
         let dtype = running.dev.pool.geom.dims.dtype;
         let hidden = running.dev.pool.geom.dims.hidden;
         let bt = running
-            .bank
-            .sessions
-            .session(sid)
+            .bank.parts().sessions.session(sid)
             .expect("session")
             .mtp_block_table
             .clone();

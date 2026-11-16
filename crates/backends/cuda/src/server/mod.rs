@@ -1199,15 +1199,12 @@ impl GpuServer {
         // ── 显存硬预算(2026-10-16):**主动拒发**,不去 malloc ──
         // 判据见 `crate::state::VramGuard::check`（驱动 free − reserve；可选叠
         // live 账上限）。拒发 = 结构化 `PoolExhausted` + 一条 WARN（带池账/驱动账）。
-        let guard_check =
-            |g: &mut crate::state::VramGuard,
-             vram: &VramAccount,
-             reserve: u64,
-             budget: Option<u64>|
-             -> Result<(), ModelError> { g.check(n_bytes, reserve, budget, vram) };
+        let guard_check = |g: &mut crate::state::VramGuard,
+                           vram: &VramAccount,
+                           reserve: u64|
+         -> Result<(), ModelError> { g.check(n_bytes, reserve, vram) };
         let reserve_b = self.diag.vram_reserve_mb << 20;
-        let budget_b = self.diag.vram_budget_mb.map(|m| m << 20);
-        let first = guard_check(&mut self.vram_guard, &self.vram, reserve_b, budget_b);
+        let first = guard_check(&mut self.vram_guard, &self.vram, reserve_b);
         if let Err(e) = first {
             // **池缓存应急回收(2026-10-20 §23.9)**:`RELEASE_THRESHOLD=∞` 下
             // 已 free 的块仍占物理显存 ⇒ "驱动 free 告急"常是**池缓存**不是 live。
@@ -1228,7 +1225,7 @@ impl GpuServer {
             let freed = trimmed.as_ref().ok().copied().unwrap_or(0);
             let retry_ok = trimmed.is_ok()
                 && freed > 0
-                && guard_check(&mut self.vram_guard, &self.vram, reserve_b, budget_b).is_ok();
+                && guard_check(&mut self.vram_guard, &self.vram, reserve_b).is_ok();
             if retry_ok {
                 self.sink.logf(
                     owl_shared::log::LVL_INFO,

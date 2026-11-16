@@ -122,7 +122,7 @@ pub struct AgentSession {
     pub local_chain: bool,
     /// **图像段账**(前缀无感删除;2026-10-23):上轮 prompt 里各图像占位段
     /// (含页对齐 pad)的会话坐标 + 网格 + 客户端可删标记。
-    /// 生命周期跟随 `tokens`:turn 收口由 `set_img_spans` 写回,`reset` 清空。
+    /// 生命周期跟随 `tokens`:turn 收口由 `set_img_spans` 写回,`reopen_chain`/`rebase` 清空。
     pub img_spans: Vec<ImgSpan>,
     /// **pad 区间账**(padded 坐标,升序):`unpad(tokens, pads)` = 客户端可见
     /// 序列。与 `img_spans` 同一次写回(两处各写一份 = 下一轮 diff 拿错坐标)。
@@ -148,7 +148,7 @@ pub struct AgentSession {
     ///
     /// 上轮 turn 的最新边界快照。跨 turn 保留 —— 空闲会话的尾部锚点是
     /// **Dense 档**(最后淘汰,但空间不足时可逐出;不是 pin),append 的
-    /// 100% 命中靠它。前缀失配 `reset()` 时清空。
+    /// 100% 命中靠它。前缀失配 `rebase()` 时清空。
     pub tail_snap: Option<crate::SnapKey>,
     /// **最近 K 个 turn 尾快照**（L1 资产；`snap_msg_recent`；不是 pin，
     /// 只是 `Dense` 档优先保留；超出 K 的旧尾降为 `Extra`）。
@@ -156,7 +156,7 @@ pub struct AgentSession {
     /// **上轮 prompt 的消息边界**(页对齐 token offset;L1 资产)。
     ///
     /// turn 收口时从 `ActiveTurn.msg_snaps` 写回,跨 turn 保留;下一轮用于
-    /// 回撤定位（Dense 档 / Binary 稀疏锚点）。前缀失配 `reset()` 时清空。
+    /// 回撤定位（Dense 档 / Binary 稀疏锚点）。前缀失配 `rebase()` 时清空。
     pub msg_snaps: Vec<usize>,
     /// **与 `msg_snaps` 同序的快照键**(L1 资产;2026-11-12 二刀)。
     ///
@@ -174,7 +174,7 @@ pub struct AgentSession {
     /// **链哈希游标**(快照键真源):已哈希整块数 + 链尾内容身份。
     /// 懒惰推进(只喂新增整块)⇒ 全 turn O(n);键必须是**内容身份**
     /// (物理块号会被回收复用 —— `crate::ChainCursor` 头注)。
-    /// 生命周期跟随链:前缀失配 `reset()` 归零;前缀命中由调度层 `seed()`。
+    /// 生命周期跟随链:前缀失配 `rebase()` 归零;前缀命中由调度层 `seed()`。
     pub chain: ChainCursor,
 }
 
@@ -277,15 +277,16 @@ impl AgentSession {
         (0..n).find(|&i| self.tokens[i] != prompt[i])
     }
 
-    /// 账本重置(链面):清 `tokens/positions/chain` + 块表(块归还由引擎
-    /// 调账房,本函数只负责账面 —— 引擎在 reset 路径调 `release_table`)。
+    /// 账本重置(链面):只清 `tokens/positions/chain` 等账面；块表由
+    /// `SessionBank::reset_session_for_rebuild` / `reopen_session_chain`
+    /// 在归还旧链后替换（本函数不碰设备表，避免账/链两处各清一半）。
     ///
     /// **不清 L1 资产**(`tail_snap` / `msg_snaps` / `msg_snap_keys`):
-    /// 前缀命中的续写路径也会调本函数,那一次 `reset` 不是重建;L1 资产
-    /// 要到 turn 收口/fresh 重建时才由 `rebase` 处理。否则每轮命中都会
+    /// 前缀命中的续写路径走 `reopen_chain`(内部调本函数),那一次不是重建;
+    /// L1 资产要到 turn 收口/fresh 重建时才由 `rebase` 处理。否则每轮命中都会
     /// 把旧 tail 的 Dense 归属丢掉(旧 key 永久留在 Dense 档,见 2026-11-13
     /// 前置评审)。
-    pub fn reset(&mut self) {  // FIXME: 不推荐使用可变范式。你要用新的，你就直接创建一个新的，你不要搞这个什么reset。把那个不要的东西销毁掉，创建一个全全新的session
+    fn reset(&mut self) {
         // 内容身份的参考边界随账清零（历史长度唯一真源 = `tokens.len()`）
         self.prompt_boundary = 0;
         self.tokens.clear();
@@ -295,6 +296,18 @@ impl AgentSession {
         self.pads.clear();
         self.positions.clear();
         self.max_pos = 0;
+    }
+
+    /// **重开链**（前缀命中续写）：消费旧会话，清空 token/位置/链游标，
+    /// **保留 L1 快照资产**（tail/msg 边界属于同一条对话，不能因本轮重开链
+    /// 而丢归属）。与 [`Self::rebase`] 的分工：rebase 是换了一条链，L1 全清；
+    /// 本函数只清执行态，调用方随后把新块表/哈希写回。
+    ///
+    /// 返回新值，调用方必须用 [`SessionTable::put`] 替换旧账 —— 不再提供
+    /// `&mut self` 的 reset 公共入口。
+    pub fn reopen_chain(mut self) -> Self {
+        self.reset();
+        self
     }
 
     /// **记录 turn 尾快照**：最近 `keep` 个保持 `Dense` 档；更老的返回给
@@ -319,12 +332,12 @@ impl AgentSession {
         demoted
     }
 
-    /// **整段重建**(前缀失配 / 位置压实):`reset` + L1 资产失效 +
-    /// 位置账代数递增。
+    /// **整段重建**(前缀失配 / 位置压实):消费旧会话,返回全新账。
     ///
-    /// 只有真正换了一条链才清 L1 快照资产;前缀命中的续写路径不得清零
-    /// (它也会调 `reset()`,但那不是重建)。
-    pub fn rebase(&mut self) {
+    /// 不再提供 `&mut self` 的 rebase:调用方必须把旧值销毁、把新值放回
+    /// 会话表,避免"手里还捏着旧账引用"的半态。L1 资产属于旧链,这里
+    /// 一并清掉;前缀命中的续写路径**不得**走本函数。
+    pub fn rebase(mut self) -> Self {
         self.reset();
         // 旧 tail/消息边界属于旧链;内容仍可由 L2/L3 按 LRU/档位回收。
         self.tail_snap = None;
@@ -333,6 +346,7 @@ impl AgentSession {
         self.msg_snap_keys.clear();
         self.local_chain = false;
         self.position_epoch = self.position_epoch.wrapping_add(1);
+        self
     }
 
     /// **写入当前前缀的位置账**(删除/前缀命中后、turn 收口前使用)。
@@ -510,6 +524,28 @@ impl SessionTable {
                 what: format!("会话账缺失(会话 {id} 不在账)"),
             }
         })
+    }
+
+    /// 把会话从账中取出（所有权转移；用于"销毁旧账 → 新建替换"路径）。
+    /// 取出后调用方必须在所有成功/失败路径把新账 `put` 回来。
+    pub fn take(&mut self, id: u64) -> Result<AgentSession> {
+        self.sessions.remove(&id).ok_or_else(|| {
+            owl_iface::contract::ModelError::EngineInvariant {
+                what: format!("会话账缺失(会话 {id} 不在账)"),
+            }
+        })
+    }
+
+    /// 把新账放回表中（`take` 的配对口；重复 id = 结构错，响亮拒绝）。
+    pub fn put(&mut self, session: AgentSession) -> Result<()> {
+        let id = session.id;
+        if self.sessions.insert(id, session).is_some() {
+            return Err(owl_iface::contract::ModelError::EngineInvariant {
+                what: format!("会话账重复插入(会话 {id} 已在账)"),
+            });
+        }
+        self.next_id = self.next_id.max(id.saturating_add(1));
+        Ok(())
     }
 
     /// 新表(空账；首次 `submit` 隐式建会话)。
@@ -728,16 +764,73 @@ pub struct BankPlan {
 /// 准入判决也从这里出。MTP 链仍为裸腿(独立页池,裁决④推后 S5)。
 pub struct SessionBank {
     /// 会话账(GDN 格分配/LRU 逐出/前缀守卫)
-    pub sessions: SessionTable,
+    sessions: SessionTable,
     /// target 链门面(块腿 = `rel.leg`;预算/准入账同屋)
-    pub rel: Rel,
+    rel: Rel,
     /// MTP 链块腿(独立页池,无前缀缓存;宿主面恒关 —— 裁决④推后)
-    pub leg_mtp: BlockLeg,
+    leg_mtp: BlockLeg,
     /// MTP 草稿 KV 物理环(T5;true = 不向 leg_mtp 领页/不归还)
+    mtp_ring: bool,
+}
+
+/// `SessionBank` 的一次性 split-borrow 视图。
+///
+/// **为什么不是逐字段访问器**：`sessions` 与 `rel` 的复合操作需要同时可变
+/// 借用两个不相交字段；`&mut self` 方法会整借 bank，调用点会退化成把
+/// 一个字段临时 `take` 出来或再引入一套旁路。这里一次性拆开四个字段，
+/// 借用关系在类型上显式可见，调用点不能再绕过 bank 的复合语义口。
+///
+/// 单字段只读路径用 [`SessionBank::parts`]；需要写任一分量时用
+/// [`SessionBank::parts_mut`]，并把绑定限制在真正需要同时访问的作用域内。
+pub struct SessionBankParts<'a> {
+    /// 会话账。
+    pub sessions: &'a mut SessionTable,
+    /// target 链门面。
+    pub rel: &'a mut Rel,
+    /// MTP 链块腿。
+    pub leg_mtp: &'a mut BlockLeg,
+    /// MTP 环模式（标量快照，拆借后仍可读）。
+    pub mtp_ring: bool,
+}
+
+/// `SessionBank` 的只读 split-borrow 视图（供诊断/查询路径使用）。
+pub struct SessionBankRef<'a> {
+    /// 会话账。
+    pub sessions: &'a SessionTable,
+    /// target 链门面。
+    pub rel: &'a Rel,
+    /// MTP 链块腿。
+    pub leg_mtp: &'a BlockLeg,
+    /// MTP 环模式。
     pub mtp_ring: bool,
 }
 
 impl SessionBank {
+    /// 只读拆借（四个分量一次借出；不暴露字段本身）。
+    pub fn parts(&self) -> SessionBankRef<'_> {
+        SessionBankRef {
+            sessions: &self.sessions,
+            rel: &self.rel,
+            leg_mtp: &self.leg_mtp,
+            mtp_ring: self.mtp_ring,
+        }
+    }
+
+    /// 可变拆借（sessions/rel/leg_mtp 三路不相交）。
+    pub fn parts_mut(&mut self) -> SessionBankParts<'_> {
+        SessionBankParts {
+            sessions: &mut self.sessions,
+            rel: &mut self.rel,
+            leg_mtp: &mut self.leg_mtp,
+            mtp_ring: self.mtp_ring,
+        }
+    }
+
+    /// MTP 是否走物理环（不领 `leg_mtp` 页）。
+    pub fn mtp_ring(&self) -> bool {
+        self.mtp_ring
+    }
+
     /// boot 构造(target 链门面 + MTP 链账房;几何随池)。前缀缓存
     /// 只挂 target 链(容量 = 池半);MTP 链无前缀缓存,非 mtp 模式
     /// 0 块 —— 误用 = 结构化报错(池耗尽语义)。
@@ -966,6 +1059,45 @@ impl SessionBank {
             Ok(())
         }
     }
+
+    /// **会话重建前置**（`plan_fresh` / 位置压实共用）：双链归还 + 账本
+    /// rebase。复合操作必须与 bank 同屋 —— engine 不再自己拆 `sessions`
+    /// 与 `leg_mtp` 后逐项归还（拆开就是单边泄漏的入口）。
+    ///
+    /// 归还失败时 `release_session_chains` 会把未归还的表放回会话，
+    /// 本函数不 rebase、原样上抛；下一次 close/重建仍可重试。
+    pub fn reset_session_for_rebuild(&mut self, id: u64) -> Result<()> {
+        self.release_session_chains(id)?;
+        let old = self.sessions.take(id)?;
+        self.sessions.put(old.rebase())
+    }
+
+    /// **前缀命中后的链重开**：旧账清执行态（保留 L1），写入本次复用的
+    /// 块表/哈希/链游标。`table.len() == hashes.len()` 由调用方保证；
+    /// 这里再做一次显式校验，错长 = 结构错，不静默截断。
+    pub fn reopen_session_chain(
+        &mut self,
+        id: u64,
+        table: Vec<u32>,
+        hashes: Vec<crate::ChainHash>,
+        tail: crate::ChainHash,
+    ) -> Result<()> {
+        if table.len() != hashes.len() {
+            return Err(ModelError::EngineInvariant {
+                what: format!(
+                    "重开链表长不一致：session={id} table={} hashes={}",
+                    table.len(),
+                    hashes.len()
+                ),
+            });
+        }
+        let old = self.sessions.take(id)?;
+        let mut next = old.reopen_chain();
+        next.chain.seed(hashes.len(), tail);
+        next.block_table = table;
+        next.block_hashes = hashes;
+        self.sessions.put(next)
+    }
 }
 
 #[cfg(test)]
@@ -1165,6 +1297,39 @@ mod bank_tests {
             Some((crate::policy::NO_SESSION, 1)),
             "关闭后快照归属必须转无主"
         );
+    }
+
+    /// **重建复合口**：双链归还 + 账本换新；旧 tokens/L1 不得残留，id 保留。
+    #[test]
+    fn reset_session_for_rebuild_replaces_account() {
+        let mut bank = bank_of(plan(64, 8, true, false));
+        let mtp_before = bank.leg_mtp.report().slots_free;
+        let tgt_before = bank.rel.slots_free();
+        let (id, s) = bank.sessions.get_or_create(Some(7)).expect("建会话");
+        let toks = [1u32, 2, 3, 4];
+        let pos: Vec<[i32; 3]> = toks.iter().map(|t| [*t as i32; 3]).collect();
+        s.commit_turn(&toks, &[], &pos).expect("收口历史");
+        s.tail_snap = Some(crate::SnapKey::at_boundary(crate::ChainHash::new(0x77)));
+        s.position_epoch = 3;
+        bank.rel
+            .ensure_for_len_unreserved(&mut s.block_table, 24)
+            .expect("target 块");
+        bank.leg_mtp
+            .ensure_for_len(&mut s.mtp_block_table, 9)
+            .expect("mtp 块");
+
+        bank.reset_session_for_rebuild(id).expect("重建");
+
+        let s = bank.sessions.session(id).expect("会话 id 保留");
+        assert_eq!(s.id, id);
+        assert!(s.tokens.is_empty(), "旧历史必须销毁");
+        assert!(s.positions.is_empty(), "旧位置账必须销毁");
+        assert!(s.tail_snap.is_none(), "旧 L1 资产必须销毁");
+        assert!(s.block_table.is_empty(), "新账从空设备表起步");
+        assert!(s.mtp_block_table.is_empty(), "MTP 表同清");
+        assert_eq!(s.position_epoch, 4, "重建代数递增");
+        assert_eq!(bank.rel.slots_free(), tgt_before, "target 链归还");
+        assert_eq!(bank.leg_mtp.report().slots_free, mtp_before, "MTP 链归还");
     }
 
     #[test]
@@ -1376,7 +1541,7 @@ mod bank_tests {
         assert_eq!(s.msg_snap_keys, vec![Some(k), None], "键沿用不得断");
         assert!(s.local_chain, "命中续写仍持 gapped 链");
 
-        s.rebase();
+        let s = s.clone().rebase();
         assert!(!s.local_chain, "真换链必须解除 gapped 表保留");
         assert!(s.tail_snap.is_none(), "真换链清 tail");
         assert!(s.msg_snaps.is_empty(), "真换链清消息边界");

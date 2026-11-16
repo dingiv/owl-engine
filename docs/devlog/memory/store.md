@@ -2699,7 +2699,7 @@ KV 树(见下)⇒ **本版的快照回填"账上可见、实际选不中"**(内�
 
 > **2026-10-29 补注**:本节只解决"**索引**能重建";**内容**是否在盘上仍取决于压力票
 > (§31.3) —— 宿主够大时永不溢写 ⇒ 索引在、内容不在 ⇒ 截断到 0。补这一半的是
-> **§31.10 S6.2 主动 checkpoint**(`[pool].checkpoint_max_mb`)。
+> **§31.10 S6.2 主动 checkpoint**(磁盘层启用后自动；无配置键)。
 > ⇒ 跨重启复用的**必要条件 = 索引 + 内容 + 锚点快照**三者同时在盘上。
 
 **真机结果(0.8B / 单卡 3080 / 池 16 页 / host 16 MiB / disk 16 MiB)**:
@@ -2737,28 +2737,28 @@ engine **59**(+ `disk_chain_index_enables_cross_restart_reuse`:turn 写索引 �
 **层级律不变**(§31.3):①③ 走"设备 → 宿主 → 盘"两跳;②的设备块**借宿主缓冲但不登记**
 (不占宿主预算、不解绑设备槽) —— 这是"复制"与"搬家"的机制差异,不是新的跨层直连。
 
-#### 31.10.2 配置面
+#### 31.10.2 策略面（无配置键）
 
 ```toml
-[pool]
+[store]
 disk_dir            = "/var/lib/owl/kv"   # 盘层目录(空 = 关层)
 disk_cache_mb       = 2048                 # KV 盘分片(S6;0 = 关层)
 snap_disk_mb        = 1024                 # 状态腿盘分片(锚点快照要它)
-checkpoint_max_mb   = 0                    # S6.2:单次配额 MiB(0 = 关 = 旧行为)
-checkpoint_min_gap_ms = 5000               # 两次之间的最小间隔(0 = 每 turn)
+# 主动 checkpoint 自动运行；单次 64 MiB / 最小间隔 5s 是引擎内部策略。
+# 它只限制后台复制量，**不是**准入/压力卸载的门槛。
 ```
 
-> **⚠️ 三键必须同时给**:只开 `checkpoint_max_mb` 而没有 `snap_max` / `snap_disk_mb`
-> ⇒ 块能落盘、**锚点落不了** ⇒ `reuse_face` 找不到 Durable 快照,复用面被裁到 0
-> (实测 `cache=0/4753`)。boot 期已加 WARN 点名这个组合。
+> **⚠️ 快照盘腿要一起给**：`snap_max>0` 但没有 `snap_disk_mb` ⇒ 自动 checkpoint
+> 只能落 KV，锚点落不了 ⇒ `reuse_face` 找不到 Durable 快照，复用面被裁到 0
+> (实测 `cache=0/4753`)。boot 期会 WARN 点名。
 
 #### 31.10.3 checkpoint 的执行序(`checkpoint_session_kv`)
 
 ```text
 turn 收口(release_turn_table 之前;会话 tokens 还在)
  └ maybe_checkpoint_kv(sid)
-    门: checkpoint_max_mb>0 && disk_dir && disk_cache_mb>0 && hk.kv_checkpoint_due(gap)
-    └ checkpoint_session_kv(sid, quota):
+    门: disk_enabled && hk.kv_checkpoint_due(5s)
+    └ checkpoint_session_kv(sid, 64 MiB):
        ① 从根起跳过**盘上已存在**的块(增量;整链已在盘则只补快照)
        ② 配额 → 块数(quota/块字节,至少 1 块:小配额档也要能推进)
        ③ **连续前缀**扫描:遇洞(既不在设备也不在宿主)即停 —— boot 以"内容在场"
@@ -2793,7 +2793,7 @@ turn 收口(release_turn_table 之前;会话 tokens 还在)
 - store:`plan_read_blocks_reads_live_blocks_without_touching_ledger`
   (活跃块 `refs==2`:下沉票 `LiveRefs` 拒 / 只读票出;账不变;缓冲可归还)
 - engine:`disk_checkpoint_survives_restart_without_host_pressure`
-  (两分支对照:`checkpoint_max_mb=0` ⇒ 盘上 0 文件 + 重启不命中;`=8` ⇒ 落盘 + 重启命中)
+  (两分支对照:内部 policy step=0 ⇒ 盘上 0 文件 + 重启不命中;step=8 MiB ⇒ 落盘 + 重启命中)
 - 现状:store **162** · engine **185** · store e2e 4/8(全绿)
 
 #### 31.10.6 与 §31.6 挂账的对账(2026-10-29)

@@ -1212,7 +1212,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// 0..nb ⇒ 读到别家 KV(§7.6 定谳:多请求"答上一题")。
     pub(crate) fn xqa_pt_of(&self, sid: u64) -> Vec<f32> {
         let empty: &[u32] = &[];
-        let table = self.bank.sessions.get(sid).map(|s| s.block_table.as_slice()).unwrap_or(empty);
+        let table = self.bank.parts().sessions.get(sid).map(|s| s.block_table.as_slice()).unwrap_or(empty);
         // 槽容量 = 池页数。overcommit 档的会话链会大于池(select_partial),
         // XQA 此时已禁用;仍按槽容量截断,避免 verify 输入装填越界。
         let nb = self.dev.pool.geom.nb.max(1);
@@ -1240,7 +1240,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         nb: usize,
     ) -> Result<Option<VerifyViewTables>> {
         let page = page.max(1);
-        let chain = self.bank.sessions.session(sid)?.block_table.clone();
+        let chain = self.bank.parts().sessions.session(sid)?.block_table.clone();
         let need_pages = pos.saturating_add(rows).div_ceil(page);
         if chain.len() < need_pages {
             return Err(ModelError::Msg(format!(
@@ -1428,7 +1428,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let vg = self.dev.graphs.verify_mut(depth)?;
         let ts = std::time::Instant::now();
         let bt_chain = {
-            let s = self.bank.sessions.session(sid)?;
+            let s = self.bank.parts().sessions.session(sid)?;
             s.block_table.clone()
         };
         let ids_f: Vec<f32> = block.iter().map(|&v| v as f32).collect();
@@ -1877,7 +1877,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if self.sel.has_view() && self.dev.graphs.session.has_input("sel_pt") {
             return Ok(());
         }
-        let table = self.bank.sessions.session(sid)?.block_table.clone();
+        let table = self.bank.parts().sessions.session(sid)?.block_table.clone();
         // ★ **双 rank 镜像**(P2.1-c,2026-10-19):页表是**每 rank 各自**的设备块 ⇒
         // TP 档必须两边都写(否则 peer 的寻址停代)。单卡档 = 原路(零分支)。
         match self.peer.as_mut() {
@@ -1983,7 +1983,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// store 只持账,不持设备句柄 ⇒ 设备槽的清理留在引擎(两 rank 镜像)。
     /// 账在设备层但池内无槽 = 账/槽不平,响亮拒(不静默丢)。
     fn drop_snap_asset_for_admit(&mut self, key: owl_store::SnapKey) -> Result<()> {
-        let (tier, bytes) = self.bank.rel.drop_snap_asset(key)?;
+        let (tier, bytes) = self.bank.parts_mut().rel.drop_snap_asset(key)?;
         if tier == owl_store::Tier::Gpu {
             let slot = self.dev.pool.snap_slot_of(key).ok_or_else(|| {
                 ModelError::Msg(format!("快照 {key:?} 在设备层但池内无槽(账/槽不平)"))
@@ -2028,7 +2028,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             structural_reserve: self.boot.cfg.knobs.snap_structural_reserve,
         };
         // 快照准入只按 class 优先级；不在 admission 里按活跃会话点名保护。
-        match self.bank.rel.admit_snap(sid, key, class, policy, &[]) {
+        match self.bank.parts().rel.admit_snap(sid, key, class, policy, &[]) {
             owl_store::SnapAdmit::Add => {
                 owl_shared::metrics::with_metrics_store(|m| {
                     m.counter_add("snap.admit.add", 1, file!(), line!());
@@ -2082,9 +2082,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // **记账单元 = 一条快照的总字节**(单 rank 平面 × world;2026-11-01):
         // 与盘上文件/宿主块/下沉检查同一口径 —— 按单 rank 记会让 TP2 的
         // `plan_snap_offload` 报「账 79MB ≠ 布局 159MB」而弃置整个 turn。
-        let ghosts = self.bank.rel.register_snap_captured(
+        let bank = self.bank.parts_mut();
+        let snap_bytes = bank.rel.snap_file_bytes();
+        let ghosts = bank.rel.register_snap_captured(
             key,
-            self.bank.rel.snap_file_bytes(),
+            snap_bytes,
             durability,
             sid,
             full_blocks,
@@ -2120,9 +2122,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     ) -> Result<bool> {
         let (full_blocks, key) = {
             let s = self
-                .bank
-                .sessions
-                .get(sid)
+                .bank.parts().sessions.get(sid)
                 .ok_or_else(|| ModelError::Msg(format!("会话 {sid} 不在账")))?;
             (s.chain.blocks(), owl_store::SnapKey::at_boundary(s.chain.tail()))
         };
@@ -2182,7 +2182,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             return Ok(()); // 边界 0 = 无已完整块,无状态可拍
         }
         // 1) 纯读游标位置(借用即散)
-        let start = self.bank.sessions.get(sid).map(|s| s.chain.blocks()).unwrap_or(0);
+        let start = self.bank.parts().sessions.get(sid).map(|s| s.chain.blocks()).unwrap_or(0);
         if self.boot.cfg.knobs.probes.debug {
             owl_shared::log_debug!(
                 "dbg snap",
@@ -2211,9 +2211,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let (key, per_block, parent0) = {
             let s = self
-                .bank
-                .sessions
-                .get_mut(sid)
+                .bank.parts_mut().sessions.get_mut(sid)
                 .ok_or_else(|| ModelError::Msg(format!("会话 {sid} 不在账")))?;
             let parent0 = s.chain.tail();
             let tail = s.chain.advance(page, &seg, full_blocks, tags.get(start..).unwrap_or(&[])).ok_or_else(|| {
@@ -2300,9 +2298,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 逻辑块号当物理页号 = 单会话且顺序分配才对)。
         // 会话块表快照(两个块共用:增量登记要真槽、索引采集要物理页)
         let bt_now: Vec<u32> = self
-            .bank
-            .sessions
-            .get(sid)
+            .bank.parts().sessions.get(sid)
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
         // ── **B-3e-2 第 2b 项:轮内增量登记**(`select_partial` 档)──
@@ -2325,10 +2321,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             if !blk_slices.is_empty() {
                 let up = self
-                    .bank
-                    .rel
-                    .register_chain_inc_tagged(parent0, &blk_slices, &inc_tags)?;
-                self.bank.rel.set_chain_owner(sid, &up.inserted);
+                    .bank.parts_mut().rel.register_chain_inc_tagged(parent0, &blk_slices, &inc_tags)?;
+                self.bank.parts_mut().rel.set_chain_owner(sid, &up.inserted);
                 mcnt("store.chain.inc.blocks", up.inserted.len() as u64);
                 mcnt("store.chain.inc.evicted", up.evicted.len() as u64);
             }
@@ -2539,7 +2533,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
-            self.bank.rel.index_register_flat(*hash, flat)?;
+            self.bank.parts_mut().rel.index_register_flat(*hash, flat)?;
             off = end;
         }
         let el = t_index.elapsed().as_secs_f64() * 1000.0;
@@ -2565,7 +2559,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if items.is_empty() {
             return Ok(());
         }
-        let Some(ix_geom) = self.bank.rel.index().map(|i| i.geometry()) else {
+        let Some(ix_geom) = self.bank.parts().rel.index().map(|i| i.geometry()) else {
             return Ok(()); // 索引未注册(未开采集)
         };
         let (dim, layers, kv_heads) = ix_geom;
@@ -2585,7 +2579,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let todo: Vec<&(owl_store::ChainHash, usize, usize)> = items
             .iter()
             .filter(|(h, _, _)| {
-                !self.bank.rel.index().is_some_and(|i| i.contains(*h))
+                !self.bank.parts().rel.index().is_some_and(|i| i.contains(*h))
             })
             .collect();
         if todo.is_empty() {
@@ -2727,7 +2721,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         for (i, entries) in by_idx.into_iter().enumerate() {
             let (hash, _, _) = todo[i];
-            self.bank.rel.index_register(*hash, entries.ok_or_else(|| {
+            self.bank.parts_mut().rel.index_register(*hash, entries.ok_or_else(|| {
                 owl_iface::contract::ModelError::Msg(format!("索引采集漏块:第 {i} 块无条目"))
             })?)?;
         }
@@ -2741,20 +2735,20 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// ⚠️ 宿主梯满时由 **store 政策**先逐最冷条目(见 `plan_snap_offload`)——
     /// 逐出量在此上报(store 零日志依赖:`evicted_bytes` 差分)。
     pub(crate) async fn snap_offload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
-        let ev0 = self.bank.rel.snap_host_evicted_bytes();
-        let (pieces, table) = self.bank.rel.plan_snap_offload(key, slot)?;
+        let ev0 = self.bank.parts().rel.snap_host_evicted_bytes();
+        let (pieces, table) = self.bank.parts_mut().rel.plan_snap_offload(key, slot)?;
         let table = match self
             .swap_all_ranks(owl_iface::contract::SwapDir::Out, &pieces, table)
             .await
         {
             Ok(t) => t,
             Err(e) => {
-                self.bank.rel.abort_snap_offload(key);
+                self.bank.parts_mut().rel.abort_snap_offload(key);
                 return Err(e);
             }
         };
-        self.bank.rel.commit_snap_offload(key, table)?;
-        let ev = self.bank.rel.snap_host_evicted_bytes().saturating_sub(ev0);
+        self.bank.parts_mut().rel.commit_snap_offload(key, table)?;
+        let ev = self.bank.parts().rel.snap_host_evicted_bytes().saturating_sub(ev0);
         if ev > 0 {
             owl_shared::metrics::with_metrics_store(|m| {
                 m.counter_add("store.snap.host_evict_bytes", ev, file!(), line!());
@@ -2768,14 +2762,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             m.counter_add("store.snap.out", 1, file!(), line!());
             m.counter_add(
                 "store.snap.out.bytes",
-                self.bank.rel.snap_bytes() as u64,
+                self.bank.parts().rel.snap_bytes() as u64,
                 file!(),
                 line!(),
             );
         });
         // **大页提示可观测面**(2026-10-19):宿主块若未拿到大页,冷写回到 4KiB
         // 缺页速度(159 MiB 约 80ms vs 12ms)⇒ 不许静默(指标 + 首次点名)。
-        let hint_fail = self.bank.rel.snap_host_hint_failures();
+        let hint_fail = self.bank.parts().rel.snap_host_hint_failures();
         if hint_fail > 0 {
             owl_shared::metrics::with_metrics_store(|m| {
                 m.counter_add("store.host.hint_fail", hint_fail as u64, file!(), line!());
@@ -2790,7 +2784,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
 
     /// **快照回灌**(宿主 → 设备槽;一条 swap 搬 N 片)。
     pub(crate) async fn snap_onload(&mut self, key: owl_store::SnapKey, slot: u32) -> Result<()> {
-        let (pieces, table) = self.bank.rel.plan_snap_onload(key, slot)?;
+        let (pieces, table) = self.bank.parts_mut().rel.plan_snap_onload(key, slot)?;
         let table = match self
             .swap_all_ranks(owl_iface::contract::SwapDir::In, &pieces, table)
             .await
@@ -2798,11 +2792,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             Ok(t) => t,
             Err(e) => {
                 // 台子随失败的 connector 消失 ⇒ 内容已丢 ⇒ 条目一并删
-                self.bank.rel.abort_snap_onload(key);
+                self.bank.parts_mut().rel.abort_snap_onload(key);
                 return Err(e);
             }
         };
-        self.bank.rel.commit_snap_onload(key, table)?;
+        self.bank.parts_mut().rel.commit_snap_onload(key, table)?;
         self.dev.pool.snap_place(slot, key);
         // **TP:peer 的池槽索引同刻对齐**(物理槽由 swap 两 rank 同步写入;
         // 索引不镜像 ⇒ 后续逐出/复用判据在两侧漂移)
@@ -2811,12 +2805,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // **触达入 store 账**(§30.6-②):store 的 `last_use` 是出序输入;
         // 池的 `last_use` 只是物理面。两处同刻更新 ⇒ 判据与池不再漂。
-        self.bank.rel.touch_snap(key);
+        self.bank.parts_mut().rel.touch_snap(key);
         owl_shared::metrics::with_metrics_store(|m| {
             m.counter_add("store.snap.in", 1, file!(), line!());
             m.counter_add(
                 "store.snap.in.bytes",
-                self.bank.rel.snap_bytes() as u64,
+                self.bank.parts().rel.snap_bytes() as u64,
                 file!(),
                 line!(),
             );

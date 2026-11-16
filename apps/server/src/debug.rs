@@ -470,6 +470,7 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
             "slots_free": r.kv.slots_free,
             "cached_blocks": r.kv.cached_blocks,
             "host_blocks": r.kv.host_blocks,
+            "disk_blocks": r.kv.disk_blocks,
             "gpu_bytes": r.kv.gpu_bytes,
             "hits": r.kv.hits,
             "misses": r.kv.misses,

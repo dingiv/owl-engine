@@ -859,21 +859,6 @@ pub struct StoreCfg {
     ///
     /// 目录由 `disk_dir` 指定;进程重启后**扫目录回填账**(内容惰性读回)。
     pub disk_cache_mb: usize,
-    /// **磁盘 KV 主动 checkpoint 的单次配额 MiB**（S6.2;缺省 0 = 关）。
-    ///
-    /// 语义：turn 收口时把**活跃会话已算出的 KV 块**从 设备/宿主**复制**一份
-    /// 到盘层（复制语义 —— 不动运行期驻留），于是引擎**重启后**仍能按盘上
-    /// 索引（`.idx`）召回前缀，不必全量重算。
-    ///
-    /// 旧行为（本键 = 0）：只有**宿主压力票**才被动溢写 ⇒ 宿主够大时重启后
-    /// 索引在、内容不在 ⇒ boot 截断到 0（等于没有跨重启召回）。
-    ///
-    /// 取值 = 一次 turn 收口最多写这么多（按「从根起的连续前缀」推进，中断即停，
-    /// 不留跳块）。64 MiB ≈ 64 块 ≈ 0.1 s（NVMe）—— 多轮小步即可把长链铺满，
-    /// 且不拖慢单轮响应。需要 `disk_dir` 非空 + `disk_cache_mb > 0`。
-    pub checkpoint_max_mb: usize,
-    /// **两次 KV checkpoint 的最小间隔 ms**（缺省 5000；0 = 每个 turn 都做）。
-    pub checkpoint_min_gap_ms: u64,
     /// **磁盘状态腿**(MiB;0 = 关层;与 [`Self::disk_cache_mb`] 同属盘层总账的两个分片)。
     pub snap_disk_mb: usize,
     /// **磁盘内容目录**(空 = 关层;两腿子目录 `kv/` 与 `snap/` 自动分)。
@@ -883,24 +868,16 @@ pub struct StoreCfg {
     pub disk_dir: String,
     /// **显存治理占比**(0..1;0 = 治理禁用,1.0 = 吃满驱动 free)。
     ///
-    /// `target_total = 驱动 total × vram_budget`;与 [`Self::vram_budget_mb`]
-    /// (绝对硬上限)是两个不同量。2026-11-13 由 `vram_target` 更名,
-    /// 语义不变(旧键已拒)。
+    /// `target_total = 驱动 total × vram_budget`。2026-11-13 由 `vram_target`
+    /// 更名，语义不变（旧键已拒）。绝对上限不再单设键 —— 用占比表达。
     pub vram_budget: f64,
+    /// **运行时激活/固定预留 MiB**：图执行 320 + warmup 138 + 运行时余量。
+    /// 用于池 cap 与 CUDA 硬预算 `free − reserve`；**不是** KV 池容量，
+    /// 也不是 `vram_budget` 的重复（占比管总量，本键管池外瞬态/碎片）。
     pub vram_reserve_mb: u64,
-    /// **解释器块池预算**(字节;0 = 关 = 逐节点 alloc/free 存量路径)。
-    /// 原 `OWL_BLOCK_POOL` env;P1″ 块竞技场(见 `interpreters::eval`)。
-    pub block_pool_bytes: usize,
     /// **关掉解释器活性中途回收**(诊断/对照臂;缺省 false = 开回收)。
     /// 原 `OWL_NO_RECLAIM` env。⚠️ 开会无界常驻(长请求 OOM),只作取证。
     pub no_reclaim: bool,
-    /// **驱动账逻辑上限 MiB**(`None` / **`0`** = 只按驱动账判;原 `OWL_VRAM_BUDGET_MB`)。
-    /// 适合"这台卡只准 owl 用 N GB"的部署口径;与 `vram_budget`(占比)
-    /// 是两个不同量:本键是硬上限,超出即主动拒发。
-    /// ⚠️ `0` 与 `None` 同义(各档显式写 `0` 表示"不限")—— 归一点在
-    /// `DiagOpts` 构造(`state.rs`);**不要**把它当"0 字节预算"。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vram_budget_mb: Option<u64>,
     /// 主 KV 池子域（`[store.kv]`）。
     pub kv: StoreKvCfg,
     /// GDN 行几何 + 状态快照子域（`[store.gdn]`）。
@@ -914,15 +891,11 @@ impl Default for StoreCfg {
             host_cache_mb: 0,
             snap_host_mb: 0,
             disk_cache_mb: 0,
-            checkpoint_max_mb: 0,
-            checkpoint_min_gap_ms: 5000,
             snap_disk_mb: 0,
             disk_dir: String::new(),
             vram_budget: 0.97,
             vram_reserve_mb: 714,
-            block_pool_bytes: 0,
             no_reclaim: false,
-            vram_budget_mb: None,
             kv: StoreKvCfg::default(),
             gdn: StoreGdnCfg::default(),
         }
@@ -2286,7 +2259,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
     if v.get("pool").is_some() {
         return Err(
             "`[store]` 已改名为 `[store]`（2026-11-16）：基础键（prefix_cache / host_* / \
-             disk_* / checkpoint_* / vram_* / block_pool_bytes / no_reclaim）留在 `[store]`；\
+             disk_* / vram_* / no_reclaim）留在 `[store]`；\
              `kv_dtype` → `[store.kv]`；`gdn_slots` 与 `snap_*` → `[store.gdn]`。\
              迁移：`server -p <旧档> --print-config > <新档>.toml`"
                 .to_string(),
@@ -2297,7 +2270,7 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
         (
             "store",
             "vram_target",
-            "已更名(2026-11-13): 改用 `[store] vram_budget`(0..1 占比,语义不变);绝对硬上限仍是 `[store] vram_budget_mb`",
+            "已更名(2026-11-13): 改用 `[store] vram_budget`(0..1 占比,语义不变);绝对上限不再单设键",
         ),
         (
             "model",
@@ -2344,6 +2317,26 @@ fn reject_retired_keys(v: &toml::Value) -> Result<(), String> {
             "runtime",
             "server_url",
             "已退役(2026-10-27):零读取 —— 删掉该键",
+        ),
+        (
+            "store",
+            "vram_budget_mb",
+            "已删除(2026-11-16):绝对上限改用 `[store] vram_budget` 占比表达；删掉本键",
+        ),
+        (
+            "store",
+            "block_pool_bytes",
+            "已删除(2026-11-16):解释器块池只是实验/诊断面，生产固定关（0）；测试直接注入 InterpEnv",
+        ),
+        (
+            "store",
+            "checkpoint_max_mb",
+            "已删除(2026-11-16):主动 checkpoint 在磁盘层启用后自动运行；单次复制量是内部策略，不再配置",
+        ),
+        (
+            "store",
+            "checkpoint_min_gap_ms",
+            "已删除(2026-11-16):主动 checkpoint 节拍是内部策略(5s)，不再配置",
         ),
         (
             "spec",
@@ -3424,7 +3417,7 @@ mod tests {
         let e = OwlConfig::from_toml_str("[store]\nvram_target = 0.99\n")
             .expect_err("旧 vram_target 必须拒");
         assert!(
-            e.contains("退役键") && e.contains("vram_budget") && e.contains("vram_budget_mb"),
+            e.contains("退役键") && e.contains("vram_budget"),
             "{e}"
         );
     }

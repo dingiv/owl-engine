@@ -53,12 +53,9 @@ pub struct DiagOpts {
     /// **显存硬预算:预留 MiB**(2026-10-16):判据 = 驱动账 `free − reserve ≥ 请求`,
     /// 否则**主动拒发**(不让 `cudaMallocAsync` 去抛错 —— 那是"已经太晚"的现场)。
     /// reserve 覆盖未入账面:CUDA ctx(~430MB)/池保留页/瞬态。
-    /// 缺省 256MiB(测试面);生产经 `from_config` 取 `pool.vram_reserve_mb`(1024MiB)
-    /// —— 与引擎池治理**同一个预留**,两个旋钮不打架。
+    /// 缺省 0（测试面）；生产经 `from_config` 取 `[store].vram_reserve_mb`
+    /// —— 与引擎池治理**同一个预留**，不是第二个池容量。
     pub vram_reserve_mb: u64,
-    /// **显存硬预算:逻辑上限 MiB**(None = 只按驱动账判)。
-    /// 叠一层"引擎 live 账"上限:适合"这台卡只准 owl 用 N GB"的部署口径。
-    pub vram_budget_mb: Option<u64>,
     /// **发射账容量**(cuda.trace_ring;0 = 关)。>0 ⇒ server 记最近 N 条
     /// 命令(launch/htod/dtoh/alloc/free/memset/copy;见 `crate::trace`)。
     pub trace_ring: usize,
@@ -87,7 +84,6 @@ impl Default for DiagOpts {
             fi_plan_restore: false,
             capture_slab_mb: None,
             vram_reserve_mb: 0,
-            vram_budget_mb: None,
             trace_ring: 0,
             tag_filter: owl_kernels::tag_filter::TagFilter::wildcard(),
         }
@@ -120,10 +116,6 @@ impl DiagOpts {
                 .vram_reserve_mb
                 .saturating_sub(owl_shared::config::POOL_GRAPH_WARMUP_RESERVE_MB)
                 .max(1),
-            // **`0` = 不限**(与 `[store] vram_budget_mb` 注释"留空 = 只按驱动账判"同义;
-            // 各档普遍显式写 0)。写成 `Some(0)` = 0 字节硬预算 ⇒ 装载第一条就拒发,
-            // boot 直接死在 embed_tokens(2026-10-21 实测)。
-            vram_budget_mb: cfg.store.vram_budget_mb.filter(|m| *m > 0),
             d2h_prof: c.d2h_prof,
             gpu_prof: c.gpu_prof,
             graph_flags: c.graph_flags.to_bits(),
@@ -690,10 +682,8 @@ pub(super) enum FamAct {
 /// 严格档开关(进程级一次读取;诊断旋钮 —— 与 `OWL_GDN_FRESH_SCRATCH` 同族)
 /// **显存硬预算判据（唯一实现；2026-10-16 立项 / 2026-10-18 缓存化）**。
 ///
-/// 两段，顺序有义：
-/// ① **驱动账**（主判据）：`cuMemGetInfo` 的 free − `reserve` ≥ 请求 —— 覆盖
-///    未入账面（CUDA ctx / 池保留页 / 别的进程）；
-/// ② **逻辑上限**（可选）：`vram::live + n ≤ budget`。
+/// 判据：**驱动账** `cuMemGetInfo` 的 free − `reserve` ≥ 请求 —— 覆盖
+/// 未入账面（CUDA ctx / 池保留页 / 别的进程）。
 ///
 /// 不通过 = `PoolExhausted`（**结构化**：要多少 / 还能给多少）⇒ 调用方**拒发**，
 /// 不去 malloc —— CUDA 侧失败是“已经太晚”的现场（错误语义模糊 + 池撕碎）。
@@ -747,22 +737,9 @@ impl VramGuard {
         &mut self,
         n_bytes: usize,
         reserve_bytes: u64,
-        budget_bytes: Option<u64>,
         vram: &owl_iface::contract::VramAccount,
     ) -> Result<(), ModelError> {
-        // ② 逻辑上限（可选；纯账，零驱动）
-        if let Some(cap) = budget_bytes {
-            let live = vram.live_bytes();
-            let after = live.saturating_add(n_bytes as u64);
-            if after > cap {
-                return Err(ModelError::PoolExhausted {
-                    pool: "vram-hard-budget(live 账上限)".into(),
-                    needed: n_bytes as u64,
-                    available: cap.saturating_sub(live),
-                });
-            }
-        }
-        // ① 驱动账：先看估计，够用且不陈旧就**不查驱动**
+        // 驱动账：先看估计，够用且不陈旧就**不查驱动**
         let live = vram.live_bytes();
         let now = std::time::Instant::now();
         let need_sample = match Self::estimate_free(self.sample, live, now) {

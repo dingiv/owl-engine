@@ -1,8 +1,8 @@
 //! **显存硬预算门**(2026-10-16):server 侧**主动拒发**超出限度的分配请求 ——
 //! 不让 `cudaMallocAsync` 去抛错(那是"已经太晚"的现场:错误语义模糊 + 池被撕碎)。
 //!
-//! 两条判据(见 `cuda::state::VramGuard::check`):
-//! ① 驱动账:`free − reserve ≥ 请求`;② 逻辑上限(可选):`live + n ≤ budget`。
+//! 判据(见 `cuda::state::VramGuard::check`):
+//! 驱动账 `free − reserve ≥ 请求`。
 //! 拒发 = **结构化** `PoolExhausted`(要多少/还能给多少)+ `is_fatal() == true`
 //! ⇒ 服务面据此走优雅关停(见 `apps/server/src/shutdown.rs`)。
 //!
@@ -24,37 +24,6 @@ async fn client_with(diag: DiagOpts) -> GpuClient {
         .expect("spawn server");
     client.sync().await.expect("sync");
     client
-}
-
-/// ② 逻辑上限:预算 1MiB ⇒ 2MiB 请求必被拒(且**不依赖卡上余量**,可重复)
-#[tokio::test]
-async fn logical_cap_refuses_before_cuda() {
-    if owl_cuda::test_device_bdf().is_none() {
-        owl_shared::testkit::report::skip("OWL_TEST_DEVICE 未设");
-        return;
-    }
-    let mut c = client_with(DiagOpts { vram_budget_mb: Some(1), ..Default::default() }).await;
-    // 先占 0.5MiB(在上限内):应放行
-    let ok = c
-        .alloc(Dtype::F32, (512 * 1024) / 4, "probe:budget-ok")
-        .await
-        .expect("预算内应放行");
-    // 句柄非 `Drop`:归还走 fake client 的显式接口;这里只结束借用(`drop()` 会误导)。
-    let _ = ok;
-    // 再要 2MiB:live(0.5MiB 已归还但账已记)… 直接要 2MiB > 1MiB 上限 ⇒ 拒
-    let err = c
-        .alloc(Dtype::F32, (2 * 1024 * 1024) / 4, "probe:budget-over")
-        .await
-        .expect_err("超上限必须拒发");
-    eprintln!("[硬预算门] 逻辑上限拒发: {err}");
-    match &err {
-        ModelError::PoolExhausted { pool, needed, .. } => {
-            assert!(pool.contains("vram-hard-budget"), "拒发须带预算标识:{pool}");
-            assert_eq!(*needed, 2 * 1024 * 1024);
-        }
-        other => panic!("期望 PoolExhausted,得 {other:?}"),
-    }
-    assert!(err.is_fatal(), "拒发属不可恢复类(服务面据此优雅关停)");
 }
 
 /// ① 驱动账:reserve 拉满(1TiB)⇒ 任何请求都被拒,且**一次 malloc 都没发**

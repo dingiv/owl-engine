@@ -198,8 +198,10 @@ pub struct LegStats {
     pub slots_free: usize,
     /// 缓存条目数。
     pub cached_blocks: usize,
-    /// host 承载条目数。
+    /// 宿主承载条目数（`BlockLeg` 原生；`Rel::leg_stats` 会扣除盘上-only）。
     pub host_blocks: usize,
+    /// 盘上驻留条目数（`Rel::leg_stats` 从 DiskTier 合并）。
+    pub disk_blocks: usize,
     /// 设备侧缓存字节(树绑定条目面)。
     pub gpu_bytes: usize,
     /// **池实占字节**(槽账真源:已用槽 × 块字节)。
@@ -1068,6 +1070,7 @@ impl BlockLeg {
             slots_free: kv.slots_free,
             cached_blocks: kv.cached_blocks,
             host_blocks: kv.host_blocks,
+            disk_blocks: 0,
             gpu_bytes: kv.gpu_bytes,
             occupied_bytes: self.occupied_bytes(),
             movable_bytes: self.movable_bytes(),

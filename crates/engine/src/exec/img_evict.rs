@@ -23,7 +23,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if ops.is_empty() {
             return Ok(());
         }
-        if !self.bank.rel.snap_disk_enabled() {
+        if !self.bank.parts().rel.snap_disk_enabled() {
             return Err(ModelError::EngineInvariant {
                 what: format!("盘层快照收尾:未接盘层却有 {} 张票", ops.len()),
             });
@@ -32,10 +32,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         for op in ops {
             match op {
                 SnapDiskOp::Rekey { old, new } => {
-                    let (from, to) = self.bank.rel.plan_rekey_snap_disk(*old, *new)?;
+                    let (from, to) = self.bank.parts().rel.plan_rekey_snap_disk(*old, *new)?;
                     match crate::disk_io::rename_block(from, to).await {
                         Ok(()) => {
-                            self.bank.rel.commit_rekey_snap_disk(*old, *new)?;
+                            self.bank.parts_mut().rel.commit_rekey_snap_disk(*old, *new)?;
                             rekeyed += 1;
                         }
                         Err(e) => {

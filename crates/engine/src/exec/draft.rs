@@ -35,8 +35,8 @@ fn mtp_table_for_session(
     sid: u64,
     cover: usize,
 ) -> Result<Vec<u32>> {
-    let (sessions, leg) = (&mut bank.sessions, &mut bank.leg_mtp);
-    let s = sessions.get_mut(sid).expect("账在");
+    let parts = bank.parts_mut();
+    let s = parts.sessions.get_mut(sid).expect("账在");
     if let Some(ring) = ring {
         let pages = cover.div_ceil(page.max(1));
         let table = ring.table(pages);
@@ -44,7 +44,7 @@ fn mtp_table_for_session(
         Ok(table)
     } else {
         // MTP 腿 cache=Off ⇒ 纯分配；长度由 generation_target 配对覆盖。
-        leg.ensure_for_len(&mut s.mtp_block_table, cover)?;
+        parts.leg_mtp.ensure_for_len(&mut s.mtp_block_table, cover)?;
         Ok(s.mtp_block_table.clone())
     }
 }
@@ -119,19 +119,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             (crate::sampler::SamplerCfg::default(), 0)
         };
         let _page = self.dev.pool.geom.page;
-        {
+        let (sid, grew) = {
             let act = self.turns.active()?;
             let (sid, grant) = (act.session_id, act.grant);
-            let s = self.bank.sessions.session_mut(sid)?;
+            let bank = self.bank.parts_mut();
+            let s = bank.sessions.session_mut(sid)?;
             let before = s.block_table.len();
             // **P0-4**：消费本 turn 的准入 Grant。
-            self.bank
-                .rel
-                .ensure_for_len(grant, &mut s.block_table, fp + block)?;
-            if s.block_table.len() != before {
-                let sid = act.session_id;
-                self.write_bt(sid).await?;
-            }
+            bank.rel.ensure_for_len(grant, &mut s.block_table, fp + block)?;
+            (sid, s.block_table.len() != before)
+        };
+        if grew {
+            self.write_bt(sid).await?;
         }
         // 草稿池寻址一律经 StatePool 权威(slot≥1 案配套;分派点零推槽)
         // ring(2026-10-22):逻辑位 % ring_slots;captured Copy ⇒ 不借 self
@@ -464,7 +463,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let bt = self.dev.pool.bt_leaf_flat();
         let (_bt_chain, _) = {
             let act = self.turns.active()?;
-            let s = self.bank.sessions.session(act.session_id)?;
+            let s = self.bank.parts().sessions.session(act.session_id)?;
             // GDN 行 = turn 域资源(§28)
             (s.block_table.clone(), act.gdn_slot)
         };
@@ -474,23 +473,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 越 page 界 panic)。**grew → write_bt 同步律**:块表增长必须
         // 伴设备侧重写,否则 scheduler 下轮 grew=false 跳过 write_bt,
         // 烘焙块表停代(gate9 文本分歧 / gate10 空轮两案真凶)
-        {
+        let (sid, grew) = {
             let act = self.turns.active()?;
             let (sid, grant) = (act.session_id, act.grant);
-            let s = self.bank.sessions.session_mut(sid)?;
+            let bank = self.bank.parts_mut();
+            let s = bank.sessions.session_mut(sid)?;
             let before = s.block_table.len();
             // **P0-4**：消费本 turn 的准入 Grant。
-            self.bank
-                .rel
-                .ensure_for_len(grant, &mut s.block_table, pos + block)?;
-            if s.block_table.len() != before {
-                let sid = act.session_id;
-                self.write_bt(sid).await?;
-            }
+            bank.rel.ensure_for_len(grant, &mut s.block_table, pos + block)?;
+            (sid, s.block_table.len() != before)
+        };
+        if grew {
+            self.write_bt(sid).await?;
         }
         let (bt_chain, _) = {
             let act = self.turns.active()?;
-            let s = self.bank.sessions.session(act.session_id)?;
+            let s = self.bank.parts().sessions.session(act.session_id)?;
             // GDN 行 = turn 域资源(§28)
             (s.block_table.clone(), act.gdn_slot)
         };
@@ -1849,7 +1847,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     ) -> Result<(Vec<u32>, owl_iface::contract::Bytes, Option<Vec<f32>>)> {
         let bt_chain = {
             let act = self.turns.active()?;
-            let s = self.bank.sessions.get(act.session_id).expect("账在");
+            let s = self.bank.parts().sessions.get(act.session_id).expect("账在");
             s.block_table.clone()
         };
         // P1.1 词表切:切档 ⇒ 两 rank 都读半表行(rank0 host 拼接);

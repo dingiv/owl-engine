@@ -15,6 +15,15 @@ use owl_store::{ChainHash, HostBlock, Rel, SnapKey, SpillPlanOf, StoreError, Tie
 use crate::mem::disk_io;
 use crate::Result;
 
+/// checkpoint 写盘的一次计数（设备 D2H / 宿主 clone 分开记）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SpillStats {
+    /// 从设备只读 D2H 后写盘的块数。
+    pub dev_blocks: usize,
+    /// 从宿主副本直接写盘的块数。
+    pub host_blocks: usize,
+}
+
 /// 磁盘 I/O 运行器（boot 一次装配配额，运行期只读）。
 pub(crate) struct DiskRuntime;
 
@@ -46,7 +55,10 @@ impl DiskRuntime {
         let plan = match self.plan_spill_kv(rel, chain, active_sessions).await? {
             Some(p) => p,
             None => {
-                // 盘装不下（腾完也不够）⇒ 内容还回宿主：本单该条不出票
+                // 盘装不下（腾完也不够）⇒ 内容还回宿主：本单该条不出票。
+                // **运行期盘满不伪造 Drop**：下一拍 `plan_capacity` 仍会按
+                // 统一 Verdict 决定是否丢内容；这里只把"盘满挡路"记成指标。
+                owl_shared::counter_inc!("store.disk.spill_full");
                 rel.host_put(chain, buf)?;
                 return Ok(false);
             }
@@ -84,7 +96,11 @@ impl DiskRuntime {
         }
         let plan = match self.plan_spill_kv(rel, chain, active_sessions).await? {
             Some(p) => p,
-            None => return Ok(false), // 盘装不下（腾完也不够）⇒ 本单停
+            None => {
+                // 复制语义：原驻留仍在，盘满只停本单；Drop 由下一拍压力计划出。
+                owl_shared::counter_inc!("store.disk.checkpoint.full");
+                return Ok(false);
+            }
         };
         match disk_io::write_block(plan.path.clone(), plan.tmp.clone(), bytes).await {
             Ok(_) => {
@@ -107,6 +123,60 @@ impl DiskRuntime {
                 Ok(false)
             }
         }
+    }
+
+    /// **checkpoint 宿主块批量写盘**：clone 字节（复制语义），失败/配额到顶即停。
+    /// 返回计数写进 `out`；`false` 的块不计数，原宿主副本不动。
+    pub(crate) async fn spill_host_blocks(
+        &self,
+        rel: &mut Rel,
+        host: &[ChainHash],
+        active_sessions: &[u64],
+        out: &mut SpillStats,
+    ) -> Result<()> {
+        for h in host {
+            let Some(bytes) = rel.host_block(*h).map(|b| b.as_slice().to_vec()) else {
+                break;
+            };
+            if self
+                .spill_bytes(rel, *h, bytes, active_sessions)
+                .await?
+            {
+                out.host_blocks += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// **checkpoint 设备块写盘**：调用方已完成 D2H 交换并交出 `table`；
+    /// 这里逐槽读、写盘、计数。缓冲由 `recycle_read_plan` 统一归还。
+    pub(crate) async fn spill_device_table(
+        &self,
+        rel: &mut Rel,
+        chains: &[ChainHash],
+        table: &owl_store::SlotTable,
+        block_bytes: usize,
+        active_sessions: &[u64],
+        out: &mut SpillStats,
+    ) -> Result<()> {
+        use owl_iface::contract::Connector as _;
+        for (i, h) in chains.iter().enumerate() {
+            let mut buf = vec![0u8; block_bytes];
+            if let Err(e) = table.get(owl_iface::contract::ConnSlot(i as u64), 0, &mut buf) {
+                owl_shared::log_warn!("store", "KV checkpoint 读槽 {i} 失败:{e}");
+                break;
+            }
+            if !self
+                .spill_bytes(rel, *h, buf, active_sessions)
+                .await?
+            {
+                break;
+            }
+            out.dev_blocks += 1;
+        }
+        Ok(())
     }
 
     /// **快照溢写**（状态腿宿主 → 磁盘）。语义同 [`Self::spill_kv`]。
@@ -171,6 +241,7 @@ impl DiskRuntime {
             }
         }
         let Some(plan) = plan else {
+            owl_shared::counter_inc!("store.disk.snap.spill_full");
             rel.snap_host_put(key, buf)?;
             return Ok(false);
         };

@@ -48,6 +48,25 @@ pub enum RecallMode {
     Miss,
 }
 
+/// **KV checkpoint 的 store 侧计划**（store 出层/连续性，engine 只做 I/O）。
+///
+/// `chain` = 从根到本次可落盘前缀的**连续**链（含之前已在盘上的块）；
+/// `dev` / `host` = 本次还要复制的块（源层）。盘上-only 不会进 `host`，
+/// 也不会被误判成可从宿主复制 —— tier 真相只在 store 一处。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KvCheckpointPlan {
+    /// 连续前缀链（到本次写完的块为止；供快照逐边界落盘）。
+    pub chain: Vec<ChainHash>,
+    /// 本次需从设备 D2H 复制的块。
+    pub dev: Vec<ChainHash>,
+    /// 本次需从宿主 clone 字节的块（必有宿主内容）。
+    pub host: Vec<ChainHash>,
+    /// 盘层单块字节。
+    pub block_bytes: usize,
+    /// `chain` 开头已经在盘上的块数（本次从这之后开始写）。
+    pub already_on_disk: usize,
+}
+
 /// 召回命中面(层信息;组装与搬运在 engine 侧段边界执行)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecallHit {
@@ -787,6 +806,83 @@ impl Rel {
     /// KV 盘层单块字节（未接线 = `None`）。
     pub fn kv_disk_block_bytes(&self) -> Option<usize> {
         self.disk.as_ref().map(|d| d.block_bytes())
+    }
+
+    /// **规划一次 KV checkpoint**：由 `tokens + tags` 重算内容链，跳过盘上
+    /// 已有前缀，按 `quota_bytes` 小步取连续段，按真实 carrier 分成
+    /// `dev`（D2H 复制）/ `host`（clone 字节）。
+    ///
+    /// - 盘上-only 块 `slot=None` 但**不在 host**：显式走 `carrier_of` 判成
+    ///   `Disk`，绝不再落进 host 分支（`KvStore::locate` 的二值口径在这里
+    ///   被门面校正）；
+    /// - 遇到洞（既不在设备也不在宿主）/盘上已有块/配额到顶即停，**不跳块**；
+    /// - 返回 `None` = 没有可写内容（全在盘、配额 0、或前缀断在根）。
+    pub fn plan_checkpoint_kv(
+        &self,
+        tokens: &[u32],
+        tags: &[crate::kv::BlockTag],
+        quota_bytes: usize,
+    ) -> StoreResult<Option<KvCheckpointPlan>> {
+        if quota_bytes == 0 || !self.disk_enabled() {
+            return Ok(None);
+        }
+        let Some(block_bytes) = self.kv_disk_block_bytes() else {
+            return Ok(None);
+        };
+        if block_bytes == 0 {
+            return Ok(None);
+        }
+        let page = self.leg.block_tokens().max(1);
+        let full = tokens.len() / page;
+        if full == 0 {
+            return Ok(None);
+        }
+        // 身份来源 = tokens（必须与 ChainIndex 同源；不能走树祖先链）。
+        let mut parent = ChainHash::new(0);
+        let mut chain = Vec::with_capacity(full);
+        for (i, block) in tokens.chunks(page).take(full).enumerate() {
+            parent = crate::kv::hash_block(parent, block, tags.get(i).copied().unwrap_or(0));
+            chain.push(parent);
+        }
+        let mut start = 0usize;
+        while start < chain.len() && self.kv_disk_contains(chain[start]) {
+            start += 1;
+        }
+        if start >= chain.len() {
+            return Ok(None); // 整链已在盘上
+        }
+        let max_blocks = (quota_bytes / block_bytes).max(1);
+        let mut dev = Vec::new();
+        let mut host = Vec::new();
+        for h in chain.iter().skip(start) {
+            if dev.len() + host.len() >= max_blocks {
+                break;
+            }
+            if self.kv_disk_contains(*h) {
+                break; // 连续前缀断在盘上已有块（理论上 start 已越过）
+            }
+            match self.carrier_of(*h) {
+                Ok(Carrier::Device(_)) => dev.push(*h),
+                Ok(Carrier::Host) => {
+                    if self.host_block(*h).is_none() {
+                        break; // 账说宿主、内容不在 ⇒ 不准跳洞
+                    }
+                    host.push(*h);
+                }
+                Ok(Carrier::Disk) | Err(_) => break,
+            }
+        }
+        let wrote = dev.len() + host.len();
+        if wrote == 0 {
+            return Ok(None);
+        }
+        Ok(Some(KvCheckpointPlan {
+            chain: chain[..start + wrote].to_vec(),
+            dev,
+            host,
+            block_bytes,
+            already_on_disk: start,
+        }))
     }
 
     /// KV 盘层空闲槽数（未接线 = 0）。
@@ -2534,8 +2630,13 @@ impl Rel {
         StoreReport {
             tiers,
             kv: {
-                // 宿主账漂指纹合并(真源 = 宿主层;`KvStore` 看不到宿主 ⇒ 报告处补)
+                // 宿主账漂指纹合并(真源 = 宿主层;`KvStore` 看不到宿主 ⇒ 报告处补)。
+                // **tier 真相**：`KvStore` 的 `host_blocks` 是 `slot=None` 二值计数，
+                // 盘上-only 也在内；报告面必须从 DiskTier 扣掉，单独报 `disk_blocks`。
                 let mut k = self.leg.kv_stats();
+                let disk_entries = self.disk.as_ref().map(|d| d.resident_count()).unwrap_or(0);
+                k.disk_blocks = disk_entries;
+                k.host_blocks = k.host_blocks.saturating_sub(disk_entries);
                 k.host_duplicate_landings = self.leg.host_duplicate_landings();
                 k.host_drop_missing = self.leg.host_drop_missing();
                 k
@@ -2721,8 +2822,15 @@ impl Rel {
     }
 
     /// 腿报告(KV 腿的完整面:槽/缓存/宿主/搬运计数 —— 报告与对账口用)。
+    ///
+    /// **tier 真相**：`BlockLeg` 只看到 `slot=None`，盘上-only 也会被报成
+    /// Host；这里用 DiskTier 的驻留数校正，并单列 `disk_blocks`。
     pub fn leg_stats(&self) -> LegStats {
-        self.leg.report()
+        let mut st = self.leg.report();
+        let disk_entries = self.disk.as_ref().map(|d| d.resident_count()).unwrap_or(0);
+        st.disk_blocks = disk_entries;
+        st.host_blocks = st.host_blocks.saturating_sub(disk_entries);
+        st
     }
 }
 
@@ -4311,6 +4419,19 @@ mod tests {
         assert_eq!((rep.chains, rep.blocks), (1, 3), "{rep:?}");
         assert_eq!(rep.kept.len(), 3);
         assert_eq!(r.leg.kv_stats().host_blocks, 3, "重建条目应为非设备层");
+        // **tier 真相门**：盘上-only 不能被 engine 面报成 Host。
+        let leg = r.leg_stats();
+        assert_eq!(leg.disk_blocks, 3, "盘上链应计入 disk_blocks");
+        assert_eq!(leg.host_blocks, 0, "盘上-only 不得计入 host_blocks");
+        let stats = r.report();
+        assert_eq!(stats.kv.disk_blocks, 3, "报告面应拆出盘块");
+        assert_eq!(stats.kv.host_blocks, 0, "报告面盘上-only 不得算 Host");
+        assert!(
+            r.plan_checkpoint_kv(&tokens, &[], 8 << 20)
+                .expect("plan")
+                .is_none(),
+            "整链已在盘 ⇒ 不应再产 checkpoint 写计划"
+        );
         let (hit, recall) = r.match_prefix(&tokens).expect("命中");
         assert_eq!(hit.matched_blocks, 3, "命中面应按重建的树工作");
         assert_eq!(recall.kv_tier, Some(Tier::Disk), "盘上链必须报 Disk 层");

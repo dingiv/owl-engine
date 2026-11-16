@@ -56,7 +56,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 条目只可能来自启动半态，收掉它是幂等且安全的（在册 turn 不被动）；
         // 恒开 = 任何没被本函数归属到的半态都能自愈，而不是等下一次巧合同形。
         let live: Vec<u64> = self.turns.active.iter().map(|a| a.id).collect();
-        match self.bank.rel.finish_orphan_turns(&live) {
+        match self.bank.parts_mut().rel.finish_orphan_turns(&live) {
             Ok(reps) if !reps.is_empty() => {
                 for (t, r) in reps {
                     owl_shared::log_warn!(
@@ -261,7 +261,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let generated = act.fed.saturating_sub(act.prompt_ids.len());
         let mut demote_tail = None;
-        let s = self.bank.sessions.session_mut(act.session_id)?;
+        let s = self.bank.parts_mut().sessions.session_mut(act.session_id)?;
         s.tokens.clear();
         s.tokens.extend_from_slice(&act.prompt_ids[..written]);
         // 内容身份的参考边界 = 已写入的 prompt 段（中断时 generation 尚未落账）
@@ -319,9 +319,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         );
         if let Some(old) = demote_tail {
             if self
-                .bank
-                .rel
-                .reclassify_snap(old, owl_store::SnapClass::Extra)
+                .bank.parts_mut().rel.reclassify_snap(old, owl_store::SnapClass::Extra)
             {
                 owl_shared::metrics::with_metrics_store(|m| {
                     m.counter_add("snap.demote.tail", 1, file!(), line!());
@@ -341,7 +339,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         self.turns.admission.note_finished(turn_id);
         // **store 单一围栏**：Grant + 准入账 + GDN 行一次归还（幂等）。
         // 不在这里逐项手还 —— 三本账同源，拆开就必然有半态（2026-11-06 真机）。
-        match self.bank.rel.finish_turn(turn_id) {
+        match self.bank.parts_mut().rel.finish_turn(turn_id) {
             Ok(r) => {
                 if r.admission || r.grants > 0 || r.row.is_some() {
                     owl_shared::log_debug!(
@@ -433,7 +431,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 会话账落地(S1 收口):KV 此刻 = prompt 全量 + 生成段;GDN 状态
         // 跨 turn 连续。临时会话终了即焚(表不随 turn 数无界增长)
         let mut demote_tail = None;
-        if let Some(s) = self.bank.sessions.get_mut(act.session_id) {
+        if let Some(s) = self.bank.parts_mut().sessions.get_mut(act.session_id) {
             s.commit_turn(&act.prompt_ids, &act.out, &act.positions)?;
             // **图像段账写回**(前缀无感删除;2026-10-23):与 `tokens` 同一次
             // 收口 —— 两处各写一份 = 下一轮删除识别拿错坐标。
@@ -457,9 +455,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         if let Some(old) = demote_tail {
             if self
-                .bank
-                .rel
-                .reclassify_snap(old, owl_store::SnapClass::Extra)
+                .bank.parts_mut().rel.reclassify_snap(old, owl_store::SnapClass::Extra)
             {
                 owl_shared::metrics::with_metrics_store(|m| {
                     m.counter_add("snap.demote.tail", 1, file!(), line!());
