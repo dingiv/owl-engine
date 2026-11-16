@@ -4,7 +4,7 @@
 //! 关键变量 = `OWL_BLOCK_POOL`(块池预算;池开 ⇒ 逐节点 alloc 退化为零命令,
 //! 发射才能真的攒成批;池关 ⇒ 每个节点前面必有一次 `flush`,批长退回 1)。
 //!
-//! 运行(块池预算走**配置键** `[pool] block_pool_bytes`;本夹具用
+//! 运行(块池预算走**配置键** `[store] block_pool_bytes`;本夹具用
 //! `OWL_BENCH_POOL_BYTES` 走测试面注入,不改生产配置):
 //! ```text
 //! OWL_TEST_DEVICE=01:00.0 OWL_BENCH_POOL_BYTES=$((64<<20)) \
@@ -46,7 +46,7 @@ async fn eval_host_cost_probe() {
     };
     const N: usize = 256;
     const DEPTH: usize = 200;
-    // 块池预算(测试面注入;生产 = `[pool] block_pool_bytes`)
+    // 块池预算(测试面注入;生产 = `[store] block_pool_bytes`)
     let budget: usize = std::env::var("OWL_BENCH_POOL_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())

@@ -1,7 +1,5 @@
 # 池组件：f16 KV（image-evict / KVMem 长上下文对照）。
-[pool]
-kv_dtype = "f16"
-gdn_slots = 1
+[store]
 # **2026-11-04 收紧(用户裁决:预留太保守)**:f16 per_tok 是 int8/fp8 的 2×,
 # 旧档 `target=0.97 + reserve=1024` 在 24G 单卡上等于白扔 708MiB(target)
 # + 1GiB(reserve) —— 实测 32k 上下文都挤不进。改为:
@@ -11,3 +9,7 @@ vram_budget = 1.0
 vram_reserve_mb = 970
 
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
+[store.kv]
+kv_dtype = "f16"
+[store.gdn]
+gdn_slots = 1

@@ -49,13 +49,12 @@ echo "[workload] 日志: $LOG" >&2
 (
     exec "$SERVER_BIN" -p "$PROFILE" \
         --set "server.bind=127.0.0.1:${PORT}" \
-        --set "pool.kv_fp8=true" \
-        --set "pool.image_evict=true" \
-        --set "pool.prefix_cache=true" \
-        --set "pool.snap_max=2" \
-        --set "pool.snap_host_mb=1024" \
+        --set "store.kv.kv_dtype=fp8" \
+        --set "vision.image_evict=true" \
+        --set "store.prefix_cache=true" \
+        --set "store.gdn.snap_max=2" \
+        --set "store.snap_host_mb=1024" \
         --set "runtime.max_seq=${MAX_SEQ}" \
-        --set "runtime.implicit_session=true" \
         --log-level info >"${LOG}" 2>&1
 ) &
 SERVER_PID=$!

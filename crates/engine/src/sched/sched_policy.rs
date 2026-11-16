@@ -16,7 +16,7 @@
 //! ┌─────────────── Admission（准入）───────────────┐   ┌────────── PhaseSched（相位）──────────┐
 //! │ 输入: StoreFacts + 队首/活跃 TurnFacts           │   │ 输入: &[TurnFacts]（相位/欠账）        │
 //! │ 状态: 会话守卫 / 退避表(页账在 store Grant)     │   │ 状态: rr 游标 / 距上一片 prefill 的拍数 │
-//! │ 输出: Admit | Hold | Reject{reason,retry_after}  │   │ 输出: Plan{kind, turn, slice_tokens}   │
+//! │ 输出: Admit | Hold | Reject{reason,retry_after}  │   │ 输出: Plan{kind, turn}                 │
 //! │ 律: A1..A4（见下）                               │   │ 律: P1..P4（见下）                     │
 //! └──────────────────────────────────────────────────┘   └────────────────────────────────────────┘
 //! ```
@@ -38,9 +38,11 @@
 //! - **A4 拒绝可行动**：必带 `Reason`（内存/槽位/会话/排队超时）+ `retry_after_ms`。
 //!
 //! ## 相位（PhaseSched）
-//! - **P1 在位者 ITL 上界**：每 `slice_every` 拍 decode 之后**至多**插一片 prefill；
-//!   由此 `ITL_A ≤ solo_ITL + slice_ms / (slice_every + 1)`（可写成门）。
-//! - **P2 一片一个 turn**：prefill 片 = `min(剩余 prompt, slice_tokens)`，一次只喂一个；
+//! - **P1 在位者 ITL 上界**：每 [`SLICE_EVERY`] 拍 decode 之后**至多**插一片
+//!   prefill；由此 `ITL_A ≤ solo_ITL + slice_ms / (SLICE_EVERY + 1)`（可写成门）。
+//!   节奏是**内核常数**（2026-11-16 用户裁决）；操作员没有旋钮。
+//! - **P2 一片一个 turn**：prefill 片 = **引擎的正常一步**（`prefill_chunk` ∩
+//!   剩余，含块长/页对齐规则），一次只喂一个；片长**不在本模块**（一处口径）。
 //! - **P3 批优先**：全活跃都在 gen 且批位够 ⇒ `BatchDecode`（权重摊薄）；
 //!   相位混合 ⇒ 单动作（批门要求同相位，不许硬拼）；
 //! - **P4 公平**：prefill 挑**欠账最多**（`fed` 最小）；gen 挑 round-robin。
@@ -80,10 +82,9 @@ pub struct Limits {
     pub chunk_pages: usize,
     /// 池保留页（增长/腾挪余量；几页级，**不是**按比例）
     pub reserve_pages: usize,
-    /// 时间片：每 `slice_every` 拍 decode 后插一片 prefill（0 = 不插，prefill 独占）
-    pub slice_every: usize,
-    /// 时间片：单片 prefill token 数（0 = 用整 chunk）
-    pub slice_tokens: usize,
+    // **`slice_every` / `slice_tokens` 已删**（2026-11-16 用户裁决 B）：
+    // 相位节奏收成内核常数 [`SLICE_EVERY`]，片长归引擎的正常 prefill 步
+    // （`prefill_chunk` ∩ 剩余）—— 旧键读两次是两套规范。
     // **公平性三旋钮已删**（2026-11-16 用户裁决）：一轮在 submit 时就按
     // 「上下文 + 本档最大输出长度」预留整份预算（`TurnFacts::max_new`），
     // 装不下即拒/排队 ⇒ 在跑者天然不被新人挤占，不需要"给新人留头寸"/
@@ -100,8 +101,6 @@ impl Default for Limits {
             workspace_pages: 0,
             chunk_pages: 0,
             reserve_pages: 8,
-            slice_every: 4,
-            slice_tokens: 64,
         }
     }
 }
@@ -525,14 +524,23 @@ fn glue(c: Capacity) -> Capacity {
 // §4 相位状态机（PhaseSched）
 // ===========================================================================
 
-/// 本拍动作（**只表达"谁/什么相位/多少 token"**；设备派生量留给引擎）
+/// **时间片节奏（内核常数）**：每 `SLICE_EVERY` 拍 decode 之后**至多**插一片
+/// prefill（= 在位者 ITL 上界的实现）。
+///
+/// 出处（2026-11-16 用户裁决 B 从配置键收编）：`qwen38_27b-3090-conc` 站点档
+/// 实测 —— 8 ⇒ 并发窗口内 decode 的 `max_gap ≈ 0.9s`；不做时间片（旧值 0）
+/// 会把 decode 冻结 **3.8s**。值由物理（一步 prefill 的墙钟）决定，操作员既
+/// 算不出也不该算 ⇒ 不再作旋钮。
+pub const SLICE_EVERY: usize = 8;
+
+/// 本拍动作（**只表达"谁/什么相位"**；片长/设备派生量留给引擎）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// 灌一片 prefill（`slice_tokens` ≤ 剩余）
+    /// 灌一片 prefill（片长 = 引擎的正常一步：`prefill_chunk` ∩ 剩余）
     Prefill,
     /// 单行 decode
     Decode,
-    /// 多行 decode（批）
+    /// 多行 decode（批；`batch_ok` 由引擎按硬件/投机/选择层事实注入）
     BatchDecode,
 }
 
@@ -540,10 +548,8 @@ pub enum Kind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub kind: Kind,
-    /// 目标 turn（BatchDecode = 0，表示"全部 gen 行"）
+    /// 目标 turn（BatchDecode = 0，表示"全部可批的 gen 行"）
     pub turn: u64,
-    /// Prefill 片长（其它相位 = 0）
-    pub slice_tokens: usize,
 }
 
 /// 相位状态机
@@ -563,8 +569,11 @@ impl PhaseSched {
     }
 
     /// **本拍计划**（纯函数 + 两个游标；`batch_ok` = 引擎的批门外因，
-    /// 如 TP/选择层/投机 —— 本模块不判断这些，只接受一个布尔）。
-    pub fn next(&mut self, l: &Limits, actives: &[TurnFacts], batch_ok: bool) -> Option<Plan> {
+    /// 如 TP/选择层/投机/带图 turn —— 本模块不判断这些，只接受一个布尔）。
+    ///
+    /// **片长不在这里**：prefill 片 = 引擎的正常一步（`prefill_chunk` ∩ 剩余，
+    /// 含块长/页对齐规则）。本机只决定**谁跑**与**何时插片** —— 一处口径。
+    pub fn next(&mut self, actives: &[TurnFacts], batch_ok: bool) -> Option<Plan> {
         if actives.is_empty() {
             return None;
         }
@@ -578,15 +587,15 @@ impl PhaseSched {
             .filter(|t| t.phase == PhaseSz::Prefill)
             .collect();
 
-        // P3:全 gen + 批位 ⇒ 批（不管时间片；批本身就是"人人前进"）
+        // P3:全 gen ⇒ 批（批本身就是"人人前进"，不受时间片约束）。
+        // 行数（min(活跃, max_batch)）由引擎按自己的几何闸——本机只说"该批"。
         if pending.is_empty() {
-            if gen.len() >= 2 && batch_ok && l.max_batch >= gen.len() {
+            if gen.len() >= 2 && batch_ok {
                 self.decodes_since_slice = self.decodes_since_slice.saturating_add(1);
                 self.last = 0;
                 return Some(Plan {
                     kind: Kind::BatchDecode,
                     turn: 0,
-                    slice_tokens: 0,
                 });
             }
             let tid = self.pick_gen(&gen);
@@ -595,7 +604,6 @@ impl PhaseSched {
             return Some(Plan {
                 kind: Kind::Decode,
                 turn: tid,
-                slice_tokens: 0,
             });
         }
 
@@ -609,19 +617,17 @@ impl PhaseSched {
             return Some(Plan {
                 kind: Kind::Prefill,
                 turn: t.turn,
-                slice_tokens: t.prefill_left().max(1),
             });
         }
 
-        // P1:每 `slice_every` 拍 decode 之后插一片（=0 ⇒ 不插 = 旧行为）
-        if l.slice_every == 0 || self.decodes_since_slice >= l.slice_every {
+        // P1：每 `SLICE_EVERY` 拍 decode 之后插一片（常数；不是配置）。
+        if self.decodes_since_slice >= SLICE_EVERY {
             let t = pick_prefill(&pending);
             self.decodes_since_slice = 0;
             self.last = t.turn;
             return Some(Plan {
                 kind: Kind::Prefill,
                 turn: t.turn,
-                slice_tokens: slice_of(l, t),
             });
         }
 
@@ -632,7 +638,6 @@ impl PhaseSched {
         Some(Plan {
             kind: Kind::Decode,
             turn: tid,
-            slice_tokens: 0,
         })
     }
 
@@ -651,16 +656,6 @@ impl PhaseSched {
         }
         self.rr = (i + 1) % n;
         gen[i].turn
-    }
-}
-
-/// 片长 = `min(剩余, slice_tokens)`；`slice_tokens = 0` ⇒ 整剩余（旧行为）
-fn slice_of(l: &Limits, t: &TurnFacts) -> usize {
-    let left = t.prefill_left().max(1);
-    if l.slice_tokens == 0 {
-        left
-    } else {
-        left.min(l.slice_tokens)
     }
 }
 
@@ -737,8 +732,6 @@ mod tests {
             workspace_pages: 32, // 1024 tok
             chunk_pages: 32,     // 1024 tok
             reserve_pages: 8,
-            slice_every: 4,
-            slice_tokens: 64,
         }
     }
 
@@ -943,59 +936,57 @@ mod tests {
         assert_eq!(cap.min(max_seq - 30_000), 2_768);
     }
 
-    /// 相位：全 gen 两行 ⇒ BatchDecode；混合 ⇒ 每 4 拍 decode 后插 1 片 prefill。
+    /// 相位：全 gen 两行 ⇒ BatchDecode；混合 ⇒ 每 `SLICE_EVERY` 拍 decode 后
+    /// 插 1 片 prefill；独跑 prefill 不被切片（片长归引擎）。
     #[test]
-    fn phase_slices_prefill_after_k_decodes() {
-        let l = limits_oversub(); // slice_every = 4, slice = 64
+    fn phase_slices_prefill_after_slice_every_decodes() {
         let mut p = PhaseSched::new();
         let mut gen = turn(1, 10, 128, 64);
         let mut pre = turn(2, 11, 4096, 64);
         pre.fed = 0;
         pre.phase = PhaseSz::Prefill;
         let two = [gen, pre];
-        // 前 4 拍：decode（每拍一次）
-        for k in 0..4 {
-            match p.next(&l, &two, true).expect("plan") {
-                Plan {
+        // 前 `SLICE_EVERY` 拍：decode（每拍一次）
+        for k in 0..SLICE_EVERY {
+            assert_eq!(
+                p.next(&two, true),
+                Some(Plan {
                     kind: Kind::Decode,
-                    turn: 1,
-                    ..
-                } => assert_eq!(k, k),
-                other => panic!("第 {k} 拍应为 Decode,得到 {other:?}"),
-            }
+                    turn: 1
+                }),
+                "第 {k} 拍应为 Decode（时间片未到）"
+            );
         }
-        // 第 5 拍：prefill 片
-        match p.next(&l, &two, true).expect("plan") {
-            Plan {
+        // 第 `SLICE_EVERY + 1` 拍：prefill 片
+        assert_eq!(
+            p.next(&two, true),
+            Some(Plan {
                 kind: Kind::Prefill,
-                turn: 2,
-                slice_tokens: 64,
-            } => {}
-            other => panic!("应为 Prefill 64,得到 {other:?}"),
-        }
+                turn: 2
+            }),
+            "时间片到点应插一片 prefill"
+        );
         // 全 gen ⇒ 批
         gen.phase = PhaseSz::Gen;
         pre.phase = PhaseSz::Gen;
         let two = [gen, pre];
         assert_eq!(
-            p.next(&l, &two, true),
+            p.next(&two, true),
             Some(Plan {
                 kind: Kind::BatchDecode,
-                turn: 0,
-                slice_tokens: 0
+                turn: 0
             })
         );
         // 只剩 gen 一人 ⇒ 单行
         assert_eq!(
-            p.next(&l, &[gen], true),
+            p.next(&[gen], true),
             Some(Plan {
                 kind: Kind::Decode,
-                turn: 1,
-                slice_tokens: 0
+                turn: 1
             })
         );
         // 空集 ⇒ None
-        assert_eq!(p.next(&l, &[], true), None);
+        assert_eq!(p.next(&[], true), None);
     }
 }
 
@@ -1006,6 +997,10 @@ mod tests {
 mod scenario_tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// 时间线模拟器的 prefill 步长（= 引擎的 `prefill_chunk` ∩ 剩余；测试取
+    /// 小值以便拍数可控 —— 片长归引擎，策略模块不再携带它）。
+    const SIM_PREFILL_CHUNK: usize = 64;
 
     /// 时间线模拟器：**每拍** = ①准入（队列→活跃）②相位（谁跑）③推进/终局。
     /// 与引擎的调用序一致（`decide` → `note_started` → `phase.next` → 推进 → `note_finished`）。
@@ -1093,7 +1088,7 @@ mod scenario_tests {
                 return false;
             }
             // ② 相位
-            let Some(plan) = self.ph.next(&self.l, &self.actives, true) else {
+            let Some(plan) = self.ph.next(&self.actives, true) else {
                 return false;
             };
             self.kinds.push(plan.kind);
@@ -1102,7 +1097,7 @@ mod scenario_tests {
             match plan.kind {
                 Kind::Prefill => {
                     if let Some(t) = self.actives.iter_mut().find(|t| t.turn == plan.turn) {
-                        t.fed = (t.fed + plan.slice_tokens).min(t.prompt_tokens);
+                        t.fed = (t.fed + SIM_PREFILL_CHUNK).min(t.prompt_tokens);
                         if t.fed >= t.prompt_tokens {
                             t.phase = PhaseSz::Gen;
                         }
@@ -1171,8 +1166,6 @@ mod scenario_tests {
             max_batch: 2,
             gdn_slots: 2,
             reserve_pages: 8,
-            slice_every: 4,
-            slice_tokens: 64,
             ..Default::default()
         }
     }
@@ -1222,7 +1215,10 @@ mod scenario_tests {
             sim.clamped
         );
         let gap = *sim.max_gap.get(&1).unwrap_or(&0);
-        assert!(gap <= 5, "A 的最大停顿 {gap} 拍应 ≤ slice_every+1");
+        assert!(
+            gap <= SLICE_EVERY + 1,
+            "A 的最大停顿 {gap} 拍应 ≤ SLICE_EVERY+1"
+        );
     }
 
     /// 在位者吃满池（prompt 199,680 ≈ 6240 页）⇒ 新人**拒**（no_memory），
@@ -1293,8 +1289,6 @@ mod scenario_tests {
             oversub: true,
             workspace_pages: 32,
             chunk_pages: 32,
-            slice_every: 4,
-            slice_tokens: 64,
             reserve_pages: 8,
         };
         let mut sim = Sim::new(l, 1024); // 32K 池
@@ -1319,8 +1313,6 @@ mod edge_tests {
             max_batch: 2,
             gdn_slots: 2,
             reserve_pages: 8,
-            slice_every: 4,
-            slice_tokens: 64,
             ..Default::default()
         }
     }
@@ -1536,71 +1528,49 @@ mod edge_tests {
         }
     }
 
-    // ── 相位：K=0 / K=1 / 独跑 / 公平 / 投机 ─────────────────────
+    // ── 相位：时间片常数 / 独跑 / 公平 / 投机 ─────────────────────
 
-    /// `slice_every = 0` = 旧行为：只要有人欠 prefill 就**一直**给它。
+    /// 混合相位：先 decode，满 `SLICE_EVERY` 拍才插一片 prefill —— 在位者
+    /// ITL 上界的实现（旧 K=0 的"prefill 独占"会把 decode 冻结 3.8s）。
     #[test]
-    fn phase_k_zero_is_prefill_first() {
-        let mut l = l();
-        l.slice_every = 0;
+    fn phase_mixed_decodes_until_slice_due() {
         let mut p = PhaseSched::new();
         let a = gen(1, 10, 100, 64);
         let b = pre(2, 11, 1000, 0, 64);
-        for _ in 0..3 {
-            match p.next(&l, &[a, b], true).expect("plan") {
-                Plan {
-                    kind: Kind::Prefill,
-                    turn: 2,
-                    ..
-                } => {}
-                other => panic!("K=0 应一直 prefill，得到 {other:?}"),
-            }
-        }
-    }
-
-    /// `slice_every = 1` ⇒ decode/prefill 严格交替。
-    #[test]
-    fn phase_k_one_alternates() {
-        let mut l = l();
-        l.slice_every = 1;
-        let mut p = PhaseSched::new();
-        let a = gen(1, 10, 100, 64);
-        let b = pre(2, 11, 1000, 0, 64);
-        let mut kinds = Vec::new();
-        for _ in 0..6 {
-            kinds.push(p.next(&l, &[a, b], true).expect("plan").kind);
+        for _ in 0..SLICE_EVERY {
+            assert_eq!(
+                p.next(&[a, b], true).expect("plan").kind,
+                Kind::Decode,
+                "时间片未到必须让在位者前进"
+            );
         }
         assert_eq!(
-            kinds,
-            vec![
-                Kind::Decode,
-                Kind::Prefill,
-                Kind::Decode,
-                Kind::Prefill,
-                Kind::Decode,
-                Kind::Prefill
-            ]
+            p.next(&[a, b], true).expect("plan").kind,
+            Kind::Prefill,
+            "时间片到点插一片"
         );
+        // 片付过 ⇒ 游标归零，再走一轮 decode
+        assert_eq!(p.next(&[a, b], true).expect("plan").kind, Kind::Decode);
     }
 
-    /// 没有 gen 可跑 ⇒ prefill 用**整剩余**（不切片；否则白拉长自己的 TTFT）。
+    /// 没有 gen 可跑 ⇒ prefill **独占**（不切片；否则白拉长自己的 TTFT）。
     #[test]
-    fn phase_lone_prefill_uses_full_remaining() {
-        let mut l = l();
-        l.slice_tokens = 64;
+    fn phase_lone_prefill_is_not_sliced() {
         let mut p = PhaseSched::new();
         let b = pre(2, 11, 1000, 100, 64); // 剩 900
-        let plan = p.next(&l, &[b], true).expect("plan");
-        assert_eq!(plan.kind, Kind::Prefill);
-        assert_eq!(plan.slice_tokens, 900, "独跑不许切片");
+        for _ in 0..3 {
+            let plan = p.next(&[b], true).expect("plan");
+            assert_eq!(
+                (plan.kind, plan.turn),
+                (Kind::Prefill, 2),
+                "独跑应一直 prefill（片长归引擎）"
+            );
+        }
     }
 
     /// gen 轮转公平：3 人依次轮转，不连续点同一个。
     #[test]
     fn phase_gen_round_robin_is_fair() {
-        let mut l = l();
-        l.max_batch = 3;
-        l.gdn_slots = 3;
         let mut p = PhaseSched::new();
         let acts = [
             gen(1, 10, 100, 64),
@@ -1609,7 +1579,7 @@ mod edge_tests {
         ];
         let mut seq = Vec::new();
         for _ in 0..6 {
-            seq.push(p.next(&l, &acts, false).expect("plan").turn);
+            seq.push(p.next(&acts, false).expect("plan").turn);
         }
         assert_eq!(seq, vec![1, 2, 3, 1, 2, 3], "round-robin 应轮满一圈再回头");
     }
@@ -1617,13 +1587,11 @@ mod edge_tests {
     /// 投机相位（`Spec`）算 gen：它可以被 decode，不算 prefill 欠账。
     #[test]
     fn phase_spec_is_gen_not_prefill() {
-        let mut l = l();
-        l.slice_every = 1;
         let mut p = PhaseSched::new();
         let mut spec = gen(1, 10, 100, 64);
         spec.phase = PhaseSz::Spec;
         let b = pre(2, 11, 1000, 0, 64);
-        let first = p.next(&l, &[spec, b], true).expect("plan");
+        let first = p.next(&[spec, b], true).expect("plan");
         assert_eq!(
             (first.kind, first.turn),
             (Kind::Decode, 1),
@@ -1635,15 +1603,13 @@ mod edge_tests {
     #[test]
     fn phase_prefill_picks_least_fed_then_smallest_turn() {
         let mut p = PhaseSched::new();
-        let mut l = l();
-        l.slice_every = 1;
         let a = pre(5, 10, 1000, 200, 64);
         let b = pre(3, 11, 1000, 50, 64);
-        let plan = p.next(&l, &[a, b], true).expect("plan");
+        let plan = p.next(&[a, b], true).expect("plan");
         assert_eq!(plan.turn, 3, "fed 最小者先");
         let c = pre(7, 12, 1000, 50, 64);
         let mut p2 = PhaseSched::new();
-        let plan = p2.next(&l, &[b, c], true).expect("plan");
+        let plan = p2.next(&[b, c], true).expect("plan");
         assert_eq!(plan.turn, 3, "同 fed ⇒ turn id 小者先");
     }
 
@@ -1680,8 +1646,6 @@ mod more_tests {
             max_batch: 2,
             gdn_slots: 2,
             reserve_pages: 8,
-            slice_every: 4,
-            slice_tokens: 64,
             ..Default::default()
         }
     }
@@ -1818,8 +1782,6 @@ mod p0_tests {
             max_batch: 1,
             gdn_slots: 1,
             reserve_pages: 8,
-            slice_every: 0,
-            slice_tokens: 0,
             ..Default::default()
         }
     }

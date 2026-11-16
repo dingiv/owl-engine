@@ -12,9 +12,8 @@
 //!
 //! 前置（两条形态都覆盖）：
 //! - **真并发**：单卡 + `max_batch=2`（TP 不与合批共存）+ `gdn_slots>=2` +
-//!   无选择层 + spec off；要 decode 不被整段 prefill 冻结，再开
-//!   `runtime.slice_every>0`（实测 8 ≈ 每 3 个 decode 步插 1 片 prefill，
-//!   窗口内 max_gap ≈ 0.9s；=0 时 ≈ 3.8s ⇒ 本门红）。
+//!   无选择层 + spec off；相位时间片**引擎自决**（`sched_policy::SLICE_EVERY`
+//!   = 8 ⇒ 每 8 拍 decode 插 1 片 prefill，窗口内 max_gap ≈ 0.9s；没有配置键）。
 //! - **队列形态**（TP2 生产档）：第二路排队，测试报 `mode=queued`。
 //!
 //! 用法：
@@ -477,7 +476,8 @@ fn run_case(args: &Args, case: &Case, pid: u32) -> Result<ScenarioReport, String
             fails.push("并发窗口内解码侧没有继续出 token".into());
         }
         // 3s ≈ 3 个 prefill chunk（2048 tok / ~1.5k t/s ≈ 1.3s）。
-        // `slice_every=0` 时解码会被整段 prefill 冻结（实测 3.8s）⇒ 红。
+        // 相位时间片现由引擎自决（`SLICE_EVERY`=8）—— 旧的不切片行为
+        // （解码被整段 prefill 冻结，实测 3.8s）已不再可达 ⇒ 本门红。
         if max_gap > 3_000 {
             fails.push(format!(
                 "并发窗口内解码侧最大 token 间隔 {max_gap}ms > 3000ms（疑似被 prefill 冻结）"

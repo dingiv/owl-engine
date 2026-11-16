@@ -76,7 +76,7 @@ pub struct EngineKnobs {
     /// 步级探针(诊断面;Default = 全关)
     pub probes: crate::running::StepProbes,
     /// **测试专用**块池容量覆写(None = 生产自动:按剩余显存取满;
-    /// 原 `[pool].pool_tokens` 配置项已于 2026-10-22 删除)。
+    /// 原 `[store].pool_tokens` 配置项已于 2026-10-22 删除)。
     pub pool_tokens: Option<usize>,
     /// 草稿域(深度/哑草稿/家族目录/池量化/verify 诊断)
     pub draft: DraftCfg,
@@ -259,9 +259,9 @@ pub struct EngineKnobs {
     pub no_graph: bool,
     // **`prefill_tail_merge` 字段已删**（2026-11-16 用户裁决）：合并由
     // prefill 的激活工作区预算决定（引擎的账）。当前定值 = [`PREFILL_TAIL_MERGE`]。
-    /// 相位时间片(0 = 关;`[runtime] slice_every/slice_tokens`)
-    pub slice_every: usize,
-    pub slice_tokens: usize,
+    // **`slice_every` / `slice_tokens` 字段已删**（2026-11-16 用户裁决 B）：
+    // 相位节奏 = 内核常数 `sched_policy::SLICE_EVERY`（为什么要切片由引擎
+    // 自己知道：有人在 decode + 有人欠 prefill）。
     /// **本档配置的最大输出长度**（`[runtime] max_new_cap`；2026-11-16 用户裁决）。
     ///
     /// 准入预算 = 本请求上下文 + 这个值（被上下文窗口夹到 `max_seq − prompt`）
@@ -269,13 +269,10 @@ pub struct EngineKnobs {
     pub max_new_cap: usize,
     // **腾挪/压力 8 个字段已删**（2026-11-16 用户裁决）：策略在
     // `owl_store::PressurePolicy`（零旋钮），引擎不再需要把它们从配置搬进来。
-    /// **末段页对齐**(前缀复用闭环,2026-10-19;`[pool] prefill_align_tail`,
-    /// 缺省 **true**)。块边界快照只在**页对齐**处拍 ⇒ 单块档(整个 prompt 落进
-    /// 一个 chunk)L4 会把尾端不对齐地一口吃完 ⇒ 一个快照都没有 ⇒ 下一轮全量
-    /// 重算。开 ⇒ 单块档切一刀(尾巴 <1 页,多付一份 ~250ms chunk 宿主税),
-    /// 换"prompt 最靠后的整页"有快照;多 chunk 档不受影响(前段尾本来就对齐)。
-    pub prefill_align_tail: bool,
-    /// **生成相位页边界快照页步长**(§9.1(6)a;`[pool] snap_decode_stride`,缺省 1)。
+    /// **末段页对齐已恒开**（2026-11-16 用户裁决：删键，默认开）：块边界
+    /// 快照只在页对齐处拍；单块档不切一刀就一个快照都没有 ⇒ 下一轮全量重算。
+    // **`prefill_align_tail` 字段已删**（原 `[store] prefill_align_tail`）。
+    /// **生成相位页边界快照页步长**(§9.1(6)a;`[store.gdn] snap_decode_stride`,缺省 1)。
     /// spec 轮提交跨过页边界 ⇒ 用 fold 把 GDN 态回卷到边界拍一张再卷回;
     /// 本键节流(`边界页号 % stride == 0` 才拍)。0 = 关(旧行为:生成相位不拍)。
     pub snap_decode_stride: usize,
@@ -303,26 +300,27 @@ pub struct EngineKnobs {
     pub max_batch: usize,
     /// spec 快照轮回滚缓冲槽数(缺省 4;原 OWL_SNAP_MAX)
     pub snap_max: usize,
-    /// 消息边界快照总开关(`[pool].snap_msg_boundary`;缺省 false)
-    pub snap_msg_boundary: bool,
-    /// **可删图前锚点快照**(`[pool].snap_evict_anchor`;缺省 true)。
-    /// 开 = **每张可删图段起点**(页边界)强制切块并拍快照(删除发生时从
-    /// 「被删图之前」的 GDN 态续跑;同游程删后缀也能复用到前几张)。
-    /// 关 = 旧行为(尾删退回 fresh)。
-    pub snap_evict_anchor: bool,
+    /// 消息边界快照**恒开**（2026-11-16 键退休）：门 = 消费者存在
+    /// （`prefix_cache && snap_max>0`）+ 分隔串可解析；否则自动回退粗锚点。
+    /// **可删图前锚点快照恒开**（2026-11-16 键退休）：截图在 prompt 尾部时，
+    /// 预填充末快照的键落在被删页上 ⇒ 删除发生时幸存页没有边界快照，只能
+    /// 退回 fresh。锚点 = **每张可删图段起点**（同游程也各拍）；预填充必须在
+    /// 这些边界**强制切块**才能拍出 GDN 态（见 `prefill_step_chunk_msg` 的
+    /// `hard_snaps`）。旧图的锚点键是内容身份，前缀命中时不会重拍。
+    /// 门 = **消费者存在**（`image_evict && prefix_cache && snap_max>0`）。
     /// 消息开启标记文本覆盖(空 = 模型 `ChatFormat.im_open`)
     pub snap_msg_delim: String,
     /// 后续消息边界稀疏间隔(token)
     pub snap_msg_min_gap: usize,
-    /// 最近 K 条消息边界无条件保留（dense tail；`[pool].snap_msg_recent`）
+    /// 最近 K 条消息边界无条件保留（dense tail；`[store].snap_msg_recent`）
     pub snap_msg_recent: usize,
-    /// **每会话快照上限**（`[pool].snap_session_cap`；0 = 不限 = 旧行为）
+    /// **每会话快照上限**（`[store].snap_session_cap`；0 = 不限 = 旧行为）
     pub snap_session_cap: usize,
-    /// **结构档保留位**（`[pool].snap_structural_reserve`；仅 cap > 0 生效）
+    /// **结构档保留位**（`[store].snap_structural_reserve`；仅 cap > 0 生效）
     pub snap_structural_reserve: usize,
     /// 消息边界切块最小步长(token)
     pub snap_msg_min_span: usize,
-    /// **显存治理占比**(`[pool].vram_budget`;缺省 0.97;0 = 治理禁用)
+    /// **显存治理占比**(`[store].vram_budget`;缺省 0.97;0 = 治理禁用)
     pub vram_budget: f64,
     /// **单值总预留 MiB**(缺省 714;含图执行/warmup/碎片)。
     /// prefill 瞬态不在这里:由 `prefill_chunk` 代码派生。
@@ -396,10 +394,7 @@ impl Default for EngineKnobs {
             admission_on_full: owl_store::QueuePolicy::Reject,
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
-            slice_every: 0,
-            slice_tokens: 0,
             max_new_cap: 8192,
-            prefill_align_tail: true,
             snap_decode_stride: 1,
             prefill_shadow: false,
             fi_cuda_graph: false,
@@ -409,8 +404,6 @@ impl Default for EngineKnobs {
             gdn_slots: 8,
             max_batch: 1,
             snap_max: 4,
-            snap_msg_boundary: false,
-            snap_evict_anchor: true,
             snap_msg_delim: String::new(),
             snap_msg_min_gap: 2048,
             snap_msg_recent: 4,
@@ -592,7 +585,7 @@ impl EngineKnobs {
             self.snap_disk_mb,
             self.disk_dir,
             self.prefix_cache as u8,
-            self.prefill_align_tail as u8,
+            1, // prefill 末段页对齐（恒开；2026-11-16 键退休）
             self.snap_decode_stride,
             if self.kvmem_virtualization { "ON" } else { "off" },
             self.index_probe as u8,
@@ -668,7 +661,7 @@ impl EngineKnobs {
                     .filter(|p| !p.as_os_str().is_empty())
                     .map(|p| p.display().to_string()),
                 mtp_dir: cfg.model.mtp_dir.as_ref().map(std::path::PathBuf::from),
-                kv_quant: match cfg.spec.draft_kv_dtype {
+                kv_quant: match cfg.store.kv.draft_kv_dtype {
                     owl_shared::config::DraftKvDtype::Fp8 => owl_models::env::KvQuant::Fp8E4M3,
                     owl_shared::config::DraftKvDtype::Bf16 => owl_models::env::KvQuant::None,
                 },
@@ -693,20 +686,20 @@ impl EngineKnobs {
                 lookup_agree: cfg.spec.lookup_agree,
                 tp_draft: cfg.spec.tp_draft,
             },
-            prefix_cache: cfg.pool.prefix_cache,
+            prefix_cache: cfg.store.prefix_cache,
             bulk_drop_when_tier_full: cfg.kvmem.bulk_drop_when_tier_full,
             image_evict: cfg.vision.image_evict,
             gap_reserve: cfg.runtime.gap_reserve_tokens(),
             image_evict_pad: cfg.vision.image_evict_pad.clone(),
-            // 宿主层预算(S3-3;`[pool].host_cache_mb`)
-            host_cache_mb: cfg.pool.host_cache_mb,
-            disk_cache_mb: cfg.pool.disk_cache_mb,
-            snap_disk_mb: cfg.pool.snap_disk_mb,
-            checkpoint_max_mb: cfg.pool.checkpoint_max_mb,
-            checkpoint_min_gap_ms: cfg.pool.checkpoint_min_gap_ms,
-            disk_dir: cfg.pool.disk_dir.clone(),
-            // 状态腿宿主预算(S2;`[pool].snap_host_mb`;两条腿各有热区,别互相饿死)
-            snap_host_mb: cfg.pool.snap_host_mb,
+            // 宿主层预算(S3-3;`[store].host_cache_mb`)
+            host_cache_mb: cfg.store.host_cache_mb,
+            disk_cache_mb: cfg.store.disk_cache_mb,
+            snap_disk_mb: cfg.store.snap_disk_mb,
+            checkpoint_max_mb: cfg.store.checkpoint_max_mb,
+            checkpoint_min_gap_ms: cfg.store.checkpoint_min_gap_ms,
+            disk_dir: cfg.store.disk_dir.clone(),
+            // 状态腿宿主预算(S2;`[store].snap_host_mb`;两条腿各有热区,别互相饿死)
+            snap_host_mb: cfg.store.snap_host_mb,
             // ── KVMem 选择层(B 轴):全部来自 `[kvmem]`,零 env ──
             // 生产面(`select_decode`/`select_partial`/索引/预算/节奏)与
             // 诊断面(`coverage_probe`)是**两扇门**:低显存档只开前者。
@@ -768,27 +761,22 @@ impl EngineKnobs {
             ts_probe: cfg.kernel.ts_probe,
             // 配置单源（2026-11-05 F-03）：不再读 `OWL_MAX_ACTIVE_TURNS` /
             // `OWL_GDN_SLOTS`；旧 env 残留由 config-ux 迁移清单收尾。
-            gdn_slots: cfg.pool.gdn_slots,
+            gdn_slots: cfg.store.gdn.gdn_slots,
             // 合批上限:配置文件单源(`[runtime] max_batch`;env 不参与 ——
             // 用户裁决 2026-10-19:引擎行为参数只许配置文件显式声明)
             max_batch: cfg.runtime.max_batch,
-            slice_every: cfg.runtime.slice_every,
-            slice_tokens: cfg.runtime.slice_tokens,
             max_new_cap: cfg.runtime.max_new_cap,
-            prefill_align_tail: cfg.pool.prefill_align_tail,
-            snap_decode_stride: cfg.pool.snap_decode_stride,
+            snap_decode_stride: cfg.store.gdn.snap_decode_stride,
             // 快照池容量 = 配置单源（F-03；不再读 `OWL_SNAP_MAX`）
-            snap_max: cfg.pool.snap_max,
-            snap_msg_boundary: cfg.pool.snap_msg_boundary,
-            snap_evict_anchor: cfg.pool.snap_evict_anchor,
-            snap_msg_delim: cfg.pool.snap_msg_delim.clone(),
-            snap_msg_min_gap: cfg.pool.snap_msg_min_gap,
-            snap_msg_recent: cfg.pool.snap_msg_recent,
-            snap_session_cap: cfg.pool.snap_session_cap,
-            snap_structural_reserve: cfg.pool.snap_structural_reserve,
-            snap_msg_min_span: cfg.pool.snap_msg_min_span,
-            vram_budget: cfg.pool.vram_budget,
-            vram_reserve_mb: cfg.pool.vram_reserve_mb,
+            snap_max: cfg.store.gdn.snap_max,
+            snap_msg_delim: cfg.store.gdn.snap_msg_delim.clone(),
+            snap_msg_min_gap: cfg.store.gdn.snap_msg_min_gap,
+            snap_msg_recent: cfg.store.gdn.snap_msg_recent,
+            snap_session_cap: cfg.store.gdn.snap_session_cap,
+            snap_structural_reserve: cfg.store.gdn.snap_structural_reserve,
+            snap_msg_min_span: cfg.store.gdn.snap_msg_min_span,
+            vram_budget: cfg.store.vram_budget,
+            vram_reserve_mb: cfg.store.vram_reserve_mb,
             raw_completion: cfg.probes.raw_completion,
             sampler_enabled: cfg.sampling.mode == owl_shared::config::SamplerMode::Sampling,
             sampler: crate::sampler::SamplerCfg::from_sampling(&cfg.sampling),
@@ -812,7 +800,7 @@ pub struct DraftCfg {
     pub dflash2_dir: Option<String>,
     /// MTP 头覆盖路径(目录或 `.gguf`;None = 检查点自带)
     pub mtp_dir: Option<std::path::PathBuf>,
-    /// 草稿池 KV 存储(None = f16;Fp8E4M3 = 偷显存档;真源 = `[spec] draft_kv_dtype`)
+    /// 草稿池 KV 存储(None = f16;Fp8E4M3 = 偷显存档;真源 = `[store.kv] draft_kv_dtype`)
     pub kv_quant: owl_models::env::KvQuant,
     /// DFlash2 草稿环窗口(0 = auto = 检查点 sliding_window)
     pub draft_window: usize,
@@ -1486,7 +1474,7 @@ pub(crate) fn into_running<D: DeviceClient>(
         {
             owl_shared::log_warn!(
                 "store",
-                "[pool].checkpoint_max_mb={} 但 snap_max=0 ⇒ 只落 KV 不落 GDN 快照:                 重启后 `reuse_face` 找不到锚点,复用面会被裁到 0(等于没有跨重启召回)。                 混档请同时给 snap_max / snap_host_mb / snap_disk_mb。",
+                "[store].checkpoint_max_mb={} 但 snap_max=0 ⇒ 只落 KV 不落 GDN 快照:                 重启后 `reuse_face` 找不到锚点,复用面会被裁到 0(等于没有跨重启召回)。                 混档请同时给 snap_max / snap_host_mb / snap_disk_mb。",
                 cfg.knobs.checkpoint_max_mb
             );
         }
@@ -1498,7 +1486,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                 0 // 没快照池 ⇒ 状态腿盘分片无意义(不许静默吃掉配额)
             };
             // **状态腿盘预算按 world 记**(2026-11-01 收尾;盘上一条快照 =
-            // `snap_bytes × world`,TP2 就是两倍)。`[pool] snap_disk_mb` 给的是
+            // `snap_bytes × world`,TP2 就是两倍)。`[store.gdn] snap_disk_mb` 给的是
             // **字节预算**,而盘层按"一条快照 = 一个文件"落 ⇒ 能装几条 =
             // `预算 / (snap_bytes × world)`。旧口径按单 rank 估 ⇒ 512 MiB 只装 3 条、
             // 第 4 条起「超预算」逐条隔离(实测:锚点每轮在丢,跨重启召回被裁)。
@@ -1511,7 +1499,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                 let need_mb = (per_file.saturating_mul(cap)).div_ceil(1 << 20);
                 if per_file > 0 && n_fit == 0 {
                     return Err(owl_iface::contract::ModelError::Msg(format!(
-                        "[pool] snap_disk_mb={} 装不下**一条**快照:一条 = {}B(单 rank {} × world {})⇒ 至少要 {} MiB",
+                        "[store.gdn] snap_disk_mb={} 装不下**一条**快照:一条 = {}B(单 rank {} × world {})⇒ 至少要 {} MiB",
                         cfg.knobs.snap_disk_mb,
                         per_file,
                         dev.pool.snap_bytes(),
@@ -1750,16 +1738,14 @@ pub(crate) fn into_running<D: DeviceClient>(
     }
 
     // **消息边界快照的分隔符解析**(2026-10-24):
-    // 代码里不写死 `<|im_start|>`;优先用显式 `[pool].snap_msg_delim`,
+    // 代码里不写死 `<|im_start|>`;优先用显式 `[store].snap_msg_delim`,
     // 空串则回退模型声明 `ChatFormat.im_open`。这里 boot 期只 tokenize 一次,
     // 运行期扫 prompt_ids 时只传 `&[u32]`。
-    let msg_snap_on =
-        cfg.knobs.snap_msg_boundary && cfg.knobs.prefix_cache && cfg.knobs.snap_max > 0;
-    if cfg.knobs.snap_msg_boundary && !msg_snap_on {
-        owl_shared::log_warn!(
+    let msg_snap_on = cfg.knobs.prefix_cache && cfg.knobs.snap_max > 0;
+    if !msg_snap_on {
+        owl_shared::log_info!(
             "boot",
-            "snap_msg_boundary=true 但 prefix_cache/snap_max 无快照消费者 ⇒ \
-             消息边界快照关闭(不会切块、不会拍快照)"
+            "消息边界快照：无消费者（prefix_cache/snap_max=0）⇒ 不切块、不拍快照"
         );
     }
     let msg_open_ids = if msg_snap_on {
@@ -1771,20 +1757,20 @@ pub(crate) fn into_running<D: DeviceClient>(
         if delim.is_empty() {
             owl_shared::log_warn!(
                 "boot",
-                "snap_msg_boundary=true 但分割串为空且模型 ChatFormat.im_open 为空 \
+                "消息边界快照：分隔串为空且模型 ChatFormat.im_open 为空 \
                  ⇒ 回退旧的粗锚点策略(消息边界快照不生效)"
             );
             Vec::new()
         } else {
             let ids = tokenizer.try_encode(&delim).map_err(|e| {
                 ModelError::Msg(format!(
-                    "[pool].snap_msg_delim 无法 tokenize({delim:?}): {e}"
+                    "[store].snap_msg_delim 无法 tokenize({delim:?}): {e}"
                 ))
             })?;
             if ids.is_empty() {
                 owl_shared::log_warn!(
                     "boot",
-                    "snap_msg_boundary=true 但分割串 {delim:?} 编码为空 \
+                    "消息边界快照：分隔串 {delim:?} 编码为空 \
                      ⇒ 回退旧的粗锚点策略"
                 );
             } else {
@@ -2435,7 +2421,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
     if env.kv.quant == owl_models::env::KvQuant::Int8 {
         if dims.hd != 256 || env.kv.page != 32 || !env.kv.paged {
             return Err(ModelError::Msg(format!(
-                "[pool] kv_dtype=\"int8\" 只支持 hd=256/page=32/paged,得 hd={} page={} paged={}",
+                "[store.kv] kv_dtype=\"int8\" 只支持 hd=256/page=32/paged,得 hd={} page={} paged={}",
                 dims.hd, env.kv.page, env.kv.paged
             )));
         }
@@ -2445,7 +2431,7 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         // 不再拒绝 spec。
         if cfg.knobs.env.attn.force_naive_prefill {
             return Err(ModelError::Msg(
-                "[pool] kv_dtype=\"int8\" 不支持 force_naive_prefill(naive 路径按 f16/fp8 池寻址)".into(),
+                "[store.kv] kv_dtype=\"int8\" 不支持 force_naive_prefill(naive 路径按 f16/fp8 池寻址)".into(),
             ));
         }
         // index/coverage 的 host 回读、select_decode 的页表/视图、select_partial
@@ -2680,7 +2666,7 @@ pub(crate) fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
     // 不许静默:开了 partial 却没开 prefix_cache = 配置错,拒启。
     if cfg.knobs.select_partial && !cfg.knobs.prefix_cache {
         return Err(owl_iface::contract::ModelError::Msg(
-            "boot: `[kvmem].select_partial = true` 要求 `[pool].prefix_cache = true` \
+            "boot: `[kvmem].select_partial = true` 要求 `[store].prefix_cache = true` \
              —— 下沉靠「缓存树 + 会话双持」(refs==2)才能 decref 放给宿主;\
              关着 prefix_cache ⇒ 缓存树 cap=0 ⇒ 块永远 refs==1 ⇒ **一块都沉不下去** \
              (响亮拒:跑起来会白跑一趟还报 '不可沉 N 块')"

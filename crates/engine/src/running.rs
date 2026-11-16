@@ -225,7 +225,7 @@ pub(crate) struct BootCtx {
     pub(crate) cfg: EngineConfig,
     pub(crate) tok: Tokenizer,
     pub(crate) probes: StepProbes,
-    /// 消息开启标记的 token 序列（`[pool].snap_msg_delim` 或模型
+    /// 消息开启标记的 token 序列（`[store].snap_msg_delim` 或模型
     /// `ChatFormat.im_open` 在 boot 期 tokenize 的结果；只读）。
     pub(crate) msg_open_ids: Vec<u32>,
     /// boot 序号(metrics 打点命名空间;进程内自增,b1/b2…)
@@ -1430,11 +1430,10 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let (positions, positions_gap) =
             self.prompt_positions(session, &prompt_ids, &img_spans, deletion.as_ref())?;
-        // **消息边界快照点**(2026-10-24):页对齐 token offset，供
-        // `prefill_step_chunk_msg` 切块与 `capture_gdn_snap` 的 snap_keep
-        // 共用。`open_ids` 来自配置/模型声明，不在扫描函数里写死。
-        let msg_snaps = if self.boot.cfg.knobs.snap_msg_boundary
-            && self.boot.cfg.knobs.prefix_cache
+        // **消息边界快照点**(2026-10-24；2026-11-16 键退休 = **恒开**):页对齐
+        // token offset，供 `prefill_step_chunk_msg` 切块与 `capture_gdn_snap` 的
+        // snap_keep 共用。门 = 消费者存在；`open_ids` 来自配置/模型声明。
+        let msg_snaps = if self.boot.cfg.knobs.prefix_cache
             && self.dev.pool.geom.paged
             && self.dev.pool.snap_capacity() > 0
         {
@@ -1464,8 +1463,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         // fresh。锚点 = **每张可删图段起点**（同游程也各拍）；预填充必须在这些
         // 边界**强制切块**才能拍出 GDN 态（见 `prefill_step_chunk_msg` 的
         // `hard_snaps`）。旧图的锚点键是内容身份，前缀命中时不会重拍。
-        let evict_snaps: Vec<usize> = if self.boot.cfg.knobs.snap_evict_anchor
-            && self.boot.cfg.knobs.image_evict
+        // 2026-11-16 键退休 = **恒开**（门 = 消费者存在）。
+        let evict_snaps: Vec<usize> = if self.boot.cfg.knobs.image_evict
             && self.boot.cfg.knobs.prefix_cache
             && self.dev.pool.geom.paged
             && self.dev.pool.snap_capacity() > 0
@@ -3073,7 +3072,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 self.boot.cfg.prefill_chunk,
                 crate::engine::PREFILL_TAIL_MERGE,
                 Self::prefill_align_page(
-                    self.boot.cfg.knobs.prefill_align_tail,
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
@@ -3574,7 +3572,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     ///
     /// 与旧路径（`spill_kv_to_disk`）的区别只有**驱动条件**：
     /// - 旧 = 宿主压力票 ⇒ 宿主够大时永不落盘 ⇒ 重启后索引在、内容不在（召回=0）；
-    /// - 本 = **定期主动**（`[pool].checkpoint_max_mb` / `checkpoint_min_gap_ms`）。
+    /// - 本 = **定期主动**（`[store].checkpoint_max_mb` / `checkpoint_min_gap_ms`）。
     ///
     /// 三条纪律：
     /// 1. **复制语义**：设备块走只读 D2H（`plan_read_blocks`）后归还缓冲、不解绑；

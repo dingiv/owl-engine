@@ -165,7 +165,7 @@ pub(crate) struct PoolPlan {
     pub seq_tokens: usize,
     /// 池容量(token;**`pool_auto = true` 时本值被忽略**,按 `seq_tokens` 自动)
     pub pool_tokens: usize,
-    /// **池容量自动派生**(`[pool].pool_tokens` 未写;2026-10-21 用户令:
+    /// **池容量自动派生**(`[store].pool_tokens` 未写;2026-10-21 用户令:
     /// "池子一般不需要手动指定 —— 算出来、把最大 ctx 显示出来")。
     ///
     /// 自动档语义:**并发感知** —— 池 = `min(cap − transient, seq_tokens × 并发数)`;
@@ -2117,7 +2117,7 @@ impl<'a> AllocCtx<'a> {
         for (tag, q) in [("kv", plan.kv), ("draft_kv", plan.draft_kv)] {
             if q == owl_models::env::KvQuant::Fp8E5M2 {
                 return Err(owl_iface::contract::ModelError::Msg(format!(
-                    "{tag} = fp8-e5m2:本仓尚无 e5m2 核臂(只有 e4m3);请改 [pool] kv_dtype = \"fp8\" 或等臂接入"
+                    "{tag} = fp8-e5m2:本仓尚无 e5m2 核臂(只有 e4m3);请改 [store.kv] kv_dtype = \"fp8\" 或等臂接入"
                 )));
             }
         }
@@ -2404,7 +2404,7 @@ pub(crate) fn auto_pool_tokens(
     if seq_tokens > cap_tokens {
         if !overcommit {
             return Err(format!(
-                "[pool] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
+                "[store] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
                  本档 per_tok={}B。修法:降 [runtime].max_seq、降 per_tok\
                  (池 fp8 / 减草稿池)、或开 [kvmem] 超卖(select_decode+select_partial+pool_overcommit)。",
                 seq_tokens, cap_tokens, per_tok_bytes
@@ -2420,7 +2420,7 @@ pub(crate) fn auto_pool_tokens(
     let pool = target.min(usable).max(1);
     if pool < seq_tokens && !overcommit {
         return Err(format!(
-            "[pool] 并发自动池装不下单请求:max_seq={} > cap−瞬态={} \
+            "[store] 并发自动池装不下单请求:max_seq={} > cap−瞬态={} \
              (cap={} / 瞬态 {} MiB = {} tok)。修法:降 max_seq、\
              降 `prefill_chunk`、或开 [kvmem] 超卖。",
             seq_tokens, usable, cap_tokens, transient_mb, transient_tok

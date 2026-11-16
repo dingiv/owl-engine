@@ -261,7 +261,7 @@ implicit_session = true
 客户端标记只是一半，服务端必须满足：
 
 ```toml
-[pool]
+[store]
 image_evict = true
 prefix_cache = true
 # 删除后处理固定 leave-gap（不转 K、保留位置洞）

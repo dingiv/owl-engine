@@ -22,11 +22,11 @@ extends = [
 - 卡位只走 `[parallel]`；`device` 用 BDF / UUID / 名字子串，**禁 CUDA 序号**。
 - **实验变体一律用 `--set`，不新建入口档**（见下"唯二常驻档门"）。
 - **并发只有两个键，必须成组改**：
-  - `[pool] gdn_slots = N` —— **并发唯一真源**（2026-11-16：旧的
+  - `[store.gdn] gdn_slots = N` —— **并发唯一真源**（2026-11-16：旧的
     `[runtime] max_concurrency` 已删；服务面 permit 数与引擎活跃槽位上限都从它来）。
     每活跃 turn 一格 GDN 状态；`parts/pool/fp8.toml` 给的是 1，多并发档要在 leaf
     里显式覆盖；**0 = 拒启**（旧的"0 = 自动"已退休）。
-  - `[pool] snap_max`：**N=2 时用 6**（2026-11-06 双会话门实测：3 会丢空闲会话的尾锚点，
+  - `[store.gdn] snap_max`：**N=2 时用 6**（2026-11-06 双会话门实测：3 会丢空闲会话的尾锚点，
     下一轮命中 71.6% vs 期望 86%；4 仍偶发，6 稳定）。单并发 N=1 用 2。
     语义 = 每个活跃 turn 的 `last_snap` 各占一格且**受保护**，
     再留一格给"刚收口那条链的尾边界"）。
@@ -110,7 +110,7 @@ extends = [
 
 2026-10-25 生产档拉满（两档同形，硬件差异只留 max_seq/TP）：
 
-- `prefix_cache=true` + `snap_msg_boundary=true`；
+- `prefix_cache=true`（消息边界快照/删图锚点**恒开**，2026-11-16 键退休）；
 - 会话身份 = **内容身份**（pi 不发 session 键 ⇒ 引擎按 prompt 前缀认会话；
   2026-11-16 原始算法；旧 `implicit_session` 键已删）；
 - `image_evict=true`（最终方案 = **leave-gap**：删后不转 K、保留位置洞，
@@ -139,7 +139,7 @@ image_evict 的前缀块会被下沉到 host（`前缀有宿主占位 ⇒ 不吸
 # 临时变体（不再建文件；超过 ctx_max 会被 boot 响亮拒，不会静默夹）
 --set spec.depth=0 --set spec.lookup=false     # 关投机对照臂
 --set runtime.max_seq=63456                    # 全特性稳定点（默认）
---set runtime.max_seq=79872 --set pool.snap_max=1  # 更大 ctx 但 image_evict 可能失效
+--set runtime.max_seq=79872 --set store.gdn.snap_max=1  # 更大 ctx 但 image_evict 可能失效
 --set model.vision=false                       # 关视觉可换回更大 ctx（~104k）
 ```
 

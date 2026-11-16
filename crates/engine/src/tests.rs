@@ -228,7 +228,11 @@ async fn multi_active_decode_uses_selected_turn_gdn_row() {
 
     // 每次 pump 可能先吐 pending 事件（不调度）；循环到两 turn 都活跃且
     // prefill 完成（max_new 给大，避免提前终了）。
-    for _ in 0..12 {
+    //
+    // 拍数上界：相位时间片自决后，混合相位**先 decode 8 拍再插一片**
+    // （`SLICE_EVERY`）⇒ 第二人的两片 prefill 最坏 ≈ 2×(8+1) = 18 拍；
+    // 再留余量（旧 12 拍是"prefill 独占"时代的假设）。
+    for _ in 0..40 {
         running.pump().await.expect("pump");
         let ready = running.active_len() == 2
             && running
@@ -241,28 +245,45 @@ async fn multi_active_decode_uses_selected_turn_gdn_row() {
         }
     }
     assert_eq!(running.active_len(), 2, "两 turn 应都入活跃");
-    assert_eq!(running.turns.active[0].fed, running.turns.active[0].prompt_ids.len());
-    assert_eq!(running.turns.active[1].fed, running.turns.active[1].prompt_ids.len());
+    // `fed` 是 **KV 推进指针**（prefill chunk 与 decode 每步都 +1），不是
+    // "prefill 进度" ⇒ prefill 完的判据是 `fed ≥ prompt 长`（解码中的 turn
+    // 会继续领先）。旧断言用 `==` 只在"prefill 独占"时代成立。
+    assert!(running.turns.active[0].fed >= running.turns.active[0].prompt_ids.len());
+    assert!(running.turns.active[1].fed >= running.turns.active[1].prompt_ids.len());
 
     // 轮转选中第二个 turn。**只抬 depth 到 1 用于本次 `schedule`**：让调度
     // 绕开批 decode 门（批门要求 depth==0）；不执行本步，故不需要 spec 缓冲。
+    // 相位游标在 `PhaseSched` 内部（`turns.rr` 已删），其位置取决于前面的
+    // prefill 拍 ⇒ 不假设"第几拍选中谁"：连拍几次，要求**每一拍**的
+    // `gdn_slot` 都等于本拍执行者的行，且至少轮到过一次第二个 turn。
     running.dev.spec_rt.depth = 1;
-    running.turns.rr = 1;
-    let out = running.schedule().await.expect("schedule");
-    match out {
-        SchedulerOutput::Step {
-            action: StepAction::Decode { gdn_slot, .. },
-            ..
-        } => {
-            let want = running.turns.active[1].gdn_slot;
-            let other = running.turns.active[0].gdn_slot;
-            assert_eq!(
-                gdn_slot, want,
-                "decode 应使用选中 turn 的 GDN 行（F-16）：got {gdn_slot}, want {want}, other {other}"
-            );
+    let mut picked_second = false;
+    for _ in 0..4 {
+        let out = running.schedule().await.expect("schedule");
+        let executing = running.turns.executing.expect("单 turn 路必须有执行者");
+        let idx = running
+            .turns
+            .active
+            .iter()
+            .position(|a| a.id == executing)
+            .expect("executing 必须在册");
+        let want = running.turns.active[idx].gdn_slot;
+        let other = running.turns.active[1 - idx].gdn_slot;
+        match out {
+            SchedulerOutput::Step {
+                action: StepAction::Decode { gdn_slot, .. },
+                ..
+            } => {
+                assert_eq!(
+                    gdn_slot, want,
+                    "decode 应使用选中 turn 的 GDN 行（F-16）：got {gdn_slot}, want {want}, other {other}"
+                );
+                picked_second |= idx == 1;
+            }
+            _ => panic!("应走单 turn decode 路径"),
         }
-        _ => panic!("应走单 turn decode 路径"),
     }
+    assert!(picked_second, "round-robin 应在 4 拍内轮到第二个 turn");
 }
 
 /// **会话身份 = 内容身份（一）**：原样重发 ⇒ 认到同一条会话，且**内容树**

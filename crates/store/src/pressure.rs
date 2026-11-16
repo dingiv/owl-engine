@@ -55,7 +55,7 @@ pub struct PressureSignals {
     pub disk_snap_free_slots: usize,
     /// 最紧一张卡的驱动 free（TP2 取两 rank 的 min）。
     pub driver_free_bytes: u64,
-    /// boot 时为驱动的硬墙留的预留（`[pool] vram_reserve_mb`）。
+    /// boot 时为驱动的硬墙留的预留（`[store] vram_reserve_mb`）。
     pub reserve_bytes: u64,
     // 以上字段全是**纯 host 账**，引擎每拍读一次；本结构零 I/O。
 }

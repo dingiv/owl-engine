@@ -569,7 +569,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 self.boot.cfg.prefill_chunk,
                 crate::engine::PREFILL_TAIL_MERGE,
                 Self::prefill_align_page(
-                    self.boot.cfg.knobs.prefill_align_tail,
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
@@ -674,7 +673,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 self.boot.cfg.prefill_chunk,
                 crate::engine::PREFILL_TAIL_MERGE,
                 Self::prefill_align_page(
-                    self.boot.cfg.knobs.prefill_align_tail,
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),

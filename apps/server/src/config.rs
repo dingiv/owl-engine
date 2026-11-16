@@ -528,7 +528,7 @@ impl ServerConfig {
             tp_comm: cfg.parallel.tp_comm,
             tp_vocab_split: cfg.parallel.tp_vocab_split,
             tp_ar: cfg.parallel.tp_ar,
-            max_concurrency: cfg.pool.gdn_slots,
+            max_concurrency: cfg.store.gdn.gdn_slots,
             max_batch: cfg.runtime.max_batch,
             perf_dump: None,
             perf_level: cfg.probes.perf_level.to_u8(),
@@ -581,9 +581,9 @@ pub fn summary_line(r: &ResolvedConfig) -> Option<String> {
         gib(e.used_bytes()),
         gib(e.total_bytes),
         gib(e.total_bytes.saturating_sub(e.used_bytes())),
-        if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
+        if c.store.prefix_cache { format!("snap{}", c.store.gdn.snap_max) } else { "off".into() },
         if c.spec.depth > 0 { format!("dflash{}", c.spec.depth) } else { "off".into() },
-        c.pool.gdn_slots,
+        c.store.gdn.gdn_slots,
     ))
 }
 
@@ -626,10 +626,10 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             c.runtime.max_seq,
             c.runtime.prefill_chunk,
             owl_engine::PREFILL_TAIL_MERGE,
-            c.pool.gdn_slots,
+            c.store.gdn.gdn_slots,
             c.runtime.max_batch,
-            c.pool.gdn_slots,
-            c.pool.kv_dtype,
+            c.store.gdn.gdn_slots,
+            c.store.kv.kv_dtype,
         ));
         if let Some(e) = r.estimate() {
             out.push_str(&format!(
@@ -675,10 +675,10 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
             c.runtime.max_seq,
             c.runtime.prefill_chunk,
             owl_engine::PREFILL_TAIL_MERGE,
-            c.pool.gdn_slots,
+            c.store.gdn.gdn_slots,
             c.runtime.max_batch,
-            c.pool.gdn_slots,
-            c.pool.kv_dtype,
+            c.store.gdn.gdn_slots,
+            c.store.kv.kv_dtype,
         ));
     }
 
@@ -815,7 +815,7 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
         if c.kernel.gdn_chunked { "chunked" } else { "scalar" },
         c.spec.depth,
         c.spec.draft,
-        if c.pool.prefix_cache { format!("snap{}", c.pool.snap_max) } else { "off".into() },
+        if c.store.prefix_cache { format!("snap{}", c.store.gdn.snap_max) } else { "off".into() },
         c.runtime.max_batch,
         if c.vision.enabled { "on" } else { "off" },
     ));

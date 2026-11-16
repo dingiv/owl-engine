@@ -137,7 +137,7 @@ fn paged_decode_v2_knhd_parity() {
                 }
             }
         }
-        eprintln!("[pool] classic 池回读错位 {mism}");
+        eprintln!("[store] classic 池回读错位 {mism}");
         let mut d_kn = unsafe { stream.alloc::<u16>(kc_n.len()) }.unwrap();
         stream.memcpy_htod(&kc_n, &mut d_kn).unwrap();
         stream.memcpy_dtoh(&d_kn, &mut back).unwrap();
@@ -152,7 +152,7 @@ fn paged_decode_v2_knhd_parity() {
                 }
             }
         }
-        eprintln!("[pool] knhd 池回读错位 {mism2}");
+        eprintln!("[store] knhd 池回读错位 {mism2}");
     }
 
     let run = |name: &str, kcp: &[u16], vcp: &[u16], kstride: i32| -> Vec<u16> {

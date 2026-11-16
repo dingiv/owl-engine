@@ -300,13 +300,13 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
     // 卡锁 / 选卡 / 单卡与 TP 双 rank 并行装载 / 图捕获 / 泵循环 / 卡锁释放
     // 全部由 `owl_engine::EngineService::boot` 在**引擎自己的 OS 线程**内完成
     //（与 `owl-cuda` 的 `GpuServer` 同形）。server 这一步只搬配置字段。
-    // 并发上限的**唯一真源 = `pool.gdn_slots`**（2026-11-16：`[runtime]
+    // 并发上限的**唯一真源 = `store.gdn.gdn_slots`**（2026-11-16：`[runtime]
     // max_concurrency` 已删，permit 数与引擎槽位上限都从这里出）。
     let max_concurrency = config.max_concurrency;
     let max_batch = config.max_batch;
     owl_shared::log_info!(
         "boot",
-        "并发上限 {max_concurrency}(= pool.gdn_slots;本地服务,排队超出请求)"
+        "并发上限 {max_concurrency}(= store.gdn.gdn_slots;本地服务,排队超出请求)"
     );
     let (bind, model_name) = (config.bind.clone(), config.model_name.clone());
     // 请求原文落盘目录（诊断开关；空 = 关）。写入失败 = 启动失败，
@@ -371,7 +371,7 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
     };
     let client = service.client();
 
-    // 并发闸门（permit = `pool.gdn_slots`；在跑 + 排队 ≤ 它）。
+    // 并发闸门（permit = `store.gdn.gdn_slots`；在跑 + 排队 ≤ 它）。
     // 两者同一口径是**类型级**保证：`max_concurrency` 就是 `gdn_slots` 的投影，
     // 不再有"配错会污染状态格"的组合（旧的 `gdn_slots ≥ max_concurrency` 门已删）。
     let concurrency_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
@@ -389,7 +389,7 @@ async fn async_main(workers: usize) -> std::process::ExitCode {
             owl_shared::log_warn!(
                 "boot",
                 "合批上限 {max_batch} > 并发上限 {max_concurrency} ⇒ 批位闲置(服务面进不来那么多) \
-                 —— 想让批吃满,`pool.gdn_slots` 应 ≥ `runtime.max_batch`"
+                 —— 想让批吃满,`store.gdn.gdn_slots` 应 ≥ `runtime.max_batch`"
             );
         }
     }

@@ -62,7 +62,7 @@ max_seq = 262144
 # - ⚠️ 批路当前只覆盖 **bare decode**;DFlash2 的 spec verify 批化是下一刀
 #   (多活跃时 spec 轮的草稿 KV 已按会话隔离,不再互踩)。要现在拿真批吞吐:
 #   `--set spec.depth=0 --set spec.lookup=false`(文本并发档)。
-# 并发唯一真源 = `pool.gdn_slots`(2026-11-16：`runtime.max_concurrency` 已删)
+# 并发唯一真源 = `store.gdn.gdn_slots`(2026-11-16：`runtime.max_concurrency` 已删)
 max_batch = 2
 # 3080 TP2 冷 prefill A/B（2026-10-25，15K/25K/37K）:
 #   512  = 1486 / 1446 / 1359 t/s
@@ -117,7 +117,18 @@ tp_draft = true
 # 与 pi 源 BF16 草稿同源(incoai),1.19G/TP2 = 0.6G/卡。
 draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 
-[pool]
+[store]
+snap_host_mb = 3072
+host_cache_mb = 10240
+# 2026-11-16:单值总预留 = 256(旧 reserve) + 320(图执行) + 138(warmup) = 714。
+# 2×112k 双会话实测通过(池 340,384 tok);图执行实测 +430MiB。
+# prefill 瞬态不再配置:代码按 `prefill_chunk` 派生(2048 ⇒ 896MiB)。
+vram_reserve_mb = 714
+# 图像前缀无感删除(leave-gap:删后不转 K、保留位置洞)。
+# 消息边界快照 / 删图锚点快照 = 恒开(2026-11-16 键退休);pi 每轮重发全历史,
+# delim/gap/span 走 full.toml 默认。锚点把「被删图之前」的复用面兜住。
+
+[store.gdn]
 # 生产级默认:关键特性全开(非"看着省一点"的保守档)。
 # TP2 双卡各 20G:快照 2 槽 + 宿主 3G(pi agent 无 session,
 # 前缀缓存必须开;宿主预算避免 Transient 快照顶掉 durable 边界)。
@@ -142,19 +153,6 @@ snap_structural_reserve = 4
 # GDN 状态格 = 每活跃 turn 一格 = **并发唯一真源**(服务面 permit 也用它),
 # 否则拒启(`parts/pool/fp8.toml` 里是 1 ⇒ 本档显式覆盖成 2)。
 gdn_slots = 2
-snap_host_mb = 3072
-host_cache_mb = 10240
-# 2026-11-16:单值总预留 = 256(旧 reserve) + 320(图执行) + 138(warmup) = 714。
-# 2×112k 双会话实测通过(池 340,384 tok);图执行实测 +430MiB。
-# prefill 瞬态不再配置:代码按 `prefill_chunk` 派生(2048 ⇒ 896MiB)。
-vram_reserve_mb = 714
-# 图像前缀无感删除(leave-gap:删后不转 K、保留位置洞)。
-# 消息边界快照:pi 每轮重发全历史;delim/gap/span 走 full.toml 默认。
-snap_msg_boundary = true
-# 截图在 prompt 尾部时的删除锚点(2026-11-13):每张可删图段起点一张快照,
-# 把「被删图之前」的复用面兜住(否则尾删只能退回 fresh;同游程删后缀也覆盖)。
-snap_evict_anchor = true
-
 [vision]
 # 图像前缀无感删除(leave-gap)。
 image_evict = true

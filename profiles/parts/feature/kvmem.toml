@@ -1,13 +1,14 @@
 # 特性组件：KVMem 选择层 + 部分驻留 + host 下沉。
 # 具体 workspace / max_seq / 池大小由 leaf 用 --set 或少量键定。
-[pool]
+[store]
 prefix_cache = true
-snap_max = 0
 host_cache_mb = 10240
 snap_host_mb = 1024
 vram_reserve_mb = 1482
 
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
+[store.gdn]
+snap_max = 0
 [kvmem]
 select_decode = true
 select_partial = true

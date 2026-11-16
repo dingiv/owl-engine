@@ -540,8 +540,6 @@ pub(crate) struct TurnLedger {
     /// 单 turn 执行码(草稿/验实/快照…)经 `active()/active_mut()` 读它 ——
     /// 多活跃时未选定 = 显式错误,不许猜。
     pub(crate) executing: Option<u64>,
-    /// 多活跃单 turn 相位的 round-robin 游标(公平:不让首 turn 独占)
-    pub(crate) rr: usize,
     /// turn id 发号器(进程内单调)
     pub(crate) next_id: u64,
     /// 多 token 轮的事件队列(pump 逐个出;SpecRound 一轮 m+1 token)
@@ -553,7 +551,8 @@ pub(crate) struct TurnLedger {
     pub(crate) admit_wait: Option<(u64, std::time::Instant)>,
     /// 最近终了 turn 的 prompt token 数(诊断/无卡门校准;不参与语义)。
     pub(crate) last_prompt_len: Option<usize>,
-    /// **相位状态机**(时间片;`[runtime] slice_every>0` 才参与决策)
+    /// **相位状态机**(时间片节奏 = `sched_policy::SLICE_EVERY` 内核常数；
+    /// round-robin 游标也在这里，不再有第二份 `turns.rr`)
     pub(crate) phase: crate::sched_policy::PhaseSched,
     /// **准入状态机**(容量/会话/退避;起 turn 前唯一放行口)
     pub(crate) admission: crate::sched_policy::Admission,
@@ -654,7 +653,6 @@ impl TurnLedger {
             queue: VecDeque::new(),
             active: Vec::new(),
             executing: None,
-            rr: 0,
             next_id: 1,
             pending_events: VecDeque::new(),
             admit_wait: None,

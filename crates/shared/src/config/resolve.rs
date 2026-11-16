@@ -22,7 +22,7 @@ use super::intent::{
 };
 use super::memory::{self, MemoryEstimate, MemoryInputs, STABILITY_MARGIN_BYTES};
 
-/// 逐键来源表(键 = 点路径,如 `pool.prefill_chunk`)
+/// 逐键来源表(键 = 点路径,如 `store.prefill_chunk`)
 pub type Origins = BTreeMap<String, Origin>;
 
 /// 一个低层键的来源
@@ -151,23 +151,23 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     match intent.goal {
         Goal::MaxContext => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=max-context:桶上界 1024");
-            b.set("pool.vram_budget", 0.99f64.into(), "goal=max-context:贴顶");
-            b.set("pool.vram_reserve_mb", 714i64.into(), "goal=max-context:总预留(含图/warmup/碎片)");
+            b.set("store.vram_budget", 0.99f64.into(), "goal=max-context:贴顶");
+            b.set("store.vram_reserve_mb", 714i64.into(), "goal=max-context:总预留(含图/warmup/碎片)");
         }
         Goal::MaxSpeed => {
             b.set("runtime.prefill_chunk", 1024i64.into(), "goal=max-speed:大块摊薄固定税");
-            b.set("pool.vram_budget", 0.99f64.into(), "goal=max-speed:贴顶");
-            b.set("pool.vram_reserve_mb", 970i64.into(), "goal=max-speed:总预留(含图/warmup/碎片)");
+            b.set("store.vram_budget", 0.99f64.into(), "goal=max-speed:贴顶");
+            b.set("store.vram_reserve_mb", 970i64.into(), "goal=max-speed:总预留(含图/warmup/碎片)");
         }
         Goal::Balanced => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=balanced");
-            b.set("pool.vram_budget", 0.97f64.into(), "goal=balanced");
-            b.set("pool.vram_reserve_mb", 970i64.into(), "goal=balanced:总预留");
+            b.set("store.vram_budget", 0.97f64.into(), "goal=balanced");
+            b.set("store.vram_reserve_mb", 970i64.into(), "goal=balanced:总预留");
         }
         Goal::LowMemory => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=low-memory:小激活面");
-            b.set("pool.vram_budget", 0.99f64.into(), "goal=low-memory");
-            b.set("pool.vram_reserve_mb", 970i64.into(), "goal=low-memory:总预留");
+            b.set("store.vram_budget", 0.99f64.into(), "goal=low-memory");
+            b.set("store.vram_reserve_mb", 970i64.into(), "goal=low-memory:总预留");
         }
     }
 
@@ -190,9 +190,9 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
              非超卖档池按上下文×{c} 计"
         ));
     }
-    // 并发唯一真源 = `pool.gdn_slots`（2026-11-16：`[runtime] max_concurrency` 已删；
+    // 并发唯一真源 = `store.gdn.gdn_slots`（2026-11-16：`[runtime] max_concurrency` 已删；
     // 服务面 permit 数与引擎活跃槽位上限都从它来）
-    b.set("pool.gdn_slots", (c as i64).into(), "intent.concurrency → GDN 状态格 = 并发唯一真源");
+    b.set("store.gdn.gdn_slots", (c as i64).into(), "intent.concurrency → GDN 状态格 = 并发唯一真源");
     b.set("runtime.max_batch", (max_batch as i64).into(), "intent.concurrency → 合批上限(≤8)");
 
     match intent.spec {
@@ -218,13 +218,13 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     match intent.kv {
         KvIntent::Fp8 => {
             b.set(
-                "pool.kv_dtype",
+                "store.kv.kv_dtype",
                 "fp8".into(),
                 "intent.kv = fp8(容量 ×2;FI 读核前提)",
             );
         }
         KvIntent::F16 => {
-            b.set("pool.kv_dtype", "f16".into(), "intent.kv = f16");
+            b.set("store.kv.kv_dtype", "f16".into(), "intent.kv = f16");
         }
     }
 
@@ -239,9 +239,9 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
                 );
             }
             b.set("kvmem.pool_overcommit", false.into(), "intent.kvmem = off");
-            b.set("pool.host_cache_mb", 0i64.into(), "kvmem=off:无宿主 KV 腿");
-            b.set("pool.disk_cache_mb", 0i64.into(), "kvmem=off:无磁盘 KV 腿");
-            b.set("pool.snap_disk_mb", 0i64.into(), "kvmem=off:无磁盘状态腿");
+            b.set("store.host_cache_mb", 0i64.into(), "kvmem=off:无宿主 KV 腿");
+            b.set("store.disk_cache_mb", 0i64.into(), "kvmem=off:无磁盘 KV 腿");
+            b.set("store.snap_disk_mb", 0i64.into(), "kvmem=off:无磁盘状态腿");
         }
         KvmemIntent::Overcommit => {
             for k in ["select_decode", "select_partial", "index"] {
@@ -253,8 +253,8 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             }
             b.set("kvmem.pool_overcommit", true.into(), "intent.kvmem = overcommit");
             b.set("kvmem.workspace_per_req", 1024i64.into(), "kvmem=overcommit:每 turn 工作集");
-            b.set("pool.host_cache_mb", 4096i64.into(), "kvmem=overcommit:宿主 KV 腿");
-            b.set("pool.snap_host_mb", 2048i64.into(), "kvmem=overcommit:宿主状态腿");
+            b.set("store.host_cache_mb", 4096i64.into(), "kvmem=overcommit:宿主 KV 腿");
+            b.set("store.snap_host_mb", 2048i64.into(), "kvmem=overcommit:宿主状态腿");
         }
     }
 
@@ -319,30 +319,30 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     };
     match reuse {
         ReuseIntent::Off => {
-            b.set("pool.prefix_cache", false.into(), "reuse=off:单会话最大上下文档");
-            b.set("pool.snap_max", 0i64.into(), "reuse=off:无消费方");
-            b.set("pool.snap_host_mb", 0i64.into(), "reuse=off");
-            b.set("pool.host_cache_mb", 0i64.into(), "reuse=off");
+            b.set("store.prefix_cache", false.into(), "reuse=off:单会话最大上下文档");
+            b.set("store.gdn.snap_max", 0i64.into(), "reuse=off:无消费方");
+            b.set("store.snap_host_mb", 0i64.into(), "reuse=off");
+            b.set("store.host_cache_mb", 0i64.into(), "reuse=off");
         }
         ReuseIntent::Session => {
-            b.set("pool.prefix_cache", true.into(), "reuse=session");
-            b.set("pool.snap_max", 1i64.into(), "reuse=session:1 条边界快照");
-                        b.set("pool.snap_host_mb", 1024i64.into(), "reuse=session:状态腿下沉");
+            b.set("store.prefix_cache", true.into(), "reuse=session");
+            b.set("store.gdn.snap_max", 1i64.into(), "reuse=session:1 条边界快照");
+                        b.set("store.snap_host_mb", 1024i64.into(), "reuse=session:状态腿下沉");
         }
         ReuseIntent::Global => {
-            b.set("pool.prefix_cache", true.into(), "reuse=global");
-            b.set("pool.snap_max", 4i64.into(), "reuse=global:4 条快照(跨会话)");
-                        b.set("pool.snap_host_mb", 3072i64.into(), "reuse=global:状态腿下沉");
-            b.set("pool.host_cache_mb", 4096i64.into(), "reuse=global:KV 宿主腿");
+            b.set("store.prefix_cache", true.into(), "reuse=global");
+            b.set("store.gdn.snap_max", 4i64.into(), "reuse=global:4 条快照(跨会话)");
+                        b.set("store.snap_host_mb", 3072i64.into(), "reuse=global:状态腿下沉");
+            b.set("store.host_cache_mb", 4096i64.into(), "reuse=global:KV 宿主腿");
         }
     }
     // 超卖档强制前缀缓存(否则 select_* 永远不出洞 ⇒ 池装不下就 Exhausted)
     if overcommit {
-        if !get_bool(value, "pool.prefix_cache").unwrap_or(false) {
-            b.set("pool.prefix_cache", true.into(), "kvmem=overcommit:虚拟化前提");
+        if !get_bool(value, "store.prefix_cache").unwrap_or(false) {
+            b.set("store.prefix_cache", true.into(), "kvmem=overcommit:虚拟化前提");
         }
-        if get_usize(value, "pool.snap_max").unwrap_or(0) == 0 {
-            b.set("pool.snap_max", 1i64.into(), "kvmem=overcommit:前缀复用需要快照");
+        if get_usize(value, "store.gdn.snap_max").unwrap_or(0) == 0 {
+            b.set("store.gdn.snap_max", 1i64.into(), "kvmem=overcommit:前缀复用需要快照");
         }
     }
 
@@ -365,17 +365,17 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     );
     let inp = MemoryInputs {
         total_bytes: hw.total_bytes,
-        vram_budget: get_f64(&out, "pool.vram_budget").unwrap_or(0.97),
-        reserve_bytes: (get_usize(&out, "pool.vram_reserve_mb").unwrap_or(714) as u64) << 20,
+        vram_budget: get_f64(&out, "store.vram_budget").unwrap_or(0.97),
+        reserve_bytes: (get_usize(&out, "store.vram_reserve_mb").unwrap_or(714) as u64) << 20,
         model,
         spec_dflash: intent.spec == SpecIntent::Dflash,
         // 内存模型只关心"每元素几字节"——直接给字节数,不再用布尔表达格式。
-        kv_bytes_per_elem: match get_str(&out, "pool.kv_dtype").unwrap_or("f16") {
+        kv_bytes_per_elem: match get_str(&out, "store.kv.kv_dtype").unwrap_or("f16") {
             "fp8" | "int8" => 1,
             _ => 2,
         },
-        gdn_slots: get_usize(&out, "pool.gdn_slots").unwrap_or(8),
-        snap_max: get_usize(&out, "pool.snap_max").unwrap_or(4),
+        gdn_slots: get_usize(&out, "store.gdn.gdn_slots").unwrap_or(8),
+        snap_max: get_usize(&out, "store.gdn.snap_max").unwrap_or(4),
         sessions: c,
         tp_world: if tp { 2 } else { 1 },
         vision: get_bool(&out, "vision.enabled").unwrap_or(false),
@@ -693,19 +693,19 @@ mode = "greedy"
 
         // 上下文/并发/预填充
         assert_eq!(c.runtime.max_seq, 143_360, "context=max ⇒ 合并预留后的模型上限");
-        assert_eq!(c.pool.gdn_slots, 1, "并发唯一真源 = gdn_slots");
+        assert_eq!(c.store.gdn.gdn_slots, 1, "并发唯一真源 = gdn_slots");
         assert_eq!(c.runtime.max_batch, 1);
         assert_eq!(c.runtime.prefill_chunk, 512);
 
         // 复用关(reuse=off ⇒ 快照/宿主/前缀缓存全零)
-        assert_eq!(c.pool.snap_max, 0, "reuse=off ⇒ 快照池关");
-        assert_eq!(c.pool.host_cache_mb, 0, "reuse=off ⇒ KV 宿主层关");
-        assert_eq!(c.pool.snap_host_mb, 0, "reuse=off ⇒ 快照宿主层关");
-        assert!(!c.pool.prefix_cache, "reuse=off ⇒ 前缀缓存关");
-        assert_eq!(c.pool.gdn_slots, 1);
-        assert_eq!(c.pool.kv_dtype, super::super::KvDtype::Fp8, "kv=fp8");
-        assert_eq!(c.pool.vram_budget, 0.99);
-        assert_eq!(c.pool.vram_reserve_mb, 714);
+        assert_eq!(c.store.gdn.snap_max, 0, "reuse=off ⇒ 快照池关");
+        assert_eq!(c.store.host_cache_mb, 0, "reuse=off ⇒ KV 宿主层关");
+        assert_eq!(c.store.snap_host_mb, 0, "reuse=off ⇒ 快照宿主层关");
+        assert!(!c.store.prefix_cache, "reuse=off ⇒ 前缀缓存关");
+        assert_eq!(c.store.gdn.gdn_slots, 1);
+        assert_eq!(c.store.kv.kv_dtype, super::super::KvDtype::Fp8, "kv=fp8");
+        assert_eq!(c.store.vram_budget, 0.99);
+        assert_eq!(c.store.vram_reserve_mb, 714);
 
         // 投机关(spec=off)
         assert_eq!(c.spec.depth, 0, "spec=off ⇒ 深度 0");
@@ -780,7 +780,7 @@ concurrency = 2
 "#,
         );
         assert_eq!(get_usize(&v, "runtime.max_seq"), Some(32_768));
-        assert_eq!(get_usize(&v, "pool.gdn_slots"), Some(2));
+        assert_eq!(get_usize(&v, "store.gdn.gdn_slots"), Some(2));
         assert_eq!(get_usize(&v, "runtime.max_batch"), Some(2));
     }
 
@@ -851,7 +851,7 @@ graphs = "auto"
     /// 旧档(无 intent)零变化:apply 返回 None 且不增删键
     #[test]
     fn legacy_config_is_untouched() {
-        let src = "[runtime]\nmax_seq = 4096\n[pool]\ngdn_slots = 2\n";
+        let src = "[runtime]\nmax_seq = 4096\n[store.gdn]\ngdn_slots = 2\n";
         let mut v: Value = toml::from_str(src).expect("toml");
         let before = v.clone();
         let mut origins = Origins::new();
@@ -875,7 +875,7 @@ kvmem = "overcommit"
         );
         let ctx = get_usize(&v, "runtime.max_seq").expect("ctx");
         assert_eq!(ctx, 262_144, "超卖档逻辑上下文可到模型上限");
-        assert_eq!(get_bool(&v, "pool.prefix_cache"), Some(true));
+        assert_eq!(get_bool(&v, "store.prefix_cache"), Some(true));
         assert_eq!(get_bool(&v, "kvmem.select_decode"), Some(true));
         assert_eq!(get_bool(&v, "kvmem.pool_overcommit"), Some(true));
         // 选择层档不得建 FI 桶图

@@ -784,7 +784,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ⑥ fold(尾部:图发射异步,restore 单命令;下一轮 verify 流序
         // 排其后,GPU ~1ms 藏于前端)
         //
-        // **轮内页边界快照**(§9.1(6)a;`[pool] snap_decode_stride`):本轮提交
+        // **轮内页边界快照**(§9.1(6)a;`[store.gdn] snap_decode_stride`):本轮提交
         // `(pos, pos+m]` 跨过页边界 b ⇒ 先把池态卷到 state@b 拍一张,再卷到
         // state@fed —— 这样生成相位的每个页边界都有快照(旧状:只有 prefill 段有
         // ⇒ 短 prompt 的尾部复用面受限于 prompt 里最后一个整页)。

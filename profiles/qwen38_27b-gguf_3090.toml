@@ -62,9 +62,7 @@ depth = 7
 draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 lookup = true
 
-[pool]
-# snap1 + reserve256:给 2048 块的瞬态激活留余量(见 max_seq 注)
-snap_max = 1
+[store]
 prefix_cache = true
 vram_reserve_mb = 714
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
@@ -73,12 +71,13 @@ host_cache_mb = 10240
 # store 的「块已在宿主层」不变量(实测一次,同 2026-10-24 粘性毒化案族)。
 # 只留设备侧 1 槽:边界快照被换掉就是丢了(单会话 + 活链前缀缓存够用)。
 snap_host_mb = 0
-# agent 消息边界快照(delim 空 = 模型 ChatFormat.im_open)
-snap_msg_boundary = true
+[store.gdn]
+# snap1 + reserve256:给 2048 块的瞬态激活留余量(见 max_seq 注)
+snap_max = 1
+# agent 消息边界快照 = 恒开(2026-11-16 键退休;delim 空 = 模型 ChatFormat.im_open)
 snap_msg_delim = ""
 snap_msg_min_gap = 2048
 snap_msg_min_span = 0
-
 [vision]
 enabled = true
 path = "../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"

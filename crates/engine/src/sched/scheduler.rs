@@ -282,12 +282,10 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// 分块决策(scheduler) / kvmem 准入估算(scheduler) / 池需求估算(running) /
     /// 边界预测(phases) —— 曾经各传各的(一处门了、三处没门 ⇒ 估算与真调度
     /// 打架),现收成这一处。
-    pub(crate) fn prefill_align_page(
-        align_tail: bool,
-        prefix_cache: bool,
-        pool_page: usize,
-    ) -> usize {
-        if align_tail && prefix_cache {
+    pub(crate) fn prefill_align_page(prefix_cache: bool, pool_page: usize) -> usize {
+        // 末段页对齐**恒开**（2026-11-16 删键）；仍受 prefix_cache 门控 ——
+        // 没有前缀复用时对齐只会多切一刀，没有消费者。
+        if prefix_cache {
             pool_page
         } else {
             0
@@ -349,8 +347,8 @@ impl<D: DeviceClient> RunningEngine<D> {
         //
         // 对齐的代价 = 本轮多一个 <page 的固定税块（≈90ms）；对“一次请求
         // 只问一句”的纯 chat 是净亏，但对 agent 追问（每轮都会续写）是
-        // 必须的锚点。配置侧无需旋钮：`prefill_align_page` 已经由
-        // `prefill_align_tail && prefix_cache` 门控，关缓存档不受影响。
+        // 必须的锚点。配置侧无需旋钮（2026-11-16 键已删）：末段页对齐**恒开**，
+        // 由 `prefill_align_page` 的 `prefix_cache` 门控，关缓存档不受影响。
         let small_tail =
             fed > 0 && step == remaining && remaining <= MSG_SPLIT_MIN_REMAINING;
         if page > 0 && step == remaining && !(fed + step).is_multiple_of(page) {
@@ -387,7 +385,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         Some(step)
     }
 
-    /// **本轮该拍的页边界**(纯函数;`[pool] snap_decode_stride`;§9.1(6)a)。
+    /// **本轮该拍的页边界**(纯函数;`[store.gdn] snap_decode_stride`;§9.1(6)a)。
     ///
     /// 语义 = 本轮提交 `(pos, fed_new]` 跨过的**最大**页边界 `b`,且该边界
     /// 页号是 `stride` 的整数倍(spec 轮提交 ≤ depth+1 ≤ 8 行 < 页 32 ⇒
@@ -535,8 +533,6 @@ impl<D: DeviceClient> RunningEngine<D> {
             // 吃光）。2026-11-16 认领：这个值是池几何的函数，操作员没有
             // 信息量去覆盖它（旧键 `[runtime] reserve_pages` 已删）。
             reserve_pages: (self.dev.pool.geom.nb / 64).min(8),
-            slice_every: self.boot.cfg.knobs.slice_every,
-            slice_tokens: self.boot.cfg.knobs.slice_tokens,
         }
     }
 
@@ -641,7 +637,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 self.boot.cfg.prefill_chunk,
                 crate::engine::PREFILL_TAIL_MERGE,
                 Self::prefill_align_page(
-                    self.boot.cfg.knobs.prefill_align_tail,
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
@@ -2327,8 +2322,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             return Ok(SchedulerOutput::Idle);
         }
 
-        // ── B5.1 批 decode 门 ────────────────────────────────────────────
-        // 判据(全部成立才拼批;任一不成立走单 turn 旧路,零行为变化):
+        // ── 批 decode 门（**只注入事实**；决策在 `PhaseSched` P3） ─────────
+        // 判据(全部成立才把 `batch_ok` 置真;任一不成立 = 本拍单 turn 路):
         // ① 至少 2 个活跃且都在生成相位(无 prefill 欠账);
         // ② **无投机**(depth==0):spec 轮的 GDN 是顺序块 + 快照,批化是 M2;
         // ③ 单 rank(TP 的 AR 批语义未审,R8);④ 选择层视图关闭(页表需 per-row)。
@@ -2338,7 +2333,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             None => true,
             Some(p) => self.dev.graphs.batch.is_some() && p.graphs.batch.is_some(),
         };
-        if self.boot.cfg.knobs.max_batch > 1
+        let batch_ok = self.boot.cfg.knobs.max_batch > 1
             && self.turns.active.len() >= 2
             && self
                 .turns
@@ -2353,8 +2348,45 @@ impl<D: DeviceClient> RunningEngine<D> {
                 })
             && self.dev.spec_rt.depth == 0
             && tp_batch_ready
-            && !self.sel.has_view()
-        {
+            && !self.sel.has_view();
+
+        // ── 相位决策（**单一口径**：策略全在 `PhaseSched`，引擎只喂事实） ──
+        // 旧的两套实现（`slice_every>0` 走状态机 / =0 走内联判据）已删：
+        // 同一件事两套判据就是两个会漂移的答案（2026-11-16 用户裁决 B）。
+        let facts: Vec<crate::sched_policy::TurnFacts> = self
+            .turns
+            .active
+            .iter()
+            .map(|a| {
+                let fed = a.fed.min(a.prompt_ids.len());
+                let phase = if fed < a.prompt_ids.len() {
+                    crate::sched_policy::PhaseSz::Prefill
+                } else {
+                    crate::sched_policy::PhaseSz::Gen
+                };
+                crate::sched_policy::TurnFacts {
+                    turn: a.id,
+                    session: a.session_id,
+                    prompt_tokens: a.prompt_ids.len(),
+                    cached_tokens: a.cached_start.min(a.prompt_ids.len()),
+                    max_new: a.reserve_new,
+                    fed,
+                    out_len: a.out.len(),
+                    phase,
+                    spec: self.dev.spec_rt.depth > 0,
+                }
+            })
+            .collect();
+        let plan = self
+            .turns
+            .phase
+            .next(&facts, batch_ok)
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: "相位计划为空（活跃席位却在册）".into(),
+            })?;
+
+        // P3 批：行数（几何闸）仍由引擎定，策略只说"该批"。
+        if matches!(plan.kind, crate::sched_policy::Kind::BatchDecode) {
             let n = self.turns.active.len().min(self.boot.cfg.knobs.max_batch);
             let mut rows = Vec::with_capacity(n);
             for i in 0..n {
@@ -2367,74 +2399,32 @@ impl<D: DeviceClient> RunningEngine<D> {
             });
         }
 
-        // 相位决策:prompt 相位(块式 prefill;W1/PF1)优先。
-        // 多活跃时选**欠账最多的 prefill turn**(先把 prompt 灌完),否则
-        // round-robin 推进生成相(单 turn 档 = 唯一活跃,行为不变)。
-        // **相位决策**（`[runtime] slice_every > 0` 时走纯状态机；=0 走旧逻辑逐字节不变）
-        let pick_idx = if self.boot.cfg.knobs.slice_every > 0 {
-            // 事实注入（引擎只提供事实，策略全在 `sched_policy::PhaseSched`）
-            let facts: Vec<crate::sched_policy::TurnFacts> = self
-                .turns
-                .active
-                .iter()
-                .map(|a| {
-                    let fed = a.fed.min(a.prompt_ids.len());
-                    let phase = if fed < a.prompt_ids.len() {
-                        crate::sched_policy::PhaseSz::Prefill
-                    } else {
-                        crate::sched_policy::PhaseSz::Gen
-                    };
-                    crate::sched_policy::TurnFacts {
-                        turn: a.id,
-                        session: a.session_id,
-                        prompt_tokens: a.prompt_ids.len(),
-                        cached_tokens: a.cached_start.min(a.prompt_ids.len()),
-                        max_new: a.reserve_new,
-                        fed,
-                        out_len: a.out.len(),
-                        phase,
-                        spec: self.dev.spec_rt.depth > 0,
-                    }
-                })
-                .collect();
-            let l = crate::sched_policy::Limits {
-                slice_every: self.boot.cfg.knobs.slice_every,
-                slice_tokens: self.boot.cfg.knobs.slice_tokens,
-                ..Default::default()
-            };
-            // `batch_ok = false`：批 decode 已在上面的批门处理过，这里只决定单拍相位。
-            match self.turns.phase.next(&l, &facts, false) {
-                Some(plan) => self
-                    .turns
-                    .active
-                    .iter()
-                    .position(|a| a.id == plan.turn)
-                    .ok_or_else(|| ModelError::EngineInvariant {
-                        what: format!("phase 计划指向不存在的 turn {}", plan.turn),
-                    })?,
-                None => 0,
-            }
-        } else if let Some(i) = self
+        let pick_idx = self
             .turns
             .active
             .iter()
-            .enumerate()
-            .filter(|(_, a)| a.fed < a.prompt_ids.len())
-            .min_by_key(|(_, a)| a.fed)
-            .map(|(i, _)| i)
-        {
-            i
-        } else {
-            let n = self.turns.active.len();
-            let i = self.turns.rr % n;
-            self.turns.rr = self.turns.rr.wrapping_add(1);
-            i
-        };
+            .position(|a| a.id == plan.turn)
+            .ok_or_else(|| ModelError::EngineInvariant {
+                what: format!("phase 计划指向不存在的 turn {}", plan.turn),
+            })?;
         let pick_id = self.turns.active[pick_idx].id;
         self.turns.select(Some(pick_id));
 
         let act = self.turns.active()?;
-        if act.fed < act.prompt_ids.len() {
+        // 计划与事实必须一致（显式：漂移就响亮拒，不静默走错相位）。
+        let wants_prefill = matches!(plan.kind, crate::sched_policy::Kind::Prefill);
+        if wants_prefill != (act.fed < act.prompt_ids.len()) {
+            return Err(ModelError::EngineInvariant {
+                what: format!(
+                    "相位计划 {:?} 与 turn {} 事实不一致（fed {}/{}）",
+                    plan.kind,
+                    act.id,
+                    act.fed,
+                    act.prompt_ids.len()
+                ),
+            });
+        }
+        if wants_prefill {
             let base = act.fed;
             let remaining = act.prompt_ids.len() - base;
             // 块长:配置块长 ∩ 剩余(E1 paged 核后无 256 窗钳制;
@@ -2445,7 +2435,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 self.boot.cfg.prefill_chunk,
                 crate::engine::PREFILL_TAIL_MERGE,
                 Self::prefill_align_page(
-                    self.boot.cfg.knobs.prefill_align_tail,
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
@@ -2454,22 +2443,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                 self.boot.cfg.knobs.snap_msg_min_span,
             )
             .unwrap_or_else(|| remaining.max(1));
-            // 时间片档：**只在"有人正在 decode"时**才把 prefill 切小 ——
-            // 独自一人时切片只会白拉长自己的 TTFT（实测 106→638ms），
-            // 且对谁都没好处（没有在位者需要保护）。
-            let interleaving = self
-                .turns
-                .active
-                .iter()
-                .any(|a| a.fed >= a.prompt_ids.len());
-            let chunk = if self.boot.cfg.knobs.slice_every > 0
-                && self.boot.cfg.knobs.slice_tokens > 0
-                && interleaving
-            {
-                chunk.min(self.boot.cfg.knobs.slice_tokens)
-            } else {
-                chunk
-            };
+            // 片长 = 上面算出的**正常一步**（片长不再有第二处读取：相位只决定
+            // 谁跑/何时插片，chunk 几何归引擎）。
             let action = StepAction::Prefill {
                 chunk_ids: act.prompt_ids[base..base + chunk].to_vec(),
                 base,

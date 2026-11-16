@@ -6,7 +6,7 @@
 //! 供 `prefill_step_chunk_msg` 切块与 `capture_gdn_snap` 的 `snap_keep` 共用。
 //!
 //! **不写死分割串**:`open_ids` 是调用方传入的 token 序列 ——
-//! 来源 = `[pool].snap_msg_delim` 配置(非空)或模型的
+//! 来源 = `[store].snap_msg_delim` 配置(非空)或模型的
 //! `ChatFormat.im_open`(Qwen 系 `<|im_start|>`)。函数本身只认 token 序列;
 //! 换模板 = 换配置/模型声明,不改这里。
 //!

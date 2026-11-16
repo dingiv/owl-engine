@@ -175,9 +175,9 @@ def main() -> int:
     want(b2["cached"] >= b1["cached"], f"B2 cached 增长（{b1['cached']} → {b2['cached']}）")
     want(c2["cached"] > c1["cached"], f"C2（显式键）增量命中（{c1['cached']} → {c2['cached']}）")
 
-    print("\n会话表（cached_len 是 L1 设备前缀账 —— turn 收口已归还，恒 0 属正常）：")
+    print("\n会话表（history_len = 会话账 `tokens.len()` 唯一真源；L1 前缀账已归还）：")
     for sid, s in sorted(sessions(base).items()):
-        print(f"  #{sid}: cached_len={s['cached_len']} tail_snap={'有' if s['tail_snap'] else '无'}")
+        print(f"  #{sid}: history_len={s['history_len']} tail_snap={'有' if s['tail_snap'] else '无'}")
 
     print("\n" + ("ALL PASS" if ok else "FAIL"))
     return 0 if ok else 2

@@ -24,9 +24,9 @@ name = "qwen3.8-27b"
 # (原 [runtime] device_ordinal 已迁 [parallel] device)
 max_seq = 8448
 
-[pool]
+[store]
+[store.gdn]
 gdn_slots = 8
-
 [kernel]
 prefill_split = true
 

@@ -119,20 +119,19 @@ topp = 0.95
 # 这是 opt-in 反循环档：若长跑出现词沙拉/工具遵循下降，回 1.0 即可（核内跳过）。
 rep_penalty = 1.00
 
-[pool]
-# 2 槽 = 297MiB:覆盖三图窗口的删除快照(与 ① 同口径)。
-snap_max = 2
+[store]
 prefix_cache = true
 vram_reserve_mb = 970
 # 宿主 KV 腿 10GiB(设备池之外的冷缓存;整链下沉而不是硬拒)。
 host_cache_mb = 10240
 snap_host_mb = 3072
-# 图像前缀无感删除(leave-gap;snap2 覆盖三图窗口)。
-snap_msg_boundary = true
+[store.gdn]
+# 2 槽 = 297MiB:覆盖三图窗口的删除快照(与 ① 同口径)。
+snap_max = 2
+# 图像前缀无感删除(leave-gap;snap2 覆盖三图窗口)。消息边界快照恒开(键退休)。
 snap_msg_delim = ""
 snap_msg_min_gap = 2048
 snap_msg_min_span = 0
-
 [vision]
 # 图像前缀无感删除(leave-gap)。
 image_evict = true

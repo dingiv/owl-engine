@@ -12,7 +12,7 @@
 #
 # 前置档要求（见脚本头与 profiles/README.md）：
 #   · 真并发：单卡 + max_batch=2 + gdn_slots>=2 + 无选择层 + spec off
-#     + runtime.slice_every>0（否则解码被整段 prefill 冻结）；
+#     （相位时间片是引擎自决：每 8 拍 decode 插 1 片 prefill，无需配置）；
 #   · 队列形态（TP2 生产档 max_batch=1）也能跑：测试报 mode=queued。
 set -u
 cd "$(dirname "$0")/../.."
@@ -49,8 +49,8 @@ if ! healthy; then
          本机档是 *.local.toml（不入库）。先按下面的形状建一份，或改用 --url 指向已起服务：
            extends = ["profiles/qwen38_27b-3090.toml"]
            [parallel] device = ["GPU-<uuid>"]      # 单卡，UUID 钉卡
-           [runtime] max_concurrency = 2, max_batch = 2, slice_every = 8
-           [pool]    gdn_slots = 2, snap_max = 6
+           [runtime] max_batch = 2          # 相位时间片引擎自决（SLICE_EVERY=8）
+           [store]    gdn_slots = 2, snap_max = 6
            [spec]    depth = 0, lookup = false
 EOF
     exit 2

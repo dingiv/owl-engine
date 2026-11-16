@@ -196,7 +196,7 @@ impl KvQuant {
                 fi_prefill: Some(fi::PREFILL_FI_FP8KV),
             }),
             // e5m2:类型体系能表达,**核臂全缺** ⇒ 统一在这里拒(不再是 7 处文案)
-            KvQuant::Fp8E5M2 => Err("fp8-e5m2 暂无核臂(本仓只有 e4m3);请改 [pool] kv_dtype = \"fp8\""),
+            KvQuant::Fp8E5M2 => Err("fp8-e5m2 暂无核臂(本仓只有 e4m3);请改 [store.kv] kv_dtype = \"fp8\""),
             // int8:K int8 + V token-major + 两张 scale —— 没有 FP8/FI 系列臂,
             // 也没有 split(走整块 Int8PrefillPaged);verify 走专用 GQA-TC 臂。
             KvQuant::Int8 => Ok(KvKernels {
@@ -212,7 +212,7 @@ impl KvQuant {
 
     /// 本格式的内核表(装配期已经过一次 boot 门 ⇒ 这里可放心 `expect`)。
     ///
-    /// 唯一允许 panic 的位置与理由:配置面 `KvQuant` 由 `[pool] kv_dtype`
+    /// 唯一允许 panic 的位置与理由:配置面 `KvQuant` 由 `[store.kv] kv_dtype`
     /// 唯一派生,`validate`/boot 门已把 e5m2 挡在启动之外;真跑到这里说明
     /// 有人绕过了装配边界 —— **响亮**比静默错臂好。
     #[inline]
@@ -415,7 +415,7 @@ pub struct DiagEnv {
     pub live_diag: bool,
 }
 
-/// 解释器内存治理(`[pool]`;原 `OWL_BLOCK_POOL` / `OWL_NO_RECLAIM` env)
+/// 解释器内存治理(`[store]`;原 `OWL_BLOCK_POOL` / `OWL_NO_RECLAIM` env)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InterpEnv {
     /// 块池预算字节(0 = 关 = 逐节点 alloc/free)
@@ -581,7 +581,7 @@ impl EnvProvider {
                 fused_decode_v2: d.gdn_fused_decode_v2,
             },
             kv: KvEnv {
-                quant: match cfg.pool.kv_dtype {
+                quant: match cfg.store.kv.kv_dtype {
                     owl_shared::config::KvDtype::Int8 => KvQuant::Int8,
                     owl_shared::config::KvDtype::Fp8 => KvQuant::Fp8E4M3,
                     owl_shared::config::KvDtype::F16 => KvQuant::None,
@@ -595,8 +595,8 @@ impl EnvProvider {
                 live_diag: cfg.probes.live_diag,
             },
             interp: InterpEnv {
-                block_pool_bytes: cfg.pool.block_pool_bytes,
-                no_reclaim: cfg.pool.no_reclaim,
+                block_pool_bytes: cfg.store.block_pool_bytes,
+                no_reclaim: cfg.store.no_reclaim,
             },
             ..Self::default()
         }

@@ -13,7 +13,7 @@
 #   python3 apps/server/tests/prefix_reuse_probe.py \
 #     --base-url http://127.0.0.1:8137 --model qwen3.8-27b
 #
-# 被测项(`[pool].prefix_cache`)的 A/B:
+# 被测项(`[store].prefix_cache`)的 A/B:
 #   基线 = flavor 值(false,跨会话块级缓存关);
 #   目标 = 本文件显式的 true ⇒ 探针判据 ④⑤(跨会话命中 + 真值等价)才可判。
 # ============================================================================
@@ -27,13 +27,13 @@ name = "qwen3.8-27b"
 max_seq = 16384
 prefill_chunk = 512
 
-[pool]
+[store]
+[store.gdn]
 # **容量面全部继承 flavor**(2026-10-19 容量定档后):`prefix_cache=true` /
 # `host_cache_mb=4096` / `snap_max=4` / `snap_host_mb=2048`
 # 都在 `profiles/qwen38_27b-3090.toml` 里(三层账与 VRAM 算式见该档注释)。
 # 本测装**不再覆盖**它们 —— 测的就是生产档的真实容量策略。
 gdn_slots = 1
-
 [probes]
 # token 级取证(§4.3 对称律排查):渲染后完整 prompt 落盘 /tmp/owl-prompt-<ms>.txt
 # + `[dbg prefix]` 守卫读数。平时关(落盘 + 日志有成本)。

@@ -77,16 +77,14 @@ max_seq = 32768
 #    32k 连跑三次仍有余量(free ≈1.1G)。要再上去得先给预填留专用预算。
 prefill_chunk = 512
 # **跨会话合批上限**(1 = 串行;缺省)。
-# >1 的前置:`pool.gdn_slots ≥ max_batch`、**单卡**(TP 的 AR 批语义未审,
+# >1 的前置:`store.gdn.gdn_slots ≥ max_batch`、**单卡**(TP 的 AR 批语义未审,
 # 配置校验直接拒)、`kvmem.select_decode = false`(M1 页表按行)。
 # 效果:最多 N 个活跃 turn 的 decode 拼成一次 T=N 前向;单 turn 语义不变。
 max_batch = 1
-# **相位时间片**:每 `slice_every` 拍 decode 之后插**一片** prefill
-# (0 = 关 = prefill 独占泵,缺省)。只对"有在位者 decode"有意义:给长 prompt
-# 的 prefill 开个口子,牺牲在位者 ITL 换新请求的 TTFT。
-slice_every = 0
-# 单片 prefill token 数(0 = 用整 `prefill_chunk`)
-slice_tokens = 0
+# **相位时间片**:引擎自决(2026-11-16 用户裁决 B) —— 每 8 拍 decode 后
+# 至多插一片 prefill(`sched_policy::SLICE_EVERY`,出处:该档实测 max_gap
+# ≈0.9s;不做时间片会把 decode 冻结 3.8s)。片长 = 正常一步
+# (`prefill_chunk` ∩ 剩余)。无配置键:操作员既算不出也不该算这个节奏。
 # **准入预算**(2026-11-16 用户裁决):一轮的预留 = 本请求上下文 +
 # `max_new_cap`(被 `max_seq` 窗口夹住)。装不下 ⇒ 拒/排队,**不切在跑者的
 # 份额** ⇒ 旧的"给新人留头寸/在位者最小生成/队列上限"三旋钮已删。
@@ -157,53 +155,12 @@ beta_slow = 1.0
 attention_factor = 1.0
 
 # ---------------------------------------------------------------------------
-# [pool] —— 设备池与显存治理   # FIXME: 改名为 [store]
+# [store] —— 存储面（KV/GDN/宿主/磁盘；2026-11-16 由 [pool] 改名）
 # ---------------------------------------------------------------------------
-[pool]   # FIXME: 增加嵌套配置, 普通 kv 作为一个子域, gdn 作为一个子域
-# 主 KV 池 dtype（full 模板默认 fp8；30 系 leaf 由 parts/pool/int8.toml 覆盖为 int8）
-kv_dtype = "fp8"
-# 设备 KV 池（2026-10-22；不再有手工容量键）:
-#   prefix_cache=false → min(剩余显存 cap, max_seq×并发 + 1 页)
-#   prefix_cache=true  → cap(整池可被前缀缓存持有,新请求逐出到 host/disk)
-# **GDN 状态格数 = 同时推进的 turn 上限**（每活跃 turn 一格；2026-11-16 起
-# 它是并发唯一真源：服务面 permit 数也用它）。必须显式 ≥ 1。
-# full 模板给 1；多并发 leaf 显式覆盖（如 3080 档 2）。
-gdn_slots = 1
+[store]
 # 前缀缓存开/关
 prefix_cache = true
-# 末段页对齐(前缀复用闭环;单块档多切一刀)
-prefill_align_tail = true   # FIXME: 删除配置项目, 默认开
-# 生成相位页边界快照页步长(0 = 关)
-snap_decode_stride = 1   # FIXME: ?? 
-# GDN 快照池槽数
-snap_max = 0          # FIXME: ?? 
-# 消息边界快照（缺省关；agent 档开）。开 = 在消息开启标记前取页对齐边界，
-# prefill 在边界切块并拍 Durable 快照，供同 system/tool 前缀跨会话复用。
-# 依赖 prefix_cache=true + snap_max>0；无消费者 = boot 告警（full 模板 snap_max=0 ⇒ 保持 false）。
-snap_msg_boundary = false  # FIXME: 删除配置项目, 默认开
-# 可删图前锚点快照（缺省开；2026-11-13）。开 = 在**每张可删图的段起点**
-# 强制切块并拍一张快照（Extra 档；旧图同键 Touch，稳态≈新进图数）。
-# 解决“截图在 prompt 尾部”时尾快照落在被删页、删除只能退回 fresh 的问题；
-# 同游程只删后几张时也能复用到前几张。
-# 只在 image_evict=true + prefix_cache=true + snap_max>0 时有消费者。
-snap_evict_anchor = true   # FIXME: 删除配置项目, 默认开
-# 消息开启标记文本覆盖（空 = 用模型 ChatFormat.im_open，如 Qwen <|im_start|>）
-# 引擎 boot 时 tokenize；扫描函数只收 open_ids 参数，不写死字面量。
-snap_msg_delim = ""
-# 后续消息边界的稀疏间隔（token；第一条边界无条件保留）
-snap_msg_min_gap = 2048   # FIXME: ??? 
-# 最近 K 条消息边界无条件保留（dense tail；0 = 旧行为）
-snap_msg_recent = 4
-# 每会话快照上限（0 = 不限 = 旧行为；只数非 Transient 条目，
-# 设备+宿主+盘都算）；**与 snap_max（设备槽数）是两个量**。
-# 超限时按 SnapClass 档位替换/跳过
-snap_session_cap = 0    # FIXME: ???
-# 结构档（Dense/Binary）保留位；仅约束 Extra（Extra ≤ cap − reserve）
-snap_structural_reserve = 4    # FIXME: ??? 
-# 距当前 fed 小于本值（token）的边界不单独切块；0 = 不设下限（推荐，
-# 否则边界落在 chunk 起点附近会被跳过，system 前缀反而丢）
-snap_msg_min_span = 0    # FIXME: ???
-# 宿主 KV 腿 / 快照腿 / 盘层两腿(MiB;0 = 关)
+# 宿主 KV 腿 / 快照腿 / 盘层两腿(MiB;0 = 关层)
 host_cache_mb = 0
 snap_host_mb = 0
 disk_cache_mb = 0
@@ -232,6 +189,46 @@ block_pool_bytes = 0 # FIXME: 删除配置项目, 和 vram_budget 重复
 # 关活性中途回收(诊断;开会无界常驻)
 no_reclaim = false
 
+# KV 池子域（2026-11-16 用户裁决：kv 作为 store 的子域）
+[store.kv]
+# 主 KV 池 dtype（full 模板默认 fp8；30 系 leaf 由 parts/pool/int8.toml 覆盖为 int8）
+kv_dtype = "fp8"
+# 草稿池 KV dtype（bf16 = 缺省；fp8 e4m3 = 偷显存档，池体积减半）
+draft_kv_dtype = "bf16"
+
+# GDN 子域（2026-11-16 用户裁决：gdn 作为 store 的子域）
+[store.gdn]
+# **GDN 状态格数 = 同时推进的 turn 上限**（每活跃 turn 一格；2026-11-16 起
+# 它是并发唯一真源：服务面 permit 数也用它）。必须显式 ≥ 1。
+# full 模板给 1；多并发 leaf 显式覆盖（如 3080 档 2）。
+gdn_slots = 1
+# 生成相位页边界快照页步长(0 = 关)
+snap_decode_stride = 1   # FIXME: ?? 
+# GDN 快照池槽数
+snap_max = 0          # FIXME: ?? 
+# 消息边界快照 = **恒开**(2026-11-16 键退休):在消息开启标记前取页对齐边界,
+# prefill 切块并拍 Durable 快照,供同 system/tool 前缀跨会话复用。
+# 门 = 消费者存在(prefix_cache=true + snap_max>0);本模板 snap_max=0 ⇒ 自然后退。
+# 可删图前锚点快照 = **恒开**(2026-11-16 键退休;2026-11-13 引入):在**每张
+# 可删图的段起点**强制切块并拍一张快照(Extra 档;旧图同键 Touch)。
+# 门 = image_evict=true + prefix_cache=true + snap_max>0。
+# 消息开启标记文本覆盖（空 = 用模型 ChatFormat.im_open，如 Qwen <|im_start|>）
+# 引擎 boot 时 tokenize；扫描函数只收 open_ids 参数，不写死字面量。
+snap_msg_delim = ""
+# 后续消息边界的稀疏间隔（token；第一条边界无条件保留）
+snap_msg_min_gap = 2048   # FIXME: ??? 
+# 最近 K 条消息边界无条件保留（dense tail；0 = 旧行为）
+snap_msg_recent = 4
+# 每会话快照上限（0 = 不限 = 旧行为；只数非 Transient 条目，
+# 设备+宿主+盘都算）；**与 snap_max（设备槽数）是两个量**。
+# 超限时按 SnapClass 档位替换/跳过
+snap_session_cap = 0    # FIXME: ???
+# 结构档（Dense/Binary）保留位；仅约束 Extra（Extra ≤ cap − reserve）
+snap_structural_reserve = 4    # FIXME: ??? 
+# 距当前 fed 小于本值（token）的边界不单独切块；0 = 不设下限（推荐，
+# 否则边界落在 chunk 起点附近会被跳过，system 前缀反而丢）
+snap_msg_min_span = 0    # FIXME: ???
+
 # ---------------------------------------------------------------------------
 # [spec] —— 投机解码
 # ---------------------------------------------------------------------------
@@ -242,8 +239,6 @@ depth = 0
 draft_path = ""
 # 哑草稿诊断面(无草稿器时)
 dumb = false
-# 草稿池 fp8(关 = bf16)
-draft_kv_dtype = "bf16"  # FIXME: 移动到 [pool]
 # DFlash2 草稿环窗口(token;0 = auto = 检查点声明,缺声明 = 家族 2048;当前核支持 2048)
 draft_window = 0
 # DFlash2 选择器 walk 策略（**AL 消融量具,不是调优旋钮**;仅 DFlash2 档）
@@ -300,7 +295,7 @@ probe_every = 8
 # ---------------------------------------------------------------------------
 # [vision] —— 视觉面
 # ---------------------------------------------------------------------------
-# 视觉相关的四件事收编在此(原散在 [model]/[server]/[pool]):
+# 视觉相关的四件事收编在此(原散在 [model]/[server]/[store]):
 #   enabled/path     视觉塔开关与权重(空 = 检查点内置 model.visual.*;
 #                    GGUF 档 = 同目录唯一 mmproj-*.gguf)
 #   max_pixels       图像预处理 `smart_resize` 封顶(0 = 4096² = 实际不缩)。
@@ -308,7 +303,7 @@ probe_every = 8
 #                    真实 GUI agent 每轮 +1 张截图 ⇒ 每 100 tok ≈ 135 ms prefill(135k)。
 #   image_evict      前缀无感删除(图像段;leave-gap):客户端给图打 `owl_evict`
 #                    ⇒ 段落页对齐 + 删除即位置帧平移,不转 K/不动幸存 token;
-#                    需 [pool] prefix_cache + 分页 KV。缺省关 = 逐字节旧行为。
+#                    需 [store] prefix_cache + 分页 KV。缺省关 = 逐字节旧行为。
 #   image_evict_pad  删除段的页对齐 pad 词(必须恰 1 token;空 = 自动 `。`→` `→`\n`)。
 [vision]
 enabled = false
@@ -416,7 +411,7 @@ decode_arm = "fi"
 # fi_plan_restore 两布尔(validate 强制互反)已于 2026-10-27 收成单键。
 fi_plan = "baked"
 fi_cuda_graph = true
-# prefill-only FP8→F16 shadow(2026-10-31 复辟;仅 pool.kv_dtype="fp8" 有效)。
+# prefill-only FP8→F16 shadow(2026-10-31 复辟;仅 store.kv.kv_dtype="fp8" 有效)。
 # 算子级实测(单 3080/hd256/hkv4/page32/ctx=139264):fp8 KV 的 **prefill 注意力
 # 比 f16 慢 21~26%**(sm86 无 fp8 MMA,每瓦片要反量化),而 **decode(T=1)快 2×**。
 # 影子 = 保留 fp8 主池(容量),prefill 先反量化本层 KV 进 dense f16 staging。

@@ -954,7 +954,7 @@ impl SessionBank {
 
     // **会话表软上限已退休**（2026-11-16 用户裁决：会话数不设上限 ——
     // 常驻成本 = 元数据 + 可驱逐资产，上限由池 + host/disk 预算 + 淘汰机制给；
-    // 硬约束只有"同时推进" = `pool.gdn_slots`）。原 `enforce_session_cap` 删除。
+    // 硬约束只有"同时推进" = `store.gdn.gdn_slots`）。原 `enforce_session_cap` 删除。
 
     /// MTP 链归还:线性档走块腿;ring 档只清表(页池固定,不归槽)。
     pub fn release_mtp_table(&mut self, table: &mut Vec<u32>) -> Result<()> {
