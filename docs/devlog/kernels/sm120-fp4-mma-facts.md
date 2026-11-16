@@ -87,3 +87,27 @@ nvcc -O3 -std=c++17 -gencode arch=compute_120a,code=sm_120a \
      cu/probe/fp4_mma_sm120_sf_probe.cu -o /tmp/p2 -lcudart && /tmp/p2 a && /tmp/p2 b
 ```
 （`p1` 打印 `max|err| = 0`；`p2` 打印 SF 的 (lane,byte) → 行/列 归属表。）
+
+## 6. 附带实测：CUTLASS SF 交错布局的**仿射步长**（2026-11-08）
+
+写 decode GEMV 时不能“猜”SF 布局，所以把 plan 里的步长直接读出来（
+`owl_nvfp4_sfa_strides` / `owl_nvfp4_sfb_strides`，`Sm1xxBlkScaledConfig` 的
+`tile_atom_to_shape_SF{A,B}` 实测）——**5 个形状全同形**（N=9216/8192/4096/2560/1024，
+K=2560/4096/9216）：
+
+```
+off(n, gg) = sfb_base + 16·(n%32) + 4·((n/32)%4) + s2·(n/128) + 1·(gg%4) + 512·(gg/4)
+             s2 = 128·(K/16) = 8K            （SFA 同律，只是把 n 换成 m）
+```
+
+两个直接可用的推论：
+
+1. **同一 group-quad 的 32 行 × 4 组 = 512 字节连续**（一个“扇区族”）；
+   单个 32 字节扇区恰好装 `{2 行}×{4 个 b}×{4 组}` ⇒ 只要让“一个 warp 负责这 8 行”，
+   按 k 切的数据侧与按 n 读的缩放侧就同时满扇区（decode GEMV 就是靠这条做到
+   缩放零浪费的，见 `crates/kernels/cu/nvfp4/nvfp4_gemv.cu`）。
+2. 反过来，“按 k 切、顺带逐行读缩放”的朴素写法会 **8× 放大缩放流量**
+   （1 字节用掉一整个 32B 扇区）——`decode` 上等于把权重流量翻倍。
+
+**注**：`sfa_bytes` 按 `ceil(M/128)·128·K/16` 排（M=1 也要一整块 128 行），
+`sfb_bytes` 在 N 128 对齐时 = `N·K/16`；两处口径不同，别混用。

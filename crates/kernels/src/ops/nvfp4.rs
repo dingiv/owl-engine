@@ -10,7 +10,8 @@
 //! ## 适用面
 //! - 硬件:必须 `Caps::fp4_blockscale`(sm_12x;准入表 [`crate::admit`] 管)
 //! - 形状:`k % 16 == 0`(块缩放粒度)、`n % 8 == 0`(epilogue 向量化);
-//!   **M 不设门**(2026-10-28 用户裁决:统一臂,decode 的 m=1 也走这条)
+//!   **M 不设门**:库内按 `m ≤ 8` 分到 decode GEMV(纯 SIMT)/ CUTLASS 主循环,
+//!   两者同槽序、同数值口径(2026-11-08)。
 //! - **可进图**(2026-10-28):alpha 在设备侧算(`dg` 槽 = `alpha = g·gb`),
 //!   发射路径零 host 工作/零同步 ⇒ decode / propose / verify 三张图都能捕
 

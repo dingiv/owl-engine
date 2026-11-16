@@ -387,8 +387,10 @@ pub enum QuantScheme {
     /// `q`(`u8`)+ `sf`(`u8`,CUTLASS 交错布局),前向 = 设备侧激活量化 + CUTLASS
     /// `m16n8k64` 块缩放 MMA(sm_12x 的 `a` 档指令)。
     ///
-    /// **统一臂**(用户裁决 2026-10-28):不按 m 分流 —— decode(m=1)与 prefill
-    /// 都走同一条;代价是 decode 会按 128 行 tile 空转,收益在 prefill。
+    /// **两条核、一层配置**(2026-11-08):`m ≤ 8` 走 `cu/nvfp4/nvfp4_gemv.cu`
+    /// 的纯 SIMT 流式反量化(FP4 张量核在 m=1 上只会把 1 行塞进 128 行 tile 空转,
+    /// 实测 242 GB/s);`m > 8` 走 CUTLASS blockscaled 主循环。分流在**库内**
+    /// (`owl_nvfp4_gemv_ok` 建 plan 时判形状 + SF 布局),不占配置面、不改槽序。
     #[serde(rename = "nvfp4")]
     Nvfp4,
     /// **GGUF 块型**(`format=gguf` 专用;声明口径 —— 实际逐张量型从文件读,

@@ -229,6 +229,30 @@ static float quantize(const __half* a, int rows, int K, uint8_t* q, TensorSF sf)
 }  // namespace owl_nvfp4_detail
 
 // ---------------------------------------------------------------------------
+// decode GEMV 臂(`nvfp4_gemv.cu`,同一个 `.a`)
+// ---------------------------------------------------------------------------
+//
+// 为什么在 FFI 内部按 M 分流、而不是新开一个 KernelSpec:分流只依赖
+// **plan 形状**(m≤8 与 SF 布局),不需要任何新参数 —— 声明面/槽序/图节点
+// 全部不变,“什么时候用哪个核”留给同一个算子自己说话(与 `driver::KernelPick`
+// 的“按形状选核”精神一致)。
+extern "C" int owl_nvfp4_gemv_ok(int m, int n, int k, const int* sfa, const int* sfb);
+extern "C" int owl_nvfp4_gemv_launch(
+    const uint8_t* aq, const uint8_t* asf, const float* alpha_dev, float alpha_host,
+    const uint8_t* bq, const uint8_t* bsf, __half* d, int m, int n, int k,
+    int sfa_base, const int* sfa, int sfb_base, const int* sfb, void* stream);
+
+/// 诊断面急停(`OWL_NVFP4_NO_GEMV=1` 强制回落 CUTLASS 臂;只供离线 A/B,
+/// 读一次缓存在静态里 —— 不在发射路径上反复 readenv)
+static bool gemv_disabled() {
+  static const bool disabled = [] {
+    const char* v = getenv("OWL_NVFP4_NO_GEMV");
+    return v != nullptr && v[0] != '0' && v[0] != '\0';
+  }();
+  return disabled;
+}
+
+// ---------------------------------------------------------------------------
 // 执行计划(M/N/K 绑定;SF 布局与 workspace 尺寸都在这里定死)
 // ---------------------------------------------------------------------------
 struct OwlNvfp4Plan {
@@ -244,6 +268,11 @@ struct OwlNvfp4Plan {
   /// 2026-10-28:装载改成**设备侧打包**后,权重量化器需要它
   /// (host 打包时由 cute 的 `make_tensor` 直接算,设备侧只能拿仿射模型)。
   int sfb_s[5] = {0, 0, 0, 0, 0};
+  /// 两个 SF 仿射模型的**原点**(`layout(0,0,0)`;cute 布局实测通常 0,
+  /// 但 decode GEMV 要直接算绝对偏移 ⇒ 不靠这个巧合)
+  int sfa_base = 0, sfb_base = 0;
+  /// decode GEMV 臂是否可用([`owl_nvfp4_gemv_ok`] 的结论;**plan 建时算一次**)
+  bool gemv_ok = false;
 };
 
 extern "C" {
@@ -337,6 +366,7 @@ void* owl_nvfp4_plan_new(int M, int N, int K) {
   auto sfa_at = [&](int m, int gg) -> long { return (long)p->l_sfa(m, 16 * gg, 0); };
   const int groups = K / 16;
   const long base = sfa_at(0, 0);
+  p->sfa_base = (int)base;
   p->sf_s[0] = (int)(sfa_at(1, 0) - base);
   p->sf_s[1] = (int)(sfa_at(32, 0) - base);
   p->sf_s[2] = (int)(sfa_at(128, 0) - base);
@@ -363,6 +393,7 @@ void* owl_nvfp4_plan_new(int M, int N, int K) {
   {
     auto sfb_at = [&](int n_idx, int gg) -> long { return (long)p->l_sfb(n_idx, 16 * gg, 0); };
     const long base_b = sfb_at(0, 0);
+    p->sfb_base = (int)base_b;
     p->sfb_s[0] = (int)(sfb_at(1, 0) - base_b);
     p->sfb_s[1] = (int)(sfb_at(32, 0) - base_b);
     p->sfb_s[2] = (int)(sfb_at(128, 0) - base_b);
@@ -388,6 +419,9 @@ void* owl_nvfp4_plan_new(int M, int N, int K) {
       return nullptr;  // SFB 布局结构变了 ⇒ 设备侧权重量化器拒绝旧仿射模型
     }
   }
+  // decode 臂可用性:[`owl_nvfp4_gemv_ok`] 吃的是**本 plan 实测的步长**
+  // (形状 + 布局两轴都在它里面判)⇒ 建 plan 时算一次,发射期零判断成本。
+  p->gemv_ok = owl_nvfp4_gemv_ok(M, N, K, p->sf_s, p->sfb_s) != 0 && !gemv_disabled();
   // workspace 与 args 无关的部分(当前实测 0,但不依赖这个巧合:预分配按需真算)
   StrideA stride_A{(int64_t)K, cute::C<1>{}, (int64_t)M * K};
   StrideB stride_B{(int64_t)K, cute::C<1>{}, (int64_t)N * K};
@@ -418,6 +452,22 @@ int owl_nvfp4_sfb_strides(void* plan, int* out) {
   for (int i = 0; i < 5; ++i) out[i] = p->sfb_s[i];
   return 0;
 }
+
+/// **SFA 仿射步长 + 原点**(激活侧;decode GEMV 与诊断面用,`out` 至少 6 个 int:
+/// 5 个步长 + base)。返回 0 = 已写入。
+int owl_nvfp4_sfa_strides(void* plan, int* out) {
+  auto* p = static_cast<OwlNvfp4Plan*>(plan);
+  if (!p || !out) return -1;
+  for (int i = 0; i < 5; ++i) out[i] = p->sf_s[i];
+  out[5] = p->sfa_base;
+  return 0;
+}
+
+/// decode 臂是否就绪(`1` = m≤8 且布局匹配;**plan 建时已算好**,这里只读)
+int owl_nvfp4_plan_gemv_ok(void* plan) {
+  auto* p = static_cast<OwlNvfp4Plan*>(plan);
+  return (p && p->gemv_ok) ? 1 : 0;
+}
 size_t owl_nvfp4_plan_ws_bytes(void* plan) { return static_cast<OwlNvfp4Plan*>(plan)->ws_bytes; }
 
 /// 发射一次 `D[M,N] = alpha · A(M,K) × B(N,K)ᵀ`。`ws` 长度须 ≥ `plan_ws_bytes`
@@ -431,6 +481,14 @@ int owl_nvfp4_run(void* plan, void* stream,
   auto* p = static_cast<OwlNvfp4Plan*>(plan);
   if (!p || !stream) return -1;
   const int M = p->M, N = p->N, K = p->K;
+  // ---- decode 臂:eager 路径的 alpha 直接给标量(零额外缓冲/零同步)----
+  if (p->gemv_ok) {
+    const int rc = owl_nvfp4_gemv_launch(aq, asf, nullptr, ga * gb, bq, bsf, d, M, N, K,
+                                         p->sfa_base, p->sf_s, p->sfb_base, p->sfb_s,
+                                         stream);
+    if (rc == 0) return 0;
+    (void)cudaGetLastError();  // 清错位,免得污染 CUTLASS 臂的读数
+  }
   StrideA stride_A{(int64_t)K, cute::C<1>{}, (int64_t)M * K};
   StrideB stride_B{(int64_t)K, cute::C<1>{}, (int64_t)N * K};
   using StrideC = typename Epilogue::StrideC;
@@ -469,6 +527,14 @@ int owl_nvfp4_run_dev(void* plan, void* stream,
   auto* p = static_cast<OwlNvfp4Plan*>(plan);
   if (!p || !stream || !alpha_dev) return -1;
   const int M = p->M, N = p->N, K = p->K;
+  // ---- decode 臂(生产/进图路径):alpha 从设备读 ⇒ 仍零 host 工作、可捕获 ----
+  if (p->gemv_ok) {
+    const int rc = owl_nvfp4_gemv_launch(aq, asf, alpha_dev, 0.f, bq, bsf, d, M, N, K,
+                                         p->sfa_base, p->sf_s, p->sfb_base, p->sfb_s,
+                                         stream);
+    if (rc == 0) return 0;
+    (void)cudaGetLastError();
+  }
   StrideA stride_A{(int64_t)K, cute::C<1>{}, (int64_t)M * K};
   StrideB stride_B{(int64_t)K, cute::C<1>{}, (int64_t)N * K};
   using StrideC = typename Epilogue::StrideC;
@@ -497,7 +563,8 @@ int owl_nvfp4_run_dev(void* plan, void* stream,
 
 /// 版本/自述(诊断面:确认编进去的是哪个算术形态)
 const char* owl_nvfp4_banner() {
-  return "owl_nvfp4 v1 · NVFP4(e2m1+e4m3/16) · CUTLASS SM120 blockscaled mainloop · Tile 128x128x256";
+  return "owl_nvfp4 v2 · NVFP4(e2m1+e4m3/16) · m≤8 = decode GEMV(纯 SIMT) / "
+         "m>8 = CUTLASS SM120 blockscaled mainloop · Tile 128x128x256";
 }
 
 // ---------------------------------------------------------------------------

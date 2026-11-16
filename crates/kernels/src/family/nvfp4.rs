@@ -13,6 +13,17 @@
 //! - `out` = 输出 f16 `[m, n]`
 //! - `aq/asf/dg` = **本次调用的量化产物**(u8/u8/f32[1];层侧每轮瞬态)
 //! - `gb`  = 权重 per-tensor 全局缩放(host f32;`ga` 由设备算完回读)
+//!
+//! ## 同一个槽序、两条核(2026-11-08)
+//!
+//! `nvfp4_gemm` 这个名字下有两个实现,由 `libnvfp4.a` **自己**按 `m` 分:
+//! - `m ≤ 8`:`nvfp4_gemv.cu` 的纯 SIMT 流式反量化(FP4 张量核在 m=1 上
+//!   只会把 1 行塞进 128 行 tile 空转 → 实测 242 GB/s 的死腿);
+//! - `m > 8`:`nvfp4_gemm.cu` 的 CUTLASS blockscaled 主循环。
+//!
+//! 分流条件是**形状 + SF 步长**(建 plan 时算一次),所以槽序/声明面/图节点
+//! 都不用动;诊断面可读 `Nvfp4Plan::gemv_ok()`,A/B 时用
+//! `OWL_NVFP4_NO_GEMV=1` 强制回落。
 
 /// foreign-kernel 核名(server 分派臂;**字面量住址 = 本模块**)
 pub const GEMM: &str = "nvfp4_gemm";

@@ -1299,7 +1299,12 @@ fn build_nvfp4() {
     };
     let compute_a = sm_a.replace("sm_", "compute_");
     // 两个 TU:GEMM 适配器 + 设备侧激活量化器(同一个 `.a`)
-    let sources = ["cu/nvfp4/nvfp4_gemm.cu", "cu/nvfp4/nvfp4_quant_act.cu"];
+    let sources = [
+        "cu/nvfp4/nvfp4_gemm.cu",
+        "cu/nvfp4/nvfp4_quant_act.cu",
+        // decode 臂(m≤8 的纯 SIMT GEMV;2026-11-08)
+        "cu/nvfp4/nvfp4_gemv.cu",
+    ];
     let inc_cutlass = "cu/cutlass/include";
     for s in sources {
         println!("cargo:rerun-if-changed={s}");

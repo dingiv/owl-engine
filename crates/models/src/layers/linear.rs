@@ -391,7 +391,8 @@ pub struct Linear {
     gguf_ty: Option<crate::formats::gguf::GgmlTy>,
     /// **NVFP4 五条臂之一**(2026-10-28):`Some` = 本层权重以 **e2m1 + e4m3/16
     /// 块缩放**驻留(`q` = `[out, in/2]` 字节、`sf` = CUTLASS 交错布局)。
-    /// 与 GGUF 同族(**统一臂**:decode 的 m=1 也走这条,不按 m 分流)。
+    /// 与 GGUF 同族(库内按 `m ≤ 8` 选 decode GEMV / CUTLASS 主循环;
+    /// 层侧不分流、槽序不变)。
     nv_q: Option<Weight>,
     nv_sf: Option<Weight>,
     /// 权重 per-tensor 全局缩放(`gb`;装载期由 `pack` 算出后经
