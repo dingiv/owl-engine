@@ -33,14 +33,6 @@ use serde::Serialize;
 
 use super::intent::ModelProfile;
 
-/// 图 slab 预算(保守值;engine `GRAPH_SLAB_BUDGET` 桶退役后 = 320)。
-///
-/// ⚠️ 这里**故意保留 640**:降到 320 会把 `context=max` 从 131072 抬到 143360,
-/// 贴近已知 144k/15 轮 reserve 泄漏带。等 144k 泄漏校准后再两边同步降;
-/// 当前 `--check` 对图项偏保守 320MiB(不影响安全,只少报可用池)。
-pub const GRAPH_SLAB_BYTES: u64 = 640 << 20;
-/// warmup 瞬态 + 杂项(engine `WARMUP_MISC_BUDGET`)
-pub const WARMUP_MISC_BYTES: u64 = 138 << 20;
 /// 长跑稳定裕度(已知 turn 临时块泄漏 + 激活抖动;P2 校准探测后收紧)
 pub const STABILITY_MARGIN_BYTES: u64 = 1_300 << 20;
 /// `context = "max"` 的向下取整粒度(token;避免 147,584 这类数字)
@@ -51,13 +43,11 @@ pub const CONTEXT_ROUND_TOKENS: usize = 4096;
 pub struct FixedParts {
     pub gdn_grid: u64,
     pub gdn_snap: u64,
-    pub graph_slab: u64,
-    pub warmup_misc: u64,
 }
 
 impl FixedParts {
     pub fn total(&self) -> u64 {
-        self.gdn_grid + self.gdn_snap + self.graph_slab + self.warmup_misc
+        self.gdn_grid + self.gdn_snap
     }
 }
 
@@ -177,8 +167,6 @@ pub fn budget_parts(inp: &MemoryInputs) -> (FixedParts, u64, u64, usize) {
     let fixed = FixedParts {
         gdn_grid: gdn_row * inp.gdn_slots as u64,
         gdn_snap: gdn_row * inp.snap_max as u64,
-        graph_slab: GRAPH_SLAB_BYTES,
-        warmup_misc: WARMUP_MISC_BYTES,
     };
     let target_total = (inp.total_bytes as f64 * inp.vram_budget) as u64;
     let weights = weights_bytes(inp);
@@ -330,7 +318,8 @@ mod tests {
         MemoryInputs {
             total_bytes: RTX_3090TI_24G.total_bytes,
             vram_budget: 0.99,
-            reserve_bytes: 256 << 20,
+            // 2026-11-16:图执行/warmup 已并入 vram_reserve(原 256+320+138)。
+            reserve_bytes: 714 << 20,
             model: &QWEN38_27B_AWQ,
             spec_dflash: false,
             kv_bytes_per_elem: if kv_1byte { 1 } else { 2 },
@@ -345,22 +334,22 @@ mod tests {
         }
     }
 
-    /// 3090 Ti + 27B/fp8/spec off/512+512:`context="max"` 必须解出 128k
-    /// (与 `profiles/qwen38_27b-3090.toml` 同档,供 A/B 对拍)。
+    /// 3090 Ti + 27B/fp8/spec off/512+512:`context="max"` 在合并预留后
+    /// 解出 140k(仅估算器口径;物理池仍由引擎按 free 定)。
     #[test]
-    fn max_context_solves_to_128k_on_3090ti() {
+    fn max_context_solves_after_merged_reserve() {
         let inp = inputs(true, 512, 512, 0);
         let (fixed, _target, budget, cap) = budget_parts(&inp);
-        // 与 boot 现场对齐(2026-10-20):fixed_after=0.90G / budget=5.95G / cap≈194k
-        assert_eq!(fixed.total(), (926 << 20) + (1 << 19), "fixed = 148.5 + 778 = 926.5 MiB");
+        // fixed 只剩真实 GDN 分配;图/warmup 在 reserve(714MiB)内。
+        assert_eq!(fixed.total(), (148 << 20) + (1 << 19), "fixed = GDN 格+快照 148.5 MiB");
         assert!(
-            (budget as f64 / GB - 5.95).abs() < 0.02,
-            "budget={:.3}G 应 ≈5.95G",
+            (budget as f64 / GB - 6.26).abs() < 0.02,
+            "budget={:.3}G 应 ≈6.26G(2026-11-16 合并预留后)",
             budget as f64 / GB
         );
-        assert!((190_000..200_000).contains(&cap), "cap={cap}");
+        assert!((200_000..210_000).contains(&cap), "cap={cap}");
         let (ctx, pool, _) = solve_max(&inp, QWEN38_27B_AWQ.geom.max_pos, false).expect("有解");
-        assert_eq!(ctx, 131_072, "128k:激活 0.60G + 裕度 1.30G 是本次定档");
+        assert_eq!(ctx, 143_360, "合并预留后:激活 0.60G + 裕度 1.30G");
         assert_eq!(pool, ctx, "非超卖档池 = 上下文");
     }
 
@@ -390,11 +379,11 @@ mod tests {
         let mut inp = inputs(true, 512, 512, 0);
         inp.sessions = 2;
         let (ctx, pool, cap) = solve_max(&inp, QWEN38_27B_AWQ.geom.max_pos, false).expect("有解");
-        assert_eq!(ctx, 65_536, "4.05G / (32KiB × 2) ⇒ 64k 档");
+        assert_eq!(ctx, 69_632, "合并预留后:单会话 139k / 双会话 ≈69k");
         assert_eq!(pool, ctx * 2, "池必须装得下两条满上下文");
         assert!(pool <= cap, "pool={pool} cap={cap}");
         let e = estimate(&inp, ctx, pool, true).expect("估");
-        assert_eq!(e.pool_tokens, 131_072);
+        assert_eq!(e.pool_tokens, 139_264);
         assert!(e.slack_bytes >= 0, "{e:?}");
     }
 

@@ -103,9 +103,8 @@ rep_penalty = 1.00
 [pool]
 # 2 槽 = 297MiB:给压力地板(1GiB)留余量,同时覆盖三图窗口的删除快照。
 snap_max = 2
-vram_reserve_mb = 512
+vram_reserve_mb = 970
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
-transient_reserve_mb = 1024
 # KV 宿主腿 10GiB:设备池只有 1983 槽(63k ctx),两发长 prompt 就占满;
 # 宿主腿让整链下沉(内容不丢)而不是硬拒。4GiB 实测:70k+65k 链装不下
 # ⇒ N6 只能逐叶丢(一次一个叶),第三发 27k 前缀回灌时 `槽池耗尽`

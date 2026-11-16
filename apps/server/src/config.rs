@@ -583,15 +583,14 @@ pub fn check_report(r: &ResolvedConfig) -> Result<CheckReport, String> {
                 if e.pool_tokens <= e.cap_tokens { "≤" } else { ">" },
             ));
             out.push_str(&format!(
-                "[check] basis: per_tok {}B(主 {} + 草稿 {})·激活 {}·固定 = gdn {} + snap {} + slab {} + warmup {}\n",
+                "[check] basis: per_tok {}B(主 {} + 草稿 {})·激活 {}·固定 = gdn {} + snap {}·预留 {}\n",
                 e.per_tok,
                 e.per_tok_main,
                 e.per_tok_draft,
                 e.activation_note,
                 gib(e.fixed.gdn_grid),
                 gib(e.fixed.gdn_snap),
-                gib(e.fixed.graph_slab),
-                gib(e.fixed.warmup_misc),
+                gib(e.reserve_bytes),
             ));
             out.push_str(
                 "[check] note: 估算池 = 逻辑下限(上下文×并发);物理池 = 无缓存→min(cap, ctx×并发+1页),缓存开→cap\n",

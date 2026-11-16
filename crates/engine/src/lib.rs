@@ -91,6 +91,18 @@ pub mod preflight;
 pub use engine::{Engine, EngineConfig, EngineKnobs};
 pub use owl_iface::handle::{AssetClass, DeviceHandle, Owner};
 
+/// **DFlash2 草稿权重的块名前缀**(事件账/`/debug/vram` 共用的唯一词表)。
+///
+/// 目标模型权重用 `wt.model.*` / `repack.model.*`;草稿侧是
+/// `candidate_selector` + 5 层 `wt.layers.*` + `repack.fc_*` /
+/// `repack.layers.*`。未命中这些前缀的权重保留在 `weights_other`,不猜。
+pub const DRAFT_WEIGHT_PREFIXES: &[&str] = &[
+    "wt.candidate_selector.",
+    "wt.layers.",
+    "repack.fc_",
+    "repack.layers.",
+];
+
 /// **GPU 设备面类型糖**(内核后端 + 事件账钩子):`RunningEngine`/`TpEngine` 的
 /// 公共签名用它 —— 上层不必手写嵌套泛型(2026-10-19 步 3)。
 pub type GpuFace = DeviceHandle<owl_cuda::GpuClient>;

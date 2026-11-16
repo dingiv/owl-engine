@@ -260,8 +260,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     "vlm-dbg",
                     "restore key={:?} tier={:?} owner={:?} reset_gdn={}",
                     k,
-                    self.bank.rel.state.locate(k),
-                    self.bank.rel.state.snap_session(k),
+                    self.bank.rel.state_locate(k),
+                    self.bank.rel.snap_session_info(k),
                     b.reset_gdn
                 ),
                 None => owl_shared::log_info!(
@@ -510,7 +510,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if self.pending_out.is_some() {
                 let page = self.dev.pool.geom.page.max(1);
                 let grow = chunk_ids.len().div_ceil(page).max(1);
-                if self.bank.rel.leg.report().slots_free < grow {
+                if self.bank.rel.leg_stats().slots_free < grow {
                     owl_shared::counter_inc!("select.rec.drain_for_slots");
                     self.drain_pending_out().await?;
                 }
@@ -553,24 +553,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 不能在两处各写一个数。
         let q_needed = if self.boot.cfg.knobs.select_decode || self.boot.cfg.knobs.coverage_probe {
             let new_fed = base + chunk_ids.len();
-            let prompt_len = self
-                .turns
-                .active
-                .first()
-                .map(|a| a.prompt_ids.len())
-                .unwrap_or(new_fed);
-            let msg_snaps = self
-                .turns
-                .active
-                .first()
-                .map(|a| a.msg_snaps.as_slice())
-                .unwrap_or(&[]);
-            let evict_snaps = self
-                .turns
-                .active
-                .first()
-                .map(|a| a.evict_snaps.as_slice())
-                .unwrap_or(&[]);
+            // **本步执行 turn**（`executing`）—— 多活跃时不能取 `active.first()`：
+            // 轮转选中的可能是 #2，用别家 prompt 长度/快照点会切错块。
+            let (prompt_len, msg_snaps, evict_snaps) = {
+                let act = self.turns.active()?;
+                (
+                    act.prompt_ids.len(),
+                    act.msg_snaps.clone(),
+                    act.evict_snaps.clone(),
+                )
+            };
             let next_end = Self::prefill_step_chunk_msg(
                 new_fed,
                 prompt_len,
@@ -581,8 +573,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
-                msg_snaps,
-                evict_snaps,
+                msg_snaps.as_slice(),
+                evict_snaps.as_slice(),
                 self.boot.cfg.knobs.snap_msg_min_span,
             )
             .map(|n| new_fed + n)
@@ -668,24 +660,14 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if self.dev.pool.geom.paged && new_fed.is_multiple_of(self.dev.pool.geom.page) {
             // **末边界预测**(纯 host;必须在拍快照**之前**算 —— 节奏化要用它):
             // 与 `coverage_analyze` 同一份调度算式(接口单源)。
-            let prompt_len = self
-                .turns
-                .active
-                .first()
-                .map(|a| a.prompt_ids.len())
-                .unwrap_or(new_fed);
-            let msg_snaps = self
-                .turns
-                .active
-                .first()
-                .map(|a| a.msg_snaps.as_slice())
-                .unwrap_or(&[]);
-            let evict_snaps = self
-                .turns
-                .active
-                .first()
-                .map(|a| a.evict_snaps.as_slice())
-                .unwrap_or(&[]);
+            let (prompt_len, msg_snaps, evict_snaps) = {
+                let act = self.turns.active()?;
+                (
+                    act.prompt_ids.len(),
+                    act.msg_snaps.clone(),
+                    act.evict_snaps.clone(),
+                )
+            };
             let next_end = Self::prefill_step_chunk_msg(
                 new_fed,
                 prompt_len,
@@ -696,26 +678,18 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     self.boot.cfg.knobs.prefix_cache,
                     self.dev.pool.geom.page,
                 ),
-                msg_snaps,
-                evict_snaps,
+                msg_snaps.as_slice(),
+                evict_snaps.as_slice(),
                 self.boot.cfg.knobs.snap_msg_min_span,
             )
             .map(|n| new_fed + n)
             .unwrap_or(new_fed);
             let last_boundary =
                 next_end == new_fed || !next_end.is_multiple_of(self.dev.pool.geom.page);
-            let msg_snap = self
-                .turns
-                .active
-                .first()
-                .is_some_and(|a| a.msg_snaps.binary_search(&new_fed).is_ok());
+            let msg_snap = msg_snaps.binary_search(&new_fed).is_ok();
             // **可删图锚点**（2026-11-13）：必须无条件拍 —— 删除发生时它是
             // “图前前缀”唯一的 GDN 恢复面（尾快照会落在被删页上被安全拒绝）。
-            let evict_snap = self
-                .turns
-                .active
-                .first()
-                .is_some_and(|a| a.evict_snaps.binary_search(&new_fed).is_ok());
+            let evict_snap = evict_snaps.binary_search(&new_fed).is_ok();
             // GDN 快照**节奏化**(2026-10-20):末边界 + 每 `SNAP_EVERY` 个 chunk 一个锚点。
             // 冷 prefill 每边界都拍 = 槽满后每拍一次 DtoH(159 MB ≈ 31 ms);
             // 复用只需要**末边界**(append 场景)与稀疏锚点(分叉场景)。
@@ -1410,8 +1384,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .map(|b| TensorOps::of_block(b.id, dtype, vec![1, hidden]))
                 .collect();
             if taps.len() == self.dev.spec_rt.dflash_tap_count {
+                let ring = self.turns.active()?.gdn_slot;
                 self.dev
-                    .prefill_dflash_encode(self.boot.probes, &taps, pos)
+                    .prefill_dflash_encode(self.boot.probes, &taps, pos, ring)
                     .await?;
             }
             mrec("decode.sync", t_syn.elapsed());
@@ -1490,6 +1465,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let face = self.dev.graphs.session.face_mut();
             self.dev.pool.write_bt_batch(face, &tables).await?;
         }
+        // TP2: 页表是两 rank 各一份设备副本（槽号相同）；只写 rank0 会让
+        // peer 的批注意力读到上一步的旧表 ⇒ 输出分歧。批路必须同写。
+        if let Some(p) = self.peer.as_mut() {
+            let face = p.graphs.session.face_mut();
+            p.pool.write_bt_batch(face, &tables).await?;
+        }
 
         // ── ② 行槽([T];图臂按 max_batch 定形,真行数 = rows.len())──
         let t_pad = self.boot.cfg.knobs.max_batch.max(2);
@@ -1529,7 +1510,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     ("kv_slot", &slots_v),
                     ("gdn_slot", &gslot_v),
                 ];
-                let g =
+                let g0 =
                     self.dev
                         .graphs
                         .batch
@@ -1537,10 +1518,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         .ok_or_else(|| ModelError::EngineInvariant {
                             what: "合批图缺席(判据漂移)".into(),
                         })?;
-                g.step(&refs).await?;
-                let tok = g.read_output_f32("token").await?;
+                match self.peer.as_mut() {
+                    // 单卡：原路。
+                    None => {
+                        g0.step(&refs).await?;
+                    }
+                    // TP2：两 rank 的批图必须**同时**推进（图内含 allreduce；
+                    // 只跑 rank0 会等 peer 的 AR 信号）。读数只取主 rank。
+                    Some(p) => {
+                        let g1 = p.graphs.batch.as_mut().ok_or_else(|| {
+                            ModelError::EngineInvariant {
+                                what: "TP 合批：peer 批图缺席(调度门失守)".into(),
+                            }
+                        })?;
+                        let (r0, r1) = crate::exec::join2(g0.step(&refs), g1.step(&refs)).await;
+                        r1?;
+                        r0?;
+                    }
+                }
+                let tok = g0.read_output_f32("token").await?;
                 let logits = if need_logits {
-                    Some(g.read_output_f32("logits").await?)
+                    Some(g0.read_output_f32("logits").await?)
                 } else {
                     None
                 };

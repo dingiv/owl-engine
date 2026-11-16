@@ -23,7 +23,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if ops.is_empty() {
             return Ok(());
         }
-        if self.bank.rel.snap_disk.is_none() {
+        if !self.bank.rel.snap_disk_enabled() {
             return Err(ModelError::EngineInvariant {
                 what: format!("盘层快照收尾:未接盘层却有 {} 张票", ops.len()),
             });

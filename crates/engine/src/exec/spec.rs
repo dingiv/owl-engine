@@ -165,6 +165,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             )));
         }
         let sid = self.turns.active()?.session_id;
+        // DFlash2 草稿图目前只烘焙了 ring0 的 K/V 叶（每会话一份 ring；
+        // 图族按 ring 捕获是下一刀）。ring1 走 eager（encode/propose 都已
+        // 按 ring 取视图），正确性不受影响，只少一层图加速。
+        let dflash_graph_ok =
+            self.turns.active()?.gdn_slot == 0 && self.dev.graphs.dflash.is_some();
         if grew {
             let ts_bt = std::time::Instant::now();
             self.write_bt(sid).await?;
@@ -736,7 +741,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             // **此处不还**（2026-10-28 M6）:`hidden` 在本轮 ⑦ 还要喂
             // `propose_round`（MTP）—— 旧实现在这里先 free 一次、⑦ 之后再
             // free 一次 ⇒ eager 档（`hidden_owned = true`）**双 free**
-            // （现场：`free: 双 free —— id=… 已在复用池(pooled)里`，
+            // （现场：`free: 双 free —— 账上已无 id=… 的在借登记`，
             // 四个请求全挂；图态 `hidden_owned = false` 所以从没暴露）。
             // 归还点统一在后一个（⑦ 之后，那也是本轮最后一次用 `hidden`）。
         }
@@ -760,7 +765,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         };
         let early_propose = if !round_done_early
             && !degraded_now
-            && self.dev.graphs.dflash.is_some()
+            && dflash_graph_ok
             && self
                 .dev
                 .spec_rt
@@ -932,7 +937,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if let Some(d2) = d2_arc7 {
             let ts = std::time::Instant::now();
             // E5-DF4:图态(单图一轮 encode+propose);图降级才走 eager 路
-            if self.dev.graphs.dflash.is_some() {
+            if dflash_graph_ok {
                 let d = self
                     .dflash_graph_round(m, pos, toks[m], lookup.as_ref())
                     .await?;
@@ -2322,9 +2327,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 let up = self
                     .bank
                     .rel
-                    .leg
                     .register_chain_inc_tagged(parent0, &blk_slices, &inc_tags)?;
-                self.bank.rel.leg.set_owner(sid, &up.inserted);
+                self.bank.rel.set_chain_owner(sid, &up.inserted);
                 mcnt("store.chain.inc.blocks", up.inserted.len() as u64);
                 mcnt("store.chain.inc.evicted", up.evicted.len() as u64);
             }
@@ -2561,7 +2565,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         if items.is_empty() {
             return Ok(());
         }
-        let Some(ix_geom) = self.bank.rel.index.as_ref().map(|i| i.geometry()) else {
+        let Some(ix_geom) = self.bank.rel.index().map(|i| i.geometry()) else {
             return Ok(()); // 索引未注册(未开采集)
         };
         let (dim, layers, kv_heads) = ix_geom;
@@ -2581,7 +2585,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let todo: Vec<&(owl_store::ChainHash, usize, usize)> = items
             .iter()
             .filter(|(h, _, _)| {
-                !self.bank.rel.index.as_ref().is_some_and(|i| i.contains(*h))
+                !self.bank.rel.index().is_some_and(|i| i.contains(*h))
             })
             .collect();
         if todo.is_empty() {
@@ -2807,7 +2811,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // **触达入 store 账**(§30.6-②):store 的 `last_use` 是出序输入;
         // 池的 `last_use` 只是物理面。两处同刻更新 ⇒ 判据与池不再漂。
-        self.bank.rel.state.touch(key);
+        self.bank.rel.touch_snap(key);
         owl_shared::metrics::with_metrics_store(|m| {
             m.counter_add("store.snap.in", 1, file!(), line!());
             m.counter_add(

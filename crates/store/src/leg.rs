@@ -496,7 +496,11 @@ impl BlockLeg {
     /// **整链搬盘候选**(S6.1;引擎/计划面共用):`(链尾, 整链块数, last_use)`。
     /// 只出"**整链都在宿主**"的链(半链无复用价值)。
     pub fn host_chain_candidates(&self, protect: &[ChainHash]) -> Vec<(ChainHash, usize, u64)> {
-        self.kv.host_chain_candidates(protect)
+        self.kv
+            .host_chain_candidates(protect)
+            .into_iter()
+            .filter(|(tail, _, _)| self.chain_fully_on_host(*tail))
+            .collect()
     }
 
     /// **宿主层候选**(S6:溢写到磁盘的取料面):树里 `slot = None` 的**叶**,
@@ -505,12 +509,29 @@ impl BlockLeg {
         let mut c = self.kv.evict_candidates(protect);
         c.retain(|x| x.tier == crate::tier::Tier::Host);
         c.sort_by_key(|x| x.last_use);
-        c.into_iter().take(limit).filter_map(|x| x.chain).collect()
+        c.into_iter()
+            .take(limit)
+            .filter_map(|x| x.chain)
+            .filter(|tail| self.chain_fully_on_host(*tail))
+            .collect()
     }
 
     /// **宿主层削减候选**(从最冷链尾向内;见 [`KvStore::host_prune_candidates`])。
     pub fn host_prune_candidates(&self, protect: &[ChainHash], limit: usize) -> Vec<ChainHash> {
-        self.kv.host_prune_candidates(protect, limit)
+        self.kv
+            .host_prune_candidates(protect, limit)
+            .into_iter()
+            .filter(|tail| self.chain_fully_on_host(*tail))
+            .collect()
+    }
+
+    /// **整链内容都在宿主层**（树 `slot=None` 还不够：盘上-only 的条目也是
+    /// `slot=None`，必须以宿主副本是否存在为准）。
+    fn chain_fully_on_host(&self, tail: ChainHash) -> bool {
+        self.kv
+            .chain_of(tail)
+            .iter()
+            .all(|b| self.host.get(b.chain).is_some())
     }
 
     /// **宿主层让位**(执行面兜底;纯内存,无 I/O):按"最冷链尾向内"真丢内容,
@@ -659,7 +680,7 @@ impl BlockLeg {
         self.kv
             .chain_of(tail)
             .into_iter()
-            .filter(|b| b.slot.is_none())
+            .filter(|b| b.slot.is_none() && self.host.get(b.chain).is_some())
             .count()
     }
 
@@ -671,7 +692,13 @@ impl BlockLeg {
 
     /// **从链尾向内连续在宿主的块数**（宿主腾位的整枝票长）。
     pub fn host_droppable_tail_span(&self, tail: ChainHash) -> usize {
-        self.kv.host_droppable_tail_span(tail)
+        // 从尾向内连续**真有宿主内容**的块；盘上-only 的 `slot=None` 不算。
+        self.kv
+            .chain_of(tail)
+            .iter()
+            .rev()
+            .take_while(|b| self.host.get(b.chain).is_some())
+            .count()
     }
 
     /// **从链尾向内连续可丢的设备块数**（`prune_branch` 的真实可达长度）。

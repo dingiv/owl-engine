@@ -45,6 +45,8 @@ mod openai;
 mod repeat_guard;
 // 视觉输入(主分支 V1–V5)
 mod vision_processor;
+// 互斥 VRAM 账(/debug/vram 的 ledger;2026-11-15 P0)
+mod vram_ledger;
 // 三通道流式解析器(增量文本 → 思考/正文/工具调用;agent 服务面 §4.5)
 mod toolcall;
 

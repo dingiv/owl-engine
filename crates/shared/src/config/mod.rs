@@ -70,8 +70,7 @@
 //! | model | head_quant | HeadQuant 枚举("off"\|"rtn-int4-g32"\|"rtn-int8-row")/ off |
 //! | pool | kv_dtype | KvDtype 枚举 `f16\|fp8\|int8` / f16(主 KV 池存储格式;2026-11-04 由两个布尔合成单键) |
 //! | pool | gdn_slots / snap_max | usize / 8、4 |
-//! | pool | pool_cap_mb | usize / 256(临时块复用池上限;0 = 不限) |
-//! | pool | vram_budget / vram_reserve_mb | f64、u64 / 0.97、1024 |
+//! //! | pool | vram_budget / vram_reserve_mb | f64、u64 / 0.97、714 |
 //! | pool | prefix_cache | bool / true(缓存可占整池;逐出到 host/disk) |
 //! | vision | enabled | bool / false(视觉塔开关;GGUF 档另有 `path` 指向 `mmproj-*.gguf`) |
 //! | vision | image_evict | bool / false(**前缀无感删除**:图像段打标记 ⇒ 页对齐 + 删除即位置帧平移,需 `[pool] prefix_cache`) |
@@ -833,6 +832,15 @@ pub struct ModelCfg {
     pub quant: QuantScheme,
 }
 
+/// **`vram_reserve_mb` 中属于图执行/warmup 的派生部分**(MiB)。
+///
+/// 单值 `vram_reserve_mb` 同时服务两件事:
+/// - 池 cap 预算:整值(含图执行 320 + warmup 138 + 运行时余量);
+/// - `vram-guard` 运行时硬预算:只该扣**真余量** —— 图/warmup 已经分配,
+///   再扣一次会让 2×112k 首 chunk 撞 `vram-hard-budget`(2026-11-16 实测)。
+/// 运行时余量 = `vram_reserve_mb - 本常数`。
+pub const POOL_GRAPH_WARMUP_RESERVE_MB: u64 = 458;
+
 /// 池几何与显存预算(engine StatePool)
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -860,21 +868,6 @@ pub struct PoolCfg {
     /// 只在 `边界页号 % stride == 0` 的边界拍(快照 27B ≈ 152 MiB/条 ⇒ 拍得越密,
     /// 宿主下沉流量越大;1 = 每个页边界都拍)。
     pub snap_decode_stride: usize,
-    /// **超卖档的「池外瞬态余量」MiB**(缺省 1024 = 历史硬编码值)。
-    ///
-    /// 语义:超卖档池吃满显存治理 `cap` 之后,**不在池里**的那部分分配
-    /// (prefill chunk 的激活/工作区、选择层视图、图 warmup、kernel 惰性保留)
-    /// 只能从池外挤 ⇒ 必须留一块空。
-    ///
-    /// **为什么要有这个旋钮**:该值原先**硬编码 1 GiB**
-    /// (`state.rs::pool` 2026-10-27),而代码注释自己写着"实测瞬态只要 24–68 MiB"。
-    /// 在 27B/a8/视觉档上 1 GiB = 池预算的 41%(32,768 tok / 32 KiB 每 token)——
-    /// 等于用**池容量**给不确定的瞬态买单。现在改成可观测、可扫的值。
-    ///
-    /// 取值口径:池 = `cap − ceil(本值 / per_tok)`;越小池越大,但**小于真实瞬态
-    /// 需求会撞 `vram-hard-budget` 拒发**(响亮,不静默)。扫档记录见
-    /// `roadmap.local/26-10-28-KVMem-位置定谳与三修.md` §13。
-    pub transient_reserve_mb: u64,
     /// **主 KV 池存储格式**(→ `KvQuant`)。既是存储 dtype 也是池几何
     /// (32/64 KiB 每 token),所以归池面而不是算子臂。
     ///
@@ -938,9 +931,6 @@ pub struct PoolCfg {
     pub snap_msg_min_span: usize,
     /// **宿主 KV 腿**(MiB;0 = 关层)。下沉的落点之一。
     pub host_cache_mb: usize,
-    /// **复用池容量上限**(MiB;缺口 4 收尾 P1-1;缺省 256,0 = 不限)。
-    /// 释放的临时块先进池复用、不立即还驱动;超出本上限的**逐块顶出**回驱动。
-    pub pool_cap_mb: usize,
     /// **宿主状态腿**(MiB;0 = 关层)。GDN 快照下沉的落点 ——
     /// ⚠️ 超卖档会把压力推给它(实测 27B 单快照 607 MiB),别只给 KV 腿留量。
     pub snap_host_mb: usize,
@@ -2178,10 +2168,8 @@ impl Default for PoolCfg {
             checkpoint_max_mb: 0,
             checkpoint_min_gap_ms: 5000,
             disk_dir: String::new(),
-            pool_cap_mb: 256,
             vram_budget: 0.97,
-            vram_reserve_mb: 1024,
-            transient_reserve_mb: 1024,
+            vram_reserve_mb: 714,
             prefix_cache: true,
             block_pool_bytes: 0,
             no_reclaim: false,
@@ -3395,11 +3383,6 @@ impl OwlConfig {
                     self.runtime.max_batch
                 ));
             }
-            if self.parallel.mode != ParallelMode::Single {
-                return Err(
-                    "[runtime] max_batch > 1 与 TP 不共戴天(AR 的批语义未审;先单卡)".into(),
-                );
-            }
             if self.kvmem.select_decode {
                 return Err(
                     "[runtime] max_batch > 1 与 [kvmem] select_decode 不共戴天                     (M1 合批页表按行铺,不做选择层视图)"
@@ -3621,11 +3604,8 @@ mod tests {
                 .is_err(),
             "gdn_slots < max_batch 应拒"
         );
-        assert!(
-            parse("[runtime]\nmax_batch = 2\nmax_concurrency = 2\n[pool]\ngdn_slots = 2\n[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\n")
-                .is_err(),
-            "合批 + TP 应拒"
-        );
+        parse("[runtime]\nmax_batch = 2\nmax_concurrency = 2\n[pool]\ngdn_slots = 2\n[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\n")
+            .expect("TP2 真批已落地:max_batch=2 应接受");
         assert!(
             parse("[runtime]\nmax_batch = 2\nmax_concurrency = 2\n[kvmem]\nselect_decode = true\n[pool]\ngdn_slots = 2\n")
                 .is_err(),

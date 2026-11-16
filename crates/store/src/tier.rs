@@ -76,14 +76,6 @@ impl AssetKind {
     /// 常驻系统面(Weight/Graph/Pool)也是保留面 —— 它们不参与 store 的
     /// 驱逐/下沉决策(不是池的可回收块)。`Unclassified` **不声称**保留
     /// (分类未知就不许替决策面下结论;当前决策面根本不读本函数)。
-    /// **可池化?**(缺口 4「临时池」的门;2026-10-19)——**决策产地 = store**:
-    /// 只有临时面(chunk 激活/工作区)进复用池;常驻面(权重/图/池骨架/地板/行)
-    /// 与缓存面(KV/快照/索引)**不许**被当作可复用临时块发放(它们的生命周期
-    /// 各自有主)。
-    pub fn poolable(self) -> bool {
-        matches!(self, AssetKind::Temp)
-    }
-
     /// 保留面(地板/行/元数据/权重/图/池骨架 —— 不参与临时块复用)
     pub fn is_reserved(self) -> bool {
         matches!(
@@ -295,6 +287,12 @@ impl TierLedger {
                 "换层源=目的({from:?});调用方算错相位"
             )));
         }
+        // 分类账与 owner 账必须同时在场；缺任一都是半态，先拒再改。
+        if !self.cells.contains_key(&(from, kind)) {
+            return Err(StoreError::Invariant(format!(
+                "{from:?}/{kind:?} 无分类账可换(幽灵换层)"
+            )));
+        }
         let src = self.owners.get_mut(&(owner, from, kind)).ok_or_else(|| {
             StoreError::Invariant(format!(
                 "{} 在 {from:?}/{kind:?} 无账可换(幽灵换层)",
@@ -427,9 +425,11 @@ impl TierLedger {
             rows.push(TierRow { tier: *tier, kind: *kind, bytes: cell.bytes, entries: cell.entries });
         }
         TierReport {
-            rows,
+            cells: rows,
+            views: Vec::new(),
             owners: self.detail(),
             gpu_used: self.used(Tier::Gpu),
+            gpu_views_bytes: 0,
             host_used: self.used(Tier::Host),
             disk_used: self.used(Tier::Disk),
             host_cap: self.budget.host_bytes,
@@ -454,15 +454,20 @@ pub struct TierRow {
 /// 三层报告。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TierReport {
-    /// 明细行。
-    pub rows: Vec<TierRow>,
+    /// **互斥账行**(事件账 + store 语义账；可相加，GPU 和 = `gpu_used`)。
+    pub cells: Vec<TierRow>,
+    /// **腿自报视图行**(KV/快照等逻辑面；可能落在 Pool 预留块内部，
+    /// 不可与 `cells` 相加；同 key 的 cells 已扣除)。
+    pub views: Vec<TierRow>,
     /// **owner 维明细**(字节降序;第 0 刀 —— 泄漏判据面)。
     pub owners: Vec<OwnerRow>,
-    /// GPU 总占用。
+    /// GPU **互斥账**合计（不含腿视图）。
     pub gpu_used: usize,
-    /// host 总占用。
+    /// GPU **腿视图**合计（不可与 `gpu_used` 相加）。
+    pub gpu_views_bytes: usize,
+    /// host 总占用（cells + views）。
     pub host_used: usize,
-    /// 盘总占用。
+    /// 盘总占用（cells + views）。
     pub disk_used: usize,
     /// host 上限(0 = 关层)。
     pub host_cap: usize,
@@ -536,6 +541,32 @@ mod tests {
         assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Temp), 0);
         assert_eq!(b.open_total_bytes(), 0);
         assert_eq!(b.hook_fail(), 0);
+    }
+
+    /// **归属清点不得静默丢账**：出账失败时保留 loan，不把 id 交给调用方 free。
+    #[test]
+    fn drain_owner_keeps_loan_when_account_is_missing() {
+        use owl_iface::handle::{AllocEvent, AssetClass, Owner as IfOwner};
+        let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        let mut b = LedgerBook::new(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
+        b.on_alloc(&AllocEvent {
+            id: 21,
+            bytes: 4096,
+            name: "chunk.ws".into(),
+            class: AssetClass::Temp,
+            owner: IfOwner::Turn(7),
+            rank: 0,
+        });
+        // 人为制造“登记在、三层账不在”的坏账，模拟上游半态。
+        b.tiers_mut()
+            .remove_owned(IfOwner::Turn(7), Tier::Gpu, AssetKind::Temp, 4096)
+            .expect("先摘三层账");
+        let (ids, bytes) = b.drain_owner(IfOwner::Turn(7), None);
+        assert!(ids.is_empty(), "出账失败不得交出 id");
+        assert_eq!(bytes, 0);
+        assert_eq!(b.open_count(), 1, "loan 必须保留可重试");
+        assert_eq!(b.hook_fail(), 1, "失败必须计数");
+        let _ = cell;
     }
 
     /// **步 2 门 ②**:双持 / 幽灵归还**响亮拒**(计数,不 panic、不静默)
@@ -635,86 +666,6 @@ mod tests {
         assert!(!AssetKind::from(A::Unclassified).is_reserved(), "未分类不声称保留");
     }
 
-    /// **缺口 4 门:临时池三条律**
-    #[test]
-    fn temp_pool_reuses_released_blocks_and_sweeps_owner() {
-        use owl_iface::handle::{AllocEvent, Owner as IfOwner};
-        let cell = shared_ledger(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
-        let mut b = LedgerBook::new(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
-        // ① 入账(temp 类)+ 释放 ⇒ 入池(不回驱动),仍在借
-        b.on_alloc(&AllocEvent {
-            id: 11,
-            bytes: 4096,
-            name: "chunk.ws".into(),
-            class: owl_iface::handle::AssetClass::Temp,
-            owner: IfOwner::Turn(1),
-            rank: 0,
-        });
-        assert!(b.pool_release(11).is_empty(), "空 = 已入池");
-        assert_eq!(b.open_count(), 1, "**入池 ≠ 归还**:块仍在借");
-        assert_eq!(b.pool_stats(), (1, 4096));
-        // ② 同类同尺寸命中;异类/异尺寸不命中(尺寸错 = 双错)
-        assert_eq!(b.pool_acquire(0, AssetKind::Temp, 4096), Some(11));
-        assert_eq!(b.pool_acquire(0, AssetKind::Temp, 8192), None);
-        assert_eq!(b.pool_acquire(0, AssetKind::KvBlock, 4096), None);
-        let (hits, misses, _) = b.pool_counters();
-        assert_eq!((hits, misses), (1, 2), "命中/未中计数");
-        // **P0-1**:rank 不匹配不命中(TP 两 rank 共写一本账 ⇒ 键必须带 rank)
-        assert!(b.pool_release(11).is_empty());
-        assert_eq!(b.pool_acquire(1, AssetKind::Temp, 4096), None, "rank1 不许拿 rank0 的块");
-        assert_eq!(b.pool_acquire(0, AssetKind::Temp, 4096), Some(11), "本 rank 可拿");
-        // **P0-2**:同一块二次入池 ⇒ 响亮拒(不 push 第二份),且不交回调用方去 free
-        assert!(b.pool_release(11).is_empty(), "首次入池");
-        let fails_before = b.hook_fail();
-        assert!(b.pool_release(11).is_empty(), "二次入池 ⇒ 拒(不产生第二份)");
-        assert_eq!(b.hook_fail(), fails_before + 1, "双次入池必须计数");
-        assert_eq!(b.pool_stats(), (1, 4096), "池里仍只有 1 份");
-        let _ = b.pool_acquire(0, AssetKind::Temp, 4096);
-        // ③ 不可池化类:拒绝(bool = false ⇒ 调用方必须真归还)
-        b.on_alloc(&AllocEvent {
-            id: 12,
-            bytes: 1024,
-            name: "weight".into(),
-            class: owl_iface::handle::AssetClass::Weight,
-            owner: IfOwner::Turn(1),
-            rank: 0,
-        });
-        assert_eq!(b.pool_release(12), vec![12], "常驻面不许进池 ⇒ 同 id 真归还");
-        // ④ 清点:池内 Turn(1) → Cache(改归属,不变 tier/kind);非池块**不动**
-        assert!(b.pool_release(11).is_empty(), "重新入池(供清点)");
-        let swept = b.pool_sweep(IfOwner::Turn(1), IfOwner::Cache);
-        assert_eq!(swept, (1, 4096), "只清点池内那块");
-        assert_eq!(b.open_bytes(IfOwner::Turn(1)), 1024, "非池块仍归 turn(泄漏可见)");
-        assert_eq!(b.open_bytes(IfOwner::Cache), 4096);
-        assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Temp), 4096, "temp 面仍平");
-        assert_eq!(b.tiers().kind_bytes(Tier::Gpu, AssetKind::Weight), 1024, "常驻面另账");
-        let _ = cell;
-    }
-
-    /// **池上限门**(2026-10-19 实测:27B 一轮后池囤到 669 MiB ⇒ 必须有界):
-    /// 超上限时 `pool_release` 顶出**最旧**块并把它的 id 交回(调用方真还驱动)。
-    #[test]
-    fn pool_cap_evicts_oldest_and_hands_back_id() {
-        use owl_iface::handle::{AllocEvent, Owner as IfOwner};
-        let mut b = LedgerBook::new(TierBudget { host_bytes: 1 << 20, disk_bytes: 0 });
-        b.set_pool_cap(4096); // 只装 1 块
-        for (id, name) in [(1u64, "a"), (2, "b")] {
-            b.on_alloc(&AllocEvent {
-                id,
-                bytes: 4096,
-                name: name.into(),
-                class: owl_iface::handle::AssetClass::Temp,
-                owner: IfOwner::Turn(1),
-                rank: 0,
-            });
-        }
-        assert!(b.pool_release(1).is_empty(), "第一块入池");
-        assert_eq!(b.pool_release(2), vec![1], "超上限 ⇒ 顶出最旧(1),由调用方真还");
-        assert_eq!(b.pool_stats(), (1, 4096), "池内只剩最新那块");
-        assert_eq!(b.pool_evicted(), 1, "顶出计数");
-        assert_eq!(b.pool_cap(), 4096, "上限可查(报告面)");
-    }
-
     /// **第 0 刀:owner 维**(每字节唯一归属;出账逐 owner 判,不替他人平账)
     #[test]
     fn owner_dimension_balances_and_rejects_cross_owner_release() {
@@ -762,14 +713,9 @@ pub struct Loan {
     pub tier: Tier,
     /// 全量字节(登记值 —— 出账/换层都按它扣)。
     pub bytes: usize,
-    /// 分配点点名(排障:哪一处要的这块;池复用**不改名** —— 名字 = 首生名,见收尾单 P2-2)。
+    /// 分配点点名(排障:哪一处要的这块;GPU 默认池复用**不改名** ——
+    /// 名字 = 首生名)。
     pub name: String,
-    /// **是否在池内**(P0-2:同一块二次入池 = 别名事故 ⇒ 响亮拒)。
-    /// 入池置 true;池取命中置 false;真归还随登记一起删。
-    pub pooled: bool,
-    /// **已被池上限顶出、等待真归还**(2026-10-20)。置位后本次 free 必须
-    /// **真还驱动**(不能再入池,否则同一块在池/待还两态间打转)。
-    pub evicted: bool,
 }
 
 /// **共享账本单元** = 三层账(决策面)+ 出借登记(事件面)。
@@ -787,27 +733,6 @@ pub struct LedgerBook {
     /// 与 `hook_fail` 分开:后者必须恒为 0(真失败信号),本计数只说明
     /// "该资产的事件层账不适用(以腿自报为准)"。
     partial_moves: u64,
-    /// **临时块池**(缺口 4;2026-10-19):`(kind, bytes) → 可复用 id 栈`(LIFO)。
-    ///
-    /// 三条律:
-    /// 1. **同 rank + 同 kind + 同尺寸**才复用(P0-1:TP 两 rank 共写一本账 ⇒
-    ///    键必须带 rank,否则跨卡发句柄;尺寸不等 = 形状/账目双错 ⇒ 不许);
-    /// 2. **只有"已被持有者释放"的块入池**(`on_free` 路径),池成员 = 无活持有者
-    ///    ⇒ 再发放不会造成别名/UAF;
-    /// 3. 入池**不等于归还**:块仍在借(账上照旧占着),只是**可复用** ——
-    ///    真还驱动 = 压力/关会话时的池排空(N6)。
-    pool: BTreeMap<(u8, AssetKind, usize), Vec<u64>>,
-    /// **池容量上限**(字节;2026-10-19 实测 27B 一轮后池囤到 669 MiB ⇒ 必须有界):
-    /// 超限时 `pool_release` **顶出最旧块**并把 id 交回调用方(真还驱动)。
-    /// 缺省 = `pool_cap_default()`;boot 可用 `set_pool_cap` 覆写。
-    pool_cap: usize,
-    /// 池命中/未命中(打点:复用率 = hits/(hits+misses))
-    pool_hits: u64,
-    pool_misses: u64,
-    /// 池排空(真还驱动)计数 —— N6 前恒 0
-    pool_drained: u64,
-    /// **超上限顶出**计数(顶出的块已真还驱动)
-    pool_evicted: u64,
 }
 
 impl LedgerBook {
@@ -818,12 +743,6 @@ impl LedgerBook {
             open: BTreeMap::new(),
             hook_fail: 0,
             partial_moves: 0,
-            pool: BTreeMap::new(),
-            pool_cap: pool_cap_default(),
-            pool_hits: 0,
-            pool_misses: 0,
-            pool_drained: 0,
-            pool_evicted: 0,
         }
     }
 
@@ -855,6 +774,17 @@ impl LedgerBook {
     /// 某 owner 的出借字节(诊断面)。
     pub fn open_bytes(&self, owner: Owner) -> usize {
         self.open.values().filter(|l| l.owner == owner).map(|l| l.bytes).sum()
+    }
+
+    /// **按块名前缀统计在借字节**(实测草稿权重等固定项;名称词表由调用方给)。
+    ///
+    /// 只读当前 `open` 登记,不改变账;同一前缀命中多块按字节累加。
+    pub fn open_bytes_by_prefixes(&self, prefixes: &[&str]) -> usize {
+        self.open
+            .values()
+            .filter(|l| prefixes.iter().any(|p| l.name.starts_with(p)))
+            .map(|l| l.bytes)
+            .sum()
     }
 
     /// 出借总字节(与块账房全等门的左值)。
@@ -896,223 +826,15 @@ impl LedgerBook {
             .collect()
     }
 
-    /// **池取块**(同 kind + 同尺寸才给;`None` = 未命中 ⇒ 调用方走真分配)。
-    pub fn pool_acquire(&mut self, rank: u8, kind: AssetKind, bytes: usize) -> Option<u64> {
-        let id = self.pool.get_mut(&(rank, kind, bytes)).and_then(|v| v.pop());
-        match id {
-            Some(id) => {
-                self.pool_hits = self.pool_hits.saturating_add(1);
-                // 出池即回到"借出"态(再次入池前不许被二次释放)
-                if let Some(l) = self.open.get_mut(&id) {
-                    l.pooled = false;
-                }
-                Some(id)
-            }
-            None => {
-                self.pool_misses = self.pool_misses.saturating_add(1);
-                None
-            }
-        }
-    }
-
-    /// **池还块**(只在 `on_free` 路径调:持有者已声明不再引用)。
-    ///
-    /// 返回 = **必须真归还驱动**的 id 列表(调用方逐条 `free` + `FreeEvent`):
-    /// - 空 = 本次**已入池**(调用方不要碰驱动);
-    /// - `[id]` = 该块不可池化/不在借(同一个 id),或**单块就超池上限**;
-    /// - `[old…]` = 为腾容量**顶出的最旧块**(可能**多块**)。
-    ///
-    /// ⚠️ **2026-10-20 定谳**:旧实现只返回**最后一块**被顶出的 id —— 一次
-    /// 还块要腾多块时,前面被顶出的 id 从池里摘掉却**无人释放**:设备内存
-    /// 永远不还、loan 永远 `pooled=true` 且不在池里 ⇒ 每 chunk 泄漏数 MiB
-    /// (GGUF 27B 262k 联调实测:5k prompt 泄漏 314 MiB,turn 账与池账对不上)。
-    /// 本函数现在**逐块收集**顶出集,一个都不丢。
-    ///
-    /// 顶出策略 = **FIFO 最旧**(池是"复用缓存",旧块留着只是白占;上限内保留
-    /// 最近释放的,与 CPU cache 的 LRU 直觉一致)。计数入 `pool_evicted`。
-    pub fn pool_release(&mut self, id: u64) -> Vec<u64> {
-        self.pool_release_on(id, None)
-    }
-
-    /// **带调用面 rank 的归还**(防呆门;2026-10-20):`rank` = 发起 free 的句柄的设备序。
-    ///
-    /// 块只能在**它自己那个 server** 的块表里被 free;与 `Loan.rank` 不符 ⇒
-    /// **响亮记错**(`hook_fail` + stderr)并返回**空**(不真还)—— 因为错面真还
-    /// 必然打空(服务器静默返回 0),那正是 §79 那条 ±2.8 GiB/turn 的泄漏。
-    /// 留在账上 ⇒ turn 收尾的**逐 rank 兜底**会把它还到正确的面
-    /// (错面 free 降级为"延迟还",而不是"静默丢")。
-    pub fn pool_release_on(&mut self, id: u64, rank: Option<u8>) -> Vec<u64> {
-        let Some(l) = self.open.get(&id).cloned() else { return vec![id] };
-        if let Some(rk) = rank {
-            if l.rank != rk {
-                self.fail(
-                    "跨 rank 归还(块只能在自己的 server 上 free)",
-                    format!("id={id} name={} 块属 rank{} 但由 rank{rk} 发起", l.name, l.rank),
-                );
-                return Vec::new();
-            }
-        }
-        if !l.kind.poolable() {
-            return vec![id];
-        }
-        // 池上限顶出过的块 = **待真还**;再入池会让它永远在"池↔待还"之间打转
-        if l.evicted {
-            return vec![id];
-        }
-        // **P0-2**:同一块二次入池 ⇒ 池里会有两份 ⇒ 两个未来 alloc 拿到同一 id(别名)。
-        // 响亮拒(计数可见),且**不**把它交回调用方去 free(它已在池里)。
-        if l.pooled {
-            self.fail("双次入池(同一块重复释放)", format!("id={id} name={}", l.name));
-            return Vec::new();
-        }
-        let key = (l.rank, l.kind, l.bytes);
-        // 上限:池内字节 + 本块 > cap ⇒ 顶出最旧块(跨尺寸类也顶,先保总量)。
-        // **所有**被顶出的块都要交回调用方(见函数头注的 2026-10-20 定谳)。
-        // ⚠️ **只顶同 rank**(2026-10-20,§79):池是**两 rank 共用**的一本账,而块的 free
-        // 只能打到**它自己那个 server** —— 跨 rank 顶出 ⇒ 调用方拿别的面去 free ⇒
-        // 服务器块表里找不到 ⇒ **静默漏**(实测 `free: 0/1` ≈2048 次/轮,主体正是
-        // `owl_add_f16`/`owl_fused_add_rmsnorm_f16` 这些高频残留流块)。
-        let mut evicted: Vec<u64> = Vec::new();
-        while self.pool_bytes() + l.bytes > self.pool_cap {
-            let Some(old_key) = self
-                .pool
-                .iter()
-                .find(|((rk, _, _), v)| *rk == l.rank && !v.is_empty())
-                .map(|(k, _)| *k)
-            else {
-                break;
-            };
-            if let Some(v) = self.pool.get_mut(&old_key) {
-                if let Some(old) = v.first().copied() {
-                    v.remove(0);
-                    self.pool_evicted = self.pool_evicted.saturating_add(1);
-                    // 出池待还:清 pooled、置 evicted(否则下一次 free 会把它当
-                    // "双次入池"拒掉 ⇒ 既没还又留账 —— 实测就是这么冒出来的)
-                    if let Some(m) = self.open.get_mut(&old) {
-                        m.pooled = false;
-                        m.evicted = true;
-                    }
-                    evicted.push(old);
-                    continue;
-                }
-            }
-            self.pool.remove(&old_key);
-        }
-        // 单块就超上限(极端档):腾空也装不下 ⇒ 本块也真归还(池不可用)。
-        if self.pool_bytes() + l.bytes > self.pool_cap {
-            evicted.push(id);
-            return evicted;
-        }
-        self.pool.entry(key).or_default().push(id);
-        if let Some(m) = self.open.get_mut(&id) {
-            m.pooled = true;
-        }
-        evicted
-    }
-
-    /// 池内字节(键 × 块数的快速求和)。
-    fn pool_bytes(&self) -> usize {
-        self.pool.iter().map(|((_, _, b), v)| b * v.len()).sum()
-    }
-
-    /// boot/测试:设池容量上限(0 = 不限;>0 = 硬上限)。
-    pub fn set_pool_cap(&mut self, bytes: usize) {
-        self.pool_cap = bytes;
-    }
-
-    /// 池上限(报告面)。
-    pub fn pool_cap(&self) -> usize {
-        self.pool_cap
-    }
-
-    /// **N4 池清点**:把**池内**`from` 名下的块改归属 `to`(池 = 共享复用面,
-    /// 不再是某个 turn 的临时面),返回 `(块数, 字节)`。
-    ///
-    /// 为什么安全:池成员**按构造**无活持有者(只在 `free` 路径入池)⇒ 换归属
-    /// 不改变任何人的持有事实;而"真没归还"的块(不在池里)**不换** ——
-    /// 它们保持 `Turn(t)` 归属,继续在 N4 清单里点名(泄漏 vs 复用从此可分)。
-    pub fn pool_sweep(&mut self, from: Owner, to: Owner) -> (usize, usize) {
-        let pooled: Vec<u64> = self.pool.values().flatten().copied().collect();
-        let mut n = 0usize;
-        let mut bytes = 0usize;
-        for id in pooled {
-            let Some(l) = self.open.get(&id).cloned() else { continue };
-            if l.owner != from {
-                continue;
-            }
-            if self.tiers.reown(l.owner, to, l.tier, l.kind, l.bytes).is_err() {
-                self.fail("池清点改归属失败", format!("id={id}"));
-                continue;
-            }
-            if let Some(m) = self.open.get_mut(&id) {
-                m.owner = to;
-            }
-            n += 1;
-            bytes += l.bytes;
-        }
-        (n, bytes)
-    }
-
-    /// **池排空**(N6 压力路径):清空池并**交出全部 id** —— 调用方负责真归还驱动
-    /// (逐条 `FreeEvent` 销账)。返回的 id 顺序 = 池内 LIFO 逆序(无语义)。
-    /// **池排空**(N6):只排**本 rank** 的条目 —— 块只能在自己那个 server 上 free
-    /// (跨 rank 返回的 id 必然打空,见 `pool_release` 的同款注记)。
-    pub fn pool_drain(&mut self, rank: Option<u8>) -> Vec<u64> {
-        let mut ids: Vec<u64> = Vec::new();
-        for ((rk, _, _), v) in self.pool.iter_mut() {
-            if rank.is_none_or(|r| *rk == r) {
-                ids.append(v);
-            }
-        }
-        self.pool.retain(|_, v| !v.is_empty());
-        if !ids.is_empty() {
-            self.pool_drained = self.pool_drained.saturating_add(1);
-        }
-        ids
-    }
-
-    /// **按类明细**(P2-3;报告面):`(kind, entries, bytes)`,字节降序。
-    // 结构性豁免(2026-11-02 clippy 清理):排序键是复合比较(多字段/方向混合),抽 key 会丢掉可读性
-    #[allow(clippy::unnecessary_sort_by)]
-    pub fn pool_by_class(&self) -> Vec<(AssetKind, usize, usize)> {
-        let mut agg: BTreeMap<AssetKind, (usize, usize)> = BTreeMap::new();
-        for ((_, kind, bytes), v) in &self.pool {
-            let e = agg.entry(*kind).or_insert((0, 0));
-            e.0 += v.len();
-            e.1 += bytes * v.len();
-        }
-        let mut out: Vec<(AssetKind, usize, usize)> =
-            agg.into_iter().map(|(k, (n, b))| (k, n, b)).collect();
-        out.sort_by(|a, b| b.2.cmp(&a.2));
-        out
-    }
-
-    /// 池内块数 / 字节(一等指标)。
-    pub fn pool_stats(&self) -> (usize, usize) {
-        let n = self.pool.values().map(|v| v.len()).sum();
-        let b: usize = self.pool.iter().map(|((_, _, bytes), v)| bytes * v.len()).sum();
-        (n, b)
-    }
-
-    /// 池命中/未命中/排空计数。
-    pub fn pool_counters(&self) -> (u64, u64, u64) {
-        (self.pool_hits, self.pool_misses, self.pool_drained)
-    }
-
-    /// 超上限顶出计数(顶出块已真还驱动)。
-    pub fn pool_evicted(&self) -> u64 {
-        self.pool_evicted
-    }
-
     /// **该 id 是否有在借登记**(账本审计探针;`OWL_LEDGER_AUDIT`)。
     pub fn has_loan(&self, id: u64) -> bool {
         self.open.contains_key(&id)
     }
 
-    /// **借出状态**(`Some((rank, pooled))`);`None` = 无登记。
+    /// **借出状态**(`Some(rank)`);`None` = 无登记。
     /// 消费点 = `DeviceHandle::free` 的归还前置校验(幽灵/双 free/跨 rank 三判据)。
-    pub fn loan_state(&self, id: u64) -> Option<(u8, bool)> {
-        self.open.get(&id).map(|l| (l.rank, l.pooled))
+    pub fn loan_state(&self, id: u64) -> Option<u8> {
+        self.open.get(&id).map(|l| l.rank)
     }
 
     /// 在借块的点名(硬错误自解释)
@@ -1148,9 +870,7 @@ impl LedgerBook {
     ///
     /// 语义:把 `owner` 名下**仍开着**的块整批结清 ——
     /// 1. 删出借登记(out of `open`)并**出三层账**(与 `on_free` 同式);
-    /// 2. **摘池索引**(池内块 `pooled = true` 也在内:池成员 = 无活持有者,
-    ///    归还驱动是安全的,只是丢了下次复用);
-    /// 3. 返回 `(id 清单, 字节数)` 交调用方**真归还驱动**(结清口径 free:
+    /// 2. 返回 `(id 清单, 字节数)` 交调用方**真归还驱动**(结清口径 free:
     ///    账已结清 ⇒ 不再补 `FreeEvent`)。
     ///
     /// 为什么需要:**turn 收尾清点只报告不处置**时,任何漏 free 的调用点都会让
@@ -1188,19 +908,23 @@ impl LedgerBook {
             return (ids, 0);
         }
         let mut bytes = 0usize;
+        let mut drained = Vec::with_capacity(ids.len());
         for id in &ids {
-            if let Some(l) = self.open.remove(id) {
-                bytes += l.bytes;
-                let _ = self.tiers.remove_owned(l.owner, l.tier, l.kind, l.bytes);
-                if l.pooled {
-                    for v in self.pool.values_mut() {
-                        v.retain(|x| x != id);
-                    }
+            let Some(l) = self.open.get(id).cloned() else {
+                continue;
+            };
+            match self.tiers.remove_owned(l.owner, l.tier, l.kind, l.bytes) {
+                Ok(()) => {
+                    self.open.remove(id);
+                    drained.push(*id);
+                    bytes += l.bytes;
                 }
+                // 出账失败 = 账本自身不平；保留 loan 并响亮计数，
+                // 不把 id 交给调用方真 free（否则登记/账目双失）。
+                Err(e) => self.fail("归属清点出账失败", format!("id={id} {e}")),
             }
         }
-        self.pool.retain(|_, v| !v.is_empty());
-        (ids, bytes)
+        (drained, bytes)
     }
 
     /// 归属清点(无异例;等价 `drain_owner_except(.., &[])`)。
@@ -1266,8 +990,6 @@ impl LedgerBook {
                         tier: Tier::Gpu,
                         bytes: ev.bytes,
                         name: ev.name.clone(),
-                        pooled: false,
-                        evicted: false,
                     },
                 );
             }
@@ -1277,14 +999,18 @@ impl LedgerBook {
 
     /// 归还(注销 + 出账;字节按**登记**扣 —— 事件只带 id)。
     pub fn on_free(&mut self, ev: &owl_iface::handle::FreeEvent) {
-        let Some(l) = self.open.remove(&ev.id) else {
+        let Some(l) = self.open.get(&ev.id).cloned() else {
             self.fail("幽灵归还(未登记)", format!("id={}", ev.id));
             return;
         };
+        // **先出账、后注销登记**：出账失败时保留 loan，调用方可重试；
+        // 旧顺序先 remove 再出账，失败后既无登记也无账可查。
         let res = self.tiers.remove_owned(l.owner, l.tier, l.kind, l.bytes);
         if let Err(e) = res {
             self.fail("出账失败", format!("id={} {e}", ev.id));
+            return;
         }
+        self.open.remove(&ev.id);
     }
 
     /// 换层(**不注销**:owner/entries 不变;tier 迁移)。
@@ -1338,15 +1064,6 @@ impl LedgerBook {
 /// HTTP 线程 ⇒ `Rc` 在那条路径上是真的 UB。单线程热路径无争用锁 ≈ ns 级。
 pub type SharedLedger = std::sync::Arc<std::sync::Mutex<LedgerBook>>;
 
-/// **池容量缺省上限** = 256 MiB。
-///
-/// 依据(2026-10-19 真机):27B 单轮释放后池天然囤到 **669 MiB**;而下一轮几乎
-/// 不会用到同一尺寸集合的全部(复用率 ~37%)⇒ 无界池 = 新形态囤积。256 MiB
-/// 覆盖实测单轮热集的大头,h按超出量逐块顶出回驱动。
-pub fn pool_cap_default() -> usize {
-    256 << 20
-}
-
 /// **建账**(boot 唯一入口;预算只能给一次 —— 池上限随账走)。
 pub fn shared_ledger(budget: TierBudget) -> SharedLedger {
     std::sync::Arc::new(std::sync::Mutex::new(LedgerBook::new(budget)))
@@ -1380,23 +1097,7 @@ impl owl_iface::handle::AllocLedger for LedgerEntry {
         book_lock(&self.book).on_alloc(ev);
     }
 
-    fn pool_acquire(
-        &mut self,
-        rank: u8,
-        class: owl_iface::handle::AssetClass,
-        bytes: usize,
-    ) -> Option<u64> {
-        let kind = AssetKind::from(class);
-        book_lock(&self.book).pool_acquire(rank, kind, bytes)
-    }
-
-    fn pool_release(&mut self, id: u64) -> Vec<u64> {
-        book_lock(&self.book).pool_release(id)
-    }
-    fn pool_release_on(&mut self, id: u64, rank: Option<u8>) -> Vec<u64> {
-        book_lock(&self.book).pool_release_on(id, rank)
-    }
-    fn loan_state(&mut self, id: u64) -> Option<(u8, bool)> {
+    fn loan_state(&mut self, id: u64) -> Option<u8> {
         book_lock(&self.book).loan_state(id)
     }
     fn loan_name(&mut self, id: u64) -> Option<String> {

@@ -330,6 +330,11 @@ impl Admission {
                 "set_active_slots: slot_bytes = 0".into(),
             ));
         }
+        // **先校验 turn 再定档**：旧顺序会先把 `slot_bytes` 写死，
+        // 再因 turn 缺失返回错误，留下“宽度已变、活跃集未变”的半态。
+        if !self.active.contains_key(&turn) {
+            return Err(StoreError::Unknown(format!("turn {turn}")));
+        }
         if self.slot_bytes == 0 {
             self.slot_bytes = slot_bytes;
         } else if self.slot_bytes != slot_bytes {
@@ -346,6 +351,16 @@ impl Admission {
         t.floor_bytes = blocks.len().saturating_mul(slot_bytes);
         t.slots = blocks;
         Ok(())
+    }
+
+    /// 活跃 turn 是否在册（段边界同步的预检口）。
+    pub fn has_active(&self, turn: u64) -> bool {
+        self.active.contains_key(&turn)
+    }
+
+    /// 已定档的活跃槽宽（0 = 尚未接过块身份）。
+    pub fn slot_bytes(&self) -> usize {
+        self.slot_bytes
     }
 
     /// 缓存面驻留登记(入账/出账由调用方配对)。
@@ -730,6 +745,13 @@ mod tests {
 
     /// **P0-3**:两个活跃 turn 共享前缀时,保留面按槽号并集计,
     /// 第三个同尺寸 turn 不应因重复计数被误拒。
+    #[test]
+    fn active_slots_missing_turn_does_not_set_width() {
+        let mut a = Admission::new();
+        assert!(a.set_active_slots(1, [1u32], 1 << 20).is_err());
+        assert_eq!(a.slot_bytes(), 0, "失败不得把槽宽定死");
+    }
+
     #[test]
     fn shared_prefix_is_counted_once() {
         let b = pool_budget(3, 4 << 20); // 4MiB 池;1MiB/块

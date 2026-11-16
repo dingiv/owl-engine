@@ -153,35 +153,36 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=max-context:桶上界 1024");
             b.set("runtime.prefill_tail_merge", 512i64.into(), "goal=max-context:尾块并入桶");
             b.set("pool.vram_budget", 0.99f64.into(), "goal=max-context:贴顶");
-            b.set("pool.vram_reserve_mb", 256i64.into(), "goal=max-context:最小守卫");
+            b.set("pool.vram_reserve_mb", 714i64.into(), "goal=max-context:总预留(含图/warmup/碎片)");
         }
         Goal::MaxSpeed => {
             b.set("runtime.prefill_chunk", 1024i64.into(), "goal=max-speed:大块摊薄固定税");
             b.set("runtime.prefill_tail_merge", 0i64.into(), "goal=max-speed:不做尾合并");
             b.set("pool.vram_budget", 0.99f64.into(), "goal=max-speed:贴顶");
-            b.set("pool.vram_reserve_mb", 512i64.into(), "goal=max-speed:留瞬态余量");
+            b.set("pool.vram_reserve_mb", 970i64.into(), "goal=max-speed:总预留(含图/warmup/碎片)");
         }
         Goal::Balanced => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=balanced");
             b.set("runtime.prefill_tail_merge", 512i64.into(), "goal=balanced");
             b.set("pool.vram_budget", 0.97f64.into(), "goal=balanced");
-            b.set("pool.vram_reserve_mb", 512i64.into(), "goal=balanced");
+            b.set("pool.vram_reserve_mb", 970i64.into(), "goal=balanced:总预留");
         }
         Goal::LowMemory => {
             b.set("runtime.prefill_chunk", 512i64.into(), "goal=low-memory:小激活面");
             b.set("runtime.prefill_tail_merge", 0i64.into(), "goal=low-memory");
             b.set("pool.vram_budget", 0.99f64.into(), "goal=low-memory");
-            b.set("pool.vram_reserve_mb", 512i64.into(), "goal=low-memory:留瞬态余量");
+            b.set("pool.vram_reserve_mb", 970i64.into(), "goal=low-memory:总预留");
         }
     }
 
     // 并发单键三处同源
     let c = intent.concurrency;
     let mut max_batch = c.min(8);
-    if intent.kvmem == KvmemIntent::Overcommit || tp {
-        // M1 合批与选择层视图/TP 不共戴
+    if intent.kvmem == KvmemIntent::Overcommit {
+        // 超卖档批路与选择层视图不共戴（池小于上下文，页表按行铺）。
         max_batch = 1;
     }
+    let _ = tp;
     if c > 8 {
         warnings.push(format!(
             "concurrency={c} > 8:max_batch 限制为 8(Concat 8 槽),其余请求按 max_concurrency 排队"
@@ -189,7 +190,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     }
     if c > 1 {
         warnings.push(format!(
-            "concurrency={c}:≥2 活跃 turn 的批路走 v2 注意力(FI 臂只服务 T=1 单行);\
+            "concurrency={c}:≥2 活跃 turn 走 v2 注意力批（TP2 也走真批 AR）；\
              非超卖档池按上下文×{c} 计"
         ));
     }
@@ -367,7 +368,7 @@ pub fn apply(value: &mut Value, origins: &mut Origins) -> Result<Option<ResolveM
     let inp = MemoryInputs {
         total_bytes: hw.total_bytes,
         vram_budget: get_f64(&out, "pool.vram_budget").unwrap_or(0.97),
-        reserve_bytes: (get_usize(&out, "pool.vram_reserve_mb").unwrap_or(1024) as u64) << 20,
+        reserve_bytes: (get_usize(&out, "pool.vram_reserve_mb").unwrap_or(714) as u64) << 20,
         model,
         spec_dflash: intent.spec == SpecIntent::Dflash,
         // 内存模型只关心"每元素几字节"——直接给字节数,不再用布尔表达格式。
@@ -693,7 +694,7 @@ mode = "greedy"
         assert_eq!(c.model.quant, crate::config::QuantScheme::W4a16);
 
         // 上下文/并发/预填充
-        assert_eq!(c.runtime.max_seq, 131_072, "context=max ⇒ 模型 max_pos");
+        assert_eq!(c.runtime.max_seq, 143_360, "context=max ⇒ 合并预留后的模型上限");
         assert_eq!(c.runtime.max_concurrency, 1);
         assert_eq!(c.runtime.max_batch, 1);
         assert_eq!(c.runtime.prefill_chunk, 512);
@@ -707,7 +708,7 @@ mode = "greedy"
         assert_eq!(c.pool.gdn_slots, 1);
         assert_eq!(c.pool.kv_dtype, super::super::KvDtype::Fp8, "kv=fp8");
         assert_eq!(c.pool.vram_budget, 0.99);
-        assert_eq!(c.pool.vram_reserve_mb, 256);
+        assert_eq!(c.pool.vram_reserve_mb, 714);
 
         // 投机关(spec=off)
         assert_eq!(c.spec.depth, 0, "spec=off ⇒ 深度 0");
@@ -728,18 +729,18 @@ mode = "greedy"
         assert_eq!(c.sampling.mode, crate::config::SamplerMode::Greedy);
     }
 
-    /// `--check` 的估算必须与手写档 boot 现场对齐(128k / 池 4G / fixed 0.90G)
+    /// `--check` 的估算必须与手写档 boot 现场对齐(合并预留后 / fixed 只剩 GDN)
     #[test]
     fn profile_estimate_matches_boot_ledger() {
         let mut v: Value = toml::from_str(INTENT_AWQ_3090_MAX).expect("toml");
         let mut origins = Origins::new();
         let meta = super::apply(&mut v, &mut origins).expect("resolve").expect("intent");
         let e = meta.estimate.expect("estimate");
-        assert_eq!(e.context_tokens, 131_072);
+        assert_eq!(e.context_tokens, 143_360);
         assert_eq!(e.pool_tokens, e.context_tokens, "逻辑池 = 上下文(物理池自动)");
-        assert_eq!(e.pool_bytes, 4 << 30);
-        assert_eq!(e.fixed_bytes, (926 << 20) + (1 << 19), "boot 实测 0.90G = 926.5 MiB");
-        assert!((e.budget_bytes as f64 / GB - 5.95).abs() < 0.02, "budget={:?}", e.budget_bytes);
+        assert_eq!(e.pool_bytes, 143_360 * 32768);
+        assert_eq!(e.fixed_bytes, (148 << 20) + (1 << 19), "fixed 只剩 GDN 真实分配");
+        assert!((e.budget_bytes as f64 / GB - 6.26).abs() < 0.02, "budget={:?}", e.budget_bytes);
         assert_eq!(e.stability_margin_bytes, STABILITY_MARGIN_BYTES);
         assert!(e.slack_bytes >= 0, "导出的 128k 应有正余量:{e:?}");
     }
@@ -807,8 +808,8 @@ context = "max"
         super::apply(&mut v, &mut origins).expect("resolve");
         assert_eq!(get_usize(&v, "runtime.prefill_chunk"), Some(1024));
         assert_eq!(origins.get("runtime.prefill_chunk"), Some(&Origin::Cli));
-        // 激活面随之变化(1024 档 1.05G),context=max 解更小(96k)
-        assert_eq!(get_usize(&v, "runtime.max_seq"), Some(98_304));
+        // 激活面随之变化(1024 档),context=max 解更小
+        assert_eq!(get_usize(&v, "runtime.max_seq"), Some(106_496));
     }
 
     /// 意图与显式 [model] 冲突 = 拒(模型只能有一个真源)

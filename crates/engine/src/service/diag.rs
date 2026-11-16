@@ -134,6 +134,8 @@ pub struct DiagSnapshot {
     pub batch: BatchFacts,
     /// 设备显存实况（`cuMemGetInfo`）：`(free, total)`。`Err` = 后端不支持。
     pub device: Result<(u64, u64), String>,
+    /// **逐 rank 设备显存实况**（TP2 闭合账；`device` 是 rank0 兼容面）。
+    pub devices: Vec<(u8, Result<(u64, u64), String>)>,
 }
 
 /// 合批事实（与 [`DiagSnapshot`] 同刻取）
@@ -268,7 +270,14 @@ pub async fn snapshot<D: DeviceClient>(running: &mut RunningEngine<D>) -> DiagSn
         .collect();
     let pools = running.pool_probe().await;
     let report = running.store_report();
-    let device = running.mem_info().await;
+    // **一次取全 rank**：`device` 只是 rank0 兼容面，不能再单独发一次
+    // `mem_info`（TP2 下会重复读设备且可能拿到不同刻的数字）。
+    let devices = running.mem_info_all().await;
+    let device = devices
+        .iter()
+        .find(|(rank, _)| *rank == 0)
+        .map(|(_, r)| r.clone())
+        .unwrap_or_else(|| Err("mem_info: 无 rank0 读数".into()));
     let snap_evict = running.snap_evict_preview(8);
     let sessions = running.session_assets();
     let batch = {
@@ -298,6 +307,7 @@ pub async fn snapshot<D: DeviceClient>(running: &mut RunningEngine<D>) -> DiagSn
         pools,
         batch,
         device,
+        devices,
     }
 }
 

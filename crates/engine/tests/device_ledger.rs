@@ -31,8 +31,6 @@ async fn ledger_captures_load_pool_and_graph_phases() {
         prefill_chunk: 32,
         knobs: EngineKnobs {
             sampler_enabled: false,
-            // P1-1 门:池上限走配置面(值随 knobs 进 Rel → 账本)
-            pool_cap_mb: 32,
             ..Default::default()
         },
     };
@@ -91,20 +89,9 @@ async fn ledger_captures_load_pool_and_graph_phases() {
     assert_eq!(hf, 0, "全程不许有未入账事件");
     assert_eq!(wu, 0, "没有窗失败 ⇒ 不该有未收窗");
     assert!(b.open_count() > 0, "账必须有内容(否则记了个寂寞)");
-    // **缺口 4 门**:turn 内的临时块释放后应进**复用池**(不回驱动),
-    // 且池指标是一等输出(不是告警里的一行)。
-    let pool = b.pool_stats();
-    let (hits, misses, drained) = b.pool_counters();
-    eprintln!(
-        "[ledger] 池:{} 块 / {} KiB;命中 {hits} 未中 {misses} 排空 {drained}",
-        pool.0,
-        pool.1 / 1024
-    );
-    assert!(pool.0 > 0, "turn 后应有过释放的临时块入池(缺口 4)");
-    assert!(hits + misses > 0, "取块计数必须有量(hits+misses>0)");
-    // **P1-1 门**:池上限来自配置(`pool_cap_mb = 32`),且报告面可查
-    assert_eq!(b.pool_cap(), 32 << 20, "池上限必须由配置注入(不是硬编码)");
-    assert!(b.pool_stats().1 <= b.pool_cap(), "池字节不许超上限");
+    // **2026-11-15 下沉门**:store 不再持有临时块复用池 —— 全部 free 事件
+    // 直接销账，复用由 GPU server 的 cudaMallocAsync 默认池负责。
+    // 该门现在由类型面保证:store/AllocLedger 已无任何 pool_* 接口。
 }
 
 /// **账本预算交叉校验**:`Rel::open` 必须拒"账本与分解不符"(boot 算式漂了 = 响亮拒)

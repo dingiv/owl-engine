@@ -27,8 +27,10 @@ use crate::tier::{Owner, Tier};
 /// 固定项身份(新增项必须显式命名;禁止 `Other("...")` 兜底)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ComponentId {
-    /// 模型权重与装载产物(常驻)。
+    /// 目标模型权重与装载产物(常驻)。
     Weights,
+    /// DFlash2 草稿权重(常驻;与目标权重分开计量)。
+    DraftWeights,
     /// GDN 状态格(`gdn_slots × gdn_row_bytes`)。
     GdnGrid,
     /// GDN 前缀快照池。
@@ -39,8 +41,6 @@ pub enum ComponentId {
     ReplaySnapshots,
     /// 图 slab 预算(捕获期产物)。
     GraphSlab,
-    /// warmup 瞬态与治理器之后的杂项。
-    WarmupMisc,
     /// 草稿池(MTP 链 / DFlash2 ring)。
     DraftPool,
 }
@@ -50,12 +50,12 @@ impl ComponentId {
     pub fn label(self) -> &'static str {
         match self {
             Self::Weights => "weights",
+            Self::DraftWeights => "draft_weights",
             Self::GdnGrid => "gdn_grid",
             Self::GdnSnapshots => "gdn_snap",
             Self::SpecSnapshots => "spec_snap",
             Self::ReplaySnapshots => "replay_snap",
             Self::GraphSlab => "graph_slab",
-            Self::WarmupMisc => "warmup_misc",
             Self::DraftPool => "draft_pool",
         }
     }
@@ -310,6 +310,15 @@ impl MemoryPlan {
         self.fixed.iter().copied().find(|c| c.id == id)
     }
 
+    /// 按 ID 汇总固定项字节（重复登记时**全部计入**，供预算投影使用）。
+    pub fn component_bytes(&self, id: ComponentId) -> usize {
+        self.fixed
+            .iter()
+            .filter(|c| c.id == id)
+            .map(|c| c.bytes)
+            .sum()
+    }
+
     /// 重复登记的固定项(空 = 合法)。
     pub fn duplicate_components(&self) -> Vec<ComponentId> {
         let mut seen = std::collections::BTreeSet::new();
@@ -358,11 +367,15 @@ impl MemoryPlan {
     /// (快照池 + 图 slab + warmup/杂项)。这样与 `VramBudget::v_avail`
     /// 的减法项一一对应,不会把同一批字节算两遍。
     pub fn to_budget_inputs(&self) -> StoreResult<crate::budget::BudgetInputs> {
-        let weights = self.component(ComponentId::Weights).map_or(0, |c| c.bytes);
-        let gdn_grid = self.component(ComponentId::GdnGrid).map_or(0, |c| c.bytes);
-        let draft = self
-            .component(ComponentId::DraftPool)
-            .map_or(0, |c| c.bytes);
+        // **权重 = 目标 + 草稿**(2026-11-16):草稿权重原先漏在 plan 外,
+        // `free_at_boot` 又是在它装载之前取的 ⇒ 准入式少减 0.8G/rank。
+        // 这里合成一个预算项;报告面仍用两个 `ComponentId` 分开显示。
+        let weights = self
+            .component_bytes(ComponentId::Weights)
+            .checked_add(self.component_bytes(ComponentId::DraftWeights))
+            .ok_or_else(|| StoreError::Budget("MemoryPlan: 权重合计溢出".into()))?;
+        let gdn_grid = self.component_bytes(ComponentId::GdnGrid);
+        let draft = self.component_bytes(ComponentId::DraftPool);
         let fixed = self.fixed_bytes();
         let runtime_floor = fixed
             .checked_sub(weights)
@@ -477,13 +490,6 @@ mod tests {
                 Owner::System,
             ),
             MemComponent::new(
-                ComponentId::WarmupMisc,
-                138 << 20,
-                PlanSource::Conservative,
-                Tier::Gpu,
-                Owner::System,
-            ),
-            MemComponent::new(
                 ComponentId::DraftPool,
                 5 << 20,
                 PlanSource::Measured,
@@ -491,6 +497,34 @@ mod tests {
                 Owner::System,
             ),
         ]
+    }
+
+    #[test]
+    fn draft_weights_are_weights_not_runtime_floor() {
+        let mut fixed = fixed();
+        fixed.push(MemComponent::new(
+            ComponentId::DraftWeights,
+            1 << 30,
+            PlanSource::Measured,
+            Tier::Gpu,
+            Owner::System,
+        ));
+        let p = MemoryPlan::new(
+            0,
+            card(16 << 30),
+            fixed,
+            pool(),
+            TierPlan::default(),
+            PlanPolicy { fixed_pool: true },
+        )
+        .expect("plan");
+        let inp = p.to_budget_inputs().expect("projection");
+        assert_eq!(inp.weights_bytes, 9 << 30, "target + draft 合成权重");
+        assert_eq!(
+            inp.runtime_floor_bytes,
+            (3 << 20) + (320 << 20),
+            "草稿权重不得落进运行底价(否则会漏减/重复减)"
+        );
     }
 
     #[test]
@@ -505,11 +539,9 @@ mod tests {
         )
         .expect("plan");
         let inp = p.to_budget_inputs().expect("projection");
-        // runtime_floor = 快照 3MiB + graph 320MiB + warmup 138MiB
-        assert_eq!(
-            inp.runtime_floor_bytes,
-            (3 << 20) + (320 << 20) + (138 << 20)
-        );
+        // runtime_floor = 快照 3MiB + graph 320MiB(固定项;warmup 已并入
+        // `vram_reserve_mb`,不再是 MemoryPlan 的 fixed)
+        assert_eq!(inp.runtime_floor_bytes, (3 << 20) + (320 << 20));
         assert_eq!(inp.weights_bytes, 8 << 30);
         assert_eq!(inp.draft_pool_bytes, 5 << 20);
         assert_eq!(inp.gdn_row_bytes, 1 << 20);

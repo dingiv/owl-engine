@@ -461,7 +461,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     /// ⇒ `usable = free + cache − reserve ≤ total − reserved − reserve`：
     /// 物理可用、缓存可回收、未来承诺三者同时成立才放人。
     pub(crate) fn store_facts(&self) -> crate::sched_policy::StoreFacts {
-        let leg = self.bank.rel.leg.report();
+        let leg = self.bank.rel.leg_stats();
         // **P0-4**：页账唯一真源 = store 的 ReservationLedger（不再读 sched_policy
         // 的影子 admitted 账）。
         let reserved = self.bank.rel.reserved_slots();
@@ -474,9 +474,9 @@ impl<D: DeviceClient> RunningEngine<D> {
         // TP 合并后 = world 页 —— 与宿主槽同粒度；`attach_disk` 按 `host_slot_bytes`
         // 开层）。配额接了就把它算进“能落哪儿”，否则宿主满 = 拒新（配了盘却
         // 不用 = 假容量，超卖档等于白配）。
-        let disk_free_pages = self.bank.rel.disk.as_ref().map_or(0, |d| {
-            let per = d.block_bytes() / leg.block_bytes.max(1);
-            d.free_slots().saturating_mul(per)
+        let disk_free_pages = self.bank.rel.kv_disk_block_bytes().map_or(0, |blk| {
+            let per = blk / leg.block_bytes.max(1);
+            self.bank.rel.kv_disk_free_slots().saturating_mul(per)
         });
         crate::sched_policy::StoreFacts {
             free_pages,
@@ -596,7 +596,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let grant_id = grant.id;
         // **准入登记**(S3b §23.2):turn 从此占用一块保留额(实占随
         // `sync_pool_account` 在段边界更新;天花板门 count 靠它)。
-        self.bank.rel.admission.admit(turn.id, 0, 0)?;
+        self.bank.rel.admission_mut().admit(turn.id, 0, 0)?;
         self.turns.admit_wait = None;
         // **S2b(§28):turn 起借 GDN 行**(账在 store:行 = 活跃 turn 的资源;
         // 物理行号就是账里的行号 —— 一本账,不两份)。行耗尽 = 响亮拒
@@ -604,7 +604,6 @@ impl<D: DeviceClient> RunningEngine<D> {
         let gdn_row = match self
             .bank
             .rel
-            .state
             .borrow_row(owl_store::tier::Owner::Turn(turn.id))
         {
             Ok(row) => row,
@@ -927,7 +926,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         if delta == 0 {
             return Ok(());
         }
-        let free = self.bank.rel.leg.report().slots_free;
+        let free = self.bank.rel.leg_stats().slots_free;
         if free < delta {
             let shortage = delta - free;
             owl_shared::log_info!(
@@ -980,7 +979,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             table = std::mem::take(&mut s.block_table);
             mtp_table = std::mem::take(&mut s.mtp_block_table);
         }
-        if let Err(e) = self.bank.rel.leg.release_table(&mut table) {
+        if let Err(e) = self.bank.rel.release_table(&mut table) {
             owl_shared::log_warn!(
                 "sched",
                 "start_one 回滚:还复用链失败(turn {turn_id}, session {session_id:#x}): {e}"
@@ -998,7 +997,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         // 单一围栏已还行：这里只核对"确实不在账上"（不再二次归还 ——
         // 重复归还必然 `Invariant`，用错误当控制流会把真故障也一起吞掉）。
         if let Some(row) = gdn_row {
-            if self.bank.rel.state.row_owner(row).is_some() {
+            if self.bank.rel.row_owner(row).is_some() {
                 owl_shared::log_warn!(
                     "sched",
                     "start_one 回滚:GDN 行 {row} 仍在账上（turn {turn_id}）—— 围栏未收走"
@@ -1035,7 +1034,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     pub(crate) fn reset_session_for_rebuild(&mut self, session_id: u64) -> Result<()> {
         let s = self.bank.sessions.session_mut(session_id)?;
         let mut table = std::mem::take(&mut s.block_table);
-        self.bank.rel.leg.release_table(&mut table)?;
+        self.bank.rel.release_table(&mut table)?;
         let mut mold = std::mem::take(&mut s.mtp_block_table);
         if self.bank.mtp_ring {
             mold.clear();
@@ -1184,7 +1183,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         while keep > 0 {
             let bi = b_blocks + keep - 1;
             let k = owl_store::SnapKey::at_boundary(hit.hashes[bi]);
-            if self.bank.rel.state.locate(k).is_some() {
+            if self.bank.rel.state_locate(k).is_some() {
                 boundary = Some((bi, k));
                 break;
             }
@@ -1229,7 +1228,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let k_old = owl_store::SnapKey::at_boundary(hit.hashes[b_blocks + i]);
             let k_new = owl_store::SnapKey::at_boundary(h);
             new_hashes.push(h);
-            let tier = self.bank.rel.state.locate(k_old);
+            let tier = self.bank.rel.state_locate(k_old);
             let target = snap_rekey_target(tier, self.dev.pool.snap_slot_of(k_old).is_some());
             let ok = match target {
                 RekeyTarget::Device => {
@@ -1260,7 +1259,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 let pending_disk = disk_ops
                     .iter()
                     .any(|o| matches!(o, SnapDiskOp::Rekey { old, new } if *old == k_old && *new == k_new));
-                boundary_new = if self.bank.rel.state.locate(k_new).is_some() || pending_disk {
+                boundary_new = if self.bank.rel.state_locate(k_new).is_some() || pending_disk {
                     Some(k_new)
                 } else {
                     None
@@ -1276,7 +1275,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let idx = table.len();
             match hit.slots[i] {
                 Some(slot) => {
-                    self.bank.rel.leg.incref(slot)?;
+                    self.bank.rel.incref(slot)?;
                     table.push(slot);
                 }
                 None => {
@@ -1290,7 +1289,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let idx = table.len();
             match hit.slots[bi] {
                 Some(slot) => {
-                    self.bank.rel.leg.incref(slot)?;
+                    self.bank.rel.incref(slot)?;
                     table.push(slot);
                 }
                 None => {
@@ -1422,7 +1421,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 survivor_tokens.extend_from_slice(&old[b * page..(b + 1) * page]);
             }
             let key = owl_store::SnapKey::at_boundary(hit.hashes[b]);
-            if self.bank.rel.state.locate(key).is_some() {
+            if self.bank.rel.state_locate(key).is_some() {
                 snap_pages.push(b);
             }
         }
@@ -1450,12 +1449,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         let tail_old_idx = hit.matched_blocks.saturating_sub(1);
         let tail_old_key = tail_snap.or_else(|| {
             let key = owl_store::SnapKey::at_boundary(hit.hashes[tail_old_idx]);
-            (self.bank.rel.state.locate(key).is_some()).then_some(key)
+            (self.bank.rel.state_locate(key).is_some()).then_some(key)
         });
         let tail_usable = tail_old_key
             .map(|k| {
                 snap_rekey_target(
-                    self.bank.rel.state.locate(k),
+                    self.bank.rel.state_locate(k),
                     self.dev.pool.snap_slot_of(k).is_some(),
                 ) != RekeyTarget::Skip
             })
@@ -1524,7 +1523,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             let old_idx = layout.survivors[new_idx];
             match hit.slots[old_idx] {
                 Some(slot) => {
-                    self.bank.rel.leg.incref(slot)?;
+                    self.bank.rel.incref(slot)?;
                     table.push(slot);
                 }
                 None => {
@@ -1535,7 +1534,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             if new_idx >= first_deleted_page {
                 let old_key = owl_store::SnapKey::at_boundary(hit.hashes[old_idx]);
                 let new_key = owl_store::SnapKey::at_boundary(hashes[new_idx]);
-                let tier = self.bank.rel.state.locate(old_key);
+                let tier = self.bank.rel.state_locate(old_key);
                 let target = snap_rekey_target(tier, self.dev.pool.snap_slot_of(old_key).is_some());
                 let ok = match target {
                     RekeyTarget::Device => {
@@ -1566,7 +1565,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let restore_key = owl_store::SnapKey::at_boundary(hashes[used_len - 1]);
         // 恢复点通常不在新链的最后一个幸存块上：把它重挂到新边界。
-        if self.bank.rel.state.locate(restore_key).is_none() {
+        if self.bank.rel.state_locate(restore_key).is_none() {
             let old_key = match layout.restore {
                 crate::img_evict::GapRestore::TailSnapshot => tail_old_key,
                 crate::img_evict::GapRestore::OldBoundary(old_page) => {
@@ -1578,7 +1577,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 what: "多段 leave-gap:恢复点缺失但 layout 声称可用".into(),
             })?;
             let target = snap_rekey_target(
-                self.bank.rel.state.locate(old_key),
+                self.bank.rel.state_locate(old_key),
                 self.dev.pool.snap_slot_of(old_key).is_some(),
             );
             let ok = match target {
@@ -1666,7 +1665,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 self.bank.leg_mtp.release_table(&mut mold)?;
             }
             s.block_hashes = d.hashes;
-            s.cached_len = d.cached_len;
             s.tokens.clear();
             s.tokens.extend_from_slice(&turn.prompt_ids[..d.cached_len]);
             // **中途落账也必须自洽**：Abort 不会再 commit_turn；pad/spans 若仍
@@ -1806,7 +1804,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 match local {
                     Some(h) => {
                         let blocks = h.matched_blocks;
-                        let snap_tier = self.bank.rel.state.locate(
+                        let snap_tier = self.bank.rel.state_locate(
                             owl_store::SnapKey::at_boundary(h.hashes[blocks - 1]),
                         );
                         let kv_tier = if h.slots.iter().any(|x| x.is_some()) {
@@ -1868,8 +1866,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 let tier_of = |h: &owl_store::ChainHash| match self
                     .bank
                     .rel
-                    .state
-                    .locate(owl_store::SnapKey::at_boundary(*h))
+                    .state_locate(owl_store::SnapKey::at_boundary(*h))
                 {
                     Some(owl_store::Tier::Gpu) => "dev",
                     Some(owl_store::Tier::Host) => "host",
@@ -1945,8 +1942,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     && self
                         .bank
                         .rel
-                        .state
-                        .locate(owl_store::SnapKey::at_boundary(hashes[m - 1]))
+                        .state_locate(owl_store::SnapKey::at_boundary(hashes[m - 1]))
                         .is_none()
                 {
                     m -= 1;
@@ -1972,8 +1968,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     match self
                         .bank
                         .rel
-                        .state
-                        .locate(owl_store::SnapKey::at_boundary(hashes[m - 1]))
+                        .state_locate(owl_store::SnapKey::at_boundary(hashes[m - 1]))
                     {
                         Some(owl_store::Tier::Gpu) => "dev",
                         Some(owl_store::Tier::Host) => "host",
@@ -2005,7 +2000,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // `alloc_slot` + `rebind` 建立;占位值不参与账)
                 for &b in &chain[..m] {
                     if b != PENDING_LOAD_PLACEHOLDER {
-                        self.bank.rel.leg.incref(b)?;
+                        self.bank.rel.incref(b)?;
                     }
                 }
                 // ── **待回灌清单 = 起点视图要读的那一小批**（W3）──
@@ -2098,7 +2093,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     }
                 }
                 let mut old = std::mem::take(&mut s.block_table);
-                self.bank.rel.leg.release_table(&mut old)?;
+                self.bank.rel.release_table(&mut old)?;
                 s.block_table = chain[..m].to_vec();
                 // MTP 链同步重置(E5-M2b):保留前缀的 mtp 条目虽
                 // 语义可复用(同 token 同 hidden 确定性),但 M2b
@@ -2117,7 +2112,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 // 同会话复用的逐块身份:从本次 hit 的前 m 块接管。
                 s.block_hashes.clear();
                 s.block_hashes.extend_from_slice(&hashes[..m]);
-                s.cached_len = m * self.dev.pool.geom.page;
                 Ok((
                     m * self.dev.pool.geom.page,
                     Some(owl_store::SnapKey::at_boundary(hashes[m - 1])),
@@ -2314,7 +2308,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                                 match self.relieve_pressure().await {
                                     Ok((freed, k, hkv, hsnap)) => owl_shared::log_warn!(
                                         "store",
-                                        "显存压力:已收缩(还缓存 {freed} 块 + 目标腾 {k} KV 槽 + {hkv} KV 宿主块 + {hsnap} 快照)⇒ 泵继续"
+                                        "显存压力:已收缩(缓存回收 {:.1}MiB + 目标腾 {k} KV 槽 + {hkv} KV 宿主块 + {hsnap} 快照)⇒ 泵继续",
+                                        freed as f64 / 1048576.0
                                     ),
                                     Err(pe) => owl_shared::log_warn!(
                                         "store",
@@ -2344,15 +2339,27 @@ impl<D: DeviceClient> RunningEngine<D> {
         // ① 至少 2 个活跃且都在生成相位(无 prefill 欠账);
         // ② **无投机**(depth==0):spec 轮的 GDN 是顺序块 + 快照,批化是 M2;
         // ③ 单 rank(TP 的 AR 批语义未审,R8);④ 选择层视图关闭(页表需 per-row)。
+        // **TP2 真批**：批图在两 rank 各捕获一份；执行器同时推进两图
+        // （图内含 AR）。缺 peer 图 = 调度门失守 ⇒ 本拍退回单 turn 路。
+        let tp_batch_ready = match self.peer.as_ref() {
+            None => true,
+            Some(p) => self.dev.graphs.batch.is_some() && p.graphs.batch.is_some(),
+        };
         if self.boot.cfg.knobs.max_batch > 1
             && self.turns.active.len() >= 2
             && self
                 .turns
                 .active
                 .iter()
-                .all(|a| a.fed >= a.prompt_ids.len())
+                .all(|a| {
+                    a.fed >= a.prompt_ids.len()
+                        // 带图 turn 不进批：batch 前向没有 VLM embd/replay 面
+                        // （图像走单 turn 路径；文本轮仍可批）。
+                        && a.vlm.is_none()
+                        && a.vlm_peer.is_none()
+                })
             && self.dev.spec_rt.depth == 0
-            && self.peer.is_none()
+            && tp_batch_ready
             && !self.sel.has_view()
         {
             let n = self.turns.active.len().min(self.boot.cfg.knobs.max_batch);

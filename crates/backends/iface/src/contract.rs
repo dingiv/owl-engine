@@ -497,11 +497,10 @@ pub trait DeviceClient: Send {
         crate::handle::CtxScope::noop()
     }
 
-    /// **复用池排空**(缺口 3/4;store 侧决策、本层执行):把池内可复用块**真还驱动**,
-    /// 返回释放块数。缺省 `0` = 无池面(裸 face/mock)。
+    /// **GPU 默认池缓存 trim**:把 `cudaMallocAsync` 已 free 的缓存页**真还驱动**,
+    /// 返回释放字节数。缺省 `0` = 无池面(裸 face/mock)。
     ///
-    /// ⚠️ 名字**故意**与 `DeviceHandle::drain_pool_to_driver` 区分:2026-10-19 实测
-    /// 踩过"同名方法解析到契约缺省"⇒ 池只进不出。契约面用 `drain_temp_pool`。
+    /// store 不再持有临时块复用池;块复用与 trim 的唯一归属 = GPU server。
     fn drain_temp_pool(&mut self) -> impl Future<Output = usize> + Send {
         async { 0 }
     }

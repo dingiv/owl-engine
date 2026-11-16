@@ -16,7 +16,7 @@ pub(crate) enum AbandonPublish {
 }
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
-    /// **turn 末释放设备表**：表出账归还（引用减一），`cached_len` 归零。
+    /// **turn 末释放设备表**：表出账归还（引用减一）；历史 `tokens` 保留。
     ///
     /// 不在 turn 之间保留任何 block_table。所有块回到 store 缓存面，由
     /// 引用计数 + LRU/过期策略回收；下一轮可重新按内容命中，命中不了就重建。
@@ -24,18 +24,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     // Phase 3：H6 执行臂。唯一调用者是 `StoreHook::Release`；
     // engine 其它位置不得直呼。
     pub(crate) fn release_turn_table(&mut self, session_id: u64) -> Result<()> {
-        let mut table = Vec::new();
-        if let Some(s) = self.bank.sessions.get_mut(session_id) {
-            table = std::mem::take(&mut s.block_table);
-            // 表已不在会话手里：会话级前缀账必须同步归零，否则下一轮
-            // admission 会把“已释放的块”当成仍驻留（欠账/超卖）。
-            s.cached_len = 0;
-            s.block_hashes.clear();
-            s.chain.reset();
-            s.local_chain = false;
-        }
-        self.bank.rel.release_table(&mut table)?;
-        Ok(())
+        // 表归还 + 会话级前缀账归零由 store 同屋完成（2026-11-15 下沉）。
+        self.bank.release_turn_table(session_id)
     }
 
     /// turn 烧毁(E5 性能会战:server 泵错误路径的原先弃置会让 active
@@ -290,7 +280,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let s = self.bank.sessions.session_mut(act.session_id)?;
         s.tokens.clear();
         s.tokens.extend_from_slice(&act.prompt_ids[..written]);
-        s.cached_len = written;
         // 位置账:长度对不上 = 结构错(写错位置比不写更坏 ⇒ 清空后
         // leave-gap 自会按"位置账缺失"跳过,而不是拿错坐标算)
         if act.positions.len() >= written {

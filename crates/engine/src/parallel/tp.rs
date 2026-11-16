@@ -359,9 +359,18 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         .await?;
         let ctx0 = staging0.ctx(plan0);
         let ctx1 = staging1.ctx(plan1);
-        // **池前 live 基线**(per-device!2026-10-24):每 rank 读自己的 account
-        // 快照 —— 不再把进程级 LIVE 除以 world。两 rank 的权重/杂项对称,
-        // 但并行 boot 时共享全局账会串值,这里必须各算各的。
+        // **池前结算 + live 基线**(per-device!2026-10-24):先 trim 装载期
+        // 的 cudaMallocAsync 缓存并刷新 free 账，再读快照。两 rank 的权重/杂项对称；池前
+        // 必须让两 rank 看到**同一份 free**（见下 `TpPoolShare` 交换）。
+        for (label, f) in [("rank0", &mut face0), ("rank1", &mut face1)] {
+            let _ = f.drain_temp_pool().await;
+            if let Err(e) = f.mem_pool_trim().await {
+                owl_shared::log_warn!("tp", "{label} 池前 trim 失败(继续): {e}");
+            }
+            if let Err(e) = f.mem_info().await {
+                owl_shared::log_warn!("tp", "{label} 池前 mem_info 失败(继续): {e}");
+            }
+        }
         let snap0 = face0.vram_snapshot();
         let snap1 = face1.vram_snapshot();
         let baseline0 = snap0.live;
@@ -373,9 +382,14 @@ impl<D: DeviceClient + 'static> TpEngine<D> {
         // 装配期的 AR 已被 `eval_current_dry` 从 warmup/干跑里摘掉 ⇒ 每 rank
         // 独立完成,无需对端在场(确定性分片协议的"零协调"落实到装配面)。
         let t_boot = std::time::Instant::now();
+        // **池几何必须两 rank 一致**（块表/图/页表跨 rank 共享槽号）。
+        // 两 rank 在 `boot_rank` 内（草稿装载 + 池前结算之后）交换实际
+        // `free`，取 min 作为池预算；不再是“预装载 free − 1 GiB”的
+        // 保守边（草稿实际 ~0.83 GiB，1 GiB 会多扣 ~0.17 GiB）。
+        let (share0, share1) = crate::engine::TpPoolShare::pair();
         let (r0, r1) = tokio::join!(
-            boot_rank(face0, &mut cfg0, rm0, Some(ctx0), baseline0, t_boot),
-            boot_rank(face1, &mut cfg1, rm1, Some(ctx1), baseline1, t_boot),
+            boot_rank(face0, &mut cfg0, rm0, Some(ctx0), baseline0, Some(share0), t_boot),
+            boot_rank(face1, &mut cfg1, rm1, Some(ctx1), baseline1, Some(share1), t_boot),
         );
         let (dev0, dev1) = match (r0, r1) {
             (Ok(a), Ok(b)) => (a, b),

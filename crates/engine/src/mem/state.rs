@@ -147,6 +147,15 @@ pub(crate) fn kv_per_tok_bytes(
 /// 设备状态块池(KV paged 池 / GDN 行 / 快照池 / 持久块表)。
 /// 治理对象(charter A1 味):S2 图档与执行器只经方法面触碰状态块,
 /// 不直摸块句柄。
+/// **prefill 瞬态预算**(代码派生;2048 chunk ⇒ 896MiB)。
+///
+/// 线性项 = `chunk × 11/32 MiB`(实测 ≈0.344 MiB/tok);192MiB 覆盖图执行
+/// 尾差、分配器/碎片。改 chunk 自动跟随,不需要每档手配。
+pub(crate) fn prefill_transient_mb(chunk_tokens: usize) -> u64 {
+    let linear = (chunk_tokens as u64 * 11).div_ceil(32);
+    linear + 192
+}
+
 /// 池装配计划(engine run 从 knobs/spec_mode 派生;显式依赖律的
 /// 参数对象 —— 原散列布尔/数值参数群收编:量化 = KvQuant 枚举,
 /// 投机形态 = SpecMode 枚举,互斥语义由派生保证,调用点零自洽负担)
@@ -159,10 +168,17 @@ pub(crate) struct PoolPlan {
     /// **池容量自动派生**(`[pool].pool_tokens` 未写;2026-10-21 用户令:
     /// "池子一般不需要手动指定 —— 算出来、把最大 ctx 显示出来")。
     ///
-    /// 自动档语义:池 = 单会话 ctx(`ceil(seq_tokens/page)` 页)+ 页对齐;
+    /// 自动档语义:**并发感知** —— 池 = `min(cap − transient, seq_tokens × 并发数)`;
+    /// 并发数 = `max_batch`(1 = 单会话语义，逐字节旧行为)。
     /// 显存治理器的 `cap` 退化为**上限校验 + 报告**(`ctx_max = cap − page`);
     /// `seq_tokens > ctx_max` ⇒ 拒启并给出可服务的最大 ctx。
     pub pool_auto: bool,
+    /// **自动池的并发份数**（= `[runtime] max_batch`，至少 1）。
+    ///
+    /// 为什么池要乘并发：`seq_tokens` 是**单请求**上限，不是池上限；
+    /// 两个 100k 会话各自 32k 生成需要 264k token，旧实现池 = 262k
+    /// ⇒ 第二个请求必然撞墙。`cap` 是显存预算允许的总池，必须用满。
+    pub pool_sessions: usize,
     /// **最终 query replay**(KVMem §5.2):需要专用 GDN 回滚缓冲。
     pub query_replay: bool,
     /// **允许池小于上下文**(锁①;`[kvmem].pool_overcommit`)。
@@ -216,14 +232,14 @@ pub(crate) struct PoolPlan {
     pub snap_max: usize,
     /// **显存治理占比**(0 = 治理禁用;1.0 = 吃满驱动 free)
     pub vram_budget: f64,
-    /// VRAM 预留 MiB
+    /// 单值总预留 MiB(图执行/warmup/碎片;prefill 瞬态另算)
     pub vram_reserve_mb: u64,
-    /// **超卖档「池外瞬态余量」MiB**(= `[pool].transient_reserve_mb`)。
+    /// **prefill 瞬态预算 MiB**(**代码派生，不配置**)。
     ///
-    /// 原先这里是硬编码 1 GiB(并且日志文案漂移成"512 MiB"),现在**可配置 +
-    /// 日志打真值**。语义:超卖档池 = `cap − ceil(本值 / per_tok)`,给池外
-    /// 瞬态(chunk 激活/视图/图 warmup/kernel 惰性保留)留的空。
-    pub transient_reserve_mb: u64,
+    /// 口径 = `chunk × 11/32 + 192`(2048 chunk ⇒ 896MiB)。192 覆盖图执行
+    /// 超出 `vram_reserve_mb` 的尾差、分配器/碎片;池 = `cap − 本值/per_tok`。
+    /// 不再从配置读取;改 `prefill_chunk` 自动跟随。
+    pub prefill_transient_mb: u64,
     /// **选择层视图块表槽**(B-2;`OWL_COVERAGE_PROBE=1` = 召回点探针档)。
     /// true ⇒ 主池多分配一个 `[1, nb]` 的视图页表块(内容 = **选中块**的物理页
     /// 按时间序;每召回点重写),与全量块表 `bt` **并存**(两者都要在场:
@@ -560,9 +576,15 @@ pub(crate) struct DraftBank {
     fp8: bool,
     /// 草稿池 elem dtype(非 fp8 时;随检查点事实:量化族 BF16 / 未量化族 F16)
     dt: Dtype,
-    /// **DFlash2 ring 槽数**(0 = 线性全池;>0 = 逻辑位 `% ring_slots`)。
+    /// **DFlash2 ring 槽数**(每会话;0 = 线性全池;>0 = 逻辑位 `% ring_slots`)。
     /// 草稿 config 的 sliding_window=2048 + 自块 8 ⇒ 2080(页对齐)。
     ring_slots: usize,
+    /// **DFlash2 ring 份数**（= 活跃 turn 上限；每会话一份，禁止跨会话共享）。
+    ///
+    /// 草稿 KV 按 token 的**绝对位置**取模；两个会话共享一个 ring 时，
+    /// 同位置的窗口行会互相覆盖（100k vs 100k 的会话几乎全撞）。份数由
+    /// `PoolPlan::pool_sessions`（= `max_batch`）决定，物理池 = ring × 份数。
+    rings: usize,
 }
 
 /// GDN 序列表持久槽(P-6b;见 [`StatePool::gdn_tables`])
@@ -693,13 +715,9 @@ impl PerTokBytes {
 /// ⚠️ **2026-10-21 prefill 桶退役:640 → 320 MiB**。
 /// 历史:2026-10-19 为桶族(296.5)+ 尾档 t1024(502.3)把 262 抬到 640;
 /// 桶已删除,非桶图族(spec-dflash 实测 261MiB)回到 320 = 262 + 58MiB 余量。
-/// 总治理口径 778 → 458 MiB(WARMUP_MISC 138 不变),KV 池多 ~320MiB。
+/// **2026-11-16 起本常数只服务 GraphFleet 捕获后对账**；`FixedAfter` 不再
+/// 扣它（图执行/warmup 已并入 `vram_reserve_mb`）。
 pub(crate) const GRAPH_SLAB_BUDGET: usize = 320 << 20;
-
-/// warmup 瞬态 + 杂项(治理器之后、图之外的固定分配)。未单列实测;
-/// = 原一锅端 `400MiB` 减图项后的余量(总分不变 ⇒ 历史治理数字可比):
-/// 400 − 262 = 138MiB。
-const WARMUP_MISC_BUDGET: usize = 138 << 20;
 
 /// **治理器之后的固定分配项**(原为一行 `n_gdn*slots*elems*4 + snap*… + 400MiB`)
 #[derive(Debug, Clone, Copy)]
@@ -716,15 +734,6 @@ struct FixedAfter {
     spec_snap: usize,
     /// **query replay 回滚缓冲**(独立于 spec 快照;`query_replay` 且 paged 时分配)
     replay_snap: usize,
-    /// 图 slab 预算(见 [`GRAPH_SLAB_BUDGET`])。
-    ///
-    /// ⚠️ 本结构**不含池后 scratch**（attn_v2 三档 / XQA / FI 表 / 块表）——
-    /// 它们由 [`KvBank::alloc_scratch`]/[`KvBank::alloc_xqa`]/[`KvBank::alloc_tables`]
-    /// 分配，`[vram-gov]` 日志会显式标注"未计"，由 `reserve`（1 GiB）覆盖。
-    /// 精确并入预算另案（F-26；避免在预算与分配两处各写一份公式）。
-    graph_slab: usize,
-    /// warmup 瞬态 + 杂项(见 [`WARMUP_MISC_BUDGET`])
-    warmup_misc: usize,
     /// **DFlash2 草稿池 ring**(固定项;不再按 token 线性)
     draft_ring: usize,
 }
@@ -746,8 +755,6 @@ impl FixedAfter {
             gdn_snap: snap_max * snap_row,
             spec_snap: if spec_snap { snap_row } else { 0 },
             replay_snap: if replay_snap { snap_row } else { 0 },
-            graph_slab: GRAPH_SLAB_BUDGET,
-            warmup_misc: WARMUP_MISC_BUDGET,
             draft_ring,
         }
     }
@@ -757,21 +764,17 @@ impl FixedAfter {
             + self.gdn_snap
             + self.spec_snap
             + self.replay_snap
-            + self.graph_slab
-            + self.warmup_misc
             + self.draft_ring
     }
 
     fn explain(self) -> String {
         let mbf = |v: usize| v as f64 / 1048576.0;
         format!(
-            "gdn格 {:.0}MiB + gdn快照 {:.0}MiB + spec快照 {:.0}MiB + replay快照 {:.0}MiB + 图slab {:.0}MiB + warmup/杂项 {:.0}MiB + 草稿ring {:.0}MiB",
+            "gdn格 {:.0}MiB + gdn快照 {:.0}MiB + spec快照 {:.0}MiB + replay快照 {:.0}MiB + 草稿ring {:.0}MiB",
             mbf(self.gdn_grid),
             mbf(self.gdn_snap),
             mbf(self.spec_snap),
             mbf(self.replay_snap),
-            mbf(self.graph_slab),
-            mbf(self.warmup_misc),
             mbf(self.draft_ring)
         )
     }
@@ -997,13 +1000,6 @@ impl StatePool {
                 Owner::System,
             ),
             MemComponent::new(
-                ComponentId::WarmupMisc,
-                WARMUP_MISC_BUDGET,
-                PlanSource::Conservative,
-                Tier::Gpu,
-                Owner::System,
-            ),
-            MemComponent::new(
                 ComponentId::DraftPool,
                 self.draft_pool_bytes(),
                 PlanSource::Measured,
@@ -1141,23 +1137,46 @@ impl StatePool {
         (fp + 8) as f32
     }
 
-    pub(crate) fn dflash_kv_leaves(&self) -> Option<Vec<(TensorOps, TensorOps)>> {
+    /// **每会话的 DFlash2 草稿池视图**（`ring` = 活跃 turn 的 GDN 行号）。
+    ///
+    /// 物理池 = `rings × ring_nb` 页；这里按 `ring` 切一段**连续视图**，
+    /// 内核仍按 `p % ring_slots` 映射（ring_cap = 每份槽数）。视图隔离后
+    /// 两个会话的同位置窗口行不再互相覆盖。
+    pub(crate) fn dflash_kv_leaves(
+        &self,
+        ring: usize,
+    ) -> Option<Vec<(TensorOps, TensorOps)>> {
         let ks = self.draft.dflash_kvs.as_ref()?;
+        if ring >= self.draft.rings.max(1) {
+            return None;
+        }
         let (dkv, dhd) = (8usize, 128usize);
+        let page = self.geom.page.max(1);
+        // ring_slots = 0 = 线性全池（非生产档）；此时视图 = 整池。
+        let ring_nb = if self.draft.ring_slots > 0 {
+            self.draft.ring_slots.div_ceil(page)
+        } else {
+            self.geom.nb
+        };
+        let per_ring = ring_nb * dkv * dhd * page;
         // B6:fp8 草稿池 = U32 扁平字节账(主池同款)
         if self.draft.fp8 {
-            let shape = vec![self.geom.nb * dkv * dhd * self.geom.page / 4];
+            let off = ring * (per_ring / 4);
+            let shape = vec![per_ring / 4];
             return Some(
                 ks.iter()
                     .map(|kb| {
                         (
-                            block_leaf_dt(&kb.k_cache.0, shape.clone(), Dtype::U32),
-                            block_leaf_dt(&kb.v_cache.0, shape.clone(), Dtype::U32),
+                            block_leaf_dt(&kb.k_cache.0, shape.clone(), Dtype::U32)
+                                .slice_view(off, shape.clone()),
+                            block_leaf_dt(&kb.v_cache.0, shape.clone(), Dtype::U32)
+                                .slice_view(off, shape.clone()),
                         )
                     })
                     .collect(),
             );
         }
+        let off = ring * per_ring;
         Some(
             ks.iter()
                 .map(|kb| {
@@ -1168,20 +1187,16 @@ impl StatePool {
                         // 被 L3 事实面当场抳住(2026-10-15)。
                         block_leaf_dt(
                             &kb.k_cache.0,
-                            vec![
-                                self.geom.nb,
-                                dkv,
-                                dhd / self.geom.x,
-                                self.geom.page,
-                                self.geom.x,
-                            ],
+                            vec![ring_nb, dkv, dhd / self.geom.x, page, self.geom.x],
                             self.draft.dt,
-                        ),
+                        )
+                        .slice_view(off, vec![ring_nb, dkv, dhd / self.geom.x, page, self.geom.x]),
                         block_leaf_dt(
                             &kb.v_cache.0,
-                            vec![self.geom.nb, dkv, dhd, self.geom.page],
+                            vec![ring_nb, dkv, dhd, page],
                             self.draft.dt,
-                        ),
+                        )
+                        .slice_view(off, vec![ring_nb, dkv, dhd, page]),
                     )
                 })
                 .collect(),
@@ -2159,8 +2174,10 @@ impl<'a> AllocCtx<'a> {
                 .draft_geom
                 .map(|(l, h, d)| DraftPoolGeom::from_geom(l, h, d))
                 .unwrap_or(DRAFT_POOL);
+            // 每会话一份 ring（并发档 = max_batch 份）。
             owl_models::layers::dflash2::draft_ring_slots(page_for_draft)
                 * geom.per_tok_bytes(plan.draft_kv.size_bytes())
+                * plan.pool_sessions.max(1)
         } else {
             0
         };
@@ -2197,48 +2214,53 @@ impl<'a> AllocCtx<'a> {
         let ctx_max = pool_cap.map(|c| c.saturating_sub(page_align));
         let pool_tokens = if plan.pool_auto {
             match ctx_max {
-                Some(m) if plan.seq_tokens > m => {
-                    // **超卖档(锁①,2026-10-27 修)**:`[kvmem].pool_overcommit` 开的语义就是
-                    // "池 < 上下文" —— 多出的链块靠选择层下沉 host/disk。旧实现无条件拒启
-                    // (2026-10-21 自动池重构漏了这条门),把超卖档挡在门外。
-                    if !plan.pool_overcommit {
-                        return Err(ModelError::Msg(format!(
-                            "[pool] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
-                             本档 per_tok={}B ⇒ cap={:?} tok。修法:降 [runtime].max_seq 到 ≤ {}、\
-                             或降 per_tok(池 fp8 / 减草稿池)、或开 [kvmem] 超卖(select_decode+select_partial+pool_overcommit)。",
+                Some(m) => {
+                    let (pool, over) = auto_pool_tokens(
+                        plan.seq_tokens,
+                        plan.pool_sessions,
+                        m,
+                        per_tok.total(),
+                        plan.prefill_transient_mb,
+                        plan.pool_overcommit,
+                    )
+                    .map_err(ModelError::Msg)?;
+                    let transient_mb = plan.prefill_transient_mb.max(1);
+                    if over {
+                        // **超卖档(锁①,2026-10-27 修)**:`[kvmem].pool_overcommit` 开的语义就是
+                        // "池 < 上下文" —— 多出的链块靠选择层下沉 host/disk。
+                        owl_shared::log_info!(
+                            "pool",
+                            "**超卖档**:max_seq={} > ctx_max={} ⇒ 设备池 = cap − 瞬态余量({} MiB) = {} tok(超卖 {:.2}×);\
+                             其余链块靠选择层下沉 host/disk",
                             plan.seq_tokens,
                             m,
-                            per_tok.total(),
-                            pool_cap,
-                            m
-                        )));
+                            transient_mb,
+                            pool,
+                            plan.seq_tokens as f64 / pool as f64
+                        );
+                    } else if plan.pool_sessions > 1 {
+                        let transient_tok = (((transient_mb as usize) << 20)
+                            / per_tok.total().max(1))
+                            .max(1);
+                        owl_shared::log_info!(
+                            "pool",
+                            "**并发自动池**:max_seq={} × {} = {} tok，\
+                             cap={} − 瞬态 {} MiB({} tok) ⇒ 池 {} tok(占预算 {:.0}%)",
+                            plan.seq_tokens,
+                            plan.pool_sessions,
+                            plan.seq_tokens.saturating_mul(plan.pool_sessions),
+                            m,
+                            transient_mb,
+                            transient_tok,
+                            pool,
+                            100.0 * pool as f64 / m.max(1) as f64
+                        );
                     }
-                    // 预填**瞬态**余量:超卖档池一旦吃满 cap,chunk 的激活/工作区
-                    // + 选择层视图 + 图 warmup + kernel 惰性保留都得从**池外**挤。
-                    //
-                    // ⚠️ 2026-10-28:此值原为**硬编码 1 GiB**,而日志文案一直写
-                    // "512 MiB"(漂移)。现改为 `[pool].transient_reserve_mb`
-                    // (缺省 1024 = 旧行为),日志打**真值** —— 这笔"给不确定性的
-                    // 保险费"是池预算里最大的一块可调项(1 GiB = 32,768 tok)。
-                    let transient_mb = plan.transient_reserve_mb.max(1);
-                    let transient_tok =
-                        (((transient_mb as usize) << 20) / per_tok.total().max(1)).max(1);
-                    let pool = m.saturating_sub(transient_tok).max(1);
-                    owl_shared::log_info!(
-                        "pool",
-                        "**超卖档**:max_seq={} > ctx_max={} ⇒ 设备池 = cap − 瞬态余量({} MiB = {} tok) = {} tok(超卖 {:.2}×);\
-                         其余链块靠选择层下沉 host/disk",
-                        plan.seq_tokens,
-                        m,
-                        transient_mb,
-                        transient_tok,
-                        pool,
-                        plan.seq_tokens as f64 / pool as f64
-                    );
                     pool
                 }
-                Some(m) => plan.seq_tokens.min(m),
-                None => plan.seq_tokens,
+                None => plan
+                    .seq_tokens
+                    .saturating_mul(plan.pool_sessions.max(1)),
             }
         } else {
             match pool_cap {
@@ -2351,12 +2373,63 @@ impl<'a> AllocCtx<'a> {
     }
 }
 
-/// **显存治理**:池 token 上限(None = 治理禁用)。
+// **显存治理**:池 token 上限(None = 治理禁用)。
+//
+// 口径(2026-10-22 起):`base = min(free, free − total×(1−target))`
+// (驱动实测 free;target 只作上限),`cap = (base − reserve − fixed_after)/per_tok`。
+// 旧式用引擎账 `live` 近似,漏掉 CUDA ctx / FI ws / allocator 惰性 reserved
+// (实测差 ~2-3 GiB)⇒ cap 虚高;`live` 仍打印但仅作参考。
+
+/// **自动池容量（并发感知；唯一产地）**。
 ///
-/// 口径(2026-10-22 起):`base = min(free, free − total×(1−target))`
-/// (驱动实测 free;target 只作上限),`cap = (base − reserve − fixed_after)/per_tok`。
-/// 旧式用引擎账 `live` 近似,漏掉 CUDA ctx / FI ws / allocator 惰性 reserved
-/// (实测差 ~2-3 GiB)⇒ cap 虚高;`live` 仍打印但仅作参考。
+/// 语义（`sessions = max_batch`）：
+/// - `sessions == 1`：池 = 单会话 ctx（逐字节旧行为；不扣瞬态）；
+/// - `sessions > 1`：池 = `min(cap − transient, seq × sessions)`；瞬态余量给
+///   prefill activation / 图 warmup / 内核惰性保留；
+/// - `seq > cap`：仅超卖档允许，池 = `cap − transient`（其余链块下沉）。
+///
+/// 返回 `(pool_tokens, overcommit_path)`。`Err` = 非超卖档连单请求都装不下
+/// （boot 应当响亮拒，不许静默缩 ctx）。
+pub(crate) fn auto_pool_tokens(
+    seq_tokens: usize,
+    sessions: usize,
+    cap_tokens: usize,
+    per_tok_bytes: usize,
+    transient_mb: u64,
+    overcommit: bool,
+) -> std::result::Result<(usize, bool), String> {
+    let sessions = sessions.max(1);
+    let per_tok = per_tok_bytes.max(1);
+    let transient_tok = (((transient_mb as usize) << 20) / per_tok).max(1);
+    if seq_tokens > cap_tokens {
+        if !overcommit {
+            return Err(format!(
+                "[pool] 自动池装不下本档:max_seq={}(+页对齐) > 预算可服务上限 ctx_max={}。\
+                 本档 per_tok={}B。修法:降 [runtime].max_seq、降 per_tok\
+                 (池 fp8 / 减草稿池)、或开 [kvmem] 超卖(select_decode+select_partial+pool_overcommit)。",
+                seq_tokens, cap_tokens, per_tok_bytes
+            ));
+        }
+        return Ok((cap_tokens.saturating_sub(transient_tok).max(1), true));
+    }
+    if sessions == 1 {
+        return Ok((seq_tokens.min(cap_tokens), false));
+    }
+    let usable = cap_tokens.saturating_sub(transient_tok);
+    let target = seq_tokens.saturating_mul(sessions);
+    let pool = target.min(usable).max(1);
+    if pool < seq_tokens && !overcommit {
+        return Err(format!(
+            "[pool] 并发自动池装不下单请求:max_seq={} > cap−瞬态={} \
+             (cap={} / 瞬态 {} MiB = {} tok)。修法:降 max_seq、\
+             降 `prefill_chunk`、或开 [kvmem] 超卖。",
+            seq_tokens, usable, cap_tokens, transient_mb, transient_tok
+        ));
+    }
+    Ok((pool, false))
+}
+
+/// **显存治理**：池 token 上限（None = 治理禁用；算式见上方注释）。
 fn pool_cap(plan: &PoolPlan, per_tok: &PerTokBytes, fixed_after: &FixedAfter) -> Option<usize> {
     let per_tok_bytes = per_tok.total();
     let vram_reserve = plan.vram_reserve_mb << 20;
@@ -2833,6 +2906,12 @@ impl DraftBank {
         } else {
             nb
         };
+        // **每会话一份 ring**（并发档；DFlash2 only）。物理池 = ring_nb × rings。
+        let rings = if dflash && paged {
+            plan.pool_sessions.max(1)
+        } else {
+            0
+        };
         let dflash_kvs = if dflash && paged {
             // 几何单源 = [`DRAFT_POOL`](原此处另写 `(8,128,5)`,与预算项两处各一遍)
             let geom = plan
@@ -2843,7 +2922,10 @@ impl DraftBank {
             // B6 偷显存:草稿池 e4m3(OWL_DFLASH_KV_FP8;1B/elem,U32 字节承载)
             // 分配项与预算项共用 `KvQuant::size_bytes` + 几何单源 ⇒ 两处不会再漂
             let df_bytes_elem = plan.draft_kv.size_bytes();
-            let df_elems = geom.layer_elems(ring_nb, page);
+            let df_elems = geom
+                .layer_elems(ring_nb, page)
+                .checked_mul(rings.max(1))
+                .expect("DFlash ring 元素数溢出");
             let (df_elems, df_dt) = if df_bytes_elem == 1 {
                 (df_elems / 4, Dtype::U32)
             } else {
@@ -2906,6 +2988,7 @@ impl DraftBank {
             fp8: plan.draft_kv.size_bytes() == 1,
             dt: plan.draft_dt,
             ring_slots,
+            rings,
         })
     }
 
@@ -3073,6 +3156,15 @@ mod vram_budget_tests {
         d.nk * d.hk * 3 + d.nv * d.hv * 3 + d.nv * d.hk * d.hv
     }
 
+    /// **prefill 瞬态 = 代码派生**（不再每档手配）：2048 chunk ⇒ 896MiB，
+    /// 1024 ⇒ 544MiB；线性项 ≈0.344 MiB/tok + 192MiB 固定余量。
+    #[test]
+    fn prefill_transient_is_code_derived() {
+        assert_eq!(prefill_transient_mb(2048), 896);
+        assert_eq!(prefill_transient_mb(1024), 544);
+        assert_eq!(prefill_transient_mb(512), 368);
+    }
+
     /// 逐 token 项:**ring 后生产 per_tok = 主池 only**;草稿池几何仍单列
     /// (固定项,不再进 per_tok),且随池量化声明走。
     #[test]
@@ -3103,34 +3195,53 @@ mod vram_budget_tests {
         assert_eq!(ring, 2080 * 10240);
     }
 
-    /// 固定项:GDN 格/快照按几何算,图 slab + warmup 两常数之和**必须仍是
-    /// 历史校准的 400MiB**(B1 拆分不改总分 ⇒ 历史治理数字可比),且 27B 档
-    /// 合计复现 boot 日志 `fixed_after=0.68G`(= 697MiB)。
+    /// **自动池并发感知**（2026-11-15）：单会话 = 旧行为；并发 = 用满
+    /// `cap − transient`，不再被单请求 `max_seq` 钉死。
     #[test]
-    fn fixed_after_matches_production_and_keeps_historical_total() {
-        // ⚠️ 2026-10-21 桶退役后:320 图 + 138 杂项 = **458 MiB**
-        // (非桶图族实测 261 + 59MiB 余量;KV 池多 ~320MiB)。
+    fn auto_pool_uses_budget_and_scales_with_batch() {
+        // 27B/3080 档实测账：cap ≈ 380,746（不含 scratch），per_tok 17,536。
+        let cap = 380_746usize;
+        let per_tok = 17_536usize;
+        let (one, over) =
+            auto_pool_tokens(262_144, 1, cap, per_tok, 1024, false).expect("单会话");
+        assert_eq!(one, 262_144, "单会话逐字节旧行为");
+        assert!(!over);
+
+        let (two, over) =
+            auto_pool_tokens(262_144, 2, cap, per_tok, 1024, false).expect("双并发");
+        assert!(!over);
+        // 瞬态 1 GiB ≈ 61.2k tok ⇒ 池 ≈ 319k；必须覆盖 2×(100k+32k)=264k。
+        assert!(two > 264_000, "并发池 {two} 必须装下 2×132k");
+        assert!(two < cap, "并发池必须给 scratch 留余量");
         assert_eq!(
-            GRAPH_SLAB_BUDGET + WARMUP_MISC_BUDGET,
-            458 << 20,
-            "桶退役后预算校准(2026-10-21:640→320)"
+            two,
+            cap - (1usize << 30) / per_tok,
+            "池 = cap − ceil(瞬态/per_tok)"
         );
+
+        // 非超卖：cap 连单请求都装不下 ⇒ 响亮拒（不许静默缩 ctx）。
+        assert!(auto_pool_tokens(262_144, 2, 200_000, per_tok, 1024, false).is_err());
+        // 超卖：允许池 < ctx（其余链块下沉）。
+        let (small, over) =
+            auto_pool_tokens(262_144, 2, 200_000, per_tok, 1024, true).expect("超卖");
+        assert!(over);
+        assert!(small < 262_144);
+    }
+
+    /// 固定项只剩**真实分配**:GDN 格/快照/spec/replay/草稿 ring。
+    /// 图执行/warmup 已并入 `vram_reserve_mb`，不再进 `FixedAfter`。
+    #[test]
+    fn fixed_after_contains_only_real_allocations() {
         let f = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1, 0, false, false);
         assert_eq!(f.gdn_grid, 155_713_536);
         assert_eq!(f.gdn_snap, 155_713_536);
-        assert_eq!(f.graph_slab, 320 << 20, "图项 = 非桶图族 261 + 余量");
-        assert_eq!(f.warmup_misc, 138 << 20);
-        assert_eq!(
-            f.total(),
-            730_857_472 + (58 << 20),
-            "fixed_after = 历史 400MiB + 图项 58MiB"
-        );
+        assert_eq!(f.total(), 311_427_072, "只剩两行 GDN 真实分配");
         // DFlash2 ring:固定项计入 total;2080 slots(65 页)×10240B/token
         let ring = 2080 * 10240;
         let fr = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1, ring, false, false);
         assert_eq!(fr.draft_ring, ring);
         assert_eq!(fr.total(), f.total() + ring);
-        // spec/replay 快照各是一整行 GDN 状态（此前漏账 ⇒ cap 虚高 4860 tok/份）
+        // spec/replay 快照各是一整行 GDN 状态
         let fs = FixedAfter::of(48, 1, gdn_slot_elems(&dims_27b()), 1, 0, true, true);
         assert_eq!(fs.spec_snap, fs.gdn_snap, "spec 快照 = 一行 GDN");
         assert_eq!(fs.replay_snap, fs.gdn_snap, "replay 快照 = 一行 GDN");

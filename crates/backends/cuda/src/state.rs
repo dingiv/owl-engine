@@ -113,8 +113,13 @@ impl DiagOpts {
             free_legacy: c.free_legacy,
             sync_mask: mask,
             launch_time: c.launch_time,
-            // 硬预算:与池治理同一预留(1GiB);逻辑上限走显式配置
-            vram_reserve_mb: cfg.pool.vram_reserve_mb.max(1),
+            // 硬预算只扣**运行时真余量**:`vram_reserve_mb` 里图/warmup
+            // 已经分配,再扣一次会把 2×112k 首 chunk 拒掉(2026-11-16)。
+            vram_reserve_mb: cfg
+                .pool
+                .vram_reserve_mb
+                .saturating_sub(owl_shared::config::POOL_GRAPH_WARMUP_RESERVE_MB)
+                .max(1),
             // **`0` = 不限**(与 `[pool] vram_budget_mb` 注释"留空 = 只按驱动账判"同义;
             // 各档普遍显式写 0)。写成 `Some(0)` = 0 字节硬预算 ⇒ 装载第一条就拒发,
             // boot 直接死在 embed_tokens(2026-10-21 实测)。

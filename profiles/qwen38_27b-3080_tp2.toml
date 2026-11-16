@@ -55,16 +55,18 @@ max_sessions = 0
 admission_on_full = "reject"
 keepalive_ms = 1000   # SSE 静默保活(ms;0=关):长 prefill 期间探客户端断流
 max_seq = 262144
-# **并发上限 2**(2026-11-03 用户裁决:TP2 档默认开双并发)。
-# 语义边界(别误解):
+# **并发上限 2**(2026-11-03 用户裁决:TP2 档默认开双并发;
+# 2026-11-15 升为真批 AR)。
+# 语义边界:
 # - ✅ 两路请求可以**同时被受理**(各有 turn id / sink / 在 `/debug/queue` 可见),
-#   不再在 HTTP permit 上串行等待;同会话仍由会话闸串行。
-# - ❌ **设备拍仍串行**:本档 TP2 + DFlash2 + 选择层 ⇒ `max_batch` 必须 1
-#   (合批要求单卡 / spec off),所以 `turns.active` 上限仍是 1,第二路在**引擎队列**
-#   里等。真并行不在这档的形状里。
-# - 代价:第二路会做准入预留(Strict 地板 = 全 ctx 页);池不够时它**排队**而不是
-#   抢第一路的块(活跃块由槽引用计数保护,逐不动)。
+#   同会话仍由会话闸串行;跨会话进入 `turns.active`。
+# - ✅ **设备拍真批**:TP2 两 rank 各跑一份 batch 图(图内含 AR),T=2 行
+#   一次前向;`max_batch=2` 与 `gdn_slots=2` 对齐。
+# - ⚠️ 批路当前只覆盖 **bare decode**;DFlash2 的 spec verify 批化是下一刀
+#   (多活跃时 spec 轮的草稿 KV 已按会话隔离,不再互踩)。要现在拿真批吞吐:
+#   `--set spec.depth=0 --set spec.lookup=false`(文本并发档)。
 max_concurrency = 2
+max_batch = 2
 # 3080 TP2 冷 prefill A/B（2026-10-25，15K/25K/37K）:
 #   512  = 1486 / 1446 / 1359 t/s
 #   1024 = 1576 / 1521 / 1454 t/s
@@ -149,9 +151,10 @@ snap_structural_reserve = 4
 gdn_slots = 2
 snap_host_mb = 3072
 host_cache_mb = 10240
-vram_reserve_mb = 512
-# 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
-transient_reserve_mb = 1024
+# 2026-11-16:单值总预留 = 256(旧 reserve) + 320(图执行) + 138(warmup) = 714。
+# 2×112k 双会话实测通过(池 340,384 tok);图执行实测 +430MiB。
+# prefill 瞬态不再配置:代码按 `prefill_chunk` 派生(2048 ⇒ 896MiB)。
+vram_reserve_mb = 714
 # 图像前缀无感删除(leave-gap:删后不转 K、保留位置洞)。
 # 消息边界快照:pi 每轮重发全历史;delim/gap/span 走 full.toml 默认。
 snap_msg_boundary = true

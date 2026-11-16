@@ -23,12 +23,13 @@ Rel(关系层门面)  身份映射 · 召回语义(Exact / ContextOnly)· 换出
 ```
 BlockLeg(engine 侧唯一门面)= KvStore(身份+槽账)+ HostTier(宿主物理)+ 搬运口
                               ↑ 布局由 engine 注册(id 级 + epoch);server 执行搬运(swap 单命令)
-Rel   = 关系层,待**两条腿齐备**(S2 之后)再立 —— 现在只有 KV 一条腿(rel.rs 仍在,未接线)
+Rel   = 关系层门面(S3b 已接线):双腿关联 / 准入 / 搬运计划;组合件字段私有,
+        engine 只调语义方法(slots_free / state_locate / kv_disk_* / plan_* / release_*)
 ```
 
 ## 谁在用(2026-10-17,S3-3 全刀之后;交互契约全文见设计卷 §10、钩子 §14、需求驱动 §17)
 
-`owl-engine` 的 `SessionBank` 持两套**块腿**(`BlockLeg`:target / mtp);`KvStore` 已是内部件。
+`owl-engine` 的 `SessionBank` 持 target 链 `Rel` + MTP 块腿(`BlockLeg`);`KvStore` 是 `Rel` 内部件。
 engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5)。
 
 已经通的:
@@ -40,11 +41,10 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
 - **无卡验证**:`tests/store_e2e.rs`(端到端三门口 + 链级粒度,0.00s)
   与 engine 侧 `cpu_mock_smoke`(boot/装载/warmup/图捕获/turn)。
 
-仍未接线:
+旧口径更正(2026-11-16):
 
-1. `Rel` 关系层(**要两条腿齐备**;只有 KV 一条腿时立它 = 半空门面)—— 待 S2/S2b 状态腿;
-2. 盘层(§15.4 的 disk connector;`Carrier::Disk` 位已留);
-3. 挂账清单集中在本包 `docs/devlog/memory/store.md` **§20**。
+- 盘层**已接线**(S6:`attach_disk` / `adopt_disk_*` / spill / fill),不再是"未接线";
+- 历史挂账清单集中在本包 `docs/devlog/memory/store.md` **§20**。
 
 ## 律(违反即 `// CMA:` 标记)
 
@@ -86,3 +86,18 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
     (engine 的 `step_need` ↔ `reuse_face`/`prefill_step_chunk`);`ensure_for_len` 的同步
     驱逐是**兜底**,触发即计入 `LegOps::ensure_evicted`(非零 = 保洁不足的指纹);
     需求上界宁可**多算**(多腾不丢内容),**少算才丢内容** —— 方向性错误不对称。
+16. **组合件字段私有 + 语义方法(2026-11-16)**：`Rel` 的 `leg`/`state`/`snap_host`/`disk`/
+    `snap_disk`/`index`/`admission`/`reservations` 不对 engine 暴露，**也不提供
+    `leg()`/`state()`/`disk()` 访问器**；engine 只调 `Rel` 的语义方法
+    (`slots_free`/`state_locate`/`kv_disk_plan_spill`/`plan_onload`/`release_table` …)。
+    新增存储能力一律先给 store 加方法；禁止在 engine 侧重新拼内部账或直接替换组合件。
+    2026-11-16 第一刀已落:engine 的 `spill_kv` / `spill_snap` / `fill_kv` /
+    `fill_kv_window` / `fill_snap` / `write_chain_index` / `ensure_host_resident`
+    已抽到 `engine::mem::disk_runtime::DiskRuntime`(无本地配额副本，接收 `&mut Rel`)；
+    store 继续只出计划/记账。盘层淘汰已接 session 感知：
+    `Rel::kv_disk_plan_evict_sessions` / `snap_disk_plan_evict_sessions`
+    先避开活跃 session，不够才回落到活跃面；`StoreReport.disk_sessions` 给出
+    逐 session 的盘上 KV/快照账。三级级联（GPU → Host → Disk → Drop）的候选
+    出序也统一带会话档：`order_candidates`（KV/状态）与 `order_snap_victims`
+    （快照）都是“冷会话先、会话内再按 LRU/LRFU”。下一步:`SessionBank` 的 `sessions`/`rel`/`leg_mtp`
+    需要 split-borrow 门面(`parts_mut`)才能私有化；checkpoint 编排簇仍可继续抽。

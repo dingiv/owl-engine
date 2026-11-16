@@ -93,25 +93,25 @@ async fn snapshot_offload_and_reload_is_byte_identical() {
     let k = key(7);
     seed(&mut face, &ps, 0, 0x11).await;
     let before = read_slot(&mut face, &ps, 0).await;
-    r.state.register_snap(k, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
-    assert_eq!(r.state.locate(k), Some(Tier::Gpu));
-    assert_eq!(r.state.snaps_in_tier(Tier::Gpu), (1, SNAP_BYTES));
+    r.register_snap_account(k, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
+    assert_eq!(r.state_locate(k), Some(Tier::Gpu));
+    assert_eq!(r.snaps_in_tier(Tier::Gpu), (1, SNAP_BYTES));
 
     // ① 下沉:设备槽 0 → 宿主(一条 swap 搬 N 片)
     let (pieces, table) = r.plan_snap_offload(k, 0).expect("下沉计划");
     let conn = face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await.expect("swap(Out)");
     let table = owl_store::reclaim_slot_table(conn).expect("回执取台");
     r.commit_snap_offload(k, table).expect("下沉记账");
-    assert_eq!(r.state.locate(k), Some(Tier::Host), "层应下沉");
+    assert_eq!(r.state_locate(k), Some(Tier::Host), "层应下沉");
     assert_eq!(r.snap_host_used(), SNAP_BYTES, "宿主层应真有驻留");
-    assert_eq!(r.state.snaps_in_tier(Tier::Host), (1, SNAP_BYTES));
+    assert_eq!(r.snaps_in_tier(Tier::Host), (1, SNAP_BYTES));
 
     // ② 回灌:宿主 → 设备槽 2(另一槽 ⇒ 证明内容跟着走,不是原地)
     let (pieces, table) = r.plan_snap_onload(k, 2).expect("回灌计划");
     let conn = face.swap(SwapDir::In, &pieces[0], Box::new(table)).await.expect("swap(In)");
     let table = owl_store::reclaim_slot_table(conn).expect("回执取台");
     r.commit_snap_onload(k, table).expect("回灌记账");
-    assert_eq!(r.state.locate(k), Some(Tier::Gpu), "层应回设备");
+    assert_eq!(r.state_locate(k), Some(Tier::Gpu), "层应回设备");
     assert_eq!(r.snap_host_used(), 0, "宿主层应清空");
     assert_eq!(read_slot(&mut face, &ps, 2).await, before, "**逐字节一致**(门④)");
 
@@ -119,25 +119,25 @@ async fn snapshot_offload_and_reload_is_byte_identical() {
     //    回落"丢**新**快照" ⇒ 实测把整条链的旧边界挤死,部分前缀复用面 29%)。
     //    预算 = 一条 ⇒ 第二条装不下 ⇒ 逐最冷(此处只有 k2)后新条目落位。
     let k2 = key(8);
-    r.state.register_snap(k2, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
+    r.register_snap_account(k2, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
     let (p1, t1) = r.plan_snap_offload(k2, 3).expect("第一条");
     let c1 = face.swap(SwapDir::Out, &p1[0], Box::new(t1)).await.expect("swap");
     r.commit_snap_offload(k2, owl_store::reclaim_slot_table(c1).expect("台")).expect("落账");
     assert_eq!(r.snap_host_free_slots(), 0, "预算 = 一条 ⇒ 此刻宿主满");
     let k3 = key(9);
-    r.state.register_snap(k3, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
+    r.register_snap_account(k3, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
     let (p3, t3) = r.plan_snap_offload(k3, 1).expect("宿主满 ⇒ 逐最冷后应能下沉");
     let c3 = face.swap(SwapDir::Out, &p3[0], Box::new(t3)).await.expect("swap");
     r.commit_snap_offload(k3, owl_store::reclaim_slot_table(c3).expect("台")).expect("落账");
-    assert_eq!(r.state.locate(k2), None, "最冷条目 k2 应被逐(内容整体丢)");
-    assert_eq!(r.state.locate(k3), Some(Tier::Host), "新条目应落宿主");
+    assert_eq!(r.state_locate(k2), None, "最冷条目 k2 应被逐(内容整体丢)");
+    assert_eq!(r.state_locate(k3), Some(Tier::Host), "新条目应落宿主");
     assert!(r.snap_host_evicted_bytes() >= SNAP_BYTES as u64, "逐出量应入账(观测面)");
 
     // ④ 回灌失败可回滚:缓冲放回宿主(内容不丢)
     let (_pieces, _table) = r.plan_snap_onload(k3, 0).expect("回灌计划");
     // 失败路径:台子随失败的 connector 消失 ⇒ 条目删(不留假账)
     r.abort_snap_onload(k3);
-    assert_eq!(r.state.locate(k3), None, "内容已丢 ⇒ 条目一并删");
+    assert_eq!(r.state_locate(k3), None, "内容已丢 ⇒ 条目一并删");
     assert_eq!(r.snap_host_used(), 0, "宿主账同步清");
 }
 
@@ -151,7 +151,7 @@ async fn snap_host_is_independent_from_kv_host() {
         .expect("布局");
     assert_eq!(r.snap_host_budget(), 1 << 20);
     assert_eq!(r.snap_host_free_slots(), (1 << 20) / SNAP_BYTES);
-    assert_eq!(r.leg.host_budget_bytes(), 0, "KV 腿宿主面仍关");
+    assert_eq!(r.host_budget_bytes(), 0, "KV 腿宿主面仍关");
 }
 
 /// ⑤ **生成段(Transient)快照不可下沉**:逐出即丢,不占宿主带宽。
@@ -165,22 +165,20 @@ async fn transient_snapshot_is_not_offloadable() {
         .expect("布局");
     let k = key(11);
     seed(&mut face, &ps, 0, 0x22).await;
-    r.state
-        .register_snap(k, SNAP_BYTES, Tier::Gpu, SnapDurability::Transient);
-    assert_eq!(r.state.snap_durability(k), Some(SnapDurability::Transient));
-    assert_eq!(r.state.snaps_transient(), 1);
+    r.register_snap_account(k, SNAP_BYTES, Tier::Gpu, SnapDurability::Transient);
+    assert_eq!(r.snap_durability(k), Some(SnapDurability::Transient));
+    assert_eq!(r.snaps_transient(), 1);
     // 宿主预算**充足**,但 Transient 一律拒(不是"装不下",是"不值得搬")
     let err = match r.plan_snap_offload(k, 0) {
         Ok(_) => panic!("Transient 必须拒"),
         Err(e) => e,
     };
     assert!(matches!(err, StoreError::Invariant(_)), "得 {err:?}");
-    assert_eq!(r.state.locate(k), Some(Tier::Gpu), "拒后层不动(零副作用)");
+    assert_eq!(r.state_locate(k), Some(Tier::Gpu), "拒后层不动(零副作用)");
     assert_eq!(r.snap_host_used(), 0, "宿主账不动");
     // 前缀段(Durable)同槽同预算 = 照旧可沉(证明拒的是档不是环境)
     let kd = key(12);
-    r.state
-        .register_snap(kd, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
+    r.register_snap_account(kd, SNAP_BYTES, Tier::Gpu, SnapDurability::Durable);
     r.plan_snap_offload(kd, 1).expect("Durable 可沉");
 }
 /// ⑥ **同名边界快照重拍不留幽灵**(2026-10-28 定谳)。
@@ -214,7 +212,7 @@ async fn recapture_drops_stale_host_copy() {
     let (pieces, table) = r.plan_snap_offload(k, 0).expect("下沉计划");
     let conn = face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await.expect("swap");
     r.commit_snap_offload(k, owl_store::reclaim_slot_table(conn).expect("台")).expect("落账");
-    assert_eq!(r.state.locate(k), Some(Tier::Host));
+    assert_eq!(r.state_locate(k), Some(Tier::Host));
     assert_eq!(r.snap_host_used(), SNAP_BYTES);
 
     // 重拍同一边界(同键):幽灵必须当场丢
@@ -230,14 +228,14 @@ async fn recapture_drops_stale_host_copy() {
         .expect("重拍");
     assert_eq!(ghosts, 1, "应丢掉一份旧副本");
     assert_eq!(r.snap_host_used(), 0, "宿主账必须清零(否则是幽灵)");
-    assert_eq!(r.state.locate(k), Some(Tier::Gpu), "层账回到设备");
+    assert_eq!(r.state_locate(k), Some(Tier::Gpu), "层账回到设备");
 
     // 再沉一次:病灶版在这里抛「已在宿主层」
     let (pieces, table) = r.plan_snap_offload(k, 1).expect("重拍后可再沉(零幽灵)");
     let conn = face.swap(SwapDir::Out, &pieces[0], Box::new(table)).await.expect("swap");
     r.commit_snap_offload(k, owl_store::reclaim_slot_table(conn).expect("台"))
         .expect("再沉落账(不得撞不变量)");
-    assert_eq!(r.state.locate(k), Some(Tier::Host));
+    assert_eq!(r.state_locate(k), Some(Tier::Host));
 }
 
 /// ⑦ **宿主满时的淘汰也必须遵守 SnapClass**（2026-11-13）。
@@ -298,12 +296,12 @@ async fn host_eviction_respects_snap_class_before_lru() {
     let _ = r.plan_snap_offload(k_new, 2).expect("宿主满 ⇒ 按档位逐一条");
 
     assert_eq!(
-        r.state.locate(k_extra),
+        r.state_locate(k_extra),
         None,
         "更新的 Extra 必须先于更老的 Dense 被逐"
     );
     assert_eq!(
-        r.state.locate(k_dense),
+        r.state_locate(k_dense),
         Some(Tier::Host),
         "Dense 是最后淘汰档，不应先走"
     );

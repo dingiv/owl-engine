@@ -627,6 +627,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                         d_model,
                         d.dtype,
                         base,
+                        host.gdn_slot,
                     );
                 if defer {
                     keep_hfb = true;
@@ -642,7 +643,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                         })
                         .collect();
                     let t_de = std::time::Instant::now();
-                    self.prefill_dflash_encode(host.probes, &tap_views, base).await?;
+                    self.prefill_dflash_encode(host.probes, &tap_views, base, host.gdn_slot).await?;
                     mrec("dflash.encode", t_de.elapsed());
                     // 探针:concat 父块整块落盘(python 对拍 taps;真块 dtoh)
                     if host.probes.dflash_probe && !self.spec_rt.mem_dumped2 {
@@ -932,6 +933,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                             *dd,
                             d.dtype,
                             base,
+                            host.gdn_slot,
                         );
                     if defer {
                         keep_b = true;
@@ -947,7 +949,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                             })
                             .collect();
                         let t_de = std::time::Instant::now();
-                        self.prefill_dflash_encode(host.probes, &tap_views, base).await?;
+                        self.prefill_dflash_encode(host.probes, &tap_views, base, host.gdn_slot).await?;
                         mrec("dflash.encode", t_de.elapsed());
                     }
                 } else if self.spec_rt.drafter.as_ref().map(|d| d.as_mtp().is_some()).unwrap_or(false) && t > 1 {

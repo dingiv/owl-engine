@@ -236,15 +236,14 @@ checkpoint_max_mb = 0
 # 两次 checkpoint 的最小间隔 ms（仅 checkpoint_max_mb>0 时生效；0 = 每 turn 都试）
 checkpoint_min_gap_ms = 5000
 # 临时块复用池上限(MiB;0 = 不限)
-pool_cap_mb = 256
 # **显存治理（二选一）**：
 #   vram_budget    = 驱动 total 的占比(0..1;0 = 关治理;1.0 = 吃满 free)
 #   vram_budget_mb = 绝对硬上限 MiB(0 = 只按驱动账;适合“这台卡只准用 N GB”)
-# target_total = total × vram_budget；vram_reserve_mb 是额外预留。
+# target_total = total × vram_budget；vram_reserve_mb 是**单值总预留**
+# (含图执行/warmup/碎片;prefill 瞬态由代码按 runtime.prefill_chunk 派生)。
 vram_budget = 0.99
-vram_reserve_mb = 256
+vram_reserve_mb = 714
 # 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
-transient_reserve_mb = 1024
 # 显存硬上限 MiB(留空 / 0 = 只按驱动账判)
 vram_budget_mb = 0
 # 解释器块池预算(字节;0 = 关)

@@ -178,6 +178,14 @@ impl StateStore {
     ///
     /// `owner` = 行归属（正常 = `Owner::Turn(turn)`）；报告面据此按 turn 归因。
     pub fn borrow_row(&mut self, owner: Owner) -> StoreResult<usize> {
+        // 一个 owner 至多一行：`release_row_of` 只释放第一行，重复借行
+        // 会让第二行永久占格（直到进程重启）。
+        if self.row_owners.values().any(|o| *o == owner) {
+            return Err(StoreError::Invariant(format!(
+                "owner {} 已占一行，不能重复借行",
+                owner.label()
+            )));
+        }
         let row = *self
             .rows_free
             .iter()
@@ -201,22 +209,16 @@ impl StateStore {
         }
         self.row_owners.remove(&row);
         if let Some(k) = snap {
-            self.tick += 1;
-            let tick = self.tick;
-            // 行归还时的快照 = **链头**(turn 收口那一刻的态;idle 会话靠它复活)
-            // ⇒ 长期价值 ⇒ Durable(可下沉)
-            self.snaps.insert(
+            // **同键重拍不得覆盖既有归属/档位**：行归还快照是 Dense 尾锚点，
+            // 但若该键此前已被某会话登记，`session`/`depth` 必须保留。
+            self.register_snap_owned_class(
                 k,
-                SnapEntry {
-                    tier: Tier::Gpu,
-                    bytes: self.row_bytes,
-                    last_use: tick,
-                    session: crate::policy::NO_SESSION,
-                    depth: 0,
-                    durability: SnapDurability::Durable,
-                    // 行归还 = turn 末链头态 = 尾锚点 ⇒ Dense(最后淘汰,可淘汰)。
-                    class: SnapClass::Dense,
-                },
+                self.row_bytes,
+                Tier::Gpu,
+                SnapDurability::Durable,
+                crate::policy::NO_SESSION,
+                0,
+                SnapClass::Dense,
             );
         }
         Ok(())
@@ -627,6 +629,36 @@ pub struct StateStats {
 mod tests {
     use super::*;
     use crate::id::ChainHash;
+
+    #[test]
+    fn duplicate_owner_borrow_is_loud() {
+        let mut s = StateStore::new(2, 1);
+        s.borrow_row(Owner::Turn(1)).expect("首行");
+        let err = s.borrow_row(Owner::Turn(1)).expect_err("同一 owner 不得借两行");
+        assert!(matches!(err, StoreError::Invariant(_)), "得 {err:?}");
+        assert_eq!(s.rows_free(), 1, "失败不得消耗行");
+    }
+
+    #[test]
+    fn return_row_snapshot_preserves_existing_owner() {
+        let mut s = StateStore::new(1, 4096);
+        let key = SnapKey::at_boundary(ChainHash::new(0x71));
+        s.register_snap_owned(
+            key,
+            4096,
+            Tier::Gpu,
+            SnapDurability::Durable,
+            7,
+            3,
+        );
+        let row = s.borrow_row(Owner::Turn(1)).expect("借行");
+        s.return_row(row, Some(key)).expect("还行并落快照");
+        assert_eq!(
+            s.snap_session(key),
+            Some((7, 3)),
+            "同键重拍必须保留既有会话归属/深度"
+        );
+    }
 
     #[test]
     fn rows_are_borrowed_per_turn_and_returned_with_snapshot() {

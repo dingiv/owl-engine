@@ -203,40 +203,12 @@ pub trait AllocLedger: Send {
     /// 换层(只改 tier/owner,不注销)。
     fn on_move(&mut self, ev: &MoveEvent);
 
-    /// **池取块**(缺口 4):**同 rank + 同 kind + 同尺寸**才给(P0-1:TP 两 rank
-    /// 共写一本账 ⇒ 键必须带 rank);`None` = 未命中(调用方真分配)。缺省 = 无池面。
-    fn pool_acquire(&mut self, _rank: u8, _class: AssetClass, _bytes: usize) -> Option<u64> {
-        None
-    }
-
-    /// **池还块**:返回**必须真归还驱动**的 id 列表(空 = 已入池)。
-    /// 不可池化 ⇒ `[id]`;超池上限顶出的旧块 ⇒ `[old…]`(**可能多块**,
-    /// 2026-10-20 定谳:早先只返还最后一块 ⇒ 多顶出时其余块永久泄漏)。
-    fn pool_release(&mut self, id: u64) -> Vec<u64> {
-        vec![id]
-    }
-
-    /// **带调用面 rank 的还块**(防呆门;2026-10-20):块只能在自己那个 server 上 free
-    /// ⇒ 账本按 `Loan.rank` 校验;不符 ⇒ 记错并 `None`(留在账上,等 turn 收尾的
-    /// **逐 rank 兜底**还到正确的面)。缺省 = 回落 [`AllocLedger::pool_release`]。
-    fn pool_release_on(&mut self, id: u64, rank: Option<u8>) -> Vec<u64> {
-        let _ = rank;
-        self.pool_release(id)
-    }
-
-    /// **池排空**(压力路径 N6):清**本 rank** 的池条目并交出 id(调用方真归还驱动)。
-    /// `rank` = 本句柄的设备序 —— 块只能打到**它自己的 server**(跨 rank 必打空)。
-    fn pool_drain(&mut self, rank: u8) -> Vec<u64> {
-        let _ = rank;
-        Vec::new()
-    }
-
-    /// **借出状态**(`Some((rank, pooled))` = 在借;`None` = 无登记)。
+    /// **借出状态**(`Some(rank)` = 在借;`None` = 无登记)。
     ///
     /// 消费点 = `DeviceHandle::free` 的**前置校验**(2026-10-20 用户裁决:
     /// "都是显式拒绝,不留隐式"):跨 rank / 双 free / 幽灵 free 一律 `Err`,
     /// 不再"记一笔然后吞掉"。缺省 `None` = 无账面后端(不校验)。
-    fn loan_state(&mut self, id: u64) -> Option<(u8, bool)> {
+    fn loan_state(&mut self, id: u64) -> Option<u8> {
         let _ = id;
         None
     }
@@ -435,9 +407,6 @@ struct Ctx {
     class: AssetClass,
     /// 本引擎的设备序(单卡 0;TP rank1 = 1)—— 事件按它分组,卡不混账。
     dev_rank: u8,
-    /// 池命中/入池计数(诊断面;缺口 4)
-    pool_hits: u64,
-    pool_released: u64,
     /// 本上下文发出的事件条数(诊断 + `adopt_ledger` 的 boot 期判据;
     /// 放共享上下文 ⇒ 克隆句柄的发事件也算“本引擎已开始记账”)。
     events_sent: u64,
@@ -456,8 +425,6 @@ impl Ctx {
             owner: Owner::default_owner(),
             class: AssetClass::Unclassified,
             dev_rank: 0,
-            pool_hits: 0,
-            pool_released: 0,
             events_sent: 0,
             hook_fail: 0,
             windows: Vec::new(),
@@ -718,22 +685,6 @@ impl<D: DeviceClient> DeviceHandle<D> {
         self.ctx().window_unclosed
     }
 
-    /// **池命中/入池计数**(诊断面;缺口 4)。
-    pub fn pool_counters(&self) -> (u64, u64) {
-        let c = self.ctx();
-        (c.pool_hits, c.pool_released)
-    }
-
-    fn note_pool_hit(&self) {
-        let mut c = self.ctx();
-        c.pool_hits = c.pool_hits.saturating_add(1);
-    }
-
-    fn note_pool_released(&self, n: usize) {
-        let mut c = self.ctx();
-        c.pool_released = c.pool_released.saturating_add(n as u64);
-    }
-
     /// 当前捕获窗内**尚未归还**的块数(诊断面;非 0 且非捕获期 = 有图未退休)。
     pub fn open_window_blocks(&self) -> usize {
         let c = self.ctx();
@@ -812,18 +763,13 @@ impl<D: DeviceClient> DeviceHandle<D> {
                 Ok(Outcome::Buf(b))
             }
             Command::Free { ids } => {
-                // **缺口 4**:可池化的块**不回驱动**(入 store 池 ⇒ 零命令复用);
-                // 池内那条**不**发 FreeEvent(块仍在借 —— 只是变得可复用)。
-                let (rest, pooled) = self.pool_release_all(&ids)?;
-                if pooled > 0 {
-                    self.note_pool_released(pooled);
-                }
-                if !rest.is_empty() {
-                    self.inner.free(&rest).await?;
-                }
-                for id in rest {
+                // 复用交给 GPU server 的 cudaMallocAsync 默认池；这里先校验
+                // 幽灵/双 free/跨 rank，然后全部真归还。
+                self.validate_free_ids(&ids)?;
+                self.inner.free(&ids).await?;
+                for id in &ids {
                     // 字节数在账本侧反查(FreeEvent 只带 id);此处留 0 = 由账本按登记扣
-                    frees.push(FreeEvent { id, bytes: 0 });
+                    frees.push(FreeEvent { id: *id, bytes: 0 });
                 }
                 for id in &ids {
                     self.untrack(*id);
@@ -919,157 +865,74 @@ impl<D: DeviceClient> DeviceHandle<D> {
         }
     }
 
-    /// **池取块**(真分配之前问一次;命中 ⇒ 零命令复用)。
+    /// **把 GPU 默认池的缓存还给驱动**(压力自愈/N6;`cuMemPoolTrimTo`)。
     ///
-    /// **P0-3(安全门)**:捕获窗开着时**一律不取池** —— 窗内块若来自池(而非 slab 切片),
-    /// 它的指针会被烘进图,之后被复用/顶出/排空 ⇒ 图回放踩已改嫁的块。
-    fn pool_acquire(&self, class: AssetClass, bytes: usize) -> Option<u64> {
-        let cell = self.ledger.as_ref()?;
-        let (rank, in_window) = {
-            let c = self.ctx();
-            (c.dev_rank, !c.windows.is_empty())
-        };
-        if in_window {
-            return None;
-        }
-        let mut g = match cell.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        g.pool_acquire(rank, class, bytes)
-    }
-
-    /// **压力自愈**(N6 第一刀):池排空 ⇒ 真归还驱动 ⇒ 销账。返回释放块数。
-    ///
-    /// 为什么放在句柄:它是唯一同时握有**池(store 账本)**与**驱动口(face)**的一层
-    /// —— 决策仍在 store(排空哪些 = `pool_drain`),执行在这里。
+    /// store 已不再持有临时块复用池;块复用由 CUDA `cudaMallocAsync` 默认池
+    /// 负责。本函数只做驱动侧 trim,返回释放字节数。
     pub async fn drain_pool_to_driver(&mut self) -> usize {
-        let Some(cell) = self.ledger.as_ref() else { return 0 };
-        let ids = {
-            let mut g = match cell.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            g.pool_drain(self.ctx().dev_rank)
-        };
-        if ids.is_empty() {
-            return 0;
-        }
-        if let Err(e) = self.inner.free(&ids).await {
-            // 释放失败**不许静默**:本块仍归池(不销账),下次再来
-            self.sink.logf(
-                LVL_WARN,
-                "device-handle",
-                format_args!("池排空释放失败({} 块):{e}", ids.len()),
-            );
-            // 回填入池可能**顶出旧块** —— 那些 id 必须真还驱动(否则又是泄漏)
-            let evicted = {
-                let mut g = match cell.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                let mut evicted = Vec::new();
-                for id in &ids {
-                    evicted.extend(g.pool_release(*id));
-                }
-                evicted
-            };
-            if !evicted.is_empty() {
-                if let Err(e2) = self.inner.free(&evicted).await {
-                    self.sink.logf(
-                        LVL_WARN,
-                        "device-handle",
-                        format_args!("池回填顶出释放失败({} 块):{e2}", evicted.len()),
-                    );
-                } else {
-                    let frees: Vec<FreeEvent> =
-                        evicted.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
-                    self.send_events(&[], &frees, &[]);
-                    for id in &evicted {
-                        self.untrack(*id);
-                    }
-                }
+        // 复用池已下沉 GPU server：这里只把 cudaMallocAsync 默认池的缓存
+        // 还给驱动。返回值 = 释放字节数（调用方只做日志；不再有 store 池账）。
+        match self.inner.mem_pool_trim().await {
+            Ok(bytes) => bytes as usize,
+            Err(e) => {
+                self.sink.logf(
+                    LVL_WARN,
+                    "device-handle",
+                    format_args!("GPU mem pool trim 失败: {e}"),
+                );
+                0
             }
-            return 0;
         }
-        let frees: Vec<FreeEvent> = ids.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
-        self.send_events(&[], &frees, &[]);
-        for id in &ids {
-            self.untrack(*id);
-        }
-        ids.len()
     }
 
-    /// **池还块**(逐 id):返回 `(必须真归还的 id 列表, 入池条数)`。
-    ///
-    /// 两种"必须归还":①不可池化(同一 id)②超池上限**顶出**的旧块
-    /// (**可以多条** —— 一次还块可能要腾多块;旧实现只收最后一条 ⇒ 泄漏)。
-    /// 入池条数 = 本次真正留在池里的块数(打点;顶出块在 store 侧另计 `pool_evicted`)。
-    /// **归还前校验 + 入池/交还**(唯一收口;三条硬判据,2026-10-20 用户裁决):
-    ///
+    /// **归还前校验**(唯一收口;三条硬判据,2026-10-20 用户裁决):
     /// 1. **幽灵 free**(账上没这块)⇒ `Err`;
-    /// 2. **双 free**(账上是 `pooled` 态 ⇒ 已经在复用池里)⇒ `Err`;
+    /// 2. **双 free**(账上已无该 id ⇒ 与幽灵同判)⇒ `Err`;
     /// 3. **跨 rank**(块的归属面 ≠ 本句柄的设备序)⇒ `Err` —— 块只能在自己那个
-    ///    server 的块表里 free,错面真还必然打空(§79 那条泄漏)。
+    ///    server 的块表里 free,错面真还必然打空。
     ///
-    /// 不校验 = 无账面的后端(`ledger == None`,纯转发态)。
-    fn pool_release_all(&self, ids: &[u64]) -> Result<(Vec<u64>, usize), ModelError> {
-        let Some(cell) = self.ledger.as_ref() else { return Ok((ids.to_vec(), 0)) };
+    /// 复用已下沉 GPU server 的 cudaMallocAsync 默认池:校验通过后调用方
+    /// **全部真归还**,store 不再持有/复用块。
+    fn validate_free_ids(&self, ids: &[u64]) -> Result<(), ModelError> {
+        let Some(cell) = self.ledger.as_ref() else { return Ok(()) };
         let my_rank = self.ctx().dev_rank;
         let mut g = match cell.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        // 前置校验(**全批先判**,一条不合法就整批拒 —— 不留半还的状态)
-        if g.validates() {
-            // **批内重复 id** = 调用方把同一块列了两次(硬 bug;显式拒)
-            {
-                let mut seen: std::collections::HashMap<u64, usize> =
-                    std::collections::HashMap::with_capacity(ids.len());
-                for (i, id) in ids.iter().enumerate() {
-                    if let Some(j) = seen.insert(*id, i) {
-                        return Err(ModelError::Msg(format!(
-                            "free: 批内重复 id={id}(name={:?};第 {j} 与第 {i} 项,批长 {})",
-                            g.loan_name(*id).unwrap_or_else(|| "?".into()),
-                            ids.len()
-                        )));
-                    }
-                }
-            }
-            for id in ids {
-                match g.loan_state(*id) {
-                    None => {
-                        return Err(ModelError::Msg(format!(
-                            "free: 幽灵归还 —— 账上无 id={id} 的在借登记(双 free 或未登记)"
-                        )))
-                    }
-                    Some((_rank, true)) => {
-                        return Err(ModelError::Msg(format!(
-                            "free: 双 free —— id={id} 已在复用池(pooled)里,不能重复归还"
-                        )))
-                    }
-                    Some((rank, false)) if rank != my_rank => {
-                        return Err(ModelError::Msg(format!(
-                            "free: 跨 rank 归还 —— id={id} 属 rank{rank},却由 rank{my_rank} 发起\
-                             (块只能在自己的 server 上 free)"
-                        )))
-                    }
-                    Some(_) => {}
+        if !g.validates() {
+            return Ok(());
+        }
+        // **批内重复 id** = 调用方把同一块列了两次(硬 bug;显式拒)
+        {
+            let mut seen: std::collections::HashMap<u64, usize> =
+                std::collections::HashMap::with_capacity(ids.len());
+            for (i, id) in ids.iter().enumerate() {
+                if let Some(j) = seen.insert(*id, i) {
+                    return Err(ModelError::Msg(format!(
+                        "free: 批内重复 id={id}(name={:?};第 {j} 与第 {i} 项,批长 {})",
+                        g.loan_name(*id).unwrap_or_else(|| "?".into()),
+                        ids.len()
+                    )));
                 }
             }
         }
-        let mut must_free = Vec::new();
-        let mut pooled = 0usize;
         for id in ids {
-            // 空 = 已入池(或按防呆门拒收);非空 = 这些 id 必须真归还
-            let real = g.pool_release_on(*id, Some(my_rank));
-            if real.is_empty() {
-                pooled += 1;
-            } else {
-                must_free.extend(real);
+            match g.loan_state(*id) {
+                None => {
+                    return Err(ModelError::Msg(format!(
+                        "free: 幽灵归还 —— 账上无 id={id} 的在借登记(双 free 或未登记)"
+                    )))
+                }
+                Some(rank) if rank != my_rank => {
+                    return Err(ModelError::Msg(format!(
+                        "free: 跨 rank 归还 —— id={id} 属 rank{rank},却由 rank{my_rank} 发起                         (块只能在自己的 server 上 free)"
+                    )))
+                }
+                Some(_) => {}
             }
         }
-        Ok((must_free, pooled))
+        Ok(())
     }
 
     /// 发事件(客户端侧;**短锁**,绝不跨 await)。
@@ -1355,25 +1218,19 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         elems: usize,
         name: &str,
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
-        // 池命中 ⇒ **零命令复用**;`alloc` 是零化语义 ⇒ 命中后补一次 memset(不许静默降级)
-        let class = self.ctx().class; // 先落变量(上下文临时 guard 不许跨到下一句)
-        let hit = DeviceHandle::pool_acquire(self, class, elems * dtype.size_bytes());
         async move {
-            if let Some(id) = hit {
-                self.note_pool_hit();
-                let b = Bytes::new(id, elems, dtype, 0);
-                self.inner.memset_zero(&b, elems * dtype.size_bytes()).await?;
-                return Ok(b);
-            }
+            // **临时块复用 = GPU server 层**（cudaMallocAsync 默认 mem pool）；
+            // store 不再持有/分配复用池，这里只做真分配。
             let b = match self.inner.alloc(dtype, elems, name).await {
                 Ok(b) => b,
                 Err(e) if matches!(e, ModelError::PoolExhausted { .. }) => {
-                    let n = self.drain_pool_to_driver().await;
-                    if n > 0 {
+                    // 压力自愈 = 让 GPU server 的 mem pool 把缓存还给驱动，再试一次。
+                    let trimmed = self.inner.mem_pool_trim().await.unwrap_or(0);
+                    if trimmed > 0 {
                         self.sink.logf(
                             LVL_INFO,
                             "device-handle",
-                            format_args!("分配遇 PoolExhausted ⇒ 排空复用池 {n} 块后重试"),
+                            format_args!("分配遇 PoolExhausted ⇒ GPU mem pool trim {trimmed} B 后重试"),
                         );
                         self.inner.alloc(dtype, elems, name).await?
                     } else {
@@ -1398,24 +1255,17 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
         elems: usize,
         name: &str,
     ) -> impl Future<Output = Result<Bytes, ModelError>> + Send {
-        // 池命中 ⇒ 零命令 + **免零化**(kernel 全量覆写的块;设计原文的复用红利)
-        let class = self.ctx().class; // 先落变量(上下文临时 guard 不许跨到下一句)
-        let hit = DeviceHandle::pool_acquire(self, class, elems * dtype.size_bytes());
         async move {
-            if let Some(id) = hit {
-                self.note_pool_hit();
-                return Ok(Bytes::new(id, elems, dtype, 0));
-            }
+            // 复用同样交给 GPU server 的 cudaMallocAsync 默认池。
             let b = match self.inner.alloc_uninit(dtype, elems, name).await {
                 Ok(b) => b,
-                // **N6 压力自愈**:硬预算/池耗尽 ⇒ 先把复用池还给驱动,再试一次
                 Err(e) if matches!(e, ModelError::PoolExhausted { .. }) => {
-                    let n = self.drain_pool_to_driver().await;
-                    if n > 0 {
+                    let trimmed = self.inner.mem_pool_trim().await.unwrap_or(0);
+                    if trimmed > 0 {
                         self.sink.logf(
                             LVL_INFO,
                             "device-handle",
-                            format_args!("分配遇 PoolExhausted ⇒ 排空复用池 {n} 块后重试"),
+                            format_args!("分配遇 PoolExhausted ⇒ GPU mem pool trim {trimmed} B 后重试"),
                         );
                         self.inner.alloc_uninit(dtype, elems, name).await?
                     } else {
@@ -1573,17 +1423,12 @@ impl<D: DeviceClient> DeviceClient for DeviceHandle<D> {
     #[allow(clippy::manual_async_fn)]
     fn free(&mut self, ids: &[u64]) -> impl Future<Output = Result<(), ModelError>> + Send {
         async move {
-            // **缺口 4**:可池化 ⇒ 入池(不回驱动);其余真归还。池内那条不发 FreeEvent。
-            // **前置校验**(幽灵/双 free/跨 rank)在这里**硬拒**;失败不改账
-            let (rest, pooled) = self.pool_release_all(ids)?;
-            if pooled > 0 {
-                self.note_pool_released(pooled);
-            }
-            if !rest.is_empty() {
-                self.inner.free(&rest).await?;
-            }
+            // 复用由 GPU server 的 cudaMallocAsync 默认池负责；store 只做
+            // 幽灵/双 free/跨 rank 校验，然后**全部**真归还驱动。
+            self.validate_free_ids(ids)?;
+            self.inner.free(ids).await?;
             let frees: Vec<FreeEvent> =
-                rest.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
+                ids.iter().map(|id| FreeEvent { id: *id, bytes: 0 }).collect();
             self.send_events(&[], &frees, &[]);
             for id in ids {
                 self.untrack(*id);

@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 
 use owl_shared::metrics::{collect_metrics, collect_since_epoch, level_name, MetricsFilter};
 
+use crate::vram_ledger;
+
 /// 单次查询行数上限(防动态 tag 增殖拖爆应答)
 const ROWS_LIMIT: usize = 512;
 
@@ -346,19 +348,10 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
             })
         })
         .collect();
-    let cells: Vec<Value> = r
-        .tiers
-        .rows
-        .iter()
-        .map(|c| {
-            json!({
-                "tier": format!("{:?}", c.tier),
-                "kind": format!("{:?}", c.kind),
-                "bytes": c.bytes,
-                "entries": c.entries,
-            })
-        })
-        .collect();
+    // 互斥账本(2026-11-15 P0):所有桶逐 rank 闭合;`tiers.cells` 只留
+    // 事件账独占项,腿自报的 KvBlock/Snap 走 `tiers.views`(不可相加)。
+    let ledger_json = vram_ledger::json_from(&vram_ledger::build(snap));
+    let tiers_json = vram_ledger::tiers_json(r);
     let pools: Vec<Value> = snap
         .pools
         .iter()
@@ -405,29 +398,42 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
     };
     // **驱动残差**(P5):物理 − free − store live − 池缓存。这一项就是
     // CUDA ctx / 模块 / cuBLAS / 图 exec / 分配器元数据 —— 块账拦不住的部分。
+    // rank0 兼容面:残差按 **rank0 自己的** 事件账/池缓存算。旧实现把
+    // 两 rank 的 `tiers.gpu_used` 从 rank0 的 total 里减 ⇒ 恒为 0,已修。
     let device_json = match &snap.device {
         Ok((free, total)) => {
-            let pool_cached: u64 = snap
+            let (pool_cached, pool_reserved) = snap
                 .pools
                 .iter()
-                .filter_map(|(_, row)| {
-                    row.as_ref()
-                        .ok()
-                        .map(|(u, _, res, _)| res.saturating_sub(*u))
+                .find(|(rank, _)| *rank == 0)
+                .and_then(|(_, row)| row.as_ref().ok())
+                .map(|(used, _, reserved, _)| {
+                    (reserved.saturating_sub(*used), *reserved)
                 })
+                .unwrap_or((0, 0));
+            let events_rank0: u64 = r
+                .events
+                .rows
+                .iter()
+                .filter(|e| e.rank == 0)
+                .map(|e| e.bytes as u64)
                 .sum();
             let residual = total
                 .saturating_sub(*free)
-                .saturating_sub(r.tiers.gpu_used as u64)
+                .saturating_sub(events_rank0)
                 .saturating_sub(pool_cached);
             json!({
                 "free": free,
                 "total": total,
+                "pool_reserved": pool_reserved,
                 "pool_cached": pool_cached,
+                "events_rank0": events_rank0,
                 "residual": residual,
                 "free_mib": (*free as f64) / 1048576.0,
                 "total_mib": (*total as f64) / 1048576.0,
+                "pool_cached_mib": (pool_cached as f64) / 1048576.0,
                 "residual_mib": (residual as f64) / 1048576.0,
+                "note": "兼容面(rank0);闭合看 ledger",
             })
         }
         Err(e) => json!({ "error": e }),
@@ -440,7 +446,7 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
         .map(|s| {
             json!({
                 "id": s.id,
-                "cached_len": s.cached_len,
+                "history_len": s.history_len,
                 "tail_snap": s.tail_snap.map(|k| format!("{k:?}")),
                 "msg_snaps": s.msg_snaps,
                 "msg_snap_keys": s.msg_snap_keys.iter()
@@ -453,17 +459,11 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
         .collect();
     json!({
         "device": device_json,
+        "ledger": ledger_json,
         "sessions": sessions,
         "pools": pools,
         "blocks_top": block_rows,
-        "tiers": {
-            "gpu_used": r.tiers.gpu_used,
-            "host_used": r.tiers.host_used,
-            "disk_used": r.tiers.disk_used,
-            "host_cap": r.tiers.host_cap,
-            "disk_cap": r.tiers.disk_cap,
-            "cells": cells,
-        },
+        "tiers": tiers_json,
         "owners": owners,
         "kv": {
             "slots_total": r.kv.slots_total,
@@ -525,6 +525,19 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
                 "used_bytes": d.used_bytes, "entries": d.entries,
                 "evicted_bytes": d.evicted_bytes,
             })),
+            // 盘层归属:会话 → 盘上 KV/快照占用(0 是合法会话 id,
+            // 无主用 NO_SESSION = u64::MAX,JSON 里显式 null)。
+            "by_session": r.disk_sessions.iter().map(|s| json!({
+                "session": if s.session == u64::MAX {
+                    serde_json::Value::Null
+                } else {
+                    json!(s.session)
+                },
+                "kv_blocks": s.kv_blocks,
+                "kv_bytes": s.kv_bytes,
+                "snap_entries": s.snap_entries,
+                "snap_bytes": s.snap_bytes,
+            })).collect::<Vec<_>>(),
         },
         // **MemoryPlan**(V0/V1):固定项逐项来源 + 主池 + 预留 + 卡面闭合。
         "plan": r.plan.as_ref().map(|p| {
@@ -627,21 +640,6 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
                 "mib": (e.bytes as f64) / (1024.0 * 1024.0),
                 "entries": e.entries,
             })).collect::<Vec<_>>(),
-            // **复用池**(缺口 4):池内可复用字节 = 一等指标(此前只在告警里一行)
-            "pool": {
-                "entries": r.events.pool.entries,
-                "bytes": r.events.pool.bytes,
-                "mib": (r.events.pool.bytes as f64) / (1024.0 * 1024.0),
-                "hits": r.events.pool.hits,
-                "misses": r.events.pool.misses,
-                "drained": r.events.pool.drained,
-                "evicted": r.events.pool.evicted,
-                "cap_bytes": r.events.pool.cap,
-                // P2-3:按类明细(与 events.rows 同口径)
-                "by_class": r.events.pool.by_class.iter().map(|(k, n, b)| json!({
-                    "kind": format!("{k:?}"), "entries": n, "bytes": b,
-                })).collect::<Vec<_>>(),
-            },
             // **lifecycle 在借清单**(N4/N5 未归还的逐块指纹:名字 + id)。
             // 判据:同一 `name` 的条目**逐轮增长** = 该处没在节点上归还。
             "open": r.events.open_lifecycle.iter().map(|l| json!({

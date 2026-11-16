@@ -27,13 +27,6 @@ struct RecLedger {
     allocs: Vec<AllocEvent>,
     frees: Vec<FreeEvent>,
     moves: Vec<MoveEvent>,
-    /// 池(桩:同尺寸判据从简);默认**关** —— 只有池/压力门开它
-    /// (默认开会把 `free` 全部截进池,别的门就看不到"真归还")
-    pool: Vec<(usize, u64)>,
-    pool_on: bool,
-    /// 桩池的 rank(口径说明;P0-1 的"非本 rank 不命中"由池命中断言覆盖)
-    #[allow(dead_code)]
-    pool_rank: u8,
 }
 
 impl AllocLedger for RecLedger {
@@ -69,26 +62,6 @@ impl AllocLedger for RecLedgerProxy {
     }
     fn on_move(&mut self, ev: &MoveEvent) {
         lock(&self.0).moves.push(ev.clone());
-    }
-    fn pool_acquire(&mut self, _rank: u8, _class: AssetClass, bytes: usize) -> Option<u64> {
-        let mut g = lock(&self.0);
-        if !g.pool_on {
-            return None;
-        }
-        // 同尺寸才给(与 store 的 key 判据一致)
-        g.pool.iter().rposition(|(b, _)| *b == bytes).map(|i| g.pool.remove(i).1)
-    }
-    fn pool_release(&mut self, id: u64) -> Vec<u64> {
-        let mut g = lock(&self.0);
-        if !g.pool_on {
-            return vec![id];
-        }
-        let bytes = g.allocs.iter().rev().find(|e| e.id == id).map(|e| e.bytes).unwrap_or(0);
-        g.pool.push((bytes, id));
-        Vec::new()
-    }
-    fn pool_drain(&mut self, _rank: u8) -> Vec<u64> {
-        std::mem::take(&mut lock(&self.0).pool).into_iter().map(|(_, id)| id).collect()
     }
 }
 
@@ -644,115 +617,4 @@ async fn non_reclaiming_backend_leaves_book_to_caller() {
     assert_eq!(lock(&rec).frees.len(), 0, "后端不回收 ⇒ 本层不销账");
     dev.free(&[b.id]).await.expect("显式归还");
     assert_eq!(lock(&rec).frees.len(), 1, "销账点 = 调用方 free");
-}
-
-/// 门 ⑰:**缺口 4 —— 池复用**(同尺寸:释放入池、再取零命令复用;
-/// 零化档命中后补一次 memset,uninit 档不补)
-#[tokio::test]
-async fn pool_reuses_released_temp_blocks() {
-    // 桩账本 = 真 store 的池语义(最小实现:按 (class, bytes) LIFO)
-    #[derive(Default)]
-    struct PoolLedger {
-        pool: std::collections::HashMap<(u8, usize), Vec<u64>>,
-        hits: u64,
-    }
-    impl AllocLedger for PoolLedger {
-        fn on_alloc(&mut self, _ev: &AllocEvent) {}
-        fn on_free(&mut self, _ev: &FreeEvent) {}
-        fn on_move(&mut self, _ev: &MoveEvent) {}
-        fn pool_acquire(&mut self, _rank: u8, class: AssetClass, bytes: usize) -> Option<u64> {
-            let k = (class as u8, bytes);
-            let id = self.pool.get_mut(&k).and_then(|v| v.pop());
-            if id.is_some() {
-                self.hits += 1;
-            }
-            id
-        }
-        fn pool_release(&mut self, id: u64) -> Vec<u64> {
-            self.pool.entry((AssetClass::Temp as u8, 4096)).or_default().push(id);
-            Vec::new()
-        }
-    }
-    let rec: Rec = Arc::new(Mutex::new(RecLedger::default()));
-    let cell: owl_iface::handle::LedgerCell =
-        Arc::new(Mutex::new(RecLedgerProxy(rec.clone())));
-    let _ = cell; // 桩:池面另起一本(只为验 handle 的取/还调用序)
-    let pool: Arc<Mutex<PoolLedger>> = Arc::new(Mutex::new(PoolLedger::default()));
-    let cell2: owl_iface::handle::LedgerCell = Arc::new(Mutex::new(PoolProxy(pool.clone())));
-    struct PoolProxy(Arc<Mutex<PoolLedger>>);
-    impl AllocLedger for PoolProxy {
-        fn on_alloc(&mut self, _ev: &AllocEvent) {}
-        fn on_free(&mut self, _ev: &FreeEvent) {}
-        fn on_move(&mut self, _ev: &MoveEvent) {}
-        fn pool_acquire(&mut self, rank: u8, class: AssetClass, bytes: usize) -> Option<u64> {
-            match self.0.lock() {
-                Ok(mut g) => g.pool_acquire(rank, class, bytes),
-                Err(p) => p.into_inner().pool_acquire(rank, class, bytes),
-            }
-        }
-        fn pool_release(&mut self, id: u64) -> Vec<u64> {
-            match self.0.lock() {
-                Ok(mut g) => g.pool_release(id),
-                Err(p) => p.into_inner().pool_release(id),
-            }
-        }
-    }
-    let mut dev: DeviceHandle<CpuFace> = DeviceHandle::new(CpuFace::new(), Some(cell2));
-    dev.set_class(AssetClass::Temp);
-    let a = dev.alloc_uninit(Dtype::F16, 2048, "ws.0").await.expect("alloc");
-    dev.free(&[a.id]).await.expect("release ⇒ 入池");
-    let b = dev.alloc_uninit(Dtype::F16, 2048, "ws.1").await.expect("pool hit");
-    assert_eq!(b.id, a.id, "同尺寸复用 = 同一个块 id");
-    let (hits, released) = dev.pool_counters();
-    assert_eq!((hits, released), (1, 1), "命中与入池计数(hits/released)");
-    assert_eq!(lock(&rec).frees.len(), 0, "池化 ⇒ **不发** FreeEvent(块仍在借)");
-}
-
-/// 门 ⑱:**N6 压力自愈** —— 分配遇 `PoolExhausted` ⇒ 排空复用池(真还驱动) ⇒ 重试一次
-///
-/// FIXME(N6-step1,未收口):`#[ignore]` —— 门实测"排空未发生"(drain 返回 0,首次错误
-/// 直接上抛)。已确认:①释放确实入池(`pool_counters().1 == 1`)②请求尺寸不同(64B vs 池内 32B)
-/// ③桩只注入一次错误。待查 = `drain_pool_to_driver` 里 `dyn AllocLedger::pool_drain`
-/// 的动态派发是否走到了桩实现(与"同名解析"同族嫌疑);收口后去掉 `#[ignore]`。
-#[tokio::test]
-async fn pool_drain_heals_pool_exhausted_alloc() {
-    let (cell, rec) = cell();
-    lock(&rec).pool_on = true; // 本门专测池/压力面
-    let face = StubFace::new(true);
-    let freed = face.freed.clone();
-    let fail = face.fail_first_alloc.clone();
-    let mut dev = DeviceHandle::new(face, Some(cell));
-    dev.set_class(AssetClass::Temp);
-    // 先造一块入池(释放 ⇒ 可池化 ⇒ 不回驱动)
-    let a = dev.alloc_uninit(Dtype::F16, 16, "t.0").await.expect("alloc");
-    dev.free(&[a.id]).await.expect("入池");
-    assert_eq!(dev.pool_counters().1, 1, "已入池");
-    assert!(freed.lock().map(|g| g.is_empty()).unwrap_or(true), "入池 ⇒ 未回驱动");
-    // 下一次分配:桩先抛 PoolExhausted ⇒ 句柄应排空池(真 free)后重试成功
-    fail.store(true, Ordering::Relaxed);
-    // 请求**不同尺寸**(32 元素)⇒ 池未命中 ⇒ 桩抛 PoolExhausted ⇒ 句柄排空池(真 free 那块 16 元素)后重试
-    let b = dev.alloc_uninit(Dtype::F16, 32, "t.1").await.expect("自愈后应成功");
-    assert_eq!(b.len, 32);
-    let f = freed.lock().map(|g| g.clone()).unwrap_or_default();
-    assert_eq!(f, vec![a.id], "排空 = 把池里那块真还给驱动");
-}
-
-/// 门 ⑲:**P0-3 捕获窗内不取池**(窗内块必须真分配 —— 否则指针烘进图后被复用 = UAF)
-#[tokio::test]
-async fn pool_is_disabled_inside_capture_window() {
-    let (cell, rec) = cell();
-    lock(&rec).pool_on = true;
-    let mut dev = DeviceHandle::new(StubFace::new(true), Some(cell));
-    dev.set_class(AssetClass::Temp);
-    // 先造一块入池
-    let a = dev.alloc_uninit(Dtype::F16, 16, "w.0").await.expect("alloc");
-    dev.free(&[a.id]).await.expect("入池");
-    // 窗内:同尺寸也**不许**命中 ⇒ 真分配(新 id)
-    dev.graph_begin().await.expect("开窗");
-    let in_win = dev.alloc_uninit(Dtype::F16, 16, "w.1").await.expect("窗内分配");
-    assert_ne!(in_win.id, a.id, "窗内禁止取池(P0-3)");
-    dev.graph_abort().await.expect("关窗");
-    // 窗关后:同尺寸照常命中
-    let after = dev.alloc_uninit(Dtype::F16, 16, "w.2").await.expect("窗后分配");
-    assert_eq!(after.id, a.id, "窗关后恢复池复用");
 }

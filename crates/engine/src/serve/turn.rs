@@ -415,7 +415,7 @@ pub(crate) struct ActiveTurn {
     /// 首 token 的墙钟毫秒(`now_ms()`;`None` = 还没产出 token)。
     pub(crate) first_token_ms: Option<u64>,
     pub(crate) out: Vec<u32>,
-    /// KV/prompt 推进指针(会话 turn 从 `cached_len` 起步 = 增量 prefill)
+    /// KV/prompt 推进指针(turn 起点由内容树命中面/历史决定 = 增量 prefill)
     pub(crate) fed: usize,
     pub(crate) decoded: String,
     /// **VLM 图像输入 + 备料**(空/None = 纯文本)

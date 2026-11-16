@@ -1567,7 +1567,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let kv_leaves = pool.dflash_kv_leaves().ok_or_else(|| ModelError::EngineInvariant { what: "dflash KV 池句柄缺席(档位/池几何不一致)".into() })?;
+        let kv_leaves = pool.dflash_kv_leaves(0).ok_or_else(|| ModelError::EngineInvariant { what: "dflash KV 池句柄缺席(档位/池几何不一致)".into() })?;
         let bt_leaf = pool.bt_leaf_flat();
         let model_df = Arc::clone(&boot.model);
         let rp_df = boot.spec.draft_rope.as_ref().ok_or_else(|| ModelError::EngineInvariant { what: "draft rope 缺席(草稿档位不一致)".into() })?.clone();

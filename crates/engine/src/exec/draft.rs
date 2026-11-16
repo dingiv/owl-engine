@@ -452,10 +452,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // assign_extend_cache_locs [prefix_len, prefix_len+block_size) 同位;
         // 曾误填 0..8 —— 每轮把位置 0..7 的 memory 前缀 KV 磨成噪声块
         // 残写,永久污染窗口头部 → AL=0 案真凶,2026-10-08 定谳)
+        // 每会话一份草稿 ring（并发档；ring = 本 turn 的 GDN 行号）。
+        let ring = self.turns.active()?.gdn_slot;
         let leaves =
             self.dev
                 .pool
-                .dflash_kv_leaves()
+                .dflash_kv_leaves(ring)
                 .ok_or_else(|| ModelError::EngineInvariant {
                     what: "dflash KV 池句柄缺席(档位/池几何不一致)".into(),
                 })?;
@@ -601,7 +603,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let peer_tree = |p: &mut crate::engine::RankDev<D>| -> Result<owl_models::TensorOps> {
             let leaves_p =
                 p.pool
-                    .dflash_kv_leaves()
+                    .dflash_kv_leaves(ring)
                     .ok_or_else(|| ModelError::EngineInvariant {
                         what: "peer 草稿 KV 池句柄缺席".into(),
                     })?;
@@ -920,10 +922,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         );
         // 编码槽表 = 线性逻辑位(pos..pos+rows;草稿池线性寻址,同 ②)
         let _page = self.dev.pool.geom.page;
+        let ring = self.turns.active()?.gdn_slot;
         let leaves =
             self.dev
                 .pool
-                .dflash_kv_leaves()
+                .dflash_kv_leaves(ring)
                 .ok_or_else(|| ModelError::EngineInvariant {
                     what: "dflash KV 池句柄缺席(档位/池几何不一致)".into(),
                 })?;
@@ -1959,6 +1962,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         d_model: usize,
         dtype: owl_models::Dtype,
         base: usize,
+        ring: usize,
     ) -> bool {
         if n_tp == 0 || t == 0 {
             return false;
@@ -1974,6 +1978,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
             d_model,
             dtype,
             base,
+            ring,
         });
         true
     }
@@ -2017,6 +2022,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
                     crate::running::StepProbes::default(),
                     &tap_views,
                     p.base,
+                    p.ring,
                 )
                 .await;
             // 根块在 encode 之后才可回收；encode 失败也必须尝试回收，
@@ -2041,6 +2047,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         probes: crate::running::StepProbes,
         tap_views: &[TensorOps],
         base: usize,
+        ring: usize,
     ) -> Result<()> {
         let d2 = self
             .spec_rt
@@ -2067,7 +2074,7 @@ impl<D: DeviceClient> crate::engine::RankDev<D> {
         // 前缀读同样按 ring 映射(窗口 2048 + 自块)。bt 物理槽仅首 session
         // 重合 —— slot≥1 案修,2026-10-10。
         let _page = self.pool.geom.page;
-        let leaves = self.pool.dflash_kv_leaves().expect("dflash 池");
+        let leaves = self.pool.dflash_kv_leaves(ring).expect("dflash 池");
         let bt = self.pool.bt_leaf_flat();
         // **逐层表必须共享 Htod**（2026-11-13）：DFlash2 的 5 层 encode 用
         // 同一份 `slots`/`kv_lens`（只依赖 base/t，不依赖层），旧实现把

@@ -441,10 +441,23 @@ impl<K: DiskKey> DiskTier<K> {
 
     /// **驱逐计划**(纯 host;最老在前,`protect` 绝不入列)。
     pub fn plan_evict(&self, need_bytes: usize, protect: &[K]) -> DiskEvictPlanOf<K> {
+        self.plan_evict_where(need_bytes, protect, |_| true)
+    }
+
+    /// **带谓词的驱逐计划**（session 感知策略用；`allow` = 可入列）。
+    pub fn plan_evict_where<F>(
+        &self,
+        need_bytes: usize,
+        protect: &[K],
+        allow: F,
+    ) -> DiskEvictPlanOf<K>
+    where
+        F: Fn(&K) -> bool,
+    {
         let mut cands: Vec<(K, u64)> = self
             .resident
             .iter()
-            .filter(|(k, _)| !protect.contains(k))
+            .filter(|(k, _)| !protect.contains(k) && allow(k))
             .map(|(k, e)| (*k, e.last_use))
             .collect();
         cands.sort_by_key(|(_, t)| *t);

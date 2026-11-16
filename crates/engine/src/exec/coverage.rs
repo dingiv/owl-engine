@@ -675,12 +675,12 @@ impl<D: DeviceClient> RunningEngine<D> {
         let margin = crate::sched_policy::reclaim_margin(
             self.boot.cfg.prefill_chunk.div_ceil(page),
         );
-        if !sink.is_empty() && self.bank.rel.leg.slots_free() >= margin + need.len() {
+        if !sink.is_empty() && self.bank.rel.slots_free() >= margin + need.len() {
             self.sel.note_lazy_keep(sink.len());
             owl_shared::log_debug!(
                 "cov-probe",
                 "懒沉:池余 {} 槽 ≥ 余量 {margin} ⇒ 本轮 {} 块保持常驻",
-                self.bank.rel.leg.slots_free(),
+                self.bank.rel.slots_free(),
                 sink.len()
             );
             sink.clear();
@@ -693,7 +693,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut sinkable: Vec<(usize, owl_store::ChainHash, u32)> = Vec::new();
         let mut not_in_tree = 0usize;
         for (i, h, slot) in sink.drain(..) {
-            if self.bank.rel.leg.slot_refs(slot) == 2 {
+            if self.bank.rel.slot_refs(slot) == 2 {
                 sinkable.push((i, h, slot));
             } else {
                 not_in_tree += 1;
@@ -718,7 +718,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         // ② 放开会话引用(只对双持块:decref 后 refs == 1 = 缓存独占)
         for (_, _, slot) in &sink {
-            if let Err(e) = self.bank.rel.leg.decref(*slot) {
+            if let Err(e) = self.bank.rel.decref(*slot) {
                 owl_shared::log_warn!("cov-probe", "下沉前 decref 槽 {slot} 失败:{e}(跳过该块)");
             }
         }
@@ -752,7 +752,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                     let waiter = match self.swap_out_begin(&pieces, tbl) {
                         Ok(w) => w,
                         Err(e) => {
-                            owl_store::abort_offload(&mut self.bank.rel.leg, &blocks);
+                            self.bank.rel.abort_offload(&blocks);
                             return Err(owl_iface::contract::ModelError::Msg(format!(
                                 "分离式下沉提交失败: {e}"
                             )));
@@ -794,13 +794,13 @@ impl<D: DeviceClient> RunningEngine<D> {
                     {
                         Ok(t) => t,
                         Err(e) => {
-                            owl_store::abort_offload(&mut self.bank.rel.leg, &blocks);
+                            self.bank.rel.abort_offload(&blocks);
                             return Err(e);
                         }
                     };
                     rec_phase("select.rec.out_swap", t_swap);
                     let t_commit = std::time::Instant::now();
-                    let n = owl_store::commit_offload(&mut self.bank.rel.leg, &blocks, t)?;
+                    let n = self.bank.rel.commit_offload(&blocks, t)?;
                     rec_phase("select.rec.out_commit", t_commit);
                     let sunk_set: std::collections::HashSet<ChainHash> =
                         blocks.iter().map(|(h, _)| *h).collect();
@@ -830,12 +830,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             let hashes: Vec<ChainHash> = need.iter().map(|(_, h)| *h).collect();
             // **S6**:盘上的块先读回宿主(与 phases.rs 同一口)
             let t_host = std::time::Instant::now();
-            let _ = self.ensure_host_resident(&hashes).await?;
+            let _ = self.disk.ensure_host_resident(&mut self.bank.rel, &hashes).await?;
             rec_phase("select.rec.in_host", t_host);
             let t_plan = std::time::Instant::now();
             let (cs, slots, pieces, tbl) = {
                 // diag-only(store-hook): 同上；仅诊断/选择层探针。
-                let p = owl_store::plan_onload(&mut self.bank.rel.leg, &hashes)?;
+                let p = self.bank.rel.plan_onload(&hashes)?;
                 (p.chains, p.slots, p.pieces, p.table)
             };
             rec_phase("select.rec.in_plan", t_plan);
@@ -847,13 +847,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             {
                 Ok(t) => t,
                 Err(e) => {
-                    owl_store::abort_onload(&mut self.bank.rel.leg, &cs, &slots);
+                    self.bank.rel.abort_onload(&cs, &slots);
                     return Err(e);
                 }
             };
             rec_phase("select.rec.in_swap", t_swap);
             let t_commit = std::time::Instant::now();
-            let got = owl_store::commit_onload(&mut self.bank.rel.leg, &cs, &slots, tbl)?;
+            let got = self.bank.rel.commit_onload(&cs, &slots, tbl)?;
             rec_phase("select.rec.in_commit", t_commit);
             staged = got.len();
             // 槽写回表(同序:need 与 cs 同序)
@@ -889,10 +889,11 @@ impl<D: DeviceClient> RunningEngine<D> {
         let Some(v) = self.sel.view() else { return Ok(None) };
         let (view_pages, view_recall, view_tokens) = (v.pages.clone(), v.recall_pos, v.tokens);
         let page = self.dev.pool.geom.page.max(1);
+        // 本步执行 turn（多活跃时 `active()` = executing，不能取 first）。
         let chain: Vec<u32> = self
             .turns
-            .active
-            .first()
+            .active()
+            .ok()
             .and_then(|a| self.bank.sessions.get(a.session_id))
             .map(|s| s.block_table.clone())
             .unwrap_or_default();
@@ -1367,7 +1368,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 );
             } else {
                 for (b, &pg) in v.blocks.iter().zip(v.pages.iter()) {
-                    match self.bank.rel.leg.carrier_of(*b) {
+                    match self.bank.rel.carrier_of(*b) {
                         Ok(owl_store::Carrier::Device(slot)) if slot == pg => {}
                         Ok(owl_store::Carrier::Device(slot)) => owl_shared::log_error!(
                             "view-diag",
@@ -1668,7 +1669,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             );
             cands.push(parent);
         }
-        let Some(index) = self.bank.rel.index.as_ref() else {
+        let Some(index) = self.bank.rel.index() else {
             return Err(ModelError::Msg(
                 "覆盖率探针:索引账不在场(index_probe 未开?两枚旋钮需同开)".into(),
             ));

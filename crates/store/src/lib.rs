@@ -87,8 +87,8 @@ pub use policy::{
     QueuePolicy,
 };
 pub use rel::{
-    AdoptChainsReport, DiskAttach, EventBook, KvConfig, OpenLoan, PoolReport, Protected, RecallHit,
-    RecallMode, Rel, SnapEvictPreview, StoreReport,
+    AdoptChainsReport, DiskAttach, DiskSessionUsage, EventBook, KvConfig, OpenLoan, Protected,
+    RecallHit, RecallMode, Rel, SnapEvictPreview, StoreReport,
 };
 pub use reservations::{Grant, GrantReport, ReservationId, ReservationKind, ReservationLedger};
 pub use select::{
@@ -103,4 +103,5 @@ pub use state::{
 pub use tier::{
     book_lock, ledger_entry, shared_ledger, tier_budget_of, AssetKind, EventRow, LedgerBook,
     LedgerEntry, Loan, Owner, OwnerRow, SharedLedger, Tier, TierBudget, TierLedger, TierReport,
+    TierRow,
 };

@@ -17,13 +17,13 @@
 //! 卸载/回灌都从这里进 —— 跨腿台账([`TierLedger`])只在门面上维护,腿内自洽。
 
 use crate::budget::{Admission, AdmissionVerdict, BudgetInputs, TurnFloor, VramBudget};
-use crate::disk::{AdoptReport, DiskTier};
+use crate::disk::{AdoptReport, DiskEvictPlanOf, DiskTier, FillPlanOf, SpillPlanOf};
 use crate::error::{StoreError, StoreResult};
-use crate::host::HostTier;
+use crate::host::{HostBlock, HostTier};
 use crate::host::SlotTable;
 use crate::id::{ChainHash, PrefixId, SnapKey};
 use crate::kv::{CacheUpdate, KvDiag, KvStats};
-use crate::leg::{BlockLeg, ChainHit, LegConfig, LegStats};
+use crate::leg::{BlockLeg, Carrier, ChainHit, InPlan, LegConfig, LegStats, PoolLayout, ReadPlan};
 use crate::plan::MemoryPlan;
 use crate::policy::{AdmissionPolicy, EvictCandidate, EvictPolicy, LruPolicy};
 use crate::reservations::{Grant, ReservationId, ReservationKind, ReservationLedger};
@@ -141,10 +141,27 @@ pub struct StoreReport {
     pub disk_kv: Option<crate::disk::DiskStats>,
     /// 磁盘层(状态腿;`None` = 关层)。
     pub disk_snap: Option<crate::disk::DiskStats>,
+    /// **磁盘层按会话归属**(KV 链 + 快照；`NO_SESSION` = 无主/孤儿)。
+    pub disk_sessions: Vec<DiskSessionUsage>,
     /// **事件账**(DeviceHandle 钩子的出借登记;与腿自报互为校验 —— 两独立来源)。
     pub events: EventBook,
     /// **boot 显存计划**(V0;`None` = 旧装配/测试未注入)。
     pub plan: Option<MemoryPlan>,
+}
+
+/// **磁盘层的会话归属**(调度/淘汰的会话感知面；`NO_SESSION` = 无主/孤儿)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiskSessionUsage {
+    /// 会话 id（`NO_SESSION` = 无主/孤儿；会话 0 是合法 id）。
+    pub session: u64,
+    /// 该会话在盘上的 KV 块数。
+    pub kv_blocks: usize,
+    /// 该会话在盘上的 KV 字节。
+    pub kv_bytes: usize,
+    /// 该会话在盘上的快照条数。
+    pub snap_entries: usize,
+    /// 该会话在盘上的快照字节。
+    pub snap_bytes: usize,
 }
 
 /// **事件账报告**(`LedgerBook` 的出借登记面投影)。
@@ -163,32 +180,9 @@ pub struct EventBook {
     pub partial_moves: u64,
     /// **逐 rank 在借 id 集**(与块账房做全等门的原料)。
     pub ids: Vec<(u8, Vec<u64>)>,
-    /// **复用池**(缺口 4;一等指标:池内可复用字节)
-    pub pool: PoolReport,
     /// **lifecycle 在借清单**(turn/session 归属的逐条:id/点名/字节/类 ——
     /// N4/N5"本该归还却还没归还"的**逐块指纹**;系统常驻/缓存面不在列)。
     pub open_lifecycle: Vec<OpenLoan>,
-}
-
-/// **复用池报告**(缺口 4:池内可复用面 —— 不再是告警里的一行,而是一等指标)。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PoolReport {
-    /// 池内块数。
-    pub entries: usize,
-    /// 池内可复用字节。
-    pub bytes: usize,
-    /// 取块命中次数(零命令复用)。
-    pub hits: u64,
-    /// 取块未命中次数(走了真分配)。
-    pub misses: u64,
-    /// 池排空次数(N6)。
-    pub drained: u64,
-    /// 超上限**顶出**块数(已真还驱动)。
-    pub evicted: u64,
-    /// 池上限字节(0 = 不限)。
-    pub cap: usize,
-    /// **按类明细**(P2-3):`(kind, entries, bytes)`,字节降序。
-    pub by_class: Vec<(AssetKind, usize, usize)>,
 }
 
 /// 在借清单的一行(报告面投影;`Loan` + id)。
@@ -259,22 +253,24 @@ pub struct DiskAttach {
 /// KV 块面的真源 = 腿的报告(`LegStats`)。
 pub struct Rel {
     /// attention 块腿(账 + 宿主物理 + 搬运口 —— 唯一状态持有者)。
-    pub leg: BlockLeg,
+    ///
+    /// 字段私有：engine 只能经 [`Rel::leg`] / [`Rel::leg_mut`] 取用。
+    leg: BlockLeg,
     /// GDN 状态账(行 + 快照;快照的**层**是真源 —— §25.2)。
-    pub state: StateStore,
+    state: StateStore,
     /// 状态腿的宿主层(键 = [`SnapKey`];与 KV 腿各自一本账)。
-    pub snap_host: HostTier<SnapKey>,
+    snap_host: HostTier<SnapKey>,
     /// **KV 腿磁盘层**(S6;`None` = 未接线/关层)。
     ///
     /// 语义:磁盘是宿主的下游 —— 条目在 tree 里仍是"非设备槽"(`slot = None`,
     /// `locate` 归 `Tier::Host` 的**可回灌**面),物理承载在磁盘上
     /// (`DiskTier` 自己的账/报告才是盘层的真源)。
-    pub disk: Option<DiskTier<ChainHash>>,
+    disk: Option<DiskTier<ChainHash>>,
     /// **状态腿磁盘层**(S6);与 `state.set_tier(Disk)` 配套(快照层账可精确到盘)。
-    pub snap_disk: Option<DiskTier<SnapKey>>,
+    snap_disk: Option<DiskTier<SnapKey>>,
     /// **选择层检索索引**(B 轴:Mean-K 块级索引;host 驻留 —— 论文同款)。
     /// 几何由 engine 在 boot 注册([`Rel::attach_index`])。
-    pub index: Option<crate::select::MeanKIndex>,
+    index: Option<crate::select::MeanKIndex>,
     /// 语义账(状态腿快照/行 + 保留面/弹性面 + **DeviceHandle 事件账**)。
     ///
     /// `Arc<Mutex<..>>`(2026-10-19 用户裁决):DeviceHandle 侧的钩子要**与 store 看同一本账**
@@ -282,13 +278,13 @@ pub struct Rel {
     /// 是硬约束,且 `/debug/blocks` 的 `face_clone()` 会把句柄真的送进 HTTP 线程
     /// ⇒ `Rc` 在那条路径上是真的 UB。单线程热路径无争用锁 ≈ ns 级。
     /// store 自己的读写统一走 [`crate::tier::book_lock`]。
-    pub ledger: crate::tier::SharedLedger,
+    ledger: crate::tier::SharedLedger,
     /// 准入策略(boot 装配)。
-    pub policy: AdmissionPolicy,
+    policy: AdmissionPolicy,
     /// 活跃 turn 在飞账。
-    pub admission: Admission,
+    admission: Admission,
     /// **Grant / Reservation 账**(P0-4;store 是“谁被批准占多少槽”的唯一真源)。
-    pub reservations: ReservationLedger,
+    reservations: ReservationLedger,
     budget: VramBudget,
     evict: Box<dyn EvictPolicy>,
     /// 整枝塌缩开关(见 [`Self::set_bulk_drop_when_tier_full`])。
@@ -433,6 +429,615 @@ impl Rel {
     /// 宿主腿平面数(= TP world;1 = 单卡)。
     pub fn world(&self) -> usize {
         self.world
+    }
+
+    // ---------------------------------------------------------------------
+    // KV 腿语义面（store 内部字段私有；engine 只调这些方法）
+    // ---------------------------------------------------------------------
+
+    /// 注册 target 腿的设备布局（boot 一次）。
+    pub fn attach_pool(&mut self, layout: PoolLayout) -> StoreResult<u64> {
+        self.leg.attach_pool(layout)
+    }
+
+    /// 单槽字节（目标腿几何）。
+    pub fn slot_bytes(&self) -> usize {
+        self.leg.slot_bytes()
+    }
+
+    /// 设备侧实占字节。
+    pub fn occupied_bytes(&self) -> usize {
+        self.leg.occupied_bytes()
+    }
+
+    /// 可移动（缓存）字节。
+    pub fn movable_bytes(&self) -> usize {
+        self.leg.movable_bytes()
+    }
+
+    /// 设备 KV 空闲槽数。
+    pub fn slots_free(&self) -> usize {
+        self.leg.slots_free()
+    }
+
+    /// 设备 KV 总槽数。
+    pub fn slots_total(&self) -> usize {
+        self.leg.slots_total()
+    }
+
+    /// 槽引用数（0 = 槽空；>0 = 被链/表持有）。
+    pub fn slot_refs(&self, slot: u32) -> u32 {
+        self.leg.slot_refs(slot)
+    }
+
+    /// 内容树条目数。
+    pub fn tree_len(&self) -> usize {
+        self.leg.tree_len()
+    }
+
+    /// 内容树容量上限。
+    pub fn tree_cap(&self) -> usize {
+        self.leg.tree_cap()
+    }
+
+    /// KV 腿统计（host 块/命中/搬运）。
+    pub fn kv_stats(&self) -> KvStats {
+        self.leg.kv_stats()
+    }
+
+    /// 宿主层是否有该链内容。
+    pub fn host_contains(&self, chain: ChainHash) -> bool {
+        self.leg.host_contains(chain)
+    }
+
+    /// 只读宿主副本（checkpoint 的复制语义；不搬内容）。
+    pub fn host_block(&self, chain: ChainHash) -> Option<&HostBlock> {
+        self.leg.host_block(chain)
+    }
+
+    /// 宿主让位计数（执行面兜底真删的块数）。
+    pub fn host_relief_blocks(&self) -> u64 {
+        self.leg.host_relief_blocks()
+    }
+
+    /// 宿主层是否启用。
+    pub fn host_enabled(&self) -> bool {
+        self.leg.host_enabled()
+    }
+
+    /// 宿主层空闲块数。
+    pub fn host_free_slots(&self) -> usize {
+        self.leg.host_free_slots()
+    }
+
+    /// 宿主层总块数。
+    pub fn host_total_slots(&self) -> usize {
+        self.leg.host_total_slots()
+    }
+
+    /// 宿主层预算字节（0 = 关层）。
+    pub fn host_budget_bytes(&self) -> usize {
+        self.leg.host_budget_bytes()
+    }
+
+    /// 整链块身份（根 → tail）。
+    pub fn chain_blocks(&self, tail: ChainHash) -> Vec<ChainHash> {
+        self.leg.chain_blocks(tail)
+    }
+
+    /// 链当前载体（设备槽/宿主/磁盘）。
+    ///
+    /// **盘层也是 store 的事实**：树的 `slot = None` 只说明“不在设备”，
+    /// 还要问 `DiskTier` 才能区分 Host / Disk（checkpoint 的复制语义下
+    /// 可能两份都在，此时优先 Host —— 运行期可直读，盘只是备份）。
+    pub fn carrier_of(&self, chain: ChainHash) -> StoreResult<Carrier> {
+        let c = self.leg.carrier_of(chain)?;
+        if matches!(c, Carrier::Host)
+            && !self.leg.host_contains(chain)
+            && self.kv_disk_contains(chain)
+        {
+            return Ok(Carrier::Disk);
+        }
+        Ok(c)
+    }
+
+    /// 链所属会话（0 = 无主）。
+    pub fn session_of(&self, chain: ChainHash) -> u64 {
+        self.leg.session_of(chain)
+    }
+
+    /// 链深度（块数）。
+    pub fn depth_of(&self, chain: ChainHash) -> usize {
+        self.leg.depth_of(chain)
+    }
+
+    /// 链尾内容身份（纯文本链）。
+    pub fn tail_hash(&self, tokens: &[u32], full_blocks: usize) -> Option<ChainHash> {
+        self.leg.tail_hash(tokens, full_blocks)
+    }
+
+    /// 链尾内容身份（带逐块多模态指纹）。
+    pub fn tail_hash_tagged(
+        &self,
+        tokens: &[u32],
+        full_blocks: usize,
+        tags: &[crate::kv::BlockTag],
+    ) -> Option<ChainHash> {
+        self.leg.tail_hash_tagged(tokens, full_blocks, tags)
+    }
+
+    /// 槽引用 +1（前缀复用/回灌绑定）。
+    pub fn incref(&mut self, slot: u32) -> StoreResult<()> {
+        self.leg.incref(slot)
+    }
+
+    /// 槽引用 -1（表归还/逐出）。
+    pub fn decref(&mut self, slot: u32) -> StoreResult<()> {
+        self.leg.decref(slot)
+    }
+
+    /// 设置链的会话归属（0 = 无主）。
+    pub fn set_chain_owner(&mut self, session: u64, chains: &[ChainHash]) {
+        self.leg.set_owner(session, chains);
+    }
+
+    /// 登记一条由指定会话持有的链（带逐块多模态指纹）。
+    pub fn register_chain_owned_tagged(
+        &mut self,
+        tokens: &[u32],
+        table: &[u32],
+        session: u64,
+        tags: &[crate::kv::BlockTag],
+    ) -> StoreResult<CacheUpdate> {
+        self.leg.register_chain_owned_tagged(tokens, table, session, tags)
+    }
+
+    /// 从宿主层取走内容（溢写/下沉）。
+    pub fn host_take(&mut self, chain: ChainHash) -> StoreResult<HostBlock> {
+        self.leg.host_take(chain)
+    }
+
+    /// 把内容放回宿主层（溢写失败回滚/回填）。
+    pub fn host_put(&mut self, chain: ChainHash, buf: HostBlock) -> StoreResult<()> {
+        self.leg.host_put(chain, buf)
+    }
+
+    /// **TP peer 平面布局**（boot 一次；两 rank 各一套 PieceSpec）。
+    pub fn attach_pool_peer(&mut self, layout: PoolLayout) -> StoreResult<u64> {
+        self.leg.attach_pool_peer(layout)
+    }
+
+    /// 增量登记一条链（父链之后追加块；带逐块多模态指纹）。
+    pub fn register_chain_inc_tagged(
+        &mut self,
+        parent0: ChainHash,
+        blocks: &[(&[u32], u32)],
+        tags: &[crate::kv::BlockTag],
+    ) -> StoreResult<CacheUpdate> {
+        self.leg.register_chain_inc_tagged(parent0, blocks, tags)
+    }
+
+    /// 借一条 GDN 行（turn 生命周期）。
+    pub fn borrow_row(&mut self, owner: crate::tier::Owner) -> StoreResult<usize> {
+        self.state.borrow_row(owner)
+    }
+
+    /// 制定回灌计划（宿主 → 设备；纯 host，零 I/O）。
+    pub fn plan_onload(&mut self, chains: &[ChainHash]) -> StoreResult<InPlan> {
+        crate::leg::plan_onload(&mut self.leg, chains)
+    }
+
+    /// 回灌记账（搬运成功后）。
+    pub fn commit_onload(
+        &mut self,
+        chains: &[ChainHash],
+        slots: &[u32],
+        table: SlotTable,
+    ) -> StoreResult<Vec<u32>> {
+        crate::leg::commit_onload(&mut self.leg, chains, slots, table)
+    }
+
+    /// 回灌回滚（搬运失败后）。
+    pub fn abort_onload(&mut self, chains: &[ChainHash], slots: &[u32]) {
+        crate::leg::abort_onload(&mut self.leg, chains, slots);
+    }
+
+    /// 制定只读拷贝计划（设备 → 宿主；纯 host，零 I/O）。
+    pub fn plan_read_blocks(&mut self, chains: &[ChainHash]) -> StoreResult<ReadPlan> {
+        crate::leg::plan_read_blocks(&mut self.leg, chains)
+    }
+
+    /// 归还只读计划的宿主缓冲（swap 回执的槽台）。
+    pub fn recycle_read_plan(&mut self, table: SlotTable) {
+        crate::leg::recycle_read_plan(&mut self.leg, table);
+    }
+
+    /// 换出记账（搬运成功后）。
+    pub fn commit_offload(
+        &mut self,
+        blocks: &[(ChainHash, u32)],
+        table: SlotTable,
+    ) -> StoreResult<usize> {
+        crate::leg::commit_offload(&mut self.leg, blocks, table)
+    }
+
+    /// 换出回滚（搬运失败后）。
+    pub fn abort_offload(&mut self, blocks: &[(ChainHash, u32)]) {
+        crate::leg::abort_offload(&mut self.leg, blocks);
+    }
+
+    // ---------------------------------------------------------------------
+    // 状态腿语义面（快照/行；engine 不直接拿 StateStore）
+    // ---------------------------------------------------------------------
+
+    /// 快照当前所在层（None = 不在账）。
+    pub fn state_locate(&self, key: SnapKey) -> Option<Tier> {
+        self.state.locate(key)
+    }
+
+    /// 状态腿统计（行/快照/命中）。
+    pub fn state_stats(&self) -> StateStats {
+        self.state.stats()
+    }
+
+    /// 快照的会话归属与边界深度。
+    pub fn snap_session_info(&self, key: SnapKey) -> Option<(u64, usize)> {
+        self.state.snap_session(key)
+    }
+
+    /// 状态腿淘汰候选（按策略序；保护集不入序）。
+    pub fn snap_evict_candidates(&self, protect: &[SnapKey]) -> Vec<EvictCandidate> {
+        self.state.evict_candidates(protect)
+    }
+
+    /// 快照持久性档（Transient 不可下沉）。
+    pub fn snap_durability(&self, key: SnapKey) -> Option<SnapDurability> {
+        self.state.snap_durability(key)
+    }
+
+    /// 指定层快照条数与字节。
+    pub fn snaps_in_tier(&self, tier: Tier) -> (usize, usize) {
+        self.state.snaps_in_tier(tier)
+    }
+
+    /// 生成段（Transient）快照条数。
+    pub fn snaps_transient(&self) -> usize {
+        self.state.snaps_transient()
+    }
+
+    /// GDN 行当前 owner。
+    pub fn row_owner(&self, row: usize) -> Option<crate::tier::Owner> {
+        self.state.row_owner(row)
+    }
+
+    /// GDN 单行字节。
+    pub fn row_bytes(&self) -> usize {
+        self.state.row_bytes()
+    }
+
+    /// 登记一条快照的层账（测试/旧装配口；生产走 `register_snap_captured`）。
+    pub fn register_snap_account(
+        &mut self,
+        key: SnapKey,
+        bytes: usize,
+        tier: Tier,
+        durability: SnapDurability,
+    ) {
+        self.state.register_snap(key, bytes, tier, durability);
+    }
+
+    /// 登记一条带会话归属/边界深度的快照（L1 资产）。
+    pub fn register_snap_owned(
+        &mut self,
+        key: SnapKey,
+        bytes: usize,
+        tier: Tier,
+        durability: SnapDurability,
+        session: u64,
+        depth: usize,
+    ) {
+        self.state
+            .register_snap_owned(key, bytes, tier, durability, session, depth);
+    }
+
+    /// 使用即触达（store 淘汰序真源）。
+    pub fn touch_snap(&mut self, key: SnapKey) {
+        self.state.touch(key);
+    }
+
+    /// 改快照层账（下沉/回填成功后调用）。
+    pub fn set_snap_tier(&mut self, key: SnapKey, tier: Tier) -> StoreResult<()> {
+        self.state.set_tier(key, tier)
+    }
+
+    /// 快照出账（不搬内容）。
+    pub fn drop_snap_account(&mut self, key: SnapKey) -> StoreResult<usize> {
+        self.state.drop_snap(key)
+    }
+
+    /// 归还 GDN 行（可同时挂一条快照）。
+    pub fn return_state_row(
+        &mut self,
+        row: usize,
+        snap: Option<SnapKey>,
+    ) -> StoreResult<()> {
+        self.state.return_row(row, snap)
+    }
+
+    /// 状态腿宿主层是否有该快照内容。
+    pub fn snap_host_contains(&self, key: SnapKey) -> bool {
+        self.snap_host.get(key).is_some()
+    }
+
+    /// 从宿主层取走一条快照（下沉/回填）。
+    pub fn snap_host_take(&mut self, key: SnapKey) -> StoreResult<HostBlock> {
+        self.snap_host.take(key)
+    }
+
+    /// 把快照内容放回宿主层（下沉失败回滚/回填）。
+    pub fn snap_host_put(&mut self, key: SnapKey, buf: HostBlock) -> StoreResult<()> {
+        self.snap_host.put(key, buf)
+    }
+
+    /// KV 盘层是否有该链内容。
+    pub fn kv_disk_contains(&self, key: ChainHash) -> bool {
+        self.disk.as_ref().is_some_and(|d| d.contains(key))
+    }
+
+    /// KV 盘层单块字节（未接线 = `None`）。
+    pub fn kv_disk_block_bytes(&self) -> Option<usize> {
+        self.disk.as_ref().map(|d| d.block_bytes())
+    }
+
+    /// KV 盘层空闲槽数（未接线 = 0）。
+    pub fn kv_disk_free_slots(&self) -> usize {
+        self.disk.as_ref().map_or(0, |d| d.free_slots())
+    }
+
+    /// KV 盘层配额字节（0 = 未接线）。
+    pub fn kv_disk_budget_bytes(&self) -> usize {
+        self.disk.as_ref().map_or(0, |d| d.budget_bytes())
+    }
+
+    /// KV 盘层根目录。
+    pub fn kv_disk_root(&self) -> Option<&std::path::Path> {
+        self.disk.as_ref().map(|d| d.root())
+    }
+
+    /// KV 盘层内容路径。
+    pub fn kv_disk_path_of(&self, key: ChainHash) -> Option<&std::path::Path> {
+        self.disk.as_ref().and_then(|d| d.path_of(key))
+    }
+
+    /// KV 盘层驻留条数。
+    pub fn kv_disk_resident_count(&self) -> usize {
+        self.disk.as_ref().map_or(0, |d| d.resident_count())
+    }
+
+    /// KV 盘层驻留键。
+    pub fn kv_disk_resident_keys(&self) -> Vec<ChainHash> {
+        self.disk.as_ref().map(|d| d.resident_keys()).unwrap_or_default()
+    }
+
+    /// 制定 KV 溢写计划（未接线 = 结构化错）。
+    pub fn kv_disk_plan_spill(&self, key: ChainHash) -> StoreResult<SpillPlanOf<ChainHash>> {
+        self.disk
+            .as_ref()
+            .ok_or_else(|| StoreError::Invariant("KV 盘层未接线".into()))?
+            .plan_spill(key)
+    }
+
+    /// KV 溢写记账。
+    pub fn kv_disk_commit_spill(&mut self, plan: &SpillPlanOf<ChainHash>) -> StoreResult<()> {
+        self.disk
+            .as_mut()
+            .ok_or_else(|| StoreError::Invariant("KV 盘层未接线".into()))?
+            .commit_spill(plan)
+    }
+
+    /// 制定 KV 回填计划。
+    pub fn kv_disk_plan_fill(&self, key: ChainHash) -> StoreResult<FillPlanOf<ChainHash>> {
+        self.disk
+            .as_ref()
+            .ok_or_else(|| StoreError::Invariant("KV 盘层未接线".into()))?
+            .plan_fill(key)
+    }
+
+    /// KV 回填记账。
+    pub fn kv_disk_commit_fill(&mut self, key: ChainHash) -> StoreResult<()> {
+        self.disk
+            .as_mut()
+            .ok_or_else(|| StoreError::Invariant("KV 盘层未接线".into()))?
+            .commit_fill(key)
+    }
+
+    /// KV 盘层逐出计划（未接线 = 空计划）。
+    pub fn kv_disk_plan_evict(
+        &self,
+        need_bytes: usize,
+        protect: &[ChainHash],
+    ) -> DiskEvictPlanOf<ChainHash> {
+        self.disk
+            .as_ref()
+            .map(|d| d.plan_evict(need_bytes, protect))
+            .unwrap_or_default()
+    }
+
+    /// **session 感知的 KV 盘层逐出计划**：先避开活跃 session，不够才动活跃面。
+    ///
+    /// 盘内容是全局共享缓存，但淘汰应先动“冷会话”的历史；活跃 session 的
+    /// 盘块只有在整个盘都腾不出时才允许作为最后来源。
+    pub fn kv_disk_plan_evict_sessions(
+        &self,
+        need_bytes: usize,
+        protect: &[ChainHash],
+        active_sessions: &[u64],
+    ) -> DiskEvictPlanOf<ChainHash> {
+        let Some(d) = self.disk.as_ref() else {
+            return DiskEvictPlanOf::default();
+        };
+        let is_active = |k: &ChainHash| active_sessions.contains(&self.leg.session_of(*k));
+        let mut plan = d.plan_evict_where(need_bytes, protect, |k| !is_active(k));
+        if plan.freed_bytes < need_bytes {
+            let more = d.plan_evict_where(need_bytes - plan.freed_bytes, protect, is_active);
+            plan.freed_bytes += more.freed_bytes;
+            plan.victims.extend(more.victims);
+        }
+        plan
+    }
+
+    /// KV 盘层逐出记账/删账（返回释放字节；未接线 = 0）。
+    pub fn kv_disk_commit_evict(&mut self, keys: &[ChainHash]) -> usize {
+        self.disk.as_mut().map_or(0, |d| d.commit_evict(keys))
+    }
+
+    /// KV 盘层触达。
+    pub fn kv_disk_touch(&mut self, key: ChainHash) -> StoreResult<()> {
+        self.disk
+            .as_mut()
+            .ok_or_else(|| StoreError::Invariant("KV 盘层未接线".into()))?
+            .touch(key)
+    }
+
+    /// 状态腿盘层是否接线。
+    pub fn snap_disk_enabled(&self) -> bool {
+        self.snap_disk.as_ref().is_some_and(|d| !d.is_disabled())
+    }
+
+    /// 状态腿盘层是否有该快照内容。
+    pub fn snap_disk_contains(&self, key: SnapKey) -> bool {
+        self.snap_disk.as_ref().is_some_and(|d| d.contains(key))
+    }
+
+    /// 状态腿盘层单块字节（未接线 = `None`）。
+    pub fn snap_disk_block_bytes(&self) -> Option<usize> {
+        self.snap_disk.as_ref().map(|d| d.block_bytes())
+    }
+
+    /// 状态腿盘层空闲槽数（未接线 = 0）。
+    pub fn snap_disk_free_slots(&self) -> usize {
+        self.snap_disk.as_ref().map_or(0, |d| d.free_slots())
+    }
+
+    /// 状态腿盘层配额字节（0 = 未接线）。
+    pub fn snap_disk_budget_bytes(&self) -> usize {
+        self.snap_disk.as_ref().map_or(0, |d| d.budget_bytes())
+    }
+
+    /// 状态腿盘层根目录。
+    pub fn snap_disk_root(&self) -> Option<&std::path::Path> {
+        self.snap_disk.as_ref().map(|d| d.root())
+    }
+
+    /// 状态腿盘层内容路径。
+    pub fn snap_disk_path_of(&self, key: SnapKey) -> Option<&std::path::Path> {
+        self.snap_disk.as_ref().and_then(|d| d.path_of(key))
+    }
+
+    /// 状态腿盘层驻留条数。
+    pub fn snap_disk_resident_count(&self) -> usize {
+        self.snap_disk.as_ref().map_or(0, |d| d.resident_count())
+    }
+
+    /// 状态腿盘层驻留键。
+    pub fn snap_disk_resident_keys(&self) -> Vec<SnapKey> {
+        self.snap_disk.as_ref().map(|d| d.resident_keys()).unwrap_or_default()
+    }
+
+    /// 制定快照溢写计划（未接线 = 结构化错）。
+    pub fn snap_disk_plan_spill(&self, key: SnapKey) -> StoreResult<SpillPlanOf<SnapKey>> {
+        self.snap_disk
+            .as_ref()
+            .ok_or_else(|| StoreError::Invariant("状态腿盘层未接线".into()))?
+            .plan_spill(key)
+    }
+
+    /// 快照溢写记账。
+    pub fn snap_disk_commit_spill(&mut self, plan: &SpillPlanOf<SnapKey>) -> StoreResult<()> {
+        self.snap_disk
+            .as_mut()
+            .ok_or_else(|| StoreError::Invariant("状态腿盘层未接线".into()))?
+            .commit_spill(plan)
+    }
+
+    /// 制定快照回填计划。
+    pub fn snap_disk_plan_fill(&self, key: SnapKey) -> StoreResult<FillPlanOf<SnapKey>> {
+        self.snap_disk
+            .as_ref()
+            .ok_or_else(|| StoreError::Invariant("状态腿盘层未接线".into()))?
+            .plan_fill(key)
+    }
+
+    /// 快照回填记账。
+    pub fn snap_disk_commit_fill(&mut self, key: SnapKey) -> StoreResult<()> {
+        self.snap_disk
+            .as_mut()
+            .ok_or_else(|| StoreError::Invariant("状态腿盘层未接线".into()))?
+            .commit_fill(key)
+    }
+
+    /// 快照盘层逐出计划（未接线 = 空计划）。
+    pub fn snap_disk_plan_evict(
+        &self,
+        need_bytes: usize,
+        protect: &[SnapKey],
+    ) -> DiskEvictPlanOf<SnapKey> {
+        self.snap_disk
+            .as_ref()
+            .map(|d| d.plan_evict(need_bytes, protect))
+            .unwrap_or_default()
+    }
+
+    /// **session 感知的快照盘层逐出计划**：先避开活跃 session，不够才动活跃面。
+    pub fn snap_disk_plan_evict_sessions(
+        &self,
+        need_bytes: usize,
+        protect: &[SnapKey],
+        active_sessions: &[u64],
+    ) -> DiskEvictPlanOf<SnapKey> {
+        let Some(d) = self.snap_disk.as_ref() else {
+            return DiskEvictPlanOf::default();
+        };
+        let is_active = |k: &SnapKey| {
+            self.state
+                .snap_session(*k)
+                .map_or(false, |(session, _)| active_sessions.contains(&session))
+        };
+        let mut plan = d.plan_evict_where(need_bytes, protect, |k| !is_active(k));
+        if plan.freed_bytes < need_bytes {
+            let more = d.plan_evict_where(need_bytes - plan.freed_bytes, protect, is_active);
+            plan.freed_bytes += more.freed_bytes;
+            plan.victims.extend(more.victims);
+        }
+        plan
+    }
+
+    /// 快照盘层逐出记账/删账（返回释放字节；未接线 = 0）。
+    pub fn snap_disk_commit_evict(&mut self, keys: &[SnapKey]) -> usize {
+        self.snap_disk.as_mut().map_or(0, |d| d.commit_evict(keys))
+    }
+
+    /// 快照盘层触达。
+    pub fn snap_disk_touch(&mut self, key: SnapKey) -> StoreResult<()> {
+        self.snap_disk
+            .as_mut()
+            .ok_or_else(|| StoreError::Invariant("状态腿盘层未接线".into()))?
+            .touch(key)
+    }
+
+    /// 选择层索引（未注册 = `None`）。
+    pub fn index(&self) -> Option<&crate::select::MeanKIndex> {
+        self.index.as_ref()
+    }
+
+    /// 活跃 turn 在飞账（只读）。
+    pub fn admission(&self) -> &Admission {
+        &self.admission
+    }
+
+    /// 活跃 turn 在飞账（可变；仅限 `SessionBank` 的复合账口）。
+    pub fn admission_mut(&mut self) -> &mut Admission {
+        &mut self.admission
     }
 
     /// **状态腿的出序(判据唯一的一面;§30.6-②)** —— "设备层快照谁该先走"。
@@ -976,7 +1581,7 @@ impl Rel {
             // **必须在**"KV 前缀里还有这块"的前提下才算活锚点(2026-11-01):
             // 配额对账把 KV 截到前 N 块后,落在 N 之后的锚点**没有 KV 内容可配**
             // ⇒ 留着也没用(实测:留下的是尾端锚点 ⇒ `reuse_face` 一路回退到 0)。
-            let boundary_alive = self.leg.carrier_of(k.boundary()).is_ok();
+            let boundary_alive = self.carrier_of(k.boundary()).is_ok();
             if boundary_alive && self.state.locate(k).is_some() {
                 if let Some(p) = d.path_of(k) {
                     out.insert(p.to_path_buf());
@@ -1023,10 +1628,10 @@ impl Rel {
     /// 与 [`Self::match_prefix`] 二选一使用(两条查询路径各自记一次命中账;
     /// 同一次查询不要两条都调,否则计数双算)。
     pub fn probe(&mut self, id: PrefixId) -> RecallHit {
-        let kv_tier = self.leg.carrier_of(id.chain).ok().map(|c| match c {
-            crate::leg::Carrier::Device(_) => Tier::Gpu,
-            crate::leg::Carrier::Host => Tier::Host,
-            crate::leg::Carrier::Disk => Tier::Disk,
+        let kv_tier = self.carrier_of(id.chain).ok().map(|c| match c {
+            Carrier::Device(_) => Tier::Gpu,
+            Carrier::Host => Tier::Host,
+            Carrier::Disk => Tier::Disk,
         });
         let snap_tier = self.state.locate(id.snap_key());
         let hit = RecallHit {
@@ -1094,13 +1699,11 @@ impl Rel {
     ) -> StoreResult<(ChainHit, RecallHit)> {
         let m = self.leg.match_prefix_tagged(tokens, tags)?;
         let tail = m.hashes.last().copied();
-        let kv_tier = tail
-            .and_then(|t| self.leg.carrier_of(t).ok())
-            .map(|c| match c {
-                crate::leg::Carrier::Device(_) => Tier::Gpu,
-                crate::leg::Carrier::Host => Tier::Host,
-                crate::leg::Carrier::Disk => Tier::Disk,
-            });
+        let kv_tier = tail.and_then(|t| self.carrier_of(t).ok()).map(|c| match c {
+            Carrier::Device(_) => Tier::Gpu,
+            Carrier::Host => Tier::Host,
+            Carrier::Disk => Tier::Disk,
+        });
         let snap_tier = tail.and_then(|t| self.state.locate(SnapKey::at_boundary(t)));
         let hit = RecallHit {
             kv_tier,
@@ -1780,10 +2383,47 @@ impl Rel {
         r
     }
 
+    /// **磁盘层的会话归属汇总**（KV 链 + 快照；纯 host，零 I/O）。
+    ///
+    /// 盘上的内容是全局共享缓存，但调度仍需回答"这块盘是谁的历史" ——
+    /// KV 归属来自内容树（`session_of`），快照归属来自 `StateStore`。
+    pub fn disk_session_usage(&self) -> Vec<DiskSessionUsage> {
+        use std::collections::BTreeMap;
+        let mut by_session: BTreeMap<u64, DiskSessionUsage> = BTreeMap::new();
+        if let Some(d) = self.disk.as_ref() {
+            let block_bytes = d.block_bytes();
+            for key in d.resident_keys() {
+                let session = self.leg.session_of(key);
+                let e = by_session.entry(session).or_insert(DiskSessionUsage {
+                    session,
+                    ..DiskSessionUsage::default()
+                });
+                e.kv_blocks += 1;
+                e.kv_bytes = e.kv_bytes.saturating_add(block_bytes);
+            }
+        }
+        if let Some(d) = self.snap_disk.as_ref() {
+            let block_bytes = d.block_bytes();
+            for key in d.resident_keys() {
+                let session = self
+                    .state
+                    .snap_session(key)
+                    .map_or(crate::policy::NO_SESSION, |(session, _)| session);
+                let e = by_session.entry(session).or_insert(DiskSessionUsage {
+                    session,
+                    ..DiskSessionUsage::default()
+                });
+                e.snap_entries += 1;
+                e.snap_bytes = e.snap_bytes.saturating_add(block_bytes);
+            }
+        }
+        by_session.into_values().collect()
+    }
+
     /// 报告(两腿 + 保留/弹性面)。
     ///
-    /// KV 块面从**腿**报出(单一真源),`tiers` 只列 store 自管面
-    /// (状态腿/保留面/弹性面)—— 同一字节不两处记(§13.1/§23.1)。
+    /// `tiers` 已拆成 **cells**(事件/语义互斥账)与 **views**(腿自报逻辑面)；
+    /// 同 key 的腿行已扣除 cells，调用方不得再把两者相加。
     pub fn report(&self) -> StoreReport {
         // **第 0.5 刀:腿自报 → owner 行(对账式记账)**
         //
@@ -1794,34 +2434,100 @@ impl Rel {
         // 事件式记账的收益 = 精确区分"仍被持有"vs"未归还",留作接线后的第二步。
         let mut tiers = crate::tier::book_lock(&self.ledger).tiers().report();
         let legs = self.leg_accounting();
-        for row in &legs.owners {
-            tiers.rows.push(crate::tier::TierRow {
-                tier: row.tier,
-                kind: row.kind,
-                bytes: row.bytes,
-                entries: row.entries,
-            });
+        // **cells / views 分家**：ledger 的 cells 是互斥账；腿自报是逻辑视图。
+        // 同 key 的腿行先扣掉 cells（否则 `/debug/vram` 把同一字节算两遍）。
+        let mut cell_map: std::collections::BTreeMap<(Tier, AssetKind), (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for row in &tiers.cells {
+            let e = cell_map.entry((row.tier, row.kind)).or_default();
+            e.0 = e.0.saturating_add(row.bytes);
+            e.1 += row.entries;
         }
-        tiers.owners.extend(legs.owners);
+        let mut views = Vec::new();
+        for row in legs.views {
+            let (cell_bytes, cell_entries) = cell_map
+                .get(&(row.tier, row.kind))
+                .copied()
+                .unwrap_or((0, 0));
+            let bytes = row.bytes.saturating_sub(cell_bytes);
+            let entries = row.entries.saturating_sub(cell_entries);
+            if bytes > 0 {
+                views.push(crate::tier::TierRow {
+                    tier: row.tier,
+                    kind: row.kind,
+                    bytes,
+                    entries,
+                });
+            }
+        }
+        tiers.views = views;
+        tiers.gpu_views_bytes = tiers
+            .views
+            .iter()
+            .filter(|r| r.tier == crate::tier::Tier::Gpu)
+            .map(|r| r.bytes)
+            .sum();
+        // owner 维也只保留一份：ledger owner + 腿 owner 扣掉同 key 的 ledger 部分。
+        let mut cell_owner_map: std::collections::BTreeMap<
+            (crate::tier::Owner, Tier, AssetKind),
+            (usize, usize),
+        > = std::collections::BTreeMap::new();
+        for o in &tiers.owners {
+            let e = cell_owner_map.entry((o.owner, o.tier, o.kind)).or_default();
+            e.0 = e.0.saturating_add(o.bytes);
+            e.1 += o.entries;
+        }
+        for o in legs.owners {
+            let (cell_bytes, cell_entries) = cell_owner_map
+                .get(&(o.owner, o.tier, o.kind))
+                .copied()
+                .unwrap_or((0, 0));
+            let bytes = o.bytes.saturating_sub(cell_bytes);
+            let entries = o.entries.saturating_sub(cell_entries);
+            if bytes > 0 {
+                tiers.owners.push(crate::tier::OwnerRow {
+                    owner: o.owner,
+                    tier: o.tier,
+                    kind: o.kind,
+                    bytes,
+                    entries,
+                });
+            }
+        }
+        let mut owner_map: std::collections::BTreeMap<
+            (crate::tier::Owner, Tier, AssetKind),
+            (usize, usize),
+        > = std::collections::BTreeMap::new();
+        for o in tiers.owners.drain(..) {
+            let e = owner_map.entry((o.owner, o.tier, o.kind)).or_default();
+            e.0 = e.0.saturating_add(o.bytes);
+            e.1 += o.entries;
+        }
+        tiers.owners = owner_map
+            .into_iter()
+            .map(|((owner, tier, kind), (bytes, entries))| crate::tier::OwnerRow {
+                owner,
+                tier,
+                kind,
+                bytes,
+                entries,
+            })
+            .collect();
         tiers
             .owners
             .sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.owner.cmp(&b.owner)));
-        // **host/盘总账 = 合并后 rows 的层和**(2026-10-23 修)。
-        //
-        // 原实现只取 ledger 的 `host_used`:腿自报的 Host KvBlock / Host Snap
-        // 只进了 `rows`/`owners`,没进总数 ⇒ `/debug/vram` 在 260k kvmem 档
-        // 报 host_used≈204MiB,而实际 host 驻留≈5GiB(误导内存排查)。
-        // GPU 不重算:腿的 KvBlock/Snap/Row 在 `Pool` 预留块**内部**,
-        // `gpu_used` 的语义是「账本预留面」,重算会把同一批字节算两遍。
+        // host/盘总账 = cells + views 的层和；GPU 只报 cells（views 在 Pool 内）。
         tiers.host_used = tiers
-            .rows
+            .cells
             .iter()
+            .chain(tiers.views.iter())
             .filter(|r| r.tier == crate::tier::Tier::Host)
             .map(|r| r.bytes)
             .sum();
         tiers.disk_used = tiers
-            .rows
+            .cells
             .iter()
+            .chain(tiers.views.iter())
             .filter(|r| r.tier == crate::tier::Tier::Disk)
             .map(|r| r.bytes)
             .sum();
@@ -1851,6 +2557,7 @@ impl Rel {
             host_free_bytes: self.leg.host_free_bytes(),
             disk_kv: self.disk.as_ref().map(|d| d.stats()),
             disk_snap: self.snap_disk.as_ref().map(|d| d.stats()),
+            disk_sessions: self.disk_session_usage(),
             plan: self.plan.clone(),
             events: {
                 // 事件账(出借登记;与腿自报互为校验 —— 两个独立来源)
@@ -1862,20 +2569,6 @@ impl Rel {
                     hook_fail: b.hook_fail(),
                     partial_moves: b.partial_moves(),
                     ids: b.open_ids_by_rank(),
-                    pool: {
-                        let (n, by) = b.pool_stats();
-                        let (hits, misses, drained) = b.pool_counters();
-                        PoolReport {
-                            entries: n,
-                            bytes: by,
-                            hits,
-                            misses,
-                            drained,
-                            evicted: b.pool_evicted(),
-                            cap: b.pool_cap(),
-                            by_class: b.pool_by_class(),
-                        }
-                    },
                     open_lifecycle: b
                         .open_loans(|o| o.is_lifecycle())
                         .into_iter()
@@ -2016,15 +2709,10 @@ impl Rel {
             );
         }
         crate::tier::TierReport {
-            rows,
+            views: rows,
             owners,
             ..Default::default()
         }
-    }
-
-    /// **复用池上限**(缺口 4 收尾 P1-1;boot 一次,显式配置)。`0` = 不限。
-    pub fn set_pool_cap(&mut self, bytes: usize) {
-        crate::tier::book_lock(&self.ledger).set_pool_cap(bytes);
     }
 
     /// **账本单元**(boot 接线:DeviceHandle 的事件入口与 store 的 `Rel` 要**同一本**)
@@ -3129,12 +3817,11 @@ mod tests {
         );
     }
 
-    /// **快照淘汰门(2026-10-23 改判)**:快照**不走** KV 块的"末端先削"结构档 ——
-    /// 每条快照按自己的边界身份独立键控,逐浅的不会让深的失效;而"深度大者先逐"
-    /// 会先逐掉**最有用的一条**(会话上一轮尾巴 = 增量续写/前缀无感删除的 GDN
-    /// 恢复点)。现行 = **Transient 最前 + 其余按新鲜度(LRU)**。
+    /// **快照淘汰门(2026-10-23/11-16)**:快照不走 KV 的"末端先削"结构档；
+    /// 现行 = **Transient 最前 + 会话档（冷会话先）+ 会话内新鲜度(LRU)**。
+    /// 深度仍不参与排序。
     #[test]
-    fn snap_victim_order_is_recency_based() {
+    fn snap_victim_order_is_session_then_recency() {
         let mut r = rel(4);
         let k = |n: u64| SnapKey::at_boundary(ChainHash::new(n));
         // 会话 1:depth 1/2/3(先登记 ⇒ last_use 小)
@@ -3163,11 +3850,12 @@ mod tests {
         // 也是前缀无感删除的 GDN 恢复点 ⇒ 必须**最后**被逐(旧策略会最先逐它)
         r.state.touch(k(102));
         let order = r.snap_victim_order(&[]);
-        // 纯新鲜度:登记序 = 100,101,200,201;102 被触达 ⇒ 最后
+        // 会话 1 更冷 ⇒ 整组先走（组内 LRU：102 被触达 ⇒ 组内最后）；
+        // 会话 2 更新 ⇒ 整组后走。深度不参与。
         assert_eq!(
             order,
-            vec![k(100), k(101), k(200), k(201), k(102)],
-            "快照出序 = 新鲜度(LRU):刚用过的尾巴最后逐,深度不参与"
+            vec![k(100), k(101), k(102), k(200), k(201)],
+            "快照出序 = 冷会话优先 + 会话内新鲜度"
         );
     }
 
@@ -3623,8 +4311,50 @@ mod tests {
         assert_eq!((rep.chains, rep.blocks), (1, 3), "{rep:?}");
         assert_eq!(rep.kept.len(), 3);
         assert_eq!(r.leg.kv_stats().host_blocks, 3, "重建条目应为非设备层");
-        let (hit, _recall) = r.match_prefix(&tokens).expect("命中");
+        let (hit, recall) = r.match_prefix(&tokens).expect("命中");
         assert_eq!(hit.matched_blocks, 3, "命中面应按重建的树工作");
+        assert_eq!(recall.kv_tier, Some(Tier::Disk), "盘上链必须报 Disk 层");
+        assert_eq!(
+            r.carrier_of(*hit.hashes.last().expect("尾块")),
+            Ok(Carrier::Disk),
+            "仅盘上有内容时必须报 Disk(不能把 slot=None 一律当 Host)"
+        );
+        // **会话感知的盘账**：归属来自内容树，而不是磁盘文件自己猜。
+        r.set_chain_owner(7, &hit.hashes);
+        let usage = r.disk_session_usage();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].session, 7);
+        assert_eq!(usage[0].kv_blocks, 3);
+        assert_eq!(usage[0].kv_bytes, 3 * (4 << 20) / 4, "盘块 = 单槽字节");
+    }
+
+    /// **盘层 session 感知淘汰**：活跃 session 的盘块最后才动。
+    #[test]
+    fn disk_eviction_skips_active_sessions_first() {
+        let mut i = inputs();
+        i.disk_bytes = 8 << 20;
+        let mut r = rel_with_disk(&mut i, 4 << 20, 0);
+        let ta = toks(32);
+        let tb: Vec<u32> = (100..132).collect();
+        let ha = r.leg.tail_hash(&ta, 1).expect("A 身份");
+        let hb = r.leg.tail_hash(&tb, 1).expect("B 身份");
+        // A 先落盘（更老），B 后落盘（更新）。
+        for h in [ha, hb] {
+            let plan = r.disk.as_ref().expect("盘").plan_spill(h).expect("计划");
+            r.disk.as_mut().expect("盘").commit_spill(&plan).expect("落账");
+        }
+        let ia = crate::disk_index::ChainIndex::new(32, ta).expect("A 索引");
+        let ib = crate::disk_index::ChainIndex::new(32, tb).expect("B 索引");
+        r.adopt_disk_chains(&[ia, ib]).expect("重建树");
+        // A 归活跃 session 7；B 无主。按纯 LRU 会先挑 A（更老）。
+        r.set_chain_owner(7, &[ha]);
+        let block = r.kv_disk_block_bytes().expect("盘块");
+        let plan = r.kv_disk_plan_evict_sessions(block, &[], &[7]);
+        let victims: Vec<ChainHash> = plan.victims.iter().map(|(k, _)| *k).collect();
+        assert!(
+            victims.contains(&hb) && !victims.contains(&ha),
+            "活跃 session 的盘块不应先被淘汰: {victims:?}"
+        );
     }
 
     /// **S6.1 带指纹重建**：盘上内容键由 `(tokens, tags)` 算出；索引必须
@@ -3893,11 +4623,11 @@ mod tests {
         assert_eq!(rep.tiers.host_used, BLOCK_BYTES, "host 总账应含腿自报块");
         assert_eq!(rep.host_resident_bytes, BLOCK_BYTES, "腿自报同源");
         assert!(
-            rep.tiers.rows.iter().any(|r| r.tier == Tier::Host
+            rep.tiers.views.iter().any(|r| r.tier == Tier::Host
                 && r.kind == AssetKind::KvBlock
                 && r.bytes == BLOCK_BYTES),
-            "报告应有 Host/KvBlock 行:{:?}",
-            rep.tiers.rows
+            "报告应有 Host/KvBlock view 行:{:?}",
+            rep.tiers.views
         );
         assert_eq!(rep.tiers.gpu_used, 0, "GPU 预留面语义不因 host 行走样");
     }
@@ -3928,11 +4658,11 @@ mod tests {
         assert_eq!(rep.tiers.host_used, per_block, "索引进 host 层账");
         assert!(
             rep.tiers
-                .rows
+                .cells
                 .iter()
                 .any(|x| x.kind == AssetKind::Index && x.bytes == per_block),
-            "报告应有 Index 行:{:?}",
-            rep.tiers.rows
+            "报告应有 Index cell 行:{:?}",
+            rep.tiers.cells
         );
         // 形状错 = 响亮拒(不进账)
         assert!(r

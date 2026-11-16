@@ -511,7 +511,6 @@ async fn failed_start_does_not_kill_active_turn() {
     running
         .bank
         .rel
-        .state
         .borrow_row(owl_store::tier::Owner::System)
         .expect("借走最后一行");
 
@@ -684,7 +683,7 @@ async fn session_cap_evicts_lru_idle() {
 }
 
 /// **P2-2 图 slab 实测回填门**：GraphFleet 捕获后，MemoryPlan 的 GraphSlab
-/// 必须标为 `Measured`；WarmupMisc 仍保留 `Conservative`（瞬态上界语义不变）。
+/// 必须标为 `Measured`。warmup 已并入 `vram_reserve_mb`，不再是 fixed 项。
 #[cfg(test)]
 #[tokio::test]
 async fn memory_plan_uses_measured_graph_slab_after_capture() {
@@ -698,13 +697,10 @@ async fn memory_plan_uses_measured_graph_slab_after_capture() {
         owl_store::PlanSource::Measured,
         "捕获后 GraphSlab 应回填实测"
     );
-    let warm = plan
-        .component(owl_store::ComponentId::WarmupMisc)
-        .expect("WarmupMisc 项");
-    assert_eq!(
-        warm.source,
-        owl_store::PlanSource::Conservative,
-        "Warmup 瞬态仍是保守上界"
+    assert!(
+        plan.fixed.iter().all(|c| c.id != owl_store::ComponentId::GraphSlab
+            || c.source == owl_store::PlanSource::Measured),
+        "图 slab 项必须实测"
     );
 }
 
@@ -727,7 +723,7 @@ async fn idle_node_offloads_device_snapshot_via_store_plan() {
 
     // 手工登记一条 Durable 设备快照(不经 capture:本门只验调度 + 执行臂)
     let key = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0x5A5A));
-    running.bank.rel.state.register_snap(
+    running.bank.rel.register_snap_account(
         key,
         bytes,
         owl_store::Tier::Gpu,
@@ -741,7 +737,7 @@ async fn idle_node_offloads_device_snapshot_via_store_plan() {
         .expect("Idle 节点");
 
     assert_eq!(
-        running.bank.rel.state.locate(key),
+        running.bank.rel.state_locate(key),
         Some(owl_store::Tier::Host),
         "store 判 Host ⇒ engine 必须真沉(执行臂闭环)"
     );
@@ -760,7 +756,7 @@ async fn state_hook_slot_offload_and_resident_roundtrip() {
     let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB32));
     let k_new = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xC33));
     for k in [k_a, k_b] {
-        running.bank.rel.state.register_snap(
+        running.bank.rel.register_snap_account(
             k,
             bytes,
             owl_store::Tier::Gpu,
@@ -775,10 +771,10 @@ async fn state_hook_slot_offload_and_resident_roundtrip() {
     let slot = running.snap_ensure_slot(k_new).await.expect("State::Slot");
     let victim = [k_a, k_b]
         .into_iter()
-        .find(|k| running.bank.rel.state.locate(*k) == Some(owl_store::Tier::Host))
+        .find(|k| running.bank.rel.state_locate(*k) == Some(owl_store::Tier::Host))
         .expect("应有一条被沉到宿主");
     assert!(
-        running.bank.rel.snap_host.get(victim).is_some(),
+        running.bank.rel.snap_host_contains(victim),
         "宿主应有内容"
     );
     assert_eq!(running.dev.pool.snap_used(), 1, "受害者设备槽已释放");
@@ -790,7 +786,7 @@ async fn state_hook_slot_offload_and_resident_roundtrip() {
         .await
         .expect("State::Resident");
     assert_eq!(
-        running.bank.rel.state.locate(victim),
+        running.bank.rel.state_locate(victim),
         Some(owl_store::Tier::Gpu),
         "回灌后层账应回设备"
     );
@@ -800,7 +796,7 @@ async fn state_hook_slot_offload_and_resident_roundtrip() {
         "槽索引应记上"
     );
     assert!(
-        running.bank.rel.snap_host.get(victim).is_none(),
+        !running.bank.rel.snap_host_contains(victim),
         "宿主副本已取走"
     );
     assert_eq!(running.dev.pool.snap_used(), 2, "两槽重新占满");
@@ -851,18 +847,18 @@ async fn disk_spill_and_fill_roundtrip() {
     // **P2 磁盘腿入准入**：`store_facts()` 必须看见盘上余量（旧行为恒 0
     // ⇒ 超卖档配了盘也不用，宿主满 = 拒新）。单卡：盘块 = 一页 ⇒ 页数 = 槽数。
     let facts = running.store_facts();
-    let slots = running.bank.rel.disk.as_ref().unwrap().free_slots();
+    let slots = running.bank.rel.kv_disk_free_slots();
     assert!(slots > 0, "盘配额应给出空位（实得 {slots}）");
     assert_eq!(facts.disk_free_pages, slots, "盘槽 → 页的折算必须一一对应");
     assert_eq!(
-        running.bank.rel.snap_disk.as_ref().unwrap().free_slots(),
+        running.bank.rel.snap_disk_free_slots(),
         1,
         "24MiB / 一条"
     );
     let k_a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xA11));
     let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB22));
     for k in [k_a, k_b] {
-        running.bank.rel.state.register_snap(
+        running.bank.rel.register_snap_account(
             k,
             bytes,
             owl_store::Tier::Gpu,
@@ -882,7 +878,7 @@ async fn disk_spill_and_fill_roundtrip() {
         ))
         .await
         .expect("拍 1");
-    let st1 = running.bank.rel.state.stats();
+    let st1 = running.bank.rel.state_stats();
     assert_eq!(
         (st1.snap_gpu.0, st1.snap_host.0),
         (1, 1),
@@ -890,7 +886,7 @@ async fn disk_spill_and_fill_roundtrip() {
     );
     let in_host = [k_a, k_b]
         .into_iter()
-        .find(|k| running.bank.rel.state.locate(*k) == Some(owl_store::Tier::Host))
+        .find(|k| running.bank.rel.state_locate(*k) == Some(owl_store::Tier::Host))
         .expect("应有一张在宿主");
     let other = if in_host == k_a { k_b } else { k_a };
 
@@ -904,38 +900,24 @@ async fn disk_spill_and_fill_roundtrip() {
         ))
         .await
         .expect("拍 2");
-    let disk = running
-        .bank
-        .rel
-        .snap_disk
-        .as_ref()
-        .unwrap()
-        .resident_count();
+    let disk = running.bank.rel.snap_disk_resident_count();
     assert_eq!(
         disk,
         1,
         "宿主满 ⇒ 一张落磁盘:{:?}",
-        running.bank.rel.state.stats()
+        running.bank.rel.state_stats()
     );
     assert_eq!(
-        running.bank.rel.state.locate(in_host),
+        running.bank.rel.state_locate(in_host),
         Some(owl_store::Tier::Disk),
         "被挪去盘的是宿主里那张"
     );
     assert_eq!(
-        running.bank.rel.state.locate(other),
+        running.bank.rel.state_locate(other),
         Some(owl_store::Tier::Gpu),
         "设备那张仍在(内容不丢优先:本轮不出 Drop)"
     );
-    let path = running
-        .bank
-        .rel
-        .snap_disk
-        .as_ref()
-        .unwrap()
-        .path_of(in_host)
-        .unwrap()
-        .to_path_buf();
+    let path = running.bank.rel.snap_disk_path_of(in_host).unwrap().to_path_buf();
     assert!(path.exists(), "文件应真写盘:{}", path.display());
     assert_eq!(
         std::fs::metadata(&path).unwrap().len() as usize,
@@ -944,24 +926,22 @@ async fn disk_spill_and_fill_roundtrip() {
     );
 
     // 回填:盘 → 宿主(层账回 Host;磁盘副本仍在 = 权威)
-    assert!(running.fill_snap_from_disk(in_host).await.expect("回填"));
+    assert!(running
+        .disk
+        .fill_snap(&mut running.bank.rel, in_host)
+        .await
+        .expect("回填"));
     assert_eq!(
-        running.bank.rel.state.locate(in_host),
+        running.bank.rel.state_locate(in_host),
         Some(owl_store::Tier::Host),
         "回填后层账 = Host"
     );
     assert!(
-        running.bank.rel.snap_host.get(in_host).is_some(),
+        running.bank.rel.snap_host_contains(in_host),
         "宿主应有内容"
     );
     assert!(
-        running
-            .bank
-            .rel
-            .snap_disk
-            .as_ref()
-            .unwrap()
-            .contains(in_host),
+        running.bank.rel.snap_disk_contains(in_host),
         "磁盘副本仍在(权威)"
     );
 
@@ -1012,7 +992,7 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
     let k_c = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xC43));
     let k_d = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xD44));
     for k in [k_a, k_b] {
-        running.bank.rel.state.register_snap(
+        running.bank.rel.register_snap_account(
             k,
             bytes,
             owl_store::Tier::Gpu,
@@ -1028,20 +1008,14 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
         .await
         .expect("第一次 State::Slot");
     running.dev.pool.snap_place(slot_c, k_c);
-    running.bank.rel.state.register_snap(
+    running.bank.rel.register_snap_account(
         k_c,
         bytes,
         owl_store::Tier::Gpu,
         owl_store::SnapDurability::Durable,
     );
-    let st1 = running.bank.rel.state.stats();
-    let disk1 = running
-        .bank
-        .rel
-        .snap_disk
-        .as_ref()
-        .map(|d| d.resident_count())
-        .unwrap_or(0);
+    let st1 = running.bank.rel.state_stats();
+    let disk1 = running.bank.rel.snap_disk_resident_count();
     assert_eq!(
         (st1.snap_gpu.0, st1.snap_host.0, disk1),
         (2, 1, 0),
@@ -1055,14 +1029,8 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
         .snap_ensure_slot(k_d)
         .await
         .expect("第二次 State::Slot");
-    let st2 = running.bank.rel.state.stats();
-    let disk2 = running
-        .bank
-        .rel
-        .snap_disk
-        .as_ref()
-        .map(|d| d.resident_count())
-        .unwrap_or(0);
+    let st2 = running.bank.rel.state_stats();
+    let disk2 = running.bank.rel.snap_disk_resident_count();
     assert_eq!(
         (st2.snap_gpu.0, st2.snap_host.0, disk2),
         (1, 1, 1),
@@ -1071,18 +1039,12 @@ async fn state_slot_spills_host_snapshot_to_disk_before_drop() {
     // 三条旧快照都还在账（没有内容被丢）。
     for k in [k_a, k_b, k_c] {
         assert!(
-            running.bank.rel.state.locate(k).is_some(),
+            running.bank.rel.state_locate(k).is_some(),
             "快照 {k:?} 被丢了"
         );
     }
     assert_eq!(
-        running
-            .bank
-            .rel
-            .snap_disk
-            .as_ref()
-            .unwrap()
-            .resident_count(),
+        running.bank.rel.snap_disk_resident_count(),
         1,
         "盘上应有一条"
     );
@@ -1115,29 +1077,27 @@ async fn turn_records_session_ownership_for_kv_and_snaps() {
     let tail = running
         .bank
         .rel
-        .leg
         .tail_hash(&toks, full)
         .expect("链尾身份");
     assert_eq!(
-        running.bank.rel.leg.session_of(tail),
+        running.bank.rel.session_of(tail),
         sid,
         "KV 尾块应归本会话"
     );
-    assert_eq!(running.bank.rel.leg.depth_of(tail), full, "深度 = 块数");
+    assert_eq!(running.bank.rel.depth_of(tail), full, "深度 = 块数");
 
     // 快照(页边界)也要带归属与深度
     let snaps: Vec<_> = running
         .bank
         .rel
-        .state
-        .evict_candidates(&[])
+        .snap_evict_candidates(&[])
         .into_iter()
         .filter_map(|c| c.snap)
         .collect();
     assert!(!snaps.is_empty(), "应有页边界快照");
     let mut seen_depth = false;
     for k in snaps {
-        let (s, d) = running.bank.rel.state.snap_session(k).expect("在账");
+        let (s, d) = running.bank.rel.snap_session_info(k).expect("在账");
         assert_eq!(s, sid, "快照应归本会话");
         if d > 0 {
             seen_depth = true;
@@ -1179,7 +1139,7 @@ async fn gdn_row_is_owned_by_the_active_turn() {
         })
         .expect("行应归 Turn(tid)");
     assert_eq!(row.entries, 1, "本 turn 应恰好借一行:{row:?}");
-    assert_eq!(row.bytes, running.bank.rel.state.row_bytes());
+    assert_eq!(row.bytes, running.bank.rel.row_bytes());
     let row_grant = rep
         .grants
         .iter()
@@ -1298,13 +1258,7 @@ async fn disk_checkpoint_survives_restart_without_host_pressure() {
         let (h2, _) = running2.bank.rel.match_prefix(&t0).expect("重启后命中查询");
         eprintln!(
             "[ckpt] 重启后: ckpt={ckpt_mb} 盘 entries={} matched={}",
-            running2
-                .bank
-                .rel
-                .disk
-                .as_ref()
-                .map(|d| d.resident_count())
-                .unwrap_or(0),
+            running2.bank.rel.kv_disk_resident_count(),
             h2.matched_blocks
         );
         assert_eq!(
@@ -1397,7 +1351,7 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
                 .await
                 .expect("保洁");
         }
-        let disk_entries = running.bank.rel.disk.as_ref().unwrap().resident_count();
+        let disk_entries = running.bank.rel.kv_disk_resident_count();
         assert!(disk_entries > 0, "应已有链内容溢写到盘");
         // 重启前的对照:同一份 token 化应命中(证明索引 tokens 与查询同源)
         // 提交路径会套 chat 模板 ⇒ 查询侧同口径(chat_wrap = true)
@@ -1433,16 +1387,10 @@ async fn disk_chain_index_enables_cross_restart_reuse() {
     let mut running2 = boot(mk(&dir)).await;
     eprintln!(
         "[idx] 重启后: 盘 entries={} / 树 host_blocks={}",
-        running2
-            .bank
-            .rel
-            .disk
-            .as_ref()
-            .map(|d| d.resident_count())
-            .unwrap_or(0),
-        running2.bank.rel.leg.kv_stats().host_blocks
+        running2.bank.rel.kv_disk_resident_count(),
+        running2.bank.rel.kv_stats().host_blocks
     );
-    let rebuilt = running2.bank.rel.leg.kv_stats().host_blocks;
+    let rebuilt = running2.bank.rel.kv_stats().host_blocks;
     assert!(rebuilt > 0, "重启后应按索引重建出条目(非设备层)");
     let toks = running2.tokenize(&prompt, true).expect("tokenize").tokens;
     let (hit, _recall) = running2.bank.rel.match_prefix(&toks).expect("命中");
@@ -1503,7 +1451,7 @@ async fn disk_adopt_on_boot_restores_ledger() {
     {
         let mut running = boot(mk(&dir)).await;
         let bytes = running.bank.rel.snap_bytes();
-        running.bank.rel.state.register_snap(
+        running.bank.rel.register_snap_account(
             key,
             bytes,
             owl_store::Tier::Gpu,
@@ -1522,7 +1470,7 @@ async fn disk_adopt_on_boot_restores_ledger() {
                 .expect("保洁");
         }
         assert_eq!(
-            running.bank.rel.state.locate(key),
+            running.bank.rel.state_locate(key),
             Some(owl_store::Tier::Disk),
             "第一次进程里应已落盘"
         );
@@ -1530,17 +1478,23 @@ async fn disk_adopt_on_boot_restores_ledger() {
 
     // ── 第二次进程:同目录 ⇒ boot 扫盘回填账(不搬内容)
     let running2 = boot(mk(&dir)).await;
-    let d = running2.bank.rel.snap_disk.as_ref().expect("盘层应接线");
-    assert_eq!(d.resident_count(), 1, "盘上条目应被回填进账");
-    assert!(d.contains(key), "回填的正是那张快照");
     assert_eq!(
-        running2.bank.rel.state.locate(key),
+        running2.bank.rel.snap_disk_resident_count(),
+        1,
+        "盘上条目应被回填进账"
+    );
+    assert!(
+        running2.bank.rel.snap_disk_contains(key),
+        "回填的正是那张快照"
+    );
+    assert_eq!(
+        running2.bank.rel.state_locate(key),
         Some(owl_store::Tier::Disk),
         "层账回填到 Disk"
     );
     // 启动期**不读内容**:宿主里还没有它(惰性)
     assert!(
-        running2.bank.rel.snap_host.get(key).is_none(),
+        !running2.bank.rel.snap_host_contains(key),
         "启动不回读内容"
     );
 
@@ -1562,13 +1516,13 @@ async fn snapshot_victim_follows_store_order() {
     assert!(bytes > 0);
     let k_a = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xA1));
     let k_b = owl_store::SnapKey::at_boundary(owl_store::ChainHash::new(0xB2));
-    running.bank.rel.state.register_snap(
+    running.bank.rel.register_snap_account(
         k_a,
         bytes,
         owl_store::Tier::Gpu,
         owl_store::SnapDurability::Durable,
     );
-    running.bank.rel.state.register_snap(
+    running.bank.rel.register_snap_account(
         k_b,
         bytes,
         owl_store::Tier::Gpu,
@@ -1764,7 +1718,6 @@ pub async fn gpu_schedule_decision_surface() {
             &act.positions[..act.prompt_ids.len()],
         )
         .expect("提交位置账");
-        s.cached_len -= 2;
     }
     eng.submit_session(Some(sid), "一二三四五六七八九十", 2)
         .unwrap();
@@ -1886,18 +1839,17 @@ async fn state_leg_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D
     let host_key = running
         .bank
         .rel
-        .state
-        .evict_candidates(&[])
+        .snap_evict_candidates(&[])
         .into_iter()
         .filter_map(|c| c.snap)
-        .find(|k| running.bank.rel.state.locate(*k) == Some(owl_store::Tier::Host))
+        .find(|k| running.bank.rel.state_locate(*k) == Some(owl_store::Tier::Host))
         .expect("应有宿主层快照");
     let slot = running
         .snap_ensure_resident(host_key)
         .await
         .expect("回灌就位");
     assert_eq!(
-        running.bank.rel.state.locate(host_key),
+        running.bank.rel.state_locate(host_key),
         Some(owl_store::Tier::Gpu),
         "回灌后层账应回设备"
     );
@@ -2036,7 +1988,7 @@ async fn index_probe_scenario<D: DeviceClient>(
     let (blocks, per_block) = running
         .bank
         .rel
-        .index
+        .index()
         .as_ref()
         .map(|i| (i.len(), i.block_bytes()))
         .unwrap_or((0, 0));
@@ -2045,7 +1997,7 @@ async fn index_probe_scenario<D: DeviceClient>(
         after,
         rep.tiers.host_used,
         rep.tiers
-            .rows
+            .cells
             .iter()
             .filter(|r| r.kind == owl_store::AssetKind::Index)
             .map(|r| r.bytes)
@@ -2055,7 +2007,7 @@ async fn index_probe_scenario<D: DeviceClient>(
     assert_eq!(after, blocks * per_block, "索引体量 = 块数 × 每块字节");
     if expect_nonzero {
         // 真卡档:索引必须来自真实 K（全零 = GPU 路径/切片偏移失守）
-        let ix = running.bank.rel.index.as_ref().expect("索引账在场");
+        let ix = running.bank.rel.index().expect("索引账在场");
         let first = ix
             .evict_candidates(&[])
             .first()
@@ -2069,7 +2021,7 @@ async fn index_probe_scenario<D: DeviceClient>(
     }
     assert!(
         rep.tiers
-            .rows
+            .cells
             .iter()
             .any(|r| r.kind == owl_store::AssetKind::Index),
         "报告应有 Index 行(host 层)"
@@ -2079,7 +2031,7 @@ async fn index_probe_scenario<D: DeviceClient>(
     if let Some(k) = running
         .bank
         .rel
-        .index
+        .index()
         .as_ref()
         .and(None::<owl_store::SnapKey>)
     {
@@ -2089,7 +2041,7 @@ async fn index_probe_scenario<D: DeviceClient>(
         running
             .bank
             .rel
-            .index
+            .index()
             .as_ref()
             .map(|i| i.len())
             .unwrap_or(0),
@@ -2801,7 +2753,7 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
         rep1.host_resident_bytes as f64 / 1048576.0,
         rep1.kv.slots_free,
         rep1.kv.slots_total,
-        running.bank.rel.leg.report().ops.offloads
+        running.bank.rel.leg_stats().ops.offloads
     );
     // ② 会话 2:造压 ⇒ 下沉
     {
@@ -2821,8 +2773,8 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
         rep2.kv.cached_blocks,
         rep2.kv.host_blocks,
         rep2.host_resident_bytes as f64 / 1048576.0,
-        running.bank.rel.leg.report().ops.offloads,
-        running.bank.rel.leg.report().ops.offload_bytes >> 10,
+        running.bank.rel.leg_stats().ops.offloads,
+        running.bank.rel.leg_stats().ops.offload_bytes >> 10,
         rep2.kv.slots_free
     );
     let _stage_before = running.sel.stage().blocks;
@@ -2843,8 +2795,8 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
     eprintln!("[b3e] {}", st.line());
     eprintln!(
         "[b3e] 轮 3 后:回灌 {} 次/{}KiB(命中面复用)· 宿主仍驻留 {:.2}MiB",
-        running.bank.rel.leg.report().ops.onloads,
-        running.bank.rel.leg.report().ops.onload_bytes >> 10,
+        running.bank.rel.leg_stats().ops.onloads,
+        running.bank.rel.leg_stats().ops.onload_bytes >> 10,
         rep3.host_resident_bytes as f64 / 1048576.0
     );
     // 27B 外推(每块 K+V = 16 层 × 32 tok × 4 头 × 256 dim × 2B × 2)
@@ -2862,11 +2814,11 @@ async fn stage_in_scenario<D: DeviceClient>(running: &mut RunningEngine<D>) {
     );
     let _ = s1;
     assert!(
-        running.bank.rel.leg.report().ops.offloads > 0,
+        running.bank.rel.leg_stats().ops.offloads > 0,
         "门①:没造出下沉(宿主层/压力不够?)"
     );
     assert!(
-        st.blocks > 0 && running.bank.rel.leg.report().ops.onloads > 0,
+        st.blocks > 0 && running.bank.rel.leg_stats().ops.onloads > 0,
         "门②:回灌没发生(前缀命中的块不在宿主层?下沉量不够?)"
     );
 }
@@ -2945,8 +2897,9 @@ async fn select_27b_scenario() {
         "view" => (true, true, false),
         _ => (knobs.index_probe, knobs.select_decode, knobs.select_partial),
     };
-    knobs.vram_reserve_mb =
-        owl_shared::env_reader::parse::<u64>("OWL_27B_RESERVE_MB").unwrap_or(128);
+    knobs.vram_reserve_mb = owl_shared::env_reader::parse::<u64>("OWL_27B_RESERVE_MB")
+        .unwrap_or(128)
+        + owl_shared::config::POOL_GRAPH_WARMUP_RESERVE_MB;
     knobs.index_probe = ix;
     knobs.select_decode = sd;
     knobs.select_partial = sp;
@@ -3204,7 +3157,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     // 保洁按链把 A+B(各 3 块)整条沉到宿主(内容不丢,不是被同步驱逐掉)
     let _ = probe_run_turn(&mut *running, &long).await;
 
-    let rep = running.bank.rel.leg.report();
+    let rep = running.bank.rel.leg_stats();
     eprintln!(
         "[s3-3b] 轮 3 后:自由槽 {}/{} · 缓存 {} 块 · 宿主 {} 块 / {:.2}MiB · 换出 {} 次 {}KiB(drop {} / 同步驱逐 canary —)",
         rep.slots_free,
@@ -3259,7 +3212,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
         let mut diag = |tag: &str, p: &str| {
             let wrapped = running.boot.tok.chat_wrap(p);
             let ids = running.boot.tok.encode(&wrapped);
-            let hit = running.bank.rel.leg.match_prefix(&ids).expect("match");
+            let hit = running.bank.rel.match_prefix(&ids).expect("match").0;
             let rows: Vec<String> = hit
                 .hashes
                 .iter()
@@ -3273,8 +3226,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
                         if running
                             .bank
                             .rel
-                            .state
-                            .locate(owl_store::SnapKey::at_boundary(*h))
+                            .state_locate(owl_store::SnapKey::at_boundary(*h))
                             .is_some()
                         {
                             "Y"
@@ -3308,7 +3260,7 @@ async fn offload_probe_scenario<D: DeviceClient>(running: &mut RunningEngine<D>)
     let cold = cold_text.as_deref().expect("轮 1 冷启动基线在场");
     assert_eq!(text, cold, "门③:命中路径输出必须与冷启动逐字节一致");
 
-    let rep2 = running.bank.rel.leg.report();
+    let rep2 = running.bank.rel.leg_stats();
     eprintln!(
         "[s3-3b] 轮 4 后:宿主 {} 块 / {:.2}MiB · 换出 {} 块/{} 命令 · 回灌 {} 块/{} 命令 · 同步驱逐 canary {}",
         rep2.host_blocks,
@@ -4167,10 +4119,9 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
         .boot
         .tok
         .encode(&running.boot.tok.chat_wrap(a_prompt.as_str()));
-    let a_hit_1 = running
+    let (a_hit_1, _) = running
         .bank
         .rel
-        .leg
         .match_prefix(&a_tokens)
         .expect("A 命中查询");
     assert!(a_hit_1.matched_blocks >= 1, "A 的历史应进缓存(内容身份)");
@@ -4183,10 +4134,9 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
     assert!(!tb1_text.trim().is_empty());
 
     // 隔离断言 ①:B 的 turn 后,A 的**内容链**与账本都不变
-    let a_hit_2 = running
+    let (a_hit_2, _) = running
         .bank
         .rel
-        .leg
         .match_prefix(&a_tokens)
         .expect("A 命中查询");
     assert_eq!(
@@ -4203,10 +4153,9 @@ pub async fn gpu_multi_session_isolation(shared: Option<&mut RunningEngine<crate
         .boot
         .tok
         .encode(&running.boot.tok.chat_wrap("我的代号是贝塔。"));
-    let b_hit = running
+    let (b_hit, _) = running
         .bank
         .rel
-        .leg
         .match_prefix(&b_tokens)
         .expect("B 命中查询");
     assert!(
@@ -4355,16 +4304,14 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFa
         .boot
         .tok
         .encode(&running.boot.tok.chat_wrap(prompt_b.as_str()));
-    let hit_a = running
+    let (hit_a, _) = running
         .bank
         .rel
-        .leg
         .match_prefix(&a_ids)
         .expect("A 命中查询");
-    let hit_b = running
+    let (hit_b, _) = running
         .bank
         .rel
-        .leg
         .match_prefix(&b_ids)
         .expect("B 命中查询");
     let shared = hit_b
@@ -4378,7 +4325,7 @@ pub async fn gpu_prefix_cache_hit(shared: Option<&mut RunningEngine<crate::GpuFa
         "B 应命中 ≥8 块,得 {}",
         hit_b.matched_blocks
     );
-    let rep = running.bank.rel.leg.report();
+    let rep = running.bank.rel.leg_stats();
     assert!(
         rep.cached_blocks >= 8,
         "缓存面应有 ≥8 条目,得 {}",
@@ -7126,7 +7073,7 @@ pub async fn gpu_image_evict_gate() {
     assert!(!deleted_slots.is_empty(), "被删图应有设备槽");
     for slot in &deleted_slots {
         assert!(
-            running.bank.rel.leg.slot_refs(*slot) > 0,
+            running.bank.rel.slot_refs(*slot) > 0,
             "删除前 {slot} 应仍有缓存引用（否则本门没有可验对象）"
         );
     }
@@ -7146,7 +7093,7 @@ pub async fn gpu_image_evict_gate() {
     running.execute_begin(begin).await.expect("t2 begin");
     for slot in &deleted_slots {
         assert_eq!(
-            running.bank.rel.leg.slot_refs(*slot),
+            running.bank.rel.slot_refs(*slot),
             0,
             "被删图的槽 {slot} 仍有缓存引用：leave-gap 没有解除旧链尾引用"
         );
@@ -7788,7 +7735,7 @@ pub async fn gpu_image_evict_anchor_gate() {
         for (k, sp) in [(0, r0), (1, r1)] {
             let key = owl_store::SnapKey::at_boundary(hit_a.hashes[sp.start / page - 1]);
             assert!(
-                running.bank.rel.state.locate(key).is_some(),
+                running.bank.rel.state_locate(key).is_some(),
                 "第 {k} 张图段前锚点快照不在账（键 {}）—— 每张都要拍",
                 sp.start / page - 1
             );
@@ -7833,11 +7780,8 @@ pub async fn gpu_image_evict_anchor_gate() {
         };
         running.execute_begin(begin).await.expect("run t2 begin");
         let cached = running
-            .bank
-            .sessions
-            .session(sid2)
-            .expect("run 会话账")
-            .cached_len;
+            .active_cached_len(a2)
+            .expect("run t2 active");
         assert!(
             cached >= r1.start,
             "只删后一张时复用面必须覆盖前一张（cached={cached} 需 >= r1.start={}）",
@@ -7880,7 +7824,7 @@ pub async fn gpu_image_evict_anchor_gate() {
             ],
             false,
         );
-        let (sid3, b1) = running
+        let (_sid3, b1) = running
             .submit_session_opts(
                 Some(23),
                 p1.as_str(),
@@ -7944,11 +7888,8 @@ pub async fn gpu_image_evict_anchor_gate() {
         };
         running.execute_begin(begin).await.expect("trim t2 begin");
         let cached = running
-            .bank
-            .sessions
-            .session(sid3)
-            .expect("trim 会话账")
-            .cached_len;
+            .active_cached_len(b2)
+            .expect("trim t2 active");
         assert!(
             cached >= t0.start,
             "模板 trim 边界未复原：cached={cached} 需 >= 图前起点 {}",
@@ -8251,7 +8192,7 @@ pub async fn gpu_image_evict_multi_gate() {
     assert!(!deleted_slots.is_empty(), "被删图应有设备槽");
     for slot in &deleted_slots {
         assert!(
-            running.bank.rel.leg.slot_refs(*slot) > 0,
+            running.bank.rel.slot_refs(*slot) > 0,
             "删除前 {slot} 应仍有缓存引用"
         );
     }
@@ -8271,7 +8212,7 @@ pub async fn gpu_image_evict_multi_gate() {
     running.execute_begin(begin).await.expect("multi t2 begin");
     for slot in &deleted_slots {
         assert_eq!(
-            running.bank.rel.leg.slot_refs(*slot),
+            running.bank.rel.slot_refs(*slot),
             0,
             "被删图的槽 {slot} 仍有缓存引用：多段 leave-gap 没释放旧链尾引用"
         );

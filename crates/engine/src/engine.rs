@@ -16,8 +16,8 @@
 //! (CPU 测试/自定义后端)。
 //!
 //! **会话接线(S0/S1,2026-09-26)**:SessionTable 入引擎 ——
-//! `submit_session(Some(id), …)` = 连续会话(同会话跳过 GDN 重置,
-//! 只 prefill `cached_len..` 增量段;token 账前缀守卫失配回退全量);
+//! `submit_session(Some(id), …)` = 连续会话(同会话跳过 GDN 重置；
+//! 可复用面由 store 内容树回答，历史守卫失配回退全量)；
 //! `submit(None)` = 临时会话终了即焚,行为同 M0.5(每 turn 全量重算)。
 //!
 //! # 模块地图(2026-10-01 拆分;原单文件 1782 行 → 六户)
@@ -220,11 +220,6 @@ pub struct EngineKnobs {
     pub dense_floor_mib: Option<u64>,
     /// **状态腿宿主预算 MiB**(S2 §25.2;缺省 **0 = 关层**)。`OWL_SNAP_HOST_MB`。
     ///
-    /// **复用池容量上限**(MiB;缺口 4 收尾 P1-1;2026-10-19)。
-    ///
-    /// 缺省 256:27B 单轮释放后池天然囤到 669 MiB、复用率仅 ~46% ⇒ 无界池 = 新形态囤积;
-    /// 256 覆盖实测热集大头,超出部分逐块顶出回驱动。0 = 不限(仅供诊断/对照)。
-    pub pool_cap_mb: usize,
     /// 与 [`Self::host_cache_mb`] 同属 store 中层总账的两个**分片**
     /// (KV 块腿 / GDN 快照腿)—— 总账 = 两者之和(`Rel::open` 交叉校验分片
     /// 不超总账)。为什么分开:两条腿的搬运形态与热区完全不同,共用一个数
@@ -344,11 +339,9 @@ pub struct EngineKnobs {
     pub snap_msg_min_span: usize,
     /// **显存治理占比**(`[pool].vram_budget`;缺省 0.97;0 = 治理禁用)
     pub vram_budget: f64,
-    /// VRAM 预留 MiB(缺省 1024;原 OWL_VRAM_RESERVE_MB)
+    /// **单值总预留 MiB**(缺省 714;含图执行/warmup/碎片)。
+    /// prefill 瞬态不在这里:由 `prefill_chunk` 代码派生。
     pub vram_reserve_mb: u64,
-    /// **超卖档池外瞬态余量 MiB**(`[pool].transient_reserve_mb`;缺省 1024)。
-    /// 池 = `cap − ceil(mb / per_tok)`。原来是 `state.rs` 里写死的 1 GiB。
-    pub transient_reserve_mb: u64,
     /// 裸续写输出,绕过 chat 模板(原 OWL_RAW_COMPLETION)
     pub raw_completion: bool,
     /// 采样开关(缺省开;OWL_SAMPLER=greedy → false)
@@ -387,7 +380,6 @@ impl Default for EngineKnobs {
             checkpoint_max_mb: 0,
             checkpoint_min_gap_ms: 5000,
             disk_dir: String::new(),
-            pool_cap_mb: 256,
             index_probe: false,
             index_gpu: true,
             coverage_probe: false,
@@ -454,8 +446,7 @@ impl Default for EngineKnobs {
             snap_structural_reserve: 4,
             snap_msg_min_span: 0,
             vram_budget: 0.97,
-            vram_reserve_mb: 1024,
-            transient_reserve_mb: 1024,
+            vram_reserve_mb: 714,
             raw_completion: false,
             sampler_enabled: true,
             sampler: crate::sampler::SamplerCfg::default(),
@@ -693,7 +684,6 @@ impl EngineKnobs {
             // `docs/arch/配置面-单一来源.md`。
             // 生产 = 自动(剩余显存);仅测试通过 `EngineKnobs` 直接覆写。
             pool_tokens: None,
-            pool_cap_mb: cfg.pool.pool_cap_mb,
             draft: DraftCfg {
                 depth: cfg.spec.depth,
                 family: cfg.spec.draft,
@@ -840,7 +830,6 @@ impl EngineKnobs {
             snap_msg_min_span: cfg.pool.snap_msg_min_span,
             vram_budget: cfg.pool.vram_budget,
             vram_reserve_mb: cfg.pool.vram_reserve_mb,
-            transient_reserve_mb: cfg.pool.transient_reserve_mb,
             raw_completion: cfg.probes.raw_completion,
             sampler_enabled: cfg.sampling.mode == owl_shared::config::SamplerMode::Sampling,
             sampler: crate::sampler::SamplerCfg::from_sampling(&cfg.sampling),
@@ -996,6 +985,7 @@ fn build_memory_plan(
     cfg: &EngineConfig,
     pool: &StatePool,
     weights_bytes: u64,
+    draft_weights_bytes: usize,
     graph_slab_bytes: usize,
 ) -> Result<owl_store::MemoryPlan> {
     let tier_budget = owl_store::tier_budget_of(
@@ -1035,6 +1025,27 @@ fn build_memory_plan(
             owl_store::Owner::System,
         ),
     );
+    // 草稿权重是**目标权重之后**才装载的;旧 plan 只记了 target,导致
+    // `/debug/vram.plan_audit` 长期缺 0.8G/rank。它是常驻权重,必须进
+    // fixed,并且 `to_budget_inputs` 会把它与 target 合成 `weights_bytes`。
+    if draft_weights_bytes > 0 {
+        fixed.insert(
+            1,
+            owl_store::MemComponent::new(
+                owl_store::ComponentId::DraftWeights,
+                draft_weights_bytes,
+                owl_store::PlanSource::Measured,
+                owl_store::Tier::Gpu,
+                owl_store::Owner::System,
+            ),
+        );
+        owl_shared::log_info!(
+            "boot",
+            "MemoryPlan 权重: target {:.1}MiB + draft {:.1}MiB",
+            weights_bytes as f64 / 1048576.0,
+            draft_weights_bytes as f64 / 1048576.0,
+        );
+    }
     let plan = owl_store::MemoryPlan::new(
         0,
         owl_store::CardPlan {
@@ -1352,7 +1363,7 @@ impl<D: DeviceClient + 'static> Engine<D> {
         let live_before_pool = face.vram_snapshot().live;
         let weights_bytes = live_before_pool.saturating_sub(boot.live_at_new);
         // 设备侧装配(单卡:tp = None;双 rank 走 `TpEngine` 的同一 `boot_rank`)
-        let dev = boot_rank(face, &mut cfg, rm, None, live_before_pool, t_run).await?;
+        let dev = boot_rank(face, &mut cfg, rm, None, live_before_pool, None, t_run).await?;
         let mut engine = into_running(cfg, tokenizer, boot, dev, None, ledger, weights_bytes)?;
         // **staging 预热放在就绪之前**(2026-10-27):把首次大下沉的
         // `cudaHostAlloc(≈600 ms)` 从 TTFT 关键路径搬到 boot。只在部分驻留档
@@ -1418,11 +1429,18 @@ pub(crate) fn into_running<D: DeviceClient>(
         .graphs
         .slab_bytes()
         .max(peer.as_ref().map_or(0, |p| p.graphs.slab_bytes()));
+    // 草稿权重实测:事件账里按唯一词表统计(两 rank 共享一本账 ⇒ 先合计再
+    // 摊到每卡;与 `weights_bytes` 的 per-card 口径一致)。
+    let rank_count = if peer.is_some() { 2usize } else { 1usize };
+    let draft_weights_total = owl_store::book_lock(&ledger)
+        .open_bytes_by_prefixes(crate::DRAFT_WEIGHT_PREFIXES);
+    let draft_weights_per_card = draft_weights_total / rank_count;
     let memory_plan = build_memory_plan(
         &boot,
         &cfg,
         &dev.pool,
         weights_bytes,
+        draft_weights_per_card,
         graph_slab_bytes,
     )?;
     let budget_inputs = assemble_budget(&cfg, &memory_plan)?;
@@ -1460,20 +1478,8 @@ pub(crate) fn into_running<D: DeviceClient>(
         // **TP:peer 平面布局**(2026-10-20 双卡 KVMem)。两 rank 的池句柄 id
         // 是两套 ⇒ 每个平面必须用**自己那套** `PieceSpec` 组片(靠偏移平移不行)。
         if let Some(pr) = peer.as_ref() {
-            b.rel.leg.attach_pool_peer(pr.pool.pool_layout(0))?;
+            b.rel.attach_pool_peer(pr.pool.pool_layout(0))?;
         }
-        // **复用池上限**(缺口 4 收尾 P1-1):配置面显式(=0 ⇒ 不限,仅诊断用)
-        let cap = cfg.knobs.pool_cap_mb << 20;
-        b.rel.set_pool_cap(cap);
-        owl_shared::log_info!(
-            "store",
-            "复用池上限 = {}(缺省 256MiB;超限逐块顶出回驱动)",
-            if cap == 0 {
-                "不限".to_string()
-            } else {
-                format!("{}MiB", cfg.knobs.pool_cap_mb)
-            }
-        );
         // **B-4 驱逐策略装配**(boot 一次;缺省 LRU ⇒ 与历史逐字一致)
         b.rel.set_evict_policy(cfg.knobs.evict_policy.build());
         // 整枝塌缩(2026-10-23):宿主/磁盘**装不下整链**时允许一张票丢整段
@@ -1493,7 +1499,7 @@ pub(crate) fn into_running<D: DeviceClient>(
                 dev.pool.geom.dims.hd,
                 dev.pool.kvs().len(),
                 dev.pool.geom.dims.hkv,
-                b.rel.index.as_ref().map(|i| i.block_bytes()).unwrap_or(0)
+                b.rel.index().map(|i| i.block_bytes()).unwrap_or(0)
             );
         }
         if dev.pool.geom.paged && dev.pool.snap_capacity() > 0 {
@@ -1653,23 +1659,18 @@ pub(crate) fn into_running<D: DeviceClient>(
             owl_shared::log_info!(
                 "store",
                 "树对账:adopt 后 entries={} cap={}(设备池 {} 槽 × 份额 + 宿主槽)",
-                b.rel.leg.tree_len(),
-                b.rel.leg.tree_cap(),
-                b.rel.leg.slots_total(),
+                b.rel.tree_len(),
+                b.rel.tree_cap(),
+                b.rel.slots_total(),
             );
             {
                 let kept: std::collections::HashSet<_> = rep.kept.iter().copied().collect();
                 let orphans: Vec<owl_store::ChainHash> = b
                     .rel
-                    .disk
-                    .as_ref()
-                    .map(|d| {
-                        d.resident_keys()
-                            .into_iter()
-                            .filter(|k| !kept.contains(k))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                    .kv_disk_resident_keys()
+                    .into_iter()
+                    .filter(|k| !kept.contains(k))
+                    .collect();
                 if !orphans.is_empty() {
                     // **不再开箱即删**(2026-11-01 P1 收尾,踩过两次):
                     // 链索引由 turn 收口**另写**,而内容由空转 checkpoint 写 —— 两者
@@ -1679,17 +1680,10 @@ pub(crate) fn into_running<D: DeviceClient>(
                     // 现口径:**只报不删** —— 盘配额由 `DiskTier` 的 LRU 负责回收
                     // (真写不下时按最老逐),孤儿内容留在盘上顶多占配额,不会毁数据。
                     // 想主动清就删目录(运维动作),引擎不代劳。
-                    let paths: Vec<std::path::PathBuf> = b
-                        .rel
-                        .disk
-                        .as_ref()
-                        .map(|d| {
-                            orphans
-                                .iter()
-                                .filter_map(|k| d.path_of(*k).map(|p| p.to_path_buf()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let paths: Vec<std::path::PathBuf> = orphans
+                        .iter()
+                        .filter_map(|k| b.rel.kv_disk_path_of(*k).map(|p| p.to_path_buf()))
+                        .collect();
                     let _ = &paths; // 只报不删(见上)
                     owl_shared::log_warn!(
                         "store",
@@ -1860,6 +1854,7 @@ pub(crate) fn into_running<D: DeviceClient>(
         );
     }
 
+    let disk = crate::mem::disk_runtime::DiskRuntime::new();
     let boot = crate::running::BootCtx {
         probes: cfg.knobs.probes,
         tok: tokenizer,
@@ -1877,6 +1872,7 @@ pub(crate) fn into_running<D: DeviceClient>(
         dev,
         peer,
         pending_out: None,
+        disk,
         vlm_cache: [
             crate::vlm::VlmMergedCache::default(),
             crate::vlm::VlmMergedCache::default(),
@@ -1956,6 +1952,8 @@ pub(crate) struct PendingDflash {
     pub d_model: usize,
     pub dtype: owl_models::Dtype,
     pub base: usize,
+    /// 本会话的 DFlash2 草稿 ring 号（= 活跃 turn 的 GDN 行号；并发隔离）。
+    pub ring: usize,
 }
 
 /// **装载期定型、运行期只读**的 rank 事实(权重是分片的,每 rank 一份)。
@@ -2071,7 +2069,7 @@ fn check_dense_floor_gate(cfg: &EngineConfig) -> Result<()> {
 ///
 /// 这些组合一旦放进运行期才爆,现场都很难查(0.8B 桶门 IMA / 首个 verify
 /// 步越界 / 图档瓦与表内容不同构)。集中在这里 = 坏配置毫秒级拒。
-fn boot_knobs_check(cfg: &EngineConfig, tp: Option<&owl_models::module::TpCtx>) -> Result<()> {
+fn boot_knobs_check(cfg: &EngineConfig, _tp: Option<&owl_models::module::TpCtx>) -> Result<()> {
     check_dense_floor_gate(cfg)?;
     // **算子族装配参数:装配期下发**(2026-10-19 桶门立案;2026-11-01 分层修正)。
     //
@@ -2089,11 +2087,6 @@ fn boot_knobs_check(cfg: &EngineConfig, tp: Option<&owl_models::module::TpCtx>) 
     // 缺省空实现 = 静默托管。现形状 = 族自己拥有配置面,引擎装配期唯一写者。
     // **合批档自洽门**(B5.1;2026-10-20):每会话一格 GDN + 单卡 AR 语义未审
     if cfg.knobs.max_batch > 1 {
-        if tp.is_some() {
-            return Err(owl_iface::contract::ModelError::Msg(
-                "[runtime] max_batch > 1 与 TP 不共戴天(AR 的批语义未审;先单卡)".into(),
-            ));
-        }
         if cfg.knobs.max_batch > 8 {
             return Err(owl_iface::contract::ModelError::Msg(format!(
                 "max_batch({}) > 8:逐行 token 输出走 Concat 8 槽",
@@ -2640,6 +2633,8 @@ fn boot_pool_plan(
         seq_tokens: s,
         pool_tokens,
         pool_auto,
+        // 自动池的并发份数 = 活跃 turn 上限（`max_batch`）。1 = 旧单会话语义。
+        pool_sessions: cfg.knobs.max_batch.max(1),
         // **锁①门控**:只有虚拟化真的开着(配置显式 `select_decode` +
         // `select_partial`)才允许池小于上下文 —— 否则链超出池容量必
         // `Exhausted`(无洞可停,即无选择层可挤)。
@@ -2679,7 +2674,9 @@ fn boot_pool_plan(
         snap_max: cfg.knobs.snap_max,
         vram_budget: cfg.knobs.vram_budget,
         vram_reserve_mb: cfg.knobs.vram_reserve_mb,
-        transient_reserve_mb: cfg.knobs.transient_reserve_mb,
+        // prefill 瞬态 = 代码派生;旧档显式值仅作兼容覆盖。
+        // prefill 瞬态 = 代码派生(不配置):chunk × 11/32 + 192。
+        prefill_transient_mb: crate::state::prefill_transient_mb(cfg.prefill_chunk),
         // B-2:选择层视图面(**生产档也要** —— 视图是 decode 的消费方;
         // 与诊断面 `coverage_probe` 解耦)
         select_view: cfg.knobs.coverage_probe || cfg.knobs.select_decode,
@@ -2796,12 +2793,49 @@ pub(crate) fn boot_kvmem_check(cfg: &EngineConfig) -> Result<()> {
 /// `tp` = 张量并行上下文(**必须在图捕获之前**传入 —— 捕获期拒三个 `Peer*`
 /// 命令;staging 的 VMM 握手由调用方在更早完成,见 `tp.rs`)。
 #[allow(clippy::arc_with_non_send_sync)]
+/// **TP2 池几何协调**（两 rank 的池必须逐位相同；块表/图/页表跨 rank
+/// 共享槽号）。两 rank 在 `boot_rank` 的**池前结算之后**交换各自的
+/// `free`，取 min 作为池预算；对端在交换前失败 = 通道关闭 ⇒ 本 rank
+/// 响亮返回（不静默用单边 free）。
+pub(crate) struct TpPoolShare {
+    tx: tokio::sync::watch::Sender<Option<u64>>,
+    rx: tokio::sync::watch::Receiver<Option<u64>>,
+}
+
+impl TpPoolShare {
+    /// 两 rank 各持一支：rank0 = `(tx0, rx1)`，rank1 = `(tx1, rx0)`。
+    pub(crate) fn pair() -> (Self, Self) {
+        let (tx0, rx0) = tokio::sync::watch::channel(None::<u64>);
+        let (tx1, rx1) = tokio::sync::watch::channel(None::<u64>);
+        (
+            Self { tx: tx0, rx: rx1 },
+            Self { tx: tx1, rx: rx0 },
+        )
+    }
+
+    async fn exchange(&mut self, free: u64) -> Result<u64> {
+        self.tx
+            .send(Some(free))
+            .map_err(|_| ModelError::Msg("TP 池协调:对端已退出".into()))?;
+        loop {
+            if let Some(v) = *self.rx.borrow() {
+                return Ok(v.min(free));
+            }
+            self.rx
+                .changed()
+                .await
+                .map_err(|_| ModelError::Msg("TP 池协调:对端在池前退出".into()))?;
+        }
+    }
+}
+
 pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
     mut face: DeviceHandle<D>,
     cfg: &mut EngineConfig,
     rm: RankModel,
     tp: Option<owl_models::module::TpCtx>,
     live_baseline_per_card: u64,
+    mut pool_share: Option<TpPoolShare>,
     t_run: std::time::Instant,
 ) -> Result<RankDev<DeviceHandle<D>>> {
         boot_knobs_check(cfg, tp.as_ref())?;
@@ -2834,8 +2868,8 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         // 状态块(StatePool::alloc,零初始化;GDN 段每 turn 开始按格重置)。
         // KV 布局表驱动(kv_paged_policy;REQ-HW-01);块池容量 =
         // min(剩余显存 cap, max_seq×并发 + 1 页)(knobs.pool_tokens 仅测试覆写)。
-        // **池前 settle(2026-10-22)**:装载期临时块(store 复用池)与
-        // cudaMallocAsync 缓存会残留到 `free@池` 的读数里;不排空则同一档
+        // **池前 settle(2026-10-22)**:装载期临时块与 cudaMallocAsync
+        // 缓存会残留到 `free@池` 的读数里;不排空则同一档
         // 不同 boot 的 cap 抖动(79k–116k)。先把它们还驱动/还 OS,再让
         // `pool_cap` 读 free —— 这是“池前 materialize/结算”的收口。
         let drained = face.drain_temp_pool().await;
@@ -2853,7 +2887,14 @@ pub(crate) async fn boot_rank<D: DeviceClient + 'static>(
         }
         // **本 rank 的池前快照**(2026-10-24):`mem_info` 已把 free/total 写进
         // 设备 account;池容量只读这份,不再读进程级全局 FREE。
-        let vram = face.vram_snapshot();
+        let mut vram = face.vram_snapshot();
+        if let Some(share) = pool_share.as_mut() {
+            // 精确协调：本值已是**草稿装载 + 池前结算之后**的 free，另一
+            // rank 的同相位值由 watch 通道交换；取 min 后两 rank 池几何
+            // 逐位一致，不再需要 1 GiB 的保守安全边。
+            let other = share.exchange(vram.free).await?;
+            vram.free = vram.free.min(other);
+        }
         eprintln!(
             "[vram-pre-pool] temp_drained={drained} 块 · driver_trimmed={} MiB ⇒ free={} MiB",
             trimmed >> 20,

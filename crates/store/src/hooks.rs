@@ -1063,10 +1063,11 @@ pub(crate) fn order_candidates(
 /// 前缀无感删除的 GDN 恢复点(实测:滑窗 6 轮后 `snap_max=4/16` 都把尾巴
 /// 逐掉 ⇒ 删除退化为全量重算)。
 ///
-/// 现行语义 = **事实档 + 新鲜度**:
+/// 现行语义 = **事实档 + 会话档 + 新鲜度**:
 /// 1. `Transient`(生成段快照,逐出零代价)最前;
-/// 2. 其余按 `EvictPolicy`(缺省 LRU = `last_use`)—— 刚拍/刚用的尾巴自然
-///    最后被逐,冷会话先走。
+/// 2. 同档内先按会话冷度（冷会话先，无主最后）；
+/// 3. 会话内按 `EvictPolicy`(缺省 LRU = `last_use`)—— 刚拍/刚用的尾巴
+///    在**本会话内**最后被逐。
 pub(crate) fn order_snap_victims(
     policy: &dyn EvictPolicy,
     cands: Vec<EvictCandidate>,
@@ -1091,9 +1092,32 @@ pub(crate) fn order_snap_victims(
         buckets.entry(class.evict_rank()).or_default().push(c);
     }
     let mut out = Vec::new();
-    for (_, mut group) in buckets {
-        policy.order(&mut group);
-        out.extend(group);
+    for (_, group) in buckets {
+        // **会话档（与 KV 同律）**：同一档内先动"最冷的会话"，
+        // 无主候选最后；会话内再交给策略对象（LRU/LRFU）。
+        let mut sess_cold: std::collections::BTreeMap<u64, u64> =
+            std::collections::BTreeMap::new();
+        for c in &group {
+            let e = sess_cold.entry(c.session).or_insert(u64::MAX);
+            if c.last_use < *e {
+                *e = c.last_use;
+            }
+        }
+        let mut by_session: std::collections::BTreeMap<u64, Vec<EvictCandidate>> =
+            std::collections::BTreeMap::new();
+        for c in group {
+            by_session.entry(c.session).or_default().push(c);
+        }
+        let mut keys: Vec<u64> = by_session.keys().copied().collect();
+        keys.sort_by_key(|s| {
+            (*s == crate::policy::NO_SESSION, *sess_cold.get(s).unwrap_or(&u64::MAX))
+        });
+        for k in keys {
+            if let Some(mut g) = by_session.remove(&k) {
+                policy.order(&mut g);
+                out.extend(g);
+            }
+        }
     }
     out
 }
@@ -1154,6 +1178,25 @@ mod tests {
         ];
         let order = order_candidates(policy.as_ref(), cands, &state);
         assert_eq!(order[0].chain, Some(ChainHash::new(2)), "冷会话先走");
+    }
+
+    /// 快照出序也必须带会话档：冷会话的 Extra 先于热会话的 Extra。
+    #[test]
+    fn snapshots_prefer_cold_session_within_same_class() {
+        let state = StateStore::new(1, 1);
+        let policy = EvictPolicyKind::Lru.build();
+        let mut hot = cand(7, 1, 900, 1);
+        hot.leg = Leg::State;
+        hot.snap = Some(SnapKey::at_boundary(ChainHash::new(11)));
+        let mut cold = cand(9, 1, 10, 2);
+        cold.leg = Leg::State;
+        cold.snap = Some(SnapKey::at_boundary(ChainHash::new(12)));
+        let order = order_snap_victims(policy.as_ref(), vec![hot, cold], &state);
+        assert_eq!(
+            order[0].snap,
+            Some(SnapKey::at_boundary(ChainHash::new(12))),
+            "冷会话快照先走"
+        );
     }
 
     /// 混合腿出序:同一会话内 **Extra 快照先于更冷的 Dense** ——

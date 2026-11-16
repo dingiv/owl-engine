@@ -232,6 +232,30 @@ impl KvStore {
     /// 拿它去 `decref` = 触碰越界槽(实测踩:`槽 4294967295 越界`)——
     /// **没有设备槽就没有引用可还**,按定义跳过。
     pub fn release_table(&mut self, table: &mut Vec<u32>) -> StoreResult<()> {
+        // **先全量校验，再统一减引用**：中途失败不能留下“前几槽已还、
+        // 后几槽未还”的半截表（调用方会重试或丢弃表，二者都会坏账）。
+        let capacity = self.pool.capacity();
+        let mut seen = std::collections::BTreeSet::new();
+        for &slot in table.iter().rev() {
+            if crate::leg::is_host_placeholder(slot) {
+                continue;
+            }
+            if slot as usize >= capacity {
+                return Err(StoreError::Invariant(format!(
+                    "归还块表:槽 {slot} 越界(共 {capacity} 槽)"
+                )));
+            }
+            if !seen.insert(slot) {
+                return Err(StoreError::Invariant(format!(
+                    "归还块表:槽 {slot} 在表内重复"
+                )));
+            }
+            if self.pool.refs(slot) == 0 {
+                return Err(StoreError::Invariant(format!(
+                    "归还块表:槽 {slot} 已是自由槽(重复归还)"
+                )));
+            }
+        }
         for &slot in table.iter().rev() {
             if crate::leg::is_host_placeholder(slot) {
                 continue;
@@ -362,6 +386,9 @@ impl KvStore {
     pub fn drop_chain(&mut self, chain: ChainHash) -> StoreResult<bool> {
         match self.tree.remove(chain) {
             Some(slot) => {
+                // 树条目已离开：归属表必须同步删除，否则长驻服务里
+                // `owners` 会随历史唯一块数无界增长，且 id 复用后串归属。
+                self.forget_owner(chain);
                 if let Some(slot) = slot {
                     self.pool.decref(slot)?;
                 }
@@ -422,6 +449,7 @@ impl KvStore {
             out.inserted.push(*chain);
         }
         for (chain, slot) in &up.evicted {
+            self.forget_owner(*chain);
             if let Some(slot) = slot {
                 self.pool.decref(*slot)?;
             }
@@ -507,6 +535,11 @@ impl KvStore {
             .unwrap_or(crate::policy::NO_SESSION)
     }
 
+    /// 树条目离开时同步清理归属（`owners` 的唯一删除口）。
+    fn forget_owner(&mut self, chain: ChainHash) {
+        self.owners.remove(&chain);
+    }
+
     /// **块在链上的深度**(从根到该块的块数;1 = 根块)。
     pub fn depth_of(&self, chain: ChainHash) -> usize {
         self.tree.chain_of(chain).len()
@@ -586,7 +619,8 @@ impl KvStore {
             )));
         }
         let inserted: Vec<ChainHash> = up.inserted.iter().map(|(c, _)| *c).collect();
-        for (_chain, slot) in &up.evicted {
+        for (chain, slot) in &up.evicted {
+            self.forget_owner(*chain);
             if let Some(slot) = slot {
                 self.pool.decref(*slot)?;
             }
@@ -634,7 +668,8 @@ impl KvStore {
     /// 按容量驱逐 `n` 个叶(压力面/策略面共用);返回被逐条目。
     pub fn evict_cached(&mut self, n: usize) -> StoreResult<Vec<(ChainHash, Option<u32>)>> {
         let batch = self.tree.evict(n);
-        for (_chain, slot) in &batch {
+        for (chain, slot) in &batch {
+            self.forget_owner(*chain);
             if let Some(slot) = slot {
                 self.pool.decref(*slot)?;
             }
@@ -811,6 +846,9 @@ impl KvStore {
     /// 丢弃一条缓存条目(host 副本已由上层处理;返回是否真的移除)。
     pub fn drop_entry(&mut self, chain: ChainHash) -> StoreResult<Option<Option<u32>>> {
         let removed = self.tree.remove(chain);
+        if removed.is_some() {
+            self.forget_owner(chain);
+        }
         if let Some(Some(slot)) = removed {
             self.pool.decref(slot)?;
         }
@@ -915,7 +953,8 @@ mod tests {
     /// 需要造槽的用例显式走这条等价路径。
     fn evict_device_cached(m: &mut KvStore, n: usize) -> Vec<(ChainHash, Option<u32>)> {
         let batch = m.tree.evict_device(n);
-        for (_, slot) in &batch {
+        for (chain, slot) in &batch {
+            m.forget_owner(*chain);
             if let Some(slot) = slot {
                 m.pool.decref(*slot).expect("逐出设备叶");
             }
@@ -1389,5 +1428,58 @@ mod tests {
         );
         assert_eq!(d.bound_refs_hist[1], 2, "{d:?}");
         assert_eq!(m.chain_down_span(tail), Some(2));
+    }
+
+    /// **归属表生命周期**：树条目离开时 `owners` 必须同步删除。
+    ///
+    /// 旧实现只增不减：长驻服务里每出现一条新前缀就多一条永久记录，
+    /// 且 session id 复用后 `session_of` 会串到旧会话。
+    #[test]
+    fn owners_are_forgotten_when_tree_entry_leaves() {
+        let mut m = kv(8, 8);
+        let toks_a = toks(64);
+        let mut ta = Vec::new();
+        m.ensure_for_len(&mut ta, 64).expect("建链");
+        m.register_chain_owned(&toks_a, &ta, 7).expect("登记");
+        let tail = m.tail_hash(&toks_a, 2).expect("尾身份");
+        assert_eq!(m.session_of(tail), 7);
+        assert!(m.drop_chain(tail).expect("摘链"));
+        assert_eq!(
+            m.session_of(tail),
+            crate::policy::NO_SESSION,
+            "drop_chain 后归属必须清空"
+        );
+
+        // 容量驱逐路径同理。
+        let mut m2 = kv(8, 8);
+        let toks_b = toks(96);
+        let mut tb = Vec::new();
+        m2.ensure_for_len(&mut tb, 96).expect("建链");
+        m2.register_chain_owned(&toks_b, &tb, 9).expect("登记");
+        let tail_b = m2.tail_hash(&toks_b, 3).expect("尾身份");
+        assert_eq!(m2.session_of(tail_b), 9);
+        let evicted = m2.evict_cached(1).expect("逐缓存");
+        assert_eq!(evicted[0].0, tail_b, "逐出的应是叶");
+        assert_eq!(
+            m2.session_of(tail_b),
+            crate::policy::NO_SESSION,
+            "evict_cached 后归属必须清空"
+        );
+    }
+
+    /// **归还块表的事务性**：预检失败不得清表/减引用，否则调用方重试会双扣。
+    #[test]
+    fn release_table_validates_before_mutating() {
+        let mut m = kv(8, 8);
+        let mut table = Vec::new();
+        m.ensure_for_len(&mut table, 64).expect("建表");
+        let slot0 = table[0];
+        let mut bad = vec![slot0, slot0];
+        let err = m.release_table(&mut bad).expect_err("表内重复槽必须拒");
+        assert!(matches!(err, StoreError::Invariant(_)), "得 {err:?}");
+        assert_eq!(bad, vec![slot0, slot0], "失败不得清表");
+        assert_eq!(m.slot_refs(slot0), 1, "失败不得减引用");
+        m.release_table(&mut table).expect("合法表归还");
+        assert!(table.is_empty());
     }
 }
