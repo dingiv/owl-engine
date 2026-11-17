@@ -285,7 +285,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 .dflash_select_merged(bonus, sampler_on, q_cfg, q_seed, fp, lookup)
                 .await?;
             mrec("spec.propose.sel", t_sel.elapsed());
-            if self.boot.probes.dflash_probe {
+            if self.boot.probes.dflash_probe || self.boot.probes.draft_trace {
                 owl_shared::log_debug!("dflash-probe", "anchor={bonus} drafts={d:?}");
             }
             return Ok(d);
@@ -876,7 +876,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 用同图输出的 scores/topk 建 q。
         self.apply_dflash_lookup(&mut out, lookup);
         self.tspec()?.spec_q_host = None;
-        if self.boot.probes.dflash_probe {
+        if self.boot.probes.dflash_probe || self.boot.probes.draft_trace {
             owl_shared::log_debug!("dflash-probe", "pos={pos} anchor={anchor} drafts={out:?}");
         }
         Ok(out)

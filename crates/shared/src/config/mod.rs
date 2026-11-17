@@ -195,6 +195,13 @@ pub enum TpArMode {
     Fused,
     /// 非 fp8 小包(≤256KiB)走 barrier-only AR-2;其余落 `Fused` / v1
     Ar2,
+    /// AR-2 的 **push** 变体：本端把载荷写到对端槽（P2P store），再从
+    /// **本端**槽读回；与 `Ar2` 的 pull（写本端、读对端）相对。
+    /// 目的：让两卡同时向对方发数据，减少对端读延迟与“一卡等另一卡”。
+    /// **实测（2026-11-17，3090 TP2/d5/136k）：与 pull 中性（95.3 vs 94.6 t/s，
+    /// 6.07 vs 6.13 J/tok）**；需 `PROT_READWRITE` peer alias。
+    /// ⚠️ **3080 对勿开**（P2P 写方向风险；保持 `ar2` pull）。
+    Ar2Push,
 }
 
 impl TpArMode {
@@ -204,17 +211,23 @@ impl TpArMode {
             Self::V1 => "v1",
             Self::Fused => "fused",
             Self::Ar2 => "ar2",
+            Self::Ar2Push => "ar2push",
         }
     }
 
     /// 融合核是否在场(`Fused`/`Ar2` 都自带 fused 回落)
     pub const fn uses_fused(self) -> bool {
-        matches!(self, Self::Fused | Self::Ar2)
+        matches!(self, Self::Fused | Self::Ar2 | Self::Ar2Push)
     }
 
     /// barrier-only AR-2 是否在场
     pub const fn uses_ar2(self) -> bool {
-        matches!(self, Self::Ar2)
+        matches!(self, Self::Ar2 | Self::Ar2Push)
+    }
+
+    /// AR-2 是否走 push（写对端槽、读本端槽）
+    pub const fn uses_ar2_push(self) -> bool {
+        matches!(self, Self::Ar2Push)
     }
 }
 
@@ -505,8 +518,9 @@ pub struct RuntimeCfg {
     // **准入三旋钮已删**（2026-11-16 用户裁决）：
     // `newcomer_min_tokens` / `min_gen_tokens` / `max_queue` 是"给新人留头寸"
     // 的补丁层。原始算法的预算已经**保底**：一轮在 submit 时就按
-    // 「本请求上下文 + 本档最大输出长度(`max_new_cap`)」预留，装不下就拒/排队
-    // ⇒ 在跑的 turn 不会被新人挤占，也不需要公平性旋钮去补贴它。
+    // 「本请求上下文 + 本请求 max_tokens」预留（先被 `max_new_cap` 与窗口夹过），
+    // 装不下就拒/排队 ⇒ 在跑的 turn 不会被新人挤占，也不需要公平性旋钮去补贴它。
+    // （2026-11-17 裁决 A：不再预留整档 `max_new_cap` —— 近窗 prompt 会被挤出准入。）
     /// **准入满员姿态**（`[runtime] admission_on_full`；2026-11-05 从 env 收编）：
     /// `"reject"`（缺省）/ `"queue"`（最多等 30s）/ `"queue:<ms>"`。
     /// 坏值 = boot 拒启（`validate` 与引擎构造都走同一解析）。
@@ -1801,6 +1815,11 @@ pub struct ProbesCfg {
     pub debug: bool,
     pub trace_gate: bool,
     pub dflash_probe: bool,
+    /// **草稿逐位追踪**（2026-11-17）：只打印**已经在关键路径上读回**的
+    /// draft/accept 账（`exec/draft.rs` 收割面 + `exec/spec.rs` 接受账），
+    /// **不新增 dtoh/sync** ⇒ TP2 档可用（`dflash_probe` 的 prefill 读探针仍禁）。
+    #[serde(default)]
+    pub draft_trace: bool,
     pub raw_completion: bool,
     /// 渲染后 prompt 落盘(/tmp/owl-prompt-*.txt;诊断面 —— 原
     /// OWL_PROMPT_DUMP env,2026-10-15 随 env 退出配置链收编)
@@ -3197,13 +3216,13 @@ impl OwlConfig {
                     .to_string(),
             );
         }
-        // **生成预算自洽**（2026-11-16 用户裁决：预留 = 上下文 + max_new_cap）。
-        // `max_new_cap = 0` ⇒ 任何请求都算不出预留（一进来就被拒）——
+        // **生成预算自洽**（2026-11-17 裁决 A：预留 = 上下文 + 请求 max_tokens）。
+        // `max_new_cap = 0` ⇒ 请求的输出上限定死为 0（生成被关死）——
         // 那是配置错误，不是"关掉生成"的开关。
         if self.runtime.max_new_cap == 0 {
             return Err(
-                "[runtime] max_new_cap = 0 —— 准入预算是「上下文 + 本档最大输出长度」；\
-                 上限为 0 等于所有请求都无法准入（要短生成就把请求的 max_tokens 调小）"
+                "[runtime] max_new_cap = 0 —— 请求的生成上限被夹到 0（模型只吐空回复）；\
+                 要短生成请把请求的 max_tokens 调小，不要把档上限设为 0"
                     .to_string(),
             );
         }
@@ -3492,8 +3511,7 @@ mod tests {
             .expect("缺省 cap=0(不启用 per-session 上限)");
     }
 
-    /// **`max_new_cap = 0` 拒启**（2026-11-16：准入预算 = 上下文 + 该值，
-    /// 0 等于所有请求都算不出预留）。
+    /// **`max_new_cap = 0` 拒启**（2026-11-17 A：请求上限被夹到 0 = 空回复）。
     #[test]
     fn validate_rejects_zero_max_new_cap() {
         let e = OwlConfig::from_toml_str("[runtime]\nmax_new_cap = 0\n")
@@ -3740,6 +3758,13 @@ mod tp_ar_tests {
         assert_eq!(c.parallel.tp_ar, TpArMode::Ar2);
         assert!(c.parallel.tp_ar.uses_fused() && c.parallel.tp_ar.uses_ar2());
         assert!(!TpArMode::V1.uses_fused() && !TpArMode::Fused.uses_ar2());
+        let c = OwlConfig::from_toml_str(
+            "[parallel]\nmode = \"tensor\"\ndevice = [\"41:00.0\", \"42:00.0\"]\ntp_ar = \"ar2push\"\n",
+        )
+        .expect("TP2 + ar2push 合法");
+        assert_eq!(c.parallel.tp_ar, TpArMode::Ar2Push);
+        assert!(c.parallel.tp_ar.uses_ar2() && c.parallel.tp_ar.uses_ar2_push());
+        assert!(!TpArMode::Ar2.uses_ar2_push() && !TpArMode::V1.uses_ar2_push());
     }
 
     /// 旧四布尔(含已退役的 push / one_stage)必须**响亮拒**,不留第二套接口。

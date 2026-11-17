@@ -264,8 +264,9 @@ pub struct EngineKnobs {
     // 自己知道：有人在 decode + 有人欠 prefill）。
     /// **本档配置的最大输出长度**（`[runtime] max_new_cap`；2026-11-16 用户裁决）。
     ///
-    /// 准入预算 = 本请求上下文 + 这个值（被上下文窗口夹到 `max_seq − prompt`）
-    /// —— 一轮在 submit 时就把它预留住，在跑的 turn 不会被新人挤占。
+    /// 准入预算 = 本请求上下文 + **本次请求的 max_tokens**（先被本 cap 与
+    /// 上下文窗口夹过）—— 一轮在 submit 时就把它预留住，在跑的 turn 不会被
+    /// 新人挤占。2026-11-17 裁决 A：cap 只夹单请求上限，不再整体预留。
     pub max_new_cap: usize,
     // **腾挪/压力 8 个字段已删**（2026-11-16 用户裁决）：策略在
     // `owl_store::PressurePolicy`（零旋钮），引擎不再需要把它们从配置搬进来。
@@ -2325,6 +2326,14 @@ async fn boot_env_and_spec<D: DeviceClient + 'static>(
         hidden: rm.spec.hidden,
         dtype: rm.spec.dtype,
     };
+    owl_shared::log_info!(
+        "tp-shape",
+        "rank dims: hq={hq} hkv={hkv} hd={hd} nk={nk} hk={hk} nv={nv} hv={hv} hidden={} inter={} vocab={} (rank/world={})",
+        rm.spec.hidden,
+        rm.spec.inter,
+        rm.spec.vocab,
+        tp.map(|t| format!("{}/{}", t.plan.rank(), t.plan.world())).unwrap_or_else(|| "1/1".into())
+    );
 
     // 解释器执行环境(EnvProvider;E1.5 抽象):旋钮携带(入口经
     // from_config 填充)+ 硬件档自 iface 合入(被动律:引擎 = 环境事实来源)

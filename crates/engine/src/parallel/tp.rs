@@ -93,6 +93,8 @@ pub struct TpOpts {
     /// 复用 v1 的 produced/consumed 相对游标 + 双槽,但去掉尾部 rendezvous、
     /// wait_done/blocks_done 与全线程 system fence。peer 只读别名即可。
     pub ar2: bool,
+    /// **AR-2 push 变体**（2026-11-17）：写对端槽、读本端槽；与 `ar2` 同协议。
+    pub ar2_push: bool,
     /// **卡间通信通道**(2026-11-04):`P2p` = VMM peer alias(现役);
     /// `Host` = pinned host-mapped 中转(无 P2P 驱动兜底)。由入口显式传入。
     pub comm: TpCommMode,
@@ -112,6 +114,8 @@ pub struct TpStaging {
     ar_fused: bool,
     /// **barrier-only AR-2**(与 `TpOpts::ar2` 同值;2026-10-23)
     ar2: bool,
+    /// **AR-2 push**(与 `TpOpts::ar2_push` 同值;2026-11-17)
+    ar2_push: bool,
     /// **host-mapped 通道**(与 `TpOpts::comm` 同值;2026-11-04)
     host_mode: bool,
     /// host staging 的 host 视图(base;0 = P2P)。header 初始化/诊断直读用。
@@ -167,6 +171,7 @@ impl TpStaging {
             ar_f8: self.ar_f8,
             ar_fused: self.ar_fused,
             ar2: self.ar2,
+            ar2_push: self.ar2_push,
             host_own: self.host_own,
             host_quant: self.host_quant.clone(),
             host_dummy: self.host_dummy.clone(),
@@ -1131,6 +1136,7 @@ async fn handshake_staging(
                 ar_f8: opts.ar_f8,
                 ar_fused: false,
                 ar2: false,
+                ar2_push: false,
                 host_mode: true,
                 host_own: h0,
                 host_peer: h1,
@@ -1144,6 +1150,7 @@ async fn handshake_staging(
                 ar_f8: opts.ar_f8,
                 ar_fused: false,
                 ar2: false,
+                ar2_push: false,
                 host_mode: true,
                 host_own: h1,
                 host_peer: h0,
@@ -1171,13 +1178,26 @@ async fn handshake_staging(
             return Err(ModelError::Msg(format!("TP staging 分配失败(rank1):{e}")));
         }
     };
-    // staging 别名**恒只读导入**(v1 数据腿:stage 写本端槽 → reduce 读对端槽)。
-    // push(写对端)与 1-stage 对称 arena 两个实验档已在 2026-10-27 配置面剪枝中退役
-    // (3090 对读写对称 / 对称 arena 实测中性,详见 `roadmap.local/26-10-27-配置面-review.md`)。
-    let p0 = match face0
-        .peer_import(cred1, bytes, uuid1.to_string(), "tp.peer.r0")
-        .await
-    {
+    // staging 别名缺省**只读导入**(v1 数据腿:stage 写本端槽 → reduce 读对端槽)。
+    // `ar2_push` 需要本端写对端槽 ⇒ 导入侧 `PROT_READWRITE`(§36.6 的 push 前置)。
+    // 历史:push / 1-stage 对称 arena 在 2026-10-27 配置面退役(3090 对实测中性);
+    // 本档只作为 2026-11-17 的复测开关,不改变缺省。
+    if opts.ar2_push {
+        owl_shared::log_warn!(
+            "tp",
+            "AR-2 push: peer alias 以 PROT_READWRITE 导入(写对端槽);3090 对实测中性,3080 对勿开"
+        );
+    }
+    let p0 = if opts.ar2_push {
+        face0
+            .peer_import_rw(cred1, bytes, uuid1.to_string(), "tp.peer.r0")
+            .await
+    } else {
+        face0
+            .peer_import(cred1, bytes, uuid1.to_string(), "tp.peer.r0")
+            .await
+    };
+    let p0 = match p0 {
         Ok(v) => v,
         Err(e) => {
             if let Err(er) = face0.peer_release(vec![own0.id]).await {
@@ -1191,10 +1211,16 @@ async fn handshake_staging(
             )));
         }
     };
-    let p1 = match face1
-        .peer_import(cred0, bytes, uuid0.to_string(), "tp.peer.r1")
-        .await
-    {
+    let p1 = if opts.ar2_push {
+        face1
+            .peer_import_rw(cred0, bytes, uuid0.to_string(), "tp.peer.r1")
+            .await
+    } else {
+        face1
+            .peer_import(cred0, bytes, uuid0.to_string(), "tp.peer.r1")
+            .await
+    };
+    let p1 = match p1 {
         Ok(v) => v,
         Err(e) => {
             if let Err(er) = face0.peer_release(vec![p0.id, own0.id]).await {
@@ -1215,6 +1241,7 @@ async fn handshake_staging(
             ar_f8: opts.ar_f8,
             ar_fused: opts.ar_fused,
             ar2: opts.ar2,
+            ar2_push: opts.ar2_push,
             host_mode: false,
             host_own: 0,
             host_peer: 0,
@@ -1228,6 +1255,7 @@ async fn handshake_staging(
             ar_f8: opts.ar_f8,
             ar_fused: opts.ar_fused,
             ar2: opts.ar2,
+            ar2_push: opts.ar2_push,
             host_mode: false,
             host_own: 0,
             host_peer: 0,

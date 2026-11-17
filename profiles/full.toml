@@ -85,11 +85,13 @@ max_batch = 1
 # 至多插一片 prefill(`sched_policy::SLICE_EVERY`,出处:该档实测 max_gap
 # ≈0.9s;不做时间片会把 decode 冻结 3.8s)。片长 = 正常一步
 # (`prefill_chunk` ∩ 剩余)。无配置键:操作员既算不出也不该算这个节奏。
-# **准入预算**(2026-11-16 用户裁决):一轮的预留 = 本请求上下文 +
-# `max_new_cap`(被 `max_seq` 窗口夹住)。装不下 ⇒ 拒/排队,**不切在跑者的
-# 份额** ⇒ 旧的"给新人留头寸/在位者最小生成/队列上限"三旋钮已删。
-# ⚠️ `max_new_cap` 必须显著小于池(自动池 = `max_seq`),否则每轮都预留到
-# 窗口边缘,并发会退化成 1;`max_new_cap ≥ max_seq` 等于一请求都进不来。
+# **准入预算**(2026-11-17 裁决 A):一轮的预留 = 本请求上下文 +
+# **本请求的 max_tokens**(先被 `max_new_cap` 与 `max_seq` 窗口夹住)。
+# 装不下 ⇒ 拒/排队,**不切在跑者的份额** ⇒ 旧的"给新人留头寸/在位者最小
+# 生成/队列上限"三旋钮已删。
+# （2026-11-16 旧口径预留整档 cap；实测会把 "prompt+请求值明明装得下" 的
+#  近窗请求挤出准入，2026-11-17 改为请求值口径。）
+# `max_new_cap` 只夹单请求上限，不再决定并发/近窗准入。
 # **腾挪/压力策略不在配置里**（2026-11-16 用户裁决）：水位（主池/宿主低 12%→
 # 高 25%）、单次腾挪上限、空转要不要整理 —— 全是 `owl_store::PressurePolicy`
 # 的内部定值。理由：水位是**池几何的函数**（池多大由 store 分配，操作员算不出），
@@ -437,6 +439,9 @@ gdn_dump = false
 debug = false
 trace_gate = false
 dflash_probe = false
+# 草稿逐位追踪（只打已在关键路径读回的 draft/accept 账；TP2 可用；
+# 与 dflash_probe 的 prefill 读探针分开，避免 TP v1 拒启）
+draft_trace = false
 raw_completion = false
 prompt_dump = false
 live_diag = false

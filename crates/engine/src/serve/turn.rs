@@ -420,6 +420,9 @@ pub(crate) struct ActiveTurn {
     pub(crate) cached_start: usize,
     /// 首 token 的墙钟毫秒(`now_ms()`;`None` = 还没产出 token)。
     pub(crate) first_token_ms: Option<u64>,
+    /// **首 token 期限**（起跑时按新增 token 估；见 `crate::ttft_gate`）。
+    /// 到点仍无 `first_token_ms` ⇒ 泵循环强停该 turn（与客户端 cancel 同路径）。
+    pub(crate) ttft_budget_ms: u64,
     pub(crate) out: Vec<u32>,
     /// KV/prompt 推进指针(turn 起点由内容树命中面/历史决定 = 增量 prefill)
     pub(crate) fed: usize,
@@ -564,7 +567,41 @@ pub(crate) struct TurnLedger {
     pub(crate) reject_stats: std::collections::BTreeMap<(u64, String), u64>,
 }
 
+/// 一个到期的首 token 门（服务面日志 / 强停用）。
+pub(crate) struct TtftExpired {
+    pub(crate) turn: u64,
+    pub(crate) waited_ms: u64,
+    pub(crate) budget_ms: u64,
+    pub(crate) new_tokens: usize,
+    pub(crate) prompt_tokens: usize,
+    pub(crate) cached_tokens: usize,
+}
+
 impl TurnLedger {
+    /// **首 token 超期清单**：`first_token_ms == None` 且实等 > 预算。
+    ///
+    /// 这是纯查询（不碰设备/账）：调用方（泵循环）负责日志 + `cancel_turn`。
+    pub(crate) fn ttft_expired(&self, now_ms: u64) -> Vec<TtftExpired> {
+        self.active
+            .iter()
+            .filter(|a| a.first_token_ms.is_none())
+            .filter_map(|a| {
+                let waited_ms = now_ms.saturating_sub(a.started_ms);
+                if waited_ms <= a.ttft_budget_ms {
+                    return None;
+                }
+                Some(TtftExpired {
+                    turn: a.id,
+                    waited_ms,
+                    budget_ms: a.ttft_budget_ms,
+                    new_tokens: crate::ttft_gate::new_tokens(a.prompt_ids.len(), a.cached_start),
+                    prompt_tokens: a.prompt_ids.len(),
+                    cached_tokens: a.cached_start,
+                })
+            })
+            .collect()
+    }
+
     /// **活跃 turn**(显式 `Result`;2026-10-17 用户裁决:引擎内部不变量失守
     /// **不许 panic** —— 一路上抛到泵循环,由它打印 + 丢 turn + 优雅关停)。
     ///

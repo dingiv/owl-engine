@@ -52,25 +52,24 @@ quant = "w4a8"
 # 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
 admission_on_full = "reject"
 max_seq = 262144
-# **并发上限 2**(2026-11-03 用户裁决:TP2 档默认开双并发;
-# 2026-11-15 升为真批 AR)。
-# 语义边界:
-# - ✅ 两路请求可以**同时被受理**(各有 turn id / sink / 在 `/debug/queue` 可见),
-#   同会话仍由会话闸串行;跨会话进入 `turns.active`。
-# - ✅ **设备拍真批**:TP2 两 rank 各跑一份 batch 图(图内含 AR),T=2 行
-#   一次前向;`max_batch=2` 与 `gdn_slots=2` 对齐。
-# - ⚠️ 批路当前只覆盖 **bare decode**;DFlash2 的 spec verify 批化是下一刀
-#   (多活跃时 spec 轮的草稿 KV 已按会话隔离,不再互踩)。要现在拿真批吞吐:
-#   `--set spec.depth=0 --set spec.lookup=false`(文本并发档)。
+# **并发上限 = 1**(2026-11-16 现场定谳:20G 卡上 2 活跃不可用)。
+# 原因:本档 spec.depth=7 ⇒ 批 decode 门恒关(`batch_ok` 要求 depth==0),
+# `max_batch=2` 拿不到真批收益,却让两路各自按整份输出预算预留 ⇒ 长 prompt
+# 一到第二路把池吃光,第一路 prefill 工作区撞 vram-guard(PoolExhausted)
+# ⇒ turn 被弃/客户端卡死。要并发吞吐(文本、spec off)显式开:
+#   --set runtime.max_batch=2 --set store.gdn.gdn_slots=2 \
+#   --set spec.depth=0 --set spec.lookup=false
 # 并发唯一真源 = `store.gdn.gdn_slots`(2026-11-16：`runtime.max_concurrency` 已删)
-max_batch = 2
+max_batch = 1
 # 3080 TP2 冷 prefill A/B（2026-10-25，15K/25K/37K）:
 #   512  = 1486 / 1446 / 1359 t/s
-#   1024 = 1576 / 1521 / 1454 t/s
-#   2048 = 1605 / 1543 / 1477 t/s  ← 当前档
-# 只改本 TP2 档;3090 档 2026-10-27 亦提到 2048(单卡实测 +3~5%)。
+#   1024 = 1576 / 1521 / 1454 t/s  ← 当前档
+#   2048 = 1605 / 1543 / 1477 t/s（−4.5%,但 marlin 工作区 68MB/步）
+# 2026-11-16 现场:**取 1024 换工作区余量** —— 20G 卡上 2048 的 68MB 工作区
+# 叠加 3 图 scatter(≈242MB)与捕获图后,驱动 free 只剩 ~285MB,prefill 中途
+# 直接 PoolExhausted;1024 把工作区减半(193k prompt 实测 1473 t/s,可接受)。
 # 尾块合并取 0:同 full.toml 注 —— 合并会把块撑到 2560,工作区跟着变大。
-prefill_chunk = 2048
+prefill_chunk = 1024
 
 [sampling]
 # GUI agent 联调：打破 greedy 复读；客户端显式 temperature=0 仍可逐请求回落贪心。
@@ -120,28 +119,20 @@ draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 [store]
 snap_host_mb = 3072
 host_cache_mb = 10240
-# 2026-11-16:单值总预留 = 256(旧 reserve) + 320(图执行) + 138(warmup) = 714。
-# 2×112k 双会话实测通过(池 340,384 tok);图执行实测 +430MiB。
-# prefill 瞬态不再配置:代码按 `prefill_chunk` 派生(2048 ⇒ 896MiB)。
-vram_reserve_mb = 714
+# 2026-11-16 现场:**预留必须覆盖 scratch**。池按 `max_seq` 落账(margins 未计
+# 工作区/图/图像 scatter),714MiB 只够 320M 图执行 + 138M warmup + 256M 运行时,
+# 长 prompt prefill 的 marlin 工作区(68MB/步)会把驱动 free 压到 <300MB ⇒
+# vram-guard 拒发 → PoolExhausted → turn 弃置。取 2560MiB:池 = max_seq
+# (262144 tok / 4384MiB),驱动侧多留 ~1.8GiB 给 scratch。
+vram_reserve_mb = 2560
 # 图像前缀无感删除(leave-gap:删后不转 K、保留位置洞)。
 # 消息边界快照 / 删图锚点快照 = 恒开(2026-11-16 键退休);pi 每轮重发全历史,
 # delim/gap/span 走 full.toml 默认。锚点把「被删图之前」的复用面兜住。
 
 [store.gdn]
-# 生产级默认:关键特性全开(非"看着省一点"的保守档)。
-# TP2 双卡各 20G:快照 2 槽 + 宿主 3G(pi agent 无 session,
-# 前缀缓存必须开;宿主预算避免 Transient 快照顶掉 durable 边界)。
-# 27B agent prompt 实测 49k token 二次命中 99.9%(TTFT 37.9s→0.21s)。
-# **快照设备槽 3 个**(2026-11-03 随并发 2 上调;2026-10-31 前是 2)。
-# 规律:**2 并发用 6**(2026-11-06 双会话门实测:`snap_max=3` 时空闲会话的
-# 尾锚点会被另一会话的拍摄挤掉 ⇒ 下一轮复用面被迫裁到上一个快照
-# (命中 71.6% vs 期望 86%)；4 仍偶发,6 稳定。单并发 2 格仍是够的。
-# 每个活跃 turn 的 `last_snap` 各占一格(受 `snap_guard` 保护,逐不动)，
-# 再给**每个在场会话**留一格尾边界(空闲会话的锚点也必须活到下一轮)，
-# 最后留一格给"刚收口那条链的尾边界"。
-# 代价 = +1 张 × 159MB(TP2 两 rank 各 79.6MB);boot 余量 ~3.2GiB/card,够。
-snap_max = 6
+# 单活跃档:1 条活跃链 + 1 条刚收口的尾边界,4 格足够(6 格多占 160MB)。
+# 槽位规律仍见 `profiles/README.md`(2 并发才需要 6)。
+snap_max = 4
 # **快照准入(2026-11-12)**:单会话最多 20 张(设备+宿主+盘都算;
 # Transient 不计)。结构档(Dense/Binary)预留 4 格 ⇒ Extra 最多 16 张;
 # 超限时只替换更冷/更低档的条目,满手 Dense 时 Extra 直接跳过拍摄
@@ -150,9 +141,9 @@ snap_max = 6
 # 「冷会话先 + SnapClass 档位」淘汰 —— 本键只防单会话无限积累。
 snap_session_cap = 20
 snap_structural_reserve = 4
-# GDN 状态格 = 每活跃 turn 一格 = **并发唯一真源**(服务面 permit 也用它),
-# 否则拒启(`parts/pool/fp8.toml` 里是 1 ⇒ 本档显式覆盖成 2)。
-gdn_slots = 2
+# GDN 状态格 = 同时推进的 turn 上限 = **并发唯一真源**(服务面 permit 也用它);
+# 本档单活跃 ⇒ 1(与 `max_batch=1` 对齐)。
+gdn_slots = 1
 [vision]
 # 图像前缀无感删除(leave-gap)。
 image_evict = true

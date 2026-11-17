@@ -44,6 +44,7 @@ mod mem; // 内存/存储三层:StatePool / Store 钩子 / 磁盘执行面
 mod parallel; // 并行域:TP2 双 rank 装配
 mod perf; // 诊断/取证:dump 路径唯一构造点
 mod sched; // 调度域(S0 决策半):词汇 / 政策 / 选择层 / 保洁账
+mod ttft_gate; // 首 token 门:按新增 token 预估期限,超时强停 prefill
 mod serve; // 请求面:Session → Turn → Step + 消息边界
 mod spec; // 投机解码运行域(轮内执行在 exec/)
 mod vision; // 视觉:VLM 请求态 / 塔输出缓存 / 图像段前缀删除

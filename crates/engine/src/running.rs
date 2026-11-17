@@ -98,6 +98,8 @@ pub struct StepProbes {
     pub trace_gate: bool,
     /// E3 收编(原热路径散落 var_os;boot 解析一次):DFlash2 诊断/回退族
     pub dflash_probe: bool,
+    /// 草稿逐位追踪（只打已在关键路径读回的 draft/accept 账；TP2 可用）
+    pub draft_trace: bool,
     /// 渲染后 prompt 落盘诊断(原 OWL_PROMPT_DUMP;2026-10-15 收编)
     pub prompt_dump: bool,
     /// KV 页差分落点(原 OWL_KV_DUMP,同上收编)
@@ -123,6 +125,7 @@ impl StepProbes {
             probe_every: cfg.spec.probe_every,
             trace_gate: p.trace_gate,
             dflash_probe: p.dflash_probe,
+            draft_trace: p.draft_trace,
             prompt_dump: p.prompt_dump,
             // ⚠️ `0` = 关(与 full.toml 的文档口径一致):`Option` 会把 toml 的
             // `kv_dump_at = 0` 解析成 **Some(0)** —— 那意味着"每个请求 pos 0
@@ -1787,28 +1790,32 @@ impl<D: DeviceClient> RunningEngine<D> {
                 m.counter_add("snap.reclassify.miss", reclass_miss as u64, file!(), line!());
             });
         }
-        // **生成预算 = 上下文 + 本档最大输出长度**（2026-11-16 用户裁决）。
+        // **生成预算 = 上下文 + 本请求的输出上限**（2026-11-17 裁决 A）。
         //
-        // 预算是**预留口径**：submit 时就按"这轮最多会长到多少"占住池，
-        // 在跑的 turn 因此不会被新人挤占（准入装不下就拒/排队，不切在跑者的
-        // 份额）。上界同时被**上下文窗口**夹住：`max_seq − prompt`
-        // —— 否则 32k 档里一个 26k prompt 永远"预留 32K 输出"而无法准入。
+        // 预留口径 = 这轮**实际可能生成的长度**：`max_new`（请求值，先被
+        // `max_new_cap` 与上下文窗口 `max_seq − prompt` 夹过）。
         //
-        // `max_new`（实际生成长度）仍 = 请求值，≤ 预留（请求要多少给多少）。
-        let reserve_new = self
+        // 为什么不再预留整档 cap（2026-11-16 旧口径）：客户端只要 13k 时，
+        // 多留到 32k 的那 19k 永远不可能被本 turn 兑现；而 `prompt + cap`
+        // 在近窗时正好 = 整窗 ⇒ 触发 `reserve_pages` 安全边 ⇒ 235k/241k
+        // 这类 "prompt + 请求值明明装得下" 的请求被永久 `no_memory`。
+        // 在跑 turn 仍按自己的 `max_new` 全额预留，新人挤不动它。
+        let window_left = self
             .boot
             .cfg
-            .knobs
-            .max_new_cap
-            .min(self.boot.cfg.max_seq_tokens.saturating_sub(prompt_ids.len()));
-        if reserve_new == 0 {
+            .max_seq_tokens
+            .saturating_sub(prompt_ids.len());
+        if window_left == 0 {
             return Err(SubmitError::Engine(ModelError::Msg(format!(
                 "submit: prompt {} 已占满上下文窗口（max_seq {}）—— 连 1 token 的输出预算都没有",
                 prompt_ids.len(),
                 self.boot.cfg.max_seq_tokens
             ))));
         }
-        let max_new = max_new.min(reserve_new);
+        let max_new = max_new
+            .min(self.boot.cfg.knobs.max_new_cap)
+            .min(window_left);
+        let reserve_new = max_new;
         let id = self.turns.alloc_id();
         self.turns.queue.push_back(Turn {
             id,
@@ -2004,6 +2011,14 @@ impl<D: DeviceClient> RunningEngine<D> {
 
     pub fn active_len(&self) -> usize {
         self.turns.active.len()
+    }
+
+    /// **首 token 超期清单**（服务面泵循环每拍调用；纯 host 账，零设备）。
+    ///
+    /// 预算在起跑时按新增 token 定（`crate::ttft_gate`）；到点仍无首 token
+    /// ⇒ 调用方打日志并 `cancel_turn_reason(..., "TTFT 超时")`。
+    pub(crate) fn ttft_expired(&self, now_ms: u64) -> Vec<crate::turn::TtftExpired> {
+        self.turns.ttft_expired(now_ms)
     }
 
     /// 提交时**前缀命中量**(usage `cached_tokens` 真源;AGT-12):

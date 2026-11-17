@@ -120,6 +120,10 @@ pub async fn run<D: DeviceClient>(
             if let Some(t) = dropped.take() {
                 cancel_turn(running, &mut sinks, 0, Some(t)).await;
             }
+            // ③b **首 token 门**（2026-11-16）：起跑时按新增 token 定的预算到期
+            // 仍无 `first_token_ms` ⇒ 响亮强停。防一个卡死的 prefill 拖住整泵
+            // （客户端只会看到 HTTP 超时，而引擎日志能归因到 turn/token 数）。
+            ttft_gate(running, &mut sinks).await;
             // AGT-12：turn 已定相 ⇒ 补发真值 `cached_tokens`
             if let Some(t) = running.active_turn_id() {
                 if !cache_reported.contains(&t) {
@@ -267,6 +271,35 @@ async fn abandon_turn<D: DeviceClient>(
                 "executor",
                 "弃置 turn {failed_turn} 的 sink 已不在（请求方已断开）"
             );
+        }
+    }
+}
+
+/// **首 token 门**：逐拍检查预算到期的活跃 turn，强停并投递终态。
+///
+/// 与客户端 cancel 同一条清理路径（发布已写入前缀 + 中断补拍快照），
+/// 终态文案归因为 `TTFT 超时`（服务面把它翻成 5xx/断流，前端能立刻重试）。
+async fn ttft_gate<D: DeviceClient>(
+    running: &mut RunningEngine<D>,
+    sinks: &mut HashMap<u64, mpsc::Sender<StreamEvent>>,
+) {
+    for e in running.ttft_expired(crate::running::now_ms()) {
+        owl_shared::log_warn!(
+            "ttft",
+            "turn {} 首 token 超时: 起跑后 {}ms > 预算 {}ms（prompt={} cached={} new={} tok）⇒ 强制停止",
+            e.turn,
+            e.waited_ms,
+            e.budget_ms,
+            e.prompt_tokens,
+            e.cached_tokens,
+            e.new_tokens
+        );
+        let Some(ev) = running.cancel_turn_reason(e.turn, "TTFT 超时").await else {
+            continue;
+        };
+        let tid = event_turn(&ev).unwrap_or(e.turn);
+        if let Some(sink) = sinks.remove(&tid) {
+            let _ = deliver(&sink, StreamEvent::Turn(ev)).await;
         }
     }
 }

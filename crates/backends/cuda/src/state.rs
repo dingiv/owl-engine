@@ -115,6 +115,12 @@ impl DiagOpts {
                 .store
                 .vram_reserve_mb
                 .saturating_sub(owl_shared::config::POOL_GRAPH_WARMUP_RESERVE_MB)
+                // **prefill 瞬态是 reserve 的一部分，guard 必须允许它花掉**
+                // （2026-11-16 图像 prefill 自旋立案）：池吃满后 free 正好
+                // = reserve，若不扣瞬态，marlin/图像 merge 工作区永远被拒。
+                .saturating_sub(owl_shared::config::memory::prefill_transient_mb(
+                    cfg.runtime.prefill_chunk,
+                ))
                 .max(1),
             d2h_prof: c.d2h_prof,
             gpu_prof: c.gpu_prof,

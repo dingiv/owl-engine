@@ -127,6 +127,9 @@ pub struct TpCtx {
     /// ★ **barrier-only AR-2**(2026-10-23):小包 graph 专用;与 fused 同线格式,
     /// 复用 v1 produced/consumed 相对游标,单 block 去掉尾部 rendezvous。
     pub ar2: bool,
+    /// ★ **AR-2 push**（2026-11-17）：`true` ⇒ 本端写**对端**槽、读**本端**槽
+    /// （P2P store）；`false` ⇒ 原 pull（写本端、读对端）。仅 `ar2` 在场时生效。
+    pub ar2_push: bool,
     /// ★ **host-mapped staging 的 host 视图**(2026-11-04;0 = P2P 通道)。
     /// 只给装配期自证/诊断直读 header 用,不参与热路径计算。
     pub host_own: u64,

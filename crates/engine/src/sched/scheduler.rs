@@ -835,6 +835,20 @@ impl<D: DeviceClient> RunningEngine<D> {
             .max()
             .unwrap_or(-1)
             .saturating_add(1);
+        // **首 token 门**：起跑时按「新增 token」定预算并留一条可归因日志
+        // （2026-11-16 用户裁决；见 `crate::ttft_gate`）。
+        let ttft_prompt_tokens = turn.prompt_ids.len();
+        let ttft_new_tokens = crate::ttft_gate::new_tokens(ttft_prompt_tokens, cached_len);
+        let ttft_budget_ms = crate::ttft_gate::budget_ms(ttft_prompt_tokens, cached_len);
+        owl_shared::log_info!(
+            "ttft",
+            "turn {} 起跑: prompt={} cached={} new={} ⇒ 首 token 预算 {}ms",
+            turn.id,
+            ttft_prompt_tokens,
+            cached_len,
+            ttft_new_tokens,
+            ttft_budget_ms
+        );
         self.turns.active.push(crate::turn::ActiveTurn {
             id: turn.id,
             session_id: turn.session_id,
@@ -861,6 +875,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             trim_text_to: None,
             seed: opts.seed,
             first_token_ms: None,
+            ttft_budget_ms,
             out: Vec::new(),
             fed: cached_len,
             cached_start: cached_len,

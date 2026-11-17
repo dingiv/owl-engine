@@ -152,8 +152,8 @@ pub(crate) fn kv_per_tok_bytes(
 /// 线性项 = `chunk × 11/32 MiB`(实测 ≈0.344 MiB/tok);192MiB 覆盖图执行
 /// 尾差、分配器/碎片。改 chunk 自动跟随,不需要每档手配。
 pub(crate) fn prefill_transient_mb(chunk_tokens: usize) -> u64 {
-    let linear = (chunk_tokens as u64 * 11).div_ceil(32);
-    linear + 192
+    // 单一产地 = shared（cuda 的 vram-guard 也读同一算式）。
+    owl_shared::config::memory::prefill_transient_mb(chunk_tokens)
 }
 
 /// 池装配计划(engine run 从 knobs/spec_mode 派生;显式依赖律的
@@ -2413,7 +2413,21 @@ pub(crate) fn auto_pool_tokens(
         return Ok((cap_tokens.saturating_sub(transient_tok).max(1), true));
     }
     if sessions == 1 {
-        return Ok((seq_tokens.min(cap_tokens), false));
+        // **单会话同样要留瞬态**（2026-11-16）：以前直接返回 seq，池把
+        // cap 里属于 prefill 工作区的那一段也吃了 ⇒ 运行期 free 卡在
+        // reserve 上、工作区被拒发。现在与多会话同式：usable = cap − transient。
+        let usable = cap_tokens.saturating_sub(transient_tok);
+        if seq_tokens > usable {
+            if !overcommit {
+                return Err(format!(
+                    "[store] 自动池装不下单请求:max_seq={} > cap−瞬态={} (cap={} / 瞬态 {} MiB = {} tok)。\
+                     修法:降 max_seq、降 prefill_chunk、或开 [kvmem] 超卖。",
+                    seq_tokens, usable, cap_tokens, transient_mb, transient_tok
+                ));
+            }
+            return Ok((usable.max(1), true));
+        }
+        return Ok((seq_tokens, false));
     }
     let usable = cap_tokens.saturating_sub(transient_tok);
     let target = seq_tokens.saturating_mul(sessions);

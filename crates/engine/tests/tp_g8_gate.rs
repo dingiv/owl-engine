@@ -273,6 +273,7 @@ async fn body(ref_dev: usize, oa: usize, ob: usize, dir: PathBuf) {
             ar_f8,
             ar_fused,
             ar2,
+            ar2_push: false,
             comm: tp_comm(),
         },
     )
@@ -542,6 +543,7 @@ async fn body_probe(oa: usize, ob: usize, dir: PathBuf, prompt: String, tag: Str
         ar_f8: flag("OWL_TP_AR_F8"),
         ar_fused: flag("OWL_TP_AR_FUSED"),
         ar2: flag("OWL_TP_AR2"),
+        ar2_push: flag("OWL_TP_AR2_PUSH"),
         comm: tp_comm(),
     };
     let tp = TpEngine::assemble_with(vec![e0, e1], vec![l0, l1], opts)

@@ -693,7 +693,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // mcnt("spec.pos.last", ...) 在 metrics 段(pos+m+1 gauge)
         // 对齐探针(E5-DF3 AL=0 排查):drafts vs 目标验证行逐位对照 ——
         // 附近命中(drafts[i]==ids[i±1]) = 位移对齐 bug;全散 = 分布质量
-        if self.boot.probes.dflash_probe {
+        if self.boot.probes.dflash_probe || self.boot.probes.draft_trace {
             let hits: Vec<String> = (0..depth)
                 .map(|i| {
                     let near = if i > 0 && drafts[i] == ids[i - 1] {
@@ -961,7 +961,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             let fp = pos + m + 1;
             let bonus = toks[m];
             let d = self.dflash_propose(bonus, fp, lookup.as_ref()).await?;
-            if self.boot.probes.dflash_probe && self.dev.spec_rt.stats.rounds < 3 {
+            if (self.boot.probes.dflash_probe || self.boot.probes.draft_trace)
+                && self.dev.spec_rt.stats.rounds < 3
+            {
                 let toks_txt = self.boot.tok.decode(&d);
                 owl_shared::log_debug!("dflash-probe", "pos={fp} bonus={bonus} drafts={d:?} txt={toks_txt:?}");
             }

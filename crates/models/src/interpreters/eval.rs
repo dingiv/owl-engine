@@ -1333,14 +1333,19 @@ where
                         owl_shared::metrics::with_metrics_store(|s| {
                             s.counter_add("tp.ar.ar2", 1, file!(), line!())
                         });
-                        // AR-2 固定 v1 数据腿(写本端、读对端):协议用
-                        // produced/consumed 游标。
+                        // AR-2 数据腿：缺省 pull（写本端、读对端）；
+                        // `ar2_push` = 写对端、读本端（P2P store，两卡同时向对方发）。
+                        let (data_w, data_r) = if tp.ar2_push {
+                            (tp.peer.clone(), tp.own.clone())
+                        } else {
+                            (tp.own.clone(), tp.peer.clone())
+                        };
                         let call = owl_kernels::client::comm::ArFusedCall::new(
                             out.clone(),
                             tp.own.clone(),
                             tp.peer.clone(),
-                            tp.own.clone(),
-                            tp.peer.clone(),
+                            data_w,
+                            data_r,
                             n_bytes as u64,
                             tp.slot_bytes,
                             0,
@@ -1578,6 +1583,7 @@ mod tp_injection_tests {
             ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
             ar_fused: false, // 测试档:两核路(融合档由配置开)
             ar2: false, // 测试档:不走 barrier-only
+            ar2_push: false, // 测试档:pull
             host_own: 0, // 测试档:P2P
             host_quant: None,
             host_dummy: None,
@@ -1619,6 +1625,7 @@ mod tp_injection_tests {
             ar_f8: false, // 测试档:载荷走 f16(装配期由配置填)
             ar_fused: false, // 测试档:两核路(融合档由配置开)
             ar2: false, // 测试档:不走 barrier-only
+            ar2_push: false, // 测试档:pull
             host_own: 0, // 测试档:P2P
             host_quant: None,
             host_dummy: None,

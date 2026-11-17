@@ -461,6 +461,16 @@ pub fn dflash2_draft_sharded(
         );
     }
     let spec = shard_draft_spec(spec, tp)?;
+    let (hq, hkv, hd) = spec.full_heads;
+    owl_shared::log_info!(
+        "tp-shape",
+        "draft shard: rank={}/{} hq={hq} hkv={hkv} hd={hd} hidden={} inter={} layers={}",
+        tp.rank(),
+        tp.world(),
+        spec.hidden,
+        spec.inter,
+        spec.layer_types.len()
+    );
     let kind = crate::formats::kind::detect(dir)?.kind;
     let is_q = matches!(kind, CheckpointKind::PackQuantized | CheckpointKind::AwqGemm);
     let plan = if is_q { crate::module::QuantPlan::W4A16 } else { crate::module::QuantPlan::F16 };

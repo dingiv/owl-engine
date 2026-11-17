@@ -116,6 +116,18 @@ impl MemoryEstimate {
 ///
 /// 数值来自 2026-10-20 单 3090 Ti / 27B 实测(chunk 512 档峰 0.4–0.6G,
 /// chunk 1024 档 0.8–1.2G,无桶 2048 块 ~1.6G);取各档上界。
+/// **prefill 瞬态预算**（代码派生；chunk 2048 ⇒ 896MiB，1024 ⇒ 544MiB）。
+///
+/// 线性项 = `chunk × 11/32 MiB`（实测 ≈0.344 MiB/tok）；192MiB 覆盖图执行
+/// 尾差、分配器/碎片。**两个消费者同一产地**：池容量求解（engine）与运行时
+/// vram-guard 的"可用余量"（cuda）。2026-11-16 前 guard 不扣它 ⇒ 池吃满后
+/// 驱动 free 正好卡在 reserve 上，prefill 工作区（marlin/图像 merge）被拒发、
+/// 进而挂死（图像 prefill 自旋立案）。
+pub fn prefill_transient_mb(chunk_tokens: usize) -> u64 {
+    let linear = (chunk_tokens as u64 * 11).div_ceil(32);
+    linear + 192
+}
+
 pub fn activation_for(chunk: usize, tail_merge: usize) -> (u64, &'static str) {
     // ① 上界超过桶阶梯顶 ⇒ 该块没有桶图,走 eager(1.6–1.8G);
     // ② 否则按**最大块**分档(512+512 仍按 512 档 —— 尾块合并只在末块发生,

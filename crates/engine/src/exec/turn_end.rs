@@ -84,6 +84,11 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     /// - **排队中**:只出队 + 准入账收口 + 丢弃该 turn 的残留事件(不碰设备);
     /// - 不在账:`None`(调用方如实处理 —— 竞态下 turn 可能刚自然终了)。
     pub async fn cancel_turn(&mut self, turn: u64) -> Option<TurnEvent> {
+        self.cancel_turn_reason(turn, "客户端取消").await
+    }
+
+    /// 同 [`Self::cancel_turn`]，但终态文案可归因（首 token 门 = "TTFT 超时"）。
+    pub async fn cancel_turn_reason(&mut self, turn: u64, reason: &str) -> Option<TurnEvent> {
         // 残留事件先清(否则服务面会在 Failed 之后还收到该 turn 的 Token 帧)
         self.turns.pending_events.retain(|e| match e {
             TurnEvent::Prefill { turn: t, .. }
@@ -109,7 +114,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             self.close_admission(turn);
             return Some(TurnEvent::Failed {
                 turn,
-                err: "客户端取消(活跃 turn)".into(),
+                err: format!("{reason}(活跃 turn)").into(),
             });
         }
         if let Some(pos) = self.turns.queue.iter().position(|t| t.id == turn) {
@@ -120,7 +125,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 self.drop_queued_turn(&t);
                 return Some(TurnEvent::Failed {
                     turn,
-                    err: "客户端取消(排队中)".into(),
+                    err: format!("{reason}(排队中)").into(),
                 });
             }
         }

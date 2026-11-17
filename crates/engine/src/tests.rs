@@ -449,14 +449,14 @@ async fn pressure_evicts_cold_sessions_whole() {
     assert_eq!(running.bank.parts().rel.slots_free(), total, "目标 = 全自由");
 }
 
-/// **准入预算 = 上下文 + 本档最大输出长度**（2026-11-16 用户裁决）。
+/// **准入预留 = 上下文 + 本请求的 max_tokens**（2026-11-17 裁决 A）。
 ///
-/// - 短 ctx ⇒ 预留 = `max_new_cap`；
-/// - 长 ctx ⇒ 被上下文窗口夹到 `max_seq − prompt`（再留就不是"能用到的"）；
-/// - 请求的 `max_tokens` 只决定**实际**生成上限（≤ 预留），不改预留。
+/// - 预留 = 请求值（先被 `max_new_cap` 与 `max_seq − prompt` 夹过）；
+/// - 近窗 prompt（`prompt + cap > max_seq`）仍能按请求值预留（旧 cap 口径会拒）；
+/// - 在跑者不被新人挤占（另见 `budget_is_ctx_plus_max_output_and_not_squeezable`）。
 #[cfg(test)]
 #[tokio::test]
-async fn submit_reserves_ctx_plus_max_output_cap() {
+async fn submit_reserves_request_max_new() {
     let mut knobs = EngineKnobs {
         sampler_enabled: false,
         raw_completion: true,
@@ -471,17 +471,17 @@ async fn submit_reserves_ctx_plus_max_output_cap() {
     knobs.snap_max = 1;
     let mut running = mock_engine_with(knobs).await;
 
-    // 短 prompt：预留 = 上限 64（与请求的 8 无关）
+    // 短 prompt：预留 = 请求值 8（不再预留整档 cap 64）
     let (_s1, _t1) = running
         .submit_session_opts(None, "short", 8, Default::default())
         .expect("submit 短");
     {
         let t = running.turns.queue.back().expect("排队项");
-        assert_eq!(t.reserve_new, 64, "短 ctx 的预留 = max_new_cap");
-        assert_eq!(t.spec.max_new, 8, "实际生成上限仍是请求值");
+        assert_eq!(t.reserve_new, 8, "预留 = 请求 max_tokens");
+        assert_eq!(t.spec.max_new, 8, "实际生成上限 = 请求值");
     }
 
-    // 长 prompt（~200 tok / 256 窗口）：预留被窗口夹到 max_seq − prompt
+    // 长 prompt（~200 tok / 256 窗口）：近窗时预留仍是请求值（旧口径会预留到窗口余量）
     let mut long = String::new();
     while running.boot.tok.encode(&long).len() < 200 {
         long.push_str("word ");
@@ -492,13 +492,20 @@ async fn submit_reserves_ctx_plus_max_output_cap() {
     {
         let t = running.turns.queue.back().expect("排队项");
         let n = t.prompt_ids.len();
-        assert_eq!(
-            t.reserve_new,
-            256 - n,
-            "长 ctx 的预留 = 上下文窗口余量（prompt {n}）"
-        );
-        assert!(t.reserve_new > 0);
+        assert_eq!(t.reserve_new, 8, "近窗 prompt 也按请求值预留（prompt {n}）");
         assert_eq!(t.spec.max_new, 8);
+    }
+
+    // 请求值在窗口内但小于 cap ⇒ 预留仍是请求值（cap 不参与预留）
+    let mut mid = long.clone();
+    mid.push_str("tail ");
+    let (_s3, _t3) = running
+        .submit_session_opts(None, mid, 40, Default::default())
+        .expect("submit 窗口内请求");
+    {
+        let t = running.turns.queue.back().expect("排队项");
+        assert_eq!(t.reserve_new, 40, "cap=64 不参与预留");
+        assert_eq!(t.spec.max_new, 40);
     }
 }
 

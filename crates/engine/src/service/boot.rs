@@ -92,6 +92,7 @@ pub async fn assemble(
         ar_f8: spec.tp_ar_f8,
         ar_fused: spec.tp_ar.uses_fused(),
         ar2: spec.tp_ar.uses_ar2(),
+        ar2_push: spec.tp_ar.uses_ar2_push(),
         comm: spec.tp_comm,
     };
     owl_shared::log_info!("boot", "装载臂 = {}", arm.name());
