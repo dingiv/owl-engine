@@ -385,7 +385,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         Some(step)
     }
 
-    /// **本轮该拍的页边界**(纯函数;`[store.gdn] snap_decode_stride`;§9.1(6)a)。
+    /// **本轮该拍的页边界**(纯函数;`engine::DECODE_SNAP_STRIDE`;§9.1(6)a)。
     ///
     /// 语义 = 本轮提交 `(pos, fed_new]` 跨过的**最大**页边界 `b`,且该边界
     /// 页号是 `stride` 的整数倍(spec 轮提交 ≤ depth+1 ≤ 8 行 < 页 32 ⇒
@@ -639,7 +639,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 ),
                 &turn.msg_snaps,
                 &turn.evict_snaps,
-                self.boot.cfg.knobs.snap_msg_min_span,
+                crate::engine::SNAP_MSG_MIN_SPAN,
             )
             .unwrap_or(1)
         } else {
@@ -2425,7 +2425,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 ),
                 &act.msg_snaps,
                 &act.evict_snaps,
-                self.boot.cfg.knobs.snap_msg_min_span,
+                crate::engine::SNAP_MSG_MIN_SPAN,
             )
             .unwrap_or_else(|| remaining.max(1));
             // 片长 = 上面算出的**正常一步**（片长不再有第二处读取：相位只决定

@@ -77,7 +77,9 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
 11. **三分工**(裁决⑪):engine = 决策/调用 · **本 crate = 实现**(换什么/搬到哪层/账怎么走/
     宿主缓冲/策略出序)· server = 执行(地址/DMA/一次 ack)。
 12. **载体三层**:`Carrier{Device(SlotId) | Host(HostId) | Disk(FileOff)}` —— 身份与载体**正交**,
-    换层只换 `Carrier` + 台账挪一行;`Disk` 位现留、实现归 S6。
+    换层只换 `Carrier` + 台账挪一行。`Disk` 已接线（S6：`attach_disk` / `adopt_disk_*` /
+    spill / fill）；盘上-only 的 `slot=None` 不等于 Host，报告/候选必须走 `Rel::carrier_of`
+    或 `BlockLeg` 的宿主内容过滤。
 13. **批面为搬运唯一规范**:单件 = `n = 1` 的糖(实现共享一条路径)。批的 N 有上限并切块。
 14. **段边界独占**：搬运口只接受"段边界"的调用形状;调用点不得持会话借用(先收集工作单,
     再独占执行)—— 与律⑦(自由函数)配套。捕获窗内 server 对 Swap 类命令**响亮拒**。

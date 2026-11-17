@@ -1488,7 +1488,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
     ) -> Result<Vec<u32>> {
         use owl_models::layers::dflash2::TOP_K;
         let rows = self.dev.spec_rt.depth;
-        // **走格策略**（`[spec] dflash_walk`;AL 消融量具）：conditional = 设备核原律
+        // **走格策略**（`[probes] dflash_walk`;AL 消融量具）：conditional = 设备核原律
         // （零回归）；其余两臂 = 收割面 host 用同一张分数表重走格，需要图的
         // `mcand` 槽（合并后的 值‖id 两半）。
         let walk = self.dev.spec_rt.dflash_walk;
@@ -1807,7 +1807,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             if !self.dev.spec_rt.walk_warned {
                 owl_shared::log_warn!(
                     "spec",
-                    "[spec] dflash_walk 消融臂自检失败：host 条件走格 ≠ 设备 sel 槽\
+                    "[probes] dflash_walk 消融臂自检失败：host 条件走格 ≠ 设备 sel 槽\
                      （分数表/候选域不同源）⇒ 本臂 AL 不可归因，先查 select 图 mcand 槽"
                 );
                 self.dev.spec_rt.walk_warned = true;

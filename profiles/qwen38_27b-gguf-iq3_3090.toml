@@ -67,8 +67,6 @@ snap_host_mb = 0
 snap_max = 1
 # 消息边界快照 = 恒开(2026-11-16 键退休)
 snap_msg_delim = ""
-snap_msg_min_gap = 2048
-snap_msg_min_span = 0
 [vision]
 enabled = true
 path = "../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"

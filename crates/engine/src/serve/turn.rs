@@ -340,8 +340,8 @@ pub(crate) struct Turn {
     pub(crate) msg_snap_keys: Vec<Option<owl_store::SnapKey>>,
     /// **可删图前的硬快照点**（token offset；2026-11-13）。
     ///
-    /// 与 `msg_snaps` 分开：锚点必须**无条件切块**（不受 `snap_msg_min_span`
-    /// 节流），否则删除发生时拿不到“图前前缀”的 GDN 态。
+    /// 与 `msg_snaps` 分开：锚点必须**无条件切块**（不受引擎最小步长
+    /// `SNAP_MSG_MIN_SPAN` 节流），否则删除发生时拿不到“图前前缀”的 GDN 态。
     pub(crate) evict_snaps: Vec<usize>,
     /// 本轮 prompt 的图像段(含 pad;本轮坐标)—— 收口写回会话账
     pub(crate) img_spans: Vec<crate::img_evict::ImgSpan>,

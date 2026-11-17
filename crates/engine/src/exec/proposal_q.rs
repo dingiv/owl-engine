@@ -39,7 +39,7 @@ pub(crate) struct DraftQ {
     /// 被截断丢掉的质量（逐轮累加；0 = 请求没截断草稿支撑）
     dropped: f32,
     /// **每步实际使用的那一行原始分数**（`[K,16]`；已乘 α，未过采样变换）。
-    /// 只为标定测量（`[spec] q_dump`）保留——生产路径不读。
+    /// 只为标定测量（`[probes] q_dump`）保留——生产路径不读。
     raw: Vec<f32>,
 }
 
@@ -56,16 +56,16 @@ pub(crate) struct QInput<'a> {
     pub depth: usize,
     /// `[depth, 16]` 逐位置边际（选择器 top-k 值半区；`walk = Unary` 时必需）。
     pub unary: Option<&'a [f32]>,
-    /// 走格读哪一行（`[spec] dflash_walk`）。
+    /// 走格读哪一行（`[probes] dflash_walk`）。
     pub walk: owl_shared::config::DflashWalk,
     pub cfg: &'a crate::sampler::SamplerCfg,
     pub seed: u64,
     pub base_pos: usize,
-    /// **草稿 q 的 logit 缩放**（`[spec] q_alpha`;1.0 = 原律）。
+    /// **草稿 q 的 logit 缩放**（引擎常数 `DRAFT_Q_ALPHA`;1.0 = 原律）。
     /// 选择器边分不是校准 logits ⇒ 默认 softmax 近乎 one-hot ⇒ 拒绝采样的
     /// 每步接受概率退化为 `p(argmax)`。乘 α 把 q 摊开（α→0 = 候选集上均匀）。
     pub alpha: f32,
-    /// **候选集上的均匀地板**（`[spec] q_floor`;0 = 不加）。
+    /// **候选集上的均匀地板**（引擎常数 `DRAFT_Q_FLOOR`;0 = 不加）。
     pub floor: f32,
 }
 
@@ -154,7 +154,7 @@ pub(crate) fn walk_greedy(
     Ok(out)
 }
 
-/// 收割面重走格：候选**下标** → token id（`[spec] dflash_walk` 非 conditional 时用）。
+/// 收割面重走格：候选**下标** → token id（`[probes] dflash_walk` 非 conditional 时用）。
 pub(crate) fn walk_tokens(
     scores: &[f32],
     unary: &[f32],
