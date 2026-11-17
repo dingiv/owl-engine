@@ -176,14 +176,14 @@ pub(crate) struct SpecRuntime {
     pub lookup_agree: usize,
     /// DFlash2 选择器 walk 策略（AL 消融量具；缺省 conditional）
     pub dflash_walk: owl_shared::config::DflashWalk,
-    /// **草稿 q 的 logit 缩放**（`[spec] q_alpha`;1.0 = 原律）。
+    /// **草稿 q 的 logit 缩放**（引擎常数 `DRAFT_Q_ALPHA`;1.0 = 原律）。
     /// 选择器边分过自信 ⇒ 乘 α 把 q 摊开,让拒绝采样拿到 `Σ min(p,q) > p(argmax)`。
     pub q_alpha: f32,
-    /// **草稿 q 的均匀地板**（`[spec] q_floor`;0 = 不加）。
+    /// **草稿 q 的均匀地板**（引擎常数 `DRAFT_Q_FLOOR`;0 = 不加）。
     pub q_floor: f32,
-    /// **是否启用 host 侧草稿 q**（`[spec] q_host`;缺省 false）。
+    /// **是否启用 host 侧草稿 q**（引擎常数 `DRAFT_Q_HOST`;固定 true）。
     pub q_host: bool,
-    /// **[标定] q dump 路径**（`[spec] q_dump`;空 = 关）。
+    /// **[标定] q dump 路径**（`[probes] q_dump`;空 = 关）。
     pub q_dump: String,
     /// spec 接受账(M2b 恒等门覆盖断言:三路 m 分布 + 账目闭合)
     pub stats: SpecStats,
@@ -311,17 +311,17 @@ pub(crate) struct SpecBootInput<'a> {
     pub(crate) lookup_nmax: usize,
     pub(crate) lookup_nstrong: usize,
     pub(crate) lookup_agree: usize,
-    /// **DFlash2 选择器 walk 策略**（`[spec] dflash_walk`;AL 消融量具）。
+    /// **DFlash2 选择器 walk 策略**（`[probes] dflash_walk`;AL 消融量具）。
     /// `Conditional` = 设备核原律（零回归）；其余 = 收割面 host 走格
     /// （读 select 图的 `mcand` 槽）。只服务 DFlash2。
     pub(crate) dflash_walk: owl_shared::config::DflashWalk,
-    /// **草稿 q 的 logit 缩放**（`[spec] q_alpha`;1.0 = 原律）。
+    /// **草稿 q 的 logit 缩放**（引擎常数 `DRAFT_Q_ALPHA`;1.0 = 原律）。
     pub(crate) q_alpha: f32,
-    /// **草稿 q 的均匀地板**（`[spec] q_floor`;0 = 不加）。
+    /// **草稿 q 的均匀地板**（引擎常数 `DRAFT_Q_FLOOR`;0 = 不加）。
     pub(crate) q_floor: f32,
-    /// **是否启用 host 侧草稿 q**（`[spec] q_host`;缺省 false）。
+    /// **是否启用 host 侧草稿 q**（引擎常数 `DRAFT_Q_HOST`;固定 true）。
     pub(crate) q_host: bool,
-    /// **[标定] q dump 路径**（`[spec] q_dump`;空 = 关）。
+    /// **[标定] q dump 路径**（`[probes] q_dump`;空 = 关）。
     pub(crate) q_dump: String,
     /// **target 侧共享事实**(词表/层数/hidden;草稿不自带 —— 仅 GGUF 草稿
     /// 的声明校验与码本行数用)
@@ -340,9 +340,9 @@ pub(crate) struct SpecBootInput<'a> {
 
 /// **q 校准旋钮的族门**(纯函数;单测锚)。
 ///
-/// - `q_alpha`/`q_floor` 值域:α 有限且 >0;ε ∈ [0,1);
+/// - `q_alpha`/`q_floor` 值域:α 有限且 >0;ε ∈ [0,1)（值现已由引擎常数给定）；
 /// - 非默认值时只服务 DFlash2(其余模式不消费 q,写了 = 白跑 A/B);
-/// - `q_host` 缺省 **true**,所以只拦**显式关掉**(`false`)用在非 DFlash2 档;
+/// - `q_host` 固定 **true**；只拦内部误传的 `false` 用在非 DFlash2 档;
 /// - `q_dump` 非空只服务 DFlash2,且需要 `q_host = true`(否则 dump 拿不到 q,
 ///   是静默 no-op —— `dump_q_calibration` 在 `q=None` 时直接返回)。
 fn check_q_knobs(
@@ -354,33 +354,33 @@ fn check_q_knobs(
 ) -> Result<()> {
     if !(q_alpha.is_finite() && q_alpha > 0.0) {
         return Err(ModelError::Msg(format!(
-            "[spec] q_alpha={q_alpha} 非法（需有限且 > 0；1.0 = 原律）"
+            "草稿 q_alpha={q_alpha} 非法（需有限且 > 0；1.0 = 原律）"
         )));
     }
     if !(q_floor.is_finite() && (0.0..1.0).contains(&q_floor)) {
         return Err(ModelError::Msg(format!(
-            "[spec] q_floor={q_floor} 非法（需 ∈ [0,1)）"
+            "草稿 q_floor={q_floor} 非法（需 ∈ [0,1)）"
         )));
     }
     if (q_alpha != 1.0 || q_floor != 0.0) && mode != SpecMode::DFlash2 {
         return Err(ModelError::Msg(format!(
-            "[spec] q_alpha/q_floor 只服务 DFlash2，但当前模式 = {mode:?}"
+            "草稿 q_alpha/q_floor 只服务 DFlash2，但当前模式 = {mode:?}"
         )));
     }
     if !q_host && mode != SpecMode::DFlash2 {
         return Err(ModelError::Msg(format!(
-            "[spec] q_host = false 只服务 DFlash2（当前模式 = {mode:?}；缺省 true 不消费,但显式关掉 = 配置说谎）"
+            "草稿 q_host = false 只服务 DFlash2（当前模式 = {mode:?}；引擎常数固定 true）"
         )));
     }
     if !q_dump.is_empty() {
         if mode != SpecMode::DFlash2 {
             return Err(ModelError::Msg(format!(
-                "[spec] q_dump = {q_dump:?} 只服务 DFlash2，但当前模式 = {mode:?}"
+                "[probes] q_dump = {q_dump:?} 只服务 DFlash2，但当前模式 = {mode:?}"
             )));
         }
         if !q_host {
             return Err(ModelError::Msg(
-                "[spec] q_dump 需要 q_host = true（q_host 关时没有 q 可 dump）".into(),
+                "[probes] q_dump 需要 q_host = true（q_host 关时没有 q 可 dump）".into(),
             ));
         }
     }
@@ -555,7 +555,7 @@ pub(crate) async fn load_spec_runtime<D: DeviceClient + 'static>(
     if !inp.dflash_walk.is_conditional() {
         if mode != SpecMode::DFlash2 {
             return Err(ModelError::Msg(format!(
-                "[spec] dflash_walk={:?} 只服务 DFlash2，但当前模式 = {:?}（depth={}, draft={:?}）",
+                "[probes] dflash_walk={:?} 只服务 DFlash2，但当前模式 = {:?}（depth={}, draft={:?}）",
                 inp.dflash_walk, mode, depth, inp.family
             )));
         }

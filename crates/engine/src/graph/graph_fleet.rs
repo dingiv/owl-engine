@@ -1795,7 +1795,7 @@ impl<D: DeviceClient> GraphFleet<D> {
                         shape: vec![rows * (k * k + 1)],
                         dtype: Dtype::F32,
                     },
-                    // 合并后的 值‖id 两半（全表域）：`[spec] dflash_walk` 消融臂
+                    // 合并后的 值‖id 两半（全表域）：`[probes] dflash_walk` 消融臂
                     // 的 host 重走格读面（conditional 臂不读，零回归）。
                     OutputSlot {
                         name: "mcand".into(),

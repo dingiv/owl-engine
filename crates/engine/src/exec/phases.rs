@@ -570,7 +570,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 ),
                 msg_snaps.as_slice(),
                 evict_snaps.as_slice(),
-                self.boot.cfg.knobs.snap_msg_min_span,
+                crate::engine::SNAP_MSG_MIN_SPAN,
             )
             .map(|n| new_fed + n)
             .unwrap_or(new_fed);
@@ -674,7 +674,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 ),
                 msg_snaps.as_slice(),
                 evict_snaps.as_slice(),
-                self.boot.cfg.knobs.snap_msg_min_span,
+                crate::engine::SNAP_MSG_MIN_SPAN,
             )
             .map(|n| new_fed + n)
             .unwrap_or(new_fed);

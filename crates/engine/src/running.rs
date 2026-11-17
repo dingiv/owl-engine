@@ -1469,7 +1469,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 &prompt_ids,
                 &self.boot.msg_open_ids,
                 self.dev.pool.geom.page,
-                self.boot.cfg.knobs.snap_msg_min_gap,
+                crate::engine::SNAP_MSG_MIN_GAP,
                 self.boot.cfg.knobs.snap_msg_recent,
             )
         } else {
@@ -3099,7 +3099,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 ),
                 &act.msg_snaps,
                 &act.evict_snaps,
-                self.boot.cfg.knobs.snap_msg_min_span,
+                crate::engine::SNAP_MSG_MIN_SPAN,
             ) {
                 Some(chunk) => act.fed + chunk,
                 None => self.generation_target(act.fed), // 生成相位(act.fed = pos)

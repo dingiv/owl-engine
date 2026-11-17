@@ -53,6 +53,43 @@ type Result<T> = std::result::Result<T, ModelError>;
 /// 那是引擎自己的账。等工作区预算可查询后改成自算（roadmap 3.4）。
 pub const PREFILL_TAIL_MERGE: usize = 0;
 
+/// **生成相位页边界快照的页步长**（1 = 每个页边界一拍）。
+///
+/// 2026-11-17：`[store.gdn] snap_decode_stride` 键退休。它是拍摄节流，
+/// 不是容量；唯一消费者是前缀复用（`prefix_cache && snap_max > 0`），
+/// 没有按档调节的真实需求。保留常数是为了让 `decode_boundary_in` 的
+/// 节流语义仍有单一产地。
+pub const DECODE_SNAP_STRIDE: usize = 1;
+
+/// **消息边界快照的稀疏间距**（token）。
+///
+/// 2026-11-17：`[store.gdn] snap_msg_min_gap` 键退休。全档实测都是 2048，
+/// 且它只控制“同一段消息里别拍太密”，属于引擎策略。
+pub const SNAP_MSG_MIN_GAP: usize = 2048;
+
+/// **消息边界切块最小步长**（token；0 = 不设下限）。
+///
+/// 2026-11-17：`[store.gdn] snap_msg_min_span` 键退休。全档实测 0，
+/// 推荐值本来就是“不设下限”；设正数会让贴近 chunk 起点的 system 前缀
+/// 被跳过，反而丢复用面。
+pub const SNAP_MSG_MIN_SPAN: usize = 0;
+
+/// **DFlash2 草稿 q 的 logit 缩放**（1.0 = 原律）。
+///
+/// 2026-11-17：`[spec] q_alpha` 键退休。真机 A/B 已定谳：把 q 摊平只会掉 AL，
+/// 生产值就是 1.0；内部仍保留参数供 `DraftQ`/单测使用。
+pub const DRAFT_Q_ALPHA: f32 = 1.0;
+
+/// **DFlash2 草稿 q 的均匀地板**（0.0 = 不加）。
+///
+/// 2026-11-17：`[spec] q_floor` 键退休；与 [`DRAFT_Q_ALPHA`] 同批定谳。
+pub const DRAFT_Q_FLOOR: f32 = 0.0;
+
+/// **是否启用 host 侧草稿 q**（true = 真机 A/B 高 ~8% AL）。
+///
+/// 2026-11-17：`[spec] q_host` 键退休；生产固定 true。
+pub const DRAFT_Q_HOST: bool = true;
+
 /// boot 旋钮(显式依赖律,2026-10-10:环境变量是隐式依赖,引擎内部
 /// **零 env 读取** —— env 派生数据由入口(server config)/ 测试用例经
 /// 本结构显式传入;[`EngineKnobs::from_config`] 是唯一的入口侧构造器,
@@ -273,10 +310,8 @@ pub struct EngineKnobs {
     /// **末段页对齐已恒开**（2026-11-16 用户裁决：删键，默认开）：块边界
     /// 快照只在页对齐处拍；单块档不切一刀就一个快照都没有 ⇒ 下一轮全量重算。
     // **`prefill_align_tail` 字段已删**（原 `[store] prefill_align_tail`）。
-    /// **生成相位页边界快照页步长**(§9.1(6)a;`[store.gdn] snap_decode_stride`,缺省 1)。
-    /// spec 轮提交跨过页边界 ⇒ 用 fold 把 GDN 态回卷到边界拍一张再卷回;
-    /// 本键节流(`边界页号 % stride == 0` 才拍)。0 = 关(旧行为:生成相位不拍)。
-    pub snap_decode_stride: usize,
+    // **`snap_decode_stride` 字段已删**（2026-11-17）：拍摄节流收为
+    // [`DECODE_SNAP_STRIDE`]，不再走配置。
     /// **prefill-only FP8→F16 影子**(`[kernel] prefill_shadow`;2026-10-31 复辟)。
     /// 装配期由 `kernel_cfg::apply` → 族 `configure` 投递给核侧。
     pub prefill_shadow: bool,
@@ -311,16 +346,12 @@ pub struct EngineKnobs {
     /// 门 = **消费者存在**（`image_evict && prefix_cache && snap_max>0`）。
     /// 消息开启标记文本覆盖(空 = 模型 `ChatFormat.im_open`)
     pub snap_msg_delim: String,
-    /// 后续消息边界稀疏间隔(token)
-    pub snap_msg_min_gap: usize,
-    /// 最近 K 条消息边界无条件保留（dense tail；`[store].snap_msg_recent`）
+    /// 最近 K 条消息边界无条件保留（dense tail；`[store.gdn].snap_msg_recent`）
     pub snap_msg_recent: usize,
-    /// **每会话快照上限**（`[store].snap_session_cap`；0 = 不限 = 旧行为）
+    /// **每会话快照上限**（`[store.gdn].snap_session_cap`；0 = 不限）
     pub snap_session_cap: usize,
-    /// **结构档保留位**（`[store].snap_structural_reserve`；仅 cap > 0 生效）
+    /// **结构档保留位**（`[store.gdn].snap_structural_reserve`；仅 cap > 0 生效）
     pub snap_structural_reserve: usize,
-    /// 消息边界切块最小步长(token)
-    pub snap_msg_min_span: usize,
     /// **显存治理占比**(`[store].vram_budget`;缺省 0.97;0 = 治理禁用)
     pub vram_budget: f64,
     /// **单值总预留 MiB**(缺省 714;含图执行/warmup/碎片)。
@@ -395,7 +426,6 @@ impl Default for EngineKnobs {
             dense_floor: owl_store::TurnFloor::Strict,
             no_graph: false,
             max_new_cap: 8192,
-            snap_decode_stride: 1,
             prefill_shadow: false,
             fi_cuda_graph: false,
             fi_plan_bake: None,
@@ -405,11 +435,9 @@ impl Default for EngineKnobs {
             max_batch: 1,
             snap_max: 4,
             snap_msg_delim: String::new(),
-            snap_msg_min_gap: 2048,
             snap_msg_recent: 4,
             snap_session_cap: 0,
             snap_structural_reserve: 4,
-            snap_msg_min_span: 0,
             vram_budget: 0.97,
             vram_reserve_mb: 714,
             raw_completion: false,
@@ -586,7 +614,7 @@ impl EngineKnobs {
             self.disk_dir,
             self.prefix_cache as u8,
             1, // prefill 末段页对齐（恒开；2026-11-16 键退休）
-            self.snap_decode_stride,
+            DECODE_SNAP_STRIDE,
             if self.kvmem_virtualization { "ON" } else { "off" },
             self.index_probe as u8,
             self.index_gpu as u8,
@@ -675,11 +703,11 @@ impl EngineKnobs {
                 depth_switch_ctx: cfg.spec.depth_switch_ctx,
                 adaptive_min_tpr: cfg.spec.adaptive_min_tpr,
                 lookup: cfg.spec.lookup,
-                dflash_walk: cfg.spec.dflash_walk,
-                q_alpha: cfg.spec.q_alpha,
-                q_floor: cfg.spec.q_floor,
-                q_host: cfg.spec.q_host,
-                q_dump: cfg.spec.q_dump.clone(),
+                dflash_walk: cfg.probes.dflash_walk,
+                q_alpha: DRAFT_Q_ALPHA,
+                q_floor: DRAFT_Q_FLOOR,
+                q_host: DRAFT_Q_HOST,
+                q_dump: cfg.probes.q_dump.clone(),
                 lookup_nmin: cfg.spec.lookup_nmin,
                 lookup_nmax: cfg.spec.lookup_nmax,
                 lookup_nstrong: cfg.spec.lookup_nstrong,
@@ -765,15 +793,12 @@ impl EngineKnobs {
             // 用户裁决 2026-10-19:引擎行为参数只许配置文件显式声明)
             max_batch: cfg.runtime.max_batch,
             max_new_cap: cfg.runtime.max_new_cap,
-            snap_decode_stride: cfg.store.gdn.snap_decode_stride,
             // 快照池容量 = 配置单源（F-03；不再读 `OWL_SNAP_MAX`）
             snap_max: cfg.store.gdn.snap_max,
             snap_msg_delim: cfg.store.gdn.snap_msg_delim.clone(),
-            snap_msg_min_gap: cfg.store.gdn.snap_msg_min_gap,
             snap_msg_recent: cfg.store.gdn.snap_msg_recent,
             snap_session_cap: cfg.store.gdn.snap_session_cap,
             snap_structural_reserve: cfg.store.gdn.snap_structural_reserve,
-            snap_msg_min_span: cfg.store.gdn.snap_msg_min_span,
             vram_budget: cfg.store.vram_budget,
             vram_reserve_mb: cfg.store.vram_reserve_mb,
             raw_completion: cfg.probes.raw_completion,
@@ -821,15 +846,15 @@ pub struct DraftCfg {
     pub adaptive_min_tpr: f32,
     /// DFlash2 lookup-augmented drafting（LABD；仅 DFlash2）
     pub lookup: bool,
-    /// DFlash2 选择器 walk 策略（AL 消融量具；缺省 conditional = 核内原律）
+    /// DFlash2 选择器 walk 策略（`[probes] dflash_walk`；AL 消融量具）
     pub dflash_walk: owl_shared::config::DflashWalk,
-    /// 草稿 q 的 logit 缩放（AL 校准；1.0 = 原律）
+    /// 草稿 q 的 logit 缩放（引擎常数 [`DRAFT_Q_ALPHA`]）
     pub q_alpha: f32,
-    /// 草稿 q 的均匀地板（AL 校准；0 = 不加）
+    /// 草稿 q 的均匀地板（引擎常数 [`DRAFT_Q_FLOOR`]）
     pub q_floor: f32,
-    /// 是否启用 host 侧草稿 q（缺省 true：真机 A/B 高 ~8% AL）
+    /// 是否启用 host 侧草稿 q（引擎常数 [`DRAFT_Q_HOST`]）
     pub q_host: bool,
-    /// 草稿 q 标定 dump 路径（空 = 关）
+    /// 草稿 q 标定 dump 路径（`[probes] q_dump`；空 = 关）
     pub q_dump: String,
     pub lookup_nmin: usize,
     pub lookup_nmax: usize,
@@ -862,9 +887,9 @@ impl Default for DraftCfg {
             adaptive_min_tpr: 3.0,
             lookup: false,
             dflash_walk: owl_shared::config::DflashWalk::Conditional,
-            q_alpha: 1.0,
-            q_floor: 0.0,
-            q_host: true,
+            q_alpha: DRAFT_Q_ALPHA,
+            q_floor: DRAFT_Q_FLOOR,
+            q_host: DRAFT_Q_HOST,
             q_dump: String::new(),
             lookup_nmin: 6,
             lookup_nmax: 12,
@@ -1777,9 +1802,9 @@ pub(crate) fn into_running<D: DeviceClient>(
                     "消息边界快照:开 · delim={delim:?} → {} token {:?} · min_gap={} · recent={} · min_span={}",
                     ids.len(),
                     ids,
-                    cfg.knobs.snap_msg_min_gap,
+                    SNAP_MSG_MIN_GAP,
                     cfg.knobs.snap_msg_recent,
-                    cfg.knobs.snap_msg_min_span
+                    SNAP_MSG_MIN_SPAN
                 );
             }
             ids

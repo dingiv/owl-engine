@@ -75,9 +75,8 @@ snap_host_mb = 0
 # snap1 + reserve256:给 2048 块的瞬态激活留余量(见 max_seq 注)
 snap_max = 1
 # agent 消息边界快照 = 恒开(2026-11-16 键退休;delim 空 = 模型 ChatFormat.im_open)
+# 消息边界间距/最小步长 = 引擎常数（2026-11-17 退休）。
 snap_msg_delim = ""
-snap_msg_min_gap = 2048
-snap_msg_min_span = 0
 [vision]
 enabled = true
 path = "../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"

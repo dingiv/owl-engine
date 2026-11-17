@@ -75,14 +75,14 @@
 //! | vision | image_evict_pad | str / "。"(图像段页对齐 pad 词;必须恰 1 token;空 = 自动) |
 //! | vision | max_pixels / path | usize 0 / Option None(图像预处理像素封顶 / 视觉塔权重路径) |
 //! | ~~store~~ | *(prefill_align_tail / snap_msg_boundary / snap_evict_anchor 2026-11-16 退役：删键**默认开**，门由消费者/几何导出)* |
-//! | store.gdn | snap_decode_stride | usize / 1(生成相位页边界快照页步长;0 = 关) |
+//! | ~~store.gdn~~ | *(snap_decode_stride / snap_msg_min_gap / snap_msg_min_span 2026-11-17 退役：节流/间距/最小步长是引擎策略，见 `engine::DECODE_SNAP_STRIDE` / `engine::SNAP_MSG_MIN_GAP` / `engine::SNAP_MSG_MIN_SPAN`)* |
 //! | store | host_cache_mb / snap_host_mb | usize / 0、0(**宿主两层分片**;0 = 关层) |
 //! | store | disk_cache_mb / snap_disk_mb | usize / 0、0(**磁盘两层分片**;0 = 关层) |
 //! | store | disk_dir | String / ""(磁盘内容目录;**重启扫目录回填账**;空 = 关层) |
 //! | spec | depth / draft / dumb | usize 0(off)、SpecDraft auto/mtp/dflash2、flag |
 //! | store.kv | draft_kv_dtype | DraftKvDtype `bf16\|fp8` / bf16（2026-11-16 由 `[spec]` 迁入） |
-//! | spec | dflash_walk | DflashWalk 枚举("conditional"|"fixed_pred"|"unary")/ conditional(**AL 消融旋钮**;缺省 = 设备核原律) |
-//! | spec | q_alpha / q_floor | f32 / 1.0、0.0(**草稿 q 校准旋钮**;α = logit 缩放,ε = 候选集上的均匀地板) |
+//! | ~~spec~~ | *(dflash_walk 2026-11-17 迁 `[probes] dflash_walk`：AL 消融量具，不是生产配置)* |
+//! | ~~spec~~ | *(q_alpha / q_floor / q_host 2026-11-17 退役：q 默认值已定谳，收成引擎常数；标定 dump 迁 `[probes] q_dump`)* |
 //! | spec | mtp_window / mtp_sink | usize / 0、64(MTP 草稿读视图;0 = full) |
 //! | spec | mtp_window_min_ctx | usize / 0(短 ctx 不压缩的门槛) |
 //! | spec | adaptive_depth / depth_min / depth_switch_ctx / adaptive_min_tpr | flag / false、3、49152、3.0(MTP 两档图族 + T1b 门) |
@@ -113,6 +113,8 @@
 //! | probes | step_gate / step_gate_ms / step_gate_us / step_gate_every | StepMode("off"\|"sticky"\|"single") / 50 / 0(覆盖 ms) / 1 |
 //! | log | level / tags_allow / tags_deny / file / max_mb / keep / timestamp | 见模块 |
 //! | probes | trace_gate / dflash_probe / raw_completion / prompt_dump / live_diag | flag / false |
+//! | probes | dflash_walk | DflashWalk 枚举("conditional"|"fixed_pred"|"unary")/ conditional(AL 消融量具；只服务 DFlash2) |
+//! | probes | q_dump | String / ""(草稿 q 标定 JSONL 路径；空 = 关) |
 //! | probes | prefill_bisect | flag / false(层间 hidden 行 checksum;诊断) |
 //! | probes | kv_dump_at | Option<usize> / None(KV 页差分落点) |
 //! | cuda | srv_timing / cap_prof / launch_sync / launch_time | flag / false |
@@ -788,7 +790,8 @@ impl Default for StoreKvCfg {
 /// **GDN 状态子域**（`[store.gdn]`；2026-11-16 用户裁决：gdn 作为 store 的子域）。
 ///
 /// 这里放"每活跃 turn 一格 GDN 行"的几何（`gdn_slots`）与 **GDN 状态快照**
-/// 的全部策略键（设备槽数 / 生成相位页步长 / 消息边界点 / 每会话上限）。
+/// 的容量/边界策略（设备槽数 / 消息边界点 / 每会话上限）。拍摄节奏与
+/// 最小间距是引擎常数，不在这里暴露。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StoreGdnCfg {
@@ -797,35 +800,29 @@ pub struct StoreGdnCfg {
     /// 已随那个键一起退休 —— 现在它就是唯一真源，服务面 permit 数也用它）。
     #[serde(default = "default_gdn_slots")]
     pub gdn_slots: usize,
-    /// **生成相位页边界快照的页步长**(缺省 1 = 每页一拍;0 = 关)。
+    /// GDN 快照池**设备槽数**（池几何 = 显存预算的一部分；不是行为旋钮）。
     ///
-    /// 背景(§9.1(6)a):prefill 页对齐（恒开）只覆盖 **prefill 段**;生成相位的
-    /// 每个页边界此前**不拍快照**(spec 轮提交跨过边界 ⇒ 状态已过界)⇒ 短 prompt
-    /// 的**尾部复用面**受限于 prompt 里最后一个整页(实测 187 tok 档只复用 64)。
-    /// 现在 spec 轮内用 fold 把 GDN 态回卷到边界拍一张再卷回;本键是**节流**:
-    /// 只在 `边界页号 % stride == 0` 的边界拍(快照 27B ≈ 152 MiB/条 ⇒ 拍得越密,
-    /// 宿主下沉流量越大;1 = 每个页边界都拍)。
-    pub snap_decode_stride: usize,
-    /// GDN 快照池槽数
+    /// 每槽 = 一条 GDN 行 × 层数（27B ≈ 148.5 MiB/槽，TP2 两 rank 各半）。
+    /// 它决定设备上能同时留住多少条快照资产；容量必须由操作员按卡型给定，
+    /// 引擎无法从 `snap_host_mb` 反推（宿主/盘是下沉落点，不是设备池）。
+    /// 快照拍摄节奏（`snap_decode_stride`）已收为引擎常数，不再与容量混在一个段。
     pub snap_max: usize,
     /// 消息开启标记的**文本覆盖**（空 = 用模型的 `ChatFormat.im_open`，
     /// 如 Qwen 系 `<|im_start|>`）。引擎 boot 时把它 tokenize 成 id 序列；
     /// 扫描代码只认参数 `open_ids`，不写死任何字面量。
     pub snap_msg_delim: String,
-    /// 后续消息边界的稀疏间隔（token）。第一条边界无条件保留（通常是
-    /// system 结束），之后距上一条不足本值的边界跳过，避免 10K 多消息
-    /// 场景一次拍出几十张 27B 快照（152 MiB/张）。
-    pub snap_msg_min_gap: usize,
     /// **最近 K 条消息边界无条件保留**（dense tail；2026-11-12 分层）。
     ///
     /// Agent 前端只在消息末尾追加；最近几条消息可能回撤，且对 TTFT 最敏感。
-    /// 这几条边界即使距上一条不足 `snap_msg_min_gap` 也要拍快照（并在 L1
-    /// 会话资产里记录）——它们正是"新增一条消息 → 前面 100% 命中"的锚点。
-    /// 0 = 旧行为（仅第一条无条件 + min_gap）。
+    /// 这几条边界即使距上一条不足引擎常数 `SNAP_MSG_MIN_GAP` 也要拍快照
+    /// （并在 L1 会话资产里记录）——它们正是"新增一条消息 → 前面 100% 命中"
+    /// 的锚点。0 = 旧行为（仅第一条无条件 + 固定间距）。
     pub snap_msg_recent: usize,
-    /// **每会话快照上限**（2026-11-12；0 = 不限 = 旧行为）。
+    /// **每会话快照上限**（2026-11-12；0 = 不限）。
     ///
-    /// 只数**非 Transient** 条目（设备 + 宿主 + 盘都算）；`Transient` 是
+    /// **不是 LRU 的重复**：全局 LRU 只排序“谁先被逐”，一条活跃长会话仍可
+    /// 吃满 `snap_max` 设备槽与整条宿主腿；本键是单会话资产护栏。只数
+    /// **非 Transient** 条目（设备 + 宿主 + 盘都算）；`Transient` 是
     /// decode/spec rollback 的页边界快照，设备槽内自限、逐出零成本，不计入。
     /// 超限时按 `SnapClass` 档位选 victim：`Extra` → 老 `Binary` → 最老
     /// `Dense`；新条目档位不高于 victim 才替换，否则**跳过拍摄**（不拷贝）。
@@ -834,25 +831,20 @@ pub struct StoreGdnCfg {
     ///
     /// `Extra` 最多占 `snap_session_cap - snap_structural_reserve` 格，
     /// 剩余名额留给 `Dense`/`Binary`。不是 pin：结构档满手时 `Dense` 也按
-    /// LRU 替换，`Binary` 不会逆档挤掉 `Dense`。
+    /// LRU 替换，`Binary` 不会逆档挤掉 `Dense`。它与 cap 是同一护栏的两半，
+    /// 不能只删一个。
     pub snap_structural_reserve: usize,
-    /// 消息边界切块的**最小步长**（token）。距当前 `fed` 太近的边界不单独
-    /// 切块，避免 20-token 消息制造大量小 prefill chunk。
-    pub snap_msg_min_span: usize,
 }
 
 impl Default for StoreGdnCfg {
     fn default() -> Self {
         Self {
             gdn_slots: 8,
-            snap_decode_stride: 1,
             snap_max: 4,
             snap_msg_delim: String::new(),
-            snap_msg_min_gap: 2048,
             snap_msg_recent: 4,
             snap_session_cap: 0,
             snap_structural_reserve: 4,
-            snap_msg_min_span: 0,
         }
     }
 }
@@ -1296,7 +1288,7 @@ impl SpecDraft {
     }
 }
 
-/// **DFlash2 选择器 walk 的"读哪一行"策略**(`[spec] dflash_walk`;
+/// **DFlash2 选择器 walk 的"读哪一行"策略**(`[probes] dflash_walk`;
 /// 2026-11-03 S0 AL 消融旋钮)。
 ///
 /// 选择器的分数表是 `scores[e, prev, c] = unary[e,c] + A[pred]·proj[e]·B[cand]`,
@@ -1349,34 +1341,12 @@ pub struct SpecCfg {
     /// 草稿池按这个窗口做环形缓冲(不再按 pool_tokens 全量物化);
     /// 当前 NC 核只实例化 2048,写非 2048 = boot 拒(等核支持 4k/8k)。
     pub draft_window: usize,
-    /// **DFlash2 选择器 walk 策略**（缺省 `conditional` = 设备核原律）。
-    /// 只服务 DFlash2；MTP/Off 档写非 conditional = boot 拒（不静默忽略）。
-    pub dflash_walk: DflashWalk,
-    /// **草稿 q 的 logit 缩放**（`>0`；1.0 = 原律）。
-    ///
-    /// 选择器边分不是校准 logits（低秩码本内积 + unary）：实测 `q(top1)≈0.97`
-    /// 而目标 `p(top1)≈0.34` ⇒ q 严重过自信 ⇒ `Σ min(p,q) ≈ p(top1)`，
-    /// 拒绝采样拿不到任何好处。乘上 α 把 q 摊开（α→0 = 候选集上的均匀分布）。
-    /// q 可以是任意分布（精确性由拒绝采样保证），本旋钮只影响**接受率**。
-    pub q_alpha: f32,
-    /// **草稿 q 的均匀地板**（`[0,1)`；0 = 不加）。
-    ///
-    /// `q ← (1−ε)·q + ε·uniform(候选集)`：给平坦负载一个保底接受面，
-    /// 免得 α 把某个高熵负载的尾部削掉。与 α 正交。
-    pub q_floor: f32,
-    /// **是否启用 host 侧草稿 q**（拒绝采样路径；缺省 **true**）。
-    ///
-    /// 2026-11-03 真机 A/B（4080 单卡，12 轮 ×2 负载）：开 = 创作 AL 1.450 /
-    /// 数学 3.711；关（设备 argmax + 相等式接受）= 1.334 / 3.470 ⇒ **开高 ~8%**。
-    /// 与离线逐步口径不同的原因未定谳（离线按 `Σ min(p,q)` 算 q 更差）；
-    /// 以真机为准。注意：**对 q 做温度摊平只会更差**（同一批 dump 实测
-    /// α=0.5/0.25 的接受率单调下降）⇒ `q_alpha` 保持 1.0。
-    pub q_host: bool,
-    /// **[标定] 草稿 q 的 dump 路径**（空 = 关）。
-    ///
-    /// 每轮一行 JSONL：raw 行（已乘 α）/ 候选 id / 目标 p（top-32）。
-    /// 这是离线拟合 (α, ε) 的唯一事实源 —— 生产档保持空字符串。
-    pub q_dump: String,
+    // **`dflash_walk` 已迁 `[probes]`**（2026-11-17）：AL 消融量具不属于生产
+    // spec 配置；非 conditional 只服务 DFlash2。
+    // **q 默认值已收为引擎常数**（2026-11-17）：
+    //   q_alpha = 1.0 / q_floor = 0.0 / q_host = true。
+    // 真机 A/B 已定谳（摊平 q 只会掉 AL；host q 高 ~8%），这些不是生产旋钮。
+    // 标定 dump 路径归 `[probes] q_dump`，不再挂在 `[spec]`。
     /// **DFlash2 lookup-augmented drafting(LABD)**：在当前请求的 token 历史里
     /// 找当前后缀的最近一次出现，用其后续 token 覆盖/补齐草稿块。
     /// 只服务 DFlash2（`draft=dflash2` 或 `auto`+`draft_path`）；MTP/Off 写了 = boot 拒。
@@ -1820,7 +1790,14 @@ pub struct ProbesCfg {
     /// **不新增 dtoh/sync** ⇒ TP2 档可用（`dflash_probe` 的 prefill 读探针仍禁）。
     #[serde(default)]
     pub draft_trace: bool,
+    /// **DFlash2 选择器 walk 策略**（AL 消融量具，不是生产调参面）。
+    /// `conditional` = 设备核原律；其余值在收割面 host 重走格。只服务 DFlash2。
+    pub dflash_walk: DflashWalk,
     pub raw_completion: bool,
+    /// **[标定] 草稿 q 的 dump 路径**（空 = 关；`[probes] q_dump`）。
+    /// 每轮一行 JSONL：raw 行（已乘 α）/ 候选 id / 目标 p（top-32）。
+    /// 这是离线拟合 q 的唯一事实源，不属于生产调参面；只服务 DFlash2。
+    pub q_dump: String,
     /// 渲染后 prompt 落盘(/tmp/owl-prompt-*.txt;诊断面 —— 原
     /// OWL_PROMPT_DUMP env,2026-10-15 随 env 退出配置链收编)
     #[serde(default)]
@@ -2100,11 +2077,6 @@ impl Default for SpecCfg {
             draft_path: None,
             dumb: false,
             draft_window: 0,
-            dflash_walk: DflashWalk::Conditional,
-            q_alpha: 1.0,
-            q_floor: 0.0,
-            q_host: true,
-            q_dump: String::new(),
             lookup: false,
             lookup_nmin: 6,
             lookup_nmax: 12,
@@ -2939,20 +2911,8 @@ impl OwlConfig {
                 self.spec.depth, SPEC_DEPTH_MAX, SPEC_VERIFY_ROWS_MAX
             ));
         }
-        // **草稿 q 校准旋钮**（2026-11-03）：非法值在配置面直接拒启。
-        // α ≤ 0 会让 softmax 除零/反转语义；ε ∉ [0,1) 会让 q 不归一。
-        if !(self.spec.q_alpha.is_finite() && self.spec.q_alpha > 0.0) {
-            return Err(format!(
-                "[spec] q_alpha = {} 非法（需有限且 > 0；1.0 = 原律）",
-                self.spec.q_alpha
-            ));
-        }
-        if !(self.spec.q_floor.is_finite() && (0.0..1.0).contains(&self.spec.q_floor)) {
-            return Err(format!(
-                "[spec] q_floor = {} 非法（需 ∈ [0,1)）",
-                self.spec.q_floor
-            ));
-        }
+        // **q 校准默认值已定谳**（2026-11-17）：q_alpha/q_floor/q_host 不再是
+        // 配置键，值域由引擎常数保证；旧 `[spec] q_*` 由 deny_unknown_fields 拒启。
         // **prefill shadow 仅限 fp8 主 KV 池**(2026-10-26 用户裁决):
         // 这是 FP8→F16 的 prefill-only 影子;f16 主池没有可反量化的源,
         // 开启即无意义。默认关;显式开 + f16 池 = 配置面直接拒启,
@@ -3738,6 +3698,33 @@ mod retired_pool_keys {
         assert_eq!(c.store.gdn.snap_max, 0);
         assert!(!c.store.prefix_cache);
     }
+
+    /// **2026-11-17 第五批退役键**（`[store.gdn]`）：拍摄节流 / 消息边界间距 /
+    /// 切块最小步长。三者是引擎策略而不是容量；旧键必须 unknown-field 拒启，
+    /// 不能留成静默 no-op。容量/护栏键 `snap_max` / `snap_session_cap` /
+    /// `snap_structural_reserve` 保留。
+    #[test]
+    fn snapshot_policy_knobs_are_retired() {
+        for k in [
+            "snap_decode_stride",
+            "snap_msg_min_gap",
+            "snap_msg_min_span",
+        ] {
+            let src = format!("[store.gdn]\n{k} = 1\n");
+            let e = OwlConfig::from_toml_str(&src).expect_err("退役键必须拒启");
+            assert!(
+                e.contains("unknown field") || e.contains(k),
+                "{k} 拒语应点名键: {e}"
+            );
+        }
+        let c = OwlConfig::from_toml_str(
+            "[store.gdn]\nsnap_max = 4\nsnap_session_cap = 20\nsnap_structural_reserve = 4\n",
+        )
+        .expect("容量/护栏键仍是合法档");
+        assert_eq!(c.store.gdn.snap_max, 4);
+        assert_eq!(c.store.gdn.snap_session_cap, 20);
+        assert_eq!(c.store.gdn.snap_structural_reserve, 4);
+    }
 }
 
 #[cfg(test)]
@@ -4075,31 +4062,39 @@ mod auto_pool_tests {
     /// **walk 策略枚举**（2026-11-03 S0 量具）：三值严格，缺省 conditional。
     #[test]
     fn dflash_walk_parses_strictly() {
-        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\n").expect("缺省档");
-        assert_eq!(c.spec.dflash_walk, DflashWalk::Conditional);
-        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\ndflash_walk = \"unary\"\n")
+        let c = OwlConfig::from_toml_str("[probes]\n").expect("缺省档");
+        assert_eq!(c.probes.dflash_walk, DflashWalk::Conditional);
+        let c = OwlConfig::from_toml_str("[probes]\ndflash_walk = \"unary\"\n")
             .expect("unary 臂");
-        assert_eq!(c.spec.dflash_walk, DflashWalk::Unary);
-        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\ndflash_walk = \"fixed_pred\"\n")
+        assert_eq!(c.probes.dflash_walk, DflashWalk::Unary);
+        let c = OwlConfig::from_toml_str("[probes]\ndflash_walk = \"fixed_pred\"\n")
             .expect("fixed_pred 臂");
-        assert_eq!(c.spec.dflash_walk, DflashWalk::FixedPred);
-        let bad = OwlConfig::from_toml_str("[spec]\ndflash_walk = \"marginal\"\n")
+        assert_eq!(c.probes.dflash_walk, DflashWalk::FixedPred);
+        let bad = OwlConfig::from_toml_str("[probes]\ndflash_walk = \"marginal\"\n")
             .expect_err("未知名必拒");
         assert!(bad.contains("dflash_walk"), "{bad}");
+        assert!(
+            OwlConfig::from_toml_str("[spec]\ndepth = 7\ndflash_walk = \"unary\"\n").is_err(),
+            "旧 [spec] dflash_walk 必须拒启"
+        );
     }
 
+    /// **q 默认值不再是配置键**（2026-11-17）：旧三键必须拒启；标定 dump 归
+    /// `[probes] q_dump`，空串 = 关，非空路径原样保留。
     #[test]
-    fn q_calibration_knobs_parse_and_default() {
-        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\n").expect("缺省档");
-        assert_eq!(c.spec.q_alpha, 1.0);
-        assert_eq!(c.spec.q_floor, 0.0);
-        let c = OwlConfig::from_toml_str("[spec]\ndepth = 7\nq_alpha = 0.3\nq_floor = 0.25\n")
-            .expect("校准档");
-        assert!((c.spec.q_alpha - 0.3).abs() < 1e-6);
-        assert!((c.spec.q_floor - 0.25).abs() < 1e-6);
-        let bad = OwlConfig::from_toml_str("[spec]\ndepth = 7\nq_alpha = 0.0\n")
-            .expect_err("α=0 必须在 boot 期被拒（除零）");
-        assert!(bad.contains("q_alpha"), "{bad}");
+    fn q_defaults_are_constants_and_dump_moved_to_probes() {
+        for (k, v) in [("q_alpha", "0.3"), ("q_floor", "0.25"), ("q_host", "false")] {
+            let src = format!("[spec]\ndepth = 7\n{k} = {v}\n");
+            let e = OwlConfig::from_toml_str(&src).expect_err("旧 q 配置键必须拒启");
+            assert!(
+                e.contains("unknown field") || e.contains(k),
+                "{k} 拒语应点名键: {e}"
+            );
+        }
+        let c = OwlConfig::from_toml_str("[probes]\nq_dump = \"/tmp/q.jsonl\"\n")
+            .expect("probes.q_dump 合法");
+        assert_eq!(c.probes.q_dump, "/tmp/q.jsonl");
+        assert_eq!(OwlConfig::default().probes.q_dump, "");
     }
 
     #[test]

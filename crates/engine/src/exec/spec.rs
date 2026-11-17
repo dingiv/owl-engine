@@ -784,7 +784,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // ⑥ fold(尾部:图发射异步,restore 单命令;下一轮 verify 流序
         // 排其后,GPU ~1ms 藏于前端)
         //
-        // **轮内页边界快照**(§9.1(6)a;`[store.gdn] snap_decode_stride`):本轮提交
+        // **轮内页边界快照**(§9.1(6)a;`engine::DECODE_SNAP_STRIDE`):本轮提交
         // `(pos, pos+m]` 跨过页边界 b ⇒ 先把池态卷到 state@b 拍一张,再卷到
         // state@fed —— 这样生成相位的每个页边界都有快照(旧状:只有 prefill 段有
         // ⇒ 短 prompt 的尾部复用面受限于 prompt 里最后一个整页)。
@@ -802,7 +802,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 // `prefix_cache = false` ⇒ 缓存区份额 0 ⇒ 复用面结构上恒 0
                 // ⇒ 下面的「卷到边界 + 拍 + 卷回」三段是**纯浪费**(实测
                 // `spec.bnd.fold1` 1.17ms + `spec.snap` 0.90ms ≈ 2.1ms/边界)。
-                // 注:`snap_decode_stride = 0` 同样关(两处门同向)。
+                // 注:拍摄节流 = 引擎常数 `DECODE_SNAP_STRIDE`;关层走
+                // `snap_max = 0`（两处门同向）。
                 let snap_consumer = self.boot.cfg.knobs.prefix_cache && self.dev.pool.snap_capacity() > 0;
                 if let Some(b) = snap_consumer
                     .then(|| {
@@ -810,7 +811,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                             pos,
                             pos + m + 1,
                             self.dev.pool.geom.page,
-                            self.boot.cfg.knobs.snap_decode_stride,
+                            crate::engine::DECODE_SNAP_STRIDE,
                         )
                     })
                     .flatten()
@@ -3000,7 +3001,7 @@ mod live_depth_tests {
     }
 }
 
-/// **[标定] 草稿 q 的 dump**（`[spec] q_dump = "<path>"`；空 = 关）。
+/// **[标定] 草稿 q 的 dump**（`[probes] q_dump = "<path>"`；空 = 关）。
 ///
 /// 每轮一行 JSONL：`raw`（第 e 步实际使用的 16 个分数，已乘 α）/ `cand`（全局 id）
 /// / `p`（目标 verify 各行的 top-32 候选及其概率）。离线据此拟合 (α, ε)：
