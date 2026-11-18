@@ -145,6 +145,10 @@ pub(crate) struct ImageLeaveGap {
     pending_loads: Vec<(usize, owl_store::ChainHash)>,
     /// 旧链尾身份:等宿主回灌完成后再释放引用(不能先丢宿主内容)
     release_chains: Vec<owl_store::ChainHash>,
+    /// 旧页号 → 新页号（仅幸存页；`None` = 被删/未复用）。
+    new_page_of: Vec<Option<usize>>,
+    /// 被删/未能重挂的旧快照键：内容已不属于新链，必须整体丢弃。
+    drop_keys: Vec<owl_store::SnapKey>,
 }
 
 /// leave-gap 删除的设备/盘层收尾(不转 K)。
@@ -729,7 +733,7 @@ impl<D: DeviceClient> RunningEngine<D> {
                 } else if turn.deletion.is_some() {
                     match self.plan_image_leave_gap(&turn)? {
                         Some(p) => {
-                            let (c, r, pl, im) = self.apply_image_leave_gap(p, &turn)?;
+                            let (c, r, pl, im) = self.apply_image_leave_gap(p, &mut turn)?;
                             (c, r, pl, im, None)
                         }
                         None => {
@@ -856,10 +860,11 @@ impl<D: DeviceClient> RunningEngine<D> {
             grant: grant_id,
             // 回滚键 = 当前 turn 的第一个已知边界;capture 后会被更新。
             last_snap: restore_key,
+            last_snap_at: restore_key.map(|_| cached_len),
             started_ms,
             prompt_ids: turn.prompt_ids,
             msg_snaps: turn.msg_snaps,
-            msg_snap_classes: turn.msg_snap_classes,
+            msg_snap_roles: turn.msg_snap_roles,
             msg_snap_keys: turn.msg_snap_keys,
             evict_snaps: turn.evict_snaps,
             max_new: turn.spec.max_new,
@@ -1177,7 +1182,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
             keep -= 1;
         }
-        let Some((bi, old_key)) = boundary else {
+        let Some((bi, _old_key)) = boundary else {
             owl_shared::log_info!(
                 "img-evict",
                 "leave-gap 后缀边界无快照:session={:#x} turn={} keep={} ⇒ 不吸收",
@@ -1201,6 +1206,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut boundary_new: Option<owl_store::SnapKey> = None;
         let mut rekeyed = 0usize;
         let mut disk_ops: Vec<SnapDiskOp> = Vec::new();
+        let mut drop_keys: Vec<owl_store::SnapKey> = Vec::new();
         for i in 0..keep {
             let lo = (a_blocks + i) * page;
             let h = cur
@@ -1242,6 +1248,8 @@ impl<D: DeviceClient> RunningEngine<D> {
             };
             if ok {
                 rekeyed += 1;
+            } else if self.bank.parts().rel.state_locate(k_old).is_some() {
+                drop_keys.push(k_old);
             }
             if b_blocks + i == bi {
                 let pending_disk = disk_ops
@@ -1287,12 +1295,42 @@ impl<D: DeviceClient> RunningEngine<D> {
             }
         }
         let cached_len = (a_blocks + keep) * page;
+        let old_blocks = old.len() / page;
+        let mut new_page_of = vec![None; old_blocks];
+        for p in 0..a_blocks {
+            new_page_of[p] = Some(p);
+        }
+        for i in 0..keep {
+            new_page_of[b_blocks + i] = Some(a_blocks + i);
+        }
+        // 被删页/未复用页上的旧快照包含新 prefix 之外的 token，不能重挂。
+        for p in 0..old_blocks {
+            if new_page_of[p].is_none() {
+                if let Some(h) = hit.hashes.get(p) {
+                    let k = owl_store::SnapKey::at_boundary(*h);
+                    if self.bank.parts().rel.state_locate(k).is_some() {
+                        drop_keys.push(k);
+                    }
+                }
+            }
+        }
         let old_marked = old_spans.iter().filter(|s| s.evict).count();
         // **待释放旧链尾**（不是 free）：新表已持前缀/后缀引用；旧链从
         // 删点起的所有身份（被删图 + 未复用旧尾）在执行面回灌完成后摘掉
         // ⇒ 缓存不再站住这些槽。槽何时真正回收由 store/调度器决定。
         let release_chains: Vec<owl_store::ChainHash> =
             hit.hashes[a_blocks..hit.matched_blocks].to_vec();
+        // 后缀恢复键必须在新链上；旧键 fallback 会让 GDN 恢复出“含被删图”
+        // 的旧状态。没有新键 = 本 turn 不吸收删除，退回普通前缀复用/重建。
+        let Some(restore_key) = boundary_new else {
+            owl_shared::log_warn!(
+                "img-evict",
+                "leave-gap 不吸收:session={:#x} turn={} 后缀边界快照未能重挂到新链",
+                turn.session_id,
+                turn.id
+            );
+            return Ok(None);
+        };
         owl_shared::log_info!(
             "img-evict",
             "leave-gap:session={:#x} turn={} 删 [{}, {})={} tok/{} 页 · 保留前缀 {} + 后缀 {} 页 / {} tok · 不改 K · 待释放旧链 {} 块 · 宿主回灌 {} 页 · 快照重挂 {} 条(盘待搬 {}) · marked={}",
@@ -1319,10 +1357,12 @@ impl<D: DeviceClient> RunningEngine<D> {
             rekeyed,
             cached_len,
             tail_hash: cur.tail(),
-            restore_key: boundary_new.or(Some(old_key)),
+            restore_key: Some(restore_key),
             snap_disk: disk_ops,
             pending_loads,
             release_chains,
+            new_page_of,
+            drop_keys,
         }))
     }
 
@@ -1507,6 +1547,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         let mut pending_loads: Vec<(usize, owl_store::ChainHash)> = Vec::new();
         let mut snap_disk: Vec<SnapDiskOp> = Vec::new();
         let mut rekeyed = 0usize;
+        let mut drop_keys: Vec<owl_store::SnapKey> = Vec::new();
         for new_idx in 0..used_len {
             let old_idx = layout.survivors[new_idx];
             match hit.slots[old_idx] {
@@ -1548,6 +1589,8 @@ impl<D: DeviceClient> RunningEngine<D> {
                 };
                 if ok {
                     rekeyed += 1;
+                } else if self.bank.parts().rel.state_locate(old_key).is_some() {
+                    drop_keys.push(old_key);
                 }
             }
         }
@@ -1596,6 +1639,23 @@ impl<D: DeviceClient> RunningEngine<D> {
             rekeyed += 1;
         }
         let cached_len = used_len * page;
+        let old_blocks = old.len() / page;
+        let mut new_page_of = vec![None; old_blocks];
+        for (new_page, old_page) in layout.survivors.iter().copied().enumerate() {
+            if old_page < old_blocks {
+                new_page_of[old_page] = Some(new_page);
+            }
+        }
+        for p in 0..old_blocks {
+            if new_page_of[p].is_none() {
+                if let Some(h) = hit.hashes.get(p) {
+                    let k = owl_store::SnapKey::at_boundary(*h);
+                    if self.bank.parts().rel.state_locate(k).is_some() {
+                        drop_keys.push(k);
+                    }
+                }
+            }
+        }
         let release_chains: Vec<owl_store::ChainHash> =
             hit.hashes[first_deleted_page..old_blocks].to_vec();
         let tail_hash = hashes[used_len - 1];
@@ -1625,7 +1685,195 @@ impl<D: DeviceClient> RunningEngine<D> {
             snap_disk,
             pending_loads,
             release_chains,
+            new_page_of,
+            drop_keys,
         }))
+    }
+
+    /// **删除后的 v4 快照布局重映射**（纯 host 决策）。
+    ///
+    /// 图像 leave-gap 会压缩 token 坐标：旧 `msg_snaps/keys` 不能按 offset
+    /// 直接沿用。这里把幸存页上的旧布局点映射到新坐标，并重新跑
+    /// `plan_snap_layout`；被删页/未重挂的旧键进 `drop`，由 apply 统一释放。
+    fn remap_snap_layout_after_delete(
+        &mut self,
+        d: &ImageLeaveGap,
+        turn: &crate::turn::Turn,
+    ) -> Result<(
+        Vec<usize>,
+        Vec<owl_store::SnapRole>,
+        Vec<Option<owl_store::SnapKey>>,
+        std::collections::BTreeSet<owl_store::SnapKey>,
+    )> {
+        let page = self.dev.pool.geom.page;
+        let (old_points, old_keys, old_tail) = {
+            let s = self.bank.parts().sessions.session(turn.session_id)?;
+            (
+                s.msg_snaps.clone(),
+                s.msg_snap_keys.clone(),
+                s.tail_at.zip(s.tail_snap),
+            )
+        };
+        let mut candidates = crate::msg_boundary::message_snap_points(
+            &turn.prompt_ids,
+            &self.boot.msg_open_ids,
+            page,
+        );
+        let prompt_end = turn.prompt_ids.len() / page * page;
+        if prompt_end > 0 {
+            candidates.push(prompt_end);
+            // 与 submit 同律：保留尾块前一页，防 append 改写最后一页。
+            if prompt_end > page {
+                candidates.push(prompt_end - page);
+            }
+        }
+        candidates.extend(turn.evict_snaps.iter().copied());
+        candidates.push(d.cached_len);
+        let mut key_by_at: std::collections::BTreeMap<usize, owl_store::SnapKey> =
+            std::collections::BTreeMap::new();
+        let mut mapped_keys: Vec<owl_store::SnapKey> = Vec::new();
+        let mut drop: std::collections::BTreeSet<owl_store::SnapKey> =
+            std::collections::BTreeSet::new();
+        // 幸存页上的**全部持久快照**（含不在 msg_snaps 里的图前硬锚点）也纳入
+        // 新布局；否则它们会在删除后变成无 L1 指针的孤儿，继续占会话配额。
+        for new_page in d.new_page_of.iter().copied() {
+            let Some(new_page) = new_page else { continue };
+            let Some(h) = d.hashes.get(new_page) else { continue };
+            let new_at = new_page * page;
+            let new_key = owl_store::SnapKey::at_boundary(*h);
+            if self.bank.parts().rel.snap_durability(new_key)
+                != Some(owl_store::SnapDurability::Durable)
+            {
+                continue;
+            }
+            candidates.push(new_at);
+            key_by_at.insert(new_at, new_key);
+            mapped_keys.push(new_key);
+        }
+        for (at, key) in old_points.iter().copied().zip(old_keys.iter().copied()) {
+            let old_page = at / page;
+            let Some(new_page) = d.new_page_of.get(old_page).copied().flatten() else {
+                if let Some(k) = key {
+                    drop.insert(k);
+                }
+                continue;
+            };
+            let Some(h) = d.hashes.get(new_page) else {
+                if let Some(k) = key {
+                    drop.insert(k);
+                }
+                continue;
+            };
+            let new_at = new_page * page;
+            let new_key = owl_store::SnapKey::at_boundary(*h);
+            candidates.push(new_at);
+            if self.bank.parts().rel.state_locate(new_key).is_some() {
+                key_by_at.insert(new_at, new_key);
+                mapped_keys.push(new_key);
+            } else if let Some(k) = key {
+                drop.insert(k);
+            }
+        }
+        if let Some((old_at, old_key)) = old_tail {
+            let old_page = old_at / page;
+            if let Some(new_page) = d.new_page_of.get(old_page).copied().flatten() {
+                if let Some(h) = d.hashes.get(new_page) {
+                    let new_at = new_page * page;
+                    let new_key = owl_store::SnapKey::at_boundary(*h);
+                    candidates.push(new_at);
+                    if self.bank.parts().rel.state_locate(new_key).is_some() {
+                        key_by_at.insert(new_at, new_key);
+                        mapped_keys.push(new_key);
+                    } else {
+                        drop.insert(old_key);
+                    }
+                }
+            } else {
+                drop.insert(old_key);
+            }
+        }
+        if let Some(k) = d.restore_key {
+            // 只认新链边界：单段旧实现可能 fallback 到旧 key，不能写回会话。
+            let on_new_chain = d
+                .hashes
+                .iter()
+                .any(|h| owl_store::SnapKey::at_boundary(*h) == k);
+            if on_new_chain && self.bank.parts().rel.state_locate(k).is_some() {
+                key_by_at.insert(d.cached_len, k);
+                mapped_keys.push(k);
+            } else {
+                drop.insert(k);
+            }
+        }
+        let mut layout = crate::msg_boundary::plan_snap_layout(
+            &candidates,
+            self.boot.cfg.knobs.snap_tail,
+            self.boot.cfg.knobs.snap_session_cap,
+        );
+        // restore 边界是当前 turn 的硬恢复点，不能被均匀选点挤出目标集合。
+        // 若布局没选它：按 History 插入（不改变 Tail 配额语义），再按 cap 删最老点。
+        if layout.points.binary_search(&d.cached_len).is_err() {
+            let pos = layout.points.partition_point(|p| *p < d.cached_len);
+            layout.points.insert(pos, d.cached_len);
+            layout.roles.insert(pos, owl_store::SnapRole::History);
+            let cap = self.boot.cfg.knobs.snap_session_cap;
+            if cap > 0 && layout.points.len() > cap {
+                let victim = (0..layout.points.len())
+                    .find(|&i| {
+                        layout.roles[i] == owl_store::SnapRole::History
+                            && layout.points[i] != d.cached_len
+                    })
+                    .or_else(|| {
+                        (0..layout.points.len()).find(|&i| {
+                            layout.roles[i] == owl_store::SnapRole::Tail
+                                && layout.points[i] != d.cached_len
+                        })
+                    });
+                if let Some(i) = victim {
+                    layout.points.remove(i);
+                    layout.roles.remove(i);
+                }
+            }
+        }
+        let mut keys: Vec<Option<owl_store::SnapKey>> = layout
+            .points
+            .iter()
+            .map(|at| key_by_at.get(at).copied())
+            .collect();
+        // 角色也要回写 store：删除后 offset 变了，旧 Tail 可能变 History，
+        // 只改会话字段会让淘汰序继续用旧角色。
+        for i in 0..keys.len() {
+            let Some(k) = keys[i] else { continue };
+            if !self
+                .bank
+                .parts_mut()
+                .rel
+                .reclassify_snap(k, layout.roles[i])
+            {
+                keys[i] = None;
+            }
+        }
+        let keep: std::collections::BTreeSet<owl_store::SnapKey> =
+            keys.iter().flatten().copied().collect();
+        for k in mapped_keys {
+            if !keep.contains(&k) {
+                drop.insert(k);
+            }
+        }
+        for k in old_keys.iter().flatten().copied() {
+            if !keep.contains(&k) {
+                drop.insert(k);
+            }
+        }
+        if let Some((_, k)) = old_tail {
+            if !keep.contains(&k) {
+                drop.insert(k);
+            }
+        }
+        for k in d.drop_keys.iter().copied() {
+            drop.insert(k);
+        }
+        Ok((layout.points, layout.roles, keys, drop))
     }
 
     /// leave-gap 删除计划的落账(表/游标/token/位置账);设备半只做盘快照收尾。
@@ -1635,7 +1883,7 @@ impl<D: DeviceClient> RunningEngine<D> {
     fn apply_image_leave_gap(
         &mut self,
         d: ImageLeaveGap,
-        turn: &crate::turn::Turn,
+        turn: &mut crate::turn::Turn,
     ) -> Result<(
         usize,
         Option<owl_store::SnapKey>,
@@ -1643,6 +1891,19 @@ impl<D: DeviceClient> RunningEngine<D> {
         Option<ImageExec>,
     )> {
         let page = self.dev.pool.geom.page;
+        let (snap_points, snap_roles, snap_keys, snap_drop) =
+            self.remap_snap_layout_after_delete(&d, turn)?;
+        // 只认新链上的 restore key；旧链 fallback 不得写回会话。
+        let restore_key = d
+            .restore_key
+            .filter(|k| snap_keys.iter().flatten().any(|x| x == k));
+        let mut last_actual: Option<(usize, owl_store::SnapKey)> = None;
+        for i in (0..snap_keys.len()).rev() {
+            if let Some(k) = snap_keys[i] {
+                last_actual = Some((snap_points[i], k));
+                break;
+            }
+        }
         let mut old_table;
         {
             let bank = self.bank.parts_mut();
@@ -1666,6 +1927,13 @@ impl<D: DeviceClient> RunningEngine<D> {
             s.chain.seed(d.cached_len / page, d.tail_hash);
             s.set_positions(&turn.positions[..d.cached_len])?;
             s.position_epoch = s.position_epoch.wrapping_add(1);
+            // **v4：坐标已压缩，旧布局按 offset 不能直接沿用**。用重映射后的
+            // 目标集合写回会话；被删页/未重挂旧键由下面的 `snap_drop` 清掉。
+            s.msg_snaps = snap_points.clone();
+            s.msg_snap_roles = snap_roles.clone();
+            s.msg_snap_keys = snap_keys.clone();
+            s.tail_snap = last_actual.map(|(_, k)| k);
+            s.tail_at = last_actual.map(|(at, _)| at);
             // 新表已在 plan 侧 incref；这里再摘旧表。旧表若为空（无本地链）
             // 是 no-op；有本地链时旧表**非空**，不释放会每轮漏引用。
             // 先完成所有可失败的位置/账写入，再摘表，避免错误路径漏 decref。
@@ -1677,6 +1945,23 @@ impl<D: DeviceClient> RunningEngine<D> {
             s.local_chain = true;
         }
         self.bank.parts_mut().rel.release_table(&mut old_table)?;
+        // 删除页/未重挂快照：旧身份已不属于新链，整体释放（设备槽 + 宿主/盘 + 账）。
+        let mut dropped = 0usize;
+        for key in snap_drop {
+            if self.bank.parts().rel.state_locate(key).is_none() {
+                continue;
+            }
+            self.drop_snap_asset_for_admit(key)?;
+            dropped += 1;
+        }
+        if dropped > 0 {
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("snap.image_delete.evicted", dropped as u64, file!(), line!());
+            });
+        }
+        turn.msg_snaps = snap_points;
+        turn.msg_snap_roles = snap_roles;
+        turn.msg_snap_keys = snap_keys;
         self.img_evict.absorbed += 1;
         self.img_evict.last = Some(crate::running::ImgEvictTrace {
             a: d.a,
@@ -1687,7 +1972,7 @@ impl<D: DeviceClient> RunningEngine<D> {
         owl_shared::counter_add!("image_evict.blocks_released", d.release_chains.len() as u64);
         Ok((
             d.cached_len,
-            d.restore_key,
+            restore_key,
             d.pending_loads,
             Some(ImageExec {
                 snap_disk: d.snap_disk,

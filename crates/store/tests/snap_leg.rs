@@ -10,7 +10,7 @@ use owl_cpu::CpuFace;
 use owl_iface::contract::{DeviceClient, Dtype, HeapRegion, PinnedRegion, SwapDir};
 use owl_store::{
     AdmissionPolicy, BlockClass, BudgetInputs, ChainHash, LegConfig, PieceSpec, PoolLayout,
-    QueuePolicy, Rel, SnapClass, SnapDurability, SnapKey, StoreError, Tier,
+    QueuePolicy, Rel, SnapRole, SnapDurability, SnapKey, StoreError, Tier,
 };
 
 const ROW_BYTES: usize = 64; // 一条"行宽"(片步长)
@@ -205,7 +205,7 @@ async fn recapture_drops_stale_host_copy() {
         SnapDurability::Durable,
         7,
         4,
-        owl_store::SnapClass::Extra,
+        owl_store::SnapRole::History,
     )
     .expect("首拍");
     // 沉到宿主(此刻宿主真有内容)
@@ -223,7 +223,7 @@ async fn recapture_drops_stale_host_copy() {
             SnapDurability::Durable,
             7,
             4,
-            owl_store::SnapClass::Extra,
+            owl_store::SnapRole::History,
         )
         .expect("重拍");
     assert_eq!(ghosts, 1, "应丢掉一份旧副本");
@@ -238,42 +238,42 @@ async fn recapture_drops_stale_host_copy() {
     assert_eq!(r.state_locate(k), Some(Tier::Host));
 }
 
-/// ⑦ **宿主满时的淘汰也必须遵守 SnapClass**（2026-11-13）。
+/// ⑦ **宿主满时的淘汰也必须遵守 SnapRole**（2026-11-13）。
 ///
-/// 宿主梯旧实现直接 `EvictPolicy::order`，绕过了 `Dense/Extra` 档位：
-/// 一条更老的 Dense 尾锚点会比一条更新的 Extra 先被逐掉。门用
-/// “Dense 更老 + Extra 更新”构造，正确序必须先走 Extra。
+/// 宿主梯旧实现直接 `EvictPolicy::order`，绕过了 `Tail/History` 角色：
+/// 一条更老的 Tail 尾锚点会比一条更新的 History 先被逐掉。门用
+/// “Tail 更老 + History 更新”构造，正确序必须先走 History。
 #[tokio::test]
-async fn host_eviction_respects_snap_class_before_lru() {
+async fn host_eviction_respects_snap_role_before_lru() {
     let mut face = CpuFace::new();
     let ps = snap_pieces(&mut face, 4).await;
     let mut r = rel(2 * SNAP_BYTES);
     r.attach_snap_layout(PoolLayout { class: BlockClass::GdnRow, epoch: 0, pieces: ps.clone() })
         .expect("布局");
 
-    let k_dense = key(31);
-    let k_extra = key(32);
+    let k_tail = key(31);
+    let k_history = key(32);
     let k_new = key(33);
     r.register_snap_captured(
-        k_dense,
+        k_tail,
         SNAP_BYTES,
         SnapDurability::Durable,
         7,
         1,
-        SnapClass::Dense,
+        SnapRole::Tail,
     )
-    .expect("登记 Dense");
+    .expect("登记 Tail");
     r.register_snap_captured(
-        k_extra,
+        k_history,
         SNAP_BYTES,
         SnapDurability::Durable,
         7,
         2,
-        SnapClass::Extra,
+        SnapRole::History,
     )
-    .expect("登记 Extra");
+    .expect("登记 History");
 
-    for (k, slot) in [(k_dense, 0u32), (k_extra, 1u32)] {
+    for (k, slot) in [(k_tail, 0u32), (k_history, 1u32)] {
         let (pieces, table) = r.plan_snap_offload(k, slot).expect("下沉计划");
         let conn = face
             .swap(SwapDir::Out, &pieces[0], Box::new(table))
@@ -290,20 +290,20 @@ async fn host_eviction_respects_snap_class_before_lru() {
         SnapDurability::Durable,
         7,
         3,
-        SnapClass::Extra,
+        SnapRole::History,
     )
-    .expect("登记新 Extra");
-    let _ = r.plan_snap_offload(k_new, 2).expect("宿主满 ⇒ 按档位逐一条");
+    .expect("登记新 History");
+    let _ = r.plan_snap_offload(k_new, 2).expect("宿主满 ⇒ 按角色逐一条");
 
     assert_eq!(
-        r.state_locate(k_extra),
+        r.state_locate(k_history),
         None,
-        "更新的 Extra 必须先于更老的 Dense 被逐"
+        "更新的 History 必须先于更老的 Tail 被逐"
     );
     assert_eq!(
-        r.state_locate(k_dense),
+        r.state_locate(k_tail),
         Some(Tier::Host),
-        "Dense 是最后淘汰档，不应先走"
+        "Tail 是最后淘汰角色，不应先走"
     );
 }
 

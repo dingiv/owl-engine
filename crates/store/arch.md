@@ -101,7 +101,7 @@ engine 侧原来的 `blocks.rs` / `prefix_cache.rs` **已整文件删除**(§9.5
     先避开活跃 session，不够才回落到活跃面；`StoreReport.disk_sessions` 给出
     逐 session 的盘上 KV/快照账。三级级联（GPU → Host → Disk → Drop）的候选
     出序也统一带会话档：`order_candidates`（KV/状态）与 `order_snap_victims`
-    （快照）都是“冷会话先、会话内再按 LRU/LRFU”。
+    （快照）都是“冷会话先、会话内再按角色（Transient → History → Tail）与 LRU/LRFU”。
     2026-11-16 第二刀已落:`SessionBank` 的 `sessions`/`rel`/`leg_mtp`/`mtp_ring`
     已私有化；engine 统一走 `SessionBank::parts()` / `parts_mut()` split-borrow
     或 `reset_session_for_rebuild` / `reopen_session_chain` 这类复合语义口。

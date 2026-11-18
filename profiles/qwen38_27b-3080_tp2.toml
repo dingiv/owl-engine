@@ -140,14 +140,12 @@ vram_reserve_mb = 2560
 # 单活跃档:1 条活跃链 + 1 条刚收口的尾边界,4 格足够(6 格多占 160MB)。
 # 槽位规律仍见 `profiles/README.md`(2 并发才需要 6)。
 snap_max = 4
-# **快照准入(2026-11-12)**:单会话最多 20 张(设备+宿主+盘都算;
-# Transient 不计)。结构档(Dense/Binary)预留 4 格 ⇒ Extra 最多 16 张;
-# 超限时只替换更冷/更低档的条目,满手 Dense 时 Extra 直接跳过拍摄
-# (不选槽、不拷贝 159MB)。0 = 关闭 per-session 上限(旧行为)。
-# 两会话共享 host 3G(≈19 张);全局 host/device 压力仍按
-# 「冷会话先 + SnapClass 档位」淘汰 —— 本键只防单会话无限积累。
-snap_session_cap = 20
-snap_structural_reserve = 4
+# **持久快照布局（v4）**：每会话 30 张（设备+宿主+盘都算；Transient 不计）。
+# 最后 12 张连续保留为 Tail，前面按 token 位置均匀选 18 张 History；
+# 超限先删 History，History 空后才动 Tail。0 = 关闭 per-session 上限。
+# 两会话共享 host 3G；全局 host/device 压力仍按「Transient → History → Tail」。
+snap_session_cap = 30
+snap_tail = 12
 # GDN 状态格 = 同时推进的 turn 上限 = **并发唯一真源**(服务面 permit 也用它);
 # 本档单活跃 ⇒ 1(与 `max_batch=1` 对齐)。
 gdn_slots = 1

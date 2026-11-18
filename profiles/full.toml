@@ -194,11 +194,11 @@ draft_kv_dtype = "bf16"
 [store.gdn]
 # **GDN 状态格数 = 同时推进的 turn 上限**（每活跃 turn 一格；2026-11-16 起
 # 它是并发唯一真源：服务面 permit 数也用它）。必须显式 ≥ 1。
-# full 模板给 1；多并发 leaf 显式覆盖（如 3080 档 2）。
+# full 模板给 1；多并发 leaf 显式覆盖。
 gdn_slots = 1
-# 生成相位页边界快照节奏 / 消息边界间距 / 最小步长 = 引擎内部策略，
-# 2026-11-17 键退休（`engine::DECODE_SNAP_STRIDE` / `SNAP_MSG_MIN_GAP` /
-# `SNAP_MSG_MIN_SPAN`）。关快照面请用 `snap_max = 0`，不要再配节流。
+# 生成相位页边界快照节奏 / 消息间距 / 最小步长 = 引擎内部策略
+# （`DECODE_SNAP_STRIDE` / `SNAP_EVERY` / `SNAP_MSG_MIN_SPAN`），不再暴露配置。
+# 关快照面请用 `snap_max = 0`，不要再配节流。
 # GDN 快照池**设备槽数**（池几何 = 显存预算；不是行为旋钮）。
 # 每槽 = 一条 GDN 行 × 层数（27B ≈ 148.5 MiB/槽，TP2 两 rank 各半）。
 # full 模板给 0 = 不启用；生产档按卡型显式给 1/2/4/6。
@@ -207,21 +207,16 @@ snap_max = 0
 # prefill 切块并拍 Durable 快照,供同 system/tool 前缀跨会话复用。
 # 门 = 消费者存在(prefix_cache=true + snap_max>0);本模板 snap_max=0 ⇒ 自然后退。
 # 可删图前锚点快照 = **恒开**(2026-11-16 键退休;2026-11-13 引入):在**每张
-# 可删图的段起点**强制切块并拍一张快照(Extra 档;旧图同键 Touch)。
+# 可删图的段起点**强制切块并拍一张快照(History 角色;旧图同键 Touch)。
 # 门 = image_evict=true + prefix_cache=true + snap_max>0。
 # 消息开启标记文本覆盖（空 = 用模型 ChatFormat.im_open，如 Qwen <|im_start|>）
 # 引擎 boot 时 tokenize；扫描函数只收 open_ids 参数，不写死字面量。
 snap_msg_delim = ""
-# 最近 K 条消息边界无条件保留（dense tail；0 = 旧行为）
-snap_msg_recent = 4
-# **每会话快照上限**（0 = 不限；只数非 Transient 条目，设备+宿主+盘都算）。
-# 不是 LRU 的重复：全局 LRU 只排序谁先被逐，一条活跃长会话仍可吃满设备槽
-# 与宿主腿；本键是单会话资产护栏。**与 snap_max（设备槽数）是两个量**。
-# 超限时按 SnapClass 档位替换/跳过。
-snap_session_cap = 0
-# 结构档（Dense/Binary）保留位；仅约束 Extra（Extra ≤ cap − reserve）。
-# 与 cap 是同一护栏的两半，不能只删一个。
-snap_structural_reserve = 4
+# **每次会话持久快照上限**（Tail + History；0 = 不限；只数非 Transient）。
+# 与 `snap_max`（设备热槽数）是两个量：历史点可落宿主/盘。
+snap_session_cap = 30
+# 最近 `snap_tail` 张连续保留；更早的点按 token 位置均匀选 History。
+snap_tail = 12
 
 # ---------------------------------------------------------------------------
 # [spec] —— 投机解码

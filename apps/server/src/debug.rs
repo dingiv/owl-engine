@@ -448,7 +448,9 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
                 "id": s.id,
                 "history_len": s.history_len,
                 "tail_snap": s.tail_snap.map(|k| format!("{k:?}")),
+                "tail_at": s.tail_at,
                 "msg_snaps": s.msg_snaps,
+                "msg_snap_roles": s.msg_snap_roles.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>(),
                 "msg_snap_keys": s.msg_snap_keys.iter()
                     .map(|k| k.map(|k| format!("{k:?}")))
                     .collect::<Vec<_>>(),
@@ -499,7 +501,7 @@ pub fn vram_json(snap: &owl_engine::DiagSnapshot) -> Value {
             // **淘汰序预览**(会话感知:同会话 depth 降序 = 末端先走)
             "evict_order": snap.snap_evict.iter().map(|e| json!({
                 "key": format!("{:?}", e.key),
-                "class": format!("{:?}", e.class),
+                "role": format!("{:?}", e.role),
                 // 无归属 = null(会话 id 0 是合法 id,不能用 0 表示"无主")
                 "session": if e.session == u64::MAX { serde_json::Value::Null } else { json!(e.session) },
                 "depth": e.depth,

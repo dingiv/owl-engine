@@ -75,6 +75,10 @@ host_cache_mb = 10240
 # 只留设备侧 1 槽:边界快照被换掉就是丢了(单会话 + 活链前缀缓存够用)。
 snap_host_mb = 0
 [store.gdn]
+# 无 host/disk 分片（snap_host_mb=0）⇒ 逻辑配额压小，避免 30 个目标历史点
+# 在单设备槽上反复准入/替换；实际仍由 snap_max=1 的设备槽兜底。
+snap_session_cap = 4
+snap_tail = 2
 # snap1 + reserve256:给 2048 块的瞬态激活留余量(见 max_seq 注)
 snap_max = 1
 # agent 消息边界快照 = 恒开(2026-11-16 键退休;delim 空 = 模型 ChatFormat.im_open)

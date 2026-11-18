@@ -67,6 +67,10 @@ host_cache_mb = 10240
 # 快照腿宿主面关(同档③:单槽快照换槽会撞 store「块已在宿主层」不变量)
 snap_host_mb = 0
 [store.gdn]
+# 无 host/disk 分片（snap_host_mb=0）⇒ 逻辑配额压小，避免 30 个目标历史点
+# 在单设备槽上反复准入/替换；实际仍由 snap_max=1 的设备槽兜底。
+snap_session_cap = 4
+snap_tail = 2
 snap_max = 1
 # 消息边界快照 = 恒开(2026-11-16 键退休)
 snap_msg_delim = ""

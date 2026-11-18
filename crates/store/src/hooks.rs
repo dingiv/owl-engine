@@ -281,8 +281,8 @@ pub fn plan_capacity(
 /// **单池档：只有 GPU。** 没有下一级可移，缺口只能 `Drop`。
 ///
 /// 仍遵守统一淘汰序：KV 叶按会话冷热 + `EvictPolicy`，GDN 快照按
-/// `SnapClass`（`Transient → Extra → Binary → Dense`）。整枝塌缩的 `span`
-/// 与本拍缺口封顶，避免过度承诺。
+/// `Transient → History → Tail`。整枝塌缩的 `span` 与本拍缺口封顶，
+/// 避免过度承诺。
 pub fn plan_gpu_only(
     kv: &BlockLeg,
     state: &StateStore,
@@ -329,15 +329,9 @@ pub fn plan_gpu_only(
     let mut got_snap = 0usize;
     let mut cands: Vec<EvictCandidate> = Vec::new();
     if got_slots < kv_goal {
-        cands.extend(
-            kv.evict_candidates(protect_chains)
-                .into_iter()
-                .filter(|c| {
-                    c.tier == Tier::Gpu
-                        && c.chain
-                            .is_some_and(|chain| kv.device_leaf_is_cache(chain))
-                }),
-        );
+        cands.extend(kv.evict_candidates(protect_chains).into_iter().filter(|c| {
+            c.tier == Tier::Gpu && c.chain.is_some_and(|chain| kv.device_leaf_is_cache(chain))
+        }));
     }
     if got_snap < snap_goal {
         cands.extend(
@@ -487,7 +481,11 @@ pub fn plan_gpu_host_disk(
     let mut got_host_kv = 0usize;
     let mut got_host_snap = 0usize;
     let mut picked: Vec<ChainHash> = protect_chains.to_vec();
-    let mut kv_host_room = if host_disk_only { 0 } else { room.host_kv_slots };
+    let mut kv_host_room = if host_disk_only {
+        0
+    } else {
+        room.host_kv_slots
+    };
     // 诊断面（deny 报文用）：入口余位 + 轮零探到的最小可沉链跨度。
     let host_room0 = kv_host_room;
     let mut min0: Option<usize> = None;
@@ -569,7 +567,11 @@ pub fn plan_gpu_host_disk(
                 if span == 0 || span > disk_kv {
                     continue;
                 }
-                v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Disk, span });
+                v.out.push(EvictOut::Kv {
+                    chain: tail,
+                    sink: Sink::Disk,
+                    span,
+                });
                 picked.push(tail);
                 disk_kv -= span;
                 kv_host_room += span;
@@ -590,7 +592,11 @@ pub fn plan_gpu_host_disk(
                     break;
                 }
                 let span = kv.host_droppable_tail_span(chain).max(1).min(need);
-                v.out.push(EvictOut::Kv { chain, sink: Sink::Drop, span });
+                v.out.push(EvictOut::Kv {
+                    chain,
+                    sink: Sink::Drop,
+                    span,
+                });
                 picked.push(chain);
                 kv_host_room += span;
                 need -= span;
@@ -601,21 +607,24 @@ pub fn plan_gpu_host_disk(
     // ── 轮零（状态腿）：宿主快照满且无盘 ⇒ 先淘汰更冷的宿主快照 ─────────
     //
     // 没有磁盘时，宿主快照满会让轮一完全不出 Host 票；轮二只从 GPU 快照
-    // 里 Drop ⇒ 若宿主是更冷的 Extra、设备是 Dense，会先丢 Dense，违反
-    // `Transient → Extra → Binary → Dense`。这里按档位/新鲜度做一对一配对：
+    // 里 Drop ⇒ 若宿主是更冷的 History、设备是 Tail，会先丢 Tail，违反
+    // `Transient → History → Tail`。这里按角色/新鲜度做一对一配对：
     // 只有宿主 victim 不比它要换下的 GPU 候选更热时才 Drop 宿主。
-    if !host_disk_only
-        && got_snap < snap_goal
-        && snap_host_room == 0
-        && room.disk_snap_slots == 0
-    {
+    if !host_disk_only && got_snap < snap_goal && snap_host_room == 0 && room.disk_snap_slots == 0 {
         let snap_key = |c: &EvictCandidate| {
-            let rank = c
-                .snap
-                .and_then(|k| state.snap_class(k))
-                .map(|cl| cl.evict_rank())
-                .unwrap_or((1, 0));
-            (rank.0, rank.1, c.last_use)
+            let Some(k) = c.snap else {
+                return (3u8, 0u64, c.last_use);
+            };
+            if state.snap_durability(k) == Some(SnapDurability::Transient) {
+                return (0, 0, c.last_use);
+            }
+            match state
+                .snap_role(k)
+                .unwrap_or(crate::state::SnapRole::History)
+            {
+                crate::state::SnapRole::History => (1, c.last_use, 0),
+                crate::state::SnapRole::Tail => (2, c.depth as u64, c.last_use),
+            }
         };
         let gpu = order_snap_victims(
             policy,
@@ -688,7 +697,11 @@ pub fn plan_gpu_host_disk(
                 if span == 0 || span > kv_host_room {
                     continue;
                 }
-                v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Host, span });
+                v.out.push(EvictOut::Kv {
+                    chain: tail,
+                    sink: Sink::Host,
+                    span,
+                });
                 picked.push(tail);
                 kv_host_room -= span;
                 got_slots += span;
@@ -702,7 +715,10 @@ pub fn plan_gpu_host_disk(
                 if state.snap_durability(key) == Some(SnapDurability::Transient) {
                     continue;
                 }
-                v.out.push(EvictOut::Snap { key, sink: Sink::Host });
+                v.out.push(EvictOut::Snap {
+                    key,
+                    sink: Sink::Host,
+                });
                 snap_host_room -= 1;
                 got_snap += c.bytes;
             }
@@ -784,7 +800,11 @@ pub fn plan_gpu_host_disk(
                     if take == 0 {
                         continue;
                     }
-                    v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Disk, span: take });
+                    v.out.push(EvictOut::Kv {
+                        chain: tail,
+                        sink: Sink::Disk,
+                        span: take,
+                    });
                     picked.push(tail);
                     disk_kv -= take;
                     got_host_kv += take;
@@ -798,7 +818,10 @@ pub fn plan_gpu_host_disk(
                     if host_disk_only && got_host_snap >= host_snap_goal {
                         continue;
                     }
-                    v.out.push(EvictOut::Snap { key, sink: Sink::Disk });
+                    v.out.push(EvictOut::Snap {
+                        key,
+                        sink: Sink::Disk,
+                    });
                     disk_snap -= 1;
                     got_host_snap += 1;
                     host_relief_host = true;
@@ -825,15 +848,9 @@ pub fn plan_gpu_host_disk(
             // 叶级:丢尾部不动链头(前缀仍可复用)。已出票的链尾已在 `picked` 里。
             // **P0 修正**：活跃 turn/会话持着的块 `refs > 1`，plan 不得把它
             // 列进 Drop 票（执行侧只会 Busy 跳过，制造 plan 级过度承诺）。
-            cands2.extend(
-                kv.evict_candidates(&picked)
-                    .into_iter()
-                    .filter(|c| {
-                        c.tier == Tier::Gpu
-                            && c.chain
-                                .is_some_and(|chain| kv.device_leaf_is_cache(chain))
-                    }),
-            );
+            cands2.extend(kv.evict_candidates(&picked).into_iter().filter(|c| {
+                c.tier == Tier::Gpu && c.chain.is_some_and(|chain| kv.device_leaf_is_cache(chain))
+            }));
         }
         if got_snap < snap_goal {
             cands2.extend(
@@ -842,7 +859,9 @@ pub fn plan_gpu_host_disk(
                     .into_iter()
                     .filter(|c| {
                         c.tier == Tier::Gpu
-                            && !v.out.iter().any(|o| matches!(o, EvictOut::Snap { key, .. } if Some(*key) == c.snap))
+                            && !v.out.iter().any(
+                                |o| matches!(o, EvictOut::Snap { key, .. } if Some(*key) == c.snap),
+                            )
                     }),
             );
         }
@@ -906,7 +925,11 @@ pub fn plan_gpu_host_disk(
                     } else {
                         n_trickle += 1;
                     }
-                    v.out.push(EvictOut::Kv { chain: tail, sink: Sink::Drop, span });
+                    v.out.push(EvictOut::Kv {
+                        chain: tail,
+                        sink: Sink::Drop,
+                        span,
+                    });
                     got_slots += span;
                 }
                 Leg::State => {
@@ -914,7 +937,10 @@ pub fn plan_gpu_host_disk(
                     if got_snap >= snap_goal {
                         continue;
                     }
-                    v.out.push(EvictOut::Snap { key, sink: Sink::Drop });
+                    v.out.push(EvictOut::Snap {
+                        key,
+                        sink: Sink::Drop,
+                    });
                     got_snap += c.bytes;
                 }
             }
@@ -965,10 +991,12 @@ pub fn plan_gpu_host_disk(
     v
 }
 
-/// **同一会话组内只重排状态腿**(2026-11-12):KV 候选位置不变,快照按
-/// [`SnapClass`](crate::state::SnapClass) 档位序;同档保持 `policy.order`
-/// 的新鲜度序。目的 = host 下沉/溢盘时不要在 `Extra` 之前先搬 `Dense`。
+/// **同一会话组内只重排状态腿**（v4）：KV 候选位置不变，快照按
+/// `Transient → History → Tail`；History 保持 `policy.order` 的新鲜度序，
+/// Tail 按边界深度（最老先走）。目的 = host 下沉/溢盘时不要在 History
+/// 之前先搬 Tail。
 fn order_state_in_session(group: &mut [EvictCandidate], state: &StateStore) {
+    use crate::state::{SnapDurability, SnapRole};
     let idx: Vec<usize> = group
         .iter()
         .enumerate()
@@ -979,12 +1007,18 @@ fn order_state_in_session(group: &mut [EvictCandidate], state: &StateStore) {
         return;
     }
     let mut snaps: Vec<EvictCandidate> = idx.iter().map(|&i| group[i]).collect();
-    // `sort_by_key` 稳定 ⇒ 同档保留 policy 的 LRU/LRFU 序。
+    // `sort_by_key` 稳定 ⇒ History 保留 policy 的 LRU/LRFU 序。
     snaps.sort_by_key(|c| {
-        c.snap
-            .and_then(|k| state.snap_class(k))
-            .map(|cl| cl.evict_rank())
-            .unwrap_or((1, 0))
+        let Some(k) = c.snap else {
+            return (3u8, 0usize, 0u64);
+        };
+        if state.snap_durability(k) == Some(SnapDurability::Transient) {
+            return (0, 0, 0);
+        }
+        match state.snap_role(k).unwrap_or(SnapRole::History) {
+            SnapRole::History => (1, 0, 0),
+            SnapRole::Tail => (2, c.depth, 0),
+        }
     });
     for (slot, c) in idx.into_iter().zip(snaps) {
         group[slot] = c;
@@ -1042,8 +1076,14 @@ pub(crate) fn order_candidates(
         groups.entry(c.session).or_default().push(c);
     }
     let mut keys: Vec<u64> = groups.keys().copied().collect();
-    keys.sort_by_key(|s| (*s == crate::policy::NO_SESSION, *sess_cold.get(s).unwrap_or(&u64::MAX)));
-    let mut ordered: Vec<EvictCandidate> = Vec::with_capacity(groups.values().map(|g| g.len()).sum());
+    keys.sort_by_key(|s| {
+        (
+            *s == crate::policy::NO_SESSION,
+            *sess_cold.get(s).unwrap_or(&u64::MAX),
+        )
+    });
+    let mut ordered: Vec<EvictCandidate> =
+        Vec::with_capacity(groups.values().map(|g| g.len()).sum());
     for k in keys {
         if let Some(mut g) = groups.remove(&k) {
             policy.order(&mut g);
@@ -1054,49 +1094,13 @@ pub(crate) fn order_candidates(
     first.into_iter().chain(ordered).collect()
 }
 
-/// **快照槽位出序**(专用;2026-10-23 —— 与 KV 块的"末端先削"脱钩)。
-///
-/// 为什么不能沿用 [`order_candidates`] 的会话深度档:那条规则是为 **KV 块**
-/// 立的(父块被逐 ⇒ 子链不可达),对**快照**并不成立 —— 每条快照按自己的边界
-/// 身份独立键控,逐掉浅的不会让深的失效。而"深度大者先逐"恰好会**先逐掉
-/// 最有用的一条**:会话**上一轮的尾巴**既是指令续写的前缀复用面,也是
-/// 前缀无感删除的 GDN 恢复点(实测:滑窗 6 轮后 `snap_max=4/16` 都把尾巴
-/// 逐掉 ⇒ 删除退化为全量重算)。
-///
-/// 现行语义 = **事实档 + 会话档 + 新鲜度**:
-/// 1. `Transient`(生成段快照,逐出零代价)最前;
-/// 2. 同档内先按会话冷度（冷会话先，无主最后）；
-/// 3. 会话内按 `EvictPolicy`(缺省 LRU = `last_use`)—— 刚拍/刚用的尾巴
-///    在**本会话内**最后被逐。
-pub(crate) fn order_snap_victims(
+/// 同一角色内按会话冷度分组，再交给策略/深度序。
+fn order_snap_role_group(
     policy: &dyn EvictPolicy,
-    cands: Vec<EvictCandidate>,
-    state: &StateStore,
+    group: Vec<EvictCandidate>,
+    tail_by_depth: bool,
 ) -> Vec<EvictCandidate> {
-    // **2026-11-12 二分稀疏淘汰**:档位优先,档内 LRU/频率。
-    //   0 Transient(rollback,零成本)
-    //   1 Extra(不在二分节点/不在 dense 尾部)
-    //   2 Binary(level)(二分节点,level 越大越老 → 先走)
-    //   3 Dense(最近 K 条/会话尾锚点,最后走 —— **但不是不可淘汰**)
-    //
-    // 注意:这不是 pin。任何档位在空间不足时都会被逐出;`Dense` 只是**最后**
-    // 被选中。硬保护面只应包含当前正在使用的 key(active turn / capture)。
-    use crate::state::SnapClass;
-    let mut buckets: std::collections::BTreeMap<(u8, i16), Vec<EvictCandidate>> =
-        std::collections::BTreeMap::new();
-    for c in cands {
-        let class = c
-            .snap
-            .and_then(|k| state.snap_class(k))
-            .unwrap_or(SnapClass::Extra);
-        buckets.entry(class.evict_rank()).or_default().push(c);
-    }
-    let mut out = Vec::new();
-    for (_, group) in buckets {
-        // **会话档（与 KV 同律）**：同一档内先动"最冷的会话"，
-        // 无主候选最后；会话内再交给策略对象（LRU/LRFU）。
-        let mut sess_cold: std::collections::BTreeMap<u64, u64> =
-            std::collections::BTreeMap::new();
+    let mut sess_cold: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
         for c in &group {
             let e = sess_cold.entry(c.session).or_insert(u64::MAX);
             if c.last_use < *e {
@@ -1110,15 +1114,69 @@ pub(crate) fn order_snap_victims(
         }
         let mut keys: Vec<u64> = by_session.keys().copied().collect();
         keys.sort_by_key(|s| {
-            (*s == crate::policy::NO_SESSION, *sess_cold.get(s).unwrap_or(&u64::MAX))
+        (
+            *s == crate::policy::NO_SESSION,
+            *sess_cold.get(s).unwrap_or(&u64::MAX),
+        )
         });
+    let mut out = Vec::new();
         for k in keys {
             if let Some(mut g) = by_session.remove(&k) {
+            if tail_by_depth {
+                // Tail：只从最老的边界开始，最新尾锚点最后。
+                g.sort_by_key(|c| (c.depth, c.last_use));
+            } else {
                 policy.order(&mut g);
+            }
                 out.extend(g);
             }
         }
+    out
+}
+
+/// **快照槽位出序**(专用;2026-10-23 —— 与 KV 块的"末端先削"脱钩)。
+///
+/// 为什么不能沿用 [`order_candidates`] 的会话深度档:那条规则是为 **KV 块**
+/// 立的(父块被逐 ⇒ 子链不可达),对**快照**并不成立 —— 每条快照按自己的边界
+/// 身份独立键控,逐掉浅的不会让深的失效。而"深度大者先逐"恰好会**先逐掉
+/// 最有用的一条**:会话**上一轮的尾巴**既是指令续写的前缀复用面,也是
+/// 前缀无感删除的 GDN 恢复点(实测:滑窗 6 轮后 `snap_max=4/16` 都把尾巴
+/// 逐掉 ⇒ 删除退化为全量重算)。
+///
+/// v4 语义 = **Transient → History → Tail**:
+/// 1. `Transient`(生成段快照,逐出零代价)最前;
+/// 2. `History` 先走（会话冷度 + `EvictPolicy`）；
+/// 3. `Tail` 最后走，且从最老边界开始（最新尾锚点最后）。
+pub(crate) fn order_snap_victims(
+    policy: &dyn EvictPolicy,
+    cands: Vec<EvictCandidate>,
+    state: &StateStore,
+) -> Vec<EvictCandidate> {
+    use crate::state::{SnapDurability, SnapRole};
+    let mut transient = Vec::new();
+    let mut history = Vec::new();
+    let mut tail = Vec::new();
+    for c in cands {
+        let is_transient =
+            c.snap.and_then(|k| state.snap_durability(k)) == Some(SnapDurability::Transient);
+        if is_transient {
+            transient.push(c);
+            continue;
+        }
+        match c
+            .snap
+            .and_then(|k| state.snap_role(k))
+            .unwrap_or(SnapRole::History)
+        {
+            SnapRole::History => history.push(c),
+            SnapRole::Tail => tail.push(c),
+        }
     }
+    // 注意:这不是 pin。任何角色在空间不足时都会被逐出;Tail 只是最后被选中。
+    policy.order(&mut transient);
+    let mut out = transient;
+    out.extend(order_snap_role_group(policy, history, false));
+    out.extend(order_snap_role_group(policy, tail, true));
     out
 }
 
@@ -1180,9 +1238,9 @@ mod tests {
         assert_eq!(order[0].chain, Some(ChainHash::new(2)), "冷会话先走");
     }
 
-    /// 快照出序也必须带会话档：冷会话的 Extra 先于热会话的 Extra。
+    /// 快照出序也必须带会话档：冷会话的 History 先于热会话的 History。
     #[test]
-    fn snapshots_prefer_cold_session_within_same_class() {
+    fn snapshots_prefer_cold_session_within_same_role() {
         let state = StateStore::new(1, 1);
         let policy = EvictPolicyKind::Lru.build();
         let mut hot = cand(7, 1, 900, 1);
@@ -1199,36 +1257,40 @@ mod tests {
         );
     }
 
-    /// 混合腿出序:同一会话内 **Extra 快照先于更冷的 Dense** ——
-    /// host 下沉/溢盘不能在 Extra 之前先搬 Dense。
+    /// 混合腿出序：同一会话内 **History 先于更冷的 Tail** ——
+    /// host 下沉/溢盘不能在 History 之前先搬 Tail。
     #[test]
-    fn extra_snapshot_goes_before_colder_dense() {
+    fn history_snapshot_goes_before_colder_tail() {
         let mut state = StateStore::new(1, 1);
-        let dense = SnapKey::at_boundary(ChainHash::new(0xD1));
-        let extra = SnapKey::at_boundary(ChainHash::new(0xE1));
-        // dense 先登记 ⇒ last_use 更小(LRU 会先逐它);档位序必须让 Extra 先走。
-        state.register_snap_owned_class(
-            dense,
+        let tail = SnapKey::at_boundary(ChainHash::new(0xD1));
+        let history = SnapKey::at_boundary(ChainHash::new(0xE1));
+        // tail 先登记 ⇒ last_use 更小（LRU 会先逐它）；角色序必须让 History 先走。
+        state.register_snap_owned_role(
+            tail,
             1,
             Tier::Gpu,
             SnapDurability::Durable,
             1,
             90,
-            crate::state::SnapClass::Dense,
+            crate::state::SnapRole::Tail,
         );
-        state.register_snap_owned_class(
-            extra,
+        state.register_snap_owned_role(
+            history,
             1,
             Tier::Gpu,
             SnapDurability::Durable,
             1,
             40,
-            crate::state::SnapClass::Extra,
+            crate::state::SnapRole::History,
         );
         let cands = state.evict_candidates(&[]);
         let policy = EvictPolicyKind::Lru.build();
         let order = order_candidates(policy.as_ref(), cands, &state);
-        assert_eq!(order[0].snap, Some(extra), "Extra 先于更冷的 Dense");
-        assert_eq!(order[1].snap, Some(dense));
+        assert_eq!(order[0].snap, Some(history), "History 先于更冷的 Tail");
+        assert_eq!(order[1].snap, Some(tail));
+
+        let order = order_snap_victims(policy.as_ref(), state.evict_candidates(&[]), &state);
+        assert_eq!(order[0].snap, Some(history), "专用快照序同样 History 先走");
+        assert_eq!(order[1].snap, Some(tail));
     }
 }

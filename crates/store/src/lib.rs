@@ -100,7 +100,7 @@ pub use select::{
     ViewPlan,
 };
 pub use state::{
-    SnapAdmit, SnapAdmitPolicy, SnapClass, SnapDurability, SnapSkip, StateStore,
+    SnapAdmit, SnapAdmitPolicy, SnapDurability, SnapRole, SnapSkip, StateStore,
 };
 pub use tier::{
     book_lock, ledger_entry, shared_ledger, tier_budget_of, AssetKind, EventRow, LedgerBook,

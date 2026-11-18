@@ -16,6 +16,110 @@ pub(crate) enum AbandonPublish {
 }
 
 impl<D: DeviceClient> crate::running::RunningEngine<D> {
+    /// 把当前游标的最后完整页加入活跃 turn 的布局点（幂等）。
+    ///
+    /// Tail/History 布局按 token offset 计算；turn 结束/中断时生成段末尾
+    /// 可能尚未出现在 submit 的候选里，必须先把 `at` 纳入再拍 Tail。
+    fn add_active_snap_point(&mut self, at: usize) -> Result<()> {
+        if at == 0 {
+            return Ok(());
+        }
+        let act = self.turns.active_mut()?;
+        if let Err(pos) = act.msg_snaps.binary_search(&at) {
+            act.msg_snaps.insert(pos, at);
+            act.msg_snap_roles.insert(pos, owl_store::SnapRole::Tail);
+            act.msg_snap_keys.insert(pos, None);
+        }
+        Ok(())
+    }
+
+    /// 按 v4 规则重算活跃 turn 的 Tail/History 布局，删除不在目标集合里的
+    /// 旧持久键（当前正在拍的最新尾已加入布局，不会被删）。
+    fn reconcile_active_snap_layout(&mut self) -> Result<usize> {
+        let (old_points, old_keys, old_tail) = {
+            let act = self.turns.active()?;
+            (
+                act.msg_snaps.clone(),
+                act.msg_snap_keys.clone(),
+                act.last_snap_at.zip(act.last_snap),
+            )
+        };
+        let layout = crate::msg_boundary::plan_snap_layout(
+            &old_points,
+            self.boot.cfg.knobs.snap_tail,
+            self.boot.cfg.knobs.snap_session_cap,
+        );
+        let mut new_keys =
+            crate::serve::session::carry_msg_snap_keys(&old_points, &old_keys, &layout.points);
+        if let Some((at, key)) = old_tail {
+            if let Ok(i) = layout.points.binary_search(&at) {
+                if new_keys[i].is_none() {
+                    new_keys[i] = Some(key);
+                }
+            }
+        }
+        let mut reclassified = 0usize;
+        for i in 0..new_keys.len() {
+            let Some(key) = new_keys[i] else { continue };
+            if self
+                .bank
+                .parts_mut()
+                .rel
+                .reclassify_snap(key, layout.roles[i])
+            {
+                reclassified += 1;
+            } else {
+                new_keys[i] = None;
+            }
+        }
+        let keep: std::collections::BTreeSet<owl_store::SnapKey> =
+            new_keys.iter().flatten().copied().collect();
+        let mut drop_keys: std::collections::BTreeSet<owl_store::SnapKey> =
+            std::collections::BTreeSet::new();
+        for key in old_keys.iter().flatten().copied() {
+            if !keep.contains(&key) {
+                drop_keys.insert(key);
+            }
+        }
+        if let Some((_, key)) = old_tail {
+            if !keep.contains(&key) {
+                drop_keys.insert(key);
+            }
+        }
+        let mut dropped = 0usize;
+        for key in drop_keys {
+            if self.bank.parts().rel.state_locate(key).is_none() {
+                continue;
+            }
+            self.drop_snap_asset_for_admit(key)?;
+            dropped += 1;
+        }
+        // 最新实际在账的 Tail 才是尾锚点；布局中尚未拍到的尾部点不回填
+        // `last_snap`（否则会指向已删/不存在的键）。
+        let mut last_actual: Option<(usize, owl_store::SnapKey)> = None;
+        for i in (0..new_keys.len()).rev() {
+            if let Some(key) = new_keys[i] {
+                last_actual = Some((layout.points[i], key));
+                break;
+            }
+        }
+        {
+            let act = self.turns.active_mut()?;
+            act.msg_snaps = layout.points;
+            act.msg_snap_roles = layout.roles;
+            act.msg_snap_keys = new_keys;
+            act.last_snap = last_actual.map(|(_, key)| key);
+            act.last_snap_at = last_actual.map(|(at, _)| at);
+        }
+        if reclassified > 0 || dropped > 0 {
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("snap.layout.recomputed", 1, file!(), line!());
+                m.counter_add("snap.history.evicted", dropped as u64, file!(), line!());
+            });
+        }
+        Ok(dropped)
+    }
+
     /// **turn 末释放设备表**：表出账归还（引用减一）；历史 `tokens` 保留。
     ///
     /// 不在 turn 之间保留任何 block_table。所有块回到 store 缓存面，由
@@ -48,7 +152,8 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // (批动作失败时未选定)。
         if let Some(act) = self.turns.take_exec() {
             // 引擎错误：账面不可信 ⇒ **不发布**已写入前缀（会话保留，前缀守卫失配自会回退全量）
-            self.abandon_active(act, turn_id, AbandonPublish::Skip).await;
+            self.abandon_active(act, turn_id, AbandonPublish::Skip)
+                .await;
         }
         // 准入账同步(S3b §23.2):turn 生死 = 保留额生死
         self.close_admission(turn_id);
@@ -74,7 +179,10 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             Ok(_) => {}
             Err(e) => owl_shared::log_warn!("store", "孤儿 turn 收口失败：{e}"),
         }
-        TurnEvent::Failed { turn: turn_id, err: err.into() }
+        TurnEvent::Failed {
+            turn: turn_id,
+            err: err.into(),
+        }
     }
 
     /// **按 turn 精确终结**(B5.1 服务面契约:合批档下"取消"必须指名 turn,
@@ -201,32 +309,50 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
     }
 
-    /// **中断点补一张边界快照**(2026-11-03):只在"prefill 中段被取消"时动手。
+    /// **中断点补一张 Tail 快照**（v4：prefill 与 generation 都覆盖）。
     ///
-    /// 判据:
-    /// - `fed < prompt_len`(仍在 prefill;已 prefill 完的 turn 走正常路径的
-    ///   `last_boundary` 快照,不需要补);
-    /// - `fed` **页对齐**(快照键 = 边界块身份;不对齐就没有边界可挂);
-    /// - 前缀缓存与快照池都在场(否则快照没有消费者)。
+    /// 判据：
+    /// - `fed > 0`，且至少有一个完整页（快照 key 只能挂页边界）；
+    /// - 前缀缓存与快照池都在场（否则快照没有消费者）；
+    /// - 取 `floor(fed/page)*page` = 最后完整页边界；generation 中断同样适用。
     async fn capture_abort_snap(&mut self, turn: u64) -> Result<()> {
         let Some(act) = self.turns.active_of(turn) else {
             return Ok(());
         };
         let (sid, fed, prompt_len) = (act.session_id, act.fed, act.prompt_ids.len());
         let page = self.dev.pool.geom.page.max(1);
-        if fed == 0 || fed >= prompt_len || fed % page != 0 {
+        let at = self
+            .bank
+            .parts()
+            .sessions
+            .get(sid)
+            .map(|s| s.chain.blocks() * page)
+            .unwrap_or(0);
+        if at == 0 {
             return Ok(());
         }
         if !self.boot.cfg.knobs.prefix_cache || self.dev.pool.snap_capacity() == 0 {
             return Ok(());
         }
-        let _captured = self
+        self.add_active_snap_point(at)?;
+        let captured = self
             .capture_snap_at_cursor(
                 sid,
                 owl_store::SnapDurability::Durable,
-                owl_store::SnapClass::Dense,
+                owl_store::SnapRole::Tail,
             )
             .await?;
+        self.reconcile_active_snap_layout()?;
+        if captured {
+            let tag = if fed >= prompt_len {
+                "snap.capture.abort_generation"
+            } else {
+                "snap.capture.abort_prefill"
+            };
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add(tag, 1, file!(), line!());
+            });
+        }
         Ok(())
     }
 
@@ -265,7 +391,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             return Ok(());
         }
         let generated = act.fed.saturating_sub(act.prompt_ids.len());
-        let mut demote_tail = None;
         let s = self.bank.parts_mut().sessions.session_mut(act.session_id)?;
         s.tokens.clear();
         s.tokens.extend_from_slice(&act.prompt_ids[..written]);
@@ -289,32 +414,27 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         let (spans, pads) = crate::img_evict::ledger_prefix(&act.img_spans, &act.img_pads, written);
         s.set_img_spans(spans, pads);
-        // **L1 资产:尾锚点 + 消息边界跨轮保留**(2026-11-12)。
-        // 中断时只保留已算前缀内的边界;尾快照若已拍到则保持 Dense 档。
+        // **L1 资产：Tail 尾锚点 + 布局跨轮保留（v4）**。
+        //
+        // 布局点只保留 `<= written` 的 prompt 边界；生成段不入 token 账，
+        // 但 generation abort 的最后页 Tail 仍通过 `tail_snap/tail_at`
+        // 保留。下一轮若客户端带回这段文本，可按 offset 重新纳入布局。
         if act.last_snap.is_some() {
-            let key = act.last_snap.expect("刚判过");
-            s.tail_snap = Some(key);
-            // 与 complete 同律：最近 K 个尾保持 Dense，溢出者降 Extra。
-            demote_tail = s.push_recent_tail(
-                key,
-                self.boot.cfg.knobs.snap_msg_recent.max(1),
-            );
+            s.tail_snap = act.last_snap;
+            s.tail_at = act.last_snap_at;
         }
-        s.msg_snaps = act
+        let kept: Vec<(usize, owl_store::SnapRole, Option<owl_store::SnapKey>)> = act
             .msg_snaps
             .iter()
             .copied()
-            .filter(|&b| b <= written)
-            .collect();
-        let kept_keys: Vec<Option<owl_store::SnapKey>> = act
-            .msg_snaps
-            .iter()
-            .copied()
+            .zip(act.msg_snap_roles.iter().copied())
             .zip(act.msg_snap_keys.iter().copied())
-            .filter(|(b, _)| *b <= written)
-            .map(|(_, key)| key)
+            .filter(|((b, _), _)| *b <= written)
+            .map(|((b, role), key)| (b, role, key))
             .collect();
-        s.msg_snap_keys = kept_keys.clone();
+        s.msg_snaps = kept.iter().map(|(b, _, _)| *b).collect();
+        s.msg_snap_roles = kept.iter().map(|(_, role, _)| *role).collect();
+        s.msg_snap_keys = kept.into_iter().map(|(_, _, key)| key).collect();
         owl_shared::log_info!(
             "prefix",
             "中断落账:session={:#x} turn={} prompt 前缀 {} tok 入账(生成段 {generated} tok 不入缓存)⇒ 交给 Release(Abort) 发布链身份",
@@ -322,15 +442,6 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             act.id,
             written
         );
-        if let Some(old) = demote_tail {
-            if self
-                .bank.parts_mut().rel.reclassify_snap(old, owl_store::SnapClass::Extra)
-            {
-                owl_shared::metrics::with_metrics_store(|m| {
-                    m.counter_add("snap.demote.tail", 1, file!(), line!());
-                });
-            }
-        }
         Ok(())
     }
 
@@ -356,10 +467,9 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     );
                 }
             }
-            Err(e) => owl_shared::log_warn!(
-                "store",
-                "turn {turn_id} 终局归还失败（继续收尾）：{e}"
-            ),
+            Err(e) => {
+                owl_shared::log_warn!("store", "turn {turn_id} 终局归还失败（继续收尾）：{e}")
+            }
         }
         if let Err(e) = self.sync_pool_account() {
             owl_shared::log_warn!("store", "准入账同步失败：{e}");
@@ -370,24 +480,47 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         &mut self,
         reason: crate::turn::FinishReason,
     ) -> Result<TurnEvent> {
-        // **Turn 末 Dense 尾锚点**(2026-11-12):生成段最后一页边界默认是
-        // Transient(最先淘汰);这里把它升级为 Dense —— append 的 100% 命中
-        // 靠它。只改淘汰档位,不 pin:空间不足时 Dense 仍可被逐出。
+        // **Turn 末 Tail 尾锚点（v4）**：生成段最后一页边界默认是
+        // Transient（最先淘汰）；这里把该 offset 纳入布局并升级为 Tail。
+        // 只改角色，不 pin：空间不足时 Tail 仍可被逐出。
         if self.boot.cfg.knobs.prefix_cache && self.dev.pool.snap_capacity() > 0 {
-            let sid = self.turns.active().ok().map(|a| a.session_id);
-            if let Some(sid) = sid {
-                if let Err(e) = self
-                    .capture_snap_at_cursor(
-                        sid,
-                        owl_store::SnapDurability::Durable,
-                        owl_store::SnapClass::Dense,
-                    )
-                    .await
-                {
-                    owl_shared::log_warn!(
-                        "snap",
-                        "turn 末 Dense 尾锚点补拍失败(继续收口): {e}"
-                    );
+            if let Ok(act) = self.turns.active() {
+                let sid = act.session_id;
+                let page = self.dev.pool.geom.page.max(1);
+                let at = self
+                    .bank
+                    .parts()
+                    .sessions
+                    .get(sid)
+                    .map(|s| s.chain.blocks() * page)
+                    .unwrap_or(0);
+                if at > 0 {
+                    if let Err(e) = self.add_active_snap_point(at) {
+                        owl_shared::log_warn!("snap", "turn 末布局点追加失败: {e}");
+                    } else {
+                        match self
+                            .capture_snap_at_cursor(
+                                sid,
+                                owl_store::SnapDurability::Durable,
+                                owl_store::SnapRole::Tail,
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                owl_shared::metrics::with_metrics_store(|m| {
+                                    m.counter_add("snap.capture.complete", 1, file!(), line!());
+                                });
+                            }
+                            Ok(false) => {}
+                            Err(e) => owl_shared::log_warn!(
+                                "snap",
+                                "turn 末 Tail 尾锚点补拍失败(继续收口): {e}"
+                            ),
+                        }
+                        if let Err(e) = self.reconcile_active_snap_layout() {
+                            owl_shared::log_warn!("snap", "turn 末布局压缩失败: {e}");
+                        }
+                    }
                 }
             }
         }
@@ -435,37 +568,22 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 结构性消失(2026-10-10 生命周期收口;原手动 spec_drafts_host 清)
         // 会话账落地(S1 收口):KV 此刻 = prompt 全量 + 生成段;GDN 状态
         // 跨 turn 连续。临时会话终了即焚(表不随 turn 数无界增长)
-        let mut demote_tail = None;
         if let Some(s) = self.bank.parts_mut().sessions.get_mut(act.session_id) {
             s.commit_turn(&act.prompt_ids, &act.out, &act.positions)?;
             // **图像段账写回**(前缀无感删除;2026-10-23):与 `tokens` 同一次
             // 收口 —— 两处各写一份 = 下一轮删除识别拿错坐标。
             s.set_img_spans(act.img_spans.clone(), act.img_pads.clone());
-            // **L1 资产:尾锚点 + 消息边界跨轮保留**(2026-11-12)。
-            // 空闲会话的 tail_snap 保持 Dense 档(最后淘汰,不是 pin) ——
-            // append 时上一条消息末尾 100% 命中;msg_snaps 供下一轮回撤定位。
+            // **L1 资产：Tail 尾锚点 + Tail/History 布局跨轮保留**。
+            // 空闲会话的 tail_snap 保持 Tail 角色（最后淘汰，不是 pin）。
             if act.last_snap.is_some() {
-                let key = act.last_snap.expect("刚判过");
-                s.tail_snap = Some(key);
-                // 最近 K 个 turn 尾保持 Dense；更老的尾降 Extra。
-                demote_tail = s.push_recent_tail(
-                    key,
-                    self.boot.cfg.knobs.snap_msg_recent.max(1),
-                );
+                s.tail_snap = act.last_snap;
+                s.tail_at = act.last_snap_at;
             }
             s.msg_snaps = act.msg_snaps.clone();
+            s.msg_snap_roles = act.msg_snap_roles.clone();
             s.msg_snap_keys = act.msg_snap_keys.clone();
             // 链登记 / 盘索引 / 表释放 / GDN 行 / 归属下行 / N4 全部由
             // `StoreHook::Release(TurnEnd)` 统一执行（Phase 3）。
-        }
-        if let Some(old) = demote_tail {
-            if self
-                .bank.parts_mut().rel.reclassify_snap(old, owl_store::SnapClass::Extra)
-            {
-                owl_shared::metrics::with_metrics_store(|m| {
-                    m.counter_add("snap.demote.tail", 1, file!(), line!());
-                });
-            }
         }
         // **收口顺序**：先跑 Release 钩子（块链/行/N4），再无条件走准入围栏，
         // 最后才把钩子错误上抛 —— `store_hook(...)?` 直接早退会跳过收口，

@@ -1458,41 +1458,13 @@ impl<D: DeviceClient> RunningEngine<D> {
         }
         let (positions, positions_gap) =
             self.prompt_positions(session, &prompt_ids, &img_spans, deletion.as_ref())?;
-        // **消息边界快照点**(2026-10-24；2026-11-16 键退休 = **恒开**):页对齐
-        // token offset，供 `prefill_step_chunk_msg` 切块与 `capture_gdn_snap` 的
-        // snap_keep 共用。门 = 消费者存在；`open_ids` 来自配置/模型声明。
-        let msg_snaps = if self.boot.cfg.knobs.prefix_cache
-            && self.dev.pool.geom.paged
-            && self.dev.pool.snap_capacity() > 0
-        {
-            crate::msg_boundary::message_snap_points(
-                &prompt_ids,
-                &self.boot.msg_open_ids,
-                self.dev.pool.geom.page,
-                crate::engine::SNAP_MSG_MIN_GAP,
-                self.boot.cfg.knobs.snap_msg_recent,
-            )
-        } else {
-            Vec::new()
-        };
-        // 淘汰优先级档(2026-11-12):Dense(最近 K 条) / Binary(二分节点) /
-        // Extra。不是 pin —— 只决定 shell 淘汰顺序(§二分稀疏淘汰)。
-        let msg_snap_classes = if msg_snaps.is_empty() {
-            Vec::new()
-        } else {
-            crate::msg_boundary::classify_snap_points(
-                &msg_snaps,
-                prompt_ids.len(),
-                self.boot.cfg.knobs.snap_msg_recent,
-            )
-        };
         // **可删图前的硬快照点**（2026-11-13）：截图在 prompt 尾部时，预填充末
         // 快照的键落在被删页上 ⇒ 删除发生时幸存页没有任何边界快照，只能退回
         // fresh。锚点 = **每张可删图段起点**（同游程也各拍）；预填充必须在这些
         // 边界**强制切块**才能拍出 GDN 态（见 `prefill_step_chunk_msg` 的
         // `hard_snaps`）。旧图的锚点键是内容身份，前缀命中时不会重拍。
         // 2026-11-16 键退休 = **恒开**（门 = 消费者存在）。
-        let evict_snaps: Vec<usize> = if self.boot.cfg.knobs.image_evict
+        let mut evict_snaps: Vec<usize> = if self.boot.cfg.knobs.image_evict
             && self.boot.cfg.knobs.prefix_cache
             && self.dev.pool.geom.paged
             && self.dev.pool.snap_capacity() > 0
@@ -1505,6 +1477,21 @@ impl<D: DeviceClient> RunningEngine<D> {
         } else {
             Vec::new()
         };
+        // **尾块守护页**：小尾块规则会跳过消息边界切块，导致 prompt_end 前
+        // 一页的 Tail 快照实际没拍；下一次 assistant→user append 会重写最后
+        // 一个整块，复用面从 99% 跌到 1 块。把它放进 hard_snaps 强制切一刀。
+        if self.boot.cfg.knobs.prefix_cache
+            && self.dev.pool.geom.paged
+            && self.dev.pool.snap_capacity() > 0
+        {
+            let page = self.dev.pool.geom.page.max(1);
+            let prompt_end = prompt_ids.len() / page * page;
+            if prompt_end > page {
+                evict_snaps.push(prompt_end - page);
+                evict_snaps.sort_unstable();
+                evict_snaps.dedup();
+            }
+        }
         // 准入地板(S3b §23.5 / A7-bis 接线 2026-10-19):
         //
         // 非 Strict 地板 = "允许选择层按需物化" ⇒ **必须有执行面**才收:
@@ -1703,93 +1690,6 @@ impl<D: DeviceClient> RunningEngine<D> {
                 ))));
             }
         };
-        // 会话**一律持久**（2026-11-16 原始算法 §32）：无论显式键还是内容身份，
-        // turn 终局只还设备表，不焚会话（idle 会话的快照/前缀账是下一轮命中的
-        // 依据，焚掉等于内容身份失效）。
-        let session_id = self.bank.get_or_create(session)?;
-        // **L1 快照键沿用 + 重分类**(2026-11-12 二刀)
-        //
-        // 纯 append 时位置对齐(前缀守卫生效)⇒ 直接沿用上轮 `msg_snap_keys`;
-        // 然后按**本轮**的 `msg_snap_classes` 重分类已存在的快照(不搬内容)。
-        // 旧 dense 尾巴降级为 Binary/Extra —— 否则 Dense 会跨轮无限积累。
-        // 截短/前缀失配时,不再属于当前链的旧锚点统一降为 Extra。
-        let mut msg_snap_keys: Vec<Option<owl_store::SnapKey>> = vec![None; msg_snaps.len()];
-        let mut demote_keys: std::collections::BTreeSet<owl_store::SnapKey> =
-            std::collections::BTreeSet::new();
-        if let Some(s) = self.bank.parts().sessions.get(session_id) {
-            if cached_hit > 0 {
-                msg_snap_keys = crate::serve::session::carry_msg_snap_keys(
-                    &s.msg_snaps,
-                    &s.msg_snap_keys,
-                    &msg_snaps,
-                );
-                // 旧边界不在新 prompt 里(截短/回撤)⇒ 降为 Extra。
-                let carried: Vec<owl_store::SnapKey> =
-                    msg_snap_keys.iter().flatten().copied().collect();
-                for (at, key) in s.msg_snaps.iter().zip(s.msg_snap_keys.iter().copied()) {
-                    if let Some(key) = key {
-                        if msg_snaps.binary_search(at).is_err() && !carried.contains(&key) {
-                            demote_keys.insert(key);
-                        }
-                    }
-                }
-                // 截短:旧 turn 末 cursor 在新 prompt 之外,不能再作为起点。
-                if prompt_ids.len() < s.tokens.len() {
-                    if let Some(tail) = s.tail_snap {
-                        demote_keys.insert(tail);
-                    }
-                }
-            } else {
-                // 前缀失配/新链:旧边界与旧 tail 都不再是当前链的 Dense 锚点。
-                demote_keys.extend(s.msg_snap_keys.iter().flatten().copied());
-                if let Some(tail) = s.tail_snap {
-                    demote_keys.insert(tail);
-                }
-            }
-        }
-        let mut reclassified = 0usize;
-        let mut reclass_miss = 0usize;
-        debug_assert_eq!(
-            msg_snap_keys.len(),
-            msg_snap_classes.len(),
-            "L1 keys/classes 必须同序等长"
-        );
-        for i in 0..msg_snap_keys.len() {
-            let Some(key) = msg_snap_keys[i] else { continue };
-            let Some(class) = msg_snap_classes.get(i).copied() else {
-                continue;
-            };
-            if class == owl_store::SnapClass::Transient {
-                continue;
-            }
-            if self.bank.parts_mut().rel.reclassify_snap(key, class) {
-                reclassified += 1;
-            } else {
-                // 已被逐出是正常事件(不是错误);同时清掉 L1 残影,避免
-                // 每轮 submit 都重试一个不存在的键。
-                msg_snap_keys[i] = None;
-                reclass_miss += 1;
-            }
-        }
-        for key in demote_keys {
-            // 仍在当前消息边界表里的键由上面的分类循环管,别降级。
-            if msg_snap_keys.iter().flatten().any(|k| *k == key) {
-                continue;
-            }
-            if self
-                .bank.parts_mut().rel.reclassify_snap(key, owl_store::SnapClass::Extra)
-            {
-                reclassified += 1;
-            } else {
-                reclass_miss += 1;
-            }
-        }
-        if reclassified > 0 || reclass_miss > 0 {
-            owl_shared::metrics::with_metrics_store(|m| {
-                m.counter_add("snap.reclassify", reclassified as u64, file!(), line!());
-                m.counter_add("snap.reclassify.miss", reclass_miss as u64, file!(), line!());
-            });
-        }
         // **生成预算 = 上下文 + 本请求的输出上限**（2026-11-17 裁决 A）。
         //
         // 预留口径 = 这轮**实际可能生成的长度**：`max_new`（请求值，先被
@@ -1816,6 +1716,152 @@ impl<D: DeviceClient> RunningEngine<D> {
             .min(self.boot.cfg.knobs.max_new_cap)
             .min(window_left);
         let reserve_new = max_new;
+        // **v4 快照布局（Tail + History）**：候选 = 消息边界 + prompt 末页；
+        // 前缀命中时并入本会话已拍的布局点；由 `plan_snap_layout` 统一决定
+        // 保留集合与 Tail/History 角色。
+        let snap_on = self.boot.cfg.knobs.prefix_cache
+            && self.dev.pool.geom.paged
+            && self.dev.pool.snap_capacity() > 0;
+        let mut candidates = if snap_on {
+            crate::msg_boundary::message_snap_points(
+                &prompt_ids,
+                &self.boot.msg_open_ids,
+                page,
+            )
+        } else {
+            Vec::new()
+        };
+        if snap_on {
+            let prompt_end = prompt_ids.len() / page * page;
+            if prompt_end > 0 {
+                candidates.push(prompt_end);
+                // **尾块守护页**：下一次 append 可能改写最后一个整块的模板尾
+                // （assistant→user 的结束标记），只有 prompt_end 一张快照时
+                // `reuse_face` 会退到 1 块。保留前一页边界，确保 100 字符级
+                // append 仍能从前一页恢复。
+                if prompt_end > page {
+                    candidates.push(prompt_end - page);
+                }
+            }
+        }
+        // 会话**一律持久**（2026-11-16 原始算法 §32）：无论显式键还是内容身份，
+        // turn 终局只还设备表，不焚会话（idle 会话的快照/前缀账是下一轮命中的
+        // 依据，焚掉等于内容身份失效）。
+        let session_id = self.bank.get_or_create(session)?;
+        // 删除轮（图像 leave-gap）的旧 padded 坐标不能按 offset 直接沿用：
+        // 旧快照键要留给 scheduler 重挂到新链，绝不能在 submit 这里删掉。
+        let snap_reconcile = snap_on && !session_busy && deletion.is_none() && !positions_gap;
+        let mut old_points: Vec<usize> = Vec::new();
+        let mut old_keys: Vec<Option<owl_store::SnapKey>> = Vec::new();
+        let mut old_tail: Option<(usize, owl_store::SnapKey)> = None;
+        let mut carry_points: Vec<usize> = Vec::new();
+        let mut carry_keys: Vec<Option<owl_store::SnapKey>> = Vec::new();
+        let mut carry_tail: Option<(usize, owl_store::SnapKey)> = None;
+        // 同会话排队中：上一 turn 还没收口，此刻的会话账是“未来态”，不能拿它
+        // 做布局/删键。等上一 turn 收口后，本 turn 自己的 prefill 仍会按候选拍点。
+        if snap_reconcile {
+            if let Some(sess) = self.bank.parts().sessions.get(session_id) {
+                old_points.extend(sess.msg_snaps.iter().copied());
+                old_keys.extend(sess.msg_snap_keys.iter().copied());
+                old_tail = sess.tail_at.zip(sess.tail_snap);
+                if session_prefix > 0 {
+                    // 只沿用**当前 prompt 公共前缀**内的旧布局点：生成段回填
+                    // 可能因 BPE 接缝不同而在 tail 前失配，不能只按 prompt 长度带键。
+                    // 注意：判据是 token 公共前缀，**不是 KV 命中量** ——
+                    // 快照可独立驻留宿主/盘，KV 全被逐出也不清空快照资产（设计 §3.8）。
+                    for (&at, key) in old_points.iter().zip(old_keys.iter().copied()) {
+                        if at <= session_prefix {
+                            candidates.push(at);
+                            carry_points.push(at);
+                            carry_keys.push(key);
+                        }
+                    }
+                    if let Some((at, key)) = old_tail {
+                        if at <= session_prefix {
+                            candidates.push(at);
+                            carry_tail = Some((at, key));
+                        }
+                    }
+                }
+            }
+        }
+        let layout = crate::msg_boundary::plan_snap_layout(
+            &candidates,
+            self.boot.cfg.knobs.snap_tail,
+            self.boot.cfg.knobs.snap_session_cap,
+        );
+        let msg_snaps = layout.points;
+        let msg_snap_roles = layout.roles;
+        let mut msg_snap_keys: Vec<Option<owl_store::SnapKey>> = vec![None; msg_snaps.len()];
+        if snap_reconcile && session_prefix > 0 {
+            msg_snap_keys =
+                crate::serve::session::carry_msg_snap_keys(&carry_points, &carry_keys, &msg_snaps);
+            // 尾锚点可能不在 `msg_snaps`（旧账只记 key），按 offset 补一次。
+            if let Some((at, key)) = carry_tail {
+                if let Ok(i) = msg_snaps.binary_search(&at) {
+                    if msg_snap_keys[i].is_none() {
+                        msg_snap_keys[i] = Some(key);
+                    }
+                }
+            }
+        }
+        debug_assert_eq!(
+            msg_snap_keys.len(),
+            msg_snap_roles.len(),
+            "L1 keys/roles 必须同序等长"
+        );
+        // 同键重分类（不搬内容）；键已不在账 = 正常逐出，清掉 L1 残影。
+        let mut reclassified = 0usize;
+        let mut reclass_miss = 0usize;
+        for i in 0..msg_snap_keys.len() {
+            let Some(key) = msg_snap_keys[i] else { continue };
+            let role = msg_snap_roles[i];
+            if self.bank.parts_mut().rel.reclassify_snap(key, role) {
+                reclassified += 1;
+            } else {
+                msg_snap_keys[i] = None;
+                reclass_miss += 1;
+            }
+        }
+        // 删除不在新布局里的旧持久点（同会话排队中不动上一 turn 的账）。
+        let mut evicted = 0usize;
+        if snap_reconcile {
+            let keep: std::collections::BTreeSet<owl_store::SnapKey> =
+                msg_snap_keys.iter().flatten().copied().collect();
+            let mut drop_keys: std::collections::BTreeSet<owl_store::SnapKey> =
+                std::collections::BTreeSet::new();
+            for key in old_keys.iter().flatten().copied() {
+                if !keep.contains(&key) {
+                    drop_keys.insert(key);
+                }
+            }
+            if let Some((_, key)) = old_tail {
+                if !keep.contains(&key) {
+                    drop_keys.insert(key);
+                }
+            }
+            for key in drop_keys {
+                if self.bank.parts().rel.state_locate(key).is_none() {
+                    continue;
+                }
+                self.drop_snap_asset_for_admit(key)
+                    .map_err(SubmitError::Engine)?;
+                evicted += 1;
+            }
+        }
+        if reclassified > 0 || reclass_miss > 0 || evicted > 0 {
+            owl_shared::metrics::with_metrics_store(|m| {
+                m.counter_add("snap.reclassify", reclassified as u64, file!(), line!());
+                m.counter_add(
+                    "snap.reclassify.miss",
+                    reclass_miss as u64,
+                    file!(),
+                    line!(),
+                );
+                m.counter_add("snap.layout.recomputed", 1, file!(), line!());
+                m.counter_add("snap.history.evicted", evicted as u64, file!(), line!());
+            });
+        }
         let id = self.turns.alloc_id();
         self.turns.queue.push_back(Turn {
             id,
@@ -1828,7 +1874,7 @@ impl<D: DeviceClient> RunningEngine<D> {
             reserve_new,
             prompt_ids,
             msg_snaps,
-            msg_snap_classes,
+            msg_snap_roles,
             msg_snap_keys,
             evict_snaps,
             img_spans,

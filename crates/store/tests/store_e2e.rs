@@ -1188,23 +1188,23 @@ fn snapshot_cascade_spills_host_before_dropping_gpu() {
     let mut state = StateStore::new(1, 64);
     let host_key = owl_store::SnapKey::at_boundary(ChainHash::new(0x11));
     let gpu_key = owl_store::SnapKey::at_boundary(ChainHash::new(0x22));
-    state.register_snap_owned_class(
+    state.register_snap_owned_role(
         host_key,
         64,
         owl_store::Tier::Host,
         owl_store::SnapDurability::Durable,
         1,
         1,
-        owl_store::SnapClass::Extra,
+        owl_store::SnapRole::History,
     );
-    state.register_snap_owned_class(
+    state.register_snap_owned_role(
         gpu_key,
         64,
         owl_store::Tier::Gpu,
         owl_store::SnapDurability::Durable,
         1,
         2,
-        owl_store::SnapClass::Dense,
+        owl_store::SnapRole::Tail,
     );
     let room = Room {
         host_enabled: true,
@@ -1282,31 +1282,31 @@ fn snapshot_cascade_spills_host_before_dropping_gpu() {
     );
 }
 
-/// **两池档（无盘）宿主快照满**：必须按 `SnapClass` 先淘汰更冷的宿主快照，
-/// 不能因为宿主瞬时无位就把设备的 `Dense` 快照 Drop（2026-11-13）。
+/// **两池档（无盘）宿主快照满**：必须按 `SnapRole` 先淘汰更冷的宿主快照，
+/// 不能因为宿主瞬时无位就把设备的 `Tail` 快照 Drop（2026-11-13）。
 #[test]
-fn two_tier_host_snapshot_relief_respects_class() {
+fn two_tier_host_snapshot_relief_respects_role() {
     let l = leg(1); // 宿主开启；磁盘由 Room 显式关掉
     let mut state = StateStore::new(1, 64);
     let host_key = owl_store::SnapKey::at_boundary(ChainHash::new(0x31));
     let gpu_key = owl_store::SnapKey::at_boundary(ChainHash::new(0x32));
-    state.register_snap_owned_class(
+    state.register_snap_owned_role(
         host_key,
         64,
         owl_store::Tier::Host,
         owl_store::SnapDurability::Durable,
         1,
         1,
-        owl_store::SnapClass::Extra,
+        owl_store::SnapRole::History,
     );
-    state.register_snap_owned_class(
+    state.register_snap_owned_role(
         gpu_key,
         64,
         owl_store::Tier::Gpu,
         owl_store::SnapDurability::Durable,
         1,
         2,
-        owl_store::SnapClass::Dense,
+        owl_store::SnapRole::Tail,
     );
     let room = Room {
         host_enabled: true,
@@ -1337,43 +1337,43 @@ fn two_tier_host_snapshot_relief_respects_class() {
         v.out.iter().any(
             |o| matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == host_key)
         ),
-        "必须先 Drop 更冷的宿主 Extra：{:?}",
+        "必须先 Drop 更冷的宿主 History：{:?}",
         v.out
     );
     assert!(
         v.out.iter().any(
             |o| matches!(o, EvictOut::Snap { key, sink: Sink::Host } if *key == gpu_key)
         ),
-        "再让设备 Dense 下沉：{:?}",
+        "再让设备 Tail 下沉：{:?}",
         v.out
     );
     assert!(
         v.out.iter().all(
             |o| !matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == gpu_key)
         ),
-        "设备 Dense 不得被 Drop：{:?}",
+        "设备 Tail 不得被 Drop：{:?}",
         v.out
     );
 
-    // 反向：宿主是 Dense、设备是 Extra ⇒ 应丢设备 Extra，宿主 Dense 留下。
+    // 反向：宿主是 Tail、设备是 History ⇒ 应丢设备 History，宿主 Tail 留下。
     let mut state = StateStore::new(1, 64);
-    state.register_snap_owned_class(
+    state.register_snap_owned_role(
         host_key,
         64,
         owl_store::Tier::Host,
         owl_store::SnapDurability::Durable,
         1,
         1,
-        owl_store::SnapClass::Dense,
+        owl_store::SnapRole::Tail,
     );
-    state.register_snap_owned_class(
+    state.register_snap_owned_role(
         gpu_key,
         64,
         owl_store::Tier::Gpu,
         owl_store::SnapDurability::Durable,
         1,
         2,
-        owl_store::SnapClass::Extra,
+        owl_store::SnapRole::History,
     );
     let v = plan_capacity(
         &l,
@@ -1395,14 +1395,14 @@ fn two_tier_host_snapshot_relief_respects_class() {
         v.out.iter().all(
             |o| !matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == host_key)
         ),
-        "宿主 Dense 不得为设备 Extra 让位：{:?}",
+        "宿主 Tail 不得为设备 History 让位：{:?}",
         v.out
     );
     assert!(
         v.out.iter().any(
             |o| matches!(o, EvictOut::Snap { key, sink: Sink::Drop } if *key == gpu_key)
         ),
-        "设备 Extra 应被 Drop：{:?}",
+        "设备 History 应被 Drop：{:?}",
         v.out
     );
 }

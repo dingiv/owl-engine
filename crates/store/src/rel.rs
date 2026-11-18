@@ -19,8 +19,8 @@
 use crate::budget::{Admission, AdmissionVerdict, BudgetInputs, TurnFloor, VramBudget};
 use crate::disk::{AdoptReport, DiskEvictPlanOf, DiskTier, FillPlanOf, SpillPlanOf};
 use crate::error::{StoreError, StoreResult};
-use crate::host::{HostBlock, HostTier};
 use crate::host::SlotTable;
+use crate::host::{HostBlock, HostTier};
 use crate::id::{ChainHash, PrefixId, SnapKey};
 use crate::kv::{CacheUpdate, KvDiag, KvStats};
 use crate::leg::{BlockLeg, Carrier, ChainHit, InPlan, LegConfig, LegStats, PoolLayout, ReadPlan};
@@ -232,8 +232,8 @@ pub struct SnapEvictPreview {
     pub depth: usize,
     /// 是否为生成段(逐出即丢)。
     pub transient: bool,
-    /// 淘汰优先级档(Dense/Binary/Extra/Transient;2026-11-12)。
-    pub class: crate::state::SnapClass,
+    /// 持久角色（Tail / History；Transient 看 `transient`）。
+    pub role: crate::state::SnapRole,
 }
 
 /// **盘上链索引重建报告**(S6.1;boot)。
@@ -608,7 +608,8 @@ impl Rel {
         session: u64,
         tags: &[crate::kv::BlockTag],
     ) -> StoreResult<CacheUpdate> {
-        self.leg.register_chain_owned_tagged(tokens, table, session, tags)
+        self.leg
+            .register_chain_owned_tagged(tokens, table, session, tags)
     }
 
     /// 从宿主层取走内容（溢写/下沉）。
@@ -775,11 +776,7 @@ impl Rel {
     }
 
     /// 归还 GDN 行（可同时挂一条快照）。
-    pub fn return_state_row(
-        &mut self,
-        row: usize,
-        snap: Option<SnapKey>,
-    ) -> StoreResult<()> {
+    pub fn return_state_row(&mut self, row: usize, snap: Option<SnapKey>) -> StoreResult<()> {
         self.state.return_row(row, snap)
     }
 
@@ -912,7 +909,10 @@ impl Rel {
 
     /// KV 盘层驻留键。
     pub fn kv_disk_resident_keys(&self) -> Vec<ChainHash> {
-        self.disk.as_ref().map(|d| d.resident_keys()).unwrap_or_default()
+        self.disk
+            .as_ref()
+            .map(|d| d.resident_keys())
+            .unwrap_or_default()
     }
 
     /// 制定 KV 溢写计划（未接线 = 结构化错）。
@@ -1037,7 +1037,10 @@ impl Rel {
 
     /// 状态腿盘层驻留键。
     pub fn snap_disk_resident_keys(&self) -> Vec<SnapKey> {
-        self.snap_disk.as_ref().map(|d| d.resident_keys()).unwrap_or_default()
+        self.snap_disk
+            .as_ref()
+            .map(|d| d.resident_keys())
+            .unwrap_or_default()
     }
 
     /// 制定快照溢写计划（未接线 = 结构化错）。
@@ -1268,10 +1271,10 @@ impl Rel {
                     depth,
                     transient: self.state.snap_durability(k)
                         == Some(crate::state::SnapDurability::Transient),
-                    class: self
+                    role: self
                         .state
-                        .snap_class(k)
-                        .unwrap_or(crate::state::SnapClass::Extra),
+                        .snap_role(k)
+                        .unwrap_or(crate::state::SnapRole::History),
                 }
             })
             .collect()
@@ -1367,16 +1370,12 @@ impl Rel {
             if ok == 0 {
                 // **身份对拍诊断**(2026-11-01 P1):索引算出的前几个块身份 vs 盘上
                 // 真实键 —— "盘上有内容却一块都不认"时,这一行直接给谁对不上。
-                if let (Some(first), Some(disk_keys)) = (
-                    idx.tokens.chunks(page).next(),
-                    Some(disk.resident_keys()),
-                ) {
+                if let (Some(first), Some(disk_keys)) =
+                    (idx.tokens.chunks(page).next(), Some(disk.resident_keys()))
+                {
                     let h0 = crate::kv::hash_block(ChainHash::new(0), first, 0);
-                    let sample: Vec<String> = disk_keys
-                        .iter()
-                        .take(3)
-                        .map(|k| format!("{k:?}"))
-                        .collect();
+                    let sample: Vec<String> =
+                        disk_keys.iter().take(3).map(|k| format!("{k:?}")).collect();
                     owl_shared::log_warn!(
                         "store",
                         "身份对拍:索引首块 h={h0:?}(tokens[0..{page}]) 盘上含={} · \
@@ -1532,7 +1531,7 @@ impl Rel {
         durability: crate::state::SnapDurability,
         session: u64,
         depth: usize,
-        class: crate::state::SnapClass,
+        role: crate::state::SnapRole,
     ) -> StoreResult<usize> {
         let mut ghosts = 0usize;
         if self.snap_host.get(key).is_some() {
@@ -1545,14 +1544,14 @@ impl Rel {
                 ghosts += 1;
             }
         }
-        self.state.register_snap_owned_class(
+        self.state.register_snap_owned_role(
             key,
             bytes,
             Tier::Gpu,
             durability,
             session,
             depth,
-            class,
+            role,
         );
         if ghosts > 0 {
             owl_shared::log_debug!(
@@ -1571,17 +1570,18 @@ impl Rel {
         &self,
         session: u64,
         key: SnapKey,
-        class: crate::state::SnapClass,
+        durability: crate::state::SnapDurability,
         policy: crate::state::SnapAdmitPolicy,
         protect: &[SnapKey],
     ) -> crate::state::SnapAdmit {
-        self.state.admit_snap(session, key, class, policy, protect)
+        self.state
+            .admit_snap(session, key, durability, policy, protect)
     }
 
-    /// **只重分类快照条目的淘汰档**(不搬内容;2026-11-12 二刀)。
+    /// **只重分类快照条目的角色**(不搬内容)。
     /// 返回 `false` = 键已不在账(正常逐出)。
-    pub fn reclassify_snap(&mut self, key: SnapKey, class: crate::state::SnapClass) -> bool {
-        self.state.reclassify_snap(key, class)
+    pub fn reclassify_snap(&mut self, key: SnapKey, role: crate::state::SnapRole) -> bool {
+        self.state.reclassify_snap(key, role)
     }
 
     /// **会话关闭:释放该会话的快照归属**(不丢内容;2026-11-12 二刀)。
@@ -1615,10 +1615,7 @@ impl Rel {
     /// 状态腿宿主层**还能装几条快照**。
     pub fn snap_host_free_slots(&self) -> usize {
         let used = self.snap_host.used_bytes() + self.snap_host.free_bytes();
-        self.snap_host
-            .budget_bytes()
-            .saturating_sub(used)
-            / self.snap_file_bytes().max(1)
+        self.snap_host.budget_bytes().saturating_sub(used) / self.snap_file_bytes().max(1)
     }
 
     /// 状态腿宿主层总槽数(= 预算 / 单条快照字节;0 = 关层)。
@@ -1911,12 +1908,7 @@ impl Rel {
     }
 
     /// 临时工作区票（调用方给槽/字节；turn 生命周期或调用方显式归还）。
-    pub fn reserve_temp(
-        &mut self,
-        turn: u64,
-        slots: usize,
-        bytes: usize,
-    ) -> StoreResult<Grant> {
+    pub fn reserve_temp(&mut self, turn: u64, slots: usize, bytes: usize) -> StoreResult<Grant> {
         self.reserve_direct(turn, ReservationKind::Temp, slots, bytes, slots, bytes)
     }
 
@@ -1965,10 +1957,7 @@ impl Rel {
     ///
     /// 这种条目只可能来自"start 半态"（`finish_turn` 没跑到）。引擎在
     /// `abandon` 拿不到归属 turn 时调它 —— 保证泄漏能自愈，而不是永久占天花板。
-    pub fn finish_orphan_turns(
-        &mut self,
-        live: &[u64],
-    ) -> StoreResult<Vec<(u64, TurnRelease)>> {
+    pub fn finish_orphan_turns(&mut self, live: &[u64]) -> StoreResult<Vec<(u64, TurnRelease)>> {
         let orphans: Vec<u64> = self
             .admission
             .active_ids()
@@ -2230,12 +2219,12 @@ impl Rel {
         // 的"部分前缀"复用面从 ~97% 塔到 29%(7k 共享只复用 2k = 白重算 5k
         // token ≈ 5 s/请求)。
         //
-        // 政策 = **同一份快照出序**(`order_snap_victims`):先按 `SnapClass`
-        // 档位(`Transient → Extra → 老 Binary → Dense`),同档再交给
-        // `EvictPolicy`。只比 `Tier::Host` 的候选,排序后取第一个。
+        // 政策 = **同一份快照出序**(`order_snap_victims`):Transient 最前，
+        // 然后 History、最后 Tail；同角色再交给 `EvictPolicy`。只比
+        // `Tier::Host` 的候选,排序后取第一个。
         //
-        // 不能直接 `self.evict.order`:那会绕过 SnapClass,宿主满时可能先丢
-        // 一条 Dense 尾锚点,却留下更冷的 Extra。代价说明:先逐后搬 ⇒ 若接下来
+        // 不能直接 `self.evict.order`:那会绕过角色,宿主满时可能先丢
+        // 一条 Tail 尾锚点,却留下更冷的 History。代价说明:先逐后搬 ⇒ 若接下来
         // 的 DMA 失败(`abort_snap_offload`),被逐条目已丢(比"丢新条目"代价小
         // —— 它本来就在淘汰序最前)。
         let last = self.snap_host.used_bytes();
@@ -2256,11 +2245,8 @@ impl Rel {
                             "宿主梯满且无 Host 层候选可逐({why};层账={last}B)"
                         )));
                     }
-                    let v = crate::hooks::order_snap_victims(
-                        self.evict.as_ref(),
-                        cands,
-                        &self.state,
-                    )
+                    let v =
+                        crate::hooks::order_snap_victims(self.evict.as_ref(), cands, &self.state)
                     .into_iter()
                     .filter_map(|c| c.snap)
                     .next()
@@ -2601,13 +2587,15 @@ impl Rel {
         }
         tiers.owners = owner_map
             .into_iter()
-            .map(|((owner, tier, kind), (bytes, entries))| crate::tier::OwnerRow {
+            .map(
+                |((owner, tier, kind), (bytes, entries))| crate::tier::OwnerRow {
                 owner,
                 tier,
                 kind,
                 bytes,
                 entries,
-            })
+                },
+            )
             .collect();
         tiers
             .owners
@@ -2932,10 +2920,7 @@ mod tests {
         assert_eq!(r.state.rows_free(), r.state.rows_total());
 
         // 幂等：重复收口 = 全零，不再报错、不再改账。
-        assert_eq!(
-            r.finish_turn(7).expect("重复收口"),
-            TurnRelease::default()
-        );
+        assert_eq!(r.finish_turn(7).expect("重复收口"), TurnRelease::default());
     }
 
     /// **孤儿收口**：准入账里有、但不在活跃集里的 turn 由围栏一次清掉。
@@ -3148,7 +3133,10 @@ mod tests {
         );
 
         // 状态腿到位 ⇒ Exact
-        let row = r.state.borrow_row(crate::tier::Owner::Turn(1)).expect("借行");
+        let row = r
+            .state
+            .borrow_row(crate::tier::Owner::Turn(1))
+            .expect("借行");
         r.state
             .return_row(row, Some(id.snap_key()))
             .expect("落快照");
@@ -3168,7 +3156,10 @@ mod tests {
         }
         let a = r.leg.tail_hash(&ta, 1).expect("A 身份");
         let b = r.leg.tail_hash(&tb, 1).expect("B 身份");
-        let row = r.state.borrow_row(crate::tier::Owner::Turn(1)).expect("借行");
+        let row = r
+            .state
+            .borrow_row(crate::tier::Owner::Turn(1))
+            .expect("借行");
         r.state
             .return_row(row, Some(SnapKey::at_boundary(ChainHash::new(9))))
             .expect("快照");
@@ -3237,44 +3228,44 @@ mod tests {
         );
     }
 
-    /// **可删图锚点可淘汰门（2026-11-13）**：锚点是 `Extra` 档、不进任何
-    /// 保护面 ⇒ 空间不足时**先于 Dense** 被逐出。这是“不搞 pin”的硬门：
-    /// 谁把锚点提到 `Dense` 或塞进 `Protected`，这里就红。
+    /// **可删图锚点可淘汰门（2026-11-13；v4 角色）**：锚点是 `History`、
+    /// 不进任何保护面 ⇒ 空间不足时**先于 Tail** 被逐出。这是“不搞 pin”的硬门：
+    /// 谁把锚点提到 `Tail` 或塞进 `Protected`，这里就红。
     #[test]
-    fn evict_anchor_snapshot_is_extra_and_evictable() {
-        use crate::state::SnapClass;
+    fn evict_anchor_snapshot_is_history_and_evictable() {
+        use crate::state::SnapRole;
         let mut r = rel(2);
         let anchor = SnapKey::at_boundary(ChainHash::new(0xA1));
-        let dense = SnapKey::at_boundary(ChainHash::new(0xA2));
-        // 同一会话：锚点 = Extra（capture 路径的 class），尾锚点 = Dense。
-        r.state.register_snap_owned_class(
+        let tail = SnapKey::at_boundary(ChainHash::new(0xA2));
+        // 同一会话：锚点 = History（capture 路径的 role），尾锚点 = Tail。
+        r.state.register_snap_owned_role(
             anchor,
             BLOCK_BYTES,
             Tier::Gpu,
             SnapDurability::Durable,
             7,
             5,
-            SnapClass::Extra,
+            SnapRole::History,
         );
-        r.state.register_snap_owned_class(
-            dense,
+        r.state.register_snap_owned_role(
+            tail,
             BLOCK_BYTES,
             Tier::Gpu,
             SnapDurability::Durable,
             7,
             6,
-            SnapClass::Dense,
+            SnapRole::Tail,
         );
-        assert_eq!(r.state.snap_class(anchor), Some(SnapClass::Extra));
+        assert_eq!(r.state.snap_role(anchor), Some(SnapRole::History));
         assert_eq!(
             r.snap_victim_order(&[]).first(),
             Some(&anchor),
-            "Extra 档的锚点必须先进淘汰序（不是 pin）"
+            "History 锚点必须先进淘汰序（不是 pin）"
         );
         // 锚点不在 `Protected` 面里；只有**正在载入**的 key 才被显式挡住。
         assert_eq!(
             r.snap_victim_order(&[anchor]),
-            vec![dense],
+            vec![tail],
             "显式 protect（正在载入）才挡；引擎不会把锚点塞进 protect"
         );
     }
@@ -3492,7 +3483,11 @@ mod tests {
         assert!(v.deny.is_none(), "前缀够配额 ⇒ 不拒:{:?}", v.deny);
         assert_eq!(
             v.out,
-            vec![EvictOut::Kv { chain: tail, sink: Sink::Disk, span: 1 }],
+            vec![EvictOut::Kv {
+                chain: tail,
+                sink: Sink::Disk,
+                span: 1
+            }],
             "长链只搬 root 前缀 1 块:{v:?}"
         );
     }
@@ -3849,13 +3844,30 @@ mod tests {
         let disk_snaps = v
             .out
             .iter()
-            .filter(|o| matches!(o, EvictOut::Snap { sink: Sink::Disk, .. }))
+            .filter(|o| {
+                matches!(
+                    o,
+                    EvictOut::Snap {
+                        sink: Sink::Disk,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(disk_snaps, 1, "只出一张快照 Disk 票:{v:?}");
         assert!(
-            v.out
-                .iter()
-                .all(|o| !matches!(o, EvictOut::Kv { .. } | EvictOut::Snap { sink: Sink::Host, .. } | EvictOut::Snap { sink: Sink::Drop, .. })),
+            v.out.iter().all(|o| !matches!(
+                o,
+                EvictOut::Kv { .. }
+                    | EvictOut::Snap {
+                        sink: Sink::Host,
+                        ..
+                    }
+                    | EvictOut::Snap {
+                        sink: Sink::Drop,
+                        ..
+                    }
+            )),
             "HostPressure 不应出 KV/Host/Drop 票:{v:?}"
         );
     }
@@ -3906,7 +3918,14 @@ mod tests {
         assert_eq!(
             v.out
                 .iter()
-                .filter(|o| matches!(o, EvictOut::Kv { sink: Sink::Disk, span: 1, .. }))
+                .filter(|o| matches!(
+                    o,
+                    EvictOut::Kv {
+                        sink: Sink::Disk,
+                        span: 1,
+                        ..
+                    }
+                ))
                 .count(),
             1,
             "KV 应出 1 张前缀票:{v:?}"
@@ -3914,13 +3933,21 @@ mod tests {
         assert_eq!(
             v.out
                 .iter()
-                .filter(|o| matches!(o, EvictOut::Snap { sink: Sink::Disk, .. }))
+                .filter(|o| matches!(
+                    o,
+                    EvictOut::Snap {
+                        sink: Sink::Disk,
+                        ..
+                    }
+                ))
                 .count(),
             1,
             "快照应出 1 张票:{v:?}"
         );
         assert!(
-            v.out.iter().all(|o| o.sink() != Sink::Host && o.sink() != Sink::Drop),
+            v.out
+                .iter()
+                .all(|o| o.sink() != Sink::Host && o.sink() != Sink::Drop),
             "HostPressure 不得 Host/Drop:{v:?}"
         );
     }
@@ -4462,7 +4489,11 @@ mod tests {
         // A 先落盘（更老），B 后落盘（更新）。
         for h in [ha, hb] {
             let plan = r.disk.as_ref().expect("盘").plan_spill(h).expect("计划");
-            r.disk.as_mut().expect("盘").commit_spill(&plan).expect("落账");
+            r.disk
+                .as_mut()
+                .expect("盘")
+                .commit_spill(&plan)
+                .expect("落账");
         }
         let ia = crate::disk_index::ChainIndex::new(32, ta).expect("A 索引");
         let ib = crate::disk_index::ChainIndex::new(32, tb).expect("B 索引");
@@ -4498,11 +4529,7 @@ mod tests {
                 .commit_spill(&plan)
                 .expect("落账");
         }
-        let idx = crate::disk_index::ChainIndex::with_tags(
-            32,
-            tokens.clone(),
-            tags.clone(),
-        )
+        let idx = crate::disk_index::ChainIndex::with_tags(32, tokens.clone(), tags.clone())
         .expect("索引");
         let rep = r.adopt_disk_chains(&[idx]).expect("重建");
         assert_eq!((rep.chains, rep.blocks), (1, 3), "{rep:?}");
@@ -4715,7 +4742,10 @@ mod tests {
         let floor = r
             .reserve_capacity(1, 2, 2, crate::reservations::ReservationKind::ActiveFloor)
             .expect("floor");
-        assert_eq!(floor.kind, crate::reservations::ReservationKind::ActiveFloor);
+        assert_eq!(
+            floor.kind,
+            crate::reservations::ReservationKind::ActiveFloor
+        );
         r.reserve_row(1).expect("row");
         r.reserve_load(1, 3).expect("load");
         r.reserve_snap(1).expect("snap");

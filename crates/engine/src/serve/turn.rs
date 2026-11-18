@@ -334,8 +334,8 @@ pub(crate) struct Turn {
     pub(crate) prompt_ids: Vec<u32>,
     /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
     pub(crate) msg_snaps: Vec<usize>,
-    /// 与 `msg_snaps` 同序的淘汰优先级档（Dense/Binary/Extra；2026-11-12）
-    pub(crate) msg_snap_classes: Vec<owl_store::SnapClass>,
+    /// 与 `msg_snaps` 同序的角色（Tail / History；v4）
+    pub(crate) msg_snap_roles: Vec<owl_store::SnapRole>,
     /// 与 `msg_snaps` 同序的快照键（`None` = 尚未拍/已逐出；2026-11-12 二刀）
     pub(crate) msg_snap_keys: Vec<Option<owl_store::SnapKey>>,
     /// **可删图前的硬快照点**（token offset；2026-11-13）。
@@ -377,11 +377,13 @@ pub(crate) struct ActiveTurn {
     /// 每次 capture 成功后更新。store 保洁/驱逐把它当显式保护面 ——
     /// 快照面没有引用计数,不能像 KV 那样靠 `refs > 1` 兜底。
     pub(crate) last_snap: Option<owl_store::SnapKey>,
+    /// 最新边界快照的 token offset（页对齐；v4 布局用）。
+    pub(crate) last_snap_at: Option<usize>,
     pub(crate) prompt_ids: Vec<u32>,
     /// 页对齐的消息边界快照点（token offset；空 = 关闭/未识别）
     pub(crate) msg_snaps: Vec<usize>,
-    /// 与 `msg_snaps` 同序的淘汰优先级档（Dense/Binary/Extra；2026-11-12）
-    pub(crate) msg_snap_classes: Vec<owl_store::SnapClass>,
+    /// 与 `msg_snaps` 同序的角色（Tail / History；v4）
+    pub(crate) msg_snap_roles: Vec<owl_store::SnapRole>,
     /// 与 `msg_snaps` 同序的快照键（`None` = 尚未拍/已逐出；2026-11-12 二刀）
     pub(crate) msg_snap_keys: Vec<Option<owl_store::SnapKey>>,
     /// **可删图前的硬快照点**（token offset；2026-11-13；见 `Turn::evict_snaps`）

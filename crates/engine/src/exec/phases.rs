@@ -1069,7 +1069,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     owl_store::SnapDurability::Transient,
                     true,
                     true,
-                    owl_store::SnapClass::Transient,
+                    owl_store::SnapRole::History,
                 )
                 .await?;
             }
@@ -1643,7 +1643,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                     owl_store::SnapDurability::Transient,
                     true,
                     true,
-                    owl_store::SnapClass::Transient,
+                    owl_store::SnapRole::History,
                 )
                 .await?;
             }

@@ -829,7 +829,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                         owl_store::SnapDurability::Transient,
                         true,
                         true,
-                        owl_store::SnapClass::Transient,
+                        owl_store::SnapRole::History,
                     )
                     .await?;
                     owl_shared::log_debug!("spec-round", "边界:snap_tail 完");
@@ -1941,7 +1941,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // 稀疏锚点(见 `phases.rs` 的 `SNAP_EVERY`)。
         // 淘汰优先级档(2026-11-12):末边界 = Dense;消息边界按 dense/binary/extra;
         // 其余 chunk 锚点 = Extra。
-        let class = self.prefill_snap_class(fed);
+        let role = self.prefill_snap_role(fed);
         self.capture_gdn_snap_tail(
             sid,
             fed,
@@ -1949,43 +1949,44 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             owl_store::SnapDurability::Durable,
             snap_keep,
             index_now,
-            class,
+            role,
         )
         .await
     }
 
-    /// prefill 边界的快照档:末边界/消息边界(按 `msg_snap_classes`)→
-    /// 否则 Extra。不是 pin —— 只决定淘汰顺序。
+    /// prefill 边界的快照角色：prompt 末页 / 消息边界按布局角色；
+    /// 可删图锚点与普通 chunk 边界都落 History。
     ///
-    /// **可删图锚点（`evict_snaps`）恒落 `Extra`**（2026-11-13）：它们是
+    /// **可删图锚点（`evict_snaps`）恒落 `History`**（2026-11-13）：它们是
     /// 删除发生时的恢复面，但**不是长期资产** —— 不进 `msg_snap_keys` /
-    /// `tail_snap` / `recent_tails`，也不进 `Protected`；槽位/宿主/盘紧张时
-    /// 与其它 Extra 一样按 LRU 先走。`fed == prompt_len` 的末边界仍走 Dense。
-    fn prefill_snap_class(&self, fed: usize) -> owl_store::SnapClass {
+    /// `tail_snap` / `Protected`；槽位/宿主/盘紧张时与其它 History 一样先走。
+    fn prefill_snap_role(&self, fed: usize) -> owl_store::SnapRole {
         let Ok(act) = self.turns.active() else {
-            return owl_store::SnapClass::Extra;
+            return owl_store::SnapRole::History;
         };
         if fed >= act.prompt_ids.len() {
-            return owl_store::SnapClass::Dense;
+            return owl_store::SnapRole::Tail;
         }
-        if act.evict_snaps.binary_search(&fed).is_ok() {
-            return owl_store::SnapClass::Extra;
-        }
-        match act.msg_snaps.binary_search(&fed) {
-            Ok(i) => act
-                .msg_snap_classes
+        // 布局角色优先：尾块守护页也在 hard_snaps 里，但它在 msg_snaps
+        // 里被标成 Tail，不能按图锚点降成 History。
+        if let Ok(i) = act.msg_snaps.binary_search(&fed) {
+            return act
+                .msg_snap_roles
                 .get(i)
                 .copied()
-                .unwrap_or(owl_store::SnapClass::Extra),
-            Err(_) => owl_store::SnapClass::Extra,
+                .unwrap_or(owl_store::SnapRole::History);
         }
+        if act.evict_snaps.binary_search(&fed).is_ok() {
+            return owl_store::SnapRole::History;
+        }
+        owl_store::SnapRole::History
     }
 
     /// **准入替换**:整体释放一条快照资产(设备槽 + 宿主/盘 + 状态账)。
     ///
     /// store 只持账,不持设备句柄 ⇒ 设备槽的清理留在引擎(两 rank 镜像)。
     /// 账在设备层但池内无槽 = 账/槽不平,响亮拒(不静默丢)。
-    fn drop_snap_asset_for_admit(&mut self, key: owl_store::SnapKey) -> Result<()> {
+    pub(crate) fn drop_snap_asset_for_admit(&mut self, key: owl_store::SnapKey) -> Result<()> {
         let (tier, bytes) = self.bank.parts_mut().rel.drop_snap_asset(key)?;
         if tier == owl_store::Tier::Gpu {
             let slot = self.dev.pool.snap_slot_of(key).ok_or_else(|| {
@@ -2014,7 +2015,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         key: owl_store::SnapKey,
         full_blocks: usize,
         durability: owl_store::SnapDurability,
-        class: owl_store::SnapClass,
+        role: owl_store::SnapRole,
     ) -> Result<bool> {
         let gdn_slot = self.turns.active().map(|a| a.gdn_slot).unwrap_or(0);
         // **准入(2026-11-12)**:先问账,再选槽/拷贝。
@@ -2025,13 +2026,16 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         // - `Touch` ⇒ 同键已在账:照常重拍(内容刷新),不占新格;
         // - `Transient` / 无会话归属 / `session_cap=0` ⇒ `Add`(旧行为)。
         //
-        // 快照准入只按 class 优先级，不按活跃会话点名保护。
+        // 快照准入只按角色优先级，不按活跃会话点名保护。
         let policy = owl_store::SnapAdmitPolicy {
             session_cap: self.boot.cfg.knobs.snap_session_cap,
-            structural_reserve: self.boot.cfg.knobs.snap_structural_reserve,
         };
-        // 快照准入只按 class 优先级；不在 admission 里按活跃会话点名保护。
-        match self.bank.parts().rel.admit_snap(sid, key, class, policy, &[]) {
+        match self
+            .bank
+            .parts()
+            .rel
+            .admit_snap(sid, key, durability, policy, &[])
+        {
             owl_store::SnapAdmit::Add => {
                 owl_shared::metrics::with_metrics_store(|m| {
                     m.counter_add("snap.admit.add", 1, file!(), line!());
@@ -2048,7 +2052,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
                 });
                 owl_shared::log_debug!(
                     "snap",
-                    "准入跳过:session={sid:#x} key={key:?} class={class:?} reason={reason:?}"
+                    "准入跳过:session={sid:#x} key={key:?} role={role:?} reason={reason:?}"
                 );
                 return Ok(false);
             }
@@ -2093,7 +2097,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             durability,
             sid,
             full_blocks,
-            class,
+            role,
         )?;
         if ghosts > 0 {
             owl_shared::metrics::with_metrics_store(|m| {
@@ -2102,7 +2106,12 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         }
         // **P1-2**:本 turn 的最新边界进入显式保护面。快照面没有引用计数,
         // 若不记在这里,下一次 Idle/Pressure 可能把它当成最冷条目搬走。
-        self.turns.active_mut()?.last_snap = Some(key);
+        let at = full_blocks.saturating_mul(self.dev.pool.geom.page);
+        {
+            let act = self.turns.active_mut()?;
+            act.last_snap = Some(key);
+            act.last_snap_at = Some(at);
+        }
         Ok(true)
     }
 
@@ -2121,7 +2130,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         &mut self,
         sid: u64,
         durability: owl_store::SnapDurability,
-        class: owl_store::SnapClass,
+        role: owl_store::SnapRole,
     ) -> Result<bool> {
         let (full_blocks, key) = {
             let s = self
@@ -2133,7 +2142,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             return Ok(false);
         }
         let captured = self
-            .capture_snap_at_boundary(sid, key, full_blocks, durability, class)
+            .capture_snap_at_boundary(sid, key, full_blocks, durability, role)
             .await?;
         if captured {
             // **L1 键回填**:cursor 边界若正好是某个消息边界,记下 key
@@ -2147,7 +2156,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
             }
             owl_shared::log_info!(
                 "snap",
-                "cursor 补拍:session={sid:#x} 边界 {full_blocks} 块 的快照已就位(class={class:?})"
+                "cursor 补拍:session={sid:#x} 边界 {full_blocks} 块 的快照已就位(role={role:?})"
             );
         }
         Ok(captured)
@@ -2166,7 +2175,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         durability: owl_store::SnapDurability,
         snap_keep: bool,
         index_now: bool,
-        class: owl_store::SnapClass,
+        role: owl_store::SnapRole,
     ) -> Result<()> {
         // 快照面开关(只门住第 ④ 步;前三步照走)。
         //
@@ -2276,7 +2285,7 @@ impl<D: DeviceClient> crate::running::RunningEngine<D> {
         let mut captured = false;
         if snap_on {
             captured = self
-                .capture_snap_at_boundary(sid, key, full_blocks, durability, class)
+                .capture_snap_at_boundary(sid, key, full_blocks, durability, role)
                 .await?;
             if !captured {
                 owl_shared::log_debug!(
