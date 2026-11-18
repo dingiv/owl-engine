@@ -1,292 +1,175 @@
 # ============================================================================
-# owl 全量配置模板(`full.toml`)
+# owl 公开配置模板（full.toml）
 # ============================================================================
 #
-# 本文件是**唯一全量档**:所有键都显式写出(缺一个就拒启 —— 启动点可复现)。
-# 其它档用顶部 `extends` 继承它,只写自己的差异:
+# 这里只列用户需要关心的键；诊断/内部面（[probes]、[cuda] 细项、loader dump、
+# kvmem 诊断等）默认不在模板里，需要时用 `--set` 临时开启。
 #
-#   extends = ["full.toml"]        # 相对本文件;也可写绝对路径;数组按序覆盖
-#   [model]
-#   path = "/path/to/checkpoint"
-#   [parallel]
-#   mode = "tensor"
-#   device = ["3090", "3090"]      # BDF / UUID / 名字子串(禁 CUDA 序号)
+# 用法：
+#   cp profiles/full.toml my.toml
+#   # 改 [model] path / [parallel] device / [server] bind
+#   server -p my.toml --check
 #
-# 生成/校验:
-#   server -p profiles/full.toml --check
-#   server -p profiles/full.toml --print-config   # 生效值(+ 来源)
-#
-# 本文件里的值 = **一个可跑的单卡 27B AWQ 配置**(3090 Ti 24G / 128k);
-# 0 / false / 空串 = 关闭或默认，**生产 leaf 不要照抄全量**，只写与模板/组件不同的键。
-# 复制出去改站点事实即可(改完记得 `--check`)。
+# 其它档用 extends 继承本文件，只写差异。路径相对声明它的文件。
 # ============================================================================
 
-# 继承列表:按序覆盖(后者胜);相对路径 = 相对**声明它的这个文件**。
 extends = []
 
 # ---------------------------------------------------------------------------
-# [server] —— HTTP 服务面(监听 / 模板 / 工具解析)
+# [server] —— HTTP 服务面
 # ---------------------------------------------------------------------------
 [server]
-# **监听全部网卡**(2026-11-03 用户裁决:局域网直连)。⚠️ 本服务**无鉴权**
-# ⇒ 只在可信内网用;不要做公网端口映射。端口 = 硬件形状(见 profiles/README)。
+# 监听地址；服务无鉴权，不要直接暴露到公网。
 bind = "0.0.0.0:8137"
-# 原始请求 JSON 落盘目录（空 = 关；每请求一份 body，供前端联调复现；
-# 含业务数据/图片 data URL，开启前确认隐私与磁盘容量）。
+# 原始请求 JSON 落盘（空 = 关；含业务数据，开启前确认隐私）。
 request_dump_dir = ""
-# 模板路径覆盖:空 = 用模型快照 `<model.path>/chat_template.jinja`;
-# 相对路径 = 相对模型目录。
+# 模板覆盖（空 = 模型快照内 chat_template.jinja；相对路径 = 相对模型目录）。
 template_path = ""
-# **工具/思考等模板变量住独立文件**（2026-11-16 用户裁决：模板里的
-# 变量不属于引擎配置）。空 = 自动找 `<model.path>/chat_template.toml`；
-# 相对路径 = 相对模型目录。文件形态 = 扁平 TOML 表，一个键 = 一个 jinja
-# 变量，例如：
-#   tool_call_format = "xml"                       # xml | json（模板按它选分支）
-#   auto_disable_thinking_with_tools = false
-#   reasoning_effort = "medium"
-# 请求 `chat_template_kwargs` 覆盖文件；文件覆盖模板自带缺省。
+# 模板变量文件（空 = 自动找 <model.path>/chat_template.toml）。
 template_vars = ""
 
 # ---------------------------------------------------------------------------
-# [runtime] —— 引擎运行时(上下文 / 调度 / 准入 / 会话缺省)
+# [runtime] —— 上下文 / 调度 / 准入
 # ---------------------------------------------------------------------------
 [runtime]
-# 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
+# 满员姿态：reject | queue | queue:<ms>
 admission_on_full = "reject"
-# 未带 max_tokens 时的生成步数 / 夹紧上限
+# 未带 max_tokens 时的生成长度 / 单请求上限
 default_max_new = 4096
 max_new_cap = 32768
-# **上下文上限(token)**
-# （SSE 保活/排队超时/选卡阈值/gap 预留 已从配置退休：前两者是传输层与
-#  `admission_on_full` 的事，后两者是引擎定值 —— 2026-11-16 用户裁决）
+# 上下文上限（token）
 max_seq = 32768
-# **每 chunk 覆写的持久表必须与消费者同流**（2026-11-16 根因修复）。
-# 例：GDN 序列表 / 选择层视图槽曾用 H2D 流写、COMPUTE 核读 —— 前一 chunk
-# 的核还没跑完，下一 chunk 的表就把它覆写（1k needle 固定丢 `M`）。
-# 修法 = 持久表写入走 COMPUTE（与 FI/块表同律），零事件、零栅栏；
-# 原 `[runtime] int8_prefill_sync` 与末块前全设备 sync 均已删除。
-# 回归门：`tools/fixture/int8_text_gate.py`（1k/3k/8k）。
-# 预填块长（尾块合并已收成引擎定值 0：它取决于 prefill 的激活工作区预算）
-# 实测(2026-10-27,单 3090 / 27B AWQ / DFlash2 d7 / ctx 63456,**冷 boot 逐档**):
-#   chunk 512 / tail 512 : 4k 1320 · 8k 1308 t/s ; 32k 1173 t/s(TTFT 27.9s)
-#   chunk 1024 / tail 0  : 4k 1328 · 8k 1350 t/s
-#   chunk 2048 / tail 0  : 4k 1360 · 8k 1358 t/s ; 32k 1231 t/s(TTFT 26.6s)
-# ⇒ **2048 是最优档**(+3~5%);旧注"m>1024 会拆 M 更慢"已被本轮实测推翻。
-# ⚠️ **4096 不可用**:单 3090 在 prefix_cache 吃满池后,4096 块的 marlin 工作区
-#    (272MiB)会撞 vram 硬预算 ⇒ 请求直接 PoolExhausted。2048 的工作区 ≈136MiB,
-#    32k 连跑三次仍有余量(free ≈1.1G)。要再上去得先给预填留专用预算。
+# prefill 块长；越大吞吐越高，但激活工作区也越大
 prefill_chunk = 512
-# **跨会话合批上限**(1 = 串行;缺省)。
-# >1 的前置:`store.gdn.gdn_slots ≥ max_batch`、**单卡**(TP 的 AR 批语义未审,
-# 配置校验直接拒)、`kvmem.select_decode = false`(M1 页表按行)。
-# 效果:最多 N 个活跃 turn 的 decode 拼成一次 T=N 前向;单 turn 语义不变。
+# 跨会话 decode 合批上限（1 = 串行）
 max_batch = 1
-# **相位时间片**:引擎自决(2026-11-16 用户裁决 B) —— 每 8 拍 decode 后
-# 至多插一片 prefill(`sched_policy::SLICE_EVERY`,出处:该档实测 max_gap
-# ≈0.9s;不做时间片会把 decode 冻结 3.8s)。片长 = 正常一步
-# (`prefill_chunk` ∩ 剩余)。无配置键:操作员既算不出也不该算这个节奏。
-# **准入预算**(2026-11-17 裁决 A):一轮的预留 = 本请求上下文 +
-# **本请求的 max_tokens**(先被 `max_new_cap` 与 `max_seq` 窗口夹住)。
-# 装不下 ⇒ 拒/排队,**不切在跑者的份额** ⇒ 旧的"给新人留头寸/在位者最小
-# 生成/队列上限"三旋钮已删。
-# （2026-11-16 旧口径预留整档 cap；实测会把 "prompt+请求值明明装得下" 的
-#  近窗请求挤出准入，2026-11-17 改为请求值口径。）
-# `max_new_cap` 只夹单请求上限，不再决定并发/近窗准入。
-# **腾挪/压力策略不在配置里**（2026-11-16 用户裁决）：水位（主池/宿主低 12%→
-# 高 25%）、单次腾挪上限、空转要不要整理 —— 全是 `owl_store::PressurePolicy`
-# 的内部定值。理由：水位是**池几何的函数**（池多大由 store 分配，操作员算不出），
-# 单次搬运量是**延迟预算**，空转整理由**真实余量**回答（低水位才触发）。
-# 旧 8 键（idle_compact / pressure_* / host_pressure_*）已删，写了即拒启。
 
 # ---------------------------------------------------------------------------
-# [parallel] —— 并行与卡位(唯一真源)
+# [parallel] —— 并行与卡位
 # ---------------------------------------------------------------------------
 [parallel]
-# single | tensor(TP2) | layer(暂未支持 = 拒启)
+# single | tensor(TP2)
 mode = "single"
-# 卡位:每项 = BDF("41:00.0")/ UUID("GPU-…")/ 名字子串("3090");
-# **禁 CUDA 序号**(序会漂)。空 = 自动挑空闲卡(single 1 张 / tensor 2 张);
-# 按列表序去重消费:["3090","3090"] = 两张不同的 3090。
+# 卡位：BDF / UUID / 名字子串；禁 CUDA 序号。空 = 自动挑空闲卡。
 device = []
-# AR 拓扑档:v1(两核)| fused(非 fp8 单核)| ar2(非 fp8 小包 barrier-only;
-# 其余落 fused/v1)。原 tp_ar_fused / tp_ar2 / tp_push / tp_one_stage 四布尔
-# 已于 2026-10-27 单键化(前两个中性/无档使用的实验档直接剪掉)。
+# TP allreduce 拓扑：v1 | fused | ar2
 tp_ar = "v1"
-# TP AR 载荷 fp8(两侧同档)
+# TP AR 载荷使用 fp8
 tp_ar_f8 = false
-# TP 卡间通信通道:p2p(现役 VMM peer alias)| host(pinned host-mapped 中转,
-# 无 P2P 驱动环境兜底;当前只支持 tp_ar = "v1")
+# TP 通信通道：p2p | host
 tp_comm = "p2p"
-# lm_head 词表切(每 rank 只持半表;需 mode = tensor)
+# lm_head 词表切分（需 mode = tensor）
 tp_vocab_split = false
 
 # ---------------------------------------------------------------------------
 # [model] —— 模型资产
 # ---------------------------------------------------------------------------
 [model]
-# 对外模型名(空 = GGUF 用文件名 / 其它用服务端缺省)
+# 服务端模型名；空 = GGUF 文件名 / 服务端缺省
 name = "qwen3.8-27b"
-# 模型路径:目录(safetensors / awq)或 .gguf 单文件
+# 目录（safetensors / awq）或 .gguf 单文件
 path = "../models/cyankiwi/Qwen3.8-27B-AWQ-INT4"
-# 权重摆放格式:safetensors | awq | gguf
+# safetensors | awq | gguf
 format = "awq"
-# 主干量化方案(2026-10-30 白名单口径;权威表 = owl_engine::load_arm_of):
-#   awq         + w4a16 → AWQ-INT4 预量化(pack-quantized g32 非对称)
-#   awq         + w4a8  → 同源权重 + int8 激活(生产档;prefill +48~50%)
-#   safetensors + nvfp4 → NVFP4 块缩放(e2m1 + e4m3/16)
-#   gguf        + q4k | iq4 | iq3 → GGUF 块型
-#   safetensors + w4a16 → f16/bf16 基线(无量化;开发档)
-#     (G128 = g128-sym pack-quantized 档在路线图内,未接线:届时按键面探测分流)
-#   其余组合 = boot 期拒。owl 不做格式转换,只吃**已量化好的产物**。
+# 量化方案，必须与 format 匹配：w4a16 | w4a8 | nvfp4 | q4k | iq4 | iq3
 quant = "w4a16"
-# lm_head 量化:off | rtn-int4-g32 | rtn-int8-row
-# 2026-10-22 用户裁决:int4 头太小,int8 为默认(质量优先;int4 仅显式覆盖)
-# int8 = W8A16:多 token 自动走 f16 Tensor Core(2026-10-22;HBM 读 int8、
-#   寄存器反量化、激活 f16),质量门 0.9896。
+# lm_head 量化：off | rtn-int4-g32 | rtn-int8-row
 head_quant = "rtn-int8-row"
-# embedding 表量化:f16(默认/对照) | i8(per-row;省 ~1.2G,仅 untied)
+# embedding 表量化：f16 | i8
 embed_quant = "f16"
+
 [model.rope]
-# YaRN 外推(1.0 = 关;2.0 → 524k,4.0 → 1M);只对 GGUF 档生效
+# YaRN 外推；只对 GGUF 档生效（1.0 = 关）
 yarn_factor = 1.0
-# 0 = 用模型自带 context_length
+# 0 = 使用模型自带 context_length
 original_max = 0
 beta_fast = 32.0
 beta_slow = 1.0
-# 额外 attention 乘子(乘在 0.1·ln(factor)+1 上)
 attention_factor = 1.0
 
 # ---------------------------------------------------------------------------
-# [store] —— 存储面（KV/GDN/宿主/磁盘；2026-11-16 由 [pool] 改名）
+# [store] —— KV / GDN / 宿主 / 磁盘
 # ---------------------------------------------------------------------------
 [store]
-# 前缀缓存开/关
+# 前缀缓存（跨 turn / 跨会话复用）
 prefix_cache = true
-# 宿主 KV 腿 / 快照腿 / 盘层两腿(MiB;0 = 关层)
+# 宿主/快照/磁盘腿（MiB；0 = 关层）
 host_cache_mb = 0
 snap_host_mb = 0
 disk_cache_mb = 0
 snap_disk_mb = 0
-# 盘层目录(给了配额就必须给;必须独占)
+# 磁盘目录：给了磁盘配额就必须给，且必须独占
 disk_dir = ""
-# **主动 checkpoint 已无配置键**：磁盘层启用（disk_cache_mb/disk_dir）后，
-# 空闲拍自动把活跃会话已算好的 KV 复制一份到盘，供重启召回。
-# 单次复制量与节拍是引擎内部策略（64 MiB / 5s），不参与准入/压力卸载。
-# **显存治理**：
-#   vram_budget = 驱动 total 的占比(0..1;0 = 关治理;1.0 = 吃满 free)
-# target_total = total × vram_budget。
-# vram_reserve_mb = **运行时激活/固定预留**(图执行/warmup/碎片/瞬态)，
-# 不是 KV 池容量，也不是 vram_budget 的重复；prefill 瞬态另按 chunk 派生。
+# 显存治理：驱动 total 的占比；以及池外固定预留 MiB
 vram_budget = 0.99
 vram_reserve_mb = 714
-# 解释器块池：实验/诊断面，配置键已退休；生产固定关（0）。
-# 关活性中途回收(诊断;开会无界常驻)
-no_reclaim = false
 
-# KV 池子域（2026-11-16 用户裁决：kv 作为 store 的子域）
 [store.kv]
-# 主 KV 池 dtype（full 模板默认 fp8；30 系 leaf 由 parts/pool/int8.toml 覆盖为 int8）
+# 主 KV 池 dtype：f16 | fp8 | int8
 kv_dtype = "fp8"
-# 草稿池 KV dtype（bf16 = 缺省；fp8 e4m3 = 偷显存档，池体积减半）
+# 草稿池 dtype：bf16 | fp8
 draft_kv_dtype = "bf16"
 
-# GDN 子域（2026-11-16 用户裁决：gdn 作为 store 的子域）
 [store.gdn]
-# **GDN 状态格数 = 同时推进的 turn 上限**（每活跃 turn 一格；2026-11-16 起
-# 它是并发唯一真源：服务面 permit 数也用它）。必须显式 ≥ 1。
-# full 模板给 1；多并发 leaf 显式覆盖（如 3080 档 2）。
+# 同时推进的 turn 上限；也是服务面 permit 数的唯一真源
 gdn_slots = 1
-# 生成相位页边界快照节奏 / 消息边界间距 / 最小步长 = 引擎内部策略，
-# 2026-11-17 键退休（`engine::DECODE_SNAP_STRIDE` / `SNAP_MSG_MIN_GAP` /
-# `SNAP_MSG_MIN_SPAN`）。关快照面请用 `snap_max = 0`，不要再配节流。
-# GDN 快照池**设备槽数**（池几何 = 显存预算；不是行为旋钮）。
-# 每槽 = 一条 GDN 行 × 层数（27B ≈ 148.5 MiB/槽，TP2 两 rank 各半）。
-# full 模板给 0 = 不启用；生产档按卡型显式给 1/2/4/6。
+# GDN 快照设备槽数（0 = 关闭快照池）
 snap_max = 0
-# 消息边界快照 = **恒开**(2026-11-16 键退休):在消息开启标记前取页对齐边界,
-# prefill 切块并拍 Durable 快照,供同 system/tool 前缀跨会话复用。
-# 门 = 消费者存在(prefix_cache=true + snap_max>0);本模板 snap_max=0 ⇒ 自然后退。
-# 可删图前锚点快照 = **恒开**(2026-11-16 键退休;2026-11-13 引入):在**每张
-# 可删图的段起点**强制切块并拍一张快照(Extra 档;旧图同键 Touch)。
-# 门 = image_evict=true + prefix_cache=true + snap_max>0。
-# 消息开启标记文本覆盖（空 = 用模型 ChatFormat.im_open，如 Qwen <|im_start|>）
-# 引擎 boot 时 tokenize；扫描函数只收 open_ids 参数，不写死字面量。
+# 消息开启标记覆盖（空 = 模型 ChatFormat.im_open）
 snap_msg_delim = ""
-# 最近 K 条消息边界无条件保留（dense tail；0 = 旧行为）
+# 最近 K 条消息边界无条件保留
 snap_msg_recent = 4
-# **每会话快照上限**（0 = 不限；只数非 Transient 条目，设备+宿主+盘都算）。
-# 不是 LRU 的重复：全局 LRU 只排序谁先被逐，一条活跃长会话仍可吃满设备槽
-# 与宿主腿；本键是单会话资产护栏。**与 snap_max（设备槽数）是两个量**。
-# 超限时按 SnapClass 档位替换/跳过。
+# 每会话快照上限（0 = 不限）
 snap_session_cap = 0
-# 结构档（Dense/Binary）保留位；仅约束 Extra（Extra ≤ cap − reserve）。
-# 与 cap 是同一护栏的两半，不能只删一个。
+# Extra 档之外的 Dense/Binary 保留位
 snap_structural_reserve = 4
 
 # ---------------------------------------------------------------------------
 # [spec] —— 投机解码
 # ---------------------------------------------------------------------------
 [spec]
-# 深度(0 = 关;结构上限 7)
+# 深度（0 = 关）
 depth = 0
-# 草稿检查点目录(空 = 未配;depth>0 时必填)
+# 草稿检查点目录（depth > 0 时必填）
 draft_path = ""
-# 哑草稿诊断面(无草稿器时)
+# 哑草稿诊断面
 dumb = false
-# DFlash2 草稿环窗口(token;0 = auto = 检查点声明,缺声明 = 家族 2048;当前核支持 2048)
+# DFlash2 草稿环窗口（0 = auto）
 draft_window = 0
-# **q 默认值已定谳**（2026-11-17 键退休）：q_alpha=1.0 / q_floor=0.0 /
-# q_host=true 收为引擎常数。把 q 摊平只会掉 AL；host q 真机 A/B 高 ~8%。
-# 标定 dump 路径不在这里，归 `[probes] q_dump`。
-# DFlash2 lookup-augmented drafting（LABD；仅 DFlash2 档可开）
-# 在当前请求 token 历史里找当前后缀的最近一次出现，用其后续 token 覆盖草稿头；
-# 缺省关 = 旧档逐字节不变。nmin/nmax/nstrong/agree 语义见 docs/devlog/perf/tp2-decode-fast.md §10。
+# DFlash2 lookup-augmented drafting
 lookup = false
 lookup_nmin = 6
 lookup_nmax = 12
 lookup_nstrong = 6
 lookup_agree = 0
-# MTP 窗口/sink 的全量 schema 缺省(0 = full)。**实际性能值写在具体 MTP 档**
-# (如 profiles/parts/feature/mtp-window.toml 的 4032/64)，不要在这里做调优。
+# MTP 草稿窗口 / sink / 生效 ctx
 mtp_window = 0
 mtp_sink = 64
-# 窗口生效的最小绝对 ctx(0 = 不设额外门槛;短 ctx 保完整历史)
 mtp_window_min_ctx = 0
-# **MTP 草稿 KV 物理环**(T5;缺省 false)。只服务 MTP + window>0。
-# 容量 = max(min_ctx, sink + window + depth + page),页对齐；短 ctx 仍保留
-# 完整历史，长 ctx 只回收当前读集外的旧槽。**不改变读集**。
 mtp_ring = false
-# 自适应 depth(仅 MTP;短 ctx 用 depth,长 ctx 回 depth_min)。
-# 两档图族在 boot 期预捕获;缺省关 = 旧档逐字节不变。
+# 自适应深度（仅 MTP）
 adaptive_depth = false
 depth_min = 3
 depth_switch_ctx = 49152
-# T1b 滚动降档门(tokens/round = m+1;仅 adaptive 生效)
 adaptive_min_tpr = 3.0
-# TP 档放行投机(未验完的档不许静默放行)
+# TP 档放行投机
 tp_draft = false
-# m=0 连击降级阈值(0 = 禁用)/ 降级后的探测窗口(tokens)
+# m=0 连击降级阈值 / 探测窗口
 degrade_after = 6
 probe_every = 8
 
 # ---------------------------------------------------------------------------
-# [vision] —— 视觉面
+# [vision] —— 视觉
 # ---------------------------------------------------------------------------
-# 视觉相关的四件事收编在此(原散在 [model]/[server]/[store]):
-#   enabled/path     视觉塔开关与权重(空 = 检查点内置 model.visual.*;
-#                    GGUF 档 = 同目录唯一 mmproj-*.gguf)
-#   max_pixels       图像预处理 `smart_resize` 封顶(0 = 4096² = 实际不缩)。
-#                    图像 token 数 ∝ 像素:1920×1088 ⇒ 646 tok / 2560×1440 ⇒ 1160 tok;
-#                    真实 GUI agent 每轮 +1 张截图 ⇒ 每 100 tok ≈ 135 ms prefill(135k)。
-#   image_evict      前缀无感删除(图像段;leave-gap):客户端给图打 `owl_evict`
-#                    ⇒ 段落页对齐 + 删除即位置帧平移,不转 K/不动幸存 token;
-#                    需 [store] prefix_cache + 分页 KV。缺省关 = 逐字节旧行为。
-#   image_evict_pad  删除段的页对齐 pad 词(必须恰 1 token;空 = 自动 `。`→` `→`\n`)。
 [vision]
 enabled = false
+# GGUF 视觉塔路径（空 = 模型内置 / 同目录 mmproj）
 path = ""
+# 图像预处理像素封顶（0 = 不缩）
 max_pixels = 0
+# 前缀无感删除
 image_evict = false
+# 图像段页对齐 pad 词（必须恰 1 token）
 image_evict_pad = "。"
 
 # ---------------------------------------------------------------------------
@@ -301,169 +184,64 @@ topp = 0.95
 rep_penalty = 1.0
 
 # ---------------------------------------------------------------------------
-# [load] —— 装载域(校验 / 观测 / 重排)
+# [load] —— 装载
 # ---------------------------------------------------------------------------
 [load]
-verify = false
-debug_tap = false
-# 暂存槽上限 MiB(0 = 不设上限)
+# 单键暂存槽上限 MiB；0 = 不设上限
 staging_mb = 128
 # auto | device | cpu
 repack = "auto"
-dump = false
 
 # ---------------------------------------------------------------------------
-# [kvmem] —— 池虚拟化/选择层
+# [kvmem] —— 池虚拟化 / 选择层（高级）
 # ---------------------------------------------------------------------------
 [kvmem]
-# 诊断面:方案 A/B 对照 / 最小 ctx / 重诊断步进(0 = 每边界)
-coverage_scheme_probe = false
-coverage_scheme_min_ctx = 0
-coverage_analyze_every = 0
 select_decode = false
 select_partial = false
 index = false
-# 索引采集走 GPU 块级 Mean-K（false = 旧 host 整页回读，golden/排障）
 index_gpu = true
 workspace_per_req = 2240
-# verify 视图带宽上限（token；0 = 跟随 workspace；只裁 verify，decode 不动）
 verify_view_tokens = 0
-# GQA 聚合：mean | max（KVMem 产品脚本默认 max）
 gqa_aggregation = "max"
-# 最终 query replay（KVMem §5.2；当前仅 spec.depth=0）
 query_replay = false
 select_sink = 2
 select_recent = 4
-# 时间序分层抽样块数(P1-3 覆盖率门;0 = 关 = 旧行为)。
-# >0 ⇒ 中间区间等距取块,保证全文每段都有一双眼(top-k 只填剩余位)。
 select_stratified = 0
-# 保底 sink/recent 的 **token 口径**(0 = 用上面的块数;参照实现配方 sink/recent=12288/1024 tok)
 select_sink_tokens = 0
 select_recent_tokens = 0
-# query 窗(打分用最近多少行;参照实现默认 512,我们历史值 64)
 select_query_tokens = 64
-# 召回打分 scorer:`cosine-max`(折叠热路) | `cosine-mean` | `softmax-mean`(参照实现默认,
-# 逐 token softmax;不可折叠 ⇒ host 侧 72k 不可用,需 GPU 化) | `logit-mean`
 score_mode = "cosine-max"
-# 一跳邻接传播 α(参照实现 propagate_query_scores;0 = 关,cosine 打分缺省也是 0)
 select_graph_alpha = 0.0
 recall_every = 1
-# prefill 过去视图口径：on-hole（缺省，= 旧行为，池内走全量链）| always
-# always = prefill 与 decode 同源稀疏视图 ⇒ attention ∝ 工作集（64k +10.5%）。
-# 🔴 **2026-10-27 实测禁用**：always 下 prefill 只读 top-k 选中块，**长 system /
-# tools schema 里未被选中的部分模型看不见** ⇒ 输出退化到 1~2 token 就 EOS。
-# 复现：60k system（超池）时 C1 只 output 1 token；同一上下文 on-hole 正常 176。
-# ⇒ agent/工具调用场景**必须** on-hole；always 只留给"纯长文档、无 system 契约"的实验。
 prefill_view = "on-hole"
-# 召回点选块口径:`topk`(缺省,按 cosine 补足 = scattered)|
-# `recency`(参照实现 prefill 口径 = 头 + 连续近期窗;2026-10-28 受控对照)
 prefill_select = "topk"
-coverage_probe = false
-analyze_at_ctx = 0
-# lru | lrfu | lrfu:0.8
 evict_policy = "lru"
-# **整枝塌缩**(2026-10-23):Drop 轮是否允许"一张票丢一整段"(叶→分叉点)。
-# 缺省 false = 保守:只要宿主/磁盘有空位就逐块(先缩小到装得进宿主,再由
-# 下沉/搬盘接走,内容优先保留);没有分层的档位本来就走整枝。
-# 开 = 当链**这一轮搬不走**(宿主剩余槽 < 链长)时允许整枝丢 —— 避免
-# "宿主/磁盘长期满 + 深冷枝"要 O(深度) 个调度轮才腾干净。
-# 淘汰只看时间(新鲜度),不看内容"贵不贵"。
 bulk_drop_when_tier_full = false
 pool_overcommit = false
-# 每 turn 工作集下限 MiB(留空 = 派生)
 dense_floor_mib = 0
 
 # ---------------------------------------------------------------------------
-# [kernel] —— 算子/臂选择(原 [dispatch])
+# [kernel] —— 算子臂（高级）
 # ---------------------------------------------------------------------------
 [kernel]
 qkv_fuse = true
-force_naive_prefill = false
-# 单键臂(2026-10-21;旧 verify_v2/verify_fi/verify_xqa + decode_fi/decode_xqa 已退役)
 verify_arm = "v2"
 decode_arm = "fi"
-# 单图烘 plan(上界恒 = runtime.max_seq;true 需 fi_plan_restore = false + fi_cuda_graph = true)
-# plan 表权威:baked(图自携,上界恒 = max_seq;需 fi_cuda_graph)| host-sync
-# (缺省;图不烘表,引擎每步 fi_plan_sync 刷精确表)。原 fi_plan_bake +
-# fi_plan_restore 两布尔(validate 强制互反)已于 2026-10-27 收成单键。
+# baked | host-sync
 fi_plan = "baked"
 fi_cuda_graph = true
-# prefill-only FP8→F16 shadow(2026-10-31 复辟;仅 store.kv.kv_dtype="fp8" 有效)。
-# 算子级实测(单 3080/hd256/hkv4/page32/ctx=139264):fp8 KV 的 **prefill 注意力
-# 比 f16 慢 21~26%**(sm86 无 fp8 MMA,每瓦片要反量化),而 **decode(T=1)快 2×**。
-# 影子 = 保留 fp8 主池(容量),prefill 先反量化本层 KV 进 dense f16 staging。
-# 首层按 runtime.max_seq 一次预留:100k≈200MiB/rank,262k≈512MiB/rank。
 prefill_shadow = false
 gdn_chunked = true
 gdn_scalar = false
 gdn_fused_decode = true
 gdn_fused_decode_v2 = true
-# GGUF 小 n(装得进 L2)且 m ≤ TILE_MT ⇒ 让 MMVQ 赢(0 = 关)
+# GGUF 小 n 走 MMVQ 的 L2 上限（MiB；0 = 关）
 gguf_mmvq_l2_mib = 4
-# GGUF 预填臂(缺省全开;关 = 回退下一臂)
 gguf_tile = true
 gguf_cublas = true
 gguf_mmq2 = true
 gguf_mmq = true
 gguf_smem = true
-resolve_trace = false
-host_argmax = false
-ts_probe = false
-tag_wildcard = false
-
-# ---------------------------------------------------------------------------
-# [probes] —— 诊断
-# ---------------------------------------------------------------------------
-[probes]
-step_profile = false
-# off | counters | host | gpu
-perf_level = "host"
-gdn_dump = false
-debug = false
-trace_gate = false
-dflash_probe = false
-# 草稿逐位追踪（只打已在关键路径读回的 draft/accept 账；TP2 可用；
-# 与 dflash_probe 的 prefill 读探针分开，避免 TP v1 拒启）
-draft_trace = false
-# DFlash2 选择器 walk 策略（**AL 消融量具，不是调优旋钮**；只服务 DFlash2）
-#   conditional = 设备核原律；fixed_pred / unary = host 重走格对照。
-# 背景:roadmap.local/26-11-03-ddtree-AL升级-交接.md §4 S0。
-dflash_walk = "conditional"
-# **[标定] 草稿 q dump 路径**（空 = 关；每轮一行 JSONL：raw 行 / 候选 id / 目标 p）
-q_dump = ""
-raw_completion = false
-prompt_dump = false
-live_diag = false
-prefill_bisect = false
-# 单步/粘滞调试门(需 --features stepgate 构建)
-step_gate = "off"
-step_gate_ms = 50
-step_gate_us = 0
-step_gate_every = 1
-
-# ---------------------------------------------------------------------------
-# [cuda] —— 设备面(图 / 同步 / 实例化旗标 / 发射账)
-# ---------------------------------------------------------------------------
-[cuda]
-# 图捕获总闸(false = eager 直发,连 decode/verify/fold/propose 族一起关)
-graph = true
-srv_timing = false
-cap_prof = false
-launch_sync = false
-# 同步点分解掩码(0 = 生产;见 config::sync_bit)
-sync_mask = 0
-launch_time = false
-d2h_prof = false
-gpu_prof = false
-free_legacy = false
-# 捕获 slab 固定档 MiB(留空 = warmup 计量定量)
-capture_slab_mb = 0
-# 发射账容量(0 = 关)
-trace_ring = 0
-
-[cuda.graph_flags]
-# UPLOAD = 0b10(实例化后预热上传)
-upload = false
 
 # ---------------------------------------------------------------------------
 # [log]

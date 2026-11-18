@@ -11,8 +11,7 @@
 extends = [
   "full.toml",
   "parts/model/27b-awq.toml",
-  "parts/hardware/3090-single.toml",
-  "parts/kernel/fi-graph.toml",
+  "parts/feature/fi-graph.toml",
   "parts/pool/fp8.toml",   # 30 系换成 parts/pool/int8.toml；40/50 保持 fp8
 ]
 ```
@@ -20,7 +19,8 @@ extends = [
 - `extends` 路径相对**声明它的文件**；数组按序覆盖，后者胜。
 - 合并后仍缺键 ⇒ 拒启；`--print-config` 是唯一放行半份档的迁移工具。
 - 卡位只走 `[parallel]`；`device` 用 BDF / UUID / 名字子串，**禁 CUDA 序号**。
-- **实验变体一律用 `--set`，不新建入口档**（见下"唯二常驻档门"）。
+  硬件形状直接写进 leaf（例如 `mode = "single"; device = ["3090"]`）。
+- **实验变体一律用 `--set`，不新建入口档**（见下"入口档面"）。
 - **并发只有两个键，必须成组改**：
   - `[store.gdn] gdn_slots = N` —— **并发唯一真源**（2026-11-16：旧的
     `[runtime] max_concurrency` 已删；服务面 permit 数与引擎活跃槽位上限都从它来）。
@@ -61,52 +61,26 @@ extends = [
 | `qwen38_27b-gguf-iq3_3090.toml` | 8137 | 单 3090 Ti / 27B **GGUF UD-IQ3_S**（12.0GB）+ mmproj-F16 / DFlash2 d7 / **FP8 KV（例外：3-bit 主干对 INT8 KV 的 1k needle 敏感）** / **max_seq 229376（224k，逼近 native 262144）** / chunk 2048。prefill 1409–1509 t/s、decode 97–121；**与 8137 上的其它单卡 3090 档互斥**（同一张卡二选一），速度慢 ~13%、3bit 质量低一档 |
 | `qwen38_27b-4080.toml` | 8138 | 单 **4080 SUPER（Ada sm_89 / 32G）** / 27B AWQ-INT4 **a8** + 视觉 / DFlash2 d7 / FI+图 / fp8 KV / 前缀缓存 / image_evict / **max_seq 262144（= 模型 native 上限，32 KiB/token ⇒ 池 8192MiB）** / chunk 2048。std 五点三轮（`perf-runs/std-4080-20261030/`）：**spec-off prefill 2392→3084 t/s、decode 35.9 t/s 长 ctx 平坦**；spec-d7 decode ×1.70（60.1@8k）；**同二进制 3090 Ti 对照：prefill ×1.21–1.37、decode ×0.81、TTFT ×0.73–0.83**。**需 sm_89 二进制**（`cargo build --release -p server --no-default-features --features arch-sm89`，落到独立 target 目录）——单份 `.a` 家族取最高代，30 系与 40 系不混在一份构建里。**2026-11-04 原生 FP8 MMA**（KernelPick 按运行期 Sm89/Sm120 选臂；e4m3 Q×KV，CTA16）：std 1024–8192 均值 3113 t/s（旧 3030，+2.8%）、32k 2844（旧 2379，+19.6%）、65k 2435（旧 2099，+16.0%），decode 不变；1k/8k/65k needle + 视觉 36/36 全绿（`docs/bench/fp8-sm89-native-mma-2026-11-04.md`） |
 
-这条裁决被**测试钉住**：`crates/shared/src/profiles.rs::入口档面只允许三个常驻档`
-—— 往 `profiles/` 顶层再丢一个 `.toml` 就会红。置顶三档各占一张卡
+这条裁决被**测试钉住**：`crates/shared/src/profiles.rs::入口档面只允许五个常驻档`
+—— 往 `profiles/` 顶层再丢一个 `.toml` 就会红。五个入口档按硬件形状分工
 （**端口纪律 2026-11-03 用户裁决**）：
 
 | 形状 | 端口 | 说明 |
 |---|---|---|
 | 双 3080 20G（TP2） | **8135** | `qwen38_27b-3080_tp2.toml` |
-| 双 3090 Ti（TP2） | **8136** | `qwen38_27b-3090_tp2.toml`（本地变体见 `*.local.toml`） |
+| 双 3090 Ti（TP2） | **8136** | 无公共入口档；本地档直接写 `[parallel]`（`mode="tensor"`, `device=["3090","3090"]`） |
 | **单卡 3090（任意配置）** | **8137** | AWQ / GGUF-IQ4 / GGUF-IQ3 / KVMem … **统一这一个端口**，同卡互斥 ⇒ 换配置 = 停一个起一个（`--set` 或换档文件，端口不变） |
 | **单 4080 SUPER** | **8138** | 同上：任意单卡 4080 配置都用 8138 |
 
-单卡的"换配置"不换端口：端口 = **硬件形状**，配置 = 档文件 / `--set`。四档各占各的卡（3090 对 8136 占两张 3090 Ti；单卡 3090 档 8137 与它互斥；3080 对 8135；4080 8138），互不干扰。
+单卡的"换配置"不换端口：端口 = **硬件形状**，配置 = 档文件 / `--set`。
+3090 对 8136 占两张 3090 Ti；单卡 3090 的 AWQ/IQ4/IQ3 档共用 8137、彼此互斥；
+3080 对 8135；4080 8138。
 
-**绑定 = 全部网卡**（2026-11-03 用户裁决）：所有档 `[server] bind = "0.0.0.0:<port>"`，局域网客户端直连 `http://192.168.1.6:<port>/v1`（`~/.pi/agent/models.json` 已按此配置）。
-⚠️ 服务**无鉴权** ⇒ 只在可信内网用，不要做公网端口映射。
+**绑定**：档里的 `[server] bind` 只是本机示例；部署到别的机器时改成该机的监听地址。
+服务**无鉴权** ⇒ 不要直接做公网端口映射。
 
-`profiles/measurement/` = **测量/实验档**（不计入入口档面；子目录不参与档名发现）：
-
-- `qwen38_27b-gguf.toml` / `qwen38_27b-gguf-iq4.toml` —— GGUF 裸性能口径（单卡）；
-- `qwen38_27b-gguf-iq4-tp2.toml` —— **GGUF TP2 档（8136，双 3090 Ti）**：同一
-  `UD-IQ4_XS`（`ssm_out` 是 K/I 超块，2026-11-03 前的几何会响亮拒）；spec off
-  作数值门/性能基线。实测 prefill 1.24–1.36×、decode 1.47× 单卡，权重 7.7 GiB/rank；
-- `qwen38_27b-gguf-iq4-3080tp2.toml` —— **GGUF TP2 档（8135，双 3080 20G）**：
-  `max_seq = 262144`（模型 native 上限；**260k needle 实测 RETRIEVED**）；
-  spec off 基线 decode 1.64× / prefill 1.34–1.43×，d7 档 decode **181/221 t/s**；
-  权重 7.4 GiB/rank。设计与门见 `docs/devlog/models/gguf-tp2-kquant-设计.md`；
-- `qwen38_27b-3090-int8.toml` —— **INT8 KV 单卡档（8141）**：**w4a8**、
-  max_seq 131072、K int8 + V token-major + per-token scale；P8 prefill /
-  P32 decode；spec off。3 次中位 65k 1691 t/s / TTFT 38.75s，
-  100k 1488 / 67.19s；GSM8K 200 96.5%，needle 8k/32k/64k/100k 全过。
-- `qwen38_27b-3090-fp8.toml` —— **FP8 KV 单卡同形对照档（8144）**：默认
-  w4a16，A/B 时用 `--set model.quant=w4a8` 与 int8 档同形。
-- `qwen38_27b-3090_tp2-int8.toml` / `qwen38_27b-3090_tp2-fp8.toml` —— **双 3090
-  TP2 INT8/FP8 同形对照档（8142/8143）**：w4a8、262k、spec off。
-  65k INT8 2483.8 t/s / decode 58.97；100k 2222.5 / 57.48。
-- `qwen38_27b-3090-kvmem.toml` —— **KVMem 单卡档（8137，与单卡 3090 统一端口）**：池超卖 5.49× +
-  选择层 + 块下沉。起机 `-p profiles/measurement/qwen38_27b-3090-kvmem.toml`
-  （不需要 `--set`）。
-  🔴 **真实可用上下文 = 池容量 47744 tok，不是 `max_seq`**：链越过池就有
-  占位符 ⇒ prefill 被迫只读稀疏视图 ⇒ 实测 64k 起输出退到 1 token。
-  长上下文请用 `qwen38_27b-3080_tp2.toml`。
-  实测：prefill 4k/8k/16k/32k/64k = 2168/2116/2018/1795/1755 t/s；
-  decode（真实文本 8k/512 tok）**83 t/s**、AL 2.83、verify 24.4 ms/轮；
-  48k 文档增量对话 ≈ 9 s（修 GDN 快照锚点前是 28.7 s）。
-  档内焊死三个"看着能开、实际会坏"的开关（`prefill_view=always` /
-  `decode_arm=fi` / `spec.degrade_after>0`），档头有逐条实测依据。
+本机实验档放在 ignored 的 `profiles/.local/` 与 `*.local.toml`（站点私有，不入库、
+不参与入口档面）；公共档不要引用这些文件。
 
 2026-10-25 生产档拉满（两档同形，硬件差异只留 max_seq/TP）：
 
@@ -115,14 +89,14 @@ extends = [
   2026-11-16 原始算法；旧 `implicit_session` 键已删）；
 - `image_evict=true`（最终方案 = **leave-gap**：删后不转 K、保留位置洞，
   可无限次丢弃旧图片缓存；旧的 rebase/K 旋转路径已删除）；
-- 3090：`max_seq=63456 / snap_max=2 / host_cache=10G / snap_host=3G`；
-- 3080 TP2：`max_seq=262144 / snap_max=2 / host_cache=10G / snap_host=3G`。
+- 3090：`max_seq=57344 / snap_max=2 / host_cache=10G / snap_host=3G`；
+- 3080 TP2：`max_seq=262144 / snap_max=6 / gdn_slots=2 / host_cache=10G / snap_host=3G`。
 
 pi 实测工具跟进 cached 95.6% / TTFT 149ms，手动新消息 96.2% / 97ms，
 新会话 98.3% / 116ms；8135 的 `image-evict` 5/5、GUI 窗口 PASS。
 详见 `docs/devlog/serving/agent-surface.md` §9.4。
 
-`max_seq=63456 / snap_max=2` 是 **2026-10-25 单 3090 全特性稳定点**：
+`max_seq=57344 / snap_max=2` 是 **2026-10-27 a8 版单 3090 全特性稳定点**：
 24G 上同时开视觉塔 + DFlash2 d7 + fp8 KV + 前缀缓存 + image_evict。
 fresh boot 驱动余量高于 1GiB；前缀缓存饱和后可能短暂出现 N6 压力 WARN，
 `image_delete_marked` 与 GUI 三图窗口实测仍通过。更大的 79872/snap1 虽然 ctx 更大，但驱动余量贴地板，
@@ -159,7 +133,7 @@ cargo serve -p profiles/qwen38_27b-3090.toml
 --set spec.depth=0 --set spec.lookup=false     # 关投机对照臂
 # 无 P2P 驱动环境:切 pinned host-mapped 中转(当前需同时落回 v1 两核)
 --set parallel.tp_comm=host --set parallel.tp_ar=v1
-# 默认 63456 + snap2;要更大 ctx 见上面 79872 的取舍
+# 默认 57344 + snap2;要更大 ctx 见上面 79872 的取舍
 ```
 
 ## 目录
@@ -167,18 +141,16 @@ cargo serve -p profiles/qwen38_27b-3090.toml
 ```text
 profiles/
   full.toml                    # 全量 schema + 注释（底座，不是档位）
-  qwen38_27b-3090.toml         # 常驻档①：单 3090 满血（AWQ + 视觉）
-  qwen38_27b-3080_tp2.toml     # 常驻档②：双 3080 TP2 满血
-  qwen38_27b-gguf_3090.toml    # 常驻档③：单 3090 / GGUF Q4_K_M（文本，更快）
-  measurement/                 # 测量档（不算入口档面；GGUF 裸性能口径）
-    qwen38_27b-gguf.toml
-    qwen38_27b-gguf-iq4.toml
+  qwen38_27b-3090.toml         # 常驻档①：单 3090 / AWQ-INT4 + 视觉
+  qwen38_27b-3080_tp2.toml     # 常驻档②：双 3080 TP2 / AWQ-INT4
+  qwen38_27b-gguf_3090.toml    # 常驻档③：单 3090 / GGUF IQ4_XS + 视觉
+  qwen38_27b-gguf-iq3_3090.toml# 常驻档④：单 3090 / GGUF IQ3_S（极限上下文）
+  qwen38_27b-4080.toml         # 常驻档⑤：单 4080 SUPER / AWQ-INT4
+  examples/                    # 模板变量示例（不入入口档面）
   parts/
     model/                     # 模型资产（path/format/quant/head；含 0.8B/4B/27B GGUF 与 AWQ）
-    hardware/                  # 卡位 + TP 开关（3090-single / 3080-tp2 / 4080-single / 5070ti-single）
-    kernel/                    # fi-graph / v2 臂
     pool/                      # fp8 / f16 / int8 池
-    feature/                   # vision / dflash2 / mtp / kvmem / agent / w4a8 / image-evict
+    feature/                   # vision / dflash2 / mtp / kvmem / fi-graph / w4a8 / image-evict
 ```
 
 `parts/**` 是**构成件**，不是入口档；小模型（0.8B / 4B）与 GGUF 形状要用时

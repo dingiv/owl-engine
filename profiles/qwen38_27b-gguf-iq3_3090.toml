@@ -1,72 +1,43 @@
-# ── 常驻档 ④:单张 3090 Ti / 27B **GGUF UD-IQ3_S** + DFlash2 d7(极限上下文档)──
+# ── 单 3090 Ti / Qwen3.8-27B GGUF UD-IQ3_S + 视觉 ────────────────────────
 #
-# **与档③(IQ4_XS)二选一**:两者都要一张 3090,而本机两张 3090 已被档①/档③占住
-# ⇒ 想用本档先停同端口的 IQ4 档(`lsof -ti :8137` 取 PID,不要 pkill -f),
-# 再 `-p profiles/qwen38_27b-gguf-iq3_3090.toml` 起 8137。
-#
-# 为什么值得单独一档(IQ3_S = 12.0GB,比 IQ4_XS 再轻 2.3GB):
-#   同一张 24G 卡上 **上下文 168k → 224k**(逼近模型 native 262144,不用 YaRN),
-#   代价 = 内核更慢(IQ3 的 3.44bit 打包反量化比 IQ4 贵)且 3bit 质量更低。
-#
-# 实测(单 3090 / greedy / chunk 2048 / DFlash2 d7 / 视觉塔 F16 在座):
-#   ctx        prefill      decode     TTFT
-#   4k         1409 t/s      97 t/s     2.91 s
-#   8k         1509 t/s     121 t/s     5.43 s
-#   64k        1218 t/s      61 t/s     53.8 s
-#   128k        948 t/s      56 t/s    138.2 s
-#   (cap = 286041;本档 229376 = 80%;64k/128k 请求零拒发,余量 2.1GB)
-#   ← 对比档③(IQ4_XS):prefill 1646/1681 → **IQ3 慢 ~13%**,换 +33% ctx。
-#
-# 视觉:同源 unsloth `mmproj-F16.gguf`(0.9GB,已计入上面的 max_seq);
-#   烟雾门:三色横带图 ⇒ 正确答"红、绿、蓝"。
-# 质量:3bit 明显比 IQ4/AWQ 差一档 —— 长文检索/摘要这类"读得多"的任务优先本档,
-#   需要精度(数学/代码/严格格式)请用档①(a8,同端口 8137)或 IQ4。
+# 极限上下文档：IQ3_S 12.0GB，ctx 可到 224k；代价是比 IQ4 慢约 13%、
+# 3-bit 质量低一档。与 IQ4 档共用 8137，二选一。
+# 例外：3-bit 主干对 INT8 KV 的 1k needle 敏感，本档保持 FP8 KV。
 extends = [
   "full.toml",
   "parts/model/27b-gguf-iq3s.toml",
-  "parts/hardware/3090-single.toml",
-  "parts/kernel/fi-graph.toml",
+  "parts/feature/fi-graph.toml",
   "parts/pool/fp8.toml",
 ]
 
 [server]
-# 8137:**单卡 3090 的统一端口**(2026-11-03 用户裁决);本档与 AWQ 档 / IQ4 档
-# 互斥(同一张卡)⇒ 同时起会先撞 bind,再撞选卡拒。
 bind = "0.0.0.0:8137"
 
-[model]
-# 视觉塔(GGUF 主干不含 model.visual.*)
+[parallel]
+mode = "single"
+device = ["3090"]
 
 [runtime]
-# 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
 admission_on_full = "reject"
-# 229376 = 7168 页(boot 报的 cap 286041 的 80%,已含 0.9GB 视觉塔);
-# 实测 64k/128k 零拒发、余量 2.1GB。
+# 含 0.9GB 视觉塔后的稳定点（cap 约 286k 的 80%）
 max_seq = 229376
-# GGUF prefill 走 MMQ2;512→2048 实测 +8~15%,4096 在 8k prompt 上会边界降级。
 prefill_chunk = 2048
 
 [spec]
-# 同档③:外部 DFlash2 W4A16 草稿(depth>0 + draft_path ⇒ tag filter 同时放行
-# QUANT_GGUF 与 W4A16/AWQ)。
 depth = 7
 draft_path = "../models/syvai/Qwen3.8-27B-DFlash2-W4A16"
 lookup = true
 
-# ⚠️ 30 系默认是 INT8 KV，但本档例外保持 FP8：IQ3_S 3-bit 主干 +
-# INT8 KV 在 1k needle 上稳定拒答（"I cannot provide..."），同题 FP8 通过；
-# 这是 3-bit 主干对 KV 量化误差更敏感，不是 INT8 机制错。IQ4 档已切 INT8。
 [store]
 prefix_cache = true
 vram_reserve_mb = 714
-# 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
 host_cache_mb = 10240
-# 快照腿宿主面关(同档③:单槽快照换槽会撞 store「块已在宿主层」不变量)
 snap_host_mb = 0
+
 [store.gdn]
 snap_max = 1
-# 消息边界快照 = 恒开(2026-11-16 键退休)
 snap_msg_delim = ""
+
 [vision]
 enabled = true
 path = "../models/unsloth/Qwen3.8-27B-GGUF/mmproj-F16.gguf"

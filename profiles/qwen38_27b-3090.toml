@@ -1,91 +1,36 @@
-# ── 唯二常驻档 ①:单张 3090 Ti / 27B AWQ-INT4 满血档 ──────────────────────
+# ── 单 3090 Ti / Qwen3.8-27B AWQ-INT4 + 视觉 ───────────────────────────────
 #
-# 形状:prefill = eager + Marlin W4A16;decode = FlashInfer + CUDA graph;
-#       投机 = DFlash2 d7(W4A16 草稿);KV = **int8**(30 系默认);**视觉塔开**;
-#       前缀缓存 + 三层账全开 + image_evict(INT8)。
-# 2026-11-04 INT8 默认验收：1k/2k/8k 文本 needle 绿；视觉 grounding +
-# image_evict 36/36、hit@16px 100%；末块 sync 的 prefill 税 ≈0。
-#
-# **max_seq = 57344 / snap_max = 2 —— 2026-10-27 a8 版全特性稳定点**
-# (原 a16 版 63456;换 a8 后显存账变小,见 [runtime] 注)
-#
-# 24G 卡上:27B + 视觉塔 + DFlash2 d7 + INT8 KV + 前缀缓存 + image_evict
-# 全部同时开。fresh boot 驱动余量 >1GiB;前缀缓存饱和后可能短暂出现 N6
-# 压力 WARN(功能/删除/缓存实测仍通过)。`image_delete_marked` / GUI 三图
-# 窗口均通过。79872 + snap1 是更大 ctx,但驱动余量贴 1GiB 压力地板,
-# image_evict 的前缀块会被下沉到 host(`前缀有宿主占位 ⇒ 不吸收`)⇒ 不在
-# 生产档保留“看起来更大、实际关键特性失效”的点。
-#
-# 分工:本档 = agent 低时延短上下文;长上下文/大图窗口由 3080 TP2(262144,
-# snap2)承担。池不手写:自动派生自 max_seq。
-#
-# ⚠️ 已知引擎缺陷(2026-10-24 立案,非本档引入):DFlash2 **尾批裁剪**形状
-# (`max_new` 剩余 ≤ depth)会让 verify 以裁后的 T 跑图档 ⇒ **核在设备上自旋**
-# (GPU util 恒 100%、主机全 futex 等待),短 `max_new` 请求可整台卡死;
-# 2026-10-25 已确定性复现(T=8 正常、T=7 自旋)。
-# 现场与判据见 `docs/devlog/serving/spec-tailcap-gpu-spin-立案.md`。
-# 规避:功能/恒等门用 `--set spec.depth=0 --set spec.lookup=false`;
-# agent 客户端给足 `max_tokens`(pi 用 8192,早停回合不受影响)。
+# 短上下文 / 低时延档：单卡 24G，W4A8 + INT8 KV + DFlash2 d7。
+# 全特性稳定点 max_seq=57344；prefill_chunk=2048（单卡实测最优点）。
 extends = [
   "full.toml",
   "parts/model/27b-awq.toml",
   "parts/feature/vision.toml",
   "parts/feature/dflash2-27b.toml",
-  "parts/hardware/3090-single.toml",
-  "parts/kernel/fi-graph.toml",
+  "parts/feature/fi-graph.toml",
   "parts/pool/int8.toml",
 ]
 
 [server]
 bind = "0.0.0.0:8137"
 
+[parallel]
+mode = "single"
+device = ["3090"]
+
 [model]
-# **W4A8 主干**(2026-10-27 用户裁决默认):激活 per-token int8 × 权重 int4,
-# 走 SM86 **INT8 张量核**(W4A16 只能走 f16 核 ⇒ 半率)。实测同卡同二进制:
-#   prefill 4k 1334→**2126** / 8k 1311→**2230** t/s(**+59%**),decode 持平
-#   (+0.95ms/轮的 a8 verify 税已由 A-1/刀B 压掉大半),TTFT@4k 3.13→1.93 s。
-# 质量:非逐字同(int8 激活在近平分处翻 greedy 轨迹),S3 battery −0.95pt、
-#   McNemar p≈0.69 不显著 ⇒ 按"统计等价"取舍,见 roadmap 26-10-27 两份台账。
 quant = "w4a8"
 
 [kernel]
-# INT8 主池没有 FP8→F16 shadow（`prefill_shadow` 仅 `kv_dtype = "fp8"` 有效；
-# 配置面会拒 `prefill_shadow && kv_dtype != "fp8"`）。INT8 prefill 走专用 P8 核。
 prefill_shadow = false
 
 [runtime]
-# 准入满员姿态(reject | queue | queue:<ms>;缺省 reject)
 admission_on_full = "reject"
-# ⚠️ a8 的显存体积比 a16 大(marlin 工作区 84MiB×2 + 激活量化缓冲):
-# 63.4k 档实测 8k 请求就撞硬预算(拒发 19-34MiB)⇒ 全特性档收到 **57.3k**
-# (32k/24k 连发零拒发,余量 1.3GB)。要 63k 就不开 a8(回到 w4a16)。
 max_seq = 57344
-# **prefill 块长 2048 / 尾块 0**(2026-10-27 逐档实测,详见 full.toml 注):
-# 4k 1320→1360、8k 1308→1358 t/s(+3.3%),32k TTFT 27.9→26.6s;
-# 4096 会撞显存硬预算(272MiB 工作区)⇒ 2048 是单卡天花板。
 prefill_chunk = 2048
 
 [sampling]
-# 2026-10-30 定调（复读立案）：本档原为 `greedy`（继承 full.toml）。
-# **greedy = 本项目已定谳的 27B instruct 复读吸引子**；但本轮真机复读探测把
-# 结论收窄了：
-#   ① 单轮内“逐字复读”在合成 prompt 上**没复现**（6-gram 峰值 2–3，无整段咬死）；
-#      3080 TP2 上看到的 13 是**结构复读**（同一命令前缀排队），非死循环。
-#   ② 生产真凶是**跳轮固定点**（/debug/agent seq29–45：17 轮逐字相同：89 tok /
-#      29 reasoning / 87B bash args / +1441 prompt tok每轮），而那台机器
-#      **已经是采样档 temp=0.3** ⇒ 采样并不能阻止跳轮复读。
-#
-# 因此本档**维持 greedy**（速度优先），跳轮守卫另做（服务层检测同一 tool_call
-# 重复，不靠采样）。
-#
-# ⚠️ **2026-10-31 已修**（单设备 top-32 候选路落地）：单卡采样不再每步回读整行
-# logits。同形状复测（w4a8 + spec d7，256 tok）：
-#   greedy 88.2 / 88.8 / 89.0 t/s；采样 **78.7 / 79.5 / 89.0 t/s**（修前 66.9–75.0）。
-# 残余差 3–7% 且**几乎全来自 AL**（采样 2.80/2.66 vs greedy 2.95 ⇒ 每轮少出
-# 4% token），不是回读税。所以本档若要采样已不付结构代价；仍维持 greedy 的
-# 理由 = 快那 3–7% + 本轮实测表明采样治不了跳轮复读（见 ②）。
-# rep_penalty 保持 1.00（关）；且本档 greedy 下它**本就不生效**
-# （`act.sampler_on=false` ⇒ rep 槽填哨兵）。
+# 速度优先；跳轮复读由服务层守卫处理
 mode = "greedy"
 temp = 1.0
 topk = 20
@@ -93,21 +38,13 @@ topp = 0.95
 rep_penalty = 1.00
 
 [store]
+prefix_cache = true
 vram_reserve_mb = 970
-# 超卖档「池外瞬态余量」MiB(池 = cap − 本值/per_tok;缺省 1024 = 旧硬编码值)
-# KV 宿主腿 10GiB:设备池只有 1983 槽(63k ctx),两发长 prompt 就占满;
-# 宿主腿让整链下沉(内容不丢)而不是硬拒。4GiB 实测:70k+65k 链装不下
-# ⇒ N6 只能逐叶丢(一次一个叶),第三发 27k 前缀回灌时 `槽池耗尽`
-# (2026-10-25;旧版还会丢宿主内容 ⇒ 粘性「身份未登记」,已修)。
-# 10GiB ≈ 容纳 4 条 63k 链(每条 1983 块)的冷缓存。
 host_cache_mb = 10240
 snap_host_mb = 3072
-# agent 消息边界快照 = 恒开(2026-11-16 键退休);delim 走 full.toml 默认;
-# gap/span 已是引擎常数（2026-11-17 键退休）。
 
 [store.gdn]
-# 2 槽 = 297MiB:给压力地板(1GiB)留余量,同时覆盖三图窗口的删除快照。
 snap_max = 2
+
 [vision]
-# 图像前缀无感删除(leave-gap;snap2 覆盖三图窗口)。
 image_evict = true
